@@ -262,7 +262,19 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
     // #3917: one folded message's text, addressed by its mNNNNN ref — the leaf
     // rows of the tier tree fetch their bytes one click at a time.
     if (req.method === "GET" && req.url !== undefined && isSessionMessagePath(req.url)) return sendWebSessionMessage(res, req.url);
-    if (req.method === "GET" && req.url === "/") {
+    // #5024: the local convenience routes below (welcome page + favicon) must
+    // only answer requests addressed to THIS gateway. In MITM mode a decrypted
+    // vhost request (e.g. GET https://chatgpt.com/) re-enters this same handler
+    // carrying the UPSTREAM vhost's Host header; matching on path alone 302'd
+    // real browser navigation onto the local admin UI, answered the JSON health
+    // fallback instead of forwarding, and served bili's own icon for the
+    // vhost's favicon probe. Foreign-Host requests fall through to the normal
+    // forward path, exactly like every other path. The trusted-hostname gate
+    // is the same identity judgment the /__bili/ origin check uses (#1537):
+    // loopback names (+ concrete bind host), port-insensitive so SSH forwards
+    // keep working.
+    const addressedToGateway = isTrustedAdminOrigin(req.headers.origin, req.headers.host, adminTrustedHostnames(opts.host));
+    if (req.method === "GET" && req.url === "/" && addressedToGateway) {
         // Browser visits root → redirect to the web UI. curl / health probes
         // (Accept: */* or no Accept) still get the JSON health check so
         // existing scripts and Docker-style health probes keep working.
@@ -284,7 +296,10 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
     // client ever asks for. The panel page declares the bundled icon (page.ts)
     // so well-behaved browsers fetch it once and cache it; this route is what
     // serves those bytes (plus the backstop for probes that skip the page).
-    if (req.method === "GET" && req.url?.split("?", 2)[0] === "/favicon.ico") {
+    // #5024: same addressed-to-gateway gate as the welcome route above — a
+    // MITM vhost's own favicon probe (Host: <vhost>) must forward, not get
+    // answered with bili's icon bytes.
+    if (req.method === "GET" && req.url?.split("?", 2)[0] === "/favicon.ico" && addressedToGateway) {
         res.writeHead(200, { "content-type": "image/x-icon", "cache-control": "no-cache" });
         res.end(Buffer.from(FAVICON_ICO_BASE64, "base64"));
         return;
