@@ -22,6 +22,7 @@ process.env.NODE_TEST_CONTEXT = "1";
 const { ompIncrementalBeforeSend, ompIncrementalOnResponse, _setOmpOriginForTest, __resetOmpIncrementalForTests } = await import("../src/agent/omp-native.ts");
 const { __resetIncrementalClientForTests, noteHostMsgIdHint, noteIncrementalAck, planIncrementalTurn } = await import("../src/agent/incremental-client.ts");
 const { ompBranchMsgIdEntries } = await import("../src/agent/pi.ts");
+const { pfLearnStamp, pfRequestHeaders } = await import("../src/agent/pf-channel.ts");
 
 const MODEL_URL = "https://api.openai-anthropic.example/v1/messages";
 
@@ -264,4 +265,51 @@ test("omp msgids: a re-planned delta never re-claims ids the lane may already ho
     // resync:true), so the same ids may ride a resync again.
     const resync = planIncrementalTurn({ conversationId: sid, messages: deltaMsgs, system: undefined, msgIds: ["c1", "c2", "c3"] }, true);
     assert.deepEqual(JSON.parse((resync as { body: string }).body).msgIds, ["c1", "c2", "c3"], "resync replaces the claim set wholesale");
+});
+
+// ── #5403/#5418: the same proven list feeds the SHARED watermark channel ──
+
+const PF_CONVO = "x-bili-plugin-conversation";
+
+test("omp watermark: an aligned branch feeds pf-channel for the chokepoint to stamp", async () => {
+    __resetIncrementalClientForTests();
+    __resetOmpIncrementalForTests();
+    const lane = await fakeLane();
+    lanes.push(lane);
+    _setOmpOriginForTest(lane.base);
+    const sid = "omp-pf-aligned";
+
+    stashHint(sid, [msgEntry("e1a2b3c4", "user", "hello"), msgEntry("e5f6a7b8", "assistant", "hi there")]);
+    const round = await convert(sid, [wire("user", "hello"), wire("assistant", "hi there")]);
+    assert.equal(round.body.resync, true, "the turn still converts normally");
+    // The watermark channel learned the list client-side; once a server stamp
+    // exists the single chokepoint emits count + tail-ids for this sid.
+    pfLearnStamp({ [PF_CONVO]: sid }, 200, new Headers({ "x-bili-pf-seq": "2" }));
+    const out = pfRequestHeaders({ [PF_CONVO]: sid });
+    assert.equal(out["x-bili-pf-count"], "2");
+    assert.equal(out["x-bili-pf-tail-ids"], "e5f6a7b8", "K=2 ⇒ anchor element 1 + new elements");
+    round.ack(2);
+});
+
+test("omp watermark: a misaligned branch CLEARS the channel list (count-only)", async () => {
+    __resetIncrementalClientForTests();
+    __resetOmpIncrementalForTests();
+    const lane = await fakeLane();
+    lanes.push(lane);
+    _setOmpOriginForTest(lane.base);
+    const sid = "omp-pf-misaligned";
+
+    // Two turns first: prove the list lands, then break alignment and expect
+    // the next request to wipe it rather than ride a stale one.
+    stashHint(sid, [msgEntry("e1a2b3c4", "user", "hello")]);
+    let round = await convert(sid, [wire("user", "hello")]);
+    pfLearnStamp({ [PF_CONVO]: sid }, 200, new Headers({ "x-bili-pf-seq": "1" }));
+    assert.equal(pfRequestHeaders({ [PF_CONVO]: sid })["x-bili-pf-tail-ids"], "e1a2b3c4", "first turn proves capture landed");
+    round.ack(1);
+
+    stashHint(sid, [msgEntry("e1a2b3c4", "user", "hello"), msgEntry("e9c0d1e2", "user", "WRONG role order")]);
+    round = await convert(sid, [wire("user", "hello"), wire("assistant", "edited reply")]);
+    const out = pfRequestHeaders({ [PF_CONVO]: sid });
+    assert.deepEqual(out, { "x-bili-pf-count": "1" }, "failed alignment clears the stored list — count-only, never a stale slice");
+    round.ack(2);
 });

@@ -17,7 +17,8 @@ import { isModelApiUrl, nativeInterceptInstalled } from "./native-intercept.js";
 import { wirePiSubagents } from "./pi-subagents.js";
 import { wireToolGuardrails } from "./tool-guardrails.js";
 import { clearIncrementalProbe, noteHostMsgIdHint, INCREMENTAL_TURN_MARKER_HEADER, incrementalEnvelopeConversationId, incrementalWireHash, noteIncrementalRejection, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, pullIncrementalReceipt, sweepStale, wireMessagesLookAnthropic, type HostMsgIdHintEntry, type IncrementalWireMessage } from "./incremental-client.js";
-import { laneMsgIdsForWire, lanePinnableContent } from "./pi-msgids.js";
+import { laneMsgIdsForOpenAiWire, laneMsgIdsForWire, lanePinnableContent } from "./pi-msgids.js";
+import * as pfChannel from "./pf-channel.js";
 import { validateMsgIds } from "../msgid-pin.js";
 import type { DirectSendPrep } from "./native-intercept.js";
 import { asciiHeaderValue, detectProxyBase, destinationRoutedThroughProxy, fetchManifest, forwardTool, fetchStatus, fetchProxyVersion, postIdentityRegister, reportRuntimeInfoOnChange, armedIdleNotice, noSessionWarning, nonHttpProvidersFromEnv, type ForwardedToolResult, type ManifestTool } from "./shared.js";
@@ -1488,6 +1489,32 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
             await forkAdopter.maybeAdopt({ base: proxyBase, parent, child: sid, body: (event as { payload?: unknown } | undefined)?.payload });
         }
         pi.on("before_provider_request", async (event, ctx) => {
+            // #5403/#5418 unified watermark channel: capture THIS request's
+            // host msgids per family for the ONE chokepoint emitter. Runs on
+            // EVERY model request — including the OpenAI-family turns the
+            // incremental divert shape-gates away (#3433). A failed resolution
+            // CLEARS the previous list; a stale anchor is worse than no field.
+            {
+                const pfSid = sessionIdOf(ctx);
+                if (pfSid !== undefined && pfSid.length > 0) {
+                    const payload = (event as { payload?: unknown } | undefined)?.payload;
+                    const msgs = payload === null || typeof payload !== "object" ? undefined : (payload as { messages?: unknown }).messages;
+                    let branch: unknown;
+                    try {
+                        branch = ctx.sessionManager?.getBranch?.();
+                    } catch {
+                        branch = undefined;
+                    }
+                    pfChannel.pfCaptureIds(
+                        pfSid,
+                        Array.isArray(msgs) && msgs.length > 0
+                            ? wireMessagesLookAnthropic(msgs)
+                                ? laneMsgIdsForWire(msgs, branch)
+                                : laneMsgIdsForOpenAiWire(msgs, branch)
+                            : undefined,
+                    );
+                }
+            }
             // #4491 omp msgids: snapshot the branch's stable entry ids BEFORE
             // any await below — the hint must be the generation of THIS
             // payload. The fetch-layer planner (omp-native) reads it back by
