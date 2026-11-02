@@ -83,7 +83,7 @@ function historyTexts(): string[] {
 // The loop adopts it as the next turn's tokenCount (usage-grade baseline), so
 // this is how each row dials context usage against the 64k declared window.
 
-async function harness(wire: Wire, lane: Lane, toolNames: string[], injectTool = true, teachTokens = 50_000) {
+async function harness(wire: Wire, lane: Lane, toolNames: string[], injectTool = true, teachTokens = 50_000, location: "top" | "additional" = "top") {
     // Windows CI flake class (seen on runners, not on dev VMs): listen(0)
     // occasionally lands in an OS-reserved/excluded port range and emits
     // "error" (EACCES/EADDRINUSE) instead of "listening". events.once(
@@ -155,10 +155,16 @@ async function harness(wire: Wire, lane: Lane, toolNames: string[], injectTool =
             };
         }
         if (wire === "responses") {
+            const items = texts.map((text, i) => ({ role: roles[i], content: [{ type: i % 2 === 0 ? "input_text" : "output_text", text }] }));
+            // #5527: Codex-shaped hosts (DSH pi-ai codex path) declare the model-visible
+            // tools in an input[] preamble item and send NO top-level `tools` (issue shape).
+            const preamble = toolNames.length > 0 && location === "additional"
+                ? [{ type: "additional_tools", role: "developer", tools: wireTools("responses", toolNames) }]
+                : [];
             return {
                 model: "model-test",
-                input: texts.map((text, i) => ({ role: roles[i], content: [{ type: i % 2 === 0 ? "input_text" : "output_text", text }] })),
-                ...(toolNames.length > 0 ? { tools: wireTools("responses", toolNames) } : {}),
+                input: [...preamble, ...items],
+                ...(toolNames.length > 0 && location !== "additional" ? { tools: wireTools("responses", toolNames) } : {}),
                 max_output_tokens: 1024, stream: false,
             };
         }
@@ -215,7 +221,13 @@ function outcome(wire: Wire, sentCount: number, forwarded: Record<string, unknow
         const raw = forwarded["instructions"];
         if (typeof raw === "string") instr = raw;
         else if (Array.isArray(raw)) instr = raw.map(String).join("\n");
-        const devItem = items.find((it) => (it as { type?: string }).type === "developer" || it.role === "developer" || it.role === "system");
+        // Canonical sys/dev view (same predicate as prepare-responses's
+        // systemParts collection): TYPED items (e.g. #5527's additional_tools
+        // preamble, role "developer") are not standing-prompt carriers.
+        const devItem = items.find((it) => {
+            const t = (it as { type?: string }).type;
+            return (t === undefined || t === "message") && (it.role === "developer" || it.role === "system");
+        });
         const devText = devItem ? JSON.stringify(devItem.content ?? "") : "";
         return { nudge, standingPrompt: instr.includes(STANDING_MARKER) || devText.includes(STANDING_MARKER) };
     }
@@ -228,7 +240,7 @@ function outcome(wire: Wire, sentCount: number, forwarded: Record<string, unknow
     return { nudge, standingPrompt: sys.includes(STANDING_MARKER) };
 }
 
-const ROWS: { name: string; lane: Lane; tools: string[]; injectTool?: boolean; teach?: number; headerlessProbe?: boolean; expect: (w: Wire) => RowOutcome }[] = [
+const ROWS: { name: string; lane: Lane; tools: string[]; injectTool?: boolean; teach?: number; headerlessProbe?: boolean; location?: "top" | "additional"; onlyWires?: readonly Wire[]; expect: (w: Wire) => RowOutcome }[] = [
     { name: "omp control keeps the surface", lane: "omp", tools: [], expect: () => ({ nudge: true, standingPrompt: true }) },
     { name: "dsh no-tools drops the surface (#3177)", lane: "dsh", tools: [], expect: () => ({ nudge: false, standingPrompt: false }) },
     // #3401 FIX ROW: dsh with compress actually declared on
@@ -255,6 +267,17 @@ const ROWS: { name: string; lane: Lane; tools: string[]; injectTool?: boolean; t
     // (#3177 preset-standard shape keeps its suppression).
     { name: "dsh single non-omnibus tool still drops the surface (precision retained)", lane: "dsh", tools: ["get_weather"], expect: () => ({ nudge: false, standingPrompt: false }) },
     { name: "dsh acp_status-only drops the surface (named-tool precision target)", lane: "dsh", tools: ["acp_status"], expect: () => ({ nudge: false, standingPrompt: false }) },
+    // #5527 FIX ROWS (dsh, responses wire only): DSH's pi-ai codex path declares
+    // the model-visible bili tools in an input[].type==="additional_tools"
+    // preamble item and sends NO top-level `tools` — top-level-only observation
+    // read that as "no tools at all" (issue log: nudge ARMED-SUPPRESSED T1 at
+    // pendingT1=62364/50000 with surface=off(no-tools) while the model could in
+    // fact call compress). The observation now reads every declaration location
+    // (declaredToolEntries); the acp_status-only row pins the negative direction
+    // (#3617): a preamble exposing no compress keeps the surface off.
+    { name: "dsh additional_tools compress keeps the surface (#5527 DSH pi-ai codex shape)", lane: "dsh", tools: ["compress", "acp_status"], location: "additional", onlyWires: ["responses"], expect: () => ({ nudge: true, standingPrompt: true }) },
+    { name: "dsh additional_tools acp_status-only still drops the surface (#5527 precision retained)", lane: "dsh", tools: ["acp_status"], location: "additional", onlyWires: ["responses"], expect: () => ({ nudge: false, standingPrompt: false }) },
+    { name: "dsh additional_tools code_run omnibus keeps the surface (#5527 × #3884 family via preamble)", lane: "dsh", tools: ["code_run"], location: "additional", onlyWires: ["responses"], expect: () => ({ nudge: true, standingPrompt: true }) },
     // #3427 review: pin the disclosed anthropic-wire convergence — with
     // injectTool off the nudge must stay off on ALL wires (master allowed it
     // on anthropic: gate drift, #3293 shape); red on pre-fix master [anthropic].
@@ -306,8 +329,9 @@ const ROWS: { name: string; lane: Lane; tools: string[]; injectTool?: boolean; t
 
 for (const wire of ["anthropic", "openai", "responses", "google"] as const) {
     for (const row of ROWS) {
+        if (row.onlyWires !== undefined && !row.onlyWires.includes(wire)) continue;
         test(`lane matrix [${wire}] ${row.name}`, { timeout: 60_000 }, async () => {
-            const h = await harness(wire, row.lane, row.tools, row.injectTool, row.teach);
+            const h = await harness(wire, row.lane, row.tools, row.injectTool, row.teach, row.location);
             try {
                 await h.send(["hello"]);                 // teach usage 50k / 64k = 78%
                 await h.send(historyTexts(), { headerless: row.headerlessProbe === true });            // arm the nudge
