@@ -12,19 +12,15 @@
 //   2. NO request body ever carries the run separator text — the chat wire
 //      has no run concept, steady or folded;
 //   3. any consecutive-body divergence below the plain-growth floor must sit
-//      INSIDE the fold-summary element (the covering-range text swap) — never
-//      before it and never in a later message.
+//      INSIDE the fold-summary element (the covering-range text swap) or at the
+//      fold's own compress carrier pair — default-on lays that out at its fold
+//      point instead of the tail (#5483/#5505-B) — never anywhere else mid-history.
 import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
 import { defaultConfig } from "acp-kernel";
 import { startServer } from "../src/server.ts";
-
-// #5483: the fold-point carrier move (now default on) legitimately re-lays-out
-// round-2 bodies at the fold boundary; this shape regression pins the legacy
-// layout contract, so run it against the conservative default explicitly.
-process.env.BILI_COMPRESS_AT_FOLD_POINT = "off";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import type { ProxyOptions } from "../src/config.ts";
@@ -152,6 +148,9 @@ test("#1592 chat fold round-2 renders the next turn's shape (no run separators, 
     const lcp = (a: string, b: string): number => { const n = Math.min(a.length, b.length); let i = 0; while (i < n && a[i] === b[i]) i++; return i; };
     const elemCount = (s: string): number => (s.match(/"role"/g) ?? []).length;
     const elemIdxAt = (s: string, off: number): number => (s.slice(0, off).match(/"role"/g) ?? []).length;
+    const elSlice = (s: string, k: number): string => { const rs = [...s.matchAll(/"role"/g)]; const st = rs[k]?.index ?? -1; if (st < 0) return ""; return s.slice(st, rs[k + 1]?.index ?? s.length); };
+    const isCarrierCore = (seg: string): boolean => /"name"\s*:\s*"compress"/.test(seg) || (/"role"\s*:\s*"tool"/.test(seg) && /\[Compressed m\d/.test(seg));
+    const carrierNear = (s: string, off: number): boolean => { const k = elemIdxAt(s, off); for (const j of [k - 1, k, k + 1]) if (isCarrierCore(elSlice(s, j))) return true; return false; };
     for (let i = 1; i < captured.length; i++) {
         const a = captured[i - 1]!, b = captured[i]!;
         if (a === b) continue;
@@ -166,6 +165,12 @@ test("#1592 chat fold round-2 renders the next turn's shape (no run separators, 
             const elemEnd = b.indexOf('"role"', anchor + SUMMARY_MARKER.length);
             inSummaryElem = p >= elemStart && (elemEnd === -1 || p < elemEnd);
         }
-        assert.ok(inVolatileTail || inSummaryElem, `pair ${i - 1}->${i} diverges at body-${i} element #${idxB}/${elemCount(b)} — mid-history rewrite (neither the fold-summary element nor the trailing volatile slots). #1592: refreshFolded must render the steady path's shape`);
+        // Default-on (#5483/#5505-B): the fold's own compress carrier pair now
+        // sits at its fold point (adjacent to the summary) instead of the tail,
+        // arriving/departing as blocks activate and deactivate. That carrier
+        // churn is the ONE extra mid-history divergence the shipped layout
+        // allows — anything else mid-history is still the #1592 bug.
+        const carrierBreak = carrierNear(a, p) || carrierNear(b, p);
+        assert.ok(inVolatileTail || inSummaryElem || carrierBreak, `pair ${i - 1}->${i} diverges at body-${i} element #${idxB}/${elemCount(b)} — mid-history rewrite (neither the fold-summary element, the trailing volatile slots, nor the fold-point compress carrier). #1592: refreshFolded must render the steady path's shape`);
     }
 });
