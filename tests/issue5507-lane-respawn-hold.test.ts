@@ -108,7 +108,7 @@ async function waitFor(cond: () => boolean, what: string): Promise<void> {
 
 type Lane = {
     name: string;
-    reset: () => void;
+    reset: (base?: string, toolsReady?: boolean) => void;
     setSpawn: (fn?: () => Promise<string | undefined>) => void;
     hold: () => number | undefined;
     arm: (ctx: HostCtx) => void;
