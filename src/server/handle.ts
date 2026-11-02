@@ -2804,32 +2804,32 @@ async function handleRequest(
     }
 }
 
-    // #987: the window is NEVER learned from traffic — no self-heal read
-    // here. Only the one-shot emergency shrink (armed on the overflow
-    // itself) reacts to a wrong declared window.
-    // Reserve the model's OUTPUT budget for this turn from the window so the
-    // kernel's nudge/truncate bands sit below (window - reserved) and a
-    // context+output overflow can't happen on a small window (e.g. 100k with a
-    // large max_tokens — the most common "context blew up" cause; none of the
-    // three layers reserved room for the output before this). #4205: EVERY
-    // wire reserves unless the route carries positive evidence of a separate
-    // output budget (real-Claude routing — api.anthropic.com or a claude-*
-    // model id; see shouldReserveOutputHeadroom / hasSeparateOutputBudgetEvidence).
-    // The old blanket anthropic exemption is what let wrapper providers on
-    // that wire (DeepSeek /anthropic bills completion against the same
-    // window) 400 at the wall (#3900); proven-share learning (#3973) composes
-    // here later. The request's own budget field is the exact
-    // output budget requested for THIS turn, so it is precise and per-request;
-    // when the harness omits every budget field (#924 fallback below) the
-    // model's declared max output stands in for it.
-    // #896: headroomCap (compress.outputHeadroomMaxPct, default 0.25, aligned
-    // with billion-context-pi #207) caps the reservation at headroomCap × window
-    // — reserved = min(maxOutput, headroomCap × window). Replies longer than the
-    // reservation overflow once; the self-heal above recovers it next turn.
-    // Only reserve when it leaves a usable window (maxOutput < window);
-    // otherwise the request is degenerate (output >= whole window) and the
-    // self-heal above handles the resulting overflow. Feeds reqConfig (→
-    // processTurn `config`), so diagNudge shows the reserved window (no extra log).
+// #987: the window is NEVER learned from traffic — no self-heal read
+// here. Only the one-shot emergency shrink (armed on the overflow
+// itself) reacts to a wrong declared window.
+// Reserve the model's OUTPUT budget for this turn from the window so the
+// kernel's nudge/truncate bands sit below (window - reserved) and a
+// context+output overflow can't happen on a small window (e.g. 100k with a
+// large max_tokens — the most common "context blew up" cause; none of the
+// three layers reserved room for the output before this). #4205: EVERY
+// wire reserves unless the route carries positive evidence of a separate
+// output budget (real-Claude routing — api.anthropic.com or a claude-*
+// model id; see shouldReserveOutputHeadroom / hasSeparateOutputBudgetEvidence).
+// The old blanket anthropic exemption is what let wrapper providers on
+// that wire (DeepSeek /anthropic bills completion against the same
+// window) 400 at the wall (#3900); proven-share learning (#3973) composes
+// here later. The request's own budget field is the exact
+// output budget requested for THIS turn, so it is precise and per-request;
+// when the harness omits every budget field (#924 fallback below) the
+// model's declared max output stands in for it.
+// #896: headroomCap (compress.outputHeadroomMaxPct, default 0.25, aligned
+// with billion-context-pi #207) caps the reservation at headroomCap × window
+// — reserved = min(maxOutput, headroomCap × window). Replies longer than the
+// reservation overflow once; the self-heal above recovers it next turn.
+// Only reserve when it leaves a usable window (maxOutput < window);
+// otherwise the request is degenerate (output >= whole window) and the
+// self-heal above handles the resulting overflow. Feeds reqConfig (→
+// processTurn `config`), so diagNudge shows the reserved window (no extra log).
 // The 15 parameters below ARE the real coupling surface of this block: it takes
 // no decision, forwards nothing and never touches kernel state — it only reads
 // what the pipeline already resolved and returns a tightened Config. Extracting
