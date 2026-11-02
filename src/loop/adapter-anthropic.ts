@@ -318,7 +318,7 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
             return { ...body, system: stamped, messages: withNotes };
         },
 
-        async *parseStream(upstream, round) {
+        async *parseStream(upstream, round, opts) {
             const pending = new Map<number, ToolUseBuffer>();
             let roundInput: number | undefined;
             let roundCached: number | undefined;
@@ -372,6 +372,21 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
             let lastTextIndex: number | null = null;
             let lastThinkingIndex: number | null = null;
             let sawThinking = false;
+            // round2-hold: thinking deltas of a bili-owned round, buffered off the
+            // client wire until their signature releases them. Per-parse by design:
+            // a dead attempt's buffer must vanish with it (that is what keeps the
+            // #413 blind re-fetch zero-side-effect), while heldThinkingStarts lives
+            // at factory level so a re-fetched parse can discard the dead attempt's
+            // still-held start. The frames are stored UN-remapped: a held block has
+            // no client index yet (the start frame is what allocates it), so the
+            // index remap happens at flush time.
+            const heldThinkingDeltas = new Map<number, string[]>();
+            // round2-hold: hold ONLY when the upstream is evidenced to sign — a
+            // relay that never signs (GLM/DeepSeek anthropic-compat) has no
+            // signature contract to violate, so holding would just delay its
+            // thinking to a burst at block end for nothing. Self-arms below the
+            // moment this parse sees a signature_delta.
+            let upstreamSignsThinking = opts?.upstreamSignsThinking === true;
             let toolCallsEmitted = 0;
             let degenerateWarned = false;
             const maybeWarnDegenerate = (reason: string | undefined) => {
@@ -541,17 +556,42 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                             // persists the filtered bytes and re-sends them forever). So the
                             // #1881/#1882 prose filters NEVER touch thinking; cosmetic
                             // tag/marker echoes inside a thinking pane are accepted.
-                            const startBuf = releaseHeldThinking(upstreamIndex);
-                            const ci = indexMap.get(upstreamIndex) ?? upstreamIndex;
-                            lastThinkingIndex = ci;
-                            if (startBuf) {
-                                yield { kind: "meta", chunk: startBuf, firstRoundOnly: round === 1, thinkingStart: true } as ParsedStreamEvent;
+                            if (round > 1 && upstreamSignsThinking && heldThinkingStarts.has(upstreamIndex)) {
+                                // round2-hold: bili owns round ≥ 2 (its own re-request
+                                // after a proxy tool) — the client CANNOT replay it,
+                                // because round 1 already committed its own bytes to
+                                // the client's stream. On a signing upstream a cut
+                                // that leaves an unsigned thinking block on the wire
+                                // is unrecoverable: #2501 proves the re-fetch cannot
+                                // fix it (next replay 400 "thinking.signature: Field
+                                // required" → the client strips all thinking). So the
+                                // payload is buffered and the block stays invisible
+                                // until `signature_delta`, which releases start +
+                                // payload + signature together (block below). A death
+                                // before that leaves zero client state, and the #413
+                                // blind re-fetch heals the turn by re-running the
+                                // same round. Round 1 keeps its live stream: that
+                                // turn is the client's own and it can replay it.
+                                const held = heldThinkingDeltas.get(upstreamIndex) ?? [];
+                                held.push(eventStr);
+                                heldThinkingDeltas.set(upstreamIndex, held);
+                                // Accounting only — the loop still accumulates the
+                                // text for the re-request rebuild; `withheld` keeps
+                                // it off the wire (core.ts reasoning branch).
+                                yield { kind: "reasoning", delta: delta.thinking, withheld: true } as ParsedStreamEvent;
+                            } else {
+                                const startBuf = releaseHeldThinking(upstreamIndex);
+                                const ci = indexMap.get(upstreamIndex) ?? upstreamIndex;
+                                lastThinkingIndex = ci;
+                                if (startBuf) {
+                                    yield { kind: "meta", chunk: startBuf, firstRoundOnly: round === 1, thinkingStart: true } as ParsedStreamEvent;
+                                }
+                                yield {
+                                    kind: "reasoning",
+                                    delta: delta.thinking,
+                                    raw: remapIndexInEvent(eventStr, ci),
+                                } as ParsedStreamEvent;
                             }
-                            yield {
-                                kind: "reasoning",
-                                delta: delta.thinking,
-                                raw: remapIndexInEvent(eventStr, ci),
-                            } as ParsedStreamEvent;
                         } else if (!heldThinkingStarts.has(upstreamIndex)) {
                             // #2501: empty thinking_delta with the start already on the
                             // wire — inert, forwarded like any unknown round-1 delta.
@@ -567,10 +607,34 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                     } else if (delta.type === "signature_delta" && typeof delta.signature === "string") {
                         // #2501: a signature is payload-bearing — release the held start
                         // first (Opus 5.5 sends ONLY this between start and stop).
+                        // round2-hold: the signature is what makes the block VALID
+                        // client history, so this is the one moment the buffered
+                        // deltas may be released — start, payload, signature, all in
+                        // this burst. From here this upstream has PROVEN it signs, so
+                        // later blocks of the same response are held too (the loop's
+                        // evidence can only be computed before the parse starts).
+                        upstreamSignsThinking = true;
                         const startBuf = releaseHeldThinking(upstreamIndex);
                         const ci = indexMap.get(upstreamIndex) ?? upstreamIndex;
                         if (startBuf) {
                             yield { kind: "meta", chunk: startBuf, firstRoundOnly: round === 1, thinkingStart: true } as ParsedStreamEvent;
+                        }
+                        const held = heldThinkingDeltas.get(upstreamIndex);
+                        if (held !== undefined) {
+                            heldThinkingDeltas.delete(upstreamIndex);
+                            if (held.length > 0) {
+                                lastThinkingIndex = ci;
+                                // One frame per held event, concatenated and remapped to
+                                // the index the start frame just allocated: the client
+                                // sees the whole payload arrive with its start, inside
+                                // the SAME single block (never one block per delta — the
+                                // #1455/round-2 duplicate-thinking trap).
+                                yield {
+                                    kind: "meta",
+                                    chunk: Buffer.concat(held.map((h) => Buffer.concat([remapIndexInEvent(h, ci), Buffer.from("\n\n", "utf8")]))),
+                                    firstRoundOnly: false,
+                                } as ParsedStreamEvent;
+                            }
                         }
                         yield {
                             kind: "reasoning",
@@ -601,7 +665,23 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                         // stop may surface: a signature-less thinking block in the client's
                         // history is the exact poison #2501 fixes. Discard silently.
                         // (Map.delete returns a BOOLEAN — true iff an entry was removed.)
-                        if (heldThinkingStarts.delete(upstreamIndex)) continue;
+                        // round2-hold: this is also the discard point for a bili-owned
+                        // round whose block ended WITHOUT a signature — the upstream
+                        // proved it signs (that is why the payload was held), so a
+                        // signature-less block from it is invalid history by
+                        // definition and must never reach the client. The withheld
+                        // text still lives in the loop's accounting, where the
+                        // re-request rebuild drops unsigned reasoning segments for
+                        // signing protocols (core.ts requiresThinkingSignature).
+                        if (heldThinkingStarts.delete(upstreamIndex)) {
+                            if (heldThinkingDeltas.delete(upstreamIndex)) {
+                                // The loop accumulated a reasoning segment for the
+                                // withheld payload; seal it so the NEXT thinking
+                                // block cannot inherit it.
+                                yield { kind: "reasoning", delta: "", blockEnd: true, withheld: true } as ParsedStreamEvent;
+                            }
+                            continue;
+                        }
                         // Seal the current thinking segment so interleaved thinking
                         // blocks each keep their own signature on rebuild.
                         // #1960: a redacted block has no captured reasoning — replay its
