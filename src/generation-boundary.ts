@@ -20,7 +20,7 @@
 // renders for the session's lifetime — static text, byte-stable across turns,
 // prefix-cache safe after the (typically never-visible) one-time append.
 //
-// #5543 adds WITNESSED seeding: the two host-side split points where a new
+// #5542 adds WITNESSED seeding: the two host-side split points where a new
 // ref-ledger generation is born under an already-running conversation (a
 // persona fork onto a suffixed session key, and the native-compaction rebase)
 // call witnessGenerationReset AT THE MOMENT OF THE SPLIT. Residue detection
@@ -142,7 +142,7 @@ export function detectGenerationBoundary(
     return true;
 }
 
-/** #5543: witness a ref-ledger generation reset AT THE MOMENT IT HAPPENS. The
+/** #5542: witness a ref-ledger generation reset AT THE MOMENT IT HAPPENS. The
  *  two host-side split points call this (a persona fork onto a suffixed session
  *  key, and the native-compaction rebase) so the standing note rides from the
  *  FIRST turn of the new generation instead of waiting for residue detection —
@@ -163,11 +163,11 @@ export function witnessGenerationReset(
     if (witness.detail) record.detail = witness.detail;
     (session.metadata ?? (session.metadata = {}))[STORAGE_KEY] = record;
     markDirty(session);
-    log?.("info", `[${session.id}] [acp-gen-reset] ref-ledger generation reset witnessed (${witness.reason}${witness.detail ? ` — ${witness.detail}` : ""}; previous-generation frontier ${record.frontier || "unknown"}) — refs minted before this session's ledger are inert here; standing generation-boundary note active from this turn (#5543)`);
+    log?.("info", `[${session.id}] [acp-gen-reset] ref-ledger generation reset witnessed (${witness.reason}${witness.detail ? ` — ${witness.detail}` : ""}; previous-generation frontier ${record.frontier || "unknown"}) — refs minted before this session's ledger are inert here; standing generation-boundary note active from this turn (#5542)`);
     return true;
 }
 
-/** #5543: persona-fork variant of the witness, called from the conversation-
+/** #5542: persona-fork variant of the witness, called from the conversation-
  *  resolution seam where a request lands on a FRESH suffixed-key session while
  *  its conversation id already owns a session. Witnesses only when there is a
  *  previous generation to lose: the forked session is still empty AND the raw

@@ -598,7 +598,7 @@ function resolveDerivedDecompress(
         const header = `[Block ${blockId} content — ${count} item(s)${full ? ", full" : ""} · read-only from derived session ${anc.id} (#1333)]`;
         return toolOk(`${header}\n${body}`);
     }
-    // #5543: when this session's ledger was reset mid-conversation (witnessed
+    // #5542: when this session's ledger was reset mid-conversation (witnessed
     // or detected), a not-found is overwhelmingly a previous-generation id —
     // say so explicitly instead of the bare "not found" that reads like a typo
     // and invites retry loops on ids that can never resolve here.

@@ -1,4 +1,4 @@
-// #5543 regression: ref-ledger generation resets (persona fork / native-
+// #5542 regression: ref-ledger generation resets (persona fork / native-
 // compaction rebase) were invisible — no log marker at the split moment, the
 // standing note only after residue detection (which never fires when the reset
 // discarded the citing text too), no acp_status section, and a decompress
@@ -34,8 +34,8 @@ function seedRefs(s: Session, n: number): void {
     s.state.messageRefs.byRef = byRef;
 }
 
-test("#5543: witnessed reset seeds the boundary record and logs [acp-gen-reset]", () => {
-    const s = getSession(`g5543-seed-${rand()}`);
+test("#5542: witnessed reset seeds the boundary record and logs [acp-gen-reset]", () => {
+    const s = getSession(`g5542-seed-${rand()}`);
     const logs: string[] = [];
     const seeded = witnessGenerationReset(s, { reason: "persona-fork", detail: "conversation raw-1 forked onto raw-1|sub:task:abc12345", frontier: 42 }, (_l, m) => logs.push(m));
     assert.equal(seeded, true);
@@ -49,8 +49,8 @@ test("#5543: witnessed reset seeds the boundary record and logs [acp-gen-reset]"
     assert.match(logs[0]!, /m00042/);
 });
 
-test("#5543: witness is first-wins — a residue-detected record is not overwritten by a later witness", () => {
-    const s = getSession(`g5543-first-${rand()}`);
+test("#5542: witness is first-wins — a residue-detected record is not overwritten by a later witness", () => {
+    const s = getSession(`g5542-first-${rand()}`);
     seedRefs(s, 10);
     const staleMsgs: CoreMessage[] = [
         { id: "a", role: "user", contentType: "text", text: "old receipt compress m00042–m00051" },
@@ -66,8 +66,8 @@ test("#5543: witness is first-wins — a residue-detected record is not overwrit
     assert.equal(after.reason, undefined, "detection record shape untouched");
 });
 
-test("#5543: fork witness gates on fresh fork + raw session with minted refs", () => {
-    const rawId = `g5543-fork-raw-${rand()}`;
+test("#5542: fork witness gates on fresh fork + raw session with minted refs", () => {
+    const rawId = `g5542-fork-raw-${rand()}`;
     const raw = getSession(rawId);
     seedRefs(raw, 33);
     const forkId = `${rawId}|sub:task:deadbeef`;
@@ -78,12 +78,12 @@ test("#5543: fork witness gates on fresh fork + raw session with minted refs", (
     assert.match(logs[0]!, /\[acp-gen-reset\]/);
     assert.equal(witnessForkedGeneration(fork, rawId, forkId), false, "repeat call: first-wins");
 
-    const rawEmpty = getSession(`g5543-empty-raw-${rand()}`);
+    const rawEmpty = getSession(`g5542-empty-raw-${rand()}`);
     const fork2 = getSession(`${rawEmpty.id}|sub:task:cafebabe`);
     assert.equal(witnessForkedGeneration(fork2, rawEmpty.id, fork2.id), false, "#2156 sidecar shape: raw session minted nothing — no previous generation to lose");
     assert.equal(readGenerationBoundary(fork2), undefined);
 
-    const rawBusy = getSession(`g5543-busy-raw-${rand()}`);
+    const rawBusy = getSession(`g5542-busy-raw-${rand()}`);
     seedRefs(rawBusy, 5);
     const fork3 = getSession(`${rawBusy.id}|sub:task:feedface`);
     seedRefs(fork3, 2);
@@ -91,8 +91,8 @@ test("#5543: fork witness gates on fresh fork + raw session with minted refs", (
     assert.equal(readGenerationBoundary(fork3), undefined);
 });
 
-test("#5543: native-compaction rebase witnesses the reset with the pre-rebase frontier", () => {
-    const s = getSession(`g5543-rebase-${rand()}`);
+test("#5542: native-compaction rebase witnesses the reset with the pre-rebase frontier", () => {
+    const s = getSession(`g5542-rebase-${rand()}`);
     seedRefs(s, 33);
     s.metadata!.nativeCompactionBoundary = { at: Date.now(), pendingRebase: true };
     assert.equal(reconcileNativeCompactionBoundary(s), true, "rebase lands");
@@ -106,8 +106,8 @@ function statusCtx(session: Session) {
     return { core: createCore(), config: defaultConfig(200_000), messages: [] as CoreMessage[], session, log: () => { } };
 }
 
-test("#5543: acp_status renders the GENERATION BOUNDARY section for a witnessed boundary", () => {
-    const s = createSession(`g5543-status-${rand()}`);
+test("#5542: acp_status renders the GENERATION BOUNDARY section for a witnessed boundary", () => {
+    const s = createSession(`g5542-status-${rand()}`);
     witnessGenerationReset(s, { reason: "persona-fork", detail: "conversation X forked onto Y", frontier: 12 });
     const report = handleAcpStatus({}, statusCtx(s)).text;
     assert.ok(report.includes("GENERATION BOUNDARY"), `section missing: ${report.slice(0, 400)}`);
@@ -117,13 +117,13 @@ test("#5543: acp_status renders the GENERATION BOUNDARY section for a witnessed 
     assert.ok(report.includes("verify disk/git state"), "execution-tail compensation order present");
 });
 
-test("#5543: acp_status section falls back to residue wording for detection records and stays absent otherwise", () => {
-    const s = createSession(`g5543-status-det-${rand()}`);
+test("#5542: acp_status section falls back to residue wording for detection records and stays absent otherwise", () => {
+    const s = createSession(`g5542-status-det-${rand()}`);
     s.metadata!.generationBoundary = { at: Date.now(), frontier: "m00010", maxStaleRef: "m09631" };
     const report = handleAcpStatus({}, statusCtx(s)).text;
     assert.ok(report.includes("GENERATION BOUNDARY"), "detection-shaped record renders too");
     assert.ok(report.includes("residue detected"), "fallback wording names the detection path");
-    const bare = createSession(`g5543-status-none-${rand()}`);
+    const bare = createSession(`g5542-status-none-${rand()}`);
     assert.ok(!handleAcpStatus({}, statusCtx(bare)).text.includes("GENERATION BOUNDARY"), "no boundary: report unchanged");
 });
 
@@ -133,8 +133,8 @@ function decompressCtx(session: Session): DecompressCtx {
     return { core: createCore(), config: defaultConfig(200_000), messages: [], session, log: () => { } } as unknown as DecompressCtx;
 }
 
-test("#5543: decompress not-found names the discarded generation when a boundary is active", () => {
-    const s = getSession(`g5543-dec-${rand()}`);
+test("#5542: decompress not-found names the discarded generation when a boundary is active", () => {
+    const s = getSession(`g5542-dec-${rand()}`);
     witnessGenerationReset(s, { reason: "persona-fork", frontier: 5 });
     const out = resolveDecompress({ blockId: "b7" }, decompressCtx(s)).text;
     assert.ok(out.startsWith("[Block b7 not found]"), out);
@@ -143,13 +143,13 @@ test("#5543: decompress not-found names the discarded generation when a boundary
     assert.ok(out.includes("do not retry variations"), out);
 });
 
-test("#5543: decompress not-found stays bare without a boundary (typo case byte-unchanged)", () => {
-    const s = getSession(`g5543-dec-none-${rand()}`);
+test("#5542: decompress not-found stays bare without a boundary (typo case byte-unchanged)", () => {
+    const s = getSession(`g5542-dec-none-${rand()}`);
     const out = resolveDecompress({ blockId: "b7" }, decompressCtx(s)).text;
     assert.equal(out, "[Block b7 not found]");
 });
 
-test("#5543: the standing note carries the execution-tail compensation clause", () => {
+test("#5542: the standing note carries the execution-tail compensation clause", () => {
     assert.ok(GENERATION_BOUNDARY_NOTE.includes("UNVERIFIED"), "earlier completion reports demoted to unverified");
     assert.ok(GENERATION_BOUNDARY_NOTE.includes("execution tail"), "names the failure mode");
     assert.ok(GENERATION_BOUNDARY_NOTE.includes("Check the real state"), "orders verification before claiming completion");

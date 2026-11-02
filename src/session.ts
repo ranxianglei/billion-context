@@ -1704,7 +1704,7 @@ export function reconcileNativeCompactionBoundary(session: Session): boolean {
         rebasedAt: Date.now(),
     };
     markDirty(session);
-    // #5543: witness the reset at the rebase moment itself — the compacted
+    // #5542: witness the reset at the rebase moment itself — the compacted
     // resend starts a fresh m00001 ledger while the visible history keeps
     // citing pre-compaction refs, so the standing note + [acp-gen-reset]
     // marker go live from the next turn without waiting for residue detection.

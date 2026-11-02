@@ -354,7 +354,7 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
             }
         }
     }
-    // #5543: witnessed/detected generation boundary — the ref ledger restarted
+    // #5542: witnessed/detected generation boundary — the ref ledger restarted
     // mid-conversation (persona fork or native-compaction rebase) or previous-
     // generation residue was detected. Display-only, user-visible in tool
     // output: the canonical surface saying "your old refs are dead and here is

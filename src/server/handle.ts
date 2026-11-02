@@ -1433,7 +1433,7 @@ async function handleRequest(
         const session = await getSessionAsync(sessionId, { protocol, upstreamOrigin, label: clientLabel ?? (anonAffinity ? `prefix-affinity ${anonAffinity.tailHash.slice(0, 8)}` : undefined) });
         memProbe(opts.debug, log, sessionId, "inbound-parsed", bodyBuffer.length);
         if (designNamespaced && session.metadata.personaNamespace !== true) session.metadata.personaNamespace = true;
-        // #5543: a FRESH persona fork restarts the ref ledger at m00001 under a
+        // #5542: a FRESH persona fork restarts the ref ledger at m00001 under a
         // suffixed key while the model's visible history keeps citing the RAW
         // session's refs — witness the generation reset at the split moment so
         // the standing note, the [acp-gen-reset] marker and the acp_status
