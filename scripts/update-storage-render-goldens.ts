@@ -16,6 +16,17 @@ process.env.BILI_IMAGE_RESCALE = "0";
 // what the committed test run hashes, and every freshly regenerated golden
 // would red on the next CI run.
 process.env.BILI_SNAPSHOT_SHADOW = "0";
+// Parity #3 (#5402): the suite runs under the CI preload chain, whose
+// tests/preload-test-env.mjs pins BILI_MESSAGE_TIMESTAMPS=0. A bare
+// `node --import tsx` regen has no preload and renders with the production
+// default (timestamps ON), so every nudge/tsStamps digest differs from what
+// the suite hashes and a freshly regenerated golden reds immediately.
+//
+// This is the first parity pin that must be forced rather than defaulted:
+// #3400 and #3756 both assign unconditionally, and so does the preload, so
+// `??=` is enough only as long as every caller agrees. Keep the three pins
+// uniform so a partial preload can never desync them.
+process.env.BILI_MESSAGE_TIMESTAMPS = "0";
 
 const GOLDEN_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "tests", "golden", "storage-render");
 fs.mkdirSync(GOLDEN_DIR, { recursive: true });

@@ -26,6 +26,11 @@ process.env.BILI_IMAGE_RESCALE = "0";
 // RENDER/STORAGE shape, not observability — keep them free of the new field
 // (the shadow lane has its own suite, tests/snapshot-shadow.test.ts).
 process.env.BILI_SNAPSHOT_SHADOW = "0";
+// #4313 follow-up: message timestamps are ON by default now; these goldens
+// pin the pre-feature bytes, so force the display gate off — same value as
+// the CI preload chain (tests/preload-test-env.mjs), so bare local runs
+// stay green too (#5402).
+process.env.BILI_MESSAGE_TIMESTAMPS = "0";
 
 
 const GOLDEN_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "golden", "storage-render");
