@@ -2376,6 +2376,32 @@ export function applyReasoningDrop(
     return out;
 }
 
+/** Predicate factory for the experimental fold-point carrier relocation
+ *  "thinking clear" (kernel Config.reasoningDroppable): a reasoning core may
+ *  be dropped at the moment its compress pair is repositioned ONLY when it
+ *  carries no wire signature. Signed Anthropic thinking/redacted_thinking
+ *  bytes are NEVER rewritten or deleted (#1658 doctrine). Returns undefined
+ *  for sessions where the kernel must not drop anything at all: strict-echo
+ *  upstreams (#684 — reasoning must round-trip with tool_calls) and views
+ *  holding ANY signed thinking block (presence-based gate, same posture as
+ *  planReasoningDrop), so a conservative misclassification can never break a
+ *  signed session. Pure + cheap; install per request. */
+export function makeFoldPointReasoningDroppable(
+    msgs: BiliMessage[],
+    strictEcho: boolean,
+): ((m: import("acp-kernel").CoreMessage) => boolean) | undefined {
+    if (strictEcho) return undefined;
+    if (msgs.some(hasSignedThinkingBlock)) return undefined;
+    return (m: import("acp-kernel").CoreMessage): boolean => {
+        const core = m as BiliMessage;
+        if (core.contentType === "reasoning") {
+            return !(typeof core.thinkingSignature === "string" && core.thinkingSignature.length > 0);
+        }
+        const raw = core.rawAnthropicBlock as { type?: unknown } | undefined;
+        return raw?.type !== "redacted_thinking";
+    };
+}
+
 /** [#651] Strip oversized reasoning from closed compress turns (see
  *  src/reasoning-drop.ts) with an ops log line when anything was dropped.
  *  Standalone form for callers holding an anchor-intact array (tests, ad-hoc

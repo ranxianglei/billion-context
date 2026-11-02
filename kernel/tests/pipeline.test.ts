@@ -37,6 +37,7 @@ test("defaultNodes exposes the canonical ordered pipeline", () => {
     "absorb-prompt",
     "filter",
     "hide-compress-calls",
+    "relocate-compress-carriers",
     "view-latch",
     "recommend",
     "nudge-inject",

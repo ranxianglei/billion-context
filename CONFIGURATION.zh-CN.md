@@ -276,6 +276,8 @@
 | `compress.maxSummaryLength` | number | kernel 20000 | — | 单条生成摘要的硬字符上限；超长的回复被整段拒绝（不截断、不重试）。外部摘要模型会被提前告知这个确切上限（#3635）。0 = 不限制。 |
 | `compress.minSummaryLength` | number | kernel 50 | — | 生成摘要的字符下限；过短的回复被整段拒绝。0 = 禁用。外部摘要模型受同一下限约束（#3635）。 |
 | `compress.reconcile` | "off" \| "warn" \| "repair" | "repair" | BILI_FOLD_RECONCILE | 客户端在轮次之间回退或改写历史时校准已折叠状态。 |
+| `compress.compressAtFoldPoint` | boolean | false | BILI_COMPRESS_AT_FOLD_POINT | 实验性，默认关闭：把仍可见的压缩调用/结果对从原位置（贴近尾部）移到它自己的折叠点，即 [已折叠区]–[调用对]–[保护消息]，避免弱注意力模型把历史末尾的工具交换当成新命令。纯视图变换：refs 与状态不变、每轮重算结果一致；关闭时布局字节级不变。 |
+| `compress.compressAtFoldPointClearThinking` | boolean | false | BILI_COMPRESS_AT_FOLD_POINT_CLEAR_THINKING | 依附于 compress.compressAtFoldPoint 的第二层开关：调用对被挪位的一瞬间，同时丢掉紧邻其前的未签名思考段（模型对本次折叠本身的思考），让挪位后的开头更干净。主开关关闭时无效；带签名的思考块与严格推理回显会话绝不受影响（#1658/#684）。 |
 | `compress.promptPack` | string (builtin: "default", "lean") | builtin "default" | — | 压缩提示词包，按 项目包 → 用户包 → 内置 解析；不受 acknowledgePromptsRisk 门控。 |
 | `compress.tiers` | boolean | true | — | T1→T3 分级蒸馏把折叠成本摊到多代。 |
 | `compress.protectedTools` | string[] | none | — | 全历史硬排除：列出工具的结果永不折叠。路径模式（skill/<name>）可按名指定 skill（#1947）。 |
@@ -1831,6 +1833,8 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_CLIENT_ERROR_BACKSTOP_MS` | `network.clientErrorBackstopMs` | 30000 |
 | `BILI_CODEARTS_REF` | `resign` | {} (armed; built-in scheme sdk-hmac-sha256) |
 | `BILI_CODEX_COMPACT` | `codexCompact` | "intercept" |
+| `BILI_COMPRESS_AT_FOLD_POINT` | `compress.compressAtFoldPoint` | false |
+| `BILI_COMPRESS_AT_FOLD_POINT_CLEAR_THINKING` | `compress.compressAtFoldPointClearThinking` | false |
 | `BILI_DECODED_BODY_BYTES` | `network.decodedBodyBytes` | 10737418240 |
 | `BILI_DECOMPRESS_TMP_CAP` | `decompressTmpCap` | 50 |
 | `BILI_DSH_AUTHORED_COMPACTION` | `dsh.authoredCompaction` | true (on, #3901 flip) |

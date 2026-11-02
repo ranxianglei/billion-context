@@ -276,6 +276,8 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `compress.maxSummaryLength` | number | kernel 20000 | — | Hard character cap on ONE generated summary; longer replies are rejected whole (no truncation, no retry). External summarizers are told this exact cap up front (#3635). 0 = unbounded. |
 | `compress.minSummaryLength` | number | kernel 50 | — | Character floor for generated summaries; shorter replies are rejected whole. 0 = disabled. External summarizers are held to the same floor (#3635). |
 | `compress.reconcile` | "off" \| "warn" \| "repair" | "repair" | BILI_FOLD_RECONCILE | Reconcile folded state when the client rewinds or rewrites history between turns. |
+| `compress.compressAtFoldPoint` | boolean | false | BILI_COMPRESS_AT_FOLD_POINT | EXPERIMENTAL, default off: move a still-visible compress call/result pair from its original (tail-adjacent) slot to its own fold point in the re-sent view, i.e. [folded region] – [pair] – [protected messages], so weak-attention models stop reading a trailing tool exchange as a fresh command. View-only transform: refs and state untouched, recomputed identically on every turn; off = byte-identical layout. |
+| `compress.compressAtFoldPointClearThinking` | boolean | false | BILI_COMPRESS_AT_FOLD_POINT_CLEAR_THINKING | Second opt-in riding on compress.compressAtFoldPoint: when the pair is repositioned, also drop the contiguous run of unsigned reasoning cores immediately preceding it (the model's thinking about this very fold), so the moved pair starts clean. Inert unless the main switch is on; signed thinking blocks and strict reasoning-echo sessions are never touched (#1658/#684). |
 | `compress.promptPack` | string (builtin: "default", "lean") | builtin "default" | — | Compression prompt pack, resolved project pack → user pack → builtin; not gated by acknowledgePromptsRisk. |
 | `compress.tiers` | boolean | true | — | Tiered T1→T3 distillation spreads folding cost across generations. |
 | `compress.protectedTools` | string[] | none | — | Hard exclusion across all history: results of listed tools never fold. Path patterns (skill/<name>) select skills by name (#1947). |
@@ -1848,6 +1850,8 @@ File keys resolve only when the matching env var is unset. Defaults in parenthes
 | `BILI_CLIENT_ERROR_BACKSTOP_MS` | `network.clientErrorBackstopMs` | 30000 |
 | `BILI_CODEARTS_REF` | `resign` | {} (armed; built-in scheme sdk-hmac-sha256) |
 | `BILI_CODEX_COMPACT` | `codexCompact` | "intercept" |
+| `BILI_COMPRESS_AT_FOLD_POINT` | `compress.compressAtFoldPoint` | false |
+| `BILI_COMPRESS_AT_FOLD_POINT_CLEAR_THINKING` | `compress.compressAtFoldPointClearThinking` | false |
 | `BILI_DECODED_BODY_BYTES` | `network.decodedBodyBytes` | 10737418240 |
 | `BILI_DECOMPRESS_TMP_CAP` | `decompressTmpCap` | 50 |
 | `BILI_DSH_AUTHORED_COMPACTION` | `dsh.authoredCompaction` | true (on, #3901 flip) |

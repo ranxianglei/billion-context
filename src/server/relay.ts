@@ -7,7 +7,7 @@ import { maybeRunInvariantJudge } from "../invariant-judge.js";
 import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
-import { type CompressionCore, type Config, type CoreMessage, defaultCountTokens, defaultPrompts, resolveOutputSteeringConfig } from "acp-kernel";
+import { type CompressionCore, type Config, type CoreMessage, defaultCountTokens, defaultPrompts, relocateCompressCarriers, resolveOutputSteeringConfig } from "acp-kernel";
 import { type BiliMessage } from "acp-kernel/wire";
 import { absorbToolName, applyAbsorbView } from "../absorb.js";
 import { APIG_RESIGN_SCHEME, resignApig } from "../apig-resign.js";
@@ -68,7 +68,8 @@ import { buildForwardHeaders, connectionNamedHeaders, RESPONSE_ONLY_STRIP_HEADER
 import { bodyDumpEnabled, logDumpFailure } from "./observability.js";
 import { effectiveAbsorbBlock } from "./prepare-responses.js";
 import { awaitDrain, bufferToStream, dumpStreamToFile, pipeThrough, readStreamToBuffer } from "./stream-io.js";
-import { buildForwardTarget, outboundPayloadBreakdown, registerRequestAbort, beginStreamKeepalive, effectiveTokenCount, googlePathKind, imageBillingFor, imageTokenCapFor, inboundResignCredential, outboundContextEstimates, repairResponsesAssistantOrdering, resolveUpstream, stripKernelSummaries, usageGradeInputBaseline, DOOMED_PROBE_ABSOLUTE_BYTES, DOOMED_PROBE_BYTES_PER_TOKEN, type Prepared } from "../server.js";
+import { buildForwardTarget, makeFoldPointReasoningDroppable, outboundPayloadBreakdown, registerRequestAbort, beginStreamKeepalive, effectiveTokenCount, googlePathKind, imageBillingFor, imageTokenCapFor, inboundResignCredential, outboundContextEstimates, repairResponsesAssistantOrdering, resolveUpstream, stripKernelSummaries, usageGradeInputBaseline, DOOMED_PROBE_ABSOLUTE_BYTES, DOOMED_PROBE_BYTES_PER_TOKEN, type Prepared } from "../server.js";
+import { isStrictReasoningEcho, modelIdOf } from "../strict-echo.js";
 
 /** Infer the wire protocol from the request path for compat-role rewrites on
  *  requests the pipeline did not prepare (passthrough). Mirrors the path
@@ -2086,6 +2087,12 @@ async function forwardCaptured(
             const absorbBlock = effectiveAbsorbBlock(prepared.pluginMode === true, config, opts.compress.absorb);
             const absorbActive = absorbBlock?.enabled === true && opts.compress.injectTool && !textProtocol;
             const loopConfig = ccrLoopConfig(prepared.session, { ...config, absorb: absorbActive ? absorbBlock : undefined });
+            // Experimental fold-point "thinking clear" (default OFF): install the
+            // kernel drop predicate only when BOTH switches are set; strict-echo
+            // and signed-thinking views yield none at all (#684/#1658).
+            if (loopConfig.compressAtFoldPointClearThinking) {
+                loopConfig.reasoningDroppable = makeFoldPointReasoningDroppable(prepared.originalMessages as BiliMessage[], isStrictReasoningEcho(prepared.session, targetOrigin, modelIdOf({ model: prepared.model })));
+            }
             // Cache-seam: the compress<->absorb join must be byte-identical to
             // the steady prepare* paths. Every steady wire joins the absorb
             // section with a plain "\n\n" (sysParts.join / injectSystem parts
@@ -2157,7 +2164,19 @@ async function forwardCaptured(
                     // it). Ephemeral acp_loop_* pairs are never re-sent by proxy-mode clients; stripping
                     // against them drops the only cross-turn summary carrier and breaks the byte-prefix
                     // at the fold anchor (post-fold cache floor reset to the stable head).
-                    const out = [...stripKernelSummaries(viewed as BiliMessage[], turn.state), ...(records as BiliMessage[])] as BiliMessage[];
+                    const outBase = [...stripKernelSummaries(viewed as BiliMessage[], turn.state), ...(records as BiliMessage[])] as BiliMessage[];
+                    // Fold-point carrier relocation round-2 mirror (switch A): with the
+                    // switch on, pairs sit at their fold point instead of being
+                    // tail-appended onto the re-request. Idempotent when processTurn's
+                    // node already moved them (view-only + deterministic transform).
+                    const out = loopConfig.compressAtFoldPoint
+                        ? relocateCompressCarriers(outBase as unknown as CoreMessage[], turn.state, {
+                            isCompressTool: loopConfig.isCompressTool,
+                            ...(loopConfig.compressAtFoldPointClearThinking && loopConfig.reasoningDroppable
+                                ? { clearThinking: true, reasoningDroppable: loopConfig.reasoningDroppable }
+                                : {}),
+                        }) as BiliMessage[]
+                        : outBase;
                     // [#1592] Mirror the steady path's per-wire post-processing EXACTLY:
                     // the reasoning drop each prepare* applied, and — only on the
                     // Responses wire — the run-ordering repair (#564). Applying the
