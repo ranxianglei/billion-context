@@ -67,7 +67,14 @@ export function probeRequestMembership(session: Session, ids: string[], payloadU
     // Needle discipline: only member / first-turn / main-scale requests may
     // move it — a tiny foreign payload must never own the needle, or the
     // next main turn would probe against the polluter's id and be gated.
-    const referenceScale = session.stats.lastInputTokens > 0 ? session.stats.lastInputTokens : (t.needlePayloadUpper ?? 0);
+    // #5500 family (kill-at-reader, #1839 discipline): an ESTIMATE-grade or
+    // unprovenanced scalar is an arming quantity, not a measurement — prefer
+    // the needle's own per-request scale over it. (The incoming payloadUpper
+    // rides the same char-bound caliber as a poisoned arm today, so the ratio
+    // self-normalizes; the gate makes the reference robust to any future
+    // caliber drift instead of silently skewing ~4x.)
+    const anchorGradeOk = session.stats.lastInputTokensSource === "usage" || session.stats.lastInputTokensSource === "overflow-arm";
+    const referenceScale = anchorGradeOk && session.stats.lastInputTokens > 0 ? session.stats.lastInputTokens : (t.needlePayloadUpper ?? 0);
     const mainScale = payloadUpper >= referenceScale * MEMBERSHIP_RECORD_SCALE_RATIO;
     if (member || mainScale) {
         t.latestKnownMsgId = ids[ids.length - 1];
