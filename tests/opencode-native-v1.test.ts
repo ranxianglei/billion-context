@@ -549,6 +549,21 @@ describe("derived-session inheritance report (#1362)", () => {
         }
     });
 
+    it("prefers data.fork.sessionID over parentID for UI user forks (#5509)", async () => {
+        const proxy = await startProxy();
+        try {
+            // User forks store parent_id NULL — the SDK exposes their lineage as
+            // data.fork.sessionID; a stale parentID must lose to it.
+            const client = { session: { get: async () => ({ data: { id: "ses_fork", parentID: "stale-parent", fork: { sessionID: "ses_real_parent", boundary: { type: "through", messageID: "msg_7" } } } }) } };
+            const hooks = createV1ServerHooks(() => proxy.origin, { client }, v1Deps());
+            await hooks["chat.headers"]?.({ sessionID: "ses_fork" }, { headers: {} });
+            await waitFor("register", () => proxy.registers.length >= 1);
+            assert.deepEqual(proxy.registers[0], { conversationId: "ses_fork", agent: "opencode", identity: true, parentConversationId: "ses_real_parent" });
+        } finally {
+            await proxy.close();
+        }
+    });
+
     it("root sessions (no parentID) send nothing extra", async () => {
         const proxy = await startProxy();
         try {

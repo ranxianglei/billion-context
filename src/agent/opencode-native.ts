@@ -720,7 +720,11 @@ export function createV1ServerHooks(getOrigin: () => string | undefined, ctx: V1
         void (async () => {
             try {
                 const res = await get({ path: { id: sid } });
-                const parent = res?.data?.parentID;
+                // #5509: UI user forks store parent_id NULL — their lineage rides
+                // data.fork.sessionID instead; prefer it, fall back to parentID.
+                const data = res?.data;
+                const forkParent = typeof data?.fork?.sessionID === "string" ? data.fork.sessionID : "";
+                const parent = forkParent.length > 0 ? forkParent : data?.parentID;
                 if (typeof parent === "string" && parent.length > 0 && parent !== sid) {
                     await postIdentityRegister(base, sid, "opencode", parent);
                     derivedReported.set(sid, "done");

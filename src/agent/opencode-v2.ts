@@ -50,7 +50,7 @@
 
 import { ACP_TOOLS_OPENAI, ABSORB_TOOL_OPENAI } from "../compress-tool.js";
 import { asciiHeaderValue, fetchManifest, fetchProxyVersion, fetchStatus, fitNoticeDescription, forwardTool, postIdentityRegister, proxyBaseFromEnv, proxyBaseFromUrl, reportCompactionBoundary, reportRuntimeInfoOnChange, V2_SYNTHETIC_TEXT } from "./shared.js";
-import { createForkAdopter } from "./fork-adopt.js";
+import { createForkAdopter, normalizeForkBoundary, type ForkBoundary } from "./fork-adopt.js";
 import { logHostEvent } from "./host-log.js";
 
 // OpenCode V2 TUI renders a synthetic message as a visible Notice row only when its display text fits the
@@ -270,9 +270,14 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
         const registrations: V2Registration[] = [];
 
         // #1362: derived-session inheritance for the V2 lane (same register
-        // channel as pi/omp/V1, #1333). Parents are learned from
-        // session.created events (wire shape probed on @opencode/cli 2.0.3:
-        // data.sessionID + optional data.parentID); each derived sid is then
+        // channel as pi/omp/V1, #1333). Parents are learned from session events:
+        // session.created (wire shape probed on @opencode/cli 2.0.3:
+        // data.sessionID + optional data.parentID) covers agent-spawned child
+        // sessions; session.forked (#5509, verified on @opencode/cli 2.x:
+        // data.sessionID + data.parentID + data.boundary {type:"before"|"through",
+        // messageID}) covers UI user forks — those rows carry parent_id NULL, so
+        // session.created alone never learns them and the child silently starts
+        // with zero inherited folds. Each derived sid is then
         // identity-registered once by its first stamped request. Fire-and-forget
         // with per-sid cooldown after failure; root sessions never report.
         // #2399 stage 3: fork-child adoption. derivedParent (below) is the
@@ -286,7 +291,7 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
         // identity register in reportDerived may claim the child id first —
         // the proxy's fork endpoint tolerates a same-parent claim (#2399 B).
         const forkAdopter = createForkAdopter((line) => logHostEvent("error", "[native-client]", `[bili-opencode] ${line}`));
-        const derivedParent = new Map<string, string>();
+        const derivedParent = new Map<string, { parent: string; boundary?: ForkBoundary }>();
         const derivedReported = new Map<string, "pending" | "done">();
         const derivedRetryAt = new Map<string, number>();
         const derivedRetryMs = options.derivedRetryMs ?? 10000;
@@ -295,10 +300,10 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
             if (!base || !sid || derivedReported.has(sid)) return;
             const retryAt = derivedRetryAt.get(sid);
             if (retryAt !== undefined && Date.now() < retryAt) return;
-            const parent = derivedParent.get(sid);
-            if (parent === undefined) return;
+            const lineage = derivedParent.get(sid);
+            if (lineage === undefined) return;
             derivedReported.set(sid, "pending");
-            void postIdentityRegister(base, sid, "opencode", parent).then(
+            void postIdentityRegister(base, sid, "opencode", lineage.parent).then(
                 () => {
                     derivedReported.set(sid, "done");
                 },
@@ -370,8 +375,8 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
             // #2399 stage 3: adopt the fork child before its first request
             // reaches the proxy (see the forkAdopter comment above).
             const forkChild = typeof e.sessionID === "string" ? e.sessionID : "";
-            const forkParent = derivedParent.get(forkChild);
-            if (forkChild.length > 0 && forkParent !== undefined && state.proxyBase) {
+            const forkLineage = derivedParent.get(forkChild);
+            if (forkChild.length > 0 && forkLineage !== undefined && state.proxyBase) {
                 let forkBody: unknown;
                 try {
                     // The structural type cannot know the runtime shape; opencode
@@ -382,7 +387,7 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
                 } catch {
                     forkBody = undefined;
                 }
-                await forkAdopter.maybeAdopt({ base: state.proxyBase, parent: forkParent, child: forkChild, body: forkBody });
+                await forkAdopter.maybeAdopt({ base: state.proxyBase, parent: forkLineage.parent, child: forkChild, body: forkBody, boundary: forkLineage.boundary });
             }
             // #3248 phase 2: incremental-turn divert (native adapters only —
             // the body swap must land after routing/stamping so the marker
@@ -647,7 +652,19 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
                             const data = evt.data;
                             const sid = data && typeof data.sessionID === "string" ? data.sessionID : "";
                             const parent = data && typeof data.parentID === "string" ? data.parentID : "";
-                            if (sid && parent && parent !== sid) derivedParent.set(sid, parent);
+                            if (sid && parent && parent !== sid) derivedParent.set(sid, { parent });
+                            continue;
+                        }
+                        // #5509: UI user forks announce themselves here — their
+                        // session rows carry parent_id NULL, so only this event
+                        // (plus Session.Info.fork on the V1 SDK) exposes the
+                        // lineage. The boundary rides along for branch-point
+                        // capping when its message is locatable by rawId.
+                        if (evt?.type === "session.forked") {
+                            const data = evt.data;
+                            const sid = data && typeof data.sessionID === "string" ? data.sessionID : "";
+                            const parent = data && typeof data.parentID === "string" ? data.parentID : "";
+                            if (data !== undefined && sid && parent && parent !== sid) derivedParent.set(sid, { parent, boundary: normalizeForkBoundary(data.boundary) });
                             continue;
                         }
                         if (evt?.type !== "session.compaction.ended" || pluginDisabled()) continue;
