@@ -181,7 +181,7 @@ test("v3 databases migrate to v11 in place, idempotently", async () => {
         } finally {
             migrated.close();
         }
-        // Reopening a v10 database is a no-op (idempotent migration).
+        // Reopening a v11 database is a no-op (idempotent migration).
         const again = UnifiedStore.open(dbPath);
         const ver2 = (again as unknown as { db: { prepare(q: string): { get(): unknown } } }).db.prepare("PRAGMA user_version").get() as { user_version: number };
         assert.equal(ver2.user_version, 11);

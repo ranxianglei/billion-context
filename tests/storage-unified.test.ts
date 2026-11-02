@@ -838,7 +838,7 @@ test("schema v10: v9→v10 migration adds messages.ts without backfill; idempote
     const dbPath = path.join(dir, "index.db");
     try {
         const { DatabaseSync } = await import("node:sqlite");
-        // Fresh install (v10 DDL), one row with a known ts, then knock the
+        // Fresh install (v11 DDL), one row with a known ts, then knock the
         // library back to a v9 shape: drop the column (SQLite ≥3.35), stamp
         // user_version=9.
         const store = UnifiedStore.open(dbPath);
@@ -863,7 +863,7 @@ test("schema v10: v9→v10 migration adds messages.ts without backfill; idempote
         } finally {
             reopened.close();
         }
-        // Idempotence arm: reopen a stamped v10 — no ALTER may run twice.
+        // Idempotence arm: reopen a stamped v11 — no ALTER may run twice.
         const again = UnifiedStore.open(dbPath);
         again.close();
     } finally {
