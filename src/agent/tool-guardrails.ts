@@ -282,7 +282,7 @@ function resolveRepetition(g: GuardrailOptions["repetition"]): { enabled: boolea
     const obj = g && typeof g === "object" ? g : {};
     const warn = positiveInt(obj.warn, REPETITION_GUARD_DEFAULTS.warn);
     const abort = Math.max(positiveInt(obj.abort, REPETITION_GUARD_DEFAULTS.abort), warn + 1);
-    const backstopEnabled = (obj as { backstopEnabled?: boolean }).backstopEnabled === true;
+    const backstopEnabled = (obj as { backstopEnabled?: boolean }).backstopEnabled !== false;
     return { enabled: obj.enabled !== false, warn, abort, backstopEnabled };
 }
 
