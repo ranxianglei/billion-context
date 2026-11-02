@@ -956,6 +956,15 @@ function changelogCatOf(rawLine) {
             // keep the stale paint; the cache keeps its old timestamp, so the next visit retries
         }).then(function () { blogRefreshBusy = false; });
     }
+    // Per-post discussion thread: the thread number is data, not inference — it reaches
+    // the client as item.discussion once the server-side passthrough lands (separate PR,
+    // see PR body) and the pipeline records a number for the post. Exact direct link only;
+    // a post without a recorded number simply shows no button (no guessed search URL).
+    function blogDiscussionUrl(item) {
+        return (typeof item.discussion === "number" && item.discussion > 0)
+            ? "https://github.com/ranxianglei/billion-context/discussions/" + item.discussion
+            : null;
+    }
     async function loadBlog(sub) {
         const host = $("bl-list");
         if (!host) return;
@@ -985,7 +994,13 @@ function changelogCatOf(rawLine) {
             const kindLabel = item.kind === "post" ? t("bl.kind_post") : t("bl.kind_article");
             const title = zhOn && item.titleZh ? item.titleZh : (item.title || "");
             const html = zhOn ? (item.htmlZh || item.html || "") : (item.html || "");
-            host.innerHTML = offlineNote + '<div class="card"><div class="card-b"><span class="mono bl-date">' + escapeHtml(item.date || "\u2014") + '</span><span class="badge">' + escapeHtml(kindLabel) + '</span><a href="#/blog" class="bl-back">' + escapeHtml(t("bl.back")) + "</a></div>"
+            const dUrl = blogDiscussionUrl(item);
+            const commentLink = dUrl ? '<a class="bl-back" href="' + dUrl + '" target="_blank" rel="noopener">' + escapeHtml(t("bl.comment")) + "</a>" : "";
+            // Per-article language pin: ?lang= outranks the saved UI language (#2321), so plain
+            // links double as an in-page EN|中文 toggle. Labels stay self-describing on purpose.
+            const subHref = "#/blog/" + encodeURIComponent(String(item.id));
+            const langToggle = '<a class="bl-back" href="?lang=en' + subHref + '">EN</a> <a class="bl-back" href="?lang=zh' + subHref + '">\u4e2d\u6587</a>';
+            host.innerHTML = offlineNote + '<div class="card"><div class="card-b"><span class="mono bl-date">' + escapeHtml(item.date || "\u2014") + '</span><span class="badge">' + escapeHtml(kindLabel) + '</span><a href="#/blog" class="bl-back">' + escapeHtml(t("bl.back")) + "</a> " + langToggle + " " + commentLink + "</div>"
                 + '<h3 class="bl-h">' + escapeHtml(title) + "</h3>"
                 + '<div class="card-b post-body">' + html + "</div></div>";
             return;
@@ -3871,6 +3886,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             tsRow.inp.checked = cp ? cp.messageTimestamps !== false : true;
             const ab = (cp && cp.absorb && typeof cp.absorb === "object" && !Array.isArray(cp.absorb)) ? cp.absorb : null;
             abRow.inp.checked = ab ? ab.enabled === true : false;
+            cafRow.inp.checked = cp ? cp.compressAtFoldPoint === true : false;
             const pv = (cp && typeof cp.promptPack === "string") ? cp.promptPack : "default";
             while (packSel.options.length > 0) packSel.removeChild(packSel.lastChild);
             (packNames.length ? packNames : ["default", "lean"]).forEach((name) => {
@@ -4038,6 +4054,26 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             }
         }));
         void tsRow.ctl;
+        // #5470 fold-point carrier relocation — default OFF (opt-in); uncheck
+        // deletes the key so the file stays clean (mirrors the absorb row).
+        const cafRow = row("quick-compress-at-fold-point", t("cfg.q_cafp"));
+        qCtrls.push(cafRow.inp);
+        cafRow.inp.addEventListener("change", () => commit((d) => {
+            if (cafRow.inp.checked) {
+                if (!compressOf(d)) d.compress = {};
+                d.compress.compressAtFoldPoint = true;
+            } else {
+                const c = compressOf(d);
+                if (c) {
+                    delete c.compressAtFoldPoint;
+                    if (Object.keys(c).length === 0) delete d.compress;
+                }
+            }
+        }));
+        const cafHint = document.createElement("span");
+        cafHint.className = "dim small";
+        cafHint.textContent = t("cfg.q_cafp_hint");
+        cafRow.ctl.appendChild(cafHint);
         const pw = document.createElement("div");
         pw.style.cssText = "display:flex;gap:12px;align-items:center;flex-wrap:wrap";
         const plab = document.createElement("label");
