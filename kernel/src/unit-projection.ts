@@ -368,6 +368,10 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
   // leaves a valid message stream and stays allowed (#564 depends on it), so
   // only turns whose KEPT side carries a tool-call while the FOLDED side
   // carries the reasoning are withdrawn, entirely (all members stay visible).
+  // Signed thinking-family blocks are the exception (#4885 INV3): a run of
+  // consecutive assistant messages carrying one rebuilds into ONE provider
+  // message, so a partially folded signed run is withdrawn wholesale in
+  // either direction — leaving part of it behind orphans the signature.
   // The same carve can also strip a call and its result onto opposite sides of
   // the fold. Either half alone is invalid — a visible call whose result folded
   // is an unanswered tool_call_id, a visible result whose call folded answers
@@ -375,7 +379,7 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
   // visible. Whole pairs may still fold while the turn's reasoning and text
   // stay visible (#564).
   //
-  // Both invariants are re-checked to a fixed point inside
+  // All three invariants are re-checked to a fixed point inside
   // computeIntegrityWithdrawals: withdrawing a pair for the result half can
   // strand a turn whose reasoning still folds and whose call now stays visible.
   {
