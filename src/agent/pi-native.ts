@@ -217,6 +217,8 @@ export async function verifyAttachAndRecover(attachOrigin: string): Promise<stri
     state.origin = undefined;
     const start = singleFlight(_spawnForTest ?? bootstrap);
     state.respawn = start;
+    // #5507: same in-flight-spawn hold as the plan-time arm below (#4516).
+    state.spawnWaitMs = SPAWN_BUDGET_MS + 10_000;
     // Publish whatever origin lands on BOTH the shared state and the env —
     // env readers (compaction reporter, /acp status) must never disagree with
     // what the route resolves, whoever produced the origin.
@@ -346,6 +348,18 @@ if (process.env.NODE_TEST_CONTEXT === undefined && plan.mode !== "off") {
 /** Test hook: expose the armed runtime-recovery seam (mirrors opencode/dsh). */
 export function _stateRespawnForTest(): (() => Promise<string | undefined>) | undefined {
     return state.respawn;
+}
+
+/** Test hook (#5507): expose the in-flight-respawn hold budget armed by the
+ *  launcher-spawn transitions (undefined = generic readiness cap applies). */
+export function _spawnWaitMsForTest(): number | undefined {
+    return state.spawnWaitMs;
+}
+
+/** Test hook (#5507): expose the shared intercept state so a suite can await
+ *  readiness and observe which origin attached. */
+export function _nativeStateForTest(): NativeInterceptState {
+    return state;
 }
 
 /** Test hook (#1365): record routed-channel evidence without the fetch patch. */

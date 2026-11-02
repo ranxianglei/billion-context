@@ -21,7 +21,7 @@
 // /bili/ rewrite launch (BILI_PROVIDER_REWRITES) or an opt-out
 // (BILLION_CONTEXT_PLUGIN=0 / BILI_NATIVE_OMP=0).
 
-import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST } from "../launcher.js";
+import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST, SPAWN_BUDGET_MS } from "../launcher.js";
 import { createBiliPlugin } from "./pi.js";
 import { applyOmpFirstEventTimeout, markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, setNativeOriginWaiter, singleFlight } from "./native-bootstrap.js";
 import { installNativeFetchIntercept, noteRoutedOrigin, observeRoutedOrigin, readyOrigin, type NativeInterceptState } from "./native-intercept.js";
@@ -309,6 +309,9 @@ export async function verifyAttachAndRecover(attachOrigin: string): Promise<stri
 
     const start = singleFlight(_spawnForTest ?? bootstrap);
     state.respawn = start;
+    // #5507: requests racing THIS in-flight launcher spawn hold under the
+    // launcher's own bring-up budget too (rationale at the plan-time arm).
+    state.spawnWaitMs = SPAWN_BUDGET_MS + 10_000;
     // Publish whatever origin lands on BOTH the shared state and the env —
     // env readers (compaction reporter, /acp status) must never disagree with
     // what the route resolves, whoever produced the origin.
@@ -365,6 +368,13 @@ export function armNativeOmp(p: typeof plan): void {
     } else if (process.env.NODE_TEST_CONTEXT === undefined) {
         const start = singleFlight(bootstrap);
         state.respawn = start;
+        // #5507: a request may hold out for an IN-FLIGHT spawn under the
+        // launcher's own bring-up budget (+margin for health settle) instead of
+        // degrading at the generic 15s readiness cap — same seam pi carries since
+        // #4516 (its #4515 report); this lane previously held only the 15s cap
+        // while its spawn budget was 60s. The attach-mode fallback above arms
+        // the same hold.
+        state.spawnWaitMs = SPAWN_BUDGET_MS + 10_000;
         // #1531: pi-native's #1243 pattern — before_provider_request reads the
         // proxy base from BILLION_CONTEXT_PROXY, which bootstrap() writes
         // asynchronously. Publish the ready promise so the awaited runtime-info
@@ -425,6 +435,18 @@ export function _stateRespawnForTest(): (() => Promise<string | undefined>) | un
     return state.respawn;
 }
 
+/** Test hook (#5507): expose the in-flight-respawn hold budget armed by the
+ *  launcher-spawn transitions (undefined = generic readiness cap applies). */
+export function _spawnWaitMsForTest(): number | undefined {
+    return state.spawnWaitMs;
+}
+
+/** Test hook (#5507): expose the shared intercept state so a suite can await
+ *  readiness and observe which origin attached. */
+export function _nativeStateForTest(): NativeInterceptState {
+    return state;
+}
+
 /** Test hook (#1365): record routed-channel evidence without the fetch patch. */
 export function _noteRoutedForTest(url: string): void {
     noteRoutedOrigin(state, url);
@@ -439,6 +461,7 @@ export function _resetNativeStateForTest(): void {
     state.onRoutedOriginObserved = undefined;
     state.respawn = undefined;
     state.onGiveUp = undefined;
+    state.spawnWaitMs = undefined;
     state.ready = Promise.resolve(undefined);
     _spawnForTest = undefined;
     delete process.env.BILLION_CONTEXT_PROXY;
