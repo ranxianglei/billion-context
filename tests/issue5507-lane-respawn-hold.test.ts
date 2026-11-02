@@ -7,6 +7,9 @@
 // mechanism is pinned in tests/issue4516-pi-direct-fallback.test.ts; this suite
 // pins the LANE arming: each launcher-spawn transition arms
 // state.spawnWaitMs = SPAWN_BUDGET_MS + margin, and a healthy attach never does.
+// It also pins the RESOLVER-side consumption: OpenCode 2.x model traffic resolves
+// through createLiveOriginResolver, which must honor the armed budget too —
+// without that read the hold never applied to opencode's primary path.
 
 import test, { afterEach } from "node:test";
 import assert from "node:assert/strict";
@@ -19,6 +22,7 @@ import { apply as dshApply, _resetRegisterForTest as dshReset, _setSpawnForTest 
 import { planNativeOmp, armNativeOmp, _resetNativeStateForTest as ompReset, _setSpawnForTest as ompSetSpawn, _spawnWaitMsForTest as ompHold, _nativeStateForTest as ompNativeState } from "../src/agent/omp-native.ts";
 import { planNativeOpencode, armNativeOpencode, _resetNativeStateForTest as ocReset, _setSpawnForTest as ocSetSpawn, _spawnWaitMsForTest as ocHold, _nativeStateForTest as ocNativeState } from "../src/agent/opencode-native.ts";
 import { planNativePi, armNativePi, _resetNativeStateForTest as piReset, _setSpawnForTest as piSetSpawn, _spawnWaitMsForTest as piHold, _nativeStateForTest as piNativeState } from "../src/agent/pi-native.ts";
+import { createLiveOriginResolver, type NativeInterceptState } from "../src/agent/native-intercept.ts";
 import { rmrf } from "./tmp-rm.ts";
 
 delete process.env.BILLION_CONTEXT_ATTACH;
@@ -186,3 +190,44 @@ for (const lane of LANES) {
         }
     });
 }
+
+// ———— V2 live-origin resolver consumes the armed hold (#5507) ——————————————
+// Arming is only half the seam: OpenCode 2.x model traffic resolves through
+// createLiveOriginResolver, which awaited readiness under the generic cap even
+// when spawnWaitMs was armed — so on 2.x hosts the hold never applied to
+// opencode at all. Both directions pinned: an armed state adopts a respawn that
+// lands after the generic cap but inside the armed budget; a disarmed state
+// still degrades at the generic cap (no silent 70s holds everywhere).
+
+const LATE_ORIGIN = "http://127.0.0.1:49999";
+
+function lateSpawnResolver(armed: boolean): { resolve: () => Promise<string | undefined>; landedNow: () => boolean } {
+    let landed = false;
+    const state: NativeInterceptState = {
+        origin: undefined,
+        ready: Promise.resolve(undefined),
+        readyTimeoutMs: 100,
+        ...(armed ? { spawnWaitMs: 600 } : {}),
+        respawn: () => new Promise<string | undefined>((resolveSpawn) => {
+            setTimeout(() => {
+                landed = true;
+                resolveSpawn(LATE_ORIGIN);
+            }, 400);
+        }),
+    };
+    return { resolve: createLiveOriginResolver(state, { probe: async () => true }), landedNow: () => landed };
+}
+
+test("#5507 v2-route: an armed hold adopts a respawn landing past the generic cap", async () => {
+    const { resolve, landedNow } = lateSpawnResolver(true);
+    const origin = await resolve();
+    assert.equal(origin, LATE_ORIGIN, "the spawn lands at 400ms, inside the 600ms armed budget but past the 100ms generic cap — it must be adopted");
+    assert.ok(landedNow(), "adoption implies the wait actually held out for the landing");
+});
+
+test("#5507 v2-route: a disarmed state degrades at the generic cap before a late spawn lands", async () => {
+    const { resolve, landedNow } = lateSpawnResolver(false);
+    const origin = await resolve();
+    assert.equal(origin, undefined, "no armed budget → no extended hold");
+    assert.equal(landedNow(), false, "the decision was made at the 100ms cap, before the 400ms landing");
+});

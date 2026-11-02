@@ -1113,9 +1113,12 @@ export async function withTimeout<T>(p: Promise<T>, ms: number): Promise<T | und
     }
 }
 
-export async function readyOrigin(state: NativeInterceptState): Promise<string | undefined> {
+export async function readyOrigin(state: NativeInterceptState, waitBudgetMs?: number): Promise<string | undefined> {
     if (state.origin !== undefined) return state.origin;
-    return withTimeout(state.ready, state.readyTimeoutMs ?? 15000);
+    // #5507: waitBudgetMs overrides the generic readiness cap for callers holding
+    // an in-flight launcher respawn under the bring-up budget (the V2 resolver);
+    // other callers keep the readyTimeoutMs semantics unchanged.
+    return withTimeout(state.ready, waitBudgetMs ?? state.readyTimeoutMs ?? 15000);
 }
 
 // ———— Routed-channel evidence (#1365) ————————————————————————————
@@ -1381,7 +1384,11 @@ export function createLiveOriginResolver(state: NativeInterceptState, deps: Live
             busyEpisodes.clear();
             state.ready = state.respawn();
         }
-        const o = await readyOrigin(state);
+        // #5507: same in-flight-respawn hold as the fetch-intercept #4516 branch —
+        // an armed lane waits out the launcher's own bring-up budget instead of
+        // the generic readiness cap. This resolver is opencode's model-traffic
+        // path, so without it the armed spawnWaitMs was never read on OpenCode 2.x.
+        const o = await readyOrigin(state, state.spawnWaitMs);
         if (o !== undefined) {
             const v = await probe(o);
             if (v.state === "alive") {
