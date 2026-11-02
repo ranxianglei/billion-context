@@ -87,7 +87,8 @@ test("#5225: rapid identical loop escalates staged — refusal at 5, kill only o
     assert.equal(abortAfterFifth, 0, "the refusal must NOT kill the turn — one live chance to change approach");
     assert.equal((sixth as { block?: boolean })?.block, true, "the identical repeat after the refusal is blocked");
     assert.match((sixth as { reason?: string })?.reason ?? "", /BLOCKED/);
-    assert.equal(w.ctx.abortCalls, 1, "turn aborted exactly once, at the repeat after the final refusal");
+    // #5505: soft stop at count 6-9 (no ctx.abort); hard-abort at call 10
+    assert.equal(w.ctx.abortCalls, 0, "call 6 is soft-stopped (no ctx.abort)");
 });
 
 test("#5225: rapid loop escapes the final refusal via ONE longer wait (staging composes with polling advice)", () => {
@@ -154,7 +155,7 @@ test("#5225: user input still resets a polling run (cancellation path preserved)
 const T0 = 1_000_000;
 
 test("RepetitionTracker: a prior identical call that ran >= 5s restarts the run (#5225)", () => {
-    const t = new RepetitionTracker({ warn: 3, abort: 5 });
+    const t = new RepetitionTracker({ warn: 3, abort: 5, backstopEnabled: true });
     assert.equal(t.note("wait", { seconds: 10 }, "a1", T0).action, "none");
     t.complete("a1", T0 + 10_000);
     assert.equal(t.note("wait", { seconds: 10 }, "a2", T0 + 11_000).count, 1, "slow prior call restarts the run");
@@ -164,7 +165,7 @@ test("RepetitionTracker: a prior identical call that ran >= 5s restarts the run 
 });
 
 test("RepetitionTracker: fast identical calls escalate staged — final-refuse at 5, abort at 6 (fail-safe unchanged)", () => {
-    const t = new RepetitionTracker({ warn: 3, abort: 5 });
+    const t = new RepetitionTracker({ warn: 3, abort: 5, backstopEnabled: true });
     let d = { action: "none" as string, count: 0 };
     for (let i = 1; i <= 5; i++) {
         d = t.note("w", {}, `f${i}`, T0 + i * 100);
@@ -178,7 +179,7 @@ test("RepetitionTracker: fast identical calls escalate staged — final-refuse a
 });
 
 test("RepetitionTracker: duration evidence without any complete() leaves count-only behavior standing", () => {
-    const t = new RepetitionTracker({ warn: 3, abort: 5 });
+    const t = new RepetitionTracker({ warn: 3, abort: 5, backstopEnabled: true });
     for (let i = 1; i <= 4; i++) {
         t.note("w", {}, `n${i}`, T0 + i * 10);
     }
@@ -187,14 +188,14 @@ test("RepetitionTracker: duration evidence without any complete() leaves count-o
 });
 
 test("RepetitionTracker: exactly-at-threshold duration counts as slow (>= boundary)", () => {
-    const t = new RepetitionTracker({ warn: 3, abort: 5 });
+    const t = new RepetitionTracker({ warn: 3, abort: 5, backstopEnabled: true });
     t.note("w", {}, "g1", T0);
     t.complete("g1", T0 + 5000);
     assert.equal(t.note("w", {}, "g2", T0 + 6000).count, 1, "boundary: >= 5000ms resets");
 });
 
 test("RepetitionTracker: a 4999ms prior call does NOT reset (just under threshold)", () => {
-    const t = new RepetitionTracker({ warn: 3, abort: 5 });
+    const t = new RepetitionTracker({ warn: 3, abort: 5, backstopEnabled: true });
     for (let i = 1; i <= 3; i++) {
         const id = `s${i}`;
         t.note("w", {}, id, T0 + i * 100);
@@ -204,7 +205,7 @@ test("RepetitionTracker: a 4999ms prior call does NOT reset (just under threshol
 });
 
 test("RepetitionTracker: duration evidence for a different fingerprint never resets the run", () => {
-    const t = new RepetitionTracker({ warn: 3, abort: 5 });
+    const t = new RepetitionTracker({ warn: 3, abort: 5, backstopEnabled: true });
     t.note("w", {}, "h1", T0);
     t.complete("h1", T0 + 100);
     t.note("other", { x: 1 }, "h2", T0 + 200);
@@ -215,11 +216,44 @@ test("RepetitionTracker: duration evidence for a different fingerprint never res
 });
 
 test("RepetitionTracker.reset() clears pending timing and completed evidence", () => {
-    const t = new RepetitionTracker({ warn: 3, abort: 5 });
+    const t = new RepetitionTracker({ warn: 3, abort: 5, backstopEnabled: true });
     t.note("w", {}, "r1", T0);
     t.complete("r1", T0 + 10_000);
     t.reset();
     t.note("w", {}, "r2", T0 + 20_000);
     t.complete("r2", T0 + 20_100);
     assert.equal(t.note("w", {}, "r3", T0 + 21_000).count, 2, "post-reset run counts normally (fast evidence honored)");
+});
+
+test("RepetitionTracker: pendingStarts stays empty when handler cleans up blocked calls (#5505)", () => {
+    // Simulates the wire handler calling note() then complete() for each
+    // blocked call (final-refuse at 5, soft stop 6-9, hard-abort at 10).
+    // Executed calls (1-4) are completed via tool_result events.
+    // After all calls, pendingStarts must be empty — no leaks.
+    const t = new RepetitionTracker({ warn: 3, abort: 5, backstopEnabled: true });
+    const id = (n: number) => `b${n}`;
+    // Calls 1-2: execute normally — tool_result calls complete()
+    t.note("w", {}, id(1), T0);
+    t.complete(id(1), T0 + 100);
+    t.note("w", {}, id(2), T0 + 200);
+    t.complete(id(2), T0 + 300);
+    // Call 3: warning — call was executed, tool_result completes it
+    assert.equal(t.note("w", {}, id(3), T0 + 400).action, "warn");
+    t.complete(id(3), T0 + 500); // tool_result cleanup
+    // Call 4: warning — call was executed, tool_result completes it
+    assert.equal(t.note("w", {}, id(4), T0 + 600).action, "warn");
+    t.complete(id(4), T0 + 700); // tool_result cleanup
+    // Call 5: final-refuse — handler calls complete() before returning { block: true }
+    assert.equal(t.note("w", {}, id(5), T0 + 800).action, "final-refuse");
+    t.complete(id(5), T0 + 800); // handler cleanup
+    // Calls 6-9: abort (soft stop) — handler calls complete() before returning { block: true }
+    for (let i = 6; i <= 9; i++) {
+        assert.equal(t.note("w", {}, id(i), T0 + i * 100).action, "abort");
+        t.complete(id(i), T0 + i * 100); // handler cleanup
+    }
+    // Call 10: hard-abort (backstop) — handler calls complete() BEFORE ctx.abort()
+    assert.equal(t.note("w", {}, id(10), T0 + 1100).action, "hard-abort");
+    t.complete(id(10), T0 + 1100); // handler cleanup (BEFORE ctx.abort)
+    // After all blocked calls, pendingStarts must be empty
+    assert.equal((t as any).pendingStarts.size, 0, "pendingStarts must be empty — no leaks");
 });
