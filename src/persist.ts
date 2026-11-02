@@ -43,7 +43,7 @@ import { toLegacyLike, type LegacySessionLike } from "./storage/ingest.js";
 import { sha256Hex, type CheckpointRow, type MessageRefContentRow } from "./storage/store.js";
 import { contentStoreOf } from "./store.js";
 import type { WireProtocol } from "./util.js";
-import { currentContextObservation, CALIBRATION_CLAMP_MAX, CALIBRATION_CLAMP_MIN, CALIBRATION_SAMPLE_MAX, CALIBRATION_SAMPLE_MIN, CALIBRATION_SAMPLE_WINDOW } from "./cache-ledger.js";
+import { currentContextObservation, canonicalJson, CALIBRATION_CLAMP_MAX, CALIBRATION_CLAMP_MIN, CALIBRATION_SAMPLE_MAX, CALIBRATION_SAMPLE_MIN, CALIBRATION_SAMPLE_WINDOW } from "./cache-ledger.js";
 
 /**
  * On-disk persistence for proxy sessions.
@@ -483,7 +483,10 @@ export class SessionStore {
      *  kernel-internal debounce cannot observe its own landing, which left every
      *  per-turn debounced save unstamped and killed the ownership fast path. */
     private readonly saveTimers = new Map<string, ReturnType<typeof setTimeout>>();
-    private readonly saveBuilders = new Map<string, () => PersistedSession>();
+    /** #5506: the armed builder plus a slot capturing the record it BUILT —
+     *  settle handlers need the built bytes to prove what landed (the builder
+     *  runs inside the kernel write chain; only this slot observes its output). */
+    private readonly saveBuilders = new Map<string, { build: () => PersistedSession; rec: PersistedSession | null }>();
     /** #5155/#4788 D2: afterNextFlush waiters — drained with a success verdict
      *  (true = a landing proof exists, false = no proof / failed settle) when
      *  the armed save settles. Callers may decline unsafe follow-up work (the
@@ -507,7 +510,17 @@ export class SessionStore {
      *  behind disk-narrow-read loaders loses nothing; any newer mutation keeps
      *  the gate closed until its own save lands. Absent entry = this process
      *  has no disk proof for the id yet → treated as unsaved (conservative). */
-    private readonly durableRevision = new Map<string, number>();
+     private readonly durableRevision = new Map<string, number>();
+    /** #5506: fingerprint of the METADATA BYTES last proven on disk per id (the
+     *  persisted shape — live metadata plus biliVersion/storageMode stamps).
+     *  dropResidentMetadata folds only when the live view matches: the lazy
+     *  proxy re-materializes from disk alone, so an unsaved direct mutation
+     *  (no markDirty → no revision bump → the durableRevision equality gate
+     *  cannot see it) would be orphaned by an ungated fold. Recorded only on
+     *  confirmed commits — a fenced/aborted async write must not prove bytes
+     *  that never landed. Absent entry = nothing locally proven yet → the fold
+     *  stays closed (conservative, same failure direction as durableRevision). */
+    private readonly committedMetaFp = new Map<string, string>();
     /** #4788 D1-A: hard-cap warn timestamp per id (60 s throttle). */
     private readonly capWarnAt = new Map<string, number>();
     private readonly debounceMs: number;
@@ -797,7 +810,9 @@ export class SessionStore {
                 // clamped by buildSession — rewrite the stale file so the
                 // negative value is gone from disk.
                 const warmProof = session.revisionEpoch; // #4788 D2
-                await this.store.writeNow(id, () => this.buildRecordForSave(session));
+                const warmRec: { v: PersistedSession | null } = { v: null };
+                await this.store.writeNow(id, () => { const r = this.buildRecordForSave(session); warmRec.v = r; return r; });
+                if (warmRec.v) this.committedMetaFp.set(id, this.metaFingerprint(warmRec.v.metadata ?? {})); // #5506: clamp rewrite landed
                 this.noteDurable(id, warmProof); // clamp rewrite landed
                 clamped++;
                 // #3049: the clamp rewrite writes a DIFFERENT payload than any
@@ -1303,7 +1318,9 @@ export class SessionStore {
             }
             session.id = label;
             const rekeyProof = session.revisionEpoch; // #4788 D2
-            await this.store.writeNow(label, () => this.buildRecordForSave(session));
+            const rekeyRec: { v: PersistedSession | null } = { v: null };
+            await this.store.writeNow(label, () => { const r = this.buildRecordForSave(session); rekeyRec.v = r; return r; });
+            if (rekeyRec.v) this.committedMetaFp.set(label, this.metaFingerprint(rekeyRec.v.metadata ?? {})); // #5506: rekey rewrite landed
             this.noteDurable(label, rekeyProof); // rekey rewrite landed
             // #3049: direct write bypassing guardedBuild — the boot rekey
             // rewrites envelopes without the sidecar ingest, so any prior
@@ -2511,6 +2528,7 @@ export class SessionStore {
         record.savedAt = Date.now();
         record.meta = { ...record.meta, restoredFrom: cp.session_id, restoredCheckpoint: cp.cp_id } as PersistedSession["meta"];
         await this.store.writeNow(newId, () => record);
+        this.committedMetaFp.set(newId, this.metaFingerprint(record.metadata ?? {})); // #5506: replica restore landed
         shadow.record(record);
         // #3049: the replica record was ingested from the checkpoint payload
         // — the ownership token must mirror exactly those counters.
@@ -2918,8 +2936,9 @@ export class SessionStore {
                 const proofRevision = session.revisionEpoch;
                 let settledOk = false;
                 try {
-                    this.guardedBuild(session)();
+                    const rec = this.guardedBuild(session)();
                     this.maybeCutForkBase(session);
+                    this.committedMetaFp.set(session.id, this.metaFingerprint(rec.metadata ?? {})); // #5506: index-only build landed
                     // #4788 D2: the index-only build landed synchronously —
                     // run the same settle protocol as a kernel-write land
                     // (invariant #5: this routing path gets equivalent
@@ -2956,14 +2975,22 @@ export class SessionStore {
         if (!this.enabled) return;
         this.tryRecoverSidecar(); // #5188: dirty activity is the "still wanted" signal for a lost sidecar
         const id = session.id;
-        this.saveBuilders.set(id, this.guardedBuild(session));
+        // #5506: wrap so the settle handler can fingerprint what THIS armed
+        // save built (the builder runs inside the kernel chain, out of reach
+        // of the .then — only this slot observes its output).
+        const guarded = this.guardedBuild(session);
+        const armed: { build: () => PersistedSession; rec: PersistedSession | null } = {
+            build: () => { const r = guarded(); armed.rec = r; return r; },
+            rec: null,
+        };
+        this.saveBuilders.set(id, armed);
         const existing = this.saveTimers.get(id);
         if (existing) return;
         const timer = setTimeout(() => {
             this.saveTimers.delete(id);
-            const build = this.saveBuilders.get(id);
+            const armed = this.saveBuilders.get(id);
             this.saveBuilders.delete(id);
-            if (!build) return;
+            if (!armed) return;
             // #4788 D2: prove what THIS write covers BEFORE the chain starts
             // building (the closure reads live state at chain-run time; newer
             // mutations can only ride along — the spill gate's equality check
@@ -2973,8 +3000,9 @@ export class SessionStore {
             // Errors are logged inside the kernel write chain; swallowing here
             // keeps a failed timer write from becoming an unhandledRejection.
             this.saveWritesInFlight.add(id);
-            void this.store.writeNow(id, build).then(() => {
+            void this.store.writeNow(id, armed.build).then(() => {
                 this.stampOwnWrite(id); // #3406: the write LANDED — prove our bytes are on disk
+                if (armed.rec) this.committedMetaFp.set(id, this.metaFingerprint(armed.rec.metadata ?? {})); // #5506: debounced save landed
                 this.noteDurable(id, proofRevision);
                 this.lastSaveLanded.set(id, true);
                 // #4788 D2: discharge the droppable fields once the debounced
@@ -3146,8 +3174,9 @@ export class SessionStore {
             // sync build subsumes it; later mutations re-arm on their own.
             this.writerOffPending.delete(session.id);
             const proofRevision = session.revisionEpoch; // #4788 D2: capture BEFORE the sync build
-            this.guardedBuild(session)();
+            const rec = this.guardedBuild(session)();
             this.maybeCutForkBase(session);
+            this.committedMetaFp.set(session.id, this.metaFingerprint(rec.metadata ?? {})); // #5506: index-only build landed
             this.noteDurable(session.id, proofRevision); // #4788 D2: index-only build landed
             this.lastSaveLanded.set(session.id, true);
             this.foldResidentTail(session);
@@ -3158,13 +3187,15 @@ export class SessionStore {
         }
         const proofRevision = session.revisionEpoch; // #4788 D2: capture BEFORE the chain builds
         this.saveWritesInFlight.add(session.id);
+        const rec: { v: PersistedSession | null } = { v: null };
         try {
-            await this.store.writeNow(session.id, this.guardedBuild(session));
+            await this.store.writeNow(session.id, () => { const r = this.guardedBuild(session)(); rec.v = r; return r; });
         } catch (err) {
             this.saveWritesInFlight.delete(session.id);
             throw err;
         }
         this.stampOwnWrite(session.id); // #3406: the write LANDED — prove our bytes are on disk
+        if (rec.v) this.committedMetaFp.set(session.id, this.metaFingerprint(rec.v.metadata ?? {})); // #5506: immediate save landed
         this.maybeCutForkBase(session);
         this.noteDurable(session.id, proofRevision);
         this.lastSaveLanded.set(session.id, true);
@@ -3246,6 +3277,32 @@ export class SessionStore {
         session.lastMessagesFolded = true;
     }
 
+    /** #5506: the EXACT metadata shape buildRecord persists ({...live,
+     *  biliVersion, storageMode}) — the fold gate must compare like-for-like:
+     *  the proven disk bytes carry the version/mode stamps the live object
+     *  lacks, so fingerprinting the bare live object would never match.
+     *  storageMode MUST be this instance's liveStorageStamp — the very value
+     *  guardedBuild stamps into every record — not the process-wide
+     *  effectiveFileStorageMode(): with several store instances alive (tests,
+     *  or a lane switch mid-process) the process peek can point at ANOTHER
+     *  instance's mode and the fingerprints could never agree. */
+    private persistedMetadataView(session: Session): Record<string, unknown> {
+        return { ...(session.metadata as Record<string, unknown>), biliVersion: VERSION, storageMode: this.liveStorageStamp };
+    }
+
+    /** #5506: stable identity of a persisted-shape metadata view — JSON-normalized
+     *  (dates → strings, undefined dropped: mirrors what persistence does) then
+     *  key-sorted canonicalized (field order must not matter across a disk
+     *  round-trip). An unserializable view yields a unique sentinel so the gate
+     *  fails CLOSED (skip the fold), never open. */
+    private metaFingerprint(view: Record<string, unknown>): string {
+        try {
+            return createHash("sha256").update(canonicalJson(JSON.parse(JSON.stringify(view))), "utf8").digest("hex");
+        } catch {
+            return "\u0000unhashable-" + Math.random().toString(36).slice(2);
+        }
+    }
+
     /** #3050 R3 ②c: after a successful save, an idle session's metadata
      *  record (fold anchors, cache ledger, lineage — the reconciliation
      *  bookkeeping that dominates long sessions) folds to a transparent
@@ -3256,6 +3313,14 @@ export class SessionStore {
         if (session.inFlight > 0 || !this.enabled) return;
         if (isDroppedMetadata(session.metadata)) return;
         if (Object.keys(session.metadata).length === 0) return;
+        // #5506: fold ONLY when the disk copy provably carries these exact
+        // bytes — the proxy below re-materializes from disk alone, so any
+        // unsaved mutation (a direct write without markDirty, which bumps no
+        // revision and defeats the durableRevision equality gate upstream)
+        // would be silently orphaned by the fold. Divergence or no local
+        // proof yet keeps the record resident until a save carries it.
+        const proven = this.committedMetaFp.get(session.id);
+        if (proven === undefined || proven !== this.metaFingerprint(this.persistedMetadataView(session))) return;
         // Hand-built sessions (tests, seeds) may carry no meta — the lazy
         // loader degrades to the id-only lookup, same as a protocol-less file.
         const meta = session.meta ?? undefined;
@@ -3391,8 +3456,9 @@ export class SessionStore {
             // #3133: same subsume rule as writeNow.
             this.writerOffPending.delete(session.id);
             const proofRevision = session.revisionEpoch; // #4788 D2: capture BEFORE the sync build
+            let rec: PersistedSession | null = null;
             try {
-                this.guardedBuild(session)();
+                rec = this.guardedBuild(session)();
             } catch (err) {
                 // Same never-throw flush contract as the kernel-store branch
                 // below: evictOldest (src/session.ts) calls this without an
@@ -3402,6 +3468,7 @@ export class SessionStore {
                 return false;
             }
             this.maybeCutForkBase(session);
+            if (rec) this.committedMetaFp.set(session.id, this.metaFingerprint(rec.metadata ?? {})); // #5506: index-only flush landed
             this.noteDurable(session.id, proofRevision); // #4788 D2: index-only flush landed
             this.lastSaveLanded.set(session.id, true);
             this.foldResidentTail(session);
@@ -3420,9 +3487,11 @@ export class SessionStore {
             this.saveBuilders.delete(session.id);
         }
         const proofRevision = session.revisionEpoch; // #4788 D2: capture BEFORE the sync commit
-        const ok = this.store.flushSync(session.id, this.guardedBuild(session));
+        const syncRec: { v: PersistedSession | null } = { v: null };
+        const ok = this.store.flushSync(session.id, () => { const r = this.guardedBuild(session)(); syncRec.v = r; return r; });
         if (ok) {
             this.stampOwnWrite(session.id); // #3406: the write LANDED — prove our bytes are on disk
+            if (syncRec.v) this.committedMetaFp.set(session.id, this.metaFingerprint(syncRec.v.metadata ?? {})); // #5506: sync commit landed
             this.noteDurable(session.id, proofRevision);
             this.maybeCutForkBase(session);
             this.foldResidentTail(session);
@@ -3452,6 +3521,8 @@ export class SessionStore {
             if (!this.store.flushSync(session.id, () => record)) throw new Error("fork envelope persistence failed; retry the same request");
             this.stampOwnWrite(session.id);
         }
+        // #5506: the fork record is durable here (envelope or unified row) — prove its metadata
+        this.committedMetaFp.set(session.id, this.metaFingerprint(record.metadata ?? {}));
         this.foldResidentTail(session);
         this.dropResidentBlockContents(session);
         this.dropResidentMetadata(session);
@@ -3473,6 +3544,8 @@ export class SessionStore {
             if (!this.store.flushSync(id, () => record)) throw new Error("fork envelope recovery failed");
             this.stampOwnWrite(id);
         }
+        // #5506: recovered record now durable (envelope written or unified row already held it)
+        this.committedMetaFp.set(id, this.metaFingerprint(record.metadata ?? {}));
         await this.maybeCutForkBaseAsync(session);
     }
 
@@ -3499,15 +3572,16 @@ export class SessionStore {
         const ids = [...this.saveTimers.keys()];
         for (const timer of this.saveTimers.values()) clearTimeout(timer);
         this.saveTimers.clear();
-        const builders = new Map<string, () => PersistedSession>();
+        const armed = new Map<string, { build: () => PersistedSession; rec: PersistedSession | null }>();
         for (const id of ids) {
-            const build = this.saveBuilders.get(id);
-            if (build) builders.set(id, build);
+            const slot = this.saveBuilders.get(id);
+            if (slot) armed.set(id, slot);
             this.saveBuilders.delete(id);
         }
-        await Promise.all([...builders.entries()].map(([id, build]) =>
-            this.store.writeNow(id, build).then(() => {
+        await Promise.all([...armed.entries()].map(([id, slot]) =>
+            this.store.writeNow(id, slot.build).then(() => {
                 this.stampOwnWrite(id);
+                if (slot.rec) this.committedMetaFp.set(id, this.metaFingerprint(slot.rec.metadata ?? {})); // #5506: shutdown flush landed
             }).catch((e) => {
                 this.log("error", `[persist] shutdown flush failed for ${id}: ${String(e)}`);
             }),
