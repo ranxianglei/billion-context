@@ -4249,9 +4249,16 @@ export async function preflightCompressIfNeeded(
             log("warn", `[${session.id}] auto-fold target ${compressionTarget} unreachable — the session's irreducible baseline measures ~${rebuiltTextSize + imageTokens} tokens (system prompt + tools + live tail); effective target raised to the floor until the gap closes (#3444). Raise compress.externalSummary.autoFoldTargetTokens above ${rebuiltTextSize + imageTokens} for headroom`);
         }
     } else {
-        fits = unknownBaseline
-            ? result.fitsWindow
-            : estimateCoreMessages(prepared.processedMessages) + overheadEstimate + imageTokens < limit;
+        // #4930: zero folds means nothing changed since entry, so the scoped fit computed
+        // at entry — payloadFitsWindow = calibratedPayload < limit (the payload's own text
+        // scaled by this route/model's k̂ + wire overhead + the UNSCALED image reserve, via
+        // outboundPayloadBreakdown's processed-or-original view) — IS the final fit. Re-
+        // measuring raw core text here discarded k̂: a deflated session (k̂<1) whose calibrated
+        // estimate fit the window was fail-fast'd on its raw over-window reading, and an
+        // inflated session (k̂>1) whose calibrated estimate exceeded the window was forwarded
+        // on its raw under-window reading. Unknown-baseline sessions keep the loop's own
+        // judgment (result.fitsWindow, #553) — that regime distrusts the optimistic re-estimate.
+        fits = unknownBaseline ? result.fitsWindow : payloadFitsWindow;
     }
     const f = result.failure;
     // 重建过程也会让出执行权；所有转发许可都必须在此重新检查取消。
