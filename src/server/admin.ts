@@ -102,18 +102,20 @@ function isTrustedAdminOrigin(origin: string | undefined, host: string | undefin
     if (!origin) return true; // non-browser client (curl, CLI UI) on a trusted Host
     try {
         const parsed = new URL(origin);
-        // #3513 (desktop variant): the dsh desktop Electron app renders its
-        // settings pane from the custom scheme origin dsh-app://app, not an
-        // http origin. Browsers set the Origin header themselves — page
-        // content cannot forge it — and the dsh-app scheme exists only inside
-        // the dsh Electron app (a registered custom protocol), so a website
-        // can never produce a request whose Origin is dsh-app://. Accepting
-        // that exact origin (scheme dsh-app, hostname "app") admits the
-        // desktop embed probe without weakening the anti-rebinding property:
-        // rebinding attacks arrive with http/https attacker hostnames and
-        // still fail the hostname check below. Any other custom scheme or a
-        // different dsh-app hostname stays rejected.
-        if (parsed.protocol === "dsh-app:") {
+        // #3513/#5203 (desktop variant): the dsh desktop Electron app renders
+        // its settings pane from a custom scheme origin, not an http origin —
+        // dsh-app://app on older builds, dsh-desktop://app from DSH Desktop
+        // 0.13.0 onward (renderer flags --standard-schemes/--cors-schemes/
+        // --fetch-schemes=dsh-desktop). Browsers set the Origin header
+        // themselves — page content cannot forge it — and each scheme exists
+        // only inside the dsh Electron app (a registered custom protocol), so
+        // a website can never produce a request whose Origin uses one of them.
+        // Accepting exactly those origins (hostname "app") admits the desktop
+        // embed probe without weakening the anti-rebinding property: rebinding
+        // attacks arrive with http/https attacker hostnames and still fail the
+        // hostname check below. Any other custom scheme or a different
+        // hostname under these schemes stays rejected.
+        if (parsed.protocol === "dsh-app:" || parsed.protocol === "dsh-desktop:") {
             return normalizeAdminHostname(parsed.hostname) === "app";
         }
         if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return false;
