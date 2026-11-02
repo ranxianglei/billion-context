@@ -555,6 +555,27 @@ export interface Config {
   rules?: RulesConfig;
   /** Deterministic tool-result compression, tier 1 of the absorb gate (see crush.ts). Requires absorb enabled. */
   crush?: CrushConfig;
+  /** EXPERIMENTAL (default off): relocate still-visible compress carrier pairs
+   *  from their original tail-adjacent position to their own fold point —
+   *  "[folded/summary region] – [compress pair] – [protected messages]".
+   *  View-only + deterministic (see relocate-compress.ts): nothing is persisted,
+   *  refs are untouched, so the layout recomputes identically every turn. OFF
+   *  = byte-identical to before (the node fast-paths to the same array ref).
+   *  The round-2 re-render and the S4 plugin render mirror this transform host-side
+   *  with the same pure function so all lanes agree. */
+  compressAtFoldPoint?: boolean;
+  /** Second opt-in riding on compressAtFoldPoint: drop the contiguous `reasoning`
+   *  core run immediately preceding a moved pair — ONLY cores accepted by
+   *  reasoningDroppable. Default off; both flags must be set to drop anything. */
+  compressAtFoldPointClearThinking?: boolean;
+  /** Host predicate for the above drop: signed-thinking blocks and strict-echo
+   *  sessions must answer false (wire signatures live host-side, #1658/#684
+   *  doctrine). UNSET ⇒ no reasoning core is ever dropped, even with
+   *  compressAtFoldPointClearThinking set (conservative default). Must be pure
+   *  and cheap: runs once per candidate per pass. NOTE: function fields are not
+   *  carried into session effectiveConfig stamps (#2584) — wire paths re-resolve
+   *  it per request; panel/tool reads see it absent by design. */
+  reasoningDroppable?: (msg: CoreMessage) => boolean;
   /** Lossless content-cached retrieval for oversized tool results (see ccr.ts). Absent/disabled = feature off. */
   ccr?: CcrConfig;
   messageFilters?: import("./filter/types.js").MessageFiltersConfig;

@@ -4,6 +4,7 @@ import { findRoute, type CompressSettings, type NamedProviderRecipe, type Provid
 import { configDir } from "./paths.js";
 import { log as loggerLog } from "./logger.js";
 import { expandExternalSummaryChainTolerant, type ExternalSummarySettings } from "./external-summary-settings.js";
+import { resolveCompressAtFoldPoint, resolveCompressAtFoldPointClearThinking } from "./knobs.js";
 import { shippedPacksSource } from "./chat-pack.js";
 
 export type { CompressSettings } from "./config.js";
@@ -107,6 +108,10 @@ export function mergeCompress(
         outputSteering: outputSteeringLevels.length > 0 ? Object.assign({}, ...outputSteeringLevels) : undefined,
         priceProfile: priceProfileLevels.length > 0 ? Object.assign({}, ...priceProfileLevels) : undefined,
         reconcile: pick("reconcile"),
+        // Experimental fold-point carrier relocation (env-resolved later, in
+        // applyCompressSettings; here only the file tiers cascade).
+        compressAtFoldPoint: pick("compressAtFoldPoint"),
+        compressAtFoldPointClearThinking: pick("compressAtFoldPointClearThinking"),
         promptPack: pick("promptPack"),
         // Whole-chain replace (same semantics as `tiers`/`rules`): an
         // `externalSummary` object at a deeper level replaces the entire
@@ -322,6 +327,10 @@ export function applyCompressSettings(base: Config, limit: number, s: CompressSe
         nudge.growthFloor = s.nudgeGrowthTokens;
         nudge.growthCap = s.nudgeGrowthTokens;
     }
+    // Experimental fold-point carrier relocation (#view-transform-A): the env
+    // tier wins over every file level per knob doctrine (#2030), resolved
+    // per request like every other wire-facing knob. Off = byte-identical
+    // pre-change behavior (the kernel node fast-paths to the same array ref).
     // #3211: explicit 0 is meaningful (legacy any-pending pressure behavior),
     // so pass it through instead of skipping like the growth-token knobs.
     if (s.minPressureBenefitTokens !== undefined) nudge.minPressureBenefitTokens = s.minPressureBenefitTokens;
@@ -381,6 +390,13 @@ export function applyCompressSettings(base: Config, limit: number, s: CompressSe
         externalSummary: s.externalSummary !== undefined ? expandExternalSummaryChainTolerant(s.externalSummary, recipes) : (base as ResolvedKernelConfig).externalSummary,
         ...(absorb !== undefined ? { absorb } : {}),
         ...(ccr !== undefined ? { ccr } : {}),
+        // Fold-point carrier relocation pair: explicit pass-through so an unset
+        // flag never leaks a stale base value into the resolved config.
+        compressAtFoldPoint: resolveCompressAtFoldPoint(process.env, s.compressAtFoldPoint),
+        compressAtFoldPointClearThinking: resolveCompressAtFoldPointClearThinking(
+            process.env,
+            s.compressAtFoldPointClearThinking,
+        ),
         ...(s.rules !== undefined ? { rules: { enabled: s.rules === true } } : {}),
     };
     return resolved;
@@ -414,6 +430,13 @@ export function resolveRequestConfig(
 ): ResolvedKernelConfig {
     const compress = resolveCompress(routes, embeddedUrl, model, globalCompress);
     const limit = resolveContextLimitValue(compress.modelContextLimit, native ?? base.modelContextLimit);
-    if (!hasCompressSettings(compress) && limit === base.modelContextLimit) return base;
+    // #5470 opt-in reachability: an env-only enablement of either fold-point
+    // switch is invisible to hasCompressSettings (env never joins the file
+    // cascade), so without these checks such a lane would hit the short-circuit
+    // below and the knob would silently die. Both-falsy keeps the original
+    // short-circuit byte-for-byte (zero behavior change when nothing is set).
+    const cafAt = resolveCompressAtFoldPoint(process.env, compress.compressAtFoldPoint);
+    const cafCt = resolveCompressAtFoldPointClearThinking(process.env, compress.compressAtFoldPointClearThinking);
+    if (!hasCompressSettings(compress) && limit === base.modelContextLimit && !cafAt && !cafCt) return base;
     return applyCompressSettings(base, limit, compress, namedProviders ?? {});
 }
