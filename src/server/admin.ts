@@ -24,7 +24,7 @@ import { getStore } from "../persist.js";
 import { BodyTooLargeError, headerValue, readBody } from "../server.js";
 import { dismissHostPlugin, visibleHostPluginNotices } from "../host-plugin-notice.js";
 import { PCK_NOTICE_ID, dismissUpgradeNotice, pckNoticeActive } from "../pck-notice.js";
-import { listSessions, memoryReport, peekSession, splitSessionWarnings, totalInFlight } from "../session.js";
+import { isCompressionDisabled, listSessions, markDirty, memoryReport, peekSession, splitSessionWarnings, totalInFlight } from "../session.js";
 import { BILI_TUNNEL_HEADER } from "../tunnel-guard.js";
 import { isLoopbackAddress } from "../util.js";
 import { clearUpstreamAlertsForHost, getUpstreamAlerts, getUpstreamHealthReport } from "../upstream-alerts.js";
@@ -190,6 +190,28 @@ function auxProxyShot(opts: ProxyOptions): { proxy: string | null; source: strin
     } catch {
         return { proxy: null, source: null };
     }
+}
+
+// #5300: parse /__bili/session/<id>/compress → decoded id, or undefined when
+// the shape doesn't match (method is judged by the caller; query strings are
+// tolerated and stripped). Exact-match discipline: ids never contain "/",
+// overlong or malformed encodings are rejected rather than guessed.
+const SESSION_COMPRESS_PREFIX = "/__bili/session/";
+const SESSION_COMPRESS_SUFFIX = "/compress";
+function sessionCompressIdFromUrl(url: string | undefined): string | undefined {
+    if (!url || !url.startsWith(SESSION_COMPRESS_PREFIX)) return undefined;
+    const rest = url.slice(SESSION_COMPRESS_PREFIX.length);
+    const q = rest.indexOf("?");
+    const pathPart = q === -1 ? rest : rest.slice(0, q);
+    if (!pathPart.endsWith(SESSION_COMPRESS_SUFFIX) || pathPart.length <= SESSION_COMPRESS_SUFFIX.length) return undefined;
+    let id: string;
+    try {
+        id = decodeURIComponent(pathPart.slice(0, pathPart.length - SESSION_COMPRESS_SUFFIX.length));
+    } catch {
+        return undefined;
+    }
+    if (id.length === 0 || id.length > 512 || id.includes("/")) return undefined;
+    return id;
 }
 
 export async function handleAdminRoute(req: http.IncomingMessage, res: http.ServerResponse, ctx: AdminCtx): Promise<void> {
@@ -675,6 +697,62 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
             log("info", `[admin] POST /__bili/storage/restore ${parsed.sessionId} → ${JSON.stringify(result)}`);
             res.writeHead(result?.ok ? 200 : 404, { "content-type": "application/json" });
             res.end(JSON.stringify({ ok: result?.ok === true, error: result?.reason ?? (result ? undefined : "unified store unavailable") }));
+            return;
+        } catch (err) {
+            res.writeHead(err instanceof BodyTooLargeError ? 413 : 400, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: false, error: String(err) }));
+            return;
+        }
+    }
+    // #5300: per-session compression opt-out — the scope between the
+    // global/provider/model compress merge and all-or-nothing route
+    // passthrough. Flag lives in session.metadata (persisted with the record,
+    // survives restarts); EXACT id match only — a silent prefix/label mis-hit
+    // would defeat the feature's purpose (no silent folding). Excluded
+    // sessions take the pipeline's verbatim-forward tail (handle.ts): no fold,
+    // no nudge, no injection, no preflight, no marker; window overflow surfaces
+    // as an explicit upstream error instead of a quiet fold. Loopback-gated
+    // like every /__bili/ route.
+    const sessionCompressId = req.method === "GET" || req.method === "POST" ? sessionCompressIdFromUrl(req.url) : undefined;
+    if (req.method === "GET" && sessionCompressId !== undefined) {
+        const id = sessionCompressId;
+        const resident = peekSession(id);
+        if (resident) {
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: true, sessionId: id, compression: { enabled: !isCompressionDisabled(resident) }, resident: true }));
+            return;
+        }
+        const loaded = await getStore().loadAsync(id);
+        if (!loaded) {
+            res.writeHead(404, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: false, error: `unknown session "${id}" — no such record in this proxy instance` }));
+            return;
+        }
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true, sessionId: id, compression: { enabled: !isCompressionDisabled(loaded) }, resident: false }));
+        return;
+    }
+    if (req.method === "POST" && sessionCompressId !== undefined) {
+        const id = sessionCompressId;
+        try {
+            const parsed = JSON.parse((await readBody(req)).toString("utf8")) as { enabled?: unknown };
+            if (typeof parsed.enabled !== "boolean") {
+                res.writeHead(400, { "content-type": "application/json" });
+                res.end(JSON.stringify({ ok: false, error: 'expected { "enabled": true|false }' }));
+                return;
+            }
+            const session = peekSession(id);
+            if (!session) {
+                res.writeHead(404, { "content-type": "application/json" });
+                res.end(JSON.stringify({ ok: false, error: `unknown session "${id}" — not resident in this proxy instance; a model request under its id re-binds it` }));
+                return;
+            }
+            if (parsed.enabled) delete session.metadata.compressionDisabled;
+            else session.metadata.compressionDisabled = true;
+            markDirty(session);
+            log("info", `[admin] POST /__bili/session/${id}/compress — compression ${parsed.enabled ? "re-enabled" : "disabled"} (#5300)`);
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: true, sessionId: id, compression: { enabled: parsed.enabled } }));
             return;
         } catch (err) {
             res.writeHead(err instanceof BodyTooLargeError ? 413 : 400, { "content-type": "application/json" });

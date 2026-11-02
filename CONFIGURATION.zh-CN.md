@@ -1274,6 +1274,26 @@ URL 键通道（或带 `bind` 的命名条目）可以向上游发送**自己的
 
 压缩行为由 `compress` 块控制，它可以出现在三个层级。它们按**逐字段、最深层胜出**的方式合并：在更深层设置的字段会覆盖上层同名字段，但更深层*未设置*的字段**永远不会**清除上层已设置的值。换言之，子级按字段覆盖父级 —— 它绝不是整体替换对象。
 
+### 按会话排除压缩（#5300）
+
+上面的三级合并是唯一的**静态**作用域。如果某个会话的历史绝不能被折叠（例如长期陪伴 / 角色扮演会话，原始措辞本身就是资产），可以在运行时把它排除——没有配置键，**精确匹配会话 id**（刻意不做前缀 / 标签匹配：误命中会静默失效，正好毁掉这个功能的目的），开关存进会话记录、跨重启生效：
+
+```bash
+# 对单个会话关闭压缩
+curl -s -X POST -H 'content-type: application/json' -d '{"enabled":false}' \
+  http://127.0.0.1:<bili端口>/__bili/session/<session-id>/compress
+
+# 读回——防「静默恢复压缩」的保险（驻留会话从内存回答，冷会话从存储回答，未知 id 返回 404）
+curl -s http://127.0.0.1:<bili端口>/__bili/session/<session-id>/compress
+# → {"ok":true,"sessionId":"…","compression":{"enabled":false},"resident":true}
+
+# 用完后重新开启
+curl -s -X POST -H 'content-type: application/json' -d '{"enabled":true}' \
+  http://127.0.0.1:<bili端口>/__bili/session/<session-id>/compress
+```
+
+排除期间的语义（与 [`passthrough`](#passthrough) 同一条 verbatim 转发尾，但只作用于一个会话）：不折叠、不 nudge、不注入工具、不 preflight、不打 marker——客户端的字节原样发出，会话因此无限增长，**窗口溢出会以上游自己的错误形式显式冒出来**，而不是被悄悄折掉（这正是设计目的：看得见的显式失败好过不可逆的静默丢失）。已折叠的块保持折叠（`decompress` 仍能恢复），插件车道宿主调用 compress 工具会得到响亮的拒绝（`409 COMPRESSION_DISABLED`），而不是静默空转。同一模型上的其余会话照常压缩。与所有 `/__bili/` 路由一样仅限 loopback。
+
 ### 共享外部摘要服务
 
 可选的 `compress.externalSummary` 会把压缩摘要交给一个或多个独立配置的模型。它与其余 `compress` 字段一样存在于全部三个层级，采用整链替换语义：在更深层级（provider 或 model）设置的链会**整体替换**上层链，不做按目标或按预算的子字段合并，与 `tiers` 完全一致。只有 `enabled` 为 `true` 时才启用；启用后按顺序调用目标，目标失败或返回不可用摘要时继续使用下一个目标。摘要请求不会复用主请求的 provider、模型或认证信息。启用该功能后，压缩工具中的 `summary` 变为可选的、非权威提示；代理仍保留原文可恢复，只提交通过校验的外部摘要。由于会话模型不再撰写最终摘要，链启用期间注入的压缩系统提示会去掉摘要撰写规则（`HOW TO COMPRESS`、`KEEP VERBATIM`、`DROP`、`PRIORITY`）和单条摘要长度预算；摘要请求本身仍携带完整规则（#4460）。

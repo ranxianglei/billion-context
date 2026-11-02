@@ -8,7 +8,7 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import { getStore, storageStatusLabel } from "./persist.js";
 import { cloneStoreForRefs } from "./store.js";
-import { acquireInFlight, createSession, getSessionAsync, publishForkSession, diagnoseSuccessWithoutUsage, effectiveConfig, findSessionByCanonicalId, listSessions, markCompactionBoundary, markDirty, noteAbortedTurn, peekSession, releaseInFlight, statusInputBaseline, withSessionLock, type Session } from "./session.js";
+import { acquireInFlight, createSession, getSessionAsync, publishForkSession, diagnoseSuccessWithoutUsage, effectiveConfig, findSessionByCanonicalId, isCompressionDisabled, listSessions, markCompactionBoundary, markDirty, noteAbortedTurn, peekSession, releaseInFlight, statusInputBaseline, withSessionLock, type Session } from "./session.js";
 import { clientConversationHeader } from "./session-id.js";
 import { buildContextView } from "./context-view.js";
 import { ABSORB_TOOL_NAME, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_OPENAI_NO_RANGE, BILI_ACP_TOOLS_RESPONSES_NO_RANGE, PROXY_TOOL_NAMES, READ_ORIGINAL_IMAGE_TOOL, READ_ORIGINAL_IMAGE_TOOL_NAME, READ_ORIGINAL_IMAGE_TOOL_OPENAI, READ_ORIGINAL_IMAGE_TOOL_RESPONSES, RETRIEVE_TOOL_NAME, RULE_TOOL, RULE_TOOL_NAME, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES, SEARCH_CONTEXT_TOOL_NAME, absorbToolsFor, retrieveToolsFor, withAcpNotes, withAcpNotesOpenAI } from "./compress-tool.js";
@@ -2178,6 +2178,14 @@ export async function handlePluginTool(
                 : "unknown plugin conversation (id registered but its session is not resident in this proxy instance — a fresh model request re-binds it)",
         }));
         return;
+    }
+    // #5300: an excluded session's pipeline never folds, so a compress call can
+    // only fail — refuse it loudly instead of letting the model believe a fold
+    // happened. decompress stays available (restoring a pre-exclusion block is
+    // still meaningful while the session record retains it).
+    if (tool === "compress" && isCompressionDisabled(session)) {
+        deps.log("info", `[${session.id}] [plugin] compress refused: compression is disabled for this session (#5300)`);
+        return forkReply(res, 409, { ok: false, code: "COMPRESSION_DISABLED", error: `compression is disabled for session "${session.id}" (#5300 per-session opt-out) — nothing was folded. Re-enable it (POST /__bili/session/${encodeURIComponent(session.id)}/compress {"enabled":true}) or continue without folding.` });
     }
     // Absorb/rules enablement is per-session (last resolved config), so the
     // gate needs the session — it runs after the lookup above.

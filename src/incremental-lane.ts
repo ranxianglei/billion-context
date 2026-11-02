@@ -62,7 +62,7 @@ import { createHash } from "node:crypto";
 import { Readable } from "node:stream";
 import { anthropicToCore, coreToAnthropic, type BiliMessage } from "acp-kernel/wire";
 import { getStore } from "./persist.js";
-import { peekSession } from "./session.js";
+import { isCompressionDisabled, peekSession, snapshotMessages } from "./session.js";
 import { pluginAgentHeader, pluginReportedModel } from "./plugin.js";
 import { headerValue, readBody } from "./server.js";
 import { featureEnabled } from "./rollout.js";
@@ -886,6 +886,16 @@ export async function handleIncrementalTurn(
             (res as { writeHead?: unknown }).writeHead = originalWriteHead as unknown as never;
         };
         log("info", `[incremental] turn ${conversationId} since=${String(sinceSeq)} applied=${String(appliedSeq)} agent=${agent} model=${String(model)} → forward ${path}`);
+        // #5300: the pipeline gate forwards excluded sessions verbatim, which
+        // skips prepare-anthropic — the one place rawTail durability gets
+        // armed. Arm it here from the lane's authoritative core view so the
+        // post-forward scheduleSave ingests THIS turn; without it the canonical
+        // table would miss excluded turns and a cold rebuild would 409-resync
+        // against history the client already pruned past its acked seq.
+        const liveSession = peekSession(sessionId);
+        if (liveSession && isCompressionDisabled(liveSession)) {
+            snapshotMessages(liveSession, entry.msgs);
+        }
         // Best-effort durability close-out: flush the session once the
         // response has fully left so the canonical table catches up with the
         // ack before the client can act on the next turn.
