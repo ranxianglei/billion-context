@@ -15,6 +15,11 @@ import path from "node:path";
 import { stateDir } from "./paths.js";
 
 export const PCK_NOTICE_ID = "pck-default-off";
+// #5403 watermark fastpath experimental-grey intro (owner ruling 2026-11-02):
+// same one-time-per-instance store, its own id so dismissal stays independent.
+export const WM_FASTPATH_INTRO_ID = "wm-fastpath-intro";
+
+const UPGRADE_NOTICE_IDS: ReadonlySet<string> = new Set([PCK_NOTICE_ID, WM_FASTPATH_INTRO_ID]);
 
 const DISMISS_FILE = "upgrade-notices.json";
 
@@ -38,7 +43,7 @@ export function dismissedUpgradeNotices(env: NodeJS.ProcessEnv = process.env): R
 
 /** Idempotent. Returns false only for unknown notice ids. */
 export function dismissUpgradeNotice(id: string, env: NodeJS.ProcessEnv = process.env): boolean {
-    if (id !== PCK_NOTICE_ID) return false;
+    if (!UPGRADE_NOTICE_IDS.has(id)) return false;
     const set = new Set(dismissedUpgradeNotices(env));
     set.add(id);
     try {
