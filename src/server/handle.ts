@@ -161,7 +161,7 @@ export async function handle(
                 res.end(JSON.stringify({ error: denial }));
                 return;
             }
-            await handlePluginRender(req, res, log);
+            await handlePluginRender(req, res, log, config);
             return;
         }
         // #3248 marker divert: a native extension may stamp

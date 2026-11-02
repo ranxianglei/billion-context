@@ -10,12 +10,12 @@
 // with NO resolvable row in the window skips its coverage (its rows stay
 // live-visible — the safe direction) instead of failing the whole render.
 import http from "node:http";
-import { relocateCompressCarriers } from "acp-kernel";
+import { relocateCompressCarriers, type Config } from "acp-kernel";
 import { coreToAnthropic, type BiliMessage } from "acp-kernel/wire";
-import { loadConfigFile, isMcpBiliCompress } from "./config.js";
+import { isMcpBiliCompress } from "./config.js";
 import { resolveCompressAtFoldPoint } from "./knobs.js";
 import { getStore } from "./persist.js";
-import { peekSession } from "./session.js";
+import { effectiveConfig, peekSession } from "./session.js";
 import { pluginAgentHeader } from "./plugin.js";
 import { readBody } from "./server.js";
 import { featureEnabled } from "./rollout.js";
@@ -32,7 +32,7 @@ function jsonReply(res: http.ServerResponse, status: number, body: Record<string
     res.end(JSON.stringify(body));
 }
 
-export async function handlePluginRender(req: http.IncomingMessage, res: http.ServerResponse, log: (level: string, msg: string) => void): Promise<void> {
+export async function handlePluginRender(req: http.IncomingMessage, res: http.ServerResponse, log: (level: string, msg: string) => void, config: Config): Promise<void> {
     const agent = pluginAgentHeader(req.headers);
     if (!agent) return jsonReply(res, 400, { ok: false, error: "render requires the x-bili-plugin header (agent identity)" });
     if (!featureEnabled("pluginLaneServerHistory")) return jsonReply(res, 404, { ok: false, error: "feature-off" });
@@ -138,15 +138,12 @@ export async function handlePluginRender(req: http.IncomingMessage, res: http.Se
     // — the same view-only transform the kernel node applies on processTurn,
     // so the rendered prefix and steady turns agree. S4 has no per-request
     // strictness context, so move-only (no thinking clear here).
-    // KNOWN ASYMMETRY (v1, #5470 review): the knob is read from env + the
-    // global `compress` file section only, while steady turns resolve through
-    // the full cascade — a key set at a provider/model tier moves pairs on
-    // steady turns but not here. With the default now ON, the no-config and
-    // global-tier cases agree (both on); the divergence only bites when the
-    // knob is set explicitly at a provider/model tier — most plausibly now as
-    // a per-tier opt-OFF. Deliberate for now; wire the resolved value through
-    // in a follow-up.
-    if (resolveCompressAtFoldPoint(process.env, loadConfigFile().compress?.compressAtFoldPoint)) {
+    // Same source as steady turns (#5505-A, #833): read the flag back from the
+    // session's last cascade-resolved Config stamp, not env+global — a provider/
+    // model-tier opt-OFF must render off here exactly as it does on steady turns.
+    // No fresh stamp (cold / pre-flip) → stale-guard falls to env+global, keeping
+    // the shipped default-on. Do not "simplify" back to loadConfigFile() here.
+    if (resolveCompressAtFoldPoint(process.env, effectiveConfig(session, config).compressAtFoldPoint)) {
         merged = relocateCompressCarriers(merged as unknown as Parameters<typeof relocateCompressCarriers>[0], session.state, { isCompressTool: isMcpBiliCompress }) as unknown as BiliMessage[];
     }
 

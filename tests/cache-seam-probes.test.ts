@@ -22,12 +22,6 @@ import http from "node:http";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-
-// #5483: these probes compare adjacent steady-state requests element by
-// element and do not yet declare the fold-point carrier move as an expected,
-// cache-safe divergence. Pin the conservative layout; the shipped default-on
-// bytes are pinned by the storage-render goldens instead (see #5483 body).
-process.env.BILI_COMPRESS_AT_FOLD_POINT = "off";
 import { once } from "node:events";
 import { defaultConfig } from "acp-kernel";
 import { startServer } from "../src/server.ts";
@@ -221,7 +215,9 @@ const isRound2 = (p: Item): boolean => msgsOf(p).some((mm) => asArr((mm as Msg).
 
 /** Consecutive-pair walker: every pair must share a byte-identical prefix of
  *  message elements except (a) elements carrying a fold summary that is new
- *  in `cur`, and (b) the trailing volatile slots (chain/nudge, last 3). */
+ *  in `cur`, (b) the fold's own compress carrier pair — default-on lays it out
+ *  at its fold point instead of the tail (#5483/#5505-B) and it arrives/departs
+ *  as blocks activate/deactivate — and (c) the trailing volatile slots (last 3). */
 function assertPairSeamStable(prev: string, cur: string, label: string): void {
     const a = JSON.parse(prev) as Item;
     const b = JSON.parse(cur) as Item;
@@ -235,13 +231,21 @@ function assertPairSeamStable(prev: string, cur: string, label: string): void {
     while (k < Math.min(ma.length, mb.length) && eq(ma[k], mb[k])) k++;
     const solidA = ma.length - tail;
     // Sanctioned mid-history mutations (not seams): a NEW fold summary at the
-    // divergence point, and the kernel's emergency truncation band (estimator
+    // divergence point, the fold's own compress carrier pair relocating to its
+    // fold point, and the kernel's emergency truncation band (estimator
     // overshoot on estimate-grade sessions reclaims old content — #728/#1492
     // territory, by design, not a cache seam).
+    const isCompressPairEl = (m: Msg | undefined): boolean => {
+        if (!m) return false;
+        if (asArr(m.tool_calls).some((tc) => (tc as { function?: { name?: string } }).function?.name === "compress")) return true;
+        return m.role === "tool" && JSON.stringify(m.content ?? "").includes("probe fold receipt");
+    };
+    const nearCarrier = (arr: readonly unknown[], idx: number): boolean => [idx - 1, idx, idx + 1].some((j) => isCompressPairEl(arr[j] as Msg | undefined));
     const summaryNew = JSON.stringify(mb[k] ?? "").includes("Seam-probe fold covering");
     const emergencyTrunc = JSON.stringify(mb[k] ?? "").includes("[truncated for context space]");
+    const carrierMoved = nearCarrier(mb, k) || nearCarrier(ma, k);
     assert.ok(
-        k >= solidA || summaryNew || emergencyTrunc,
+        k >= solidA || summaryNew || emergencyTrunc || carrierMoved,
         `${label}: mid-history divergence at message[${k}] of ${ma.length} (round2=${isRound2(b)}) — absorb/CCR view flipped between adjacent requests`,
     );
 }
