@@ -175,6 +175,13 @@ function isThinkingModifiedError(e: unknown): boolean {
     return e instanceof UpstreamHttpError && /cannot be modified/i.test(e.body);
 }
 
+function proxyToolResultFailed(result: string): boolean {
+    // A successful compression receipt embeds the model-authored summary in later fingerprint
+    // lines. That summary may legitimately quote an earlier FAILED tool result; only the status
+    // line is authoritative for whether this tool call itself failed.
+    return (result.trimStart().split("\n", 1)[0] ?? "").includes("FAILED");
+}
+
 // #1453 client-facing labels for transport failures that end the turn in-band.
 // Deliberately kind-level only: raw error text can embed endpoint hostnames/IPs,
 // which must never reach the client stream (the full masked chain goes to the
@@ -1449,7 +1456,7 @@ export async function* runCompressLoop(
                     if (threadContinue) threadDelta.push(injection);
                 }
                 const anyCompressFailed = proxyResults.some(
-                    (pr) => (pr.name === "compress" || pr.name === "decompress") && pr.result.includes("FAILED"),
+                    (pr) => (pr.name === "compress" || pr.name === "decompress") && proxyToolResultFailed(pr.result),
                 );
                 if (!ctx.textProtocol && !anyCompressFailed) {
                     const hidden = hideConsumedCompressCalls(ctx.session.state, coreMessages, ctx.config.isCompressTool);
@@ -1470,7 +1477,7 @@ export async function* runCompressLoop(
                 const absorbName = activeAbsorbToolName(ctx.session, ctx.config);
                 if (
                     ctx.refreshFolded &&
-                    proxyResults.some((pr) => (pr.name === "compress" || pr.name === absorbName) && !pr.result.includes("FAILED"))
+                    proxyResults.some((pr) => (pr.name === "compress" || pr.name === absorbName) && !proxyToolResultFailed(pr.result))
                 ) {
                     try {
                         const refreshed = await ctx.refreshFolded(coreMessages);
@@ -1560,7 +1567,7 @@ export async function* runCompressLoop(
             // carry server-invisible bytes upstream — exactly the seam #4186
             // forbids.
             const failedMutating = proxyResults.filter(
-                (pr) => (pr.name === "compress" || pr.name === "decompress") && pr.result.includes("FAILED"),
+                (pr) => (pr.name === "compress" || pr.name === "decompress") && proxyToolResultFailed(pr.result),
             );
 
             if (!probeWarned) {
@@ -1675,14 +1682,14 @@ export async function* runCompressLoop(
                         let committedTokens = 0;
                         let committedBlocks = 0;
                         for (const pr of proxyResults) {
-                            if (pr.name === "compress" && !pr.result.includes("FAILED")) {
+                            if (pr.name === "compress" && !proxyToolResultFailed(pr.result)) {
                                 const saved = /~(\d[\d,]*) tokens saved/.exec(pr.result);
                                 if (saved) committedTokens += Number(saved[1]!.replace(/,/g, ""));
                                 const blocks = /(\d+) block\(s\)/.exec(pr.result);
                                 if (blocks) committedBlocks += Number(blocks[1]);
                             }
                         }
-                        const absorbed = proxyResults.some((pr) => pr.name === activeAbsorbToolName(ctx.session, ctx.config) && !pr.result.includes("FAILED"));
+                        const absorbed = proxyResults.some((pr) => pr.name === activeAbsorbToolName(ctx.session, ctx.config) && !proxyToolResultFailed(pr.result));
                         const note = committedTokens > 0
                             ? `compression committed (~${committedTokens.toLocaleString("en-US")} tokens saved${committedBlocks > 0 ? ` in ${committedBlocks} block(s)` : ""}); `
                             : absorbed ? "context work committed; " : "";
