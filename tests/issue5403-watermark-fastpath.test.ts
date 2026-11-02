@@ -178,7 +178,10 @@ test("#5418 A/B byte-equality + residency band (hermetic dual-proxy)", async () 
     const roots: string[] = [];
     try {
         // ---------- PHASE A: feature OFF (legacy full-resend) ----------
-        delete process.env[ENV];
+        // GA flip (#5469-followup): "unset" now means ON, so phase A must
+        // force-off explicitly; the A/B contrast is unchanged (explicit off
+        // vs explicit on).
+        process.env[ENV] = "0";
         const ha0 = makeHarness("phase-a"); roots.push(ha0.root);
         const ha = await bringUp(ha0);
         const ra = await runClient(ha.origin, ha.upstreamUrl, "pfab-phase-a", scriptTurns());
