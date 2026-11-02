@@ -15,6 +15,7 @@
 | **配置文件（显式指定）** | `BILI_CONFIG_FILE` 的值 | 直接指向任意 JSON 文件 |
 | **CLI 参数** | `--config <FILE>` | 与 `BILI_CONFIG_FILE` 等价，文件路径优先级最高 |
 | **会话数据** | `~/.local/share/billion-context/sessions/` | 持久化的压缩状态，会随时间增长 |
+| **本地公告（#5548）** | `~/.config/billion-context/announcements/*.json` | 用户自有的公告记录，每文件一条（单文件 ≤64 KB）；丢一个文件进去 → 下一次概览轮询即出现，删掉 → 消失。与远程车道共用同一套白名单 schema；未知字段丢弃，坏文件单独跳过、绝不拖垮其余文件 |
 
 首次运行时，`billion-context` 会在配置路径下生成一个空模板（`{ "providers": {} }`），方便你直接编辑。它**不会**覆盖已存在的文件。
 
@@ -1777,7 +1778,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 
 环境变量优先于配置文件。在不修改文件的情况下，它们适用于环境特定的覆盖（CI、容器）。
 
-**优先级模型（#2030）。** 每个行为开关的解析顺序为 **环境变量 > 配置文件 > 内置默认值**。自 #2030 起，每个纯行为开关同时拥有配置文件键，部署可以完全放在 `billion-context.json` 里；环境变量保留为覆盖层。**已设置**的环境变量独占其开关——即使值是垃圾值，也按 #2030 之前的原样解析（回落到默认值），既不会泄漏到文件层、也不会被文件层遮蔽。纯环境变量仅保留给无法放进文件的东西：密钥（`BILI_LAUNCH_TOKEN`、`BILI_ENCRYPTION_KEY`）、由另一个 bili 组件在 spawn 时写入的进程间通道（`BILI_MCP_PROXY`、`BILI_PARENT_PID`、`BILI_STRICT_PORT`、`BILI_OPENCODE_ACP_SPEC`、`BILI_LAUNCHER_MODEL_*`）、在第三方宿主进程内读取的宿主侧姿态（`BILLION_CONTEXT_PLUGIN*`、`BILI_NATIVE_*`、`BILI_RECLAIM_FETCH_PATCH`）、路径重定位（`BILI_CONFIG_FILE`、`BILI_SESSIONS_DIR`、`ACP_DUMP_DIR`、`XDG_*`）以及第三方约定（`CLAUDE_CODE_SESSION_ID`、`CODEX_HOME`、`https_proxy`）。新开关的准入规则见 AGENTS.md「Environment Variable Discipline」。
+**优先级模型（#2030）。** 每个行为开关的解析顺序为 **环境变量 > 配置文件 > 内置默认值**。自 #2030 起，每个纯行为开关同时拥有配置文件键，部署可以完全放在 `billion-context.json` 里；环境变量保留为覆盖层。**已设置**的环境变量独占其开关——即使值是垃圾值，也按 #2030 之前的原样解析（回落到默认值），既不会泄漏到文件层、也不会被文件层遮蔽。纯环境变量仅保留给无法放进文件的东西：密钥（`BILI_LAUNCH_TOKEN`、`BILI_ENCRYPTION_KEY`）、由另一个 bili 组件在 spawn 时写入的进程间通道（`BILI_MCP_PROXY`、`BILI_PARENT_PID`、`BILI_STRICT_PORT`、`BILI_OPENCODE_ACP_SPEC`、`BILI_LAUNCHER_MODEL_*`）、在第三方宿主进程内读取的宿主侧姿态（`BILLION_CONTEXT_PLUGIN*`、`BILI_NATIVE_*`、`BILI_RECLAIM_FETCH_PATCH`）、路径重定位（`BILI_CONFIG_FILE`、`BILI_SESSIONS_DIR`、`ACP_DUMP_DIR`、`BILI_ANNOUNCEMENTS_URL`、`XDG_*`）以及第三方约定（`CLAUDE_CODE_SESSION_ID`、`CODEX_HOME`、`https_proxy`）。新开关的准入规则见 AGENTS.md「Environment Variable Discipline」。
 
 ### 环境变量的配置键对照（#2030）
 
@@ -1956,6 +1957,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_RECLAIM_FETCH_PATCH` | 设为 `0` 关闭 native 模式 fetch 自愈重武装（#1158）。默认情况下 native fetch 拦截会把 `globalThis.fetch` 装成受保护的访问器：第三方补丁重新赋值 `globalThis.fetch` 时（如 dsh-http-proxy 的 settings 刷新用冻结的 pre-bili `originalFetch` 盲覆盖），会被接链为下游，模型流量继续经过 bili。设 `0` 则回到经典直装：第三方重装生效，bili 将看不到本会话的模型流量。**出口提示：** 自愈生效期间，被认领的模型流量由 bili 代理自身派发——不再走第三方链的出口（例如 dsh-http-proxy 里配置的 SOCKS5；bili 自身的上游代理仅支持 HTTP 形式）。若需要回退第三方出口，设 `0` 并在 bili 层配置出口（`"proxy": "http://…"`）。**共存提示（#3528）：** 默认的访问器形态与要求 `globalThis.fetch` 为普通可写数据属性的第三方组件不兼容——它们读取其属性描述符、发现没有 `value`，便在加载时中止 fetch 观察者（已报告：DSH 桌面「开发者工具 / NodeJS 诊断」插件，`@deepseek-ai/dsh-experimental-inspector`）。设 `0`（然后完全重启宿主）让此类观察者经经典直装正常加载；代价见上文。详见 #3528。 |
 | `BILI_RESIGN` | 设为 `0` 整体卸载 #1884 重签臂（回到修复前行为：带签名的请求照常改写、上游 401）。默认开启——可重签的签名请求（SDK-HMAC-SHA256 且能解析出凭据）走隧道，每个出站 body 都重签；重签臂在 dsh 上无需任何配置（经 credentials 服务做账号池发现）。**内置方案**无法重签的请求（解析不出凭据）本地拒收 403 并给出可操作提示——其修复（提供凭据）是可操作的。其他任何被检测到的方案（SigV4、`x-ofm-signature` 等网关自造头——检测是形状判定，#2090）在 bili 内部没有凭据来源也没有重签器，因此**一律本地拒收**（二元契约：重签+压缩或拒绝，绝不无签名放行）：403 指明方案名，记入 `resign-pending.json`，每次启动（以及 web UI）反复提醒直到 bili 补上该方案的重签器。`BILI_RESIGN_PASSTHROUGH=1` 仅对内置方案开启原样转发（不压缩）——对其余方案无效。`enabled` / `passthrough` / `credentialRef` 有配置文件孪生项，见 [`resign`](#resign) 块——按签名方案分键（`resign["sdk-hmac-sha256"]`；`providers.<url>.resign["<方案>"]` 是二级覆盖）——环境变量优先于文件。方案键把 passthrough 钉死到具体签名：只有自己的键设了的方案才走隧道。相关：`BILI_RESIGN_BENEFIT`（逗号分隔的 CodeArts benefit 模型列表，这些请求附带参与签名的 `maas_type: benefit` 头——优先于整棵三级树；文件侧孪生项是三级的 `models.<name>.benefit` 布尔，未设置落到内置 `glm-5.3-flash,deepseek-v4.1-flash`，对齐 dsh codearts 插件的 `CODEARTS_BENEFIT_FALLBACK`）与 `BILI_CODEARTS_REF`（强制指定重签用的 dsh credentials 服务 ref，而不是从 `$DSH_HOME/jet-hub/state.json` 里发现启用的 `codearts` 账号）。 |
 | `BILI_CONFIG_FILE` | 覆盖配置文件路径（指向任意 JSON 文件）。 |
+| `BILI_ANNOUNCEMENTS_URL` | 覆盖远程公告文档地址（#5548 车道 C）。缺省：本仓库 master 上 `announcements/remote.json` 的官方 raw 地址。供防火墙后无法访问 raw.githubusercontent.com 的装机做路径重定位逃生门——指向自己中继上同一份 `{v:1, entries:[…]}` 文档。设计为纯环境变量（无配置文件孪生项）：它重定位的是一个抓取目标，且远程车道无论如何都是 fail-open。 |
 | `ACP_PORT` / `PORT` | 覆盖监听端口。 |
 | `ACP_HOST` | 覆盖监听主机。 |
 | `ACP_UPSTREAM` | 覆盖默认上游 base URL。 |
