@@ -434,6 +434,24 @@ additionally need `network.allowPrivateHttpProviders` (#2984). Verified
 end-to-end over all three wires (OpenAI Chat / Responses / Anthropic Messages,
 including cross-protocol conversion), #4433.
 
+**Can I combine bili with the [qoder-trae-workbuddy-switch](https://github.com/NextAgentX/qoder-trae-workbuddy-switch) quota gateway?**
+Yes — same `/bili/` prefix pattern: `http://localhost:8787/bili/http://127.0.0.1:5789x/v1`
+(OpenAI wire) or without `/v1` (Anthropic wire) + the gateway's sk-* key; ports
+57891 WorkBuddy / 57892 unified / 57894 Trae / 57895 Qoder. Caveats: ① the
+gateway's account stickiness reads ONLY the non-standard body field
+`metadata.conversation_id` (no header fallback) — clients that don't write it
+(Claude Code, Codex) get a per-request account draw from the pool, and each
+vendor account keeps its own prefix cache, so cross-turn prefix-cache hits ≈ 0;
+use a client that writes the field (Cursor/Cline) or set the gateway's pick
+mode to Sequential / keep one account in the allowlist; ② the unified gateway
+requires namespaced model names `<ns>:<model>` (bare names → 400) — declare
+their context windows under the providers key via `models.<name>.context`
+(#2317); ③ the Qoder lane reports zero token usage upstream → bili's usage
+stats degrade there (compression is unaffected — it runs on local tokenization);
+④ mid-conversation account switches invalidate the provider's prefix cache and
+stay invisible to bili's KEY SWITCHES attribution (the outbound key is always
+the stable sk-* gateway key). Full analysis: #5193.
+
 **Where are logs and session data stored?** Log:
 `~/.local/state/billion-context/bili.log` (also mirrored to stderr); session
 state: `~/.local/share/billion-context/` (XDG-overridable; Windows AV exclusion
