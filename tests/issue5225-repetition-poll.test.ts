@@ -87,7 +87,8 @@ test("#5225: rapid identical loop escalates staged — refusal at 5, kill only o
     assert.equal(abortAfterFifth, 0, "the refusal must NOT kill the turn — one live chance to change approach");
     assert.equal((sixth as { block?: boolean })?.block, true, "the identical repeat after the refusal is blocked");
     assert.match((sixth as { reason?: string })?.reason ?? "", /BLOCKED/);
-    assert.equal(w.ctx.abortCalls, 1, "turn aborted exactly once, at the repeat after the final refusal");
+    // #5505: soft stop at count 6-9 (no ctx.abort); hard-abort at call 10
+    assert.equal(w.ctx.abortCalls, 0, "call 6 is soft-stopped (no ctx.abort)");
 });
 
 test("#5225: rapid loop escapes the final refusal via ONE longer wait (staging composes with polling advice)", () => {
