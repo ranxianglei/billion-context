@@ -16,9 +16,9 @@ export type UpstreamFailureKind =
     /** Downstream client disconnected (external abort fired). Nothing bili
      *  did or can retry — the request is dead by definition. */
     | "client-abort"
-    /** Idle-budget / read-phase timeout expiry: our own watchdog aborted, or
-     *  OS/undici reported a headers/body timeout. NOT retried — the budget
-     *  already waited and the request may have reached the upstream. */
+    /** Timeout: our idle watchdog, an undici headers/body timeout, or an OS
+     *  ETIMEDOUT whose phase may be unknown. NOT retried — the request may
+     *  have reached the upstream. This category alone does not prove idle expiry. */
     | "upstream-timeout"
     /** Connect-phase timeout (undici UND_ERR_CONNECT_TIMEOUT): the TCP
      *  handshake never completed, so nothing reached the upstream and each
@@ -226,7 +226,7 @@ export function isFailFastUpstreamKind(kind: UpstreamFailureKind): boolean {
  *  taxonomy and the checklist never drift apart. */
 export const UPSTREAM_FAIL_HINTS: Record<UpstreamFailureKind, string> = {
     "client-abort": "downstream client disconnected — no bili-side action",
-    "upstream-timeout": "idle budget expired (headers/body) — check upstream health; not retried by design",
+    "upstream-timeout": "transport timeout — inspect code/syscall and nested causes to identify the phase; not retried by design",
     "connect-timeout": "TCP handshake never completed — upstream/proxy unreachable or blackholed; a bounded transparent replay may be attempted (BILI_REPLAY_RETRY_MAX)",
     "proxy-reset": "proxy dropped the connection before the response — check proxy idle-recycle/payload limits (BILI_PROXY_KEEPALIVE_MAX_MS can shorten our reuse window); a bounded transparent replay may be attempted (BILI_REPLAY_RETRY_MAX)",
     "upstream-reset": "upstream/network reset before the response — check upstream and local network; a bounded transparent replay may be attempted (BILI_REPLAY_RETRY_MAX)",

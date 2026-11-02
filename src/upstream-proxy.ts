@@ -4,7 +4,7 @@ import tls from "node:tls";
 import { Pool, ProxyAgent } from "undici";
 import type { ProviderRoutes } from "./config.js";
 import { log as loggerLog } from "./logger.js";
-import { maskHostInText, maskHostPortForDisplay, maskUrlForLog } from "./log-mask.js";
+import { maskHostInText, maskHostPortForDisplay, maskUrlForLog, maskIpsInText, maskUrlsInText, redactSecretsInText } from "./log-mask.js";
 import { upstreamTimeoutMs } from "./fetch-util.js";
 import { classifyUpstreamFailure, hintWithSkippedProxy, isTlsTrustCode, redactProxyUrl, tlsTrustRemediation, type SkippedProxyInfo, type UpstreamFailureDetail } from "./upstream-fail.js";
 import { upstreamCaIdentity, upstreamExtraCa } from "./upstream-ca.js";
@@ -536,22 +536,33 @@ export function connectThroughProxy(host: string, port: number, proxyUrl: string
 function errorChain(error: unknown): Array<Record<string, unknown>> {
     const chain: Array<Record<string, unknown>> = [];
     const seen = new Set<unknown>();
-    let current: unknown = error;
-    while (current && !seen.has(current)) {
+    // Bound both depth and visits so large or cyclic aggregates cannot flood diagnostics.
+    let remaining = 32;
+    let truncated = false;
+    const visit = (current: unknown, depth: number): void => {
+        if (remaining-- <= 0 || depth >= 8) { truncated = true; return; }
+        if (!current || seen.has(current)) return;
         seen.add(current);
         if (current instanceof Error) {
-            const record: Record<string, unknown> = { message: current.message };
+            const record: Record<string, unknown> = { message: String(current.message) };
             for (const key of ["code", "errno", "syscall", "address", "port"]) {
                 const value = (current as unknown as Record<string, unknown>)[key];
-                if (value !== undefined) record[key] = value;
+                if (typeof value === "string" || typeof value === "number") record[key] = value;
             }
             chain.push(record);
-            current = current.cause;
+            if (current.cause !== undefined) visit(current.cause, depth + 1);
+            if (current instanceof AggregateError && Array.isArray(current.errors)) {
+                for (const child of current.errors) {
+                    if (remaining <= 0) { truncated = true; break; }
+                    visit(child, depth + 1);
+                }
+            }
         } else {
             chain.push({ message: String(current) });
-            break;
         }
-    }
+    };
+    visit(error, 0);
+    if (truncated) chain.push({ message: "[error chain truncated]" });
     return chain;
 }
 
@@ -578,9 +589,9 @@ export function describeUpstreamFailure(error: unknown, url: string, proxyUrl?: 
     try { targetHostPort = new URL(url).host; } catch { /* not a URL — no display host */ }
     const maskHostIn = (s: string): string => {
         try {
-            return maskHostInText(s, new URL(url).hostname);
-        } catch { /* not a URL — nothing to mask */ }
-        return s;
+            s = maskHostInText(s, new URL(url).hostname);
+        } catch { /* not a URL — no target host to mask */ }
+        return redactSecretsInText(maskUrlsInText(maskIpsInText(s)));
     };
     let codeValue: unknown;
     for (const field of fields) {
@@ -592,6 +603,12 @@ export function describeUpstreamFailure(error: unknown, url: string, proxyUrl?: 
     }
     const messages = chain.map((entry) => maskHostIn(String(entry.message ?? ""))).filter(Boolean);
     if (messages.length > 0) parts.push(`message=${messages.join(" <- ")}`);
+    if (chain.length > 1) {
+        const causes = chain.slice(1).map((entry) => Object.fromEntries(
+            Object.entries(entry).map(([key, value]) => [key, typeof value === "string" ? maskHostIn(value) : value]),
+        ));
+        parts.push(`causes=${JSON.stringify(causes)}`);
+    }
     parts.push(`url=${maskUrlForLog(url)}`);
     parts.push(`proxy=${redactProxyUrl(proxyUrl) ?? "direct"}`);
     let hint = hintWithSkippedProxy(kind, skipped);
