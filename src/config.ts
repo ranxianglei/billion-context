@@ -663,6 +663,13 @@ const CONTEXT_LIMIT_TABLE: Array<{ match: RegExp; limit: number }> = [
     { match: /^minimax/i, limit: 204_800 },
     { match: /^qwen/i, limit: 200_000 },
     { match: /^kimi/i, limit: 200_000 },
+    // StepFun step-5 line serves a 1M window (field evidence #5500: an nvidia_nim
+    // deployment of stepfun-ai/step-5-preview enforces max_input_tokens=1048576
+    // and its models registry lists contextWindow=1048576). The miss used to fall
+    // to the 2e5 env default → 150K effective window, stranding step-family
+    // sessions in the preflight fail-fast loop (#852 doctrine: too-large guesses
+    // self-heal on first upstream overflow, too-small ones strand).
+    { match: /^step-/i, limit: 1_000_000 },
     { match: /^llama-/i, limit: 200_000 },
 ];
 
