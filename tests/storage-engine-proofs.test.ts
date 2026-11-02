@@ -11,11 +11,11 @@
  *                      render goldens, both with a mid-conversation restart
  *                      and with the legacy file DELETED at the restart (the
  *                      index alone carries the session — the migration's
- *                      end-state promise). #4316 PR3/3 (380ef4dac): a
- *                      full-mode cold load additionally re-homes citation
- *                      numbers once (one-time ledger alignment) — comparisons
- *                      run modulo that renumbering (citation-normalized
- *                      digests), which is the ONLY permitted delta.
+ *                      end-state promise). #4316 PR3/3 (380ef4dac) used to
+ *                      re-home citation numbers on a full-mode cold load
+ *                      (one-time ledger alignment); that rewrite is now
+ *                      removed, but committed goldens still carry its
+ *                      numbering, so comparisons stay citation-normalized.
  *   STALE REJECT     — a multi-instance stale write that the guarded build
  *                      rejects must never reach index.db; the converged disk
  *                      record is what gets ingested.
@@ -159,7 +159,7 @@ function unifiedRows(store: UnifiedStore, id: string): ReturnType<typeof loadLeg
 // ---------------------------------------------------------------------------
 
 for (const wire of WIRES) {
-    test(`storage engine: full-mode restart is invisible on the ${wire} wire (== legacy restart / committed goldens, modulo the #4316 one-time citation renumbering)`, { timeout: 240_000 }, async () => {
+    test(`storage engine: full-mode restart is invisible on the ${wire} wire (== legacy restart / committed goldens, modulo historical #4316 citation numbering in the goldens)`, { timeout: 240_000 }, async () => {
         const golden = JSON.parse(fs.readFileSync(path.join(RENDER_ROOT, `${wire}.json`), "utf8")) as {
             turns: Array<{ i: number; sha: string; shaCiteNorm: string }>;
             foldAt: number; editedAt: number; summaryFrom: number;
@@ -178,9 +178,9 @@ for (const wire of WIRES) {
             assert.equal(record.turns.length, legacy.turns.length, `${wire}/${leg}: body count drifted vs legacy restart`);
             for (let i = 0; i < legacy.turns.length; i++) {
                 if (i <= record.editedAt) assert.equal(record.turns[i]!.sha, golden.turns[i]!.sha, `${wire}/${leg}: pre-migration body #${i} digest drift vs committed goldens`);
-                // #4316 PR3/3 (380ef4dac): a full-mode cold load re-homes citation
-                // numbers once (one-time ledger alignment) — the ONLY permitted
-                // wire delta. Citation-normalized digests must match turn-for-turn.
+                // #4316 PR3/3 (380ef4dac) goldens were captured with the old
+                // one-time citation renumbering. Current cold loads seal refs;
+                // the remaining normalization targets those historical goldens.
                 assert.equal(record.turns[i]!.shaCiteNorm, legacy.turns[i]!.shaCiteNorm, `${wire}/${leg}: outbound body #${i} drifts beyond citation renumbering vs legacy restart`);
                 assert.equal(record.turns[i]!.shaCiteNorm, golden.turns[i]!.shaCiteNorm, `${wire}/${leg}: outbound body #${i} drifts beyond citation renumbering vs committed goldens (restart-inherent bs-field loss aside)`);
             }
@@ -317,7 +317,7 @@ test("storage engine: rollback contract — explicit legacy mode serves the iden
         const storeFull = new SessionStore({ dir, debounceMs: 1, enabled: true });
         const viaFull = storeFull.loadSync("corpus-folded", { protocol: "anthropic", upstreamOrigin: "http://127.0.0.1:8199" });
         assert.ok(viaFull, "full-mode reload returned null");
-        // Persist the one-time cold-load alignment before exercising rollback.
+        // Persist the full-mode load result before exercising rollback.
         await storeFull.writeNow(viaFull);
         storeFull.closeQuietly();
         const digestFull = viewDigest(toLegacyLike(viaFull));
@@ -329,8 +329,8 @@ test("storage engine: rollback contract — explicit legacy mode serves the iden
         assert.ok(legacy, "legacy-only reload returned null after rollback");
         // #2960 ⑤: cross-mode equality is on the STATE proper — full mode
         // serves the raw table tail, legacy the envelope's folded view.
-        // #4316 PR3/3: modulo the one-time ledger alignment (full-side cold
-        // load re-homes citation numbers; legacy keeps counter numbers).
+        // #4316 PR3/3: committed fixtures may still carry the historical
+        // cold-load numbering, so these cross-mode digests stay normalized.
         assert.equal(viewStateDigest(stripOneTimeAlignment(toLegacyLike(legacy))), viewStateDigest(stripOneTimeAlignment(toLegacyLike(viaFull))), "rollback: legacy-only load state digest drift vs full-mode load");
         assert.ok(viaFull.lastMessages && viaFull.lastMessages.length > 0, "⑤: full-mode load serves the table tail");
         assert.ok(legacy.lastMessages && legacy.lastMessages.length > 0, "⑤: rollback keeps the envelope tail");

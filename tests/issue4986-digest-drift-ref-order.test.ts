@@ -8,11 +8,10 @@ import { SessionStore } from "../src/persist.ts";
 /**
  * #4986: the sampled ingest read-back verify must not report DIGEST DRIFT
  * when the in-memory messageRefs key order diverges from the stored
- * refs-row order. The golden corpora are exactly that shape: byRef sits in
- * ref-number order while byRaw — which finishPlan freezes into row ord at
- * full ingest — sits in a different key order, so the row-rebuilt leg's
- * byRef starts at m00041 while the live leg's starts at m00001. Identical
- * content, different key insertion order. Pre-fix, every such save logged
+ * refs-row order. The fixture reorders byRef without changing any binding;
+ * byRaw — which finishPlan freezes into row ord at full ingest — keeps its
+ * original order. Identical content, different key insertion order.
+ * Pre-fix, every such save logged
  * an error-level DIGEST DRIFT and dropped the ingest watermark (full-tail
  * re-ingest next save); post-fix the parity digest compares contents, not
  * key insertion order (#3407/#3113 philosophy).
@@ -53,10 +52,11 @@ test("ingest verify ignores messageRefs key-order divergence (#4986)", async () 
         try {
             const session = loadCorpusCase(seed, "folded", "corpus-folded", "anthropic");
 
-            // Precondition: the corpus exhibits the divergent shape — the
-            // row order (byRaw key order, what finishPlan stores as ord)
-            // projects byRef to a DIFFERENT key sequence than the live map's
-            // own key order. Without this the test would pass vacuously.
+            const refsBefore = structuredClone(session.state.messageRefs);
+            session.state.messageRefs.byRef = Object.fromEntries(Object.entries(refsBefore.byRef).reverse());
+            assert.deepEqual(session.state.messageRefs, refsBefore, "order-only fixture preserves every raw/ref binding");
+
+            // Without different key orders this regression would pass vacuously.
             const byRaw = session.state.messageRefs.byRaw;
             const byRef = session.state.messageRefs.byRef;
             const rowOrderProjectedRefs = Object.keys(byRaw)

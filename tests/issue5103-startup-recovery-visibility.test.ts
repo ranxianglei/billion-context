@@ -188,6 +188,7 @@ function mkLegacy(id: string, lastMessages: LegacySessionLike["lastMessages"]): 
 
 test("#5103: first ingest failure warns immediately with the db path; failures NEVER self-disable", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-5103-shadow-"));
+    const dbPath = path.join(dir, "index.db").replaceAll("\\", "/");
     try {
         const shadow = UnifiedShadow.maybeOpen(dir, { BILI_STORAGE_UNIFIED: "shadow" }, (r) => r as LegacySessionLike);
         assert.ok(shadow, "shadow mode sidecar must open");
@@ -208,7 +209,7 @@ test("#5103: first ingest failure warns immediately with the db path; failures N
             shadow.record(mkLegacy("s1", [msg(1), msg(2)]));
             const firstWarn = captured.find((c) => c.level === "warn" && c.msg.includes("failed to ingest"));
             assert.ok(firstWarn, "the FIRST failure must warn (#5103) — no silent strikes any more");
-            assert.ok(firstWarn!.msg.includes(path.join(dir, "index.db")), "warning must name the database file");
+            assert.ok(firstWarn!.msg.replaceAll("\\", "/").includes(dbPath), "warning must name the database file");
             if (process.platform === "win32") {
                 assert.ok(firstWarn!.msg.includes("(win32:"), "win32 runner carries the OS-level hint");
             }

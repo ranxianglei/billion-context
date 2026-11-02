@@ -3,7 +3,7 @@ import { buildCompressSystemPrompt, parseCompressInput, type ParsedRange } from 
 import { messageTimestampSections } from "./external-summary-surface.js";
 import { configuredSummaryPlan } from "./external-summary-runtime.js";
 import type { ResolvedKernelConfig } from "./compress-settings.js";
-import { applyRanges, noVisibleContextRefusal, normalizeRangeOrder, recoverEvictedView, type RewriteCtx } from "./stream.js";
+import { applyRanges, refLedgerConflictRefusal, noVisibleContextRefusal, normalizeRangeOrder, recoverEvictedView, type RewriteCtx } from "./stream.js";
 import { compressResult, type ProxyToolResult } from "./proxy-tool-result.js";
 import { imagePlaceholders } from "./image-note.js";
 import { describeExternalSummaryFailure, summaryLengthBudgetClause, type SummaryWork } from "./external-summary.js";
@@ -35,6 +35,8 @@ function withOptionalSummaries(input: unknown): unknown {
 
 /** Called under the host session lock; generation is separate from kernel commit. */
 export async function applyConfiguredCompression(input: unknown, ctx: RewriteCtx, callId?: string, signal?: AbortSignal): Promise<ProxyToolResult> {
+    const conflict = refLedgerConflictRefusal(ctx);
+    if (conflict) return conflict;
     if (signal?.aborted) return compressResult("[Compression FAILED: cancelled. Nothing compressed.]", "refused", 0);
     // The plan rides the request Config rail (#833: ctx.config is the
     // session's effective Config — same cascade that produced the wire).

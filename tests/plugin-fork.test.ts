@@ -63,7 +63,7 @@ interface StatusResponse {
 type PluginResponse<Path extends string> = Path extends "/__bili/plugin/manifest"
     ? { tools: { openai: { type: "function"; function: { name: string; parameters: Record<string, unknown> } }[] }; capabilities: { fork: { protocolVersion: number; endpoint: string; snapshotEndpoint: string } } }
     : Path extends "/__bili/plugin/fork" ? ForkResponse
-    : Path extends "/__bili/plugin/tool" ? { result: string; code?: string; conversationId?: string }
+    : Path extends "/__bili/plugin/tool" ? { result: string; code?: string; conversationId?: string; outcome?: string }
     : Path extends `/__bili/plugin/status${string}` ? StatusResponse
     : SnapshotResponse;
 
@@ -128,6 +128,36 @@ test("plain proxy panel snapshots do not change raw-history persistence", { time
         assert.equal((await h.request("/__bili/plugin/snapshot?conversationId=plain-panel")).status, 409);
     } finally { await h.close(); }
 });
+
+for (const inheritedConflict of ["marker", "diagnostics"] as const) {
+    test(`HTTP fork preserves known ref ambiguity through cold restore (${inheritedConflict})`, { timeout: 60_000 }, async () => {
+        const h = await harness(true);
+        try {
+            const parent = resolveConversation("parent").session!;
+            if (inheritedConflict === "marker") parent.metadata.refLedgerConflict = true;
+            else parent.refLedgerConflict = [{ ref: "m00001", refNum: 1, oldRawId: "retired-owner", currentRawId: parent.state.messageRefs.byRef.m00001 }];
+            const snapshot = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;
+            assert.equal((await h.request("/__bili/plugin/fork", forkRequest(snapshot))).status, 201);
+            for (const cold of [false, true]) {
+                if (cold) {
+                    assert(h.store.flushSync(resolveConversation("child").session!));
+                    _resetPluginStateForTest();
+                    _resetSessionsForTest();
+                }
+                const childSnapshot = await h.request("/__bili/plugin/snapshot?conversationId=child");
+                assert.equal(childSnapshot.status, 200);
+                const child = resolveConversation("child").session!;
+                const before = JSON.stringify({ state: child.state, stats: child.stats, metadata: child.metadata, revision: child.revisionEpoch });
+                const ref = childSnapshot.body.orderedMessages[0]!.ref;
+                const result = await h.request("/__bili/plugin/tool", { conversationId: "child", tool: "compress", args: { content: [{ startId: ref, endId: ref, summary }] } });
+                assert.equal(result.status, 200);
+                assert.equal(result.body.outcome, "refused");
+                assert.equal(child.metadata.refLedgerConflict, true);
+                assert.equal(JSON.stringify({ state: child.state, stats: child.stats, metadata: child.metadata, revision: child.revisionEpoch }), before);
+            }
+        } finally { await h.close(); }
+    });
+}
 
 test("HTTP fork preserves sparse parent ledger before the child's first save", { timeout: 60_000 }, async () => {
     const oldMode = process.env.BILI_STORAGE_UNIFIED;
@@ -958,10 +988,10 @@ for (const storageMode of ["legacy", "full"] as const) {
             parent.contentStore = storeOriginal(createContentStore(), { ref: "m00001", rawId: parent.pluginSnapshot![0].id, text: "CCR original retained independently after restart", kind: "original", tokens: 10, head: "CCR original" });
             parent.contentStoreDirty = true;
             assert(h.store.flushSync(parent));
-            // #4316 PR3/3: only a unified cold load runs the one-time ledger
-            // alignment; the CI legacy baseline retains the original state.
+            // A cold load must not re-stamp or renumber issued refs: the state
+            // it serves is byte-for-byte the state that was flushed, in every
+            // storage mode (no one-time ledger alignment marker).
             const persistedState = JSON.parse(JSON.stringify(parent.state));
-            if (h.store.replicasAvailable()) persistedState.refLedgerAligned = true;
             assert.deepEqual(JSON.parse(JSON.stringify(h.store.loadSync("parent")!.state)), persistedState);
             const snapshot = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;
             const req = forkRequest(snapshot);
@@ -1535,33 +1565,33 @@ test("HTTP a mid-history rewrite replaces the snapshot wholesale with an exact b
 });
 
 test("HTTP a cold-restored non-retained parent serves its intact raw tail immediately (#5140)", { timeout: 60_000 }, async () => {
-    // The reconstruction path reads the unified index, so this test must run
-    // under unified-full — the global test baseline pins BILI_STORAGE_UNIFIED=
-    // "legacy" for non-storage suites, under which the sidecar never opens and
-    // replicasAvailable() is structurally false (a bare sidecar-missing 409).
-    const oldMode = process.env.BILI_STORAGE_UNIFIED;
+    const prevMode = process.env.BILI_STORAGE_UNIFIED;
     process.env.BILI_STORAGE_UNIFIED = "full";
-    const h = await harness(true);
     try {
-        const parent = resolveConversation("parent").session!;
-        assert(h.store.flushSync(parent));
-        h.store.cancelAll();
-        _resetSessionsForTest();
-        _resetPluginStateForTest();
-        const restored = getSession("parent");
-        assert.equal(restored.pluginSnapshot, undefined, "a non-forked session restores without its raw snapshot");
-        // #5140: the intact raw tail is reconstructable from the unified index, so the cold
-        // parent is servable immediately — no model call needed to recover stored source.
-        // The 409 body names the exact forkSnapshot refusal branch — a bare status assert
-        // swallowed it and left the CI flake undiagnosable (#4599 sentinel 2026-10-30).
-        const coldSnap = await h.request("/__bili/plugin/snapshot?conversationId=parent");
-        assert.equal(coldSnap.status, 200, JSON.stringify(coldSnap.body));
-        await sendModel(h, "parent", h.messages);
-        assert.equal((await h.request("/__bili/plugin/snapshot?conversationId=parent")).status, 200);
-        assert.equal(resolveConversation("parent").session!.pluginSnapshot!.length, 3);
+        const h = await harness(true);
+        try {
+            const parent = resolveConversation("parent").session!;
+            assert(h.store.flushSync(parent));
+            h.store.cancelAll();
+            _resetSessionsForTest();
+            _resetPluginStateForTest();
+            const restored = getSession("parent");
+            assert.equal(restored.pluginSnapshot, undefined, "a non-forked session restores without its raw snapshot");
+            // #5140: the intact raw tail is reconstructable from the unified index, so the cold
+            // parent is servable immediately — no model call needed to recover stored source.
+            // The 409 body names the exact forkSnapshot refusal branch — a bare status assert
+            // swallowed it and left the CI flake undiagnosable (#4599 sentinel 2026-10-30).
+            const coldSnap = await h.request("/__bili/plugin/snapshot?conversationId=parent");
+            assert.equal(coldSnap.status, 200, JSON.stringify(coldSnap.body));
+            assert.deepEqual(coldSnap.body.messages.map((m) => m.text), h.messages.map((m) => m.content), "cold snapshot preserves the exact raw text and order");
+            assert.deepEqual(coldSnap.body.orderedMessages.map((m) => m.rawId), restored.state.lastPassIds, "cold snapshot preserves the exact raw message identities and order");
+            await sendModel(h, "parent", h.messages);
+            assert.equal((await h.request("/__bili/plugin/snapshot?conversationId=parent")).status, 200);
+            assert.equal(resolveConversation("parent").session!.pluginSnapshot!.length, 3);
+        } finally { await h.close(); }
     } finally {
-        await h.close();
-        if (oldMode === undefined) delete process.env.BILI_STORAGE_UNIFIED; else process.env.BILI_STORAGE_UNIFIED = oldMode;
+        if (prevMode === undefined) delete process.env.BILI_STORAGE_UNIFIED;
+        else process.env.BILI_STORAGE_UNIFIED = prevMode;
     }
 });
 

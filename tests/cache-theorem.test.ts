@@ -278,7 +278,7 @@ test("[grounding:g1] ref cursor mechanics pinned to assignRefs/allocateFreeRef",
     assert.equal(res.map.byRaw["q1"], "m00006", "smallest free >= nextIndex");
     assert.equal(highestUsedIndex(res.map), 6);
   }
-  // pre-existing binding untouched; gap below the cursor is claimable
+  // pre-existing binding untouched; a stale cursor cannot reopen issued ref space
   {
     const existing = emptyRefMap();
     existing.byRaw["a"] = "m00005";
@@ -286,8 +286,8 @@ test("[grounding:g1] ref cursor mechanics pinned to assignRefs/allocateFreeRef",
     const res = assignRefs([msg("a"), msg("q")], { existing, nextIndex: 4 });
     assert.equal(res.map.byRaw["a"], "m00005", "existing untouched");
     assert.equal(res.newlyAssigned, 1, "existing message consumes no number");
-    assert.equal(res.map.byRaw["q"], "m00004", "gap below cursor is the first free slot");
-    assert.equal(res.nextIndex, 5);
+    assert.equal(res.map.byRaw["q"], "m00006", "fresh ref stays above every issued number despite a stale cursor");
+    assert.equal(res.nextIndex, 7);
   }
   // BLOCKED consumes no number
   {

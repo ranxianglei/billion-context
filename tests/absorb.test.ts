@@ -271,3 +271,22 @@ test("persist round-trip: absorbed records and absorbedTokens survive save/load"
     assert.deepEqual(loaded!.state.absorbed, [record], "absorbed records must survive restart");
     assert.equal(loaded!.state.stats.absorbedTokens, 4321);
 });
+
+
+test("executeAbsorb: retained ref-history conflicts refuse before any mutation", () => {
+    const { turn, config, refFor } = makeTurn();
+    const ref = refFor("t-res");
+    assert.ok(ref);
+    const session = makeSession();
+    session.state = turn.state;
+    session.refLedgerConflict = [{ ref, refNum: Number(ref.slice(1)), oldRawId: "previous-owner", currentRawId: "t-res" }];
+    const stateBefore = structuredClone(session.state);
+    const statsBefore = structuredClone(session.stats);
+    const result = executeAbsorb({ ref, summary: "must not absorb a reused ref" }, "conflict-call", config.absorb!, {
+        config, messages: turn.messages, session,
+    });
+    assert.match(result.text, /FAILED/);
+    assert.match(result.text, /ambiguous/);
+    assert.deepEqual(session.state, stateBefore, "ambiguous ref must not alter absorptions or refs");
+    assert.deepEqual(session.stats, statsBefore, "ambiguous ref must not credit tokens");
+});
