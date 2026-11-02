@@ -669,7 +669,7 @@ const CONTEXT_LIMIT_TABLE: Array<{ match: RegExp; limit: number }> = [
     // to the 2e5 env default → 150K effective window, stranding step-family
     // sessions in the preflight fail-fast loop (#852 doctrine: too-large guesses
     // self-heal on first upstream overflow, too-small ones strand).
-    { match: /^step-/i, limit: 1_000_000 },
+    { match: /^step-/i, limit: 1_048_576 },
     { match: /^llama-/i, limit: 200_000 },
 ];
 
