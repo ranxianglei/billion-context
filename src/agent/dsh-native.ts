@@ -698,6 +698,17 @@ function errMessage(err: unknown): string {
     return err instanceof Error ? err.message : String(err);
 }
 
+const MAX_THROWN_STACK_FRAMES = 8;
+// #5066: a thrown attribution error's stack rides the durable log so the
+// wedged-gate shape (host scope dead + over-window body) is diagnosable from
+// bili.log alone. Bounded frames — a pathological stack must not flood the log.
+function thrownStackFramesForLog(stack: string | undefined): string[] {
+    if (stack === undefined || stack.length === 0) return [];
+    const frames = stack.split("\n").map((f) => f.trim()).filter((f) => f.length > 0);
+    if (frames.length <= MAX_THROWN_STACK_FRAMES) return frames;
+    return [...frames.slice(0, MAX_THROWN_STACK_FRAMES), `[stack truncated: ${frames.length - MAX_THROWN_STACK_FRAMES} more frame(s)]`];
+}
+
 // #1158/#2831: GUI hosts swallow process stderr, so a bootstrap failure that
 // only console.errors vanishes together with the symptom it causes (silent
 // direct-send degradation — zero interception, zero trace). Append the fact
@@ -1143,7 +1154,7 @@ function maybeRetry(ctx: PluginContext): void {
 type GateAttribution =
     | { state: "ok"; sid: string }
     | { state: "none"; initiatorPresent: boolean }
-    | { state: "threw"; message: string };
+    | { state: "threw"; message: string; stack?: string };
 
 // #4082: session identity carried by the REQUEST OBJECT, not the async chain.
 // dsh's `llm/stream` waterfall stamps `options.sessionId` on every model
@@ -1236,7 +1247,15 @@ function attributionOf(ctx: PluginContext): GateAttribution {
         if (typeof sid === "string" && sid.length > 0) return { state: "ok", sid };
         return { state: "none", initiatorPresent: init !== undefined && init !== null };
     } catch (err) {
-        return { state: "threw", message: err instanceof Error ? err.message : String(err) };
+        return {
+            state: "threw",
+            message: err instanceof Error ? err.message : String(err),
+            // #5066: the thrown MESSAGE names the error class but not WHERE the
+            // host threw — the stack is what separates a disposed-scope DI error
+            // (cordis "cannot get required service ... in inactive context")
+            // from anything else, and it was missing from every durable line.
+            ...(err instanceof Error && typeof err.stack === "string" ? { stack: err.stack } : {}),
+        };
     }
 }
 
@@ -2021,6 +2040,10 @@ export function apply(ctx: PluginContext): void {
     // copy goes through persistClientEvent: GUI hosts swallow stderr, which is
     // exactly how the reported zero-traffic case stayed invisible.
     const gateRefusals = new Map<string, { state: string; count: number }>();
+    // #5066: endpoints whose wedged detail (thrown message + stack) already hit
+    // the durable log — every retry re-logs the doom line, so the detail must
+    // fire once per endpoint or it floods the stack again per request.
+    const doomDetailLogged = new Set<string>();
     const gateKeyOf = (url: string): string => {
         try {
             const u = new URL(url);
@@ -2048,6 +2071,7 @@ export function apply(ctx: PluginContext): void {
             since: attrHealth.since,
             ...(attrHealth.error !== undefined ? { error: attrHealth.error } : {}),
             ...(attrHealth.endpoint !== undefined ? { endpoint: attrHealth.endpoint } : {}),
+            ...(attrHealth.wedged === true ? { wedged: true } : {}),
         }).catch(() => undefined);
     };
     // #3651 (owner contract, #3651 thread): 「正常拦截不报告，报告必须可诊断」.
@@ -2062,13 +2086,20 @@ export function apply(ctx: PluginContext): void {
     // error, never legitimate agentless evidence (#1158 L2) — keeps the
     // #3581a cadence (first refusal immediate, then count doubling) and now
     // carries the thrown message + masked endpoint as diagnostics.
-    const noteAttrRefusal = (state: "none" | "threw", detail?: { message?: string; endpoint?: string }): void => {
+    const noteAttrRefusal = (state: "none" | "threw", detail?: { message?: string; endpoint?: string; wedged?: boolean }): void => {
         if (state === "none") return;
         if (detail?.message !== undefined) attrHealth.error = detail.message;
         if (detail?.endpoint !== undefined) attrHealth.endpoint = detail.endpoint;
+        // #5066: sticky within the episode — once one request proved scope-dead
+        // AND over-window, the session is wedged until recovery resets it.
+        if (detail?.wedged === true) attrHealth.wedged = true;
         const diag = {
             ...(attrHealth.error !== undefined ? { error: attrHealth.error } : {}),
             ...(attrHealth.endpoint !== undefined ? { endpoint: attrHealth.endpoint } : {}),
+            // #5066: the ok→refusal transition below REPLACES the record
+            // wholesale — wedged must ride the replacement or the first
+            // wedge of an episode would be silently dropped.
+            ...(attrHealth.wedged === true ? { wedged: true } : {}),
         };
         if (attrHealth.state === "ok") {
             attrHealth = { state, refusals: 1, since: Date.now(), ...diag };
@@ -2108,6 +2139,11 @@ export function apply(ctx: PluginContext): void {
             const suffix = prev !== undefined ? ` (state ${prev.state}→${attr.state})` : "";
             const line = `bili-native-dsh: model request sent DIRECT (uncompressed) — takeover gate refused ${key}: ${reason} — refusals so far: ${count}${suffix}`;
             persistClientEvent(line);
+            // #5066: a fresh/changed threw state adds WHERE the host threw —
+            // the line above carries the message, these carry the frames.
+            for (const frame of attr.state === "threw" ? thrownStackFramesForLog(attr.stack) : []) {
+                persistClientEvent(`bili-native-dsh:   attribution stack: ${frame}`);
+            }
         }
         if (attr.state !== "ok") {
             noteAttrRefusal(attr.state, {
@@ -2125,7 +2161,7 @@ export function apply(ctx: PluginContext): void {
     // session (the host's own compaction and the #1117 direct fallback must
     // both ship the full history upstream, which 400s once it exceeds the
     // window — all recovery paths vanish the instant the gate lets go).
-    const settleThrewAttribution = async (message: string, url: string, body: { bytes: number } | undefined, init: RequestInit | undefined): Promise<GateVerdict> => {
+    const settleThrewAttribution = async (attr: Extract<GateAttribution, { state: "threw" }>, url: string, body: { bytes: number } | undefined, init: RequestInit | undefined): Promise<GateVerdict> => {
         // #3581: after giveUpStreak consecutive requests whose settle-retry
         // exhausted STILL threw, stop re-settling — a disposed ctx stays
         // disposed for the host's whole lifetime (#3578), so retrying the same
@@ -2164,8 +2200,21 @@ export function apply(ctx: PluginContext): void {
         // would accept.
         const doom = bodyProvablyOverWindow(body, init, effectiveContextWindow(ctx));
         if (doom !== undefined) {
-            persistClientEvent(`bili-native-dsh: takeover gate refused ${gateKeyOf(url)} LOCALLY (422) — attribution threw and body ≥${doom.floorTokens} tok (core est ${doom.coreBytes}B/4${doom.mediaBytes > 0 ? `, ${doom.mediaBytes}B media excluded` : ""}) exceeds window ${doom.window} (declared ${doom.declaredWindow}; never assumes below ${MIN_ASSUMED_WINDOW_TOKENS}); a direct send would 400 upstream (#2924/#4111)`);
-            noteAttrRefusal("threw", { message, endpoint: maskUrlForDiagnostics(gateKeyOf(url)) });
+            const key = gateKeyOf(url);
+            persistClientEvent(`bili-native-dsh: takeover gate refused ${key} LOCALLY (422) — attribution threw and body ≥${doom.floorTokens} tok (core est ${doom.coreBytes}B/4${doom.mediaBytes > 0 ? `, ${doom.mediaBytes}B media excluded` : ""}) exceeds window ${doom.window} (declared ${doom.declaredWindow}; never assumes below ${MIN_ASSUMED_WINDOW_TOKENS}); a direct send would 400 upstream (#2924/#4111)`);
+            // #5066: the doom line above carries the NUMBERS; this carries WHAT
+            // the host threw — scope-dead + over-window wedges the session
+            // until the host restarts, and the thrown stack is the only
+            // evidence of which host shape produced it. Once per endpoint.
+            if (!doomDetailLogged.has(key)) {
+                if (doomDetailLogged.size >= 256) doomDetailLogged.clear();
+                doomDetailLogged.add(key);
+                persistClientEvent(`bili-native-dsh: takeover gate WEDGED on ${key} — currentInitiator() threw: ${attr.message}`);
+                for (const frame of thrownStackFramesForLog(attr.stack)) {
+                    persistClientEvent(`bili-native-dsh:   attribution stack: ${frame}`);
+                }
+            }
+            noteAttrRefusal("threw", { message: attr.message, endpoint: maskUrlForDiagnostics(key), wedged: true });
             return "refuse-oversized";
         }
         return refuse(url, attributionOf(ctx));
@@ -2230,7 +2279,7 @@ export function apply(ctx: PluginContext): void {
             });
         }
         if (attr.state === "threw") {
-            return settleThrewAttribution(attr.message, url, body, init).then((verdict) => {
+            return settleThrewAttribution(attr, url, body, init).then((verdict) => {
                 if (verdict === true) {
                     threwStreak = 0;
                     threwGiveUpNoticed = false;
@@ -2870,14 +2919,14 @@ export function _setThrewRetryForTest(cfg?: Partial<typeof DEFAULT_THREW_RETRY>)
 // per host process); _resetAttributionHealthForTest isolates test scenarios.
 // error/endpoint ride along on `threw` reports only (#3651 diagnosable-
 // failure contract) — `none` episodes never report at all.
-let attrHealth: { state: "ok" | "none" | "threw"; refusals: number; since: number; error?: string; endpoint?: string } = { state: "ok", refusals: 0, since: 0 };
+let attrHealth: { state: "ok" | "none" | "threw"; refusals: number; since: number; error?: string; endpoint?: string; wedged?: boolean } = { state: "ok", refusals: 0, since: 0 };
 let attrReportedRefusals = 0;
 let threwStreak = 0;
 let threwGiveUpNoticed = false;
 
 /** Test hook (#3581): snapshot the attribution-health counters and give-up latch. */
-export function _attributionHealthForTest(): { state: "ok" | "none" | "threw"; refusals: number; since: number; error?: string; endpoint?: string; threwStreak: number; gaveUp: boolean } {
-    return { state: attrHealth.state, refusals: attrHealth.refusals, since: attrHealth.since, ...(attrHealth.error !== undefined ? { error: attrHealth.error } : {}), ...(attrHealth.endpoint !== undefined ? { endpoint: attrHealth.endpoint } : {}), threwStreak, gaveUp: threwGiveUpNoticed };
+export function _attributionHealthForTest(): { state: "ok" | "none" | "threw"; refusals: number; since: number; error?: string; endpoint?: string; wedged?: boolean; threwStreak: number; gaveUp: boolean } {
+    return { state: attrHealth.state, refusals: attrHealth.refusals, since: attrHealth.since, ...(attrHealth.error !== undefined ? { error: attrHealth.error } : {}), ...(attrHealth.endpoint !== undefined ? { endpoint: attrHealth.endpoint } : {}), ...(attrHealth.wedged === true ? { wedged: true } : {}), threwStreak, gaveUp: threwGiveUpNoticed };
 }
 
 /** Test hook (#3581): reset the attribution-health counters between scenarios. */

@@ -1296,6 +1296,9 @@ function changelogCatOf(rawLine) {
                 attEl.innerHTML = "<strong>" + escapeHtml(t("sys.attribution_broken", { agent: agent, n: entry.refusals })) + "</strong>"
                     + (entry.error ? '<div class="mono">' + escapeHtml(t("sys.attribution_error", { err: String(entry.error) })) + "</div>" : "")
                     + "<div>" + escapeHtml(t("sys.attribution_impact", { since: sinceText })) + "</div>"
+                    // #5066: scope-dead + over-window = every retry stays locally
+                    // refused until the host restarts — name it and the escape.
+                    + (entry.wedged === true ? "<div>" + escapeHtml(t("sys.attribution_wedged")) + "</div>" : "")
                     + '<div style="margin-top:8px;display:flex;gap:8px">'
                     + '<button id="report-copy-btn" class="btn sm">' + t("sys.report_copy") + "</button>"
                     + '<a id="report-issue-link" class="btn sm" target="_blank" rel="noopener noreferrer" href="#">' + t("sys.report_issue") + "</a>"
