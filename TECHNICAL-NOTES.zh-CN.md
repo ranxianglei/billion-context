@@ -131,6 +131,28 @@ dsh 插件道中,body-keyed 中转站能读到的身份信号只有一个:请求
 
 pi/omp 线路沿用各自的独立打戳门(上文 Responses 线路的 `prompt_cache_key` 提升、Cowork 弃戳)——本节只讲 OpenAI **聊天**线路。
 
+## 插件车道全量重发水位线(#5418)
+
+**问题。** dsh 插件车道每个模型请求都全量重发整个会话 body(约 81 MiB,随历史折叠涨到数百 MB)。bili 的请求路径对该整段 body 做 `JSON.parse` 成 AST(`src/server/handle.ts`),然后 `openaiToCore` 遍历全部约 2 万条消息逐条复核身份后再折叠。两个生产者喂出用户侧 6× OOM(#5403):(1) 每轮全量解析的峰值(AST ≈ body 体积的 3–4×);(2) 跨轮 AST 钉扎(`snapshotMessages` 把解析后的 body 钉进 `session.lastMessages`,只有经 `foldResidentTail` 才释放,而它需要一份持久化证明,在 evict/冷重载抖动 + Windows EPERM 下会卡住)。本节覆盖移除这两个生产者的机制;**它不减少传输量**(重发的字节仍过线 —— 那个终态活归增量车道,#3248)。
+
+**机制 —— 计数字水位线断言替代逐条身份复核。** 不再为每条重发消息重算身份,而是注入层在请求上打一个计数,服务端拿它对照自己的存储权威做断言:
+
+- **请求头 `x-bili-pf-count: K`** —— 由注入层(dsh-native)打戳,客户端逐字回显。含义:「`body.messages` 的前 K 个元素与你上一轮发给我的逐字一致」。
+- **响应头 `x-bili-pf-seq: T`** —— 服务端每轮返回的权威水位线:本轮看到的 `messages[]` 元素总数。
+
+**单位纪律(承重)。** 水位线单位永远是 wire `messages[]` **元素数**,绝不用 DB 行数。`openaiToCore` 把一条 wire 消息展开成 N 个 core part(tool call、图片、reasoning),所以 DB 行与 wire 元素对不齐(#3642)。混用单位会让水位线静默失步。
+
+**匹配路径。** 当回显的 `K` 等于存储权威且统一存储可读时,服务端跑 `scanFastpath`(`src/server/fastpath-scan.ts`)—— 对原始 body 字符串做单遍、offset-only 深度扫描,定位 `messages` 数组并把每个元素的字节跨度记进一个扁平 `Int32Array`(不逐元素解析、不建中间 AST),然后**只**解析未覆盖尾段窗口 `[K−U .. T)`(U = 自上一个块边界以来的消息数,通常几十条而非 2 万条)。出站投影 = 当前渲染的块摘要 + 尾段窗口,与 legacy 路径逐字节相等(尾段消息带 `ledgerSeq`,让 `assignRefs` 发出稳定 ref id —— KDD #13 / #4316,因为 ACP 标签内嵌这些 id)。顶层标量与未知字段原样带走(§7.3)。
+
+**失配路径。** 任何未命中(K ≠ 存储值、头缺失/非法、存储不可读、无活跃块、分流冲突、或已熔断)都把整轮走 legacy 全量解析路径不变,且响应重广播当前权威 `T`,客户端下一轮自愈。连续 5 次失配熔断该会话回到纯全量重发(一条 warn 日志)。最坏情况就是今天的行为 —— 无新失效面。
+
+**门禁与灰度。** 由纯函数 `decideFastpath`(`src/server/fastpath-gate.ts`)按固定优先级裁决(circuit-broken > divert-conflict > rollout-off > not-plugin-mode > agent≠dsh > protocol≠openai > no-active-blocks > header-missing > header-invalid > watermark-missing > watermark-mismatch > storage-unreadable > take)。挂在 `rollout.features.pluginFullResendWatermark`(默认 0%;env `BILI_ROLLOUT_PLUGIN_FULL_RESEND_WATERMARK`)之后。存储可读性沿用增量车道的 `replicasAvailable` 模式。
+
+**信任模型变更(披露)。** 旧 = 每轮 client-authoritative 逐条身份重算;新 = 断言 + 账本复用,熔断兜底。这是 §7.4 人工评审级变更(wire/信任模型);禁 auto-merge。
+
+**分阶段状态。** 本次落地并验证:纯扫描器(`fastpath-scan.ts`,含大 body 性能钉 + 往返不变量测试)、纯 gate(`fastpath-gate.ts`,含双向决策矩阵 —— 一行正例 + 每个原因一行反例,#3617)、rollout 注册项、en/zh 配置 + AGENTS.md 文档。**后续增量(尚未落地):** `handle.ts` 早分流(gate 在全量 `JSON.parse` 之前评估)、fastpath `prepare-openai` 变体及其 A/B golden 逐字节相等证明、`relay.ts` 打 `x-bili-pf-seq`、dsh-native 回显 `x-bili-pf-count`、熔断接线、hermetic 多轮 e2e。在那之前,该特性在 0% 灰度下是惰性的(零用户影响)。
+
+测试(已落地):`tests/fastpath-scan.test.ts`、`tests/fastpath-gate.test.ts`。
 ### #5079:政策反转 —— 自注入默认关闭,一个开关管住两条 wire
 
 owner 定案(取代 #2649 的默认全盖章裁决):大量服务见到这个字段会直接拒绝请求,而这类服务无法预先枚举 —— 所以 bili 不再主动写自己的 `prompt_cache_key`,除非用户要求。闸门是**既有**的 `promptCache.routing` 开关(`ACP_PROMPT_CACHE_ROUTING`,或 Web UI 快速配置),现在同时管住 bili 在**两条 wire** 上的自注入 —— 不新增任何配置面:

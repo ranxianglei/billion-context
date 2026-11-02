@@ -86,6 +86,18 @@ export const ROLLOUT_FEATURES: Record<string, RolloutPlan> = {
     // cohorts (compressed vs deleted) and detects generation switches.
     // Default 0% — force on with `BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY=1`.
     pluginLaneServerHistory: { percent: 0 },
+    // #5418 plugin-lane full-resend watermark: a dsh chat-completions request that
+    // echoes a valid count watermark (`x-bili-pf-count`) matching the server's
+    // stored authority skips the per-round full JSON.parse of the whole resent
+    // body and parses only the uncovered tail window (src/server/fastpath-scan.ts),
+    // killing the OOM-producing parse peak + cross-round AST pinning (#5403). The
+    // outbound projection is byte-identical to the legacy path; any mismatch
+    // degrades to legacy for one round and 5 consecutive mismatches circuit-break
+    // the session back to plain full-resend. Requires storage.unified readable
+    // (replicasAvailable); default 0% — force on with
+    // `rollout.features.pluginFullResendWatermark: true` or
+    // `BILI_ROLLOUT_PLUGIN_FULL_RESEND_WATERMARK=1`.
+    pluginFullResendWatermark: { percent: 0 },
 };
 
 export const BP_MAX = 10_000;
