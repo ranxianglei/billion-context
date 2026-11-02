@@ -39,6 +39,7 @@ import { CREDENTIAL_HEADER_RE, maskHeaderForLog, maskHeadersForLog, maskHostPort
 import { pickAdapter, runCompressLoop } from "../loop/index.js";
 import { ABSORB_INSTRUCTION_MARKER, containsToolCallXmlFragment } from "../loop/tag-echo-filter.js";
 import { dumpsDir } from "../paths.js";
+import { armSessionOverflow } from "../overflow-arm.js";
 import { noteKnownAttachmentIds } from "../phantom-attachment.js";
 import { pipePluginChatWithStrip, pipePluginJson, pipePluginResponsesWithStrip, type UpstreamMeta } from "../plugin.js";
 import { describeCoreTextDuplication, estimateCoreMessages, estimateCoreMessagesUpperBytes } from "../preflight.js";
@@ -1166,154 +1167,92 @@ async function forwardCaptured(
     // nothing persisted/learned) — extracted so the same-request overflow retry
     // below and the !ok passthrough share it exactly once per request.
     let overflowArmed = false;
+    // #4950: shared arming — the in-stream SSE lanes (plugin pipes) and this
+    // HTTP path feed the SAME function, so every overflow shape records
+    // identical evidence (see src/overflow-arm.ts).
     const armOverflowShrink = (info: ContextOverflowInfo): void => {
         if (overflowArmed || !info.isOverflow) return;
         overflowArmed = true;
         const s = prepared!.session;
-        let reqModel: string | undefined;
-        let rawBody: string | undefined;
+        let payloadText: string | undefined;
         try {
-            rawBody = typeof prepared!.body === "string" ? prepared!.body : prepared!.body.toString("utf8");
-            const parsedBody = JSON.parse(rawBody) as Record<string, unknown>;
-            reqModel = typeof parsedBody.model === "string" ? parsedBody.model : undefined;
+            payloadText = typeof prepared!.body === "string" ? prepared!.body : prepared!.body.toString("utf8");
         } catch {
-            reqModel = undefined;
+            payloadText = undefined;
         }
-        if (info.window) {
-            // Arm the emergency shrink at EXACTLY the stated window: the
-            // upstream just proved a turn cannot succeed above it, so the
-            // next turn's kernel emergency nudge + tool-result truncate
-            // must fire. #857: a number the upstream itself stated bounds
-            // the payload (never a content estimate). #1839: it is still an
-            // ARM, not a billing report — tag it "overflow-arm", never
-            // "usage" (the only tier trusted unconditionally);
-            // effectiveTokenCount's fast path and the #496 forward-once gate
-            // accept it as rescue-grade, everything else usage-gated keeps
-            // excluding it. A real usage report on the next successful turn
-            // overwrites it.
-            //
-            // #3738: the armed value must be ≤ the limit the kernel actually
-            // JUDGES against, or the arm can never trigger the fold it
-            // exists to cause. The kernel judges against reqConfig's
-            // output-headroom-RESERVED window, recorded per-request as
-            // `session.metadata.reservedContextLimit` (#4205 split the display
-            // off into the unreserved `effectiveContextLimit`), e.g. 1,048,576
-            // - 256,000 = 792,576 — while `info.window` is the RAW stated
-            // window (1,048,576). A
-            // live limb hit exactly this: upstream 400 "maximum context
-            // length is 1048576 ... you requested 1097304 (841304 in the
-            // messages, 256000 in the completion)", the arm sat at 1,048,576
-            // which is ABOVE the 792,576 judging limit, so the emergency /
-            // over-limit bands read the arm as "still fits" and the client
-            // re-sent the same oversized history every turn — 400 forever.
-            // Clamping to min(stated, reserved) keeps the arm upstream-truth
-            // when the two agree, and only bites when a reservation exists.
-            //
-            // #3450: when the body states the REJECTED PAYLOAD'S OWN size
-            // ("N in the messages"), book THAT as the armed baseline — the
-            // window is a ceiling, not a measurement; arming at the ceiling
-            // made preflight see "payload ~window, deficit 0" while the real
-            // payload sat above its local estimate and the re-forward died.
-            // The #3738 clamp then caps that measurement at the judging limit
-            // (a stated count exceeds the reserved limit exactly when the
-            // completion share pushed the total over the window).
-            const measured = typeof info.requestedMessages === "number" && info.requestedMessages > 0 ? info.requestedMessages : undefined;
-            const judgingLimit = typeof s.metadata.reservedContextLimit === "number" && s.metadata.reservedContextLimit > 0
-                ? s.metadata.reservedContextLimit
-                : typeof s.metadata.effectiveContextLimit === "number" && s.metadata.effectiveContextLimit > 0 ? s.metadata.effectiveContextLimit : 0;
-            const unclampedBaseline = measured ?? info.window;
-            const armedBaseline = judgingLimit > 0 && judgingLimit < unclampedBaseline ? judgingLimit : unclampedBaseline;
-            s.stats.lastInputTokens = armedBaseline;
-            s.stats.lastInputTokensSource = "overflow-arm";
-            // #2313: the rejection came from THIS upstream — stamp the
-            // evidence origin so the #1933 F2 route gate (and the #2313
-            // probe-forward gate) treat the arm as current-route evidence
-            // instead of demoting it against a stale settle origin.
-            s.stats.lastInputTokensOrigin = normalizeUpstreamOrigin(upstreamUrl);
-            // #1110: record the arm SEPARATELY so the side-request guard
-            // can read it without ever touching the nudge baseline. The guard
-            // keeps the CEILING even when the baseline books a measured or
-            // clamped value (#3450) — it must never clamp below what the
-            // upstream proved, and it reserves each side request's own output
-            // from this value itself, so feeding it a pre-reserved number
-            // would double-subtract the headroom.
-            s.stats.overflowArmTokens = info.window;
-            // #3450: the completion share proves this provider bills OUTPUT
-            // against the same wall — remember it so preflight folds against
-            // window − completion (the foldable quantity is MESSAGES).
-            const reserve = typeof info.requestedCompletion === "number" && info.requestedCompletion > 0 ? info.requestedCompletion : undefined;
-            if (reserve !== undefined) {
-                s.stats.overflowArmCompletionReserve = reserve;
-                // #3450 follow-up: same evidence on the provider's lifetime —
-                // the arm retires on the next usage report (#1110), this must
-                // not (see provenCompletionReserve). Scoped to the origin+model.
-                const provenOrigin = normalizeUpstreamOrigin(upstreamUrl);
-                if (provenOrigin !== undefined && reqModel !== undefined) {
-                    s.stats.provenCompletionWall = reserve;
-                    s.stats.provenCompletionWallOrigin = provenOrigin;
-                    s.stats.provenCompletionWallModel = reqModel;
-                }
+        armSessionOverflow(s, info, upstreamUrl, payloadText, log);
+    };
+    // #4950/#1195: run the same-request refold ONCE and re-send the folded
+    // body — shared by the HTTP 400/413 path below and the in-stream SSE
+    // overflow hook handed to the plugin pipes. Returns the retry's transport
+    // result plus the re-prepared object (ok only) or null when nothing
+    // foldable changed the body / the transport failed; the caller decides how
+    // to answer with the verdict. The prepared-swap stays in straight-line
+    // caller code on purpose: assigning that captured variable inside this
+    // nested function defeats TypeScript narrowing for every use further down.
+    const refoldAndResend = async (statedWindow?: number): Promise<{ response: Response; clearTimer: () => void; stopIdleTimer: () => void; newPrepared: Prepared | null } | null> => {
+        if (!overflowRefold || !prepared?.session) return null;
+        // #3787 follow-up: a NUMBERLESS overflow states no window; the armed
+        // baseline (min of declared and the rejected payload's own estimate)
+        // is the only ceiling evidence there is. Judging the refold against
+        // the DECLARED window made preflight see "already fits" and return an
+        // unchanged body — the rescue then only worked when re-render churn
+        // happened to change bytes, which byte-stable rebuilds (#3939 ③)
+        // eliminate. The arm is BY CONSTRUCTION the rejected payload's own
+        // size, so a refold targeting the arm itself leaves nothing to fold
+        // (payload == ceiling on every estimate): fold with a 10% margin
+        // under it, the same headroom discipline as the arm's own
+        // min(declared, est) clamp — the rejection proved the ceiling is
+        // below the payload, give the fold real room.
+        const armedWindow = statedWindow ?? (prepared.session.stats.lastInputTokensSource === "overflow-arm" ? Math.floor(prepared.session.stats.lastInputTokens * 0.9) : undefined);
+        const refolded = await overflowRefold(armedWindow).catch(() => null);
+        if (!refolded) return null;
+        try {
+            // #816 family: the refold rebuilds the body from state summaries —
+            // scrub string bodies again so a lone surrogate can't poison the
+            // retry (see the #1884 seam).
+            const wireRefolded = typeof refolded.body === "string" ? scrubLoneSurrogatesOnWire(refolded.body) : refolded.body;
+            applyResign(headers, wireRefolded);
+            const retried = await fetchWithTimeout(upstreamUrl, { ...init, body: v1Wrap(wireRefolded) }, undefined, clientAbort.signal);
+            if (retried.response.ok) {
+                wireBody = wireRefolded; // #1900: track the accepted re-send as the wire base
             }
-            // #3450: one-time mismatch warning — the upstream-stated window
-            // differs from the window bili actually judges on. #4205: compare
-            // against the UNRESERVED declaration, so routes that reserve output
-            // headroom no longer warn on every arm just because R < N.
-            const declaredWindow = typeof s.metadata.effectiveContextLimit === "number" ? s.metadata.effectiveContextLimit : 0;
-            if (declaredWindow > 0 && declaredWindow !== info.window && !s.stats.overflowArmMismatchWarned) {
-                s.stats.overflowArmMismatchWarned = true;
-                log("warn", `[${s.id}] upstream-stated window ${info.window} differs from the declared window in use (${declaredWindow}, model=${reqModel ?? "unknown"}) — folding targets the smallest of the stated window, the declared window and the per-route output reservation; set compress.modelContextLimit if the declaration is wrong (#3450)`);
-            }
-            log("warn", `[${s.id}] upstream context overflow (model=${reqModel ?? "unknown"}) — window ${info.window} stated upstream${measured !== undefined ? `, rejected payload ~${measured} tokens stated` : ""}${reserve !== undefined ? `, completion reservation ${reserve} tokens` : ""}; armed emergency shrink at ${armedBaseline}${armedBaseline < unclampedBaseline ? ` (clamped to the judging limit ${judgingLimit}, #3738)` : ""}, declared window unchanged (#987)`);
-            // #3900/#4079: the stated count is a usage-grade measurement of
-            // the exact rejected body (#3450) whose local estimate prepare
-            // recorded as the pending k̂ pair — feed it into the SAME ring a
-            // usage settle uses, so the estimator learns even on a route that
-            // only ever overflows and the next preflight judges "doesn't fit"
-            // on the corrected calibre instead of re-forwarding the same body
-            // forever. The refold below re-runs prepare and re-notes a fresh
-            // pair for the folded body (#1195), so retiring the consumed pair
-            // here cannot mispair a later report.
-            if (measured !== undefined) settleOverflowCalibration(s, measured, upstreamUrl);
-        } else {
-            // No window number stated — nothing to learn (and #987
-            // removed the learner anyway), but the rejection itself is
-            // evidence at the size actually sent: arm at
-            // min(declared, payload estimate). A payload BELOW the
-            // declared window being rejected means the declaration is
-            // wrong (or the upstream is flaky) — arming at the payload's
-            // own size never over-triggers, while a payload OVER the
-            // declared window arms at the declaration — which is what
-            // the #496 image-relay forward-once gate needs to break the
-            // #488 400 loop after exactly one rejected forward.
-            // #4205: arm against the JUDGING (reserved) window so the #3738
-            // invariant holds here too; pre-#4205 persisted sessions carry that
-            // value in effectiveContextLimit (the field then held R), hence the
-            // fallback.
-            const judging = typeof s.metadata.reservedContextLimit === "number" && s.metadata.reservedContextLimit > 0
-                ? s.metadata.reservedContextLimit
-                : typeof s.metadata.effectiveContextLimit === "number" ? s.metadata.effectiveContextLimit : 0;
-            let est = 0;
+            return { ...retried, newPrepared: retried.response.ok ? refolded.prepared : null };
+        } catch {
+            // transport failure — the caller answers with what it holds
+            return null;
+        }
+    };
+    // #4950: the plugin pipes see the upstream stream frame-by-frame, so they
+    // are the ONLY place an in-stream (HTTP-200) explicit context overflow is
+    // observed — hand them this hook: fold against the evidence the frame
+    // itself carries and return the folded re-send's body, or null to pass
+    // the failure through verbatim. Arming happens in the pipes (they own the
+    // once-per-stream guard and the zero-visible safety check). No prepared-
+    // swap here either: overflowRefold already updated the caller's
+    // pendingForward in place, and this path returns before forward() reads
+    // prepared again for anything load-bearing.
+    const onInStreamOverflow = async (info: ContextOverflowInfo): Promise<ReadableStream<Uint8Array> | null> => {
+        if (!overflowRefold || !prepared?.session) return null;
+        const retried = await refoldAndResend(info.window);
+        if (retried === null) return null;
+        if (retried.response.ok && retried.response.body) {
+            // The pipe owns the stream from here (reads to EOF); drop the
+            // retry's idle watchdog like makeContinuationRefetch does.
+            retried.stopIdleTimer();
+            log("info", `[${prepared.session.id}] context overflow (in-stream SSE) — refolded and re-sent within the same request, upstream accepted (#4950)`);
+            return retried.response.body as ReadableStream<Uint8Array>;
+        }
+        if (retried.response.body) {
             try {
-                // #1492: same CJK-aware lower bound as armFailureShrink.
-                est = defaultCountTokens(rawBody ?? "");
-            } catch { est = 0; }
-            const arm = Math.max(0, Math.min(judging, Number.isFinite(est) ? est : judging));
-            if (arm > 0) {
-                s.stats.lastInputTokens = arm;
-                // #1839: an estimate promoted to "usage" would enter the nudge
-                // denominator unconditionally — tag it "overflow-arm" instead
-                // (still accepted by effectiveTokenCount + the #496 gate).
-                s.stats.lastInputTokensSource = "overflow-arm";
-                s.stats.overflowArmTokens = arm; // #1110: guard reads this, not the baseline
-                s.stats.lastInputTokensOrigin = normalizeUpstreamOrigin(upstreamUrl); // #2313: same-route evidence, see the window branch above
+                await readStreamToBuffer(retried.response.body);
+            } catch {
+                /* discarded either way */
             }
-            log("warn", `[${s.id}] upstream context overflow (window not parseable, model=${reqModel ?? "unknown"}) — armed emergency shrink at ~${arm} tokens (min of judging window ${judging} and payload estimate), nothing learned (#987): ${info.message}`);
         }
-        // The armed emergency (lastInputTokens) lives in memory only
-        // until scheduled — the error path returns before forward()'s
-        // trailing markDirty, so schedule the save HERE or the arm is
-        // lost on restart.
-        markDirty(s);
+        retried.clearTimer();
+        log("warn", `[${prepared.session.id}] context overflow (in-stream SSE) — refold re-send rejected (HTTP ${retried.response.status}); passing the original failure through (#4950)`);
+        return null;
     };
     // #1195: a context overflow used to arm the shrink and pass the 400 through
     // verbatim, expecting the NEXT turn to fold — but wire clients treat the
@@ -1413,59 +1352,35 @@ async function forwardCaptured(
                 }
             } else if (overflowInfo.isOverflow) {
                 armOverflowShrink(overflowInfo);
-                // #3787 follow-up: a NUMBERLESS overflow states no window; the
-                // armed baseline (min of declared and the rejected payload's
-                // own estimate) is the only ceiling evidence there is. Judging
-                // the refold against the DECLARED window made preflight see
-                // "already fits" and return an unchanged body — the rescue
-                // then only worked when re-render churn happened to change
-                // bytes, which byte-stable rebuilds (#3939 ③) eliminate.
-                // The arm is BY CONSTRUCTION the rejected payload's own size,
-                // so a refold targeting the arm itself leaves nothing to fold
-                // (payload == ceiling on every estimate): fold with a 10%
-                // margin under it, the same headroom discipline as the arm's
-                // own min(declared, est) clamp — the rejection proved the
-                // ceiling is below the payload, give the fold real room.
-                const armedWindow = overflowInfo.window ?? (prepared.session.stats.lastInputTokensSource === "overflow-arm" ? Math.floor(prepared.session.stats.lastInputTokens * 0.9) : undefined);
-                const refolded = await overflowRefold(armedWindow).catch(() => null);
-                if (refolded) {
-                    try {
-                        // #816 family: the refold rebuilds the body from state
-                        // summaries — scrub string bodies again so a lone
-                        // surrogate can't poison the retry (see the #1884 seam).
-                        const wireRefolded = typeof refolded.body === "string" ? scrubLoneSurrogatesOnWire(refolded.body) : refolded.body;
-                        applyResign(headers, wireRefolded);
-                        const retried = await fetchWithTimeout(upstreamUrl, { ...init, body: v1Wrap(wireRefolded) }, undefined, clientAbort.signal);
-                        if (retried.response.ok) {
-                            upstreamResult.clearTimer();
-                            wireBody = wireRefolded; // #1900: track the accepted re-send as the wire base
-                            upstreamResult = retried;
-                            log("info", `[${prepared.session.id}] context overflow — refolded and re-sent within the same request, upstream accepted (#1195)`);
-                            prepared = refolded.prepared;
-                        } else {
-                            let retryErrText: string | null = null;
-                            if (retried.response.body) {
-                                try {
-                                    retryErrText = (await readStreamToBuffer(retried.response.body)).toString("utf8");
-                                } catch {
-                                    retryErrText = null;
-                                }
+                const retried = await refoldAndResend(overflowInfo.window);
+                if (retried) {
+                    if (retried.response.ok) {
+                        upstreamResult.clearTimer();
+                        upstreamResult = retried;
+                        log("info", `[${prepared.session.id}] context overflow — refolded and re-sent within the same request, upstream accepted (#1195)`);
+                        const nextPrepared = retried.newPrepared;
+                        if (nextPrepared !== null) prepared = nextPrepared;
+                    } else {
+                        let retryErrText: string | null = null;
+                        if (retried.response.body) {
+                            try {
+                                retryErrText = (await readStreamToBuffer(retried.response.body)).toString("utf8");
+                            } catch {
+                                retryErrText = null;
                             }
-                            // Answer with the retry's own verdict, not the stale first 400.
-                            upstreamResult.clearTimer();
-                            upstreamResult = {
-                                response: new Response(retryErrText ?? "", {
-                                    status: retried.response.status,
-                                    statusText: retried.response.statusText,
-                                    headers: new Headers(retried.response.headers),
-                                }),
-                                clearTimer: retried.clearTimer,
-                                stopIdleTimer: retried.stopIdleTimer,
-                            };
-                            log("warn", `[${prepared.session.id}] context overflow — refold retry still rejected (HTTP ${retried.response.status}); passing the retry response through (#1195)`);
                         }
-                    } catch {
-                        // transport failure — the buffered original 400 answers below
+                        // Answer with the retry's own verdict, not the stale first 400.
+                        upstreamResult.clearTimer();
+                        upstreamResult = {
+                            response: new Response(retryErrText ?? "", {
+                                status: retried.response.status,
+                                statusText: retried.response.statusText,
+                                headers: new Headers(retried.response.headers),
+                            }),
+                            clearTimer: retried.clearTimer,
+                            stopIdleTimer: retried.stopIdleTimer,
+                        };
+                        log("warn", `[${prepared.session.id}] context overflow — refold retry still rejected (HTTP ${retried.response.status}); passing the retry response through (#1195)`);
                     }
                 }
             }
@@ -1801,6 +1716,7 @@ async function forwardCaptured(
                         wireBodyText,
                         upstreamMeta,
                         reply,
+                        onInStreamOverflow,
                     );
                 } else {
                     // #732/#821: the plugin pipe re-issues the agent's own body
@@ -1829,6 +1745,7 @@ async function forwardCaptured(
                         wireBodyText,
                         upstreamMeta,
                         reply,
+                        onInStreamOverflow,
                     );
                 }
             } else {

@@ -68,7 +68,8 @@ import { describeUpdateReady, getUpdateVisibility } from "./update-notes.js";
 import { warnCacheCollapse } from "./cache-warn.js";
 import { currentContextObservation, recordContextObservation, settleUsageReport } from "./cache-ledger.js";
 import { billOutputUsage } from "./billing.js";
-import { promptInputTotal, declaredInclusiveFromUsage, type WireProtocol } from "./util.js";
+import { classifyStructuredOverflow, promptInputTotal, declaredInclusiveFromUsage, structuredErrorFields, type ContextOverflowInfo, type WireProtocol } from "./util.js";
+import { armSessionOverflow } from "./overflow-arm.js";
 import { stateDir } from "./paths.js";
 import { lookupToolUseIdSession, lookupToolWitness, recordToolUseId, recordToolWitness } from "./tool-ring.js";
 import { awaitDrain } from "./server/stream-io.js";
@@ -2532,6 +2533,7 @@ export async function pipePluginChatWithStrip(
     // swallows the original response object, hence optional.
     upstreamMeta?: UpstreamMeta,
     reply?: HandoffReply,
+    onInStreamOverflow?: (info: ContextOverflowInfo) => Promise<ReadableStream<Uint8Array> | null>,
 ): Promise<void> {
     let reader = stream.getReader();
     let decoder = new TextDecoder("utf-8");
@@ -2693,6 +2695,13 @@ export async function pipePluginChatWithStrip(
     // shifted past the ones already streamed.
     let degenerateRetried = false;
     let truncationRetried = false;
+    // #4950: in-stream context overflow (HTTP 200 + an error frame carrying a
+    // context-window marker): armed at most once per stream — the evidence must
+    // survive even when the frame passes through untouched — and the
+    // swallowed-failure re-send spends the same single re-issue budget as the
+    // two retries above.
+    let overflowArmedHere = false;
+    let overflowRetried = false;
     let forwardedAny = false;
     let inRetry = false;
     let retryIndexOffset = 0;
@@ -2709,7 +2718,7 @@ export async function pipePluginChatWithStrip(
      *  already spent its one re-issue on a zero-visible cut (#2171) cannot also
      *  re-send on a degenerate completion — one re-issue per request, total. */
     const retryEmptyTurn = async (reason: string | undefined): Promise<boolean> => {
-        if (refetch === undefined || truncationRetried) return false;
+        if (refetch === undefined || truncationRetried || overflowRetried) return false;
         // #2303: a terminal turn whose visible prose ends with a compression-draft
         // closing tag and no tool call is non-converged even though it has visible
         // text — the model wrote a handoff/compression draft in prose instead of
@@ -2807,7 +2816,7 @@ export async function pipePluginChatWithStrip(
      *  the #721 in-band error (partial content must not be regenerated). */
     const retryZeroByteCut = async (): Promise<boolean> => {
         if (refetch === undefined) return false;
-        if (degenerateRetried || truncationRetried) return false;
+        if (degenerateRetried || truncationRetried || overflowRetried) return false;
         // Zero-visible predicate: no framing opened, no content block started,
         // no prose accumulated or held by the tag filter, no unparseable frame
         // forwarded verbatim, no partial SSE event left in the buffer.
@@ -3546,6 +3555,66 @@ export async function pipePluginChatWithStrip(
                     } else diagPushType("frame");
                     if (retryFraming(ev)) continue;
                     if (ev["error"] || ev["type"] === "error") sawReplyError = true;
+                    // #4950: the chat wires carry the same in-stream explicit
+                    // context overflow the Responses wire does (an HTTP-200
+                    // stream whose error frame says the input exceeded the
+                    // context window) — classify it, arm the emergency shrink
+                    // like the HTTP path, and take over with a folded re-send
+                    // only when nothing client-visible was delivered yet;
+                    // otherwise pass the frame through verbatim (the armed
+                    // evidence still breaks the #2313 probe loop next round).
+                    if (session && (ev["error"] || ev["type"] === "error")) {
+                        const info = classifyStructuredOverflow(structuredErrorFields(ev));
+                        if (info.isOverflow) {
+                            // Evidence recording is independent of refold capability:
+                            // even without a hook, the armed baseline breaks the
+                            // #2313 probe loop on the next round.
+                            if (!overflowArmedHere) {
+                                overflowArmedHere = true;
+                                armSessionOverflow(session, info, upstreamOrigin, requestText, loggerLog);
+                                log?.(`in-stream context overflow classified (${info.message.slice(0, 120)}); armed emergency shrink (#4950)`);
+                            }
+                            if (onInStreamOverflow !== undefined) {
+                                const visibleYet = sawThinking || sawToolUse || blocksForwarded > 0 || visibleTextChars > 0 ||
+                                    proseAcc.length > 0 || streams.size > 0 || buf.length > 0;
+                                if (!visibleYet && !degenerateRetried && !truncationRetried && !overflowRetried &&
+                                    !res.destroyed && !res.writableEnded) {
+                                    let folded: ReadableStream<Uint8Array> | null = null;
+                                    try {
+                                        folded = await onInStreamOverflow(info);
+                                    } catch {
+                                        folded = null;
+                                    }
+                                    if (folded !== null) {
+                                        overflowRetried = true;
+                                        log?.("in-stream context overflow with nothing client-visible yet; swallowing the failure and piping the folded re-send within the same request (#4950)");
+                                        // Takeover mirrors the degenerate-turn retry's: the replacement
+                                        // feeds under the first attempt's framing (retryFraming /
+                                        // retryIndexOffset), so the client sees one turn — never a
+                                        // success appended behind a delivered failure.
+                                        sawTerminal = false;
+                                        finalFinishReason = undefined;
+                                        delete lastChunkMeta["finishReason"];
+                                        retryIndexOffset = blocksForwarded;
+                                        inRetry = true;
+                                        // The swallowed error was not a reply-level failure of the
+                                        // turn that follows: the folded answer is good output.
+                                        sawReplyError = false;
+                                        streams.clear();
+                                        try {
+                                            await reader.cancel();
+                                        } catch {
+                                            /* already closed */
+                                        }
+                                        reader = folded.getReader();
+                                        decoder = new TextDecoder("utf-8");
+                                        buf = "";
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                    }
                     if (protocol === "anthropic" && ev["type"] === "content_block_start") blocksForwarded++;
                     // After the retryFraming gate: only the first attempt's
                     // message_start reaches here (the retry's was consumed).
@@ -3796,6 +3865,7 @@ export async function pipePluginResponsesWithStrip(
     // #2328 Q2 — see pipePluginChatWithStrip.
     upstreamMeta?: UpstreamMeta,
     reply?: HandoffReply,
+    onInStreamOverflow?: (info: ContextOverflowInfo) => Promise<ReadableStream<Uint8Array> | null>,
 ): Promise<void> {
     let reader = stream.getReader();
     let decoder = new TextDecoder("utf-8");
@@ -3883,6 +3953,13 @@ export async function pipePluginResponsesWithStrip(
     // last item's family can still be held.
     let degenerateRetried = false;
     let truncationRetried = false;
+    // #4950: in-stream context overflow (HTTP 200 + an SSE failed/error frame
+    // carrying a context-window marker): armed at most once per stream — the
+    // evidence must survive even when the frame passes through untouched — and
+    // the swallowed-failure re-send below spends the same single re-issue
+    // budget as the two retries above.
+    let overflowArmedHere = false;
+    let overflowRetried = false;
     let forwardedAny = false;
     let inRetry = false;
     /** Text the client actually assembled from this attempt's deltas. */
@@ -3922,7 +3999,7 @@ export async function pipePluginResponsesWithStrip(
      *  keeps the #721 in-band error. */
     const retryZeroByteCut = async (): Promise<boolean> => {
         if (refetch === undefined) return false;
-        if (degenerateRetried || truncationRetried) return false;
+        if (degenerateRetried || truncationRetried || overflowRetried) return false;
         // Zero-visible predicate: no item framing held, no status observed, no
         // prose accumulated or held by the filters, no verbatim frame
         // forwarded, no partial SSE event left in the buffer.
@@ -4137,7 +4214,7 @@ export async function pipePluginResponsesWithStrip(
      *  drops the held done-family events AND the completion it came from. */
     const retryEmptyTurn = async (status: string | undefined): Promise<boolean> => {
         // truncationRetried: one re-issue per request, total — see the chat-pipe twin.
-        if (degenerateRetried || truncationRetried || refetch === undefined) return false;
+        if (degenerateRetried || truncationRetried || overflowRetried || refetch === undefined) return false;
         // #2303: same shape as the chat-pipe twin — visible prose ending in a
         // compression-draft closing tag with no function call is non-converged.
         // #2612: except when the request itself demands that shape (client
@@ -4379,6 +4456,71 @@ export async function pipePluginResponsesWithStrip(
                         await write(out + rawEvent + "\n\n");
                         continue;
                     }
+                    // #4950: an HTTP-200 stream can carry an EXPLICIT context overflow
+                    // inside it (a response.failed or error frame with a context-window
+                    // marker) that inspectContextOverflow's status gate never sees —
+                    // left unhandled, the #2313 estimate-only probe re-forwards the same
+                    // oversized body forever, because the failed forward records no
+                    // evidence. Classify the structured error, arm the emergency shrink
+                    // exactly like the HTTP path, and when nothing client-visible was
+                    // delivered yet take over with a folded re-send within this same
+                    // request (the #1195 rescue, in-stream form). Otherwise pass the
+                    // failure through verbatim — the armed evidence still breaks the
+                    // probe loop on the next round.
+                    if ((type === "response.failed" || type === "error") && session) {
+                        const info = classifyStructuredOverflow(structuredErrorFields(ev));
+                        if (info.isOverflow) {
+                            // Evidence recording is independent of refold capability:
+                            // even without a hook, the armed baseline breaks the
+                            // #2313 probe loop on the next round.
+                            if (!overflowArmedHere) {
+                                overflowArmedHere = true;
+                                armSessionOverflow(session, info, upstreamOrigin, requestText, loggerLog);
+                                log?.(`in-stream context overflow classified (${info.message.slice(0, 120)}); armed emergency shrink (#4950)`);
+                            }
+                            if (onInStreamOverflow !== undefined) {
+                                const visibleYet = sawFunctionCall || sawReasoning || visibleTextChars > 0 ||
+                                    fastPathChars > 0 || proseAcc.length > 0 || heldEvents.length > 0 ||
+                                    heldVisibleChars > 0 || argStreams.size > 0 || buf.length > 0;
+                                if (!visibleYet && !degenerateRetried && !truncationRetried && !overflowRetried &&
+                                    !res.destroyed && !res.writableEnded) {
+                                    let folded: ReadableStream<Uint8Array> | null = null;
+                                    try {
+                                        folded = await onInStreamOverflow(info);
+                                    } catch {
+                                        folded = null;
+                                    }
+                                    if (folded !== null) {
+                                        overflowRetried = true;
+                                        log?.("in-stream context overflow with nothing client-visible yet; swallowing the failed frame and piping the folded re-send within the same request (#4950)");
+                                        // Takeover mirrors the degenerate-turn retry's: the replacement
+                                        // feeds under the first attempt's framing (inRetry /
+                                        // rewriteRetryIds), so the client sees one response — never a
+                                        // success appended behind a delivered failure.
+                                        sawTerminal = false;
+                                        responseStatus = undefined;
+                                        heldEvents = [];
+                                        heldVisibleChars = 0;
+                                        inRetry = true;
+                                        tagFilter.flush();
+                                        try {
+                                            await reader.cancel();
+                                        } catch {
+                                            /* already closed */
+                                        }
+                                        reader = folded.getReader();
+                                        decoder = new TextDecoder("utf-8");
+                                        buf = "";
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Not safe to take over (visible output already delivered, budget
+                    // spent, client gone) or no fold available: fall through —
+                    // response.failed reaches the terminal branch below, error frames the
+                    // raw exit; both reach the client verbatim.
                     if (type === "response.completed" || type === "response.failed" || type === "response.incomplete") {
                         sawTerminal = true;
                         if (await retryEmptyTurn(type === "response.completed" ? "completed" : undefined)) {
