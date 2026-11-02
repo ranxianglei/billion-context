@@ -20,6 +20,11 @@ import http from "node:http";
 import { once } from "node:events";
 import { defaultConfig } from "acp-kernel";
 import { startServer } from "../src/server.ts";
+
+// #5483: the fold-point carrier move (now default on) legitimately re-lays-out
+// round-2 bodies at the fold boundary; this shape regression pins the legacy
+// layout contract, so run it against the conservative default explicitly.
+process.env.BILI_COMPRESS_AT_FOLD_POINT = "off";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import type { ProxyOptions } from "../src/config.ts";
