@@ -933,6 +933,11 @@ export type ProxyOptions = {
      *  conversations keep the raw key. Opt out with env BILI_SUBAGENT_SPLIT=0
      *  or `subagentSplit: false` in the config file (env wins). */
     subagentSplit?: boolean;
+    /** Split a Claude-over-Responses lane when the instructions text changes
+     *  AND the incoming history does not continue the tracked chain
+     *  (default on). Opt out with env BILI_PERSONA_SPLIT=0 or
+     *  `personaSplit: false` in the config file (env wins). */
+    personaSplit?: boolean;
     /** Opt-in fork block-adoption (#629, default off). ANONYMOUS clients
      *  (prefix-affinity) that fork their history inherit the parent's
      *  fully-present compression blocks instead of restarting at zero.
@@ -1674,6 +1679,7 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         },
         maskHosts: (env.BILI_LOG_MASK_HOSTS ?? (fileConfig.maskHosts === false ? "0" : "1")) !== "0",
         subagentSplit: (env.BILI_SUBAGENT_SPLIT ?? (fileConfig.subagentSplit === false ? "0" : "1")) !== "0",
+        personaSplit: (env.BILI_PERSONA_SPLIT ?? (fileConfig.personaSplit === false ? "0" : "1")) !== "0",
         forkAdoption: (env.BILI_FORK_ADOPTION ?? (fileConfig.forkAdoption === true ? "1" : "0")) !== "0",
         affinitySimhash: (env.BILI_AFFINITY_SIMHASH ?? (fileConfig.affinitySimhash === false ? "0" : "1")) !== "0",
         resumeInheritance: (env.BILI_RESUME_INHERITANCE ?? (fileConfig.resumeInheritance === false ? "0" : "1")) !== "0",
@@ -1904,6 +1910,11 @@ type FileConfig = {
     /** Set `false` to keep Claude Code subagents on the main session (#970;
      *  env BILI_SUBAGENT_SPLIT=0 wins). */
     subagentSplit?: boolean;
+    /** Split a Claude-over-Responses lane when the instructions text changes
+     *  AND the incoming history does not continue the tracked chain
+     *  (default on). Opt out with env BILI_PERSONA_SPLIT=0 or
+     *  `personaSplit: false` in the config file (env wins). */
+    personaSplit?: boolean;
     /** Opt-in fork block-adoption (#629): when an anonymous (prefix-affinity)
      *  client forks its history mid-conversation (edit / regenerate), the new
      *  session inherits the parent's compression blocks whose source content
@@ -2306,7 +2317,7 @@ const KNOWN_TOP_LEVEL_KEYS = new Set([
     "advisoryCheck", "advisoryUrl", "releaseNotesCheck", "releaseNotesUrl",
     "upstreamProxy", "upstreamProxyMode",
     "logFile", "compress", "promptCache", "mitm", "maskHosts",
-    "subagentSplit", "forkAdoption", "affinitySimhash", "resumeInheritance",
+    "subagentSplit", "personaSplit", "forkAdoption", "affinitySimhash", "resumeInheritance",
     "chainContentDetection", "chainEgressStamp", "stableSystemAnchor",
     "rollout",
     "dsh",

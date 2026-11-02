@@ -139,7 +139,7 @@ export function zcodeMemoryConversation(parent: string, headers: Record<string, 
  * (#3482): present header names, the resolved conversation-source header,
  * and the codex user-agent fact. Shared by every predicate below so the
  * signal extraction stays single-sourced. */
-function wireClientSignals(headers: Record<string, string | string[] | undefined>): { headerNames: Set<string>; conversationSourceName: string | undefined; codexUserAgent: boolean } {
+function wireClientSignals(headers: Record<string, string | string[] | undefined>, personaSplitOff?: boolean): { headerNames: Set<string>; conversationSourceName: string | undefined; codexUserAgent: boolean; personaSplitOff?: boolean } {
     const headerNames = new Set<string>();
     for (const [name, value] of Object.entries(headers ?? {})) {
         const first = Array.isArray(value) ? value[0] : value;
@@ -149,15 +149,19 @@ function wireClientSignals(headers: Record<string, string | string[] | undefined
         headerNames,
         conversationSourceName: conversationHeaderSource(headers)?.name,
         codexUserAgent: isCodexClient(headers),
+        personaSplitOff,
     };
 }
 
-export function instructionsFingerprintApplies(headers: Record<string, string | string[] | undefined>): boolean {
+export function instructionsFingerprintApplies(headers: Record<string, string | string[] | undefined>, personaSplitOff?: boolean): boolean {
     // Detection only — the client-identity DECISION (who keys by
     // instructions) lives in the lane-decisions wire-client registry
     // (#3482 site 4): the header-name literals are registry data, not
     // scattered comparisons. Signals are name-free observations here.
-    return resolveWireClientProfile(wireClientSignals(headers)).instructionsFingerprintKeyed;
+    // personaSplitOff (#XXXX): host-level opt-out threaded from ProxyOptions
+    // so resolveWireClientProfile can strip instructionsFingerprintKeyed
+    // without mutating WIRE_CLIENTS literals.
+    return resolveWireClientProfile(wireClientSignals(headers, personaSplitOff)).instructionsFingerprintKeyed;
 }
 
 /** #4352: whether THIS request's claude-code-over-Anthropic traffic should

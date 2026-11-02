@@ -233,6 +233,17 @@ entries:
     desc_zh: "Claude 子代理拥有独立会话命名空间（<session>|sub:<agent-id>），不再排队在主会话锁后。"
     site_en: "<code>subagentSplit</code> — Claude subagents get their own session namespace (on by default)."
     site_zh: "<code>subagentSplit</code> —— Claude 子代理拥有独立会话命名空间（默认开）。"
+  - key: personaSplit
+    type: boolean
+    default: "true"
+    env: BILI_PERSONA_SPLIT
+    group: behavior
+    id: tt.persona
+    site_group: beh
+    desc_en: "Split a Claude-over-Responses lane when the instructions text changes AND the incoming history does not continue the tracked chain (default on). Opt out with env BILI_PERSONA_SPLIT=0 or personaSplit: false (env wins)."
+    desc_zh: "当 instructions 文本变化且入站历史不连续时，把 Claude-over-Responses 车道分叉出去（默认开）。用环境变量 BILI_PERSONA_SPLIT=0 或配置 personaSplit: false 关闭（环境变量优先）。"
+    site_en: "<code>personaSplit</code> — Responses-wire instructions-fingerprint split (on by default; set false / BILI_PERSONA_SPLIT=0 to opt out)."
+    site_zh: "<code>personaSplit</code> —— Responses 线路 instructions 指纹分叉（默认开；false / BILI_PERSONA_SPLIT=0 关闭）。"
   - key: forkAdoption
     type: boolean
     default: "false"

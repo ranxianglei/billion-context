@@ -1191,7 +1191,7 @@ async function handleRequest(
                    // verbatim-identity treatment as the trusted codexTurn
                    // branch above.
                    ? (responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader))
-                   : instructionsFingerprintApplies(req.headers)
+                   : instructionsFingerprintApplies(req.headers, opts.personaSplit === false)
                      // #1106: the instructions fingerprint is an inverted
                      // allowlist — it applies ONLY to codex traffic (root
                      // threads / older builds; subagent threads key by thread-id
@@ -1258,7 +1258,7 @@ async function handleRequest(
         const designNamespaced = zcodeMemory !== undefined || personaForked
             || (protocol === "responses"
                 && codexTurn === undefined
-                && instructionsFingerprintApplies(req.headers)
+                && instructionsFingerprintApplies(req.headers, opts.personaSplit === false)
                 && !sideRequestLike
                 && responsesIdentity !== undefined
                 && conversation !== responsesIdentity.value);
