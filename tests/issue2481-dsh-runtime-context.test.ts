@@ -153,7 +153,7 @@ test("dshRuntimeContextPath: projects both snapshot variants to durable/runtime-
     assert.equal(dshClassifier!(msg("text", "\x3cavailable_skills\x3e…\x3c/available_skills\x3e")), "durable/skill-catalog", "lane entry still covers the #2419 catalog shape");
     assert.equal(dshClassifier!(msg("text", "Instructions from: AGENTS.md")), "durable/agents-md", "lane entry still covers the #2447 baseline shape");
     assert.equal(dshClassifier!(msg("text", RT_MSG)), "durable/runtime-context", "lane entry covers the #2481 snapshot shape");
-    assert.deepEqual(Object.keys(durableMessageToolPaths), ["dsh"], "allowlist stays dsh-only (KDD #9 evidence-permitlist discipline)");
+    assert.deepEqual(Object.keys(durableMessageToolPaths).sort(), ["dsh", "opencode"], "allowlist stays evidence-backed (KDD #9) — no wholesale lanes");
 });
 
 /** Grow a dsh-lane conversation whose fold range POSITIONALLY covers the
