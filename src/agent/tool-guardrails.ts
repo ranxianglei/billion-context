@@ -15,6 +15,8 @@ import type { ExtensionAPI } from "./pi.js";
 
 const DEFAULT_TOOL_OUTPUT_MAX_BYTES = 50_000;
 const REPETITION_GUARD_DEFAULTS = { warn: 3, abort: 5 } as const;
+/** Recovery-mode hard-abort offset past the abort threshold (#5505). */
+const RECOVERY_BACKSTOP_OFFSET = 5;
 
 type ContentPart = { type: string; text?: string; [key: string]: unknown };
 type ToolContent = ContentPart[];
@@ -226,7 +228,7 @@ export class RepetitionTracker {
         }
         if (toolCallId !== undefined) this.pendingStarts.set(toolCallId, { fp, startedAt: now });
         let action: RepetitionAction = "none";
-        const backstop = this.thresholds.abort + 5;
+        const backstop = this.thresholds.abort + RECOVERY_BACKSTOP_OFFSET;
         if (this.thresholds.recovery && this.count >= backstop) action = "hard-abort";
         else if (this.thresholds.recovery && this.count > this.thresholds.abort) action = "soft-stop";
         else if (this.count > this.thresholds.abort) action = "abort";
