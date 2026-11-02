@@ -147,8 +147,11 @@ interface WebSessionSummary {
     /** #4899 v4: the exact tier rates (USD/Mtok) this session's dollar figures
      *  were computed with — live price tiers when resolvable, else the stamped
      *  profile. Exposed so panel formula lines can print the prices themselves.
-     *  Absent when no price resolves (tokens-only session). */
-    rates?: { w: number; r: number; q: number };
+     *  Absent when no price resolves (tokens-only session). #4956: `w` follows
+     *  the kernel fold contract (the cache-WRITE rate); `i` carries the INPUT
+     *  rate separately for the spend/miss faces that bill new content at input
+     *  (absent on stamped-only sessions, where no input-priced face exists). */
+    rates?: { w: number; r: number; q: number; i?: number };
     /** Σ T — measured compression re-pay tokens. */
     repayCost?: number;
     /** Σ σ — summary generation cost (output tokens). */
@@ -205,8 +208,10 @@ interface WebOverview {
     foldsTotal: number;
     /** #4899 v4: single rate triple (USD/Mtok) when every priced session
      *  resolves identical rates — lets formula lines name THE price. Absent
-     *  when several models bill differently (totals stay per-session then). */
-    moneyRates?: { w: number; r: number; q: number };
+     *  when several models bill differently (totals stay per-session then).
+     *  #4956: `i` (input rate) is present only while every input-priced face
+     *  in the fleet agrees on one value. */
+    moneyRates?: { w: number; r: number; q: number; i?: number };
     /** #4899: Σ money-mirrored net savings (only priced sessions contribute). */
     savedUsdTotal: number;
     /** #4899 v2: Σ money-mirrored GROSS savings (avoided turns @ read rate).
@@ -652,12 +657,16 @@ function livePriceForSummary(s: SummarySource): LivePrice | undefined {
 }
 
 /** Absolute $/Mtok profile {w,r,q} for the fold economics mirror, newest
- *  source first: (1) the live-resolved tier prices (input / cacheRead /
+ *  source first: (1) the live-resolved tier prices (cacheWrite / cacheRead /
  *  output) — always fresh, so price edits propagate; (2) a stamped ABSOLUTE
  *  profile (model no longer in any price table); (3) legacy dimensionless
  *  ratio profiles anchored against the stamped billing price (kernel defaults
  *  1/0.1/4 fill partial profiles, as before). Nothing usable → undefined:
- *  tokens only, never fabricated dollars. */
+ *  tokens only, never fabricated dollars. #4956: w is the cache-WRITE rate on
+ *  every branch (kernel fold contract: (w−r)·T re-uploads at the write
+ *  premium) — previously the live branch fed it the INPUT rate, overstating
+ *  savings ~28% for write-premium providers and jumping when a model left the
+ *  table (the stamped branch already carried the write rate). */
 function savedUsdProfileForSummary(s: SummarySource, live?: LivePrice): { w: number; r: number; q: number } | undefined {
     if (live !== undefined) return { w: live.cacheWrite, r: live.cacheRead, q: live.output };
     const o = s.metadata["cachePriceProfile"];
@@ -901,13 +910,13 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
         ? { n: ((agg?.agg?.nc ?? 0) * livePrice.input) / 1e6, c: ((agg?.agg?.cr ?? 0) * livePrice.cacheRead) / 1e6, x: ((agg?.agg?.tr ?? 0) * livePrice.cacheRead) / 1e6 }
         : undefined;
     // #4899 v4: publish the unit rates this session's dollars were computed
-    // with so the panel can print them INSIDE the formulas (fold math uses
-    // usdProf; spend/miss mirrors use livePrice — same tiers whenever both).
+    // with so the panel can print them INSIDE the formulas. #4956: the fold
+    // formula's w is the cache-WRITE rate; the input rate rides along as `i`
+    // for the spend/miss faces that bill new content at input (live-only —
+    // stamped sessions have no input-priced face, so no i).
     const rates = usdProf !== undefined
-        ? { w: usdProf.w, r: usdProf.r, q: usdProf.q }
-        : livePrice !== undefined
-            ? { w: livePrice.cacheWrite, r: livePrice.cacheRead, q: livePrice.output }
-            : undefined;
+        ? { w: usdProf.w, r: usdProf.r, q: usdProf.q, ...(livePrice !== undefined ? { i: livePrice.input } : {}) }
+        : undefined;
     // Untitled sessions: fall back to the first compression block's topic/summary lead.
     let firstBlockHint = "";
     const fb = s.state.blocks.find((b) => b.topic || b.summary);
@@ -1123,7 +1132,7 @@ export async function buildOverview(): Promise<WebOverview> {
     let costUsdTotal = 0, savedUsdTotal = 0, savedUsdGrossTotal = 0, hasMoneyData = false;
     let cuI = 0, cuR = 0, cuW = 0, cuO = 0;
     // #4899 v4: fold count + fleet-wide rate uniformity (see WebOverview.rates).
-    let foldsTotal = 0, mrSeen = false, mrMulti = false, mW = 0, mR = 0, mQ = 0;
+    let foldsTotal = 0, mrSeen = false, mrMulti = false, mW = 0, mR = 0, mQ = 0, mISeen = false, mIMulti = false, mI = 0;
     let missUsdN = 0, missUsdC = 0, missUsdX = 0, hasMissUsd = false;
     let coverageLostFoldTotal = 0, coverageLostFrozenTotal = 0;
     let pbSpent = 0, pbSaved = 0, pbTurns = 0, hasPayback = false;
@@ -1177,6 +1186,12 @@ export async function buildOverview(): Promise<WebOverview> {
                 mR = s.rates.r;
                 mQ = s.rates.q;
             } else if (s.rates.w !== mW || s.rates.r !== mR || s.rates.q !== mQ) mrMulti = true;
+            // #4956: i is optional (stamped-only sessions carry none) — only
+            // present values constrain fleet-wide uniformity.
+            const si = s.rates.i;
+            if (si !== undefined) {
+                if (!mISeen) { mISeen = true; mI = si; } else if (si !== mI) mIMulti = true;
+            }
         }
         if (s.savedUsd !== undefined) {
             hasMoneyData = true;
@@ -1233,7 +1248,7 @@ export async function buildOverview(): Promise<WebOverview> {
         savedUsdTotal,
         savedUsdGrossTotal,
         foldsTotal,
-        ...(mrSeen && !mrMulti ? { moneyRates: { w: mW, r: mR, q: mQ } } : {}),
+        ...(mrSeen && !mrMulti ? { moneyRates: { w: mW, r: mR, q: mQ, ...(mISeen && !mIMulti ? { i: mI } : {}) } } : {}),
         ...(hasPayback
             ? { paybackUsdTotal: { spent: Math.round(pbSpent * 1e4) / 1e4, saved: Math.round(pbSaved * 1e4) / 1e4, turns: pbTurns } }
             : {}),
