@@ -2295,10 +2295,14 @@ export class SessionStore {
     /** #2960 R2.1: summary rows for list surfaces (CLI export, web exposure
      *  tick). Full mode only — in shadow the JSON tree is the truth base and
      *  rows may lag files never yet recorded, so list surfaces must walk.
-     *  Null when unavailable (legacy/shadow/degraded) — callers fall back to
-     *  the legacy file walk. */
+     *  Null when unavailable (legacy/shadow/degraded/network backend) —
+     *  callers fall back to the legacy file walk. */
     unifiedSessionSummaries(): import("./storage/store.js").SessionSummaryRow[] | null {
-        if (!this.shadow?.readsUnified) return null;
+        // #5062: on network backends (mysql) the sync facade misses — its
+        //  miss value [] would masquerade as an authoritative EMPTY index
+        //  (blank session list / "no persisted sessions" on healthy
+        //  installs). Same guard as webSummaryBaseline (#3931 step 3).
+        if (!this.shadow?.readsUnified || this.shadow.isAsyncBackend) return null;
         try {
             return this.shadow.sessionSummaries();
         } catch {

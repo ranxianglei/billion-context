@@ -100,6 +100,11 @@ test("mysql hot path: saves land on the backend, envelopes keep being written, r
         }).shadow;
         assert.ok(shadow, "mysql sidecar must attach after ready()");
         assert.equal(shadow.isAsyncBackend, true, "the shadow must ride the async backend");
+        assert.equal(
+            store.unifiedSessionSummaries(),
+            null,
+            "#5062: the sync summary facade must MISS on network backends — its [] would masquerade as an authoritative empty index (blank list / false 'no persisted sessions')",
+        );
 
         // Hot-path write: the save runs the async ingest queue.
         await store.writeNow(corpus);
