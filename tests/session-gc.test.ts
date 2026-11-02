@@ -5,7 +5,7 @@ import os from "node:os";
 import { once } from "node:events";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import path from "node:path";
-import { defaultConfig } from "acp-kernel";
+import { createCore, createInitialState, defaultConfig, type CoreMessage } from "acp-kernel";
 import { startServer } from "../src/server.js";
 import { SessionStore, _setStoreForTest } from "../src/persist.js";
 import { imageTokensInParsedBody } from "../src/image-tokens.js";
@@ -16,7 +16,10 @@ import { createStorageCodec, parseEncryptionKey } from "../src/encrypt.js";
 import { _resetSessionsForTest, getSession, markDirty, peekSession } from "../src/session.js";
 import type { Session } from "../src/session.js";
 import { contentStoreTokens, gcConfigFromEnv, gcSessionFiles, isGcEligible, viewFromParsed } from "../src/session-gc.js";
+import { adoptContentStore, storeEffectiveCcr } from "../src/store.js";
+import { applyCompressSettings } from "../src/compress-settings.js";
 import { restoreExportDirName } from "../src/image-restore.js";
+import { retrieveSessionDirName } from "../src/paths.js";
 
 const DAY = 86_400_000;
 
@@ -640,5 +643,96 @@ test("gcSessionFiles: session deletion co-deletes its image spill dir; stale spi
         assert.ok(!existsSync(spill), "spill dir co-deleted with its session despite fresh mtime");
         assert.ok(!existsSync(orphan), "stale orphan swept");
         assert.ok(existsSync(fresh), "fresh spill dir kept");
+    });
+});
+
+test("gcSessionFiles: session deletion co-deletes its retrieval export dir; stale export dirs and legacy flat txt swept (#4699)", async () => {
+    const dir = tmpDir("bili-gc-exp-");
+    const exportRoot = tmpDir("bili-gc-exportroot-");
+    await withEnv({ BILI_SESSION_GC: "1" }, async () => {
+        const store = new SessionStore({ dir, debounceMs: 500 });
+        const oldSavedAt = Date.now() - 10 * DAY;
+        const fDel = writeFile(dir, "anthropic/host_del.json", JSON.stringify(envelope("gc-exp-1", oldSavedAt, { metadata: { rawInputTokens: 5000 } })), 10);
+        const sessionFileBytes = statSync(fDel).size;
+        // Export dir for the deleted session, FRESH mtime — the deterministic
+        // co-delete (session id → dir name) must take it despite the age gate.
+        const exp = path.join(exportRoot, retrieveSessionDirName("gc-exp-1"));
+        mkdirSync(exp, { recursive: true });
+        writeFileSync(path.join(exp, "m00001.txt"), "x".repeat(100));
+        // Orphaned stale dir (no session at all), backdated past the age gate.
+        const orphan = path.join(exportRoot, "old-lane");
+        mkdirSync(orphan, { recursive: true });
+        writeFileSync(path.join(orphan, "m00001.txt"), "x".repeat(100));
+        const old = new Date(Date.now() - 30 * DAY);
+        utimesSync(orphan, old, old);
+        // Fresh orphan — kept; live sessions keep their exports.
+        const fresh = path.join(exportRoot, "fresh-lane");
+        mkdirSync(fresh, { recursive: true });
+        writeFileSync(path.join(fresh, "m00001.txt"), "x".repeat(100));
+        // Legacy pre-#4699 flat exports sit directly under the root: stale one
+        // swept, fresh one kept, non-txt stray never ours so never touched.
+        const staleFlat = path.join(exportRoot, "m00042.txt");
+        writeFileSync(staleFlat, "legacy".repeat(10));
+        utimesSync(staleFlat, old, old);
+        const freshFlat = path.join(exportRoot, "m00043.txt");
+        writeFileSync(freshFlat, "live");
+        const stray = path.join(exportRoot, "stray.bin");
+        writeFileSync(stray, "?");
+        utimesSync(stray, old, old);
+
+        const res = await gcSessionFiles({ dir, store, now: Date.now(), exportRoot });
+        assert.equal(res.removed, 1);
+        assert.equal(res.retrievalExportsRemoved, 3, `co-delete + stale orphan + stale flat, got ${JSON.stringify(res)}`);
+        assert.ok(!existsSync(fDel));
+        assert.ok(!existsSync(exp), "export dir co-deleted with its session despite fresh mtime");
+        assert.ok(!existsSync(orphan), "stale orphan swept");
+        assert.ok(existsSync(fresh), "fresh export dir kept");
+        assert.ok(!existsSync(staleFlat), "stale legacy flat txt swept");
+        assert.ok(existsSync(freshFlat), "fresh flat txt kept");
+        assert.ok(existsSync(stray), "non-txt stray untouched");
+        // #4699 review: dir deletions count their CONTENTS in bytesFreed (a
+        // dir's own stat.size is meaningless) — pin the exact total so an
+        // undercounting regression cannot slip through silently.
+        assert.equal(res.bytesFreed, sessionFileBytes + 100 + 100 + 60, `bytesFreed = session file + both dir contents + flat file, got ${res.bytesFreed} vs ${sessionFileBytes}`);
+    });
+});
+
+test("gcSessionFiles: legacy flat txt whose ref a LIVE session still holds is kept (#4699 review)", async () => {
+    const dir = tmpDir("bili-gc-liverefs-");
+    const exportRoot = tmpDir("bili-gc-liverefroot-");
+    await withEnv({ BILI_SESSION_GC: "1" }, async () => {
+        try {
+            // Live session whose content store holds one stored ref — exactly
+            // the upgrade-window shape: pre-upgrade pointers may name the flat
+            // file and the model context may still hold them.
+            const id = "gc-live-ref";
+            const s = getSession(id);
+            storeEffectiveCcr(s, { enabled: true, minToolTokens: 50 });
+            const core = createCore();
+            const msgs: CoreMessage[] = [
+                { id: "u1", role: "user", contentType: "text", text: "run a big build" },
+                { id: "a-tc", role: "assistant", contentType: "tool-call", toolName: "bash", toolCallId: "call_1", text: JSON.stringify({ command: "npm run build" }) },
+                { id: "t-res", role: "tool", contentType: "tool-result", toolCallId: "call_1", toolName: "bash", text: "big tool output ".repeat(400) },
+            ];
+            const turn = core.processTurn({ messages: msgs, state: createInitialState(), config: applyCompressSettings(defaultConfig(200000), 200_000, { absorb: { enabled: true, minToolTokens: 50 }, ccr: { enabled: true, minToolTokens: 50 } }), tokenCount: 0, renderTags: "text-only" });
+            adoptContentStore(s, turn.contentStore);
+            const ref = Object.keys(s.contentStore!.byRef)[0]!;
+
+            const store = new SessionStore({ dir, debounceMs: 500 });
+            const old = new Date(Date.now() - 30 * DAY);
+            const kept = path.join(exportRoot, `${ref}.txt`);
+            writeFileSync(kept, "legacy");
+            utimesSync(kept, old, old);
+            const swept = path.join(exportRoot, "m09999.txt");
+            writeFileSync(swept, "legacy");
+            utimesSync(swept, old, old);
+
+            const res = await gcSessionFiles({ dir, store, now: Date.now(), exportRoot });
+            assert.ok(existsSync(kept), `stale flat ${ref}.txt kept while its ref is live in a session`);
+            assert.ok(!existsSync(swept), "unreferenced stale flat txt swept");
+            assert.equal(res.retrievalExportsRemoved, 1, `only the unreferenced file goes, got ${JSON.stringify(res)}`);
+        } finally {
+            _resetSessionsForTest();
+        }
     });
 });

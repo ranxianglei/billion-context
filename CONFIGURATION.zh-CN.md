@@ -2030,7 +2030,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_SESSION_RESIDENT_MAX_BYTES` | 常驻会话估算字节的软目标（#2803；默认 `536870912` = 512 MiB）。活跃/in-flight 状态不受此限制（字节预算约束的是空闲缓存而非活跃负载）；超出目标时空闲状态随请求完成回落磁盘。文件侧对应：`sessions.residentMaxBytes`。 |
 | `BILI_PUBLIC_SNAPSHOT_CAP_BYTES` | 为公开 fork API 按插件会话保留的原始 wire 历史快照的大小上限（字节，#2017）。序列化快照超限的插件会话不再可 fork —— `GET /__bili/plugin/snapshot` 与 `POST /__bili/plugin/fork` 以 `409` fail-closed 并注明原因 —— 而不是永久保留无上限的原始历史副本。上限在每次插件模型请求时重新评估：会话缩回上限内（fork 裁剪后或宿主缩短历史）即恢复可 fork。默认 `104857600`（100 MiB）；`0` 完全停用留存（所有会话不可 fork，已有快照在下一次请求时丢弃）。文件孪生键：`plugin.snapshotCapBytes`。 |
 | `BILI_SESSIONS_DIR` | 会话持久化目录（默认 XDG data 目录）。 |
-| `BILI_SESSION_GC` | 过期会话文件清理（#1082）为**可选开启**：设 `1`/`true`/`on` 启用 —— 默认关闭，因为会话文件是用户数据（可导出、可续聊），不应有静默删除策略。启用后，扫描（启动 + 每小时）只在**两个条件同时满足**时删除一个文件：年龄超过 `BILI_SESSION_GC_MAX_AGE_DAYS`，并且"小"到无损 —— 该会话**从未被压缩过**（零折叠块）且最近一次请求体 ≤ 下述 token 上限，这样继续对话只损失一次冷重建（用客户端自己的历史重建），别无其他。安全边界：被压缩过的会话永不删除（其摘要无法无损重建）；内存中仍持有的会话会被跳过，除非该会话自上次落盘后一直空闲；不可读/损坏的文件原地保留；每次删除逐条写审计日志（路径、大小、年龄），另有一次非空扫描的汇总日志；只触碰会话目录；清空后的协议子目录一并删除。注意 resident 守卫是进程内的：共享 `BILI_SESSIONS_DIR` 但不落盘的另一实例（如 `BILI_PERSIST=0`）不会刷新文件 mtime，其仍活跃的会话文件可能老化被扫 —— 代价同样是有限的一次冷重建，且有年龄门兜底。CCR 内容存储（#1097）与会话共享生命周期（#1180）：`<hash>.content-store.json` 伴随文件随其会话文件一起删除；孤儿伴随文件（会话文件已不存在）超过年龄门后被清扫；不可读的伴随文件会连同其会话文件一起保留（绝不猜测）。 |
+| `BILI_SESSION_GC` | 过期会话文件清理（#1082）为**可选开启**：设 `1`/`true`/`on` 启用 —— 默认关闭，因为会话文件是用户数据（可导出、可续聊），不应有静默删除策略。启用后，扫描（启动 + 每小时）只在**两个条件同时满足**时删除一个文件：年龄超过 `BILI_SESSION_GC_MAX_AGE_DAYS`，并且"小"到无损 —— 该会话**从未被压缩过**（零折叠块）且最近一次请求体 ≤ 下述 token 上限，这样继续对话只损失一次冷重建（用客户端自己的历史重建），别无其他。安全边界：被压缩过的会话永不删除（其摘要无法无损重建）；内存中仍持有的会话会被跳过，除非该会话自上次落盘后一直空闲；不可读/损坏的文件原地保留；每次删除逐条写审计日志（路径、大小、年龄），另有一次非空扫描的汇总日志；只触碰会话目录与 `<state>/retrieve/` 下的 CCR 导出树（#4699）：每会话的图片溢出目录、每会话的文本导出目录，以及 #4699 之前直接落在 `retrieve/` 下的扁平 `<ref>.txt` 文件——全部是「重新 retrieve / 重新溢出即可再生」的纯缓存；清空后的协议子目录一并删除。注意 resident 守卫是进程内的：共享 `BILI_SESSIONS_DIR` 但不落盘的另一实例（如 `BILI_PERSIST=0`）不会刷新文件 mtime，其仍活跃的会话文件可能老化被扫 —— 代价同样是有限的一次冷重建，且有年龄门兜底。CCR 内容存储（#1097）与会话共享生命周期（#1180）：`<hash>.content-store.json` 伴随文件随其会话文件一起删除；孤儿伴随文件（会话文件已不存在）超过年龄门后被清扫；不可读的伴随文件会连同其会话文件一起保留（绝不猜测）。 |
 | `BILI_SESSION_GC_MAX_AGE_DAYS` | 会话文件成为清理候选的最小年龄（天，默认 `7`）。必须远超任何合理续聊窗口：文件删除后同会话再续聊，消息编号会从 m00001 重新分配，而续聊 agent 的转录里可能还引用着旧编号（内核契约：编号永不复用）。 |
 | `BILI_SESSION_GC_MAX_TOKENS` | 清理资格的大小上限（token 数，默认 `1000000` = 1M，#1082 owner 拍板）。按**解码后**的上下文判断，绝不看文件字节数（加密/zstd 文件在盘上小得多）：记录了最近一次请求体 token 估算值（`rawInputTokens`，每轮记录）时以它为准；未记录的旧文件用 `stats.contextTokens`；伴随的内容存储占用（#1097：唯一内容经内核 CJK-aware `defaultCountTokens` 计数，与 `rawInputTokens` 同一估算器，#1180）叠加其上，防止小会话携带大存储钻过上限。仅适用于从未被压缩过的会话 —— 含折叠块的文件无论多大都保留，因为其摘要无法从重新发送中无损重建。 |
 | `BILI_SESSION_GC_INTERVAL_MS` | 后台清理扫描间隔（毫秒，默认 `3600000` = 1 小时）。启动时会先扫一次。 |
@@ -2490,6 +2490,32 @@ billion-context 把每个会话的压缩状态持久化为会话目录（默认 
 2. **不要同步该目录。** 确认 OneDrive（或 Dropbox / Google Drive 等）没有同步 `%USERPROFILE%\.local\share\billion-context\`。若它位于同步文件夹下，用 `BILI_SESSIONS_DIR` 把它迁到非同步路径。
 
 高频 persist 写入否则会在每一轮反复触发实时扫描 —— 这正是产生 `EPERM` 写失败的原因。目录加入排除项后，告警即止。
+
+### Windows：把持久化数据挪出系统盘（#4699）
+
+Windows 上所有默认根目录都落在系统盘的 `%USERPROFILE%` 下：配置 `%USERPROFILE%\.config\`、数据（会话）`%USERPROFILE%\.local\share\`、缓存 `%USERPROFILE%\.cache\`、状态（日志 + 检索导出）`%USERPROFILE%\.local\state\`。长会话会把这些目录撑得相当大——几百 MB 的会话文件加上 `<state>\retrieve\` 导出是常见体量。这里**刻意不做** `%LOCALAPPDATA%` 特判：它和默认位置在同一个卷上，换过去一字节也省不出来。要真正挪出系统盘，用环境变量把各根指到别的卷：
+
+| 环境变量 | 挪动对象 | 默认值 |
+|---------|---------|--------|
+| `XDG_CONFIG_HOME` | 配置目录（bili 用 `<值>\billion-context`） | `%USERPROFILE%\.config` |
+| `XDG_DATA_HOME` | 数据目录（会话在 `<值>\billion-context\sessions`） | `%USERPROFILE%\.local\share` |
+| `XDG_CACHE_HOME` | 缓存目录 | `%USERPROFILE%\.cache` |
+| `XDG_STATE_HOME` | 状态目录（日志 + `<值>\billion-context\retrieve\` 导出） | `%USERPROFILE%\.local\state` |
+| `BILI_SESSIONS_DIR` | 会话目录本身——必须指到**叶子目录** | `<数据目录>\sessions` |
+
+实测配方（PowerShell；按用户设一次，之后经 bili 启动客户端即可）：
+
+```powershell
+[Environment]::SetEnvironmentVariable('XDG_STATE_HOME',    'F:\billion-context\state',  'User')
+[Environment]::SetEnvironmentVariable('XDG_DATA_HOME',     'F:\billion-context\data',   'User')
+[Environment]::SetEnvironmentVariable('XDG_CACHE_HOME',    'F:\billion-context\cache',  'User')
+[Environment]::SetEnvironmentVariable('XDG_CONFIG_HOME',   'F:\billion-context\config', 'User')
+[Environment]::SetEnvironmentVariable('BILI_SESSIONS_DIR', 'F:\billion-context\data\billion-context\sessions', 'User')
+```
+
+实测踩坑：`BILI_SESSIONS_DIR` 覆盖的是**叶子**会话目录而不是父目录——把它指到 `F:\billion-context\data` 时，会话会静默落到 `F:\billion-context\data\sessions`，不报错。请用上面的完整叶子路径。另外这些是进程级 XDG 变量：同一环境里启动的其他 XDG 感知工具也会跟着走。
+
+已有数据**不会自动迁移**：想保留历史就把旧目录树拷到新根（旧会话在原路径仍可续聊）。#4699 之后的检索导出布局为 `<state>\retrieve\<会话>\<ref>.txt`——每会话一个子目录，两个会话再也不会互相覆盖同号 ref；更早的扁平 `<state>\retrieve\<ref>.txt` 文件仍可读取，超过年龄门后由 GC 清扫。
 
 ### Windows:node 运行时被打了 Low 完整性标签(NTFS mandatory integrity)(#5154)
 
