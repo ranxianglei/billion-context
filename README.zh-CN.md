@@ -341,6 +341,15 @@ bili --no-auto-update        # 本次启动禁用自动更新
 
 参数优先级高于环境变量和配置文件。`bili --help` 列出全部。
 
+### 性能工具（`bili bench` / `bili fixture-gen`，#5460）
+
+只记录不评判的性能基准：`bili bench <scenario>` 把真实代理作为子进程拉起，对着一次性 XDG 目录里的进程内确定性假上游（随机端口、自动更新关闭）重放种子 fixture（顺序全量重发回合，即 dsh 插件车道的流量形状），再读子进程的 `perf.sqlite`（#5460 P1），输出 JSON 产物 —— `total_ms` p50/p95/max/min/mean、入站/出站字节总量、内存 HWM、逐回合错误。**它只记录、不评判**：指标慢照样 exit 0；只有 harness 故障（服务始终未就绪、全部回合失败、遥测未武装、运行中崩溃）才 exit 1。容差带 / 基线棘轮 / FULL+nightly CI 接线是后续工作（#5460 P3）。不带 scenario 的 `bili bench` 列出全部场景：`smoke-openai-tiny`、`proxy-append-openai-s-small`、`proxy-append-openai-s-med`、`proxy-append-anthropic-s-med`、`proxy-compress-openai-s-med`（声明 16K 窗口逼出折叠密度）、`proxy-append-openai-s-large`（约 80 MiB fixture，镜像 #5403 形状 —— nightly 档）。
+
+```bash
+bili bench proxy-append-openai-s-med --rounds 3 --out report.json  # --keep-workdir 保留一次性目录;--dist PATH 指定拉起哪个 dist/index.js
+bili fixture-gen --seed 42 --msgs 2000 --shape anthropic > fx.json # seed/msgs/shape 的纯函数:同输入 ⇒ 字节级一致;--out FILE 写文件而非 stdout
+```
+
 ### 远程 agent（`--host`）
 
 默认绑定 `127.0.0.1`,只接受本机连接。要给其他机器上的 agent 用:`bili --host 0.0.0.0`(或局域网 IP);远程 agent 把模型 `baseURL` 指向 `http://<本机>:<端口>/bili/…`。

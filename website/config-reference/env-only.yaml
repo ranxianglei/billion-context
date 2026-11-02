@@ -66,6 +66,14 @@ entries:
     group: envonly
     desc_en: "Snapshot-render shadow observability (#3756 follow-up): compute the outbound snapshot view on every armed turn WITHOUT using it, classify the diff against the legacy outbound, and surface per-session counters in the web panel + the snapshot-shadow diagnostics topic. 0/false/off disables; 1/true/on enables; otherwise the config-file snapshot.shadow boolean applies (default on). The render lane itself stays rollout-gated (BILI_ROLLOUT_SNAPSHOT_RENDER), so the shadow lane never changes outbound bytes - it is the dry-run evidence that flips the rollout later."
     desc_zh: "快照渲染影子对账（#3756 后续）：每轮已折叠会话都用引擎现算一次出站快照视图但不使用，与 legacy 实际出站比对分类，逐会话计数进 web 面板与 snapshot-shadow 诊断主题。0/false/off 关闭；1/true/on 开启；否则读配置文件 snapshot.shadow 布尔（默认开）。渲染车道本身仍受灰度开关控制（BILI_ROLLOUT_SNAPSHOT_RENDER），影子车道绝不改变出站字节 —— 它是后续翻转灰度的干跑证据。"
+  - key: BILI_PERF_TELEMETRY
+    type: boolean-ish
+    default: "on"
+    kind: env-only
+    audience: user
+    group: envonly
+    desc_en: "Kill switch for #5460 realtime perf telemetry. On by default in DB-backed storage modes (sqlite/mysql): every handled request writes one row plus a 30 s memory-watermark sample into perf.sqlite next to index.db — a separate file, crash/size-isolated from the user's own store; pure-JSON storage mode is frozen and never collects. 0/false disables collection entirely. A telemetry open/insert failure degrades collection (one warn + dead flag) without ever affecting serving."
+    desc_zh: "#5460 实时性能采集总开关。DB 存储模式（sqlite/mysql）下默认开启：每处理一个请求落一行，外加每 30 秒一条内存水位采样，写入 index.db 旁边的独立小库 perf.sqlite —— 独立文件，与用户自己的库崩溃/体积隔离；纯 JSON 存储模式冻结、永不采集。0/false 整体关闭采集。任何打开/插入失败只降级采集（一次性告警 + 死标记），绝不影响服务。"
   - key: BILI_CONFIG_FILE
     type: string
     default: "unset (XDG config path)"
