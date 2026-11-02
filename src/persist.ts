@@ -2299,6 +2299,11 @@ export class SessionStore {
      *  the legacy file walk. */
     unifiedSessionSummaries(): import("./storage/store.js").SessionSummaryRow[] | null {
         if (!this.shadow?.readsUnified) return null;
+        // #3931 step 3: network backends ride the async facade (sync === null)
+        // and the sync sessionSummaries() miss value is [] — which callers read
+        // as "zero sessions" and blank the list (listSessions showed an empty
+        // tree on healthy mysql installs). Null = unavailable = file walk.
+        if (this.shadow.isAsyncBackend) return null;
         try {
             return this.shadow.sessionSummaries();
         } catch {
