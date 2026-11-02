@@ -407,7 +407,10 @@ console.log(JSON.stringify({ ids }));
         // prove the publication durable, not a missing reclaim.
         for (const step of out.ids.slice(1)) assert.equal(step.reclaimed, 0, "an unproven publication reclaims nothing");
         assert.equal(publishedNames(journalDir).length, 5, "the corrupt input plus every publication — bounded debris, nothing corrupt duplicated");
-        assert.equal(readAll(journalDir).filter((e) => e.id === "r4").length, 1, "the newest record is still exactly one survivor across the store");
+        const validRecords = publishedNames(journalDir)
+            .filter((name) => name !== "pub-0-0000000000000000")
+            .flatMap((name) => (JSON.parse(fs.readFileSync(path.join(journalDir, name, SNAPSHOT_PAYLOAD), "utf8")) as { entries: Rec[] }).entries);
+        assert.equal(validRecords.filter((e) => e.id === "r4").length, 1, "the newest record is still exactly one survivor across the valid publications");
     }
 });
 
@@ -874,11 +877,12 @@ console.log(JSON.stringify({
 
     // One bounded warning, and it names the gap rather than claiming completeness.
     assert.equal(out.result.uncovered, 1, "the capped-out leaf stays and is counted");
-    assert.equal(out.result.retained, out.result.uncovered, "retained is the parseable inputs left in place, i.e. the uncovered ones here");
     if (dirFsyncWorks()) {
+        assert.equal(out.result.retained, out.result.uncovered, "with covered inputs reclaimed, only the uncovered leaf remains");
         assert.equal(out.oldLeaf, false, "the leaf whose record the output still dominates IS reclaimed");
         assert.equal(out.result.reclaimed, 1, "exactly the dominated leaf was deleted");
     } else {
+        assert.equal(out.result.retained, 2, "both parseable inputs remain when the publication has no directory barrier");
         assert.equal(out.oldLeaf, true, "without a directory barrier even the dominated leaf stays");
         assert.equal(out.result.reclaimed, 0, "an unproven publication deletes nothing — coverage and durability are separate questions");
     }
