@@ -1271,6 +1271,27 @@ A URL-keyed lane (or a named entry with `bind`) can send **its own** credential 
 
 Compression behaviour is controlled by the `compress` block, which can appear at three levels. They merge **per-field, deepest wins**: a field set at a deeper level overrides the same field higher up, but an *unset* field at a deeper level never clears a value set higher up. In other words, the child covers the parent field-by-field — it never replaces the whole object.
 
+### Per-session opt-out (#5300)
+
+The merge above is the only *static* scope. For one session whose history must never be folded (e.g. a long-lived companion/roleplay conversation where the original wording itself is the asset), exclude it at runtime — no config key, **exact session id** (deliberately no prefix/label matching: a mis-hit would fail silently, defeating the purpose), and the flag persists in the session record across restarts:
+
+```bash
+# turn compression OFF for one session
+curl -s -X POST -H 'content-type: application/json' -d '{"enabled":false}' \
+  http://127.0.0.1:<bili-port>/__bili/session/<session-id>/compress
+
+# read it back — the guard against silent re-enablement (resident sessions
+# answer from memory, cold ones from the store; unknown ids 404)
+curl -s http://127.0.0.1:<bili-port>/__bili/session/<session-id>/compress
+# → {"ok":true,"sessionId":"…","compression":{"enabled":false},"resident":true}
+
+# re-enable when you are done
+curl -s -X POST -H 'content-type: application/json' -d '{"enabled":true}' \
+  http://127.0.0.1:<bili-port>/__bili/session/<session-id>/compress
+```
+
+Semantics while excluded (the same verbatim tail as [`passthrough`](#passthrough), scoped to one session): no fold, no nudge, no tool injection, no preflight, no marker — the client's bytes go out untouched, so the conversation grows unbounded and **window overflow surfaces as the upstream's own error** instead of a quiet fold (that is the point: an explicit failure you can see beats irreversible silent loss). Already-folded blocks stay folded (`decompress` still restores them), and plugin-lane hosts calling the compress tool get a loud refusal (`409 COMPRESSION_DISABLED`) instead of a silent no-op. Every other session on the same model keeps compressing normally. Loopback-only like every `/__bili/` route.
+
 ### Shared external summary service
 
 The optional `compress.externalSummary` block sends compression summaries to one or more separately configured models. It lives at all three `compress` levels like every other field, with whole-chain semantics: a chain set at a deeper level (provider or model) **replaces** the entire chain above it — there is no per-target or per-budget sub-merge, exactly like `tiers`. It is disabled unless `enabled` is `true`; when enabled, targets are tried in order and a failed or unusable target falls through to the next one. The main request provider, model, and authorization are never reused for these calls. This feature changes the compression tool contract so `summary` is an optional non-authoritative hint; the proxy keeps the original messages recoverable and commits only a validated returned summary. Because the conversation model no longer writes the committed summary, its injected compress prompt drops the summary-writing rules (`HOW TO COMPRESS`, `KEEP VERBATIM`, `DROP`, `PRIORITY`) and the per-summary length budget while the chain is enabled; the summary requests themselves still carry the full rules (#4460).
