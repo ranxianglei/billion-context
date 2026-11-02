@@ -1573,7 +1573,8 @@ async function forwardCaptured(
             // dropping reasoning and every following turn split again.
             // #2169: match BOTH field spellings — the chat wire says
             // reasoning_content, DeepSeek's Responses wire says reasoning_text.
-            if (upstream.status === 400 && /reasoning_(?:content|text)/i.test(errText)) {
+            // #5495: DeepSeek's Anthropic-wire endpoint spells it content[].thinking.
+            if (upstream.status === 400 && /reasoning_(?:content|text)|content\[\]\.thinking/i.test(errText)) {
                 if (s.metadata.strictReasoningEcho !== true) {
                     s.metadata.strictReasoningEcho = true;
                     markDirty(s);
