@@ -3921,20 +3921,27 @@ export class SessionStore {
             // #3133: same subsume rule as writeNow.
             this.writerOffPending.delete(session.id);
             const proofRevision = session.revisionEpoch; // #4788 D2: capture BEFORE the sync build
-            let rec: PersistedSession | null = null;
-            try {
-                rec = this.guardedBuild(session)();
-            } catch (err) {
-                // Same never-throw flush contract as the kernel-store branch
-                // below: evictOldest (src/session.ts) calls this without an
-                // error boundary and relies on false to keep the session
-                // resident — a throw would escape the sync eviction path.
-                this.log("error", `[persist] writerOff flushSync build failed for ${session.id}: ${String(err)}`);
-                return false;
+            // The index copy already covers this exact revision (the same
+            // disk proof the idle spill trusts): rebuilding and re-ingesting
+            // an unchanged session would only stall the event loop, which on
+            // eviction of a large session costs tens of seconds.
+            const covered = this.durableRevision.get(session.id) === (proofRevision ?? 0);
+            if (!covered) {
+                let rec: PersistedSession | null = null;
+                try {
+                    rec = this.guardedBuild(session)();
+                } catch (err) {
+                    // Same never-throw flush contract as the kernel-store branch
+                    // below: evictOldest (src/session.ts) calls this without an
+                    // error boundary and relies on false to keep the session
+                    // resident — a throw would escape the sync eviction path.
+                    this.log("error", `[persist] writerOff flushSync build failed for ${session.id}: ${String(err)}`);
+                    return false;
+                }
+                this.maybeCutForkBase(session);
+                if (rec) this.noteMetaFp(session.id, rec.metadata ?? {}); // #5506: index-only flush landed
+                this.noteDurable(session.id, proofRevision); // #4788 D2: index-only flush landed
             }
-            this.maybeCutForkBase(session);
-            if (rec) this.noteMetaFp(session.id, rec.metadata ?? {}); // #5506: index-only flush landed
-            this.noteDurable(session.id, proofRevision); // #4788 D2: index-only flush landed
             this.lastSaveLanded.set(session.id, true);
             this.foldResidentTail(session);
             this.dropResidentBlockContents(session);
