@@ -251,6 +251,15 @@ async function main() {
   const port = await freePort();
   const profileDir = path.join(baseDir, "dsh-home", "profiles", "gate");
   const proxyLog = path.join(baseDir, "proxy.log");
+  // Evidence channel: bili tees every log line to $XDG_STATE_HOME/billion-
+  // context/bili.log AND (historically) to the captured stderr stream above.
+  // Since master's #5012 the stderr leg mutes itself once the log file proves
+  // live on an undrained pipe — exactly this harness's spawn shape — so
+  // post-boot lines live ONLY in bili.log. Every assertion below greps the
+  // evidence file through mark()/slice(), so resolve it per call (bili.log
+  // appends across the mid-Lane-B proxy restart, offsets stay valid).
+  const biliLog = path.join(baseDir, "xdg", "state", "billion-context", "bili.log");
+  const evidenceFile = () => (fs.existsSync(biliLog) ? biliLog : proxyLog);
   const biliConfig = path.join(baseDir, "bili.json");
 
   const childEnv = {
@@ -370,8 +379,8 @@ async function main() {
   fs.writeFileSync(path.join(baseDir, "work", "corpus.md"), buildCorpus(G.corpusTokens));
 
   const ctx = { workDir: path.join(baseDir, "work"), childEnv, proxyLog, port, profileEntry, sessionId: null };
-  const mark = () => fs.statSync(proxyLog).size;
-  const slice = (from, to) => fs.readFileSync(proxyLog, "utf8").slice(from, to ?? undefined);
+  const mark = () => fs.statSync(evidenceFile()).size;
+  const slice = (from, to) => { const f = evidenceFile(); if (f !== proxyLog && !fs.existsSync(f)) throw new Error(`evidence log ${f} vanished`); return fs.readFileSync(f, "utf8").slice(from, to ?? undefined); };
 
   async function turn(prompt, label) {
     const r = spawnSync(
@@ -399,7 +408,8 @@ async function main() {
 
   // ---- 3. proxy up ----------------------------------------------------------
   log(`starting profile proxy on 127.0.0.1:${port} …`);
-  if (!(await startProxy(ctx))) throw new Error(`proxy did not come up — see ${proxyLog}`);
+  if (!(await startProxy(ctx))) throw new Error(`proxy did not come up — see ${proxyLog} (${fs.existsSync(biliLog) ? "" : "and no " + biliLog + " appeared"})`);
+  if (!fs.existsSync(biliLog)) warn("bili.log missing after proxy boot — evidence falls back to proxy.log; post-boot assertions may red because the stderr tee mutes itself (#5012)");
 
   try {
     // ================= Lane A: compression =================================
