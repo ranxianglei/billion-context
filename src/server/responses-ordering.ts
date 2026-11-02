@@ -52,11 +52,8 @@
 
 import type { BiliMessage, ResponseInputItem } from "acp-kernel/wire";
 import { RESPONSES_TURN_SEPARATOR_ID_PREFIX } from "../turn-separator.js";
+import { isSeparatorCarrier, RESPONSES_TURN_SEPARATOR } from "./responses-separator.js";
 import { CoreMessage } from "acp-kernel";
-
-/** The separator's wire text. One literal shared by the producer, the manifest
- *  and the judge; no other module re-exports it (#2627). */
-export const RESPONSES_TURN_SEPARATOR = "[The exchange between these two assistant turns was compressed.]";
 
 /**
  * One marker the producer actually inserted: the exact object identities that
@@ -76,36 +73,6 @@ export interface SeparatorSlot {
   /** The wire carrier carried on that core's `rawResponsesItem` sidecar — the
    *  exact object the codec emits. Reference identity is the ownership proof. */
   carrier: ResponseInputItem;
-}
-
-/**
- * Canonical serialized shape of a lone separator marker: `coreToResponses`
- * renders a single-user-core run to exactly `{type, role, content}` with a
- * plain string body. Requiring EXACTLY those three keys (and a non-empty string
- * body equal to `text`) means a client item carrying extra fields, or an array
- * content, is never mistaken for a carrier.
- */
-export function isSeparatorCarrier(item: unknown, text: string = RESPONSES_TURN_SEPARATOR): boolean {
-  if (item === null || typeof item !== "object" || Array.isArray(item)) return false;
-  const record = item as Record<string, unknown>;
-  const keys = Object.keys(record);
-  if (keys.length !== 3) return false;
-  return record["type"] === "message" && record["role"] === "user" && record["content"] === text;
-}
-
-/**
- * Shape test for a CoreMessage that could be a serialized turn separator.
- *
- * This is deliberately a SHAPE test, not an ownership test: it answers "could
- * this core be an unattributable marker?" — never "does the producer own it?".
- * Only used where ownership is already proven UNKNOWN (an opaque host rewrite
- * destroyed the proof), so that a genuine host marker is not reported as a
- * client insertion. A client that copies the exact prose is indistinguishable
- * here, which is precisely why this predicate must never be used to GRANT an
- * exemption.
- */
-export function isSeparatorCoreShaped(core: CoreMessage, text: string = RESPONSES_TURN_SEPARATOR): boolean {
-  return core.role === "user" && core.contentType === "text" && core.text === text;
 }
 
 /**
@@ -422,27 +389,6 @@ export function separatorProvenanceSet(
     if (claim.index >= wire.length) continue;
     if (!isSeparatorCarrier(wire[claim.index], manifest.text)) continue;
     owned.add(claim.index);
-  }
-  return owned;
-}
-
-/**
- * Translate wire indexes into indexes of a core list parsed from the SAME wire.
- *
- * `responsesToCore` stamps every core it derives from an item with that item's
- * `wireIndex`, and a lone user message yields exactly one core, so the owned wire
- * index maps to the owned core deterministically. Cores without a `wireIndex`
- * (other wire protocols) never match, so non-Responses traffic is unaffected.
- */
-export function separatorCoreProvenance(
-  ownedWireIndexes: ReadonlySet<number>,
-  cores: readonly CoreMessage[] | null | undefined,
-): ReadonlySet<number> {
-  const owned = new Set<number>();
-  if (ownedWireIndexes.size === 0 || !Array.isArray(cores)) return owned;
-  for (let index = 0; index < cores.length; index++) {
-    const wireIndex = cores[index]!.wireIndex;
-    if (wireIndex !== undefined && ownedWireIndexes.has(wireIndex)) owned.add(index);
   }
   return owned;
 }

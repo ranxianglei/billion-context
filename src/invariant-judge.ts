@@ -48,7 +48,8 @@ import { openaiToCore, anthropicToCore, responsesToCore, googleToCore } from "ac
 import { log as loggerLog } from "./logger.js";
 import { invariantJudgeEnabled } from "./knobs.js";
 import { normalizeEchoArtifacts } from "./loop/tag-echo-filter.js";
-import { collectSeparatorManifest, isSeparatorCoreShaped, separatorCoreProvenance, SeparatorManifest, separatorProvenanceSet, type SeparatorSlot } from "./server/responses-ordering.js";
+import { collectSeparatorManifest, SeparatorManifest, separatorProvenanceSet, type SeparatorSlot } from "./server/responses-ordering.js";
+import { isSeparatorCoreShaped, separatorCoreProvenance } from "./server/responses-separator.js";
 
 // `<acp tokens="N" type="T">ref</acp>`; angle brackets hex-escaped per KDD#2.
 // An optional leading newline is consumed too — the renderer injects the tag on

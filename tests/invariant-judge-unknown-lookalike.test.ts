@@ -16,7 +16,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { CoreMessage } from "acp-kernel";
 import { judgeInboundOutbound, type JudgeVerdict } from "../src/invariant-judge.js";
-import { RESPONSES_TURN_SEPARATOR } from "../src/server/responses-ordering.js";
+import { RESPONSES_TURN_SEPARATOR } from "../src/server/responses-separator.js";
 type JudgeOptions = Parameters<typeof judgeInboundOutbound>[2];
 
 let seq = 0;
