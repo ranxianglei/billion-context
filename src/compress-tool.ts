@@ -50,6 +50,7 @@ import type { CompressPromptSections, Prompts, SectionOverride, ToolPrompts } fr
 import { log as loggerLog } from "./logger.js";
 import { maxShrinkPerCompress } from "./fetch-util.js";
 import { EXTERNAL_SUMMARY_NOTE } from "./external-summary-surface.js";
+import { tryBareContentWrap } from "./plugin-compress-salvage.js";
 
 export {
     COMPRESS_TOOL_NAME,
@@ -565,6 +566,21 @@ export function parseCompressInput(input: unknown, callId?: string, options: { q
                 note(`[acp-compress-input] double-escape salvage: recovered ${retry.ranges.length} range(s) after decoding literal backslash-n separators once (kind was ${parsed.diagnostics.kind}) (#3780)`);
                 parsed = retry;
             }
+        }
+    }
+    // #4889: bad shape A (#2580/#2579) reaching lanes without the plugin relay's
+    // wire rewrite — `{"content": <bare line-form text>` with no opening quote.
+    // The kernel ladder recovers nothing here (its truncated-entry salvage
+    // requires the literal `"content": [`), so wrap the bare value as a JSON
+    // string and re-parse; adopt only if strictly more ranges, same discipline
+    // as #3780 — a payload that parses today is never touched. Regex/candidates
+    // shared with the plugin-lane rewrite (plugin-compress-salvage.ts); the
+    // ultimate home for this step is the kernel's parse path pending a change.
+    if (!parsed.diagnostics.ok && parsed.diagnostics.kind !== "ok" && typeof normalized === "string") {
+        const wrapped = tryBareContentWrap(normalized, callId);
+        if (wrapped !== undefined && wrapped.parsed.ranges.length > parsed.ranges.length) {
+            loggerLog("warn", `[acp-compress-input] bare-content salvage: recovered ${wrapped.parsed.ranges.length} range(s) by wrapping the unquoted content value as a JSON string (kind was ${parsed.diagnostics.kind}) (#4889)`);
+            parsed = wrapped.parsed;
         }
     }
     if (parsed.diagnostics.quoteSalvage === true) {

@@ -8,7 +8,7 @@
 // happen only after strict JSON.parse fails, and every rescue is
 // acceptance-tested by re-parsing through parseCompressArgs.
 
-import { parseCompressArgs } from "acp-kernel";
+import { parseCompressArgs, type ParsedCompressInput } from "acp-kernel";
 
 type CompressArgSalvageAction =
     | "verbatim"        // strict JSON — untouched (#1039 invariant)
@@ -48,6 +48,25 @@ function canonicalize(ranges: readonly CanonicalRange[]): string {
     });
 }
 
+// #4889: bad-shape A wrap step extracted so this wire rewrite AND the shared
+// execution-layer parser (parseCompressInput) run ONE implementation instead of
+// two regex copies. Undefined when the shape doesn't match or no candidate
+// survives the acceptance re-parse — callers keep their own result.
+interface BareContentWrap {
+    wrapped: string; // strict JSON: {"content":"…"}
+    parsed: ParsedCompressInput;
+}
+export function tryBareContentWrap(raw: string, callId?: string): BareContentWrap | undefined {
+    const m = BARE_CONTENT_RE.exec(raw);
+    if (!m || !REF_TOKEN_RE.test(m[1])) return undefined;
+    for (const candidate of [m[1], m[1].replace(/[\s"}\]]+$/, "")]) {
+        const wrapped = JSON.stringify({ content: candidate });
+        const parsed = parseCompressArgs(wrapped, callId !== undefined ? { callId } : undefined);
+        if (parsed.ranges.length > 0) return { wrapped, parsed };
+    }
+    return undefined;
+}
+
 export function salvageCompressArgs(raw: string, callId: string): CompressArgSalvage {
     try {
         JSON.parse(raw);
@@ -59,15 +78,9 @@ export function salvageCompressArgs(raw: string, callId: string): CompressArgSal
         return { out: canonicalize(lenient.ranges), action: "canonicalized", kind: lenient.diagnostics.kind, ranges: lenient.ranges.length };
     }
 
-    const m = BARE_CONTENT_RE.exec(raw);
-    if (m && REF_TOKEN_RE.test(m[1])) {
-        for (const candidate of [m[1], m[1].replace(/[\s"}\]]+$/, "")]) {
-            const wrapped = JSON.stringify({ content: candidate });
-            const reparsed = parseCompressArgs(wrapped, { callId });
-            if (reparsed.ranges.length > 0) {
-                return { out: wrapped, action: "wrapped", kind: reparsed.diagnostics.kind, ranges: reparsed.ranges.length };
-            }
-        }
+    const bare = tryBareContentWrap(raw, callId);
+    if (bare !== undefined) {
+        return { out: bare.wrapped, action: "wrapped", kind: bare.parsed.diagnostics.kind, ranges: bare.parsed.ranges.length };
     }
 
     return { out: raw, action: "unrecoverable", ranges: 0 };
