@@ -57,11 +57,13 @@
 //   P5 marker/tag hygiene: every content text unit carries exactly one
 //       well-formed head render tag; the marker→ref map is constant across
 //       ALL turns (ids are never reused); refs unique per turn; OPEN/CLOSE
-//       balanced; the system layer is byte-stable across all turns. At a
-//       SANCTIONED native-compaction boundary the era splits: refs re-seeded
-//       onto the compacted view belong to a new era and the old-era map does
-//       not constrain them (eraBreak option) — within each era the map stays
-//       constant;
+//       balanced; the system layer is byte-stable across all turns, with ONE
+//       sanctioned exception at a SANCTIONED native-compaction boundary
+//       (#5542): the generation-boundary standing note appends exactly once
+//       at the rebase turn, then stays stable again (eraBreak option). At
+//       that boundary the era also splits for refs: refs re-seeded onto the
+//       compacted view belong to a new era and the old-era map does not
+//       constrain them — within each era the map stays constant;
 //   P6 dsh native-compaction rebase (#2596/#2658, all four wires): after a
 //       live fold, the host replaces its history with [checkpoint framing,
 //       retained tail] (the dsh compaction landing — the #2596 cache-loss
@@ -97,6 +99,7 @@ import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { _resetPluginStateForTest } from "../src/plugin.ts";
 import { getSession } from "../src/session.ts";
 import { DSH_CHECKPOINT_OPEN_TAG, DSH_CHECKPOINT_PREAMBLE_PREFIX } from "../src/server/dsh-compaction-guard.ts";
+import { GENERATION_BOUNDARY_NOTE } from "../src/generation-boundary.ts";
 import { rmrf } from "./tmp-rm.ts";
 
 const LT = "\x3c";
@@ -233,27 +236,39 @@ function orderedUnits(entry: Record<string, unknown>, wire: Wire): Unit[] {
     return out;
 }
 
-interface Canon { core: Unit[]; slots: string[]; sys: string; raw: string }
+interface Canon { core: Unit[]; slots: string[]; sys: string; sysText: string; raw: string }
+
+function partTexts(v: unknown): string {
+    if (typeof v === "string") return v;
+    if (Array.isArray(v)) return v.map((p) => { const t = (p as Record<string, unknown>).text; return typeof t === "string" ? t : ""; }).join("");
+    return "";
+}
 
 function canon(raw: string, wire: Wire): Canon {
     const b = JSON.parse(raw) as Record<string, unknown>;
     let sys = "";
+    let sysText = "";
     let entries: Record<string, unknown>[];
     if (wire === "anthropic") {
         sys = typeof b.system === "string" ? b.system : JSON.stringify(b.system ?? null);
+        sysText = partTexts(b.system);
         entries = (b.messages as Record<string, unknown>[]) ?? [];
     } else if (wire === "openai") {
         const msgs = (b.messages as Record<string, unknown>[]) ?? [];
         if (msgs.length > 0 && msgs[0]!.role === "system") {
             sys = JSON.stringify(msgs[0]!.content);
+            sysText = partTexts(msgs[0]!.content);
             entries = msgs.slice(1);
         } else entries = msgs;
     } else if (wire === "responses") {
         const inp = (b.input as Record<string, unknown>[]) ?? [];
         sys = inp.length > 0 ? JSON.stringify(inp[0]) : "";
+        sysText = inp.length > 0 ? partTexts((inp[0] as Record<string, unknown>).content) : "";
         entries = inp.slice(1);
     } else {
         sys = JSON.stringify(b.systemInstruction ?? null);
+        const si = b.systemInstruction as { parts?: unknown } | null | undefined;
+        sysText = si && Array.isArray(si.parts) ? si.parts.map((p) => { const t = (p as Record<string, unknown>).text; return typeof t === "string" ? t : ""; }).join("") : "";
         entries = (b.contents as Record<string, unknown>[]) ?? [];
     }
     const core: Unit[] = [];
@@ -278,7 +293,7 @@ function canon(raw: string, wire: Wire): Canon {
         }
         for (const u of toolsOf(e, wire)) core.push(u);
     }
-    return { core, slots, sys, raw };
+    return { core, slots, sys, sysText, raw };
 }
 
 function keyOf(u: Unit): string {
@@ -356,7 +371,10 @@ function assertTagPolicy(cans: Canon[], label: string, eraBreak?: number): void 
     // native-compaction boundary. Refs before/after belong to different
     // eras (the rebase re-seeds the ref space onto the compacted view), so
     // the marker→ref map is pinned constant WITHIN each era only —
-    // cross-era re-issue is sanctioned, never a bug.
+    // cross-era re-issue is sanctioned, never a bug. The system layer gets
+    // exactly ONE sanctioned delta at that turn (#5542): the generation-
+    // boundary standing note appends once when the reset is witnessed, then
+    // stays byte-stable again; anything else in the delta is a regression.
     const seen = new Map<string, string>();
     const seenNext = new Map<string, string>();
     for (let t = 0; t < cans.length; t++) {
@@ -388,7 +406,17 @@ function assertTagPolicy(cans: Canon[], label: string, eraBreak?: number): void 
         assert.equal(new Set(refs).size, refs.length, `${label} t${t + 1}: duplicate refs in one turn`);
     }
     for (let t = 1; t < cans.length; t++) {
-        assert.equal(cans[t]!.sys, cans[0]!.sys, `${label}: system layer bytes changed at t${t + 1}`);
+        const base = eraBreak !== undefined && t >= eraBreak ? eraBreak : 0;
+        if (t === base) continue;
+        assert.equal(cans[t]!.sys, cans[base]!.sys, `${label}: system layer bytes changed at t${t + 1}`);
+    }
+    if (eraBreak !== undefined && eraBreak > 0) {
+        const pre = cans[0]!.sysText;
+        const post = cans[eraBreak]!.sysText;
+        assert.ok(post.startsWith(pre), `${label} t${eraBreak + 1}: pre-rebase system text must remain an exact prefix after the sanctioned boundary`);
+        const delta = post.slice(pre.length);
+        const allowed = [GENERATION_BOUNDARY_NOTE, "\n\n" + GENERATION_BOUNDARY_NOTE, "\n\n---\n\n" + GENERATION_BOUNDARY_NOTE];
+        assert.ok(allowed.includes(delta), `${label} t${eraBreak + 1}: system-layer delta at the rebase turn must be exactly the generation-boundary note (#5542), got ${JSON.stringify(delta.slice(0, 160))}`);
     }
 }
 
