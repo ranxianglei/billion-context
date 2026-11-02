@@ -224,3 +224,36 @@ test("RepetitionTracker.reset() clears pending timing and completed evidence", (
     t.complete("r2", T0 + 20_100);
     assert.equal(t.note("w", {}, "r3", T0 + 21_000).count, 2, "post-reset run counts normally (fast evidence honored)");
 });
+
+test("RepetitionTracker: pendingStarts stays empty when handler cleans up blocked calls (#5505)", () => {
+    // Simulates the wire handler calling note() then complete() for each
+    // blocked call (final-refuse at 5, soft stop 6-9, hard-abort at 10).
+    // Executed calls (1-4) are completed via tool_result events.
+    // After all calls, pendingStarts must be empty — no leaks.
+    const t = new RepetitionTracker({ warn: 3, abort: 5, backstopEnabled: true });
+    const id = (n: number) => `b${n}`;
+    // Calls 1-2: execute normally — tool_result calls complete()
+    t.note("w", {}, id(1), T0);
+    t.complete(id(1), T0 + 100);
+    t.note("w", {}, id(2), T0 + 200);
+    t.complete(id(2), T0 + 300);
+    // Call 3: warning — call was executed, tool_result completes it
+    assert.equal(t.note("w", {}, id(3), T0 + 400).action, "warn");
+    t.complete(id(3), T0 + 500); // tool_result cleanup
+    // Call 4: warning — call was executed, tool_result completes it
+    assert.equal(t.note("w", {}, id(4), T0 + 600).action, "warn");
+    t.complete(id(4), T0 + 700); // tool_result cleanup
+    // Call 5: final-refuse — handler calls complete() before returning { block: true }
+    assert.equal(t.note("w", {}, id(5), T0 + 800).action, "final-refuse");
+    t.complete(id(5), T0 + 800); // handler cleanup
+    // Calls 6-9: abort (soft stop) — handler calls complete() before returning { block: true }
+    for (let i = 6; i <= 9; i++) {
+        assert.equal(t.note("w", {}, id(i), T0 + i * 100).action, "abort");
+        t.complete(id(i), T0 + i * 100); // handler cleanup
+    }
+    // Call 10: hard-abort (backstop) — handler calls complete() BEFORE ctx.abort()
+    assert.equal(t.note("w", {}, id(10), T0 + 1100).action, "hard-abort");
+    t.complete(id(10), T0 + 1100); // handler cleanup (BEFORE ctx.abort)
+    // After all blocked calls, pendingStarts must be empty
+    assert.equal((t as any).pendingStarts.size, 0, "pendingStarts must be empty — no leaks");
+});
