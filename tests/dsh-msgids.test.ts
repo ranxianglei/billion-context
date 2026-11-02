@@ -341,3 +341,48 @@ test("ids the server would hard-fail on (duplicate/reserved/control) are dropped
         }
     });
 });
+
+test("a turn blocked by the single-flight guard does not burn its msgIds (#4491/#3370)", async () => {
+    await withSetup(async (handle) => {
+        // No ambient initiator — the whole identity (sid + ids) rides the
+        // llm/stream options, same shape as the sibling cases above.
+        handle.setInitiator(undefined);
+
+        // Seed: converted and left UN-ACKED, so the next conversion on this
+        // URL is still inside the guard's single-flight window.
+        const hostMsgs1 = [
+            { id: "u-1", role: "user", content: "hello" },
+            { id: "a-1", role: "assistant", content: "hi there" },
+        ];
+        const turn1 = await dispatchTurn(handle, { sessionId: "sess-guard-burn", messages: hostMsgs1 }, [
+            { role: "user", content: "hello" },
+            { role: "assistant", content: "hi there" },
+        ]);
+        assert.equal(turn1.marker, "1", "seed converted to the incremental lane");
+
+        // Turn 2 while the seed is still pending: the guard leaves the
+        // request on the normal pipeline. The blocked attempt must not
+        // CLAIM this turn's ids client-side — a discarded plan's ids would
+        // be unreclaimable (the all-or-nothing screen screens the retry
+        // against them) and the host's retry would silently lose the whole
+        // msgIds field, pinning the server to content-derived identity.
+        const hostMsgs2 = [...hostMsgs1, { id: "u-2", role: "user", content: "and again" }];
+        const wire2 = [
+            { role: "user", content: "hello" },
+            { role: "assistant", content: "hi there" },
+            { role: "user", content: "and again" },
+        ];
+        const turn2blocked = await dispatchTurn(handle, { sessionId: "sess-guard-burn", messages: hostMsgs2 }, wire2);
+        assert.equal(turn2blocked.marker, null, "single-flight guard: the delta attempt rides the normal pipeline untouched");
+
+        // The seed finally acks; the host retries turn 2 — the retry must
+        // still pin the host ids ("u-2" must not have been burned by the
+        // blocked attempt).
+        ackTurn(turn1.init, 2);
+        const turn2 = await dispatchTurn(handle, { sessionId: "sess-guard-burn", messages: hostMsgs2 }, wire2);
+        assert.equal(turn2.marker, "1", "retry converts once the guard window closes");
+        const body2 = JSON.parse(turn2.init.body as string) as TurnBody;
+        assert.equal(body2.sinceSeq, 2, "delta against the acked base");
+        assert.deepEqual(body2.msgIds, ["u-2"], "the blocked attempt did not burn the delta ids");
+    });
+});

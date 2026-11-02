@@ -190,6 +190,17 @@ entries:
     desc_zh: "出站图片降采样总开关（#3295/#3400）：大图以缩小形态发给模型，原图在会话存储中保持字节级原样。逐请求实时读取。"
     site_en: "<code>imageRescale</code> — egress downscale switch; large outbound images sent shrunken, originals kept byte-exact in session storage."
     site_zh: "<code>imageRescale</code> —— 出站图片降采样总开关；大图以缩小形态出站，原图在会话存储中保持字节级原样。"
+  - key: billing
+    type: object
+    default: "{}"
+    env: []
+    group: upstream
+    id: tt.billing
+    site_group: up
+    desc_en: "Per-model billing prices (#4899): billing.prices[model] = { input, output?, cacheRead?, cacheWrite? } in USD per million tokens; overrides the models.dev snapshot for the panel's USD spend ledger and saved-dollar estimate. Unpriced models show tokens only."
+    desc_zh: "按模型计费单价（#4899）：billing.prices[模型] = { input, output?, cacheRead?, cacheWrite? }，美元/百万 token；覆盖 models.dev 快照价，驱动面板美元花费台账与省钱折算。无价模型只显示 token。"
+    site_en: "<code>billing.prices</code> — per-model USD/Mtok prices feeding the panel's spend + savings views."
+    site_zh: "<code>billing.prices</code> —— 按模型美元/百万 token 单价，驱动面板花费与省钱视图。"
   - key: maskHosts
     type: boolean
     default: "true"
@@ -378,11 +389,11 @@ entries:
     desc_zh: "按 Authorization 方案键控的重签名臂：可重签名的模型请求全程重签转发；无法重签的请求本地 403 拒绝，除非该方案经 passthrough 选择原文透传。"
   - key: promptCache.routing
     type: "\"auto\" | \"enabled\" | \"disabled\""
-    default: "auto"
+    default: "disabled"
     env: ACP_PROMPT_CACHE_ROUTING
     group: behavior
-    desc_en: "Prompt-cache routing posture for cache-aware lane selection."
-    desc_zh: "面向缓存感知路由选择的提示词缓存路由姿态。"
+    desc_en: "Posture of bili's own `prompt_cache_key` emission (both wires); client-supplied keys always forward verbatim."
+    desc_zh: "bili 自注入 `prompt_cache_key` 的姿态（两条 wire 同时生效）；客户端自带的 key 永远原样转发。"
   - key: cacheKeepalive.enabled
     type: boolean
     default: "false"

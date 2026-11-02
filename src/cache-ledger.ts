@@ -18,6 +18,8 @@ import {
 import { log as loggerLog } from "./logger.js";
 import { METADATA_CANONICAL_SYS_FP, METADATA_FOLD_COVERAGE, METADATA_LAST_RESPONSES_MODE, METADATA_SYSTEM_FP } from "./fold-reconcile.js";
 import { clearPostRebuildAnchor, markDirty, type Session } from "./session.js";
+import { isForeignMembership } from "./request-membership.js";
+import { billInputUsage } from "./billing.js";
 import { normalizeUpstreamOrigin } from "./util.js";
 import { toolFail, toolOk, type ProxyToolResult } from "./proxy-tool-result.js";
 
@@ -912,10 +914,20 @@ function seamLcp(a: Buffer, b: Buffer): { lcpBytes: number; msgIndex: number | n
 // returned UTF-16 code units, so CJK offsets were short by up to 3× and the
 // 1024-byte head threshold / ±64-byte append tolerance misfired on them.
 function byteLcp(a: Buffer, b: Buffer): number {
-    let lcp = 0;
     const n = Math.min(a.length, b.length);
-    while (lcp < n && a[lcp] === b[lcp]) lcp++;
-    return lcp;
+    if (n === 0 || a[0] !== b[0]) return 0;
+    // Same integer as the naive per-byte walk ("first k bytes equal" is
+    // monotone in k), but binary search over k with native Buffer.compare
+    // views (memcmp, no copies) — consecutive turns share the whole history
+    // as prefix, so the walk was O(body) of interpreter steps every turn.
+    let lo = 1;
+    let hi = n;
+    while (lo < hi) {
+        const mid = (lo + hi + 1) >>> 1;
+        if (Buffer.compare(a.subarray(0, mid), b.subarray(0, mid)) === 0) lo = mid;
+        else hi = mid - 1;
+    }
+    return lo;
 }
 
 // #3476: true iff `prev` is fully covered by the common prefix (length `lcp`)
@@ -927,9 +939,16 @@ function byteLcp(a: Buffer, b: Buffer): number {
 function isMidInsertionAppend(prev: Buffer, cur: Buffer, lcp: number): boolean {
     if (cur.length <= prev.length || lcp >= prev.length) return false;
     const room = prev.length - lcp;
-    let lcs = 0;
-    while (lcs < room && prev[prev.length - 1 - lcs] === cur[cur.length - 1 - lcs]) lcs++;
-    return lcp + lcs === prev.length;
+    // "the last k bytes of prev equal the last k of cur" is monotone in k —
+    // the same native-compare binary search as byteLcp, over the suffix.
+    let lo = 0;
+    let hi = room;
+    while (lo < hi) {
+        const mid = (lo + hi + 1) >>> 1;
+        if (Buffer.compare(prev.subarray(prev.length - mid), cur.subarray(cur.length - mid)) === 0) lo = mid;
+        else hi = mid - 1;
+    }
+    return lcp + lo === prev.length;
 }
 
 // #2982: byte offset of the CLOSING bracket terminating the top-level
@@ -950,15 +969,21 @@ function messagesArrayCloseOffset(body: Buffer): number | null {
     const n = body.length;
     let depth = 0; // object/array nesting depth
     let inStr = false;
-    let esc = false;
     let want = -1; // depth at which the tracked array closes (-1 = not tracking)
     let keyAt = -1; // opening-quote offset of a candidate top-level key
-    for (let i = 0; i < n; i++) {
+    let i = 0;
+    while (i < n) {
         const c = body[i];
         if (inStr) {
-            if (esc) esc = false;
-            else if (c === 92) esc = true; // backslash
-            else if (c === 34) {
+            if (c === 92) {
+                // Backslash run: JSON parity — an odd-length run escapes the
+                // single byte after it, an even run is pure content.
+                let j = i;
+                while (j < n && body[j] === 92) j++;
+                i = (j - i) % 2 === 1 ? j + 1 : j;
+                continue;
+            }
+            if (c === 34) {
                 inStr = false;
                 if (keyAt >= 0) {
                     // +1/-1 strip the surrounding quotes from the captured range.
@@ -976,16 +1001,35 @@ function messagesArrayCloseOffset(body: Buffer): number | null {
                         }
                     }
                 }
+                i++;
+                continue;
             }
+            // String content: hop to the next quote or backslash (native
+            // scans) instead of branching per byte — the bulk of any body.
+            let m = n;
+            const q = body.indexOf(34, i + 1);
+            if (q !== -1 && q < m) m = q;
+            const b = body.indexOf(92, i + 1);
+            if (b !== -1 && b < m) m = b;
+            i = m;
             continue;
         }
-        if (c === 34) { inStr = true; keyAt = depth === 1 ? i : -1; continue; }
-        if (c === 123 || c === 91) { depth++; continue; }
+        if (c === 34) { inStr = true; keyAt = depth === 1 ? i : -1; i++; continue; }
+        if (c === 123 || c === 91) { depth++; i++; continue; }
         if (c === 125 || c === 93) {
             if (want !== -1 && c === 93 && depth === want) return i;
             depth--;
+            i++;
             continue;
         }
+        // Inter-token filler (whitespace/commas/colons/literals): hop to the
+        // next structural byte, again natively.
+        let m = n;
+        for (const code of [34, 123, 125, 91, 93]) {
+            const p = body.indexOf(code, i + 1);
+            if (p !== -1 && p < m) m = p;
+        }
+        i = m;
     }
     return null;
 }
@@ -1797,13 +1841,30 @@ export function noteOutboundContextEstimates(
 
 export function settleUsageReport(
     session: Session,
-    s: { total: number; reportedCached: number | null; output?: number; protocol?: string; upstream?: string },
+    s: { total: number; reportedCached: number | null; output?: number; protocol?: string; upstream?: string; creation?: number },
     localTextEstimate?: number,
 ): void {
     // #793: a zero-total sample carries no information (gateway placeholder or
     // relay echo) — it must not clobber the last trusted lastInputTokens.
     if (s.total > 0) {
         session.stats.inputTokens += s.total;
+        // #4899: USD spend ledger — input/cache-read/cache-write billed at the
+        // per-request stamped price, in lockstep with the token counters above
+        // (foreign #4805 payloads bill too: the tokens were really spent, the
+        // gate only protects this conversation's anchor family).
+        billInputUsage(session, { total: s.total, cached: s.reportedCached, creation: s.creation });
+        // #4805: id-membership gate — a report produced by a request whose
+        // message ids do not join this session's known id family is foreign
+        // billing data under a colliding session key (auxiliary host personas
+        // stamp the host conversation id on their own tiny payloads). It
+        // still counts toward cumulative usage, but it is not this
+        // conversation's truth and must not touch the anchor family. Abstain
+        // paths (no evidence / first turns / #2821 re-mints) settle exactly
+        // as before: the gate only ever refuses the clearly-foreign.
+        if (isForeignMembership(session.transient?.requestMembership)) {
+            const m = session.transient!.requestMembership!;
+            loggerLog("info", `[${session.id}] [membership] usage sample (total=${s.total}) refused anchor write: its request did not carry the conversation's latest message id (needle=${m.needle ?? "-"}) — foreign payload under a shared session id (#4805)`);
+        } else {
         // Net out this turn's compress credit: the post-compress re-request
         // re-sends the unfolded history, so its usage report over-reports the
         // context the NEXT request will actually carry (see stream.ts applyRanges).
@@ -1813,6 +1874,7 @@ export function settleUsageReport(
         // never by estimate-grade samples or arming paths; dropped at native-
         // compaction boundaries via resetSessionCompression (session.ts).
         session.stats.lastUsageGradeTokens = session.stats.lastInputTokens;
+        session.stats.lastUsagePayloadUpper = session.stats.localInputEstimate ?? 0;
         session.stats.lastInputTokensSource = "usage";
         // #3148: a real usage report supersedes the failed-round arm — drop the
         // visibility marker so acp_status stops advertising a stale emergency state.
@@ -1849,6 +1911,7 @@ export function settleUsageReport(
         // re-arms both in one event).
         delete session.stats.overflowArmTokens;
         delete session.stats.overflowArmCompletionReserve;
+        }
     }
     // #1933 F1: roll the pending pair forward to the current turn's value —
     // it will be consumed by the NEXT report (or cleared when the lane

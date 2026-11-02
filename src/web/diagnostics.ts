@@ -210,8 +210,18 @@ function hostClientVersionLines(): string[] {
         return lines;
     }
     for (const dir of dirs.slice(0, DSH_PROFILE_CAP)) {
-        const vers = DSH_REPORT_PACKAGES.map((p) => `${p.split("/")[1]} ${dshPackageVersion(dir, p) ?? "?"}`).join(", ");
-        lines.push(`dsh profile ${path.basename(dir)}: ${vers}`);
+        const versions = DSH_REPORT_PACKAGES.map((p) => dshPackageVersion(dir, p));
+        if (versions.every((v) => v === undefined)) {
+            // #5146: three bare "?"s told triage nothing about WHERE the version
+            // truth lives — on DSH Desktop bundle installs the @deepseek-ai core
+            // ships inside the app, not under the profile's node_modules (which
+            // holds third-party plugins like billion-context alone), so every
+            // lookup missed and reports lost the host-version dimension entirely.
+            lines.push(`dsh profile ${path.basename(dir)}: (no @deepseek-ai packages under this profile bundle — on desktop installs the core ships inside the app; include the app version)`);
+        } else {
+            const vers = DSH_REPORT_PACKAGES.map((p, i) => `${p.split("/")[1]} ${versions[i] ?? "?"}`).join(", ");
+            lines.push(`dsh profile ${path.basename(dir)}: ${vers}`);
+        }
     }
     if (dirs.length > DSH_PROFILE_CAP) lines.push(`… ${dirs.length - DSH_PROFILE_CAP} more profile(s)`);
     return lines;

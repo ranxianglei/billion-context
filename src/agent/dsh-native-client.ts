@@ -94,7 +94,11 @@ const SLOW_POLL_INTERVAL_MS = 10000;
 // the web UI's own nav terminology (src/web/i18n.ts) so each tab reads like
 // the title of the page inside the frame. "connect" stays out: it documents
 // how OTHER clients reach this proxy, which makes no sense from inside dsh.
-const PAGE_IDS = ["overview", "sessions", "config", "logs", "updates"] as const;
+// #4906 follow-up (owner 2026-10-27): "blog" joins right after "updates" so
+// the master-pulled 博客 sits next to 版本 in the dsh bili设置 tab bar; an
+// older embedded frame without the #/blog route falls back to its own
+// default page inside the iframe (no blank pane).
+const PAGE_IDS = ["overview", "sessions", "config", "logs", "updates", "blog"] as const;
 type PageId = (typeof PAGE_IDS)[number];
 const PAGE_KEYS: Record<PageId, string> = {
     overview: "tab_overview",
@@ -102,6 +106,7 @@ const PAGE_KEYS: Record<PageId, string> = {
     config: "tab_config",
     logs: "tab_logs",
     updates: "tab_updates",
+    blog: "tab_blog",
 };
 
 // #3816: the exact field a remote user adds to enable the #3373 relay. A
@@ -491,6 +496,7 @@ const zh: Dict = {
     "tab_config": "配置",
     "tab_logs": "日志",
     "tab_updates": "版本",
+    "tab_blog": "博客",
     "tab_ctx": "上下文",
     "ctx_waiting": "等待首个模型请求…",
     "ctx_nodata": "暂无上下文数据——完成一次模型请求后自动刷新。",
@@ -519,6 +525,7 @@ const en: Dict = {
     "tab_config": "Config",
     "tab_logs": "Logs",
     "tab_updates": "Versions",
+    "tab_blog": "Blog",
     "tab_ctx": "Context",
     "ctx_waiting": "Waiting for the first model request…",
     "ctx_nodata": "No context data yet — refreshes automatically after the first model request.",

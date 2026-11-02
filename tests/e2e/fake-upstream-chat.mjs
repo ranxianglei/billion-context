@@ -114,7 +114,11 @@ function compressArgs(refs) {
     // zone (last 5 messages / most recent user message).
     if (refs.length === 0) return {};
     const start = refs[0];
-    return { content: [{ startId: start, endId: start, summary: "e2e fold: scripted compress round over the run-one filler message" }] };
+    // #4823 narrowed the advertised schema to the single string form; hosts
+    // like opencode/pi validate tool args against it client-side, so the
+    // scripted call must use the canonical string (the array form is still
+    // accepted by bili's lenient parser but dies at host validation).
+    return { content: `${start}–${start} e2e fold\nscripted compress round over the run-one filler message` };
 }
 
 // A chain-checkpoint carrier (<bili-chain ... /> #1421 step 3) rides as a

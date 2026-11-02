@@ -38,16 +38,12 @@ interface SpawnRecord {
 // clone (plugin injection only; 2.x directory wrapper when the host is 2.x).
 test("runLaunch opencode-inline: no proxy spawned, BILI_OPENCODE_INLINE=1, attach/proxy env stripped, plugin rides OPENCODE_CONFIG", async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-ocinline-"));
-    const prevHome = process.env.HOME;
-    const prevUserProfile = process.env.USERPROFILE;
     const prevXdg = process.env.XDG_CONFIG_HOME;
     const prevOcConfig = process.env.OPENCODE_CONFIG;
     const prevClientBin = process.env.BILI_CLIENT_BIN;
     const prevBcp = process.env.BILLION_CONTEXT_PROXY;
     const prevHttpsProxy = process.env.HTTPS_PROXY;
     const prevMitmHosts = process.env.BILI_MITM_HOSTS;
-    process.env.HOME = home;
-    if (prevUserProfile !== undefined) process.env.USERPROFILE = home;
     // Isolated config root: no user opencode.json, no ambient OPENCODE_CONFIG.
     process.env.XDG_CONFIG_HOME = path.join(home, ".config");
     delete process.env.OPENCODE_CONFIG;
@@ -122,14 +118,15 @@ test("runLaunch opencode-inline: no proxy spawned, BILI_OPENCODE_INLINE=1, attac
             const childComspec = ce.COMSPEC ?? ce.ComSpec ?? ce.comspec;
             const expectedComspec = typeof childComspec === "string" && childComspec.trim().length > 0 ? childComspec : "cmd.exe";
             assert.equal(cap.command, expectedComspec, "#679 comspec wrap uses the child env's COMSPEC");
-            assert.deepEqual(cap.args.slice(0, 3), ["/d", "/s", "/c"]);
+            const quotedOc = /\s/.test(fakeOc) ? `"${fakeOc}"` : fakeOc;
+            assert.deepEqual(cap.args, ["/d", "/s", "/c", `"${quotedOc}"`]);
             assert.equal(cap.verbatim, true, "#679 verbatim argv keeps cmd.exe from re-splitting");
             assert.match(cap.args[3] ?? "", /^".*\.cmd"$/, "comspec line wraps the quoted .cmd shim");
         } else {
             assert.equal(cap.command, fakeOc);
             assert.deepEqual(cap.args, []);
         }
-        const env = spawns[0].env!;
+        const env = cap.env!;
         assert.equal(env.BILI_OPENCODE_INLINE, "1");
         assert.equal(env.BILLION_CONTEXT_PROXY, undefined, "inherited BILLION_CONTEXT_PROXY must be stripped (attach would win)");
         assert.equal(env.HTTPS_PROXY, undefined, "inherited HTTPS_PROXY must be stripped (no MITM lane)");
@@ -153,9 +150,6 @@ test("runLaunch opencode-inline: no proxy spawned, BILI_OPENCODE_INLINE=1, attac
         assert.equal(clone.compaction?.auto, false, "host auto-compaction stays off (ACP owns compression)");
     } finally {
         process.exit = prevExit;
-        process.env.HOME = prevHome;
-        if (prevUserProfile === undefined) delete process.env.USERPROFILE;
-        else process.env.USERPROFILE = prevUserProfile;
         if (prevXdg === undefined) delete process.env.XDG_CONFIG_HOME;
         else process.env.XDG_CONFIG_HOME = prevXdg;
         if (prevOcConfig === undefined) delete process.env.OPENCODE_CONFIG;

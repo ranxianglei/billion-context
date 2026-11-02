@@ -1,9 +1,11 @@
-import { DEFAULT_ABSORB_CONFIG, DEFAULT_CCR_CONFIG, defaultPrompts, resolvePrompts, createPackResolver, defaultPackSources, isValidPackName, type AbsorbConfig, type Config, type CcrConfig, type PackSurface, type Prompts } from "acp-kernel";
+import { DEFAULT_ABSORB_CONFIG, DEFAULT_CCR_CONFIG, defaultPrompts, resolvePrompts, createPackResolver, builtinSource, createDirPackSource, isValidPackName, type AbsorbConfig, type Config, type CcrConfig, type Pack, type PackSurface, type Prompts } from "acp-kernel";
 import * as path from "node:path";
 import { findRoute, type CompressSettings, type NamedProviderRecipe, type ProviderRoutes } from "./config.js";
 import { configDir } from "./paths.js";
 import { log as loggerLog } from "./logger.js";
 import { expandExternalSummaryChainTolerant, type ExternalSummarySettings } from "./external-summary-settings.js";
+import { resolveCompressAtFoldPoint, resolveCompressAtFoldPointClearThinking } from "./knobs.js";
+import { shippedPacksSource } from "./chat-pack.js";
 
 export type { CompressSettings } from "./config.js";
 
@@ -93,6 +95,10 @@ export function mergeCompress(
         rules: pick("rules"),
 
         visibilityMarkers: pick("visibilityMarkers"),
+        // #4313 (PR #5236): display gate — global level only; provider/model
+        // values are merged here but the consumer (resolveMessageTimestamps)
+        // reads the GLOBAL setting, mirroring the single shared core.
+        messageTimestamps: pick("messageTimestamps"),
         streamSummary: pick("streamSummary"),
         // `reasoning` is a third nested-object field merged sub-field-wise
         // exactly like `absorb`/`prompts`: a model-level `threshold` must not
@@ -102,6 +108,10 @@ export function mergeCompress(
         outputSteering: outputSteeringLevels.length > 0 ? Object.assign({}, ...outputSteeringLevels) : undefined,
         priceProfile: priceProfileLevels.length > 0 ? Object.assign({}, ...priceProfileLevels) : undefined,
         reconcile: pick("reconcile"),
+        // Experimental fold-point carrier relocation (env-resolved later, in
+        // applyCompressSettings; here only the file tiers cascade).
+        compressAtFoldPoint: pick("compressAtFoldPoint"),
+        compressAtFoldPointClearThinking: pick("compressAtFoldPointClearThinking"),
         promptPack: pick("promptPack"),
         // Whole-chain replace (same semantics as `tiers`/`rules`): an
         // `externalSummary` object at a deeper level replaces the entire
@@ -162,24 +172,35 @@ interface SurfaceResolution {
     packVersion?: string;
 }
 
+function packResolver(
+    dirs?: { projectDir?: string; userDirs?: readonly string[] },
+): ReturnType<typeof createPackResolver> {
+    // #5319: host-shipped packs sit between the user dirs and the kernel
+    // builtin registry — same-name user/project files still win, and the
+    // kernel registry itself stays untouched (Kernel Boundary: adding a pack
+    // must not require a kernel/** change).
+    return createPackResolver([
+        createDirPackSource("project", dirs?.projectDir ?? path.join(process.cwd(), ".billion-context", "packs")),
+        ...(dirs?.userDirs ?? [path.join(configDir(), "packs")]).map((dir) => createDirPackSource("user", dir)),
+        shippedPacksSource,
+        builtinSource,
+    ]);
+}
+
 /** Resolve the pack surface for one request: `promptPack` names a pack in the
- *  kernel's resolver chain [project `./.billion-context/packs` > user
- *  `<configDir>/packs` > builtin registry]. Unknown names fall back to the
- *  identity surface ({} — kernel defaults everywhere) with a one-time-per-name
- *  warning, so a typo never degrades the compression prompts. Directory
- *  layout is host policy; resolution/sanitization is the kernel's. */
+ *  host's resolver chain [project `./.billion-context/packs` > user
+ *  `<configDir>/packs` > shipped host-bundled packs (`chat`, #5319) > kernel
+ *  builtin registry]. Unknown names fall back to the identity surface
+ *  ({} — kernel defaults everywhere) with a one-time-per-name warning, so a
+ *  typo never degrades the compression prompts. Directory layout is host
+ *  policy; resolution/sanitization is the kernel's. */
 export function resolveCompressSurfaceDetailed(
     s: CompressSettings,
     dirs?: { projectDir?: string; userDirs?: readonly string[] },
 ): SurfaceResolution {
     const name = s.promptPack;
     if (typeof name !== "string" || name === "default" || !isValidPackName(name)) return { surface: {}, packName: "default" };
-    const resolver = createPackResolver(
-        defaultPackSources({
-            projectDir: dirs?.projectDir ?? path.join(process.cwd(), ".billion-context", "packs"),
-            userDirs: dirs?.userDirs ?? [path.join(configDir(), "packs")],
-        }),
-    );
+    const resolver = packResolver(dirs);
     const pack = resolver.resolve(name);
     if (!pack) {
         if (!warnedUnknownPack.has(name)) {
@@ -189,6 +210,14 @@ export function resolveCompressSurfaceDetailed(
         return { surface: {}, packName: "default" };
     }
     return { surface: pack.surface, packName: name, packVersion: pack.version };
+}
+
+/** Every pack resolvable by name right now (first-wins per name) — the panel
+ *  picker's inventory (#5319 web half). Same chain as per-request resolution. */
+export function listResolvedPacks(
+    dirs?: { projectDir?: string; userDirs?: readonly string[] },
+): Pack[] {
+    return packResolver(dirs).listPacks();
 }
 
 export function resolveCompressSurface(
@@ -298,6 +327,10 @@ export function applyCompressSettings(base: Config, limit: number, s: CompressSe
         nudge.growthFloor = s.nudgeGrowthTokens;
         nudge.growthCap = s.nudgeGrowthTokens;
     }
+    // Experimental fold-point carrier relocation (#view-transform-A): the env
+    // tier wins over every file level per knob doctrine (#2030), resolved
+    // per request like every other wire-facing knob. Off = byte-identical
+    // pre-change behavior (the kernel node fast-paths to the same array ref).
     // #3211: explicit 0 is meaningful (legacy any-pending pressure behavior),
     // so pass it through instead of skipping like the growth-token knobs.
     if (s.minPressureBenefitTokens !== undefined) nudge.minPressureBenefitTokens = s.minPressureBenefitTokens;
@@ -357,6 +390,13 @@ export function applyCompressSettings(base: Config, limit: number, s: CompressSe
         externalSummary: s.externalSummary !== undefined ? expandExternalSummaryChainTolerant(s.externalSummary, recipes) : (base as ResolvedKernelConfig).externalSummary,
         ...(absorb !== undefined ? { absorb } : {}),
         ...(ccr !== undefined ? { ccr } : {}),
+        // Fold-point carrier relocation pair: explicit pass-through so an unset
+        // flag never leaks a stale base value into the resolved config.
+        compressAtFoldPoint: resolveCompressAtFoldPoint(process.env, s.compressAtFoldPoint),
+        compressAtFoldPointClearThinking: resolveCompressAtFoldPointClearThinking(
+            process.env,
+            s.compressAtFoldPointClearThinking,
+        ),
         ...(s.rules !== undefined ? { rules: { enabled: s.rules === true } } : {}),
     };
     return resolved;
@@ -390,6 +430,13 @@ export function resolveRequestConfig(
 ): ResolvedKernelConfig {
     const compress = resolveCompress(routes, embeddedUrl, model, globalCompress);
     const limit = resolveContextLimitValue(compress.modelContextLimit, native ?? base.modelContextLimit);
-    if (!hasCompressSettings(compress) && limit === base.modelContextLimit) return base;
+    // #5470 opt-in reachability: an env-only enablement of either fold-point
+    // switch is invisible to hasCompressSettings (env never joins the file
+    // cascade), so without these checks such a lane would hit the short-circuit
+    // below and the knob would silently die. Both-falsy keeps the original
+    // short-circuit byte-for-byte (zero behavior change when nothing is set).
+    const cafAt = resolveCompressAtFoldPoint(process.env, compress.compressAtFoldPoint);
+    const cafCt = resolveCompressAtFoldPointClearThinking(process.env, compress.compressAtFoldPointClearThinking);
+    if (!hasCompressSettings(compress) && limit === base.modelContextLimit && !cafAt && !cafCt) return base;
     return applyCompressSettings(base, limit, compress, namedProviders ?? {});
 }

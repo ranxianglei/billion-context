@@ -14,6 +14,8 @@ import {
     persistEpermAlertThreshold as knobPersistEpermAlertThreshold,
     persistEpermAlertRepeatMs as knobPersistEpermAlertRepeatMs,
     resolveJsonWriterOff as knobResolveJsonWriterOff,
+    contentStorePinned,
+    sessionResidentHardMaxBytes,
     resolveArchiveAfterDays,
     fileStorageUnified,
     fileStorageJsonWriter,
@@ -29,11 +31,13 @@ import { createStorageCodec, parseEncryptionKey } from "./encrypt.js";
 import { PersistEpermAlert } from "./persist-eperm.js";
 import { createInitialState, defaultCountTokens, prune, type CompressionState, type CoreMessage, type MessageContentStore } from "acp-kernel";
 import { markDirty } from "./session.js";
+import { validCostUsd } from "./billing.js";
 import { mergeState } from "./state-hydration.js";
 import { restampRefsToLedger, restampContentStore } from "acp-kernel";
-import { LazyBlockContents, isDroppedMetadata, lazyMetadata } from "./session.js";
+import { LazyBlockContents, isDroppedContentStore, isDroppedMetadata, lazyContentStore, lazyMetadata, peekSession, sessionWeight } from "./session.js";
 import type { Session, BlockContent, BlockView } from "./session.js";
-import { orphanContents, resolveStorageMode, UnifiedShadow, type StorageMode } from "./storage/shadow.js";
+import { orphanContents, resolveStorageMode, UnifiedShadow, hadIntegrityQuickCheckFailure, type StorageMode } from "./storage/shadow.js";
+import { noteColdLoad } from "./attach-heartbeat.js";
 import { resolveBackendName } from "./storage/backend.js";
 import { toLegacyLike, type LegacySessionLike } from "./storage/ingest.js";
 import { sha256Hex, type CheckpointRow, type MessageRefContentRow } from "./storage/store.js";
@@ -112,6 +116,36 @@ import { currentContextObservation, CALIBRATION_CLAMP_MAX, CALIBRATION_CLAMP_MIN
  */
 
 const PERSIST_VERSION = 3;
+// #5188: wall-clock cooldown between sidecar reopen attempts driven by the
+// SAVE path (see tryRecoverSidecar). A fixed constant — no config surface
+// (#5140): 30 s of spacing bounds the retry cost while still healing an
+// fd-spike-class outage within one agent turn. The READ path
+// (replicasAvailable) paces itself much faster below, because a read asking
+// "are replicas available?" must get a fresh answer instead of waiting for
+// the next write (#5140's cold-restore snapshot 409 arrived milliseconds
+// after construction, before any save could trigger a retry).
+const SHADOW_REOPEN_COOLDOWN_MS = 30_000;
+const SHADOW_REOPEN_READ_CHECK_MS = 100;
+// #5188 round 3: patient-wait budget for the user-visible 409 paths
+// (snapshot/fork) when the sidecar is missing after a transient first-open
+// failure. The read-check slot above drives the recovery ATTEMPTS; this only
+// bounds how long a request waits for that recovery before failing closed
+// exactly as before. Latched-disabled never waits (nothing brings it back
+// without a restart), so the wait can never mask structural breakage.
+const RECON_REPLICAS_WAIT_MS = 750;
+const RECON_REPLICAS_POLL_MS = 50;
+let shadowReopenCooldownMsOverride: number | null = null;
+let shadowReopenReadCheckMsOverride: number | null = null;
+
+/** Test seam: shrink/restore the #5188 sidecar-reopen save-path cooldown (null = default).
+ *  Mirrors setSqliteEnginesUnavailableForTests — always reset by the tests. */
+export function setShadowReopenCooldownMsForTests(ms: number | null): void {
+    shadowReopenCooldownMsOverride = ms;
+}
+/** Test seam: shrink/restore the #5188 read-path availability-check interval (null = default). */
+export function setShadowReopenReadCheckMsForTests(ms: number | null): void {
+    shadowReopenReadCheckMsOverride = ms;
+}
 /** Dotfile (invisible to the kernel's .json walk): written after the first
  *  successful #286 migration pass so later boots skip the scan entirely. */
 const MIGRATION_MARKER = ".bili-migration-286.done";
@@ -167,6 +201,7 @@ interface PersistedSession {
         // pendingFoldUsage / lastLocalTextEstimate(+Origin), which ride along
         // but are deliberately not restored — see buildSession).
         localInputEstimate?: number;
+        lastUsagePayloadUpper?: number;
         lastUsageGradeTokens?: number;
         calibratedEstimate?: number;
         calibratedEstimateOrigin?: string;
@@ -184,6 +219,10 @@ interface PersistedSession {
         rangeRestores?: number;
         wholeBlockRestores?: number;
         wholeBlockRestoresPreciseAvailable?: number;
+        // #5303: USD spend ledger (#4899) rides along via buildRecord's spread;
+        // buildSession restores it (dropping it zeroed historical spend on
+        // every cold load).
+        costUsd?: { input: number; cacheRead: number; cacheWrite: number; output: number };
     };
     /** Free-form escape hatch (v2+). */
     metadata?: Record<string, unknown>;
@@ -305,7 +344,22 @@ export function fileNameMatchesId(base: string, id: string, protocol?: string, u
 /** Session persistence policy over the kernel StateStore mechanism. The
  *  public API predates the extraction and is kept stable for session.ts /
  *  server.ts / export.ts. */
+// #5408: a cold-loaded view older than this on a session that has compressed
+// is treated as stale (its fold state predates unseen turns). Observability
+// only — the warn never changes what is served.
+const STALE_COLD_LOAD_WARN_MIN = 30;
+// #5408: how often the frozen-skip ERROR may repeat per session.
+const FROZEN_SKIP_NOTICE_COOLDOWN_MS = 10 * 60_000;
+
 export class SessionStore {
+    /** #5188: args of the SYNCHRONOUS first-open path only. When that path ran
+     *  and failed, the save path retries maybeOpen on a cooldown; intentional
+     *  opt-outs (persistence off, encryption active) and the mysql async attach
+     *  never record args, so they keep their documented one-shot posture. */
+    private readonly syncSidecarOpen: { legacyLoad: (rec: unknown) => LegacySessionLike | null } | null = null;
+    private sidecarReopenNextAttemptAt = 0;
+    private sidecarReadCheckNextAttemptAt = 0;
+
     readonly enabled: boolean;
     private readonly sessionsDir: string;
     private readonly store: StateStore<PersistedSession>;
@@ -380,22 +434,37 @@ export class SessionStore {
     // #3931 step 3: assigned asynchronously for network backends (mysql) —
     // see the constructor and ready().
     private shadow?: UnifiedShadow;
+    /** Only alive while one synchronous record build hydrates both lazy fields. */
+    private residentFieldsForBuild?: {
+        id: string;
+        fields: { metadata?: Record<string, unknown>; blockContents?: Record<string, BlockContent> } | null;
+    };
     /** #2960 ②: sessions whose fork_base checkpoint has been cut (or was
      *  found already present) — memoized so steady-state writes of receipt
      *  sessions do not re-query the checkpoints table every flush. */
     private readonly forkBaseCut = new Set<string>();
     private readonly storageMode: StorageMode;
     /** Phase 3 (#2960): true only when the JSON envelope is actually skipped —
-     *  requires an explicit off request AND effective-full mode. If the
-     *  sidecar dies mid-run (3-strike disable) writerOffActive() turns false
-     *  and file writes resume on the very next save (fail-safe: never a
-     *  window with no persistent copy at all). */
+     *  requires an explicit off request AND effective-full mode.
+     *  writerOffActive() additionally needs a LIVE sidecar, so if the sidecar
+     *  never comes up at all (e.g. a proven-corrupt index alarms and boots
+     *  without it, or an engine-less environment refuses) envelope writes
+     *  stay ON for the whole life of this process (fail-safe: never a window
+     *  with no persistent copy at all). */
     private readonly jsonWriterOff: boolean;
     /** #3931 step 3: resolves when the async backend (mysql) opened (or
      *  failed to — the sidecar just stays undefined). Resolved immediately
      *  for sqlite/legacy boots. */
     private readonly mysqlReady: Promise<void> = Promise.resolve();
-    /** Await the storage backend before first use (mysql pool + DDL). */
+    /** #4942: true when a network backend (mysql) was selected for
+     *  unified-full mode — the sidecar attaches asynchronously, so before
+     *  ready() resolves this.shadow is still undefined while the DB already
+     *  carries rows. */
+    private readonly networkFullExpected: boolean = false;
+    /** Await the storage backend before first use (mysql pool + DDL). #5046
+     *  owner policy 2026-10-30 (no degradation in any case): a backend that
+     *  cannot come up REJECTS — boot awaits this before listen(); async
+     *  request paths see it on first use. */
     ready(): Promise<void> {
         return this.mysqlReady;
     }
@@ -404,6 +473,10 @@ export class SessionStore {
      *  synchronously on EVERY call; a microtask-batched run per turn keeps
      *  the immediate-ish semantics while coalescing same-tick calls. */
     private readonly writerOffPending = new Map<string, () => void>();
+    /** #5408: per-session cooldown for the frozen-skip ERROR log (epoch ms of
+     *  the last notice) — a live session saves every turn, so without it the
+     *  line would spam; one notice per cooldown still makes the freeze loud. */
+    private readonly frozenNoticeAt = new Map<string, number>();
     /** #3406: host-owned debounced envelope saves (id → armed timer / latest builder).
      *  The debounce lives HERE instead of inside the kernel store so each landed
      *  write goes through the stamped path (store.writeNow + stampOwnWrite): a
@@ -411,9 +484,35 @@ export class SessionStore {
      *  per-turn debounced save unstamped and killed the ownership fast path. */
     private readonly saveTimers = new Map<string, ReturnType<typeof setTimeout>>();
     private readonly saveBuilders = new Map<string, () => PersistedSession>();
+    /** #5155/#4788 D2: afterNextFlush waiters — drained with a success verdict
+     *  (true = a landing proof exists, false = no proof / failed settle) when
+     *  the armed save settles. Callers may decline unsafe follow-up work (the
+     *  #4788 between-turns spill) on false. */
+    private readonly flushWaiters = new Map<string, Array<(ok: boolean) => void>>();
+    /** #4788 D2: verdict of the LAST settled write per id — read at drain time
+     *  to hand waiters the landing-proof flag. Absent entry = no proof yet, so
+     *  consumers fail closed (treat the session as unsaved). */
+    private readonly lastSaveLanded = new Map<string, boolean>();
+    /** #4788 D2: ids with a save still running on the kernel write chain
+     *  (armed from enqueue until settle). afterNextFlush must treat these as
+     *  pending — otherwise a waiter armed AFTER the debounce arm was consumed
+     *  would see "nothing queued" even though its proof is mid-write. */
+    private readonly saveWritesInFlight = new Set<string>();
+    /** #4788 D2/D1-A: revisionEpoch covered by a durable DISK copy per id —
+     *  stamped only by (a) successful save settles and (b) cold loads (a load
+     *  IS a disk proof; a fresh stamp also retires any stamp belonging to a
+     *  previous object generation of the same id). The between-turns spill
+     *  gate demands EQUALITY with the live revisionEpoch: then every markDirty
+     *  since the last disk proof has itself landed, so dropping resident fields
+     *  behind disk-narrow-read loaders loses nothing; any newer mutation keeps
+     *  the gate closed until its own save lands. Absent entry = this process
+     *  has no disk proof for the id yet → treated as unsaved (conservative). */
+    private readonly durableRevision = new Map<string, number>();
+    /** #4788 D1-A: hard-cap warn timestamp per id (60 s throttle). */
+    private readonly capWarnAt = new Map<string, number>();
     private readonly debounceMs: number;
 
-    constructor(opts?: { dir?: string; debounceMs?: number; enabled?: boolean; log?: Logger }) {
+    constructor(opts?: { dir?: string; debounceMs?: number; enabled?: boolean; log?: Logger; shadow?: UnifiedShadow }) {
         const debounceMs = opts?.debounceMs ?? defaultDebounce();
         this.enabled = (opts?.enabled ?? true) && debounceMs >= 0;
         this.debounceMs = Math.max(0, debounceMs);
@@ -470,17 +569,18 @@ export class SessionStore {
         if (wantJsonWriterOff && !this.jsonWriterOff) {
             baseLog("warn", "[storage] storage.jsonWriter=off ignored — requires storage.unified=full on the sqlite backend (network backends keep the JSON envelope as the sync read path)");
         }
-        const legacyLoad = (rec: unknown): LegacySessionLike | null => {
-            const s = buildSession(rec as PersistedSession);
-            return toLegacyLike(s);
-        };
+        const legacyLoad = recordToLegacyView;
         // #3931 step 3: network backends (mysql) can only open asynchronously
         // (pool + DDL), so the sidecar attaches when it resolves — until then
         // this.shadow stays undefined and every surface keeps its documented
         // no-sidecar posture (envelope reads/writes, banner, replicas off).
         // `ready()` gates the async consumers (saves, boot, admin).
         const backendName = resolveBackendName(process.env, fileStorageBackend());
-        if (this.enabled && !unifiedBlockedByEncryption && backendName === "mysql") {
+        if (opts?.shadow !== undefined) {
+            // #4942 test seam: a pre-built sidecar skips the env-driven open.
+            this.shadow = opts.shadow;
+            this.networkFullExpected = !!(opts.shadow.readsUnified && opts.shadow.isAsyncBackend);
+        } else if (this.enabled && !unifiedBlockedByEncryption && backendName === "mysql") {
             this.mysqlReady = UnifiedShadow.openAsync(
                 this.sessionsDir,
                 process.env,
@@ -492,11 +592,29 @@ export class SessionStore {
             ).then((sh) => {
                 this.shadow = sh ?? undefined;
             });
+            // #5046 chain (2026-10-30): openAsync now REJECTS on backend failure
+            // (no degradation in any case). Boot awaits ready() and exits
+            // deterministically; the .catch here keeps every OTHER construct-
+            // then-later-await path from dying via unhandled rejection instead
+            // of the caller seeing the rejection on await.
+            this.mysqlReady.catch(() => {});
             this.shadow = undefined;
+            this.networkFullExpected = storageMode === "full";
         } else {
-            this.shadow = this.enabled && !unifiedBlockedByEncryption
-                ? (UnifiedShadow.maybeOpen(this.sessionsDir, process.env, legacyLoad, fileStorageUnified(), fileStorageWalJournalSizeLimit(), fileStorageBackend()) ?? undefined)
-                : undefined;
+            if (this.enabled && !unifiedBlockedByEncryption) {
+                // #5188: remember the open args when this sync attempt actually
+                // runs, so a failure here can be retried. Deliberately NO
+                // cooldown stamp at construction: the first RETRY must be
+                // immediately eligible on first need. A transient load spike
+                // (EMFILE/BUSY under CI-shard load) clears in milliseconds, and
+                // #5140's cold-restore read arrives before any save would have
+                // triggered a paced retry — stamping here kept that read failing
+                // closed for a full cooldown window.
+                this.syncSidecarOpen = { legacyLoad };
+                this.shadow = UnifiedShadow.maybeOpen(this.sessionsDir, process.env, legacyLoad, fileStorageUnified(), fileStorageWalJournalSizeLimit(), fileStorageBackend()) ?? undefined;
+            } else {
+                this.shadow = undefined;
+            }
         }
         this.store = new StateStore<PersistedSession>({
             dir: this.sessionsDir,
@@ -545,25 +663,35 @@ export class SessionStore {
         ]);
     }
 
-    private readContentStoreRels(id: string, rels: string[]): MessageContentStore | null {
-        if (!this.enabled) return null;
-        // #3399/#3765: probe the winning source's CCR BEFORE rels[0]. Adoption
-        // rewrites meta.upstreamOrigin to the requesting route during loadSync,
-        // so rels[0] targets that route's sidecar — a degraded current-route twin
-        // with a valid-but-incomplete CCR would otherwise shadow the winning
-        // ledger's originals (missing refs → DIGEST DRIFT). A .fb.json fallback
-        // source keeps its canonical <base>.content-store.json name.
+    /** #4788 phase 2: candidate on-disk locations of id's content-store
+     *  envelope, in probe order — the winning source's canonical sidecar
+     *  (#3399/#3765: first, because adoption rewrites meta.upstreamOrigin to
+     *  the requesting route during loadSync, so rels[0] targets that route's
+     *  sidecar and a degraded current-route twin with a valid-but-incomplete
+     *  CCR would otherwise shadow the winning ledger's originals → DIGEST
+     *  DRIFT; a .fb.json fallback source keeps its <base>.content-store.json
+     *  name), then the rel-path candidates, then every .json file on disk
+     *  whose name matches the id. BOTH consumers must go through this —
+     *  readContentStoreRels (parse) and contentStoreLanded (existence proof)
+     *  — so the drop gate can never go positive on a path the reader would
+     *  not consult. */
+    private candidateContentStorePaths(id: string, rels: string[]): string[] {
         const source = this.sourceFiles.get(id);
         const sourceCcr = source
             ? (source.endsWith(".fb.json")
                 ? `${source.slice(0, -".fb.json".length)}.content-store.json`
                 : `${source.slice(0, -".json".length)}.content-store.json`)
             : null;
-        const paths = [...(sourceCcr ? [sourceCcr] : []),
+        return [...new Set([
+            ...(sourceCcr ? [sourceCcr] : []),
             ...rels.map(rel => path.join(this.sessionsDir, rel)),
             ...this.diskFiles.filter(file => fileNameMatchesId(path.basename(file), id))
-                .map(file => file.replace(/\.json$/, ".content-store.json"))];
-        for (const file of new Set(paths)) {
+                .map(file => file.replace(/\.json$/, ".content-store.json"))])];
+    }
+
+    private readContentStoreRels(id: string, rels: string[]): MessageContentStore | null {
+        if (!this.enabled) return null;
+        for (const file of this.candidateContentStorePaths(id, rels)) {
             let buf: Buffer;
             try {
                 buf = readFileSync(file);
@@ -668,7 +796,9 @@ export class SessionStore {
                 // #408 one-time migration: the in-memory value is already
                 // clamped by buildSession — rewrite the stale file so the
                 // negative value is gone from disk.
-                await this.store.writeNow(id, () => buildRecord(session));
+                const warmProof = session.revisionEpoch; // #4788 D2
+                await this.store.writeNow(id, () => this.buildRecordForSave(session));
+                this.noteDurable(id, warmProof); // clamp rewrite landed
                 clamped++;
                 // #3049: the clamp rewrite writes a DIFFERENT payload than any
                 // ingested record (clamped stats) without a sidecar ingest —
@@ -681,11 +811,14 @@ export class SessionStore {
         // #2960 R2.1 boot union (full mode): rows whose legacy file is gone
         // (deleted, or written by a Phase 3 future that stops writing JSON)
         // remain enumerable — the index is self-sufficient. Shadow stays
-        // file-walk: there JSON is the truth base.
-        if (this.shadow?.readsUnified) {
-            for (const id of this.shadow.listSessionIds()) {
+        // file-walk: there JSON is the truth base. #4942: on network backends
+        // the sidecar attaches asynchronously and the sync facade misses by
+        // design — enumerate through the async twins instead.
+        if (this.shadow?.readsUnified || this.networkFullExpected) {
+            if (this.networkFullExpected) await this.ready();
+            for (const id of await this.unionIds()) {
                 if (out.has(id)) continue;
-                const session = this.loadSync(id);
+                const session = await this.loadAsync(id);
                 if (session) out.set(id, session);
             }
         }
@@ -714,11 +847,13 @@ export class SessionStore {
         // without a legacy file stay enumerable (the index is
         // self-sufficient). bootBounded (limits path) intentionally stays
         // file-based: bounded boot is the cold-start triage path for huge
-        // legacy trees.
-        if (this.shadow?.readsUnified) {
-            for (const id of this.shadow.listSessionIds()) {
+        // legacy trees. #4942: network backends enumerate through the async
+        // twins (the sync facade misses by design there).
+        if (this.shadow?.readsUnified || this.networkFullExpected) {
+            if (this.networkFullExpected) await this.ready();
+            for (const id of await this.unionIds()) {
                 if (out.has(id)) continue;
-                const session = this.loadSync(id);
+                const session = await this.loadAsync(id);
                 if (session) out.set(id, session);
             }
         }
@@ -735,6 +870,21 @@ export class SessionStore {
             if (existsSync(path.join(root, flatFileNameFor(id)))) return true;
         }
         return false;
+    }
+
+    /** #4942: enumeration for the boot/loadAll unions. sqlite keeps the sync
+     *  listSessionIds(); network backends enumerate through sessionSummaries —
+     *  one query carries both the ids and updatedAt, so a budget-bounded
+     *  pre-warm can order newest-first (matching the savedAt-desc arbitration
+     *  of the file path) instead of alphabetical row order. Both sources
+     *  return the SAME row set (neither filters archived tombstones). */
+    private async unionIds(): Promise<string[]> {
+        const shadow = this.shadow;
+        if (!shadow) return [];
+        if (!shadow.isAsyncBackend) return shadow.listSessionIds();
+        const rows = await shadow.sessionSummariesAsync();
+        rows.sort((a, b) => b.updatedAt - a.updatedAt);
+        return rows.map((r) => r.sessionId);
     }
 
     private async bootBounded(limits: { maxSessions: number; maxBytes: number }): Promise<Map<string, Session>> {
@@ -852,15 +1002,19 @@ export class SessionStore {
         // The pure-index ids that do enter are measured by their SERIALIZED
         // record — the same proxy readRawFileWithBytes gives the file path
         // (#2803: the budget is a RAM proxy, not a disk one).
-        if (this.shadow?.readsUnified) {
+        // #4942: network backends pre-warm through the async twins under the
+        // SAME budget (the sync facade misses by design there); newest-first
+        // ordering comes from unionIds.
+        if (this.shadow?.readsUnified || this.networkFullExpected) {
+            if (this.networkFullExpected) await this.ready();
             let warmBytes = 0;
             for (const item of warm) warmBytes += item.bytes;
-            for (const id of this.shadow.listSessionIds()) {
+            for (const id of await this.unionIds()) {
                 if (out.size >= limits.maxSessions) break;
                 if (warmBytes >= limits.maxBytes) break;
                 if (out.has(id)) continue;
                 if (this.stateFileOnDisk(id)) continue;
-                const session = this.loadSync(id);
+                const session = await this.loadAsync(id);
                 if (!session) continue;
                 const bytes = this.estimateDecodedBytes(session);
                 if (warmBytes + bytes > limits.maxBytes) continue;
@@ -1148,7 +1302,9 @@ export class SessionStore {
                 continue;
             }
             session.id = label;
-            await this.store.writeNow(label, () => buildRecord(session));
+            const rekeyProof = session.revisionEpoch; // #4788 D2
+            await this.store.writeNow(label, () => this.buildRecordForSave(session));
+            this.noteDurable(label, rekeyProof); // rekey rewrite landed
             // #3049: direct write bypassing guardedBuild — the boot rekey
             // rewrites envelopes without the sidecar ingest, so any prior
             // ownership token for this id is stale.
@@ -1433,10 +1589,26 @@ export class SessionStore {
         if (refs > 0 && blocks === 0) {
             this.log("warn", `[persist] ${id} loaded with ${refs} mapped ref(s) but NO persisted blocks (compressions=${compressions}) — the folded history will replay raw and preflight must rebuild from scratch (#3573)`);
         }
+        // #5408: a STALE view on a session that DID compress is the incident
+        // signature — its fold state predates turns that happened while the
+        // session was invisible to the proxy, so preflight judges against a
+        // baseline far behind the live surface (123K persisted vs 542K
+        // measured in the incident). Warn once per cold load.
+        if (savedAt !== undefined && ageMin !== undefined && ageMin > STALE_COLD_LOAD_WARN_MIN && compressions > 0) {
+            this.log("warn", `[persist] ${id} cold-loaded view is ~${ageMin} min old (savedAt ${new Date(savedAt).toISOString()}) with ${compressions} prior compression(s) — the served fold state predates unseen turns; expect preflight pressure to catch up sharply when traffic resumes (#5408)`);
+        }
+        // #5408: a hot-at-attach session must show model traffic shortly after
+        // this load or the request path detached somewhere upstream of us —
+        // arm the observation heartbeat (no-op when the view is not hot).
+        noteColdLoad(id, source, savedAt);
     }
 
     loadSync(id: string, meta?: { protocol?: string; upstreamOrigin?: string }): Session | null {
         if (!this.enabled) return null;
+        // #4788 D2: retire any durable-revision stamp belonging to a PREVIOUS
+        // object generation of this id — a fresh cold load re-proves its own
+        // copy below (stamps must never vouch across generations).
+        this.durableRevision.delete(id);
         if (this.shadow?.readsUnified) {
             // #3135 ④/#3818: the last sampled verify drifted for this
             // session — the envelope is the fresher/authoritative copy while
@@ -1494,6 +1666,7 @@ export class SessionStore {
                     }
                     this.log("info", `[persist] serving ${id} from the legacy envelope: last sampled digest drifted (#3135 ④)`);
                     this.logColdLoad(id, "legacy file (drift fallback)", drifted, driftedEnvelope.payload.savedAt);
+                    this.noteDurable(id, drifted.revisionEpoch); // #4788 D2
                     return drifted;
                 }
             }
@@ -1551,6 +1724,7 @@ export class SessionStore {
             }
             this.logColdLoad(id, "legacy file", session, envelope.payload.savedAt);
             this.adoptRequestedRoute(id, session, meta);
+            this.noteDurable(id, session.revisionEpoch); // #4788 D2
             return session;
         }
         const envelope = this.loadEnvelope(id, meta);
@@ -1569,7 +1743,30 @@ export class SessionStore {
         }
         this.logColdLoad(id, "legacy file", session, envelope.payload.savedAt);
         this.adoptRequestedRoute(id, session, meta);
+        this.noteDurable(id, session.revisionEpoch); // #4788 D2
         return session;
+    }
+
+    /** #4942: async reload seam for network backends — on mysql the sync
+     *  facade has NO read path (viewFor/listSessionIds miss by design, #3931
+     *  step 3), so a cold load with no local envelope used to return null and
+     *  the request path silently started a fresh session, losing every folded
+     *  block at each restart. Serves exactly what loadSync serves whenever
+     *  loadSync finds something (zero behavior change); only when the sync
+     *  path has no copy does it fall to the DB row via viewForAsync.
+     *  Envelope-first precedence is deliberate: envelope writes are
+     *  synchronous per save while DB writes ride the coalesced record queue,
+     *  so an existing envelope is never older than the DB in single-writer
+     *  deployments. Null when neither copy exists. */
+    async loadAsync(id: string, meta?: { protocol?: string; upstreamOrigin?: string }): Promise<Session | null> {
+        const sync = this.loadSync(id, meta);
+        if (sync) return sync;
+        const shadow = this.shadow;
+        if (!shadow || !shadow.readsUnified || !shadow.isAsyncBackend) return null;
+        await this.ready();
+        const view = await shadow.viewForAsync(id);
+        if (!view) return null;
+        return this.afterLoad(id, view);
     }
 
     /** Shared post-load fixups for the unified read path: rebuilds the
@@ -1579,6 +1776,8 @@ export class SessionStore {
     private afterLoad(id: string, view: LegacySessionLike): Session {
         const record = viewToRecord(view);
         const session = buildSession(record);
+        // #4788 D2: a cold load IS a disk proof of this live revision.
+        this.noteDurable(id, session.revisionEpoch);
         if (hasNegativePersistedTokens(record)) {
             this.scheduleSave(session);
             this.log("info", `[persist] clamped negative token stats on reload for ${id} (#408)`);
@@ -1671,6 +1870,60 @@ export class SessionStore {
         return this.shadow ? this.shadow.viewFor(id) : null;
     }
 
+    /** Restore only the dropped fields, with the same source preference as loadSync.
+     * A field read must not restamp refs, import rows, or schedule another save. */
+    private loadResidentFields(
+        id: string,
+        meta: { protocol?: string; upstreamOrigin?: string },
+        fields: { metadata?: boolean; blockContents?: boolean },
+    ): { metadata?: Record<string, unknown>; blockContents?: Record<string, BlockContent> } | null {
+        if (this.residentFieldsForBuild?.id === id) return this.residentFieldsForBuild.fields;
+        if (!this.enabled) return null;
+        const indexed = this.shadow?.readsUnified ? this.shadow.readResidentFieldsFor(id, fields) : null;
+        const envelope = this.loadEnvelope(id, meta);
+        let useEnvelope = indexed === null;
+        if (indexed && envelope) {
+            if (this.shadow?.driftedSessions.has(id)) {
+                const envActive = countActiveBlocks(envelope.payload);
+                const envRefs = Object.keys(envelope.payload.state?.messageRefs?.byRef ?? {}).length;
+                useEnvelope = indexed.header.activeBlockCount <= envActive && indexed.header.mappedRefCount <= envRefs;
+            } else {
+                const requests = Number(envelope.payload.stats?.requests ?? 0);
+                useEnvelope = requests > indexed.header.requests ||
+                    (requests === indexed.header.requests && Number(envelope.payload.state?.nextBlockId ?? 0) > indexed.header.nextBlockId);
+            }
+        }
+        if (useEnvelope) {
+            if (!envelope) return null;
+            return {
+                ...(fields.metadata ? { metadata: envelope.payload.metadata ?? {} } : {}),
+                ...(fields.blockContents ? { blockContents: Object.fromEntries(restoreBlockContents(Object.entries(envelope.payload.blockContents ?? {}))) } : {}),
+            };
+        }
+        if (!indexed) return null;
+        return {
+            ...(fields.metadata ? { metadata: indexed.metadata } : {}),
+            ...(fields.blockContents ? { blockContents: Object.fromEntries(restoreBlockContents(indexed.blockContents ?? [])) } : {}),
+        };
+    }
+
+    private buildRecordForSave(session: Session, storageMode: "legacy" | "shadow" | "full" = effectiveFileStorageMode()): PersistedSession {
+        const bothDropped = isDroppedMetadata(session.metadata) &&
+            session.blockContents instanceof LazyBlockContents && session.blockContents.isDropped;
+        if (!bothDropped) return buildRecord(session, storageMode);
+        // Metadata and contents used to each rebuild a whole Session here. Share
+        // one projection and envelope arbitration for this build, never a cache
+        // that keeps another session alive after the synchronous build returns.
+        const previous = this.residentFieldsForBuild;
+        const fields = this.loadResidentFields(session.id, session.meta ?? {}, { metadata: true, blockContents: true });
+        this.residentFieldsForBuild = { id: session.id, fields };
+        try {
+            return buildRecord(session, storageMode);
+        } finally {
+            this.residentFieldsForBuild = previous;
+        }
+    }
+
     /** Read-only state load for cross-session search (#841): unlike loadSync,
      *  never schedules a save (no #408 clamp-rewrite side effect). */
     loadStateForSearch(id: string): CompressionState | null {
@@ -1716,8 +1969,55 @@ export class SessionStore {
         }
     }
 
+    /** Which half of replicasAvailable() is down — diagnostic for the fork
+     *  raw-tail gate (#5188): missing sidecar (transient open failure,
+     *  recoverable without restart) vs latched-disabled sidecar (structural
+     *  breakage, stays down by design). */
+    sidecarDownReason(): "sidecar-missing" | "sidecar-disabled" {
+        return this.shadow === undefined ? "sidecar-missing" : "sidecar-disabled";
+    }
+
     replicasAvailable(): boolean {
+        // #5188: a false answer must mean "unavailable right now". When the
+        // first sync open died on a transient OS error, save-path hooks alone
+        // leave READ-only consumers failing closed until the next write —
+        // #5140's cold-restore snapshot 409 fired milliseconds after
+        // construction, before any save. Demand-driven recheck on the read
+        // path: paced by its own short interval (one maybeOpen per slot),
+        // steady state costs two field reads.
+        if (this.syncSidecarOpen !== null && this.shadow === undefined) {
+            const now = Date.now();
+            if (now >= this.sidecarReadCheckNextAttemptAt) {
+                this.sidecarReadCheckNextAttemptAt = now + (shadowReopenReadCheckMsOverride ?? SHADOW_REOPEN_READ_CHECK_MS);
+                this.tryRecoverSidecar(true);
+            }
+        }
         return this.shadow !== undefined && !this.shadow.stats.disabled;
+    }
+
+    /** #5188 round 3: bounded patient wait for user-visible 409 paths. A first
+     *  open that died on a transient spike recovers on its own (the read-check
+     *  slot inside replicasAvailable() drives the attempts); #5140's flake was
+     *  a request racing that recovery — arriving before the first post-spike
+     *  slot could fire. Healthy returns immediately, latched-disabled returns
+     *  false immediately (waiting cannot help there), and a still-gone resource
+     *  costs at most `timeoutMs` of latency before failing closed as before. */
+    async waitForReplicas(timeoutMs = RECON_REPLICAS_WAIT_MS, pollMs = RECON_REPLICAS_POLL_MS): Promise<boolean> {
+        const deadline = Date.now() + timeoutMs;
+        for (;;) {
+            if (this.replicasAvailable()) return true;
+            if (this.sidecarDownReason() !== "sidecar-missing") return false;
+            if (Date.now() >= deadline) return false;
+            await new Promise((r) => setTimeout(r, pollMs));
+        }
+    }
+
+    /** #4804: true only in FULL mode — the one mode whose unified reads
+     *  (unifiedMessageIdRows/unifiedMessageRows/…) actually serve data. In
+     *  shadow mode every read returns null, so read-dependent lanes gate on
+     *  THIS predicate instead of replicasAvailable(). */
+    unifiedReads(): boolean {
+        return this.enabled && this.shadow?.readsUnified === true;
     }
 
     /** #4316 PR3/3: raw id → canonical seq map for the one-time ledger
@@ -1733,30 +2033,35 @@ export class SessionStore {
         }
     }
 
-    /** #4730: highest live (non-retired) seq — the fork endpoint's inclusive
-     *  throughSeq. NOT count - 1 from unifiedLiveRowCount: tombstones keep
-     *  their seq, so a retired middle row makes the count shortchange the
-     *  clone and the child silently loses the newest live rows. Null when the
-     *  unified store is unavailable (kernel-only fork) or no live rows. */
-    unifiedLastLiveSeq(id: string): number | null {
-        if (!this.shadow) return null;
+    /** #4730/#4911: highest live (non-retired) seq — the fork endpoint's
+     *  inclusive throughSeq, awaited from the (async) fork lane. NOT count - 1
+     *  from unifiedLiveRowCount: tombstones keep their seq, so a retired
+     *  middle row makes the count shortchange the clone and the child
+     *  silently loses the newest live rows. Network backends cannot serve the
+     *  sync facade — this twin routes through the backend (#4911). Null when
+     *  the unified store is unavailable (kernel-only fork) or no live rows. */
+    unifiedLastLiveSeqAsync(id: string): Promise<number | null> {
+        if (!this.shadow) return Promise.resolve(null);
         try {
-            return this.shadow.lastLiveSeq(id);
+            return this.shadow.lastLiveSeqAsync(id);
         } catch {
-            return null;
+            return Promise.resolve(null);
         }
     }
 
-    /** #4316 PR3/3: fork adoption row clone (child keeps the parent's seq
-     *  values so cloned kernel refs keep pointing at the same ledger
-     *  positions). Null when the unified store is unavailable — the fork
-     *  endpoint then proceeds exactly as before (kernel-only clone). */
-    unifiedCloneSessionRows(parentId: string, childId: string, throughSeq: number): boolean {
-        if (!this.shadow) return false;
+    /** #4316 PR3/3, #4911: fork adoption row clone, awaited from the (async)
+     *  fork lane (child keeps the parent's seq values so cloned kernel refs
+     *  keep pointing at the same ledger positions; on network backends this
+     *  twin routes through the backend — see shadow.cloneSessionRowsAsync).
+     *  False when the unified store is unavailable or the clone failed — the
+     *  fork endpoint then proceeds exactly as before (kernel-only clone).
+     *  Never throws. */
+    unifiedCloneSessionRowsAsync(parentId: string, childId: string, throughSeq: number): Promise<boolean> {
+        if (!this.shadow) return Promise.resolve(false);
         try {
-            return this.shadow.cloneSessionRows(parentId, childId, throughSeq);
+            return this.shadow.cloneSessionRowsAsync(parentId, childId, throughSeq);
         } catch {
-            return false;
+            return Promise.resolve(false);
         }
     }
 
@@ -1812,6 +2117,18 @@ export class SessionStore {
         }
     }
 
+    /** #4612: live foreign writer on the unified db (#4175 lock discipline) —
+     *  the gc full-vacuum preflight signal for the CLI/HTTP surfaces. Null when
+     *  the unified store is unavailable or nobody else is provably writing. */
+    unifiedActiveWriter(): number | null {
+        if (!this.shadow || this.shadow.stats.disabled) return null;
+        try {
+            return this.shadow.activeForeignWriter();
+        } catch {
+            return null; // sidecar degraded mid-call: no evidence of a writer
+        }
+    }
+
     /** #3901/#3463: restore an archived session from its export file. */
     unifiedRestoreArchived(sessionId: string, archiveDir?: string): { ok: boolean; reason?: string } | null {
         if (!this.shadow || this.shadow.stats.disabled) return null;
@@ -1831,6 +2148,57 @@ export class SessionStore {
             return this.shadow.archiveSession(sessionId, { archiveDir: archiveDir ?? join(this.sessionsDir, "archive") });
         } catch (err) {
             this.log("warn", `[persist] unified archive failed: ${String(err)}`);
+            return null;
+        }
+    }
+
+    /** #5312: foreign-block sweep data access. Null when the unified store is
+     *  unavailable (legacy-only lanes) — the sweep then reports "unavailable"
+     *  rather than guessing over an empty set. */
+    unifiedAllMessageIds(sessionId: string): string[] | null {
+        if (!this.shadow || this.shadow.stats.disabled) return null;
+        try {
+            return this.shadow.allMessageIds(sessionId);
+        } catch {
+            return null; // sidecar degraded mid-call: treat as unavailable
+        }
+    }
+
+    unifiedGetBlocks(sessionId: string): ReturnType<import("./storage/store.js").UnifiedStore["getBlocks"]> | null {
+        if (!this.shadow || this.shadow.stats.disabled) return null;
+        try {
+            return this.shadow.getBlocks(sessionId);
+        } catch {
+            return null; // sidecar degraded mid-call: treat as unavailable
+        }
+    }
+
+    unifiedListSessionIds(): string[] | null {
+        if (!this.shadow || this.shadow.stats.disabled) return null;
+        try {
+            return this.shadow.listSessionIds();
+        } catch {
+            return null; // sidecar degraded mid-call: treat as unavailable
+        }
+    }
+
+    /** #5312: reversible single-block archive / restore (see UnifiedStore). */
+    unifiedArchiveBlock(sessionId: string, blockId: string, archiveDir?: string): { ok: boolean; exportPath?: string; reason?: string; contentRowsDeleted?: number } | null {
+        if (!this.shadow || this.shadow.stats.disabled) return null;
+        try {
+            return this.shadow.archiveBlock(sessionId, blockId, { archiveDir: archiveDir ?? join(this.sessionsDir, "archive") });
+        } catch (err) {
+            this.log("warn", `[persist] unified block archive failed: ${String(err)}`);
+            return null;
+        }
+    }
+
+    unifiedRestoreBlock(sessionId: string, blockId: string, archiveDir?: string): { ok: boolean; reason?: string } | null {
+        if (!this.shadow || this.shadow.stats.disabled) return null;
+        try {
+            return this.shadow.restoreBlock(sessionId, blockId, { archiveDir: archiveDir ?? join(this.sessionsDir, "archive") });
+        } catch (err) {
+            this.log("warn", `[persist] unified block restore failed: ${String(err)}`);
             return null;
         }
     }
@@ -1855,10 +2223,10 @@ export class SessionStore {
         this.liveShadow().vacuum(mode);
     }
 
-    unifiedRawMessages(sessionId: string): { seq: number; content: string }[] | null {
+    unifiedRawMessages(sessionId: string, fromSeqExclusive?: number): { seq: number; content: string; ts: number | null }[] | null {
         if (!this.shadow || this.shadow.stats.disabled) return null;
         try {
-            return this.shadow.rawMessages(sessionId);
+            return this.shadow.rawMessages(sessionId, fromSeqExclusive);
         } catch {
             return null; // sidecar degraded mid-call: treat as unavailable
         }
@@ -2058,7 +2426,7 @@ export class SessionStore {
                 this.forkBaseCut.add(session.id);
                 return;
             }
-            const record = buildRecord(session);
+            const record = this.buildRecordForSave(session);
             const activeBlockIds = session.state.blocks
                 .filter((b) => (b as { active?: boolean }).active !== false)
                 .map((b) => b.blockId)
@@ -2367,7 +2735,7 @@ export class SessionStore {
         // the JSON envelope, and the stamp must say legacy for that copy.
         const stamp = this.liveStorageStamp;
         return () => {
-            const record = buildRecord(session, stamp);
+            const record = this.buildRecordForSave(session, stamp);
             const disk = this.staleDiskPayload(record);
             if (disk === null) {
                 // #3301: external-converter import payload rides exactly ONE
@@ -2515,9 +2883,24 @@ export class SessionStore {
      *  store.writeNow AND gets stamped (stampOwnWrite), which the kernel's
      *  internal debounce could not do: every per-turn save then proved its
      *  bytes on disk and the ownership fast path stayed live. */
+    /** #5408: rate-limited ERROR for a save routed index-only because THIS
+     *  process froze the session's envelope writes after digest-drift
+     *  escalation. Before this, a frozen session saved silently for hours —
+     *  the freeze was only discoverable by grepping old drift lines. */
+    private noteFrozenSkip(sessionId: string, route: string): void {
+        const now = Date.now();
+        const last = this.frozenNoticeAt.get(sessionId) ?? 0;
+        if (now - last < FROZEN_SKIP_NOTICE_COOLDOWN_MS) return;
+        this.frozenNoticeAt.set(sessionId, now);
+        const info = this.shadow?.envelopeFrozenInfo(sessionId);
+        const since = info ? new Date(info.sinceMs).toISOString() : "?";
+        loggerLog("error", `[persist] ${sessionId}: skipping ${route} envelope save — JSON envelope writes FROZEN since ${since} (digest-drift escalation #4323); the unified store keeps receiving the save and compression continues from the in-memory view, but the two copies are NOT converging — see the [storage] DIGEST DRIFT lines for the divergence diagnosis (#5408)`);
+    }
+
     scheduleSave(session: Session): void {
         if (!this.saveContentStore(session)) return;
         if (this.writerOffActive() || this.envelopeFrozen(session.id)) {
+            if (this.envelopeFrozen(session.id)) this.noteFrozenSkip(session.id, "scheduled");
             // Phase 3 (#2960): index-only persistence — the builder closure
             // runs the sidecar ingest (raw tail + live CCR) and the stale-disk
             // guard; no envelope write is armed, so no debounce is needed.
@@ -2528,24 +2911,27 @@ export class SessionStore {
             if (this.writerOffPending.has(session.id)) return;
             const run = (): void => {
                 this.writerOffPending.delete(session.id);
+                // #4788 D2: prove what THIS build covers BEFORE it starts —
+                // the closure reads live state at run time; newer mutations
+                // can only ride along, never be missing, so the spill gate's
+                // equality check against the CURRENT epoch stays conservative.
+                const proofRevision = session.revisionEpoch;
+                let settledOk = false;
                 try {
                     this.guardedBuild(session)();
                     this.maybeCutForkBase(session);
-                    // #3135 ①/#3818: the 3-strike may have fired INSIDE that
-                    // build (shadow.record's catch disables the sidecar after
-                    // consecutive failures). writerOffActive() turns false for
-                    // the NEXT save — but this very session currently exists
-                    // on NEITHER copy (index got no rows, envelope was never
-                    // armed). Land one synchronous JSON write NOW via the
-                    // kernel store so the disabling tick always closes with
-                    // the data on the durable file copy.
-                    if (this.shadow && this.shadow.stats.disabled) {
-                        this.log("warn", `[persist] unified sidecar disabled mid-build for ${session.id} — landing an immediate JSON envelope write (#3135 ①)`);
-                        const build = this.guardedBuild(session);
-                        void this.store.writeNow(session.id, build).then(() => this.stampOwnWrite(session.id)).catch(() => {
-                            // Errors surface through the kernel write chain's own logging.
-                        });
-                    }
+                    // #4788 D2: the index-only build landed synchronously —
+                    // run the same settle protocol as a kernel-write land
+                    // (invariant #5: this routing path gets equivalent
+                    // drop behavior, gated identically). The JSON-envelope
+                    // safety valve for a mid-build disable (#3135 ①) was
+                    // removed together with the 3-strike breaker itself
+                    // (2026-10-30 owner policy: index writes are never
+                    // abandoned, jsonWriter=off accepts index-only persistence).
+                    this.noteDurable(session.id, proofRevision);
+                    this.lastSaveLanded.set(session.id, true);
+                    this.runIdleSpillIfIdle(session.id);
+                    settledOk = true;
                     // #3818 writerOff safety valve REMOVED (#4216/#4242):
                     // the orphan/reap shape is now representable — its
                     // contents ride sessions.orphans_json in the same
@@ -2557,6 +2943,8 @@ export class SessionStore {
                     // escaping this microtask is fatal in embedded/plugin hosts
                     // without process-level handlers; the next markDirty retries.
                     this.log("error", `[persist] writerOff coalesced build failed for ${session.id}: ${String(err)}`);
+                } finally {
+                    this.drainFlushWaiters(session.id, settledOk);
                 }
             };
             this.writerOffPending.set(session.id, run);
@@ -2566,6 +2954,7 @@ export class SessionStore {
             return;
         }
         if (!this.enabled) return;
+        this.tryRecoverSidecar(); // #5188: dirty activity is the "still wanted" signal for a lost sidecar
         const id = session.id;
         this.saveBuilders.set(id, this.guardedBuild(session));
         const existing = this.saveTimers.get(id);
@@ -2575,14 +2964,163 @@ export class SessionStore {
             const build = this.saveBuilders.get(id);
             this.saveBuilders.delete(id);
             if (!build) return;
+            // #4788 D2: prove what THIS write covers BEFORE the chain starts
+            // building (the closure reads live state at chain-run time; newer
+            // mutations can only ride along — the spill gate's equality check
+            // against the CURRENT epoch stays conservative). peekSession: the
+            // debounced path does not keep the Session object itself.
+            const proofRevision = peekSession(id)?.revisionEpoch;
             // Errors are logged inside the kernel write chain; swallowing here
             // keeps a failed timer write from becoming an unhandledRejection.
+            this.saveWritesInFlight.add(id);
             void this.store.writeNow(id, build).then(() => {
                 this.stampOwnWrite(id); // #3406: the write LANDED — prove our bytes are on disk
-            }).catch(() => {});
+                this.noteDurable(id, proofRevision);
+                this.lastSaveLanded.set(id, true);
+                // #4788 D2: discharge the droppable fields once the debounced
+                // save has actually settled — before this PR the trio sat on
+                // landed writes that fired MID-request (#4788), where it saw
+                // inFlight>0 and skipped everything. Each drop re-checks
+                // inFlight itself; the request-end boundary (spillBetweenTurns)
+                // gives the same discharge at every turn edge.
+                this.runIdleSpillIfIdle(id);
+            }).catch(() => {
+                this.lastSaveLanded.set(id, false);
+            }).finally(() => {
+                this.saveWritesInFlight.delete(id);
+                // #5155/#4788 D2: settle waiters even on failure — waiting on a
+                // flush must never wedge a caller past a failed write (the next
+                // turn re-arms the whole path anyway). The verdict tells spill
+                // callers whether a landing proof actually exists.
+                this.drainFlushWaiters(id, this.lastSaveLanded.get(id) === true);
+            });
         }, this.debounceMs);
-        timer.unref?.();
+        // #4788: the debounce timer is host-owned periodic upkeep and must not
+        // pin a process open on its own -- so it is unref'd. But `afterNextFlush`
+        // makes it a HOST: a caller that awaits a verdict has no other handle
+        // guaranteed to fire, and an unref'd timer is not a reason for Node to
+        // stay alive. Awaiting then exits the loop with the promise unresolved
+        // (`Promise resolution is still pending but the event loop has already
+        // resolved`). Keep the timer referenced exactly while someone waits.
+        if (!this.flushWaiters.has(id)) timer.unref?.();
         this.saveTimers.set(id, timer);
+    }
+
+    /** #5155/#4788 D2: resolves once everything currently queued or in flight
+     *  for this session has settled on the kernel write chain — true only when
+     *  every settle carried a landing proof. Resolves immediately when nothing
+     *  is armed and nothing is mid-write. Used by callers that need a "the
+     *  row has landed" signal without paying for a synchronous writeNow, and by
+     *  the #4788 between-turns spill gate which must never thin resident state
+     *  behind a missing/failed write. */
+    async afterNextFlush(sessionId: string): Promise<boolean> {
+        if (!this.saveTimers.has(sessionId)
+            && !this.writerOffPending.has(sessionId)
+            && !this.saveWritesInFlight.has(sessionId)) {
+            return true;
+        }
+        return await new Promise<boolean>((resolve) => {
+            const ws = this.flushWaiters.get(sessionId) ?? [];
+            ws.push((ok: boolean): void => { resolve(ok); });
+            this.flushWaiters.set(sessionId, ws);
+            // #4788: the timer was armed unref'd (no waiter existed then). The
+            // waiter now holds the promise open, so the timer must hold the loop
+            // open too -- otherwise the process drains and the verdict is lost.
+            this.saveTimers.get(sessionId)?.ref?.();
+        });
+    }
+
+    private drainFlushWaiters(sessionId: string, ok: boolean): void {
+        const ws = this.flushWaiters.get(sessionId);
+        if (!ws) return;
+        this.flushWaiters.delete(sessionId);
+        for (const w of ws) {
+            try {
+                w(ok);
+            } catch {
+                // verdict callbacks cannot usefully fail; never let one
+                // breaker take down the flush chain
+            }
+        }
+    }
+
+    /** #4788 D2/D1-A: the request-end-boundary spill — handle.ts's request
+     *  finally block calls this FIRE-AND-FORGET after releaseInFlight, i.e. in
+     *  the gap between requests: the same "only drop between requests"
+     *  invariant the post-save drops observe (handoff replies keep object
+     *  identity sentinels — see handoff-response.ts — so dropping while some
+     *  request still references session state would corrupt them). Safety
+     *  chain; every link fails closed and skips the drop silently:
+     *   1. afterNextFlush → true: everything armed or mid-write settled WITH a
+     *      landing proof (any failed settle or missing proof vetoes),
+     *   2. inFlight == 0 re-checked after the await,
+     *   3. durableRevision === live revisionEpoch: the disk copy provably
+     *      covers the EXACT current state, so each dropped field is
+     *      transparently rebuildable from disk by its narrow-read loader
+     *      (invariants #4/#7: media stays on the disk-only path, metadata
+     *      stays a small proxy).
+     *  D1-A hard cap: exceeding BILI_SESSION_RESIDENT_HARD_MAX_BYTES forces
+     *  this same discharge even for sessions exempt from pool eviction and
+     *  warns once per 60 s. The non-droppable remainder (state/transient) is
+     *  out of scope here — state is hot every turn; transient is a separate
+     *  TODO(owner). The content store became droppable in phase 2
+     *  (dropResidentContentStore). Errors are swallowed by design: this is idle
+     *  upkeep at a request boundary, never caller-critical. */
+    async spillBetweenTurns(session: Session): Promise<void> {
+        if (session.inFlight > 0) return;
+        let landed: boolean;
+        try {
+            landed = await this.afterNextFlush(session.id);
+        } catch {
+            return;
+        }
+        if (!landed) return;
+        if (session.inFlight > 0) return; // re-check across the await
+        const cap = sessionResidentHardMaxBytes();
+        if (cap > 0 && sessionWeight(session) > cap) {
+            const now = Date.now();
+            if (now - (this.capWarnAt.get(session.id) ?? 0) >= 60_000) {
+                this.capWarnAt.set(session.id, now);
+                this.log("warn", `[persist] ${session.id}: resident estimate ${sessionWeight(session)} B exceeds the per-session hard cap ${cap} B (#4788 D1-A) — discharging droppable fields back to disk now, including pool-exempt sessions; remainder (state/transient) is non-droppable`);
+            }
+        }
+        this.runIdleSpill(session);
+    }
+
+    /** #4788 D2: post-settle discharge shared by every save-settle path
+     *  (debounce timer fire, writerOff microtask, public writeNow, flushSync,
+     *  spillBetweenTurns) — the single implementation of the droppable-field
+     *  gate, so invariant #5 (index-only paths get equivalent drops) holds by
+     *  construction. No-op while another request is in flight or while the
+     *  disk proof lags the live revision. */
+    private runIdleSpillIfIdle(id: string): void {
+        const s = peekSession(id);
+        if (!s || s.inFlight > 0) return;
+        this.runIdleSpill(s);
+    }
+
+    private runIdleSpill(session: Session): void {
+        if (session.inFlight > 0) return;
+        // Disk-proof gate: durableRevision EQUAL to the live epoch means every
+        // markDirty since the last disk proof has itself landed, so all four
+        // fields are reconstructable from disk via their narrow-read loaders;
+        // anything newer keeps them resident until its own save settles.
+        // (convergeToDisk and the drop internals are untouched — invariant #3:
+        // stampOwnWrite always precedes any drop, as here.)
+        if (this.durableRevision.get(session.id) !== (session.revisionEpoch ?? 0)) return;
+        this.foldResidentTail(session);
+        this.dropResidentBlockContents(session);
+        this.dropResidentMetadata(session);
+        this.dropResidentContentStore(session);
+    }
+
+    /** #4788 D2/D1-A: stamp that the disk copy of id now covers the given
+     *  revisionEpoch. Callers capture the epoch BEFORE the write/load that
+     *  proves it — build closures read live state at run time, so anything
+     *  newer may only ride along, never be missing; the gate's equality check
+     *  against the CURRENT epoch makes the whole scheme conservative. */
+    private noteDurable(id: string, revisionEpoch: number | undefined): void {
+        this.durableRevision.set(id, revisionEpoch ?? 0);
     }
 
     /** Asynchronously persist a session right now (skips the debounce). Throws
@@ -2603,22 +3141,95 @@ export class SessionStore {
     async writeNow(session: Session): Promise<void> {
         if (!this.saveContentStore(session)) throw new Error(`Originals were not saved for ${session.id}`);
         if (this.writerOffActive() || this.envelopeFrozen(session.id)) {
+            if (this.envelopeFrozen(session.id)) this.noteFrozenSkip(session.id, "writeNow");
             // #3133: drop the armed microtask (token mismatch below) — this
             // sync build subsumes it; later mutations re-arm on their own.
             this.writerOffPending.delete(session.id);
+            const proofRevision = session.revisionEpoch; // #4788 D2: capture BEFORE the sync build
             this.guardedBuild(session)();
             this.maybeCutForkBase(session);
+            this.noteDurable(session.id, proofRevision); // #4788 D2: index-only build landed
+            this.lastSaveLanded.set(session.id, true);
             this.foldResidentTail(session);
             this.dropResidentBlockContents(session);
             this.dropResidentMetadata(session);
+            this.dropResidentContentStore(session);
             return;
         }
-        await this.store.writeNow(session.id, this.guardedBuild(session));
+        const proofRevision = session.revisionEpoch; // #4788 D2: capture BEFORE the chain builds
+        this.saveWritesInFlight.add(session.id);
+        try {
+            await this.store.writeNow(session.id, this.guardedBuild(session));
+        } catch (err) {
+            this.saveWritesInFlight.delete(session.id);
+            throw err;
+        }
         this.stampOwnWrite(session.id); // #3406: the write LANDED — prove our bytes are on disk
         this.maybeCutForkBase(session);
+        this.noteDurable(session.id, proofRevision);
+        this.lastSaveLanded.set(session.id, true);
         this.foldResidentTail(session);
         this.dropResidentBlockContents(session);
         this.dropResidentMetadata(session);
+        this.dropResidentContentStore(session);
+        this.drainFlushWaiters(session.id, true);
+    }
+
+    /** #4739: where this id's record lives RIGHT NOW — the one build-scoped
+     *  source decision shared by both lazy-field restores after a save.
+     *  Mirrors loadSync's routing exactly: no readable unified index (never
+     *  opened, 3-strike disabled, shadow mode serving files) or a drift latch
+     *  (the envelope outranks the index while it exists, #3135 ④) → file;
+     *  else index. Bound at save time, deliberately NOT re-evaluated at
+     *  restore time — a later racing writer converges on the next save, and
+     *  re-routing mid-burst could flip the source between the two fields of
+     *  one saved record. */
+    private lazySource(id: string): "index" | "file" {
+        const sh = this.shadow;
+        if (!sh || !sh.readsUnified || sh.stats.disabled) return "file";
+        if (sh.driftedSessions.has(id)) return "file";
+        return "index";
+    }
+
+    /** #4739: narrow metadata restore for the dropped-metadata proxy —
+     *  single-column index read or single-file-field envelope read instead
+     *  of the full-session loadSync rebuild. Tries the bound source first,
+     *  then the other copy; null only when BOTH miss/fail (keeps the proxy's
+     *  refuse-empty throw semantics). Never imports, never schedules a save,
+     *  never touches the drift latch. */
+    private narrowMetadata(id: string, source: "index" | "file", meta?: { protocol?: string; upstreamOrigin?: string }): Record<string, unknown> | null {
+        const fromIndex = (): Record<string, unknown> | null => this.shadow?.getSessionMetadata(id) ?? null;
+        const fromFile = (): Record<string, unknown> | null => {
+            const env = this.loadEnvelope(id, meta);
+            return env ? (env.payload.metadata ?? {}) : null;
+        };
+        if (source === "index") {
+            const idx = fromIndex();
+            return idx !== null ? idx : fromFile();
+        }
+        const file = fromFile();
+        return file !== null ? file : fromIndex();
+    }
+
+    /** #4739: narrow blockContents restore for the dropped-blockContents
+     *  proxy — block rows + orphans journal (index) or the persisted
+     *  record's map (file), never message rows. Same bound-source-first /
+     *  other-copy-fallback / refuse-empty contract as narrowMetadata. */
+    private narrowBlockContents(id: string, source: "index" | "file", meta?: { protocol?: string; upstreamOrigin?: string }): Record<string, BlockContent> | null {
+        const fromIndex = (): Record<string, BlockContent> | null => {
+            const rows = this.shadow?.getBlockContents(id);
+            return rows ? Object.fromEntries(rows) : null;
+        };
+        const fromFile = (): Record<string, BlockContent> | null => {
+            const env = this.loadEnvelope(id, meta);
+            return env ? (env.payload.blockContents ?? {}) : null;
+        };
+        if (source === "index") {
+            const idx = fromIndex();
+            return idx !== null ? idx : fromFile();
+        }
+        const file = fromFile();
+        return file !== null ? file : fromIndex();
     }
 
     /** #3050 R3 ②a: once a save has captured the raw tail (envelope + the
@@ -2648,9 +3259,10 @@ export class SessionStore {
         // Hand-built sessions (tests, seeds) may carry no meta — the lazy
         // loader degrades to the id-only lookup, same as a protocol-less file.
         const meta = session.meta ?? undefined;
+        // #4739: one narrow read per field instead of a full-session rebuild.
+        const source = this.lazySource(session.id);
         session.metadata = lazyMetadata(session.id, { protocol: meta?.protocol, upstreamOrigin: meta?.upstreamOrigin }, (id, m) => {
-            const loaded = this.loadSync(id, m);
-            return loaded ? loaded.metadata : null;
+            return this.loadResidentFields(id, m, { metadata: true })?.metadata ?? null;
         });
     }
 
@@ -2667,12 +3279,103 @@ export class SessionStore {
             return;
         }
         if (existing.size === 0) return;
+        // #4739: one narrow read per field instead of a full-session rebuild.
+        const source = this.lazySource(session.id);
         const lazy = new LazyBlockContents(session.id, { protocol: session.meta.protocol, upstreamOrigin: session.meta.upstreamOrigin }, (id, meta) => {
-            const loaded = this.loadSync(id, meta);
-            return loaded ? Object.fromEntries(loaded.blockContents) : null;
+            return this.loadResidentFields(id, meta, { blockContents: true })?.blockContents ?? null;
         });
         lazy.drop();
         session.blockContents = lazy;
+    }
+
+    /** #4788 phase 2 (owner decision 2026-10-31, discussion #3916-E): the CCR
+     *  content store folds away too — by the time this runs its last growth has
+     *  provably landed (durableRevision gate above + contentStoreDirty veto,
+     *  because adoptContentStore marks dirty exactly when refs appear), so the
+     *  non-empty originals live in the unified ccr mirror and/or the
+     *  .content-store.json sidecar (payload-first write order, #2674). The proxy
+     *  is never undefined while held: saveContentStore, the ingest's ccr_json /
+     *  ccr_entries, fork records and publicSnapshotStoredRefs all see the full
+     *  set transparently — only RAM goes quiet, one narrow read per burst.
+     *  BILI_SESSION_CONTENT_STORE_PIN restores the previous always-resident
+     *  behavior for operators who want it. */
+    private dropResidentContentStore(session: Session): void {
+        if (session.inFlight > 0 || !this.enabled) return;
+        if (isDroppedContentStore(session.contentStore)) return;
+        if (session.contentStoreDirty) return; // unsaved growth stays resident until its own save settles
+        if (contentStorePinned()) return;     // owner escape hatch
+        const store = session.contentStore;
+        if (!store || Object.keys(store.byRef).length === 0) return; // nothing to fold
+        const meta = session.meta ?? undefined;
+        if (!this.contentStoreLanded(session.id, meta)) {
+            // No provably-landed copy on disk — folding would make the next
+            // touch throw where a resident set still exists. Fork children are
+            // the canonical case: their store rides in the ENVELOPE's
+            // forkContentStore with no sidecar of their own; staying resident
+            // costs a few KB at fork time. The lazy loader below has exactly
+            // these two sources, so prove one of them before dropping RAM.
+            return;
+        }
+        session.contentStore = lazyContentStore(session.id, (id) =>
+            this.unifiedCcrFor(id)
+            ?? this.contentStoreById(id, { protocol: meta?.protocol, upstreamOrigin: meta?.upstreamOrigin }));
+    }
+
+    /** #4788 phase 2, landing proof for dropResidentContentStore: mirrors the
+     *  lazy loader's candidate set (unified ccr mirror first, then the same
+     *  sidecar paths readContentStoreRels probes) and answers "will the next
+     *  touch find data?" WITHOUT parsing — the mirror read is one narrow index
+     *  fetch, the rest is pure existence checks. Conservative by design: any
+     *  uncertainty keeps the store resident. */
+    private contentStoreLanded(id: string, meta?: { protocol?: string; upstreamOrigin?: string } | null): boolean {
+        if (this.unifiedCcrFor(id) !== null) return true;
+        // Same candidate set the lazy loader probes (candidateContentStorePaths);
+        // existence checks only, no parsing.
+        for (const p of this.candidateContentStorePaths(id, [
+            contentStoreRelPathFor(id, meta?.protocol, meta?.upstreamOrigin),
+            contentStoreRelPathFor(id),
+        ])) {
+            try { if (existsSync(p)) return true; } catch { /* probe only */ }
+        }
+        return false;
+    }
+
+    /** #5188: recover a sidecar whose FIRST synchronous open died on a
+     *  transient OS error (fd exhaustion under test/CI load, momentary
+     *  disk-full, a spike of EBUSY). Before this, one failure at
+     *  construction time degraded the whole process for its lifetime and the
+     *  fork raw-tail rebuild failed closed at replicasAvailable() (#5140's
+     *  409s). Two triggers share this attempt: the save path (the natural
+     *  "this store is still wanted" signal), gated by the long cooldown, and
+     *  replicasAvailable() (read path), which bypasses the cooldown but paces
+     *  itself on its own short interval — a read deserves a fresh availability
+     *  answer. Under the 2026-10-30 owner chain MaybeOpen DOES throw for
+     *  transient environment failures (that is how boot refuses), so this
+     *  in-process hook catches: the never-throw save/evict contract survives,
+     *  one log line per cooldown window, no sidecar until a later attempt
+     *  succeeds. A proven-corrupt index (hadIntegrityQuickCheckFailure) is
+     *  never retried in-process — alarm + operator hand-fix by design. */
+    private tryRecoverSidecar(force = false): void {
+        const args = this.syncSidecarOpen;
+        if (!args || this.shadow !== undefined) return;
+        if (hadIntegrityQuickCheckFailure()) return;
+        const now = Date.now();
+        if (!force && now < this.sidecarReopenNextAttemptAt) return;
+        const cooldown = shadowReopenCooldownMsOverride ?? SHADOW_REOPEN_COOLDOWN_MS;
+        this.sidecarReopenNextAttemptAt = now + cooldown;
+        try {
+            this.shadow = UnifiedShadow.maybeOpen(this.sessionsDir, process.env, args.legacyLoad, fileStorageUnified(), fileStorageWalJournalSizeLimit(), fileStorageBackend()) ?? undefined;
+        } catch (err) {
+            // Transient refusal class re-occurred mid-process (unreachable via
+            // boot — that path exits first — kept defensive per #5188):
+            // record loudly once per window, keep serving from envelopes.
+            this.log("error", `[storage] sidecar reopen attempt failed (${String(err)}) — still envelope-served; will retry next window (#5188)`);
+            return;
+        }
+        if (this.shadow !== undefined) {
+            this.log("info", "[storage] unified sidecar recovered after a transient open failure — unified surfaces resume without a restart (#5188)");
+            return;
+        }
     }
 
     /** Synchronous flush for a single session. Used on memory eviction so a
@@ -2682,9 +3385,12 @@ export class SessionStore {
      *  failure for a never-persisted session or it is lost permanently). */
     flushSync(session: Session): boolean {
         if (!this.saveContentStore(session)) return false;
+        this.tryRecoverSidecar(); // #5188: eviction-time flushes are also a recovery opportunity
         if (this.writerOffActive() || this.envelopeFrozen(session.id)) {
+            if (this.envelopeFrozen(session.id)) this.noteFrozenSkip(session.id, "flushSync");
             // #3133: same subsume rule as writeNow.
             this.writerOffPending.delete(session.id);
+            const proofRevision = session.revisionEpoch; // #4788 D2: capture BEFORE the sync build
             try {
                 this.guardedBuild(session)();
             } catch (err) {
@@ -2696,9 +3402,12 @@ export class SessionStore {
                 return false;
             }
             this.maybeCutForkBase(session);
+            this.noteDurable(session.id, proofRevision); // #4788 D2: index-only flush landed
+            this.lastSaveLanded.set(session.id, true);
             this.foldResidentTail(session);
             this.dropResidentBlockContents(session);
             this.dropResidentMetadata(session);
+            this.dropResidentContentStore(session);
             return true;
         }
         // Mirror the kernel flushSync contract: a sync commit supersedes any
@@ -2710,15 +3419,61 @@ export class SessionStore {
             this.saveTimers.delete(session.id);
             this.saveBuilders.delete(session.id);
         }
+        const proofRevision = session.revisionEpoch; // #4788 D2: capture BEFORE the sync commit
         const ok = this.store.flushSync(session.id, this.guardedBuild(session));
         if (ok) {
             this.stampOwnWrite(session.id); // #3406: the write LANDED — prove our bytes are on disk
+            this.noteDurable(session.id, proofRevision);
             this.maybeCutForkBase(session);
             this.foldResidentTail(session);
             this.dropResidentBlockContents(session);
             this.dropResidentMetadata(session);
+            this.dropResidentContentStore(session);
         }
         return ok;
+    }
+
+    async persistForkSession(parentId: string, session: Session): Promise<void> {
+        await this.ready();
+        const record = buildRecord(session, this.liveStorageStamp);
+        // No child ingest may precede this transaction: its first identities
+        // must inherit the parent's absolute ledger, including retired slots.
+        const cloned = await this.shadow?.createForkAsync(parentId, toLegacyLike(session)) ?? false;
+        if (!cloned) {
+            if (!this.flushSync(session)) throw new Error("fork persistence failed");
+            return;
+        }
+        await this.maybeCutForkBaseAsync(session);
+        // A failure here leaves a COMPLETE durable fork receipt in the DB.
+        // The exact retry repairs its envelope; never delete an uncertain commit.
+        if (!this.saveContentStore(session)) throw new Error("fork content persistence failed; retry the same request");
+        this.noteOwnCommit(session.id, record);
+        if (!this.writerOffActive()) {
+            if (!this.store.flushSync(session.id, () => record)) throw new Error("fork envelope persistence failed; retry the same request");
+            this.stampOwnWrite(session.id);
+        }
+        this.foldResidentTail(session);
+        this.dropResidentBlockContents(session);
+        this.dropResidentMetadata(session);
+        this.dropResidentContentStore(session);
+    }
+
+    async recoverCompletedFork(id: string): Promise<void> {
+        await this.ready();
+        if (this.loadEnvelope(id) !== null) return;
+        const view = await this.shadow?.viewForAsync(id);
+        if (!view) return;
+        const record = viewToRecord(view);
+        const receipt = record.metadata?.publicForkReceipt as { requestHash?: unknown; response?: { ok?: unknown; sessionId?: unknown; childConversationId?: unknown } } | undefined;
+        if (typeof receipt?.requestHash !== "string" || receipt.response?.ok !== true || receipt.response.sessionId !== id || receipt.response.childConversationId !== id) return;
+        const session = buildSession(record);
+        if (!this.saveContentStore(session)) throw new Error("fork content recovery failed");
+        this.noteOwnCommit(id, record);
+        if (!this.writerOffActive()) {
+            if (!this.store.flushSync(id, () => record)) throw new Error("fork envelope recovery failed");
+            this.stampOwnWrite(id);
+        }
+        await this.maybeCutForkBaseAsync(session);
     }
 
     /** Flush all dirty content stores, then pending session writes. Called on
@@ -2796,11 +3551,13 @@ export class SessionStore {
         return this.saveTimers.has(id) || this.writerOffPending.has(id);
     }
 
-    /** Phase 3 (#2960): the JSON envelope is skipped only while the sidecar
-     *  is both configured off AND actually alive — a mid-run sidecar death
-     *  (3-strike disable) automatically resumes file writes. */
+    /** Phase 3 (#2960): the JSON envelope is skipped while the operator asked
+     *  for index-only persistence AND the sidecar opened. Static decision:
+     *  the 3-strike breaker that used to re-arm envelope writes mid-run was
+     *  removed (2026-10-30 owner policy — index writes are never abandoned,
+     *  so there is nothing to fall back FROM anymore). */
     private writerOffActive(): boolean {
-        return this.jsonWriterOff && this.shadow !== undefined && !this.shadow.stats.disabled;
+        return this.jsonWriterOff && this.shadow !== undefined;
     }
 
     /** #4323: per-session envelope freeze (escalated structural drift, see
@@ -2925,9 +3682,9 @@ function restoreCalibrationRing(v: unknown): { origin: string; values: number[] 
     return recent.length > 0 ? { origin: ring.origin, values: recent } : undefined;
 }
 
-function buildSession(parsed: PersistedSession): Session {
+function restoreBlockContents(entries: Iterable<readonly [string, unknown]>): Map<string, BlockContent> {
     const blockContents = new Map<string, BlockContent>();
-    for (const [bid, content] of Object.entries(parsed.blockContents ?? {})) {
+    for (const [bid, content] of entries) {
         if (!content || typeof content !== "object") continue;
         const full = (content as Record<string, unknown>).full;
         if (!isBlockView(full)) continue;
@@ -2940,6 +3697,19 @@ function buildSession(parsed: PersistedSession): Session {
             full,
         });
     }
+    return blockContents;
+}
+
+/** #4942: the record→legacy-view adapter the sidecar ingest path runs on
+ *  every committed record — exported so the hermetic seam suite can build a
+ *  sidecar against a stub backend with the SAME adapter the store uses. */
+export function recordToLegacyView(record: unknown): LegacySessionLike | null {
+    const s = buildSession(record as PersistedSession);
+    return toLegacyLike(s);
+}
+
+function buildSession(parsed: PersistedSession): Session {
+    const blockContents = restoreBlockContents(Object.entries(parsed.blockContents ?? {}));
     // Read grouped shape (v2+); fall back to flat fields for v1 files.
     const meta = parsed.meta ?? {};
     const stats = parsed.stats ?? {};
@@ -3015,6 +3785,12 @@ function buildSession(parsed: PersistedSession): Session {
             // acp_status survives restarts instead of silently resetting.
             wholeBlockRestores: stats.wholeBlockRestores ?? 0,
             wholeBlockRestoresPreciseAvailable: stats.wholeBlockRestoresPreciseAvailable ?? 0,
+            // #5303: the USD spend ledger (billing, #4899) — buildRecord persists
+            // it via spread but this whitelist dropped it, so every cold load
+            // (restart / LRU eviction) zeroed historical spend and the next save
+            // wrote that loss into BOTH stores (envelope + index.db). Restored
+            // through the shared validator; corrupt blobs read as "no ledger".
+            costUsd: validCostUsd(stats.costUsd),
         },
         metadata: parsed.metadata ?? {},
         state: mergeState(parsed.state),
@@ -3296,4 +4072,14 @@ export function getStore(): SessionStore {
 export function _setStoreForTest(store: SessionStore): void {
     _store = store;
     if (globalSessionCommitListener !== undefined) store.setSessionCommitListener(globalSessionCommitListener);
+}
+
+/** Test hook: close and drop the singleton so the next getStore() re-resolves
+ *  env/config (BILI_SESSIONS_DIR, storage mode, persist.enabled). Closes first
+ *  — in unified modes the store holds an index.db handle that would leak past
+ *  rmSync on Windows (the #2690 review-4 class). #4990: the web read surface
+ *  now rides this singleton, so its test reset funnels through here. */
+export function _resetStoreForTest(): void {
+    _store?.closeQuietly();
+    _store = null;
 }

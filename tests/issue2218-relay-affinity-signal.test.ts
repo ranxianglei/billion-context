@@ -102,31 +102,35 @@ function chatBody(extra: Record<string, unknown> = {}): Record<string, unknown> 
     };
 }
 
-test("#2218/#2645 unit: resolveRelayAffinityPck decision matrix", () => {
+test("#2218/#2645 unit: resolveRelayAffinityPck decision matrix (routing auto/enabled)", () => {
     _resetPckProbeForTest();
     const loop = "http://127.0.0.1:7864/v1";
     const remote = "https://relay.example.com/v1";
     // internal plugin lane + no client key + nothing learned yet → stamp,
     // EVERY destination shape (#2645: the static destination-shape gate is
-    // gone — strict APIs are found out at egress by A/B instead)
-    assert.equal(resolveRelayAffinityPck("x-bili-plugin-conversation", undefined, remote, remote), "stamp");
-    assert.equal(resolveRelayAffinityPck("x-bili-plugin-conversation", undefined, undefined, loop), "stamp");
+    // gone — strict APIs are found out at egress by A/B instead). Under
+    // #5079 stamping additionally requires routing auto/enabled — both are
+    // exercised here; the disabled default lives in tests/issue5079.
+    assert.equal(resolveRelayAffinityPck("x-bili-plugin-conversation", undefined, remote, remote, "auto"), "stamp");
+    assert.equal(resolveRelayAffinityPck("x-bili-plugin-conversation", undefined, undefined, loop, "enabled"), "stamp");
     // A/B-ablated pair → drop (stamped keys AND client keys alike)
     recordPckAblation({ origin: "https://strict.example.com/v1", model: "nim-550b", sessionId: "s1", statusWithKey: 400, errSnippet: "bad" });
-    assert.equal(resolveRelayAffinityPck("x-bili-plugin-conversation", undefined, "https://strict.example.com/v1/chat/completions", "https://strict.example.com/v1", "nim-550b"), "drop");
-    assert.equal(resolveRelayAffinityPck(undefined, "client-key", "https://strict.example.com/v1/chat/completions", "https://strict.example.com/v1", "nim-550b"), "drop");
+    assert.equal(resolveRelayAffinityPck("x-bili-plugin-conversation", undefined, "https://strict.example.com/v1/chat/completions", "https://strict.example.com/v1", "auto", "s1", "nim-550b"), "drop");
+    assert.equal(resolveRelayAffinityPck(undefined, "client-key", "https://strict.example.com/v1/chat/completions", "https://strict.example.com/v1", "auto", undefined, "nim-550b"), "drop");
     // model-level granularity: same origin, different model → still stamp
-    assert.equal(resolveRelayAffinityPck("x-bili-plugin-conversation", undefined, "https://strict.example.com/v1", "https://strict.example.com/v1", "nim-120b"), "stamp");
+    assert.equal(resolveRelayAffinityPck("x-bili-plugin-conversation", undefined, "https://strict.example.com/v1", "https://strict.example.com/v1", "auto", "s1", "nim-120b"), "stamp");
     // unlearned origin+model pair fails open
     assert.equal(pckKeyAbated("https://other.example.com/v1", undefined, undefined), false);
     // client's own key on a clean destination passes through verbatim
-    assert.equal(resolveRelayAffinityPck("x-bili-plugin-conversation", "pck-own", loop, loop), "keep-client");
-    assert.equal(resolveRelayAffinityPck(undefined, "pck-own", remote, remote), "keep-client");
-    // non-plugin identity sources never get stamped (and nothing dropped)
-    assert.equal(resolveRelayAffinityPck("session-id", undefined, loop, loop), "keep-client");
-    assert.equal(resolveRelayAffinityPck(undefined, undefined, loop, loop), "keep-client");
+    assert.equal(resolveRelayAffinityPck("x-bili-plugin-conversation", "pck-own", loop, loop, "auto", "s1"), "keep-client");
+    assert.equal(resolveRelayAffinityPck(undefined, "pck-own", remote, remote, "auto"), "keep-client");
+    // non-plugin identity sources never get stamped; with no key present the
+    // drop/keep distinction is an unobservable no-op on the wire (#5079
+    // normalizes the absent-key case to "drop")
+    assert.equal(resolveRelayAffinityPck("session-id", undefined, loop, loop, "auto"), "drop");
+    assert.equal(resolveRelayAffinityPck(undefined, undefined, loop, loop, "auto"), "drop");
     // unparseable origin is never ablated (fail open)
-    assert.equal(resolveRelayAffinityPck("x-bili-plugin-conversation", undefined, "not-a-url", "not-a-url"), "stamp");
+    assert.equal(resolveRelayAffinityPck("x-bili-plugin-conversation", undefined, "not-a-url", "not-a-url", "auto"), "stamp");
 });
 
 test("#2218 regression: plain client body pck still forwards x-session-id + body pck", async () => {

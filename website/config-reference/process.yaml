@@ -209,8 +209,8 @@ entries:
     default: "true"
     env: BILI_GUARDRAIL_REPETITION
     group: process
-    desc_en: "Identical-call loop-breaker for the pi/omp plugin (warn at 3, abort at 5 consecutive byte-identical calls). false / env 0 disables it."
-    desc_zh: "pi/omp 插件的同一调用循环破除器（连续 3 次警告、5 次中止，按字节全同判定）。false 或 env 0 关闭。"
+    desc_en: "Identical-call loop-breaker for the pi/omp plugin: warns from the 3rd consecutive identical call issued in quick succession (arguments compare key-order-insensitively; a previous identical call that actually executed for >=5s counts as long polling and restarts the run), issues ONE final refusal (that call is refused but the turn stays alive) at the 5th so a legitimate wait/poll can still switch to a longer wait, and aborts the turn only if the identical call is repeated again after that refusal (#5225). false / env 0 disables it."
+    desc_zh: "pi/omp 插件的同一调用循环破除器：快速连续的相同调用（参数比较忽略键序；上一次相同调用若实际执行 ≥5s 视为长轮询并重新计数）从第 3 次起随结果附警告；第 5 次只拒绝这一次调用并发出明确的最后警告（回合保留，合法的等待/轮询此时可改成一次更长的等待继续）；被拒之后仍一字不差地重发同样调用才终止整个回合（#5225）。false 或 env 0 关闭。"
   - key: guardrails.textRunThreshold
     type: number
     default: "200"
@@ -292,8 +292,8 @@ entries:
     default: "unset (sqlite)"
     env: BILI_STORAGE_BACKEND
     group: process
-    desc_en: "Storage backend selection (#3388 / #3931): the unified store consumes an operation-level async StorageBackend contract. sqlite is the default (the existing UnifiedStore behind a Promise-wrapped adapter). mysql is FULLY WIRED (steps 2+3): openBackend(\"mysql\", dsn) opens the real MysqlBackend against MySQL 8.0 — the full contract surface (ingest with CAS refcounts, reads, session_ext, reap journal, archive/restore/gc, checkpoints, conversations), with mysql2 bundled as a regular dependency and loaded lazily (boots that never select mysql never load it). The proxy hot path is wired through the async shadow facade: saves enqueue onto a serial backend queue (watermark deltas, orphan/reap journal, digest sampling — sqlite keeps its zero-await sync fast path unchanged), SYNC reads ride the JSON envelope (the sidecar attaches asynchronously via ready(); viewFor/importRecord sync facades miss by design), replicas/ext/GC/export speak the async twins. writerOff stays sqlite-only (the envelope is the mysql sync read path). Unknown names fall back to sqlite with a notice. Resolved once per lane boot."
-    desc_zh: "存储后端选择（#3388 / #3931）：统一存储消费操作级的异步 StorageBackend 契约。sqlite 为默认（现有 UnifiedStore 套一层 Promise 包装适配器）。mysql 已完整接线（第二+三步）：openBackend(\"mysql\", dsn) 打开真正的 MysqlBackend,对接 MySQL 8.0 —— 完整契约面（带 CAS 引用计数的 ingest、读取、session_ext、收割台账、归档/恢复/GC、checkpoint、会话绑定）,mysql2 作为常规依赖打包并按需懒加载（从不选 mysql 的启动永不加载它）。代理热路径经异步影子 facade 接线：保存进串行后端队列（水位 delta、孤儿/收割台账、digest 采样 —— sqlite 保持零 await 同步快车道不变）,同步读走 JSON 信封（sidecar 经 ready() 异步挂载;viewFor/importRecord 同步面按设计 miss）,replicas/ext/GC/export 走异步孪生。writerOff 仅 sqlite（信封就是 mysql 的同步读路径）。未知名字回退 sqlite 并提示。每个 lane 启动时解析一次。"
+    desc_en: "Storage backend selection (#3388 / #3931): the unified store consumes an operation-level async StorageBackend contract. sqlite is the default (the existing UnifiedStore behind a Promise-wrapped adapter). mysql is FULLY WIRED (steps 2+3): openBackend(\"mysql\", dsn) opens the real MysqlBackend against MySQL 8.0 — the full contract surface (ingest with CAS refcounts, reads, session_ext, reap journal, archive/restore/gc, checkpoints, conversations), with mysql2 bundled as a regular dependency and loaded lazily (boots that never select mysql never load it). The proxy hot path is wired through the async shadow facade: saves enqueue onto a serial backend queue (watermark deltas, orphan/reap journal, digest sampling — sqlite keeps its zero-await sync fast path unchanged), SYNC reads ride the JSON envelope (the sidecar attaches asynchronously via ready(); viewFor/importRecord sync facades miss by design), replicas/ext/GC/export/fork speak the async twins (#4911: the fork lane awaits lastLiveSeq + the row clone through them; the sync window reads for fold-anchor backfill / snapshot render stay envelope-served by design). writerOff stays sqlite-only (the envelope is the mysql sync read path). Unknown names fall back to sqlite with a notice. Resolved once per lane boot."
+    desc_zh: "存储后端选择（#3388 / #3931）：统一存储消费操作级的异步 StorageBackend 契约。sqlite 为默认（现有 UnifiedStore 套一层 Promise 包装适配器）。mysql 已完整接线（第二+三步）：openBackend(\"mysql\", dsn) 打开真正的 MysqlBackend,对接 MySQL 8.0 —— 完整契约面（带 CAS 引用计数的 ingest、读取、session_ext、收割台账、归档/恢复/GC、checkpoint、会话绑定）,mysql2 作为常规依赖打包并按需懒加载（从不选 mysql 的启动永不加载它）。代理热路径经异步影子 facade 接线：保存进串行后端队列（水位 delta、孤儿/收割台账、digest 采样 —— sqlite 保持零 await 同步快车道不变）,同步读走 JSON 信封（sidecar 经 ready() 异步挂载;viewFor/importRecord 同步面按设计 miss）,replicas/ext/GC/export/fork 走异步孪生（#4911：fork 车道经它们 await lastLiveSeq + 行克隆；fold-anchor 回填/快照渲染用的同步窗口读按设计仍走信封）。writerOff 仅 sqlite（信封就是 mysql 的同步读路径）。未知名字回退 sqlite 并提示。每个 lane 启动时解析一次。"
   - key: storage.mysql.dsn
     type: string
     default: "unset"
@@ -367,6 +367,20 @@ entries:
     group: process
     desc_en: "Soft target for estimated resident session bytes (#2803). Active/in-flight state stays pinned above it; when over target, idle state discharges back to disk as requests complete."
     desc_zh: "驻留会话估算字节的软目标（#2803）。活跃/在途状态始终固定保留；超过目标时，空闲状态随请求完成回写磁盘释放。"
+  - key: sessions.hardMaxBytes
+    type: number
+    default: "(same as `sessions.residentMaxBytes`)"
+    env: BILI_SESSION_RESIDENT_HARD_MAX_BYTES
+    group: process
+    desc_en: "Per-SESSION hard cap on estimated resident bytes (#4788, decision #4792 D1-A). Unlike the pool soft cap — which can only evict OTHER cold sessions and never touches a sole-active session — this bounds ONE session: over the cap at a request-end boundary, its droppable fields (folded-block originals, metadata ledger, the raw tail beyond the bounded view) are forced back to disk even for a pool-exempt session, and the next turn transparently re-reads what it needs via narrow disk reads. Safe drops run at every request boundary as long as the last save has provably landed; the cap adds the per-session call-out (warn, throttled to 60 s). `0` disables the cap check."
+    desc_zh: "单会话驻留字节的硬上限（#4788，决策 #4792 D1-A）。不同于池软上限——它只能逐出其他冷会话、从不触碰唯一活跃会话——它约束单个会话：在请求结束边界超过上限时，其可丢弃字段（已折叠块的原文、元数据账本、超出有界视图的原始尾巴）会被强制回写磁盘，即使该会话被池逐出豁免；下一轮通过窄盘读透明地重新读取所需内容。只要上一次保存已被证明落盘，安全丢弃就在每个请求边界运行；该上限额外加入单会话告警（warn，限流至 60 秒）。`0` 关闭该检查。"
+  - key: sessions.contentStorePin
+    type: boolean
+    default: "false"
+    env: BILI_SESSION_CONTENT_STORE_PIN
+    group: process
+    desc_en: "Escape hatch for the #4788 phase-2 resident drop: keep each session's content store pinned in memory (nothing ever folded away). Default off: after every proven-landed save, idle sessions' content stores are dropped between requests and re-read on demand from the unified index mirror or the sidecar file; sessions whose store has no provably-landed copy (e.g. fresh fork children) stay resident automatically. Set this if you need zero re-read latency at the cost of RAM."
+    desc_zh: "#4788 二期驻留丢弃的逃生门：把会话内容存储钉在内存（永不折叠）。默认关闭：每次已证明落盘的保存之后，空闲会话的内容存储在请求间隙被释放，需要时从统一索引镜像或伴生文件按需重读；没有可证明落盘副本的会话（如新建 fork 子会话）自动保持驻留。需要零重读延迟且愿意用内存换时可设此项。"
   - key: sessions.gc.enabled
     type: boolean
     default: "false"
