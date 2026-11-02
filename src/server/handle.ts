@@ -2032,7 +2032,7 @@ async function handleRequest(
             log("warn", `[window] model=${reqModelId} still unresolved after ${UNRESOLVED_MODEL_SESSION_THRESHOLD}+ sessions (no table/registry/configured/plugin evidence; anonymous default ${reqConfig.modelContextLimit} in force) — declare providers.<upstream>.models.${reqModelId}.context (and .output) to stop sizing against the guess (#5490)`);
         }
         if (designNamespaced && session.metadata.personaNamespace !== true) session.metadata.personaNamespace = true;
-        // #5543: a FRESH persona fork restarts the ref ledger at m00001 under a
+        // #5542: a FRESH persona fork restarts the ref ledger at m00001 under a
         // suffixed key while the model's visible history keeps citing the RAW
         // session's refs — witness the generation reset at the split moment so
         // the standing note, the [acp-gen-reset] marker and the acp_status
