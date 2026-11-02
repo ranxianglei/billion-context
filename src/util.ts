@@ -254,7 +254,19 @@ export function promptInputTotal(
     const baseSplit = !wireInclusive || (typeof cached === "number" && input < cached);
     // #4128: the ONLY lane whose default can flip to inclusive here, and ONLY on an
     // explicit upstream declaration — never inferred from the numbers (see above).
-    const anthropicInclusive = protocol === "anthropic" && declaredInclusive === true;
+    // #5515: trust that declaration only while it is SELF-CONSISTENT. An inclusive
+    // input contains its cache-read subset by definition, so it can never be smaller
+    // than it. A stamp claiming inclusive while reporting input < cached is
+    // self-refuting — it can only be a relay that reports Anthropic-split numbers
+    // (fresh-only input_tokens + separate cache_read) yet stamps semantic="openai"
+    // (e.g. a DeepSeek-backed gateway, whose native prompt_tokens is fresh-only).
+    // Reverting to split there adds the cached segment back instead of dividing it
+    // out of an under-counted total (which produced 1796–6991% "hit rates"). A
+    // genuine inclusive relay always has input >= cached, so this never touches
+    // correct traffic.
+    const anthropicInclusive =
+        protocol === "anthropic" && declaredInclusive === true &&
+        !(typeof cached === "number" && input < cached);
     const splitSemantics = baseSplit && !anthropicInclusive;
     const additive =
         (splitSemantics && typeof cached === "number" ? cached : 0) +
