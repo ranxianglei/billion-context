@@ -49,7 +49,7 @@ test("whole-text: \\u003c-escaped chain form is stripped after unescaping", () =
     assert.equal(stripBiliArtifacts(halfEscaped), "", "escaped close handled too");
 });
 
-test("whole-text: field-head header block cuts to end; other occurrences redact in place (#5588)", () => {
+test("whole-text: field-head header block cuts to end; other occurrences redact in place (#5587)", () => {
     assert.equal(stripBiliArtifacts(`${H1}\nsummary body\nmore`), "");
     assert.equal(stripBiliArtifacts(`${H2} — topic\nbody`), "");
     assert.equal(
@@ -79,7 +79,7 @@ test("whole-text: field-head header block cuts to end; other occurrences redact 
     );
 });
 
-test("whole-text: redaction is a fixed point of stripAcpTags (#5588)", () => {
+test("whole-text: redaction is a fixed point of stripAcpTags (#5587)", () => {
     for (const input of [`intro\n${H2} — topic\nbody`, `x ${H1} y\n${H2}\ntail`, `${H2} — t\nbody`]) {
         const once = stripAcpTags(input);
         assert.equal(stripAcpTags(once), once, `fixed point for ${JSON.stringify(input)}`);
@@ -132,7 +132,7 @@ test("pre-checks: contains/mayStart agree with the stripper on edge inputs", () 
     assert.ok(mayStartBiliInternal(`ends with open ${L}`));
     assert.ok(mayStartBiliInternal(`ends mid escape ${ESC.slice(0, 4)}`));
     assert.ok(mayStartBiliInternal("\n[Co"));
-    assert.ok(mayStartBiliInternal("plain line ending in bracket ["), "trailing '[' is a header prefix now (#5588: matcher is position-independent, the gate must agree)");
+    assert.ok(mayStartBiliInternal("plain line ending in bracket ["), "trailing '[' is a header prefix now (#5587: matcher is position-independent, the gate must agree)");
     assert.ok(mayStartBiliInternal("mid line [Co"));
     assert.ok(!mayStartBiliInternal("[Code review notes]"), "'[Cod' is not a header prefix");
 });
@@ -171,7 +171,7 @@ test("streaming: field-head forged block swallowed to end of field at every spli
     }
 });
 
-test("streaming: mention after genuine prose redacts the literal at every split point (#5588)", () => {
+test("streaming: mention after genuine prose redacts the literal at every split point (#5587)", () => {
     const payload = `intro\n${H2} — topic\nbody continues`;
     const expected = `intro\n${PH2} — topic\nbody continues`;
     for (const n of [1, 2, 4, 9]) {
@@ -181,7 +181,7 @@ test("streaming: mention after genuine prose redacts the literal at every split 
     }
 });
 
-test("streaming: mid-line backtick mention is split-stable and keeps the sentence (#5588)", () => {
+test("streaming: mid-line backtick mention is split-stable and keeps the sentence (#5587)", () => {
     // The reported repro shape: the model quotes the fold header inside a
     // sentence. Char-by-char arrivals used to complete the header at buf
     // position 0 and swallow the rest of the stream; whole-chunk arrivals let
@@ -250,7 +250,7 @@ test("degenerate-turn gate parity: a fully forged turn yields zero visible outpu
     }
 });
 
-test("degenerate-turn gate parity: a mixed turn keeps its visible answer (#5588)", () => {
+test("degenerate-turn gate parity: a mixed turn keeps its visible answer (#5587)", () => {
     // Genuine prose before the header means the field is NOT a forged block:
     // the answer text survives (redaction marker included) so the empty-turn
     // retry does not fire on a turn that actually delivered an answer.
