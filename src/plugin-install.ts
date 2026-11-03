@@ -498,7 +498,7 @@ export function claudeAcpCacheCommandFile(env: NodeJS.ProcessEnv = process.env):
  *  `<protocol>/` segment covers the Vertex form (/bili/anthropic/<url>). */
 export function isBiliClaudeBaseUrl(value: unknown): boolean {
     if (typeof value !== "string") return false;
-    return /^http:\/\/127\.0\.0\.1:\d{1,5}\/bili\/(?:[a-z][a-z0-9-]*\/)?https?:\/\//.test(value);
+    return /^https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\]):\d{1,5}\/bili\/(?:[a-z][a-z0-9-]*\/)?https?:\/\//.test(value);
 }
 
 /** Disk evidence that the Claude Desktop app is installed — the host whose
@@ -587,8 +587,21 @@ export function claudeNativeBaseUrlForOrigin(origin: string, upstream: string | 
 /** The inverse of the wrap: strip a bili wrapper (any loopback port) from a
  *  base URL. Returns undefined for anything not written by us. */
 export function unwrapBiliBaseUrl(value: string): string | undefined {
-    const m = /^http:\/\/127\.0\.0\.1:\d{1,5}\/bili\/(https?:\/\/.+)$/.exec(value);
+    const m = /^https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\]):\d{1,5}\/bili\/(https?:\/\/.+)$/.exec(value);
     return m ? m[1] : undefined;
+}
+
+/** #5369: upstream to bake at INSTALL time. An explicit BILI_CLAUDE_UPSTREAM
+ *  override wins — return undefined so claudeNativeBaseUrlForOrigin's default
+ *  resolution picks the env relay up (documented override semantics). Without
+ *  the override, preserve what an earlier install or the user already pointed
+ *  at: the relay wrapped into the current value, or a plain http(s) relay. */
+export function claudeInstallUpstream(existingBaseUrl: unknown, env: NodeJS.ProcessEnv = process.env): string | undefined {
+    const relay = env.BILI_CLAUDE_UPSTREAM?.trim();
+    if (relay !== undefined && relay.length > 0) return undefined;
+    const raw = typeof existingBaseUrl === "string" ? existingBaseUrl.trim() : undefined;
+    if (!raw) return undefined;
+    return unwrapBiliBaseUrl(raw) ?? (raw.startsWith("http") ? raw : undefined);
 }
 
 /** #1660: SessionStart drift-repair — repin the managed block's
@@ -637,7 +650,10 @@ export function applyClaudeManagedBlock(settings: Record<string, unknown>, opts:
     const notes: string[] = [];
     const env = (data.env !== null && typeof data.env === "object" && !Array.isArray(data.env) ? data.env : {}) as Record<string, unknown>;
     const cur = env.ANTHROPIC_BASE_URL;
-    if (cur === undefined || cur === null || isBiliClaudeBaseUrl(cur)) {
+    const relay = process.env.BILI_CLAUDE_UPSTREAM?.trim();
+    const isRelayMatch = relay !== undefined && relay.length > 0 && typeof cur === "string" && cur.replace(/\/+$/, "") === relay.replace(/\/+$/, "");
+    const isWrappingCur = typeof cur === "string" && unwrapBiliBaseUrl(opts.baseUrl) === cur.replace(/\/+$/, "");
+    if (cur === undefined || cur === null || isBiliClaudeBaseUrl(cur) || isRelayMatch || isWrappingCur) {
         if (cur !== opts.baseUrl) {
             env.ANTHROPIC_BASE_URL = opts.baseUrl;
             notes.push("env.ANTHROPIC_BASE_URL pinned to the bili proxy");
@@ -659,13 +675,26 @@ export function applyClaudeManagedBlock(settings: Record<string, unknown>, opts:
         }
     }
     const dac = env.DISABLE_AUTO_COMPACT;
-    if (dac === undefined || dac === null || dac === "1") {
-        if (dac !== "1") {
-            env.DISABLE_AUTO_COMPACT = "1";
-            notes.push("env.DISABLE_AUTO_COMPACT=1 (bili owns compression; manual /compact survives)");
+    const isBiliManaged = isBiliClaudeBaseUrl(env.ANTHROPIC_BASE_URL) || (opts.vertexBaseUrl !== undefined && isBiliClaudeBaseUrl(env.ANTHROPIC_VERTEX_BASE_URL));
+    if (isBiliManaged) {
+        if (dac === undefined || dac === null || dac === "1") {
+            if (dac !== "1") {
+                env.DISABLE_AUTO_COMPACT = "1";
+                notes.push("env.DISABLE_AUTO_COMPACT=1 (bili owns compression; manual /compact survives)");
+            }
+        } else {
+            notes.push(`env.DISABLE_AUTO_COMPACT left untouched (foreign value ${JSON.stringify(dac)})`);
         }
+    } else if (dac === "1") {
+        // Pre-fix installs wrote DISABLE_AUTO_COMPACT=1 even when the URL stayed
+        // foreign, so an upgrade alone would keep native auto-compaction OFF while
+        // bili is bypassed — the original deadlock survives. The key is bili-owned
+        // (remove strips it), so drop only the harmful sticky value and say so;
+        // .bili-bak keeps it restorable.
+        delete env.DISABLE_AUTO_COMPACT;
+        notes.push(`env.DISABLE_AUTO_COMPACT removed (leftover "1" from a pre-fix install — bili bypasses this session, so native auto-compaction is restored; restore from .bili-bak if you set it yourself)`);
     } else {
-        notes.push(`env.DISABLE_AUTO_COMPACT left untouched (foreign value ${JSON.stringify(dac)})`);
+        notes.push(`env.DISABLE_AUTO_COMPACT left untouched (bili proxy bypassed — foreign ANTHROPIC_BASE_URL)`);
     }
     if (Object.keys(env).length > 0) data.env = env;
 
@@ -940,9 +969,10 @@ function claudeInstall(): string {
     // Both variables are baked for the SAME origin; the Vertex one only exists
     // when the lane is configured for Vertex (claudeNativeVertexBaseUrl).
     const managedOrigin = claudeNativeOrigin();
+    const existingBaseUrl = (settings.env as Record<string, unknown> | undefined)?.ANTHROPIC_BASE_URL;
     const vertexManagedBaseUrl = claudeNativeVertexBaseUrl(managedOrigin);
     const { data, notes } = applyClaudeManagedBlock(settings, {
-        baseUrl: claudeNativeBaseUrlForOrigin(managedOrigin, undefined),
+        baseUrl: claudeNativeBaseUrlForOrigin(managedOrigin, claudeInstallUpstream(existingBaseUrl)),
         hookCommand,
         subagentHookCommand,
         ...(vertexManagedBaseUrl !== undefined ? { vertexBaseUrl: vertexManagedBaseUrl } : {}),

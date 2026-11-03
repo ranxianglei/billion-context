@@ -179,19 +179,19 @@ export const COMPRESS_TOOL_OPENAI = {
 /** #4313 (toggle, PR #5236): timestamps-off default — the exact pre-feature ACP TAGS section; the default assembly ships these so `messageTimestamps` off renders byte-identical to pre-#4313 masters. The time-aware variants below reach hosts that enable the feature (bili selects them at the prompt-exit when compress.messageTimestamps / BILI_MESSAGE_TIMESTAMPS is on). */
 const FUNCTION_ACP_TAGS_DEFAULT = `ACP TAGS
 
-Each message in the conversation is annotated with a <acp tokens="2.1K" type="tool:bash">m00175</acp> tag showing its reference ID, approximate token size, and content type. These tags are system metadata injected by the proxy. NEVER echo, repeat, or reference these XML tags in your responses — the tags must not appear in your output. Use only the ref ID (e.g. m00005) inside compress calls, never the XML wrapper. The token size is approximate — treat it as a relative guide, not an exact count.`;
+Addressable messages in the conversation are annotated with a <acp tokens="2.1K" type="tool:bash">m00175</acp> tag showing its reference ID, approximate token size, and content type. These tags are system metadata injected by the proxy. NEVER echo, repeat, or reference these XML tags in your responses — the tags must not appear in your output. Use only the ref ID (e.g. m00005) inside compress calls, never the XML wrapper. The token size is approximate — treat it as a relative guide, not an exact count.`;
 
 export const FUNCTION_ACP_TAGS_TIMESTAMPED = `ACP TAGS
 
-Each message in the conversation is annotated with a <acp tokens="2.1K" type="tool:bash" time="2026-10-30 09:02:11">m00175</acp> tag showing its reference ID, approximate token size, content type, and local time of occurrence (yyyy-mm-dd hh:mm:ss). Ordering: smaller ref number = earlier message; smaller time = earlier message. These tags are system metadata injected by the proxy. NEVER echo, repeat, or reference these XML tags in your responses — the tags must not appear in your output. Use only the ref ID (e.g. m00005) inside compress calls, never the XML wrapper. The token size is approximate — treat it as a relative guide, not an exact count.`;
+Addressable messages in the conversation are annotated with a <acp tokens="2.1K" type="tool:bash" time="2026-10-30 09:02:11">m00175</acp> tag showing its reference ID, approximate token size, content type, and local time of occurrence (yyyy-mm-dd hh:mm:ss). Ordering: smaller ref number = earlier message; smaller time = earlier message. These tags are system metadata injected by the proxy. NEVER echo, repeat, or reference these XML tags in your responses — the tags must not appear in your output. Use only the ref ID (e.g. m00005) inside compress calls, never the XML wrapper. The token size is approximate — treat it as a relative guide, not an exact count.`;
 
 const TEXT_ACP_TAGS_DEFAULT = `ACP TAGS
 
-Each message in the conversation is annotated with a <acp tokens="2.1K" type="tool:bash">m00175</acp> tag showing its reference ID, approximate token size, and content type. These tags are system metadata. NEVER echo these history tags. Use only the ref ID (e.g. m00005), never the XML wrapper.`;
+Addressable messages in the conversation are annotated with a <acp tokens="2.1K" type="tool:bash">m00175</acp> tag showing its reference ID, approximate token size, and content type. These tags are system metadata. NEVER echo these history tags. Use only the ref ID (e.g. m00005), never the XML wrapper.`;
 
 export const TEXT_ACP_TAGS_TIMESTAMPED = `ACP TAGS
 
-Each message in the conversation is annotated with a <acp tokens="2.1K" type="tool:bash" time="2026-10-30 09:02:11">m00175</acp> tag showing its reference ID, approximate token size, content type, and local time of occurrence (yyyy-mm-dd hh:mm:ss). Ordering: smaller ref number = earlier message; smaller time = earlier message. These tags are system metadata. NEVER echo these history tags. Use only the ref ID (e.g. m00005), never the XML wrapper.`;
+Addressable messages in the conversation are annotated with a <acp tokens="2.1K" type="tool:bash" time="2026-10-30 09:02:11">m00175</acp> tag showing its reference ID, approximate token size, content type, and local time of occurrence (yyyy-mm-dd hh:mm:ss). Ordering: smaller ref number = earlier message; smaller time = earlier message. These tags are system metadata. NEVER echo these history tags. Use only the ref ID (e.g. m00005), never the XML wrapper.`;
 
 const FUNCTION_PROMPT_SECTIONS: ReadonlyArray<
   readonly [keyof CompressPromptSections, string]
@@ -201,12 +201,14 @@ const FUNCTION_PROMPT_SECTIONS: ReadonlyArray<
     "tools",
     `TOOLS
 
-You have five context-management tools:
+You have four context-management tools:
 
 - compress — Replace consumed conversation ranges with self-contained summaries you write. ONE call carries EVERY range: compress({ content: "m00150–m00220 Auth\\nsummary…\\nm00300–m00350 Deploy\\nsummary…" }) — one plain string, one block per range, each block starting with its 'mNNNNN–mNNNNN optional topic' header line followed by that block's summary (a valid JSON string: \\\" and \\n). A single range is the same shape with one block. Never split a batch into one call per range.
-- decompress — Restore a previously compressed block's content. By default restores one tier up (T2→T1 summaries, not raw messages). Use full: true to restore all the way to original messages. Use toFile to write to file instead of inflating context. Example: decompress({ blockId: "b5" }) or decompress({ blockId: "b5", toFile: "path" }) or decompress({ blockId: "b5", full: true }).
-- search_context — Search compressed block summaries (and optionally visible messages) by keyword. Use BEFORE decompressing to find the right block. Example: search_context({ query: "auth token refresh" }).
-- acp_status — Context status with compressible ranges. No args = overview + ranges. Use to find what to compress next.`,
+- decompress — Restore a previously compressed block's content. By default restores one tier up (T2→T1 summaries, not raw messages); a leaf block has no lower tier, so the default already returns its content. Use full: true to restore all the way to original messages. Use toFile to write to file instead of inflating context. Example: decompress({ blockId: "b5" }) or decompress({ blockId: "b5", toFile: "path" }) or decompress({ blockId: "b5", full: true }).
+- search_context — Search stored compressed-block summaries and folded-away originals by keyword — NOT your currently visible messages. Use BEFORE decompressing to find the right block. Example: search_context({ query: "auth token refresh" }).
+- acp_status — Context status with compressible ranges. No args = overview + ranges. Use to find what to compress next.
+
+Message refs are per-generation: mNNNNN ids are assigned in ingest order for THIS conversation view. Switching model or upstream mid-conversation starts a fresh generation whose refs restart at m00001 and old ones stop resolving — after any such switch (or any unknown-ref failure), call acp_status for current refs before compressing.`,
   ],
   [
     "summariesInContext",
@@ -315,7 +317,7 @@ const HYBRID_PROMPT_SECTIONS: ReadonlyArray<
     "acpTags",
     `ACP TAGS
 
-Each message in the conversation is annotated with a <acp> tag showing its reference ID, approximate token size, and content type. These tags are system metadata. NEVER echo these history tags. Use only the ref ID (e.g. m00005), never the XML wrapper.`,
+Addressable messages in the conversation are annotated with a <acp> tag showing its reference ID, approximate token size, and content type. These tags are system metadata. NEVER echo these history tags. Use only the ref ID (e.g. m00005), never the XML wrapper.`,
   ],
   [
     "textProtocol",
@@ -406,21 +408,54 @@ export const SEARCH_CONTEXT_TOOL_OPENAI = {
   },
 };
 
+// #5555 audit: handleAcpStatus has always read scope/view/tool/sort/limit/
+// archiveDetail, but every wire advertised ZERO parameters so models could
+// only guess them from prose tips. Declared once here; all four wire
+// variants share this object (anthropic/responses/google alias it).
+const ACP_STATUS_PARAMETERS = {
+  type: "object" as const,
+  properties: {
+    scope: {
+      type: "string",
+      description:
+        '"uncompressed": history outside active blocks; "compressed": block ledger; omit = default overview',
+    },
+    view: {
+      type: "string",
+      description: '"messages" for a per-message listing; "ranges" is the default',
+    },
+    tool: {
+      type: "string",
+      description: 'With view:"messages": only list results of this tool name',
+    },
+    sort: {
+      type: "string",
+      description: 'With view:"messages": order by "size", "time", "tool", or "age"',
+    },
+    limit: {
+      type: "number",
+      description: "Max entries to list",
+    },
+    archiveDetail: {
+      type: "boolean",
+      description:
+        "List pre-compaction archived blocks per-id instead of grouped by reason",
+    },
+  },
+};
+
 export const ACP_STATUS_TOOL_OPENAI = {
   type: "function" as const,
   function: {
     name: ACP_STATUS_TOOL_NAME,
     description:
-      "Show context usage and compressible ranges. No args = overview. Use to find what to compress next.",
-    parameters: {
-      type: "object",
-      properties: {},
-    },
+      "Show context usage and compressible ranges. No args = overview; pass scope/view/tool/sort/limit/archiveDetail for targeted listings.",
+    parameters: ACP_STATUS_PARAMETERS,
   },
 };
 
 export const ACP_CACHE_TOOL_DESCRIPTION =
-  'Prompt-cache reconciliation: grand ledger (total input/cached/output, overall hit rate) with every request\'s miss split into new content / compression re-pay / upstream-ttl-or-client-rewrite (unattributed stable-prefix misses), plus per-fold economics (breakeven turns vs measured cadence). Defaults to a compact summary (totals + verdicts + anomalies only); pass detail="full" for every fold and line item. Read-only. Call when asked about cache hits, cache invalidation, or what compression costs.';
+  'Prompt-cache reconciliation: grand ledger (total input/cached/output, overall hit rate) with every request\'s miss split into new content / compression re-pay / upstream-ttl-or-client-rewrite (unattributed stable-prefix misses), plus per-fold economics (breakeven turns vs measured cadence). Defaults to a compact summary (totals + verdicts + anomalies only); pass detail="full" for every fold and its line-item breakdown. Read-only. Call when asked about cache hits, cache invalidation, or what compression costs.';
 
 export const ACP_CACHE_TOOL_OPENAI = {
   type: "function" as const,
@@ -434,7 +469,7 @@ export const ACP_CACHE_TOOL_OPENAI = {
           type: "string",
           enum: ["summary", "full"],
           description:
-            '"summary" (default): totals, verdicts, notable folds, anomalous requests only. "full": every retained fold and line item.',
+            '"summary" (default): totals, verdicts, notable folds, anomalous requests only. "full": every retained fold and its line-item breakdown (most-recent window — the output states the cap).',
         },
       },
     },
@@ -573,7 +608,7 @@ export const ACP_READONLY_TOOLS: ReadonlySet<string> = new Set([
 /** Opt-in absorb tool (instant tool-result absorption). Inject/register only
  *  when config.absorb.enabled — NOT part of ACP_TOOLS_* arrays. */
 export const ABSORB_TOOL_DESCRIPTION =
-  "Distill a tool result into a compact summary you write. REQUIRED immediately after a tool result ends with an [ACP absorb] instruction: pass its ref and the distilled essentials (outcome, key values, paths:lines, errors, decisions). The original output is then removed from context; your summary is the durable record.";
+  "Distill a tool result into a compact summary you write. REQUIRED immediately after a tool result ends with an [ACP absorb] instruction: pass its ref and the distilled essentials (outcome, key values, paths:lines, errors, decisions). The original output is then removed from context; your summary is the durable record. If nothing worth keeping survives, say so in the summary (e.g. \'(nothing needed)\') \u2014 that discards the output cleanly.";
 
 const ABSORB_PARAMETERS = {
   type: "object" as const,
@@ -638,12 +673,21 @@ export const ACP_STATUS_TOOL_GOOGLE = {
   parameters: ACP_STATUS_TOOL_OPENAI.function.parameters,
 };
 
+/** #5555 audit: google previously shipped acp_status but NOT acp_cache —
+ *  Gemini lanes could be asked about cache economics through prose alone. */
+export const ACP_CACHE_TOOL_GOOGLE = {
+  name: ACP_CACHE_TOOL_NAME,
+  description: ACP_CACHE_TOOL_DESCRIPTION,
+  parameters: ACP_CACHE_TOOL_OPENAI.function.parameters,
+};
+
 /** All ACP tools in Gemini flat format, matching ACP_TOOL_NAMES. */
 export const ACP_TOOLS_GOOGLE = [
   COMPRESS_TOOL_GOOGLE,
   DECOMPRESS_TOOL_GOOGLE,
   SEARCH_CONTEXT_TOOL_GOOGLE,
   ACP_STATUS_TOOL_GOOGLE,
+  ACP_CACHE_TOOL_GOOGLE,
 ] as const;
 
 /** Opt-in absorb tool in Gemini flat format (config.absorb.enabled). */
@@ -659,14 +703,14 @@ export const ABSORB_TOOL_GOOGLE = {
 export const RETRIEVE_TOOL_NAME = "acp_retrieve";
 
 export const RETRIEVE_TOOL_DESCRIPTION =
-  "Retrieve the full original text of a stored tool result. REQUIRED when you need details from a placeholder that starts with 📦 [acp-stored #mNNNNN: pass its ref. Returns the exact original text; the placeholder stays in context. Unknown refs return not-found.";
+  "Retrieve the full original text of a stored tool result. REQUIRED when you need details from a placeholder that starts with 📦 [acp-stored #mNNNNN: pass its ref. Returns the exact original text inline — very large originals are exported to a file instead, and the result then carries the exported file's path. The placeholder stays in context. Unknown refs return not-found.";
 
 const RETRIEVE_PARAMETERS = {
   type: "object" as const,
   properties: {
     ref: {
       type: "string",
-      description: "mNNNNN ref shown in the 📦 [acp-stored placeholder",
+      description: "mNNNNN ref shown in the 📦 [acp-stored …] placeholder",
     },
   },
   required: ["ref"],
