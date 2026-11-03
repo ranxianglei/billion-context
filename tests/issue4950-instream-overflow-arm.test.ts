@@ -426,6 +426,92 @@ async function setup(): Promise<{ proxyPort: number; upstreamPort: number; calls
     };
 }
 
+type UpstreamMode = "overflow" | "generic" | "healthy";
+
+// Shared mock for the route-switch regressions: summary calls get the #2313
+// payload; oversized bodies answer per MODE — "overflow" with the explicit
+// in-band context overflow (+ terminal), "generic" with a NON-overflow error
+// and deliberately NO terminal (an incomplete stream), "healthy" normally.
+async function startUpstream(calls: CallRec[], mode: UpstreamMode): Promise<{ server: http.Server; port: number }> {
+    const server = http.createServer((req, res) => {
+        const chunks: Buffer[] = [];
+        req.on("data", (c: Buffer) => chunks.push(c));
+        req.on("end", () => {
+            const body = Buffer.concat(chunks).toString("utf8");
+            const isSummaryCall = SUMMARY_MARKER.test(body);
+            calls.push({ url: req.url ?? "/", body, summary: isSummaryCall, status: 200, contentChars: body.length });
+            if (isSummaryCall) {
+                res.writeHead(200, { "content-type": "application/json" });
+                res.end(JSON.stringify({ id: "chatcmpl-sum", object: "chat.completion", model: "gpt-test", choices: [{ index: 0, message: { role: "assistant", content: SUMMARY_TEXT }, finish_reason: "stop" }] }));
+                return;
+            }
+            if (body.length > 100_000 && mode !== "healthy") {
+                res.writeHead(200, { "content-type": "text/event-stream" });
+                const err = mode === "overflow"
+                    ? { error: { message: "prompt is too long: 33000 tokens > 20000 maximum", type: "invalid_request_error" } }
+                    : { error: { message: "Rate limit reached for gpt-test", type: "rate_limit" } };
+                res.write(`data: ${JSON.stringify(err)}\n\n`);
+                if (mode === "overflow") res.write("data: [DONE]\n\n");
+                res.end();
+                return;
+            }
+            res.writeHead(200, { "content-type": "text/event-stream" });
+            res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { role: "assistant" } }] })}\n\n`);
+            res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { content: "ok" } }] })}\n\n`);
+            res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: Math.ceil(body.length / 4), completion_tokens: 2, total_tokens: Math.ceil(body.length / 4) + 2 } })}\n\n`);
+            res.write("data: [DONE]\n\n");
+            res.end();
+        });
+    });
+    await once(server.listen(0, "127.0.0.1"), "listening");
+    return { server, port: (server.address() as { port: number }).port };
+}
+
+interface SwitchCtx { proxyPort: number; portA: number; portB: number; portC: number; calls: CallRec[]; close: () => Promise<void> }
+
+async function setupSwitch(): Promise<SwitchCtx> {
+    const calls: CallRec[] = [];
+    const a = await startUpstream(calls, "healthy");
+    const b = await startUpstream(calls, "overflow");
+    const c = await startUpstream(calls, "generic");
+    const proxyOptions: ProxyOptions = {
+        port: 0,
+        host: "127.0.0.1",
+        upstream: "http://127.0.0.1",
+        routes: {
+            [`http://127.0.0.1:${a.port}`]: { models: { "gpt-test": { context: WINDOW } } },
+            [`http://127.0.0.1:${b.port}`]: { models: { "gpt-test": { context: WINDOW } } },
+            [`http://127.0.0.1:${c.port}`]: { models: { "gpt-test": { context: WINDOW } } },
+        },
+        modelContextLimit: WINDOW,
+        kernelConfig: defaultConfig(WINDOW, {
+            preserveRecentMessages: 2,
+            preserveRecentTokens: 2000,
+            compress: { minCompressRange: 1000, maxSummaryLength: 20000, minSummaryLength: 50 },
+        }),
+        compress: { injectTool: true, injectNudge: true },
+        sessionHeader: "x-acp-session",
+        streamErrorShape: "protocol",
+        promptCache: { routing: "auto" },
+        log: false, debug: false, passthrough: false,
+        autoUpdate: false, advisoryCheck: false, releaseNotesCheck: false,
+        mitm: { enabled: false, domains: [] },
+    };
+    const server = await startServer(proxyOptions);
+    if (server.address() === null) await once(server, "listening");
+    const proxyPort = (server.address() as { port: number }).port;
+    return {
+        proxyPort, portA: a.port, portB: b.port, portC: c.port, calls,
+        close: async () => {
+            server.closeAllConnections?.();
+            await new Promise<void>((r) => server.close(() => r()));
+            a.server.close();
+            b.server.close();
+            c.server.close();
+        },
+    };
+}
+
 function bigMessages(): Array<{ role: string; content: string }> {
     const msgs: Array<{ role: string; content: string }> = [];
     for (let i = 0; i < 30; i++) {
@@ -483,4 +569,82 @@ test("#4950 e2e: an in-band overflow forward records evidence, so the next round
     assert.ok(forwardsBefore >= 1, "round 1 did forward the raw body");
     assert.equal(s!.stats.lastInputTokensSource, "usage", "the successful folded forward settles usage and retires the arm (#1110)");
     void b2;
+});
+
+test("#4950 e2e model-switch: in-band overflow evidence binds to the CURRENT route after a route switch", async (t) => {
+    let ctx: SwitchCtx | undefined;
+    t.after(async () => { if (ctx) await ctx.close(); });
+    ctx = await setupSwitch();
+    const urlA = `http://127.0.0.1:${ctx.proxyPort}/bili/http://127.0.0.1:${ctx.portA}/chat/completions`;
+    const urlB = `http://127.0.0.1:${ctx.proxyPort}/bili/http://127.0.0.1:${ctx.portB}/chat/completions`;
+    const headers = { "content-type": "application/json", "x-acp-session": "i4950-sw" };
+    const postA = (messages: Array<{ role: string; content: string }>) => fetch(urlA, { method: "POST", headers, body: JSON.stringify({ model: "gpt-test", stream: true, messages }) });
+    const postB = (messages: Array<{ role: string; content: string }>) => fetch(urlB, { method: "POST", headers, body: JSON.stringify({ model: "gpt-test", stream: true, messages }) });
+
+    // A real small turn on route A settles a usage baseline bound to A's origin.
+    const r0 = await postA([{ role: "user", content: "hello" }]);
+    await r0.text();
+    const s = getSession("i4950-sw");
+    assert.ok(s, "session registered on route A");
+    assert.equal(s!.stats.lastInputTokensSource, "usage", "route A settled a usage baseline");
+    const originA = s!.stats.lastInputTokensOrigin;
+    const originB = normalizeUpstreamOrigin(`http://127.0.0.1:${ctx.portB}/chat/completions`);
+    assert.notEqual(originA, originB, "sanity: A and B are distinct routes");
+    // The #2313 stuck-meter profile after the switch (chars/4 over-read
+    // ratchets the estimate far past the window). The origin stays A's — the
+    // F2 route gate, not a faked origin, must be what demotes it on B.
+    s!.stats.lastInputTokens = 7_300_000;
+    s!.stats.lastInputTokensSource = "estimate";
+
+    const raw = bigMessages();
+    const rawJson = JSON.stringify({ model: "gpt-test", stream: true, messages: raw });
+
+    // Contract 1: the probe forward on B gets 200 + in-band overflow; the
+    // evidence MUST bind to B — the current route — not the seeded route A.
+    const r1 = await postB(raw);
+    const b1 = await r1.text();
+    assert.equal(r1.status, 200, `round-1 body: ${b1.slice(0, 600)}`);
+    assert.ok(b1.includes("prompt is too long"), `in-band error reaches the client; got: ${b1.slice(0, 600)}`);
+    assert.equal(s!.stats.lastInputTokensSource, "overflow-arm", "explicit structured overflow establishes evidence");
+    assert.equal(s!.stats.lastInputTokensOrigin, originB, "evidence bound to the CURRENT route (B)");
+
+    // Contract 2: a later retry makes progress — the next round on B folds.
+    const r2 = await postB(raw);
+    const b2 = await r2.text();
+    assert.equal(r2.status, 200, `round-2 body: ${b2.slice(0, 600)}`);
+    assert.ok(ctx.calls.some((c) => c.summary), "the retry runs the compression pipeline instead of re-probing raw");
+    const lastForward = ctx.calls.filter((c) => !c.summary).at(-1)!;
+    assert.ok(lastForward.contentChars < rawJson.length, `folded body (${lastForward.contentChars}) smaller than raw (${rawJson.length})`);
+    assert.equal(s!.stats.lastInputTokensSource, "usage", "the successful folded forward retires the arm (#1110)");
+    void b2;
+});
+
+test("#4950 e2e model-switch: generic errors and incomplete streams never poison the window", async (t) => {
+    let ctx: SwitchCtx | undefined;
+    t.after(async () => { if (ctx) await ctx.close(); });
+    ctx = await setupSwitch();
+    const urlC = `http://127.0.0.1:${ctx.proxyPort}/bili/http://127.0.0.1:${ctx.portC}/chat/completions`;
+    const headers = { "content-type": "application/json", "x-acp-session": "i4950-ng" };
+    const postC = (messages: Array<{ role: string; content: string }>) => fetch(urlC, { method: "POST", headers, body: JSON.stringify({ model: "gpt-test", stream: true, messages }) });
+
+    const r0 = await postC([{ role: "user", content: "hello" }]);
+    await r0.text();
+    const s = getSession("i4950-ng");
+    assert.ok(s, "session registered on route C");
+    assert.equal(s!.stats.lastInputTokensSource, "usage");
+
+    // An oversized forward answered with a NON-overflow error on an
+    // intentionally incomplete stream must leave the window untouched.
+    const r1 = await postC(bigMessages());
+    const b1 = await r1.text();
+    assert.equal(r1.status, 200, `body: ${b1.slice(0, 600)}`);
+    assert.ok(b1.includes("Rate limit reached"), "the generic error reaches the client verbatim");
+    assert.notEqual(s!.stats.lastInputTokensSource, "overflow-arm", "a generic error must not arm the shrink (#570)");
+    assert.equal(s!.stats.lastInputTokensSource, "usage", "and the settled baseline survives");
+
+    // The conversation keeps working afterwards — nothing was poisoned.
+    const r2 = await postC([{ role: "user", content: "still alive?" }]);
+    const b2 = await r2.text();
+    assert.equal(r2.status, 200);
+    assert.ok(b2.includes("ok"), "subsequent turns complete normally");
 });
