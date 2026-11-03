@@ -7581,6 +7581,16 @@ test("runLaunch copilot: cert-MITM env (HTTPS_PROXY + combined SSL_CERT_FILE), i
     assertInheritedProxyStripped(seenEnv, String(origin));
 });
 
+test("runLaunch kiro: cert-MITM env (HTTPS_PROXY + combined CA on SSL_CERT_FILE and NODE_EXTRA_CA_CERTS), inherited proxy stripped", async () => {
+    const seenEnv = await captureLaunchedClientEnv("kiro");
+    const origin = seenEnv.BILLION_CONTEXT_PROXY;
+    assert.ok(/^http:\/\/127\.0\.0\.1:\d+$/.test(String(origin)), `origin: ${origin}`);
+    const combined = path.join("billion-context", "ca", "combined-ca.pem");
+    assert.ok(String(seenEnv.SSL_CERT_FILE).endsWith(combined), String(seenEnv.SSL_CERT_FILE));
+    assert.ok(String(seenEnv.NODE_EXTRA_CA_CERTS).endsWith(combined), String(seenEnv.NODE_EXTRA_CA_CERTS));
+    assertInheritedProxyStripped(seenEnv, String(origin), { NO_PROXY: "localhost,127.0.0.1,::1", no_proxy: "localhost,127.0.0.1,::1" });
+});
+
 test("runLaunch amp: cert-MITM env (HTTPS_PROXY + combined SSL_CERT_FILE), inherited proxy stripped (#1049)", async () => {
     const seenEnv = await captureLaunchedClientEnv("amp");
     const origin = seenEnv.BILLION_CONTEXT_PROXY;
