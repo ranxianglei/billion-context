@@ -122,3 +122,44 @@ test("#5620 D: media-free sessions keep today's output exactly (additive-only ch
     assert.ok(out.includes("Nudge:"), "nudge line still present");
     assert.ok(!out.includes("MEDIA FLOOR") && !out.includes("PRESSURE NOTE"), "no new sections without media mass");
 });
+
+// anthropic-wire url-source image riding the host block sidecar — the counter's
+// rawAnthropicBlock branch must meter it like its openai counterpart.
+function imageMsgAnthropic(id: string, url: string, chars: number): CoreMessage {
+    return {
+        id, role: "user", contentType: "text", text: "x".repeat(chars),
+        rawAnthropicBlock: { type: "image", source: { type: "url", url } },
+    } as unknown as CoreMessage;
+}
+
+// responses-wire input_image item — image_url is a bare string on that wire.
+function imageMsgResponses(id: string, url: string, chars: number): CoreMessage {
+    return {
+        id, role: "user", contentType: "text", text: "x".repeat(chars),
+        rawResponsesItem: { type: "input_image", image_url: url },
+    } as unknown as CoreMessage;
+}
+
+test("#5620 E: anthropic-wire remote images are metered too (rawAnthropicBlock branch)", () => {
+    const msgs = [
+        imageMsgAnthropic("img_1", REMOTE.replace("%d", "1"), 16),
+        imageMsgAnthropic("img_2", REMOTE.replace("%d", "2"), 16),
+        imageMsgAnthropic("img_3", REMOTE.replace("%d", "3"), 16),
+    ];
+    const out = handleAcpStatus({}, withRefs(makeCtx(msgs))).text;
+    assert.ok(out.includes("MEDIA FLOOR"), `anthropic-wire media floor line present (got: ${out.slice(0, 600)})`);
+    assert.ok(out.includes("3 live message(s)"), "names the message count");
+    assert.ok(out.includes(String(REMOTE_IMAGE_TOKENS)), "names the per-image prior");
+});
+
+test("#5620 F: responses-wire remote images are metered too (rawResponsesItem branch)", () => {
+    const msgs = [
+        imageMsgResponses("img_1", REMOTE.replace("%d", "1"), 16),
+        imageMsgResponses("img_2", REMOTE.replace("%d", "2"), 16),
+        imageMsgResponses("img_3", REMOTE.replace("%d", "3"), 16),
+    ];
+    const out = handleAcpStatus({}, withRefs(makeCtx(msgs))).text;
+    assert.ok(out.includes("MEDIA FLOOR"), `responses-wire media floor line present (got: ${out.slice(0, 600)})`);
+    assert.ok(out.includes("3 live message(s)"), "names the message count");
+    assert.ok(out.includes(String(REMOTE_IMAGE_TOKENS)), "names the per-image prior");
+});
