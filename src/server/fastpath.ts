@@ -461,7 +461,14 @@ export function evaluateWatermarkFastpath(
             }
             // Mid-list check over indices [1, cursor): index 0 is the window
             // ORIGIN — handled by the origin pin above (an unknown origin is
-            // explicitly neutralized there, #5418 v3/#5571 v5).
+            // explicitly neutralized there, #5418 v3/#5571 v5). PROOF REQUIREMENT:
+            // an unknown real id must be FOLLOWED by at least one still-known
+            // slot (cursor > i) — "unknown before known" is the only shape
+            // that proves in-range mutation from ids alone. A pure trailing run
+            // of fresh ids (incl. a full-history compaction summary with fresh
+            // ids) is NOT distinguishable from ordinary appends ⇒ rides by
+            // default per R4/O3: the summary passes THROUGH AS A NEW MESSAGE,
+            // its fresh ids enter the ledger via finalize, no suppression.
             let midInsertion = false;
             for (let i = 1; i < cursor; i++) {
                 if (tailIds[i] !== PF_SLOT_UNKNOWN && !known.has(tailIds[i])) { midInsertion = true; break; }
