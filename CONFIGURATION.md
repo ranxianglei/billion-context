@@ -428,6 +428,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `BILI_MITM_HOSTS` | string[] (csv) | unset | — | Launcher channel: MITM whitelist hosts handed to the spawned proxy (distinct from the config-file twin BILI_MITM_DOMAINS). |
 | `BILI_PLUGIN_AGENT` | boolean-ish | off | — | Spawn channel: marks a plugin-agent process. |
 | `BILI_IMAGE_RESCALE_MAX_DIM` | integer | 1600 | — | Longest-edge trigger threshold (px) for the egress image downscale pass (#3400); non-numeric or below 128 ignored (default applies). Env-only by design. |
+| `BILI_NATIVE_IDENTITY_PROFILES_JSON` | string | unset (built-in table) | — | Native-identity observation (#5573 M1): JSON object of per-client profile rows merged over the built-in evidence table (src/server/native-identity-profiles.ts) — entries ADD new rows or REPLACE a built-in row by name, never remove one (the built-ins are the floor). Same shape as a built-in row (name, matchHeaders, sessionHeaders, msgidHeaders, compactionEdgeHeader, countPatterns, compactionPrefixes, ...). Malformed JSON fails open silently (built-ins only). Only meaningful while rollout.features.nativeIdentityObservation is enabled; feeds no decision. |
 
 <!-- /bili:gen -->
 

@@ -19,7 +19,7 @@
  * is exactly the work #5403 removed from the hot path).
  */
 
-export interface NativeIdPattern {
+interface NativeIdPattern {
     /** Literal substring to locate/count in the decoded body text. */
     pattern: string;
     /** Label for the count in the observation line (short, grep-able). */
@@ -149,7 +149,7 @@ let envOverrideWarned = false;
 /** Resolve the active profile table: built-ins are the floor; the env JSON may
  *  add/replace rows by name, never remove built-ins. Malformed env JSON is
  *  ignored (fail-open, one warn per process). */
-export function nativeIdProfiles(): readonly NativeIdProfileDef[] {
+function nativeIdProfiles(): readonly NativeIdProfileDef[] {
     const raw = process.env["BILI_NATIVE_IDENTITY_PROFILES_JSON"];
     if (raw === undefined || raw.trim().length === 0) return BUILTIN_PROFILES;
     try {
@@ -209,7 +209,7 @@ export function resolveNativeIdProfile(
     return UNKNOWN_PROFILE;
 }
 
-export const UNKNOWN_PROFILE: NativeIdProfileDef & { name: string } = {
+const UNKNOWN_PROFILE: NativeIdProfileDef & { name: string } = {
     name: "unknown",
     matchHeaders: [],
     sessionHeaders: [],

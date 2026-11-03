@@ -530,3 +530,11 @@ entries:
     group: envonly
     desc_en: "Longest-edge trigger threshold (px) for the egress image downscale pass (#3400); non-numeric or below 128 ignored (default applies). Env-only by design."
     desc_zh: "出站图片降采样 pass 的最长边触发阈值（像素，#3400）；非数字或低于 128 的取值按默认处理。设计上仅环境变量。"
+  - key: BILI_NATIVE_IDENTITY_PROFILES_JSON
+    type: string
+    default: "unset (built-in table)"
+    kind: env-only
+    audience: user
+    group: envonly
+    desc_en: "Native-identity observation (#5573 M1): JSON object of per-client profile rows merged over the built-in evidence table (src/server/native-identity-profiles.ts) — entries ADD new rows or REPLACE a built-in row by name, never remove one (the built-ins are the floor). Same shape as a built-in row (name, matchHeaders, sessionHeaders, msgidHeaders, compactionEdgeHeader, countPatterns, compactionPrefixes, ...). Malformed JSON fails open silently (built-ins only). Only meaningful while rollout.features.nativeIdentityObservation is enabled; feeds no decision."
+    desc_zh: "原生身份观测（#5573 M1）：JSON 对象，按内置证据表（src/server/native-identity-profiles.ts）同形提供客户端画像行——按名**新增**或**整体替换**内置行，绝不删除（内置为底）。字段形如内置行（name、matchHeaders、sessionHeaders、msgidHeaders、compactionEdgeHeader、countPatterns、compactionPrefixes……）。畸形 JSON 静默失效（只用内置表）。仅在 rollout.features.nativeIdentityObservation 开启时有意义；不喂任何决策。"

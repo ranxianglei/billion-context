@@ -37,13 +37,13 @@ const TOP_FIELD_WINDOW = 8192;
  *  hits are the headline signal M2/L2a consumes). */
 const WARN_EVENTS = new Set(["compaction", "dual_mismatch", "shape_assert_fail"]);
 
-export interface NidvEvent {
+interface NidvEvent {
     t: number;
     k: string;
     e?: string;
 }
 
-export interface NidvMsgStats {
+interface NidvMsgStats {
     n: number;
     /** Lower bound: unique digests inside the bounded recent ring. */
     distinct: number;
@@ -53,7 +53,7 @@ export interface NidvMsgStats {
     ring: string[];
 }
 
-export interface NidvObs {
+interface NidvObs {
     v: 1;
     client: string;
     firstSeen: number;
@@ -89,13 +89,13 @@ export interface NativeIdInput {
     msgIds?: string[];
 }
 
-export interface NativeIdCount {
+interface NativeIdCount {
     label: string;
     n: number;
     assertZero?: boolean;
 }
 
-export interface NativeIdExtraction {
+interface NativeIdExtraction {
     client: string;
     profileName: string;
     sessH?: string;

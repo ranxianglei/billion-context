@@ -428,6 +428,7 @@
 | `BILI_MITM_HOSTS` | string[] (csv) | unset | — | 启动器通道：传给被派生代理的 MITM 白名单主机（区别于配置文件对应项 BILI_MITM_DOMAINS）。 |
 | `BILI_PLUGIN_AGENT` | boolean-ish | off | — | 派生通道：标记插件 agent 进程。 |
 | `BILI_IMAGE_RESCALE_MAX_DIM` | integer | 1600 | — | 出站图片降采样 pass 的最长边触发阈值（像素，#3400）；非数字或低于 128 的取值按默认处理。设计上仅环境变量。 |
+| `BILI_NATIVE_IDENTITY_PROFILES_JSON` | string | unset (built-in table) | — | 原生身份观测（#5573 M1）：JSON 对象，按内置证据表（src/server/native-identity-profiles.ts）同形提供客户端画像行——按名**新增**或**整体替换**内置行，绝不删除（内置为底）。字段形如内置行（name、matchHeaders、sessionHeaders、msgidHeaders、compactionEdgeHeader、countPatterns、compactionPrefixes……）。畸形 JSON 静默失效（只用内置表）。仅在 rollout.features.nativeIdentityObservation 开启时有意义；不喂任何决策。 |
 
 <!-- /bili:gen -->
 

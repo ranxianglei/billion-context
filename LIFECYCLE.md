@@ -55,6 +55,7 @@
 | 测试钩子：`BILI_DSH_RECOVERY_INTERVAL_MS` / `BILI_DSH_RETRY_INTERVAL_MS` / `BILI_MODEL_INFO_RETRY_MS` | #2082 等 | 缩短测试/运维节奏（dsh-native.ts；NODE_TEST_CONTEXT 感知，避免生产误缩） | 永久测试设施，随宿主代码走 | 测试钩子 |
 | `BILI_COMPRESS_AT_FOLD_POINT` | #5470 | compress-at-fold-point 实验性 opt-in（**默认关**；2026-11-01 真实模型验证通过，owner 决定保持 opt-in）：把重放视图中可见的 compress 调用对挪到它自己的折叠点（布局 [已折叠区]–[调用对]–[保护消息]），弱注意力模型不再把历史尾部的工具交换误读成新命令；纯视图变换，关时布局字节级不变；文件键 `compress.compressAtFoldPoint`；含 env-only opt-in 可达性修复（默认短路保持不变） | 更多真实模型积累后转正为默认开（走评审），或按废弃流程删除 | opt-in（默认关） |
 | `BILI_COMPRESS_AT_FOLD_POINT_CLEAR_THINKING` | #5470 | 依附上一开关：挪位瞬间清紧邻的未签名思考段（默认 off，A 关时无效）；strict-echo(#684) 或存在签名思考块(#1658)时整个机制不出手 | 同上 | opt-in（默认 off） |
+| `BILI_NATIVE_IDENTITY_PROFILES_JSON` | #5573 M1 | 原生身份观测画像表的运维扩展钩子：JSON 客户端画像行按名追加/替换内置行（内置为底；畸形值静默失效）；仅在 rollout.features.nativeIdentityObservation 开启时有意义，不喂任何决策 | 观测层转正（现场数据退出判据达成）后移 §2 常设面 | opt-in（缺省 = 内置表） |
 
 ## 2. 常设面全量登记表（src/ 实际读取的其余 BILI_* 环境变量）
 
