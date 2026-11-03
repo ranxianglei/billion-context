@@ -107,6 +107,13 @@ export const LIVE_FILES = [
     // #4612: spawns an idle node child as the "other live process" fixture;
     // binds no ports, mkdtemp-isolated per test
     "tests/issue4612-gc-online-guard.test.ts",
+    // #5625: opencode V2 hook-payload pins — three rows are in-process with a
+    // fake fetch sink (no sockets bound), the setup-gate row starts a listen(0)
+    // probe server and spawns `node --import tsx -e` children against it
+    // (BILLION_CONTEXT_PROXY=probe origin, XDG_STATE_HOME=per-run mkdtemp).
+    // Everything is ephemeral — like #3890/#5114 no zone band is needed, the
+    // entry is for the SPAWN_RE tripwire
+    "tests/issue5625-opencode-v2-hook-payload.test.ts",
 ];
 
 /** Band width per live file: the zone ladder drifts +1 per EADDRINUSE retry;
