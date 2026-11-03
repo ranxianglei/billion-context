@@ -106,6 +106,18 @@ export const ROLLOUT_FEATURES: Record<string, RolloutPlan> = {
     // `BILI_ROLLOUT_NATIVE_IDENTITY_OBSERVATION=1` or
     // `rollout.features.nativeIdentityObservation: true`.
     nativeIdentityObservation: { percent: 0 },
+    // #5403/#5418 v6 canonical-ledger unification (contract R4): client-side
+    // structural rewrites — the compaction/insertion shapes that survive the
+    // width + origin gates with a shape-valid tail-id list — take ONE
+    // conservative legacy pass and ride PASSTHROUGH-AS-NEW-MESSAGE from the
+    // next turn: the rewritten/summary elements carry fresh host ids that
+    // the incremental ledger appends (R2), no suppression logic, never a
+    // speculative rebuild (O3). Nested under pluginFullResendWatermark —
+    // dead weight outside the watermark cohort. Default ON (percent 100
+    // inside base) = passthrough; OFF = pre-v6 behavior for rewrite-shaped
+    // turns only. Force off with `rollout.features.watermarkCompactionPassthrough:
+    // false` or `BILI_ROLLOUT_WATERMARK_COMPACTION_PASSTHROUGH=0`.
+    watermarkCompactionPassthrough: { percent: 100, base: "pluginFullResendWatermark" },
 };
 
 export const BP_MAX = 10_000;
