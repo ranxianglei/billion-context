@@ -72,6 +72,12 @@ const HEAD_CHECK_ELEMENTS = 8;
 const PF_BREAKER_MISSES = 5;
 const PF_DISABLED_TTL_MS = 60 * 60 * 1000;
 const PF_EXT_KEY = "pf:state";
+// #5403/#5418 v6 (contract R2): bounds for the cumulative host-id ledger
+// (`lg`). Entry shape mirrors parseTailIds screening (len 1..512, no '?');
+// the FIFO drop and serialized-size guard follow the obs layer's ≤4KB-style
+// discipline scaled to the watermark cohort's realistic history depth.
+const PF_LEDGER_CAP = 2048;
+const PF_LEDGER_MAX_BYTES = 48 * 1024;
 
 interface PFSavedState {
     t: number;
@@ -81,6 +87,17 @@ interface PFSavedState {
     /** Last received tail-id list (#5418 v2) — survives restarts so the
      *  prevId continuity check is live on the first turn back. */
     l?: string[];
+    /** #5403/#5418 v6 (contract R2): CUMULATIVE host-id ledger for THIS
+     *  session — every real id ever observed on the channel, in order,
+     *  FIFO-capped (oldest dropped past PF_LEDGER_CAP / serialized-size
+     *  guard); '?' slots never recorded. MODEL-INDEPENDENT by design (R6):
+     *  projections partition on (model × wire format), the logical ledger
+     *  does not — a model flip rebuilds the projection but inherits the
+     *  id bookkeeping. Grown ONLY in finalizeWatermarkTurn from this
+     *  turn's shape-valid list (no server-authored text ever enters);
+     *  consumed as the set-diff baseline for the v6 rewrite classification.
+     *  Bootstrap/migration: sessions predating v6 fall back to `l`. */
+    lg?: string[];
     /** #5571 v5: client-native session id digest recorded with this state
      *  (h8, never raw — privacy parity with #5571); sess-change gate input. */
     cs?: string;
@@ -148,6 +165,12 @@ export interface FastpathOutcome {
      *  (undefined when no known header carried a value). Persisted by
      *  finalize as state `cs`; feeds the sess-change identity gate. */
     readonly clientSess?: string;
+    /** #5403/#5418 v6 (contract R7): set when the cs (sess-change) gate
+     *  fired — the incoming conversation SWAPPED. finalize honors it by
+     *  holding the cumulative ledger: a swapped-in conversation's ids must
+     *  never fold into this session's ledger (they describe different
+     *  clients' history and would poison the set-diff baseline). */
+    readonly ledgerHold?: boolean;
 }
 
 /** #5418 v2: decode the shim's x-bili-pf-tail-ids value.
@@ -198,6 +221,9 @@ function readSaved(sessionId: string): PFSavedState | null {
             l: Array.isArray(o.l) && o.l.length > 0 && o.l.length <= 2048
                 && (o.l as unknown[]).every((x): x is string => typeof x === "string" && x.length > 0 && x.length <= 512)
                 ? (o.l as string[]) : undefined,
+            lg: Array.isArray(o.lg) && o.lg.length > 0 && o.lg.length <= PF_LEDGER_CAP
+                && (o.lg as unknown[]).every((x): x is string => typeof x === "string" && x.length > 0 && x.length <= 512)
+                ? (o.lg as string[]) : undefined,
             cs: typeof o.cs === "string" && o.cs.length === 8 ? o.cs : undefined,
         };
     } catch {
@@ -211,6 +237,43 @@ function writeSaved(sessionId: string, state: PFSavedState): void {
         if (!store.replicasAvailable()) return;
         store.setSessionExt(sessionId, PF_EXT_KEY, JSON.stringify(state));
     } catch { /* state is advisory — losing it degrades to verify-next-turn */ }
+}
+
+/** #5403/#5418 v6 (contract R2): grow the cumulative host-id ledger from
+ *  one shape-valid tail-id list. Real ids append in list order, deduped;
+ *  '?' slots never enter (unknown identity claims nothing); the result is
+ *  FIFO-trimmed to PF_LEDGER_CAP entries / PF_LEDGER_MAX_BYTES serialized
+ *  (oldest dropped first). Append-only — server-authored text is NEVER
+ *  injected here (R2), the list is the client's own id surface as screened
+ *  by parseTailIds. No-op turns (nothing new) return the previous ledger so
+ *  the persisted state is untouched. */
+function growPfLedger(
+    saved: PFSavedState | null,
+    list: readonly string[],
+): string[] | undefined {
+    // Bootstrap/migration: pre-v6 sessions carry only `l` (last list).
+    const base = saved?.lg ?? saved?.l ?? [];
+    const known = new Set(base);
+    const out: string[] = [];
+    for (const id of base) {
+        if (!known.has(id)) known.add(id); // defensive dedupe of hand-edited state
+        out.push(id);
+    }
+    for (const id of list) {
+        if (id === PF_SLOT_UNKNOWN || known.has(id)) continue;
+        known.add(id);
+        out.push(id);
+    }
+    // Serialized-size estimate: two quotes + one separator per entry
+    // (JSON escapes in exotic id alphabets only inflate a little; the
+    // per-entry len cap bounds the worst case).
+    const jsonLen = (arr: string[]): number => arr.reduce((n, s) => n + s.length + 3, 1);
+    while (out.length > PF_LEDGER_CAP || jsonLen(out) > PF_LEDGER_MAX_BYTES) {
+        const dropped = out.shift();
+        if (dropped !== undefined) known.delete(dropped);
+        if (out.length === 0) return undefined; // pathological — start fresh next list
+    }
+    return out.length > 0 ? out : undefined;
 }
 
 function breakerArmed(saved: PFSavedState | null): boolean {
@@ -504,7 +567,7 @@ function noteCreditedMiss(sessionId: string, decision: string, log: (level: stri
     const staleHold = cur.disabledAt !== undefined && Date.now() - cur.disabledAt >= PF_DISABLED_TTL_MS;
     const misses = (staleHold ? 0 : cur.misses) + 1;
     if (misses >= PF_BREAKER_MISSES) {
-        writeSaved(sessionId, { t: cur.t, m: cur.m, misses, disabledAt: Date.now(), cs: cur.cs });
+        writeSaved(sessionId, { t: cur.t, m: cur.m, misses, disabledAt: Date.now(), l: cur.l, lg: cur.lg, cs: cur.cs });
         log("warn", `[${sessionId}] watermark fastpath disabled for ${Math.round(PF_DISABLED_TTL_MS / 60000)}m after ${misses} consecutive verified misses (last: ${decision}) — legacy full-parse continues`);
     } else {
         writeSaved(sessionId, { ...cur, misses, disabledAt: staleHold ? undefined : cur.disabledAt });
@@ -531,6 +594,14 @@ export function finalizeWatermarkTurn(
     if (outcome.measuredT === undefined) return headers;
     const T = outcome.measuredT;
     const saved = readSaved(session.id);
+    // #5403/#5418 v6 (R2/R7): sole ledger growth site. Grow when this turn
+    // delivered a shape-valid list, the v6 knob is on, and the conversation
+    // did not swap (cs gate fired ⇒ ledgerHold — a swapped-in conversation's
+    // ids must not fold into this session's baseline). Non-grow turns carry
+    // the stored ledger forward unchanged (never wipe).
+    const lg = outcome.receivedTailIds !== undefined && !outcome.ledgerHold && featureEnabled("watermarkCompactionPassthrough")
+        ? growPfLedger(saved, outcome.receivedTailIds)
+        : saved?.lg;
     if (outcome.hit) {
         seeds.set(session, {
             cores: outcome.hit.view,
@@ -541,7 +612,7 @@ export function finalizeWatermarkTurn(
             lastTailIds: outcome.receivedTailIds,
             multimodal: outcome.hit.seedMultimodal,
         });
-        writeSaved(session.id, { t: T, m: input.model, misses: 0, l: outcome.receivedTailIds, cs: outcome.clientSess ?? saved?.cs });
+        writeSaved(session.id, { t: T, m: input.model, misses: 0, l: outcome.receivedTailIds, lg, cs: outcome.clientSess ?? saved?.cs });
         headers[PF_SEQ_HEADER] = String(T);
         return headers;
     }
@@ -558,7 +629,7 @@ export function finalizeWatermarkTurn(
     }
     // Held (breaker-armed) turns flow through here too and DO restamp: the
     // stamp is how a client converges on truth while the lane stays hit-less.
-    writeSaved(session.id, { t: T, m: input.model, misses: saved?.misses ?? 0, disabledAt: saved?.disabledAt, l: outcome.receivedTailIds, cs: outcome.clientSess ?? saved?.cs });
+    writeSaved(session.id, { t: T, m: input.model, misses: saved?.misses ?? 0, disabledAt: saved?.disabledAt, l: outcome.receivedTailIds, lg, cs: outcome.clientSess ?? saved?.cs });
     headers[PF_SEQ_HEADER] = String(T);
     return headers;
 }
