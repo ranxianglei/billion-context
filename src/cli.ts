@@ -444,12 +444,13 @@ export function parseArgs(argv: string[]): Parsed {
 
     // First positional (if any) is the command. "start" | "update" | "test"
     // are recognized; an unknown command is an error.
-    if (client) {
+    const informational = command === "help" || command === "version";
+    if (!informational && client) {
         command = "launch";
-    } else if (positional.length > 0) {
+    } else if (!informational && positional.length > 0) {
         const cmd = positional[0]!;
         if (cmd === "start") {
-            command = command === "help" || command === "version" ? command : "start";
+            command = "start";
         } else if (cmd === "update") {
             command = "update";
         } else if (cmd === "doctor") {
