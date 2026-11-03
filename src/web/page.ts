@@ -40,8 +40,7 @@ export function renderPage(origin: string, version: string, embed = false, theme
 <div id="plugin-advisory-banner" class="banner warn" hidden></div>
 <div id="pck-banner" class="banner warn" hidden></div>
 <div id="host-plugin-banner" class="banner warn" hidden></div>
-<div id="pck-notice-banner" class="banner warn" hidden></div>
-<div id="wm-notice-banner" class="banner ok" hidden></div>
+<div id="notices-banners"></div>
 <div id="alerts-banner" class="banner err" hidden></div>
 <main>
 <section id="page-overview" class="page">
@@ -72,6 +71,7 @@ export function renderPage(origin: string, version: string, embed = false, theme
 <div class="card" style="margin-top:16px"><div class="card-h"><span data-i18n="ov.recent">${zh("ov.recent")}</span><a class="btn sm" href="#/sessions" data-i18n="ov.view_all">${zh("ov.view_all")}</a></div><div class="card-b flush"><div class="twrap twide"><table class="data"><colgroup><col><col style="width:52px"><col style="width:84px"><col style="width:104px"><col style="width:48px"><col style="width:62px"><col style="width:62px"><col style="width:62px"><col style="width:190px"><col style="width:72px"><col style="width:48px"><col style="width:48px"><col style="width:56px"></colgroup><thead><tr>
 <th data-i18n="ses.th_title">${zh("ses.th_title")}</th><th data-i18n="ses.th_client">${zh("ses.th_client")}</th><th data-i18n="ses.th_proto">${zh("ses.th_proto")}</th><th data-i18n="ses.th_upstream">${zh("ses.th_upstream")}</th><th class="num" data-i18n="ses.th_reqs">${zh("ses.th_reqs")}</th><th class="num" data-i18n="ses.th_ctx">${zh("ses.th_ctx")}</th><th class="num" data-i18n="ses.th_input">${zh("ses.th_input")}</th><th class="num" data-i18n="ses.th_saved">${zh("ses.th_saved")}</th><th class="num" data-i18n="ses.th_hit">${zh("ses.th_hit")}</th><th class="num" title="${zh("ses.th_switches_tip")}" data-i18n-title="ses.th_switches_tip" data-i18n="ses.th_switches">${zh("ses.th_switches")}</th><th class="num" data-i18n="ses.th_folds">${zh("ses.th_folds")}</th><th class="num" data-i18n="ses.th_blocks">${zh("ses.th_blocks")}</th><th data-i18n="ses.th_seen">${zh("ses.th_seen")}</th>
 </tr></thead><tbody id="recent-body"></tbody></table></div></div></div>
+<div class="card" style="margin-top:16px" id="notice-list-card" hidden><div class="card-h"><span data-i18n="notices.list_title">${zh("notices.list_title")}</span></div><div class="card-b" id="notice-list"></div></div>
 </section>
 <section id="page-sessions" class="page" hidden>
 <div id="sessions-list-view">
