@@ -201,7 +201,10 @@ test("#5582 stub-parent rescue: acp_status/acp_cache follow the deep descendant;
         // sharp byRef-membership tier routes to the lane that minted them.
         const comp = await forwardTool(rig.baseUrl, CONV, "compress", { startId: "m00005", endId: "m00060", summary: "Wrap-up of the early turns: setup, environment notes and the first exploration steps." }, undefined, true);
         assert.equal(comp.failed, false, `compress must land in the owning lane, got: ${comp.text.slice(0, 300)}`);
-        assert.ok(!comp.text.includes("highest allocated ref"), "no ghost 'above highest allocated ref' error");
+        // The fatal ghost error reads "...is above this session's highest allocated ref ...";
+        // the benign no-op receipt ALSO contains "highest allocated ref" ("Session highest
+        // allocated ref is mNNNNN — target older ranges only"), so match the fatal shape only.
+        assert.ok(!comp.text.includes("is above this session"), "no ghost 'above highest allocated ref' error");
         assert.ok(!comp.text.includes("Total compressible content too small"), "no ghost 'too small' error");
     } finally {
         await stopRig(rig);
