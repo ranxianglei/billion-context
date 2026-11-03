@@ -51,6 +51,16 @@ const ALERT_KINDS: ReadonlySet<UpstreamFailureKind> = new Set([
 
 const MAX_ALERTS = 32;
 
+/** #5572: an alert row is a snapshot of NOW (#1682), so it dies when its host stops
+ *  being hit-and-failing. A single stray failure against a loopback provider shim
+ *  that rebound to a fresh ephemeral port after a plugin reload otherwise pins the
+ *  banner forever: the dead port can never succeed again, so
+ *  clearUpstreamAlertsForHost — the only other removal path — can never fire for it.
+ *  Expire rows older than this since their LAST failure. Hosts still failing refresh
+ *  lastSeen on every failure (live outages; open-circuit half-open probes re-record
+ *  through the same relay path every 60s), so they never age out. */
+const ALERT_STALE_MS = 5 * 60_000;
+
 let alerts = new Map<string, UpstreamAlert>();
 
 function hostOf(url: string): string {
@@ -63,6 +73,17 @@ function hostOf(url: string): string {
 
 function keyFor(kind: UpstreamFailureKind, host: string): string {
     return kind + "\u0000" + host;
+}
+
+/** #5572: drop rows whose last failure predates `now - ALERT_STALE_MS`. Called lazily
+ *  from the two read projections; sweeping ≤MAX_ALERTS entries per read is negligible.
+ *  Deleting the current entry mid-iteration is defined behavior for a Map iterator. */
+function pruneStaleAlerts(now: number): void {
+    if (alerts.size === 0) return;
+    const cutoff = now - ALERT_STALE_MS;
+    for (const [key, a] of alerts) {
+        if (a.lastSeen < cutoff) alerts.delete(key);
+    }
 }
 
 /** #5146: pull the errno off a Node error when present (ECONNREFUSED, ENOTFOUND, …) so the
@@ -116,8 +137,10 @@ export function clearUpstreamAlertsForHost(url: string): void {
     }
 }
 
-/** Active alerts, most recently seen first. Always a fresh array. */
-export function getUpstreamAlerts(): UpstreamAlert[] {
+/** Active alerts, most recently seen first. Always a fresh array. Prunes rows that
+ *  stopped refreshing past ALERT_STALE_MS before projecting (#5572). */
+export function getUpstreamAlerts(now: number = Date.now()): UpstreamAlert[] {
+    pruneStaleAlerts(now);
     return [...alerts.values()].sort((a, b) => b.lastSeen - a.lastSeen);
 }
 
@@ -356,6 +379,7 @@ export interface UpstreamHealthReport {
 }
 
 export function getUpstreamHealthReport(now: number = Date.now()): UpstreamHealthReport {
+    pruneStaleAlerts(now);
     interface Acc {
         alerts: UpstreamAlert[];
         circuit: UpstreamCircuit | null;
