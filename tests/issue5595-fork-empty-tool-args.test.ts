@@ -3,10 +3,13 @@
 // Unrecovered tool-call cores serialize as EMPTY function.arguments on the OpenAI
 // wire — a hard provider 400 ("...must be a valid JSON object string") that
 // compaction/preflight cannot rescue (it is a VALIDATION failure, not a size
-// failure), bricking the forked child forever. The outbound boundary must never
-// emit empty/non-object JSON arguments: valid args ride byte-exact (wire fidelity,
-// #1039: tool-call arguments are user intent); only empty/malformed ones become a
-// parseable placeholder. Sibling of #3661 (the model-produced-non-JSON case).
+// failure), bricking the forked child forever. The PROXY-MODE prepare boundary
+// (prepare-openai) therefore never emits empty/non-object JSON arguments: valid
+// args ride byte-exact (wire fidelity, #1039); only empty/malformed ones become a
+// parseable placeholder. The LOOP re-request path (openai adapter buildRequest)
+// must stay VERBATIM even for degenerate args — the host re-sends its own history
+// and any rewrite desyncs the session (#1039/#1960; owner review of PR #5602).
+// Sibling of #3661 (the model-produced-non-JSON case).
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { CoreMessage } from "acp-kernel";
@@ -94,10 +97,12 @@ test("#5595 messages without tool_calls pass through unchanged", () => {
     assert.deepEqual(messages, input, "untouched");
 });
 
-// Wiring pin: the guard sits in the openai adapter's outbound buildRequest, so an
-// empty history tool-call arg is healed before the request leaves the proxy while
-// a valid one rides byte-exact.
-test("#5595 wiring: buildRequest heals an empty history tool-call arg, keeps a valid one exact", () => {
+// Boundary pin (owner review of PR #5602): the openai LOOP adapter's buildRequest
+// is the loop's re-request path and MUST forward tool-call arguments verbatim —
+// including degenerate ones — because the host re-sends its own history and any
+// rewrite desyncs the session (#1039/#1960). The #5595 placeholder guard therefore
+// lives ONLY in the proxy-mode prepare path, never here; this pins that boundary.
+test("#5595 boundary: loop adapter forwards degenerate tool-call args verbatim (no rewrite)", () => {
     const cores: CoreMessage[] = [
         { id: "u1", role: "user", contentType: "text", text: "run it" },
         { id: "a1", role: "assistant", contentType: "tool-call", text: "", toolName: "bash", toolCallId: "call_empty" },
@@ -109,9 +114,8 @@ test("#5595 wiring: buildRequest heals an empty history tool-call arg, keeps a v
     const assistant = messages.find((m) => m.role === "assistant" && Array.isArray(m.tool_calls));
     assert.ok(assistant, "an assistant tool-call message rides the request");
     const byId = new Map(argsOf(assistant!).map((t) => [t.id, t.args]));
-    assert.equal(byId.get("call_empty"), EMPTY_TOOL_CALLS_ARGUMENTS_PLACEHOLDER, "empty history arg becomes the placeholder");
-    JSON.parse(byId.get("call_empty")!); // sendable
-    assert.equal(byId.get("call_ok"), '{"cmd":"ls"}', "valid history arg stays byte-exact");
+    assert.equal(byId.get("call_empty"), "", "empty arg forwarded verbatim — loop path must not rewrite it (#1039)");
+    assert.equal(byId.get("call_ok"), '{"cmd":"ls"}', "valid arg stays byte-exact");
 });
 
 // --- #5595/F4: the replicasUnavailable detail must name the ACTUAL cause ---
