@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import type { Config } from "acp-kernel";
 import { createCore, createInitialState, assignRefs, emptyRefMap, defaultConfig } from "acp-kernel";
 import type { Session } from "../src/session.ts";
-import { runCompressLoop, createResponsesAdapter, failedCallSignature, MAX_LOOP_ROUNDS } from "../src/loop/index.ts";
+import { runCompressLoop, createResponsesAdapter, createAnthropicAdapter, failedCallSignature, MAX_LOOP_ROUNDS } from "../src/loop/index.ts";
+import type { WireProtocol } from "../src/util.ts";
 import { buildCompressSystemPrompt } from "../src/compress-tool.ts";
 import type { CoreMessage } from "acp-kernel";
 
@@ -50,18 +51,20 @@ const COMPLETED = sse("response.completed", { response: { id: "resp_done", statu
 
 const SYS_PROMPT = buildCompressSystemPrompt();
 
-function makeCtx(messages: CoreMessage[] = []): {
+function makeCtx(messages: CoreMessage[] = [], protocol?: WireProtocol): {
     core: ReturnType<typeof createCore>;
     config: Config;
     messages: CoreMessage[];
     session: Session;
     log: (m: string) => void;
     visibilityMarkers?: boolean;
+    protocol?: WireProtocol;
 } {
     return {
         core: createCore(),
         config: defaultConfig(200000),
         messages,
+        protocol,
         session: {
             id: "issue5220-test",
             meta: {},
@@ -94,9 +97,10 @@ async function drain(
     ctx: ReturnType<typeof makeCtx>,
     requestBody: Record<string, unknown>,
     requestOptions: { url: string; headers: Record<string, string> },
+    adapter: ReturnType<typeof createResponsesAdapter> = createResponsesAdapter(),
 ): Promise<string> {
     const chunks: Buffer[] = [];
-    for await (const chunk of runCompressLoop(stream, ctx, requestBody, requestOptions, createResponsesAdapter(), SYS_PROMPT)) {
+    for await (const chunk of runCompressLoop(stream, ctx, requestBody, requestOptions, adapter, SYS_PROMPT)) {
         chunks.push(chunk);
     }
     return Buffer.concat(chunks).toString("utf8");
@@ -304,6 +308,121 @@ test("#5220 T6: deduped markers → re-request WITHOUT an empty assistant frame 
             const texts = assistantTexts(bodies[i]!);
             assert.ok(!texts.some((t) => t.trim().length === 0), `re-request ${i + 1}: no zero-byte assistant frame rides upstream (empty text blocks are illegal on strict wires)`);
         }
+    } finally {
+        globalThis.fetch = orig;
+    }
+});
+
+// #5604: the recovery receipt is assistant-role by design (#5220 cache invariant —
+// the client echoes the streamed markers back as assistant content), so a failed-only
+// round's re-request ENDED ON AN ASSISTANT TURN. Anthropic rejects that shape outright
+// ("final assistant content cannot end with trailing whitespace" / "assistant message
+// prefill not supported"), the client gets a 400 and a subagent dies with "Agent
+// terminated early due to an API error". The fix caps the re-request with a thin user
+// nudge so it always ends on a user turn. This test pins the final-message role — the
+// existing T1/T6 only asserted the ❌ bytes ride upstream, never which role ends the body.
+test("#5604: failed-only re-request ENDS ON A USER TURN (no assistant prefill)", async () => {
+    let n = 0;
+    const bodies: string[] = [];
+    const orig = globalThis.fetch;
+    globalThis.fetch = (async (_u: unknown, init?: RequestInit) => {
+        n++;
+        if (init?.body) bodies.push(String(init.body));
+        return new Response(NATURAL_END_ROUND, { status: 200, headers: { "content-type": "text/event-stream" } });
+    }) as typeof fetch;
+    try {
+        const ctx = withRefs(makeCtx([
+            textMsg("u1", "user", "do the task"),
+            textMsg("a1", "assistant", "working on it"),
+        ]));
+        // invalid refs → applyRanges returns FAILED, no block created
+        const round1 = [
+            sse("response.created", { response: { id: "resp_1", status: "in_progress" } }),
+            fcEvents(0, "call_c5604", "compress", JSON.stringify({ content: [{ startId: "b99", endId: "b99", summary: "x".repeat(60) }] })),
+            COMPLETED,
+        ].join("");
+        await drain(
+            new Response(round1, { status: 200 }).body!,
+            ctx,
+            { model: "gpt-4o", input: [], stream: true },
+            { url: "http://mock", headers: {} },
+        );
+        assert.equal(n, 1, "first-time failure re-requests once");
+        const parsed = JSON.parse(bodies[0]!) as { input: Array<{ type?: string; role?: string }> };
+        const msgs = parsed.input.filter((it) => it.type === "message");
+        assert.ok(msgs.length >= 2, `re-request carries the base history plus the cap, got ${msgs.length} message(s)`);
+        assert.equal(msgs[msgs.length - 1]!.role, "user", "the re-request ENDS on a user turn — never an assistant prefill (#5604)");
+        assert.ok(assistantTexts(bodies[0]!).some((t) => t.includes("❌")), "the assistant receipt still carries the streamed marker bytes (#5220 cache invariant intact)");
+    } finally {
+        globalThis.fetch = orig;
+    }
+});
+
+// #5604 on the ANTHROPIC wire (where the 400 actually fires), with a SIGNED THINKING
+// block: buildVisibilityMarker appends "\n", so the receipt merged into that assistant
+// turn ends in trailing whitespace → "final assistant content cannot end with trailing
+// whitespace" / "assistant message prefill not supported". The Responses pin above never
+// reaches this shape; this one does.
+function anthropicFailedRound(): string {
+    return [
+        sse("message_start", { type: "message_start", message: { id: "msg_1", usage: { input_tokens: 10 } } }),
+        sse("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "thinking", thinking: "" } }),
+        sse("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "Fold old ranges." } }),
+        sse("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "signature_delta", signature: "sig-abc" } }),
+        sse("content_block_stop", { type: "content_block_stop", index: 0 }),
+        sse("content_block_start", { type: "content_block_start", index: 1, content_block: { type: "tool_use", id: "toolu_1", name: "compress", input: {} } }),
+        sse("content_block_delta", { type: "content_block_delta", index: 1, delta: { type: "input_json_delta", partial_json: JSON.stringify({ content: [{ startId: "b99", endId: "b99", summary: "x".repeat(60) }] }) } }),
+        sse("content_block_stop", { type: "content_block_stop", index: 1 }),
+        sse("message_delta", { type: "message_delta", delta: { stop_reason: "tool_use" }, usage: { output_tokens: 7 } }),
+        sse("message_stop", { type: "message_stop" }),
+    ].join("");
+}
+
+function anthropicNaturalEndRound(): string {
+    return [
+        sse("message_start", { type: "message_start", message: { id: "msg_2", usage: { input_tokens: 20 } } }),
+        sse("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }),
+        sse("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "DONE-ANTHROPIC-5604" } }),
+        sse("content_block_stop", { type: "content_block_stop", index: 0 }),
+        sse("message_delta", { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 5 } }),
+        sse("message_stop", { type: "message_stop" }),
+    ].join("");
+}
+
+test("#5604 anthropic wire (+signed thinking): failed-only re-request ENDS ON A USER TURN", async () => {
+    let n = 0;
+    const bodies: string[] = [];
+    const orig = globalThis.fetch;
+    globalThis.fetch = (async (_u: unknown, init?: RequestInit) => {
+        n++;
+        if (init?.body) bodies.push(String(init.body));
+        return new Response(anthropicNaturalEndRound(), { status: 200, headers: { "content-type": "text/event-stream" } });
+    }) as typeof fetch;
+    try {
+        const reqBody = { model: "claude-test", stream: true, thinking: { type: "enabled", budget_tokens: 2048 }, messages: [] };
+        const ctx = withRefs(makeCtx([
+            textMsg("u1", "user", "do the task"),
+            textMsg("a1", "assistant", "working on it"),
+            textMsg("u2", "user", "go on"),
+        ], "anthropic"));
+        const out = await drain(
+            new Response(anthropicFailedRound(), { status: 200 }).body!,
+            ctx,
+            reqBody,
+            { url: "http://mock", headers: {} },
+            createAnthropicAdapter(reqBody),
+        );
+        assert.equal(n, 1, "first-time failure re-requests once");
+        assert.ok(out.includes("❌"), "failure marker streamed to the client");
+        assert.ok(out.includes("DONE-ANTHROPIC-5604"), "natural end-of-turn reached the client (turn survived)");
+        const msgs = (JSON.parse(bodies[0]!) as { messages: Array<{ role: string; content: unknown }> }).messages;
+        const last = msgs[msgs.length - 1]!;
+        if (last.role === "assistant") {
+            const c = last.content;
+            const lastText = typeof c === "string" ? c : (c as Array<{ type: string; text?: string }>).filter((b) => b.type === "text").map((b) => b.text ?? "").pop() ?? "";
+            assert.equal(lastText, lastText.trimEnd(), "final assistant content must not end with whitespace (Anthropic 400)");
+        }
+        assert.equal(last.role, "user", "re-request ENDS on a user turn — never an assistant prefill (#5604)");
     } finally {
         globalThis.fetch = orig;
     }
