@@ -3,6 +3,7 @@ import {
     countMessageTokens,
     defaultCountTokens,
     formatRanges,
+    hasUnrecoverableMediaPayload,
     viableRanges,
     type CompressionCore,
     type Config,
@@ -111,6 +112,22 @@ function fmtBytes(n: number): string {
 // #2366: usage fraction at which the PRESSURE NOTE becomes worth showing —
 // below it the window still has headroom and "stop folding" is noise.
 const PRESSURE_NOTE_USAGE_FRACTION = 0.6;
+// #5620: unrecoverable-media floor — live messages carrying remote-URL / file-ref
+// media can never fold (#1188/#2609) and turn integrity pins the turns around
+// them (#684); when that mass is a meaningful share of the window, name it so a
+// high-usage low-compressible session explains its own floor instead of reading
+// as a broken compressor.
+const MEDIA_FLOOR_REPORT_FRACTION = 0.05;
+function mediaFloorMass(messages: readonly CoreMessage[]): { count: number; tokens: number } {
+    let count = 0;
+    let tokens = 0;
+    for (const m of messages) {
+        if (!hasUnrecoverableMediaPayload(m)) continue;
+        count += 1;
+        tokens += countMessageTokens(m, defaultCountTokens);
+    }
+    return { count, tokens };
+}
 // #2362: render dead refs as compact ref spans ("m09539, m09543–m09558").
 function formatDeadRefSpans(refs: string[]): string {
     const nums = refs
@@ -277,6 +294,15 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
             // forfeits the cache hit for almost-nothing reclaimed).
             if (!nudge.shouldInject && nudge.contextUsage >= PRESSURE_NOTE_USAGE_FRACTION && nudge.breakdown.maxPending < nudge.breakdown.nudgeGrowthTokens) {
                 extra.push(`PRESSURE NOTE: billed input sits at ${Math.round(nudge.contextUsage * 100)}% of the ${ctx.config.modelContextLimit}-token limit while max compressible mass is only ~${nudge.breakdown.maxPending} tokens — little left to fold. Repeated small folds rewrite the prefix (forfeiting cache hits) while reclaiming almost nothing; continue the task instead of folding again unless pressure climbs further.`);
+            }
+            // #5620: the note above misses the media-wall case — its gate needs
+            // maxPending < growth step, but pinned turns keep a range advertised
+            // forever, so report the never-foldable mass itself whenever it is a
+            // meaningful share of the window.
+            const limit = ctx.config.modelContextLimit;
+            const mediaFloor = mediaFloorMass(ctx.messages);
+            if (mediaFloor.count > 0 && limit > 0 && mediaFloor.tokens >= MEDIA_FLOOR_REPORT_FRACTION * limit) {
+                extra.push(`MEDIA FLOOR: ${mediaFloor.count} live message(s) carry unrecoverable media (remote URL / file references with no stored bytes) ≈ ${mediaFloor.tokens} tok (~${Math.round((100 * mediaFloor.tokens) / limit)}% of the ${limit}-token limit) — these can never fold (#1188/#2609) and turn integrity pins the turns around them (#684); the context floor includes this mass plus system/tools/block anchors. Only fewer such images (or a fresh session) lowers the floor.`);
             }
             // #847: only advertise ranges the submit gate accepts — the gate
             // counts raw chars (minCompressRange), not tokens, so a range can
