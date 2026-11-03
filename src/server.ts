@@ -416,7 +416,7 @@ export function googlePathKind(urlPath: string): GooglePathKind | null {
  *  `parsed.model`. Returns undefined when the path carries no model or an
  *  undecodable one. */
 export function googleModelFromPath(urlPath: string): string | undefined {
-    const m = /\/models\/([^/:?]+):(?:streamGenerateContent|generateContent|countTokens)\b/.exec(urlPath);
+    const m = /\/models\/([^:?]+):(?:streamGenerateContent|generateContent|countTokens)\b/.exec(urlPath);
     if (!m || !m[1]) return undefined;
     try {
         return decodeURIComponent(m[1]);

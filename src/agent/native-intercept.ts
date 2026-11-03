@@ -263,7 +263,15 @@ function noteSignedDirect(url: string, scheme: string, why: string): void {
 // isV1InternalControlPlanePath) keep passing through direct. Version segment
 // is optional and unpinned (zhipuai uses `/v4/chat/completions`, bailian
 // mounts `/apps/anthropic/v1/messages`), so match on the trailing shape only.
-const MODEL_API_SUFFIX = /(?:^|\/)(?:v\d+\/)?(?:messages|chat\/completions|completions|responses|conversations)\/?$|(?:^|\/)models\/[^/:?]+:(?:streamGenerateContent|generateContent|countTokens)$|(?:^|\/)v1internal:(?:streamGenerateContent|generateContent|countTokens)$/;
+// The model id may itself carry a namespace — a gateway route (`models/hard:
+// streamGenerateContent`) or a provider prefix relayed verbatim (`models/
+// antigravity/gemini-3.8-flash:streamGenerateContent`, omp `google-generative-ai`
+// providers) — so the id accepts `/` and is bounded only by the method colon and
+// the query. Excluding it silently classified those requests as non-model
+// traffic: the interceptor forwarded them straight to the upstream, so the
+// session never reached the proxy (no window resolution, no compression, and
+// `acp_status` reporting "unknown plugin conversation") (#5593).
+const MODEL_API_SUFFIX = /(?:^|\/)(?:v\d+\/)?(?:messages|chat\/completions|completions|responses|conversations)\/?$|(?:^|\/)models\/[^:?]+:(?:streamGenerateContent|generateContent|countTokens)$|(?:^|\/)v1internal:(?:streamGenerateContent|generateContent|countTokens)$/;
 
 /** True when the URL points at a model-API endpoint worth proxying. Never
  *  true for bili's own proxy paths (`/bili/…`, `/__bili/…`) or non-HTTP(S). */
