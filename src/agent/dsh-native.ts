@@ -2239,7 +2239,7 @@ export async function apply(ctx: PluginContext): Promise<void> {
         attrReportedRefusals = 0;
         reportAttrHealth();
     };
-    const refuse = (url: string, attr: GateAttribution, body?: { bytes: number }): false => {
+    const refuse = (url: string, attr: GateAttribution, body?: { bytes?: number; window?: number | undefined }): false => {
         const key = gateKeyOf(url);
         const prev = gateRefusals.get(key);
         const count = (prev?.count ?? 0) + 1;
@@ -2257,10 +2257,17 @@ export async function apply(ctx: PluginContext): Promise<void> {
             // Size visibility (#5613): a KNOWN size here means the send fits
             // under the calibrated bar (bigger ones refused LOCALLY above);
             // an UNKNOWN one names the remaining blind spot — a streamed or
-            // unreadable body the over-window fuse could not price.
+            // unreadable body the over-window fuse could not price. The
+            // window token makes one line self-describing: body scale + the
+            // window it was judged against, no provider-log correlation
+            // needed; an unresolvable window degrades to "window unknown"
+            // (never a fabricated number).
+            const windowNote = body?.window !== undefined
+                ? `, window ${body.window.toLocaleString("en-US")}`
+                : ", window unknown";
             const sizeNote = body?.bytes !== undefined
-                ? ` (this body ${body.bytes.toLocaleString("en-US")} B)`
-                : " (body size unknown — streamed/unreadable; the over-window fuse could not run)";
+                ? ` (this body ${body.bytes.toLocaleString("en-US")} B${windowNote})`
+                : ` (body size unknown — streamed/unreadable; the over-window fuse could not run${windowNote})`;
             const line = `bili-native-dsh: model request sent DIRECT (uncompressed) — takeover gate refused ${key}: ${reason} — refusals so far: ${count}${suffix}${sizeNote}`;
             persistClientEvent(line);
         }
@@ -2330,7 +2337,9 @@ export async function apply(ctx: PluginContext): Promise<void> {
             noteAttrRefusal("threw", { message, endpoint: maskUrlForDiagnostics(gateKeyOf(url)) });
             return "refuse-oversized";
         }
-        return refuse(url, attributionOf(ctx), body);
+        // #5613: the refusal line carries the request's own scale (#5875) plus
+        // the resolved window so one line is self-describing.
+        return refuse(url, attributionOf(ctx), { bytes: body?.bytes, window: declared });
     };
 
     // #4068/#4079: `none` keeps #1117 direct semantics by design — an
@@ -2361,7 +2370,8 @@ export async function apply(ctx: PluginContext): Promise<void> {
             noteAttrRefusal(attr.state, { endpoint: maskUrlForDiagnostics(gateKeyOf(url)) });
             return "refuse-oversized-unattributed";
         }
-        return refuse(url, attr, body);
+        // #5613: same self-describing-line contract as the threw arm above.
+        return refuse(url, attr, { bytes: body?.bytes, window: declared });
     };
     state.takeoverGate = (url, body, init) => {
         // #1295: an operator-declared endpoint is explicitly "this URL IS my
