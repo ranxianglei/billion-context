@@ -464,3 +464,58 @@ test("clearWatermarkSeed forces the next turn back through verification", () => 
     const { out } = runTurn(session, { [PF_COUNT_HEADER]: "3" }, b2);
     assert.equal(out.decision, "unseeded");
 });
+
+// ---------------------------------------------------------------------------
+// #5571 v5 (owner ruling 2026-11-03): identity-only head verification
+// ---------------------------------------------------------------------------
+
+test("v5 id mode: head rewrite under stable host msgids RIDES the stashed prefix and warns", () => {
+    LOGS.length = 0;
+    makeStubStore();
+    const session = freshSession("pf-v5-ride");
+    const b1 = bodyOf([SYS("s"), USR("a"), USR("b")]);
+    assert.equal(runTurn(session, {}, b1).out.decision, "no-stamp");
+    // rewrite "b" IN PLACE and append one user turn; the shim echoes the window host ids.
+    // Pre-v5 this was an uncredited head-prefix-drift miss; under v5 the host
+    // msgid chain (shape + width + prevId) IS the proof — it rides.
+    const b2 = bodyOf([SYS("s"), USR("a"), USR("b-E"), USR("c")]);
+    const { out } = runTurn(session, TAIL(["h-bE", "h-c"]), b2);
+    assert.equal(out.decision, "hit(no-count)", LOGS.join("\n"));
+    // the diagnostic stream must record the drift (feeds M3 re-seeding signals)
+    assert.ok(LOGS.some((l) => l.startsWith("warn") && l.includes("watermark v5")), LOGS.join("\n"));
+});
+
+test("v5: system-text change STILL misses under stable host msgids (pinned deviation — a prompt has no msgid)", () => {
+    LOGS.length = 0;
+    makeStubStore();
+    const session = freshSession("pf-v5-sys");
+    const b1 = bodyOf([SYS("s"), USR("a"), USR("b")]);
+    runTurn(session, {}, b1);
+    const b2 = bodyOf([SYS("CHANGED"), USR("a"), USR("b"), USR("c")]);
+    const { out } = runTurn(session, TAIL(["x1", "x2"]), b2);
+    assert.equal(out.decision, "head-drift", LOGS.join("\n"));
+    assert.equal(out.creditedMiss, true);
+});
+
+test("v5: client session-id swap under stable host msgids misses sess-change, recovers when the conversation returns", () => {
+    LOGS.length = 0;
+    makeStubStore();
+    const session = freshSession("pf-v5-sess");
+    const A: Record<string, string> = { "x-conversation-id": "conv-A" };
+    const b1 = bodyOf([SYS("s"), USR("a"), USR("b")]);
+    runTurn(session, A, b1); // no-stamp; cs captured
+    const b2 = bodyOf([SYS("s"), USR("a"), USR("b"), USR("c")]);
+    const bad = runTurn(session, { ...A, "x-conversation-id": "conv-B", ...TAIL(["p1", "p2"]) }, b2);
+    assert.equal(bad.out.decision, "sess-change", LOGS.join("\n"));
+    // The missed turn went legacy AND the recorded identity follows the
+    // traffic: state now belongs to conv-B, so B's continuous growth RIDES
+    // (window ids open on the swapped turn's last slot) ...
+    const b3 = bodyOf([...JSON.parse(b2).messages, USR("d")]);
+    const contB = runTurn(session, { ...A, "x-conversation-id": "conv-B", ...TAIL(["p2", "q2"]) }, b3);
+    assert.equal(contB.out.decision, "hit(no-count)", LOGS.join("\n"));
+    // ...while the ORIGINAL conversation A returning is ANOTHER identity
+    // event — it pays one more legacy pass (no silent ride across swaps).
+    const b4 = bodyOf([...JSON.parse(b3).messages, USR("e")]);
+    const backA = runTurn(session, { ...A, ...TAIL(["q2", "r2"]) }, b4);
+    assert.equal(backA.out.decision, "sess-change", LOGS.join("\n"));
+});
