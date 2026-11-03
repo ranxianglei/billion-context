@@ -52,13 +52,15 @@ const ALERT_KINDS: ReadonlySet<UpstreamFailureKind> = new Set([
 const MAX_ALERTS = 32;
 
 /** #5572: an alert row is a snapshot of NOW (#1682), so it dies when its host stops
- *  being hit-and-failing. A single stray failure against a loopback provider shim
- *  that rebound to a fresh ephemeral port after a plugin reload otherwise pins the
- *  banner forever: the dead port can never succeed again, so
+ *  being hit-and-failing. A single stray failure against a provider that then stops
+ *  being requested — a loopback shim that rebound to a fresh ephemeral port after a
+ *  plugin reload, or a user-configured endpoint whose session switched models away —
+ *  otherwise pins the banner forever: the dead port can never succeed again, so
  *  clearUpstreamAlertsForHost — the only other removal path — can never fire for it.
- *  Expire rows older than this since their LAST failure. Hosts still failing refresh
- *  lastSeen on every failure (live outages; open-circuit half-open probes re-record
- *  through the same relay path every 60s), so they never age out. */
+ *  Circuit half-open probes are request-driven (consulted per-request, no background
+ *  timer), so an unreferenced host gets neither fresh failures nor probes. Expire rows
+ *  older than this since their LAST failure; a host still actively failing refreshes
+ *  lastSeen on every failing request and stays visible while genuinely down. */
 const ALERT_STALE_MS = 5 * 60_000;
 
 let alerts = new Map<string, UpstreamAlert>();
