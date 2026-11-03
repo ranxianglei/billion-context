@@ -178,10 +178,11 @@ const npmCmd = process.platform === "win32" ? "npm.cmd" : "npm";
 console.log("[ci-tests] pretest (kernel + pi-subagents build)");
 execFileSync(npmCmd, ["run", "pretest"], { cwd: root, stdio: "inherit", shell: process.platform === "win32" });
 
-// Loader chain the suites depend on (storage-baseline preload, #2671/#2803,
-// then tsx). Shared by the main phase and the isolated diagnostic re-run so
-// the latter sees the SAME environment as the in-phase run.
-const PRELOAD_ARGS = ["--import", "./tests/preload-storage-baseline.mjs", "--import", "./tests/preload-zone-slot.mjs", "--import", "tsx"];
+// Loader chain the suites depend on (storage-baseline preload #2671/#2803,
+// hermetic data roots #5107, CI zone-slot ports #3182, then tsx). Shared by
+// the main phase and the isolated diagnostic re-run so the latter sees the
+// SAME environment as the in-phase run.
+const PRELOAD_ARGS = ["--import", "./tests/preload-storage-baseline.mjs", "--import", "./tests/preload-test-env.mjs", "--import", "./tests/preload-zone-slot.mjs", "--import", "tsx"];
 
 const MAX_CAPTURE = 32 * 1024 * 1024; // bound in-memory capture; real runs are MB-scale
 

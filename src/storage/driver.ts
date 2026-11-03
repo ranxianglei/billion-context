@@ -14,11 +14,15 @@
  *                     engine-bootstrap.ts): pinned version + sha512, cached under
  *                     ~/.cache/billion-context/sqlite/. Registered via
  *                     registerSelfDownloadedBetterSqlite3().
- *   none             — no engine: openSqliteDatabase throws and the unified sidecar
- *                     degrades to legacy-only (contract pinned by #2825).
+ *   none             — no engine: openSqliteDatabase throws and a unified/full
+ *                     ask REFUSES TO START loudly (2026-10-30: no degradation in
+ *                     any case; JSON-only serve = explicit BILI_STORAGE_UNIFIED=
+ *                     legacy). Pre-policy contract was #2825 legacy-only degrade.
  *
  * The invariant: engine acquisition NEVER depends on host install-time build-script
- * approval, and every failure path lands in legacy JSON persistence.
+ * approval; every failure path stays durable (JSON persistence) — either by an
+ * explicit JSON-only opt-out or by refusing to start at all (never a silent
+ * half-mode).
  *
  * The interface is deliberately ~50 lines: everything above this file is
  * engine-agnostic SQL; nothing below it leaks into the store.
@@ -40,6 +44,8 @@ export interface SqliteDatabase {
     prepare(sql: string): SqliteStatement;
     /** Runs fn inside BEGIN/COMMIT; rolls back on throw (including nested calls via savepoints). */
     transaction<T>(fn: () => T): T;
+    /** Deferred snapshot: readers do not reserve the writer lock. */
+    readTransaction<T>(fn: () => T): T;
     close(): void;
     readonly open: boolean;
 }
@@ -86,7 +92,24 @@ function wrapBetterSqlite3(db: BetterSqlite3Database): SqliteDatabase {
         // a write lock mid-flight — SQLITE_BUSY_SNAPSHOT, which busy_timeout
         // cannot resolve. Taking the write lock up front makes concurrent
         // writers queue on busy_timeout instead (#2690 review blocking 5).
-        transaction: (fn) => db.transaction(fn).immediate(),
+        transaction: (fn) => {
+            try {
+                return db.transaction(fn).immediate();
+            } catch (err) {
+                // #4949: better-sqlite3's own wrapper runs ROLLBACK after ANY
+                // inner failure; when BEGIN or COMMIT itself failed there was
+                // nothing left to roll back, and its "cannot rollback - no
+                // transaction is active" REPLACES the real error (commonly
+                // disk full / SQLITE_FULL) before it reaches us. Name the
+                // masking at our seam so operators see the likely cause.
+                const msg = String(err);
+                if (/cannot rollback|no transaction is active/i.test(msg)) {
+                    throw new SqliteDriverError(`${msg} — masked by better-sqlite3's automatic rollback after a failed BEGIN/COMMIT; the original error no longer survives (disk full / SQLITE_FULL is the common cause)`, "better-sqlite3");
+                }
+                throw err;
+            }
+        },
+        readTransaction: (fn) => db.transaction(fn).deferred(),
         close: () => void db.close(),
         get open() {
             return db.open;
@@ -94,41 +117,65 @@ function wrapBetterSqlite3(db: BetterSqlite3Database): SqliteDatabase {
     };
 }
 
+let databaseSyncFactoryForTests: ((path: string) => NodeSqliteDatabase) | null = null;
+
+/** Test seam: substitute how the node:sqlite emulation obtains its database
+ *  handle (e.g. an adapter injecting engine-level I/O failures, #4949).
+ *  Null = the real builtin node:sqlite module. */
+export function setDatabaseSyncFactoryForTests(factory: ((path: string) => NodeSqliteDatabase) | null): void {
+    databaseSyncFactoryForTests = factory;
+}
+
 function openNodeSqlite(path: string): SqliteDatabase {
     // node:sqlite is synchronous like better-sqlite3, but has no
     // .transaction() helper — emulate with BEGIN/COMMIT + savepoints for
     // nesting, which is the only behavioral difference the store relies on.
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const { DatabaseSync } = require("node:sqlite") as {
-        DatabaseSync: new (path: string) => NodeSqliteDatabase;
-    };
-    const db = new DatabaseSync(path);
+    const db = databaseSyncFactoryForTests
+        ? databaseSyncFactoryForTests(path)
+        : (() => {
+              // eslint-disable-next-line @typescript-eslint/no-require-imports
+              const { DatabaseSync } = require("node:sqlite") as {
+                  DatabaseSync: new (path: string) => NodeSqliteDatabase;
+              };
+              return new DatabaseSync(path);
+          })();
     let depth = 0;
-    const begin = () => db.exec(depth === 0 ? "BEGIN IMMEDIATE" : `SAVEPOINT sp${depth}`); // IMMEDIATE at top level: multi-process SQLITE_BUSY_SNAPSHOT guard (see openBetterSqlite3)
+    const begin = (readOnly: boolean) => db.exec(depth === 0 ? (readOnly ? "BEGIN DEFERRED" : "BEGIN IMMEDIATE") : `SAVEPOINT sp${depth}`);
     const commit = () => db.exec(depth === 1 ? "COMMIT" : `RELEASE sp${depth - 1}`);
     const rollback = () => db.exec(depth === 1 ? "ROLLBACK" : `ROLLBACK TO sp${depth - 1}`);
+    const transaction = <T>(fn: () => T, readOnly: boolean): T => {
+        if (db.getAutoCommit?.() === false && depth === 0) {
+            // Already inside an outer transaction driven directly by
+            // DatabaseSync — just run inline; the outer COMMIT covers us.
+            return fn();
+        }
+        begin(readOnly);
+        depth++;
+        try {
+            const out = fn();
+            commit();
+            return out;
+        } catch (err) {
+            // #4949: a failed BEGIN/COMMIT can leave NO transaction active
+            // (SQLite auto-aborts on I/O-class failures such as disk full);
+            // the follow-up ROLLBACK then throws "cannot rollback - no
+            // transaction is active" and would MASK the original failure.
+            // The original error below is always authoritative.
+            try {
+                rollback();
+            } catch {
+                /* secondary rollback failure — original error wins (#4949) */
+            }
+            throw err;
+        } finally {
+            depth--;
+        }
+    };
     return {
         exec: (sql) => void db.exec(sql),
         prepare: (sql) => adaptNodeSqliteStatement(db.prepare(sql)),
-        transaction: <T>(fn: () => T): T => {
-            if (db.getAutoCommit?.() === false && depth === 0) {
-                // Already inside an outer transaction driven directly by
-                // DatabaseSync — just run inline; the outer COMMIT covers us.
-                return fn();
-            }
-            begin();
-            depth++;
-            try {
-                const out = fn();
-                commit();
-                return out;
-            } catch (err) {
-                rollback();
-                throw err;
-            } finally {
-                depth--;
-            }
-        },
+        transaction: (fn) => transaction(fn, false),
+        readTransaction: (fn) => transaction(fn, true),
         close: () => void db.close(),
         get open() {
             return db.open;
@@ -141,7 +188,7 @@ interface NodeSqliteStatement {
     get(...args: unknown[]): unknown;
     all(...args: unknown[]): unknown[];
 }
-interface NodeSqliteDatabase {
+export interface NodeSqliteDatabase {
     exec(sql: string): unknown;
     prepare(sql: string): NodeSqliteStatement;
     getAutoCommit(): boolean;
@@ -217,6 +264,14 @@ export function clearSelfDownloadedEngineForTests(): void {
 }
 
 let cachedEngine: ResolvedEngine | null = null;
+
+/** #5108: the last successfully resolved engine (null until resolution
+ * succeeds). Diagnostics surfaces use it to say WHICH engine resolved when a
+ * store open later failed with a real error — reporting "engine: none" for a
+ * corrupt-index failure misdirected triage toward an engine problem. */
+export function resolvedSqliteEngineInfo(): ResolvedEngine | null {
+    return cachedEngine;
+}
 
 function detectEngine(): ResolvedEngine {
     if (cachedEngine) return cachedEngine;

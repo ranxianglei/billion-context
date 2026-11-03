@@ -52,6 +52,7 @@ import { homedir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { logHostEvent } from "./host-log.js";
+import * as pfChannel from "./pf-channel.js";
 import { DSH_BUILD_CHECK, emitNewerClientBuildNote, walkUpNodeModuleVersion } from "./client-build-note.js";
 import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST, requestInstanceShutdown } from "../launcher.js";
 import { isVersionNewer } from "../update.js";
@@ -886,14 +887,27 @@ async function spawnFallback(attachOrigin: string, note: string, gen: number): P
 const PINNED_ROTATION_WAIT_MS = 12_000;
 const PINNED_ROTATION_POLL_MS = 500;
 
+let pinnedRotationWaitMs = PINNED_ROTATION_WAIT_MS;
+/** #5167 test seam: shrink the rotation deadline so negative cases (a
+ *  resident that never releases the port) run in milliseconds instead of 12s. */
+export function _setPinnedRotationWaitForTest(ms: number): void {
+    pinnedRotationWaitMs = ms;
+}
+
 /** Pinned-attach twin of the launcher's discovery-path rotation (#3544): ask
  *  the strictly-older resident to drain+exit, then wait for the port. True
- *  only when the target actually stopped answering health polls. */
+ *  only when the target stopped accepting FRESH connections (its listener
+ *  closed — the port-release signal), NOT when it stopped answering pooled
+ *  keep-alive sockets: post-#3890 a draining resident keeps serving pooled
+ *  sockets for up to (1+10)×10s while its listener is already gone (#5167). */
 export async function rotatePinnedStaleProxy(origin: string): Promise<boolean> {
     if (!(await requestInstanceShutdown(origin))) return false;
-    const deadline = Date.now() + PINNED_ROTATION_WAIT_MS;
+    const deadline = Date.now() + pinnedRotationWaitMs;
     for (;;) {
-        const v = await fetchProxyVersion(origin).catch(() => undefined);
+        // #5167: Connection: close → undici never reuses a pooled socket for
+        // this poll, so "answers" means "the listener still accepts" — exactly
+        // what must be false before the caller may spawn onto the freed port.
+        const v = await fetchProxyVersion(origin, { headers: { connection: "close" } }).catch(() => undefined);
         if (v === undefined) return true;
         if (Date.now() >= deadline) return false;
         await new Promise<void>((resolve) => setTimeout(resolve, PINNED_ROTATION_POLL_MS));
@@ -1183,6 +1197,24 @@ function hostMsgIdsOf(messages: unknown): string[] | undefined {
         ids.push(id);
     }
     return ids;
+}
+
+/** #5418 v3 watermark-capture variant of hostMsgIdsOf: per-slot instead of
+ *  all-or-nothing. Hosts compress/rewrite histories, so one id-less element
+ *  (native-compaction summary, persona sidecar) must NOT poison its
+ *  neighbours' ids — unknown slots ride the "?" placeholder and stay in
+ *  position (order is the binding carrier, #11). */
+function pfSlotIdsOf(messages: unknown): string[] | undefined {
+    if (!Array.isArray(messages) || messages.length === 0) return undefined;
+    const out: string[] = [];
+    for (const m of messages) {
+        let id: unknown = m === null || typeof m !== "object" ? undefined : (m as { id?: unknown }).id;
+        if (typeof id !== "string" || id.length === 0 || id.length > 512 || id.startsWith("acp_summary_") || /[\s\p{C}]/u.test(id)) {
+            id = undefined;
+        }
+        out.push(typeof id === "string" ? id : pfChannel.PF_SLOT_UNKNOWN);
+    }
+    return out;
 }
 
 /** Re-enter the dispatch scope on every iterator advance: generator bodies
@@ -1911,6 +1943,13 @@ export function apply(ctx: PluginContext): void {
                 // — undefined (all-or-nothing) when any message lacks a usable
                 // id, so sidecar shapes degrade to id-less turns.
                 const scope: LlmDispatchScope = { sid, msgIds: hostMsgIdsOf(options?.messages) };
+                // #5403/#5418 v3: feed the per-slot id sequence into the
+                // watermark channel (the fetch chokepoint emits count +
+                // tail-ids; core = pf-channel.ts) — "?" slots ride id-less
+                // elements without poisoning the rest. A failed resolution
+                // (no usable message list at all) CLEARS like every other
+                // adapter — never ride a stale one.
+                pfChannel.pfCaptureIds(sid, pfSlotIdsOf(options?.messages));
                 // next() may start the adapter's fetch eagerly (inside this
                 // call), and lazy continuations resume on each advance — the
                 // run() below covers the former, wrapScopedIterable the latter.

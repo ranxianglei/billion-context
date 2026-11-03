@@ -503,7 +503,11 @@ function parseLineEntry(
     afterRefs = single.index + single[0].length;
   }
   if (summary.length === 0)
-    return { reason: "line entry: missing summary after the refs header line" };
+    // #4521: name the two most common shapes behind this parse error — a
+    // stray note line about an already-folded range, and a block rewrite
+    // written as refs — so the model fixes the entry instead of resending it
+    // verbatim (each resend was a full failed round-trip).
+    return { reason: "line entry: missing summary after the refs header line (every entry needs refs THEN its summary text on the same or the next line; a note about an already-folded range does not belong in the batch — drop it; to rewrite an existing block use a bN..bM block-id header entry)" };
   const explicitTopic = head.slice(afterRefs).trim();
   const range: CompressRangeSpec = {
     startRef,

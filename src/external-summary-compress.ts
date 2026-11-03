@@ -1,5 +1,6 @@
 import { collectBlockContent } from "acp-kernel";
 import { buildCompressSystemPrompt, parseCompressInput, type ParsedRange } from "./compress-tool.js";
+import { messageTimestampSections } from "./external-summary-surface.js";
 import { configuredSummaryPlan } from "./external-summary-runtime.js";
 import type { ResolvedKernelConfig } from "./compress-settings.js";
 import { applyRanges, noVisibleContextRefusal, normalizeRangeOrder, recoverEvictedView, type RewriteCtx } from "./stream.js";
@@ -91,7 +92,7 @@ export async function applyConfiguredCompression(input: unknown, ctx: RewriteCtx
         // without it the compress path asked for output it could never accept.
         const maxSummaryChars = Math.min(range.summaryMaxChars ?? Infinity, ctx.config.compress.maxSummaryLength);
         work.push({ content, reference, minSummaryChars: ctx.config.compress.minSummaryLength, maxSummaryChars,
-            instructions: `${ctx.session.meta.summaryInstructions ?? buildCompressSystemPrompt()}\nWrite a faithful summary of the selected range ${range.startRef}-${range.endRef}. Preserve task status, constraints, decisions, exact code identifiers, paths and errors, and unfinished objectives with their source message refs. Submitted summary hints are non-authoritative. Never summarize or change the read-only reference.`
+            instructions: `${ctx.session.meta.summaryInstructions ?? buildCompressSystemPrompt(undefined, messageTimestampSections(undefined))}\nWrite a faithful summary of the selected range ${range.startRef}-${range.endRef}. Preserve task status, constraints, decisions, exact code identifiers, paths and errors, and unfinished objectives with their source message refs. Submitted summary hints are non-authoritative. Never summarize or change the read-only reference.`
                 + summaryLengthBudgetClause(maxSummaryChars, ctx.config.compress.minSummaryLength) });
     }
     if (work.length === 0) return compressResult("[Compression FAILED: no selected range passed the existing kernel protection checks. Nothing compressed.]", "refused", 0);

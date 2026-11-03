@@ -47,7 +47,7 @@ async function harness(gateOn: boolean): Promise<Harness> {
     _resetPluginStateForTest();
     resetToolRingForTest();
     __resetIncrementalLaneForTests();
-    const store = new SessionStore({ dir: dir + "/sessions", enabled: true, debounceMs: 60000 });
+    const store = new SessionStore({ dir: dir + "/sessions", enabled: true, debounceMs: 15 });
     _setStoreForTest(store);
     _setForTest({});
     const forwarded: Record<string, unknown>[] = [];

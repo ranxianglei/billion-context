@@ -130,8 +130,19 @@ const CAP_SLACK = 4 * KiB;
  * message row, so ~192 rows of post-reset writes now overshoot by ~12 pages
  * (observed 1095952 vs 1048576). The truncate-at-checkpoint INVARIANT is
  * intact; budget the inter-reset accumulation instead of pinning one page.
+ *
+ * #4796/#5193 (schema v9): idx_content_refcount adds index-maintenance
+ * frames to every content insert, shifting WHERE the 1000-page autocheckpoint
+ * window lands inside this fixed ingest sequence — the post-reset tail grew
+ * from 34.2 KiB (pre-v9, 1083592) to 54.3 KiB locally / 66.4 KiB on CI
+ * (1116552; the SQLite build's page packing moves the crossing point by
+ * ~±12 KiB between runner images). Same drift class as #4506: the
+ * truncate-at-checkpoint invariant is intact (every reset lands exactly on
+ * the cap), so the budget widens to 128 KiB rather than pinning the tail.
+ * Still discriminating: if the configured cap failed to reach the pragma the
+ * file would sit at its ~4.4 MiB high-water mark, far above the bound.
  */
-const CUSTOM_CAP_SLACK = 64 * KiB;
+const CUSTOM_CAP_SLACK = 128 * KiB;
 
 test("#3250: close() converges the WAL so a clean exit leaves nothing to replay", () => {
     const dir = tmpdir("bili-3250-close-");

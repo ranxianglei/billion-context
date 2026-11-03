@@ -5,7 +5,11 @@ import { countMessageTokens } from "./tokenize.js";
 import { segmentGroups } from "./segment.js";
 import { isLiveCheckpointCarrier } from "./state.js";
 import { computeProtectedRefs } from "./recommend.js";
-import { collectCoverage, projectUnit } from "./unit-projection.js";
+import {
+  buildProjectionShared,
+  collectCoverage,
+  projectUnit,
+} from "./unit-projection.js";
 import type { UnitProjection } from "./unit-projection.js";
 import type {
   CompressionBlock,
@@ -431,6 +435,11 @@ function renderUncompressedRanges(
       config,
       countTokens,
     );
+    // #5337 option A: every displayed row runs projectUnit against this same
+    // (original, state, config) triple — share the per-pass O(n) derivations
+    // instead of re-scanning the whole history per row (status refresh on a
+    // long session).
+    const shared = buildProjectionShared(original, state, config);
     const splitDescOf = (p: UnitProjection): string => {
       const parts: string[] = [];
       if (p.splitTurnCount > 0) parts.push(`${p.splitTurnCount} turn(s)`);
@@ -449,6 +458,7 @@ function renderUncompressedRanges(
           endRef: r.endRef,
           preExistingCoverage: coverage,
           protectedMessageIds: protectedRefs,
+          shared,
         });
       } catch {
         return "\u26a0 not foldable: refs unresolvable";
