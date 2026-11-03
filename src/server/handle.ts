@@ -37,7 +37,7 @@ import { affinityToken, anthropicFirstUserFrag, claudeAnthropicPersonaOrderAppli
 import { personaConversationOrder } from "../session-resolve.js";
 import { prefixAffinity, describeResumeMiss, type AnonymousAffinity } from "../prefix-affinity.js";
 import { buildAnonymousProvenance, type AnonymousProvenance } from "../anon-provenance.js";
-import { maybeAdoptForkBlocks, maybeAdoptResume, maybeAdoptDerivedFork, seedTimestampsFromParent } from "../fork-adoption.js";
+import { maybeAdoptForkBlocks, maybeAdoptResume, maybeAdoptDerivedFork } from "../fork-adoption.js";
 import { executeThreadsReforge } from "./threads-lane.js";
 import { resetThreadTailTracking } from "./thread-tracking.js";
 import { resolveClaudeTranscriptLineage } from "../claude-transcript-lineage.js";
@@ -1723,25 +1723,40 @@ async function handleRequest(
                         ? prefixAffinity.diagnoseResumeMiss(affinityList, sessionId, derivedParent)
                         : prefixAffinity.diagnoseResumeMiss(affinityList, sessionId);
                     log(miss.best !== undefined ? "info" : "debug", `[${sessionId}] [resume-inheritance] miss: ${describeResumeMiss(miss)} (#4264)`);
-                    // #5608/#4313: a miss starts fresh state, so the stamp-timestamps
-                    // node would mint "now" for days-old history (or render
-                    // time-less tags where the old process rendered time-stamped
-                    // ones) — flipping every tagged byte and re-billing the whole
-                    // prefix for one generation. Seed the timestamp ledger from
-                    // the closest tracked chain: stamps are raw-id (content-hash)
-                    // keyed, so an inherited value always denotes the exact bytes
-                    // the model saw. Refs/blocks still stay fresh — only the
-                    // byte-stable ledger rides along.
+                    // #5608: a miss starts FRESH state, so the first replay renders
+                    // tags with new ref numbers, minted "now" times (or no times),
+                    // and RAW ranges where the old process sent FOLDED carriers —
+                    // every tagged byte flips vs the provider-cached prefix and
+                    // the whole history re-bills for one generation (the 1–12%
+                    // hit events). Adopt from the CLOSEST tracked chain instead of
+                    // starting bare: refs/blocks/latches/timestamps are all raw-id
+                    // (content-hash) keyed, so every carried value denotes the
+                    // exact bytes the model saw, and set-semantics adoption
+                    // self-defends against the deep divergence that broke the
+                    // byte-exact gate — a block whose sources were mutated is
+                    // simply straddled and left out. Honest ceiling: the true
+                    // common prefix; 100% needs a byte-faithful reload.
                     const best = miss.best?.sessionId;
                     if (best) {
                         try {
-                            const n = seedTimestampsFromParent(session, loadParent(best));
-                            if (n > 0) {
-                                markDirty(session);
-                                log("info", `[${sessionId}] [resume-inheritance] miss: seeded ${n} timestamp(s) from closest chain ${best} — shared prefix replays provider-cached tag bytes instead of minting "now" for days-old history (#5608)`);
+                            const bestParent = loadParent(best);
+                            if (bestParent && bestParent !== session) {
+                                maybeAdoptResume({
+                                    session,
+                                    parent: bestParent,
+                                    sharedDepth: 0,
+                                    protocol,
+                                    parsed,
+                                    upstreamOrigin,
+                                    blocksEnabled: true,
+                                    via: "weakly resumed closest chain after byte-exact miss (#5608)",
+                                    log,
+                                });
+                            } else {
+                                log("info", `[${sessionId}] [resume-inheritance] miss: closest chain ${best} is not loadable — starting fresh (#5608)`);
                             }
                         } catch (err) {
-                            log("warn", `[${sessionId}] [resume-inheritance] miss: timestamp seeding from ${best} failed (${String(err)}); continuing fresh (#5608)`);
+                            log("warn", `[${sessionId}] [resume-inheritance] miss: weak adoption from closest chain ${best} failed (${String(err)}); continuing fresh (#5608)`);
                         }
                     }
                 }

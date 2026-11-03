@@ -6,7 +6,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BLOCKED_REF, defaultConfig } from "acp-kernel";
-import { planForkAdoption, applyForkAdoption, seedTimestampsFromParent } from "../src/fork-adoption.ts";
+import { planForkAdoption, applyForkAdoption, seedTimestampsFromParent, maybeAdoptResume, incomingCoreMessages } from "../src/fork-adoption.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _resetSessionsForTest, getSession, type Session } from "../src/session.ts";
 import { startServer } from "../src/server.ts";
@@ -20,16 +20,21 @@ import { closeServers } from "./server-close-guard.ts";
 process.env.NODE_ENV = "test";
 
 /**
- * #5608/#4313 regression pins for the timestamp-ledger carry. A stamp is keyed
- * by raw id (SHA-256 of message identity) and renders into the ACP tag's
- * time= attribute — cache-relevant bytes. Two paths used to drop them:
+ * #5608/#4313 regression pins for the resume-inheritance ledger carry. A stamp
+ * is keyed by raw id (SHA-256 of message identity) and renders into the ACP
+ * tag's time= attribute — cache-relevant bytes. Three paths used to drop the
+ * byte-stable state:
  *  1. resume/fork ADOPTION seeded refs/blocks/latches but never tsStamps, so
  *     the first replay rendered time-less tags where the original process
  *     rendered time-stamped ones (byte flip at every tagged message);
- *  2. a resume-inheritance MISS starts fresh state, so the stamp node minted
- *     "now" for days-old history (the 1–12% one-generation cache collapse in
- *     #5608, shapes B/C).
- * Both now ride seedTimestampsFromParent.
+ *  2. a resume-inheritance MISS started FRESH state — new ref numbers, minted
+ *     "now" times, RAW ranges where the old process sent FOLDED carriers —
+ *     flipping every tagged byte and re-billing the whole prefix for one
+ *     generation (the 1–12% one-generation cache collapse in #5608);
+ *  3. the weak miss path must log its relationship honestly, or a future
+ *     triage reads a byte-exact-MISS adoption as a clean resume.
+ * 1+2 ride seedTimestampsFromParent + set-semantics adoption; 3 pins the
+ * maybeAdoptResume `via` phrasing (strong-path output stays byte-identical).
  */
 
 type MinimalSession = { state: { tsStamps?: Record<string, number> } };
@@ -195,10 +200,106 @@ test("resume-inheritance MISS seeds the timestamp ledger from the closest tracke
         assert.equal(r2.status, 200, await r2.text());
         const fresh = getSession("new");
         assert.deepEqual(fresh.state.tsStamps, oldStamps, "the miss seeded the ledger from the closest chain instead of letting the stamp node mint now-times for days-old history");
-        assert.ok(logs.some((l) => l.includes("[resume-inheritance] miss: seeded") && l.includes("from closest chain old")), "seeding is logged, not silent");
+        // #5608 v2: the miss path no longer seeds timestamps alone — it runs full
+        // weak adoption from the closest chain, so the proof line is the adoption
+        // log naming the weak relationship (same intent: seeding is logged, not silent).
+        assert.ok(logs.some((l) => l.includes("weakly resumed closest chain after byte-exact miss") && l.includes("old")), "weak adoption is logged, not silent");
     } finally {
         setLogCapture(null);
         store2.closeQuietly();
         await closeServers([proxy2, upstream], "miss-seed phase 2");
     }
+});
+
+/** Weak-path fixtures: a parent whose refs/stamps/block all match what an
+ *  incoming (re)send of the same conversation carries — computed through the
+ *  SAME incomingCoreMessages pipeline the server hook uses, so the ids agree. */
+function weakFixtures() {
+    const parsed = {
+        model: "m",
+        max_tokens: 1,
+        messages: [
+            { role: "user", content: "hello world 5608" },
+            { role: "assistant", content: "hi there 5608" },
+        ],
+    };
+    const msgs = incomingCoreMessages("anthropic", parsed)!;
+    const byRaw: Record<string, string> = {};
+    const byRef: Record<string, string> = {};
+    const tsStamps: Record<string, number> = {};
+    msgs.forEach((m, i) => {
+        const ref = `m${String(i + 1).padStart(5, "0")}`;
+        byRaw[m.id] = ref;
+        byRef[ref] = m.id;
+        tsStamps[m.id] = 1730000000 + i;
+    });
+    const blocks = [
+        { blockId: "b1", active: true, effectiveMessageIds: [msgs[0].id], directBlockIds: [], compressedTokens: 42 },
+    ];
+    const meta = { protocol: "anthropic", upstreamOrigin: "test" };
+    const parent = {
+        id: "parent-weak",
+        meta,
+        blockContents: new Map(),
+        state: { blocks, tokenSnapshot: {}, nextBlockId: 2, nextRunId: 1, messageRefs: { byRaw, byRef }, tsStamps },
+    } as unknown as Session;
+    const child = {
+        id: "child-weak",
+        meta,
+        state: {
+            blocks: [] as unknown[],
+            tokenSnapshot: {} as Record<string, number>,
+            nextBlockId: 1,
+            nextRunId: 1,
+            messageRefs: { byRaw: {} as Record<string, string>, byRef: {} as Record<string, string> },
+        },
+        blockContents: new Map(),
+    } as unknown as Session;
+    return { parsed, msgs, parent, child };
+}
+
+test("maybeAdoptResume weak path (via): seeds refs+stamps+blocks and logs the WEAK relationship (#5608)", () => {
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    const { parsed, msgs, parent, child } = weakFixtures();
+    const lines: string[] = [];
+    const outcome = maybeAdoptResume({
+        session: child,
+        parent,
+        sharedDepth: 0,
+        protocol: "anthropic",
+        parsed,
+        upstreamOrigin: "test",
+        blocksEnabled: true,
+        via: "weakly resumed closest chain after byte-exact miss (#5608)",
+        log: (_level, msg) => { lines.push(msg); },
+    });
+    assert.equal(outcome.seededRefs, msgs.length, "every present message keeps its PARENT ref — tag bytes stay provider-cached");
+    assert.equal(outcome.adoptedActive, 1, "the fully-present block is adopted — the child re-renders the folded carrier, not raw range");
+    assert.equal(child.state.messageRefs.byRaw[msgs[0].id], "m00001");
+    assert.deepEqual((child.state as MinimalSession["state"]).tsStamps, Object.fromEntries(msgs.map((m) => [m.id, 1730000000 + msgs.indexOf(m)])));
+    assert.equal(child.state.blocks.length, 1);
+    const adoptLine = lines.find((l) => l.includes("inherited"));
+    assert.ok(adoptLine?.includes("weakly resumed closest chain after byte-exact miss"), "log names the weak relationship for future triage");
+    assert.ok(!lines.some((l) => l.includes("shared msgs")), "strong-resume phrasing must not leak into the weak path");
+});
+
+test("maybeAdoptResume strong path (no via): success-line phrasing unchanged (#1486 regression guard)", () => {
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    const { parsed, parent, child } = weakFixtures();
+    const lines: string[] = [];
+    maybeAdoptResume({
+        session: child,
+        parent,
+        sharedDepth: 2,
+        protocol: "anthropic",
+        parsed,
+        upstreamOrigin: "test",
+        blocksEnabled: true,
+        log: (_level, msg) => { lines.push(msg); },
+    });
+    const adoptLine = lines.find((l) => l.includes("inherited"));
+    assert.ok(
+        adoptLine?.startsWith("[resume-inheritance] child-weak resumed parent-weak (2 shared msgs): inherited"),
+        `strong-path line must stay byte-identical to pre-#5608 wording, got: ${adoptLine}`,
+    );
 });

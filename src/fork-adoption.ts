@@ -457,24 +457,30 @@ export function maybeAdoptResume(args: {
     upstreamOrigin: string;
     blocksEnabled: boolean;
     log: (level: string, msg: string) => void;
+    /** #5608: relationship phrasing for the log lines. Absent = the strong
+     *  byte-exact path (output unchanged); the weak closest-chain path passes
+     *  its own so a future reader of the log cannot mistake a byte-exact-MISS
+     *  adoption for a clean resume. */
+    via?: string;
 }): AdoptionOutcome {
     const { session, parent, sharedDepth, protocol, parsed, upstreamOrigin, blocksEnabled, log } = args;
+    const rel = args.via ? `${args.via} ${parent.id}` : `resumed ${parent.id} (${sharedDepth} shared msgs)`;
     const incomingMsgs = incomingCoreMessages(protocol, parsed);
     if (!incomingMsgs) {
-        log("info", `[resume-inheritance] ${session.id}: resumed ${parent.id} (${sharedDepth} shared msgs) but ${protocol} has no adoption support in v1; lineage recorded, refs/blocks not inherited (#1486)`);
+        log("info", `[resume-inheritance] ${session.id}: ${rel} but ${protocol} has no adoption support in v1; lineage recorded, refs/blocks not inherited (#1486)`);
         return { adoptedActive: 0, seededRefs: 0 };
     }
     const ids = new Set(incomingMsgs.map((m) => m.id));
     const plan = planForkAdoption(parent, ids, { seedAllRefs: true, includeBlocks: blocksEnabled });
     const seededRefs = Object.keys(plan.refs.byRaw).length;
     if (seededRefs === 0 && plan.adoptedActive === 0) {
-        log("info", `[resume-inheritance] ${session.id}: resume of ${parent.id} had nothing to inherit (no overlapping refs${blocksEnabled ? " or fully-present blocks" : ""}); starting fresh (#1486)`);
+        log("info", `[resume-inheritance] ${session.id}: ${args.via ? `${args.via} ` : ""}resume of ${parent.id} had nothing to inherit (no overlapping refs${blocksEnabled ? " or fully-present blocks" : ""}); starting fresh (#1486)`);
         return { adoptedActive: 0, seededRefs: 0 };
     }
     applyForkAdoption(session, plan, parent);
     log(
         "info",
-        `[resume-inheritance] ${session.id} resumed ${parent.id}: inherited ${seededRefs} ref(s) up to ${plan.maxRef || "n/a"}${plan.adoptedActive > 0 ? `, ${plan.adoptedActive} block(s) (~${plan.adoptedTokens} tokens)` : ""}; stale citations now resolve to their original messages (#1486)`,
+        `[resume-inheritance] ${session.id} ${rel}: inherited ${seededRefs} ref(s) up to ${plan.maxRef || "n/a"}${plan.adoptedActive > 0 ? `, ${plan.adoptedActive} block(s) (~${plan.adoptedTokens} tokens)` : ""}; stale citations now resolve to their original messages (#1486)`,
     );
     const wanted = new Set([...Object.keys(plan.refs.byRef), ...citedPlaceholderRefs(incomingMsgs)]);
     const storeSlice = cloneStoreForRefs(contentStoreOf(parent), wanted);
