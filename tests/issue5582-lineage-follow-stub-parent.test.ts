@@ -47,7 +47,7 @@ const { defaultConfig } = await import("acp-kernel");
 const { startServer } = await import("../src/server.ts");
 const { SessionStore, _setStoreForTest } = await import("../src/persist.ts");
 const { _setForTest: setRegistryForTest } = await import("../src/registry.ts");
-const { resetToolRingForTest } = await import("../src/tool-ring.ts");
+const { recordToolWitness, resetToolRingForTest } = await import("../src/tool-ring.ts");
 const { _resetPluginStateForTest } = await import("../src/plugin.ts");
 const { forwardTool } = await import("../src/agent/shared.ts");
 const { resetSessionOrderForTest, resolveSessionOrder } = await import("../src/session-resolve.ts");
@@ -72,8 +72,10 @@ const SYSTEM_Z = "You are DeepSeek Harness, the main coding agent.\nModel: GLM-Z
 const forkKey = (conv: string, system: string): string =>
     `${conv}|sub:${createHash("sha256").update(system, "utf8").digest("hex").slice(0, 16)}`;
 /** Content-length string (≥32 chars post-normalization) so the normalized
- *  projection keeps the leaf, like real dsh turns. */
-const long = (s: string): string => `${s}-` + "z".repeat(120);
+ *  projection keeps the leaf, like real dsh turns; at this size a 64-message
+ *  lane sits past the kernel's 5K-token protected zone, so a mid-history
+ *  compress range actually folds instead of no-op'ing on the recent tail. */
+const long = (s: string): string => `${s}-` + "z".repeat(800);
 const msgs = (n: number, tag: string): { role: string; content: string }[] =>
     Array.from({ length: n }, (_, i) => ({ role: i % 2 === 0 ? "user" : "assistant", content: long(`${tag}-${i + 1}`) }));
 
@@ -206,6 +208,36 @@ test("#5582 stub-parent rescue: acp_status/acp_cache follow the deep descendant;
         // allocated ref is mNNNNN — target older ranges only"), so match the fatal shape only.
         assert.ok(!comp.text.includes("is above this session"), "no ghost 'above highest allocated ref' error");
         assert.ok(!comp.text.includes("Total compressible content too small"), "no ghost 'too small' error");
+        assert.equal(peekSession(forkB)!.state.blocks.length, 1, "the fold landed in the owning lane (one block minted there)");
+    } finally {
+        await stopRig(rig);
+    }
+});
+
+test("#5582 witness-conflict rescue: a stale lineage witness doesn't block routing to the ref holder", async () => {
+    const rig = await startRig();
+    const CONV = "dshc-witness-conflict";
+    try {
+        const { forkB } = await buildStubParentPathology(rig, CONV);
+        // A second deep lane under the same base id: every session mints its
+        // OWN ref space from m00001, so its byRef also holds m00005/m00060 —
+        // sharp-tier overlap. The outbound witness names THIS lane, but it is
+        // idle past the lineage freshness window, so the #2601 lineage follow
+        // refuses it and only the #5582 evidence rescue can route the call.
+        const FORK_C = forkKey(CONV, SYSTEM_C);
+        await dshTurn(rig, CONV, SYSTEM_C, msgs(64, "witness"));
+        const forkC = peekSession(FORK_C);
+        assert.ok(forkC, "the second persona forked onto its own |sub:");
+        forkC!.lastSeen = Date.now() - 11 * 60 * 1000; // stale for personaLineageWitness
+        const compArgs = { startId: "m00005", endId: "m00060", summary: "Wrap-up of the early turns: setup, environment notes and the first exploration steps." };
+        recordToolWitness(FORK_C, "compress", compArgs);
+        const comp = await forwardTool(rig.baseUrl, CONV, "compress", compArgs, undefined, true);
+        assert.equal(comp.failed, false, `compress must route despite the conflicting stale witness, got: ${comp.text.slice(0, 300)}`);
+        // The witness bonus outranks freshness inside the sharp tier: the
+        // exact call was minted in the witnessed lane, so it executes THERE
+        // even though the fresh owner lane also holds every cited ref.
+        assert.equal(peekSession(FORK_C)!.state.blocks.length, 1, "the fold executed in the witnessed lane");
+        assert.equal(peekSession(forkB)!.state.blocks.length, 0, "the fresh owner lane was not followed instead");
     } finally {
         await stopRig(rig);
     }
