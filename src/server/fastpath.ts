@@ -35,6 +35,7 @@ import type { CoreMessage } from "acp-kernel";
 import type { OpenAIRequestBody } from "acp-kernel/wire";
 import { openaiToCore } from "acp-kernel/wire";
 import type http from "node:http";
+import { createHash } from "node:crypto";
 import { featureEnabled } from "../rollout.js";
 import { getStore } from "../persist.js";
 import type { Session } from "../session.js";
@@ -46,6 +47,23 @@ import { scanMessagesSpans, type RawSpan } from "./fastpath-scan.js";
 export const PF_COUNT_HEADER = "x-bili-pf-count";
 export const PF_SEQ_HEADER = "x-bili-pf-seq";
 export const PF_TAIL_IDS_HEADER = "x-bili-pf-tail-ids";
+
+// #5571 v5 (owner ruling 2026-11-03): identity-only verification takes the
+// client's NATIVE session id as an identity input alongside host msgids.
+// Canonical table lives in #5571's native-identity-profiles; these three
+// spellings are byte-duplicated here (#3482 precedent) so this module stays
+// dependency-free of the observation layer.
+const CLIENT_SESS_HEADERS = ["x-conversation-id", "x-claude-code-session-id", "x-session-affinity"] as const;
+
+/** h8 digest of whichever known client session header carries a value
+ *  (first hit wins); undefined when none does — absence claims nothing. */
+function clientSessDigest(req: http.IncomingMessage): string | undefined {
+    for (const h of CLIENT_SESS_HEADERS) {
+        const v = req.headers[h];
+        if (typeof v === "string" && v.length > 0) return createHash("sha1").update(v).digest("hex").slice(0, 8);
+    }
+    return undefined;
+}
 // #5418 v3: UNIDENTIFIED slot marker — an element that carries no host id
 // (native-compaction summary, persona sidecar, foreign shape) travels as "?".
 // Wire literal duplicated per #3482 (agent bundles stay import-free leaves).
@@ -63,6 +81,9 @@ interface PFSavedState {
     /** Last received tail-id list (#5418 v2) — survives restarts so the
      *  prevId continuity check is live on the first turn back. */
     l?: string[];
+    /** #5571 v5: client-native session id digest recorded with this state
+     *  (h8, never raw — privacy parity with #5571); sess-change gate input. */
+    cs?: string;
 }
 
 interface PFSeed {
@@ -123,6 +144,10 @@ export interface FastpathOutcome {
      *  into the (re)seeded state either way so continuity holds across both.
      *  Absent (undefined) for count-only turns or shape-invalid lists. */
     readonly receivedTailIds?: string[];
+    /** #5571 v5: client-native session id digest of THIS request
+     *  (undefined when no known header carried a value). Persisted by
+     *  finalize as state `cs`; feeds the sess-change identity gate. */
+    readonly clientSess?: string;
 }
 
 /** #5418 v2: decode the shim's x-bili-pf-tail-ids value.
@@ -173,6 +198,7 @@ function readSaved(sessionId: string): PFSavedState | null {
             l: Array.isArray(o.l) && o.l.length > 0 && o.l.length <= 2048
                 && (o.l as unknown[]).every((x): x is string => typeof x === "string" && x.length > 0 && x.length <= 512)
                 ? (o.l as string[]) : undefined,
+            cs: typeof o.cs === "string" && o.cs.length === 8 ? o.cs : undefined,
         };
     } catch {
         return null;
@@ -232,10 +258,13 @@ export function evaluateWatermarkFastpath(
     const T = scan.total;
     const rawStamp = req.headers[PF_COUNT_HEADER];
     const stamped = typeof rawStamp === "string" && /^\d+$/.test(rawStamp.trim()) ? parseInt(rawStamp.trim(), 10) : NaN;
+    // #5571 v5: captured ONCE per evaluated turn — feeds the sess-change gate
+    // below and rides the outcome so finalize persists it as state `cs`.
+    const nowCs = clientSessDigest(req);
     const miss = (decision: string, credited: boolean, receivedTailIds?: string[]): FastpathOutcome => {
         if (credited) noteCreditedMiss(session.id, decision, log);
         log("info", `[${session.id}] watermark fastpath miss (${decision}) — legacy full-parse this turn`);
-        return { hit: null, measuredT: T, decision, creditedMiss: credited, receivedTailIds };
+        return { hit: null, measuredT: T, decision, creditedMiss: credited, receivedTailIds, clientSess: nowCs };
     };
     const seed = seeds.get(session);
     const rawTailIds = req.headers[PF_TAIL_IDS_HEADER];
@@ -289,6 +318,17 @@ export function evaluateWatermarkFastpath(
                 if (prevKnown !== undefined && prevKnown !== PF_SLOT_UNKNOWN && tailIds[0] !== prevKnown) return miss("tail-ids-prev", false);
             }
         }
+        // #5571 v5 (owner ruling 2026-11-03): session continuity joins the
+        // identity proof. State carrying a client-native session id digest
+        // means an earlier turn claimed an identity; this request must keep
+        // claiming the SAME one — a swapped conversation riding one bili
+        // session is an identity event, not a byte question. Neutral when
+        // either side claims nothing (header-less clients unchanged);
+        // asserted only when both sides do. Id mode only (no valid list
+        // reached here without one).
+        if (tailIds !== undefined && saved?.cs !== undefined) {
+            if (nowCs !== undefined && nowCs !== saved.cs) return miss("sess-change", false, tailIds);
+        }
         if (seed.multimodal) return miss("seeded-multimodal", false, tailIds);
         const headEnd = Math.min(HEAD_CHECK_ELEMENTS, T);
         const headFragment: { messages: unknown } = { messages: [] };
@@ -300,23 +340,35 @@ export function evaluateWatermarkFastpath(
         const windowCounts = stripRawStage(windowFragment, "openai");
         const headCores = openaiToCore(headFragment as OpenAIRequestBody);
         if (headCores.systemText !== seed.systemText) return miss("head-drift", true, tailIds);
-        // In-place head EDIT detection. The system-text check alone would miss
-        // an in-place rewrite of any non-system head element (dsh message-edit
-        // flows): counts stay equal, the stamp stays honest, and the stale
-        // seed byte would ride the outbound again — the costliest divergence
-        // class. Compare every stashed prefix core against its freshly parsed
-        // counterpart: openaiToCore is deterministic per element bytes, so
-        // structural inequality (cluster id / role / content) marks a rewrite.
-        // Uncredited: a genuine client edit is not a lying stamp, so the
-        // breaker must not arm on it; finalizeWatermarkTurn reseeds from the
-        // legacy full parse of THIS turn, so the very next turn hits against
-        // the new baseline (self-healing). Shape mismatch covers small
-        // histories where the head fragment reaches past seed coverage —
-        // those turns legitimately go legacy.
-        // Compare ONLY the part of the head still under seed coverage: on small
-        // histories the 8-element head fragment legitimately reaches INTO the
-        // fresh tail region, whose content differs from nothing stashed yet —
-        // positions >= coverage are verified by the window conversion itself.
+        // In-place head EDIT detection (pre-v5 history): the system-text
+        // check alone misses an in-place rewrite of any non-system head
+        // element (dsh message-edit flows) — counts stay equal, stamp stays
+        // honest, stale seed byte rides outbound again. Pre-v5 that
+        // comparison GATED: openaiToCore is deterministic per element bytes,
+        // structural inequality marked a rewrite, uncredited self-healing
+        // legacy turn (a genuine client edit is not a lying stamp).
+        // v5 (owner ruling 2026-11-03, identity-only verification): with a
+        // shape-valid HOST msgid list the identity chain IS the proof —
+        // width arithmetic re-derives the count SERVER-side (never from a
+        // client echo), the prevId chain pins the window origin, sess-change
+        // rules out conversation swaps, model equality rules out cross-model
+        // reuse. Bili INTERNAL core ids are content-derived
+        // (deriveCanonicalMessageId(role,text)) — they carry no identity
+        // beyond the byte check itself. So under id mode BOTH the id-
+        // equality and byte-equality loops demote to a diagnostic warn: host
+        // rewrites ride the stashed prefix cores; the warn stream feeds M3
+        // smart re-seeding should the rides ever prove harmful. Pure-COUNT
+        // clients have no ids at all — their byte check remains the sole
+        // truth and behaves exactly as pre-v5. System text has no msgid
+        // (flagged deviation in the ruling thread): head-drift above STAYS
+        // gating in both modes — serving a stale prompt beats saving one
+        // parse. Compare ONLY the part of the head still under seed coverage:
+        // on small histories the 8-element head fragment legitimately reaches
+        // INTO the fresh tail region, whose content differs from nothing
+        // stashed yet — positions >= coverage are verified by the window
+        // conversion itself.
+        let contentDrifts = 0;
+        let driftTotal = 0;
         const headElements = Array.isArray((headFragment as { messages?: unknown }).messages)
             ? ((headFragment as { messages: unknown[] }).messages.filter((m): m is { role?: unknown } => typeof m === "object" && m !== null && (m as { role?: unknown }).role !== "system")).length
             : -1;
@@ -324,12 +376,17 @@ export function evaluateWatermarkFastpath(
             const compareUpTo = Math.min(headElements, headCores.msgs.length, seed.cores.length);
             const seedHead = seed.cores.slice(0, compareUpTo);
             if (headCores.msgs.length < seedHead.length) return miss("head-shape", false, tailIds);
+            driftTotal = seedHead.length;
             for (let hi = 0; hi < seedHead.length; hi++) {
                 const a = headCores.msgs[hi];
                 const b = seedHead[hi];
-                if (a.id !== b.id || JSON.stringify(a) !== JSON.stringify(b)) return miss("head-prefix-drift", false, tailIds);
+                if (a.id !== b.id || JSON.stringify(a) !== JSON.stringify(b)) {
+                    if (tailIds === undefined) return miss("head-prefix-drift", false, tailIds);
+                    contentDrifts += 1;
+                }
             }
         }
+        if (contentDrifts > 0) log("warn", `[${session.id}] watermark v5: ${contentDrifts}/${driftTotal} head element(s) differ from the seed under stable host ids — riding the stashed prefix per owner ruling 2026-11-03 (diagnostic only; feeds M3 re-seeding signals)`);
         const windowRaw = openaiToCore(windowFragment as OpenAIRequestBody);
         if (windowRaw.systemText.trim() !== "") return miss("window-system-head", true, tailIds);
         const rekeyedWindow = rekeyWindowCores(windowRaw.msgs, K, seed.cores);
@@ -352,6 +409,7 @@ export function evaluateWatermarkFastpath(
             decision: hitDecision,
             creditedMiss: false,
             receivedTailIds: tailIds,
+            clientSess: nowCs,
         };
     }
     return miss(seed === undefined ? "unseeded" : "seed-stale", false);
@@ -439,14 +497,14 @@ function addStripCounts(a: RawStripCounts, b: RawStripCounts): RawStripCounts {
 }
 
 function noteCreditedMiss(sessionId: string, decision: string, log: (level: string, msg: string) => void): void {
-    const cur = readSaved(sessionId) ?? { t: 0, m: "", misses: 0 };
+    const cur = readSaved(sessionId) ?? ({ t: 0, m: "", misses: 0 } as PFSavedState);
     // an EXPIRED hold has already paid its penalty — count fresh from zero,
     // or the very first verified miss after the TTL would instantly re-arm
     // (the persisted counter sits at PF_BREAKER_MISSES from the original trip).
     const staleHold = cur.disabledAt !== undefined && Date.now() - cur.disabledAt >= PF_DISABLED_TTL_MS;
     const misses = (staleHold ? 0 : cur.misses) + 1;
     if (misses >= PF_BREAKER_MISSES) {
-        writeSaved(sessionId, { t: cur.t, m: cur.m, misses, disabledAt: Date.now() });
+        writeSaved(sessionId, { t: cur.t, m: cur.m, misses, disabledAt: Date.now(), cs: cur.cs });
         log("warn", `[${sessionId}] watermark fastpath disabled for ${Math.round(PF_DISABLED_TTL_MS / 60000)}m after ${misses} consecutive verified misses (last: ${decision}) — legacy full-parse continues`);
     } else {
         writeSaved(sessionId, { ...cur, misses, disabledAt: staleHold ? undefined : cur.disabledAt });
@@ -483,7 +541,7 @@ export function finalizeWatermarkTurn(
             lastTailIds: outcome.receivedTailIds,
             multimodal: outcome.hit.seedMultimodal,
         });
-        writeSaved(session.id, { t: T, m: input.model, misses: 0, l: outcome.receivedTailIds });
+        writeSaved(session.id, { t: T, m: input.model, misses: 0, l: outcome.receivedTailIds, cs: outcome.clientSess ?? saved?.cs });
         headers[PF_SEQ_HEADER] = String(T);
         return headers;
     }
@@ -500,7 +558,7 @@ export function finalizeWatermarkTurn(
     }
     // Held (breaker-armed) turns flow through here too and DO restamp: the
     // stamp is how a client converges on truth while the lane stays hit-less.
-    writeSaved(session.id, { t: T, m: input.model, misses: saved?.misses ?? 0, disabledAt: saved?.disabledAt, l: outcome.receivedTailIds });
+    writeSaved(session.id, { t: T, m: input.model, misses: saved?.misses ?? 0, disabledAt: saved?.disabledAt, l: outcome.receivedTailIds, cs: outcome.clientSess ?? saved?.cs });
     headers[PF_SEQ_HEADER] = String(T);
     return headers;
 }
