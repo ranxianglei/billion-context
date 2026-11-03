@@ -77,6 +77,7 @@ Usage:
   bili mcode [opts --] [args]      start a proxy + launch MiniMax Code against it (cert-MITM)
   bili aider [opts --] [args]      start a proxy + launch aider against it (cert-MITM)
   bili copilot [opts --] [args]    start a proxy + launch Copilot CLI against it (cert-MITM)
+  bili kiro [opts --] [args]       start a proxy + launch Kiro CLI (kiro-cli) against it (cert-MITM)
   bili amp [opts --] [args]        start a proxy + launch Amp against it (cert-MITM)
   bili crush [opts --] [args]      start a proxy + launch Crush against it (cert-MITM)
   bili zed [opts --] [args]        start a proxy + launch the Zed editor against it (cert-MITM)
@@ -137,12 +138,12 @@ Usage:
   bili --version                   print version
   bili --help                      show this help
 
-Launcher (bili pi / bili codex / bili claude / bili omp / bili opencode / bili hermes / bili dsh / bili codebuddy / bili qoder / bili trae / bili jcode / bili kimi / bili gemini / bili iflow / bili qwen / bili antigravity / bili mcode / bili aider / bili copilot / bili amp / bili crush / bili zed / bili goose):
+Launcher (bili pi / bili codex / bili claude / bili omp / bili opencode / bili hermes / bili dsh / bili codebuddy / bili qoder / bili trae / bili jcode / bili kimi / bili gemini / bili iflow / bili qwen / bili antigravity / bili mcode / bili aider / bili copilot / bili amp / bili crush / bili zed / bili goose / bili kiro):
   Brings up a proxy on an independent port (a fresh instance every launch), then runs the client pointed at it via HTTPS_PROXY + the proxy's
   MITM CA — no config-file edits. Discovered HTTPS upstream domains are
   auto-whitelisted for MITM so the proxy TLS-terminates exactly the hosts the
   client uses; HTTP / localhost providers go direct. pi/claude/qoder trust the CA
-  via NODE_EXTRA_CA_CERTS, codex/trae/jcode/aider/copilot/amp/crush/zed via SSL_CERT_FILE
+  via NODE_EXTRA_CA_CERTS, codex/trae/jcode/aider/copilot/amp/crush/zed via SSL_CERT_FILE, kiro via both
   (aider also REQUESTS_CA_BUNDLE). Goose trusts neither (rustls), so it is redirected per-endpoint instead. Proxy killed on client exit.
   bili flags (-F, --mitm-domain, --port, ...) must precede the client name;
   everything after the client name is passed through to the client.
@@ -168,6 +169,7 @@ Launcher (bili pi / bili codex / bili claude / bili omp / bili opencode / bili h
     bili mcode                            # launch MiniMax Code through the proxy (cert-MITM; provider hosts from ~/.minimax*/config.yaml or the official agent.minimax.* endpoints)
     bili aider                            # launch aider through the proxy (cert-MITM; endpoint from OPENAI_API_BASE/--openai-api-base/.aider.conf.yml or api.openai.com+api.anthropic.com by default)
     bili copilot                          # launch Copilot CLI through the proxy (cert-MITM; api.githubcopilot.com + plan subdomains whitelisted by default)
+    bili kiro                             # launch Kiro CLI through the proxy (cert-MITM; runtime.<region>.kiro.dev model gateways whitelisted; developer/system roles re-voiced as user)
     bili amp                              # launch Amp through the proxy (cert-MITM; ampcode.com whitelisted by default)
     bili crush                            # launch Crush through the proxy (cert-MITM; api.anthropic.com/api.openai.com/openrouter.ai + crush.json base_urls whitelisted)
     bili zed                              # launch the Zed editor through the proxy (cert-MITM; built-in provider hosts + settings.json api_urls whitelisted; Linux TLS env)
@@ -446,12 +448,13 @@ export function parseArgs(argv: string[]): Parsed {
 
     // First positional (if any) is the command. "start" | "update" | "test"
     // are recognized; an unknown command is an error.
-    if (client) {
+    const informational = command === "help" || command === "version";
+    if (!informational && client) {
         command = "launch";
-    } else if (positional.length > 0) {
+    } else if (!informational && positional.length > 0) {
         const cmd = positional[0]!;
         if (cmd === "start") {
-            command = command === "help" || command === "version" ? command : "start";
+            command = "start";
         } else if (cmd === "update") {
             command = "update";
         } else if (cmd === "doctor") {

@@ -34,6 +34,7 @@ import { codexCompactGatePre, codexCompactMode, hasCompactionTrigger, isCodexHos
 import { emitPreflightError } from "../stream-error.js";
 import { agentProviderRecipes } from "../agent-providers.js";
 import { affinityToken, anthropicFirstUserFrag, claudeAnthropicPersonaOrderApplies, conversationHeaderSource, claudeSubagentAgentId, claudeSubagentSplit, claudeSubagentLaneTokenOf, clientConversationHeader, codexTurnIdentity, dshPersonaFingerprintApplies, instructionsFingerprintApplies, openaiSystemTextForPersona, preferPromptCacheKeyIdentity, zcodeMemoryConversation } from "../session-id.js";
+import { preferKiroConversationIdentity } from "../kiro.js";
 import { personaConversationOrder } from "../session-resolve.js";
 import { prefixAffinity, describeResumeMiss, type AnonymousAffinity } from "../prefix-affinity.js";
 import { buildAnonymousProvenance, type AnonymousProvenance } from "../anon-provenance.js";
@@ -928,9 +929,13 @@ async function handleRequest(
         const responsesIdentity = protocol === "responses"
             ? (codexTurn
                 ? { value: codexTurn.value, source: "header" as const, clientProvided: true }
-                : preferPromptCacheKeyIdentity(
-                      conversationIdentityResponses(parsed as ResponsesRequestBody, convHeader),
-                      parsed as ResponsesRequestBody,
+                : preferKiroConversationIdentity(
+                      preferPromptCacheKeyIdentity(
+                          conversationIdentityResponses(parsed as ResponsesRequestBody, convHeader),
+                          parsed as ResponsesRequestBody,
+                      ),
+                      parsed,
+                      req.headers,
                   ))
             : undefined;
         // OpenAI chat mirrors the responses pck promotion: clients that replay
