@@ -512,7 +512,7 @@ test("A: explicit websocket — intercepted, stamped, compress/decompress round 
     assert.ok(sentinelRef, "sentinel message carries an ACP ref tag");
     const minRef = userRefs.reduce((a, b) => (Number(a.slice(1)) < Number(b.slice(1)) ? a : b));
 
-    ok("fold", await piRun(ctx, `WS_FOLD_REQUEST_B64 ${b64({ content: [{ startId: minRef, endId: sentinelRef, summary: SUMMARY }] })}`, { resume: true }));
+    ok("fold", await piRun(ctx, `WS_FOLD_REQUEST_B64 ${b64({ content: `${minRef}–${sentinelRef} fold\n${SUMMARY}` })}`, { resume: true }));
     const foldedRow = mock.rows.filter((r) => r.transport === "ws").find((r) => toolResult(r, "compress")?.includes("Compressed"));
     assert.ok(foldedRow, "compress executed and reported the fold");
 
@@ -585,7 +585,7 @@ test("B: auto — successful WS still routes, previous_response_id continuation 
     assert.ok(sentinelRef && userRefs.length >= 2, `user-message ACP refs present (${userRefs.length})`);
     const minRef = userRefs.reduce((a, b) => (Number(a.slice(1)) < Number(b.slice(1)) ? a : b));
 
-    ok("fold", await piRun(ctx, `WS_FOLD_REQUEST_B64 ${b64({ content: [{ startId: minRef, endId: sentinelRef, summary: SUMMARY }] })}`, { resume: true }));
+    ok("fold", await piRun(ctx, `WS_FOLD_REQUEST_B64 ${b64({ content: `${minRef}–${sentinelRef} fold\n${SUMMARY}` })}`, { resume: true }));
 
     // Delta frames emerge inside multi-call tool-loop processes (pi's
     // websocketSessionCache is per-process): A/E show them on the final call of
@@ -688,7 +688,7 @@ test("D: explicit sse — regression guard, full fold cycle over HTTP", { skip: 
     assert.ok(sentinelRef && userRefs.length >= 2, `user-message ACP refs present (${userRefs.length})`);
     const minRef = userRefs.reduce((a, b) => (Number(a.slice(1)) < Number(b.slice(1)) ? a : b));
 
-    ok("fold", await piRun(ctx, `WS_FOLD_REQUEST_B64 ${b64({ content: [{ startId: minRef, endId: sentinelRef, summary: SUMMARY }] })}`, { resume: true }));
+    ok("fold", await piRun(ctx, `WS_FOLD_REQUEST_B64 ${b64({ content: `${minRef}–${sentinelRef} fold\n${SUMMARY}` })}`, { resume: true }));
     ok("recall", await piRun(ctx, "final recall", { resume: true }));
 
     // Re-capture AFTER fold/recall: preFoldRows is a pre-fold snapshot.

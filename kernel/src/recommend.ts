@@ -31,12 +31,17 @@ import {
   isMessageLatestProtected,
   isMessageProtectedWithPairing,
   isNeverPreserveRecent,
+  lastUserAnchor,
 } from "./protected.js";
 import { countMessageTokens } from "./tokenize.js";
 import { computeIntegrityWithdrawals } from "./turn-integrity.js";
 import { evaluateRefold } from "./refold.js";
 import { segmentGroups } from "./segment.js";
-import { projectUnit, collectCoverage } from "./unit-projection.js";
+import {
+  projectUnit,
+  collectCoverage,
+  buildProjectionShared,
+} from "./unit-projection.js";
 import { BoundaryNotFoundError } from "./boundaries.js";
 import type { UnitProjection } from "./unit-projection.js";
 
@@ -143,12 +148,10 @@ export function computeProtectedRefs(
   // skipped above — user intent is always protected regardless of recent
   // tool results.
   if (preserveN > 0) {
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const msg = messages[i]!;
-      if (msg.role !== "user" || isSyntheticOrPruned(msg, covered)) continue;
-      const ref = state.messageRefs.byRaw[msg.id];
+    const anchor = lastUserAnchor(messages, covered, config);
+    if (anchor) {
+      const ref = state.messageRefs.byRaw[anchor.id];
       if (ref && ref !== "BLOCKED") result.add(ref);
-      break;
     }
   }
 
@@ -426,9 +429,17 @@ export function buildCompressibleRanges(
   // each removed message as a gap so no range spans it.
   // #2663: judge foldability on the same array class apply does (see the
   // `integritySource` parameter) — grouping/pairing are array-dependent.
+  // #5531: ids already covered by an active block are INVISIBLE, not kept —
+  // a covered call cannot strand its turn's reasoning. Without this, every
+  // #564 reverse split (call+result folded into a block, reasoning+text left
+  // visible) manufactures residue that no later fold may ever take: it is
+  // withdrawn here AND rejected at apply, so each growth fold reclaims only
+  // the non-residue and the session grows without bound (billion-context#5531).
   const unfoldedIds = computeIntegrityWithdrawals(
     integritySource ?? messages,
     new Set(compressibleMsgs.map((info) => info.id)),
+    undefined,
+    covered,
   ).withdrawn;
   if (unfoldedIds.size > 0) {
     let gapPending = false;
@@ -652,6 +663,12 @@ export function screenRecommendedUnits(
 ): CompressibleRange[] {
   if (units.length === 0) return units;
   const coverage = collectCoverage(state);
+  // #5337 option A: the O(n) per-pass derivations (index map, carrier scan,
+  // protected/latest/aged collectors, pair map, anchor, integrity pre) used
+  // to be rebuilt INSIDE projectUnit for every screened unit — O(units x n).
+  // Build them once here and share across all units in this pass; the
+  // judgment itself is unchanged.
+  const shared = buildProjectionShared(source, state, config);
   return units.filter((unit) => {
     let projection: UnitProjection | undefined;
     try {
@@ -663,6 +680,7 @@ export function screenRecommendedUnits(
         endRef: unit.endRef,
         preExistingCoverage: coverage,
         protectedMessageIds: protectedRefs,
+        shared,
       });
     } catch (err) {
       // Endpoints that cannot resolve on this array class (dead/consumed)

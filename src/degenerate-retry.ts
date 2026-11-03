@@ -1,4 +1,5 @@
 import { fetchWithTimeout } from "./fetch-util.js";
+import { noteUpstreamThrottle429, noteUpstreamThrottleResolved, upstreamThrottleLocalReject } from "./upstream-throttle.js";
 import { hasCompactionTrigger } from "./codex-compact.js";
 import { proxyDispatcher } from "./upstream-proxy.js";
 import type { WireProtocol } from "./util.js";
@@ -82,6 +83,17 @@ export function makeContinuationRefetch(opts: ContinuationRetryOpts): () => Prom
         const wireRetryBody = opts.wrapBody ? opts.wrapBody(retryBody) : retryBody;
         try {
             opts.resign?.(opts.reqHeaders, wireRetryBody);
+            // #4743: the retry is an egress send like any other — feed the 429
+            // governor (observe only, no local gate: the retry is bounded by
+            // the degenerate-turn ladder, and holding IT locally would strand
+            // the client's already-open response stream). A 429 verdict arms
+            // the hold for the NEXT main-lane send; any other resolved status
+            // clears it — same one-observation-per-request discipline as relay.
+            const throttleReject = upstreamThrottleLocalReject(opts.upstreamUrl, opts.reqHeaders);
+            if (throttleReject !== undefined) {
+                opts.log("info", `[${opts.label}] [plugin] degenerate-terminal retry answered locally by the 429 hold (#4204) — passing the empty turn through`);
+                return null;
+            }
             const r = await fetchWithTimeout(
                 opts.upstreamUrl,
                 {
@@ -95,9 +107,12 @@ export function makeContinuationRefetch(opts: ContinuationRetryOpts): () => Prom
             );
             if (!r.response.ok || !r.response.body) {
                 r.clearTimer();
+                if (r.response.status === 429) noteUpstreamThrottle429(opts.upstreamUrl, opts.reqHeaders, r.response.headers.get("retry-after"));
+                else noteUpstreamThrottleResolved(opts.upstreamUrl, opts.reqHeaders, r.response.status);
                 opts.log("warn", `[${opts.label}] [plugin] degenerate-terminal retry rejected (HTTP ${r.response.status}); passing the empty turn through`);
                 return null;
             }
+            noteUpstreamThrottleResolved(opts.upstreamUrl, opts.reqHeaders, r.response.status);
             const body = r.response.body as ReadableStream<Uint8Array>;
             // The retry stream is spliced into a response the caller already
             // owns, so its own idle timer is dropped — a stalled retry then ends

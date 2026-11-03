@@ -6,8 +6,9 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { defaultConfig, ABSORB_TOOL_NAME, RULE_TOOL_NAME, RETRIEVE_TOOL_NAME } from "acp-kernel";
-import { startServer, BILI_TOOL_NAMES } from "../src/server.ts";
+import { defaultConfig, ABSORB_TOOL_NAME, RULE_TOOL_NAME, RETRIEVE_TOOL_NAME, type CoreMessage } from "acp-kernel";
+import { settleUsageReport } from "../src/cache-ledger.ts";
+import { startServer, BILI_TOOL_NAMES, effectiveTokenCount } from "../src/server.ts";
 import { READ_ORIGINAL_IMAGE_TOOL_NAME } from "../src/compress-tool.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
@@ -313,12 +314,15 @@ test("(F) extracted protocol modules keep the side-lane boundary (#1440 P2 cut 2
 // (no threshold, no session state) consulted only to set sideIntent. #4438
 // adds isDshAutoReviewRequest — same category again: a pure dsh auto-review
 // shape predicate (no threshold, no session state) consulted to set sideIntent
-// and to keep stamped reviews off the |sub: fork path.
+// and to keep stamped reviews off the |sub: fork path. #5135 adds
+// isClaudeCodeTitleRequest — same category once more: a pure claude-code
+// title-sidecar shape predicate consulted to set sideIntent and to keep the
+// title call out of the #4774 raw-key anchor race.
 test("(G) extracted pipeline module keeps the side-lane boundary (#1440 P2 cut 3)", () => {
     const text = readFileSync(fileURLToPath(new URL("../src/server/handle.ts", import.meta.url)), "utf8");
     const laneInternals = /\bSIDE_REQUEST_MAX_TOKENS\b|\bSIDE_REQUEST_AGENTS\b|\bDemoteGateSignals\b|\bSideLaneSignals\b|\bSideLaneDecision\b|\bBILI_TOOL_NAMES\b|\bOutputBudgetField\b|\boutputBudgetField\b|\breadOutputBudget\b|\bwriteOutputBudget\b|\b_resetNoOutputCeilingWarningsForTest\b/;
     assert.doesNotMatch(text, laneInternals, "handle.ts must stay decoupled from the side-lane engine internals");
-    const allowlist = new Set(["hasLeakedBiliToolsOnly", "isDshAutoReviewRequest", "isDshTitleRequest", "isServerToolUtilityCall", "isSideRequest", "resolveSideLane", "demoteGate", "stripLeakedBiliTools", "restoreOutputBudget", "sideRequestGuard"]);
+    const allowlist = new Set(["hasLeakedBiliToolsOnly", "isClaudeCodeTitleRequest", "isDshAutoReviewRequest", "isDshTitleRequest", "isServerToolUtilityCall", "isSideRequest", "resolveSideLane", "demoteGate", "stripLeakedBiliTools", "restoreOutputBudget", "sideRequestGuard"]);
     let sawImport = false;
     for (const m of text.matchAll(/\{([^}]*)\}\s*from\s*["'][^"']*side-request\.js["']/g)) {
         sawImport = true;
@@ -365,4 +369,220 @@ test("(I) revival (#3402): the absorb tool name is bili-owned again", () => {
 // membership (same discipline as (I) above for the absorb removal).
 test("(J) post-#3400: acp_read_original_image is bili-owned for #1897 demotion", () => {
     assert.ok(BILI_TOOL_NAMES.has(READ_ORIGINAL_IMAGE_TOOL_NAME), "acp_read_original_image is in the bili-owned set");
+});
+
+// (#4805/#4720): side-lane usage samples must never pollute the main
+// conversation's usage anchor. Reported incident: a 2-message auxiliary
+// request under the SAME session id settled a 5100-token sample over a
+// 300K-token anchor — nudge growth could then never reach its floor,
+// compression froze while real context grew past the window. Time-based
+// staleness cannot catch a seconds-old contaminant, so the defense is
+// directional SIZE plus credit exemption, at two independent decision
+// points (each guard alone breaks the freeze loop; incident regression
+// detail in tests/issue4805-anchor-pollution.test.ts).
+function anchorSession(anchor: number): Session {
+    return {
+        id: "s4805",
+        meta: {},
+        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: anchor, lastInputTokensSource: "usage", contextTokens: anchor } as never,
+        metadata: {},
+        createdAt: Date.now(),
+        lastSeen: Date.now(),
+        blockContents: new Map(),
+        inFlight: 0,
+        persisted: false,
+        pendingRetrievals: [],
+    } as never as Session;
+}
+
+function longHistory(count: number): CoreMessage[] {
+    const msgs: CoreMessage[] = [];
+    for (let i = 0; i < count; i++) {
+        msgs.push({ id: `m${i}`, role: i % 2 === 0 ? "user" : "assistant", contentType: "text", text: "x".repeat(6000) });
+    }
+    return msgs;
+}
+
+test("(K) settle keeps usage-grade truth: a far-smaller usage sample supersedes AND snapshots its payload size (#4805/#1492 B)", () => {
+    // #1492 B contract: the next real usage report ALWAYS self-heals the anchor —
+    // the settle side must not magnitude-gate (a poisoned 1.2M anchor over a
+    // folded 5K conversation is the SAME small-sample shape as side-lane
+    // pollution). #4805's protection moved entirely to the meter (K2): settle
+    // records WHICH request produced the anchor (lastUsagePayloadUpper) so the
+    // meter can refuse anchors written by tiny requests.
+    const session = anchorSession(300_000);
+    session.stats.localInputEstimate = 2_600; // the side-lane request's own payload upper
+    settleUsageReport(session, { total: 5_100, reportedCached: 128, output: 30, protocol: "openai" });
+    assert.equal(session.stats.lastInputTokens, 5_100, "usage-grade samples supersede unconditionally (#1492 B self-heal)");
+    assert.equal(session.stats.lastUsagePayloadUpper, 2_600, "the anchor carries its producing request's payload snapshot");
+    assert.equal(session.stats.inputTokens, 5_100, "counters accrue");
+    // same-lane reports keep writing and re-snapshot
+    session.stats.localInputEstimate = 295_000;
+    settleUsageReport(session, { total: 290_000, reportedCached: null, protocol: "openai" });
+    assert.equal(session.stats.lastInputTokens, 290_000, "main-lane reports keep updating the anchor");
+    assert.equal(session.stats.lastUsagePayloadUpper, 295_000, "the snapshot follows the producing request");
+    // first settle on an empty anchor always writes
+    const fresh = anchorSession(0);
+    settleUsageReport(fresh, { total: 5_100, reportedCached: null });
+    assert.equal(fresh.stats.lastInputTokens, 5_100, "first settle on an empty anchor always writes");
+});
+
+test("(K2) side-lane meter guard: an anchor written by a request far smaller than the payload at hand sizes nothing (#4805/#1820 B)", () => {
+    // #4805 shape: anchor 5100 written by a ~2600-upper side request; the main
+    // payload towers over BOTH the anchor and its producing request's snapshot.
+    const session = anchorSession(5_100);
+    session.stats.contextTokens = 5_100;
+    (session.stats as { contextTokensSource?: string }).contextTokensSource = "usage";
+    session.stats.localInputEstimate = 0; // not cycle-stale: the demotion below must come from the size guard alone
+    session.stats.lastUsagePayloadUpper = 2_600;
+    const verdict = effectiveTokenCount(session, longHistory(800), 0);
+    assert.notEqual(verdict.tokens, 5_100, "a 5100-tok anchor from a 2600-upper request cannot describe a multi-million-char payload");
+    assert.equal(verdict.source, "estimate", "falls through to the local measurement (#4805 size guard)");
+    // #1820 B shape: an HONEST anchor whose request was this big (its upstream
+    // under-reports 8x) keeps the fast path — the snapshot term is the margin.
+    const honest = anchorSession(5_100);
+    honest.stats.contextTokens = 5_100;
+    (honest.stats as { contextTokensSource?: string }).contextTokensSource = "usage";
+    honest.stats.localInputEstimate = 0;
+    honest.stats.lastUsagePayloadUpper = 220_000;
+    // payload at the anchor-producer's own scale (~240k upper over a 220k snapshot)
+    const trusted = effectiveTokenCount(honest, longHistory(40), 0);
+    assert.equal(trusted.source, "usage", "an anchor written by THIS-size request stays ground truth (#1820 B)");
+    assert.equal(trusted.tokens, 5_100, "usage-grade sizing preserved");
+    // early-session growth stays anchored (no false trips below the absolute floor)
+    const small = anchorSession(800);
+    small.stats.contextTokens = 800;
+    (small.stats as { contextTokensSource?: string }).contextTokensSource = "usage";
+    small.stats.localInputEstimate = 0;
+    small.stats.lastUsagePayloadUpper = 900;
+    const early = effectiveTokenCount(small, longHistory(3), 0);
+    assert.equal(early.tokens, 800, "small payloads keep sizing off the anchor");
+});
+
+// (#4352): the header-less claude-code persona gate landed in src/server/handle.ts's
+// anthropic ladder with a fresh `!sideRequestLike` conjunct — a lane-symbol edit
+// in handle.ts must land with a dedicated lane-suite pin (#2170 discipline). This
+// row is that pin, contrast-shaped: the SAME claude-code persona traffic, with
+// sideRequestLike=true (tiny tool-less budget, no agent header) stays verbatim on
+// the raw key and observation-transparent, while sideRequestLike=false (full
+// budget) rides the order resolver and forks its own |sub:<fp> lane.
+test("(L) #4352 anthropic persona gate is side-vetoed: side shape stays verbatim, full-budget shape forks", async () => {
+    const h = await harness();
+    try {
+        const conv = "cc4352";
+        const ccSend = async (system: string, msgs: unknown[], maxTokens: number) => {
+            const r = await fetch(`${h.origin}/bili/${h.upstreamUrl}/v1/messages`, {
+                method: "POST",
+                headers: { "content-type": "application/json", "x-claude-code-session-id": conv },
+                body: JSON.stringify({ model: "claude-test", stream: false, max_tokens: maxTokens, system, messages: msgs }),
+            });
+            assert.equal(r.status, 200, await r.text());
+        };
+        // main turn anchors the raw key (claude-code main persona)
+        await ccSend("You are Claude Code, Anthropic's official CLI for Claude. You are an interactive agent.", [mainMsg(0)], 256);
+        const session = resolveConversation(conv).session!;
+        assert.equal(session.stats.requests, 1, "main turn counted once on the parent");
+        const sessions = listSessions().length;
+
+        // side shape: same raw id, SUB persona system, tool-less tiny budget (<=
+        // the #388 heuristic, no agent header) → the new anthropic gate is
+        // vetoed by !sideRequestLike: verbatim raw key, counted nowhere, and
+        // NO persisted |sub ghost for it.
+        const hits = h.forwarded.length;
+        await ccSend("You are a file search specialist for the parent session.", [{ role: "user", content: "summarize" }], 100);
+        assert.equal(h.forwarded.length, hits + 1, "the side call reaches the upstream");
+        assert.equal(resolveConversation(conv).session!.stats.requests, 1, "side call never counts on the parent");
+        assert.equal(listSessions().length, sessions, "side call must not fork a |sub lane");
+
+        // full-budget shape: the SAME sub persona system + disjoint history → the
+        // resolver DOES engage (proof the verbatim above is the sideRequestLike
+        // conjunct, not a dead gate): a |sub:<fp> lane appears, parent untouched.
+        await ccSend("You are a file search specialist for the parent session.", [
+            { role: "user", content: "sub-user-1" },
+            { role: "assistant", content: "sub-assistant-1" },
+            { role: "user", content: "sub-user-2" },
+        ], 1024);
+        assert.equal(listSessions().length, sessions + 1, "full-budget sub persona forks its own |sub lane");
+        assert.equal(resolveConversation(conv).session!.stats.requests, 1, "the fork lane counts nowhere on the parent");
+    } finally {
+        await h.close();
+    }
+});
+
+// (#5135): the claude code session-title sidecar (terminal CLI, proxy mode,
+// header-less) fires ~1ms ahead of the first main turn under the SAME
+// x-claude-code-session-id. Pre-fix it claimed the raw-key anchor in the #4774
+// order resolver and the main conversation forked onto |sub:<fp> for the
+// session lifetime. Lane-symbol edit in handle.ts → dedicated lane-suite pin
+// per #2170 discipline: positive rows (title shape rides verbatim + passthrough
+// in BOTH arrival orders) and negative rows (tools present / missing wrapper /
+// non-CC client evidence → full pipeline, counted).
+test("(M) #5135 claude-code title sidecar: no anchor claim in either arrival order", async () => {
+    const h = await harness();
+    try {
+        const MAIN_SYS = "You are Claude Code, Anthropic's official CLI for Claude. You are an interactive agent.";
+        const TITLE_SYS = "Summarize the user's first message into a short title.";
+        const CC_TOOLS = [{ name: "Bash", description: "run a shell command", input_schema: { type: "object", properties: { command: { type: "string" } }, required: ["command"] } }];
+        const TITLE_BLOB = "\u003csession\u003efix the flaky login test\u003c/session\u003e";
+        const ccSend = async (conv: string, system: string, msgs: unknown[], maxTokens: number, tools?: unknown[]) => {
+            const r = await fetch(`${h.origin}/bili/${h.upstreamUrl}/v1/messages`, {
+                method: "POST",
+                headers: { "content-type": "application/json", "x-claude-code-session-id": conv },
+                body: JSON.stringify({ model: "claude-test", stream: false, max_tokens: maxTokens, system, messages: msgs, ...(tools ? { tools } : {}) }),
+            });
+            assert.equal(r.status, 200, await r.text());
+        };
+
+        // Positive A — the reported race: title call FIRST on the virgin id
+        // (own system, single wrapped blob, no tools, budget past the <=200
+        // heuristic) → verbatim keying + passthrough; counts nowhere, mints no
+        // fork; the main turn then lands on the RAW key.
+        const conv = "cc5136";
+        const hits0 = h.forwarded.length;
+        await ccSend(conv, TITLE_SYS, [{ role: "user", content: TITLE_BLOB }], 4096);
+        assert.equal(h.forwarded.length, hits0 + 1, "the title call reaches the upstream");
+        assert.equal(resolveConversation(conv).session?.stats.requests ?? 0, 0, "the title call counts nowhere");
+        assert.equal(listSessions().filter((s) => s.id.startsWith(conv + "|")).length, 0, "the title call mints no |sub lane");
+        await ccSend(conv, MAIN_SYS, [mainMsg(0)], 256, CC_TOOLS);
+        assert.equal(resolveConversation(conv).session!.stats.requests, 1, "the main turn lands on the RAW key");
+        assert.equal(listSessions().filter((s) => s.id.startsWith(conv + "|")).length, 0, `the main conversation never forks, got ${listSessions().map((s) => s.id).join(", ")}`);
+
+        // Positive B — reverse arrival order: the anchor exists first; the
+        // title call afterwards still rides transparently.
+        const conv2 = "cc5136-rev";
+        await ccSend(conv2, MAIN_SYS, [mainMsg(0)], 256, CC_TOOLS);
+        assert.equal(resolveConversation(conv2).session!.stats.requests, 1, "the main turn anchors the raw key");
+        const hits1 = h.forwarded.length;
+        await ccSend(conv2, TITLE_SYS, [{ role: "user", content: TITLE_BLOB }], 4096);
+        assert.equal(h.forwarded.length, hits1 + 1, "the later title call still reaches the upstream");
+        assert.equal(resolveConversation(conv2).session!.stats.requests, 1, "the later title call counts nowhere");
+        assert.equal(listSessions().filter((s) => s.id.startsWith(conv2 + "|")).length, 0, "no fork in either order");
+
+        // Negative A — tools veto: the same wrapped blob WITH a tools surface
+        // is an agent turn → full pipeline, counted on the raw key (pre-fix
+        // behavior preserved; single shallow turn claims the raw key, no fork).
+        const conv3 = "cc5136-tools";
+        await ccSend(conv3, TITLE_SYS, [{ role: "user", content: TITLE_BLOB }], 4096, CC_TOOLS);
+        assert.equal(resolveConversation(conv3).session!.stats.requests, 1, "tools-shape request rides the full pipeline");
+        assert.equal(listSessions().filter((s) => s.id.startsWith(conv3 + "|")).length, 0, "single shallow turn claims the raw key, no fork");
+
+        // Negative B — missing wrapper: a plain first-prompt blob is not the
+        // title shape → full pipeline, counted.
+        const conv4 = "cc5136-nowrap";
+        await ccSend(conv4, TITLE_SYS, [{ role: "user", content: "fix the flaky login test" }], 4096);
+        assert.equal(resolveConversation(conv4).session!.stats.requests, 1, "unwrapped blob rides the full pipeline");
+
+        // Negative C — client-evidence gate: the SAME title shape from a
+        // non-claude-code client (x-acp-session source) is NOT exempted.
+        const conv5 = "cc5136-other";
+        const r5 = await fetch(`${h.origin}/bili/${h.upstreamUrl}/v1/messages`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-acp-session": conv5 },
+            body: JSON.stringify({ model: "claude-test", stream: false, max_tokens: 4096, system: TITLE_SYS, messages: [{ role: "user", content: TITLE_BLOB }] }),
+        });
+        assert.equal(r5.status, 200, await r5.text());
+        assert.equal(resolveConversation(conv5).session!.stats.requests, 1, "non-CC client evidence gate: full pipeline, counted");
+    } finally {
+        await h.close();
+    }
 });
