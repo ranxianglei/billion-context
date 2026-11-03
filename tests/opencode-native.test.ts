@@ -1084,11 +1084,12 @@ test("#4669 composition: opencode inline chain — rewrites land on the inline e
     }
 });
 
-test("#4669 V2 composition: route rewrite + fetch chain serves INLINE_ORIGIN in-process", async () => {
-    // OpenCode 2.x production shape: the http.request route hook REPLACES the
-    // outgoing Request's target with `${INLINE_ORIGIN}/bili/<url>`, then the
-    // host's own fetch (patched by our chain) sends it. Route rewrite must
-    // compose with the inline link exactly like the intercept's own rewrite.
+test("#4669 V2 composition: fetch-time rewrite + inline engine serves INLINE_ORIGIN in-process", async () => {
+    // OpenCode 2.x production shape (#4276): the http.request hook only
+    // DISCOVERS the proxy origin; the host's own fetch (patched by our chain)
+    // rewrites the model URL to `${INLINE_ORIGIN}/bili/<url>` at send time.
+    // The fetch-time rewrite must compose with the inline link exactly like
+    // the intercept's own rewrite.
     const ie = await import("../src/inline-engine.ts");
     const ni = await import("../src/agent/native-intercept.ts");
     const fc = await import("../src/agent/fetch-chain/index.ts");
@@ -1110,14 +1111,16 @@ test("#4669 V2 composition: route rewrite + fetch chain serves INLINE_ORIGIN in-
         piInline._resetInlineTransportForTest();
         piInline.installInlineTransport();
         const state: NativeInterceptState = { origin: ie.INLINE_ORIGIN, ready: Promise.resolve(ie.INLINE_ORIGIN) };
+        assert.equal(ni.installNativeFetchIntercept(state), true);
         const route = createNativeRoute(state, { probe: async () => true });
         const e: V2HttpRequestEvent = {
             sessionID: "ses_inline",
             request: new Request(MODEL_URL, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" }),
         };
         await route(e, {});
-        assert.equal((e.request as Request).url, `${ie.INLINE_ORIGIN}/bili/${MODEL_URL}`, "route rewrites to the pseudo-origin");
-        // The host then sends the rewritten Request through global fetch.
+        assert.equal((e.request as Request).url, MODEL_URL, "hook keeps the shared payload untouched (#4276)");
+        // The host then sends the original Request through global fetch; the
+        // chain performs the rewrite at send time.
         const r = await fetch(e.request as Request);
         assert.equal(r.status, 200);
         assert.equal(await r.text(), "inline-ok");

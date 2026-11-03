@@ -26,7 +26,8 @@ after(() => {
 
 const MODEL_URL = "https://api.anthropic.com/v1/messages";
 // The Antigravity pool endpoint the provider plugin rewrites to in the #4276
-// repro: not a model-API shape, so the chain must pass it through unproxied.
+// repro. Since #4256 this v1internal dialect is a recognized model-API shape
+// (DSH Desktop Code-Assist traffic), so the chain routes it — see the test.
 const POOL_URL = "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse";
 const DIRECT_PREFIX = "https://ex.example";
 const EXEMPT_URL = `${DIRECT_PREFIX}/v1/chat/completions`;
@@ -103,7 +104,7 @@ test("hook leaves e.request untouched; the fetch routes to <origin>/bili/<url> (
     }
 });
 
-test("provider plugin rewriting to a pool endpoint passes through unproxied (#4276)", async () => {
+test("provider plugin rewriting to a pool endpoint: hook stays out, chain forwards (#4276)", async () => {
     const origin = "http://127.0.0.1:43211";
     const state: NativeInterceptState = { origin, ready: Promise.resolve(origin) };
     const { createNativeRoute } = await import("../src/agent/opencode-native.js");
@@ -121,8 +122,14 @@ test("provider plugin rewriting to a pool endpoint passes through unproxied (#42
             await globalThis.fetch(e.request as Request);
         });
         const model = sink.filter((s) => !s.url.includes("/__bili/"));
-        assert.deepEqual(model.map((s) => s.url), [POOL_URL], "pool endpoint sent byte-identical, unproxied");
-        assert.equal(model[0].headers["x-bili-plugin"], undefined, "chain adds no bili headers to non-model traffic");
+        // The v1internal pool dialect IS a recognized model-API shape (#4256:
+        // DSH Desktop Code-Assist traffic rides exactly this URL and the server
+        // side supports the dialect), so the chain routes it like any other
+        // model request — byte-preserving forward, no bili identity invented
+        // for the plugin's fresh request. Hosts keeping such traffic fully off
+        // bili opt out per upstream via providers.<url>.direct (next test).
+        assert.deepEqual(model.map((s) => s.url), [`${origin}/bili/${POOL_URL}`]);
+        assert.equal(model[0].headers["x-bili-plugin"], undefined, "chain adds no bili identity to the plugin-produced request");
         assert.equal(model[0].headers["authorization"], "Bearer pool-token");
     } finally {
         cleanup();

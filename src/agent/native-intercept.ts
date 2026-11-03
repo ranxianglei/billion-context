@@ -1091,37 +1091,6 @@ export function createLiveOriginResolver(state: NativeInterceptState, deps: Live
     };
 }
 
-/** Replace the outgoing request reference with a new Request against
- *  `target`, preserving method/headers/body (a Request.url is read-only,
- *  #810 — the reference itself moves). When the body cannot be copied the
- *  original request is left untouched (it goes direct rather than dying). */
-export function replaceRequestTarget(e: { request?: unknown }, target: string): void {
-    const old = e.request;
-    if (old == null) return;
-    try {
-        e.request = new Request(target, old as unknown as Request);
-    } catch {
-        // undici refuses to copy a body-bearing Request without explicit
-        // duplex — reconstruct with the body stream passed explicitly.
-        const src = old as unknown as { method?: unknown; headers?: Iterable<readonly [string, string]> | null; body?: ReadableStream<Uint8Array> | null };
-        try {
-            const init: RequestInit & { duplex?: "half" } = { method: typeof src.method === "string" ? src.method : "GET" };
-            const pairs: [string, string][] = [];
-            try {
-                for (const pair of src.headers ?? []) pairs.push([pair[0], pair[1]]);
-            } catch {}
-            if (pairs.length > 0) init.headers = pairs;
-            if (src.body != null) {
-                init.body = src.body as RequestInit["body"];
-                init.duplex = "half";
-            }
-            e.request = new Request(target, init);
-        } catch {
-            // replacement impossible (exotic body) — request goes direct
-        }
-    }
-}
-
 /** Replace the hook's request with a new Request carrying a NEW BODY (and
  *  optionally extra headers) while preserving url/method/headers. The
  *  incremental-turn adapters use it: the host hands a real fetch Request
