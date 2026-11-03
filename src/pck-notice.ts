@@ -20,6 +20,11 @@ export const PCK_NOTICE_ID = "pck-default-off";
 export const WM_FASTPATH_INTRO_ID = "wm-fastpath-intro";
 
 const UPGRADE_NOTICE_IDS: ReadonlySet<string> = new Set([PCK_NOTICE_ID, WM_FASTPATH_INTRO_ID]);
+// #5548 P2: local announcements dismiss as `<id>@<content-hash16>` so edited
+// content re-nags exactly once; the hash shape is the only dynamic form the
+// store accepts (raw local ids never enter it — those use instance/always).
+const HASHED_NOTICE_RE = /^[a-z0-9][a-z0-9-]{0,63}@[0-9a-f]{16}$/;
+const MAX_DISMISSED_KEYS = 200;
 
 const DISMISS_FILE = "upgrade-notices.json";
 
@@ -43,13 +48,20 @@ export function dismissedUpgradeNotices(env: NodeJS.ProcessEnv = process.env): R
 
 /** Idempotent. Returns false only for unknown notice ids. */
 export function dismissUpgradeNotice(id: string, env: NodeJS.ProcessEnv = process.env): boolean {
-    if (!UPGRADE_NOTICE_IDS.has(id)) return false;
+    if (!UPGRADE_NOTICE_IDS.has(id) && !HASHED_NOTICE_RE.test(id)) return false;
     const set = new Set(dismissedUpgradeNotices(env));
     set.add(id);
+    // #5548: bound the file — built-in ids are protected, oldest hashed keys trim first.
+    let keys = [...set].sort();
+    while (keys.length > MAX_DISMISSED_KEYS) {
+        const victim = keys.find((k) => !UPGRADE_NOTICE_IDS.has(k));
+        if (victim === undefined) break;
+        keys = keys.filter((k) => k !== victim);
+    }
     try {
         const dir = stateDirFor(env);
         fs.mkdirSync(dir, { recursive: true });
-        fs.writeFileSync(path.join(dir, DISMISS_FILE), JSON.stringify({ dismissed: [...set].sort() }, null, 2) + "\n");
+        fs.writeFileSync(path.join(dir, DISMISS_FILE), JSON.stringify({ dismissed: keys }, null, 2) + "\n");
     } catch {
         // best effort: dismissal intent still holds for this process's answers
     }
