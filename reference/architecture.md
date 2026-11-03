@@ -77,6 +77,7 @@ billion-context/
 │   ├── fold-reconcile.ts         # Fold-anchor reconciliation for stable prefix cache
 │   ├── generation-boundary.ts    # Standing generation-boundary note for post-switch stale-ref residue (#4305)
 │   ├── orphan-gc.ts              # Orphan block garbage collection
+│   ├── foreign-block-sweep.ts    # Legacy cross-session fold-block sweep: covered-ids with zero transcript intersection → reversible archive (#5312)
 │   ├── fork-adoption.ts          # Fork block adoption on mid-history divergence (#629)
 │   ├── prefix-affinity.ts        # Anonymous prefix-affinity session resolution (#309)
 │   ├── affinity-persist.ts       # Prefix-affinity persistence across proxy restarts (#499)
@@ -132,6 +133,7 @@ billion-context/
 │   ├── error-dump.ts             # Rejected-body dump (diagnostics.dump4xx / BILI_DUMP_4XX)
 │   ├── ws-bridge.ts              # Generic WebSocket bridge shell
 │   ├── responses-ws.ts           # Codex/OpenCode Responses-over-WebSocket codec (#1844)
+│   ├── kiro.ts                   # Kiro CLI: model-gateway hosts, built-in developer/system→user roles, kiro:conversation_id identity
 │   ├── launcher.ts               # `bili <client>` launcher (auto-proxies both schemes)
 │   ├── client-config.ts          # Read-only discovery of each client's own upstream config
 │   ├── plugin.ts                 # Cooperative plugin protocol (x-bili-plugin lane, legacy marker #920)

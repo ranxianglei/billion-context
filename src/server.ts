@@ -96,13 +96,15 @@ import { conflictScanEnabled, isDesignBenign, scanClientPlugins, sniffScanClient
 import { clearConflictEvents, recordConflict, summarizeConflicts } from "./conflict-watch.js";
 import { getStore, setGlobalSessionCommitListener } from "./persist.js";
 import { log as loggerLog, configureLogger, getLogPath, closeLogger, isStreamWriteError, isBenignSocketRaceError, enterSessionContext, muteStderrLeg, onFileLegLive, shouldMuteStderrLegAfterFileLive, logTimestamp } from "./logger.js";
+import { noteRequest } from "./attach-heartbeat.js";
 import { queryLogLines } from "./web/logs-query.js";
 import { configFile, defaultLogFile, sessionsDir, stateDir } from "./paths.js";
-import { atomicWriteInstanceFile, clearProxyInstanceFile, classifySameLanePeer, entryShape, findSameLanePredecessor, findVerifiedSameLaneTwin, isPidAlive, listInstances, markPortReleased, probePid, readProxyInstanceFile, registerInstanceAndWarn, resolveOwnFingerprint, sameInstanceShape, SPAWN_FINGERPRINT_ENV, unregisterInstance, warnOnNewPeers, writeSpawnPortLog, type InstanceShape, type PidProbe, type ProxyInstanceFile, type RegistryEntry, type SameLanePeer } from "./instance.js";
+import { atomicWriteInstanceFile, clearProxyInstanceFile, classifySameLanePeer, entryShape, findPresentUnverifiedSameLaneTwin, findSameLanePredecessor, findVerifiedSameLaneTwin, isPidAlive, listInstances, markPortReleased, probePid, readProxyInstanceFile, registerInstanceAndWarn, resolveOwnFingerprint, sameInstanceShape, SPAWN_FINGERPRINT_ENV, unregisterInstance, warnOnNewPeers, writeSpawnPortLog, type InstanceShape, type PidProbe, type ProxyInstanceFile, type RegistryEntry, type SameLanePeer } from "./instance.js";
 import { createServedMarkerWriter, peerStillContests, reapStaleWriterMarkers, writerMarkerDir, type ServedMarkerWriter } from "./served-markers.js";
 import { recordSplitBrainContest, registerSplitBrainEvidenceCheck } from "./storage/runtime-status.js";
 import { holderProbeOrigin, mayClobberPointer, probeHolderForHint, probeOwnerInfo, resolvePortClaim, verifyEntryOwnsPort } from "./port-owner.js";
 import { armEventLoopWatchdog } from "./event-loop-watchdog.js";
+import { tcpConnectable } from "./liveness.js";
 import { hoistTrappedToolItems } from "./tool-pair-order.js";
 import { computeAnthropicMessageMarks, stampAnthropicSystemCacheControl, anthropicToolsCarryCacheControl } from "./loop/cache-control.js";
 import { reconcileSystemAnchor } from "./system-anchor.js";
@@ -414,7 +416,7 @@ export function googlePathKind(urlPath: string): GooglePathKind | null {
  *  `parsed.model`. Returns undefined when the path carries no model or an
  *  undecodable one. */
 export function googleModelFromPath(urlPath: string): string | undefined {
-    const m = /\/models\/([^/:?]+):(?:streamGenerateContent|generateContent|countTokens)\b/.exec(urlPath);
+    const m = /\/models\/([^:?]+):(?:streamGenerateContent|generateContent|countTokens)\b/.exec(urlPath);
     if (!m || !m[1]) return undefined;
     try {
         return decodeURIComponent(m[1]);
@@ -678,8 +680,23 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         onSpawnFailure: (err) => logMsg(opts, "warn", `[event-loop-watchdog] could not arm (${String(err)}) — continuing unwatched (#4762)`),
     });
 
+    const instances = listInstances();
+    /** Both pre-persistence twin exits below share this tail: createEngineContext
+     *  has not run yet, so its configureLogger call has not happened either —
+     *  open the file leg here (mirroring it) so the twin line lands in bili.log
+     *  like the late-path twin line, gate on opts.log like every other
+     *  startServer line, and drain the stream before exiting or the buffered
+     *  line can be lost with the process. */
+    const exitBeforePersistence = async (hint: string): Promise<never> => {
+        const listenLine = `listen failed: EADDRINUSE listen EADDRINUSE: address already in use ${opts.host}:${opts.port}${hint}`;
+        configureLogger(opts.logFile ?? defaultLogFile());
+        logMsg(opts, "error", listenLine);
+        if (launchToken !== undefined) writeSpawnPortLog(opts.port, `${logTimestamp()} [error] [v=${VERSION}] ${listenLine}`);
+        await closeLogger();
+        process.exit(eaddrinuseExitCode("twin-collision"));
+    };
     const earlyTwin = await findVerifiedSameLaneTwin(
-        listInstances(),
+        instances,
         opts.port,
         launcherLane,
         ownFingerprint,
@@ -687,22 +704,34 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         (origin) => probeOwnerInfo(origin),
     );
     if (earlyTwin !== undefined) {
-        // createEngineContext has not run yet, so its configureLogger call
-        // has not happened either — open the file leg here (mirroring it) so
-        // the adopt line lands in bili.log like the late-path twin line, gate
-        // on opts.log like every other startServer line, and drain the stream
-        // before exiting or the buffered line can be lost with the process.
-        configureLogger(opts.logFile ?? defaultLogFile());
         // #4762: the twin verdict above rested on ONE health probe during
         // classification — a wedged zombie drains probes intermittently, so
         // re-probe at the moment of death and say which case we actually hit.
         const holderFragment = await probeHolderForHint({ origin: holderProbeOrigin(opts.host, opts.port), knownPid: earlyTwin.pid });
-        const hint = ` — port ${opts.port} is already served by a same-build bili instance (pid ${earlyTwin.pid}, lane ${launcherLane}) — exiting before persistence initialization instead of hopping: the duplicate loses and the serving instance keeps serving; the next launch will attach to it (#4341/#3044). A spawner reads this exit as an adopt signal and attaches to the serving instance itself (#3654). ${holderFragment}.`;
-        const listenLine = `listen failed: EADDRINUSE listen EADDRINUSE: address already in use ${opts.host}:${opts.port}${hint}`;
-        logMsg(opts, "error", listenLine);
-        if (launchToken !== undefined) writeSpawnPortLog(opts.port, `${logTimestamp()} [error] [v=${VERSION}] ${listenLine}`);
-        await closeLogger();
-        process.exit(eaddrinuseExitCode("twin-collision"));
+        await exitBeforePersistence(` — port ${opts.port} is already served by a same-build bili instance (pid ${earlyTwin.pid}, lane ${launcherLane}) — exiting before persistence initialization instead of hopping: the duplicate loses and the serving instance keeps serving; the next launch will attach to it (#4341/#3044). A spawner reads this exit as an adopt signal and attaches to the serving instance itself (#3654). ${holderFragment}.`);
+    }
+    // #4977: the verified path above only adopts an occupant that PROVES itself
+    // healthy. The complement case — same-build twin marker whose socket still
+    // accepts connections but whose health probe is silent (dying or
+    // event-loop-wedged, #3654) — used to fall through into persistence init
+    // and open index.db under the zombie before the listen failed EADDRINUSE
+    // (two-writer window #3923/#3959). Same outcome, decided earlier: once the
+    // bind proved the port busy, the late policy classified this exact registry
+    // evidence and fail-fast-exited with the identical code.
+    // #5018 decision (owner, 2026-10-31): option A — the early adopt-exit wins
+    // over #5016's late ladder for this unstamped same-lane corner; the
+    // cross-lane squatter form stays ladder-off (lane matching excludes it).
+    const presentTwin = await findPresentUnverifiedSameLaneTwin(
+        instances,
+        opts.port,
+        launcherLane,
+        ownFingerprint,
+        (entry) => sameInstanceShape(entryShape(entry), ownShape),
+        (origin) => probeOwnerInfo(origin),
+        (origin) => tcpConnectable(origin),
+    );
+    if (presentTwin !== undefined) {
+        await exitBeforePersistence(` — port ${opts.port} is still held by a same-build bili instance (pid ${presentTwin.pid}, lane ${launcherLane}) whose health probe is silent while its socket accepts connections: it is dying or event-loop-wedged (#3654), not serving — exiting before persistence initialization instead of opening index.db under it (#3923/#3959 two-writer window); the spawner reads this exit as an adopt signal and retries once the port frees (#4811/#4977).`);
     }
 
     const engine = await createEngineContext(opts);
@@ -1871,6 +1900,13 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
 
 export type Prepared = {
     body: string | Buffer;
+    /** The pre-serialization form of `body` when the lane built it as an
+     *  object (every prepare-* does: `body` is JSON.stringify(rebuilt)).
+     *  Consumers that would re-parse the string (image walk, overhead
+     *  estimate) read this instead — JSON round-trips are structurally
+     *  equal, and one full-body parse per consumer per turn is pure CPU
+     *  (#2078 seam rationale applied to the prepared body). */
+    parsedBody?: unknown;
     session: Session;
     processedMessages: CoreMessage[];
     /** Original CoreMessages from the protocol conversion, BEFORE processTurn
@@ -1900,6 +1936,11 @@ export type Prepared = {
      *  prompt carries the MCP name-mapping note (withMcpDialectNote). Threads
      *  to the round-2 system rebuild for byte-parity. */
     mcpDialectNote?: boolean;
+    /** #5418 watermark fastpath: extra SUCCESS-response headers built by the
+     *  prepare lane (x-bili-pf-seq = this turn's server-measured element
+     *  count, for client-side watermark convergence). The relay's 2xx path
+     *  merges them onto the upstream response headers. */
+    responseExtraHeaders?: Record<string, string>;
     responsesTextProtocol?: boolean;
     resetAfterSuccess?: boolean;
     responsesProjection?: ResponsesProjection;
@@ -2094,6 +2135,10 @@ export const headroomFallbackLogged = new Set<string>();
 // #2096: dedupe the post-reservation effective-window line per model|value —
 // the reserved window varies per request (max_tokens), so key on both.
 export const headroomEffectiveLogged = new Set<string>();
+/** #5191: per session|model|value dedup for the [arm-judge] line — the
+ * session overflow arm's judging wall is session-scoped evidence, unlike the
+ * config-derived [headroom] value, so the dedup key carries the session id. */
+export const armJudgingWallLogged = new Set<string>();
 
 // #1840: best-known OUTPUT ceiling for the request's model, resolved through
 // the SAME source chain (and rank order) the output-headroom fallback uses
@@ -2329,6 +2374,32 @@ export function applyReasoningDrop(
         log("info", `[${sessionId}] compress-reasoning: dropped ${msgs.length - out.length} reasoning message(s) from closed compress turns (#651)`);
     }
     return out;
+}
+
+/** Predicate factory for the experimental fold-point carrier relocation
+ *  "thinking clear" (kernel Config.reasoningDroppable): a reasoning core may
+ *  be dropped at the moment its compress pair is repositioned ONLY when it
+ *  carries no wire signature. Signed Anthropic thinking/redacted_thinking
+ *  bytes are NEVER rewritten or deleted (#1658 doctrine). Returns undefined
+ *  for sessions where the kernel must not drop anything at all: strict-echo
+ *  upstreams (#684 — reasoning must round-trip with tool_calls) and views
+ *  holding ANY signed thinking block (presence-based gate, same posture as
+ *  planReasoningDrop), so a conservative misclassification can never break a
+ *  signed session. Pure + cheap; install per request. */
+export function makeFoldPointReasoningDroppable(
+    msgs: BiliMessage[],
+    strictEcho: boolean,
+): ((m: import("acp-kernel").CoreMessage) => boolean) | undefined {
+    if (strictEcho) return undefined;
+    if (msgs.some(hasSignedThinkingBlock)) return undefined;
+    return (m: import("acp-kernel").CoreMessage): boolean => {
+        const core = m as BiliMessage;
+        if (core.contentType === "reasoning") {
+            return !(typeof core.thinkingSignature === "string" && core.thinkingSignature.length > 0);
+        }
+        const raw = core.rawAnthropicBlock as { type?: unknown } | undefined;
+        return raw?.type !== "redacted_thinking";
+    };
 }
 
 /** [#651] Strip oversized reasoning from closed compress turns (see
@@ -3456,13 +3527,13 @@ export function outboundPayloadBreakdown(
     reqUrl: string,
 ): { textEstimate: number; overheadEstimate: number; imageTokens: number; payloadEstimate: number; armEstimate: number } {
     const billingUpstream = route?.rewrittenUrl ?? (/^https?:\/\//i.test(reqUrl) ? reqUrl : opts.upstream);
-    const imageTokens = imageReserveFor(prepared.session, prepared.protocol, prepared.body, opts, billingUpstream);
+    const imageTokens = imageReserveFor(prepared.session, prepared.protocol, prepared.parsedBody ?? prepared.body, opts, billingUpstream);
     // #1498-F2: a kernel-transform failure leaves processedMessages empty while
     // the outbound IS the raw client body — measure that view instead of arming
     // at wire overhead only (the mirror of localInputEstimate's fallback).
     const msgs = prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages;
     const textEstimate = estimateCoreMessages(msgs);
-    const overheadEstimate = estimateWireOverhead(prepared.protocol, prepared.body);
+    const overheadEstimate = estimateWireOverhead(prepared.protocol, (prepared.parsedBody as Record<string, unknown> | undefined) ?? prepared.body);
     // #1498-F1: the arm value is not only a preflight floor — the kernel's
     // tool-result truncation loop consumes it as its remaining-depth input, so
     // an optimistic text estimate (chars/4 undercounts dense JSON/code by up to
@@ -3603,6 +3674,31 @@ export function warnRouteMissIfNew(
     return true;
 }
 
+// #5612: complement to warnRouteMissIfNew — a providers key DID match but the
+// model id is absent from that route's per-model table (e.g. client renamed ids
+// /,.→-), so overrides silently drop. Once per upstream+model, hints the rename.
+const modelNameMissWarned = new Set<string>();
+
+export function _resetModelNameMissWarnedForTest(): void {
+    modelNameMissWarned.clear();
+}
+
+export function warnModelNameMissIfNew(
+    origin: string | undefined,
+    model: string | undefined,
+    declaredNames: string[],
+    log: (level: string, msg: string) => void,
+): boolean {
+    if (!origin || !model || declaredNames.length === 0) return false;
+    const key = `${origin}\u0000${model}`;
+    if (modelNameMissWarned.has(key)) return false;
+    modelNameMissWarned.add(key);
+    const shown = declaredNames.slice(0, 8).join(", ");
+    const more = declaredNames.length > 8 ? `, … (+${declaredNames.length - 8})` : "";
+    log("warn", `[route] providers key ${hostIdForLog(origin)} matched but model=${model} is not among its declared per-model entries [${shown}${more}] — its context/output/compress overrides are IGNORED. If the client renames model ids (/ . → -), declare that spelling too; otherwise add "${model}" under the providers key.`);
+    return true;
+}
+
 /** #736 / #2317: the preflight fail-fast "effective window below native" note. The
  *  operator and codex-route-hit texts are preserved byte-for-byte; the new
  *  codex-route-miss branch fires when the shrink is codex-driven AND the request's
@@ -3668,6 +3764,30 @@ export async function preflightCompressIfNeeded(
     const limit = completionReserve > 0 && statedWall > 0
         ? Math.max(0, Math.min(config.modelContextLimit, statedWall - completionReserve))
         : config.modelContextLimit;
+    // #5191: handle.ts already announced "nudge/preflight judge input against
+    // ${reserved}" ([headroom]) — but when THIS session's overflow arm proved the
+    // upstream bills the completion share against the same wall (#3450), the
+    // judgments below run on min(reserved, statedWall - completionReserve),
+    // which can sit BELOW the announced window. An incident log showing two
+    // windows with no explanation sent the #5191 reporter chasing config that
+    // was never read. State the wall that actually judges, once per
+    // session|model|arm-value|headroom-value (the [headroom] number itself
+    // moves — the #3450 provider-lifetime proof clamps it later, e.g.
+    // 1,086,000 → 894,000 — and each new announcement deserves its own arm
+    // note). Reference the #4205 reserved twin, NOT config.modelContextLimit:
+    // the post-400 recovery pass reaches this code with modelContextLimit
+    // already rewritten to the armed ceiling, which would mislabel the
+    // comparison number as the [headroom] window.
+    const headroomWindow = typeof session.metadata.reservedContextLimit === "number" && session.metadata.reservedContextLimit > 0
+        ? session.metadata.reservedContextLimit
+        : config.modelContextLimit;
+    if (limit < headroomWindow) {
+        const armKey = `${session.id}|${String(model ?? "?")}|${limit}|${headroomWindow}`;
+        if (!armJudgingWallLogged.has(armKey)) {
+            armJudgingWallLogged.add(armKey);
+            log("info", `[arm-judge] upstream overflow proof (stated wall ${statedWall}, ${completionReserve} billed to completion): nudge/preflight judge input against ${limit} — BELOW the [headroom] window ${headroomWindow}; that line does not apply while this arm is live (#3450, #5191)`);
+        }
+    }
     // #321: codex's local auto-compaction runs at ~90% of its OWN context window,
     // so bili's preflight must stay ahead of that bar to win the race — a 100%
     // trigger lets codex compact first and the ACP lane becomes a backstop.
@@ -4504,6 +4624,9 @@ export function logRequestCost(log: (level: string, msg: string) => void, sessio
     const outboundField = outbound !== undefined ? `, outbound=${formatBytes(Buffer.byteLength(outbound))}` : "";
     const view = currentFetchTransport() ? ", view=ws-expanded" : "";
     log("info", `[${sessionId}] request: ${msgs ?? "?"} msgs, inbound=${formatBytes(inboundBytes)}${outboundField}, local=${ms}ms${view}`);
+    // #5408: this line is THE observation point — a hot-at-attach session that
+    // never produces one is silent compression loss (the incident signature).
+    noteRequest(sessionId);
     if (msgs !== null && msgs > SLOW_SESSION_MSG_WARN) {
         log("warn", `[${sessionId}] slow-session: ${msgs} msgs / inbound=${formatBytes(inboundBytes)} took local=${ms}ms — per-turn O(messages) synchronous scans are starving the event loop (#4528); consider closing/restarting the session or enabling compression`);
     }

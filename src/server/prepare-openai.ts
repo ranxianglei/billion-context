@@ -8,16 +8,16 @@ import { effectivePromptCacheRouting } from "../config.js";
 import { currentCalibrationFactor, hardenOpenaiAssistantContent, systemToUser } from "../util.js";
 import { conversationHeaderSource, resolveRelayAffinityPck } from "../session-id.js";
 import { pluginAgentHeader } from "../plugin.js";
-import { applyReasoningDrop, diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, planReasoningDrop, reapOrphansLogged, resolveKnownOutputCeiling, runNudgeDecision, stripKernelSummaries, warnDroppedOpenaiParts, warnReasoningPairs, type Prepared } from "../server.js";
+import { applyReasoningDrop, diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, planReasoningDrop, makeFoldPointReasoningDroppable, reapOrphansLogged, resolveKnownOutputCeiling, runNudgeDecision, stripKernelSummaries, warnDroppedOpenaiParts, warnReasoningPairs, type Prepared } from "../server.js";
 import { yieldToEventLoop } from "../yield-loop.js";
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, resolveDecisionRange, stripDecisionReasoningFields, type DecideConfig } from "../nudge-decide.js";
 import { excludeDeadRefRanges } from "../acp-status.js";
 import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "../fold-reconcile.js";
 import { maybeSnapshotView } from "./snapshot-render.js";
-import { storedMessagesFor } from "../fold-decomposition-lookup.js";
+import { storedMessagesFor, storedRowLookupFor } from "../fold-decomposition-lookup.js";
 import { nudgeSuppressed } from "../session-self-heal.js";
 import { compressBreakerArmed } from "../stream.js";
-import { applyCompactionArchive, coveredRealHistoryIds, detectUnannouncedHistoryRewrite, foldCoverage, markCompactionBoundary, markDirty, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, REWRITE_MIN_INCOMING_TOTAL, snapshotMessages, type PendingRetrieval, type Session } from "../session.js";
+import { absorbAbortedTurnGrowth, applyCompactionArchive, coveredRealHistoryIds, detectUnannouncedHistoryRewrite, foldCoverage, markCompactionBoundary, markDirty, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, REWRITE_MIN_INCOMING_TOTAL, snapshotMessages, type PendingRetrieval, type Session } from "../session.js";
 import { carriesDshLocalCompactionSummary, DSH_LOCAL_COMPACTION_MIN_MISSING } from "./dsh-compaction-guard.js";
 import { carriesBiliSnapshotCheckpoint } from "./dsh-authored-compaction.js";
 import { ABSORB_TOOL_NAME, READ_ORIGINAL_IMAGE_TOOL_OPENAI, RULE_TOOL_OPENAI, absorbToolsFor, buildAbsorbSystemPrompt, buildAcpTagsOnlyPrompt, buildCompressSystemPrompt, retrieveToolsFor, withFirstSightDrain, withMarkerIntegrityNote, withMcpDialectNote, withSummaryBudgetNote, withProjectAttribution } from "../compress-tool.js";
@@ -32,13 +32,15 @@ import { estimateCoreMessages, estimateCoreMessagesUpper } from "../preflight.js
 import { dshNativeCompactionWitness, recordConflict } from "../conflict-watch.js";
 import { isStrictReasoningEcho, modelIdOf, normalizeStrictEchoReasoning } from "../strict-echo.js";
 import { reconcileSystemAnchor } from "../system-anchor.js";
-import { logRawStripCounts, markerArtifactCount, stripRawStage } from "../marker/engine.js";
+import { logRawStripCounts, markerArtifactCount, stripRawStage, type RawStripCounts } from "../marker/engine.js";
 import { imageRescaleMaxDim, renderNone as knobRenderNone } from "../knobs.js";
 import { applyImageRescalePass } from "../image-rescale.js";
 import { clampOutgoingOutput, countSystemAndToolsTokens, dshLedgerFloorTokens, emergencyNudge, emergencyNudgeArmed } from "./budget.js";
 import { effectiveAbsorbBlock } from "./prepare-responses.js";
 import { injectOpenaiTool, injectTool } from "./inject.js";
 import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
+import { featureEnabled } from "../rollout.js";
+import { evaluateWatermarkFastpath, finalizeWatermarkTurn, type FastpathHit, type FastpathOutcome } from "./fastpath.js";
 import { collectRequestIds, probeRequestMembership } from "../request-membership.js";
 
 export async function prepareOpenai(
@@ -58,10 +60,13 @@ export async function prepareOpenai(
     visibilityMarkers: boolean,
     billingUpstream?: string,
     decide?: DecideConfig,
+    bodyText?: string,
 ): Promise<Prepared> {
     const sessionId = session.id;
     const stream = parsed.stream === true;
-    const inboundMessageCount = Array.isArray(parsed.messages) ? parsed.messages.length : 1;
+    // Real wire element count; a watermark hit overrides it with the measured
+    // total T (see the #5403/#5418 block below).
+    let inboundMessageCount = Array.isArray(parsed.messages) ? parsed.messages.length : 1;
     ++session.stats.requests;
     let openaiSystemText = "";
     let sysNotes: string[] = [];
@@ -104,7 +109,40 @@ export async function prepareOpenai(
     // overrides the dsh default — #3401); alias kept for the remaining reads.
     const laneDecisions = resolveLaneDecisions({ protocol: "openai", pluginMode, pluginAgent: typeof session.metadata["pluginAgent"] === "string" ? session.metadata["pluginAgent"] as string : undefined, parsed, shouldInject, pluginHeaderPresent: pluginAgentHeader(req.headers) !== undefined });
 
-    const markerCounts = stripRawStage(parsed, "openai");
+    // #5403/#5418 watermark fastpath (rollout-gated; plugin lane only): a
+    // verified hit ASSERTS the re-sent prefix is unchanged, so this turn skips
+    // the full-body re-strip/re-convert below — the prefix view comes from the
+    // seed stash minted on identical bytes last turn (#3642 deterministic ids),
+    // while head + tail fragments and scalar fields are decoded from raw
+    // slices. Every miss falls through to the legacy path byte-identically.
+    let wpHit: FastpathHit | undefined;
+    let wpOutcome: FastpathOutcome | null = null;
+    let wpFullText: string | undefined;
+    const wpModel = typeof parsed.model === "string" ? parsed.model : "";
+    if (bodyText !== undefined && pluginMode && !isTitleGen && featureEnabled("pluginFullResendWatermark")) {
+        wpFullText = bodyText;
+        wpOutcome = evaluateWatermarkFastpath(bodyText, req, session, { pluginMode, titleGen: isTitleGen, model: wpModel }, log);
+        log("debug", `[${session.id}] fastpath ${wpOutcome.hit ? "HIT" : wpOutcome.decision}${wpOutcome.creditedMiss ? "(credited)" : ""}${wpOutcome.measuredT !== undefined ? ` T=${wpOutcome.measuredT}` : ""}`);
+        if (wpOutcome.hit) {
+            wpHit = wpOutcome.hit;
+            const fields: Record<string, unknown> = {};
+            for (const [key, span] of wpHit.fieldSpans) {
+                // "messages" keeps its WIRE POSITION (the scanner records it
+                // position-only); every other field is re-parsed from its own
+                // span so no bytes of the prefix are ever decoded.
+                if (key === "messages") fields[key] = wpHit.windowMessages;
+                else fields[key] = JSON.parse(bodyText.slice(span.start, span.end));
+            }
+            parsed = fields as OpenAIRequestBody;
+            inboundMessageCount = wpHit.totalT;
+        }
+    }
+    // Full-body text for the whole-wire image accounting (window-only bodies
+    // would under-count pre-existing images).
+    const reserveBody: OpenAIRequestBody | string = wpHit !== undefined && wpFullText !== undefined ? wpFullText : parsed;
+    let wpSeedSystemText = "";
+    let wpTurnStrip: RawStripCounts | undefined;
+    const markerCounts = wpHit !== undefined ? wpHit.markerCounts : stripRawStage(parsed, "openai");
     logRawStripCounts(markerCounts, log, sessionId);
 
     try {
@@ -112,8 +150,11 @@ export async function prepareOpenai(
         // OUT of the fold space: system content is host runtime state and
         // must not feed ids/fingerprints. Capture it and re-inject below —
         // otherwise the proxy would forward payloads without any system.
-        const { msgs, systemText } = openaiToCore(parsed);
+        const converted = wpHit !== undefined ? { msgs: wpHit.view, systemText: wpHit.systemText } : openaiToCore(parsed);
+        const { msgs, systemText } = converted;
         openaiSystemText = systemText;
+        wpSeedSystemText = systemText;
+        wpTurnStrip = markerCounts;
         warnDroppedOpenaiParts(parsed, sessionId, log);
         // Title-gen side-requests carry their own tiny system — reconciling
         // them would pollute the conversation's anchor state.
@@ -139,7 +180,7 @@ export async function prepareOpenai(
         // tokenCount = upstream's real input_tokens from the previous turn
         // tokenCount = upstream's real input_tokens from the previous turn
         // (see anthropic branch comment + its #553-follow-up exception).
-        const { tokens: tokenCount, source: tokenCountSource } = effectiveTokenCount(session, renderMsgs, imageReserveFor(session, "openai", parsed, opts, billingUpstream ?? upstreamOrigin));
+        const { tokens: tokenCount, source: tokenCountSource } = effectiveTokenCount(session, renderMsgs, imageReserveFor(session, "openai", reserveBody, opts, billingUpstream ?? upstreamOrigin));
 
         const activeBefore = new Set(session.state.blocks.filter((b) => b.active).map((b) => b.blockId));
         // Absorb markers ride in the kernel's processTurn output (gated by
@@ -150,6 +191,10 @@ export async function prepareOpenai(
         const absorbActive = absorbBlock?.enabled === true && shouldInject;
         const rulesActive = rulesEnabled(config) && shouldInject;
         const loopConfig = ccrLoopConfig(session, { ...config, absorb: absorbActive ? absorbBlock : undefined });
+        // Experimental fold-point "thinking clear" (default OFF): install the kernel drop predicate only when BOTH switches are set; strict-echo (#684) and signed-thinking views yield none at all (#1658).
+        if (loopConfig.compressAtFoldPointClearThinking) {
+            loopConfig.reasoningDroppable = makeFoldPointReasoningDroppable(renderMsgs, isStrictReasoningEcho(session, upstreamOrigin, modelIdOf(parsed)));
+        }
         // #2432: dsh desktop's native compaction can LAND without ever
         // transiting bili — its summarizer calls ctx.llm.stream() directly,
         // and manual /compact / idle-session paths have no ALS attribution so
@@ -197,7 +242,7 @@ export async function prepareOpenai(
         // #3301: stored decompositions for pre-#2644 anchors whose wire-side
         // backfill can never fire after a wire-shape flip.
         const foldMode = resolveFoldReconcileMode(process.env, opts.compress.reconcile);
-        const reconcileOutcome = reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStripped: markerArtifactCount(markerCounts), inboundMessageCount, storedMessages: foldMode === "off" ? undefined : storedMessagesFor(session, sessionId, msgs) });
+        const reconcileOutcome = reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStripped: markerArtifactCount(markerCounts), inboundMessageCount, storedMessages: foldMode === "off" ? undefined : storedMessagesFor(session, sessionId, msgs), storedRowLookup: foldMode === "off" ? undefined : storedRowLookupFor(sessionId) });
         if (!isTitleGen) noteSystemPromptFingerprint(session, systemText, { sessionId, log });
         // #1195: pre-turn snapshot of the fold's covered ids — syncBlocks inside
         // processTurn may deactivate fully-drifted blocks, erasing them.
@@ -212,6 +257,8 @@ export async function prepareOpenai(
         // resent history; yield before it so UI/API requests that queued during
         // this turn are served, not frozen behind the whole turn.
         await yieldToEventLoop();
+        // #5293: re-anchor the nudge growth reference after a user-aborted turn (no-op otherwise).
+        absorbAbortedTurnGrowth(session, tokenCount);
         const turn = core.processTurn({ messages: renderMsgs, state: session.state, config: loopConfig, tokenCount, renderTags: renderStrategy, contentStore: contentStoreOf(session) });
         session.state = turn.state;
         adoptContentStore(session, turn.contentStore);
@@ -501,14 +548,16 @@ export async function prepareOpenai(
     // Title-gen side requests are skipped like the overhead row above — their
     // tiny payload would clobber the conversation's measurement.
     if (!isTitleGen) {
+        // One tree walk shared by both calibers (see the anthropic lane).
+        const imageReserve = imageReserveFor(session, "openai", rebuilt, opts, billingUpstream ?? upstreamOrigin);
         session.stats.localInputEstimate = estimateCoreMessagesUpper(processedMessages.length > 0 ? processedMessages : originalMessages)
             + countSystemAndToolsTokens(openaiOutboundSystem || openaiSystemText, toolsOut)
-            + imageReserveFor(session, "openai", rebuilt, opts, billingUpstream ?? upstreamOrigin);
+            + imageReserve;
         // #1933 F1: billed-caliber twin (chars/4) for the k̂ learning pair —
         // see the anthropic-lane counterpart above.
         session.stats.lastLocalTextEstimate = estimateCoreMessages(processedMessages.length > 0 ? processedMessages : originalMessages)
             + countSystemAndToolsTokens(openaiOutboundSystem || openaiSystemText, toolsOut)
-            + imageReserveFor(session, "openai", rebuilt, opts, billingUpstream ?? upstreamOrigin);
+            + imageReserve;
         const openaiPairOrigin = billingUpstream ?? upstreamOrigin;
         if (openaiPairOrigin) session.stats.lastLocalTextEstimateOrigin = openaiPairOrigin;
         // #4805: id-membership evidence for the settle gate (see the
@@ -516,9 +565,22 @@ export async function prepareOpenai(
         // evidence is the tool-call ids resent in the history.
         probeRequestMembership(session, collectRequestIds(undefined, processedMessages.length > 0 ? processedMessages : originalMessages), session.stats.localInputEstimate ?? 0);
     }
-    snapshotMessages(session, originalMessages);
+    // #5403/#5418: on a watermark hit pin only this turn's window — the
+    // stashed prefix lives OUTSIDE the Session by design; the fold machinery
+    // applies to the pin exactly as it already does for folded sessions.
+    snapshotMessages(session, wpHit !== undefined ? wpHit.windowCores : originalMessages);
     markDirty(session);
-    return { body: JSON.stringify(rebuilt), session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, judgeBaseline, protocol: "openai", stream, compressInjected: injectTools, pluginMode, mcpDialectNote: laneDecisions.mcpDialect, nudge, nudgeOutcome, prompts, surface, openaiSystemText, systemNotes: sysNotes, renderTags: renderStrategy, dropReasoning: (msgs: BiliMessage[]) => applyReasoningDrop(msgs, reasoningPlan, log, sessionId) } as Prepared;
+    let wpResponseHeaders: Record<string, string> | undefined;
+    if (wpFullText !== undefined && wpOutcome !== null && wpTurnStrip !== undefined) {
+        wpResponseHeaders = finalizeWatermarkTurn(session, wpOutcome, {
+            model: wpModel,
+            legacyCores: originalMessages,
+            rawSystemText: wpHit !== undefined ? wpHit.systemText : wpSeedSystemText,
+            turnStripCounts: wpTurnStrip,
+        });
+        if (Object.keys(wpResponseHeaders).length === 0) wpResponseHeaders = undefined;
+    }
+    return { body: JSON.stringify(rebuilt), parsedBody: rebuilt, session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, judgeBaseline, protocol: "openai", stream, compressInjected: injectTools, pluginMode, mcpDialectNote: laneDecisions.mcpDialect, nudge, nudgeOutcome, prompts, surface, openaiSystemText, systemNotes: sysNotes, renderTags: renderStrategy, responseExtraHeaders: wpResponseHeaders, dropReasoning: (msgs: BiliMessage[]) => applyReasoningDrop(msgs, reasoningPlan, log, sessionId) } as Prepared;
 }
 
 /** Append the ephemeral nudge to a Gemini `contents` array. Gemini is

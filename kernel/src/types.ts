@@ -133,6 +133,20 @@ export interface NudgeState {
    *  tiers. Using a record (not N named fields) so adding tier 4+ needs no
    *  schema change. */
   lastShownByTier: Record<number, number>;
+  /** #5415: growth debt + absorb count booked by the host's #5293
+   *  abort-absorb. absorbAbortedTurnGrowth() re-anchors the reference to
+   *  the current meter, which skips not just the aborted turn's unreported
+   *  partial (intended, #5293) but also the MEASURED growth from the old
+   *  reference up to the pre-abort anchor. That skipped-but-real growth is
+   *  banked here; absorbCount tracks how many absorbs happened. Debt pays
+   *  into the growth floor (and unlocks the backlog-drain guard) only once
+   *  absorbCount >= 2 — a SINGLE abort stays exactly as quiet as #5293
+   *  pinned (no nudge on the user's redirect), while abort-heavy clients
+   *  (85 absorbs in one reported 4.5h log) recover the 209-era cadence
+   *  instead of starving with a huge ready mass idle for hours. Both reset
+   *  by applyCompression alongside the other baselines. */
+  absorbedDebt?: number;
+  absorbCount?: number;
 }
 
 export interface CompressionStats {
@@ -541,6 +555,27 @@ export interface Config {
   rules?: RulesConfig;
   /** Deterministic tool-result compression, tier 1 of the absorb gate (see crush.ts). Requires absorb enabled. */
   crush?: CrushConfig;
+  /** EXPERIMENTAL (default off): relocate still-visible compress carrier pairs
+   *  from their original tail-adjacent position to their own fold point —
+   *  "[folded/summary region] – [compress pair] – [protected messages]".
+   *  View-only + deterministic (see relocate-compress.ts): nothing is persisted,
+   *  refs are untouched, so the layout recomputes identically every turn. OFF
+   *  = byte-identical to before (the node fast-paths to the same array ref).
+   *  The round-2 re-render and the S4 plugin render mirror this transform host-side
+   *  with the same pure function so all lanes agree. */
+  compressAtFoldPoint?: boolean;
+  /** Second opt-in riding on compressAtFoldPoint: drop the contiguous `reasoning`
+   *  core run immediately preceding a moved pair — ONLY cores accepted by
+   *  reasoningDroppable. Default off; both flags must be set to drop anything. */
+  compressAtFoldPointClearThinking?: boolean;
+  /** Host predicate for the above drop: signed-thinking blocks and strict-echo
+   *  sessions must answer false (wire signatures live host-side, #1658/#684
+   *  doctrine). UNSET ⇒ no reasoning core is ever dropped, even with
+   *  compressAtFoldPointClearThinking set (conservative default). Must be pure
+   *  and cheap: runs once per candidate per pass. NOTE: function fields are not
+   *  carried into session effectiveConfig stamps (#2584) — wire paths re-resolve
+   *  it per request; panel/tool reads see it absent by design. */
+  reasoningDroppable?: (msg: CoreMessage) => boolean;
   /** Lossless content-cached retrieval for oversized tool results (see ccr.ts). Absent/disabled = feature off. */
   ccr?: CcrConfig;
   messageFilters?: import("./filter/types.js").MessageFiltersConfig;

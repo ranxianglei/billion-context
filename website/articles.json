@@ -1,0 +1,19 @@
+{
+  "articles": [
+    {
+      "file": "website/blog/posts/2026-10-08_meet-bili.md",
+      "zh_file": "website/blog/posts/2026-10-08_meet-bili.zh.md",
+      "slug": "meet-bili"
+    },
+    {
+      "file": "website/blog/posts/2026-11-01_frequent-compression.md",
+      "zh_file": "website/blog/posts/2026-11-01_frequent-compression.zh.md",
+      "slug": "frequent-compression"
+    },
+    {
+      "file": "website/blog/posts/2026-11-02_compress-at-fold-point.md",
+      "zh_file": "website/blog/posts/2026-11-02_compress-at-fold-point.zh.md",
+      "slug": "compress-at-fold-point"
+    }
+  ]
+}

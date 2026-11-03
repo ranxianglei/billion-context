@@ -67,7 +67,7 @@ function executeAnthropicProxyTool(toolName: string, args: Record<string, unknow
         return handleAcpStatus(args, ctx);
     }
     if (toolName === "acp_cache") {
-        return handleAcpCache(ctx.session);
+        return handleAcpCache(ctx.session, args);
     }
     const absorb = effectiveAbsorbConfig(ctx.session, ctx.config);
     if (absorb?.enabled === true && toolName === (absorb.toolName ?? ABSORB_TOOL_NAME)) {
@@ -841,7 +841,11 @@ export function visibleSummaryStubs(messages: CoreMessage[], state: CompressionS
         if (m.contentType !== "tool-call" || m.toolName !== COMPRESS_TOOL_NAME || typeof m.text !== "string") continue;
         let parsed: ReturnType<typeof parseCompressInput>;
         try {
-            parsed = parseCompressInput(m.text);
+            // #5161: quiet — this scan re-parses past calls on every fold; in
+            // external-summary mode their summary-less entries are schema-legal,
+            // so per-call rejection warns were pure false noise (the scan only
+            // needs the summaries that DO parse).
+            parsed = parseCompressInput(m.text, undefined, { quiet: true });
         } catch {
             continue;
         }
@@ -892,12 +896,14 @@ export function findVisibleStubResubmissions(ctx: RewriteCtx, ranges: ParsedRang
  *  Refusal only when an endpoint is a superseded key whose translation
  *  dead-ends (the message lost its mapping entirely — an honest stale cite).
  *
- *  Transitional honesty: for sessions restamped by kernels WITHOUT the
- *  superseded-liveness prune, case 1 can in principle swallow a resent
- *  pre-restart call's intent (number now owned by someone else). The replay
- *  window is seconds; the deadlock it replaces is permanent — live-first is
- *  the right trade, and the kernel prune removes the ambiguity entirely for
- *  fresh restamps. */
+ *  Transitional honesty: sessions whose restamp predates kernel #5196's
+ *  slot-retirement may still carry an ambiguity — a number restamped over a
+ *  live occupant, so case 1 can in principle swallow a resent pre-restart
+ *  call's intent. #4807 (#4797) traded that seconds-long replay window
+ *  against a permanent deadlock; live-first keeps that trade. Kernels from
+ *  #5196 onward retire every seat a mover vacates into its own seq+1, so no
+ *  freshly stamped number ever names two messages and case 1 can never
+ *  mis-engage on such data. */
 interface SupersededResolution<T extends { startRef: string; endRef: string } = { startRef: string; endRef: string; summary: string }> {
     rejection: string | null;
     translatedRanges: T[];
@@ -1000,15 +1006,23 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
             return compressResult(armedRefusalReceipt(armedDetail.n, armedDetail.decayMinutes), "refused", 0, `parse:${diagnostics.kind}`);
         }
         if (isEmptyCall) {
-            return compressResult(`[Compression FAILED: the call carried no content at all (kind=${diagnostics.kind}) — an empty compress() compresses nothing and can never succeed. Do NOT re-issue an empty call; if you meant to compress, put the non-empty 'content' array (elements {startId, endId, summary}) in that SAME single call.${guard}${loopGuard}]`, "refused", 0, `parse:${diagnostics.kind}`);
+            return compressResult(`[Compression FAILED: the call carried no content at all (kind=${diagnostics.kind}) — an empty compress() compresses nothing and can never succeed. Do NOT re-issue an empty call; if you meant to compress, put content as ONE non-empty string in that SAME single call — each block headed by a 'mNNNNN–mNNNNN optional topic' line followed by its summary markdown (a JSON-encoded array of {startId, endId, summary} objects is also accepted INSIDE that same string).${guard}${loopGuard}]`, "refused", 0, `parse:${diagnostics.kind}`);
         }
         if (argCorruption) {
             const truncNote = diagnostics.kind === "truncated" ? " (looks truncated)" : "";
-            return compressResult(`[Compression FAILED: the call's arguments (${argLen} chars) were not parseable JSON${truncNote} — the intended content was lost and nothing was compressed. Re-issue the compress call as well-formed JSON: a single object with a non-empty 'content' array of {startId, endId, summary} elements.${guard}${loopGuard}]`, "refused", 0, `parse:${diagnostics.kind}`);
+            return compressResult(`[Compression FAILED: the call's arguments (${argLen} chars) were not parseable JSON${truncNote} — the intended content was lost and nothing was compressed. Re-issue ONE compress call whose arguments parse as a single object with a STRING 'content' field: {"content": "<each block headed 'mNNNNN–mNNNNN optional topic', its summary on the following lines>"}. Never send 'content' as an actual JSON array or nested object — it is one plain string.${guard}${loopGuard}]`, "refused", 0, `parse:${diagnostics.kind}`);
         }
         const recovery = loopGuard === "" ? compressionRecovery(ctx) : { hint: "", canRetry: false };
-        const retry = recovery.canRetry ? " Re-issue the compress call with a valid content array using those eligible refs." : "";
-        return compressResult(`[Compression FAILED: no valid ranges parsed (kind=${diagnostics.kind}, dropped=${diagnostics.invalidItems}).${why} compress requires a non-empty 'content' array where each element is EITHER an object {startId, endId, summary} OR one line-form string whose first line is 'mNNNNN–mNNNNN optional topic' with the summary markdown on the following lines (a separate summary-only element right after a bare header line is also accepted). startId/endId are mNNNNN message refs from the conversation (call acp_status to see current refs).${recovery.hint}${retry}${guard}${loopGuard}]`, "refused", 0, `parse:${diagnostics.kind}`);
+        const retry = recovery.canRetry ? " Re-issue the compress call using those eligible refs." : "";
+        // #4252 hole-closure receipt: the shape that most often lands here is a
+        // range OBJECT encoded INSIDE the content string (the parameter's own
+        // description invites a JSON string; after #4252 removed the legal
+        // array, models encode the old object as a string). Point the retry at
+        // the exact repair instead of a generic re-parse.
+        const notArrayHint = diagnostics.kind === "content-not-array"
+            ? " If your 'content' string encoded a single JSON object, wrap it in square brackets so it encodes an ARRAY of entries (\"[...]\"), or use the line-form headers below."
+            : "";
+        return compressResult(`[Compression FAILED: no valid ranges parsed (kind=${diagnostics.kind}, dropped=${diagnostics.invalidItems}).${why}${notArrayHint} compress takes ONE 'content' STRING holding every range: each block starts with its header line 'mNNNNN–mNNNNN optional topic' followed by that block's summary markdown; a JSON-encoded array of {startId, endId, summary} objects is also accepted INSIDE that same string. startId/endId are mNNNNN message refs from the conversation (call acp_status to see current refs).${recovery.hint}${retry}${guard}${loopGuard}]`, "refused", 0, `parse:${diagnostics.kind}`);
     }
     // #847: detect reversed refs as SUBMITTED, before #1001 normalization
     // rewrites them (order matters — normalizeRangeOrder mutates in place).

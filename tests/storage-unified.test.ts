@@ -875,7 +875,7 @@ test("#4313: ingest stamps ts from CoreMessage.ts; re-ingest never overwrites it
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-unified-v10b-"));
     const store = UnifiedStore.open(path.join(dir, "index.db"));
     try {
-        const stub = (id: string, msgs: CoreMessage[]): LegacySessionLike => ({
+        const stub = (id: string, msgs: (CoreMessage & { ts?: number })[]): LegacySessionLike => ({
             id,
             createdAt: 1700000000000,
             lastSeen: 1700000001000,
@@ -912,7 +912,7 @@ test("#4313: fork clone copies ts verbatim (inherited ledger rows keep their sta
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-unified-v10c-"));
     const store = UnifiedStore.open(path.join(dir, "index.db"));
     try {
-        const stub = (id: string, msgs: CoreMessage[]): LegacySessionLike => ({
+        const stub = (id: string, msgs: (CoreMessage & { ts?: number })[]): LegacySessionLike => ({
             id,
             createdAt: 1700000000000,
             lastSeen: 1700000001000,

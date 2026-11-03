@@ -281,6 +281,41 @@ export async function findVerifiedSameLaneTwin(
     return undefined;
 }
 
+/** #4977: the recovery-window complement to findVerifiedSameLaneTwin. A registry
+ *  twin whose health probe is SILENT while its socket still accepts connections
+ *  is present but unserviceable — dying or event-loop-wedged (#3654 three-state
+ *  liveness), NOT a healthy peer. The verified path correctly refuses to adopt
+ *  such an occupant; pre-#4977 the child then proceeded into persistence
+ *  initialization, opening index.db under the zombie before its own listen
+ *  failed EADDRINUSE — a real two-writer window on one store (#3923/#3959) plus
+ *  a misleading "another process is already writing" report, all on a round
+ *  that ends in the twin-collision exit anyway (the late EADDRINUSE policy
+ *  classifies the same registry evidence and fail-fasts). Positive-evidence-only
+ *  discipline (#4341): the socket check runs FIRST and is decisive in the
+ *  negative — no live listener means nothing to adjudicate (stale marker over a
+ *  free or foreign port), so we fall through and let the bind proceed; a health
+ *  probe that ANSWERS also falls through — matches belong to the verified path,
+ *  mismatches must not be refused here. */
+export async function findPresentUnverifiedSameLaneTwin(
+    entries: RegistryEntry[],
+    port: number,
+    lane: string | undefined,
+    ownFingerprint: string | undefined,
+    sameShape: (e: RegistryEntry) => boolean,
+    healthOf: (origin: string) => Promise<{ pid?: number; instanceId?: string } | undefined>,
+    socketAlive: (origin: string) => Promise<boolean>,
+): Promise<RegistryEntry | undefined> {
+    for (const entry of entries) {
+        const peer = classifySameLanePeer([entry], port, lane, ownFingerprint, sameShape);
+        if (peer?.kind !== "twin") continue;
+        if (!(await socketAlive(entry.origin))) continue;
+        const health = await healthOf(entry.origin);
+        if (health !== undefined) continue;
+        return entry;
+    }
+    return undefined;
+}
+
 /** #1225: content identity of a bili entry script (sha256 of its bytes).
  *  The spawned child records this for ITS script; an attaching launcher
  *  compares it against the hash of the script it would spawn — so "same

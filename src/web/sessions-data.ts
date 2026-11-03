@@ -7,7 +7,7 @@ import { flatFileNameFor } from "acp-kernel/persist";
 import type { WebSummaryRow } from "../storage/store.js";
 import { renderHandoff } from "../export.js";
 import { buildSessionCacheReport } from "../cache-ledger.js";
-import { resolveBillingPrice, savedUsdFromFolds } from "../billing.js";
+import { resolveBillingPrice, savedUsdFromFolds, validCostUsd } from "../billing.js";
 
 /** Shape of a resolved price row — taken via ReturnType so this module never
  *  couples to billing.ts's internal export surface (see #4916 unused-export
@@ -631,18 +631,6 @@ function num(v: unknown, fallback = 0): number {
 
 function str(v: unknown): string | undefined {
     return typeof v === "string" && v.length > 0 ? v : undefined;
-}
-
-/** #4899: validate the persisted USD ledger blob — metadata/stats are
- *  user-editable JSON, so only finite non-negative fields survive; anything
- *  else reads as "no ledger" instead of poisoning the display. */
-function validCostUsd(v: unknown): { input: number; cacheRead: number; cacheWrite: number; output: number } | undefined {
-    if (!v || typeof v !== "object" || Array.isArray(v)) return undefined;
-    const o = v as Record<string, unknown>;
-    const f = (x: unknown): number | undefined => (typeof x === "number" && Number.isFinite(x) && x >= 0 ? x : undefined);
-    const input = f(o.input), cacheRead = f(o.cacheRead), cacheWrite = f(o.cacheWrite), output = f(o.output);
-    if (input === undefined && cacheRead === undefined && cacheWrite === undefined && output === undefined) return undefined;
-    return { input: input ?? 0, cacheRead: cacheRead ?? 0, cacheWrite: cacheWrite ?? 0, output: output ?? 0 };
 }
 
 /** #4899 v2 (owner design): the dollar faces of the panel are a DERIVED VIEW.

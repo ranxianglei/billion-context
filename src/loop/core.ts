@@ -12,7 +12,7 @@ import { STATUS_REPORT_CLOSE, STATUS_REPORT_OPEN } from "../acp-panel.js";
 import { credentialFingerprint, generationParamFp, handleAcpCache, lastForwardedBody, noteForwardedBody, noteForwardedImageFacts, settleUsageReport } from "../cache-ledger.js";
 import { billOutputUsage } from "../billing.js";
 import { maybeJudgeContinuity } from "../invariant-judge.js";
-import { countImagesInRawBody } from "../image-tokens.js";
+import { countImagesInParsedBody, countImagesInRawBody } from "../image-tokens.js";
 import { diagnoseSuccessWithoutUsage, lastCompressSuffix, withSessionLock, type Session } from "../session.js";
 import type { BiliMessage } from "acp-kernel/wire";
 import { coreToAnthropic } from "acp-kernel/wire";
@@ -47,7 +47,7 @@ import { log as loggerLog } from "../logger.js";
 import { promptInputTotal, type WireProtocol } from "../util.js";
 import { DEGENERATE_RETRY_NUDGE } from "../degenerate-retry.js";
 import { endsWithDraftClose, lastUserSummaryInstruction, requestExpectsProseSummary } from "../degenerate-turn.js";
-import { safePrefix, safeSuffix, scrubLoneSurrogatesOnWire } from "../text-safe.js";
+import { safePrefix, safeSuffix, scrubLoneSurrogateEscapesOnJson } from "../text-safe.js";
 
 export const MAX_LOOP_ROUNDS = 10;
 
@@ -173,6 +173,14 @@ function bodyHasSignedThinking(body: Record<string, unknown>): boolean {
 // history, which is what recovers the session.
 function isThinkingModifiedError(e: unknown): boolean {
     return e instanceof UpstreamHttpError && /cannot be modified/i.test(e.body);
+}
+
+// #5495: a "must be passed back" 400 (DeepSeek — reasoning_content on the chat
+// wire, content[].thinking on its Anthropic-wire endpoint) means thinking is
+// MANDATORY on this upstream. Stripping the replayed thinking and retrying
+// guarantees a second 400 plus a swapped error; propagate the original instead.
+function isReasoningRequiredError(e: unknown): boolean {
+    return e instanceof UpstreamHttpError && /must be passed back/i.test(e.body);
 }
 
 // #1453 client-facing labels for transport failures that end the turn in-band.
@@ -507,13 +515,17 @@ export async function* runCompressLoop(
         // 400). Scrub once at the single loop send chokepoint; the same string
         // then feeds resign and forensics so all three views agree (this also
         // de-duplicates the previous double JSON.stringify of the same body).
-        let wireBodyStr = scrubLoneSurrogatesOnWire(JSON.stringify(wireObj));
+        // The stringify output cannot carry a real lone-half code unit
+        // (well-formed JSON.stringify escapes each half), so the escape-only
+        // JSON variant skips the dead character-level scan.
+        let wireBodyStr = scrubLoneSurrogateEscapesOnJson(JSON.stringify(wireObj));
+        let wireShedRewrote = false;
         // #3701/#3909: internal re-requests ride the same transport as the outer turn
         // (AsyncLocalStorage) — WS or plain HTTP relay — so an oversized rebuild dies the
         // same way; run the same lane-keyed soft byte budget here, before resign/forensics,
         // so both see the bytes actually transmitted.
         if (ctx.protocol) {
-            wireBodyStr = scrubLoneSurrogatesOnWire((await shedEgressIfOverBudget(wireBodyStr, ctx.protocol, {
+            const shedBody = (await shedEgressIfOverBudget(wireBodyStr, ctx.protocol, {
                 sessionId: ctx.session.id,
                 session: ctx.session,
                 // Single sink: ctx.log routes into the same tee logger
@@ -521,7 +533,14 @@ export async function* runCompressLoop(
                 // write each line twice (#3701 review Finding 2).
                 log: (level, msg) => loggerLog(level, `[acp-loop] ${msg}`),
                 phase: "loop",
-            })).body);
+            })).body;
+            // The budget rewrites only an over-limit body; an unchanged body
+            // is already scrubbed and the scrub is idempotent, so re-scrub
+            // (another full-text scan) only when the bytes actually changed.
+            if (shedBody !== wireBodyStr) {
+                wireShedRewrote = true;
+                wireBodyStr = scrubLoneSurrogateEscapesOnJson(shedBody);
+            }
         }
         requestOptions.resign?.(requestOptions.headers, wireBodyStr);
         // #2131 follow-up: the message array lives under `messages` (chat),
@@ -543,7 +562,14 @@ export async function* runCompressLoop(
         // text side must mirror what outboundPayloadBreakdown bills (messages +
         // wire overhead) so observed image mass = billed total - textSide.
         if (ctx.imageLearn && ctx.protocol) {
-            const nImages = countImagesInRawBody(ctx.protocol, wireBodyStr);
+            // Count from the exact object serialized into wireBodyStr instead
+            // of re-probing and re-parsing the string form — unless a budget
+            // shed rewrote the bytes since that serialization, in which case
+            // the pre-shed object overcounts the images actually sent (rare
+            // path: sheds fire only above the lane byte budget).
+            const nImages = wireShedRewrote
+                ? countImagesInRawBody(ctx.protocol, wireBodyStr)
+                : countImagesInParsedBody(ctx.protocol, wireObj);
             if (nImages > 0) {
                 noteForwardedImageFacts(ctx.session, {
                     nImages,
@@ -1288,17 +1314,23 @@ export async function* runCompressLoop(
             // never in coreMessages), and hideConsumedCompressCalls runs each
             // round so consumed compress records cannot re-prime the model.
             if (proxyResults.length > 0) {
-                // #539: only wires that VERIFY thinking+signature pairs need a
-                // signature to replay a thinking block — Anthropic and Gemini 3
-                // (its thoughtSignature is rejected when dropped, same fatality).
-                // OpenAI/DeepSeek and Responses echo reasoning_content back
-                // verbatim and emit no signature — gating on one dropped every
+                // #539/#5495: whether a thinking block NEEDS a signature to be
+                // replayed is upstream evidence, not protocol. Real Claude signs
+                // every round and Gemini 3 rejects a dropped thoughtSignature
+                // (same fatality); but an Anthropic-wire relay that does NOT
+                // sign (DeepSeek's /anthropic endpoint) requires the UNSIGNED
+                // block passed back — gating on protocol alone dropped every
                 // such round's reasoning from the re-request, leaving the
-                // proxy-tool assistant message without reasoning_content
-                // (DeepSeek 400 invalid_request_error: "reasoning_content ...
-                // must be passed back"). Relies on the invariant that the single
+                // tool_use assistant message without its thinking sibling
+                // (400 invalid_request_error: "content[].thinking ... must be
+                // passed back"). Gating on the protocol alone was #539's fix for
+                // the mirror image (OpenAI/DeepSeek chat + Responses echo
+                // reasoning_content verbatim and emit no signature). Require a
+                // signature only when THIS attempt actually saw one; otherwise
+                // replay verbatim. Relies on the invariant that the single
                 // production call site (server.ts) always populates ctx.protocol.
-                const requiresThinkingSignature = ctx.protocol === "anthropic" || ctx.protocol === "google";
+                const requiresThinkingSignature =
+                    (ctx.protocol === "anthropic" || ctx.protocol === "google") && sawSignedThinkingThisAttempt;
                 let reasoningIdx = 0;
                 let textIdx = 0;
                 let redactedIdx = 0;
@@ -1623,13 +1655,16 @@ export async function* runCompressLoop(
                     // On OpenAI/DeepSeek thinking mode reasoning_content is
                     // MANDATORY, so a strip-retry there guarantees another 400 plus
                     // a misleading log — gate the degraded retry to the wires that
-                    // verify signatures.
+                    // verify signatures. #5495: same fatality on an Anthropic-wire
+                    // upstream that makes thinking mandatory WITHOUT signing it —
+                    // a "must be passed back" 400 must propagate, not strip-retry.
                     if (
                         !(e instanceof UpstreamHttpError) ||
                         e.status < 400 ||
                         e.status >= 500 ||
                         degradedRetried ||
                         isThinkingModifiedError(e) ||
+                        isReasoningRequiredError(e) ||
                         (ctx.protocol !== "anthropic" && ctx.protocol !== "google") ||
                         !coreMessages.some(isLoopThinking)
                     ) {
@@ -1682,9 +1717,10 @@ export async function* runCompressLoop(
                 // again (kernel gate prevents the split; this closes the loop).
                 // #2169: match BOTH field spellings — the chat wire says
                 // reasoning_content, DeepSeek's Responses wire says reasoning_text.
+                // #5495: DeepSeek's Anthropic-wire endpoint spells it content[].thinking.
                 if (
                     e.status === 400 &&
-                    /reasoning_(?:content|text)/i.test(e.body) &&
+                    /reasoning_(?:content|text)|content\[\]\.thinking/i.test(e.body) &&
                     ctx.session.metadata.strictReasoningEcho !== true
                 ) {
                     ctx.session.metadata.strictReasoningEcho = true;

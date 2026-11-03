@@ -88,6 +88,11 @@ const WAIVERS = new Map([
     // structurally via Awaited<ReturnType<typeof getLastInstall>>); keep the
     // export so the wire shape stays named at its definition site.
     ["src/update.ts", new Set(["LastInstallRecord"])],
+    // #5146 /__bili/upstreams read contract: the two report payload interfaces
+    // are referenced only inside src/upstream-alerts.ts (admin.ts consumes
+    // getUpstreamHealthReport() structurally via JSON.stringify); keep the
+    // exports so the wire shape stays named at its definition site.
+    ["src/upstream-alerts.ts", new Set(["UpstreamHealthEntry", "UpstreamHealthReport"])],
     // #3962 gate telemetry: the coverage record crosses the gate/dsh-native
     // BUNDLE boundary on the globalThis channel — consumers use it
     // structurally through dshCompactionGateTelemetry()'s return type; keep

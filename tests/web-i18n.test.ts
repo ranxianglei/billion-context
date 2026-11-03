@@ -48,6 +48,15 @@ function collectRefs(): Set<string> {
     for (const m of clientSrc.matchAll(/\bt\("([\w.]+)"/g)) refs.add(m[1]);
     for (const m of reportSrc.matchAll(/\bt\("([\w.]+)"/g)) refs.add(m[1]);
     for (const m of reportSrc.matchAll(/\btr\(\s*\w+,\s*"([\w.]+)"/g)) refs.add(m[1]);
+    // #5345: the pack editor builds its <option> labels through a pair-array
+    // (t(pair[1])), so those catalog keys are only referenced via bare quoted
+    // strings — accept any dot-qualified identifier that appears verbatim in
+    // the sources as a live reference too.
+    for (const src of [pageSrc, clientSrc, reportSrc]) {
+        for (const m of src.matchAll(/"([a-z][\w]*\.[\w.]+)"/g)) {
+            if (/^[a-z][\w]*(\.[\w]+)+$/.test(m[1]) && !m[1].includes("..")) refs.add(m[1]);
+        }
+    }
     return refs;
 }
 
