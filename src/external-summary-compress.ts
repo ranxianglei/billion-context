@@ -3,7 +3,7 @@ import { buildCompressSystemPrompt, parseCompressInput, type ParsedRange } from 
 import { messageTimestampSections } from "./external-summary-surface.js";
 import { configuredSummaryPlan } from "./external-summary-runtime.js";
 import type { ResolvedKernelConfig } from "./compress-settings.js";
-import { applyRanges, noVisibleContextRefusal, normalizeRangeOrder, recoverEvictedView, type RewriteCtx } from "./stream.js";
+import { applyRanges, noVisibleContextRefusal, noopCompressReceipt, normalizeRangeOrder, recoverEvictedView, type RewriteCtx } from "./stream.js";
 import { compressResult, type ProxyToolResult } from "./proxy-tool-result.js";
 import { imagePlaceholders } from "./image-note.js";
 import { describeExternalSummaryFailure, summaryLengthBudgetClause, type SummaryWork } from "./external-summary.js";
@@ -95,7 +95,16 @@ export async function applyConfiguredCompression(input: unknown, ctx: RewriteCtx
             instructions: `${ctx.session.meta.summaryInstructions ?? buildCompressSystemPrompt(undefined, messageTimestampSections(undefined))}\nWrite a faithful summary of the selected range ${range.startRef}-${range.endRef}. Preserve task status, constraints, decisions, exact code identifiers, paths and errors, and unfinished objectives with their source message refs. Submitted summary hints are non-authoritative. Never summarize or change the read-only reference.`
                 + summaryLengthBudgetClause(maxSummaryChars, ctx.config.compress.minSummaryLength) });
     }
-    if (work.length === 0) return compressResult("[Compression FAILED: no selected range passed the existing kernel protection checks. Nothing compressed.]", "refused", 0);
+    if (work.length === 0) {
+        // #5558: every submitted range was skipped by the probe (protected or
+        // already covered) — no kernel error means an idempotent no-op, so reuse
+        // the normal path's success-shaped receipt instead of a fresh failure.
+        if (preview.result.errors.length === 0) {
+            const detail = parsed.ranges.map((rg) => `${rg.startRef}–${rg.endRef}`).join(", ");
+            return noopCompressReceipt(ctx, detail, preview.result.warnings);
+        }
+        return compressResult("[Compression FAILED: no selected range passed the existing kernel protection checks. Nothing compressed.]", "refused", 0);
+    }
     const batch = await plan.summarize(work, signal);
     if (signal?.aborted || ctx.session.state !== state || ctx.session.revisionEpoch !== revision) return compressResult("[Compression FAILED: cancelled or session changed while generating external summaries. Nothing compressed.]", "refused", 0);
     const successful: ParsedRange[] = [];
