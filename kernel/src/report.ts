@@ -348,8 +348,11 @@ function renderOverview(
   }
 
   lines.push("");
+  // #5555 audit: was leaking an internal function name + option keys;
+  // scope/view/tool are declared params on every wire now, so this hint is
+  // honest advice in the public contract.
   lines.push(
-    `Tip: buildStatusReport({scope:"uncompressed", view:"messages", tool:"${topTool ?? "bash"}"}) for per-message listing`,
+    `Tip: call again with scope:"uncompressed", view:"messages"${topTool ? `, tool:"${topTool}"` : ""} for a per-message listing`,
   );
   return lines.join("\n");
 }

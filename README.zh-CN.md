@@ -130,6 +130,7 @@ QQ群:
 | **aider** | [`billion-context`](https://github.com/ranxianglei/billion-context),`bili aider`(cert-MITM)或 `/bili/` 前缀 —— 无原生模式(仅 shell 命令钩子,无工具注入接缝,[#1048](https://github.com/ranxianglei/billion-context/issues/1048)) |
 | **copilot**(GitHub Copilot CLI) | `bili copilot`(启动器,cert-MITM)—— 闭源 Go 二进制、无插件接缝(#1049) |
 | **amp**(Amp CLI) | `bili amp`(启动器,cert-MITM)—— 闭源 Go 二进制、无插件接缝(#1049) |
+| **kiro**(Kiro CLI,AWS) | `bili kiro`(启动器,cert-MITM)—— Rust 外壳 + Node 代理服务、无插件接缝;模型流量走 `runtime.<region>.kiro.dev` 的 Responses wire,网关差异已内置处理——详见 [CLIENTS.zh-CN.md](CLIENTS.zh-CN.md#kiro-cliaws) |
 | **crush**(Charm Crush) | `bili crush`(启动器,cert-MITM)—— 开源 Go 二进制、无插件接缝;内置 provider 域加白,crush.json 自定义 `base_url` 自动发现(#2340) |
 | **zed**(Zed 编辑器) | `bili zed`(启动器,cert-MITM)—— 开源 Rust 编辑器、无插件接缝;reqwest 吃 HTTPS_PROXY,CA 走 SSL_CERT_FILE(Linux TLS env 探测);内置 provider 域加白,settings.json 自定义 `api_url` 自动发现;环回 provider(ollama/lmstudio)经 NO_PROXY 保持直连(#2340) |
 | **goose**(Goose CLI) | `bili goose`(启动器)—— rustls 不信任任何 CA 文件,无法 cert-MITM:openai/anthropic 腿经 `OPENAI_HOST`/`ANTHROPIC_HOST`,自定义 provider 经重新生成的 `GOOSE_PATH_ROOT` overlay(#1049) |
@@ -200,7 +201,7 @@ pi / omp / kimi / claude 没有客户端侧通道 —— 它们的配置条目�
 - `jcode`、`aider` 无原生模式(无插件/MCP/工具注入接缝:#962、#1048)—— 用 `bili jcode` / `bili aider`。
 - `copilot`、`amp`、`crush`、`zed`、`goose` 仅启动器模式(#1049/#2340);goose 无法 cert-MITM(rustls 不信任任何 CA 文件),改走纯 HTTP base-URL 重定向。
 
-### 方式 2 —— 启动器(`bili pi` / `bili codex` / `bili claude` / `bili omp` / `bili opencode` / `bili hermes` / `bili dsh` / `bili codebuddy` / `bili qoder` / `bili trae` / `bili jcode` / `bili kimi` / `bili gemini` / `bili iflow` / `bili qwen` / `bili antigravity` / `bili mcode` / `bili aider` / `bili copilot` / `bili amp` / `bili crush` / `bili zed` / `bili goose`)
+### 方式 2 —— 启动器(`bili pi` / `bili codex` / `bili claude` / `bili omp` / `bili opencode` / `bili hermes` / `bili dsh` / `bili codebuddy` / `bili qoder` / `bili trae` / `bili jcode` / `bili kimi` / `bili gemini` / `bili iflow` / `bili qwen` / `bili antigravity` / `bili mcode` / `bili aider` / `bili copilot` / `bili amp` / `bili crush` / `bili zed` / `bili goose` / `bili kiro`)
 
 启动器把客户端包进一条命令:在独立端口拉起一个代理(总是全新实例,绝不复用端口),再按客户端支持的机制把它指向代理 —— 能吃代理/CA 环境变量的走**证书 MITM**,不吃的走隔离的**`/bili/` 配置重写**。真实配置文件从不被修改;客户端自己的配置只被**读取**,用来发现它实际连接的 HTTPS 上游主机,把这些主机加入 MITM 白名单 —— 代理只 TLS 终结它们,其余流量盲透传。
 
@@ -228,6 +229,7 @@ bili amp                              # Amp CLI(Sourcegraph,闭源 Go 二进制)
 bili crush                            # Crush(Charm,开源 Go 二进制)—— 证书 MITM(HTTPS_PROXY + SSL_CERT_FILE),api.anthropic.com/api.openai.com/openrouter.ai + crush.json 自定义 base_url 加白(#2340)
 bili zed                              # Zed 编辑器(开源 Rust)—— 证书 MITM(HTTPS_PROXY + SSL_CERT_FILE,Linux TLS env 探测),内置 provider 域 + settings.json 自定义 api_url 加白,环回 provider 保持直连(#2340)
 bili goose                            # Goose(Block,Rust/reqwest):rustls 发布构建不信任任何 CA 文件 —— openai/anthropic 腿经 OPENAI_HOST/ANTHROPIC_HOST,自定义 provider 经重新生成的 GOOSE_PATH_ROOT overlay(/bili/ 改写,真实配置不动)(#1049)
+bili kiro                             # Kiro CLI(AWS):经 HTTPS_PROXY + SSL_CERT_FILE 与 NODE_EXTRA_CA_CERTS 上的合并 CA 做 cert-MITM;只解密 runtime.<region>.kiro.dev;developer/system 项为网关改写为 user;会话 = Kiro 的 conversation id(--resume 后保持)
 bili pi --mitm-domain api.foo.com     # 向 MITM 白名单追加域名
 ```
 
@@ -298,7 +300,7 @@ bili --version
 
 **bili 是透明的吗?怎么关掉?** 未识别端点原样转发([CLIENTS.zh-CN.md](CLIENTS.zh-CN.md)),且每种模式都能干净退出:原生安装用 `bili plugin remove <client>`,另两种模式停掉启动器命令 / 环境变量 / `/bili/` 前缀即可 —— 流量立刻恢复直连。
 
-**能配合模型路由网关(如 [magpie](https://github.com/yetone/magpie))用吗?** 能 —— 客户端指向 bili、bili 经 `/bili/` 前缀指向网关(前缀内嵌网关的绝对 URL):`http://localhost:8787/bili/http://127.0.0.1:3425…`。例:Claude Code → `ANTHROPIC_BASE_URL=http://localhost:8787/bili/http://127.0.0.1:3425` + `ANTHROPIC_API_KEY=magpie`;OpenAI 系客户端 → `OPENAI_BASE_URL=http://localhost:8787/bili/http://127.0.0.1:3425/v1`(+ `OPENAI_API_KEY=magpie`)。压缩发生在路由*之前*——到达网关节点里任何账号的请求都已是压缩后的。凭据留在网关内:客户端的假 key 原样穿过,真实 key 不接触 bili。注意:① 会话中途切换账号会使 provider 前缀缓存失效——多账号路由的固有代价,与 bili 无关(见 `/acp-cache` 的 KEY SWITCHES 段);② 路由后的模型名对 bili 的窗口查询不透明——需在 providers 键 `http://127.0.0.1:3425` 下用 `models.<name>.context` 声明其上下文窗口,否则按兜底窗口运行(route-miss 警告,#2317);③ 中继若拒绝 bili Anthropic 车道的 `cache_control` 标记,设 `compat.noCacheControl`;④ 回环网关开箱即用;网关在非回环私网地址时可能还需 `network.allowPrivateHttpProviders`(#2984)。三条线(OpenAI Chat / Responses / Anthropic Messages,含跨协议转换)已端到端实测,#4433。
+**能配合模型路由网关(如 [magpie](https://github.com/yetone/magpie))用吗?** 能 —— 客户端指向 bili、bili 经 `/bili/` 前缀指向网关(前缀内嵌网关的绝对 URL):`http://localhost:8787/bili/http://127.0.0.1:3425…`。例:Claude Code → `ANTHROPIC_BASE_URL=http://localhost:8787/bili/http://127.0.0.1:3425` + `ANTHROPIC_API_KEY=magpie`;OpenAI 系客户端 → `OPENAI_BASE_URL=http://localhost:8787/bili/http://127.0.0.1:3425/v1`(+ `OPENAI_API_KEY=magpie`)。压缩发生在路由*之前*——到达网关节点里任何账号的请求都已是压缩后的。凭据留在网关内:客户端的假 key 原样穿过,真实 key 不接触 bili。注意:① 会话中途切换账号会使 provider 前缀缓存失效——多账号路由的固有代价,与 bili 无关(见 `/acp-cache` 的 KEY SWITCHES 段);② 路由后的模型名对 bili 的窗口查询不透明——需在 providers 键 `http://127.0.0.1:3425` 下用 `models.<name>.context` 声明其上下文窗口,否则按兜底窗口运行(route-miss 警告,#2317);③ 中继若拒绝 bili Anthropic 车道的 `cache_control` 标记,设 `compat.noCacheControl`;④ 回环网关开箱即用;网关在非回环私网地址时可能还需 `network.allowPrivateHttpProviders`(#2984);⑤ Claude Code 原生插件模式(`bili plugin install claude`)下,可在安装前设 `BILI_CLAUDE_UPSTREAM=http://127.0.0.1:3425`,受管配置块会自动将其包裹为代理 URL(或直接配置 `ANTHROPIC_BASE_URL=http://127.0.0.1:8787/bili/http://127.0.0.1:3425`;`localhost` 与 `127.0.0.1` 均被正确识别,#5369)。三条线(OpenAI Chat / Responses / Anthropic Messages,含跨协议转换)已端到端实测,#4433。
 
 **日志和会话数据存在哪?** 日志:`~/.local/state/billion-context/bili.log`(同时镜像到 stderr);会话状态:`~/.local/share/billion-context/`(XDG 可覆盖;Windows 杀软排除 #362、可选清理 #1082)—— 完整路径见 [CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md)。
 

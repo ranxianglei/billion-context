@@ -17,7 +17,7 @@ const REPORT = [
     '  b1 (T1)  474.4K→169  3 msgs  "preflight overflow compress"',
     '  b2 (T1)  400.0K→150  5 msgs  "exploration"',
     "",
-    'Tip: buildStatusReport({scope:"uncompressed", view:"messages", tool:"bash"}) for per-message listing',
+    'Tip: call again with scope:"uncompressed", view:"messages", tool:"bash" for a per-message listing',
 ].join("\n");
 
 const EXTRAS = [
