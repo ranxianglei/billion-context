@@ -34,7 +34,7 @@ import { codexCompactGatePre, codexCompactMode, hasCompactionTrigger, isCodexHos
 import { emitPreflightError } from "../stream-error.js";
 import { agentProviderRecipes } from "../agent-providers.js";
 import { affinityToken, anthropicFirstUserFrag, claudeAnthropicPersonaOrderApplies, conversationHeaderSource, claudeSubagentAgentId, claudeSubagentSplit, claudeSubagentLaneTokenOf, clientConversationHeader, codexTurnIdentity, dshPersonaFingerprintApplies, instructionsFingerprintApplies, openaiSystemTextForPersona, preferPromptCacheKeyIdentity, zcodeMemoryConversation } from "../session-id.js";
-import { personaConversationOrder } from "../session-resolve.js";
+import { personaConversationOrder, resolveSessionOrder } from "../session-resolve.js";
 import { prefixAffinity, describeResumeMiss, type AnonymousAffinity } from "../prefix-affinity.js";
 import { buildAnonymousProvenance, type AnonymousProvenance } from "../anon-provenance.js";
 import { maybeAdoptForkBlocks, maybeAdoptResume, maybeAdoptDerivedFork } from "../fork-adoption.js";
@@ -102,6 +102,13 @@ function persistLineageLinkNow(session: Session): void {
  *  be noise on a stream that re-sends the same id every turn. */
 const vertexModelNormalised = new Set<string>();
 const VERTEX_MODEL_LOG_CAP = 64;
+
+/** #5582: ids already warned about for the sidecar anchor race (once each —
+ *  the fork decision repeats every turn of the affected conversation). Capped
+ *  like warnedNoModelRequests: a long-lived proxy must not grow this set
+ *  without bound one conversation id at a time. */
+const anchorRaceWarned = new Set<string>();
+const ANCHOR_RACE_WARN_CAP = 4096;
 
 export async function handle(
     req: http.IncomingMessage,
@@ -1071,6 +1078,22 @@ async function handleRequest(
               : protocol === "google"
                 ? googleSystemText(parsed as GoogleRequestBody)
                 : "";
+        // #5582: one-shot observability at the dsh resolver sites — a
+        // derived-persona fork off a SHALLOW recording while a main-shaped
+        // conversation arrives under a different persona is the signature of a
+        // non-recognized sidecar claiming the virgin raw-key anchor before the
+        // first main turn (#2156 family). The fork stays the correct decision
+        // (#150/#2948); the flag names the shape so the field shows WHICH
+        // sidecar recognition drifted (title prefix / review policy text).
+        const dshPersonaOrder = (id: string, history: unknown, tag: string = personaSystemText): string => {
+            const r = resolveSessionOrder(id, history, tag, pluginReportedModel(req.headers));
+            if (r.action === "derived-persona" && r.anchorRace && !anchorRaceWarned.has(id)) {
+                if (anchorRaceWarned.size >= ANCHOR_RACE_WARN_CAP) anchorRaceWarned.clear();
+                anchorRaceWarned.add(id);
+                log("warn", `[${id}] suspected sidecar anchor race (#5582): the raw-key anchor is held by a shallow (non-main) conversation when a main conversation arrived under a different persona — the main lane forked onto its own |sub: key; check whether a dsh sidecar (title/review) shape drifted past recognition`);
+            }
+            return r.key;
+        };
         const zcodeParentIdentity = responsesIdentity ?? openaiIdentity ?? anthropicIdentity ?? googleIdentity;
         const zcodeMemory = zcodeParentIdentity?.clientProvided
             ? zcodeMemoryConversation(zcodeParentIdentity.value, req.headers)
@@ -1089,12 +1112,10 @@ async function handleRequest(
             ? (dshPersona && !sideRequestLike
                 ? (personaSystemText === ""
                       ? (googleIdentity?.value ?? googleSignal)
-                      : personaConversationOrder(
-                          googleIdentity?.value ?? googleSignal,
-                          (parsed as GoogleRequestBody).contents,
-                          personaSystemText,
-                          pluginReportedModel(req.headers),
-                      ))
+                       : dshPersonaOrder(
+                           googleIdentity?.value ?? googleSignal,
+                           (parsed as GoogleRequestBody).contents,
+                       ))
                 : (googleIdentity?.value ?? googleSignal))
             : protocol === "anthropic"
             ? // #970: a subagent's conversation value gets its own
@@ -1118,12 +1139,10 @@ async function handleRequest(
                           // empty-tag traffic through the order resolver
                           // (codex turn-1 shape keys by its session header).
                            ? (anthropicIdentity?.value ?? anthropicSignal)
-                           : personaConversationOrder(
-                               anthropicIdentity?.value ?? anthropicSignal,
-                               (parsed as AnthropicRequestBody).messages,
-                               personaSystemText,
-                               pluginReportedModel(req.headers),
-                           ))
+                            : dshPersonaOrder(
+                                anthropicIdentity?.value ?? anthropicSignal,
+                                (parsed as AnthropicRequestBody).messages,
+                            ))
                      : claudeAnthropicPersonaOrderApplies(req.headers) && opts.subagentSplit !== false
                        && !sideRequestLike && personaSystemText !== ""
                        // #4352: header-less claude code subagents (VS Code
@@ -1157,12 +1176,10 @@ async function handleRequest(
                        : anthropicIdentity?.value ?? anthropicSignal)
              : protocol === "openai"
               ? (dshPersona && !sideRequestLike && personaSystemText !== ""
-                    ? personaConversationOrder(
-                          openaiIdentity?.value ?? openaiSignal,
-                          (parsed as OpenAIRequestBody).messages,
-                          personaSystemText,
-                          pluginReportedModel(req.headers),
-                      )
+                     ? dshPersonaOrder(
+                           openaiIdentity?.value ?? openaiSignal,
+                           (parsed as OpenAIRequestBody).messages,
+                       )
                     : openaiIdentity?.value ?? openaiSignal)
               : codexTurn
                 // Trusted Codex turn id enters the verbatim session chain
@@ -1179,12 +1196,11 @@ async function handleRequest(
                    // Must sit BEFORE the stableSystemAnchor branch below so a
                    // plugin request never takes the plain-proxy verbatim anchor.
                    // Empty instructions = non-anchoring (verbatim id).
-                    ? personaConversationOrder(
-                          responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader),
-                          (parsed as ResponsesRequestBody).input,
-                          (parsed as ResponsesRequestBody).instructions ?? "",
-                          pluginReportedModel(req.headers),
-                      )
+                     ? dshPersonaOrder(
+                           responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader),
+                           (parsed as ResponsesRequestBody).input,
+                           (parsed as ResponsesRequestBody).instructions ?? "",
+                       )
                  : opts.stableSystemAnchor && pluginAgentHeader(req.headers) === undefined
                    // #1085: with anchoring on (plain-proxy mode only — see the
                    // prepare* gates), instruction drift is the expected event —
