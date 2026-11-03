@@ -780,7 +780,7 @@ export function mayStartToolCallEmission(s: string): boolean {
 // strip it, breaking the self-reinforcing loop. Recognition keys off the SAME
 // constants the injectors use (single source of truth): chain spans validate
 // through the frozen checkpoint parser; header literals are recognized
-// position-independently (#5588 — the old line-start rule made the streaming
+// position-independently (#5587 — the old line-start rule made the streaming
 // tail buffer misread mid-line mentions as field-head blocks). A header that
 // OPENS the field (only whitespace ahead) is still a forged block opening and
 // is cut to end of field as before (#1634: the resulting empty turn drives the
@@ -830,7 +830,7 @@ function nextChainSpan(s: string): { start: number; end: number } | null {
     return { start: i, end: i + end };
 }
 
-// #5588: unrecoverable stand-ins for the two headers. Novel wording the kernel
+// #5587: unrecoverable stand-ins for the two headers. Novel wording the kernel
 // never renders — an echo persisted in client history cannot regrow the
 // canonical artifact form from them, so the imitation loop stays broken while
 // the surrounding prose survives (#1634 goal kept, amputation gone).
@@ -842,7 +842,7 @@ const ARTIFACT_HEADERS: Array<[string, string]> = [
 ];
 
 /** First complete internal-artifact header literal anywhere in s
- *  (position-independent since #5588), or null. */
+ *  (position-independent since #5587), or null. */
 function nextArtifactHeader(s: string): { pos: number; hdr: string; redaction: string } | null {
     let best: { pos: number; hdr: string; redaction: string } | null = null;
     for (const [hdr, redaction] of ARTIFACT_HEADERS) {
@@ -869,7 +869,7 @@ export function stripBiliArtifacts(text: string): string {
 }
 
 /** Swap every internal-artifact header literal for its redaction placeholder,
- *  preserving all surrounding bytes (#5588). The field-head forged-block case
+ *  preserving all surrounding bytes (#5587). The field-head forged-block case
  *  is ruled out by the caller (that one cuts instead). */
 function redactArtifactHeaders(s: string): string {
     let out = "";
@@ -908,7 +908,7 @@ function prefixAlts(s: string, minLen: number): string[] {
 // held from its first char — a lone trailing "[" must survive chunk boundaries
 // because both headers begin with it and the decision splits on the second
 // char (broad-hold/strict-decide, same trade as MARKER_HEAD_PREFIX). The hold
-// is position-independent since #5588: the matcher no longer requires line
+// is position-independent since #5587: the matcher no longer requires line
 // start, so a mid-line mention arriving across a chunk boundary must be held
 // exactly like a line-start one — otherwise the output depends on where the
 // split fell (the #4107/#3198 defect class).
@@ -959,7 +959,7 @@ export function createBiliArtifactFilter(onDrop?: (snippet: string) => void): Ta
     /** Whether any non-whitespace byte has left this field yet. The buf alone
      *  cannot answer that (it only holds undecidable tails), so a mid-line
      *  mention completing at buf position 0 would be misread as a field-head
-     *  forged block and swallow the rest of the stream (#5588). */
+     *  forged block and swallow the rest of the stream (#5587). */
     let deliveredNonWs = false;
     let droppedAny = false;
     let notified = false;
@@ -994,7 +994,7 @@ export function createBiliArtifactFilter(onDrop?: (snippet: string) => void): Ta
                     break;
                 }
                 // Genuine content precedes: mention or inline forgery — swap
-                // the literal for its redaction, keep the tail (#5588).
+                // the literal for its redaction, keep the tail (#5587).
                 out += buf.slice(0, hit.pos) + hit.redaction;
                 drop(hit.hdr);
                 buf = buf.slice(hit.pos + hit.hdr.length);
