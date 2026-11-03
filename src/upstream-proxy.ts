@@ -562,9 +562,12 @@ interface UpstreamFailureParts {
     detail: UpstreamFailureDetail;
 }
 
-export function describeUpstreamFailure(error: unknown, url: string, proxyUrl?: string, skipped?: SkippedProxyInfo): UpstreamFailureParts {
+export function describeUpstreamFailure(error: unknown, url: string, proxyUrl?: string, skipped?: SkippedProxyInfo, externalAborted?: boolean): UpstreamFailureParts {
     const chain = errorChain(error);
-    const kind = classifyUpstreamFailure(error, { viaProxy: proxyUrl !== undefined });
+    // #5598: the caller's external (client-disconnect) signal state decides the
+    // attribution — without it an AbortError is billed to the upstream's idle
+    // budget ("check upstream health") when the user simply hit stop.
+    const kind = classifyUpstreamFailure(error, { viaProxy: proxyUrl !== undefined, externalAborted });
     const fields = ["code", "errno", "syscall", "address", "port"];
     const parts: string[] = [`kind=${kind}`];
     // Error text from undici/OS layers embeds the endpoint identity
@@ -605,16 +608,16 @@ export function describeUpstreamFailure(error: unknown, url: string, proxyUrl?: 
     return { message: parts.join(" "), detail: { kind, ...(codeValue !== undefined ? { code: String(codeValue) } : {}), ...(targetHostPort !== "" ? { host: maskHostPortForDisplay(targetHostPort) } : {}), hint } };
 }
 
-export function formatUpstreamError(error: unknown, url: string, proxyUrl?: string, skipped?: SkippedProxyInfo): string {
-    return describeUpstreamFailure(error, url, proxyUrl, skipped).message;
+export function formatUpstreamError(error: unknown, url: string, proxyUrl?: string, skipped?: SkippedProxyInfo, externalAborted?: boolean): string {
+    return describeUpstreamFailure(error, url, proxyUrl, skipped, externalAborted).message;
 }
 
-export function recordUpstreamConnection(url: string, proxyUrl: string | undefined, error?: unknown, skipped?: SkippedProxyInfo): void {
+export function recordUpstreamConnection(url: string, proxyUrl: string | undefined, error?: unknown, skipped?: SkippedProxyInfo, externalAborted?: boolean): void {
     lastConnection = {
         url,
         proxy: redactProxyUrl(proxyUrl),
         connected: error === undefined,
-        ...(error === undefined ? {} : { error: formatUpstreamError(error, url, proxyUrl, skipped) }),
+        ...(error === undefined ? {} : { error: formatUpstreamError(error, url, proxyUrl, skipped, externalAborted) }),
         checkedAt: new Date().toISOString(),
     };
 }
