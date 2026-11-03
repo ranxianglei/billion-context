@@ -1218,7 +1218,7 @@ function pfSlotIdsOf(messages: unknown): string[] | undefined {
     return out;
 }
 
-/** #5616: a model operation must begin OUTSIDE any earlier transport fetch's
+/** #5614: a model operation must begin OUTSIDE any earlier transport fetch's
  *  re-entry scope (the dispatchDepth/chainHop stores), or its first request
  *  looks like mid-descent re-entry and skips the compression entry — see
  *  runOutsideFetchChain. Re-enter our sid/msgIds scope INSIDE that cleared
@@ -1231,7 +1231,7 @@ function runLlmDispatch<R>(scope: LlmDispatchScope, operation: () => R): R {
  *  resume in the consumer's dynamic context, so each `next()` must run the
  *  adapter's continuation (its awaits, and any fetches it starts) inside the
  *  same scope the dispatch carried. Each boundary also clears the inherited
- *  fetch-chain re-entry state (#5616) via runLlmDispatch. */
+ *  fetch-chain re-entry state (#5614) via runLlmDispatch. */
 function wrapScopedIterable<T>(iter: AsyncIterable<T>, scope: LlmDispatchScope): AsyncIterable<T> {
     return {
         [Symbol.asyncIterator]: () => {
@@ -1966,7 +1966,7 @@ export function apply(ctx: PluginContext): void {
                 // runLlmDispatch covers the former, wrapScopedIterable the
                 // latter; each also clears inherited fetch-chain re-entry
                 // state so a new operation never looks like mid-descent
-                // re-entry (#5616).
+                // re-entry (#5614).
                 return runLlmDispatch(scope, () => wrapScopedIterable(next(), scope));
             });
         });

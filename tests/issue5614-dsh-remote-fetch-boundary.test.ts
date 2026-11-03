@@ -1,5 +1,5 @@
 /**
- * #5616: DSH Remote — a NEW model operation must not inherit the previous
+ * #5614: DSH Remote — a NEW model operation must not inherit the previous
  * transport fetch's re-entry state and silently skip compression.
  *
  * The fetch chain tracks per-request dispatch depth in AsyncLocalStorage
@@ -162,7 +162,7 @@ async function withSetup(fn: (handle: CtxHandle) => Promise<void>): Promise<void
     }
 }
 
-test("#5616 fetch-chain primitive: runOutsideFetchChain re-dispatches a stale-context fetch", async () => {
+test("#5614 fetch-chain primitive: runOutsideFetchChain re-dispatches a stale-context fetch", async () => {
     const originalFetch = globalThis.fetch;
     const canned = (async () => new Response("ok")) as typeof fetch;
     let dispatches = 0;
@@ -194,7 +194,7 @@ test("#5616 fetch-chain primitive: runOutsideFetchChain re-dispatches a stale-co
     }
 });
 
-test("#5616 dsh remote: a new model op from a stale transport context still compresses", async () => {
+test("#5614 dsh remote: a new model op from a stale transport context still compresses", async () => {
     await withSetup(async (handle) => {
         const headersFor = _stateHeadersForTest();
         assert.ok(headersFor, "headersFor stamp is installed after apply()");
@@ -289,7 +289,7 @@ test("#5616 dsh remote: a new model op from a stale transport context still comp
     });
 });
 
-test("#5616 dsh remote: concurrent model ops keep their own scope (no cross-talk)", async () => {
+test("#5614 dsh remote: concurrent model ops keep their own scope (no cross-talk)", async () => {
     await withSetup(async (handle) => {
         const headersFor = _stateHeadersForTest();
         assert.ok(headersFor);
