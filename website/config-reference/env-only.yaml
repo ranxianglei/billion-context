@@ -18,6 +18,14 @@ entries:
     group: envonly
     desc_en: "Env tier for dsh.contextTab (#4237): 0/false removes the DSH top-bar 「上下文」/「Context」 tab (everything else keeps working); any other value forces it on over the file tier; unset = file tier applies (default true). Takes effect on next page load / dsh restart."
     desc_zh: "dsh.contextTab 的 env 层（#4237）：0/false 移除 DSH 顶栏「上下文」标签页（其余一切照常工作）；其他取值强制开启并覆盖文件层；缺省 = 按文件层取值（默认 true）。下次页面加载 / dsh 重启生效。"
+  - key: BILI_DSH_AUTOREVIEW_BLOCK
+    type: boolean
+    default: "true (on by default, #4634)"
+    kind: env-only
+    audience: user
+    group: envonly
+    desc_en: "Env tier for dsh.autoReviewBlock (#4634): 0/false restores forwarding of dsh auto-review traffic upstream; any other value forces the local block on over the file tier; unset = file tier applies (default on). Read per-request, no restart needed."
+    desc_zh: "dsh.autoReviewBlock 的 env 层（#4634）：0/false 恢复把 dsh auto-review 流量转发上游；其他值强制开启本地拦截并覆盖文件层；未设 = 文件层生效（默认开）。每请求读取，无需重启。"
   - key: BILI_DSH_MAX_TESTED_VERSION
     type: string
     default: "0.2.0-rc.2 (CI e2e anchor)"
