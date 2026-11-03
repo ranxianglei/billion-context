@@ -342,8 +342,9 @@ export function guardrailRepetition(): boolean | { enabled?: boolean; warn?: num
     const envRaw = process.env.BILI_GUARDRAIL_REPETITION;
     if (envRaw !== undefined) return !(envRaw === "0" || envRaw === "false");
     const val = loadConfigFile().guardrails?.repetition;
-    // truthy boolean → keep; object form → pass through; undefined/false → normalize
-    return val !== undefined && val !== false ? val : true;
+    // undefined → default on; boolean/object forms pass through untouched,
+    // so a file `repetition: false` still disables the guard (#5505 review).
+    return val === undefined ? true : val;
 }
 
 /** #3260 text-run breaker default: parity with pi's findDegenerateRuns minRun
