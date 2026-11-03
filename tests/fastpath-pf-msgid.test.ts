@@ -6,8 +6,10 @@
 // cold-start mint/arm ingestion, geometry-only hits, hard-pin hits with
 // ledger-id binding, shape/wrong-origin self-healing misses, compaction
 // archive-and-reset (no row deletion, same sid echoed through the reset),
-// post-boot hydration, L1 checkpoint fold round-trip, and the untouched
-// default (knob OFF) behavior as the regression anchor.
+// post-boot hydration, L1 checkpoint fold round-trip, sess-change as an
+// identity event, model-switch as a non-event, shared-breaker naming via
+// credited misses, id-stable in-place edits riding frozen cores, and the
+// untouched default (knob OFF) behavior as the regression anchor.
 import assert from "node:assert/strict";
 import test from "node:test";
 import http from "node:http";
@@ -318,5 +320,95 @@ test("post-boot hydration rebuilds the resident from L1+L0 (and across an L1 fol
         // fold advanced elemsBeyond the checkpoint state (elemsBefore ≤ lastT).
         assert.ok(elemsBefore <= lastT, "fold state precedes the final ingest");
         assert.equal(h.out.measuredT, lastT + 1, "element frontier restored exactly across L1+L0");
+    } finally { setMsgIdLane(false); _resetStoreForTest(); }
+});
+
+test("sess-change: swapped client-native session identity is an event (sid survives, resident untouched)", () => {
+    try {
+        setMsgIdLane(true);
+        const pf = new MemPF();
+        makeStub(pf);
+        const s = mkSession("s-sess");
+        const { sid, msgs } = bootWorld(pf, s);
+        // Teach the saved carrier baseline (cs) with a normal hit turn.
+        const a = runTurn(s, { [PF_SID_HEADER]: sid, [PF_TAIL_IDS_HEADER]: "cidU2,cidQA", "x-conversation-id": "conv-A" }, [...msgs, USR("sess qA")]);
+        assert.equal(a.out.decision, "hit(v6-mid)", `baseline hit expected, got ${a.out.decision}`);
+        const hi = pf.maxPos(sid);
+        // Swap the carrier under the same bili session + sid ⇒ identity event.
+        // (The event fires BEFORE world-shape arithmetic — T===K here would
+        // otherwise read as no-progress, which pins the gate ordering too.)
+        const b = runTurn(s, { [PF_SID_HEADER]: sid, [PF_TAIL_IDS_HEADER]: "cidU2,cidQB", "x-conversation-id": "conv-B" }, [...msgs, USR("sess qB")]);
+        assert.equal(b.out.decision, "sess-change", `carrier swap must be an event, got ${b.out.decision}`);
+        assert.equal(b.out.creditedMiss, false, "identity events are uncredited legal fulls");
+        assert.equal(b.headers[PF_SID_HEADER], sid, "the partition identity survives the event");
+        assert.equal(pf.maxPos(sid), hi, "the resident partition is untouched by the event");
+    } finally { setMsgIdLane(false); _resetStoreForTest(); }
+});
+
+test("model switch within the wire family is not an event (the lane carries no model gate)", () => {
+    try {
+        setMsgIdLane(true);
+        const pf = new MemPF();
+        makeStub(pf);
+        const s = mkSession("s-model");
+        const { sid, msgs } = bootWorld(pf, s);
+        // Identical geometry + valid origin pin, different model string.
+        const r = runTurn(s, { [PF_SID_HEADER]: sid, [PF_TAIL_IDS_HEADER]: "cidU2,cidA2" }, [...msgs, ASST("model a2 reply")], "m2");
+        assert.equal(r.out.decision, "hit(v6-mid)", `model switch must not be an event, got ${r.out.decision}`);
+        assert.equal(r.out.canonical, true);
+    } finally { setMsgIdLane(false); _resetStoreForTest(); }
+});
+
+test("breaker naming: msgid-lane credited misses arm the SHARED breaker (5 strikes / 60-min TTL)", () => {
+    try {
+        setMsgIdLane(true);
+        const pf = new MemPF();
+        const stub = makeStub(pf);
+        const s = mkSession("s-break");
+        const { sid, msgs } = bootWorld(pf, s);
+        const hi = pf.maxPos(sid);
+        // A system element at the window head is the lane's always-credited
+        // drift verdict, and it writes NOTHING to the pf plane — repeatable
+        // against the same frontier, so it names the shared breaker cleanly.
+        for (let i = 0; i < 5; i++) {
+            const body = [...msgs, { role: "system", content: `intruder ${i}` }, USR(`break q${i}`)];
+            const r = runTurn(s, { [PF_SID_HEADER]: sid, [PF_TAIL_IDS_HEADER]: "?,?,?" }, body);
+            assert.equal(r.out.decision, "v6m-window-system", `strike ${i + 1}: got ${r.out.decision}`);
+            assert.equal(r.out.creditedMiss, true);
+        }
+        const stateKey = `${s.id}\u0000pf:state`;
+        const st = JSON.parse(String(stub.ext.get(stateKey))) as Record<string, unknown>;
+        assert.equal(typeof st.disabledAt, "number", "five consecutive credited misses arm the hold");
+        assert.equal(pf.maxPos(sid), hi, "credited misses never touch the resident partition");
+        // Held: the gate stands above every lane — no hit, but T keeps measuring.
+        const held = runTurn(s, { [PF_SID_HEADER]: sid, [PF_TAIL_IDS_HEADER]: "?,?,?" }, [...msgs, { role: "system", content: "intruder h" }, USR("break qh")]);
+        assert.equal(held.out.decision, "breaker-armed");
+        assert.equal(held.headers[PF_SID_HEADER], undefined, "a held turn never resolves a sid");
+        // TTL expiry pays off: the next verified miss counts fresh from zero.
+        stub.ext.set(stateKey, JSON.stringify({ ...st, disabledAt: Date.now() - 61 * 60 * 1000 }));
+        const rec = runTurn(s, { [PF_SID_HEADER]: sid, [PF_TAIL_IDS_HEADER]: "?,?,?" }, [...msgs, { role: "system", content: "intruder r" }, USR("break qr")]);
+        assert.equal(rec.out.decision, "v6m-window-system", `post-TTL miss expected, got ${rec.out.decision}`);
+        const st2 = JSON.parse(String(stub.ext.get(stateKey))) as Record<string, unknown>;
+        assert.equal(st2.disabledAt, undefined, "an expired hold resets the strike counter");
+    } finally { setMsgIdLane(false); _resetStoreForTest(); }
+});
+
+test("id-stable in-place edit rides the frozen core (geometry+ids judged, bytes never)", () => {
+    try {
+        setMsgIdLane(true);
+        const pf = new MemPF();
+        makeStub(pf);
+        const s = mkSession("s-edit");
+        const { sid, msgs } = bootWorld(pf, s);
+        const hi = pf.maxPos(sid);
+        // Client rewrites u1 IN PLACE, keeping geometry and ids; one new element.
+        const edited = [SYSP, USR("world u1 bytes EDITED"), ASST("world a1 reply"), USR("world u2 bytes"), USR("edit u3")];
+        const r = runTurn(s, { [PF_SID_HEADER]: sid, [PF_TAIL_IDS_HEADER]: "cidU2,cidU3" }, edited);
+        assert.equal(r.out.decision, "hit(v6-mid)", `origin pin must ride on the recorded id, got ${r.out.decision}`);
+        assert.equal(r.out.hit!.view[0]!.text, "world u1 bytes", "server snapshot stays absolute authority over the edited slot");
+        // Only the window was ingested: exactly one new row, bound to cidU3.
+        const rows = pf.readRows(sid, [[hi + 1, 1_000_000]]);
+        assert.equal(rows.length, 1);
+        assert.equal(rows[0].ledgerId, "cidU3");
     } finally { setMsgIdLane(false); _resetStoreForTest(); }
 });
