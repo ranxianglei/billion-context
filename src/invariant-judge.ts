@@ -653,7 +653,7 @@ export function maybeJudgeContinuity(
     const entry = parseExitCores(prev, protocol);
     const exitCores0 = parseExitCores(body, protocol);
     if (!entry || !exitCores0) return;
-      const exitCores = fault ? fault([...exitCores0]) : exitCores0;
+    const exitCores = fault ? fault([...exitCores0]) : exitCores0;
     // #564/#2627: the producer's carrier objects are matched against `bodyArr` —
     // the exact array the sent body was serialized from — by one linear reference
     // walk. The owned wire indexes are then translated to exit-core indexes with
