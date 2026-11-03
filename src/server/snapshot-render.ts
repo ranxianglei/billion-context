@@ -85,6 +85,67 @@ export function identitySigForTest(m: BiliMessage): string {
     return identitySig(m);
 }
 
+// #5403/#5418 v6 (contract R1): observability-only confirmation layer. The
+// watermark lane's cheap gate is the shim tail-ids SET-DIFF against its
+// cumulative ledger — equivalent to this chain's ID FAST-PATH (host msgids
+// unique forever ⇒ pure-append list ⟺ backward id-chain from client end),
+// minus the signature fallback, which by definition never fires for an id-
+// carried request. Running buildView's full walk on watermark hit turns would
+// pay the O(N) parse the fastpath exists to avoid; on MISS turns the parse is
+// already paid, so a light probe (identity rows ONLY — no content bytes) lets
+// the canonical transcript confirm or contradict the ledger's view. One log
+// per session at most (latch lives in session.metadata). Deliberately NOT
+// reused from buildView: this module is render authority (#3812/#4241) — the
+// probe must not couple doctrine-critical walk code to a diagnostics path.
+export interface TranscriptProbeResult {
+    readonly anchored: boolean;
+    /** Human-readable reason when not anchored. */
+    readonly reason?: string;
+    /** Unified-transcript row where the client tail joins, when anchored. */
+    readonly joinRow?: number;
+}
+
+/** Backward STRICT-contiguous id chain over unifiedMessageIdRows — the same
+ *  proof snapshot-render's anchor alignment produces for id-carried tails,
+ *  without rendering anything. See TranscriptProbeResult for placement. */
+export function probeTranscriptAlignment(
+    session: Session,
+    clientMsgs: readonly { readonly id: string }[],
+): TranscriptProbeResult {
+    if (!session.state.blocks.some((b) => b.active)) return { anchored: false, reason: "no-active-blocks" };
+    const store = getStore();
+    if (!store.replicasAvailable()) return { anchored: false, reason: "store-unavailable" };
+    let rows: Array<{ seq: number; msgId: string }> | null;
+    try {
+        rows = store.unifiedMessageIdRows(session.id);
+    } catch { return { anchored: false, reason: "transcript-error" }; }
+    if (!rows || rows.length === 0) return { anchored: false, reason: "transcript-empty" };
+    const indexById = new Map<string, number>();
+    for (let i = rows.length - 1; i >= 0; i--) {
+        const r = rows[i];
+        if (r && typeof r.msgId === "string" && r.msgId.length > 0 && !indexById.has(r.msgId)) indexById.set(r.msgId, i);
+    }
+    // Contiguous backward walk: any skip between matches breaks the run
+    // (the transcript has rows the client no longer sends ⇒ structural
+    // divergence, same discipline as buildView's gap handling).
+    let prevRow = Infinity;
+    let started = false;
+    let run = 0;
+    let joinRow: number | undefined;
+    for (let i = clientMsgs.length - 1; i >= 0; i--) {
+        const row = indexById.get(clientMsgs[i].id);
+        if (row === undefined) { break; }
+        if (started && row !== prevRow - 1) break;
+        started = true;
+        run += 1;
+        joinRow = row;
+        prevRow = row;
+    }
+    if (!started) return { anchored: false, reason: "chain-not-started" };
+    if (run < MIN_SEAM_RUN) return { anchored: false, reason: "seam-too-short", joinRow };
+    return { anchored: true, joinRow };
+}
+
 interface ViewRow {
     seq: number;
     msgId: string;
