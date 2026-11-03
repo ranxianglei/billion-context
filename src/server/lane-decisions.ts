@@ -92,7 +92,7 @@ interface WireClientSignals {
     readonly conversationSourceName: string | undefined;
     /** The shared codex UA/header detection (isCodexClient). */
     readonly codexUserAgent: boolean;
-    /** #XXXX: host-level opt-out for the instructions-fingerprint split
+    /** #5456: host-level opt-out for the instructions-fingerprint split
      *  (config `personaSplit:false` / env BILI_PERSONA_SPLIT=0). The
      *  fingerprint exists to keep DISJOINT subagent blobs off the main
      *  lane; on a plain-proxy lane whose system prompt legitimately
@@ -136,7 +136,7 @@ const WIRE_CLIENTS: readonly WireClientEntry[] = [
 export function resolveWireClientProfile(signals: WireClientSignals): HostProfile {
     for (const entry of WIRE_CLIENTS) {
         if (!entry.matches(signals)) continue;
-        // #XXXX: the switch only disables the FINGERPRINT split; every other
+        // #5456: the switch only disables the FINGERPRINT split; every other
         // profile field (identity, caching rules, tool surface) stays.
         if (signals.personaSplitOff && entry.profile.instructionsFingerprintKeyed) {
             return { ...entry.profile, instructionsFingerprintKeyed: false };

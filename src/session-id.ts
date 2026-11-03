@@ -158,7 +158,7 @@ export function instructionsFingerprintApplies(headers: Record<string, string | 
     // instructions) lives in the lane-decisions wire-client registry
     // (#3482 site 4): the header-name literals are registry data, not
     // scattered comparisons. Signals are name-free observations here.
-    // personaSplitOff (#XXXX): host-level opt-out threaded from ProxyOptions
+    // personaSplitOff (#5456): host-level opt-out threaded from ProxyOptions
     // so resolveWireClientProfile can strip instructionsFingerprintKeyed
     // without mutating WIRE_CLIENTS literals.
     return resolveWireClientProfile(wireClientSignals(headers, personaSplitOff)).instructionsFingerprintKeyed;
