@@ -49,6 +49,20 @@ import { personaConversationOrder, type SessionOrderResolution } from "../sessio
 function onSessionResolveEvent(rawId: string, r: SessionOrderResolution): void {
     if (r.action !== "reanchor" && !r.action.startsWith("derived-")) return;
     loggerLog(r.action.startsWith("derived-") ? "warn" : "info", `[session-resolve] ${r.action}: ${rawId} -> ${r.key}${r.reason !== undefined ? ` (${r.reason})` : ""}`);
+    // #5582: one-shot sidecar anchor-race observability. A derived-persona
+    // fork off a SHALLOW recording while a MAIN-shaped conversation arrives
+    // under a different persona is the signature of a non-recognized sidecar
+    // having claimed the virgin raw-key anchor before the first main turn
+    // (#2156 family). The fork stays the correct decision (#150/#2948); the
+    // flag names the shape so the field shows WHICH sidecar recognition
+    // drifted (title prefix / review policy text). Living in this observer
+    // means it sees the post-msgid-rescue outcome, so a race that stored ids
+    // rescue into a continuation is never logged as a false positive. Warn
+    // once per id — the fork decision repeats every turn of the conversation.
+    if (r.action === "derived-persona" && r.anchorRace && !anchorRaceWarned.has(rawId)) {
+        anchorRaceWarned.add(rawId);
+        loggerLog("warn", `[${rawId}] suspected sidecar anchor race (#5582): the raw-key anchor is held by a shallow (non-main) conversation when a main conversation arrived under a different persona — the main lane forked onto its own |sub: key; check whether a dsh sidecar (title/review) shape drifted past recognition`);
+    }
 }
 import { prefixAffinity, describeResumeMiss, type AnonymousAffinity } from "../prefix-affinity.js";
 import { buildAnonymousProvenance, type AnonymousProvenance } from "../anon-provenance.js";
@@ -148,6 +162,10 @@ function persistLineageLinkNow(session: Session): void {
  *  be noise on a stream that re-sends the same id every turn. */
 const vertexModelNormalised = new Set<string>();
 const VERTEX_MODEL_LOG_CAP = 64;
+
+/** #5582: ids already warned about for the sidecar anchor race (once each —
+ *  the fork decision repeats every turn of the affected conversation). */
+const anchorRaceWarned = new Set<string>();
 
 export async function handle(
     req: http.IncomingMessage,
