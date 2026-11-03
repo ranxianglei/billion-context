@@ -1712,6 +1712,14 @@ export const CALIBRATION_CLAMP_MAX = 4;
 // One lucky/degenerate pair must not flip every estimate on the route.
 export const CALIBRATION_SAMPLE_WINDOW = 3;
 const CALIBRATION_CONSISTENCY_RATIO = 2;
+// #4504 (round 2, #2313 shim profile): a local OpenAI-compatible endpoint may
+// bill at a divergent caliber — the #2313 incident shim billed ~200 B/token
+// (chars/40), i.e. ~1/10 of the chars/4 body estimate; overhead dilution pulls
+// the observed sample/pair ratio toward ~0.08, below CALIBRATION_SAMPLE_MIN by
+// design (k̂ must not learn such factors). This floor bounds how far below the
+// own-body band a report may sit and still correspond to its own payload when
+// the incumbent is ESTIMATE-sourced (an unmeasured phantom, not evidence).
+const DIVERGENT_CALIBER_FLOOR = 0.05;
 // #4425: write-side twin of the #4383 reader guard (the read side degrades a
 // stale anchor once it sits far below the established load; the write side
 // must be stricter because here the incumbent is EVIDENCE BEING DESTROYED,
@@ -1915,7 +1923,29 @@ export function settleUsageReport(
         const consistentWithOwnBody = pair !== undefined && pair >= CALIBRATION_MIN_ESTIMATE
             && pairOrigin !== undefined && sampleOrigin !== undefined && pairOrigin === sampleOrigin
             && s.total >= CALIBRATION_SAMPLE_MIN * pair && s.total <= CALIBRATION_SAMPLE_MAX * pair;
-        if (!consistentWithOwnBody) {
+        // #4504 (round 2): two more legitimate sub-scale MAIN shapes the band
+        // above cannot see through. (b) A report measured on a DIFFERENT
+        // upstream than the incumbent's provenance is a route-change recovery
+        // (#2313: baseline measured on a dead route, current route's real scale
+        // ~1/22 of it) — #1933 F2 already treats cross-origin measurements as
+        // non-comparable evidence, so such a sample cannot be an aux slip of
+        // the incumbent's context. (c) Against an ESTIMATE-sourced incumbent
+        // (an unmeasured phantom — poisoned meter, armed round) there is no
+        // real evidence to protect, so a same-route sample corresponding to
+        // its own prepared body is admitted even at a divergent billing
+        // caliber below the calibration band (#2313 b/d: the probe-400 arms
+        // re-stamp the origin to the live route, leaving only the body match).
+        // USAGE-sourced incumbents keep the strict band above — that is the
+        // #4425/#4805 protection surface.
+        const incumbentOrigin = normalizeUpstreamOrigin(session.stats.lastInputTokensOrigin);
+        const crossOriginRecovery = sampleOrigin !== undefined && incumbentOrigin !== undefined
+            && sampleOrigin !== incumbentOrigin;
+        const divergentCaliberRecovery = !crossOriginRecovery
+            && session.stats.lastInputTokensSource === "estimate"
+            && pair !== undefined && pair >= CALIBRATION_MIN_ESTIMATE
+            && pairOrigin !== undefined && pairOrigin === sampleOrigin
+            && s.total >= DIVERGENT_CALIBER_FLOOR * pair && s.total <= CALIBRATION_SAMPLE_MAX * pair;
+        if (!consistentWithOwnBody && !crossOriginRecovery && !divergentCaliberRecovery) {
             session.stats.inputTokens += s.total;
             // #4899 parity: the USD ledger bills on this path too — the tokens
             // were really spent even though no decision state moves.
