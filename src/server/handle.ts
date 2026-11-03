@@ -60,6 +60,7 @@ function onSessionResolveEvent(rawId: string, r: SessionOrderResolution): void {
     // rescue into a continuation is never logged as a false positive. Warn
     // once per id — the fork decision repeats every turn of the conversation.
     if (r.action === "derived-persona" && r.anchorRace && !anchorRaceWarned.has(rawId)) {
+        if (anchorRaceWarned.size >= ANCHOR_RACE_WARN_CAP) anchorRaceWarned.clear();
         anchorRaceWarned.add(rawId);
         loggerLog("warn", `[${rawId}] suspected sidecar anchor race (#5582): the raw-key anchor is held by a shallow (non-main) conversation when a main conversation arrived under a different persona — the main lane forked onto its own |sub: key; check whether a dsh sidecar (title/review) shape drifted past recognition`);
     }
@@ -164,8 +165,11 @@ const vertexModelNormalised = new Set<string>();
 const VERTEX_MODEL_LOG_CAP = 64;
 
 /** #5582: ids already warned about for the sidecar anchor race (once each —
- *  the fork decision repeats every turn of the affected conversation). */
+ *  the fork decision repeats every turn of the affected conversation). Capped
+ *  like warnedNoModelRequests: a long-lived proxy must not grow this set
+ *  without bound one conversation id at a time. */
 const anchorRaceWarned = new Set<string>();
+const ANCHOR_RACE_WARN_CAP = 4096;
 
 export async function handle(
     req: http.IncomingMessage,
