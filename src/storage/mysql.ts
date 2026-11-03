@@ -325,7 +325,10 @@ export class MysqlBackend implements StorageBackend {
     async init(): Promise<void> {
         const conn = await this.pool.getConnection();
         try {
-            const multi = MYSQL_DDL.trim();
+            // #5578: strip `--` line comments BEFORE splitting — a comment may
+            // contain `;`, and its orphaned tail would execute as SQL
+            // (ER_PARSE_ERROR on every MySQL boot). Blob has no literals.
+            const multi = MYSQL_DDL.replace(/--[^\n]*/g, "").trim();
             for (const stmt of multi.split(";")) {
                 const s = stmt.trim();
                 if (s.length === 0) continue;
