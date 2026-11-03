@@ -300,6 +300,13 @@ export function localDismissMode(id: string): "persistent" | "instance" | "alway
     return "absent";
 }
 
+/** Content-addressed dismiss key for a currently VISIBLE local record (the
+ *  same key the visibility gate filters on), else undefined (#5548 fix). */
+export function localDismissKey(id: string): string | undefined {
+    const rec = loadLocalRecords().find((r) => r.id === id && noticePassesGates(r, new Date(), process.env));
+    return rec ? `${id}@${contentHash16(rec)}` : undefined;
+}
+
 type MergedNotice = { source: "builtin"; id: string; tone: ToneName; keys: Record<string, string>; priority: number } | AnnouncementPayload;
 
 /** Single ordered payload for GET /__bili/notices and the overview field:

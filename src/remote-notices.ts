@@ -14,7 +14,7 @@ import { log as loggerLog, type Logger } from "./logger.js";
 import type { FetchOptions } from "./fetch-util.js";
 import { CHECK_INTERVAL_MS, egressDispatcher } from "./update.js";
 import type { NoticeRecord } from "./announcements.js";
-import { noticePassesGates, announcementPayload, validateRecord } from "./announcements.js";
+import { noticePassesGates, announcementPayload, validateRecord, contentHash16 } from "./announcements.js";
 
 /** Official feed location (trust boundary = who can push to this repo). */
 export const DEFAULT_ANNOUNCEMENTS_URL = "https://raw.githubusercontent.com/ranxianglei/billion-context/master/announcements/remote.json";
@@ -226,6 +226,13 @@ export function remoteAnnouncementPayloads(now: Date = new Date(), env: NodeJS.P
 export function remoteDismissMode(id: string): "persistent" | "instance" | "always" | "absent" {
     const rec = state.entries?.find((r) => r.id === id);
     return rec ? rec.dismiss : "absent";
+}
+
+/** Content-addressed dismiss key for a currently visible remote entry
+ *  (same key the visibility gate filters on), else undefined (#5548 fix). */
+export function remoteDismissKey(id: string): string | undefined {
+    const rec = visibleRemoteRecords().find((r) => r.id === id);
+    return rec ? `${id}@${contentHash16(rec)}` : undefined;
 }
 
 /** Read-only state for tests / diagnostics. */

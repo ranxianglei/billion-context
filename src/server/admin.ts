@@ -24,8 +24,8 @@ import { getStore } from "../persist.js";
 import { BodyTooLargeError, headerValue, readBody } from "../server.js";
 import { dismissHostPlugin, visibleHostPluginNotices } from "../host-plugin-notice.js";
 import { dismissUpgradeNotice } from "../pck-notice.js";
-import { mergedNotices, localDismissMode, markInstanceDismissal } from "../announcements.js";
-import { remoteAnnouncementPayloads, remoteDismissMode } from "../remote-notices.js";
+import { mergedNotices, localDismissKey, localDismissMode, markInstanceDismissal } from "../announcements.js";
+import { remoteAnnouncementPayloads, remoteDismissKey, remoteDismissMode } from "../remote-notices.js";
 import { listSessions, memoryReport, peekSession, splitSessionWarnings, totalInFlight } from "../session.js";
 import { BILI_TUNNEL_HEADER } from "../tunnel-guard.js";
 import { isLoopbackAddress } from "../util.js";
@@ -1047,27 +1047,27 @@ async function handleNoticeDismiss(req: http.IncomingMessage, res: http.ServerRe
         res.end(JSON.stringify({ error: 'expected JSON body {"id": "<notice id>"}' }, null, 2));
         return;
     }
-    // #5548 P2: route dismissal by the local record's declared mode before
-    // touching the persistent store (always = accept-and-ignore, instance =
-    // process memory only). Built-in and persistent ids fall through below.
-    const localMode = localDismissMode(id);
-    // #5548 P3: remote entries declare their own dismiss mode on the feed;
-    // route them the same way before touching anything persistent.
-    const remoteMode = localMode === "absent" ? remoteDismissMode(id) : localMode;
-    if (remoteMode === "always") {
+    // #5548 P2/P3 fix: persistent dismissals are stored CONTENT-ADDRESSED
+    // (id@hash) exactly like the visibility gate filters on them — storing
+    // the bare id landed on the builtin allowlist and 400'd every file/feed
+    // dismissal (caught by live smoke test 2026-11-03).
+    const localKey = localDismissKey(id);
+    const remoteKey = localKey === undefined ? remoteDismissKey(id) : undefined;
+    const declMode = localKey !== undefined ? localDismissMode(id) : remoteKey !== undefined ? remoteDismissMode(id) : "builtin";
+    if (declMode === "always") {
         log("info", `[notices] dismiss for always-mode ${id} accepted as no-op`);
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify({ ok: true }, null, 2));
         return;
     }
-    if (remoteMode === "instance") {
+    if (declMode === "instance") {
         markInstanceDismissal(id);
         log("info", `[notices] instance-mode ${id} dismissed for this process`);
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify({ ok: true }, null, 2));
         return;
     }
-    if (!dismissUpgradeNotice(id)) {
+    if (!dismissUpgradeNotice(localKey ?? remoteKey ?? id)) {
         res.writeHead(400, { "content-type": "application/json" });
         res.end(JSON.stringify({ error: `unknown notice: ${id}` }, null, 2));
         return;

@@ -14,7 +14,7 @@ process.env.BILI_CONFIG_FILE = path.join(root, "cfg.json"); // absent ⇒ defaul
 process.env.XDG_STATE_HOME = path.join(root, "state");
 const annDir = path.join(root, "announcements");
 
-const { matchesVersion, validateRecord, visibleLocalNotices, mergedNotices, contentHash16, markInstanceDismissal, localDismissMode, noticeBucket } = await import("../src/announcements.ts");
+const { matchesVersion, validateRecord, visibleLocalNotices, mergedNotices, contentHash16, markInstanceDismissal, localDismissMode, noticeBucket, localDismissKey } = await import("../src/announcements.ts");
 const { PCK_NOTICE_ID, WM_FASTPATH_INTRO_ID, dismissUpgradeNotice, dismissedUpgradeNotices } = await import("../src/pck-notice.ts");
 
 function drop(name: string, rec: unknown): void {
@@ -190,4 +190,22 @@ test("store cap: 200+ hashed keys trim down without dropping built-in ids", () =
     const set = dismissedUpgradeNotices(process.env);
     assert.ok(set.size <= 200, `trimmed to <=200, got ${set.size}`);
     assert.ok(set.has(PCK_NOTICE_ID), "built-in id protected from trimming");
+});
+
+test("dismiss key contract (handler path): bare id rejected, id@hash stored, edit re-nags once", () => {
+    clear();
+    // The store-cap test above left ~200 pad keys; start clean so trimming
+    // cannot evict the key under assertion.
+    fs.rmSync(path.join(root, "state"), { recursive: true, force: true });
+    const rec = base({ id: "handler-key", title: { en: "Handler path", "zh-CN": "处理器路径" } });
+    drop("h.json", rec);
+    assert.equal(dismissUpgradeNotice("handler-key", process.env), false, "bare local id must NOT be storable (allowlist)");
+    assert.ok(visibleLocalNotices().some((p) => p.id === "handler-key"));
+    const key = localDismissKey("handler-key");
+    assert.ok(key && /^handler-key@[0-9a-f]{16}$/.test(key), `key shape id@hash16: ${key}`);
+    assert.equal(dismissUpgradeNotice(key!, process.env), true);
+    assert.ok(!visibleLocalNotices().some((p) => p.id === "handler-key"), "gate filters on exactly this key");
+    drop("h.json", Object.assign({}, rec, { title: { en: "Edited", "zh-CN": "改了" } }));
+    assert.ok(visibleLocalNotices().some((p) => p.id === "handler-key"), "new content ⇒ new hash ⇒ shown again once");
+    clear();
 });
