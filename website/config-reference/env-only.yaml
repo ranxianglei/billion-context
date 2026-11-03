@@ -82,6 +82,14 @@ entries:
     group: envonly
     desc_en: "Where session records are stored (path relocation)."
     desc_zh: "会话记录的存放目录（路径重定位）。"
+  - key: BILI_ANNOUNCEMENTS_URL
+    type: string
+    default: "official raw URL of announcements/remote.json"
+    kind: env-only
+    audience: user
+    group: envonly
+    desc_en: "Override the remote announcements document URL (#5548 lane C): installs behind firewalls can point bili at their own relay of announcements/remote.json; unset = the official raw address. Path relocation; fail-open either way (unreachable or malformed document = no remote lane, never blocks startup or traffic)."
+    desc_zh: "覆盖远程公告文档地址（#5548 C 车道）：防火墙后的装机可指向自己中继的 announcements/remote.json；缺省 = 官方 raw 地址。路径重定位类；任何情况下 fail-open（拉不到/文档坏 = 无远程车道，永不阻断启动或流量）。"
   - key: BILI_ENCRYPTION_KEY
     type: string
     default: "unset"

@@ -392,6 +392,10 @@ bili --no-auto-update        # 本次启动禁用自动更新
 
 该检查默认 fail-open:公告源不可达或格式错误只产生警告,绝不阻断模型流量。禁用方式:配置(`"advisoryCheck": false`)或环境变量(`BILI_ADVISORY_CHECK=0`);可用 `"advisoryUrl"` / `BILI_ADVISORY_URL` 指向自定义文档。
 
+### 公告面（#5548）
+
+Web UI 的公告来自**三个来源、一套渲染器**：与代码行为绑定的内置声明（如 `prompt_cache_key` 默认翻转提示、增量解析实验性功能介绍）、用户自有的 JSON 文件（`~/.config/billion-context/announcements/` 下每文件一条记录，与远程车道共用同一套白名单校验）、以及本仓库 master 上的远程文档（`announcements/remote.json`，按自更新节奏拉取——发布/撤回远程公告就是向 master 推一次）。同 id 冲突时本地优先于远程、远程优先于内置。每条记录支持定向投放（`versions` 版本匹配、按安装实例的 `percent` 分桶、`since`/`until` 时间窗）与关闭模式：persistent（默认；内容变更后复现一次）、instance（重启后复现）、always（不渲染关闭按钮，重大事故用）。页面顶部最多渲染 5 条横幅，其余列在下方公告列表。整个面是单向广播、零遥测，且每个来源独立 fail-open——不可达或格式错误的来源只是缺席。防火墙后可用 `BILI_ANNOUNCEMENTS_URL` 把远程车道指向自己的中继。记录 schema 与环境变量见 [CONFIGURATION.zh-CN.md → 环境变量](CONFIGURATION.zh-CN.md#环境变量)。
+
 ## 配置
 
 完整的配置参考 —— 配置文件位置、顶层键、providers、压缩调参、环境变量 ——
