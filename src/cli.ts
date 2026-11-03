@@ -38,6 +38,7 @@ import { registerUpdateActions } from "./server/update-actions.js";
 import { startAdvisoryWatcher, getAdvisoryState, advisoryDeferring, advisoryBlocksVersion, advisoryAwaitingFirstCheck } from "./advisory.js";
 import { startReleaseNotesWatcher } from "./update-notes.js";
 import { startRemoteNoticesWatcher } from "./remote-notices.js";
+import { hydrateNoticeReceipts } from "./notice-store.js";
 import { resolveProxy } from "./upstream-proxy.js";
 import { runMcpStdio } from "./mcp.js";
 import { PLUGIN_AGENTS, isPluginAgent, pluginInstall, pluginRemove, pluginStatusAll, pluginUpdate, renderPluginList, warnActivePluginSessions, type PluginAgent } from "./plugin-install.js";
@@ -907,4 +908,7 @@ export async function main(): Promise<void> {
         remoteAnnouncementsUrl: opts.remoteAnnouncementsUrl,
         resolveProxy: (url) => resolveProxy(opts.routes, opts.proxy, url, opts.proxyFallback),
     });
+    // #5548: notice dismissal receipts ride the unified storage — hydrate the
+    // in-memory view once at boot (and migrate any legacy JSON file one time).
+    void hydrateNoticeReceipts();
 }
