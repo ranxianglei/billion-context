@@ -64,6 +64,24 @@ export const ROLLOUT_FEATURES: Record<string, RolloutPlan> = {
     // `rollout.features.pluginFullResendWatermark: true|false` (or a percent)
     // / `BILI_ROLLOUT_PLUGIN_FULL_RESEND_WATERMARK=1|0`.
     pluginFullResendWatermark: { percent: 5 },
+    // #5576 v6 (owner ruling 2026-11-03): canonical-watermark lane — the hit
+    // verdict comes SOLELY from unified-transcript row-chain alignment
+    // (the #3482 chain discipline: fold-time id fast path, identity-sig
+    // fallback, MIN_SEAM_RUN), replacing the v4/v5 byte-compare + width-
+    // arithmetic + head-drift gate stack as decision authority (they remain
+    // negative filters where they are pure server-side arithmetic). The view
+    // is served from stored rows (covered regions suppressed, synthetic
+    // anchors spliced) plus this turn's converted tail — NOTHING prefix-
+    // shaped is pinned in memory on a hit. Requires storage.unified=full
+    // (reads) and one prior fold (an active block anchors the rows); every
+    // verification miss degrades to the untouched legacy full-parse path
+    // byte-identically. Default 0% — nested INSIDE the pluginFullResendWatermark
+    // cohort by design (v6 evaluates only where the base watermark lane is
+    // already live): force on with `rollout.features.watermarkCanonicalV6: true`
+    // (or a percent) / `BILI_ROLLOUT_WATERMARK_CANONICAL_V6=1`. Companion
+    // env `BILI_PF_V6_REWRITE_STRICT=1` credits content-rewrite misses toward
+    // the breaker instead of letting them self-heal silently.
+    watermarkCanonicalV6: { percent: 0, base: "pluginFullResendWatermark" },
     // #4804 WS delta continuation: codex/opencode WebSocket clients that keep a
     // previous_response_id checkpoint stop reconstructing full history on every
     // turn — the session augments the delta with the server-committed previous

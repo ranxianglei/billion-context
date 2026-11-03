@@ -50,7 +50,7 @@ import { createHash } from "node:crypto";
 
 /** Client-tail walk budget. Full-resend histories are bounded by the wire;
  *  beyond this the lane degrades rather than scanning unbounded tails. */
-const MAX_CHAIN_WALK = 8192;
+export const MAX_CHAIN_WALK = 8192;
 
 /** #3812: a seam is only accepted after at least this many CONSECUTIVE chain
  *  matches. The identity signature has no id component, so a single sig hit
@@ -153,7 +153,10 @@ function parseRow(content: string, seq: number, ts?: number | null): BiliMessage
 // everything in clientMsgs at indices >= tailStart rides the outbound verbatim,
 // everything below is server-rendered territory. Exposed so the egress judge can
 // exempt the rendered prefix and validate only the tail it promises byte-intact.
-type ViewResult = { ok: true; view: BiliMessage[]; tailStart: number } | { ok: false; reason: string };
+type ViewResult = { ok: true; view: BiliMessage[]; tailStart: number; /** #5576 v6: first CLIENT index of the tail (core space) —
+ *  consumed by the canonical watermark lane to recover the element-space
+ *  window origin via wireIndex. Absent from the WS-lane result shape is NOT
+ *  a concern: every ok-return carries it, consumers that predate it ignore it. */ clientJoin?: number } | { ok: false; reason: string };
 
 interface TranscriptBase {
     rows: ViewRow[];
@@ -416,8 +419,16 @@ function buildView(session: Session, clientMsgs: BiliMessage[]): ViewResult {
     // the judge would validate nothing (vacuous clean — the regression that
     // blinded the #4241 teeth on the T1-consolidation train).
     const tailCount = clientMsgs.length - clientJoin;
-    return { ok: true, view: merged, tailStart: merged.length - tailCount };
+    // #5576 v6: surface the client-domain seam (element-recovery input for
+    // the canonical watermark lane); tailStart above stays VIEW-domain (#4241).
+    return { ok: true, view: merged, tailStart: merged.length - tailCount, clientJoin };
 }
+
+/** #5576 v6 canonical watermark lane: same probe under a purpose-named
+ *  export so the fastpath module never reaches into snapshot-render's
+ *  private surface. Zero behavior change for the snapshotRender feature
+ *  itself — maybeSnapshotView consumes .view/.tailStart exactly as before. */
+export const alignClientAgainstTranscript = buildView;
 
 // ---------------------------------------------------------------------------
 // #4804 anchored render — WS delta continuation lane (codex/opencode clients

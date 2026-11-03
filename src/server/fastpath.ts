@@ -31,8 +31,20 @@
 // change the count and are caught by the k-behind/k-ahead verdicts before
 // any stale core could feed the kernel; under v4 (count relaxation below)
 // the catch moves from the client echo to the ledger width arithmetic itself.
+//
+// v6 canonical lane (#5576, owner ruling 2026-11-03, rollout-gated
+// `watermarkCanonicalV6`, default OFF): the hit verdict comes SOLELY from
+// unified-transcript row-chain alignment (alignClientAgainstTranscript —
+// fold-time id fast path, identity-sig fallback, MIN_SEAM_RUN discipline).
+// The byte-compare / width-arithmetic machinery survives ONLY as negative
+// filters built from server-side arithmetic over client-declared ledger ids;
+// nothing compares prefix BYTES anymore, the rows ARE the prefix proof.
+// On a hit the view is served from stored rows (covered regions suppressed,
+// synthetic anchors spliced) plus this turn's converted tail; NO prefix-
+// shaped state is pinned in memory (the seed stash is bypassed entirely on
+// canonical outcomes). Every doubt degrades to the untouched legacy path.
 import type { CoreMessage } from "acp-kernel";
-import type { OpenAIRequestBody } from "acp-kernel/wire";
+import type { BiliMessage, OpenAIRequestBody } from "acp-kernel/wire";
 import { openaiToCore } from "acp-kernel/wire";
 import type http from "node:http";
 import { createHash } from "node:crypto";
@@ -43,6 +55,7 @@ import { type RawStripCounts, stripRawStage } from "../marker/engine.js";
 import { INCREMENTAL_TURN_MARKER_HEADER } from "../incremental-lane.js";
 import { watermarkGateAllowed } from "./lane-decisions.js";
 import { scanMessagesSpans, type RawSpan } from "./fastpath-scan.js";
+import { alignClientAgainstTranscript, MAX_CHAIN_WALK } from "./snapshot-render.js";
 
 export const PF_COUNT_HEADER = "x-bili-pf-count";
 export const PF_SEQ_HEADER = "x-bili-pf-seq";
@@ -148,6 +161,11 @@ export interface FastpathOutcome {
      *  (undefined when no known header carried a value). Persisted by
      *  finalize as state `cs`; feeds the sess-change identity gate. */
     readonly clientSess?: string;
+    /** #5576 v6: produced on the canonical lane (hit AND miss). Finalize
+     *  must NOT pin seed-stash cores for these outcomes — retaining prefix-
+     *  shaped state in memory is exactly what the canonical lane removes; a
+     *  lane toggle back to v5 self-heals with one legacy verification turn. */
+    readonly canonical?: boolean;
 }
 
 /** #5418 v2: decode the shim's x-bili-pf-tail-ids value.
@@ -271,6 +289,13 @@ export function evaluateWatermarkFastpath(
     // three states: undefined = header absent (pure count mode); null =
     // present but malformed; array = shape-valid.
     const parsedTailIds = rawTailIds === undefined ? undefined : typeof rawTailIds === "string" ? parseTailIds(rawTailIds) : null;
+    // #5576 v6 (owner ruling 2026-11-03): when the canonical lane is live for
+    // this install the verdict comes from unified-transcript row-chain
+    // alignment instead of the v4/v5 machinery below — that code runs UNTOUCHED
+    // for everyone else (default OFF keeps v5 byte-behavior the default).
+    if (featureEnabled("watermarkCanonicalV6")) {
+        return evaluateCanonicalV6({ session, bodyText, scan, saved, stamped, parsedTailIds, nowCs, miss });
+    }
     // #5403/#5418 v4 count relaxation (owner ruling 2026-11-02): once a
     // session carries a ledger-proven tail-id list whose WIDTH matches its own
     // bookkeeping (len = T - seed.stampT + 1), msgid continuity proves the
@@ -415,6 +440,144 @@ export function evaluateWatermarkFastpath(
     return miss(seed === undefined ? "unseeded" : "seed-stale", false);
 }
 
+// #5576 v6 companion switch (env-only in v1): host-side rewrites that survive
+// every filter and break the row-chain are content-rewrite class. Default:
+// self-healing UNcredited legacy turns — host compaction/rewrite is normal
+// traffic, not misbehavior (the legacy rewrite-detection machinery then
+// marks the boundary and subsequent turns align against the rebased view).
+// Strict mode credits them toward the breaker for exotic hosts whose
+// thrash-rewriting would otherwise ride one free legacy turn forever.
+function rewriteStrict(): boolean {
+    return process.env.BILI_PF_V6_REWRITE_STRICT === "1";
+}
+
+/**
+ * #5576 v6 canonical lane. Decision authority = transcript row-chain
+ * alignment ONLY; the surviving pre-filters are pure server-side arithmetic
+ * over client-declared ledger ids (negative filters, no byte comparison):
+ *   ahead          echoed stamp above our own measurement (lying upstream);
+ *   tail-ids-shape ledger list width ≠ T - K + 1 (shrink/gap/misframe);
+ *   no-progress    count-only zero delta (empty window would pin nothing);
+ *   sess-change    swapped client-native session identity (R7, unchanged).
+ * The expensive stage converts the body once with the REAL codec (openaiToCore
+ * over the same bytes the legacy path would parse — zero codec mirroring,
+ * so cluster numbering can only agree with stored rows, never drift from it)
+ * and hands the cores to alignClientAgainstTranscript. On ok: view = stored
+ * rows up to the seam (covered regions suppressed behind synthetic anchors)
+ * + this turn's tail cores; system text is re-decoded from the CURRENT head
+ * every turn (passthrough by construction — there is no stashed system copy
+ * to drift from, which retires the v5 head-drift gate entirely). On any miss
+ * reason the caller runs the untouched legacy full-parse path; chain-class
+ * reasons (chain-not-started / seam-too-short) are content-rewrite class and
+ * credit per BILI_PF_V6_REWRITE_STRICT.
+ */
+function evaluateCanonicalV6(args: {
+    session: Session;
+    bodyText: string;
+    scan: { total: number; messageSpans: readonly RawSpan[]; fieldSpans: ReadonlyMap<string, RawSpan> };
+    saved: PFSavedState | null;
+    stamped: number;
+    parsedTailIds: string[] | null | undefined;
+    nowCs: string | undefined;
+    miss: (decision: string, credited: boolean, receivedTailIds?: string[]) => FastpathOutcome;
+}): FastpathOutcome {
+    const { session, bodyText, scan, saved, stamped, parsedTailIds, nowCs, miss } = args;
+    const mm = (decision: string, credited: boolean, receivedTailIds?: string[]): FastpathOutcome =>
+        ({ ...miss(decision, credited, receivedTailIds), canonical: true });
+    const T = scan.total;
+    if (!Number.isNaN(stamped) && stamped > T) return mm("ahead", true);
+    // Width arithmetic on the client-declared ledger list (server-side check;
+    // count-only clients carry no list and skip to pure alignment — v6 is
+    // ALSO their first watermark access, the stamp echo is not required).
+    let tailIds: string[] | undefined;
+    const K = saved?.t;
+    if (parsedTailIds !== undefined) {
+        if (parsedTailIds === null || (K !== undefined && parsedTailIds.length !== T - K + 1)) return mm("tail-ids-shape", false);
+        tailIds = parsedTailIds;
+    } else if (K !== undefined && T <= K) {
+        return mm("no-progress", false);
+    }
+    // R7 (unchanged from v5): a swapped client-native session riding one bili
+    // session is an identity event, asserted only when both sides claim one.
+    if (saved?.cs !== undefined && nowCs !== undefined && nowCs !== saved.cs) return mm("sess-change", false, tailIds);
+    // Cheap structural pre-gates before paying for a conversion:
+    const store = getStore();
+    if (!store || !store.replicasAvailable()) return mm("v6-store-unavailable", false, tailIds);
+    // One prior fold anchors the rows (unified-lane doctrine, #3482 client-
+    // authoritative pre-fold); pre-fold sessions run the untouched path.
+    if (!session.state.blocks.some((b) => b.active)) return mm("v6-pre-fold", false, tailIds);
+    // Conversion range: the WHOLE body when affordable — the intra-call
+    // cluster counter must see exactly the same occurrence stream the legacy
+    // single-parse minted (windowed conversion would renumber duplicate
+    // contents and desync the id fast path); the walk budget caps how far
+    // alignment ever looks, so beyond MAX_CHAIN_WALK elements we convert the
+    // walk-reachable suffix only (documented residual: dup-content bodies
+    // past the cap lean on the sig fallback there).
+    const spans = scan.messageSpans;
+    const lo = T > MAX_CHAIN_WALK ? T - MAX_CHAIN_WALK : 0;
+    const midBody: { messages: unknown } = { messages: [] };
+    midBody.messages = parseElementSlices(bodyText, spans.slice(lo));
+    if (!Array.isArray(midBody.messages)) return mm("fragment-parse", false, tailIds);
+    const midCounts = stripRawStage(midBody, "openai");
+    const cores = openaiToCore(midBody as OpenAIRequestBody);
+    const res = alignClientAgainstTranscript(session, cores.msgs as BiliMessage[]);
+    if (!res.ok) {
+        const rewriteClass = res.reason === "chain-not-started" || res.reason === "seam-too-short";
+        return mm(`v6-${res.reason}`, rewriteClass && rewriteStrict(), tailIds);
+    }
+    const clientJoin = res.clientJoin;
+    // A full-length join (every converted core "anchored", no unmatched
+    // trailing tail) is the signature of the documented sig-fallback
+    // residual: a FRESH trailing element whose content collides with stored
+    // history false-matches an old row through the sig path and swallows the
+    // new tail (view would silently drop it). Degrade to legacy instead —
+    // never serve a hit that ends before the request does.
+    if (typeof clientJoin !== "number" || clientJoin >= cores.msgs.length) return mm("v6-no-seam-origin", false, tailIds);
+    // Element-space window origin: codecs stamp each core with wireIndex =
+    // its source element ordinal in the converted array (kernel contract,
+    // bili-message sidecar doc). Windowed conversions number relative to lo.
+    const seamWi = (cores.msgs[clientJoin] as { wireIndex?: unknown }).wireIndex;
+    let eStar: number;
+    if (typeof seamWi === "number") eStar = lo + seamWi;
+    else if (K !== undefined) eStar = K; // codec gap: fall back to the persisted anchor
+    else return mm("v6-no-seam-origin", false, tailIds);
+    if (!(eStar >= lo && eStar < T)) return mm("v6-no-seam-origin", false, tailIds);
+    // System passthrough (R3): decoded fresh from the CURRENT head every
+    // turn — rows exclude hoisted system by design, so this is runtime state
+    // flow, not prefix identity. The ≤8-element fragment also carries the
+    // strip counts for the pre-window region on capped conversions.
+    const headEnd = Math.min(HEAD_CHECK_ELEMENTS, T);
+    const headFragment: { messages: unknown } = { messages: [] };
+    headFragment.messages = parseElementSlices(bodyText, spans.slice(0, headEnd));
+    if (!Array.isArray(headFragment.messages)) return mm("fragment-parse", false, tailIds);
+    const headCounts = stripRawStage(headFragment, "openai");
+    const systemText = openaiToCore(headFragment as OpenAIRequestBody).systemText ?? "";
+    const markerCounts = lo > 0 ? addStripCounts(headCounts, midCounts) : midCounts;
+    return {
+        hit: {
+            view: res.view as CoreMessage[],
+            windowCores: cores.msgs.slice(clientJoin) as CoreMessage[],
+            systemText,
+            totalT: T,
+            fieldSpans: scan.fieldSpans,
+            windowMessages: midBody.messages.slice(eStar - lo),
+            // Canonical lanes serve ACTUALLY-ingested cores: sidecars
+            // (imagePart/rawOpenaiContent) survive the fold pipeline intact
+            // and the egress positional rule computes over the real array —
+            // the v5 multimodal degradation exists solely because the seed
+            // STASH could not reproduce legacy bytes, which v6 has none of.
+            seedMultimodal: false,
+            markerCounts,
+        },
+        measuredT: T,
+        decision: "hit-v6",
+        creditedMiss: false,
+        receivedTailIds: tailIds,
+        clientSess: nowCs,
+        canonical: true,
+    };
+}
+
 /** #3642 identity continuity. openaiToCore mints cluster ids (base, or base_N
  * by INTRA-CALL occurrence order) and stamps wireIndex from the array position
  * it was given. The window fragment was parsed alone, so both are
@@ -532,20 +695,25 @@ export function finalizeWatermarkTurn(
     const T = outcome.measuredT;
     const saved = readSaved(session.id);
     if (outcome.hit) {
-        seeds.set(session, {
-            cores: outcome.hit.view,
-            systemText: outcome.hit.systemText,
-            stampT: T,
-            model: input.model,
-            stripCounts: outcome.hit.markerCounts,
-            lastTailIds: outcome.receivedTailIds,
-            multimodal: outcome.hit.seedMultimodal,
-        });
+        // #5576 v6: canonical outcomes pin NOTHING prefix-shaped in memory —
+        // retaining the view here would recreate the very OOM pair (#5403)
+        // the lane removes. A lane toggle back to v5 self-heals in one turn.
+        if (!outcome.canonical) {
+            seeds.set(session, {
+                cores: outcome.hit.view,
+                systemText: outcome.hit.systemText,
+                stampT: T,
+                model: input.model,
+                stripCounts: outcome.hit.markerCounts,
+                lastTailIds: outcome.receivedTailIds,
+                multimodal: outcome.hit.seedMultimodal,
+            });
+        }
         writeSaved(session.id, { t: T, m: input.model, misses: 0, l: outcome.receivedTailIds, cs: outcome.clientSess ?? saved?.cs });
         headers[PF_SEQ_HEADER] = String(T);
         return headers;
     }
-    if (input.legacyCores.length > 0) {
+    if (input.legacyCores.length > 0 && !outcome.canonical) {
         seeds.set(session, {
             cores: input.legacyCores,
             systemText: input.rawSystemText,
