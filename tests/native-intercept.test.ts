@@ -26,6 +26,21 @@ test("isModelApiUrl: matches Google native wire shapes (#2493)", () => {
     assert.equal(isModelApiUrl("https://gw.example.com/api/v1beta/models/my-model@v2:generateContent"), true);
 });
 
+test("isModelApiUrl: Google model ids may carry a namespace (#5593)", () => {
+    // A provider prefix relayed verbatim in the path (omp `google-generative-ai`
+    // provider pointing at a gateway: `antigravity/gemini-3.8-flash`) and a
+    // gateway route (`group/hard`) are model ids, not path segments.
+    assert.equal(isModelApiUrl("http://127.0.0.1:3425/v1beta/models/antigravity/gemini-3.8-flash:streamGenerateContent"), true);
+    assert.equal(isModelApiUrl("http://127.0.0.1:3425/v1beta/models/antigravity/gemini-3.8-flash:streamGenerateContent?alt=sse"), true);
+    assert.equal(isModelApiUrl("http://127.0.0.1:3425/v1beta/models/group/hard:generateContent"), true);
+    assert.equal(isModelApiUrl("https://gw.example.com/v1beta/models/llmgateway-providers/google-vertex/gemini-3.8-flash:countTokens"), true);
+    // The namespace does not widen what counts as a model call: discovery lists
+    // and methods with no pipeline still go direct.
+    assert.equal(isModelApiUrl("http://127.0.0.1:3425/v1beta/models"), false);
+    assert.equal(isModelApiUrl("http://127.0.0.1:3425/v1beta/models/antigravity/gemini-3.8-flash:predict"), false);
+    assert.equal(isModelApiUrl("http://127.0.0.1:3425/v1beta/models/antigravity/gemini-3.8-flash"), false);
+});
+
 test("isModelApiUrl: matches Google Cloud Code v1internal wire shapes (#4256)", () => {
     assert.equal(isModelApiUrl("https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent"), true);
     assert.equal(isModelApiUrl("https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse"), true);
@@ -116,6 +131,15 @@ test("install: rewrites Google-wire model URLs through the proxy (#2493)", async
         assert.equal(res.status, 200);
     });
     assert.deepEqual(sink, ["http://127.0.0.1:40006/bili/http://127.0.0.1:8317/v1beta/models/gemini-3.8-flash-high:streamGenerateContent?alt=sse"]);
+});
+
+test("install: rewrites namespaced Google-wire model URLs through the proxy (#5593)", async () => {
+    const state: NativeInterceptState = { origin: "http://127.0.0.1:40008", ready: Promise.resolve("http://127.0.0.1:40008") };
+    const { sink } = await withPatch(state, async (fetch) => {
+        const res = await fetch("http://127.0.0.1:3425/v1beta/models/antigravity/gemini-3.8-flash:streamGenerateContent?alt=sse", { method: "POST" });
+        assert.equal(res.status, 200);
+    });
+    assert.deepEqual(sink, ["http://127.0.0.1:40008/bili/http://127.0.0.1:3425/v1beta/models/antigravity/gemini-3.8-flash:streamGenerateContent?alt=sse"]);
 });
 
 test("install: already-routed Google-wire /bili/ request gets plugin headers re-stamped (#2493)", async () => {
