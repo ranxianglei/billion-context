@@ -6,7 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
 
-// #5548 / PR #5577 reviewer supplement: pins the POST /__bili/notices/dismiss
+// #5548 / PR #5575 reviewer supplement: pins the POST /__bili/notices/dismiss
 // ROUTE end-to-end — the content-addressed fix (77c0e05c9) only unit-pins the
 // resolver+store, so an endpoint-glue regression slips past that pin. Shapes:
 // persistent LOCAL, built-in (bare allowlist), unknown (400), persistent REMOTE.

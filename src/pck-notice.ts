@@ -73,7 +73,8 @@ export function dismissUpgradeNotice(id: string, env: NodeJS.ProcessEnv = proces
     }
     const set = new Set(dismissedUpgradeNotices(env));
     set.add(id);
-    // bound the file — built-in ids are protected, oldest hashed keys trim first
+    // bound the file — built-in ids are protected; overflow evicts alphabetically
+    // (the flat legacy file carries no insertion times, so true FIFO is not possible here)
     let keys = [...set].sort();
     while (keys.length > MAX_DISMISSED_KEYS) {
         const victim = keys.find((k) => !isBuiltinNoticeId(k));
