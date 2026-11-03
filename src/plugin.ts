@@ -1228,9 +1228,14 @@ function reconstructRawTailForFork(session: Session): CoreMessage[] | null {
     if (!expected || expected.length === 0) return reconMiss(session, "empty-lastPassIds");
     const store = getStore();
     if (!store.replicasAvailable()) {
-        // #5595/F4: legacy storage has no unified tail rows, so this bail is permanent —
-        // name it instead of the misleading transient "sidecar-missing".
-        const detail = store.liveStorageStamp === "legacy"
+        // #5595/F4: name the bail by its ACTUAL cause. Structurally legacy-only
+        // instances will never have unified tail rows — say so with the
+        // actionable knob. Unified-configured instances whose sidecar is down
+        // right now keep the #5188 transient-vs-latched reason. liveStorageStamp
+        // cannot make this call: it reads "legacy" whenever replicasAvailable()
+        // is false, which would stamp every latched/corrupt-index instance as
+        // legacy-only.
+        const detail = !store.configuredUnified
             ? "durable storage is legacy-only (json) — fork inheritance needs the unified store (storage.unified=shadow|full); this child rebuilds raw history (a large first request)"
             : store.sidecarDownReason();
         return reconMiss(session, "replicasUnavailable", detail);

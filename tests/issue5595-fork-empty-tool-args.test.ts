@@ -16,6 +16,12 @@ import {
     EMPTY_TOOL_CALLS_ARGUMENTS_PLACEHOLDER,
 } from "../src/util.ts";
 import { createOpenaiAdapter } from "../src/loop/index.ts";
+import { SessionStore } from "../src/persist.ts";
+import { UnifiedShadow } from "../src/storage/shadow.ts";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import * as path from "node:path";
+import { rmrf } from "./tmp-rm.ts";
 
 // --- isValidToolCallArguments: the single definition of a sendable argument ---
 test("#5595 isValidToolCallArguments accepts exactly a JSON object string", () => {
@@ -106,4 +112,99 @@ test("#5595 wiring: buildRequest heals an empty history tool-call arg, keeps a v
     assert.equal(byId.get("call_empty"), EMPTY_TOOL_CALLS_ARGUMENTS_PLACEHOLDER, "empty history arg becomes the placeholder");
     JSON.parse(byId.get("call_empty")!); // sendable
     assert.equal(byId.get("call_ok"), '{"cmd":"ls"}', "valid history arg stays byte-exact");
+});
+
+// --- #5595/F4: the replicasUnavailable detail must name the ACTUAL cause ---
+//
+// The first F4 revision branched on liveStorageStamp === "legacy" — which is
+// ALWAYS true inside the !replicasAvailable() branch (the stamp reads legacy
+// whenever the sidecar is absent/disabled), so its else branch was dead code
+// and every unified-configured instance with a down sidecar got stamped
+// "durable storage is legacy-only" — mislabeling exactly the recoverable/
+// latched cases F4 exists to tell apart. The discriminator is the
+// constructor-time resolution (configuredUnified). Pin both branches against
+// real stores: structurally legacy, and full-configured with a 3-strike-latched
+// sidecar (stats.disabled flipped post-open — the #4942 seam skips env-driven
+// open so no IO error simulation is needed).
+const ENV_KEYS = ["BILI_SESSIONS_DIR", "BILI_CONFIG_FILE", "XDG_CACHE_HOME", "XDG_STATE_HOME", "BILI_STORAGE_UNIFIED", "BILI_ENCRYPTION_KEY"] as const;
+
+function isolateEnv(base: string): Record<string, string | undefined> {
+    const snap: Record<string, string | undefined> = {};
+    for (const k of ENV_KEYS) snap[k] = process.env[k];
+    const sessions = path.join(base, "sessions");
+    mkdtempSync(sessions);
+    process.env.BILI_SESSIONS_DIR = sessions;
+    process.env.BILI_CONFIG_FILE = path.join(base, "absent-config.json");
+    process.env.XDG_CACHE_HOME = path.join(base, "cache");
+    process.env.XDG_STATE_HOME = path.join(base, "state");
+    delete process.env.BILI_STORAGE_UNIFIED;
+    delete process.env.BILI_ENCRYPTION_KEY;
+    return snap;
+}
+
+function restoreEnv(snap: Record<string, string | undefined>): void {
+    for (const k of ENV_KEYS) {
+        if (snap[k] === undefined) delete process.env[k];
+        else process.env[k] = snap[k];
+    }
+}
+
+test("#5595/F4 structural legacy-only instance selects the actionable config message", () => {
+    const base = mkdtempSync(path.join(tmpdir(), "bili-5595f4-legacy-"));
+    const snap = isolateEnv(base);
+    process.env.BILI_STORAGE_UNIFIED = "legacy";
+    try {
+        const store = new SessionStore({ dir: process.env.BILI_SESSIONS_DIR, enabled: true });
+        assert.equal(store.configuredUnified, false, "knob resolved to legacy at construction");
+        assert.equal(store.replicasAvailable(), false);
+        assert.equal(store.sidecarDownReason(), "sidecar-missing");
+        assert.equal(store.liveStorageStamp, "legacy");
+        assert.ok(!store.configuredUnified, "⇒ the F4 bail must take the legacy-only branch here");
+    } finally {
+        restoreEnv(snap);
+        rmrf(base);
+    }
+});
+
+test("#5595/F4 unified-configured instance with latched sidecar keeps the #5188 reason", () => {
+    const base = mkdtempSync(path.join(tmpdir(), "bili-5595f4-latched-"));
+    const snap = isolateEnv(base);
+    process.env.BILI_STORAGE_UNIFIED = "full";
+    try {
+        const sessions = process.env.BILI_SESSIONS_DIR!;
+        const shadow = UnifiedShadow.maybeOpen(sessions, process.env);
+        assert.ok(shadow, "builtin node:sqlite opens a real sidecar in full mode");
+        shadow.stats.disabled = true; // the 3-strike latch state
+        const store = new SessionStore({ dir: sessions, enabled: true, shadow });
+        assert.equal(store.configuredUnified, true, "configured unified despite the down sidecar");
+        assert.equal(store.replicasAvailable(), false);
+        assert.equal(store.sidecarDownReason(), "sidecar-disabled");
+        assert.equal(
+            store.liveStorageStamp,
+            "legacy",
+            "the conflation F4 must not branch on: live stamp reads legacy while the instance is configured unified",
+        );
+        assert.ok(!store.configuredUnified === false, "⇒ the F4 bail must keep sidecarDownReason() here, not the legacy-only message");
+    } finally {
+        restoreEnv(snap);
+        rmrf(base);
+    }
+});
+
+test("#5595/F4 encryption-blocked instance is structurally legacy despite a unified knob", () => {
+    const base = mkdtempSync(path.join(tmpdir(), "bili-5595f4-encrypted-"));
+    const snap = isolateEnv(base);
+    process.env.BILI_STORAGE_UNIFIED = "full";
+    process.env.BILI_ENCRYPTION_KEY = "0000000000000000000000000000000000000000000000000000000000000000";
+    try {
+        const store = new SessionStore({ dir: process.env.BILI_SESSIONS_DIR, enabled: true });
+        assert.equal(store.configuredUnified, false, "the hard-block resolves the instance to legacy-only at construction");
+        assert.equal(store.replicasAvailable(), false);
+        assert.equal(store.sidecarDownReason(), "sidecar-missing");
+        assert.equal(store.liveStorageStamp, "legacy");
+        assert.ok(!store.configuredUnified, "⇒ the F4 bail takes the legacy-only branch (the startup alarm names the key)");
+    } finally {
+        restoreEnv(snap);
+        rmrf(base);
+    }
 });
