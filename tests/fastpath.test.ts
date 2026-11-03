@@ -519,3 +519,21 @@ test("v5: client session-id swap under stable host msgids misses sess-change, re
     const backA = runTurn(session, { ...A, ...TAIL(["q2", "r2"]) }, b4);
     assert.equal(backA.out.decision, "sess-change", LOGS.join("\n"));
 });
+
+test("v5: sess-change gate is NEUTRAL when either side claims nothing (no spurious misses)", () => {
+    LOGS.length = 0;
+    makeStubStore();
+    const session = freshSession("pf-v5-sess-neutral");
+    const b1 = bodyOf([SYS("s"), USR("a"), USR("b")]);
+    // Seed turn carries NO session header -> nothing recorded yet. A later
+    // request that DOES carry one must not be treated as a swap ...
+    assert.equal(runTurn(session, {}, b1).out.decision, "no-stamp");
+    const b2 = bodyOf([SYS("s"), USR("a"), USR("b"), USR("c")]);
+    const firstSeen = runTurn(session, { "x-conversation-id": "conv-A", ...TAIL(["p1", "p2"]) }, b2);
+    assert.equal(firstSeen.out.decision, "hit(no-count)", LOGS.join("\n"));
+    // ...and once an identity IS recorded, a follow-up WITHOUT the header is
+    // equally neutral (hosts may rotate which headers they send).
+    const b3 = bodyOf([...JSON.parse(b2).messages, USR("d")]);
+    const dropped = runTurn(session, TAIL(["p2", "q1"]), b3);
+    assert.equal(dropped.out.decision, "hit(no-count)", LOGS.join("\n"));
+});
