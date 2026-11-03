@@ -1741,7 +1741,7 @@ export function preCompactionArchiveOf(session: Session): PreCompactionArchive {
 // retained tail's live tag.
 // #5589: defined in state-hydration.js so the storage rebuild seam can skip
 // the floor row without importing the session layer; re-exported for the
-// existing importers (fork-adoption, tests).
+// existing test importers.
 export { REF_FLOOR_RAW_ID } from "./state-hydration.js";
 import { REF_FLOOR_RAW_ID } from "./state-hydration.js";
 
