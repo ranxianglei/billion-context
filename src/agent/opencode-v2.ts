@@ -52,7 +52,7 @@ import { randomUUID } from "node:crypto";
 import { ACP_TOOLS_OPENAI, ABSORB_TOOL_OPENAI } from "../compress-tool.js";
 import { asciiHeaderValue, fetchManifest, fetchProxyVersion, fetchStatus, fitNoticeDescription, forwardTool, postIdentityRegister, proxyBaseFromEnv, proxyBaseFromUrl, reportCompactionBoundary, reportRuntimeInfoOnChange, V2_SYNTHETIC_TEXT } from "./shared.js";
 import { createForkAdopter } from "./fork-adopt.js";
-import { directExemptMatch, isModelApiUrl } from "./native-intercept.js";
+import { directExemptMatch, isModelApiUrl, routedBiliModelUrl } from "./native-intercept.js";
 import { logHostEvent } from "./host-log.js";
 
 // OpenCode V2 TUI renders a synthetic message as a visible Notice row only when its display text fits the
@@ -446,12 +446,17 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
                 let httpTunnel: string | undefined;
                 if (state.proxyBase !== undefined && reqUrl !== undefined && reqUrl.startsWith(`${state.proxyBase}/bili/`)) {
                     httpTunnel = reqUrl.replace("/bili/http", "/bili/responses/http");
-                } else if (state.proxyBase !== undefined && isModelApiUrl(httpUrl)) {
-                    // #4276: the hook no longer rewrites the shared request, so a raw
-                    // model URL still needs its tunnel built here — byte-identical to
-                    // what the old rewrite + replace pipeline produced (and a
-                    // /bili/-baked foreign URL fails isModelApiUrl exactly as before).
-                    httpTunnel = `${state.proxyBase}/bili/responses/${httpUrl}`;
+                } else if (state.proxyBase !== undefined) {
+                    // #4276: the hook no longer rewrites the shared request, so the tunnel
+                    // is built here from whatever shape arrived — byte-identical to what
+                    // the old rewrite + replace pipeline produced. A raw model URL tunnels
+                    // as-is. A /bili/-baked overlay whose origin predates a launcher
+                    // respawn (respawn binds a fresh dynamic port) misses branch 1's prefix
+                    // and its /bili/ path fails isModelApiUrl — without decoding it would
+                    // drop the handshake and connect the host to the dead origin, so decode
+                    // the embedded upstream and tunnel from the live origin instead.
+                    const upstream = routedBiliModelUrl(httpUrl) ?? (isModelApiUrl(httpUrl) ? httpUrl : undefined);
+                    if (upstream !== undefined) httpTunnel = `${state.proxyBase}/bili/responses/${upstream}`;
                 }
                 if (httpTunnel === undefined) return;
                 e.url = httpTunnel.replace(/^http/, "ws");
