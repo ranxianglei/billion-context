@@ -1227,7 +1227,14 @@ function reconstructRawTailForFork(session: Session): CoreMessage[] | null {
     const expected = session.state.lastPassIds;
     if (!expected || expected.length === 0) return reconMiss(session, "empty-lastPassIds");
     const store = getStore();
-    if (!store.replicasAvailable()) return reconMiss(session, "replicasUnavailable", store.sidecarDownReason());
+    if (!store.replicasAvailable()) {
+        // #5595/F4: legacy storage has no unified tail rows, so this bail is permanent —
+        // name it instead of the misleading transient "sidecar-missing".
+        const detail = store.liveStorageStamp === "legacy"
+            ? "durable storage is legacy-only (json) — fork inheritance needs the unified store (storage.unified=shadow|full); this child rebuilds raw history (a large first request)"
+            : store.sidecarDownReason();
+        return reconMiss(session, "replicasUnavailable", detail);
+    }
     const seqs = store.unifiedTailSeqs(session.id);
     if (!seqs || seqs.length === 0) return reconMiss(session, "empty-tailSeqs", `expected=${expected.length}`);
     const rows = store.unifiedTailViewRows(session.id);
