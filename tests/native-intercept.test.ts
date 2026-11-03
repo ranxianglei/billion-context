@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { createLiveOriginResolver, installNativeFetchIntercept, isModelApiUrl, liveStateSlotEffect, noteRoutedOrigin, observeRoutedOrigin, _resetForTest, _setRespawnCooldownForTest, type NativeInterceptState } from "../src/agent/native-intercept.ts";
 import { makeRecordingFetch, runHotReplace, type RecordedCall } from "./helpers/hot-replace.ts";
+import * as pfChannel from "../src/agent/pf-channel.ts";
 
 test("isModelApiUrl: matches model-API endpoint shapes", () => {
     assert.equal(isModelApiUrl("http://127.0.0.1:8199/v1/messages"), true);
@@ -23,6 +24,21 @@ test("isModelApiUrl: matches Google native wire shapes (#2493)", () => {
     assert.equal(isModelApiUrl("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent"), true);
     assert.equal(isModelApiUrl("http://127.0.0.1:8317/v1beta/models/gemini-2.5-flash:countTokens"), true);
     assert.equal(isModelApiUrl("https://gw.example.com/api/v1beta/models/my-model@v2:generateContent"), true);
+});
+
+test("isModelApiUrl: Google model ids may carry a namespace (#5593)", () => {
+    // A provider prefix relayed verbatim in the path (omp `google-generative-ai`
+    // provider pointing at a gateway: `antigravity/gemini-3.8-flash`) and a
+    // gateway route (`group/hard`) are model ids, not path segments.
+    assert.equal(isModelApiUrl("http://127.0.0.1:3425/v1beta/models/antigravity/gemini-3.8-flash:streamGenerateContent"), true);
+    assert.equal(isModelApiUrl("http://127.0.0.1:3425/v1beta/models/antigravity/gemini-3.8-flash:streamGenerateContent?alt=sse"), true);
+    assert.equal(isModelApiUrl("http://127.0.0.1:3425/v1beta/models/group/hard:generateContent"), true);
+    assert.equal(isModelApiUrl("https://gw.example.com/v1beta/models/llmgateway-providers/google-vertex/gemini-3.8-flash:countTokens"), true);
+    // The namespace does not widen what counts as a model call: discovery lists
+    // and methods with no pipeline still go direct.
+    assert.equal(isModelApiUrl("http://127.0.0.1:3425/v1beta/models"), false);
+    assert.equal(isModelApiUrl("http://127.0.0.1:3425/v1beta/models/antigravity/gemini-3.8-flash:predict"), false);
+    assert.equal(isModelApiUrl("http://127.0.0.1:3425/v1beta/models/antigravity/gemini-3.8-flash"), false);
 });
 
 test("isModelApiUrl: matches Google Cloud Code v1internal wire shapes (#4256)", () => {
@@ -117,6 +133,15 @@ test("install: rewrites Google-wire model URLs through the proxy (#2493)", async
     assert.deepEqual(sink, ["http://127.0.0.1:40006/bili/http://127.0.0.1:8317/v1beta/models/gemini-3.8-flash-high:streamGenerateContent?alt=sse"]);
 });
 
+test("install: rewrites namespaced Google-wire model URLs through the proxy (#5593)", async () => {
+    const state: NativeInterceptState = { origin: "http://127.0.0.1:40008", ready: Promise.resolve("http://127.0.0.1:40008") };
+    const { sink } = await withPatch(state, async (fetch) => {
+        const res = await fetch("http://127.0.0.1:3425/v1beta/models/antigravity/gemini-3.8-flash:streamGenerateContent?alt=sse", { method: "POST" });
+        assert.equal(res.status, 200);
+    });
+    assert.deepEqual(sink, ["http://127.0.0.1:40008/bili/http://127.0.0.1:3425/v1beta/models/antigravity/gemini-3.8-flash:streamGenerateContent?alt=sse"]);
+});
+
 test("install: already-routed Google-wire /bili/ request gets plugin headers re-stamped (#2493)", async () => {
     const state: NativeInterceptState = {
         origin: "http://127.0.0.1:40007",
@@ -131,6 +156,37 @@ test("install: already-routed Google-wire /bili/ request gets plugin headers re-
     assert.equal(sink[0].url, "http://127.0.0.1:40007/bili/http://127.0.0.1:8317/v1beta/models/gemini-3.8-flash-high:streamGenerateContent?alt=sse");
     assert.equal(sink[0].headers["x-bili-plugin"], "dsh");
     assert.equal(sink[0].headers["x-bili-plugin-conversation"], "session-g");
+});
+
+test("install: direct-to-proxy model requests stamp and learn the watermark channel (#5403/#5418)", async () => {
+    const state: NativeInterceptState = { origin: "http://127.0.0.1:40009", ready: Promise.resolve("http://127.0.0.1:40009") };
+    const saved = globalThis.fetch;
+    _resetForTest();
+    const counts: (string | null)[] = [];
+    globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+        counts.push(new Headers(init?.headers ?? {}).get("x-bili-pf-count"));
+        // Every success stamps the next turn's truth, like the real core.
+        return new Response("{}", { status: 200, headers: { "x-bili-pf-seq": "8" } });
+    }) as typeof fetch;
+    try {
+        assert.equal(installNativeFetchIntercept(state), true);
+        // Seed one learned stamp the way a prior successful turn would have.
+        pfChannel.pfLearnStamp({ "x-bili-plugin-conversation": "pf-self-sid" }, 200, new Headers({ "x-bili-pf-seq": "7" }));
+        const direct = "http://127.0.0.1:40009/v1/chat/completions";
+        const header = { "x-bili-plugin-conversation": "pf-self-sid" };
+        // A self-addressed request (host dials the proxy root straight — dsh
+        // profile bundles) must carry the learned count; before 7aa43e63 this
+        // branch never stamped, so such lanes silently never seeded the channel.
+        await fetch(direct, { method: "POST", headers: header });
+        assert.equal(counts[0], "7");
+        // ...and it learns symmetrically: the stamp this response carries
+        // replaces what the next request sends.
+        await fetch(direct, { method: "POST", headers: header });
+        assert.equal(counts[1], "8");
+    } finally {
+        globalThis.fetch = saved;
+        _resetForTest();
+    }
 });
 
 test("install: waits for a not-yet-ready proxy before rewriting", async () => {

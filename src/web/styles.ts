@@ -124,6 +124,7 @@ body {
 .banner.warn { background: var(--amber-soft); border-color: var(--amber); color: var(--amber); }
 .banner.err { background: var(--red-soft); border-color: var(--red); color: var(--red); }
 .banner.info { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
+.banner.ok { background: var(--green-soft); border-color: var(--green); color: var(--green); }
 .banner .banner-title { font-weight: 600; margin-bottom: 6px; }
 .banner .banner-upgrade-now { display: block; margin-top: 8px; padding: 4px 12px; border: 1px solid currentColor; border-radius: var(--radius); background: transparent; color: inherit; font-size: 12.5px; cursor: pointer; }
 .banner .banner-upgrade-now:disabled { opacity: 0.55; cursor: default; }
