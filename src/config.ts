@@ -768,13 +768,71 @@ export function findRoute(routes: ProviderRoutes, upstreamUrl: string | undefine
     return key ? routes[key] : undefined;
 }
 
+/** #5612: clients like Qoder Desktop rewrite model ids client-side (`/`,`.`→`-`),
+ *  so an EXACT-name lookup misses the operator's declared entry and silently
+ *  falls to defaults. This canonical key treats `/`, `.`, `_` as interchangeable
+ *  and is case-insensitive; callers use it ONLY as a guarded fallback after an
+ *  exact match fails (see resolveModelEntryOnModels). */
+export function canonicalModelKey(name: string): string {
+    return name.toLowerCase().replace(/[./_]/g, "-");
+}
+
+export interface ResolvedModelEntry {
+    entry?: ModelEntry;
+    /** Set only on a non-exact (normalized) match: the operator's declared name. */
+    declaredName?: string;
+    /** True only when found via normalization rather than an exact name match. */
+    viaNormalization?: boolean;
+}
+
+function resolveModelEntryOnModels(
+    models: Record<string, ModelEntry> | undefined,
+    model: string | undefined,
+): ResolvedModelEntry {
+    if (!model || !models) return {};
+    const exact = models[model];
+    if (exact !== undefined) return { entry: exact };
+    const canon = canonicalModelKey(model);
+    if (canon.length === 0) return {};
+    let hit: string | undefined;
+    for (const name of Object.keys(models)) {
+        if (canonicalModelKey(name) === canon) {
+            if (hit === undefined) hit = name;
+            else return {}; // two declared names share the canonical key → ambiguous
+        }
+    }
+    if (hit === undefined) return {};
+    return { entry: models[hit], declaredName: hit, viaNormalization: true };
+}
+
+/** Per-model entry resolution for a request's model id: exact providers-table
+ *  match first (unchanged behavior), then a guarded canonical-key match (#5612).
+ *  Shared by every per-model lookup (context/output/compress/benefit/keepalive)
+ *  so the renamed-id miss is fixed once, not per call site. */
+export function resolveModelEntry(
+    routes: ProviderRoutes,
+    upstreamUrl: string | undefined,
+    model: string | undefined,
+): ResolvedModelEntry {
+    return resolveModelEntryOnModels(findRoute(routes, upstreamUrl)?.models, model);
+}
+
+/** Route-shaped variant for callers that already hold the matched ProviderRoute
+ *  (billing resign, cache keepalive). Same exact→guarded-normalized contract. */
+export function resolveModelEntryOnRoute(
+    route: ProviderRoute | undefined,
+    model: string | undefined,
+): ResolvedModelEntry {
+    return resolveModelEntryOnModels(route?.models, model);
+}
+
 export function resolveConfiguredContextLimit(
     routes: ProviderRoutes,
     upstreamUrl: string | undefined,
     model: string | undefined,
 ): number | undefined {
     if (!model || !upstreamUrl) return undefined;
-    const m = findRoute(routes, upstreamUrl)?.models?.[model];
+    const m = resolveModelEntry(routes, upstreamUrl, model).entry;
     if (m?.context && m.context > 0) return m.context;
     return undefined;
 }
@@ -791,7 +849,7 @@ export function resolveConfiguredOutputLimit(
     model: string | undefined,
 ): number | undefined {
     if (!model || !upstreamUrl) return undefined;
-    const m = findRoute(routes, upstreamUrl)?.models?.[model];
+    const m = resolveModelEntry(routes, upstreamUrl, model).entry;
     if (m?.output && m.output > 0) return m.output;
     return undefined;
 }
