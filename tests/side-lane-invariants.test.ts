@@ -403,18 +403,18 @@ function longHistory(count: number): CoreMessage[] {
     return msgs;
 }
 
-test("(K) settle keeps usage-grade truth: a far-smaller usage sample supersedes AND snapshots its payload size (#4805/#1492 B)", () => {
-    // #1492 B contract: the next real usage report ALWAYS self-heals the anchor —
-    // the settle side must not magnitude-gate (a poisoned 1.2M anchor over a
-    // folded 5K conversation is the SAME small-sample shape as side-lane
-    // pollution). #4805's protection moved entirely to the meter (K2): settle
-    // records WHICH request produced the anchor (lastUsagePayloadUpper) so the
-    // meter can refuse anchors written by tiny requests.
+test("(K) settle gates sub-scale samples billing-only; main-scale reports write and snapshot (#4425/#4805/#1492 B)", () => {
+    // #1492 B self-heal survives the #4425 write-side gate: a legitimate
+    // main-turn report at this conversation's scale always bills above 1/10
+    // of the established load (post-fold re-requests bill the UNFOLDED body;
+    // native compaction resets the anchor to zero). What the gate blocks is
+    // the auxiliary shape — billing two orders of magnitude below the session,
+    // whose acceptance WAS the #4805 pollution event. The reader-side meter
+    // guard (K2, lastUsagePayloadUpper) remains defense-in-depth.
     const session = anchorSession(300_000);
     session.stats.localInputEstimate = 2_600; // the side-lane request's own payload upper
     settleUsageReport(session, { total: 5_100, reportedCached: 128, output: 30, protocol: "openai" });
-    assert.equal(session.stats.lastInputTokens, 5_100, "usage-grade samples supersede unconditionally (#1492 B self-heal)");
-    assert.equal(session.stats.lastUsagePayloadUpper, 2_600, "the anchor carries its producing request's payload snapshot");
+    assert.equal(session.stats.lastInputTokens, 300_000, "#4425: sub-scale samples are billing-only — the main anchor stands");
     assert.equal(session.stats.inputTokens, 5_100, "counters accrue");
     // same-lane reports keep writing and re-snapshot
     session.stats.localInputEstimate = 295_000;
