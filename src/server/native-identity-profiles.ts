@@ -144,11 +144,9 @@ const BUILTIN_PROFILES: readonly NativeIdProfileDef[] = [
     },
 ];
 
-let envOverrideWarned = false;
-
 /** Resolve the active profile table: built-ins are the floor; the env JSON may
  *  add/replace rows by name, never remove built-ins. Malformed env JSON is
- *  ignored (fail-open, one warn per process). */
+ *  ignored (fail-open). */
 function nativeIdProfiles(): readonly NativeIdProfileDef[] {
     const raw = process.env["BILI_NATIVE_IDENTITY_PROFILES_JSON"];
     if (raw === undefined || raw.trim().length === 0) return BUILTIN_PROFILES;
@@ -180,19 +178,17 @@ function nativeIdProfiles(): readonly NativeIdProfileDef[] {
         }
         return merged;
     } catch {
-        if (!envOverrideWarned) {
-            envOverrideWarned = true;
-            // loggerLog-free on purpose: this module must stay import-light;
-            // the caller surfaces nothing — a bad override silently keeps the
-            // built-ins (fail-open, observation layer only).
-        }
+        // Malformed override: silently keep the built-ins (fail-open,
+        // observation layer only). No logger on purpose — this module must
+        // stay import-light.
         return BUILTIN_PROFILES;
     }
 }
 
-/** First matching profile, fixed priority wb → codex → cc → opencode → gemini →
- *  unknown. Plugin-lane traffic (agent-stamped) resolves to the AGENT name
- *  upstream of this table — those identities are bili-trusted, not forensics. */
+/** First matching profile wins: built-in rows in table order (wb → codex → cc
+ *  → opencode → gemini), then env-added rows, then unknown. Plugin-lane
+ *  traffic (agent-stamped) resolves to the AGENT name upstream of this table —
+ *  those identities are bili-trusted, not forensics. */
 export function resolveNativeIdProfile(
     headers: Record<string, string | string[] | undefined>,
     protocol: string | null | undefined,
