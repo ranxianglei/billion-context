@@ -28,5 +28,11 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # #2092: the validator transitively imports src modules that resolve
+      # acp-kernel to its built dist (file:./kernel link, inlined at bundle
+      # time) — same prerequisite as the main test matrix in ci.yml.
+      - name: Build in-repo kernel
+        run: npm --prefix kernel run build
+
       - name: Validate remote announcement feed
         run: node --import tsx scripts/validate-remote-announcements.ts
