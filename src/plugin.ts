@@ -72,7 +72,7 @@ import { promptInputTotal, declaredInclusiveFromUsage, type WireProtocol } from 
 import { stateDir } from "./paths.js";
 import { lookupToolUseIdSession, lookupToolWitness, recordToolUseId, recordToolWitness } from "./tool-ring.js";
 import { awaitDrain } from "./server/stream-io.js";
-import { incomingCoreMessages } from "./fork-adoption.js";
+import { incomingCoreMessages, seedTimestampsFromParent } from "./fork-adoption.js";
 import { BUILD_COMMIT } from "./version.js";
 import { isExternalSummaryBlock } from "./external-summary-marker.js";
 
@@ -1595,6 +1595,11 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
             if (parent.state.viewLatchConfigDigest) {
                 child.state.viewLatchConfigDigest = parent.state.viewLatchConfigDigest;
             }
+            // #5608/#5609: carry the timestamp ledger (raw-id-keyed cache bytes,
+            // same content-addressed discipline as the ref seeding above) so the
+            // child's first replay re-renders the provider-cached time= attrs
+            // instead of minting "now" for inherited history.
+            seedTimestampsFromParent(child, parent);
             // #2362: inverse of the orphan filter — a dead ref whose message IS
             // in the forked prefix is visible again in the child; refs outside
             // it stay dead (their messages are absent from the child too).

@@ -1,9 +1,23 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { BLOCKED_REF } from "acp-kernel";
+import http from "node:http";
+import { once } from "node:events";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { BLOCKED_REF, defaultConfig } from "acp-kernel";
 import { planForkAdoption, applyForkAdoption, seedTimestampsFromParent } from "../src/fork-adoption.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
-import type { Session } from "../src/session.ts";
+import { _resetSessionsForTest, getSession, type Session } from "../src/session.ts";
+import { startServer } from "../src/server.ts";
+import type { ProxyOptions } from "../src/config.ts";
+import { _setForTest } from "../src/registry.ts";
+import { setLogCapture } from "../src/logger.ts";
+import { prefixAffinity } from "../src/prefix-affinity.ts";
+import { flushPrefixAffinity } from "../src/affinity-persist.ts";
+import { closeServers } from "./server-close-guard.ts";
+
+process.env.NODE_ENV = "test";
 
 /**
  * #5608/#4313 regression pins for the timestamp-ledger carry. A stamp is keyed
@@ -109,4 +123,82 @@ test("applyForkAdoption without a parent ledger leaves the child stamp-free (hon
     const plan = planForkAdoption(parent, new Set(["p1", "r1"]), { seedAllRefs: true, includeBlocks: false });
     applyForkAdoption(child, plan, parent);
     assert.equal((child.state as MinimalSession["state"]).tsStamps, undefined);
+});
+
+test("resume-inheritance MISS seeds the timestamp ledger from the closest tracked chain (#5608 wiring)", { timeout: 90_000 }, async () => {
+    const dir = mkdtempSync(join(tmpdir(), "bili-miss-seed-"));
+    for (const key of ["XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME"]) process.env[key] = dir;
+    _resetSessionsForTest();
+    // Eight distinct messages: the miss diagnostics only judge chains at or
+    // above MIN_RESUME_PREFIX (8) — shorter chains never produce a closest
+    // candidate, so the seed rung would be unreachable below this floor.
+    const messages = [
+        { role: "user", content: "miss-seed turn one with enough substance to fingerprint" },
+        { role: "assistant", content: "miss-seed answer one" },
+        { role: "user", content: "miss-seed turn two" },
+        { role: "assistant", content: "miss-seed answer two" },
+        { role: "user", content: "miss-seed turn three" },
+        { role: "assistant", content: "miss-seed answer three" },
+        { role: "user", content: "miss-seed turn four" },
+        { role: "assistant", content: "miss-seed answer four" },
+    ];
+    const upstream = http.createServer((req, res) => {
+        req.resume();
+        req.on("end", () => {
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ id: "msg_test", role: "assistant", content: [{ type: "text", text: "answer" }], usage: { input_tokens: 1000, output_tokens: 10 } }));
+        });
+    });
+    upstream.listen(0, "127.0.0.1");
+    await once(upstream, "listening");
+    const uaddr = upstream.address();
+    assert(uaddr && typeof uaddr === "object");
+    const upstreamUrl = `http://127.0.0.1:${uaddr.port}`;
+    const options = { port: 0, host: "127.0.0.1", upstream: upstreamUrl, routes: { [upstreamUrl]: { models: { "claude-test": { context: 400000 } } } }, modelContextLimit: 400000, kernelConfig: defaultConfig(400000), compress: { injectTool: true, injectNudge: true, preserveRecentMessages: 1, preserveRecentTokens: 0, minCompressRangeChars: 100 }, promptCache: { routing: "auto" }, sessionHeader: "x-acp-session", log: true, debug: false, passthrough: false, autoUpdate: false, mitm: { enabled: false, domains: [] } } as ProxyOptions;
+
+    // Phase 1: build the old chain under id "old" and persist everything (session + affinity snapshot).
+    const store1 = new SessionStore({ dir: dir + "/sessions", enabled: true, debounceMs: 60_000 });
+    _setStoreForTest(store1);
+    _setForTest({});
+    const proxy1 = await startServer(options);
+    await once(proxy1, "listening");
+    const paddr1 = proxy1.address();
+    assert(paddr1 && typeof paddr1 === "object");
+    let oldStamps: Record<string, number> | undefined;
+    try {
+        const r1 = await fetch(`http://127.0.0.1:${paddr1.port}/bili/${upstreamUrl}/v1/messages`, { method: "POST", headers: { "content-type": "application/json", "x-acp-session": "old" }, body: JSON.stringify({ model: "claude-test", max_tokens: 1024, stream: false, messages }) });
+        assert.equal(r1.status, 200, await r1.text());
+        oldStamps = getSession("old").state.tsStamps;
+        assert.ok(oldStamps && Object.keys(oldStamps).length >= 8, "phase 1 minted stamps for the tagged history");
+        flushPrefixAffinity();
+        prefixAffinity.forget("old");
+        assert.ok(store1.flushSync(getSession("old")), "phase 1 session persisted");
+    } finally {
+        store1.closeQuietly();
+        await closeServers([proxy1], "miss-seed phase 1");
+    }
+
+    // Phase 2: fresh process state — the equal-depth replay under a NEW id is not a resume
+    // (byte-exact equal-depth replay is ruled out by design), so the gate misses; the closest
+    // chain must still donate its timestamp ledger before the first request serves.
+    _resetSessionsForTest();
+    const store2 = new SessionStore({ dir: dir + "/sessions", enabled: true, debounceMs: 60_000 });
+    _setStoreForTest(store2);
+    const logs: string[] = [];
+    setLogCapture((level, msg) => { if (level === "info") logs.push(msg); });
+    const proxy2 = await startServer(options);
+    await once(proxy2, "listening");
+    const paddr2 = proxy2.address();
+    assert(paddr2 && typeof paddr2 === "object");
+    try {
+        const r2 = await fetch(`http://127.0.0.1:${paddr2.port}/bili/${upstreamUrl}/v1/messages`, { method: "POST", headers: { "content-type": "application/json", "x-acp-session": "new" }, body: JSON.stringify({ model: "claude-test", max_tokens: 1024, stream: false, messages }) });
+        assert.equal(r2.status, 200, await r2.text());
+        const fresh = getSession("new");
+        assert.deepEqual(fresh.state.tsStamps, oldStamps, "the miss seeded the ledger from the closest chain instead of letting the stamp node mint now-times for days-old history");
+        assert.ok(logs.some((l) => l.includes("[resume-inheritance] miss: seeded") && l.includes("from closest chain old")), "seeding is logged, not silent");
+    } finally {
+        setLogCapture(null);
+        store2.closeQuietly();
+        await closeServers([proxy2, upstream], "miss-seed phase 2");
+    }
 });
