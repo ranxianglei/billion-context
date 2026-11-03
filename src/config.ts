@@ -991,10 +991,12 @@ export type ProxyOptions = {
      *  conversations keep the raw key. Opt out with env BILI_SUBAGENT_SPLIT=0
      *  or `subagentSplit: false` in the config file (env wins). */
     subagentSplit?: boolean;
-    /** Split a Claude-over-Responses lane when the instructions text changes
-     *  AND the incoming history does not continue the tracked chain
-     *  (default on). Opt out with env BILI_PERSONA_SPLIT=0 or
-     *  `personaSplit: false` in the config file (env wins). */
+    /** Split the Responses-wire lane keyed by the instructions fingerprint
+     *  (Claude Code over /v1/responses; Codex root threads / older builds)
+     *  when the instructions text changes AND the incoming history does not
+     *  continue the tracked chain (default on). Opt out with env
+     *  BILI_PERSONA_SPLIT=0 or `personaSplit: false` in the config file
+     *  (env wins). */
     personaSplit?: boolean;
     /** Opt-in fork block-adoption (#629, default off). ANONYMOUS clients
      *  (prefix-affinity) that fork their history inherit the parent's
@@ -1968,10 +1970,12 @@ type FileConfig = {
     /** Set `false` to keep Claude Code subagents on the main session (#970;
      *  env BILI_SUBAGENT_SPLIT=0 wins). */
     subagentSplit?: boolean;
-    /** Split a Claude-over-Responses lane when the instructions text changes
-     *  AND the incoming history does not continue the tracked chain
-     *  (default on). Opt out with env BILI_PERSONA_SPLIT=0 or
-     *  `personaSplit: false` in the config file (env wins). */
+    /** Split the Responses-wire lane keyed by the instructions fingerprint
+     *  (Claude Code over /v1/responses; Codex root threads / older builds)
+     *  when the instructions text changes AND the incoming history does not
+     *  continue the tracked chain (default on). Opt out with env
+     *  BILI_PERSONA_SPLIT=0 or `personaSplit: false` in the config file
+     *  (env wins). */
     personaSplit?: boolean;
     /** Opt-in fork block-adoption (#629): when an anonymous (prefix-affinity)
      *  client forks its history mid-conversation (edit / regenerate), the new
