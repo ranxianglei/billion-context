@@ -11,9 +11,25 @@
 //   * the tail fragment [k..T) — the only genuinely new content
 //   * each remaining top-level field individually (scalars + tools)
 // Prefix CORES come from the in-memory seed: the previous turn's canonical
-// openaiToCore output. Reuse is sound because wire identity is deterministic
+// openaiToCore output, SHARED across model projections (contract R6): one
+// logical ledger (`pf:state.lg`) per session, one derived projection per
+// (model × wire format) — the first request for a new model pays one full
+// legacy pass building that projection, subsequent turns are pure
+// incremental appends. Reuse is sound because wire identity is deterministic
 // (content-hash canonical ids, #3642): the legacy re-parse would mint exactly
 // the same cores for unchanged bytes.
+//
+// v6 canonical-ledger unification (owner rulings 2026-11-03, contract
+// R1–R8): the HIT DECISION derives from the canonical transcript ALIGNMENT,
+// not from parallel byte gates. Mechanically, snapshot-render's id fast-path
+// IS this channel's set-diff: host msgids are unique forever, so a list that
+// is a PURE APPEND to the session's cumulative ledger (`pf:state.lg`) is
+// equivalent to the backward id-chain anchored on the transcript succeeding.
+// Consuming snapshot-render's full walk here would pay the very O(N) parse
+// this lane exists to avoid (guidance item 2) — the set-diff fronts the same
+// semantic contract as the primary cheap gate; snapshot-render confirms on
+// the free turns (miss turns already pay the full parse; see
+// probeTranscriptAlignment).
 //
 // Fail-soft contract (anti-deviation lock): the legacy pipeline is UNTOUCHED
 // code — this module only swaps the inputs the caller feeds it when EVERY
@@ -26,11 +42,20 @@
 //
 // Declared trust boundary (§7.4 human review required): a client that edits
 // prefix bytes while keeping the element count constant is NOT detected (the
-// cost of skipping byte-level re-verification). Destructive rewrites —
-// announced compaction, truncation, reorders that add/remove elements —
-// change the count and are caught by the k-behind/k-ahead verdicts before
-// any stale core could feed the kernel; under v4 (count relaxation below)
-// the catch moves from the client echo to the ledger width arithmetic itself.
+// cost of skipping byte-level re-verification). v6: the verdict rides the
+// CANONICAL LEDGER instead of byte comparison — the list must be a pure
+// append to pf:state.lg (host msgids unique forever); a structural rewrite
+// that survives the shape gates takes ONE conservative credited legacy pass
+// and the increment rides passthrough-as-new-message from the next turn
+// (watermarkCompactionPassthrough knob, default ON; R4/O3), never a
+// speculative rebuild. The remaining pre-v6 gates survive WHERE ALIGNMENT
+// CANNOT COVER THEM: width arithmetic = shim-protocol shape validity +
+// server-side window-origin K (it re-verifies the exact width the ids assert);
+// the origin pin = a gap-tolerant alignment would ride a re-minted origin
+// slot the client no longer claims; the head SYSTEM-text gate = a prompt has
+// no msgid (flagged deviation: serving a stale prompt beats saving one
+// parse); model switch = physical projection partition (R6) over ONE logical
+// ledger. Count-only turns stay byte-identical to pre-v6 in every branch.
 import type { CoreMessage } from "acp-kernel";
 import type { OpenAIRequestBody } from "acp-kernel/wire";
 import { openaiToCore } from "acp-kernel/wire";
@@ -108,6 +133,9 @@ interface PFSeed {
     /** Verified head system run the stash was built under (real bytes). */
     readonly systemText: string;
     readonly stampT: number;
+    /** Projection-cache key (v6/R6): the seed is ONE (model × wire-format)
+     *  projection over the shared logical ledger — a model flip rebuilds the
+     *  projection via one legacy pass but keeps the id bookkeeping (`lg`). */
     readonly model: string;
     /** Full-body marker-strip ledger carried from the seed turn — the middle
      * region is never re-scanned, so its stripped-marker accounting rides
@@ -324,10 +352,10 @@ export function evaluateWatermarkFastpath(
     // #5571 v5: captured ONCE per evaluated turn — feeds the sess-change gate
     // below and rides the outcome so finalize persists it as state `cs`.
     const nowCs = clientSessDigest(req);
-    const miss = (decision: string, credited: boolean, receivedTailIds?: string[]): FastpathOutcome => {
+    const miss = (decision: string, credited: boolean, receivedTailIds?: string[], ledgerHold?: boolean): FastpathOutcome => {
         if (credited) noteCreditedMiss(session.id, decision, log);
         log("info", `[${session.id}] watermark fastpath miss (${decision}) — legacy full-parse this turn`);
-        return { hit: null, measuredT: T, decision, creditedMiss: credited, receivedTailIds, clientSess: nowCs };
+        return { hit: null, measuredT: T, decision, creditedMiss: credited, receivedTailIds, clientSess: nowCs, ...(ledgerHold !== undefined ? { ledgerHold } : {}) };
     };
     const seed = seeds.get(session);
     const rawTailIds = req.headers[PF_TAIL_IDS_HEADER];
@@ -378,7 +406,7 @@ export function evaluateWatermarkFastpath(
                 const prevKnown = seed.lastTailIds !== undefined && seed.lastTailIds.length > 0 ? seed.lastTailIds[seed.lastTailIds.length - 1] : undefined;
                 // "?" on EITHER side = no identity claim — no penalty; the
                 // byte-level head checks below remain the boundary truth
-                if (prevKnown !== undefined && prevKnown !== PF_SLOT_UNKNOWN && tailIds[0] !== prevKnown) return miss("tail-ids-prev", false);
+                if (prevKnown !== undefined && prevKnown !== PF_SLOT_UNKNOWN && tailIds[0] !== prevKnown) return miss("tail-ids-prev", false, tailIds);
             }
         }
         // #5571 v5 (owner ruling 2026-11-03): session continuity joins the
@@ -390,7 +418,59 @@ export function evaluateWatermarkFastpath(
         // asserted only when both sides do. Id mode only (no valid list
         // reached here without one).
         if (tailIds !== undefined && saved?.cs !== undefined) {
-            if (nowCs !== undefined && nowCs !== saved.cs) return miss("sess-change", false, tailIds);
+            if (nowCs !== undefined && nowCs !== saved.cs) return miss("sess-change", false, tailIds, true);
+        }
+        // --- v6 canonical-ledger classification (contract R1/R2/R4/R5) -----
+        // Runs LAST among identity gates: width (shape/origin K) and the
+        // origin pin above have already proven the window anchors on the
+        // verified range, and the cs gate has ruled out conversation swaps.
+        // The list spans slots [K-1 .. T-1], so every REAL id in it is either
+        // (a) the window origin — pinned above, neutralized there when the
+        // client re-mints it with no claim (#5418 v3) — or (b) inside the
+        // verified range [K .. T-1]. Ids OUTSIDE [K-1..] legitimately never
+        // reappear (pure-append traffic), so "vanishing from traffic" is NOT
+        // a signal — the only thing detectable HERE is a REAL id that arrived
+        // MID-LIST before a still-known id: history was structurally mutated
+        // (client compaction summary inserted between two ids this session
+        // already saw, or rows inserted/reordered) — the stashed prefix cores
+        // describe a world the client no longer resends. With
+        // watermarkCompactionPassthrough ON (default, R4/O3): ONE conservative
+        // legacy pass (CREDITED — parity with the pre-v6 credited `ahead`/
+        // head-drift catches; bounded by the 1h breaker on pathological
+        // cycles), then the increment rides PASSTHROUGH-AS-NEW-MESSAGE from
+        // the next turn — the summary block carries fresh host ids, the
+        // finalize set-diff appends them naturally, NO suppression logic, and
+        // never a speculative rebuild. OFF: skipped entirely — pre-v6
+        // semantics (such a list passes everything below and rides the
+        // stashed prefix under the v5 identity-only ruling, byte-compare
+        // demoted to the diagnostic warn further down).
+        let v6UnidentifiableIncrement = false;
+        if (tailIds !== undefined && featureEnabled("watermarkCompactionPassthrough")) {
+            const baseline = saved?.lg ?? saved?.l ?? [];
+            const known = new Set(baseline);
+            // Trailing region = maximal suffix holding NO known real id:
+            // exactly the fresh increment ('?' counts as trailing-neutral;
+            // an unknown real id claims NEWNESS, a known one ends the region).
+            let cursor = tailIds.length;
+            let newRealCount = 0;
+            while (cursor > 0) {
+                const s = tailIds[cursor - 1];
+                if (s !== PF_SLOT_UNKNOWN && known.has(s)) break;
+                if (s !== PF_SLOT_UNKNOWN) newRealCount += 1;
+                cursor -= 1;
+            }
+            // Mid-list check over indices [1, cursor): index 0 is the window
+            // ORIGIN — handled by the origin pin above (an unknown origin is
+            // explicitly neutralized there, #5418 v3/#5571 v5).
+            let midInsertion = false;
+            for (let i = 1; i < cursor; i++) {
+                if (tailIds[i] !== PF_SLOT_UNKNOWN && !known.has(tailIds[i])) { midInsertion = true; break; }
+            }
+            if (!midInsertion) v6UnidentifiableIncrement = T > K && newRealCount === 0;
+            if (midInsertion) {
+                return miss("rewrite-passthrough", true, tailIds);
+            }
+            log("debug", `[${session.id}] [pf-v6] set-diff ok: ${newRealCount} new real id(s), trailing region ${tailIds.length - cursor}/${tailIds.length} slots, ledger ${baseline.length}`);
         }
         if (seed.multimodal) return miss("seeded-multimodal", false, tailIds);
         const headEnd = Math.min(HEAD_CHECK_ELEMENTS, T);
@@ -452,6 +532,14 @@ export function evaluateWatermarkFastpath(
         if (contentDrifts > 0) log("warn", `[${session.id}] watermark v5: ${contentDrifts}/${driftTotal} head element(s) differ from the seed under stable host ids — riding the stashed prefix per owner ruling 2026-11-03 (diagnostic only; feeds M3 re-seeding signals)`);
         const windowRaw = openaiToCore(windowFragment as OpenAIRequestBody);
         if (windowRaw.systemText.trim() !== "") return miss("window-system-head", true, tailIds);
+        // R5: the body GREW (T > K) yet the increment carries NO host id —
+        // an unidentifiable delta. We do NOT speculate: replay the stashed
+        // snapshot (hit proceeds normally — every verifiable gate agreed)
+        // and leave the ledger untouched (growth below is a natural no-op);
+        // the structured diagnostic marks the gap for M3. Model-switch / fork
+        // id-space questions live in research holds O1/O2 (contract) — no
+        // speculative rebuild behavior may land ahead of them.
+        if (v6UnidentifiableIncrement) log("warn", `[${session.id}] [pf-v6] unidentifiable-increment: T=${T} K=${K} — body grew but the increment carries no host id; replaying the stashed snapshot WITHOUT ledger append (R5; model-switch/fork id behavior pending research holds O1/O2)`);
         const rekeyedWindow = rekeyWindowCores(windowRaw.msgs, K, seed.cores);
         // v4 diagnostics ride the decision string (the debug/panel surfaces
         // already print it): pure count mode stays byte-identical "hit" —
