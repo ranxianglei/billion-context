@@ -1255,7 +1255,8 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
             const errs = r.errors.join("; ") || "no blocks created";
             // #2362: machine-readable failure class for the [plugin] execution
             // line — outcome=refused alone never says why in the logs.
-            const gateReason = /cannot be anchored/.test(errs) ? "gate:cannot-anchor"
+            const gateReason = /overlap another range/i.test(errs) ? "gate:overlap"
+                : /cannot be anchored/.test(errs) ? "gate:cannot-anchor"
                 : /already compressed/.test(errs) ? "gate:already-compressed"
                 : /requested range\(s\) resolved/.test(errs) ? "gate:none-resolved"
                 : /too small/.test(errs) ? "gate:too-small"

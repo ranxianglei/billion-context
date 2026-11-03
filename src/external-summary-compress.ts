@@ -95,7 +95,12 @@ export async function applyConfiguredCompression(input: unknown, ctx: RewriteCtx
             instructions: `${ctx.session.meta.summaryInstructions ?? buildCompressSystemPrompt(undefined, messageTimestampSections(undefined))}\nWrite a faithful summary of the selected range ${range.startRef}-${range.endRef}. Preserve task status, constraints, decisions, exact code identifiers, paths and errors, and unfinished objectives with their source message refs. Submitted summary hints are non-authoritative. Never summarize or change the read-only reference.`
                 + summaryLengthBudgetClause(maxSummaryChars, ctx.config.compress.minSummaryLength) });
     }
-    if (work.length === 0) return compressResult("[Compression FAILED: no selected range passed the existing kernel protection checks. Nothing compressed.]", "refused", 0);
+    // #5541: when the whole batch was rejected atomically (overlapping ranges),
+    // surface the kernel's named conflict instead of the generic protection text.
+    const overlapError = preview.result.errors.find((error) => /overlap another range/i.test(error));
+    if (work.length === 0) return compressResult(overlapError
+        ? `[Compression FAILED: ${overlapError} Nothing compressed.]`
+        : "[Compression FAILED: no selected range passed the existing kernel protection checks. Nothing compressed.]", "refused", 0);
     const batch = await plan.summarize(work, signal);
     if (signal?.aborted || ctx.session.state !== state || ctx.session.revisionEpoch !== revision) return compressResult("[Compression FAILED: cancelled or session changed while generating external summaries. Nothing compressed.]", "refused", 0);
     const successful: ParsedRange[] = [];
