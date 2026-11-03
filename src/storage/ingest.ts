@@ -36,7 +36,7 @@ import { splitMediaContent, identityOfStoredContent } from "./identity.js";
  * (src/state-hydration.ts), not hand-kept: the hand list had already drifted
  * (#4192). The loader rebuilds the state object in exactly this order.
  */
-import { COMPRESSION_STATE_FIELDS as MERGE_STATE_FIELDS } from "../state-hydration.js";
+import { COMPRESSION_STATE_FIELDS as MERGE_STATE_FIELDS, REF_FLOOR_RAW_ID } from "../state-hydration.js";
 
 /** Fields owned by dedicated tables/columns — never inside kstate_json. */
 const TABLE_OWNED_FIELDS = new Set(["blocks", "messageRefs", "deadRefs", "nextBlockId", "nextRunId"]);
@@ -600,11 +600,14 @@ export class LegacyViewBuilder {
         const byRef: Record<string, string> = {};
         for (const r of refs) {
             byRaw[r.rawId] = r.ref;
-            // "BLOCKED" is a byRaw-only token: the in-memory map keeps the
-            // inverse projection strictly mNNNNN→rawId. Admitting it into byRef
+            // "BLOCKED" and the ref floor (#2592/F5, REF_FLOOR_RAW_ID) are
+            // byRaw-only tokens: the in-memory map keeps the inverse
+            // projection strictly mNNNNN→rawId. Admitting either into byRef
             // mints a key the persisted state never had (#2671 soak: sub-agent
-            // sessions with protected messages drifted on every save).
-            if (r.ref !== "BLOCKED" && byRef[r.ref] === undefined) byRef[r.ref] = r.rawId;
+            // sessions with protected messages drifted on every save; #5589:
+            // the floor row drifted every Codex native-compaction session on
+            // every sampled verify → watermark drop + envelope freeze).
+            if (r.ref !== "BLOCKED" && r.rawId !== REF_FLOOR_RAW_ID && byRef[r.ref] === undefined) byRef[r.ref] = r.rawId;
         }
 
         const state = this.state;

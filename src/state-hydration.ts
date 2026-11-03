@@ -81,3 +81,15 @@ export function mergeState(parsed: CompressionState): CompressionState {
  */
 export const COMPRESSION_STATE_FIELDS: readonly (keyof CompressionState)[] =
     Object.keys(mergeState(createInitialState())) as (keyof CompressionState)[];
+
+/** Synthetic byRaw key pinning a session's ref high-water mark (#2592/F5). Its
+ *  value is the highest ref this session must never re-allocate (refs the
+ *  parent used before a fork/resume, or numbers freed by an archive prune);
+ *  the kernel cursor (highestUsedIndex+1) then starts above it. Never a real
+ *  message id (those are SHA-256 hex), so it matches no incoming message and
+ *  has NO byRef entry — consumers that invert the ref ledger back into byRef
+ *  must skip it exactly like "BLOCKED" (#5589: inverting the floor row minted
+ *  a phantom entry the live map never has → permanent DIGEST DRIFT). Lives
+ *  here, not in session.ts, so the storage rebuild seam can consume it without
+ *  importing the session layer. */
+export const REF_FLOOR_RAW_ID = "bili:ref-floor";
