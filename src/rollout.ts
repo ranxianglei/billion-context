@@ -97,6 +97,15 @@ export const ROLLOUT_FEATURES: Record<string, RolloutPlan> = {
     // cohorts (compressed vs deleted) and detects generation switches.
     // Default 0% — force on with `BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY=1`.
     pluginLaneServerHistory: { percent: 0 },
+    // #5573 M1 (L1) native-identity observation: pure-observation collection of
+    // client-native session/msgid identity evidence (header families, bounded
+    // body signals, compaction prefaces) into the session ext store
+    // ("nidv:obs") plus a per-request debug line. Feeds NO decision — request
+    // handling, folding, parsing and outbound bytes are untouched; off-or-
+    // unknown traffic produces zero diff against the golden suites. Default
+    // 0% — force on with `rollout.features.nativeIdentityObservation: true` or
+    // `BILI_ROLLOUT_NATIVE_IDENTITY_OBSERVATION=1`.
+    nativeIdentityObservation: { percent: 0 },
 };
 
 export const BP_MAX = 10_000;

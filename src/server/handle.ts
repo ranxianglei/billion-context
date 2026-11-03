@@ -34,6 +34,8 @@ import { codexCompactGatePre, codexCompactMode, hasCompactionTrigger, isCodexHos
 import { emitPreflightError } from "../stream-error.js";
 import { agentProviderRecipes } from "../agent-providers.js";
 import { affinityToken, anthropicFirstUserFrag, claudeAnthropicPersonaOrderApplies, conversationHeaderSource, claudeSubagentAgentId, claudeSubagentSplit, claudeSubagentLaneTokenOf, clientConversationHeader, codexTurnIdentity, dshPersonaFingerprintApplies, instructionsFingerprintApplies, openaiSystemTextForPersona, preferPromptCacheKeyIdentity, zcodeMemoryConversation } from "../session-id.js";
+import { observeNativeIdentity } from "./native-identity.js";
+import { featureEnabled } from "../rollout.js";
 import { personaConversationOrder } from "../session-resolve.js";
 import { prefixAffinity, describeResumeMiss, type AnonymousAffinity } from "../prefix-affinity.js";
 import { buildAnonymousProvenance, type AnonymousProvenance } from "../anon-provenance.js";
@@ -427,6 +429,18 @@ async function handleRequest(
         res.writeHead(400, { "content-type": "application/json" });
         res.end(JSON.stringify({ error: { type: "invalid_request", message: String(err) } }));
         return;
+    }
+    // #5573 M1 (L1): native-identity observation — pure logging + ext record,
+    // feeds no decision (zero-behavior-change contract), rollout-gated with
+    // default off. Sits ahead of the passthrough/bypass branches below so
+    // those lanes are observed too; the body is only touched when a matched
+    // profile declares body-level signals.
+    if (req.method === "POST" && bodyBuffer.length > 0 && featureEnabled("nativeIdentityObservation")) {
+        observeNativeIdentity(
+            { headers: req.headers, body: bodyBuffer, protocol, path: urlPath },
+            getStore(),
+            log,
+        );
     }
     // #1757: resolve compat.dropFields once, ahead of the verbatim branches
     // that forward before reaching the final boundary (they can't use

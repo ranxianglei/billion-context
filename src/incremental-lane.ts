@@ -66,6 +66,7 @@ import { peekSession } from "./session.js";
 import { pluginAgentHeader, pluginReportedModel } from "./plugin.js";
 import { headerValue, readBody } from "./server.js";
 import { featureEnabled } from "./rollout.js";
+import { observeNativeIdentity } from "./server/native-identity.js";
 import { MSG_IDS_BODY_FIELD, MSG_SEQS_BODY_FIELD, applyMsgIdPin, validateMsgIds } from "./msgid-pin.js";
 
 export const INCREMENTAL_TURN_PATH = "/__bili/plugin/turn";
@@ -788,6 +789,24 @@ export async function handleIncrementalTurn(
             entry.systemSet = true;
         }
         touchCache(conversationId, entry);
+        // #5573 M1 (L1): native-identity observation — the lane delta is the
+        // cheap scan surface (small by construction); the msgIds envelope
+        // carries host-native per-element ids (#4491). Pure observation,
+        // rollout-gated off by default, feeds no decision.
+        if (featureEnabled("nativeIdentityObservation")) {
+            observeNativeIdentity(
+                {
+                    key: conversationId,
+                    headers: req.headers,
+                    body: rawBody !== undefined ? rawBody : JSON.stringify(deltaWire),
+                    protocol: "anthropic",
+                    agent,
+                    msgIds: deltaIds,
+                },
+                getStore(),
+                log,
+            );
+        }
         // Record the epoch BEFORE the forward lands the new branch's rows.
         if (resync) await recordResyncBaseSeq(sessionId, log);
         persistLaneState(sessionId, entry.system, entry.systemSet, entry.marks, log);
