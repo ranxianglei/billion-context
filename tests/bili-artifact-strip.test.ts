@@ -58,6 +58,11 @@ test("whole-text: field-head header block cuts to end; other occurrences redact 
         "whitespace-only lead still reads as a forged field head",
     );
     assert.equal(
+        stripBiliArtifacts(`  ${H2} — topic\nbody`),
+        "  ",
+        "space lead without newline still reads as a forged field head (the old line-start rule leaked this)",
+    );
+    assert.equal(
         stripBiliArtifacts(`intro\n${H2} — topic\nbody`),
         `intro\n${PH2} — topic\nbody`,
         "line-start mention after genuine prose keeps its tail",
@@ -161,6 +166,7 @@ test("streaming: field-head forged block swallowed to end of field at every spli
     const cases: Array<[string, string]> = [
         [`${H2} — topic\nbody continues`, ""],
         [`\n${H1}\nsummary body`, "\n"],
+        [`  ${H2} x`, "  "],
     ];
     for (const [payload, expected] of cases) {
         for (const n of [1, 2, 4, 9]) {
