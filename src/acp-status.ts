@@ -126,10 +126,11 @@ const MEDIA_FLOOR_REPORT_FRACTION = 0.05;
 // billing lane already uses for images whose bytes bili never sees
 // (REMOTE_IMAGE_TOKENS, src/image-tokens.ts) per remote-URL image payload.
 // Mirrors the media branches of hasUnrecoverableMediaPayload over the shapes
-// reachable in ctx.messages (system messages are extracted at prepare time, so
-// the predicate's system sidecar branches cannot fire here). Other
-// unrecoverable payloads (file refs, Google fileData/videoMetadata) have no
-// stable billed prior — they still count toward `count`.
+// reachable in ctx.messages. Mid-conversation system messages keep their
+// rawAnthropicMessage sidecar in the core array (kernel/src/wire/anthropic.ts),
+// so the predicate's system sidecar branches CAN fire — like any payload with
+// no remote-image branch here (file refs, Google fileData/videoMetadata) they
+// count toward `count` without an image prior.
 interface MediaSidecarView {
     rawOpenaiContent?: unknown;
     rawOpenaiContentParts?: unknown;
