@@ -80,9 +80,12 @@ export function mergeNidvState(prev: NidvState | null, obs: NidvObservation, now
             pushEvent("id_change", `sess ${h}`);
         }
     }
-    // Cross-channel verification (cc metadata vs header).
+    // Cross-channel verification (cc metadata vs header). Evidence carries
+    // DIGESTS of both channels — a raw id must never reach the persisted blob.
     if (typeof obs.dualBodySessVal === "string" && typeof obs.sessVal === "string") {
-        if (nidvH8(obs.dualBodySessVal) !== nidvH8(obs.sessVal)) pushEvent("dual_mismatch", obs.dualBodySessVal.slice(0, EV_TEXT_CAP));
+        const hHdr = nidvH8(obs.sessVal);
+        const hBody = nidvH8(obs.dualBodySessVal);
+        if (hHdr !== hBody) pushEvent("dual_mismatch", `hdr=${hHdr} body=${hBody}`);
     }
     // Message-level host id (wb today): per-request id changes every turn by
     // design — we track LAST value + sighting count; M2's binding table turns

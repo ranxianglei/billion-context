@@ -127,9 +127,14 @@ test("stability matrix: fresh / repeat / change / restart continuity / flip / mi
     const flipped = mergeNidvState(after, extractNativeIdentity(detectNativeProfile({ "x-claude-code-session-id": "s2" }, "/v1/messages", "anthropic"), { "x-claude-code-session-id": "s2" }, "/v1/messages", "anthropic", {}, undefined), 10000);
     assert.equal(flipped.client, "cc");
     assert.ok(flipped.events.some((e) => e.k === "profile_flip"));
-    // dual mismatch event
+    // dual mismatch event — evidence must be digest-only: raw channel values
+    // never land in the persisted state (privacy redline, review of M1 PR)
     const mm = mergeNidvState(null, extractNativeIdentity(detectNativeProfile({ "x-claude-code-session-id": "cc-sess-1" }, "", "anthropic"), { "x-claude-code-session-id": "cc-sess-1" }, "/v1/messages", "anthropic", CC_BODY_MISMATCH, undefined), 11000);
     assert.ok(mm.events.some((e) => e.k === "dual_mismatch"));
+    const mmBlob = JSON.stringify(mm);
+    assert.ok(!mmBlob.includes("cc-sess-OTHER"));
+    assert.ok(!mmBlob.includes("cc-sess-1"));
+    assert.ok(mm.events.some((e) => e.k === "dual_mismatch" && /^hdr=[0-9a-f]{8} body=[0-9a-f]{8}$/.test(e.e)));
 });
 
 test("event FIFO cap 32 + ≤4KB hard budget survive heavy churn", () => {
