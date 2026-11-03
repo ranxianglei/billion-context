@@ -293,7 +293,37 @@ export function applyForkAdoption(session: Session, plan: ForkAdoptionPlan, pare
     if (parent.state.viewLatchConfigDigest) {
         session.state.viewLatchConfigDigest = parent.state.viewLatchConfigDigest;
     }
+    // #5608/#4313: same carry for the timestamp ledger — a resumed/forked
+    // session re-sends the same history; without the stamps the first replay
+    // renders time-less tags where the parent rendered time-stamped ones (and
+    // a fresh-state start mints "now" for days-old history instead), flipping
+    // every tagged byte and paying the whole prefix again. #4313 landed after
+    // these carries were written, so the ledger was simply never carried.
+    seedTimestampsFromParent(session, parent);
     markDirty(session);
+}
+
+/** #5608/#4313: copy the parent's timestamp ledger into a fresh child, parent
+ *  entries losing to any the child already holds. A stamp is keyed by raw id
+ *  (SHA-256 of message identity — the same content-addressed discipline as the
+ *  ref seeding above): an inherited value always denotes the exact bytes the
+ *  model saw, replaying the parent's stored first-sight time verbatim — i.e.
+ *  the tag bytes the provider already cached. Ids absent from the parent's map
+ *  are untouched: the stamp-timestamps node mints them honestly on arrival.
+ *  Returns the number of entries seeded. */
+export function seedTimestampsFromParent(session: Session, parent: Session | undefined): number {
+    const src = parent?.state.tsStamps;
+    if (!src) return 0;
+    const dst = { ...(session.state.tsStamps ?? {}) };
+    let seeded = 0;
+    for (const [id, ts] of Object.entries(src)) {
+        if (dst[id] === undefined) {
+            dst[id] = ts;
+            seeded++;
+        }
+    }
+    if (seeded > 0) session.state.tsStamps = dst;
+    return seeded;
 }
 
 /** #3925 → #3011 C9: what acp_status renders while a fork runs with zero

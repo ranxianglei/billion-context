@@ -37,7 +37,7 @@ import { affinityToken, anthropicFirstUserFrag, claudeAnthropicPersonaOrderAppli
 import { personaConversationOrder } from "../session-resolve.js";
 import { prefixAffinity, describeResumeMiss, type AnonymousAffinity } from "../prefix-affinity.js";
 import { buildAnonymousProvenance, type AnonymousProvenance } from "../anon-provenance.js";
-import { maybeAdoptForkBlocks, maybeAdoptResume, maybeAdoptDerivedFork } from "../fork-adoption.js";
+import { maybeAdoptForkBlocks, maybeAdoptResume, maybeAdoptDerivedFork, seedTimestampsFromParent } from "../fork-adoption.js";
 import { executeThreadsReforge } from "./threads-lane.js";
 import { resetThreadTailTracking } from "./thread-tracking.js";
 import { resolveClaudeTranscriptLineage } from "../claude-transcript-lineage.js";
@@ -1723,6 +1723,27 @@ async function handleRequest(
                         ? prefixAffinity.diagnoseResumeMiss(affinityList, sessionId, derivedParent)
                         : prefixAffinity.diagnoseResumeMiss(affinityList, sessionId);
                     log(miss.best !== undefined ? "info" : "debug", `[${sessionId}] [resume-inheritance] miss: ${describeResumeMiss(miss)} (#4264)`);
+                    // #5608/#4313: a miss starts fresh state, so the stamp-timestamps
+                    // node would mint "now" for days-old history (or render
+                    // time-less tags where the old process rendered time-stamped
+                    // ones) — flipping every tagged byte and re-billing the whole
+                    // prefix for one generation. Seed the timestamp ledger from
+                    // the closest tracked chain: stamps are raw-id (content-hash)
+                    // keyed, so an inherited value always denotes the exact bytes
+                    // the model saw. Refs/blocks still stay fresh — only the
+                    // byte-stable ledger rides along.
+                    const best = miss.best?.sessionId;
+                    if (best) {
+                        try {
+                            const n = seedTimestampsFromParent(session, loadParent(best));
+                            if (n > 0) {
+                                markDirty(session);
+                                log("info", `[${sessionId}] [resume-inheritance] miss: seeded ${n} timestamp(s) from closest chain ${best} — shared prefix replays provider-cached tag bytes instead of minting "now" for days-old history (#5608)`);
+                            }
+                        } catch (err) {
+                            log("warn", `[${sessionId}] [resume-inheritance] miss: timestamp seeding from ${best} failed (${String(err)}); continuing fresh (#5608)`);
+                        }
+                    }
                 }
             }
             if (resume) {
