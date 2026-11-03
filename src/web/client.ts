@@ -421,9 +421,27 @@ export const WEB_CLIENT = `(function () {
     window.bili_hostPluginBanner = bili_hostPluginBanner;
     // #5548: single renderer for every built-in notice — tone carries the
     // color (banner ok|warn); adding a notice never adds a builder again.
+    // #5548 P2: local announcements ship their own localized copy on the wire
+    // ({"zh-CN": …, "en": …} or a plain string) — pick the UI locale with the
+    // same fallback chain t() uses.
+    function bili_pickLoc(v) {
+        if (typeof v === "string") return v;
+        if (v && typeof v === "object") {
+            if (v[locale] !== undefined && typeof v[locale] === "string") return v[locale];
+            if (v["zh-CN"] !== undefined && typeof v["zh-CN"] === "string") return v["zh-CN"];
+            if (v.en !== undefined && typeof v.en === "string") return v.en;
+            const vals = Object.values(v);
+            const first = vals.find((x) => typeof x === "string");
+            if (first !== undefined) return first;
+        }
+        return "";
+    }
     function bili_noticeBanner(s) {
         let html = '<div class="banner-title">' + escapeHtml(s.on) + "</div>";
-        html += '<div class="alert-row"><span>' + escapeHtml(s.desc) + '</span><button class="btn sm notice-dismiss">' + escapeHtml(s.dismiss) + "</button></div>";
+        let row = '<div class="alert-row"><span>' + escapeHtml(s.desc) + "</span>";
+        if (s.cta && s.cta.url) row += '<a class="btn sm notice-cta" href="' + escapeHtml(s.cta.url) + '" target="_blank" rel="noopener noreferrer">' + escapeHtml(s.cta.label) + "</a>";
+        if (!s.hideDismiss) row += '<button class="btn sm notice-dismiss">' + escapeHtml(s.dismiss) + "</button>";
+        html += row + "</div>";
         html += '<div class="dim small" style="margin-top:6px">' + escapeHtml(s.hint) + "</div>";
         return html;
     }
@@ -1581,11 +1599,15 @@ function changelogCatOf(rawLine) {
             for (const n of list) {
                 if (!n || typeof n !== "object" || typeof n.id !== "string") continue;
                 const el = document.createElement("div");
-                el.className = "banner " + (n.tone === "ok" ? "ok" : "warn");
+                el.className = "banner " + (n.tone === "ok" ? "ok" : n.tone === "warn" ? "warn" : "");
                 el.dataset.id = n.id;
                 nr.appendChild(el);
-                const k = n.keys && typeof n.keys === "object" ? n.keys : {};
-                el.innerHTML = bili_noticeBanner({ on: t(String(k.on)), desc: t(String(k.desc)), hint: t(String(k.hint)), dismiss: t(String(k.dismiss)) });
+                if (n.source === "local") {
+                    el.innerHTML = bili_noticeBanner({ on: bili_pickLoc(n.title), desc: bili_pickLoc(n.desc), hint: bili_pickLoc(n.hint), dismiss: t("notices.dismiss_btn"), cta: n.ctaUrl ? { label: n.ctaLabel ?? "", url: n.ctaUrl } : null, hideDismiss: !!n.suppressDismiss });
+                } else {
+                    const k = n.keys && typeof n.keys === "object" ? n.keys : {};
+                    el.innerHTML = bili_noticeBanner({ on: t(String(k.on)), desc: t(String(k.desc)), hint: t(String(k.hint)), dismiss: k.dismiss ? t(String(k.dismiss)) : t("notices.dismiss_btn"), cta: null, hideDismiss: false });
+                }
             }
             for (const btn of Array.from(nr.querySelectorAll(".notice-dismiss"))) {
                 btn.addEventListener("click", async () => {
