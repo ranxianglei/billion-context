@@ -429,9 +429,17 @@ export function buildCompressibleRanges(
   // each removed message as a gap so no range spans it.
   // #2663: judge foldability on the same array class apply does (see the
   // `integritySource` parameter) — grouping/pairing are array-dependent.
+  // #5531: ids already covered by an active block are INVISIBLE, not kept —
+  // a covered call cannot strand its turn's reasoning. Without this, every
+  // #564 reverse split (call+result folded into a block, reasoning+text left
+  // visible) manufactures residue that no later fold may ever take: it is
+  // withdrawn here AND rejected at apply, so each growth fold reclaims only
+  // the non-residue and the session grows without bound (billion-context#5531).
   const unfoldedIds = computeIntegrityWithdrawals(
     integritySource ?? messages,
     new Set(compressibleMsgs.map((info) => info.id)),
+    undefined,
+    covered,
   ).withdrawn;
   if (unfoldedIds.size > 0) {
     let gapPending = false;

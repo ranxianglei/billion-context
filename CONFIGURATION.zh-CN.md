@@ -102,6 +102,7 @@
 | `rollout.features.salt` | string | the feature name | — | 分桶哈希盐。修改它会重新随机整个分组(唯一的洗牌方式;仅上调 percent 永不洗牌)。 |
 | `rollout.features.base` | string | unset (roll out over everyone) | — | 嵌套灰度:仅在所指特性的已入组人群内评估本特性,percent 相对该人群(B 只放量给 A 的用户;允许链式,环路判为关)。 |
 | `rollout.features.pluginLaneServerHistory` | boolean \| number | 0(关) | BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY | 插件车道服务端正史(#4491):对已放量的安装,(a) 插件车道请求可携带与 `messages` 平行的内部字段 `biliMsgIds`,把消息身份钉在客户端提供的 id 上(转发上游前一律剥掉;格式错误的数组告警后忽略,身份投毒形态在增量车道直接硬失败);(b) 仅回环可达的 `POST /__bili/plugin/render` 端点从统一存储渲染出站前缀(折叠区收敛为摘要锚点;任何失步都返回非 2xx,shim 退回本地历史);(c) 增量车道探测响应通告 `serverHistory`。默认 0%,放量前无行为变化。 |
+| `rollout.features.pluginFullResendWatermark` | boolean \| number | 5(实验性灰度) | BILI_ROLLOUT_PLUGIN_FULL_RESEND_WATERMARK | 全量重发水位快路径(#5403/#5418):插件车道 chat-completions 回合若上一轮响应盖有 x-bili-pf-seq,则用回声计数声明重发前缀(结构扫描,不做全量解析);命中时管线只消费钉存的前缀核 + 新增尾巴窗口(出站字节同源可证;任何疑点当轮回退未动过的全量解析路径并重新盖戳,连续五次计名失配将车道按住一小时)。需客户端把戳回声为 x-bili-pf-count(适配的车道回带;其余车道不会命中)。**实验性灰度**——默认仅约 5% 的安装开启(owner 裁定 2026-11-02:先小流量再 GA;web 面板对全部安装显示一次性公告、快速配置提供三态开关);`true` 强制开、`false`(或百分比)/ env = 0 关。见 TECHNICAL-NOTES.zh-CN.md「全量重发水位快路径」。 |
 | `maskHosts` | boolean | true | BILI_LOG_MASK_HOSTS | 日志中把非公开目标主机遮成 <private-host>；凭据头无论此开关如何总是遮盖。 |
 | `security.adminRelay` | boolean | false | — | 允许宿主（当前为 dsh web）把它自己入口域名下的整个 /__bili/ 管理面中继到本机代理，使远程浏览器能打开面板（#3373）。默认关闭、仅配置文件。中继跳到达代理时是本机非浏览器客户端（回环源地址 + 回环 Host、无 Origin 头），管理端门槛不变；开启后，凡能访问宿主 web 入口的人都能改配置、写凭据——请先给入口加鉴权/反代。 |
 | `subagentSplit` | boolean | true | BILI_SUBAGENT_SPLIT | Claude 子代理拥有独立会话命名空间（<session>\|sub:<agent-id>），不再排队在主会话锁后。 |
@@ -175,8 +176,8 @@
 | `network.receiveBodyBytes` | number | 5368709120 | BILI_RECEIVE_BODY_BYTES | 单请求读入内存的入站 wire 字节上限，超限在 receive 阶段返回 413。由硬编码 100 MiB 提升到 5 GiB（#3128 owner 决定），使多 GB 单请求被接受而非断连。同时也是解码请求占用两个共享大解码准入槽位的阈值。WebSocket lane 保持固定 100 MiB 表面。 |
 | `network.decodedBodyBytes` | number | 10737418240 | BILI_DECODED_BODY_BYTES | content-encoding 解压（gzip/deflate/br/zstd）后的解码字节上限，解码过程中增量检查（decode 阶段 413）。默认为接收预算的 2 倍，沿用旧的 decode=2×wire 关系；用于防解压炸弹。 |
 | `network.outboundBodyBytes` | number | 5368709120 | BILI_OUTBOUND_BODY_BYTES | 转发到上游的重建请求字节上限（forward 阶段 413），按最终 body 字符串的 UTF-8 字节计。在 fetch 之前检查，超预算的重建不会触发上游看门狗分配。 |
-| `network.wsOutboundBytes` | number | 10485760 | BILI_WS_OUTBOUND_BYTES | 仅针对 WebSocket 通道的软字节预算（#3701）：当最终序列化的 Responses WS 帧超出该预算时，优先从出站副本中裁减较早的图片（归档为占位符备注——原始文件仍保留在会话存储中，可通过 read_original_image / decompress 恢复），随后对剩余内容通过 jimp maxDim 阶梯进行有界降采样。若帧仍超出限制且上游在任何事件发出前即以 1009 关闭连接，则在同一请求内尝试一次严格更小的重发。设为 0 可禁用裁减（即恢复此前的原样发送行为）。HTTP 通道不受影响——硬性拒绝上限仍为 network.outboundBodyBytes。 |
-| `network.httpOutboundBytes` | number | 10485760 | BILI_HTTP_OUTBOUND_BYTES | 面向普通/代理/pi 原生 HTTP 中继通道的软字节预算（#3909）：当最终序列化的请求超出该预算时，优先从出站副本中裁减较早的图片（归档为占位符备注——原始文件仍保留在会话存储中，可通过 read_original_image / decompress 恢复），随后对剩余内容通过 jimp maxDim 阶梯进行有界降采样。它补上图片密集会话留下的缺口：token 空间折叠按 token 决策，而上游按字节/像素解码 CPU 拒收（Cloudflare Worker 503），于是 ~48 MiB 的请求会永远 503、每次重试都重发同样的像素。仅在未安装受管传输（即 spawn 出来的中继）时生效；WebSocket 通道用 network.wsOutboundBytes，受管 HTTP 传输（inline-engine / dsh-inline）在此从不裁减（#3701 Finding 1）。设为 0 可禁用（恢复此前的原样发送）；硬性拒绝上限仍为 network.outboundBodyBytes。 |
+| `network.wsOutboundBytes` | number | 10485760 | BILI_WS_OUTBOUND_BYTES | 仅针对 WebSocket 通道的软字节预算（#3701）：当最终序列化的 Responses WS 帧超出该预算时，优先从出站副本中裁减较早的图片（归档为占位符备注——原始文件仍保留在会话存储中，可通过 read_original_image / decompress 恢复——仅限注册了 bili 工具的通道；拒绝注入工具的 codex 类通道只有尺寸备注），随后对剩余内容通过 jimp maxDim 阶梯进行有界降采样。若帧仍超出限制且上游在任何事件发出前即以 1009 关闭连接，则在同一请求内尝试一次严格更小的重发。设为 0 可禁用裁减（即恢复此前的原样发送行为）。HTTP 通道不受影响——硬性拒绝上限仍为 network.outboundBodyBytes。 |
+| `network.httpOutboundBytes` | number | 10485760 | BILI_HTTP_OUTBOUND_BYTES | 面向普通/代理/pi 原生 HTTP 中继通道的软字节预算（#3909）：当最终序列化的请求超出该预算时，优先从出站副本中裁减较早的图片（归档为占位符备注——原始文件仍保留在会话存储中，可通过 read_original_image / decompress 恢复——仅限注册了 bili 工具的通道；拒绝注入工具的 codex 类通道只有尺寸备注），随后对剩余内容通过 jimp maxDim 阶梯进行有界降采样。它补上图片密集会话留下的缺口：token 空间折叠按 token 决策，而上游按字节/像素解码 CPU 拒收（Cloudflare Worker 503），于是 ~48 MiB 的请求会永远 503、每次重试都重发同样的像素。仅在未安装受管传输（即 spawn 出来的中继）时生效；WebSocket 通道用 network.wsOutboundBytes，受管 HTTP 传输（inline-engine / dsh-inline）在此从不裁减（#3701 Finding 1）。设为 0 可禁用（恢复此前的原样发送）；硬性拒绝上限仍为 network.outboundBodyBytes。 |
 | `network.caFile` | string | unset | BILI_CA_FILE | PEM 文件路径，包含要额外信任的根 CA（#3776），仅作用于 bili 自己的上游 fetch。与 Node 内置根证书及 NODE_EXTRA_CA_CERTS 中的条目合并——从不替换。安全软件做 HTTPS/加密连接扫描（卡巴斯基、企业 DLP）或企业 MITM 代理重签上游时使用：把该厂商根证书导出为 PEM 并指向此键。未设置 = 默认信任，行为逐字节不变。 |
 | `guardrails` | object | {} (all defaults) | — | 守卫集合：pi/omp 插件的工具输出守卫（#3066）及代理侧流式 text-run 守卫（#3406）。 |
 | `guardrails.bashTimeout` | number | 60 | BILI_GUARDRAIL_BASH_TIMEOUT | 模型未写 timeout 时注入到 bash 工具的秒数（#3066 owner 有意为之，#3366 重申：无人看管的 bash 会把 pi 会话挂死一整天——宿主 schema 本身无默认值）。设 N 调整秒数，设 0 关闭注入（恢复 pi 原生行为）。 |
@@ -1895,6 +1896,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_RESIGN_PASSTHROUGH` | `resign` | {} (armed; built-in scheme sdk-hmac-sha256) |
 | `BILI_RESUME_INHERITANCE` | `resumeInheritance` | true |
 | `BILI_ROLLOUT_<FEATURE>` | `rollout.features.enabled` | unset (bucket math decides) |
+| `BILI_ROLLOUT_PLUGIN_FULL_RESEND_WATERMARK` | `rollout.features.pluginFullResendWatermark` | 5 (experimental grey) |
 | `BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY` | `rollout.features.pluginLaneServerHistory` | 0 (off) |
 | `BILI_SESSION_CONTENT_STORE_PIN` | `sessions.contentStorePin` | false |
 | `BILI_SESSION_GC` | `sessions.gc.enabled` | false |

@@ -5,7 +5,7 @@ import type { CompressionCore, Config } from "acp-kernel";
 import { APIG_RESIGN_SCHEME, KNOWN_SIGNATURE_SCHEMES, readPendingRefusals, unresolvedRefusals } from "../apig-resign.js";
 import { handleAcpCache, readKeySwitchStats, readModelSwitchStats, readProjSwitchStats, readPromptSwitchStats } from "../cache-ledger.js";
 import type { ProxyOptions } from "../config.js";
-import { effectivePromptCacheRouting, loadNamedProviders, loadOptions, loadRoutes, resolveResignSettings } from "../config.js";
+import { effectivePromptCacheRouting, loadConfigFile, loadNamedProviders, loadOptions, loadRoutes, resolveResignSettings } from "../config.js";
 import { applyCompressSettings, listResolvedPacks, resolveCompressSurfaceDetailed } from "../compress-settings.js";
 import { clearConflictEvents, summarizeConflicts } from "../conflict-watch.js";
 import { cannotResolveTarget, getAdvisoryState } from "../advisory.js";
@@ -23,7 +23,8 @@ import { getUnrecognizedPathStats } from "./observability.js";
 import { getStore } from "../persist.js";
 import { BodyTooLargeError, headerValue, readBody } from "../server.js";
 import { dismissHostPlugin, visibleHostPluginNotices } from "../host-plugin-notice.js";
-import { PCK_NOTICE_ID, dismissUpgradeNotice, pckNoticeActive } from "../pck-notice.js";
+import { dismissedUpgradeNotices, dismissUpgradeNotice, PCK_NOTICE_ID, pckNoticeActive, WM_FASTPATH_INTRO_ID } from "../pck-notice.js";
+import { featureOverrideAbsent } from "../rollout.js";
 import { listSessions, memoryReport, peekSession, splitSessionWarnings, totalInFlight } from "../session.js";
 import { BILI_TUNNEL_HEADER } from "../tunnel-guard.js";
 import { isLoopbackAddress } from "../util.js";
@@ -1044,7 +1045,7 @@ async function handleNoticeDismiss(req: http.IncomingMessage, res: http.ServerRe
         res.end(JSON.stringify({ error: `unknown notice: ${id}` }, null, 2));
         return;
     }
-    log("info", `[pck] notice ${id} dismissed via web UI`);
+    log("info", `[notices] notice ${id} dismissed via web UI`);
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ ok: true }, null, 2));
 }
@@ -1338,6 +1339,15 @@ async function sendOverview(res: http.ServerResponse, opts: ProxyOptions, laneHo
         pluginAdvisories: detectCostAdvisories(process.env),
         hostPluginNotices: visibleHostPluginNotices(process.env),
         pckNotice: { id: PCK_NOTICE_ID, active: pckNoticeActive(effectivePromptCacheRouting(opts.promptCache)) },
+        wmNotice: {
+            id: WM_FASTPATH_INTRO_ID,
+            // #5403 experimental-grey intro: visible to EVERY install on its
+            // first upgrade to this build until closed — unless the user
+            // already wrote an explicit rollout override (they made the call).
+            active:
+                !dismissedUpgradeNotices(process.env).has(WM_FASTPATH_INTRO_ID) &&
+                featureOverrideAbsent("pluginFullResendWatermark", loadConfigFile().rollout),
+        },
         inFlight: totalInFlight(),
         blindTunnels: getBlindTunnelStats(),
         conflicts: summarizeConflicts(listSessions()),
