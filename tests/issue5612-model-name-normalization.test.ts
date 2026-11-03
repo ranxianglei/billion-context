@@ -7,7 +7,9 @@ import {
     resolveConfiguredContextLimit,
     resolveConfiguredOutputLimit,
     type ProviderRoutes,
+    type ResolvedModelEntry,
 } from "../src/config.ts";
+import { warnModelNameMissIfNew, _resetModelNameMissWarnedForTest } from "../src/server.ts";
 
 // #5612: clients like Qoder Desktop rewrite model ids (/,.→-), so EXACT-name
 // lookups miss the operator's declared entry → silent default fallback. Pinned in
@@ -29,7 +31,7 @@ test("the reported repro: renamed id resolves the operator's declared window", (
     // Before the fix both of these were undefined → 200K default fallback.
     assert.equal(resolveConfiguredContextLimit(routes, url, "auto-deepseek-v4-1-flash"), 1_000_000);
     assert.equal(resolveConfiguredOutputLimit(routes, url, "auto-deepseek-v4-1-flash"), 64_000);
-    const r = resolveModelEntry(routes, url, "auto-deepseek-v4-1-flash");
+    const r: ResolvedModelEntry = resolveModelEntry(routes, url, "auto-deepseek-v4-1-flash");
     assert.equal(r.viaNormalization, true);
     assert.equal(r.declaredName, "auto/deepseek-v4.1-flash");
 });
@@ -76,4 +78,45 @@ test("missing model / missing models table resolve to an empty result", () => {
     assert.deepEqual(resolveModelEntry(routes, "u/x", undefined), {});
     assert.deepEqual(resolveModelEntry({ u: {} }, "u/x", "m"), {});
     assert.deepEqual(resolveModelEntry({}, "u/x", "m"), {});
+});
+
+test("warnModelNameMissIfNew warns once per (upstream-origin, model)", () => {
+    _resetModelNameMissWarnedForTest();
+    const seen: string[] = [];
+    const lg = (_level: string, msg: string) => { seen.push(msg); };
+    // route matched but the model id is absent from the declared entries → fires with the rename hint
+    assert.equal(warnModelNameMissIfNew("http://127.0.0.1:9001", "auto-deepseek-v4-1-flash", ["auto/deepseek-v4.1-flash"], lg), true);
+    assert.equal(seen.length, 1);
+    assert.ok(seen[0].includes("model=auto-deepseek-v4-1-flash"));
+    assert.ok(seen[0].includes("auto/deepseek-v4.1-flash"));
+    assert.ok(seen[0].includes("declare that spelling too"));
+    // same origin+model again → suppressed
+    assert.equal(warnModelNameMissIfNew("http://127.0.0.1:9001", "auto-deepseek-v4-1-flash", ["auto/deepseek-v4.1-flash"], lg), false);
+    assert.equal(seen.length, 1);
+    // different origin or different model → fresh warning each
+    assert.equal(warnModelNameMissIfNew("http://127.0.0.1:9002", "auto-deepseek-v4-1-flash", ["a/b"], lg), true);
+    assert.equal(warnModelNameMissIfNew("http://127.0.0.1:9001", "other-model", ["a/b"], lg), true);
+    assert.equal(seen.length, 3);
+});
+
+test("warnModelNameMissIfNew stays silent when there is nothing to warn about", () => {
+    _resetModelNameMissWarnedForTest();
+    const seen: string[] = [];
+    const lg = (_level: string, msg: string) => { seen.push(msg); };
+    // empty declared table → no hint possible (the route declares no per-model entries)
+    assert.equal(warnModelNameMissIfNew("http://127.0.0.1:9001", "gpt-x", [], lg), false);
+    // no origin / no model → cannot attribute the miss
+    assert.equal(warnModelNameMissIfNew(undefined, "gpt-x", ["a/b"], lg), false);
+    assert.equal(warnModelNameMissIfNew("http://127.0.0.1:9001", undefined, ["a/b"], lg), false);
+    assert.equal(warnModelNameMissIfNew("", "", ["a/b"], lg), false);
+    assert.equal(seen.length, 0);
+});
+
+test("warnModelNameMissIfNew truncates long declaration lists in the message", () => {
+    _resetModelNameMissWarnedForTest();
+    const seen: string[] = [];
+    const lg = (_level: string, msg: string) => { seen.push(msg); };
+    const names = Array.from({ length: 12 }, (_, i) => `m${i}`);
+    assert.equal(warnModelNameMissIfNew("http://127.0.0.1:9001", "x", names, lg), true);
+    assert.ok(seen[0].includes(", … (+4)"));
 });
