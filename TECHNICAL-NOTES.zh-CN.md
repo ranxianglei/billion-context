@@ -164,3 +164,18 @@ chat wire 上 bili 自己 vs 客户端自带:插件车道上,请求体里等于�
 诚实边界:(1) 一旦多模态尾部(含 `image_url` 的 content array)进入缓存,该段历史此后整段降级回 legacy 全量轮——kernel 按位置区分 user 图片消息在尾部与在历史中部的渲染,冻结缓存无法做到位置无关地复现 legacy 字节;纯文本工作负载(#5403 报告者的形态)不受影响。(2) 每次命中会现解析头部 8 个元素,只为做 system-run 校验。(3) 两个 `x-bili-pf-*` 头都在转发上游前剥掉(`UPSTREAM_HOP_HEADERS`)——协议头绝不漏进模型流量。
 
 实测(出处:`tests/issue5403-watermark-fastpath.test.ts`,同语料 hermetic 双代理 A/B):命中轮完全跳过全量解析/转换/钉存;含一个 multipart 图片落位回合的 8 回合语料上,常驻 `lastMessages` 8684 B → 1210 B(7.2×);全程出站字节与 legacy 逐字一致(仅 kernel `time="…"` 属性归一);两个阶段捕获到的上游请求里均无 `x-bili-pf-*`。单元覆盖:`tests/fastpath.test.ts`(verdict 阶梯全表,含熔断 TTL 解除后重播种)、`tests/fastpath-scanner.test.ts`(对抗 JSON 表、深度上限、surrogate 对、5 万元素规模)、`tests/lane-decisions-matrix.test.ts`(门矩阵,双向)。
+
+## 原生身份观测层(#5571 M1)
+
+每条经过 bili 的模型 API 请求都自带其客户端的**原生身份面**——session id、逐条消息宿主 id、压缩标记——以普通头/正文字段形式,在 relay 任何改写之前就可读。观测层把这份静态取证(issue #5571 采集表)变成按会话的实测数据,让 M2 绑定表与 M3 re-baseline 建立在测量事实而非二进制字符串之上。
+
+**单采集点,单张模式表。** `observeNativeIdentity()` 每请求恰好调用一次,位于 `src/server/handle.ts` 会话 id 绑定(`enterSessionContext`)之后。客户端家族钉在 `src/server/native-identity-profiles.ts`(WorkBuddy / codex / Claude Code / opencode / Gemini 五行:session/msg/request 头、双通道 body 路径、压缩前缀、形状断言)。压缩文案是客户端版本面——上游漂移时改这张表+测试,禁止在别处硬编码字面量。
+
+**不变量(红线):**
+- 零转发字节改动——本模块只读;M2/M3 决定之前,下游任何逻辑不得基于这些数据做 gate。
+- 隐私:session ext 键 `nidv:obs` 只存 id 值的 sha1-8 **摘要**;原始值只在请求内存里活几微秒;日志打摘要/截断。
+- unknown 客户端**不写任何东西**(隐私红线:不把陌生流量的指纹存进存储)。
+- 默认关:`rollout.features.nativeIdentityObservation`,percent 0(env `BILI_ROLLOUT_NATIVE_IDENTITY_OBSERVATION=1|0`;配置 `true/false`)。关 = 零 ext 写入、管线字节一致——由既有 golden 套件的无感中性(对现有队列特性缺席)加 `tests/issue5571-native-identity-obs.test.ts` 显式 off 用例共同钉住。
+- 结构性 fail-open:全部采集在函数内一个 try/catch 里;任何坏行降级为「无观测」,绝不会失败或拖慢请求(常数成本查找 + 有界正文扫描——`USER_TEXT_SCAN_CAP=3`、`TOOL_ANCHOR_CAP=4096`)。
+
+**状态形状**(`nidv:obs`,JSON ≤4KB 硬上限,事件 FIFO 裁剪):`{v:1, client, firstSeen, lastSeen, reqs, sessH?, sessStable, msgN?, msgLastH?, events:[{t,k,e≤64}]}`。事件类型:`compaction`(三级信号——显式头 > 专用 `/responses/compact` 端点 > 摘要轮前缀[锚定在文本开头,中段嵌入不得命中])、`id_change`、`profile_flip`、`dual_mismatch`(cc 头 vs metadata 通道不一致)、`shape_assert_fail`(opencode wire 形状漂移)。连续相同事件去重,最多保 32 条。
