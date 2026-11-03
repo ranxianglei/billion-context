@@ -7,13 +7,17 @@ import { assignRefs, createCore, createInitialState, defaultConfig, emptyRefMap 
 import type { CoreMessage } from "acp-kernel";
 import type { Session } from "../src/session.ts";
 import { handleAcpStatus } from "../src/acp-status.ts";
+import { REMOTE_IMAGE_TOKENS } from "../src/image-tokens.ts";
 
 // #5620: dsh sessions carrying remote-URL / file-ref images climbed to ~72%
 // usage while the kernel offered only tens of K of foldable mass — such
 // messages can never fold (#1188/#2609) and turn integrity pins the turns
 // around them (#684), so the context floor silently includes their mass.
 // acp_status now names that never-foldable mass (MEDIA FLOOR) whenever it is
-// a meaningful share of the window. The gate is independent of the PRESSURE
+// a meaningful share of the window, metered at billed grade (local text
+// estimate + REMOTE_IMAGE_TOKENS per remote-URL image payload — the local
+// meter alone only sees the "[image]" placeholder and would never fire here).
+// The gate is independent of the PRESSURE
 // NOTE, whose maxPending < growth-step condition is NOT met in this state
 // (pinned turns keep a range advertised forever).
 // Gate-test discipline (#3617): positive rows AND negative rows (recoverable
@@ -73,20 +77,23 @@ function withRefs(ctx: ReturnType<typeof makeCtx>): ReturnType<typeof makeCtx> {
 const REMOTE = "https://cdn.example.com/img-%d.png";
 
 test("#5620 A: remote-URL image mass above 5% of the window renders a MEDIA FLOOR line", () => {
-    // 3 × 20000 chars = 3 × 5000 tok = 15000 = 7.5% of the 200000 limit ≥ 5%.
+    // Realistic shape: each image part is its own core message whose local
+    // text is just a caption — the mass comes from the billed-grade prior,
+    // 3 × (caption + 4096) ≈ 12300 tok = ~6% of the 200000 limit ≥ 5%.
     const msgs = [
         textMsg("raw_1", "user", 4000),
-        imageMsg("img_1", REMOTE.replace("%d", "1"), 20000),
+        imageMsg("img_1", REMOTE.replace("%d", "1"), 16),
         textMsg("raw_2", "assistant", 4000),
-        imageMsg("img_2", REMOTE.replace("%d", "2"), 20000),
-        imageMsg("img_3", REMOTE.replace("%d", "3"), 20000),
+        imageMsg("img_2", REMOTE.replace("%d", "2"), 16),
+        imageMsg("img_3", REMOTE.replace("%d", "3"), 16),
     ];
     const out = handleAcpStatus({}, withRefs(makeCtx(msgs))).text;
     assert.ok(out.includes("MEDIA FLOOR"), `media floor line present (got: ${out.slice(0, 600)})`);
     assert.ok(out.includes("3 live message(s)"), "names the message count");
+    assert.ok(out.includes("~6% of the 200000-token limit"), "mass includes the billed prior, not just captions");
+    assert.ok(out.includes(String(REMOTE_IMAGE_TOKENS)), "names the per-image prior");
     assert.ok(out.includes("#1188/#2609"), "cites the never-fold provenance");
     assert.ok(out.includes("turn integrity"), "names the pinning mechanism");
-    assert.ok(out.includes("of the 200000-token limit"), "names the window");
 });
 
 test("#5620 B: archivable data-URL images are NOT unrecoverable — no MEDIA FLOOR (#2607)", () => {
@@ -102,8 +109,9 @@ test("#5620 B: archivable data-URL images are NOT unrecoverable — no MEDIA FLO
 });
 
 test("#5620 C: below the 5% share the line stays silent (noise guard)", () => {
-    // 1 × 4000 chars = 1000 tok = 0.5% of the limit ≪ 5%.
-    const msgs = [textMsg("raw_1", "user", 4000), imageMsg("img_1", REMOTE.replace("%d", "1"), 4000)];
+    // 1 remote image ≈ 4096 tok = ~2% of the limit < 5% — a stray image must
+    // not paint the whole session as media-bound.
+    const msgs = [textMsg("raw_1", "user", 4000), imageMsg("img_1", REMOTE.replace("%d", "1"), 16)];
     const out = handleAcpStatus({}, withRefs(makeCtx(msgs))).text;
     assert.ok(!out.includes("MEDIA FLOOR"), "sub-threshold media mass stays silent");
 });
