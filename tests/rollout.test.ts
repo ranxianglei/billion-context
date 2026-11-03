@@ -207,7 +207,12 @@ test("rolloutDecisions: sorted, one per registered feature, real install id", ()
         assert.equal(zeta.enabled, false);
         // percent-0 still flows through the bucketing tier (bucket < 0bp is
         // never true) — "off" is reserved for features with no percent at all.
-        for (const d of ds) assert.equal(d.source, "bucket", d.feature);
+        // Nested (`base:`) features resolve inside their base's cohort: base
+        // off ⇒ source "off" by design (NESTING in src/rollout.ts), not a bucket miss.
+        for (const d of ds) {
+            if (rollout.ROLLOUT_FEATURES[d.feature]?.base !== undefined) continue;
+            assert.equal(d.source, "bucket", d.feature);
+        }
     });
 });
 
