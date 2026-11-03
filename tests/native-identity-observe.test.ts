@@ -439,5 +439,8 @@ test("latency smoke: 1MB codex-shaped body, extraction p99 stays cheap (CI-porta
     samples.sort((a, b) => a - b);
     const p99 = samples[Math.min(samples.length - 1, Math.ceil(0.99 * samples.length) - 1)];
     console.log(`[nidv latency smoke] 1MB body p99=${p99.toFixed(3)}ms median=${samples[samples.length >> 1].toFixed(3)}ms`);
-    assert.ok(p99 < 20, `p99 ${p99.toFixed(3)}ms exceeds the CI-portable bound (guards against accidental parse-class regressions; local dog-machine numbers land in the PR description)`);
+    // Bound 20ms flaked on a Windows node22 runner (observed p99 27.3ms vs a
+    // typical-CI 3–4ms, one-off spike); 50ms absorbs that variance while staying
+    // far below any parse-class regression cost (full 1MB JSON.parse is ≫10× this).
+    assert.ok(p99 < 50, `p99 ${p99.toFixed(3)}ms exceeds the CI-portable bound (guards against accidental parse-class regressions; local dog-machine numbers land in the PR description)`);
 });
