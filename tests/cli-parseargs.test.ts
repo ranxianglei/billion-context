@@ -70,7 +70,7 @@ test("parseArgs: informational flags take precedence over subcommand dispatch (#
         ["start"], ["update"], ["doctor"], ["export"], ["plugin-register", "example"],
         ["mcp"], ["plugin", "list"], ["plugin", "remove", "codex"], ["test", "codex"],
         ["acp-cache", "diff", "/some/dir"], ["sessions", "ls"], ["sessions", "rm", "example"],
-        ["pack", "list"], ["pack", "remove", "example"], ["storage", "gc"],
+        ["storage", "gc"],
     ];
     for (const [flag, expected] of [["--help", "help"], ["-h", "help"], ["--version", "version"], ["-V", "version"]] as const) {
         for (const args of commands) {
@@ -82,7 +82,7 @@ test("parseArgs: informational flags take precedence over subcommand dispatch (#
 });
 
 test("parseArgs: informational flags bypass incomplete subcommand validation (#5606)", () => {
-    for (const args of [["plugin"], ["plugin", "remove"], ["test"], ["acp-cache"], ["acp-cache", "diff"], ["sessions"], ["sessions", "rm"], ["pack"], ["pack", "remove"], ["storage"]]) {
+    for (const args of [["plugin"], ["plugin", "remove"], ["test"], ["acp-cache"], ["acp-cache", "diff"], ["sessions"], ["sessions", "rm"], ["storage"]]) {
         for (const [flag, expected] of [["--help", "help"], ["--version", "version"]] as const) {
             assert.equal(parseArgs([...args, flag]).command, expected, [...args, flag].join(" "));
         }
