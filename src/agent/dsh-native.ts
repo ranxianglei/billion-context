@@ -2039,13 +2039,14 @@ export function apply(ctx: PluginContext): void {
     // RETRY_INTERVAL_MS until a proxy lands.
     maybeRetry(ctx);
 
-    // #1158 L2: a refusal sends model traffic DIRECT. First refusal per
-    // endpoint logs once; same-state refusals accumulate silently and re-print
-    // only on an attribution STATE change (none↔threw), always carrying the
-    // cumulative count — bounded noise (#1117 silence preserved) while a
-    // "dozens refused, one passed" distribution becomes visible. The durable
-    // copy goes through persistClientEvent: GUI hosts swallow stderr, which is
-    // exactly how the reported zero-traffic case stayed invisible.
+    // #1158 L2: a refusal sends model traffic DIRECT. The durable line re-prints
+    // on every attribution STATE change (none↔threw) AND on a doubling cadence
+    // of same-state refusals (#5613: counts 1, 2, 4, 8…), always carrying the
+    // cumulative count — bounded noise (~2·log₂ N lines per endpoint-state run,
+    // #1117 silence preserved) while a "dozens refused, one passed" distribution
+    // becomes visible. The durable copy goes through persistClientEvent: GUI
+    // hosts swallow stderr, which is exactly how the reported zero-traffic case
+    // stayed invisible.
     const gateRefusals = new Map<string, { state: string; count: number; logged: number }>();
     const gateKeyOf = (url: string): string => {
         try {
