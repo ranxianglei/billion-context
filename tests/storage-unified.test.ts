@@ -11,6 +11,7 @@ import { canonicalize, sha256 } from "./golden-canonical.ts";
 import { planIngest, loadLegacyView, toLegacyLike, type LegacySessionLike } from "../src/storage/ingest.ts";
 import { restampRefsToLedger } from "acp-kernel";
 import { UnifiedStore } from "../src/storage/store.ts";
+import { STORAGE_SCHEMA_VERSION } from "../src/storage/schema.ts";
 import { resolveStorageMode } from "../src/storage/shadow.ts";
 import { resolveStorageWalJournalSizeLimit } from "../src/knobs.ts";
 import { setPreferredSqliteEngineForTests, type SqliteEngineName } from "../src/storage/driver.ts";
@@ -794,7 +795,7 @@ test("schema v2: dev-window v1 database upgrades in place (identity columns adde
             assert.equal(row!.namespace, "proxy", "namespace backfills with its constant default");
             assert.equal(row!.origin, null, "origin backfills NULL");
             const ver = (store as unknown as { db: { prepare(q: string): { get(): unknown } } }).db.prepare("PRAGMA user_version").get() as { user_version: number };
-            assert.equal(ver.user_version, 10, "schema version stamped to 10 (v2 columns + v3 identity index + v4 extension namespaces + v5 watermark column + v6 orphans journal + v7 media map + v8 identity/tombstones + v9 zero-ref collection index + v10 immutable message ts column)");
+            assert.equal(ver.user_version, STORAGE_SCHEMA_VERSION, "schema stamped to the current version (v2 columns … v11 pf snapshot plane)");
             // v3 backfill: every pre-existing sessions row claims its
             // (namespace, conversation_id) identity binding.
             const binding = (store as unknown as { lookupConversation(ns: string, id: string): string | null }).lookupConversation("proxy", "dev-window-1");
@@ -856,7 +857,7 @@ test("schema v10: v9→v10 migration adds messages.ts without backfill; idempote
         try {
             const ver = (reopened as unknown as { db: { prepare(q: string): { get(): unknown } } }).db
                 .prepare("PRAGMA user_version").get() as { user_version: number };
-            assert.equal(ver.user_version, 10, "v9 library migrates to v10");
+            assert.equal(ver.user_version, STORAGE_SCHEMA_VERSION, "v9 library migrates to the current version");
             const rows = reopened.getMessages("v10-mig-1") as { seq: number; ts?: number | null }[];
             assert.equal(rows.length, 1, "row survives the migration");
             assert.ok(rows[0].ts === null || rows[0].ts === undefined, "pre-existing row keeps NULL (never backfilled)");

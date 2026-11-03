@@ -47,7 +47,7 @@ import type { CoreMessage } from "acp-kernel";
 import type { BiliMessage, OpenAIRequestBody } from "acp-kernel/wire";
 import { openaiToCore } from "acp-kernel/wire";
 import type http from "node:http";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { featureEnabled } from "../rollout.js";
 import { getStore } from "../persist.js";
 import type { Session } from "../session.js";
@@ -60,6 +60,10 @@ import { alignClientAgainstTranscript, MAX_CHAIN_WALK } from "./snapshot-render.
 export const PF_COUNT_HEADER = "x-bili-pf-count";
 export const PF_SEQ_HEADER = "x-bili-pf-seq";
 export const PF_TAIL_IDS_HEADER = "x-bili-pf-tail-ids";
+// #5600 §3.1: the msgid lane's identity channel. Echoing carries identity
+// ONLY (content claims ride x-bili-pf-tail-ids); responses always carry the
+// server's own sid for the request's partition, including the mint turn.
+export const PF_SID_HEADER = "x-bili-pf-session";
 
 // #5571 v5 (owner ruling 2026-11-03): identity-only verification takes the
 // client's NATIVE session id as an identity input alongside host msgids.
@@ -166,6 +170,10 @@ export interface FastpathOutcome {
      *  shaped state in memory is exactly what the canonical lane removes; a
      *  lane toggle back to v5 self-heals with one legacy verification turn. */
     readonly canonical?: boolean;
+    /** #5600 msgid lane: the server-minted pf_sid this request resolved to.
+     *  Present on every lane outcome (minted on the arm turn); finalize
+     *  performs the partition append/residency update and echoes the header. */
+    readonly sid?: string;
 }
 
 /** #5418 v2: decode the shim's x-bili-pf-tail-ids value.
@@ -289,11 +297,18 @@ export function evaluateWatermarkFastpath(
     // three states: undefined = header absent (pure count mode); null =
     // present but malformed; array = shape-valid.
     const parsedTailIds = rawTailIds === undefined ? undefined : typeof rawTailIds === "string" ? parseTailIds(rawTailIds) : null;
-    // #5576 v6 (owner ruling 2026-11-03): when the canonical lane is live for
-    // this install the verdict comes from unified-transcript row-chain
-    // alignment instead of the v4/v5 machinery below — that code runs UNTOUCHED
-    // for everyone else (default OFF keeps v5 byte-behavior the default).
-    if (featureEnabled("watermarkCanonicalV6")) {
+    // Lane dispatch (#5600/#5576): the msgid lane (default OFF) runs first
+    // when live — it owns identity via server-minted pf_sids over the
+    // snapshot partition store and returns null whenever the pf plane is
+    // unavailable, falling straight through to the lanes below untouched.
+    if (featureEnabled("watermarkV6MsgId")) {
+        const mid = evaluateMsgIdLane({ session, req, bodyText, scan, saved, parsedTailIds, nowCs, log });
+        if (mid !== null) return mid;
+    } else if (featureEnabled("watermarkCanonicalV6")) {
+        // #5576 v6 (owner ruling 2026-11-03): when the canonical lane is live
+        // the verdict comes from unified-transcript row-chain alignment
+        // instead of the v4/v5 machinery below — UNTOUCHED for everyone else
+        // (default OFF keeps v5 byte-behavior the default).
         return evaluateCanonicalV6({ session, bodyText, scan, saved, stamped, parsedTailIds, nowCs, miss });
     }
     // #5403/#5418 v4 count relaxation (owner ruling 2026-11-02): once a
@@ -578,6 +593,282 @@ function evaluateCanonicalV6(args: {
     };
 }
 
+// ============================================================================
+// #5600 v6 msgid lane — owner rulings 2026-11-03, issue §3.1/§5/§6/§8.
+// Identity: server-MINTED pf_sid (§3.1) — echo header x-bili-pf-session,
+// ledger-id probe over x-bili-pf-tail-ids, mint as the last resort; client-
+// native ids play NO identity role. Data: the pf_* partition store
+// (append-only pf_rows + zero-state LSM metadata, cleanup rides
+// deleteSession only). Hit authority: ledger-width arithmetic against OUR
+// OWN persisted frontier (never a client echo — the stamp demotes fully) +
+// the window-origin pin; local edits/invisible reorders ride by doctrine
+// (§6.2 corner rulings). Frozen cores come from the RESIDENT array —
+// hydrated from the partition after boot, bytes never re-derived (this is
+// the P1 retention pair the feature exists to remove). Fresh cores decode
+// from the CURRENT window fragment ONLY and are rekeyed onto the prefix
+// numbering (#3642, same contract as v5); system text re-decodes from the
+// head each turn (passthrough, no stashed copy to drift from). Semantic
+// misses (arm / compaction-reset) re-base the partition and resident on the
+// freshly parsed full view in finalize (§6.1: compaction = archive + reset,
+// transcript stays durable). Every doubt degrades to the untouched legacy
+// full-parse. SOFT plane: the store unavailable ⇒ null ⇒ the pre-existing
+// lanes below run byte-for-byte as before.
+const PF_SID_RE = /^pf_[0-9a-f]{12}$/u;
+/** Session-ext registry naming every pf_sid minted under one bili session —
+ *  deleteSession sweeps it (store cascade, no independent retention period). */
+const PF_EXT_SIDS_KEY = "pf:sids";
+/** Bounded probe budget for identity resolution from a tail-id list. */
+const PF_PROBE_BUDGET = 8;
+
+interface PFResident {
+    sid: string;
+    /** Frozen ingested cores of the ACTIVE world — the full view at the last
+     *  ingest: reset-world cores plus every subsequent window, in order. */
+    cores: CoreMessage[];
+    /** Element count T of the last ingest (the ledger frontier in ELEMENTS —
+     *  the window always decodes from spans[K..T), never from a client echo). */
+    elems: number;
+    /** Exclusive high pf_row pos consumed so far (position cursor). */
+    rowHi: number;
+    /** Sticky: some resident core carries an image part. */
+    imgFlag: boolean;
+    /** Cumulative strip ledger of ALL ingested bytes (carried forward — the
+     *  middle is never re-scanned; each geom entry snapshots it so folds
+     *  reconstruct it without a re-scan). */
+    markers: RawStripCounts;
+}
+const residents = new WeakMap<Session, PFResident>();
+
+function mintPfSid(): string {
+    return `pf_${randomBytes(6).toString("hex")}`;
+}
+
+/** Soft-plane accessor (§4.1.6): store absent, unshaped or misbehaving ⇒
+ *  null ⇒ this lane stands aside and the pre-existing lanes run byte-for-
+ *  byte. NEVER throws into the request path. */
+function pfAvailable(): NonNullable<ReturnType<NonNullable<ReturnType<typeof getStore>>["pfStore"]>> | null {
+    try {
+        const s = getStore();
+        return s?.pfStore ? s.pfStore() ?? null : null;
+    } catch {
+        return null;
+    }
+}
+
+/** Register a minted sid under the owning bili session (advisory — the sweep
+ *  only ever under-deletes an orphan at worst, never other sessions' data). */
+function registerPfSid(session: Session, sid: string): void {
+    try {
+        const store = getStore();
+        const cur = store.getSessionExt(session.id, PF_EXT_SIDS_KEY) as unknown;
+        const list = Array.isArray(cur)
+            ? cur.filter((s): s is string => typeof s === "string" && s !== sid)
+            : [];
+        list.push(sid);
+        store.setSessionExt(session.id, PF_EXT_SIDS_KEY, list);
+    } catch { /* registry is advisory */ }
+}
+
+/** Rebuild the resident array from the partition (post-boot / lane-toggle /
+ *  resident-dropped). Fold: L1 checkpoint meta (last geom's cumulative state)
+ *  + in-order L0 tail replay; 'reset'/'arm' entries move the active frontier
+ *  to their recorded fromPos (archive stays durable — rows are only deleted
+ *  by deleteSession). Any unrecoverable shape degrades to null. */
+function hydratePf(
+    pf: NonNullable<ReturnType<NonNullable<ReturnType<typeof getStore>>["pfStore"]>>,
+    session: Session,
+    sid: string,
+    log: (level: string, msg: string) => void,
+): PFResident | null {
+    const maxP = pf.maxPos(sid);
+    if (maxP < 0) return null;
+    const meta = pf.readMeta(sid);
+    let basePos = 0;
+    let elems = 0;
+    let imgFlag = false;
+    let markers: RawStripCounts = { panels: 0, statusBodies: 0, statusBodyLines: 0, markerLines: 0, nudges: 0, carriers: 0 };
+    const applyGeom = (p: Record<string, unknown>, fromPosValue: number | null | undefined): void => {
+        if (typeof p.t === "number") elems = p.t;
+        if (typeof p.imgFlag === "boolean") imgFlag = p.imgFlag;
+        if (p.markers !== null && typeof p.markers === "object") {
+            const m = p.markers as Record<string, unknown>;
+            const pick = (k: keyof RawStripCounts): number => (typeof m[k] === "number" && Number.isInteger(m[k] as number) && (m[k] as number) >= 0 ? (m[k] as number) : 0);
+            markers = { panels: pick("panels"), statusBodies: pick("statusBodies"), statusBodyLines: pick("statusBodyLines"), markerLines: pick("markerLines"), nudges: pick("nudges"), carriers: pick("carriers") };
+        }
+        if (fromPosValue !== null && typeof fromPosValue === "number") basePos = fromPosValue;
+    };
+    if (meta.ckpt !== null) {
+        try {
+            const m = JSON.parse(meta.ckpt.metaJson) as { s?: Record<string, unknown>; f?: number | null };
+            if (typeof m.s === "object" && m.s !== null) applyGeom(m.s, m.f ?? null);
+        } catch {
+            return null; // corrupt checkpoint with an opaque folded prefix — degrade
+        }
+    }
+    for (const e of meta.tailLog) {
+        let p: Record<string, unknown>;
+        try { p = JSON.parse(e.payloadJson) as Record<string, unknown>; } catch { return null; }
+        if (e.kind === "geom") applyGeom(p, (p.f as number | null | undefined) ?? null);
+        else if (e.kind === "reset" || e.kind === "arm") {
+            if (typeof p.t === "number") elems = p.t;
+            basePos = typeof p.fromPos === "number" ? p.fromPos : maxP;
+        }
+    }
+    if (elems === 0) return null; // no completed ingest yet — arm flow owns this
+    const rows = pf.readRows(sid, [[basePos, maxP + 1]]);
+    const cores: CoreMessage[] = [];
+    for (const r of rows) {
+        try { cores.push(JSON.parse(r.coreJson) as CoreMessage); }
+        catch { log("warn", `[${session.id}] watermark v6-msgid: undecodable core row at ${r.pos} — resident rebuild degraded`); return null; }
+    }
+    if (cores.length === 0) return null;
+    const res: PFResident = { sid, cores, elems, rowHi: maxP + 1, imgFlag, markers };
+    residents.set(session, res);
+    return res;
+}
+
+/** The lane's verdict for one turn. null = pf plane unavailable (caller
+ *  falls through to the pre-existing lanes); anything else is authoritative
+ *  for this turn (hit or miss — a miss still routes the LEGACY full-parse
+ *  exactly like every other lane, and echoes the sid back). */
+function evaluateMsgIdLane(args: {
+    session: Session;
+    req: http.IncomingMessage;
+    bodyText: string;
+    scan: { total: number; messageSpans: readonly RawSpan[]; fieldSpans: ReadonlyMap<string, RawSpan> };
+    saved: PFSavedState | null;
+    parsedTailIds: string[] | null | undefined;
+    nowCs: string | undefined;
+    log: (level: string, msg: string) => void;
+}): FastpathOutcome | null {
+    const { session, req, bodyText, scan, saved, parsedTailIds, nowCs, log } = args;
+    const T = scan.total;
+    const pf = pfAvailable();
+    if (pf === null) return null; // soft availability — §4.1.6 待裁④ default
+    const tailValid = parsedTailIds !== undefined && parsedTailIds !== null ? parsedTailIds : undefined;
+    const out = (decision: string, credited: boolean, extra?: Partial<FastpathOutcome>): FastpathOutcome => {
+        if (credited) noteCreditedMiss(session.id, decision, log);
+        log("info", `[${session.id}] watermark v6-msgid miss (${decision}) — legacy full-parse this turn`);
+        return { hit: null, measuredT: T, decision, creditedMiss: credited, receivedTailIds: tailValid, clientSess: nowCs, canonical: true, ...extra };
+    };
+    // ---- ① identity resolution (§3.1, priority: echo → probe → mint) ------
+    const rawHdr = req.headers[PF_SID_HEADER];
+    const echoed = (Array.isArray(rawHdr) ? String(rawHdr[0] ?? "") : String(rawHdr ?? "")).trim();
+    let sid: string | undefined;
+    if (PF_SID_RE.test(echoed)) {
+        const meta = pf.readMeta(echoed);
+        if (pf.maxPos(echoed) >= 0 || meta.ckpt !== null || meta.tailLog.length > 0) sid = echoed;
+        else log("warn", `[${session.id}] watermark v6-msgid: echo of unknown pf_sid treated as fabrication — falling back to probe`);
+    }
+    if (sid === undefined && tailValid !== undefined) {
+        let budget = PF_PROBE_BUDGET;
+        for (const id of tailValid) {
+            if (id === PF_SLOT_UNKNOWN) continue;
+            const found = pf.lookupLedger(id);
+            if (found !== null) { sid = found.sid; break; }
+            if (--budget <= 0) break;
+        }
+    }
+    if (sid === undefined) {
+        // §8 case 7 cold start: the FIRST full parse IS the arm — P5 accepts
+        // one full materialization here and never again for this world.
+        const minted = mintPfSid();
+        registerPfSid(session, minted);
+        return out("v6m-arm", false, { sid: minted });
+    }
+    // ---- ② resident (in-process) or hydration (post-boot) -----------------
+    let res: PFResident | null = residents.get(session) ?? null;
+    if (res === null || res.sid !== sid) res = hydratePf(pf, session, sid, log);
+    if (res === null) return out("v6m-hydrate", false, { sid });
+    // R7 parity (unchanged from v5): swapped client-native session riding one
+    // bili session is an identity event, asserted only when both sides claim.
+    if (tailValid !== undefined && saved?.cs !== undefined) {
+        if (nowCs !== undefined && nowCs !== saved.cs) return out("sess-change", false, { sid });
+    }
+    // ---- ③ world-shape arithmetic against OUR frontier ---------------------
+    const K = res.elems;
+    if (T < K) {
+        // §6.1 client compaction (announce class): shrink-with-evidence of a
+        // world change. Default = passthrough-as-new-message (uncredited —
+        // host compaction is normal traffic); BILI_PF_V6_REWRITE_STRICT
+        // credits it toward the breaker for thrashing exotic hosts.
+        return out("v6m-compact", rewriteStrict(), { sid });
+    }
+    if (T === K) return out("v6m-no-progress", false, { sid }); // empty window pins nothing (v5 parity)
+    const W = T - K;
+    // ---- ④ window origin (only real proof needed: WHERE does new begin) ----
+    let tailIds: string[] | undefined;
+    if (parsedTailIds !== undefined) {
+        if (parsedTailIds === null || parsedTailIds.length !== W + 1) return out("v6m-shape", false, { sid });
+        tailIds = parsedTailIds;
+        const lastRow = res.rowHi > 0 ? pf.readRows(sid, [[res.rowHi - 1, res.rowHi]])[0] : undefined;
+        // Frontier coherence gate: the last stored row must BE element K-1
+        // (absolute body ordinal, system hoisted out by design). A row that
+        // does not line up means the resident lost sync with the partition —
+        // self-heal via a legacy turn rather than trust the arithmetic.
+        if (lastRow === undefined || lastRow.elem !== K - 1) return out("v6m-shape", false, { sid });
+        if (tailIds[0] !== PF_SLOT_UNKNOWN) {
+            if (pf.verifyOriginPin(sid, K - 1, tailIds[0])) {
+                // Hard pin: the claimed id is recorded on element K-1 of OUR
+                // partition — exact regardless of how many rows that element
+                // split into (multimodal pairs share one id).
+            } else if ((lastRow.ledgerId ?? null) === null) {
+                // Weak pin (null-row transition): the frontier row was ingested
+                // without a ledger id (client id-silent on the arm/reset turn).
+                // No recorded id can be drifted from, so any evidence for the
+                // slot — including an unbound real id — is accepted; the width
+                // arithmetic + window decode still guard the content, and every
+                // later turn re-binds through newly stored ids. A client that
+                // says "?" against a RECORDED id still fails the hard branch.
+            } else {
+                // Unknown / foreign / misplaced ⇒ world drift ⇒ self-healing
+                // legacy turn, resident untouched (retry next turn). Strictly
+                // stronger than v5's string compare: identity resolves inside
+                // OUR partition, never against a client echo.
+                return out("v6m-prev", false, { sid });
+            }
+        }
+    }
+    // ---- ⑤ decode: head (system passthrough) + window ONLY -----------------
+    const spans = scan.messageSpans;
+    const headEnd = Math.min(HEAD_CHECK_ELEMENTS, T);
+    const headFragment: { messages: unknown } = { messages: [] };
+    const windowFragment: { messages: unknown } = { messages: [] };
+    headFragment.messages = parseElementSlices(bodyText, spans.slice(0, headEnd));
+    windowFragment.messages = parseElementSlices(bodyText, spans.slice(K));
+    if (!Array.isArray(headFragment.messages) || !Array.isArray(windowFragment.messages)) return out("fragment-parse", false, { sid, receivedTailIds: tailIds });
+    stripRawStage(headFragment, "openai"); // normalize before convert; head bytes were already counted when ingested
+    const windowCounts = stripRawStage(windowFragment, "openai");
+    const windowRaw = openaiToCore(windowFragment as OpenAIRequestBody);
+    // Hoist hazard (parity with v5/canonical): a system/developer element at
+    // the window head poisons the view — credited, since it signals real drift.
+    if (windowRaw.systemText.trim() !== "") return out("v6m-window-system", true, { sid, receivedTailIds: tailIds });
+    const rekeyedWindow = rekeyWindowCores(windowRaw.msgs, K, res.cores);
+    const headCores = openaiToCore(headFragment as OpenAIRequestBody);
+    return {
+        hit: {
+            view: [...res.cores, ...rekeyedWindow] as CoreMessage[],
+            windowCores: rekeyedWindow as CoreMessage[],
+            systemText: headCores.systemText ?? "",
+            totalT: T,
+            fieldSpans: scan.fieldSpans,
+            windowMessages: windowFragment.messages,
+            // ACTUAL ingested cores are served (canonical-lane doctrine): the
+            // egress positional rule computes over the real array, so the v5
+            // stash-multimodal degradation has no referent here.
+            seedMultimodal: false,
+            markerCounts: addStripCounts(res.markers, windowCounts),
+        },
+        measuredT: T,
+        decision: "hit(v6-mid)",
+        creditedMiss: false,
+        receivedTailIds: tailIds,
+        clientSess: nowCs,
+        canonical: true,
+        sid,
+    };
+}
+
 /** #3642 identity continuity. openaiToCore mints cluster ids (base, or base_N
  * by INTRA-CALL occurrence order) and stamps wireIndex from the array position
  * it was given. The window fragment was parsed alone, so both are
@@ -694,6 +985,87 @@ export function finalizeWatermarkTurn(
     if (outcome.measuredT === undefined) return headers;
     const T = outcome.measuredT;
     const saved = readSaved(session.id);
+    // #5600 msgid plane: persistent residency replaces seed pinning. Hits
+    // append this turn's window rows + a geom snapshot; semantic misses
+    // (arm / compaction-reset) re-base the partition on the freshly parsed
+    // FULL view (§6.1 archive-and-reset — rows are never deleted here). All
+    // other miss classes write NOTHING (retry next turn against the same
+    // frontier). The shared writeSaved block below still runs for every
+    // outcome: ext state keeps t/m/l/cs live for debug + fallback lanes.
+    if (outcome.sid !== undefined) {
+        try {
+            const pf = pfAvailable();
+            if (pf !== null) {
+                const res = residents.get(session);
+                if (outcome.hit !== null) {
+                    if (res !== undefined && res.sid === outcome.sid) {
+                        // Element→ledger-id map from THIS turn's list (offset 1:
+                        // slot 0 is the origin pin); "?" slots ride id-less.
+                        const idByElem = new Map<number, string>();
+                        outcome.receivedTailIds?.slice(1).forEach((id, i) => { if (id !== PF_SLOT_UNKNOWN) idByElem.set(res.elems + i, id); });
+                        const rows = outcome.hit!.windowCores.map((c) => {
+                            const wi = (c as { wireIndex?: unknown }).wireIndex;
+                            return {
+                                ledgerId: typeof wi === "number" ? idByElem.get(wi) ?? null : null,
+                                // Absolute body-element ordinal (kernel stamps
+                                // wireIndex from the source array); split cores
+                                // of one multimodal element share it.
+                                elem: typeof wi === "number" ? wi : -1,
+                                coreId: c.id,
+                                coreJson: JSON.stringify(c),
+                            };
+                        });
+                        const geom = { kind: "geom", payload: { t: T, model: input.model, f: res.rowHi, imgFlag: res.imgFlag, markers: outcome.hit!.markerCounts }, bornPosHi: res.rowHi + rows.length } as const;
+                        const marks = pf.appendTurn(outcome.sid, rows, [geom]);
+                        residents.set(session, {
+                            sid: outcome.sid,
+                            cores: outcome.hit!.view,
+                            elems: T,
+                            rowHi: marks.maxPos + 1,
+                            imgFlag: res.imgFlag || coresHaveImagePart(outcome.hit!.windowCores),
+                            markers: outcome.hit!.markerCounts,
+                        });
+                        // L1 fold upkeep: collapse the L0 tail every 32 log
+                        // entries so post-boot hydration stays bounded.
+                        if (marks.lsSeq > 0 && marks.lsSeq % 32 === 0) {
+                            const r2 = residents.get(session)!;
+                            pf.writeCkpt(outcome.sid, marks.lsSeq, JSON.stringify({ s: { t: T, imgFlag: r2.imgFlag, markers: r2.markers }, f: res.rowHi }), createHash("sha256").update(JSON.stringify({ t: T })).digest("hex"));
+                        }
+                    }
+                } else if ((outcome.decision === "v6m-arm" || outcome.decision === "v6m-compact") && input.legacyCores.length > 0) {
+                    // §8 case-7 arm / §6.1 reset: ingest the freshly parsed
+                    // full view at CONTINUING positions (the old world stays
+                    // archived in the partition — rollback reference).
+                    const fromPos = res !== undefined && res.sid === outcome.sid ? res.rowHi : pf.maxPos(outcome.sid) + 1;
+                    const idByElem = new Map<number, string>();
+                    outcome.receivedTailIds?.forEach((id, i) => { if (id !== PF_SLOT_UNKNOWN) idByElem.set(i, id); });
+                    const rows = input.legacyCores.map((c) => {
+                        const wi = (c as { wireIndex?: unknown }).wireIndex;
+                        return {
+                            ledgerId: typeof wi === "number" ? idByElem.get(wi) ?? null : null,
+                            elem: typeof wi === "number" ? wi : -1,
+                            coreId: c.id,
+                            coreJson: JSON.stringify(c),
+                        };
+                    });
+                    const entryKind = outcome.decision === "v6m-arm" ? "arm" : "reset";
+                    const entry = { kind: entryKind, payload: { t: T, fromPos }, bornPosHi: fromPos + rows.length } as const;
+                    const marks = pf.appendTurn(outcome.sid, rows, [entry]);
+                    residents.set(session, {
+                        sid: outcome.sid,
+                        cores: [...input.legacyCores],
+                        elems: T,
+                        rowHi: marks.maxPos + 1,
+                        imgFlag: coresHaveImagePart(input.legacyCores),
+                        markers: input.turnStripCounts,
+                    });
+                }
+            }
+        } catch { /* pf plane is soft — degrade, never break the turn */ }
+        // Identity echo channel (§3.1): responses always carry the sid, which
+        // ALSO issues it on the mint turn (the client stores what it gets).
+        headers[PF_SID_HEADER] = outcome.sid;
+    }
     if (outcome.hit) {
         // #5576 v6: canonical outcomes pin NOTHING prefix-shaped in memory —
         // retaining the view here would recreate the very OOM pair (#5403)
@@ -733,9 +1105,12 @@ export function finalizeWatermarkTurn(
 
 /** Drop the in-process seed (e.g. an announced compaction was detected while
  *  the fastpath was silent on later turns). Cheap and idempotent; the next
- *  turn simply re-verifies via the legacy path. */
+ *  turn simply re-verifies via the legacy path. Also drops the #5600 msgid-
+ *  lane resident — the partition on disk is the truth and re-hydrates on
+ *  demand, so dropping memory never loses anything. */
 export function clearWatermarkSeed(session: Session): void {
     seeds.delete(session);
+    residents.delete(session);
 }
 
 /** Introspection for panel/tests: whether a live prefix stash exists. */

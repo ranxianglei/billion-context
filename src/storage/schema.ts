@@ -68,7 +68,14 @@
 //        never updated). No backfill: pre-feature rows stay NULL and keep
 //        rendering without the tag's time attribute. Same both-directions
 //        compatibility as v5 (older build ignores, newer build ALTERs).
-export const STORAGE_SCHEMA_VERSION = 10;
+/** v11 (#5600 §4.1/§3.1): fastpath snapshot store — pf_sid-partitioned
+ *  append-only data plane (pf_rows) + LSM metadata plane (pf_log/pf_ckpt).
+ *  Fresh databases create the shape directly; older installs upgrade with
+ *  three idempotent CREATE TABLE IF NOT EXISTS statements + two indexes
+ *  (upgrade cost: empty tables, byte-zero impact on existing data).
+ *  Tables are ZERO-STATE (no status/frontier columns); cleanup rides
+ *  deleteSession only (owner ruling: no independent retention period). */
+export const STORAGE_SCHEMA_VERSION = 11;
 
 /** #3250: cap for `journal_size_limit` (see STORAGE_PRAGMAS). Passive and
  *  auto checkpoints move frames into the main db and reset the write offset
@@ -397,6 +404,21 @@ export function migrateSchema(db: {
             if (!tsCols.includes("ts")) {
                 db.exec("ALTER TABLE messages ADD COLUMN ts INTEGER");
             }
+        }
+        if (from < 11) {
+            // v11 (#5600): fastpath snapshot store. Sid = server-minted
+            // pf_sid (§3.1) — client session ids NEVER appear in these
+            // tables. Idempotent CREATEs (dev-window discipline).
+            db.exec("CREATE TABLE IF NOT EXISTS pf_rows (\n                sid          TEXT NOT NULL,\n                pos          INTEGER NOT NULL,\n                elem         INTEGER NOT NULL,\n                ledger_id    TEXT,\n                core_id      TEXT NOT NULL,\n                core_json    TEXT NOT NULL,\n                ts           INTEGER NOT NULL,\n                PRIMARY KEY (sid, pos)\n            ) WITHOUT ROWID");
+            // Global probe index — msgid observed globally unique so far;
+            // backs the §3.1 rule-② identity probe (any sid resolves).
+            db.exec("CREATE INDEX IF NOT EXISTS idx_pf_rows_ledger ON pf_rows (ledger_id)")
+            // Origin-pin verification (elem-scoped id EXISTS check).
+            db.exec("CREATE INDEX IF NOT EXISTS idx_pf_rows_elem ON pf_rows (sid, elem)");
+            // block↔pos binding lookups.
+            db.exec("CREATE INDEX IF NOT EXISTS idx_pf_rows_core ON pf_rows (sid, core_id)");
+            db.exec("CREATE TABLE IF NOT EXISTS pf_log (\n                sid          TEXT NOT NULL,\n                ls_seq       INTEGER NOT NULL,\n                kind         TEXT NOT NULL,\n                payload_json TEXT NOT NULL,\n                born_pos_hi  INTEGER,\n                ts           INTEGER NOT NULL,\n                PRIMARY KEY (sid, ls_seq)\n            ) WITHOUT ROWID");
+            db.exec("CREATE TABLE IF NOT EXISTS pf_ckpt (\n                sid           TEXT PRIMARY KEY,\n                ckpt_ls_seq   INTEGER NOT NULL,\n                meta_json     TEXT NOT NULL,\n                checksum      TEXT NOT NULL,\n                updated_at    INTEGER NOT NULL\n            ) WITHOUT ROWID");
         }
     });
     if (needV8Backfill) migrateV8Identities(db);

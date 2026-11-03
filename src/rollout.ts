@@ -82,6 +82,23 @@ export const ROLLOUT_FEATURES: Record<string, RolloutPlan> = {
     // env `BILI_PF_V6_REWRITE_STRICT=1` credits content-rewrite misses toward
     // the breaker instead of letting them self-heal silently.
     watermarkCanonicalV6: { percent: 0, base: "pluginFullResendWatermark" },
+    // #5600 v6 msgid lane (owner ruling 2026-11-03): identity rides
+    // server-minted pf_sids (x-bili-pf-session echo + ledger-id probe + mint),
+    // NEVER client-native ids; frozen prefix cores come from the persistent
+    // pf_* snapshot partition store (hydrated at boot, append-only, cleanup
+    // rides deleteSession only) instead of an in-memory seed stash — the P1
+    // retention pair is removed even across restarts. Hit authority: ledger
+    // width arithmetic against our own persisted frontier + window-origin pin;
+    // the stamped x-bili-pf-count demotes to diagnostic. Every doubt degrades
+    // to the untouched legacy full-parse; compaction resets the world by
+    // archive-and-rebase (§6.1). SOFT plane: store unavailable ⇒ this lane
+    // stands aside byte-for-byte. Default 0% — nested INSIDE the
+    // pluginFullResendWatermark cohort; force on with
+    // `rollout.features.watermarkV6MsgId: true` /
+    // `BILI_ROLLOUT_WATERMARK_V6_MSG_ID=1`. Companion env
+    // `BILI_PF_V6_REWRITE_STRICT=1` credits compaction-class misses toward
+    // the breaker (shared with the canonical lane).
+    watermarkV6MsgId: { percent: 0, base: "pluginFullResendWatermark" },
     // #4804 WS delta continuation: codex/opencode WebSocket clients that keep a
     // previous_response_id checkpoint stop reconstructing full history on every
     // turn — the session augments the delta with the server-committed previous

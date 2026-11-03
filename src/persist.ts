@@ -2393,6 +2393,45 @@ export class SessionStore {
         return this.liveShadow().deleteSessionExt(sessionId, key);
     }
 
+    // ------------------------------------------------------------------
+    // #5600 fastpath snapshot store (pfsid plane). SOFT availability: null ⇒
+    // the lane degrades to status-quo behavior (§4.1.6 待裁④ 默认值). Knob-off
+    // traffic never reaches here — zero reads, zero writes.
+    // ------------------------------------------------------------------
+
+    pfStore(): {
+        appendTurn(
+            sid: string,
+            rows: { ledgerId: string | null; elem: number; coreId: string; coreJson: string }[],
+            entries: { kind: string; payload: unknown; bornPosHi?: number }[],
+        ): { maxPos: number; lsSeq: number };
+        lookupLedger(ledgerId: string): { sid: string; pos: number } | null;
+        verifyOriginPin(sid: string, elem: number, ledgerId: string): boolean;
+        readMeta(sid: string): {
+            ckpt: { ckptLsSeq: number; metaJson: string; checksum: string } | null;
+            tailLog: { lsSeq: number; kind: string; payloadJson: string; bornPosHi: number | null }[];
+        };
+        writeCkpt(sid: string, ckptLsSeq: number, metaJson: string, checksum: string, truncateBeforeInclusive?: boolean): void;
+        readRows(sid: string, intervals: ReadonlyArray<readonly [number, number]>): { pos: number; elem: number; ledgerId: string | null; coreId: string; coreJson: string; ts: number }[];
+        maxPos(sid: string): number;
+    } | null {
+        if (!this.replicasAvailable()) return null;
+        try {
+            const s = this.liveShadow();
+            return {
+                appendTurn: (sid, rows, entries) => s.pfAppendTurn(sid, rows, entries),
+                lookupLedger: (ledgerId) => s.pfLookupLedger(ledgerId),
+                readMeta: (sid) => s.pfReadMeta(sid),
+                writeCkpt: (sid, n, json, sum, t) => s.pfWriteCkpt(sid, n, json, sum, t),
+                verifyOriginPin: (sid, e, id) => s.pfVerifyOriginPin(sid, e, id),
+                readRows: (sid, iv) => s.pfReadRows(sid, iv),
+                maxPos: (sid) => s.pfMaxPos(sid),
+            };
+        } catch {
+            return null;
+        }
+    }
+
     setKv(namespace: string, key: string, value: unknown): void {
         this.liveShadow().setKv(namespace, key, value);
     }

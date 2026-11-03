@@ -1037,6 +1037,55 @@ export class UnifiedShadow {
         return this.sync.deleteSessionExt(sessionId, key);
     }
 
+    // ------------------------------------------------------------------
+    // #5600 fastpath snapshot store (pfsid plane) passthroughs — side-table
+    // substrate like checkpoints/ext. Availability gating happens at the
+    // persist level (pfStore() soft accessor); null-sync degrades to empty.
+    // ------------------------------------------------------------------
+
+    pfAppendTurn(
+        sid: string,
+        rows: { ledgerId: string | null; elem: number; coreId: string; coreJson: string }[],
+        entries: { kind: string; payload: unknown; bornPosHi?: number }[],
+    ): { maxPos: number; lsSeq: number } {
+        if (this.sync === null) return { maxPos: -1, lsSeq: -1 };
+        return this.sync.pfAppendTurn(sid, rows, entries);
+    }
+
+    pfLookupLedger(ledgerId: string): { sid: string; pos: number } | null {
+        if (this.sync === null) return null;
+        return this.sync.pfLookupLedger(ledgerId);
+    }
+
+    /** #5600 origin-pin check (see Store.pfVerifyOriginPin). */
+    pfVerifyOriginPin(sid: string, elem: number, ledgerId: string): boolean {
+        if (this.sync === null) return false;
+        return this.sync.pfVerifyOriginPin(sid, elem, ledgerId);
+    }
+
+    pfReadMeta(sid: string): {
+        ckpt: { ckptLsSeq: number; metaJson: string; checksum: string } | null;
+        tailLog: { lsSeq: number; kind: string; payloadJson: string; bornPosHi: number | null }[];
+    } {
+        if (this.sync === null) return { ckpt: null, tailLog: [] };
+        return this.sync.pfReadMeta(sid);
+    }
+
+    pfWriteCkpt(sid: string, ckptLsSeq: number, metaJson: string, checksum: string, truncateBeforeInclusive = true): void {
+        if (this.sync === null) return;
+        this.sync.pfWriteCkpt(sid, ckptLsSeq, metaJson, checksum, truncateBeforeInclusive);
+    }
+
+    pfReadRows(sid: string, intervals: ReadonlyArray<readonly [number, number]>): { pos: number; elem: number; ledgerId: string | null; coreId: string; coreJson: string; ts: number }[] {
+        if (this.sync === null) return [];
+        return this.sync.pfReadRows(sid, intervals);
+    }
+
+    pfMaxPos(sid: string): number {
+        if (this.sync === null) return -1;
+        return this.sync.pfMaxPos(sid);
+    }
+
     setKv(namespace: string, key: string, value: unknown): void {
         if (this.sync === null) return;
         this.sync.setKv(namespace, key, value);

@@ -1665,6 +1665,20 @@ export class UnifiedStore {
 
     deleteSession(sessionId: string): void {
         this.db.transaction(() => {
+            // #5600 §4.1.1: pfsid partitions ride session deletion (owner
+            // ruling: no independent retention period) — the session's
+            // ext registry (`pf:sids`) names every snapshot identity minted
+            // under it; all three pf_* tables sweep in THIS transaction.
+            try {
+                const sidsRow = this.db.prepare("SELECT value_json FROM session_ext WHERE session_id = ? AND key = 'pf:sids'").get(sessionId) as { value_json: string } | undefined;
+                if (sidsRow) {
+                    const parsed: unknown = JSON.parse(sidsRow.value_json);
+                    if (Array.isArray(parsed)) {
+                        const sids = parsed.filter((s): s is string => typeof s === "string" && s.length > 0);
+                        if (sids.length > 0) this.pfDeleteSids(sids, true);
+                    }
+                }
+            } catch { /* malformed registry — nothing to sweep */ }
             const refs: string[] = [];
             for (const m of this.db
                 .prepare("SELECT content_hash FROM messages WHERE session_id = ?")
@@ -2295,6 +2309,140 @@ export class UnifiedStore {
         return sessionId
             ? (this.db.prepare(`SELECT ${cols} FROM checkpoints WHERE session_id = ? ORDER BY created_at, cp_id`).all(sessionId) as CheckpointRow[])
             : (this.db.prepare(`SELECT ${cols} FROM checkpoints ORDER BY created_at, cp_id`).all() as CheckpointRow[]);
+    }
+
+    // ------------------------------------------------------------------
+    // Fastpath snapshot store (#5600 §4.1/§3.1). Sid = server-minted pf_sid;
+    // append-only data plane + LSM metadata plane; ZERO-STATE tables (no
+    // status/frontier columns — current state derives from log folds). Every
+    // op is one transaction. Cleanup rides deleteSession only (no
+    // independent retention period — owner ruling).
+    // ------------------------------------------------------------------
+
+    /** Append one turn's data rows + log entries atomically (single tx).
+     *  Returns the new high-water marks after this turn. */
+    pfAppendTurn(
+        sid: string,
+        rows: { ledgerId: string | null; elem: number; coreId: string; coreJson: string }[],
+        entries: { kind: string; payload: unknown; bornPosHi?: number }[],
+    ): { maxPos: number; lsSeq: number } {
+        return this.db.transaction(() => {
+            const now = Date.now();
+            const r = this.db.prepare("SELECT COALESCE(MAX(pos), -1) AS m FROM pf_rows WHERE sid = ?").get(sid) as { m: number };
+            let pos = r.m;
+            if (rows.length > 0) {
+                const ins = this.db.prepare("INSERT INTO pf_rows (sid, pos, elem, ledger_id, core_id, core_json, ts) VALUES (?, ?, ?, ?, ?, ?, ?)");
+                for (const row of rows) {
+                    pos += 1;
+                    ins.run(sid, pos, row.elem, row.ledgerId, row.coreId, row.coreJson, now);
+                }
+            }
+            const l = this.db.prepare("SELECT COALESCE(MAX(ls_seq), -1) AS m FROM pf_log WHERE sid = ?").get(sid) as { m: number };
+            let seq = l.m;
+            if (entries.length > 0) {
+                const ins = this.db.prepare("INSERT INTO pf_log (sid, ls_seq, kind, payload_json, born_pos_hi, ts) VALUES (?, ?, ?, ?, ?, ?)");
+                for (const e of entries) {
+                    seq += 1;
+                    ins.run(sid, seq, e.kind, JSON.stringify(e.payload), e.bornPosHi ?? null, now);
+                }
+            }
+            return { maxPos: pos, lsSeq: seq };
+        });
+    }
+
+    /** §3.1 origin-pin verification: does element `elem` of THIS partition
+     *  carry `ledgerId` on ANY of its rows (a multimodal element splits into
+     *  several rows sharing one id)? Exactly the check the msgid lane needs
+     *  instead of first-hit-by-pos equality. */
+    pfVerifyOriginPin(sid: string, elem: number, ledgerId: string): boolean {
+        const r = this.db
+            .prepare("SELECT 1 AS x FROM pf_rows WHERE sid = ? AND elem = ? AND ledger_id = ? LIMIT 1")
+            .get(sid, elem, ledgerId);
+        return r !== undefined;
+    }
+
+    /** §3.1 rule-② identity probe: does any partition carry this msgid?
+     *  Msgid is observed globally unique so far, so one hit resolves the
+     *  owner sid unambiguously; ties break to the lowest pos (diagnostic
+     *  noise would show up there first). */
+    pfLookupLedger(ledgerId: string): { sid: string; pos: number } | null {
+        const row = this.db
+            .prepare("SELECT sid, pos FROM pf_rows WHERE ledger_id = ? ORDER BY pos LIMIT 1")
+            .get(ledgerId) as { sid: string; pos: number } | undefined;
+        return row ?? null;
+    }
+
+    /** L1 checkpoint + bounded tail of the L0 hot log since it.
+     *  Caller replays tailLog in order over the ckpt meta (§4.1.4 hydration). */
+    pfReadMeta(sid: string): {
+        ckpt: { ckptLsSeq: number; metaJson: string; checksum: string } | null;
+        tailLog: { lsSeq: number; kind: string; payloadJson: string; bornPosHi: number | null }[];
+    } {
+        const c = this.db
+            .prepare("SELECT ckpt_ls_seq, meta_json, checksum FROM pf_ckpt WHERE sid = ?")
+            .get(sid) as { ckpt_ls_seq: number; meta_json: string; checksum: string } | undefined;
+        const fromSeq = c ? c.ckpt_ls_seq : -1;
+        const tailLog = this.db
+            .prepare("SELECT ls_seq, kind, payload_json, born_pos_hi FROM pf_log WHERE sid = ? AND ls_seq > ? ORDER BY ls_seq")
+            .all(sid, fromSeq) as { ls_seq: number; kind: string; payload_json: string; born_pos_hi: number | null }[];
+        return {
+            ckpt: c ? { ckptLsSeq: c.ckpt_ls_seq, metaJson: c.meta_json, checksum: c.checksum } : null,
+            tailLog: tailLog.map((r) => ({ lsSeq: r.ls_seq, kind: r.kind, payloadJson: r.payload_json, bornPosHi: r.born_pos_hi })),
+        };
+    }
+
+    /** Write the L1 checkpoint and (default recommendation, vetoable §4.1.6-⑤)
+     *  physically drop the folded L0 prefix in the SAME transaction. */
+    pfWriteCkpt(sid: string, ckptLsSeq: number, metaJson: string, checksum: string, truncateBeforeInclusive = true): void {
+        this.db.transaction(() => {
+            this.db
+                .prepare(
+                    "INSERT INTO pf_ckpt (sid, ckpt_ls_seq, meta_json, checksum, updated_at) VALUES (?, ?, ?, ?, ?) " +
+                        "ON CONFLICT (sid) DO UPDATE SET ckpt_ls_seq = excluded.ckpt_ls_seq, meta_json = excluded.meta_json, checksum = excluded.checksum, updated_at = excluded.updated_at",
+                )
+                .run(sid, ckptLsSeq, metaJson, checksum, Date.now());
+            if (truncateBeforeInclusive) {
+                this.db.prepare("DELETE FROM pf_log WHERE sid = ? AND ls_seq <= ?").run(sid, ckptLsSeq);
+            }
+        });
+    }
+
+    /** Windowed read of data-plane rows for visible intervals
+     *  [lo, hi) — caller keeps intervals sorted & disjoint ascending so the
+     *  result comes back globally pos-ordered. Deep-fold hydration can pass
+     *  only the live windows (§4.1.4: hydration gets lighter as folds deepen). */
+    pfReadRows(sid: string, intervals: ReadonlyArray<readonly [number, number]>): { pos: number; elem: number; ledgerId: string | null; coreId: string; coreJson: string; ts: number }[] {
+        const q = this.db.prepare(
+            "SELECT pos, elem, ledger_id, core_id, core_json, ts FROM pf_rows WHERE sid = ? AND pos >= ? AND pos < ? ORDER BY pos",
+        );
+        const out: { pos: number; elem: number; ledgerId: string | null; coreId: string; coreJson: string; ts: number }[] = [];
+        for (const [lo, hi] of intervals) {
+            const rows = q.all(sid, lo, hi) as { pos: number; elem: number; ledger_id: string | null; core_id: string; core_json: string; ts: number }[];
+            for (const r of rows) out.push({ pos: r.pos, elem: r.elem, ledgerId: r.ledger_id, coreId: r.core_id, coreJson: r.core_json, ts: r.ts });
+        }
+        return out;
+    }
+
+    pfMaxPos(sid: string): number {
+        const r = this.db.prepare("SELECT COALESCE(MAX(pos), -1) AS m FROM pf_rows WHERE sid = ?").get(sid) as { m: number };
+        return r.m;
+    }
+
+    /** Cascade cleanup for a set of pfsids — called from deleteSession via
+     *  the session's ext registry (`pf:sids`), honoring the no-retention
+     *  ruling. `insideTx=true` skips the wrapper when the caller already
+     *  holds a transaction (better-sqlite3 has no nested BEGIN); the three
+     *  deletes then ride the caller's transaction atomically. */
+    pfDeleteSids(sids: string[], insideTx = false): void {
+        if (sids.length === 0) return;
+        const run = (): void => {
+            const ph = sids.map(() => "?").join(", ");
+            this.db.prepare(`DELETE FROM pf_rows WHERE sid IN (${ph})`).run(...sids);
+            this.db.prepare(`DELETE FROM pf_log WHERE sid IN (${ph})`).run(...sids);
+            this.db.prepare(`DELETE FROM pf_ckpt WHERE sid IN (${ph})`).run(...sids);
+        };
+        if (insideTx) run();
+        else this.db.transaction(run);
     }
 
     // ------------------------------------------------------------------
