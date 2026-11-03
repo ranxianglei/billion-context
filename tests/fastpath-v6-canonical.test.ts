@@ -18,6 +18,12 @@ import { _setStoreForTest, _resetStoreForTest, type SessionStore } from "../src/
 import type { Session } from "../src/session.ts";
 
 process.env.BILI_ROLLOUT_PLUGIN_FULL_RESEND_WATERMARK = "1";
+// TEMP (#5576 pre-merge verification push): the branch temporarily ships the
+// watermarkV6MsgId registry default at 100%; pin it OFF here so this suite
+// exercises the CANONICAL lane in isolation (the msgid lane intentionally
+// shadows it while live — covered by tests/fastpath-pf-msgid.test.ts).
+// REVERT together with the TEMP-ON defaults before merge.
+process.env.BILI_ROLLOUT_WATERMARK_V6_MSG_ID = "0";
 
 const LOGS: string[] = [];
 const log = (level: string, msg: string): void => { LOGS.push(`${level} ${msg}`); };
