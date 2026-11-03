@@ -210,6 +210,7 @@
 | `BILI_AUTO_MODE_FORGE` | autoModeForge.enabled，默认 on——auto-mode 分类判定本地 forge，零出账/计费（`=0` 恢复纯透传，留给付真实判定费的用户，#2740 owner 决定） |
 | `BILI_DSH_CONTEXT_TAB` | dsh.contextTab 的 env 层（#4237）：`=0` 隐藏 DSH 顶栏「上下文」标签页（压缩及其余入口全部不受影响）；其他值强制开并覆盖文件层；缺省按文件层（默认 true）；下次页面加载 / dsh 重启生效 |
 | `BILI_DSH_MAX_TESTED_VERSION` | dsh native lane「高于已测最高版」启动提示的上限（#4545）：从注入包上方最近的 node_modules/@deepseek-ai/dsh/package.json 读运行中的构建，**严格高于**上限才弹一条启动提示，建议先回滚；默认 0.2.0-rc.2（CI e2e 锚点），新版本验证通过后抬高；空串 = 关闭检查；只提示不拦截 |
+| `BILI_PF_V6_REWRITE_STRICT` | fastpath watermark v6 msgid 车道（#5600）strict 开关：msgid 车道上把「压缩类前缀收缩」从可自愈未计名 miss 升级为计名（喂熔断）；canonical 车道上同开关表示链断裂。v6m-window-system 恒计名、不受它影响；默认 unset/off |
 
 ## 3. 非环境变量的 BILI_* 标识符（勿与上表混淆）
 

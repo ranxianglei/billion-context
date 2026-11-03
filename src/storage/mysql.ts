@@ -65,10 +65,10 @@ import type {
  *  Same discipline as the jimp lazy load (src/image-rescale.ts, #3516). */
 export type Mysql2Module = typeof import("mysql2/promise");
 
-/** v10 (#4313): immutable per-message wall-clock stamp. Existing stamped-v9
- *  libraries re-enter the probe-first DDL block below exactly once on first
- *  open; pre-feature rows read NULL (no backfill). */
-const MYSQL_SCHEMA_VERSION = 10;
+/** v11 (#5600): fastpath snapshot store (pf_rows/pf_log/pf_ckpt) rides the
+ *  always-run fresh-install DDL below — no data step; the stamp keeps the two
+ *  backends' shape bookkeeping in lockstep with STORAGE_SCHEMA_VERSION. */
+const MYSQL_SCHEMA_VERSION = 11;
 
 /** Parity constants with the sqlite v8 streaming backfill
  *  (src/storage/schema.ts, #4677): same page size, same printable absent
@@ -256,6 +256,41 @@ CREATE TABLE IF NOT EXISTS message_media (
 CREATE TABLE IF NOT EXISTS bili_meta (
     meta_key   VARCHAR(64) NOT NULL PRIMARY KEY,
     meta_value VARCHAR(256) NOT NULL
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4;
+
+-- #5600 fastpath snapshot store (sqlite twin: schema.ts v11). Sid = server-
+-- minted pf_sid; ledger_id holds host msgids (<=512ch by the parse cap), so
+-- its single-column utf8mb4 index stays under InnoDB's 3072B limit.
+CREATE TABLE IF NOT EXISTS pf_rows (
+    sid        VARCHAR(255) NOT NULL,
+    pos        BIGINT       NOT NULL,
+    elem       BIGINT       NOT NULL,
+    ledger_id  VARCHAR(512),
+    core_id    VARCHAR(255) NOT NULL,
+    core_json  LONGTEXT     NOT NULL,
+    ts         BIGINT       NOT NULL,
+    PRIMARY KEY (sid, pos),
+    KEY idx_pf_rows_ledger (ledger_id),
+    KEY idx_pf_rows_elem (sid, elem),
+    KEY idx_pf_rows_core (sid, core_id)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4;
+
+CREATE TABLE IF NOT EXISTS pf_log (
+    sid          VARCHAR(255) NOT NULL,
+    ls_seq       BIGINT       NOT NULL,
+    kind         VARCHAR(64)  NOT NULL,
+    payload_json LONGTEXT     NOT NULL,
+    born_pos_hi  BIGINT,
+    ts           BIGINT       NOT NULL,
+    PRIMARY KEY (sid, ls_seq)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4;
+
+CREATE TABLE IF NOT EXISTS pf_ckpt (
+    sid           VARCHAR(255) NOT NULL PRIMARY KEY,
+    ckpt_ls_seq   BIGINT       NOT NULL,
+    meta_json     LONGTEXT     NOT NULL,
+    checksum      VARCHAR(64)  NOT NULL,
+    updated_at    BIGINT       NOT NULL
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4;
 `;
 
