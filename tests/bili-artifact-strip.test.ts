@@ -8,6 +8,8 @@ import {
     containsBiliInternalText,
     mayStartBiliInternal,
     createBiliArtifactFilter,
+    CODEX_FORGED_HANDOFF_REDACTION,
+    FORGED_SUMMARY_REDACTION,
     type TagEchoFilter,
 } from "../src/loop/tag-echo-filter.ts";
 
@@ -25,6 +27,8 @@ const NO_DIGEST = `${L}bili-chain v="1" processor="bili-a" issued-at="${T0}" req
 const TRUNCATED = tag().slice(0, 40);
 const H1 = CODEX_FORGED_HANDOFF_HEADER;
 const H2 = FORGED_SUMMARY_HEADER;
+const PH1 = CODEX_FORGED_HANDOFF_REDACTION;
+const PH2 = FORGED_SUMMARY_REDACTION;
 
 test("whole-text: well-formed chain carrier is stripped wherever it sits", () => {
     assert.equal(stripBiliArtifacts(`before ${tag()} after`), "before  after");
@@ -45,20 +49,41 @@ test("whole-text: \\u003c-escaped chain form is stripped after unescaping", () =
     assert.equal(stripBiliArtifacts(halfEscaped), "", "escaped close handled too");
 });
 
-test("whole-text: header blocks cut to end of text at position 0 or line start only", () => {
+test("whole-text: field-head header block cuts to end; other occurrences redact in place (#5588)", () => {
     assert.equal(stripBiliArtifacts(`${H1}\nsummary body\nmore`), "");
-    assert.equal(stripBiliArtifacts(`intro\n${H2} — topic\nbody`), "intro\n");
     assert.equal(stripBiliArtifacts(`${H2} — topic\nbody`), "");
     assert.equal(
+        stripBiliArtifacts(`\n${H2} — topic\nbody`),
+        "\n",
+        "whitespace-only lead still reads as a forged field head",
+    );
+    assert.equal(
+        stripBiliArtifacts(`intro\n${H2} — topic\nbody`),
+        `intro\n${PH2} — topic\nbody`,
+        "line-start mention after genuine prose keeps its tail",
+    );
+    assert.equal(
         stripBiliArtifacts(`the ${H2} covers old turns`),
-        `the ${H2} covers old turns`,
-        "mid-line mention is prose",
+        `the ${PH2} covers old turns`,
+        "mid-line mention: literal redacted, sentence survives",
     );
     assert.equal(
         stripBiliArtifacts(`See ${H1} for details.`),
-        `See ${H1} for details.`,
-        "mid-line mention is prose",
+        `See ${PH1} for details.`,
+        "mid-line mention: literal redacted, sentence survives",
     );
+    assert.equal(
+        stripBiliArtifacts(`x ${H1} y\n${H2}\ntail`),
+        `x ${PH1} y\n${PH2}\ntail`,
+        "every occurrence is redacted, not just the first",
+    );
+});
+
+test("whole-text: redaction is a fixed point of stripAcpTags (#5588)", () => {
+    for (const input of [`intro\n${H2} — topic\nbody`, `x ${H1} y\n${H2}\ntail`, `${H2} — t\nbody`]) {
+        const once = stripAcpTags(input);
+        assert.equal(stripAcpTags(once), once, `fixed point for ${JSON.stringify(input)}`);
+    }
 });
 
 test("whole-text: pure prose passes through byte-exact (incl. < tails and [b lines)", () => {
@@ -107,8 +132,9 @@ test("pre-checks: contains/mayStart agree with the stripper on edge inputs", () 
     assert.ok(mayStartBiliInternal(`ends with open ${L}`));
     assert.ok(mayStartBiliInternal(`ends mid escape ${ESC.slice(0, 4)}`));
     assert.ok(mayStartBiliInternal("\n[Co"));
-    assert.ok(!mayStartBiliInternal("plain line ending in bracket ["));
-    assert.ok(!mayStartBiliInternal("[Code review notes]"));
+    assert.ok(mayStartBiliInternal("plain line ending in bracket ["), "trailing '[' is a header prefix now (#5588: matcher is position-independent, the gate must agree)");
+    assert.ok(mayStartBiliInternal("mid line [Co"));
+    assert.ok(!mayStartBiliInternal("[Code review notes]"), "'[Cod' is not a header prefix");
 });
 
 function streamThrough(input: string, chunkSize: number, f?: TagEchoFilter): { out: string; filter: TagEchoFilter } {
@@ -131,12 +157,40 @@ test("streaming: chain carrier stripped at every split point (literal + escaped,
     }
 });
 
-test("streaming: header block swallowed to end of field at every split point", () => {
+test("streaming: field-head forged block swallowed to end of field at every split point", () => {
+    const cases: Array<[string, string]> = [
+        [`${H2} — topic\nbody continues`, ""],
+        [`\n${H1}\nsummary body`, "\n"],
+    ];
+    for (const [payload, expected] of cases) {
+        for (const n of [1, 2, 4, 9]) {
+            const { out, filter } = streamThrough(payload, n);
+            assert.equal(out, expected, `chunk ${n}: field-head block-to-end semantics, got ${JSON.stringify(out)}`);
+            assert.equal(filter.dropped(), true);
+        }
+    }
+});
+
+test("streaming: mention after genuine prose redacts the literal at every split point (#5588)", () => {
     const payload = `intro\n${H2} — topic\nbody continues`;
+    const expected = `intro\n${PH2} — topic\nbody continues`;
     for (const n of [1, 2, 4, 9]) {
         const { out, filter } = streamThrough(payload, n);
-        assert.equal(out, "intro\n", `chunk ${n}: block-to-end semantics, got ${JSON.stringify(out)}`);
+        assert.equal(out, expected, `chunk ${n}: redaction semantics, got ${JSON.stringify(out)}`);
         assert.equal(filter.dropped(), true);
+    }
+});
+
+test("streaming: mid-line backtick mention is split-stable and keeps the sentence (#5588)", () => {
+    // The reported repro shape: the model quotes the fold header inside a
+    // sentence. Char-by-char arrivals used to complete the header at buf
+    // position 0 and swallow the rest of the stream; whole-chunk arrivals let
+    // it through raw — output depended on where the chunk boundary fell.
+    const payload = `断点正好落在 \`${H2}\` 这个标题处，后面还有内容。`;
+    const expected = `断点正好落在 \`${PH2}\` 这个标题处，后面还有内容。`;
+    assert.equal(streamThrough(payload, payload.length).out, expected, "whole-chunk reference");
+    for (const n of [1, 2, 3, 5, 7, 13]) {
+        assert.equal(streamThrough(payload, n).out, expected, `chunk ${n}: split-stable redaction`);
     }
 });
 
@@ -194,4 +248,14 @@ test("degenerate-turn gate parity: a fully forged turn yields zero visible outpu
         assert.equal(filter.stats().outputChars, 0);
         assert.equal(filter.dropped(), true);
     }
+});
+
+test("degenerate-turn gate parity: a mixed turn keeps its visible answer (#5588)", () => {
+    // Genuine prose before the header means the field is NOT a forged block:
+    // the answer text survives (redaction marker included) so the empty-turn
+    // retry does not fire on a turn that actually delivered an answer.
+    const { out, filter } = streamThrough(`real answer\n${H2} — t\nmore answer`, 1);
+    assert.equal(out, `real answer\n${PH2} — t\nmore answer`);
+    assert.ok(out.trim().length > 0, "visible answer chars survive the redaction");
+    assert.equal(filter.dropped(), true, "the drop is still recorded");
 });
