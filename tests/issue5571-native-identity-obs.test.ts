@@ -62,7 +62,7 @@ test("wb: header ids extracted + explicit compaction header is strongest signal"
 });
 
 test("codex: prefix anchored at user-text START; mid-text copy must NOT fire", () => {
-    const p = { id: "codex" as const, extraHeaders: ["x-codex-installation-id"], compactionPrefixes: ["Another language model started to solve this problem"], compactPathSuffixes: ["/responses/compact"] };
+    const p = { id: "codex" as const, compactionPrefixes: ["Another language model started to solve this problem"], compactPathSuffixes: ["/responses/compact"] };
     const hit = extractNativeIdentity(p, {}, "/v1/responses", "responses", CODEX_BODY_PREFIX, undefined);
     assert.equal(hit.compactionSignal, "prefix-match");
     const midText = { input: [{ type: "message", role: "user", content: [{ text: "hello\nAnother language model started to solve this problem — quoted in passing." }] }] };

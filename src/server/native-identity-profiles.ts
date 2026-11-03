@@ -25,8 +25,6 @@ interface NidvProfile {
     readonly reqHeader?: string;
     /** Fork/lineage header. */
     readonly parentHeader?: string;
-    /** Additional headers to capture — dynamic-capture items, spelling TBC. */
-    readonly extraHeaders?: readonly string[];
     /** Body JSON paths for session-id cross-channel verification. */
     readonly bodySessPaths?: ReadonlyArray<readonly (string | number)[]>;
     /** User-turn text prefixes marking a client-side re-baseline (compaction). */
@@ -77,17 +75,9 @@ const WB: NidvProfile = {
 
 const CODEX: NidvProfile = {
     id: "codex",
-    // Installation id is stable per machine (file ~/.codex/installation_id);
-    // the thread/window header spellings are FORENSIC GUESSES pending a live
-    // capture — capture them all when present, do not filter on them yet.
-    extraHeaders: [
-        "x-codex-installation-id",
-        "x-client-request-id",
-        "x-codex-window-id",
-        "x-codex-turn-metadata",
-        "x-codex-parent-thread-id",
-        "x-openai-subagent",
-    ],
+    // Installation id is stable per machine (file ~/.codex/installation_id) —
+    // the reliable detector; the other thread/window header spellings are
+    // forensic guesses pending live capture (issue #5571 collection table).
     parentHeader: "x-codex-parent-thread-id",
     // Re-baseline: fixed lead sentence prepended after a local compact, plus
     // the dedicated server endpoint POST /responses/compact.
