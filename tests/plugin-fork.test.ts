@@ -294,6 +294,10 @@ test("HTTP exposes a versioned snapshot and forks an exact ordered prefix", { ti
 });
 
 test("HTTP fork carries the timestamp ledger so the first child replay re-renders cached tag bytes (#5608)", { timeout: 60_000 }, async () => {
+    // the carry only has teeth when stamps exist: defeat the suite's ambient
+    // BILI_MESSAGE_TIMESTAMPS=0 pin so this instance resolves the #4313 default ON
+    const prevStampEnv = process.env.BILI_MESSAGE_TIMESTAMPS;
+    delete process.env.BILI_MESSAGE_TIMESTAMPS;
     const h = await harness();
     try {
         const parent = resolveConversation("parent").session!;
@@ -303,7 +307,11 @@ test("HTTP fork carries the timestamp ledger so the first child replay re-render
         assert.equal(fork.status, 201, JSON.stringify(fork.body));
         const child = resolveConversation("child").session!;
         assert.deepEqual(child.state.tsStamps, parent.state.tsStamps, "stamps are raw-id (content-hash) keyed — the whole ledger denotes exact cached bytes and rides the fork verbatim");
-    } finally { await h.close(); }
+    } finally {
+        await h.close();
+        if (prevStampEnv === undefined) delete process.env.BILI_MESSAGE_TIMESTAMPS;
+        else process.env.BILI_MESSAGE_TIMESTAMPS = prevStampEnv;
+    }
 });
 
 async function sendIntentModel(h: Awaited<ReturnType<typeof harness>>, conversationId: string, messages: unknown[], tools: unknown[], requestAgent?: string, maxTokens = 256, announcePlugin = true, pluginName = "ekko-agent") {

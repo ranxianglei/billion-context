@@ -133,6 +133,9 @@ test("applyForkAdoption without a parent ledger leaves the child stamp-free (hon
 test("resume-inheritance MISS seeds the timestamp ledger from the closest tracked chain (#5608 wiring)", { timeout: 90_000 }, async () => {
     const dir = mkdtempSync(join(tmpdir(), "bili-miss-seed-"));
     for (const key of ["XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME"]) process.env[key] = dir;
+    // defeat the suite's ambient BILI_MESSAGE_TIMESTAMPS=0 pin (#4313 default ON) — without stamp minting there is nothing for the seed rung to carry
+    const prevStampEnv = process.env.BILI_MESSAGE_TIMESTAMPS;
+    delete process.env.BILI_MESSAGE_TIMESTAMPS;
     _resetSessionsForTest();
     // Eight distinct messages: the miss diagnostics only judge chains at or
     // above MIN_RESUME_PREFIX (8) — shorter chains never produce a closest
@@ -208,6 +211,8 @@ test("resume-inheritance MISS seeds the timestamp ledger from the closest tracke
         setLogCapture(null);
         store2.closeQuietly();
         await closeServers([proxy2, upstream], "miss-seed phase 2");
+        if (prevStampEnv === undefined) delete process.env.BILI_MESSAGE_TIMESTAMPS;
+        else process.env.BILI_MESSAGE_TIMESTAMPS = prevStampEnv;
     }
 });
 
