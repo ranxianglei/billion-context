@@ -14,9 +14,10 @@ import { describeUpstreamFailure, formatUpstreamError, getUpstreamConnectionStat
  *  before any upstream byte returns — nginx records 499, and bili's relay catch
  *  classified the resulting AbortError as upstream-timeout ("check upstream
  *  health") because it never passed the clientAbort signal state into the
- *  classification. Retry/alert/circuit were already correctly gated on
- *  externalAborted; the misattribution lived in the last-connection status
- *  surface, the egress line detail, and the 502 diagnostic body. */
+ *  classification. The retry ladder already classified with externalAborted,
+ *  and alert/circuit never count these kinds (ALERT_KINDS whitelist); the
+ *  misattribution lived in the last-connection status surface, the egress line
+ *  detail, and the 502 diagnostic body. */
 
 function abortError(): Error {
     return new DOMException("This operation was aborted", "AbortError");
