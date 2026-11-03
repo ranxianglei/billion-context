@@ -216,7 +216,7 @@ export function resolveDecompress(
         return resolveDecompressRange(args, ctx, block);
     }
 
-    const full = args.full === true;
+    const full = args.full === true || args.full === "true";
     const cached = ctx.session.blockContents.get(blockId);
     let body: string;
     let count: number;
@@ -589,7 +589,7 @@ function resolveDerivedDecompress(
         if (hasRangeArgs(args)) {
             return toolFail(`[decompress FAILED: range restore (startId/endId) of derived-parent blocks is not supported — decompress "${blockId}" without range args (#1333)]`);
         }
-        const full = args.full === true;
+        const full = args.full === true || args.full === "true";
         const cached = anc.blockContents.get(blockId);
         const view = cached ? (full ? cached.full : (cached.one ?? cached.full)) : undefined;
         const body = view?.text || block.summary;
@@ -829,7 +829,8 @@ export function executeSearchContext(
     const query = typeof args.query === "string" ? args.query : "";
     if (query.length === 0) return toolFail("[search_context FAILED: query is required]");
     const scope = foreignSessionId ? ` in session ${foreignSessionId}` : "";
-    const limit = typeof args.limit === "number" && args.limit > 0 ? Math.floor(args.limit) : 5;
+    const rawLimit = typeof args.limit === "number" ? args.limit : typeof args.limit === "string" && /^\d+$/.test(args.limit.trim()) ? Number(args.limit.trim()) : NaN;
+    const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? Math.floor(rawLimit) : 5;
     const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
     // #4154: the pool is EVERY block (active + inactive/consumed), ranked by
     // the kernel's public search surface (blockDocs + searchBlocks) instead
