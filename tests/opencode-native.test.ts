@@ -111,19 +111,21 @@ test("markNativeHost: sets when unset, first writer wins", () => {
     assert.equal(blank.BILLION_CONTEXT_NATIVE, "omp");
 });
 
-test("route: healthy origin rewrites the request reference and records proxyBase", async () => {
+test("route: healthy origin records proxyBase and leaves the shared request untouched (#4276)", async () => {
     const origin = "http://127.0.0.1:9999";
     const state: NativeInterceptState = { origin, ready: Promise.resolve(origin) };
     const route = createNativeRoute(state, { probe: async () => true });
     const s: V2State = {};
     const body = JSON.stringify({ messages: [] });
-    const e: V2HttpRequestEvent = {
-        sessionID: "ses_1",
-        request: new Request(MODEL_URL, { method: "POST", headers: { "content-type": "application/json", authorization: "Bearer x" }, body }),
-    };
+    const req = new Request(MODEL_URL, { method: "POST", headers: { "content-type": "application/json", authorization: "Bearer x" }, body });
+    const e: V2HttpRequestEvent = { sessionID: "ses_1", request: req };
     await route(e, s);
+    // #4276: the shared hook payload must survive verbatim — every later hook
+    // (provider plugins included) sees the ORIGINAL upstream URL; the proxy
+    // rewrite happens at fetch time in the native intercept chain.
+    assert.equal(e.request, req);
     const out = e.request as Request;
-    assert.equal(out.url, `${origin}/bili/${MODEL_URL}`);
+    assert.equal(out.url, MODEL_URL);
     assert.equal(out.method, "POST");
     assert.equal(out.headers.get("authorization"), "Bearer x");
     assert.equal(await out.text(), body);
@@ -146,7 +148,7 @@ test("route: non-model-API and already-routed URLs are left untouched", async ()
     assert.equal(s.proxyBase, undefined);
 });
 
-test("route: waits for a pending bootstrap before routing", async () => {
+test("route: waits for a pending bootstrap before recording proxyBase", async () => {
     let release!: (o: string) => void;
     const state: NativeInterceptState = { origin: undefined, ready: new Promise<string | undefined>((r) => (release = r)) };
     const route = createNativeRoute(state, { probe: async () => true });
@@ -155,7 +157,8 @@ test("route: waits for a pending bootstrap before routing", async () => {
     const pending = route(e, s);
     release("http://127.0.0.1:4321");
     await pending;
-    assert.equal((e.request as Request).url, `http://127.0.0.1:4321/bili/${MODEL_URL}`);
+    assert.equal((e.request as Request).url, MODEL_URL);
+    assert.equal(s.proxyBase, "http://127.0.0.1:4321");
 });
 
 test("route: failed bootstrap sends direct with a single warning (no respawn wired)", async () => {
@@ -190,7 +193,8 @@ test("route: dead origin respawns once and routes to the replacement", async () 
     const s: V2State = {};
     const e: V2HttpRequestEvent = { request: new Request(MODEL_URL) };
     await route(e, s);
-    assert.equal((e.request as Request).url, `${live}/bili/${MODEL_URL}`);
+    // #4276: shared request untouched; the replacement origin lands in proxyBase.
+    assert.equal((e.request as Request).url, MODEL_URL);
     assert.equal(s.proxyBase, live);
 });
 
@@ -246,7 +250,7 @@ test("route: load-time bootstrap failure retries after the cooldown only", async
     assert.equal(respawns, 2);
 });
 
-test("setup(route): header stamping applies to the REPLACED request, tools register natively", async () => {
+test("setup(route): header stamping applies to the SAME request, tools register natively (#4276)", async () => {
     const origin = "http://127.0.0.1:9999";
     const state: NativeInterceptState = { origin, ready: Promise.resolve(origin) };
     const hooks: Array<{ name: string; cb: (e: V2HttpRequestEvent) => void | Promise<void> }> = [];
@@ -269,14 +273,18 @@ test("setup(route): header stamping applies to the REPLACED request, tools regis
     const cleanup = await setup(ctx);
     assert.deepEqual(hooks.map((h) => h.name), ["http.request", "experimental.ws.handshake", "context", "compaction", "title", "generate"]);
     assert.deepEqual(tools.sort(), [...EXPECTED_TOOLS].sort());
+    const req = new Request(MODEL_URL, { method: "POST" });
     const e: V2HttpRequestEvent = {
         sessionID: "ses_abc",
         model: { providerID: "anthropic", id: "claude-x" },
-        request: new Request(MODEL_URL, { method: "POST" }),
+        request: req,
     };
     await hooks[0].cb(e);
+    // #4276: stamping lands on the SAME request object the host forwards to
+    // every later hook; its URL stays the original upstream URL.
+    assert.equal(e.request, req);
     const out = e.request as Request;
-    assert.equal(out.url, `${origin}/bili/${MODEL_URL}`);
+    assert.equal(out.url, MODEL_URL);
     assert.equal(out.headers.get("x-bili-plugin-conversation"), "ses_abc");
     assert.equal(out.headers.get("x-bili-plugin"), "opencode");
     cleanup();
@@ -379,7 +387,7 @@ test("planNativeOpencode: explicit BILLION_CONTEXT_ATTACH wins over the env pres
     );
 });
 
-test("native route: attach mode routes model traffic through the external proxy", async () => {
+test("native route: attach mode records proxyBase for model traffic through the external proxy", async () => {
     const origin = "http://10.0.0.5:9000";
     let respawnCalls = 0;
     const state: NativeInterceptState = {
@@ -395,7 +403,7 @@ test("native route: attach mode routes model traffic through the external proxy"
     const route = createNativeRoute(state, { probe: async () => true });
     const e: V2HttpRequestEvent = { sessionID: "ses_a", request: new Request(MODEL_URL, { method: "POST" }) };
     await route(e, s);
-    assert.equal((e.request as Request).url, `${origin}/bili/${MODEL_URL}`);
+    assert.equal((e.request as Request).url, MODEL_URL);
     assert.equal(s.proxyBase, origin);
     assert.equal(respawnCalls, 0);
 });
@@ -439,13 +447,15 @@ test("native route: attach mode respawns on runtime death and routes to the repl
     const e: V2HttpRequestEvent = { sessionID: "ses_d", request: new Request(MODEL_URL, { method: "POST" }) };
     await route(e, s);
     assert.equal(respawnCalls, 1, "one respawn per death");
-    assert.equal((e.request as Request).url, `${spawned}/bili/${MODEL_URL}`, "request re-routed to the replacement");
+    // #4276: the shared request stays untouched; the fetch chain routes to
+    // the replacement at fetch time (s.proxyBase carries the landed origin).
+    assert.equal((e.request as Request).url, MODEL_URL);
     assert.equal(s.proxyBase, spawned);
     // next request fast-paths through the landed origin
     const e2: V2HttpRequestEvent = { sessionID: "ses_d", request: new Request(MODEL_URL, { method: "POST" }) };
     await route(e2, s);
     assert.equal(respawnCalls, 1, "no re-spawn while the replacement is healthy");
-    assert.equal((e2.request as Request).url, `${spawned}/bili/${MODEL_URL}`);
+    assert.equal((e2.request as Request).url, MODEL_URL);
 });
 
 // #3308: the degrade branch must apply the #2924 ruling — a body that
@@ -698,7 +708,8 @@ test("native route: attach mode transient blip re-attaches to the SAME origin (n
     const e: V2HttpRequestEvent = { sessionID: "ses_e", request: new Request(MODEL_URL, { method: "POST" }) };
     await route(e, s);
     assert.equal(respawnCalls, 1);
-    assert.equal((e.request as Request).url, `${ext}/bili/${MODEL_URL}`, "re-attached to the same origin");
+    // #4276: shared request untouched; re-attach is visible via state.origin/proxyBase.
+    assert.equal((e.request as Request).url, MODEL_URL);
     assert.equal(state.origin, ext);
     assert.equal(s.proxyBase, ext);
 });
@@ -782,7 +793,8 @@ test("route: healthy origin triggers a single health probe across N steady-state
     for (let i = 0; i < 5; i++) {
         const e: V2HttpRequestEvent = { request: new Request(MODEL_URL) };
         await route(e, s);
-        assert.equal((e.request as Request).url, `${origin}/bili/${MODEL_URL}`);
+        // #4276: steady-state requests leave the shared URL untouched.
+        assert.equal((e.request as Request).url, MODEL_URL);
     }
     assert.equal(calls, 1, "expected exactly one probe for N requests within the TTL");
 });
@@ -809,7 +821,8 @@ test("route: a proxy that dies is detected within one TTL and degrades to direct
     const s: V2State = {};
     const up: V2HttpRequestEvent = { request: new Request(MODEL_URL) };
     await route(up, s);
-    assert.equal((up.request as Request).url, `${origin}/bili/${MODEL_URL}`);
+    // #4276: healthy-origin request leaves the shared URL untouched.
+    assert.equal((up.request as Request).url, MODEL_URL);
     assert.equal(calls, 1);
     alive = false;
     await sleep(45);
