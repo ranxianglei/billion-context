@@ -2430,22 +2430,20 @@ async function handleRequest(
                 const shapeDrift = inboundMsgs !== null && inboundMsgs > DSH_COMPACTION_SHAPE_MSGS ? `, shape drifted from the ≤${DSH_COMPACTION_SHAPE_MSGS}-msg rc.1 envelope — rc.2 replays the full shadowed region (#2193)` : "";
                 log("warn", `[${session.id}] dsh native compaction call identified (final user message = COMPACTION_INSTRUCTION, ${inboundMsgs} msgs${shapeDrift}) — REFUSED, not forwarded: bili owns compression on this lane; a landed dsh checkpoint would durably shadow the raw history (#1729, cf. #1206/#1772)`);
             }
-            // #2490: remember the replayed envelope SIZE. The host's raw ledger is
-            // invisible to bili's folded view (folds never shrink what dsh itself
-            // counts), so the next turn's output clamp must plan against the raw
-            // scale or a monster output rides a small folded input out the door
-            // (the 384K-token/7.5MB turn-37 single-message kill chain). High-water
-            // mark, not a sum: the replay is the whole ledger every time, so the
-            // max already bounds every future re-send; a sum would compound on each
-            // retry. Write-only by design: nothing decays or clears this value —
-            // dshLedgerFloorTokens() in budget.ts documents why the mark stays
-            // sticky and consumes it.
+            // #2490/#5596: remember the replayed envelope SIZE as a DIAGNOSTIC
+            // watermark of the host's raw-ledger scale (acp_status, storm logs).
+            // High-water mark, not a sum: the replay is the whole ledger every
+            // time, so the max already bounds every future re-send; a sum would
+            // compound on each retry. Write-only by design: nothing decays or
+            // clears this value while the session lives. #5596: no longer consumed
+            // by the output clamp — the refused bytes never leave bili's door, so
+            // they are not a future forwarded input (the #2490 planning floor built
+            // on them pinned healthy lanes onto the 4096 budget floor; budget.ts).
             const prevBytes = typeof session.metadata["dshCompactionRefusedBytes"] === "number" ? session.metadata["dshCompactionRefusedBytes"] as number : 0;
             session.metadata["dshCompactionRefusedBytes"] = Math.max(prevBytes, inboundBytes);
             if (authored !== null) {
-                // #3733 counters + the same raw-ledger high-water as a refusal
-                // (the envelope still proves the raw scale the output clamp must
-                // plan against); NOT counted in dshCompactionRefusals.
+                // #3733 counters + the same diagnostic raw-scale watermark as a
+                // refusal; NOT counted in dshCompactionRefusals.
                 session.metadata["dshAuthoredCompactions"] = (typeof session.metadata["dshAuthoredCompactions"] === "number" ? session.metadata["dshAuthoredCompactions"] as number : 0) + 1;
                 markDirty(session);
                 if (!res.headersSent && !res.writableEnded && !res.destroyed) {

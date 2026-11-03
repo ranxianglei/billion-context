@@ -441,10 +441,9 @@ export type Session = {
          *  it. Cleared by the next real usage report (settleUsageReport). */
         emergencyShrinkAt?: number;
         emergencyShrinkEstimate?: number;
-        /** #3148: most recent outgoing output-budget clamp event — the #2490
-         *  planning-floor clamps were previously visible only in log lines.
-         *  Display-only: no decision path reads it. */
-        lastOutputClamp?: { raw: number; capped: number; window: number; planningInput: number; ledgerFloor: number; at: number };
+        /** #3148: most recent outgoing output-budget clamp event — previously
+         *  visible only in log lines. Display-only: no decision path reads it. */
+        lastOutputClamp?: { raw: number; capped: number; window: number; planningInput: number; at: number };
         /** #1110: one-shot emergency ceiling armed by an upstream context-
          *  overflow 400 (server.ts overflow handler) — live evidence this
          *  session cannot exceed that size. Kept SEPARATE from lastInputTokens

@@ -428,9 +428,13 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
     }
     const ledgerFloor = dshLedgerFloorTokens(ctx.session.metadata);
     const lastClamp = ctx.session.stats.lastOutputClamp;
-    if (ledgerFloor > 0 || lastClamp !== undefined) {
+    if (lastClamp !== undefined) {
         extra.push("");
-        extra.push(`OUTPUT BUDGET CLAMP —${lastClamp !== undefined ? ` last: max_tokens ${lastClamp.raw} -> ${lastClamp.capped} (window ${lastClamp.window}, input~${Math.round(lastClamp.planningInput)}) @ ${new Date(lastClamp.at).toISOString()}` : ""} · planning floor ${ledgerFloor} tok from the refused dsh compaction replay (#2490, sticky for the session lifetime). Only compression can recover the input; this clamp guarantees native-window fit.`);
+        extra.push(`OUTPUT BUDGET CLAMP — last: max_tokens ${lastClamp.raw} -> ${lastClamp.capped} (window ${lastClamp.window}, input~${Math.round(lastClamp.planningInput)}) @ ${new Date(lastClamp.at).toISOString()}. Only compression can recover the input; this clamp guarantees native-window fit.`);
+    }
+    if (ledgerFloor > 0) {
+        extra.push("");
+        extra.push(`DSH COMPACTION REPLAYS REFUSED — raw-ledger high-water ${ledgerFloor} tok (recorded by the #1729 guard; diagnostic only — refusals never drive the output budget, #5596).`);
     }
     // #1097: the processTurn above already resolved the envelope when armed
     // (contentStoreOf is idempotent); when disarmed skip the disk read.
