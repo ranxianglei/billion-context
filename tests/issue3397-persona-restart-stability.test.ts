@@ -247,12 +247,18 @@ test("#3397 F2: among several live forks, cited refs route to the fork whose ref
         await dshTurn(rig, SYS_MAIN, mainMsgs(40, "owner"));
         await dshTurn(rig, SYS_AUX, mainMsgs(3, "chatty"));
 
-        // Control: NO refs cited → recency pick (pre-fix behavior, unchanged):
-        // the chatty sidecar, being newest, is followed.
+        // Control: NO refs cited. RE-BASELINED by #5582 (old→new): pre-#5582
+        // the uncited call kept the recency pick and followed the CHATTY
+        // sidecar — that newest-born chase is exactly what stranded host
+        // management calls on shallow sidecar lanes (#5582: acp_status showed
+        // "1 msg" while the real conversation sat in the owner fork). Now the
+        // deepest main-shaped descendant is followed; the recency fallback
+        // survives only for the unambiguous single-descendant case.
         resetToolRingForTest();
         const outCtrl = await forwardTool(rig.baseUrl, CONV, "acp_cache", {}, undefined, true);
         assert.equal(outCtrl.failed, false);
-        assert.ok(outCtrl.text.includes(CHATTY), "uncited call keeps the recency fallback (chatty fork)");
+        assert.ok(outCtrl.text.includes(OWNER), "uncited call follows the deep owner fork, not the chatty sidecar (#5582 re-baseline)");
+        assert.ok(!outCtrl.text.includes(CHATTY), "the chatty sidecar is no longer chased on uncited calls (#5582)");
 
         // Fit: args cite refs above the chatty fork's frontier → the follow
         // must land on the owner fork whose ref space can hold them. Pre-fix
