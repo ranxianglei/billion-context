@@ -36,10 +36,16 @@ test("matchesVersion: exact / ranges / caret / tilde / range-list both direction
     assert.equal(matchesVersion(">=0.1.210 <0.1.220", v), true);
     assert.equal(matchesVersion(">=0.1.213", v), false);
     assert.equal(matchesVersion("<0.1.212", v), false);
+    // npm semantics: with zero major, caret pins the MINOR (^0.1.x := <0.2.0),
+    // so ^0.1.99 DOES cover 0.1.212 — pin negatives use a non-overlapping major/minor.
     assert.equal(matchesVersion("^0.1.210", v), true);
-    assert.equal(matchesVersion("^0.1.99", v), false);
+    assert.equal(matchesVersion("^0.1.99", v), true);
+    assert.equal(matchesVersion("^0.1.213", v), false);
+    assert.equal(matchesVersion("^1.0.0", v), false);
+    // tilde likewise pins the minor: ~0.1.209 := >=0.1.209 <0.2.0 covers 0.1.212
     assert.equal(matchesVersion("~0.1.210", v), true);
-    assert.equal(matchesVersion("~0.1.209", v), false);
+    assert.equal(matchesVersion("~0.1.209", v), true);
+    assert.equal(matchesVersion("~0.2.0", v), false);
     assert.equal(matchesVersion("[0.1.210 0.1.214]", v), true);
     assert.equal(matchesVersion("[0.1.210 0.1.211] || [0.1.212 0.1.219]", v), true);
     assert.equal(matchesVersion("[0.1.210 0.1.211] || [0.1.213 0.1.219]", v), false);

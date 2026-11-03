@@ -913,6 +913,10 @@ export type ProxyOptions = {
     /** Override for the release-notes document URL (env
      *  BILI_RELEASE_NOTES_URL wins) (#1870). */
     releaseNotesUrl?: string;
+    /** Override for the remote announcements feed URL (#5548 P3; env
+     *  BILI_ANNOUNCEMENTS_URL wins). Firewall installs point this at a relay;
+     *  absent = official raw.githubusercontent feed. */
+    announcementsUrl?: string;
     logFile?: string;
     /** MITM transparent-proxy mode. When enabled, an HTTP CONNECT handler is
      *  attached so clients that only know how to set HTTP_PROXY (ZCode with a
@@ -1664,6 +1668,7 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         releaseNotesCheck: (env.BILI_RELEASE_NOTES_CHECK ?? (fileConfig.releaseNotesCheck === false ? "0" : "1")) !== "0",
         advisoryUrl: env.BILI_ADVISORY_URL || fileConfig.advisoryUrl || undefined,
         releaseNotesUrl: env.BILI_RELEASE_NOTES_URL || fileConfig.releaseNotesUrl || undefined,
+        announcementsUrl: env.BILI_ANNOUNCEMENTS_URL || fileConfig.announcementsUrl || undefined,
         logFile: env.ACP_LOG_FILE !== undefined ? (env.ACP_LOG_FILE || undefined) : fileConfig.logFile,
         mitm: {
             enabled: (env.BILI_MITM ?? (fileConfig.mitm?.enabled === false ? "0" : "1")) !== "0",
@@ -1864,6 +1869,9 @@ type FileConfig = {
     /** Override for the release-notes document URL (env
      *  BILI_RELEASE_NOTES_URL wins) (#1870). */
     releaseNotesUrl?: string;
+    /** Override for the remote announcements feed URL (#5548 P3; env
+     *  BILI_ANNOUNCEMENTS_URL wins). */
+    announcementsUrl?: string;
     upstreamProxy?: string;
     upstreamProxyMode?: string;
     logFile?: string;
@@ -2303,7 +2311,7 @@ const KNOWN_TOP_LEVEL_KEYS = new Set([
     "port", "host", "upstream", "providersPath", "providers", "proxy",
     "modelContextLimit", "sessionHeader", "log", "debug", "dumpSse",
     "passthrough", "autoUpdate", "autoRestartOnUpdate", "updateTag",
-    "advisoryCheck", "advisoryUrl", "releaseNotesCheck", "releaseNotesUrl",
+    "advisoryCheck", "advisoryUrl", "releaseNotesCheck", "releaseNotesUrl", "announcementsUrl",
     "upstreamProxy", "upstreamProxyMode",
     "logFile", "compress", "promptCache", "mitm", "maskHosts",
     "subagentSplit", "forkAdoption", "affinitySimhash", "resumeInheritance",

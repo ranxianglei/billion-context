@@ -1,5 +1,6 @@
-// #5548 P2: owner-dropped local announcements (source B) + the shared gates a
-// remote source (C, P3) will reuse verbatim. One plain-JSON file per record in
+// #5548 P2+P3: owner-dropped local announcements (source B) + the shared
+// gates/validation the remote GitHub-raw source (C, src/remote-notices.ts)
+// reuses verbatim. One plain-JSON file per record in
 // ~/.config/billion-context/announcements/*.json (dirname of the effective
 // config file, so BILI_CONFIG_FILE relocates it too). This module is read-only
 // and never throws: a missing dir yields nothing, a bad file is skipped so one
@@ -25,8 +26,8 @@ const CAP_TITLE = 120, CAP_DESC = 600, CAP_HINT = 300;
 const ID_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
 const ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?(\.\d+)?(Z|[+-]\d{2}:?\d{2})$/;
 
-export type NoticeKind = "new-feature" | "upgrade-advisory" | "warning" | "suggestion" | "incident" | "deprecation" | "other";
-export type ToneName = "ok" | "warn" | "info";
+type NoticeKind = "new-feature" | "upgrade-advisory" | "warning" | "suggestion" | "incident" | "deprecation" | "other";
+type ToneName = "ok" | "warn" | "info";
 
 interface LocText { [locale: string]: string }
 export interface NoticeRecord {
@@ -47,8 +48,8 @@ export interface NoticeRecord {
     publishedAt?: string;
 }
 
-export interface LocalNoticePayload {
-    source: "local";
+interface AnnouncementPayload {
+    source: "local" | "remote";
     id: string;
     tone: ToneName;
     kind: NoticeKind;
@@ -135,9 +136,12 @@ const CANON_ORDER = ["id", "kind", "title", "desc", "hint", "ctaLabel", "ctaUrl"
 
 /** Content digest for dismissal keys: fixed key order so file/key order never
  *  changes the hash; only whitelisted fields count. */
-export function contentHash16(record: Record<string, unknown>): string {
+export function contentHash16(record: object): string {
+    // Single structural cast: callers pass validated NoticeRecords (no index
+    // signature), the read set is the fixed CANON_ORDER whitelist.
+    const src = record as Record<string, unknown>;
     const canon: Record<string, unknown> = {};
-    for (const k of CANON_ORDER) if (record[k] !== undefined) canon[k] = record[k];
+    for (const k of CANON_ORDER) if (src[k] !== undefined) canon[k] = src[k];
     return crypto.createHash("sha256").update(JSON.stringify(canon)).digest("hex").slice(0, 16);
 }
 
@@ -172,11 +176,11 @@ export function validateRecord(raw: unknown): NoticeRecord | null {
     } else if (kind === "new-feature") rec.tone = "ok";
     else if (kind === "warning" || kind === "incident" || kind === "deprecation") rec.tone = "warn";
     const desc = doc["desc"] === undefined ? undefined : locText(doc["desc"], CAP_DESC);
-    if (doc["desc"] !== undefined && desc === null) return null;
-    rec.desc = desc;
+    if (desc === null) return null;
+    if (desc !== undefined) rec.desc = desc;
     const hint = doc["hint"] === undefined ? undefined : locText(doc["hint"], CAP_HINT);
-    if (doc["hint"] !== undefined && hint === null) return null;
-    rec.hint = hint;
+    if (hint === null) return null;
+    if (hint !== undefined) rec.hint = hint;
     if (doc["ctaLabel"] !== undefined || doc["ctaUrl"] !== undefined) {
         const label = doc["ctaLabel"];
         const url = doc["ctaUrl"];
@@ -256,7 +260,9 @@ function loadLocalRecords(): NoticeRecord[] {
     return out;
 }
 
-function passesGates(record: NoticeRecord, now: Date, env: NodeJS.ProcessEnv): boolean {
+/** The three gates every external (B/C) record must pass; shared verbatim by
+ *  the local loader and the remote watcher so the two sources cannot drift. */
+export function noticePassesGates(record: NoticeRecord, now: Date, env: NodeJS.ProcessEnv): boolean {
     if (record.versions) {
         const cur = parseTriple(VERSION);
         if (!cur) return false;
@@ -270,21 +276,21 @@ function passesGates(record: NoticeRecord, now: Date, env: NodeJS.ProcessEnv): b
     return !dismissedUpgradeNotices(env).has(`${record.id}@${contentHash16(record)}`);
 }
 
+/** Wire-shape a gated record for the web UI (source tags the lane). */
+export function announcementPayload(source: "local" | "remote", r: NoticeRecord): AnnouncementPayload {
+    const p: AnnouncementPayload = { source, id: r.id, tone: r.tone, kind: r.kind, title: r.title, priority: r.priority };
+    if (r.desc !== undefined) p.desc = r.desc;
+    if (r.hint !== undefined) p.hint = r.hint;
+    if (r.ctaLabel !== undefined) p.ctaLabel = r.ctaLabel;
+    if (r.ctaUrl !== undefined) p.ctaUrl = r.ctaUrl;
+    if (r.publishedAt !== undefined) p.publishedAt = r.publishedAt;
+    if (r.dismiss === "always") p.suppressDismiss = true;
+    return p;
+}
+
 /** Visible local announcements after every gate, wire-shaped for the web UI. */
-export function visibleLocalNotices(now: Date = new Date(), env: NodeJS.ProcessEnv = process.env): LocalNoticePayload[] {
-    const out: LocalNoticePayload[] = [];
-    for (const r of loadLocalRecords()) {
-        if (!passesGates(r, now, env)) continue;
-        const p: LocalNoticePayload = { source: "local", id: r.id, tone: r.tone, kind: r.kind, title: r.title, priority: r.priority };
-        if (r.desc !== undefined) p.desc = r.desc;
-        if (r.hint !== undefined) p.hint = r.hint;
-        if (r.ctaLabel !== undefined) p.ctaLabel = r.ctaLabel;
-        if (r.ctaUrl !== undefined) p.ctaUrl = r.ctaUrl;
-        if (r.publishedAt !== undefined) p.publishedAt = r.publishedAt;
-        if (r.dismiss === "always") p.suppressDismiss = true;
-        out.push(p);
-    }
-    return out;
+export function visibleLocalNotices(now: Date = new Date(), env: NodeJS.ProcessEnv = process.env): AnnouncementPayload[] {
+    return loadLocalRecords().filter((r) => noticePassesGates(r, now, env)).map((r) => announcementPayload("local", r));
 }
 
 /** What dismiss mode a raw local id currently carries (for the dismiss
@@ -294,14 +300,18 @@ export function localDismissMode(id: string): "persistent" | "instance" | "alway
     return "absent";
 }
 
-export type MergedNotice = { source: "builtin"; id: string; tone: ToneName; keys: Record<string, string>; priority: number } | LocalNoticePayload;
+type MergedNotice = { source: "builtin"; id: string; tone: ToneName; keys: Record<string, string>; priority: number } | AnnouncementPayload;
 
 /** Single ordered payload for GET /__bili/notices and the overview field:
- *  local (B) shadows builtin (A) on equal id, then priority desc with stable
- *  order for ties (builtins first). Never throws. */
-export function mergedNotices(env: NodeJS.ProcessEnv = process.env): MergedNotice[] {
+ *  on equal id local (B) shadows remote (C), both shadow builtin (A); then
+ *  priority desc with stable order for ties (builtins first). Never throws. */
+export function mergedNotices(env: NodeJS.ProcessEnv = process.env, remote: AnnouncementPayload[] = []): MergedNotice[] {
     const local = visibleLocalNotices(new Date(), env);
-    const shadow = new Set(local.map((l) => l.id));
+    const localIds = new Set(local.map((l) => l.id));
+    // B over A over S: a local record with an equal id replaces BOTH the remote
+    // twin and any builtin under that id.
+    const remoteIn = remote.filter((r) => !localIds.has(r.id));
+    const shadow = new Set([...localIds, ...remoteIn.map((r) => r.id)]);
     const builtins: MergedNotice[] = visibleNotices().filter((n) => !shadow.has(n.id)).map((n) => ({ source: "builtin", id: n.id, tone: n.tone, keys: n.keys, priority: 50 }));
-    return [...builtins, ...local].sort((a, b) => b.priority - a.priority);
+    return [...builtins, ...remoteIn, ...local].sort((a, b) => b.priority - a.priority);
 }

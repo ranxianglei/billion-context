@@ -1602,7 +1602,7 @@ function changelogCatOf(rawLine) {
                 el.className = "banner " + (n.tone === "ok" ? "ok" : n.tone === "warn" ? "warn" : "");
                 el.dataset.id = n.id;
                 nr.appendChild(el);
-                if (n.source === "local") {
+                if (n.source !== "builtin") {
                     el.innerHTML = bili_noticeBanner({ on: bili_pickLoc(n.title), desc: bili_pickLoc(n.desc), hint: bili_pickLoc(n.hint), dismiss: t("notices.dismiss_btn"), cta: n.ctaUrl ? { label: n.ctaLabel ?? "", url: n.ctaUrl } : null, hideDismiss: !!n.suppressDismiss });
                 } else {
                     const k = n.keys && typeof n.keys === "object" ? n.keys : {};

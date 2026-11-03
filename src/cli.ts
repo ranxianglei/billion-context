@@ -37,6 +37,7 @@ import { checkForUpdate, startAutoUpdate } from "./update.js";
 import { registerUpdateActions } from "./server/update-actions.js";
 import { startAdvisoryWatcher, getAdvisoryState, advisoryDeferring, advisoryBlocksVersion, advisoryAwaitingFirstCheck } from "./advisory.js";
 import { startReleaseNotesWatcher } from "./update-notes.js";
+import { startRemoteNoticesWatcher } from "./remote-notices.js";
 import { resolveProxy } from "./upstream-proxy.js";
 import { runMcpStdio } from "./mcp.js";
 import { PLUGIN_AGENTS, isPluginAgent, pluginInstall, pluginRemove, pluginStatusAll, pluginUpdate, renderPluginList, warnActivePluginSessions, type PluginAgent } from "./plugin-install.js";
@@ -900,4 +901,10 @@ export async function main(): Promise<void> {
             resolveProxy: (url) => resolveProxy(opts.routes, opts.proxy, url, opts.proxyFallback),
         });
     }
+    // #5548 P3: remote announcements feed (display-only, like release notes)
+    // — independent of autoUpdate for the same reason as the other watchers.
+    startRemoteNoticesWatcher({
+        announcementsUrl: opts.announcementsUrl,
+        resolveProxy: (url) => resolveProxy(opts.routes, opts.proxy, url, opts.proxyFallback),
+    });
 }

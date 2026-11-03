@@ -228,6 +228,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `update.policyUrl` | string | official repo raw URL | BILI_UPDATE_POLICY_URL | Override URL for the remote auto-update policy file (test seam — production stays pinned to the official repo). |
 | `advisoryCheck` | boolean | true | BILI_ADVISORY_CHECK | Critical-defect advisory watcher; force-installs the recommended fix when the running version is affected. |
 | `advisoryUrl` | string | unset (built-in feed) | BILI_ADVISORY_URL | Override URL for the advisory feed. |
+| `announcementsUrl` | string | unset (official feed: GitHub master announcements/remote.json) | BILI_ANNOUNCEMENTS_URL | Override URL for the remote announcement feed (#5548): JSON document {v: 1, entries: [...]} — same record schema as local announcement files, fetched every ~3 min like the other watchers, cached snapshot survives restarts/outages. Firewall installs point this at a relay mirror; bad pushes are rejected and the last good copy keeps showing. Local files in <config dir>/announcements/*.json always shadow same-id remote/builtin notices. |
 | `releaseNotesCheck` | boolean | true | BILI_RELEASE_NOTES_CHECK | Release-notes feed for the web panel (fetch + cache only; never installs anything). |
 | `releaseNotesUrl` | string | unset (built-in feed) | BILI_RELEASE_NOTES_URL | Override URL for the release-notes feed. |
 
@@ -1834,6 +1835,7 @@ File keys resolve only when the matching env var is unset. Defaults in parenthes
 | `BILI_AFFINITY_SIMHASH` | `affinitySimhash` | true |
 | `BILI_ALLOW_DSH_COMPACTION` | `dsh` | {} |
 | `BILI_ALLOW_PRIVATE_HTTP_PROVIDERS` | `network.allowPrivateHttpProviders` | false |
+| `BILI_ANNOUNCEMENTS_URL` | `announcementsUrl` | unset (official feed: GitHub master announcements/remote.json) |
 | `BILI_AUTO_MODE_FORGE` | `autoModeForge.enabled` | true |
 | `BILI_CACHE_KEEPALIVE` | `cacheKeepalive.enabled` | false |
 | `BILI_CACHE_KEEPALIVE_ARM_WITHOUT_BREAKPOINTS` | `cacheKeepalive.armWithoutBreakpoints` | false |
