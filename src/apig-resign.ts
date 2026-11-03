@@ -2,7 +2,7 @@ import { createHash, createHmac } from "node:crypto";
 import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
-import { RESIGN_BUILTIN_SCHEME, resolveResignSettings, type ProviderRoute } from "./config.js";
+import { RESIGN_BUILTIN_SCHEME, resolveModelEntryOnRoute, resolveResignSettings, type ProviderRoute } from "./config.js";
 import { configFile, stateDir } from "./paths.js";
 
 /**
@@ -104,7 +104,7 @@ export function apigBenefitFor(model: string | undefined, route?: ProviderRoute)
         const set = new Set(envBenefit.split(",").map((s) => s.trim().toLowerCase()).filter((s) => s.length > 0));
         return set.has(lower);
     }
-    const entry = route?.models?.[model] ?? route?.models?.[lower];
+    const entry = resolveModelEntryOnRoute(route, model).entry;
     if (entry?.benefit !== undefined) return entry.benefit;
     return DEFAULT_BENEFIT_MODELS.includes(lower);
 }
