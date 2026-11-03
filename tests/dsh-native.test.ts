@@ -2036,6 +2036,54 @@ test("#5613 L2 gate three-state: thrown attribution is a distinct state; doublin
     }
 });
 
+test("#5613 gate refusal line self-describes egressed scale: body bytes + resolved window (or unknown)", async () => {
+    const proxy = await startMockProxy([]);
+    const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-5613d-state-"));
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-5613d-home-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin, XDG_STATE_HOME: stateHome }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            const ctx = mockCtx();
+            // Wire the model services the way a real host would so the gate can
+            // resolve a real window — the #5613 session's egressed scale was
+            // otherwise unprovable from the logs.
+            class Llm5613d {
+                async resolveModelInfo(): Promise<undefined> {
+                    return undefined;
+                }
+            }
+            ctx.setModelServices(new Llm5613d(), { currentSelection: () => ({ provider: "p5613d", model: "m5613d" }) });
+            apply(ctx);
+            await waitFor(() => ctx.registeredTools.length === 1, "initial attach tool registration");
+            const gate = _stateTakeoverGateForTest();
+            assert.ok(gate !== undefined, "takeoverGate installed");
+            const url = "https://api.gate-5613d.test/v1/chat/completions";
+            const logFile = path.join(stateHome, "billion-context", "bili.log");
+            const refusedLines = (): string[] => (fs.existsSync(logFile) ? fs.readFileSync(logFile, "utf8") : "").split("\n").filter((l) => l.length > 0 && l.includes("takeover gate refused"));
+            // A sub-ceiling unattributed body rides #1117 DIRECT; its durable line must
+            // carry the request's own scale — measured body bytes + resolved window.
+            _setModelInfoForTest({ provider: "p5613d", model: "m5613d", contextWindow: 1_000_000 });
+            assert.equal(await gate(url, { bytes: 927_000 }), false, "sub-ceiling unattributed body rides #1117 direct");
+            let lines = refusedLines();
+            assert.equal(lines.length, 1, `expected one refusal line, got: ${lines.join(" | ")}`);
+            assert.match(lines[0]!, / — body 927000B, window 1000000 — refusals so far: 1$/);
+            // Window unresolvable → the SAME line degrades to `window unknown` (never a
+            // fabricated number) and the doubling cadence re-prints at count 2.
+            _setModelInfoForTest();
+            assert.equal(await gate(url, { bytes: 927_000 }), false);
+            lines = refusedLines();
+            assert.equal(lines.length, 2, `expected the doubling-cadence re-print, got: ${lines.join(" | ")}`);
+            assert.match(lines[1]!, / — body 927000B, window unknown — refusals so far: 2$/);
+        });
+    } finally {
+        _setModelInfoForTest();
+        proxy.close();
+        rmrf(stateHome);
+        rmrf(home);
+        _resetRegisterForTest(undefined);
+    }
+});
+
 test("#2924 gate `threw` attribution: bounded settle-retry recovers and CLAIMS the request", async () => {
     const proxy = await startMockProxy([]);
     const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-2924a-state-"));
