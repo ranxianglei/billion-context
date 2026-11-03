@@ -15,7 +15,7 @@
 // row here (+ unit tests) — do not hard-code literals anywhere else.
 export type NidvClientId = "wb" | "codex" | "cc" | "opencode" | "gemini" | "unknown";
 
-export interface NidvProfile {
+interface NidvProfile {
     readonly id: NidvClientId;
     /** Header carrying the SESSION id (lowercase name). */
     readonly sessHeader?: string;
@@ -40,7 +40,7 @@ export interface NidvProfile {
     readonly shapeAssertAbsent?: readonly string[];
 }
 
-export type NidvCompactionSignal = "explicit-header" | "prefix-match" | "compact-endpoint" | null;
+type NidvCompactionSignal = "explicit-header" | "prefix-match" | "compact-endpoint" | null;
 
 /** Per-request extraction result. Raw values live in MEMORY ONLY for the
  *  lifetime of this call — persistence stores sha1 digests (h8), logs never
@@ -134,7 +134,9 @@ function firstHeader(headers: Record<string, unknown>, name: string): string | u
 
 /** Deterministic profile detection. Order matters and is pinned by tests:
  *  explicit per-client session headers outrank family markers, which outrank
- *  protocol inference. Never throws on odd inputs. */
+ *  protocol inference. Headers stay structural (Record<string, unknown>) so
+ *  tests feed plain objects and handle.ts passes req.headers directly —
+ *  IncomingHttpHeaders is structurally assignable. Never throws on odd inputs. */
 export function detectNativeProfile(
     headers: Record<string, unknown>,
     urlPath: string,
@@ -288,15 +290,8 @@ export function extractNativeIdentity(
             }
         }
     } catch {
-        // Fail-open by construction: a broken profile row degrades to "no
-        // observation", never to a failed request.
-        obs.profileId = profile.id === "unknown" ? "unknown" : obs.profileId;
-        obs.compactionSignal = obs.compactionSignal ?? null;
+        // Fail-open by construction: a broken profile row degrades to a
+        // partial/no observation, never to a failed request.
     }
     return obs;
 }
-
-/** Header view kept intentionally structural (not node:http-typed) so tests
- *  can feed plain objects and handle.ts can pass req.headers directly —
- *  IncomingHttpHeaders is structurally assignable to Record<string, unknown>. */
-export type NidvHeaders = Record<string, unknown>;

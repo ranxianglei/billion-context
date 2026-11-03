@@ -20,7 +20,7 @@ const MAX_JSON_BYTES = 4096;
 const MAX_EVENTS = 32;
 const EV_TEXT_CAP = 64;
 
-export interface NidvEvent {
+interface NidvEvent {
     t: number;
     /** compaction | id_change | profile_flip | dual_mismatch | shape_assert_fail */
     k: string;
@@ -28,7 +28,7 @@ export interface NidvEvent {
     e: string;
 }
 
-export interface NidvState {
+interface NidvState {
     v: 1;
     client: NidvClientId;
     firstSeen: number;
@@ -107,13 +107,13 @@ export function mergeNidvState(prev: NidvState | null, obs: NidvObservation, now
 /** Minimal structural store view — production callers pass nothing (module
  *  singleton via getStore()); tests inject a duck to exercise the write path
  *  without a real sidecar. */
-export interface NidvStoreView {
+interface NidvStoreView {
     replicasAvailable(): boolean;
     getSessionExt(sessionId: string, key: string): unknown;
     setSessionExt(sessionId: string, key: string, value: unknown): void;
 }
 
-export interface ObserveNativeIdentityArgs {
+interface ObserveNativeIdentityArgs {
     sessionId: string;
     headers: Record<string, unknown>;
     urlPath: string;
