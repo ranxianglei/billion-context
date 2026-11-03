@@ -965,7 +965,7 @@
     "retrieveAcpRetrieve": {
       "anthropic": {
         "name": "acp_retrieve",
-        "description": "Retrieve the full original text of a stored message by its id. Large tool results are replaced on the wire with a placeholder shaped like \"📦 [acp-stored #m00423 · shell output · 4,213 tok] `npm run build`\n   → acp_retrieve(\"m00423\") returns the full text\". Call this with that ref to read the complete original back into context. Leaving the placeholder costs nothing; retrieving costs one call — fetch only when the detail matters to the current step.",
+        "description": "Retrieve the full original text of a stored message by its id. Large tool results are replaced on the wire with a placeholder shaped like \"📦 [acp-stored #m00423 · shell output · 4,213 tok] `npm run build`\n   → acp_retrieve(\"m00423\") returns the full text\". Call this with that ref to read the complete original back into context. Very large originals are exported to a file instead of inline text — the result then carries the exported file's path; read that file with your file-read tool. Leaving the placeholder costs nothing; retrieving costs one call — fetch only when the detail matters to the current step.",
         "input_schema": {
           "type": "object",
           "properties": {
@@ -983,7 +983,7 @@
         "type": "function",
         "function": {
           "name": "acp_retrieve",
-          "description": "Retrieve the full original text of a stored message by its id. Large tool results are replaced on the wire with a placeholder shaped like \"📦 [acp-stored #m00423 · shell output · 4,213 tok] `npm run build`\n   → acp_retrieve(\"m00423\") returns the full text\". Call this with that ref to read the complete original back into context. Leaving the placeholder costs nothing; retrieving costs one call — fetch only when the detail matters to the current step.",
+          "description": "Retrieve the full original text of a stored message by its id. Large tool results are replaced on the wire with a placeholder shaped like \"📦 [acp-stored #m00423 · shell output · 4,213 tok] `npm run build`\n   → acp_retrieve(\"m00423\") returns the full text\". Call this with that ref to read the complete original back into context. Very large originals are exported to a file instead of inline text — the result then carries the exported file's path; read that file with your file-read tool. Leaving the placeholder costs nothing; retrieving costs one call — fetch only when the detail matters to the current step.",
           "parameters": {
             "type": "object",
             "properties": {
@@ -1001,7 +1001,7 @@
       "responses": {
         "type": "function",
         "name": "acp_retrieve",
-        "description": "Retrieve the full original text of a stored message by its id. Large tool results are replaced on the wire with a placeholder shaped like \"📦 [acp-stored #m00423 · shell output · 4,213 tok] `npm run build`\n   → acp_retrieve(\"m00423\") returns the full text\". Call this with that ref to read the complete original back into context. Leaving the placeholder costs nothing; retrieving costs one call — fetch only when the detail matters to the current step.",
+        "description": "Retrieve the full original text of a stored message by its id. Large tool results are replaced on the wire with a placeholder shaped like \"📦 [acp-stored #m00423 · shell output · 4,213 tok] `npm run build`\n   → acp_retrieve(\"m00423\") returns the full text\". Call this with that ref to read the complete original back into context. Very large originals are exported to a file instead of inline text — the result then carries the exported file's path; read that file with your file-read tool. Leaving the placeholder costs nothing; retrieving costs one call — fetch only when the detail matters to the current step.",
         "parameters": {
           "type": "object",
           "properties": {
@@ -1017,7 +1017,7 @@
       },
       "google": {
         "name": "acp_retrieve",
-        "description": "Retrieve the full original text of a stored message by its id. Large tool results are replaced on the wire with a placeholder shaped like \"📦 [acp-stored #m00423 · shell output · 4,213 tok] `npm run build`\n   → acp_retrieve(\"m00423\") returns the full text\". Call this with that ref to read the complete original back into context. Leaving the placeholder costs nothing; retrieving costs one call — fetch only when the detail matters to the current step.",
+        "description": "Retrieve the full original text of a stored message by its id. Large tool results are replaced on the wire with a placeholder shaped like \"📦 [acp-stored #m00423 · shell output · 4,213 tok] `npm run build`\n   → acp_retrieve(\"m00423\") returns the full text\". Call this with that ref to read the complete original back into context. Very large originals are exported to a file instead of inline text — the result then carries the exported file's path; read that file with your file-read tool. Leaving the placeholder costs nothing; retrieving costs one call — fetch only when the detail matters to the current step.",
         "parameters": {
           "type": "object",
           "properties": {
