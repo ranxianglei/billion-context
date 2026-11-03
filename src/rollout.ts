@@ -48,11 +48,13 @@ export interface RolloutPlan {
 export const ROLLOUT_FEATURES: Record<string, RolloutPlan> = {
     // #3248 incremental turns: lets a native extension send only the delta of
     // a conversation (marker `x-bili-plugin-turn` on ordinary model requests)
-    // once enabled for this install. Default 0% — every client keeps the
-    // byte-identical full-resend behavior. Operators force it on with
-    // `rollout.features.pluginIncrementalTurns: true` (or a percent), or
-    // `BILI_ROLLOUT_PLUGIN_INCREMENTAL_TURNS=1`.
-    pluginIncrementalTurns: { percent: 0 },
+    // once enabled for this install. Default 100% — GA: the full-resend path
+    // is still what runs whenever any verification misses (body shape, probe,
+    // sidecar, ack), so the default changes only how many bytes the host
+    // sends (#5156), never a correctness guarantee. Escape hatches:
+    // `rollout.features.pluginIncrementalTurns: false` (or a percent), or
+    // `BILI_ROLLOUT_PLUGIN_INCREMENTAL_TURNS=0`.
+    pluginIncrementalTurns: { percent: 100 },
     // #5403/#5418 full-resend watermark fastpath: plugin-lane turns re-send
     // the ENTIRE history each turn; on a verified hit (count watermark
     // stamped by the previous response) the server stops re-parsing and
