@@ -44,7 +44,7 @@ Write dense, scannable bullets — not narrative prose. If the range spans disti
 
 ACP TAGS
 
-Each message in the conversation is annotated with a <acp> tag showing its reference ID, approximate token size, and content type. These tags are system metadata. NEVER echo these history tags. Use only the ref ID (e.g. m00005), never the XML wrapper.
+Addressable messages in the conversation are annotated with a <acp> tag showing its reference ID, approximate token size, and content type. These tags are system metadata. NEVER echo these history tags. Use only the ref ID (e.g. m00005), never the XML wrapper.
 
 COMPRESSION PROTOCOL (TEXT)
 

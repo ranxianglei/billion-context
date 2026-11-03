@@ -208,9 +208,10 @@ BYPASS banner so whoever merges knows the sha shipped without lane verification.
 Leave it UNTICKED for normal releases: an unticked run publishes exactly as before,
 a green release branch included.
 
-**Nuclear option (`raw_publish`):** ticking this checkbox publishes with literally
-nothing between you and npm but `npm ci` + `npm run build` — no typecheck, no tests,
-no CI lanes, no push to master, no release PR. The run still enforces the drift guard
+**Nuclear option (`raw_publish`):** ticking this checkbox puts nothing between you and
+npm but a one-time dependency download (`npm install --no-audit --no-fund`, a plain
+lockfile fetch that executes no project code) and `npm run build` — no typecheck,
+no tests, no CI lanes, no push to master, no release PR. The run still enforces the drift guard
 and the release-notes check, then publishes to npm, pushes the git tag, creates the
 GitHub Release (body carries a RAW EMERGENCY PUBLISH banner), and opens a version-sync
 PR so master converges. Until that sync PR merges, the NEXT one-click release aborts
@@ -218,6 +219,12 @@ on the drift guard (master sits exactly one patch behind npm) — that is delibe
 it forces a visible convergence instead of silently re-bumping. A loud warning line in
 the job log is the permanent audit record. Use it when even the fast path is too slow
 and you accept shipping an unverified tree.
+
+**Local zero-install variant:** on your own machine (where `node_modules` already
+exists) run `NPM_TOKEN=*** GITHUB_TOKEN=*** node scripts/emergency-publish.mjs` for the
+literal `npm run build && npm publish`: no dependency install step at all, then tag
+push + GitHub Release when the token is present. Add `--dry-run` to preview with zero
+side effects.
 
 A successful one-click run does NOT double-trigger `release.yml`: its check only
 matches release-branch merges / date-prefixed commits, never a plain `release v{VERSION}`
