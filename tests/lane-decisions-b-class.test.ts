@@ -144,7 +144,7 @@ test("surfaceOffDetail: names observed tools on reachability-off, silent otherwi
     assert.equal(surfaceOffDetail(dsh({ tools: [{ name: "get_weather" }, { name: "code_run2" }] }, true), true), "surface=off(top-level=[get_weather,code_run2])");
 });
 
-// #XXXX: personaSplit:false strips instructionsFingerprintKeyed at resolve
+// #5456: personaSplit:false strips instructionsFingerprintKeyed at resolve
 // time (WIRE_CLIENTS literals stay untouched); identity and other profile
 // fields are preserved. Symmetric for claude-responses and codex entries.
 test("personaSplit:false strips the instructions fingerprint but keeps identity", () => {
@@ -180,4 +180,15 @@ test("personaSplit:false also strips fingerprint on the codex wire-client entry"
     assert.equal(instructionsFingerprintApplies({ "x-codex-turn-metadata": "t=1" }, true), false);
     assert.equal(instructionsFingerprintApplies({ "x-claude-code-session-id": "uuid-1" }, true), false);
     assert.equal(instructionsFingerprintApplies({ "x-claude-code-session-id": "uuid-1" }, false), true);
+});
+
+test("personaSplit:false leaves anonymous and non-keyed clients untouched (#3617)", () => {
+    const anon = {
+        headerNames: new Set(["x-acp-session"]),
+        conversationSourceName: "x-acp-session",
+        codexUserAgent: false,
+    };
+    const withOff = resolveWireClientProfile({ ...anon, personaSplitOff: true });
+    assert.equal(withOff.identity, "");
+    assert.equal(withOff.instructionsFingerprintKeyed, false);
 });
