@@ -26,9 +26,20 @@ export const UPSTREAM_HOP_HEADERS = new Set([
     // #1117: bili-internal passthrough marker (native fetch patch → proxy);
     // never meaningful to a real upstream.
     "x-bili-passthrough",
+    // #5418: watermark fastpath handshake — client→proxy watermark claim and
+    // proxy→client measured total. Pure billing-plane bookkeeping; the A/B
+    // golden (tests/issue5403-watermark-fastpath.test.ts) pins that neither
+    // ever reaches a model endpoint.
+    "x-bili-pf-count",
+    "x-bili-pf-seq",
+    "x-bili-pf-tail-ids",
     "te",
     "trailer",
     "upgrade",
+    // expect: end-to-end per spec (not a §6.1 hop-by-hop), but undici fetch
+    // throws UND_ERR_NOT_SUPPORTED when forwarding it — strip at every egress
+    // site (#5369).
+    "expect",
 ]);
 
 // content-encoding is end-to-end (RFC 9110 §7.2), NOT hop-by-hop — but the two
@@ -80,7 +91,9 @@ export function stripRemoteCompactionBetaFeature(headers: Record<string, string>
 export function buildForwardHeaders(headers: Record<string, string>): Record<string, string> {
     const out: Record<string, string> = {};
     for (const [k, v] of Object.entries(headers)) {
-        if (k.toLowerCase() === "content-length" || k.toLowerCase() === "host") continue;
+        // expect: undici fetch rejects it with UND_ERR_NOT_SUPPORTED — dropped
+        // here so no egress path can forward it (#5369).
+        if (k.toLowerCase() === "content-length" || k.toLowerCase() === "host" || k.toLowerCase() === "expect") continue;
         out[k] = v;
     }
     out["content-type"] = "application/json";

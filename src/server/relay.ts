@@ -18,6 +18,7 @@ import { warnCacheCollapse } from "../cache-warn.js";
 import { stampOutbound } from "../chain-checkpoint.js";
 import { applyCompatDropFields, dropCompatFieldsJson, resolveCompatDropFields } from "../compat-drop.js";
 import { applyCompatRoles, applyCompatRolesJson, detectRoleRejection, detectSystemPlacementError, hasOffHeadSystem, resolveCompatRoles, type CompatRoles } from "../compat-roles.js";
+import { builtinCompatRoles, builtinRoleRestorePoints, withRestoredRoles } from "../kiro.js";
 import { compressLoopResponsesJson } from "../compress-loop-responses.js";
 import { resolveCompress } from "../compress-settings.js";
 import { buildAbsorbSystemPrompt, buildCompressHybridSystemPrompt, buildCompressSystemPrompt, withMarkerIntegrityNote, withMcpDialectNote, withProjectAttribution, withSummaryBudgetNote } from "../compress-tool.js";
@@ -306,6 +307,9 @@ async function forwardCaptured(
     // forward, or a developer-role 400 would hit mid-stream on retry).
     let compatRoles: CompatRoles | null = null;
     let compatProtocol: "openai" | "responses" | null = null;
+    // Kiro: [input index, original role] for items re-voiced by the built-in map
+    // (judge-only; the wire keeps the rewritten roles).
+    let judgeRoleRestore: Array<[number, string]> = [];
     // #1757 resolved drop list, shared with wireTransform below (re-sent
     // compress-retry bodies must carry the same drops as the initial forward).
     let compatDropPaths: string[] = [];
@@ -461,7 +465,11 @@ async function forwardCaptured(
         // so later requests skip the 400 round-trip. Session-scoped only —
         // config stays user-owned.
         const learned = (prepared?.session.metadata.learnedCompatRoles as CompatRoles | undefined) ?? {};
-        const roles = { ...configured, ...learned };
+        // Kiro CLI: its gateway takes only user/assistant items, so bili's
+        // injected developer prompt would 400 at input[0]. Built-in, lowest
+        // precedence — configured and learned roles still win per key.
+        const builtin = builtinCompatRoles(req.headers, upstreamUrl);
+        const roles = { ...builtin, ...configured, ...learned };
         const protocol = prepared?.protocol ?? route?.explicitProtocol ?? resolveDeclaredProtocol(opts.routes, upstreamUrl) ?? inferWireProtocol(req.url ?? "");
         // compatProtocol is armed even with zero roles: the learn-on-failure
         // retry below needs it, and roles may be learned mid-request.
@@ -480,12 +488,20 @@ async function forwardCaptured(
                     if (rewritten > 0) {
                         commitGraph();
                         log("info", `[${prepared?.session.id ?? "passthrough"}] [compat] rewrote ${rewritten} message role(s) per compat.roles (${Object.entries(roles).map(([f, t]) => `${f}→${t}`).join(",")})`);
+                        // Kiro: remember which items the BUILT-IN map re-voiced, so the
+                        // invariant judge can see bili's own injected prompt as what it is
+                        // (a developer item) instead of an unexplained user insertion.
+                        if (Object.keys(builtin).length > 0) judgeRoleRestore = builtinRoleRestorePoints(body, protocol, builtin, roles);
                     }
                 } else {
                     const applied = applyCompatRoles(body, protocol, roles);
                     if (applied.rewritten > 0) {
                         wireBody = applied.body;
                         log("info", `[${prepared?.session.id ?? "passthrough"}] [compat] rewrote ${applied.rewritten} message role(s) per compat.roles (${Object.entries(roles).map(([f, t]) => `${f}→${t}`).join(",")})`);
+                        // Kiro: remember which items the BUILT-IN map re-voiced, so the
+                        // invariant judge can see bili's own injected prompt as what it is
+                        // (a developer item) instead of an unexplained user insertion.
+                        if (Object.keys(builtin).length > 0) judgeRoleRestore = builtinRoleRestorePoints(body, protocol, builtin, roles);
                     }
                     // Unchanged bytes keep the prepare-time binding honest; a rewrite
                     // here came from an independent parse, so no carrier lineage can
@@ -956,7 +972,8 @@ async function forwardCaptured(
         maybeRunInvariantJudge({
             // #2078: reuse the seam block's single parse of sentBody instead of
             // paying another full JSON.parse of the largest payload per turn.
-            parsed: sentParsed,
+            // Kiro: judge with the built-in role re-voicing undone (see judgeRoleRestore).
+            parsed: withRestoredRoles(sentParsed, judgeRoleRestore),
             // #4241: a render-lane turn's outbound is built from the SERVER
             // transcript (summary anchors + store rows), so its ground truth
             // is the rendered view — reconciling the client's inbound bytes
@@ -1754,7 +1771,8 @@ async function forwardCaptured(
             // dropping reasoning and every following turn split again.
             // #2169: match BOTH field spellings — the chat wire says
             // reasoning_content, DeepSeek's Responses wire says reasoning_text.
-            if (upstream.status === 400 && /reasoning_(?:content|text)/i.test(errText)) {
+            // #5495: DeepSeek's Anthropic-wire endpoint spells it content[].thinking.
+            if (upstream.status === 400 && /reasoning_(?:content|text)|content\[\]\.thinking/i.test(errText)) {
                 if (s.metadata.strictReasoningEcho !== true) {
                     s.metadata.strictReasoningEcho = true;
                     markDirty(s);
@@ -1831,6 +1849,8 @@ async function forwardCaptured(
         // it back). The dsh recall bridge does not need it (it learns at
         // beforeSend), but any client may adopt the header directly.
         if (prepared !== null) respHeaders["x-bili-session"] = prepared.session.id;
+        // #5418: the prepare lane's own success-response headers (watermark seq stamp).
+        if (prepared !== null && prepared.responseExtraHeaders !== undefined) Object.assign(respHeaders, prepared.responseExtraHeaders);
         res.writeHead(upstream.status, respHeaders);
     }
     // #4204: success-side counterpart of the non-2xx observation above — a

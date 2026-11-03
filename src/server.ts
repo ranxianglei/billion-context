@@ -417,7 +417,7 @@ export function googlePathKind(urlPath: string): GooglePathKind | null {
  *  `parsed.model`. Returns undefined when the path carries no model or an
  *  undecodable one. */
 export function googleModelFromPath(urlPath: string): string | undefined {
-    const m = /\/models\/([^/:?]+):(?:streamGenerateContent|generateContent|countTokens)\b/.exec(urlPath);
+    const m = /\/models\/([^:?]+):(?:streamGenerateContent|generateContent|countTokens)\b/.exec(urlPath);
     if (!m || !m[1]) return undefined;
     try {
         return decodeURIComponent(m[1]);
@@ -1943,6 +1943,11 @@ export type Prepared = {
      *  prompt carries the MCP name-mapping note (withMcpDialectNote). Threads
      *  to the round-2 system rebuild for byte-parity. */
     mcpDialectNote?: boolean;
+    /** #5418 watermark fastpath: extra SUCCESS-response headers built by the
+     *  prepare lane (x-bili-pf-seq = this turn's server-measured element
+     *  count, for client-side watermark convergence). The relay's 2xx path
+     *  merges them onto the upstream response headers. */
+    responseExtraHeaders?: Record<string, string>;
     responsesTextProtocol?: boolean;
     resetAfterSuccess?: boolean;
     responsesProjection?: ResponsesProjection;
@@ -3618,6 +3623,31 @@ export function warnRouteMissIfNew(
         }
     }
     log("warn", msg);
+    return true;
+}
+
+// #5612: complement to warnRouteMissIfNew — a providers key DID match but the
+// model id is absent from that route's per-model table (e.g. client renamed ids
+// /,.→-), so overrides silently drop. Once per upstream+model, hints the rename.
+const modelNameMissWarned = new Set<string>();
+
+export function _resetModelNameMissWarnedForTest(): void {
+    modelNameMissWarned.clear();
+}
+
+export function warnModelNameMissIfNew(
+    origin: string | undefined,
+    model: string | undefined,
+    declaredNames: string[],
+    log: (level: string, msg: string) => void,
+): boolean {
+    if (!origin || !model || declaredNames.length === 0) return false;
+    const key = `${origin}\u0000${model}`;
+    if (modelNameMissWarned.has(key)) return false;
+    modelNameMissWarned.add(key);
+    const shown = declaredNames.slice(0, 8).join(", ");
+    const more = declaredNames.length > 8 ? `, … (+${declaredNames.length - 8})` : "";
+    log("warn", `[route] providers key ${hostIdForLog(origin)} matched but model=${model} is not among its declared per-model entries [${shown}${more}] — its context/output/compress overrides are IGNORED. If the client renames model ids (/ . → -), declare that spelling too; otherwise add "${model}" under the providers key.`);
     return true;
 }
 
