@@ -419,28 +419,87 @@ export const WEB_CLIENT = `(function () {
         return html;
     }
     window.bili_hostPluginBanner = bili_hostPluginBanner;
-    // #5079: one-time-per-instance upgrade notice — prompt_cache_key
-    // self-stamping is off by default now. Server decides active (effective
-    // routing "disabled" && not dismissed); pure builder, same test-seam
-    // convention as the banners above.
-    function bili_pckNoticeBanner(s) {
-        let html = '<div class="banner-title">' + escapeHtml(s.on) + "</div>";
-        html += '<div class="alert-row"><span>' + escapeHtml(s.desc) + '</span><button class="btn sm pck-notice-dismiss">' + escapeHtml(s.dismiss) + "</button></div>";
-        html += '<div class="dim small" style="margin-top:6px">' + escapeHtml(s.hint) + "</div>";
-        return html;
+    // #5548: unified announcement surface (design v2 lane A). The server ships
+    // priority-sorted visible records whose copy rides the record (string or
+    // locale object, fallback locale → zh-CN → en → any); elements are built
+    // with textContent only — zero innerHTML with external data (design §4.2).
+    function bili_noticeText(v, lang) {
+        if (typeof v === "string") return v;
+        if (v && typeof v === "object") {
+            for (const k of [lang, "zh-CN", "en"]) if (typeof v[k] === "string" && v[k]) return v[k];
+            for (const k of Object.keys(v)) if (typeof v[k] === "string" && v[k]) return v[k];
+        }
+        return "";
     }
-    window.bili_pckNoticeBanner = bili_pckNoticeBanner;
-    // #5403: one-time-per-instance intro for the watermark fastpath
-    // experimental grey rollout — same server-side dismissal convention as
-    // above (own notice id, visible on every install until closed or an
-    // explicit rollout override exists); pure builder + same test seam.
-    function bili_wmNoticeBanner(s) {
-        let html = '<div class="banner-title">' + escapeHtml(s.on) + "</div>";
-        html += '<div class="alert-row"><span>' + escapeHtml(s.desc) + '</span><button class="btn sm wm-notice-dismiss">' + escapeHtml(s.dismiss) + "</button></div>";
-        html += '<div class="dim small" style="margin-top:6px">' + escapeHtml(s.hint) + "</div>";
-        return html;
+    window.bili_noticeText = bili_noticeText;
+    const NOTICE_MAX_HEADER_BANNERS = 5;
+    function bili_buildNoticeEl(n) {
+        const el = document.createElement("div");
+        el.className = "banner show " + String(n.tone || "info");
+        const title = document.createElement("div");
+        title.className = "banner-title";
+        title.textContent = bili_noticeText(n.title, locale);
+        el.appendChild(title);
+        const row = document.createElement("div");
+        row.className = "alert-row";
+        const span = document.createElement("span");
+        span.textContent = bili_noticeText(n.desc, locale);
+        row.appendChild(span);
+        if (n.ctaUrl && n.ctaLabel) {
+            const link = document.createElement("a");
+            link.className = "mono";
+            link.href = String(n.ctaUrl);
+            link.target = "_blank";
+            link.rel = "noopener";
+            link.textContent = bili_noticeText(n.ctaLabel, locale);
+            row.appendChild(link);
+        }
+        if (n.dismiss !== "always") {
+            const btn = document.createElement("button");
+            btn.className = "btn sm notice-dismiss";
+            btn.textContent = t("notices.dismiss_btn");
+            btn.addEventListener("click", async () => {
+                busy(btn, true);
+                try {
+                    await json(API_ROOT + "/notices/dismiss", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id: typeof n.id === "string" ? n.id : "" }) });
+                    toast(t("notices.dismissed"), "ok");
+                    await loadOverview(true);
+                } catch (e) {
+                    toast(e.message, "err");
+                } finally {
+                    busy(btn, false);
+                }
+            });
+            row.appendChild(btn);
+        }
+        el.appendChild(row);
+        if (n.hint !== undefined) {
+            const hint = document.createElement("div");
+            hint.className = "dim small";
+            hint.style.marginTop = "6px";
+            hint.textContent = bili_noticeText(n.hint, locale);
+            el.appendChild(hint);
+        }
+        return el;
     }
-    window.bili_wmNoticeBanner = bili_wmNoticeBanner;
+    window.bili_buildNoticeEl = bili_buildNoticeEl;
+    function renderAnnouncementBanners(list) {
+        const host = $("notices-banners");
+        if (!host) return;
+        while (host.firstChild) host.removeChild(host.firstChild);
+        const card = $("notice-list-card");
+        const ovf = $("notice-list");
+        if (ovf) while (ovf.firstChild) ovf.removeChild(ovf.firstChild);
+        if (card) card.hidden = true;
+        if (!Array.isArray(list) || !list.length) return;
+        const head = list.slice(0, NOTICE_MAX_HEADER_BANNERS);
+        for (const n of head) host.appendChild(bili_buildNoticeEl(n));
+        const rest = list.slice(NOTICE_MAX_HEADER_BANNERS);
+        if (rest.length && card && ovf) {
+            card.hidden = false;
+            for (const n of rest) ovf.appendChild(bili_buildNoticeEl(n));
+        }
+    }
     function $(id) { return document.getElementById(id); }
     function toast(message, kind) {
         const host = $("toast-host");
@@ -1583,65 +1642,13 @@ function changelogCatOf(rawLine) {
                 hb.innerHTML = "";
             }
         }
-        // #5079: prompt_cache_key default-off upgrade notice — dismissal is
-        // server-side (POST /__bili/notices/dismiss) so one close silences
-        // every browser; the banner re-renders from the refetched overview.
-        const nb = $("pck-notice-banner");
-        if (nb) {
-            const pn = d.pckNotice && typeof d.pckNotice === "object" ? d.pckNotice : null;
-            if (pn && pn.active === true) {
-                nb.hidden = false;
-                nb.classList.add("show");
-                nb.innerHTML = bili_pckNoticeBanner({ on: t("pckoff.on"), desc: t("pckoff.desc"), hint: t("pckoff.hint"), dismiss: t("pckoff.dismiss_btn") });
-                for (const btn of Array.from(nb.querySelectorAll(".pck-notice-dismiss"))) {
-                    btn.addEventListener("click", async () => {
-                        busy(btn, true);
-                        try {
-                            await json(API_ROOT + "/notices/dismiss", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id: typeof pn.id === "string" ? pn.id : "" }) });
-                            toast(t("pckoff.dismissed"), "ok");
-                            await loadOverview(true);
-                        } catch (e) {
-                            toast(e.message, "err");
-                        } finally {
-                            busy(btn, false);
-                        }
-                    });
-                }
-            } else {
-                nb.hidden = true;
-                nb.classList.remove("show");
-                nb.innerHTML = "";
-            }
-        }
-        // #5403: watermark fastpath experimental-grey intro — all installs see
-        // it on first upgrade until closed (server-side, like #5079 above).
-        const wnb = $("wm-notice-banner");
-        if (wnb) {
-            const wn = d.wmNotice && typeof d.wmNotice === "object" ? d.wmNotice : null;
-            if (wn && wn.active === true) {
-                wnb.hidden = false;
-                wnb.classList.add("show");
-                wnb.innerHTML = bili_wmNoticeBanner({ on: t("wmfast.on"), desc: t("wmfast.desc"), hint: t("wmfast.hint"), dismiss: t("wmfast.dismiss_btn") });
-                for (const btn of Array.from(wnb.querySelectorAll(".wm-notice-dismiss"))) {
-                    btn.addEventListener("click", async () => {
-                        busy(btn, true);
-                        try {
-                            await json(API_ROOT + "/notices/dismiss", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id: typeof wn.id === "string" ? wn.id : "" }) });
-                            toast(t("wmfast.dismissed"), "ok");
-                            await loadOverview(true);
-                        } catch (e) {
-                            toast(e.message, "err");
-                        } finally {
-                            busy(btn, false);
-                        }
-                    });
-                }
-            } else {
-                wnb.hidden = true;
-                wnb.classList.remove("show");
-                wnb.innerHTML = "";
-            }
-        }
+        // #5548: unified announcement surface — one loop over the server's
+        // visible records (lane A built-ins today; B/C merge in later phases).
+        // Dismissal stays server-side (POST /__bili/notices/dismiss) so one
+        // close silences every browser; banners re-render from the refetched
+        // overview. More than NOTICE_MAX_HEADER_BANNERS overflow into the
+        // overview's 公告列表 card.
+        renderAnnouncementBanners(Array.isArray(d.notices) ? d.notices : []);
         // #1682: global upstream-connection alert banner — visible on every view,
         // one row per active alert (no stacking), dismiss per alert instance.
         latestAlerts = Array.isArray(d.alerts) ? d.alerts : [];
