@@ -128,13 +128,12 @@ test("#3148 review: an UNCOUNTED probe failure (timeout/client abort) must not p
 
 test("#3148: clampOutgoingOutput records the exact clamp event without changing the wire decision", () => {
     const rebuilt: Record<string, unknown> = { max_tokens: 300_000 };
-    let seen: { raw: number; capped: number; window: number; planningInput: number; ledgerFloor: number } | undefined;
-    // The reporter's numbers (floor 997348, window 1048576 -> margin
-    // ceil(997348*0.05)=49868, cap floor(1048576-997348-49868)=1360, lifted to
-    // 4096 by #3071's capability floor bounded by raw headroom 51228) are kept;
-    // #3384 re-gated the floor, so the request is raised to 300K >=
-    // 0.25*1048576=262144 to take the giant-request ground and keep the hook
-    // path covered.
+    let seen: { raw: number; capped: number; window: number; planningInput: number } | undefined;
+    // The reporter's numbers (near-window input 997348, window 1048576 ->
+    // margin ceil(997348*0.05)=49868, cap floor(1048576-997348-49868)=1360,
+    // lifted to 4096 by #3071's capability floor bounded by raw headroom 51228)
+    // are kept, driven by the MEASURED input since #5596 (the refused-ledger
+    // floor no longer plans); the 300K request keeps the hook path covered.
     clampOutgoingOutput(
         rebuilt,
         "max_tokens",
@@ -142,23 +141,22 @@ test("#3148: clampOutgoingOutput records the exact clamp event without changing 
             systemText: "",
             tools: [],
             processedMessages: [],
-            lastInputTokens: 97730,
+            lastInputTokens: 997348,
             lastInputTokensSource: "usage",
             nativeWindow: 1048576,
             imageTokens: 0,
-            ledgerFloorTokens: 997348,
         },
         "t",
         () => {},
         (info) => { seen = info; },
     );
-    assert.deepEqual(seen, { raw: 300_000, capped: 4096, window: 1048576, planningInput: 997348, ledgerFloor: 997348 }, "exact clamp event captured");
+    assert.deepEqual(seen, { raw: 300_000, capped: 4096, window: 1048576, planningInput: 997348 }, "exact clamp event captured");
     assert.equal(rebuilt.max_tokens, 4096, "wire decision unchanged (same cap as before the hook)");
 
-    // #3384: the OLD expectation here (modest 65536 request against this same
-    // floor clamps to 4096) IS the starvation regression — below both gate
-    // lines the floor must not drive planning, or a healthy session (folded
-    // wire ~9% of the window) loses its output budget to bytes never sent.
+    // The OLD expectation here (modest 65536 request against this same shape
+    // clamps to 4096) IS the #3384 starvation regression — post-#5596 the
+    // refused floor never plans at any request size, so this row holds
+    // trivially; kept as a negative-direction pin.
     const modest: Record<string, unknown> = { max_tokens: 65_536 };
     let modestCalls = 0;
     clampOutgoingOutput(
@@ -172,7 +170,6 @@ test("#3148: clampOutgoingOutput records the exact clamp event without changing 
             lastInputTokensSource: "usage",
             nativeWindow: 1048576,
             imageTokens: 0,
-            ledgerFloorTokens: 997348,
         },
         "t",
         () => {},
@@ -233,7 +230,7 @@ test("#3148: acp_status surfaces the open circuit, armed emergency shrink and th
     const session = makeSession({
         emergencyShrinkAt: Date.now() - 60_000,
         emergencyShrinkEstimate: 699777,
-        lastOutputClamp: { raw: 65536, capped: 1360, window: 1048576, planningInput: 997348, ledgerFloor: 997348, at: Date.now() - 30_000 },
+        lastOutputClamp: { raw: 65536, capped: 1360, window: 1048576, planningInput: 997348, at: Date.now() - 30_000 },
     });
     session.metadata.dshCompactionRefusedBytes = 997348 * 4;
     recordUpstreamCircuitFailure(URL_A, refused(), false);
@@ -247,7 +244,9 @@ test("#3148: acp_status surfaces the open circuit, armed emergency shrink and th
     assert.ok(text.includes("699777"), "shrink estimate visible");
     assert.ok(text.includes("OUTPUT BUDGET CLAMP"), "clamp section visible");
     assert.ok(text.includes("65536 -> 1360"), "last clamp values visible");
-    assert.ok(text.includes("997348"), "planning floor visible");
+    assert.ok(text.includes("input~997348"), "clamp input basis visible");
+    assert.ok(text.includes("DSH COMPACTION REPLAYS REFUSED"), "diagnostic refusal watermark visible");
+    assert.ok(text.includes("997348 tok"), "refusal high-water visible");
 });
 
 test("#3148: acp_status stays quiet about all three when none is active", () => {
@@ -255,7 +254,8 @@ test("#3148: acp_status stays quiet about all three when none is active", () => 
     const text = handleAcpStatus({}, makeCtx(makeSession())).text;
     assert.ok(!text.includes("UPSTREAM CIRCUIT OPEN"), "no circuit line when closed");
     assert.ok(!text.includes("EMERGENCY SHRINK ARMED"), "no shrink line when not armed");
-    assert.ok(!text.includes("OUTPUT BUDGET CLAMP"), "no clamp line without ledger/clamp history");
+    assert.ok(!text.includes("OUTPUT BUDGET CLAMP"), "no clamp line without clamp history");
+    assert.ok(!text.includes("DSH COMPACTION REPLAYS REFUSED"), "no refusal line without a recorded refusal");
 });
 
 test("#3148: a real usage report clears the emergency-shrink visibility marker", () => {
