@@ -416,7 +416,7 @@ export function googlePathKind(urlPath: string): GooglePathKind | null {
  *  `parsed.model`. Returns undefined when the path carries no model or an
  *  undecodable one. */
 export function googleModelFromPath(urlPath: string): string | undefined {
-    const m = /\/models\/([^/:?]+):(?:streamGenerateContent|generateContent|countTokens)\b/.exec(urlPath);
+    const m = /\/models\/([^:?]+):(?:streamGenerateContent|generateContent|countTokens)\b/.exec(urlPath);
     if (!m || !m[1]) return undefined;
     try {
         return decodeURIComponent(m[1]);
@@ -1936,6 +1936,11 @@ export type Prepared = {
      *  prompt carries the MCP name-mapping note (withMcpDialectNote). Threads
      *  to the round-2 system rebuild for byte-parity. */
     mcpDialectNote?: boolean;
+    /** #5418 watermark fastpath: extra SUCCESS-response headers built by the
+     *  prepare lane (x-bili-pf-seq = this turn's server-measured element
+     *  count, for client-side watermark convergence). The relay's 2xx path
+     *  merges them onto the upstream response headers. */
+    responseExtraHeaders?: Record<string, string>;
     responsesTextProtocol?: boolean;
     resetAfterSuccess?: boolean;
     responsesProjection?: ResponsesProjection;
@@ -2369,6 +2374,32 @@ export function applyReasoningDrop(
         log("info", `[${sessionId}] compress-reasoning: dropped ${msgs.length - out.length} reasoning message(s) from closed compress turns (#651)`);
     }
     return out;
+}
+
+/** Predicate factory for the experimental fold-point carrier relocation
+ *  "thinking clear" (kernel Config.reasoningDroppable): a reasoning core may
+ *  be dropped at the moment its compress pair is repositioned ONLY when it
+ *  carries no wire signature. Signed Anthropic thinking/redacted_thinking
+ *  bytes are NEVER rewritten or deleted (#1658 doctrine). Returns undefined
+ *  for sessions where the kernel must not drop anything at all: strict-echo
+ *  upstreams (#684 — reasoning must round-trip with tool_calls) and views
+ *  holding ANY signed thinking block (presence-based gate, same posture as
+ *  planReasoningDrop), so a conservative misclassification can never break a
+ *  signed session. Pure + cheap; install per request. */
+export function makeFoldPointReasoningDroppable(
+    msgs: BiliMessage[],
+    strictEcho: boolean,
+): ((m: import("acp-kernel").CoreMessage) => boolean) | undefined {
+    if (strictEcho) return undefined;
+    if (msgs.some(hasSignedThinkingBlock)) return undefined;
+    return (m: import("acp-kernel").CoreMessage): boolean => {
+        const core = m as BiliMessage;
+        if (core.contentType === "reasoning") {
+            return !(typeof core.thinkingSignature === "string" && core.thinkingSignature.length > 0);
+        }
+        const raw = core.rawAnthropicBlock as { type?: unknown } | undefined;
+        return raw?.type !== "redacted_thinking";
+    };
 }
 
 /** [#651] Strip oversized reasoning from closed compress turns (see
@@ -3640,6 +3671,31 @@ export function warnRouteMissIfNew(
         }
     }
     log("warn", msg);
+    return true;
+}
+
+// #5612: complement to warnRouteMissIfNew — a providers key DID match but the
+// model id is absent from that route's per-model table (e.g. client renamed ids
+// /,.→-), so overrides silently drop. Once per upstream+model, hints the rename.
+const modelNameMissWarned = new Set<string>();
+
+export function _resetModelNameMissWarnedForTest(): void {
+    modelNameMissWarned.clear();
+}
+
+export function warnModelNameMissIfNew(
+    origin: string | undefined,
+    model: string | undefined,
+    declaredNames: string[],
+    log: (level: string, msg: string) => void,
+): boolean {
+    if (!origin || !model || declaredNames.length === 0) return false;
+    const key = `${origin}\u0000${model}`;
+    if (modelNameMissWarned.has(key)) return false;
+    modelNameMissWarned.add(key);
+    const shown = declaredNames.slice(0, 8).join(", ");
+    const more = declaredNames.length > 8 ? `, … (+${declaredNames.length - 8})` : "";
+    log("warn", `[route] providers key ${hostIdForLog(origin)} matched but model=${model} is not among its declared per-model entries [${shown}${more}] — its context/output/compress overrides are IGNORED. If the client renames model ids (/ . → -), declare that spelling too; otherwise add "${model}" under the providers key.`);
     return true;
 }
 

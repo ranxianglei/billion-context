@@ -130,6 +130,7 @@ QQ群:
 | **aider** | [`billion-context`](https://github.com/ranxianglei/billion-context),`bili aider`(cert-MITM)或 `/bili/` 前缀 —— 无原生模式(仅 shell 命令钩子,无工具注入接缝,[#1048](https://github.com/ranxianglei/billion-context/issues/1048)) |
 | **copilot**(GitHub Copilot CLI) | `bili copilot`(启动器,cert-MITM)—— 闭源 Go 二进制、无插件接缝(#1049) |
 | **amp**(Amp CLI) | `bili amp`(启动器,cert-MITM)—— 闭源 Go 二进制、无插件接缝(#1049) |
+| **kiro**(Kiro CLI,AWS) | `bili kiro`(启动器,cert-MITM)—— Rust 外壳 + Node 代理服务、无插件接缝;模型流量走 `runtime.<region>.kiro.dev` 的 Responses wire,网关差异已内置处理——详见 [CLIENTS.zh-CN.md](CLIENTS.zh-CN.md#kiro-cliaws) |
 | **crush**(Charm Crush) | `bili crush`(启动器,cert-MITM)—— 开源 Go 二进制、无插件接缝;内置 provider 域加白,crush.json 自定义 `base_url` 自动发现(#2340) |
 | **zed**(Zed 编辑器) | `bili zed`(启动器,cert-MITM)—— 开源 Rust 编辑器、无插件接缝;reqwest 吃 HTTPS_PROXY,CA 走 SSL_CERT_FILE(Linux TLS env 探测);内置 provider 域加白,settings.json 自定义 `api_url` 自动发现;环回 provider(ollama/lmstudio)经 NO_PROXY 保持直连(#2340) |
 | **goose**(Goose CLI) | `bili goose`(启动器)—— rustls 不信任任何 CA 文件,无法 cert-MITM:openai/anthropic 腿经 `OPENAI_HOST`/`ANTHROPIC_HOST`,自定义 provider 经重新生成的 `GOOSE_PATH_ROOT` overlay(#1049) |
@@ -200,7 +201,7 @@ pi / omp / kimi / claude 没有客户端侧通道 —— 它们的配置条目�
 - `jcode`、`aider` 无原生模式(无插件/MCP/工具注入接缝:#962、#1048)—— 用 `bili jcode` / `bili aider`。
 - `copilot`、`amp`、`crush`、`zed`、`goose` 仅启动器模式(#1049/#2340);goose 无法 cert-MITM(rustls 不信任任何 CA 文件),改走纯 HTTP base-URL 重定向。
 
-### 方式 2 —— 启动器(`bili pi` / `bili codex` / `bili claude` / `bili omp` / `bili opencode` / `bili hermes` / `bili dsh` / `bili codebuddy` / `bili qoder` / `bili trae` / `bili jcode` / `bili kimi` / `bili gemini` / `bili iflow` / `bili qwen` / `bili antigravity` / `bili mcode` / `bili aider` / `bili copilot` / `bili amp` / `bili crush` / `bili zed` / `bili goose`)
+### 方式 2 —— 启动器(`bili pi` / `bili codex` / `bili claude` / `bili omp` / `bili opencode` / `bili hermes` / `bili dsh` / `bili codebuddy` / `bili qoder` / `bili trae` / `bili jcode` / `bili kimi` / `bili gemini` / `bili iflow` / `bili qwen` / `bili antigravity` / `bili mcode` / `bili aider` / `bili copilot` / `bili amp` / `bili crush` / `bili zed` / `bili goose` / `bili kiro`)
 
 启动器把客户端包进一条命令:在独立端口拉起一个代理(总是全新实例,绝不复用端口),再按客户端支持的机制把它指向代理 —— 能吃代理/CA 环境变量的走**证书 MITM**,不吃的走隔离的**`/bili/` 配置重写**。真实配置文件从不被修改;客户端自己的配置只被**读取**,用来发现它实际连接的 HTTPS 上游主机,把这些主机加入 MITM 白名单 —— 代理只 TLS 终结它们,其余流量盲透传。
 
@@ -213,7 +214,7 @@ bili opencode                         # OpenCode(1.x 与 2.x):完整指南见下
 bili hermes                           # file-free(#535):hermes 代理环境变量(HTTPS_PROXY + SSL_CERT_FILE 组合 CA bundle)—— https 走 CONNECT MITM,http 走绝对形式转发;真实 ~/.hermes 不动
 bili dsh                              # deepseek-harness:经 --patch 注入完整原生插件(#941) —— 真实 dsh 工具、会话绑定 /acp(plugin 模式);非回环上游走代理 env,回环保留 overlay DSH_HOME 改写(#535);dsh 自动压缩处处关闭(宿主平面经 bundle patch,web profile 的 preset 经 #3354 加载期 overlay,#1772/#2474/#3354)
 bili codebuddy                        # Tencent CodeBuddy Code CLI:CODEBUDDY_BASE_URL /bili/ 重写(OpenAI chat completions wire),预算对齐走 CODEBUDDY_AUTO_COMPACT_WINDOW;真实 ~/.codebuddy 不动
-bili qoder                            # qoder:模型端点硬编码 https(无法 /bili/ 改写)—— 证书 MITM(HTTPS_PROXY + NODE_EXTRA_CA_CERTS),默认模型主机已加白名单(#653)
+bili qoder                            # qoder CLI(`qoder`/`qodercli`):模型端点硬编码 https(无法 /bili/ 改写)—— 证书 MITM(HTTPS_PROXY + NODE_EXTRA_CA_CERTS),默认模型主机已加白名单(#653)。Qoder Desktop 是另一条 BYOK/自定义渠道,走 `/bili/` 前缀的明文 OpenAI wire —— 当作普通自定义 provider 指向 bili 即可(不走这条 MITM 车道);其官方订阅流量是加密的,不在范围内(#764)
 bili trae                             # Trae CLI(字节跳动,闭源 Go 二进制,无 base-URL 覆盖)—— 证书 MITM(HTTPS_PROXY + SSL_CERT_FILE),模型主机取 TRAE_CLI_API_HOST 或默认企业网关(#655)
 bili jcode                            # jcode(Rust 终端编码 agent)—— 环境变量式证书 MITM 启动:HTTPS_PROXY + SSL_CERT_FILE,模型主机 api.z.ai 默认加白,本地回环 provider 走 NO_PROXY 直连
 bili kimi                             # Kimi Code CLI(Moonshot):除无条件回环绕过外遵循标准代理环境变量 —— https 证书 MITM、http 绝对形式转发;回环端点编目并附手动 /bili/ 提示(#757)
@@ -228,6 +229,7 @@ bili amp                              # Amp CLI(Sourcegraph,闭源 Go 二进制)
 bili crush                            # Crush(Charm,开源 Go 二进制)—— 证书 MITM(HTTPS_PROXY + SSL_CERT_FILE),api.anthropic.com/api.openai.com/openrouter.ai + crush.json 自定义 base_url 加白(#2340)
 bili zed                              # Zed 编辑器(开源 Rust)—— 证书 MITM(HTTPS_PROXY + SSL_CERT_FILE,Linux TLS env 探测),内置 provider 域 + settings.json 自定义 api_url 加白,环回 provider 保持直连(#2340)
 bili goose                            # Goose(Block,Rust/reqwest):rustls 发布构建不信任任何 CA 文件 —— openai/anthropic 腿经 OPENAI_HOST/ANTHROPIC_HOST,自定义 provider 经重新生成的 GOOSE_PATH_ROOT overlay(/bili/ 改写,真实配置不动)(#1049)
+bili kiro                             # Kiro CLI(AWS):经 HTTPS_PROXY + SSL_CERT_FILE 与 NODE_EXTRA_CA_CERTS 上的合并 CA 做 cert-MITM;只解密 runtime.<region>.kiro.dev;developer/system 项为网关改写为 user;会话 = Kiro 的 conversation id(--resume 后保持)
 bili pi --mitm-domain api.foo.com     # 向 MITM 白名单追加域名
 ```
 

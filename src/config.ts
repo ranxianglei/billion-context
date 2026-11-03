@@ -604,6 +604,25 @@ export type CompressSettings = {
      *  Real edits never match (normalized text differs) and honestly
      *  re-enter the wire unfolded, exactly as before. */
     reconcile?: "off" | "warn" | "repair";
+    /** EXPERIMENTAL view transform A (default OFF): move a still-visible
+     *  compress call/result pair from its original tail-adjacent position to
+     *  its own fold point, so resent history ends "[folded region] – [pair] –
+     *  [protected messages]" instead of a tool exchange at the very end (which
+     *  weak-attention models read as a fresh command). Purely view-side — refs
+     *  and state are untouched; identical layout is recomputed every turn.
+     *  Env BILI_COMPRESS_AT_FOLD_POINT wins over every level;
+     *  applyCompressSettings resolves it per request. Maps to kernel
+     *  Config.compressAtFoldPoint (acp-kernel >= 0.0.177). */
+    compressAtFoldPoint?: boolean;
+    /** Second opt-in riding on compressAtFoldPoint (default OFF): also drop
+     *  the contiguous run of UNSIGNED reasoning cores immediately preceding a
+     *  relocated pair at the moment of repositioning (the turn's think about
+     *  the fold itself). Both switches must be set for anything to be dropped,
+     *  and the host additionally refuses any core carrying a wire signature or
+     *  running under strict reasoning-echo (#1658/#684 doctrine). Env
+     *  BILI_COMPRESS_AT_FOLD_POINT_CLEAR_THINKING wins over every level.
+     *  Maps to kernel Config.compressAtFoldPointClearThinking. */
+    compressAtFoldPointClearThinking?: boolean;
 };
 /** #5079: governs every prompt_cache_key BILI ITSELF writes to an egress body
  *  (chat-wire conversation-id stamping, Responses-wire identity injection).
@@ -749,13 +768,71 @@ export function findRoute(routes: ProviderRoutes, upstreamUrl: string | undefine
     return key ? routes[key] : undefined;
 }
 
+/** #5612: clients like Qoder Desktop rewrite model ids client-side (`/`,`.`→`-`),
+ *  so an EXACT-name lookup misses the operator's declared entry and silently
+ *  falls to defaults. This canonical key treats `/`, `.`, `_` as interchangeable
+ *  and is case-insensitive; callers use it ONLY as a guarded fallback after an
+ *  exact match fails (see resolveModelEntryOnModels). */
+export function canonicalModelKey(name: string): string {
+    return name.toLowerCase().replace(/[./_]/g, "-");
+}
+
+export interface ResolvedModelEntry {
+    entry?: ModelEntry;
+    /** Set only on a non-exact (normalized) match: the operator's declared name. */
+    declaredName?: string;
+    /** True only when found via normalization rather than an exact name match. */
+    viaNormalization?: boolean;
+}
+
+function resolveModelEntryOnModels(
+    models: Record<string, ModelEntry> | undefined,
+    model: string | undefined,
+): ResolvedModelEntry {
+    if (!model || !models) return {};
+    const exact = models[model];
+    if (exact !== undefined) return { entry: exact };
+    const canon = canonicalModelKey(model);
+    if (canon.length === 0) return {};
+    let hit: string | undefined;
+    for (const name of Object.keys(models)) {
+        if (canonicalModelKey(name) === canon) {
+            if (hit === undefined) hit = name;
+            else return {}; // two declared names share the canonical key → ambiguous
+        }
+    }
+    if (hit === undefined) return {};
+    return { entry: models[hit], declaredName: hit, viaNormalization: true };
+}
+
+/** Per-model entry resolution for a request's model id: exact providers-table
+ *  match first (unchanged behavior), then a guarded canonical-key match (#5612).
+ *  Shared by every per-model lookup (context/output/compress/benefit/keepalive)
+ *  so the renamed-id miss is fixed once, not per call site. */
+export function resolveModelEntry(
+    routes: ProviderRoutes,
+    upstreamUrl: string | undefined,
+    model: string | undefined,
+): ResolvedModelEntry {
+    return resolveModelEntryOnModels(findRoute(routes, upstreamUrl)?.models, model);
+}
+
+/** Route-shaped variant for callers that already hold the matched ProviderRoute
+ *  (billing resign, cache keepalive). Same exact→guarded-normalized contract. */
+export function resolveModelEntryOnRoute(
+    route: ProviderRoute | undefined,
+    model: string | undefined,
+): ResolvedModelEntry {
+    return resolveModelEntryOnModels(route?.models, model);
+}
+
 export function resolveConfiguredContextLimit(
     routes: ProviderRoutes,
     upstreamUrl: string | undefined,
     model: string | undefined,
 ): number | undefined {
     if (!model || !upstreamUrl) return undefined;
-    const m = findRoute(routes, upstreamUrl)?.models?.[model];
+    const m = resolveModelEntry(routes, upstreamUrl, model).entry;
     if (m?.context && m.context > 0) return m.context;
     return undefined;
 }
@@ -772,7 +849,7 @@ export function resolveConfiguredOutputLimit(
     model: string | undefined,
 ): number | undefined {
     if (!model || !upstreamUrl) return undefined;
-    const m = findRoute(routes, upstreamUrl)?.models?.[model];
+    const m = resolveModelEntry(routes, upstreamUrl, model).entry;
     if (m?.output && m.output > 0) return m.output;
     return undefined;
 }
@@ -2319,6 +2396,8 @@ const COMPRESS_SETTING_FIELDS = new Set([
     "reconcile", "streamSummary", "externalSummary",
     // #3635: summary-length caps — previously accepted nowhere, silently dropped.
     "maxSummaryLength", "minSummaryLength",
+    // Experimental fold-point carrier relocation switches (view-only).
+    "compressAtFoldPoint", "compressAtFoldPointClearThinking",
 ]);
 
 // Deduped per unique key set per process (same pattern as
@@ -3065,6 +3144,17 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
     if ("nudgeModelDecided" in obj) {
         if (typeof obj.nudgeModelDecided !== "boolean") ok = false;
         else out.nudgeModelDecided = obj.nudgeModelDecided;
+    }
+    // Experimental fold-point relocation pair (see CompressSettings docs): plain
+    // booleans; absent = off. Without this, file-tier/panel values are silently
+    // dropped by the parser while env resolution still honors them.
+    for (const key of ["compressAtFoldPoint", "compressAtFoldPointClearThinking"] as const) {
+        if (!(key in obj)) continue;
+        if (typeof obj[key] !== "boolean") {
+            ok = false;
+            continue;
+        }
+        out[key] = obj[key];
     }
     // #3211: an explicit 0 is meaningful (legacy any-pending), so validate
     // >= 0 instead of takeNumber's plain finite check.

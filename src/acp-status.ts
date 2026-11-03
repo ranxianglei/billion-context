@@ -294,6 +294,14 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
                 extra.push("");
                 extra.push(formatRanges(ranges, protectedRanges));
             }
+        } else {
+            // False-advertising fix: the tool advertises "compressible ranges"
+            // unconditionally, but the live table only exists while
+            // processTurn arms a nudge (growth >= floor). Say so instead of
+            // going silent — silence reads as "no refs exist at all" and
+            // sends first-call models into retry loops.
+            extra.push("");
+            extra.push("Compressible ranges: none offered right now — context growth has not reached the compression-nudge threshold, so nothing is worth folding yet. Continue the task; the live table appears once growth arms the nudge.");
         }
     } catch {
         // Base-only report; never fall back to a stale snapshot.

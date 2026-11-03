@@ -11,6 +11,7 @@ import { logHostEvent } from "./host-log.js";
 
 import { envMillis } from "./native-bootstrap.js";
 import { mediaBytesOfWireBody } from "./media-bytes.js";
+import * as pfChannel from "./pf-channel.js";
 import { probeLiveness, type LivenessVerdict } from "../liveness.js";
 import { BILI_PASSTHROUGH_HEADER, MIN_ASSUMED_WINDOW_TOKENS } from "../util.js";
 import { DSH_COMPACTION_MARKER_SNIFF } from "../server/dsh-compaction-guard.js";
@@ -262,7 +263,15 @@ function noteSignedDirect(url: string, scheme: string, why: string): void {
 // isV1InternalControlPlanePath) keep passing through direct. Version segment
 // is optional and unpinned (zhipuai uses `/v4/chat/completions`, bailian
 // mounts `/apps/anthropic/v1/messages`), so match on the trailing shape only.
-const MODEL_API_SUFFIX = /(?:^|\/)(?:v\d+\/)?(?:messages|chat\/completions|completions|responses|conversations)\/?$|(?:^|\/)models\/[^/:?]+:(?:streamGenerateContent|generateContent|countTokens)$|(?:^|\/)v1internal:(?:streamGenerateContent|generateContent|countTokens)$/;
+// The model id may itself carry a namespace — a gateway route (`models/hard:
+// streamGenerateContent`) or a provider prefix relayed verbatim (`models/
+// antigravity/gemini-3.8-flash:streamGenerateContent`, omp `google-generative-ai`
+// providers) — so the id accepts `/` and is bounded only by the method colon and
+// the query. Excluding it silently classified those requests as non-model
+// traffic: the interceptor forwarded them straight to the upstream, so the
+// session never reached the proxy (no window resolution, no compression, and
+// `acp_status` reporting "unknown plugin conversation") (#5593).
+const MODEL_API_SUFFIX = /(?:^|\/)(?:v\d+\/)?(?:messages|chat\/completions|completions|responses|conversations)\/?$|(?:^|\/)models\/[^:?]+:(?:streamGenerateContent|generateContent|countTokens)$|(?:^|\/)v1internal:(?:streamGenerateContent|generateContent|countTokens)$/;
 
 /** True when the URL points at a model-API endpoint worth proxying. Never
  *  true for bili's own proxy paths (`/bili/…`, `/__bili/…`) or non-HTTP(S). */
@@ -1271,6 +1280,11 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
                 }
             }
             const routedExtra = state.headersFor?.(routedTarget);
+            // #5403/#5418: the watermark handshake (x-bili-pf-count / -tail-ids)
+            // is emitted ONCE here for every routed model request — lanes differ
+            // only in where their ids are captured (pfChannel.pfCaptureIds).
+            const pfExtra = pfChannel.pfRequestHeaders(outgoingHeadersOf(input, init) ?? {});
+            const allExtra = { ...(routedExtra ?? {}), ...pfExtra };
             let target = url;
             const baked = new URL(url);
             if (replacedOrigins.has(baked.origin)) {
@@ -1280,14 +1294,17 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
                 const fresh = await readyOrigin(state);
                 if (fresh !== undefined && fresh !== baked.origin) target = `${fresh}${baked.pathname}${baked.search}`;
             }
-            const stamped = withHeaders(target === url ? input : makeTarget(target), init, routedExtra);
+            const stamped = withHeaders(target === url ? input : makeTarget(target), init, allExtra);
             try {
                 state.onDispatch?.(target, target === url ? "self" : "retry");
                 const resp = await send(stamped.input, stamped.init);
                 try {
+                    // #5403/#5418 central learn point: this request's measured
+                    // total T rides back in x-bili-pf-seq; store per-conversation.
+                    pfChannel.pfLearnStamp(outgoingHeadersOf(stamped.input, stamped.init) ?? {}, resp.status, resp.headers);
                     state.onResponse?.(url, resp, outgoingHeadersOf(stamped.input, stamped.init));
                 } catch {
-                    // observability hook only — never break the response
+                    // observability hooks only — never break the response
                 }
                 noteDispatchMode("proxy");
                 return resp;
@@ -1322,7 +1339,7 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
                     // BILLION_CONTEXT_PROXY process-wide in the omp/pi lanes).
                     const u = new URL(target);
                     const retried = `${again}${u.pathname}${u.search}`;
-                    const restamped = withHeaders(makeTarget(retried), init, routedExtra);
+                    const restamped = withHeaders(makeTarget(retried), init, allExtra);
                     state.onDispatch?.(retried, "retry");
                     const resp = await send(restamped.input, restamped.init);
                     try {
@@ -1494,7 +1511,12 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
         // MITM envs entirely (an http loopback target is never proxied).
         if (url.startsWith(`${origin}/`)) {
             state.onDispatch?.(url, "self");
-            const resp = await send(input, init);
+            // #5418: hosts that dial the proxy directly (dsh profile bundles,
+            // #809 attach probes) land here already addressed — stamp + learn
+            // here or their watermark channel silently never seeds.
+            const selfStamp = withHeaders(input, init, pfChannel.pfRequestHeaders(outgoingHeadersOf(input, init) ?? {}));
+            const resp = await send(selfStamp.input, selfStamp.init);
+            pfChannel.pfLearnStamp(outgoingHeadersOf(selfStamp.input, selfStamp.init) ?? {}, resp.status, resp.headers);
             noteDispatchMode("proxy");
             return resp;
         }
@@ -1508,10 +1530,15 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
         }
         const first = makeTarget(`${origin}/bili/${url}`);
         state.onDispatch?.(`${origin}/bili/${url}`, "rewrite");
+        // #5403/#5418: same single chokepoint as the routed branch — the
+        // rewrite path is where attach-mode hosts (and the V1 fetch patch)
+        // ride the proxy without a settings overlay.
+        const branchExtra = { ...(state.headersFor?.(url) ?? {}), ...pfChannel.pfRequestHeaders(outgoingHeadersOf(input, init) ?? {}), ...(resignExtra ?? {}) };
         try {
-            const stamped = withHeaders(first, init, resignExtra !== undefined ? { ...(state.headersFor?.(url) ?? {}), ...resignExtra } : state.headersFor?.(url));
+            const stamped = withHeaders(first, init, branchExtra);
             const resp = await send(stamped.input, stamped.init);
             try {
+                pfChannel.pfLearnStamp(outgoingHeadersOf(stamped.input, stamped.init) ?? {}, resp.status, resp.headers);
                 state.onResponse?.(url, resp, outgoingHeadersOf(stamped.input, stamped.init));
             } catch {
                 // observability hook only — never break the response
@@ -1531,9 +1558,10 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
                 if (again !== undefined) {
                     const retried = makeTarget(`${again}/bili/${url}`);
                     state.onDispatch?.(`${again}/bili/${url}`, "retry");
-                    const stamped = withHeaders(retried, init, resignExtra !== undefined ? { ...(state.headersFor?.(url) ?? {}), ...resignExtra } : state.headersFor?.(url));
+                    const stamped = withHeaders(retried, init, branchExtra);
                     const resp = await send(stamped.input, stamped.init);
                     try {
+                        pfChannel.pfLearnStamp(outgoingHeadersOf(stamped.input, stamped.init) ?? {}, resp.status, resp.headers);
                         state.onResponse?.(url, resp, outgoingHeadersOf(stamped.input, stamped.init));
                     } catch {
                         // observability hook only — never break the response
