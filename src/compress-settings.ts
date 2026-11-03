@@ -1,6 +1,6 @@
 import { DEFAULT_ABSORB_CONFIG, DEFAULT_CCR_CONFIG, defaultPrompts, resolvePrompts, createPackResolver, builtinSource, createDirPackSource, isValidPackName, type AbsorbConfig, type Config, type CcrConfig, type Pack, type PackSurface, type Prompts } from "acp-kernel";
 import * as path from "node:path";
-import { findRoute, type CompressSettings, type NamedProviderRecipe, type ProviderRoutes } from "./config.js";
+import { findRoute, resolveModelEntryOnRoute, type CompressSettings, type NamedProviderRecipe, type ProviderRoutes } from "./config.js";
 import { configDir } from "./paths.js";
 import { log as loggerLog } from "./logger.js";
 import { expandExternalSummaryChainTolerant, type ExternalSummarySettings } from "./external-summary-settings.js";
@@ -131,7 +131,7 @@ export function resolveCompress(
     global?: CompressSettings,
 ): CompressSettings {
     const route = findRoute(routes, upstreamUrl);
-    return mergeCompress(global, route?.compress, model ? route?.models?.[model]?.compress : undefined);
+    return mergeCompress(global, route?.compress, resolveModelEntryOnRoute(route, model).entry?.compress);
 }
 
 let warnedPromptsRisk = false;
