@@ -538,3 +538,11 @@ entries:
     group: envonly
     desc_en: "Native-identity observation (#5573 M1): JSON object of per-client profile rows merged over the built-in evidence table (src/server/native-identity-profiles.ts) — entries ADD new rows or REPLACE a built-in row by name, never remove one (the built-ins are the floor). Same shape as a built-in row (name, matchHeaders, sessionHeaders, msgidHeaders, compactionEdgeHeader, countPatterns, compactionPrefixes, ...). Malformed JSON fails open silently (built-ins only). Only meaningful while rollout.features.nativeIdentityObservation is enabled; feeds no decision."
     desc_zh: "原生身份观测（#5573 M1）：JSON 对象，按内置证据表（src/server/native-identity-profiles.ts）同形提供客户端画像行——按名**新增**或**整体替换**内置行，绝不删除（内置为底）。字段形如内置行（name、matchHeaders、sessionHeaders、msgidHeaders、compactionEdgeHeader、countPatterns、compactionPrefixes……）。畸形 JSON 静默失效（只用内置表）。仅在 rollout.features.nativeIdentityObservation 开启时有意义；不喂任何决策。"
+  - key: BILI_PF_V6_REWRITE_STRICT
+    type: boolean
+    default: "unset (off)"
+    kind: env-only
+    audience: user
+    group: envonly
+    desc_en: "Set `1` to CREDIT watermark-v6 misses toward the five-miss breaker instead of the default SELF-HEALING uncredited legacy turn, per lane: in the MSGID lane (`watermarkV6MsgId`) compaction-class shrinks against the stored frontier (`v6m-compact`); in the CANONICAL lane (`watermarkCanonicalV6`) host-side content rewrites (chain breaks: chain-not-started / seam-too-short) \u2014 for exotic hosts whose thrash would otherwise ride free legacy turns forever. (The msgid lane\u2019s `v6m-window-system` verdict is ALWAYS credited, independent of this switch.) Default unset/off; pinned by tests/fastpath-pf-msgid.test.ts and tests/fastpath-v6-canonical.test.ts."
+    desc_zh: "设 `1` 把水位 v6 失配**计名**进五次失配熔断器(替代默认的自愈型不计名 legacy 回合),按车道区分:msgid 车道(`watermarkV6MsgId`)计名对存储前沿的压缩类收缩(`v6m-compact`);规范车道(`watermarkCanonicalV6`)计名宿主侧内容改写(链断裂:chain-not-started / seam-too-short)——专为疯狂抖动的怪异宿主准备(否则它们将永远免费搭乘自愈回合)。msgid 车道的 `v6m-window-system`(窗口头部 system)恒计名,不受此开关影响。默认未设置/关闭;由 tests/fastpath-pf-msgid.test.ts 与 tests/fastpath-v6-canonical.test.ts 钉死。"
