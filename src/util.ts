@@ -662,6 +662,48 @@ export function hardenOpenaiAssistantContent<T extends { role: string }>(message
     });
 }
 
+// #5595: a fork child whose parent held multimodal/thinking content cannot be
+// textually compared, so adoption degrades to a full raw-history rebuild whose
+// unrecovered tool-call cores serialize as empty `function.arguments` — a hard
+// provider 400 that compaction/preflight cannot rescue (it is a VALIDATION
+// failure, not a size failure), bricking the child forever. Enforce the
+// provider contract at the outbound boundary we own, mirroring
+// MALFORMED_PROXY_TOOL_ARGS_REPLAY (src/loop/core.ts, the model-produced case).
+// Wire fidelity holds: valid arguments pass byte-exact; only empty/non-object
+// JSON is swapped for a parseable placeholder.
+export function isValidToolCallArguments(value: unknown): boolean {
+    if (typeof value !== "string") return false;
+    try {
+        const parsed: unknown = JSON.parse(value);
+        return parsed !== null && typeof parsed === "object" && !Array.isArray(parsed);
+    } catch {
+        return false;
+    }
+}
+
+export const EMPTY_TOOL_CALLS_ARGUMENTS_PLACEHOLDER = '{"_bili":"tool-call arguments were empty or unrecoverable on the wire; replaced with a valid placeholder so the request stays parseable — see the tool result for the original call"}';
+
+/** #5595 OpenAI chat wire: replace only invalid tool_calls[].function.arguments; returns the count. */
+export function hardenOpenaiToolCallArguments<T extends { role: string }>(messages: T[]): { messages: T[]; replaced: number } {
+    let replaced = 0;
+    const out = messages.map((m) => {
+        const tcs = (m as { tool_calls?: unknown }).tool_calls;
+        if (!Array.isArray(tcs)) return m;
+        let changed = false;
+        const next = tcs.map((tc) => {
+            const fn = (tc as { function?: { arguments?: unknown } }).function;
+            if (!fn || typeof fn !== "object") return tc;
+            if (isValidToolCallArguments(fn.arguments)) return tc;
+            changed = true;
+            replaced += 1;
+            return { ...tc, function: { ...fn, arguments: EMPTY_TOOL_CALLS_ARGUMENTS_PLACEHOLDER } };
+        });
+        if (!changed) return m;
+        return { ...m, tool_calls: next };
+    });
+    return { messages: out, replaced };
+}
+
 // #1876: rebuild the outbound Anthropic `system` by APPENDING bili's added
 // text (the compress prompt) instead of merging it into one block. The kernel's
 // buildSystem(flattenedText, original) collapses a client's N-block system into

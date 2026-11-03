@@ -6,7 +6,7 @@ import { composeStreamFilters, createBiliArtifactFilter, createIdentityStreamFil
 import { degenerateTurnWarning } from "../degenerate-turn.js";
 import { log as loggerLog } from "../logger.js";
 import { normalizeSseLineEndings, finalizeSseLineEndings } from "../sse-util.js";
-import { hardenOpenaiAssistantContent, systemToUser } from "../util.js";
+import { hardenOpenaiAssistantContent, hardenOpenaiToolCallArguments, systemToUser } from "../util.js";
 
 import type {
     CompressLoopAdapter,
@@ -244,7 +244,9 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
             // #4166: re-voice ONLY bili's own summary carriers; client-origin
             // mid system/developer cores re-emit verbatim (rawOpenaiMessage
             // sidecar) and must match the prepare lane byte-for-byte.
-            const messages = hardenOpenaiAssistantContent(coreToOpenai(systemToUser(coreMessages, (m) => isRenderedSummaryMessage(m))));
+            const argsHardened = hardenOpenaiToolCallArguments(coreToOpenai(systemToUser(coreMessages, (m) => isRenderedSummaryMessage(m))));
+            if (argsHardened.replaced > 0) loggerLog("warn", `[acp-openai] rebuilt ${argsHardened.replaced} empty/unrecoverable tool-call argument(s) with a parseable placeholder so the request stays sendable (#5595)`);
+            const messages = hardenOpenaiAssistantContent(argsHardened.messages);
             const withSys = injectOpenaiSystem(messages, [clientSystem, systemPrompt].filter((p): p is string => typeof p === "string" && p.length > 0));
             const withNotes = notes && notes.length > 0
                 ? [...withSys, ...notes.map((text) => ({ role: "user" as const, content: text }))]
