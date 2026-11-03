@@ -1897,12 +1897,32 @@ export function settleUsageReport(
     // #4805 is structurally blind).
     const establishedScale = (session.stats.lastInputTokens ?? 0) + (session.stats.compressCreditTokens ?? 0);
     if (s.total > 0 && establishedScale > 0 && s.total < NON_MAIN_USAGE_RATIO * establishedScale) {
-        session.stats.inputTokens += s.total;
-        // #4899 parity: the USD ledger bills on this path too — the tokens
-        // were really spent even though no decision state moves.
-        billInputUsage(session, { total: s.total, cached: s.reportedCached, creation: s.creation });
-        loggerLog("info", `[${session.id}] [acp-usage] non-main sample input=${s.total} (<${Math.round(NON_MAIN_USAGE_RATIO * 100)}% of established ${Math.round(establishedScale)}) — decision state kept, billing only (#4425)`);
-        return;
+        // #4504 (CI follow-up to #4425): sub-scale w.r.t. the incumbent is not,
+        // by itself, aux-shaped. A MAIN turn whose payload shrank — a model
+        // switch onto a smaller window, a preflight fold off a poisoned or armed
+        // incumbent (#1492 self-heal, preflight-compress e2e) — legitimately
+        // bills far below the previous measurement, and those contracts pin
+        // that its real report overwrites such incumbents. The discriminator is
+        // whether the sample matches the prepared body it bills: the pending k̂
+        // pair noted at prepare time on the SAME route. An aux slip's own pair
+        // was refused by noteLocalTextEstimate's clobber guard (body < 1/10 of
+        // the main pair), so its sample sits far outside the protected main
+        // pair's plausibility band; a same-route sample inside the band is this
+        // request's own report and takes the normal settle path below.
+        const pair = session.stats.lastLocalTextEstimate;
+        const pairOrigin = normalizeUpstreamOrigin(session.stats.lastLocalTextEstimateOrigin);
+        const sampleOrigin = normalizeUpstreamOrigin(s.upstream);
+        const consistentWithOwnBody = pair !== undefined && pair >= CALIBRATION_MIN_ESTIMATE
+            && pairOrigin !== undefined && sampleOrigin !== undefined && pairOrigin === sampleOrigin
+            && s.total >= CALIBRATION_SAMPLE_MIN * pair && s.total <= CALIBRATION_SAMPLE_MAX * pair;
+        if (!consistentWithOwnBody) {
+            session.stats.inputTokens += s.total;
+            // #4899 parity: the USD ledger bills on this path too — the tokens
+            // were really spent even though no decision state moves.
+            billInputUsage(session, { total: s.total, cached: s.reportedCached, creation: s.creation });
+            loggerLog("info", `[${session.id}] [acp-usage] non-main sample input=${s.total} (<${Math.round(NON_MAIN_USAGE_RATIO * 100)}% of established ${Math.round(establishedScale)}) — decision state kept, billing only (#4425)`);
+            return;
+        }
     }
     // #793: a zero-total sample carries no information (gateway placeholder or
     // relay echo) — it must not clobber the last trusted lastInputTokens.
