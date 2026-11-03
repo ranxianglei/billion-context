@@ -60,15 +60,40 @@
       },
       {
         "name": "acp_status",
-        "description": "Show context usage and compressible ranges. No args = overview. Use to find what to compress next.",
+        "description": "Show context usage and compressible ranges. No args = overview; pass scope/view/tool/sort/limit/archiveDetail for targeted listings.",
         "input_schema": {
           "type": "object",
-          "properties": {}
+          "properties": {
+            "scope": {
+              "type": "string",
+              "description": "\"uncompressed\": history outside active blocks; \"compressed\": block ledger; omit = default overview"
+            },
+            "view": {
+              "type": "string",
+              "description": "\"messages\" for a per-message listing; \"ranges\" is the default"
+            },
+            "tool": {
+              "type": "string",
+              "description": "With view:\"messages\": only list results of this tool name"
+            },
+            "sort": {
+              "type": "string",
+              "description": "With view:\"messages\": order by \"size\", \"time\", \"tool\", or \"age\""
+            },
+            "limit": {
+              "type": "number",
+              "description": "Max entries to list"
+            },
+            "archiveDetail": {
+              "type": "boolean",
+              "description": "List pre-compaction archived blocks per-id instead of grouped by reason"
+            }
+          }
         }
       },
       {
         "name": "acp_cache",
-        "description": "Prompt-cache reconciliation: grand ledger (total input/cached/output, overall hit rate) with every request's miss split into new content / compression re-pay / upstream-ttl-or-client-rewrite (unattributed stable-prefix misses), plus per-fold economics (breakeven turns vs measured cadence). Defaults to a compact summary (totals + verdicts + anomalies only); pass detail=\"full\" for every fold and line item. Read-only. Call when asked about cache hits, cache invalidation, or what compression costs.",
+        "description": "Prompt-cache reconciliation: grand ledger (total input/cached/output, overall hit rate) with every request's miss split into new content / compression re-pay / upstream-ttl-or-client-rewrite (unattributed stable-prefix misses), plus per-fold economics (breakeven turns vs measured cadence). Defaults to a compact summary (totals + verdicts + anomalies only); pass detail=\"full\" for every fold and its line-item breakdown. Read-only. Call when asked about cache hits, cache invalidation, or what compression costs.",
         "input_schema": {
           "type": "object",
           "properties": {
@@ -78,7 +103,7 @@
                 "summary",
                 "full"
               ],
-              "description": "\"summary\" (default): totals, verdicts, notable folds, anomalous requests only. \"full\": every retained fold and line item."
+              "description": "\"summary\" (default): totals, verdicts, notable folds, anomalous requests only. \"full\": every retained fold and its line-item breakdown (most-recent window — the output states the cap)."
             }
           }
         }
@@ -155,10 +180,35 @@
         "type": "function",
         "function": {
           "name": "acp_status",
-          "description": "Show context usage and compressible ranges. No args = overview. Use to find what to compress next.",
+          "description": "Show context usage and compressible ranges. No args = overview; pass scope/view/tool/sort/limit/archiveDetail for targeted listings.",
           "parameters": {
             "type": "object",
-            "properties": {}
+            "properties": {
+              "scope": {
+                "type": "string",
+                "description": "\"uncompressed\": history outside active blocks; \"compressed\": block ledger; omit = default overview"
+              },
+              "view": {
+                "type": "string",
+                "description": "\"messages\" for a per-message listing; \"ranges\" is the default"
+              },
+              "tool": {
+                "type": "string",
+                "description": "With view:\"messages\": only list results of this tool name"
+              },
+              "sort": {
+                "type": "string",
+                "description": "With view:\"messages\": order by \"size\", \"time\", \"tool\", or \"age\""
+              },
+              "limit": {
+                "type": "number",
+                "description": "Max entries to list"
+              },
+              "archiveDetail": {
+                "type": "boolean",
+                "description": "List pre-compaction archived blocks per-id instead of grouped by reason"
+              }
+            }
           }
         }
       },
@@ -166,7 +216,7 @@
         "type": "function",
         "function": {
           "name": "acp_cache",
-          "description": "Prompt-cache reconciliation: grand ledger (total input/cached/output, overall hit rate) with every request's miss split into new content / compression re-pay / upstream-ttl-or-client-rewrite (unattributed stable-prefix misses), plus per-fold economics (breakeven turns vs measured cadence). Defaults to a compact summary (totals + verdicts + anomalies only); pass detail=\"full\" for every fold and line item. Read-only. Call when asked about cache hits, cache invalidation, or what compression costs.",
+          "description": "Prompt-cache reconciliation: grand ledger (total input/cached/output, overall hit rate) with every request's miss split into new content / compression re-pay / upstream-ttl-or-client-rewrite (unattributed stable-prefix misses), plus per-fold economics (breakeven turns vs measured cadence). Defaults to a compact summary (totals + verdicts + anomalies only); pass detail=\"full\" for every fold and its line-item breakdown. Read-only. Call when asked about cache hits, cache invalidation, or what compression costs.",
           "parameters": {
             "type": "object",
             "properties": {
@@ -176,7 +226,7 @@
                   "summary",
                   "full"
                 ],
-                "description": "\"summary\" (default): totals, verdicts, notable folds, anomalous requests only. \"full\": every retained fold and line item."
+                "description": "\"summary\" (default): totals, verdicts, notable folds, anomalous requests only. \"full\": every retained fold and its line-item breakdown (most-recent window — the output states the cap)."
               }
             }
           }
@@ -247,16 +297,41 @@
       {
         "type": "function",
         "name": "acp_status",
-        "description": "Show context usage and compressible ranges. No args = overview. Use to find what to compress next.",
+        "description": "Show context usage and compressible ranges. No args = overview; pass scope/view/tool/sort/limit/archiveDetail for targeted listings.",
         "parameters": {
           "type": "object",
-          "properties": {}
+          "properties": {
+            "scope": {
+              "type": "string",
+              "description": "\"uncompressed\": history outside active blocks; \"compressed\": block ledger; omit = default overview"
+            },
+            "view": {
+              "type": "string",
+              "description": "\"messages\" for a per-message listing; \"ranges\" is the default"
+            },
+            "tool": {
+              "type": "string",
+              "description": "With view:\"messages\": only list results of this tool name"
+            },
+            "sort": {
+              "type": "string",
+              "description": "With view:\"messages\": order by \"size\", \"time\", \"tool\", or \"age\""
+            },
+            "limit": {
+              "type": "number",
+              "description": "Max entries to list"
+            },
+            "archiveDetail": {
+              "type": "boolean",
+              "description": "List pre-compaction archived blocks per-id instead of grouped by reason"
+            }
+          }
         }
       },
       {
         "type": "function",
         "name": "acp_cache",
-        "description": "Prompt-cache reconciliation: grand ledger (total input/cached/output, overall hit rate) with every request's miss split into new content / compression re-pay / upstream-ttl-or-client-rewrite (unattributed stable-prefix misses), plus per-fold economics (breakeven turns vs measured cadence). Defaults to a compact summary (totals + verdicts + anomalies only); pass detail=\"full\" for every fold and line item. Read-only. Call when asked about cache hits, cache invalidation, or what compression costs.",
+        "description": "Prompt-cache reconciliation: grand ledger (total input/cached/output, overall hit rate) with every request's miss split into new content / compression re-pay / upstream-ttl-or-client-rewrite (unattributed stable-prefix misses), plus per-fold economics (breakeven turns vs measured cadence). Defaults to a compact summary (totals + verdicts + anomalies only); pass detail=\"full\" for every fold and its line-item breakdown. Read-only. Call when asked about cache hits, cache invalidation, or what compression costs.",
         "parameters": {
           "type": "object",
           "properties": {
@@ -266,7 +341,7 @@
                 "summary",
                 "full"
               ],
-              "description": "\"summary\" (default): totals, verdicts, notable folds, anomalous requests only. \"full\": every retained fold and line item."
+              "description": "\"summary\" (default): totals, verdicts, notable folds, anomalous requests only. \"full\": every retained fold and its line-item breakdown (most-recent window — the output states the cap)."
             }
           }
         }
@@ -322,16 +397,41 @@
       {
         "type": "function",
         "name": "acp_status",
-        "description": "Show context usage and compressible ranges. No args = overview. Use to find what to compress next.",
+        "description": "Show context usage and compressible ranges. No args = overview; pass scope/view/tool/sort/limit/archiveDetail for targeted listings.",
         "parameters": {
           "type": "object",
-          "properties": {}
+          "properties": {
+            "scope": {
+              "type": "string",
+              "description": "\"uncompressed\": history outside active blocks; \"compressed\": block ledger; omit = default overview"
+            },
+            "view": {
+              "type": "string",
+              "description": "\"messages\" for a per-message listing; \"ranges\" is the default"
+            },
+            "tool": {
+              "type": "string",
+              "description": "With view:\"messages\": only list results of this tool name"
+            },
+            "sort": {
+              "type": "string",
+              "description": "With view:\"messages\": order by \"size\", \"time\", \"tool\", or \"age\""
+            },
+            "limit": {
+              "type": "number",
+              "description": "Max entries to list"
+            },
+            "archiveDetail": {
+              "type": "boolean",
+              "description": "List pre-compaction archived blocks per-id instead of grouped by reason"
+            }
+          }
         }
       },
       {
         "type": "function",
         "name": "acp_cache",
-        "description": "Prompt-cache reconciliation: grand ledger (total input/cached/output, overall hit rate) with every request's miss split into new content / compression re-pay / upstream-ttl-or-client-rewrite (unattributed stable-prefix misses), plus per-fold economics (breakeven turns vs measured cadence). Defaults to a compact summary (totals + verdicts + anomalies only); pass detail=\"full\" for every fold and line item. Read-only. Call when asked about cache hits, cache invalidation, or what compression costs.",
+        "description": "Prompt-cache reconciliation: grand ledger (total input/cached/output, overall hit rate) with every request's miss split into new content / compression re-pay / upstream-ttl-or-client-rewrite (unattributed stable-prefix misses), plus per-fold economics (breakeven turns vs measured cadence). Defaults to a compact summary (totals + verdicts + anomalies only); pass detail=\"full\" for every fold and its line-item breakdown. Read-only. Call when asked about cache hits, cache invalidation, or what compression costs.",
         "parameters": {
           "type": "object",
           "properties": {
@@ -341,7 +441,7 @@
                 "summary",
                 "full"
               ],
-              "description": "\"summary\" (default): totals, verdicts, notable folds, anomalous requests only. \"full\": every retained fold and line item."
+              "description": "\"summary\" (default): totals, verdicts, notable folds, anomalous requests only. \"full\": every retained fold and its line-item breakdown (most-recent window — the output states the cap)."
             }
           }
         }
@@ -407,10 +507,52 @@
       },
       {
         "name": "acp_status",
-        "description": "Show context usage and compressible ranges. No args = overview. Use to find what to compress next.",
+        "description": "Show context usage and compressible ranges. No args = overview; pass scope/view/tool/sort/limit/archiveDetail for targeted listings.",
         "parameters": {
           "type": "object",
-          "properties": {}
+          "properties": {
+            "scope": {
+              "type": "string",
+              "description": "\"uncompressed\": history outside active blocks; \"compressed\": block ledger; omit = default overview"
+            },
+            "view": {
+              "type": "string",
+              "description": "\"messages\" for a per-message listing; \"ranges\" is the default"
+            },
+            "tool": {
+              "type": "string",
+              "description": "With view:\"messages\": only list results of this tool name"
+            },
+            "sort": {
+              "type": "string",
+              "description": "With view:\"messages\": order by \"size\", \"time\", \"tool\", or \"age\""
+            },
+            "limit": {
+              "type": "number",
+              "description": "Max entries to list"
+            },
+            "archiveDetail": {
+              "type": "boolean",
+              "description": "List pre-compaction archived blocks per-id instead of grouped by reason"
+            }
+          }
+        }
+      },
+      {
+        "name": "acp_cache",
+        "description": "Prompt-cache reconciliation: grand ledger (total input/cached/output, overall hit rate) with every request's miss split into new content / compression re-pay / upstream-ttl-or-client-rewrite (unattributed stable-prefix misses), plus per-fold economics (breakeven turns vs measured cadence). Defaults to a compact summary (totals + verdicts + anomalies only); pass detail=\"full\" for every fold and its line-item breakdown. Read-only. Call when asked about cache hits, cache invalidation, or what compression costs.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "detail": {
+              "type": "string",
+              "enum": [
+                "summary",
+                "full"
+              ],
+              "description": "\"summary\" (default): totals, verdicts, notable folds, anomalous requests only. \"full\": every retained fold and its line-item breakdown (most-recent window — the output states the cap)."
+            }
+          }
         }
       }
     ]
@@ -658,43 +800,143 @@
     },
     "ACP_STATUS_TOOL": {
       "name": "acp_status",
-      "description": "Show context usage and compressible ranges. No args = overview. Use to find what to compress next.",
+      "description": "Show context usage and compressible ranges. No args = overview; pass scope/view/tool/sort/limit/archiveDetail for targeted listings.",
       "input_schema": {
         "type": "object",
-        "properties": {}
+        "properties": {
+          "scope": {
+            "type": "string",
+            "description": "\"uncompressed\": history outside active blocks; \"compressed\": block ledger; omit = default overview"
+          },
+          "view": {
+            "type": "string",
+            "description": "\"messages\" for a per-message listing; \"ranges\" is the default"
+          },
+          "tool": {
+            "type": "string",
+            "description": "With view:\"messages\": only list results of this tool name"
+          },
+          "sort": {
+            "type": "string",
+            "description": "With view:\"messages\": order by \"size\", \"time\", \"tool\", or \"age\""
+          },
+          "limit": {
+            "type": "number",
+            "description": "Max entries to list"
+          },
+          "archiveDetail": {
+            "type": "boolean",
+            "description": "List pre-compaction archived blocks per-id instead of grouped by reason"
+          }
+        }
       }
     },
     "ACP_STATUS_TOOL_OPENAI": {
       "type": "function",
       "function": {
         "name": "acp_status",
-        "description": "Show context usage and compressible ranges. No args = overview. Use to find what to compress next.",
+        "description": "Show context usage and compressible ranges. No args = overview; pass scope/view/tool/sort/limit/archiveDetail for targeted listings.",
         "parameters": {
           "type": "object",
-          "properties": {}
+          "properties": {
+            "scope": {
+              "type": "string",
+              "description": "\"uncompressed\": history outside active blocks; \"compressed\": block ledger; omit = default overview"
+            },
+            "view": {
+              "type": "string",
+              "description": "\"messages\" for a per-message listing; \"ranges\" is the default"
+            },
+            "tool": {
+              "type": "string",
+              "description": "With view:\"messages\": only list results of this tool name"
+            },
+            "sort": {
+              "type": "string",
+              "description": "With view:\"messages\": order by \"size\", \"time\", \"tool\", or \"age\""
+            },
+            "limit": {
+              "type": "number",
+              "description": "Max entries to list"
+            },
+            "archiveDetail": {
+              "type": "boolean",
+              "description": "List pre-compaction archived blocks per-id instead of grouped by reason"
+            }
+          }
         }
       }
     },
     "ACP_STATUS_TOOL_RESPONSES": {
       "type": "function",
       "name": "acp_status",
-      "description": "Show context usage and compressible ranges. No args = overview. Use to find what to compress next.",
+      "description": "Show context usage and compressible ranges. No args = overview; pass scope/view/tool/sort/limit/archiveDetail for targeted listings.",
       "parameters": {
         "type": "object",
-        "properties": {}
+        "properties": {
+          "scope": {
+            "type": "string",
+            "description": "\"uncompressed\": history outside active blocks; \"compressed\": block ledger; omit = default overview"
+          },
+          "view": {
+            "type": "string",
+            "description": "\"messages\" for a per-message listing; \"ranges\" is the default"
+          },
+          "tool": {
+            "type": "string",
+            "description": "With view:\"messages\": only list results of this tool name"
+          },
+          "sort": {
+            "type": "string",
+            "description": "With view:\"messages\": order by \"size\", \"time\", \"tool\", or \"age\""
+          },
+          "limit": {
+            "type": "number",
+            "description": "Max entries to list"
+          },
+          "archiveDetail": {
+            "type": "boolean",
+            "description": "List pre-compaction archived blocks per-id instead of grouped by reason"
+          }
+        }
       }
     },
     "ACP_STATUS_TOOL_GOOGLE": {
       "name": "acp_status",
-      "description": "Show context usage and compressible ranges. No args = overview. Use to find what to compress next.",
+      "description": "Show context usage and compressible ranges. No args = overview; pass scope/view/tool/sort/limit/archiveDetail for targeted listings.",
       "parameters": {
         "type": "object",
-        "properties": {}
+        "properties": {
+          "scope": {
+            "type": "string",
+            "description": "\"uncompressed\": history outside active blocks; \"compressed\": block ledger; omit = default overview"
+          },
+          "view": {
+            "type": "string",
+            "description": "\"messages\" for a per-message listing; \"ranges\" is the default"
+          },
+          "tool": {
+            "type": "string",
+            "description": "With view:\"messages\": only list results of this tool name"
+          },
+          "sort": {
+            "type": "string",
+            "description": "With view:\"messages\": order by \"size\", \"time\", \"tool\", or \"age\""
+          },
+          "limit": {
+            "type": "number",
+            "description": "Max entries to list"
+          },
+          "archiveDetail": {
+            "type": "boolean",
+            "description": "List pre-compaction archived blocks per-id instead of grouped by reason"
+          }
+        }
       }
     },
     "ACP_CACHE_TOOL": {
       "name": "acp_cache",
-      "description": "Prompt-cache reconciliation: grand ledger (total input/cached/output, overall hit rate) with every request's miss split into new content / compression re-pay / upstream-ttl-or-client-rewrite (unattributed stable-prefix misses), plus per-fold economics (breakeven turns vs measured cadence). Defaults to a compact summary (totals + verdicts + anomalies only); pass detail=\"full\" for every fold and line item. Read-only. Call when asked about cache hits, cache invalidation, or what compression costs.",
+      "description": "Prompt-cache reconciliation: grand ledger (total input/cached/output, overall hit rate) with every request's miss split into new content / compression re-pay / upstream-ttl-or-client-rewrite (unattributed stable-prefix misses), plus per-fold economics (breakeven turns vs measured cadence). Defaults to a compact summary (totals + verdicts + anomalies only); pass detail=\"full\" for every fold and its line-item breakdown. Read-only. Call when asked about cache hits, cache invalidation, or what compression costs.",
       "input_schema": {
         "type": "object",
         "properties": {
@@ -704,7 +946,7 @@
               "summary",
               "full"
             ],
-            "description": "\"summary\" (default): totals, verdicts, notable folds, anomalous requests only. \"full\": every retained fold and line item."
+            "description": "\"summary\" (default): totals, verdicts, notable folds, anomalous requests only. \"full\": every retained fold and its line-item breakdown (most-recent window — the output states the cap)."
           }
         }
       }
@@ -713,7 +955,7 @@
       "type": "function",
       "function": {
         "name": "acp_cache",
-        "description": "Prompt-cache reconciliation: grand ledger (total input/cached/output, overall hit rate) with every request's miss split into new content / compression re-pay / upstream-ttl-or-client-rewrite (unattributed stable-prefix misses), plus per-fold economics (breakeven turns vs measured cadence). Defaults to a compact summary (totals + verdicts + anomalies only); pass detail=\"full\" for every fold and line item. Read-only. Call when asked about cache hits, cache invalidation, or what compression costs.",
+        "description": "Prompt-cache reconciliation: grand ledger (total input/cached/output, overall hit rate) with every request's miss split into new content / compression re-pay / upstream-ttl-or-client-rewrite (unattributed stable-prefix misses), plus per-fold economics (breakeven turns vs measured cadence). Defaults to a compact summary (totals + verdicts + anomalies only); pass detail=\"full\" for every fold and its line-item breakdown. Read-only. Call when asked about cache hits, cache invalidation, or what compression costs.",
         "parameters": {
           "type": "object",
           "properties": {
@@ -723,7 +965,7 @@
                 "summary",
                 "full"
               ],
-              "description": "\"summary\" (default): totals, verdicts, notable folds, anomalous requests only. \"full\": every retained fold and line item."
+              "description": "\"summary\" (default): totals, verdicts, notable folds, anomalous requests only. \"full\": every retained fold and its line-item breakdown (most-recent window — the output states the cap)."
             }
           }
         }
@@ -732,7 +974,7 @@
     "ACP_CACHE_TOOL_RESPONSES": {
       "type": "function",
       "name": "acp_cache",
-      "description": "Prompt-cache reconciliation: grand ledger (total input/cached/output, overall hit rate) with every request's miss split into new content / compression re-pay / upstream-ttl-or-client-rewrite (unattributed stable-prefix misses), plus per-fold economics (breakeven turns vs measured cadence). Defaults to a compact summary (totals + verdicts + anomalies only); pass detail=\"full\" for every fold and line item. Read-only. Call when asked about cache hits, cache invalidation, or what compression costs.",
+      "description": "Prompt-cache reconciliation: grand ledger (total input/cached/output, overall hit rate) with every request's miss split into new content / compression re-pay / upstream-ttl-or-client-rewrite (unattributed stable-prefix misses), plus per-fold economics (breakeven turns vs measured cadence). Defaults to a compact summary (totals + verdicts + anomalies only); pass detail=\"full\" for every fold and its line-item breakdown. Read-only. Call when asked about cache hits, cache invalidation, or what compression costs.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -742,7 +984,7 @@
               "summary",
               "full"
             ],
-            "description": "\"summary\" (default): totals, verdicts, notable folds, anomalous requests only. \"full\": every retained fold and line item."
+            "description": "\"summary\" (default): totals, verdicts, notable folds, anomalous requests only. \"full\": every retained fold and its line-item breakdown (most-recent window — the output states the cap)."
           }
         }
       }
@@ -751,7 +993,7 @@
   "optional": {
     "ABSORB_TOOL": {
       "name": "absorb",
-      "description": "Distill a tool result into a compact summary you write. REQUIRED immediately after a tool result ends with an [ACP absorb] instruction: pass its ref and the distilled essentials (outcome, key values, paths:lines, errors, decisions). The original output is then removed from context; your summary is the durable record.",
+      "description": "Distill a tool result into a compact summary you write. REQUIRED immediately after a tool result ends with an [ACP absorb] instruction: pass its ref and the distilled essentials (outcome, key values, paths:lines, errors, decisions). The original output is then removed from context; your summary is the durable record. If nothing worth keeping survives, say so in the summary (e.g. '(nothing needed)') — that discards the output cleanly.",
       "input_schema": {
         "type": "object",
         "properties": {
@@ -774,7 +1016,7 @@
       "type": "function",
       "function": {
         "name": "absorb",
-        "description": "Distill a tool result into a compact summary you write. REQUIRED immediately after a tool result ends with an [ACP absorb] instruction: pass its ref and the distilled essentials (outcome, key values, paths:lines, errors, decisions). The original output is then removed from context; your summary is the durable record.",
+        "description": "Distill a tool result into a compact summary you write. REQUIRED immediately after a tool result ends with an [ACP absorb] instruction: pass its ref and the distilled essentials (outcome, key values, paths:lines, errors, decisions). The original output is then removed from context; your summary is the durable record. If nothing worth keeping survives, say so in the summary (e.g. '(nothing needed)') — that discards the output cleanly.",
         "parameters": {
           "type": "object",
           "properties": {
@@ -796,7 +1038,7 @@
     },
     "ABSORB_TOOL_GOOGLE": {
       "name": "absorb",
-      "description": "Distill a tool result into a compact summary you write. REQUIRED immediately after a tool result ends with an [ACP absorb] instruction: pass its ref and the distilled essentials (outcome, key values, paths:lines, errors, decisions). The original output is then removed from context; your summary is the durable record.",
+      "description": "Distill a tool result into a compact summary you write. REQUIRED immediately after a tool result ends with an [ACP absorb] instruction: pass its ref and the distilled essentials (outcome, key values, paths:lines, errors, decisions). The original output is then removed from context; your summary is the durable record. If nothing worth keeping survives, say so in the summary (e.g. '(nothing needed)') — that discards the output cleanly.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -817,13 +1059,13 @@
     },
     "RETRIEVE_TOOL": {
       "name": "acp_retrieve",
-      "description": "Retrieve the full original text of a stored tool result. REQUIRED when you need details from a placeholder that starts with 📦 [acp-stored #mNNNNN: pass its ref. Returns the exact original text; the placeholder stays in context. Unknown refs return not-found.",
+      "description": "Retrieve the full original text of a stored tool result. REQUIRED when you need details from a placeholder that starts with 📦 [acp-stored #mNNNNN: pass its ref. Returns the exact original text inline — very large originals are exported to a file instead, and the result then carries the exported file's path. The placeholder stays in context. Unknown refs return not-found.",
       "input_schema": {
         "type": "object",
         "properties": {
           "ref": {
             "type": "string",
-            "description": "mNNNNN ref shown in the 📦 [acp-stored placeholder"
+            "description": "mNNNNN ref shown in the 📦 [acp-stored …] placeholder"
           }
         },
         "required": [
@@ -835,13 +1077,13 @@
       "type": "function",
       "function": {
         "name": "acp_retrieve",
-        "description": "Retrieve the full original text of a stored tool result. REQUIRED when you need details from a placeholder that starts with 📦 [acp-stored #mNNNNN: pass its ref. Returns the exact original text; the placeholder stays in context. Unknown refs return not-found.",
+        "description": "Retrieve the full original text of a stored tool result. REQUIRED when you need details from a placeholder that starts with 📦 [acp-stored #mNNNNN: pass its ref. Returns the exact original text inline — very large originals are exported to a file instead, and the result then carries the exported file's path. The placeholder stays in context. Unknown refs return not-found.",
         "parameters": {
           "type": "object",
           "properties": {
             "ref": {
               "type": "string",
-              "description": "mNNNNN ref shown in the 📦 [acp-stored placeholder"
+              "description": "mNNNNN ref shown in the 📦 [acp-stored …] placeholder"
             }
           },
           "required": [
@@ -853,13 +1095,13 @@
     "RETRIEVE_TOOL_RESPONSES": {
       "type": "function",
       "name": "acp_retrieve",
-      "description": "Retrieve the full original text of a stored tool result. REQUIRED when you need details from a placeholder that starts with 📦 [acp-stored #mNNNNN: pass its ref. Returns the exact original text; the placeholder stays in context. Unknown refs return not-found.",
+      "description": "Retrieve the full original text of a stored tool result. REQUIRED when you need details from a placeholder that starts with 📦 [acp-stored #mNNNNN: pass its ref. Returns the exact original text inline — very large originals are exported to a file instead, and the result then carries the exported file's path. The placeholder stays in context. Unknown refs return not-found.",
       "parameters": {
         "type": "object",
         "properties": {
           "ref": {
             "type": "string",
-            "description": "mNNNNN ref shown in the 📦 [acp-stored placeholder"
+            "description": "mNNNNN ref shown in the 📦 [acp-stored …] placeholder"
           }
         },
         "required": [
