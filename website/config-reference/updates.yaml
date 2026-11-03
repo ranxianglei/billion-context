@@ -98,7 +98,7 @@ entries:
     group: updates
     desc_en: "Override URL for the advisory feed."
     desc_zh: "公告源覆盖地址。"
-  - key: announcementsUrl
+  - key: remoteAnnouncementsUrl
     type: string
     default: "unset (official feed: GitHub master announcements/remote.json)"
     env: BILI_ANNOUNCEMENTS_URL

@@ -23,7 +23,7 @@ const MAX_ENTRIES = 50;
 const SUPPORTED_VERSION = 1;
 const DEFAULT_TIMEOUT_MS = 8000;
 
-/** Explicit override wins verbatim (config `announcementsUrl` / env
+/** Explicit override wins verbatim (config `remoteAnnouncementsUrl` / env
  *  BILI_ANNOUNCEMENTS_URL — firewall installs point this at their own relay);
  *  absent = the official raw URL. */
 export function resolveAnnouncementsUrl(configured: string | undefined): string {
@@ -110,7 +110,7 @@ async function writeSnapshot(text: string): Promise<void> {
 
 type RemoteNoticesOptions = {
     /** Resolved-or-raw announcements URL override (see resolveAnnouncementsUrl). */
-    announcementsUrl?: string;
+    remoteAnnouncementsUrl?: string;
     resolveProxy?: (url: string) => string | undefined;
     /** Test seam: override the 8s fetch timeout. */
     timeoutMs?: number;
@@ -134,7 +134,7 @@ export async function runRemoteNoticesCheck(opts: RemoteNoticesOptions, force = 
 
         let text: string;
         try {
-            const url = resolveAnnouncementsUrl(opts.announcementsUrl);
+            const url = resolveAnnouncementsUrl(opts.remoteAnnouncementsUrl);
             const dispatcher = egressDispatcher({ resolveProxy: opts.resolveProxy }, url);
             const init: FetchOptions = {
                 method: "GET",

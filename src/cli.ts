@@ -904,7 +904,7 @@ export async function main(): Promise<void> {
     // #5548 P3: remote announcements feed (display-only, like release notes)
     // — independent of autoUpdate for the same reason as the other watchers.
     startRemoteNoticesWatcher({
-        announcementsUrl: opts.announcementsUrl,
+        remoteAnnouncementsUrl: opts.remoteAnnouncementsUrl,
         resolveProxy: (url) => resolveProxy(opts.routes, opts.proxy, url, opts.proxyFallback),
     });
 }

@@ -72,7 +72,7 @@ test("fresh fetch success: state populated, snapshot written, gates reused", asy
     const fed = [REC(), REC({ id: "old-only", kind: "warning", versions: ["<0.1.100"] })];
     const s = await serve((res) => { res.setHeader("content-type", "application/json"); res.end(doc(fed)); });
     try {
-        await runRemoteNoticesCheck({ announcementsUrl: s.url, log: () => {} }, true);
+        await runRemoteNoticesCheck({ remoteAnnouncementsUrl: s.url, log: () => {} }, true);
     } finally {
         await s.close();
     }
@@ -91,13 +91,13 @@ test("fresh fetch success: state populated, snapshot written, gates reused", asy
 test("fetch failure: first-ever is silent-empty, later failures serve memory then snapshot", async () => {
     _resetRemoteNoticesForTest();
     fs.rmSync(snapshotFile, { force: true });
-    const opts = { announcementsUrl: "http://127.0.0.1:1/feed", timeoutMs: 500, log: () => {} };
+    const opts = { remoteAnnouncementsUrl: "http://127.0.0.1:1/feed", timeoutMs: 500, log: () => {} };
     await runRemoteNoticesCheck(opts, true);
     assert.equal(visibleRemoteRecords().length, 0, "no snapshot yet → no remote source (fail open, no error surface)");
 
     const fed = [REC()];
     let s = await serve((res) => res.end(doc(fed)));
-    await runRemoteNoticesCheck({ ...opts, announcementsUrl: s.url, timeoutMs: 500 }, true);
+    await runRemoteNoticesCheck({ ...opts, remoteAnnouncementsUrl: s.url, timeoutMs: 500 }, true);
     await s.close();
     assert.deepEqual(visibleRemoteRecords().map((r) => r.id), ["team-note"], "healthy fetch populates state");
 
@@ -118,18 +118,18 @@ test("malformed fresh doc keeps last-good; oversized doc rejected the same way",
     fs.rmSync(snapshotFile, { force: true });
     const good = [REC()];
     let s = await serve((res) => res.end(doc(good)));
-    await runRemoteNoticesCheck({ announcementsUrl: s.url, log: () => {} }, true);
+    await runRemoteNoticesCheck({ remoteAnnouncementsUrl: s.url, log: () => {} }, true);
     await s.close();
 
     s = await serve((res) => res.end("{ not json"));
-    await runRemoteNoticesCheck({ announcementsUrl: s.url, log: () => {} }, true);
+    await runRemoteNoticesCheck({ remoteAnnouncementsUrl: s.url, log: () => {} }, true);
     assert.equal(visibleRemoteRecords().length, 1, "bad JSON keeps last good copy");
     assert.ok(fs.readFileSync(snapshotFile, "utf8") === doc(good), "snapshot untouched by a bad push");
     await s.close();
 
     const huge = doc([REC({ desc: { en: "x".repeat(512 * 1024) } })]);
     s = await serve((res) => res.end(huge));
-    await runRemoteNoticesCheck({ announcementsUrl: s.url, log: () => {} }, true);
+    await runRemoteNoticesCheck({ remoteAnnouncementsUrl: s.url, log: () => {} }, true);
     assert.equal(visibleRemoteRecords().length, 1, ">512KB document rejected, last good survives");
     await s.close();
 });
@@ -140,7 +140,7 @@ test("slow response trips the fetch timeout and falls back", async () => {
     const slow = await serve((res) => setTimeout(() => res.end(doc([REC()])), 30_000));
     const t0 = Date.now();
     try {
-        await runRemoteNoticesCheck({ announcementsUrl: slow.url, timeoutMs: 300, log: () => {} }, true);
+        await runRemoteNoticesCheck({ remoteAnnouncementsUrl: slow.url, timeoutMs: 300, log: () => {} }, true);
     } finally {
         await slow.close();
     }
@@ -156,7 +156,7 @@ test("merging: local shadows remote on equal id; both shadow builtins; priority 
     return (async () => {
         const s = await serve((res) => res.end(doc(fed)));
         try {
-            await runRemoteNoticesCheck({ announcementsUrl: s.url, log: () => {} }, true);
+            await runRemoteNoticesCheck({ remoteAnnouncementsUrl: s.url, log: () => {} }, true);
             const list = mergedNotices(process.env, remoteAnnouncementPayloads());
             const ids = list.map((n) => n.id);
             assert.equal(ids.filter((i) => i === "wm-fastpath-intro").length, 1, "same id renders exactly once");
@@ -185,7 +185,7 @@ test("dismiss routing follows the remote record's declared mode", async () => {
     const fed = [REC(), REC({ id: "pinned-alert", dismiss: "always" }), REC({ id: "once-per-run", dismiss: "instance" })];
     const s = await serve((res) => res.end(doc(fed)));
     try {
-        await runRemoteNoticesCheck({ announcementsUrl: s.url, log: () => {} }, true);
+        await runRemoteNoticesCheck({ remoteAnnouncementsUrl: s.url, log: () => {} }, true);
         assert.deepEqual(remoteDismissMode("team-note"), "persistent");
         assert.deepEqual(remoteDismissMode("pinned-alert"), "always", "admin endpoint will accept-and-ignore this");
         assert.deepEqual(remoteDismissMode("once-per-run"), "instance");

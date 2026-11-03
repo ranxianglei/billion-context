@@ -390,7 +390,7 @@ bili --no-auto-update        # 本次启动禁用自动更新
 - Web UI 概览页横幅,显示原因与手动升级命令;
 - `GET /__bili/status` 在 `advisory` 字段返回生效中的公告。
 
-该检查默认 fail-open:公告源不可达或格式错误只产生警告,绝不阻断模型流量。禁用方式:配置(`"advisoryCheck": false`)或环境变量(`BILI_ADVISORY_CHECK=0`);可用 `"advisoryUrl"` / `BILI_ADVISORY_URL` 指向自定义文档。**公告（Announcements）**（#5548）——与上面的关键缺陷公告是两回事：三个来源给 Web UI 提供横幅，相同 id 的覆盖顺序为**本地文件 > 远程源 > 内置**：(1)*内置*——一次性提示，直接走界面内置文案；(2)*本地*——把 JSON 文件放进配置目录的 `announcements/*.json`（默认 `~/.config/billion-context/announcements/`）即自动渲染：双语记录、按 kind 定色、npm 风格 `versions` 版本定向（`>=a.b.c`、`^`、`~`、`[lo hi]`、`||` 列表）、`percent` 灰度、时间窗、按类型排优先级——一个坏文件只废掉它自己；(3)*远程*——本仓库 master 分支的 [`announcements/remote.json`](announcements/remote.json)（每个 PR 都过 CI 校验），约每 3 分钟拉取一次，上一份有效公告的快照可跨重启/断网存活，坏推送会被拒绝；无法直连的环境用 `"announcementsUrl"` / `BILI_ANNOUNCEMENTS_URL` 指向同一文档的中继镜像。关闭行为按每条记录声明的模式：`persistent`（默认，按内容寻址——公告内容改动后会再提示一次）、`instance`（仅本进程）或 `always`（不显示关闭按钮）。官方源当前发布的是空条目列表。
+该检查默认 fail-open:公告源不可达或格式错误只产生警告,绝不阻断模型流量。禁用方式:配置(`"advisoryCheck": false`)或环境变量(`BILI_ADVISORY_CHECK=0`);可用 `"advisoryUrl"` / `BILI_ADVISORY_URL` 指向自定义文档。**公告（Announcements）**（#5548）——与上面的关键缺陷公告是两回事：三个来源给 Web UI 提供横幅，相同 id 的覆盖顺序为**本地文件 > 远程源 > 内置**：(1)*内置*——一次性提示，直接走界面内置文案；(2)*本地*——把 JSON 文件放进配置目录的 `announcements/*.json`（默认 `~/.config/billion-context/announcements/`）即自动渲染：双语记录、按 kind 定色、npm 风格 `versions` 版本定向（`>=a.b.c`、`^`、`~`、`[lo hi]`、`||` 列表）、`percent` 灰度、时间窗、按类型排优先级——一个坏文件只废掉它自己；(3)*远程*——本仓库 master 分支的 [`announcements/remote.json`](announcements/remote.json)（每个 PR 都过 CI 校验），约每 3 分钟拉取一次，上一份有效公告的快照可跨重启/断网存活，坏推送会被拒绝；无法直连的环境用 `"remoteAnnouncementsUrl"` / `BILI_ANNOUNCEMENTS_URL` 指向同一文档的中继镜像。关闭行为按每条记录声明的模式：`persistent`（默认，按内容寻址——公告内容改动后会再提示一次）、`instance`（仅本进程）或 `always`（不显示关闭按钮）。官方源当前发布的是空条目列表。
 
 
 
