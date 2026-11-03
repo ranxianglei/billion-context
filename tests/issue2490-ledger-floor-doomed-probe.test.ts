@@ -1,15 +1,16 @@
 // #2490: the dsh-vs-bili double-bookkeeping deadlock had TWO load-bearing
 // lies, pinned here end-to-end:
-//   (a) the ledger floor — the #1729/#1835 guard refuses dsh's native
-//       compaction envelope (a FULL replay of the host's raw history), but
-//       that raw ledger stays invisible to bili's folded view, so the output
-//       clamp planned turn budgets against the SMALL folded input while the
-//       host was about to re-send the whole raw ledger next turn. Incident:
-//       window 1M, folded input ~200K, refused replay ~900K tokens → clamp
-//       let max_tokens=384_000 through → one 7.5MB assistant turn landed →
-//       un-folding kill chain (turn 37→40 death). Fix: the guard records the
-//       replay SIZE on the session (high-water bytes + count), and
-//       clampOutgoingOutput plans against max(folded estimate, ledger floor).
+//   (a) the refusal record — the #1729/#1835 guard refuses dsh's native
+//       compaction envelope (a FULL replay of the host's raw history), which
+//       stays invisible to bili's folded view. The #2490 fix recorded the
+//       replay SIZE on the session (high-water bytes + count) and planned the
+//       output budget against it; #5596 removed that planning consumption —
+//       refused bytes never leave bili's door, so they are not a future
+//       forwarded input, and the sticky high-water pinned healthy lanes onto
+//       the 4096 budget floor for the session's life (see
+//       tests/issue5596-refusal-floor-no-planning.test.ts). The record stays
+//       as a diagnostic watermark; per-request defenses own overflow
+//       (measured-input planning + preflight / egress fuse #4079/#4185).
 //   (b) the doomed probe — the #2313 forward-once-for-evidence bet assumes
 //       some tokenizer might make the payload fit. Beyond window×7.5 BYTES
 //       of core text (densest live-route billing observed: ~6.8 B/token,
@@ -169,12 +170,12 @@ async function seedStuckMeter(ctx: Ctx, sessionId: string, lastInputTokens = 7_3
 }
 
 // ---------------------------------------------------------------------------
-// (a) ledger floor
+// (a) refusal record
 
 test("unit #2490: dshLedgerFloorTokens — bytes/4 caliber, high-water, legacy-safe", () => {
     assert.equal(dshLedgerFloorTokens(undefined), 0, "no metadata bag (partial fixture) is legacy-neutral");
     assert.equal(dshLedgerFloorTokens({}), 0, "nothing recorded yet");
-    assert.equal(dshLedgerFloorTokens({ dshCompactionRefusedBytes: 3_600_000 }), 900_000, "the incident's 3.6MB replay floors planning at ~900K tokens");
+    assert.equal(dshLedgerFloorTokens({ dshCompactionRefusedBytes: 3_600_000 }), 900_000, "the incident's 3.6MB replay reads back as ~900K tokens");
     assert.equal(dshLedgerFloorTokens({ dshCompactionRefusedBytes: 0 }), 0, "zero bytes is not a floor");
     assert.equal(dshLedgerFloorTokens({ dshCompactionRefusedBytes: Number.NaN }), 0, "NaN is ignored");
     assert.equal(dshLedgerFloorTokens({ dshCompactionRefusedBytes: "big" }), 0, "non-number is ignored");
@@ -196,41 +197,34 @@ const clampCtx = (over: Partial<Parameters<typeof clampOutgoingOutput>[2]>) =>
 const clampLog = (lines: string[]): ((level: string, msg: string) => void) =>
     (level, msg) => { if (level === "info" || level === "warn") lines.push(msg); };
 
-test("unit #2490: the incident clamp — ledger floor 900K vs window 1M cuts max_tokens 384K → 55K", () => {
+test("unit #2490/#5596: refused-ledger bytes no longer drive planning — measured input decides", () => {
     const lines: string[] = [];
     const rebuilt: Record<string, unknown> = { max_tokens: 384_000 };
-    // Without the floor (pre-fix): folded input 200K, margin 10K → cap 790K ≥
-    // requested → NO clamp. This is the exact permissiveness that let the
-    // 7.5MB turn-37 monster out the door.
-    const before: Record<string, unknown> = { max_tokens: 384_000 };
-    clampOutgoingOutput(before, "max_tokens", clampCtx({ ledgerFloorTokens: undefined }), "s1", clampLog(lines));
-    assert.equal(before.max_tokens, 384_000, "pre-fix: unclamped while the raw ledger sits at 900K");
+    // Post-#5596: the refused replay (~900K tokens in the incident) is a
+    // diagnostic watermark only; the planning basis is this request's measured
+    // input (200K usage-grade here). safe 224K, margin 11.2K -> cap 764.8K >=
+    // requested, so the 384K budget passes even with a 900K refused replay on
+    // the session. Disclosed tradeoff: the #2490 monster-request shape is no
+    // longer pre-shrunk by the clamp itself — overflow at that size is owned
+    // by the per-request defenses (preflight / egress fuse #4079/#4185).
+    clampOutgoingOutput(rebuilt, "max_tokens", clampCtx({}), "s2", clampLog(lines));
+    assert.equal(rebuilt.max_tokens, 384_000, "refused bytes are not a forwarded input (#5596)");
     assert.equal(lines.length, 0, "no clamp, no log");
-
-    // With the floor: planning input max(200K, 900K)=900K, margin 45K →
-    // cap floor(1M − 900K − 45K) = 55K — the monster budget cannot exist.
-    clampOutgoingOutput(rebuilt, "max_tokens", clampCtx({ ledgerFloorTokens: 900_000 }), "s2", clampLog(lines));
-    assert.equal(rebuilt.max_tokens, 55_000, "planned against the refused raw ledger, not the folded view");
-    assert.match(lines[0] ?? "", /planning floor 900000 from the refused dsh compaction replay \(#2490\)/, "the log says which basis drove the clamp");
 });
 
-test("unit #2490: the floor only ever TIGHTENS — small floors, absent requests, legacy paths unchanged", () => {
-    // Floor below the folded input: planning basis stays the folded estimate.
-    const small: Record<string, unknown> = { max_tokens: 384_000 };
-    clampOutgoingOutput(small, "max_tokens", clampCtx({ ledgerFloorTokens: 10_000 }), "s3", clampLog([]));
-    assert.equal(small.max_tokens, 384_000, "a ledger smaller than the folded input changes nothing");
-
-    // Cap below OUTPUT_CLAMP_FLOOR surrenders to preflight (existing
-    // semantics — a 990K ledger against a 1M window is preflight territory).
+test("unit #2490/#5596: measured-input rows — near-wall surrender and legacy paths unchanged", () => {
+    // Measured input 990K against a 1M window: cap < OUTPUT_CLAMP_FLOOR
+    // surrenders to preflight (existing semantics — that regime belongs to
+    // the preflight / egress-fuse layers, not the clamp).
     const huge: Record<string, unknown> = { max_tokens: 384_000 };
     const lines: string[] = [];
-    clampOutgoingOutput(huge, "max_tokens", clampCtx({ ledgerFloorTokens: 990_000 }), "s4", clampLog(lines));
+    clampOutgoingOutput(huge, "max_tokens", clampCtx({ lastInputTokens: 990_000 }), "s4", clampLog(lines));
     assert.equal(huge.max_tokens, 384_000, "cap < 1024 → no clamp (preflight owns that regime)");
     assert.equal(lines.length, 0);
 
-    // No floor at all → byte-identical legacy behavior (frozen by #2122 tests).
+    // Healthy small request → byte-identical legacy behavior (frozen by #2122 tests).
     const legacy: Record<string, unknown> = { max_tokens: 8_000 };
-    clampOutgoingOutput(legacy, "max_tokens", clampCtx({ ledgerFloorTokens: 0 }), "s5", clampLog([]));
+    clampOutgoingOutput(legacy, "max_tokens", clampCtx({}), "s5", clampLog([]));
     assert.equal(legacy.max_tokens, 8_000);
 });
 

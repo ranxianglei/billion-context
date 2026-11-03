@@ -7,12 +7,14 @@
 // canDisableThinking:false, so each clamped budget was eaten entirely by
 // thinking -> upstream stopReason=length -> no text, no tool-call, blank GUI
 // turns, and DSH (which does not auto-continue on max-tokens) just replayed
-// the same dead loop on every "continue". Fix: the floor now engages only on
-// one of two independent grounds — the folded view already sits at the
-// enforced headroom target, or the requested budget is giant (>= 25% of the
-// native window, the #2490 monster-request line). Both protection regimes
-// stay pinned here AND in tests/issue2490-ledger-floor-doomed-probe.test.ts
-// (giant request) — this file pins the starvation side they left open.
+// the same dead loop on every "continue". #3384 gated the floor behind two
+// grounds (view at the enforced headroom target, or giant request >= 25% of
+// the window); #5596 removed the consumption entirely — refused bytes never
+// leave bili's door, so they are not a future forwarded input (the sticky
+// floor pinned healthy lanes onto the 4096 budget floor; see
+// tests/issue5596-refusal-floor-no-planning.test.ts). This file now pins the
+// incident shapes post-removal: healthy views keep their full budgets at ANY
+// request size, and the measured-input clamp boundaries still hold.
 import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
@@ -34,7 +36,6 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 
 const WINDOW = 1_000_000; // the reported deployment's declared window
-const FLOOR = 946_753;    // the incident's final planning floor (refused replay bytes / 4)
 
 type CtxArgs = Parameters<typeof clampOutgoingOutput>[2];
 
@@ -59,57 +60,42 @@ const clampLog = (lines: string[]): ((level: string, msg: string) => void) =>
 test("#3384: the incident shape keeps its full budget — modest request, healthy folded view, huge refused ledger", () => {
     const lines: string[] = [];
     const rebuilt: Record<string, unknown> = { max_tokens: 50_670 };
-    clampOutgoingOutput(rebuilt, "max_tokens", incidentCtx({ ledgerFloorTokens: FLOOR }), "s-3384-a", clampLog(lines));
-    // Pre-fix this clamped to 5909 (margin ceil(946753*0.05)=47338, cap
-    // floor(1000000-946753-47338)=5909) — the starvation the session died in.
-    assert.equal(rebuilt.max_tokens, 50_670, "budget untouched below both gate lines");
+    clampOutgoingOutput(rebuilt, "max_tokens", incidentCtx({}), "s-3384-a", clampLog(lines));
+    // Under the #2490-era unconditional floor this clamped to 5909 (margin
+    // ceil(946753*0.05)=47338, cap floor(1000000-946753-47338)=5909) — the
+    // starvation the session died in. Post-#5596 nothing consults the floor.
+    assert.equal(rebuilt.max_tokens, 50_670, "budget untouched: refused bytes never plan (#5596)");
     assert.equal(lines.length, 0, "no clamp, no log");
 });
 
-test("#3384: the giant-request ground still plans against the ledger (#2490 regime preserved)", () => {
+test("#3384/#5596: giant-request shapes on a healthy view keep their full budget (the 25% line is gone)", () => {
     const lines: string[] = [];
-    const rebuilt: Record<string, unknown> = { max_tokens: 384_000 };
-    // 384K >= 0.25 * 1M — the #2490 incident's own request size.
-    clampOutgoingOutput(rebuilt, "max_tokens", incidentCtx({ ledgerFloorTokens: FLOOR }), "s-3384-b", clampLog(lines));
-    assert.equal(rebuilt.max_tokens, 5_909, "planned against the refused ledger: cap floor(1M-946753-47338)=5909, above the 4096 capability floor");
-    assert.match(lines[0] ?? "", /planning floor 946753 from the refused dsh compaction replay \(#2490\)/);
+    // 384K (the #2490 incident's own request size), exactly 25% of the window,
+    // and one token under it: under the #3384 gate these took the giant-request
+    // ground and planned against the 946753 refused-ledger floor (cap 5909).
+    // Post-#5596 the floor is diagnostic-only — measured input 89.7K leaves
+    // ~894K headroom, so every size passes untouched. Overflow at giant sizes
+    // is owned by preflight / egress fuse (#4079/#4185), not by pre-shrinking
+    // the budget from bytes that were never forwarded.
+    for (const [req, id] of [[384_000, "b"], [250_000, "c"], [249_999, "d"]] as const) {
+        const rebuilt: Record<string, unknown> = { max_tokens: req };
+        clampOutgoingOutput(rebuilt, "max_tokens", incidentCtx({}), `s-3384-${id}`, clampLog(lines));
+        assert.equal(rebuilt.max_tokens, req, `${req} passes on a healthy view regardless of the refused ledger`);
+    }
+    assert.equal(lines.length, 0, "no clamp, no log");
 });
 
-test("#3384: the boundary is inclusive — exactly 25% of the window takes the giant ground", () => {
-    const lines: string[] = [];
-    const rebuilt: Record<string, unknown> = { max_tokens: 250_000 };
-    clampOutgoingOutput(rebuilt, "max_tokens", incidentCtx({ ledgerFloorTokens: FLOOR }), "s-3384-c", clampLog(lines));
-    assert.equal(rebuilt.max_tokens, 5_909, "raw == 0.25*window engages the floor (fail-closed side of the line)");
-    assert.ok(lines.length >= 1, "the clamp is logged");
-});
-
-test("#3384: one token under the giant line stays unclamped while the view is healthy", () => {
-    const lines: string[] = [];
-    const rebuilt: Record<string, unknown> = { max_tokens: 249_999 };
-    clampOutgoingOutput(rebuilt, "max_tokens", incidentCtx({ ledgerFloorTokens: FLOOR }), "s-3384-d", clampLog(lines));
-    assert.equal(rebuilt.max_tokens, 249_999, "below the line the ledger must not drive planning");
-    assert.equal(lines.length, 0);
-});
-
-test("#3384: the view-at-enforced-target ground engages when bili's OWN view reaches the wall", () => {
+test("#3384/#5596: view past the enforced target no longer re-engages anything — planning is measured-input only", () => {
     const lines: string[] = [];
     const rebuilt: Record<string, unknown> = { max_tokens: 50_670 };
-    // Folded view 110K already past an enforced 100K headroom target — the
-    // session really is at the wall, so worst-case-ledger planning applies
-    // even for a modest request.
-    clampOutgoingOutput(rebuilt, "max_tokens", incidentCtx({ headroomWindow: 100_000, lastInputTokens: 110_000, ledgerFloorTokens: FLOOR }), "s-3384-e", clampLog(lines));
-    assert.equal(rebuilt.max_tokens, 5_909, "view at the enforced target re-engages the floor");
-    assert.match(lines[0] ?? "", /planning floor 946753/);
-});
-
-test("#3384: legacy paths stay byte-identical — no refusal recorded, or floor below the folded view", () => {
-    const legacy: Record<string, unknown> = { max_tokens: 50_670 };
-    clampOutgoingOutput(legacy, "max_tokens", incidentCtx({}), "s-3384-f", clampLog([]));
-    assert.equal(legacy.max_tokens, 50_670, "no floor recorded -> unchanged legacy behavior");
-
-    const small: Record<string, unknown> = { max_tokens: 50_670 };
-    clampOutgoingOutput(small, "max_tokens", incidentCtx({ ledgerFloorTokens: 10_000 }), "s-3384-g", clampLog([]));
-    assert.equal(small.max_tokens, 50_670, "a floor smaller than the folded view changes nothing");
+    // Folded view 110K already past an enforced 100K headroom target: under
+    // the #3384 gate this re-engaged the refused-ledger floor (cap 5909).
+    // Post-#5596 nothing consults the floor — measured input 110K against a
+    // 1M window leaves ample headroom, so the modest budget passes. When
+    // bili's own view hits the wall, compression + preflight are the defense.
+    clampOutgoingOutput(rebuilt, "max_tokens", incidentCtx({ headroomWindow: 100_000, lastInputTokens: 110_000 }), "s-3384-e", clampLog(lines));
+    assert.equal(rebuilt.max_tokens, 50_670, "view-at-wall no longer drives refused-bytes planning (#5596)");
+    assert.equal(lines.length, 0);
 });
 
 // ---------------------------------------------------------------------------
