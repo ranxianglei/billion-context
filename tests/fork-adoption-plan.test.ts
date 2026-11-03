@@ -62,6 +62,7 @@ test("planForkAdoption default (no seedAllRefs) seeds only block coverage — do
 test("resume adoption never writes the kernel BLOCKED sentinel into byRef (#2620)", () => {
     _setStoreForTest(new SessionStore({ enabled: false }));
     const parent = {
+        metadata: {},
         state: {
             blocks: [] as unknown[],
             tokenSnapshot: {} as Record<string, number>,
@@ -71,6 +72,7 @@ test("resume adoption never writes the kernel BLOCKED sentinel into byRef (#2620
         },
     } as unknown as Session;
     const child = {
+        metadata: {},
         state: {
             blocks: [] as unknown[],
             tokenSnapshot: {} as Record<string, number>,

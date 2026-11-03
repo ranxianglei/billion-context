@@ -4,7 +4,7 @@ import { stripRawStage } from "./marker/engine.js";
 import { normalizeResponsesMessageItems, sanitizeResponsesInputIds, dropWhitespaceResponsesMessages } from "./loop/adapter-responses.js";
 import { responsesToCoreWithToolImages } from "./responses-tool-output.js";
 import { replaceBiliCompactionItems } from "./codex-compact.js";
-import { peekSession, markDirty, reserveRefsThrough, type Session } from "./session.js";
+import { peekSession, markDirty, reserveRefsThrough, hasRefLedgerConflict, type Session } from "./session.js";
 import { getStore } from "./persist.js";
 import { adoptContentStore, cloneStoreForRefs, contentStoreOf } from "./store.js";
 import type { WireProtocol } from "./util.js";
@@ -241,6 +241,8 @@ export function planForkAdoption(
 /** Seed a fresh fork session from the plan. Copy-on-fork: every value is a
  *  clone; the parent session is never touched. */
 export function applyForkAdoption(session: Session, plan: ForkAdoptionPlan, parent: Session): void {
+    // Filtered adoption does not copy the parent's historical ref rows.
+    if (hasRefLedgerConflict(parent)) session.metadata.refLedgerConflict = true;
     for (const b of plan.blocks) {
         session.state.blocks.push(b);
         const content = parent.blockContents.get(b.blockId);

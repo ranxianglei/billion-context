@@ -28,7 +28,7 @@ import { integrityModeFor, writeIntegrityCache, scheduleBackgroundIntegrityCheck
 import { sqliteCorruptionDetail } from "./sqlite-errors.js";
 import { listInstances, type RegistryEntry } from "../instance.js";
 import type { MessageContentStore } from "acp-kernel";
-import type { BlockView } from "../session.js";
+import type { BlockView, RefHistoryCollision } from "../session.js";
 
 /** #3250: run a PASSIVE wal_checkpoint every N successful ingests. The
  *  built-in autocheckpoint alone cannot guarantee reclamation in a long-lived
@@ -3182,6 +3182,34 @@ export class UnifiedStore {
             rawId: r.raw_id as string,
             ref: r.ref as string,
             refNum: (r.ref_num as number | null) ?? null,
+        }));
+    }
+
+    /** Historical message rows whose issued ref now belongs to another raw
+     *  message in the current refs ledger. `messages.ref` is first-seen
+     *  (INSERT OR IGNORE), so it preserves the number a row was originally
+     *  issued; comparing it with the live ledger exposes a retired re-stamp
+     *  without hydrating message content. Retired rows are included because
+     *  they are historical evidence; a non-empty result means ref resolution
+     *  is ambiguous and destructive ref work must fail closed. `limit` bounds
+     *  the read; one hit is enough for the guard, and the sample drives the
+     *  operator-facing message. */
+    findRefHistoryCollisions(sessionId: string, limit = 100): RefHistoryCollision[] {
+        const rows = this.db
+            .prepare(
+                `SELECT DISTINCT m.ref AS ref, m.ref_num AS ref_num, m.msg_id AS old_raw_id, r.raw_id AS current_raw_id
+                 FROM messages m
+                 JOIN refs r ON r.session_id = m.session_id AND r.ref_num = m.ref_num
+                 WHERE m.session_id = ? AND m.ref_num IS NOT NULL AND m.msg_id <> r.raw_id
+                 ORDER BY m.ref_num, old_raw_id, current_raw_id
+                 LIMIT ?`,
+            )
+            .all(sessionId, limit) as Record<string, unknown>[];
+        return rows.map((r) => ({
+            ref: r.ref as string,
+            refNum: r.ref_num as number,
+            oldRawId: r.old_raw_id as string,
+            currentRawId: r.current_raw_id as string,
         }));
     }
 

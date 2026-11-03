@@ -9,7 +9,6 @@ import type { Session } from "../src/session.ts";
 import type { CoreMessage, CompressionBlock } from "acp-kernel";
 import { canonicalize, sha256 } from "./golden-canonical.ts";
 import { planIngest, loadLegacyView, toLegacyLike, type LegacySessionLike } from "../src/storage/ingest.ts";
-import { restampRefsToLedger } from "acp-kernel";
 import { UnifiedStore } from "../src/storage/store.ts";
 import { resolveStorageMode } from "../src/storage/shadow.ts";
 import { resolveStorageWalJournalSizeLimit } from "../src/knobs.ts";
@@ -406,12 +405,11 @@ test("resolveStorageWalJournalSizeLimit: env wins, garbage falls through, file t
     assert.equal(resolveStorageWalJournalSizeLimit({}, 2097152), 2097152, "file tier applies when the env is absent");
 });
 
-/** #4316 PR3/3 parity oracle: the expected digest for a FULL-mode load is
- *  the LEGACY-mode view of the same files plus the deterministic one-time
- *  ledger alignment (same seqByRaw the full-mode load aligned against). The
- *  corpus manifest keeps pinning the PURE view (storage-corpus suite); this
- *  oracle pins the equivalence "full serve = legacy serve + alignment". */
-function alignedLegacyDigest(caseDir: string, meta: { protocol: string; id: string }, seqByRawId: Map<string, number>): string {
+/** Full mode now seals issued refs at cold load, so the expected digest for
+ *  a FULL-mode load is the PURE legacy view of the same files. The corpus
+ *  manifest pins the same digest (storage-corpus suite); this oracle keeps
+ *  the full-vs-legacy equivalence explicit. */
+function legacyDigest(caseDir: string, meta: { protocol: string; id: string }): string {
     const legacyDir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-legacy-oracle-"));
     try {
         fs.cpSync(caseDir, path.join(legacyDir, "case"), { recursive: true });
@@ -426,11 +424,7 @@ function alignedLegacyDigest(caseDir: string, meta: { protocol: string; id: stri
             store = new SessionStore({ dir: path.join(legacyDir, "case"), debounceMs: 1, enabled: true });
             const pure = store.loadSync(meta.id, { protocol: meta.protocol, upstreamOrigin: "http://127.0.0.1:8199" });
             assert.ok(pure, "legacy oracle load returned null");
-            const view = toLegacyLike(pure);
-            const state = structuredClone(view.state as Record<string, unknown>);
-            restampRefsToLedger(state as never, seqByRawId);
-            delete state.refLedgerAligned;
-            return sessionDigest({ ...view, state: state as never });
+            return sessionDigest(toLegacyLike(pure));
         } finally {
             store?.closeQuietly();
             if (prev === undefined) delete process.env.BILI_STORAGE_UNIFIED;
@@ -460,9 +454,7 @@ test("storage unified FULL mode: read path serves from the index with organic im
         let expectedDigest = "";
         try {
             assert.ok(probe.getSessionRow(meta.id), "organic import did not populate index.db");
-            // #4316 PR3/3: expected = legacy view of the same files + the
-            // deterministic alignment against these very rows.
-            expectedDigest = alignedLegacyDigest(caseDir, meta, probe.seqByRaw(meta.id));
+            expectedDigest = legacyDigest(caseDir, meta);
         } finally {
             probe.close();
         }
@@ -557,13 +549,7 @@ test("storage unified: file-config storage.unified selects the mode; env tier st
         let session = store.loadSync(meta.id, { protocol: meta.protocol, upstreamOrigin: "http://127.0.0.1:8199" });
         assert.ok(session, "file-tier full loadSync returned null");
         store.closeQuietly();
-        const probeStore = UnifiedStore.open(path.join(caseDir, "index.db"));
-        let fileTierDigest = "";
-        try {
-            fileTierDigest = alignedLegacyDigest(caseDir, meta, probeStore.seqByRaw(meta.id));
-        } finally {
-            probeStore.close();
-        }
+        const fileTierDigest = legacyDigest(caseDir, meta);
         assert.equal(sessionDigest(toLegacyLike(session)), fileTierDigest, "file-tier full read digest drift");
         assert.ok(fs.existsSync(path.join(caseDir, "index.db")), "file-tier full did not create index.db");
         // Env tier wins: explicit env legacy overrides file full on a fresh

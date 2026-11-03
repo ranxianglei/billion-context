@@ -3,7 +3,7 @@ import { collectBlockContent, countMessageTokens, defaultCountTokens, formatRang
 import { loadConfigFile, resolveMessageTimestamps } from "./config.js";
 import { excludeDeadRefRanges, handleAcpStatus, liveCompressionRanges } from "./acp-status.js";
 import { handleAcpCache, prefixTokensBeforeRef, recordCacheFoldsFromBlocks } from "./cache-ledger.js";
-import { type Session, cacheBlockContent, markDirty, residentPressure, scrubTurnSeparatorIds, statusInputBaseline, withoutTurnSeparators } from "./session.js";
+import { type Session, hasRefLedgerConflict, cacheBlockContent, markDirty, residentPressure, scrubTurnSeparatorIds, statusInputBaseline, withoutTurnSeparators } from "./session.js";
 import { COMPRESS_TOOL_NAME, parseCompressInput, ABSORB_TOOL_NAME, type ParsedRange } from "./compress-tool.js";
 import { effectiveAbsorbConfig, executeAbsorb, isProxyToolFor } from "./absorb.js";
 import { executeSearchContextTarget, resolveDecompress } from "./decompress-shared.js";
@@ -947,11 +947,32 @@ export function supersededRefRejection<T extends { startRef: string; endRef: str
     return out;
 }
 
+export function refLedgerConflictRefusal(ctx: RewriteCtx): ProxyToolResult | undefined {
+    const refLedgerConflict = ctx.session.refLedgerConflict ?? [];
+    if (hasRefLedgerConflict(ctx.session)) {
+        const refs = Array.from(new Set(refLedgerConflict.map((c) => c.ref)));
+        const listed = refs.length > 0 ? ` for ref(s) ${refs.slice(0, 5).join(", ")}` : " inherited from an ambiguous ref ledger";
+        const more = refs.length > 5 ? ` (+${refs.length - 5} more)` : "";
+        ctx.log(
+            `[acp-proxy: compress REFUSED for ${ctx.session.id} — known retained or inherited ref-history ambiguity; raw messages, blocks, and the ref ledger preserved]`,
+        );
+        return compressResult(
+            `[Compression REFUSED: this session's retained ref history is ambiguous${listed}${more}. Retained or inherited references have conflicting raw-message owners. Compressing could fold the wrong messages, so nothing was changed. Raw messages, blocks, and the ref ledger are preserved. Read-only status, decompress, and export still work; no refs were translated, renumbered, or deleted automatically. Re-read acp_status, or export and continue in a new session if the labels remain inconsistent.]`,
+            "refused",
+            0,
+            "ref-ledger-conflict",
+        );
+    }
+    return undefined;
+}
+
 export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: RewriteCtx, opts?: { loopTracking?: boolean }): ProxyToolResult {
     // #2146: preflight overflow-compress is bili's OWN internal lane — its
     // failures have separate reporting (noteSkip) and must not arm the
     // model-facing circuit breaker on attempts the model never made.
     const trackLoop = opts?.loopTracking !== false;
+    const conflict = refLedgerConflictRefusal(ctx);
+    if (conflict) return conflict;
     let { ranges, diagnostics } = parsed;
     if (ranges.length === 0) {
         ctx.log("[acp-proxy: compress call had no valid ranges; nothing compressed.]");

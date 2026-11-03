@@ -85,17 +85,19 @@ export function viewStateDigest(view: ReturnType<typeof loadLegacyView>): string
     })));
 }
 
-/** #4316 layer 3 PR3/3 (380ef4dac): a unified full-mode cold load performs a
- *  ONE-TIME ledger alignment — citation numbers are re-homed onto ledger
- *  sequence (kernel restampRefsToLedger) and state.refLedgerAligned is stamped.
- *  Cross-mode / cross-read-path "identical state" proofs must therefore compare
- *  the state modulo that one-time renumbering: this strips the alignment stamp
- *  and re-homes every ref number to a canonical order (k-th smallest raw id ->
- *  m0000k), so two views differing ONLY in which numbering scheme produced
- *  their refs hash identically under viewDigest/viewStateDigest. Object key
- *  order is normalized too: different hydration paths build identical content
- *  under different insertion orders, and canonicalize preserves them. Pure
- *  function — returns a new object, input untouched. */
+/** #4316 layer 3 PR3/3 (380ef4dac): the historical unified full-mode cold load
+ *  performed a ONE-TIME ledger alignment — citation numbers were re-homed onto
+ *  ledger sequence (kernel restampRefsToLedger) and state.refLedgerAligned was
+ *  stamped. Current cold loads seal refs and do not apply that rewrite, but
+ *  committed goldens and older fixtures still carry its numbering. Cross-mode /
+ *  cross-read-path "identical state" proofs therefore compare state modulo the
+ *  historical renumbering: this strips any alignment stamp and re-homes every
+ *  ref number to a canonical order (k-th smallest raw id -> m0000k), so two
+ *  views differing ONLY in which numbering scheme produced their refs hash
+ *  identically under viewDigest/viewStateDigest. Object key order is normalized
+ *  too: different hydration paths build identical content under different
+ *  insertion orders, and canonicalize preserves them. Pure function — returns a
+ *  new object, input untouched. */
 export function stripOneTimeAlignment<T>(view: T): T {
     const v = view as { state?: unknown; blockContents?: unknown };
     if (!v.state || typeof v.state !== "object") return view;

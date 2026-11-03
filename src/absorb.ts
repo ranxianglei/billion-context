@@ -15,7 +15,7 @@ import { PROXY_TOOL_NAMES, READ_ORIGINAL_IMAGE_TOOL_NAME, RULE_TOOL_NAME } from 
 import { effectiveRulesEnabled } from "./rules-feature.js";
 import { ccrEnabled, retrieveToolName } from "./store.js";
 import { log as loggerLog } from "./logger.js";
-import type { Session } from "./session.js";
+import { hasRefLedgerConflict, type Session } from "./session.js";
 import { toolFail, toolOk, type ProxyToolResult } from "./proxy-tool-result.js";
 
 const EFFECTIVE_ABSORB_KEY = "effectiveAbsorb";
@@ -84,6 +84,9 @@ type AbsorbExecCtx = {
 // repeat-failure guard reasons about them uniformly with compress failures.
 export function executeAbsorb(args: unknown, callId: string | undefined, absorb: AbsorbConfig, ctx: AbsorbExecCtx): ProxyToolResult {
     const log = ctx.log ?? ((msg: string) => loggerLog("info", msg));
+    if (hasRefLedgerConflict(ctx.session)) {
+        return { ...toolFail("[absorb FAILED: this session's retained ref history is ambiguous. Absorbing could hide the wrong message, so nothing was changed. Raw messages, blocks, and the ref ledger are preserved.]"), reason: "ref-ledger-conflict" };
+    }
     const parsed = parseAbsorbInput(args, callId, (w) => log(`[acp-absorb] ${w}`));
     if (!parsed) {
         return toolFail('[absorb FAILED: invalid input — expected { ref: "mNNNNN", summary: "..." }]');

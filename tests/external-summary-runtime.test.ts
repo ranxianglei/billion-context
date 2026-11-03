@@ -204,6 +204,26 @@ test("missing primary key skips its network call and tries the configured backup
     }, (req, res) => { paths.push(req.url ?? ""); success(res); });
 });
 
+test("known ref ambiguity refuses configured summaries before work or no-view bookkeeping", async () => {
+    let calls = 0;
+    await fixture(async (_base, externalSummary) => {
+        for (const emptyView of [false, true]) {
+            const ctx = context(externalSummary);
+            const input = args(ctx, SUMMARY);
+            ctx.session.refLedgerConflict = [{ ref: ctx.session.state.messageRefs.byRaw.history, refNum: 1, oldRawId: "old-history", currentRawId: "history" }];
+            if (emptyView) ctx.messages = [];
+            const before = JSON.stringify({ state: ctx.session.state, stats: ctx.session.stats, metadata: ctx.session.metadata,
+                revision: ctx.session.revisionEpoch });
+            const result = await executeProxyToolAsync("compress", input, ctx);
+            assert.equal(result.reason, "ref-ledger-conflict");
+            assert.equal(result.outcome, "refused");
+            assert.equal(calls, 0, "ambiguous source must not reach the configured summary server");
+            assert.equal(JSON.stringify({ state: ctx.session.state, stats: ctx.session.stats, metadata: ctx.session.metadata,
+                revision: ctx.session.revisionEpoch }), before);
+        }
+    }, (_req, res) => { calls++; success(res); });
+});
+
 test("protected ranges cause no paid call and no fold", async () => {
     let calls = 0;
     await fixture(async (_base, externalSummary) => {

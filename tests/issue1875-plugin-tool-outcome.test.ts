@@ -16,6 +16,7 @@ import { afterEach, beforeEach, describe, it } from "node:test";
 import { createCore, defaultConfig, type Config, type CoreMessage } from "acp-kernel";
 import { type PluginToolDeps, _resetPluginStateForTest, handlePluginTool } from "../src/plugin.ts";
 import { getSession } from "../src/session.ts";
+import { getStore } from "../src/persist.ts";
 import { applyRanges } from "../src/stream.ts";
 import { parseCompressInput } from "../src/compress-tool.ts";
 import { forwardTool } from "../src/mcp.ts";
@@ -53,6 +54,23 @@ describe("#1875: plugin tool endpoint reports business outcome, not just ok:true
         assert.equal(r.json.outcome, "refused");
         assert.equal(r.json.blocksCreated, 0);
         assert.ok(String(r.json.result).startsWith("[Compression FAILED"), `receipt: ${r.json.result}`);
+    });
+
+    it("known ambiguity refusal leaves plugin ownership, revision and storage untouched", async () => {
+        const session = getSession(sessionId);
+        session.refLedgerConflict = [{ ref: "m00001", refNum: 1, oldRawId: "old", currentRawId: "current" }];
+        const before = JSON.stringify({ metadata: session.metadata, revision: session.revisionEpoch, state: session.state, stats: session.stats });
+        const store = getStore();
+        const scheduleSave = store.scheduleSave;
+        let saves = 0;
+        store.scheduleSave = function (value) { saves++; return scheduleSave.call(this, value); };
+        try {
+            const result = await call("compress", { content: [{ startId: "m00001", endId: "m00001", summary: "Historical source." }] });
+            assert.equal(result.status, 200);
+            assert.equal(result.json.outcome, "refused");
+            assert.equal(JSON.stringify({ metadata: session.metadata, revision: session.revisionEpoch, state: session.state, stats: session.stats }), before);
+            assert.equal(saves, 0);
+        } finally { store.scheduleSave = scheduleSave; }
     });
 
     it("decompress of unknown block → 200 ok:true + outcome:failure, no blocksCreated", async () => {
