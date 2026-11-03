@@ -11,6 +11,11 @@ import path from "node:path";
 // directions (triggers when it should, NOT when it should not — #3617).
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "bili-noticestore-"));
+// CI's storage-baseline preload forces BILI_STORAGE_UNIFIED=legacy for the
+// broad corpus; this suite pins its own carrier like the storage family does
+// (tests/bounded-storage.test.ts precedent) — it asserts kv_store semantics,
+// which require full mode.
+process.env.BILI_STORAGE_UNIFIED = "full";
 process.env.BILI_SESSIONS_DIR = path.join(root, "sessions");
 process.env.XDG_STATE_HOME = path.join(root, "state");
 process.env.XDG_CACHE_HOME = path.join(root, "cache");
