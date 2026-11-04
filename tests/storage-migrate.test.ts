@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { tmpdir } from "node:os";
 import { appendFileSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
-import { join, relative } from "node:path";
+import { join, relative, sep } from "node:path";
 import { createInitialState } from "acp-kernel";
 import { SessionStore } from "../src/persist.ts";
 import type { Session } from "../src/session.ts";
@@ -203,7 +203,7 @@ test("same-id route files arbitrate to newest savedAt; alternates left untouched
         const dup = byId(r.out, "dup-1");
         assert.equal(dup.alternates, 1, "the losing route file is reported, not merged");
         assert.equal(dup.status, "imported");
-        assert.ok(dup.file.startsWith("openai/"), `newer route wins: ${dup.file}`);
+        assert.ok(dup.file.startsWith(`openai${sep}`), `newer route wins: ${dup.file}`);
     } finally {
         rmrf(dir);
     }
