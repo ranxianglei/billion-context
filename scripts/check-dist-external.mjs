@@ -85,6 +85,14 @@ const STATIC_REF_PATTERNS = [
 ];
 const DYNAMIC_REF_PATTERN = /\bimport\s*\(\s*["']([^"'\n]+)["']\s*\)/g;
 
+// A capture outside the module-specifier character set is a regex artifact,
+// not an import: #5636 — an error message ending in the word "import" fused
+// its closing quote with the next string literal on the same MINIFIED line
+// into a bogus side-effect ref (`static );decodedBytes=... @ line 935`).
+// Every char below cannot occur in a resolvable bare specifier, so dropping
+// such captures cannot hide a real external import.
+const NOT_A_SPECIFIER = /[\s"'`(){}[\];=<>$\\|&!,#`]/;
+
 function lineOf(text, index) {
     return text.slice(0, index).split("\n").length;
 }
@@ -96,6 +104,7 @@ function collectRefs(text, re, kind) {
     while ((m = re.exec(text)) !== null) {
         const spec = m[1];
         if (!spec || spec.startsWith(".") || spec.startsWith("/")) continue;
+        if (NOT_A_SPECIFIER.test(spec)) continue;
         const base = spec.replace(/^node:/, "").split("/")[0];
         if (NODE_BUILTINS.has(base)) continue;
         refs.push({ spec, kind, line: lineOf(text, m.index) });
