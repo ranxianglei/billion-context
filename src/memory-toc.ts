@@ -25,7 +25,7 @@ export interface BlockTocItem {
     effectiveMessageIds?: readonly string[];
 }
 
-export interface RenderTocOptions {
+interface RenderTocOptions {
     /** Number of MOST RECENT active blocks to list (default 10). Older blocks
      *  collapse into a single overflow line; `search_context` still reaches
      *  them. A value <= 0 lists every active block (legacy behaviour). */
@@ -38,7 +38,7 @@ export interface RenderTocOptions {
 export const DEFAULT_TOC_WINDOW = 10;
 
 /** Upper bound accepted by the knob so a typo cannot blow up the prompt. */
-export const MAX_TOC_WINDOW = 200;
+const MAX_TOC_WINDOW = 200;
 
 /**
  * Extract a concise topic from block.summary when block.topic is unset.
