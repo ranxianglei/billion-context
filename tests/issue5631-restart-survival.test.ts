@@ -538,9 +538,15 @@ async function runLane(lane: LaneShape, t: TestContext): Promise<void> {
     // upstream must keep eating the full multi-MB body every turn. If that
     // were ever cheap again, this arm (not the main one) would go red — the
     // suite proves it discriminates.
+    // Own recorder per arm: lastPrompt keys by URL only, so a shared recorder
+    // would baseline the control arm's first LCP against the MAIN arm's last
+    // prompt.
+    const ctrlRecorder = new UpstreamRecorder();
+    await ctrlRecorder.start();
+    t.after(() => ctrlRecorder.stop());
     const cctx: ArmContext = {
         lane,
-        recorder,
+        recorder: ctrlRecorder,
         sessionId: `rs5631-${lane.name}-ctrl`,
         history: [...fiber],
     };
