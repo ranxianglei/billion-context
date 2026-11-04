@@ -40,20 +40,24 @@ import {
 } from "billion-context-pi-subagents";
 import type { ExtensionAPI, ToolDefinition } from "./pi.js";
 import { loadConfigFile, type PiSubagentsFileConfig } from "../config.js";
+import { logHostEvent } from "./host-log.js";
 
 /** The four bili pi-plugin slash commands ownable via `pi.commands`. */
 export const PI_COMMAND_NAMES = ["acp", "acp-cache", "acp-rule", "acp-fleet"] as const;
 export type PiCommandName = (typeof PI_COMMAND_NAMES)[number];
-/** Default surface (#5055-adjacent): status + cache reconciliation stay on,
- *  the rarer acp-rule / acp-fleet register only when named explicitly. */
+/** Default surface: status + cache reconciliation stay on, the rarer
+ *  acp-rule / acp-fleet register only when named explicitly. */
 export const DEFAULT_PI_COMMANDS: readonly PiCommandName[] = ["acp", "acp-cache"];
 
 let warnedUnknownPiCommands = false;
+let warnedWrongTypePiCommands = false;
 
 /** Resolve `pi.commands` from billion-context.json into the set of slash
  *  commands to register. `undefined` → DEFAULT_PI_COMMANDS; `[]` or `false`
  *  → none; `true` → all four; arrays keep only known names (unknown ones warn
- *  once, honoring the never-silently-drop-user-config rule §7.3). */
+ *  once, honoring the never-silently-drop-user-config rule §7.3). Each
+ *  warning class is one-shot per process so stderr stays quiet across
+ *  session starts. */
 export function resolvePiCommands(raw: unknown): readonly PiCommandName[] {
     if (raw === undefined) return DEFAULT_PI_COMMANDS;
     if (raw === false || (Array.isArray(raw) && raw.length === 0)) return [];
@@ -72,8 +76,8 @@ export function resolvePiCommands(raw: unknown): readonly PiCommandName[] {
         return picked;
     }
     // Wrong-typed value: warn and fall back to the default surface.
-    if (!warnedUnknownPiCommands) {
-        warnedUnknownPiCommands = true;
+    if (!warnedWrongTypePiCommands) {
+        warnedWrongTypePiCommands = true;
         console.error(`bili-plugin(pi): pi.commands must be an array of command names or a boolean — got ${typeof raw}; using default ${JSON.stringify(DEFAULT_PI_COMMANDS)}`);
     }
     return DEFAULT_PI_COMMANDS;
@@ -84,7 +88,6 @@ export function resolvePiCommands(raw: unknown): readonly PiCommandName[] {
 export function piCommandsEnabled(): ReadonlySet<string> {
     return new Set(resolvePiCommands(loadConfigFile().pi?.commands));
 }
-import { logHostEvent } from "./host-log.js";
 
 const EMBEDDED_GLOBAL_KEY = Symbol.for("acp-delegate.embedded");
 

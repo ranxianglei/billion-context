@@ -56,12 +56,19 @@ test("resolvePiCommands: explicit list keeps known names, dedupes, drops unknown
     assert.equal(errors.length, 1);
 });
 
-test("resolvePiCommands: wrong type falls back to the default", () => {
-    // The warning is one-shot per module (already consumed by the previous
-    // test's unknown entry), so only the fallback result is assertable here.
-    assert.deepEqual(resolvePiCommands("yes"), [...DEFAULT_PI_COMMANDS]);
-    assert.deepEqual(resolvePiCommands(42), [...DEFAULT_PI_COMMANDS]);
-    assert.deepEqual(resolvePiCommands({ acp: true }), [...DEFAULT_PI_COMMANDS]);
+test("resolvePiCommands: wrong type warns once and falls back to the default", () => {
+    const errors: string[] = [];
+    const saved = console.error;
+    console.error = (...args: unknown[]) => { errors.push(args.join(" ")); };
+    try {
+        assert.deepEqual(resolvePiCommands("yes"), [...DEFAULT_PI_COMMANDS]);
+        assert.deepEqual(resolvePiCommands(42), [...DEFAULT_PI_COMMANDS]);
+        assert.deepEqual(resolvePiCommands({ acp: true }), [...DEFAULT_PI_COMMANDS]);
+    } finally {
+        console.error = saved;
+    }
+    assert.equal(errors.length, 1, "one wrong-type warning despite three bad values");
+    assert.match(errors[0]!, /must be an array/);
 });
 
 test("piCommandsEnabled: reads the config file per call (edits apply without restart)", () => {
