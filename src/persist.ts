@@ -2408,6 +2408,26 @@ export class SessionStore {
     deleteKv(namespace: string, key?: string): number {
         return this.liveShadow().deleteKv(namespace, key);
     }
+
+    /** #3388/#3931 async twins: network backends (mysql) resolve ONLY through
+     *  these — the sync facades above miss-noop there (sync handle absent).
+     *  On sqlite they wrap the very same synchronous calls in one microtask. */
+    setKvAsync(namespace: string, key: string, value: unknown): Promise<void> {
+        return this.liveShadow().setKvAsync(namespace, key, value);
+    }
+
+    getKvAsync(namespace: string, key: string): Promise<unknown> {
+        return this.liveShadow().getKvAsync(namespace, key);
+    }
+
+    listKvAsync(namespace?: string, keyPrefix?: string): Promise<{ namespace: string; key: string; value: unknown; updatedAt: number }[]> {
+        return this.liveShadow().listKvAsync(namespace, keyPrefix);
+    }
+
+    deleteKvAsync(namespace: string, key?: string): Promise<number> {
+        return this.liveShadow().deleteKvAsync(namespace, key);
+    }
+
     private liveShadow(): UnifiedShadow {
         if (!this.replicasAvailable()) throw new Error("[storage] replicas require the unified store (storage.unified=shadow|full or BILI_STORAGE_UNIFIED); this instance runs legacy-only");
         return this.shadow as UnifiedShadow;
@@ -4156,4 +4176,17 @@ export function _setStoreForTest(store: SessionStore): void {
 export function _resetStoreForTest(): void {
     _store?.closeQuietly();
     _store = null;
+}
+
+/** #5548: advisory probe for the notice-receipt surface — does the EXISTING
+ *  singleton (if any) offer a usable unified KV (shadow/full sidecar)?
+ *  Never creates the store, never throws: false ⇒ callers keep the legacy
+ *  file path (a legacy-only instance has no KV rows to read or write). */
+export function unifiedKvActive(): boolean {
+    try {
+        if (_store === null) return false;
+        return _store.liveStorageStamp !== "legacy";
+    } catch {
+        return false;
+    }
 }

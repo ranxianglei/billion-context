@@ -98,6 +98,13 @@ entries:
     group: updates
     desc_en: "Override URL for the advisory feed."
     desc_zh: "公告源覆盖地址。"
+  - key: remoteAnnouncementsUrl
+    type: string
+    default: "unset (official feed: GitHub master announcements/remote.json)"
+    env: BILI_ANNOUNCEMENTS_URL
+    group: updates
+    desc_en: "Override URL for the remote announcement feed (#5548): JSON document {v: 1, entries: [...]} — same record schema as local announcement files, fetched every ~3 min like the other watchers, cached snapshot survives restarts/outages. Firewall installs point this at a relay mirror; bad pushes are rejected and the last good copy keeps showing. Local files in <config dir>/announcements/*.json always shadow same-id remote/builtin notices."
+    desc_zh: "远程公告源覆盖地址（#5548）：JSON 文档 {v: 1, entries: [...]}，记录格式与本地公告文件一致；与其他监视器一样约每 3 分钟拉取一次，缓存快照可跨重启/断网存活。无法直连的安装把它指向中继镜像；坏推送会被拒绝并继续显示上一份有效公告。配置目录 announcements/*.json 的本地文件按同 id 覆盖远程/内置公告。"
   - key: releaseNotesCheck
     type: boolean
     default: "true"
