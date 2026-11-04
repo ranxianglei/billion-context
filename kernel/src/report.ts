@@ -1,8 +1,9 @@
-import { clampPrefix } from "./truncate.js";
+import { clampPrefix, scrubLoneSurrogates } from "./truncate.js";
 import { isToolMessage } from "./message-kind.js";
 import { BLOCKED_REF, orderedRefPair, refForRaw } from "./refs.js";
 import { countMessageTokens } from "./tokenize.js";
 import { segmentGroups } from "./segment.js";
+import { activeBlockSpans, blocksSpannedByRange } from "./block-map.js";
 import { isLiveCheckpointCarrier } from "./state.js";
 import { computeProtectedRefs } from "./recommend.js";
 import {
@@ -463,8 +464,9 @@ function renderUncompressedRanges(
           protectedMessageIds: protectedRefs,
           shared,
         });
-      } catch {
-        return "\u26a0 not foldable: refs unresolvable";
+      } catch (err) {
+        const detail = err instanceof Error ? err.message : String(err);
+        return `\u26a0 not foldable: ${scrubLoneSurrogates(detail).slice(0, 120)}`;
       }
       if (proj.fatal?.kind === "zone")
         return "\u26a0 not foldable: protected zone only";
@@ -477,6 +479,7 @@ function renderUncompressedRanges(
   }
   lines.push(`Sorted by ${sort === "time" ? "time" : "size"}`);
   lines.push("");
+  const activeSpansForSpan = activeBlockSpans(state);
   for (const r of merged.slice(0, limit)) {
     // Ascending endpoint labels: non-monotonic refs (#1001) can make a
     // positional span's labels numerically descending (#2168).
@@ -484,9 +487,15 @@ function renderUncompressedRanges(
       r.count === 1
         ? r.startRef
         : orderedRefPair(r.startRef, r.endRef).join("–");
+    const spanned =
+      r.count > 1
+        ? blocksSpannedByRange(r.startRef, r.endRef, activeSpansForSpan)
+        : [];
+    const spanNote =
+      spanned.length > 0 ? ` · spans folded ${spanned.join(", ")}` : "";
     const flag = flagFor ? flagFor(r) : null;
     lines.push(
-      `  ${range}  (${r.count} msgs, ${formatTokens(r.tokens)}${r.count > 1 ? ` (${Math.round(r.tokens / r.count)}/msg)` : ""}) ${dominantTool(r.toolTokens)}${flag ? `  ${flag}` : ""}`,
+      `  ${range}${spanNote}  (${r.count} msgs, ${formatTokens(r.tokens)}${r.count > 1 ? ` (${Math.round(r.tokens / r.count)}/msg)` : ""}) ${dominantTool(r.toolTokens)}${flag ? `  ${flag}` : ""}`,
     );
   }
   if (merged.length > limit) {
