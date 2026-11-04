@@ -561,18 +561,21 @@ export async function* runCompressLoop(
         // overwrites the slot; clipped/oversized bodies retain no full copy and
         // the continuity check silently skips (no false positives from partial
         // forensics). Advisory; never blocks.
-        const prevSentFull = lastForwardedBody(ctx.session)?.full ?? null;
+        const prevSent = lastForwardedBody(ctx.session);
+        const prevSentFull = prevSent?.full ?? null;
         // #3803: generation-parameter fingerprint from the full wire object (never the capped head) —
         // a host reasoning-effort / thinking-config flip re-partitions the provider cache namespace.
         noteForwardedBody(ctx.session, wireBodyStr, wireArr !== undefined ? wireArr.length : null, credentialFingerprint(requestOptions.headers), generationParamFp(wireObj));
-        if (prevSentFull) {
-            // #564/#2627: provenance is resolved against the array that belongs to
-            // `wireBodyStr`. Shedding rewrites the body wholesale, so the pre-shed
-            // `wireArr` no longer describes it; rather than map stale indexes (which
-            // would exempt the wrong element), hand over NO array and let the judge
-            // skip the separator exemption for that round.
-            maybeJudgeContinuity(prevSentFull, wireBodyStr, ctx.protocol, ctx.session.id, ctx.separatorSlots?.(), wireShedRewrote ? undefined : wireArr);
-        }
+        // #564/#2627: provenance is resolved against the array that belongs to
+        // `wireBodyStr`. Shedding rewrites the body wholesale, so the pre-shed
+        // `wireArr` no longer describes it; rather than map stale indexes (which
+        // would exempt the wrong element), hand over NO array and let the judge
+        // skip the separator exemption for that round. The markers proven for the
+        // previous body are its entry-side ownership; the ones proven for this
+        // body ride its slot to the next round.
+        const ownedSeparatorCores = maybeJudgeContinuity(prevSentFull, wireBodyStr, ctx.protocol, ctx.session.id, ctx.separatorSlots?.(), wireShedRewrote ? undefined : wireArr, prevSent?.ownedSeparatorCores);
+        const sentSlot = lastForwardedBody(ctx.session);
+        if (sentSlot !== undefined && ownedSeparatorCores !== undefined) sentSlot.ownedSeparatorCores = ownedSeparatorCores;
         // #1843 L1: capture the round's image facts for the learning layer — the
         // text side must mirror what outboundPayloadBreakdown bills (messages +
         // wire overhead) so observed image mass = billed total - textSide.

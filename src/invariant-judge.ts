@@ -130,6 +130,15 @@ interface JudgeOptions {
    *  lookalike is fidelity evidence, never proof of producer ownership, so it
    *  must feed the match rather than be judged absent. Absent ⇒ legacy. */
   separatorOwnershipUnknown?: boolean;
+  /** #564/#2627 continuity: ENTRY indexes owned by bili's own separators —
+   *  the `separatorProvenance` the producer proved for the previous round's
+   *  body, which is this verdict's entry side. Such an element is bili's
+   *  marker, never a client obligation: it may match the next comparable
+   *  outbound element when byte-equal (whether or not this round claims it),
+   *  and when bili moved or removed it, its absence is no drop. It grants no
+   *  exemption to any other index. Absent ⇒ legacy (every entry element must
+   *  be matched). */
+  entrySeparatorProvenance?: ReadonlySet<number>;
 }
 
 function normText(m: CoreMessage): string {
@@ -334,6 +343,22 @@ export function judgeInboundOutbound(
   const isUnattributableSeparator = (k: number): boolean => ownershipUnknown && isSeparatorCoreShaped(exit[k]!);
   const isProvenOrUnattributableSeparator = (k: number): boolean =>
     (ownedSep !== undefined && ownedSep.has(k)) || isUnattributableSeparator(k);
+  // #564/#2627 continuity: an entry marker the producer proved it owned last
+  // round is bili's, not the client's. It consumes the NEXT comparable outbound
+  // element only when byte-equal — no gap scan, so a lookalike further down can
+  // never pull the cursor past real history — and otherwise bili moved or
+  // removed its own marker: no finding, cursor unchanged. Returns the consumed
+  // outbound index, or -1.
+  const entryOwnedSep = opts.entrySeparatorProvenance;
+  const matchOwnedEntrySeparator = (e: CoreMessage, from: number, end: number): number => {
+    const eCarrier = isCarrier(e);
+    for (let k = from; k < end; k++) {
+      const x = exit[k]!;
+      if (isReasoning(x) || (!eCarrier && isCarrier(x))) continue;
+      return stableEqual(e, x) ? k : -1;
+    }
+    return -1;
+  };
   const violations: Violation[] = [];
   let matched = 0;
   let total = 0;
@@ -363,6 +388,11 @@ export function judgeInboundOutbound(
     for (let i = rts!; i < entry.length; i++) {
       const e = entry[i];
       if (isReasoning(e)) continue;
+      if (entryOwnedSep !== undefined && entryOwnedSep.has(i)) {
+        const k = located ? matchOwnedEntrySeparator(e, j, exit.length) : -1;
+        if (k >= 0) { total++; matched++; j = k + 1; }
+        continue;
+      }
       total++;
       const eCarrier = isCarrier(e);
       let found = -1;
@@ -413,6 +443,11 @@ export function judgeInboundOutbound(
       const e = entry[i];
       if (isReasoning(e)) continue;
       if (folded && j >= freezeEnd) { foldStart = i; break; } // remainder is the folded region
+      if (entryOwnedSep !== undefined && entryOwnedSep.has(i)) {
+        const k = matchOwnedEntrySeparator(e, j, freezeEnd);
+        if (k >= 0) { total++; matched++; j = k + 1; }
+        continue;
+      }
       total++;
 
       // Stateful hosts re-send previously-injected carriers in their inbound
@@ -600,8 +635,12 @@ function armed(): boolean {
   return invariantJudgeEnabled();
 }
 
-export function maybeRunInvariantJudge(input: InvariantJudgeInput): void {
-  if (!armed()) return;
+/** Returns the exit-core indexes the producer proved it owns in `input.body`
+ *  (undefined when none were proven or the judge is disarmed) — the caller
+ *  keeps them with the sent body so the next loop round's continuity verdict
+ *  knows which of its entry markers are bili's own. */
+export function maybeRunInvariantJudge(input: InvariantJudgeInput): ReadonlySet<number> | undefined {
+  if (!armed()) return undefined;
   try {
     const entry = input.originalMessages ?? [];
     let parsed = input.parsed;
@@ -609,7 +648,7 @@ export function maybeRunInvariantJudge(input: InvariantJudgeInput): void {
       parsed = JSON.parse(input.body) as Record<string, unknown>;
     }
     const exitCores0 = parseExitCores(input.body, input.protocol, parsed);
-    if (!exitCores0) return; // unparseable/unknown wire → skip, never false-positive
+    if (!exitCores0) return undefined; // unparseable/unknown wire → skip, never false-positive
     const exitCores = fault ? fault([...exitCores0]) : exitCores0;
     const separatorProvenance = input.separatorManifest !== undefined && input.protocol === "responses" && Array.isArray(parsed?.input)
       ? separatorCoreProvenance(separatorProvenanceSet(input.separatorManifest, parsed.input, typeof input.body === "string" ? input.body : undefined), exitCores)
@@ -623,8 +662,10 @@ export function maybeRunInvariantJudge(input: InvariantJudgeInput): void {
     // able to see folded-but-clean traffic too, not just violations — that is
     // how the live I2 path proves a real fold stayed green (#3842).
     (sink ?? defaultSink(input.sessionId, "main"))({ ...v, lane: "main" });
+    return separatorProvenance !== undefined && separatorProvenance.size > 0 ? separatorProvenance : undefined;
   } catch {
     // advisory layer: a judge failure must never disturb the request
+    return undefined;
   }
 }
 
@@ -635,6 +676,9 @@ export function maybeRunInvariantJudge(input: InvariantJudgeInput): void {
 // absent and the check silently skips — no false positives from partial
 // forensics). Same-wire by construction; a mid-session wire switch fails the
 // parse/pair loudly, which is exactly the #3849 signal.
+// Returns the exit-core indexes proven bili-owned in `body` — computed even
+// when `prev` is absent — for the caller to hand back as `prevSeparatorProvenance`
+// with the next round.
 export function maybeJudgeContinuity(
   prev: string | Buffer | null | undefined,
   body: string | Buffer,
@@ -647,12 +691,15 @@ export function maybeJudgeContinuity(
    *  marker — the judge then behaves as before. */
   slots?: readonly SeparatorSlot[],
   bodyArr?: readonly unknown[],
-): void {
-  if (!armed() || !prev) return;
+  /** #564/#2627: what this function (or the main-lane judge) returned for
+   *  `prev` — the entry markers bili proved it owned when it sent them. */
+  prevSeparatorProvenance?: ReadonlySet<number>,
+): ReadonlySet<number> | undefined {
+  const hasSlots = Array.isArray(slots) && slots.length > 0 && Array.isArray(bodyArr);
+  if (!armed() || (!prev && !hasSlots)) return undefined;
   try {
-    const entry = parseExitCores(prev, protocol);
     const exitCores0 = parseExitCores(body, protocol);
-    if (!entry || !exitCores0) return;
+    if (!exitCores0) return undefined;
     const exitCores = fault ? fault([...exitCores0]) : exitCores0;
     // #564/#2627: the producer's carrier objects are matched against `bodyArr` —
     // the exact array the sent body was serialized from — by one linear reference
@@ -661,16 +708,22 @@ export function maybeJudgeContinuity(
     // that came from the producer's item and nowhere else. A missing or replaced
     // carrier, or an absent array (shed round), claims nothing.
     const provenance = (() => {
-      if (!Array.isArray(slots) || slots.length === 0 || !Array.isArray(bodyArr)) return undefined;
-      const manifest = collectSeparatorManifest(bodyArr, slots, typeof body === "string" ? body : undefined);
+      if (!hasSlots) return undefined;
+      const manifest = collectSeparatorManifest(bodyArr!, slots!, typeof body === "string" ? body : undefined);
       if (manifest === undefined) return undefined;
-      return separatorCoreProvenance(separatorProvenanceSet(manifest, bodyArr, typeof body === "string" ? body : undefined), exitCores);
+      const owned = separatorCoreProvenance(separatorProvenanceSet(manifest, bodyArr!, typeof body === "string" ? body : undefined), exitCores);
+      return owned.size > 0 ? owned : undefined;
     })();
+    const entry = prev ? parseExitCores(prev, protocol) : undefined;
+    if (!entry) return provenance;
     const v = judgeInboundOutbound(entry, exitCores, {
-      ...(provenance !== undefined && provenance.size > 0 ? { separatorProvenance: provenance } : {}),
+      ...(provenance !== undefined ? { separatorProvenance: provenance } : {}),
+      ...(prevSeparatorProvenance !== undefined && prevSeparatorProvenance.size > 0 ? { entrySeparatorProvenance: prevSeparatorProvenance } : {}),
     });
     (sink ?? defaultSink(sessionId, "loop"))({ ...v, lane: "loop" });
+    return provenance;
   } catch {
     // advisory layer: a judge failure must never disturb the request
+    return undefined;
   }
 }

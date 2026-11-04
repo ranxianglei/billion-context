@@ -13,7 +13,7 @@ import { type BiliMessage } from "acp-kernel/wire";
 import { absorbToolName, applyAbsorbView } from "../absorb.js";
 import { APIG_RESIGN_SCHEME, resignApig } from "../apig-resign.js";
 import { noteSuccessfulForward } from "../cache-keepalive.js";
-import { credentialFingerprint, generationParamFp, noteClientAbort, noteForwardedBody, noteForwardedImageFacts, noteInboundMessages, noteOutboundContextEstimates, settleOverflowCalibration, settleUsageReport, withCacheCapture } from "../cache-ledger.js";
+import { credentialFingerprint, generationParamFp, lastForwardedBody, noteClientAbort, noteForwardedBody, noteForwardedImageFacts, noteInboundMessages, noteOutboundContextEstimates, settleOverflowCalibration, settleUsageReport, withCacheCapture } from "../cache-ledger.js";
 import { warnCacheCollapse } from "../cache-warn.js";
 import { stampOutbound } from "../chain-checkpoint.js";
 import { applyCompatDropFields, dropCompatFieldsJson, resolveCompatDropFields } from "../compat-drop.js";
@@ -969,7 +969,9 @@ async function forwardCaptured(
         const renderTailStart = typeof prepared.session.metadata["snapshotRenderTailStart"] === "number"
             ? (prepared.session.metadata["snapshotRenderTailStart"] as number)
             : undefined;
-        maybeRunInvariantJudge({
+        // #564/#2627: keep the proven marker indexes with the body just noted, so a
+        // compress-loop round re-sending these markers judges them as bili's own.
+        const ownedSeparatorCores = maybeRunInvariantJudge({
             // #2078: reuse the seam block's single parse of sentBody instead of
             // paying another full JSON.parse of the largest payload per turn.
             // Kiro: judge with the built-in role re-voicing undone (see judgeRoleRestore).
@@ -999,6 +1001,8 @@ async function forwardCaptured(
             ...(separatorOwnershipUnknown ? { separatorOwnershipUnknown: true } : {}),
             ...(renderTailStart !== undefined ? { renderTailStart } : {}),
         });
+        const sentSlot = lastForwardedBody(prepared.session);
+        if (sentSlot !== undefined && ownedSeparatorCores !== undefined) sentSlot.ownedSeparatorCores = ownedSeparatorCores;
     }
     // #3148: round-level breaker — while the endpoint is provably dead, fail
     // fast WITHOUT contacting it instead of burning another full cold send +
