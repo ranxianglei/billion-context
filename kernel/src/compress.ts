@@ -1835,7 +1835,13 @@ function applySingleRange(input: SingleRangeInput): SingleRangeOutcome {
 
   for (const consumedId of consumedBlockIds) {
     const consumed = blockById(input.state, consumedId);
-    if (consumed) consumed.active = false;
+    if (consumed) {
+      consumed.active = false;
+      // Lineage: name the consumer so "inactive" stays diagnosable — an
+      // orphaned inactive block with no supersedes id is a GC/orphan/expand
+      // event, one WITH it was absorbed into that parent fold.
+      consumed.supersedesBlockId = blockId;
+    }
   }
 
   return { tokens: compressedTokens, warnings };

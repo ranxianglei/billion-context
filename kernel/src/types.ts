@@ -107,6 +107,15 @@ export interface CompressionBlock {
    *  Undefined = unstamped traffic or provably-loose coverage; never guessed. */
   startSeq?: number;
   endSeq?: number;
+  /** Nested-compression lineage: id of the newer block that CONSUMED this one.
+   *  Set once at applySingleRange's single consumption site (which deactivates
+   *  every input block). Absent = never consumed — all other deactivation causes
+   *  (orphan GC, host expand, stale-view reconciliation) leave no lineage, so
+   *  storage/web/stats derivations can tell "absorbed into parent" apart from
+   *  every other reason a block went inactive. Round-trips through the
+   *  payload_json serialization; the read-side column mapping lives in
+   *  src/storage/ingest.ts. */
+  supersedesBlockId?: string;
 }
 
 /** A compression block's current ref span, pre-resolved for display. */
@@ -634,6 +643,16 @@ export interface CompressibleRange {
    *  has no index gap and the index check alone would let mergeRangesToThreshold
    *  bridge back into one doomed span bracketing the dead ref. */
   noMergeBefore?: boolean;
+  /** Display-only honesty flag (#5508 family): active block ids whose owned
+   *  messages sit in ref-number holes INSIDE this range's label — territory
+   *  invisible on surface-replacing (pruned) views, where the folded messages
+   *  left the array without leaving a gap flag, so a contiguous run renders as
+   *  one label that actually spans an already-folded block. NEVER participates
+   *  in eligibility (KDD #12: the projection/fold gate is the single source of
+   *  truth); it only tells the model which advertised spans already contain
+   *  folded territory (blindly resubmitting such a span nests those blocks
+   *  into a redundant parent fold). Absent on hand-built ranges. */
+  crossesCoveredBy?: string[];
 }
 
 export interface ProtectedRange {

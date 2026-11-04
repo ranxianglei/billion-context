@@ -602,7 +602,9 @@ export function buildRecap(state: CompressionState, blockId?: string): string {
       return `Block ${blockId} not found. Active blocks: ${activeList}`;
     }
     if (!block.active) {
-      return `Block ${blockId} is inactive (deactivated by nested compression).`;
+      return block.supersedesBlockId
+        ? `Block ${blockId} is inactive (deactivated by nested compression, superseded by ${block.supersedesBlockId}).`
+        : `Block ${blockId} is inactive (deactivated by nested compression).`;
     }
     const range = `${block.effectiveMessageIds.length} messages`;
     return `[Compressed conversation section]\n${block.summary}\n\n[${blockId} | ${range} | topic: "${block.topic ?? "(none)"}"]`;
