@@ -417,8 +417,11 @@ test("resolveStorageWalJournalSizeLimit: env wins, garbage falls through, file t
  *  the LEGACY-mode view of the same files plus the deterministic one-time
  *  ledger alignment (same seqByRaw the full-mode load aligned against). The
  *  corpus manifest keeps pinning the PURE view (storage-corpus suite); this
- *  oracle pins the equivalence "full serve = legacy serve + alignment". */
-function alignedLegacyDigest(caseDir: string, meta: { protocol: string; id: string }, seqByRawId: Map<string, number>): string {
+ *  oracle pins the equivalence "full serve = legacy serve + alignment".
+ *  #5599: the alignment is applied only when the one-time re-stamp's
+ *  completeness guard would pass (every mapped id owns a row) — an imported
+ *  collapsed ledger keeps its legacy refs, mirroring the cold-load path. */
+function alignedLegacyDigest(caseDir: string, meta: { protocol: string; id: string }, probe: UnifiedStore): string {
     const legacyDir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-legacy-oracle-"));
     try {
         fs.cpSync(caseDir, path.join(legacyDir, "case"), { recursive: true });
@@ -435,7 +438,16 @@ function alignedLegacyDigest(caseDir: string, meta: { protocol: string; id: stri
             assert.ok(pure, "legacy oracle load returned null");
             const view = toLegacyLike(pure);
             const state = structuredClone(view.state as Record<string, unknown>);
-            restampRefsToLedger(state as never, seqByRawId);
+            // #5599 completeness mirror of the cold-load re-stamp gate: an
+            // imported collapsed ledger (folded ghosts own no rows) keeps its
+            // legacy refs instead of being stamped.
+            const byRaw = (state.messageRefs as { byRaw: Record<string, string> }).byRaw;
+            const mapped = Object.keys(byRaw).filter((rawId) => byRaw[rawId] !== "BLOCKED");
+            const seqByRawId = probe.seqByRaw(meta.id);
+            const backed = probe.backedMsgIds(meta.id, mapped);
+            if (seqByRawId.size > 0 && backed !== null && !mapped.some((rawId) => !backed.has(rawId))) {
+                restampRefsToLedger(state as never, seqByRawId);
+            }
             delete state.refLedgerAligned;
             return sessionDigest({ ...view, state: state as never });
         } finally {
@@ -469,7 +481,7 @@ test("storage unified FULL mode: read path serves from the index with organic im
             assert.ok(probe.getSessionRow(meta.id), "organic import did not populate index.db");
             // #4316 PR3/3: expected = legacy view of the same files + the
             // deterministic alignment against these very rows.
-            expectedDigest = alignedLegacyDigest(caseDir, meta, probe.seqByRaw(meta.id));
+            expectedDigest = alignedLegacyDigest(caseDir, meta, probe);
         } finally {
             probe.close();
         }
@@ -567,7 +579,7 @@ test("storage unified: file-config storage.unified selects the mode; env tier st
         const probeStore = UnifiedStore.open(path.join(caseDir, "index.db"));
         let fileTierDigest = "";
         try {
-            fileTierDigest = alignedLegacyDigest(caseDir, meta, probeStore.seqByRaw(meta.id));
+            fileTierDigest = alignedLegacyDigest(caseDir, meta, probeStore);
         } finally {
             probeStore.close();
         }
