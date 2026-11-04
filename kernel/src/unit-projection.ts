@@ -248,7 +248,7 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
   });
   if (mediaExcluded.length > 0) {
     warnings.push(
-      `Excluded ${mediaExcluded.length} message(s) carrying unrecoverable media (remote URL / file references with no stored bytes) from compression range — folding would destroy them permanently (billion-context#1188/#2609). Inline images fold normally and stay restorable via decompress({ imageRef }).`,
+      `Excluded ${mediaExcluded.length} message(s) carrying unrecoverable media (no stored bytes and no re-access handle in the message) from compression range — folding would destroy them permanently (billion-context#1188/#2609). Ref-based media (remote URL / file id) folds normally since #5620 with its handle recorded in the summary; inline images fold normally too and stay restorable via decompress({ imageRef }).`,
     );
   }
 
