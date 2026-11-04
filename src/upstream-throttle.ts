@@ -292,7 +292,7 @@ const NOOP_CLASSIFICATION_RESERVATION: ThrottleClassificationReservation = {
     release(): void {},
 };
 
-export interface ThrottleLocalReject {
+interface ThrottleLocalReject {
     /** 429 while under budget (Retry-After attached); 424 terminal. */
     status: 429 | 424;
     code: "bili_throttle_hold" | "bili_throttle_terminal";
@@ -305,7 +305,7 @@ export interface ThrottleLocalReject {
     model?: string;
 }
 
-export interface UpstreamThrottleGate {
+interface UpstreamThrottleGate {
     reject?: ThrottleLocalReject;
     /** Present only when this send claimed one or more expired hold slots. */
     probeToken?: symbol;
