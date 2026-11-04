@@ -109,7 +109,11 @@ export interface RenderWorld {
     textCum: number;
     /** Cumulative image-reserve contribution of frozen rows. */
     imgCum: number;
-    /** Engaged-turn tick — % PF_RENDER_AUDIT_EVERY === 0 ⇒ audit due. */
+    /** Green (fast-served) engaged-turn tick — % PF_RENDER_AUDIT_EVERY === 0
+     *  ⇒ audit due. Consumed (zeroed) by ANY legacy full-capture round served,
+     *  which IS the audit (the full byte path ran to completion).
+     *  Invariant: a red-for-audit-due turn always lands in a legacy capture,
+     *  so the obligation cannot stall the lane after N ticks. */
     auditTick: number;
 }
 
@@ -207,11 +211,18 @@ function hydrateMirror(store: SessionStore, sid: string, log?: LogFn): RenderWor
         const rowsParsed: unknown[] = new Array(rowsRaw.length);
         for (let i = 0; i < rowsRaw.length; i++) {
             const rj = rowsRaw[i].rowJson;
-            if (rj === null || rowsRaw[i].pos !== i) return null; // tombstone/gap = inconsistent
+            if (rj === null || rowsRaw[i].pos !== i) {
+                // Row table inconsistent on disk (tombstone where a row must
+                // be, or a gap): judge the plane dead LOUDLY — same discipline
+                // as an S4 checksum mismatch, never a silent fallback.
+                log?.("error", `[${sid}] #5664 render plane judged dead: row-table inconsistency at pos ${rowsRaw[i].pos} (expected contiguous ${i})`);
+                return null;
+            }
             rows[i] = rj;
             try {
                 rowsParsed[i] = JSON.parse(rj);
             } catch {
+                log?.("error", `[${sid}] #5664 render plane judged dead: row parse failed at pos ${i}`);
                 return null;
             }
         }
@@ -314,8 +325,10 @@ export function renderPlaneGate(args: RenderGateArgs): RenderGateDecision {
     return { ok: true, rw, F };
 }
 
-/** Called AFTER the decision is consumed (keeps the audit cadence honest —
- *  a gated-off-for-pressure turn still counts as engaged). */
+/** Bumped once per GREEN round (prepare-openai gate block). The obligation is
+ *  consumed by any legacy full-capture round (commitRenderCapture zeroes it):
+ *  cadence = "one full pass per PF_RENDER_AUDIT_EVERY fast rounds", red turns
+ *  included among those full passes. */
 export function bumpAuditTick(sid: string): void {
     const rw = mirrors.get(sid);
     if (rw) rw.auditTick += 1;
@@ -348,8 +361,13 @@ export function spliceOutboundRows<T>(rw: RenderWorld, F: number, tail: T[]): T[
     const out: T[] = [];
     // rowsParsed entries are JSON.parse of THIS plane's previously captured
     // rows — exactly T elements by construction (capture stores what egress
-    // emitted, and egress emitted T).
-    out.push(...(rw.rowsParsed.slice(0, prefixLen) as T[]));
+    // emitted, and egress emitted T). Shallow-clone each cached object: these
+    // doubles as next round's verify baseline, so no downstream consumer may
+    // alias-mutate the mirror cache (review P2-5).
+    for (const x of rw.rowsParsed.slice(0, prefixLen)) {
+        const y: T = x !== null && typeof x === "object" ? ({ ...(x as object) } as T) : (x as T);
+        out.push(y);
+    }
     out.push(...tail);
     return out;
 }
@@ -391,8 +409,24 @@ export function diffRowLists(prev: string[], cur: string[]): "equal" | "append" 
     return "recast";
 }
 
+/** sids whose row payload carried a literal NUL and were therefore refused
+ *  persistence (node:sqlite silently TRUNCATES bound strings at the first \0
+ *  — storing would corrupt the row with S4 unable to see it, since the
+ *  checksum only covers checkpoint meta). Loud-once, then fail-soft per turn:
+ *  the in-memory mirror keeps serving this process's lifetime; disk simply
+ *  stops advancing until restart/caps-flip recast is possible again. */
+const nulRejectedSids = new Set<string>();
+
 export function commitRenderCapture(args: CaptureArgs): { committed: boolean; op: "none" | "append" | "cast" | "recast" } {
     const { store, sid, caps, log } = args;
+    const hasNul = args.rowStrings.some((rj) => rj.includes("\u0000"));
+    if (hasNul) {
+        if (!nulRejectedSids.has(sid)) {
+            nulRejectedSids.add(sid);
+            log?.("error", `[${sid}] #5664 render row carries a literal NUL (node:sqlite truncates it silently) — plane persistence disabled for this sid`);
+        }
+        return { committed: false, op: "none" };
+    }
     let rw = mirrors.get(sid);
     if (rw === undefined && !mirrors.has(sid)) {
         const hydrated = hydrateMirror(store, sid, log);
@@ -441,6 +475,11 @@ export function commitRenderCapture(args: CaptureArgs): { committed: boolean; op
         touchMirror(rw);
         return { committed: true, op: "append" };
     }
+    // A full-path round IS the audit regardless of verdict (the legacy byte
+    // path ran to completion) — consume the cadence obligation here, or a
+    // clean long run would dead-lock on "audit-due" after N ticks (only
+    // cast/recast zeroed it before this fix).
+    if (args.mode === "legacy") rw.auditTick = 0;
     // legacy full-capture: diff against truth, minimal commit.
     const verdict = diffRowLists(rw.rows, args.rowStrings);
     if (verdict === "equal") {
@@ -528,5 +567,6 @@ export function watermarkV6RenderDebugState(sessionId: string): { sids: RenderDe
 export function _resetWatermarkV6RenderTestState(): void {
     mirrors.clear();
     sessionSids.clear();
+    nulRejectedSids.clear();
     mirrorBytes = 0;
 }

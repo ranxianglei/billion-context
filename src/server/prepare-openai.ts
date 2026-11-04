@@ -41,7 +41,7 @@ import { injectOpenaiTool, injectTool } from "./inject.js";
 import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
 import { featureEnabled } from "../rollout.js";
 import { evaluateWatermarkFastpath, finalizeWatermarkTurn, type FastpathHit, type FastpathOutcome } from "./fastpath.js";
-import { evaluateWatermarkV6, finalizeWatermarkV6, PF_SESSION_HEADER, watermarkV6DebugState, type V6Outcome } from "./fastpath-v6.js";
+import { evaluateWatermarkV6, finalizeWatermarkV6, FastpathV6IdentityFault, PF_SESSION_HEADER, watermarkV6DebugState, type V6Outcome } from "./fastpath-v6.js";
 import { bumpAuditTick, commitRenderCapture, renderPlaneGate, spliceOutboundRows, verifyRenderWindow, type RenderCaps, type RenderGateDecision, type RenderWorld } from "./fastpath-v6-render.js";
 import { getStore } from "../persist.js";
 import { collectRequestIds, probeRequestMembership } from "../request-membership.js";
@@ -382,6 +382,10 @@ export async function prepareOpenai(
                     session.state.nextRuleId = Math.max(session.state.nextRuleId ?? 1, scratch.nextRuleId ?? 1);
                     return t;
                 } catch (err) {
+                    // Identity-plane faults are deterministic 400s — a
+                    // retry-pass over them would turn fail-fast into
+                    // retry-pass (review P2-6); everything else falls back.
+                    if (err instanceof FastpathV6IdentityFault) throw err;
                     log("warn", `[${sessionId}] #5664 render window pass failed (${String(err)}) — legacy full pass this turn`);
                     renderFast = null;
                 }
@@ -390,8 +394,11 @@ export async function prepareOpenai(
         })();
         if (renderFast === null) {
             session.state = turn.state;
-            adoptContentStore(session, turn.contentStore);
         }
+        // Content-store adoption is cheap (no-op without new entries) and must
+        // NOT defer to the next full pass: CCR refs minted on a fast round are
+        // already referenced by the outbound placeholder (review P2-4).
+        adoptContentStore(session, turn.contentStore);
         // #4528: split the kernel pass from its post-processing scan passes so
         // each is a bounded synchronous stretch rather than one long block.
         await yieldToEventLoop();
@@ -522,7 +529,11 @@ export async function prepareOpenai(
             const rw = renderFast.rw;
             const wpWindowLen = wpHit?.windowCores.length ?? 0;
             const committedTail = mappedAll.slice(0, Math.min(renderFast.F + wpWindowLen, mappedAll.length));
-            renderedImageDelta = imageReserveFor(session, "openai", { model: parsed.model, messages: committedTail } as unknown as OpenAIRequestBody, opts, billingUpstream ?? upstreamOrigin);
+            // Image reserve DELTA covers only this turn's NEW rows — the F
+            // frozen-window rows' reserve already sits in rw.imgCum; counting
+            // them again here drifts the ledger by a whole window each green
+            // round (review P1-2). slice(F) aligns with the captured tail.
+            renderedImageDelta = imageReserveFor(session, "openai", { model: parsed.model, messages: committedTail.slice(renderFast.F) } as unknown as OpenAIRequestBody, opts, billingUpstream ?? upstreamOrigin);
             if (verifyRenderWindow(committedTail.slice(0, renderFast.F).map((m) => JSON.stringify(m)), rw, renderFast.F)) {
                 rebuiltMessages = spliceOutboundRows(rw, renderFast.F, committedTail);
                 renderedCaptureStrings = [...rw.rows.slice(0, rw.rows.length - renderFast.F), ...committedTail.map((m) => JSON.stringify(m))];
@@ -769,15 +780,22 @@ export async function prepareOpenai(
     if (renderedCaptureStrings !== null && renderCapturedSid !== null && renderCapturedCaps !== null && featureEnabled("watermarkV6Render")) {
         const store = getStore();
         if (store.pfRenderAvailable()) {
-            const boundN = renderFast !== null && wpHit !== undefined ? renderFast.F + wpHit.windowCores.length : renderedCaptureStrings.length;
-            const sumsSrc = renderFast !== null ? processedMessages.slice(0, boundN) : processedMessages;
+            // steady-mode contract (CaptureSums "DELTAS for the tail"): rows
+            // AND sums cover ONLY this turn's new elements. The frozen window
+            // rows entered the ledger when they were first captured —
+            // re-appending them shifts every pos forward, doubles the table,
+            // and inflates estCum/textCum/imgCum by a whole window per green
+            // round (review P1-2 + tail-only rows fix). The slice past F is
+            // exactly the appended tail (committedTail was capped at F+kNew).
+            const steadyTailRows = renderFast !== null ? renderedTailObjects.slice(renderFast.F).map((m) => JSON.stringify(m)) : renderedCaptureStrings;
+            const sumsSrc = renderFast !== null ? processedMessages.slice(Math.min(renderFast.F, processedMessages.length)) : processedMessages;
             const capOp = commitRenderCapture({
                 sessionId,
                 store,
                 sid: renderCapturedSid,
                 mode: renderFast !== null ? "steady" : "legacy",
                 caps: renderCapturedCaps,
-                rowStrings: renderedCaptureStrings,
+                rowStrings: steadyTailRows,
                 sums: {
                     estCum: estimateCoreMessagesUpper(sumsSrc),
                     textCum: estimateCoreMessages(sumsSrc),

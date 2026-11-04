@@ -222,6 +222,34 @@ test("unit: S4 checksum tamper kills the mirror (hydrate-failed, loudly logged)"
     } finally { h.cleanup(); }
 });
 
+// Review round 1 blind-spot pins (issue #5664): session teardown must wipe the
+// three render tables in the same cascade, and re-running the migration on an
+// already-v12 sidecar must be a no-op that leaves rows untouched.
+test("unit: session cascade wipes render tables; v12 re-migration is a no-op", () => {
+    const h = makeH("cascade");
+    try {
+        const b1 = makeBody([{ role: "user", content: "hello" }]);
+        const r1 = v6Eval(h, "s-cas", b1, ["id0"]);
+        r1.fin();
+        const sid = r1.sid!;
+        const cast = commitRenderCapture({ sessionId: "s-cas", store: h.store, sid, mode: "legacy", caps: capsFor("none"), rowStrings: ['{"a":1}', '{"b":2}'], sums: { estCum: 2, textCum: 2, imgCum: 0 } });
+        assert.equal(cast.op, "cast");
+        assert.equal(h.store.pfRenderRows(sid).length, 2);
+        // Re-opening the sidecar re-runs the migrator on an already-v12
+        // database: must be a no-op that leaves rows untouched (review round 1
+        // blind spot: explicit 12→12 idempotency).
+        const shadow2 = UnifiedShadow.maybeOpen(h.dir, { BILI_STORAGE_UNIFIED: "shadow" }, (r) => r as never);
+        assert.ok(shadow2, "second open must tolerate an already-migrated sidecar");
+        assert.equal(shadow2.pfRenderAvailable(), true);
+        assert.equal(shadow2.pfRenderRows(sid).length, 2);
+        shadow2.close();
+        // Session teardown cascades the render plane with the identity plane.
+        h.store.pfDeleteForSession("s-cas");
+        assert.equal(h.store.pfRenderRows(sid).length, 0);
+        assert.equal(h.store.pfRenderCkptIntact(sid), true); // no checkpoint left = vacuously intact
+    } finally { h.cleanup(); }
+});
+
 // ---------------------------------------------------------------------------
 // Golden tier: FAST emit == legacy emit at EVERY engaged turn, byte-for-byte,
 // across arm → steady fast rounds → client compaction (turn 8) → strategy
@@ -273,6 +301,8 @@ test("golden: cached-prefix splice equals the legacy full-path bytes end-to-end"
     const sessB = { id: "s-gold-b", state: stateB } as unknown as Session;
     let sidB: string | undefined;
     let fastRounds = 0, castOps = 0, recastOps = 0, legacyRounds = 0;
+    let totalSubmittedRows = 0; // volume discipline pin (see final assert)
+    let totalSubmittedText = 0;
     for (let tn = 1; tn <= 16; tn++) {
         const strategy = strategyOf(tn);
         const body = clientBody(tn);
@@ -293,6 +323,7 @@ test("golden: cached-prefix splice equals the legacy full-path bytes end-to-end"
         });
         let rebuilt: OpenAIMessage[];
         let captureStrings: string[];
+        let steadyAppendRows: string[] = [];
         let mode: "steady" | "legacy";
         if (gate.ok) {
             const sidNow = sidB;
@@ -327,15 +358,13 @@ test("golden: cached-prefix splice equals the legacy full-path bytes end-to-end"
             const mappedAll = mapEgress(pmW);
             const committedTail = mappedAll.slice(0, Math.min(F + (v.outcome.hit?.windowCores.length ?? 0), mappedAll.length));
             const vv = verifyRenderWindow(committedTail.slice(0, F).map((m) => JSON.stringify(m)), rw, F);
-            if (!vv) {
-                for (let k = 0; k < F; k++) {
-                    const a = JSON.stringify(committedTail[k]); const b = rw.rows[rw.rows.length - F + k];
-
-                }
-            }
             assert.equal(vv, true, `turn ${tn}: window verify failed — tail bytes drifted vs stored rows`);
             rebuilt = spliceOutboundRows<OpenAIMessage>(rw, F, committedTail);
             captureStrings = [...rw.rows.slice(0, rw.rows.length - F), ...committedTail.map((m) => JSON.stringify(m))];
+            // steady-mode contract: only THIS turn's new rows are appended to
+            // the plane (the slice past the F frozen window); the full list
+            // stays in captureStrings for the golden equation below.
+            steadyAppendRows = committedTail.slice(F).map((m) => JSON.stringify(m));
             mode = "steady";
             fastRounds++;
         } else {
@@ -348,10 +377,17 @@ test("golden: cached-prefix splice equals the legacy full-path bytes end-to-end"
             mode = "legacy";
             legacyRounds++;
         }
+        const srcRows = mode === "steady" ? steadyAppendRows : captureStrings;
+        // Length-based deterministic stand-in for the token estimators: what
+        // this tier exercises is the accumulation ALGEBRA — each row counted
+        // exactly once with its own cost, tail-only deltas on steady rounds.
+        const rowCost = (rs: string[]): number => rs.reduce((s, x) => s + x.length, 0);
         const op = commitRenderCapture({
-            sessionId: "s-gold-b", store: hB.store, sid: sidB!, mode, caps, rowStrings: captureStrings,
-            sums: { estCum: 0, textCum: 0, imgCum: 0 },
+            sessionId: "s-gold-b", store: hB.store, sid: sidB!, mode, caps, rowStrings: srcRows,
+            sums: { estCum: rowCost(srcRows), textCum: rowCost(srcRows), imgCum: 0 },
         });
+        totalSubmittedRows += srcRows.length;
+        totalSubmittedText += rowCost(srcRows);
         if (op.committed) {
             if (op.op === "cast") castOps++;
             else if (op.op === "recast") recastOps++;
@@ -361,11 +397,27 @@ test("golden: cached-prefix splice equals the legacy full-path bytes end-to-end"
             `turn ${tn} (${mode}${gate.ok ? "" : `, reason=${gate.reason}`}): lane emit diverged from legacy oracle`);
         assert.equal(stateB.blocks.length, 0, "assumption pin: no folds materialize in this synthetic conv");
         v.fin(); // plane advances AFTER capture — same order as prepare-openai
+        // Structural regression pin (review round 1, tail-only fix): the render
+        // table must track the identity ledger one-row-per-element at every
+        // turn boundary — a duplicate-append corruption shows up here instantly
+        // instead of hiding behind the byte equation.
+        assert.equal(hB.store.pfRenderRows(sidB!).length, watermarkV6DebugState("s-gold-b").worlds[sidB!]!.maxPos + 1,
+            `turn ${tn}: render table drifted from identity ledger (rows=${hB.store.pfRenderRows(sidB!).length})`);
     }
     assert.equal(castOps, 1, "exactly one cast (the arm turn)");
-    assert.ok(fastRounds >= 6, `expected several fast rounds, got ${fastRounds} (audit too aggressive?)`);
+    // ≥ 12 fast rounds = at least TWO full audit waves served green: the first
+    // proves the lane runs, the second proves any legacy round CONSUMES the
+    // audit obligation (pre-fix, tick froze at N and every later turn rode
+    // legacy forever — masked at the time by per-round recasts).
+    assert.ok(fastRounds >= 12, `expected ≥2 audit waves of fast rounds, got ${fastRounds} (audit obligation not consumed?)`);
     assert.ok(recastOps >= 1, "strategy flip at turn 10 must force ≥1 recast");
     assert.ok(legacyRounds >= 2, `arm + audit/caps-flip rounds must ride legacy (got ${legacyRounds})`);
+    // Volume discipline (steady deltas must stay O(new) per round, never
+    // O(full list)): pre-tail-fix behavior re-submitted the whole list each
+    // green round ⇒ ~8×final volume here.
+    const finalRowCount = hB.store.pfRenderRows(sidB!).length;
+    assert.ok(totalSubmittedRows <= 3 * finalRowCount,
+        `submitted row-volume ${totalSubmittedRows} vs final table ${finalRowCount} — steady rounds must append tails, not full lists`);
     // S4 truth intact at the end; mirror agrees with the last golden shape
     assert.equal(hB.store.pfRenderCkptIntact(sidB!), true);
     const dbgLhs = watermarkV6RenderDebugState("s-gold-b");
@@ -373,6 +425,11 @@ test("golden: cached-prefix splice equals the legacy full-path bytes end-to-end"
     const lhsRows = dbgLhs.sids[dbgLhs.sids.length - 1].rows;
     const rhsRows = goldens[goldens.length - 1].rows.length;
     assert.equal(lhsRows, rhsRows, "mirror row count must equal last golden row count");
+    // Sums algebra pin (review P1-2): every row's cost entered the cumulative
+    // ledger EXACTLY once — a frozen-window double-count would overshoot here.
+    const finalRowCost = hB.store.pfRenderRows(sidB!).reduce((s, r) => s + (r.rowJson?.length ?? 0), 0);
+    assert.ok(Math.abs(dbgLhs.sids[dbgLhs.sids.length - 1].textCum - finalRowCost) < Math.max(1, finalRowCost * 0.25),
+        `cumulative text ledger drifted from row truth (cum=${dbgLhs.sids[dbgLhs.sids.length - 1].textCum} vs rows=${finalRowCost}; submitted=${totalSubmittedText})`);
 
     // ---- phase 3: restart hydration — mirrors wiped, disk must continue -----
     _resetWatermarkV6RenderTestState();
