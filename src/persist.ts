@@ -424,7 +424,7 @@ const STALE_COLD_LOAD_WARN_MIN = 30;
 const FROZEN_SKIP_NOTICE_COOLDOWN_MS = 10 * 60_000;
 
 /** #5599 `bili storage migrate`: per-session outcome of the bulk legacy→unified import. */
-export interface LegacyMigrateSessionResult {
+interface LegacyMigrateSessionResult {
     id: string;
     /** Representative state file (relative to the sessions dir) for this id. */
     file: string;
