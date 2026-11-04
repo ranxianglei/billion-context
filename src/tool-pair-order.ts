@@ -77,7 +77,9 @@ function synthOutputFor<T extends ToolPairItem>(callType: string, id: string): T
     if (callType === "custom_tool_call")
         return { type: "custom_tool_call_output", call_id: id, output: LOST_OUTPUT_TEXT } as unknown as T;
     if (callType === "tool_search_call")
-        return { type: "tool_search_output", call_id: id, tools: [], execution: "client" } as unknown as T;
+        // status mirrors real Codex traffic ({type, call_id, status, execution, tools});
+        // #5670 probe 2026-11-04: upstream accepts the item with or without it.
+        return { type: "tool_search_output", call_id: id, status: "completed", tools: [], execution: "client" } as unknown as T;
     return { type: "function_call_output", call_id: id, output: LOST_OUTPUT_TEXT } as unknown as T;
 }
 

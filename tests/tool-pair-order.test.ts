@@ -197,8 +197,8 @@ test("#5670 I1: tool_search_call orphan mid-history gets a minimal tool_search_o
     const out = hoistTrappedToolItems(input);
     assert.deepEqual(types(out), ["tool_search_call", "tool_search_output", "message"]);
     assert.deepEqual(
-        out[1] as unknown as { type: string; call_id: string; tools: unknown[]; execution: string },
-        { type: "tool_search_output", call_id: "s", tools: [], execution: "client" },
+        out[1] as unknown as { type: string; call_id: string; status: string; tools: unknown[]; execution: string },
+        { type: "tool_search_output", call_id: "s", status: "completed", tools: [], execution: "client" },
     );
     assertNoTrap(out);
 });
