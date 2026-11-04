@@ -51,13 +51,37 @@ const SLOW_MS = 1500;
 // openai-sse closed=0 after the full poll, duration 20518ms; anthropic/
 // responses/json siblings 131–410ms in the same run; master main CI green
 // 40min earlier at 23a826d3 — same load-starvation draw, not a regression).
-// Doubled again to 40s on win32 only; the 10s gate stays everywhere else.
-const ABORT_TEARDOWN_BUDGET_MS = process.platform === "win32" ? 40000 : 10000;
+// That closes out the flat-raise ladder: the poller and the upstream mock
+// share ONE event loop with whatever is starving the runner, so a close event
+// cannot be delivered faster than the loop itself — an absolute wall-clock
+// budget measures the runner, not the teardown. The budget is therefore
+// extended by the poll's OWN measured event-loop lag (each tick that lands
+// late adds its lateness), capped at 2×base so a genuine hang still fails: on
+// a healthy loop the gate stays byte-for-byte the flat budget (zero
+// extension); under starvation the window grows with the measured lag up to
+// 2×base (win32: 20s base ⇒ ≤40s — the same ceiling a flat 40s raise would
+// give unconditionally, applied only when lag is actually observed). Same
+// relative-invariant discipline as the #3228/#3152-C error-delivery cells.
+const ABORT_TEARDOWN_BUDGET_MS = process.platform === "win32" ? 20000 : 10000;
+const TEARDOWN_POLL_MS = 100;
+
+/** May the teardown poll keep going? base + measured event-loop lag, capped
+ *  at 2×base — see the budget comment above for the starvation mechanics. */
+function teardownPollContinues(elapsedMs: number, baseMs: number, lagMs: number): boolean {
+    return elapsedMs < baseMs + Math.min(lagMs, baseMs);
+}
 
 async function awaitUpstreamTeardown(socketsClosed: () => number): Promise<void> {
-    const deadline = Date.now() + ABORT_TEARDOWN_BUDGET_MS;
-    while (socketsClosed() < 1 && Date.now() < deadline) {
-        await new Promise((r) => setTimeout(r, 100));
+    const base = ABORT_TEARDOWN_BUDGET_MS;
+    const t0 = Date.now();
+    let lagMs = 0;
+    let last = t0;
+    while (socketsClosed() < 1 && teardownPollContinues(Date.now() - t0, base, lagMs)) {
+        await new Promise((r) => setTimeout(r, TEARDOWN_POLL_MS));
+        const now = Date.now();
+        const lateBy = now - last - TEARDOWN_POLL_MS;
+        if (lateBy > 0) lagMs += lateBy;
+        last = now;
     }
 }
 
@@ -407,4 +431,14 @@ test("error-delivery x proxy-openai-sse: preflight failure after the early commi
         up.server.closeIdleConnections?.();
         await once(up.server, "close");
     }
+});
+
+test("abort x teardown-budget arithmetic: measured lag extends the window, capped at 2×base", () => {
+    const base = 10_000;
+    assert.equal(teardownPollContinues(9_999, base, 0), true, "healthy loop: inside the flat budget");
+    assert.equal(teardownPollContinues(10_000, base, 0), false, "healthy loop: boundary unchanged (zero lag ⇒ old flat gate byte-for-byte)");
+    assert.equal(teardownPollContinues(12_000, base, 5_000), true, "measured event-loop lag extends the window");
+    assert.equal(teardownPollContinues(15_000, base, 5_000), false, "extension equals the measured lag, no more");
+    assert.equal(teardownPollContinues(19_999, base, 999_999), true, "runaway lag cannot push the window past 2×base");
+    assert.equal(teardownPollContinues(20_000, base, 999_999), false, "hard ceiling at 2×base guarantees termination");
 });
