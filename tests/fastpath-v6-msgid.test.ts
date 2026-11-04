@@ -23,7 +23,7 @@ import type { SessionStore as SessionStoreType } from "../src/persist.ts";
 import { UnifiedShadow } from "../src/storage/shadow.ts";
 import type { Session } from "../src/session.ts";
 import {
-    evaluateWatermarkV6, finalizeWatermarkV6, FastpathV6IdentityFault, watermarkV6DebugState, PF_SESSION_HEADER,
+    evaluateWatermarkV6, finalizeWatermarkV6, FastpathV6IdentityFault, watermarkV6DebugState, clearWatermarkV6, PF_SESSION_HEADER,
 } from "../src/server/fastpath-v6.ts";
 import { PF_SEQ_HEADER, PF_TAIL_IDS_HEADER } from "../src/server/fastpath.ts";
 import type { V6Outcome } from "../src/server/fastpath-v6.ts";
@@ -412,5 +412,25 @@ test("§8-17/18 identity boundary: echo accelerates O(1); carrier change does NO
         h.store.pfDeleteForSession("s-bd");
         assert.deepEqual(h.store.pfMeta(sidA), { ckpt: null, log: [] }, "pfDeleteForSession sweeps all sids of this relay session");
         assert.equal(h.store.pfLatestGeom(sidB), null);
+    } finally { h.cleanup(); }
+});
+
+test("teardown: clearWatermarkV6 drops every in-memory mirror; the disk plane survives until pfDeleteForSession", () => {
+    const h = makeH("teardown");
+    try {
+        const log = makeLog();
+        const b1 = makeBody([{ role: "system", content: SYS }, { role: "user", content: "u1" }]);
+        const r1 = turn("s-tear", "car-tear", b1, ids(2, "-t"), log);
+        assert.equal(r1.outcome.decision, "arm");
+        const sid = r1.sid!;
+        assert.deepEqual(watermarkV6DebugState("s-tear").liveSids, [sid]);
+        const before = h.store.pfMeta(sid);
+        assert.ok(before !== null && before.log.length > 0, "arm committed rows to the disk plane");
+
+        clearWatermarkV6("s-tear");
+        assert.deepEqual(watermarkV6DebugState("s-tear"), { liveSids: [], worlds: {} }, "every mirror + pending commit dropped");
+        assert.deepEqual(h.store.pfMeta(sid), before, "disk plane untouched (delete-time cascade owns it)");
+        clearWatermarkV6("s-tear"); // idempotent
+        assert.equal(watermarkV6DebugState("s-tear").liveSids.length, 0);
     } finally { h.cleanup(); }
 });
