@@ -6,12 +6,12 @@ import test from "node:test";
 process.env.NODE_ENV = "test";
 
 import { defaultConfig } from "acp-kernel";
-import { startServer } from "../src/server.ts";
+import { startServer, effectiveTokenCount } from "../src/server.ts";
 import { lookupContextLimit } from "../src/config.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
-import { _resetSessionsForTest, absorbAbortedTurnGrowth, listSessions, noteAbortedTurn } from "../src/session.ts";
+import { _resetSessionsForTest, absorbAbortedTurnGrowth, getSession, listSessions, noteAbortedTurn } from "../src/session.ts";
 import type { Session } from "../src/session.ts";
 import { probeRequestMembership } from "../src/request-membership.ts";
 
@@ -63,6 +63,24 @@ import { probeRequestMembership } from "../src/request-membership.ts";
 //   C5 src/session.ts noteAbortedTurn — an untrustworthy meter carries FALSE
 //      information: it would delay the #5293 re-anchor ~4x and make #5415
 //      bank phantom growth debt; T8 pins skip-on-poison + stamp-on-usage.
+//
+// Round 3 (field report follow-up on v0.1.212, Pi/Responses lane): the
+// CYCLE-STALE demotion (#4383 — last send's report never settled) handed the
+// kernel meter the CHAR-BOUND estimate (localInputEstimate / raw upper),
+// inflating it ~2–4× over the measured size and crossing the kernel's
+// DESTRUCTIVE emergency-truncate band (0.95×window) — false clips then LATCH
+// until the next successful fold (#3939 ③), destroying delivered tool output
+// on a session whose measured usage sat safely under the band. Fix C6:
+// cycle-stale rides contextEstimateTokens (billing caliber, k̂-scaled where
+// provenance matches — the same replacement reading staleSmallAnchorFallback
+// returns for its own demotion class), capped by the current payload's own
+// upper bound. C6a/b pin the ride-on + the four unchanged calibers; C7
+// reproduces the field chain end-to-end (usage settle → no-report resend →
+// repeat prepare → pre-fix the clips latch); C7-control pins the kernel band
+// itself is untouched (genuine over-limit readings still clip). The two
+// remaining sub-defects that need the KERNEL side (destructive action on
+// unprovenanced evidence; truncate ignoring protectedTools) are tracked in a
+// separate kernel authorization request — host-side scope ends at C6.
 
 function okSse(inputTokens: number): string {
     return (
@@ -71,6 +89,20 @@ function okSse(inputTokens: number): string {
         `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "ok" } })}\n\n` +
         `event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: 0 })}\n\n` +
         `event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 3 } })}\n\n` +
+        `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`
+    );
+}
+
+// The field trigger condition: a completed stream that reports NO usage at
+// all (aborted/cancelled/flaky upstream). The relay send stamp stays pending
+// ("estimate") because settleUsageReport never fires without a numeric report.
+function okSseNoUsage(): string {
+    return (
+        `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { id: "m1", role: "assistant" } })}\n\n` +
+        `event: content_block_start\ndata: ${JSON.stringify({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } })}\n\n` +
+        `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "ok" } })}\n\n` +
+        `event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: 0 })}\n\n` +
+        `event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null } })}\n\n` +
         `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`
     );
 }
@@ -587,4 +619,207 @@ test("e2e #5500 C3-control: a usage-grade anchor still wins the minted codex com
         assert.equal(e2.response.usage.input_tokens, 12_000, "a trustworthy scalar keeps precedence over the raw-body estimate (#3617 negative direction)");
         assert.equal(h.bodies.length, afterSetup, "upstream untouched by the intercept");
     });
+});
+
+// ---------------------------------------------------------------------------
+// Round 3: cycle-stale demotion must not ride the char bound into the kernel
+// meter (C6 fix in effectiveTokenCount) — C6a/b unit pins, C7 field-chain e2e,
+// C7-control kernel-band pin.
+
+type CoreMsg = import("acp-kernel").CoreMessage;
+
+function meterSession(stats: Record<string, unknown>): Session {
+    // Real session object so every stats default matches production; only the
+    // fields under test are pinned (same discipline as entryBudgetScenario).
+    const s = getSession(`issue5500-meter-${Math.random().toString(36).slice(2)}`);
+    Object.assign(s.stats, stats as Partial<typeof s.stats>);
+    return s;
+}
+
+const METER_MSGS: CoreMsg[] = [
+    // The report's fixture scale: 639_673 chars ≈ 262_850 real tokens
+    // (~2.4 chars/token mixed content). raw upper == 639_673.
+    { id: "big", role: "user", contentType: "text", text: "x".repeat(639_673) },
+];
+
+test("unit #5500 C6a: a cycle-stale meter rides the billing-caliber estimate, not the char bound", () => {
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    const s = meterSession({
+        lastInputTokens: 262_850,
+        lastInputTokensSource: "usage",
+        lastUsagePayloadUpper: 639_673,
+        compressCreditTokens: 0,
+        contextTokensSource: "estimate",
+        localInputEstimate: 639_673,
+        contextEstimateTokens: 262_850,
+    });
+    const r = effectiveTokenCount(s, METER_MSGS);
+    assert.equal(r.tokens, 262_850, "cycle-stale rides contextEstimateTokens (billing caliber); pre-fix it returned the char bound 639_673 and crossed the destructive truncate band (#5500 round 3 / #4383)");
+    assert.equal(r.source, "estimate", "the ride-on is labeled estimate-grade — it must not masquerade as the settled anchor");
+});
+
+test("unit #5500 C6b: fresh-settle, anchor-less, legacy and k̂-overshoot calibers are UNCHANGED", () => {
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    // B1: the previous cycle SETTLED (contextTokensSource flipped back) — the
+    // measured anchor branch is untouched by C6.
+    const fresh = meterSession({
+        lastInputTokens: 262_850, lastInputTokensSource: "usage", lastUsagePayloadUpper: 639_673,
+        compressCreditTokens: 0, contextTokensSource: "usage", localInputEstimate: 639_673, contextEstimateTokens: 262_850,
+    });
+    const r1 = effectiveTokenCount(fresh, METER_MSGS);
+    assert.deepEqual(r1, { tokens: 262_850, source: "usage" }, "fresh settle keeps the measured anchor (#4383 regression guard)");
+
+    // B2: ANCHOR-LESS session (never reported) — #728's fail-closed bound must
+    // survive: with no usage-grade source there is nothing fresher to prefer.
+    const anchorless = meterSession({
+        lastInputTokens: 0, compressCreditTokens: 0,
+        contextTokensSource: "estimate", localInputEstimate: 639_673, contextEstimateTokens: 262_850,
+    });
+    const r2 = effectiveTokenCount(anchorless, METER_MSGS);
+    assert.deepEqual(r2, { tokens: 639_673, source: "estimate" }, "#728 never-reporting posture unchanged (char-bound fail-closed)");
+
+    // B3: cycle-stale but no contextEstimateTokens (legacy restored session) —
+    // graceful degradation to the legacy reading.
+    const legacy = meterSession({
+        lastInputTokens: 262_850, lastInputTokensSource: "usage", lastUsagePayloadUpper: 639_673,
+        compressCreditTokens: 0, contextTokensSource: "estimate", localInputEstimate: 639_673,
+    });
+    const r3 = effectiveTokenCount(legacy, METER_MSGS);
+    assert.deepEqual(r3, { tokens: 639_673, source: "estimate" }, "absent calibrated field falls back to the legacy reading");
+
+    // B4: mis-calibrated k̂ overshoots the payload's own bound — the min cap
+    // keeps C6 at or below today's fail-closed worst case.
+    const overshoot = meterSession({
+        lastInputTokens: 262_850, lastInputTokensSource: "usage", lastUsagePayloadUpper: 639_673,
+        compressCreditTokens: 0, contextTokensSource: "estimate", localInputEstimate: 639_673, contextEstimateTokens: 900_000,
+    });
+    const r4 = effectiveTokenCount(overshoot, METER_MSGS);
+    assert.deepEqual(r4, { tokens: 639_673, source: "estimate" }, "never above the current payload's own upper bound");
+});
+
+const TRUNC_MARKER = "[truncated for context space]";
+
+// 12 bash tool exchanges × 9_000-char results: ~27K tokens by the chars/4
+// estimator (well under the 0.95×50K band) but ~108K+ chars (far above it).
+// Each result clears the kernel's candidate bars (≥1000 tokens, >4000-char
+// keep window) and sits outside preserveRecentMessages.
+function truncPayload(): Record<string, unknown> {
+    const FILLER = "x".repeat(9_000);
+    const messages: unknown[] = [{ role: "user", content: "Run the diagnostics." }];
+    for (let i = 0; i < 12; i++) {
+        messages.push({ role: "assistant", content: [{ type: "tool_use", id: `tu_${i}`, name: "bash", input: { command: `diag-${i}` } }] });
+        messages.push({ role: "user", content: [{ type: "tool_result", tool_use_id: `tu_${i}`, content: FILLER }] });
+    }
+    messages.push({ role: "user", content: "Summarize the results." });
+    return { model: "trunc-fake", max_tokens: 1024, stream: true, messages };
+}
+
+async function withTruncHarness(firstUsage: number, fn: (h: { url: string; bodies: string[] }) => Promise<void>): Promise<void> {
+    const bodies: string[] = [];
+    const upstream = http.createServer((req, res) => {
+        const chunks: Buffer[] = [];
+        req.on("data", (c: Buffer) => chunks.push(c));
+        req.on("end", () => {
+            bodies.push(Buffer.concat(chunks).toString("utf8"));
+            res.writeHead(200, { "content-type": "text/event-stream" });
+            // Request 1 settles `firstUsage`; later requests complete WITHOUT
+            // any usage frame — the field trigger condition.
+            res.end(bodies.length === 1 ? okSse(firstUsage) : okSseNoUsage());
+        });
+    });
+    upstream.listen(0, "127.0.0.1");
+    await once(upstream, "listening");
+    const upstreamPort = (upstream.address() as { port: number }).port;
+
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    setRegistryForTest({});
+    const proxy = await startServer({
+        port: 0,
+        host: "127.0.0.1",
+        upstream: "http://127.0.0.1",
+        routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "trunc-fake": { context: 50_000 } } } },
+        modelContextLimit: 50_000,
+        kernelConfig: defaultConfig(50_000),
+        compress: { injectTool: true, injectNudge: true },
+        promptCache: { routing: "auto" },
+        sessionHeader: "x-acp-session",
+        log: false,
+        debug: false,
+        passthrough: false,
+        autoUpdate: false,
+        mitm: { enabled: false, domains: [] },
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
+    } as ProxyOptions);
+    await once(proxy, "listening");
+    const proxyPort = (proxy.address() as { port: number }).port;
+    try {
+        await fn({ url: `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`, bodies });
+    } finally {
+        proxy.close();
+        proxy.closeIdleConnections?.();
+        await once(proxy, "close");
+        upstream.close();
+        upstream.closeIdleConnections?.();
+        await once(upstream, "close");
+    }
+}
+
+test("e2e #5500 C7: a missing usage report must not arm the emergency truncate on a measured-safe session", async () => {
+    await withTruncHarness(30_000, async (h) => {
+        const headers = { "content-type": "application/json", "x-acp-session": "issue5500-trunc-a" };
+        const body = JSON.stringify(truncPayload());
+
+        const r1 = await fetch(h.url, { method: "POST", headers, body });
+        assert.equal(r1.status, 200);
+        await r1.text();
+        const s = listSessions().find((x) => x.id === "issue5500-trunc-a");
+        assert.ok(s, "session exists after request 1");
+        assert.equal(s!.stats.lastInputTokens, 30_000, "request 1 settled the usage-grade anchor");
+        assert.ok(!h.bodies[0]!.includes(TRUNC_MARKER), "measured-safe request 1 stays unclipped");
+
+        const r2 = await fetch(h.url, { method: "POST", headers, body });
+        assert.equal(r2.status, 200);
+        await r2.text();
+        assert.ok(!h.bodies[1]!.includes(TRUNC_MARKER), "request 2 still rides the fresh anchor");
+        assert.equal(s!.stats.contextTokensSource, "estimate", "request 2's send stamp is pending its (absent) report — the cycle goes stale here");
+
+        // THE field damage: pre-fix request 3's meter rode the char bound
+        // (~110K ≫ 0.95×window) and latched clips into the delivered view even
+        // though the session's measured size (30K) sat safely under the band.
+        const r3 = await fetch(h.url, { method: "POST", headers, body });
+        assert.equal(r3.status, 200, "cycle-stale must not fail-fast either");
+        await r3.text();
+        assert.ok(!h.bodies[2]!.includes(TRUNC_MARKER), "no report ≠ over-window: the measured-safe session must not be clipped (#5500 round 3 / #4383 / #3939 ③ latch)");
+    });
+});
+
+test("unit #5500 C7-control: the kernel emergency band itself is untouched (genuine over-limit readings still clip)", async () => {
+    // C6 changed the HOST meter only; this pin proves the kernel band still
+    // fires on a direct over-limit reading through the real pipeline node.
+    const { createCore } = await import("acp-kernel");
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    const { getSession } = await import("../src/session.ts");
+    const s = getSession(`issue5500-band-${Math.random().toString(36).slice(2)}`);
+    const msgs: CoreMsg[] = [];
+    for (let i = 0; i < 12; i++) {
+        msgs.push({ id: `call-${i}`, role: "assistant", contentType: "tool-call", toolName: "bash", text: JSON.stringify({ command: `diag-${i}` }) });
+        msgs.push({ id: `res-${i}`, role: "user", contentType: "tool-result", toolName: "bash", text: "x".repeat(9_000) });
+    }
+    const turn = createCore().processTurn({
+        messages: msgs,
+        state: s.state,
+        config: defaultConfig(50_000),
+        tokenCount: 49_000,
+        renderTags: "none",
+    });
+    assert.ok(
+        turn.messages.some((m) => (m.text ?? "").includes(TRUNC_MARKER)),
+        "a genuine ≥0.95×window reading still emergency-truncates (#3617 negative direction — C6 must not soften the band)",
+    );
 });
