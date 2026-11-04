@@ -75,7 +75,7 @@ dialect whose frame names are its own.
 |----|------------|---------------------|
 | WC-12a | The conversation is openai-completions, but message content is ALWAYS an array of parts — tool results included, and the part vocabulary is OpenAI's (`text`, `image_url`). | Unwrap joins all-text parts into a plain string and keeps the part array when an `image_url` is present (pictures ride through untouched); a part type outside that vocabulary (audio/file) rejects the whole body → verbatim relay (#1284). Rewrap turns a string back into one text part and restores image parts in order. |
 | WC-12b | Tool calls keep OpenAI's envelope (`id`, `type: "function"`) but rename the payload key to `function_call`; an assistant turn carrying tool calls sets `content: null`. | Unwrap renames to `function`; rewrap renames back and restores `content: null` for tool turns (`arguments` survives byte-semantically, #1039). |
-| WC-12c | The stream is `event:<name>` / `data:<json>` with NO space after the colon and NO `[DONE]` sentinel; the `done` frame terminates it. Frames: `metadata` → `timing_cost` → N×`output` → (`extra_info`) → `token_usage` → `done`. | The adapter parses that dialect; `emitCompletion` writes `token_usage` + `done`. A truncation synthesizes an `error` frame only when the cut happened before `done`. |
+| WC-12c | The stream is `event:<name>` / `data:<json>` with NO space after the colon and NO `[DONE]` sentinel; the `done` frame terminates it. Frames: `metadata` → `timing_cost` → N×`output` → (`extra_info`) → `token_usage` → `done`. | The adapter parses that dialect; `emitCompletion` writes `token_usage` + `done`. A truncation synthesizes an `error` frame only when the cut happened before `done`. Plugin mode needs its OWN passthrough pipe (`pipePluginTraeWithStrip`): the shared chat pipe treats only a quoted `finish_reason` chunk or the `[DONE]` sentinel as terminal, neither of which this wire emits, so a CLEAN trae turn reached EOF with no terminal seen and was reported as truncated (144 hits on the live seat before the fix). |
 | WC-12d | Rewrap must never drop content mid-forward. | Roles this wire has no slot for (e.g. a compat-roles rewrite target) degrade to `user` text instead of being discarded. |
 | WC-12e | Upstream may emit frames bili does not understand (future revision risk). | Unrecognized frame names and undecodable `data:` payloads are forwarded byte-exact — first round only, before bili's own injections could be confused with upstream content. |
 | WC-12f | `token_usage` carries the real counters in the per-request fields; every `*_total` field is always 0. | Usage maps from `prompt_tokens` / `completion_tokens` / `cache_read_input_tokens`; the `*_total` fields are never read. |
@@ -96,7 +96,14 @@ dialect whose frame names are its own.
   capture (#1295). The bili-side round trip is covered by unit tests, and both
   the single-call framing and the parallel-call framing (WC-12i, captured
   2026-11-04 with two `run_code` calls in one turn) are replayed from verbatim
-  frame dumps under `tests/fixtures/`. A full end-to-end replay through a real
-  Trae client (compressed conversation echoed back by the IDE) has NOT been run
-  — that needs a live seat, and it is now the only remaining check.
+  frame dumps under `tests/fixtures/`. The plugin lane has its own passthrough
+  pipe (`pipePluginTraeWithStrip`), pinned by the same real dump in
+  `tests/trae-plugin-pipe.test.ts`: byte-verbatim on a clean turn, an in-band
+  `error` frame only on a genuine cut, render-tag echo stripped from the prose
+  field alone, and `token_usage` feeding `lastInputTokens`. The proxy lane has
+  since run on a live seat (compressed turns were forwarded to the real Trae
+  host, and a fold took the reported context from 24% to 8%). What has NOT run
+  is a full end-to-end replay through a real Trae client (compressed
+  conversation echoed back by the IDE) — that needs a live seat, and it remains
+  the only open check.
 

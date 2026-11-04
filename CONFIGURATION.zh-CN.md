@@ -84,7 +84,7 @@
 | `upstreamProxy` | string | unset | — | Web 面板手动设置的代理层级（由仪表盘代理编辑器写入）；解析顺序中位于 BILI_UPSTREAM_PROXY 之下。 |
 | `upstreamProxyMode` | "auto" \| "manual" \| "direct" | auto (unset behaves as direct) | BILI_UPSTREAM_PROXY_MODE | 全局代理来源策略：auto（环境变量/系统发现）、manual（仅 Web 面板值）、direct（从不使用代理）。 |
 | `providers` | record url-prefix → route entry | {} | — | 路由表：URL 前缀键到逐 provider 条目（models、compress、compat…）的映射。详见 Providers 章节。 |
-| `modelEndpointPatterns` | array of { match: string, wire: "anthropic" \| "openai" \| "responses" \| "google" \| "commandcode" } | [] | — | 可声明的自定义 wire 模型端点：绝对 URL 前缀到 wire 族的映射。同一配置源同时喂给代理协议分类器与客户端 fetch 认领，两个门不再漂移（#1295）。 |
+| `modelEndpointPatterns` | array of { match: string, wire: "anthropic" \| "openai" \| "responses" \| "google" \| "commandcode" \| "trae" } | [] | — | 可声明的自定义 wire 模型端点：绝对 URL 前缀到 wire 族的映射。同一配置源同时喂给代理协议分类器与客户端 fetch 认领，两个门不再漂移（#1295）。 |
 | `modelContextLimit` | number | 200000 | ACP_MODEL_CONTEXT_LIMIT | 旧版全局窗口上限（窗口来源中优先级最高，兼作使用率分母）；建议改用 compress.modelContextLimit。 |
 | `imageBilling` | "auto" \| "pixels" \| "bytes" | auto (resolves to pixels) | BILI_IMAGE_BILLING | 全局图片 token 估算口径；逐请求实时读取，优先于所有逐 provider 设置。 |
 | `imageTokenCap` | number | unset (uncapped) | BILI_IMAGE_TOKEN_CAP | 全局单图 token 上限，叠加在计费口径之上生效；逐请求实时读取。 |
