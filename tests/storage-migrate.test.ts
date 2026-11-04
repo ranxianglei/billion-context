@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { tmpdir } from "node:os";
-import { appendFileSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
+import { appendFileSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join, relative, sep } from "node:path";
 import { createInitialState } from "acp-kernel";
 import { SessionStore } from "../src/persist.ts";
@@ -220,6 +220,39 @@ test("migrate never modifies any file under the sessions dir", async () => {
         const after = snapshotFiles(dir);
         assert.equal(after.size, before.size, "no files added or removed (quarantine renames included)");
         for (const [rel, meta] of before) assert.deepEqual(after.get(rel), meta, `${rel} untouched`);
+    } finally {
+        rmrf(dir);
+    }
+});
+
+test("already-indexed session whose file diverged reports drifted without re-writing", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "bili-migrate-"));
+    try {
+        await writeSessions(dir, [{ id: "drift-1", requests: 1 }]);
+        dropIndex(dir);
+        const first = await runMigrate(dir);
+        assert.equal(byId(first.out, "drift-1").status, "imported");
+
+        // Diverge the source file WITHOUT making it ahead: bump a non-request
+        // stat so its digest no longer matches the index, while requests and
+        // nextBlockId stay put so the ahead-probe does not re-import it.
+        const protoDir = join(dir, "_unknown");
+        const file = join(protoDir, readdirSync(protoDir).find((n) => {
+            try {
+                return JSON.parse(readFileSync(join(protoDir, n), "utf8")).payload.id === "drift-1";
+            } catch {
+                return false;
+            }
+        })!);
+        const obj = JSON.parse(readFileSync(file, "utf8"));
+        obj.payload.stats.tokensSaved = 999999;
+        writeFileSync(file, JSON.stringify(obj));
+
+        const second = await runMigrate(dir);
+        assert.equal(second.code, 1, "drifted results exit non-zero");
+        const d = byId(second.out, "drift-1");
+        assert.equal(d.status, "drifted", `expected drifted, got ${d.status}: ${d.reason}`);
+        assert.equal(second.out.counts.imported, 0, "diverged-but-not-ahead session is not re-imported");
     } finally {
         rmrf(dir);
     }
