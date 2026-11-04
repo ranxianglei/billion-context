@@ -119,8 +119,12 @@ test("rewrap: an assistant tool turn keeps content null and renames the payload 
 test("unwrap rejects: non-streaming, missing model, non-text part, unknown role, tool without id", () => {
     assert.equal(unwrapTraeBody(body({ stream: false })), undefined);
     assert.equal(unwrapTraeBody(body({ model: "" })), undefined);
-    assert.equal(unwrapTraeBody(body({
+    // images are OpenAI-vocabulary parts and now survive the round trip
+    assert.ok(unwrapTraeBody(body({
         messages: [{ role: "user", content: [{ type: "image_url", image_url: { url: "data:," } }] }],
+    })));
+    assert.equal(unwrapTraeBody(body({
+        messages: [{ role: "user", content: [{ type: "audio", audio: {} }] }],
     })), undefined);
     assert.equal(unwrapTraeBody(body({ messages: [{ role: "developer", content: [{ type: "text", text: "x" }] }] })), undefined);
     assert.equal(unwrapTraeBody(body({
