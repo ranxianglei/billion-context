@@ -68,7 +68,13 @@
 //        never updated). No backfill: pre-feature rows stay NULL and keep
 //        rendering without the tag's time attribute. Same both-directions
 //        compatibility as v5 (older build ignores, newer build ALTERs).
-export const STORAGE_SCHEMA_VERSION = 10;
+//      - v11: fastpath v6 (#5643) composite-identity ledger — three
+//        append-only sidecar tables (pf_rows / pf_log / pf_ckpt), all pure
+//        CREATE IF NOT EXISTS: a pre-v11 install upgrades with zero byte
+//        change, and with the watermarkV6MsgId rollout OFF no traffic ever
+//        touches them. No backfill, no back-compat column juggling — older
+//        builds stop at the version gate and simply ignore the extra tables.
+export const STORAGE_SCHEMA_VERSION = 11;
 
 /** #3250: cap for `journal_size_limit` (see STORAGE_PRAGMAS). Passive and
  *  auto checkpoints move frames into the main db and reset the write offset
@@ -397,6 +403,48 @@ export function migrateSchema(db: {
             if (!tsCols.includes("ts")) {
                 db.exec("ALTER TABLE messages ADD COLUMN ts INTEGER");
             }
+        }
+        if (from < 11) {
+            // v11 (#5643): fastpath v6 identity plane — two planes per the
+            // contract: DATA (pf_rows: the frozen cores themselves, strictly
+            // append-only; a half-written pos is never reused) and METADATA
+            // (pf_log L0 append-only entries + pf_ckpt L1 checkpoint; current
+            // state = fold(ckpt, log-after-ckpt)). Naming keeps the pf_*
+            // namespace of the feature's header/ext footprint. The global
+            // probe index is on (sess_raw, ledger_id): "have we seen this
+            // (sessionid,msgid) pair?" answers pf_sid + pos across restarts
+            // (P8 id immortality); idx_pf_rows_core serves block↔pos binding
+            // for fold rendering. Raw host ids are stored UNTRUNCATED as
+            // received (P9: no digest in any judgement-relevant position).
+            db.exec(`
+CREATE TABLE IF NOT EXISTS pf_rows (
+    sid TEXT NOT NULL,
+    pos INTEGER NOT NULL,
+    ledger_id TEXT NOT NULL,
+    sess_raw TEXT NOT NULL,
+    core_id TEXT NOT NULL,
+    core_json TEXT NOT NULL,
+    PRIMARY KEY (sid, pos)
+);
+CREATE INDEX IF NOT EXISTS idx_pf_rows_ledger ON pf_rows(sess_raw, ledger_id);
+CREATE INDEX IF NOT EXISTS idx_pf_rows_core ON pf_rows(sid, core_id);
+CREATE TABLE IF NOT EXISTS pf_log (
+    sid TEXT NOT NULL,
+    ls_seq INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    born_pos_hi INTEGER NOT NULL,
+    ts INTEGER NOT NULL,
+    PRIMARY KEY (sid, ls_seq)
+);
+CREATE TABLE IF NOT EXISTS pf_ckpt (
+    sid TEXT NOT NULL,
+    ckpt_ls_seq INTEGER NOT NULL,
+    meta_json TEXT NOT NULL,
+    checksum TEXT NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (sid)
+)`);
         }
     });
     if (needV8Backfill) migrateV8Identities(db);

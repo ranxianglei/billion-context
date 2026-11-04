@@ -1084,6 +1084,91 @@ export class UnifiedShadow {
         return this.sync.listSessionExt(sessionId);
     }
 
+    // ------------------------------------------------------------------
+    // #5643 fastpath v6 identity plane passthroughs. SQLite fast lane only:
+    // on a network backend (mysql) sync === null → every method returns the
+    // "lane unavailable" value (null / empty / false) so the request path
+    // degrades softly onto the legacy watermark path (§7-A②).
+    // ------------------------------------------------------------------
+
+    pfAvailable(): boolean {
+        if (this.sync === null) return false;
+        try {
+            return this.sync.pfAvailable();
+        } catch {
+            return false;
+        }
+    }
+
+    pfProbePairs(sessRaw: string, ledgerIds: string[]): Map<string, { sid: string; pos: number }> | null {
+        if (this.sync === null) return null;
+        try {
+            return this.sync.pfProbePairs(sessRaw, ledgerIds);
+        } catch {
+            return null; // mid-call degrade: treat as unavailable, lane rides baseline
+        }
+    }
+
+    pfMeta(
+        sid: string,
+    ): {
+        ckpt: { ckptLsSeq: number; metaJson: string; checksum: string; updatedAt: number } | null;
+        log: { lsSeq: number; kind: string; payloadJson: string; bornPosHi: number; ts: number }[];
+    } | null {
+        if (this.sync === null) return null;
+        try {
+            return this.sync.pfMeta(sid);
+        } catch {
+            return null;
+        }
+    }
+
+    pfLatestGeom(sid: string): { t: number; maxPos: number } | null {
+        if (this.sync === null) return null;
+        try {
+            return this.sync.pfLatestGeom(sid);
+        } catch {
+            return null;
+        }
+    }
+
+    /** Throws are NOT swallowed here deliberately: a failed turn commit must
+     *  be loud to the caller (it re-parses nothing and fails soft for that
+     *  turn only — see fastpath-v6). Network backends: null (unavailable). */
+    pfCommitTurn(
+        sid: string,
+        args: {
+            rows: { pos: number; ledgerId: string; sessRaw: string; coreId: string; coreJson: string }[];
+            logEntries: { kind: string; payloadJson: string; bornPosHi: number; ts?: number }[];
+        },
+    ): number | null {
+        if (this.sync === null) return null;
+        return this.sync.pfCommitTurn(sid, args);
+    }
+
+    pfCompact(sid: string, args: { metaJson: string; nextLsSeq: number }): void {
+        if (this.sync === null) return;
+        this.sync.pfCompact(sid, args);
+    }
+
+    pfHydrateWindow(sid: string, posFrom: number, posTo: number): Map<number, string> {
+        if (this.sync === null) return new Map();
+        try {
+            return this.sync.pfHydrateWindow(sid, posFrom, posTo);
+        } catch {
+            return new Map();
+        }
+    }
+
+    pfDeleteAll(sids: string[]): void {
+        if (this.sync === null || sids.length === 0) return;
+        try {
+            this.sync.pfDeleteAll(sids);
+        } catch {
+            // teardown sweep: log-and-continue semantics like sibling sweeps
+        }
+    }
+
     deleteSessionExt(sessionId: string, key?: string): number {
         if (this.sync === null) return 0;
         return this.sync.deleteSessionExt(sessionId, key);

@@ -2199,6 +2199,88 @@ export class SessionStore {
         }
     }
 
+    // ------------------------------------------------------------------
+    // #5643 fastpath v6 identity plane — same guard shape as every other
+    // unified* facade: null = "plane unavailable right now" (sidecar
+    // missing/disabled/network backend) and the v6 lane fails soft onto
+    // the legacy watermark path. pfCommitTurn does NOT swallow silently:
+    // a turn commit failure is logged once, then fails soft for THAT turn.
+    // ------------------------------------------------------------------
+
+    /** The registry ext key mapping one relay session → every pf_sid it has
+     *  been issued across re-arming rotations (§3.1). Stored as an array of
+     *  sids; rides the session_ext cascade on session deletion. */
+    readonly PF_V6_SID_REGISTRY_EXT_KEY = "pf:v6-sids";
+
+    pfAvailable(): boolean {
+        if (!this.shadow || this.shadow.stats.disabled) return false;
+        try {
+            return this.shadow.pfAvailable();
+        } catch {
+            return false;
+        }
+    }
+
+    pfProbePairs(sessRaw: string, ledgerIds: string[]): Map<string, { sid: string; pos: number }> | null {
+        if (!this.shadow || this.shadow.stats.disabled) return null;
+        return this.shadow.pfProbePairs(sessRaw, ledgerIds);
+    }
+
+    pfMeta(
+        sid: string,
+    ): {
+        ckpt: { ckptLsSeq: number; metaJson: string; checksum: string; updatedAt: number } | null;
+        log: { lsSeq: number; kind: string; payloadJson: string; bornPosHi: number; ts: number }[];
+    } | null {
+        if (!this.shadow || this.shadow.stats.disabled) return null;
+        return this.shadow.pfMeta(sid);
+    }
+
+    pfLatestGeom(sid: string): { t: number; maxPos: number } | null {
+        if (!this.shadow || this.shadow.stats.disabled) return null;
+        return this.shadow.pfLatestGeom(sid);
+    }
+
+    pfCommitTurn(
+        sid: string,
+        args: {
+            rows: { pos: number; ledgerId: string; sessRaw: string; coreId: string; coreJson: string }[];
+            logEntries: { kind: string; payloadJson: string; bornPosHi: number; ts?: number }[];
+        },
+    ): number | null {
+        if (!this.shadow || this.shadow.stats.disabled) return null;
+        try {
+            return this.shadow.pfCommitTurn(sid, args);
+        } catch (err) {
+            this.log("warn", `[persist] pf turn commit failed (${sid}): ${String(err)}`); // loud once, then fail-soft for THIS turn
+            return null;
+        }
+    }
+
+    pfCompact(sid: string, args: { metaJson: string; nextLsSeq: number }): void {
+        if (!this.shadow || this.shadow.stats.disabled) return;
+        try {
+            this.shadow.pfCompact(sid, args);
+        } catch {
+            // compaction is opportunistic; skip this cycle, retry next finalize
+        }
+    }
+
+    pfHydrateWindow(sid: string, posFrom: number, posTo: number): Map<number, string> {
+        if (!this.shadow || this.shadow.stats.disabled) return new Map();
+        return this.shadow.pfHydrateWindow(sid, posFrom, posTo);
+    }
+
+    /** Session teardown (#5643 §8 test 19 third clause): sweep the pf plane
+     *  for EVERY sid this relay session was ever issued. Reads the registry
+     *  from ext FIRST (deleteSession sweeps session_ext itself), then deletes
+     *  rows/log/ckpt. Safe to call when nothing was ever issued. */
+    pfDeleteForSession(sessionId: string): void {
+        if (!this.shadow || this.shadow.stats.disabled) return;
+        const reg = this.shadow.getSessionExt(sessionId, this.PF_V6_SID_REGISTRY_EXT_KEY) as string[] | undefined;
+        if (Array.isArray(reg)) this.shadow.pfDeleteAll(reg);
+    }
+
     /** #5312: reversible single-block archive / restore (see UnifiedStore). */
     unifiedArchiveBlock(sessionId: string, blockId: string, archiveDir?: string): { ok: boolean; exportPath?: string; reason?: string; contentRowsDeleted?: number } | null {
         if (!this.shadow || this.shadow.stats.disabled) return null;

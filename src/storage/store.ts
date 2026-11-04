@@ -425,6 +425,8 @@ export class UnifiedStore {
     private readonly foreignLockHolder: { pid: number } | null;
     private readonly lockPath: string | null;
     private readonly dbPath: string;
+    /** #5643: cached one-time capability probe for the pf plane (null = not yet probed). */
+    private pfAvail: boolean | null = null;
     /** #4609: the last completed check (sync, cache hit, or background
      * verdict) said the file set is sound — a clean close then refreshes the
      * verdict cache onto the post-checkpoint stats so the next boot skips
@@ -2344,6 +2346,200 @@ export class UnifiedStore {
         }
         validateExtKey(key, "key");
         return Number(this.db.prepare("DELETE FROM session_ext WHERE session_id = ? AND key = ?").run(sessionId, key).changes);
+    }
+
+    // ======================================================================
+    // #5643 fastpath v6 identity plane (schema v11): pf_rows / pf_log /
+    // pf_ckpt. DATA plane = pf_rows (strictly append-only; a pos is never
+    // reused — a half-written turn rolls back whole). METADATA plane = LSM:
+    // pf_log (L0 append-only) + pf_ckpt (L1); current state is ALWAYS
+    // fold(ckpt.metaJson, pf_log[ls_seq > ckpt_ls_seq]) — deterministic,
+    // idempotent, the in-memory arrays are a cache nothing depends on.
+    // Availability degrades soft (§7-A②): on nodes where this plane is
+    // unusable the v6 lane stays OFF and traffic rides the legacy path.
+    // Raw host ids are stored untruncated as received (P9); no digest ever
+    // occupies a judgement-relevant position.
+    // ======================================================================
+
+    /** One-time capability probe (table presence), cached. False on pre-v11
+     *  databases (feature gate ignores them) and anywhere the DDL never ran
+     *  — callers treat false as "lane unavailable", never as an error. */
+    pfAvailable(): boolean {
+        if (this.pfAvail !== null) return this.pfAvail;
+        try {
+            const cols = (this.db.prepare("PRAGMA table_info(pf_rows)").all() as unknown as { name?: unknown }[])
+                .map((c) => (typeof c?.name === "string" ? c.name : ""));
+            this.pfAvail = cols.includes("core_json") && cols.includes("ledger_id");
+        } catch {
+            this.pfAvail = false;
+        }
+        return this.pfAvail;
+    }
+
+    /** Data-plane insert: one turn's new rows for `sid`, strictly sequential
+     *  (pos values must be contiguous ascending). Never updates/deletes an
+     *  existing pos. Throws on conflict — the surrounding transaction rolls
+     *  back, leaving the plane exactly as before. */
+    private pfInsertRows(
+        sid: string,
+        rows: { pos: number; ledgerId: string; sessRaw: string; coreId: string; coreJson: string }[],
+    ): void {
+        const ins = this.db.prepare(
+            "INSERT INTO pf_rows (sid, pos, ledger_id, sess_raw, core_id, core_json) VALUES (?, ?, ?, ?, ?, ?)",
+        );
+        for (const r of rows) ins.run(sid, r.pos, r.ledgerId, r.sessRaw, r.coreId, r.coreJson);
+    }
+
+    /** Global identity probe (P8): for the request-level `sessRaw`, which of
+     *  these msgids have been seen before? Returns a map keyed by ledger id
+     *  → { sid, pos }. ONE round-trip per distinct sess_raw (a turn shares
+     *  one request-level sessionid). Cross-sid by design: the index is global.
+     *  First-seen wins on any impossible duplicate (rows are immutable). */
+    pfProbePairs(sessRaw: string, ledgerIds: string[]): Map<string, { sid: string; pos: number }> {
+        const out = new Map<string, { sid: string; pos: number }>();
+        if (ledgerIds.length === 0) return out;
+        const placeholders = ledgerIds.map(() => "?").join(", ");
+        const rows = this.db
+            .prepare(`SELECT ledger_id, sid, MIN(pos) AS pos FROM pf_rows WHERE sess_raw = ? AND ledger_id IN (${placeholders}) GROUP BY ledger_id`)
+            .all(sessRaw, ...ledgerIds) as { ledger_id: string; sid: string; pos: number }[];
+        for (const r of rows) out.set(r.ledger_id, { sid: r.sid, pos: r.pos });
+        return out;
+    }
+
+    /** Metadata-plane read: the L1 checkpoint (if any) plus every L0 entry
+     *  after it, in ls_seq order. Compaction keeps this read bounded (≤64
+     *  entries / ≤64 KB between folds). The sqlite path never throws into
+     *  the request path for a missing row — callers branch on null/empty. */
+    pfMeta(sid: string): {
+        ckpt: { ckptLsSeq: number; metaJson: string; checksum: string; updatedAt: number } | null;
+        log: { lsSeq: number; kind: string; payloadJson: string; bornPosHi: number; ts: number }[];
+    } {
+        const c = this.db.prepare("SELECT ckpt_ls_seq, meta_json, checksum, updated_at FROM pf_ckpt WHERE sid = ?").get(sid) as
+            | { ckpt_ls_seq: number; meta_json: string; checksum: string; updated_at: number }
+            | undefined;
+        const log = this.db
+            .prepare("SELECT ls_seq, kind, payload_json, born_pos_hi, ts FROM pf_log WHERE sid = ? AND ls_seq > ? ORDER BY ls_seq")
+            .all(sid, c === undefined ? 0 : c.ckpt_ls_seq) as { ls_seq: number; kind: string; payload_json: string; born_pos_hi: number; ts: number }[];
+        return {
+            ckpt: c === undefined ? null : { ckptLsSeq: c.ckpt_ls_seq, metaJson: c.meta_json, checksum: c.checksum, updatedAt: c.updated_at },
+            log: log.map((r) => ({ lsSeq: r.ls_seq, kind: r.kind, payloadJson: r.payload_json, bornPosHi: r.born_pos_hi, ts: r.ts })),
+        };
+    }
+
+    /** Newest geom entry (scanning the post-ckpt log backwards). Fold itself
+     *  is owned by the fastpath-v6 module (it defines the meta schema); this
+     *  just surfaces the last-known {t,maxPos} for cheap diagnostics without
+     *  hydrating cores. */
+    pfLatestGeom(sid: string): { t: number; maxPos: number } | null {
+        const { log } = this.pfMeta(sid);
+        for (let i = log.length - 1; i >= 0; i--) {
+            const e = log[i];
+            if (e?.kind !== "geom") continue;
+            try {
+                const p = JSON.parse(e.payloadJson) as { t?: unknown; maxPos?: unknown };
+                if (typeof p.t === "number" && typeof p.maxPos === "number") return { t: p.t, maxPos: p.maxPos };
+            } catch {
+                continue;
+            }
+        }
+        return null;
+    }
+
+    /** Atomic turn finalize (§4.1.3 single-transaction double plane): new
+     *  data-plane rows AND their metadata-plane entries commit together — a
+     *  mid-turn crash leaves zero trace and the client's next full body IS
+     *  the replay source. Log entries are appended at strictly increasing
+     *  ls_seq starting after MAX(ls_seq). Returns the next free ls_seq.
+     *  Any throw → rollback → the plane is byte-identical to before. */
+    pfCommitTurn(
+        sid: string,
+        args: {
+            rows: { pos: number; ledgerId: string; sessRaw: string; coreId: string; coreJson: string }[];
+            logEntries: { kind: string; payloadJson: string; bornPosHi: number; ts?: number }[];
+        },
+    ): number {
+        if (!this.pfAvailable()) throw new Error("pf plane unavailable");
+        const nextLsSeq = this.db.transaction((): number => {
+            this.pfInsertRows(sid, args.rows);
+            const start = Number(
+                ((this.db.prepare("SELECT COALESCE(MAX(ls_seq), 0) AS m FROM pf_log WHERE sid = ?").get(sid) as { m: number }).m ?? 0),
+            );
+            const insLog = this.db.prepare(
+                "INSERT INTO pf_log (sid, ls_seq, kind, payload_json, born_pos_hi, ts) VALUES (?, ?, ?, ?, ?, ?)",
+            );
+            let seq = start;
+            for (const e of args.logEntries) {
+                seq += 1;
+                insLog.run(sid, seq, e.kind, e.payloadJson, e.bornPosHi, e.ts ?? Date.now());
+            }
+            return seq;
+        });
+        if (typeof nextLsSeq !== "number") throw new Error("pf commit turn: transaction returned no sequence");
+        return nextLsSeq;
+    }
+
+    /** L0→L1 compaction (§4.1.3, called opportunistically from finalize —
+     *  no background threads): fold the whole history into a fresh ckpt in
+     *  the SAME transaction that deletes the superseded log entries.
+     *  S4 lesson: the checksum covers the exact metaJson bytes and hydrate
+     *  re-verifies — a mismatch invalidates the ckpt (rebuild from the
+     *  replay source), never guesses. Idempotent under stable stringify at
+     *  the call site. Caller supplies `metaJson` already folded from the
+     *  same history this call deletes. */
+    pfCompact(sid: string, args: { metaJson: string; nextLsSeq: number }): void {
+        if (!this.pfAvailable()) throw new Error("pf plane unavailable");
+        const hash = createHash("sha256").update(args.metaJson).digest("hex");
+        this.db.transaction(() => {
+            this.db
+                .prepare(
+                    "INSERT INTO pf_ckpt (sid, ckpt_ls_seq, meta_json, checksum, updated_at) VALUES (?, ?, ?, ?, ?) " +
+                        "ON CONFLICT (sid) DO UPDATE SET ckpt_ls_seq = excluded.ckpt_ls_seq, meta_json = excluded.meta_json, " +
+                        "checksum = excluded.checksum, updated_at = excluded.updated_at",
+                )
+                .run(sid, args.nextLsSeq, args.metaJson, hash, Date.now());
+            this.db.prepare("DELETE FROM pf_log WHERE sid = ?").run(sid);
+        });
+    }
+
+    /** Should we compact? Contract thresholds (owner may veto): ≥64 entries
+     *  OR ≥64 KB OR 30 min idle since the last entry. The idle gate fires
+     *  only when there IS a tail to fold — empty tails cause no ckpt churn. */
+    pfNeedsCompaction(opts: { entriesAfterCkpt: number; logBytesEstimate: number; lastEntryTsMs: number }): boolean {
+        const PF_COMPACT_ENTRIES = 64; // §4.1.3 threshold (owner may veto)
+        const PF_COMPACT_BYTES = 64 * 1024;
+        const PF_COMPACT_IDLE_MS = 30 * 60 * 1000;
+        if (opts.entriesAfterCkpt >= PF_COMPACT_ENTRIES || opts.logBytesEstimate >= PF_COMPACT_BYTES) return true;
+        return opts.entriesAfterCkpt > 0 && Date.now() - opts.lastEntryTsMs >= PF_COMPACT_IDLE_MS;
+    }
+
+    /** Water window rows into a map pos→core_json for rehydration after
+     *  restart (§4.1.4): ONLY the visible slice is lifted into memory —
+     *  deep-folded territory stays on disk until an audit demands it. No
+     *  plane → empty map (lane unavailable ⇒ caller serves baseline). */
+    pfHydrateWindow(sid: string, posFrom: number, posTo: number): Map<number, string> {
+        const out = new Map<number, string>();
+        if (!this.pfAvailable()) return out;
+        const rows = this.db
+            .prepare("SELECT pos, core_json FROM pf_rows WHERE sid = ? AND pos >= ? AND pos <= ? ORDER BY pos")
+            .all(sid, posFrom, posTo) as { pos: number; core_json: string }[];
+        for (const r of rows) out.set(r.pos, r.core_json);
+        return out;
+    }
+
+    /** Delete EVERYTHING for a set of pf sids (session teardown, §8 test 19
+     *  third clause: retire-region bytes die only with the session). The
+     *  relay-session→pf_sid registry lives in session_ext, which the
+     *  existing deleteSession sweep already removes; this sweeps the three
+     *  tables themselves by the caller-supplied registry. */
+    pfDeleteAll(sids: string[]): void {
+        if (sids.length === 0) return;
+        if (!this.pfAvailable()) return;
+        const ph = sids.map(() => "?").join(", ");
+        this.db.transaction(() => {
+            this.db.prepare(`DELETE FROM pf_rows WHERE sid IN (${ph})`).run(...sids);
+            this.db.prepare(`DELETE FROM pf_log WHERE sid IN (${ph})`).run(...sids);
+            this.db.prepare(`DELETE FROM pf_ckpt WHERE sid IN (${ph})`).run(...sids);
+        });
     }
 
     /** #4949: circuit-breaker re-enable probe — one REAL committed write
