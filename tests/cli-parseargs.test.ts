@@ -138,3 +138,38 @@ test("parseArgs+applyPosturePins: -s pins reach the launcher env the child inher
         if (origOc === undefined) delete process.env.BILI_OPENCODE_INLINE; else process.env.BILI_OPENCODE_INLINE = origOc;
     }
 });
+
+test("parseArgs: informational flags take precedence over subcommand dispatch (#5606)", () => {
+    const commands = [
+        ["start"], ["update"], ["doctor"], ["export"], ["plugin-register", "example"],
+        ["mcp"], ["plugin", "list"], ["plugin", "remove", "codex"], ["test", "codex"],
+        ["acp-cache", "diff", "/some/dir"], ["sessions", "ls"], ["sessions", "rm", "example"],
+        ["storage", "gc"],
+    ];
+    for (const [flag, expected] of [["--help", "help"], ["-h", "help"], ["--version", "version"], ["-V", "version"]] as const) {
+        for (const args of commands) {
+            for (const argv of [[flag, ...args], [...args, flag]]) {
+                assert.equal(parseArgs(argv).command, expected, argv.join(" "));
+            }
+        }
+    }
+});
+
+test("parseArgs: informational flags bypass incomplete subcommand validation (#5606)", () => {
+    for (const args of [["plugin"], ["plugin", "remove"], ["test"], ["acp-cache"], ["acp-cache", "diff"], ["sessions"], ["sessions", "rm"], ["storage"]]) {
+        for (const [flag, expected] of [["--help", "help"], ["--version", "version"]] as const) {
+            assert.equal(parseArgs([...args, flag]).command, expected, [...args, flag].join(" "));
+        }
+    }
+});
+
+test("parseArgs: launcher flags stay with the client, bili flags stay before it (#5606)", () => {
+    for (const flag of ["--help", "-h", "--version", "-V"]) {
+        const forwarded = parseArgs(["codex", flag]);
+        assert.equal(forwarded.command, "launch");
+        assert.deepEqual(forwarded.clientArgs, [flag]);
+        assert.equal(parseArgs([flag, "codex"]).command, flag === "--help" || flag === "-h" ? "help" : "version");
+    }
+    assert.equal(parseArgs(["export", "--output", "--help"]).command, "export");
+    assert.equal(parseArgs(["export", "--output", "--help"]).exportOutput, "--help");
+});

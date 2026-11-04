@@ -162,13 +162,14 @@ export {
     type GooseConfig,
     type GooseDirs,
 } from "./client-config.js";
+import { KIRO_DEFAULT_MODEL_HOSTS } from "./kiro.js";
 import { conflictRemediation } from "./conflict-watch.js";
 import { conflictScanEnabled, isDesignBenign, scanClientPlugins } from "./thirdparty-scan.js";
 
 export const LAUNCHER_DEFAULT_HOST = "127.0.0.1";
-export const LAUNCH_CLIENTS = ["pi", "codex", "claude", "omp", "opencode", "hermes", "dsh", "codebuddy", "qoder", "trae", "jcode", "kimi", "gemini", "iflow", "qwen", "mcode", "aider", "copilot", "amp", "crush", "zed", "goose", "antigravity", "pi-test", "pi-inline", "opencode-inline"] as const;
+export const LAUNCH_CLIENTS = ["pi", "codex", "claude", "omp", "opencode", "hermes", "dsh", "codebuddy", "qoder", "trae", "jcode", "kimi", "gemini", "iflow", "qwen", "mcode", "aider", "copilot", "amp", "crush", "zed", "goose", "antigravity", "kiro", "pi-test", "pi-inline", "opencode-inline"] as const;
 export type ClientName = (typeof LAUNCH_CLIENTS)[number];
-type BaseClientName = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh" | "codebuddy" | "qoder" | "trae" | "jcode" | "kimi" | "gemini" | "iflow" | "qwen" | "mcode" | "aider" | "copilot" | "amp" | "crush" | "zed" | "goose" | "antigravity";
+type BaseClientName = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh" | "codebuddy" | "qoder" | "trae" | "jcode" | "kimi" | "gemini" | "iflow" | "qwen" | "mcode" | "aider" | "copilot" | "amp" | "crush" | "zed" | "goose" | "antigravity" | "kiro";
 
 const HEALTH_PATH = "/__bili/health";
 const HEALTH_POLL_INTERVAL_MS = 200;
@@ -853,6 +854,11 @@ export function discoverRoutes(client: ClientName, config: ClientConfig): Discov
         // GitHub's own CI firewall allowlist for the CLI: api.githubcopilot.com
         // plus the per-plan subdomains.
         addStaticHosts(acc, COPILOT_DEFAULT_MODEL_HOSTS, true);
+    } else if (client === "kiro") {
+        // Kiro CLI: no base-URL override; HTTPS_PROXY is honored by both its Rust
+        // shell and its Node agent server, so cert-MITM the model gateways only
+        // (management/telemetry/auth stay blind-tunneled). See src/kiro.ts.
+        addStaticHosts(acc, KIRO_DEFAULT_MODEL_HOSTS, true);
     } else if (client === "amp") {
         // #1049: closed Go binary like copilot; ampcode.com carries both the
         // model leg and the control plane, so one entry covers both.
@@ -983,7 +989,7 @@ export function buildPiEnv(
 // https entry wins, matching the historical sequential assignment). buildPiEnv
 // (JSON manifest + host list envs) and buildClaudePluginEnv (direct-URL mode,
 // returns baseEnv untouched) stay bespoke above/below this table. ---
-type LauncherEnvClient = "codex" | "trae" | "jcode" | "aider" | "copilot" | "amp" | "claude" | "codebuddy" | "qoder" | "gemini" | "iflow" | "qwen" | "antigravity" | "zed";
+type LauncherEnvClient = "codex" | "trae" | "jcode" | "aider" | "copilot" | "amp" | "claude" | "codebuddy" | "qoder" | "gemini" | "iflow" | "qwen" | "antigravity" | "zed" | "kiro";
 
 interface EnvClientPreset {
     /** CA path is written to every listed env var. */
@@ -1038,6 +1044,16 @@ const ENV_CLIENTS: Record<LauncherEnvClient, EnvClientPreset> = {
     copilot: { caKeys: ["SSL_CERT_FILE"], proxy: true, httpProxyOnRouteHttp: false },
     // #1049: amp is a Go binary like copilot — same cert-MITM contract.
     amp: { caKeys: ["SSL_CERT_FILE"], proxy: true, httpProxyOnRouteHttp: false },
+    // Kiro CLI: a Rust shell (rustls; SSL_CERT_FILE REPLACES its roots, hence
+    // the combined bundle) driving a bundled Node agent server (additive
+    // NODE_EXTRA_CA_CERTS). Both honor HTTPS_PROXY. NO_PROXY keeps loopback
+    // legs (the local agent server, MCP servers) direct.
+    kiro: {
+        caKeys: ["SSL_CERT_FILE", "NODE_EXTRA_CA_CERTS"],
+        proxy: true,
+        httpProxyOnRouteHttp: false,
+        extras: [["NO_PROXY", LAUNCHER_LOOPBACK_NO_PROXY], ["no_proxy", LAUNCHER_LOOPBACK_NO_PROXY]],
+    },
     /** No proxy/CA env: the /bili/ URL in ANTHROPIC_BASE_URL (and
      *  ANTHROPIC_VERTEX_BASE_URL) is plain http on loopback, so there is no TLS
      *  hop for a proxy to tunnel and no certificate for NODE_EXTRA_CA_CERTS to
@@ -1187,6 +1203,13 @@ export function buildCopilotEnv(origin: string, caPath: string, baseEnv: NodeJS.
 
 export function buildAmpEnv(origin: string, caPath: string, baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
     return buildClientEnv(ENV_CLIENTS.amp, origin, caPath, baseEnv);
+}
+
+/** Kiro CLI: cert-MITM env (HTTPS_PROXY + the combined CA bundle on both
+ *  SSL_CERT_FILE and NODE_EXTRA_CA_CERTS). Pass the COMBINED bundle: SSL_CERT_FILE
+ *  replaces the Rust shell's trust store, so system roots must ride along. */
+export function buildKiroEnv(origin: string, caPath: string, baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+    return buildClientEnv(ENV_CLIENTS.kiro, origin, caPath, baseEnv);
 }
 
 export function buildCrushEnv(origin: string, caPath: string, baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
@@ -1580,7 +1603,7 @@ export function launcherDirectUrl(env: NodeJS.ProcessEnv): boolean {
  *  (#2115): its model channel is a closed Go binary with no MCP-injection
  *  flag — v1 runs pure wire mode. */
 export function launcherInjectMcp(env: NodeJS.ProcessEnv, base: string, codexUpstream?: string): boolean {
-    if (base === "pi" || base === "omp" || base === "opencode" || base === "hermes" || base === "dsh" || base === "codebuddy" || base === "qoder" || base === "trae" || base === "jcode" || base === "kimi" || base === "gemini" || base === "iflow" || base === "qwen" || base === "antigravity" || base === "mcode" || base === "aider" || base === "copilot" || base === "amp" || base === "crush" || base === "zed" || base === "goose") return false;
+    if (base === "pi" || base === "omp" || base === "opencode" || base === "hermes" || base === "dsh" || base === "codebuddy" || base === "qoder" || base === "trae" || base === "jcode" || base === "kimi" || base === "gemini" || base === "iflow" || base === "qwen" || base === "antigravity" || base === "mcode" || base === "aider" || base === "copilot" || base === "amp" || base === "crush" || base === "zed" || base === "goose" || base === "kiro") return false;
     if (env.BILI_LAUNCHER_PLUGIN === "0") return false;
     if (base === "codex" && env.BILI_LAUNCHER_PLUGIN === undefined && codexUpstream !== undefined && isPrivateUpstreamHost(codexUpstream)) {
         return false;
@@ -6065,6 +6088,15 @@ export function resolveClientCommand(
     if (client === "trae") {
         return { command: firstOnPath(["traecli", "trae-cli", "trae"], env) ?? "traecli", prefixArgs: [] };
     }
+    if (client === "kiro") {
+        // The binary is `kiro-cli`; install.sh places it at ~/.local/bin/kiro-cli.
+        const resolved = resolveOnPath("kiro-cli", env);
+        if (resolved) return { command: resolved, prefixArgs: [] };
+        const base = platform === "win32"
+            ? path.join(env.LOCALAPPDATA ?? path.join(os.homedir(), "AppData", "Local"), "kiro-cli", "bin", "kiro-cli")
+            : path.join(os.homedir(), ".local", "bin", "kiro-cli");
+        return { command: probeInstalledBin(base, platform === "win32" ? [".exe", ""] : [""]), prefixArgs: [] };
+    }
     if (client === "kimi") {
         // install.sh / npm postinstall both place the binary at <KIMI_CODE_HOME>/bin/kimi.
         const resolved = resolveOnPath("kimi", env);
@@ -6783,6 +6815,13 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         // via SSL_CERT_FILE combined bundle). No budget env — the CLI manages
         // its own context window.
         env = buildCopilotEnv(origin, resolveCombinedCaPath(process.env), stripInheritedProxy(process.env));
+    } else if (base === "kiro") {
+        // Kiro CLI: cert-MITM (HTTPS_PROXY honored by the Rust shell and the Node
+        // agent server; combined CA bundle on SSL_CERT_FILE + NODE_EXTRA_CA_CERTS).
+        // Kiro's own auto-compaction stays on as a backstop; bili folds earlier,
+        // so it rarely triggers. Turn it off with
+        // `kiro-cli settings chat.disableAutoCompaction true` if you prefer.
+        env = buildKiroEnv(origin, resolveCombinedCaPath(process.env), stripInheritedProxy(process.env));
     } else if (base === "amp") {
         // #1049: cert-MITM like copilot; ampcode.com carries both the model
         // leg and the control plane, so the single whitelist entry covers both.
