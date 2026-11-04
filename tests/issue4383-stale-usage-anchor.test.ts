@@ -51,10 +51,13 @@ test("#4383 frozen shape: last cycle ended without a settle → per-send estimat
     // many later cycles: every send stamps fresh estimates, no usage ever settles
     noteOutboundContextEstimates(session, { upperBound: 303_092, scaledText: 150_000, imageTokens: 0, calibrated: false });
     assert.equal(usageAnchorCycleStale(session.stats), true);
-    // pre-fix: { tokens: 4733, source: "usage" } — growth read 0, nudge idle 154 turns
+    // pre-fix: { tokens: 4733, source: "usage" } — growth read 0, nudge idle 154 turns.
+    // #5500 round 3: the ride-on upgraded from the char bound (upperBound 303_092)
+    // to the calibrated per-send estimate (scaledText 150_000) — the char bound
+    // crossed the destructive emergency-truncate band on measured-safe sessions.
     const sizing = effectiveTokenCount(session, bigMsgs());
     assert.equal(sizing.source, "estimate");
-    assert.equal(sizing.tokens, 303_092);
+    assert.equal(sizing.tokens, 150_000);
     assert.equal(statusInputBaseline(session), 303_092);
 });
 
@@ -84,10 +87,11 @@ test("#4383 grade branch is bypassed too: a drained anchor's stale grade must no
     session.stats.lastInputTokensSource = "usage";
     session.stats.lastUsageGradeTokens = 4_733;
     noteOutboundContextEstimates(session, { upperBound: 303_092, scaledText: 150_000, imageTokens: 0, calibrated: false });
-    // pre-fix: branch 3 returned the frozen grade 4733
+    // pre-fix: branch 3 returned the frozen grade 4733; #5500 round 3 moved the
+    // stale ride-on from the char bound to the calibrated per-send estimate.
     const sizing = effectiveTokenCount(session, bigMsgs());
     assert.equal(sizing.source, "estimate");
-    assert.equal(sizing.tokens, 303_092);
+    assert.equal(sizing.tokens, 150_000);
     assert.equal(statusInputBaseline(session), 303_092);
 });
 

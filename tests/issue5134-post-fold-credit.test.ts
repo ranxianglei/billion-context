@@ -102,7 +102,9 @@ test("T5 #4383 cycle-stale outranks the credit exemption (unreported send rides 
     const s = incidentSession();
     noteOutboundContextEstimates(s, { upperBound: 350_000, scaledText: 190_000, imageTokens: 0, calibrated: true });
     const r = effectiveTokenCount(s, towerHistory());
-    assert.deepEqual(r, { tokens: 350_000, source: "estimate" },
+    // #5500 round 3: the stale ride-on is the calibrated per-send estimate
+    // (scaledText 190_000), not the char bound (upperBound 350_000).
+    assert.deepEqual(r, { tokens: 190_000, source: "estimate" },
         "a newer unreported main send postdates the settle — its calibrated estimate wins (#4383)");
 });
 
