@@ -16,7 +16,7 @@
 // messages ({role, content: string | blocks[]}) — the lane derives stable
 // content ids server-side, so hosts without their own message ids work.
 
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { DirectSendPrep } from "./native-intercept.js";
 
 /** Marker header the lane's divert recognizes. Client-side copy of
@@ -216,6 +216,21 @@ interface ConvState {
 
 const convs = new Map<string, ConvState>();
 
+/** #4868: per-process identity stamped on EVERY incremental envelope. Two
+ * hosts sharing one conversation id flip each other's canonical with their
+ * resyncs until both burn REJECTION_CIRCUIT strikes into the sticky full-
+ * resend degradation — without a source fingerprint on the wire that race is
+ * indistinguishable in server logs from ordinary drift. One value per process
+ * lifetime (a restart is exactly when the stickiness clears); older servers
+ * ignore unknown envelope fields, older clients omit it (the lane then cannot
+ * fingerprint — no false alarm). */
+const INSTANCE_ID = randomUUID();
+
+/** Test seam for the stamped per-process fingerprint (stable within a process). */
+export function __incrementalInstanceIdForTests(): string {
+    return INSTANCE_ID;
+}
+
 // #4491 host msgids: ids this client has already put on an envelope for the
 // conversation — the client-side mirror of the lane's canonical id set. The
 // lane HARD-FAILS a non-resync turn (400) whose msgIds reuse a live canonical
@@ -389,6 +404,7 @@ function buildBody(args: PlanArgs, sinceSeq: number, messages: IncrementalWireMe
         path: args.path ?? "/v1/messages",
         request,
         messages,
+        instanceId: INSTANCE_ID,
     };
     if (resync) body.resync = true;
     if (includeSystem) body.system = args.system === undefined ? null : args.system;

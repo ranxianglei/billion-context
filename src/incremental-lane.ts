@@ -9,6 +9,7 @@
  *     "sinceSeq": 0,                    // canonical length the client has acked
  *     "resync": false,                  // true → messages[] is a full replacement
  *     "system": "..." | [blocks],       // latest system text (sticky when omitted)
+ *     "instanceId": "<uuid>",           // OPTIONAL per-process client fingerprint (#4868 dual-writer alert)
  *     "path": "/v1/messages",           // optional forward path: bare relative (default, rides the lane's default upstream) or /bili/<upstream>/… embedded
  *     "request": { model, max_tokens, tools, stream, ... },  // anthropic params (allowlist)
  *     "messages": [ ...anthropic wire messages... ]
@@ -163,6 +164,42 @@ function warnDroppedRequestParams(conversationId: string, request: Record<string
     for (const key of unwarned) seen.add(key);
     droppedParamWarned.set(conversationId, seen);
     log("warn", `[incremental] ${conversationId}: request parameter(s) not in the forward allowlist were dropped: ${unwarned.join(", ")} — extend REQUEST_PARAM_KEYS (src/incremental-lane.ts) if they must reach the upstream (#3406)`);
+}
+
+// #4868: last canonical REPLACEMENT per conversation — the client-stamped
+// source fingerprint plus when it landed. Two DISTINCT sources replacing the
+// same canonical inside DUAL_WRITER_WINDOW_MS means two hosts share one
+// conversation id: each resync invalidates the other's acks, so both burn
+// consecutive 409s into the client-side REJECTION_CIRCUIT=3 sticky full-
+// resend degradation — and nothing else on the wire distinguishes that race
+// from ordinary drift. Warn once per cooldown so the log names the actual
+// cause instead of three mystery 409s per host. An empty instanceId (older
+// client / malformed value) cannot be fingerprinted: it records the event but
+// never triggers the alarm (no false alarms by design).
+const DUAL_WRITER_WINDOW_MS = 60_000;
+const DUAL_WRITER_WARN_COOLDOWN_MS = 5 * 60_000;
+const RESYNC_SOURCE_BUDGET = 4096;
+interface ResyncSource {
+    instanceId: string;
+    at: number;
+    warnedAt: number;
+}
+const resyncSources = new Map<string, ResyncSource>();
+const INSTANCE_ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
+
+function noteResyncSource(conversationId: string, raw: unknown, log: (level: string, msg: string) => void): void {
+    const now = Date.now();
+    const instanceId = typeof raw === "string" && INSTANCE_ID_PATTERN.test(raw) ? raw : "";
+    const prev = resyncSources.get(conversationId);
+    // Same bounded discipline as droppedParamWarned: past the budget, drop the
+    // oldest epoch rather than grow without bound.
+    if (resyncSources.size >= RESYNC_SOURCE_BUDGET && prev === undefined) resyncSources.clear();
+    const entry: ResyncSource = { instanceId, at: now, warnedAt: prev?.warnedAt ?? 0 };
+    resyncSources.set(conversationId, entry);
+    const distinct = prev !== undefined && instanceId !== "" && prev.instanceId !== "" && prev.instanceId !== instanceId;
+    if (!distinct || now - prev.at > DUAL_WRITER_WINDOW_MS || now - entry.warnedAt < DUAL_WRITER_WARN_COOLDOWN_MS) return;
+    entry.warnedAt = now;
+    log("warn", `[incremental] ${conversationId}: suspected dual writers — distinct sources "${prev.instanceId}" and "${instanceId}" replaced this canonical ${Math.round((now - prev.at) / 1000)}s apart; each resync invalidates the other's acks, so both hosts will burn 3 consecutive 409s into the sticky full-resend fallback unless they stop sharing the conversation id (#4868)`);
 }
 
 /** Wire headers the client may contribute to the forwarded request. */
@@ -550,7 +587,11 @@ function applyTurn(
     const serverSeq = entry.msgs.length;
     if (resync) {
         // Full replacement: the client is the source of truth for the whole
-        // history (edit / branch reset / recovery). Marks and system survive.
+        // history (edit / branch reset / recovery). System survives (sticky
+        // state, never positional); marks are pruned below to the live set —
+        // ids are unique so a surviving mark can only attach to a live
+        // message, but a replaced branch's marks would otherwise linger in
+        // the map (and its ext key) forever (#4868).
     } else if (sinceSeq !== serverSeq) {
         // Strict ack contract — including sinceSeq 0 against a populated
         // canonical: a client that believes it is seeding a fresh server must
@@ -587,6 +628,10 @@ function applyTurn(
     }
     const base = resync ? [] : entry.msgs;
     entry.msgs = [...base, ...deltaMsgs];
+    if (resync) {
+        const live = new Set(entry.msgs.map((m) => m.id));
+        for (const id of entry.marks.keys()) if (!live.has(id)) entry.marks.delete(id);
+    }
     const marksTouched = flat.cacheControls.size > 0;
     for (const [id, mark] of flat.cacheControls) entry.marks.set(id, mark);
     // #5155: a mark can legally target an id the prefix already rendered
@@ -623,6 +668,7 @@ export function __resetIncrementalLaneForTests(): void {
     pendingPtrWork.clear();
     droppedParamWarned.clear();
     droppedParamWarnPairs = 0;
+    resyncSources.clear();
 }
 
 /** Marker header native extensions stamp on an ordinary model request to
@@ -789,7 +835,10 @@ export async function handleIncrementalTurn(
         }
         touchCache(conversationId, entry);
         // Record the epoch BEFORE the forward lands the new branch's rows.
-        if (resync) await recordResyncBaseSeq(sessionId, log);
+        if (resync) {
+            await recordResyncBaseSeq(sessionId, log);
+            noteResyncSource(conversationId, payload.instanceId, log);
+        }
         persistLaneState(sessionId, entry.system, entry.systemSet, entry.marks, log);
 
         const body: Record<string, unknown> = { ...forwarded };
