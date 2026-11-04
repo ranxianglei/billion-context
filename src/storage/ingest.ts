@@ -422,7 +422,7 @@ function finishPlan(
             tier: b.tier,
             summary: JSON.stringify(full),
             one: one === null ? null : JSON.stringify(one),
-            supersedesBlockId: null,
+            supersedesBlockId: b.supersedesBlockId ?? null,
             active: b.active,
             createdAt: b.createdAt,
             coveredHash: sha256Hex(JSON.stringify(covered)),

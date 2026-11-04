@@ -1835,7 +1835,13 @@ function applySingleRange(input: SingleRangeInput): SingleRangeOutcome {
 
   for (const consumedId of consumedBlockIds) {
     const consumed = blockById(input.state, consumedId);
-    if (consumed) consumed.active = false;
+    if (consumed) {
+      // #5667 A: lineage written ONLY here (consumption). Non-consumptive
+      // deactivation (orphan GC / host expand in sync.ts) must leave it unset —
+      // that absence is what keeps the death cause discriminable.
+      consumed.active = false;
+      consumed.supersedesBlockId = blockId;
+    }
   }
 
   return { tokens: compressedTokens, warnings };
