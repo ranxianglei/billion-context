@@ -7,16 +7,30 @@ import { execFileSync } from "node:child_process";
 // dev (tsx: src/version.ts → ../package.json) and bundled (tsup: dist/*.js →
 // ../package.json). Single source for the CLI banner, the /acp panel header,
 // and the acp_status surface-meta host line.
-function readPkgField(field: string, fallback: string): string {
+/** The package root this running copy loads from (the directory holding its
+ *  package.json). Flat dist entries sit at dist/<entry>.js (one level up);
+ *  subdirectory bundles (dist/agent/*.js) need one more level — the flat
+ *  assumption made every subdirectory entry report VERSION="dev". */
+export function pkgRoot(): string | undefined {
     const here = fileURLToPath(import.meta.url);
-    // Flat dist entries sit at dist/<entry>.js (one level up = package root);
-    // subdirectory bundles (dist/agent/*.js) need one more level — the flat
-    // assumption made every subdirectory entry report VERSION="dev".
     for (const rel of ["..", "../.."]) {
         try {
-            return (JSON.parse(readFileSync(path.join(path.dirname(here), rel, "package.json"), "utf8"))[field] as string) ?? fallback;
+            readFileSync(path.join(path.dirname(here), rel, "package.json"));
+            return path.resolve(path.dirname(here), rel);
         } catch {
-            // try the next candidate, then the fallback
+            // try the next candidate, then undefined
+        }
+    }
+    return undefined;
+}
+
+function readPkgField(field: string, fallback: string): string {
+    const root = pkgRoot();
+    if (root !== undefined) {
+        try {
+            return (JSON.parse(readFileSync(path.join(root, "package.json"), "utf8"))[field] as string) ?? fallback;
+        } catch {
+            // fall through to the fallback
         }
     }
     return fallback;
@@ -24,6 +38,9 @@ function readPkgField(field: string, fallback: string): string {
 
 export const VERSION = readPkgField("version", "dev");
 export const PACKAGE_NAME = readPkgField("name", "billion-context");
+// #5648: which install is actually serving — /__bili/health reports it so a
+// report can't cite the wrong build when CLI and running instance skew.
+export const INSTALL_PATH = pkgRoot();
 
 // Which git commit this running code was built from. Display-only (never used
 // for update decisions — the updater compares package.json semver).

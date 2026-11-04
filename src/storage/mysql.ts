@@ -171,6 +171,7 @@ CREATE TABLE IF NOT EXISTS blocks (
     tier                BIGINT NOT NULL,
     summary_hash        VARCHAR(64) NOT NULL,
     one_hash            VARCHAR(64) NULL,
+    -- #5648: no writer yet — ALWAYS NULL (see schema.ts).
     supersedes_block_id VARCHAR(64) NULL,
     active              TINYINT NOT NULL DEFAULT 1,
     created_at          BIGINT NOT NULL,
