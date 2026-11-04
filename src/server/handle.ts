@@ -102,8 +102,22 @@ function persistLineageLinkNow(session: Session): void {
  *  until the user hit the symptom days later. Persistent [session-resolve]
  *  lines for the two decision classes that matter: derived-* forks warn (the
  *  abnormal event), reanchor migrations info; claim/continue stay silent —
- *  they are the steady state and would log once per request. */
+ *  they are the steady state and would log once per request.
+ *
+ *  Logging is TRANSITION-AWARE: the resolver re-runs on every request and a
+ *  STABLE derived lane re-derives the same fork key every time (e.g. the
+ *  claude-code subagent lane token rides the first user message of every
+ *  dispatch turn, so D1-C resolves derived-persona per turn) — per-request
+ *  logging would spam one warn per subagent model call. First occurrence and
+ *  every action/key change still log exactly once; repeats are suppressed. */
+const sessionResolutionLastLogged = new Map<string, string>();
+const SESSION_RESOLUTION_LOG_CAP = 4096;
+
 function noteSessionResolution(rawId: string, resolution: SessionOrderResolution): void {
+    const signature = `${resolution.action}:${resolution.key}`;
+    if (sessionResolutionLastLogged.get(rawId) === signature) return;
+    if (sessionResolutionLastLogged.size >= SESSION_RESOLUTION_LOG_CAP) sessionResolutionLastLogged.clear();
+    sessionResolutionLastLogged.set(rawId, signature);
     if (resolution.action === "reanchor") {
         loggerLog("info", `[session-resolve] ${rawId} → ${resolution.key}: anchor migrated — ${resolution.reason}`);
     } else if (resolution.action !== "claim" && resolution.action !== "continue") {
