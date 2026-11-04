@@ -1821,13 +1821,18 @@ test("#2592/#2709: unattributed raw-URL POST without the marker still sends dire
     assert.deepEqual(sink, ["https://api.deepseek.com/chat/completions"]);
 });
 
-test("#2592/#2709: marker hit but proxy not ready falls open to a direct send", async () => {
+// #5686 P0-1 supersedes this pin: the old "proxy not ready ⇒ fail open to a
+// direct send" was precisely the last local-landing leak window — a decisive
+// compaction call sent direct lands its checkpoint in the dsh client and
+// destroys the compression substrate (#1729). Owner ruling #1884 leaves no
+// third exit: what cannot be compressed must be refused.
+test("#2592/#2709/#5686: marker hit with no live proxy is refused locally (was: fail-open direct send)", async () => {
     const state: NativeInterceptState = { origin: undefined, ready: Promise.resolve(undefined), takeoverGate: () => false };
-    const { sink } = await withPatch(state, async (fetch) => {
-        const res = await fetch("https://api.deepseek.com/chat/completions", { method: "POST", body: dshCompactionEnvelope() });
-        assert.equal(res.status, 200);
-    });
-    assert.deepEqual(sink, ["https://api.deepseek.com/chat/completions"]);
+    const { sink, result } = await withPatch(state, async (fetch) =>
+        fetch("https://api.deepseek.com/chat/completions", { method: "POST", body: dshCompactionEnvelope() }));
+    assert.equal(result.status, 422);
+    assert.equal(result.headers.get("x-bili-gate"), "dsh-compaction-refused");
+    assert.deepEqual(sink, []);
 });
 
 test("#2592/#2709: Uint8Array body with the marker diverts; URLSearchParams form-encoding cannot carry the raw marker", async () => {

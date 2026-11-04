@@ -14,7 +14,7 @@ import { mediaBytesOfWireBody } from "./media-bytes.js";
 import * as pfChannel from "./pf-channel.js";
 import { probeLiveness, type LivenessVerdict } from "../liveness.js";
 import { BILI_PASSTHROUGH_HEADER, MIN_ASSUMED_WINDOW_TOKENS } from "../util.js";
-import { DSH_COMPACTION_MARKER_SNIFF } from "../server/dsh-compaction-guard.js";
+import { DSH_COMPACTION_MARKER_SNIFF, dshCompactionRefusal, isDshCompactionCall } from "../server/dsh-compaction-guard.js";
 import { APIG_RESIGN_HEADER, APIG_RESIGN_CREDENTIAL_HEADER, APIG_RESIGN_SCHEME, clearSignedRefusal, encodeApigCredential, inboundSignedScheme, recordSignedRefusal, resignEnabled, resignPassthroughEnabled, signedRefusal } from "../apig-resign.js";
 
 /** #2924: takeover-gate verdict. `true` claims the request; `false` keeps the
@@ -396,6 +396,23 @@ function fetchMethodOf(input: string | URL | Request, init?: RequestInit): strin
         // fallthrough
     }
     return "GET";
+}
+
+/** #5686: the wire protocol a raw model URL speaks, by path suffix — the same
+ *  heuristic family as the server's protocol derivation (handle.ts), minus
+ *  google: dsh never speaks the google wire, and a miss here fails OPEN (the
+ *  #1729 decisive check below simply doesn't run and the request keeps its
+ *  direct send). */
+function modelProtocolOfUrl(url: string): "anthropic" | "openai" | "responses" | null {
+    try {
+        const p = new URL(url).pathname.replace(/\/+$/, "");
+        if (p.endsWith("/messages")) return "anthropic";
+        if (p.endsWith("/responses") || p.endsWith("/responses/compact")) return "responses";
+        if (p.endsWith("/chat/completions") || p.endsWith("/llm_raw_chat") || p.endsWith("/completions") || p.endsWith("/conversations")) return "openai";
+        return null;
+    } catch {
+        return null;
+    }
 }
 
 /** Merge extra headers into a (input, init) pair, preserving all three
@@ -1309,6 +1326,7 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
             defaultInput: string | URL | Request,
             init: RequestInit | undefined,
             degradeLog?: string,
+            noLiveProxy?: boolean,
         ): Promise<Response> => {
             const prep = await prepareForDirectSend(dispatchUrl, defaultInput, init);
             if (prep.outcome === "unrestorable") {
@@ -1321,6 +1339,48 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
                 if (degradeLog !== undefined) noteDispatchMode("refused", `bili-native: ${degradeLog} — lane-only payload refused locally instead (#3304)`);
                 logHostEvent("error", "[native-client]", `bili-native: no usable proxy and the request carries a lane-only payload — failing locally instead of sending it to the provider; retry the turn (#3304): ${dispatchUrl}`);
                 throw new TypeError("billion-context: proxy unavailable — the request payload is lane-specific (incremental turn) and cannot be forwarded to the provider directly; retry the turn (#3304)");
+            }
+            // #5686 P0-1 (owner ruling #1884 「要么一定压缩，或者一定拒绝」,
+            // restated at the gate-false divert below): every caller passing
+            // noLiveProxy has ALREADY established there is no live proxy to
+            // compress through (bootstrap failed / respawn exhausted / the
+            // proxy died and recovery found no replacement / the gate
+            // declined with no usable origin) — so a marker-decisive dsh
+            // native compaction call reaching here has exactly ONE legal
+            // outcome: refuse locally. Sent direct, the upstream answers
+            // normally and dsh's frameSummary writes its checkpoint to local
+            // disk, durably shadowing the raw history and destroying the
+            // compression substrate (#1729) — the pre-fix code admitted the
+            // gap in writing ("a dead proxy — keeps #1117's direct
+            // semantics"). Same two-stage shape as the divert above: cheap
+            // 48-byte sniff first (ordinary traffic never pays a full read),
+            // then the marker-DECISIVE last-user-message check on the exact
+            // bytes about to go out — a conversation that merely MENTIONS the
+            // instruction text mid-body never matches. Fail OPEN, today's
+            // behavior: streaming bodies (a ReadableStream cannot be peeked
+            // without consuming it), undecodable buffers (#4912), unparseable
+            // JSON, or a URL whose protocol is unrecognized each keep the
+            // direct send, with this refusal line in bili.log as the audit
+            // trail for the calls that DID get caught.
+            if (noLiveProxy === true && fetchMethodOf(defaultInput, init) === "POST" && isModelApiUrl(dispatchUrl)
+                && await dshCompactionMarkerInBody(defaultInput, init)) {
+                const outgoingRaw = prep.outcome === "restored" ? prep.body : (await directSendBodyMeasure(defaultInput, init))?.raw;
+                if (outgoingRaw !== undefined && outgoingRaw.includes(DSH_COMPACTION_MARKER_SNIFF)) {
+                    let parsed: unknown;
+                    try {
+                        parsed = JSON.parse(outgoingRaw);
+                    } catch {
+                        parsed = undefined;
+                    }
+                    const protocol = modelProtocolOfUrl(dispatchUrl);
+                    if (parsed !== undefined && protocol !== null && isDshCompactionCall(protocol, parsed)) {
+                        state.onDispatch?.(dispatchUrl, "refused");
+                        if (degradeLog !== undefined) noteDispatchMode("refused", `bili-native: ${degradeLog} — dsh native compaction call refused locally instead of landing upstream (#5686)`);
+                        logHostEvent("error", "[native-client]", `bili-native: dsh native compaction call refused locally instead of direct send — with no live proxy there is nothing left to compress it, so a landed checkpoint would durably shadow the raw history and destroy the compression substrate (#1729/#5686): ${dispatchUrl}`);
+                        const refusal = dshCompactionRefusal(protocol);
+                        return new Response(JSON.stringify(refusal.body), { status: refusal.status, headers: { "content-type": "application/json", "x-bili-gate": "dsh-compaction-refused" } });
+                    }
+                }
             }
             // #4516/#4894: without a live proxy the raw history rides straight
             // to the provider — refuse LOCALLY what provably cannot fit the
@@ -1505,7 +1565,10 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
                 // the steady-state verdict rewrites history. Steady-state
                 // degraded-mode visibility is #4516's dispatch-mode tracker's
                 // job (noteDispatchMode below), not this slot's.
-                return directSendOrRefuse(routedTarget, makeTarget(routedTarget), init, "no live proxy — model requests go direct (uncompressed)");
+                // #5686 P0-1: routedTarget IS the raw upstream (the /bili/ form
+                // was unrouted by construction) and recovery just failed — no
+                // live proxy, so marker-decisive compaction calls refuse here.
+                return directSendOrRefuse(routedTarget, makeTarget(routedTarget), init, "no live proxy — model requests go direct (uncompressed)", true);
             }
         }
         if (!isModelApiUrl(url)) {
@@ -1608,7 +1671,11 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
                     state.onDispatch?.(url, "refused");
                     return verdict === "refuse-oversized" ? oversizeRefusal(url) : unattributedOversizeRefusal(url);
                 }
-                return directSendOrRefuse(url, input, init);
+                // #5686 P0-1: any marker-sniffed POST reaching here already ran
+                // readyOrigin in the divert above and found no live origin —
+                // so the choke point's refusal applies; GETs and sniff-misses
+                // pass through it untouched.
+                return directSendOrRefuse(url, input, init, undefined, true);
             }
         }
 
@@ -1645,7 +1712,9 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
             // what provably cannot fit, send the rest direct (uncompressed),
             // and log every transition into this state (#4516).
             state.lastUnavailableReason = everHeldOrigin ? "dead" : "bootstrap-failed";
-            return directSendOrRefuse(url, input, init, everHeldOrigin ? "proxy respawn failed — model requests go direct (uncompressed)" : "proxy not ready — model requests go direct (uncompressed)");
+            // #5686 P0-1: origin is undefined after the respawn wait — no live
+            // proxy by construction of this branch.
+            return directSendOrRefuse(url, input, init, everHeldOrigin ? "proxy respawn failed — model requests go direct (uncompressed)" : "proxy not ready — model requests go direct (uncompressed)", true);
         }
         state.lastUnavailableReason = undefined;
         everHeldOrigin = true;
@@ -1724,8 +1793,10 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
                 state.onGiveUp?.();
                 // #4125/#4824: same as the routed branch — the branch reason
                 // stays readable after the fire; the degraded-mode tracker
-                // carries the steady-state visibility.
-                return directSendOrRefuse(url, input, init, "proxy respawn failed — model requests go direct (uncompressed)");
+                // carries the steady-state visibility. #5686 P0-1: recover()
+                // found no replacement — no live proxy, so marker-decisive
+                // compaction calls refuse here instead of landing upstream.
+                return directSendOrRefuse(url, input, init, "proxy respawn failed — model requests go direct (uncompressed)", true);
             }
             throw err;
         }
