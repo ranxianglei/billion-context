@@ -2550,9 +2550,11 @@ export class UnifiedStore {
     }
 
     /** Water window rows into a map pos→core_json for rehydration after
-     *  restart (§4.1.4): ONLY the visible slice is lifted into memory —
-     *  deep-folded territory stays on disk until an audit demands it. No
-     *  plane → empty map (lane unavailable ⇒ caller serves baseline). */
+     *  restart (§4.1.4): loads EVERY row in [posFrom,posTo] — v6 worlds
+     *  carry no bili-side fold entries (plugin-lane agents own compression),
+     *  so the caller requests the whole frozen prefix and nothing is left
+     *  behind. No plane → empty map (lane unavailable ⇒ caller serves
+     *  baseline). */
     pfHydrateWindow(sid: string, posFrom: number, posTo: number): Map<number, string> {
         const out = new Map<number, string>();
         if (!this.pfAvailable()) return out;
