@@ -30,6 +30,16 @@ interface WireRule {
 
 export const WIRE_RULES: readonly WireRule[] = [
     {
+        // Landed as WC-024 on the feature branch; the lane rebase renumbered
+        // the output-side rule to WC-024, so this one takes WC-025.
+        id: "WC-025",
+        wire: "responses",
+        summary:
+            "a call item (function_call / custom_tool_call / tool_search_call) whose call_id matches no output item anywhere in the same input array is unrecoverable upstream — strict Responses backends 400 the whole request with 'No tool output found for tool call <id>' (#766's production error string). The only legal output-less call is an in-flight one, which structurally sits in the trailing run of the array (calls and post-call reasoning only). bili completes such mid-history orphans with an honest synthesized lost-output result at the wire boundary (completeOrphanToolCalls, src/tool-pair-order.ts)",
+        provenance:
+            "bili #5670 production evidence (Codex 0.166 + DeepSeek via Magpie): the invariant-judge log cited in the issue flagged 'I1 violation: mid-history-rewrite @118 — inbound[118] tool-result#call_94ffd9dc... absent from outbound frozen prefix' — a compression round dropped the OUTPUT while the CALL survived, the mirror of WC-024's shape. One compression bug thus produces two distinct unshippable requests. The rejecting error string is #766's production 400 text, so the constraint holds for the whole responses wire, not one provider lane.",
+    },
+    {
         id: "WC-024",
         wire: "responses",
         summary:
@@ -490,6 +500,36 @@ export function validateResponsesBody(body: unknown): string[] {
                 if (typeof item.call_id !== "string" || item.call_id.length === 0) return;
                 if (!callIds.has(item.call_id))
                     out.push(`WC-024 input[${i}]: ${t} references call_id "${item.call_id}" but no matching call item exists in input — strict backends 400 'No tool call found for tool output' (#5670)`);
+            });
+        }
+        // WC-025 (#5670 I1 direction): the mirror of WC-024 — a call with no surviving
+        // output before the trailing run was abandoned mid-history by compression
+        // ('No tool output found for tool call <id>', #766's error string). In-flight
+        // calls are exempt: they can only legally sit in the trailing {call, reasoning}
+        // suffix. Mirrors completeOrphanToolCalls (src/tool-pair-order.ts) exactly;
+        // calls with missing/empty call_id are not flagged — unjudgeable, same as WC-024.
+        {
+            const outIds = new Set<string>();
+            for (const item of body.input) {
+                if (!isPlainObject(item)) continue;
+                const t = item.type;
+                if ((t === "function_call_output" || t === "custom_tool_call_output" || t === "tool_search_output") && typeof item.call_id === "string" && item.call_id.length > 0)
+                    outIds.add(item.call_id);
+            }
+            let tail = body.input.length;
+            while (tail > 0) {
+                const it = body.input[tail - 1];
+                const t = isPlainObject(it) ? it.type : undefined;
+                if (t === "function_call" || t === "custom_tool_call" || t === "tool_search_call" || t === "reasoning") tail--;
+                else break;
+            }
+            body.input.forEach((item, i) => {
+                if (!isPlainObject(item) || i >= tail) return;
+                const t = item.type;
+                if (t !== "function_call" && t !== "custom_tool_call" && t !== "tool_search_call") return;
+                if (typeof item.call_id !== "string" || item.call_id.length === 0) return;
+                if (!outIds.has(item.call_id))
+                    out.push(`WC-025 input[${i}]: ${t} has call_id "${item.call_id}" but no matching output item exists in input (and it sits before the trailing in-flight run) — strict backends 400 'No tool output found for tool call' (#5670)`);
             });
         }
     }

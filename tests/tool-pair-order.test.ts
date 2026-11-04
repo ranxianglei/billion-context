@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { dropOrphanToolOutputs, hoistTrappedToolItems } from "../src/tool-pair-order.ts";
+import { completeOrphanToolCalls, dropOrphanToolOutputs, hoistTrappedToolItems } from "../src/tool-pair-order.ts";
 
 const fc = (id: string) => ({ type: "function_call", call_id: id });
 const fo = (id: string) => ({ type: "function_call_output", call_id: id });
@@ -85,11 +85,14 @@ test("item after the trailing output is not trapped", () => {
     assertNoTrap(out);
 });
 
-test("orphan call (no output) does not trap a following item", () => {
+test("#5670 I1: mid-history call without output gets a synthesized completion; following item stays put", () => {
     const input: Item[] = [fc("orphan"), msg("m"), fc("real"), fo("real")];
     const out = hoistTrappedToolItems(input);
-    // "m" has no matching-output call before it that also has an output after → stays put.
-    assert.deepEqual(types(out), ["function_call", "message", "function_call", "function_call_output"]);
+    // "orphan" sits before the trailing run with no surviving output → completed in place;
+    // "m" is not trapped (the completed pair closes before it) and keeps its position.
+    assert.deepEqual(types(out), ["function_call", "function_call_output", "message", "function_call", "function_call_output"]);
+    assert.equal((out[1] as unknown as { output?: string }).output, "tool output lost during context compression");
+    assert.equal(out[1].call_id, "orphan");
     assertNoTrap(out);
 });
 
@@ -167,4 +170,58 @@ test("dropOrphanToolOutputs: multiple orphans all dropped, paired items survive"
     const input: Item[] = [ct("c1"), cto("c1"), tso("gone_1"), fc("f1"), fo("f1"), tso("gone_2")];
     const out = dropOrphanToolOutputs(input);
     assert.deepEqual(types(out), ["custom_tool_call", "custom_tool_call_output", "function_call", "function_call_output"]);
+});
+
+test("#5670 I1: in-flight parallel pending pair at the tail is untouched (same reference)", () => {
+    const input: Item[] = [fc("a"), fc("b")];
+    assert.strictEqual(hoistTrappedToolItems(input), input);
+    assert.strictEqual(completeOrphanToolCalls(input), input);
+});
+
+test("#5670 I1: pending batch interleaved with post-call reasoning stays untouched (same reference)", () => {
+    const input: Item[] = [msg("m"), fc("a"), reason(), fc("b")];
+    const out = hoistTrappedToolItems(input);
+    assert.strictEqual(out, input);
+});
+
+test("#5670 I1: custom_tool_call orphan mid-history gets a family-matched synthesized output", () => {
+    const input: Item[] = [ct("c"), msg("m")];
+    const out = hoistTrappedToolItems(input);
+    assert.deepEqual(types(out), ["custom_tool_call", "custom_tool_call_output", "message"]);
+    assert.equal((out[1] as unknown as { output?: string }).output, "tool output lost during context compression");
+    assertNoTrap(out);
+});
+
+test("#5670 I1: tool_search_call orphan mid-history gets a minimal tool_search_output (empty result)", () => {
+    const input: Item[] = [tsc("s"), msg("m")];
+    const out = hoistTrappedToolItems(input);
+    assert.deepEqual(types(out), ["tool_search_call", "tool_search_output", "message"]);
+    assert.deepEqual(
+        out[1] as unknown as { type: string; call_id: string; tools: unknown[]; execution: string },
+        { type: "tool_search_output", call_id: "s", tools: [], execution: "client" },
+    );
+    assertNoTrap(out);
+});
+
+test("#5670 both directions in one array: dead output dropped, both abandoned calls completed", () => {
+    const input: Item[] = [fc("a"), fo("dead"), fc("b"), msg("m")];
+    const out = hoistTrappedToolItems(input);
+    assert.deepEqual(types(out), ["function_call", "function_call_output", "function_call", "function_call_output", "message"]);
+    assert.equal(out[1].call_id, "a");
+    assert.equal(out[3].call_id, "b");
+    assertNoTrap(out);
+});
+
+test("#5670 I1: completeOrphanToolCalls keeps a lone pending call and a message-then-call tail unchanged", () => {
+    const lone: Item[] = [fc("only")];
+    assert.strictEqual(completeOrphanToolCalls(lone), lone);
+    const tail: Item[] = [msg("m"), fc("p")];
+    assert.strictEqual(completeOrphanToolCalls(tail), tail);
+});
+
+test("#5670 I1: call with missing call_id is unjudgeable — kept, not completed", () => {
+    const bare = { type: "function_call" } as Item;
+    const input: Item[] = [bare, msg("m")];
+    const out = hoistTrappedToolItems(input);
+    assert.strictEqual(out, input);
 });
