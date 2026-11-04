@@ -657,12 +657,13 @@ export async function refreshDshProfileBundles(
                 // repair detected — clear the marker (also when the version is
                 // unchanged, or it would linger and re-log on every cycle)
                 log("info", `[update] dsh profile ${name}: billion-context copy readable again (${before}) after a host-side destruction — resuming normal updates (#5642)`);
-                copies[dir] = { version: before, updatedAt: Date.now() };
-                ledgerDirty = true;
-            } else if (prev?.version !== before) {
-                copies[dir] = { version: before, updatedAt: Date.now() };
-                ledgerDirty = true;
             }
+            // Touch on EVERY readable observation — an in-step profile must keep
+            // its entry alive past the TTL, or after 7 days a later destruction
+            // looks "never observed" again and re-arms the destructive retry
+            // this ledger exists to stop.
+            copies[dir] = { version: before, updatedAt: Date.now() };
+            ledgerDirty = true;
         }
         if (before === targetVersion) continue; // #1803: already in step
         try {
@@ -688,8 +689,10 @@ export async function refreshDshProfileBundles(
             log("warn", `[update] dsh profile ${name}: bundle refresh to ${targetVersion} failed: ${detail} — manual fix: run \`dsh plugin --profile ${name} add billion-context@${targetVersion}\` from a shell where \`dsh\` resolves (or point BILI_DSH_BIN at dsh's executable)`);
         }
     }
-    // Prune entries whose profile no longer declares a registry-pinned bili.
-    // Broken entries never age out — forgetting them would re-arm exactly the
+    // Prune entries whose profile no longer declares a registry-pinned bili,
+    // plus healthy entries of profiles that stopped being observed (readable
+    // ones are touched on every check, so live entries never age out). Broken
+    // entries never age out — forgetting them would re-arm exactly the
     // destructive retry they exist to stop; they clear on repair or when the
     // profile drops the dependency.
     const targetSet = new Set(targets);

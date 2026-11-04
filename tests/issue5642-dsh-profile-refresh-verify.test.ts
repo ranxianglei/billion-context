@@ -295,3 +295,37 @@ test("corrupt ledger file fails open — refresh proceeds and the file is rewrit
         _setDshRunnersForTest(undefined);
     }
 });
+
+test("in-step observation keeps the entry alive past the TTL, so a later destruction stays remembered", async () => {
+    _resetProfileCopyLedgerForTest();
+    const { home, dirs } = makeHome(["a"]);
+    const env = { ...process.env, DSH_HOME: home };
+    const calls: string[] = [];
+    _setDshRunnersForTest({ async: runner(home, calls) });
+    try {
+        const { log, entries } = makeLog();
+        await refreshDshProfileBundles("2.0.0", log, env);
+        assert.equal(calls.length, 1);
+        // Age the entry past the 7-day TTL like steady-state weeks would, then
+        // observe it in-step again: the next prune pass must keep it — forget
+        // it and a later destruction looks "never observed", re-arming the
+        // destructive install op (#5642).
+        const doc = JSON.parse(fs.readFileSync(ledgerFile(), "utf-8")) as { v: number; copies: Record<string, { version: string; updatedAt: number }> };
+        doc.copies[dirs.a].updatedAt -= 8 * 24 * 60 * 60 * 1000;
+        fs.writeFileSync(ledgerFile(), JSON.stringify(doc));
+        const r2 = await refreshDshProfileBundles("2.0.0", log, env);
+        assert.deepEqual(r2, { refreshed: 0, failed: 0 });
+        assert.equal(calls.length, 1, "in-step — no spawn");
+        const kept = (JSON.parse(fs.readFileSync(ledgerFile(), "utf-8")) as { copies: Record<string, unknown> }).copies[dirs.a];
+        assert.ok(kept, "observed entry survives the TTL prune");
+        fs.rmSync(path.join(dirs.a, "node_modules"), { recursive: true, force: true });
+        const r3 = await refreshDshProfileBundles("2.0.0", log, env);
+        assert.deepEqual(r3, { refreshed: 0, failed: 0 });
+        assert.equal(calls.length, 1, "no destructive retry against a remembered profile");
+        const warns = entries.filter((l) => l.startsWith("warn"));
+        assert.equal(warns.length, 1);
+        assert.ok(warns[0].includes("Leaving the profile untouched"));
+    } finally {
+        _setDshRunnersForTest(undefined);
+    }
+});
