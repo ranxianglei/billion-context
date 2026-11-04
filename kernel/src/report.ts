@@ -1,4 +1,4 @@
-import { clampPrefix } from "./truncate.js";
+import { clampPrefix, scrubLoneSurrogates } from "./truncate.js";
 import { isToolMessage } from "./message-kind.js";
 import { BLOCKED_REF, orderedRefPair, refForRaw } from "./refs.js";
 import { countMessageTokens } from "./tokenize.js";
@@ -498,8 +498,19 @@ function renderUncompressedRanges(
           protectedMessageIds: protectedRefs,
           shared,
         });
-      } catch {
-        return "\u26a0 not foldable: refs unresolvable";
+      } catch (err) {
+        // A thrown resolution failure means the row's endpoints cannot be
+        // mapped onto the apply array class at all (stale/BLOCKED/surface-
+        // drift refs). Surface the underlying reason verbatim-ish: the flat
+        // "refs unresolvable" verdict sent agents down dead-end theories
+        // (they read it as ledger corruption when it was one bad endpoint).
+        const detail = scrubLoneSurrogates(
+          err instanceof Error ? err.message : String(err),
+        )
+          .replace(/[\r\n]+/g, " ")
+          .trim()
+          .slice(0, 120);
+        return `\u26a0 not foldable: projection failed${detail ? ` (${detail})` : ""}`;
       }
       if (proj.fatal?.kind === "zone")
         return "\u26a0 not foldable: protected zone only";
