@@ -94,9 +94,11 @@ interface LaneShape { name: "dsh" | "pi"; model: string; endpoint: string; }
 
 const LANES: LaneShape[] = [
     { name: "dsh", model: "gpt-test", endpoint: "/chat/completions" },     // openai chat shape
-    // #388: claude-* model ids route to the side-request lane, which bypasses
-    // compression BY DESIGN — the pi lane needs a non-side model id to stay
-    // on the main compression path despite the anthropic wire shape.
+    // Neutral model id: the #388 side-request passthrough arms on client
+    // EVIDENCE only (agent headers, output budget <= 200, host-sidecar shapes
+    // — src/server/side-request.ts), never on model family, so any id stays
+    // on the main compression path here; a neutral id keeps the suite off the
+    // claude registry/window-table entries.
     { name: "pi", model: "test-anthropic-model", endpoint: "/v1/messages" },  // anthropic shape
 ];
 
