@@ -220,10 +220,13 @@ class UpstreamRecorder {
             const prev = this.lastPrompt.get(key);
             const lcpPromptBytes = prev !== undefined ? UpstreamRecorder.lcp(prompt, prev) : 0;
             this.lastPrompt.set(key, prompt);
-            try {
-                fs.mkdirSync(debugDir(), { recursive: true });
-                fs.writeFileSync(`${debugDir()}/up_${String(this.hits.length).padStart(3, "0")}_${key.replace(/[^a-z0-9]+/gi, "_")}.json`, body);
-            } catch { /* best effort */ }
+            const dump = debugDir();
+            if (dump) {
+                try {
+                    fs.mkdirSync(dump, { recursive: true });
+                    fs.writeFileSync(`${dump}/up_${String(this.hits.length).padStart(3, "0")}_${key.replace(/[^a-z0-9]+/gi, "_")}.json`, body);
+                } catch { /* best effort */ }
+            }
             const seq = this.hits.length;
             const ack = `ack-${seq}`;
             this.hits.push({ url: key, bytes, prompt, lcpPromptBytes, ack });
