@@ -39,6 +39,11 @@ import {
 } from "./protected.js";
 import { isToolMessage } from "./message-kind.js";
 import { projectUnit, collectCoverage } from "./unit-projection.js";
+import {
+  appendMediaRefsSection,
+  collectFoldMediaRefs,
+  parseMediaRefsSection,
+} from "./media-refs.js";
 import { evaluateRefold, type RefoldDecision } from "./refold.js";
 import {
   computeProtectedRefs,
@@ -286,17 +291,21 @@ function applyRefolds(input: {
 }): void {
   validateSummaryLength(input.spec, input.config.compress);
   const targets = new Set(input.blockIds);
-  input.state.blocks = input.state.blocks.map((block) =>
-    targets.has(block.blockId)
-      ? {
-          ...block,
-          summary: input.spec.summary,
-          topic: input.spec.topic ?? block.topic,
-          runId: input.runId,
-          restoredInline: false,
-        }
-      : block,
-  );
+  input.state.blocks = input.state.blocks.map((block) => {
+    if (!targets.has(block.blockId)) return block;
+    // #5620: refold rewrites the stored summary — carry this block's own
+    // MEDIA REFS section forward mechanically.
+    const carriedRefs = parseMediaRefsSection(block.summary).map(
+      scrubLoneSurrogates,
+    );
+    return {
+      ...block,
+      summary: appendMediaRefsSection(input.spec.summary, carriedRefs),
+      topic: input.spec.topic ?? block.topic,
+      runId: input.runId,
+      restoredInline: false,
+    };
+  });
 }
 
 export function createCore(ports: Ports = {}): CompressionCore {
@@ -1162,11 +1171,14 @@ const assignRefsNode: PipelineNode = {
       hasProtection && hasPathPatterns
         ? collectProtectedToolCallIds(io.messages, ctx.config)
         : undefined;
-    // Unrecoverable media (remote URLs / file refs with no stored bytes) ride
+    // Unrecoverable media (no stored bytes AND no re-access handle) rides
     // outside msg.text; folding one destroys it permanently with no restore
     // behind it (#1188/#2609), so those messages get a BLOCKED ref — never
-    // advertised, never folded. Archivable inline images fold like text and
-    // stay citable by their numeric ref for decompress({ imageRef }) (#2607).
+    // advertised, never folded. #5620: ref-based media (remote URL / file id)
+    // is NOT blocked — its handle rides the stored summary (media-refs.ts)
+    // and decompress restores the original. Archivable inline images fold
+    // like text and stay citable by their numeric ref for
+    // decompress({ imageRef }) (#2607).
     const protectedFn = (m: CoreMessage) =>
       hasUnrecoverableMediaPayload(m) ||
       (hasProtection
@@ -1781,6 +1793,15 @@ function applySingleRange(input: SingleRangeInput): SingleRangeOutcome {
     }
   }
 
+  // #5620: ref-recoverable media folded here keeps its re-access handles in
+  // the stored summary — appended mechanically (never model discretion; on
+  // the wire a URL part is often invisible to the summarizer), and carried
+  // forward from consumed blocks so merges/distillations drop none.
+  const foldMediaRefs = collectFoldMediaRefs(
+    filteredIds.map((id) => input.messages.find((entry) => entry.id === id)),
+    consumedBlockIds.map((id) => blockById(input.state, id)),
+  ).map(scrubLoneSurrogates);
+
   const blockId = allocateBlockId(input.state);
   // #4316 layer 3: resolve the fold's ledger interval before constructing the
   // block. The claim is recorded only when it is EXACT — see
@@ -1794,7 +1815,7 @@ function applySingleRange(input: SingleRangeInput): SingleRangeOutcome {
     runId: input.runId,
     tier: outputTier,
     topic: input.spec.topic,
-    summary: input.spec.summary,
+    summary: appendMediaRefsSection(input.spec.summary, foldMediaRefs),
     directMessageIds: filteredIds,
     effectiveMessageIds: [...effectiveMessageIds],
     directBlockIds: [...consumedBlockIds],

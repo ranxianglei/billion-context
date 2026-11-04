@@ -300,7 +300,7 @@ bili --version
 
 **bili 是透明的吗?怎么关掉?** 未识别端点原样转发([CLIENTS.zh-CN.md](CLIENTS.zh-CN.md)),且每种模式都能干净退出:原生安装用 `bili plugin remove <client>`,另两种模式停掉启动器命令 / 环境变量 / `/bili/` 前缀即可 —— 流量立刻恢复直连。
 
-**能配合模型路由网关(如 [magpie](https://github.com/yetone/magpie))用吗?** 能 —— 客户端指向 bili、bili 经 `/bili/` 前缀指向网关(前缀内嵌网关的绝对 URL):`http://localhost:8787/bili/http://127.0.0.1:3425…`。例:Claude Code → `ANTHROPIC_BASE_URL=http://localhost:8787/bili/http://127.0.0.1:3425` + `ANTHROPIC_API_KEY=magpie`;OpenAI 系客户端 → `OPENAI_BASE_URL=http://localhost:8787/bili/http://127.0.0.1:3425/v1`(+ `OPENAI_API_KEY=magpie`)。压缩发生在路由*之前*——到达网关节点里任何账号的请求都已是压缩后的。凭据留在网关内:客户端的假 key 原样穿过,真实 key 不接触 bili。注意:① 会话中途切换账号会使 provider 前缀缓存失效——多账号路由的固有代价,与 bili 无关(见 `/acp-cache` 的 KEY SWITCHES 段);② 路由后的模型名对 bili 的窗口查询不透明——需在 providers 键 `http://127.0.0.1:3425` 下用 `models.<name>.context` 声明其上下文窗口,否则按兜底窗口运行(route-miss 警告,#2317);③ 中继若拒绝 bili Anthropic 车道的 `cache_control` 标记,设 `compat.noCacheControl`;④ 回环网关开箱即用;网关在非回环私网地址时可能还需 `network.allowPrivateHttpProviders`(#2984)。三条线(OpenAI Chat / Responses / Anthropic Messages,含跨协议转换)已端到端实测,#4433。
+**能配合模型路由网关(如 [magpie](https://github.com/yetone/magpie))用吗?** 能 —— 客户端指向 bili、bili 经 `/bili/` 前缀指向网关(前缀内嵌网关的绝对 URL):`http://localhost:8787/bili/http://127.0.0.1:3425…`。例:Claude Code → `ANTHROPIC_BASE_URL=http://localhost:8787/bili/http://127.0.0.1:3425` + `ANTHROPIC_API_KEY=magpie`;OpenAI 系客户端 → `OPENAI_BASE_URL=http://localhost:8787/bili/http://127.0.0.1:3425/v1`(+ `OPENAI_API_KEY=magpie`)。压缩发生在路由*之前*——到达网关节点里任何账号的请求都已是压缩后的。凭据留在网关内:客户端的假 key 原样穿过,真实 key 不接触 bili。注意:① 会话中途切换账号会使 provider 前缀缓存失效——多账号路由的固有代价,与 bili 无关(见 `/acp-cache` 的 KEY SWITCHES 段);② 路由后的模型名对 bili 的窗口查询不透明——需在 providers 键 `http://127.0.0.1:3425` 下用 `models.<name>.context` 声明其上下文窗口,否则按兜底窗口运行(route-miss 警告,#2317);③ 中继若拒绝 bili Anthropic 车道的 `cache_control` 标记,设 `compat.noCacheControl`;④ 回环网关开箱即用;网关在非回环私网地址时可能还需 `network.allowPrivateHttpProviders`(#2984);⑤ Claude Code 原生插件模式(`bili plugin install claude`)下,可在安装前设 `BILI_CLAUDE_UPSTREAM=http://127.0.0.1:3425`,受管配置块会自动将其包裹为代理 URL(或直接配置 `ANTHROPIC_BASE_URL=http://127.0.0.1:8787/bili/http://127.0.0.1:3425`;`localhost` 与 `127.0.0.1` 均被正确识别,#5369)。三条线(OpenAI Chat / Responses / Anthropic Messages,含跨协议转换)已端到端实测,#4433。
 
 **日志和会话数据存在哪?** 日志:`~/.local/state/billion-context/bili.log`(同时镜像到 stderr);会话状态:`~/.local/share/billion-context/`(XDG 可覆盖;Windows 杀软排除 #362、可选清理 #1082)—— 完整路径见 [CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md)。
 
@@ -392,7 +392,9 @@ bili --no-auto-update        # 本次启动禁用自动更新
 - Web UI 概览页横幅,显示原因与手动升级命令;
 - `GET /__bili/status` 在 `advisory` 字段返回生效中的公告。
 
-该检查默认 fail-open:公告源不可达或格式错误只产生警告,绝不阻断模型流量。禁用方式:配置(`"advisoryCheck": false`)或环境变量(`BILI_ADVISORY_CHECK=0`);可用 `"advisoryUrl"` / `BILI_ADVISORY_URL` 指向自定义文档。
+该检查默认 fail-open:公告源不可达或格式错误只产生警告,绝不阻断模型流量。禁用方式:配置(`"advisoryCheck": false`)或环境变量(`BILI_ADVISORY_CHECK=0`);可用 `"advisoryUrl"` / `BILI_ADVISORY_URL` 指向自定义文档。**公告（Announcements）**（#5548）——与上面的关键缺陷公告是两回事：三个来源给 Web UI 提供横幅，相同 id 的覆盖顺序为**本地文件 > 远程源 > 内置**：(1)*内置*——一次性提示，直接走界面内置文案；(2)*本地*——把 JSON 文件放进配置目录的 `announcements/*.json`（默认 `~/.config/billion-context/announcements/`）即自动渲染：双语记录、按 kind 定色、npm 风格 `versions` 版本定向（`>=a.b.c`、`^`、`~`、`[lo hi]`、`||` 列表）、`percent` 灰度、时间窗、按类型排优先级——一个坏文件只废掉它自己；(3)*远程*——本仓库 master 分支的 [`announcements/remote.json`](announcements/remote.json)（每个 PR 都过 CI 校验），约每 3 分钟拉取一次，上一份有效公告的快照可跨重启/断网存活，坏推送会被拒绝；无法直连的环境用 `"remoteAnnouncementsUrl"` / `BILI_ANNOUNCEMENTS_URL` 指向同一文档的中继镜像。关闭行为按每条记录声明的模式：`persistent`（默认，按内容寻址——公告内容改动后会再提示一次）、`instance`（仅本进程）或 `always`（不显示关闭按钮）。关闭内置提示的记录按安装持久化在统一存储里（默认 SQLite，MySQL 后端同样可用），重启后不复发；旧的 `upgrade-notices.json` 状态文件只作为无统一存储边车（如显式加密 opt-out）的旧式安装的回退。官方源当前发布的是空条目列表。
+
+
 
 ## 配置
 
