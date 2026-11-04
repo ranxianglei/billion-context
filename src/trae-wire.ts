@@ -22,21 +22,57 @@ export interface TraeEnvelopeMeta {
 
 const isObj = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === "object" && !Array.isArray(v);
 
-/** Trae text parts → plain string. Returns undefined for any non-text part
- *  (image/audio payloads this codec does not re-encode). */
-function partsToText(content: unknown): string | undefined {
+/** Trae content → flat OpenAI content. Trae's part vocabulary is the OpenAI one
+ *  (`{type:"text",text}` / `{type:"image_url",image_url:{url}}`), so parts
+ *  pass through unchanged; an all-text part list collapses to a plain string (the
+ *  shape every downstream consumer expects), and any image keeps the array so the
+ *  picture survives the round trip. Returns undefined for a vocabulary this codec
+ *  cannot re-encode (audio, files, unknown types). */
+function partsToContent(content: unknown): string | Array<Record<string, unknown>> | undefined {
     if (typeof content === "string") return content;
     if (!Array.isArray(content)) return undefined;
-    const parts: string[] = [];
+    const parts: Array<Record<string, unknown>> = [];
+    let allText = true;
     for (const p of content) {
-        if (!isObj(p) || p.type !== "text" || typeof p.text !== "string") return undefined;
-        parts.push(p.text as string);
+        if (!isObj(p)) return undefined;
+        if (p.type === "text") {
+            if (typeof p.text !== "string") return undefined;
+            parts.push({ type: "text", text: p.text });
+            continue;
+        }
+        if (p.type === "image_url") {
+            const url = isObj(p.image_url) && typeof p.image_url.url === "string" ? p.image_url.url : undefined;
+            if (url === undefined) return undefined;
+            allText = false;
+            parts.push({ type: "image_url", image_url: { url } });
+            continue;
+        }
+        return undefined;
     }
-    return parts.join("\n");
+    if (allText) return parts.map((p) => String(p.text)).join("\\n");
+    return parts;
 }
 
-function textToParts(text: string): Array<Record<string, unknown>> {
-    return [{ type: "text", text }];
+function contentToTrae(content: unknown): Array<Record<string, unknown>> | undefined {
+    if (typeof content === "string") return content.length > 0 ? [{ type: "text", text: content }] : [];
+    if (!Array.isArray(content)) return undefined;
+    const parts: Array<Record<string, unknown>> = [];
+    for (const p of content) {
+        if (!isObj(p)) return undefined;
+        if (p.type === "text") {
+            if (typeof p.text !== "string") return undefined;
+            if (p.text.length > 0) parts.push({ type: "text", text: p.text });
+            continue;
+        }
+        if (p.type === "image_url") {
+            const url = isObj(p.image_url) && typeof p.image_url.url === "string" ? p.image_url.url : undefined;
+            if (url === undefined) return undefined;
+            parts.push({ type: "image_url", image_url: { url } });
+            continue;
+        }
+        return undefined;
+    }
+    return parts;
 }
 
 function convertToolCalls(raw: unknown): Array<Record<string, unknown>> | undefined {
@@ -66,17 +102,17 @@ function convertMessages(messages: unknown): Array<Record<string, unknown>> | un
         if (!isObj(m)) return undefined;
         const role = m.role;
         if (role === "system" || role === "user") {
-            const text = partsToText(m.content);
-            if (text === undefined) return undefined;
-            if (text.length === 0 && role === "system") continue;
-            out.push({ role, content: text });
+            const content = partsToContent(m.content);
+            if (content === undefined) return undefined;
+            if (typeof content === "string" && content.length === 0 && role === "system") continue;
+            out.push({ role, content });
             continue;
         }
         if (role === "assistant") {
             const hasContent = m.content !== null && m.content !== undefined;
-            const text = hasContent ? partsToText(m.content) : undefined;
-            if (hasContent && text === undefined) return undefined;
-            const msg: Record<string, unknown> = { role: "assistant", content: text === undefined ? null : text };
+            const content = hasContent ? partsToContent(m.content) : undefined;
+            if (hasContent && content === undefined) return undefined;
+            const msg: Record<string, unknown> = { role: "assistant", content: content === undefined || content === "" ? null : content };
             if (m.reasoning_content !== undefined && typeof m.reasoning_content === "string" && m.reasoning_content.length > 0) {
                 msg.reasoning_content = m.reasoning_content;
             }
@@ -91,9 +127,9 @@ function convertMessages(messages: unknown): Array<Record<string, unknown>> | un
         }
         if (role === "tool") {
             if (typeof m.tool_call_id !== "string") return undefined;
-            const text = partsToText(m.content);
-            if (text === undefined) return undefined;
-            out.push({ role: "tool", tool_call_id: m.tool_call_id, content: text });
+            const content = partsToContent(m.content);
+            if (content === undefined) return undefined;
+            out.push({ role: "tool", tool_call_id: m.tool_call_id, content: typeof content === "string" ? content : JSON.stringify(content) });
             continue;
         }
         return undefined;
@@ -132,19 +168,19 @@ export function unwrapTraeBody(parsed: Record<string, unknown>): { body: Record<
 function messageToTrae(m: Record<string, unknown>): Record<string, unknown> | undefined {
     const role = m.role;
     if (role === "system" || role === "user" || role === "tool") {
-        const text = typeof m.content === "string" ? m.content : m.content === null || m.content === undefined ? "" : undefined;
-        if (text === undefined) return undefined;
-        const msg: Record<string, unknown> = { role, content: textToParts(text) };
+        const parts = contentToTrae(m.content === null || m.content === undefined ? "" : m.content);
+        if (parts === undefined) return undefined;
+        const msg: Record<string, unknown> = { role, content: parts };
         if (role === "tool" && typeof m.tool_call_id === "string") msg.tool_call_id = m.tool_call_id;
         return msg;
     }
     if (role === "assistant") {
         const calls = m.tool_calls === undefined ? undefined : convertToolCalls(m.tool_calls);
-        const text = typeof m.content === "string" ? m.content : undefined;
-        if (m.content !== null && m.content !== undefined && text === undefined) return undefined;
+        const parts = m.content === null || m.content === undefined ? undefined : contentToTrae(m.content);
+        if (m.content !== null && m.content !== undefined && parts === undefined) return undefined;
         const msg: Record<string, unknown> = {
             role: "assistant",
-            content: calls !== undefined && calls.length > 0 && (text === undefined || text.length === 0) ? null : textToParts(text ?? ""),
+            content: calls !== undefined && calls.length > 0 && (parts === undefined || parts.length === 0) ? null : (parts ?? []),
         };
         if (calls !== undefined && calls.length > 0) {
             msg.tool_calls = calls.map((c) => ({
@@ -158,7 +194,8 @@ function messageToTrae(m: Record<string, unknown>): Record<string, unknown> | un
     }
     // Compat-roles rewrites can target roles this wire has no slot for; degrade
     // to user text rather than dropping content mid-forward (WC-12d).
-    if (typeof m.content === "string") return { role: "user", content: textToParts(m.content) };
+    const parts = contentToTrae(m.content);
+    if (parts !== undefined) return { role: "user", content: parts };
     return undefined;
 }
 
