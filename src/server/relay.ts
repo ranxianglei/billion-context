@@ -892,9 +892,12 @@ async function forwardCaptured(
     } catch (error) {
         const oversize = extractWsOversizeError(error);
         if (oversize === undefined) {
-            recordUpstreamConnection(upstreamUrl, proxyUrl, error, skippedProxy);
+            // #5598: plumb the client-disconnect state into the classification —
+            // a user hitting stop must not surface as "check upstream health"
+            // on the status surface or in the egress line.
+            recordUpstreamConnection(upstreamUrl, proxyUrl, error, skippedProxy, clientAbort.signal.aborted);
             recordUpstreamAlert(upstreamUrl, error, proxyUrl !== undefined, skippedProxy);
-            const failure = describeUpstreamFailure(error, upstreamUrl, proxyUrl, skippedProxy);
+            const failure = describeUpstreamFailure(error, upstreamUrl, proxyUrl, skippedProxy, clientAbort.signal.aborted);
             recordUpstreamCircuitFailure(upstreamUrl, error, proxyUrl !== undefined, failure.message);
             // #604: a network-level failure (socket reset, timeout abort) also never
             // reports usage — arm the emergency shrink like the 5xx branch below.
@@ -958,7 +961,7 @@ async function forwardCaptured(
                 log("warn", `[${prepared.session.id}] [ws-byte-shed] shrunken resend still rejected (HTTP ${retried.response.status}); passing the retry response through`);
             }
         } catch (retryErr) {
-            log("warn", `[${prepared?.session.id ?? "unknown"}] [ws-byte-shed] shrunken resend failed: ${formatUpstreamError(retryErr, upstreamUrl, proxyUrl, skippedProxy)}`);
+            log("warn", `[${prepared?.session.id ?? "unknown"}] [ws-byte-shed] shrunken resend failed: ${formatUpstreamError(retryErr, upstreamUrl, proxyUrl, skippedProxy, clientAbort.signal.aborted)}`);
             throw new Error(wsOversizeDiagnosis(sentBytes, stats, budget), { cause: retryErr });
         }
     }
