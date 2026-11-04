@@ -1052,6 +1052,14 @@ export class UnifiedShadow {
         return this.sync.pfAppendTurn(sid, rows, entries);
     }
 
+    /** #5576 review S5: true only when a local sync plane actually persists
+     *  pf partitions. Replica/MySQL views run with sync===null and would
+     *  otherwise expose no-op closures to the lane (per-turn fabrication
+     *  warn + unbounded mint/registerPfSid growth). */
+    pfPlaneUsable(): boolean {
+        return this.sync !== null;
+    }
+
     pfLookupLedger(ledgerId: string): { sid: string; pos: number } | null {
         if (this.sync === null) return null;
         return this.sync.pfLookupLedger(ledgerId);

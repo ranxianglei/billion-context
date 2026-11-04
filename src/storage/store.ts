@@ -1917,6 +1917,20 @@ export class UnifiedStore {
         // --- sweep the row bodies (refcount discipline; pinned checkpoints survive) ---
         let contentRowsDeleted = 0;
         this.db.transaction(() => {
+            // #5576 review S2: the pf:sids registry dies with session_ext
+            // further down — sweep the pfsid partitions IN THIS transaction
+            // (deleteSession's pattern) so archiving without restore cannot
+            // leave a permanent full-transcript copy in the live DB.
+            try {
+                const sidsRow = this.db.prepare("SELECT value_json FROM session_ext WHERE session_id = ? AND key = 'pf:sids'").get(sessionId) as { value_json: string } | undefined;
+                if (sidsRow) {
+                    const parsed: unknown = JSON.parse(sidsRow.value_json);
+                    if (Array.isArray(parsed)) {
+                        const sids = parsed.filter((s): s is string => typeof s === "string" && s.length > 0);
+                        if (sids.length > 0) this.pfDeleteSids(sids, true);
+                    }
+                }
+            } catch { /* malformed registry — nothing to sweep */ }
             const rel: string[] = [];
             for (const m of messages) rel.push(m.content_hash as string);
             for (const mm of mediaMaps) rel.push(mm.media_hash as string);

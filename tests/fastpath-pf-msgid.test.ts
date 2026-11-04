@@ -11,6 +11,7 @@
 // credited misses, id-stable in-place edits riding frozen cores, and the
 // untouched default (knob OFF) behavior as the regression anchor.
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import test from "node:test";
 import http from "node:http";
 import { openaiToCore } from "acp-kernel/wire";
@@ -414,5 +415,105 @@ test("id-stable in-place edit rides the frozen core (geometry+ids judged, bytes 
         const rows = pf.readRows(sid, [[hi + 1, 1_000_000]]);
         assert.equal(rows.length, 1);
         assert.equal(rows[0].ledgerId, "cidU3");
+    } finally { setMsgIdLane(false); _resetStoreForTest(); }
+});
+
+// ---------------------------------------------------------------------------
+// #5576 review round-1 (2026-11-04) regressions — B1 BLOCKER: the hydrated
+// resident must serve the FULL active transcript, never just the last
+// window. The pre-fix hydration consumed each geom entry's `f` (that
+// WINDOW's pre-append start) as the row-read frontier, so after N windows
+// a restart silently served "last window + new tail" while `t` still claimed
+// full width. These tests assert the EXACT delivered texts across repeated
+// simulated boots (fresh Session object, same persistent store), crossing
+// L1 folds so the checkpoint's world-origin field carries the frontier.
+// ---------------------------------------------------------------------------
+
+test("B1: repeated boots hydrate the FULL transcript, across L1 folds", () => {
+    try {
+        setMsgIdLane(true);
+        const pf = new MemPF();
+        makeStub(pf);
+        let session = mkSession("b1-s0");
+        const { sid, msgs: m0 } = bootWorld(pf, session);
+        const served: string[] = ["world u1 bytes", "world a1 reply", "world u2 bytes"];
+        let msgs: unknown[] = [...m0];
+        const frontierPin = (): string => pf.readRows(sid, [[pf.maxPos(sid), pf.maxPos(sid) + 1]]).at(-1)?.ledgerId ?? "?";
+        for (let c = 1; c <= 3; c++) {
+            // Grow 45 in-process turns before each boot — crosses the
+            // 32-entry L1 fold, so the checkpoint (not the raw arm entry)
+            // must carry the world origin through the restart.
+            for (let i = 1; i <= 45; i++) {
+                const t = `b1 c${c} u${i} bytes`;
+                served.push(t);
+                msgs = [...msgs, USR(t)];
+                const r = runTurn(session, { [PF_SID_HEADER]: sid, [PF_TAIL_IDS_HEADER]: `${frontierPin()},bc${c}_${i}` }, msgs);
+                assert.equal(r.out.decision, "hit(v6-mid)", `cycle ${c} turn ${i}: got ${r.out.decision}`);
+            }
+            // Simulated restart: brand-new Session object (fresh residents
+            // map) over the SAME persistent store, then one more turn.
+            session = mkSession(`b1-s${c}`);
+            const t = `b1 c${c} reboot question`;
+            served.push(t);
+            msgs = [...msgs, USR(t)];
+            const h = runTurn(session, { [PF_SID_HEADER]: sid, [PF_TAIL_IDS_HEADER]: `${frontierPin()},br${c}` }, msgs);
+            assert.equal(h.out.decision, "hit(v6-mid)", `boot ${c}: got ${h.out.decision}`);
+            // THE regression assertion: the view IS the complete transcript
+            // (pre-fix code served only the last window + this turn here).
+            assert.deepEqual(
+                h.out.hit!.view.map((v) => v.text),
+                served,
+                `boot ${c}: hydrated view must equal the full transcript`,
+            );
+        }
+        // Writer side: every L1 checkpoint carries the active world ORIGIN
+        // (`o`) — cold-started here, never reset ⇒ always 0.
+        const ck = pf.readMeta(sid).ckpt;
+        assert.ok(ck, "an L1 fold must have fired");
+        assert.equal(JSON.parse(ck.metaJson).o, 0, "checkpoint records the cold-start world origin");
+    } finally { setMsgIdLane(false); _resetStoreForTest(); }
+});
+
+const ZERO_MARKERS = { panels: 0, statusBodies: 0, statusBodyLines: 0, markerLines: 0, nudges: 0, carriers: 0 };
+const sha256hex = (s: string): string => createHash("sha256").update(s).digest("hex");
+
+test("B1/S4: untrusted checkpoints degrade exactly ONE turn, then self-heal (pre-fix shapes)", () => {
+    try {
+        setMsgIdLane(true);
+        const runBadCkptCase = (label: string, metaJson: string, checksum: string): void => {
+            const pf = new MemPF();
+            makeStub(pf);
+            const s = mkSession(`bad-${label}`);
+            const { sid, msgs: m0 } = bootWorld(pf, s);
+            // Plant an UNTRUSTED checkpoint over the folded prefix: it
+            // truncates the tail exactly like a real fold did.
+            const tailSeq = pf.readMeta(sid).tailLog.at(-1)!.lsSeq;
+            pf.writeCkpt(sid, tailSeq, metaJson, checksum);
+            const bodyA = [...m0, USR(`bad-${label} qa`)];
+            // Fresh Session objects for BOTH degraded turns — the in-process
+            // resident must NOT mask the broken partition (that is exactly
+            // the post-boot path under review).
+            const r1 = runTurn(mkSession(`bad-${label}-b1`), { [PF_SID_HEADER]: sid, [PF_TAIL_IDS_HEADER]: ["?", "?"].join(",") }, bodyA);
+            assert.equal(r1.out.decision, "v6m-hydrate", `${label}: got ${r1.out.decision}`);
+            assert.equal(r1.out.hit, null, `${label}: degraded turn must not serve a fast view`);
+            // …and the failed turn itself repairs the partition by re-ingesting
+            // the FULL legacy view (append-only archive-and-reset).
+            const bodyB = [...bodyA, USR(`bad-${label} qb`)];
+            const r2 = runTurn(mkSession(`bad-${label}-b2`), { [PF_SID_HEADER]: sid, [PF_TAIL_IDS_HEADER]: ["?", "?"].join(",") }, bodyB);
+            assert.equal(r2.out.decision, "hit(v6-mid)", `${label} heal: got ${r2.out.decision}`);
+            assert.deepEqual(
+                r2.out.hit!.view.map((v) => v.text),
+                ["world u1 bytes", "world a1 reply", "world u2 bytes", `bad-${label} qa`, `bad-${label} qb`],
+                `${label}: healed view serves the full transcript`,
+            );
+        };
+        // (a) PRE-FIX shape: self-consistent hash but the old field set —
+        // `f` instead of `o`, i.e. no world origin recorded anywhere.
+        const oldMeta = JSON.stringify({ s: { t: 4, imgFlag: false, markers: ZERO_MARKERS }, f: 2 });
+        runBadCkptCase("noo", oldMeta, sha256hex(oldMeta));
+        // (b) CURRENT shape with a CORRUPTED checksum — state must be
+        // ignored the same way even though `o` parses fine inside it.
+        const curMeta = JSON.stringify({ s: { t: 4, imgFlag: false, markers: ZERO_MARKERS }, o: 0 });
+        runBadCkptCase("sum", curMeta, "deadbeef");
     } finally { setMsgIdLane(false); _resetStoreForTest(); }
 });

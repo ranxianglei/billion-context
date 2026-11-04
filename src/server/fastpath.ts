@@ -630,6 +630,12 @@ interface PFResident {
     elems: number;
     /** Exclusive high pf_row pos consumed so far (position cursor). */
     rowHi: number;
+    /** Origin (inclusive pf_row pos) of the ACTIVE world — the latest
+     *  arm/reset fromPos (cold start: 0). Hydration reads exactly
+     *  [worldOrigin .. rowHi): WINDOW starts (`f`) are never treated as the
+     *  frontier — they mark where each turn's window began, one per window,
+     *  not where the current world began (#5576 review B1). */
+    worldOrigin: number;
     /** Sticky: some resident core carries an image part. */
     imgFlag: boolean;
     /** Cumulative strip ledger of ALL ingested bytes (carried forward — the
@@ -683,11 +689,20 @@ function hydratePf(
     const maxP = pf.maxPos(sid);
     if (maxP < 0) return null;
     const meta = pf.readMeta(sid);
-    let basePos = 0;
+    // Frontier reconstruction (#5576 review B1): the world frontier may be
+    // moved ONLY by arm/reset entries (their fromPos) — geom entries record
+    // their OWN window's pre-append start (`f`), which must never be read
+    // back as the frontier (replaying them walked the frontier backwards
+    // window-by-window, hydrating a truncated core set while `t` still
+    // claimed full width). Folding deletes the arm/reset entry, so the
+    // checkpoint carries the origin as `o`; pre-fix checkpoints lack `o`
+    // (and use the old checksum shape) — fail closed to legacy until the
+    // world re-arms.
+    let worldOrigin: number | null = null;
     let elems = 0;
     let imgFlag = false;
     let markers: RawStripCounts = { panels: 0, statusBodies: 0, statusBodyLines: 0, markerLines: 0, nudges: 0, carriers: 0 };
-    const applyGeom = (p: Record<string, unknown>, fromPosValue: number | null | undefined): void => {
+    const applyGeom = (p: Record<string, unknown>): void => {
         if (typeof p.t === "number") elems = p.t;
         if (typeof p.imgFlag === "boolean") imgFlag = p.imgFlag;
         if (p.markers !== null && typeof p.markers === "object") {
@@ -695,34 +710,48 @@ function hydratePf(
             const pick = (k: keyof RawStripCounts): number => (typeof m[k] === "number" && Number.isInteger(m[k] as number) && (m[k] as number) >= 0 ? (m[k] as number) : 0);
             markers = { panels: pick("panels"), statusBodies: pick("statusBodies"), statusBodyLines: pick("statusBodyLines"), markerLines: pick("markerLines"), nudges: pick("nudges"), carriers: pick("carriers") };
         }
-        if (fromPosValue !== null && typeof fromPosValue === "number") basePos = fromPosValue;
     };
     if (meta.ckpt !== null) {
-        try {
-            const m = JSON.parse(meta.ckpt.metaJson) as { s?: Record<string, unknown>; f?: number | null };
-            if (typeof m.s === "object" && m.s !== null) applyGeom(m.s, m.f ?? null);
-        } catch {
-            return null; // corrupt checkpoint with an opaque folded prefix — degrade
+        // Review S4: verify the checksum NOW — it covers the meta_json bytes
+        // themselves (pre-fix it hashed a {t} subset and was decorative). An
+        // UNTRUSTED checkpoint is skipped rather than fatal: the live tail
+        // may still hold the arm/reset naming the frontier, and only a fully
+        // unresolvable shape degrades (below) to legacy.
+        let ckptTrusted = true;
+        if (createHash("sha256").update(meta.ckpt.metaJson).digest("hex") !== meta.ckpt.checksum) {
+            log("warn", `[${session.id}] watermark v6-msgid: checkpoint checksum mismatch — ignoring checkpoint state`);
+            ckptTrusted = false;
+        }
+        if (ckptTrusted) {
+            try {
+                const m = JSON.parse(meta.ckpt.metaJson) as { s?: Record<string, unknown>; o?: number };
+                if (typeof m.s === "object" && m.s !== null) applyGeom(m.s);
+                worldOrigin = typeof m.o === "number" && Number.isInteger(m.o) && m.o >= 0 ? m.o : null;
+            } catch {
+                log("warn", `[${session.id}] watermark v6-msgid: undecodable checkpoint payload — ignoring checkpoint state`);
+                worldOrigin = null;
+            }
         }
     }
     for (const e of meta.tailLog) {
         let p: Record<string, unknown>;
         try { p = JSON.parse(e.payloadJson) as Record<string, unknown>; } catch { return null; }
-        if (e.kind === "geom") applyGeom(p, (p.f as number | null | undefined) ?? null);
+        if (e.kind === "geom") applyGeom(p);
         else if (e.kind === "reset" || e.kind === "arm") {
             if (typeof p.t === "number") elems = p.t;
-            basePos = typeof p.fromPos === "number" ? p.fromPos : maxP;
+            worldOrigin = typeof p.fromPos === "number" ? p.fromPos : maxP;
         }
     }
     if (elems === 0) return null; // no completed ingest yet — arm flow owns this
-    const rows = pf.readRows(sid, [[basePos, maxP + 1]]);
+    if (worldOrigin === null) return null; // no trustworthy frontier (unfolded state missing arm/reset, or pre-fix ckpt) — legacy until re-arm
+    const rows = pf.readRows(sid, [[worldOrigin, maxP + 1]]);
     const cores: CoreMessage[] = [];
     for (const r of rows) {
         try { cores.push(JSON.parse(r.coreJson) as CoreMessage); }
         catch { log("warn", `[${session.id}] watermark v6-msgid: undecodable core row at ${r.pos} — resident rebuild degraded`); return null; }
     }
     if (cores.length === 0) return null;
-    const res: PFResident = { sid, cores, elems, rowHi: maxP + 1, imgFlag, markers };
+    const res: PFResident = { sid, cores, elems, rowHi: maxP + 1, worldOrigin, imgFlag, markers };
     residents.set(session, res);
     return res;
 }
@@ -730,8 +759,21 @@ function hydratePf(
 /** The lane's verdict for one turn. null = pf plane unavailable (caller
  *  falls through to the pre-existing lanes); anything else is authoritative
  *  for this turn (hit or miss — a miss still routes the LEGACY full-parse
- *  exactly like every other lane, and echoes the sid back). */
-function evaluateMsgIdLane(args: {
+ *  exactly like every other lane, and echoes the sid back). Read-side faults
+ *  (SQLITE_BUSY under multi-instance sharing, disk full, ...) degrade to
+ *  null the same way — never a 5xx on a live request (#5576 review S3). */
+function evaluateMsgIdLane(args: MsgIdLaneArgs): FastpathOutcome | null {
+    try {
+        return evaluateMsgIdLaneCore(args);
+    } catch (err) {
+        args.log(
+            "warn",
+            `[${args.session.id}] watermark v6-msgid: read-side fault (${err instanceof Error ? err.message : String(err)}) — legacy full-parse this turn`,
+        );
+        return null;
+    }
+}
+type MsgIdLaneArgs = {
     session: Session;
     req: http.IncomingMessage;
     bodyText: string;
@@ -740,7 +782,8 @@ function evaluateMsgIdLane(args: {
     parsedTailIds: string[] | null | undefined;
     nowCs: string | undefined;
     log: (level: string, msg: string) => void;
-}): FastpathOutcome | null {
+};
+function evaluateMsgIdLaneCore(args: MsgIdLaneArgs): FastpathOutcome | null {
     const { session, req, bodyText, scan, saved, parsedTailIds, nowCs, log } = args;
     const T = scan.total;
     const pf = pfAvailable();
@@ -1022,6 +1065,7 @@ export function finalizeWatermarkTurn(
                             cores: outcome.hit!.view,
                             elems: T,
                             rowHi: marks.maxPos + 1,
+                            worldOrigin: res.worldOrigin,
                             imgFlag: res.imgFlag || coresHaveImagePart(outcome.hit!.windowCores),
                             markers: outcome.hit!.markerCounts,
                         });
@@ -1029,13 +1073,24 @@ export function finalizeWatermarkTurn(
                         // entries so post-boot hydration stays bounded.
                         if (marks.lsSeq > 0 && marks.lsSeq % 32 === 0) {
                             const r2 = residents.get(session)!;
-                            pf.writeCkpt(outcome.sid, marks.lsSeq, JSON.stringify({ s: { t: T, imgFlag: r2.imgFlag, markers: r2.markers }, f: res.rowHi }), createHash("sha256").update(JSON.stringify({ t: T })).digest("hex"));
+                            // B1/S4: the checkpoint carries the active world
+                            // ORIGIN (`o`) — its tail fold may have deleted the
+                            // arm/reset entry that recorded it — and its
+                            // checksum covers the meta_json bytes.
+                            const ckptMeta = JSON.stringify({ s: { t: T, imgFlag: r2.imgFlag, markers: r2.markers }, o: r2.worldOrigin });
+                            pf.writeCkpt(outcome.sid, marks.lsSeq, ckptMeta, createHash("sha256").update(ckptMeta).digest("hex"));
                         }
                     }
-                } else if ((outcome.decision === "v6m-arm" || outcome.decision === "v6m-compact") && input.legacyCores.length > 0) {
-                    // §8 case-7 arm / §6.1 reset: ingest the freshly parsed
-                    // full view at CONTINUING positions (the old world stays
-                    // archived in the partition — rollback reference).
+                } else if ((outcome.decision === "v6m-arm" || outcome.decision === "v6m-compact" || outcome.decision === "v6m-hydrate") && input.legacyCores.length > 0) {
+                    // §8 case-7 arm / §6.1 reset / failed-hydration self-heal:
+                    // ingest the freshly parsed FULL view at CONTINUING
+                    // positions (the old world stays archived in the
+                    // partition — rollback reference). The v6m-hydrate leg
+                    // re-bases a partition whose frontier cannot be
+                    // reconstructed (untrusted checkpoint + empty tail),
+                    // bounding the degradation to ONE legacy turn: the
+                    // appended reset entry carries fromPos, so the NEXT turn
+                    // hydrates cleanly off it.
                     const fromPos = res !== undefined && res.sid === outcome.sid ? res.rowHi : pf.maxPos(outcome.sid) + 1;
                     const idByElem = new Map<number, string>();
                     outcome.receivedTailIds?.forEach((id, i) => { if (id !== PF_SLOT_UNKNOWN) idByElem.set(i, id); });
@@ -1056,6 +1111,7 @@ export function finalizeWatermarkTurn(
                         cores: [...input.legacyCores],
                         elems: T,
                         rowHi: marks.maxPos + 1,
+                        worldOrigin: fromPos,
                         imgFlag: coresHaveImagePart(input.legacyCores),
                         markers: input.turnStripCounts,
                     });

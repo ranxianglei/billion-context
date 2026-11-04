@@ -2418,6 +2418,11 @@ export class SessionStore {
         if (!this.replicasAvailable()) return null;
         try {
             const s = this.liveShadow();
+            // #5576 review S5: a shadow whose sync plane is absent
+            // (replica/MySQL views) exposes no-op pf closures — handing them
+            // to the lane loops a per-turn fabrication warn plus unbounded
+            // sid minting. Report null instead (soft plane: null == absent).
+            if (!s.pfPlaneUsable()) return null;
             return {
                 appendTurn: (sid, rows, entries) => s.pfAppendTurn(sid, rows, entries),
                 lookupLedger: (ledgerId) => s.pfLookupLedger(ledgerId),
