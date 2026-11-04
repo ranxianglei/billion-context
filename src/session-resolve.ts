@@ -478,7 +478,7 @@ export function applyOrderSnapshot(entries: OrderSkeletonEntry[]): number {
  *  and continue stay silent (steady-state volume); the caller decides what
  *  to log. The callback is best-effort: a throwing observer must never break
  *  resolution. */
-export type SessionResolveObserver = (rawId: string, r: SessionOrderResolution) => void;
+type SessionResolveObserver = (rawId: string, r: SessionOrderResolution) => void;
 
 export function personaConversationOrder(rawId: string, history: unknown, personaTag?: string, declaredModel?: string, laneToken?: string, laneDiscriminator?: string, onResolve?: SessionResolveObserver): string {
     const res = resolveSessionOrder(rawId, history, personaTag ?? "", declaredModel, laneToken, laneDiscriminator);
