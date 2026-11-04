@@ -859,7 +859,7 @@
 "pi": {
   "subagents": {
     "enabled": true,              // 总开关；false（或 "subagents": false）移除工具+提示词+快捷键（新会话生效）
-    "forceEnable": false,        // 检测到项目级 pi-subagents 安装时仍保留 acp_delegate（#415）
+    "forceEnable": false,        // 检测到任一作用域（项目级或用户级）的 pi-subagents 安装时仍保留 acp_delegate（#415、#5637）
     "displayUsage": "separate",  // "separate"（独立 footer 块）| "merged"（并入工具结果用量）
     "maxDepth": 2,               // 嵌套深度上限，向子进程传播
     "syncTimeoutMinutes": 5,     // 同步 delegate 硬超时；0/null 关闭

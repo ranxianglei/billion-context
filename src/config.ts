@@ -1837,9 +1837,10 @@ export interface PiSubagentsFileConfig {
      *  `"pi": {"subagents": false}`) removes the three tools, the
      *  system-prompt section and the fleet shortcut (new session required). */
     enabled?: boolean;
-    /** Keep acp_delegate active even when a project-scope pi-subagents
-     *  install is detected (#415 stand-down). Default false. Env
-     *  PI_ACP_DELEGATE_FORCE_ENABLE=true/false wins over the file. */
+    /** Keep acp_delegate active even when a pi-subagents install at either
+     *  scope is detected (#415 stand-down, widened to user-scope in #5637).
+     *  Default false. Env PI_ACP_DELEGATE_FORCE_ENABLE=true/false wins over
+     *  the file. */
     forceEnable?: boolean;
     /** "separate" (default) — delegate tokens tracked in their own
      *  accumulator; "merged" — folded into the main session totals. */
