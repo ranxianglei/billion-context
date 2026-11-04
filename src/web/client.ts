@@ -1118,11 +1118,12 @@ function changelogCatOf(rawLine) {
             $("st-gross-sub").textContent = t("ov.gross_note") + ((o.savedEstimated || 0) > 0 ? " · " + t("ov.saved_from_legacy", { n: fmtW(o.savedEstimated) }) : "")
                 + (o.savedUsdGrossTotal
                     ? " · " + (mra ? t("ov.gross_formula", { f: o.foldsTotal, g: fmtW(o.grossSavedTotal), r: mra.r, n: fmtUsd(o.savedUsdGrossTotal) }) : t("ov.money_eq", { n: fmtUsd(o.savedUsdGrossTotal) }))
-                    : "");
+                    : "")
+                + (o.savingsEstimated ? " · " + t("ov.est_mark") : "");
             const netEl = $("st-netsaved");
             netEl.textContent = o.hasFoldData ? ((o.netSavedTotal || 0) < 0 ? "-" : "") + fmtW(Math.abs(o.netSavedTotal || 0)) : t("common.none");
             netEl.title = o.hasFoldData && o.netSavedTotal ? String(Math.round(Number(o.netSavedTotal))) : "";
-            $("st-net-sub").textContent = o.hasFoldData ? t("ov.sub_repay", { r: fmtW(o.repayTotal || 0), s: fmtW(o.summaryCostTotal || 0) }) + ((o.savedEstimated || 0) > 0 ? " · " + t("ov.net_excl") : "") + ((o.coverageLostFrozenTotal || 0) > 0 ? " · " + t("ov.covlost_note", { n: o.coverageLostFoldTotal || 0, x: fmtW(o.coverageLostFrozenTotal) }) : "") : "";
+            $("st-net-sub").textContent = o.hasFoldData ? t("ov.sub_repay", { r: fmtW(o.repayTotal || 0), s: fmtW(o.summaryCostTotal || 0) }) + ((o.savedEstimated || 0) > 0 ? " · " + t("ov.net_excl") : "") + ((o.coverageLostFrozenTotal || 0) > 0 ? " · " + t("ov.covlost_note", { n: o.coverageLostFoldTotal || 0, x: fmtW(o.coverageLostFrozenTotal) }) : "") + ((o.blockDeadFrozenTotal || 0) > 0 ? " · " + t("ov.blockdead_note", { n: o.blockDeadFoldTotal || 0, x: fmtW(o.blockDeadFrozenTotal) }) : "") : "";
             if (o.hasFoldData && o.savedUsdTotal) $("st-net-sub").textContent += " · " + t("ov.money_eq", { n: fmtUsd(o.savedUsdTotal) }) + (mra ? " " + t("ov.net_rates", mra) : "");
             $("st-hitpct").textContent = o.hitPct == null ? t("common.none") : o.hitPct.toFixed(1) + "%";
             // #4899: fleet money totals — only priced sessions contribute; no
