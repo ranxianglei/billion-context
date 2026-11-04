@@ -253,7 +253,7 @@ test("unit: session cascade wipes render tables; v12 re-migration is a no-op", (
 // ---------------------------------------------------------------------------
 // Golden tier: FAST emit == legacy emit at EVERY engaged turn, byte-for-byte,
 // across arm → steady fast rounds → client compaction (turn 8) → strategy
-// recast (turn 10) → audit cadence → restart-hydration continuation.
+// strategy-flip recast (turn 14) → audit cadence (fires for real at turn 10) → restart-hydration continuation.
 // ---------------------------------------------------------------------------
 
 test("golden: cached-prefix splice equals the legacy full-path bytes end-to-end", async (t) => {
@@ -265,7 +265,7 @@ test("golden: cached-prefix splice equals the legacy full-path bytes end-to-end"
     // drops e_1/e_3 (client-side compaction) — the lane ignores the drop
     // (ledger grows forward only), views and rows keep growing, and the
     // golden equation must still hold element-stable (ids follow elements,
-    // never positions). Strategy flips text-only→none at turn 10 ⇒ caps flip
+    // never positions). Strategy flips text-only→none at turn 14 ⇒ caps flip
     // ⇒ forced legacy recast round, then steady on the new byte form.
     const ELEMENTS: Msg[] = Array.from({ length: 16 }, (_, i) => ({ role: i % 2 === 0 ? "user" : "assistant", content: `content number ${i}` }));
     const STABLE_ID = (i: number) => `eid-${i}`;
@@ -275,7 +275,8 @@ test("golden: cached-prefix splice equals the legacy full-path bytes end-to-end"
         return els;
     };
     const idsOf = (els: Msg[]) => els.map((el) => STABLE_ID(ELEMENTS.indexOf(el)));
-    const strategyOf = (tn: number) => (tn < 10 ? "text-only" : "none");
+    const strategyOf = (tn: number) => (tn < 14 ? "text-only" : "none");
+    const gateSeq: string[] = [];
 
     // ---- phase 1: arm A — pure legacy full path over its own store ----------
     const hA = makeH("gold-a");
@@ -321,6 +322,7 @@ test("golden: cached-prefix splice equals the legacy full-path bytes end-to-end"
             snapshotLaneActive: false, absorbActive: false, ccrOn: false, foldUsagePending: false, markerNonZero: false,
             log: hB.log,
         });
+        gateSeq.push(gate.ok ? "fast" : String(gate.reason));
         let rebuilt: OpenAIMessage[];
         let captureStrings: string[];
         let steadyAppendRows: string[] = [];
@@ -405,12 +407,20 @@ test("golden: cached-prefix splice equals the legacy full-path bytes end-to-end"
             `turn ${tn}: render table drifted from identity ledger (rows=${hB.store.pfRenderRows(sidB!).length})`);
     }
     assert.equal(castOps, 1, "exactly one cast (the arm turn)");
+    // Audit cadence exercised FOR REAL (review round 2): with the flip deferred
+    // to turn 14, eight consecutive green rounds land tick=8 ⇒ turn 10 MUST ride
+    // legacy as the scheduled audit itself, and the very next round recovers to
+    // fast (any legacy full-capture zeroes the tick — a lockout would keep every
+    // later turn red until restart/caps-flip/S4-heal).
+    assert.deepEqual(gateSeq.filter((r) => r === "audit-due"), ["audit-due"], `expected exactly one audit-due round, got ${JSON.stringify(gateSeq)}`);
+    assert.equal(gateSeq.indexOf("audit-due"), 9, `audit-due expected at loop index 9 (turn 10), got ${JSON.stringify(gateSeq)}`);
+    assert.equal(gateSeq[10], "fast", `round right after the audit must recover to fast, got ${JSON.stringify(gateSeq)}`);
     // ≥ 12 fast rounds = at least TWO full audit waves served green: the first
     // proves the lane runs, the second proves any legacy round CONSUMES the
     // audit obligation (pre-fix, tick froze at N and every later turn rode
     // legacy forever — masked at the time by per-round recasts).
     assert.ok(fastRounds >= 12, `expected ≥2 audit waves of fast rounds, got ${fastRounds} (audit obligation not consumed?)`);
-    assert.ok(recastOps >= 1, "strategy flip at turn 10 must force ≥1 recast");
+    assert.ok(recastOps >= 1, "strategy flip at turn 14 must force ≥1 recast");
     assert.ok(legacyRounds >= 2, `arm + audit/caps-flip rounds must ride legacy (got ${legacyRounds})`);
     // Volume discipline (steady deltas must stay O(new) per round, never
     // O(full list)): pre-tail-fix behavior re-submitted the whole list each
