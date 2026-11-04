@@ -327,7 +327,10 @@ export class MysqlBackend implements StorageBackend {
         try {
             // #5578: strip `--` line comments BEFORE splitting — a comment may
             // contain `;`, and its orphaned tail would execute as SQL
-            // (ER_PARSE_ERROR on every MySQL boot). Blob has no literals.
+            // (ER_PARSE_ERROR on every MySQL boot). The blob DOES carry
+            // literals ('{}', 'sha256', 'active'); splitting on ';' stays
+            // safe ONLY because none of them contains ';' or '--' — keep
+            // new defaults literal-free or move the DDL out of the blob.
             const multi = MYSQL_DDL.replace(/--[^\n]*/g, "").trim();
             for (const stmt of multi.split(";")) {
                 const s = stmt.trim();

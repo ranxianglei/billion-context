@@ -2367,7 +2367,7 @@ export class UnifiedStore {
      *  noise would show up there first). */
     pfLookupLedger(ledgerId: string): { sid: string; pos: number } | null {
         const row = this.db
-            .prepare("SELECT sid, pos FROM pf_rows WHERE ledger_id = ? ORDER BY pos LIMIT 1")
+            .prepare("SELECT sid, pos FROM pf_rows WHERE ledger_id = ? ORDER BY pos, sid LIMIT 1")
             .get(ledgerId) as { sid: string; pos: number } | undefined;
         return row ?? null;
     }
