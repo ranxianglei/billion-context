@@ -52,6 +52,7 @@ import { randomUUID } from "node:crypto";
 import { ACP_TOOLS_OPENAI, ABSORB_TOOL_OPENAI } from "../compress-tool.js";
 import { asciiHeaderValue, fetchManifest, fetchProxyVersion, fetchStatus, fitNoticeDescription, forwardTool, postIdentityRegister, proxyBaseFromEnv, proxyBaseFromUrl, reportCompactionBoundary, reportRuntimeInfoOnChange, V2_SYNTHETIC_TEXT } from "./shared.js";
 import { createForkAdopter } from "./fork-adopt.js";
+import { directExemptMatch, isModelApiUrl, routedBiliModelUrl } from "./native-intercept.js";
 import { logHostEvent } from "./host-log.js";
 
 // OpenCode V2 TUI renders a synthetic message as a visible Notice row only when its display text fits the
@@ -82,6 +83,11 @@ export interface V2HttpRequestEvent {
     request?: { url?: unknown; headers?: V2Headers | null };
     url?: unknown;
     headers?: Record<string, string>;
+    /** #4276: set by this plugin's own hook when the URL is a providers.<url>.direct
+     *  exemption — the hook skips stamping/incremental for that request so no
+     *  x-bili-plugin-* header or lane-only body ever rides the direct send. The
+     *  host spreads its own event fields and ignores this one. */
+    biliDirect?: boolean;
 }
 
 interface V2ToolEditor {
@@ -254,11 +260,18 @@ function refreshWindows(ctx: V2PluginContext, state: V2State): void {
 }
 
 interface OpencodeV2SetupOptions {
-    /** Native mode only: called for EVERY outgoing provider request before
-     *  stamping. Owns proxy discovery and URL rewriting to the self-spawned
-     *  proxy (idempotent on already-routed URLs) and sets state.proxyBase
-     *  when traffic is routed. Absent in launcher mode (no routing). */
+    /** Native mode only: called for EVERY non-exempt outgoing provider request
+     *  before stamping. Owns proxy discovery and local refusal, and sets
+     *  state.proxyBase when traffic is routed. #4276: it must NOT rewrite
+     *  e.request.url — the shared hook payload is handed verbatim to every
+     *  later hook (provider plugins included), so the proxy rewrite happens at
+     *  fetch time in the shared native intercept chain. Absent in launcher
+     *  mode (no routing). */
     route?: (e: V2HttpRequestEvent, state: V2State) => void | Promise<void>;
+    /** #4276: providers.<url>.direct client-side exemptions — model-API URLs
+     *  under these origins are marked direct by the hook (no stamping, no
+     *  incremental, no ws tunneling) and sent unproxied by the fetch chain. */
+    directPrefixes?: readonly string[];
     /** Native mode only (#3248 phase 2): called LAST in the http.request hook
      *  (after header stamping and fork adoption) so the incremental-turn
      *  adapters can swap the body for an incremental payload and stamp the
@@ -349,6 +362,13 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
             if (pluginDisabled()) return;
             const url = e.request?.url;
             if (typeof url !== "string") return;
+            // #4276: documented client-side exemption (providers.<url>.direct) —
+            // never point this upstream at bili. Marking (not just returning)
+            // also stops the ws.handshake hook from tunneling the same URL.
+            if (options.directPrefixes !== undefined && directExemptMatch(url, options.directPrefixes)) {
+                e.biliDirect = true;
+                return;
+            }
             if (options.route !== undefined) {
                 // #3308: prime the window map BEFORE the route decides — its
                 // degrade branch needs the model's context window to refuse a
@@ -415,16 +435,32 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
                 if (!new URL(httpUrl).pathname.endsWith("/responses")) return;
                 const requestEvent: V2HttpRequestEvent = { sessionID: e.sessionID, agent: e.agent, model: e.model, request: new Request(httpUrl, { headers: e.headers }) };
                 await httpRequestHook(requestEvent);
+                if (requestEvent.biliDirect === true) return;
                 const pinned = proxyBaseFromUrl(typeof requestEvent.request?.url === "string" ? requestEvent.request.url : undefined);
                 if (pinned && !state.proxyBase) {
                     state.proxyBase = pinned;
                     refreshWindows(ctx, state);
                     stampHeaders(requestEvent);
                 }
-                const routed = requestEvent.request;
-                if (!state.proxyBase || typeof routed?.url !== "string" || !routed.url.startsWith(`${state.proxyBase}/bili/`)) return;
-                e.url = routed.url.replace("/bili/http", "/bili/responses/http").replace(/^http/, "ws");
-                e.headers = Object.fromEntries((routed as Request).headers.entries());
+                const reqUrl = typeof requestEvent.request?.url === "string" ? requestEvent.request.url : undefined;
+                let httpTunnel: string | undefined;
+                if (state.proxyBase !== undefined && reqUrl !== undefined && reqUrl.startsWith(`${state.proxyBase}/bili/`)) {
+                    httpTunnel = reqUrl.replace("/bili/http", "/bili/responses/http");
+                } else if (state.proxyBase !== undefined) {
+                    // #4276: the hook no longer rewrites the shared request, so the tunnel
+                    // is built here from whatever shape arrived — byte-identical to what
+                    // the old rewrite + replace pipeline produced. A raw model URL tunnels
+                    // as-is. A /bili/-baked overlay whose origin predates a launcher
+                    // respawn (respawn binds a fresh dynamic port) misses branch 1's prefix
+                    // and its /bili/ path fails isModelApiUrl — without decoding it would
+                    // drop the handshake and connect the host to the dead origin, so decode
+                    // the embedded upstream and tunnel from the live origin instead.
+                    const upstream = routedBiliModelUrl(httpUrl) ?? (isModelApiUrl(httpUrl) ? httpUrl : undefined);
+                    if (upstream !== undefined) httpTunnel = `${state.proxyBase}/bili/responses/${upstream}`;
+                }
+                if (httpTunnel === undefined) return;
+                e.url = httpTunnel.replace(/^http/, "ws");
+                e.headers = Object.fromEntries((requestEvent.request as Request).headers.entries());
             });
             if (wsReg) registrations.push(wsReg);
         } catch {

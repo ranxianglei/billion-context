@@ -208,6 +208,12 @@ export interface NativeInterceptState {
      *  bili produces is re-signed); undefined falls back to the #1886 direct
      *  send — bytes untouched, inbound signature intact, no compression. */
     resignCredentialFor?: (url: string, scheme: string, inboundAk?: string) => Promise<{ ak: string; sk: string; token?: string } | undefined>;
+    /** #4276: client-side exemption prefixes (`providers.<url>.direct`) — a
+     *  model-API request whose URL matches one of these origins sends DIRECT
+     *  (uncompressed, byte-untouched, no plugin headers stamped): the
+     *  documented per-route exemption completed for the fetch-intercept lanes.
+     *  Same boundary rule as the zcode store lane (exact key or key + "/"). */
+    directPrefixes?: readonly string[];
 }
 
 // #1410: same-process installs share one identity — Symbol.for keeps the
@@ -247,6 +253,16 @@ function noteSignedDirect(url: string, scheme: string, why: string): void {
     if (signedDirectSeen.has(key) || signedDirectSeen.size >= 128) return;
     signedDirectSeen.add(key);
     logHostEvent("warn", "[native-client]", `bili-native: ${scheme}-signed model request forwarded DIRECT (${why}): ${key}`);
+}
+
+// #4276: the documented client-side exemption (providers.<url>.direct) sends
+// model traffic uncompressed — loud exactly like the signed passthrough
+// (#2090): once per exempted upstream, never per request.
+const directExemptSeen = new Set<string>();
+function noteDirectExempt(prefix: string, url: string): void {
+    if (directExemptSeen.has(prefix) || directExemptSeen.size >= 128) return;
+    directExemptSeen.add(prefix);
+    logHostEvent("warn", "[native-client]", `bili-native: providers.direct exemption active — model traffic for ${prefix} sends direct (uncompressed): ${url}`);
 }
 
 // Model-API endpoint suffixes across the wires bili proxies: Anthropic
@@ -296,6 +312,14 @@ export function isModelApiUrl(url: string): boolean {
     } catch {
         return false;
     }
+}
+
+/** #4276: `providers.<url>.direct` exemption match — returns the matching
+ *  prefix (for once-per-prefix logging) or undefined. Same boundary rule as
+ *  the zcode store lane (src/zcode/json-edit.ts directExemptionHit): exact key
+ *  or key + "/", so "https://x.com" never exempts "https://x.com.evil". */
+export function directExemptMatch(url: string, directPrefixes: readonly string[]): string | undefined {
+    return directPrefixes.find((prefix) => url === prefix || url.startsWith(prefix + "/"));
 }
 
 /** Normalize either init.headers or a Request-object input — the two forms a
@@ -1067,37 +1091,6 @@ export function createLiveOriginResolver(state: NativeInterceptState, deps: Live
     };
 }
 
-/** Replace the outgoing request reference with a new Request against
- *  `target`, preserving method/headers/body (a Request.url is read-only,
- *  #810 — the reference itself moves). When the body cannot be copied the
- *  original request is left untouched (it goes direct rather than dying). */
-export function replaceRequestTarget(e: { request?: unknown }, target: string): void {
-    const old = e.request;
-    if (old == null) return;
-    try {
-        e.request = new Request(target, old as unknown as Request);
-    } catch {
-        // undici refuses to copy a body-bearing Request without explicit
-        // duplex — reconstruct with the body stream passed explicitly.
-        const src = old as unknown as { method?: unknown; headers?: Iterable<readonly [string, string]> | null; body?: ReadableStream<Uint8Array> | null };
-        try {
-            const init: RequestInit & { duplex?: "half" } = { method: typeof src.method === "string" ? src.method : "GET" };
-            const pairs: [string, string][] = [];
-            try {
-                for (const pair of src.headers ?? []) pairs.push([pair[0], pair[1]]);
-            } catch {}
-            if (pairs.length > 0) init.headers = pairs;
-            if (src.body != null) {
-                init.body = src.body as RequestInit["body"];
-                init.duplex = "half";
-            }
-            e.request = new Request(target, init);
-        } catch {
-            // replacement impossible (exotic body) — request goes direct
-        }
-    }
-}
-
 /** Replace the hook's request with a new Request carrying a NEW BODY (and
  *  optionally extra headers) while preserving url/method/headers. The
  *  incremental-turn adapters use it: the host hands a real fetch Request
@@ -1515,6 +1508,16 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
             if (!isBiliControlUrl(url) && fetchMethodOf(input, init) === "POST") state.onUnroutedModelUrl?.(url);
             return send(input, init);
         }
+        // #4276: documented client-side exemption (providers.<url>.direct) —
+        // this upstream is NEVER pointed at bili: byte-untouched direct send.
+        // The http.request hook marks such requests before stamping, so no
+        // x-bili-plugin-* header rides them either.
+        const exemptPrefix = state.directPrefixes !== undefined ? directExemptMatch(url, state.directPrefixes) : undefined;
+        if (exemptPrefix !== undefined) {
+            noteDirectExempt(exemptPrefix, url);
+            state.onDispatch?.(url, "direct");
+            return send(input, init);
+        }
         // #1884/#2090 plan A + owner binary-contract ruling ("要么一定压缩，
         // 或者一定拒绝"): a body-covering signature cannot survive a rewrite —
         // routing these through the proxy un-armed makes the upstream reject
@@ -1766,6 +1769,7 @@ export function _resetForTest(opts: { anchor?: typeof globalThis.fetch } = {}): 
     delete g[ACTIVE_STATE];
     delete g[ACTIVE_STATE_SEQ];
     signedDirectSeen.clear();
+    directExemptSeen.clear();
     lastMissingStateLogSeq = Symbol("unset");
     respawnCooldownOverrideMs = undefined;
     resetFetchChainForTest(opts);

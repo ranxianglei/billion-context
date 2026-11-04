@@ -16,11 +16,12 @@
 // The /acp command hooks themselves live in src/agent/opencode-acp-command.ts
 // and are shared with the native V1 entry (opencode-native.ts).
 
+import { zcodeDirectPrefixes } from "../config.js";
 import { LAUNCHER_DEFAULT_HOST, ensureProxyRunning } from "../launcher.js";
 import { createAcpCommandHooks } from "./opencode-acp-command.js";
 import { nativeProxyScriptPath, singleFlight } from "./native-bootstrap.js";
-import { createLiveOriginResolver, installNativeFetchIntercept, isModelApiUrl, replaceRequestTarget, routedBiliModelUrl, type NativeInterceptState } from "./native-intercept.js";
-import { createOpencodeV2Setup, type V2HttpRequestEvent, type V2State } from "./opencode-v2.js";
+import { createLiveOriginResolver, installNativeFetchIntercept, isModelApiUrl, routedBiliModelUrl, type NativeInterceptState } from "./native-intercept.js";
+import { createOpencodeV2Setup, type V2HttpRequestEvent, type V2PluginContext, type V2State } from "./opencode-v2.js";
 import { fetchProxyVersion } from "./shared.js";
 import { logHostEvent } from "./host-log.js";
 
@@ -89,6 +90,9 @@ const intercept: NativeInterceptState | undefined = proxyBase === "" ? undefined
     onGiveUp: () => {
         delete process.env.BILLION_CONTEXT_PROXY;
     },
+    // #4276: providers.<url>.direct client-side exemptions — honored by BOTH
+    // fetch chains sharing this state (V1 server() + V2 setup) and the V2 hook.
+    directPrefixes: zcodeDirectPrefixes(process.env),
 };
 
 /** Re-probe the attached origin first: a transient blip must not migrate the
@@ -133,18 +137,20 @@ const server = async (ctx: OpencodePluginContext): Promise<OpencodeHooks> => {
 
 // V2 lane: routes provider requests through the LIVE proxy origin. Handles
 // BOTH URL shapes: baked `<proxy>/bili/<upstream>` overlays from the
-// launcher's config rewrite (re-baked to the current origin on recovery) and
-// raw model-API URLs from SDK-default providers (routed like the native
-// entry does). A dead origin degrades to a DIRECT send of the upstream URL
-// rather than failing closed — compression is lost, the session survives.
+// launcher's config rewrite and raw model-API URLs from SDK-default providers.
+// #4276: this route only DISCOVERS the live origin (state.proxyBase drives
+// header stamping) — the actual rewrite happens at fetch time in the shared
+// intercept chain installed by setup()/server(), so every later hook sees the
+// original URL baked overlays carry. A dead origin degrades to a DIRECT send
+// of the upstream URL rather than failing closed — compression is lost, the
+// session survives.
 const route = intercept === undefined ? undefined : (() => {
     const resolveLive = createLiveOriginResolver(intercept);
     let warned = false;
     return async (e: V2HttpRequestEvent, s: V2State): Promise<void> => {
         const url = typeof e.request?.url === "string" ? e.request.url : undefined;
         if (url === undefined) return;
-        const upstream = routedBiliModelUrl(url);
-        if (upstream === undefined && !isModelApiUrl(url)) return;
+        if (!routedBiliModelUrl(url) && !isModelApiUrl(url)) return;
         const live = await resolveLive();
         if (live === undefined) {
             if (!warned) {
@@ -152,16 +158,26 @@ const route = intercept === undefined ? undefined : (() => {
                 logHostEvent("error", "[native-client]", "[bili-opencode] no live bili proxy — model requests go direct (uncompressed)");
             }
             s.proxyBase = undefined;
-            if (upstream !== undefined) replaceRequestTarget(e, upstream);
             return;
         }
         warned = false;
         s.proxyBase = live;
-        const target = `${live}/bili/${upstream ?? url}`;
-        if (target !== url) replaceRequestTarget(e, target);
     };
 })();
 
-const setup = createOpencodeV2Setup(route === undefined ? {} : { route });
+const v2Setup = createOpencodeV2Setup(route === undefined ? {} : { route, directPrefixes: intercept?.directPrefixes });
+
+// #4276: V2 hosts install the shared fetch chain too — routing happens at
+// fetch time so every later hook (provider plugins included) sees the original
+// upstream URL. server() already installs for V1 hosts; a second call is a
+// silent no-op (one chain per process). Skipped under NODE_TEST_CONTEXT so
+// test processes keep a pristine globalThis.fetch (tests drive the chain
+// explicitly through _resetForTest).
+async function setup(ctx: V2PluginContext): Promise<() => void> {
+    if (intercept !== undefined && process.env.NODE_TEST_CONTEXT === undefined && installNativeFetchIntercept(intercept)) {
+        console.log("[bili-opencode] v2: fetch patch installed (routes model traffic at fetch time; provider plugins see original URLs)");
+    }
+    return v2Setup(ctx);
+}
 
 export default { id: "billion-context-opencode", setup, server };
