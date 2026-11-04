@@ -68,23 +68,27 @@ test("pf-channel: failed whole-resolution CLEARS the stored list (no stale slice
     }
 });
 
-test("pf-channel: bad SLOTS ride '?' — one id-less element never poisons the list (owner 2026-11-02)", () => {
+test("pf-channel: F2 guarantee branch — ANY id-less slot clears the WHOLE captured table, no '?' on the wire (owner 2026-11-04)", () => {
     const sid = "sid-slots-1";
     const inH = { [CONVO]: sid };
-    learn(inH, "2"); // stamp known; the FULL list rides regardless of position
+    learn(inH, "2"); // stamp known; an id-complete list would ride in full
     for (const row of [
-        [["ok", 7], "ok,%3F"],
-        [["ok", ""], "ok,%3F"],
-        [["acp_summary_x", "y"], "%3F,y"],
-        [["a b", "c"], "%3F,c"],
-        [["c", "c"], "c,%3F"], // duplicate real id collapses its repeat to unknown
-        [["z".repeat(513), "w"], "%3F,w"],
+        ["ok", 7],
+        ["ok", ""],
+        ["acp_summary_x", "y"],
+        ["a b", "c"],
+        ["c", "c"], // duplicate real id collapses its repeat to a hole
+        ["z".repeat(513), "w"],
     ] as const) {
-        pfChannel.pfCaptureIds(sid, [...row[0]]);
-        assert.equal(pfChannel.pfRequestHeaders(inH)["x-bili-pf-tail-ids"], row[1], `slots=${JSON.stringify(row[0])}`);
+        pfChannel.pfCaptureIds(sid, [...row]);
+        // the mixed span emits NO tail-ids at all — honest absence beats a poisoned slice
+        assert.deepEqual(pfChannel.pfRequestHeaders(inH), { "x-bili-pf-count": "2" }, `slots=${JSON.stringify([...row])} must clear the whole table`);
     }
-    // an ALL-unknown span degrades back to pure count mode (noise beats signal)
-    pfChannel.pfCaptureIds(sid, ["", 7]);
+    // negative line: the table RE-ARMS once every element resolves a real unique id again
+    pfChannel.pfCaptureIds(sid, ["q1", "q2"]);
+    assert.deepEqual(pfChannel.pfRequestHeaders(inH), { "x-bili-pf-count": "2", "x-bili-pf-tail-ids": "q1,q2" });
+    // and a later hole clears again — no sticky half-lists either direction
+    pfChannel.pfCaptureIds(sid, ["q3", ""]); 
     assert.deepEqual(pfChannel.pfRequestHeaders(inH), { "x-bili-pf-count": "2" });
 });
 

@@ -34,10 +34,21 @@
 // turn). The identity ladder does not need the proofs: msgids are unique
 // forever (kernel contract), ORDER binds them to positions inside the
 // verified delta window, and the byte-level head check remains the boundary
-// truth. Capture therefore screens SLOTS, not the list as a whole — an
-// id-bearing element travels with its id, an id-less one (native-compaction
-// summaries, personas) rides the UNIDENTIFIED placeholder below; nothing is
-// ever dropped from or re-ordered inside the captured span.
+// truth. Capture therefore screens SLOTS, not the list as a whole — nothing
+// is ever dropped from or re-ordered inside the captured span.
+//
+// F2 RULING (owner, 2026-11-04, PR #5652 review follow-up — supersedes the
+// "id-less slots travel as ?" half of the block above): proceeding on the
+// GUARANTEE BRANCH — post-compaction histories are assumed to carry a real,
+// unique id on EVERY element (source-analysis issue filed for dsh /
+// opencode v1+v2 / pi to prove or disprove this). Consequence: ONE id-less
+// slot anywhere in the span clears the WHOLE captured table instead of
+// emitting a "?" placeholder — the v6 hard gate treats partial/"?" lists as
+// malformed, so honest absence (count-only fallback for v5, loud refusal
+// for v6) beats a poisoned slice. If the analysis disproves the guarantee,
+// the sanctioned fallback is the contract §3.2 tolerance clause ('?' turns
+// soft-miss onto baseline without breaker strikes), NOT re-introducing "?"
+// onto the wire.
 const COUNT_HEADER = "x-bili-pf-count";
 const TAIL_IDS_HEADER = "x-bili-pf-tail-ids";
 const CONVERSATION_HEADER = "x-bili-plugin-conversation";
@@ -45,7 +56,6 @@ const SEQ_HEADER = "x-bili-pf-seq";
 // #5643: the v6 world echo header the server mints (pf_<hex12>).
 const PF_SESSION_HEADER = "x-bili-pf-session";
 const PF_SID_RE = /^pf_[0-9a-f]{12}$/u;
-export const PF_SLOT_UNKNOWN = "?";
 
 const MAX_ID_LEN = 512;
 const RESERVED_PREFIX = "acp_summary_";
@@ -103,10 +113,13 @@ export function pfLearnStamp(headersIn: Record<string, string>, respStatus: numb
  *  opencode messages.transform): store the per-slot id sequence for THIS
  *  turn's wire elements, position-indexed exactly as the host gave it.
  *
- *  Per-slot discipline (owner 2026-11-02): format-invalid entries become the
- *  UNIDENTIFIED placeholder — they NEVER poison neighbouring slots anymore.
- *  A whole failed resolution (null/undefined/non-array) still clears the
- *  stored list: honest absence beats a stale, mis-positioned one. */
+ *  Per-slot discipline (F2 ruling, owner 2026-11-04, superseding the
+ *  2026-11-02 "travel as ?" half): a format-invalid or missing id ANYWHERE
+ *  in the span clears the stored list wholesale — "?" never reaches the
+ *  wire (guarantee branch: hosts keep every element id-bearing after
+ *  compaction; a hole therefore means drift, and honest absence degrades
+ *  safely instead of poisoning the v6 hard gate). A whole failed
+ *  resolution (null/undefined/non-array) clears identically. */
 export function pfCaptureIds(sid: string, ids: unknown): void {
     if (sid.length === 0) return;
     const slot = takeSlot(sid);
@@ -115,22 +128,19 @@ export function pfCaptureIds(sid: string, ids: unknown): void {
         return;
     }
     const seen = new Set<string>();
-    let known = 0;
     const out: string[] = [];
     for (const v of ids) {
         if (
             typeof v !== "string" || v.length === 0 || v.length > MAX_ID_LEN ||
             v.startsWith(RESERVED_PREFIX) || BAD_ID_CHARS.test(v) || seen.has(v)
         ) {
-            out.push(PF_SLOT_UNKNOWN); // id-less slot (summary/persona/foreign shape) — travel as unknown
-            continue;
+            delete slot.ids; // F2: any hole ⇒ clear the WHOLE table, never emit "?" or a partial slice
+            return;
         }
         seen.add(v);
-        known++;
         out.push(v);
     }
-    // Nothing identifiable in the whole span ⇒ count-only beats noise.
-    slot.ids = known > 0 ? out : undefined;
+    slot.ids = out.length > 0 ? out : undefined;
 }
 
 /** Chokepoint emit (native-intercept routed-send site): the handshake headers
