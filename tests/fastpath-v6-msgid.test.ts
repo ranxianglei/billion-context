@@ -17,6 +17,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type http from "node:http";
+import { DatabaseSync } from "node:sqlite";
 import { openaiToCore } from "acp-kernel/wire";
 import { SessionStore, _setStoreForTest, _resetStoreForTest } from "../src/persist.ts";
 import type { SessionStore as SessionStoreType } from "../src/persist.ts";
@@ -431,5 +432,49 @@ test("teardown: clearWatermarkV6 drops every in-memory mirror; the disk plane su
         assert.deepEqual(h.store.pfMeta(sid), before, "disk plane untouched (delete-time cascade owns it)");
         clearWatermarkV6("s-tear"); // idempotent
         assert.equal(watermarkV6DebugState("s-tear").liveSids.length, 0);
+    } finally { h.cleanup(); }
+});
+
+test("failed arm registration hands out NO world id (next turn re-arms cleanly, no fault storm)", () => {
+    const h = makeH("armfail");
+    try {
+        const log = makeLog();
+        const b1 = makeBody([{ role: "system", content: SYS }, { role: "user", content: "u1" }]);
+        const commit = h.store.pfCommitTurn.bind(h.store);
+        let failNext = true;
+        h.store.pfCommitTurn = ((...args: Parameters<SessionStoreType["pfCommitTurn"]>) => {
+            if (failNext) { failNext = false; return null; }
+            return commit(...args);
+        }) as SessionStoreType["pfCommitTurn"];
+        const r1 = turn("s-af", "car-af", b1, ["w0", "w1"], log);
+        assert.equal(r1.outcome.decision, "arm");
+        assert.equal(r1.headers[PF_SESSION_HEADER], undefined, "a failed registration must not echo a world id the plane cannot resolve");
+        assert.equal(r1.headers[PF_SEQ_HEADER], "2", "the honest seq stamp still rides");
+        const r2 = turn("s-af", "car-af", b1, ["w0", "w1"], log);
+        assert.equal(r2.outcome.decision, "arm");
+        assert.notEqual(r2.sid, r1.sid, "re-arm mints a new world id");
+    } finally { h.cleanup(); }
+});
+
+test("§8-22 real store deletion cascades every registered world (in-TX registry sweep)", async () => {
+    const h = makeH("cascade");
+    try {
+        const log = makeLog();
+        const b1 = makeBody([{ role: "system", content: SYS }, { role: "user", content: "u1" }]);
+        const rA = turn("s-cs", "car-cs-A", b1, ["z0", "z1"], log);
+        const sidA = rA.sid!;
+        const rB = turn("s-cs", "car-cs-B", b1, ["z0", "z1"], log);
+        const sidB = rB.sid!;
+        assert.notEqual(sidA, sidB);
+        await h.store.removeSession("s-cs");
+        const db = new DatabaseSync(path.join(h.dir, "index.db"));
+        try {
+            for (const t of ["pf_rows", "pf_log", "pf_ckpt"]) {
+                const row = db.prepare(`SELECT COUNT(*) AS n FROM ${t}`).get() as { n: number } | undefined;
+                assert.equal(row?.n, 0, `${t} must be empty after session deletion`);
+            }
+        } finally { db.close(); }
+        assert.equal(h.store.pfLatestGeom(sidA), null);
+        assert.equal(h.store.pfLatestGeom(sidB), null);
     } finally { h.cleanup(); }
 });
