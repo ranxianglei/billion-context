@@ -78,6 +78,15 @@ export const ROLLOUT_FEATURES: Record<string, RolloutPlan> = {
     // `BILI_ROLLOUT_WATERMARK_V6_MSG_ID=1`; bucketed growth stays nested
     // inside the v5 watermark cohort.
     watermarkV6MsgId: { percent: 0, base: "pluginFullResendWatermark" },
+    // #5664 station-3 fast emit: v6 identity lanes with a healthy render
+    // snapshot plane serve steady hit turns by splicing the cached outbound
+    // rows (frozen prefix verbatim + bounded window-pass over the last cores)
+    // instead of rescanning n rows; every red gate condition (pressure,
+    // caps mismatch, audit cadence, hydrate failure, byte-mismatch vs the
+    // stored suffix) falls back to this branch's baseline path byte-for-byte.
+    // Requires watermarkV6MsgId + the pf_render plane; nested cohort bucketing
+    // inside the v6 lane. Default 0%.
+    watermarkV6Render: { percent: 0, base: "watermarkV6MsgId" },
     // #4804 WS delta continuation: codex/opencode WebSocket clients that keep a
     // previous_response_id checkpoint stop reconstructing full history on every
     // turn — the session augments the delta with the server-committed previous
