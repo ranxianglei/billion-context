@@ -464,3 +464,68 @@ test("clearWatermarkSeed forces the next turn back through verification", () => 
     const { out } = runTurn(session, { [PF_COUNT_HEADER]: "3" }, b2);
     assert.equal(out.decision, "unseeded");
 });
+
+// #5576 review round-1 (V1/V3, 2026-11-04): the v5 lane is the only LIVE
+// identity lane today, so its #3617 bidirectionality matrix and the R7
+// sess-change gate get their positive-direction lines HERE — they previously
+// existed only inside the canonical/msgid lanes.
+
+test("v5 #3617 matrix: id-mode stable-id edit RIDES with a warn (stale byte outbound); count-only same edit is GATED", () => {
+    // A) id mode: identity chain intact ⇒ hit; stashed cores ride OUTBOUND —
+    //    the pre-edit byte is served, the edit is diagnostic-only (owner
+    //    ruling 2026-11-03; feeds M3 re-seeding signals).
+    makeStubStore();
+    const sA = freshSession("pf-v5-ride");
+    assert.equal(runTurn(sA, {}, bodyOf([SYS("s"), USR("a"), USR("b")])).out.decision, "no-stamp");
+    const bA2 = bodyOf([SYS("s"), USR("a"), USR("b"), USR("c")]);
+    assert.equal(runTurn(sA, { [PF_COUNT_HEADER]: "3", ...TAIL(["h-b", "h-c"]) }, bA2).out.decision, "hit");
+    const LOGS_AT = LOGS.length;
+    // client rewrites element `b` IN PLACE while its host id stays `h-b`
+    const bA3 = bodyOf([SYS("s"), USR("a"), USR("b-EDITED"), USR("c"), ASST("d")]);
+    const rA = runTurn(sA, { [PF_COUNT_HEADER]: "4", ...TAIL(["h-c", "h-d"]) }, bA3);
+    assert.equal(rA.out.decision, "hit", LOGS.join("\n"));
+    assert.ok(LOGS.slice(LOGS_AT).some((l) => l.includes("riding the stashed prefix")),
+        "id-mode head drift must log the diagnostic ride line");
+    const textsA = rA.out.hit!.view.map((m) => String((m as { text?: unknown }).text ?? ""));
+    assert.ok(textsA.includes("b"), "stale core byte rides outbound under id mode");
+    assert.ok(!textsA.includes("b-EDITED"), "the edit must NOT be served from this lane");
+    // B) count-only parallel: SAME bytes without an id list stay byte-gated —
+    //    rewrite detected, uncredited miss, self-heal reseed (paired direction).
+    makeStubStore();
+    const sB = freshSession("pf-v5-gate");
+    assert.equal(runTurn(sB, {}, bodyOf([SYS("s"), USR("a"), USR("b")])).out.decision, "no-stamp");
+    assert.equal(runTurn(sB, { [PF_COUNT_HEADER]: "3" }, bA2).out.decision, "hit");
+    const mB = runTurn(sB, { [PF_COUNT_HEADER]: "4" }, bA3);
+    assert.equal(mB.out.decision, "head-prefix-drift", LOGS.join("\n"));
+    assert.equal(mB.out.creditedMiss, false);
+});
+
+test("v5 R7 port: sess-change on the DEFAULT lane — swap is an event, same carrier silent, absent carrier never one", () => {
+    const stub = makeStubStore();
+    const s1 = freshSession("pf-r7-swap");
+    assert.equal(runTurn(s1, {}, bodyOf([SYS("s"), USR("a"), USR("b")])).out.decision, "no-stamp");
+    const h = { "x-conversation-id": "conv-A" };
+    assert.equal(runTurn(s1, { [PF_COUNT_HEADER]: "3", ...TAIL(["h-b", "h-c"]), ...h },
+        bodyOf([SYS("s"), USR("a"), USR("b"), USR("c")])).out.decision, "hit");
+    assert.equal(typeof readSaved(stub, s1.id).cs, "string", "first claimed carrier persists as cs digest");
+    // same carrier on the next turn = non-event
+    assert.equal(runTurn(s1, { [PF_COUNT_HEADER]: "4", ...TAIL(["h-c", "h-d"]), ...h },
+        bodyOf([SYS("s"), USR("a"), USR("b"), USR("c"), ASST("d")])).out.decision, "hit");
+    // swapped carrier = identity EVENT (uncredited, legacy + reseed)
+    const swapped = runTurn(s1, { [PF_COUNT_HEADER]: "5", ...TAIL(["h-d", "h-e"]), "x-conversation-id": "conv-B" },
+        bodyOf([SYS("s"), USR("a"), USR("b"), USR("c"), ASST("d"), USR("e")]));
+    assert.equal(swapped.out.decision, "sess-change", LOGS.join("\n"));
+    assert.equal(swapped.out.creditedMiss, false);
+    // identity follows traffic: growth under the NEW carrier rides again
+    assert.equal(runTurn(s1, { [PF_COUNT_HEADER]: "6", ...TAIL(["h-e", "h-f"]), "x-conversation-id": "conv-B" },
+        bodyOf([SYS("s"), USR("a"), USR("b"), USR("c"), ASST("d"), USR("e"), USR("f")])).out.decision, "hit");
+    // neutral: state that never claimed a carrier never fires, even late
+    makeStubStore();
+    const s2 = freshSession("pf-r7-neutral");
+    assert.equal(runTurn(s2, {}, bodyOf([SYS("s"), USR("a"), USR("b")])).out.decision, "no-stamp");
+    assert.equal(runTurn(s2, { [PF_COUNT_HEADER]: "3", ...TAIL(["h-b", "h-c"]) },
+        bodyOf([SYS("s"), USR("a"), USR("b"), USR("c")])).out.decision, "hit");
+    assert.equal(runTurn(s2, { [PF_COUNT_HEADER]: "4", ...TAIL(["h-c", "h-d"]), "x-conversation-id": "late-joiner" },
+        bodyOf([SYS("s"), USR("a"), USR("b"), USR("c"), ASST("d")])).out.decision, "hit",
+        "carrier appearing where none was stored must be neutral (first claim, not a change)");
+});

@@ -15,7 +15,7 @@ import { createHash } from "node:crypto";
 import test from "node:test";
 import http from "node:http";
 import { openaiToCore } from "acp-kernel/wire";
-import { evaluateWatermarkFastpath, finalizeWatermarkTurn, PF_SID_HEADER, PF_TAIL_IDS_HEADER } from "../src/server/fastpath.ts";
+import { evaluateWatermarkFastpath, finalizeWatermarkTurn, watermarkDebugState, PF_SID_HEADER, PF_TAIL_IDS_HEADER } from "../src/server/fastpath.ts";
 import { stripRawStage } from "../src/marker/engine.ts";
 import { rolloutEnvName } from "../src/rollout.ts";
 import { _setStoreForTest, _resetStoreForTest, type SessionStore } from "../src/persist.ts";
@@ -515,5 +515,80 @@ test("B1/S4: untrusted checkpoints degrade exactly ONE turn, then self-heal (pre
         // ignored the same way even though `o` parses fine inside it.
         const curMeta = JSON.stringify({ s: { t: 4, imgFlag: false, markers: ZERO_MARKERS }, o: 0 });
         runBadCkptCase("sum", curMeta, "deadbeef");
+    } finally { setMsgIdLane(false); _resetStoreForTest(); }
+});
+
+// #5576 review round-1 pins (V4/V5/V6, 2026-11-04).
+
+test("V4: compaction-class misses stay UNcredited when strict is off, and the frontier still self-heals", () => {
+    try {
+        setMsgIdLane(true); // BILI_PF_V6_REWRITE_STRICT deliberately UNset
+        const pf = new MemPF();
+        makeStub(pf);
+        const s = mkSession("s-cmp-loose");
+        const { sid, msgs } = bootWorld(pf, s);
+        const shrunken = [{ role: "system", content: "compact summary round one" }, USR("resume q1")];
+        const r1 = runTurn(s, { [PF_SID_HEADER]: sid }, shrunken);
+        assert.equal(r1.out.decision, "v6m-compact");
+        assert.equal(r1.out.creditedMiss, false, "strict OFF: rewrite-class misses never feed the breaker");
+        const grew = [...shrunken, USR("grew g")];
+        const r2 = runTurn(s, { [PF_SID_HEADER]: sid, [PF_TAIL_IDS_HEADER]: ["?", "?"].join(",") }, grew);
+        assert.equal(r2.out.decision, "hit(v6-mid)", `post-reset ride must heal, got ${r2.out.decision}`);
+        // second host compaction: still uncredited
+        const shrunk2 = [{ role: "system", content: "compact summary round two" }, USR("resume q2")];
+        const r3 = runTurn(s, { [PF_SID_HEADER]: sid }, shrunk2);
+        assert.equal(r3.out.decision, "v6m-compact");
+        assert.equal(watermarkDebugState(s).missCount ?? 0, 0, "no breaker credit accumulated across loose-mode compactions");
+    } finally { setMsgIdLane(false); _resetStoreForTest(); }
+});
+
+test("S3/V5: a mid-flight read-side store fault degrades to the legacy lanes uncredited — no throw, no breaker credit (even under strict)", () => {
+    try {
+        setMsgIdLane(true);
+        process.env.BILI_PF_V6_REWRITE_STRICT = "1";
+        const pf = new MemPF();
+        makeStub(pf);
+        const s = mkSession("s-infra-fault");
+        const { sid, msgs } = bootWorld(pf, s);
+        const before = watermarkDebugState(s).missCount ?? 0;
+        // Poison every READ surface the lane touches during evaluation.
+        const origMeta = pf.readMeta.bind(pf), origRows = pf.readRows.bind(pf), origLedger = pf.lookupLedger.bind(pf);
+        let fail = true;
+        const boom = (): never => { throw new Error("SQLITE_BUSY: database is locked"); };
+        pf.readMeta = ((..._a: unknown[]) => { void _a; if (fail) return boom(); return origMeta.apply(pf as never, [] as never); }) as typeof pf.readMeta;
+        pf.readRows = ((...a: unknown[]) => fail ? boom() : origRows(...(a as Parameters<typeof pf.readRows>))) as typeof pf.readRows;
+        pf.lookupLedger = ((id: string) => fail ? boom() : origLedger(id)) as typeof pf.lookupLedger;
+        try {
+            const r = runTurn(s, { [PF_SID_HEADER]: sid, [PF_TAIL_IDS_HEADER]: ["?", "?"].join(",") }, [...msgs, USR("during outage")]);
+            assert.ok(!String(r.out.decision).startsWith("v6m-"), `lane must have degraded away, got ${r.out.decision}`);
+            assert.equal(r.out.creditedMiss, false, "infra faults are NOT misses of this partition");
+        } finally {
+            fail = false;
+            pf.readMeta = origMeta as typeof pf.readMeta;
+            pf.readRows = origRows as typeof pf.readRows;
+            pf.lookupLedger = origLedger as typeof pf.lookupLedger;
+        }
+        assert.equal(watermarkDebugState(s).missCount ?? before, before, "breaker untouched by the faulted turn");
+    } finally { setMsgIdLane(false); delete process.env.BILI_PF_V6_REWRITE_STRICT; _resetStoreForTest(); }
+});
+
+test("V6 documented contract: forged-sid echoes mint one fresh sid per turn (registry grows linearly; cap policy pending owner ruling)", () => {
+    try {
+        setMsgIdLane(true);
+        const pf = new MemPF();
+        const stub = makeStub(pf);
+        const s = mkSession("s-forge-burst");
+        const mints: string[] = [];
+        for (let i = 0; i < 3; i++) {
+            const r = runTurn(s, { [PF_SID_HEADER]: `pf_forged${i}00` }, [SYSP, USR(`forge turn ${i}`)]);
+            assert.equal(r.out.decision, "v6m-arm");
+            assert.equal(r.out.creditedMiss, false, "fabricated echoes are uncredited by design");
+            assert.notEqual(r.headers[PF_SID_HEADER] === undefined, true);
+            mints.push(String(r.headers[PF_SID_HEADER]));
+        }
+        assert.ok(mints.every((m) => /^pf_[0-9a-f]{12}$/.test(m)));
+        assert.equal(new Set(mints).size, 3, "each forged echo probes, fails, and mints fresh (today: unbounded)");
+        const reg = stub.ext.get("s-forge-burst\u0000pf:sids") as unknown;
+        assert.deepEqual(reg, mints, "registry grows linearly with the forged loop — pinned so any future cap lands deliberately");
     } finally { setMsgIdLane(false); _resetStoreForTest(); }
 });
