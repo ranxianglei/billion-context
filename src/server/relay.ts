@@ -48,7 +48,7 @@ import { pickAdapter, runCompressLoop } from "../loop/index.js";
 import { ABSORB_INSTRUCTION_MARKER, containsToolCallXmlFragment } from "../loop/tag-echo-filter.js";
 import { dumpsDir } from "../paths.js";
 import { noteKnownAttachmentIds } from "../phantom-attachment.js";
-import { pipePluginChatWithStrip, pipePluginJson, pipePluginJsonlWithStrip, pipePluginResponsesWithStrip, type UpstreamMeta } from "../plugin.js";
+import { pipePluginChatWithStrip, pipePluginJson, pipePluginJsonlWithStrip, pipePluginResponsesWithStrip, pipePluginTraeWithStrip, type UpstreamMeta } from "../plugin.js";
 import { describeCoreTextDuplication, estimateCoreMessages, estimateCoreMessagesUpperBytes } from "../preflight.js";
 import { reasoningGuardEngages, runReasoningGuard } from "../reasoning-guard.js";
 import { wrapStreamWithRunawayGuard } from "../runaway-guard.js";
@@ -2298,6 +2298,17 @@ async function forwardCaptured(
                         prepared.session,
                         (msg) => log("info", `[${prepared.session.id}] ${msg}`),
                     );
+                } else if (prepared.traeWire) {
+                    // #1295: trae terminates on its own `done` frame, which the
+                    // chat pipe does not recognize — a separate pipe forwards
+                    // frames verbatim while still stripping render-tag echo.
+                    await pipePluginTraeWithStrip(
+                        pluginBody,
+                        res,
+                        prepared.session,
+                        (msg) => log("info", `[${prepared.session.id}] ${msg}`),
+                        targetOrigin,
+                    );
                 } else if (prepared.protocol === "responses") {
                     // #732/#821 applies to this pipe too (#871): the agent's own
                     // body, held here with its URL and headers, is re-issued once
@@ -2544,6 +2555,9 @@ async function forwardCaptured(
                     upstreamMeta,
                     reply,
                 );
+            } else if (p.traeWire) {
+                // #1295: same reason as the plugin branch above.
+                await pipePluginTraeWithStrip(responseBody, res, undefined, tagLog, targetOrigin);
             } else {
                 await pipePluginChatWithStrip(
                     responseBody,

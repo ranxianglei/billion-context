@@ -267,7 +267,7 @@ export function emitUpstreamTruncation(res: http.ServerResponse, protocol: Proto
         } else if (protocol === "trae") {
             // WC-12c: the done frame IS this wire's terminator; only a
             // mid-flight cut needs an error frame.
-            if (!finished) safeWrite(res, traeFrame("error", { message }));
+            if (!finished) safeWrite(res, traeFrame("error", { code: "upstream_stream_truncated", message, ...metaField }));
         } else if (protocol === "commandcode") {
             // The finish event IS this wire's terminator: when delivered there
             // is nothing to synthesize; only a mid-flight cut gets an error line.

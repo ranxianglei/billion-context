@@ -66,7 +66,7 @@ envelope 包着的 openai-completions 对话（`function: "solo_agent"`，模型
 |----|------|---------------|
 | WC-12a | 对话是 openai-completions 形状，但 message 的 content 恒为 parts 数组 —— tool 结果也一样，且 part 词表就是 OpenAI 的（`text`、`image_url`）。 | unwrap 把纯 text 的 parts 拼回一个字符串，出现 `image_url` 时保留 parts 数组（图片原样透传）；词表之外的 part 类型（音频/文件）判定整个 body 不可转换 → 原样 relay（#1284）。rewrap 把字符串还原成单个 text part，并把图片 part 按序还原。 |
 | WC-12b | tool call 保留 OpenAI 外层（`id`、`type: "function"`），但载荷键改名为 `function_call`；带工具调用的 assistant 轮 `content: null`。 | unwrap 改回 `function`；rewrap 改回 `function_call` 并还原工具轮的 `content: null`（`arguments` 按字节语义保真，#1039）。 |
-| WC-12c | 流是 `event:<name>` / `data:<json>`，冒号后没有空格，也没有 `[DONE]`；`done` 帧是终止符。帧序：`metadata` → `timing_cost` → N×`output` → (`extra_info`) → `token_usage` → `done`。 | 适配器按该方言解析；`emitCompletion` 写 `token_usage` + `done`。只有 `done` 之前的断流才合成 `error` 帧。 |
+| WC-12c | 流是 `event:<name>` / `data:<json>`，冒号后没有空格，也没有 `[DONE]`；`done` 帧是终止符。帧序：`metadata` → `timing_cost` → N×`output` → (`extra_info`) → `token_usage` → `done`。 | 适配器按该方言解析；`emitCompletion` 写 `token_usage` + `done`。只有 `done` 之前的断流才合成 `error` 帧。plugin 模式必须有自己的直通 pipe（`pipePluginTraeWithStrip`）：共用的 chat pipe 只把带引号的 `finish_reason` 块或 `[DONE]` 哨兵当终止符，本 wire 两者都不发，于是一个干净的 trae 轮次到 EOF 时判定为「没见过终止符」并报成截断（修复前活座 144 次）。 |
 | WC-12d | rewrap 绝不允许在转发中途丢内容。 | 该 wire 没有对应槽位的角色（例如 compat-roles 的重写目标）降级为 `user` 文本，而不是被丢弃。 |
 | WC-12e | 上游可能发出 bili 不认识的帧（未来改版风险）。 | 未知帧名、无法解析的 `data:` 载荷一律按字节原样转发 —— 只限第一轮，避免 bili 自己的注入被误当成上游内容。 |
 | WC-12f | `token_usage` 的真实计数在每请求字段里；所有 `*_total` 字段恒为 0。 | usage 从 `prompt_tokens` / `completion_tokens` / `cache_read_input_tokens` 映射；`*_total` 字段从不读取。 |
@@ -84,7 +84,12 @@ envelope 包着的 openai-completions 对话（`function: "solo_agent"`，模型
   压缩重发）原样回放。
 - 验证边界：上述请求/响应形状来自真机 capture（#1295）。bili 侧往返有单测覆盖；
   单调用分帧与并行调用分帧（WC-12i，2026-11-04 一轮两个 `run_code` 的真机捕获）
-  都已用逐帧原文 fixture 回放钉住（`tests/fixtures/`）。但**没有**跑过「压缩后的
-  对话被真实 Trae 客户端回放」的端到端验证 —— 那需要一个活的账号席位，它现在是
-  唯一剩下的检查项。
+  都已用逐帧原文 fixture 回放钉住（`tests/fixtures/`）。plugin 车道有自己的直通
+  pipe（`pipePluginTraeWithStrip`），由同一份真机 dump 在
+  `tests/trae-plugin-pipe.test.ts` 里钉住：干净轮次逐字节原样、只有真正断流才注入
+  in-band `error` 帧、渲染标签回声只从 prose 字段剥掉、`token_usage` 进
+  `lastInputTokens`。代理车道随后已在活座跑过（压缩后的轮次被转发到真实 Trae
+  主机，一次折叠把上报的上下文从 24% 降到 8%）。**没有**跑过的仍是「压缩后的对话
+  被真实 Trae 客户端回放」的端到端验证 —— 那需要一个活的账号席位，它现在是唯一
+  剩下的检查项。
 
