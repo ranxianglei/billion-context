@@ -2578,7 +2578,144 @@ export class UnifiedStore {
             this.db.prepare(`DELETE FROM pf_rows WHERE sid IN (${ph})`).run(...sids);
             this.db.prepare(`DELETE FROM pf_log WHERE sid IN (${ph})`).run(...sids);
             this.db.prepare(`DELETE FROM pf_ckpt WHERE sid IN (${ph})`).run(...sids);
+            this.db.prepare(`DELETE FROM pf_render WHERE sid IN (${ph})`).run(...sids);
+            this.db.prepare(`DELETE FROM pf_render_log WHERE sid IN (${ph})`).run(...sids);
+            this.db.prepare(`DELETE FROM pf_render_ckpt WHERE sid IN (${ph})`).run(...sids);
         });
+    }
+
+    // ------------------------------------------------------------------
+    // #5664 render snapshot plane — the v6 frozen prefix's OUTBOUND-rendered
+    // rows (final wire form; inbound owns all rewrite/compaction). Same LSM
+    // family as the identity plane: row table = current truth, L0 log
+    // journals ops, L1 ckpt folds with an S4 checksum. Read-only soft
+    // degrade on the sqlite path (missing plane ⇒ empty); writes throw into
+    // the surrounding transaction like every other pf_* write.
+    // ------------------------------------------------------------------
+
+    pfRenderAvailable(): boolean {
+        try {
+            const cols = (this.db.prepare("PRAGMA table_info(pf_render)").all() as unknown as { name?: unknown }[])
+                .map((c) => (typeof c?.name === "string" ? c.name : ""));
+            return cols.includes("row_json") && cols.includes("pos");
+        } catch {
+            return false;
+        }
+    }
+
+    /** Current-truth live rows for one sid in pos order (tombstones — NULL
+     *  rows where the kernel hid the ordinal — ride along as null so the
+     *  ordinal structure stays visible). No plane → empty array (lane
+     *  unavailable ⇒ caller serves baseline). */
+    pfRenderRows(sid: string): { pos: number; rowJson: string | null }[] {
+        const out: { pos: number; rowJson: string | null }[] = [];
+        if (!this.pfRenderAvailable()) return out;
+        try {
+            const rows = this.db
+                .prepare("SELECT pos, row_json FROM pf_render WHERE sid = ? ORDER BY pos")
+                .all(sid) as { pos: number; row_json: string | null }[];
+            for (const r of rows) out.push({ pos: r.pos, rowJson: r.row_json === null ? null : String(r.row_json) });
+        } catch {
+            return [];
+        }
+        return out;
+    }
+
+    /** Atomic turn commit for the render plane (#5664): upsert `rows`
+     *  (pos may move — a recast rewrites covered ordinals), physically drop
+     *  `deletes` (ordinals that no longer exist after a rewrite), journal
+     *  `logEntries` at strictly increasing ls_seq, and — when
+     *  `checkpointMetaJson` is given — fold the whole log into a fresh ckpt
+     *  WITH its S4 checksum in the SAME transaction (the forced checkpoint
+     *  of a compression round). Any throw → rollback → byte-identical plane.
+     *  Returns the next free ls_seq. */
+    pfRenderCommit(
+        sid: string,
+        args: {
+            rows: { pos: number; rowJson: string | null }[];
+            deletes?: number[];
+            logEntries: { kind: string; payloadJson: string }[];
+            checkpointMetaJson?: string;
+            ts?: number;
+        },
+    ): number {
+        if (!this.pfRenderAvailable()) throw new Error("render plane unavailable");
+        return this.db.transaction((): number => {
+            const insRow = this.db.prepare(
+                "INSERT INTO pf_render (sid, pos, row_json) VALUES (?, ?, ?) ON CONFLICT (sid, pos) DO UPDATE SET row_json = excluded.row_json",
+            );
+            for (const r of args.rows) insRow.run(sid, r.pos, r.rowJson);
+            if (args.deletes && args.deletes.length > 0) {
+                const ph = args.deletes.map(() => "?").join(", ");
+                this.db.prepare(`DELETE FROM pf_render WHERE sid = ? AND pos IN (${ph})`).run(sid, ...args.deletes);
+            }
+            // Continuation must clear BOTH the surviving log tail AND the
+            // checkpoint watermark: a fresh checkpoint ABSORBS its own log
+            // entries (delete below), so MAX(log) can sit BEHIND ckpt_ls_seq;
+            // anything numbered <= ckpt would be invisible to pfRenderMeta
+            // forever (entries written after the fold silently lost).
+            const start = Number(
+                Math.max(
+                    (this.db.prepare("SELECT COALESCE(MAX(ls_seq), 0) AS m FROM pf_render_log WHERE sid = ?").get(sid) as { m: number }).m ?? 0,
+                    (this.db.prepare("SELECT ckpt_ls_seq AS n FROM pf_render_ckpt WHERE sid = ?").get(sid) as { n: number } | undefined)?.n ?? 0,
+                ),
+            );
+            const insLog = this.db.prepare("INSERT INTO pf_render_log (sid, ls_seq, kind, payload_json, ts) VALUES (?, ?, ?, ?, ?)");
+            let seq = start;
+            for (const e of args.logEntries) {
+                seq += 1;
+                insLog.run(sid, seq, e.kind, e.payloadJson, args.ts ?? Date.now());
+            }
+            if (args.checkpointMetaJson !== undefined && seq > 0) {
+                const hash = createHash("sha256").update(args.checkpointMetaJson).digest("hex");
+                this.db
+                    .prepare(
+                        "INSERT INTO pf_render_ckpt (sid, ckpt_ls_seq, meta_json, checksum, updated_at) VALUES (?, ?, ?, ?, ?) " +
+                            "ON CONFLICT (sid) DO UPDATE SET ckpt_ls_seq = excluded.ckpt_ls_seq, meta_json = excluded.meta_json, " +
+                            "checksum = excluded.checksum, updated_at = excluded.updated_at",
+                    )
+                    .run(sid, seq, args.checkpointMetaJson, hash, args.ts ?? Date.now());
+                this.db.prepare("DELETE FROM pf_render_log WHERE sid = ?").run(sid);
+            }
+            return seq;
+        });
+    }
+
+    /** Render-plane metadata read (diagnostics / hydration validation): the
+     *  L1 checkpoint plus post-ckpts L0 entries in ls_seq order. */
+    pfRenderMeta(sid: string): {
+        ckpt: { ckptLsSeq: number; metaJson: string; checksum: string; updatedAt: number } | null;
+        log: { lsSeq: number; kind: string; payloadJson: string; ts: number }[];
+    } | null {
+        if (!this.pfRenderAvailable()) return null;
+        try {
+            const c = this.db.prepare("SELECT ckpt_ls_seq, meta_json, checksum, updated_at FROM pf_render_ckpt WHERE sid = ?").get(sid) as
+                | { ckpt_ls_seq: number; meta_json: string; checksum: string; updated_at: number }
+                | undefined;
+            const log = this.db
+                .prepare("SELECT ls_seq, kind, payload_json, ts FROM pf_render_log WHERE sid = ? AND ls_seq > ? ORDER BY ls_seq")
+                .all(sid, c === undefined ? 0 : c.ckpt_ls_seq) as { ls_seq: number; kind: string; payload_json: string; ts: number }[];
+            return {
+                ckpt:
+                    c === undefined ? null : { ckptLsSeq: c.ckpt_ls_seq, metaJson: c.meta_json, checksum: c.checksum, updatedAt: c.updated_at },
+                log: log.map((r) => ({ lsSeq: r.ls_seq, kind: r.kind, payloadJson: r.payload_json, ts: r.ts })),
+            };
+        } catch {
+            return null;
+        }
+    }
+
+    /** S4: does the checkpoint's checksum cover the EXACT meta bytes? False
+     *  kills the render plane for this sid at the caller (rebuild from the
+     *  replay source — never guess). No ckpt yet = nothing to verify = true.
+     */
+    pfRenderCkptIntact(sid: string): boolean {
+        if (!this.pfRenderAvailable()) return false;
+        const c = this.db.prepare("SELECT meta_json, checksum FROM pf_render_ckpt WHERE sid = ?").get(sid) as
+            | { meta_json: string; checksum: string }
+            | undefined;
+        if (c === undefined) return true;
+        return createHash("sha256").update(c.meta_json).digest("hex") === c.checksum;
     }
 
     /** #4949: circuit-breaker re-enable probe — one REAL committed write

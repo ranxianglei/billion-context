@@ -74,7 +74,12 @@
 //        change, and with the watermarkV6MsgId rollout OFF no traffic ever
 //        touches them. No backfill, no back-compat column juggling — older
 //        builds stop at the version gate and simply ignore the extra tables.
-export const STORAGE_SCHEMA_VERSION = 11;
+//      - v12: fastpath v6 render snapshot plane (#5664) — three more
+//        append-oriented sidecar tables (pf_render / pf_render_log /
+//        pf_render_ckpt), same pure CREATE IF NOT EXISTS shape: pre-v12
+//        installs upgrade with zero byte change, and with the
+//        watermarkV6Render rollout OFF no traffic touches them.
+export const STORAGE_SCHEMA_VERSION = 12;
 
 /** #3250: cap for `journal_size_limit` (see STORAGE_PRAGMAS). Passive and
  *  auto checkpoints move frames into the main db and reset the write offset
@@ -438,6 +443,42 @@ CREATE TABLE IF NOT EXISTS pf_log (
     PRIMARY KEY (sid, ls_seq)
 );
 CREATE TABLE IF NOT EXISTS pf_ckpt (
+    sid TEXT NOT NULL,
+    ckpt_ls_seq INTEGER NOT NULL,
+    meta_json TEXT NOT NULL,
+    checksum TEXT NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (sid)
+)`);
+        }
+        if (from < 12) {
+            // v12 (#5664): fastpath v6 RENDER snapshot plane — the frozen
+            // prefix's outbound-rendered rows (the final wire form AFTER all
+            // rewrite/compaction is done inbound; outbound only maps stored
+            // rows to the target protocol, no rewrite, no scan). Same LSM
+            // family as the identity plane: pf_render is the current-truth
+            // row set (pos = rendered-message ordinal; row_json NULL =
+            // tombstone: the kernel hid that ordinal), pf_render_log L0
+            // journals each turn's ops (cast/append/delete/compact),
+            // pf_render_ckpt L1 folds it with an S4 checksum over the exact
+            // meta bytes (hydrate re-verifies; mismatch kills the plane for
+            // that sid — rebuild from the replay source, never guess).
+            db.exec(`
+CREATE TABLE IF NOT EXISTS pf_render (
+    sid TEXT NOT NULL,
+    pos INTEGER NOT NULL,
+    row_json TEXT,
+    PRIMARY KEY (sid, pos)
+);
+CREATE TABLE IF NOT EXISTS pf_render_log (
+    sid TEXT NOT NULL,
+    ls_seq INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    ts INTEGER NOT NULL,
+    PRIMARY KEY (sid, ls_seq)
+);
+CREATE TABLE IF NOT EXISTS pf_render_ckpt (
     sid TEXT NOT NULL,
     ckpt_ls_seq INTEGER NOT NULL,
     meta_json TEXT NOT NULL,

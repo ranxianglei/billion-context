@@ -2291,6 +2291,58 @@ export class SessionStore {
         if (Array.isArray(reg)) this.shadow.pfDeleteAll(reg);
     }
 
+    /** #5664 render snapshot plane facade — same guard shape as the identity
+     *  plane: null/empty/false = "plane unavailable right now" and the v6
+     *  lane fails soft onto the legacy full path for that turn only.
+     *  pfRenderCommit does NOT swallow silently. */
+    pfRenderAvailable(): boolean {
+        if (!this.shadow || this.shadow.stats.disabled) return false;
+        try {
+            return this.shadow.pfRenderAvailable();
+        } catch {
+            return false;
+        }
+    }
+
+    pfRenderRows(sid: string): { pos: number; rowJson: string | null }[] {
+        if (!this.shadow || this.shadow.stats.disabled) return [];
+        return this.shadow.pfRenderRows(sid);
+    }
+
+    pfRenderCommit(
+        sid: string,
+        args: {
+            rows: { pos: number; rowJson: string | null }[];
+            deletes?: number[];
+            logEntries: { kind: string; payloadJson: string }[];
+            checkpointMetaJson?: string;
+            ts?: number;
+        },
+    ): number | null {
+        if (!this.shadow || this.shadow.stats.disabled) return null;
+        try {
+            return this.shadow.pfRenderCommit(sid, args);
+        } catch (err) {
+            this.log("warn", `[persist] pf render commit failed (${sid}): ${String(err)}`); // loud once, fail-soft for THIS turn
+            return null;
+        }
+    }
+
+    pfRenderMeta(
+        sid: string,
+    ): {
+        ckpt: { ckptLsSeq: number; metaJson: string; checksum: string; updatedAt: number } | null;
+        log: { lsSeq: number; kind: string; payloadJson: string; ts: number }[];
+    } | null {
+        if (!this.shadow || this.shadow.stats.disabled) return null;
+        return this.shadow.pfRenderMeta(sid);
+    }
+
+    pfRenderCkptIntact(sid: string): boolean {
+        if (!this.shadow || this.shadow.stats.disabled) return false;
+        return this.shadow.pfRenderCkptIntact(sid);
+    }
+
     /** #5312: reversible single-block archive / restore (see UnifiedStore). */
     unifiedArchiveBlock(sessionId: string, blockId: string, archiveDir?: string): { ok: boolean; exportPath?: string; reason?: string; contentRowsDeleted?: number } | null {
         if (!this.shadow || this.shadow.stats.disabled) return null;
