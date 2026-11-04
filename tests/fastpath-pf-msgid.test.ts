@@ -137,11 +137,7 @@ const SYSP = { role: "system", content: "pf-test-system-prompt-bytes" };
 
 test("msgid lane off by default — legacy lanes untouched", () => {
     try {
-        // TEMP push: registry default is 100% while verification is on, so the
-        // "lane off" assertion pins the env kill-switch explicitly (REVERT the
-        // extra line together with the TEMP-ON defaults before merge).
         setMsgIdLane(false);
-        process.env[MSGID_ENV] = "0";
         makeStub(new MemPF());
         const s = mkSession("s-off");
         const { out, headers } = runTurn(s, {}, [SYSP, USR("first user bytes off-lane")]);

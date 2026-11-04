@@ -18,15 +18,12 @@ process.env.XDG_STATE_HOME = dir;
 const { featureOverrideAbsent, ROLLOUT_FEATURES } = await import("../src/rollout.js");
 const { PCK_NOTICE_ID, WM_FASTPATH_INTRO_ID, dismissedUpgradeNotices, dismissUpgradeNotice } = await import("../src/pck-notice.js");
 
-test("wm fastpath: baked plan — TEMP-ON 100% for #5576 pre-merge verification push", () => {
-    // REVERT before merge: the shipped default is { percent: 5 } (owner ruling
-    // 2026-11-02: small cohort first, web switch + intro notice alongside; a
-    // regression to 100 at merge time would ship an unreviewed trust-model
-    // change). This push temporarily forces 100 so remote CI — including the
-    // windows scenarios not reproducible locally (npm ci / install lanes) —
-    // exercises the full watermark path end-to-end.
+test("wm fastpath: baked plan stays EXPERIMENTAL grey at 5%", () => {
+    // GA flip was retracted (owner 2026-11-02): small cohort first, web
+    // switch + intro notice ship alongside. A regression to 100 would be
+    // shipping an unreviewed-by-users trust-model change.
     const plan = ROLLOUT_FEATURES["pluginFullResendWatermark"];
-    assert.equal(plan.percent, 100);
+    assert.equal(plan.percent, 5);
 });
 
 test("#5403 unit: featureOverrideAbsent — nags only users who never chose", () => {

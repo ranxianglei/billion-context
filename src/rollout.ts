@@ -63,10 +63,7 @@ export const ROLLOUT_FEATURES: Record<string, RolloutPlan> = {
     // intro notice ship alongside); force it per install with
     // `rollout.features.pluginFullResendWatermark: true|false` (or a percent)
     // / `BILI_ROLLOUT_PLUGIN_FULL_RESEND_WATERMARK=1|0`.
-    // TEMP-ON (#5576 pre-merge verification push, owner ruling 2026-11-03): 5 → 100
-    // so remote CI (incl. windows scenarios not reproducible locally) exercises
-    // the watermark path; REVERT to { percent: 5 } before merge.
-    pluginFullResendWatermark: { percent: 100 },
+    pluginFullResendWatermark: { percent: 5 },
     // #5576 v6 (owner ruling 2026-11-03): canonical-watermark lane — the hit
     // verdict comes SOLELY from unified-transcript row-chain alignment
     // (the #3482 chain discipline: fold-time id fast path, identity-sig
@@ -84,8 +81,7 @@ export const ROLLOUT_FEATURES: Record<string, RolloutPlan> = {
     // (or a percent) / `BILI_ROLLOUT_WATERMARK_CANONICAL_V6=1`. Companion
     // env `BILI_PF_V6_REWRITE_STRICT=1` credits content-rewrite misses toward
     // the breaker instead of letting them self-heal silently.
-    // TEMP-ON (#5576 pre-merge verification push): 0 → 100; REVERT to 0 before merge.
-    watermarkCanonicalV6: { percent: 100, base: "pluginFullResendWatermark" },
+    watermarkCanonicalV6: { percent: 0, base: "pluginFullResendWatermark" },
     // #5600 v6 msgid lane (owner ruling 2026-11-03): identity rides
     // server-minted pf_sids (x-bili-pf-session echo + ledger-id probe + mint),
     // NEVER client-native ids; frozen prefix cores come from the persistent
@@ -102,8 +98,7 @@ export const ROLLOUT_FEATURES: Record<string, RolloutPlan> = {
     // `BILI_ROLLOUT_WATERMARK_V6_MSG_ID=1`. Companion env
     // `BILI_PF_V6_REWRITE_STRICT=1` credits compaction-class misses toward
     // the breaker (shared with the canonical lane).
-    // TEMP-ON (#5576 pre-merge verification push): 0 → 100; REVERT to 0 before merge.
-    watermarkV6MsgId: { percent: 100, base: "pluginFullResendWatermark" },
+    watermarkV6MsgId: { percent: 0, base: "pluginFullResendWatermark" },
     // #4804 WS delta continuation: codex/opencode WebSocket clients that keep a
     // previous_response_id checkpoint stop reconstructing full history on every
     // turn — the session augments the delta with the server-committed previous
