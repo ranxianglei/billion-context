@@ -185,7 +185,7 @@ test("plugin lane: agent stamp labels the client, msgIds envelope drives the sta
     assert.ok(first.lines[0].includes("msgΔ=+3"));
     const second = runObs(store, { key: "lane-conv-1", headers: {}, agent: "dsh", msgIds: ["m2", "m3"] });
     assert.ok(second.lines[0].includes("msgΔ=+2"));
-    const rec = JSON.parse(String(store.getSessionExt("lane-conv-1", NIDV_EXT_KEY))) as { ids: { msg?: { n: number; distinct: number; stable: string } } };
+    const rec = JSON.parse(String(store.getSessionExt(`n:${digest8("lane-conv-1")}`, NIDV_EXT_KEY))) as { ids: { msg?: { n: number; distinct: number; stable: string } } };
     assert.equal(rec.ids.msg?.n, 5);
     assert.equal(rec.ids.msg?.distinct, 3);
     assert.equal(rec.ids.msg?.stable, "yes", "m2 repeated across turns = host reuses ids (retry-stable evidence)");
@@ -195,14 +195,14 @@ test("stability matrix: session repeat→yes, change→no + id_change, restart c
     const store = tmpStore();
     const base = { key: "fixed", headers: { "x-conversation-id": "conv-A" } };
     runObs(store, base);
-    let rec = JSON.parse(String(store.getSessionExt("fixed", NIDV_EXT_KEY))) as { ids: { sess?: { h: string; stable: string } } };
+    let rec = JSON.parse(String(store.getSessionExt(`n:${digest8("fixed")}`, NIDV_EXT_KEY))) as { ids: { sess?: { h: string; stable: string } } };
     assert.equal(rec.ids.sess?.stable, "unknown", "first sighting is undecided");
     runObs(store, base);
-    rec = JSON.parse(String(store.getSessionExt("fixed", NIDV_EXT_KEY))) as typeof rec;
+    rec = JSON.parse(String(store.getSessionExt(`n:${digest8("fixed")}`, NIDV_EXT_KEY))) as typeof rec;
     assert.equal(rec.ids.sess?.stable, "yes");
     const r = runObs(store, { key: "fixed", headers: { "x-conversation-id": "conv-B" } });
     assert.ok(r.lines[0].includes("id_change(sess)"));
-    rec = JSON.parse(String(store.getSessionExt("fixed", NIDV_EXT_KEY))) as typeof rec;
+    rec = JSON.parse(String(store.getSessionExt(`n:${digest8("fixed")}`, NIDV_EXT_KEY))) as typeof rec;
     assert.equal(rec.ids.sess?.stable, "no");
     assert.equal(rec.ids.sess?.h, digest8("conv-B"));
     // Restart continuity: a preloaded prior record continues seamlessly.
@@ -211,9 +211,9 @@ test("stability matrix: session repeat→yes, change→no + id_change, restart c
         v: 1, client: "wb", firstSeen: 1000, lastSeen: 2000, reqs: 5,
         ids: { sess: { h: digest8("conv-A"), stable: "unknown" as const } }, events: [],
     };
-    store2.setSessionExt("fixed", NIDV_EXT_KEY, JSON.stringify(prior));
+    store2.setSessionExt(`n:${digest8("fixed")}`, NIDV_EXT_KEY, JSON.stringify(prior));
     runObs(store2, base);
-    const cont = JSON.parse(String(store2.getSessionExt("fixed", NIDV_EXT_KEY))) as { firstSeen: number; reqs: number; ids: { sess?: { stable: string } } };
+    const cont = JSON.parse(String(store2.getSessionExt(`n:${digest8("fixed")}`, NIDV_EXT_KEY))) as { firstSeen: number; reqs: number; ids: { sess?: { stable: string } } };
     assert.equal(cont.firstSeen, 1000, "firstSeen survives the restart");
     assert.equal(cont.reqs, 6);
     assert.equal(cont.ids.sess?.stable, "yes");
@@ -224,7 +224,7 @@ test("msg stability: ≥8 all-distinct turns → no", () => {
     for (let i = 0; i < 9; i += 1) {
         runObs(store, { key: "fixed", headers: {}, agent: "dsh", msgIds: [`id-${String(i)}`] });
     }
-    const rec = JSON.parse(String(store.getSessionExt("fixed", NIDV_EXT_KEY))) as { ids: { msg?: { n: number; stable: string } } };
+    const rec = JSON.parse(String(store.getSessionExt(`n:${digest8("fixed")}`, NIDV_EXT_KEY))) as { ids: { msg?: { n: number; stable: string } } };
     assert.equal(rec.ids.msg?.n, 9);
     assert.equal(rec.ids.msg?.stable, "no");
 });
@@ -234,7 +234,7 @@ test("profile_flip event + FIFO cap + 4KB budget", () => {
     for (let i = 0; i < 40; i += 1) {
         runObs(store, { key: "fixed", headers: {}, agent: i % 2 === 0 ? "dsh" : "omp", msgIds: [`flip-${String(i)}`] });
     }
-    const raw = String(store.getSessionExt("fixed", NIDV_EXT_KEY));
+    const raw = String(store.getSessionExt(`n:${digest8("fixed")}`, NIDV_EXT_KEY));
     assert.ok(raw.length <= 4096, `ext record fits the budget (${raw.length})`);
     const rec = JSON.parse(raw) as { events: { k: string }[]; client: string };
     assert.ok(rec.events.length <= 32);

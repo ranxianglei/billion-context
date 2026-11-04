@@ -68,15 +68,18 @@ interface NidvObs {
 }
 
 export interface NativeIdInput {
-    /** Explicit record key (the plugin-lane site passes its conversationId —
-     *  the host-native conversation id). When omitted (relay site) the key is
-     *  DERIVED FROM THE PROFILE'S OWN SESSION EVIDENCE (`n:<sha1-8>`), not
-     *  bili's identity chain: pre-#5526 the chain would key WorkBuddy traffic
-     *  by the account-level x-session-id, merging every conversation of one
-     *  account into one record and corrupting the stability stats. No session
-     *  evidence ⇒ the shared "anon" bucket (coarse by design, documented).
-     *  Deliberately NOT bili's internal session id either way — forks share
-     *  the parent's client-visible key, which is what we are observing. */
+    /** Explicit record BUCKET (the plugin-lane site passes its conversationId —
+     *  the host-native conversation id). Stored DIGESTED as `n:<sha1-8>` —
+     *  the module redline is that id VALUES never persist or log in plaintext
+     *  (#5576 review M1: the raw value must not reach the ext store). When
+     *  omitted (relay site) the key is DERIVED FROM THE PROFILE'S OWN SESSION
+     *  EVIDENCE (`n:<sha1-8>`), not bili's identity chain: pre-#5526 the chain
+     *  would key WorkBuddy traffic by the account-level x-session-id, merging
+     *  every conversation of one account into one record and corrupting the
+     *  stability stats. No session evidence ⇒ the shared "anon" bucket (coarse
+     *  by design, documented). Deliberately NOT bili's internal session id
+     *  either way — forks share the parent's client-visible key, which is what
+     *  we are observing. */
     key?: string;
     headers: Record<string, string | string[] | undefined>;
     /** Decoded body bytes/text. May be omitted (then body signals are skipped). */
@@ -291,7 +294,10 @@ export function observeNativeIdentity(
     try {
         const ex = extractNativeIdentity(input);
         if (ex === null) return;
-        const recordKey = input.key ?? (ex.sessH !== undefined ? `n:${ex.sessH}` : "anon");
+        // #5576 review M1: explicit buckets are stored DIGESTED like every
+        // other key in this module — the raw host-native id value never
+        // reaches the ext store (privacy redline, module header).
+        const recordKey = input.key !== undefined ? `n:${digest8(input.key)}` : (ex.sessH !== undefined ? `n:${ex.sessH}` : "anon");
         if (recordKey.length === 0) return;
 
         const now = Date.now();

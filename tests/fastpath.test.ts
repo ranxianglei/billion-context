@@ -529,3 +529,49 @@ test("v5 R7 port: sess-change on the DEFAULT lane — swap is an event, same car
         bodyOf([SYS("s"), USR("a"), USR("b"), USR("c"), ASST("d")])).out.decision, "hit",
         "carrier appearing where none was stored must be neutral (first claim, not a change)");
 });
+
+test("v5 drift-ride lifetime cap: after 5 consecutive ride turns one UNcredited reseed forces the edit into the seed (review V1)", () => {
+    makeStubStore();
+    const session = freshSession("pf-v1-cap");
+    const b1 = bodyOf([SYS("s"), USR("a"), USR("b"), USR("c")]);
+    assert.equal(runTurn(session, {}, b1).out.decision, "no-stamp");
+    // Rewrite element #2 IN PLACE with stable host ids + an honest count:
+    // id mode demotes the byte check to a diagnostic — the STALE byte rides.
+    let msgs = [SYS("s"), USR("a"), USR("b-EDITED"), USR("c"), ASST("d")];
+    let r = runTurn(session, { [PF_COUNT_HEADER]: "4", ...TAIL(["h-c", "h-d"]) }, bodyOf(msgs));
+    assert.equal(r.out.decision, "hit", LOGS.join("\n"));
+    assert.equal(r.out.creditedMiss, false);
+    assert.equal(r.out.driftRides, 1, "the first drift turn rides and counts itself");
+    assert.equal(String((r.out.hit!.view[1] as { text?: unknown }).text ?? ""), "b", "stale stashed byte serves during the ride");
+    // The ride re-stashes its own view, so a persistent edit keeps riding —
+    // the counter climbs one per consecutive drift turn...
+    msgs = [...msgs, USR("x0")];
+    r = runTurn(session, { [PF_COUNT_HEADER]: "5", ...TAIL(["h-d", "h-x0"]) }, bodyOf(msgs));
+    assert.equal(r.out.decision, "hit", LOGS.join("\n"));
+    assert.equal(r.out.driftRides, 2);
+    msgs = [...msgs, USR("x1")];
+    r = runTurn(session, { [PF_COUNT_HEADER]: "6", ...TAIL(["h-x0", "h-x1"]) }, bodyOf(msgs));
+    assert.equal(r.out.driftRides, 3);
+    msgs = [...msgs, USR("x2")];
+    r = runTurn(session, { [PF_COUNT_HEADER]: "7", ...TAIL(["h-x1", "h-x2"]) }, bodyOf(msgs));
+    assert.equal(r.out.driftRides, 4);
+    msgs = [...msgs, USR("x3")];
+    r = runTurn(session, { [PF_COUNT_HEADER]: "8", ...TAIL(["h-x2", "h-x3"]) }, bodyOf(msgs));
+    assert.equal(r.out.decision, "hit", LOGS.join("\n"));
+    assert.equal(r.out.driftRides, 5);
+    // ...until the sixth: the cap forces ONE uncredited legacy reseed —
+    // self-heal, never breaker fuel.
+    msgs = [...msgs, USR("x4")];
+    r = runTurn(session, { [PF_COUNT_HEADER]: "9", ...TAIL(["h-x3", "h-x4"]) }, bodyOf(msgs));
+    assert.equal(r.out.decision, "v5-drift-cap", LOGS.join("\n"));
+    assert.equal(r.out.creditedMiss, false);
+    assert.equal(watermarkDebugState(session).missCount ?? 0, 0, "the cap miss is a self-heal, not breaker fuel");
+    // Reseeded from real bytes: the EDIT now rides and the head compares clean.
+    msgs = [...msgs, USR("x5")];
+    r = runTurn(session, { [PF_COUNT_HEADER]: "10", ...TAIL(["h-x4", "h-x5"]) }, bodyOf(msgs));
+    assert.equal(r.out.decision, "hit", LOGS.join("\n"));
+    assert.equal(r.out.driftRides, undefined, "fresh seed: the ride episode is over");
+    const texts = r.out.hit!.view.map((m) => String((m as { text?: unknown }).text ?? ""));
+    assert.ok(texts.includes("b-EDITED"), "the reseed carried the edited bytes");
+    assert.ok(!texts.some((t) => t === "b"), "the stale byte is gone from the view");
+});

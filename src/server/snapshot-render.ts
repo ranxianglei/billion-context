@@ -406,6 +406,12 @@ function buildView(session: Session, clientMsgs: BiliMessage[]): ViewResult {
         // accepting it renders only the ancient prefix + the one tail message
         // and silently drops everything between. Degrade instead: never guess.
         if (run < MIN_SEAM_RUN) return { ok: false, reason: "seam-too-short" };
+        // KNOWN RESIDUAL (#5632, found via #5576 review): run counts matches
+        // of EITHER class, so two consecutive SIGNATURE-ONLY hits on adjacent
+        // uncovered deep rows still pass this gate and truncate everything
+        // newer than the join (silent history loss). Narrow path — needs a
+        // byte-identical duplicate pair with fresh ids at the tail boundary.
+        // Direction: require byId corroboration for non-local sig-only runs.
     }
     const d = joinRow + 1; // prefix = rows[0..d) — everything up to the join; rows beyond (rewound-away tails) never render
     const merged = assembleView(rows, blockSeeds, coveredSeqUnion, d, clientMsgs.slice(clientJoin));

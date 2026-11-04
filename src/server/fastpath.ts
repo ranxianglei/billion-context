@@ -87,6 +87,13 @@ function clientSessDigest(req: http.IncomingMessage): string | undefined {
 export const PF_SLOT_UNKNOWN = "?";
 const HEAD_CHECK_ELEMENTS = 8;
 const PF_BREAKER_MISSES = 5;
+// #5576 review V1 (bounded ride lifetime): an in-place client edit with stable
+// host ids rides stale stashed bytes on EVERY subsequent turn — the ride
+// re-stashes its own view, so nothing downstream ever notices. After this many
+// CONSECUTIVE drift turns one uncredited legacy turn reseeds from real bytes
+// (any non-canonical miss reseeds in finalize), then rides may resume. The cap
+// also bounds the diagnostic warn stream below to one line per cap-many turns.
+const PF_V5_DRIFT_RIDE_CAP = 5;
 const PF_DISABLED_TTL_MS = 60 * 60 * 1000;
 const PF_EXT_KEY = "pf:state";
 
@@ -101,6 +108,10 @@ interface PFSavedState {
     /** #5571 v5: client-native session id digest recorded with this state
      *  (h8, never raw — privacy parity with #5571); sess-change gate input. */
     cs?: string;
+    /** #5576 review V1: consecutive id-mode drift RIDE turns (stale prefix
+     *  served under stable host ids). A clean head or a reseeding miss resets
+     *  it; exceeding PF_V5_DRIFT_RIDE_CAP forces one uncredited reseed turn. */
+    d?: number;
 }
 
 interface PFSeed {
@@ -165,6 +176,9 @@ export interface FastpathOutcome {
      *  (undefined when no known header carried a value). Persisted by
      *  finalize as state `cs`; feeds the sess-change identity gate. */
     readonly clientSess?: string;
+    /** #5576 review V1: the drift-ride count THIS hit carries (undefined on
+     *  every non-drift hit — a clean head resets the episode in finalize). */
+    readonly driftRides?: number;
     /** #5576 v6: produced on the canonical lane (hit AND miss). Finalize
      *  must NOT pin seed-stash cores for these outcomes — retaining prefix-
      *  shaped state in memory is exactly what the canonical lane removes; a
@@ -225,6 +239,7 @@ function readSaved(sessionId: string): PFSavedState | null {
                 && (o.l as unknown[]).every((x): x is string => typeof x === "string" && x.length > 0 && x.length <= 512)
                 ? (o.l as string[]) : undefined,
             cs: typeof o.cs === "string" && o.cs.length === 8 ? o.cs : undefined,
+            d: typeof o.d === "number" && Number.isInteger(o.d) && o.d >= 0 ? o.d : undefined,
         };
     } catch {
         return null;
@@ -409,6 +424,7 @@ export function evaluateWatermarkFastpath(
         // conversion itself.
         let contentDrifts = 0;
         let driftTotal = 0;
+        let driftRides: number | undefined;
         const headElements = Array.isArray((headFragment as { messages?: unknown }).messages)
             ? ((headFragment as { messages: unknown[] }).messages.filter((m): m is { role?: unknown } => typeof m === "object" && m !== null && (m as { role?: unknown }).role !== "system")).length
             : -1;
@@ -426,7 +442,16 @@ export function evaluateWatermarkFastpath(
                 }
             }
         }
-        if (contentDrifts > 0) log("warn", `[${session.id}] watermark v5: ${contentDrifts}/${driftTotal} head element(s) differ from the seed under stable host ids — riding the stashed prefix per owner ruling 2026-11-03 (diagnostic only; feeds M3 re-seeding signals)`);
+        if (contentDrifts > 0) {
+            // #5576 review V1: cap the episode — after PF_V5_DRIFT_RIDE_CAP
+            // consecutive drift turns one UNcredited legacy turn reseeds from
+            // real bytes (any non-canonical miss reseeds in finalize), then
+            // rides may resume. Self-heal by design: never breaker fuel.
+            const rides = (saved?.d ?? 0) + 1;
+            if (rides > PF_V5_DRIFT_RIDE_CAP) return miss("v5-drift-cap", false, tailIds);
+            log("warn", `[${session.id}] watermark v5: ${contentDrifts}/${driftTotal} head element(s) differ from the seed under stable host ids — riding the stashed prefix per owner ruling 2026-11-03 (diagnostic only; feeds M3 re-seeding signals; ${rides}/${PF_V5_DRIFT_RIDE_CAP} consecutive ride turns, next forces a reseed)`);
+            driftRides = rides;
+        }
         const windowRaw = openaiToCore(windowFragment as OpenAIRequestBody);
         if (windowRaw.systemText.trim() !== "") return miss("window-system-head", true, tailIds);
         const rekeyedWindow = rekeyWindowCores(windowRaw.msgs, K, seed.cores);
@@ -450,6 +475,7 @@ export function evaluateWatermarkFastpath(
             creditedMiss: false,
             receivedTailIds: tailIds,
             clientSess: nowCs,
+            driftRides,
         };
     }
     return miss(seed === undefined ? "unseeded" : "seed-stale", false);
@@ -1001,7 +1027,7 @@ function noteCreditedMiss(sessionId: string, decision: string, log: (level: stri
     const staleHold = cur.disabledAt !== undefined && Date.now() - cur.disabledAt >= PF_DISABLED_TTL_MS;
     const misses = (staleHold ? 0 : cur.misses) + 1;
     if (misses >= PF_BREAKER_MISSES) {
-        writeSaved(sessionId, { t: cur.t, m: cur.m, misses, disabledAt: Date.now(), cs: cur.cs });
+        writeSaved(sessionId, { t: cur.t, m: cur.m, misses, disabledAt: Date.now(), cs: cur.cs, d: cur.d });
         log("warn", `[${sessionId}] watermark fastpath disabled for ${Math.round(PF_DISABLED_TTL_MS / 60000)}m after ${misses} consecutive verified misses (last: ${decision}) — legacy full-parse continues`);
     } else {
         writeSaved(sessionId, { ...cur, misses, disabledAt: staleHold ? undefined : cur.disabledAt });
@@ -1137,7 +1163,9 @@ export function finalizeWatermarkTurn(
                 multimodal: outcome.hit.seedMultimodal,
             });
         }
-        writeSaved(session.id, { t: T, m: input.model, misses: 0, l: outcome.receivedTailIds, cs: outcome.clientSess ?? saved?.cs });
+        // d: the ride count THIS hit carries (0 on every non-drift hit — a
+        // clean head resets the episode).
+        writeSaved(session.id, { t: T, m: input.model, misses: 0, l: outcome.receivedTailIds, cs: outcome.clientSess ?? saved?.cs, d: outcome.driftRides ?? 0 });
         headers[PF_SEQ_HEADER] = String(T);
         return headers;
     }
@@ -1154,7 +1182,11 @@ export function finalizeWatermarkTurn(
     }
     // Held (breaker-armed) turns flow through here too and DO restamp: the
     // stamp is how a client converges on truth while the lane stays hit-less.
-    writeSaved(session.id, { t: T, m: input.model, misses: saved?.misses ?? 0, disabledAt: saved?.disabledAt, l: outcome.receivedTailIds, cs: outcome.clientSess ?? saved?.cs });
+    // d follows the SEED: a miss that reseeds from real bytes starts a fresh
+    // ride episode; misses that keep the old seed carry the counter (canonical
+    // lane outcomes never touch the v5 seed).
+    const reseeded = input.legacyCores.length > 0 && !outcome.canonical;
+    writeSaved(session.id, { t: T, m: input.model, misses: saved?.misses ?? 0, disabledAt: saved?.disabledAt, l: outcome.receivedTailIds, cs: outcome.clientSess ?? saved?.cs, d: reseeded ? 0 : (saved?.d ?? 0) });
     headers[PF_SEQ_HEADER] = String(T);
     return headers;
 }
