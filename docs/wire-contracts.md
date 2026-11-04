@@ -81,7 +81,7 @@ dialect whose frame names are its own.
 | WC-12f | `token_usage` carries the real counters in the per-request fields; every `*_total` field is always 0. | Usage maps from `prompt_tokens` / `completion_tokens` / `cache_read_input_tokens`; the `*_total` fields are never read. |
 | WC-12g | The wire has no dedicated channel for visibility markers. | Injected markers ride as prose inside an `output` frame's `response`; how they render is host-side policy. |
 | WC-12h | `output.reasoning_content` streams through the same frame type as `response` (no separate reasoning event), and `extra_info` re-delivers reasoning that already streamed. | Reasoning maps to the reasoning channel; `extra_info` is forwarded verbatim (first round) and never re-injected into the rebuilt conversation. |
-| WC-12i | Parallel tool calls in one turn: the capture only pins the single-call framing (`index: 0` on the full-envelope frame, then `arguments`-only increments carrying an empty `id`). How this wire distinguishes a SECOND call in the same turn is uncaptured. | Outbound, `emitToolCall` numbers calls by first appearance (0, 1, …) exactly as `adapter-openai` does — byte-identical to the captured shape while only one call exists, and never colliding on 0 once there are two. Inbound, a frame that reuses an occupied `index` with a DIFFERENT non-empty `id` opens a new call instead of merging into the buffered one: distinct ids are distinct calls by definition. |
+| WC-12i | Parallel tool calls in one turn. Captured 2026-11-04 (Trae Max, two `run_code` calls in one turn): the opening frame of each call carries the full envelope (`index`, `id: call_00_…` / `call_01_…`, `type: "function"`, `function_call.name`) with empty `arguments`; every argument increment carries an EMPTY `id`/`type`/`name` and only `function_call.arguments`; the frame that opens call #1 also closes call #0's arguments (two entries in one frame); every frame after that carries TWO entries of the SAME `index: 1`, i.e. the argument stream is chunked twice per frame. The turn still terminates with `extra_info` → `token_usage` → `done`, and both calls share that single terminator. | Grouping is by `index`, and `index` increases per call (0, 1) — the captured wire never reuses an index with a fresh id and never puts two calls on index 0. Outbound, `emitToolCall` numbers calls by first appearance (0, 1, …) exactly as `adapter-openai` does. Inbound, every entry of a frame is appended in order (one frame may close a call and open the next); a frame reusing an occupied `index` with a DIFFERENT non-empty `id` opens a new call instead of merging — defensive only, not something this capture shows. Pinned by `tests/fixtures/trae-2026-11-04-two-tool-calls.sse.txt`. |
 
 ### Envelope mapping (unwrap / rewrap)
 
@@ -93,10 +93,10 @@ dialect whose frame names are its own.
   at unwrap and replayed at the final forward boundary (and on every
   compress-loop re-send).
 - Verification boundary: the request/response shapes above come from a real
-  capture (#1295). The bili-side round trip is covered by unit tests; a full
-  end-to-end replay through a real Trae client (compressed conversation echoed
-  back by the IDE) has NOT been run — that needs a live seat. The single-call
-  framing is pinned; a parallel-call turn (WC-12i) is the concrete fixture that
-  replay would settle (whether this wire numbers a second call, or reuses
-  `index: 0` with a fresh `id`).
+  capture (#1295). The bili-side round trip is covered by unit tests, and both
+  the single-call framing and the parallel-call framing (WC-12i, captured
+  2026-11-04 with two `run_code` calls in one turn) are replayed from verbatim
+  frame dumps under `tests/fixtures/`. A full end-to-end replay through a real
+  Trae client (compressed conversation echoed back by the IDE) has NOT been run
+  — that needs a live seat, and it is now the only remaining check.
 
