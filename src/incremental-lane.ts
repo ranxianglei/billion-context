@@ -67,7 +67,6 @@ import { pluginAgentHeader, pluginReportedModel } from "./plugin.js";
 import { headerValue, readBody } from "./server.js";
 import { featureEnabled } from "./rollout.js";
 import { MSG_IDS_BODY_FIELD, MSG_SEQS_BODY_FIELD, applyMsgIdPin, validateMsgIds } from "./msgid-pin.js";
-import { UPSTREAM_HOP_HEADERS, connectionNamedHeaders } from "./server/headers.js";
 
 export const INCREMENTAL_TURN_PATH = "/__bili/plugin/turn";
 
@@ -706,22 +705,20 @@ export async function handleIncrementalTurn(
         }
         const bodyBuf = Buffer.from(JSON.stringify(body));
 
-        // Forward the CLIENT'S OWN end-to-end headers, not a positive allowlist:
-        // buildForwardHeaders already ships every header except host/content-length
-        // in full-resend mode, so credentials like x-api-key reach the upstream. An
-        // allowlist here silently dropped any credential outside it → the upstream
-        // saw an unauthenticated request (401) and DSH signed the account out
-        // (#5658). Hop-by-hop never crosses a proxy; x-bili-* markers mean nothing
-        // to a model endpoint and the lane re-stamps its own below.
-        const connNamed = connectionNamedHeaders(req.headers.connection);
+        // Re-enter the pipeline (forward → handleRequest → buildForwardHeaders) with a
+        // synthetic indistinguishable from the ORIGINAL client request, so egress
+        // normalization is the SAME code that serves full-resend traffic (#5658). This
+        // mirrors the marker-divert replay (handle.ts): copy the client's own headers
+        // and drop only the lane-intent marker — do NOT hand-roll a strip list, which
+        // diverges from the proven non-incremental surface and risks upstream rejection.
+        // The only extra corrections are forced by the REBUILT body: its length, and the
+        // encoding marker (an assembled turn body is always plain JSON, so any inbound
+        // content-encoding is stale). Lane identity is stamped below.
         const headers: Record<string, string> = {};
         for (const [k, v] of Object.entries(req.headers)) {
             if (v === undefined) continue;
             const lower = k.toLowerCase();
-            if (lower.startsWith("x-bili-")) continue;
-            if (UPSTREAM_HOP_HEADERS.has(lower)) continue;
-            if (connNamed.has(lower)) continue;
-            // body is rebuilt as plain JSON below — the delta POST's encoding is stale
+            if (lower === INCREMENTAL_TURN_MARKER_HEADER.toLowerCase()) continue;
             if (lower === "content-encoding") continue;
             headers[k] = Array.isArray(v) ? v.join(", ") : v;
         }

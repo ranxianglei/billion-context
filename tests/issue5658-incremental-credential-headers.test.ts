@@ -116,13 +116,17 @@ function hitHasCredential(h: UpstreamHit, name: string, value: string): boolean 
 test("#5658 direct turn: every credential header reaches the upstream, no x-bili marker leaks", async () => {
     const h = await harness();
     try {
-        const status = await h.turn(Object.fromEntries(CREDENTIALS));
+        const status = await h.turn({ ...Object.fromEntries(CREDENTIALS), "x-custom-gateway": "gw-TEST" });
         assert.equal(status, 200);
         assert.equal(h.hits.length, 1);
         const hit = h.hits[0];
         for (const [name, value] of CREDENTIALS) {
             assert.ok(hitHasCredential(hit, name, value), `credential header ${name} must reach the upstream`);
         }
+        // Full-resend parity (#5658): the lane forwards the client's OWN end-to-end
+        // headers verbatim (buildForwardHeaders downstream), never an allowlist — an
+        // arbitrary non-credential client header must ride through as well.
+        assert.ok(hitHasCredential(hit, "x-custom-gateway", "gw-TEST"), "an arbitrary client end-to-end header must reach the upstream");
         assert.equal(hit.headers["x-bili-turn-id"] ?? null, null, "lane turn-id bookkeeping must not be forwarded verbatim");
     } finally {
         await h.close();
