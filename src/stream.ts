@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { collectBlockContent, countMessageTokens, defaultCountTokens, formatRanges, formatTagTime, hideConsumedCompressCalls, indexToRef, parseBoundary, storeCoveredOriginals, viableRanges, type CompressionCore, type Config, type CompressionBlock, type CoreMessage, type CompressionState, type NudgeDecision, type CompressParseDiagnostics, refToIndex } from "acp-kernel";
+import { collectBlockContent, countMessageTokens, defaultCountTokens, formatRanges, formatTagTime, hideConsumedCompressCalls, indexToRef, parseBoundary, storeCoveredOriginals, viableRanges, type CompressionCore, type Config, type CompressionBlock, type CompressibleRange, type CoreMessage, type CompressionState, type NudgeDecision, type CompressParseDiagnostics, refToIndex } from "acp-kernel";
 import { loadConfigFile, resolveMessageTimestamps } from "./config.js";
 import { excludeDeadRefRanges, handleAcpStatus, liveCompressionRanges } from "./acp-status.js";
 import { handleAcpCache, prefixTokensBeforeRef, recordCacheFoldsFromBlocks } from "./cache-ledger.js";
@@ -19,6 +19,7 @@ import { attachSubagentSessions, subagentSessionNote, subagentSessionsOf, syncSu
 import { METADATA_DRIFT_ESCALATED } from "./fold-reconcile.js";
 import { safePrefix, safeSuffix, scrubLoneSurrogates } from "./text-safe.js";
 import { applyConfiguredCompression } from "./external-summary-compress.js";
+import { unpromptedGateOf } from "./unprompted-gate.js";
 import { describeUncoveredRuns, shortTokenCount, uncoveredHistoryRuns } from "./uncovered.js";
 
 export type RewriteCtx = {
@@ -947,11 +948,107 @@ export function supersededRefRejection<T extends { startRef: string; endRef: str
     return out;
 }
 
+// #5683: out-of-bounds gate helpers. The recommendation set a compress call may
+// cover is judged by COVERAGE over message-ref indices: every index of a
+// submitted range must be either already folded into an active block (refolds
+// update an existing summary in place — those refs never sit in fresh
+// recommendation lists, so excluding them would break summary refinement) or
+// inside a currently-recommended interval.
+
+function mergeIntervals(intervals: Array<[number, number]>): Array<[number, number]> {
+    if (intervals.length === 0) return [];
+    const sorted = intervals.slice().sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+    const out: Array<[number, number]> = [sorted[0]];
+    for (let i = 1; i < sorted.length; i++) {
+        const last = out[out.length - 1];
+        if (sorted[i][0] <= last[1] + 1) last[1] = Math.max(last[1], sorted[i][1]);
+        else out.push(sorted[i]);
+    }
+    return out;
+}
+
+/** The recommended intervals for THIS call: this request's prepare-time offer
+ *  when present (the exact list the nudge text / acp_status showed), else a
+ *  live recompute (plugin-lane ctxs carry no prepare snapshot). Same filters as
+ *  the advertised surfaces: viable + dead-ref exclusion + minCompressRange. */
+function recommendedIntervals(ctx: RewriteCtx): Array<[number, number]> {
+    let ranges: CompressibleRange[] | undefined;
+    if (ctx.lastNudge) {
+        ranges = excludeDeadRefRanges(viableRanges(ctx.lastNudge.compressibleRanges ?? []), ctx.session.state.deadRefs);
+    } else {
+        ranges = liveCompressionRanges(ctx)?.ranges;
+    }
+    const minChars = ctx.config.compress.minCompressRange;
+    const out: Array<[number, number]> = [];
+    for (const r of ranges ?? []) {
+        if (minChars > 0 && (r.chars ?? r.tokens * 4) < minChars) continue;
+        const s = refToIndex(r.startRef);
+        const e = refToIndex(r.endRef);
+        if (s !== null && e !== null && s <= e) out.push([s, e]);
+    }
+    return mergeIntervals(out);
+}
+
+/** Ref-index runs covered by ACTIVE blocks — the refold carve-out set. */
+function coveredRefRuns(state: CompressionState): Array<[number, number]> {
+    const byRaw = state.messageRefs?.byRaw ?? {};
+    const nums = new Set<number>();
+    for (const block of state.blocks) {
+        if (!block.active) continue;
+        for (const raw of block.effectiveMessageIds) {
+            const ref = byRaw[raw];
+            if (!ref) continue;
+            const n = refToIndex(ref);
+            if (n !== null) nums.add(n);
+        }
+    }
+    const sorted = [...nums].sort((a, b) => a - b);
+    const runs: Array<[number, number]> = [];
+    for (const n of sorted) {
+        const last = runs[runs.length - 1];
+        if (last && n === last[1] + 1) last[1] = n;
+        else runs.push([n, n]);
+    }
+    return runs;
+}
+
+/** Submitted ranges whose LIVE portion escapes the recommendation set. Empty
+ *  array = every span stays within bounds (or is a pure refold). Unresolvable
+ *  refs are skipped — the downstream gates own those receipts. */
+function outOfRecommendedRanges(ranges: ParsedRange[], ctx: RewriteCtx): string[] {
+    const exempt = mergeIntervals([...recommendedIntervals(ctx), ...coveredRefRuns(ctx.session.state)]);
+    const offending: string[] = [];
+    for (const range of ranges) {
+        const s = refToIndex(range.startRef);
+        const e = refToIndex(range.endRef);
+        if (s === null || e === null || s > e) continue;
+        let pos = s;
+        let within = false;
+        for (const [a, b] of exempt) {
+            if (b < pos) continue;
+            if (a > pos) break;
+            pos = Math.max(pos, b) + 1;
+            if (pos > e) { within = true; break; }
+        }
+        if (!within) offending.push(`${range.startRef}–${range.endRef}`);
+    }
+    return offending;
+}
+
 export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: RewriteCtx, opts?: { loopTracking?: boolean }): ProxyToolResult {
     // #2146: preflight overflow-compress is bili's OWN internal lane — its
     // failures have separate reporting (noteSkip) and must not arm the
     // model-facing circuit breaker on attempts the model never made.
     const trackLoop = opts?.loopTracking !== false;
+    // #5683: unprompted-compression policy gate (timing). Model-initiated calls
+    // only — bili's own overflow backstop folds ride loopTracking:false above
+    // and never reach this check, so availability is unaffected even when the
+    // nudge channel itself is suppressed.
+    const gate = trackLoop ? unpromptedGateOf(ctx.session) : undefined;
+    if (gate?.requireNudge && !gate.armed) {
+        ctx.log("[acp-proxy: refused unprompted compress — no nudge was injected this turn (compress.requireNudge)]");
+        return compressResult("[Compression REFUSED: unprompted compression is disabled on this route (compress.requireNudge) — you may only call compress in a round where a compression nudge was actually injected, and no nudge accompanied this round. Continue the task without folding; when a nudge appears, follow its ranges.]", "refused", 0, "unprompted");
+    }
     let { ranges, diagnostics } = parsed;
     if (ranges.length === 0) {
         ctx.log("[acp-proxy: compress call had no valid ranges; nothing compressed.]");
@@ -1046,6 +1143,17 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
     if (supersededRes.translated > 0) {
         ranges = supersededRes.translatedRanges;
         ctx.log(`[acp-proxy: translated ${supersededRes.translated} superseded ref(s) onto current labels (identity-preserving, #4797): ${ranges.map((r) => `${r.startRef}–${r.endRef}`).join(", ")}]`);
+    }
+    // #5683: out-of-bounds policy gate (scope). Runs only on live, normalized
+    // refs (post-#1001 order fix + post-#4316 superseded translation), so the
+    // coverage judgment compares like-for-like against the advertised set.
+    if (gate?.requireRecommendation) {
+        const offending = outOfRecommendedRanges(ranges, ctx);
+        if (offending.length > 0) {
+            const listed = offending.slice(0, 3).join(", ") + (offending.length > 3 ? ` (+${offending.length - 3} more)` : "");
+            ctx.log(`[acp-proxy: refused out-of-recommendation compress — span(s) ${listed} outside the current recommendation set (compress.requireRecommendation)]`);
+            return compressResult(`[Compression REFUSED: out-of-bounds compression is disabled on this route (compress.requireRecommendation) — span(s) ${listed} contain content bili does not currently recommend folding. Call acp_status for the current compressible ranges and stay within them: subdividing a listed span into smaller chunks is fine, and re-folding an already-compressed block to update its summary is fine.]`, "refused", 0, "out-of-recommendation");
+        }
     } else {
         ranges = supersededRes.translatedRanges;
     }
