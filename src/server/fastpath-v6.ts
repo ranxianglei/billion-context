@@ -601,7 +601,13 @@ export function evaluateWatermarkV6(
         // echoed sid the plane never heard of = fabrication/loopback =
         // consistency break (a forged echo is exactly how mis-attribution
         // starts — the same discipline that voids partial id claims, #2821).
-        const knows = store.pfLatestGeom(echo) !== null || (store.pfMeta(echo)?.log.length ?? 0) > 0 || worlds.has(echo);
+        const mEcho = store.pfMeta(echo);
+        // A compacted world keeps its state in the ckpt with an EMPTY log —
+        // the ckpt row itself is plane knowledge (P8: a world is immortal
+        // until session deletion, which removes all three tables), so it
+        // must count as "known" or every post-restart echo of a compacted
+        // world fault-loops into a park cycle.
+        const knows = (mEcho?.log.length ?? 0) > 0 || mEcho?.ckpt !== null || worlds.has(echo);
         if (!knows) {
             const d = `echo references unknown pf_sid ${echo}`;
             recordFault(store, session.id, d, log);

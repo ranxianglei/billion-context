@@ -478,3 +478,26 @@ test("§8-22 real store deletion cascades every registered world (in-TX registry
         assert.equal(h.store.pfLatestGeom(sidB), null);
     } finally { h.cleanup(); }
 });
+test("restart after compaction: a compacted world echoes cleanly off its ckpt (no fault storm, no re-arm)", () => {
+    const h = makeH("ckok");
+    try {
+        const log = makeLog();
+        const b1 = makeBody([{ role: "system", content: SYS }, { role: "user", content: "u1" }]);
+        const r1 = turn("s-co", "car-co", b1, ["c0", "c1"], log);
+        assert.equal(r1.outcome.decision, "arm");
+        const sid = r1.sid!;
+        const m = h.store.pfMeta(sid);
+        assert.ok(m !== null && m.log.length > 0 && m.ckpt === null);
+        // fold into a ckpt (log goes EMPTY), then drop every mirror — the
+        // process-restart shape: the ckpt row is now the world's only state
+        h.store.pfCompact(sid, { metaJson: JSON.stringify({ v: 1, t: 2, maxPos: 1 }), nextLsSeq: m.log[m.log.length - 1].lsSeq });
+        clearWatermarkV6("s-co");
+        const b2 = makeBody([
+            { role: "system", content: SYS }, { role: "user", content: "u1" },
+            { role: "assistant", content: "a1" }, { role: "user", content: "u2" },
+        ]);
+        const r2 = turn("s-co", "car-co", b2, ["c0", "c1", "c2", "c3"], log, sid);
+        assert.equal(r2.outcome.decision, "hit", `compacted world must hydrate off the ckpt, log=${JSON.stringify(log.lines.slice(-4))}`);
+        assert.equal(r2.headers[PF_SESSION_HEADER], sid, "the SAME world continues — no re-arm, no fault");
+    } finally { h.cleanup(); }
+});
