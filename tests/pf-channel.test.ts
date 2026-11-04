@@ -30,17 +30,20 @@ test("pf-channel: count mode; tail-ids ride only a validated list; encoding", ()
     // count-only until ids are captured
     assert.deepEqual(pfChannel.pfRequestHeaders(inH), { "x-bili-pf-count": "2" });
     pfChannel.pfCaptureIds(sid, ["a", "b", "c"]);
-    // K=2 ⇒ [id(K-1)] + new = ["b","c"]; per-segment encode
-    assert.equal(pfChannel.pfRequestHeaders(inH)["x-bili-pf-tail-ids"], "b,c");
-    // comma inside an id travels %2C; the separator stays literal (K=1 ⇒ whole list sent)
+    // #5643 full-list wire form: EVERY captured id rides (one segment per
+    // body element) — the server judges by set difference, so no window math
+    // happens client-side anymore
+    assert.deepEqual(pfChannel.pfRequestHeaders(inH), { "x-bili-pf-count": "2", "x-bili-pf-tail-ids": "a,b,c" });
+    // comma inside an id travels %2C; the separator stays literal
     learn(inH, "1");
     pfChannel.pfCaptureIds(sid, ["pre,v1", "new,id"]);
     assert.equal(pfChannel.pfRequestHeaders(inH)["x-bili-pf-tail-ids"], encodeURIComponent("pre,v1") + "," + encodeURIComponent("new,id"));
-    // a list shorter than K degrades to count-only (never partial)
+    // a short list STILL emits in full (honest presence beats old partial-slice
+    // degradation; the server's hard gate handles geometry, not the client)
     const sidShort = "sid-count-short";
     learn({ [CONVO]: sidShort }, "2");
     pfChannel.pfCaptureIds(sidShort, ["x"]);
-    assert.deepEqual(pfChannel.pfRequestHeaders({ [CONVO]: sidShort }), { "x-bili-pf-count": "2" });
+    assert.deepEqual(pfChannel.pfRequestHeaders({ [CONVO]: sidShort }), { "x-bili-pf-count": "2", "x-bili-pf-tail-ids": "x" });
 });
 
 test("pf-channel: failed whole-resolution CLEARS the stored list (no stale slice)", () => {
@@ -48,8 +51,8 @@ test("pf-channel: failed whole-resolution CLEARS the stored list (no stale slice
     const inH = { [CONVO]: sid };
     learn(inH, "2");
     pfChannel.pfCaptureIds(sid, ["a", "b"]);
-    assert.equal(pfChannel.pfRequestHeaders(inH)["x-bili-pf-tail-ids"], "b");
-    for (const bad of [null, undefined, "not-an-array", [], 42, Array.from({ length: 2049 }, (_, i) => `m${i}`)]) {
+    assert.deepEqual(pfChannel.pfRequestHeaders(inH), { "x-bili-pf-count": "2", "x-bili-pf-tail-ids": "a,b" });
+    for (const bad of [null, undefined, "not-an-array", [], 42, Array.from({ length: 16_385 }, (_, i) => `m${i}`)]) {
         pfChannel.pfCaptureIds(sid, bad);
         assert.deepEqual(pfChannel.pfRequestHeaders(inH), { "x-bili-pf-count": "2" }, `bad=${String(bad)} must clear`);
     }
@@ -58,14 +61,14 @@ test("pf-channel: failed whole-resolution CLEARS the stored list (no stale slice
 test("pf-channel: bad SLOTS ride '?' — one id-less element never poisons the list (owner 2026-11-02)", () => {
     const sid = "sid-slots-1";
     const inH = { [CONVO]: sid };
-    learn(inH, "2"); // K=2 ⇒ this turn's wire carries slots[1..]
+    learn(inH, "2"); // stamp known; the FULL list rides regardless of position
     for (const row of [
-        [["ok", 7], "%3F"],
-        [["ok", ""], "%3F"],
-        [["acp_summary_x", "y"], "y"],
-        [["a b", "c"], "c"],
-        [["c", "c"], "%3F"], // duplicate real id collapses its repeat to unknown
-        [["z".repeat(513), "w"], "w"],
+        [["ok", 7], "ok,%3F"],
+        [["ok", ""], "ok,%3F"],
+        [["acp_summary_x", "y"], "%3F,y"],
+        [["a b", "c"], "%3F,c"],
+        [["c", "c"], "c,%3F"], // duplicate real id collapses its repeat to unknown
+        [["z".repeat(513), "w"], "%3F,w"],
     ] as const) {
         pfChannel.pfCaptureIds(sid, [...row[0]]);
         assert.equal(pfChannel.pfRequestHeaders(inH)["x-bili-pf-tail-ids"], row[1], `slots=${JSON.stringify(row[0])}`);
@@ -137,7 +140,7 @@ test("chokepoint: routed model request carries count+tail-ids; the response lear
         assert.equal(sinkIn[0].headers["x-bili-pf-count"], undefined, "turn 1 unseeded");
     });
     assert.equal(sink[1].headers["x-bili-pf-count"], "2");
-    assert.equal(sink[1].headers["x-bili-pf-tail-ids"], "m2,m3");
+    assert.equal(sink[1].headers["x-bili-pf-tail-ids"], "m1,m2,m3");
     // the chokepoint fabricates no lane identity of its own
     assert.ok(!("x-bili-plugin" in sink[1].headers), "chokepoint must not add a lane plugin header");
 });
@@ -162,7 +165,7 @@ test("chokepoint: direct-to-proxy self-branch emits and learns (dsh profile shap
         assert.equal(sinkIn[0].headers["x-bili-pf-count"], undefined, "turn 1 unseeded on the self branch too");
     });
     assert.equal(sink[1].headers["x-bili-pf-count"], "4");
-    assert.equal(sink[1].headers["x-bili-pf-tail-ids"], "n4,n5");
+    assert.equal(sink[1].headers["x-bili-pf-tail-ids"], "n1,n2,n3,n4,n5");
 });
 
 test("chokepoint: already-routed /bili/ MODEL url is stamped; __bili/ control-plane never is", async () => {
@@ -185,7 +188,7 @@ test("chokepoint: already-routed /bili/ MODEL url is stamped; __bili/ control-pl
     }, { headersFor: () => ({ "x-bili-plugin": "dsh" }) });
     assert.equal(sink.length, 2);
     assert.equal(sink[0].headers["x-bili-pf-count"], "4");
-    assert.equal(sink[0].headers["x-bili-pf-tail-ids"], "d,e");
+    assert.equal(sink[0].headers["x-bili-pf-tail-ids"], "a,b,c,d,e");
     assert.equal(sink[1].headers["x-bili-pf-count"], undefined);
     assert.equal(sink[1].headers["x-bili-pf-tail-ids"], undefined);
     assert.ok(!sink[1].url.includes("/bili/"), "control plane must not be re-routed");

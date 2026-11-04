@@ -14,10 +14,15 @@
 //   - emit:        one pfRequestHeaders() merge in native-intercept at the
 //                  routed-send site (count + tail-ids alike).
 //
-// Wire form: x-bili-pf-count = last-seen total T (pure count mode);
-// x-bili-pf-tail-ids = percent-encoded "[id(K-1)] + new element ids" joined
-// with LITERAL commas (commas INSIDE ids travel %2C — unambiguous). A captured
-// list missing or shorter than K degrades to count-only: never partial.
+// Wire form (v6, #5643): x-bili-pf-tail-ids = percent-encoded FULL element
+// id list — one entry per body element, body order, LITERAL commas between
+// segments (commas INSIDE ids travel %2C — unambiguous). The server
+// reconciles it against its structural scan (|R| == T, all real ids) and
+// judges NEW by set difference alone. x-bili-pf-count still carries the
+// LAST-STAMPED total from earlier responses (v5 lanes read it; v6 ignores
+// it). x-bili-pf-session echoes the server-minted world id once learned.
+// A captured list that resolves NO ids degrades to absent: better nothing
+// than a partial list onto the wire.
 //
 // Owner ruling 2026-11-02 (m02989): hosts compress and REWRITE their histories,
 // so all-or-nothing alignment proofs against the wire fight reality and kill
@@ -33,6 +38,9 @@ const COUNT_HEADER = "x-bili-pf-count";
 const TAIL_IDS_HEADER = "x-bili-pf-tail-ids";
 const CONVERSATION_HEADER = "x-bili-plugin-conversation";
 const SEQ_HEADER = "x-bili-pf-seq";
+// #5643: the v6 world echo header the server mints (pf_<hex12>).
+const PF_SESSION_HEADER = "x-bili-pf-session";
+const PF_SID_RE = /^pf_[0-9a-f]{12}$/u;
 export const PF_SLOT_UNKNOWN = "?";
 
 const MAX_ID_LEN = 512;
@@ -41,10 +49,13 @@ const RESERVED_PREFIX = "acp_summary_";
 // the incremental-lane adapters; keep them in sync (a bad id degrades the WHOLE
 // list to absent, never a partial list onto the wire).
 const BAD_ID_CHARS = /[\s\p{C}]/u;
-const MAX_IDS = 2048; // long-conversation ceiling; the sliced head stays small
+// #5643: v6 sends the FULL list — long-hostory ceilings apply to whole bodies
+// now, not just the tail window. 16k elements (~8 MB worst-case id payload,
+// typically far less) covers the multi-MiB #5403 conversations in full.
+const MAX_IDS = 16_384;
 const MAX_TRACKED = 1024; // sid table cap (same hygiene as the old per-lane maps)
 
-type Tracked = { t?: number; ids?: string[] };
+type Tracked = { t?: number; ids?: string[]; /** #5643: minted pf_sid echoed back by a v6-enabled server. */ v6?: string };
 
 const tracked = new Map<string, Tracked>();
 
@@ -66,11 +77,16 @@ export function pfLearnStamp(headersIn: Record<string, string>, respStatus: numb
     if (respStatus !== 200) return;
     const sid = headersIn[CONVERSATION_HEADER];
     if (sid === undefined || sid.length === 0 || respHeaders === null || respHeaders === undefined) return;
+    const slot = takeSlot(sid);
     const raw = respHeaders.get(SEQ_HEADER);
-    if (raw === null || !/^\d+$/.test(raw)) return;
-    const t = Number(raw);
-    if (!Number.isSafeInteger(t)) return;
-    takeSlot(sid).t = t;
+    if (raw !== null && /^\d+$/.test(raw)) {
+        const t = Number(raw);
+        if (Number.isSafeInteger(t)) slot.t = t;
+    }
+    // #5643: remember the minted world id once the server hands one over;
+    // every later request echoes it (matching rule ①, O(1) + spot-checked).
+    const rawSid = respHeaders.get(PF_SESSION_HEADER);
+    if (rawSid !== null && PF_SID_RE.test(rawSid)) slot.v6 = rawSid;
 }
 
 /** Thin capture adapter contract (called ONCE PER outbound model request,
@@ -111,18 +127,26 @@ export function pfCaptureIds(sid: string, ids: unknown): void {
 
 /** Chokepoint emit (native-intercept routed-send site): the handshake headers
  *  this request should carry, given its outgoing header record (source of the
- *  conversation id). {} whenever the session never saw a stamp yet. */
+ *  conversation id). {} whenever nothing pf-related is known for this sid.
+ *
+ *  #5643 wire form: the FULL captured id list rides on every request (one
+ *  segment per body element, body order) — the server reconciles it against
+ *  its scan and judges purely by set difference, so no window math happens
+ *  here anymore. The count claim keeps its old meaning (last-stamped total,
+ *  emitted only once known) for v5 lanes and for count-only clients; v6
+ *  servers ignore it. Cold start: turn ONE carries the full list WITHOUT a
+ *  count — v6 uses that very turn as its legal arm entrance (register pos
+ *  0..T-1) while v5-only servers fall through to the legacy full-parse path
+ *  (they require the count to engage at all). */
 export function pfRequestHeaders(incoming: Record<string, string>): Record<string, string> {
     const sid = incoming[CONVERSATION_HEADER];
     if (sid === undefined || sid.length === 0) return {};
     const slot = tracked.get(sid);
-    if (slot === undefined || slot.t === undefined) return {};
-    const k = slot.t;
-    if (k < 1) return {};
-    const out: Record<string, string> = { [COUNT_HEADER]: String(k) };
+    if (slot === undefined) return {};
+    const out: Record<string, string> = {};
+    if (slot.t !== undefined && slot.t >= 1) out[COUNT_HEADER] = String(slot.t);
     const ids = slot.ids;
-    if (ids !== undefined && ids.length >= k) {
-        out[TAIL_IDS_HEADER] = ids.slice(k - 1).map(encodeURIComponent).join(",");
-    }
+    if (ids !== undefined && ids.length >= 1) out[TAIL_IDS_HEADER] = ids.map(encodeURIComponent).join(",");
+    if (slot.v6 !== undefined) out[PF_SESSION_HEADER] = slot.v6;
     return out;
 }
