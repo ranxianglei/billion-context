@@ -47,7 +47,12 @@ const SLOW_MS = 1500;
 // (every recorded starvation instance was windows-latest — node22+24, multiple
 // shards, #3665/#4347 era — ubuntu never showed the signature), keeping the
 // tight 10s gate everywhere else so a genuine teardown hang still fails fast.
-const ABORT_TEARDOWN_BUDGET_MS = process.platform === "win32" ? 20000 : 10000;
+// Flaked once more at 20s (ci-fixes c37293b6, run 41776902208, 2026-11-04:
+// openai-sse closed=0 after the full poll, duration 20518ms; anthropic/
+// responses/json siblings 131–410ms in the same run; master main CI green
+// 40min earlier at 23a826d3 — same load-starvation draw, not a regression).
+// Doubled again to 40s on win32 only; the 10s gate stays everywhere else.
+const ABORT_TEARDOWN_BUDGET_MS = process.platform === "win32" ? 40000 : 10000;
 
 async function awaitUpstreamTeardown(socketsClosed: () => number): Promise<void> {
     const deadline = Date.now() + ABORT_TEARDOWN_BUDGET_MS;
