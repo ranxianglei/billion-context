@@ -326,14 +326,13 @@ test("P4 conservative layout + §8-13 breaker via soft misses: mid-body system r
     } finally { h.cleanup(); }
 });
 
-test("§8-14 capacity cap: lists beyond the wire cap refuse loudly (format-class fault, counted)", () => {
+test("§8-14 capacity cap: over-window lists refuse loudly (F1 format-class fault, counted)", () => {
     const h = makeH("cap");
     try {
         const log = makeLog();
-        const body = makeBody([{ role: "system", content: SYS }]); // T=1 makes the mismatch trivial to trigger…
-        void body;
-        // …but the CAP itself fires earlier, inside strict screening: T elements of body
-        // vs a list longer than WIRE_MAX_IDS regardless of geometry.
+        // F1: the strict decoder refuses ANY list longer than PF_TAIL_WINDOW
+        // (64) segments before geometry reasoning — an adversarial 16k-segment
+        // list hits that boundary immediately and lands in the breaker.
         const many = Array.from({ length: 16_385 }, (_, i) => `cap${i}`);
         const b1 = makeBody([{ role: "system", content: SYS }]);
         const req = {

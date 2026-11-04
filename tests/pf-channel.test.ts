@@ -30,9 +30,8 @@ test("pf-channel: count mode; tail-ids ride only a validated list; encoding", ()
     // count-only until ids are captured
     assert.deepEqual(pfChannel.pfRequestHeaders(inH), { "x-bili-pf-count": "2" });
     pfChannel.pfCaptureIds(sid, ["a", "b", "c"]);
-    // #5643 full-list wire form: EVERY captured id rides (one segment per
-    // body element) — the server judges by set difference, so no window math
-    // happens client-side anymore
+    // #5643 F1 wire form: lists at or under the tail window ride IN FULL
+    // (one segment per body element) — only long lists are windowed
     assert.deepEqual(pfChannel.pfRequestHeaders(inH), { "x-bili-pf-count": "2", "x-bili-pf-tail-ids": "a,b,c" });
     // comma inside an id travels %2C; the separator stays literal
     learn(inH, "1");
@@ -44,6 +43,17 @@ test("pf-channel: count mode; tail-ids ride only a validated list; encoding", ()
     learn({ [CONVO]: sidShort }, "2");
     pfChannel.pfCaptureIds(sidShort, ["x"]);
     assert.deepEqual(pfChannel.pfRequestHeaders({ [CONVO]: sidShort }), { "x-bili-pf-count": "2", "x-bili-pf-tail-ids": "x" });
+});
+
+test("pf-channel: long captured lists emit ONLY the fixed tail window (#5643 F1)", () => {
+    const sid = "sid-window-1";
+    learn({ [CONVO]: sid }, "99");
+    const many = Array.from({ length: 100 }, (_, i) => `id${i}`);
+    pfChannel.pfCaptureIds(sid, many);
+    const hdr = pfChannel.pfRequestHeaders({ [CONVO]: sid })["x-bili-pf-tail-ids"]!;
+    const segs = decodeURIComponent(hdr).split(",");
+    assert.equal(segs.length, 64, "exactly the last PF_TAIL_WINDOW slots ride, regardless of list length");
+    assert.deepEqual(segs, many.slice(-64), "the window is the TAIL of the captured list (order preserved)");
 });
 
 test("pf-channel: failed whole-resolution CLEARS the stored list (no stale slice)", () => {

@@ -14,13 +14,17 @@
 //   - emit:        one pfRequestHeaders() merge in native-intercept at the
 //                  routed-send site (count + tail-ids alike).
 //
-// Wire form (v6, #5643): x-bili-pf-tail-ids = percent-encoded FULL element
-// id list — one entry per body element, body order, LITERAL commas between
-// segments (commas INSIDE ids travel %2C — unambiguous). The server
-// reconciles it against its structural scan (|R| == T, all real ids) and
-// judges NEW by set difference alone. x-bili-pf-count still carries the
-// LAST-STAMPED total from earlier responses (v5 lanes read it; v6 ignores
-// it). x-bili-pf-session echoes the server-minted world id once learned.
+// Wire form (v6, #5643, F1 revision per the PR #5652 owner review
+// 2026-11-04): x-bili-pf-tail-ids = percent-encoded FIXED TAIL WINDOW — only
+// the LAST PF_TAIL_WINDOW captured element ids (body order), literal commas
+// between segments (commas INSIDE ids travel %2C — unambiguous). Header
+// bytes are bounded by construction, so stock Node maxHeaderSize needs no
+// tuning; over-window lists get a loud server reject. HONEST BOUNDARY:
+// judgement covers the tail window plus the ledger chain — prefix content
+// older than the window that a host rewrites is not promised detectable (it
+// rides the forward-append view). x-bili-pf-count RETIRES from the v6 world
+// (the v6 lane never reads it) but stays emitted for v5 lanes, whose count
+// logic is untouched. x-bili-pf-session echoes the server-minted world id.
 // A captured list that resolves NO ids degrades to absent: better nothing
 // than a partial list onto the wire.
 //
@@ -49,10 +53,14 @@ const RESERVED_PREFIX = "acp_summary_";
 // the incremental-lane adapters; keep them in sync (a bad id degrades the WHOLE
 // list to absent, never a partial list onto the wire).
 const BAD_ID_CHARS = /[\s\p{C}]/u;
-// #5643: v6 sends the FULL list — long-hostory ceilings apply to whole bodies
-// now, not just the tail window. 16k elements (~8 MB worst-case id payload,
-// typically far less) covers the multi-MiB #5403 conversations in full.
+// #5643: per-element CAPTURE ceiling (host message arrays can be long even
+// though the wire only ever sends the tail window below).
 const MAX_IDS = 16_384;
+/** F1 (owner ruling in the PR #5652 review, 2026-11-04): fixed TAIL-WINDOW
+ *  size for x-bili-pf-tail-ids — emit ONLY the last N captured ids. Mirror
+ *  of src/server/fastpath-v6.ts PF_TAIL_WINDOW (server expects exactly
+ *  min(N, T); the byte-budget derivation lives with that constant). */
+const PF_TAIL_WINDOW = 64;
 const MAX_TRACKED = 1024; // sid table cap (same hygiene as the old per-lane maps)
 
 type Tracked = { t?: number; ids?: string[]; /** #5643: minted pf_sid echoed back by a v6-enabled server. */ v6?: string };
@@ -129,15 +137,17 @@ export function pfCaptureIds(sid: string, ids: unknown): void {
  *  this request should carry, given its outgoing header record (source of the
  *  conversation id). {} whenever nothing pf-related is known for this sid.
  *
- *  #5643 wire form: the FULL captured id list rides on every request (one
- *  segment per body element, body order) — the server reconciles it against
- *  its scan and judges purely by set difference, so no window math happens
- *  here anymore. The count claim keeps its old meaning (last-stamped total,
- *  emitted only once known) for v5 lanes and for count-only clients; v6
- *  servers ignore it. Cold start: turn ONE carries the full list WITHOUT a
- *  count — v6 uses that very turn as its legal arm entrance (register pos
- *  0..T-1) while v5-only servers fall through to the legacy full-parse path
- *  (they require the count to engage at all). */
+ *  #5643 + F1 wire form: ONLY the last PF_TAIL_WINDOW captured ids ride on
+ *  every request (body order) — the server reconciles width against
+ *  min(window, scanned geometry) and judges purely by set difference over
+ *  window ∪ ledger; anything older rides the ledger chain (honest boundary
+ *  for out-of-window prefix rewrites). The count claim keeps its old meaning
+ *  (last-stamped total, emitted only once known) for v5 lanes and
+ *  count-only clients; v6 servers ignore it. Cold start: turn ONE carries
+ *  the tail list WITHOUT a count — v6 uses that very turn as its legal arm
+ *  entrance (register pos 0..T-1, identities ledgred only where carried)
+ *  while v5-only servers fall through to the legacy full-parse path (they
+ *  require the count to engage at all). */
 export function pfRequestHeaders(incoming: Record<string, string>): Record<string, string> {
     const sid = incoming[CONVERSATION_HEADER];
     if (sid === undefined || sid.length === 0) return {};
@@ -146,7 +156,10 @@ export function pfRequestHeaders(incoming: Record<string, string>): Record<strin
     const out: Record<string, string> = {};
     if (slot.t !== undefined && slot.t >= 1) out[COUNT_HEADER] = String(slot.t);
     const ids = slot.ids;
-    if (ids !== undefined && ids.length >= 1) out[TAIL_IDS_HEADER] = ids.map(encodeURIComponent).join(",");
+    if (ids !== undefined && ids.length >= 1) {
+        const win = ids.slice(-PF_TAIL_WINDOW); // F1: fixed tail window — bounded header bytes
+        out[TAIL_IDS_HEADER] = win.map(encodeURIComponent).join(",");
+    }
     if (slot.v6 !== undefined) out[PF_SESSION_HEADER] = slot.v6;
     return out;
 }

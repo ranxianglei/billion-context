@@ -30,16 +30,30 @@
 //     may only appear in warn-level diagnostics.
 //
 //  Client compaction (B version, owner ruling 2026-11-04): when the dual
-//  channels reconcile (complete, |R| == scanned geometry, members sound)
-//  compaction is IGNORED entirely — NEW elements are registered and
-//  converted wherever they sit in the body; a compaction summary arriving
-//  as an ordinary element is admitted with ZERO special treatment. The view
-//  keeps growing forward; the token bill does not follow the client's
-//  /compact down (explicitly accepted trade).
+//  channels reconcile (complete, width sound, members sound) compaction is
+//  IGNORED entirely — NEW elements are registered and converted wherever
+//  they sit in the body; a compaction summary arriving as an ordinary
+//  element is admitted with ZERO special treatment. The view keeps growing
+//  forward; the token bill does not follow the client's /compact down
+//  (explicitly accepted trade).
+//
+//  Wire form = FIXED TAIL WINDOW (F1, owner ruling in the #5652 review,
+//  2026-11-04): x-bili-pf-tail-ids carries only the LAST PF_TAIL_WINDOW
+//  element ids (body order), never the full history — header bytes stay
+//  bounded by construction, so stock Node maxHeaderSize needs no tuning
+//  and the old "list grows with history" 431 class cannot exist.
+//  HONEST COVERAGE BOUNDARY (contract §3): judgement covers exactly the
+//  tail-window identities plus the ledger chain. Prefix content older than
+//  the window that the client rewrote/compacted away is NOT promised
+//  detectable — same known boundary tier as "mid-history change at stable
+//  total"; it rides the forward-append view (P3) instead of being faked.
+//  x-bili-pf-count RETIRES from this lane (v6 never reads it); v5 lanes
+//  keep their count logic untouched — two worlds, no cross-contamination.
 //
 //  Identity hard gate (§3.2): lane entry requires BOTH channels complete and
-//  sound — a request-level carrier id AND an element-level list 1:1 with
-//  the scanned geometry, every member a real unique id. The four fault
+//  sound — a request-level carrier id AND an element-level tail-window list
+//  of exactly min(PF_TAIL_WINDOW, T) members, every one a real unique id.
+//  The four fault
 //  classes (channel missing / width mismatch / malformed member /
 //  consistency break) REJECT the request (400, structured body) with zero
 //  data-plane side effects. Three prohibitions: no silent legacy fallback,
@@ -77,10 +91,21 @@ const FRONT_REREAD_ELEMENTS = 8;
 /** Breaker cadence (contract §8 line 12; same numbers the v5 line proved). */
 const PF_V6_BREAKER_FAULTS = 5;
 const PF_V6_DISABLED_TTL_MS = 60 * 60 * 1000;
-/** #5643 wire-list ceiling, mirrors src/agent/pf-channel.ts MAX_IDS: long
- *  multi-MiB #5403 bodies carry thousands of ids, not hundreds. A LONGER
- *  list is a wire fault (Q4), not a degrade-to-baseline. */
-const WIRE_MAX_IDS = 16_384;
+/** F1 (owner ruling 2026-11-04, PR #5652 review): fixed TAIL-WINDOW size —
+ *  Mirror of src/agent/pf-channel.ts PF_TAIL_WINDOW (wire owner declares it
+ *  over there; both sides carry the literal with cross-references).
+ *  the emit side sends ONLY the last N captured element ids; the server
+ *  expects exactly min(N, T). Byte budget derivation (the ruling's formula
+ *  budget = N × measured-max-segment × margin 2): measured fleet segment
+ *  lengths are uuid-hex32 (wb X-Conversation-Message-ID), msg_<12hex>
+ *  (opencode), hex/dotted kernel ids (dsh/pi/omp lanes); the screening cap
+ *  above stays 512 raw chars worst case. With N = 64 even adversarial
+ *  maximum-length ids encode to ≤ ~33 KB… which exceeds stock Node's
+ *  ≈16 KB default maxHeaderSize — so the realistic measured distribution
+ *  (≤ ~70 encoded bytes per segment for every lane we ship today) bounds
+ *  the header at ≈ 64 × 70 ≈ 4.5 KB, comfortably inside. A list LONGER
+ *  than the window is a loud width/malformed reject, not a degrade. */
+const PF_TAIL_WINDOW = 64;
 /** Ledger working-copy cap (contract §4): in-memory SEEN index only. The
  *  DISK plane is unlimited — trimming drops just the shortcut; evicted ids
  *  take the DB probe path (still correct, one extra index lookup). */
@@ -277,13 +302,15 @@ export interface V6Outcome {
 }
 
 // --- wire decoding ---------------------------------------------------------
-/** Strict full-list decoder (§3.2 + Q4 ruling): EVERY element carries a real
- *  unique well-formed id — the v3 "?" placeholder is GONE from this lane;
- *  an id-less slot IS the fault (recorded upstream of the call site check).
- *  All-or-nothing: one bad segment voids the whole list. */
+/** Strict tail-window list decoder (§3.2 + Q4 ruling): every member carries
+ *  a real unique well-formed id — the v3 "?" placeholder is GONE from this
+ *  lane; an id-less slot IS the fault (recorded upstream of the call site
+ *  check). All-or-nothing: one bad segment voids the whole list. Lists over
+ *  the fixed window are malformed here (over-window = client bug; the width
+ *  gate below handles the under-window side). */
 function parseFullIdList(raw: string): string[] | null {
     const segs = raw.split(",");
-    if (segs.length === 0 || segs.length > WIRE_MAX_IDS) return null;
+    if (segs.length === 0 || segs.length > PF_TAIL_WINDOW) return null;
     const ids: string[] = [];
     const seen = new Set<string>();
     for (const seg of segs) {
@@ -547,11 +574,18 @@ export function evaluateWatermarkV6(
         throw new FastpathV6IdentityFault(d);
     }
     const R = parsed;
-    if (R.length !== T) {
-        const d = `identity width mismatch: list=${R.length} vs scanned geometry T=${T}`;
+    // F1: expected width is the FIXED WINDOW, min(window, T) — not T itself.
+    // Any other length means the channel drifted (stale slice form, foreign
+    // encoder, over-window overflow) — refuse loudly.
+    const expectLen = Math.min(PF_TAIL_WINDOW, T);
+    if (R.length !== expectLen) {
+        const d = `identity width mismatch: list=${R.length} vs expected min(window=${PF_TAIL_WINDOW}, T)=${expectLen}`;
         recordFault(store, session.id, d, log);
         throw new FastpathV6IdentityFault(d);
     }
+    // R[i] binds to BODY element posStart+i; everything earlier than the
+    // window rides the ledger (or the honest coverage boundary — see docs).
+    const posStart = T - R.length;
 
     // --- matching (§3.1 rules ①②③) ---------------------------------------------
     const P = store.pfProbePairs(sessRaw, [...new Set(R)]);
@@ -691,7 +725,7 @@ export function evaluateWatermarkV6(
     }
 
     // --- the NEW set: decode ONLY the new element spans (any positions) ---------
-    const newFragment = parseElementFragment(bodyText, newIdx.map((i) => scan.messageSpans[i]));
+    const newFragment = parseElementFragment(bodyText, newIdx.map((i) => scan.messageSpans[posStart + i]));
     if (newFragment === null) {
         recordSoftMiss(store, session.id, "NEW-span fragment unparseable", log);
         log("warn", `[${session.id}] v6 NEW-span fragment unparseable — baseline turn (uncredited)`);
@@ -703,9 +737,9 @@ export function evaluateWatermarkV6(
     // guess where the freeze frontier sits.
     let midSystem = false;
     for (let k = 0; k < newIdx.length; k++) {
-        const i = newIdx[k];
+        const absIdx = posStart + newIdx[k];
         const m = newFragment.messages[k];
-        if (i >= frontEnd && typeof m === "object" && m !== null) {
+        if (absIdx >= frontEnd && typeof m === "object" && m !== null) {
             const role = (m as { role?: unknown }).role;
             if (role === "system" || role === "developer") {
                 midSystem = true;
@@ -723,15 +757,15 @@ export function evaluateWatermarkV6(
     const positioned: { pos: number; ledgerId: string; elemIdx: number; cores: CoreMessage[] }[] = [];
     let startFail = false;
     for (let k = 0; k < newIdx.length; k++) {
-        const i = newIdx[k];
-        const cores = transformElement(bodyText, scan.messageSpans[i]);
+        const absIdx = posStart + newIdx[k];
+        const cores = transformElement(bodyText, scan.messageSpans[absIdx]);
         if (cores === null) {
-            recordSoftMiss(store, session.id, `element ${i} transform failed`, log);
-            log("warn", `[${session.id}] v6 element ${i} transform failed — baseline turn (uncredited)`);
+            recordSoftMiss(store, session.id, `element ${absIdx} transform failed`, log);
+            log("warn", `[${session.id}] v6 element ${absIdx} transform failed — baseline turn (uncredited)`);
             startFail = true;
             break;
         }
-        positioned.push({ pos: world.maxPos + 1 + k, ledgerId: R[i], elemIdx: i, cores });
+        positioned.push({ pos: world.maxPos + 1 + k, ledgerId: R[newIdx[k]], elemIdx: absIdx, cores });
     }
     if (startFail) return { hit: null, measuredT: T, decision: "element-transform-fail", sessionCarrier: sessRaw, extraHeaders: stamps };
     if (frontFrag === null) {
@@ -848,9 +882,14 @@ export function finalizeWatermarkV6(
     try {
         if (evaluated.armed !== undefined) {
             // ARM registration: every element of THIS turn, wire order →
-            // pos 0..T-1 (first world under the fresh sid).
+            // pos 0..T-1 (first world under the fresh sid). F1: the carried
+            // ids cover only the tail window — prefix rows register with the
+            // empty ledger marker (cores stored, identity unknown forever;
+            // probes never query it, the honest boundary made concrete).
             const { sid, ids, spans } = evaluated.armed;
-            if (input.bodyText === undefined || spans.length !== T || ids.length !== T) {
+            const armPosStart = T - ids.length;
+            const armExpect = Math.min(PF_TAIL_WINDOW, T);
+            if (input.bodyText === undefined || spans.length !== T || ids.length > T || ids.length < armExpect) {
                 log("error", `[${session.id}] v6 arm: geometry mismatch at finalize — registration skipped (world stays empty; next turn arms fresh via probe-miss)`);
                 return headers;
             }
@@ -861,15 +900,18 @@ export function finalizeWatermarkV6(
                     log("error", `[${session.id}] v6 arm: element ${i} transform failed — registration aborted (turn already served from baseline)`);
                     return headers;
                 }
-                positioned.push({ pos: i, ledgerId: ids[i], cores });
+                positioned.push({ pos: i, ledgerId: i >= armPosStart ? ids[i - armPosStart] : "", cores });
             }
             const keyed = rekeyContinuing([], positioned.map((p) => ({ pos: p.pos, cores: p.cores })));
             const allCores = keyed.flatMap((r) => r.cores);
             const frontText = input.armSystemText ?? "";
             const frontStrips = input.armStripCounts ?? EMPTY_STRIP;
             const frontMultimodal = input.armMultimodal ?? coresHaveImagePart(allCores);
+            // F1: window-relative ids → absolute pos via armPosStart; prefix rows ride the empty marker.
+            const armLedgerByPos = new Map<number, string>();
+            for (let i = armPosStart; i < T; i++) armLedgerByPos.set(i, ids[i - armPosStart]);
             const plan = {
-                rows: keyed.map((r) => ({ pos: r.pos, ledgerId: ids[r.pos], coreId: r.coreIds.join("|"), coreJson: JSON.stringify(r.cores) })),
+                rows: keyed.map((r) => ({ pos: r.pos, ledgerId: armLedgerByPos.get(r.pos) ?? "", coreId: r.coreIds.join("|"), coreJson: JSON.stringify(r.cores) })),
                 logEntries: [
                     { kind: "arm", payloadJson: JSON.stringify({ t: T }), bornPosHi: T - 1 },
                     { kind: "front", payloadJson: JSON.stringify({ systemText: frontText, stripCounts: frontStrips, multimodal: frontMultimodal }), bornPosHi: T - 1 },
@@ -880,9 +922,10 @@ export function finalizeWatermarkV6(
                 log("warn", `[${session.id}] v6 arm commit failed — world deferred to next turn`);
                 return headers;
             }
-            const seen = new Map(ids.map((id, i) => [id, i] as const));
+            const seen = new Map<string, number>();
+            for (let i = armPosStart; i < T; i++) seen.set(ids[i - armPosStart], i);
             upsertWorld({ sid, t: T, maxPos: T - 1, systemText: frontText, stripCounts: frontStrips, multimodal: frontMultimodal, seen });
-            log("info", `[${session.id}] v6 armed world ${sid} (T=${T}, ${keyed.length} elements registered)`);
+            log("info", `[${session.id}] v6 armed world ${sid} (T=${T}, ${keyed.length} elements registered, ${seen.size} identities ledgred from the tail window)`);
             return headers;
         }
         // Hit-turn commits (including no-progress front/geom ledger moves).
