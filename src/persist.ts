@@ -1947,6 +1947,19 @@ export class SessionStore {
         try {
             const seqByRawId = this.unifiedSeqByRaw(session.id);
             if (seqByRawId === null || seqByRawId.size === 0) return;
+            // #5599: stamp only a COMPLETE ledger — every mapped id must own a
+            // row (live or retired). An imported collapsed ledger (folded
+            // ghosts have no rows; the tail re-based at seq 0) would let the
+            // stamp evict the ghost bindings onto fresh numbers and re-target
+            // saved citations at newer bodies. Incomplete → keep legacy refs
+            // (JSON-load parity); a later cold load retries once rows exist.
+            // Query failure fails safe to skip: never restamp on uncertain input.
+            const mapped = Object.keys(state.messageRefs.byRaw).filter((id) => state.messageRefs.byRaw[id] !== "BLOCKED");
+            const backed = this.unifiedBackedMsgIds(session.id, mapped);
+            if (backed === null || mapped.some((id) => !backed.has(id))) {
+                this.log("info", `[persist] ${session.id}: unified ledger incomplete (${mapped.length} mapped ids checked) — keeping legacy refs (#5599)`);
+                return;
+            }
             const outcome = restampRefsToLedger(state, seqByRawId);
             // #4733: the ref restamp alone leaves the CCR content store keyed by
             // store-time refs — a stored original would sit under a number the
@@ -2169,6 +2182,18 @@ export class SessionStore {
         if (!this.shadow || this.shadow.stats.disabled) return null;
         try {
             return this.shadow.seqByRaw(id);
+        } catch {
+            return null;
+        }
+    }
+
+    /** #5599: msg ids owning ≥1 unified row (live or retired) — the re-stamp
+     *  completeness check's data source. Null when the unified store cannot
+     *  answer; the caller then keeps legacy refs (fail-safe direction). */
+    private unifiedBackedMsgIds(id: string, msgIds: string[]): Set<string> | null {
+        if (!this.shadow || this.shadow.stats.disabled) return null;
+        try {
+            return this.shadow.backedMsgIds(id, msgIds);
         } catch {
             return null;
         }

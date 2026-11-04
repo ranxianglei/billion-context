@@ -1052,6 +1052,18 @@ export class UnifiedShadow {
         return this.sync.seqByRaw(sessionId);
     }
 
+    /** #5599: row-backed msg ids (live OR retired) for the re-stamp
+     *  completeness check — same full-trust gate as seqByRaw. Null when the
+     *  store cannot answer; the caller fails safe to keeping legacy refs. */
+    backedMsgIds(sessionId: string, msgIds: string[]): Set<string> | null {
+        if (this.sync === null) return null;
+        try {
+            return this.sync.backedMsgIds(sessionId, msgIds);
+        } catch {
+            return null;
+        }
+    }
+
     /** #4316 PR3/3: live (non-retired) message row count. */
     liveRowCount(sessionId: string): number {
         if (this.sync !== null) return this.sync.liveRowCount(sessionId);
