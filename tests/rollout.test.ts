@@ -206,8 +206,13 @@ test("rolloutDecisions: sorted, one per registered feature, real install id", ()
         assert.equal(alpha.enabled, true);
         assert.equal(zeta.enabled, false);
         // percent-0 still flows through the bucketing tier (bucket < 0bp is
-        // never true) — "off" is reserved for features with no percent at all.
-        for (const d of ds) assert.equal(d.source, "bucket", d.feature);
+        // never true) — "off" is reserved for features with no percent at all,
+        // plus base-nested members whose base cohort excludes this install
+        // (#5643: watermarkV6MsgId nests under pluginFullResendWatermark).
+        for (const d of ds) {
+            const baseExcluded = d.base !== undefined && !ds.some((x) => x.feature === d.base && x.enabled);
+            assert.equal(d.source, baseExcluded ? "off" : "bucket", d.feature);
+        }
     });
 });
 
