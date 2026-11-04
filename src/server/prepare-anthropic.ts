@@ -530,7 +530,9 @@ export async function prepareAnthropic(
                 }
             } else if (useDecide) {
                 const ranges = turn.nudge.compressibleRanges ?? [];
-                const sideBody: Record<string, unknown> = { ...parsed, messages: [...rebuiltMessages, { role: "user", content: buildDecisionPrompt(ranges) }], system: systemOut, tools: toolsOut, stream: false, max_tokens: decide.maxTokens };
+                // [#5688] the side call shares the main request's upstream —
+                // un-deduped rebuiltMessages would 400 the decision too.
+                const sideBody: Record<string, unknown> = { ...parsed, messages: [...dedupeAdjacentOutputConfig(rebuiltMessages), { role: "user", content: buildDecisionPrompt(ranges) }], system: systemOut, tools: toolsOut, stream: false, max_tokens: decide.maxTokens };
                 delete sideBody.prompt_cache_key;
                 stripDecisionReasoningFields("anthropic", sideBody);
                 const outcome = await runNudgeDecision({ req, opts, protocol: "anthropic", sideBody, session, log });
