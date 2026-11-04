@@ -886,19 +886,28 @@ export function finalizeWatermarkV6(
             // ids cover only the tail window — prefix rows register with the
             // empty ledger marker (cores stored, identity unknown forever;
             // probes never query it, the honest boundary made concrete).
+            // A FAILED registration must not hand the client the world id:
+            // the plane holds nothing for it, so a next-turn echo would
+            // fault-loop ("echo references unknown pf_sid") straight into a
+            // breaker park. Drop the echo on every failure exit below; keep
+            // the seq stamp.
+            const failNoEcho = (): Record<string, string> => {
+                delete headers[PF_SESSION_HEADER];
+                return headers;
+            };
             const { sid, ids, spans } = evaluated.armed;
             const armPosStart = T - ids.length;
             const armExpect = Math.min(PF_TAIL_WINDOW, T);
             if (input.bodyText === undefined || spans.length !== T || ids.length > T || ids.length < armExpect) {
                 log("error", `[${session.id}] v6 arm: geometry mismatch at finalize — registration skipped (world stays empty; next turn arms fresh via probe-miss)`);
-                return headers;
+                return failNoEcho();
             }
             const positioned: { pos: number; ledgerId: string; cores: CoreMessage[] }[] = [];
             for (let i = 0; i < spans.length; i++) {
                 const cores = transformElement(input.bodyText, spans[i]);
                 if (cores === null) {
                     log("error", `[${session.id}] v6 arm: element ${i} transform failed — registration aborted (turn already served from baseline)`);
-                    return headers;
+                    return failNoEcho();
                 }
                 positioned.push({ pos: i, ledgerId: i >= armPosStart ? ids[i - armPosStart] : "", cores });
             }
@@ -920,7 +929,7 @@ export function finalizeWatermarkV6(
             };
             if (store.pfCommitTurn(sid, { rows: plan.rows.map((r) => ({ ...r, sessRaw: evaluated.sessionCarrier })), logEntries: plan.logEntries }) === null) {
                 log("warn", `[${session.id}] v6 arm commit failed — world deferred to next turn`);
-                return headers;
+                return failNoEcho();
             }
             const seen = new Map<string, number>();
             for (let i = armPosStart; i < T; i++) seen.set(ids[i - armPosStart], i);
