@@ -110,6 +110,9 @@ test("#5680: reversed stored ranges render ascending and resolve contained spans
     const REVERSED: CompressibleRange[] = [
         { startRef: "m00517", endRef: "m00002", count: 4, tokens: 9_000, toolPct: 40, textPct: 60 },
         { startRef: "m00030", endRef: "m00040", count: 11, tokens: 3_000, toolPct: 10, textPct: 90 },
+        // Largest on purpose: with the reversed range ALSO the largest, a
+        // containment hit and the largest-range fallback are indistinguishable.
+        { startRef: "m00900", endRef: "m00910", count: 5, tokens: 20_000, toolPct: 20, textPct: 80 },
     ];
     // Display: the model copies the span verbatim into its JSON answer, so the
     // prompt must never show a descending pair.
@@ -129,8 +132,14 @@ test("#5680: reversed stored ranges render ascending and resolve contained spans
         startRef: "m00002",
         endRef: "m00517",
     });
-    // Fallback over a reversed live view returns normalized labels.
-    assert.deepEqual(resolveDecisionRange({}, REVERSED), { startRef: "m00002", endRef: "m00517" });
+    // A proposal inside the LARGER non-reversed range resolves to that range —
+    // per-range containment, not absorption into whatever is largest.
+    assert.deepEqual(resolveDecisionRange({ range: "m00905-m00908" }, REVERSED), {
+        startRef: "m00900",
+        endRef: "m00910",
+    });
+    // Fallback over a reversed live view returns the largest range, normalized.
+    assert.deepEqual(resolveDecisionRange({}, REVERSED), { startRef: "m00900", endRef: "m00910" });
 });
 
 test("failure ladder counts hard failures, resets on any parsed answer", () => {
