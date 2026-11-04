@@ -166,15 +166,13 @@ export function wirePiSubagents(pi: ExtensionAPI, agent: string): void {
             setDelegatePolicy(state.policy);
             setDelegateDefaults({ thinkingLevel: state.policy.thinkingLevel, agents: state.policy.agents });
             setDelegateNotifyIfRead(state.policy.notifyIfRead);
-            // Third-party pi-subagents overlap guard (#415, same contract as
-            // the standalone package): a PROJECT-scope install stands
-            // acp_delegate down unless delegate.forceEnable opts back in; a
-            // USER-scope-only install stays active (warn-only there too, but
-            // silently here — bili's lane already reports overlap through its
-            // own log surface).
+            // Third-party pi-subagents overlap guard (#415/#5637, same contract
+            // as the standalone package): ANY install — project OR user scope —
+            // stands acp_delegate down unless delegate.forceEnable opts back in.
             if (state.policy.enabled && !state.policy.forceEnable) {
                 const scopes = findPiSubagentsInstalls(resolveAgentDir(), cwd);
-                if (scopes.project[0] !== undefined) {
+                const install = scopes.project[0] ?? scopes.user[0];
+                if (install !== undefined) {
                     state.stoodDown = true;
                     if (!standDownWarned) {
                         standDownWarned = true;

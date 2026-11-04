@@ -133,22 +133,27 @@ export function createSubagentsExtension(inline?: SubagentsAdapterConfig): Exten
         setDelegatePolicy(state.policy);
         setDelegateDefaults({ thinkingLevel: state.policy.thinkingLevel, agents: state.policy.agents });
         setDelegateNotifyIfRead(state.policy.notifyIfRead);
-        // Third-party subagent overlap guard (#415): a PROJECT-scope pi-subagents
-        // install stands acp_delegate down unless delegate.forceEnable opts back
-        // in; a USER-scope-only install logs a warning and stays active, so a
-        // global install can't silently disable it in every project.
+        // Third-party subagent overlap guard (#415/#5637): ANY pi-subagents
+        // install — project OR user scope — stands acp_delegate down unless
+        // delegate.forceEnable opts back in. The original scope split kept
+        // user-scope installs warn-only so a global install couldn't SILENTLY
+        // disable acp_delegate everywhere; the stand-down is loud (UI notify /
+        // console.error) and forceEnable is the documented escape hatch, neither
+        // scope-dependent, so the most common install path (`pi install
+        // npm:pi-subagents`, which writes user-scope) now also stands down
+        // instead of leaving two competing sub-agent systems live in every
+        // project.
         if (state.policy.enabled && !state.policy.forceEnable) {
           const scopes = findPiSubagentsInstalls(resolveAgentDir(), cwd);
-          if (scopes.project[0] !== undefined) {
+          const install = scopes.project[0] ?? scopes.user[0];
+          if (install !== undefined) {
             state.stoodDown = true;
-            logWarn("delegate", { event: "delegate-auto-disabled", sid, install: scopes.project[0], scope: "project", hint: "run /acp-subagents (billion-context-pi) to give its agents ACP compression tools; delegate.forceEnable=true keeps acp_delegate" });
+            logWarn("delegate", { event: "delegate-auto-disabled", sid, install, scope: scopes.project[0] !== undefined ? "project" : "user", hint: "run /acp-subagents (billion-context-pi) to give its agents ACP compression tools; delegate.forceEnable=true keeps acp_delegate" });
             if (!standDownWarned) {
               standDownWarned = true;
               if (ctx.hasUI) ctx.ui.notify(DELEGATE_STAND_DOWN_MESSAGE, "warning");
               else console.error(DELEGATE_STAND_DOWN_MESSAGE);
             }
-          } else if (scopes.user[0] !== undefined) {
-            logWarn("delegate", { event: "delegate-user-scope-detected", sid, install: scopes.user[0], action: "warn-only" });
           }
         }
       } catch (e) {

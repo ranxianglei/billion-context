@@ -433,7 +433,7 @@ bili --no-auto-update        # 本次启动禁用自动更新
 
 使用 `bili pi` 或 pi 原生插件（`bili plugin install pi`）时，会自带默认启用的子代理功能：`acp_delegate`、`acp_delegate_wait` 和 `acp_delegate_cancel`。这组额外工具仅在 pi 上提供。
 
-**建议只启用一套子代理实现。** 如果使用内置功能，建议在用户级和项目级配置中移除或禁用其他 pi 子代理插件（例如 `pi-subagents` 或单独安装的 `billion-context-pi-subagents`），避免工具、提示词或行为重叠。如果更喜欢其他子代理插件，可以关闭内置功能。项目级 `pi-subagents` 安装默认会让内置 delegate 自动让位，但仅有用户级安装时不会，因此不能把这项保护当作所有安装方式都适用的保障。
+**建议只启用一套子代理实现。** 如果使用内置功能，建议在用户级和项目级配置中移除或禁用其他 pi 子代理插件（例如 `pi-subagents` 或单独安装的 `billion-context-pi-subagents`），避免工具、提示词或行为重叠。如果更喜欢其他子代理插件，可以关闭内置功能。任意 scope（项目级 `<cwd>/.pi/…` 或用户级 `~/.pi/agent/…`）的 `pi-subagents` 安装现在都会让内置 delegate 默认自动让位；如需保留 `acp_delegate`，设置 `pi.subagents.forceEnable`（或 acp.json 里的 `delegate.forceEnable`）。
 
 要关闭内置子代理并保留上下文压缩，请将以下配置合并到 `~/.config/billion-context/billion-context.json`（或 `BILI_CONFIG_FILE` 指定的文件），保留已有的其他设置：
 

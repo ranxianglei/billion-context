@@ -49,9 +49,12 @@ function extensionInstallUnder(root: string): string | null {
   return null;
 }
 
-/** Scope-split detection result (#415): a user-scope install must not silently
- *  disable acp_delegate in every project — only project-scope hits trigger the
- *  auto stand-down; user-scope-only hits get a warning log instead. */
+/** Installs found per scope (#415). BOTH `user` and `project` are standalone
+ *  triggers for the acp_delegate stand-down (#5637): the original "user-scope
+ *  stays active" carve-out was dropped because the stand-down is loud (UI
+ *  notify / console.error) and delegate.forceEnable is the documented escape
+ *  hatch — neither is scope-dependent, so a global (user-scope) install no
+ *  longer leaves two competing sub-agent systems live in every project. */
 export interface PiSubagentsScopes {
   user: string[];
   project: string[];

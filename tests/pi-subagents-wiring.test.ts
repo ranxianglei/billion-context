@@ -240,6 +240,64 @@ test("project-scope pi-subagents install stands acp_delegate down (#415)", async
     assert.equal(ctx.ui.notifications[0][1], "warning");
 });
 
+test("user-scope pi-subagents install ALSO stands acp_delegate down (#5637)", async () => {
+    const { pi, handlers, tools, commands, shortcuts } = fakePi();
+    (globalThis as Record<symbol, unknown>)[Symbol.for("acp-delegate.embedded")] = false;
+    wirePiSubagents(pi, "pi");
+    (globalThis as Record<symbol, unknown>)[Symbol.for("acp-delegate.embedded")] = true;
+    // A user-scope install lives under <agentDir>/npm/node_modules/pi-subagents.
+    // Point PI_CODING_AGENT_DIR at a private temp dir so the shared $HOME tree
+    // read by every other test in this file stays clean, then restore it.
+    const agentBase = fs.mkdtempSync(path.join(HOME, "user-agent-"));
+    process.env.PI_CODING_AGENT_DIR = agentBase;
+    try {
+        fs.mkdirSync(path.join(agentBase, "npm", "node_modules", "pi-subagents"), { recursive: true });
+        fs.writeFileSync(
+            path.join(agentBase, "npm", "node_modules", "pi-subagents", "package.json"),
+            JSON.stringify({ name: "pi-subagents", version: "1.0.0" }),
+        );
+        const ctx = sessionCtx();
+        await handlers.get("session_start")!(undefined, ctx);
+        assert.deepEqual(tools, [], "no delegate tools for a user-scope install");
+        assert.deepEqual(commands, ["acp-fleet"]);
+        assert.equal(shortcuts.length, 0);
+        assert.equal(ctx.ui.notifications.length, 1);
+        assert.match(ctx.ui.notifications[0][0], /pi-subagents detected/);
+        assert.equal(ctx.ui.notifications[0][1], "warning");
+    } finally {
+        delete process.env.PI_CODING_AGENT_DIR;
+        fs.rmSync(agentBase, { recursive: true, force: true });
+    }
+});
+
+test("user-scope install with pi.subagents.forceEnable:true keeps acp_delegate active (#5637)", async () => {
+    clearBiliConfig();
+    writeBiliConfig({ pi: { subagents: { forceEnable: true } } });
+    const { pi, handlers, tools, commands, shortcuts } = fakePi();
+    (globalThis as Record<symbol, unknown>)[Symbol.for("acp-delegate.embedded")] = false;
+    wirePiSubagents(pi, "pi");
+    (globalThis as Record<symbol, unknown>)[Symbol.for("acp-delegate.embedded")] = true;
+    const agentBase = fs.mkdtempSync(path.join(HOME, "user-agent-fe-"));
+    process.env.PI_CODING_AGENT_DIR = agentBase;
+    try {
+        fs.mkdirSync(path.join(agentBase, "npm", "node_modules", "pi-subagents"), { recursive: true });
+        fs.writeFileSync(
+            path.join(agentBase, "npm", "node_modules", "pi-subagents", "package.json"),
+            JSON.stringify({ name: "pi-subagents", version: "1.0.0" }),
+        );
+        const ctx = sessionCtx();
+        await handlers.get("session_start")!(undefined, ctx);
+        assert.deepEqual(tools.sort(), ["acp_delegate", "acp_delegate_cancel", "acp_delegate_wait"], "forceEnable re-enables despite user-scope install");
+        assert.deepEqual(commands, ["acp-fleet"]);
+        assert.equal(shortcuts.length, 1);
+        assert.equal(ctx.ui.notifications.length, 0, "no stand-down reminder when forceEnabled");
+    } finally {
+        delete process.env.PI_CODING_AGENT_DIR;
+        fs.rmSync(agentBase, { recursive: true, force: true });
+        clearBiliConfig();
+    }
+});
+
 // --- #2230 config-home: pi.subagents in billion-context.json ---
 
 function writeBiliConfig(value: unknown): void {
