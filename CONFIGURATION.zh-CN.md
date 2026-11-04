@@ -891,7 +891,7 @@
 
 修改在**新会话**生效（工具在会话启动时注册）。完整 delegate 面文档（角色、执行模型、fleet 检查器）见 [billion-context-pi-subagents README](pi-subagents/README.md)。
 
-**内联姿态与 delegate 子代理（#5645）。** pi 车道默认运行在**内联**模式（`pi.inline` / `BILI_PI_INLINE`，自 #5428 起默认开启）：压缩在 pi 宿主**进程内**执行——不起 proxy、无临时端口。`acp_delegate` 把每个子代理作为独立的 `pi` 子进程运行；自 #5645 起，这类子进程不再 attach 到父进程的进程内占位 origin，而是**自启一个进程内引擎**，因此 delegate 子也会被压缩（每个进程各持一个引擎；同一共享 state dir 上的并发引擎是受支持的多实例拓扑，#5082/#3923，且各自在正常退出时 flush 自己的会话）。spawn-proxy 姿态（`"pi": { "inline": false }` / `BILI_PI_INLINE=0`）与 `bili pi` 启动器仍为可用替代。
+**内联姿态与 delegate 子代理（#5645）。** pi 车道默认运行在**内联**模式（`pi.inline` / `BILI_PI_INLINE`，自 #5428 起默认开启）：压缩在 pi 宿主**进程内**执行——不起 proxy、无临时端口。`acp_delegate` 把每个子代理作为独立的 `pi` 子进程运行；自 #5645 起，这类子进程不再 attach 到父进程的进程内占位 origin，而是**自启一个进程内引擎**，因此 delegate 子也会被压缩（每个进程各持一个引擎；同一共享 state dir 上的并发引擎是受支持的多实例拓扑，#5082/#3923）。spawn-proxy 姿态（`"pi": { "inline": false }` / `BILI_PI_INLINE=0`）与 `bili pi` 启动器仍为可用替代。
 
 ### 进程级配置块（#2030）
 
