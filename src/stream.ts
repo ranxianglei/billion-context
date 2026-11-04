@@ -1140,8 +1140,12 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         ctx.log(`[acp-proxy: refused compress citing superseded ref(s): ${supersededRes.rejection} (#4316 PR3/3)]`);
         return compressResult(`[Compression REFUSED: ${supersededRes.rejection} The refs in this call no longer identify the same messages and folding them would compress the wrong span. Re-issue the compress call with the updated labels.]`, "refused", 0, "superseded-ref");
     }
+    // supersededRefRejection returns a fresh identity-preserving copy of EVERY
+    // range (a plain {...r} when nothing was translated) — adopt it
+    // unconditionally so the scope gate below judges the exact refs the fold
+    // will act on.
+    ranges = supersededRes.translatedRanges;
     if (supersededRes.translated > 0) {
-        ranges = supersededRes.translatedRanges;
         ctx.log(`[acp-proxy: translated ${supersededRes.translated} superseded ref(s) onto current labels (identity-preserving, #4797): ${ranges.map((r) => `${r.startRef}–${r.endRef}`).join(", ")}]`);
     }
     // #5683: out-of-bounds policy gate (scope). Runs only on live, normalized
@@ -1154,8 +1158,6 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
             ctx.log(`[acp-proxy: refused out-of-recommendation compress — span(s) ${listed} outside the current recommendation set (compress.requireRecommendation)]`);
             return compressResult(`[Compression REFUSED: out-of-bounds compression is disabled on this route (compress.requireRecommendation) — span(s) ${listed} contain content bili does not currently recommend folding. Call acp_status for the current compressible ranges and stay within them: subdividing a listed span into smaller chunks is fine, and re-folding an already-compressed block to update its summary is fine.]`, "refused", 0, "out-of-recommendation");
         }
-    } else {
-        ranges = supersededRes.translatedRanges;
     }
     if (ctx.messages.length > 0) {
         const ids = ctx.messages.slice(0, 10).map((m) => `${saltedMsgIdForLog(m.id)}(${(m.text ?? "").length}c)`).join(", ");
