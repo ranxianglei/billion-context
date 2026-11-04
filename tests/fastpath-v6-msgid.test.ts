@@ -478,6 +478,45 @@ test("§8-22 real store deletion cascades every registered world (in-TX registry
         assert.equal(h.store.pfLatestGeom(sidB), null);
     } finally { h.cleanup(); }
 });
+
+test("S4: a tampered pf_ckpt checksum parks the world loudly instead of hydrating corrupt state", () => {
+    const h = makeH("cksum");
+    try {
+        const log = makeLog();
+        const b1 = makeBody([{ role: "system", content: SYS }, { role: "user", content: "u1" }]);
+        const r1 = turn("s-ck", "car-ck", b1, ["k0", "k1"], log);
+        assert.equal(r1.outcome.decision, "arm");
+        const sid = r1.sid!;
+        // fold the log into a ckpt so hydration depends on the ckpt bytes,
+        // then break the checksum binding on disk (bytes intact, binding not)
+        const m = h.store.pfMeta(sid);
+        assert.ok(m !== null && m.log.length > 0 && m.ckpt === null);
+        h.store.pfCompact(sid, { metaJson: JSON.stringify({ v: 1, t: 2, maxPos: 1 }), nextLsSeq: m.log[m.log.length - 1].lsSeq });
+        const db = new DatabaseSync(path.join(h.dir, "index.db"));
+        db.prepare(`UPDATE pf_ckpt SET checksum = 'deadbeef' WHERE sid = ?`).run(sid);
+        db.close();
+        clearWatermarkV6("s-ck"); // drop the in-memory mirror: the next turn MUST hydrate from the plane
+        const req = {
+            headers: {
+                "x-bili-plugin-conversation": "car-ck",
+                [PF_TAIL_IDS_HEADER]: ["k0", "k1"].map(encodeURIComponent).join(","),
+                [PF_SESSION_HEADER]: sid,
+            },
+        } as unknown as http.IncomingMessage;
+        const input = { pluginMode: true, titleGen: false, model: "m" };
+        const out = evaluateWatermarkV6(b1, req, { id: "s-ck" } as unknown as Session, input, log);
+        assert.equal(out, null, `corrupt-ckpt world must NOT hydrate (log=${JSON.stringify(log.lines.slice(-3))})`);
+        assert.ok(log.lines.some((l) => l.msg.includes("world unrecoverable")), "the park must be logged loud");
+        // parked: the very next turn rides baseline without a fresh fault storm
+        assert.equal(evaluateWatermarkV6(b1, req, { id: "s-ck" } as unknown as Session, input, log), null);
+        const db2 = new DatabaseSync(path.join(h.dir, "index.db"));
+        try {
+            const row = db2.prepare(`SELECT COUNT(*) AS n FROM pf_rows WHERE sid = ?`).get(sid) as { n: number };
+            assert.equal(row.n, 2, "the park path must not touch the data plane");
+        } finally { db2.close(); }
+    } finally { h.cleanup(); }
+});
+
 test("restart after compaction: a compacted world echoes cleanly off its ckpt (no fault storm, no re-arm)", () => {
     const h = makeH("ckok");
     try {

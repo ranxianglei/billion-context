@@ -68,7 +68,7 @@ import type { CoreMessage } from "acp-kernel";
 import type { OpenAIRequestBody } from "acp-kernel/wire";
 import { openaiToCore } from "acp-kernel/wire";
 import type http from "node:http";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { featureEnabled } from "../rollout.js";
 import { getStore } from "../persist.js";
 import type { SessionStore } from "../persist.js";
@@ -448,6 +448,11 @@ function loadWorldFromPlane(store: SessionStore, sid: string): V6World | null {
     if (meta === null) return null;
     let folded: Record<string, unknown> = {};
     if (meta.ckpt !== null) {
+        if (createHash("sha256").update(meta.ckpt.metaJson).digest("hex") !== meta.ckpt.checksum) {
+            // S4: stored bytes no longer match their bound checksum — treat
+            // as unrecoverable rather than guess (guessing poisons forever).
+            return null;
+        }
         let p: unknown;
         try { p = JSON.parse(meta.ckpt.metaJson); } catch {
             // S4: checksum-bound bytes failed to parse back — treat as
