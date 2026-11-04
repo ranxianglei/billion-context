@@ -165,7 +165,7 @@ test("e2e: fragmented mid-overshoot switches to digests mid-flight; consolidated
 
         const callsD = calls.slice(markD);
         const summaryCallsD = callsD.filter((c) => !c.stream);
-        assert.ok(summaryCallsD.length >= 1, `#5617 negative direction: the LLM path still summarizes when its budget CAN close the gap (got ${summaryCallsD.length})`);
+        assert.ok(summaryCallsD.length >= 1, `#5671 negative direction: the LLM path still summarizes when its budget CAN close the gap (got ${summaryCallsD.length})`);
         const sD = listSessions().find((x) => x.id === "cons-sess");
         const blocksD = (sD?.state.blocks ?? []).filter((b) => b.active);
         assert.ok(blocksD.length >= 1, "LLM path created compression block(s)");
