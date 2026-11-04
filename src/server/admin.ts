@@ -5,7 +5,7 @@ import type { CompressionCore, Config } from "acp-kernel";
 import { APIG_RESIGN_SCHEME, KNOWN_SIGNATURE_SCHEMES, readPendingRefusals, unresolvedRefusals } from "../apig-resign.js";
 import { handleAcpCache, readKeySwitchStats, readModelSwitchStats, readProjSwitchStats, readPromptSwitchStats } from "../cache-ledger.js";
 import type { ProxyOptions } from "../config.js";
-import { effectivePromptCacheRouting, loadConfigFile, loadNamedProviders, loadOptions, loadRoutes, resolveResignSettings } from "../config.js";
+import { loadConfigFile, loadNamedProviders, loadOptions, loadRoutes, resolveResignSettings } from "../config.js";
 import { applyCompressSettings, listResolvedPacks, resolveCompressSurfaceDetailed } from "../compress-settings.js";
 import { clearConflictEvents, summarizeConflicts } from "../conflict-watch.js";
 import { cannotResolveTarget, getAdvisoryState } from "../advisory.js";
@@ -23,8 +23,9 @@ import { getUnrecognizedPathStats } from "./observability.js";
 import { getStore } from "../persist.js";
 import { BodyTooLargeError, headerValue, readBody } from "../server.js";
 import { dismissHostPlugin, visibleHostPluginNotices } from "../host-plugin-notice.js";
-import { dismissedUpgradeNotices, dismissUpgradeNotice, PCK_NOTICE_ID, pckNoticeActive, WM_FASTPATH_INTRO_ID } from "../pck-notice.js";
-import { featureOverrideAbsent } from "../rollout.js";
+import { dismissUpgradeNotice } from "../pck-notice.js";
+import { mergedNotices, localDismissKey, localDismissMode, markInstanceDismissal } from "../announcements.js";
+import { remoteAnnouncementPayloads, remoteDismissKey, remoteDismissMode } from "../remote-notices.js";
 import { listSessions, memoryReport, peekSession, splitSessionWarnings, totalInFlight } from "../session.js";
 import { BILI_TUNNEL_HEADER } from "../tunnel-guard.js";
 import { isLoopbackAddress } from "../util.js";
@@ -440,6 +441,12 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
     if (req.method === "POST" && req.url === "/__bili/host-plugins/dismiss") return handleHostPluginDismiss(req, res, log);
     // #5079: silence the prompt_cache.routing default-off upgrade notice.
     if (req.method === "POST" && req.url === "/__bili/notices/dismiss") return handleNoticeDismiss(req, res, log);
+    // #5548: unified built-in notice surface (same payload as the overview field).
+    if (req.method === "GET" && req.url === "/__bili/notices") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ notices: mergedNotices(process.env, remoteAnnouncementPayloads()) }, null, 2));
+        return;
+    }
     // #3923/#3959: dismiss the surfaced split-brain notice (body {"sessionId": string}).
     if (req.method === "POST" && req.url === "/__bili/storage/split-brain/ack") return handleSplitBrainAck(req, res, log);
     if (req.method === "GET" && req.url === "/__bili/upstream") {
@@ -1040,7 +1047,27 @@ async function handleNoticeDismiss(req: http.IncomingMessage, res: http.ServerRe
         res.end(JSON.stringify({ error: 'expected JSON body {"id": "<notice id>"}' }, null, 2));
         return;
     }
-    if (!dismissUpgradeNotice(id)) {
+    // #5548 P2/P3 fix: persistent dismissals are stored CONTENT-ADDRESSED
+    // (id@hash) exactly like the visibility gate filters on them — storing
+    // the bare id landed on the builtin allowlist and 400'd every file/feed
+    // dismissal (caught by live smoke test 2026-11-03).
+    const localKey = localDismissKey(id);
+    const remoteKey = localKey === undefined ? remoteDismissKey(id) : undefined;
+    const declMode = localKey !== undefined ? localDismissMode(id) : remoteKey !== undefined ? remoteDismissMode(id) : "builtin";
+    if (declMode === "always") {
+        log("info", `[notices] dismiss for always-mode ${id} accepted as no-op`);
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true }, null, 2));
+        return;
+    }
+    if (declMode === "instance") {
+        markInstanceDismissal(id);
+        log("info", `[notices] instance-mode ${id} dismissed for this process`);
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true }, null, 2));
+        return;
+    }
+    if (!dismissUpgradeNotice(localKey ?? remoteKey ?? id)) {
         res.writeHead(400, { "content-type": "application/json" });
         res.end(JSON.stringify({ error: `unknown notice: ${id}` }, null, 2));
         return;
@@ -1338,16 +1365,7 @@ async function sendOverview(res: http.ServerResponse, opts: ProxyOptions, laneHo
         updatePolicy: updatePolicyPayload(),
         pluginAdvisories: detectCostAdvisories(process.env),
         hostPluginNotices: visibleHostPluginNotices(process.env),
-        pckNotice: { id: PCK_NOTICE_ID, active: pckNoticeActive(effectivePromptCacheRouting(opts.promptCache)) },
-        wmNotice: {
-            id: WM_FASTPATH_INTRO_ID,
-            // #5403 experimental-grey intro: visible to EVERY install on its
-            // first upgrade to this build until closed — unless the user
-            // already wrote an explicit rollout override (they made the call).
-            active:
-                !dismissedUpgradeNotices(process.env).has(WM_FASTPATH_INTRO_ID) &&
-                featureOverrideAbsent("pluginFullResendWatermark", loadConfigFile().rollout),
-        },
+        notices: mergedNotices(process.env, remoteAnnouncementPayloads()),
         inFlight: totalInFlight(),
         blindTunnels: getBlindTunnelStats(),
         conflicts: summarizeConflicts(listSessions()),
