@@ -2053,7 +2053,7 @@ export class SessionStore {
                 try {
                     const parsed = await this.readRawFileWithBytes(rep.file);
                     const rec = parsed ? this.parseBootPayload(parsed.value) : null;
-                    if (!parsed || !rec || rec.payload.id !== id) throw new Error("representative file changed between scan and import");
+                    if (!parsed || !rec || rec.payload.id !== id) throw new Error("representative file changed between scan and import attempt");
                     decodedBytes = parsed.bytes;
                     const shadow = this.shadow;
                     if (!shadow) throw new Error("unified sidecar unavailable");
