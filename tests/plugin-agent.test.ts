@@ -248,7 +248,7 @@ function makeFakePi(): FakePi {
             // single-slot map would let the last registration shadow the rest.
             const h = handler as (event: unknown, ctx: unknown) => unknown;
             const prev = events.get(event);
-            events.set(event, prev ? ((e, c) => { prev(e, c); return h(e, c); }) : h);
+            events.set(event, prev ? ((e, c) => { const r = prev(e, c); return r instanceof Promise ? r.then(() => h(e, c)) : h(e, c); }) : h);
         },
         registerTool: (tool) => {
             registerCallCount++;
@@ -2830,6 +2830,25 @@ test("#957: omp reports runtime-info via before_provider_request (omp has no hea
             baseURL: `${proxy.origin}/bili/https://api.example.com/v1`,
             conversationId: "omp-rt-1",
             source: "client-config",
+        });
+    } finally {
+        await proxy.close();
+    }
+});
+
+test("before_agent_start awaits tool registration so Turn 1 system prompt includes ACP tools without a Turn 2 codemode_catalog patch", async () => {
+    const proxy = await startFakeProxy();
+    try {
+        await withEnv({ BILLION_CONTEXT_PROXY: undefined }, async () => {
+            const pi = makeFakePi();
+            createBiliPlugin("pi")(pi as never);
+            const ctx = fakeCtx(proxy, "sess-before-agent-start");
+            assert.equal(pi.tools.length, 0, "no tools before before_agent_start when session_start was not awaited");
+            const beforeAgentStart = pi.events.get("before_agent_start");
+            assert.ok(beforeAgentStart, "before_agent_start handler registered");
+            await beforeAgentStart({}, ctx);
+            assert.equal(pi.tools.length, 2, "ACP tools registered before _prepareRun freezes Turn 1 tool loadout and codemode_catalog");
+            assert.deepEqual(pi.tools.map((t) => t.name).sort(), ["acp_status", "compress"]);
         });
     } finally {
         await proxy.close();

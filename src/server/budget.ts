@@ -21,6 +21,24 @@ export { readOutputBudget };
 // compress nudge.
 const OUTPUT_CLAMP_MARGIN_PCT = 0.05;
 const OUTPUT_CLAMP_MIN_MARGIN = 2048;
+// #5278: safety inflation applied to the planning estimate BEFORE sizing both
+// the subtraction and the margin below. The margin exists to absorb the
+// ESTIMATOR's error, but it is computed from the very estimate whose error it
+// must absorb — self-referential. The heuristic estimator (defaultCountTokens:
+// CJK 1 token/char, rest chars/4) systematically understates CJK-heavy payloads
+// by ~5%, the same order as OUTPUT_CLAMP_MARGIN_PCT, so on those sessions
+// margin < actual error and the clamped total lands at exactly window+1 ->
+// upstream ContextWindowExceededError 502 (three field incidents on bili
+// 0.1.206/0.1.209, billed/estimated ratios 1.050011/1.050016/1.050020).
+// Inflating by S makes any true input up to S*estimate provably fit (both the
+// cap path and the #3071 floor path bound their output against the inflated
+// basis); with S=1.12 the compound reservation S*(1+MARGIN_PCT) additionally
+// covers underestimates up to u <= ~17.6%, ~3.5x the observed 5%. Deliberately
+// a module constant, not config surface: it hardens an invariant, it is not a
+// tuning knob. Behavior change vs pre-#5278: emitted caps tighten by up to
+// ~12% of the input estimate (field-validated 120–18891 tokens across a 1088-
+// sample sweep); previously-unclamped oversized requests may now clamp.
+const OUTPUT_CLAMP_ESTIMATE_SAFETY = 1.12;
 const OUTPUT_CLAMP_FLOOR = 1024;
 // #3071/#2490: capability floor for the clamped budget — see clampOutputBudget.
 const OUTPUT_CLAMP_MIN_OUTPUT = 4096;
@@ -280,30 +298,42 @@ export function estimateWireOverhead(protocol: "anthropic" | "openai" | "respons
  *  (fail-closed preserved). The sub-floor surrender above (cap < OUTPUT_CLAMP_FLOOR)
  *  stays byte-identical. */
 export function clampOutputBudget(requested: number, inputEstimate: number, nativeWindow: number, knownOutputCeiling?: number): number | undefined {
-    const margin = Math.max(OUTPUT_CLAMP_MIN_MARGIN, Math.ceil(inputEstimate * OUTPUT_CLAMP_MARGIN_PCT));
-    // #2011: max_tokens / max_completion_tokens / max_output_tokens are integer-typed on every
-    // wire protocol. Since v0.1.181 inputEstimate can carry a fraction: #1843 L1's learned
-    // per-route image cost (learnedImageReserve in cache-ledger.ts — an EMA over
-    // observed/nImages usage samples) takes precedence over the integer pixel/byte priors
-    // (#488) when fresh matching evidence exists, which made this cap fractional and strict
-    // upstreams rejected the whole turn with `max_tokens: Input should be a valid integer`.
-    // Floor at the decision point so the emitted budget is always an integer (floor <= exact
-    // headroom, so input+output <= window still holds).
-    // #3833: the window headroom cap can still sit ABOVE the model's declared
-    // output ceiling (window - input - margin > ceiling) — a 1M-window model with
-    // a 131072 output ceiling and ~827K input yields headroom 131577 > 131072.
-    // The ceiling is a hard upstream bound (strict providers reject max_tokens above
-    // it with 400), so cap BOTH the headroom and the #3071 floor to min(·, ceiling);
-    // absent a known ceiling (Infinity) every term is byte-identical to before.
     const ceilingBound = typeof knownOutputCeiling === "number" && Number.isFinite(knownOutputCeiling) ? knownOutputCeiling : Number.POSITIVE_INFINITY;
-    const cap = Math.min(Math.floor(nativeWindow - inputEstimate - margin), ceilingBound);
-    if (cap < OUTPUT_CLAMP_FLOOR || cap >= requested) return undefined;
-    // #3071: cap >= OUTPUT_CLAMP_FLOOR here. Never reduce below the capability
-    // floor, bounded by raw headroom so input+output <= window still holds.
-    const floorOut = Math.min(OUTPUT_CLAMP_MIN_OUTPUT, Math.floor(nativeWindow - inputEstimate), ceilingBound);
-    const clamped = Math.max(cap, floorOut);
-    if (clamped >= requested) return undefined;
-    return clamped;
+    const clampFor = (est: number): number | undefined => {
+        const margin = Math.max(OUTPUT_CLAMP_MIN_MARGIN, Math.ceil(est * OUTPUT_CLAMP_MARGIN_PCT));
+        // #2011: max_tokens / max_completion_tokens / max_output_tokens are integer-typed on every
+        // wire protocol. Since v0.1.181 est can carry a fraction: #1843 L1's learned
+        // per-route image cost (learnedImageReserve in cache-ledger.ts — an EMA over
+        // observed/nImages usage samples) takes precedence over the integer pixel/byte priors
+        // (#488) when fresh matching evidence exists, which made this cap fractional and strict
+        // upstreams rejected the whole turn with `max_tokens: Input should be a valid integer`.
+        // Floor at the decision point so the emitted budget is always an integer (floor <= exact
+        // headroom, so input+output <= window still holds).
+        // #3833: the window headroom cap can sit ABOVE the model's declared output
+        // ceiling (window - est - margin > ceiling). The ceiling is a hard upstream bound
+        // (strict providers reject max_tokens above it with 400), so cap BOTH the headroom
+        // and the #3071 floor to min(·, ceiling); absent a known ceiling (Infinity) every
+        // term is byte-identical to before.
+        const cap = Math.min(Math.floor(nativeWindow - est - margin), ceilingBound);
+        if (cap < OUTPUT_CLAMP_FLOOR || cap >= requested) return undefined;
+        // #3071: cap >= OUTPUT_CLAMP_FLOOR here. Never reduce below the capability
+        // floor, bounded by raw headroom so input+output <= window still holds.
+        const floorOut = Math.min(OUTPUT_CLAMP_MIN_OUTPUT, Math.floor(nativeWindow - est), ceilingBound);
+        const clamped = Math.max(cap, floorOut);
+        if (clamped >= requested) return undefined;
+        return clamped;
+    };
+    // #5278: judge on the safety-inflated estimate so a systematically low estimator
+    // cannot eat the margin (see OUTPUT_CLAMP_ESTIMATE_SAFETY).
+    const safe = clampFor(Math.ceil(inputEstimate * OUTPUT_CLAMP_ESTIMATE_SAFETY));
+    if (safe !== undefined) return safe;
+    // The inflated estimate dropped the cap below the capability floor (input alone
+    // nearly fills the window — preflight/self-heal territory) while the raw formula
+    // would still clamp (the #2490/#3071 pinned ledger shapes). Re-run on the raw
+    // estimate so we never surrender a clamp the raw formula applies — those regimes
+    // stay byte-identical. Every other safe-path no-op implies the same no-op on the
+    // raw path: a looser estimate only raises every term.
+    return clampFor(inputEstimate);
 }
 
 /** #2490: translate the refused dsh compaction replay size (recorded on the

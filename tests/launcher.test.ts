@@ -556,6 +556,99 @@ test("runLaunch pi: native -e plugin injected only when not installed", async ()
     }
 });
 
+// #5428: -s pi pins the proxy posture on the child. cli.ts records the pin as
+// overrides.BILI_PI_INLINE="0"; the launch path must layer it onto the child
+// env — stripInheritedProxy does NOT touch BILI_PI_INLINE, so without this a
+// hostile inherited BILI_PI_INLINE=1 would still arm the in-process engine in
+// the child while THIS launch's proxy sits idle.
+test("runLaunch pi #5428: -s posture override reaches the child env over a hostile inherited inline var", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-pis-"));
+    const prevHome = process.env.HOME;
+    const prevUserProfile = process.env.USERPROFILE;
+    const prevPiBin = process.env.PI_BIN;
+    const prevPiDir = process.env.PI_CODING_AGENT_DIR;
+    const prevInline = process.env.BILI_PI_INLINE;
+    process.env.HOME = home;
+    if (prevUserProfile !== undefined) process.env.USERPROFILE = home;
+    delete process.env.PI_CODING_AGENT_DIR;
+    // Hostile inheritance: the user's shell exported the inline opt-in.
+    process.env.BILI_PI_INLINE = "1";
+    const fakePi = path.join(home, process.platform === "win32" ? "fake-pi.exe" : "fake-pi");
+    fs.writeFileSync(fakePi, "");
+    process.env.PI_BIN = fakePi;
+    const piHome = path.join(home, ".pi/agent");
+    fs.mkdirSync(piHome, { recursive: true });
+    fs.writeFileSync(path.join(piHome, "models.json"), JSON.stringify({ providers: {} }));
+
+    // runLaunch only injects -e when dist/agent/pi.js exists; create a stub
+    // when running tests from a checkout without a prior build.
+    const root = selfPackageRoot();
+    const distAgent = path.join(root, "dist", "agent", "pi.js");
+    const stubbed = !fs.existsSync(distAgent);
+    if (stubbed) {
+        fs.mkdirSync(path.dirname(distAgent), { recursive: true });
+        fs.writeFileSync(distAgent, "");
+    }
+
+    const childEnvs: NodeJS.ProcessEnv[] = [];
+    const spawnImpl: SpawnFn = (cmd, _args, options) => {
+        if (cmd === fakePi) {
+            childEnvs.push({ ...(options?.env ?? {}) });
+            // runClient resolves on "exit" — fire it on next tick.
+            const child = makeFakeChild(0);
+            const orig = child.on!.bind(child);
+            (child as { on: SpawnChild["on"] }).on = (event, listener) => {
+                orig(event, listener);
+                if (event === "exit") setTimeout(() => listener(0, null), 0);
+                return child;
+            };
+            return child;
+        }
+        return makeFakeChild(42422);
+    };
+    const fetchImpl = async () => ({ ok: true });
+    const fetchHealthInfo = async () => ({ ok: true, pid: 42422 });
+
+    // runLaunch ends with process.exit() — stub it or it kills the test
+    // runner and every test registered after this one silently never runs.
+    const prevExit = process.exit;
+    const exitCalls: number[] = [];
+    process.exit = ((code?: number) => {
+        exitCalls.push(code ?? 0);
+        return undefined as never;
+    }) as typeof process.exit;
+
+    try {
+        // Control: without the pin the hostile inheritance reaches the child.
+        await runLaunch(
+            { client: "pi", clientArgs: [], overrides: {} },
+            { fetchImpl, fetchHealthInfo, spawnImpl, sleep: () => Promise.resolve() },
+        );
+        assert.equal(childEnvs[0]?.BILI_PI_INLINE, "1", "inherited inline var still reaches the child without -s");
+
+        // -s pi: the pin must beat the inheritance in the child env.
+        await runLaunch(
+            { client: "pi", clientArgs: [], overrides: { BILI_PI_INLINE: "0" } },
+            { fetchImpl, fetchHealthInfo, spawnImpl, sleep: () => Promise.resolve() },
+        );
+        assert.equal(childEnvs[1]?.BILI_PI_INLINE, "0", "-s pin overrides the inherited inline var for the child");
+        assert.deepEqual(exitCalls, [0, 0]);
+    } finally {
+        process.exit = prevExit;
+        process.env.HOME = prevHome;
+        if (prevUserProfile === undefined) delete process.env.USERPROFILE;
+        else process.env.USERPROFILE = prevUserProfile;
+        if (prevPiBin === undefined) delete process.env.PI_BIN;
+        else process.env.PI_BIN = prevPiBin;
+        if (prevPiDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+        else process.env.PI_CODING_AGENT_DIR = prevPiDir;
+        if (prevInline === undefined) delete process.env.BILI_PI_INLINE;
+        else process.env.BILI_PI_INLINE = prevInline;
+        if (stubbed) fs.rmSync(distAgent, { force: true });
+        rmrf(home);
+    }
+});
+
 test("runLaunch pi #535: refuses launch when http rewrites needed and extension cannot load; no overlay files written", async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-pirefuse-"));
     const prevHome = process.env.HOME;
@@ -7581,6 +7674,16 @@ test("runLaunch copilot: cert-MITM env (HTTPS_PROXY + combined SSL_CERT_FILE), i
     assertInheritedProxyStripped(seenEnv, String(origin));
 });
 
+test("runLaunch kiro: cert-MITM env (HTTPS_PROXY + combined CA on SSL_CERT_FILE and NODE_EXTRA_CA_CERTS), inherited proxy stripped", async () => {
+    const seenEnv = await captureLaunchedClientEnv("kiro");
+    const origin = seenEnv.BILLION_CONTEXT_PROXY;
+    assert.ok(/^http:\/\/127\.0\.0\.1:\d+$/.test(String(origin)), `origin: ${origin}`);
+    const combined = path.join("billion-context", "ca", "combined-ca.pem");
+    assert.ok(String(seenEnv.SSL_CERT_FILE).endsWith(combined), String(seenEnv.SSL_CERT_FILE));
+    assert.ok(String(seenEnv.NODE_EXTRA_CA_CERTS).endsWith(combined), String(seenEnv.NODE_EXTRA_CA_CERTS));
+    assertInheritedProxyStripped(seenEnv, String(origin), { NO_PROXY: "localhost,127.0.0.1,::1", no_proxy: "localhost,127.0.0.1,::1" });
+});
+
 test("runLaunch amp: cert-MITM env (HTTPS_PROXY + combined SSL_CERT_FILE), inherited proxy stripped (#1049)", async () => {
     const seenEnv = await captureLaunchedClientEnv("amp");
     const origin = seenEnv.BILLION_CONTEXT_PROXY;
@@ -8188,7 +8291,7 @@ test("ensureProxyRunning: a squatter without a matching child record ends in a l
 // first read sees nothing, so the #1753 squatter branch provably fires before
 // the handshake settles (gating on read count taken AT SPAWN, immune to
 // however many times pre-spawn discovery reads the file).
-const SQUATTER_MSG = "bili: port 18787 answers health (pid 875250) but is not the proxy this launcher spawned (child pid 42451) — waiting for the spawned instance to report its real origin";
+const SQUATTER_MSG = "bili: port 18787 answers health (pid 875250) but is not the proxy this launcher spawned (child pid 42451) — waiting for the spawned instance to report its real origin; if that never happens, kill pid 875250 or set native.attachExternal=true / BILI_NATIVE_ATTACH_EXTERNAL=1 to attach to the holder instead";
 function makeSquatterScenario(debug: boolean, attachDiag?: (msg: string) => void) {
     let childToken = "";
     let preSpawnReads = -1;

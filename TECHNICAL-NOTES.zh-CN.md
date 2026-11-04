@@ -130,3 +130,37 @@ dsh 插件道中,body-keyed 中转站能读到的身份信号只有一个:请求
 - **双模式推理** —— 只有插件道(注册 agent / dsh 插件,内部会话头在场)会打戳;纯代理模式双向都是原样透传,逐字节不变。
 
 pi/omp 线路沿用各自的独立打戳门(上文 Responses 线路的 `prompt_cache_key` 提升、Cowork 弃戳)——本节只讲 OpenAI **聊天**线路。
+
+### #5079:政策反转 —— 自注入默认关闭,一个开关管住两条 wire
+
+owner 定案(取代 #2649 的默认全盖章裁决):大量服务见到这个字段会直接拒绝请求,而这类服务无法预先枚举 —— 所以 bili 不再主动写自己的 `prompt_cache_key`,除非用户要求。闸门是**既有**的 `promptCache.routing` 开关(`ACP_PROMPT_CACHE_ROUTING`,或 Web UI 快速配置),现在同时管住 bili 在**两条 wire** 上的自注入 —— 不新增任何配置面:
+
+- `"disabled"`(新默认;无法识别的值一律落到这里):bili 任何地方都不写自己的 key。客户端自带的 key 不受此闸门影响 —— 任何模式下都原样转发(上面的 A/B 探测记忆仍会撤掉已被证实拒收该 key 的 origin+model 组合上的客户端 key)。
+- `"auto"`:完全等于 #5079 之前的行为 —— chat wire 每个插件车道请求都盖,Responses wire 仅对 `api.openai.com` 注入。
+- `"enabled"`:所有支持的车道都盖/注(Responses wire:任意 host)。
+
+chat wire 上 bili 自己 vs 客户端自带:插件车道上,请求体里等于绑定会话 id 的 key 只可能是 bili 自己的机制回显(让客户端 key 赢得身份绑定的提升机制要求内部会话头缺席),因此算 bili 自注入、`"disabled"` 下被剥掉;其他取值保持客户端所有、原样转发。Responses wire 同理:显式 body key 等于会话 id 且身份未被提升时算 bili 自己打的(omp/dsh 扩展所打);身份已提升则说明是客户端提供的。
+
+升级提示(owner 要求):运行 `"disabled"` 的实例展示一次性提示 —— Web 面板横幅(可关闭,按实例持久化在 state 目录 `upgrade-notices.json`)、`acp_status` 一行、启动日志一行 —— 点名应切回 `"auto"`/`"enabled"` 的人群:workbuddy panel/hub 之类的中转站与号池,缺了这个 key 流量随机路由、前缀缓存亲和下降。直连官方 API 的用户忽略即可。关闭提示不会改动 routing 的值。
+
+测试:`tests/issue5079-pck-default-off.test.ts`(解析兜底、双 wire 矩阵含 bili 回显行、提示模块、默认关/auto 成对的活代理出口断言)+ `tests/issue2218-relay-affinity-signal.test.ts` 的更新矩阵。
+
+## 全量重发水位快路径(#5403 / #5418)
+
+插件车道宿主(dsh threads 模型等——每轮把完整历史加新尾巴整体重发的客户端)过去每轮要付三笔钱:整包 body 的 `JSON.parse`、全量 `openaiToCore` 转换、以及把结果 AST 钉进 `session.lastMessages` 跨轮驻留(`snapshotMessages`)。#5403 的规模(2 万消息、每轮约 81 MiB 入站)下,这一对就是两小时内六次撞爆 JS 堆上限的生产者。
+
+现在这条车道携带一个水位线。每个成功的插件车道 chat-completions 响应都会盖 `x-bili-pf-seq` = 该请求 `messages` 数组的服务端实测元素数 T。T 由 `src/server/fastpath-scan.ts` 的单遍结构扫描器测出(字符遍历 + 字符串状态机):它验证足够的 JSON 以可信,但只分配跨度偏移——无 AST、无全量解析。客户端收敛为**一台状态机**(`src/agent/pf-channel.ts`)+ **一个发戳点**:全局 fetch 拦截(`src/agent/native-intercept.ts`)对全部插件车道模型请求盖 `x-bili-pf-count`(与下文 v2 tail-ids)——`/bili/` 路由分支、provider URL 重写分支(attach 模式、V1 fetch patch)、**以及直连代理的自分支**(provider URL 直指 bili 根,dsh profile bundle 即此类)三条出网点盖戳+学习对称(自分支是容器化 gate 跑出「该车道静默永不盖戳」后补的)——车道从此不再各自实现握手。
+
+**与增量车道(#3248/#4491)的关系——可同开、互不双处理**:两机制打的是同一个痛点(插件宿主全量重发),但按**请求形状逐回合分轨**。dsh shim 的 divert 只接 **anthropic wire** body(`wireMessagesLookAnthropic`;OpenAI tool 形态 `role:"tool"`/`tool_calls` 恒走全量重发,#3433)——而 #5403 恰是相反的线(chat-completions / openai profile),增量车道在那种会话里从不发散。所以两条是互补不是竞争:anthropic-wire 插件会话归增量车道,OpenAI chat-completions 插件会话归水位快路径。单个请求恒走其中一条路(shim 逐回合二选一);服务端对带 `x-bili-plugin-turn` 标记的请求整体跳过水位判定(不打混合标),divert 响应不盖 pf-seq(盖的是 `x-bili-applied-seq`);lane 重入的合成请求头上游用显式白名单(`PASSTHROUGH_HEADERS`),不含 pf-* → 握手头经这条路也漏不出去。残留无害情形:混用会话里陈旧 `x-bili-pf-count` 可能多陪跑一次验证轮,响应当轮重盖真值即收敛。
+
+身份通道 v2/v3(owner 层级 msgid>顺序>hash,#11):裸 count 只按**位置**钉边界——保元素数改写的客户端不可见。我们的 shim 在环时,请求额外携带 `x-bili-pf-tail-ids`:元素 K−1(上一轮锚点)的宿主 msgid + 全部新增元素——「几个,不是几十个」。宿主不在 chat-completions body 里发 id,但我们注入的扩展能从宿主上下文读到(与增量信封同一套逐元素规则,#4491),因此不需要宿主发版。线上形态为**逐段**百分号编码(`ids.map(encodeURIComponent).join(",")`):分隔逗号保持字面量、id 内部的逗号走 %2C,服务端「先拆后解」对任意 id 字母表都无歧义。**不做对齐证明**(owner 裁定 2026-11-02:宿主本就压缩/改写历史,证明门槛与现实对抗、反而杀死通道——msgid 永不复用,顺序在已验证增量窗内绑定身份,字节级头部比对才是边界真值)。采集因此是**逐槽**的:拿不到可用宿主 id 的元素(native-compaction 摘要 `acp_summary_*`、persona 副车、外来形状、重复 id)随未知槽占位符 `?`(线上 `%3F`)旅行,不毒害邻居;只有整份都解析不出来才清空存储。判决:长度不符/真实 id 重复/坏段 ⇒ **静默降级本轮、不计熔断**(shim↔代理失步靠 legacy 路径+重盖戳自愈);prevId ≠ 存锚 ⇒ UNcredited,且仅当**两侧都是已知 id**时才校验——任一侧是 `?` = 无身份主张(不惩罚)。缺头 ⇒ 纯计数模式,v2 之前的一切行为逐字不变。车道覆盖是**协议统一**的(owner 裁定:客户端之间只允许「在哪拿到 id」不同,其余一律归一):dsh 从宿主 dispatch 上下文逐槽直读(`pfSlotIdsOf`,`?` 占位,见上);pi 用共享 entry walker 按出体族对齐 session branch 条目(anthropic `laneMsgIdsForWire`,openai-chat `laneMsgIdsForOpenAiWire`);opencode 复用其 messages-transform 钩子为增量信封已对齐的同一份验证列表(#4491),omp 用 fetch 层「宿主 `before_provider_request` 暂存 branch 条目 vs 实际出体」的对齐结果(`ompTurnMsgIds`,与信封共用同一份;**仅跑 anthropic wire 回合**——其严格 count+role 证明桥不过 config-assembled 前导 system 段,失败清空会抹掉共享钩子对同一会话刚落下的列表;openai 形回合由共享 `laneMsgIdsForOpenAiWire` 解析器单独覆盖,#2583)。pi/opencode/omp 的 walker 解析器仍是全有全无、整份失败即清空存储列表(它们的失败意味着**位置知识本身缺失**,清空是诚实的)——无法证明的请求降级回纯计数,绝不骑陈旧锚点;dsh 逐槽采集不受此限(见上)。一条协议注记:chat-completions 的 body 以前导 system|developer 元素开头,它们由 config/state 组装、**没有 branch entry**;openai 解析器用位置钉死的合成令牌(`bili-ps-<i>`——槽位稳定、字符安全、不可能与 8-hex uuid entry id 混淆)覆盖该前导段,链不会死在第一个 system 元素上,槽位挪动则像真实改写一样诚实断锚(UNcredited,自愈)。
+
+命中条件:窗口起点 K 已定局、进程内种子(上一轮的 canonical cores,模块级 `WeakMap<Session, …>`,刻意放在 Session 对象之外,让面板字段分解如实反映会话真相)恰在该 count、同模型下盖过戳。**v4 计数降级(owner 裁定 2026-11-02)**:某轮带形状合格且宽度与服务端账本吻合(`len = T − K + 1`,服务端重验)的 `x-bili-pf-tail-ids` 列表时,K 取自**服务端账本**(`seed.stampT`),回带的 `x-bili-pf-count` 该轮降级为纯诊断——缺失或错乱的回显不再产生 miss(决策串留痕 `hit(no-count)` / `hit(count-off=N)`,永不喂熔断);无合格列表时 pre-v4 阶梯逐字节不变(回带值须等于 `stampT` 且严格小于 T)。前 8 个元素重转后 system 逐字一致、窗口首非 system/developer(hoist 会失步 `reconcileSystemAnchor`)。命中时管道拿到的是「[种子 cores] + [尾窗 [K..T) 现解析的 cores]」而非全量解析,且 `snapshotMessages` 只钉尾窗。尾窗 cores 必须按前缀重新编号:`openaiToCore` 铸造 cluster id 按调用内出现次序(`h_<sha256-16>` 基名加 `_N` 后缀)、`wireIndex` 取自所给数组的位置——前缀里出现过同样内容基名的,窗口这边必须接上序号,否则账本身份契约就断;K=1 时不重编号甚至会把两条不同的 wire 消息**合并**成一条(prune 的 first-user-pin 在同一 wireIndex 上扩展 run)。
+
+失败即软着陆(反偏离锁):legacy 管道代码**原封未动**——本特性只在调用方喂进去的输入上做替换,任何疑点(无/坏/旧 stamp——除非 v4 账本级 tail-ids 列表撑场、count 倒退、零增长——零增长即便带合格单元素列表也保 `no-progress`(空窗会钉空 `lastMessages` 基线)、模型切换、头部漂移、hoist 险、扫描失败、熔断器持有)整轮回退到那条没动过的全量路径,然后**重新盖戳**,客户端一轮之内收敛到真值。5 次连续「可归因」(credited)miss 触发熔断,车道停摆一小时不再取命中——持有期间仍持续扫描并盖戳(如果持有期不发戳,客户端水位线就永远卡在旧值,这个死锁在上线前已被单元测试抓住并钉死)。可归因指能证明不是我们错(客户端说谎或改写了历史);未播种/零增长这类 miss 免费。
+
+声明的信任边界(§7.4——必须人工评审,禁止自动合并):**保元素数不变的前缀字节改写不可检测**——锚点除外:v2 在锚点比对 carried prevId 与存锚,id 重铸 = 一次 UNcredited miss + 下一轮自愈。这就是跳过逐条字节复核的全部代价;该代价已过 §7.4 人工评审,故以**实验性灰度**出厂——默认仅约 5% 的安装开启(owner 裁定 2026-11-02:先小流量,web 面板对全部安装显示一次性公告直到关闭、快速配置提供三态开关),A/B 黄金测试钉死出站字节逐字一致,并提供 per-install 开/关(`rollout.features.pluginFullResendWatermark: true|false` / `BILI_ROLLOUT_PLUGIN_FULL_RESEND_WATERMARK=1|0`)。破坏性改写(通告 compaction、截断、重排)都会改变 count,在任何陈旧 core 喂给内核之前就被判掉——在 v4 下这道拦截从客户端回显移到宽度算式本身:前缀收缩要求一个非正宽度,任何 id 列表都不可能满足,credited `ahead` / `seed-stale` 判决与 pre-v4 完全一致地触发。
+
+诚实边界:(1) 一旦多模态尾部(含 `image_url` 的 content array)进入缓存,该段历史此后整段降级回 legacy 全量轮——kernel 按位置区分 user 图片消息在尾部与在历史中部的渲染,冻结缓存无法做到位置无关地复现 legacy 字节;纯文本工作负载(#5403 报告者的形态)不受影响。(2) 每次命中会现解析头部 8 个元素,只为做 system-run 校验。(3) 两个 `x-bili-pf-*` 头都在转发上游前剥掉(`UPSTREAM_HOP_HEADERS`)——协议头绝不漏进模型流量。
+
+实测(出处:`tests/issue5403-watermark-fastpath.test.ts`,同语料 hermetic 双代理 A/B):命中轮完全跳过全量解析/转换/钉存;含一个 multipart 图片落位回合的 8 回合语料上,常驻 `lastMessages` 8684 B → 1210 B(7.2×);全程出站字节与 legacy 逐字一致(仅 kernel `time="…"` 属性归一);两个阶段捕获到的上游请求里均无 `x-bili-pf-*`。单元覆盖:`tests/fastpath.test.ts`(verdict 阶梯全表,含熔断 TTL 解除后重播种)、`tests/fastpath-scanner.test.ts`(对抗 JSON 表、深度上限、surrogate 对、5 万元素规模)、`tests/lane-decisions-matrix.test.ts`(门矩阵,双向)。
