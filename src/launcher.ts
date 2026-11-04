@@ -4596,7 +4596,7 @@ export function probeNodeMajor(candidate: string, env: NodeJS.ProcessEnv): numbe
 
 /** #5663: the identity a candidate reports about itself — its own execPath and,
  *  when it is an Electron binary running as Node, the Electron version. */
-export interface NodeRuntimeIdentity {
+interface NodeRuntimeIdentity {
     execPath: string;
     electron?: string;
 }
