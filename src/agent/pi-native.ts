@@ -80,10 +80,17 @@ export function planNativePi(env: NodeJS.ProcessEnv, fileInline: boolean | undef
     // Explicit choices keep the historical precedence — an explicit env OFF
     // still suppresses a file-true value (env > file, #3278 contract):
     if (!inlineEnvOff && (inlineEnvOn || fileInline === true)) return { mode: "inline" };
-    const attachOrigin = nativeAttachOrigin(env) ?? proxyEnvOrigin(env);
-    // An ANNOUNCED attach target beats the #5428 inline default: `bili pi`
-    // sets BILLION_CONTEXT_PROXY before the child starts, and its launcher
-    // proxy must keep serving that child.
+    // #5645: an inherited INLINE_ORIGIN is not an announced attach target. The
+    // inline placeholder (src/inline-engine.ts) only means something to the
+    // process that booted the in-process engine. It appears in a process's
+    // INITIAL env ONLY when that process is a nested child (e.g. a pi-subagents
+    // acp_delegate session spawned with {...process.env}) of an inline parent.
+    // Such a child must run ITS OWN in-process engine (#5428 default) rather than
+    // attach to a host that never listens — so discount the placeholder and let
+    // the child resolve its own posture below. A REAL launcher origin (`bili pi`
+    // sets a live proxy) is untouched and still beats the default.
+    const rawAttach = nativeAttachOrigin(env) ?? proxyEnvOrigin(env);
+    const attachOrigin = rawAttach === INLINE_ORIGIN ? undefined : rawAttach;
     if (attachOrigin !== undefined) return { mode: "attach", attachOrigin };
     // #5428 default flip (supersedes #4687): with NO explicit choice anywhere
     // (env unset/blank AND file unset) the lane runs INLINE in-process. Reach
