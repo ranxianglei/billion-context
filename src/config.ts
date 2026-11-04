@@ -1221,8 +1221,11 @@ function warnCompressOnlyFieldsAtRouteRoot(key: string, obj: Record<string, unkn
 /** True when the providers-map key is itself a URL lane (http/https/mitm
  *  scheme — mitm:// is the README-documented lookup key for MITM traffic).
  *  Anything else is a NAMED key (provider id): routing-inert on its own,
- *  meaningful via `compactionOptIn` (#1392) and/or `bind` (#1469). */
-function isUrlLikeKey(key: string): boolean {
+ *  meaningful via `compactionOptIn` (#1392) and/or `bind` (#1469).
+ *  Exported so the whole-file config save path (web/api.ts) classifies URL
+ *  lanes vs named recipes with the SAME predicate the runtime uses, instead
+ *  of an https-only regex that mis-rejects documented mitm:// lanes (#5620). */
+export function isUrlLikeKey(key: string): boolean {
     return /^(https?|mitm):\/\//i.test(key.trim());
 }
 
