@@ -453,7 +453,20 @@ export function applyOrderSnapshot(entries: OrderSkeletonEntry[]): number {
  *  raw id + the request's history in, the conversation key out. The old
  *  ladder consumed (systemText, model) and keyed by system-hash; the v2
  *  resolver is content-blind and keys by order+id with fragment guards,
- *  so those parameters are simply gone. */
-export function personaConversationOrder(rawId: string, history: unknown, personaTag?: string, declaredModel?: string, laneToken?: string, laneDiscriminator?: string): string {
-    return resolveSessionOrder(rawId, history, personaTag ?? "", declaredModel, laneToken, laneDiscriminator).key;
+ *  so those parameters are simply gone. #5686 P1-1: optional `onResolve`
+ *  hands the FULL resolution back to the caller — pre-fix this adapter
+ *  dropped action/reason, so fork (`derived-*`) and anchor-migration
+ *  (`reanchor`) decisions were invisible in production logs. */
+export function personaConversationOrder(
+    rawId: string,
+    history: unknown,
+    personaTag?: string,
+    declaredModel?: string,
+    laneToken?: string,
+    laneDiscriminator?: string,
+    onResolve?: (rawId: string, resolution: SessionOrderResolution) => void,
+): string {
+    const resolution = resolveSessionOrder(rawId, history, personaTag ?? "", declaredModel, laneToken, laneDiscriminator);
+    onResolve?.(rawId, resolution);
+    return resolution.key;
 }

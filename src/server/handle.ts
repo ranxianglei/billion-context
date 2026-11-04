@@ -35,7 +35,7 @@ import { emitPreflightError } from "../stream-error.js";
 import { agentProviderRecipes } from "../agent-providers.js";
 import { affinityToken, anthropicFirstUserFrag, claudeAnthropicPersonaOrderApplies, conversationHeaderSource, claudeSubagentAgentId, claudeSubagentSplit, claudeSubagentLaneTokenOf, clientConversationHeader, codexTurnIdentity, dshPersonaFingerprintApplies, instructionsFingerprintApplies, openaiSystemTextForPersona, preferPromptCacheKeyIdentity, zcodeMemoryConversation } from "../session-id.js";
 import { preferKiroConversationIdentity } from "../kiro.js";
-import { personaConversationOrder } from "../session-resolve.js";
+import { personaConversationOrder, type SessionOrderResolution } from "../session-resolve.js";
 import { prefixAffinity, describeResumeMiss, type AnonymousAffinity } from "../prefix-affinity.js";
 import { buildAnonymousProvenance, type AnonymousProvenance } from "../anon-provenance.js";
 import { maybeAdoptForkBlocks, maybeAdoptResume, maybeAdoptDerivedFork } from "../fork-adoption.js";
@@ -94,6 +94,21 @@ function persistLineageLinkNow(session: Session): void {
     void getStore().writeNow(session).catch((err) => {
         loggerLog("warn", `[${session.id}] [lineage] immediate lineage persist failed (${String(err)}); the debounced save will retry (#2986)`);
     });
+}
+
+/** #5686 P1-1: the order resolver's fork/migration decisions were invisible
+ *  in production (the wiring adapter returned only the key) — a session could
+ *  deterministically fork onto a |sub:<fp> lane and nobody would find out
+ *  until the user hit the symptom days later. Persistent [session-resolve]
+ *  lines for the two decision classes that matter: derived-* forks warn (the
+ *  abnormal event), reanchor migrations info; claim/continue stay silent —
+ *  they are the steady state and would log once per request. */
+function noteSessionResolution(rawId: string, resolution: SessionOrderResolution): void {
+    if (resolution.action === "reanchor") {
+        loggerLog("info", `[session-resolve] ${rawId} → ${resolution.key}: anchor migrated — ${resolution.reason}`);
+    } else if (resolution.action !== "claim" && resolution.action !== "continue") {
+        loggerLog("warn", `[session-resolve] ${rawId} → ${resolution.key}: forked (${resolution.action}) — ${resolution.reason}`);
+    }
 }
 
 /** Vertex model ids are mixed-convention — `claude-haiku-5-5` is bare while
@@ -1106,6 +1121,9 @@ async function handleRequest(
                           (parsed as GoogleRequestBody).contents,
                           personaSystemText,
                           pluginReportedModel(req.headers),
+                          undefined,
+                          undefined,
+                          noteSessionResolution,
                       ))
                 : (googleIdentity?.value ?? googleSignal))
             : protocol === "anthropic"
@@ -1135,6 +1153,9 @@ async function handleRequest(
                                (parsed as AnthropicRequestBody).messages,
                                personaSystemText,
                                pluginReportedModel(req.headers),
+                               undefined,
+                               undefined,
+                               noteSessionResolution,
                            ))
                      : claudeAnthropicPersonaOrderApplies(req.headers) && opts.subagentSplit !== false
                        && !sideRequestLike && personaSystemText !== ""
@@ -1165,6 +1186,7 @@ async function handleRequest(
                            pluginReportedModel(req.headers),
                            claudeSubagentLaneTokenOf((parsed as AnthropicRequestBody).messages),
                            anthropicFirstUserFrag((parsed as AnthropicRequestBody).messages),
+                           noteSessionResolution,
                          )
                        : anthropicIdentity?.value ?? anthropicSignal)
              : protocol === "openai"
@@ -1174,6 +1196,9 @@ async function handleRequest(
                           (parsed as OpenAIRequestBody).messages,
                           personaSystemText,
                           pluginReportedModel(req.headers),
+                          undefined,
+                          undefined,
+                          noteSessionResolution,
                       )
                     : openaiIdentity?.value ?? openaiSignal)
               : codexTurn
@@ -1196,6 +1221,9 @@ async function handleRequest(
                           (parsed as ResponsesRequestBody).input,
                           (parsed as ResponsesRequestBody).instructions ?? "",
                           pluginReportedModel(req.headers),
+                          undefined,
+                          undefined,
+                          noteSessionResolution,
                       )
                  : opts.stableSystemAnchor && pluginAgentHeader(req.headers) === undefined
                    // #1085: with anchoring on (plain-proxy mode only — see the
@@ -1236,6 +1264,9 @@ async function handleRequest(
                                 (parsed as ResponsesRequestBody).input,
                                 (parsed as ResponsesRequestBody).instructions ?? "",
                                 pluginReportedModel(req.headers),
+                                undefined,
+                                undefined,
+                                noteSessionResolution,
                           )
                           : (responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader)))
                       : (responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader));
