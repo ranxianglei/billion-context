@@ -6,7 +6,7 @@ import { defaultConfig } from "acp-kernel";
 import { startServer } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _resetSessionsForTest, peekSession } from "../src/session.ts";
-import { claudeSubagentAgentId, claudeSubagentSplit } from "../src/session-id.ts";
+import { anthropicFirstUserFrag, claudeSubagentAgentId, claudeSubagentSplit } from "../src/session-id.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 
@@ -119,18 +119,28 @@ async function startHarness(upstream: http.Server, over: Partial<ProxyOptions> =
 const sessionHeaders = { "x-claude-code-session-id": SESSION };
 const subagentHeaders = { "x-claude-code-session-id": SESSION, "x-claude-code-agent-id": SUB_AGENT, "x-claude-code-parent-agent-id": "a47c8f3e8bac7386b" };
 
-// System-block shapes captured from live Claude Code 2.1.274 traffic.
+// System-block shapes captured from live Claude Code 2.1.274 & 2.1.308 traffic.
 const MAIN_INTERACTIVE_SYSTEM = ["You are Claude Code, Anthropic's official CLI for Claude. You are an interactive agent..."];
 const MAIN_PRINT_SYSTEM = ["x-anthropic-billing-header: cc_version=...", "You are a Claude agent, built on Anthropic's...", "You are an interactive agent that helps..."];
 const GENERAL_PURPOSE_SUB_SYSTEM = ["x-anthropic-billing-header: cc_version=...", "You are a Claude agent, built on Anthropic's...", "This session is a background job. The..."];
 const EXPLORE_SUB_SYSTEM = ["x-anthropic-billing-header: cc_version=...", "You are a Claude agent, built on Anthropic's...", "You are a file search specialist for..."];
+const CLAUDE_CODE_SDK_SUB_SYSTEM = [
+    "You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK.",
+    "You are an agent for Claude Code, Anthropic's official CLI for Claude. Given the user's message, you should use the tools available to complete the task...",
+];
+const CLAUDE_CODE_SDK_MAIN_SYSTEM = [
+    "You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK.",
+    "\nYou are an agent working with the user toward their goals, using your own judgment along the way.",
+];
 
 test("claudeSubagentAgentId: two-signal discrimination (headers + main system prefixes)", () => {
     assert.equal(claudeSubagentAgentId(subagentHeaders, GENERAL_PURPOSE_SUB_SYSTEM), SUB_AGENT, "general-purpose subagent splits");
     assert.equal(claudeSubagentAgentId(subagentHeaders, EXPLORE_SUB_SYSTEM), SUB_AGENT, "custom agent type (Explore) splits");
+    assert.equal(claudeSubagentAgentId(subagentHeaders, CLAUDE_CODE_SDK_SUB_SYSTEM), SUB_AGENT, "SDK subagent with 'running within the Claude Agent SDK' splits");
     assert.equal(claudeSubagentAgentId({ "x-claude-code-session-id": SESSION, "x-claude-code-agent-id": SUB_AGENT }, EXPLORE_SUB_SYSTEM), SUB_AGENT, "agent-id without parent still splits (custom agent types send no parent header)");
     assert.equal(claudeSubagentAgentId({ "x-claude-code-agent-id": "a47c8f3e8bac7386b" }, MAIN_PRINT_SYSTEM), undefined, "-p main turn (agent-id present, interactive system block) must not split");
     assert.equal(claudeSubagentAgentId({ "x-claude-code-agent-id": "a47c8f3e8bac7386b" }, MAIN_INTERACTIVE_SYSTEM), undefined, "interactive main turn must not split even with agent-id");
+    assert.equal(claudeSubagentAgentId({ "x-claude-code-agent-id": "a47c8f3e8bac7386b" }, CLAUDE_CODE_SDK_MAIN_SYSTEM), undefined, "SDK main turn (agent-id present, working with user toward goals) must not split");
     assert.equal(claudeSubagentAgentId(sessionHeaders, MAIN_INTERACTIVE_SYSTEM), undefined, "no agent headers must not split");
     assert.equal(claudeSubagentAgentId(subagentHeaders, []), SUB_AGENT, "no system at all but agent headers present splits (header-only fallback)");
     assert.equal(claudeSubagentAgentId({ "x-claude-code-agent-id": "  ", "x-claude-code-parent-agent-id": "p" }, EXPLORE_SUB_SYSTEM), "p", "blank agent id falls back to the parent id");
@@ -223,3 +233,30 @@ test("#970 gate: subagentSplit:false restores the single-session behavior", asyn
         await close(upstream);
     }
 });
+
+test("anthropicFirstUserFrag strips leading <system-reminder> blocks so long shared reminders do not collide in 1024-char cap", () => {
+    const sharedReminder = `<system-reminder>\n${"Codebase instructions line.\n".repeat(80)}</system-reminder>`;
+    const messagesA = [
+        {
+            role: "user",
+            content: [
+                { type: "text", text: sharedReminder },
+                { type: "text", text: "Task arm A: explore gateway_service.go" },
+            ],
+        },
+    ];
+    const messagesB = [
+        {
+            role: "user",
+            content: [
+                { type: "text", text: sharedReminder },
+                { type: "text", text: "Task arm B: explore gemini_messages_compat_service.go" },
+            ],
+        },
+    ];
+    const discA = anthropicFirstUserFrag(messagesA);
+    const discB = anthropicFirstUserFrag(messagesB);
+    assert.notEqual(discA, "", "discriminator A should be non-empty");
+    assert.notEqual(discA, discB, "subagents with >1024 chars shared <system-reminder> and distinct task prompts must not collide");
+});
+

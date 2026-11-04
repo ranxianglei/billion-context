@@ -303,6 +303,13 @@ export function openaiSystemTextForPersona(body: { messages?: unknown }): string
  *  whose content holds no top-level text (pure tool_result) are skipped. ""
  *  when nothing is usable → the call site degrades to the two-segment lane
  *  key. Body-only read: no header literals here (B-class guard). */
+const LEADING_SYSTEM_REMINDER_RE = /^(?:\s*\x3csystem-reminder\x3e[\s\S]*?\x3c\/system-reminder\x3e\s*)+/;
+
+function stripLeadingSystemReminders(text: string): string {
+    const stripped = text.replace(LEADING_SYSTEM_REMINDER_RE, "").trim();
+    return stripped.length > 0 ? stripped : text;
+}
+
 export function anthropicFirstUserFrag(messages: unknown): string {
     const list = Array.isArray(messages) ? messages : [];
     const cap = 1024;
@@ -310,7 +317,7 @@ export function anthropicFirstUserFrag(messages: unknown): string {
         if (m === null || typeof m !== "object" || (m as { role?: unknown }).role !== "user") continue;
         const content = (m as { content?: unknown }).content;
         if (typeof content === "string") {
-            if (content.length > 0) return content.slice(0, cap);
+            if (content.length > 0) return stripLeadingSystemReminders(content).slice(0, cap);
         } else if (Array.isArray(content)) {
             const parts: string[] = [];
             for (const part of content) {
@@ -319,7 +326,7 @@ export function anthropicFirstUserFrag(messages: unknown): string {
                 }
             }
             const joined = parts.join("\n\n");
-            if (joined.length > 0) return joined.slice(0, cap);
+            if (joined.length > 0) return stripLeadingSystemReminders(joined).slice(0, cap);
         }
     }
     return "";
@@ -506,11 +513,13 @@ export function codexTurnIdentity(headers: Record<string, string | string[] | un
  *    the parent header is NOT reliable (general-purpose `-p` subagents send
  *    it, custom agent types like Explore do not).
  *
- * 2. SYSTEM: the MAIN agent's system always contains a block starting with
- *    one of the MAIN_SYSTEM_PREFIXES ("You are Claude Code…" for interactive
- *    sessions, "You are an interactive agent…" for -p/SDK sessions), while a
- *    subagent's system blocks are its agent definition ("This session is a
- *    background job…", "You are a file search specialist for…", …) — no
+ * 2. SYSTEM: the MAIN agent's system always contains a block identifying
+ *    it as the interactive main session ("You are an interactive agent…",
+ *    "You are an agent working with the user toward their goals…", or the
+ *    legacy standalone "You are Claude Code, Anthropic's official CLI for Claude."
+ *    without SDK subagent markers), while a subagent's system blocks are its
+ *    agent definition ("This session is a background job…", "You are an agent
+ *    for Claude Code…", "You are a file search specialist for…", …) — no
  *    stable positive marker exists across agent types, so the check is
  *    negative: none of the main prefixes may match.
  *
@@ -528,7 +537,10 @@ export function codexTurnIdentity(headers: Record<string, string | string[] | un
  * Responses branch. Clients without these headers (older Claude Code, other
  * agents, curl) are untouched.
  */
-const MAIN_SYSTEM_PREFIXES = ["You are Claude Code", "You are an interactive agent"] as const;
+const MAIN_SYSTEM_PREFIXES = [
+    "You are an interactive agent",
+    "You are an agent working with the user toward their goals",
+] as const;
 
 export function claudeSubagentAgentId(
     headers: Record<string, string | string[] | undefined>,
@@ -544,7 +556,12 @@ export function claudeSubagentAgentId(
     if (agentId === undefined && parentId === undefined) return undefined;
     const isMain = systemBlocks.some((block) => {
         const t = block.trimStart();
-        return MAIN_SYSTEM_PREFIXES.some((p) => t.startsWith(p));
+        if (MAIN_SYSTEM_PREFIXES.some((p) => t.startsWith(p))) return true;
+        // Claude Code CLI interactive header: "You are Claude Code, Anthropic's official CLI for Claude."
+        // In Claude Code 2.1.308+, SDK subagents also start with "You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK."
+        // Exclude SDK subagent header from treating the turn as main.
+        if (t.startsWith("You are Claude Code") && !t.includes("running within the Claude Agent SDK")) return true;
+        return false;
     });
     if (isMain) return undefined;
     return agentId ?? parentId;
