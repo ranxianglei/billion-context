@@ -49,10 +49,11 @@ const SIZE_BUCKET_TOK = 20000;
 const LOST_LOGGED_KEY = "foldCoverageLostLogged";
 
 // #5646: blockIds whose dead-block transition was already logged — one warn per
-// fold per boot instead of one per usage sample. Unlike coverage loss there is
-// no restore entry to delete: liveness is re-derived from the state every
-// sample, so re-logging only happens if the same block id genuinely dies twice
-// within one boot (reap → host resync restores it → reap again).
+// block id instead of one per usage sample. Unlike coverage loss there is no
+// restore entry to delete (liveness re-derives from the state every sample and
+// a recovered block resumes accruing silently), so a block that dies, returns
+// and dies again stays quiet after its first warn; the map persists with the
+// session metadata, so this holds across daemon restarts too.
 const DEAD_LOGGED_KEY = "foldBlockDeadLogged";
 
 function median(xs: number[]): number | null {
