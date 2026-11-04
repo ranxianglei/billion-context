@@ -9,7 +9,8 @@
  *    first divergent slot (names only — values never reach the log line,
  *    same privacy contract as the #3919 fingerprints);
  *  - while a session is drift-latched the stored prefix is proven
- *    untrustworthy, so the delta fast path must not vouch for it: every
+ *    untrustworthy, so the delta fast path must not vouch for it (BOTH
+ *    lanes — the sync record() and the backend-queue twin): every
  *    latched save takes the exact full path, the legs stay same-generation
  *    at sample time, the next sample re-admits, and the delta resumes —
  *    the chronic ESCALATED→FROZEN loop (#4614 producer class: a host
@@ -25,6 +26,7 @@ import * as path from "node:path";
 import { UnifiedStore } from "../src/storage/store.ts";
 import { UnifiedShadow, describeViewDivergence, formatDriftDiagnostics } from "../src/storage/shadow.ts";
 import { openSqliteDatabase } from "../src/storage/driver.ts";
+import { openBackend } from "../src/storage/backend.ts";
 import { loadLegacyView, type LegacySessionLike } from "../src/storage/ingest.ts";
 import { setLogCapture } from "../src/logger.ts";
 import type { CoreMessage } from "acp-kernel";
@@ -32,7 +34,7 @@ import type { CoreMessage } from "acp-kernel";
 process.env.BILI_PERSIST_ZSTD = "0";
 // Same hermeticity pin as the other storage suites: a developer machine with
 // storage.unified in its real config must not leak a tier into these tests.
-const hermetic = fs.mkdtempSync(path.join(os.tmpdir(), "bili-5678-hermetic-"));
+const hermetic = fs.mkdtempSync(path.join(os.tmpdir(), "bili-5677-hermetic-"));
 process.env.BILI_CONFIG_FILE = path.join(hermetic, "no-config.json");
 process.env.BILI_STORAGE_UNIFIED = "legacy";
 
@@ -48,6 +50,12 @@ function rmBestEffort(p: string): void {
     } catch {
         /* leaked temp dir on a Windows runner is harmless */
     }
+}
+
+/** Give the serial backend queue a turn so enqueueAsyncRecord drains (same
+ *  pattern as the #5412 async suite). */
+function settle(ms = 300): Promise<void> {
+    return new Promise((r) => setTimeout(r, ms));
 }
 
 function captureLogs(): { captured: Captured[]; stop: () => void } {
@@ -155,7 +163,7 @@ test("diagnosis: the divergent slot's differing top-level fields are named, valu
 });
 
 test("latch gate: a drift-latched session rides the full path until a clean sample re-admits it", () => {
-    const dir = tmpdir("bili-5678-latch-");
+    const dir = tmpdir("bili-5677-latch-");
     try {
         const { shadow, store } = openShadow(dir);
         try {
@@ -227,6 +235,47 @@ test("latch gate: a drift-latched session rides the full path until a clean samp
         } finally {
             shadow.close();
             store.close();
+        }
+    } finally {
+        rmBestEffort(dir);
+    }
+});
+
+test("latch gate (async twin): a drift-latched session on the backend queue also rides the full path", async () => {
+    const dir = tmpdir("bili-5677-async-latch-");
+    try {
+        // Real sqlite backend + fromBackend: record() lands on
+        // enqueueAsyncRecord — the same queue an opt-in network backend runs
+        // on, without needing a live server (same setup as the #5412 suite).
+        const backend = await openBackend("sqlite", path.join(dir, "index.db"));
+        const shadow = UnifiedShadow.fromBackend("shadow", backend, (r) => r as LegacySessionLike);
+        try {
+            const ids = "drift-latch-async";
+            let k = 5;
+            shadow.record(mkLegacy(ids, Array.from({ length: k }, (_, i) => msg(i))));
+            await settle();
+            assert.equal(stats(shadow).ingests, 1, "first ingest is full");
+            assert.equal(stats(shadow).deltaIngests, 0);
+
+            // Positive control: unlatched, an append rides the delta fast path.
+            k += 1;
+            shadow.record(mkLegacy(ids, Array.from({ length: k }, (_, i) => msg(i))));
+            await settle();
+            assert.equal(stats(shadow).deltaIngests, 1, "unlatched append rides the delta");
+            assert.equal(stats(shadow).ingests, 2, "every save lands as an ingest (async lane counts deltas too)");
+
+            // Latch the session directly (same manual latch as the #5412
+            // suite — this pins the GATE predicate, not the sampling that
+            // sets it): the next save must take the exact full path even
+            // though the watermark says the prefix is unchanged.
+            drifted(shadow).add(ids);
+            k += 1;
+            shadow.record(mkLegacy(ids, Array.from({ length: k }, (_, i) => msg(i))));
+            await settle();
+            assert.equal(stats(shadow).deltaIngests, 1, "no delta ingest while drift-latched (async queue)");
+            assert.equal(stats(shadow).ingests, 3, "the latched save landed via the exact full path");
+        } finally {
+            shadow.close();
         }
     } finally {
         rmBestEffort(dir);
