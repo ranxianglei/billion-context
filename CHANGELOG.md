@@ -6,6 +6,7 @@ Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag
 ## [Unreleased]
 
 ### Changed
+- **pi 内联压缩通道默认开启(#5428,取代 #4687 的手动开启规则)**:装了 bili 扩展的裸 `pi`(没设任何环境变量、没写配置)现在直接跑**进程内引擎**,不再自己派生代理进程。新优先级:kill-switch > /bili/ 改写启动 > 显式内联(`BILI_PI_INLINE=1/on/yes/TRUE` 或 `"pi": {"inline": true}`)> 宣告的附着目标(launcher 预置的 `BILLION_CONTEXT_PROXY/ATTACH`,`bili pi` 照旧用自己的 launcher 代理)> **默认内联** > spawn。**人类入口(短旗标,必须放在子命令前)**:`bili -i pi`(≡ `bili pi-inline`,强制内联+预检扩展+清理继承代理变量)与 `bili -s pi`(钉死代理姿态:子进程预置 `BILI_PI_INLINE=0`,压过继承的内联变量;opencode 同理)。不想用内联:`bili -s pi`、`BILI_PI_INLINE=0/false/no/off` 或 `"pi": {"inline": false}`——都恢复旧的 attach/spawn 姿态(有宣告代理就附着,否则自己派生代理)。`bili pi-inline` 一键车道保留(同 `-i pi`);空白 `BILI_PI_INLINE=""` 按未设置折叠。opencode 通道的默认不变(仍手动开启,`-i/-s` 两个旗标对它可用)。
 - **The full-resend watermark fastpath (#5403/#5418) is now ON by default (GA)** after its §7.4 human review: plugin-lane chat-completions turns whose prefix is byte-stable skip the full history re-parse/re-pin on hit (the #5403 OOM producer), any doubt still falls back to the untouched full-parse path per turn. Opt out per install with `rollout.features.pluginFullResendWatermark: false` (or a percent) or `BILI_ROLLOUT_PLUGIN_FULL_RESEND_WATERMARK=0`.
 
 ### Fixed
