@@ -1700,6 +1700,27 @@ export class UnifiedStore {
             this.db.prepare("DELETE FROM refs WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM ccr_entries WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM conversations WHERE session_id = ?").run(sessionId);
+            // #5643: fastpath v6 identity-plane partitions hang off this
+            // session through the ext registry (persist.ts
+            // PF_V6_SID_REGISTRY_EXT_KEY); cascade their ledger/log/ckpt rows
+            // in the SAME transaction so deletion leaves no cross-plane
+            // orphans (tables exist by migration invariant).
+            const pfRegRow = this.db
+                .prepare("SELECT value_json FROM session_ext WHERE session_id = ? AND key = 'pf:v6-sids'")
+                .get(sessionId) as { value_json: string } | undefined;
+            if (pfRegRow !== undefined) {
+                let pfSids: unknown[] = [];
+                try {
+                    const p = JSON.parse(pfRegRow.value_json);
+                    if (Array.isArray(p)) pfSids = p;
+                } catch { /* corrupt registry: nothing to cascade from */ }
+                for (const sid of pfSids) {
+                    if (typeof sid !== "string") continue;
+                    this.db.prepare("DELETE FROM pf_rows WHERE sid = ?").run(sid);
+                    this.db.prepare("DELETE FROM pf_log WHERE sid = ?").run(sid);
+                    this.db.prepare("DELETE FROM pf_ckpt WHERE sid = ?").run(sid);
+                }
+            }
             this.db.prepare("DELETE FROM session_ext WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM sessions WHERE session_id = ?").run(sessionId);
             for (const hash of refs) this.releaseContent(hash);
@@ -2510,6 +2531,22 @@ export class UnifiedStore {
         const PF_COMPACT_IDLE_MS = 30 * 60 * 1000;
         if (opts.entriesAfterCkpt >= PF_COMPACT_ENTRIES || opts.logBytesEstimate >= PF_COMPACT_BYTES) return true;
         return opts.entriesAfterCkpt > 0 && Date.now() - opts.lastEntryTsMs >= PF_COMPACT_IDLE_MS;
+    }
+
+    /** Lightweight ledger id/index scan for one sid, POS ORDER: the raw
+     *  host ledger id + the canonical core-id list for every stored element.
+     *  Strings only (no core_json) — feeds the #3642 rekey base counting
+     *  without hydrating any payload bytes. */
+    pfLedgerIds(sid: string): { pos: number; ledgerId: string; coreId: string }[] | null {
+        if (!this.pfAvailable()) return null;
+        try {
+            const rows = this.db
+                .prepare("SELECT pos, ledger_id, core_id FROM pf_rows WHERE sid = ? ORDER BY pos")
+                .all(sid) as { pos: number; ledger_id: string; core_id: string }[];
+            return rows.map((r) => ({ pos: r.pos, ledgerId: r.ledger_id, coreId: r.core_id }));
+        } catch {
+            return null;
+        }
     }
 
     /** Water window rows into a map pos→core_json for rehydration after

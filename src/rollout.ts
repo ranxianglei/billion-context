@@ -64,6 +64,20 @@ export const ROLLOUT_FEATURES: Record<string, RolloutPlan> = {
     // `rollout.features.pluginFullResendWatermark: true|false` (or a percent)
     // / `BILI_ROLLOUT_PLUGIN_FULL_RESEND_WATERMARK=1|0`.
     pluginFullResendWatermark: { percent: 5 },
+    // #5643 fastpath v6: (sessionid,msgid) composite-identity-driven
+    // incremental lane. Replaces the count-watermark guesswork with a hard
+    // identity channel: every body element carries its host msgid listwise,
+    // hits are set-difference lookups against the pf_* ledger plane, and
+    // only NEW elements get parsed (any positions in the body). Identity
+    // faults REFUSE the request loudly (400, zero side effects) instead of
+    // degrading silently; five consecutive faults/misses park the lane for
+    // 60 minutes and traffic rides the baseline lanes. Requires the unified
+    // sidecar storage plane (pf_rows/pf_log/pf_ckpt); without it the lane
+    // soft-degrades per node (baseline behavior, no error). Default 0% —
+    // force on with `rollout.features.watermarkV6MsgId: true` or
+    // `BILI_ROLLOUT_WATERMARK_V6_MSG_ID=1`; bucketed growth stays nested
+    // inside the v5 watermark cohort.
+    watermarkV6MsgId: { percent: 0, base: "pluginFullResendWatermark" },
     // #4804 WS delta continuation: codex/opencode WebSocket clients that keep a
     // previous_response_id checkpoint stop reconstructing full history on every
     // turn — the session augments the delta with the server-committed previous

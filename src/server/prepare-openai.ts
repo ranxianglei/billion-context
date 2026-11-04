@@ -41,6 +41,7 @@ import { injectOpenaiTool, injectTool } from "./inject.js";
 import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
 import { featureEnabled } from "../rollout.js";
 import { evaluateWatermarkFastpath, finalizeWatermarkTurn, type FastpathHit, type FastpathOutcome } from "./fastpath.js";
+import { evaluateWatermarkV6, finalizeWatermarkV6, type V6Outcome } from "./fastpath-v6.js";
 import { collectRequestIds, probeRequestMembership } from "../request-membership.js";
 
 export async function prepareOpenai(
@@ -115,11 +116,38 @@ export async function prepareOpenai(
     // seed stash minted on identical bytes last turn (#3642 deterministic ids),
     // while head + tail fragments and scalar fields are decoded from raw
     // slices. Every miss falls through to the legacy path byte-identically.
+    // #5643 fastpath v6 — composite-identity lane ((sessionid, msgid)):
+    // evaluated FIRST and owns the turn whenever it engages (hit / arm /
+    // stamped degrade). Its identity fault (FastpathV6IdentityFault)
+    // PROPAGATES on purpose to handle.ts → 400 refusal (§3.2) — nothing
+    // upstream of that mapping may swallow it.
+    // #5403/#5418 watermark fastpath (v5, count-watermark era) follows and
+    // keeps serving non-cohort traffic byte-identically as before.
     let wpHit: FastpathHit | undefined;
     let wpOutcome: FastpathOutcome | null = null;
     let wpFullText: string | undefined;
+    let v6Evaluated: V6Outcome | null = null;
     const wpModel = typeof parsed.model === "string" ? parsed.model : "";
-    if (bodyText !== undefined && pluginMode && !isTitleGen && featureEnabled("pluginFullResendWatermark")) {
+    if (bodyText !== undefined && pluginMode && !isTitleGen && featureEnabled("watermarkV6MsgId")) {
+        v6Evaluated = evaluateWatermarkV6(bodyText, req, session, { pluginMode, titleGen: isTitleGen, model: wpModel }, log);
+        if (v6Evaluated !== null) {
+            wpFullText = bodyText; // whole-wire image accounting stays honest
+            log("debug", `[${session.id}] fastpath v6 ${v6Evaluated.hit ? "HIT" : v6Evaluated.decision}${v6Evaluated.measuredT !== undefined ? ` T=${v6Evaluated.measuredT}` : ""}`);
+            if (v6Evaluated.hit) {
+                // V6Hit is field-for-field identical to FastpathHit — the same
+                // consumption pattern applies below.
+                wpHit = v6Evaluated.hit;
+                const fields: Record<string, unknown> = {};
+                for (const [key, span] of wpHit.fieldSpans) {
+                    if (key === "messages") fields[key] = wpHit.windowMessages;
+                    else fields[key] = JSON.parse(bodyText.slice(span.start, span.end));
+                }
+                parsed = fields as OpenAIRequestBody;
+                inboundMessageCount = wpHit.totalT;
+            }
+        }
+    }
+    if (v6Evaluated === null && bodyText !== undefined && pluginMode && !isTitleGen && featureEnabled("pluginFullResendWatermark")) {
         wpFullText = bodyText;
         wpOutcome = evaluateWatermarkFastpath(bodyText, req, session, { pluginMode, titleGen: isTitleGen, model: wpModel }, log);
         log("debug", `[${session.id}] fastpath ${wpOutcome.hit ? "HIT" : wpOutcome.decision}${wpOutcome.creditedMiss ? "(credited)" : ""}${wpOutcome.measuredT !== undefined ? ` T=${wpOutcome.measuredT}` : ""}`);
@@ -571,7 +599,14 @@ export async function prepareOpenai(
     snapshotMessages(session, wpHit !== undefined ? wpHit.windowCores : originalMessages);
     markDirty(session);
     let wpResponseHeaders: Record<string, string> | undefined;
-    if (wpFullText !== undefined && wpOutcome !== null && wpTurnStrip !== undefined) {
+    if (v6Evaluated !== null && wpTurnStrip !== undefined) {
+        wpResponseHeaders = finalizeWatermarkV6(session, v6Evaluated, {
+            bodyText: wpFullText,
+            armSystemText: wpSeedSystemText,
+            armStripCounts: wpTurnStrip,
+        }, log);
+        if (Object.keys(wpResponseHeaders).length === 0) wpResponseHeaders = undefined;
+    } else if (wpFullText !== undefined && wpOutcome !== null && wpTurnStrip !== undefined) {
         wpResponseHeaders = finalizeWatermarkTurn(session, wpOutcome, {
             model: wpModel,
             legacyCores: originalMessages,

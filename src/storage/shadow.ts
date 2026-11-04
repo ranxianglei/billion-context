@@ -1160,6 +1160,24 @@ export class UnifiedShadow {
         }
     }
 
+    pfLedgerIds(sid: string): { pos: number; ledgerId: string; coreId: string }[] | null {
+        if (this.sync === null) return null;
+        try {
+            return this.sync.pfLedgerIds(sid);
+        } catch {
+            return null;
+        }
+    }
+
+    pfNeedsCompaction(opts: { entriesAfterCkpt: number; logBytesEstimate: number; lastEntryTsMs: number }): boolean {
+        if (this.sync === null) return false;
+        try {
+            return this.sync.pfNeedsCompaction(opts);
+        } catch {
+            return false;
+        }
+    }
+
     pfDeleteAll(sids: string[]): void {
         if (this.sync === null || sids.length === 0) return;
         try {

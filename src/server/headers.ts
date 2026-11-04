@@ -33,6 +33,11 @@ export const UPSTREAM_HOP_HEADERS = new Set([
     "x-bili-pf-count",
     "x-bili-pf-seq",
     "x-bili-pf-tail-ids",
+    // #5643: fastpath v6 world echo — server-minted pf_sid returned on
+    // v6-engaged responses so clients can re-send it (matching rule ①).
+    // Same billing-plane bookkeeping family as the three above: never to
+    // a model endpoint.
+    "x-bili-pf-session",
     "te",
     "trailer",
     "upgrade",

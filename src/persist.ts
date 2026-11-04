@@ -2271,6 +2271,16 @@ export class SessionStore {
         return this.shadow.pfHydrateWindow(sid, posFrom, posTo);
     }
 
+    pfLedgerIds(sid: string): { pos: number; ledgerId: string; coreId: string }[] | null {
+        if (!this.shadow || this.shadow.stats.disabled) return null;
+        return this.shadow.pfLedgerIds(sid);
+    }
+
+    pfNeedsCompaction(opts: { entriesAfterCkpt: number; logBytesEstimate: number; lastEntryTsMs: number }): boolean {
+        if (!this.shadow || this.shadow.stats.disabled) return false;
+        return this.shadow.pfNeedsCompaction(opts);
+    }
+
     /** Session teardown (#5643 §8 test 19 third clause): sweep the pf plane
      *  for EVERY sid this relay session was ever issued. Reads the registry
      *  from ext FIRST (deleteSession sweeps session_ext itself), then deletes
