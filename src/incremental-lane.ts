@@ -67,6 +67,7 @@ import { pluginAgentHeader, pluginReportedModel } from "./plugin.js";
 import { headerValue, readBody } from "./server.js";
 import { featureEnabled } from "./rollout.js";
 import { MSG_IDS_BODY_FIELD, MSG_SEQS_BODY_FIELD, applyMsgIdPin, validateMsgIds } from "./msgid-pin.js";
+import { UPSTREAM_HOP_HEADERS, connectionNamedHeaders } from "./server/headers.js";
 
 export const INCREMENTAL_TURN_PATH = "/__bili/plugin/turn";
 
@@ -164,9 +165,6 @@ function warnDroppedRequestParams(conversationId: string, request: Record<string
     droppedParamWarned.set(conversationId, seen);
     log("warn", `[incremental] ${conversationId}: request parameter(s) not in the forward allowlist were dropped: ${unwarned.join(", ")} — extend REQUEST_PARAM_KEYS (src/incremental-lane.ts) if they must reach the upstream (#3406)`);
 }
-
-/** Wire headers the client may contribute to the forwarded request. */
-const PASSTHROUGH_HEADERS = ["authorization", "anthropic-version", "anthropic-beta"] as const;
 
 /** Canonical prefix per conversation, in memory. Bounded LRU: cold entries
  *  rebuild from the unified messages table on demand (see loadCanonical). */
@@ -708,23 +706,36 @@ export async function handleIncrementalTurn(
         }
         const bodyBuf = Buffer.from(JSON.stringify(body));
 
-        const headers: Record<string, string> = {
-            "content-type": "application/json",
-            "content-length": String(bodyBuf.length),
-            host: headerValue(req, "host") ?? "127.0.0.1",
-            // Session identity rides the CLIENT's own conversation header (the
-            // strongest signal in the pipeline) — see laneSessionId().
-            "x-bili-plugin": agent,
-            "x-bili-plugin-conversation": conversationId,
-            accept: headerValue(req, "accept") ?? "application/json",
-        };
+        // Forward the CLIENT'S OWN end-to-end headers, not a positive allowlist:
+        // buildForwardHeaders already ships every header except host/content-length
+        // in full-resend mode, so credentials like x-api-key reach the upstream. An
+        // allowlist here silently dropped any credential outside it → the upstream
+        // saw an unauthenticated request (401) and DSH signed the account out
+        // (#5658). Hop-by-hop never crosses a proxy; x-bili-* markers mean nothing
+        // to a model endpoint and the lane re-stamps its own below.
+        const connNamed = connectionNamedHeaders(req.headers.connection);
+        const headers: Record<string, string> = {};
+        for (const [k, v] of Object.entries(req.headers)) {
+            if (v === undefined) continue;
+            const lower = k.toLowerCase();
+            if (lower.startsWith("x-bili-")) continue;
+            if (UPSTREAM_HOP_HEADERS.has(lower)) continue;
+            if (connNamed.has(lower)) continue;
+            // body is rebuilt as plain JSON below — the delta POST's encoding is stale
+            if (lower === "content-encoding") continue;
+            headers[k] = Array.isArray(v) ? v.join(", ") : v;
+        }
+        // Lane-owned values win, set explicitly (framing matches the assembled body;
+        // session identity rides the client's own conversation value — laneSessionId()).
+        headers["content-type"] = "application/json";
+        headers["content-length"] = String(bodyBuf.length);
+        headers["host"] = headerValue(req, "host") ?? "127.0.0.1";
+        headers["x-bili-plugin"] = agent;
+        headers["x-bili-plugin-conversation"] = conversationId;
+        headers["accept"] = headerValue(req, "accept") ?? "application/json";
         // Plugin capability headers the client may contribute on the turn
         // POST (context window / max output reports for the [window] clamp).
         for (const h of ["x-bili-plugin-context-window", "x-bili-plugin-max-output"] as const) {
-            const v = headerValue(req, h);
-            if (v !== undefined) headers[h] = v;
-        }
-        for (const h of PASSTHROUGH_HEADERS) {
             const v = headerValue(req, h);
             if (v !== undefined) headers[h] = v;
         }
