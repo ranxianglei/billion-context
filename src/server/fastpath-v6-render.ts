@@ -318,10 +318,9 @@ export function renderPlaneGate(args: RenderGateArgs): RenderGateDecision {
     // misaligned window.
     if (rw.rows.length !== args.maxPos + 1) return off("rows-misaligned");
     registerSidForSession(args.sessionId, args.sid);
-    const F = Math.min(PF_RENDER_WINDOW, rw.rows.length);
     // Window input = last F identity elements (+ new cores added by caller);
     // positions are contiguous because the ledger grows forward only (P3).
-    if (args.maxPos < F - 1) return off("window-short");
+    const F = Math.min(PF_RENDER_WINDOW, rw.rows.length);
     return { ok: true, rw, F };
 }
 
