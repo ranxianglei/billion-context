@@ -768,13 +768,71 @@ export function findRoute(routes: ProviderRoutes, upstreamUrl: string | undefine
     return key ? routes[key] : undefined;
 }
 
+/** #5612: clients like Qoder Desktop rewrite model ids client-side (`/`,`.`→`-`),
+ *  so an EXACT-name lookup misses the operator's declared entry and silently
+ *  falls to defaults. This canonical key treats `/`, `.`, `_` as interchangeable
+ *  and is case-insensitive; callers use it ONLY as a guarded fallback after an
+ *  exact match fails (see resolveModelEntryOnModels). */
+export function canonicalModelKey(name: string): string {
+    return name.toLowerCase().replace(/[./_]/g, "-");
+}
+
+export interface ResolvedModelEntry {
+    entry?: ModelEntry;
+    /** Set only on a non-exact (normalized) match: the operator's declared name. */
+    declaredName?: string;
+    /** True only when found via normalization rather than an exact name match. */
+    viaNormalization?: boolean;
+}
+
+function resolveModelEntryOnModels(
+    models: Record<string, ModelEntry> | undefined,
+    model: string | undefined,
+): ResolvedModelEntry {
+    if (!model || !models) return {};
+    const exact = models[model];
+    if (exact !== undefined) return { entry: exact };
+    const canon = canonicalModelKey(model);
+    if (canon.length === 0) return {};
+    let hit: string | undefined;
+    for (const name of Object.keys(models)) {
+        if (canonicalModelKey(name) === canon) {
+            if (hit === undefined) hit = name;
+            else return {}; // two declared names share the canonical key → ambiguous
+        }
+    }
+    if (hit === undefined) return {};
+    return { entry: models[hit], declaredName: hit, viaNormalization: true };
+}
+
+/** Per-model entry resolution for a request's model id: exact providers-table
+ *  match first (unchanged behavior), then a guarded canonical-key match (#5612).
+ *  Shared by every per-model lookup (context/output/compress/benefit/keepalive)
+ *  so the renamed-id miss is fixed once, not per call site. */
+export function resolveModelEntry(
+    routes: ProviderRoutes,
+    upstreamUrl: string | undefined,
+    model: string | undefined,
+): ResolvedModelEntry {
+    return resolveModelEntryOnModels(findRoute(routes, upstreamUrl)?.models, model);
+}
+
+/** Route-shaped variant for callers that already hold the matched ProviderRoute
+ *  (billing resign, cache keepalive). Same exact→guarded-normalized contract. */
+export function resolveModelEntryOnRoute(
+    route: ProviderRoute | undefined,
+    model: string | undefined,
+): ResolvedModelEntry {
+    return resolveModelEntryOnModels(route?.models, model);
+}
+
 export function resolveConfiguredContextLimit(
     routes: ProviderRoutes,
     upstreamUrl: string | undefined,
     model: string | undefined,
 ): number | undefined {
     if (!model || !upstreamUrl) return undefined;
-    const m = findRoute(routes, upstreamUrl)?.models?.[model];
+    const m = resolveModelEntry(routes, upstreamUrl, model).entry;
     if (m?.context && m.context > 0) return m.context;
     return undefined;
 }
@@ -791,7 +849,7 @@ export function resolveConfiguredOutputLimit(
     model: string | undefined,
 ): number | undefined {
     if (!model || !upstreamUrl) return undefined;
-    const m = findRoute(routes, upstreamUrl)?.models?.[model];
+    const m = resolveModelEntry(routes, upstreamUrl, model).entry;
     if (m?.output && m.output > 0) return m.output;
     return undefined;
 }
@@ -913,6 +971,10 @@ export type ProxyOptions = {
     /** Override for the release-notes document URL (env
      *  BILI_RELEASE_NOTES_URL wins) (#1870). */
     releaseNotesUrl?: string;
+    /** Override for the remote announcements feed URL (#5548 P3; env
+     *  BILI_ANNOUNCEMENTS_URL wins). Firewall installs point this at a relay;
+     *  absent = official raw.githubusercontent feed. */
+    remoteAnnouncementsUrl?: string;
     logFile?: string;
     /** MITM transparent-proxy mode. When enabled, an HTTP CONNECT handler is
      *  attached so clients that only know how to set HTTP_PROXY (ZCode with a
@@ -933,6 +995,13 @@ export type ProxyOptions = {
      *  conversations keep the raw key. Opt out with env BILI_SUBAGENT_SPLIT=0
      *  or `subagentSplit: false` in the config file (env wins). */
     subagentSplit?: boolean;
+    /** Split the Responses-wire lane keyed by the instructions fingerprint
+     *  (Claude Code over /v1/responses; Codex root threads / older builds)
+     *  when the instructions text changes AND the incoming history does not
+     *  continue the tracked chain (default on). Opt out with env
+     *  BILI_PERSONA_SPLIT=0 or `personaSplit: false` in the config file
+     *  (env wins). */
+    personaSplit?: boolean;
     /** Opt-in fork block-adoption (#629, default off). ANONYMOUS clients
      *  (prefix-affinity) that fork their history inherit the parent's
      *  fully-present compression blocks instead of restarting at zero.
@@ -1152,8 +1221,11 @@ function warnCompressOnlyFieldsAtRouteRoot(key: string, obj: Record<string, unkn
 /** True when the providers-map key is itself a URL lane (http/https/mitm
  *  scheme — mitm:// is the README-documented lookup key for MITM traffic).
  *  Anything else is a NAMED key (provider id): routing-inert on its own,
- *  meaningful via `compactionOptIn` (#1392) and/or `bind` (#1469). */
-function isUrlLikeKey(key: string): boolean {
+ *  meaningful via `compactionOptIn` (#1392) and/or `bind` (#1469).
+ *  Exported so the whole-file config save path (web/api.ts) classifies URL
+ *  lanes vs named recipes with the SAME predicate the runtime uses, instead
+ *  of an https-only regex that mis-rejects documented mitm:// lanes (#5620). */
+export function isUrlLikeKey(key: string): boolean {
     return /^(https?|mitm):\/\//i.test(key.trim());
 }
 
@@ -1664,6 +1736,7 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         releaseNotesCheck: (env.BILI_RELEASE_NOTES_CHECK ?? (fileConfig.releaseNotesCheck === false ? "0" : "1")) !== "0",
         advisoryUrl: env.BILI_ADVISORY_URL || fileConfig.advisoryUrl || undefined,
         releaseNotesUrl: env.BILI_RELEASE_NOTES_URL || fileConfig.releaseNotesUrl || undefined,
+        remoteAnnouncementsUrl: env.BILI_ANNOUNCEMENTS_URL || fileConfig.remoteAnnouncementsUrl || undefined,
         logFile: env.ACP_LOG_FILE !== undefined ? (env.ACP_LOG_FILE || undefined) : fileConfig.logFile,
         mitm: {
             enabled: (env.BILI_MITM ?? (fileConfig.mitm?.enabled === false ? "0" : "1")) !== "0",
@@ -1674,6 +1747,7 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         },
         maskHosts: (env.BILI_LOG_MASK_HOSTS ?? (fileConfig.maskHosts === false ? "0" : "1")) !== "0",
         subagentSplit: (env.BILI_SUBAGENT_SPLIT ?? (fileConfig.subagentSplit === false ? "0" : "1")) !== "0",
+        personaSplit: (env.BILI_PERSONA_SPLIT ?? (fileConfig.personaSplit === false ? "0" : "1")) !== "0",
         forkAdoption: (env.BILI_FORK_ADOPTION ?? (fileConfig.forkAdoption === true ? "1" : "0")) !== "0",
         affinitySimhash: (env.BILI_AFFINITY_SIMHASH ?? (fileConfig.affinitySimhash === false ? "0" : "1")) !== "0",
         resumeInheritance: (env.BILI_RESUME_INHERITANCE ?? (fileConfig.resumeInheritance === false ? "0" : "1")) !== "0",
@@ -1864,6 +1938,9 @@ type FileConfig = {
     /** Override for the release-notes document URL (env
      *  BILI_RELEASE_NOTES_URL wins) (#1870). */
     releaseNotesUrl?: string;
+    /** Override for the remote announcements feed URL (#5548 P3; env
+     *  BILI_ANNOUNCEMENTS_URL wins). */
+    remoteAnnouncementsUrl?: string;
     upstreamProxy?: string;
     upstreamProxyMode?: string;
     logFile?: string;
@@ -1904,6 +1981,13 @@ type FileConfig = {
     /** Set `false` to keep Claude Code subagents on the main session (#970;
      *  env BILI_SUBAGENT_SPLIT=0 wins). */
     subagentSplit?: boolean;
+    /** Split the Responses-wire lane keyed by the instructions fingerprint
+     *  (Claude Code over /v1/responses; Codex root threads / older builds)
+     *  when the instructions text changes AND the incoming history does not
+     *  continue the tracked chain (default on). Opt out with env
+     *  BILI_PERSONA_SPLIT=0 or `personaSplit: false` in the config file
+     *  (env wins). */
+    personaSplit?: boolean;
     /** Opt-in fork block-adoption (#629): when an anonymous (prefix-affinity)
      *  client forks its history mid-conversation (edit / regenerate), the new
      *  session inherits the parent's compression blocks whose source content
@@ -1975,13 +2059,14 @@ type FileConfig = {
      *  `"pi": {"subagents": false}` disables the whole surface. The four
      *  acp.json keys (delegate/delegatePrompt/displayUsage/debug) are a
      *  deprecated fallback, read only while this section is absent.
-     *  `inline` (#3278, OPT-IN — default stays the spawned proxy, #4687
-     *  reverts the #4571 default flip): run the pi lane's compression
-     *  IN-PROCESS — no proxy server spawned. Enable with `true` (or
-     *  BILI_PI_INLINE=1/on/yes/TRUE). Resolved env > file; an explicit
-     *  inline choice beats an announced attach target (launcher-set
-     *  BILLION_CONTEXT_PROXY/ATTACH); when unset the lane behaves exactly
-     *  as before (attach/spawn). */
+     *  `inline` (#3278, DEFAULT-ON since #5428 — supersedes the #4687 opt-in
+     *  rule): run the pi lane's compression IN-PROCESS — no proxy server
+     *  spawned. Unset env+file runs INLINE; an announced attach target
+     *  (launcher-set BILLION_CONTEXT_PROXY/ATTACH) still beats the default,
+     *  so `bili pi` keeps its launcher proxy. Opt OUT with `false` (or
+     *  BILI_PI_INLINE=0/false/no/off) — restores attach/spawn. Resolved
+     *  env > file > default; an explicit inline choice beats an announced
+     *  attach target. */
      pi?: { subagents?: PiSubagentsFileConfig | boolean; inline?: boolean };
     /** Built-in opencode-lane inline switch (#3278 port, OPT-IN — default
      *  stays the spawned proxy, per owner decision on #4687): run the
@@ -2249,16 +2334,19 @@ type FileConfig = {
      *  (#3066 owner intent, re-affirmed #3366: unsupervised bash could hang a
      *  pi session for a whole day); 0 disables injection (pi-native).
      *  `maxOutputBytes` caps combined text tool output (default 50000, 0 = no
-     *  cap). `repetition: false` disables the identical-call loop-breaker.
-     *  `textRunThreshold` is the single-codepoint repetition breaker over
-     *  decoded model text (default 200, 0 = off). Env
-     *  BILI_GUARDRAIL_BASH_TIMEOUT / BILI_GUARDRAIL_MAX_OUTPUT_BYTES /
-     *  BILI_GUARDRAIL_REPETITION / BILI_GUARDRAIL_TEXT_RUN_THRESHOLD win over
+     *  cap). `repetition` disables the identical-call loop-breaker when false;
+     *  the object form additionally accepts `enabled` (default true),
+     *  `warn` (default 3, first warning threshold), `abort` (default 5,
+     *  final-refuse threshold), and `recovery` (default false, opt-in
+     *  graceful-termination mode). `textRunThreshold` is the
+     *  single-codepoint repetition breaker over decoded model text (default
+     *  200, 0 = off). Env BILI_GUARDRAIL_REPETITION (truthy/disabled, boolean
+     *  only — object form is file-only); other guardrail env vars win over
      *  all. */
     guardrails?: {
         bashTimeout?: number;
         maxOutputBytes?: number;
-        repetition?: boolean;
+        repetition?: boolean | { enabled?: boolean; warn?: number; abort?: number; recovery?: boolean };
         textRunThreshold?: number;
     };
     /** CCR retrieval TTL in ms (#2030) — was BILI_CCR_RETRIEVAL_TTL_MS (default 600000). */
@@ -2303,10 +2391,10 @@ const KNOWN_TOP_LEVEL_KEYS = new Set([
     "port", "host", "upstream", "providersPath", "providers", "proxy",
     "modelContextLimit", "sessionHeader", "log", "debug", "dumpSse",
     "passthrough", "autoUpdate", "autoRestartOnUpdate", "updateTag",
-    "advisoryCheck", "advisoryUrl", "releaseNotesCheck", "releaseNotesUrl",
+    "advisoryCheck", "advisoryUrl", "releaseNotesCheck", "releaseNotesUrl", "remoteAnnouncementsUrl",
     "upstreamProxy", "upstreamProxyMode",
     "logFile", "compress", "promptCache", "mitm", "maskHosts",
-    "subagentSplit", "forkAdoption", "affinitySimhash", "resumeInheritance",
+    "subagentSplit", "personaSplit", "forkAdoption", "affinitySimhash", "resumeInheritance",
     "chainContentDetection", "chainEgressStamp", "stableSystemAnchor",
     "rollout",
     "dsh",

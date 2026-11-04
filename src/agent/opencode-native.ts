@@ -78,6 +78,7 @@ import { createAcpCommandHooks, showAcpText } from "./opencode-acp-command.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, setNativeOriginWaiter, singleFlight } from "./native-bootstrap.js";
 import { createLiveOriginResolver, installNativeFetchIntercept, isModelApiUrl, noteRoutedOrigin, observeRoutedOrigin, readyOrigin, replaceRequestPayload, replaceRequestTarget, routedBiliModelUrl, type LiveOriginResolverDeps, type NativeInterceptState, type UnavailableReason } from "./native-intercept.js";
 import { clearIncrementalProbe, createPrepareDirectSend, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalAck, noteIncrementalRejection, planIncrementalTurn, probeIncrementalTurns, rememberOriginalBody, sweepStale, wireMessagesLookAnthropic, type IncrementalWireMessage } from "./incremental-client.js";
+import * as pfChannel from "./pf-channel.js";
 import { createOpencodeV2Setup, type V2HttpRequestEvent, type V2State } from "./opencode-v2.js";
 import { alignedMsgIdsForWire, harvestOpencodeMsgIds } from "./opencode-msgids.js";
 import { asciiHeaderValue, fetchProxyVersion, postIdentityRegister, reportRuntimeInfoOnChange, waitForProxyVersion, type ForwardedToolResult } from "./shared.js";
@@ -681,8 +682,14 @@ function lastSessionFromMessages(messages: unknown): string | undefined {
  *  messages.transform hook — the only opencode seam that sees them (V2's
  *  http.request sees just the wire, so V2-shaped turns degrade to
  *  content-derived identities). Never mutates the host's messages. */
-const harvestMsgIdsTransform = async (_input: unknown, output: { messages?: unknown }): Promise<void> => {
+const harvestMsgIdsTransform = async (input: unknown, output: { messages?: unknown }): Promise<void> => {
     harvestOpencodeMsgIds(lastSessionFromMessages(output?.messages), output?.messages);
+    // #5403/#5418 unified watermark channel: feed the ONE chokepoint emitter
+    // with the SAME validated 1:1 list the harvest just aligned — undefined
+    // (any misalignment) CLEARS the previous list; the emitter degrades to
+    // count-only rather than sending a stale anchor.
+    const sid = (input === null || typeof input !== "object" ? undefined : (input as { sessionID?: unknown }).sessionID);
+    if (typeof sid === "string" && sid.length > 0) pfChannel.pfCaptureIds(sid, alignedMsgIdsForWire(sid, output?.messages));
 };
 
 // #1135: dynamic origin getter instead of a captured constant — after a

@@ -204,6 +204,14 @@ export const WIRE_RULES: readonly WireRule[] = [
         provenance:
             "bili #1996 production 400 (vLLM /v1/responses serving a Qwen model: artifact:chat_template.jinja Jinja Exception \"System message must be at the beginning.\", code invalid_prompt, every post-compression request of two OMP plugin-mode sessions, 2026-10-03); vLLM Responses→chat passes role-bearing items verbatim (vllm/entrypoints/openai/responses/utils.py _construct_message_from_response_item)",
     },
+    {
+        id: "WC-023",
+        wire: "anthropic",
+        summary:
+            'mid-conversation role:"system" messages carry a TWO-sided positional contract: each such system (except the directive-only form — empty content + output_config — which is legal anywhere) must FOLLOW a user message or an assistant message whose last content block is a tool result (the <name>_tool_result family incl. plain tool_result) AND PRECEDE an assistant message or end the array; a run of consecutive systems is judged once, at its first non-directive member; any violation 400s the whole request',
+        provenance:
+            'bili #5432 production 400s (claude-code v2.1.316 + mid-conversation-tool-changes-2026-07-01 through bili v0.1.210 / acp-kernel 0.0.175) produced BOTH live error strings: "messages.N: role \'system\' must follow a \'user\' message or an \'assistant\' message ending in a server tool result; the directive-only form (content: [] with output_config) is accepted at any position" (follow side) and "messages.N: role \'system\' must precede an \'assistant\' message or end the array" (precede side). Repair: kernel/src/wire/anthropic.ts healIllegalSystemPositions enforces both halves (#5438, PR #5522); this validator is the permanent tripwire on every outbound Anthropic body, both lanes',
+    },
 ];
 
 // ---------------------------------------------------------------------------
@@ -257,7 +265,59 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
     return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
-/** WC-001..WC-003, WC-007, WC-010, WC-016, WC-022 on an Anthropic /v1/messages body. Returns violation strings. */
+/** WC-023: two-sided positional contract for mid-conversation role:"system"
+ *  messages. Mirrors kernel healIllegalSystemPositions exactly — the outbound
+ *  body must satisfy what the API accepts whatever path built it: each
+ *  non-directive system must FOLLOW a user message or an assistant message
+ *  whose last content block is a tool result (<name>_tool_result family —
+ *  plain tool_result included; server-tool results ride inside assistant
+ *  messages on the real wire) AND PRECEDE an assistant message or end the
+ *  array; a consecutive-system run carries one verdict, reported at its first
+ *  non-directive member (directive-only members are exempt and transparent);
+ *  a missing predecessor (array start) is legal by contract. Shared by both
+ *  Anthropic lanes (main + Vertex). Returns violation strings. */
+function midConversationSystemViolations(messages: unknown[]): string[] {
+    const out: string[] = [];
+    const isSys = (m: unknown): boolean => isPlainObject(m) && m.role === "system";
+    const isDirective = (m: Record<string, unknown>): boolean =>
+        Array.isArray(m.content) && m.content.length === 0 && m.output_config !== undefined;
+    for (let i = 0; i < messages.length; i++) {
+        const m = messages[i];
+        if (!isPlainObject(m) || m.role !== "system") continue;
+        if (isDirective(m)) continue;
+        let prev = i - 1;
+        let earlierNonDirective = false;
+        while (prev >= 0 && isSys(messages[prev])) {
+            if (!isDirective(messages[prev] as Record<string, unknown>)) {
+                earlierNonDirective = true;
+                break;
+            }
+            prev--;
+        }
+        if (earlierNonDirective) continue;
+        let k = i + 1;
+        while (k < messages.length && isSys(messages[k])) k++;
+        const next = messages[k];
+        if (isPlainObject(next) && next.role !== "assistant")
+            out.push(`WC-023 messages[${i}]: role:"system" must precede an "assistant" message or end the array (#5432)`);
+        let p = i - 1;
+        while (p >= 0 && isSys(messages[p])) p--;
+        if (p >= 0) {
+            const pred = messages[p] as Record<string, unknown>;
+            const pc = pred.content;
+            const last = Array.isArray(pc) && pc.length > 0 ? pc[pc.length - 1] : undefined;
+            const lastType = isPlainObject(last) ? last.type : undefined;
+            const ok =
+                pred.role === "user" ||
+                (pred.role === "assistant" && typeof lastType === "string" && lastType.endsWith("tool_result"));
+            if (!ok)
+                out.push(`WC-023 messages[${i}]: role:"system" must follow a "user" message or an "assistant" message ending in a tool result (#5432)`);
+        }
+    }
+    return out;
+}
+
+/** WC-001..WC-003, WC-007, WC-010, WC-016, WC-022, WC-023 on an Anthropic /v1/messages body. Returns violation strings. */
 function validateAnthropicBody(body: unknown): string[] {
     const out: string[] = [];
     if (!isPlainObject(body)) return out;
@@ -268,6 +328,7 @@ function validateAnthropicBody(body: unknown): string[] {
                 if (isPlainObject(b) && (b.type === "tool_addition" || b.type === "tool_removal"))
                     out.push(`WC-022 messages[${i}].content: '${b.type}' blocks are only permitted within role:"system" messages`);
         });
+    if (Array.isArray(body.messages)) out.push(...midConversationSystemViolations(body.messages));
     if ("prompt_cache_key" in body)
         out.push("WC-007 top-level prompt_cache_key is not part of the Anthropic Messages API (#1403)");
     // WC-010 runs before the tools early-return: breakpoints can live in
@@ -689,7 +750,9 @@ export function vertexAnthropicPathInfo(url: string): VertexAnthropicPathInfo | 
 }
 
 /** WC-019, lane-scoped: the version lives in the BODY on the Vertex Anthropic wire. Deliberately silent about a
- *  body `model` field — whether Vertex tolerates one is unverified and the real client never sends it. */
+ *  body `model` field — whether Vertex tolerates one is unverified and the real client never sends it. Also enforces
+ *  WC-023 (lane-independent position rule, shared with the main anthropic validator — the same Messages API sits
+ *  behind both lanes). */
 export function validateVertexAnthropicBody(body: unknown): string[] {
     const out: string[] = [];
     if (!isPlainObject(body)) return out;
@@ -697,6 +760,7 @@ export function validateVertexAnthropicBody(body: unknown): string[] {
         out.push(
             `WC-019 anthropic_version must be "vertex-2023-10-16" in the body on the Vertex Anthropic wire (saw ${JSON.stringify(body.anthropic_version)}) — the version is a body field here, not a header`,
         );
+    if (Array.isArray(body.messages)) out.push(...midConversationSystemViolations(body.messages));
     return out;
 }
 
