@@ -952,7 +952,15 @@ export function finalizeWatermarkV6(
         const sid = evaluated.extraHeaders?.[PF_SESSION_HEADER];
         if (sid === undefined) return headers;
         const pending = pendingCommits.get(sid);
-        if (pending === undefined) return headers;
+        if (pending === undefined) {
+            // Mirror knew this sid but its proposal vanished between evaluate
+            // and finalize (eviction above MAX_WORLD_MIRRORS or a teardown
+            // race): serve baseline this turn — the plane never saw the
+            // uncommitted rows, so the client's full-body resend registers
+            // them next round without duplication.
+            log("warn", `[${session.id}] v6 finalize: proposal for ${sid} already gone (eviction/teardown race) — baseline turn, resend converges`);
+            return headers;
+        }
         pendingCommits.delete(sid);
         if (store.pfCommitTurn(sid, {
             rows: pending.rows.map((r) => ({ ...r, sessRaw: evaluated.sessionCarrier })),
