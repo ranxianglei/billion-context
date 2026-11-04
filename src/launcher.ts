@@ -4938,7 +4938,9 @@ const ownerHeartbeatWorkers = new Map<string, { stop: () => void; refs: number }
  *  recovered with exactly ONE host-visible notice through the diagnostic
  *  channel captured at attach time. A resolved fetch returning 409/5xx never
  *  counts as recovery. Entries die on recovery, on a direct "ok"
- *  re-registration, or when the origin's last heartbeat stops. Exported
+ *  re-registration, or when the origin's last heartbeat stops; a
+ *  foreign-owner-pid entry (no heartbeat runs for it) simply lives until
+ *  process exit or a later direct-"ok" attach to the same origin. Exported
  *  alongside noteWatcherHeartbeatAck so the regression suite can exercise the
  *  transition without a full proxy bring-up. */
 const watcherPendingRecovery = new Map<string, { pid: number; diag: (msg: string) => void }>();
