@@ -3,7 +3,7 @@ import { isToolMessage } from "./message-kind.js";
 import { BLOCKED_REF, orderedRefPair, refForRaw } from "./refs.js";
 import { countMessageTokens } from "./tokenize.js";
 import { segmentGroups } from "./segment.js";
-import { isLiveCheckpointCarrier } from "./state.js";
+import { coveredMessageIds, isLiveCheckpointCarrier } from "./state.js";
 import { computeProtectedRefs } from "./recommend.js";
 import {
   buildProjectionShared,
@@ -423,6 +423,41 @@ function renderUncompressedRanges(
   // ordering would mis-sort equal-size ranges.
   if (sort !== "time")
     merged.sort((a, b) => b.tokens - a.tokens || a.startIndex - b.startIndex);
+  // Honest span labels: rows derived from surface-replacing views can bridge
+  // folded territory (the covered ids left no array slot or gap flag). Name
+  // the hiding active blocks inline — display only, eligibility untouched.
+  const byRef = state.messageRefs.byRef;
+  const refNumOf = (ref: string): number | null => {
+    const m = /^m(\d+)$/i.exec(ref);
+    return m !== null ? Number(m[1]) : null;
+  };
+  const foldedOwner = new Map<string, string>();
+  for (const blk of state.blocks) {
+    if (!blk.active) continue;
+    for (const id of blk.effectiveMessageIds) foldedOwner.set(id, blk.blockId);
+  }
+  const coveredRaw = coveredMessageIds(state);
+  const ownedHoles: { n: number; owner: string }[] = [];
+  for (const [ref, raw] of Object.entries(byRef)) {
+    const n = refNumOf(ref);
+    if (n === null || !coveredRaw.has(raw)) continue;
+    const owner = foldedOwner.get(raw);
+    if (owner !== undefined) ownedHoles.push({ n, owner });
+  }
+  ownedHoles.sort((a, b) => a.n - b.n);
+  const crossedFolded = (r: Merged): string | undefined => {
+    const [lo, hi] = orderedRefPair(r.startRef, r.endRef);
+    const loN = refNumOf(lo);
+    const hiN = refNumOf(hi);
+    if (loN === null || hiN === null || hiN - loN <= 1 || hiN - loN > 512)
+      return undefined;
+    const found: string[] = [];
+    for (const h of ownedHoles) {
+      if (h.n >= hiN) break;
+      if (h.n > loN && !found.includes(h.owner)) found.push(h.owner);
+    }
+    return found.length > 0 ? found.join(", ") : undefined;
+  };
   // #3236: screen displayed rows through the SAME projection applySingleRange
   // executes so a row that would be rejected wholesale carries a ⚠ flag. The
   // diagnostic view flags rather than drops — it must keep showing what is
@@ -485,8 +520,9 @@ function renderUncompressedRanges(
         ? r.startRef
         : orderedRefPair(r.startRef, r.endRef).join("–");
     const flag = flagFor ? flagFor(r) : null;
+    const crossed = crossedFolded(r);
     lines.push(
-      `  ${range}  (${r.count} msgs, ${formatTokens(r.tokens)}${r.count > 1 ? ` (${Math.round(r.tokens / r.count)}/msg)` : ""}) ${dominantTool(r.toolTokens)}${flag ? `  ${flag}` : ""}`,
+      `  ${range}  (${r.count} msgs, ${formatTokens(r.tokens)}${r.count > 1 ? ` (${Math.round(r.tokens / r.count)}/msg)` : ""}) ${dominantTool(r.toolTokens)}${crossed ? ` · spans folded ${crossed}` : ""}${flag ? `  ${flag}` : ""}`,
     );
   }
   if (merged.length > limit) {
