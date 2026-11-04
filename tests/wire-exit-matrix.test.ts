@@ -35,9 +35,19 @@ const SLOW_MS = 1500;
 // Raised to 10s after 6s still flaked three consecutive runs on windows-latest
 // node22 shard 2 (master c78ecb4b + ci-fixes c49bf8b1/12b988ff, all closed=0,
 // same cell, sibling shards green — load latency, not a teardown regression;
-// recorded under #4599). If it flakes again at 10s, investigate a real teardown
-// hang instead of raising further.
-const ABORT_TEARDOWN_BUDGET_MS = 10000;
+// recorded under #4599). Flaked once more at 10s (master 9dc4c945, run
+// 41686972484, 2026-11-03: openai-sse + anthropic-sse closed=0 after the full
+// poll, ~11s each; same code green on the ubuntu22/24 and windows24 shard-2
+// siblings, pass durations 23–352ms). The mandated "investigate a real
+// teardown hang" audit found none: relay.ts arms res.on("close") ->
+// clientAbort.abort() synchronously with no linger/backstop on this path, and
+// no commit since d244ffff touched destroy/abort wiring — the residual latency
+// is runner-side event-loop starvation on loaded Windows runners. Hence a
+// platform-scoped budget instead of another flat raise: win32 doubles to 20s
+// (every recorded starvation instance was windows-latest — node22+24, multiple
+// shards, #3665/#4347 era — ubuntu never showed the signature), keeping the
+// tight 10s gate everywhere else so a genuine teardown hang still fails fast.
+const ABORT_TEARDOWN_BUDGET_MS = process.platform === "win32" ? 20000 : 10000;
 
 async function awaitUpstreamTeardown(socketsClosed: () => number): Promise<void> {
     const deadline = Date.now() + ABORT_TEARDOWN_BUDGET_MS;
