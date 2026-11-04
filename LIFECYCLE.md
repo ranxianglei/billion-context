@@ -183,6 +183,7 @@
 | `BILI_UPDATE_CHECK_INTERVAL_MS` | update.checkIntervalMs 覆盖（#2030） |
 | `BILI_ADVISORY_CHECK` | 公告检查开关（默认 ON；文件 advisoryCheck:false 退出） |
 | `BILI_ADVISORY_URL` | 公告文档 URL 覆盖 |
+| `BILI_ANNOUNCEMENTS_URL` | 统一公告面远程源 URL 覆盖（#5548，配置键 remoteAnnouncementsUrl；缺省官方 raw 地址，fail-open） |
 | `BILI_RELEASE_NOTES_CHECK` | 发布说明检查（#1870，默认 ON） |
 | `BILI_RELEASE_NOTES_URL` | 发布说明 URL 覆盖 |
 | `BILI_UPDATE_POLICY_URL` | update.policyUrl——更新策略 URL 覆盖（**测试专用**：生产固定官方 repo，#3619 安全边界） |

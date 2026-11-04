@@ -419,28 +419,33 @@ export const WEB_CLIENT = `(function () {
         return html;
     }
     window.bili_hostPluginBanner = bili_hostPluginBanner;
-    // #5079: one-time-per-instance upgrade notice — prompt_cache_key
-    // self-stamping is off by default now. Server decides active (effective
-    // routing "disabled" && not dismissed); pure builder, same test-seam
-    // convention as the banners above.
-    function bili_pckNoticeBanner(s) {
+    // #5548: single renderer for every built-in notice — tone carries the
+    // color (banner ok|warn); adding a notice never adds a builder again.
+    // #5548 P2: local announcements ship their own localized copy on the wire
+    // ({"zh-CN": …, "en": …} or a plain string) — pick the UI locale with the
+    // same fallback chain t() uses.
+    function bili_pickLoc(v) {
+        if (typeof v === "string") return v;
+        if (v && typeof v === "object") {
+            if (v[locale] !== undefined && typeof v[locale] === "string") return v[locale];
+            if (v["zh-CN"] !== undefined && typeof v["zh-CN"] === "string") return v["zh-CN"];
+            if (v.en !== undefined && typeof v.en === "string") return v.en;
+            const vals = Object.values(v);
+            const first = vals.find((x) => typeof x === "string");
+            if (first !== undefined) return first;
+        }
+        return "";
+    }
+    function bili_noticeBanner(s) {
         let html = '<div class="banner-title">' + escapeHtml(s.on) + "</div>";
-        html += '<div class="alert-row"><span>' + escapeHtml(s.desc) + '</span><button class="btn sm pck-notice-dismiss">' + escapeHtml(s.dismiss) + "</button></div>";
+        let row = '<div class="alert-row"><span>' + escapeHtml(s.desc) + "</span>";
+        if (s.cta && s.cta.url) row += '<a class="btn sm notice-cta" href="' + escapeHtml(s.cta.url) + '" target="_blank" rel="noopener noreferrer">' + escapeHtml(s.cta.label) + "</a>";
+        if (!s.hideDismiss) row += '<button class="btn sm notice-dismiss">' + escapeHtml(s.dismiss) + "</button>";
+        html += row + "</div>";
         html += '<div class="dim small" style="margin-top:6px">' + escapeHtml(s.hint) + "</div>";
         return html;
     }
-    window.bili_pckNoticeBanner = bili_pckNoticeBanner;
-    // #5403: one-time-per-instance intro for the watermark fastpath
-    // experimental grey rollout — same server-side dismissal convention as
-    // above (own notice id, visible on every install until closed or an
-    // explicit rollout override exists); pure builder + same test seam.
-    function bili_wmNoticeBanner(s) {
-        let html = '<div class="banner-title">' + escapeHtml(s.on) + "</div>";
-        html += '<div class="alert-row"><span>' + escapeHtml(s.desc) + '</span><button class="btn sm wm-notice-dismiss">' + escapeHtml(s.dismiss) + "</button></div>";
-        html += '<div class="dim small" style="margin-top:6px">' + escapeHtml(s.hint) + "</div>";
-        return html;
-    }
-    window.bili_wmNoticeBanner = bili_wmNoticeBanner;
+    window.bili_noticeBanner = bili_noticeBanner;
     function $(id) { return document.getElementById(id); }
     function toast(message, kind) {
         const host = $("toast-host");
@@ -1583,63 +1588,41 @@ function changelogCatOf(rawLine) {
                 hb.innerHTML = "";
             }
         }
-        // #5079: prompt_cache_key default-off upgrade notice — dismissal is
+        // #5548: built-in notices — one region, one loop; per-notice activity
+        // is decided server-side (src/notices.ts registry), dismissal stays
         // server-side (POST /__bili/notices/dismiss) so one close silences
-        // every browser; the banner re-renders from the refetched overview.
-        const nb = $("pck-notice-banner");
-        if (nb) {
-            const pn = d.pckNotice && typeof d.pckNotice === "object" ? d.pckNotice : null;
-            if (pn && pn.active === true) {
-                nb.hidden = false;
-                nb.classList.add("show");
-                nb.innerHTML = bili_pckNoticeBanner({ on: t("pckoff.on"), desc: t("pckoff.desc"), hint: t("pckoff.hint"), dismiss: t("pckoff.dismiss_btn") });
-                for (const btn of Array.from(nb.querySelectorAll(".pck-notice-dismiss"))) {
-                    btn.addEventListener("click", async () => {
-                        busy(btn, true);
-                        try {
-                            await json(API_ROOT + "/notices/dismiss", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id: typeof pn.id === "string" ? pn.id : "" }) });
-                            toast(t("pckoff.dismissed"), "ok");
-                            await loadOverview(true);
-                        } catch (e) {
-                            toast(e.message, "err");
-                        } finally {
-                            busy(btn, false);
-                        }
-                    });
+        // every browser. Tone + i18n keys come from the payload.
+        const nr = $("notices-banner-region");
+        if (nr) {
+            const list = Array.isArray(d.notices) ? d.notices : [];
+            nr.innerHTML = "";
+            for (const n of list) {
+                if (!n || typeof n !== "object" || typeof n.id !== "string") continue;
+                const el = document.createElement("div");
+                el.className = "banner " + (n.tone === "ok" ? "ok" : n.tone === "warn" ? "warn" : "");
+                el.dataset.id = n.id;
+                nr.appendChild(el);
+                if (n.source !== "builtin") {
+                    el.innerHTML = bili_noticeBanner({ on: bili_pickLoc(n.title), desc: bili_pickLoc(n.desc), hint: bili_pickLoc(n.hint), dismiss: t("notices.dismiss_btn"), cta: n.ctaUrl ? { label: n.ctaLabel ?? "", url: n.ctaUrl } : null, hideDismiss: !!n.suppressDismiss });
+                } else {
+                    const k = n.keys && typeof n.keys === "object" ? n.keys : {};
+                    el.innerHTML = bili_noticeBanner({ on: t(String(k.on)), desc: t(String(k.desc)), hint: t(String(k.hint)), dismiss: k.dismiss ? t(String(k.dismiss)) : t("notices.dismiss_btn"), cta: null, hideDismiss: false });
                 }
-            } else {
-                nb.hidden = true;
-                nb.classList.remove("show");
-                nb.innerHTML = "";
             }
-        }
-        // #5403: watermark fastpath experimental-grey intro — all installs see
-        // it on first upgrade until closed (server-side, like #5079 above).
-        const wnb = $("wm-notice-banner");
-        if (wnb) {
-            const wn = d.wmNotice && typeof d.wmNotice === "object" ? d.wmNotice : null;
-            if (wn && wn.active === true) {
-                wnb.hidden = false;
-                wnb.classList.add("show");
-                wnb.innerHTML = bili_wmNoticeBanner({ on: t("wmfast.on"), desc: t("wmfast.desc"), hint: t("wmfast.hint"), dismiss: t("wmfast.dismiss_btn") });
-                for (const btn of Array.from(wnb.querySelectorAll(".wm-notice-dismiss"))) {
-                    btn.addEventListener("click", async () => {
-                        busy(btn, true);
-                        try {
-                            await json(API_ROOT + "/notices/dismiss", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id: typeof wn.id === "string" ? wn.id : "" }) });
-                            toast(t("wmfast.dismissed"), "ok");
-                            await loadOverview(true);
-                        } catch (e) {
-                            toast(e.message, "err");
-                        } finally {
-                            busy(btn, false);
-                        }
-                    });
-                }
-            } else {
-                wnb.hidden = true;
-                wnb.classList.remove("show");
-                wnb.innerHTML = "";
+            for (const btn of Array.from(nr.querySelectorAll(".notice-dismiss"))) {
+                btn.addEventListener("click", async () => {
+                    busy(btn, true);
+                    const holder = btn.closest(".banner");
+                    try {
+                        await json(API_ROOT + "/notices/dismiss", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id: holder ? holder.dataset.id : "" }) });
+                        toast(t("notices.dismissed"), "ok");
+                        await loadOverview(true);
+                    } catch (e) {
+                        toast(e.message, "err");
+                    } finally {
+                        busy(btn, false);
+                    }
+                });
             }
         }
         // #1682: global upstream-connection alert banner — visible on every view,
