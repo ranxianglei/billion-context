@@ -104,19 +104,28 @@ Two lanes, same plugin (#941):
      alive when `bili-native` is disabled or kill-switched (#3662) —
      registers a cordis `internal/config` overlay (vendored from
      deshark42/dsh-compaction-basic-disable, MIT) that marks the preset's
-     `compaction-basic` and `command-compact` rows `disabled: true` while
+     `compaction-basic` rows — and `command-compact` rows unless
+     `dsh.keepCommandCompact` is set (#4872) — `disabled: true` while
      bili owns the lane, and the preset gate rows in the bundle patch make
      each Web preset wait for that overlay's service before it can register.
      Native
     auto-compaction is OFF in these profiles too (and `/compact` is
-    unavailable there — that is EXPECTED, not a bug (#4002): bili owns
-    compression on the lane, so the preset's compact command and its
-    auto-compaction are both stood down deliberately; there is no
-    re-enable switch by design (#3651/#3666), see CONFIGURATION.md);
+    unavailable there by default — that is EXPECTED, not a bug (#4002):
+    bili owns compression on the lane, so the preset's compact command
+    and its auto-compaction are both stood down deliberately; there is
+    no re-enable switch for AUTO-compaction by design (#3651/#3666). If
+    you run third-party plugins bridging through the DSH-official
+    `ctx.commands.find(agent, "compact")` path and need the explicit
+    `/compact` command back, set `dsh.keepCommandCompact` (env
+    `BILI_DSH_KEEP_COMMAND_COMPACT`) — the overlay then disables only
+    compaction-basic, and a `/compact`-triggered call still passes the
+    #1729 wire guard; see CONFIGURATION.md, #4872);
     ACP compression is unaffected. Since #4147 the overlay matches
     STRUCTURALLY — any entry whose resolved `config.plugins` nests
-    `compaction-basic`/`command-compact` rows gets them disabled, custom
-    and profile-local presets exactly like the factory ones (the four
+    `compaction-basic`/`command-compact` rows enters the rewrite (always
+    for compaction-basic, additionally for command-compact while
+    `dsh.keepCommandCompact` is unset, #4872), custom and profile-local
+    presets exactly like the factory ones (the four
     gate-row ids in `dsh.bundle.patch.yml` are ordering insurance for the
     factory roster, not the coverage boundary — a profile shipping other
     preset ids is covered by the structural walk). The one-time `[dsh-client]`
