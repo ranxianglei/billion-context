@@ -134,11 +134,13 @@ test("legacyBcpEntriesIn: reads packages[], tolerates missing/broken files", () 
     assert.deepEqual(legacyBcpEntriesIn(path.join(dir, "missing.json")), []);
 });
 
-test("planNativePi: default is the in-process inline lane (#4571); opt-out and /bili/ launches are off", () => {
-    // plain `pi` with the plugin and no signals plans the spawned proxy —
-    // inline is OPT-IN (#4687 reverts the #4571 default flip; owner rule:
-    // never change defaults). Explicit opt-out paths also plan the server.
-    assert.deepEqual(planNativePi({}), { mode: "spawn" }, "default stays spawn (no default flip)");
+test("planNativePi: default is the in-process inline lane (#5428 restores the #4571 posture); explicit opt-out and /bili/ launches leave it", () => {
+    // plain `pi` with the plugin and no signals plans the IN-PROCESS lane —
+    // inline is the DEFAULT since #5428 (supersedes the #4687 opt-in rule).
+    // Explicit opt-out (env off / file false) plans the spawned server, and
+    // an ANNOUNCED attach target still beats the default (see next test).
+    assert.deepEqual(planNativePi({}), { mode: "inline" }, "default is inline (#5428 default flip)");
+    assert.deepEqual(planNativePi({ BILI_PI_INLINE: "" }), { mode: "inline" }, "blank env folds to unset → default inline");
     assert.deepEqual(planNativePi({ BILI_PI_INLINE: "0" }), { mode: "spawn" });
     assert.deepEqual(planNativePi({}, false), { mode: "spawn" });
     assert.deepEqual(planNativePi({}, true), { mode: "inline" });
@@ -162,10 +164,10 @@ test("planNativePi: a preset BILLION_CONTEXT_PROXY is an attach target, not a st
     // kill switches and a /bili/ launch still win over the preset
     assert.deepEqual(planNativePi({ BILLION_CONTEXT_PROXY: "http://127.0.0.1:36485", BILLION_CONTEXT_PLUGIN: "0" }), { mode: "off" });
     assert.deepEqual(planNativePi({ BILLION_CONTEXT_PROXY: "http://127.0.0.1:36485", BILI_PROVIDER_REWRITES: "{}" }), { mode: "off" });
-    // a garbage / blank preset falls back to self-managed — the spawned
-    // server (historical default), never dead-off
-    assert.deepEqual(planNativePi({ BILLION_CONTEXT_PROXY: "garbage" }), { mode: "spawn" });
-    assert.deepEqual(planNativePi({ BILLION_CONTEXT_PROXY: "  " }), { mode: "spawn" });
+    // a garbage / blank preset is no attach origin at all — the #5428 inline
+    // DEFAULT arms, never dead-off
+    assert.deepEqual(planNativePi({ BILLION_CONTEXT_PROXY: "garbage" }), { mode: "inline" });
+    assert.deepEqual(planNativePi({ BILLION_CONTEXT_PROXY: "  " }), { mode: "inline" });
 });
 
 test("planNativePi: explicit BILLION_CONTEXT_ATTACH wins over the env preset", () => {
@@ -192,9 +194,9 @@ test("#3278: BILI_PI_INLINE plans the no-server lane and outranks ambient attach
     assert.deepEqual(planNativePi({ BILI_PI_INLINE: "1", BILLION_CONTEXT_PLUGIN: "0" }), { mode: "off" });
     assert.deepEqual(planNativePi({ BILI_PI_INLINE: "1", BILI_NATIVE_PI: "0" }), { mode: "off" });
     assert.deepEqual(planNativePi({ BILI_PI_INLINE: "1", BILI_PROVIDER_REWRITES: "{}" }), { mode: "off" });
-    // unset / off values keep today's postures untouched
+    // unset / off values: unset = the #5428 inline default; explicit off = spawn
     assert.deepEqual(planNativePi({ BILI_PI_INLINE: "0" }), { mode: "spawn" });
-    assert.deepEqual(planNativePi({}), { mode: "spawn" }, "default stays spawn (no default flip)");
+    assert.deepEqual(planNativePi({}), { mode: "inline" }, "default is inline (#5428 default flip)");
 });
 
 test("#3278: pi.inline (config file) enables the lane; env resolves over it", () => {
@@ -209,7 +211,7 @@ test("#3278: pi.inline (config file) enables the lane; env resolves over it", ()
     assert.deepEqual(planNativePi({ BILI_PI_INLINE: "false" }, true), { mode: "spawn" });
     // explicit env on enables over a false file value
     assert.deepEqual(planNativePi({ BILI_PI_INLINE: "1" }, false), { mode: "inline" });
-    assert.deepEqual(planNativePi({}, false), { mode: "spawn" });
+    assert.deepEqual(planNativePi({}, false), { mode: "spawn" }, "explicit file false opts out of the #5428 inline default");
     // kill switches and /bili/ launches still win over the file
     assert.deepEqual(planNativePi({ BILLION_CONTEXT_PLUGIN: "0" }, true), { mode: "off" });
     assert.deepEqual(planNativePi({ BILI_NATIVE_PI: "0" }, true), { mode: "off" });
