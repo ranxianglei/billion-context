@@ -52,7 +52,9 @@ function isTraeConversation(v: unknown): boolean {
         if (c === null || c === undefined) return m.role === "assistant";
         if (typeof c === "string") return true;
         if (!Array.isArray(c)) return false;
-        return c.every((p) => p !== null && typeof p === "object" && (p as Record<string, unknown>).type === "text");
+        // text and image_url are OpenAI vocabulary this wire carries end to end;
+        // anything else (audio/file) still refuses, matching the codec.
+        return c.every((p) => p !== null && typeof p === "object" && ["text", "image_url"].includes(String((p as Record<string, unknown>).type)));
     });
 }
 
@@ -173,7 +175,7 @@ test("#1295: declared trae endpoint — envelope unwrapped, Trae SSE back down",
     }
 });
 
-test("#1295: declared trae endpoint with a non-text part relays byte-for-byte", async () => {
+test("#1295: declared trae endpoint carrying an image part enters the pipeline", async () => {
     const rig = await startRig();
     try {
         const body = traeBody({
@@ -185,14 +187,42 @@ test("#1295: declared trae endpoint with a non-text part relays byte-for-byte", 
         const r = await post(rig, "/api/agent/v3/llm_utils_chat", "trae-image", body);
         assert.equal(r.status, 200);
         const text = await r.text();
+        assert.ok(text.includes("event:done"), "an image does not demote the lane to verbatim relay");
         const fwd = rig.forwards.at(-1)!;
-        assert.equal(fwd.raw, body, "unconvertible bodies must reach upstream untouched");
-        assert.ok(text.startsWith(body), "and the upstream reply passes through unmodified");
+        assert.notEqual(fwd.raw, body, "the image-bearing body is rebuilt by the pipeline");
+        const up = JSON.parse(fwd.raw) as Record<string, unknown>;
+        const msgs = up.messages as Array<Record<string, unknown>>;
+        // the pipeline prepends its own system message, so scan every message
+        // for the image part rather than assuming it stayed at index 0.
+        const allParts = msgs.flatMap((m) => (Array.isArray(m.content) ? (m.content as Array<Record<string, unknown>>) : []));
+        const img = allParts.find((p) => p.type === "image_url") as Record<string, unknown> | undefined;
+        assert.ok(img !== undefined, "the image part survives the round trip");
+        assert.equal((img!.image_url as Record<string, unknown>).url, "data:image/png;base64,AA", "image bytes are untouched");
+        assert.equal(up.function, "solo_agent", "envelope keys still ride along");
     } finally {
         await closeRig(rig);
     }
 });
 
+test("#1295: declared trae endpoint with an audio part relays byte-for-byte", async () => {
+    const rig = await startRig();
+    try {
+        const body = traeBody({
+            messages: [{
+                role: "user",
+                content: [{ type: "text", text: "listen" }, { type: "audio", audio: { data: "AA" } }],
+            }],
+        });
+        const r = await post(rig, "/api/agent/v3/llm_utils_chat", "trae-audio", body);
+        assert.equal(r.status, 200);
+        const text = await r.text();
+        const fwd = rig.forwards.at(-1)!;
+        assert.equal(fwd.raw, body, "an unknown vocabulary still reaches upstream untouched");
+        assert.ok(text.startsWith(body), "and the upstream reply passes through unmodified");
+    } finally {
+        await closeRig(rig);
+    }
+});
 test("#1295: declared trae endpoint with a non-streaming body demotes to verbatim relay", async () => {
     const rig = await startRig();
     try {

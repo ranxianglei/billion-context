@@ -64,7 +64,7 @@ envelope 包着的 openai-completions 对话（`function: "solo_agent"`，模型
 
 | ID | 约束 | bili 侧的后果 |
 |----|------|---------------|
-| WC-12a | 对话是 openai-completions 形状，但 message 的 content 恒为 text parts 数组 —— tool 结果也一样。 | unwrap 把 parts 拼回一个字符串；出现非 text part（图片/音频）即判定整个 body 不可转换 → 原样 relay。rewrap 把每条消息还原成单个 text part。 |
+| WC-12a | 对话是 openai-completions 形状，但 message 的 content 恒为 parts 数组 —— tool 结果也一样，且 part 词表就是 OpenAI 的（`text`、`image_url`）。 | unwrap 把纯 text 的 parts 拼回一个字符串，出现 `image_url` 时保留 parts 数组（图片原样透传）；词表之外的 part 类型（音频/文件）判定整个 body 不可转换 → 原样 relay（#1284）。rewrap 把字符串还原成单个 text part，并把图片 part 按序还原。 |
 | WC-12b | tool call 保留 OpenAI 外层（`id`、`type: "function"`），但载荷键改名为 `function_call`；带工具调用的 assistant 轮 `content: null`。 | unwrap 改回 `function`；rewrap 改回 `function_call` 并还原工具轮的 `content: null`（`arguments` 按字节语义保真，#1039）。 |
 | WC-12c | 流是 `event:<name>` / `data:<json>`，冒号后没有空格，也没有 `[DONE]`；`done` 帧是终止符。帧序：`metadata` → `timing_cost` → N×`output` → (`extra_info`) → `token_usage` → `done`。 | 适配器按该方言解析；`emitCompletion` 写 `token_usage` + `done`。只有 `done` 之前的断流才合成 `error` 帧。 |
 | WC-12d | rewrap 绝不允许在转发中途丢内容。 | 该 wire 没有对应槽位的角色（例如 compat-roles 的重写目标）降级为 `user` 文本，而不是被丢弃。 |
