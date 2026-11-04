@@ -502,11 +502,13 @@ bili sessions ls                 # id、label、解码后大小、最后更新�
 bili sessions rm <id>            # 完整删除(释放内容引用计数,含媒体);随后收缩 index.db(--no-vacuum 跳过)
 bili sessions archive <id>       # 导出到 archive/archive.jsonl + 清行;tombstone 保留 label 与身份
 bili sessions restore <id>       # 从日志行恢复已归档的会话
+bili sessions foreign-blocks     # (#5312) 列出折叠块覆盖的消息从未属于本会话的记录 —— dry-run;--apply 可逆地归档它们,--restore <sid>:<bid> 找回其中一条
 bili storage gc [--days N] [--vacuum full|incremental] [--dry-run]
                                  # 先打印清扫计划(超期会话、零引用内容行、可回收页数估算),再执行与 HTTP 端点相同的 gc();--dry-run 只打印计划
+bili storage migrate [--dry-run]  # (#5599) 一次性把全部 legacy JSON 会话批量导入统一 SQLite 索引,逐会话做摘要对账(imported / indexed / drifted / failed);对 JSON 文件只读 —— 报告干净后归档/删除由你自己决定;--dry-run 只打印计划不写入
 ```
 
-`archive`/`restore`/`gc` 需要统一存储(`BILI_STORAGE_UNIFIED=sqlite|shadow|full` 或配置文件里的 `storage.unified` —— 缺省现在就是纯 sqlite)—— legacy-only 安装会拒绝并给出提示。`--days` 默认取 `storage.archiveAfterDays`(365)。没有调度器:全部按需运行。所有命令都支持 `--json`。
+`archive`/`restore`/`gc`/`migrate` 需要统一存储(`BILI_STORAGE_UNIFIED=sqlite|shadow|full` 或配置文件里的 `storage.unified` —— 缺省现在就是纯 sqlite)—— legacy-only 安装会拒绝并给出提示。`--days` 默认取 `storage.archiveAfterDays`(365)。没有调度器:全部按需运行。所有命令都支持 `--json`。
 
 **大库上 full vacuum 是离线操作(#4612)。** `--vacuum full`(默认)会在独占写锁下重写整个 index.db —— O(库大小),多 GB 的库要几分钟到几十分钟,且没有中间进度(SQLite 的 VACUUM 是原子操作,拆不开)。在有代理正从同一会话目录服务时跑它,会把那个代理的写入饿死到其存储层降级为止,所以 `storage gc --vacuum full` **在另一个存活进程持有该数据库时会拒绝启动**(`index.db.lock` pid 纪律,#4175):CLI 以退出码 1 给出可操作提示,面板端点返回 HTTP 409。先停掉另一个实例(或等它退出)再重试;要在线安全地缩库用 `--vacuum incremental`,它以短事务回收空闲页、不拿独占锁。零引用删除清扫无论哪种模式都分批执行并逐批打印进度。
 
