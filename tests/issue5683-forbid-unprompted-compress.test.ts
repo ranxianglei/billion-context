@@ -180,6 +180,21 @@ test("#5683: requireRecommendation ON + mixed range (part offered, part not) —
     assert.equal(ctx.session.state.blocks.length, 0, "atomic: nothing folded");
 });
 
+test("#5683: requireRecommendation ON + offered span BELOW the minCompressRange floor — out of bounds", () => {
+    // The advertised surfaces (nudge submitGate, acp_status) drop sub-floor
+    // ranges, so the gate must agree: raising the floor above the offered
+    // span's char count (4 × 8000 tokens × 4 = 32000) removes it from the
+    // recommendation set even though it sits in lastNudge verbatim.
+    const ctx = freshCtx();
+    setOffer(ctx, [offerRange("m00001", "m00004", 4)]);
+    ctx.config.compress.minCompressRange = 40000;
+    storeUnpromptedGate(ctx.session, { armed: false, requireNudge: false, requireRecommendation: true });
+    const out = runApply(ctx, { content: [{ startId: "m00001", endId: "m00004", summary: SUM }] });
+    assert.ok(out.startsWith("[Compression REFUSED"), `sub-floor span must be out of bounds, got: ${out.slice(0, 160)}`);
+    assert.ok(out.includes("out-of-bounds compression is disabled"), "must be OUR receipt, not a kernel one:\n" + out);
+    assert.equal(ctx.session.state.blocks.length, 0, "nothing folded");
+});
+
 test("#5683: requireRecommendation ON + pure refold of an active block — NOT refused by the scope gate", () => {
     // Fold m1-m4 first (gates off), then re-point the offer away and re-submit
     // the SAME span: the covered messages never sit in fresh recommendation
