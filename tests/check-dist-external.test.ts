@@ -53,6 +53,20 @@ test("the sanctioned opaque path and incidental strings are invisible", () => {
     assert.equal(clean.length, 0);
 });
 
+test("the word 'import' inside a string literal is not an import (the #5636 false positive)", () => {
+    // The minified shape that tripped the build: an error message ending in
+    // the word import, then more code and another string literal on the SAME
+    // line. The side-effect pattern used to fuse the two quotes into a bogus
+    // ref — pinning both directions (#3617): no ref here, and a real
+    // side-effect import on the next line is still caught.
+    const text =
+        'if(!rec)throw new Error("representative file changed between scan and import");decodedBytes=parsed.bytes;\n' +
+        'import"left-pad";';
+    const refs = findExternalRefs(text);
+    assert.equal(refs.length, 1);
+    assert.deepEqual({ spec: refs[0].spec, kind: refs[0].kind }, { spec: "left-pad", kind: "static" });
+});
+
 test("node builtins (with and without node: prefix) are clean", () => {
     const clean = findExternalRefs(
         'import{readFile}from"node:fs";import crypto from"crypto";const u=require("util");',
