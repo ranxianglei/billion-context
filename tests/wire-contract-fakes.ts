@@ -30,6 +30,14 @@ interface WireRule {
 
 export const WIRE_RULES: readonly WireRule[] = [
     {
+        id: "WC-023",
+        wire: "responses",
+        summary:
+            "an output item (function_call_output / custom_tool_call_output / tool_search_output) whose call_id matches no call item in the same input array is unrecoverable upstream — strict Responses backends 400 the whole request with 'No tool call found for tool output <id>' and every later turn re-fails until restart; bili drops such orphaned outputs at the wire boundary (dropOrphanToolOutputs, src/tool-pair-order.ts)",
+        provenance:
+            "bili #5670 production 400 (Codex 0.166 + DeepSeek via Magpie, bili 0.1.208/0.1.212/master): Codex's new tool_search_call/tool_search_output pair was absent from src/tool-pair-order.ts, and a compression round dropped a tool_search_call while keeping its output (invariant-judge: I2 mid-history-drop x39); DeepSeek answered invalid_request_error 'No tool call found for tool output with call_id call_00_...' and the session was stuck on that model until restart. The error string mirrors OpenAI's own validation shape, so the constraint is enforced for the whole responses wire, not a DeepSeek-only lane.",
+    },
+    {
         id: "WC-017",
         wire: "responses",
         lane: "codex",
@@ -464,6 +472,26 @@ export function validateResponsesBody(body: unknown): string[] {
             if (typeof item.id === "string" && item.id.startsWith("msg")) return;
             out.push(`WC-015 input[${i}].id: expected an ID that begins with 'msg'`);
         });
+        // WC-023 (#5670): an output whose call_id matches no call in the array can never
+        // resolve upstream. bili's repair drops these at the wire boundary (src/tool-pair-order.ts);
+        // this clause catches any future path that bypasses it. Missing/empty call_id is not
+        // flagged — the #5670 evidence only covers identified orphans.
+        {
+            const callIds = new Set<string>();
+            for (const item of body.input) {
+                if (!isPlainObject(item)) continue;
+                if ((item.type === "function_call" || item.type === "custom_tool_call" || item.type === "tool_search_call") && typeof item.call_id === "string")
+                    callIds.add(item.call_id);
+            }
+            body.input.forEach((item, i) => {
+                if (!isPlainObject(item)) return;
+                const t = item.type;
+                if (t !== "function_call_output" && t !== "custom_tool_call_output" && t !== "tool_search_output") return;
+                if (typeof item.call_id !== "string" || item.call_id.length === 0) return;
+                if (!callIds.has(item.call_id))
+                    out.push(`WC-023 input[${i}]: ${t} references call_id "${item.call_id}" but no matching call item exists in input — strict backends 400 'No tool call found for tool output' (#5670)`);
+            });
+        }
     }
     // WC-013 (#1757): runs before the tools early-return — reasoning.summary
     // exists on bodies without tools.

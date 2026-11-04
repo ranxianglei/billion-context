@@ -4,14 +4,23 @@
 // call <id>" even though both items exist. Enforced at the wire boundary: any such
 // trapped item is hoisted just before the earliest call it sits between. No-op on
 // healthy input, so well-formed sessions stay byte-stable for the prefix cache.
+// #5670 — Codex 0.166 additionally emits tool_search_call / tool_search_output pairs
+// (OpenAI tool-search feature), which were absent from the type sets above, so neither
+// guarantee applied to them. Second failure mode on the same boundary: when compression
+// drops a call but keeps its output, no reordering can save the turn — strict backends
+// 400 the whole request with "No tool call found for tool output <id>" and the session
+// is stuck until restart. Fail closed here: orphaned outputs are dropped and logged.
+// Both guarantees are no-ops (same array reference) on healthy input.
+
+import { log } from "./logger.js";
 
 interface ToolPairItem {
     type?: string;
     call_id?: string;
 }
 
-const CALL_TYPES = new Set(["function_call", "custom_tool_call"]);
-const OUTPUT_TYPES = new Set(["function_call_output", "custom_tool_call_output"]);
+const CALL_TYPES = new Set(["function_call", "custom_tool_call", "tool_search_call"]);
+const OUTPUT_TYPES = new Set(["function_call_output", "custom_tool_call_output", "tool_search_output"]);
 
 function isCall(type: string | undefined): boolean {
     return type !== undefined && CALL_TYPES.has(type);
@@ -25,7 +34,33 @@ function idOf(item: ToolPairItem): string {
     return typeof item.call_id === "string" ? item.call_id : "";
 }
 
-export function hoistTrappedToolItems<T extends ToolPairItem>(items: T[]): T[] {
+// #5670 fail-closed half: an output whose call_id matches no call in the array can never
+// be valid upstream (a compression pass that dropped the call leaves exactly this shape),
+// so it is dropped instead of shipped. Outputs with an empty/missing call_id are kept —
+// unjudgeable, and dropping them would lose data we cannot prove orphaned. Returns the
+// same reference when nothing is dropped (byte-stable for the prefix cache).
+export function dropOrphanToolOutputs<T extends ToolPairItem>(items: T[]): T[] {
+    const callIds = new Set<string>();
+    for (const it of items) {
+        if (!isCall(it.type)) continue;
+        const id = idOf(it);
+        if (id) callIds.add(id);
+    }
+    const dropped: string[] = [];
+    const kept = items.filter((it) => {
+        if (!isOutput(it.type)) return true;
+        const id = idOf(it);
+        if (!id || callIds.has(id)) return true;
+        dropped.push(id);
+        return false;
+    });
+    if (dropped.length === 0) return items;
+    log("warn", `[tool-pair-order] dropped ${dropped.length} orphan tool output(s) whose call is absent from the outbound array: ${dropped.slice(0, 5).join(", ")}${dropped.length > 5 ? ` (+${dropped.length - 5} more)` : ""}`);
+    return kept;
+}
+
+export function hoistTrappedToolItems<T extends ToolPairItem>(input: T[]): T[] {
+    const items = dropOrphanToolOutputs(input);
     const n = items.length;
     if (n < 3) return items;
 

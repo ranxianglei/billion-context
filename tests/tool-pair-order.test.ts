@@ -1,31 +1,36 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { hoistTrappedToolItems } from "../src/tool-pair-order.ts";
+import { dropOrphanToolOutputs, hoistTrappedToolItems } from "../src/tool-pair-order.ts";
 
 const fc = (id: string) => ({ type: "function_call", call_id: id });
 const fo = (id: string) => ({ type: "function_call_output", call_id: id });
 const ct = (id: string) => ({ type: "custom_tool_call", call_id: id });
 const cto = (id: string) => ({ type: "custom_tool_call_output", call_id: id });
+const tsc = (id: string) => ({ type: "tool_search_call", call_id: id });
+const tso = (id: string) => ({ type: "tool_search_output", call_id: id });
 const msg = (text: string) => ({ type: "message", role: "assistant", content: [{ type: "output_text", text }] });
 const reason = () => ({ type: "reasoning" });
 
 type Item = { type: string; role?: string; content?: unknown[] | string; call_id?: string };
 
+const CALL_T = new Set(["function_call", "custom_tool_call", "tool_search_call"]);
+const OUT_T = new Set(["function_call_output", "custom_tool_call_output", "tool_search_output"]);
+
 // Invariant the fix guarantees: no non-tool item sits strictly between a
-// function_call/custom_tool_call and its matching output.
+// call and its matching output (all registered pair families, #5670 included).
 function assertNoTrap(items: Item[]): void {
     const callPos = new Map<string, number>();
     const outPos = new Map<string, number>();
     items.forEach((it, i) => {
-        if (it.type === "function_call" || it.type === "custom_tool_call") {
+        if (CALL_T.has(it.type)) {
             if (!callPos.has(it.call_id!)) callPos.set(it.call_id!, i);
-        } else if (it.type === "function_call_output" || it.type === "custom_tool_call_output") {
+        } else if (OUT_T.has(it.type)) {
             if (!outPos.has(it.call_id!)) outPos.set(it.call_id!, i);
         }
     });
     for (let p = 0; p < items.length; p++) {
         const t = items[p].type;
-        if (t === "function_call" || t === "custom_tool_call" || t === "function_call_output" || t === "custom_tool_call_output") continue;
+        if (CALL_T.has(t) || OUT_T.has(t)) continue;
         for (const [id, c] of callPos) {
             const o = outPos.get(id);
             assert.ok(!(o !== undefined && c < p && o > p), `non-tool item at ${p} trapped between call@${c} and output@${o} (${id})`);
@@ -105,4 +110,61 @@ test("short arrays are returned unchanged", () => {
     assert.deepEqual(hoistTrappedToolItems([]), []);
     assert.deepEqual(hoistTrappedToolItems([msg("only")]), [msg("only")]);
     assert.deepEqual(hoistTrappedToolItems([fc("a"), fo("a")]), [fc("a"), fo("a")]);
+});
+
+test("#5670 pair registration: reasoning wedged between tool_search_call and tool_search_output is hoisted", () => {
+    const input: Item[] = [tsc("search_1"), reason(), tso("search_1")];
+    const out = hoistTrappedToolItems(input);
+    assert.deepEqual(types(out), ["reasoning", "tool_search_call", "tool_search_output"]);
+    assertNoTrap(out);
+});
+
+test("#5670 fail-closed: orphan tool_search_output (call dropped by compression) is removed, rest untouched", () => {
+    const input: Item[] = [fc("a"), fo("a"), tso("call_00_D0V8XQjbPiJOdAcTcAX38458"), msg("after")];
+    const out = hoistTrappedToolItems(input);
+    assert.deepEqual(types(out), ["function_call", "function_call_output", "message"]);
+    assertNoTrap(out);
+});
+
+test("#5670 fail-closed: orphan function_call_output is dropped identically", () => {
+    const input: Item[] = [fc("keep"), fo("keep"), fo("dead")];
+    const out = hoistTrappedToolItems(input);
+    assert.deepEqual(types(out), ["function_call", "function_call_output"]);
+});
+
+test("#5670 negative: orphan CALLS are kept (an in-flight turn's call has no output yet)", () => {
+    const input: Item[] = [fc("a"), fo("a"), fc("pending")];
+    const out = hoistTrappedToolItems(input);
+    assert.strictEqual(out, input);
+});
+
+test("#5670 negative: output with missing call_id is kept (unjudgeable — dropping would lose data)", () => {
+    const bare = { type: "function_call_output" } as Item;
+    const input: Item[] = [fc("a"), fo("a"), bare];
+    const out = hoistTrappedToolItems(input);
+    assert.strictEqual(out, input);
+    assert.equal(out.length, 3);
+});
+
+test("#5670 negative: healthy input containing tool_search pairs returns the same array reference (byte-stable)", () => {
+    const input: Item[] = [tsc("s1"), tso("s1"), msg("m"), fc("f"), fo("f")];
+    const out = hoistTrappedToolItems(input);
+    assert.strictEqual(out, input);
+});
+
+test("#5670 evidence-based: interleaved parallel groups are left alone (DeepSeek accepts them — issue payloads 2-4 all 200)", () => {
+    const input: Item[] = [fc("a"), fc("b"), fo("a"), fo("b")];
+    const out = hoistTrappedToolItems(input);
+    assert.strictEqual(out, input);
+});
+
+test("#5670 short-array path still drops a lone orphan output", () => {
+    assert.deepEqual(dropOrphanToolOutputs([tso("x")]), []);
+    assert.deepEqual(hoistTrappedToolItems([tso("x")]), []);
+});
+
+test("dropOrphanToolOutputs: multiple orphans all dropped, paired items survive", () => {
+    const input: Item[] = [ct("c1"), cto("c1"), tso("gone_1"), fc("f1"), fo("f1"), tso("gone_2")];
+    const out = dropOrphanToolOutputs(input);
+    assert.deepEqual(types(out), ["custom_tool_call", "custom_tool_call_output", "function_call", "function_call_output"]);
 });
