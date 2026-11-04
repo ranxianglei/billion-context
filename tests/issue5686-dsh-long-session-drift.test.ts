@@ -155,6 +155,21 @@ test("#5686 P0-1: with a LIVE proxy the choke point is inert — the request rou
     assert.deepEqual(sink, ["http://127.0.0.1:40001/bili/http://127.0.0.1:8199/v1/messages"]);
 });
 
+test("#5686 P0-1: signed built-in passthrough entry with no live proxy refuses decisive compaction too (#5692 delta absorbed)", async () => {
+    // The #1884 byte-untouched opt-in short-circuits before the origin
+    // machinery — pre-fix this entry was never flagged, so a marker-decisive
+    // compaction call on a signed gateway with a dead proxy still landed
+    // upstream and shadowed the raw history (mechanism B enumerates it).
+    await withEnv({ BILI_RESIGN_PASSTHROUGH: "1" }, async () => {
+        const state: NativeInterceptState = { origin: undefined, ready: Promise.resolve(undefined), readyTimeoutMs: 50 };
+        const { sink, result } = await withPatch(state, async (fetch) =>
+            fetch("http://127.0.0.1:8199/v1/messages", { method: "POST", headers: { "content-type": "application/json", authorization: `SDK-HMAC-SHA256 Access=AKTEST123,SignedHeaders=host,Signature=${"ab".repeat(32)}` }, body: anthropicCompactionBody() }));
+        assert.equal(result.status, 422);
+        assert.equal(result.headers.get("x-bili-gate"), "dsh-compaction-refused");
+        assert.deepEqual(sink, []);
+    });
+});
+
 // ---- P0-2: the compaction-disable overlay latch alarm must fire on EVERY
 // profile shape, not only the web-app one (#5684 desktop blind spot). --------
 

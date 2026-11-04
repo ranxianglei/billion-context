@@ -1625,7 +1625,12 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
                     }
                     clearSignedRefusal(signedScheme);
                     noteSignedDirect(url, signedScheme, "built-in passthrough opt-in (#1884) — byte-untouched, no compression");
-                    return directSendOrRefuse(url, input, init);
+                    // #5686 P0-1 (delta absorbed from parallel PR #5692): this
+                    // entry short-circuits BEFORE the origin machinery, so the
+                    // per-caller judgment is made here — refuse marker-decisive
+                    // compaction calls exactly when there is no live proxy
+                    // (mechanism B enumerates this signed-passthrough shape).
+                    return directSendOrRefuse(url, input, init, undefined, state.origin === undefined);
                 }
                 resignExtra = {
                     [APIG_RESIGN_HEADER]: APIG_RESIGN_SCHEME,
