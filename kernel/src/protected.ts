@@ -1,5 +1,6 @@
 import type { Config, CoreMessage } from "./types.js";
 import { SUMMARY_HEADER } from "./prune.js";
+import { hasRefRecoverableMediaPayload } from "./media-refs.js";
 
 /** Tools that are ALWAYS protected, regardless of user config. These are ACP's
  *  own metadata tools whose records must remain in context: compress calls
@@ -595,15 +596,25 @@ export function hasMediaPayload(msg: CoreMessage): boolean {
   return false;
 }
 
-/** True when msg carries media whose bytes bili CANNOT store locally —
- *  remote-URL images and opaque file references (DeepSeek Files API
- *  `{type:"file"}`, Google `fileData`/`videoMetadata`) — so folding it would
- *  destroy the payload permanently with no decompress({ imageRef }) restore
- *  behind it (billion-context#1188; the missing Google detection was #2609).
- *  Archivable media (inline base64 / data: URLs, which the host spills to disk
- *  at arrival time) is deliberately NOT unrecoverable: since #2607 such
- *  messages fold like ordinary text and stay citable by their mNNNNN ref.
- *  The data-URL test mirrors the host archive channel (image-restore.ts
+/** True when msg carries state that CANNOT survive folding:
+ *
+ *  (a) control-plane structured system messages — folding one un-declares
+ *      tools mid-conversation (#3992/#4166);
+ *  (b) media with NO extractable re-access handle — bili archives no such
+ *      bytes anywhere (no server-side media store), so folding destroys
+ *      them with no restore path behind (#1188; the missing Google
+ *      detection was #2609). Their refs stay BLOCKED so they are never
+ *      advertised or foldable either.
+ *
+ *  #5620 split of the media class: media that exposes at least one
+ *  re-access handle (remote URL / DeepSeek Files API file id / Google
+ *  fileUri — hasRefRecoverableMediaPayload, media-refs.ts) is FOLDABLE —
+ *  the handles ride the stored summary verbatim (appended mechanically at
+ *  apply time) and decompress restores the original message losslessly.
+ *  Unknown opaque shapes deliberately keep pinning until their semantics
+ *  are established. Archivable inline media (base64 / data-URL images,
+ *  spilled to disk at arrival) folds like text as before (#2607): the
+ *  data-URL test mirrors the host archive channel (image-restore.ts
  *  messageImageBytes) exactly, so "recoverable here" ⇔ "bytes actually
  *  spilled there". */
 export function hasUnrecoverableMediaPayload(msg: CoreMessage): boolean {
@@ -637,7 +648,10 @@ export function hasUnrecoverableMediaPayload(msg: CoreMessage): boolean {
     const part = asObj(roc);
     const url =
       part?.type === "image_url" ? asObj(part.image_url)?.url : undefined;
-    if (!isInlineDataUrl(url)) return true;
+    // #5620: a remote URL / file ref IS the payload's re-access handle —
+    // foldable, the ref rides the stored summary (media-refs.ts). Only
+    // byteless-AND-refless opaque parts still pin.
+    if (!isInlineDataUrl(url)) return !hasRefRecoverableMediaPayload(msg);
   }
 
   if (Array.isArray(m.rawOpenaiContentParts)) {
@@ -645,14 +659,14 @@ export function hasUnrecoverableMediaPayload(msg: CoreMessage): boolean {
       const part = asObj(p);
       const url =
         part?.type === "image_url" ? asObj(part.image_url)?.url : undefined;
-      if (!isInlineDataUrl(url)) return true;
+      if (!isInlineDataUrl(url)) return !hasRefRecoverableMediaPayload(msg);
     }
   }
 
   const ab = asObj(m.rawAnthropicBlock);
   if (ab) {
     if (ab.type === "image" && !anthropicSourceArchivable(asObj(ab.source)))
-      return true;
+      return !hasRefRecoverableMediaPayload(msg);
     if (ab.type === "tool_result") {
       const content = ab.content;
       if (Array.isArray(content)) {
@@ -660,7 +674,8 @@ export function hasUnrecoverableMediaPayload(msg: CoreMessage): boolean {
           const blk = asObj(b);
           if (!blk || blk.type === "text") continue;
           if (blk.type === "image") {
-            if (!anthropicSourceArchivable(asObj(blk.source))) return true;
+            if (!anthropicSourceArchivable(asObj(blk.source)))
+              return !hasRefRecoverableMediaPayload(msg);
             continue;
           }
           return true;
@@ -689,7 +704,8 @@ export function hasUnrecoverableMediaPayload(msg: CoreMessage): boolean {
         for (const p of arr) if (asObj(p)?.type === "input_image") parts.push(p);
     }
     for (const p of parts) {
-      if (!isInlineDataUrl(asObj(p)?.image_url)) return true;
+      if (!isInlineDataUrl(asObj(p)?.image_url))
+        return !hasRefRecoverableMediaPayload(msg);
     }
   }
 
@@ -700,13 +716,14 @@ export function hasUnrecoverableMediaPayload(msg: CoreMessage): boolean {
     for (const p of m.rawGoogleParts) {
       const part = asObj(p);
       if (!part) continue;
-      if (part.fileData != null || part.videoMetadata != null) return true;
+      if (part.fileData != null || part.videoMetadata != null)
+        return !hasRefRecoverableMediaPayload(msg);
       const fr = asObj(part.functionResponse);
       if (fr && Array.isArray(fr.parts)) {
         for (const np of fr.parts) {
           const sub = asObj(np);
           if (sub && (sub.fileData != null || sub.videoMetadata != null))
-            return true;
+            return !hasRefRecoverableMediaPayload(msg);
         }
       }
     }
