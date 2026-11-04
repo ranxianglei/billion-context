@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createTraeAdapter } from "../src/loop/adapter-trae.ts";
+import { readFileSync } from "node:fs";
 import { buildVisibilityMarker } from "../src/loop/core.ts";
 import type { ParsedStreamEvent } from "../src/loop/core.ts";
 
@@ -185,4 +186,33 @@ test("emit: errors use an error frame", () => {
     const out = adapter.emitError("upstream said no").toString("utf8");
     assert.ok(out.startsWith("event:error\ndata:"));
     assert.equal(JSON.parse(out.split("data:")[1]).message, "upstream said no");
+});
+
+test("parseStream: a real captured turn carrying two tool calls assembles both (WC-12i)", async () => {
+    // Verbatim upstream frames captured on 2026-11-04 through the Trae account
+    // channel (model trae/deepseek-v4.1-flash, Trae Max): one turn, two run_code
+    // calls. Frame 14 of this fixture both closes call #0's arguments and opens
+    // call #1 (index 1); the frames after it carry two same-index chunks each.
+    const body = readFileSync(new URL("./fixtures/trae-2026-11-04-two-tool-calls.sse.txt", import.meta.url), "utf8");
+    const events = await collect(1, body);
+    const calls = events.filter((e) => e.kind === "tool_call");
+    assert.deepEqual(calls.map((c) => field<string>(c, "callId")), [
+        "call_00_d731qw0yaapdffpw2pcm2eex",
+        "call_01_pkyxyief04hpm4pii3xakew9",
+    ]);
+    assert.deepEqual(calls.map((c) => field<string>(c, "name")), ["run_code", "run_code"]);
+    const first = JSON.parse(field<string>(calls[0], "arguments"));
+    const second = JSON.parse(field<string>(calls[1], "arguments"));
+    assert.match(first.code, /probe-a\.txt/);
+    assert.match(second.code, /probe-b\.txt/);
+    assert.equal(first.description, "Print probe-a.txt contents");
+    assert.equal(second.description, "Print probe-b.txt contents");
+
+    const adapter = createTraeAdapter({ model: "m", messages: [], stream: true });
+    const emitted = calls.map((c) => JSON.parse(
+        adapter.emitToolCall({ name: field<string>(c, "name"), callId: field<string>(c, "callId"), arguments: field<string>(c, "arguments") })
+            .toString("utf8").split("data:")[1],
+    ).tool_calls[0]);
+    assert.deepEqual(emitted.map((c) => c.index), [0, 1], "upstream index 0/1 is preserved end to end");
+    assert.deepEqual(emitted.map((c) => c.function_call.name), ["run_code", "run_code"]);
 });
