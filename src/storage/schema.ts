@@ -165,7 +165,7 @@ CREATE TABLE IF NOT EXISTS blocks (
     tier                INTEGER NOT NULL,
     summary_hash        TEXT NOT NULL REFERENCES content(hash),
     one_hash            TEXT REFERENCES content(hash),
-    -- #5648: no writer yet — ALWAYS NULL. Block lineage / retirement reason
+    -- #5647: no writer yet — ALWAYS NULL. Block lineage / retirement reason
     -- (tier upgrade vs reset vs gc) is not recorded anywhere today; tooling
     -- must not infer events from this column being NULL.
     supersedes_block_id TEXT,

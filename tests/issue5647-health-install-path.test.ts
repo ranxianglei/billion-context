@@ -12,7 +12,7 @@ import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 
 process.env.NODE_ENV = "test";
 
-// #5648 item 5: `bili --version` said 0.1.211 while /__bili/health said
+// #5647 item 5: `bili --version` said 0.1.211 while /__bili/health said
 // 0.1.212 — a report citing one build about another. version+commit already
 // identify the RUNNING copy; installPath now identifies WHICH install serves
 // it, so a skew can be located instead of guessed.
@@ -43,7 +43,7 @@ function opts(): ProxyOptions {
     };
 }
 
-test("INSTALL_PATH resolves to the running copy's package root (#5648)", () => {
+test("INSTALL_PATH resolves to the running copy's package root (#5647)", () => {
     assert.ok(typeof INSTALL_PATH === "string" && INSTALL_PATH.length > 0, "package root resolved");
     const pkgFile = join(INSTALL_PATH, "package.json");
     assert.ok(existsSync(pkgFile), "root holds its package.json");
@@ -51,7 +51,7 @@ test("INSTALL_PATH resolves to the running copy's package root (#5648)", () => {
     assert.equal(name, "billion-context", "it is THIS package's root, not an ancestor's");
 });
 
-test("/__bili/health reports installPath alongside version and commit (#5648)", async () => {
+test("/__bili/health reports installPath alongside version and commit (#5647)", async () => {
     setRegistryForTest({});
     _setStoreForTest(new SessionStore({ enabled: false }));
     const proxy = await startServer(opts());
