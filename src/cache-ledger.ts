@@ -1327,10 +1327,13 @@ function detectOrphanSweeps(session: Session, led: CacheLedger): void {
  *  in marathon plugin sessions). This is the one liveness signal verifiable
  *  in plugin mode, where #2202's wire-coverage evidence is structurally
  *  absent (the agent prunes locally, so resends never carry raw originals).
- *  Callers treat an empty/absent block list as UNVERIFIABLE, not as "all
- *  dead" — same status-quo discipline as #2202 legacy entries. Takes the
- *  minimal structural view (not the full CompressionBlock) so read-only
- *  summary paths over sparse block shapes can share the same traversal. */
+ *  Liveness is only claimed from what the list actually says: an ABSENT list
+ *  is UNVERIFIABLE (status quo, same discipline as #2202 legacy entries); an
+ *  EMPTY list is a real "no live blocks" verdict that freezes every bid-linked
+ *  fold; web read paths additionally treat a non-empty list carrying no string
+ *  blockId (sparse unified-index rows) as UNVERIFIABLE. Takes the minimal
+ *  structural view (not the full CompressionBlock) so read-only summary paths
+ *  over sparse block shapes can share the same traversal. */
 export type BlockLivenessView = { blockId?: unknown; active?: boolean; directBlockIds?: readonly string[] };
 
 export function liveBlockIds(blocks: readonly BlockLivenessView[]): Set<string> {
