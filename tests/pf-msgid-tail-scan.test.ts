@@ -372,3 +372,37 @@ test("wrong-width id list: full-scan fallback + miss, then one correct turn self
     assert.equal(healed.out.decision, "hit", LOGS.slice(-6).join("\n"));
     assert.equal(healed.walked, 11, "self-healed back to head+tail");
 });
+
+test("model switch blocks the tail resume — full walk + uncredited miss even with a shape-valid list", () => {
+    _resetStoreForTest();
+    makeStubStore();
+    const session = freshSession("pf-tail-modelswitch");
+    // grow on m1 until the very last warmup turn runs in tail mode
+    for (let t = 0; t <= 5; t++) {
+        const msgs = historyFor(t);
+        const body = bodyOf(msgs);
+        const prev = t > 0 ? 2 * (t - 1) + 2 : undefined;
+        const headers: Record<string, string> = {};
+        if (prev !== undefined) {
+            headers[PF_COUNT_HEADER] = String(prev);
+            headers[PF_TAIL_IDS_HEADER] = msgs.map(idOf).slice(prev - 1).map(encodeURIComponent).join(",");
+        }
+        const r = runTurn(session, headers, body);
+        if (t === 0) assert.equal(r.out.decision, "no-stamp");
+        else assert.equal(r.out.decision, "hit", `warmup ${t}: ${LOGS.slice(-6).join("\n")}`);
+        if (t === 5) assert.equal(r.walked, 11, "warmup 5 must already be in tail mode");
+    }
+    // identical growth shape under a DIFFERENT model: the id list is fully
+    // shape-valid and the echo is honest, but the seed was minted under m1 —
+    // the resume gate must refuse (the anchor offsets belong to a different
+    // wire encoding), so the FULL walk runs and the turn misses uncredited
+    const msgs = historyFor(6);
+    const prev = 2 * 5 + 2;
+    const r = runTurn(session, {
+        [PF_COUNT_HEADER]: String(prev),
+        ...TAIL(msgs.map(idOf).slice(prev - 1)),
+    }, bodyOf(msgs, "m2"));
+    assert.equal(r.out.decision, "seed-stale", LOGS.slice(-6).join("\n"));
+    assert.equal(r.out.creditedMiss, false);
+    assert.equal(r.walked, 2 * 6 + 2, "model switch forces the full walk, never the resume");
+});

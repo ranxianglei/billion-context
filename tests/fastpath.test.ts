@@ -402,6 +402,7 @@ test("count ahead of reality is credited; five consecutive verified misses arm t
     assert.equal(held.out.decision, "breaker-armed");
     assert.equal(held.out.measuredT, 1);
     assert.equal(held.headers[PF_SEQ_HEADER], "1", "held lane keeps teaching truth");
+    assert.equal(typeof watermarkDebugState(session).tailAnchorStart, "number", "held turns keep teaching the tail anchor (#5654)");
     // client has learned T=1; after the TTL expires verification resumes and
     // an identical resend is a plain no-progress (no re-arm either way)
     stub.ext.set(savedKey("pf-breaker"), JSON.stringify({ ...saved, disabledAt: Date.now() - 61 * 60 * 1000 }));
