@@ -174,6 +174,51 @@ export function isDshAutoReviewRequest(protocol: string | null, parsed: unknown)
     return users === 1 && userHasContent;
 }
 
+// #5135: Claude Code's session-title sidecar (terminal CLI, proxy mode — no
+// x-bili-plugin stamp). It fires at session start UNDER THE SAME
+// x-claude-code-session-id as the first main turn, ~1ms ahead of it. Field
+// shape (0.1.209, three machines): a single user message wrapping the first
+// prompt in \x3csession\x3e…\x3c/session\x3e, no tools, an output budget past
+// the <=200 heuristic, and its OWN system prompt — so pre-fix it entered the
+// #4774 order resolver on the virgin id and CLAIMED the raw key as kernel
+// anchor; the main turn then arrived tagChanged and history-disjoint and
+// forked onto a |sub:<fp> lane for the session lifetime (#2156 form: side
+// requests must never claim the anchor). A main turn can never match: it
+// carries a tools surface and multi-turn history; the one-entry bar rejects
+// every history-replaying request. The caller must gate on
+// claudeAnthropicPersonaOrderApplies (evidence-per-client discipline): the
+// wrapper alone is not client proof.
+export const CLAUDE_CODE_TITLE_SESSION_TAG = "\x3csession\x3e";
+
+export function isClaudeCodeTitleRequest(protocol: string | null, parsed: unknown): boolean {
+    if (protocol === null || !parsed || typeof parsed !== "object") return false;
+    const p = parsed as Record<string, unknown>;
+    // Same no-tools veto as isSideRequest/isDshTitleRequest/isDshAutoReviewRequest.
+    if (Array.isArray(p.tools) && p.tools.length > 0) return false;
+    const entries = protocol === "responses" ? p.input : protocol === "google" ? p.contents : p.messages;
+    // Exactly ONE entry total: on the anthropic wire the system rides top-level,
+    // so any extra messages[] row (a role:system entry included) is a replayed
+    // history, not the one-shot title call.
+    if (!Array.isArray(entries) || entries.length !== 1) return false;
+    const entry = entries[0];
+    if (entry === null || typeof entry !== "object") return false;
+    const rec = entry as Record<string, unknown>;
+    if (rec.role !== "user") return false;
+    if (rec.type !== undefined && rec.type !== "message") return false;
+    const c = rec.content ?? rec.parts;
+    let text = "";
+    if (typeof c === "string") {
+        text = c;
+    } else if (Array.isArray(c)) {
+        for (const b of c) {
+            if (b !== null && typeof b === "object" && typeof (b as Record<string, unknown>).text === "string") {
+                text += (b as Record<string, unknown>).text as string;
+            }
+        }
+    }
+    return text.trimStart().startsWith(CLAUDE_CODE_TITLE_SESSION_TAG);
+}
+
 // #2170 measure 1: the two lane gates extracted from src/server.ts so they have
 // ONE home and an exhaustive truth-table test. They are PURE — the two effects
 // that guard demotion (detectAcpArtifacts' full-history re-encode and the

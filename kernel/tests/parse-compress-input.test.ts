@@ -1348,6 +1348,32 @@ test("parseCompressArgs accepts U+2212 minus and fullwidth hyphen as range separ
   assert.equal(fw.ranges[0]?.endRef, "m00168");
 });
 
+// #5555 audit: ".." was advertised in an error message but rejected by the
+// pair regex; a two-dot header was even worse — splitLineEntries never saw a
+// refs header there and swallowed the entry into the previous one silently.
+test("parseCompressArgs accepts two-dot ranges exactly like three-dot", () => {
+  const two = parseCompressArgs({ content: "m00150..m00168 topic\nsummary." });
+  assert.equal(two.ranges[0]?.startRef, "m00150");
+  assert.equal(two.ranges[0]?.endRef, "m00168");
+  const three = parseCompressArgs({ content: "m00150...m00168 topic\nsummary." });
+  assert.equal(three.ranges[0]?.startRef, "m00150");
+  assert.equal(three.ranges[0]?.endRef, "m00168");
+});
+
+test("line-form entries split at two-dot refs headers (no silent continuation)", () => {
+  const parsed = parseCompressArgs({
+    content: "m00001..m00003 first\nsum A\nm00004..m00007 second\nsum B",
+  });
+  assert.equal(parsed.ranges.length, 2);
+  assert.deepEqual(
+    parsed.ranges.map((r) => [r.startRef, r.endRef]),
+    [
+      ["m00001", "m00003"],
+      ["m00004", "m00007"],
+    ],
+  );
+});
+
 test("parseCompressArgs refuses to narrow a ref pair with an unrecognized separator", () => {
   const { ranges, diagnostics } = parseCompressArgs({
     content: "m00150 => m00168 topic\nsummary.",

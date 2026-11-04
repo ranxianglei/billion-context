@@ -65,10 +65,10 @@ import type {
  *  Same discipline as the jimp lazy load (src/image-rescale.ts, #3516). */
 export type Mysql2Module = typeof import("mysql2/promise");
 
-/** v9 (#4796): zero-ref collection index. Existing stamped-v8 libraries
- *  re-enter the probe-first DDL block below exactly once on first open;
- *  migrateV8Identities() is a no-op there (no identity='' rows left). */
-const MYSQL_SCHEMA_VERSION = 9;
+/** v10 (#4313): immutable per-message wall-clock stamp. Existing stamped-v9
+ *  libraries re-enter the probe-first DDL block below exactly once on first
+ *  open; pre-feature rows read NULL (no backfill). */
+const MYSQL_SCHEMA_VERSION = 10;
 
 /** Parity constants with the sqlite v8 streaming backfill
  *  (src/storage/schema.ts, #4677): same page size, same printable absent
@@ -152,6 +152,7 @@ CREATE TABLE IF NOT EXISTS messages (
     content_hash VARCHAR(64) NOT NULL,
     identity     VARCHAR(64) NOT NULL DEFAULT '',
     retired_at   BIGINT NULL,
+    ts           BIGINT NULL,
     PRIMARY KEY (session_id, seq),
     UNIQUE KEY uq_messages_identity (session_id, msg_id, content_hash),
     KEY idx_messages_session (session_id, seq),
@@ -325,6 +326,11 @@ export class MysqlBackend implements StorageBackend {
                 }
                 if (!have.has("retired_at")) {
                     await conn.query("ALTER TABLE messages ADD COLUMN retired_at BIGINT NULL");
+                }
+                // #4313 (v10): immutable message wall-clock stamp — nullable,
+                // no backfill; probe-first like the v8 columns.
+                if (!have.has("ts")) {
+                    await conn.query("ALTER TABLE messages ADD COLUMN ts BIGINT NULL");
                 }
                 // #4796 (v9): zero-ref collection index — gc()'s sweep and the
                 // dry-run count address content BY refcount; without this index
@@ -720,11 +726,12 @@ export class MysqlBackend implements StorageBackend {
                 "INSERT IGNORE INTO conversations (namespace, conversation_id, session_id, claimed_at) VALUES (?, ?, ?, ?)",
                 [s.namespace ?? "proxy", s.sessionId, s.sessionId, s.updatedAt],
             );
+            const batchTs = Date.now(); // #4313: one sample per save batch
             for (const m of messages) {
                 const hash = await this.putContent(c, m.content, m.contentHash);
                 const [res] = (await c.query(
-                    "INSERT IGNORE INTO messages (session_id, seq, msg_id, ref, ref_num, role, kind, content_hash, identity) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    [s.sessionId, m.seq, m.msgId, m.ref, m.refNum, m.role, m.kind, hash, m.identity ?? identityOfStoredContent(m.content)],
+                    "INSERT IGNORE INTO messages (session_id, seq, msg_id, ref, ref_num, role, kind, content_hash, identity, ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    [s.sessionId, m.seq, m.msgId, m.ref, m.refNum, m.role, m.kind, hash, m.identity ?? identityOfStoredContent(m.content), typeof m.ts === "number" ? m.ts : batchTs],
                 )) as unknown as [{ affectedRows: number }, unknown];
                 if (res.affectedRows === 0) {
                     await this.releaseContent(c, hash);
@@ -1283,8 +1290,8 @@ export class MysqlBackend implements StorageBackend {
             )) as unknown as Row[][];
             if (num(alreadyRows[0].n) > 0) throw new Error("cloneSessionRows: conflicting fork lineage (child already has messages)");
             await conn.query(
-                `INSERT INTO messages (session_id, seq, msg_id, ref, ref_num, role, kind, content_hash, identity, retired_at)
-                 SELECT ?, seq, msg_id, ref, ref_num, role, kind, content_hash, identity, retired_at FROM messages
+                `INSERT INTO messages (session_id, seq, msg_id, ref, ref_num, role, kind, content_hash, identity, retired_at, ts)
+                 SELECT ?, seq, msg_id, ref, ref_num, role, kind, content_hash, identity, retired_at, ts FROM messages
                  WHERE session_id = ? AND seq <= ?`,
                 [childId, parentId, throughSeq],
             );
@@ -1408,7 +1415,7 @@ export class MysqlBackend implements StorageBackend {
             const chunk = [...new Set(pointers.slice(i, i + CHUNK))];
             if (chunk.length === 0) continue;
             const [rows] = (await this.pool.query(
-                `SELECT seq, msg_id, ref, ref_num, role, kind, content_hash FROM messages
+                `SELECT seq, msg_id, ref, ref_num, role, kind, content_hash, ts FROM messages
                  WHERE session_id = ? AND retired_at IS NULL AND seq IN (${chunk.map(() => "?").join(", ")})`,
                 [sessionId, ...chunk],
             )) as unknown as Row[][];
@@ -1422,6 +1429,7 @@ export class MysqlBackend implements StorageBackend {
                     role: str(r.role),
                     kind: str(r.kind),
                     contentHash,
+                    ts: nullableNum(r.ts),
                     content: await this.hydrateMediaAsync((await this.getContent(this.pool, contentHash)) ?? "", this.pool),
                 });
             }
@@ -1446,7 +1454,7 @@ export class MysqlBackend implements StorageBackend {
         const seqFilter = opts?.seqs ? ` AND seq IN (${opts.seqs.map(() => "?").join(",")})` : "";
         const retiredFilter = opts?.includeRetired === true ? "" : " AND retired_at IS NULL";
         const [rows] = (await conn.query(
-            `SELECT seq, msg_id, ref, ref_num, role, kind, content_hash, retired_at FROM messages WHERE session_id = ?${retiredFilter}${seqFilter} ORDER BY seq`,
+            `SELECT seq, msg_id, ref, ref_num, role, kind, content_hash, retired_at, ts FROM messages WHERE session_id = ?${retiredFilter}${seqFilter} ORDER BY seq`,
             [sessionId, ...(opts?.seqs ?? [])],
         )) as unknown as Row[][];
         const out: (MessageRow & { contentHash: string; retiredAt: number | null })[] = [];
@@ -1461,6 +1469,7 @@ export class MysqlBackend implements StorageBackend {
                 kind: str(r.kind),
                 contentHash,
                 retiredAt: nullableNum(r.retired_at),
+                ts: nullableNum(r.ts),
                 content: await this.hydrateMediaAsync((await this.getContent(conn, contentHash)) ?? "", conn),
             });
         }
@@ -1614,7 +1623,10 @@ export class MysqlBackend implements StorageBackend {
         const exportPath = join(opts.archiveDir, MysqlBackend.ARCHIVE_LOG_NAME);
         if (row.status === "archived") return { ok: true, exportPath };
         const q = async (sql: string): Promise<Row[]> => ((await this.pool.query(sql, [sessionId])) as unknown as Row[][])[0];
-        const messages = await q("SELECT seq, msg_id, ref, ref_num, role, kind, content_hash FROM messages WHERE session_id = ? ORDER BY seq");
+        // #4665: carry the v8 row state (identity JOIN key + historian
+        // tombstone) across archive/restore — sqlite twin, same reason.
+        // #4313: ts rides along so restored rows keep their wall-clock stamps.
+        const messages = await q("SELECT seq, msg_id, ref, ref_num, role, kind, content_hash, identity, retired_at, ts FROM messages WHERE session_id = ? ORDER BY seq");
         const mediaMaps = await q("SELECT seq, media_hash FROM message_media WHERE session_id = ?");
         const blocks = await q("SELECT block_id, ord, start_seq, end_seq, start_ref, end_ref, tier, summary_hash, one_hash, supersedes_block_id, active, created_at, covered_hash, payload_json FROM blocks WHERE session_id = ? ORDER BY ord");
         const refsRows = await q("SELECT ord, raw_id, ref, ref_num FROM refs WHERE session_id = ? ORDER BY ord");
@@ -1716,9 +1728,14 @@ export class MysqlBackend implements StorageBackend {
         await this.tx(async (c) => {
             for (const [hash, body] of Object.entries(dump.content)) await this.putContent(c, body, hash);
             for (const m of dump.messages) {
+                // #4665: pre-fix dumps lack both fields — recompute identity
+                // from the CAS body (same formula as the v8 migration
+                // backfill); retire state is unrecoverable there → live.
+                const stored = typeof m.content_hash === "string" ? dump.content[m.content_hash] : undefined;
+                const identity = typeof m.identity === "string" && m.identity !== "" ? m.identity : stored !== undefined ? identityOfStoredContent(stored) : "";
                 await c.query(
-                    "INSERT INTO messages (session_id, seq, msg_id, ref, ref_num, role, kind, content_hash, identity) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    [sessionId, m.seq, m.msg_id, m.ref ?? null, m.ref_num ?? null, m.role, m.kind ?? "message", m.content_hash, m.identity ?? ""],
+                    "INSERT INTO messages (session_id, seq, msg_id, ref, ref_num, role, kind, content_hash, identity, retired_at, ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    [sessionId, m.seq, m.msg_id, m.ref ?? null, m.ref_num ?? null, m.role, m.kind ?? "message", m.content_hash, identity, typeof m.retired_at === "number" ? m.retired_at : null, typeof m.ts === "number" ? m.ts : null],
                 );
             }
             for (const mm of (dump as { mediaMaps?: Record<string, unknown>[] }).mediaMaps ?? []) {

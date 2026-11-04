@@ -63,7 +63,12 @@
 //        index. Both directions compatible: an older build opening a v5
 //        file no-ops at the version gate (extra column ignored); a newer
 //        build upgrades a v4 file with one idempotent ALTER TABLE.
-export const STORAGE_SCHEMA_VERSION = 9;
+//      - v10: immutable per-message local time-of-occurrence (#4313) —
+//        messages gains nullable `ts` (epoch ms, stamped once at ingest,
+//        never updated). No backfill: pre-feature rows stay NULL and keep
+//        rendering without the tag's time attribute. Same both-directions
+//        compatibility as v5 (older build ignores, newer build ALTERs).
+export const STORAGE_SCHEMA_VERSION = 10;
 
 /** #3250: cap for `journal_size_limit` (see STORAGE_PRAGMAS). Passive and
  *  auto checkpoints move frames into the main db and reset the write offset
@@ -144,6 +149,7 @@ CREATE TABLE IF NOT EXISTS messages (
     content_hash    TEXT NOT NULL REFERENCES content(hash),
     identity        TEXT NOT NULL DEFAULT '',
     retired_at      INTEGER,
+    ts              INTEGER,
     PRIMARY KEY (session_id, seq),
     UNIQUE (session_id, msg_id, content_hash)
 );
@@ -381,6 +387,16 @@ export function migrateSchema(db: {
             // quick_check pays on EVERY open (#4175). Idempotent CREATE so a
             // dev-window lib that already carried it re-lands cleanly.
             db.exec("CREATE INDEX IF NOT EXISTS idx_content_refcount ON content(refcount)");
+        }
+        if (from < 10) {
+            // v10 (#4313): immutable message wall-clock stamp. Nullable, no
+            // backfill — pre-feature rows read NULL and render without the
+            // time attribute (legacy bytes unchanged). Probe-first like v8.
+            const tsCols = (db.prepare("PRAGMA table_info(messages)").all() as unknown as { name?: unknown }[])
+                .map((c) => (typeof c?.name === "string" ? c.name : ""));
+            if (!tsCols.includes("ts")) {
+                db.exec("ALTER TABLE messages ADD COLUMN ts INTEGER");
+            }
         }
     });
     if (needV8Backfill) migrateV8Identities(db);

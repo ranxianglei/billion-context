@@ -19,8 +19,10 @@ import type { BiliMessage } from "../src/wire/bili-message.js";
 //    ending in a server tool result"
 //     — a fold (compress-loop re-request) removes the user turn before a
 //       never-fold sidecar system, leaving it right after an assistant.
-// The heal must leave the FINAL wire array obeying both halves without
-// dropping user-visible content.
+// The two-sided heal lives in coreToAnthropic (#5438); #4570 adds the
+// FINAL-array backstop (healAnthropicSystemPositions) for hosts that append
+// after coreToAnthropic returned. Demotion re-voices to user with tool-delta
+// blocks stripped (WC-022); user-visible text is never dropped.
 
 function sys(content: AnthropicSystemMessage["content"]): AnthropicSystemMessage {
   return { role: "system", content };
@@ -35,16 +37,15 @@ function isDirectiveOnly(m: AnthropicWireMessage): boolean {
   );
 }
 
+// Mirrors the kernel's #5438 contract: an array start (no predecessor) is
+// legal by contract; the tool-result family is matched by suffix (server-tool
+// results ride inside assistant messages on the real wire).
 function legalPredecessor(m: AnthropicWireMessage | undefined): boolean {
-  if (!m) return false;
+  if (!m) return true;
   if (m.role === "user") return true;
   if (m.role !== "assistant" || !Array.isArray(m.content)) return false;
   const last = m.content[m.content.length - 1] as { type?: unknown } | undefined;
-  return (
-    typeof last?.type === "string" &&
-    last.type !== "tool_result" &&
-    last.type.endsWith("_tool_result")
-  );
+  return typeof last?.type === "string" && last.type.endsWith("tool_result");
 }
 
 /** Every violation of either half of the rule, as Anthropic reports it. */
@@ -133,7 +134,7 @@ test("must-follow shape: a sidecar system between two assistants is re-voiced", 
   assert.deepEqual(texts(wire), ["q1", "a1", "mid-session update", "a2", "q2"]);
 });
 
-test("must-follow shape: a system after an assistant moves past the next user turn", () => {
+test("must-follow shape: a system after an assistant is re-voiced in place", () => {
   const sent = healAnthropicSystemPositions([
     { role: "user", content: "q1" },
     { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "bash", input: {} }] },
@@ -142,12 +143,12 @@ test("must-follow shape: a system after an assistant moves past the next user tu
     { role: "assistant", content: [{ type: "text", text: "done" }] },
   ]);
   assert.deepEqual(violations(sent), []);
-  assert.equal(sent[3]!.role, "system", "moved whole, tool deltas intact");
-  assert.ok(JSON.stringify(sent[3]).includes("tool_addition"));
-  assert.equal((sent[2]!.content as { type: string }[])[0]!.type, "tool_result", "tool_result stays right after tool_use");
+  assert.equal(sent[2]!.role, "user", "demoted in place (#5438)");
+  assert.ok(JSON.stringify(sent).includes("tools updated"), "text kept");
+  assert.ok(!JSON.stringify(sent).includes("tool_addition"), "WC-022: delta stripped on demotion");
 });
 
-test("must-follow shape: a run of systems after an assistant moves in order", () => {
+test("must-follow shape: a run of systems after an assistant is demoted in order", () => {
   const sent = healAnthropicSystemPositions([
     { role: "user", content: "q1" },
     { role: "assistant", content: [{ type: "text", text: "a1" }] },
@@ -156,10 +157,10 @@ test("must-follow shape: a run of systems after an assistant moves in order", ()
     { role: "user", content: "q2" },
   ]);
   assert.deepEqual(violations(sent), []);
-  assert.deepEqual(texts(sent), ["q1", "a1", "q2", "first", "second"]);
+  assert.deepEqual(texts(sent), ["q1", "a1", "first", "second", "q2"]);
 });
 
-test("must-follow shape: a trailing system after an assistant and a leading system are re-voiced", () => {
+test("must-follow shape: a trailing system after an assistant is re-voiced; a leading one is untouched", () => {
   const trailing = healAnthropicSystemPositions([
     { role: "user", content: "q1" },
     { role: "assistant", content: [{ type: "text", text: "a1" }] },
@@ -173,6 +174,7 @@ test("must-follow shape: a trailing system after an assistant and a leading syst
     user("u1", "q1"),
   ]);
   assert.deepEqual(violations(leading), []);
+  assert.equal(leading[0]!.role, "system", "array start is legal by contract (#5438)");
   assert.deepEqual(texts(leading), ["early", "ok", "q1"]);
 });
 
