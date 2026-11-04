@@ -18,6 +18,7 @@
  *   bili acp-cache diff <dir>     attribute cache breaks from ACP_DUMP_BODY dumps
  *   bili sessions ls|rm|archive|restore [id]   manage persisted sessions
  *   bili storage gc [--days N]    run the storage sweep now (--dry-run plans only)
+ *   bili storage migrate          bulk-import legacy JSON sessions into the unified index (#5599)
  *   bili pack install <spec>      install a custom compress prompt pack from npm (#5319)
  *   bili test pi                  non-polluting pi smoke test
  *   bili --version
@@ -46,7 +47,7 @@ import { runMcpStdio } from "./mcp.js";
 import { PLUGIN_AGENTS, isPluginAgent, pluginInstall, pluginRemove, pluginStatusAll, pluginUpdate, renderPluginList, warnActivePluginSessions, type PluginAgent } from "./plugin-install.js";
 import { runLaunch, runTestPi, isLaunchClient, type ClientName } from "./launcher.js";
 import { exportSession } from "./export.js";
-import { runSessionsCommand, runStorageGcCommand } from "./storage-maintenance.js";
+import { runSessionsCommand, runStorageGcCommand, runStorageMigrateCommand } from "./storage-maintenance.js";
 import { installPackFromNpm, removePackFile } from "./pack-install.js";
 import { listResolvedPacks } from "./compress-settings.js";
 import { renderJson, renderText, runDiff } from "./acp-cache-diff.js";
@@ -107,6 +108,13 @@ Usage:
                                     release unreferenced content, shrink index.db
                                     (--days N overrides the age; --vacuum full|incremental;
                                     prints the sweep plan first, --dry-run stops there)
+   bili storage migrate              bulk-import every legacy JSON session into the unified
+                                    SQLite index with per-session digest reconciliation (#5599):
+                                    imports what is missing or newer than the index, then
+                                    verifies every session against its source file and lists
+                                    drifted/failed ones. Read-only over the JSON files
+                                    (--dry-run plans without writing; --json machine-readable).
+                                    Safest while no host process is running.
   bili pack install <npm-spec>     npm-install a custom compress prompt pack
   bili pack list / remove <name>   list resolvable packs / delete a local pack file
                                    (--project targets ./.billion-context/packs/ instead;
@@ -231,6 +239,7 @@ type Parsed = {
     sessionsNoVacuum?: boolean;
     sessionsApply?: boolean;
     sessionsRestoreTarget?: string;
+    storageAction?: "gc" | "migrate";
     storageDays?: number;
     storageVacuum?: "full" | "incremental";
     storageDryRun?: boolean;
@@ -268,6 +277,7 @@ export function parseArgs(argv: string[]): Parsed {
     let sessionsNoVacuum = false;
     let sessionsApply = false;
     let sessionsRestoreTarget: string | undefined;
+    let storageAction: Parsed["storageAction"];
     let storageDays: number | undefined;
     let storageVacuum: Parsed["storageVacuum"];
     let storageDryRun = false;
@@ -564,10 +574,12 @@ export function parseArgs(argv: string[]): Parsed {
             packSpec = arg;
         } else if (cmd === "storage") {
             command = "storage";
-            if (positional[1] !== "gc") {
-                console.error(`bili storage: unknown action "${positional[1] ?? ""}" (try "bili storage gc")`);
+            const action = positional[1];
+            if (action !== "gc" && action !== "migrate") {
+                console.error(`bili storage: unknown action "${action ?? ""}" (try "bili storage gc | migrate")`);
                 process.exit(2);
             }
+            storageAction = action;
         } else {
             console.error(`bili: unknown command "${cmd}" (try "bili --help")`);
             process.exit(2);
@@ -600,11 +612,11 @@ export function parseArgs(argv: string[]): Parsed {
         }
     }
 
-    return { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, sessionsSub, sessionsTarget, sessionsNoVacuum, sessionsApply, sessionsRestoreTarget, storageDays, storageVacuum, storageDryRun, jsonOutput, doctorJson, doctorFix, packAction, packSpec, packProject, packForce };
+    return { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, sessionsSub, sessionsTarget, sessionsNoVacuum, sessionsApply, sessionsRestoreTarget, storageAction, storageDays, storageVacuum, storageDryRun, jsonOutput, doctorJson, doctorFix, packAction, packSpec, packProject, packForce };
 }
 
 export async function main(): Promise<void> {
-    const { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, sessionsSub, sessionsTarget, sessionsNoVacuum, sessionsApply, sessionsRestoreTarget, storageDays, storageVacuum, storageDryRun, jsonOutput, doctorJson, doctorFix, packAction, packSpec, packProject, packForce } = parseArgs(process.argv.slice(2));
+    const { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, sessionsSub, sessionsTarget, sessionsNoVacuum, sessionsApply, sessionsRestoreTarget, storageAction, storageDays, storageVacuum, storageDryRun, jsonOutput, doctorJson, doctorFix, packAction, packSpec, packProject, packForce } = parseArgs(process.argv.slice(2));
     if (command === "help") {
         process.stdout.write(HELP);
         return;
@@ -757,7 +769,9 @@ export async function main(): Promise<void> {
         try {
             const r = command === "sessions"
                 ? await runSessionsCommand({ sub: sessionsSub!, target: sessionsTarget, json: jsonOutput, noVacuum: sessionsNoVacuum, apply: sessionsApply, restoreTarget: sessionsRestoreTarget })
-                : await runStorageGcCommand({ days: storageDays, vacuum: storageVacuum, dryRun: storageDryRun, json: jsonOutput });
+                : storageAction === "migrate"
+                    ? await runStorageMigrateCommand({ dryRun: storageDryRun, json: jsonOutput })
+                    : await runStorageGcCommand({ days: storageDays, vacuum: storageVacuum, dryRun: storageDryRun, json: jsonOutput });
             process.stdout.write(r.text);
             if (r.code !== 0) process.exit(r.code);
         } catch (error) {

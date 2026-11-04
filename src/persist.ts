@@ -351,6 +351,24 @@ const STALE_COLD_LOAD_WARN_MIN = 30;
 // #5408: how often the frozen-skip ERROR may repeat per session.
 const FROZEN_SKIP_NOTICE_COOLDOWN_MS = 10 * 60_000;
 
+/** #5599 `bili storage migrate`: per-session outcome of the bulk legacy→unified import. */
+export interface LegacyMigrateSessionResult {
+    id: string;
+    /** Representative state file (relative to the sessions dir) for this id. */
+    file: string;
+    status: "imported" | "indexed" | "drifted" | "failed" | "planned";
+    reason?: string;
+    /** Same-id route files that were NOT used as representative (left untouched). */
+    alternates?: number;
+    decodedBytes?: number;
+}
+
+export interface LegacyMigrateReport {
+    scannedFiles: number;
+    results: LegacyMigrateSessionResult[];
+    counts: { imported: number; indexed: number; drifted: number; failed: number; planned: number };
+}
+
 export class SessionStore {
     /** #5188: args of the SYNCHRONOUS first-open path only. When that path ran
      *  and failed, the save path retries maybeOpen on a cooldown; intentional
@@ -1784,6 +1802,112 @@ export class SessionStore {
         const view = await shadow.viewForAsync(id);
         if (!view) return null;
         return this.afterLoad(id, view);
+    }
+
+    /** #5599 `bili storage migrate`: bulk-import every legacy JSON session into
+     *  the unified index, then digest-reconcile each against its source file —
+     *  the same verifier the steady-state sample uses, run once per session.
+     *  Read-only over the JSON files (never deletes/renames/quarantines); the
+     *  re-import decision mirrors loadSync's ahead-probe, so the outcome equals
+     *  what a live open would converge to. Re-runs are safe: consistent
+     *  sessions report "indexed" without re-writing. */
+    async migrateLegacyToUnified(opts: { dryRun?: boolean } = {}): Promise<LegacyMigrateReport> {
+        const dryRun = opts.dryRun === true;
+        const counts = { imported: 0, indexed: 0, drifted: 0, failed: 0, planned: 0 };
+        const results: LegacyMigrateSessionResult[] = [];
+        const byId = new Map<string, Array<{ file: string; savedAt: number }>>();
+        const badFiles: Array<{ file: string; reason: string }> = [];
+        let scannedFiles = 0;
+        for (const root of [this.sessionsDir, `${this.sessionsDir}-cold`] as string[]) {
+            if (!existsSync(root)) continue;
+            for (const file of walkJsonFilesSync(root)) {
+                if (path.basename(file).endsWith(".content-store.json")) continue;
+                scannedFiles++;
+                const parsed = await this.readRawFileWithBytes(file);
+                if (!parsed) {
+                    badFiles.push({ file, reason: "unreadable or undecodable" });
+                    continue;
+                }
+                const rec = this.parseBootPayload(parsed.value);
+                if (!rec) {
+                    badFiles.push({ file, reason: "invalid session record" });
+                    continue;
+                }
+                if (!fileNameMatchesId(path.basename(file), rec.payload.id, rec.meta.protocol, rec.meta.upstreamOrigin)) {
+                    badFiles.push({ file, reason: `filename does not match the record id (${rec.payload.id})` });
+                    continue;
+                }
+                const list = byId.get(rec.payload.id) ?? [];
+                list.push({ file, savedAt: rec.payload.savedAt ?? 0 });
+                byId.set(rec.payload.id, list);
+            }
+        }
+        const relOf = (file: string): string =>
+            file.startsWith(`${this.sessionsDir}-cold${path.sep}`)
+                ? `cold:${path.relative(`${this.sessionsDir}-cold`, file)}`
+                : path.relative(this.sessionsDir, file);
+        const indexedBefore = new Set(this.unifiedListSessionIds() ?? []);
+        for (const id of [...byId.keys()].sort()) {
+            const files = byId.get(id)!;
+            // Boot's survivor rule: newest savedAt wins, lexicographic path breaks ties.
+            const rep = [...files].sort((a, b) => b.savedAt - a.savedAt || a.file.localeCompare(b.file))[0];
+            let status: LegacyMigrateSessionResult["status"] = "failed";
+            let reason: string | undefined;
+            let decodedBytes: number | undefined;
+            if (dryRun) {
+                status = indexedBefore.has(id) ? "indexed" : "planned";
+            } else {
+                try {
+                    const parsed = await this.readRawFileWithBytes(rep.file);
+                    const rec = parsed ? this.parseBootPayload(parsed.value) : null;
+                    if (!parsed || !rec || rec.payload.id !== id) throw new Error("representative file changed between scan and import");
+                    decodedBytes = parsed.bytes;
+                    const shadow = this.shadow;
+                    if (!shadow) throw new Error("unified sidecar unavailable");
+                    const hadRows = indexedBefore.has(id);
+                    const indexed = hadRows ? this.loadUnified(id) : null;
+                    const envReq = Number(rec.payload.stats?.requests ?? 0);
+                    const idxReq = indexed ? Number(indexed.stats?.requests ?? 0) : 0;
+                    const ahead = indexed !== null &&
+                        (envReq > idxReq || (envReq === idxReq && Number(rec.payload.state?.nextBlockId ?? 0) > Number(indexed.state?.nextBlockId ?? 0)));
+                    let wrote = false;
+                    if (!hadRows || indexed === null || ahead) {
+                        if (!shadow.importRecord(rec.payload)) throw new Error("import failed (see log)");
+                        wrote = true;
+                    }
+                    const legacy = recordToLegacyView(rec.payload);
+                    if (!legacy) throw new Error("legacy view build failed");
+                    const verdict = shadow.verifyImported(legacy);
+                    if (verdict === null) {
+                        status = wrote ? "imported" : "indexed";
+                        reason = "verification unavailable (network backend)";
+                    } else if (verdict.matches) {
+                        status = wrote ? "imported" : "indexed";
+                    } else {
+                        status = "drifted";
+                        const parts = [`diverged: ${verdict.diagnostics.keys.join(", ")}`];
+                        if (verdict.diagnostics.stateKeys) parts.push(`state: ${verdict.diagnostics.stateKeys.join(", ")}`);
+                        reason = `digest mismatch (${parts.join("; ")})`;
+                    }
+                } catch (err) {
+                    status = "failed";
+                    reason = String(err instanceof Error ? err.message : err);
+                }
+            }
+            const entry: LegacyMigrateSessionResult = { id, file: relOf(rep.file), status };
+            if (reason) entry.reason = reason;
+            if (decodedBytes !== undefined) entry.decodedBytes = decodedBytes;
+            if (files.length > 1) entry.alternates = files.length - 1;
+            results.push(entry);
+            counts[status]++;
+        }
+        for (const bad of badFiles) {
+            const entry: LegacyMigrateSessionResult = { id: path.basename(bad.file), file: relOf(bad.file), status: "failed", reason: bad.reason };
+            results.push(entry);
+            counts.failed++;
+        }
+        this.log("info", `[persist] storage migrate${dryRun ? " (dry run)" : ""}: ${scannedFiles} files scanned, ${counts.imported} imported, ${counts.indexed} indexed, ${counts.drifted} drifted, ${counts.failed} failed`);
+        return { scannedFiles, results, counts };
     }
 
     /** Shared post-load fixups for the unified read path: rebuilds the
