@@ -2684,15 +2684,31 @@ export function apply(ctx: PluginContext): void {
         } catch {
             // older dsh builds without the service: diagnostic only
         }
-        if (bundles !== undefined && bundles.includes("@deepseek-ai/dsh-web-app")) {
-            webProfileWarned = true;
-            // #3806: overlay failed to latch -> escalate the passive note into a boot-time alarm.
-            const gap = detectCompactionOverlayGap(ctx);
-            if (gap !== null) {
-                persistClientEvent(`profile bundles include @deepseek-ai/dsh-web-app and the load-time compaction-disable overlay (#3354) could not latch on this dsh build (${gap}) — dsh native auto-compaction is likely ARMED here. bili's wire-level refusal (#1729) refuses routed compaction calls but CANNOT stop dsh writing its checkpoint locally, so a landed checkpoint will destroy the compression substrate and surface later as a 'compression conflict' banner. Apply the #2474 full-snapshot override of preset-standard in your profile's cordis.patch.yml now (a partial snippet silently drops everything not restated; see CONFIGURATION.md)`);
-            } else {
-                persistClientEvent("profile bundles include @deepseek-ai/dsh-web-app — its agent presets run their own compaction-basic in nested rows no patch layer can address by id (#1772/#2360); bili disables those preset rows at load time via a vendored overlay (deshark42/dsh-compaction-basic-disable, MIT, #3354; since #4147 the match is structural, covering custom presets too), so dsh native auto-compaction stays OFF in this profile (ACP compression unaffected). If you still see a dsh compaction checkpoint land on a newer/older dsh build — the overlay rides cordis' INTERNAL 'internal/config' hook and is version-sensitive — fall back to the #2474 full-snapshot override of preset-standard in your profile's cordis.patch.yml (a partial snippet silently drops everything not restated; see CONFIGURATION.md)." + gateCoverageSuffix());
-            }
+        // #5686 P0-2: the latch probe (pure structural typeof checks on the
+        // cordis host surface — cheap, side-effect-free) now runs for EVERY
+        // profile shape, including the shape whose bundle list cannot be
+        // introspected at all (bundles === undefined, older dsh builds).
+        // Pre-#5686 it ran ONLY inside the @deepseek-ai/dsh-web-app branch, so
+        // desktop app-in-bundle installs (#5684 clients=dsh desktop profiles)
+        // and unintrospectable builds booted SILENTLY when the #3354 disable
+        // middleware could not latch — native auto-compaction armed with zero
+        // boot-time signal. Host capability is stable within a process, so one
+        // probe per process suffices; latching webProfileWarned here (not only
+        // in the web branch) keeps that once-per-process semantics for all
+        // shapes.
+        const isWeb = bundles !== undefined && bundles.includes("@deepseek-ai/dsh-web-app");
+        const gap = detectCompactionOverlayGap(ctx);
+        webProfileWarned = true;
+        if (gap !== null) {
+            // #3806/#5686: overlay failed to latch -> boot-time alarm on ANY profile shape.
+            const shape = isWeb
+                ? "profile bundles include @deepseek-ai/dsh-web-app and"
+                : bundles === undefined
+                    ? "the profile bundle list could not be introspected on this dsh build and"
+                    : "profile bundles do not include @deepseek-ai/dsh-web-app and";
+            persistClientEvent(`${shape} the load-time compaction-disable overlay (#3354) could not latch on this dsh build (${gap}) — dsh native auto-compaction is likely ARMED here${bundles === undefined ? "" : isWeb ? "" : " (silent arming blind spot for non-web profile shapes, #5684/#3806)"}. bili's wire-level refusal (#1729) refuses routed compaction calls but CANNOT stop dsh writing its checkpoint locally, so a landed checkpoint will destroy the compression substrate and surface later as a 'compression conflict' banner. Apply the #2474 full-snapshot override of preset-standard in your profile's cordis.patch.yml now (a partial snippet silently drops everything not restated; see CONFIGURATION.md)`);
+        } else if (isWeb) {
+            persistClientEvent("profile bundles include @deepseek-ai/dsh-web-app — its agent presets run their own compaction-basic in nested rows no patch layer can address by id (#1772/#2360); bili disables those preset rows at load time via a vendored overlay (deshark42/dsh-compaction-basic-disable, MIT, #3354; since #4147 the match is structural, covering custom presets too), so dsh native auto-compaction stays OFF in this profile (ACP compression unaffected). If you still see a dsh compaction checkpoint land on a newer/older dsh build — the overlay rides cordis' INTERNAL 'internal/config' hook and is version-sensitive — fall back to the #2474 full-snapshot override of preset-standard in your profile's cordis.patch.yml (a partial snippet silently drops everything not restated; see CONFIGURATION.md)." + gateCoverageSuffix());
         } else if (bundles !== undefined && !nonWebTraceLogged) {
             // #3651: the web-profile note above is the ONLY confirmation that
             // the #3354 overlay took effect, and it is scoped to dsh-web-app
@@ -2701,19 +2717,7 @@ export function apply(ctx: PluginContext): void {
             // trace so a field log can tell "overlay registered" from "profile
             // shape unconfirmed".
             nonWebTraceLogged = true;
-            // #5686 P0-2: the latch check used to run ONLY inside the
-            // web-profile branch above — every other profile shape (notably
-            // desktop app-in-bundle installs, #5684 clients=dsh desktop
-            // profiles) booted SILENTLY even when the overlay could not latch
-            // on this host build, leaving native auto-compaction armed with no
-            // trace until a checkpoint destroyed the fold base days later.
-            // Same capability probe, same alarm level as the web branch.
-            const gap = detectCompactionOverlayGap(ctx);
-            if (gap !== null) {
-                persistClientEvent(`profile bundles do not include @deepseek-ai/dsh-web-app and the load-time compaction-disable overlay (#3354) could not latch on this dsh build (${gap}) — dsh native auto-compaction is likely ARMED here (silent arming blind spot for non-web profile shapes, #5684/#3806). bili's wire-level refusal (#1729) refuses routed compaction calls but CANNOT stop dsh writing its checkpoint locally, so a landed checkpoint will destroy the compression substrate and surface later as a 'compression conflict' banner. Apply the #2474 full-snapshot override of preset-standard in your profile's cordis.patch.yml now (a partial snippet silently drops everything not restated; see CONFIGURATION.md)`);
-            } else {
-                persistClientEvent("profile bundles do not include @deepseek-ai/dsh-web-app — the #3354 load-time compaction-disable middleware is registered anyway (it rewrites any entry's nested compaction-basic/command-compact rows through cordis' version-sensitive internal 'internal/config' hook, covering custom presets as of #4147), but no web-profile disable note applies here; if dsh native auto-compaction still lands in this profile, apply the #2474 full-snapshot override of preset-standard (CONFIGURATION.md) — and note the #1729 wire guard now refuses such native compaction calls unconditionally (the #2028 allowDshCompaction opt-in was removed in #3651)." + gateCoverageSuffix());
-            }
+            persistClientEvent("profile bundles do not include @deepseek-ai/dsh-web-app — the #3354 load-time compaction-disable middleware is registered anyway (it rewrites any entry's nested compaction-basic/command-compact rows through cordis' version-sensitive internal 'internal/config' hook, covering custom presets as of #4147), but no web-profile disable note applies here; if dsh native auto-compaction still lands in this profile, apply the #2474 full-snapshot override of preset-standard (CONFIGURATION.md) — and note the #1729 wire guard now refuses such native compaction calls unconditionally (the #2028 allowDshCompaction opt-in was removed in #3651)." + gateCoverageSuffix());
         }
     }
 

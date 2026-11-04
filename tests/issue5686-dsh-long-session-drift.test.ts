@@ -270,6 +270,23 @@ test("#5686 P0-2: web profile + hook-less host ⇒ existing web ARMED alarm unch
     assert.match(lines[0], /ARMED/i);
 });
 
+test("#5686 P0-2: unintrospectable profile shape (no bundle list) + hook-less host ⇒ ARMED alarm too", async () => {
+    // Absorbed from parallel PR #5692's broader coverage: older dsh builds
+    // expose no profileContext at all — pre-absorption this shape stayed
+    // silent even when the overlay could not latch.
+    const bare: BareCtx = {
+        tools: { register: () => undefined },
+        commands: { register: () => undefined },
+        agents: {},
+    };
+    const lines = await runApplyWithShape(bare);
+    assert.equal(lines.length, 1);
+    assert.match(lines[0], /could not be introspected/);
+    assert.match(lines[0], /could not latch/i);
+    assert.match(lines[0], /no-config-hook/);
+    assert.match(lines[0], /ARMED/i);
+});
+
 // ---- P1-1 + P1-2: session order resolution visibility and the landed-checkpoint rung. ----
 
 const H = [
