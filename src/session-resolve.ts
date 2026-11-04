@@ -349,6 +349,26 @@ export function resolveSessionOrder(rawId: string, history: unknown, personaTag?
             record(rawId, turns, tagHash, effectiveModel);
             return { key: rawId, action: "reanchor", reason: "persona text changed but the recorded history continues inside the incoming — anchor migrated (#4778)" };
         }
+        if (
+            mainShaped(kinds) &&
+            kinds.length < recorded.kinds.length &&
+            tailAligns(kinds, recorded.kinds) &&
+            fragTailEquals(kinds.length)
+        ) {
+            // #5686 P1-2: strictly symmetric to the tagless shorter-reanchor
+            // rung below (structurally mainShaped-gated there). A LANDED dsh
+            // native compaction (mechanism B) truncates the head to one
+            // checkpoint message while keeping the living tail verbatim —
+            // and dsh re-stamps its system prompt every turn, so the same
+            // request arrives tagChanged. The #4778 rung's length gate (>=)
+            // excluded this shape, so the session forked deterministically
+            // onto a lane whose first visible message IS the checkpoint
+            // sentence. 8-cell sha256 tail byte-equality across distinct
+            // sessions ≈ 0 (same doctrine as the tagless rung) → migrate,
+            // never fork.
+            record(rawId, turns, tagHash, effectiveModel);
+            return { key: rawId, action: "reanchor", reason: "persona text changed on a shorter history whose tail is verbatim (landed native compaction rewrote the head) — anchor migrated (#5686)" };
+        }
         // #5095 D1-B: a non-empty discriminator (only the claude-anthropic
         // headless-subagent call site passes one) widens the key into a
         // three-segment form so distinct same-type runs never share a
@@ -453,7 +473,20 @@ export function applyOrderSnapshot(entries: OrderSkeletonEntry[]): number {
  *  raw id + the request's history in, the conversation key out. The old
  *  ladder consumed (systemText, model) and keyed by system-hash; the v2
  *  resolver is content-blind and keys by order+id with fragment guards,
- *  so those parameters are simply gone. */
-export function personaConversationOrder(rawId: string, history: unknown, personaTag?: string, declaredModel?: string, laneToken?: string, laneDiscriminator?: string): string {
-    return resolveSessionOrder(rawId, history, personaTag ?? "", declaredModel, laneToken, laneDiscriminator).key;
+ *  so those parameters are simply gone. #5686 P1-1: optional `onResolve`
+ *  hands the FULL resolution back to the caller — pre-fix this adapter
+ *  dropped action/reason, so fork (`derived-*`) and anchor-migration
+ *  (`reanchor`) decisions were invisible in production logs. */
+export function personaConversationOrder(
+    rawId: string,
+    history: unknown,
+    personaTag?: string,
+    declaredModel?: string,
+    laneToken?: string,
+    laneDiscriminator?: string,
+    onResolve?: (rawId: string, resolution: SessionOrderResolution) => void,
+): string {
+    const resolution = resolveSessionOrder(rawId, history, personaTag ?? "", declaredModel, laneToken, laneDiscriminator);
+    onResolve?.(rawId, resolution);
+    return resolution.key;
 }
