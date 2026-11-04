@@ -45,7 +45,7 @@ function snapshotFiles(dir: string): Map<string, { size: number; mtimeMs: number
     const out = new Map<string, { size: number; mtimeMs: number }>();
     const walk = (cur: string): void => {
         for (const name of readdirSync(cur)) {
-            if (/^index\.db(-.*)?$/.test(name)) continue;
+            if (name.startsWith("index.db")) continue;
             const full = join(cur, name);
             const st = statSync(full);
             if (st.isDirectory()) walk(full);
@@ -133,6 +133,9 @@ test("already-indexed sessions report indexed without re-writing", async () => {
     const dir = mkdtempSync(join(tmpdir(), "bili-migrate-"));
     try {
         await writeSessions(dir, [{ id: "keep-1" }, { id: "keep-2" }]);
+        // Without this the writing instance's own first-open auto-import has
+        // already filled the index, and the first migrate run only verifies.
+        dropIndex(dir);
         const first = await runMigrate(dir);
         assert.equal(first.out.counts.imported, 2);
         const second = await runMigrate(dir);
