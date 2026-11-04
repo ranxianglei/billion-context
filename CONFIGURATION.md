@@ -2115,6 +2115,7 @@ Every upstream transport failure is classified into a `kind=` that leads its log
 | `proxy-reset` | connection died pre-response **through a proxy** (prime suspect: proxy idle-recycle / payload cap / node churn) | transparent replay, bounded by `BILI_REPLAY_RETRY_MAX` (default 3 total attempts) |
 | `upstream-reset` | same, direct connection (suspect upstream/local network) | same (bounded by `BILI_REPLAY_RETRY_MAX`) |
 | `connect-refused` | TCP refused (the proxy when configured, else upstream) | same (bounded by `BILI_REPLAY_RETRY_MAX`) |
+| `upstream-unreachable` | no route to the host (ICMP `EHOSTUNREACH` / `ENETUNREACH` / `EHOSTDOWN`) — routing / ACL / firewall `REJECT`; on macOS also the Local Network privacy denial (#5663) | same (bounded by `BILI_REPLAY_RETRY_MAX`) |
 | `dns` | name resolution failed (DNS server / hostname typo) | transparent replay, bounded by `BILI_REPLAY_RETRY_MAX` |
 | `tls` / `unknown` | TLS/handshake failure (CA/MITM) / unclassified transport failure | not retried |
 
