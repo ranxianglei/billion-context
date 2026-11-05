@@ -106,8 +106,10 @@ export async function hydrateNoticeReceipts(): Promise<void> {
     try {
         const dbRows = await getStore().listKvAsync(NS);
         const rowKeys = new Set(dbRows.map((r) => r.key));
-        // One-time migration: file keys not yet in kv into kv (raw junk stays
-        // file-only — the view below still honors it).
+        // One-time migration: every file key not yet in kv goes into kv
+        // (best-effort, no format policing — the API path validates, the file
+        // may not). The view below unions file keys directly, so each is honored
+        // in-process whether or not its kv write landed.
         const fileKeys = fileKeysOf(process.env);
         const toImport = [...fileKeys].filter((k) => !rowKeys.has(k));
         for (const k of toImport) {
