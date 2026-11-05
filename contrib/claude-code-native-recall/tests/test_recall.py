@@ -24,7 +24,7 @@ def tool_call(name, inp, tokens, tid='t'):
 
 def tool_result(text, tid='t'):
     return {'type': 'user', 'isSidechain': False,
-            'message': {'role': 'user', 'content': [{'type': 'tool_result', 'tool_use_id': tid, 'content': text}]}}
+            'message': {'role': 'user', 'content': [{'type': 'tool_result', 'tool_use_id': tid, 'content': text, 'is_error': False}]}}
 
 
 def reply(text, tokens):
@@ -44,7 +44,8 @@ class RecallTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = pathlib.Path(self.tmp.name)
         self.path = self.root / 't.jsonl'
-        self.env = {**os.environ, 'RECALL_HOME': str(self.root / 'archive')}
+        self.env = {**os.environ, 'RECALL_HOME': str(self.root / 'archive'),
+                    'RECALL_CC_VERSION': '2.1.105'}  # Explicit fixture capability, not a real host probe.
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -59,7 +60,14 @@ class RecallTest(unittest.TestCase):
 
     def context(self, proc):
         out = proc.stdout.decode('utf-8').strip()
-        return json.loads(out)['hookSpecificOutput']['additionalContext'] if out else None
+        if not out:
+            return None
+        text = json.loads(out)['hookSpecificOutput']['additionalContext']
+        try:
+            value = json.loads(text)
+        except ValueError:
+            return text
+        return value['recall_history']['display_text'] if 'recall_history' in value else text
 
     def conversation(self, n_turns, tokens, big_output=''):
         entries = []
@@ -95,10 +103,11 @@ class RecallTest(unittest.TestCase):
 
         self.path.unlink()
         failed = self.hook('precompact', trigger='auto')
-        self.assertNotEqual(failed.returncode, 0)
+        self.assertEqual(failed.returncode, 0, 'Storage failure must not block the host')
         err = self.events()[-1]
         self.assertEqual((err['event'], err['hook']), ('error', 'precompact'))
-        self.assertIn('FileNotFoundError', err['trace'])
+        self.assertEqual(err['error_type'], 'FileNotFoundError')
+        self.assertNotIn('trace', err)
 
     # --- compaction gate ---
     def test_auto_compaction_blocked_until_model_is_ready(self):
@@ -108,13 +117,13 @@ class RecallTest(unittest.TestCase):
         self.assertIn('compact_ready', blocked.stderr.decode('utf-8'))
         self.assertFalse((self.root / 'archive' / SID / 'turns.jsonl').exists())
 
-        self.write(self.conversation(3, 260_000) + [tool_call(READY, {'focus': 'x'}, 260_000)])
+        self.write(self.conversation(3, 260_000) + [tool_call(READY, {'summary': 'fixture ready', 'focus': 'x'}, 260_000, 'ready-1'), tool_result('已记录。', 'ready-1')])
         allowed = self.hook('precompact', trigger='auto')
         self.assertEqual(allowed.returncode, 0)
         self.assertTrue((self.root / 'archive' / SID / 'turns.jsonl').exists())
 
     def test_ready_from_before_previous_compaction_does_not_count(self):
-        self.write(self.conversation(2, 260_000)[:4] + [tool_call(READY, {'focus': 'x'}, 260_000), BOUNDARY, SUMMARY]
+        self.write(self.conversation(2, 260_000)[:4] + [tool_call(READY, {'summary': 'fixture ready', 'focus': 'x'}, 260_000, 'ready-1'), tool_result('已记录。', 'ready-1'), BOUNDARY, SUMMARY]
                    + self.conversation(2, 260_000))
         self.assertEqual(self.hook('precompact', trigger='auto').returncode, 2)
 
@@ -181,7 +190,7 @@ class RecallTest(unittest.TestCase):
         self.assertIsNotNone(self.context(self.hook('nudge', **ev)), 'must nudge again after context dropped')
 
     def test_no_nudge_after_model_declared_ready(self):
-        self.write(self.conversation(2, 260_000) + [tool_call(READY, {'focus': 'x'}, 260_000)])
+        self.write(self.conversation(2, 260_000) + [tool_call(READY, {'summary': 'fixture ready', 'focus': 'x'}, 260_000, 'ready-1'), tool_result('已记录。', 'ready-1')])
         self.assertIsNone(self.context(self.hook('nudge', hook_event_name='PostToolUse')))
 
     # --- restore after compaction ---

@@ -1,7 +1,7 @@
 {
   "name": "billion-claude-recall",
-  "version": "0.3.0",
-  "description": "可找回的上下文压缩：模型择机压缩、压缩前存档、压缩后补回最近 5 轮",
+  "version": "0.3.2",
+  "description": "本地原文归档与稳定召回：版本感知压缩准备、低信任恢复、可重建索引",
   "author": {
     "name": "local"
   }

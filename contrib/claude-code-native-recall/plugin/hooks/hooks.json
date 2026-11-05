@@ -1,5 +1,5 @@
 {
-  "description": "billion-claude-recall: nudge, compaction gate, post-compaction restore",
+  "description": "billion-claude-recall: bounded capture, optional version-declared readiness policy, untrusted history restore",
   "hooks": {
     "UserPromptSubmit": [
       {
@@ -37,7 +37,7 @@
     ],
     "SessionStart": [
       {
-        "matcher": "compact",
+        "matcher": "compact|resume",
         "hooks": [
           {
             "type": "command",
@@ -83,6 +83,29 @@
             "type": "command",
             "command": "P=${RECALL_PYTHON:-python3}; $P -c '' 2>/dev/null || P=python; $P -X utf8 \"${CLAUDE_PLUGIN_ROOT}/recall/hook.py\" restore 8",
             "timeout": 30
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "P=${RECALL_PYTHON:-python3}; $P -c '' 2>/dev/null || P=python; $P -X utf8 \"${CLAUDE_PLUGIN_ROOT}/recall/hook.py\" observe",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "P=${RECALL_PYTHON:-python3}; $P -c '' 2>/dev/null || P=python; $P -X utf8 \"${CLAUDE_PLUGIN_ROOT}/recall/hook.py\" observe",
+            "timeout": 10
           }
         ]
       }

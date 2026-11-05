@@ -1,0 +1,9 @@
+evidence/
+isolated/
+synthetic-project/
+native-archive/
+empty-cc-projects/
+native-state.json
+__pycache__/
+*.pyc
+test-plugin/*-result.json

@@ -11,7 +11,8 @@ RULE = 'mcp__plugin_billion-claude-recall_recall__recall_rule'
 
 
 def ready(summary, tokens, tid='r', **extra):
-    return tool_call(READY, {'summary': summary, **extra}, tokens, tid)
+    return [tool_call(READY, {'summary': summary, **extra}, tokens, tid),
+            tool_result('已记录。', tid)]  # Explicit successful completion fixture.
 
 
 class V2Test(RecallTest):
@@ -47,7 +48,7 @@ class V2Test(RecallTest):
         self.assertNotIn('m00', tool['description'])
 
     def test_summary_stored_with_turn_range_and_restored_in_compressed_section_format(self):
-        first = self.conversation(3, 260_000) + [ready('第一段摘要 ALPHA', 260_000, 'r1', focus='F1')]
+        first = self.conversation(3, 260_000) + [*ready('第一段摘要 ALPHA', 260_000, 'r1', focus='F1')]
         self.write(first)
         self.hook('precompact', trigger='auto')  # PreCompact runs before Claude Code writes the boundary
         first += [BOUNDARY, SUMMARY]
@@ -58,7 +59,7 @@ class V2Test(RecallTest):
         self.assertIn(f'recall_get(session_id="{SID}", turn=1, to_turn=3)', block)
 
         second = [user('任务 4'), reply('完成 4', 260_000), user('任务 5'), reply('完成 5', 260_000)]
-        self.write(first + second + [ready('第二段 BETA', 260_000, 'r2')])
+        self.write(first + second + [*ready('第二段 BETA', 260_000, 'r2')])
         self.assertEqual(self.hook('precompact', trigger='auto').returncode, 0)
         self.hook('precompact', trigger='auto')  # same call again: not stored twice
         self.assertEqual([(r['id'], r['from'], r['to']) for r in self.summaries()], [('s1', 1, 3), ('s2', 4, 5)])
@@ -75,7 +76,7 @@ class V2Test(RecallTest):
         self.assertEqual(a, b, 'pressure layer repeats on every call')
         self.write(self.conversation(2, 290_000))
         self.assertIn('Context limit reached', self.context(self.hook('nudge', **ev)))
-        self.write(self.conversation(2, 290_000) + [ready('s', 290_000)])
+        self.write(self.conversation(2, 290_000) + [*ready('s', 290_000)])
         self.assertIsNone(self.context(self.hook('nudge', **ev)))
         self.assertEqual([(e['event'], e['layer']) for e in self.events()],
                          [('nudge', 'pressure'), ('nudge', 'pressure'), ('nudge', 'emergency')])
@@ -88,7 +89,7 @@ class V2Test(RecallTest):
         self.assertIn('#1–#2 (#2 is the current turn)', text)
 
     def test_reminder_names_real_turn_numbers_after_a_compaction(self):
-        first = self.conversation(3, 160_000) + [ready('s', 160_000, 'r1')]
+        first = self.conversation(3, 160_000) + [*ready('s', 160_000, 'r1')]
         self.write(first)
         self.hook('precompact', trigger='auto')  # archives turns #1–#3
         self.write(first + [BOUNDARY, SUMMARY] + self.conversation(2, 230_000))
@@ -106,7 +107,7 @@ class V2Test(RecallTest):
         self.assertIn('s1+s2+s3', text)
 
         self.write(self.conversation(2, 160_000) + [BOUNDARY, SUMMARY]
-                   + [ready('NEW summary', 160_000, 'r9', prior_digest='DIGEST of s1-s3')])
+                   + [*ready('NEW summary', 160_000, 'r9', prior_digest='DIGEST of s1-s3')])
         self.hook('precompact', trigger='manual')
         recs = self.summaries()
         self.assertEqual([(r['id'], r['tier']) for r in recs[3:]], [('s4', 2), ('s5', 1)])
@@ -125,7 +126,7 @@ class V2Test(RecallTest):
 
     # --- G1-4 search over summaries, scope ---
     def test_search_covers_summaries_and_all_sessions(self):
-        self.write(self.conversation(3, 260_000) + [ready('决定用 GAMMA 方案', 260_000)])
+        self.write(self.conversation(3, 260_000) + [*ready('决定用 GAMMA 方案', 260_000)])
         self.hook('precompact', trigger='auto')
         self.write(self.conversation(2, 100_000))
         self.hook('precompact', trigger='manual', session_id='other-sess')
@@ -162,7 +163,7 @@ class V2Test(RecallTest):
 
     # --- G1-6 status ---
     def test_status_reads_live_session_found_by_project_dir(self):
-        env = self.project(self.conversation(2, 230_000) + [ready('x', 230_000)])
+        env = self.project(self.conversation(2, 230_000) + [*ready('x', 230_000)])
         (text,) = self.mcp([('recall_status', {})], env=env)
         self.assertIn(f'session_id={SID}', text)
         self.assertIn('230.0K', text)
@@ -216,7 +217,7 @@ class V2Test(RecallTest):
         self.assertIn('- [completed] 甲', block)
         self.assertIn('- [pending] 乙', block)
         self.write(self.conversation(1, 100_000) + [
-            tool_call('TodoWrite', {'todos': [{'content': '完', 'status': 'completed'}]}, 100_000, 'w')])
+            tool_call('TodoWrite', {'todos': [{'content': '完', 'status': 'completed'}]}, 100_000, 'w'), tool_result('ok', 'w')])
         self.hook('precompact', trigger='manual')
         self.assertIsNone(self.context(self.hook('restore', '8')))
 
@@ -228,7 +229,7 @@ class V2Test(RecallTest):
         self.write(self.conversation(2, 260_000) + forged)
         self.assertEqual(self.hook('precompact', trigger='auto').returncode, 2)
         self.assertIsNotNone(self.context(self.hook('nudge', hook_event_name='PostToolUse')))
-        self.write(self.conversation(2, 260_000) + forged + [ready('real', 260_000)])
+        self.write(self.conversation(2, 260_000) + forged + [*ready('real', 260_000)])
         self.assertEqual(self.hook('precompact', trigger='auto').returncode, 0)
 
     # --- G2-10 absorb ---

@@ -44,7 +44,7 @@ def active_summaries(recs):
 
 def save_summary(sid, entries, turns):
     """Store the latest compact_ready summary (and prior_digest) of this compaction. Returns new ids."""
-    call = tr.latest_ready(entries)
+    call = tr.latest_ready(entries, sid=sid)
     inp = (call or {}).get('input') or {}
     recs = load_summaries(sid)
     if not call or not str(inp.get('summary', '')).strip() or any(r.get('call') == call.get('id') for r in recs):
@@ -146,18 +146,17 @@ def apply_rule(state, inp):
     return '\n'.join(f"{i + 1}. [{r['id']}] {r['text']}" for i, r in enumerate(rules)) or 'No rules recorded.'
 
 
-def replay_rules(entries, completed_only=False):
+def replay_rules(entries, completed_only=False, sid=None):
     """Rule state from every recall_rule call in the transcript, oldest first."""
-    done = tr.tool_results(entries) if completed_only else None
     state = {'rules': [], 'next': 1}
-    for call in tr.tool_uses(entries, RULE_SUFFIX):
-        if done is None or call.get('id') in done:
-            apply_rule(state, call.get('input') or {})
+    calls = tr.successful_tool_uses(entries, RULE_SUFFIX, sid=sid) if completed_only else tr.tool_uses(entries, RULE_SUFFIX)
+    for call in calls:
+        apply_rule(state, call.get('input') or {})
     return state
 
 
 def save_rules(sid, entries):
-    state = replay_rules(entries)
+    state = replay_rules(entries, completed_only=True, sid=sid)
     _write_json(tr.session_dir(sid) / 'rules.json', state)
     return len(state['rules'])
 
@@ -173,11 +172,11 @@ def rules_block(sid):
 
 # --- latest todo list --------------------------------------------------------------------------
 
-def latest_todos(entries):
+def latest_todos(entries, sid=None):
     """Latest TodoWrite list, or the TaskCreate/TaskUpdate state if those were used last."""
-    results = tr.tool_results(entries)
+    results = tr.tool_results(entries, completed_only=True, sid=sid)
     todos, tasks, last = [], {}, None
-    for call in tr.tool_uses(entries):
+    for call in tr.successful_tool_uses(entries, sid=sid):
         name, inp = call.get('name'), call.get('input') or {}
         if name == 'TodoWrite':
             todos = [{'content': t.get('content', ''), 'status': t.get('status', '')} for t in inp.get('todos') or []]
@@ -199,7 +198,7 @@ def latest_todos(entries):
 
 
 def save_todos(sid, entries):
-    todos = latest_todos(entries)
+    todos = latest_todos(entries, sid=sid)
     _write_json(tr.session_dir(sid) / 'todos.json', todos)
     return len(todos)
 
