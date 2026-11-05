@@ -1,0 +1,16 @@
+{
+  "name": "billion_context_native",
+  "description": "Local marketplace for billion_context_native.",
+  "owner": {
+    "name": "local"
+  },
+  "plugins": [
+    {
+      "name": "billion_context_native",
+      "description": "本地原文归档与稳定召回：版本感知压缩准备、低信任恢复、可重建索引",
+      "version": "0.3.2",
+      "source": "./plugin",
+      "category": "productivity"
+    }
+  ]
+}
