@@ -41,6 +41,11 @@ import { startAdvisoryWatcher, getAdvisoryState, advisoryDeferring, advisoryBloc
 import { startReleaseNotesWatcher } from "./update-notes.js";
 import { startRemoteNoticesWatcher } from "./remote-notices.js";
 import { hydrateNoticeReceipts } from "./notice-store.js";
+import { hydrateHostPluginDismissals } from "./host-plugin-notice.js";
+import { hydrateResignPending } from "./apig-resign.js";
+import { hydrateRolloutIdentity } from "./rollout.js";
+import { hydrateOrderUnified } from "./order-persist.js";
+import { hydrateAffinityUnified } from "./affinity-persist.js";
 import { resolveProxy } from "./upstream-proxy.js";
 import { runMcpStdio } from "./mcp.js";
 import { PLUGIN_AGENTS, isPluginAgent, pluginInstall, pluginRemove, pluginStatusAll, pluginUpdate, renderPluginList, warnActivePluginSessions, type PluginAgent } from "./plugin-install.js";
@@ -963,4 +968,13 @@ export async function main(): Promise<void> {
     // #5548: notice dismissal receipts ride the unified storage — hydrate the
     // in-memory view once at boot (and migrate any legacy JSON file one time).
     void hydrateNoticeReceipts();
+    // #5753: the same carrier rules now cover host-plugin dismissals, the
+    // apig-resign pending queue, the rollout install id, and the session-order
+    // + prefix-affinity snapshots. All no-op on legacy-only instances and
+    // before anything created the storage singleton.
+    void hydrateHostPluginDismissals();
+    void hydrateResignPending();
+    void hydrateRolloutIdentity();
+    void hydrateOrderUnified();
+    void hydrateAffinityUnified();
 }

@@ -32,6 +32,7 @@ import path from "node:path";
 import { stateDir } from "./paths.js";
 import { loadConfigFile, type RolloutFeatureOverride, type RolloutFileConfig } from "./config.js";
 import { log as loggerLog } from "./logger.js";
+import { getStore, unifiedKvActive } from "./persist.js";
 
 /** One feature's baked-in rollout plan (version-owned, set at release time). */
 export interface RolloutPlan {
@@ -234,6 +235,53 @@ export function rolloutDecisions(id: string): RolloutDecision[] {
  *  relocating XDG_STATE_HOME get independent ids within one process. */
 const idCache = new Map<string, string>();
 
+// #5753: the identity rides the UNIFIED storage (kv_store namespace "rollout",
+// key "install-id") under the #5548 carrier rules: kv primary once hydrated,
+// legacy file kept as pre-hydration fallback + sole carrier on legacy-only
+// instances + fresh-install BOOTSTRAP. The bootstrap matters: two lane copies
+// racing on a brand-new install must converge on ONE id (the historical wx
+// create-file race is the tie-breaker), so generation still creates the file
+// exactly once per install lifetime; every later read/write goes to kv.
+const ID_NS = "rollout";
+const ID_KEY = "install-id";
+let kvInstallId: string | null = null;
+let kvIdHydrated = false;
+let kvIdWarned = false;
+
+function kvIdWarnOnce(tag: string, err: unknown): void {
+    if (kvIdWarned) return;
+    kvIdWarned = true;
+    loggerLog("warn", `[rollout] ${tag} failed — install id stays file-based for this process: ${err instanceof Error ? err.message : String(err)}`);
+}
+
+/** Once per process (wired at cli start): adopt the unified-storage id when
+ *  present, otherwise import the legacy file into kv one time. Never throws.
+ */
+export async function hydrateRolloutIdentity(): Promise<void> {
+    if (kvIdHydrated || !unifiedKvActive()) return;
+    try {
+        const doc = await getStore().getKvAsync(ID_NS, ID_KEY);
+        const v = doc && typeof doc === "object" ? ((doc as { id?: unknown })["id"] as unknown) : undefined;
+        if (typeof v === "string" && /^[0-9a-f-]{8,}$/i.test(v)) {
+            kvInstallId = v;
+            kvIdHydrated = true;
+            return;
+        }
+        // no usable row: import the legacy file (one-time migration).
+        const file = rolloutIdFile();
+        const fileCached = idCache.get(file) ?? readIdFile(file);
+        if (fileCached !== undefined) {
+            await getStore().setKvAsync(ID_NS, ID_KEY, { id: fileCached });
+            kvInstallId = fileCached;
+            idCache.set(file, fileCached);
+            loggerLog("info", `[rollout] imported the install id from the legacy JSON file into unified storage (kv_store namespace "${ID_NS}")`);
+        }
+        kvIdHydrated = true;
+    } catch (err) {
+        kvIdWarnOnce("hydrate", err);
+    }
+}
+
 function rolloutIdFile(): string {
     return path.join(stateDir(), "rollout-id.json");
 }
@@ -257,6 +305,10 @@ export function rolloutInstallId(): string {
     const file = rolloutIdFile();
     const cached = idCache.get(file);
     if (cached !== undefined) return cached;
+    if (kvInstallId !== null) {
+        idCache.set(file, kvInstallId);
+        return kvInstallId;
+    }
     const existing = readIdFile(file);
     if (existing !== undefined) {
         idCache.set(file, existing);
@@ -291,6 +343,14 @@ export function rolloutInstallId(): string {
         return derived;
     }
     const settled = readIdFile(file) ?? generated;
+    // #5753: once the identity is settled, it lives in the unified store; the
+    // file remains only as the cross-process bootstrap artifact written above.
+    if (unifiedKvActive() && kvInstallId === null) {
+        void getStore()
+            .setKvAsync(ID_NS, ID_KEY, { id: settled })
+            .then(() => { if (kvInstallId === null) kvInstallId = settled; })
+            .catch((err) => kvIdWarnOnce("persist", err));
+    }
     idCache.set(file, settled);
     return settled;
 }
@@ -303,6 +363,16 @@ export function rolloutInstallId(): string {
  * → same id across restarts, so the cohort stays sticky even on this path. */
 export function derivedInstallId(home: string, hostname: string, username: string): string {
     return "derived-" + createHash("sha256").update(`${username}\n${hostname}\n${home}`).digest("hex").slice(0, 32);
+}
+
+/** Test seam: drop the unified-identity caches. */
+export function _resetRolloutIdentityForTest(): void {
+    kvInstallId = null;
+    kvIdHydrated = false;
+    kvIdWarned = false;
+    // a simulated restart re-resolves every carrier — the file-keyed identity
+    // cache must not leak a wiped volume's id into the "fresh" process.
+    idCache.clear();
 }
 
 /** One feature's effective gate, against the real install id. Call sites use
