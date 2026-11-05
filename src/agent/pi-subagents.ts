@@ -44,7 +44,7 @@ import { logHostEvent } from "./host-log.js";
 
 /** The four bili pi-plugin slash commands ownable via `pi.commands`. */
 export const PI_COMMAND_NAMES = ["acp", "acp-cache", "acp-rule", "acp-fleet"] as const;
-export type PiCommandName = (typeof PI_COMMAND_NAMES)[number];
+type PiCommandName = (typeof PI_COMMAND_NAMES)[number];
 /** Default surface: status + cache reconciliation stay on, the rarer
  *  acp-rule / acp-fleet register only when named explicitly. */
 export const DEFAULT_PI_COMMANDS: readonly PiCommandName[] = ["acp", "acp-cache"];
