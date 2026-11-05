@@ -67,7 +67,7 @@ import { buildForgeResponse, classifierForgeVariant, estimateCjkTokens, isAutoMo
 import { extractConversationId, isV1BackgroundSideRequest, isV1InternalRequest, unwrapV1Internal } from "../v1internal.js";
 import { anthropicBetaContextWindow, BILI_HOP_HEADER, capRegistryWindowByStandard, expandedContextSuffixWindow, launcherContextWindow, launcherMaxOutput, noteUnresolvedModelSession, UNRESOLVED_MODEL_SESSION_THRESHOLD, windowSourceLogged } from "./context-window.js";
 import { NO_IDENTITY_MESSAGE, safeSessionId } from "./headers.js";
-import { demoteGate, hasLeakedBiliToolsOnly, isClaudeCodeTitleRequest, isDshAutoReviewRequest, isDshSingleShotSidecar, isDshTitleRequest, isServerToolUtilityCall, isSideRequest, resolveSideLane, restoreOutputBudget, sideRequestGuard, stripLeakedBiliTools } from "./side-request.js";
+import { demoteGate, hasLeakedBiliToolsOnly, hasSingleShotBudget, isClaudeCodeTitleRequest, isDshAutoReviewRequest, isDshSingleShotSidecar, isDshTitleRequest, isServerToolUtilityCall, isSideRequest, resolveSideLane, restoreOutputBudget, sideRequestGuard, stripLeakedBiliTools } from "./side-request.js";
 import { DSH_COMPACTION_SHAPE_MSGS, DSH_REFUSAL_STORM_LOG_EVERY, detectPassthroughDshCompactionCall, dshCompactionRefusal, dshPassthroughGuardStats, isDshCompactionCall } from "./dsh-compaction-guard.js";
 import { buildDshCompactionForgeBody, renderDshAuthoredCheckpoint } from "./dsh-authored-compaction.js";
 import { artifactSeedHit, detectAcpArtifacts } from "./chain-artifacts.js";
@@ -1071,6 +1071,7 @@ async function handleRequest(
                  // anchor before the first main turn and exile the real
                  // conversation onto a persisted `|sub:<fp>` ghost.
                  || (pluginAgentHeader(req.headers) === "dsh" && sideAgent !== "main"
+                     && hasSingleShotBudget(parsed)
                      && isDshSingleShotSidecar(protocol, parsed))
                  // #5135: the claude code title sidecar stays off the raw-key
                  // anchor claim and off the kernel pipeline entirely.
@@ -2207,7 +2208,8 @@ async function handleRequest(
         // prompt-enhance-class calls ride the #388 passthrough (kernel
         // no-touch) instead of claiming the raw-key anchor; the sticky-bound leg
         // mirrors #4438 — the extension client can arrive unstamped.
-        const dshSingleShotSidecar = requestAgent !== "main" && isDshSingleShotSidecar(protocol, parsed)
+        const dshSingleShotSidecar = requestAgent !== "main" && hasSingleShotBudget(parsed)
+            && isDshSingleShotSidecar(protocol, parsed)
             && (pluginAgentHeader(req.headers) === "dsh"
                 || (typeof session.metadata.pluginAgent === "string" && session.metadata.pluginAgent === "dsh"));
         // #5135: ccTitleSidecar joins the intent set so the title call rides
