@@ -434,6 +434,13 @@ export class UnifiedStore {
      * verdict cache onto the post-checkpoint stats so the next boot skips
      * the rescan. Never true while a check is still in flight or failed. */
     private lastIntegrityOk = false;
+    /** #5539 secondary finding: releaseContent runs once per released hash
+     * (~3K/turn on busy sessions); per-call prepare() measured ~7x slower than
+     * reuse in the field report (0.063 vs 0.009 ms/call). The db handle is
+     * per-instance and readonly for the store's whole life, so a statement
+     * prepared once stays valid until close(). */
+    private releaseDecrement: ReturnType<SqliteDatabase["prepare"]> | null = null;
+    private releaseDelete: ReturnType<SqliteDatabase["prepare"]> | null = null;
 
     private constructor(db: SqliteDatabase, engine: SqliteEngineName, engineSource: SqliteEngineSource, lockPath: string | null, foreignLockHolder: { pid: number } | null, dbPath: string) {
         this.db = db;
@@ -800,16 +807,21 @@ export class UnifiedStore {
         // row in the same statement — orphans cannot structurally accumulate.
         // Re-putContent of the same bytes re-inserts cleanly (putContent is
         // upsert), so no correctness change, only no-leak.
-        this.db
-            .prepare(
+        if (this.releaseDecrement === null) {
+            this.releaseDecrement = this.db.prepare(
                 "UPDATE content SET refcount = refcount - 1 WHERE hash = ? AND refcount > 0 RETURNING refcount",
-            )
-            .all(hash)
-            .forEach((row) => {
-                if ((row as { refcount: number }).refcount <= 0) {
-                    this.db.prepare("DELETE FROM content WHERE hash = ? AND refcount <= 0").run(hash);
-                }
-            });
+            );
+        }
+        if (this.releaseDelete === null) {
+            this.releaseDelete = this.db.prepare("DELETE FROM content WHERE hash = ? AND refcount <= 0");
+        }
+        const decrement = this.releaseDecrement;
+        const remove = this.releaseDelete;
+        decrement.all(hash).forEach((row) => {
+            if ((row as { refcount: number }).refcount <= 0) {
+                remove.run(hash);
+            }
+        });
     }
 
     /** Ingests one session plan as a single transaction. Full path (no

@@ -576,7 +576,7 @@ Knobs people look for first:
 
 Using `bili pi` or the native pi plugin (`bili plugin install pi`) includes built-in subagent support, enabled by default: `acp_delegate`, `acp_delegate_wait`, and `acp_delegate_cancel`. This additional tool surface is specific to pi.
 
-**Keep only one subagent implementation enabled.** If you use the built-in support, remove or disable other pi subagent plugins (for example, `pi-subagents` or a separately installed `billion-context-pi-subagents`) in both user and project settings to avoid overlapping tools, prompts, or behavior. If you prefer another subagent plugin, disable the built-in support instead. A project-scope `pi-subagents` install makes the built-in delegate stand down by default, but a user-scope-only install does not; do not rely on that guard for every installation.
+**Keep only one subagent implementation enabled.** If you use the built-in support, remove or disable other pi subagent plugins (for example, `pi-subagents` or a separately installed `billion-context-pi-subagents`) in both user and project settings to avoid overlapping tools, prompts, or behavior. If you prefer another subagent plugin, disable the built-in support instead. A `pi-subagents` install at either scope (project or user) makes the built-in delegate stand down automatically by default — a user-scope install loads in every project, so the guard applies there too (#5637); set `delegate.forceEnable` to keep `acp_delegate` alongside it.
 
 To disable the built-in subagents while keeping context compression, merge this into `~/.config/billion-context/billion-context.json` (or the file selected by `BILI_CONFIG_FILE`), preserving your other settings:
 
