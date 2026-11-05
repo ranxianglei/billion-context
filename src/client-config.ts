@@ -2102,7 +2102,7 @@ export function readAiderConfig(env: NodeJS.ProcessEnv = process.env, cwd: strin
  *  launched client's own declarations are authoritative (#436: launching
  *  `bili omp` with omp's models.yml declaring 131072 must not be overridden by
  *  another client's larger declaration for the same model id). */
-type ModelWindowScope = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh" | "codebuddy" | "qoder" | "trae" | "jcode" | "kimi" | "gemini" | "iflow" | "qwen" | "antigravity" | "mcode" | "aider" | "copilot" | "amp" | "goose" | "crush" | "zed";
+type ModelWindowScope = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh" | "codebuddy" | "qoder" | "trae" | "jcode" | "kimi" | "gemini" | "iflow" | "qwen" | "antigravity" | "mcode" | "aider" | "copilot" | "amp" | "goose" | "crush" | "zed" | "kiro";
 
 /** Collect per-model context windows from client configs the launcher can
  *  read (pi models.json, omp models.yml, opencode opencode.json, codex

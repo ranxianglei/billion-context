@@ -248,7 +248,7 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
   });
   if (mediaExcluded.length > 0) {
     warnings.push(
-      `Excluded ${mediaExcluded.length} message(s) carrying unrecoverable media (remote URL / file references with no stored bytes) from compression range — folding would destroy them permanently (billion-context#1188/#2609). Inline images fold normally and stay restorable via decompress({ imageRef }).`,
+      `Excluded ${mediaExcluded.length} message(s) carrying unrecoverable media (no stored bytes and no re-access handle in the message) from compression range — folding would destroy them permanently (billion-context#1188/#2609). Ref-based media (remote URL / file id) folds normally since #5620 with its handle recorded in the summary; inline images fold normally too and stay restorable via decompress({ imageRef }).`,
     );
   }
 
@@ -407,10 +407,16 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
       foldedRef = new Set(effectiveMessageIds);
       for (const id of survivingCoverage) foldedRef.add(id);
     }
+    // #5531: fresh folds judge on their OWN ids alone, so the coverage of OTHER
+    // active blocks must arrive as the invisible set — a covered call is not
+    // kept-visible and cannot strand its turn's reasoning (#564 reverse-split
+    // residue, billion-context#5531). Merges already model post-fold coverage
+    // through foldedRef ∪ survivingCoverage and stay untouched.
     const initial = computeIntegrityWithdrawals(
       input.messages,
       foldedRef,
       shared?.integrityPre,
+      isMerge ? undefined : input.preExistingCoverage,
     );
     splitTurnCount = initial.splitTurnCount;
     splitPairCount = initial.splitPairCount;
