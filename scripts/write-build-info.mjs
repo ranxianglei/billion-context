@@ -33,4 +33,5 @@ const info = { commit: buildCommit() };
 const distDir = resolve(root, "dist");
 mkdirSync(distDir, { recursive: true });
 writeFileSync(resolve(distDir, "build-info.json"), `${JSON.stringify(info, null, 2)}\n`);
+writeFileSync(resolve(distDir, "agent/billion-context.js"), 'export { default } from "./pi-native.js";\n');
 console.log(`build-info: commit=${info.commit}`);
