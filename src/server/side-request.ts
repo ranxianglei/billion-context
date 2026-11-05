@@ -227,7 +227,7 @@ function carriesDurableState(text: string): boolean {
 /** #5687 follow-up (call-site narrowing): a utility sidecar pins a TINY fixed
  *  output budget (host presets: prompt-enhance 4096). Agent main turns either
  *  omit the field (openai wire) or size it from their conversation, so
- *  `isDshSingleSidecar` alone over-matches the FIRST unstyled main turn. */
+ *  `isDshSingleShotSidecar` alone over-matches the FIRST unstyled main turn. */
 const SINGLE_SHOT_SIDECAR_MAX_BUDGET = 8192;
 export function hasSingleShotBudget(parsed: unknown): boolean {
     if (!parsed || typeof parsed !== "object") return false;
@@ -235,7 +235,6 @@ export function hasSingleShotBudget(parsed: unknown): boolean {
     const budget = p.max_tokens ?? p.max_completion_tokens ?? p.max_output_tokens;
     return typeof budget === "number" && budget > 0 && budget <= SINGLE_SHOT_SIDECAR_MAX_BUDGET;
 }
-
 
 // #5656/#5584: dsh's per-feature sidecar pins above (title #2503, auto-review
 // #4438) are whack-a-mole — every NEW one-shot sidecar dsh ships around the
@@ -259,10 +258,12 @@ export function hasSingleShotBudget(parsed: unknown): boolean {
 // A non-empty system carrier is REQUIRED so the kernel's empty-instructions
 // path (aux calls riding the main session through the full pipeline, pinned in
 // tests/dsh-persona-fingerprint.test.ts phase 6) keeps its contract.
-// Residual, accepted: a tool-less MAIN turn 1 matches the single-shot shape and
-// rides the verbatim side lane for that one turn (tiny — nothing to compress);
-// turn 2+ replays history and rejoins the full pipeline. The caller must gate
-// on the dsh lane (evidence-per-client discipline, cf. isDshTitleRequest).
+// Residual, accepted (narrowed by #5687 follow-up): a tool-less MAIN turn 1
+// that ALSO passes the call-site budget screen (small pinned output,
+// hasSingleShotBudget) and carries no durable-state marker still rides the
+// verbatim side lane for that one turn; turn 2+ replays history and rejoins
+// the full pipeline. The caller must gate on the dsh lane
+// (evidence-per-client discipline, cf. isDshTitleRequest).
 export function isDshSingleShotSidecar(protocol: string | null, parsed: unknown): boolean {
     if (protocol === null || !parsed || typeof parsed !== "object") return false;
     const p = parsed as Record<string, unknown>;
