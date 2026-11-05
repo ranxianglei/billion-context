@@ -133,6 +133,34 @@ test("unwrap rejects: non-streaming, missing model, non-text part, unknown role,
     assert.equal(unwrapTraeBody(body({ messages: [] })), undefined);
 });
 
+test("rewrap: pipeline cache directives survive the round trip (#5713)", () => {
+    const unwrapped = unwrapTraeBody(body());
+    assert.ok(unwrapped);
+    // prepare-openai stamps the session id into prompt_cache_key and forces
+    // usage reporting onto the flat body after the unwrap.
+    const back = rewrapTraeBody({
+        model: "m",
+        messages: [{ role: "user", content: "hi" }],
+        prompt_cache_key: "ses_abc123",
+        stream_options: { include_usage: true },
+    }, unwrapped.meta);
+    assert.equal(back.prompt_cache_key, "ses_abc123");
+    assert.deepEqual(back.stream_options, { include_usage: true });
+});
+
+test("unwrap carries client cache directives; rewrap honors a pipeline drop (#5713)", () => {
+    const src = body({ prompt_cache_key: "client-key", stream_options: { include_usage: false } });
+    const unwrapped = unwrapTraeBody(src);
+    assert.ok(unwrapped);
+    assert.equal(unwrapped.body.prompt_cache_key, "client-key");
+    assert.deepEqual(unwrapped.body.stream_options, { include_usage: false });
+    // The pipeline dropped both (ablated upstream / routing decision): they must
+    // not resurface from the replayed envelope base.
+    const back = rewrapTraeBody({ model: "m", messages: [{ role: "user", content: "hi" }] }, unwrapped.meta);
+    assert.equal("prompt_cache_key" in back, false);
+    assert.equal("stream_options" in back, false);
+});
+
 test("rewrap degrades an unknown role to user text instead of dropping content", () => {
     const src = body();
     const unwrapped = unwrapTraeBody(src);

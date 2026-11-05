@@ -4,7 +4,7 @@
 // openai adapter's request building because the loop always speaks flat
 // OpenAI internally, then restores the envelope at the wire boundary.
 
-import { createOpenaiAdapter } from "./adapter-openai.js";
+import { createOpenaiAdapter, openaiCachedTokens } from "./adapter-openai.js";
 import { buildVisibilityMarker } from "./core.js";
 import { composeStreamFilters, createMarkerLineFilter, createTagEchoFilter } from "./tag-echo-filter.js";
 import { degenerateTurnWarning } from "../degenerate-turn.js";
@@ -199,12 +199,14 @@ export function createTraeAdapter(
                 }
                 if (frame.event === "token_usage") {
                     // WC-12f: the *_total fields are always 0 upstream; only the
-                    // per-request counters carry meaning.
+                    // per-request counters carry meaning. Cached tokens read the
+                    // openai-vocabulary fields first (the frame may gain them,
+                    // #5713), with this wire's native counter as the last rung.
                     yield {
                         kind: "usage",
                         inputTokens: typeof ev.prompt_tokens === "number" ? ev.prompt_tokens : undefined,
                         outputTokens: typeof ev.completion_tokens === "number" ? ev.completion_tokens : undefined,
-                        cachedTokens: typeof ev.cache_read_input_tokens === "number" ? ev.cache_read_input_tokens : undefined,
+                        cachedTokens: openaiCachedTokens(ev) ?? (typeof ev.cache_read_input_tokens === "number" ? ev.cache_read_input_tokens : undefined),
                     } as ParsedStreamEvent;
                     continue;
                 }

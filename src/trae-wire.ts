@@ -160,6 +160,13 @@ export function unwrapTraeBody(parsed: Record<string, unknown>): { body: Record<
     if (parsed.stop !== undefined) body.stop = parsed.stop;
     if (typeof parsed.reasoning_effort === "string") body.reasoning_effort = parsed.reasoning_effort;
     if (typeof parsed.parallel_tool_calls === "boolean") body.parallel_tool_calls = parsed.parallel_tool_calls;
+    // Cache directives (#5713): carry them into the flat body so the pipeline
+    // sees and decides on them exactly like every other openai lane — the
+    // client's own prompt_cache_key drives the keep/drop/stamp decision and
+    // stream_options carries usage reporting. Rewrap plays the decided values
+    // back at the forward boundary.
+    if (parsed.prompt_cache_key !== undefined) body.prompt_cache_key = parsed.prompt_cache_key;
+    if (isObj(parsed.stream_options)) body.stream_options = parsed.stream_options;
     body.stream = true;
 
     return { body, meta: { envelope: { ...parsed } } };
@@ -220,6 +227,12 @@ export function rewrapTraeBody(flat: Record<string, unknown>, meta: TraeEnvelope
     if (flat.stop !== undefined) body.stop = flat.stop;
     if (typeof flat.reasoning_effort === "string") body.reasoning_effort = flat.reasoning_effort;
     if (typeof flat.parallel_tool_calls === "boolean") body.parallel_tool_calls = flat.parallel_tool_calls;
+    // Cache directives (#5713): present in the decided flat body → write back;
+    // absent → the pipeline dropped them (ablated upstream / routing decision),
+    // remove from the replayed envelope so a client-sent key never survives a
+    // drop decision via the envelope base.
+    if (flat.prompt_cache_key !== undefined) body.prompt_cache_key = flat.prompt_cache_key; else delete body.prompt_cache_key;
+    if (flat.stream_options !== undefined) body.stream_options = flat.stream_options; else delete body.stream_options;
     body.stream = true;
     return body;
 }

@@ -38,6 +38,24 @@ test("parseStream: output/token_usage/done map to text/usage/done", async () => 
     assert.ok(!field<boolean>(events[6], "suppressCompletion"));
 });
 
+test("parseStream: token_usage cached tokens follow the openai-vocabulary ladder (#5713)", async () => {
+    const usage = (payload: Record<string, unknown>) =>
+        collect(1, frame("token_usage", payload) + frame("done", { finish_reason: "stop" }))
+            .then((events) => events.find((e) => e.kind === "usage"));
+
+    const fromDetails = await usage({ prompt_tokens: 100, completion_tokens: 5, prompt_tokens_details: { cached_tokens: 80 }, cache_read_input_tokens: 0 });
+    assert.deepEqual(fromDetails, { kind: "usage", inputTokens: 100, outputTokens: 5, cachedTokens: 80 });
+
+    const fromDeepSeek = await usage({ prompt_tokens: 100, completion_tokens: 5, prompt_cache_hit_tokens: 60 });
+    assert.equal(field<number | undefined>(fromDeepSeek!, "cachedTokens"), 60);
+
+    const fromNative = await usage({ prompt_tokens: 100, completion_tokens: 5, cache_read_input_tokens: 40 });
+    assert.equal(field<number | undefined>(fromNative!, "cachedTokens"), 40);
+
+    const absent = await usage({ prompt_tokens: 100, completion_tokens: 5 });
+    assert.equal(field<number | undefined>(absent!, "cachedTokens"), undefined);
+});
+
 test("parseStream: provider frames ride through in round 1 only", async () => {
     const body = [
         frame("metadata", { session_id: "s1" }),
