@@ -1293,6 +1293,17 @@ export class UnifiedStore {
             // first ingest of a 3k-message session costs ~20 statements,
             // not 3001; the compaction storm that motivated the old
             // replace-all now costs the same bounded batch budget).
+            //
+            // Load-bearing precondition (guaranteed by the producers, not
+            // checked here): a surviving raw_id's ord never INCREASES between
+            // saves — appends take higher ords, and the only renumberers
+            // (native-compaction archive #395 and zombie reap #2695, both via
+            // pruneRefsToLiveIds) preserve survivor key order and only drop
+            // ids. The incremental upsert depends on that: a new ord crossing a
+            // still-live neighbour's ord violates the (session_id, ord) PK
+            // mid-batch and rolls the whole ingest back. If a future producer
+            // can reorder survivors upward, add a delete-all fallback around
+            // the write phase below.
             const oldRefs = new Map<string, { ord: number; ref: string; refNum: number | null }>();
             for (const row of this.db
                 .prepare("SELECT raw_id, ord, ref, ref_num FROM refs WHERE session_id = ?")
@@ -1311,7 +1322,7 @@ export class UnifiedStore {
             }
             for (const rawId of oldRefs.keys()) goneRefIds.push(rawId);
             if (goneRefIds.length > 0) {
-                const perChunk = Math.floor((REF_STMT_MAX_PARAMS - 1) / 1);
+                const perChunk = REF_STMT_MAX_PARAMS - 1; // reserve the leading session_id slot
                 for (let i = 0; i < goneRefIds.length; i += perChunk) {
                     const ids = goneRefIds.slice(i, i + perChunk);
                     this.db
