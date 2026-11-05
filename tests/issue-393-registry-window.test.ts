@@ -226,7 +226,7 @@ test("#393: wire mode (no x-bili-plugin) also records effectiveContextLimit", as
 
 // --- Fix 6 (integration): /models is a known discovery path ---
 
-test("#393: GET /models does not log an unrecognized-path warn (control: unknown path does)", async () => {
+test("#393: GET /models does not log an unrecognized-path warn (control: model-call to unknown path does)", async () => {
     const rig = await startRig(500, true); // log on so the warn path is observable
     const captured: string[] = [];
     setLogCapture((level, msg) => { captured.push(`${level}:${msg}`); });
@@ -235,9 +235,28 @@ test("#393: GET /models does not log an unrecognized-path warn (control: unknown
         await r1.text();
         assert.equal(captured.filter((l) => l.includes("unrecognized path")).length, 0, "/models is a known discovery path");
 
-        const r2 = await fetch(`http://127.0.0.1:${rig.proxyPort}/totally-unknown-xyz`, { method: "GET" });
+        // #5764: the counter now fires ONLY for model-call-shaped requests (POST +
+        // body). A GET to an unknown path is a probe/enumeration — an expected
+        // passthrough, never going to be compressed — so it must NOT log. This was
+        // the headline false positive (HEAD/GET to known endpoints flagged "not a
+        // known protocol").
+        const rProbe = await fetch(`http://127.0.0.1:${rig.proxyPort}/totally-unknown-xyz`, { method: "GET" });
+        await rProbe.text();
+        assert.equal(
+            captured.filter((l) => l.includes("unrecognized path") && l.includes("totally-unknown-xyz")).length,
+            0,
+            "#5764: non-POST probe to an unknown path is not an unrecognized protocol",
+        );
+
+        // Control preserved from #393: a genuinely unknown path still signals — but
+        // now only when the request looks like a model call (POST with a body).
+        const r2 = await fetch(`http://127.0.0.1:${rig.proxyPort}/totally-unknown-xyz`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ foo: "bar" }),
+        });
         await r2.text();
-        assert.ok(captured.some((l) => l.includes("unrecognized path") && l.includes("totally-unknown-xyz")), "unknown path still warns (control)");
+        assert.ok(captured.some((l) => l.includes("unrecognized path") && l.includes("totally-unknown-xyz")), "model-call to unknown path still warns (control)");
     } finally {
         setLogCapture(null);
         await closeRig(rig);
