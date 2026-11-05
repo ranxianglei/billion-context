@@ -121,6 +121,7 @@ export function formatRanges(
     textPct: number;
     dangerous: boolean;
     noMergeBefore: boolean;
+    crossesCoveredBy: string[];
   }
   const refNum = (ref: string): number => {
     const m = ref.match(/\d+/);
@@ -147,6 +148,7 @@ export function formatRanges(
       protectedTools: [],
       dangerous: r.dangerous ?? false,
       noMergeBefore: r.noMergeBefore ?? false,
+      crossesCoveredBy: r.crossesCoveredBy ?? [],
     });
   }
   for (const r of protectedRanges) {
@@ -169,6 +171,7 @@ export function formatRanges(
       protectedTools: [...r.tools],
       dangerous: false,
       noMergeBefore: r.noMergeBefore ?? false,
+      crossesCoveredBy: [],
     });
   }
   // Order/merge by POSITION, never ref number: refs can be non-monotonic vs array
@@ -196,6 +199,9 @@ export function formatRanges(
       for (const t of e.protectedTools) {
         if (!last.protectedTools.includes(t)) last.protectedTools.push(t);
       }
+      for (const b of e.crossesCoveredBy) {
+        if (!last.crossesCoveredBy.includes(b)) last.crossesCoveredBy.push(b);
+      }
     } else {
       merged.push({ ...e });
     }
@@ -211,13 +217,19 @@ export function formatRanges(
       e.dangerous && e.compressibleTokens > 0
         ? "  ⚠️ NOT recommended unless you are certain."
         : "";
+    // #5667 B: the label bridges an already-folded interior — say so so the
+    // model does not re-submit the covered span as new content (#5508 family).
+    const spanNote =
+      e.crossesCoveredBy.length > 0
+        ? ` · spans folded ${e.crossesCoveredBy.join(", ")}`
+        : "";
     if (e.protectedTokens > 0 && e.compressibleTokens === 0) {
-      return `  ${lo}–${hi}  ${e.count} msgs  ${formatK(e.tokens)} [PROTECTED: ${e.protectedTools.join(", ")} — not compressible]${suffix}`;
+      return `  ${lo}–${hi}  ${e.count} msgs  ${formatK(e.tokens)} [PROTECTED: ${e.protectedTools.join(", ")} — not compressible]${spanNote}${suffix}`;
     }
     if (e.protectedTokens > 0 && e.compressibleTokens > 0) {
-      return `  ${lo}–${hi}  ${e.count} msgs  ${formatK(e.tokens)} [${formatK(e.compressibleTokens)} compressible | ${formatK(e.protectedTokens)} protected: ${e.protectedTools.join(", ")}]${userNote(e.userMsgs)}${suffix}`;
+      return `  ${lo}–${hi}  ${e.count} msgs  ${formatK(e.tokens)} [${formatK(e.compressibleTokens)} compressible | ${formatK(e.protectedTokens)} protected: ${e.protectedTools.join(", ")}]${userNote(e.userMsgs)}${spanNote}${suffix}`;
     }
-    return `  ${lo}–${hi}  ${e.count} msgs  ${formatK(e.tokens)} [tool ${e.toolPct}% | text ${e.textPct}%]${userNote(e.userMsgs)}${suffix}`;
+    return `  ${lo}–${hi}  ${e.count} msgs  ${formatK(e.tokens)} [tool ${e.toolPct}% | text ${e.textPct}%]${userNote(e.userMsgs)}${spanNote}${suffix}`;
   });
   return `Compressible ranges (${merged.length}, oldest first):\n${lines.join("\n")}`;
 }
