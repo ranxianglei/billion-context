@@ -318,7 +318,7 @@ async function handleRequest(
      *  there so config resolves identically across all request forms. */
     let providerDestUrl: string;
     let protocol: WireProtocol | null;
-    /** #5764: snapshot of "does this destination name a known protocol" captured
+    /** #5763: snapshot of "does this destination name a known protocol" captured
      *  BEFORE the decode step below can null `protocol`. The unrecognized-path gate
      *  (near the forward fallback) keys off this, not off `protocol`, so a decode
      *  failure on a KNOWN path is not misreported as an unknown destination. */
@@ -3018,7 +3018,7 @@ async function handleRequest(
         }
     }
     if (!prepared && !forwarded) {
-        // #5764: an "unrecognized path" is a MODEL-CALL-shaped request (POST with a
+        // #5763: an "unrecognized path" is a MODEL-CALL-shaped request (POST with a
         // body) that reached a destination naming no known protocol — NOT any request
         // that happened not to be compressed. The old `protocol === null` gate conflated
         // three unrelated states into one counter: (1) non-POST probes/scans/enumeration
