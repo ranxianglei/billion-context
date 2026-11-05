@@ -141,6 +141,13 @@ test("claudeSubagentAgentId: two-signal discrimination (headers + main system pr
     assert.equal(claudeSubagentAgentId({ "x-claude-code-agent-id": "a47c8f3e8bac7386b" }, MAIN_PRINT_SYSTEM), undefined, "-p main turn (agent-id present, interactive system block) must not split");
     assert.equal(claudeSubagentAgentId({ "x-claude-code-agent-id": "a47c8f3e8bac7386b" }, MAIN_INTERACTIVE_SYSTEM), undefined, "interactive main turn must not split even with agent-id");
     assert.equal(claudeSubagentAgentId({ "x-claude-code-agent-id": "a47c8f3e8bac7386b" }, CLAUDE_CODE_SDK_MAIN_SYSTEM), undefined, "SDK main turn (agent-id present, working with user toward goals) must not split");
+    assert.equal(
+        claudeSubagentAgentId({ "x-claude-code-agent-id": "a47c8f3e8bac7386b" }, ["You are Claude Code, Anthropic's official CLI for Claude. Per project notes the user may be running within the Claude Agent SDK."]),
+        undefined,
+        "an interactive main block that merely MENTIONS 'running within the Claude Agent SDK' later in its text must not split (exact-banner exclusion, not substring)",
+    );
+    assert.equal(claudeSubagentAgentId(subagentHeaders, [CLAUDE_CODE_SDK_SUB_SYSTEM[0]]), SUB_AGENT, "the SDK harness banner alone carries no main evidence (single-block SDK subagent splits)");
+    assert.equal(claudeSubagentAgentId({ "x-claude-code-parent-agent-id": "a47c8f3e8bac7386b" }, CLAUDE_CODE_SDK_SUB_SYSTEM), "a47c8f3e8bac7386b", "SDK subagent with parent header only falls back to the parent id");
     assert.equal(claudeSubagentAgentId(sessionHeaders, MAIN_INTERACTIVE_SYSTEM), undefined, "no agent headers must not split");
     assert.equal(claudeSubagentAgentId(subagentHeaders, []), SUB_AGENT, "no system at all but agent headers present splits (header-only fallback)");
     assert.equal(claudeSubagentAgentId({ "x-claude-code-agent-id": "  ", "x-claude-code-parent-agent-id": "p" }, EXPLORE_SUB_SYSTEM), "p", "blank agent id falls back to the parent id");

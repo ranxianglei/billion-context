@@ -513,15 +513,21 @@ export function codexTurnIdentity(headers: Record<string, string | string[] | un
  *    the parent header is NOT reliable (general-purpose `-p` subagents send
  *    it, custom agent types like Explore do not).
  *
- * 2. SYSTEM: the MAIN agent's system always contains a block identifying
- *    it as the interactive main session ("You are an interactive agent…",
- *    "You are an agent working with the user toward their goals…", or the
- *    legacy standalone "You are Claude Code, Anthropic's official CLI for Claude."
- *    without SDK subagent markers), while a subagent's system blocks are its
- *    agent definition ("This session is a background job…", "You are an agent
- *    for Claude Code…", "You are a file search specialist for…", …) — no
- *    stable positive marker exists across agent types, so the check is
- *    negative: none of the main prefixes may match.
+ * 2. SYSTEM: the MAIN agent's system always contains a block starting with
+ *    one of the MAIN_SYSTEM_PREFIXES ("You are Claude Code…" for interactive
+ *    CLI sessions, "You are an interactive agent…" for -p sessions, "You are
+ *    an agent working with the user toward their goals…" for Claude Agent SDK
+ *    main sessions), while a subagent's system blocks are its agent
+ *    definition ("This session is a background job…", "You are an agent for
+ *    Claude Code…", "You are a file search specialist for…", …) — no stable
+ *    positive marker exists across agent types, so the check is negative:
+ *    none of the main prefixes may match. Since Claude Code 2.1.308+ every
+ *    Agent SDK turn (main AND subagent) leads with the shared harness banner
+ *    CLAUDE_SDK_HARNESS_BANNER (#5724); it carries no classification signal
+ *    and is skipped before the prefix scan. It is matched by exact prefix,
+ *    not substring: a reworded banner then counts as "You are Claude Code"
+ *    and subagents stop splitting (pre-SDK serial behavior) instead of a
+ *    main session whose text merely mentions the phrase being mis-split.
  *
  * A request splits only when BOTH signals say subagent (header present AND
  * no main prefix in system). Failure modes degrade in the safe direction:
@@ -538,9 +544,17 @@ export function codexTurnIdentity(headers: Record<string, string | string[] | un
  * agents, curl) are untouched.
  */
 const MAIN_SYSTEM_PREFIXES = [
+    "You are Claude Code",
     "You are an interactive agent",
     "You are an agent working with the user toward their goals",
 ] as const;
+
+// Claude Code 2.1.308+ / Claude Agent SDK harness banner, present as a
+// leading system block on EVERY SDK turn (main and subagent alike) — shared
+// state, no classification signal (#5724). Exact prefix on purpose: if the
+// banner is reworded it degrades to counting as "You are Claude Code" (main
+// evidence → subagents stop splitting), never to mis-splitting a main turn.
+const CLAUDE_SDK_HARNESS_BANNER = "You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK";
 
 export function claudeSubagentAgentId(
     headers: Record<string, string | string[] | undefined>,
@@ -556,12 +570,8 @@ export function claudeSubagentAgentId(
     if (agentId === undefined && parentId === undefined) return undefined;
     const isMain = systemBlocks.some((block) => {
         const t = block.trimStart();
-        if (MAIN_SYSTEM_PREFIXES.some((p) => t.startsWith(p))) return true;
-        // Claude Code CLI interactive header: "You are Claude Code, Anthropic's official CLI for Claude."
-        // In Claude Code 2.1.308+, SDK subagents also start with "You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK."
-        // Exclude SDK subagent header from treating the turn as main.
-        if (t.startsWith("You are Claude Code") && !t.includes("running within the Claude Agent SDK")) return true;
-        return false;
+        if (t.startsWith(CLAUDE_SDK_HARNESS_BANNER)) return false;
+        return MAIN_SYSTEM_PREFIXES.some((p) => t.startsWith(p));
     });
     if (isMain) return undefined;
     return agentId ?? parentId;
