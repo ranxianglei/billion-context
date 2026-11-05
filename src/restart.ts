@@ -60,6 +60,7 @@ import { flushAllSessions, totalInFlight } from "./session.js";
 import { flushConversations } from "./plugin.js";
 import { flushPrefixAffinity } from "./affinity-persist.js";
 import { flushOrderSkeletons } from "./order-persist.js";
+import { flushResignPending } from "./apig-resign.js";
 import { findInstallDir, isVersionNewer, verifyInstallLoadable } from "./update.js";
 import { isPidAlive, listInstances } from "./instance.js";
 import { UPGRADE_REPLACEMENT_ENV } from "./listen-policy.js";
@@ -452,20 +453,25 @@ function resumeListening(server: http.Server, host: string, port: number, log: L
  *  what the normal shutdown path persists (conversations + sessions +
  *  prefix-affinity + session-order skeletons #3397). */
 async function defaultPreSpawnFlush(): Promise<void> {
-    flushConversations();
+    // #5753: conversations/affinity/order now ride sqlite — settle their
+    // queued writes (not just enqueue them) before the replacement boots.
+    await flushConversations();
     await flushAllSessions();
-    flushPrefixAffinity();
-    flushOrderSkeletons();
+    await flushPrefixAffinity();
+    await flushOrderSkeletons();
+    await flushResignPending();
 }
 
 function defaultFinish(): void {
-    flushConversations();
-    flushPrefixAffinity();
-    flushOrderSkeletons();
-    void flushAllSessions().finally(() => {
+    void (async () => {
+        await flushConversations();
+        await flushPrefixAffinity();
+        await flushOrderSkeletons();
+        await flushResignPending();
+        await flushAllSessions();
         closeLogger();
         process.exit(0);
-    });
+    })();
 }
 
 type StaleInstallInfo = { diskVersion: string; runningVersion: string };

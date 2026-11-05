@@ -88,7 +88,7 @@ import { extractBillingAttributionBlock, extractSummaryFromSse, preflightCompres
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, DEFAULT_DECIDE_MAX_TOKENS, DECIDE_TIMEOUT_MS, extractDecisionText, ladderMode, parseDecision, recordDecision, resolveDecisionRange, type DecideConfig, type DecisionOutcome } from "./nudge-decide.js";
 import { gcConfigFromEnv, gcSessionFiles } from "./session-gc.js";
 import { countImagesInParsedBody, countImagesInRawBody, imageTokensInRawBody, imageTokensInParsedBody, resolveImageBilling, upstreamHost, type ResolvedImageBilling } from "./image-tokens.js";
-import { APIG_RESIGN_HEADER, APIG_RESIGN_CREDENTIAL_HEADER, APIG_RESIGN_SCHEME, KNOWN_SIGNATURE_SCHEMES, clearSignedRefusal, decodeApigCredential, inboundSignedScheme, readPendingRefusals, recordSignedRefusal, resignApig, signedRefusal, unresolvedRefusals, type ApigCredential } from "./apig-resign.js";
+import { APIG_RESIGN_HEADER, APIG_RESIGN_CREDENTIAL_HEADER, APIG_RESIGN_SCHEME, KNOWN_SIGNATURE_SCHEMES, clearSignedRefusal, decodeApigCredential, flushResignPending, inboundSignedScheme, readPendingRefusals, recordSignedRefusal, resignApig, signedRefusal, unresolvedRefusals, type ApigCredential } from "./apig-resign.js";
 import { renderUI, handleConfigGet, handleConfigPut, handleSummaryCredentialPut, buildOverview, buildSessionList, buildSessionPage, buildSessionDetail, hiddenEmptyCount } from "./web/index.js";
 import { reapOrphanBlocks } from "./orphan-gc.js";
 import { conflictScanEnabled, isDesignBenign, scanClientPlugins, sniffScanClient } from "./thirdparty-scan.js";
@@ -119,7 +119,7 @@ import { maybeAdoptForkBlocks, maybeAdoptResume, reconcileDerivedLineage } from 
 import { flushPrefixAffinity, hydratePrefixAffinity, scheduleAffinityPersist } from "./affinity-persist.js";
 import { flushOrderSkeletons, hydrateOrderSkeletons } from "./order-persist.js";
 import { setSimhashAdoptionEnabled } from "./prefix-affinity.js";
-import { consumePluginRegisterFor, flushConversations, handlePluginCompact, handlePluginManifest, handlePluginFork, handlePluginSnapshot, handlePluginRegister, handlePluginRuntimeInfo, handlePluginStatus, handlePluginTool, isPluginFoldCallId, loadConversations, pluginAgentHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginReportedContextWindow, pluginReportedMaxOutput, pluginRequestAgentHeader, pluginRuntimeInfoFor, pluginRuntimeInfoForConversation, recordChainVerdict, recordPluginSession, rememberPluginMessages, resolveConversation, runtimeConversationId, takePendingPluginRegister } from "./plugin.js";
+import { consumePluginRegisterFor, flushConversations, handlePluginCompact, handlePluginManifest, handlePluginFork, handlePluginSnapshot, handlePluginRegister, handlePluginRuntimeInfo, handlePluginStatus, handlePluginTool, isPluginFoldCallId, loadConversations, hydratePluginConversationsUnified, pluginAgentHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginReportedContextWindow, pluginReportedMaxOutput, pluginRequestAgentHeader, pluginRuntimeInfoFor, pluginRuntimeInfoForConversation, recordChainVerdict, recordPluginSession, rememberPluginMessages, resolveConversation, runtimeConversationId, takePendingPluginRegister } from "./plugin.js";
 import { setupMitm, readMitmUpstream, getBlindTunnelStats, liveBlindTunnels, MITM_RAW_SOCKET_KEY } from "./mitm.js";
 import { evaluateChain, extractChainCarriers, stripEmbeddedChainCarriers } from "./chain-checkpoint.js";
 import type { BiliMessage } from "acp-kernel/wire";
@@ -569,6 +569,9 @@ export async function createEngineContext(opts: ProxyOptions): Promise<EngineCon
         process.exit(1);
     }
     loadConversations();
+    // #5753: layer the sqlite routing-table row over the file view and migrate
+    // any file-only routes one time (needs initSessions' store to be live).
+    void hydratePluginConversationsUnified();
     log("info", `[persist] ${getStore().enabled ? "enabled" : "disabled"}`);
     // #2807: restore fork lineage that a restart orphaned. Every fork writes
     // metadata.derivedFromSessionId, but both adoption paths read process-local
@@ -1519,11 +1522,12 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
                     log("error", `listen failed: ${outcome.message}`);
                     shuttingDown = true;
                     server.close();
-                    flushConversations();
-                    void flushAllSessions().finally(() => {
+                    void (async () => {
+                        await flushConversations();
+                        await flushAllSessions();
                         closeLogger();
                         process.exit(1);
-                    });
+                    })();
                     return;
                 }
             }
@@ -1657,22 +1661,24 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
             }
             shuttingDown = true;
             server.close();
-            flushConversations();
-            void flushAllSessions().finally(() => {
+            void (async () => {
+                await flushConversations();
+                await flushAllSessions();
                 closeLogger();
                 process.exit(eaddrinuseExitCode(busyReason));
-            });
+            })();
         } catch (e) {
             // The listen already failed; a crash here must still end the process
             // cleanly instead of leaving a dead listener running.
             log("error", `listen-error handling crashed: ${String(e)}`);
             shuttingDown = true;
             server.close();
-            flushConversations();
-            void flushAllSessions().finally(() => {
+            void (async () => {
+                await flushConversations();
+                await flushAllSessions();
                 closeLogger();
                 process.exit(1);
-            });
+            })();
         }
     };
     // Catch stray rejections/throws from background work (compress loops,
@@ -1714,17 +1720,25 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // debounced writes keep disk within ~500ms of in-memory state.
     let shuttingDown = false;
     const finishShutdown = (): void => {
-        flushPrefixAffinity();
-        flushOrderSkeletons();
-        servedWriter?.dispose();
-        clearProxyInstanceFile(instanceId);
-        unregisterInstance(instanceId);
-        closeLogger();
-        process.exit(0);
+        void (async () => {
+            // #5753: affinity/order now settle into sqlite — await their queued
+            // writes so a graceful exit loses nothing recorded this run.
+            await flushPrefixAffinity();
+            await flushOrderSkeletons();
+            await flushResignPending();
+            servedWriter?.dispose();
+            clearProxyInstanceFile(instanceId);
+            unregisterInstance(instanceId);
+            closeLogger();
+            process.exit(0);
+        })();
     };
     const finishDrain = (): void => {
-        flushConversations();
-        void flushAllSessions().finally(finishShutdown);
+        void (async () => {
+            await flushConversations();
+            await flushAllSessions();
+            finishShutdown();
+        })();
     };
     const shutdown = (sig: string) => {
         if (shuttingDown) return;
