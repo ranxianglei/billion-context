@@ -3532,6 +3532,272 @@ export async function pipePluginJsonlWithStrip(
     }
 }
 
+/** #1295: plugin-mode passthrough for the Trae SOLO SSE dialect (WC-12c). The
+ *  frames are `event:<name>` + `data:<json>` with NO space after the colon, and the
+ *  `done` frame — not `[DONE]` — terminates the turn. Running this wire through
+ *  `pipePluginChatWithStrip` leaves `sawTerminal` false at EOF: that pipe recognizes
+ *  only a quoted `finish_reason` chunk or the `[DONE]` sentinel, neither of which
+ *  trae emits, so a CLEAN trae turn ends up reported as `upstream stream truncated
+ *  (openai)` and the client is handed a synthesized in-band error AFTER a
+ *  complete answer (observed 144× on the live seat, every one behind a forward
+ *  to `/api/agent/v3/llm_utils_chat`).
+ *
+ *  Frames are forwarded byte-verbatim — the agent's native tool loop must see
+ *  `tool_calls` fragments untouched (#1039) — while the two prose fields
+ *  (`response` / `reasoning_content`) run through the tag-echo state machine
+ *  (parity with the proxy-lane adapter, #206/#717/#2190) and the `token_usage`
+ *  frame feeds lastInputTokens so compression keeps tracking reality. */
+export async function pipePluginTraeWithStrip(
+    stream: ReadableStream<Uint8Array>,
+    res: ServerResponse,
+    session?: Session,
+    log?: (msg: string) => void,
+    upstreamOrigin?: string,
+): Promise<void> {
+    const reader = stream.getReader();
+    const decoder = new TextDecoder("utf-8");
+    let buf = "";
+    // One filter per prose field: `response` is the visible answer,
+    // `reasoning_content` the thought. Separate instances keep a held partial-tag
+    // tail in one field from swallowing the other's bytes.
+    const onTagDrop = (snippet: string) => {
+        loggerLog("warn", `[tag-echo] stripped model-emitted render tag (trae plugin mode): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+        log?.(`[tag-echo] stripped model-emitted render tag: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+    };
+    const proseFilter = composeStreamFilters(createTagEchoFilter(onTagDrop), createMarkerLineFilter());
+    const reasoningFilter = createTagEchoFilter(onTagDrop);
+    let sawTerminal = false;
+    let finalFinishReason: string | undefined;
+    let visibleTextChars = 0;
+    let sawThinking = false;
+    let sawToolCall = false;
+    let diagBytes = 0;
+    let diagEvents = 0;
+    let diagUnparseable = 0;
+    const diagLastTypes: string[] = [];
+    const diagPushType = (label: string) => {
+        diagLastTypes.push(label);
+        if (diagLastTypes.length > 5) diagLastTypes.shift();
+    };
+    const acc: UsageSample = {};
+    const settleUsage = () => {
+        if (session && (acc.inputTokens !== undefined || acc.outputTokens !== undefined || acc.cachedTokens !== undefined || acc.creationTokens !== undefined)) {
+            // trae reports OpenAI-inclusive totals (prompt_tokens already counts
+            // the cached segment), so the openai protocol label is correct.
+            applyUsageSample(session, acc, "openai", upstreamOrigin);
+            markDirty(session);
+        }
+    };
+    const write = async (s: string) => {
+        if (res.destroyed || res.writableEnded) return;
+        if (!res.write(Buffer.from(s, "utf8"))) await awaitDrain(res);
+    };
+    /** Held tails ride their own `output` frame ahead of the terminal: a tag split
+     *  across pushes must not be swallowed when the turn ends. */
+    const flushTails = (): string => {
+        const prose = proseFilter.flush();
+        const thought = reasoningFilter.flush();
+        if (prose.length === 0 && thought.length === 0) return "";
+        return traeFrameBuf("output", {
+            response: prose,
+            reasoning_content: thought.length > 0 ? thought : null,
+            tool_calls: null,
+            multimodal_contents: null,
+            phase: null,
+        });
+    };
+    const buildDiag = (cause: "eof" | "read-error"): TruncationDiag => ({
+        cause,
+        classification: /^event:done/.test(buf.slice(0, 64)) ? "terminal-bytes-unrecognized" : "no-terminal-seen",
+        protocol: "trae",
+        events: diagEvents,
+        unparseableForwarded: diagUnparseable,
+        bytes: diagBytes,
+        lastEventTypes: [...diagLastTypes],
+        eofBufferBytes: buf.length,
+        ...(buf.length > 0 ? { eofBufferHead: buf.slice(0, 80).replace(/[\r\n]+/g, " ") } : {}),
+        ...(finalFinishReason !== undefined ? { finishReason: finalFinishReason } : {}),
+        visibleChars: visibleTextChars,
+        sawStrippedEcho: proseFilter.stats().dropped || reasoningFilter.stats().dropped,
+        retryZeroByteCutSpent: false,
+        retryDegenerateSpent: false,
+    });
+    const maybeWarnDegenerate = () => {
+        if (!sawTerminal || res.destroyed || res.writableEnded) return;
+        const st = proseFilter.stats();
+        const msg = degenerateTurnWarning({
+            reason: finalFinishReason,
+            terminalReason: "stop",
+            toolCalls: sawToolCall ? 1 : 0,
+            text: { inputChars: st.inputChars, outputChars: visibleTextChars, dropped: st.dropped, dropCount: st.dropCount },
+            sawThinking,
+            wire: "plugin-passthrough-trae",
+        });
+        if (msg) {
+            loggerLog("warn", msg);
+            log?.(msg);
+        }
+    };
+
+    const consume = async (text: string): Promise<void> => {
+        buf = normalizeSseLineEndings(buf + text);
+        let idx: number;
+        while ((idx = buf.indexOf("\n\n")) !== -1) {
+            const rawEvent = buf.slice(0, idx);
+            buf = buf.slice(idx + 2);
+            // The wire's frame name lives on its own `event:` line — with no
+            // space after the colon, unlike the OpenAI SSE this pipe's sibling
+            // handles. Keep the raw block intact for the verbatim passes.
+            let eventName = "";
+            const dataLines: string[] = [];
+            for (const l of rawEvent.split("\n")) {
+                if (l.startsWith("event:")) eventName = l.slice(6).trim();
+                else if (l.startsWith("data:")) dataLines.push(l.slice(5).replace(/^ /, ""));
+            }
+            if (dataLines.length === 0) {
+                diagEvents++;
+                diagPushType(eventName.length > 0 ? eventName : "frame");
+                await write(rawEvent + "\n\n");
+                continue;
+            }
+            const jsonStr = dataLines.join("\n").trim();
+            let payload: Record<string, unknown>;
+            try {
+                payload = JSON.parse(jsonStr) as Record<string, unknown>;
+            } catch {
+                diagEvents++;
+                diagUnparseable++;
+                diagPushType("unparseable");
+                auditRawForward(rawEvent);
+                await write(rawEvent + "\n\n");
+                continue;
+            }
+            diagEvents++;
+            diagPushType(eventName.length > 0 ? eventName : "frame");
+            if (eventName === "done") {
+                // WC-12c: `done` IS this wire's terminal.
+                sawTerminal = true;
+                const fr = payload["finish_reason"];
+                if (typeof fr === "string" && fr.length > 0) finalFinishReason = fr;
+                await write(flushTails() + rawEvent + "\n\n");
+                continue;
+            }
+            if (eventName === "error") {
+                // The wire's own error frame is terminal too: a later cut must
+                // not stack a second in-band error on top of it.
+                sawTerminal = true;
+                await write(flushTails() + rawEvent + "\n\n");
+                continue;
+            }
+            if (eventName === "token_usage") {
+                mergeUsageSample(acc, traeUsageSample(payload));
+                await write(rawEvent + "\n\n");
+                continue;
+            }
+            if (eventName !== "output") {
+                await write(rawEvent + "\n\n");
+                continue;
+            }
+            const toolCalls = payload["tool_calls"];
+            if (Array.isArray(toolCalls) && toolCalls.length > 0) sawToolCall = true;
+            const prose = payload["response"];
+            const thought = payload["reasoning_content"];
+            const hasProse = typeof prose === "string" && prose.length > 0;
+            const hasThought = typeof thought === "string" && thought.length > 0;
+            if (!hasProse && !hasThought) {
+                // Tool-call argument fragments, multimodal parts and phase
+                // markers ride byte-verbatim (#1039).
+                await write(rawEvent + "\n\n");
+                continue;
+            }
+            if (hasThought) sawThinking = true;
+            const cleanProse = hasProse ? proseFilter.push(prose as string) : "";
+            const cleanThought = hasThought ? reasoningFilter.push(thought as string) : "";
+            if (hasProse) visibleTextChars += cleanProse.length;
+            const proseChanged = hasProse && cleanProse !== (prose as string);
+            const thoughtChanged = hasThought && cleanThought !== (thought as string);
+            if (!proseChanged && !thoughtChanged) {
+                await write(rawEvent + "\n\n");
+                continue;
+            }
+            const rebuilt: Record<string, unknown> = { ...payload };
+            if (hasProse) rebuilt["response"] = cleanProse;
+            if (hasThought) rebuilt["reasoning_content"] = cleanThought;
+            await write(traeFrameBuf(eventName, rebuilt));
+        }
+    };
+    try {
+        for (;;) {
+            const { done, value } = await reader.read();
+            let pendingFinal: string | null = null;
+            if (done) {
+                // #2323: a CRLF / lone CR whose final byte arrived last is held
+                // back by the streaming normalizer; resolve it and re-drive the
+                // completed event through the same path before deciding truncation.
+                const resolved = finalizeSseLineEndings(buf);
+                if (resolved === buf) break;
+                buf = "";
+                pendingFinal = resolved;
+            } else {
+                if (value && value.length > 0) diagBytes += value.byteLength;
+                pendingFinal = value && value.length > 0 ? decoder.decode(value, { stream: true }) : null;
+            }
+            if (pendingFinal !== null) await consume(pendingFinal);
+            if (res.destroyed || res.writableEnded) break;
+        }
+        // A dangling partial frame cannot be forwarded as-is (it would fuse
+        // with the client's next read); drop it, matching the chat pipe's EOF
+        // handling. Held KNOWN tails still belong to the client and go first.
+        if (!res.destroyed && !res.writableEnded) {
+            const tail = flushTails();
+            if (tail.length > 0) await write(tail);
+        }
+        settleUsage();
+        maybeWarnDegenerate();
+        if (!sawTerminal && !res.destroyed && !res.writableEnded) {
+            // #721: a clean trae turn always carries `done`; only a genuine cut
+            // reaches here, and emitUpstreamTruncation declines to synthesize the
+            // error frame once a finish reason was already delivered.
+            emitUpstreamTruncation(res, "trae", finalFinishReason !== undefined, log, buildDiag("eof"));
+            return;
+        }
+    } catch (e) {
+        settleUsage();
+        if (res.destroyed || res.writableEnded) {
+            log?.("client aborted mid-stream");
+            return;
+        }
+        loggerLog("warn", `[plugin] upstream stream read failed (trae): ${String(e instanceof Error ? e.message : e)} — emitting in-band truncation signal`);
+        emitUpstreamTruncation(res, "trae", finalFinishReason !== undefined, log, buildDiag("read-error"));
+        return;
+    } finally {
+        reader.releaseLock();
+        res.end();
+    }
+}
+
+/** The trae `token_usage` frame reports OpenAI-style totals (prompt_tokens
+ *  already includes the cached segment); map onto the shared sample shape so
+ *  the plugin lane keeps lastInputTokens honest. */
+function traeUsageSample(payload: Record<string, unknown>): UsageSample {
+    const sample: UsageSample = {};
+    const input = num(payload["prompt_tokens"]);
+    if (input !== undefined) sample.inputTokens = input;
+    const output = num(payload["completion_tokens"]);
+    if (output !== undefined) sample.outputTokens = output;
+    // #5713/#779: same cached-token ladder as the proxy-lane adapter —
+    // openai-vocabulary fields first, this wire's native counter last.
+    const pd = payload["prompt_tokens_details"] as Record<string, unknown> | undefined;
+    const cached = num(pd?.["cached_tokens"]) ?? num(payload["prompt_cache_hit_tokens"]) ?? num(payload["cache_read_input_tokens"]);
+    if (cached !== undefined) sample.cachedTokens = cached;
+    const creation = num(payload["cache_creation_input_tokens"]);
+    if (creation !== undefined) sample.creationTokens = creation;
+    return sample;
+}
+
+function traeFrameBuf(event: string, payload: Record<string, unknown>): string {
+    return "event:" + event + "\ndata:" + JSON.stringify(payload) + "\n\n";
+}
 function hadTextOtherThanTextFields(choices: unknown): boolean {
     if (!Array.isArray(choices)) return true;
     for (const c of choices) {

@@ -47,6 +47,7 @@ import { BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, isLoopbackAddress, 
 import { checkTunnelDestination, tunnelAllowlistFromEnv } from "../tunnel-guard.js";
 import { resolveCompatDropFields } from "../compat-drop.js";
 import { unwrapCommandcodeBody, type CommandcodeEnvelopeMeta } from "../commandcode-wire.js";
+import { unwrapTraeBody, type TraeEnvelopeMeta } from "../trae-wire.js";
 import { DecompressedTooLargeError, decodeRequestBody } from "../content-encoding.js";
 import { matchModelEndpoint } from "../model-endpoints.js";
 import { autoModeForgeEnabled, dshAuthoredCompactionEnabled, imageRescaleEnabled, limitsDecodedBytes as knobLimitsDecodedBytes, noInjectTool as knobNoInjectTool, rawDumpDir as knobRawDumpDir } from "../knobs.js";
@@ -300,10 +301,10 @@ async function handleRequest(
      *  there so config resolves identically across all request forms. */
     let providerDestUrl: string;
     let protocol: WireProtocol | null;
-    /** #1295: wire family of a declared custom endpoint (currently only
-     *  "commandcode"). Undefined for built-in families; drives the envelope
-     *  unwrap/rewrap + JSONL codec selection further down the pipeline. */
-    let wireFamily: "commandcode" | null = null;
+    /** #1295: wire family of a declared custom endpoint ("commandcode",
+     *  "trae"). Undefined for built-in families; drives the envelope
+     *  unwrap/rewrap + stream codec selection further down the pipeline. */
+    let wireFamily: "commandcode" | "trae" | null = null;
     /** Gemini's model, resolved from the request path (its body never carries
      *  one). Undefined for every other protocol. */
     let googleModel: string | undefined;
@@ -378,7 +379,7 @@ async function handleRequest(
         if (req.method !== "POST" || bodyBuffer.length === 0) {
             protocol = null;
         } else if (route?.explicitProtocol !== undefined) {
-            if (declared !== undefined && route.explicitProtocol !== (declared.wire === "commandcode" ? "openai" : declared.wire)) {
+            if (declared !== undefined && route.explicitProtocol !== (declared.wire === "commandcode" || declared.wire === "trae" ? "openai" : declared.wire)) {
                 const key = `${declared.match}|${route.explicitProtocol}`;
                 if (!declPinConflictWarned.has(key)) {
                     declPinConflictWarned.add(key);
@@ -400,6 +401,13 @@ async function handleRequest(
                 // the internal protocol stays "openai" so kernel/loop pipelines
                 // run unchanged — wireFamily selects the envelope + JSONL codecs.
                 wireFamily = "commandcode";
+                protocol = "openai";
+            } else if (declared.wire === "trae") {
+                // openai-completions request shape with Trae's four message
+                // quirks (content as text parts, function_call, null content on
+                // tool turns): the internal protocol stays "openai" too, and
+                // wireFamily selects the SSE-dialect stream codec.
+                wireFamily = "trae";
                 protocol = "openai";
             } else {
                 protocol = declared.wire;
@@ -598,6 +606,31 @@ async function handleRequest(
         }
         parsed = unwrapped.body;
         ccMeta = unwrapped.meta;
+    }
+    // #1295: declared trae endpoints keep an openai-completions conversation
+    // behind Trae's envelope and message shapes (trae-wire.ts). Unwrap here for
+    // the same reasons as commandcode; rewrapTraeBody restores the envelope at
+    // the final forward boundary. Same strict-fidelity rule: a body this codec
+    // cannot convert relays verbatim with a one-time loud warning.
+    let traeMeta: TraeEnvelopeMeta | undefined;
+    if (wireFamily === "trae" && protocol !== null) {
+        const unwrapped = typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
+            ? unwrapTraeBody(parsed as Record<string, unknown>)
+            : undefined;
+        if (!unwrapped) {
+            const relayKey = `trae:${upstreamOrigin}${urlPath}`;
+            if (!nonConversationRelayWarned.has(relayKey)) {
+                nonConversationRelayWarned.add(relayKey);
+                if (nonConversationRelayWarned.size > NON_CONVERSATION_RELAY_WARN_CAP) {
+                    nonConversationRelayWarned.delete(nonConversationRelayWarned.values().next().value as string);
+                }
+                log("warn", `[trae] declared endpoint body is not a convertible streaming Trae conversation — relaying verbatim to ${maskUrlsInText(upstreamOrigin)} (#1295) — ${req.method ?? "?"} ${maskUrlForLog(req.url ?? "")}`);
+            }
+            await forward(req, res, opts, bodyBuffer, null, core, config, log, route, instanceId, undefined);
+            return;
+        }
+        parsed = unwrapped.body;
+        traeMeta = unwrapped.meta;
     }
     // #2824: one cheap raw-text pass decides whether the incoming-image index
     //  (#1995/#2607) can find anything — a provably image-free body skips BOTH
@@ -2530,6 +2563,7 @@ async function handleRequest(
                 const runPrepare = async (): Promise<Prepared> => {
                     const p = await runPrepareInner();
                     if (ccMeta !== undefined) p.commandcode = { meta: ccMeta };
+                    if (traeMeta !== undefined) p.traeWire = { meta: traeMeta };
                     return p;
                 };
                 // #332: codex's native remote-compaction request (trigger form)
@@ -2684,7 +2718,7 @@ async function handleRequest(
                                 // (protocol error event for SSE, identical JSON body for
                                 // non-stream) instead of a status code we lost.
                                 if (prepared!.stream) {
-                                    emitPreflightError(res, prepared!.commandcode ? "commandcode" : prepared!.protocol, { message: outcome.message, retryable: outcome.retryable }, (m) => log("warn", m));
+                                    emitPreflightError(res, prepared!.commandcode ? "commandcode" : prepared!.traeWire ? "trae" : prepared!.protocol, { message: outcome.message, retryable: outcome.retryable }, (m) => log("warn", m));
                                 } else {
                                     try {
                                         res.end(JSON.stringify({
