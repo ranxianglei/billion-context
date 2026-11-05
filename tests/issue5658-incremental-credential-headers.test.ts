@@ -116,7 +116,7 @@ function hitHasCredential(h: UpstreamHit, name: string, value: string): boolean 
 test("#5658 direct turn: every credential header reaches the upstream, no x-bili marker leaks", async () => {
     const h = await harness();
     try {
-        const status = await h.turn({ ...Object.fromEntries(CREDENTIALS), "x-custom-gateway": "gw-TEST" });
+        const status = await h.turn({ ...Object.fromEntries(CREDENTIALS), "x-custom-gateway": "gw-TEST", "x-bili-turn-id": "turn-direct-TEST" });
         assert.equal(status, 200);
         assert.equal(h.hits.length, 1);
         const hit = h.hits[0];
@@ -136,7 +136,7 @@ test("#5658 direct turn: every credential header reaches the upstream, no x-bili
 test("#5658 marker divert: credentials reach the upstream, x-bili-plugin-turn marker is stripped", async () => {
     const h = await harness();
     try {
-        const status = await h.markerTurn(Object.fromEntries(CREDENTIALS));
+        const status = await h.markerTurn({ ...Object.fromEntries(CREDENTIALS), "x-bili-turn-id": "turn-divert-TEST" });
         assert.equal(status, 200);
         assert.equal(h.hits.length, 1);
         const hit = h.hits[0];
@@ -144,6 +144,7 @@ test("#5658 marker divert: credentials reach the upstream, x-bili-plugin-turn ma
             assert.ok(hitHasCredential(hit, name, value), `credential header ${name} must reach the upstream`);
         }
         assert.equal(hit.headers["x-bili-plugin-turn"] ?? null, null, "the divert marker must never ride onto the upstream request");
+        assert.equal(hit.headers["x-bili-turn-id"] ?? null, null, "lane turn-id bookkeeping must not be forwarded verbatim");
     } finally {
         await h.close();
     }
