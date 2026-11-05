@@ -2294,7 +2294,8 @@ export class SessionStore {
     /** #5664 render snapshot plane facade — same guard shape as the identity
      *  plane: null/empty/false = "plane unavailable right now" and the v6
      *  lane fails soft onto the legacy full path for that turn only.
-     *  pfRenderCommit does NOT swallow silently. */
+     *  A failed render commit is logged once, then fails soft for THIS turn
+     *  (same as pfCommitTurn above). */
     pfRenderAvailable(): boolean {
         if (!this.shadow || this.shadow.stats.disabled) return false;
         try {
