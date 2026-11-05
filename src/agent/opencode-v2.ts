@@ -82,6 +82,9 @@ export interface V2HttpRequestEvent {
     request?: { url?: unknown; headers?: V2Headers | null };
     url?: unknown;
     headers?: Record<string, string>;
+    /** http.response events only (@opencode/cli 2.2.x): the upstream reply,
+     *  paired with the request that was actually sent (e.request). */
+    response?: Response;
 }
 
 interface V2ToolEditor {
@@ -265,6 +268,12 @@ interface OpencodeV2SetupOptions {
      *  marker header. Absent in launcher mode. Must never throw — the hook
      *  itself wraps it, but adapters also guard internally. */
     incremental?: (e: V2HttpRequestEvent, state: V2State) => void | Promise<void>;
+    /** Native mode only: called from the http.response hook (@opencode/cli
+     *  2.2.x fires it per provider request with the SENT request and the
+     *  upstream response). This is the V2 ack seam for incremental turns —
+     *  V2 attach/spawn modes install no fetch intercept, so without it no
+     *  `x-bili-applied-seq` ack ever lands. Must never throw. */
+    onResponse?: (e: V2HttpRequestEvent, state: V2State) => void | Promise<void>;
     /** #1362: cooldown between failed derived-session register attempts (tests inject). */
     derivedRetryMs?: number;
 }
@@ -404,6 +413,22 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
 
         const hookReg = await ctx.session?.hook?.("http.request", httpRequestHook);
         if (hookReg) registrations.push(hookReg);
+
+        if (options.onResponse !== undefined) {
+            const onResponse = options.onResponse;
+            try {
+                const respReg = await ctx.session?.hook?.("http.response", async (e) => {
+                    try {
+                        await onResponse(e, state);
+                    } catch {
+                        // observability only — never break the host's response
+                    }
+                });
+                if (respReg) registrations.push(respReg);
+            } catch {
+                // hosts without an http.response seam keep the 30s pending TTL fallback
+            }
+        }
 
         try {
             const wsReg = await ctx.session?.hook?.("experimental.ws.handshake", async (e) => {
