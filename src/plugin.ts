@@ -1535,6 +1535,25 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
     };
     try { if (await replay()) return; }
     catch (err) { return forkReply(res, 503, { ok: false, status: "unavailable", code: "FORK_FAILED", error: String(err) }); }
+    // #394/#5624: a fork POST landing while a LIVE peer instance is writing
+    //  either side of the pair fails closed BEFORE the create branch. The
+    //  idempotent-retry shape (first attempt succeeded on the peer) would
+    //  otherwise re-create the child here — replay() finds no adopted
+    //  session now that hot disk adoption is refused — and
+    //  recordPluginSession + flushSync(parent) would clobber the peer's rows:
+    //  the exact last-writer-wins damage this guard exists to stop (#3923).
+    //  Sits AFTER replay(): replay is read-only-safe (early-returns on the
+    //  child's committed envelope, else rewrites only the child's own record
+    //  — never the parent), so retries keep succeeding while the parent is
+    //  hot; only the create path needs the refusal.
+    {
+        const held = [...hotWritersOf(request.parentConversationId), ...hotWritersOf(request.childConversationId)];
+        if (held.length > 0) {
+            const peers = [...new Set(held.map(describeHotWriter))].join(", ");
+            loggerLog("error", `[plugin] fork ${request.parentConversationId} → ${request.childConversationId} refused: another live instance is writing it (${peers}) — stop that instance or route this client to it, then retry (#394)`);
+            return forkReply(res, 409, { ok: false, status: "unavailable", code: "HELD_BY_PEER_INSTANCE", error: `this conversation is currently being served by another bili instance (${peers}); stop that instance or route this client to it, then retry` });
+        }
+    }
     if (conversations.has(request.childConversationId) || pendingRegisters.some((r) => r.conversationId === request.childConversationId) || (registeredIds.has(request.childConversationId) && !forkChildHeldBySameParent(request.childConversationId, request.parentConversationId))) return forkReply(res, 409, { ok: false, code: "CHILD_CONFLICT", error: "child conversation already registered" });
     const parent = await resolveForkConversation(request.parentConversationId);
     if (!parent) return forkReply(res, 404, { ok: false, code: "PARENT_NOT_FOUND", error: "parent conversation not found" });
@@ -1785,6 +1804,20 @@ export async function handlePluginStatus(conversationId: string, res: import("no
         return h;
     };
     let session = await resolveForkConversation(conversationId);
+    // #394/#5716: a refused hot adoption must NOT fall through to the
+    //  fallback-latest branch below — that would answer with a DIFFERENT
+    //  session's state under the requested id (wrong-session misroute).
+    //  Name the holder instead; liveness-scoped like every other refusal.
+    if (!session) {
+        const held = hotWritersOf(conversationId);
+        if (held.length > 0) {
+            const peers = [...new Set(held.map(describeHotWriter))].join(", ");
+            loggerLog("error", `[plugin] status ${conversationId} refused: another live instance is writing it (${peers}) (#394)`);
+            res.writeHead(409, jsonHeaders());
+            res.end(JSON.stringify({ ok: false, code: "HELD_BY_PEER_INSTANCE", error: `this conversation is currently being served by another bili instance (${peers}); stop that instance or route this client to it, then retry` }));
+            return;
+        }
+    }
     const entry = conversations.get(conversationId);
     let viaFallback = false;
     let resolvedConversationId = conversationId;
