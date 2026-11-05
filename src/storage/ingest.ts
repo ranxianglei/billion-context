@@ -432,8 +432,11 @@ function finishPlan(
 
     // #4216/#4242: the orphan journal — blockContents entries whose block is
     // gone from state.blocks (#2695 reap keeps the contents for decompress).
-    // Rides every plan; the store merges it into sessions.orphans_json in the
-    // same transaction as the rest of the session. This is what makes the
+    // Rides every plan; the store records it authoritatively in
+    // sessions.orphans_json — REPLACE semantics (#5589-C): each save stores
+    // the live set verbatim, so an authoritative clear resets the journal
+    // (the pre-fix merge kept ghosts forever and froze the envelope). Same
+    // transaction as the rest of the session. This is what makes the
     // reap shape REPRESENTABLE, so record() no longer skips the ingest (the
     // freeze in #4216: sessions stuck at hours-old rows).
     const knownBlockIds = new Set(session.state.blocks.map((b) => b.blockId));
