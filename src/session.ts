@@ -12,6 +12,7 @@ import type { WireProtocol } from "./util.js";
 import type { InboundSlot, SeamSlot } from "./cache-ledger.js";
 import { isResponsesTurnSeparatorId } from "./turn-separator.js";
 import type { FoldReconcileResult } from "./fold-reconcile.js";
+import type { UnpromptedGate } from "./unprompted-gate.js";
 
 export type BlockView = { text: string; count: number };
 
@@ -336,6 +337,12 @@ export type Session = {
          *  In-memory only: the abort→resume causality spans one process
          *  lifetime, and a restart replants nothing. */
         abortReanchor?: { anchor: number; at: number };
+        /** #5683: the conversation's latest model-round compression-prompt facts
+         *  for the unprompted/out-of-bounds gates (src/unprompted-gate.ts).
+         *  Re-stamped on every prepare; in-memory only — a restart reads the
+         *  all-off default until the first round re-stamps, which is safe: no
+         *  tool call can reach applyRanges before its own round's prepare. */
+        unpromptedGate?: UnpromptedGate;
     };
     id: string;
     /** Identity / descriptive metadata. Populated on first request. */
@@ -1026,6 +1033,21 @@ export function absorbAbortedTurnGrowth(session: Session, tokenCount: number): v
     if (!(tokenCount > flag.anchor)) return;
     const nudge = session.state.nudge;
     const oldRef = nudge.lastPerMessageNudgeTokens;
+    // #5415: the full-meter re-anchor below skips not only the aborted
+    // turn's unreported partial (intended, #5293) but also the MEASURED
+    // growth from the old reference up to the pre-abort anchor — growth the
+    // flat cadence legitimately counts. Abort-heavy clients (85 absorbs in
+    // one reported 4.5h log) get that growth zeroed every few minutes, so
+    // the nudge cadence starves and a huge ready mass sits idle for hours.
+    // Bank the skipped measured growth as debt and count the absorbs: the
+    // kernel pays both only from the SECOND absorb on (#5415) — a single
+    // abort stays exactly as quiet as #5293 pinned, while repeated aborts
+    // prove the session is abort-heavy (not redirect-polite) and the 209-era
+    // cadence recovers. applyCompression resets the bank and the count.
+    const recovered = Math.max(0, flag.anchor - oldRef);
+    nudge.absorbCount = (nudge.absorbCount ?? 0) + 1;
+    if (recovered > 0)
+        nudge.absorbedDebt = (nudge.absorbedDebt ?? 0) + recovered;
     nudge.lastPerMessageNudgeTokens = Math.max(oldRef, tokenCount);
     // The pending nudge (if any) died with its turn: clear the shown stamp and
     // the per-tier cadence stamps together — the same full-reset shape as
@@ -1034,7 +1056,7 @@ export function absorbAbortedTurnGrowth(session: Session, tokenCount: number): v
     nudge.lastNudgeShownTokens = 0;
     nudge.lastShownByTier = {};
     delete t.abortReanchor;
-    loggerLog("info", `[${session.id}] aborted-turn growth absorbed: nudge reference ${oldRef}→${nudge.lastPerMessageNudgeTokens} (meter ${tokenCount}, pre-abort anchor ${flag.anchor}) (#5293)`);
+    loggerLog("info", `[${session.id}] aborted-turn growth absorbed: nudge reference ${oldRef}→${nudge.lastPerMessageNudgeTokens} (meter ${tokenCount}, pre-abort anchor ${flag.anchor}, growth debt +${recovered} → ${nudge.absorbedDebt ?? 0} over ${nudge.absorbCount} absorb(s)) (#5293/#5415)`);
 }
 
 // #1820: post-rebuild meter anchor. Right after a big preflight rebuild the

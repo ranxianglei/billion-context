@@ -40,6 +40,7 @@
 | `BILI_NO_CACHE_CONTROL` | compat | 历史 no-cache-control 怪癖保留（knobs.ts:458 明言 "Historical quirk preserved in the env"） | 兼容窗口结束后退役 | 默认 off |
 | `BILI_STREAM_ERROR_SHAPE` | compat | 给无法带内上报错误的 SDK 的流错误形状兼容 | 兼容保留（长期） | 常设兼容旋钮 |
 | `BILI_SUBAGENT_SPLIT` | #970 | subagent 拆分（默认 on） | 成为既定行为后移 §2 | 默认 ON（`=0` 退出） |
+| `BILI_PERSONA_SPLIT` | Responses personaSplit | Responses 线路 instructions 指纹分叉（默认 on；`=0` / `personaSplit: false` 关闭，剥 `instructionsFingerprintKeyed`、保留 identity） | 成为既定行为后移 §2 | 默认 ON（`=0` 退出） |
 | `BILI_RESUME_INHERITANCE` | resume inheritance | resume 继承行为（默认 on） | 同上 | 默认 ON（`=0` 退出） |
 | `BILI_AFFINITY_SIMHASH` | #2265 | simhash adoption kill-switch（`=0` 禁用） | adoption 成为既定行为后移 §2 | 默认 ON |
 | `BILI_CHAIN_CONTENT` | chain 识别 | chain 内容检测（#1683 背景；默认 off，文件可开） | 实验结论出来转正或删 | 默认 off |
@@ -53,6 +54,8 @@
 | `BILI_OPENCODE_INLINE` | #3278 opencode 移植（#4687） | opencode inline 模式（需手动开启，默认保持旧行为 spawn，owner 决定不改默认）：与 pi 同构——不起 proxy 进程，模型 URL 被 V2 route/intercept 改写成伪 origin 后由进程内引擎接住（bun 宿主已验：引擎 boot/dispatch 全绿）；`=1/on/yes/TRUE` 或 file 家 `"opencode": {"inline": true}` 显式开启（显式开启压过 attach 目标）；`bili opencode-inline` 一键车道 | 同 pi inline 车道节奏 | opt-in（不设置时 attach/spawn 行为与旧版完全一致） |
 | `BILI_INLINE_DEBUG` | #4669 | 仅 inline 车道：引擎 stderr 日志腿默认静默（stderr 是 pi 的交互终端，日志会挤掉输入框；默认只写 bili.log），设 1 恢复 stderr 输出用于排查 | 随 inline 车道（#3278）走 | 排查逃生口 |
 | 测试钩子：`BILI_DSH_RECOVERY_INTERVAL_MS` / `BILI_DSH_RETRY_INTERVAL_MS` / `BILI_MODEL_INFO_RETRY_MS` | #2082 等 | 缩短测试/运维节奏（dsh-native.ts；NODE_TEST_CONTEXT 感知，避免生产误缩） | 永久测试设施，随宿主代码走 | 测试钩子 |
+| `BILI_COMPRESS_AT_FOLD_POINT` | #5470 | compress-at-fold-point 实验性 opt-in（**默认关**；2026-11-01 真实模型验证通过，owner 决定保持 opt-in）：把重放视图中可见的 compress 调用对挪到它自己的折叠点（布局 [已折叠区]–[调用对]–[保护消息]），弱注意力模型不再把历史尾部的工具交换误读成新命令；纯视图变换，关时布局字节级不变；文件键 `compress.compressAtFoldPoint`；含 env-only opt-in 可达性修复（默认短路保持不变） | 更多真实模型积累后转正为默认开（走评审），或按废弃流程删除 | opt-in（默认关） |
+| `BILI_COMPRESS_AT_FOLD_POINT_CLEAR_THINKING` | #5470 | 依附上一开关：挪位瞬间清紧邻的未签名思考段（默认 off，A 关时无效）；strict-echo(#684) 或存在签名思考块(#1658)时整个机制不出手 | 同上 | opt-in（默认 off） |
 
 ## 2. 常设面全量登记表（src/ 实际读取的其余 BILI_* 环境变量）
 
@@ -181,6 +184,7 @@
 | `BILI_UPDATE_CHECK_INTERVAL_MS` | update.checkIntervalMs 覆盖（#2030） |
 | `BILI_ADVISORY_CHECK` | 公告检查开关（默认 ON；文件 advisoryCheck:false 退出） |
 | `BILI_ADVISORY_URL` | 公告文档 URL 覆盖 |
+| `BILI_ANNOUNCEMENTS_URL` | 统一公告面远程源 URL 覆盖（#5548，配置键 remoteAnnouncementsUrl；缺省官方 raw 地址，fail-open） |
 | `BILI_RELEASE_NOTES_CHECK` | 发布说明检查（#1870，默认 ON） |
 | `BILI_RELEASE_NOTES_URL` | 发布说明 URL 覆盖 |
 | `BILI_UPDATE_POLICY_URL` | update.policyUrl——更新策略 URL 覆盖（**测试专用**：生产固定官方 repo，#3619 安全边界） |

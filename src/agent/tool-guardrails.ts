@@ -15,6 +15,8 @@ import type { ExtensionAPI } from "./pi.js";
 
 const DEFAULT_TOOL_OUTPUT_MAX_BYTES = 50_000;
 const REPETITION_GUARD_DEFAULTS = { warn: 3, abort: 5 } as const;
+/** Recovery-mode hard-abort offset past the abort threshold (#5505). */
+const RECOVERY_BACKSTOP_OFFSET = 5;
 
 type ContentPart = { type: string; text?: string; [key: string]: unknown };
 type ToolContent = ContentPart[];
@@ -192,12 +194,15 @@ export function repetitionFingerprint(toolName: string, input: unknown): string 
     }
 }
 
-type RepetitionAction = "none" | "warn" | "final-refuse" | "abort";
+type RepetitionAction = "none" | "warn" | "final-refuse" | "abort" | "soft-stop" | "hard-abort";
 interface RepetitionDecision {
     action: RepetitionAction;
     count: number;
     fingerprint: string;
     toolName: string;
+    /** Count at which a hard ctx.abort() fires (abortThreshold + 5). For default
+     *  thresholds (warn=3, abort=5), backstop is 10, so hard-abort triggers on call 10. */
+    backstop: number;
 }
 
 export class RepetitionTracker {
@@ -205,7 +210,9 @@ export class RepetitionTracker {
     private count = 0;
     private lastCompleted: { fp: string; durationMs: number } | null = null;
     private pendingStarts = new Map<string, { fp: string; startedAt: number }>();
-    constructor(private readonly thresholds: { warn: number; abort: number }) {}
+    constructor(
+        private readonly thresholds: { warn: number; abort: number; recovery?: boolean },
+    ) {}
     note(toolName: string, input: unknown, toolCallId?: string, now: number = Date.now()): RepetitionDecision {
         const fp = repetitionFingerprint(toolName, input);
         const done = this.lastCompleted;
@@ -221,10 +228,13 @@ export class RepetitionTracker {
         }
         if (toolCallId !== undefined) this.pendingStarts.set(toolCallId, { fp, startedAt: now });
         let action: RepetitionAction = "none";
-        if (this.count > this.thresholds.abort) action = "abort";
+        const backstop = this.thresholds.abort + RECOVERY_BACKSTOP_OFFSET;
+        if (this.thresholds.recovery && this.count >= backstop) action = "hard-abort";
+        else if (this.thresholds.recovery && this.count > this.thresholds.abort) action = "soft-stop";
+        else if (this.count > this.thresholds.abort) action = "abort";
         else if (this.count === this.thresholds.abort) action = "final-refuse";
         else if (this.count >= this.thresholds.warn) action = "warn";
-        return { action, count: this.count, fingerprint: fp, toolName };
+        return { action, count: this.count, fingerprint: fp, toolName, backstop };
     }
     /** Feed a tool_result back in so the next note() knows how long the call took.
      *  Unknown/missing ids are ignored — without duration evidence the count-only
@@ -242,6 +252,11 @@ export class RepetitionTracker {
         this.lastCompleted = null;
         this.pendingStarts.clear();
     }
+    /** Invariant: stays bounded — blocked calls never fire tool_result, so the
+     *  handler completes them explicitly (#5505). */
+    get pendingCallCount(): number {
+        return this.pendingStarts.size;
+    }
 }
 
 function buildRepetitionWarnNotice(toolName: string, count: number): string {
@@ -249,11 +264,15 @@ function buildRepetitionWarnNotice(toolName: string, count: number): string {
 }
 
 function buildRepetitionFinalRefuseNotice(toolName: string, count: number): string {
-    return `[ACP guardrail: REFUSED — you issued ${count} consecutive identical \`${toolName}\` calls in quick succession (equivalent arguments, key order aside). This call was refused and NOT executed. FINAL WARNING: if the very next call is identical again, the entire turn will be ABORTED. If you were waiting/polling external state, issue ONE longer wait instead (larger duration argument) or stop and report to the user. Changing the tool or ANY argument restarts the count.]`;
+    return `[ACP guardrail: REFUSED — you issued ${count} consecutive identical \`${toolName}\` calls in quick succession (equivalent arguments, key order aside). This call was refused and NOT executed. FINAL WARNING: if the very next call is identical again, the guardrail will take stronger action. If you were waiting/polling external state, issue ONE longer wait instead (larger duration argument) or stop and report to the user. Changing the tool or ANY argument restarts the count.]`;
 }
 
 function buildRepetitionAbortNotice(toolName: string, count: number): string {
     return `[ACP guardrail: BLOCKED — you issued ${count} consecutive identical \`${toolName}\` calls in quick succession despite the final refusal. This call was refused and NOT executed. You MUST change strategy: use different arguments, a different tool, or stop and report to the user. Do not re-issue the identical call. The turn has been aborted.`;
+}
+
+function buildRepetitionSoftStopNotice(toolName: string, count: number, backstop: number): string {
+    return `[ACP guardrail: BLOCKED — you issued ${count} consecutive identical \`${toolName}\` calls in quick succession despite the final refusal. This call was refused and NOT executed; identical calls will keep being refused while the turn continues. You MUST change strategy: use different arguments, a different tool, or stop and report to the user. Do not re-issue the identical call. If ${backstop} identical calls in a row are reached, the turn will be forcibly terminated.`;
 }
 
 export interface GuardrailOptions {
@@ -263,19 +282,20 @@ export interface GuardrailOptions {
     /** Combined text-output byte cap per tool result. undefined = 50KB
      *  default; 0 = no cap. */
     maxBytes?: number;
-    repetition?: boolean | { enabled?: boolean; warn?: number; abort?: number };
+    repetition?: boolean | { enabled?: boolean; warn?: number; abort?: number; recovery?: boolean };
 }
 
 function positiveInt(v: unknown, fallback: number): number {
     return typeof v === "number" && Number.isFinite(v) && v > 0 ? Math.floor(v) : fallback;
 }
 
-function resolveRepetition(g: GuardrailOptions["repetition"]): { enabled: boolean; warn: number; abort: number } {
-    if (g === false) return { enabled: false, warn: REPETITION_GUARD_DEFAULTS.warn, abort: REPETITION_GUARD_DEFAULTS.abort };
+function resolveRepetition(g: GuardrailOptions["repetition"]): { enabled: boolean; warn: number; abort: number; recovery: boolean } {
+    if (g === false) return { enabled: false, warn: REPETITION_GUARD_DEFAULTS.warn, abort: REPETITION_GUARD_DEFAULTS.abort, recovery: false };
     const obj = g && typeof g === "object" ? g : {};
     const warn = positiveInt(obj.warn, REPETITION_GUARD_DEFAULTS.warn);
     const abort = Math.max(positiveInt(obj.abort, REPETITION_GUARD_DEFAULTS.abort), warn + 1);
-    return { enabled: obj.enabled !== false, warn, abort };
+    const recovery = (obj as { recovery?: boolean }).recovery === true;
+    return { enabled: obj.enabled !== false, warn, abort, recovery };
 }
 
 export function wireToolGuardrails(pi: ExtensionAPI, opts: GuardrailOptions = {}): void {
@@ -303,6 +323,9 @@ export function wireToolGuardrails(pi: ExtensionAPI, opts: GuardrailOptions = {}
         if (decision.action === "final-refuse") {
             const msg = buildRepetitionFinalRefuseNotice(decision.toolName, decision.count);
             if (ctx?.ui?.notify) ctx?.ui?.notify(`[ACP] ${msg}`, "warning");
+            // CLEANUP: blocked calls never fire tool_result, so without this
+            // pendingStarts entries would accumulate forever.
+            tracker.complete(e.toolCallId);
             // Deliberately NO ctx.abort() here: the refusal itself IS the final
             // warning. The model sees this text and can still react (change
             // args / pick another tool => the run resets). Only the NEXT
@@ -310,9 +333,39 @@ export function wireToolGuardrails(pi: ExtensionAPI, opts: GuardrailOptions = {}
             // must survive the warning stage).
             return { block: true, reason: msg };
         }
+        if (decision.action === "soft-stop") {
+            // Recovery mode (repetition.recovery): refuse WITHOUT killing the turn —
+            // the stuck-report steers the model instead of ctx.abort() (#5505).
+            // Termination stays guaranteed by the hard-abort backstop below.
+            const msg = buildRepetitionSoftStopNotice(decision.toolName, decision.count, decision.backstop);
+            if (ctx?.ui?.notify) ctx?.ui?.notify(`[ACP] ${msg}`, "warning");
+            // CLEANUP: blocked calls never fire tool_result, so without this
+            // pendingStarts entries would accumulate forever. Safe: 0ms duration
+            // < REPEAT_SLOW_CALL_MS (5000ms), won't reset the run.
+            tracker.complete(e.toolCallId);
+            return { block: true, reason: msg };
+        }
+        if (decision.action === "hard-abort") {
+            // Recovery-mode backstop: forced termination for models that ignore
+            // every refusal (#5505).
+            const msg = buildRepetitionAbortNotice(decision.toolName, decision.count);
+            if (ctx?.ui?.notify) ctx?.ui?.notify(`[ACP] ${msg}`, "warning");
+            // CLEANUP before abort: blocked calls never fire tool_result (#5505).
+            tracker.complete(e.toolCallId);
+            try {
+                ctx?.abort?.();
+            } catch {
+                // mid-tool abort is best-effort; the block below guarantees the refusal
+            }
+            return { block: true, reason: msg };
+        }
         if (decision.action === "abort") {
             const msg = buildRepetitionAbortNotice(decision.toolName, decision.count);
             if (ctx?.ui?.notify) ctx?.ui?.notify(`[ACP] ${msg}`, "warning");
+            // CLEANUP: blocked calls never fire tool_result, so without this
+            // pendingStarts entries would accumulate forever (#5505). Safe: 0ms
+            // duration < REPEAT_SLOW_CALL_MS (5000ms), won't reset the run.
+            tracker.complete(e.toolCallId);
             try {
                 ctx?.abort?.();
             } catch {

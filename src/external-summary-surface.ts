@@ -3,7 +3,7 @@ import type { ResolvedKernelConfig } from "./compress-settings.js";
 import { AUTO_FOLD_TARGET_MIN } from "./external-summary-settings.js";
 import { loadConfigFile, resolveMessageTimestamps } from "./config.js";
 
-export const EXTERNAL_SUMMARY_NOTE = "\n\n[External summary mode: the conversation model selects consumed ranges; the configured independent summary service generates the authoritative summary. Use object-form content: [{startId, endId, topic?}]. summary is optional and, if supplied, only a non-authoritative hint, not the committed summary. Selected source text and read-only context are sent to the configured service using its separate credentials. All candidates failing leaves originals unchanged. This mode overrides instructions above requiring you to write the final summary.]";
+export const EXTERNAL_SUMMARY_NOTE = "\n\n[External summary mode: the conversation model selects consumed ranges; the configured independent summary service generates the authoritative summary. Pass ONE 'content' string JSON-encoding an array of {startId, endId, topic?} objects (the string parameter accepts a JSON-encoded array; do not send a raw JSON array argument). summary is optional and, if supplied, only a non-authoritative hint, not the committed summary. Selected source text and read-only context are sent to the configured service using its separate credentials. All candidates failing leaves originals unchanged. This mode overrides instructions above requiring you to write the final summary.]";
 
 /** External-summary mode for one request, decided by the request's own
  *  resolved Config (three-level cascade, same as every other compress field):
