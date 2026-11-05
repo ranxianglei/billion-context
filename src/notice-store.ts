@@ -42,6 +42,10 @@ const DISMISS_FILE = "upgrade-notices.json";
 
 let cache: Map<string, number> | null = null;
 let hydrating = false;
+// #5761: independent of the lazy cache — cache !== null only means "some
+// dismissal touched this process", NOT "hydration completed". Bailing on it
+// (the old gate) let one pre-hydration receipt block the migration forever.
+let hydrated = false;
 let warned = false;
 
 function warnOnce(tag: string, err: unknown): void {
@@ -90,39 +94,47 @@ export function dismissedCache(): ReadonlySet<string> | null {
 
 /** Once per process (wired at cli start): load kv rows + import the legacy
  *  file one time. Legacy-only instances keep the pure-file path forever
- *  (cache intentionally left null). Never throws. */
+ *  (cache intentionally left null). Never throws.
+ *  #5761 (twin of the #5757 host-plugin fix): UNION into whatever cache a
+ *  pre-hydration dismissal already lazily created instead of bailing — that
+ *  early receipt used to block both the one-time file→kv migration and every
+ *  sibling lane's rows for the whole process lifetime. */
 export async function hydrateNoticeReceipts(): Promise<void> {
-    if (cache !== null || hydrating || !unifiedReceiptsActive()) return;
+    if (hydrated || hydrating || !unifiedReceiptsActive()) return;
     hydrating = true;
-    const merged = new Map<string, number>();
     const now = Date.now();
-    let importedFromFile = 0;
     try {
         const dbRows = await getStore().listKvAsync(NS);
+        const rowKeys = new Set(dbRows.map((r) => r.key));
+        // One-time migration: file keys not yet in kv into kv (raw junk stays
+        // file-only — the view below still honors it).
+        const fileKeys = fileKeysOf(process.env);
+        const toImport = [...fileKeys].filter((k) => !rowKeys.has(k));
+        for (const k of toImport) {
+            try {
+                await getStore().setKvAsync(NS, k, { at: now });
+            } catch (err) {
+                warnOnce("migrate", err);
+                break;
+            }
+        }
+        if (toImport.length > 0) {
+            loggerLog("info", `[notices] imported ${toImport.length} receipt(s) from the legacy JSON file into unified storage (kv_store namespace "notices")`);
+        }
+        // Snapshot the LIVE view only now: nothing awaits between here and the
+        // publish below, so a dismissal landing any time up to this point
+        // (pre-hydration lazy adoption included) survives the final
+        // assignment instead of being clobbered until restart.
+        const merged = new Map<string, number>(cache ?? []);
         for (const r of dbRows) merged.set(r.key, r.updatedAt);
-        for (const k of fileKeysOf(process.env)) {
-            if (!merged.has(k)) {
-                merged.set(k, now);
-                importedFromFile += 1;
-            }
+        for (const k of fileKeys) {
+            if (!merged.has(k)) merged.set(k, now);
         }
-        if (importedFromFile > 0) {
-            for (const [k] of merged) {
-                if (![...dbRows].some((r) => r.key === k)) {
-                    try {
-                        await getStore().setKvAsync(NS, k, { at: now });
-                    } catch (err) {
-                        warnOnce("migrate", err);
-                        break;
-                    }
-                }
-            }
-            loggerLog("info", `[notices] imported ${importedFromFile} receipt(s) from the legacy JSON file into unified storage (kv_store namespace "notices")`);
-        }
+        cache = merged;
+        hydrated = true;
     } catch (err) {
         warnOnce("hydrate", err);
     }
-    cache = merged;
     hydrating = false;
 }
 
@@ -167,5 +179,6 @@ export function persistDismissedKey(key: string): void {
 export function _resetNoticeReceiptsForTest(): void {
     cache = null;
     hydrating = false;
+    hydrated = false;
     warned = false;
 }
