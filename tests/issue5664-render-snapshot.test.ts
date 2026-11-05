@@ -46,7 +46,7 @@ import {
 import { PF_TAIL_IDS_HEADER } from "../src/server/fastpath.ts";
 import type { V6Outcome } from "../src/server/fastpath-v6.ts";
 import {
-    bumpAuditTick, commitRenderCapture, diffRowLists, renderPlaneGate, spliceOutboundRows, verifyRenderWindow,
+    bumpAuditTick, clearWatermarkV6Render, commitRenderCapture, diffRowLists, renderPlaneGate, spliceOutboundRows, verifyRenderWindow,
     watermarkV6RenderDebugState, _resetWatermarkV6RenderTestState,
     type RenderCaps,
 } from "../src/server/fastpath-v6-render.ts";
@@ -171,6 +171,31 @@ test("unit: cast → steady appends → hydrate-from-disk fold survives mirror l
             assert.equal(g.rw.rows.length, 4, "disk fold must reconstruct all four rows");
             assert.deepEqual(g.rw.rows.slice(-2), ['{"i":2}', '{"i":3}'], "appended tail must survive the fold");
         }
+    } finally { h.cleanup(); }
+});
+
+test("teardown: clearWatermarkV6Render drops every in-memory mirror; the disk plane survives", () => {
+    const h = makeH("tear");
+    try {
+        const b1 = makeBody([{ role: "user", content: "hello" }]);
+        const r1 = v6Eval(h, "s-tear", b1, ["id0"]);
+        assert.equal(r1.outcome.decision, "arm");
+        r1.fin();
+        const sid = r1.sid!;
+        const caps = capsFor("text-only");
+        assert.equal(commitRenderCapture({ sessionId: "s-tear", store: h.store, sid, mode: "legacy", caps, rowStrings: ['{"i":0}', '{"i":1}'], sums: { estCum: 2, textCum: 2, imgCum: 0 } }).op, "cast");
+        assert.equal(watermarkV6RenderDebugState("s-tear").sids.length, 1);
+
+        clearWatermarkV6Render("s-tear");
+        assert.deepEqual(watermarkV6RenderDebugState("s-tear").sids, []);
+        // Disk plane is untouched — the next process re-hydrates from it
+        // (pfDeleteForSession owns real deletion, same split as the v6 id plane).
+        assert.equal(h.store.pfRenderRows(sid).length, 2);
+        assert.equal(h.store.pfRenderCkptIntact(sid), true);
+
+        // Idempotent on an already-cleared session.
+        clearWatermarkV6Render("s-tear");
+        assert.deepEqual(watermarkV6RenderDebugState("s-tear").sids, []);
     } finally { h.cleanup(); }
 });
 

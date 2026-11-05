@@ -47,7 +47,7 @@ type LogFn = (level: string, msg: string) => void;
  *  Probe evidence (three strategies × mixed transcript × 28 turns): the
  *  suffix-only W-pass reproduces every element's outbound bytes exactly, so
  *  8 is plenty; env-tunable for operators. */
-export const PF_RENDER_WINDOW: number = (() => {
+const PF_RENDER_WINDOW: number = (() => {
     const n = Number(process.env["BILI_PF_RENDER_WINDOW"] ?? 8);
     return Number.isFinite(n) && n >= 1 ? Math.min(Math.floor(n), 64) : 8;
 })();
@@ -62,7 +62,7 @@ export const PF_RENDER_AUDIT_EVERY: number = (() => {
 /** tokenCount ≥ ratio × modelContextLimit ⇒ emergency pressure ⇒ legacy
  *  (the fold/expand machinery must see the whole view when the model is
  *  anywhere near its ceiling). */
-export const PF_RENDER_EMERGENCY_RATIO = 0.9;
+const PF_RENDER_EMERGENCY_RATIO = 0.9;
 
 /** In-memory mirror byte budget (raw row bytes summed); oldest world evicted
  *  first when over (P7 — re-hydrate from disk later, zero correctness cost). */
@@ -147,7 +147,7 @@ const sessionSids = new Map<string, Set<string>>();
  *  same conclusion. */
 const deadSids = new Set<string>();
 
-export function killRenderPlane(store: SessionStore, sid: string, reason: string, log?: LogFn): void {
+function killRenderPlane(store: SessionStore, sid: string, reason: string, log?: LogFn): void {
     if (!deadSids.has(sid)) {
         deadSids.add(sid);
         const rw = mirrors.get(sid);
@@ -306,7 +306,7 @@ function hydrateMirror(store: SessionStore, sid: string, log?: LogFn): RenderWor
 // Gate (station entry — called once per engaged request, cheap probes only)
 // ---------------------------------------------------------------------------
 
-export interface RenderGateArgs {
+interface RenderGateArgs {
     sessionId: string;
     session: Session;
     store: SessionStore;
@@ -441,9 +441,9 @@ export interface CaptureSums {
     imgCum: number;
 }
 
-export type CaptureMode = "steady" | "legacy";
+type CaptureMode = "steady" | "legacy";
 
-export interface CaptureArgs {
+interface CaptureArgs {
     sessionId: string;
     store: SessionStore;
     sid: string;
@@ -613,7 +613,7 @@ function safeParse(json: string): unknown {
 // Diagnostics / test surface
 // ---------------------------------------------------------------------------
 
-export interface RenderDebugWorld {
+interface RenderDebugWorld {
     sid: string;
     rows: number;
     dead: boolean;
