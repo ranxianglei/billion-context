@@ -1,0 +1,36 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  // This layer does not choose a provider/model or change OAuth, URLs, or proxies.
+  "plugins": [
+    {
+      "package": "/ABS/recall-source/contrib/claude-code-native-recall/opencode",
+      "options": {
+        "enabled": true,
+        "projects": ["/ABS/EXPLICIT-PROJECT"],
+        "sessions": ["ses_EXPLICIT_NATIVE_SESSION"],
+        "archiveHome": "/ABS/PRIVATE-RECALL-ARCHIVE",
+        "python": "python3"
+      }
+    }
+  ],
+  "mcp": {
+    "servers": {
+      "recall": {
+        "type": "local",
+        "command": ["python3", "/ABS/recall-source/contrib/claude-code-native-recall/plugin/recall/mcp_server.py"],
+        "environment": {
+          "RECALL_HOME": "/ABS/PRIVATE-RECALL-ARCHIVE",
+          // An empty, dedicated directory prevents unrelated CC transcript discovery.
+          "RECALL_PROJECTS": "/ABS/EMPTY-DEDICATED-PROJECTS"
+        },
+        "codemode": false,
+        "protocol": "legacy"
+      }
+    }
+  },
+  "permissions": [
+    { "action": "recall_*", "resource": "*", "effect": "deny" },
+    { "action": "recall_recall_search", "resource": "*", "effect": "allow" },
+    { "action": "recall_recall_get", "resource": "*", "effect": "allow" }
+  ]
+}
