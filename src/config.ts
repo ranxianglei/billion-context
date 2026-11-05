@@ -283,8 +283,10 @@ export type CompressSettings = {
      *  entirely. Host-only (not passed to the kernel); off unless explicitly
      *  enabled at some level. */
     nudgeModelDecided?: boolean;
-    /** #2228: output budget (tokens) of the decision side call. Default 200
-     *  (same ceiling class as SIDE_REQUEST_MAX_TOKENS). Must be > 0. */
+    /** #2228: output budget (tokens) of the decision side call. Default 1024
+     *  (#5030: raised from 200 — hybrid-thinking models spend hidden
+     *  reasoning inside the same budget and answer with an empty content at
+     *  200). Must be > 0. */
     nudgeDecisionMaxTokens?: number;
     /** #5683: forbid UNPROMPTED model-initiated compression. When true at some
      *  level, a compress call is refused unless a compression nudge actually
@@ -310,6 +312,18 @@ export type CompressSettings = {
      *  offending span(s). Host-only; off unless explicitly enabled at some
      *  level. Deepest level wins PER FIELD across global → provider → model. */
     requireRecommendation?: boolean;
+    /** #5030: idle timeout (ms) of the decision side call. Default 15000 —
+     *  raise it for providers whose full-context side calls prefill >15 s
+     *  even on a cache hit (measured 25–60 s at 200–450k tokens). Must be > 0. */
+    nudgeDecisionTimeoutMs?: number;
+    /** #5030: what the decision side call does with host-stamped reasoning
+     *  knobs. "strip" (default): delete them (#3004 behavior). "follow":
+     *  keep them — the side call obeys the thinking effort configured on
+     *  the host for this model. "off": delete, then explicitly disable
+     *  reasoning in the protocol-native way (reasoning_effort "none" etc.)
+     *  so default-thinking models cannot burn the budget on hidden
+     *  reasoning. */
+    nudgeDecisionReasoning?: "strip" | "follow" | "off";
     /** Trailing messages never offered for compression
      *  (kernel `preserveRecentMessages`). */
     preserveRecentMessages?: number;
@@ -2441,6 +2455,7 @@ const COMPRESS_SETTING_FIELDS = new Set([
     "modelContextLimit", "maxContextLimit", "emergencyThresholdPercent",
     "nudgeGrowthTokens", "minPressureBenefitTokens", "tierNudgeTokens", "nudgeModelDecided", "nudgeDecisionMaxTokens",
     "requireNudge", "requireRecommendation",
+    "nudgeDecisionTimeoutMs", "nudgeDecisionReasoning",
     "preserveRecentMessages", "preserveRecentTokens",
     "minCompressRange", "minCompressRangeChars",
     "outputHeadroomMaxPct", "tiers", "protectedLatestTools", "protectedTools",
@@ -3217,6 +3232,21 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
         if (!(key in obj)) continue;
         if (typeof obj[key] !== "boolean") ok = false;
         else out[key] = obj[key];
+    }
+    // #5030: decision side-call idle timeout — same strictness as the budget
+    // (0/negative would fire instantly and starve the call).
+    if ("nudgeDecisionTimeoutMs" in obj) {
+        const v = obj.nudgeDecisionTimeoutMs;
+        if (typeof v !== "number" || !Number.isFinite(v) || v <= 0) {
+            ok = false;
+        } else {
+            out.nudgeDecisionTimeoutMs = Math.floor(v);
+        }
+    }
+    if ("nudgeDecisionReasoning" in obj) {
+        const v = obj.nudgeDecisionReasoning;
+        if (v !== "strip" && v !== "follow" && v !== "off") ok = false;
+        else out.nudgeDecisionReasoning = v;
     }
     // #3211: an explicit 0 is meaningful (legacy any-pending), so validate
     // >= 0 instead of takeNumber's plain finite check.

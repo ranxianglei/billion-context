@@ -79,6 +79,8 @@ export function mergeCompress(
         nudgeDecisionMaxTokens: pick("nudgeDecisionMaxTokens"),
         requireNudge: pick("requireNudge"),
         requireRecommendation: pick("requireRecommendation"),
+        nudgeDecisionTimeoutMs: pick("nudgeDecisionTimeoutMs"),
+        nudgeDecisionReasoning: pick("nudgeDecisionReasoning"),
         preserveRecentMessages: pick("preserveRecentMessages"),
         preserveRecentTokens: pick("preserveRecentTokens"),
         minCompressRangeChars: rangeOf(model) ?? rangeOf(provider) ?? rangeOf(global),
