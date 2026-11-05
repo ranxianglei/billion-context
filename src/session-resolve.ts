@@ -157,21 +157,31 @@ function maxContinuationFragRun(kindsA: string[], fragsA: string[], kindsB: stri
     const nb = fb.length;
     if (na === 0 || nb === 0) return 0;
     let best = 0;
-    // s = incoming index aligned to recorded index 0; ranges so the overlap
-    // is non-empty. Within each offset the valid indices are contiguous at
-    // one end, so resetting `cur` across the out-of-range gap is exact. The
-    // caller only ever tests against CONTINUATION_MIN_RUN, so a qualifying run
-    // returns immediately — that bounds the scan on long histories instead of
-    // paying the full O(n·m) offset sweep to report an exact maximum no one
-    // reads.
-    for (let s = -(nb - 1); s <= na - 1; s++) {
-        let cur = 0;
-        for (let i = 0; i < nb; i++) {
-            const ia = i + s;
-            if (ia < 0 || ia >= na) { cur = 0; continue; }
-            cur = fa[ia] === fb[i] ? cur + 1 : 0;
-            if (cur >= CONTINUATION_MIN_RUN) return cur;
-            if (cur > best) best = cur;
+    // s = incoming index aligned to recorded index 0. Visit s=0 first, then
+    // expand by |s|: unshifted (#4778) and small-shift (#5714) continuations
+    // are found in O(n·(2k+1)) instead of paying the whole negative-offset
+    // half of the sweep first — visiting a +k shift last cost ~n²/2
+    // comparisons (measured: 280ms @ 5k cells, 4.4s @ 20k). Within each
+    // offset the valid indices are contiguous at one end, so resetting `cur`
+    // across the out-of-range gap is exact. The caller only ever tests
+    // against CONTINUATION_MIN_RUN, so a qualifying run returns immediately;
+    // visit order never changes the verdict, only how early the scan stops.
+    // A stranger (no qualifying run anywhere) still pays the full O(n·m)
+    // sweep — the exhaustive proof is the point.
+    const sMin = -(nb - 1);
+    const sMax = na - 1;
+    for (let d = 0; d <= Math.max(sMax, -sMin); d++) {
+        const offsets = d === 0 ? [0] : [d, -d];
+        for (const s of offsets) {
+            if (s < sMin || s > sMax) continue;
+            let cur = 0;
+            for (let i = 0; i < nb; i++) {
+                const ia = i + s;
+                if (ia < 0 || ia >= na) { cur = 0; continue; }
+                cur = fa[ia] === fb[i] ? cur + 1 : 0;
+                if (cur >= CONTINUATION_MIN_RUN) return cur;
+                if (cur > best) best = cur;
+            }
         }
     }
     return best;
