@@ -2622,13 +2622,16 @@ export class UnifiedStore {
     }
 
     /** Atomic turn commit for the render plane (#5664): upsert `rows`
-     *  (pos values must be contiguous ascending; under the no-recast ruling
-     *  covered ordinals are NEVER rewritten in place), journal `logEntries`
-     *  at strictly increasing ls_seq — including the kind='dead' verdict
-     *  that persists a plane death forever — and — when
-     *  `checkpointMetaJson` is given — fold the whole log into a fresh ckpt
-     *  WITH its S4 checksum in the SAME transaction (the arm cast). Any
-     *  throw → rollback → byte-identical plane.
+     *  (pos values must be contiguous ascending; under the no-UNWITNESSED-
+     *  recast ruling covered ordinals are never rewritten in place — the
+     *  single sanctioned rewrite is a WITNESSED rebase (#5643 补充裁定),
+     *  which passes `replaceAll: true` and re-inserts the full captured
+     *  table), journal `logEntries` at strictly increasing ls_seq —
+     *  including the kind='dead' verdict that persists a plane death
+     *  forever — and — when `checkpointMetaJson` is given — fold the whole
+     *  log into a fresh ckpt WITH its S4 checksum in the SAME transaction
+     *  (the arm cast, or a witnessed rebase). Any throw → rollback →
+     *  byte-identical plane.
      *  Returns the next free ls_seq. */
     pfRenderCommit(
         sid: string,
@@ -2636,11 +2639,17 @@ export class UnifiedStore {
             rows: { pos: number; rowJson: string | null }[];
             logEntries: { kind: string; payloadJson: string }[];
             checkpointMetaJson?: string;
+            /** Witnessed-rebase only: wipe this sid's row table BEFORE the
+             *  upsert so the capture replaces it wholesale (one transaction). */
+            replaceAll?: boolean;
             ts?: number;
         },
     ): number {
         if (!this.pfRenderAvailable()) throw new Error("render plane unavailable");
         return this.db.transaction((): number => {
+            if (args.replaceAll) {
+                this.db.prepare("DELETE FROM pf_render WHERE sid = ?").run(sid);
+            }
             const insRow = this.db.prepare(
                 "INSERT INTO pf_render (sid, pos, row_json) VALUES (?, ?, ?) ON CONFLICT (sid, pos) DO UPDATE SET row_json = excluded.row_json",
             );

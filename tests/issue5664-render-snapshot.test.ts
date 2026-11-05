@@ -13,13 +13,17 @@
 // the entire chain end-to-end. Equivalence with the full pass is the
 // contract, enforced here against a legacy oracle.
 //
-// NO-RECAST REGIME (owner ruling 2026-11-05, sealed during #5689 review):
-// recast is FORBIDDEN in every scenario — any stored-row divergence (core-form
-// diff vs the rewritten window, shrink, non-append capture on a live lane,
-// checksum corruption, unverifiable pre-existing snapshot) KILLS the plane
-// for that sid permanently (persisted kind='dead' log entry) and the session
-// rides the legacy full path forever after. Storage is strictly append-only
-// (+ dead markers); arm cast is legal exactly once, onto an empty table.
+// WITNESSED-REBASE REGIME (#5643 补充裁定 + owner ruling 2026-11-05):
+// the table MUST evolve with compression. A structurally-WITNESSED diverged
+// capture (fold layer's active-block multiset moved around the turn, dsh
+// native-compaction detector fired, fold usage consumed pre→post, or the
+// gate itself observed a signature move) REBASES the row table:
+// truncate from the first divergence point + whole-suffix re-append as ONE
+// transaction, checkpoint with S4 checksum, audit reset. An UNWITNESSED
+// diverged capture still KILLS the lane permanently (persisted kind='dead')
+// and rides legacy thereafter; checksum corruption stays durably dead.
+// Storage is bounded by live elements (compaction SHRINKS the table); arm
+// cast is legal exactly once, onto an empty table.
 //
 // Harness: unit-level against a REAL sqlite sidecar (UnifiedShadow shadow
 // mode), mirroring tests/fastpath-v6-msgid.test.ts; the kernel runs as a
@@ -46,7 +50,7 @@ import {
 import { PF_TAIL_IDS_HEADER } from "../src/server/fastpath.ts";
 import type { V6Outcome } from "../src/server/fastpath-v6.ts";
 import {
-    bumpAuditTick, commitRenderCapture, diffRowLists, renderPlaneGate, spliceOutboundRows, verifyRenderWindow,
+    activeBlocksSignature, bumpAuditTick, commitRenderCapture, diffRowLists, renderPlaneGate, spliceOutboundRows, verifyRenderWindow,
     watermarkV6RenderDebugState, _resetWatermarkV6RenderTestState,
     type RenderCaps,
 } from "../src/server/fastpath-v6-render.ts";
@@ -272,6 +276,59 @@ test("unit: structural divergence KILLS the plane permanently (no-recast ruling 
         assert.deepEqual(commitRenderCapture({ sessionId: "s-die", store: h.store, sid, mode: "legacy", caps, rowStrings: ['{"i":0}', '{"X":9}', '{"i":2}'], sums: { estCum: 3, textCum: 3, imgCum: 0 } }),
             { committed: false, op: "none" }, "re-capture into a dead plane is refused");
         assert.equal(h.store.pfRenderRows(sid).length, 3);
+    } finally { h.cleanup(); }
+});
+
+test("unit: witnessed structural divergence REBASES the table (snapshot evolves with compression)", (t) => {
+    const h = makeH("rebase");
+    try {
+        const b1 = makeBody([{ role: "user", content: "hello" }]);
+        const r1 = v6Eval(h, "s-rb", b1, ["id0"]);
+        r1.fin();
+        const sid = r1.sid!;
+        const caps = capsFor("text-only");
+        const preSig = activeBlocksSignature([]);
+        const newSig = activeBlocksSignature([{ blockId: "blkA", generation: "young", active: true }]);
+
+        // Forge the table on a 3-row folded-free prefix.
+        const cast = commitRenderCapture({ sessionId: "s-rb", store: h.store, sid, mode: "legacy", caps, rowStrings: ['{"i":0}', '{"i":1}', '{"i":2}'], sums: { estCum: 3, textCum: 3, imgCum: 0 }, witness: false, blocksSig: preSig });
+        assert.equal(cast.op, "cast");
+
+        // A fold lands outside bili's turn processing (#2432-class host OR
+        // the /__bili/plugin/tool endpoint executing server-side): the next
+        // model resend captures a SHRUNKEN + middle-rewritten list. With the
+        // structural witness, this rebases instead of killing.
+        const rb = commitRenderCapture({ sessionId: "s-rb", store: h.store, sid, log: h.log, mode: "legacy", caps, rowStrings: ['{"i":0}', '{"S":1}'], sums: { estCum: 2, textCum: 2, imgCum: 0 }, witness: true, blocksSig: newSig });
+        assert.deepEqual(rb, { committed: true, op: "rebase" }, `witnessed diverged capture must rebase, got ${JSON.stringify(rb)}`);
+        assert.deepEqual(h.store.pfRenderRows(sid).map((r) => r.rowJson), ['{"i":0}', '{"S":1}'], "the table now IS the compacted truth");
+        assert.equal(h.store.pfRenderCkptIntact(sid), true, "rebase folds a fresh checkpoint with S4 checksum");
+        const meta = h.store.pfRenderMeta(sid);
+        assert.ok(meta !== null && JSON.parse(meta.ckpt!.metaJson).blocksSig === newSig, "checkpoint carries the post-event block signature");
+        assert.ok(h.log.lines.some((l) => l.level === "info" && l.msg.includes("REBASED")), "rebase is logged at info level");
+
+        // Steady appends continue at the RIGHT positions after a rebase.
+        const ap = commitRenderCapture({ sessionId: "s-rb", store: h.store, sid, mode: "steady", caps, rowStrings: ['{"i":3}'], sums: { estCum: 1, textCum: 1, imgCum: 0 }, blocksSig: newSig });
+        assert.equal(ap.op, "append");
+        assert.deepEqual(h.store.pfRenderRows(sid).map((r) => ({ pos: r.pos, rowJson: r.rowJson })),
+            [{ pos: 0, rowJson: '{"i":0}' }, { pos: 1, rowJson: '{"S":1}' }, { pos: 2, rowJson: '{"i":3}' }], "positions renumber from zero over the compacted table");
+
+        // Restart: the disk fold must reproduce rows AND signature.
+        // (The forged unit table ignores the identity plane's ledger size,
+        // so maxPos mirrors s-die's hand-rolled alignment: 3 rows ⇒ 2.)
+        _resetWatermarkV6RenderTestState();
+        const base = {
+            sessionId: "s-rb", session: { id: "s-rb", state: createInitialState() } as unknown as Session,
+            store: h.store, engagedHit: true, armedTurn: false, isTitleGen: false, sid,
+            maxPos: 2, tokenCount: 500, modelContextLimit: MODEL_LIMIT, caps,
+            snapshotLaneActive: false, absorbActive: false, ccrOn: false, foldUsagePending: false, markerNonZero: false,
+        };
+        // Positive side of the pair: matching signature → green, rows intact.
+        const gMatch = renderPlaneGate({ ...base, blocksSig: newSig });
+        assert.ok(gMatch.ok, `matching post-rebase signature must gate green, got ${JSON.stringify(gMatch)}`);
+        if (gMatch.ok) assert.equal(gMatch.rw.rows.length, 3, "hydrate must reconstruct the rebased table + tail append");
+        // Negative side (#3617): a STALE session signature (pre-rebase) must
+        // NOT gate green — exactly one red round precedes the next full pass.
+        assert.deepEqual(renderPlaneGate({ ...base, blocksSig: preSig }), { ok: false, reason: "blocks-changed" }, "stale signature stays red");
     } finally { h.cleanup(); }
 });
 
@@ -502,7 +559,7 @@ test("golden: cached-prefix splice equals the legacy full-path bytes end-to-end"
         // this tier exercises is the accumulation ALGEBRA — each row counted
         // exactly once with its own cost, tail-only deltas on steady rounds.
         const rowCost = (rs: string[]): number => rs.reduce((s, x) => s + x.length, 0);
-        let op: { committed: boolean; op: "none" | "append" | "cast" } = { committed: false, op: "none" };
+        let op: { committed: boolean; op: "none" | "append" | "cast" | "rebase" } = { committed: false, op: "none" };
         // No-recast regime: once the lane dies, production stops paying for
         // capture strings entirely (the seam skips the station-2 commit); the
         // lane rides pure legacy until the session ends. Mirror that here.
