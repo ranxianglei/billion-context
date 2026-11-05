@@ -542,10 +542,13 @@ export async function hydrateResignPending(): Promise<void> {
             // the whole-map merge discipline the file write used to enforce.
             if (!c || f.lastSeen > c.lastSeen || (f.lastSeen === c.lastSeen && f.count >= c.count)) merged[k] = f;
         }
-        if (Object.keys(fileMap).length > 0 && (kvRows === null || Object.keys(kvRows).length === 0)) {
-            // one-time migration of the legacy file into the kv row
+        // one-time migration, per-entry like the sibling modules: any file scheme
+        // missing from the kv row travels up — a late file row must not be
+        // stranded just because the row already holds other schemes (#5757 review).
+        const missingFile = Object.keys(fileMap).filter((k) => !(k in (kvRows ?? {})));
+        if (missingFile.length > 0) {
             await store.setKvAsync(PENDING_NS, PENDING_KEY, merged);
-            loggerLog("info", `[resign] imported ${Object.keys(fileMap).length} pending-refusal entr(y/ies) from the legacy JSON file into unified storage (kv_store namespace "${PENDING_NS}")`);
+            loggerLog("info", `[resign] imported ${missingFile.length} pending-refusal entr(y/ies) from the legacy JSON file into unified storage (kv_store namespace "${PENDING_NS}")`);
         }
     } catch (err) {
         pendingWarnOnce("hydrate", err);
