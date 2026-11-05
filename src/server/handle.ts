@@ -1770,11 +1770,31 @@ async function handleRequest(
             }
             if (!resume) {
                 const affinityList = affinityMessageList();
-                const matched = derivedParent !== undefined
+                const strict = derivedParent !== undefined
                     ? prefixAffinity.findResumeParentWithin(derivedParent, affinityList, sessionId)
                     : prefixAffinity.findResumeParent(affinityList, sessionId);
+                let matched: { sessionId: string; sharedDepth: number } | null = strict;
+                let matchedVia = strict !== null ? `${strict.sharedDepth} msg(s) byte-exact prefix` : "";
+                if (!matched && derivedParent === undefined) {
+                    // #5738: a host FORK replays the parent's history as a
+                    // prefix copy under a fresh id — equal-depth or shorter.
+                    // The strictly-deeper resume gate above models CONTINU-
+                    // ATION, so fork shapes structurally miss it while the
+                    // anonymous lane adopts the same shape (#629). Detect
+                    // them here (undeclared scope only: a DECLARED parent is
+                    // already linked + adopted unconditionally by the #1333
+                    // weak path below, no byte match required). Adoption
+                    // stays COPY semantics downstream (per-block raw-id
+                    // judged), so the equal-depth duplicate-vs-branch
+                    // ambiguity #1486 rejected cannot misattribute bytes.
+                    const forked = prefixAffinity.findForkParent(affinityList, sessionId);
+                    if (forked) {
+                        matched = { sessionId: forked.sessionId, sharedDepth: forked.sharedDepth };
+                        matchedVia = `fork ${forked.shape} (${forked.sharedDepth} msg(s) byte-exact)`;
+                    }
+                }
                 if (matched) {
-                    resume = { sessionId: matched.sessionId, sharedDepth: matched.sharedDepth, via: `${matched.sharedDepth} msg(s) byte-exact prefix` };
+                    resume = { sessionId: matched.sessionId, sharedDepth: matched.sharedDepth, via: matchedVia };
                 } else {
                     // #4264: a miss must not be silent — equal-depth replay,
                     // parent-chain absence and head break need completely
