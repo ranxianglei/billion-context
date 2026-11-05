@@ -611,11 +611,16 @@ export async function prepareOpenai(
             }
         } else {
             rebuiltMessages = await mapEgress(processedMessages);
-            // Lane-durably-dead sessions never arm/commit again — keep the
-            // strings null so station 2 skips both their build (O(n) per
-            // turn) and the doomed commit call. Rows store the post-rewrite
-            // core form (#5643 §5), so capture from cores, never wire bytes.
-            if (!renderLaneDead) renderedCaptureStrings = processedMessages.map((m) => JSON.stringify(m));
+            // Capture strings exist ONLY for turns whose render plane can
+            // actually commit them: the gate block ran (renderCapturedSid
+            // set ⇒ v6 engaged hit + watermarkV6Render on) AND the lane is
+            // not durably dead. Building them for anything else would tax
+            // EVERY openai-wire turn (feature OFF included) with an O(n)
+            // full-view stringify that station 2 skips anyway — exactly the
+            // cost class this plane exists to remove. Rows store the
+            // post-rewrite core form (#5643 §5), so capture from cores,
+            // never wire bytes.
+            if (renderCapturedSid !== null && !renderLaneDead) renderedCaptureStrings = processedMessages.map((m) => JSON.stringify(m));
             renderedTailObjects = [];
             renderedImageDelta = 0;
         }
