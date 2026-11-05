@@ -42,7 +42,7 @@ import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decision
 import { featureEnabled } from "../rollout.js";
 import { evaluateWatermarkFastpath, finalizeWatermarkTurn, type FastpathHit, type FastpathOutcome } from "./fastpath.js";
 import { evaluateWatermarkV6, finalizeWatermarkV6, FastpathV6IdentityFault, PF_SESSION_HEADER, watermarkV6DebugState, type V6Outcome } from "./fastpath-v6.js";
-import { activeBlocksSignature, bumpAuditTick, commitRenderCapture, renderPlaneGate, spliceOutboundRows, verifyRenderWindow, type RenderCaps, type RenderGateDecision, type RenderWorld } from "./fastpath-v6-render.js";
+import { activeBlocksSignature, boundCoveredPositions, bumpAuditTick, commitRenderCapture, renderPlaneGate, spliceOutboundRows, verifyRenderWindow, type RenderCaps, type RenderGateDecision, type RenderWorld } from "./fastpath-v6-render.js";
 import { getStore } from "../persist.js";
 import { collectRequestIds, probeRequestMembership } from "../request-membership.js";
 
@@ -811,12 +811,13 @@ export async function prepareOpenai(
         if (Object.keys(wpResponseHeaders).length === 0) wpResponseHeaders = undefined;
     }
     // #5664 station 2 — ONE snapshot commit per engaged turn: steady append
-    // (fast rounds), arm cast / audit diff / witnessed REBASE on structural
-    // divergence / UNWITNESSED divergence-KILL (full-path rounds carry the
-    // complete captured array; #5643 补充裁定：快照必须随压缩演进 — a
-    // structurally-witnessed diverged capture rebases the table, an
-    // unwitnessed one still kills the lane for the sid). Fail-soft for this
-    // turn only — the identity plane already committed independently.
+    // (fast rounds), arm cast / audit diff / evidence-addressed APPLY
+    // (#5643 附录二：the table evolves by single-tx row events — covered cells
+    // upserted, prefix bytes + checksums untouched) / witnessed REBASE as
+    // COARSE tier for count-changing layout events / UNWITNESSED divergence-
+    // KILL (full-path rounds carry the complete captured array; #5643 补充
+    // 裁定：快照必须随压缩演进). Fail-soft for this turn only — the identity
+    // plane already committed independently.
     if (renderedCaptureStrings !== null && renderCapturedSid !== null && renderCapturedCaps !== null && featureEnabled("watermarkV6Render")) {
         const store = getStore();
         if (store.pfRenderAvailable()) {
@@ -837,14 +838,18 @@ export async function prepareOpenai(
             //    leave the signature byte-equal, hence the explicit term);
             // ③ fold usage was pending pre-turn and got consumed by it;
             // ④ the gate itself had observed the signature move pre-turn
-            //    ("blocks-changed" red sent this request down the full path).
+            //    ("blocks-changed" red sent this request down the full path);
+            // ⑤ the first-scene journal is pending materialization
+            //    ("structural-pending" red forced this full pass — its very
+            //    existence is the evidence).
             // Absent ALL of them, a diverged capture stays a kill verdict.
             const renderPostBlocksSig = activeBlocksSignature(session.state.blocks);
             const renderWitness =
                 dshRebased ||
                 renderPostBlocksSig !== renderPreBlocksSig ||
                 (renderFoldUsagePre && session.stats.pendingFoldUsage !== true) ||
-                renderGateReason === "blocks-changed";
+                renderGateReason === "blocks-changed" ||
+                renderGateReason === "structural-pending";
             const capOp = commitRenderCapture({
                 sessionId,
                 store,
@@ -854,6 +859,10 @@ export async function prepareOpenai(
                 rowStrings: steadyTailRows,
                 witness: renderWitness,
                 blocksSig: renderPostBlocksSig,
+                // #5643 附录二：kernel-evidence coverage for the fine-grained
+                // apply tier (legacy turns only — steady never classifies;
+                // empty-block sessions short-circuit before touching storage).
+                coveredPos: renderFast !== null ? undefined : boundCoveredPositions(store, renderCapturedSid, session.state.blocks),
                 sums: {
                     estCum: estimateCoreMessagesUpper(sumsSrc),
                     textCum: estimateCoreMessages(sumsSrc),

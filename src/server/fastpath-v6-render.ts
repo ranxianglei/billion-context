@@ -36,6 +36,7 @@
 //  P7 mirrors are caches (LRU byte budget); losing one = DB re-read.
 import type { SessionStore } from "../persist.js";
 import type { Session } from "../session.js";
+import { coveredRealHistoryIds } from "../session.js";
 
 type LogFn = (level: string, msg: string) => void;
 
@@ -114,6 +115,12 @@ interface RenderMeta {
     estCum: number;
     textCum: number;
     imgCum: number;
+    /** Covered positions journaled at the compression FIRST SCENE (#5643
+     *  附录二：同步落表) but not yet materialized by the reconcile round:
+     *  the plane serves no green turns while > 0 (gate red
+     *  'structural-pending') and a legacy capture that clears it refreshes
+     *  the meta atomically (absent ⇒ 0). */
+    pendingDeletes?: number;
     /** Active-block signature at this checkpoint (absent on pre-#5643补充裁定
      *  checkpoints ⇒ ""). Folded forward by post-ckpt 'rebase'/'append' log
      *  entries during hydration. */
@@ -144,6 +151,16 @@ export interface RenderWorld {
     textCum: number;
     /** Cumulative image-reserve contribution of frozen rows. */
     imgCum: number;
+    /** Absolute ledger positions backing `rows` (ascending distinct; index i
+     *  ↔ positions[i]). Dense 0..n-1 holds for every V1 op (the journal is
+     *  a pending DELETE, rows themselves only move via witnessed ops); sparse
+     *  admission stays accepted defensively — emission order is array order,
+     *  and a lagging trailing max is a normal transient (gate span-check). */
+    positions: number[];
+    /** Covered positions journaled at first scene awaiting materialization
+     *  (== the mirrored ckpt meta field; both reset together). While > 0 the
+     *  gate keeps the plane red ('structural-pending'). */
+    pendingDeletes: number;
     /** Set when this sid's plane is dead (no-recast regime) — diagnostic. */
     dead?: boolean;
     /** Green (fast-served) engaged-turn tick — % PF_RENDER_AUDIT_EVERY === 0
@@ -251,6 +268,7 @@ function hydrateMirror(store: SessionStore, sid: string, log?: LogFn): RenderWor
         let expectedCount = -1;
         let capsJson = "";
         let blocksSig = "";
+        let pendingDeletes = 0;
         if (metaRead?.ckpt) {
             const m = JSON.parse(metaRead.ckpt.metaJson) as RenderMeta;
             estCum = m.estCum ?? 0;
@@ -258,6 +276,7 @@ function hydrateMirror(store: SessionStore, sid: string, log?: LogFn): RenderWor
             imgCum = m.imgCum ?? 0;
             expectedCount = m.rowCount;
             blocksSig = m.blocksSig ?? "";
+            pendingDeletes = m.pendingDeletes ?? 0;
             capsJson = metaRead.ckpt.metaJson;
             for (const e of metaRead.log) {
                 const p = JSON.parse(e.payloadJson) as { de?: number; dt?: number; di?: number; n?: number; capsJson?: string; reason?: string; sharedPrefix?: number; from?: number; to?: number } & Partial<RenderMeta>;
@@ -281,6 +300,11 @@ function hydrateMirror(store: SessionStore, sid: string, log?: LogFn): RenderWor
                     // entry here means an interrupted fold — treat as count
                     // reset to its journaled target.
                     if (typeof p.to === "number") expectedCount = p.to;
+                } else if (e.kind === "delete") {
+                    // First-scene fold journal (#5643 附录二): the journal is
+                    // written WITH its own checkpoint, so a surviving entry
+                    // adds to the meta's base count (defensive accumulation).
+                    pendingDeletes += p.n ?? 0;
                 }
             }
         } else {
@@ -288,13 +312,20 @@ function hydrateMirror(store: SessionStore, sid: string, log?: LogFn): RenderWor
         }
         const rows: string[] = new Array(rowsRaw.length);
         const rowsParsed: unknown[] = new Array(rowsRaw.length);
+        const positions: number[] = new Array(rowsRaw.length);
         for (let i = 0; i < rowsRaw.length; i++) {
             const rj = rowsRaw[i].rowJson;
-            if (rj === null || rowsRaw[i].pos !== i) {
-                killRenderPlane(store, sid, `row-table inconsistency at pos ${rowsRaw[i].pos} (expected contiguous ${i})`, log);
+            const pos = rowsRaw[i].pos;
+            if (rj === null) {
+                killRenderPlane(store, sid, `row-table inconsistency at pos ${pos} (NULL payload)`, log);
+                return null;
+            }
+            if (i > 0 && pos <= positions[i - 1]) {
+                killRenderPlane(store, sid, `row-table inconsistency at pos ${pos} (expected strictly ascending)`, log);
                 return null;
             }
             rows[i] = rj;
+            positions[i] = pos;
             try {
                 rowsParsed[i] = JSON.parse(rj);
             } catch {
@@ -327,7 +358,7 @@ function hydrateMirror(store: SessionStore, sid: string, log?: LogFn): RenderWor
             killRenderPlane(store, sid, "unparseable capabilities fingerprint", log);
             return null;
         }
-        const rw: RenderWorld = { sid, rows, rowsParsed, caps, blocksSig, estCum, textCum, imgCum, auditTick: 0 };
+        const rw: RenderWorld = { sid, rows, rowsParsed, positions, caps, blocksSig, estCum, textCum, imgCum, pendingDeletes, auditTick: 0 };
         touchMirror(rw);
         return rw;
     } catch {
@@ -377,8 +408,8 @@ export type RenderGateDecision =
 /** Stable red-reason vocabulary (test-pinned, one per condition): not-engaged,
  *  arm-turn, title-gen, plane-unavailable, pressure, snapshot-lane,
  *  blocks-changed, fold-pending, absorb-active, ccr-on, markers, lane-dead,
- *  hydrate-failed, caps-mismatch, audit-due, no-rows, no-plane-geometry,
- *  rows-misaligned. */
+ *  hydrate-failed, caps-mismatch, structural-pending, audit-due, no-rows,
+ *  no-plane-geometry, rows-misaligned. */
 
 /** G1 conservative conjunction — every red condition returns the reason so
  *  the lane stays debuggable; the fallback path is unchanged baseline. */
@@ -401,6 +432,10 @@ export function renderPlaneGate(args: RenderGateArgs): RenderGateDecision {
     // returning null — report the durable reason, not the transient one.
     if (rw === undefined) return off(deadSids.has(args.sid) ? "lane-dead" : "hydrate-failed");
     if (!capsEqual(rw.caps, args.caps)) return off("caps-mismatch");
+    // #5643 附录二：first-scene journal landed but the reconcile round has
+    // not yet confirmed/materialized it — the plane stays red until ONE
+    // legacy pass verifies the layout against truth (never guess).
+    if (rw.pendingDeletes > 0) return off("structural-pending");
     // #5643 补充裁定：快照必须随压缩演进。 Replaces the old blanket
     // "blocks-active" red-out: a folded session KEEPS SERVING FAST as long as
     // nothing changed structurally since the table's own commit. A moved
@@ -412,14 +447,18 @@ export function renderPlaneGate(args: RenderGateArgs): RenderGateDecision {
     if (rw.auditTick % PF_RENDER_AUDIT_EVERY === 0 && rw.auditTick > 0) return off("audit-due");
     if (rw.rows.length < 1) return off("no-rows");
     if (args.maxPos < 0) return off("no-plane-geometry");
-    // Alignment invariant: rows are captured per engaged round and always
-    // number one row per ledger element (row i ↔ pos i), so at GATE time —
-    // which runs BEFORE this round's finalize advances the plane —
-    // rows.length must equal maxPos+1. A mismatch means an earlier commit
-    // failed soft (disk ahead/behind the mirror): fall back to the legacy
-    // byte path; the plane cannot self-heal anymore (no-recast regime) —
-    // a persistent misalignment will die its next structural diff.
-    if (rw.rows.length !== args.maxPos + 1) return off("rows-misaligned");
+    // Alignment invariant: every stored pos is a LIVE ledger position ≤ the
+    // committed plane end (a lagging trailing max is a normal transient —
+    // the finalize step advances the identity world AFTER station 2 commits,
+    // and the next steady append closes the gap). Holes (sparse abs-pos
+    // table) do NOT red-gate: emission order is the sorted-row order and any
+    // stale layout rides red through blocks-changed/structural-pending, so
+    // green always implies the table mirrors the true prefix. A pos outside
+    // [0, maxPos] means an earlier commit failed soft (disk ahead of the
+    // mirror): ride the legacy byte path — no self-heal (no-recast regime).
+    if (rw.positions.length === 0 || rw.positions[0] < 0 || rw.positions[rw.positions.length - 1] > args.maxPos) {
+        return off("rows-misaligned");
+    }
     registerSidForSession(args.sessionId, args.sid);
     // Window input = last F identity elements (+ new cores added by caller);
     // positions are contiguous because the ledger grows forward only (P3).
@@ -507,12 +546,18 @@ interface CaptureArgs {
     /** steady: ONLY the new tail raw strings; legacy: the FULL captured rows. */
     rowStrings: string[];
     sums: CaptureSums; // steady: DELTAS for the tail; legacy: ABSOLUTE totals.
+    /** #5643 附录二：absolute positions COVERED by active fold blocks (kernel
+     *  evidence → ledger pos via pf_ledger.core_id). Only these cells may
+     *  change under a fine-grained event-apply; anything else differing is
+     *  unexplained — routed to the coarse witnessed tier or killed. */
+    coveredPos?: Set<number>;
     log?: LogFn;
 }
 
 /** 'equal' | 'append' | 'diverged' — prefix-identical growth vs anything
- *  else (byte diff, shrink, non-monotonic growth). Under the no-recast
- *  ruling every 'diverged' verdict KILLS the plane. */
+ *  else (byte diff, shrink, non-monotonic growth). A 'diverged' verdict is
+ *  reconciled by evidence (#5643 附录二): kernel-covered cells may move
+ *  (fine-grained apply / coarse witnessed rebase), anything else kills. */
 export function diffRowLists(prev: string[], cur: string[]): "equal" | "append" | "diverged" {
     if (prev.length === cur.length) {
         for (let i = 0; i < prev.length; i++) if (prev[i] !== cur[i]) return "diverged";
@@ -533,7 +578,7 @@ export function diffRowLists(prev: string[], cur: string[]): "equal" | "append" 
  *  stops advancing until restart or caps change allows re-capture again. */
 const nulRejectedSids = new Set<string>();
 
-export function commitRenderCapture(args: CaptureArgs): { committed: boolean; op: "none" | "append" | "cast" | "rebase" } {
+export function commitRenderCapture(args: CaptureArgs): { committed: boolean; op: "none" | "append" | "cast" | "rebase" | "apply" } {
     const { store, sid, caps, log } = args;
     if (deadSids.has(sid)) {
         // Belt-and-braces behind the gate: a dead sid NEVER arms/commits again.
@@ -587,7 +632,7 @@ export function commitRenderCapture(args: CaptureArgs): { committed: boolean; op
             });
             if (okSeq === null) return { committed: false, op: "none" };
             const parsed = rows.map((rj) => safeParse(rj));
-            mirrors.set(sid, { sid, rows: [...rows], rowsParsed: parsed, caps: { ...caps }, blocksSig: args.blocksSig ?? "", estCum: args.sums.estCum, textCum: args.sums.textCum, imgCum: args.sums.imgCum, auditTick: 0 });
+            mirrors.set(sid, { sid, rows: [...rows], rowsParsed: parsed, positions: rows.map((_, i) => i), caps: { ...caps }, blocksSig: args.blocksSig ?? "", estCum: args.sums.estCum, textCum: args.sums.textCum, imgCum: args.sums.imgCum, pendingDeletes: 0, auditTick: 0 });
             registerSidForSession(args.sessionId, sid);
             return { committed: true, op: "cast" };
         }
@@ -606,6 +651,7 @@ export function commitRenderCapture(args: CaptureArgs): { committed: boolean; op
         const parsed = rows.map((rj) => safeParse(rj));
         rw.rows.push(...rows);
         rw.rowsParsed.push(...parsed);
+        for (let i = 0; i < rows.length; i++) rw.positions.push(prevLen + i);
         rw.estCum += args.sums.estCum;
         rw.textCum += args.sums.textCum;
         rw.imgCum += args.sums.imgCum;
@@ -619,12 +665,37 @@ export function commitRenderCapture(args: CaptureArgs): { committed: boolean; op
     // legacy full-capture: diff against truth, minimal commit.
     const verdict = diffRowLists(rw.rows, args.rowStrings);
     if (verdict === "equal") {
+        if (rw.pendingDeletes > 0) {
+            // Zero-event materialization (#5643 附录二): the first-scene
+            // journal is confirmed — bytes moved nowhere (the plugin lane's
+            // agent owns summary rendering, so bili-side folds usually change
+            // nothing on the wire), the meta is refreshed atomically with the
+            // live signature and the flag cleared. No row events, no log line
+            // (there was nothing to write), no witness needed.
+            const m: RenderMeta = { v: 1, caps, rowCount: rw.rows.length, estCum: args.sums.estCum, textCum: args.sums.textCum, imgCum: args.sums.imgCum, blocksSig: args.blocksSig ?? rw.blocksSig ?? "", pendingDeletes: 0 };
+            const okSeq = store.pfRenderCommit(sid, { rows: [], logEntries: [], checkpointMetaJson: metaJson(m) });
+            if (okSeq === null) return { committed: false, op: "none" };
+            rw.caps = { ...caps };
+            rw.blocksSig = args.blocksSig ?? rw.blocksSig;
+            rw.estCum = args.sums.estCum;
+            rw.textCum = args.sums.textCum;
+            rw.imgCum = args.sums.imgCum;
+            rw.pendingDeletes = 0;
+            touchMirror(rw);
+            return { committed: true, op: "apply" };
+        }
         rw.caps = { ...caps }; // keep caps fresh even when bytes match
         rw.blocksSig = args.blocksSig ?? rw.blocksSig;
         touchMirror(rw);
         return { committed: true, op: "none" };
     }
     if (verdict === "append") {
+        if (rw.pendingDeletes > 0) {
+            // Growth over a pending journal: the table layout must be
+            // re-derived wholesale — fall through to the classified tier
+            // below (never half-append over an unconfirmed structural event).
+            return reconcileLegacyDiverged(args, rw, store, sid, caps, metaJson);
+        }
         const prevLen = rw.rows.length;
         const tail = args.rowStrings.slice(prevLen);
         const delta = {
@@ -648,27 +719,44 @@ export function commitRenderCapture(args: CaptureArgs): { committed: boolean; op
         touchMirror(rw);
         return { committed: true, op: "append" };
     }
-    // DIVERGED (byte diff at any position, or shrink): the ONLY repair the
-    // old design offered was a recast — rewriting covered ordinals and
-    // deleting the excess. Owner ruling 2026-11-05 forbids that in every
-    // scenario: the plane is KILLED PERMANENTLY instead and the session
-    // rides the legacy full path from here on (bytes stay correct; the
-    // cache simply never serves this sid again).
     // DIVERGED (byte diff at any position, or shrink): the ORIGINAL design
     // offered only recast; the owner ruling of 2026-11-05 sealed that door,
-    // and the #5643 补充裁定 re-opened EXACTLY ONE gate in it — a WITNESSED
-    // structural event (the turn's server-side evidence that the fold layer
-    // rewrote the layout: block-multiset signature moved around the kernel
-    // pass, dsh native-compaction rebase, or fold usage consumed) authorizes
-    // a REBASE: the whole table is replaced by THIS capture in one
-    // transaction, journaled as kind='rebase' under a fresh checkpoint.
-    // Without a witness, divergence is still substrate corruption and KILLS
-    // the plane permanently — that semantics is byte-for-byte unchanged.
-    if (args.witness === true) {
-        let common = 0;
+    // and the #5643 补充裁定 + 附录二 re-opened EXACTLY ONE gate in it —
+    // reconciliation by EVIDENCE: cells whose absolute position sits inside
+    // the fold coverage reported by the compression engine itself (pf_ledger
+    // core_id ↔ block effectiveMessageIds binding) are the engine's OUTPUT
+    // rows and may move; EVERY other changed/lost cell is unexplained and
+    // without the turn's server-side witness (block signature moved, native-
+    // compaction rebase fired, fold usage consumed) the plane KILLS — that
+    // semantics is byte-for-byte unchanged. Two tiers: fine-grained APPLY
+    // (count-preserving: upsert exactly the covered cells, single tx, prefix
+    // bytes+checksums untouched) and the COARSE WITNESSED REBASE (count-
+    // changing layout events — client compaction, restore-class churn —
+    // replace the whole table contiguously; V1 boundary documented).
+    if (args.witness === true && rw.rows.length !== args.rowStrings.length) {
+        return rebaseOnWitness(args, rw, store, sid, caps, metaJson, log);
+    }
+    return reconcileLegacyDiverged(args, rw, store, sid, caps, metaJson, log);
+}
+
+/** Coarse tier: witnessed count-changing structural event — the whole table
+ *  is replaced by THIS capture in one transaction, journaled kind='rebase'
+ *  under a fresh checkpoint. V1 boundary: the rebuild reindexes contiguously
+ *  (survivors past the gap shift pos); pos-preserving reconciliation is the
+ *  follow-up (flagged in the PR). */
+function rebaseOnWitness(
+    args: CaptureArgs,
+    rw: RenderWorld,
+    store: SessionStore,
+    sid: string,
+    caps: RenderCaps,
+    metaJson: (m: RenderMeta) => string,
+    log?: LogFn,
+): { committed: boolean; op: "none" | "append" | "cast" | "rebase" | "apply" } {
+    let common = 0;
         while (common < rw.rows.length && common < args.rowStrings.length && rw.rows[common] === args.rowStrings[common]) common += 1;
         const prevLen = rw.rows.length;
-        const m: RenderMeta = { v: 1, caps, rowCount: args.rowStrings.length, estCum: args.sums.estCum, textCum: args.sums.textCum, imgCum: args.sums.imgCum, blocksSig: args.blocksSig ?? rw.blocksSig };
+        const m: RenderMeta = { v: 1, caps, rowCount: args.rowStrings.length, estCum: args.sums.estCum, textCum: args.sums.textCum, imgCum: args.sums.imgCum, blocksSig: args.blocksSig ?? rw.blocksSig ?? "" };
         const okSeq = store.pfRenderCommit(sid, {
             replaceAll: true,
             rows: args.rowStrings.map((rj, pos) => ({ pos, rowJson: rj })),
@@ -685,12 +773,82 @@ export function commitRenderCapture(args: CaptureArgs): { committed: boolean; op
         rw.textCum = args.sums.textCum;
         rw.imgCum = args.sums.imgCum;
         rw.auditTick = 0; // the rebase round IS the audit — start fresh
+        rw.positions = args.rowStrings.map((_, i) => i);
+        rw.pendingDeletes = 0;
         touchMirror(rw);
         log?.("info", `[${sid}] #5664 render plane REBASED on witnessed structural event (shared prefix ${common} row(s), table ${prevLen} -> ${args.rowStrings.length} rows)`);
         return { committed: true, op: "rebase" };
+}
+
+/** Fine-grained tier (#5643 附录二：事件化更新) — the snapshot evolves BY
+ *  EVENTS instead of being replaced: every cell is classified against the
+ *  captured truth, and ONLY the fold-covered cells may differ. The result is
+ *  ONE transaction upserting exactly those cells plus a fresh checkpoint
+ *  meta (rowCount kept, pendingDeletes cleared, live signature) — stored
+ *  prefix bytes and their checksums stay untouched (O(diff)). Count-changing
+ *  captures never land here (the caller routes them to the coarse tier);
+ *  sparse tables likewise ride the coarse door defensively. An UNEXPLAINED
+ *  delta without a witness kills the plane verbatim as before. */
+function reconcileLegacyDiverged(
+    args: CaptureArgs,
+    rw: RenderWorld,
+    store: SessionStore,
+    sid: string,
+    caps: RenderCaps,
+    metaJson: (m: RenderMeta) => string,
+    log?: LogFn,
+): { committed: boolean; op: "none" | "append" | "cast" | "rebase" | "apply" } {
+    if (rw.rows.length !== args.rowStrings.length || !rw.positions.every((p, i) => p === i)) {
+        if (args.witness === true) return rebaseOnWitness(args, rw, store, sid, caps, metaJson, log);
+        killRenderPlane(store, sid, `structural divergence (stored=${rw.rows.length} rows, captured=${args.rowStrings.length})`, log);
+        return { committed: false, op: "none" };
     }
-    killRenderPlane(store, sid, `structural divergence (stored=${rw.rows.length} rows, captured=${args.rowStrings.length})`, log);
-    return { committed: false, op: "none" };
+    const n = rw.rows.length;
+    const covered = args.coveredPos ?? new Set<number>();
+    const changed: number[] = [];
+    let unexplained = 0;
+    for (let i = 0; i < n; i++) {
+        if (rw.rows[i] !== args.rowStrings[i]) {
+            if (covered.has(i)) changed.push(i);
+            else unexplained += 1;
+        }
+    }
+    if (unexplained > 0) {
+        // Bytes outside the fold coverage changed — not an event the kernel
+        // can vouch for (external rewrite of stored truth): substrate
+        // corruption. Witness does NOT save this (it would bless foreign
+        // bytes) — kill, same string as before.
+        killRenderPlane(store, sid, `structural divergence (stored=${rw.rows.length} rows, captured=${args.rowStrings.length})`, log);
+        return { committed: false, op: "none" };
+    }
+    if (changed.length > 0 && args.witness !== true) {
+        // Covered cells moved WITHOUT this turn's server-side evidence:
+        // could be a fold this proxy did not run — unverifiable here, same
+        // kill as unwitnessed divergence (byte-for-byte unchanged semantics).
+        killRenderPlane(store, sid, `structural divergence (stored=${rw.rows.length} rows, captured=${args.rowStrings.length})`, log);
+        return { committed: false, op: "none" };
+    }
+    const m: RenderMeta = { v: 1, caps, rowCount: n, estCum: args.sums.estCum, textCum: args.sums.textCum, imgCum: args.sums.imgCum, blocksSig: args.blocksSig ?? rw.blocksSig ?? "", pendingDeletes: 0 };
+    const okSeq = store.pfRenderCommit(sid, {
+        rows: changed.map((pos) => ({ pos, rowJson: args.rowStrings[pos] })),
+        logEntries: changed.length > 0 ? [{ kind: "apply", payloadJson: JSON.stringify({ u: changed, a: [], d: [] }) }] : [],
+        checkpointMetaJson: metaJson(m),
+    });
+    if (okSeq === null) return { committed: false, op: "none" };
+    for (const pos of changed) {
+        rw.rows[pos] = args.rowStrings[pos];
+        rw.rowsParsed[pos] = safeParse(args.rowStrings[pos]);
+    }
+    rw.caps = { ...caps };
+    rw.blocksSig = args.blocksSig ?? rw.blocksSig;
+    rw.estCum = args.sums.estCum;
+    rw.textCum = args.sums.textCum;
+    rw.imgCum = args.sums.imgCum;
+    rw.pendingDeletes = 0;
+    rw.auditTick = 0; // the apply round IS the audit — start fresh
+    touchMirror(rw);
+    log?.("info", `[${sid}] #5664 render plane APPLIED ${changed.length} covered cell(s) as events (prefix + checksums untouched)`);
+    return { committed: true, op: "apply" };
 }
 
 function safeParse(json: string): unknown {
@@ -699,6 +857,98 @@ function safeParse(json: string): unknown {
     } catch {
         return {};
     }
+}
+
+// ---------------------------------------------------------------------------
+// First-scene fold journal (#5643 附录二：压缩请求内同步落表)
+// ---------------------------------------------------------------------------
+
+/** Bind the compression engine's OWN output back to ledger absolute
+ *  positions: every real-history id covered by ACTIVE fold blocks maps onto
+ *  the pf_ledger rows whose core_id column carries that kernel message id.
+ *  This is the event-addressability anchor — covered cells may move under an
+ *  apply; everything else may not. No store read when nothing is folded.
+ *  Exported: prepare-openai feeds the same set into the capture classifier. */
+export function boundCoveredPositions(
+    store: SessionStore,
+    sid: string,
+    blocks: readonly { active?: boolean; effectiveMessageIds?: readonly string[] }[],
+): Set<number> {
+    const out = new Set<number>();
+    const ids = coveredRealHistoryIds(blocks);
+    if (ids.size === 0) return out;
+    const rows = store.pfLedgerIds(sid);
+    if (!rows) return out;
+    for (const r of rows) {
+        for (const t of r.coreId.split("|")) {
+            if (t && ids.has(t)) {
+                out.add(r.pos);
+                break;
+            }
+        }
+    }
+    return out;
+}
+
+/** Synchronous first-scene write: called from the compress TOOL endpoint the
+ *  moment a fold lands (and reachable from any other in-process fold site).
+ *  Journals the covered positions + live block signature into the row table's
+ *  checkpoint meta as ONE transactional DML batch — no op-log replay layer,
+ *  no version columns (owner ruling 2026-11-05). Row bytes stay untouched:
+ *  on plugin lanes the agent owns summary rendering, so the wire usually
+ *  does NOT change at all (KDD #7); the next model turn rides ONE forced red
+ *  round ('structural-pending') that materializes/verifies the layout and
+ *  clears the flag. Fail-soft per sid — the tool response never depends on
+ *  this plane. Returns how many positions were journaled. */
+export function recordServerSideFold(
+    sessionId: string,
+    session: Session,
+    store: SessionStore,
+    log?: LogFn,
+): number {
+    const set = sessionSids.get(sessionId);
+    if (!set || set.size === 0) return 0;
+    let total = 0;
+    const sig = activeBlocksSignature(session.state.blocks);
+    for (const sid of set) {
+        if (deadSids.has(sid)) continue;
+        let rw: RenderWorld | undefined = mirrors.get(sid);
+        if (!rw) {
+            const hydrated = hydrateMirror(store, sid, log);
+            if (hydrated === null) continue; // not armed yet: the next model turn arms directly onto the post-fold form
+            mirrors.set(sid, hydrated);
+            rw = hydrated;
+        }
+        try {
+            // Idempotent: the mirror's recorded signature already equals
+            // THIS block state ⇒ this "compress" moved nothing structural
+            // beyond what was journaled under that signature (pending stays
+            // until its forced reconcile round clears it).
+            if (rw.blocksSig === sig) continue;
+            const covered = boundCoveredPositions(store, sid, session.state.blocks);
+            const hit = rw.positions.filter((p) => covered.has(p));
+            if (hit.length === 0) {
+                rw.blocksSig = sig;
+                touchMirror(rw);
+                continue;
+            }
+            const m: RenderMeta = { v: 1, caps: { ...rw.caps }, rowCount: rw.rows.length, estCum: rw.estCum, textCum: rw.textCum, imgCum: rw.imgCum, blocksSig: sig, pendingDeletes: rw.pendingDeletes + hit.length };
+            const okSeq = store.pfRenderCommit(sid, {
+                rows: [],
+                logEntries: [{ kind: "delete", payloadJson: JSON.stringify({ n: hit.length, pos: [...hit].sort((a, b) => a - b) }) }],
+                checkpointMetaJson: JSON.stringify(m),
+            });
+            if (okSeq === null) throw new Error("pfRenderCommit returned null");
+            rw.pendingDeletes += hit.length;
+            rw.blocksSig = sig;
+            touchMirror(rw);
+            total += hit.length;
+            log?.("info", `[${sid}] #5664 render plane: fold journaled at FIRST SCENE — ${hit.length} covered position(s) pending materialization (plane red 'structural-pending' until the forced reconcile round)`);
+        } catch (err) {
+            log?.("warn", `[${sid}] #5664 render first-scene journal failed fail-soft: ${String(err)}`);
+        }
+    }
+    return total;
 }
 
 // ---------------------------------------------------------------------------
@@ -714,6 +964,7 @@ interface RenderDebugWorld {
     textCum: number;
     imgCum: number;
     auditTick: number;
+    pendingDeletes: number;
 }
 
 export function watermarkV6RenderDebugState(sessionId: string): { sids: RenderDebugWorld[] } {
@@ -725,6 +976,7 @@ export function watermarkV6RenderDebugState(sessionId: string): { sids: RenderDe
             sids.push({
                 sid, rows: rw?.rows.length ?? 0, dead: deadSids.has(sid),
                 caps: rw?.caps, estCum: rw?.estCum ?? 0, textCum: rw?.textCum ?? 0, imgCum: rw?.imgCum ?? 0, auditTick: rw?.auditTick ?? 0,
+                pendingDeletes: rw?.pendingDeletes ?? 0,
             });
         }
     }

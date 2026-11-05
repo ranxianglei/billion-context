@@ -13,17 +13,22 @@
 // the entire chain end-to-end. Equivalence with the full pass is the
 // contract, enforced here against a legacy oracle.
 //
-// WITNESSED-REBASE REGIME (#5643 补充裁定 + owner ruling 2026-11-05):
-// the table MUST evolve with compression. A structurally-WITNESSED diverged
-// capture (fold layer's active-block multiset moved around the turn, dsh
-// native-compaction detector fired, fold usage consumed pre→post, or the
-// gate itself observed a signature move) REBASES the row table:
-// truncate from the first divergence point + whole-suffix re-append as ONE
-// transaction, checkpoint with S4 checksum, audit reset. An UNWITNESSED
-// diverged capture still KILLS the lane permanently (persisted kind='dead')
-// and rides legacy thereafter; checksum corruption stays durably dead.
-// Storage is bounded by live elements (compaction SHRINKS the table); arm
-// cast is legal exactly once, onto an empty table.
+// WITNESSED-EVENT REGIME (#5643 补充裁定 + 附录二, owner ruling 2026-11-05):
+// the table MUST evolve with compression, EVENT-ADDRESSED: a compression
+// fold is journaled at its FIRST SCENE (the compress tool endpoint —
+// recordServerSideFold) as ONE transaction: covered absolute positions plus
+// the live block signature; the plane stays red as 'structural-pending'
+// until exactly one forced reconcile round. The reconcile classifies the
+// full-pass capture against the kernel's own coverage (block
+// effectiveMessageIds ↔ pf_ledger core_id ↔ absolute pos): count-
+// preserving divergence upserts ONLY the covered cells (op 'apply', single
+// tx, prefix bytes+checksums untouched); count-changing layout events ride
+// the COARSE witnessed rebase tier (contiguous replaceAll — documented V1
+// boundary); ANY other changed/lost cell stays unexplained and KILLS the
+// plane durably (unwitnessed divergence keeps its byte-for-byte pre-existing
+// semantics).
+// Storage is bounded by live elements; arm cast is legal exactly once, onto
+// an empty table.
 //
 // Harness: unit-level against a REAL sqlite sidecar (UnifiedShadow shadow
 // mode), mirroring tests/fastpath-v6-msgid.test.ts; the kernel runs as a
@@ -42,6 +47,7 @@ import { SessionStore, _setStoreForTest, _resetStoreForTest } from "../src/persi
 import type { SessionStore as SessionStoreType } from "../src/persist.ts";
 import type { Session } from "../src/session.ts";
 import { UnifiedShadow } from "../src/storage/shadow.ts";
+import { sha256Hex } from "../src/storage/store.ts";
 import { stripKernelSummaries } from "../src/server.ts";
 import { hardenOpenaiAssistantContent, systemToUser } from "../src/util.ts";
 import {
@@ -51,7 +57,7 @@ import { PF_TAIL_IDS_HEADER } from "../src/server/fastpath.ts";
 import type { V6Outcome } from "../src/server/fastpath-v6.ts";
 import {
     activeBlocksSignature, bumpAuditTick, clearWatermarkV6Render, commitRenderCapture, diffRowLists, renderPlaneGate, spliceOutboundRows, verifyRenderWindow,
-    watermarkV6RenderDebugState, _resetWatermarkV6RenderTestState,
+    watermarkV6RenderDebugState, _resetWatermarkV6RenderTestState, boundCoveredPositions, recordServerSideFold,
     type RenderCaps,
 } from "../src/server/fastpath-v6-render.ts";
 
@@ -391,6 +397,255 @@ test("unit: plane death persists across restart (no re-arm ever)", (t) => {
     } finally { h.cleanup(); }
 });
 
+test("unit: first-scene fold journal: covered cells journaled, plane red 'structural-pending', zero-event apply clears (#5643 appendix two)", () => {
+    const h = makeH("evj");
+    try {
+        const b1 = makeBody([{ role: "user", content: "hello" }]);
+        const r1 = v6Eval(h, "s-evj", b1, ["id0"]);
+        r1.fin();
+        const sid = r1.sid!;
+        const caps = capsFor("text-only");
+        // Forge a dense 5-row ledger (the unit pin stands in for the identity
+        // plane's finalize; positions 0..4 carry known kernel ids).
+        const db = new DatabaseSync(path.join(h.dir, "index.db"));
+        db.prepare(`DELETE FROM pf_rows WHERE sid = ?`).run(sid);
+        for (let i = 0; i < 5; i++) db.prepare(`INSERT INTO pf_rows (sid, pos, ledger_id, sess_raw, core_id, core_json) VALUES (?, ?, ?, ?, ?, ?)`).run(sid, i, `lid${i}`, "r", `t${i}`, "{}" as never);
+        db.close();
+        const rows = ['{"i":0}', '{"i":1}', '{"i":2}', '{"i":3}', '{"i":4}'];
+        assert.equal(commitRenderCapture({ sessionId: "s-evj", store: h.store, sid, log: h.log, mode: "legacy", caps, rowStrings: rows, sums: { estCum: 5, textCum: 5, imgCum: 0 }, blocksSig: activeBlocksSignature([]) }).op, "cast");
+        const blocks = [{ blockId: "B1", generation: "young", active: true, effectiveMessageIds: ["t2"] }];
+        const liveSig = activeBlocksSignature(blocks);
+        const base = {
+            sessionId: "s-evj", session: { id: "s-evj", state: createInitialState() } as unknown as Session,
+            store: h.store, engagedHit: true, armedTurn: false, isTitleGen: false, sid,
+            maxPos: 4, tokenCount: 500, modelContextLimit: MODEL_LIMIT, caps,
+            snapshotLaneActive: false, absorbActive: false, ccrOn: false, foldUsagePending: false, markerNonZero: false,
+        };
+        // Production ordering: arm cast happened on an earlier turn, whose
+        // gate registered the session→sid map the journal reads. Reproduce
+        // it — one green gate under the EMPTY signature before anything else.
+        const pre = renderPlaneGate({ ...base });
+        assert.ok(pre.ok, `armed plane gates green before the fold, got ${JSON.stringify(pre)}`);
+        assert.equal(watermarkV6RenderDebugState("s-evj").sids[0].pendingDeletes ?? -1, 0);
+        // FIRST SCENE (the compress tool endpoint): ONE tx journals the
+        // covered position + the live signature; row bytes stay untouched —
+        // on plugin lanes the AGENT owns summary rendering, so the wire form
+        // of a covered cell usually does not change at all.
+        assert.equal(recordServerSideFold("s-evj", { id: "s-evj", state: { blocks } } as unknown as Session, h.store, h.log), 1, "one covered position journaled");
+        assert.ok(h.log.lines.some((l) => l.level === "info" && l.msg.includes("fold journaled at FIRST SCENE")), "first-scene journal is logged");
+        assert.deepEqual(h.store.pfRenderRows(sid).map((r) => r.rowJson), rows, "the journal writes NO row bytes");
+        // Plane RED until the forced reconcile round — by the FLAG alone:
+        // the signature already moved with the journal, so 'blocks-changed'
+        // would not fire either way; structural-pending IS the reason.
+        assert.deepEqual(renderPlaneGate({ ...base, blocksSig: liveSig }), { ok: false, reason: "structural-pending" }, "the journal red-gates the next round");
+        assert.equal(watermarkV6RenderDebugState("s-evj").sids[0].pendingDeletes ?? -1, 1, "mirror carries the pending flag");
+        // Idempotent: replaying the same fold journals nothing twice.
+        assert.equal(recordServerSideFold("s-evj", { id: "s-evj", state: { blocks } } as unknown as Session, h.store, h.log), 0, "replay must not double-journal");
+        // Zero-event materialization: the wire bytes are UNCHANGED; the full
+        // pass merely CONFIRMS the layout and clears the flag — no witness
+        // is needed for a zero-event commit.
+        const ap = commitRenderCapture({ sessionId: "s-evj", store: h.store, sid, log: h.log, mode: "legacy", caps, rowStrings: [...rows], sums: { estCum: 5, textCum: 5, imgCum: 0 }, blocksSig: liveSig });
+        assert.deepEqual(ap, { committed: true, op: "apply" }, `zero-event apply expected, got ${JSON.stringify(ap)}`);
+        const meta = h.store.pfRenderMeta(sid)!;
+        const ckpt = JSON.parse(meta.ckpt!.metaJson);
+        assert.equal(ckpt.pendingDeletes, 0, "flag cleared in the checkpoint meta");
+        assert.equal(ckpt.rowCount, 5);
+        assert.equal(ckpt.blocksSig, liveSig);
+        assert.equal(h.store.pfRenderCkptIntact(sid), true, "S4 re-checksummed over the fresh meta");
+        assert.deepEqual(h.store.pfRenderRows(sid).map((r) => r.rowJson), rows, "no cell bytes ever moved");
+        assert.equal(watermarkV6RenderDebugState("s-evj").sids[0].pendingDeletes ?? 1, 0);
+        // GREEN again under the live signature — and steady appends continue.
+        assert.ok(renderPlaneGate({ ...base, blocksSig: liveSig }).ok, "gate green after materialization");
+        assert.equal(commitRenderCapture({ sessionId: "s-evj", store: h.store, sid, mode: "steady", caps, rowStrings: ['{"i":5}'], sums: { estCum: 1, textCum: 1, imgCum: 0 } }).op, "append");
+        assert.equal(h.store.pfRenderRows(sid).length, 6, "table keeps growing after materialization");
+    } finally { h.cleanup(); }
+});
+
+test("unit: covered-cell change WITHOUT a witness still KILLS (coverage alone never blesses bytes)", () => {
+    const h = makeH("evk");
+    try {
+        const b1 = makeBody([{ role: "user", content: "hello" }]);
+        const r1 = v6Eval(h, "s-evk", b1, ["id0"]);
+        r1.fin();
+        const sid = r1.sid!;
+        const caps = capsFor("text-only");
+        const db = new DatabaseSync(path.join(h.dir, "index.db"));
+        db.prepare(`DELETE FROM pf_rows WHERE sid = ?`).run(sid);
+        for (let i = 0; i < 5; i++) db.prepare(`INSERT INTO pf_rows (sid, pos, ledger_id, sess_raw, core_id, core_json) VALUES (?, ?, ?, ?, ?, ?)`).run(sid, i, `lid${i}`, "r", `t${i}`, "{}" as never);
+        db.close();
+        const rows = ['{"i":0}', '{"i":1}', '{"i":2}', '{"i":3}', '{"i":4}'];
+        assert.equal(commitRenderCapture({ sessionId: "s-evk", store: h.store, sid, mode: "legacy", caps, rowStrings: rows, sums: { estCum: 5, textCum: 5, imgCum: 0 } }).op, "cast");
+        const blocks = [{ blockId: "B9", generation: "young", active: true, effectiveMessageIds: ["t1"] }];
+        assert.equal(recordServerSideFold("s-evk", { id: "s-evk", state: { blocks } } as unknown as Session, h.store, h.log), 1);
+        // Cell t1's row came back DIFFERENT and the coverage evidence names
+        // it — but no turn-level witness accompanied this capture: this
+        // proxy never ran that compression, so the bytes are unverifiable
+        // ⇒ kill, exactly as before #5721.
+        const logsBefore = h.log.lines.length;
+        const op = commitRenderCapture({ sessionId: "s-evk", store: h.store, sid, log: h.log, mode: "legacy", caps, rowStrings: [rows[0], '{"X":1}', rows[2], rows[3], rows[4]], sums: { estCum: 5, textCum: 5, imgCum: 0 }, witness: false, coveredPos: new Set([1]) });
+        assert.deepEqual(op, { committed: false, op: "none" });
+        assert.ok(h.log.lines.slice(logsBefore).some((l) => l.level === "error" && l.msg.includes("KILLED PERMANENTLY")), "unwitnessed covered change kills loudly");
+        assert.equal(h.store.pfRenderRows(sid).length, 5, "stored rows stay immutable");
+        const meta = h.store.pfRenderMeta(sid);
+        assert.ok(meta !== null && meta.log.some((e) => e.kind === "dead"), "death verdict persisted");
+    } finally { h.cleanup(); }
+});
+
+test("unit: fine-grained APPLY upserts ONLY the covered cells (witnessed; prefix bytes + checksums untouched)", () => {
+    const h = makeH("eva");
+    try {
+        const b1 = makeBody([{ role: "user", content: "hello" }]);
+        const r1 = v6Eval(h, "s-eva", b1, ["id0"]);
+        r1.fin();
+        const sid = r1.sid!;
+        const caps = capsFor("text-only");
+        const db = new DatabaseSync(path.join(h.dir, "index.db"));
+        db.prepare(`DELETE FROM pf_rows WHERE sid = ?`).run(sid);
+        for (let i = 0; i < 5; i++) db.prepare(`INSERT INTO pf_rows (sid, pos, ledger_id, sess_raw, core_id, core_json) VALUES (?, ?, ?, ?, ?, ?)`).run(sid, i, `lid${i}`, "r", `t${i}`, "{}" as never);
+        db.close();
+        const rows = ['{"i":0}', '{"i":1}', '{"i":2}', '{"i":3}', '{"i":4}'];
+        assert.equal(commitRenderCapture({ sessionId: "s-eva", store: h.store, sid, mode: "legacy", caps, rowStrings: rows, sums: { estCum: 5, textCum: 5, imgCum: 0 } }).op, "cast");
+        const blocks = [{ blockId: "B7", generation: "young", active: true, effectiveMessageIds: ["t1", "t3"] }];
+        const liveSig = activeBlocksSignature(blocks);
+        assert.equal(recordServerSideFold("s-eva", { id: "s-eva", state: { blocks } } as unknown as Session, h.store, h.log), 2, "both covered positions journaled");
+        // Witnessed full pass: EXACTLY the two covered cells return different
+        // bytes (proxy-mode-style rewrite); everything else byte-equal.
+        const ap = commitRenderCapture({ sessionId: "s-eva", store: h.store, sid, log: h.log, mode: "legacy", caps, rowStrings: [rows[0], '{"S":1}', rows[2], '{"S":3}', rows[4]], sums: { estCum: 5, textCum: 5, imgCum: 0 }, witness: true, coveredPos: new Set([1, 3]), blocksSig: liveSig });
+        assert.deepEqual(ap, { committed: true, op: "apply" }, `fine-grained apply expected, got ${JSON.stringify(ap)}`);
+        const stored = h.store.pfRenderRows(sid).map((r) => ({ pos: r.pos, rowJson: r.rowJson }));
+        assert.deepEqual(stored.map((r) => r.pos), [0, 1, 2, 3, 4], "positions are absolute ledger pos — no renumbering");
+        assert.deepEqual(stored.map((r) => r.rowJson), [rows[0], '{"S":1}', rows[2], '{"S":3}', rows[4]]);
+        const meta = h.store.pfRenderMeta(sid)!;
+        assert.equal(JSON.parse(meta.ckpt!.metaJson).pendingDeletes, 0, "the pending flag was consumed by the apply");
+        assert.ok(meta.log.every((e) => e.kind !== "delete"), "journal folded into the fresh checkpoint");
+        assert.equal(h.store.pfRenderCkptIntact(sid), true);
+        assert.ok(h.log.lines.some((l) => l.level === "info" && l.msg.includes("APPLIED 2 covered cell(s)")), "apply logged with its event set");
+        // Restart reproduces the event-applied table.
+        _resetWatermarkV6RenderTestState();
+        const g = renderPlaneGate({
+            sessionId: "s-eva", session: { id: "s-eva", state: createInitialState() } as unknown as Session,
+            store: h.store, engagedHit: true, armedTurn: false, isTitleGen: false, sid,
+            maxPos: 4, tokenCount: 500, modelContextLimit: MODEL_LIMIT, caps,
+            snapshotLaneActive: false, absorbActive: false, ccrOn: false, foldUsagePending: false, markerNonZero: false,
+            blocksSig: liveSig,
+        });
+        assert.ok(g.ok, `hydrated post-apply plane gates green, got ${JSON.stringify(g)}`);
+        if (g.ok) assert.equal(g.rw.rows[1], '{"S":1}', "hydrate restores the applied cell");
+    } finally { h.cleanup(); }
+});
+
+test("unit: count-changing divergence stays on the COARSE witnessed tier; unwitnessed kills", () => {
+    const h = makeH("evo");
+    try {
+        const b1 = makeBody([{ role: "user", content: "hello" }]);
+        const r1 = v6Eval(h, "s-evo", b1, ["id0"]);
+        r1.fin();
+        const sid = r1.sid!;
+        const caps = capsFor("text-only");
+        const rows = ['{"i":0}', '{"i":1}', '{"i":2}', '{"i":3}'];
+        assert.equal(commitRenderCapture({ sessionId: "s-evo", store: h.store, sid, mode: "legacy", caps, rowStrings: rows, sums: { estCum: 4, textCum: 4, imgCum: 0 }, blocksSig: activeBlocksSignature([]) }).op, "cast");
+        // Native-compaction class: elements VANISH beyond any coverage
+        // evidence — witnessed ⇒ the coarse tier replaces the table; the
+        // classifier is unreachable for count-changing events by design.
+        const rb = commitRenderCapture({ sessionId: "s-evo", store: h.store, sid, log: h.log, mode: "legacy", caps, rowStrings: ['{"i":0}', '{"N":1}'], sums: { estCum: 2, textCum: 2, imgCum: 0 }, witness: true, coveredPos: new Set([1]) });
+        assert.deepEqual(rb, { committed: true, op: "rebase" }, `coarse tier owns count-changing events, got ${JSON.stringify(rb)}`);
+        assert.deepEqual(h.store.pfRenderRows(sid).map((r) => ({ pos: r.pos, rowJson: r.rowJson })),
+            [{ pos: 0, rowJson: '{"i":0}' }, { pos: 1, rowJson: '{"N":1}' }], "dense contiguous positions restored");
+    } finally { h.cleanup(); }
+    const h2h = makeH("evo2");
+    try {
+        const b2 = makeBody([{ role: "user", content: "hello" }]);
+        const r2 = v6Eval(h2h, "s-evo2", b2, ["id0"]);
+        r2.fin();
+        const sid2 = r2.sid!;
+        const caps = capsFor("text-only");
+        const rows = ['{"i":0}', '{"i":1}', '{"i":2}', '{"i":3}'];
+        assert.equal(commitRenderCapture({ sessionId: "s-evo2", store: h2h.store, sid: sid2, mode: "legacy", caps, rowStrings: rows, sums: { estCum: 4, textCum: 4, imgCum: 0 } }).op, "cast");
+        const op = commitRenderCapture({ sessionId: "s-evo2", store: h2h.store, sid: sid2, log: h2h.log, mode: "legacy", caps, rowStrings: ['{"i":0}', '{"N":1}'], sums: { estCum: 2, textCum: 2, imgCum: 0 }, witness: false, coveredPos: new Set([1]) });
+        assert.deepEqual(op, { committed: false, op: "none" }, "unwitnessed count-changing divergence kills");
+        const meta = h2h.store.pfRenderMeta(sid2);
+        assert.ok(meta !== null && meta.log.some((e) => e.kind === "dead"), "death persisted");
+    } finally { h2h.cleanup(); }
+});
+
+test("unit: boundCoveredPositions binds kernel ids through pf_rows.core_id (empty folds short-circuit before the store)", () => {
+    const h = makeH("bind");
+    try {
+        const b1 = makeBody([{ role: "user", content: "hello" }]);
+        const r1 = v6Eval(h, "s-bind", b1, ["id0"]);
+        r1.fin();
+        const sid = r1.sid!;
+        const db = new DatabaseSync(path.join(h.dir, "index.db"));
+        db.prepare(`DELETE FROM pf_rows WHERE sid = ?`).run(sid);
+        db.prepare(`INSERT INTO pf_rows (sid, pos, ledger_id, sess_raw, core_id, core_json) VALUES (?, ?, ?, ?, ?, ?)`).run(sid, 0, "a", "r", "k1|k2", "{}" as never);
+        db.prepare(`INSERT INTO pf_rows (sid, pos, ledger_id, sess_raw, core_id, core_json) VALUES (?, ?, ?, ?, ?, ?)`).run(sid, 1, "b", "r", "k9", "{}" as never);
+        db.close();
+        assert.deepEqual(boundCoveredPositions(h.store, sid, []), new Set<number>(), "no blocks ⇒ no binding");
+        assert.deepEqual(boundCoveredPositions(h.store, sid, [{ active: false, effectiveMessageIds: ["k1"] }]), new Set<number>(), "INACTIVE blocks bind nothing");
+        assert.deepEqual(boundCoveredPositions(h.store, sid, [{ active: true, effectiveMessageIds: ["k1"] }]), new Set([0]), "a multi-id core column matches ANY of its tokens");
+        assert.deepEqual(boundCoveredPositions(h.store, sid, [{ active: true, effectiveMessageIds: ["k2", "k9"] }]), new Set([0, 1]));
+    } finally { h.cleanup(); }
+});
+
+test("unit: sparse hydrate accepts ascending distinct positions within the span", () => {
+    const h = makeH("spars");
+    try {
+        const b1 = makeBody([{ role: "user", content: "hello" }]);
+        const r1 = v6Eval(h, "s-spars", b1, ["id0"]);
+        r1.fin();
+        const sid = r1.sid!;
+        const caps = capsFor("text-only");
+        assert.equal(commitRenderCapture({ sessionId: "s-spars", store: h.store, sid, mode: "legacy", caps, rowStrings: ['{"i":0}', '{"i":1}', '{"i":2}', '{"i":3}'], sums: { estCum: 4, textCum: 4, imgCum: 0 } }).op, "cast");
+        const before = h.store.pfRenderMeta(sid)!;
+        // Forge a hole: drop one middle row and push the tail past the
+        // current maxPos — positions become {0, 2, 7} (sparse, ascending).
+        // Meta is refreshed with the shrunken absolute count (checksum is
+        // over meta bytes, rewritten in step).
+        const freshMeta = JSON.parse(before.ckpt!.metaJson) as Record<string, unknown>;
+        freshMeta.rowCount = 3;
+        const db = new DatabaseSync(path.join(h.dir, "index.db"));
+        db.prepare(`DELETE FROM pf_render WHERE sid = ? AND pos = 1`).run(sid);
+        db.prepare(`UPDATE pf_render SET pos = ? WHERE sid = ? AND pos = 3`).run(7, sid);
+        db.prepare(`UPDATE pf_render_ckpt SET meta_json = ?, checksum = ? WHERE sid = ?`).run(JSON.stringify(freshMeta), sha256Hex(JSON.stringify(freshMeta)), sid);
+        db.close();
+        _resetWatermarkV6RenderTestState();
+        const g = renderPlaneGate({
+            sessionId: "s-spars", session: { id: "s-spars", state: createInitialState() } as unknown as Session,
+            store: h.store, engagedHit: true, armedTurn: false, isTitleGen: false, sid,
+            maxPos: 7, tokenCount: 100, modelContextLimit: MODEL_LIMIT, caps,
+            snapshotLaneActive: false, absorbActive: false, ccrOn: false, foldUsagePending: false, markerNonZero: false,
+        });
+        assert.ok(g.ok, `sparse positions hydrate within the span, got ${JSON.stringify(g)}`);
+        if (g.ok) assert.deepEqual(g.rw.positions, [0, 2, 7], "positions ride the sorted-row order with the hole kept");
+        // A NON-ASCENDING read shape is substrate corruption ⇒ durable kill
+        // (defensive guard — a normal ordered SELECT cannot produce it, so
+        // the pin drives it through a stubbed reader like the transient-read
+        // pin does).
+        _resetWatermarkV6RenderTestState();
+        const scrambled: SessionStore = Object.create(h.store);
+        scrambled.pfRenderRows = () => [
+            { pos: 2, rowJson: '{\"i\":2}' },
+            { pos: 0, rowJson: '{\"i\":0}' },
+            { pos: 7, rowJson: '{\"i\":3}' },
+        ];
+        const g2 = renderPlaneGate({
+            sessionId: "s-spars", session: { id: "s-spars", state: createInitialState() } as unknown as Session,
+            store: scrambled, engagedHit: true, armedTurn: false, isTitleGen: false, sid,
+            maxPos: 7, tokenCount: 100, modelContextLimit: MODEL_LIMIT, caps,
+            snapshotLaneActive: false, absorbActive: false, ccrOn: false, foldUsagePending: false, markerNonZero: false,
+        });
+        assert.deepEqual(g2, { ok: false, reason: "lane-dead" }, "non-ascending positions kill durably");
+        _resetWatermarkV6RenderTestState();
+        const g3 = renderPlaneGate({
+            sessionId: "s-spars", session: { id: "s-spars", state: createInitialState() } as unknown as Session,
+            store: h.store, engagedHit: true, armedTurn: false, isTitleGen: false, sid,
+            maxPos: 7, tokenCount: 100, modelContextLimit: MODEL_LIMIT, caps,
+            snapshotLaneActive: false, absorbActive: false, ccrOn: false, foldUsagePending: false, markerNonZero: false,
+        });
+        assert.deepEqual(g3, { ok: false, reason: "lane-dead" }, "the verdict survives on the real store too");
+    } finally { h.cleanup(); }
+});
+
 test("unit: thrown row-table read defers arming without killing (transient ≠ death)", () => {
     const h = makeH("defer");
     try {
@@ -610,7 +865,7 @@ test("golden: cached-prefix splice equals the legacy full-path bytes end-to-end"
         // this tier exercises is the accumulation ALGEBRA — each row counted
         // exactly once with its own cost, tail-only deltas on steady rounds.
         const rowCost = (rs: string[]): number => rs.reduce((s, x) => s + x.length, 0);
-        let op: { committed: boolean; op: "none" | "append" | "cast" | "rebase" } = { committed: false, op: "none" };
+        let op: { committed: boolean; op: "none" | "append" | "cast" | "rebase" | "apply" } = { committed: false, op: "none" };
         // No-recast regime: once the lane dies, production stops paying for
         // capture strings entirely (the seam skips the station-2 commit); the
         // lane rides pure legacy until the session ends. Mirror that here.
