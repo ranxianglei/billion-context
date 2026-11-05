@@ -8,7 +8,7 @@ import { BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, BILI_ACP_T
 import { conversationPromptSections, externalSummaryEnabled, messageTimestampSections, withExternalSummaryTools } from "../external-summary-surface.js";
 import { forceTextProtocol as knobForceTextProtocol, renderNone as knobRenderNone } from "../knobs.js";
 import { GENERATION_BOUNDARY_NOTE } from "../generation-boundary.js";
-import { renderMemoryToc, resolveMemoryToc, resolveMemoryTocWindow } from "../memory-toc.js";
+import { renderMemoryToc, resolveMemoryToc, resolveMemoryTocWindow, type BlockTocItem } from "../memory-toc.js";
 import type { CompressionBlock } from "acp-kernel";
 
 export function injectSystem(
@@ -118,7 +118,7 @@ export function injectGoogleTool(tools: GoogleTool[] | undefined, extra?: { name
  *  and the string only changes when a fold creates or rewrites a block, so the
  *  prefix cache survives every non-folding turn. */
 export function renderSessionMemoryToc(
-    session: { state: { blocks: readonly CompressionBlock[] } },
+    session: { state: { blocks: readonly BlockTocItem[] } },
     config: Config,
     log?: (level: string, msg: string) => void,
 ): string | undefined {
@@ -126,7 +126,7 @@ export function renderSessionMemoryToc(
     if (!resolveMemoryToc(process.env, compress?.memoryToc)) return undefined;
     const window = resolveMemoryTocWindow(process.env, compress?.memoryTocWindow);
     const blocks = session.state.blocks;
-    const toc = renderMemoryToc(blocks as never, { window });
+    const toc = renderMemoryToc(blocks, { window });
     if (toc === null) return undefined;
     const activeCount = blocks.filter((b) => b.active !== false).length;
     log?.("info", `[memory-toc] injected ${activeCount} block topic(s) into system context (window=${window > 0 ? window : "all"})`);
