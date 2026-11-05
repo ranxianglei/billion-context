@@ -12,6 +12,7 @@ import type { ProxyOptions, ResignSettings } from "./config.js";
 export type { ProxyOptions } from "./config.js";
 import { loadNamedProviders, loadOptions, loadRoutes } from "./config.js";
 import { resetProxyCache } from "./upstream-proxy.js";
+import { withExitDeadline } from "./restart.js";
 import { effectivePromptCacheRouting, FALLBACK_EFFECTIVE_WINDOW_FLOOR, findRoute, findRouteKey, lookupContextLimit, resolveConfiguredContextLimit, resolveConfiguredOutputLimit, resolveCompressProtocol, resolveMessageTimestamps, resolveResignSettings } from "./config.js";
 import { contextFromRegistry, loadRegistry, peekRegistryContext, peekRegistryOutputLimit, peekRegistryPriceProfile } from "./registry.js";
 import { codexAlignedWindow } from "./codex-models.js";
@@ -1523,8 +1524,10 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
                     shuttingDown = true;
                     server.close();
                     void (async () => {
-                        await flushConversations();
-                        await flushAllSessions();
+                        await withExitDeadline("die-path storage flushes", (async () => {
+                            await flushConversations();
+                            await flushAllSessions();
+                        })());
                         closeLogger();
                         process.exit(1);
                     })();
@@ -1662,8 +1665,10 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
             shuttingDown = true;
             server.close();
             void (async () => {
-                await flushConversations();
-                await flushAllSessions();
+                await withExitDeadline("busy-port storage flushes", (async () => {
+                    await flushConversations();
+                    await flushAllSessions();
+                })());
                 closeLogger();
                 process.exit(eaddrinuseExitCode(busyReason));
             })();
@@ -1674,8 +1679,10 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
             shuttingDown = true;
             server.close();
             void (async () => {
-                await flushConversations();
-                await flushAllSessions();
+                await withExitDeadline("crash-path storage flushes", (async () => {
+                    await flushConversations();
+                    await flushAllSessions();
+                })());
                 closeLogger();
                 process.exit(1);
             })();
@@ -1723,9 +1730,13 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         void (async () => {
             // #5753: affinity/order now settle into sqlite — await their queued
             // writes so a graceful exit loses nothing recorded this run.
-            await flushPrefixAffinity();
-            await flushOrderSkeletons();
-            await flushResignPending();
+            // #5757: the await is deadline-bounded — a wedged volume must not
+            // hold the exit hostage (see withExitDeadline in restart.ts).
+            await withExitDeadline("unified-store flushes (affinity/order/resign)", (async () => {
+                await flushPrefixAffinity();
+                await flushOrderSkeletons();
+                await flushResignPending();
+            })());
             servedWriter?.dispose();
             clearProxyInstanceFile(instanceId);
             unregisterInstance(instanceId);
@@ -1735,8 +1746,10 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     };
     const finishDrain = (): void => {
         void (async () => {
-            await flushConversations();
-            await flushAllSessions();
+            await withExitDeadline("conversation/session flushes", (async () => {
+                await flushConversations();
+                await flushAllSessions();
+            })());
             finishShutdown();
         })();
     };

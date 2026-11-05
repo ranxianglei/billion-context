@@ -5,7 +5,7 @@ import path from "node:path";
 import { RESIGN_BUILTIN_SCHEME, resolveModelEntryOnRoute, resolveResignSettings, type ProviderRoute } from "./config.js";
 import { configFile, stateDir } from "./paths.js";
 import { log as loggerLog } from "./logger.js";
-import { getStore, unifiedKvActive } from "./persist.js";
+import { kvStore } from "./persist.js";
 
 /**
  * #1884 (CodeArts APIG): requests signed with SDK-HMAC-SHA256 carry a
@@ -363,16 +363,24 @@ let pendingHydrated = false;
 /** Queued carrier write: the kv row once hydrated on a unified instance,
  *  else the legacy file. Best-effort — warn-once, never throw.
  *  The FILE path stays synchronous (the old contract: a refusal recorded on
- *  the hot path must already be on disk by the time any exit fires). */
+ *  the hot path must already be on disk by the time any exit fires).
+ *  #5757 review fix: a persistent store failure DEMOTES this process back to
+ *  the file discipline (and lands the current map on disk now) instead of
+ *  quietly re-queueing forever into a dead store. */
 function persistPendingNow(map: Record<string, ResignPendingEntry>): void {
-    const unified = unifiedKvActive() && pendingHydrated;
-    if (!unified) {
+    const store = pendingHydrated ? kvStore() : null;
+    if (!store) {
         writePendingRefusals(map);
         return;
     }
-    pendingChain = pendingChain.then(async () => {
-        await getStore().setKvAsync(PENDING_NS, PENDING_KEY, map);
-    }).catch((err) => pendingWarnOnce("persist", err));
+    pendingChain = pendingChain.then(() => store.setKvAsync(PENDING_NS, PENDING_KEY, map)).catch((err) => {
+        pendingWarnOnce("persist", err);
+        // demote: everything after this ride's the legacy file again
+        pendingHydrated = false;
+        try {
+            writePendingRefusals(map);
+        } catch { /* best effort; the next op re-persists */ }
+    });
 }
 
 /** Await in-flight kv carrier writes — called from shutdown paths so a
@@ -405,11 +413,21 @@ function parsePendingDoc(value: unknown): Record<string, ResignPendingEntry> | n
 }
 
 async function fetchPendingFromStore(): Promise<Record<string, ResignPendingEntry> | null> {
+    const store = kvStore();
+    if (!store) return null;
     try {
-        return parsePendingDoc(await getStore().getKvAsync(PENDING_NS, PENDING_KEY));
+        return parsePendingDoc(await store.getKvAsync(PENDING_NS, PENDING_KEY));
     } catch {
         return null;
     }
+}
+
+/** #5757 review fix: the process is riding the kv carrier right now (hydrated
+ *  on an instance with real KV methods). Anything else — pure legacy-only
+ *  instances AND partial test stubs — keeps master's exact semantics: re-read
+ *  the FILE on every operation, no sticky cache. */
+function unifiedLive(): boolean {
+    return pendingHydrated && kvStore() !== null;
 }
 
 function resignPendingFile(): string {
@@ -467,7 +485,8 @@ export function recordSignedRefusal(scheme: string, url: string): void {
     try { origin = new URL(url).origin; } catch { origin = url.slice(0, 120); }
     const now = new Date().toISOString();
     const live: Record<string, ResignPendingEntry> = {};
-    for (const [k, v] of Object.entries(pendingCache ?? readPendingRefusalsRaw())) live[k] = { ...v };
+    const ridingKv = unifiedLive();
+    for (const [k, v] of Object.entries(ridingKv ? pendingCache ?? readPendingRefusalsRaw() : readPendingRefusalsRaw())) live[k] = { ...v };
     const prev = live[key];
     live[key] = prev
         ? { origin: prev.origin || origin, firstSeen: prev.firstSeen, lastSeen: now, count: prev.count + 1 }
@@ -478,7 +497,7 @@ export function recordSignedRefusal(scheme: string, url: string): void {
         keys.sort((a, b) => live[a].firstSeen.localeCompare(live[b].firstSeen));
         for (const drop of keys.slice(0, keys.length - RESIGN_PENDING_MAX_ENTRIES)) delete live[drop];
     }
-    pendingCache = live;
+    if (ridingKv) pendingCache = live; // legacy path never caches (#5757)
     persistPendingNow(live);
 }
 
@@ -488,17 +507,18 @@ export function recordSignedRefusal(scheme: string, url: string): void {
 export function clearSignedRefusal(scheme: string): void {
     const key = scheme.trim().toLowerCase();
     if (key.length === 0) return;
-    const src = pendingCache ?? readPendingRefusalsRaw();
+    const ridingKv = unifiedLive();
+    const src = ridingKv ? pendingCache ?? readPendingRefusalsRaw() : readPendingRefusalsRaw();
     if (!(key in src)) return;
     const live: Record<string, ResignPendingEntry> = {};
     for (const [k, v] of Object.entries(src)) live[k] = { ...v };
     delete live[key];
-    pendingCache = live;
+    if (ridingKv) pendingCache = live; // legacy path never caches (#5757)
     persistPendingNow(live);
 }
 
 export function readPendingRefusals(): Record<string, ResignPendingEntry> {
-    const src = pendingCache ?? readPendingRefusalsRaw();
+    const src = unifiedLive() ? pendingCache ?? readPendingRefusalsRaw() : readPendingRefusalsRaw();
     const out: Record<string, ResignPendingEntry> = {};
     for (const [k, v] of Object.entries(src)) out[k] = { ...v };
     return out;
@@ -508,7 +528,8 @@ export function readPendingRefusals(): Record<string, ResignPendingEntry> {
  *  file one time. Legacy-only instances keep the pure-file path forever.
  *  Never throws. */
 export async function hydrateResignPending(): Promise<void> {
-    if (pendingHydrated || !unifiedKvActive()) return;
+    const store = kvStore();
+    if (pendingHydrated || !store) return;
     let merged: Record<string, ResignPendingEntry> | null = null;
     try {
         const kvRows = await fetchPendingFromStore();
@@ -523,7 +544,7 @@ export async function hydrateResignPending(): Promise<void> {
         }
         if (Object.keys(fileMap).length > 0 && (kvRows === null || Object.keys(kvRows).length === 0)) {
             // one-time migration of the legacy file into the kv row
-            await getStore().setKvAsync(PENDING_NS, PENDING_KEY, merged);
+            await store.setKvAsync(PENDING_NS, PENDING_KEY, merged);
             loggerLog("info", `[resign] imported ${Object.keys(fileMap).length} pending-refusal entr(y/ies) from the legacy JSON file into unified storage (kv_store namespace "${PENDING_NS}")`);
         }
     } catch (err) {
