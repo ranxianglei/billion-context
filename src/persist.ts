@@ -2319,6 +2319,7 @@ export class SessionStore {
             rows: { pos: number; rowJson: string | null }[];
             logEntries: { kind: string; payloadJson: string }[];
             checkpointMetaJson?: string;
+            replaceAll?: boolean;
             ts?: number;
         },
     ): number | null {

@@ -42,7 +42,7 @@ import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decision
 import { featureEnabled } from "../rollout.js";
 import { evaluateWatermarkFastpath, finalizeWatermarkTurn, type FastpathHit, type FastpathOutcome } from "./fastpath.js";
 import { evaluateWatermarkV6, finalizeWatermarkV6, FastpathV6IdentityFault, PF_SESSION_HEADER, watermarkV6DebugState, type V6Outcome } from "./fastpath-v6.js";
-import { bumpAuditTick, commitRenderCapture, renderPlaneGate, spliceOutboundRows, verifyRenderWindow, type RenderCaps, type RenderGateDecision, type RenderWorld } from "./fastpath-v6-render.js";
+import { activeBlocksSignature, bumpAuditTick, commitRenderCapture, renderPlaneGate, spliceOutboundRows, verifyRenderWindow, type RenderCaps, type RenderGateDecision, type RenderWorld } from "./fastpath-v6-render.js";
 import { getStore } from "../persist.js";
 import { collectRequestIds, probeRequestMembership } from "../request-membership.js";
 
@@ -82,6 +82,14 @@ export async function prepareOpenai(
     let renderedImageDelta = 0;
     let renderCapturedSid: string | null = null;
     let renderCapturedCaps: RenderCaps | null = null;
+    // #5643 补充裁定 witnesses (structural events) for this turn's capture —
+    // pre-snapshots here, compared against post-pass state at station 2. The
+    // dsh native-compaction detector sets its flag deeper in the pipeline;
+    // hoisted here so station 2 can read it.
+    let dshRebased = false;
+    let renderPreBlocksSig = "";
+    let renderFoldUsagePre = false;
+    let renderGateReason: string | null = null;
     // #5664 green verdict carrier (declared here so the clamp/estimate/capture
     // consumers AFTER the try block see it; assigned at the gate below).
     let renderFast: { rw: RenderWorld; F: number; maxPos: number; sid: string } | null = null;
@@ -257,6 +265,11 @@ export async function prepareOpenai(
                 multimodal: wpHit.seedMultimodal === true || wpHit.windowCores.some((m) => Array.isArray((m as { content?: unknown }).content)),
             };
             renderCapturedCaps = rcaps;
+            // PRE-TURN structural snapshots (fold layer state BEFORE this
+            // request's own kernel pass) — the diff with the post-pass state
+            // is turn-level evidence that compression moved under us.
+            renderPreBlocksSig = activeBlocksSignature(session.state.blocks);
+            renderFoldUsagePre = session.stats.pendingFoldUsage === true;
             const renderGate: RenderGateDecision = renderPlaneGate({
                 sessionId,
                 session,
@@ -269,6 +282,7 @@ export async function prepareOpenai(
                 tokenCount,
                 modelContextLimit: config.modelContextLimit,
                 caps: rcaps,
+                blocksSig: renderPreBlocksSig,
                 snapshotLaneActive: judgeBaseline !== undefined,
                 absorbActive,
                 ccrOn: pluginMode && ccrEnabled(session),
@@ -282,6 +296,7 @@ export async function prepareOpenai(
             } else {
                 log("debug", `[${sessionId}] #5664 render lane off (${renderGate.reason}) — baseline full path`);
                 if (renderGate.reason === "lane-dead") renderLaneDead = true;
+                renderGateReason = renderGate.reason;
             }
         }
         // #2432: dsh desktop's native compaction can LAND without ever
@@ -302,7 +317,6 @@ export async function prepareOpenai(
         // lane does (#2373 commit note). Either signal alone stays on the
         // existing paths: framing paste with intact history has no gap; a gap
         // without framing falls through to detectUnannouncedHistoryRewrite.
-        let dshRebased = false;
         if (!isTitleGen && laneDecisions.profile.compactsClientSide && session.state.blocks.some((b) => b.active)) {
             const coveredBeforeDshCompact = coveredRealHistoryIds(session.state.blocks);
             const dshGap = foldCoverage(coveredBeforeDshCompact, msgs.map((m) => m.id));
@@ -797,11 +811,12 @@ export async function prepareOpenai(
         if (Object.keys(wpResponseHeaders).length === 0) wpResponseHeaders = undefined;
     }
     // #5664 station 2 — ONE snapshot commit per engaged turn: steady append
-    // (fast rounds), arm cast / audit diff / divergence-KILL (full-path
-    // rounds carry the complete captured array; owner ruling 2026-11-05:
-    // recast is forbidden — any structural divergence kills the lane for the
-    // sid). Fail-soft for this turn only — the identity plane already
-    // committed independently.
+    // (fast rounds), arm cast / audit diff / witnessed REBASE on structural
+    // divergence / UNWITNESSED divergence-KILL (full-path rounds carry the
+    // complete captured array; #5643 补充裁定：快照必须随压缩演进 — a
+    // structurally-witnessed diverged capture rebases the table, an
+    // unwitnessed one still kills the lane for the sid). Fail-soft for this
+    // turn only — the identity plane already committed independently.
     if (renderedCaptureStrings !== null && renderCapturedSid !== null && renderCapturedCaps !== null && featureEnabled("watermarkV6Render")) {
         const store = getStore();
         if (store.pfRenderAvailable()) {
@@ -814,6 +829,22 @@ export async function prepareOpenai(
             // exactly the appended tail (committedTail was capped at F+kNew).
             const steadyTailRows = renderFast !== null ? renderedTailObjects.slice(renderFast.F).map((m) => JSON.stringify(m)) : renderedCaptureStrings;
             const sumsSrc = renderFast !== null ? processedMessages.slice(Math.min(renderFast.F, processedMessages.length)) : processedMessages;
+            // #5643 补充裁定 witness assembly — server-side evidence ONLY:
+            // ① the fold layer's block multiset moved around this turn's own
+            //    kernel pass (proxy-mode compress, kernel-side rebase…); ② the
+            //    dsh native-compaction detector fired (its folds bypass bili
+            //    entirely, #2432 — its reconcile DEACTIVATES blocks, which can
+            //    leave the signature byte-equal, hence the explicit term);
+            // ③ fold usage was pending pre-turn and got consumed by it;
+            // ④ the gate itself had observed the signature move pre-turn
+            //    ("blocks-changed" red sent this request down the full path).
+            // Absent ALL of them, a diverged capture stays a kill verdict.
+            const renderPostBlocksSig = activeBlocksSignature(session.state.blocks);
+            const renderWitness =
+                dshRebased ||
+                renderPostBlocksSig !== renderPreBlocksSig ||
+                (renderFoldUsagePre && session.stats.pendingFoldUsage !== true) ||
+                renderGateReason === "blocks-changed";
             const capOp = commitRenderCapture({
                 sessionId,
                 store,
@@ -821,6 +852,8 @@ export async function prepareOpenai(
                 mode: renderFast !== null ? "steady" : "legacy",
                 caps: renderCapturedCaps,
                 rowStrings: steadyTailRows,
+                witness: renderWitness,
+                blocksSig: renderPostBlocksSig,
                 sums: {
                     estCum: estimateCoreMessagesUpper(sumsSrc),
                     textCum: estimateCoreMessages(sumsSrc),
