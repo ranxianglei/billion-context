@@ -13,6 +13,19 @@ import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { listSessions } from "../src/session.ts";
 import { codexHealthBarApplies, isCodexClient, isCodexHost } from "../src/codex-compact.ts";
 import { instructionsFingerprintApplies } from "../src/session-id.ts";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
+// #5738 fork adoption is content-driven: keep this suite's affinity chains
+// inside its own process lifetime so a byte-identical fixture under another
+// declared id cannot be adopted as a fork parent and leak fold state across
+// tests or runs (#5748 CI).
+const isoRoot = fs.mkdtempSync(path.join(os.tmpdir(), "issue3686-ua-policy-"));
+process.env.XDG_CONFIG_HOME = path.join(isoRoot, "config");
+process.env.XDG_DATA_HOME = path.join(isoRoot, "data");
+process.env.XDG_CACHE_HOME = path.join(isoRoot, "cache");
+process.env.XDG_STATE_HOME = path.join(isoRoot, "state");
 
 // #3686: a native pi request explicitly stamped x-bili-plugin: pi may ship a
 // Codex-shaped User-Agent for relay compatibility. The UA-only isCodexClient
@@ -152,12 +165,12 @@ function makeUpstream(calls: UpstreamCall[]): http.Server {
 /** Alternating user/assistant messages whose CONTENT totals at least
  *  textTokens (defaultCountTokens over the raw text); the last message
  *  overshoots by at most one chunk (~600 tok), kept well inside the band. */
-function sizedInput(textTokens: number): { type: string; role: string; content: string }[] {
+function sizedInput(textTokens: number, tag = ""): { type: string; role: string; content: string }[] {
     const input: { type: string; role: string; content: string }[] = [];
     let acc = 0;
     let i = 0;
     while (acc < textTokens) {
-        const chunk = `Message ${i} of the long conversation. `.repeat(40) + `MARKER_${i}_content_`.repeat(60);
+        const chunk = (i === 0 ? tag : "") + `Message ${i} of the long conversation. `.repeat(40) + `MARKER_${i}_content_`.repeat(60);
         input.push({ type: "message", role: i % 2 === 0 ? "user" : "assistant", content: chunk });
         acc += defaultCountTokens(chunk);
         i++;
@@ -234,7 +247,7 @@ test("#3686 e2e: genuine codex client between the bars folds (control)", async (
     process.env.BILI_CODEX_COMPACT = "intercept";
     try {
         await withHarness(async (url, calls) => {
-            const r = await post(url, { "user-agent": CODEX_UA }, "s3686-codex", sizedInput(STRADDLE_TEXT));
+            const r = await post(url, { "user-agent": CODEX_UA }, "s3686-codex", sizedInput(STRADDLE_TEXT, "s3686-codex"));
             assert.equal(r.status, 200, `preflight must fold despite the strict codex-shape validator, got ${r.status}`);
             await r.text();
             const summaries = calls.filter((c) => c.kind === "summary");
@@ -253,7 +266,7 @@ test("#3686 e2e: declared pi between the bars does NOT fold (the bug)", async ()
     process.env.BILI_CODEX_COMPACT = "intercept";
     try {
         await withHarness(async (url, calls) => {
-            const r = await post(url, { ...PI_HEADERS, "x-bili-plugin-conversation": "s3686-pi" }, "s3686-pi", sizedInput(STRADDLE_TEXT));
+            const r = await post(url, { ...PI_HEADERS, "x-bili-plugin-conversation": "s3686-pi" }, "s3686-pi", sizedInput(STRADDLE_TEXT, "s3686-pi"));
             assert.equal(r.status, 200, `request must forward cleanly, got ${r.status}`);
             await r.text();
             // Exactly the main forward — zero side-channel summary calls.
@@ -273,14 +286,14 @@ test("#3686 e2e: declared pi past the FULL window folds, summary calls keep the 
     try {
         await withHarness(async (url, calls) => {
             // Mid-window sanity first: nothing fires at 12K.
-            const warm = await post(url, { ...PI_HEADERS, "x-bili-plugin-conversation": "s3686-pi-over" }, "s3686-pi-over", sizedInput(12_000));
+            const warm = await post(url, { ...PI_HEADERS, "x-bili-plugin-conversation": "s3686-pi-over" }, "s3686-pi-over", sizedInput(12_000, "s3686-pi-over"));
             assert.equal(warm.status, 200);
             await warm.text();
             assert.equal(calls.length, 1, `mid-window request must not summarize, got ${JSON.stringify(calls)}`);
 
             // Past the full window the pi session DOES fold — and the strict
             // relay must accept its summary calls (wire profile follows UA).
-            const r = await post(url, { ...PI_HEADERS, "x-bili-plugin-conversation": "s3686-pi-over" }, "s3686-pi-over", sizedInput(22_000));
+            const r = await post(url, { ...PI_HEADERS, "x-bili-plugin-conversation": "s3686-pi-over" }, "s3686-pi-over", sizedInput(22_000, "s3686-pi-over"));
             assert.equal(r.status, 200, `over-window preflight must succeed on the strict relay, got ${r.status}`);
             await r.text();
             const summaries = calls.filter((c) => c.kind === "summary");

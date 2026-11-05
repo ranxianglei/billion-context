@@ -11,6 +11,19 @@ import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { listSessions } from "../src/session.ts";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
+// #5738 fork adoption is content-driven: keep this suite's affinity chains
+// inside its own process lifetime so a byte-identical fixture under another
+// declared id cannot be adopted as a fork parent and leak fold state across
+// tests or runs (#5748 CI).
+const isoRoot = fs.mkdtempSync(path.join(os.tmpdir(), "e2e-proof-wall-"));
+process.env.XDG_CONFIG_HOME = path.join(isoRoot, "config");
+process.env.XDG_DATA_HOME = path.join(isoRoot, "data");
+process.env.XDG_CACHE_HOME = path.join(isoRoot, "cache");
+process.env.XDG_STATE_HOME = path.join(isoRoot, "state");
 
 // #3450 follow-up: "the upstream counts the completion share inside the
 // context wall" is a PROVIDER fact, not turn evidence. #3450 learns the share
@@ -73,11 +86,11 @@ function summaryJson(): string {
     });
 }
 
-function bigConversation(): Array<{ role: string; content: string }> {
+function bigConversation(tag = ""): Array<{ role: string; content: string }> {
     const msgs: Array<{ role: string; content: string }> = [];
     for (let i = 0; i < 12; i++) {
         const role = i % 2 === 0 ? "user" : "assistant";
-        msgs.push({ role, content: `Message ${i} of the long conversation. ` + `MARKER_${i}_content_`.repeat(250) });
+        msgs.push({ role, content: (i === 0 ? `${tag} ` : "") + `Message ${i} of the long conversation. ` + `MARKER_${i}_content_`.repeat(250) });
     }
     return msgs;
 }
@@ -163,7 +176,7 @@ test("e2e #3450 follow-up: a proven completion wall outlives the arm — the nex
     const url = (port: number) => `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${port}/v1/messages`;
     // The wire is anthropic (shouldReserveOutputHeadroom === false) — the whole
     // point of the proof is that this exemption must give way to measured truth.
-    const body = JSON.stringify({ model: "claude-test", max_tokens: 1024, stream: true, messages: bigConversation() });
+    const body = JSON.stringify({ model: "claude-test", max_tokens: 1024, stream: true, messages: bigConversation("t3450-proof-sess") });
     const headers = { "content-type": "application/json", "x-acp-session": "t3450-proof-sess" };
 
     try {
@@ -201,7 +214,8 @@ test("e2e #3450 follow-up: a proven completion wall outlives the arm — the nex
         // 4. A different upstream has its own declaration — the proof never
         // travels with the session id to a route that never stated it.
         const foreignHeaders = { "content-type": "application/json", "x-acp-session": "t3450-proof-foreign" };
-        const r3 = await fetch(url(foreign.port), { method: "POST", headers: foreignHeaders, body });
+        const foreignBody = JSON.stringify({ model: "claude-test", max_tokens: 1024, stream: true, messages: bigConversation("t3450-proof-foreign") });
+        const r3 = await fetch(url(foreign.port), { method: "POST", headers: foreignHeaders, body: foreignBody });
         assert.equal(r3.status, 200);
         await r3.text();
         const s3 = listSessions().find((x) => x.id === "t3450-proof-foreign");
@@ -230,7 +244,7 @@ test("e2e #3450 follow-up: a proven share above the #896 cap is reserved in full
     setRegistryForTest({});
 
     const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${proving.port}/v1/messages`;
-    const body = JSON.stringify({ model: "claude-test", max_tokens: 1024, stream: true, messages: bigConversation() });
+    const body = JSON.stringify({ model: "claude-test", max_tokens: 1024, stream: true, messages: bigConversation("t3450-proof-cap") });
     const headers = { "content-type": "application/json", "x-acp-session": "t3450-proof-cap" };
 
     try {

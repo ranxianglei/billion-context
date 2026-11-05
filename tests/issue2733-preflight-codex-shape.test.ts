@@ -11,6 +11,19 @@ import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { listSessions } from "../src/session.ts";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
+// #5738 fork adoption is content-driven: keep this suite's affinity chains
+// inside its own process lifetime so a byte-identical fixture under another
+// declared id cannot be adopted as a fork parent and leak fold state across
+// tests or runs (#5748 CI).
+const isoRoot = fs.mkdtempSync(path.join(os.tmpdir(), "issue2733-codex-shape-"));
+process.env.XDG_CONFIG_HOME = path.join(isoRoot, "config");
+process.env.XDG_DATA_HOME = path.join(isoRoot, "data");
+process.env.XDG_CACHE_HOME = path.join(isoRoot, "cache");
+process.env.XDG_STATE_HOME = path.join(isoRoot, "state");
 
 // #2733 regression: new-api / anyrouter-family codex relays validate inbound
 // calls as "legitimate Codex requests" — input must be typed message items
@@ -84,10 +97,10 @@ function makeUpstream(summaryCalls: SummaryCall[], strictCodexShape: boolean): h
     });
 }
 
-function longInput() {
+function longInput(tag = "") {
     const input: { type: string; role: string; content: string }[] = [];
     for (let i = 0; i < 12; i++) {
-        input.push({ type: "message", role: i % 2 === 0 ? "user" : "assistant", content: `Message ${i} of the long conversation. ` + `MARKER_${i}_content_`.repeat(250) });
+        input.push({ type: "message", role: i % 2 === 0 ? "user" : "assistant", content: (i === 0 ? `${tag} ` : "") + `Message ${i} of the long conversation. ` + `MARKER_${i}_content_`.repeat(250) });
     }
     return input;
 }
@@ -137,7 +150,7 @@ test("#2733: codex client → summary payload carries the real CLI wire shape; s
         const r = await fetch(url, {
             method: "POST",
             headers: { "content-type": "application/json", "user-agent": "codex_cli_rs/0.25.0" },
-            body: JSON.stringify({ model: "gpt-resp", stream: true, session_id: "s2733-codex", instructions: "You are the test coding agent.", input: longInput() }),
+            body: JSON.stringify({ model: "gpt-resp", stream: true, session_id: "s2733-codex", instructions: "You are the test coding agent.", input: longInput("s2733-codex") }),
         });
         assert.equal(r.status, 200, `preflight must fold despite the strict codex-shape validator (before the fix every summary call was 400'd), got ${r.status}`);
         const text = await r.text();
@@ -175,7 +188,7 @@ test("#2733: non-codex client → summary payload stays the legacy minimal shape
         const r = await fetch(url, {
             method: "POST",
             headers: { "content-type": "application/json", "user-agent": "openai-node/4.0.0" },
-            body: JSON.stringify({ model: "gpt-resp", stream: true, session_id: "s2733-noncodex", instructions: "You are the test coding agent.", input: longInput() }),
+            body: JSON.stringify({ model: "gpt-resp", stream: true, session_id: "s2733-noncodex", instructions: "You are the test coding agent.", input: longInput("s2733-noncodex") }),
         });
         assert.equal(r.status, 200);
         await r.text();

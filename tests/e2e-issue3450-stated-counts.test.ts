@@ -11,6 +11,19 @@ import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { listSessions } from "../src/session.ts";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
+// #5738 fork adoption is content-driven: keep this suite's affinity chains
+// inside its own process lifetime so a byte-identical fixture under another
+// declared id cannot be adopted as a fork parent and leak fold state across
+// tests or runs (#5748 CI).
+const isoRoot = fs.mkdtempSync(path.join(os.tmpdir(), "e2e-3450-counts-"));
+process.env.XDG_CONFIG_HOME = path.join(isoRoot, "config");
+process.env.XDG_DATA_HOME = path.join(isoRoot, "data");
+process.env.XDG_CACHE_HOME = path.join(isoRoot, "cache");
+process.env.XDG_STATE_HOME = path.join(isoRoot, "state");
 
 // #3450: an upstream-stated overflow body carries more than its window — the
 // rejected payload's OWN counts ("N in the messages, K in the completion").
@@ -68,11 +81,11 @@ function summaryJson(): string {
     });
 }
 
-function bigConversation(): Array<{ role: string; content: string }> {
+function bigConversation(tag = ""): Array<{ role: string; content: string }> {
     const msgs: Array<{ role: string; content: string }> = [];
     for (let i = 0; i < 12; i++) {
         const role = i % 2 === 0 ? "user" : "assistant";
-        msgs.push({ role, content: `Message ${i} of the long conversation. ` + `MARKER_${i}_content_`.repeat(250) });
+        msgs.push({ role, content: (i === 0 ? `${tag} ` : "") + `Message ${i} of the long conversation. ` + `MARKER_${i}_content_`.repeat(250) });
     }
     return msgs;
 }
@@ -144,7 +157,7 @@ test("e2e #3450 T1: stated counts arm at the MEASURED size, reserve the completi
 
     try {
         const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`;
-        const body = JSON.stringify({ model: "claude-test", max_tokens: 1024, stream: true, messages: bigConversation() });
+        const body = JSON.stringify({ model: "claude-test", max_tokens: 1024, stream: true, messages: bigConversation("t3450-arm-sess") });
         const headers = { "content-type": "application/json", "x-acp-session": "t3450-arm-sess" };
 
         const r1 = await fetch(url, { method: "POST", headers, body });
@@ -224,7 +237,7 @@ test("e2e #3450 T2: with a small stated window the same counts rescue the turn I
 
     try {
         const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`;
-        const body = JSON.stringify({ model: "claude-test", max_tokens: 1024, stream: true, messages: bigConversation() });
+        const body = JSON.stringify({ model: "claude-test", max_tokens: 1024, stream: true, messages: bigConversation("t3450-rec-sess") });
         const headers = { "content-type": "application/json", "x-acp-session": "t3450-rec-sess" };
 
         const r1 = await fetch(url, { method: "POST", headers, body });
