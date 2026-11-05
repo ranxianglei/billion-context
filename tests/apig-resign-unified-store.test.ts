@@ -82,3 +82,21 @@ test("cap trims oldest-first-seen schemes once over budget", async () => {
     assert.ok(p["cap-33"], "newest kept");
     assert.ok(!p["cap-00"], "oldest evicted");
 });
+
+test("late file schemes still migrate when the kv row already holds other schemes", async () => {
+    // models the cross-lane drift window: a legacy-only sibling keeps writing
+    // the file while this instance's kv row is non-empty.
+    recordSignedRefusal("kv-resident", "https://resident.example/r");
+    await flushResignPending();
+    const t1 = new Date().toISOString();
+    fs.writeFileSync(legacyFile, JSON.stringify({
+        "late-scheme": { origin: "https://late.example", firstSeen: t1, lastSeen: t1, count: 1 },
+    }, null, 2));
+    _resetResignPendingForTest();
+    await hydrateResignPending();
+
+    const kv = await kvPending();
+    assert.ok(kv["late-scheme"], "file-only scheme migrated despite a non-empty kv row");
+    assert.ok(kv["kv-resident"], "existing kv entries untouched by the late import");
+    assert.ok(readPendingRefusals()["late-scheme"], "hydrated view serves the late entry");
+});
