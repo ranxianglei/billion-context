@@ -119,7 +119,7 @@ test("issue #2817 regression: identified persona, PLUGIN-MODE fold on openai lan
 
     // dsh identified-persona headers — the lane identity the dsh web client stamps.
     const CONV = "session-2817-incident-repro";
-    const dshHeaders = { "content-type": "application/json", "x-bili-plugin": "dsh", "x-bili-plugin-conversation": CONV };
+    const dshHeaders = { "content-type": "application/json", "x-bili-plugin": "dsh", "x-bili-plugin-conversation": CONV, "x-bili-plugin-agent": "main" };
 
     // Logical conversation (wire-neutral) as ONE ordered list — the pair keeps its
     // historical position exactly like the real dsh client keeps the echoed

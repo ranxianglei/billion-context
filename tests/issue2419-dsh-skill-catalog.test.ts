@@ -217,7 +217,7 @@ test("session-level: the dsh lane stamps the guard onto the effective config", a
         const url = `http://127.0.0.1:${rig.proxyPort}/bili/http://127.0.0.1:${rig.upstreamPort}/v1/chat/completions`;
         const r = await fetch(url, {
             method: "POST",
-            headers: { "content-type": "application/json", "x-bili-plugin": "dsh", "x-bili-plugin-conversation": "i2419-stamp" },
+            headers: { "content-type": "application/json", "x-bili-plugin": "dsh", "x-bili-plugin-conversation": "i2419-stamp", "x-bili-plugin-agent": "main" },
             body: JSON.stringify({ model: MODEL, max_tokens: 64_000, messages: [{ role: "system", content: MAIN_SYSTEM }, { role: "user", content: CATALOG_MSG }] }),
         });
         assert.equal(r.status, 200);
