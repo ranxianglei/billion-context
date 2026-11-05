@@ -28,7 +28,7 @@
 //
 // Gated by ACP_TEST_E2E_NATIVE=1 (same gate as e2e-native-pi.test.ts; needs
 // `npm run build` first — the pi package loads dist/agent/billion-context.js, a
-// re-export of pi-native.js (which inlines the vendored pi-subagents source)).
+// re-export of pi-native.js (which inlines the vendored pi-subagents source).
 // Skips when the pi CLI is absent.
 
 import { spawn, spawnSync } from "node:child_process";
