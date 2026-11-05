@@ -74,10 +74,24 @@ export function isServerToolUtilityCall(parsed: unknown): boolean {
 
 const STRUCTURED_FORMAT_TYPES: ReadonlySet<string> = new Set(["json_schema", "json_object"]);
 
-/** #5073: whether the body asks for a JSON reply: OpenAI chat `response_format`
- *  or the Responses wire's `text.format`. `{type:"text"}` is plain prose and
- *  does not count. */
-function requestsStructuredOutput(p: Record<string, unknown>): boolean {
+/** #5073: structural identification of a tool-less structured-output utility
+ *  call — a memory-extraction daemon such as Hindsight (inheriting the host's
+ *  HTTPS_PROXY, under the main session id) sends no tools, asks for a JSON
+ *  reply (`response_format` of type `json_schema`/`json_object` on the chat
+ *  wire, or `text.format` of those types on the Responses wire), and carries a
+ *  large output budget. Such a call is a one-shot utility request, not an
+ *  agent turn: agent turns always carry an action surface (#546), so a strict
+ *  backend rejects `tools` injected beside `response_format` with a 400. It
+ *  therefore rides the #388 verbatim side passthrough.
+ *  The no-tools veto is part of the predicate (not only the caller's #546
+ *  guard) so callers that consult it independently of `isSideRequest` — the
+ *  restoreOutputBudget skip in handle.ts, the same category as the #2500
+ *  server-tool predicate — can never demote a tool-carrying main turn.
+ *  `{type:"text"}` is plain prose and does not count. */
+export function isStructuredOutputCall(parsed: unknown): boolean {
+    if (!parsed || typeof parsed !== "object") return false;
+    const p = parsed as Record<string, unknown>;
+    if (Array.isArray(p.tools) && p.tools.length > 0) return false;
     const text = p.text;
     const format = p.response_format
         ?? (text !== null && typeof text === "object" ? (text as { format?: unknown }).format : undefined);
@@ -102,8 +116,9 @@ export function isSideRequest(parsed: unknown, requestAgent?: string): boolean {
     // utility call, not an agent turn (memory-extraction daemons such as
     // Hindsight that inherit the host's HTTPS_PROXY, with a large output
     // budget). Wire tools injected into it make strict backends reject the
-    // pair with a 400.
-    if (requestsStructuredOutput(p)) return true;
+    // pair with a 400. Routed through the #388 side passthrough like the #2500
+    // server-tool shape above.
+    if (isStructuredOutputCall(parsed)) return true;
     const field = outputBudgetField(parsed);
     if (!field) return false;
     const raw = readOutputBudget(p, field);
