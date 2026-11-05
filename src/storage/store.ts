@@ -42,6 +42,10 @@ const WAL_CHECKPOINT_EVERY_INGESTS = 20;
 /** PR #4725 N3: covered-seq span point queries chunk the msg_id IN (…) list
  *  to stay under SQLite's 999 bound-parameter limit (1 session id + 500). */
 const SEQ_SPAN_QUERY_BATCH = 500;
+/** Max bound parameters per generated statement (refs batching, #5744).
+ *  Well under the conservative 999-parameter default some SQLite builds
+ *  still ship with — see sqlite3.MAX_BIND_PARAMS. */
+const REF_STMT_MAX_PARAMS = 700;
 
 /** #4796: rows per batch of gc()'s zero-ref CAS sweep. Sized so one batch's
  *  page churn stays modest even when the store is dominated by multi-MB
@@ -1261,18 +1265,65 @@ export class UnifiedStore {
 
             // refs: the incoming array is AUTHORITATIVE — native compaction
             // and the #2695 zombie reap renumber byRaw/byRef (survivors move
-            // to lower ords, pruned ids vanish). Upserting onto that shape
-            // either hits the (session_id, ord) PK (ingest rolls back, 3-strike
-            // self-disable — review #2690 blocking 1) or leaves ghost rows that
-            // make the loaded map strictly larger than legacy (permanent
-            // DIGEST DRIFT spam — blocking 2). Replace the whole set.
-            this.db.prepare("DELETE FROM refs WHERE session_id = ?").run(s.sessionId);
+            // to lower ords, pruned ids vanish). A blind upsert onto that shape
+            // would hit the (session_id, ord) PK (review #2690 blocking 1) or
+            // leave ghost rows (blocking 2), which is why this used to
+            // DELETE-all + re-insert EVERY row on EVERY save. That made the
+            // store leg of an O(new messages) delta save O(full history):
+            // ~H native statement executions per turn on a long session
+            // (~97% of all per-save statements; the CDP profile behind #5744)
+            // while touching zero history rows in the append-only steady
+            // state. Now: one indexed read of the stored set, an in-memory
+            // diff, and writes ONLY for what changed — vanished raw_ids are
+            // deleted (ghosts can never outlive one save, so the loaded map
+            // stays exactly the legacy one), untouched survivors are skipped,
+            // and added/moved rows go out as multi-row upsert batches (a
+            // first ingest of a 3k-message session costs ~20 statements,
+            // not 3001; the compaction storm that motivated the old
+            // replace-all now costs the same bounded batch budget).
+            const oldRefs = new Map<string, { ord: number; ref: string; refNum: number | null }>();
+            for (const row of this.db
+                .prepare("SELECT raw_id, ord, ref, ref_num FROM refs WHERE session_id = ?")
+                .all(s.sessionId) as Array<{ raw_id: string; ord: number; ref: string; ref_num: number | null }>) {
+                oldRefs.set(row.raw_id, { ord: row.ord, ref: row.ref, refNum: row.ref_num });
+            }
+            const goneRefIds: string[] = [];
+            const touchedRefs: RefRow[] = [];
             for (const r of input.refs) {
-                this.db
-                    .prepare(
-                        "INSERT INTO refs (session_id, ord, raw_id, ref, ref_num) VALUES (?, ?, ?, ?, ?) ON CONFLICT(session_id, raw_id) DO UPDATE SET ord = excluded.ord, ref = excluded.ref, ref_num = excluded.ref_num",
-                    )
-                    .run(s.sessionId, r.ord, r.rawId, r.ref, r.refNum);
+                const o = oldRefs.get(r.rawId);
+                if (!o || o.ord !== r.ord || o.ref !== r.ref || o.refNum !== r.refNum) {
+                    touchedRefs.push(r);
+                } else {
+                    oldRefs.delete(r.rawId); // matched and unmodified — consume it
+                }
+            }
+            for (const rawId of oldRefs.keys()) goneRefIds.push(rawId);
+            if (goneRefIds.length > 0) {
+                const perChunk = Math.floor((REF_STMT_MAX_PARAMS - 1) / 1);
+                for (let i = 0; i < goneRefIds.length; i += perChunk) {
+                    const ids = goneRefIds.slice(i, i + perChunk);
+                    this.db
+                        .prepare(
+                            "DELETE FROM refs WHERE session_id = ? AND raw_id IN (" + ids.map(() => "?").join(", ") + ")",
+                        )
+                        .run(s.sessionId, ...ids);
+                }
+            }
+            if (touchedRefs.length > 0) {
+                const colsPerRow = 5;
+                const perChunk = Math.floor(REF_STMT_MAX_PARAMS / colsPerRow);
+                for (let i = 0; i < touchedRefs.length; i += perChunk) {
+                    const rows = touchedRefs.slice(i, i + perChunk);
+                    const params: unknown[] = [];
+                    for (const r of rows) params.push(s.sessionId, r.ord, r.rawId, r.ref, r.refNum);
+                    this.db
+                        .prepare(
+                            "INSERT INTO refs (session_id, ord, raw_id, ref, ref_num) VALUES " +
+                                rows.map(() => "(?, ?, ?, ?, ?)").join(", ") +
+                                " ON CONFLICT(session_id, raw_id) DO UPDATE SET ord = excluded.ord, ref = excluded.ref, ref_num = excluded.ref_num",
+                        )
+                        .run(...params);
+                }
             }
 
             // ccr_entries: the content store is a map whose keys can be
