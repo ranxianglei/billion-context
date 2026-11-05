@@ -109,7 +109,7 @@ function fmtBytes(n: number): string {
     return `${(n / (1024 * 1024)).toFixed(1)}MiB`;
 }
 
-// #5764: human "last seen" age for the windowed unrecognized-path counter, so a
+// #5763: human "last seen" age for the windowed unrecognized-path counter, so a
 // stale probe reads as stale rather than as an active fault.
 function ageLabel(msAgo: number): string {
     if (msAgo < 60_000) return "just now";
@@ -608,7 +608,7 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
         // #1290: requests whose path matched no known protocol were relayed
         // byte-for-byte and never entered a session — a second reason "no
         // compressed blocks" can mean misrouting rather than a short chat.
-        // #5764: windowed (last 24h) with a per-path last-seen age so a stale
+        // #5763: windowed (last 24h) with a per-path last-seen age so a stale
         // probe reads as stale, not as an active fault; only model-call-shaped
         // (POST+body) requests reach this counter now, so non-POST probe/scan
         // noise no longer lands here at all.

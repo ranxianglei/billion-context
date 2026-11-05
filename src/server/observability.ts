@@ -31,7 +31,7 @@ export function logDumpFailure(where: string, err: unknown): void {
 // log (~20k lines in one user's capture, #362). Per-path: first 3 at warn, one
 // "suppressed" notice, then silent.
 //
-// #5764: the counter is a WINDOWED view, not a since-start ledger. An entry whose
+// #5763: the counter is a WINDOWED view, not a since-start ledger. An entry whose
 // last hit is older than UNRECOGNIZED_PATH_TTL_MS drops out of BOTH the log-
 // suppression state and the /__bili/stats + acp_status panel — a one-off probe
 // from days ago must not stay resident on the panel looking like an active fault.
@@ -67,7 +67,7 @@ export function logUnrecognizedPath(log: (level: string, msg: string) => void, u
 // #1290: instance-level view of the map above — surfaced at /__bili/stats
 // (unrecognizedPaths) and in the /acp status report so "this path never got
 // compressed" is visible in a status face, not just 3 transient stderr warns.
-// #5764: windowed by UNRECOGNIZED_PATH_TTL_MS — paths/total reflect only entries
+// #5763: windowed by UNRECOGNIZED_PATH_TTL_MS — paths/total reflect only entries
 // still inside the window, and firstSeen/lastSeen (ISO) are additive so scripts
 // that read only paths/total keep working unchanged.
 type UnrecognizedPathStats = {
