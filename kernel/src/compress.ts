@@ -1,4 +1,4 @@
-import { assignRefs, BLOCKED_REF, highestUsedIndex, indexToRef } from "./refs.js";
+import { assignRefs, BLOCKED_REF, highestUsedIndex, indexToRef, orderedRefPair } from "./refs.js";
 import { remintCoveredLiveIds } from "./instance-reid.js";
 import { prune } from "./prune.js";
 import { syncBlocks } from "./sync.js";
@@ -989,9 +989,16 @@ export function createCore(ports: Ports = {}): CompressionCore {
     const bannerShown = (result.state.nudge?.lastNudgeShownTokens ?? 0) > 0 || Object.keys(result.state.nudge?.lastShownByTier ?? {}).length > 0;
     if (nudge && !nudge.shouldInject && (nudge.tier !== null || bannerShown) && (nudge.compressibleRanges?.length ?? 0) > 0) {
       const highest = highestUsedIndex(state.messageRefs);
+      // #5680: after a generation reset the stored endpoints of a positional
+      // span can be numerically descending — canonicalize to ascending like
+      // every other display surface (formatRanges, acp_status) or the model
+      // reads the line as corrupt and skips compression.
       const offered = nudge.compressibleRanges!
         .slice(0, 3)
-        .map((r) => `${r.startRef}–${r.endRef} (${formatK(r.tokens)})`)
+        .map((r) => {
+          const [lo, hi] = orderedRefPair(r.startRef, r.endRef);
+          return `${lo}–${hi} (${formatK(r.tokens)})`;
+        })
         .join(", ");
       const extra = nudge.compressibleRanges!.length > 3 ? `, +${nudge.compressibleRanges!.length - 3} more` : "";
       statusLine = `[ACP status: highest allocated ref ${highest > 0 ? indexToRef(highest) : "none"} — refs above it are not minted yet, never guess them; compressible now: ${offered}${extra}; the newest messages stay protected. Use these refs directly; acp_status only if you need the full list.]`;

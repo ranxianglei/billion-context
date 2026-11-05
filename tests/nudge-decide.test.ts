@@ -103,6 +103,45 @@ test("resolveDecisionRange finalizes against the live view only", () => {
     assert.deepEqual(resolveDecisionRange({ range: "m00040-m00030" }, RANGES), { startRef: "m00010", endRef: "m00020" });
 });
 
+test("#5680: reversed stored ranges render ascending and resolve contained spans", () => {
+    // Post-generation-reset ledger: early positions keep old-era high refs,
+    // later positions mint from m00001 — a positional span's stored endpoints
+    // can be numerically descending.
+    const REVERSED: CompressibleRange[] = [
+        { startRef: "m00517", endRef: "m00002", count: 4, tokens: 9_000, toolPct: 40, textPct: 60 },
+        { startRef: "m00030", endRef: "m00040", count: 11, tokens: 3_000, toolPct: 10, textPct: 90 },
+        // Largest on purpose: with the reversed range ALSO the largest, a
+        // containment hit and the largest-range fallback are indistinguishable.
+        { startRef: "m00900", endRef: "m00910", count: 5, tokens: 20_000, toolPct: 20, textPct: 80 },
+    ];
+    // Display: the model copies the span verbatim into its JSON answer, so the
+    // prompt must never show a descending pair.
+    const q = buildDecisionPrompt(REVERSED);
+    assert.ok(q.includes("m00002\u2013m00517  4 msgs  9.0K [tool 40% | text 60%]"));
+    for (const m of q.matchAll(/m(\d{1,7})\u2013m(\d{1,7})/g)) {
+        assert.ok(Number(m[1]) <= Number(m[2]), `prompt span ${m[0]} reads reversed`);
+    }
+    // Containment: a span inside a reversed range resolves to that range's
+    // normalized labels instead of silently falling back to the largest range.
+    assert.deepEqual(resolveDecisionRange({ range: "m00500-m00510" }, REVERSED), {
+        startRef: "m00002",
+        endRef: "m00517",
+    });
+    // The verbatim echo of the (now ascending) prompt span resolves too.
+    assert.deepEqual(resolveDecisionRange({ range: "m00002-m00517" }, REVERSED), {
+        startRef: "m00002",
+        endRef: "m00517",
+    });
+    // A proposal inside the LARGER non-reversed range resolves to that range —
+    // per-range containment, not absorption into whatever is largest.
+    assert.deepEqual(resolveDecisionRange({ range: "m00905-m00908" }, REVERSED), {
+        startRef: "m00900",
+        endRef: "m00910",
+    });
+    // Fallback over a reversed live view returns the largest range, normalized.
+    assert.deepEqual(resolveDecisionRange({}, REVERSED), { startRef: "m00900", endRef: "m00910" });
+});
+
 test("failure ladder counts hard failures, resets on any parsed answer", () => {
     const meta: Record<string, unknown> = {};
     assert.equal(ladderMode(meta), "try");
