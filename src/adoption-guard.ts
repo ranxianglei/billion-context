@@ -23,7 +23,7 @@
  */
 import { findContestedWriters, type WriterIdentity } from "./served-markers.js";
 
-export type HotWriter = WriterIdentity & { servedAt: number };
+type HotWriter = WriterIdentity & { servedAt: number };
 
 let probe: ((sessionId: string) => HotWriter[]) | undefined;
 
