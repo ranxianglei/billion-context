@@ -172,6 +172,12 @@ export { forward } from "./server/relay.js";
 // for a session. Re-exported under the old names for tests.
 export { WARNED_CHAIN_SESSION_CAP, _resetChainVerdictsForTest as _resetChainWarningsForTest, _chainVerdictMapForTest as _chainWarnSetForTest } from "./plugin.js";
 
+// #5716 test seam: harnesses that model restart handover without sending
+//  SIGTERM dispose the most recent in-process writer so its marker records
+//  a graceful stop — the handover evidence the hot-adoption guard consumes.
+let latestServedWriter: ServedMarkerWriter | undefined;
+export function _disposeServedWriterForTest(): void { latestServedWriter?.dispose(); }
+
 // #1205: sessions already warned about codec-dropped content parts (e.g.
 // DeepSeek Files API file refs) — one warn per session per distinct type-set;
 // attachment flows resend the same history every turn. Same bounded-FIFO shape
@@ -1364,6 +1370,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
                     onContest: recordSplitBrainContest,
                 },
             );
+            latestServedWriter = servedWriter;
             reapStaleWriterMarkers(markerDir, Date.now());
             // #4626: a surfaced verdict re-evaluates against CURRENT marker
             // evidence at every status read — the accused peer's own marker,

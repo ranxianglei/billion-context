@@ -3,13 +3,13 @@ import http from "node:http";
 import { once } from "node:events";
 import { createHash } from "node:crypto";
 import test from "node:test";
-import { existsSync, mkdtempSync, closeSync, ftruncateSync, openSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdtempSync, closeSync, ftruncateSync, openSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { applyAbsorb, buildStoredPlaceholder, createContentStore, defaultConfig, DEFAULT_ABSORB_CONFIG, DEFAULT_CCR_CONFIG, storeOriginal } from "acp-kernel";
-import { startServer } from "../src/server.ts";
+import { startServer, _disposeServedWriterForTest } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { setLogCapture } from "../src/logger.ts";
@@ -973,36 +973,10 @@ for (const storageMode of ["legacy", "full"] as const) {
             // #394/#5716: every commit stamps THIS process's writer marker, so
             // while h lives its marker lists parent+child as actively served
             // and the stand-in's hot-adoption guard would refuse both ids as
-            // held by a live peer. Simulate the graceful SIGTERM exit (#4626
-            // handover semantics): wait until the marker file is quiescent —
-            // a throttled flush ≤5s after the last commit can still land and
-            // clobber the stamp — then stamp stoppedAt/disposedAt ourselves.
-            // The lingering-predecessor refusal itself is pinned in
-            // tests/hot-adoption-guard.test.ts.
-            const writersDir = join(h.dir, "billion-context", "writers");
-            const markerMtimes = (): Record<string, number> => {
-                const out: Record<string, number> = {};
-                if (!existsSync(writersDir)) return out;
-                for (const f of readdirSync(writersDir)) if (f.endsWith(".json")) out[f] = statSync(join(writersDir, f)).mtimeMs;
-                return out;
-            };
-            let prevMtimes: Record<string, number> | undefined;
-            for (let i = 0; i < 8; i++) {
-                const mtimes = markerMtimes();
-                if (prevMtimes !== undefined && JSON.stringify(mtimes) === JSON.stringify(prevMtimes)) break;
-                prevMtimes = mtimes;
-                await new Promise((r) => setTimeout(r, 5_500));
-            }
-            if (existsSync(writersDir)) {
-                for (const f of readdirSync(writersDir)) {
-                    if (!f.endsWith(".json")) continue;
-                    const p = join(writersDir, f);
-                    const m = JSON.parse(readFileSync(p, "utf8")) as Record<string, unknown>;
-                    m.stoppedAt = Date.now();
-                    m.disposedAt = Date.now();
-                    writeFileSync(p, JSON.stringify(m));
-                }
-            }
+            // held by a live peer. Record the graceful stop now (#4626
+            // handover semantics); the lingering-predecessor refusals stay
+            // pinned in tests/hot-adoption-guard.test.ts.
+            _disposeServedWriterForTest();
             // #5046/#5075 (2026-10-30 owner chain): two LIVE bili processes on
             // ONE sessions dir is refused — sharing a dir across lanes is the
             // supported topology, same dir is split-brain risk. Close our own
