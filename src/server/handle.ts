@@ -7,7 +7,8 @@ import path from "node:path";
 import { performance } from "node:perf_hooks";
 import { defaultPrompts, type CompressionCore, type Config, type PackSurface, type Prompts } from "acp-kernel";
 import { conversationSignalAnthropic, conversationSignalGoogle, conversationSignalOpenai, conversationIdentityResponses, conversationSignalResponses, googleSystemText, type AnthropicRequestBody, type GoogleRequestBody, type OpenAIRequestBody, type ResponsesRequestBody } from "acp-kernel/wire";
-import { resolveCompress, resolveCompressPrompts, resolveCompressSurfaceDetailed, resolveRequestConfig } from "../compress-settings.js";
+import { resolveCompress, resolveCompressPrompts, resolveCompressSurfaceDetailed, resolveRequestConfig, type CompressSettings } from "../compress-settings.js";
+import { storeUnpromptedGate } from "../unprompted-gate.js";
 import { FALLBACK_EFFECTIVE_WINDOW_FLOOR, findRoute, findRouteKey, lookupContextLimit, resolveConfiguredOutputLimit, resolveCompressProtocol, resolveDeclaredProtocol, resolveModelEntry, type ProxyOptions } from "../config.js";
 import { resolveProxyDecision } from "../upstream-proxy.js";
 import { contextFromRegistry, peekRegistryContext, peekRegistryOutputLimit, peekRegistryPriceProfile } from "../registry.js";
@@ -2538,6 +2539,9 @@ async function handleRequest(
             // #2155: self-heal evaluates once per HTTP request — the refold
             // re-runs prepare below but must not double-count a round.
             let selfHealRoundDone = false;
+            // #5683: this round's merged three-level compress settings, captured
+            // so the post-prepare gate stamp below can read the policy knobs.
+            let preparedCs: CompressSettings | undefined;
             const runPreparedPipeline = async (
                 respondFailFast: boolean,
                 overflowWindow?: number,
@@ -2547,6 +2551,7 @@ async function handleRequest(
                     // validity (the last one deletes it — see session.ts).
                     tickPostRebuildAnchor(session);
                     const cs = resolveCompress(opts.routes, providerDestUrl, requestModel, opts.compress);
+                    preparedCs = cs;
                     // #2228: model-decided nudge timing — resolved through the standard
                     // three-level compress cascade; presence of the object enables the
                     // side-call decision path at tier-1 arms (off unless explicitly set).
@@ -2780,6 +2785,20 @@ async function handleRequest(
                         degradeAvailable: opts.compress.injectTool && !knobNoInjectTool(),
                     }, log);
                 }
+                // #5683: stamp this round's compression-prompt facts for the
+                // unprompted/out-of-bounds gates (applyRanges). armed tracks the
+                // SAME post-gate delivery fact as the self-heal credit above —
+                // only an actually delivered nudge ("injected") arms; "gated"
+                // rounds held by the emergency backoff never did reach the model.
+                // Stamped on EVERY round (not just nudge-carrying ones) so an
+                // un-nudged round disarms a stale arm; loop re-requests within
+                // the same turn do not re-run prepare, so the arm persists across
+                // rounds of one turn and dies with the next un-nudged turn.
+                storeUnpromptedGate(session, {
+                    armed: prepared.nudgeOutcome === "injected",
+                    requireNudge: preparedCs?.requireNudge === true,
+                    requireRecommendation: preparedCs?.requireRecommendation === true,
+                });
                 // A locally-served codex compaction forge never reaches an
                 // upstream: preflight would burn summarization rounds for a
                 // reply that is already forged (#3008 prompt form).

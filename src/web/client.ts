@@ -3911,6 +3911,8 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             const ab = (cp && cp.absorb && typeof cp.absorb === "object" && !Array.isArray(cp.absorb)) ? cp.absorb : null;
             abRow.inp.checked = ab ? ab.enabled === true : false;
             cafRow.inp.checked = cp ? cp.compressAtFoldPoint === true : false;
+            rnRow.inp.checked = cp ? cp.requireNudge === true : false;
+            rrRow.inp.checked = cp ? cp.requireRecommendation === true : false;
             const pv = (cp && typeof cp.promptPack === "string") ? cp.promptPack : "default";
             while (packSel.options.length > 0) packSel.removeChild(packSel.lastChild);
             (packNames.length ? packNames : ["default", "lean"]).forEach((name) => {
@@ -4074,6 +4076,43 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         abHint.className = "dim small";
         abHint.textContent = t("cfg.q_absorb_hint");
         abRow.ctl.appendChild(abHint);
+        // #5683: unprompted/out-of-bounds compression gates (compress.* booleans).
+        const rnRow = row("quick-require-nudge", t("cfg.q_require_nudge"));
+        qCtrls.push(rnRow.inp);
+        rnRow.inp.addEventListener("change", () => commit((d) => {
+            if (rnRow.inp.checked) {
+                if (!compressOf(d)) d.compress = {};
+                d.compress.requireNudge = true;
+            } else {
+                const c = compressOf(d);
+                if (c) {
+                    delete c.requireNudge;
+                    if (Object.keys(c).length === 0) delete d.compress;
+                }
+            }
+        }));
+        const rnHint = document.createElement("span");
+        rnHint.className = "dim small";
+        rnHint.textContent = t("cfg.q_require_nudge_hint");
+        rnRow.ctl.appendChild(rnHint);
+        const rrRow = row("quick-require-rec", t("cfg.q_require_rec"));
+        qCtrls.push(rrRow.inp);
+        rrRow.inp.addEventListener("change", () => commit((d) => {
+            if (rrRow.inp.checked) {
+                if (!compressOf(d)) d.compress = {};
+                d.compress.requireRecommendation = true;
+            } else {
+                const c = compressOf(d);
+                if (c) {
+                    delete c.requireRecommendation;
+                    if (Object.keys(c).length === 0) delete d.compress;
+                }
+            }
+        }));
+        const rrHint = document.createElement("span");
+        rrHint.className = "dim small";
+        rrHint.textContent = t("cfg.q_require_rec_hint");
+        rrRow.ctl.appendChild(rrHint);
         const packSel = document.createElement("select");
         packSel.className = "field-input mono";
         qCtrls.push(packSel);
