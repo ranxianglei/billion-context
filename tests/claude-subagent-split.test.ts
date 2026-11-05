@@ -260,3 +260,20 @@ test("anthropicFirstUserFrag strips leading <system-reminder> blocks so long sha
     assert.notEqual(discA, discB, "subagents with >1024 chars shared <system-reminder> and distinct task prompts must not collide");
 });
 
+test("anthropicFirstUserFrag reminder-strip edges: reminder-only degrades to original, unclosed tag untouched, consecutive reminders all stripped", () => {
+    const onlyReminder = `<system-reminder>\n${"r".repeat(2000)}\n</system-reminder>`;
+    assert.equal(
+        anthropicFirstUserFrag([{ role: "user", content: onlyReminder }]),
+        onlyReminder.slice(0, 1024),
+        "reminder-only content degrades to the original text instead of an empty discriminator");
+    assert.equal(
+        anthropicFirstUserFrag([{ role: "user", content: "<system-reminder>a</system-reminder><system-reminder>b</system-reminder>task z" }]),
+        "task z",
+        "multiple consecutive leading reminders are all stripped");
+    const unclosed = `<system-reminder>unclosed ${"u".repeat(1100)} end`;
+    assert.equal(
+        anthropicFirstUserFrag([{ role: "user", content: unclosed }]),
+        unclosed.slice(0, 1024),
+        "an unclosed leading tag is never stripped (no data loss)");
+});
+
