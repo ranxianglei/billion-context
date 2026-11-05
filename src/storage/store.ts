@@ -308,9 +308,10 @@ export interface IngestSessionInput {
     /** Serialized orphan map (Record<blockId, {one, full}>) — blockContents
      *  entries whose block is absent from state.blocks (#4216/#4242: the reap
      *  shape is REPRESENTABLE; rides the same transaction so the session row,
-     *  blocks and tail keep advancing). MERGE semantics on write: existing
-     *  journal entries survive, because LazyBlockContents means a live
-     *  session's in-memory map may not carry entries trimmed earlier. */
+     *  blocks and tail keep advancing). REPLACE semantics on write (#5589-C):
+     *  finishPlan iterates the full live map (LazyBlockContents re-materializes
+     *  on iteration), so this set is authoritative — an empty set resets the
+     *  journal after an authoritative clear (native-compaction rebase). */
     orphansJson?: string | null;
 }
 
@@ -753,38 +754,26 @@ export class UnifiedStore {
     }
 
     /** refcount-aware release; the CAS body itself never leaves. */
-    /** #4242: merge the incoming orphan map over the journal's current
-     *  contents. Incoming entries win on key collision (same id, refreshed
-     *  view); existing entries the live session no longer carries (trimmed
-     *  from memory by LazyBlockContents) survive. */
-    private mergeOrphansJson(sessionId: string, incomingJson: string | null): string | null {
-        if (incomingJson === null) {
-            // No orphans in this save — keep whatever the journal already
-            // holds (a previous reap's trimmed-away contents must survive).
-            const row = this.db
-                .prepare("SELECT orphans_json FROM sessions WHERE session_id = ?")
-                .get(sessionId) as { orphans_json: string | null } | undefined;
-            return row?.orphans_json ?? null;
-        }
-        let merged: Record<string, unknown> = {};
-        try {
-            const existing = this.db
-                .prepare("SELECT orphans_json FROM sessions WHERE session_id = ?")
-                .get(sessionId) as { orphans_json: string | null } | undefined;
-            if (existing?.orphans_json) {
-                const parsed = JSON.parse(existing.orphans_json) as Record<string, unknown>;
-                if (parsed && typeof parsed === "object") merged = parsed;
-            }
-        } catch {
-            // corrupt journal → start fresh (loadLegacyView skips bad entries too)
-        }
+    /** #4242/#5589-C: the plan's orphan set is AUTHORITATIVE — finishPlan
+     *  iterates the full live map (LazyBlockContents re-materializes on
+     *  iteration), so the journal REPLACES instead of merging. Merge
+     *  semantics latched pre-clear ghosts forever: after a native-compaction
+     *  rebase (resetSessionCompression clears blockContents) the live side
+     *  can never carry the old ids again, yet every sampled verify flagged
+     *  them ([diverged: blockContents]) until escalation froze the envelope
+     *  with no save path able to clear the journal (field evidence S6,
+     *  v0.1.212 Codex Desktop). */
+    private writeOrphansJson(incomingJson: string | null): string | null {
+        if (incomingJson === null) return null;
         try {
             const incoming = JSON.parse(incomingJson) as Record<string, unknown>;
-            if (incoming && typeof incoming === "object") merged = { ...merged, ...incoming };
+            if (incoming && typeof incoming === "object" && !Array.isArray(incoming)) {
+                return Object.keys(incoming).length > 0 ? JSON.stringify(incoming) : null;
+            }
         } catch {
-            // corrupt incoming → keep existing only
+            // corrupt authoritative input → treat as an empty set
         }
-        return Object.keys(merged).length > 0 ? JSON.stringify(merged) : null;
+        return null;
     }
 
     private releaseContent(hash: string | null): void {
@@ -1010,10 +999,9 @@ export class UnifiedStore {
                     tailJson: s.tailJson,
                     ccrJson: s.ccrJson,
                     lastIngestedSeq: watermark,
-                    // #4216/#4242: orphan journal rides the normal upsert with
-                    // MERGE semantics (existing entries survive — LazyBlockContents
-                    // means the live map may not carry trimmed entries).
-                    orphansJson: this.mergeOrphansJson(s.sessionId, s.orphansJson ?? null),
+                    // #4216/#4242/#5589-C: the plan carries the exact current
+                    // orphan set; the upsert replaces the journal wholesale.
+                    orphansJson: this.writeOrphansJson(s.orphansJson ?? null),
                 });
 
             // Identity index (#2960 R2.1): claim (namespace, conversation_id)

@@ -90,18 +90,33 @@ test("#4216: post-reap saves keep advancing (no freeze) and cold loads are fresh
         assert.ok(view.blockContents.has("b3"), "orphan original survives for decompress");
         assert.equal((view.blockContents.get("b3") as { full: { text: string } }).full.text, "b3 orphaned original summary");
 
-        // 4. journal merge: a later save (still carrying the orphan) is stable,
-        //    and a save WITHOUT it (LazyBlockContents trimmed) keeps the journal.
+        // 4. journal is authoritative per save (#5589-C): a later save still
+        //    carrying the orphan is stable; an authoritative EMPTY set (a
+        //    native-compaction rebase cleared blockContents) resets it. The
+        //    pre-#5589-C expectation here was "a trimmed live map keeps the
+        //    journal" — unreachable in production: LazyBlockContents
+        //    re-materializes on iteration (or throws refusing the thinned
+        //    view), so a save only ever sees the full set or a genuine clear.
+        //    Holding onto pre-clear ghosts latched a permanent [diverged:
+        //    blockContents] drift + envelope freeze (field evidence S6).
         store.ingestSession(planIngest(legacyLike("sess", 900, true)));
-        store.ingestSession(planIngest({ ...legacyLike("sess", 950, false), blockContents: new Map() } as LegacySessionLike));
-        const view2 = loadLegacyView({
+        let view2 = loadLegacyView({
             session: store.getSessionRow("sess")!,
             messages: store.getMessages("sess"),
             blocks: store.getBlocks("sess"),
             deadRefs: store.getDeadRefs("sess"),
             refs: store.getRefs("sess"),
         });
-        assert.ok(view2.blockContents.has("b3"), "trimmed-away journal entry survives the merge");
+        assert.ok(view2.blockContents.has("b3"), "orphan survives while the live side still carries it");
+        store.ingestSession(planIngest({ ...legacyLike("sess", 950, false), blockContents: new Map() } as LegacySessionLike));
+        view2 = loadLegacyView({
+            session: store.getSessionRow("sess")!,
+            messages: store.getMessages("sess"),
+            blocks: store.getBlocks("sess"),
+            deadRefs: store.getDeadRefs("sess"),
+            refs: store.getRefs("sess"),
+        });
+        assert.ok(!view2.blockContents.has("b3"), "an authoritative clear resets the journal (pre-fix: ghost survived forever)");
 
         store.close();
     } finally {
