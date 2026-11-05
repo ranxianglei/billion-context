@@ -36,6 +36,21 @@ const SSE_BODY =
 
 interface Harness { origin: string; upstreamUrl: string; close: () => Promise<void>; }
 
+const CLOSE_TIMEOUT_MS = 5_000;
+// #3731: bound the teardown 'close' await. Under Windows runner-pool load a delayed
+// or lost 'close' makes `await once(server,"close")` a handle-less dangling await that
+// drains the event loop, so node --test aborts the WHOLE file and records every sibling
+// subtest as cancelledByParent with ZERO assertion failures. The live timer keeps the
+// loop alive so the promise always settles; per-test/--test-timeout do NOT rescue this
+// (node:test's timer is unref'd). closeAllConnections already freed every socket.
+const settledClose = (srv: http.Server): Promise<void> => {
+    let timer: ReturnType<typeof setTimeout> | undefined = undefined;
+    const timeout = new Promise<void>((resolve) => { timer = setTimeout(resolve, CLOSE_TIMEOUT_MS); });
+    return Promise.race([once(srv, "close"), timeout]).then(() => {
+        if (timer !== undefined) clearTimeout(timer);
+    });
+};
+
 async function harness(opts: { dumpDir?: string; injectTool: boolean }): Promise<Harness> {
     _resetSessionsForTest();
     _resetPluginStateForTest();
@@ -65,8 +80,9 @@ async function harness(opts: { dumpDir?: string; injectTool: boolean }): Promise
         origin, upstreamUrl,
         close: async () => {
             store.cancelAll();
-            const closed = Promise.all([once(proxy, "close"), once(upstream, "close")]);
-            proxy.close(); upstream.close();
+            const closed = Promise.all([settledClose(proxy), settledClose(upstream)]);
+            proxy.close(); proxy.closeIdleConnections?.(); proxy.closeAllConnections?.();
+            upstream.close(); upstream.closeIdleConnections?.(); upstream.closeAllConnections?.();
             await closed;
         },
     };

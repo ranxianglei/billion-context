@@ -16,13 +16,14 @@ process.env.BILI_PERSIST = "0";
 
 import { defaultConfig, DEFAULT_ABSORB_CONFIG, type Config } from "acp-kernel";
 import { startServer } from "../src/server.ts";
-import { findAbsorbPluginDivergences, type ProxyOptions } from "../src/config.ts";
+import { findAbsorbPluginDivergences, type CompressSettings, type ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { listSessions, getSession } from "../src/session.ts";
 import { handlePluginManifest } from "../src/plugin.ts";
 import { effectiveAbsorbConfig, storeEffectiveAbsorb, isProxyToolFor } from "../src/absorb.ts";
 import { applyCompressSettings } from "../src/compress-settings.ts";
+import { effectiveAbsorbBlock } from "../src/server/prepare-responses.ts";
 
 const MODEL = "test-model";
 
@@ -75,6 +76,28 @@ test("gate: plugin-lane stamp makes the renamed name the sole accepted absorb to
     storeEffectiveAbsorb(s, renamed);
     assert.equal(isProxyToolFor("my_absorb", s, base), true, "renamed (advertised) name accepted");
     assert.equal(isProxyToolFor("absorb", s, base), false, "static name rejected after rename");
+});
+
+// #3293 guard: the plugin-lane prompt/mark gate and the manifest advertisement must
+// key off the SAME base absorb block, else a turn prompts for a tool the host never
+// registered (the unknown-tool spin that got absorb deleted in #3309). Drift re-trips #3293.
+test("#3293: plugin-lane absorb prompt gate ⟺ manifest advertisement (same base block)", () => {
+    const cases: Array<{ label: string; absorb?: CompressSettings["absorb"] }> = [
+        { label: "unset (default-off)" },
+        { label: "explicitly disabled", absorb: { enabled: false } },
+        { label: "enabled default-name", absorb: { enabled: true } },
+        { label: "enabled renamed", absorb: { enabled: true, toolName: "my_absorb" } },
+    ];
+    for (const c of cases) {
+        const compress = { injectTool: true, ...(c.absorb !== undefined ? { absorb: c.absorb } : {}) };
+        // Mirror the two production sources that must stay in sync: admin.ts:336 (manifest)
+        // and prepare-responses.ts:741 (prompt gate).
+        const resolved = applyCompressSettings(defaultConfig(200_000), 200_000, compress as Parameters<typeof applyCompressSettings>[2]);
+        const name = resolved.absorb?.toolName ?? DEFAULT_ABSORB_CONFIG.toolName;
+        const advertised = readManifest(resolved).toolNames.includes(name);
+        const promptGate = effectiveAbsorbBlock(true, resolved, c.absorb)?.enabled === true;
+        assert.equal(promptGate, advertised, `${c.label}: prompt gate (${promptGate}) must equal manifest advertisement (${advertised})`);
+    }
 });
 
 // — load-time per-field divergence diagnostic —
@@ -180,8 +203,10 @@ async function startRig(baseCompress: Record<string, unknown>, routeCompress?: R
 
 async function closeRig(rig: Rig): Promise<void> {
     rig.proxy.close();
+    rig.proxy.closeIdleConnections?.();
     await once(rig.proxy, "close");
     rig.upstream.close();
+    rig.upstream.closeIdleConnections?.();
     await once(rig.upstream, "close");
 }
 

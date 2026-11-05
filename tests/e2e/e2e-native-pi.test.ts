@@ -127,13 +127,17 @@ function filler(lines: number): string {
 
 type OracleEntry = {
   t: number;
+  wire?: "openai" | "anthropic" | "responses";
   stream: boolean;
   plugin: string | null;
   conv: string | null;
+  model?: string | null;
   tools: string[];
   nmsg: number;
   roles: string;
   acpRefs: string[];
+  acpTagCount?: number;
+  fillerHits?: number;
   toolResults: { name: string; content: string }[];
   queueIdx: number;
   toolName: string | null;
@@ -315,6 +319,39 @@ async function startCtx(): Promise<Ctx> {
               },
             ],
           },
+          // Second lane on a DIFFERENT wire (#2791): switching provider
+          // mid-session must not fork the bili session/conv or re-fold.
+          fakeant: {
+            baseUrl: `http://127.0.0.1:${ctx.fakePort}/v1`,
+            api: "anthropic-messages",
+            apiKey: "e2e-fake-key",
+            models: [
+              {
+                id: "fake-ant-model",
+                name: "Fake Anthropic",
+                input: ["text"],
+                contextWindow: 60000,
+                maxTokens: 4096,
+              },
+            ],
+          },
+          // Third wire (#2791 responses column): the openai-responses API —
+          // the input[]-items render whose neutral projection was the last
+          // un-projected lane (src/affinity-neutral.ts input_text/output_text).
+          fakeresp: {
+            baseUrl: `http://127.0.0.1:${ctx.fakePort}/v1`,
+            api: "openai-responses",
+            apiKey: "e2e-fake-key",
+            models: [
+              {
+                id: "fake-resp-model",
+                name: "Fake Responses",
+                input: ["text"],
+                contextWindow: 60000,
+                maxTokens: 4096,
+              },
+            ],
+          },
         },
       },
       null,
@@ -326,21 +363,15 @@ async function startCtx(): Promise<Ctx> {
 
 // Graceful-stop the hermetic native proxy (SIGTERM — the server flushes
 // dirty sessions on shutdown) so persisted state is observable on disk.
-async function stopProxiesGracefully(ctx: Ctx): Promise<void> {
-  const instancesDir = path.join(ctx.xdg.state, "billion-context", "instances");
+function liveInstancePids(instancesDir: string): number[] {
+  const out: number[] = [];
   try {
     for (const f of fs.readdirSync(instancesDir)) {
       try {
         const rec = JSON.parse(
           fs.readFileSync(path.join(instancesDir, f), "utf8"),
         ) as { pid?: number };
-        if (typeof rec.pid === "number" && rec.pid > 0) {
-          try {
-            process.kill(rec.pid, "SIGTERM");
-          } catch {
-            /* already gone */
-          }
-        }
+        if (typeof rec.pid === "number" && rec.pid > 0) out.push(rec.pid);
       } catch {
         /* unreadable record */
       }
@@ -348,7 +379,35 @@ async function stopProxiesGracefully(ctx: Ctx): Promise<void> {
   } catch {
     /* no instances dir */
   }
-  await new Promise((r) => setTimeout(r, 500));
+  return out;
+}
+
+async function stopProxiesGracefully(ctx: Ctx): Promise<void> {
+  const instancesDir = path.join(ctx.xdg.state, "billion-context", "instances");
+  for (const pid of liveInstancePids(instancesDir)) {
+    try {
+      process.kill(pid, "SIGTERM");
+    } catch {
+      /* already gone */
+    }
+  }
+  // Wait for actual EXIT, not a blind sleep: the product drains keep-alives
+  // BEFORE flushing sessions on SIGTERM (SHUTDOWN_DRAIN_GRACE_MS = 10s
+  // backstop), so a fixed short read can land pre-flush and flake
+  // ("proxy must persist the session", #4599). Exit ⇒ flush completed.
+  const deadline = Date.now() + 20_000;
+  for (;;) {
+    const alive = liveInstancePids(instancesDir).filter((pid) => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    });
+    if (alive.length === 0 || Date.now() > deadline) break;
+    await new Promise((r) => setTimeout(r, 100));
+  }
 }
 
 function teardown(ctx: Ctx): void {
@@ -387,9 +446,9 @@ function teardown(ctx: Ctx): void {
 function piRun(
   ctx: Ctx,
   prompt: string,
-  opts: { resume?: boolean } = {},
+  opts: { resume?: boolean; model?: string } = {},
 ): Promise<{ code: number; stdout: string; stderr: string }> {
-  const args = ["-p", "--model", "fake/fake-model"];
+  const args = ["-p", "--model", opts.model ?? "fake/fake-model"];
   if (opts.resume) args.push("--continue");
   args.push(prompt);
   const outFile = path.join(ctx.work, `pi-${Date.now()}.out`);
@@ -399,6 +458,17 @@ function piRun(
       cwd: ctx.piCwd,
       env: {
         ...cleanEnv(),
+        // This suite documents the SPAWN-posture package-native contract:
+        // instance record + proxy origin, per-request wire stamps, the
+        // shared-proxy delegate-child ACP channel (#2268), /__bili/plugin/status
+        // over HTTP. #5428 flipped the pi lane DEFAULT to inline (in-process
+        // engine, no instance record) and this suite was not updated with it:
+        // primary-lane tests then pass for the wrong reason while the
+        // instance-record and delegate-child stamp assertions fail structurally
+        // (CI sentinel incident, #4599). Pin the legacy posture so this
+        // coverage stays deterministic; inline posture is covered by
+        // tests/pi-inline-ws.test.ts and tests/pi-native.test.ts.
+        BILI_PI_INLINE: "0",
         PI_CODING_AGENT_DIR: ctx.piAgentDir,
         XDG_CONFIG_HOME: ctx.xdg.config,
         XDG_CACHE_HOME: ctx.xdg.cache,
@@ -666,6 +736,201 @@ if (checkOnly) {
       assert.ok(
         withBlocks.length >= 1,
         `at least one persisted session must carry compressed blocks (got ${sessions.length} sessions)`,
+      );
+    },
+  );
+
+  test(
+    "pi cross-protocol switch keeps the session, conv, and fold (#2791)",
+    { skip: suiteSkipReason },
+    async (t) => {
+      const ctx = await startCtx();
+      t.after(() => teardown(ctx));
+
+      // Same skeleton as the compress test: load filler, then fold on
+      // --continue. Run three CONTINUES on a DIFFERENT provider whose wire is
+      // anthropic-messages — the exact shape of a user swapping models
+      // mid-conversation in a model-picker. The #2791 regression (pre-fix)
+      // forked an anonymous session here: fold ledger orphaned, filler
+      // re-arrived 263% unfolded, upstream re-folded from scratch.
+      const load = await piRun(
+        ctx,
+        `${filler(120)}\n${Array.from({ length: 4 }, () => "请调用probe_tool").join(";")}`,
+      );
+      assert.equal(
+        load.code,
+        0,
+        `load run failed (code=${load.code}); stderr:\n${load.stderr}`,
+      );
+
+      const fold = await piRun(
+        ctx,
+        "请调用probe_tool;请调用compress;请调用acp_status",
+        { resume: true },
+      );
+      assert.equal(
+        fold.code,
+        0,
+        `fold run failed (code=${fold.code}); stderr:\n${fold.stderr}`,
+      );
+
+      const switchRun = await piRun(ctx, "请调用probe_tool", {
+        resume: true,
+        model: "fakeant/fake-ant-model",
+      });
+      assert.equal(
+        switchRun.code,
+        0,
+        `switch run failed (code=${switchRun.code}); stderr:\n${switchRun.stderr}`,
+      );
+
+      // And BACK onto the openai wire — the reverse direction of the switch
+      // must not fork either (a render asymmetry would only appear here).
+      const backRun = await piRun(ctx, "请调用probe_tool", {
+        resume: true,
+        model: "fake/fake-model",
+      });
+      assert.equal(
+        backRun.code,
+        0,
+        `back run failed (code=${backRun.code}); stderr:\n${backRun.stderr}`,
+      );
+
+      const oracle = readOracle(ctx.reqLog);
+      const openaiRows = oracle.filter((o) => o.wire !== "anthropic");
+      const anthropicRows = oracle.filter((o) => o.wire === "anthropic");
+      assert.ok(
+        openaiRows.length >= 1,
+        `openai wire rows must exist (got ${oracle.length} total)`,
+      );
+      assert.ok(
+        anthropicRows.length >= 1,
+        `anthropic wire rows must exist after the provider switch (got ${anthropicRows.length}/${oracle.length})`,
+      );
+      // The switched lane still rides the bili plugin with the SAME
+      // conversation id — a fork would mint a second conv here.
+      for (const o of anthropicRows) {
+        assert.equal(o.plugin, "pi", "anthropic-lane request must stay plugin-stamped (x-bili-plugin)");
+        assert.equal(
+          o.model,
+          "fake-ant-model",
+          `anthropic-lane request must carry the switched model (got ${o.model})`,
+        );
+      }
+      const convs = new Set(oracle.map((o) => o.conv));
+      assert.equal(
+        convs.size,
+        1,
+        `exactly ONE conversation id across both wires (got ${[...convs].join(", ")})`,
+      );
+
+      // Exactly one fold for the whole scenario, counted by model-EMITTED
+      // compress calls (the executed fold's tool_result legitimately persists
+      // in every later resend). The switched lane must NOT re-compress
+      // orphaned history (#2791's silent re-fold symptom).
+      const compressCalls = oracle.filter((o) => o.toolName === "compress");
+      assert.equal(
+        compressCalls.length,
+        1,
+        `compress must be CALLED exactly once across the protocol switch (got ${compressCalls.length})`,
+      );
+
+      // History inheritance: the first anthropic request re-sends the whole
+      // conversation (fork would arrive with a fresh 1-3-message history).
+      // The native lane rewrites the outbound body lazily (window-gated), so
+      // filler text may legitimately still be present — the fold's ledger is
+      // the session state, pinned by the blocks assertion below.
+      const firstAnth = anthropicRows[0];
+      assert.ok(
+        firstAnth.nmsg >= 6,
+        `first anthropic request must inherit the conversation history (nmsg=${firstAnth.nmsg}; a fork would arrive nearly empty)`,
+      );
+
+      // The reverse switch re-enters the openai lane AFTER the anthropic
+      // turns — same conversation, still exactly one compress.
+      const anthIdx = oracle.findIndex((o) => o.wire === "anthropic");
+      const backRow = oracle.slice(anthIdx + 1).find((o) => o.wire === "openai");
+      assert.ok(backRow, "openai-wire rows must resume after the anthropic switch (reverse direction)");
+
+      // One persisted bili session with blocks — a protocol-switch fork would
+      // have written a SECOND session file with an empty ledger.
+      await stopProxiesGracefully(ctx);
+      const sessions = sessionFiles(ctx);
+      assert.equal(
+        sessions.length,
+        1,
+        `exactly one persisted session across the switch (got ${sessions.length}: ${sessions.map((s) => path.basename(s.file)).join(", ")})`,
+      );
+      const blocks = sessions[0]?.parsed.payload?.state?.blocks;
+      assert.ok(
+        blocks && Object.keys(blocks as Record<string, unknown>).length >= 1,
+        "the persisted session must carry the folded blocks",
+      );
+    },
+  );
+
+  test(
+    "pi openai→responses switch keeps the session, conv, and fold (#2791 responses column)",
+    async (t) => {
+      const ctx = await startCtx();
+      t.after(() => teardown(ctx));
+      try {
+        // Load + fold on the openai-completions wire (same shape as the
+        // compress test above — 4 probe rounds so the run-1 filler message
+        // sits OUTSIDE the protected zone when `compress` arrives).
+        const load = await piRun(
+          ctx,
+          `${filler(120)}\n${Array.from({ length: 4 }, () => "请调用probe_tool").join(";")}`,
+        );
+        assert.equal(load.code, 0, `load run failed; stderr:\n${load.stderr}`);
+        const fold = await piRun(
+          ctx,
+          "请调用probe_tool;请调用compress;请调用acp_status",
+          { resume: true },
+        );
+        assert.equal(fold.code, 0, `fold run failed; stderr:\n${fold.stderr}`);
+
+        // Switch mid-session onto the openai-RESPONSES wire (input[] items
+        // render). Before the neutral-projection fix the responses renders
+        // hashed to canon blobs → prefix resolve missed → pfa-* fork.
+        const switchRun = await piRun(ctx, "请调用probe_tool", {
+          resume: true,
+          model: "fakeresp/fake-resp-model",
+        });
+        assert.equal(
+          switchRun.code,
+          0,
+          `switch run failed (code=${switchRun.code}); stderr:\n${switchRun.stderr}`,
+        );
+
+        const oracle = readOracle(ctx.reqLog);
+        const respRows = oracle.filter((o) => o.wire === "responses");
+        assert.ok(respRows.length >= 1, "no responses-wire requests reached the fake upstream");
+        for (const row of respRows) {
+          assert.equal(row.plugin, "pi", `responses row must be plugin-stamped (got ${row.plugin})`);
+          assert.equal(row.model, "fake-resp-model");
+        }
+        const convs = new Set(oracle.filter((o) => o.plugin === "pi").map((o) => o.conv));
+        assert.equal(convs.size, 1, `fork across the switch: convs=${[...convs].join(", ")}`);
+        const compressCalls = oracle.filter((o) => o.toolName === "compress").length;
+        assert.equal(compressCalls, 1, `the fold must be REUSED, not re-executed (compressCalls=${compressCalls})`);
+        assert.ok(
+          respRows[0].nmsg >= 6,
+          `first responses request must inherit the conversation history (nmsg=${respRows[0].nmsg}; a fork would arrive nearly empty)`,
+        );
+      } finally {
+        await stopProxiesGracefully(ctx);
+      }
+      const sessions = sessionFiles(ctx);
+      assert.equal(
+        sessions.length,
+        1,
+        `exactly one persisted session across the switch (got ${sessions.length}: ${sessions.map((s) => path.basename(s.file)).join(", ")})`,
+      );
+      const blocks = sessions[0]?.parsed.payload?.state?.blocks;
+      assert.ok(
+        blocks && Object.keys(blocks as Record<string, unknown>).length >= 1,
+        "the persisted session must carry the folded blocks",
       );
     },
   );

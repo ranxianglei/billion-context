@@ -96,6 +96,7 @@ async function startHarness(upstreamPort: number): Promise<Harness> {
         proxyPort: (proxy.address() as { port: number }).port,
         close: async () => {
             proxy.close();
+            proxy.closeIdleConnections?.();
             await once(proxy, "close");
         },
     };
@@ -138,6 +139,7 @@ test("#1647 slow prefill: keep-alive comments hold the client through ping-only 
         delete process.env.BILI_STREAM_KEEPALIVE_MS;
         up.server.closeAllConnections?.();
         up.server.close();
+        up.server.closeIdleConnections?.();
         await once(up.server, "close");
         await h.close();
     }
@@ -157,6 +159,7 @@ test("#1647 fast stream: no spurious keep-alive injection", async () => {
         delete process.env.BILI_STREAM_KEEPALIVE_MS;
         up.server.closeAllConnections?.();
         up.server.close();
+        up.server.closeIdleConnections?.();
         await once(up.server, "close");
         await h.close();
     }
@@ -175,6 +178,7 @@ test("#1647 BILI_STREAM_KEEPALIVE_MS=0 disables the hold", async () => {
         delete process.env.BILI_STREAM_KEEPALIVE_MS;
         up.server.closeAllConnections?.();
         up.server.close();
+        up.server.closeIdleConnections?.();
         await once(up.server, "close");
         await h.close();
     }

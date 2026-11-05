@@ -29,6 +29,12 @@ export interface BiliMessage extends CoreMessage {
    *  coreToAnthropic (redacted_thinking must reach the wire byte-exact —
    *  Anthropic rejects modified thinking-family blocks). */
   rawAnthropicBlock?: unknown;
+  /** Anthropic: a whole mid-conversation `role:"system"` wire message
+   *  (Pi's `tool_addition` / `tool_removal` deltas, message-level
+   *  `output_config`). Re-emitted verbatim by coreToAnthropic as its own
+   *  system-role message; kernel-synthesized system cores (rendered
+   *  summaries) never carry it and keep their user-role mapping. */
+  rawAnthropicMessage?: unknown;
   /** OpenAI chat: the original content part for an image_url (data: or
    *  remote URL) or the original message object for a developer-role
    *  message. */
@@ -36,6 +42,13 @@ export interface BiliMessage extends CoreMessage {
   /** Responses API: the original input item (for input_image, or a raw
    *  function_call / function_call_output we pass through). */
   rawResponsesItem?: unknown;
+  /** #3642: this core IS an image part of a split multi-part wire message
+   *  (canonical granularity: one core per content part). Set by every codec
+   *  at parse time; rebuild paths key off this flag — NEVER off text
+   *  equality with the "[image]" marker, because render/ref-tag injection
+   *  rewrites the marker text ("[image]<acp ...>") and a wire image part
+   *  has no text slot to carry a tag anyway. */
+  imagePart?: true;
   /** Google/Gemini: the original content parts of this message, in wire
    *  order (inlineData/fileData, executableCode, functionCall/Response ids,
    *  thought parts and unknown future part types). coreToGoogle rebuilds
@@ -45,8 +58,8 @@ export interface BiliMessage extends CoreMessage {
   /** Source wire-message ordinal for this core message, tagged by the
    *  converters (`wireIndex` of the protocol message it was flattened from).
    *  Host-side consumers use it to translate core-space fold coverage back
-   *  into wire positions (e.g. #1995's fold-anchored stripImages cutoff)
-   *  without re-deriving each codec's block-split behavior. Optional:
+   *  into wire positions without re-deriving each codec's block-split
+   *  behavior. Optional:
    *  converters adopt it incrementally; absence means "unknown". */
   wireIndex?: number;
   /** Anthropic thinking signature. Anthropic verifies thinking+signature

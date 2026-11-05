@@ -186,8 +186,10 @@ test("#1493: network-level failure arms at the outbound payload (fits) → below
         assert.equal(s2?.stats.lastInputTokens, 5000, "real usage report overwrote the armed value");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         relay.server.close();
+        relay.server.closeIdleConnections?.();
         await once(relay.server, "close");
     }
 });
@@ -218,8 +220,10 @@ test("#1493: relay 5xx arms at the outbound payload (fits) → below the emergen
         assert.equal(s2?.stats.lastInputTokens, 5000, "real usage report overwrote the armed value");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         relay.server.close();
+        relay.server.closeIdleConnections?.();
         await once(relay.server, "close");
     }
 });
@@ -265,8 +269,10 @@ test("#1498-F2: transform-failure fallback arms at the RAW view, not wire overhe
         );
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         relay.server.close();
+        relay.server.closeIdleConnections?.();
         await once(relay.server, "close");
     }
 });

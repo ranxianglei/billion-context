@@ -14,6 +14,7 @@ import path from "node:path";
 import { execFile, spawnSync } from "node:child_process";
 import { promisify } from "node:util";
 import { resolveDshHome } from "./client-config.js";
+import { cacheDir } from "./paths.js";
 import { winCmdUnsafeToken, winCmdRefusalError } from "./win-cmd.js";
 
 export const DSH_PACKAGE = "billion-context";
@@ -40,6 +41,52 @@ export function dshProfileDirs(env: NodeJS.ProcessEnv = process.env): string[] {
         throw err;
     }
     return entries.filter((e) => e.isDirectory() && e.name !== "node_modules").map((e) => path.join(profiles, e.name));
+}
+
+// — cordis.patch.yml entry parsing (#3838) ————————————————————————————————
+
+interface DshPatchEntry {
+    /** Loader id as written in the `- id:` line (surrounding quotes stripped). */
+    id: string;
+    /** True when the entry's own block carries an indented `disabled: true` line. */
+    disabled: boolean;
+}
+
+/** Parse top-level `- id:` entries out of cordis.patch.yml content. Line-based
+ *  and forgiving — a malformed line simply yields no entry. A new `- id:` line
+ *  or ANY other top-level list item closes the previous entry, so a stray
+ *  `disabled:` line cannot leak into the wrong block; only an INDENTED
+ *  `disabled: true` inside the entry's own block counts as disabling it
+ *  (#3838: the #2462 cost-advisory scan ignored the flag entirely and fired
+ *  for explicitly disabled plugins). Duplicate ids are kept per occurrence —
+ *  callers decide how duplicates combine. The single source of truth for
+ *  patch-layer enablement semantics: both the #2462 cost advisory and the
+ *  #2861 host-plugin notice scan through this so they can never drift apart. */
+export function parseDshPatchEntries(text: string): DshPatchEntry[] {
+    const itemRe = /^\s*-\s*id\s*:\s*(\S+)/;
+    const listItemRe = /^\s*-\s/;
+    const disabledRe = /^\s+disabled\s*:\s*true\b/;
+    const out: DshPatchEntry[] = [];
+    let current: DshPatchEntry | undefined;
+    for (const line of text.split(/\r?\n/)) {
+        const m = line.match(itemRe);
+        if (m) {
+            if (current) out.push(current);
+            let v = m[1];
+            if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) v = v.slice(1, -1);
+            v = v.trim();
+            current = v.length > 0 ? { id: v, disabled: false } : undefined;
+            continue;
+        }
+        if (listItemRe.test(line)) {
+            if (current) out.push(current);
+            current = undefined;
+            continue;
+        }
+        if (current && disabledRe.test(line)) current.disabled = true;
+    }
+    if (current) out.push(current);
+    return out;
 }
 
 // — legacy managed-block migration (#966) ————————————————————————————————————
@@ -137,6 +184,93 @@ export function dshProfileDependsOnBili(profileDir: string): boolean {
     return dshProfileDepSpec(profileDir) !== undefined;
 }
 
+/** #2894: converge this profile's declared billion-context spec to the version
+ *  bili just installed IN PLACE (the dsh desktop lane — #1575). The desktop
+ *  copy's node_modules entry is swapped by bili's own tarball installer while
+ *  the profile's package.json still declares the OLD version; dsh's in-app
+ *  plugin manager reconciles node_modules through pnpm against that manifest,
+ *  so a user clicking "install" restores the old version and silently reverts
+ *  the auto-update. Rewriting the spec to the installed version (caret/exact
+ *  style preserved) makes the lockfile pin on the old version unsatisfiable,
+ *  forcing the next pnpm reconciliation to re-resolve FORWARD instead of
+ *  rolling back. Deliberate local pins (link:/file:/git+…) and non-version
+ *  specs (dist-tags, other ranges) are respected and left alone. Returns
+ *  undefined when the manifest now declares the installed version (written or
+ *  already in step), or a short reason when it was left untouched — callers
+ *  log, never throw on this. */
+interface DshManifestSpecPlan {
+    /** "rewrite": package.json must be replaced with nextRaw. "keep": no write. */
+    action: "keep" | "rewrite";
+    /** Short reason when the spec was left alone (callers log, never throw). */
+    reason?: string;
+    /** The new dependencies[billion-context] value (action === "rewrite" only). */
+    nextSpec?: string;
+    /** Full replacement manifest content, 2-space JSON + trailing newline. */
+    nextRaw?: string;
+}
+
+/** Pure planning half of syncDshProfileManifestSpec (#3496 split): decide what
+ *  the manifest SHOULD become without touching disk, so the caller can commit
+ *  manifest + lockfile changes as one transaction (all-or-nothing planning).
+ *  Rules are byte-identical to the pre-split function: only ^x.y.z / x.y.z
+ *  forms are rewritten (style preserved); local pins, dist-tags, ranges and
+ *  tilde specs are respected; already-in-step specs produce no rewrite. */
+export function planDshProfileManifestSpec(profileDir: string, installedVersion: string): DshManifestSpecPlan {
+    const file = path.join(profileDir, "package.json");
+    let raw: string;
+    try {
+        raw = fs.readFileSync(file, "utf8");
+    } catch {
+        return { action: "keep", reason: "no readable package.json" };
+    }
+    let doc: { dependencies?: Record<string, unknown> };
+    try {
+        doc = JSON.parse(raw) as { dependencies?: Record<string, unknown> };
+    } catch {
+        return { action: "keep", reason: "malformed package.json" };
+    }
+    const deps = doc.dependencies;
+    if (!deps || typeof deps[DSH_PACKAGE] !== "string") return { action: "keep", reason: "no billion-context dependency declared" };
+    const spec = deps[DSH_PACKAGE];
+    if (!isRegistryDepSpec(spec)) return { action: "keep", reason: `local pin ${spec} respected` };
+    const m = spec.match(/^\^?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)/);
+    if (!m) return { action: "keep", reason: `non-version spec ${spec} respected` };
+    if (m[1] === installedVersion) return { action: "keep" }; // already in step — no rewrite
+    const nextSpec = spec.startsWith("^") ? `^${installedVersion}` : installedVersion;
+    deps[DSH_PACKAGE] = nextSpec;
+    return { action: "rewrite", nextSpec, nextRaw: JSON.stringify(doc, null, 2) + "\n" };
+}
+
+/** Atomic text write (tmp sibling + fsync + rename). #2972-M1: a crash or
+ *  power loss mid-write must leave the target byte-identical, never a torn
+ *  file that breaks dsh's plugin reconcile; the fsync before rename (#3157)
+ *  closes the write-but-not-rename window too. Returns undefined on success
+ *  or the OS error message. */
+function atomicWriteText(file: string, content: string): string | undefined {
+    const tmp = `${file}.${process.pid}.tmp`;
+    try {
+        const fd = fs.openSync(tmp, "w");
+        try {
+            fs.writeFileSync(fd, content);
+            fs.fsyncSync(fd);
+        } finally {
+            fs.closeSync(fd);
+        }
+        fs.renameSync(tmp, file);
+    } catch (e) {
+        try { fs.rmSync(tmp, { force: true }); } catch { /* best-effort cleanup */ }
+        return e instanceof Error ? e.message : String(e);
+    }
+    return undefined;
+}
+
+export function syncDshProfileManifestSpec(profileDir: string, installedVersion: string): string | undefined {
+    const plan = planDshProfileManifestSpec(profileDir, installedVersion);
+    if (plan.action !== "rewrite") return plan.reason;
+    const err = atomicWriteText(path.join(profileDir, "package.json"), plan.nextRaw!);
+    return err !== undefined ? `manifest write failed: ${err}` : undefined;
+}
+
 /** The version of the profile's installed billion-context copy, or undefined
  *  when there is no readable copy yet (declared but never installed). #1803:
  *  refresh skips profiles already sitting at the target version so a stale
@@ -149,6 +283,63 @@ function installedProfileVersion(profileDir: string): string | undefined {
         return typeof pkg.version === "string" ? pkg.version : undefined;
     } catch {
         return undefined;
+    }
+}
+
+// #5642: last-observed state of each profile's billion-context copy. The host's
+// package lifecycle can destroy a profile's node_modules — an operation that
+// exits 0 yet leaves nothing readable — so without memory of what was there,
+// every check cycle re-reads "declared but missing" and re-triggers the very
+// channel op that keeps destroying it (the reporter's 01:54 / 07:15 loop). The
+// ledger remembers the last good version per profile dir so a destroyed copy is
+// left alone (one loud warning with the manual repair command) until a human or
+// dsh repairs it — then updates resume normally on their own.
+const PROFILE_COPY_LEDGER_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+type ProfileCopyLedgerEntry = { version: string; updatedAt: number; brokenAt?: number };
+type ProfileCopyLedger = Record<string, ProfileCopyLedgerEntry>;
+
+function profileCopyLedgerFile(): string {
+    return path.join(cacheDir(), ".dsh-profile-copies.json");
+}
+
+/** Best-effort read: corrupt or missing state degrades to "no observations"
+ *  (fail-open toward retrying), never throws into the update lane. */
+function readProfileCopyLedger(): ProfileCopyLedger {
+    try {
+        const doc = JSON.parse(fs.readFileSync(profileCopyLedgerFile(), "utf-8")) as { v?: unknown; copies?: unknown };
+        if (doc.v !== 1 || typeof doc.copies !== "object" || doc.copies === null || Array.isArray(doc.copies)) return {};
+        const out: ProfileCopyLedger = {};
+        for (const [dir, raw] of Object.entries(doc.copies as Record<string, unknown>)) {
+            if (typeof raw !== "object" || raw === null || Array.isArray(raw)) continue;
+            const e = raw as { version?: unknown; updatedAt?: unknown; brokenAt?: unknown };
+            if (typeof e.version !== "string" || e.version.length === 0 || typeof e.updatedAt !== "number" || !Number.isFinite(e.updatedAt)) continue;
+            const entry: ProfileCopyLedgerEntry = { version: e.version, updatedAt: e.updatedAt };
+            if (typeof e.brokenAt === "number" && Number.isFinite(e.brokenAt)) entry.brokenAt = e.brokenAt;
+            out[dir] = entry;
+        }
+        return out;
+    } catch {
+        return {};
+    }
+}
+
+/** Best-effort write: advisory state only — losing it costs at most one extra
+ *  refresh attempt, never correctness. */
+function writeProfileCopyLedger(copies: ProfileCopyLedger): void {
+    try {
+        const file = profileCopyLedgerFile();
+        fs.mkdirSync(path.dirname(file), { recursive: true });
+        atomicWriteText(file, `${JSON.stringify({ v: 1, copies }, null, 2)}\n`);
+    } catch {
+        // state is advisory — the update lane must never fail because of it
+    }
+}
+
+export function _resetProfileCopyLedgerForTest(): void {
+    try {
+        fs.rmSync(profileCopyLedgerFile(), { force: true });
+    } catch {
+        // best effort
     }
 }
 
@@ -274,7 +465,10 @@ export function planDshSpawn(
             "Set BILI_DSH_BIN to the dsh executable, or reword the argument.",
         );
     });
-    const comspec = env.COMSPEC?.trim() || "cmd.exe";
+    // #4599: sanitized env copies keep original key casing (`ComSpec`) — an
+    // exact `env.COMSPEC` probe misses it on plain objects.
+    const comspecRaw = env.COMSPEC ?? env.ComSpec ?? env.comspec;
+    const comspec = comspecRaw?.trim() || "cmd.exe";
     const line = `"${[command, ...args].map(quoteWinToken).join(" ")}"`;
     return { command: comspec, args: ["/d", "/s", "/c", line], windowsVerbatimArguments: true };
 }
@@ -406,7 +600,15 @@ async function runDshPluginAsync(args: string[], env: NodeJS.ProcessEnv = proces
  *  Returns { refreshed, failed }: how many profile bundles were refreshed and
  *  how many attempts failed (#1803: copies already at the target version are
  *  skipped, so callers must not assume every dependent profile re-ran; #2192:
- *  the caller backs off on failed > 0). */
+ *  the caller backs off on failed > 0).
+ *  #5642: an exit-0 channel op only counts as success when the copy is
+ *  actually readable AT THE TARGET afterwards — the host's package lifecycle
+ *  can exit clean while destroying the profile's node_modules. A readable
+ *  copy that vanished since it was last observed is remembered in
+ *  .dsh-profile-copies.json and left alone (one loud warning with the manual
+ *  repair command) until it is repaired, instead of re-spawning the op that
+ *  keeps destroying it; verified failures still count as strikes, so the
+ *  caller's backoff paces any remaining retries. */
 export async function refreshDshProfileBundles(
     targetVersion: string,
     log: (level: "info" | "warn", msg: string) => void,
@@ -422,6 +624,8 @@ export async function refreshDshProfileBundles(
     if (targets.length === 0) return { refreshed: 0, failed: 0 };
     let refreshed = 0;
     let failed = 0;
+    const copies = readProfileCopyLedger();
+    let ledgerDirty = false;
     for (const dir of targets) {
         const name = path.basename(dir);
         const spec = dshProfileDepSpec(dir);
@@ -436,16 +640,71 @@ export async function refreshDshProfileBundles(
             // this function. Spawning the CLI here would just log a guaranteed failure.
             continue;
         }
-        if (installedProfileVersion(dir) === targetVersion) continue; // #1803: already in step
+        const before = installedProfileVersion(dir);
+        if (before === undefined) {
+            const prev = copies[dir];
+            if (prev?.brokenAt !== undefined) continue; // known destruction — silent skip until repaired (#5642)
+            if (prev?.version !== undefined) {
+                copies[dir] = { ...prev, brokenAt: Date.now(), updatedAt: Date.now() };
+                ledgerDirty = true;
+                log("warn", `[update] dsh profile ${name}: billion-context was ${prev.version} but its node_modules copy is now missing — a host package operation destroyed the profile's dependencies between checks (#5642). Leaving the profile untouched: re-running \`dsh plugin --profile ${name} add\` repeats the damage. Manual repair: \`dsh plugin --profile ${name} add billion-context@${prev.version}\`; updates resume automatically once the copy is readable again.`);
+                continue;
+            }
+            // declared but never observed — normal install path below (#1196)
+        } else {
+            const prev = copies[dir];
+            if (prev?.brokenAt !== undefined) {
+                // repair detected — clear the marker (also when the version is
+                // unchanged, or it would linger and re-log on every cycle)
+                log("info", `[update] dsh profile ${name}: billion-context copy readable again (${before}) after a host-side destruction — resuming normal updates (#5642)`);
+            }
+            // Touch on EVERY readable observation — an in-step profile must keep
+            // its entry alive past the TTL, or after 7 days a later destruction
+            // looks "never observed" again and re-arms the destructive retry
+            // this ledger exists to stop.
+            copies[dir] = { version: before, updatedAt: Date.now() };
+            ledgerDirty = true;
+        }
+        if (before === targetVersion) continue; // #1803: already in step
         try {
             await runDshPluginAsync(["plugin", "--profile", name, "add", `${DSH_PACKAGE}@${targetVersion}`], env);
-            refreshed += 1;
+            const after = installedProfileVersion(dir);
+            if (after === targetVersion) {
+                copies[dir] = { version: after, updatedAt: Date.now() };
+                ledgerDirty = true;
+                refreshed += 1;
+            } else {
+                failed += 1;
+                if (after === undefined && before !== undefined) {
+                    copies[dir] = { version: before, updatedAt: Date.now(), brokenAt: Date.now() };
+                } else if (after !== undefined) {
+                    copies[dir] = { version: after, updatedAt: Date.now() };
+                }
+                ledgerDirty = true;
+                log("warn", `[update] dsh profile ${name}: bundle refresh to ${targetVersion} exited clean but the copy is now ${after ?? "missing"} (expected ${targetVersion}) — the host package operation left the profile inconsistent (#5642); counted as failure so the lane backs off instead of retrying against a damaged profile`);
+            }
         } catch (err) {
             failed += 1;
             const detail = err instanceof Error ? err.message : String(err);
             log("warn", `[update] dsh profile ${name}: bundle refresh to ${targetVersion} failed: ${detail} — manual fix: run \`dsh plugin --profile ${name} add billion-context@${targetVersion}\` from a shell where \`dsh\` resolves (or point BILI_DSH_BIN at dsh's executable)`);
         }
     }
+    // Prune entries whose profile no longer declares a registry-pinned bili,
+    // plus healthy entries of profiles that stopped being observed (readable
+    // ones are touched on every check, so live entries never age out). Broken
+    // entries never age out — forgetting them would re-arm exactly the
+    // destructive retry they exist to stop; they clear on repair or when the
+    // profile drops the dependency.
+    const targetSet = new Set(targets);
+    const now = Date.now();
+    for (const dir of Object.keys(copies)) {
+        const entry = copies[dir];
+        if (!targetSet.has(dir) || (entry.brokenAt === undefined && now - entry.updatedAt > PROFILE_COPY_LEDGER_TTL_MS)) {
+            delete copies[dir];
+            ledgerDirty = true;
+        }
+    }
+    if (ledgerDirty) writeProfileCopyLedger(copies);
     if (refreshed > 0) {
         log("info", `[update] refreshed ${refreshed} dsh profile bundle(s) to ${targetVersion} — restart dsh to load it`);
     }

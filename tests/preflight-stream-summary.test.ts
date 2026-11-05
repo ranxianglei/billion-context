@@ -172,7 +172,9 @@ test("e2e #626 (Responses, delta SSE): stream-only upstream → learn on 400, su
         );
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         upstream.close();
+        upstream.closeIdleConnections?.();
         await new Promise<void>((resolve, reject) => {
             void Promise.allSettled([once(proxy, "close"), once(upstream, "close")]).then(() => resolve(), reject);
         });
@@ -200,7 +202,9 @@ test("e2e #626 (Responses, completed-only SSE): summary extracted from response.
         assert.ok(forwardRaw.length > 0);
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         upstream.close();
+        upstream.closeIdleConnections?.();
         await new Promise<void>((resolve, reject) => {
             void Promise.allSettled([once(proxy, "close"), once(upstream, "close")]).then(() => resolve(), reject);
         });
@@ -293,7 +297,9 @@ test("e2e #626 (Anthropic): stream-only upstream → learn on 400, text_delta SS
         assert.equal(sess?.metadata?.preflightStreamSummary, true, "learned");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         upstream.close();
+        upstream.closeIdleConnections?.();
         await new Promise<void>((resolve, reject) => {
             void Promise.allSettled([once(proxy, "close"), once(upstream, "close")]).then(() => resolve(), reject);
         });

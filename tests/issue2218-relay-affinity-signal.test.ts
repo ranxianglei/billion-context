@@ -7,7 +7,9 @@ import { defaultConfig } from "acp-kernel";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { _resetSessionsForTest } from "../src/session.ts";
-import { shouldStampRelayAffinityPck } from "../src/session-id.ts";
+import { _resetPckProbeForTest } from "../src/pck-probe.ts";
+import { pckKeyAbated, recordPckAblation } from "../src/pck-probe.ts";
+import { resolveRelayAffinityPck } from "../src/session-id.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import type { Server } from "node:http";
 
@@ -82,8 +84,10 @@ async function startHarness(routes: ProxyOptions["routes"] | undefined): Promise
         captured,
         close: async () => {
             proxy.close();
+            proxy.closeIdleConnections?.();
             await once(proxy, "close");
             upstream.close();
+            upstream.closeIdleConnections?.();
             await once(upstream, "close");
         },
     };
@@ -98,23 +102,35 @@ function chatBody(extra: Record<string, unknown> = {}): Record<string, unknown> 
     };
 }
 
-test("#2218 unit: shouldStampRelayAffinityPck gate matrix", () => {
+test("#2218/#2645 unit: resolveRelayAffinityPck decision matrix (routing auto/enabled)", () => {
+    _resetPckProbeForTest();
     const loop = "http://127.0.0.1:7864/v1";
     const remote = "https://relay.example.com/v1";
-    // plugin lane + no client pck + admin-rewritten route → stamp
-    assert.equal(shouldStampRelayAffinityPck("x-bili-plugin-conversation", undefined, loop, remote), true);
-    // plugin lane + no client pck + loopback destination without a route → stamp
-    assert.equal(shouldStampRelayAffinityPck("x-bili-plugin-conversation", undefined, undefined, loop), true);
-    // plugin lane + no client pck + unrouted non-loopback (strict direct API risk, #1403) → no stamp
-    assert.equal(shouldStampRelayAffinityPck("x-bili-plugin-conversation", undefined, undefined, remote), false);
-    // client's own prompt_cache_key always wins
-    assert.equal(shouldStampRelayAffinityPck("x-bili-plugin-conversation", "pck-own", loop, loop), false);
-    // non-plugin identity sources (codex session-id header, plain clients) stay unstamped
-    assert.equal(shouldStampRelayAffinityPck("session-id", undefined, loop, loop), false);
-    assert.equal(shouldStampRelayAffinityPck(undefined, undefined, loop, loop), false);
-    assert.equal(shouldStampRelayAffinityPck("x-bili-plugin-conversation", undefined, undefined, "http://localhost:7864/v1"), true);
-    // unparseable origin is not a deliberate deployment → no stamp
-    assert.equal(shouldStampRelayAffinityPck("x-bili-plugin-conversation", undefined, undefined, "not-a-url"), false);
+    // internal plugin lane + no client key + nothing learned yet → stamp,
+    // EVERY destination shape (#2645: the static destination-shape gate is
+    // gone — strict APIs are found out at egress by A/B instead). Under
+    // #5079 stamping additionally requires routing auto/enabled — both are
+    // exercised here; the disabled default lives in tests/issue5079.
+    assert.equal(resolveRelayAffinityPck("x-bili-plugin-conversation", undefined, remote, remote, "auto"), "stamp");
+    assert.equal(resolveRelayAffinityPck("x-bili-plugin-conversation", undefined, undefined, loop, "enabled"), "stamp");
+    // A/B-ablated pair → drop (stamped keys AND client keys alike)
+    recordPckAblation({ origin: "https://strict.example.com/v1", model: "nim-550b", sessionId: "s1", statusWithKey: 400, errSnippet: "bad" });
+    assert.equal(resolveRelayAffinityPck("x-bili-plugin-conversation", undefined, "https://strict.example.com/v1/chat/completions", "https://strict.example.com/v1", "auto", "s1", "nim-550b"), "drop");
+    assert.equal(resolveRelayAffinityPck(undefined, "client-key", "https://strict.example.com/v1/chat/completions", "https://strict.example.com/v1", "auto", undefined, "nim-550b"), "drop");
+    // model-level granularity: same origin, different model → still stamp
+    assert.equal(resolveRelayAffinityPck("x-bili-plugin-conversation", undefined, "https://strict.example.com/v1", "https://strict.example.com/v1", "auto", "s1", "nim-120b"), "stamp");
+    // unlearned origin+model pair fails open
+    assert.equal(pckKeyAbated("https://other.example.com/v1", undefined, undefined), false);
+    // client's own key on a clean destination passes through verbatim
+    assert.equal(resolveRelayAffinityPck("x-bili-plugin-conversation", "pck-own", loop, loop, "auto", "s1"), "keep-client");
+    assert.equal(resolveRelayAffinityPck(undefined, "pck-own", remote, remote, "auto"), "keep-client");
+    // non-plugin identity sources never get stamped; with no key present the
+    // drop/keep distinction is an unobservable no-op on the wire (#5079
+    // normalizes the absent-key case to "drop")
+    assert.equal(resolveRelayAffinityPck("session-id", undefined, loop, loop, "auto"), "drop");
+    assert.equal(resolveRelayAffinityPck(undefined, undefined, loop, loop, "auto"), "drop");
+    // unparseable origin is never ablated (fail open)
+    assert.equal(resolveRelayAffinityPck("x-bili-plugin-conversation", undefined, "not-a-url", "not-a-url", "auto"), "stamp");
 });
 
 test("#2218 regression: plain client body pck still forwards x-session-id + body pck", async () => {

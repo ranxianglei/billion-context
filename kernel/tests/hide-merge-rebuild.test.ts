@@ -27,7 +27,7 @@ function block(overrides: Partial<CompressionBlock>): CompressionBlock {
   };
 }
 
-test("hideConsumedCompressCalls keeps active-block calls, hides consumed, keeps newest two orphans", () => {
+test("hideConsumedCompressCalls keeps active-block calls and orphans until a fold (#3769)", () => {
   const state: CompressionState = {
     ...createInitialState(),
     blocks: [
@@ -70,20 +70,21 @@ test("hideConsumedCompressCalls keeps active-block calls, hides consumed, keeps 
     { id: "m5", role: "user", contentType: "text", text: "hello" },
   ];
   const result = hideConsumedCompressCalls(state, messages);
-  // active-block call kept; consumed hidden; newest KEEP_LAST_ORPHANED=2
-  // orphans kept visible (failure observability — billion-context-pi #9).
-  assert.equal(result.hidden, 1);
+  assert.equal(result.hidden, 0, "no fold pending -> nothing swept (#3769)");
   const remainingCallIds = result.messages
     .filter((m) => m.toolName === "compress")
     .map((m) => m.toolCallId);
-  assert.ok(remainingCallIds.includes("call-active"));
-  assert.ok(!remainingCallIds.includes("call-consumed"));
+  assert.ok(remainingCallIds.includes("call-active"), "active carrier kept");
+  assert.ok(
+    remainingCallIds.includes("call-consumed"),
+    "orphan stays visible between folds",
+  );
   assert.ok(remainingCallIds.includes("call-orphan1"));
   assert.ok(remainingCallIds.includes("call-orphan2"));
   assert.ok(result.messages.some((m) => m.text === "hello"));
 });
 
-test("orphaned compress residue is bounded: only the newest two pairs survive any session length", () => {
+test("orphan residue is swept onto a committed fold, not rotated on quiet turns (#3769)", () => {
   const state: CompressionState = {
     ...createInitialState(),
     blocks: [
@@ -125,22 +126,37 @@ test("orphaned compress residue is bounded: only the newest two pairs survive an
     text: "tail",
   });
 
+  messages.forEach((m, i) => {
+    state.messageRefs.byRaw[m.id] = `m${String(i + 1).padStart(5, "0")}`;
+  });
+  state.pendingOrphanSweepMinRef = 10;
+
   const result = hideConsumedCompressCalls(state, messages);
-  // 12 failed pairs in → only the newest 2 pairs + the active call remain:
-  // PR #18's unbounded accumulation cannot recur under KEEP_LAST_ORPHANED=2.
-  assert.equal(result.hidden, 20);
+  assert.equal(
+    result.hidden,
+    16,
+    "orphans at/after fold start (ref 10) swept; before it kept (#3769)",
+  );
+  assert.deepEqual(result.newlySweptCallIds, [
+    "call-fail5",
+    "call-fail6",
+    "call-fail7",
+    "call-fail8",
+    "call-fail9",
+    "call-fail10",
+    "call-fail11",
+    "call-fail12",
+  ]);
   const remainingCallIds = result.messages
     .filter((m) => m.toolName === "compress" && m.contentType === "tool-call")
     .map((m) => m.toolCallId);
   assert.deepEqual(remainingCallIds, [
     "call-active",
-    "call-fail11",
-    "call-fail12",
+    "call-fail1",
+    "call-fail2",
+    "call-fail3",
+    "call-fail4",
   ]);
-  const remainingResultIds = result.messages
-    .filter((m) => m.contentType === "tool-result")
-    .map((m) => m.toolCallId);
-  assert.deepEqual(remainingResultIds, ["call-fail11", "call-fail12"]);
 });
 
 test("a failed compress call and its result stay visible (issue #9 fixed-point precondition removed)", () => {

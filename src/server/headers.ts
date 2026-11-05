@@ -9,7 +9,7 @@ export function safeSessionId(id: string | undefined): string {
  *  history are resolved by prefix affinity (#309); only degenerate probes
  *  (empty / system-only, or a fingerprint-sized history) fail explicitly. */
 export const NO_IDENTITY_MESSAGE =
-    "Missing stable conversation identity. Send one of the headers: x-session-id, x-session-affinity, x-acp-session, x-opencode-session, x-claude-code-session-id, session-id — or body session_id / prompt_cache_key (responses/openai/anthropic). Requests replaying a conversation history are matched by content prefix affinity (#309); this one carries no usable history signal.";
+    "Missing stable conversation identity. Send one of the headers: x-session-id, x-session-affinity, x-acp-session, x-opencode-session-id, x-opencode-session, x-claude-code-session-id, session-id — or body session_id / prompt_cache_key (responses/openai/anthropic). Requests replaying a conversation history are matched by content prefix affinity (#309); this one carries no usable history signal.";
 
 export const UPSTREAM_HOP_HEADERS = new Set([
     "host",
@@ -26,9 +26,25 @@ export const UPSTREAM_HOP_HEADERS = new Set([
     // #1117: bili-internal passthrough marker (native fetch patch → proxy);
     // never meaningful to a real upstream.
     "x-bili-passthrough",
+    // #5418: watermark fastpath handshake — client→proxy watermark claim and
+    // proxy→client measured total. Pure billing-plane bookkeeping; the A/B
+    // golden (tests/issue5403-watermark-fastpath.test.ts) pins that neither
+    // ever reaches a model endpoint.
+    "x-bili-pf-count",
+    "x-bili-pf-seq",
+    "x-bili-pf-tail-ids",
+    // #5658: incremental-lane turn correlation id — the native plugin stamps it
+    // on a diverted model request alongside x-bili-plugin-turn to correlate the
+    // applied-seq ack. Pure host↔bili bookkeeping; like the pf-* handshake
+    // headers above it must never reach a model endpoint, so strip at egress.
+    "x-bili-turn-id",
     "te",
     "trailer",
     "upgrade",
+    // expect: end-to-end per spec (not a §6.1 hop-by-hop), but undici fetch
+    // throws UND_ERR_NOT_SUPPORTED when forwarding it — strip at every egress
+    // site (#5369).
+    "expect",
 ]);
 
 // content-encoding is end-to-end (RFC 9110 §7.2), NOT hop-by-hop — but the two
@@ -57,10 +73,32 @@ export function connectionNamedHeaders(conn: string | string[] | undefined): Set
     return out;
 }
 
+/** Codex advertises its own server-side context compaction via this beta
+ *  feature. It conflicts with bili's client-side compress (bili IS the
+ *  compression layer) and third-party aggregators reject it with
+ *  "invalid range / ref not found". Strip it so bili's compress is the sole
+ *  mechanism. Used by BOTH outbound derivations — the HTTP forward path
+ *  (buildForwardTarget) and the WS lane's final egress
+ *  (finalizeResponsesWsUpstreamHeaders, #3073) — so every outbound Responses
+ *  request carries the same surface regardless of which internal code path
+ *  produced it. */
+export function stripRemoteCompactionBetaFeature(headers: Record<string, string>): void {
+    const betaKey = Object.keys(headers).find((h) => h.toLowerCase() === "x-codex-beta-features");
+    if (!betaKey) return;
+    const kept = headers[betaKey]
+        .split(",")
+        .map((s) => s.trim())
+        .filter((f) => f && f !== "remote_compaction_v2");
+    if (kept.length > 0) headers[betaKey] = kept.join(",");
+    else delete headers[betaKey];
+}
+
 export function buildForwardHeaders(headers: Record<string, string>): Record<string, string> {
     const out: Record<string, string> = {};
     for (const [k, v] of Object.entries(headers)) {
-        if (k.toLowerCase() === "content-length" || k.toLowerCase() === "host") continue;
+        // expect: undici fetch rejects it with UND_ERR_NOT_SUPPORTED — dropped
+        // here so no egress path can forward it (#5369).
+        if (k.toLowerCase() === "content-length" || k.toLowerCase() === "host" || k.toLowerCase() === "expect") continue;
         out[k] = v;
     }
     out["content-type"] = "application/json";

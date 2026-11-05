@@ -185,13 +185,15 @@ test("e2e #987/#1195 T1: a stated-window overflow arms the one-shot shrink, lear
         assert.equal(s2?.metadata.confirmedContextLimits, undefined, "still nothing learned after recovery");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });
 
-test("e2e #987 T2: an overflow WITHOUT a window number arms at the declared window and learns nothing", async () => {
+test("e2e #987 T2: an overflow WITHOUT a window number arms at the payload's own size, rescues in-request (#3787), and learns nothing", async () => {
     let streamingCall = 0;
     let summaryCalls = 0;
     const upstream = http.createServer((req, res) => {
@@ -236,28 +238,33 @@ test("e2e #987 T2: an overflow WITHOUT a window number arms at the declared wind
         const headers = { "content-type": "application/json", "x-acp-session": "t2-sess" };
 
         const r1 = await fetch(url, { method: "POST", headers, body });
-        assert.equal(r1.status, 400);
+        // #3787: a NUMBERLESS overflow used to pass through verbatim (the arm
+        // fired but the refold judged against the 400k declaration and found
+        // "already fits" — nothing to fold, 400 to the client). The arm is
+        // the only ceiling evidence: refold under arm*0.9, fold, re-send.
+        assert.equal(r1.status, 200, "#3787: numberless overflow rescued in-request under the armed window");
+        assert.equal(r1.headers.get("content-type"), "text/event-stream", "the retry's SSE is what the client sees");
         await r1.text();
+        assert.ok(summaryCalls >= 1, "the rescue ran a preflight fold under the armed window");
         const s = listSessions().find((x) => x.id === "t2-sess");
         assert.ok(s, "session exists");
         assert.equal(s!.metadata.confirmedContextLimits, undefined, "nothing learned");
-        assert.ok(s!.stats.lastInputTokens > 10_000 && s!.stats.lastInputTokens < 400_000, `armed at the payload's own size (~16k, not the 400k declaration): ${s!.stats.lastInputTokens}`);
-        // #1839 ask 3: an arm is NOT a billing report — it carries its own
-        // provenance grade "overflow-arm" (still rescue-grade: effectiveTokenCount's
-        // fast path, the #496 evidence gate and the preflight floors accept it;
-        // billing-grade consumers keep excluding it).
-        assert.equal(s!.stats.lastInputTokensSource, "overflow-arm", "the arm carries its own provenance grade, never billing-grade \"usage\"");
+        assert.equal(s!.stats.lastInputTokens, 5000, "the retry's own usage report replaced the armed baseline");
+        assert.equal(s!.stats.lastInputTokensSource, "usage", "the successful retry reports usage-grade");
+        assert.equal(s!.stats.overflowArmTokens, undefined, "#1129: the retry's usage report retired the one-shot arm");
 
-        // r2: forwarded as-is (no arm, nothing learned) — the pass-through
-        // shape the old #969 test asserted is unchanged.
+        // r2: same payload — the fold is sticky, forwarded compacted, no new fold.
+        const summaryCallsBefore = summaryCalls;
         const r2 = await fetch(url, { method: "POST", headers, body });
         assert.equal(r2.status, 200);
         await r2.text();
-        assert.equal(summaryCalls, 0, "no fold");
+        assert.equal(summaryCalls, summaryCallsBefore, "r2 forwards the sticky fold without folding again");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });
@@ -333,8 +340,10 @@ test("e2e #987 T3: with a CORRECT declared window, an oversized turn still recov
         assert.ok(lastForward.includes(SUMMARY_TEXT), "the forwarded body carries the fold summary");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });

@@ -36,7 +36,7 @@ async function statusOutcome(): Promise<CommandOutcome> {
     }
     const version = await fetchProxyVersion(base);
     if (version) {
-        return { kind: "success", text: armedIdleNotice(version) };
+        return { kind: "success", text: armedIdleNotice(version, base) };
     }
     return {
         kind: "error",
@@ -72,7 +72,7 @@ async function cacheOutcome(): Promise<CommandOutcome> {
             version = undefined;
         }
         if (version) {
-            return { kind: "success", text: `billion-context@${version} — proxy connected, compression armed. No model request yet; send one, then run /acp-cache again.` };
+            return { kind: "success", text: `billion-context@${version} — proxy connected via ${base}, compression armed. No model request yet; send one, then run /acp-cache again.` };
         }
         return {
             kind: "error",

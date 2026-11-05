@@ -124,8 +124,10 @@ test("e2e: fallback-derived window is floored at 100k after output-headroom rese
         assert.equal(received[1].length, 30, "turn 2 appends no nudge at 50% of the floored 100k window (would be 31 at 78% of the unfloored 64k)");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });
@@ -216,8 +218,10 @@ test("e2e: per-route context declaration is operator-owned and never floored", a
         assert.equal(received[1].length, 31, "operator-declared window is not floored: nudge appended at 78% of 64k");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });

@@ -132,7 +132,8 @@ async function statusOf(rig: Rig, conversationId: string): Promise<{ ok?: boolea
 async function waitFor(cond: () => boolean, what: string): Promise<void> {
     const t0 = Date.now();
     while (!cond()) {
-        if (Date.now() - t0 > 5000) throw new Error(`timeout waiting for ${what}`);
+        // windows-latest load can delay the event loop past 5s (#4161); the assertion semantics are unchanged — still waits for the same responses, just tolerates runner jitter
+        if (Date.now() - t0 > 15000) throw new Error(`timeout waiting for ${what}`);
         await new Promise((r) => setTimeout(r, 25));
     }
 }

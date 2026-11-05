@@ -176,7 +176,7 @@ test("validation: batch aggregate — many small ranges pass if total >= minComp
   assert.equal(result.result.errors.length, 0);
 });
 
-test("validation: range with zero compressible messages (covered by non-nested block) is rejected", () => {
+test("validation: range with zero compressible messages (covered by non-nested block) is a covered no-op", () => {
   const core = createCore();
   const messages = [
     msg("a", longText),
@@ -200,7 +200,9 @@ test("validation: range with zero compressible messages (covered by non-nested b
 
   // m00002→m00003 maps to b,c. Block b1 covers a,b,c but its anchor is
   // at index 0 (a), outside range [1,2]. So b1 is NOT nested → consumedBlockCount=0.
-  // But b,c are in preExistingCoverage → directMessageIds=[]. Validation fires.
+  // But b,c are in preExistingCoverage → directMessageIds=[]. #4521: folds
+  // nothing — reported as the idempotent covered no-op (0 blocks, 0 errors)
+  // instead of a batch rejection the model would retry verbatim.
   const second = core.applyCompression({
     ranges: [{ startRef: "m00002", endRef: "m00003", summary: validSummary }],
     messages,
@@ -208,7 +210,15 @@ test("validation: range with zero compressible messages (covered by non-nested b
     config,
   });
   assert.equal(second.result.blocksCreated, 0);
-  assert.match(second.result.errors[0]!, /no compressible/i);
+  assert.equal(second.result.errors.length, 0);
+  assert.equal(second.result.noop, true);
+  // b1 is NOT nested inside the range, so its covered-content filter (not the
+  // covered-blocks list) removes b,c — the wording is the filtered variant of
+  // the same no-op class.
+  assert.match(
+    second.result.warnings.join(" "),
+    /already covered by active block\(s\)|protected or filtered/,
+  );
 });
 
 test("validation: block-boundary compress with 0 direct msgs but consumed blocks is allowed", () => {
@@ -259,7 +269,7 @@ test("validation: all checks disabled (0s) allows any input", () => {
   assert.equal(result.result.errors.length, 0);
 });
 
-test("validation: errors are collected per-range in batch compress", () => {
+test("validation: an empty-summary range rejects the whole batch (#3003)", () => {
   const core = createCore();
   const messages = [
     msg("a", longText),
@@ -282,7 +292,12 @@ test("validation: errors are collected per-range in batch compress", () => {
     state,
     config,
   });
-  assert.equal(result.result.blocksCreated, 1);
+  // #3003: a length-class failure (empty summary) in ANY candidate rejects the
+  // WHOLE batch — the valid sibling no longer lands. Content-class failures
+  // (unknown/invalid refs) remain per-range; see the invalid-refs batch test.
+  assert.equal(result.result.blocksCreated, 0);
+  assert.equal(result.state.blocks.length, 0);
   assert.equal(result.result.errors.length, 1);
+  assert.match(result.result.errors[0]!, /Batch rejected before folding any range/);
   assert.match(result.result.errors[0]!, /empty/i);
 });

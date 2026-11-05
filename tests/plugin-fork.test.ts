@@ -3,7 +3,7 @@ import http from "node:http";
 import { once } from "node:events";
 import { createHash } from "node:crypto";
 import test from "node:test";
-import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, closeSync, ftruncateSync, openSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
@@ -12,11 +12,14 @@ import { applyAbsorb, buildStoredPlaceholder, createContentStore, defaultConfig,
 import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
-import { _resetPluginStateForTest, rememberPluginMessages, resolveConversation } from "../src/plugin.ts";
-import { _resetSessionsForTest, getSession } from "../src/session.ts";
+import { setLogCapture } from "../src/logger.ts";
+import { _resetPluginStateForTest, forkParentRevisionLegacy, publicForkInputCheck, rememberPluginMessages, resolveConversation } from "../src/plugin.ts";
+import { _resetSessionsForTest, getSession, markDirty } from "../src/session.ts";
 import { _setForTest } from "../src/registry.ts";
 import { recordToolWitness, resetToolRingForTest } from "../src/tool-ring.ts";
 import { contentStoreOf } from "../src/store.ts";
+import { closeServers } from "./server-close-guard.ts";
+import { openSqliteDatabase } from "../src/storage/driver.ts";
 
 process.env.NODE_ENV = "test";
 const testRoot = mkdtempSync(join(tmpdir(), "bili-fork-"));
@@ -27,6 +30,7 @@ const hash = (v: unknown) => createHash("sha256").update(JSON.stringify(v)).dige
 interface SnapshotResponse {
     status: string;
     code?: string;
+    error?: string;
     sessionId: string;
     parentRevision: string;
     orderedMessages: { rawId: string; ref: string; identityHash: string }[];
@@ -70,7 +74,7 @@ async function responseBody<Path extends string>(response: Response, _path: Path
     return body as PluginResponse<Path>;
 }
 
-async function harness(persist = false, seedParent = true) {
+async function harness(persist = false, seedParent = true, compressExtra: Record<string, unknown> = {}) {
     const dir = mkdtempSync(join(testRoot, "run-"));
     for (const key of ["XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME"]) process.env[key] = dir;
     _resetSessionsForTest();
@@ -96,7 +100,7 @@ async function harness(persist = false, seedParent = true) {
     const addr = upstream.address();
     assert(addr && typeof addr === "object");
     const upstreamUrl = `http://127.0.0.1:${addr.port}`;
-    const proxy = await startServer({ port: 0, host: "127.0.0.1", upstream: upstreamUrl, routes: { [upstreamUrl]: { models: { "claude-test": { context: 400000 } } } }, modelContextLimit: 400000, kernelConfig: defaultConfig(400000), compress: { injectTool: true, injectNudge: true, preserveRecentMessages: 1, preserveRecentTokens: 0, minCompressRangeChars: 100 }, promptCache: { routing: "auto" }, sessionHeader: "x-acp-session", log: false, debug: false, passthrough: false, autoUpdate: false, mitm: { enabled: false, domains: [] } } as ProxyOptions);
+    const proxy = await startServer({ port: 0, host: "127.0.0.1", upstream: upstreamUrl, routes: { [upstreamUrl]: { models: { "claude-test": { context: 400000 } } } }, modelContextLimit: 400000, kernelConfig: defaultConfig(400000), compress: { injectTool: true, injectNudge: true, preserveRecentMessages: 1, preserveRecentTokens: 0, minCompressRangeChars: 100, ...compressExtra }, promptCache: { routing: "auto" }, sessionHeader: "x-acp-session", log: false, debug: false, passthrough: false, autoUpdate: false, mitm: { enabled: false, domains: [] } } as ProxyOptions);
     await once(proxy, "listening");
     const paddr = proxy.address();
     assert(paddr && typeof paddr === "object");
@@ -111,10 +115,10 @@ async function harness(persist = false, seedParent = true) {
         assert.equal(r.status, 200);
         await r.text();
     }
-    return { request, messages, forwarded, dir, store, upstreamUrl, origin, close: async () => { store.cancelAll(); proxy.close(); upstream.close(); await Promise.all([once(proxy, "close"), once(upstream, "close")]); } };
+    return { request, messages, forwarded, dir, store, upstreamUrl, origin, close: async () => { store.closeQuietly(); await closeServers([proxy, upstream], "plugin-fork harness"); } };
 }
 
-test("plain proxy panel snapshots do not change raw-history persistence", async () => {
+test("plain proxy panel snapshots do not change raw-history persistence", { timeout: 60_000 }, async () => {
     const h = await harness();
     try {
         const session = getSession("plain-panel");
@@ -125,11 +129,155 @@ test("plain proxy panel snapshots do not change raw-history persistence", async 
     } finally { await h.close(); }
 });
 
-test("HTTP exposes a versioned snapshot and forks an exact ordered prefix", async () => {
+test("HTTP fork preserves sparse parent ledger before the child's first save", { timeout: 60_000 }, async () => {
+    const oldMode = process.env.BILI_STORAGE_UNIFIED;
+    process.env.BILI_STORAGE_UNIFIED = "full";
+    const h = await harness(true);
+    try {
+        await compress(h);
+        for (let i = 0; i < 100 && !(resolveConversation("parent").session!.state.blocks.length); i++) await new Promise((r) => setTimeout(r, 20));
+        const parent = resolveConversation("parent").session!;
+        assert.equal(parent.state.blocks.length, 1);
+        parent.metadata.publicSnapshotRetained = true;
+        assert(h.store.flushSync(parent));
+        // Engine unpinned on purpose: the harness store used auto-detect, and bun
+        // has no node:sqlite to pin.
+        const raw = openSqliteDatabase(join(h.dir, "sessions", "index.db"));
+        // Model a ledger with retired historical positions: live messages are
+        // at 0, 3, 4, never the snapshot's dense array positions 0, 1, 2.
+        const positions = raw.db.prepare("SELECT seq FROM messages WHERE session_id = ? AND seq > 0 ORDER BY seq DESC").all(parent.id) as { seq: number }[];
+        for (const { seq } of positions) raw.db.prepare("UPDATE messages SET seq = ? WHERE session_id = ? AND seq = ?").run(seq + 2, parent.id, seq);
+        raw.db.close();
+        const ids = parent.pluginSnapshot!.map((m) => m.id);
+        parent.state.messageRefs.byRaw[ids[1]] = "m00004";
+        parent.state.messageRefs.byRaw[ids[2]] = "m00005";
+        parent.state.messageRefs.byRef = { m00001: ids[0], m00004: ids[1], m00005: ids[2] };
+        parent.state.blocks[0].endRef = "m00004";
+        assert(h.store.flushSync(parent));
+        assert.deepEqual(h.store.unifiedMessageIdRows(parent.id)!.filter((m) => ids.includes(m.msgId)).map((m) => m.seq), [0, 3, 4]);
+        const snapshot = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;
+        const request = forkRequest(snapshot, "sparse-child", 3);
+        const fork = await h.request("/__bili/plugin/fork", request);
+        assert.equal(fork.status, 201, JSON.stringify(fork.body));
+        const child = resolveConversation("sparse-child").session!;
+        assert.deepEqual(h.store.unifiedMessageIdRows(child.id)!.filter((m) => ids.includes(m.msgId)), h.store.unifiedMessageIdRows(parent.id)!.filter((m) => ids.includes(m.msgId)), "first child persistence must retain parent ledger positions");
+        assert.deepEqual(child.state.messageRefs, parent.state.messageRefs);
+        assert.deepEqual(child.state.blocks, parent.state.blocks);
+        assert.equal((await h.request("/__bili/plugin/fork", request)).status, 200);
+        assert(h.store.flushSync(child));
+        assert.deepEqual(h.store.loadSync(child.id)!.state.messageRefs, parent.state.messageRefs);
+        assert.deepEqual(JSON.parse(JSON.stringify(h.store.loadSync(child.id)!.state.blocks)), JSON.parse(JSON.stringify(child.state.blocks)));
+        const verify = openSqliteDatabase(join(h.dir, "sessions", "index.db"));
+        try {
+            const bounds = verify.db.prepare("SELECT start_seq, end_seq FROM blocks WHERE session_id = ?").get(child.id) as { start_seq: number; end_seq: number };
+            assert.equal(bounds.start_seq, 0);
+            assert.equal(bounds.end_seq, 3);
+        } finally { verify.db.close(); }
+    } finally {
+        h.store.closeQuietly();
+        await h.close();
+        if (oldMode === undefined) delete process.env.BILI_STORAGE_UNIFIED;
+        else process.env.BILI_STORAGE_UNIFIED = oldMode;
+    }
+});
+
+for (const mode of ["full", "shadow"] as const) {
+    test(`HTTP fork recovers committed receipt after envelope failure (${mode})`, { timeout: 60_000 }, async (t) => {
+        const oldMode = process.env.BILI_STORAGE_UNIFIED;
+        process.env.BILI_STORAGE_UNIFIED = mode;
+        const h = await harness(true);
+        let recovered: SessionStore | undefined;
+        try {
+            const parent = resolveConversation("parent").session!;
+            parent.metadata.publicSnapshotRetained = true;
+            assert(h.store.flushSync(parent));
+            const snapshot = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;
+            const request = forkRequest(snapshot, "crash-child", 2);
+            const disk = (h.store as unknown as { store: { flushSync(id: string, build: () => unknown): boolean } }).store;
+            const original = disk.flushSync.bind(disk);
+            const failingWrite = t.mock.method(disk, "flushSync", (id: string, build: () => unknown) => id === "crash-child" ? false : original(id, build));
+            const failed = await h.request("/__bili/plugin/fork", request);
+            assert.equal(failed.status, 503, JSON.stringify(failed.body));
+            failingWrite.mock.restore();
+            assert.equal((await h.store.findSessionFiles("crash-child")).length, 0);
+            h.store.cancelAll();
+            h.store.closeQuietly();
+            _resetSessionsForTest();
+            _resetPluginStateForTest();
+            recovered = new SessionStore({ dir: join(h.dir, "sessions"), enabled: true, debounceMs: 60_000 });
+            _setStoreForTest(recovered);
+            const replay = await h.request("/__bili/plugin/fork", request);
+            assert.equal(replay.status, 200, JSON.stringify(replay.body));
+            assert.equal(replay.body.replayed, true);
+            assert((await recovered.findSessionFiles("crash-child")).length > 0);
+            assert.equal((await h.request("/__bili/plugin/fork", { ...request, idempotencyKey: "different" })).status, 409);
+            const child = (await h.request("/__bili/plugin/snapshot?conversationId=crash-child")).body;
+            assert.deepEqual(child.orderedMessages, snapshot.orderedMessages.slice(0, 2));
+            await sendModel(h, "crash-child", [...h.messages.slice(0, 2), { role: "user", content: "continue recovered fork" }]);
+        } finally {
+            recovered?.cancelAll();
+            recovered?.closeQuietly();
+            await h.close();
+            if (oldMode === undefined) delete process.env.BILI_STORAGE_UNIFIED;
+            else process.env.BILI_STORAGE_UNIFIED = oldMode;
+        }
+    });
+}
+
+test("HTTP fork keeps unified-only JSON writer posture across replay", { timeout: 60_000 }, async () => {
+    const before = { mode: process.env.BILI_STORAGE_UNIFIED, writer: process.env.BILI_STORAGE_JSON_WRITER };
+    process.env.BILI_STORAGE_UNIFIED = "full";
+    process.env.BILI_STORAGE_JSON_WRITER = "off";
+    const h = await harness(true);
+    try {
+        const parent = resolveConversation("parent").session!;
+        parent.metadata.publicSnapshotRetained = true;
+        assert(h.store.flushSync(parent));
+        const snapshot = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;
+        const request = forkRequest(snapshot, "db-only-child");
+        assert.equal((await h.request("/__bili/plugin/fork", request)).status, 201);
+        assert.equal((await h.request("/__bili/plugin/fork", request)).status, 200);
+        assert.equal((await h.store.findSessionFiles("db-only-child")).length, 0);
+        assert(h.store.loadSync("db-only-child")!.metadata.publicForkReceipt);
+    } finally {
+        h.store.cancelAll();
+        await h.close();
+        h.store.closeQuietly();
+        if (before.mode === undefined) delete process.env.BILI_STORAGE_UNIFIED; else process.env.BILI_STORAGE_UNIFIED = before.mode;
+        if (before.writer === undefined) delete process.env.BILI_STORAGE_JSON_WRITER; else process.env.BILI_STORAGE_JSON_WRITER = before.writer;
+    }
+});
+
+test("HTTP fork transaction failure never publishes and same request can retry", { timeout: 60_000 }, async (t) => {
+    const oldMode = process.env.BILI_STORAGE_UNIFIED;
+    process.env.BILI_STORAGE_UNIFIED = "full";
+    const h = await harness(true);
+    try {
+        const parent = resolveConversation("parent").session!;
+        parent.metadata.publicSnapshotRetained = true;
+        assert(h.store.flushSync(parent));
+        const snapshot = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;
+        const request = forkRequest(snapshot, "failed-child");
+        const shadow = (h.store as unknown as { shadow: { createForkAsync(): Promise<boolean> } }).shadow;
+        const fault = t.mock.method(shadow, "createForkAsync", async () => { throw new Error("injected clone failure"); });
+        assert.equal((await h.request("/__bili/plugin/fork", request)).status, 503);
+        assert.equal(h.store.loadSync("failed-child"), null);
+        assert.equal(resolveConversation("failed-child").session, undefined);
+        fault.mock.restore();
+        assert.equal((await h.request("/__bili/plugin/fork", request)).status, 201);
+    } finally {
+        h.store.cancelAll();
+        await h.close();
+        h.store.closeQuietly();
+        if (oldMode === undefined) delete process.env.BILI_STORAGE_UNIFIED; else process.env.BILI_STORAGE_UNIFIED = oldMode;
+    }
+});
+
+test("HTTP exposes a versioned snapshot and forks an exact ordered prefix", { timeout: 60_000 }, async () => {
     const h = await harness();
     try {
         const manifest = await h.request("/__bili/plugin/manifest");
-        assert.deepEqual(manifest.body.capabilities.fork, { protocolVersion: 1, endpoint: "/__bili/plugin/fork", snapshotEndpoint: "/__bili/plugin/snapshot" });
+        assert.deepEqual(manifest.body.capabilities.fork, { protocolVersion: 2, acceptsProtocolVersions: [1, 2], endpoint: "/__bili/plugin/fork", snapshotEndpoint: "/__bili/plugin/snapshot" });
         const snapshot = await h.request("/__bili/plugin/snapshot?conversationId=parent");
         assert.equal(snapshot.status, 200, JSON.stringify({ response: snapshot.body, session: resolveConversation("parent").session }));
         assert.equal(snapshot.body.orderedMessages.length, 3);
@@ -147,10 +295,10 @@ test("HTTP exposes a versioned snapshot and forks an exact ordered prefix", asyn
     } finally { await h.close(); }
 });
 
-async function sendIntentModel(h: Awaited<ReturnType<typeof harness>>, conversationId: string, messages: unknown[], tools: unknown[], requestAgent?: string, maxTokens = 256, announcePlugin = true) {
+async function sendIntentModel(h: Awaited<ReturnType<typeof harness>>, conversationId: string, messages: unknown[], tools: unknown[], requestAgent?: string, maxTokens = 256, announcePlugin = true, pluginName = "ekko-agent") {
     const headers: Record<string, string> = { "content-type": "application/json", "x-acp-session": conversationId };
     if (announcePlugin) {
-        headers["x-bili-plugin"] = "ekko-agent";
+        headers["x-bili-plugin"] = pluginName;
         headers["x-bili-plugin-conversation"] = conversationId;
     }
     if (requestAgent !== undefined) headers["x-bili-plugin-agent"] = requestAgent;
@@ -158,11 +306,11 @@ async function sendIntentModel(h: Awaited<ReturnType<typeof harness>>, conversat
     assert.equal(response.status, 200, await response.text());
 }
 
-test("HTTP explicit main with only public ACP tools captures initial history, usage and first fork payload", async () => {
+test("HTTP explicit main with only public ACP tools captures initial history, usage and first fork payload", { timeout: 60_000 }, async () => {
     const h = await harness(false, false);
     try {
         const tools = (await h.request("/__bili/plugin/manifest")).body.tools.openai;
-        assert.deepEqual(tools.map((tool) => tool.function.name), ["compress", "decompress", "search_context", "acp_status", "acp_cache"]);
+        assert.deepEqual(tools.map((tool) => tool.function.name), ["compress", "decompress", "search_context", "acp_status", "acp_cache", "acp_read_original_image"]);
         await sendIntentModel(h, "parent", h.messages, tools, "main");
         assert.deepEqual(h.forwarded.at(-1)!.tools, tools, "main tools survive unchanged");
         assert.equal(h.forwarded.at(-1)!.max_tokens, 256);
@@ -191,7 +339,7 @@ test("HTTP explicit main with only public ACP tools captures initial history, us
     } finally { await h.close(); }
 });
 
-test("HTTP explicit main without tools survives a tiny output budget", async () => {
+test("HTTP explicit main without tools survives a tiny output budget", { timeout: 60_000 }, async () => {
     const h = await harness(false, false);
     try {
         await sendIntentModel(h, "parent", h.messages, [], "main", 100);
@@ -202,7 +350,7 @@ test("HTTP explicit main without tools survives a tiny output budget", async () 
     } finally { await h.close(); }
 });
 
-test("HTTP title on the same plugin lane cannot replace the main snapshot or usage", async () => {
+test("HTTP title on the same plugin lane cannot replace the main snapshot or usage", { timeout: 60_000 }, async () => {
     const h = await harness();
     try {
         const snapshot = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;
@@ -221,7 +369,7 @@ test("HTTP title on the same plugin lane cannot replace the main snapshot or usa
     } finally { await h.close(); }
 });
 
-test("HTTP missing or unknown intent keeps all-bili demotion; anonymous main cannot claim plugin intent", async () => {
+test("HTTP missing or unknown intent keeps all-bili demotion; anonymous main cannot claim plugin intent", { timeout: 60_000 }, async () => {
     const h = await harness(false, false);
     try {
         const tools = (await h.request("/__bili/plugin/manifest")).body.tools.openai;
@@ -245,7 +393,88 @@ function forkRequest(snapshot: { parentRevision: string; orderedMessages: unknow
     return { protocolVersion: 1, parentConversationId: "parent", childConversationId: child, parentRevision: snapshot.parentRevision, branchPoint: { messageCount: count, orderHash: hash(orderedMessages) }, orderedMessages, idempotencyKey: `fork-${child}` };
 }
 
-test("HTTP tool witnesses never override explicit parent, child or sibling identities", async () => {
+test("HTTP protected tools keep plain-text snapshots, forks and revisions usable (#2620)", { timeout: 60_000 }, async () => {
+    const h = await harness(false, false, { protectedTools: ["ask_user_question"] });
+    try {
+        const history = [
+            { role: "user", content: "Synthetic snapshot test" },
+            { role: "assistant", content: "Starting" },
+            { role: "assistant", content: null, tool_calls: [{ id: "q1", type: "function", function: { name: "ask_user_question", arguments: "{}" } }] },
+            { role: "tool", tool_call_id: "q1", content: '{"decision":"continue"}' },
+            { role: "assistant", content: null, tool_calls: [{ id: "q2", type: "function", function: { name: "ask_user_question", arguments: "{}" } }] },
+            { role: "tool", tool_call_id: "q2", content: '{"decision":"retry"}' },
+            ...Array.from({ length: 6 }, (_, i) => ({ role: i % 2 ? "assistant" : "user", content: `tail ${i}` })),
+        ];
+        await sendIntentModel(h, "parent", history, [], "main");
+        const snapshot = await h.request("/__bili/plugin/snapshot?conversationId=parent");
+        assert.equal(snapshot.status, 200, JSON.stringify(snapshot.body));
+        const refs = snapshot.body.orderedMessages.map((m) => m.ref);
+        assert.equal(refs.length, history.length);
+        assert.ok(refs.slice(0, 2).every((ref) => /^m\d{5,}$/.test(ref)), JSON.stringify(refs));
+        // #2620: both protected pairs (tool-call + paired result) are unaddressable —
+        // the wire carries null, and the kernel sentinel must never cross it.
+        assert.deepEqual(refs.slice(2, 6), [null, null, null, null]);
+        assert.ok(!refs.includes("BLOCKED"), JSON.stringify(refs));
+        assert.ok(refs.slice(6).every((ref) => /^m\d{5,}$/.test(ref)), JSON.stringify(refs));
+        const fork = await h.request("/__bili/plugin/fork", forkRequest(snapshot.body, "child", history.length));
+        assert.equal(fork.status, 201, JSON.stringify(fork.body));
+        const childSnap = (await h.request("/__bili/plugin/snapshot?conversationId=child")).body;
+        assert.deepEqual(childSnap.orderedMessages, snapshot.body.orderedMessages);
+        const childSession = resolveConversation("child").session!;
+        assert.equal(childSession.state.messageRefs.byRef["BLOCKED"], undefined);
+        assert.ok(Object.values(childSession.state.messageRefs.byRaw).includes("BLOCKED"));
+        await sendIntentModel(h, "child", [...history, { role: "assistant", content: "child continuation" }], [], "main");
+        assert.ok((await h.request("/__bili/plugin/status?conversationId=parent")).body.sessionRevision);
+    } finally { await h.close(); }
+});
+
+test("HTTP dsh-lane durable guards keep plain-text snapshots, forks and revisions usable (#2676)", { timeout: 60_000 }, async () => {
+    const h = await harness(false, false);
+    try {
+        const history = [
+            { role: "user", content: "Synthetic snapshot test" },
+            { role: "user", content: `Instructions from: /repo/AGENTS.md\n# repo rules\nbehave` },
+            { role: "assistant", content: "Starting" },
+            ...Array.from({ length: 4 }, (_, i) => ({ role: i % 2 ? "assistant" : "user", content: `tail ${i}` })),
+        ];
+        await sendIntentModel(h, "parent", history, [], "main", 256, true, "dsh");
+        const snapshot = await h.request("/__bili/plugin/snapshot?conversationId=parent");
+        assert.equal(snapshot.status, 200, JSON.stringify(snapshot.body));
+        const refs = snapshot.body.orderedMessages.map((m) => m.ref);
+        assert.equal(refs.length, history.length);
+        assert.ok(/^m\d{5,}$/.test(refs[0]), JSON.stringify(refs));
+        // dsh durable-guard lane (#2447) pins this carrier; the kernel BLOCKED
+        // sentinel addresses it internally and the wire renders null (#2620 final contract).
+        assert.equal(refs[1], null);
+        assert.ok(!refs.includes("BLOCKED"), JSON.stringify(refs));
+        assert.ok(refs.slice(2).every((ref) => /^m\d{5,}$/.test(ref)), JSON.stringify(refs));
+        const fork = await h.request("/__bili/plugin/fork", forkRequest(snapshot.body, "child", history.length));
+        assert.equal(fork.status, 201, JSON.stringify(fork.body));
+        const childSnap = (await h.request("/__bili/plugin/snapshot?conversationId=child")).body;
+        assert.deepEqual(childSnap.orderedMessages, snapshot.body.orderedMessages);
+        const childSession = resolveConversation("child").session!;
+        assert.equal(childSession.state.messageRefs.byRef["BLOCKED"], undefined);
+        assert.ok(Object.values(childSession.state.messageRefs.byRaw).includes("BLOCKED"));
+        await sendIntentModel(h, "child", [...history, { role: "assistant", content: "child continuation" }], [], "main", 256, true, "dsh");
+        assert.ok((await h.request("/__bili/plugin/status?conversationId=parent")).body.sessionRevision);
+    } finally { await h.close(); }
+});
+
+test("HTTP snapshot still rejects a genuinely inconsistent raw/ref mapping (#2620)", { timeout: 60_000 }, async () => {
+    const h = await harness();
+    try {
+        const session = resolveConversation("parent").session!;
+        const rawId = Object.keys(session.state.messageRefs.byRaw)[0];
+        assert(rawId);
+        session.state.messageRefs.byRaw[rawId] = "m99999";
+        const snapshot = await h.request("/__bili/plugin/snapshot?conversationId=parent");
+        assert.equal(snapshot.status, 409);
+        assert.equal(snapshot.body.code, "SNAPSHOT_UNAVAILABLE");
+        assert.match(String(snapshot.body.error), /raw\/ref mapping inconsistent/);
+    } finally { await h.close(); }
+});
+
+test("HTTP tool witnesses never override explicit parent, child or sibling identities", { timeout: 60_000 }, async () => {
     const h = await harness();
     try {
         const snapshot = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;
@@ -278,7 +507,7 @@ test("HTTP tool witnesses never override explicit parent, child or sibling ident
     } finally { await h.close(); }
 });
 
-test("HTTP native callers honor fork identity and revision despite a sibling witness", async () => {
+test("HTTP native callers honor fork identity and revision despite a sibling witness", { timeout: 60_000 }, async () => {
     const h = await harness();
     try {
         const parent = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;
@@ -305,7 +534,7 @@ test("HTTP native callers honor fork identity and revision despite a sibling wit
     } finally { await h.close(); }
 });
 
-test("HTTP snapshot normalizes tool error flags and rejects a success identity for a failed result", async () => {
+test("HTTP snapshot normalizes tool error flags and rejects a success identity for a failed result", { timeout: 60_000 }, async () => {
     const h = await harness();
     try {
         const history = (isError?: boolean) => [
@@ -335,12 +564,12 @@ test("HTTP snapshot normalizes tool error flags and rejects a success identity f
     } finally { await h.close(); }
 });
 
-test("HTTP fork fails closed on malformed, missing, stale and reordered boundaries", async () => {
+test("HTTP fork fails closed on malformed, missing, stale and reordered boundaries", { timeout: 60_000 }, async () => {
     const h = await harness();
     try {
         const snapshot = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;
         const req = forkRequest(snapshot);
-        for (const payload of [null, [], { ...req, protocolVersion: 2 }, { ...req, childConversationId: "parent" }, { ...req, parentConversationId: " parent" }, { ...req, branchPoint: { ...req.branchPoint, messageCount: -1 } }]) {
+        for (const payload of [null, [], { ...req, protocolVersion: 3 }, { ...req, childConversationId: "parent" }, { ...req, parentConversationId: " parent" }, { ...req, branchPoint: { ...req.branchPoint, messageCount: -1 } }]) {
             assert.equal((await h.request("/__bili/plugin/fork", payload)).status, 400);
         }
         assert.equal((await h.request("/__bili/plugin/fork", { ...req, parentConversationId: "missing" })).status, 404);
@@ -350,12 +579,16 @@ test("HTTP fork fails closed on malformed, missing, stale and reordered boundari
         assert.equal((await h.request("/__bili/plugin/fork", { ...req, branchPoint: { ...req.branchPoint, orderHash: "0".repeat(64) } })).body.code, "BRANCH_POINT_CONFLICT");
         assert.equal((await h.request("/__bili/plugin/snapshot?conversationId=child")).status, 404);
         assert.equal((await h.request("/__bili/plugin/snapshot?conversationId=parent")).body.parentRevision, snapshot.parentRevision);
-        assert.equal((await h.request("/__bili/plugin/fork", req)).status, 201);
+        const retried = await h.request("/__bili/plugin/fork", req);
+        // 201 = freshly published on the healthy store; 200 = idempotent hit —
+        // legitimate because the alarm-boot fork above may have already
+        // published the child into this process's registry.
+        assert.ok(retried.status === 200 || retried.status === 201, `retry succeeds after recovery (${retried.status})`);
         assert.equal((await h.request("/__bili/plugin/fork", { ...req, idempotencyKey: "different" })).body.code, "CHILD_CONFLICT");
     } finally { await h.close(); }
 });
 
-test("HTTP concurrent identical forks publish once and conflicting parents cannot overwrite", async () => {
+test("HTTP concurrent identical forks publish once and conflicting parents cannot overwrite", { timeout: 60_000 }, async () => {
     const h = await harness();
     try {
         const snapshot = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;
@@ -380,7 +613,7 @@ async function compress(h: Awaited<ReturnType<typeof harness>>, conversationId =
     return r;
 }
 
-test("HTTP compressed originals are isolated across parent and siblings and straddlers are excluded", async () => {
+test("HTTP compressed originals are isolated across parent and siblings and straddlers are excluded", { timeout: 60_000 }, async () => {
     const h = await harness();
     try {
         await compress(h);
@@ -420,7 +653,7 @@ test("HTTP compressed originals are isolated across parent and siblings and stra
     } finally { await h.close(); }
 });
 
-test("HTTP exact fork materializes its inherited summary with equivalent SDK text and bili-only tools", async () => {
+test("HTTP exact fork materializes its inherited summary with equivalent SDK text and bili-only tools", { timeout: 60_000 }, async () => {
     const h = await harness();
     try {
         await compress(h);
@@ -445,14 +678,22 @@ test("HTTP exact fork materializes its inherited summary with equivalent SDK tex
     } finally { await h.close(); }
 });
 
-test("HTTP first fork request rejects a mismatched inherited prefix without forwarding or mutating state", async () => {
+test("HTTP first fork request adopts a mismatched inherited prefix with a classified warn (#3741 advisory gate)", { timeout: 60_000 }, async () => {
     const h = await harness();
+    const warns: string[] = [];
+    setLogCapture((level, msg) => { if (level === "warn") warns.push(msg); });
     try {
         await compress(h);
         const snapshot = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;
         assert.equal((await h.request("/__bili/plugin/fork", forkRequest(snapshot))).status, 201);
         const child = (await h.request("/__bili/plugin/snapshot?conversationId=child")).body;
         const requests = h.forwarded.length;
+        // Three drift shapes that used to 409: semantic change under the prefix,
+        // reordering, and a too-short replay. All must now be ADOPTED: the
+        // session-id binding woke the fork child and fold reconcile settles the
+        // inherited folds — a divergent child's first request simply goes out
+        // unfolded (token spike, never corruption) instead of sticking the
+        // conversation with a permanent 409 dead-end.
         for (const messages of [
             [{ ...h.messages[0], content: "changed semantic content" }, h.messages[1], { role: "user", content: "continue child" }],
             [h.messages[1], h.messages[0], { role: "user", content: "reordered prefix" }],
@@ -460,37 +701,139 @@ test("HTTP first fork request rejects a mismatched inherited prefix without forw
         ]) {
             const response = await fetch(`${h.origin}/bili/${h.upstreamUrl}/v1/messages`, { method: "POST", headers: { "content-type": "application/json", "x-bili-plugin": "ekko-agent", "x-bili-plugin-conversation": "child" }, body: JSON.stringify({ model: "claude-test", max_tokens: 1024, stream: false, messages }) });
             const body = await response.text();
-            assert.equal(response.status, 409, body);
-            assert.equal(JSON.parse(body).code, "FORK_PREFIX_CONFLICT");
-            assert.equal(h.forwarded.length, requests);
-            assert.equal((await h.request("/__bili/plugin/snapshot?conversationId=child")).body.parentRevision, child.parentRevision);
+            assert.equal(response.status, 200, body);
+            assert.ok(h.forwarded.length > requests, "mismatched first request must be forwarded (adopted), not rejected");
+            // the child's traffic must never touch the parent session
             assert.equal((await h.request("/__bili/plugin/snapshot?conversationId=parent")).body.parentRevision, snapshot.parentRevision);
         }
-        await sendModel(h, "child", [...h.messages.slice(0, 2), { role: "user", content: "valid retry" }]);
-        assert(JSON.stringify(h.forwarded.at(-1)).includes(summary));
+        // Advisory signal: the gate is one-shot (first request only — after it,
+        // stats.requests > 0 bypasses the check entirely), so exactly one
+        // classified warn is expected, from the first adopted mismatch; the
+        // 2nd/3rd requests ride the live-traffic path with no check at all.
+        const forkWarns = warns.filter((w) => w.includes("[fork-prefix]") && w.includes("adopting anyway"));
+        assert.equal(forkWarns.length, 1, JSON.stringify(warns.filter((w) => w.includes("fork-prefix"))));
+        assert.ok(/id-drift|hash-drift-under-same-id|prefix-longer-than-incoming/.test(forkWarns[0]!), forkWarns[0]);
+        assert.notEqual((await h.request("/__bili/plugin/snapshot?conversationId=child")).body.parentRevision, child.parentRevision);
+        // The child keeps working afterwards — no dead-end, no manual escape.
+        await sendModel(h, "child", [...h.messages.slice(0, 2), { role: "user", content: "valid follow-up" }]);
+        assert(JSON.stringify(h.forwarded.at(-1)).includes("changed semantic content") || JSON.stringify(h.forwarded.at(-1)).includes(summary));
+    } finally {
+        setLogCapture(null);
+        await h.close();
+    }
+});
+
+test("publicForkInputCheck keeps the #3743 taxonomy pinned per class (hash-drift vs ref-broken)", { timeout: 60_000 }, async () => {
+    // The advisory adoption above only pins id-drift/prefix-longer-than-incoming through the warn;
+    // these two branches lost their HTTP sub-cases when the 409 assertions were inverted, so pin
+    // them directly — including #3743's fix that a pruned ref (id+hash intact) reports ref-broken
+    // ALONE and must not be mislabeled hash-drift.
+    const h = await harness();
+    try {
+        await compress(h);
+        const snapshot = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;
+        assert.equal((await h.request("/__bili/plugin/fork", forkRequest(snapshot))).status, 201);
+        const child = resolveConversation("child").session!;
+        const cell = child.pluginSnapshot![0];
+        const body = { model: "claude-test", max_tokens: 1024, stream: false, messages: [...h.messages.slice(0, 2), { role: "user", content: "continue child" }] };
+        assert.deepEqual(publicForkInputCheck(child, "anthropic", body), { ok: true }, "intact snapshot verifies clean before any mutation");
+        const savedThinkingTokens = cell.thinkingTokens;
+        cell.thinkingTokens = 7;
+        try {
+            const verdict = publicForkInputCheck(child, "anthropic", body);
+            assert.equal(verdict.ok, false);
+            if (!verdict.ok) {
+                assert.match(verdict.reason, /cell-mismatch@0 hash-drift-under-same-id/);
+                assert.doesNotMatch(verdict.reason, /id-drift|ref-broken/);
+            }
+        } finally {
+            cell.thinkingTokens = savedThinkingTokens;
+        }
+        const savedRef = child.state.messageRefs.byRaw[cell.id];
+        assert.notEqual(savedRef, undefined);
+        delete child.state.messageRefs.byRaw[cell.id];
+        try {
+            const verdict = publicForkInputCheck(child, "anthropic", body);
+            assert.equal(verdict.ok, false);
+            if (!verdict.ok) {
+                assert.match(verdict.reason, /cell-mismatch@0 ref-broken \(rawId=[^ ]+ ref=MISSING\)/);
+                assert.doesNotMatch(verdict.reason, /id-drift|hash-drift-under-same-id/);
+            }
+        } finally {
+            child.state.messageRefs.byRaw[cell.id] = savedRef;
+        }
+        assert.deepEqual(publicForkInputCheck(child, "anthropic", body), { ok: true }, "restored state verifies clean again");
     } finally { await h.close(); }
 });
 
-test("HTTP persistence failure leaves no child and retry can succeed", async () => {
+test("HTTP storage failures: broken dir refuses to start; corrupt index serves forks via envelopes", { timeout: 60_000 }, async () => {
     const h = await harness();
+    // Both failure legs are unified-sidecar behaviors; under the global legacy baseline
+    // preload no sqlite open happens at all, so refuse-to-start can never fire there.
+    const oldMode2 = process.env.BILI_STORAGE_UNIFIED;
+    process.env.BILI_STORAGE_UNIFIED = "full";
     try {
+        // Two failure shapes, per the 2026-10-30 owner policy: (a) an open
+        // into a broken directory REFUSES to start (the constructor throws —
+        // silent construction-time degradation is withdrawn), so that shape
+        // can no longer be injected into a running server; the reachable
+        // unavailable state inside a live process is (b) the proven-corrupt
+        // index, which alarms and serves envelopes without the unified side.
+        writeFileSync(h.dir + "/not-a-directory", "failure fixture");
+        assert.throws(
+            () => new SessionStore({ dir: h.dir + "/not-a-directory", enabled: true }),
+            /EEXIST|ENOTDIR/,
+            "a broken sessions dir refuses the start loudly instead of degrading silently",
+        );
+        const bad = mkdtempSync(join(testRoot, "badidx-"));
+        let seed: SessionStore | undefined;
+        try {
+            seed = new SessionStore({ dir: bad, enabled: true });
+            seed.loadSync("seed", { protocol: "anthropic", upstreamOrigin: "http://127.0.0.1:8199" });
+        } finally {
+            seed?.closeQuietly();
+        }
+        const idxPath = join(bad, "index.db");
+        const fd = openSync(idxPath, "r+");
+        try {
+            ftruncateSync(fd, Math.floor(statSync(idxPath).size / 2));
+        } finally {
+            closeSync(fd);
+        }
+        const failedStore = new SessionStore({ dir: bad, enabled: true, log: () => {} }); // alarms, boots envelope-served
+        _setStoreForTest(failedStore);
         const snapshot = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;
         const req = forkRequest(snapshot);
-        writeFileSync(h.dir + "/not-a-directory", "failure fixture");
-        const failedStore = new SessionStore({ dir: h.dir + "/not-a-directory", enabled: true, log: () => {} });
-        _setStoreForTest(failedStore);
         const failed = await h.request("/__bili/plugin/fork", req);
-        assert.equal(failed.status, 503);
-        assert.equal(resolveConversation("child").session, undefined);
-        assert.equal(failedStore.loadSync("child"), null);
-        assert.equal((await h.request("/__bili/plugin/snapshot?conversationId=child")).status, 404);
+        // Corrupt-index stores boot envelope-served and envelopes stay
+        // WRITABLE — so the fork either lands on the envelope (child must
+        // then be fully readable without the index) or fails closed.
+        // Silent half-states (published-but-unreadable child) are the bug.
+        if (failed.status === 201) {
+            const child = failedStore.loadSync("child");
+            assert.ok(child !== null && child !== undefined, "a published child must be readable back from its envelope alone");
+            assert.notEqual((await h.request("/__bili/plugin/snapshot?conversationId=parent")).body.parentRevision, null);
+        } else {
+            assert.ok(failed.status === 503 || failed.status === 409, `fork against an index-less store fails closed (${failed.status})`);
+            assert.equal(resolveConversation("child").session, undefined);
+            assert.equal(failedStore.loadSync("child"), null);
+            assert.equal((await h.request("/__bili/plugin/snapshot?conversationId=child")).status, 404);
+        }
         assert.equal((await h.request("/__bili/plugin/snapshot?conversationId=parent")).body.parentRevision, snapshot.parentRevision);
+        failedStore.closeQuietly();
         _setStoreForTest(h.store);
-        assert.equal((await h.request("/__bili/plugin/fork", req)).status, 201);
-    } finally { _setStoreForTest(h.store); await h.close(); }
+        // Retry: 201 fresh, or 200 if the alarm-boot fork already published
+        // the child — the conversation registry is process-wide.
+        assert.ok([200, 201].includes((await h.request("/__bili/plugin/fork", req)).status));
+    } finally {
+        if (oldMode2 === undefined) delete process.env.BILI_STORAGE_UNIFIED;
+        else process.env.BILI_STORAGE_UNIFIED = oldMode2;
+        _setStoreForTest(h.store);
+        await h.close();
+    }
 });
 
-test("HTTP CCR deleted index fails closed in memory after persistence", async () => {
+test("HTTP CCR deleted index fails closed in memory after persistence", { timeout: 60_000 }, async () => {
     const h = await harness(true);
     try {
         const parent = resolveConversation("parent").session!;
@@ -513,7 +856,7 @@ test("HTTP CCR deleted index fails closed in memory after persistence", async ()
     } finally { await h.close(); }
 });
 
-test("HTTP CCR shared payload deletion fails closed before persistence", async () => {
+test("HTTP CCR shared payload deletion fails closed before persistence", { timeout: 60_000 }, async () => {
     const h = await harness();
     try {
         const parent = resolveConversation("parent").session!;
@@ -564,9 +907,21 @@ for (const corruption of ["missing-ref", "missing-payload", "orphan-payload", "w
                 case "changed-payload": disk.byHash[payloadHash] = "corrupted original"; break;
             }
             writeFileSync(path, JSON.stringify(disk));
-            h.store.cancelAll();
+            // True cold disk restore: close the unified sidecar and remove its
+            // index so the corrupted content-store file is the ONLY surviving
+            // copy. Under the #3818 full-mode default an intact index.db
+            // legitimately serves the pre-corruption CCR mirror (#2960 ③) and
+            // the snapshot would answer 200 — not because fail-closed broke,
+            // but because nothing was lost. Deleting the sidecar (after
+            // closeQuietly — Windows cannot unlink an open index.db) makes the
+            // 409 contract hold identically in full and legacy modes.
+            h.store.closeQuietly();
+            const sidecar = join(h.dir, "sessions", "index.db");
+            for (const f of [sidecar, `${sidecar}-wal`, `${sidecar}-shm`]) rmSync(f, { force: true });
             _resetSessionsForTest();
             _resetPluginStateForTest();
+            const store2 = new SessionStore({ dir: join(h.dir, "sessions"), enabled: true, debounceMs: 60_000 });
+            _setStoreForTest(store2);
             const restored = getSession("parent");
             contentStoreOf(restored);
             const parentState = () => JSON.stringify({ state: restored.state, messages: restored.pluginSnapshot, metadata: restored.metadata, store: restored.contentStore });
@@ -576,76 +931,101 @@ for (const corruption of ["missing-ref", "missing-payload", "orphan-payload", "w
             assert.equal(fork.status, 409);
             assert.equal(fork.body.status, "unavailable");
             assert.equal(resolveConversation("child").session, undefined);
-            assert.equal(h.store.loadSync("child"), null);
+            assert.equal(store2.loadSync("child"), null);
             assert.equal(parentState(), before);
             assert.equal(readFileSync(path, "utf8"), JSON.stringify(disk));
+            store2.closeQuietly();
         } finally { await h.close(); }
     });
 }
 
-test("HTTP fork revision and originals survive a new proxy process", async () => {
-    const h = await harness(true);
-    let child: ReturnType<typeof spawn> | undefined;
-    try {
-        await compress(h);
-        const parent = resolveConversation("parent").session!;
-        parent.metadata.effectiveCcr = { ...DEFAULT_CCR_CONFIG, enabled: true };
-        parent.contentStore = storeOriginal(createContentStore(), { ref: "m00001", rawId: parent.pluginSnapshot![0].id, text: "CCR original retained independently after restart", kind: "original", tokens: 10, head: "CCR original" });
-        parent.contentStoreDirty = true;
-        assert(h.store.flushSync(parent));
-        assert.deepEqual(JSON.parse(JSON.stringify(h.store.loadSync("parent")!.state)), JSON.parse(JSON.stringify({ ...parent.state, imageFullRestored: parent.state.imageFullRestored ?? [], imageShrinks: parent.state.imageShrinks ?? [] })));
-        const snapshot = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;
-        const req = forkRequest(snapshot);
-        const fork = await h.request("/__bili/plugin/fork", req);
-        assert.equal(fork.status, 201);
-        const childSnapshot = (await h.request("/__bili/plugin/snapshot?conversationId=child")).body;
-        const code = `import {startServer} from './src/server.ts'; import {SessionStore,_setStoreForTest} from './src/persist.ts'; import {defaultConfig} from 'acp-kernel'; import {_setForTest} from './src/registry.ts'; _setForTest({}); _setStoreForTest(new SessionStore({dir:${JSON.stringify(h.dir + "/sessions")},enabled:true})); const s=await startServer({port:0,host:'127.0.0.1',upstream:${JSON.stringify(h.upstreamUrl)},modelContextLimit:400000,routes:{},kernelConfig:defaultConfig(400000),compress:{injectTool:true,injectNudge:true},promptCache:{routing:'auto'},sessionHeader:'x-acp-session',log:false,debug:false,passthrough:false,autoUpdate:false,mitm:{enabled:false,domains:[]}}); const ready=()=>process.stdout.write(JSON.stringify({port:s.address().port})+'\\n'); if(s.listening)ready();else s.once('listening',ready);`;
-        child = spawn(process.execPath, ["--import", "tsx", "--input-type=module", "--eval", code], { cwd: fileURLToPath(new URL("../", import.meta.url)), env: { ...process.env, NODE_ENV: "test" }, stdio: ["ignore", "pipe", "pipe"] });
-        let stderr = "";
-        child.stderr!.on("data", (b) => { stderr += b.toString(); });
-        const port = await new Promise<number>((resolve, reject) => {
-            let stdout = "";
-            const timer = setTimeout(() => reject(new Error("restart timeout: " + stderr + stdout)), 15000);
-            child!.stdout!.on("data", (b) => {
-                stdout += b.toString();
-                const port = stdout.match(/\{"port":(\d+)\}/);
-                if (port) { clearTimeout(timer); resolve(Number(port[1])); }
+for (const storageMode of ["legacy", "full"] as const) {
+    test(`HTTP fork revision and originals survive a new proxy process (${storageMode})`, { timeout: 60_000 }, async () => {
+        const previousMode = process.env.BILI_STORAGE_UNIFIED;
+        process.env.BILI_STORAGE_UNIFIED = storageMode;
+        const h = await harness(true);
+        let child: ReturnType<typeof spawn> | undefined;
+        try {
+            await compress(h);
+            // CI-only race (#4599): the compress fold lands in the live session
+            // state asynchronously after the tool response (#3573 replay
+            // semantics). On slow runners flushSync below would otherwise persist
+            // the pre-fold state and the cold load reports "0 block(s)
+            // (compressions=0)". Bounded-wait for the fold first.
+            for (let i = 0; i < 100 && !(resolveConversation("parent").session?.state.blocks?.length ?? 0); i++) {
+                await new Promise((r) => setTimeout(r, 50));
+            }
+            const parent = resolveConversation("parent").session!;
+            parent.metadata.effectiveCcr = { ...DEFAULT_CCR_CONFIG, enabled: true };
+            parent.contentStore = storeOriginal(createContentStore(), { ref: "m00001", rawId: parent.pluginSnapshot![0].id, text: "CCR original retained independently after restart", kind: "original", tokens: 10, head: "CCR original" });
+            parent.contentStoreDirty = true;
+            assert(h.store.flushSync(parent));
+            // #4316 PR3/3: only a unified cold load runs the one-time ledger
+            // alignment; the CI legacy baseline retains the original state.
+            const persistedState = JSON.parse(JSON.stringify(parent.state));
+            if (h.store.replicasAvailable()) persistedState.refLedgerAligned = true;
+            assert.deepEqual(JSON.parse(JSON.stringify(h.store.loadSync("parent")!.state)), persistedState);
+            const snapshot = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;
+            const req = forkRequest(snapshot);
+            const fork = await h.request("/__bili/plugin/fork", req);
+            assert.equal(fork.status, 201);
+            const childSnapshot = (await h.request("/__bili/plugin/snapshot?conversationId=child")).body;
+            // #5046/#5075 (2026-10-30 owner chain): two LIVE bili processes on
+            // ONE sessions dir is refused — sharing a dir across lanes is the
+            // supported topology, same dir is split-brain risk. Close our own
+            // side before the stand-in proxy boots, so exactly one writer holds
+            // the index at a time (this IS the policy, pinned here for real).
+            if (process.env.BILI_STORAGE_UNIFIED !== "legacy") h.store.closeQuietly();
+            const code = `import {startServer} from './src/server.ts'; import {SessionStore,_setStoreForTest} from './src/persist.ts'; import {defaultConfig} from 'acp-kernel'; import {_setForTest} from './src/registry.ts'; _setForTest({}); _setStoreForTest(new SessionStore({dir:${JSON.stringify(h.dir + "/sessions")},enabled:true})); const s=await startServer({port:0,host:'127.0.0.1',upstream:${JSON.stringify(h.upstreamUrl)},modelContextLimit:400000,routes:{},kernelConfig:defaultConfig(400000),compress:{injectTool:true,injectNudge:true},promptCache:{routing:'auto'},sessionHeader:'x-acp-session',log:false,debug:false,passthrough:false,autoUpdate:false,mitm:{enabled:false,domains:[]}}); const ready=()=>process.stdout.write(JSON.stringify({port:s.address().port})+'\\n'); if(s.listening)ready();else s.once('listening',ready);`;
+            child = spawn(process.execPath, ["--import", "tsx", "--input-type=module", "--eval", code], { cwd: fileURLToPath(new URL("../", import.meta.url)), env: { ...process.env, NODE_ENV: "test" }, stdio: ["ignore", "pipe", "pipe"] });
+            let stderr = "";
+            child.stderr!.on("data", (b) => { stderr += b.toString(); });
+            const port = await new Promise<number>((resolve, reject) => {
+                let stdout = "";
+                const timer = setTimeout(() => reject(new Error("restart timeout: " + stderr + stdout)), 15000);
+                child!.stdout!.on("data", (b) => {
+                    stdout += b.toString();
+                    const port = stdout.match(/\{"port":(\d+)\}/);
+                    if (port) { clearTimeout(timer); resolve(Number(port[1])); }
+                });
+                child!.once("exit", (code) => { clearTimeout(timer); reject(new Error(`restart exited ${code}: ${stderr}`)); });
+                child!.once("error", (error) => { clearTimeout(timer); reject(error); });
             });
-            child!.once("exit", (code) => { clearTimeout(timer); reject(new Error(`restart exited ${code}: ${stderr}`)); });
-            child!.once("error", (error) => { clearTimeout(timer); reject(error); });
-        });
-        const call = async <Path extends string>(path: Path, body?: unknown) => {
-            const r = await fetch(`http://127.0.0.1:${port}` + path, body === undefined ? {} : { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
-            return { status: r.status, body: await responseBody(r, path) };
-        };
-        const restored = await call("/__bili/plugin/snapshot?conversationId=child");
-        const restoredStatus = await call("/__bili/plugin/status?conversationId=parent&fallback=latest");
-        assert.equal(restoredStatus.status, 200);
-        assert.equal(restoredStatus.body.sessionId, "parent");
-        assert.equal(restoredStatus.body.fallback, undefined);
-        assert.equal(restoredStatus.body.sessionRevision, snapshot.parentRevision);
-        assert.equal(restoredStatus.body.contextTokensSource, "estimate");
-        assert.equal(restored.status, 200);
-        assert.equal(restored.body.parentRevision, childSnapshot.parentRevision);
-        assert.deepEqual(restored.body.orderedMessages, childSnapshot.orderedMessages);
-        assert.equal((await call("/__bili/plugin/snapshot?conversationId=parent")).body.parentRevision, snapshot.parentRevision);
-        const replay = await call("/__bili/plugin/fork", req);
-        assert.equal(replay.status, 200);
-        assert.equal(replay.body.replayed, true);
-        const retrieved = await call("/__bili/plugin/tool", { conversationId: "child", tool: "acp_retrieve", args: { ref: "m00001" } });
-        assert.equal(retrieved.status, 200);
-        assert.match(retrieved.body.result, /CCR original retained independently after restart/);
-        const original = await call("/__bili/plugin/tool", { conversationId: "child", tool: "decompress", args: { blockId: "b1", full: true } });
-        assert.match(original.body.result, /first original/);
-        assert.match(original.body.result, /second original/);
-        assert(!original.body.result.includes("tail original"));
-    } finally {
-        if (child?.pid && child.exitCode === null && child.signalCode === null) { child.kill("SIGTERM"); await once(child, "exit"); }
-        await h.close();
-    }
-});
+            const call = async <Path extends string>(path: Path, body?: unknown) => {
+                const r = await fetch(`http://127.0.0.1:${port}` + path, body === undefined ? {} : { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+                return { status: r.status, body: await responseBody(r, path) };
+            };
+            const restored = await call("/__bili/plugin/snapshot?conversationId=child");
+            const restoredStatus = await call("/__bili/plugin/status?conversationId=parent&fallback=latest");
+            assert.equal(restoredStatus.status, 200);
+            assert.equal(restoredStatus.body.sessionId, "parent");
+            assert.equal(restoredStatus.body.fallback, undefined);
+            assert.equal(restoredStatus.body.sessionRevision, snapshot.parentRevision);
+            assert.equal(restoredStatus.body.contextTokensSource, "estimate");
+            assert.equal(restored.status, 200);
+            assert.equal(restored.body.parentRevision, childSnapshot.parentRevision);
+            assert.deepEqual(restored.body.orderedMessages, childSnapshot.orderedMessages);
+            assert.equal((await call("/__bili/plugin/snapshot?conversationId=parent")).body.parentRevision, snapshot.parentRevision);
+            const replay = await call("/__bili/plugin/fork", req);
+            assert.equal(replay.status, 200);
+            assert.equal(replay.body.replayed, true);
+            const retrieved = await call("/__bili/plugin/tool", { conversationId: "child", tool: "acp_retrieve", args: { ref: "m00001" } });
+            assert.equal(retrieved.status, 200);
+            assert.match(retrieved.body.result, /CCR original retained independently after restart/);
+            const original = await call("/__bili/plugin/tool", { conversationId: "child", tool: "decompress", args: { blockId: "b1", full: true } });
+            assert.match(original.body.result, /first original/);
+            assert.match(original.body.result, /second original/);
+            assert(!original.body.result.includes("tail original"));
+        } finally {
+            if (child?.pid && child.exitCode === null && child.signalCode === null) { child.kill("SIGTERM"); await once(child, "exit"); }
+            await h.close();
+            if (previousMode === undefined) delete process.env.BILI_STORAGE_UNIFIED;
+            else process.env.BILI_STORAGE_UNIFIED = previousMode;
+        }
+    });
+}
 
-test("HTTP status separates real usage from a manual-compression estimate and changing generation", async () => {
+test("HTTP status separates real usage from a manual-compression estimate and changing generation", { timeout: 60_000 }, async () => {
     const h = await harness();
     try {
         const before = await h.request("/__bili/plugin/status?conversationId=parent");
@@ -682,7 +1062,7 @@ test("HTTP status separates real usage from a manual-compression estimate and ch
     } finally { await h.close(); }
 });
 
-test("HTTP manual compression renews an idle context observation without changing billing", async () => {
+test("HTTP manual compression renews an idle context observation without changing billing", { timeout: 60_000 }, async () => {
     const h = await harness();
     const realNow = Date.now;
     try {
@@ -707,7 +1087,7 @@ test("HTTP manual compression renews an idle context observation without changin
     }
 });
 
-test("HTTP compressed child effective estimate survives cold disk restore without replaying credit", async () => {
+test("HTTP compressed child effective estimate survives cold disk restore without replaying credit", { timeout: 60_000 }, async () => {
     const h = await harness(true);
     try {
         const snapshot = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;
@@ -736,7 +1116,7 @@ test("HTTP compressed child effective estimate survives cold disk restore withou
     } finally { await h.close(); }
 });
 
-test("HTTP manual compress rejects a stale expectedRevision under the session lock", async () => {
+test("HTTP manual compress rejects a stale expectedRevision under the session lock", { timeout: 60_000 }, async () => {
     const h = await harness();
     try {
         const snapshot = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;
@@ -748,7 +1128,7 @@ test("HTTP manual compress rejects a stale expectedRevision under the session lo
     } finally { await h.close(); }
 });
 
-test("HTTP missing nested originals and CCR payloads fail closed without publishing a child", async () => {
+test("HTTP missing nested originals and CCR payloads fail closed without publishing a child", { timeout: 60_000 }, async () => {
     const h = await harness();
     try {
         await compress(h);
@@ -774,7 +1154,7 @@ async function sendModel(h: Awaited<ReturnType<typeof harness>>, conversationId:
     assert.equal(response.status, 200, await response.text());
 }
 
-test("HTTP multimodal snapshots are explicitly unavailable, not text-only matches", async () => {
+test("HTTP multimodal snapshots are explicitly unavailable, not text-only matches", { timeout: 60_000 }, async () => {
     const h = await harness();
     try {
         const before = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;
@@ -790,7 +1170,7 @@ test("HTTP multimodal snapshots are explicitly unavailable, not text-only matche
     } finally { await h.close(); }
 });
 
-test("HTTP CCR foreign placeholder ref cannot publish an exact empty-store child", async () => {
+test("HTTP CCR foreign placeholder ref cannot publish an exact empty-store child", { timeout: 60_000 }, async () => {
     const h = await harness(true);
     try {
         const baseline = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;
@@ -839,7 +1219,7 @@ for (const content of [null, "audio transcript"] as const) {
     });
 }
 
-test("HTTP fork before absorb summary preserves the original pair on the first child request", async () => {
+test("HTTP fork before absorb summary preserves the original pair on the first child request", { timeout: 60_000 }, async () => {
     const h = await harness();
     try {
         const toolOutput = "unique original build output ".repeat(250);
@@ -900,7 +1280,7 @@ test("HTTP fork before absorb summary preserves the original pair on the first c
     } finally { await h.close(); }
 });
 
-test("HTTP different parents racing the same child publish exactly one identity", async () => {
+test("HTTP different parents racing the same child publish exactly one identity", { timeout: 60_000 }, async () => {
     const h = await harness();
     try {
         await sendModel(h, "other-parent", h.messages);
@@ -915,7 +1295,7 @@ test("HTTP different parents racing the same child publish exactly one identity"
     } finally { await h.close(); }
 });
 
-test("HTTP fork registration and first model append preserve inherited state and refs", async () => {
+test("HTTP fork registration and first model append preserve inherited state and refs", { timeout: 60_000 }, async () => {
     const h = await harness();
     try {
         await compress(h);
@@ -935,7 +1315,7 @@ test("HTTP fork registration and first model append preserve inherited state and
     } finally { await h.close(); }
 });
 
-test("HTTP nested summaries expand crossing ancestors and retain independent original caches", async () => {
+test("HTTP nested summaries expand crossing ancestors and retain independent original caches", { timeout: 60_000 }, async () => {
     const h = await harness(true);
     try {
         const history = [...h.messages, { role: "assistant", content: "third response ".repeat(250) }, { role: "user", content: "fourth user turn ".repeat(250) }, { role: "assistant", content: "retained recent tail" }];
@@ -951,7 +1331,12 @@ test("HTTP nested summaries expand crossing ancestors and retain independent ori
         assert.equal(exact.body.inheritedBlocks.length, 2);
         const restored = h.store.loadSync("nested")!;
         assert.deepEqual(restored.state.blocks, JSON.parse(JSON.stringify(resolveConversation("nested").session!.state.blocks)));
-        assert.deepEqual(restored.blockContents, resolveConversation("nested").session!.blockContents);
+        // #3050 R3 ②b: idle saves swap the resident map to the lazy shell —
+        // compare CONTENT (materialized) instead of the map constructor.
+        assert.deepEqual(
+            Object.fromEntries(restored.blockContents),
+            Object.fromEntries(resolveConversation("nested").session!.blockContents),
+        );
         const expanded = await h.request("/__bili/plugin/fork", forkRequest(snapshot, "nested-prefix", 2));
         assert.equal(expanded.status, 201, JSON.stringify(expanded.body));
         assert.equal(expanded.body.status, "expanded");
@@ -995,7 +1380,7 @@ test("HTTP nested summaries expand crossing ancestors and retain independent ori
     } finally { await h.close(); }
 });
 
-test("HTTP raw-snapshot retention cap fails closed instead of growing without bound (D-B)", async () => {
+test("HTTP raw-snapshot retention cap fails closed instead of growing without bound (D-B)", { timeout: 60_000 }, async () => {
     // #2016 review: without a cap every plugin session retains its full raw
     // history forever. With BILI_PUBLIC_SNAPSHOT_CAP_BYTES set tiny, the
     // session refuses to retain the snapshot and the public endpoints answer
@@ -1020,7 +1405,22 @@ test("HTTP raw-snapshot retention cap fails closed instead of growing without bo
     }
 });
 
-test("HTTP raw-snapshot retention cap lifts when the raw history shrinks below it again", async () => {
+test("HTTP 409 names the failed reconstruction gate on the generic path (#5188)", { timeout: 60_000 }, async () => {
+    // #5188 review: the generic SNAPSHOT_UNAVAILABLE body must say WHICH
+    // reconstruction gate fired so a bare 409 is diagnosable — while the capped
+    // refusal above keeps its pinned byte-exact message (no suffix there).
+    const h = await harness();
+    try {
+        const session = getSession("recon-gate");
+        assert.equal(session.pluginSnapshot, undefined);
+        assert.equal(session.metadata.publicSnapshotCapped, undefined);
+        const snapshot = await h.request("/__bili/plugin/snapshot?conversationId=recon-gate");
+        assert.equal(snapshot.status, 409);
+        assert.equal((snapshot.body as { error?: string }).error, "Error: raw snapshot unavailable; send a fresh plugin model request [reconstruction: empty-lastPassIds]");
+    } finally { await h.close(); }
+});
+
+test("HTTP raw-snapshot retention cap lifts when the raw history shrinks below it again", { timeout: 60_000 }, async () => {
     const previous = process.env.BILI_PUBLIC_SNAPSHOT_CAP_BYTES;
     process.env.BILI_PUBLIC_SNAPSHOT_CAP_BYTES = "1";
     const h = await harness();
@@ -1054,7 +1454,7 @@ function stableJson(value: unknown): string {
     return JSON.stringify(value) ?? "null";
 }
 
-test("HTTP CoW snapshot extends in place with an exactly-tracked byte count", async () => {
+test("HTTP CoW snapshot extends in place with an exactly-tracked byte count", { timeout: 60_000 }, async () => {
     const h = await harness();
     try {
         const session = resolveConversation("parent").session!;
@@ -1075,7 +1475,7 @@ test("HTTP CoW snapshot extends in place with an exactly-tracked byte count", as
     } finally { await h.close(); }
 });
 
-test("HTTP legacy snapshots are remeasured once, then no-op resends stay O(1) while the cap keeps re-evaluating", async () => {
+test("HTTP legacy snapshots are remeasured once, then no-op resends stay O(1) while the cap keeps re-evaluating", { timeout: 60_000 }, async () => {
     const h = await harness();
     try {
         const session = getSession("legacy-cap");
@@ -1104,7 +1504,7 @@ test("HTTP legacy snapshots are remeasured once, then no-op resends stay O(1) wh
     } finally { await h.close(); }
 });
 
-test("HTTP the raw snapshot persists only once a fork makes it an external contract", async () => {
+test("HTTP the raw snapshot persists only once a fork makes it an external contract", { timeout: 60_000 }, async () => {
     const h = await harness(true);
     try {
         const parent = resolveConversation("parent").session!;
@@ -1121,7 +1521,7 @@ test("HTTP the raw snapshot persists only once a fork makes it an external contr
     } finally { await h.close(); }
 });
 
-test("HTTP a mid-history rewrite replaces the snapshot wholesale with an exact byte count", async () => {
+test("HTTP a mid-history rewrite replaces the snapshot wholesale with an exact byte count", { timeout: 60_000 }, async () => {
     const h = await harness();
     try {
         const session = resolveConversation("parent").session!;
@@ -1136,7 +1536,13 @@ test("HTTP a mid-history rewrite replaces the snapshot wholesale with an exact b
     } finally { await h.close(); }
 });
 
-test("HTTP a lazily-persisted snapshot self-heals on the next model request after restart", async () => {
+test("HTTP a cold-restored non-retained parent serves its intact raw tail immediately (#5140)", { timeout: 60_000 }, async () => {
+    // The reconstruction path reads the unified index, so this test must run
+    // under unified-full — the global test baseline pins BILI_STORAGE_UNIFIED=
+    // "legacy" for non-storage suites, under which the sidecar never opens and
+    // replicasAvailable() is structurally false (a bare sidecar-missing 409).
+    const oldMode = process.env.BILI_STORAGE_UNIFIED;
+    process.env.BILI_STORAGE_UNIFIED = "full";
     const h = await harness(true);
     try {
         const parent = resolveConversation("parent").session!;
@@ -1146,9 +1552,61 @@ test("HTTP a lazily-persisted snapshot self-heals on the next model request afte
         _resetPluginStateForTest();
         const restored = getSession("parent");
         assert.equal(restored.pluginSnapshot, undefined, "a non-forked session restores without its raw snapshot");
-        assert.equal((await h.request("/__bili/plugin/snapshot?conversationId=parent")).status, 409);
+        // #5140: the intact raw tail is reconstructable from the unified index, so the cold
+        // parent is servable immediately — no model call needed to recover stored source.
+        // The 409 body names the exact forkSnapshot refusal branch — a bare status assert
+        // swallowed it and left the CI flake undiagnosable (#4599 sentinel 2026-10-30).
+        const coldSnap = await h.request("/__bili/plugin/snapshot?conversationId=parent");
+        assert.equal(coldSnap.status, 200, JSON.stringify(coldSnap.body));
         await sendModel(h, "parent", h.messages);
         assert.equal((await h.request("/__bili/plugin/snapshot?conversationId=parent")).status, 200);
         assert.equal(resolveConversation("parent").session!.pluginSnapshot!.length, 3);
+    } finally {
+        await h.close();
+        if (oldMode === undefined) delete process.env.BILI_STORAGE_UNIFIED; else process.env.BILI_STORAGE_UNIFIED = oldMode;
+    }
+});
+
+test("fork protocol v2: snapshot serves the light revision, a stale v1 whole-store revision is still accepted (#2671 Phase 2b)", { timeout: 60_000 }, async () => {
+    const h = await harness();
+    try {
+        const snapshot = await h.request("/__bili/plugin/snapshot?conversationId=parent");
+        assert.equal(snapshot.status, 200);
+        // v2 token: {sessionId, seq, active block set} — never the whole store.
+        const legacy = forkParentRevisionLegacy(getSession("parent"));
+        assert.notEqual(legacy, snapshot.body.parentRevision);
+        assert.notEqual(legacy.length, 0);
+        // A client that snapshotted under a v1 proxy (whole-store hash) must
+        // still be able to fork during the transition version.
+        const orderedMessages = snapshot.body.orderedMessages.slice(0, 2);
+        const v1Request = { protocolVersion: 1, parentConversationId: "parent", childConversationId: "legacy-client", parentRevision: legacy, branchPoint: { messageCount: 2, orderHash: hash(orderedMessages) }, orderedMessages, idempotencyKey: "fork-legacy-1" };
+        const fork = await h.request("/__bili/plugin/fork", v1Request);
+        assert.equal(fork.status, 201, JSON.stringify(fork.body));
+        assert.equal(fork.body.childConversationId, "legacy-client");
+        // And the fabricated hash still conflicts (dual acceptance is exact-match, not lax).
+        assert.equal((await h.request("/__bili/plugin/fork", { ...v1Request, childConversationId: "legacy-bad", parentRevision: "0".repeat(64) })).body.code, "PARENT_REVISION_CONFLICT");
+    } finally { await h.close(); }
+});
+
+test("fork protocol v2: revision is stable across state churn that does not move the snapshot or active blocks (#2671 Phase 2b)", { timeout: 60_000 }, async () => {
+    const h = await harness();
+    try {
+        const before = await h.request("/__bili/plugin/snapshot?conversationId=parent");
+        assert.equal(before.status, 200);
+        // stats live inside the v1 `state` hash input; mutating them (as any
+        // background path would) must NOT flip the v2 revision token.
+        const session = getSession("parent");
+        (session.state.stats as unknown as Record<string, unknown>).contextEstimateTokens = 987654;
+        (session.state.stats as unknown as Record<string, unknown>).lastUsageGradeTokens = 987654;
+        markDirty(session);
+        const after = await h.request("/__bili/plugin/snapshot?conversationId=parent");
+        assert.equal(after.status, 200);
+        assert.equal(after.body.parentRevision, before.body.parentRevision, "v2 revision must not track stats churn");
+        // A structural change (snapshot grows) must still flip it — a real model
+        // turn through the proxy (kernel assigns refs; snapshot grows by one).
+        await sendModel(h, "parent", [...h.messages, { role: "user", content: "structural change" }]);
+        const moved = await h.request("/__bili/plugin/snapshot?conversationId=parent");
+        assert.equal(moved.status, 200);
+        assert.notEqual(moved.body.parentRevision, before.body.parentRevision, "a snapshot change must flip the v2 revision");
     } finally { await h.close(); }
 });

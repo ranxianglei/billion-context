@@ -24,7 +24,7 @@ function mkdtemp(prefix: string): string {
 }
 
 function cleanup(...dirs: string[]): void {
-    for (const d of dirs) fs.rmSync(d, { recursive: true, force: true });
+    for (const d of dirs) fs.rmSync(d, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 }
 
 /** A live foreign process whose pid can be planted as the overlay owner. */

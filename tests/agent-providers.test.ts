@@ -4,17 +4,17 @@
 // never crosses GET), the inline-key rail (settings reject apiKey from the
 // file world, the executor honors it), and the PUT validation merge (a
 // chain may reference agent providers without duplicating them in the file).
-import test from "node:test";
+import { after, test } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { defaultConfig, type Config, type CoreMessage } from "acp-kernel";
 import { startServer } from "../src/server.ts";
 import { applyConfiguredCompression } from "../src/external-summary-compress.ts";
-import { parseAgentProviderReport, recordAgentProviders, agentProviderRecipes, agentRegistryStatus } from "../src/agent-providers.ts";
+import { parseAgentProviderReport, recordAgentProviders, agentProviderRecipes, agentRegistryStatus, sanitizeAgentProviderField } from "../src/agent-providers.ts";
 import { reportAgentProviders, type Ctx } from "../src/agent/pi.ts";
 import { parseExternalSummarySettings } from "../src/external-summary-settings.ts";
 import { createCore } from "acp-kernel";
@@ -26,6 +26,18 @@ import { rmrf } from "./tmp-rm.ts";
 
 process.env.NODE_ENV = "test";
 
+// #2831: agent-provider skip diagnostics now land in the shared bili.log
+// instead of the terminal the live TUI renders over — hermetic redirect.
+const STATE_ROOT = mkdtempSync(path.join(tmpdir(), "bili-agent-providers-state-"));
+const PREV_XDG_STATE_HOME = process.env.XDG_STATE_HOME;
+process.env.XDG_STATE_HOME = STATE_ROOT;
+const PROVIDERS_LOG_FILE = path.join(STATE_ROOT, "billion-context", "bili.log");
+after(() => {
+    if (PREV_XDG_STATE_HOME === undefined) delete process.env.XDG_STATE_HOME;
+    else process.env.XDG_STATE_HOME = PREV_XDG_STATE_HOME;
+    rmrf(STATE_ROOT);
+});
+
 const VALID_REPORT = {
     agent: "pi",
     providers: {
@@ -35,43 +47,64 @@ const VALID_REPORT = {
 };
 
 test("#2336 parseAgentProviderReport accepts and normalizes a valid report", () => {
-    const { agent, providers } = parseAgentProviderReport(VALID_REPORT);
+    const { agent, registered, skipped } = parseAgentProviderReport(VALID_REPORT);
     assert.equal(agent, "pi");
-    assert.deepEqual(Object.keys(providers).sort(), ["claude", "zhipu"]);
-    assert.equal(providers.zhipu.baseUrl, "https://open.bigmodel.cn/api/paas/v4", "trailing slash trimmed");
-    assert.equal(providers.zhipu.api, "openai");
-    assert.equal(providers.zhipu.models["glm-5-air"].contextWindow, undefined, "absent knobs stay absent");
+    assert.deepEqual(Object.keys(registered).sort(), ["claude", "zhipu"]);
+    assert.deepEqual(skipped, []);
+    assert.equal(registered.zhipu.baseUrl, "https://open.bigmodel.cn/api/paas/v4", "trailing slash trimmed");
+    assert.equal(registered.zhipu.api, "openai");
+    assert.equal(registered.zhipu.models["glm-5-air"].contextWindow, undefined, "absent knobs stay absent");
+});
+
+test("#2585 sanitizeAgentProviderField bounds and flattens log/response fields", () => {
+    assert.equal(sanitizeAgentProviderField(`a${String.fromCharCode(10)}b${String.fromCharCode(13)}c${String.fromCharCode(0)}d`, 10), "a?b?c?d");
+    assert.equal(sanitizeAgentProviderField("x".repeat(300), 200).length, 200);
 });
 
 test("#2336 parseAgentProviderReport rejects malformed payloads", () => {
-    const rejects: Array<[string, unknown]> = [
+    // top-level envelope violations still throw — nothing could be attributed without them
+    const topLevel: Array<[string, unknown]> = [
         ["not an object", "nope"],
         ["missing agent", { providers: { a: VALID_REPORT.providers.zhipu } }],
         ["bad agent name", { agent: "-leading-dash", providers: { a: VALID_REPORT.providers.zhipu } }],
         ["missing providers", { agent: "pi" }],
         ["empty providers", { agent: "pi", providers: {} }],
-        ["bad provider name", { agent: "pi", providers: { "no/slash": VALID_REPORT.providers.zhipu } }],
-        ["missing baseUrl", { agent: "pi", providers: { a: { api: "openai", apiKey: "k", models: { m: {} } } } }],
-        ["remote http baseUrl", { agent: "pi", providers: { a: { baseUrl: "http://example.com", api: "openai", apiKey: "k", models: { m: {} } } } }],
-        ["bili recursion baseUrl", { agent: "pi", providers: { a: { baseUrl: "https://h/__bili/x", api: "openai", apiKey: "k", models: { m: {} } } } }],
-        ["bad api enum", { agent: "pi", providers: { a: { baseUrl: "https://h", api: "grpc", apiKey: "k", models: { m: {} } } } }],
-        ["empty apiKey", { agent: "pi", providers: { a: { baseUrl: "https://h", api: "openai", apiKey: "", models: { m: {} } } } }],
-        ["control chars in apiKey", { agent: "pi", providers: { a: { baseUrl: "https://h", api: "openai", apiKey: "bad\nkey", models: { m: {} } } } }],
-        ["empty models", { agent: "pi", providers: { a: { baseUrl: "https://h", api: "openai", apiKey: "k", models: {} } } }],
-        ["bad contextWindow", { agent: "pi", providers: { a: { baseUrl: "https://h", api: "openai", apiKey: "k", models: { m: { contextWindow: 10 } } } } }],
-        ["bad outputTokens", { agent: "pi", providers: { a: { baseUrl: "https://h", api: "openai", apiKey: "k", models: { m: { outputTokens: 1 } } } } }],
-        ["bad stream flag", { agent: "pi", providers: { a: { baseUrl: "https://h", api: "openai", apiKey: "k", models: { m: { stream: "yes" } } } } }],
     ];
-    for (const [label, payload] of rejects) {
+    for (const [label, payload] of topLevel) {
         assert.throws(() => parseAgentProviderReport(payload), /.*/, label);
+    }
+    // #2585: entry-level failures are collected, never fatal — the valid sibling
+    // still registers and the refusal names the offending entry
+    const entryFails: Array<[string, Record<string, unknown>, RegExp]> = [
+        ["bad provider name", { "no/slash": VALID_REPORT.providers.zhipu }, /Invalid provider name "no\/slash"/],
+        ["non-object entry", { a: "nope" }, /must be an object/],
+        ["missing baseUrl", { a: { api: "openai", apiKey: "k", models: { m: {} } } }, /needs a baseUrl/],
+        ["remote http baseUrl", { a: { baseUrl: "http://example.com", api: "openai", apiKey: "k", models: { m: {} } } }, /must be HTTPS \(or loopback HTTP\)/],
+        ["tailscale-style http baseUrl", { a: { baseUrl: "http://100.64.0.1:11434/v1", api: "openai", apiKey: "k", models: { m: {} } } }, /must be HTTPS \(or loopback HTTP\)/],
+        ["bili recursion baseUrl", { a: { baseUrl: "https://h/__bili/x", api: "openai", apiKey: "k", models: { m: {} } } }, /must be HTTPS \(or loopback HTTP\)/],
+        ["bad api enum", { a: { baseUrl: "https://h", api: "grpc", apiKey: "k", models: { m: {} } } }, /api must be one of/],
+        ["empty apiKey", { a: { baseUrl: "https://h", api: "openai", apiKey: "", models: { m: {} } } }, /needs an apiKey/],
+        ["control chars in apiKey", { a: { baseUrl: "https://h", api: "openai", apiKey: `bad${String.fromCharCode(10)}key`, models: { m: {} } } }, /needs an apiKey/],
+        ["empty models", { a: { baseUrl: "https://h", api: "openai", apiKey: "k", models: {} } }, /needs 1 to 64 models/],
+        ["bad contextWindow", { a: { baseUrl: "https://h", api: "openai", apiKey: "k", models: { m: { contextWindow: 10 } } } }, /invalid contextWindow/],
+        ["bad outputTokens", { a: { baseUrl: "https://h", api: "openai", apiKey: "k", models: { m: { outputTokens: 1 } } } }, /invalid outputTokens/],
+        ["bad stream flag", { a: { baseUrl: "https://h", api: "openai", apiKey: "k", models: { m: { stream: "yes" } } } }, /invalid stream flag/],
+    ];
+    for (const [label, bad, re] of entryFails) {
+        const r = parseAgentProviderReport({ agent: "pi", providers: { ...bad, zhipu: VALID_REPORT.providers.zhipu } });
+        assert.deepEqual(Object.keys(r.registered), ["zhipu"], `sibling survives: ${label}`);
+        assert.equal(r.skipped.length, 1, label);
+        assert.equal(r.skipped[0].name, Object.keys(bad)[0], label);
+        assert.match(r.skipped[0].reason, re, label);
+        assert.ok(!r.skipped[0].reason.includes(String.fromCharCode(10)), `single-line reason: ${label}`);
     }
     // loopback http stays allowed (local summary servers)
     const local = parseAgentProviderReport({ agent: "pi", providers: { a: { baseUrl: "http://127.0.0.1:9000", api: "openai", apiKey: "k", models: { m: {} } } } });
-    assert.equal(local.providers.a.baseUrl, "http://127.0.0.1:9000");
+    assert.equal(local.registered.a.baseUrl, "http://127.0.0.1:9000");
 });
 
 test("#2336 registry: record/merge/status never leak keys or baseUrl", () => {
-    recordAgentProviders("pi", parseAgentProviderReport(VALID_REPORT).providers);
+    recordAgentProviders("pi", parseAgentProviderReport(VALID_REPORT).registered);
     assert.deepEqual(Object.keys(agentProviderRecipes()).sort(), ["claude", "zhipu"]);
     const status = JSON.stringify(agentRegistryStatus());
     assert.ok(status.includes("zhipu") && status.includes("glm-5"), "names and models exposed for the panel");
@@ -142,13 +175,14 @@ test("#2336 endpoint + web GET/PUT contract through a real server", async () => 
     await once(server, "listening");
     const port = (server.address() as import("node:net").AddressInfo).port;
     try {
-        // intake: valid report accepted, malformed rejected
+        // intake: valid report accepted
         let r = await request(port, "POST", "/__bili/agent-providers", VALID_REPORT);
         assert.equal(r.status, 200);
-        assert.equal(JSON.parse(r.body).ok, true);
+        let intake = JSON.parse(r.body) as { ok: boolean; registered: string[]; skipped: Array<{ name: string; reason: string }> };
+        assert.equal(intake.ok, true);
+        assert.deepEqual(intake.registered.sort(), ["claude", "zhipu"]);
+        assert.deepEqual(intake.skipped, []);
         assert.ok(!r.body.includes("agent-resolved-key"), "response carries names only");
-        r = await request(port, "POST", "/__bili/agent-providers", { agent: "pi", providers: { a: { baseUrl: "https://h", api: "grpc", apiKey: "k", models: { m: {} } } } });
-        assert.equal(r.status, 400);
 
         // GET exposes the registry layer without any secret material
         r = await request(port, "GET", "/__bili/config");
@@ -170,6 +204,39 @@ test("#2336 endpoint + web GET/PUT contract through a real server", async () => 
 
         // PUT: unknown provider still rejected
         r = await request(port, "PUT", "/__bili/config", { compress: { externalSummary: { enabled: true, targets: ["nobody/model"] } } });
+        assert.equal(r.status, 400);
+
+        // #2585: one bad entry costs only itself — the valid sibling registers
+        // and the refusal is named in the response (old behavior: 400 for the
+        // whole report, nothing registered, silent on both sides)
+        r = await request(port, "POST", "/__bili/agent-providers", {
+            agent: "pi",
+            providers: {
+                zhipu: VALID_REPORT.providers.zhipu,
+                "tailscale-ollama": { baseUrl: "http://100.64.0.1:11434/v1", api: "openai", apiKey: "k", models: { "ollama-m": {} } },
+            },
+        });
+        assert.equal(r.status, 200, `mixed report partial-accepted: ${r.body}`);
+        intake = JSON.parse(r.body) as typeof intake;
+        assert.deepEqual(intake.registered, ["zhipu"]);
+        assert.equal(intake.skipped.length, 1);
+        assert.equal(intake.skipped[0].name, "tailscale-ollama");
+        assert.match(intake.skipped[0].reason, /must be HTTPS \(or loopback HTTP\)/);
+        r = await request(port, "GET", "/__bili/config");
+        assert.deepEqual((JSON.parse(r.body) as { agentProviders?: Array<{ agent: string; providers: Array<{ name: string; models: string[] }> }> }).agentProviders, [{ agent: "pi", providers: [{ name: "zhipu", models: ["glm-5", "glm-5-air"] }] }], "only the registered entry lands");
+
+        // all-invalid report: 200 with nothing registered (clears the layer), every entry named
+        r = await request(port, "POST", "/__bili/agent-providers", { agent: "pi", providers: { a: { baseUrl: "https://h", api: "grpc", apiKey: "k", models: { m: {} } } } });
+        assert.equal(r.status, 200, `all-invalid report answers 200-partial: ${r.body}`);
+        intake = JSON.parse(r.body) as typeof intake;
+        assert.deepEqual(intake.registered, []);
+        assert.equal(intake.skipped.length, 1);
+        assert.match(intake.skipped[0].reason, /api must be one of/);
+        r = await request(port, "GET", "/__bili/config");
+        assert.deepEqual((JSON.parse(r.body) as { agentProviders?: unknown }).agentProviders, [], "zero registered clears the agent layer");
+
+        // top-level envelope violations still hard-reject
+        r = await request(port, "POST", "/__bili/agent-providers", { providers: { a: VALID_REPORT.providers.zhipu } });
         assert.equal(r.status, 400);
     } finally {
         process.env.BILI_CONFIG_FILE = prevConfig === undefined ? "" : prevConfig;
@@ -224,11 +291,18 @@ test("#2336 inline apiKey target dials with the inline key (no store)", async ()
     }
 });
 
-test("#2336 pi reportAgentProviders: sanitized table, skip rules, POST shape", async () => {
+test("#2336/#2585 pi reportAgentProviders: sanitized table, skip rules, POST shape", async () => {
     const realFetch = globalThis.fetch;
     const prevProxy = process.env.BILLION_CONTEXT_PROXY;
     process.env.BILLION_CONTEXT_PROXY = "http://127.0.0.1:8787";
     const calls: Array<{ url: string; body: unknown }> = [];
+    const termLines: string[] = [];
+    const realWarn = console.warn, realError = console.error, realLog = console.log;
+    const sink = (...args: unknown[]) => { termLines.push(args.map(String).join(" ")); };
+    console.warn = sink;
+    console.error = sink;
+    console.log = sink;
+    const logBefore = existsSync(PROVIDERS_LOG_FILE) ? readFileSync(PROVIDERS_LOG_FILE, "utf8") : "";
     globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
         calls.push({ url: String(input), body: JSON.parse(String(init?.body)) });
         return new Response(JSON.stringify({ ok: true }), { status: 200 });
@@ -247,6 +321,9 @@ test("#2336 pi reportAgentProviders: sanitized table, skip rules, POST shape", a
         { id: "m6", provider: "oauthp", api: "openai-completions" }, // oauth -> skip
         { id: "m7", provider: "selfloop", api: "openai-completions" }, // baseUrl points at bili -> skip
         { id: "m8", provider: "nokey", api: "openai-completions" }, // key resolution empty -> skip
+        { id: "m9", provider: "plainhttp", api: "openai-completions" }, // plain-HTTP non-loopback -> pre-skip (#2585)
+        { id: "m10", provider: "codexp", api: "openai-codex-responses" }, // responses-family mapping pin (#2590)
+        { id: "m11", provider: "azurep", api: "azure-openai-responses" }, // responses-family mapping pin (#2590)
     ];
     const ctx = {
         model: { baseUrl: "http://127.0.0.1:8787", api: "not-virtual" },
@@ -260,6 +337,9 @@ test("#2336 pi reportAgentProviders: sanitized table, skip rules, POST shape", a
                 oauthp: { baseUrl: "https://b.example", auth: { oauth: { kind: "oauth" } } },
                 selfloop: { baseUrl: "http://127.0.0.1:8787" },
                 nokey: { baseUrl: "https://c.example" },
+                plainhttp: { baseUrl: "http://100.64.0.1:11434/v1" },
+                codexp: { baseUrl: "https://d.example" },
+                azurep: { baseUrl: "https://e.example" },
             })[p],
             getProviderAuthStatus: (p: string) => ({
                 zhipu: { configured: true, source: "environment" },
@@ -269,6 +349,9 @@ test("#2336 pi reportAgentProviders: sanitized table, skip rules, POST shape", a
                 oauthp: { configured: true, source: "environment" },
                 selfloop: { configured: true, source: "environment" },
                 nokey: { configured: false },
+                plainhttp: { configured: true, source: "environment" },
+                codexp: { configured: true, source: "environment" },
+                azurep: { configured: true, source: "environment" },
             })[p],
             getApiKeyForProvider: async (p: string) => (p === "nokey" ? undefined : `key-${p}`),
         },
@@ -280,14 +363,68 @@ test("#2336 pi reportAgentProviders: sanitized table, skip rules, POST shape", a
         assert.equal(calls[0].url, "http://127.0.0.1:8787/__bili/agent-providers");
         const body = calls[0].body as { agent: string; providers: Record<string, { baseUrl: string; api: string; apiKey: string; models: Record<string, { contextWindow?: number; outputTokens?: number }> }> };
         assert.equal(body.agent, "pi");
-        assert.deepEqual(Object.keys(body.providers).sort(), ["claude", "openai", "zhipu"], "skip rules applied");
+        assert.deepEqual(Object.keys(body.providers).sort(), ["azurep", "claude", "codexp", "openai", "zhipu"], "skip rules applied");
         assert.deepEqual(body.providers.zhipu.models, { "glm-5": { contextWindow: 200_000, outputTokens: 8192 }, "glm-5-air": {} });
         assert.equal(body.providers.zhipu.apiKey, "key-zhipu");
         assert.equal(body.providers.openai.api, "responses", "responses-family api mapping");
+        assert.equal(body.providers.codexp.api, "responses", "codex-responses-family api mapping");
+        assert.equal(body.providers.azurep.api, "responses", "azure-responses-family api mapping");
+        // #2585/#2831: the plain-HTTP non-loopback provider is pre-skipped and named
+        // locally — in bili.log now, nothing carrying it reaches the terminal surface
+        const logLines = (existsSync(PROVIDERS_LOG_FILE) ? readFileSync(PROVIDERS_LOG_FILE, "utf8") : "").slice(logBefore.length).split("\n").filter((l) => l.length > 0);
+        assert.ok(logLines.some((l) => l.includes('provider "plainhttp" not reported') && l.includes("plain-HTTP non-loopback")), "pre-skip named locally");
+        assert.equal(termLines.filter((l) => l.includes('provider "plainhttp" not reported')).length, 0, "#2831: must not reach the terminal surface");
         // the report is accepted by the core parser as-is (client/server contract)
         const parsed = parseAgentProviderReport(body);
-        assert.deepEqual(Object.keys(parsed.providers).sort(), ["claude", "openai", "zhipu"]);
+        assert.deepEqual(Object.keys(parsed.registered).sort(), ["azurep", "claude", "codexp", "openai", "zhipu"]);
     } finally {
+        console.warn = realWarn;
+        console.error = realError;
+        console.log = realLog;
+        globalThis.fetch = realFetch;
+        if (prevProxy === undefined) delete process.env.BILLION_CONTEXT_PROXY;
+        else process.env.BILLION_CONTEXT_PROXY = prevProxy;
+    }
+});
+
+test("#2585 pi reportAgentProviders surfaces server refusal details and per-entry skips", async () => {
+    const realFetch = globalThis.fetch;
+    const prevProxy = process.env.BILLION_CONTEXT_PROXY;
+    process.env.BILLION_CONTEXT_PROXY = "http://127.0.0.1:8787";
+    const termLines: string[] = [];
+    const realWarn = console.warn, realError = console.error, realLog = console.log;
+    const sink = (...args: unknown[]) => { termLines.push(args.map(String).join(" ")); };
+    console.warn = sink;
+    console.error = sink;
+    console.log = sink;
+    const logBefore = existsSync(PROVIDERS_LOG_FILE) ? readFileSync(PROVIDERS_LOG_FILE, "utf8") : "";
+    const ctx = {
+        model: { baseUrl: "http://127.0.0.1:8787", api: "not-virtual" },
+        modelRegistry: {
+            getAll: () => [{ id: "glm-5", provider: "zhipu", api: "openai-completions" }],
+            getProvider: () => ({ baseUrl: "https://open.bigmodel.cn/api/paas/v4" }),
+            getProviderAuthStatus: () => ({ configured: true, source: "environment" }),
+            getApiKeyForProvider: async () => "key-zhipu",
+        },
+    } as unknown as Ctx;
+    try {
+        // 400 with a body naming the entry -> the reason rides into the thrown error
+        globalThis.fetch = (async () => new Response(JSON.stringify({ ok: false, error: 'Provider "tailscale-ollama" baseUrl must be HTTPS (or loopback HTTP) without credentials or proxy recursion' }), { status: 400 })) as typeof fetch;
+        await assert.rejects(reportAgentProviders(ctx, "pi"), /HTTP 400: Provider "tailscale-ollama" baseUrl must be HTTPS/);
+        // 200 with skipped entries -> local warns name them
+        globalThis.fetch = (async () => new Response(JSON.stringify({ ok: true, registered: ["zhipu"], skipped: [{ name: "tailscale-ollama", reason: 'Provider "tailscale-ollama" baseUrl must be HTTPS (or loopback HTTP) without credentials or proxy recursion' }] }), { status: 200 })) as typeof fetch;
+        assert.equal(await reportAgentProviders(ctx, "pi"), true);
+        // #2831: the server-side skip is named locally in bili.log, terminal stays clean
+        const logLines = (existsSync(PROVIDERS_LOG_FILE) ? readFileSync(PROVIDERS_LOG_FILE, "utf8") : "").slice(logBefore.length).split("\n").filter((l) => l.length > 0);
+        assert.ok(logLines.some((l) => l.includes('provider "tailscale-ollama" not registered by bili') && l.includes("stay unresolved")), "server-side skip named locally");
+        assert.equal(termLines.filter((l) => l.includes("not registered by bili")).length, 0, "#2831: must not reach the terminal surface");
+        // pre-fix server body shape (no skipped field) still fine
+        globalThis.fetch = (async () => new Response(JSON.stringify({ ok: true }), { status: 200 })) as typeof fetch;
+        assert.equal(await reportAgentProviders(ctx, "pi"), true);
+    } finally {
+        console.warn = realWarn;
+        console.error = realError;
+        console.log = realLog;
         globalThis.fetch = realFetch;
         if (prevProxy === undefined) delete process.env.BILLION_CONTEXT_PROXY;
         else process.env.BILLION_CONTEXT_PROXY = prevProxy;

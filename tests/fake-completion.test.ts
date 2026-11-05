@@ -220,8 +220,10 @@ function startHarness(scripts: string[][], extra?: Partial<ProxyOptions>): Promi
             captured,
             close: async () => {
                 proxy.close();
+                proxy.closeIdleConnections?.();
                 await once(proxy, "close");
                 upstream.close();
+                upstream.closeIdleConnections?.();
                 await once(upstream, "close");
             },
         };
@@ -435,8 +437,10 @@ test("e2e #1900: role learned mid-request (400 → hop) — hinted retry carries
         assert.ok(!raw.includes("/fake/completion/marker"), "fake-completion text must not leak to the client");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });

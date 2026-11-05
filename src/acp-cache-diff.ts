@@ -4,6 +4,7 @@
 // its producer instead of surfacing as an unattributed TTL bucket (#1254).
 import fs from "node:fs";
 import path from "node:path";
+import { DUMP_PLAINTEXT_BANNER } from "./dump-banner.js";
 import { defaultLogFile } from "./paths.js";
 import { safeSessionId } from "./server/headers.js";
 
@@ -33,7 +34,12 @@ interface AppendInfo {
     //   appended elements) — the healthy shape for array-appending clients.
     // tail-fields: same element stability, but the divergence is trailing
     //   fields after the message array.
-    kind: "strict" | "json-tail" | "tail-fields";
+    // mid-insert: same element COUNT, but one element's INTERIOR grew (a single
+    //   logical unit whose content extended in place, e.g. auto-review's giant
+    //   user message with a growing FILTERED_HISTORY + fixed PENDING_ACTION
+    //   trailer) — byte-wise a mid-body insertion, semantically an append
+    //   (#3476).
+    kind: "strict" | "json-tail" | "tail-fields" | "mid-insert";
     countA: number;
     countB: number;
 }
@@ -125,14 +131,30 @@ function collectDumps(root: string): DumpMeta[] {
 function parseDumpFile(file: string): DumpContent | null {
     let buf: Buffer;
     try { buf = fs.readFileSync(file); } catch { return null; }
-    const sep = buf.indexOf("\n\n");
-    if (sep < 0) return null;
+    // #4482: new-format dumps open with the plaintext-warning banner line; drop
+    // it explicitly (not by relying on the banner lacking ": ") so header
+    // parsing and body bytes stay identical to pre-banner files.
+    const nl = buf.indexOf(0x0a);
+    if (nl > 0 && buf.subarray(0, nl).toString("utf8").replace(/\r$/, "") === DUMP_PLAINTEXT_BANNER) {
+        buf = buf.subarray(nl + 1);
+    }
+    // #3331: the request-line + headers block can be terminated by \r\n\r\n as
+    // well as \n\n (dump files written on Windows / by CRLF-emitting clients);
+    // a bare \n\n probe misses the header block entirely on such files.
+    const lf = buf.indexOf("\n\n");
+    const crlf = buf.indexOf("\r\n\r\n");
+    let sep: number;
+    let sepLen: number;
+    if (crlf >= 0 && (lf < 0 || crlf < lf)) { sep = crlf; sepLen = 4; }
+    else if (lf >= 0) { sep = lf; sepLen = 2; }
+    else return null;
     const head = buf.subarray(0, sep).toString("utf8");
-    const body = buf.subarray(sep + 2);
+    const body = buf.subarray(sep + sepLen);
     const headers: Record<string, string> = {};
     const lines = head.split("\n");
     for (let i = 1; i < lines.length; i++) {
-        const line = lines[i]!;
+        let line = lines[i]!;
+        if (line.endsWith("\r")) line = line.slice(0, -1); // CRLF header lines
         if (!line.trim()) continue;
         const c = line.indexOf(": ");
         if (c > 0) headers[line.slice(0, c).toLowerCase()] = line.slice(c + 2);
@@ -168,6 +190,22 @@ function prefixCompare(a: Buffer, b: Buffer): { rel: "append" | "diverge"; offse
     }
     if (b.length >= a.length) return { rel: "append", offset: a.length, extra: b.length - a.length };
     return { rel: "diverge", offset: n, extra: b.length - a.length };
+}
+
+// #3476: true iff `prev` is fully covered by the common prefix (length `lcp`)
+// plus some common suffix — i.e. its middle residual is EMPTY — while `cur`
+// carries extra bytes in that middle. That is a SEMANTIC append: no prior byte
+// moved or changed, only new bytes landed between a stable head and a stable
+// trailer (e.g. a single giant message whose interior container grows, with a
+// fixed trailer shifting right). A genuine rewrite leaves a non-empty residual
+// on the shorter side, so it is never matched here — this cannot mask a real
+// mid-history break.
+function isMidInsertionAppend(prev: Buffer, cur: Buffer, lcp: number): boolean {
+    if (cur.length <= prev.length || lcp >= prev.length) return false;
+    const room = prev.length - lcp;
+    let lcs = 0;
+    while (lcs < room && prev[prev.length - 1 - lcs] === cur[cur.length - 1 - lcs]) lcs++;
+    return lcp + lcs === prev.length;
 }
 
 const MSG_KEYS = ["messages", "input", "contents"];
@@ -343,12 +381,22 @@ export function compareWires(aBody: Buffer, bBody: Buffer): WireRel {
             }
         }
     }
+    // #3476: same element count but one element's interior grew — a single
+    // logical unit extending in place (auto-review FILTERED_HISTORY + fixed
+    // PENDING_ACTION trailer). Byte-wise a mid-body insertion; semantically an
+    // append. Recognize it instead of flagging a rewrite.
+    if (isMidInsertionAppend(aBody, bBody, O)) {
+        return {
+            rel: "append", byteOffset: O, extra: byteRel.extra, preArray: false,
+            append: { kind: "mid-insert", countA: ia?.items.length ?? 0, countB: ib?.items.length ?? 0 },
+        };
+    }
     return { rel: "diverge", byteOffset: O, extra: byteRel.extra, append: null, preArray: false };
 }
 
 export interface UsageSample { ts: number; input: number; cached: number; }
 
-const USAGE_LINE_RE = /^(\d{4}-\d{2}-\d{2}T[\d:.]+Z?) \[[a-z]+\] \[([^\]]+)\] (?:\[plugin\] )?\[acp-usage\](?: round \d+)? input=(\d+) cached=(\d+)/;
+const USAGE_LINE_RE = /^(\d{4}-\d{2}-\d{2}T[\d:.]+(?:Z|[+-]\d{2}:\d{2})?) \[[a-z]+\] \[([^\]]+)\] (?:\[plugin\] )?\[acp-usage\](?: round \d+)? input=(\d+) cached=(\d+)/;
 
 export function parseUsageLog(file: string): Map<string, UsageSample[]> {
     const bySession = new Map<string, UsageSample[]>();

@@ -108,14 +108,15 @@ test("function builder honors section replace and remove", () => {
   assert.ok(
     !replaced.includes("NEVER echo, repeat, or reference these XML tags"),
   );
-  assert.ok(replaced.includes("You have five context-management tools"));
+  assert.ok(replaced.includes("You have four context-management tools"));
 
   const removed = buildCompressSystemPrompt(undefined, {
     summariesInContext: null,
   });
   assert.ok(!removed.includes("COMPRESSION SUMMARIES IN CONTEXT"));
   assert.ok(!removed.includes("MODEL-GENERATED summaries"));
-  assert.ok(removed.endsWith("Use to find what to compress next."));
+  // #5555: the tools section now closes with the per-generation refs note.
+  assert.ok(removed.includes("before compressing."));
   assert.ok(!removed.includes("next.\n\n\n"));
 
   const crossIgnored = buildCompressSystemPrompt(undefined, {
@@ -207,32 +208,16 @@ test("applyAcpToolOverrides handles the anthropic shape (name + input_schema)", 
   const out = applyAcpToolOverrides(ACP_TOOLS_ANTHROPIC, {
     compress: {
       description: "NEW-COMPRESS-DESC",
-      paramDescriptions: { startId: "NEW-START" },
+      paramDescriptions: { content: "NEW-CONTENT" },
     },
   });
   const compress = out.find((t) => t.name === "compress");
   assert.ok(compress);
   assert.equal(compress.description, "NEW-COMPRESS-DESC");
   const schema = compress.input_schema as {
-    properties: Record<
-      string,
-      {
-        anyOf: {
-          items?: {
-            anyOf: { properties?: Record<string, { description?: string }> }[];
-          };
-        }[];
-      }
-    >;
+    properties: Record<string, { description?: string }>;
   };
-  const objectForms = schema.properties.content.anyOf[0].items!.anyOf.filter(
-    (v) => v.properties !== undefined,
-  );
-  assert.equal(objectForms.length, 2);
-  for (const objectForm of objectForms)
-    assert.equal(objectForm.properties!.startId!.description, "NEW-START");
-  const untouched = out.find((t) => t.name === "decompress");
-  assert.equal(untouched, ACP_TOOLS_ANTHROPIC[1]);
+  assert.equal(schema.properties.content.description, "NEW-CONTENT");
 });
 
 test("applyAcpToolOverrides handles the openai shape (function wrapper)", () => {

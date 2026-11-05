@@ -76,6 +76,7 @@ test("#1688 unit: connect-refused is replayed and the recovered response is retu
     } finally {
         result?.clearTimer();
         srv.close();
+        srv.closeIdleConnections?.();
         await once(srv, "close");
     }
     assert.equal(retries.length, 1);
@@ -106,6 +107,7 @@ test("#1688 unit: pre-response socket reset is replayed", async () => {
     } finally {
         result.clearTimer();
         srv.close();
+        srv.closeIdleConnections?.();
         await once(srv, "close");
     }
     assert.equal(retries.length, 1);
@@ -148,6 +150,7 @@ test("#1688 unit: any HTTP verdict passes through untouched — never replayed, 
     } finally {
         result.clearTimer();
         srv.close();
+        srv.closeIdleConnections?.();
         await once(srv, "close");
     }
     assert.equal(hits, 1, "a 4xx verdict goes straight back to the caller");
@@ -329,8 +332,10 @@ test("#1688 e2e: a pre-response reset mid-round is replayed transparently — th
         assert.equal(relay.streamingCalls(), 2, "exactly one transparent replay within the same request");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         relay.server.close();
+        relay.server.closeIdleConnections?.();
         await once(relay.server, "close");
     }
 });
@@ -356,8 +361,10 @@ test("#1688 e2e: persistent transport failure exhausts the budget, then surfaces
         assert.equal(relay.streamingCalls(), 3, "exactly BILI_REPLAY_RETRY_MAX attempts, no unbounded storm");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         relay.server.close();
+        relay.server.closeIdleConnections?.();
         await once(relay.server, "close");
     }
 });
@@ -382,8 +389,10 @@ test("#1688 e2e: an upstream 4xx verdict passes through verbatim without any rep
         assert.equal(relay.streamingCalls(), 1);
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         relay.server.close();
+        relay.server.closeIdleConnections?.();
         await once(relay.server, "close");
     }
 });

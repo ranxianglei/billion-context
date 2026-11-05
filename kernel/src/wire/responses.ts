@@ -1,6 +1,13 @@
 import type { CoreMessage } from "../types.js";
 import { splitDemotedThinking } from "./demoted-thinking.js";
-import { ClusterCounter, deriveMessageId } from "./message-id.js";
+import { ClusterCounter } from "./message-id.js";
+import {
+  CANONICAL_IMAGE_TEXT,
+  canonicalOpaqueSeed,
+  canonicalToolArgs,
+  deriveCanonicalMessageId,
+  imageMediaFingerprint,
+} from "./identity.js";
 import type { ConversationIdentity } from "./util.js";
 import { hashId } from "./util.js";
 import { parseDataUrl, type BiliMessage } from "./bili-message.js";
@@ -56,6 +63,12 @@ export type ResponsesRequestBody = {
 type ResponseLayoutSlot = {
   original: ResponseInputItem;
   coreId?: string;
+  /** #3642: canonical granularity splits one wire item into one core per
+   *  content part. `coreId` stays the FIRST core (insertion anchoring);
+   *  `coreIds` lists every core this item produced so the patch/replay path
+   *  can drop the item only when ALL of its cores are folded, and rebuild a
+   *  partial view when only some are (never resurrecting folded parts). */
+  coreIds?: string[];
 };
 
 export type ResponsesProjection = {
@@ -113,6 +126,39 @@ function partText(part: ResponseContentPart): string {
     return typeof part.text === "string" ? part.text : "";
   }
   return "";
+}
+
+/** #4166: text view of a system/developer message item's content — same
+ *  flatten responsesToCore applies (string, or parts joined with "\n"). */
+function responsesTextOf(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .map((part) =>
+      part && typeof part === "object" && typeof (part as { text?: unknown }).text === "string"
+        ? (part as { text: string }).text
+        : "",
+    )
+    .join("\n");
+}
+
+/** #4166: true when content is a plain string or an all-text parts array —
+ *  the shapes whose bytes live entirely in `text`, so a kernel text rewrite
+ *  can re-lay them out without losing anything. */
+function isPlainResponsesContent(content: unknown): boolean {
+  if (content == null || typeof content === "string") return true;
+  return (
+    Array.isArray(content) &&
+    content.length > 0 &&
+    content.every(
+      (p) =>
+        p &&
+        typeof p === "object" &&
+        ((p as { type?: string }).type === "input_text" ||
+          (p as { type?: string }).type === "output_text") &&
+        typeof (p as { text?: unknown }).text === "string",
+    )
+  );
 }
 
 function messageContent(content: string | ResponseContentPart[]): string {
@@ -186,7 +232,9 @@ export function responsesToCore(
   if (typeof body.instructions === "string" && body.instructions.trim())
     systemParts.push(body.instructions);
   if (typeof body.input === "string") {
-    const id = clusters.next(deriveMessageId("user", "text", body.input));
+    const id = clusters.next(
+      deriveCanonicalMessageId("user", "text", body.input),
+    );
     msgs.push({ id, role: "user", contentType: "text", text: body.input });
     return {
       msgs,
@@ -198,9 +246,11 @@ export function responsesToCore(
       stringInput: { original: body.input, coreId: id },
     };
   }
-  for (const raw of body.input) {
+  let sysDevHead = true;
+  for (const [wireIndex, raw] of body.input.entries()) {
     const item = normalizeEasyInputItem(raw);
     let coreId: string | undefined;
+    const before = msgs.length;
     if (isOpaqueItem(item)) preamble.push(item);
     switch (item.type) {
       case "reasoning": {
@@ -214,14 +264,15 @@ export function responsesToCore(
         // put the mirror in a different ref/fingerprint space, so restart
         // replay rejected every in-stream compress call (issue #64,
         // responses variant).
+        // #3642: an item with NO extractable text used to seed on the
+        // provider's item id — unstable across resend. Seed on the
+        // canonical opaque seed (item minus id/status, hashed) instead;
+        // same bytes ⇒ same id in every future pass.
         const text = reasoningText(item);
-        const rid =
-          text.length > 0
-            ? text
-            : "id" in item && typeof item.id === "string"
-              ? item.id
-              : hashId(JSON.stringify(item));
-        coreId = clusters.next(deriveMessageId("assistant", "reasoning", rid));
+        const rid = text.length > 0 ? text : canonicalOpaqueSeed(item);
+        coreId = clusters.next(
+          deriveCanonicalMessageId("assistant", "reasoning", rid),
+        );
         msgs.push({
           id: coreId,
           role: "assistant",
@@ -235,14 +286,116 @@ export function responsesToCore(
         const message = item as ResponseInputMessage;
         const text = messageContent(message.content);
         if (message.role === "system" || message.role === "developer") {
-          systemParts.push(text);
-          idx++;
-          continue;
+          if (sysDevHead) {
+            systemParts.push(text);
+            idx++;
+            continue;
+          }
+          // #4166 (mirror of #3992): a MID-history system/developer item is
+          // client data — position-preserve it as a sidecar core instead of
+          // hoisting into systemParts (position destroyed + parts flattened).
+          // The host #1638 re-typing trick covered plugin/codex clients only;
+          // this is codec-native for every mode. Leading prefix still hoists
+          // (strict single-system upstreams keep their merged head, #377).
+          const midBase = deriveCanonicalMessageId(
+            message.role,
+            "text",
+            text,
+          );
+          msgs.push({
+            id: clusters.next(midBase),
+            role: "system",
+            contentType: "text",
+            text,
+            originalRole: message.role,
+            rawResponsesItem: item,
+          });
+          break;
         } else if (
           message.role === "user" ||
           (message.role === "assistant" && text)
         ) {
           const role = message.role;
+          // #3642 canonical granularity: split per content part (text parts
+          // ⇒ text cores seeded on their own bytes; image parts ⇒ image
+          // cores carrying the canonical "[image]" marker) so the same
+          // logical conversation yields the same core ARRAY as every other
+          // codec. Split text cores carry NO rawResponsesItem — the rebuild
+          // run-accumulator decides verbatim-vs-filtered — while image
+          // cores keep the raw item as their byte-fidelity sidecar. Messages
+          // with unknown part types fall back to the legacy merged shape
+          // (merged raw sidecar keeps unknown parts round-tripping,
+          // openai #1205 class). Only USER messages split: assistant
+          // message items in input are rare single-part text.
+          const splittable =
+            role === "user" &&
+            Array.isArray(message.content) &&
+            message.content.length > 1 &&
+            message.content.every(
+              (part) =>
+                typeof part === "object" &&
+                part !== null &&
+                (part.type === "input_text" ||
+                  part.type === "output_text" ||
+                  part.type === "input_image"),
+            );
+          if (splittable) {
+            for (const rawPart of message.content) {
+              const part =
+                typeof rawPart === "object" && rawPart !== null
+                  ? rawPart
+                  : undefined;
+              if (!part) continue;
+              if (
+                (part.type === "input_text" || part.type === "output_text") &&
+                typeof part.text === "string" &&
+                part.text.length > 0
+              ) {
+                const base = deriveCanonicalMessageId(
+                  "user",
+                  "text",
+                  part.text,
+                );
+                msgs.push({
+                  id: clusters.next(base),
+                  role: "user",
+                  contentType: "text",
+                  text: part.text,
+                });
+              } else if (
+                part.type === "input_image" &&
+                typeof part.image_url === "string"
+              ) {
+                const image = parseDataUrl(part.image_url);
+                const base = deriveCanonicalMessageId(
+                  "user",
+                  "text",
+                  CANONICAL_IMAGE_TEXT,
+                  {
+                    // #3751: payload-addressed ids — base64 payload when present, else URL.
+                    mediaFingerprint: imageMediaFingerprint(
+                      image ? image.base64 : part.image_url,
+                    ),
+                  },
+                );
+                msgs.push({
+                  id: clusters.next(base),
+                  role: "user",
+                  contentType: "text",
+                  text: CANONICAL_IMAGE_TEXT,
+                  imagePart: true,
+                  rawResponsesItem: item,
+                  ...(image
+                    ? {
+                        imageMediaType: image.mediaType,
+                        imageBase64: image.base64,
+                      }
+                    : {}),
+                });
+              }
+            }
+            break;
+          }
           let effText = text;
           if (role === "assistant") {
             // Same normalization as openaiToCore: hosts that demote
@@ -255,7 +408,11 @@ export function responsesToCore(
             if (split) {
               msgs.push({
                 id: clusters.next(
-                  deriveMessageId("assistant", "reasoning", split.reasoning),
+                  deriveCanonicalMessageId(
+                    "assistant",
+                    "reasoning",
+                    split.reasoning,
+                  ),
                 ),
                 role: "assistant",
                 contentType: "reasoning",
@@ -280,7 +437,31 @@ export function responsesToCore(
               role === "user"
                 ? userDisplayText(message.content, effText)
                 : effText;
-            coreId = clusters.next(deriveMessageId(role, "text", displayText));
+            // #3751: payload-addressed ids — every input_image in the merged
+            // shape contributes its fingerprint in order (single image ⇒ one
+            // fingerprint, byte-identical to the split path's image core so
+            // both forms of one logical message share one id; text-only legacy
+            // cores keep their ids verbatim).
+            const mediaFingerprint = Array.isArray(message.content)
+              ? message.content
+                  .flatMap((part) => {
+                    if (
+                      part?.type === "input_image" &&
+                      typeof part.image_url === "string"
+                    ) {
+                      const raw = part.image_url;
+                      const decoded = parseDataUrl(raw);
+                      return [imageMediaFingerprint(decoded ? decoded.base64 : raw)];
+                    }
+                    return [];
+                  })
+                  .join(",") || undefined
+              : undefined;
+            coreId = clusters.next(
+              deriveCanonicalMessageId(role, "text", displayText, {
+                mediaFingerprint,
+              }),
+            );
             const imageUrl = Array.isArray(message.content)
               ? message.content.find(
                   (part) =>
@@ -306,11 +487,16 @@ export function responsesToCore(
       }
       case "function_call": {
         const call = item as ResponseFunctionCall;
+        // #3642: canonical args in the seed (key-sorted, compact — same
+        // normalization as the other codecs); the wire call_id stays on the
+        // toolCallId FIELD (pairing) but is out of the seed.
         coreId = clusters.next(
-          deriveMessageId("assistant", "tool-call", call.arguments ?? "", {
-            toolCallId: call.call_id,
-            toolName: call.name,
-          }),
+          deriveCanonicalMessageId(
+            "assistant",
+            "tool-call",
+            canonicalToolArgs(call.arguments ?? ""),
+            { toolName: call.name },
+          ),
         );
         msgs.push({
           id: coreId,
@@ -331,8 +517,8 @@ export function responsesToCore(
             ? output.output
             : JSON.stringify(output.output);
         coreId = clusters.next(
-          deriveMessageId("tool", "tool-result", text, {
-            toolCallId: output.call_id,
+          deriveCanonicalMessageId("tool", "tool-result", text, {
+            toolName: toolNames.get(output.call_id),
           }),
         );
         const name = toolNames.get(output.call_id);
@@ -354,12 +540,11 @@ export function responsesToCore(
       case "image_generation_call":
       case "code_interpreter_call":
       case "mcp_call": {
-        const rid =
-          typeof (item as { id?: unknown }).id === "string"
-            ? String((item as { id?: string }).id)
-            : hashId(JSON.stringify(item));
+        // #3642: the provider's item id is unstable across resends — seed
+        // on the canonical opaque seed (item minus id/status) instead.
+        const rid = canonicalOpaqueSeed(item);
         coreId = clusters.next(
-          deriveMessageId("assistant", "responses-call", rid),
+          deriveCanonicalMessageId("assistant", "responses-call", rid),
         );
         msgs.push({
           id: coreId,
@@ -381,8 +566,7 @@ export function responsesToCore(
         customToolCallIds.add(callId);
         const argText = ctc.input ?? ctc.arguments ?? "";
         coreId = clusters.next(
-          deriveMessageId("assistant", "tool-call", argText, {
-            toolCallId: callId,
+          deriveCanonicalMessageId("assistant", "tool-call", argText, {
             toolName: ctc.name ?? "custom",
           }),
         );
@@ -407,8 +591,8 @@ export function responsesToCore(
             ? ctco.output
             : JSON.stringify(ctco.output ?? "");
         coreId = clusters.next(
-          deriveMessageId("tool", "tool-result", outText, {
-            toolCallId: callId,
+          deriveCanonicalMessageId("tool", "tool-result", outText, {
+            toolName: toolNames.get(callId),
           }),
         );
         const name = toolNames.get(callId);
@@ -427,7 +611,31 @@ export function responsesToCore(
         if (!isOpaqueItem(item)) preamble.push(item);
         break;
     }
-    layout.push({ original: item, coreId });
+    for (let k = before; k < msgs.length; k++) {
+      msgs[k]!.wireIndex = wireIndex;
+    }
+    // #4166: the sys/dev hoisting head lasts only until the first
+    // CONVERSATION item lands — mirroring the host #1638 head rule:
+    // sys/dev message items and the head-neutral tooling declarations
+    // (additional_tools / mcp_list_tools) do not break the head; anything
+    // else does. Mid-history system/developer items after that become
+    // positioned sidecar cores.
+    const role = (item as { role?: unknown }).role;
+    const isSysDevMsgItem =
+      (item.type === undefined || item.type === "message") &&
+      (role === "system" || role === "developer");
+    if (
+      !isSysDevMsgItem &&
+      item.type !== "additional_tools" &&
+      item.type !== "mcp_list_tools"
+    )
+      sysDevHead = false;
+    const produced = msgs.slice(before).map((m) => m.id);
+    layout.push({
+      original: item,
+      ...(produced.length > 0 ? { coreId: produced[0] } : {}),
+      ...(produced.length > 1 ? { coreIds: produced } : {}),
+    });
     idx++;
   }
   return {
@@ -450,11 +658,16 @@ function patchTextParts(
   if (textIndexes.length === 0) return [{ type: "input_text", text }, ...parts];
   const first = textIndexes[0];
   const remaining = new Set(textIndexes.slice(1));
-  return parts.map((part, index) => {
-    if (index === first) return { ...part, text };
-    if (remaining.has(index)) return { ...part, text: "" };
-    return part;
-  });
+  // Consolidate all text into the FIRST text part and DROP the others — never
+  // leave them as text:"" placeholders: strict Responses backends reject an
+  // empty input_text.text with 400 "text is required" (#3089).
+  const out: ResponseContentPart[] = [];
+  for (let index = 0; index < parts.length; index++) {
+    const part = parts[index];
+    if (!part || remaining.has(index)) continue;
+    out.push(index === first ? { ...part, text } : part);
+  }
+  return out;
 }
 
 function patchOriginalItem(
@@ -547,6 +760,47 @@ export function patchResponsesInput(
   const out: ResponseInputItem[] = [];
   projection.layout.forEach((slot, index) => {
     out.push(...(insertions.get(index) ?? []));
+    if (slot.coreIds && slot.coreIds.length > 1) {
+      // #3642 split item: drop only when ALL cores folded; partial survival
+      // rebuilds a filtered view (never resurrecting folded parts).
+      const entries = slot.coreIds.map((id) => ({
+        core: sourceById.get(id),
+        next: nextById.get(id),
+      }));
+      if (entries.every((entry) => entry.next === undefined)) return;
+      const original = slot.original as ResponseInputMessage;
+      const allSurvive = entries.every((entry) => entry.next !== undefined);
+      const changed = entries.some(
+        (entry) =>
+          entry.core &&
+          entry.next &&
+          (entry.core.text ?? "") !== (entry.next.text ?? ""),
+      );
+      if (allSurvive && !changed) {
+        out.push(slot.original);
+        return;
+      }
+      const imageParts = Array.isArray(original.content)
+        ? original.content.filter((part) => part.type === "input_image")
+        : [];
+      let img = 0;
+      const parts: ResponseContentPart[] = [];
+      for (const entry of entries) {
+        if (!entry.next) continue;
+        const bili = entry.next as BiliMessage;
+        // The SOURCE core decides image-ness: render/ref-tag injection may
+        // rewrite the marker text, and a wire image part has no text slot.
+        if (entry.core?.imagePart || bili.text === CANONICAL_IMAGE_TEXT) {
+          const part = imageParts[img++];
+          if (part) parts.push(part);
+        } else if (bili.text) {
+          parts.push({ type: "input_text", text: bili.text });
+        }
+      }
+      if (parts.length > 0)
+        out.push({ ...original, content: parts } as ResponseInputItem);
+      return;
+    }
     if (!slot.coreId) {
       out.push(slot.original);
       return;
@@ -565,16 +819,19 @@ export function coreToResponses(
   customToolCallIds: Set<string> = new Set(),
 ): ResponseInputItem[] {
   const out: ResponseInputItem[] = [];
-  for (const message of messages) {
-    const biliMessage = message as BiliMessage;
-    const raw = biliMessage.rawResponsesItem as ResponseInputItem | undefined;
-    if (message.role === "system") {
-      out.push({
-        type: "message",
-        role: "developer",
-        content: message.text ?? "",
-      });
-    } else if (message.role === "user") {
+  // #3642: canonical granularity splits one user item into one core per
+  // part, so consecutive user cores are a RUN that rebuilds as ONE wire
+  // item. Full coverage (every part's core present, run length == part
+  // count) rebuilds the original item VERBATIM — byte-exact for the
+  // untouched case. A partial run (some parts' cores folded away) rebuilds
+  // a FILTERED view: only the surviving parts, never resurrecting folded
+  // content from the raw sidecar.
+  const flushUserRun = (run: CoreMessage[]) => {
+    if (run.length === 0) return;
+    if (run.length === 1) {
+      const message = run[0]!;
+      const raw = (message as BiliMessage)
+        .rawResponsesItem as ResponseInputItem | undefined;
       const rawMessage =
         raw?.type === "message" ? (raw as ResponseInputMessage) : undefined;
       if (
@@ -585,13 +842,118 @@ export function coreToResponses(
         ) === (message.text ?? "")
       )
         out.push(rawMessage);
+      else if (
+        ((message as BiliMessage).imagePart ||
+          (message as BiliMessage).text === CANONICAL_IMAGE_TEXT) &&
+        rawMessage &&
+        Array.isArray(rawMessage.content)
+      )
+        out.push({
+          type: "message",
+          role: "user",
+          content: rawMessage.content.filter(
+            (part) => part.type === "input_image",
+          ),
+        });
       else
         out.push({
           type: "message",
           role: "user",
           content: message.text ?? "",
         });
-    } else if (message.role === "assistant") {
+      return;
+    }
+    const rawCarrier = run.find(
+      (m) => (m as BiliMessage).rawResponsesItem !== undefined,
+    ) as BiliMessage | undefined;
+    const rawItem = rawCarrier?.rawResponsesItem as
+      | ResponseInputItem
+      | undefined;
+    const rawMessage =
+      rawItem?.type === "message"
+        ? (rawItem as ResponseInputMessage)
+        : undefined;
+    const fullCover =
+      rawMessage &&
+      Array.isArray(rawMessage.content) &&
+      rawMessage.content.length === run.length;
+    if (fullCover && rawMessage) {
+      out.push(rawMessage);
+      return;
+    }
+    const imageParts =
+      rawMessage && Array.isArray(rawMessage.content)
+        ? rawMessage.content.filter((part) => part.type === "input_image")
+        : [];
+    let img = 0;
+    const parts: ResponseContentPart[] = [];
+    for (const message of run) {
+      const bili = message as BiliMessage;
+      // Image-ness is structural (parse-time flag), never text equality:
+      // render/ref-tag injection rewrites the marker, and image parts have
+      // no text slot to carry a tag.
+      if (bili.imagePart && bili.rawResponsesItem) {
+        const part = imageParts[img++];
+        if (part) parts.push(part);
+      } else if (bili.text) {
+        parts.push({ type: "input_text", text: bili.text });
+      }
+    }
+    out.push({
+      type: "message",
+      role: "user",
+      content: parts.length > 0 ? parts : "",
+    });
+  };
+  let userRun: CoreMessage[] = [];
+  for (const message of messages) {
+    if (message.role === "user") {
+      userRun.push(message);
+      continue;
+    }
+    flushUserRun(userRun);
+    userRun = [];
+    const biliMessage = message as BiliMessage;
+    const raw = biliMessage.rawResponsesItem as ResponseInputItem | undefined;
+    if (message.role === "system") {
+      // #4166: a client mid-history system/developer item re-emits its raw
+      // item byte-exact (position + structured parts). Kernel text rewrites
+      // (emergency truncation) re-lay plain-text content; structured items
+      // are unfoldable-by-protection, so verbatim still. Cores WITHOUT a
+      // sidecar are kernel-rendered summary carriers — keep the legacy
+      // developer rebuild (their wire shape is golden-pinned).
+      const rawMsg = raw as
+        | { type?: string; role?: string; content?: unknown }
+        | undefined;
+      const isSysDevRaw =
+        rawMsg != null &&
+        (rawMsg.type === undefined || rawMsg.type === "message") &&
+        (rawMsg.role === "system" || rawMsg.role === "developer");
+      if (isSysDevRaw) {
+        const text = message.text ?? "";
+        if (
+          text !== responsesTextOf(rawMsg.content) &&
+          isPlainResponsesContent(rawMsg.content)
+        ) {
+          out.push({
+            type: "message",
+            role: rawMsg.role,
+            content:
+              typeof rawMsg.content === "string"
+                ? text
+                : [{ type: "input_text", text }],
+          } as ResponseInputItem);
+        } else {
+          out.push(raw as ResponseInputItem);
+        }
+      } else {
+        out.push({
+          type: "message",
+          role: "developer",
+          content: message.text ?? "",
+        });
+      }
+      } else if (message.role === "assistant") {
       if (message.contentType === "text") {
         out.push({
           type: "message",
@@ -636,6 +998,7 @@ export function coreToResponses(
       }
     }
   }
+  flushUserRun(userRun);
   return out;
 }
 

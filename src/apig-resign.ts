@@ -1,8 +1,8 @@
 import { createHash, createHmac } from "node:crypto";
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
-import { RESIGN_BUILTIN_SCHEME, resolveResignSettings, type ProviderRoute } from "./config.js";
+import { RESIGN_BUILTIN_SCHEME, resolveModelEntryOnRoute, resolveResignSettings, type ProviderRoute } from "./config.js";
 import { configFile, stateDir } from "./paths.js";
 
 /**
@@ -104,7 +104,7 @@ export function apigBenefitFor(model: string | undefined, route?: ProviderRoute)
         const set = new Set(envBenefit.split(",").map((s) => s.trim().toLowerCase()).filter((s) => s.length > 0));
         return set.has(lower);
     }
-    const entry = route?.models?.[model] ?? route?.models?.[lower];
+    const entry = resolveModelEntryOnRoute(route, model).entry;
     if (entry?.benefit !== undefined) return entry.benefit;
     return DEFAULT_BENEFIT_MODELS.includes(lower);
 }
@@ -369,7 +369,15 @@ function writePendingRefusals(map: Record<string, ResignPendingEntry>): void {
     try {
         mkdirSync(stateDir(), { recursive: true });
         const tmp = `${resignPendingFile()}.tmp`;
-        writeFileSync(tmp, JSON.stringify(map, null, 2));
+        // fsync before rename: a crash between write and rename otherwise leaves
+        // a size-correct, VDL=0 zero file (#3157).
+        const fd = openSync(tmp, "w");
+        try {
+            writeFileSync(fd, JSON.stringify(map, null, 2));
+            fsyncSync(fd);
+        } finally {
+            closeSync(fd);
+        }
         renameSync(tmp, resignPendingFile());
     } catch (err) {
         console.warn(`bili: cannot persist resign-pending.json (${err instanceof Error ? err.message : String(err)})`);

@@ -15,6 +15,7 @@ import { startServer } from "../src/server.ts";
 import { ResponsesWsHistory, ResponsesWsUpstream, finalizeResponsesWsUpstreamHeaders } from "../src/responses-ws.ts";
 import { _liveUpstreamTimersForTest } from "../src/fetch-util.ts";
 import { proxyDispatcher } from "../src/upstream-proxy.ts";
+import { _resetUpstreamThrottleForTest } from "../src/upstream-throttle.ts";
 import { ensureRootCA, mintHostCert, rootCaPath } from "../src/ca.ts";
 import { validateResponsesWsCreate } from "./wire-contract-fakes.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
@@ -96,7 +97,22 @@ test("Responses WS egress headers: azure strips consumed x-bili-* under the cust
     for (const dropped of ["host", "connection", "content-length", "sec-websocket-key"]) assert.ok(!(dropped in openai), `non-azure egress must still drop hop marker ${dropped}`);
 });
 
-test("V2 handshake: azure Responses sockets are intercepted; uncovered providers stay unintercepted", async () => {
+// #3073: the codex remote_compaction_v2 beta feature is stripped on EVERY
+// host (not just via buildForwardTarget) so probe and turn egress agree.
+test("Responses WS egress headers: remote_compaction_v2 beta feature stripped on all hosts (#3073)", () => {
+    const base = { "content-type": "application/json", authorization: "Bearer t" };
+    const openai = finalizeResponsesWsUpstreamHeaders("https://api.openai.com/v1/responses", { ...base, "x-codex-beta-features": "remote_compaction_v2, some_other_feature" });
+    assert.equal(openai["x-codex-beta-features"], "some_other_feature");
+    const only = finalizeResponsesWsUpstreamHeaders("https://api.openai.com/v1/responses", { ...base, "x-codex-beta-features": " remote_compaction_v2 , " });
+    assert.ok(!("x-codex-beta-features" in only));
+    const untouched = finalizeResponsesWsUpstreamHeaders("https://api.openai.com/v1/responses", { ...base, "x-codex-beta-features": "some_other_feature" });
+    assert.equal(untouched["x-codex-beta-features"], "some_other_feature");
+    const azure = finalizeResponsesWsUpstreamHeaders("https://westus2.openai.azure.com/openai/v1/responses", { ...base, "x-bili-plugin": "opencode", "x-codex-beta-features": "remote_compaction_v2, some_other_feature" });
+    assert.equal(azure["x-codex-beta-features"], "some_other_feature");
+    assert.ok(!("x-bili-plugin" in azure));
+});
+
+test("V2 handshake: openai/azure and custom OpenAI-compatible responses sockets are intercepted; non-responses endpoints stay direct", async () => {
     const hooks = new Map<string, (event: V2HttpRequestEvent) => void | Promise<void>>();
     const origin = "http://127.0.0.1:8787";
     const cleanup = await createOpencodeV2Setup({ route: createNativeRoute({ origin, ready: Promise.resolve(origin) }, { probe: async () => true }) })({
@@ -109,6 +125,15 @@ test("V2 handshake: azure Responses sockets are intercepted; uncovered providers
         assert.equal(azureEvent.url, `ws://127.0.0.1:8787/bili/responses/${azureUrl.replace(/^ws/, "http")}`);
         assert.equal(azureEvent.headers?.["x-bili-plugin"], "opencode");
         assert.equal(azureEvent.headers?.["x-bili-plugin-conversation"], "ses_az");
+        // #2491: a custom OpenAI-compatible provider on an OpenAI /responses endpoint
+        // must be intercepted too — previously only literal openai/azure ids qualified,
+        // so these silently bypassed the proxy and reached upstream uncompressed over WS.
+        const customUrl = "wss://api.aixw.example/v1/responses";
+        const customEvent: V2HttpRequestEvent = { url: customUrl, headers: { authorization: "Bearer custom-key" }, sessionID: "ses_custom", agent: "build", model: { providerID: "aixw-grok", id: "grok-4.7" } };
+        await hooks.get("experimental.ws.handshake")!(customEvent);
+        assert.equal(customEvent.url, `ws://127.0.0.1:8787/bili/responses/${customUrl.replace(/^ws/, "http")}`);
+        assert.equal(customEvent.headers?.["x-bili-plugin"], "opencode");
+        assert.equal(customEvent.headers?.["x-bili-plugin-conversation"], "ses_custom");
         const otherUrl = "wss://api.anthropic.com/v1/messages";
         const otherEvent: V2HttpRequestEvent = { url: otherUrl, headers: {}, sessionID: "ses_other", agent: "build", model: { providerID: "anthropic", id: "claude-x" } };
         await hooks.get("experimental.ws.handshake")!(otherEvent);
@@ -118,6 +143,8 @@ test("V2 handshake: azure Responses sockets are intercepted; uncovered providers
 });
 
 async function fixture(terminalOutput: "full" | "empty" | "omitted" | "partial" | "suffix" = "full") {
+    // #4204: the 429-hold table is process-global (keyed by origin+credential); clear it per fixture so a prior test's hold cannot answer this fixture's first turn locally when the OS reuses the same ephemeral port (#4945 CI flake).
+    _resetUpstreamThrottleForTest();
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "bili-responses-ws-"));
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
@@ -666,9 +693,16 @@ test(`Responses WS faults: repeated ${code} stops after one transport recovery`,
 });
 }
 
-test("Responses WS faults: refused handshake then a new upstream reconnects without leaking diagnostics", { timeout: 30000 }, async () => {
+test("Responses WS faults: refused handshake falls back to HTTP egress without leaking diagnostics", { timeout: 30000 }, async () => {
     const f = await fixture();
-    const rejected = http.createServer();
+    // #3342: a supplier that refuses the WS upgrade but still serves plain HTTP
+    // /responses — the exact shape the fallback targets. It answers with a JSON
+    // completion so the direct transport.fetch resolves through the HTTP leg.
+    const rejected = http.createServer((req, res) => {
+        let b = "";
+        req.on("data", c => { b += c; });
+        req.on("end", () => { res.setHeader("connection", "close"); res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ status: "completed" })); });
+    });
     rejected.on("upgrade", (_req, socket) => socket.end("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"));
     rejected.listen(0, "127.0.0.1");
     await once(rejected, "listening");
@@ -677,13 +711,17 @@ test("Responses WS faults: refused handshake then a new upstream reconnects with
     const body = JSON.stringify({ model: "gpt-5.2", stream: false, input: [user("private-handshake-payload")] });
     try {
         const port = (rejected.address() as { port: number }).port;
-        await assert.rejects(transport.fetch(`http://127.0.0.1:${port}/responses?private-query=secret`, { method: "POST", headers: { authorization: "Bearer private-handshake-credential" }, body, signal: AbortSignal.timeout(10000) }), /handshake failed/);
+        // A pre-generation WS refusal now falls back to HTTP egress on the same
+        // URL instead of failing the turn (#3342) — the fetch RESOLVES via HTTP.
+        const fallback = await transport.fetch(`http://127.0.0.1:${port}/responses?private-query=secret`, { method: "POST", headers: { authorization: "Bearer private-handshake-credential" }, body, signal: AbortSignal.timeout(10000) });
+        assert.equal((await fallback.json() as Item).status, "completed", "refused WS handshake falls back to HTTP egress");
         const response = await transport.fetch(`${f.upstreamOrigin}/v1/responses`, { method: "POST", body });
         assert.equal((await response.json() as Item).status, "completed");
         assert.equal(f.rows.length, 1);
         assert.equal(f.rows[0].request.previous_response_id, undefined);
         assert.match(log.join("\n"), /failed phase=handshake event=error close_code=none/);
-        assert.match(log.join("\n"), /checkpoint reset reason=connection-key-changed/);
+        assert.match(log.join("\n"), /egress mode=http reason=ws-handshake-refused/);
+        assert.match(log.join("\n"), /checkpoint reset reason=ws-refused-http-fallback/);
         assert.doesNotMatch(log.join("\n"), /private-|secret|Bearer/);
     } finally {
         transport.close();
@@ -903,9 +941,12 @@ test("Responses WS backpressure: a permanently stalled consumer still trips the 
         const first = await reader.read();
         assert.ok(!first.done);
         await f.sentAllPromise;
-        await new Promise<void>(resolve => setTimeout(resolve, 50));
+        // The guard tears down synchronously — controller.error() runs before
+        // the upstream socket closes — so observing the disconnect proves the
+        // stream is already errored: read() below rejects instead of resolving
+        // buffered data (a fixed 50ms tick raced this under CI load, #2953).
+        await until(() => f.wss.clients.size === 0);
         await assert.rejects(reader.read(), /buffer limit exceeded/);
         assert.match(f.log.join("\n"), /upstream checkpoint reset reason=invalid-event/);
-        await until(() => f.wss.clients.size === 0);
     } finally { await f.close(); }
 });

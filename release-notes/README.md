@@ -24,6 +24,9 @@ Companion package mechanics mirror `advisories/` (#1481):
 | date     | no       | `YYYY-MM-DD` release date                          |
 | tier     | yes      | `routine` (default) / `recommended` (restart soon, record-only) / `critical` (see below) |
 | summary  | yes      | One user-meaningful line, ≤400 chars, model-written|
+| summaryZh | no      | Chinese one-liner (≤400 chars) — zh-locale web surfaces pick it; `/acp` text stays English. Unset = every locale uses `summary` |
+| minVersion | no      | Targeting: only RUNNING versions ≥ this (inclusive) see the entry. Unset = no floor |
+| maxVersion | no      | Targeting: only RUNNING versions ≤ this (inclusive) see the entry. Unset = no ceiling |
 
 Rules: newest-first, ≤20 entries, no duplicates. **Entries are opt-in since
 2026-10-04**: only severe releases get one; ordinary releases ship with NO

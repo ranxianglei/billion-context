@@ -130,6 +130,8 @@ export function _resetAdvisoryWatcherForTest(): void {
     state = {};
     warnedKeys.clear();
     firstCheckDone = false;
+    watcherStarted = false;
+    feedConsulted = false;
     stopAdvisoryWatcher();
 }
 
@@ -137,6 +139,13 @@ export function _resetAdvisoryWatcherForTest(): void {
  *  getAdvisoryState()) without driving the watcher. */
 export function _setAdvisoryStateForTest(s: AdvisoryState): void {
     state = s;
+}
+
+/** Test seam: set the watcher-started flag without scheduling the real timer,
+ *  so advisoryAwaitingFirstCheck()'s startup window can be driven
+ *  deterministically (#2456). */
+export function _setAdvisoryWatcherStartedForTest(v: boolean): void {
+    watcherStarted = v;
 }
 
 /** Default source: the npm companion package's `latest` doc on the SAME
@@ -246,6 +255,31 @@ type AdvisoryWatcherOptions = {
 let timer: ReturnType<typeof setInterval> | undefined;
 let inFlight = false;
 let firstCheckDone = false;
+// #2456: startup-window tracking for the normal self-update loop's fail-safe
+// deferral. `watcherStarted` arms when startAdvisoryWatcher schedules the
+// loop; `feedConsulted` latches true once runAdvisoryCheck has finished its
+// FIRST feed consultation this process (success OR fail-open failure — either
+// way state.entries / lastError now reflect a real fetch, so
+// advisoryBlocksVersion is meaningful). advisoryAwaitingFirstCheck() is true
+// only in the window between the two.
+let watcherStarted = false;
+let feedConsulted = false;
+
+/** #2456: true while the advisory watcher is running but has not yet
+ *  completed its first feed consultation this process. The normal self-update
+ *  loop consults this (via an injected predicate) to defer installing the
+ *  registry latest until the advisory candidate gate (#1588-A) can actually
+ *  see a freshly parsed affected range: after a restart onto a clean version a
+ *  rollback-form advisory covers the registry latest while leaving this disk
+ *  clean, and the gate is blind until the advisory's first check lands —
+ *  installing before then pulls the machine back into the defect and the
+ *  watcher rolls it back again (ping-pong). False when the watcher is not
+ *  running (advisoryCheck off), so auto-update-only installs never defer
+ *  forever; false once the first check has consulted the feed (success or
+ *  fail-open). */
+export function advisoryAwaitingFirstCheck(): boolean {
+    return watcherStarted && !feedConsulted;
+}
 
 function warnOnce(log: Logger, key: string, message: string): void {
     if (warnedKeys.has(key)) return;
@@ -363,11 +397,19 @@ export async function runAdvisoryCheck(opts: AdvisoryWatcherOptions, force = fal
         warnOnce(log, `check:${String(e)}`, `[advisory] check failed: ${String(e)}`);
     } finally {
         inFlight = false;
+        // #2456: reaching here means a check has reached (and attempted) the
+        // feed — success or fail-open either way leaves state.entries
+        // meaningful, so release the update loop's first-cycle deferral. The
+        // throttle-return path can only fire on a LATER check (firstCheckDone
+        // already true), by which point an earlier check consulted the feed;
+        // the very first check always proceeds past the gate to fetch.
+        feedConsulted = true;
     }
 }
 
 export function startAdvisoryWatcher(opts: AdvisoryWatcherOptions): void {
     if (timer) return;
+    watcherStarted = true; // #2456: open the "awaiting first check" window for the update loop's fail-safe deferral
     loggerLog("info", `[advisory] watcher enabled (checking every ${CHECK_INTERVAL_MS / 1000 | 0}s, independent of auto-update)`);
     setTimeout(() => {
         void runAdvisoryCheck(opts);

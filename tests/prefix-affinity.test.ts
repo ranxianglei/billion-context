@@ -323,7 +323,11 @@ test("prefix-affinity: resume-fork survives a cache_control breakpoint shift (#2
     ];
     assert.deepEqual(
         r.findResumeParent(childReplay, "sess-child"),
-        { sessionId: "sess-parent", sharedDepth: 10 },
+        // #2791: depth counts WIRE-NEUTRAL turns now — the parent's ten
+        //  messages are nine turns (msgs 7–8 are consecutive assistants,
+        //  which anthropic splits and openai joins; the projection merges
+        //  them so both wires hash alike).
+        { sessionId: "sess-parent", sharedDepth: 9 },
         "a resume/fork differing from the parent ONLY by cache_control placement must still inherit",
     );
 });

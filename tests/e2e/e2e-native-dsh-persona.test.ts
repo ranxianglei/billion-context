@@ -1,4 +1,4 @@
-// E2E: REAL `dsh` — the #2241 regression family, on the native lane.
+// E2E: REAL `dsh` — the #2241/#2791 regression families, on the native lane.
 //
 // A model switch mid-conversation must NOT fork the main lane off the raw
 // conversation key (#2241): dsh rebuilds its main system per model, so the
@@ -21,6 +21,17 @@
 //      The title-generation side request dsh fires on turn 1 rides the same
 //      conversation id — it must stay a harmless side lane (never steals the
 //      raw key, never mints a persisted `|sub:` of its own).
+//
+//   C. PROTOCOL switch (#2791) — same shape as A but the profile flips to a
+//      provider on a DIFFERENT wire (api anthropic-messages instead of
+//      openai-completions): turn 1 (openai) logs a bulky tagged ledger and
+//      runs one bash round; turn 2 (openai, same session) asks for a
+//      scripted compress that folds the ledger; turn 3 (anthropic wire,
+//      same session) asks a plain follow-up. Accept: one conversation id
+//      across BOTH wires, the anthropic request inherits the full history,
+//      exactly ONE model-emitted compress (a forked anonymous session would
+//      re-fold from scratch — #2791's silent symptom), and the fold's block
+//      survives on the ONE persisted session under the raw key.
 //
 //   B. auto-review (blocked, see gatedB below) — with
 //      @deepseek-ai/dsh-experimental-auto-review enabled and a task that runs
@@ -69,7 +80,7 @@ function cleanEnv(): NodeJS.ProcessEnv {
     return env;
 }
 
-type FakeMessage = { role?: string; content?: unknown };
+type FakeMessage = { role?: string; content?: unknown; tool_calls?: { id?: string; function?: { name?: string } }[]; tool_call_id?: string };
 
 // Deterministic streaming-capable chat upstream with the scripted behaviors
 // both scenarios need. Reply selection per request body:
@@ -80,14 +91,26 @@ type FakeMessage = { role?: string; content?: unknown };
 //   - otherwise                     -> ok-N
 // Every stamped request is recorded to a JSONL oracle (conversation id,
 // model, message count, system head).
+// #2791 cross-protocol lane: fold oracle markers embedded in the scripted
+// compress summary and the bulky filler. The summary text deliberately does
+// NOT contain the filler marker, so hasSummary/hasFiller stay independent.
+// >=50 chars: the kernel rejects fold summaries shorter than that
+// ("Summary too short ... The summary must capture the compressed range's
+// key information").
+const SUMMARY_MARK = "e2e fold: persona scripted compress round over the grain-ledger filler turn";
+const FILLER_MARK = "GRAIN-LEDGER-UNIT-7X";
+
 function startFakeUpstream(reqLog: string): Promise<http.Server> {
     let n = 0;
+    const refsOf = (s: string): string[] => [...s.matchAll(/\x3cacp\s[^>]*?\x3e(m\d{5})\x3c\/acp\x3e/g)].map((x) => x[1]);
     const server = http.createServer((req, res) => {
-        if (req.method === "GET" && req.url?.endsWith("/models")) {
+        const pathOnly = (req.url ?? "/").split("?")[0];
+        if (req.method === "GET" && pathOnly.endsWith("/models")) {
             res.writeHead(200, { "content-type": "application/json" });
             res.end(JSON.stringify({ object: "list", data: [
                 { id: "fake-a", object: "model" },
                 { id: "fake-b", object: "model" },
+                { id: "fake-ant-a", object: "model" },
             ] }));
             return;
         }
@@ -103,27 +126,56 @@ function startFakeUpstream(reqLog: string): Promise<http.Server> {
                         : Array.isArray(sysMsg?.content) ? sysMsg.content.map((p) => (p as { text?: string })?.text ?? "").join("")
                         : "";
                     const flat = (m: FakeMessage): string => typeof m.content === "string" ? m.content : JSON.stringify(m.content ?? "");
-                    fs.appendFileSync(reqLog, JSON.stringify({
-                        conv: req.headers["x-bili-plugin-conversation"] ?? null,
-                        plugin: req.headers["x-bili-plugin"] ?? null,
-                        model: body.model ?? null,
-                        nmsgs: messages.length,
-                        sysLen: sysText.length,
-                        sysHead: sysText.slice(0, 80),
-                        hasToolResult: messages.some((m) => m?.role === "tool"),
-                    }) + "\n");
+                    const isChainCarrier = (txt: string): boolean => /^\s*\x3cbili-chain\s[\s\S]*\/\x3e\s*$/.test(txt);
+                    const users = messages.filter((m) => m?.role === "user");
+                    const realUserTexts = users.map((m) => (typeof m.content === "string" ? m.content : JSON.stringify(m.content ?? ""))).filter((txt) => !isChainCarrier(txt));
+                    const lastUserText = realUserTexts.length > 0 ? realUserTexts[realUserTexts.length - 1] : "";
+                    const wantsCompress = realUserTexts.some((txt) => /请调用compress/.test(txt));
+                    // "a compress result is already in history" — a plain bash
+                    // tool_result must NOT suppress a later scripted compress.
+                    const toolNames = new Map<string, string>(messages.flatMap((m) => (m?.tool_calls ?? []).map((tc) => [tc.id as string, tc.function?.name as string])));
+                    const hasCompressResult = messages.some((m) => m?.role === "tool" && toolNames.get(m.tool_call_id as string) === "compress");
+                    const compressToolCall = (): { id: string; type: "function"; function: { name: string; arguments: string } } => {
+                        // Refs must come from the NON-SYSTEM messages only —
+                        // the kernel system prompt embeds example acp tags whose
+                        // refs are unknown to the session (compress would fail
+                        // with "every ref is unknown to this session").
+                        const refs = refsOf(JSON.stringify(messages.filter((m) => m?.role !== "system")));
+                        return { id: `call_${n}`, type: "function", function: { name: "compress", arguments: JSON.stringify(refs.length === 0 ? {} : { content: [{ startId: refs[0], endId: refs[0], summary: SUMMARY_MARK }] }) } };
+                    };
 
                     let content = `ok-${++n}`;
                     let toolCalls: { id: string; type: "function"; function: { name: string; arguments: string } }[] | undefined;
+                    let compressCalled = false;
                     if (/^REVIEW_POLICY/.test(sysText)) {
                         content = `{"risk":"low","decision":"allow"}`;
                     } else if (/Create a concise title/i.test(sysText)) {
                         content = "Workspace Setup";
+                    } else if (wantsCompress && !hasCompressResult) {
+                        toolCalls = [compressToolCall()];
+                        compressCalled = true;
                     } else if (messages.some((m) => m?.role === "tool")) {
                         content = "done: the output was ZX7-back";
                     } else if (messages.some((m) => m?.role === "user" && /codeword|run the command/i.test(flat(m)))) {
                         toolCalls = [{ id: `call_${n}`, type: "function", function: { name: "bash", arguments: JSON.stringify({ command: "echo ZX7-back" }) } }];
                     }
+                    const emitRow = (fields: Record<string, unknown>): void => {
+                        try { fs.appendFileSync(reqLog, JSON.stringify(fields) + "\n"); } catch { /* best-effort */ }
+                    };
+                    emitRow({
+                        conv: req.headers["x-bili-plugin-conversation"] ?? null,
+                        plugin: req.headers["x-bili-plugin"] ?? null,
+                        model: body.model ?? null,
+                        wire: "openai",
+                        nmsgs: messages.length,
+                        sysLen: sysText.length,
+                        sysHead: sysText.slice(0, 80),
+                        hasToolResult: messages.some((m) => m?.role === "tool"),
+                        tagCount: refsOf(raw).length,
+                        hasSummary: raw.includes(SUMMARY_MARK),
+                        hasFiller: raw.includes(FILLER_MARK),
+                        compressCalled: compressCalled || (toolCalls?.some((tc) => tc.function.name === "compress") ?? false),
+                    });
 
                     const id = `chatcmpl-${n}`;
                     const model = body.model ?? "fake-a";
@@ -155,13 +207,102 @@ function startFakeUpstream(reqLog: string): Promise<http.Server> {
             });
             return;
         }
+        if (req.method === "POST" && pathOnly.endsWith("/count_tokens")) {
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ input_tokens: 100 }));
+            return;
+        }
+        if (req.method === "POST" && pathOnly.endsWith("/messages")) {
+            // anthropic-messages wire (#2791): same logical conversation,
+            // structurally different render (top-level system, content
+            // blocks, tool_use objects, tool_result inside user turns).
+            // Reply selection mirrors the openai lane; rows carry the same
+            // fold-oracle fields plus wire: "anthropic".
+            let raw = "";
+            req.on("data", (c: Buffer) => { raw += c.toString("utf8"); });
+            req.on("end", () => {
+                try {
+                    const body = JSON.parse(raw) as { model?: string; system?: string | { text?: string }[]; messages?: { role?: string; content?: unknown }[]; stream?: boolean };
+                    const sysText = typeof body.system === "string" ? body.system
+                        : Array.isArray(body.system) ? body.system.map((p) => p?.text ?? "").join("")
+                        : "";
+                    const blocksOf = (m: { content?: unknown }): { type?: string; text?: string; id?: string; name?: string; input?: unknown; tool_use_id?: string }[] =>
+                        Array.isArray(m.content) ? m.content as { type?: string; text?: string }[]
+                            : typeof m.content === "string" ? [{ type: "text", text: m.content }] : [];
+                    const messages = body.messages ?? [];
+                    const isChainCarrierA = (txt: string): boolean => /^\s*\x3cbili-chain\s[\s\S]*\/\x3e\s*$/.test(txt);
+                    const userTexts = messages.filter((m) => m?.role === "user").map((m) => blocksOf(m).filter((b) => b?.type === "text").map((b) => b.text ?? "").join("")).filter((txt) => !isChainCarrierA(txt));
+                    const lastUserText = userTexts.length > 0 ? userTexts[userTexts.length - 1] : "";
+                    const hasToolResult = messages.some((m) => blocksOf(m).some((b) => b?.type === "tool_result"));
+                    const wantsCompress = /请调用compress/.test(lastUserText);
+
+                    let content = `ok-${++n}`;
+                    let toolUse: { id: string; name: string; input: Record<string, unknown> } | undefined;
+                    if (/Create a concise title/i.test(sysText)) {
+                        content = "Workspace Setup";
+                    } else if (wantsCompress && !hasToolResult) {
+                        const refs = refsOf(JSON.stringify(messages.filter((m) => m?.role !== "system")));
+                        toolUse = { id: `toolu_${n}`, name: "compress", input: refs.length === 0 ? {} : { content: [{ startId: refs[0], endId: refs[0], summary: SUMMARY_MARK }] } };
+                    } else if (hasToolResult) {
+                        content = "done: the output was ZX7-back";
+                    }
+                    try {
+                        fs.appendFileSync(reqLog, JSON.stringify({
+                            conv: req.headers["x-bili-plugin-conversation"] ?? null,
+                            plugin: req.headers["x-bili-plugin"] ?? null,
+                            model: body.model ?? null,
+                            wire: "anthropic",
+                            nmsgs: messages.length,
+                            sysLen: sysText.length,
+                            sysHead: sysText.slice(0, 80),
+                            hasToolResult,
+                            tagCount: refsOf(raw).length,
+                            hasSummary: raw.includes(SUMMARY_MARK),
+                            hasFiller: raw.includes(FILLER_MARK),
+                            compressCalled: toolUse?.name === "compress",
+                        }) + "\n");
+                    } catch { /* best-effort */ }
+
+                    const model = body.model ?? "fake-ant-a";
+                    const usage = { input_tokens: 100, output_tokens: 5 };
+                    if (body.stream) {
+                        res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
+                        const ev = (event: string, data: unknown): void => { res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`); };
+                        ev("message_start", { type: "message_start", message: { id: `msg_${n}`, type: "message", role: "assistant", model, usage: { input_tokens: 100, output_tokens: 1 } } });
+                        ev("content_block_start", { type: "content_block_start", index: 0, content_block: toolUse ? { type: "tool_use", id: toolUse.id, name: toolUse.name, input: {} } : { type: "text", text: "" } });
+                        if (toolUse) {
+                            ev("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: JSON.stringify(toolUse.input) } });
+                        } else {
+                            ev("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: content } });
+                        }
+                        ev("content_block_stop", { type: "content_block_stop", index: 0 });
+                        ev("message_delta", { type: "message_delta", delta: { stop_reason: toolUse ? "tool_use" : "end_turn" }, usage });
+                        ev("message_stop", { type: "message_stop" });
+                        res.end();
+                    } else {
+                        res.writeHead(200, { "content-type": "application/json" });
+                        res.end(JSON.stringify({
+                            id: `msg_${n}`, type: "message", role: "assistant", model,
+                            content: toolUse ? [{ type: "tool_use", id: toolUse.id, name: toolUse.name, input: toolUse.input }] : [{ type: "text", text: content }],
+                            stop_reason: toolUse ? "tool_use" : "end_turn",
+                            usage,
+                        }));
+                    }
+                } catch (e) {
+                    res.writeHead(500, { "content-type": "application/json" });
+                    res.end(JSON.stringify({ error: { message: String(e) } }));
+                }
+            });
+            return;
+        }
         res.writeHead(404, { "content-type": "application/json" });
+        if (req.method === "POST") console.error(`[persona-fake] 404 ${req.method} ${req.url}`);
         res.end(JSON.stringify({ error: { message: "not found" } }));
     });
     return new Promise((resolve) => server.listen(FAKE_PORT, "127.0.0.1", () => resolve(server)));
 }
 
-interface Oracle { conv: string | null; plugin: string | null; model: string | null; nmsgs: number; sysLen: number; sysHead: string; hasToolResult: boolean }
+interface Oracle { conv: string | null; plugin: string | null; model: string | null; wire?: "openai" | "anthropic"; nmsgs: number; sysLen: number; sysHead: string; hasToolResult: boolean; tagCount?: number; hasSummary?: boolean; hasFiller?: boolean; compressCalled?: boolean }
 
 function readOracle(reqLog: string): Oracle[] {
     if (!fs.existsSync(reqLog)) return [];
@@ -173,7 +314,7 @@ interface Rig {
     cwd: string;
     reqLog: string;
     outDir: string;
-    setDefaultModel: (model: string, withAutoReview: boolean) => void;
+    setDefaultModel: (provider: string, model: string, withAutoReview: boolean) => void;
     stopAndFlush: () => Promise<void>;
     persistedSessions: () => { state: string; data: string };
     cleanup: () => void;
@@ -209,7 +350,9 @@ function buildRig(tag: string, withAutoReview: boolean): Rig {
     // Two models; flipping the default between turns makes dsh recompose its
     // main system — the exact #2241 trigger. Model B also carries a different
     // context window so the two system texts are guaranteed apart.
-    const patchYml = (model: string, autoReview: boolean): string => [
+    // fake-ant speaks the anthropic-messages wire against the same fake
+    // upstream — the #2791 cross-protocol switch lane.
+    const patchYml = (provider: string, model: string, autoReview: boolean): string => [
         "- id: llm-pi-ai",
         "  config:",
         "    providers:",
@@ -227,17 +370,33 @@ function buildRig(tag: string, withAutoReview: boolean): Rig {
         "            name: Model Beta",
         "            contextWindow: 32000",
         "            maxTokens: 4096",
+        "      fake-ant:",
+        "        displayName: Fake Anthropic Upstream",
+        "        apiKeyEnv: E2E_FAKE_KEY",
+        "        api: anthropic-messages",
+        `        baseURL: http://127.0.0.1:${FAKE_PORT}`,
+        "        models:",
+        "          - id: fake-ant-a",
+        "            name: Model Ant Alpha",
+        "            contextWindow: 60000",
+        "            maxTokens: 4096",
         "- id: agent-default-model",
         "  config:",
-        "    provider: fake",
+        `    provider: ${provider}`,
         `    model: ${model}`,
         ...(autoReview ? ["- id: auto-review"] : []),
         "",
     ].join("\n");
-    fs.writeFileSync(path.join(profileDir, "cordis.patch.yml"), patchYml("fake-a", withAutoReview));
+    fs.writeFileSync(path.join(profileDir, "cordis.patch.yml"), patchYml("fake", "fake-a", withAutoReview));
     fs.mkdirSync(path.join(xdg.config, "billion-context"), { recursive: true });
+    // preserveRecentTokens + preserveRecentMessages = 0 — mirrors what
+    // preflight relaxes under overflow (#330): the rig's scripted turns are
+    // short, so the kernel's default protected zone (last 5 messages + most
+    // recent user message) would otherwise pin EVERY ref and the scripted
+    // compress could never fold ("Range is entirely within the protected
+    // zone"). Zeroing them is established product behavior, not a hack.
     fs.writeFileSync(path.join(xdg.config, "billion-context", "billion-context.json"),
-        JSON.stringify({ providers: {}, compress: { preserveRecentTokens: 0 } }, null, 2) + "\n");
+        JSON.stringify({ providers: {}, compress: { preserveRecentTokens: 0, preserveRecentMessages: 0 } }, null, 2) + "\n");
 
     const env: NodeJS.ProcessEnv = {
         ...cleanEnv(),
@@ -282,13 +441,17 @@ function buildRig(tag: string, withAutoReview: boolean): Rig {
                     try {
                         const j = JSON.parse(fs.readFileSync(p, "utf8")) as { payload?: { id?: string; stats?: { requests?: number }; state?: { messageRefs?: { byRaw?: Record<string, unknown> }; blocks?: Record<string, unknown> } } };
                         const inner = j.payload;
-                        if (!inner?.id) return;
-                        found.push({
-                            id: String(inner.id),
-                            requests: inner.stats?.requests ?? null,
-                            refs: Object.keys(inner.state?.messageRefs?.byRaw ?? {}).length,
-                            blocks: Object.keys(inner.state?.blocks ?? {}).length,
-                        });
+                        // Skip (don't abort the walk on) non-envelope .json
+                        // sidecars — e.g. index.db.chk — so one stray file can't
+                        // blind the whole directory scan.
+                        if (inner?.id) {
+                            found.push({
+                                id: String(inner.id),
+                                requests: inner.stats?.requests ?? null,
+                                refs: Object.keys(inner.state?.messageRefs?.byRaw ?? {}).length,
+                                blocks: Object.keys(inner.state?.blocks ?? {}).length,
+                            });
+                        }
                     } catch { /* skip unreadable */ }
                 }
             }
@@ -299,13 +462,13 @@ function buildRig(tag: string, withAutoReview: boolean): Rig {
 
     return {
         env, cwd, reqLog, outDir,
-        setDefaultModel: (model, autoReview) => fs.writeFileSync(path.join(profileDir, "cordis.patch.yml"), patchYml(model, autoReview)),
+        setDefaultModel: (provider, model, autoReview) => fs.writeFileSync(path.join(profileDir, "cordis.patch.yml"), patchYml(provider, model, autoReview)),
         stopAndFlush,
         persistedSessions: () => ({
             state: JSON.stringify(readDir(path.join(xdg.state, "billion-context", "sessions"))),
             data: JSON.stringify(readDir(path.join(xdg.data, "billion-context", "sessions"))),
         }),
-        cleanup: () => { try { fs.rmSync(root, { recursive: true, force: true }); fs.rmSync(outDir, { recursive: true, force: true }); } catch { /* best-effort */ } },
+        cleanup: () => { if (process.env.E2E_KEEP_ARTIFACTS === "1") return; try { fs.rmSync(root, { recursive: true, force: true }); fs.rmSync(outDir, { recursive: true, force: true }); } catch { /* best-effort */ } },
     };
 }
 
@@ -360,7 +523,7 @@ test("real dsh #2241 A: a mid-session model switch keeps the raw conversation ke
         assert.ok(sessionId, "turn 1 --json events expose the dsh session id");
 
         // ---- the model switch: same dsh session, recomposed main system ----
-        rig.setDefaultModel("fake-b", false);
+        rig.setDefaultModel("fake", "fake-b", false);
         const r2 = await dshRun(rig, ["--session-id", sessionId, "--json", "What was the codeword? Answer with the word only."], "A-t2");
         assert.equal(r2.code, 0, `turn 2 dsh exit (${r2.err.slice(-300)})`);
 
@@ -393,6 +556,67 @@ test("real dsh #2241 A: a mid-session model switch keeps the raw conversation ke
     }
 });
 
+test("real dsh #2791 C: a mid-session PROTOCOL switch (openai -> anthropic) keeps the session, conv, and fold", gated, async (t) => {
+    assert.ok(fs.existsSync(path.join(REPO_ROOT, "dist", "agent", "dsh-native.js")), "npm run build first — the profile loads dist/agent/dsh-native.js");
+    const rig = buildRig("xwire", false);
+    const fake = await startFakeUpstream(rig.reqLog);
+    t.after(() => { fake.close(); rig.cleanup(); });
+
+    // ---- turn 1 (openai wire): bulky tagged ledger + one bash round ----
+    // The bash round matters: with only the filler + dsh's operational notice
+    // visible, EVERY ref sits inside the kernel's protected zone (last 5
+    // messages + most recent user message) and the scripted compress would
+    // fail with "Range is entirely within the protected zone". The bash
+    // call/result pushes the filler far enough back to be foldable.
+    const fillerBody = `${FILLER_MARK} grain ledger audit. ${"the grain transport network continued without measurable incident. ".repeat(500)}`;
+    const r1 = await dshRun(rig, ["--json", `${fillerBody}\nFirst run the command to sample the ledger.`], "C-t1");
+    assert.equal(r1.code, 0, `turn 1 dsh exit (${r1.err.slice(-300)})`);
+    const sessionId = sessionIdOf(r1.out);
+    assert.ok(sessionId, "turn 1 --json events expose the dsh session id");
+
+    // ---- turn 2 (openai wire, same session): the scripted fold ----
+    const r2 = await dshRun(rig, ["--session-id", sessionId, "--json", "The grain ledger above is bulky. 请调用compress to fold it, then reply: folded done."], "C-t2");
+    assert.equal(r2.code, 0, `turn 2 dsh exit (${r2.err.slice(-300)})`);
+
+    // ---- the PROTOCOL switch: same dsh session, anthropic-messages wire ----
+    rig.setDefaultModel("fake-ant", "fake-ant-a", false);
+    const r3 = await dshRun(rig, ["--session-id", sessionId, "--json", "The ledger was folded earlier. Reply with exactly: carried on."], "C-t3");
+    assert.equal(r3.code, 0, `turn 3 dsh exit (${r3.err.slice(-2200)})`);
+
+    // ---- oracle: one conversation across BOTH wires ----
+    const oracle = readOracle(rig.reqLog);
+    const convs = new Set(oracle.map((o) => o.conv).filter(Boolean));
+    assert.equal(convs.size, 1, "requests across both wires stamped ONE conversation id");
+    const conv = [...convs][0] as string;
+    const openaiRows = oracle.filter((o) => o.wire !== "anthropic");
+    const anthropicRows = oracle.filter((o) => o.wire === "anthropic");
+    assert.ok(openaiRows.length >= 1, "turn 1 rode the openai wire");
+    assert.ok(anthropicRows.length >= 1, `turn 2 rode the anthropic wire (got ${anthropicRows.length}/${oracle.length} rows)`);
+    for (const o of anthropicRows) {
+        assert.equal(o.model, "fake-ant-a", `anthropic-lane row must carry the switched model (got ${o.model})`);
+        assert.equal(o.plugin, "dsh", "anthropic-lane row must stay plugin-stamped (x-bili-plugin)");
+    }
+    // Turn 3 inherited the conversation (a fork would arrive nearly empty).
+    const firstAnth = anthropicRows.find((o) => o.nmsgs > 1);
+    assert.ok(firstAnth && firstAnth.nmsgs >= 6, `first anthropic main request must inherit history (nmsgs=${firstAnth?.nmsgs})`);
+
+    // Exactly ONE model-emitted compress across the whole scenario — a forked
+    // anonymous session would re-fold from scratch on the switched wire
+    // (#2791's silent symptom).
+    const compressCalls = oracle.filter((o) => o.compressCalled === true);
+    assert.equal(compressCalls.length, 1, `compress must be CALLED exactly once across the protocol switch (got ${compressCalls.length})`);
+
+    // ---- acceptance: ONE session under the raw key, fold blocks on it ----
+    await rig.stopAndFlush();
+    const sessions = allSessions(rig).filter((s) => s.id === conv || s.id.startsWith(`${conv}|sub:`));
+    const main = sessions.find((s) => s.id === conv);
+    const forks = sessions.filter((s) => s.id.startsWith(`${conv}|sub:`));
+    assert.equal(forks.length, 0, `#2791: the protocol switch must NOT fork the main lane (found ${forks.map((f) => f.id).join(", ")})`);
+    assert.ok(main, "the raw conversation key persisted a session");
+    assert.ok((main?.requests ?? 0) >= 2, `both turns rode the raw key (requests=${main?.requests})`);
+    assert.ok((main?.blocks ?? 0) >= 1, `the fold survived the protocol switch (blocks=${main?.blocks})`);
+});
+
 // Scenario B is written and kept ready, but real-client auto-review cannot
 // arm in headless TODAY (verified against dsh 0.2.0-rc.2 sources):
 //   - the review gate is `permissionPresets.current(agent.session) !== "auto"
@@ -407,8 +631,10 @@ test("real dsh #2241 A: a mid-session model switch keeps the raw conversation ke
 //   - the profile settings.yaml legacy-import path does not settle within a
 //     one-shot run (the document is never consumed/renamed).
 // Until dsh exposes a headless surface (or adopts an event log we can seed
-// through supported means), the review FORK shape is pinned by the harness
-// e2e in tests/dsh-persona-continuity.test.ts (review e2e, both wires).
+// through supported means), the review passthrough shape (#4438 superseded
+// the #2241-era fork) is pinned by the harness e2e in
+// tests/dsh-persona-continuity.test.ts (review e2e, both wires) and
+// tests/issue4438-dsh-review-lane-isolation.test.ts.
 // Flip this gate when that changes.
 const gatedB = {
     skip: (!GATE || !dshAvailable())
@@ -418,7 +644,7 @@ const gatedB = {
             : "blocked: dsh 0.2.0-rc.2 exposes no headless surface to arm the Auto permission preset (web-UI /permission auto only) — set ACP_TEST_E2E_DSH_AUTO_REVIEW=1 to attempt anyway",
 };
 
-test("real dsh #2241 B: auto-review still forks onto |sub: while the main lane keeps the raw key", gatedB, async (t) => {
+test("real dsh #2241/#4438 B: auto-review rides the stateless passthrough while the main lane keeps the raw key", gatedB, async (t) => {
     assert.ok(fs.existsSync(path.join(REPO_ROOT, "dist", "agent", "dsh-native.js")), "npm run build first — the profile loads dist/agent/dsh-native.js");
     const rig = buildRig("review", true);
     const fake = await startFakeUpstream(rig.reqLog);
@@ -439,7 +665,8 @@ test("real dsh #2241 B: auto-review still forks onto |sub: while the main lane k
     assert.ok(mainTurns.length >= 2, `the main agent loop ran its rounds (rounds=${mainTurns.length})`);
     assert.ok(oracle.some((o) => o.hasToolResult), "the tool result round-tripped (reviewer allowed the call)");
 
-    // ---- acceptance: review forked, main stayed raw ----
+    // ---- acceptance: review minted nothing (#4438 stateless passthrough),
+    // main stayed raw ----
     await rig.stopAndFlush();
     const sessions = allSessions(rig).filter((s) => s.id === conv || s.id.startsWith(`${conv}|sub:`));
     const main = sessions.find((s) => s.id === conv);
@@ -447,5 +674,5 @@ test("real dsh #2241 B: auto-review still forks onto |sub: while the main lane k
     assert.ok(main, "the main lane persisted under the RAW conversation key");
     assert.ok((main?.requests ?? 0) >= 2, `main rounds rode the raw key (requests=${main?.requests})`);
     assert.ok((main?.refs ?? 0) >= 3, `main refs never reset (refs=${main?.refs})`);
-    assert.ok(forks.length >= 1, `the review request forked onto its own |sub: session — isolation preserved (forks=${JSON.stringify(forks.map((f) => f.id.slice(-12)))})`);
+    assert.equal(forks.length, 0, `#4438: the review request rides the stateless passthrough — no |sub: session minted (forks=${JSON.stringify(forks.map((f) => f.id.slice(-12)))})`);
 });

@@ -28,3 +28,13 @@ export function clampWindow(text: string, start: number, end: number): string {
   if (e > s && isHighSurrogate(text.charCodeAt(e - 1))) e -= 1;
   return text.slice(s, Math.max(s, e));
 }
+
+/** Belt-and-braces: replace any unpaired surrogate half (whatever its source —
+ *  model-authored compress summaries, hand-built strings, upstream payload)
+ *  with U+FFFD so it can never reach JSON.stringify as an unpaired escape.
+ *  Valid pairs pass through verbatim; non-surrogate text is untouched. */
+export function scrubLoneSurrogates(text: string): string {
+  return text
+    .replace(/[\ud800-\udbff](?![\udc00-\udfff])/g, "\ufffd")
+    .replace(/(?<![\ud800-\udbff])[\udc00-\udfff]/g, "\ufffd");
+}

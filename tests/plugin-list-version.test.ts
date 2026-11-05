@@ -154,6 +154,71 @@ test("pluginStatusAll resolves each lane's own on-disk copy version (shared vs i
     }
 });
 
+test("#2850: pluginStatusAll pi reads the pi-managed npm copy's own version for every spec form (decoy at the old wrong path ignored)", () => {
+    const base = mkdtempSync(path.join(tmpdir(), "bc-pluginlist-pi-"));
+    try {
+        const piHome = path.join(base, "pi");
+        const realCopy = path.join(piHome, "npm", "node_modules", "billion-context");
+        // Decoy at the OLD buggy probe path (<piHome>/agent/npm/...) with a
+        // different version — proves the fix reads the real materialized copy.
+        const decoy = path.join(piHome, "agent", "npm", "node_modules", "billion-context");
+        mkdirSync(realCopy, { recursive: true });
+        mkdirSync(decoy, { recursive: true });
+        writeFileSync(path.join(realCopy, "package.json"), JSON.stringify({ name: "billion-context", version: "0.1.143" }));
+        writeFileSync(path.join(decoy, "package.json"), JSON.stringify({ name: "billion-context", version: "9.9.9" }));
+        const settings = (packages: string[]): void => {
+            mkdirSync(piHome, { recursive: true });
+            writeFileSync(path.join(piHome, "settings.json"), JSON.stringify({ packages }));
+        };
+        for (const spec of ["npm:billion-context", "npm:billion-context@0.1.150", "npm:billion-context@latest"]) {
+            settings([spec]);
+            withEnv({ ...isolatedHome(base), PI_CODING_AGENT_DIR: piHome }, () => {
+                const row = pluginStatusAll().find((r) => r.agent === "pi")!;
+                assert.ok(row.status.startsWith("installed"), `${spec}: ${row.status}`);
+                assert.equal(row.copyVersion, "0.1.143", `${spec}: must read the real copy — never the decoy, the spec string, or the CLI version`);
+            });
+        }
+        // Copy not materialized yet → installed but unresolvable ("unknown").
+        settings(["npm:billion-context"]);
+        rmrf(realCopy);
+        withEnv({ ...isolatedHome(base), PI_CODING_AGENT_DIR: piHome }, () => {
+            const row = pluginStatusAll().find((r) => r.agent === "pi")!;
+            assert.ok(row.status.startsWith("installed"));
+            assert.equal(row.copyVersion, undefined, "missing copy must stay unknown, never fall back to the CLI version");
+        });
+    } finally {
+        rmrf(base);
+    }
+});
+
+test("#2850: pluginStatusAll pi resolves the copy under the default home and PI_HOME overrides", () => {
+    const base = mkdtempSync(path.join(tmpdir(), "bc-pluginlist-pihome-"));
+    try {
+        const place = (piHome: string, version: string): void => {
+            const copy = path.join(piHome, "npm", "node_modules", "billion-context");
+            mkdirSync(copy, { recursive: true });
+            writeFileSync(path.join(copy, "package.json"), JSON.stringify({ name: "billion-context", version }));
+            writeFileSync(path.join(piHome, "settings.json"), JSON.stringify({ packages: ["npm:billion-context"] }));
+        };
+        // Default layout: <HOME>/.pi/agent
+        place(path.join(base, "home", ".pi", "agent"), "0.1.140");
+        withEnv(isolatedHome(base), () => {
+            const row = pluginStatusAll().find((r) => r.agent === "pi")!;
+            assert.ok(row.status.startsWith("installed"));
+            assert.equal(row.copyVersion, "0.1.140");
+        });
+        // PI_HOME override (PI_CODING_AGENT_DIR unset)
+        const ph = path.join(base, "pihome");
+        place(ph, "0.1.141");
+        withEnv({ ...isolatedHome(base), PI_HOME: ph }, () => {
+            const row = pluginStatusAll().find((r) => r.agent === "pi")!;
+            assert.equal(row.copyVersion, "0.1.141");
+        });
+    } finally {
+        rmrf(base);
+    }
+});
+
 test("pluginStatusAll dsh joins distinct per-profile copy versions so drift is visible", () => {
     const base = mkdtempSync(path.join(tmpdir(), "bc-pluginlist-dsh-"));
     try {

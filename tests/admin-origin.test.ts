@@ -10,6 +10,7 @@ import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
+import { VERSION } from "../src/version.ts";
 import { rmrf } from "./tmp-rm.ts";
 
 /** #115: DNS rebinding defense on /__bili/ management endpoints. An attacker
@@ -292,6 +293,19 @@ test("unknown /__bili/ path → 404 locally, not forwarded to upstream (#346)", 
             req.end();
         });
         assert.equal(res.status, 404, "unknown /__bili/ path must 404 locally, not be forwarded to the upstream");
+        // #3100: a frozen pre-update process 404s routes that exist only in
+        // newer builds (the query-form UI route landed in v0.1.189), so the
+        // skew must be readable from the error itself instead of log
+        // archaeology. The message stays byte-identical; the new fields are
+        // additive (diskVersion is dropped by JSON when undefined).
+        const parsed = JSON.parse(res.body) as {
+            error?: { type?: string; message?: string; version?: unknown; commit?: unknown; diskVersion?: unknown; stale?: unknown };
+        };
+        assert.equal(parsed.error?.type, "not_found");
+        assert.equal(parsed.error?.message, "no such management endpoint", "the message stays byte-identical for existing consumers");
+        assert.equal(parsed.error?.version, VERSION, "the running version is reported in the 404 body");
+        assert.equal(typeof parsed.error?.commit, "string");
+        assert.equal(typeof parsed.error?.stale, "boolean");
     } finally {
         process.env.BILI_CONFIG_FILE = prevConfig;
         proxy.closeAllConnections?.();

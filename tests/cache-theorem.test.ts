@@ -7,9 +7,10 @@
  *                        (two scenarios: merge anchor flips / stationary).
  *   T2 ref monotonicity  persistent monotone cursor => no allocation reissues
  *                        an ever-issued number (kernel id-never-reused contract).
- *   Mutations            a stable-byte rewrite (T1) and a post-archive cursor
- *                        reset (T2, the #421 residual) MUST be found by the
- *                        solver as counterexamples -- the proofs are not vacuous.
+ *   Mutations            a stable-byte rewrite (T1), a post-archive cursor
+ *                        reset (T2, the #421 residual) and a claim-state-coupled
+ *                        ref presentation (T2, #3198 hardening) MUST be found by
+ *                        the solver as counterexamples -- the proofs are not vacuous.
  *
  * Trust boundary: theorems are proven over proof/spec/*.smt2 (the assembly
  * CONTRACT). The [grounding:*] subtests below pin each spec axiom to the real
@@ -121,6 +122,17 @@ const CHECKS: Check[] = [
     parts: ["preamble.smt2", "t2.smt2", "t2-mutation.smt2"],
     expect: "sat",
     modelVars: ["hui", "creset", "n3", "n4"],
+  },
+  {
+    // #3198 hardening: if live-ref presentation were gated on reconcile CLAIM
+    // state instead of the persistent content-keyed map, byte-equal mid-history
+    // messages could present under different refs across turns. Shipped code has
+    // no such coupling ([grounding:g1] pins the allocator half, [grounding:g4]
+    // the id-derivation half).
+    name: "t2-claimcoupling-permits-ref-drift",
+    parts: ["preamble.smt2", "t2.smt2", "t2-claimcoupling.smt2"],
+    expect: "sat",
+    modelVars: ["storedNum", "curNum", "rA", "rB"],
   },
 ];
 
@@ -305,5 +317,43 @@ test("[grounding:g1] ref cursor mechanics pinned to assignRefs/allocateFreeRef",
       assert.equal(new Set(nums).size, nums.length, "live bindings pairwise distinct");
       assert.equal(cursor, prev + 1, "cursor tracks highest allocated + 1");
     }
+  }
+});
+
+test("[grounding:g4] raw-id derivation pinned: determinism + prefix-extension invariance", async () => {
+  const { deriveMessageId, ClusterCounter } = await import("../kernel/src/wire/message-id.js");
+  const opts = { toolCallId: "tc-1", toolName: "bash" };
+  const id = deriveMessageId("tool", "tool-result", "output text", opts);
+  assert.equal(deriveMessageId("tool", "tool-result", "output text", opts), id, "determinism");
+  assert.notEqual(deriveMessageId("user", "tool-result", "output text", opts), id, "role participates");
+  assert.notEqual(deriveMessageId("tool", "text", "output text", opts), id, "contentType participates");
+  assert.notEqual(
+    deriveMessageId("tool", "tool-result", "output text", { toolCallId: "tc-2", toolName: "bash" }),
+    id,
+    "toolCallId participates",
+  );
+  assert.notEqual(
+    deriveMessageId("tool", "tool-result", "output text", { toolCallId: "tc-1", toolName: "cat" }),
+    id,
+    "toolName participates",
+  );
+  assert.notEqual(deriveMessageId("tool", "tool-result", "output text!", opts), id, "text participates");
+  {
+    const seq = ["dup", "solo", "dup", "dup"];
+    const c1 = new ClusterCounter();
+    const c2 = new ClusterCounter();
+    const n1 = seq.map((x) => c1.next(x));
+    const n2 = seq.map((x) => c2.next(x));
+    assert.deepEqual(n1, n2, "two passes over the same content, same numbering");
+    assert.deepEqual(n1, ["dup", "solo", "dup_1", "dup_2"]);
+  }
+  {
+    const prefixSeq = ["dup", "solo", "dup"];
+    const c1 = new ClusterCounter();
+    const first = prefixSeq.map((x) => c1.next(x));
+    const c2 = new ClusterCounter();
+    const extended = [...prefixSeq, "other", "dup"].map((x) => c2.next(x));
+    assert.deepEqual(extended.slice(0, prefixSeq.length), first, "prefix ids stable under extension");
+    assert.equal(extended[extended.length - 1], "dup_2", "later duplicate continues the count");
   }
 });

@@ -148,8 +148,10 @@ async function startHarness(sessionId: string, reportUsage: boolean): Promise<{
         cleanup: async () => {
             setLogCapture(null);
             proxy.close();
+            proxy.closeIdleConnections?.();
             await once(proxy, "close");
             relay.server.close();
+            relay.server.closeIdleConnections?.();
             await once(relay.server, "close");
         },
     };

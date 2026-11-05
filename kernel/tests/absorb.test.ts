@@ -8,6 +8,7 @@ import {
   hideAbsorbedMessages,
   isAbsorbCandidate,
   parseAbsorbInput,
+  DEFAULT_ABSORB_CONFIG,
   ABSORB_PROMPT_MARKER,
 } from "../src/absorb.js";
 import { createCore } from "../src/compress.js";
@@ -66,6 +67,10 @@ function session(): CoreMessage[] {
   ];
 }
 
+// mediaOnly is pinned false here on purpose: these tests exercise the absorb
+// MECHANISM (prompting/hiding/stats/skip rules) in isolation over text results.
+// The #3402 media-scope gate (default true) is covered by dedicated tests at
+// the bottom of this file — mixing it in would make every fixture need a payload.
 function absorbConfig(
   overrides: Partial<Config["absorb"]> = {},
 ): Config["absorb"] {
@@ -75,8 +80,15 @@ function absorbConfig(
     minToolTokens: 1000,
     contextThresholdPct: 0,
     excludeTools: [],
+    mediaOnly: false,
     ...overrides,
   };
+}
+
+function mediaResult(id: string, callId: string, toolName = "screenshot"): CoreMessage {
+  return Object.assign(smallResult(id, callId, toolName), {
+    imageBase64: "iVBORw0KGgoAAAANSUhEUg==",
+  });
 }
 
 function stateWithRefs(messages: CoreMessage[]): CompressionState {
@@ -408,6 +420,7 @@ test("absorbed records survive applyCompression cloning", () => {
     tokenCount: 100,
   }).state;
   const config = defaultConfig(200000, {
+    absorb: absorbConfig(),
     compress: {
       minCompressRange: 0,
       maxSummaryLength: 20000,
@@ -478,4 +491,67 @@ test("absorb config validation reports range errors", () => {
     "expected minToolTokens error",
   );
   assert.ok(errors.some((e) => e.includes("absorb.contextThresholdPct")));
+});
+
+// --- #3402 media-scope gate (revival of absorb, scoped to image-bearing results) ---
+
+test("isAbsorbCandidate: mediaOnly gates on hasMediaPayload", () => {
+  const textRes = bigResult("r1", "call1");
+  const mediaRes = mediaResult("r2", "call2");
+  const on = defaultConfig(200000, { absorb: absorbConfig({ mediaOnly: true }) });
+  const off = defaultConfig(200000, { absorb: absorbConfig({ mediaOnly: false }) });
+  assert.equal(isAbsorbCandidate(textRes, on), false, "mediaOnly on + no media → not a candidate");
+  assert.equal(isAbsorbCandidate(mediaRes, on), true, "mediaOnly on + media → candidate");
+  assert.equal(isAbsorbCandidate(textRes, off), true, "mediaOnly off + no media → candidate (old behavior)");
+  assert.equal(isAbsorbCandidate(mediaRes, off), true, "mediaOnly off + media → candidate");
+});
+
+test("appendAbsorbPrompts: mediaOnly marks image results (even small) and skips text results", () => {
+  const build = (): CoreMessage[] => [
+    toolCall("c1", "call1", "read"),
+    bigResult("r1", "call1", "read"),
+    toolCall("c2", "call2", "screenshot"),
+    mediaResult("r2", "call2", "screenshot"),
+  ];
+  const onMsgs = build();
+  const onState = stateWithRefs(onMsgs);
+  const onCfg = defaultConfig(200000, { absorb: absorbConfig({ mediaOnly: true }) });
+  const onRes = appendAbsorbPrompts(onMsgs, onState, onCfg, 5000, countTokens);
+  assert.ok(!onRes.messages.find((m) => m.id === "r1")!.text!.includes(ABSORB_PROMPT_MARKER), "text-only result NOT marked under mediaOnly");
+  assert.ok(onRes.messages.find((m) => m.id === "r2")!.text!.includes(ABSORB_PROMPT_MARKER), "small image result IS marked (exempt from minToolTokens)");
+  assert.equal(onRes.promptedCount, 1);
+
+  const offMsgs = build();
+  const offState = stateWithRefs(offMsgs);
+  const offCfg = defaultConfig(200000, { absorb: absorbConfig({ mediaOnly: false }) });
+  const offRes = appendAbsorbPrompts(offMsgs, offState, offCfg, 5000, countTokens);
+  assert.ok(offRes.messages.find((m) => m.id === "r1")!.text!.includes(ABSORB_PROMPT_MARKER), "old behavior: large text result marked");
+  assert.ok(!offRes.messages.find((m) => m.id === "r2")!.text!.includes(ABSORB_PROMPT_MARKER), "old behavior: tiny result below bar stays unmarked");
+});
+
+test("applyAbsorb: mediaOnly rejects a non-media target (mirror of screening)", () => {
+  const messages: CoreMessage[] = [
+    toolCall("c1", "call1", "read"),
+    bigResult("r1", "call1", "read"),
+    toolCall("c2", "call2", "screenshot"),
+    mediaResult("r2", "call2", "screenshot"),
+  ];
+  const state = stateWithRefs(messages);
+  const cfg = defaultConfig(200000, { absorb: absorbConfig({ mediaOnly: true }) });
+  const refused = applyAbsorb({ ref: refForRaw(state.messageRefs, "r1")!, summary: "s", messages, state, config: cfg });
+  assert.equal(refused.ok, false);
+  assert.ok(refused.resultText.includes("no media payload"));
+  const accepted = applyAbsorb({ ref: refForRaw(state.messageRefs, "r2")!, summary: "s", messages, state, config: cfg });
+  assert.ok(accepted.ok, accepted.resultText);
+  assert.equal(accepted.state.absorbed!.length, 1);
+});
+
+test("kernel ships mediaOnly neutral; the media-scoped default is host policy", () => {
+  // The engine exposes the capability with a neutral default (unset → legacy
+  // full-text when enabled) so engine goldens stay untouched; bili's product
+  // stance (media-scoped by default, #3402) is applied one layer up in
+  // resolveAbsorbSettings — pinned in tests/absorb.test.ts ("maps settings
+  // absorb onto kernel AbsorbConfig").
+  assert.equal(defaultConfig(100000).absorb?.mediaOnly, undefined);
+  assert.equal(DEFAULT_ABSORB_CONFIG.mediaOnly, undefined);
 });

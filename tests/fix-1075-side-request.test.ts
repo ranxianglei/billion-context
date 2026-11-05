@@ -211,8 +211,10 @@ test("#1075 e2e openai-wire: 1-message side request neither wipes ref maps nor i
         assert.ok(fwd3.raw.includes("MORE_99_payload"), "new tail survives in the payload");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });

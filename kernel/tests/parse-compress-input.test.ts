@@ -1236,3 +1236,153 @@ test("line-form split still breaks on headers after blank lines and element resi
     ],
   );
 });
+
+// ---------------------------------------------------------------------------
+// Flat single-range: summary text in the content STRING + top-level bounds
+// ({content, startId, endId, topic?}) — the two schema-advertised shapes
+// merged into one call. Observed live as repeated kind=content-not-array
+// rejections while the model retried the same valid-intent compress.
+// ---------------------------------------------------------------------------
+
+test("parseCompressArgs recovers a flat single-range call with summary text in content", () => {
+  const { ranges, diagnostics } = parseCompressArgs({
+    content: "Summary of the folded range.\nSecond line of the summary.",
+    startId: "m00150",
+    endId: "m00168",
+  });
+  assert.equal(diagnostics.ok, true);
+  assert.equal(diagnostics.flatSummarySalvage, true);
+  assert.equal(diagnostics.kind, "ok");
+  assert.equal(ranges.length, 1);
+  assert.equal(ranges[0]?.startRef, "m00150");
+  assert.equal(ranges[0]?.endRef, "m00168");
+  assert.equal(ranges[0]?.summary, "Summary of the folded range.\nSecond line of the summary.");
+});
+
+test("parseCompressArgs flat single-range keeps top-level topic and ref variants", () => {
+  const { ranges } = parseCompressArgs({
+    content: "The summary text.",
+    startRef: "m00002",
+    endRef: "m00009",
+    topic: "repro loop",
+  });
+  assert.equal(ranges.length, 1);
+  assert.equal(ranges[0]?.startRef, "m00002");
+  assert.equal(ranges[0]?.endRef, "m00009");
+  assert.equal(ranges[0]?.topic, "repro loop");
+});
+
+test("parseCompressArgs flat single-range unwraps a JSON-encoded {summary,topic} in content", () => {
+  const { ranges, diagnostics } = parseCompressArgs({
+    content: JSON.stringify({ summary: "encoded summary", topic: "inner topic" }),
+    startId: "m00001",
+    endId: "m00004",
+  });
+  assert.equal(diagnostics.flatSummarySalvage, true);
+  assert.equal(ranges[0]?.summary, "encoded summary");
+  assert.equal(ranges[0]?.topic, "inner topic");
+});
+
+test("parseCompressArgs flat single-range prefers an explicit top-level summary over content text", () => {
+  const { ranges } = parseCompressArgs({
+    content: "ignored prose",
+    summary: "explicit summary wins",
+    startId: "m00001",
+    endId: "m00002",
+  });
+  assert.equal(ranges[0]?.summary, "explicit summary wins");
+});
+
+test("parseCompressArgs does NOT apply flat single-range when content carries refs headers", () => {
+  // Line-form material keeps its line-form reading even with top-level refs:
+  // valid headers parse as ranges...
+  const ok = parseCompressArgs({
+    content: "m00010–m00020 topic\nsummary text.",
+    startId: "m00001",
+    endId: "m00099",
+  });
+  assert.equal(ok.ranges.length, 1);
+  assert.equal(ok.ranges[0]?.startRef, "m00010");
+  assert.equal(ok.diagnostics.flatSummarySalvage, undefined);
+  // ...and header-only entries report the missing summary, not a salvage.
+  const bad = parseCompressArgs({
+    content: "m00010–m00020 topic only",
+    startId: "m00001",
+    endId: "m00099",
+  });
+  assert.equal(bad.diagnostics.ok, false);
+  assert.equal(bad.diagnostics.flatSummarySalvage, undefined);
+  assert.equal(bad.diagnostics.kind, "no-valid-ranges");
+  assert.match(bad.diagnostics.invalidReasons?.[0] ?? "", /missing summary/);
+});
+
+test("parseCompressArgs keeps headerless prose without top-level refs as content-not-array", () => {
+  const { diagnostics } = parseCompressArgs({ content: "just prose, no refs, no bounds" });
+  assert.equal(diagnostics.kind, "content-not-array");
+  assert.equal(diagnostics.flatSummarySalvage, undefined);
+});
+
+test("parseCompressArgs reports header-only line entries as no-valid-ranges with reasons", () => {
+  const { diagnostics } = parseCompressArgs({
+    content: "m00010–m00020 topic one\nsummary ok.\nm00030–m00040 topic two",
+  });
+  assert.equal(diagnostics.kind, "ok"); // 1 valid + 1 invalid
+  assert.equal(diagnostics.invalidItems, 1);
+  assert.match(diagnostics.invalidReasons?.[0] ?? "", /missing summary/);
+  const none = parseCompressArgs({ content: "m00010–m00020 topic only" });
+  assert.equal(none.diagnostics.kind, "no-valid-ranges");
+  assert.match(none.diagnostics.invalidReasons?.[0] ?? "", /missing summary/);
+});
+
+// ---------------------------------------------------------------------------
+// Refs separator variants: a pair divider outside the recognized dash class
+// must never silently narrow the range to its first ref.
+// ---------------------------------------------------------------------------
+
+test("parseCompressArgs accepts U+2212 minus and fullwidth hyphen as range separators", () => {
+  const minus = parseCompressArgs({ content: "m00150−m00168 topic\nsummary." });
+  assert.equal(minus.ranges[0]?.startRef, "m00150");
+  assert.equal(minus.ranges[0]?.endRef, "m00168");
+  const fw = parseCompressArgs({ content: "m00150－m00168 topic\nsummary." });
+  assert.equal(fw.ranges[0]?.startRef, "m00150");
+  assert.equal(fw.ranges[0]?.endRef, "m00168");
+});
+
+// #5555 audit: ".." was advertised in an error message but rejected by the
+// pair regex; a two-dot header was even worse — splitLineEntries never saw a
+// refs header there and swallowed the entry into the previous one silently.
+test("parseCompressArgs accepts two-dot ranges exactly like three-dot", () => {
+  const two = parseCompressArgs({ content: "m00150..m00168 topic\nsummary." });
+  assert.equal(two.ranges[0]?.startRef, "m00150");
+  assert.equal(two.ranges[0]?.endRef, "m00168");
+  const three = parseCompressArgs({ content: "m00150...m00168 topic\nsummary." });
+  assert.equal(three.ranges[0]?.startRef, "m00150");
+  assert.equal(three.ranges[0]?.endRef, "m00168");
+});
+
+test("line-form entries split at two-dot refs headers (no silent continuation)", () => {
+  const parsed = parseCompressArgs({
+    content: "m00001..m00003 first\nsum A\nm00004..m00007 second\nsum B",
+  });
+  assert.equal(parsed.ranges.length, 2);
+  assert.deepEqual(
+    parsed.ranges.map((r) => [r.startRef, r.endRef]),
+    [
+      ["m00001", "m00003"],
+      ["m00004", "m00007"],
+    ],
+  );
+});
+
+test("parseCompressArgs refuses to narrow a ref pair with an unrecognized separator", () => {
+  const { ranges, diagnostics } = parseCompressArgs({
+    content: "m00150 => m00168 topic\nsummary.",
+  });
+  assert.equal(ranges.length, 0);
+  assert.equal(diagnostics.kind, "no-valid-ranges");
+  assert.match(diagnostics.invalidReasons?.[0] ?? "", /separator not recognized/);
+  // A legit single-ref header with a punctuation topic still parses.
+  const single = parseCompressArgs({ content: "m00150 — intro notes\nsummary." });
+  assert.equal(single.ranges[0]?.startRef, "m00150");
+  assert.equal(single.ranges[0]?.endRef, "m00150");
+});

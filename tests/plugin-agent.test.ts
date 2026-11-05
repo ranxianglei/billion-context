@@ -77,7 +77,7 @@ test("proxyBaseFromEnv accepts BILLION_CONTEXT_PROXY, detectProxyBase honors kil
 
 type FakeProxy = {
     origin: string;
-    toolCalls: Array<{ conversationId: string; tool: string; args: unknown; nativeCaller?: boolean }>;
+    toolCalls: Array<{ conversationId: string; tool: string; args: unknown; nativeCaller?: boolean; toolCallId?: string }>;
     registers: Array<{ conversationId: string; agent: string; identity: boolean; parentConversationId?: string }>;
     runtimeInfos: Array<Record<string, unknown>>;
     close(): Promise<void>;
@@ -211,6 +211,16 @@ type FakePi = {
     registerTool: (tool: RecordedTool) => void;
     registerCommand: (name: string, options: RecordedCommand) => void;
     registerProvider?: (name: string, config: { baseUrl: string }) => void;
+    // #2708: real pi exposes the registry contents; the plugin probes it to
+    // detect a mid-session drop. Optional so a host without it can be modeled.
+    getAllTools?: () => Array<{ name: string }>;
+    // #3542: real pi exposes the ACTIVE loadout (distinct from the registry);
+    // the plugin re-asserts it after a tree navigation. Optional so a host
+    // without it can be modeled.
+    activeTools: string[];
+    setActiveCalls: unknown[][];
+    getActiveTools?: () => string[];
+    setActiveTools?: (toolNames: string[]) => void;
 };
 
 function makeFakePi(): FakePi {
@@ -218,12 +228,18 @@ function makeFakePi(): FakePi {
     const tools: RecordedTool[] = [];
     const commands = new Map<string, RecordedCommand>();
     const providers = new Map<string, string>();
+    // #3542: the active loadout, separate from the registry `tools` — a test
+    // can reset it (as pi's /tree does) while the registrations survive.
+    const activeTools: string[] = [];
+    const setActiveCalls: unknown[][] = [];
     let registerCallCount = 0;
     return {
         events,
         tools,
         commands,
         providers,
+        activeTools,
+        setActiveCalls,
         get registerCalls() { return registerCallCount; },
         on: (event, handler) => {
             // Real pi dispatches each event to ALL registered handlers in
@@ -232,7 +248,7 @@ function makeFakePi(): FakePi {
             // single-slot map would let the last registration shadow the rest.
             const h = handler as (event: unknown, ctx: unknown) => unknown;
             const prev = events.get(event);
-            events.set(event, prev ? ((e, c) => { prev(e, c); return h(e, c); }) : h);
+            events.set(event, prev ? ((e, c) => { const r = prev(e, c); return r instanceof Promise ? r.then(() => h(e, c)) : h(e, c); }) : h);
         },
         registerTool: (tool) => {
             registerCallCount++;
@@ -245,6 +261,17 @@ function makeFakePi(): FakePi {
         },
         registerProvider: (name, config) => {
             providers.set(name, config.baseUrl);
+        },
+        // #2708: mirrors real pi's ExtensionAPI.getAllTools() — returns the
+        // registry contents by name. The test drops tools from `tools` directly
+        // to simulate pi rebuilding its registry with an empty instance map.
+        getAllTools: () => tools.map((t) => ({ name: t.name })),
+        // #3542: mirrors real pi's ExtensionAPI.getActiveTools()/setActiveTools().
+        // setActiveTools dedupes like pi (_setActiveTools via [...new Set(...)]).
+        getActiveTools: () => [...activeTools],
+        setActiveTools: (toolNames) => {
+            setActiveCalls.push([...toolNames]);
+            activeTools.splice(0, activeTools.length, ...new Set(toolNames));
         },
     };
 }
@@ -745,7 +772,7 @@ test("pi extension registers manifest tools and stamps headers when proxied", as
         assert.equal(out.isError, undefined);
         // #2072: the pi host stamps its session-manager id as a confirmed
         // native caller — the captured wire body carries the flag.
-        assert.deepEqual(proxy.toolCalls, [{ conversationId: "sess-42", tool: "compress", args: { content: [] }, nativeCaller: true }]);
+        assert.deepEqual(proxy.toolCalls, [{ conversationId: "sess-42", tool: "compress", args: { content: [] }, nativeCaller: true, toolCallId: "call-1" }]);
         const errOut = await pi.tools[1]!.execute("call-2", {}, undefined, undefined, fakeCtx(proxy));
         assert.match(errOut.content[0]!.text, /bili tool error:.*boom/);
         assert.equal(errOut.isError, true);
@@ -807,7 +834,7 @@ test("#2416: registered tools track the respawned proxy origin — live re-read 
         out = await pi.tools[0]!.execute("call-2", { content: [] }, undefined, undefined, ctx);
         assert.equal(out.isError, undefined, "the tool must reach the respawned proxy, not keep firing at the dead port");
         assert.match(out.content[0]!.text, /\[Compressed/);
-        assert.deepEqual(newProxy.toolCalls, [{ conversationId: "sess-42", tool: "compress", args: { content: [] }, nativeCaller: true }]);
+        assert.deepEqual(newProxy.toolCalls, [{ conversationId: "sess-42", tool: "compress", args: { content: [] }, nativeCaller: true, toolCallId: "call-2" }]);
         assert.equal(oldProxy.toolCalls.length, 1, "nothing further may hit the dead origin");
     } finally {
         if (prevEnv === undefined) delete process.env.BILLION_CONTEXT_PROXY;
@@ -851,6 +878,225 @@ test("before_provider_headers stamps after a session_start prewarm too", async (
         await pi.events.get("before_provider_headers")!({ headers: late }, fakeCtx(proxy));
         assert.equal(late["x-bili-plugin"], "pi");
         assert.equal(late["x-bili-plugin-conversation"], "sess-42");
+    } finally {
+        await proxy.close();
+    }
+});
+
+test("#2708: a mid-session registry rebuild that drops bili tools self-heals on the next request", async () => {
+    const proxy = await startFakeProxy();
+    const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bc-plugin-agent-log-"));
+    try {
+        const pi = makeFakePi();
+        biliPlugin(pi as never);
+        await pi.events.get("session_start")!({}, fakeCtx(proxy));
+        await waitForTools(pi, 2);
+        assert.equal(pi.tools.length, 2, "baseline: both manifest tools registered");
+        const before = pi.registerCalls;
+
+        const termLines: string[] = [];
+        const origWarn = console.warn;
+        const headers: Record<string, string> = {};
+        console.warn = (...args: unknown[]) => { termLines.push(args.map(String).join(" ")); };
+        try {
+            await withEnv({ XDG_STATE_HOME: stateHome }, async () => {
+                // pi rebuilds its registry while our instance's tool map is empty
+                // (runtime replacement / reload): the ACP tools vanish from the
+                // executable list, but our plugin still believes they're registered.
+                pi.tools.length = 0;
+                await pi.events.get("before_provider_headers")!({ headers }, fakeCtx(proxy));
+            });
+        } finally {
+            console.warn = origWarn;
+        }
+
+        assert.equal(pi.tools.length, 2, "the dropped tools were re-registered");
+        assert.ok(pi.tools.some((t) => t.name === "compress"), "compress restored");
+        assert.equal(headers["x-bili-plugin"], "pi", "ownership header still stamped after recovery");
+        assert.equal(headers["x-bili-plugin-conversation"], "sess-42");
+        assert.equal(pi.registerCalls, before + 2, "exactly the two dropped tools were re-asserted");
+        const dropLogPath = path.join(stateHome, "billion-context", "bili.log");
+        const dropLines = (fs.existsSync(dropLogPath) ? fs.readFileSync(dropLogPath, "utf8") : "").split("\n").filter((l) => l.length > 0 && l.includes("dropped from the host registry"));
+        assert.ok(dropLines.length >= 1, `the silent drop is logged in bili.log, got: ${JSON.stringify(dropLines)}`);
+        assert.ok(dropLines.some((l) => l.includes("compress")), "the dropped tool name is named in the log");
+        assert.equal(termLines.filter((w) => w.includes("dropped from the host registry")).length, 0, "#2831: must not reach the terminal surface");
+    } finally {
+        await proxy.close();
+        fs.rmSync(stateHome, { recursive: true, force: true });
+    }
+});
+
+test("#2708: the fast path skips re-registration when nothing was dropped", async () => {
+    const proxy = await startFakeProxy();
+    try {
+        const pi = makeFakePi();
+        biliPlugin(pi as never);
+        await pi.events.get("session_start")!({}, fakeCtx(proxy));
+        await waitForTools(pi, 2);
+        const before = pi.registerCalls;
+
+        const warns: string[] = [];
+        const origWarn = console.warn;
+        const h1: Record<string, string> = {};
+        const h2: Record<string, string> = {};
+        console.warn = (...args: unknown[]) => { warns.push(args.map(String).join(" ")); };
+        try {
+            await pi.events.get("before_provider_headers")!({ headers: h1 }, fakeCtx(proxy));
+            await pi.events.get("before_provider_headers")!({ headers: h2 }, fakeCtx(proxy));
+        } finally {
+            console.warn = origWarn;
+        }
+
+        assert.equal(pi.registerCalls, before, "no redundant re-registration when the tools are intact");
+        assert.equal(warns.filter((w) => w.includes("dropped from the host registry")).length, 0, "no spurious drop warning");
+        assert.equal(h1["x-bili-plugin"], "pi");
+        assert.equal(h2["x-bili-plugin"], "pi");
+    } finally {
+        await proxy.close();
+    }
+});
+
+test("#2708: a host without a registry query keeps the once-per-sid behavior", async () => {
+    const proxy = await startFakeProxy();
+    try {
+        const pi = makeFakePi();
+        delete pi.getAllTools; // older pi / omp: no registry query surface
+        biliPlugin(pi as never);
+        await pi.events.get("session_start")!({}, fakeCtx(proxy));
+        await waitForTools(pi, 2);
+        const before = pi.registerCalls;
+        // Drop the tools from the host registry. With no query available the
+        // plugin cannot detect it and must NOT crash or guess-re-register.
+        pi.tools.length = 0;
+        const headers: Record<string, string> = {};
+        await pi.events.get("before_provider_headers")!({ headers }, fakeCtx(proxy));
+        assert.equal(pi.registerCalls, before, "no blind re-registration without a registry query");
+        assert.equal(pi.tools.length, 0, "nothing re-registered on a host that exposes no query");
+        assert.equal(headers["x-bili-plugin"], "pi", "ownership claim is independent of the probe");
+    } finally {
+        await proxy.close();
+    }
+});
+
+test("#2708: a same-id session_start after a drop re-asserts during registration", async () => {
+    const proxy = await startFakeProxy();
+    try {
+        const pi = makeFakePi();
+        biliPlugin(pi as never);
+        await pi.events.get("session_start")!({}, fakeCtx(proxy));
+        await waitForTools(pi, 2);
+        // pi drops the tools, then a same-id session_start (resume/reload) fires.
+        // Its register loop is skipped (toolsFor already === sid), so healing
+        // depends on the post-registration re-assert, not the loop.
+        pi.tools.length = 0;
+        assert.equal(pi.tools.length, 0, "precondition: tools dropped from the registry");
+        await pi.events.get("session_start")!({}, fakeCtx(proxy));
+        // Recovery runs inside the async registration block (manifest fetch),
+        // so poll rather than asserting synchronously.
+        await waitForTools(pi, 2);
+        assert.ok(pi.tools.some((t) => t.name === "compress"), "tools re-asserted on same-id session_start");
+    } finally {
+        await proxy.close();
+    }
+});
+
+test("#3542: a /tree rewind that resets the active loadout self-heals on session_tree", async () => {
+    const proxy = await startFakeProxy();
+    const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bc-plugin-agent-log-"));
+    try {
+        const pi = makeFakePi();
+        biliPlugin(pi as never);
+        await pi.events.get("session_start")!({}, fakeCtx(proxy));
+        await waitForTools(pi, 2);
+        pi.activeTools.splice(0, pi.activeTools.length, "bash", "read", "compress", "acp_status");
+        const before = pi.registerCalls;
+
+        await withEnv({ XDG_STATE_HOME: stateHome }, async () => {
+            // pi's navigateTree() rewinds past the entry that declared our tools
+            // and _restoreToolsFromTranscript() resets the loadout to what
+            // survives — the definitions stay in the registry, only the loadout
+            // loses them (the exact shape #2708's probe cannot see).
+            pi.activeTools.splice(0, pi.activeTools.length, "bash", "read");
+            assert.deepEqual([...pi.getAllTools!().map((t) => t.name)].sort(), ["acp_status", "compress"], "precondition: definitions still registered");
+            await pi.events.get("session_tree")!({ type: "session_tree", newLeafId: null, oldLeafId: "leaf-1" }, undefined);
+        });
+
+        assert.deepEqual([...pi.activeTools].sort(), ["acp_status", "bash", "compress", "read"], "the dropped tools are back in the active loadout");
+        assert.equal(pi.registerCalls, before, "no re-registration needed — the definitions never left the registry");
+        const dropLogPath = path.join(stateHome, "billion-context", "bili.log");
+        const dropLines = (fs.existsSync(dropLogPath) ? fs.readFileSync(dropLogPath, "utf8") : "").split("\n").filter((l) => l.length > 0 && l.includes("dropped from the active loadout"));
+        assert.ok(dropLines.length >= 1, `the silent loadout reset is logged in bili.log, got: ${JSON.stringify(dropLines)}`);
+        assert.ok(dropLines.some((l) => l.includes("compress")), "the dropped tool name is named in the log");
+    } finally {
+        await proxy.close();
+        fs.rmSync(stateHome, { recursive: true, force: true });
+    }
+});
+
+test("#3542: the re-assert is additive-only — names the host holds are never removed", async () => {
+    const proxy = await startFakeProxy();
+    try {
+        const pi = makeFakePi();
+        biliPlugin(pi as never);
+        await pi.events.get("session_start")!({}, fakeCtx(proxy));
+        await waitForTools(pi, 2);
+        // Host keeps its own tools plus one of ours active; the rewind drops
+        // only acp_status from the loadout.
+        pi.activeTools.splice(0, pi.activeTools.length, "bash", "read", "compress");
+        await pi.events.get("session_tree")!({ type: "session_tree", newLeafId: null, oldLeafId: "leaf-1" }, undefined);
+        assert.equal(pi.setActiveCalls.length, 1, "exactly one setter call");
+        assert.deepEqual(pi.setActiveCalls[0], ["bash", "read", "compress", "acp_status"], "previously-active names kept, missing ones appended");
+        assert.deepEqual(pi.activeTools, ["bash", "read", "compress", "acp_status"]);
+    } finally {
+        await proxy.close();
+    }
+});
+
+test("#3542: the fast path leaves the loadout untouched when nothing was dropped", async () => {
+    const proxy = await startFakeProxy();
+    try {
+        const pi = makeFakePi();
+        biliPlugin(pi as never);
+        await pi.events.get("session_start")!({}, fakeCtx(proxy));
+        await waitForTools(pi, 2);
+        pi.activeTools.splice(0, pi.activeTools.length, "bash", "read", "compress", "acp_status");
+        const before = pi.registerCalls;
+        await pi.events.get("session_tree")!({ type: "session_tree", newLeafId: null, oldLeafId: "leaf-1" }, undefined);
+        assert.equal(pi.setActiveCalls.length, 0, "no setter call when the loadout is intact");
+        assert.equal(pi.registerCalls, before, "no re-registration either");
+    } finally {
+        await proxy.close();
+    }
+});
+
+test("#3542: a host without a loadout query/setter keeps working", async () => {
+    const proxy = await startFakeProxy();
+    try {
+        const pi = makeFakePi();
+        delete pi.getActiveTools;
+        delete pi.setActiveTools; // older pi / omp: no loadout surface
+        biliPlugin(pi as never);
+        await pi.events.get("session_start")!({}, fakeCtx(proxy));
+        await waitForTools(pi, 2);
+        pi.activeTools.splice(0, pi.activeTools.length, "bash", "read");
+        await pi.events.get("session_tree")!({ type: "session_tree", newLeafId: null, oldLeafId: "leaf-1" }, undefined);
+        assert.equal(pi.setActiveCalls.length, 0, "no blind set without a loadout surface");
+        assert.deepEqual(pi.activeTools, ["bash", "read"], "loadout untouched");
+    } finally {
+        await proxy.close();
+    }
+});
+
+test("#3542: a throwing loadout query degrades to a no-op", async () => {
+    const proxy = await startFakeProxy();
+    try {
+        const pi = makeFakePi();
+        biliPlugin(pi as never);
+        await pi.events.get("session_start")!({}, fakeCtx(proxy));
+        await waitForTools(pi, 2);
+        pi.getActiveTools = () => { throw new Error("ctx is stale"); };
+        await pi.events.get("session_tree")!({ type: "session_tree", newLeafId: null, oldLeafId: "leaf-1" }, undefined);
+        assert.equal(pi.setActiveCalls.length, 0, "never sets blindly after a failed query");
     } finally {
         await proxy.close();
     }
@@ -1265,6 +1511,52 @@ test("/acp emits a persistent custom message via pi.sendMessage when available (
     } finally {
         await new Promise<void>((resolve) => server.close(() => resolve()));
     }
+});
+
+test("/acp renderer collapses large reports and restores every block when expanded", () => {
+    type Renderer = NonNullable<Parameters<ReturnType<typeof createBiliPlugin>>[0]["registerMessageRenderer"]>;
+    let render: Parameters<Renderer>[1] | undefined;
+    biliPlugin({ on() {}, registerTool() {}, registerMessageRenderer: (name, renderer) => {
+        assert.equal(name, "bili-acp-status");
+        render = renderer;
+    } });
+    assert.ok(render, "register a renderer so Ctrl+O can control the report");
+    const text = ["╭─────────────────────────────────────────────╮", "│           ACP Context Analysis              │",
+        "╰─────────────────────────────────────────────╯", "billion-context@0.1.202", "storage: full", "",
+        "Context (session accounting): 50%", "", "Sent to LLM (after compression, est.): 50k",
+        "Prompt cache (provider-reported): 90%", "", "Blocks: 250 active / 250 total",
+        ...Array.from({ length: 250 }, (_, i) => `  [b${i}] T1 10k→1k: topic ${i}`),
+        "Web UI: http://127.0.0.1:8787/__bili/", "Tag visibility: footer"].join("\n");
+    const message = { role: "custom" as const, customType: "bili-acp-status", content: text, display: true, timestamp: 0 };
+    const backgrounds: string[] = [];
+    const theme = {
+        fg: (_color: string, value: string) => value,
+        bg: (color: string, value: string) => { backgrounds.push(color); return value; },
+        bold: (value: string) => value,
+        italic: (value: string) => value,
+        underline: (value: string) => value,
+        strikethrough: (value: string) => value,
+    } as Parameters<typeof render>[2];
+    const collapsed = render(message, { expanded: false, outputPad: 1 }, theme)!.render(120).join("\n");
+    assert.ok(collapsed.split("\n").length < 25);
+    assert.match(collapsed, /╭─/);
+    assert.match(collapsed, /ACP Context Analysis/);
+    assert.match(collapsed, /storage: full/);
+    assert.match(collapsed, /storage: full[^\n]*\n\s*\n/);
+    assert.match(collapsed, /Tag visibility: footer/);
+    assert.match(collapsed, /Blocks: 250 active/);
+    assert.match(collapsed, /Context .*50%/);
+    assert.match(collapsed, /Prompt cache .*90%/);
+    assert.match(collapsed, /Web UI:/);
+    assert.match(collapsed, /Ctrl\+O/);
+    assert.ok(!collapsed.includes("topic 249"));
+    assert.match(collapsed, /\[bili-acp-status\]/);
+    assert.ok(backgrounds.length > 0 && backgrounds.every((color) => color === "customMessageBg"));
+    assert.equal(render(message, { expanded: true, outputPad: 1 }, theme), undefined,
+        "expanded reports use pi's original styled Markdown renderer");
+    assert.equal(message.content, text, "display folding must preserve persisted report content");
+    assert.equal(render({ ...message, content: "Context: 0%\n\nBlocks: none" }, { expanded: false, outputPad: 1 }, theme),
+        undefined, "reports without block details keep pi's original renderer");
 });
 
 test("/acp sends renderAcpStatus fallback content via sendMessage when no panel string", async () => {
@@ -2538,6 +2830,25 @@ test("#957: omp reports runtime-info via before_provider_request (omp has no hea
             baseURL: `${proxy.origin}/bili/https://api.example.com/v1`,
             conversationId: "omp-rt-1",
             source: "client-config",
+        });
+    } finally {
+        await proxy.close();
+    }
+});
+
+test("before_agent_start awaits tool registration so Turn 1 system prompt includes ACP tools without a Turn 2 codemode_catalog patch", async () => {
+    const proxy = await startFakeProxy();
+    try {
+        await withEnv({ BILLION_CONTEXT_PROXY: undefined }, async () => {
+            const pi = makeFakePi();
+            createBiliPlugin("pi")(pi as never);
+            const ctx = fakeCtx(proxy, "sess-before-agent-start");
+            assert.equal(pi.tools.length, 0, "no tools before before_agent_start when session_start was not awaited");
+            const beforeAgentStart = pi.events.get("before_agent_start");
+            assert.ok(beforeAgentStart, "before_agent_start handler registered");
+            await beforeAgentStart({}, ctx);
+            assert.equal(pi.tools.length, 2, "ACP tools registered before _prepareRun freezes Turn 1 tool loadout and codemode_catalog");
+            assert.deepEqual(pi.tools.map((t) => t.name).sort(), ["acp_status", "compress"]);
         });
     } finally {
         await proxy.close();

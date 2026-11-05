@@ -183,8 +183,10 @@ test("e2e: model switch to a smaller window → preflight compresses before forw
         assert.equal(s2?.stats.lastInputTokens, 1000);
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });
@@ -272,8 +274,10 @@ test("e2e: no preflight when the context fits the (small) model window", async (
         assert.equal((s?.state.blocks ?? []).filter((b) => b.active).length, 0, "no blocks created");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });
@@ -377,8 +381,10 @@ test("e2e: fresh session (lastInputTokens=0) whose raw history overflows the win
         assert.equal(s?.stats.lastInputTokens, 1000);
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });
@@ -536,8 +542,10 @@ test("e2e: CJK stable session switch → preflight compresses (CJK-aware token a
         assert.ok(lastForward.body.includes(SUMMARY_TEXT), "the preflight summary is in the rebuilt payload");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });

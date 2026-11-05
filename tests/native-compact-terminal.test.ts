@@ -194,8 +194,10 @@ test("e2e #321 PR-C: rebase only on completed; trigger request forwarded clean",
         assert.equal(pendingRebase("term-jsonok"), true, "JSON output response schedules the rebase");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });

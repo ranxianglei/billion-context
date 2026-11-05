@@ -327,8 +327,10 @@ test("e2e #767: pixels billing recovers a stale-baseline session the bytes estim
         assert.equal(stats.imagesSeen, 4);
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });
@@ -355,7 +357,8 @@ test("e2e #767 control: explicit bytes route still fails fast — relay protecti
         s!.stats.lastInputTokens = STALE_BASELINE;
 
         const r2 = await fetch(url, { method: "POST", headers, body: imageTurn("img-byt-sess") });
-        assert.equal(r2.status, 502, "byte-billed over-window images stay blocked locally");
+        // #3461: structurally doomed (byte-billed images can't fold enough) → 413.
+        assert.equal(r2.status, 413, "byte-billed over-window images stay blocked locally");
         const err2 = JSON.parse(await r2.text()) as { error?: { code?: string; message?: string } };
         assert.equal(err2.error?.code, "preflight_compress_failed");
         assert.ok(err2.error?.message?.includes("Images alone account for"), "fail-fast carries the image remedy wording");
@@ -363,8 +366,10 @@ test("e2e #767 control: explicit bytes route still fails fast — relay protecti
         assert.equal(stats.imagesSeen, 0, "over-window images never reached the upstream");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });
@@ -403,8 +408,10 @@ test("e2e #1843: default route (auto→pixels) forwards an image-heavy payload t
         assert.ok(after.stats.lastInputTokens > 0 && after.stats.lastInputTokens < WINDOW, `baseline recovered to real usage (got ${after.stats.lastInputTokens})`);
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });
@@ -433,15 +440,18 @@ test("e2e #767: learned-limit-only variant also closes forward-once (explicit by
         (s!.stats as { lastInputTokensSource: string }).lastInputTokensSource = "usage";
 
         const r2 = await fetch(url, { method: "POST", headers, body: imageTurn("img-lrn-sess") });
-        assert.equal(r2.status, 502, "overflow evidence (learned limit) closes #496 forward-once even with a fresh baseline");
+        // #3461: structurally doomed (byte-billed images can't fold enough) → 413.
+        assert.equal(r2.status, 413, "overflow evidence (learned limit) closes #496 forward-once even with a fresh baseline");
         const err2 = JSON.parse(await r2.text()) as { error?: { code?: string } };
         assert.equal(err2.error?.code, "preflight_compress_failed");
         assert.equal(stats.streamingForwards, 1, "image-bearing turn was never forwarded");
         assert.equal(stats.imagesSeen, 0);
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });
@@ -472,15 +482,18 @@ test("e2e #767: env BILI_IMAGE_BILLING beats per-provider route config", async (
         } finally {
             delete process.env.BILI_IMAGE_BILLING;
         }
-        assert.equal(r2.status, 502, "env override downgrades the pixels route back to conservative byte billing");
+        // #3461: structurally doomed (byte-billed images can't fold enough) → 413.
+        assert.equal(r2.status, 413, "env override downgrades the pixels route back to conservative byte billing");
         const err2 = JSON.parse(await r2.text()) as { error?: { code?: string } };
         assert.equal(err2.error?.code, "preflight_compress_failed");
         assert.equal(stats.streamingForwards, 1);
         assert.equal(stats.imagesSeen, 0);
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });
@@ -517,8 +530,10 @@ test("e2e #767: per-route imageBilling applies under a path-qualified provider k
         assert.ok(after.stats.lastInputTokens > 0 && after.stats.lastInputTokens < WINDOW, `baseline recovered to real usage (got ${after.stats.lastInputTokens})`);
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });

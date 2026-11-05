@@ -59,6 +59,27 @@ entries:
     group: updates
     desc_en: "Interval between npm registry version checks."
     desc_zh: "npm registry 版本检查间隔。"
+  - key: update.staggerMinDelayMs
+    type: "number | string"
+    default: "900000 (built-in 15 min)"
+    env: BILI_UPDATE_STAGGER_MIN_MS
+    group: updates
+    desc_en: "#3619 staggered rollout: lower bound of this machine's base upgrade-delay window; ms number or duration string (15m / 2d / 1d12h); 0 disables the delay (legacy immediate). The remote policy's default window and per-version overrides stack on top."
+    desc_zh: "#3619 错峰升级：本机基础升级延迟窗口下限；毫秒数字或时长字符串（15m / 2d / 1d12h）；0 = 禁用延迟（恢复立即升级）。远端策略的 default 窗口与按版本 overrides 叠加在其上。"
+  - key: update.staggerMaxDelayMs
+    type: "number | string"
+    default: "172800000 (built-in 48 h)"
+    env: BILI_UPDATE_STAGGER_MAX_MS
+    group: updates
+    desc_en: "#3619 staggered rollout: upper bound of this machine's base upgrade-delay window; ms number or duration string (48h / 2d); together with min 0 restores legacy immediate upgrades."
+    desc_zh: "#3619 错峰升级：本机基础升级延迟窗口上限；毫秒数字或时长字符串（48h / 2d）；与 min=0 一起恢复立即升级。"
+  - key: update.policyUrl
+    type: string
+    default: "official repo raw URL"
+    env: BILI_UPDATE_POLICY_URL
+    group: updates
+    desc_en: "Override URL for the remote auto-update policy file (test seam — production stays pinned to the official repo)."
+    desc_zh: "远端自动更新策略文件的覆盖地址（测试接缝——生产固定指向官方仓库）。"
   - key: advisoryCheck
     type: boolean
     default: "true"
@@ -77,6 +98,13 @@ entries:
     group: updates
     desc_en: "Override URL for the advisory feed."
     desc_zh: "公告源覆盖地址。"
+  - key: remoteAnnouncementsUrl
+    type: string
+    default: "unset (official feed: GitHub master announcements/remote.json)"
+    env: BILI_ANNOUNCEMENTS_URL
+    group: updates
+    desc_en: "Override URL for the remote announcement feed (#5548): JSON document {v: 1, entries: [...]} — same record schema as local announcement files, fetched every ~3 min like the other watchers, cached snapshot survives restarts/outages. Firewall installs point this at a relay mirror; bad pushes are rejected and the last good copy keeps showing. Local files in <config dir>/announcements/*.json always shadow same-id remote/builtin notices."
+    desc_zh: "远程公告源覆盖地址（#5548）：JSON 文档 {v: 1, entries: [...]}，记录格式与本地公告文件一致；与其他监视器一样约每 3 分钟拉取一次，缓存快照可跨重启/断网存活。无法直连的安装把它指向中继镜像；坏推送会被拒绝并继续显示上一份有效公告。配置目录 announcements/*.json 的本地文件按同 id 覆盖远程/内置公告。"
   - key: releaseNotesCheck
     type: boolean
     default: "true"

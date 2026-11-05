@@ -208,7 +208,8 @@ test("#857 B: genuine overflow evidence (learned limit == configured window) sti
         s.stats.lastInputTokensSource = "usage";
 
         const r2 = await fetch(url, { method: "POST", headers, body: body(MODEL, "s857b", imageInput()) });
-        assert.equal(r2.status, 502, "no blind forward when the upstream proved the window");
+        // #3461: over-window per bili's own meter with no foldable mass left → 413.
+        assert.equal(r2.status, 413, "no blind forward when the upstream proved the window");
         await r2.text();
         assert.equal(stats.streamingForwards, 1, "image turn was not forwarded");
         assert.equal(stats.imagesSeen, 0);
@@ -246,7 +247,8 @@ test("#857 C: usage-grounded over-window baseline — hatch stays closed AND the
         // #1841 removes (old code walked both ranges, burned the calls, and
         // still failed here).
         const r2 = await fetch(url, { method: "POST", headers, body: body(FALLBACK_MODEL, "s857c", [...fillerHistory(16), ...imageInput()]) });
-        assert.equal(r2.status, 502, "usage evidence keeps the hatch closed");
+        // #3461: over-window per bili's own meter with no foldable mass left → 413.
+        assert.equal(r2.status, 413, "usage evidence keeps the hatch closed");
         const err2 = JSON.parse(await r2.text()) as { error?: { code?: string; message?: string } };
         assert.equal(err2.error?.code, "preflight_compress_failed");
         assert.match(err2.error?.message ?? "", /futile round/, `the skipped round names its futility verdict (got: ${err2.error?.message})`);

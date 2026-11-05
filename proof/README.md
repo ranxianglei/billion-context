@@ -66,6 +66,15 @@ session HIGH (number 5) dies; archive prunes; two appends allocate.
   residual), the solver produces the counterexample `n4 = 5` — the dead high
   number reissued. The residual window is thereby characterized exactly: it
   opens iff the cursor drops below a dead ever-issued number.
+- `t2-claimcoupling.smt2` — **SAT** (#3198 hardening): if live-message ref
+  presentation were gated on reconcile CLAIM state instead of the persistent
+  content-keyed map, a byte-identical live message presents under different
+  refs across consecutive turns (witness: turn A takes the map-lookup path →
+  stored number 5; turn B the fresh-allocation path → ≥ cursor 6). Shipped code
+  has no such coupling — `assignRefs` reads only the persistent map + persisted
+  cursor ([grounding:g1]) and raw ids derive from message content
+  ([grounding:g4]); this twin proves the theorem WOULD break if the coupling
+  were introduced.
 
 ### Mutation discipline (acceptance criterion: proofs are not vacuous)
 
@@ -88,6 +97,7 @@ so one conjunct's failure IS the pair property's failure.
 | `esc` E0/E1/E2/E3 (escaping algebra) | `[grounding:g3]` — homomorphism + injectivity of the inner JSON string encoder on 200 randomized BMP strings |
 | `mktag` determinism/injectivity | `[grounding:g2]` — `indexToRef`/`refToIndex` round-trip + injectivity over 200k numbers |
 | T2 allocation rules (floor, smallest-free-over-live, existing-untouched, BLOCKED-free, `cursor := n+1`) | `[grounding:g1]` — `assignRefs`/`allocateFreeRef`/`highestUsedIndex` on constructed maps, incl. the gap-below-cursor case |
+| raw-id derivation (content-keyed determinism; cluster numbering pass-stable + prefix-invariant) | `[grounding:g4]` — `deriveMessageId`/`ClusterCounter` on constructed inputs |
 | envelope/framing bytes (`hdr`/`ftr`/`fpre`/`fmid`/`fpost`/`SEP`) | `tests/cache-proof.test.ts` (#2144) — byte-LCP unexplainedDivergences=0 across four wires and six path classes |
 | carrier anchor placement (merge-last-user / tail-append, optionality) | #2144 scenario matrix + call-site survey recorded in `spec/t1-*.smt2` headers |
 
@@ -98,10 +108,10 @@ so one conjunct's failure IS the pair property's failure.
 node --import tsx --test tests/cache-theorem.test.ts
 ```
 
-Nine solver obligations (two context-sanity SAT guards per scenario family,
+Ten solver obligations (two context-sanity SAT guards per scenario family,
 which catch vacuous proofs if the context ever becomes inconsistent; two
-growth-stability UNSAT theorems; two T1 mutations; one T2 theorem; one T2
-mutation) plus three grounding test groups. Without a solver installed, solver
+growth-stability UNSAT theorems; two T1 mutations; one T2 theorem; two T2
+mutations) plus four grounding test groups. Without a solver installed, solver
 subtests skip individually and grounding still runs, so the main suite stays
 green; CI runs the `.github/workflows/ci-theorem.yml` lane (ubuntu, pinned
 `z3-solver==4.9.1.0`, paths-filtered to the assembly surface) so every relevant

@@ -543,7 +543,10 @@ test("#1086 T5 liveness: plain-client chat session keeps compressing as it grows
                 }));
                 res.write(sseLine({ id: "g1", object: "chat.completion.chunk", choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }], usage: { prompt_tokens: 100, completion_tokens: 2 } }));
             } else {
-                const text = `reply ${state.bodies.length} ` + "x".repeat(360);
+                // #3315: mixed-char filler on purpose — a uniform run of >= 200 identical codepoints
+                // trips the #3289 output-side text-run guard (TEXT_RUN_THRESHOLD, src/runaway-guard.ts)
+                // and the proxy aborts the upstream stream, so the turn loses its visible reply.
+                const text = `reply ${state.bodies.length} ` + "xyz".repeat(120);
                 res.write(sseLine({ id: "g1", object: "chat.completion.chunk", choices: [{ index: 0, delta: { role: "assistant", content: text } }] }));
                 res.write(sseLine({ id: "g1", object: "chat.completion.chunk", choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 100, completion_tokens: 50 } }));
             }

@@ -15,9 +15,11 @@ billion-context/
 │   │   ├── admin.ts              #   /__bili/* + /__acp/* admin route surface (stats/status/overview/sessions/detail/logs/config/plugin/watcher/upstream endpoints), loopback + trusted-origin gated (#1440)
 │   │   ├── budget.ts             #   chars/4 overhead measure outside the kernel fold space
 │   │   ├── chain-artifacts.ts    #   Allocation-free byte pre-filter for chain artifacts (#1421)
+│   │   ├── codex-catalog-cache.ts #   Same-credential, bounded offline model metadata for Codex discovery
 │   │   ├── context-window.ts     #   Context-window resolution (launcher model channel, beta headers)
 │   │   ├── dsh-compaction-guard.ts #   Rejects dsh whole-prefix compaction replays (#1729)
 │   │   ├── handle.ts             #   Proxy request pipeline (route triage, compat relay, compress orchestration) (#1440 P2 cut 3)
+│   │   ├── handoff-response.ts   #   Retains parsed assistant output for handoff export without changing request snapshots
 │   │   ├── headers.ts            #   Client-provided id sanitization for dump filenames (#286)
 │   │   ├── inject.ts             #   Per-wire tool-injection wrappers + FORCE_TEXT_PROTOCOL switch (#1440)
 │   │   ├── observability.ts      #   Body dumps (dumps/req-*.json, raw/*), unrecognized-path stats
@@ -31,6 +33,8 @@ billion-context/
 │   ├── knobs.ts                  # Single knob resolver: env > config file > default (#2030)
 │   ├── config.ts                 # Config file (billion-context.json) + providers table + loadOptions
 │   ├── instance.ts               # Live-instance registry record in the proxy-origin file (#394/#403/#417)
+│   ├── port-owner.ts             # Post-bind port-ownership verification + pointer-clobber guard (#2941) + EADDRINUSE holder diagnostics (#4762)
+│   ├── event-loop-watchdog.ts    # Worker-thread event-loop wedge detector: self-exit after 5 min of continuous main-loop silence (#4762)
 │   ├── paths.ts                  # XDG paths (config/cache/state) + relocation env vars
 │   ├── logger.ts                 # Tee logger: state-dir file + stderr
 │   ├── log-mask.ts               # Log safety: masks credentials/endpoints (#255)
@@ -41,6 +45,7 @@ billion-context/
 │   ├── conflict-watch.ts         # Per-session compression-conflict ledger (#1206)
 │   ├── upstream-proxy.ts         # undici ProxyAgent routing (explicit-direct vs no-preference, SOCKS reject)
 │   ├── fetch-util.ts             # Capped body reads, timeout/replay helpers (knob-resolved)
+│   ├── request-body-budget.ts   # 接收、解压、发送字节预算与大请求名额
 │   ├── fetch-transport.ts        # AsyncLocalStorage fetch-transport override (withFetchTransport)
 │   ├── content-encoding.ts       # gzip/deflate decode + decompression-bomb guard (413)
 │   ├── wire-body.ts              # Trailing-user-turn append on assembled wire bodies
@@ -70,12 +75,15 @@ billion-context/
 │   ├── compress-tool.ts          # ACP tool surface — thin re-export from acp-kernel
 │   ├── decompress-shared.ts      # Shared decompress logic + large-decompress tmp retention cap
 │   ├── fold-reconcile.ts         # Fold-anchor reconciliation for stable prefix cache
+│   ├── generation-boundary.ts    # Standing generation-boundary note for post-switch stale-ref residue (#4305)
 │   ├── orphan-gc.ts              # Orphan block garbage collection
+│   ├── foreign-block-sweep.ts    # Legacy cross-session fold-block sweep: covered-ids with zero transcript intersection → reversible archive (#5312)
 │   ├── fork-adoption.ts          # Fork block adoption on mid-history divergence (#629)
 │   ├── prefix-affinity.ts        # Anonymous prefix-affinity session resolution (#309)
 │   ├── affinity-persist.ts       # Prefix-affinity persistence across proxy restarts (#499)
 │   ├── cache-warn.ts             # Upstream prompt-cache collapse warning (#499)
 │   ├── cache-ledger.ts           # Per-round cache usage ledger (wire-protocol aware, #1536)
+│   ├── billing.ts                # Per-model USD prices (#4899): billing.prices overrides > models.dev; stamps per request, bills session.stats.costUsd; panel $ faces derive live from the current price table incl. a compression payback view
 │   ├── acp-status.ts             # acp_status payload (ranges/nudge recomputed live)
 │   ├── acp-panel.ts              # Cache report wrapper for transcript display
 │   ├── acp-cache-diff.ts         # Offline prefix-diff attribution over dumps (#1266)
@@ -98,6 +106,8 @@ billion-context/
 │   ├── registry-snapshot.json    # Bundled full models.dev snapshot (offline floor)
 │   ├── session.ts                # Session model + in-memory store (bounded, MAX_SESSIONS)
 │   ├── session-id.ts             # Session identity: client value verbatim + persona fork fingerprint
+│   ├── claude-lane-token.ts      # SubagentStart lane-token grammar (mint/extract, #5095)
+│   ├── session-resolve.ts        # #2944 order-primary persona resolver (skeleton + fork lanes)
 │   ├── session-gc.ts             # Session-file GC, opt-in (sessions.gc.* / BILI_SESSION_GC*) (#1082)
 │   ├── persist.ts                # On-disk session persistence (kernel StateStore)
 │   ├── persist-eperm.ts          # EPERM/EACCES write-failure alert layer (#362)
@@ -114,6 +124,8 @@ billion-context/
 │   ├── external-summary-surface.ts # Tool/schema and client-facing summary contract
 │   ├── update.ts                 # Self-updater (load-bearing — no-op release protocol) + install lanes
 │   ├── advisory.ts               # Critical-defect advisory watcher (#1481)
+│   ├── plugin-advisory.ts        # dsh cost-advisory detection + TTL cache (#2462)
+│   ├── host-plugin-notice.ts     # Known host-side metering plugin notice + dismiss state (#2861)
 │   ├── update-notes.ts           # Tiered release-notes visibility (#1870/#1977)
 │   ├── restart.ts                # Opt-in self-restart once newer code is on disk (#811)
 │   ├── upstream-alerts.ts        # Upstream connection alert table (#1682)
@@ -121,6 +133,7 @@ billion-context/
 │   ├── error-dump.ts             # Rejected-body dump (diagnostics.dump4xx / BILI_DUMP_4XX)
 │   ├── ws-bridge.ts              # Generic WebSocket bridge shell
 │   ├── responses-ws.ts           # Codex/OpenCode Responses-over-WebSocket codec (#1844)
+│   ├── kiro.ts                   # Kiro CLI: model-gateway hosts, built-in developer/system→user roles, kiro:conversation_id identity
 │   ├── launcher.ts               # `bili <client>` launcher (auto-proxies both schemes)
 │   ├── client-config.ts          # Read-only discovery of each client's own upstream config
 │   ├── plugin.ts                 # Cooperative plugin protocol (x-bili-plugin lane, legacy marker #920)
@@ -128,6 +141,7 @@ billion-context/
 │   ├── dsh-channel.ts            # dsh profile bundle management (refreshDshProfileCopy, #1196)
 │   ├── pi-channel.ts             # pi npm-copy self-refresh spec form
 │   ├── claude-native-bootstrap.ts # Claude native bootstrap hook entry
+│   ├── claude-subagent-hook.ts  # Claude SubagentStart hook: mint per-dispatch lane token (#5095)
 │   ├── mcp.ts                    # Plugin-in-launcher MCP shell (spawn-time env injection)
 │   ├── loop/                     # Unified compress loop (wire-independent core)
 │   │   ├── index.ts              #   Stream-failure presentation options (#1455)
@@ -140,8 +154,11 @@ billion-context/
 │   │   └── tag-echo-filter.ts    #   Streaming-safe stripper for model-echoed render tags (#206); tool args byte-exact
 │   ├── agent/                    # Thin agent-side plugins (per-host, each with a -native variant)
 │   │   ├── shared.ts             #   Host plan/bootstrap shared helpers (BILLION_CONTEXT_PLUGIN gate)
+│   │   ├── media-bytes.ts        #   Shared inline-media byte accounting for native direct-send refusal gates
 │   │   ├── native-bootstrap.ts   #   dist/agent/<entry>.js → dist/index.js resolution
-│   │   ├── native-intercept.ts   #   Fetch-interception self-heal (BILI_RECLAIM_FETCH_PATCH)
+│   │   ├── native-intercept.ts   #   Model-API fetch routing, attribution and proxy recovery
+│   │   ├── fetch-chain/
+│   │   │   └── index.ts          #   Fetch guard, re-entry cutoff and pi-web-access coexistence
 │   │   ├── native-ws-intercept.ts #  WebSocket-companion intercept: Codex Responses upgrades → /bili/ lane (#2111)
 │   │   ├── opencode-acp-command.ts #  /acp + /acp-cache command hooks (V1+V2)
 │   │   ├── opencode.ts           #   opencode V1 plugin (attach respawn + test seam)
@@ -170,7 +187,9 @@ billion-context/
 │   │   └── native.ts             #   Routing scope/exemptions policy (#1622)
 │   └── web/                      # Web UI (config editor, sessions, logs)
 │       ├── api.ts                #   REST handlers (config get/put with parse-state guard)
-│       ├── sessions-data.ts      #   Read-only session browsing (live pool + on-disk, #1420)
+│       ├── blogfeed.ts           #   Panel blog/articles feed from bundled markdown (#4587)
+│       ├── changelog.ts          #   GitHub Releases feed for the panel changelog (#3719)
+│       ├── sessions-data.ts      #   Read-only session browsing (live pool + on-disk, #1420); tier tree + lazy block content (#3917)
 │       ├── logs-query.ts         #   GET /__bili/logs selection engine
 │       ├── markdown.ts           #   Escape-safe Markdown → HTML (#1420)
 │       ├── page.ts               #   Server-rendered HTML page shell (CA cert hint, i18n)
@@ -186,7 +205,7 @@ billion-context/
  │   ├── src/                      #   14 modules: delegate tool/lifecycle, fleet inspector/widget, config, events
  │   ├── tests/                    #   Component unit suite (`npm --prefix pi-subagents test`, runs on TS source)
  │   └── package.json              #   Own name/version (npm `billion-context-pi-subagents`), own build chain (tsup → dist + d.ts)
- ├── tests/                        # 426 test files (+ hermetic e2e lanes under tests/e2e/)
+ ├── tests/                        # 614 test files (+ hermetic e2e lanes under tests/e2e/)
  ├── tsup.config.ts                # Build config (inlines acp-kernel + billion-context-pi-subagents; zod external)
  └── package.json                  # npm manifest (consumes kernel via `"acp-kernel": "file:./kernel"`, pi-subagents via `"billion-context-pi-subagents": "file:./pi-subagents"`; version bumped ONLY on release branches)
 
@@ -200,6 +219,7 @@ When navigating this codebase, these are the load-bearing entry points:
 - **Update path** — `src/update.ts` is deliberately self-contained and conservative; it installs via tarball extraction (not `npm install`) to avoid lifecycle-script surprises on user machines. It is load-bearing infrastructure: changes require a no-op validation release first (§5).
 - **Agent plugins** — `src/agent/*.ts` are thin host-specific adapters; shared logic lives in `src/agent/shared.ts`. Each host has a `-native.ts` bootstrap gate variant.
 - **Persistence** — `src/persist.ts` wraps the acp-kernel `StateStore`; `src/session.ts` holds the in-memory session pool. Session identity rules: `src/session-id.ts`.
+- **会话派生缓存** — `Session.transient` 持有插件工具视图与诊断请求副本；随会话淘汰释放，也纳入会话对象图的字节计量。它不写入持久化记录或上游协议；诊断截段独立复制 UTF-16 内容，避免保留完整请求底层字符串（#2920）。
 - **Wire fidelity** — `src/stream-*.ts` files handle per-protocol streaming transformation. The invariant: never alter upstream protocol shape beyond intended injection (§7.3).
 - **E2E regression** — `tests/e2e/` contains real-client suites (codex, opencode, pi, dsh) plus hermetic lanes (registry, advisory-rollback, release-canary, opencode WS, image billing); each carries its own skip gate — read the test header for the exact env var.
 - **Compression kernel** — `kernel/` (in-repo acp-kernel, #2092). Human-gated boundary; see `AGENTS.md` "Kernel Boundary".

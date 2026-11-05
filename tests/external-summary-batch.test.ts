@@ -30,11 +30,18 @@ test("external summary batch: each range uses the ordered fallback chain", async
     const result = await new ExternalSummaryExecutor(2).executeBatch(work, [
         { summarize: async (request) => { calls.push(`primary:${request.content}`); throw new Error("401"); } },
         { summarize: async (request) => { calls.push(`backup:${request.content}`); return "backup summary"; } },
-        { summarize: async () => { assert.fail("successful backup stops the chain"); } },
+        { summarize: async () => assert.fail("successful backup stops the chain") },
     ], budget);
     assert.equal(result.status, "finished");
     assert.deepEqual(result.results.map((range) => range.status === "success" ? range.targetIndex : -1), [1, 1, 1]);
-    assert.deepEqual(calls, work.flatMap((range) => [`primary:${range.content}`, `backup:${range.content}`]));
+    // #2667: ranges now run concurrently up to the pool size, so CROSS-range
+    // call order is no longer pinned (it was an artifact of the old serial
+    // loop). What stays load-bearing is the PER-RANGE ordered chain — primary
+    // before backup within each range, and a successful backup stopping the
+    // chain before the third target.
+    for (const content of work.map((range) => range.content)) {
+        assert.deepEqual(calls.filter((call) => call.endsWith(`:${content}`)), [`primary:${content}`, `backup:${content}`]);
+    }
 });
 
 test("external summary batch: one deadline covers all ranges, not one renewed budget per range", async () => {
@@ -132,16 +139,120 @@ test("external summary batch: all work and budget values are snapshotted before 
     assert.deepEqual(seen, work.map((range) => range.content));
 });
 
-test("external summary batch: event-loop stalls cannot accept late success or dispatch another range", async () => {
+test("external summary batch: event-loop stalls cannot accept late success or dispatch another range", async (t) => {
+    // #3021: model the stall with a mocked clock (as in the "queue time" test
+    // above) instead of racing a real 10ms budget against the scheduler — a
+    // loaded runner can preempt >10ms before dispatch, tripping the executor's
+    // pre-dispatch deadline check and leaving `calls === 0`. Jumping the clock
+    // past the deadline DURING the dispatch makes both outcomes deterministic.
+    let now = 0;
+    t.mock.method(performance, "now", () => now);
     let calls = 0;
     const result = await new ExternalSummaryExecutor(1).executeBatch(work, [{ summarize: async () => {
         calls++;
-        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 30);
+        now += 30;
         return "too late";
     } }], { ...budget, totalTimeoutMs: 10 });
     assert.equal(result.status, "deadline");
     assert.deepEqual(result.results.map((range) => range.status), ["deadline"]);
     assert.equal(calls, 1);
+});
+
+async function waitFor(flag: () => boolean, what: string): Promise<void> {
+    for (let i = 0; i < 1000; i++) {
+        if (flag()) return;
+        await new Promise((resolve) => setImmediate(resolve));
+    }
+    assert.fail(`timed out waiting for ${what}`);
+}
+
+test("external summary batch: a scoped pool admits concurrent work while it is in flight (#2657)", async () => {
+    const executor = new ExternalSummaryExecutor(1);
+    let releaseA!: () => void;
+    const gateA = new Promise<void>((resolve) => { releaseA = resolve; });
+    let aStarted = false;
+    let bStarted = false;
+    const candidateA: SummaryCandidate = { summarize: async () => { aStarted = true; await gateA; return "A"; } };
+    const candidateB: SummaryCandidate = { summarize: async () => { bStarted = true; return "B"; } };
+    try {
+        const pendingA = executor.execute(work[0], [candidateA], budget, undefined, { concurrency: 4 });
+        await waitFor(() => aStarted, "A to start");
+        // Base pool is 1, yet B must be admitted by A's in-flight scope of 4.
+        const pendingB = executor.execute(work[1], [candidateB], budget);
+        await waitFor(() => bStarted, "B to start while A holds its slot");
+        releaseA();
+        assert.equal((await pendingA).status, "success");
+        assert.equal((await pendingB).status, "success");
+    } finally {
+        releaseA();
+    }
+});
+
+test("external summary batch: the pool returns to base size once the scoped work settles (#2657)", async () => {
+    const executor = new ExternalSummaryExecutor(1);
+    let releaseA!: () => void;
+    const gateA = new Promise<void>((resolve) => { releaseA = resolve; });
+    let aStarted = false;
+    const candidateA: SummaryCandidate = { summarize: async () => { aStarted = true; await gateA; return "A"; } };
+    try {
+        const pendingA = executor.execute(work[0], [candidateA], budget, undefined, { concurrency: 4 });
+        await waitFor(() => aStarted, "A to start");
+        releaseA();
+        assert.equal((await pendingA).status, "success");
+        // With A settled the pool is back to base 1: B must queue behind C.
+        let releaseC!: () => void;
+        const gateC = new Promise<void>((resolve) => { releaseC = resolve; });
+        let cStarted = false;
+        let bStarted = false;
+        const candidateC: SummaryCandidate = { summarize: async () => { cStarted = true; await gateC; return "C"; } };
+        const candidateB: SummaryCandidate = { summarize: async () => { bStarted = true; return "B"; } };
+        try {
+            const pendingC = executor.execute(work[2], [candidateC], budget);
+            await waitFor(() => cStarted, "C to start");
+            const pendingB = executor.execute(work[1], [candidateB], budget);
+            // B must stay queued for every tick until C releases the only permit.
+            for (let i = 0; i < 50 && !bStarted; i++) await new Promise((resolve) => setImmediate(resolve));
+            assert.equal(bStarted, false);
+            releaseC();
+            await waitFor(() => bStarted, "B to start after C released");
+            assert.equal((await pendingB).status, "success");
+            assert.equal((await pendingC).status, "success");
+        } finally {
+            releaseC();
+        }
+    } finally {
+        releaseA();
+    }
+});
+
+test("external summary batch: an oversized scope yields to a larger in-flight demand (#2657)", async () => {
+    const executor = new ExternalSummaryExecutor(1);
+    let releaseA!: () => void;
+    const gateA = new Promise<void>((resolve) => { releaseA = resolve; });
+    let aStarted = false;
+    let bStarted = false;
+    const candidateA: SummaryCandidate = { summarize: async () => { aStarted = true; await gateA; return "A"; } };
+    const candidateB: SummaryCandidate = { summarize: async () => { bStarted = true; return "B"; } };
+    try {
+        const pendingA = executor.execute(work[0], [candidateA], budget, undefined, { concurrency: 8 });
+        await waitFor(() => aStarted, "A to start");
+        const pendingB = executor.execute(work[1], [candidateB], budget, undefined, { concurrency: 3 });
+        await waitFor(() => bStarted, "B to start under the larger in-flight demand");
+        releaseA();
+        assert.equal((await pendingA).status, "success");
+        assert.equal((await pendingB).status, "success");
+    } finally {
+        releaseA();
+    }
+});
+
+test("external summary batch: an invalid pool scope rejects without dispatch (#2657)", async () => {
+    const executor = new ExternalSummaryExecutor(1);
+    const candidate: SummaryCandidate = { summarize: async () => assert.fail("must not dispatch") };
+    // Non-positive values reject before dispatch; the 1..32 product range is
+    // owned by the settings layer, the executor takes any positive integer.
+    await assert.rejects(executor.execute(work[0], [candidate], budget, undefined, { concurrency: 0 }), TypeError);
+    await assert.rejects(executor.executeBatch(work, [candidate], budget, undefined, { concurrency: -1 }), TypeError);
 });
 
 test("external summary batch: invalid operation plans fail without dispatch", async () => {

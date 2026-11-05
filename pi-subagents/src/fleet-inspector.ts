@@ -483,6 +483,8 @@ class FleetInspectorComponent implements Component {
       else if (matchesKey(data, Key.down) || matchesKey(data, "j")) this.scrollTranscript(1);
       else if (matchesKey(data, Key.left) || matchesKey(data, Key.pageUp)) this.scrollTranscript(-this.pageSize());
       else if (matchesKey(data, Key.right) || matchesKey(data, Key.pageDown)) this.scrollTranscript(this.pageSize());
+      else if (matchesKey(data, Key.home) || matchesKey(data, "g")) this.scrollTranscriptToEdge(false);
+      else if (matchesKey(data, Key.end) || matchesKey(data, Key.shift("g"))) this.scrollTranscriptToEdge(true);
       else if (matchesKey(data, Key.enter)) {
         this.mode = "list";
         this.tui.requestRender();
@@ -503,6 +505,13 @@ class FleetInspectorComponent implements Component {
   private scrollTranscript(delta: number): void {
     const maxTop = Math.max(0, this.transcriptLines.length - this.pageSize());
     this.viewTop = clamp(this.viewTop + delta, 0, maxTop);
+    this.follow = this.viewTop >= maxTop;
+    this.tui.requestRender();
+  }
+
+  private scrollTranscriptToEdge(toEnd: boolean): void {
+    const maxTop = Math.max(0, this.transcriptLines.length - this.pageSize());
+    this.viewTop = toEnd ? maxTop : 0;
     this.follow = this.viewTop >= maxTop;
     this.tui.requestRender();
   }
@@ -565,7 +574,7 @@ class FleetInspectorComponent implements Component {
       const maxTop = Math.max(0, middle.length - midH);
       const top = clamp(this.follow ? maxTop : this.viewTop, 0, maxTop);
       middle = middle.slice(top, top + midH);
-      footer = this.theme.fg("dim", "↑↓/←→/pg scroll · enter back · esc close");
+      footer = this.theme.fg("dim", "↑↓/←→/pg scroll · g/Home top · G/End bottom · enter back · esc close");
     }
     while (middle.length < midH) middle.push("");
     return frame([...header, ...middle, footer], width, this.theme);

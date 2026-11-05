@@ -240,7 +240,9 @@ test("proxy e2e: model-switch history re-stamp re-attaches the anonymous session
     } finally {
         setLogCapture(null);
         proxy.close();
+        proxy.closeIdleConnections?.();
         relay.close();
+        relay.closeIdleConnections?.();
         await Promise.allSettled([once(proxy, "close"), once(relay, "close")]);
     }
 });

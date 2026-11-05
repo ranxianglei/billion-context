@@ -37,6 +37,10 @@ export interface StatusPanelInput {
    *  the host's provider-scale number from an estimate-scale number
    *  invents a third, meaningless scale (issue #18 "看板统计的和拆分的有差异"). */
   unprunedTokens?: number;
+  /** One-line human-readable storage-mode label (e.g. "storage: full
+   *  (unified-first reads, dual-write)"). Pre-rendered by the host from the
+   *  effective mode — the kernel never guesses. Omit to hide the line. */
+  storage?: string;
   /** Per-request prompt-cache usage (from assistant messages' provider-
    *  reported `usage`). Requests without cache reporting are excluded by
    *  cacheHitStats; when no counted request remains, the section is
@@ -44,6 +48,11 @@ export interface StatusPanelInput {
   cacheUsages?: ReadonlyArray<CacheUsageSample>;
   /** Token formatter override (defaults to formatCompactTokens). */
   fmtTokens?: (n: number) => string;
+  /** Block ids whose summaries were written by an out-of-band executor
+   *  (e.g. the host's external summary service) rather than the model
+   *  itself. Purely cosmetic: the panel marks these lines with "⚡ext".
+   *  Omit to render without markers. */
+  externalBlockIds?: ReadonlySet<string>;
 }
 
 function bar(value: number, total: number, width: number = 20): string {
@@ -74,6 +83,7 @@ function bar(value: number, total: number, width: number = 20): string {
 export function buildStatusPanel(input: StatusPanelInput): string {
   const { tokenCount, state, nudge, modelContextLimit } = input;
   const fmt = input.fmtTokens ?? formatCompactTokens;
+  const externalBlockIds = input.externalBlockIds;
   const bd = nudge?.contextBreakdown;
   const limit = modelContextLimit;
   const classified = bd
@@ -101,6 +111,7 @@ export function buildStatusPanel(input: StatusPanelInput): string {
   lines.push("│           ACP Context Analysis              │");
   lines.push("╰─────────────────────────────────────────────╯");
   if (input.version) lines.push(input.version);
+  if (input.storage) lines.push(input.storage);
   lines.push("");
   lines.push(
     `Context (session accounting, host footer scale): ${displayPct}% (${fmt(displayTotal)} / ${fmt(limit)}) — includes compressed originals; shrinks slower than the sent view`,
@@ -184,8 +195,9 @@ export function buildStatusPanel(input: StatusPanelInput): string {
         : `: ${topicFallback(b.summary || "")}`;
       const summaryTok = defaultCountTokens(b.summary || "");
       const origTok = b.compressedTokens > 0 ? b.compressedTokens : summaryTok;
+      const ext = externalBlockIds?.has(b.blockId) ? " ⚡ext" : "";
       lines.push(
-        `  [${b.blockId}] T${b.tier} ${fmt(origTok)}→${fmt(summaryTok)}${topic}`,
+        `  [${b.blockId}] T${b.tier} ${fmt(origTok)}→${fmt(summaryTok)}${ext}${topic}`,
       );
     }
   } else if (totalBlocksList.length > 0) {

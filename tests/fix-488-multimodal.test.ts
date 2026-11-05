@@ -313,6 +313,7 @@ test("e2e #488-A2 (Responses): image tokens count toward the output-budget clamp
 async function closeAll(...servers: http.Server[]): Promise<void> {
     for (const s of servers) {
         s.close();
+        s.closeIdleConnections?.();
         await once(s, "close");
     }
 }

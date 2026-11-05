@@ -30,7 +30,7 @@ const run = process.env.ACP_TEST_REGISTRY === "1";
 const skipReason = !run ? "set ACP_TEST_REGISTRY=1 (hermetic local-registry e2e; loopback only)" : undefined;
 
 const REPO_ROOT = path.resolve(import.meta.dirname, "..", "..");
-const PKG = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, "package.json"), "utf8")) as { name: string; version: string; files: string[] };
+const PKG = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, "package.json"), "utf8")) as { name: string; version: string; files: string[]; scripts?: Record<string, string> };
 
 // Version choreography (all published to the local registry as real
 // tarballs of THIS build):
@@ -94,7 +94,13 @@ async function makeFixtureTarball(work: string, version: string): Promise<string
     fs.mkdirSync(packs, { recursive: true });
     const stage = path.join(work, "fixtures", version);
     fs.mkdirSync(stage, { recursive: true });
-    fs.writeFileSync(path.join(stage, "package.json"), `${JSON.stringify({ ...PKG, version }, null, 2)}\n`);
+    // The staged copy models a PUBLISHED artifact: registry installs never run
+    // prepare, and scripts/ is outside `files`, so drop the hook referencing
+    // the non-shipped guard script (#2471).
+    fs.writeFileSync(
+        path.join(stage, "package.json"),
+        `${JSON.stringify({ ...PKG, version, scripts: Object.fromEntries(Object.entries(PKG.scripts ?? {}).filter(([name]) => name !== "prepare")) }, null, 2)}\n`,
+    );
     for (const entry of PKG.files) {
         const src = path.join(REPO_ROOT, entry);
         if (fs.existsSync(src)) await fs.promises.cp(src, path.join(stage, entry), { recursive: true });
@@ -223,7 +229,17 @@ test("e2e: rollback-form advisory (#1588) — forced rollback, no ping-pong, per
     // --- setup: registry with the controlled version sequence, disk on START
     reg = await startRegistry(path.join(work, "registry"));
     const envBase = isolatedEnv(work);
-    const biliEnv = { ...envBase, BILI_UPDATE_REGISTRY: reg.url, BILI_UPDATE_CHECK_INTERVAL_MS: String(CYCLE_MS) };
+    const biliEnv = {
+        ...envBase,
+        BILI_UPDATE_REGISTRY: reg.url,
+        BILI_UPDATE_CHECK_INTERVAL_MS: String(CYCLE_MS),
+        // #3619 pins: this suite drives version sequencing via advisory
+        // force-installs and periodic checks with tight waits — keep the
+        // stagger rollout at legacy immediate and the policy file unreachable.
+        BILI_UPDATE_STAGGER_MIN_MS: "0",
+        BILI_UPDATE_STAGGER_MAX_MS: "0",
+        BILI_UPDATE_POLICY_URL: "http://127.0.0.1:1/no-policy.json",
+    };
 
     const startTgz = await makeFixtureTarball(work, START);
     const latestTgz = await makeFixtureTarball(work, LATEST);

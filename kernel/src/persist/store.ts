@@ -271,7 +271,7 @@ export class StateStore<T> {
       const tmp = this.tempPath(file);
       try {
         fs.mkdirSync(path.dirname(file), { recursive: true });
-        fs.writeFileSync(tmp, data);
+        this.atomicWriteDurable(tmp, data);
         fs.renameSync(tmp, file);
         lastErr = undefined;
         break;
@@ -312,7 +312,7 @@ export class StateStore<T> {
     ) {
       try {
         fs.mkdirSync(path.dirname(spill), { recursive: true });
-        fs.writeFileSync(spill, data);
+        this.atomicWriteDurable(spill, data);
         spillPath = spill;
       } catch (e) {
         if (!isTransientFsError(e) || attempt === this.retryAttempts - 1) break;
@@ -468,6 +468,8 @@ export class StateStore<T> {
       try {
         await fsp.mkdir(path.dirname(file), { recursive: true });
         await fsp.writeFile(tmp, data);
+        // Make the data durable BEFORE the rename publishes it (#3157).
+        this.fsyncFile(tmp);
         // Commit block: fence check + rename in one synchronous run
         // — the event loop cannot interleave a flushSync between the
         // check and the rename, so a stale payload can never land
@@ -528,7 +530,7 @@ export class StateStore<T> {
         // id, so a late-landing stale spill would overwrite a newer
         // spill exactly like the canonical case above.
         if ((this.commitSeq.get(id) ?? 0) !== baseSeq) return;
-        fs.writeFileSync(spill, data);
+        this.atomicWriteDurable(spill, data);
         spillPath = spill;
       } catch (e) {
         if (!isTransientFsError(e) || attempt === this.retryAttempts - 1) break;
@@ -585,6 +587,38 @@ export class StateStore<T> {
       path.dirname(dest),
       `.tmp-${path.basename(dest, ".json")}-${process.pid}-${seq}`,
     );
+  }
+
+  /** Durable synchronous write: open → write → fsync → close. Without the
+   *  fsync the bytes sit in the page cache until the OS flushes them, so a
+   *  power loss / kernel panic between this write and the rename leaves a
+   *  size-correct, VDL=0 all-zero file on disk (#3157) — the metadata (size +
+   *  cluster allocation) is journaled by NTFS but the user data is not. The
+   *  fsync makes the DATA durable before the rename publishes the name. */
+  private atomicWriteDurable(file: string, data: Buffer | string): void {
+    const fd = fs.openSync(file, "w");
+    try {
+      fs.writeFileSync(fd, data);
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+  }
+
+  /** Make an already-written file durable by re-opening it and fsyncing.
+   *  Re-opening is a valid minimal-diff way to flush a file written through
+   *  an async handle before its rename publishes it (#3157). The handle must
+   *  have write access ("r+"): on POSIX fsync is file-level (inode) so any fd
+   *  works, but on Windows the flush goes through the handle
+   *  (FlushFileBuffers) and a read-only one fails with EPERM — which would
+   *  break every async state write on that platform. */
+  private fsyncFile(file: string): void {
+    const fd = fs.openSync(file, "r+");
+    try {
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
   }
 
   private backoffMs(attempt: number): number {

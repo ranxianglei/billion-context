@@ -182,18 +182,34 @@ test("responses: messages-shaped body (no input array) never intercepts", () => 
 
 test("refusal bodies carry the marker reason and are non-retryable", () => {
     const openai = dshCompactionRefusal("openai") as { status: number; body: { error: { retryable: boolean; message: string } } };
-    assert.equal(openai.status, 403);
+    assert.equal(openai.status, 422);
     assert.equal(openai.body.error.retryable, false);
     assert.match(openai.body.error.message, /#1729/);
+    // #3499: the refusal must tell the user what to do INSTEAD (keep using the
+    // lane; over-window sessions fold on the next turn), not only how to force
+    // the refused behavior — the incident user read the bare opt-in as "the fix".
+    assert.match(openai.body.error.message, /No action is needed/);
+    assert.match(openai.body.error.message, /starts folding on the next turn/);
     const anthropic = dshCompactionRefusal("anthropic") as { status: number; body: { error: { message: string } } };
-    assert.equal(anthropic.status, 403);
+    assert.equal(anthropic.status, 422);
     assert.match(anthropic.body.error.message, /durably/);
     // #2360: the responses lane refuses through the same generic shape.
     const responses = dshCompactionRefusal("responses") as { status: number; body: { error: { code: string; retryable: boolean; message: string } } };
-    assert.equal(responses.status, 403);
+    assert.equal(responses.status, 422);
     assert.equal(responses.body.error.code, "dsh_compaction_refused");
     assert.equal(responses.body.error.retryable, false);
     assert.match(responses.body.error.message, /#1729/);
+});
+
+test("refusal status is neither auth-class nor transient-class on any lane", () => {
+    // #2843: a 401/403 refusal reads as a credential failure (dsh maps it to
+    // AUTH); 408/409/429/5xx would make SDK retry logic replay the refused call.
+    for (const protocol of ["openai", "anthropic", "responses", "google"]) {
+        const { status } = dshCompactionRefusal(protocol);
+        assert.ok(status !== 401 && status !== 403, `${protocol}: ${status} is auth-class`);
+        assert.ok(status !== 408 && status !== 409 && status !== 429 && status < 500, `${protocol}: ${status} is retryable-class`);
+        assert.ok(status >= 400 && status < 500, `${protocol}: ${status} must stay a client error`);
+    }
 });
 
 test("the versioned marker prefix matches the live dsh template", () => {

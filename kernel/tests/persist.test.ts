@@ -498,9 +498,6 @@ test("mergeCompressionState keeps parsed values over defaults", () => {
     tokensCompressed: 1234,
     compressionCount: 7,
     absorbedTokens: 0,
-    imagesShrunk: 0,
-    imageBytesSaved: 0,
-    imageTokensSaved: 0,
     storedCount: 0,
     retrievalCount: 0,
   });
@@ -842,9 +839,18 @@ test("flushSync retries use a fresh temp name per attempt (no tombstoned reuse)"
   try {
     const s = store(dir, { retryAttempts: 3, retryBaseMs: 1, retryMaxMs: 1 });
     const written: string[] = [];
-    t.mock.method(fs, "writeFileSync", ((p: string, _data: string) => {
-      written.push(p);
-    }) as typeof fs.writeFileSync);
+    // The durable write (#3157) opens each target with "w" exactly once, so
+    // count those opens (forwarding to the real open) instead of the old
+    // writeFileSync call.
+    const realOpen = fs.openSync.bind(fs);
+    t.mock.method(
+      fs,
+      "openSync",
+      ((p: string, flags?: string | number, mode?: number) => {
+        if (flags === "w") written.push(p);
+        return realOpen(p, flags, mode);
+      }) as typeof fs.openSync,
+    );
     t.mock.method(fs, "renameSync", (() => {
       throw eperm();
     }) as typeof fs.renameSync);
@@ -1216,6 +1222,30 @@ test("#373: flushSync after a fully settled async write simply supersedes it", a
     const loaded = s.loadSync("sid-order");
     assert.ok(loaded);
     assert.deepEqual(loaded.payload, { label: "sync-second", count: 2 });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("#3157: every commit fsyncs the temp before rename (durable data, not just an atomic name)", async (t) => {
+  const dir = tmpDir();
+  try {
+    let fsyncs = 0;
+    t.mock.method(fs, "fsyncSync", () => {
+      fsyncs++;
+    });
+    const s = store(dir);
+    // Sync commit path (flushSync).
+    const okSync = s.flushSync("sid-sync", () => ({ label: "sync", count: 1 }));
+    assert.equal(okSync, true);
+    assert.ok(fsyncs >= 1, `flushSync must fsync the temp before rename, saw ${fsyncs}`);
+    const afterSync = fsyncs;
+    // Async commit path (writeNow -> writeInner).
+    await s.writeNow("sid-async", () => ({ label: "async", count: 2 }));
+    assert.ok(fsyncs > afterSync, `writeInner must fsync the temp before rename, saw ${fsyncs}`);
+    // The durable writes still round-trip their payload.
+    assert.deepEqual(s.loadSync("sid-sync")!.payload, { label: "sync", count: 1 });
+    assert.deepEqual(s.loadSync("sid-async")!.payload, { label: "async", count: 2 });
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

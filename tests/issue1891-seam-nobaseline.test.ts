@@ -207,6 +207,9 @@ test("#1891: streaming /bili/ lane captures outbound bodies at the main chokepoi
         // Same shape, message[1] rewritten, cache collapses: a genuine mid-history
         // break. Pre-fix this lane had NO body capture → seamEvents undefined
         // ("aggregate flag only"); post-fix the chokepoint note yields forensics.
+        // #3023: the rewrite here is authored BY THE CLIENT (this fetch rewrote
+        // message[1] in its resent list), so the pair now books the client
+        // bucket — with the same body-pair forensics the chokepoint provides.
         const resp2 = await post([
             { role: "user", content: "alpha" },
             { role: "assistant", content: "BETA-REWROTE" },
@@ -217,11 +220,13 @@ test("#1891: streaming /bili/ lane captures outbound bodies at the main chokepoi
         const s2 = getSession(sessionId);
         const led2 = getCacheLedger(s2);
         const line2 = led2.lines[led2.lines.length - 1]!;
-        assert.equal(line2.seam, 1, "real break on the streaming lane is still caught");
-        assert.equal(led2.agg.seamSuspects, 1);
+        assert.equal(line2.prov, "client", "client-authored rewrite books the client bucket, not the seam bucket (#3023)");
+        assert.equal(line2.seam, undefined);
+        assert.equal(led2.agg.clientInserts, 1);
         assert.ok(led2.seamEvents?.length, "body-pair forensics now available on the streaming lane");
         assert.ok(led2.seamEvents![0]!.lcpBytes > 0, "LCP computed from captured bodies");
         assert.ok(led2.seamEvents![0]!.msgIndex !== null && led2.seamEvents![0]!.msgIndex >= 1, "divergence located past the stable head");
+        assert.equal(led2.seamEvents![0]!.client?.idx, 1, "client forensics localize the host rewrite");
     } finally {
         await close(proxy);
         await close(upstream);

@@ -10,8 +10,6 @@ process.env.NODE_ENV = "test";
 // Fail fast on 4xx retries so rejections surface immediately.
 process.env.BILI_REPLAY_RETRY_MAX = "1";
 process.env.BILI_REPLAY_RETRY_BASE_MS = "0";
-// Short dead-end cooldown so the expiry leg stays fast.
-process.env.BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS = "400";
 
 import { defaultConfig } from "acp-kernel";
 import { startServer } from "../src/server.ts";
@@ -19,19 +17,17 @@ import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { listSessions } from "../src/session.ts";
+import { DUMP_PLAINTEXT_BANNER, stripDumpBanner } from "../src/dump-banner.ts";
 import { setLogCapture } from "../src/logger.ts";
 import { rmrf } from "./tmp-rm.ts";
 
 // #1993: a preflight summarization call answered HTTP 400 left the session
 // wedged and undiagnosable — the response body was never logged or dumped,
 // there was no chunk-shrink fallback (unlike the unusable-HTTP-200 path), and
-// the turn fail-fasted 502 retryable=false with a dead-end cooldown. These
-// tests pin: (a) the rejection body is logged AND surfaced in the client
-// message, (b) hard size-plausible 400/413 get the same halving recovery as an
-// unusable 200 while transient/auth/routing 4xx keep their old semantics,
-// (c) BILI_DUMP_4XX persists the full summary exchange (request + response),
-// (d) the dead-end cooldown only arms after the shrink cascade is genuinely
-// exhausted with zero progress.
+// the turn fail-fasted 502 retryable=false. These tests pin: (a)–(c) below
+// and (d) (#4079) the #726 dead-end cooldown is GONE: exhaustion answers
+// fail-fast retryable=false with NO persisted marker, and every retry re-runs
+// a bounded walk (the accepted trade for never freezing identical retries).
 
 const SUMMARY_TEXT =
     "PREFLIGHT-400 TEST SUMMARY: the segment held a deterministic load-growth payload across several turns; every raw marker is derivable from the seed, so the folded view loses nothing of value.";
@@ -151,13 +147,13 @@ async function driveResponses(proxyPort: number, upstreamPort: number, session: 
 }
 
 async function closeAll(...servers: http.Server[]): Promise<void> {
-    servers.forEach((s) => s.close());
+    servers.forEach((s) => { s.close(); s.closeIdleConnections?.(); });
     await new Promise<void>((resolve, reject) => {
         void Promise.allSettled(servers.map((s) => once(s, "close"))).then(() => resolve(), reject);
     });
 }
 
-test("#1993 systemic hard 400: body surfaced in log+message, bounded halving cascade, cooldown arms after exhaustion", async () => {
+test("#1993 systemic hard 400: body surfaced in log+message, bounded halving cascade, deterministic diagnosis on every retry", async () => {
     const calls: Call[] = [];
     const upstream = makeUpstream(calls, 0, 400, SYSTEMIC_400_BODY);
     upstream.listen(0, "127.0.0.1");
@@ -188,16 +184,30 @@ test("#1993 systemic hard 400: body surfaced in log+message, bounded halving cas
         assert.ok(!calls.some((c) => !c.summary), "nothing may be forwarded on failure");
 
         const sess = listSessions().find((s) => s.id.includes("s1993-systemic"));
-        const marker = sess?.metadata.preflightDeadEnd as Record<string, unknown> | undefined;
-        assert.ok(marker && typeof marker === "object", "exhausted zero-progress 400 cascade must arm the dead-end marker");
-        assert.match(String(marker?.key), /^gpt-7-sol\u000010000\u0000[0-9a-f]{64}$/, "marker scoped to model, window and request body");
+        // (#4079) the #726 dead-end cooldown was removed: a deterministic
+        // exhaustion must answer fail-fast WITHOUT persisting any marker —
+        // the retryable:false answer is the whole retry contract, and a
+        // stored marker froze every identical retry for 5 minutes (#3974).
+        assert.equal(sess?.metadata?.preflightDeadEnd, undefined, "no dead-end marker may persist (#4079)");
 
         const callsBeforeRetry = calls.length;
         const r2 = await driveResponses(proxyPort, upstreamPort, "s1993-systemic", "gpt-7-sol", longResponsesInput(12));
-        assert.equal(r2.status, 502, `cooldown must fail fast, got ${r2.status}`);
-        const j2 = (await r2.json()) as { error?: { message?: string } };
-        assert.equal(j2.error?.message, j1.error?.message, "cooldown replays the cached diagnosis");
-        assert.equal(calls.length, callsBeforeRetry, "cooldown must spend ZERO upstream calls");
+        assert.equal(r2.status, 502, `deterministic exhaustion must fail fast again, got ${r2.status}`);
+        const j2 = (await r2.json()) as { error?: { code?: string; message?: string; retryable?: boolean } };
+        assert.equal(j2.error?.code, "preflight_compress_failed");
+        assert.equal(j2.error?.retryable, false);
+        // The walk REGENERATES the diagnosis on the fresh turn (token counts
+        // shift with per-turn injections) — pin the stable core instead of the
+        // old cached-verbatim equality the cooldown used to guarantee.
+        assert.ok(
+            j2.error?.message?.includes("rejected by the upstream (HTTP 400)")
+                && j2.error?.message?.includes("request too large: 523200 tokens exceeds the 128000 input limit")
+                && j2.error?.message?.includes("The over-window payload was NOT forwarded."),
+            `regenerated diagnosis must carry the same rejection core, got: ${j2.error?.message}`,
+        );
+        const retrySummaries = calls.slice(callsBeforeRetry).filter((c) => c.summary);
+        assert.ok(retrySummaries.length >= 2 && retrySummaries.length <= 16, `the re-run walk is itself bounded by the cascade (#4079 trade), got ${retrySummaries.length}`);
+        assert.ok(!calls.some((c) => !c.summary), "nothing may be forwarded on failure");
     } finally {
         await closeAll(proxy, upstream);
     }
@@ -254,7 +264,7 @@ test("#1993 non-size 4xx does not shrink: 401 fails fast after exactly one summa
         const summaries = calls.filter((c) => c.summary);
         assert.equal(summaries.length, 1, `401 must not burn the budget on halving, got ${summaries.length} calls`);
         const sess = listSessions().find((s) => s.id.includes("s1993-auth"));
-        assert.ok(sess?.metadata?.preflightDeadEnd, "zero-progress auth rejection must arm the dead-end marker");
+        assert.equal(sess?.metadata?.preflightDeadEnd, undefined, "(#4079) no dead-end marker persists — the cooldown is gone");
     } finally {
         await closeAll(proxy, upstream);
     }
@@ -310,7 +320,9 @@ test("#1993 BILI_DUMP_4XX persists the rejected summary exchange (request + resp
 
         const files = fs.readdirSync(dumpDir).filter((f) => f.startsWith("summary-err-") && f.endsWith("-400.json"));
         assert.ok(files.length >= 1, `expected at least one summary-err dump, dir has: ${JSON.stringify(fs.readdirSync(dumpDir))}`);
-        const parsed = JSON.parse(fs.readFileSync(path.join(dumpDir, files[0]!), "utf8")) as { status: number; request: unknown; response: unknown };
+        const text = fs.readFileSync(path.join(dumpDir, files[0]!), "utf8");
+        assert.ok(text.startsWith(`${DUMP_PLAINTEXT_BANNER}\n`), "#4482: plaintext warning banner must lead the dump");
+        const parsed = JSON.parse(stripDumpBanner(text)) as { status: number; request: unknown; response: unknown };
         assert.equal(parsed.status, 400);
         assert.ok(typeof parsed.request === "string" && parsed.request.includes("instructions"), "dump must carry the request bytes");
         assert.ok(typeof parsed.response === "string" && parsed.response.includes("request too large: 523200"), "dump must carry the response bytes");

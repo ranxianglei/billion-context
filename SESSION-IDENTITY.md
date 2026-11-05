@@ -3,8 +3,11 @@
 Design record for how billion-context decides which session an **anonymous**
 request (no `session_id` header or body field, no `prompt_cache_key`) belongs
 to. Written as future reference after the tail-window reattach removal
-(#1115). Implementation: `src/prefix-affinity.ts`; behavior tests:
-`tests/truncation-fork.test.ts`, `tests/prefix-affinity.test.ts`.
+(#1115), and after the wire-neutral canonical projection (#2791).
+Implementation: `src/prefix-affinity.ts`, `src/affinity-neutral.ts`;
+behavior tests:
+`tests/truncation-fork.test.ts`, `tests/prefix-affinity.test.ts`,
+`tests/affinity-neutral.test.ts`.
 
 ## Principle: content is the only immutable anchor
 
@@ -113,6 +116,90 @@ tracked chain records `lineage: { reason: "truncated", parents }`; a shared
 leading prefix (LCP ≥ `MIN_FORK_PREFIX = 3`) records `reason: "forked"` instead
 and takes precedence. Lineage is logged and stored for UI/debug and **never
 affects matching**.
+
+## Wire-neutral canonical projection (#2791)
+
+### The cross-wire blind spot
+
+The progressive hash above was computed over the **raw wire JSON** of each
+message. Two renders of the *same conversation* on different protocols are
+never byte-equal — an OpenAI wire renders tool activity as
+`{role:"assistant", content:null, tool_calls:[{function:{name, arguments:"…json string…"}}]}`
+plus `{role:"tool", tool_call_id, content}`, while the Anthropic wire renders
+it as assistant content blocks `[{type:"thinking"}, {type:"tool_use", name,
+input:{…}}]` plus `tool_result` blocks nested inside the next user message. A
+dsh session that switches `api` (`openai-completions` → `anthropic-messages`, 
+same conversation, same upstream models) therefore matched nothing, minted a
+fresh anonymous session, orphaned its fold ledger, and paid a full re-fold
+(~182 s) plus a cache reset on the switch turn — silently (#2791).
+
+### The projection
+
+Hashing now runs on a protocol-neutral projection (`src/affinity-neutral.ts`):
+each message is normalized to a `NeutralTurn` (`{kind, text}` or
+`{kind, calls}`) under rules that are injective enough for hashing while
+dropping wire decoration:
+
+- leading system/developer run stripped (top-level `system` param never
+  entered the projection);
+- text content: string ↔ `[{type:"text"}]` blocks concatenated;
+- tool activity: `tool_calls[].function.arguments` (JSON *string*) and
+  `tool_use[].input` (object) both canonicalized to the parsed value;
+  `{role:"tool", tool_call_id}` ↔ user `tool_result` blocks become a synthetic
+  `{kind:"tool"}` turn (multi-`tool_result` user messages split);
+- assistant turns carrying tool calls drop their text (the two wires
+disagree on whether thinking accompanies a tool call);
+- consecutive assistant messages merge (Anthropic splits them);
+- client `[model changed: …]` marker turns and churn keys
+  (`cache_control`, ids, signatures) are dropped;
+- unknown shapes fall back to the raw canonical of the whole message —
+  matching degrades to v1 behavior, never to false matches.
+
+The per-turn canonical string is `canon({content, role})` — byte-identical
+to the v1 canonical of a plain OpenAI text message, so the #2265 simhash
+hamming calibration carries over unchanged (model re-stamp mutations stay
+inside the adoptable band; verified `coverage ≥ 0.9` on the original
+fixtures).
+
+### Storage and migration
+
+`ChainEntry.hv` distinguishes domains: `hv:2` entries carry neutral
+per-item hashes and simhash sketches; pre-upgrade `hv:1` entries remain
+readable and matchable (raw-wire domain, including the legacy churn-tolerant
+tail hash), so upgrading does **not** re-mint every tracked session — the
+mass-fork cost is paid only where a conversation actually crosses wires,
+which is exactly the case that previously forked anyway. Simhash adoption
+and lineage rungs operate per-domain (`hv:2` only for adoption), and the
+client-provided append-only guard re-anchors `hv:1` entries unconditionally
+(depth is only comparable within a domain).
+
+### Live evidence
+
+Fresh dsh session, 45 KB knowledge file read on the `openai-completions`
+lane (fold fired: ~13.5 k tokens saved), then the same dsh session switched
+to `anthropic-messages` and quizzed on folded content: the anthropic
+request matched the openai-lane session at prefix depth 9/11, no new
+anonymous session, no re-fold, answers served from the fold summary, cache
+hit 97 % within two rounds. Captures and log in the #2791 thread.
+
+## Snapshot render: the session id becomes the whole message identity (#3756)
+
+The anonymous-adoption ladder above exists because the wire bytes were the
+only record of an unauthenticated conversation. For sessions with a bound
+id (host-native session header or affinity key) and unified storage
+available, #3756 closes the loop: the OUTBOUND history prefix is rendered
+from the server's own transcript keyed by that session id
+(`src/server/snapshot-render.ts`, rollout feature `snapshotRender`, default
+0%). Message identity for the rendered prefix is the server row `seq` —
+content hashes demote to chain-fallback evidence that only locates where
+the client's verbatim tail joins the server prefix. Client edits, host
+checkpoints and protocol switches can no longer move, drop or duplicate
+folded coverage, because coverage is computed from the block's seq/
+signature sets, not from what the client happens to resend. The
+adoption ladder above remains the fallback for the lanes where the feature
+is off, the storage is unavailable, or the chain cannot link — degrade,
+never guess. Full mechanism and honesty boundaries:
+`MESSAGE-IDENTITY.md` §"The snapshot render engine".
 
 ## Rejected alternatives
 

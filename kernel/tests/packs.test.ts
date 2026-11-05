@@ -9,6 +9,8 @@ import {
   defaultPack,
   leanPack,
   LEAN_HOW_TO_COMPRESS,
+  LEAN_HOW_TO_COMPRESS_TIMESTAMPED,
+  TIMELINE_RULE_LINE,
   leanHowToCompress,
   HOW_TO_COMPRESS_RULES,
   TIER2_DISTILL_RULES,
@@ -116,6 +118,12 @@ test("lean carries a condensed how-to-compress style contract in the pi slot", (
   ]) {
     assert.ok(howTo.includes(marker), `missing: ${marker}`);
   }
+  // #4313 toggle: the BASE pack stays pre-feature; the timestamped variant is
+  // base + the diary-line rule, selected at host exits by the flag.
+  assert.equal(howTo, LEAN_HOW_TO_COMPRESS);
+  assert.ok(!howTo.includes("TIMELINE"), "base lean pack must not carry the timeline rule");
+  assert.ok(LEAN_HOW_TO_COMPRESS_TIMESTAMPED.includes(TIMELINE_RULE_LINE));
+  assert.equal(LEAN_HOW_TO_COMPRESS_TIMESTAMPED.replace(TIMELINE_RULE_LINE + "\n", ""), LEAN_HOW_TO_COMPRESS);
   // #265: summariesInContext is a compact trust guardrail now, not null
   assert.equal(
     typeof pi.promptSections.summariesInContext,
@@ -375,31 +383,13 @@ test("lean surface applies to wire tools via applyAcpToolOverrides", () => {
     leanPack.surface.toolPrompts?.compress?.description,
   );
   const params = compress.function.parameters as {
-    properties: {
-      content: {
-        anyOf: {
-          items?: {
-            anyOf: {
-              type: string;
-              properties?: Record<string, { description?: string }>;
-            }[];
-          };
-        }[];
-      };
-    };
+    properties: { content: { type?: string; description?: string } };
   };
-  const objectForm = params.properties.content.anyOf[0].items!.anyOf.find(
-    (v) => v.type === "object",
-  );
-  assert.ok(objectForm?.properties?.startId);
+  assert.equal(params.properties.content.type, "string");
   assert.equal(
-    objectForm!.properties!.startId!.description,
-    "Inclusive first mNNNNN or bN ref.",
+    params.properties.content.description,
+    leanPack.surface.toolPrompts?.compress?.paramDescriptions?.content,
   );
-  const lineForm = params.properties.content.anyOf[0].items!.anyOf.find(
-    (v) => v.type === "string",
-  );
-  assert.ok(lineForm, "line-form string variant is taught in the schema");
 });
 
 test("pack promptSections flow into buildCompressSystemPrompt", () => {
@@ -537,28 +527,50 @@ test("every builtin pack's compression guidance carries the open-objectives rule
   }
 });
 
-test("summaries-in-context guardrails carve out Open objectives as live tasking (#442)", () => {
+test("summaries-in-context guardrails carve out Open objectives as binding tasking (#442, billion-context#2750)", () => {
   const defaultPrompt = buildCompressSystemPrompt();
-  assert.ok(
-    defaultPrompt.includes('Exception: a summary\'s "Open objectives:" line'),
-    "default summariesInContext guardrail keeps the live-tasking exception",
-  );
   const piSections =
     (
       leanPack.surface.adapters?.pi as
         { promptSections?: Record<string, string | null> } | undefined
     )?.promptSections ?? {};
+  for (const [label, text] of [
+    ["default function prompt", defaultPrompt],
+    ["lean summariesInContext", piSections.summariesInContext ?? ""],
+  ] as const) {
+    assert.ok(
+      text.includes('Exception: a summary\'s "Open objectives:" line'),
+      `${label}: guardrail keeps the open-objectives exception`,
+    );
+    assert.ok(
+      !text.includes("confirm and resume"),
+      `${label}: ambiguous 'confirm and resume' hedge must be gone (billion-context#2750)`,
+    );
+    assert.ok(
+      text.includes("binding until the user completes, cancels, or supersedes"),
+      `${label}: open objectives stay binding until completed/cancelled/superseded (billion-context#2750)`,
+    );
+    assert.ok(
+      text.includes(
+        "re-authorize work they already authorized",
+      ) || text.includes("authorization of work already authorized"),
+      `${label}: re-authorization of already-authorized work is forbidden (billion-context#2750)`,
+    );
+    assert.ok(
+      text.includes("they never end, replace, or re-authorize an open objective"),
+      `${label}: automated events are result events only (billion-context#2750)`,
+    );
+  }
+  const leanTags = piSections.acpTags ?? "";
   assert.ok(
-    (piSections.summariesInContext ?? "").includes(
-      'Exception: a summary\'s "Open objectives:" line',
+    leanTags.includes(
+      'A summary\'s "Open objectives:" line names user-requested work that is still open',
     ),
-    "lean summariesInContext guardrail keeps the live-tasking exception",
+    "lean acpTags names the open-objective rule without the confirm hedge (billion-context#2750)",
   );
   assert.ok(
-    (piSections.acpTags ?? "").includes(
-      'A summary\'s "Open objectives:" line names still-open user requests',
-    ),
-    "lean acpTags guardrail keeps the live-tasking exception",
+    !leanTags.includes("confirm and resume"),
+    "lean acpTags: ambiguous 'confirm and resume' hedge must be gone (billion-context#2750)",
   );
 });
 

@@ -208,6 +208,22 @@ function urlOf(v: unknown): string | undefined {
     return undefined;
 }
 
+// #3398: payload bytes that bili forwards VERBATIM but no shape walker above
+// recognizes — custom content parts ({type:"image",attachment:{…}} from hosts'
+// own attachment flows), unknown google parts, nested tool_result media.
+// Charged at serialized-bytes/4 in BOTH billing modes: the part's payload is an
+// UNKNOWN shape (a 50-byte reference as often as an image container), so the
+// flat PIXEL_IMAGE_FALLBACK_TOKENS overcharges small carriers by orders of
+// magnitude and hard-blocks legitimate requests in fail-closed guards (the
+// #554 side-request guard 413'd codex's tiny compaction handoff items — CI
+// regression found on #3412 review); the proportional lower bound only delays
+// folding when it undershoots, which is the safe direction for both gates.
+// Call ONLY for parts the wire codec actually carries (each branch gates on its
+// codec's preservation rule); parts the codec drops must not be charged.
+function opaquePartCost(part: Record<string, unknown>, configuredCap?: number): number {
+    return applyCap(Math.ceil(JSON.stringify(part).length / 4), configuredCap);
+}
+
 export function imageTokensInParsedBody(protocol: "anthropic" | "openai" | "responses" | "google", body: unknown, billing: ResolvedImageBilling = "bytes", configuredCap?: number): number {
     if (!isObj(body)) return 0;
     let total = 0;
@@ -222,9 +238,15 @@ export function imageTokensInParsedBody(protocol: "anthropic" | "openai" | "resp
             for (const part of c.parts) {
                 if (!isObj(part)) continue;
                 const inline = part.inlineData;
-                if (isObj(inline) && typeof inline.data === "string") total += base64ImageCost(inline.data, billing, configuredCap);
+                if (isObj(inline) && typeof inline.data === "string") { total += base64ImageCost(inline.data, billing, configuredCap); continue; }
                 const file = part.fileData;
-                if (isObj(file) && typeof file.fileUri === "string") total += costForUrl(file.fileUri, billing, configuredCap);
+                if (isObj(file) && typeof file.fileUri === "string") { total += costForUrl(file.fileUri, billing, configuredCap); continue; }
+                // #3398: unknown-shape content parts ride rawGoogleParts verbatim
+                // (kernel google.ts: "Raw parts are preferred verbatim"). Text
+                // and function carriers are already priced on their own
+                // channels — skip them; everything else carrying bytes is charged.
+                if (typeof part.text === "string" || isObj(part.functionCall) || isObj(part.functionResponse) || isObj(part.videoMetadata)) continue;
+                total += opaquePartCost(part, configuredCap);
             }
         }
         return total;
@@ -235,11 +257,29 @@ export function imageTokensInParsedBody(protocol: "anthropic" | "openai" | "resp
         for (const item of input) {
             if (!isObj(item)) continue;
             const parts = Array.isArray(item.content) ? item.content : responsesToolImageParts(item);
-            if (!parts) continue;
+            if (!parts) {
+                // #3398/#3412-review: unknown top-level item types are NOT
+                // priced here — codex's control carriers (compaction,
+                // compaction_trigger, additional_tools…) ride the preamble
+                // verbatim but carry no media, and charging them 413'd a
+                // legitimate side request (#554 guard). Only walked content
+                // carriers below can hold media.
+                continue;
+            }
             for (const part of parts) {
-                if (!isObj(part) || part.type !== "input_image") continue;
-                const url = urlOf(part.image_url);
-                if (url) total += costForUrl(url, billing, configuredCap);
+                if (!isObj(part)) continue;
+                if (part.type === "input_image") {
+                    const url = urlOf(part.image_url);
+                    if (url) total += costForUrl(url, billing, configuredCap);
+                    continue;
+                }
+                // #3398: custom content parts on USER items ride the verbatim
+                // raw-item round-trip (coreToResponses re-emits the original
+                // item while display text matches); assistant/system items
+                // degrade to text-only, so gate on role.
+                if (item.type === "message" && item.role === "user" && part.type !== "input_text" && part.type !== "output_text") {
+                    total += opaquePartCost(part, configuredCap);
+                }
             }
         }
         return total;
@@ -267,12 +307,41 @@ export function imageTokensInParsedBody(protocol: "anthropic" | "openai" | "resp
                     total += ref ? costForUrl(ref, billing, configuredCap) : applyCap(REMOTE_IMAGE_TOKENS, configuredCap);
                     continue;
                 }
+                // #3398: unrecognized part shapes ride rawOpenaiContentParts
+                // VERBATIM on user messages (kernel openai.ts allNonTextParts,
+                // #1205) — e.g. dsh read_image results {type:"image",attachment:{…}}.
+                // Other roles reduce to text-only in the codec, so gate on
+                // role==="user": charge exactly what is forwarded.
+                if (part.type === "text") continue;
+                if (m.role === "user") total += opaquePartCost(part, configuredCap);
                 continue;
             } else {
-                if (part.type !== "image") continue;
-                const src = part.source;
-                if (isObj(src) && src.type === "base64" && typeof src.data === "string") total += base64ImageCost(src.data, billing, configuredCap);
-                else if (isObj(src) && src.type === "url" && typeof src.url === "string") total += costForUrl(src.url, billing, configuredCap);
+                if (part.type === "image") {
+                    const src = part.source;
+                    if (isObj(src) && src.type === "base64" && typeof src.data === "string") total += base64ImageCost(src.data, billing, configuredCap);
+                    else if (isObj(src) && src.type === "url" && typeof src.url === "string") total += costForUrl(src.url, billing, configuredCap);
+                    continue;
+                }
+                // #3398: redacted_thinking carries an opaque base64 payload that
+                // rides rawAnthropicBlock verbatim (kernel anthropic.ts) and is
+                // invisible to msg.text.
+                if (part.type === "redacted_thinking" && typeof part.data === "string") {
+                    total += applyCap(Math.ceil((part.data as string).length / 4), configuredCap);
+                    continue;
+                }
+                // #3398: tool_result blocks with non-text nested blocks ride the
+                // WHOLE block verbatim (rawAnthropicBlock sidecar); the nested
+                // media bytes sit outside msg.text and were unpriced.
+                if (part.type === "tool_result" && Array.isArray(part.content)) {
+                    for (const c of part.content) {
+                        if (!isObj(c) || c.type === "text") continue;
+                        const src = c.source;
+                        if (isObj(src) && src.type === "base64" && typeof src.data === "string") total += base64ImageCost(src.data, billing, configuredCap);
+                        else if (isObj(src) && src.type === "url" && typeof src.url === "string") total += costForUrl(src.url, billing, configuredCap);
+                        else total += opaquePartCost(c, configuredCap);
+                    }
+                    continue;
+                }
             }
         }
     }
@@ -283,10 +352,15 @@ export function imageTokensInParsedBody(protocol: "anthropic" | "openai" | "resp
 // prepared.body is bili's own compact JSON.stringify, but client raw buffers
 // may carry spaces, so probe both forms.
 function bodyHasImagesProbe(protocol: "anthropic" | "openai" | "responses" | "google", s: string): boolean {
+    // #3398: custom-shape media carries no recognizable literal — on the
+    // wires where content arrays are the multi-part marker (openai/responses)
+    // the array form itself is the gate; anthropic adds its two opaque block
+    // types. Array-content bodies are the minority case on these wires, so the
+    // extra parses stay rare (#2824's 170ms/32MiB worst case is unchanged).
     return protocol === "google" ? s.includes("inlineData") || s.includes("fileData")
-        : protocol === "responses" ? s.includes("input_image")
-        : protocol === "openai" ? s.includes("image_url") || s.includes('"type":"file"') || s.includes('"type": "file"')
-        : s.includes('"type":"image"') || s.includes('"type": "image"');
+        : protocol === "responses" ? s.includes("input_image") || s.includes('"content":[') || s.includes('"content": [')
+        : protocol === "openai" ? s.includes("image_url") || s.includes('"type":"file"') || s.includes('"type": "file"') || s.includes('"content":[') || s.includes('"content": [')
+        : s.includes('"type":"image"') || s.includes('"type": "image"') || s.includes('"type":"redacted_thinking"') || s.includes('"type":"document"');
 }
 
 export function imageTokensInRawBody(protocol: "anthropic" | "openai" | "responses" | "google", raw: string | Buffer, billing: ResolvedImageBilling = "bytes", configuredCap?: number): number {
@@ -324,9 +398,12 @@ export function countImagesInParsedBody(protocol: "anthropic" | "openai" | "resp
             for (const part of c.parts) {
                 if (!isObj(part)) continue;
                 const inline = part.inlineData;
-                if (isObj(inline) && typeof inline.data === "string") n += 1;
+                if (isObj(inline) && typeof inline.data === "string") { n += 1; continue; }
                 const file = part.fileData;
-                if (isObj(file) && typeof file.fileUri === "string") n += 1;
+                if (isObj(file) && typeof file.fileUri === "string") { n += 1; continue; }
+                // #3398 lockstep: same opaque-part gate as the cost walker.
+                if (typeof part.text === "string" || isObj(part.functionCall) || isObj(part.functionResponse) || isObj(part.videoMetadata)) continue;
+                n += 1;
             }
         }
         return n;
@@ -337,10 +414,15 @@ export function countImagesInParsedBody(protocol: "anthropic" | "openai" | "resp
         for (const item of input) {
             if (!isObj(item)) continue;
             const parts = Array.isArray(item.content) ? item.content : responsesToolImageParts(item);
-            if (!parts) continue;
+            if (!parts) continue; // #3398 lockstep: no opaque top-level-item charge (see cost walker).
             for (const part of parts) {
-                if (!isObj(part) || part.type !== "input_image") continue;
-                if (urlOf(part.image_url)) n += 1;
+                if (!isObj(part)) continue;
+                if (part.type === "input_image") {
+                    if (urlOf(part.image_url)) n += 1;
+                    continue;
+                }
+                // #3398 lockstep: custom parts on USER items only (codec drops them elsewhere).
+                if (item.type === "message" && item.role === "user" && part.type !== "input_text" && part.type !== "output_text") n += 1;
             }
         }
         return n;
@@ -356,13 +438,27 @@ export function countImagesInParsedBody(protocol: "anthropic" | "openai" | "resp
                     if (urlOf(part.image_url)) n += 1;
                     continue;
                 }
-                if (part.type === "file") n += 1;
+                if (part.type === "file") { n += 1; continue; }
+                if (part.type === "text") continue;
+                // #3398 lockstep: user-role opaque parts only (codec drops them on other roles).
+                if (m.role === "user") n += 1;
                 continue;
             } else {
-                if (part.type !== "image") continue;
-                const src = part.source;
-                if (isObj(src) && src.type === "base64" && typeof src.data === "string") n += 1;
-                else if (isObj(src) && src.type === "url" && typeof src.url === "string") n += 1;
+                if (part.type === "image") {
+                    const src = part.source;
+                    if (isObj(src) && src.type === "base64" && typeof src.data === "string") n += 1;
+                    else if (isObj(src) && src.type === "url" && typeof src.url === "string") n += 1;
+                    continue;
+                }
+                // #3398 lockstep: redacted_thinking base64 + nested tool_result media.
+                if (part.type === "redacted_thinking" && typeof part.data === "string") { n += 1; continue; }
+                if (part.type === "tool_result" && Array.isArray(part.content)) {
+                    for (const c of part.content) {
+                        if (!isObj(c) || c.type === "text") continue;
+                        n += 1;
+                    }
+                    continue;
+                }
             }
         }
     }

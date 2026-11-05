@@ -37,6 +37,7 @@ type Item = Record<string, unknown>;
 async function closeServer(srv?: http.Server): Promise<void> {
     if (!srv) return;
     srv.close();
+    srv.closeIdleConnections?.();
     await once(srv, "close").catch(() => {});
 }
 

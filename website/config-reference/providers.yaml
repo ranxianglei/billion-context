@@ -166,6 +166,16 @@ entries:
     desc_zh: "经私有摘要凭据存储的通道凭据覆盖（secret:NAME 语义）。"
     site_en: "Lane credential override via the private summary-credential store (`secret:NAME` semantics); exactly one of apiKeyEnv / credentialRef per entry."
     site_zh: "经私有摘要凭据存储的通道凭据覆盖（`secret:NAME` 语义）；每个条目与 apiKeyEnv 二选一。"
+  - key: calibration
+    type: "{ disabled?: boolean, max?: number }"
+    default: "unset (learned k̂ applies)"
+    group: providers
+    id: cr.calib
+    render: route-row
+    desc_en: "Per-route k̂ calibration policy (#3211): opt-out or clamp for routes whose usage reports inflate; see [Route-level k̂ calibration policy](#route-level-k-calibration-policy)."
+    desc_zh: "按路由的 k̂ 校准策略（#3211）：对虚报报数线路做退出或钳制；见[线路级 k̂ 校准策略](#route-level-k-calibration-policy)。"
+    site_en: "Per-route k̂ calibration policy (#3211): `disabled` suppresses the learned factor on this route; `max` clamps it (0 < max ≤ 4). Applied at publication time — the learned ring stays raw."
+    site_zh: "按路由的 k̂ 校准策略（#3211）：`disabled` 在该线路禁用学习系数；`max` 钳制学习系数（0 < max ≤ 4）。作用于发布环节——学习环保持原始值。"
   - key: compactionOptIn
     type: boolean
     default: "false"

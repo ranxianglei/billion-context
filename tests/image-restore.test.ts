@@ -205,7 +205,12 @@ test("resolveDecompress({ imageRef }): lists, restores to file, and reports miss
 
     assert.match(resolveDecompress({ imageRef: "m99999" }, ctxWith(idx)).text, /no restorable image for ref "m99999"/);
     assert.equal(resolveDecompress({ imageRef: "m99999" }, ctxWith(idx)).outcome, "failure");
-    assert.match(resolveDecompress({ imageRef: "" }, ctxWith(idx)).text, /\[Restorable images \(1\):\]/, "empty string == list");
+    // #2626: an empty/blank imageRef is NO LONGER treated as "list" — presence-
+    // based dispatch hijacked the text path. With no blockId it now fails loudly
+    // asking for one; only a non-blank string selects image mode.
+    assert.match(resolveDecompress({ imageRef: "" }, ctxWith(idx)).text, /blockId is required/, "empty imageRef no longer means list");
+    assert.equal(resolveDecompress({ imageRef: "" }, ctxWith(idx)).outcome, "failure");
+    assert.match(resolveDecompress({ imageRef: "   " }, ctxWith(idx)).text, /blockId is required/, "whitespace imageRef no longer means list");
     assert.match(resolveDecompress({ imageRef: "list" }, ctxWith(undefined)).text, /No restorable images right now/, "absent index degrades gracefully");
 });
 

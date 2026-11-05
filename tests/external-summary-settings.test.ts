@@ -11,6 +11,7 @@ import { applyCompressSettings, mergeCompress } from "../src/compress-settings.t
 import { collectNamedProviders, parseCompressSettings, parseNamedProviderRecipe, parseRouteEntry, type NamedProviderRecipe } from "../src/config.ts";
 import { defaultConfig } from "acp-kernel";
 import { handleConfigGet, handleConfigPut, handleSummaryCredentialPut } from "../src/web/api.ts";
+import { setLogCapture } from "../src/logger.ts";
 import { rmrf } from "./tmp-rm.ts";
 
 const recipes: Record<string, NamedProviderRecipe> = {
@@ -86,7 +87,7 @@ for (const invalid of [
     { enabled: true, targets: [{}] }, { enabled: true, targets: ["glm"] },
     { enabled: true, targets: ["glm/"] }, { enabled: true, targets: ["/flash"] },
     { enabled: true, targets: ["glm/glm-4.9-flash\n"] },
-    { enabled: true, budget: { totalTimeoutMs: 60_000 } },
+    { enabled: true, budget: { totalTimeoutMs: 700_000 } },
     { enabled: true, budget: { totalTimeoutMs: 100, targetTimeoutMs: 101 } },
     { enabled: true, budget: { concurrency: 1000 } },
     { enabled: true, targets: Array.from({ length: 17 }, () => "glm/glm-4.9-flash") },
@@ -96,6 +97,13 @@ for (const invalid of [
         assert.equal(parseCompressSettings({ externalSummary: invalid }), undefined);
     });
 }
+
+test("totalTimeoutMs accepts the widened cap and rejects above it (#2484)", () => {
+    // A big-session fold runs a dozen or more chunks against one shared
+    // deadline, so the cap was raised from 50s to 600s; the default stays 50s.
+    assert.doesNotThrow(() => parseExternalSummaryChain({ enabled: true, targets: ["glm/glm-4.9-flash"], budget: { totalTimeoutMs: 600_000 } }));
+    assert.throws(() => parseExternalSummaryChain({ enabled: true, targets: ["glm/glm-4.9-flash"], budget: { totalTimeoutMs: 600_001 } }));
+});
 
 for (const invalid of [
     "unknown/glm-4.9-flash", "glm/unknown-model",
@@ -281,5 +289,115 @@ test("config/credential API never echoes keys, and saves validate recipes and ch
         else process.env.GLM_KEY = previousEnv;
         if (previous === undefined) delete process.env.BILI_CONFIG_FILE;
         else process.env.BILI_CONFIG_FILE = previous;
+    }
+});
+
+test("whole-file save accepts documented mitm:// URL lanes but still rejects route fields on named keys (#5620)", async () => {
+    const path = join(root(), "config.json");
+    const previous = process.env.BILI_CONFIG_FILE;
+    process.env.BILI_CONFIG_FILE = path;
+    writeFileSync(path, "{}");
+    const server = http.createServer((req, res) => {
+        const handler = req.method === "GET" ? handleConfigGet(res) : handleConfigPut(req, res);
+        void handler.catch(() => { res.writeHead(500); res.end("test handler failed"); });
+    });
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const base = `http://127.0.0.1:${(server.address() as import("node:net").AddressInfo).port}`;
+    const save = async (config: unknown) => fetch(base, { method: "PUT", body: JSON.stringify({ file: JSON.stringify(config) }) });
+    try {
+        let response = await save({ providers: { "mitm://api.anthropic.com": { compress: { maxContextLimit: "50%" } } } });
+        assert.equal(response.status, 200);
+        assert.equal(JSON.parse(await response.text()).ok, true);
+        assert.deepEqual(JSON.parse(readFileSync(path, "utf8")).providers["mitm://api.anthropic.com"], { compress: { maxContextLimit: "50%" } });
+        response = await save({ providers: { "https://api.anthropic.com": { compress: { maxContextLimit: "55%" } } } });
+        assert.equal(response.status, 200);
+        assert.equal(JSON.parse(await response.text()).ok, true);
+        // A genuinely NAMED key carrying a route-only field is still refused —
+        // the predicate change admits URL lanes only, not route-shaped names.
+        response = await save({ providers: { myname: { compress: { maxContextLimit: "50%" } } } });
+        assert.equal(response.status, 400);
+        assert.match(await response.text(), /invalid recipe on named provider \\"myname\\"/);
+    } finally {
+        server.closeAllConnections();
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+        if (previous === undefined) delete process.env.BILI_CONFIG_FILE;
+        else process.env.BILI_CONFIG_FILE = previous;
+    }
+});
+
+test("autoFold rides both the chain form and the expanded rail form", () => {
+    const chain = parseExternalSummaryChain({ enabled: true, targets: ["glm/glm-4.9-flash"], autoFold: true, autoFoldTargetTokens: 12000 });
+    assert.equal(chain.autoFold, true);
+    assert.equal(chain.autoFoldTargetTokens, 12000);
+    const plan = expandExternalSummaryChain(chain, recipes);
+    assert.equal(plan.autoFold, true);
+    assert.equal(plan.autoFoldTargetTokens, 12000);
+    assert.doesNotThrow(() => parseExternalSummarySettings(plan));
+    // Default: no explicit target → the host halves the window at arm time.
+    const lazy = expandExternalSummaryChain(parseExternalSummaryChain({ enabled: true, targets: ["glm/glm-4.9-flash"], autoFold: true }), recipes);
+    assert.equal(lazy.autoFold, true);
+    assert.equal(lazy.autoFoldTargetTokens, undefined);
+});
+
+test("autoFold validation: boolean only, target within [8192, 10M]", () => {
+    assert.throws(() => parseExternalSummaryChain({ enabled: true, targets: ["glm/glm-4.9-flash"], autoFold: "yes" }), /autoFold must be boolean/);
+    assert.throws(() => parseExternalSummaryChain({ enabled: true, targets: ["glm/glm-4.9-flash"], autoFold: true, autoFoldTargetTokens: 0 }), /autoFoldTargetTokens must be an integer/);
+    assert.throws(() => parseExternalSummaryChain({ enabled: true, targets: ["glm/glm-4.9-flash"], autoFold: true, autoFoldTargetTokens: 8191 }), /autoFoldTargetTokens must be an integer/);
+    assert.throws(() => parseExternalSummaryChain({ enabled: true, targets: ["glm/glm-4.9-flash"], autoFold: true, autoFoldTargetTokens: "big" }), /autoFoldTargetTokens must be an integer/);
+    // A disabled chain never reads the rest of the object (early return).
+    const off = parseExternalSummaryChain({ enabled: false, targets: [], autoFold: "junk" as unknown as boolean });
+    assert.equal(off.enabled, false);
+    assert.equal(off.autoFold, undefined);
+});
+
+test("concurrency rides both the chain form and the expanded rail form (#2657)", () => {
+    const chain = parseExternalSummaryChain({ enabled: true, targets: ["glm/glm-4.9-flash"], concurrency: 12 });
+    assert.equal(chain.concurrency, 12);
+    const plan = expandExternalSummaryChain(chain, recipes);
+    assert.equal(plan.concurrency, 12);
+    assert.doesNotThrow(() => parseExternalSummarySettings(plan));
+    // Absent → undefined → the executor keeps its base size.
+    const lazy = expandExternalSummaryChain(parseExternalSummaryChain({ enabled: true, targets: ["glm/glm-4.9-flash"] }), recipes);
+    assert.equal(lazy.concurrency, undefined);
+    // Whole-chain replace carries it like every other field.
+    const merged = mergeCompress({ externalSummary: { ...chain, targets: ["remote/resp-model"] } }, {})?.externalSummary;
+    assert.equal(merged?.concurrency, 12);
+});
+
+test("concurrency validation: integer within [1, 32] on both forms (#2657)", () => {
+    assert.doesNotThrow(() => parseExternalSummaryChain({ enabled: true, targets: ["glm/glm-4.9-flash"], concurrency: 1 }));
+    assert.doesNotThrow(() => parseExternalSummaryChain({ enabled: true, targets: ["glm/glm-4.9-flash"], concurrency: 32 }));
+    const plan = expandExternalSummaryChain(parseExternalSummaryChain({ enabled: true, targets: ["glm/glm-4.9-flash"] }), recipes);
+    for (const bad of [0, 33, -4, 2.5, "12"]) {
+        assert.throws(() => parseExternalSummaryChain({ enabled: true, targets: ["glm/glm-4.9-flash"], concurrency: bad }), /concurrency must be an integer between 1 and 32/, JSON.stringify(bad));
+        assert.throws(() => parseExternalSummarySettings({ ...plan, concurrency: bad }), /concurrency must be an integer between 1 and 32/, JSON.stringify(bad));
+    }
+    // A disabled chain never reads the rest of the object (early return).
+    const off = parseExternalSummaryChain({ enabled: false, targets: [], concurrency: "junk" as unknown as number });
+    assert.equal(off.enabled, false);
+    assert.equal(off.concurrency, undefined);
+});
+
+test("autoFold set on a disabled chain warns instead of silently no-oping", () => {
+    const warns: string[] = [];
+    setLogCapture((level, msg) => { if (level === "warn") warns.push(msg); });
+    try {
+        // `enabled` omitted entirely → chain is off; autoFold must surface, not vanish.
+        const off = parseExternalSummaryChain({ autoFold: true });
+        assert.equal(off.enabled, false);
+        assert.ok(warns.some((w) => w.includes("autoFold") && w.includes('"enabled"')), "expected an autoFold-inert warning");
+        // Explicitly disabled with both knobs → still off, still surfaced, no crash.
+        const offBoth = parseExternalSummaryChain({ enabled: false, autoFold: true, autoFoldTargetTokens: 16384 });
+        assert.equal(offBoth.enabled, false);
+        assert.equal(offBoth.autoFold, undefined);
+        // A correctly-enabled chain emits nothing on this front.
+        const before = warns.length;
+        const on = parseExternalSummaryChain({ enabled: true, targets: ["glm/glm-4.9-flash"], autoFold: true });
+        assert.equal(on.enabled, true);
+        assert.equal(on.autoFold, true);
+        assert.equal(warns.length, before);
+    } finally {
+        setLogCapture(null);
     }
 });

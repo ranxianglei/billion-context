@@ -18,14 +18,26 @@ import { supportsDirectorySymlink } from "./platform-capabilities.ts";
 
 // LOCK_FILE is frozen at update.ts module load — redirect the cache tree
 // BEFORE importing it (same discipline as update-dsh-self-refresh.test.ts).
+// #3619: this suite pins pi-channel mechanics, not rollout timing — legacy
+// immediate upgrades (stagger 0/0) + unroutable policy URL keep it hermetic.
 const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "bili-pi-selfrefresh-")));
 process.env.XDG_CACHE_HOME = path.join(root, "cache");
+// isolate the config tree too — a real bili config's update.registry would
+// reroute the mocked registry lookups (see update-dsh-self-refresh.test.ts).
+process.env.XDG_CONFIG_HOME = path.join(root, "config");
+process.env.BILI_UPDATE_STAGGER_MIN_MS = "0";
+process.env.BILI_UPDATE_STAGGER_MAX_MS = "0";
+process.env.BILI_UPDATE_POLICY_URL = "http://127.0.0.1:1/no-policy.json";
 
 const { refreshPiNpmCopy } = await import("../src/update.ts");
 const { isPiNpmCopy, piNpmEntrySpec, resolvePiBinary, _setPiRunnersForTest } = await import("../src/pi-channel.ts");
 
 after(() => {
     delete process.env.XDG_CACHE_HOME;
+    delete process.env.XDG_CONFIG_HOME;
+    delete process.env.BILI_UPDATE_STAGGER_MIN_MS;
+    delete process.env.BILI_UPDATE_STAGGER_MAX_MS;
+    delete process.env.BILI_UPDATE_POLICY_URL;
     rmrf(root);
 });
 
@@ -164,7 +176,10 @@ function makeFixture(version: string, entry: string | null = "npm:billion-contex
 async function withRegistry<T>(version: string | undefined, fn: (fetches: { count: number }) => Promise<T>): Promise<T> {
     const original = globalThis.fetch;
     const fetches = { count: 0 };
-    globalThis.fetch = (() => {
+    // Only registry traffic is counted/mocked; anything else (e.g. the #3619
+    // update-policy fetch) passes through to the real fetch untouched.
+    globalThis.fetch = ((input: string | URL | Request, init?: RequestInit) => {
+        if (!String(input).includes("registry.npmjs.org")) return original(input, init);
         fetches.count += 1;
         return version === undefined
             ? Promise.resolve(new Response("nope", { status: 500 }))

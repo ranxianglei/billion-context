@@ -82,6 +82,7 @@ test("#853 summary output cap: 32k default, clamped to known model ceiling", asy
             }
         } finally {
             server.close();
+            server.closeIdleConnections?.();
             await once(server, "close");
         }
     }

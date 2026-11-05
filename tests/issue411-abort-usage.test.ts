@@ -124,7 +124,7 @@ async function register(rig: Rig, conversationId: string): Promise<void> {
     const res = await fetch(rig.proxyUrl("/__bili/plugin/register"), {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ conversationId, agent: "mcp" }),
+        body: JSON.stringify({ conversationId, agent: "pi" }),
     });
     assert.equal(res.status, 200, "register accepted");
 }

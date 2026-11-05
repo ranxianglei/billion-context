@@ -1,10 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
-import { mkdir, readFile, writeFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildChildArgs, delegateSpawnOptions, injectedWaitMessage, buildWaitResult, buildCancelResult, getDelegateUsage, resetDelegateUsage, injectResult, effectiveExitCode, formatRunResult, resolveWaitTimeoutMs, findUndeliveredRuns, undeliveredNoticeFrom, buildRecoveryNotice, makeDelegateTool, exitLabel, cancelledFileNote, delegateStdinText, readActivityTail, scheduleRunNotification, flushDelegateNotifications, formatBatchRunSection, setDelegatePolicy, delegateChildEnv, asyncWatchdogDescription, ConcurrencyGate, setDelegateDefaults, resetDelegateDefaults, isValidThinkingLevel, resolvePerCallTimeoutMs } from "../src/delegate-tool.js";
+import { buildChildArgs, delegateSpawnOptions, injectedWaitMessage, buildWaitResult, buildCancelResult, getDelegateUsage, resetDelegateUsage, injectResult, effectiveExitCode, formatRunResult, resolveWaitTimeoutMs, findUndeliveredRuns, undeliveredNoticeFrom, buildRecoveryNotice, makeDelegateTool, exitLabel, cancelledFileNote, delegateStdinText, readActivityTail, scheduleRunNotification, flushDelegateNotifications, formatBatchRunSection, setDelegatePolicy, delegateChildEnv, asyncWatchdogDescription, ConcurrencyGate, setDelegateDefaults, resetDelegateDefaults, isValidThinkingLevel, resolvePerCallTimeoutMs, addDelegateUsage, emitInlineUsageNote, makeDelegateWaitTool, makeDelegateCancelTool, runningRunsSnapshot } from "../src/delegate-tool.js";
 import { DEFAULT_DELEGATE_POLICY } from "../src/config.js";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 
@@ -563,6 +563,14 @@ test("injectResult completed run keeps the completed header and no body", () => 
   assert.ok(!text.includes("must not appear"), "completed runs carry no body");
 });
 
+test("completed notification declares it ends no task and grants no new scope (#2750)", () => {
+  const sent: string[] = [];
+  injectResult(capturePi(sent) as any, "researcher", "del_y", "scan repo", "completed", 0, "/tmp/del_y.out", undefined, undefined, "separate", false, "must not appear");
+  const text = sent[0]!;
+  assert.ok(text.includes("It ends no task and grants no new scope"), "no-re-authorization clause present");
+  assert.ok(text.includes("if your objective is still open, resume it from your recorded progress"), "resume-from-progress clause present");
+});
+
 // ─── #244: watchdog null-code finalize must not misreport FAILED ───────────
 // The watchdog/EOF grace kills the child (or it never exits), so close fires
 // with code === null even when the .out result is complete. finalize derives
@@ -910,6 +918,21 @@ test("flushDelegateNotifications coalesces queued runs into a single message", (
   assert.equal(a.notifyQueued, false, "queue flag cleared");
 });
 
+test("all-success batch notification carries the no-re-authorization closing (#2750)", () => {
+  resetDelegateUsage();
+  const sent: string[] = [];
+  const pi = { sendUserMessage: (t: string) => sent.push(t) };
+  const a = mkRun("del_a", "completed", { result: { code: 0, file: "/tmp/del_a.out", body: "ok" } });
+  const b = mkRun("del_b", "completed", { result: { code: 0, file: "/tmp/del_b.out", body: "fine" } });
+  scheduleRunNotification(pi as any, a);
+  scheduleRunNotification(pi as any, b);
+  flushDelegateNotifications();
+  assert.equal(sent.length, 1, "exactly one coalesced message");
+  const text = sent[0]!;
+  assert.ok(text.includes("It ends no task and grants no new scope"), "no-re-authorization closing present");
+  assert.ok(text.includes("if your objective is still open, resume it from your recorded progress"), "resume-from-progress closing present");
+});
+
 test("flush skips queued runs that gained a waiter or were consumed meanwhile", () => {
   const sent: string[] = [];
   const pi = { sendUserMessage: (t: string) => sent.push(t) };
@@ -1143,5 +1166,158 @@ test("ConcurrencyGate: cancelling a queued run skips it without leaking a slot",
   assert.deepEqual(order, ["a", "c"], "cancelled b never launched");
   assert.equal(gate.activeCount, 1);
   assert.equal(gate.queuedCount, 0);
+});
+
+// ─── #2913: inline-fetch usage note (wait/cancel show the same usage summary
+//     the async notification carries) ────────────────────────────────────────
+// Fast serial runs (maxConcurrent=1 on a local LLM) finish inside the
+// acp_delegate_wait window, so their result reaches the model inline instead of
+// via the completion notification. The notification renders a cumulative usage
+// block; the inline path used to drop it entirely, so the model saw no usage
+// readout. emitInlineUsageNote restores it on both wait-success and cancel.
+
+test("emitInlineUsageNote sends a steer usage note in separate mode", () => {
+  resetDelegateUsage();
+  addDelegateUsage(USAGE_FIXTURE);
+  const entries: Array<{ t: string; o?: { deliverAs?: string } }> = [];
+  const pi = { sendUserMessage: (t: string, o?: { deliverAs?: string }) => void entries.push({ t, o }) };
+  const run = mkRun("del_i", "completed");
+  emitInlineUsageNote(pi as any, run, "separate");
+  assert.equal(entries.length, 1, "exactly one usage note");
+  const text = entries[0]!.t;
+  assert.ok(text.includes("[acp_delegate completed]"), "names the status");
+  assert.ok(text.includes("**reviewer**"), "names the agent");
+  assert.ok(text.includes("`del_i`"), "names the runId");
+  assert.ok(text.includes("usage summary"), "labels it a usage summary");
+  assert.ok(text.includes("── Session delegate usage (excluded from main totals) ──"), "same usage header as the notification");
+  assert.ok(text.includes("Tokens: 150 in, 80 out (230 total) ($0.0023)"), "same cumulative numbers as the notification");
+  assert.ok(text.includes("NOT a user request"), "marked automated");
+  assert.deepEqual(entries[0]!.o, { deliverAs: "steer" }, "steering delivery like the notification");
+  assert.equal(run.usageNoted, true, "run marked noted");
+});
+
+test("emitInlineUsageNote shows the FAILED label for failed runs", () => {
+  resetDelegateUsage();
+  addDelegateUsage(USAGE_FIXTURE);
+  const sent: string[] = [];
+  emitInlineUsageNote(capturePi(sent) as any, mkRun("del_f", "failed"), "separate");
+  assert.equal(sent.length, 1);
+  assert.ok(sent[0]!.includes("[acp_delegate FAILED"), "FAILED label");
+});
+
+test("emitInlineUsageNote is a no-op in merged mode", () => {
+  resetDelegateUsage();
+  addDelegateUsage(USAGE_FIXTURE);
+  const sent: string[] = [];
+  emitInlineUsageNote(capturePi(sent) as any, mkRun("del_m", "completed"), "merged");
+  assert.equal(sent.length, 0, "merged folds into host totals; no separate note");
+});
+
+test("emitInlineUsageNote skips when a notification already delivered the run", () => {
+  resetDelegateUsage();
+  addDelegateUsage(USAGE_FIXTURE);
+  const sent: string[] = [];
+  const run = mkRun("del_inj", "completed", { injected: true });
+  emitInlineUsageNote(capturePi(sent) as any, run, "separate");
+  assert.equal(sent.length, 0, "injected run already showed its usage");
+  assert.notEqual(run.usageNoted, true, "not re-marked");
+});
+
+test("emitInlineUsageNote fires at most once per run across repeated fetches", () => {
+  resetDelegateUsage();
+  addDelegateUsage(USAGE_FIXTURE);
+  const sent: string[] = [];
+  const pi = capturePi(sent);
+  const run = mkRun("del_once", "completed");
+  emitInlineUsageNote(pi as any, run, "separate");
+  emitInlineUsageNote(pi as any, run, "separate");
+  assert.equal(sent.length, 1, "second call suppressed via usageNoted");
+});
+
+test("emitInlineUsageNote is a no-op when there is no usage data yet", () => {
+  resetDelegateUsage();
+  const sent: string[] = [];
+  emitInlineUsageNote(capturePi(sent) as any, mkRun("del_nou", "completed"), "separate");
+  assert.equal(sent.length, 0, "no cumulative total -> nothing to show");
+});
+
+test("emitInlineUsageNote tolerates a missing sendUserMessage without marking delivery", () => {
+  resetDelegateUsage();
+  addDelegateUsage(USAGE_FIXTURE);
+  const run = mkRun("del_nosend", "completed");
+  emitInlineUsageNote({} as any, run, "separate"); // must not throw
+  assert.notEqual(run.usageNoted, true, "not marked when there is no channel");
+});
+
+test("emitInlineUsageNote does not mark delivery when the send throws", () => {
+  resetDelegateUsage();
+  addDelegateUsage(USAGE_FIXTURE);
+  const run = mkRun("del_throw", "completed");
+  const pi = { sendUserMessage: () => { throw new Error("queue closed"); } };
+  assert.doesNotThrow(() => emitInlineUsageNote(pi as any, run, "separate"));
+  assert.notEqual(run.usageNoted, true, "failed send leaves the run recoverable");
+});
+
+// ─── #3741: wait timeout is a neutral notice, not a task failure ─────────────
+// A wait timeout only ends THIS tool call — the delegate keeps running and its
+// completion notification still arrives. The old wording led with "Failed: ...
+// result not ready", which made models and users read a plain timeout as a
+// failed delegate. Pinned end-to-end with a controlled child (PI_CLI_PATH
+// points at a sleeper script) and the minimum 1s wait timeout — no real model.
+
+test("acp_delegate_wait timeout on a running run reports neutral text and leaves the run untouched", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "bili-wait-timeout-"));
+  const sleeper = join(dir, "sleeper.mjs");
+  await writeFile(sleeper, "setTimeout(() => {}, 5000);", "utf8");
+  const prevCliPath = process.env.PI_CLI_PATH;
+  process.env.PI_CLI_PATH = sleeper; // delegate child becomes `node <sleeper> ...` and stays alive
+  try {
+    const sent: string[] = [];
+    const pi = { sendUserMessage: (t: string) => sent.push(t) } as unknown as Parameters<typeof makeDelegateTool>[0];
+    const tool = makeDelegateTool(pi);
+    const waitTool = makeDelegateWaitTool(pi);
+    const cancelTool = makeDelegateCancelTool(pi);
+    const ctx = { ...mockCtx("pi"), mode: "tui", cwd: process.cwd() } as unknown as ExtensionContext;
+    // Drain terminal runs left by earlier tests so no recovery notice rides on
+    // the result under test.
+    flushDelegateNotifications(pi);
+    const res = await tool.execute(
+      "tc-wait-to",
+      { agent: "oracle", task: "stay alive", async: true },
+      undefined,
+      undefined,
+      ctx,
+    );
+    const launch = (res.content[0] as { text?: string }).text ?? "";
+    const runId = /`(del_[a-z0-9_]+)`/.exec(launch)?.[1];
+    assert.ok(runId, `runId in launch message: ${launch}`);
+    const startDeadline = Date.now() + 5000;
+    while (!runningRunsSnapshot().some((r) => r.runId === runId) && Date.now() < startDeadline) {
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    assert.ok(runningRunsSnapshot().some((r) => r.runId === runId), "run must be running when the wait starts");
+    const t0 = Date.now();
+    const waitRes = await waitTool.execute("tc-wait-to-w", { runId: runId!, timeout: 1000 }, undefined, undefined, ctx);
+    assert.ok(Date.now() - t0 >= 950, "wait blocked until its timeout elapsed");
+    const text = (waitRes.content[0] as { text?: string }).text ?? "";
+    assert.ok(!/^Failed/i.test(text), `timeout notice must not lead with Failed: ${text}`);
+    assert.ok(!text.includes("result not ready"), `stale 'not ready' wording must be gone: ${text}`);
+    assert.match(text, /Wait timed out after 1s/, `reports the waited duration: ${text}`);
+    assert.ok(text.includes("is still running in the background"), `states the delegate keeps going: ${text}`);
+    assert.equal(waitRes.details?.status, "running", "meta status stays running");
+    assert.ok(!("usage" in waitRes), "timeout settles no usage");
+    assert.ok(runningRunsSnapshot().some((r) => r.runId === runId), "the timeout did not settle the run");
+    // The surviving run is still cancellable; cancel reaps the sleeper child.
+    await cancelTool.execute("tc-wait-to-c", { runId: runId! });
+    const reapDeadline = Date.now() + 5000;
+    while (runningRunsSnapshot().some((r) => r.runId === runId) && Date.now() < reapDeadline) {
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    assert.ok(!runningRunsSnapshot().some((r) => r.runId === runId), "cancelled run leaves the running set");
+  } finally {
+    if (prevCliPath === undefined) delete process.env.PI_CLI_PATH;
+    else process.env.PI_CLI_PATH = prevCliPath;
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 

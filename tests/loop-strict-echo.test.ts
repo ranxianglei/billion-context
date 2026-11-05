@@ -127,9 +127,13 @@ test("#762: loop re-request carries the blank strict-echo repair", async () => {
         }
         res.writeHead(200, { "content-type": "text/event-stream" });
         if (n === 2) {
+            // acp_status vehicle: the point is the re-request carrying the
+            // blanked echo, not compression. A failing compress ends the turn
+            // before any re-request (#4186) and would silently un-test the
+            // loop-path repair this file exists for.
             res.write(sseChunk("c1", { role: "assistant" }));
-            res.write(sseChunk("c1", { tool_calls: [{ index: 0, id: "tc-loop", type: "function", function: { name: "compress", arguments: "" } }] }));
-            res.write(sseChunk("c1", { tool_calls: [{ index: 0, function: { arguments: "{\"content\":[]}" } }] }));
+            res.write(sseChunk("c1", { tool_calls: [{ index: 0, id: "tc-loop", type: "function", function: { name: "acp_status", arguments: "" } }] }));
+            res.write(sseChunk("c1", { tool_calls: [{ index: 0, function: { arguments: "{}" } }] }));
             res.write(sseChunk("c1", {}, "tool_calls"));
         } else {
             res.write(sseChunk("c2", { content: "done" }));

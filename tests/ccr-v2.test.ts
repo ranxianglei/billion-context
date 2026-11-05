@@ -401,12 +401,19 @@ test("e2e CCR v2 opt-in: no ccr config at any level leaves the session unarmed â
         });
         const sse = await res.text();
         assert.ok(res.ok, `client turn failed: HTTP ${res.status}: ${sse}`);
-        assert.equal(captured.length, 3, "initial request + one re-request per executed tool");
+        // The refused decompress is a failed-only round: under #5220 it gets
+        // ONE recovery-receipt re-request (the third captured forward), which
+        // resubmits the identical refusal â€” where the restored #156 signature
+        // breaker ends the turn. Its ephemeral frame never rides that re-
+        // request upstream; the refusal surfaces to the client as the failure
+        // receipt.
+        assert.equal(captured.length, 3, "initial + compress re-request + one recovery-receipt re-request for the refused decompress (#5220)");
+        assert.match(captured[1]!, /Early history: messages 1-7 covered initial setup\./, "compress fold landed before the decompress attempt");
         // [#1207 owner decision] CCR is opt-in on every lane: with no ccr key
         // at any level the session never arms, so the range restore ack is the
         // "requires CCR" refusal instead of restored content.
-        assert.ok(!/restored 3 item\(s\)/.test(captured[2]!), "no restore without explicit opt-in");
-        assert.match(captured[2]!, /requires CCR/, "range restore refused: session unarmed by default");
+        assert.ok(!/restored 3 item\(s\)/.test(sse), "no restore without explicit opt-in");
+        assert.match(sse, /requires CCR/, "refusal surfaced to the client via the failure receipt");
     } finally {
         await closeAll();
     }

@@ -50,7 +50,8 @@
 
 QQ Group:
 1056132097 (full)
-1108730198 (open)
+1108730198 (full)
+1129868472 (open)
 
 ---
 
@@ -61,6 +62,10 @@ QQ Group:
 > 📝 **The paper itself is open-sourced under the MIT License as part of the codebase (`paper/`). It is a living document — anyone may edit it; improvements are welcome via pull request.**
 
 A production-scale longitudinal study: 4.5 months, three hosts, 174,327 model calls, 18.76B cumulative input tokens (~24.7B across all hosts), zero window violations on 204,800-token models, marathon sessions of 8,584–12,049 calls.
+
+### 📊 Independent Third-Party Benchmarks
+
+- **[1,500-Item Cross-Benchmark Evaluation (`LongMemEval-S` · `ContextBench` · `MemoryAgentBench`)](./benchmarks/third-party-1500/README.md)** ([中文版](./benchmarks/third-party-1500/README.zh-CN.md)) — head-to-head comparison of `billion-context` (`v0.1.202`) against `full` context and 3 RAG arms (`bm25`, `embedding`, `embedding-rerank`) with `DeepSeek V4.1 Flash`, `Qwen3-Embedding-8B`, `Qwen3-Reranker-4B`, and `Pi Agent`: **#1 on ContextBench** (`0.3097` Utilized F1, `-58.3%` cost vs `full`), **+16.6% over best RAG on LongMemEval-S** (`79.20%` vs `62.60%`, `-71.1%` independent-session cost vs `full`), and **100% survival on 1.48M-token MemoryAgentBench TTL** (`30×` steady-state compression where `full` fails `199/199`).
 
 ---
 
@@ -118,11 +123,12 @@ Pick by your client:
 | **gemini** (Gemini CLI) | `bili gemini` (launcher, `GOOGLE_GEMINI_BASE_URL` `/bili/` rewrite) or `/bili/` prefix — launcher-only (no in-loop tool seam, #1043) |
 | **iflow** (iFlow CLI) | `bili iflow` (launcher, `IFLOW_BASE_URL` `/bili/` rewrite) or `/bili/` prefix |
 | **qwen** (Qwen Code) | `bili qwen` (launcher, cert-MITM) or `/bili/` prefix |
-| **antigravity** (Antigravity CLI / agy, Google) | `bili antigravity` (launcher, `CLOUD_CODE_URL` `/bili/` rewrite of cloudcode-pa.googleapis.com) or `/bili/` prefix — no plugin seam (closed Go language_server; its user-plugin surface is additive-only, #2115) — details: [CLIENTS.md](CLIENTS.md) |
+| **antigravity** (Antigravity CLI / agy, Google) | `bili antigravity` (launcher, `CLOUD_CODE_URL` `/bili/` rewrite of daily-cloudcode-pa.googleapis.com — Antigravity's real default upstream, #3129) or `/bili/` prefix — no plugin seam (closed Go language_server; its user-plugin surface is additive-only, #2115) — details: [CLIENTS.md](CLIENTS.md) |
 | **mcode** (MiniMax Code) | [`billion-context`](https://github.com/ranxianglei/billion-context) via `bili mcode` (cert-MITM) or `/bili/` prefix — no native mode (event hooks only, no model-request seam, [#1050](https://github.com/ranxianglei/billion-context/issues/1050)) |
 | **aider** | [`billion-context`](https://github.com/ranxianglei/billion-context) via `bili aider` (cert-MITM) or `/bili/` prefix — no native mode (shell-command-only hooks, no tool-injection seam, [#1048](https://github.com/ranxianglei/billion-context/issues/1048)) |
 | **copilot** (GitHub Copilot CLI) | `bili copilot` (launcher, cert-MITM) — closed Go binary, no plugin seam (#1049) |
 | **amp** (Amp CLI) | `bili amp` (launcher, cert-MITM) — closed Go binary, no plugin seam (#1049) |
+| **kiro** (Kiro CLI, AWS) | `bili kiro` (launcher, cert-MITM) — Rust shell + Node agent server, no plugin seam; model traffic is the Responses wire on `runtime.<region>.kiro.dev`, gateway quirks handled built-in — details: [CLIENTS.md](CLIENTS.md#kiro-cli-aws) |
 | **crush** (Charm Crush) | `bili crush` (launcher, cert-MITM) — open-source Go binary, no plugin seam; built-in provider hosts whitelisted, custom `base_url`s auto-discovered from crush.json (#2340) |
 | **zed** (Zed editor) | `bili zed` (launcher, cert-MITM) — open-source Rust editor, no plugin seam; reqwest honors HTTPS_PROXY, CA via SSL_CERT_FILE (Linux env probing); built-in provider hosts whitelisted, custom `api_url`s auto-discovered from settings.json; loopback providers (ollama/lmstudio) stay direct via NO_PROXY (#2340) |
 | **goose** (Goose CLI) | `bili goose` (launcher) — rustls trusts no CA file, so no cert-MITM: openai/anthropic legs via `OPENAI_HOST`/`ANTHROPIC_HOST`, custom providers via a regenerated `GOOSE_PATH_ROOT` overlay (#1049) |
@@ -151,6 +157,9 @@ This installs the `bili` command (`bili-proxy` is kept as an alias). Hitting
 (pass the flag again on any future npm reinstall of `bili`) — that is the
 permanent fix; avoid `sudo`.
 
+Prefer containers? A `Dockerfile` ships at the repository root — see
+[Running in Docker](#running-in-docker) below.
+
 ## Quickstart
 
 Three ways to use it — pick one:
@@ -169,7 +178,11 @@ Ports, briefly (#1660): `bili start` (manual) owns `8787`. Everything a lane
 spawns for you (native hooks, launcher lanes) lives in a separate
 self-managed zone starting at `18787` — collisions hop +1 and each lane
 remembers its drift, so zero-config installs never fight you for a port,
-and a deliberate `bili start` daemon is attached by default. An
+and a deliberate `bili start` daemon is attached by default. Attach is
+lane-aware (#2905): a hook rides its own lane's instance first, NEVER
+another declared lane's — except lanes you list in
+`native.attachLanePriority` — and the 8787 user-zone daemon stays the
+LAST-resort fallback. An
 upgrade-restart that finds the previous build still draining on the lane's
 port waits for it to release (up to 5s) and rebinds the SAME port instead of
 drifting (#1723); only a genuinely occupied port hops +1 — and that hop is
@@ -197,9 +210,11 @@ Where a client has its own plugin channel you can also install natively,
 skipping bili commands entirely:
 
 - **dsh:** `dsh plugin --profile <name> add billion-context` is the very
-  command `bili plugin install dsh` drives per profile — same end state
-  either way (pnpm into the profile, bundled patch layer mounted by dsh
-  itself); remove through the same channel. See the dsh section below.
+  command `bili plugin install dsh` drives per profile (npm form only; a git
+  checkout has no published entry — pasting a GitHub address installs source
+  without `dist/` and the bundle never loads) — same end state either way
+  (pnpm into the profile, bundled patch layer mounted by dsh itself); remove
+  through the same channel. See the dsh section below.
 - **opencode:** add the bare npm name to your real config's plugin list —
   `"plugin": ["billion-context"]` (npm form only; a git checkout has no
   published entry). The package publishes `exports["./server"]` →
@@ -229,12 +244,12 @@ Notes:
 - `kimi` reports runtime-info at bootstrap only (static headers can't carry per-request window/model values); subagent tool calls are routed by the proxy's outbound tool-use witness ring (#1685) — no model-visible conversation id.
 - `hermes`'s native plugin is Python: it points hermes' httpx stack at the proxy via env vars after a health check and stamps per-request headers through an `llm_request` middleware.
 - `codex` is the one client a plugin install cannot make self-sufficient: codex routes model traffic via env only (no config-file routing seam for the default ChatGPT-login provider — a managed `model_providers` block would force API-key auth and drop subscription login), and an MCP server cannot inject env into its parent. `bili plugin install codex` writes a single `[mcp_servers.bili]` block into `~/.codex/config.toml` (command = node, args = dist/mcp.js) exposing the four ACP tools; at session start the shell resolves a proxy — env `BILI_MCP_PROXY` > the live-instance record (any lane's proxy or a `bili start` daemon) > the 8787 user-zone default (#1660 removed the install-time origin bake, #403) — nothing reachable → `tools/list` fails with -32003. So: start bili first (`bili start` or any client's lane proxy), export HTTPS_PROXY yourself if you also want compression, or use `bili codex` for the zero-config full posture. Mechanics: [CLIENTS.md](CLIENTS.md#codex-openai-codex-cli).
-- `claude` has a native posture (#964): managed settings block + `SessionStart` hook + MCP shell; the hook rides the self-managed port zone (#1660) and re-pins the managed URL to the live origin each session, so port drift self-heals. Opt out with `BILI_NATIVE_CLAUDE=0` (passthrough). Mechanics: [TECHNICAL-NOTES.md](TECHNICAL-NOTES.md). **Known limitation (#2290):** the Claude Desktop app's Code tab (`CLAUDE_CODE_ENTRYPOINT=claude-desktop`) sets its own `ANTHROPIC_BASE_URL` on its embedded Claude Code, overriding the managed one — desktop sessions bypass the proxy entirely while the managed block's `DISABLE_AUTO_COMPACT=1` still applies, so they get neither bili compression nor native auto-compaction. The hook warns loudly at session start (and records it for `bili doctor`, which also flags machines where Claude Desktop is installed alongside the native lane); terminal sessions are unaffected. **Field-tested 2026-10-06 (#2290):** putting `HTTPS_PROXY` in the settings `env` block produced zero CONNECT traffic to a live MITM-enabled proxy on Claude Desktop 2.19675.1 / embedded CC 2.1.288 (Windows 11) — the variable reaches no network stack there, consistent with the CLI finding that CC's undici ignores proxy env vars (why `bili claude` uses the `/bili/` base-URL rewrite instead). As of that version there is no usable routing seam on the desktop Code tab; the lane stays tracked in [#2290](https://github.com/ranxianglei/billion-context/issues/2290) in case upstream changes behavior. Desktop-only users can restore native auto-compact with `bili plugin remove claude`.
+- `claude` has a native posture (#964): managed settings block + `SessionStart` hook + MCP shell; the hook rides the self-managed port zone (#1660) and re-pins the managed URL to the live origin each session, so port drift self-heals. Since #1821 the MCP shell also watches the proxy mid-session (30 s tick × 3 failures) and respawns a dead lane proxy itself, so model requests recover within ~90 s instead of a new session (same semantics as the zcode lane). Opt out with `BILI_NATIVE_CLAUDE=0` (passthrough). Mechanics: [TECHNICAL-NOTES.md](TECHNICAL-NOTES.md). **Known limitation (#2290):** the Claude Desktop app's Code tab (`CLAUDE_CODE_ENTRYPOINT=claude-desktop`) sets its own `ANTHROPIC_BASE_URL` on its embedded Claude Code, overriding the managed one — desktop sessions bypass the proxy entirely while the managed block's `DISABLE_AUTO_COMPACT=1` still applies, so they get neither bili compression nor native auto-compaction. The hook warns loudly at session start (and records it for `bili doctor`, which also flags machines where Claude Desktop is installed alongside the native lane); terminal sessions are unaffected. **Field-tested 2026-10-06 (#2290):** putting `HTTPS_PROXY` in the settings `env` block produced zero CONNECT traffic to a live MITM-enabled proxy on Claude Desktop 2.19675.1 / embedded CC 2.1.288 (Windows 11) — the variable reaches no network stack there, matching the CLI behavior of that era — note that newer builds (CC 2.1.301+) DO honour `HTTPS_PROXY` on the CLI, which is why `bili claude` routes via the `/bili/` base-URL rewrite — the launcher gives this lane no proxy and no CA at all, and a child that brings a proxy of its own gets the loopback hosts merged into `NO_PROXY`/`no_proxy` so that leg stays direct regardless of its proxy behavior (#3446). As of that version there is no usable routing seam on the desktop Code tab; the lane stays tracked in [#2290](https://github.com/ranxianglei/billion-context/issues/2290) in case upstream changes behavior. Desktop-only users can restore native auto-compact with `bili plugin remove claude`. Since #5095 the managed block also installs a `SubagentStart` hook (`node <root>/dist/claude-subagent-hook.js`) that mints a per-dispatch lane token into each subagent's context: subagents that ride the parent's session id with no agent-id headers (the VS Code extension build, #4352) key onto their own `<id>|sub:…:t:<token>` compression lanes, so parallel same-type dispatches stop merging (and the token disappears from later requests once the first message folds — those fall back to the fingerprint lane). Uninstall removes the hook with the managed block.
 - `zcode` has a native posture (#1145): managed `~/.zcode/cli/config.json` block + per-session provider `baseURL` rewrite. Full mechanics: [CLIENTS.md](CLIENTS.md).
 - `jcode` and `aider` have no native mode (no plugin/MCP/tool-injection seam: #962, #1048) — use `bili jcode` / `bili aider`.
 - `copilot`, `amp` and `goose` are launcher-only (#1049); goose cannot be cert-MITMed (rustls trusts no CA file) and rides plain-HTTP base-URL redirects instead.
 
-### Option 2 — Launcher (`bili pi` / `bili codex` / `bili claude` / `bili omp` / `bili opencode` / `bili hermes` / `bili dsh` / `bili codebuddy` / `bili qoder` / `bili trae` / `bili jcode` / `bili kimi` / `bili gemini` / `bili iflow` / `bili qwen` / `bili antigravity` / `bili mcode` / `bili aider` / `bili copilot` / `bili amp` / `bili goose`)
+### Option 2 — Launcher (`bili pi` / `bili codex` / `bili claude` / `bili omp` / `bili opencode` / `bili hermes` / `bili dsh` / `bili codebuddy` / `bili qoder` / `bili trae` / `bili jcode` / `bili kimi` / `bili gemini` / `bili iflow` / `bili qwen` / `bili antigravity` / `bili mcode` / `bili aider` / `bili copilot` / `bili amp` / `bili goose` / `bili kiro`)
 
 The launcher wraps a client in one command: it starts a proxy on an
 independent port (a fresh instance is always spawned — a port is never
@@ -252,21 +267,22 @@ bili claude                           # launch claude through the proxy
 bili omp                              # pi-style, file-free (#535): env + extension registerProvider + compaction cancel, real ~/.omp untouched
 bili opencode                         # OpenCode (1.x & 2.x): full guide in the [OpenCode](CLIENTS.md#opencode) section below
 bili hermes                           # file-free (#535): hermes proxy env (HTTPS_PROXY + combined CA bundle via SSL_CERT_FILE) — https via CONNECT MITM, http via absolute-form forward proxy; real ~/.hermes untouched
-bili dsh                              # deepseek-harness: full native plugin injected via --patch (#941) — real dsh tools, session-bound /acp + /acp-cache (plugin mode); non-loopback upstreams ride proxy envs, loopback keeps the overlay DSH_HOME rewrite (#535); dsh auto-compaction off outside web profiles (#1772)
+bili dsh                              # deepseek-harness: full native plugin injected via --patch (#941) — real dsh tools, session-bound /acp + /acp-cache (plugin mode); non-loopback upstreams ride proxy envs, loopback keeps the overlay DSH_HOME rewrite (#535); dsh auto-compaction off everywhere — host plane via the bundle patch, web-profile presets at load time (#1772/#2474/#3354)
 bili codebuddy                        # Tencent CodeBuddy Code CLI: CODEBUDDY_BASE_URL /bili/ rewrite (OpenAI chat completions wire), budget aligned via CODEBUDDY_AUTO_COMPACT_WINDOW; real ~/.codebuddy untouched
-bili qoder                            # qoder: model endpoint is hardcoded https (no /bili/ rewrite possible) — cert-MITM via HTTPS_PROXY + NODE_EXTRA_CA_CERTS, default model hosts whitelisted (#653)
+bili qoder                            # qoder CLI (`qoder`/`qodercli`): model endpoint is hardcoded https (no /bili/ rewrite possible) — cert-MITM via HTTPS_PROXY + NODE_EXTRA_CA_CERTS, default model hosts whitelisted (#653). Qoder Desktop is a separate BYOK/custom channel that speaks plaintext OpenAI over a `/bili/` prefix — point it at bili as a normal custom provider (not this MITM lane); its official-subscription traffic is encrypted and out of scope (#764)
 bili trae                             # Trae CLI (ByteDance, closed Go binary, no base-URL override) — cert-MITM via HTTPS_PROXY + SSL_CERT_FILE, model host from TRAE_CLI_API_HOST or the default enterprise gateway (#655)
 bili jcode                            # jcode (Rust agent harness) — env-only cert-MITM launch: HTTPS_PROXY + SSL_CERT_FILE, model host api.z.ai whitelisted, local loopback providers stay direct via NO_PROXY
 bili kimi                             # Kimi Code CLI (Moonshot): standard proxy envs except an unconditional loopback bypass — https via cert-MITM, http via absolute-form forward proxy; loopback endpoints inventoried with a manual /bili/ hint (#757)
 bili gemini                           # Gemini CLI (Google): GOOGLE_GEMINI_BASE_URL /bili/ rewrite to generativelanguage.googleapis.com (Google native wire), real ~/.gemini untouched
 bili iflow                            # iFlow CLI: IFLOW_BASE_URL /bili/ rewrite to apis.iflow.cn/v1 (OpenAI chat-completions wire), real ~/.iflow untouched
 bili qwen                             # Qwen Code (multi-protocol gemini-cli fork, no base-URL hook): cert-MITM via HTTPS_PROXY + NODE_EXTRA_CA_CERTS, default DashScope/Qwen model hosts whitelisted, custom relays via --mitm-domain
-bili antigravity                      # Antigravity CLI (agy, Google): CLOUD_CODE_URL /bili/ rewrite of cloudcode-pa.googleapis.com (undocumented language-server env override, v2.19.1 binary-verified); wire recognized as Google native by path (#2115)
+bili antigravity                      # Antigravity CLI (agy, Google): CLOUD_CODE_URL /bili/ rewrite of daily-cloudcode-pa.googleapis.com — the real default upstream (bare cloudcode-pa 400s on /v1internal:*, #3129); undocumented language-server env override, v2.19.1 binary-verified; wire recognized as Google native by path (#2115)
 bili mcode                            # MiniMax Code CLI: same shape as kimi (proxy envs, unconditional loopback bypass, cert-MITM/absolute-form); session bound via X-Mavis-Session-Id (#1050)
 bili aider                            # Aider (Python pair programmer): cert-MITM via HTTPS_PROXY + SSL_CERT_FILE/REQUESTS_CA_BUNDLE; endpoint from OPENAI_API_BASE / ANTHROPIC_BASE_URL / --openai-api-base / .aider.conf.yml (#1048)
 bili copilot                          # Copilot CLI (GitHub, closed Go binary) — cert-MITM via HTTPS_PROXY + SSL_CERT_FILE, api.githubcopilot.com + per-plan subdomains whitelisted (#1049)
 bili amp                              # Amp CLI (Sourcegraph, closed Go binary) — cert-MITM via HTTPS_PROXY + SSL_CERT_FILE, ampcode.com whitelisted (#1049)
 bili goose                            # Goose (Block, Rust/reqwest): rustls release builds trust no CA file — openai/anthropic legs via OPENAI_HOST/ANTHROPIC_HOST, custom providers via a regenerated GOOSE_PATH_ROOT overlay (/bili/ rewrites, real config untouched) (#1049)
+bili kiro                             # Kiro CLI (AWS): cert-MITM via HTTPS_PROXY + combined CA on SSL_CERT_FILE and NODE_EXTRA_CA_CERTS; only runtime.<region>.kiro.dev is decrypted; developer/system items re-voiced as user for the gateway; session = Kiro's conversation id (survives --resume)
 bili pi --mitm-domain api.foo.com     # add a domain to the MITM whitelist
 ```
 
@@ -310,6 +326,21 @@ should see a `processTurn` line per request, and once the conversation grows,
 
 Everything that doesn't fit in one Quickstart line — how each client's lanes attach, what gets written where, and known limitations — lives in **[CLIENTS.md](CLIENTS.md)**: dsh · Kimi Code · Hermes · ZCode · Gemini family (Gemini CLI / iFlow CLI / Qwen Code / Antigravity) · cert-MITM clients that never compress (CONNECT blind tunnels, #897) · unrecognized endpoints going direct (#1290) · OpenCode (launcher / native / pure proxy, `/acp` status & rules, legacy opencode-acp sessions #920).
 
+## From source (development)
+
+> **Risk:** `master` is the development branch and can be broken at any moment — unreleased changes, failing builds, unverified fixes. Unless you are patching the code or testing an unreleased fix, install a release with npm as above.
+
+```bash
+git clone https://github.com/ranxianglei/billion-context.git
+cd billion-context
+npm ci
+npm run build
+npm link
+bili --version
+```
+
+After `npm link`, `bili` works from any directory.
+
 ## FAQ
 
 **How do I check my cache hit rate?** Don't dig through logs — `/acp-cache`
@@ -344,8 +375,9 @@ line in `CACHE INVALIDATION`, and a 🔑 badge in the web sessions column.
 HTTP: `GET /__bili/cache-report`; the raw per-request `[acp-usage]` lines still
 land in the log file for deep dives.
 
-**What does `/acp` show?** In clients with the native plugin (opencode, dsh),
-`/acp` renders the ACP status panel of the current conversation straight from
+**What does `/acp` show?** In clients with the native plugin (opencode, dsh,
+hermes), `/acp` renders the ACP status panel of the current conversation
+straight from
 the proxy (session, blocks, compressible ranges, usage); before the first model
 request it shows an idle notice instead. `/acp-cache [full]` prints the cache
 report above.
@@ -353,8 +385,11 @@ report above.
 **Can I query sessions and config over the web?** Yes — open
 [http://localhost:8787](http://localhost:8787): an overview dashboard, session
 list with per-session detail, live logs, a config editor, and an upstream
-connectivity test. Everything is also plain JSON for scripting
-(`/__bili/stats`, `/__bili/sessions`, `/__bili/config`, …).
+connectivity test. A Blog view renders notes and long-form articles inside the
+panel itself — bundled with the install, refreshed from GitHub master on a
+~1-hour throttle while online (fail-soft to the bundled copy when offline);
+the full library also lives on GitHub Pages. Everything else is also plain JSON
+for scripting (`/__bili/stats`, `/__bili/sessions`, `/__bili/config`, …).
 
 **When does compression happen?** It is model-driven: the injected context
 tools are called by the model as context grows, gentle growth nudges
@@ -378,12 +413,65 @@ unchanged ([CLIENTS.md](CLIENTS.md)), and every mode reverses cleanly:
 command / env vars / `/bili/` prefix for the other two — traffic goes direct
 again immediately.
 
+**Can I combine bili with a model-routing gateway (e.g. [magpie](https://github.com/yetone/magpie))?**
+Yes — point the client at bili, and point bili at the gateway through the
+`/bili/` prefix, which embeds the gateway's absolute URL:
+`http://localhost:8787/bili/http://127.0.0.1:3425…`. Example: Claude Code →
+`ANTHROPIC_BASE_URL=http://localhost:8787/bili/http://127.0.0.1:3425` +
+`ANTHROPIC_API_KEY=magpie`; OpenAI-style clients →
+`OPENAI_BASE_URL=http://localhost:8787/bili/http://127.0.0.1:3425/v1` (+
+`OPENAI_API_KEY=magpie`). Compression happens *before* routing — every request
+that reaches any account in the gateway's routing groups is already compressed.
+Credentials stay in the gateway: the client's dummy key rides through
+untouched, and real keys never touch bili. Caveats: ① an account switch
+mid-conversation invalidates the provider's prefix cache — inherent to
+multi-account routing, not bili (watch it in the `KEY SWITCHES` section of
+`/acp-cache`); ② routed model names are opaque to bili's window lookup —
+declare their context windows under the providers key
+`http://127.0.0.1:3425` via `models.<name>.context`, or they run on the
+fallback window (route-miss warning, #2317); ③ if the relay rejects bili's
+Anthropic-lane `cache_control` stamps, set `compat.noCacheControl`; ④ loopback
+gateways work out of the box; a gateway on a private non-loopback address may
+additionally need `network.allowPrivateHttpProviders` (#2984); ⑤ for Claude Code
+native plugin mode (`bili plugin install claude`), set
+`BILI_CLAUDE_UPSTREAM=http://127.0.0.1:3425` before install so the managed block
+wraps the relay into `ANTHROPIC_BASE_URL` (or configure
+`ANTHROPIC_BASE_URL=http://127.0.0.1:8787/bili/http://127.0.0.1:3425` directly;
+`localhost` and `127.0.0.1` both accepted, #5369). Verified end-to-end over all
+three wires (OpenAI Chat / Responses / Anthropic Messages, including
+cross-protocol conversion), #4433.
+
 **Where are logs and session data stored?** Log:
 `~/.local/state/billion-context/bili.log` (also mirrored to stderr); session
 state: `~/.local/share/billion-context/` (XDG-overridable; Windows AV exclusion
 #362, opt-in cleanup #1082) — full paths in [CONFIGURATION.md](CONFIGURATION.md).
 
 ## Running the proxy
+
+### Running in Docker
+
+A `Dockerfile` ships at the repository root — it installs the published npm
+package at build time (the tested artifact; nothing is compiled in the image)
+and runs the proxy as a service:
+
+```bash
+docker build -t billion-context .
+docker run -d --name bili -p 8787:8787 \
+  -v bili-config:/root/.config/billion-context \
+  -v bili-data:/root/.local/share/billion-context \
+  -v bili-cache:/root/.cache/billion-context \
+  -v bili-state:/root/.local/state/billion-context \
+  billion-context
+```
+
+Then point clients' baseURL at `http://<host>:8787/bili/…` exactly like Option 3
+above.
+
+- **Base:** `node:24-slim` — uses the builtin `node:sqlite` storage engine directly (no native-addon download). Don't switch to Node 20 bases: the self-downloaded SQLite engine requires Node ≥ 22 and crashes under 20 (#3341).
+- **Updates:** in-container self-update is **off by default** (`ACP_AUTO_UPDATE=0`) — the sanctioned update channel for a containerized copy is rebuilding/pulling a newer image; an in-place self-update would be silently reverted to the image version on the next recreate. Opt back in with `-e ACP_AUTO_UPDATE=1`; pin a release at build time with `--build-arg BILI_VERSION=0.1.197` (default `latest`).
+- **Data:** the four mounted dirs hold config, session state, update throttle/lock + cached SQLite engine, and logs respectively. Mount volumes or bind mounts so they survive container replacement; the image also declares them as `VOLUME`s so even a bare `docker run` keeps them out of the container layer.
+- **Security:** the container listens on `0.0.0.0:8787` so clients outside it can connect — there is **no authentication**, so expose the port only on a trusted network (same caveat as `--host 0.0.0.0` below). The web UI and `/__bili/*` JSON endpoints work unchanged through the mapped port.
+- **Healthcheck:** the image ships a `HEALTHCHECK` probing `/__bili/health` on 8787 via node's builtin fetch (no curl needed in the slim base); if you override the listen port, remember the probe stays pinned to 8787.
 
 ### Flags
 
@@ -394,8 +482,10 @@ bili --debug                 # verbose logging (also: set "debug": true in confi
 bili --passthrough           # forward without compression (smoke-test mode)
 bili --config ~/my-bili.json # use a different config file
 bili update                  # check & install a newer version now (bypasses throttle)
+bili doctor --fix            # converge drifted dsh profile ledgers (manifest spec / lockfile record / bundle copy) to the on-disk version (#3496)
 bili --no-auto-update        # disable self-update for this run
 bili --auto-restart-on-update   # self-restart when a new version is installed (default off)
+bili --bin /path/to/client   # launcher: spawn this exact client binary instead of auto-detecting (env BILI_CLIENT_BIN)
 ```
 
 Flags override env vars and the config file. `bili --help` lists them all.
@@ -424,9 +514,11 @@ Client-facing connections close gracefully after the final response: when the pr
 
 The proxy checks npm on startup and every 3 minutes; a newer version is installed in place and a notice is logged — **restart `bili` to pick it up**, unless you enable opt-in self-restart (`--auto-restart-on-update` flag, env `ACP_AUTO_RESTART_ON_UPDATE=1`, or `"autoRestartOnUpdate": true` in config — default OFF): with zero in-flight requests it verifies the new install, stops accepting connections, drains, spawns a replacement on the same port, and exits once it accepts connections (clients reconnect automatically; session state survives on disk). Safety gates: zero in-flight through the drain window, an install sanity check before re-exec, and a 10-minute cooldown marker so a flapping version can never loop-restart; any failure resumes the original listener and falls back to the plain reminder.
 
-While the running process is behind the on-disk install ("stale"), the web UI shows a banner (running vs installed version, auto-restart state) and `GET /__bili/status` returns `{version, diskVersion, stale, autoRestartOnUpdate, advisory, inFlight}` for scripting (`advisory` is the active critical-defect entry or `null`, see below). Disable permanently via `"autoUpdate": false` in config or `ACP_AUTO_UPDATE=0`.
+**Staggered rollout (#3619):** a discovered version is not applied immediately by automatic updates. Each instance draws ONE random moment inside a delay window (built-in default **15 min – 48 h**) and upgrades when it arrives; the drawn moment is persisted, so restarts never re-roll. Fleet upgrades therefore spread across the window instead of completing within minutes of a release, leaving time to catch a bad release mid-rollout (#3401/#3600/#3394). The window plus emergency controls live in a public policy file (`auto-update-policy.json` in this repo, fetched anonymously with ETag caching): `hold` freezes automatic upgrades fleet-wide, `blocked` skips listed versions, `pinned` sets an upgrade ceiling. Fail-open by design — an unreachable or malformed file simply falls back to local defaults, and the file can steer timing/skip/pin only, never what gets installed. Per-machine exits: manual `bili update` bypasses `hold`/stagger (still respects `blocked`/`pinned`), `"staggerMinDelayMs": 0` + `"staggerMaxDelayMs": 0` (or `BILI_UPDATE_STAGGER_MIN_MS`/`BILI_UPDATE_STAGGER_MAX_MS`) restore legacy immediate upgrades, and `ACP_AUTO_UPDATE=0` disables auto-updates entirely. Full format and semantics: [CONFIGURATION.md → `update`](CONFIGURATION.md#update).
 
-In **plugin mode** (`bili opencode` / `bili pi` / `bili dsh` — the proxy runs embedded in a long-lived host), "restart bili" means restarting the **host**: the embedded process cannot exit on its own, so a host left open keeps serving whatever code it started with, silently missing every fix auto-update reports as installed (#1603). Enable `--auto-restart-on-update` to have it self-restart at a safe point, or run `/acp` (OpenCode hosts today — pi/dsh coverage tracked in #2084) — the status panel appends a one-line staleness warning (running vs installed version) whenever the on-disk install is ahead of the live process.
+While the running process is behind the on-disk install ("stale"), the web UI shows a banner (running vs installed version, auto-restart state) and `GET /__bili/status` returns `{version, diskVersion, stale, autoRestartOnUpdate, advisory, updatePolicy, inFlight}` for scripting (`advisory` is the active critical-defect entry or `null`, see below; `updatePolicy` reports the #3619 rollout state — policy source, `hold`/`pinned`/`blocked`, and the pending staggered upgrade with its due time). Disable permanently via `"autoUpdate": false` in config or `ACP_AUTO_UPDATE=0`.
+
+In **plugin mode** (`bili opencode` / `bili pi` / `bili dsh` — the proxy runs embedded in a long-lived host), "restart bili" means restarting the **host**: the embedded process cannot exit on its own, so a host left open keeps serving whatever code it started with, silently missing every fix auto-update reports as installed (#1603). Enable `--auto-restart-on-update` to have it self-restart at a safe point, or run `/acp` (OpenCode hosts today — pi/dsh coverage tracked in #2084) — the status panel appends a one-line staleness warning (running vs installed version) whenever the on-disk install is ahead of the live process. Auto-update only ever replaces disk files and (optionally) the proxy process; **injected code inside the host process only takes effect after the host itself restarts** — so if the injection breaks at runtime mid-session (a disposed agent scope, a disabled plugin), model traffic goes direct and uncompressed until then. Since #3581 this state is visible instead of silent: the web UI shows a "takeover broken" banner (agent + refusal count) whenever a plugin reports its attribution gate degraded while no session is live, and `GET /__bili/status` / `/__bili/overview` expose the per-agent `attribution` state (`ok`/`none`/`threw`, refusal count, first-refusal timestamp). Background lanes that are agentless **by design** (e.g. dsh's title-generation sidecar) never carry an initiator, so their small one-shot calls go direct by definition; under the #3651 contract these normal interceptions are NEVER reported and therefore can never raise the banner. The banner fires only when the attribution lookup itself throws (an internal host error, e.g. a disposed agent scope), and then names what failed: the thrown error text, the masked endpoint, when the episode started, how many requests went uncompressed, the remedy (restart the host process), plus copy/submit-diagnostics buttons that prefill a GitHub issue.
 
 **Update visibility is silent by default since v0.1.183 (#1977):** routine/recommended releases no longer render an update line on the `/acp` panel footer or in `acp_status` — only a `critical`-tier release surfaces there (`CRITICAL UPDATE READY/AVAILABLE`). The standing ways to check an installed-but-not-restarted release are the stale cues above: web UI banner, the `/acp` one-line warning, and `GET /__bili/status`. Deliberately no always-on nag; the advisory channel (#1481) remains the only auto-visible critical path.
 
@@ -434,9 +526,17 @@ When an install keeps failing (unwritable or host-managed dir, network error, �
 
 The same bounded retry now covers the **owner-managed lanes** the global self-update drives instead of writing the copy itself — the dsh desktop in-place copy, the dsh profile bundles, and pi's npm copy (#2192). Each lane keeps its own failure streak keyed by lane + target version, so a persistently broken desktop layout no longer re-downloads the full tarball every cycle (up to ~480 downloads/day per affected machine before the fix); three strikes arms the same exponential cooldown, and the one-time hint names the failing lane and its manual fix (`dsh plugin --profile <name> add …`, `pi update --extension …`, or recreate the desktop profile). Host-managed instances additionally check on their own slower cadence — 30 minutes plus up to 15 minutes of jitter, tracked under a separate throttle marker — instead of consuming the global 3-minute budget. Failure streaks are shared across every bili process on the machine through a small state file in the cache dir (`.install-backoff.json`), so several running instances don't each burn their own retry budget; a clean `bili plugin update` disarms the dsh profile lane immediately. The file is written atomically (tmp+rename) and every writer merges with what is already on disk, so concurrent instances cooperate instead of overwriting each other's streaks; long-lived processes re-read it when it changes, so a manual disarm by one copy is visible to the others on their next check. It is fail-safe in the retry direction — a corrupt file or jumped clock is dropped, never allowed to silence a lane for long. `bili plugin update` clears the dsh-profile lane's key; a repaired desktop lane clears its own key on its next successful in-place refresh.
 
+### Stale local DNS after a network/VPN change (#5224)
+
+A **long-lived** standalone proxy can keep holding stale OS-resolver state after a WSL/VPN/TUN topology change — the process caches its system resolver and libuv's `getaddrinfo` does not re-read `/etc/resolv.conf` on its own. Symptom: every model request through the `/bili/` tunnel answers HTTP 502 `tunnel_destination_denied` with detail `unresolvable`, even though a freshly started `bili` resolves the same host fine at that moment and `curl` from a new shell works. Either remedy clears it:
+- **Restart the proxy process** — a fresh process re-reads the system resolver. In the launcher lanes and the dsh web-profile lane the proxy is a *separate registered* process (the instance registry), so restarting only the client/host re-adopts the same wedged proxy and does **not** help — you must stop and relaunch the proxy itself. (In embedded plugin mode the proxy runs inside the host, so restarting the host *does* clear it.)
+- **Route egress through an upstream proxy** — `-F http://<host:port>` or `BILI_UPSTREAM_PROXY=… BILI_UPSTREAM_PROXY_MODE=auto`: the destination is then resolved remotely by that proxy, so bili never consults its own (stale) resolver for admission.
+
 ### Critical-defect advisories (forced updates)
 
 Independent of auto-update (#1481): even with `autoUpdate` off, the proxy polls a small companion npm package (`billion-context-advisories`, published by CI from this repo's [`advisories/`](advisories/) directory) on the same 3-minute cadence. Each advisory names a semver range of broken versions (`affected`), the exact version to install (`target` — which may be *older* than the current one, i.e. a rollback), and a user-facing `reason`. When the local version falls inside `affected`, bili force-installs `target` through the self-updater's full safety chain (cross-process lock, backup + verify + rollback; source checkouts and host-managed installs are refused with manual instructions instead) and warns prominently: a one-time `[advisory] ⚠️ …` log line per process per advisory id, a banner on the web UI showing the reason and the exact manual upgrade command, and the active entry under `advisory` in `/__bili/status`. The check is fail-open by design: an unreachable or malformed advisory source only produces a warning — model traffic is never blocked by it. Disable via config (`"advisoryCheck": false`) or env (`BILI_ADVISORY_CHECK=0`); point at a custom document with `"advisoryUrl"` / `BILI_ADVISORY_URL`.
+
+**Announcements** (#5548) — distinct from the defect advisory above, three sources feed the web-UI banners, and equal ids shadow in the order **local file > remote feed > built-in**: (1) *built-in* one-time notices rendered from the UI i18n strings; (2) *local* — drop JSON files into `<config dir>/announcements/*.json` (`~/.config/billion-context/announcements/` by default) and they render automatically: bilingual records with kind-derived color, npm-style `versions` targeting (`>=a.b.c`, `^`, `~`, `[lo hi]`, `||` lists), `percent` grey rollout, time windows, and per-kind priority — one bad file disables only itself; (3) *remote* — this repo's master branch [`announcements/remote.json`](announcements/remote.json) (CI-linted on every PR), fetched on the ~3-minute watcher cadence, whose last-known-good snapshot survives restarts and outages while malformed pushes are rejected; unreachable installs (firewalls) point `"remoteAnnouncementsUrl"` / `BILI_ANNOUNCEMENTS_URL` at a relay mirror of the same document. Dismissal follows each record's declared mode: `persistent` (default, content-addressed — editing a notice shows it again), `instance` (this process run only), or `always` (renders without a close button). Dismissing a built-in intro notice is recorded per install in bili's unified storage (SQLite by default; the MySQL backend works too), so it survives restarts — the old `upgrade-notices.json` state file remains only as fallback on legacy-only installs without a unified sidecar. The official feed currently ships an empty entry list.
 
 ## Configuration
 
@@ -497,7 +597,8 @@ The proxy keys compression state on **the conversation value the client itself p
 Where the value comes from, first hit wins: the plugin's
 `x-bili-plugin-conversation` (honored only alongside the `x-bili-plugin`
 marker header), then per-client headers (`x-claude-code-session-id`,
-`x-grok-session-id`/`x-grok-conv-id`, `x-mavis-session-id`), then generic
+`x-grok-session-id`/`x-grok-conv-id`, `x-mavis-session-id`,
+`x-opencode-session-id`), then generic
 headers (`x-session-affinity`, `x-acp-session`, `x-session-id`,
 `x-opencode-session`, `session-id`/`session_id`), then body fields:
 `session_id` / `metadata.session_id` on the Responses wire, and
@@ -507,10 +608,12 @@ Responses/OpenAI/Anthropic wires.
 | Client | Sends conversation id? | Source |
 |---|---|---|
 | **Codex** | ✅ yes | `body.session_id` / turn-metadata thread id |
-| **OpenCode** | ✅ yes | `x-session-affinity` / `x-opencode-session` header (`ses_…`) |
+| **OpenCode** | ✅ yes | `x-opencode-session-id` header (`ses_…`, the request's own session id; 2.x sends the *parent's* cache-routing affinity in `x-session-affinity`/`X-Session-Id`/`x-opencode-session` alongside it, #2779 — 1.x sent its own id in those instead) |
 | **Claude Code** | ✅ yes | `x-claude-code-session-id` header |
 | **omp** (via plugin) | ✅ yes | `prompt_cache_key` promoted over any fingerprint (#268) |
 | **pi** (bare) | ❌ no | nothing → anonymous prefix affinity below |
+
+**omp caveat (#2583/#3556):** on recent OMP builds, default Anthropic (`anthropic-messages`) requests leave the host through OMP's Cowork transport over node:https directly — they never reach bili's fetch layer, so the `prompt_cache_key` stamp is *withheld* there (stamping would leak the field into Anthropic's strict schema → HTTP 400). Since #3556 the `bili omp` launcher lane no longer leaves that hole open by default: unless you set `PI_PROXY` / `PI_PROXY_ANTHROPIC` yourself, the launcher exports `PI_PROXY_ANTHROPIC=<proxy>`, which pushes Cowork onto Bun's fetch and routes it through the proxy like every other lane (compressed and session-visible; the stamped key is consumed and stripped by the proxy). Direct-and-anonymous remains only for native omp mode and for launcher lanes where you pin your own proxy posture; all other omp traffic keeps its stamped identity. Details: [TECHNICAL-NOTES.md](TECHNICAL-NOTES.md).
 
 **Header-less clients (pi-like): anonymous prefix affinity.** With no conversation signal at all, the proxy resolves the session from the replayed history itself (`src/prefix-affinity.ts`, #309): a request reattaches to a stored session only when its history reproduces that session's message chain byte-exactly from position 0; otherwise it gets its own deterministic `pfa-…` session. Consequences (#1262): a **resumed** conversation reattaches to its own session (even after a proxy restart, #499); a **new task with an identical opener does NOT inherit** another conversation's blocks — it mints a fresh, fully separate session; a request with no usable signal at all gets an explicit 400 instead of silently colliding.
 
@@ -528,13 +631,85 @@ client already supplied (e.g. a body `session_id` is forwarded upstream as
 
 A child session (subagent/fork starting from an empty history) reports its lineage at birth — its identity registration carries `parentConversationId` and the proxy records a read-only `derivedFrom` link — so `decompress` / `search_context` fall back along the parent chain for content the child never saw itself (cycle-guarded, depth cap 8). Nothing is copied into the child, the parent is never modified; if the parent is unknown the child simply starts fresh. Per-lane parent signals (pi/omp `parentSession` header, OpenCode V1/V2 `parentID`): [SESSION-IDENTITY.md](SESSION-IDENTITY.md#derived-child-sessions-lineage-at-birth-1333-1362). claude/codex/dsh need nothing here: they share one session id across subagents or have no child-session concept at all.
 
-### Windows: exclude the sessions dir from antivirus (#362)
+### Running multiple instances (#3633)
 
-The proxy rewrites each session's state file every turn of a long session; on Windows, real-time AV (Defender), the search indexer, or a sync tool (OneDrive) can lock the sessions dir mid-write, so persists fail with `EPERM` until the lock clears. Fix at the root: add `%USERPROFILE%\.local\share\billion-context\` to your antivirus exclusions (Defender steps included) and keep sync tools off that path — [CONFIGURATION.md](CONFIGURATION.md#windows-exclude-the-sessions-dir-from-antivirus-362).
+**One conversation belongs to one instance for its whole life.** Fold state,
+prefix affinity and the summary budget are keyed to a session id whose home is
+the client's own history — and the session's rows live in that instance's
+`index.db`. There is no shared store between instances: nothing replicates,
+nothing fails over, nothing rehydrates a session onto a different instance.
+
+Consequences for anyone tempted to put several instances behind one Service:
+
+- **Sticky routing is required, and `ClientIP` affinity is the wrong kind.**
+  The conversation identity lives in a header or the request body, not the
+  source IP — a Service can only hash on IP, so a client pinned to replica N
+  silently loses *every* session when replica N dies (buying throughput while
+  selling away availability, exactly when you scaled out because of load).
+  Correct routing is an L7 proxy hashing a conversation header
+  (`x-bili-plugin-conversation`, `x-opencode-session-id`, `x-acp-session`, …)
+  onto a backend — and the client actually sending one (header-less clients
+  get prefix affinity instead, which an L7 proxy cannot hash).
+- **Instance count is volume count.** The state directory is one local
+  directory with SQLite in WAL mode (`busy_timeout=5000`); a coherent shared
+  `-shm` and working byte-range locks across writers require an RWO volume
+  that is never shared. Pointing two instances at the same RWX/NFS path does
+  not give you a shared store — it gives you silent corruption behind a
+  timeout. One RWO volume per instance, `storage.unified` included: "unified"
+  means one store *for that instance* (sessions + CCR + CAS in one
+  `index.db`), not one store for the fleet.
+- **The workload that actually scales** is *many independent short-lived
+  conversations* — one proxy per client or per lane — not *one long
+  conversation load-balanced across proxies*. Long conversations are
+  single-instance by design.
+
+**Single machine, multiple installs (#5046).** The topology above covers
+deployment replicas; one desktop has a sibling situation: two installs on ONE
+machine (e.g. two DSH profiles — desktop + bot, or a global npm copy beside a
+host-tree copy) each start their own proxy and, unless isolated, both resolve
+the SAME default XDG sessions directory and the same config file. Multiple
+processes writing ONE local-disk `index.db` is the SUPPORTED topology
+(#5082/#5091) — SQLite WAL is multi-process safe on a local filesystem — so
+startup NEVER blocks on a live foreign writer: the peer shows up as an
+info-level `[storage] process pid … is also using …` line plus the status wire,
+nothing more (policy settled 2026-10-31, withdrawing the #5046/B-era
+refuse-to-start for exactly this shape). What genuinely remains hazardous is
+two installs walking the SAME *session* concurrently — that case alarms
+separately (split-brain contest, #3923). If you still want strictly separate
+histories and stores per install, give each its own `BILI_SESSIONS_DIR` (plus
+`BILI_CONFIG_FILE` when the config should differ too) through that install's
+launcher/profile environment — no global env changes needed. Once isolated,
+the `[instances]` notice drops off entirely. Note the distinction from the
+deployment case above: local disk with SQLite WAL tolerates many writers;
+shared RWX/NFS storage does NOT and keeps requiring one writer per volume.
+
+Naming note: `POST /__bili/replicas` creates a session **checkpoint fork**
+(from stored checkpoints), not a pod replica — read it as `/__bili/checkpoints`.
+
+
+The proxy rewrites each session's state file every turn of a long session; on Windows, real-time AV (Defender), the search indexer, or a sync tool (OneDrive) can lock the sessions dir mid-write, so persists fail with `EPERM` until the lock clears. Fix at the root: add `%USERPROFILE%\.local\share\billion-context\` to your antivirus exclusions (Defender steps included) and keep sync tools off that path — [CONFIGURATION.md](CONFIGURATION.md#windows-exclude-the-sessions-dir-from-antivirus-362). The same exclusion also covers the unified-storage `index.db` refusing to open (`unable to open database file`, #3823) — the storage-degrade warning names it as the first suspect.
 
 ### Session file cleanup (#1082)
 
 Short-lived sessions leave small state files behind that are never resumed. Cleanup is **opt-in** (`BILI_SESSION_GC=1`; off by default — session files are user data, no silent deletion policy): when enabled, bili sweeps the sessions dir at boot and hourly and deletes a file only when BOTH hold — older than `BILI_SESSION_GC_MAX_AGE_DAYS` (default 7 days) AND never compressed with its newest request body ≤ `BILI_SESSION_GC_MAX_TOKENS` tokens (default 1M) — so deletion loses nothing but bytes. CCR content stores follow their session file's lifecycle; compressed sessions are never deleted; every deletion is audit-logged. Full policy: [CONFIGURATION.md](CONFIGURATION.md#environment-variables).
+
+### Storage maintenance CLI (#3928)
+
+The same store maintenance the panel exposes over HTTP (`POST /__bili/storage/gc`, `POST /__bili/storage/restore`) has a thin CLI layer — no proxy needed, run it on any machine that owns the sessions dir:
+
+```bash
+bili sessions ls                 # id, label, decoded size, last-updated, storage status (active/archived)
+bili sessions rm <id>            # full delete (content refcount release incl. media); shrinks index.db afterwards (--no-vacuum skips)
+bili sessions archive <id>       # export to archive/archive.jsonl + sweep rows; tombstone keeps label & identity
+bili sessions restore <id>       # bring an archived session back from the log line
+bili sessions foreign-blocks     # (#5312) list fold blocks whose covered messages never belonged to this transcript — dry-run; --apply reversibly archives them, --restore <sid>:<bid> brings one back
+bili storage gc [--days N] [--vacuum full|incremental] [--dry-run]
+                                 # print the sweep plan (sessions past retention, zero-ref content rows, ~pages reclaimable), then run the same gc() the HTTP endpoint calls; --dry-run stops after the plan
+```
+
+`archive`/`restore`/`gc` require the unified store (`BILI_STORAGE_UNIFIED=shadow|full` or `storage.unified` in the config file) — legacy-only installs refuse with a hint. `--days` defaults to `storage.archiveAfterDays` (365). No scheduler: these run on demand. All commands accept `--json`.
+
+**Full vacuum is an offline operation on large databases (#4612).** `--vacuum full` (the default) rewrites the entire index.db under an exclusive write lock — O(db size), minutes to tens of minutes on multi-GB databases, with no intermediate progress (SQLite's VACUUM is atomic; it cannot be split). Running it while a proxy is serving from the same sessions dir starves that proxy's writes until its storage layer degrades, so `storage gc --vacuum full` **refuses to start when another live process holds the database** (`index.db.lock` pid discipline, #4175): the CLI exits 1 with an actionable message, the panel endpoint returns HTTP 409. Stop the other instance first (or wait for it to exit) and retry; for online-safe shrink use `--vacuum incremental`, which reclaims freed pages in short transactions without taking the exclusive lock. The zero-ref delete sweep itself is batched with per-batch progress output either way.
 
 ## Status
 

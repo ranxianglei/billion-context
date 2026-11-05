@@ -141,8 +141,10 @@ async function startHarness(): Promise<Harness> {
         bodies,
         close: async () => {
             proxy.close();
+            proxy.closeIdleConnections?.();
             await once(proxy, "close");
             upstream.close();
+            upstream.closeIdleConnections?.();
             await once(upstream, "close");
         },
     };
@@ -190,7 +192,9 @@ test("e2e #2372: codex replaying [summary, retained tail] rebases the ACP state 
         assert.equal((s.state.blocks ?? []).filter((b) => b.active).length, 0, "no active blocks survive the rebase");
         assert.equal((s.state.blocks ?? []).length, 0, "block list is empty after the boundary reset");
         const byRawKeys = Object.keys(s.state.messageRefs.byRaw);
-        assert.equal(byRawKeys.length, 3, "refs were re-seeded onto exactly the compacted view (summary + 2 retained)");
+        // #2592/F5: 3 re-seeded entries + the pinned REF_FLOOR_RAW_ID (the
+        // pre-rebase high-water mark must never be re-allocated onto new raw).
+        assert.equal(byRawKeys.length, 4, "refs were re-seeded onto exactly the compacted view (summary + 2 retained + ref-floor)");
         assert.ok(s.metadata.nativeCompactionBoundary, "native-compaction boundary is recorded");
         assert.equal((s.metadata.nativeCompactionBoundary as { pendingRebase?: boolean }).pendingRebase, false, "rebase consumed within the same request");
         assert.ok(s.metadata.nativeCompactionAt, "nativeCompactionAt recorded by the reset");
@@ -209,7 +213,7 @@ test("e2e #2372: codex replaying [summary, retained tail] rebases the ACP state 
         assert.equal(r2.status, 200, "post-compaction turn succeeds");
         await r2.text();
         const s2 = listSessions().find((x) => x.meta.label === "codex-sess-a")!;
-        assert.equal(Object.keys(s2.state.messageRefs.byRaw).length, 4, "refs accumulate append-only after the rebase");
+        assert.equal(Object.keys(s2.state.messageRefs.byRaw).length, 5, "refs accumulate append-only after the rebase");
     } finally {
         await h.close();
     }
@@ -232,7 +236,7 @@ test("negative #2372: non-codex UA with the same compacted shape does NOT rebase
         // block — the benign same-session path — so block liveness is not the
         // discriminator here; the ref map and boundary are.)
         assert.ok(s.metadata.nativeCompactionBoundary === undefined, "no boundary recorded for a non-codex client");
-        assert.ok(Object.keys(s.state.messageRefs.byRaw).length > 3, `ref map not re-seeded (got ${Object.keys(s.state.messageRefs.byRaw).length} ids — rebase would leave exactly 3)`);
+        assert.ok(Object.keys(s.state.messageRefs.byRaw).length > 4, `ref map not re-seeded (got ${Object.keys(s.state.messageRefs.byRaw).length} ids — rebase would leave exactly 4)`);
     } finally {
         await h.close();
     }

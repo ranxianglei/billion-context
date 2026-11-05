@@ -396,10 +396,7 @@ test("#2302: gentle nudge carries the static one-call hint, no expanded skeleton
     !result.text.includes("<write your summary of this range>"),
     "no ready-to-fill skeleton",
   );
-  assert.ok(
-    !result.text.includes("<topic>"),
-    "no per-range skeleton headers",
-  );
+  assert.ok(!result.text.includes("<topic>"), "no per-range skeleton headers");
 });
 
 test("#2302: emergency nudge carries the static hint, stays unconditional (#1198)", () => {
@@ -442,4 +439,102 @@ test("#2302: tier-2/tier-3 nudges carry no message-ref hint (block refs)", () =>
   );
   assert.ok(!t2.text.includes("ONE call, ONE string"), "T2 folds blocks");
   assert.ok(!t2.text.includes("<write your summary of this range>"));
+});
+
+test("anthropic lane: nudge names the <analysis>/<summary> failure and the required shape", () => {
+  // Anthropic-shaped lanes prime the model for the Claude-Code compaction
+  // envelope. It then writes the summary as reply text, the reply carries no
+  // tool call, and the turn ends — the session stalls until the user types
+  // "continue". The lane note must name both the failure and the fix.
+  const gentle = renderNudgeText(
+    makeDecision({ contextUsage: 0.5 }),
+    undefined,
+    {},
+    "anthropic",
+  );
+  assert.ok(
+    gentle.text.includes(
+      "Write the summary ONLY as the `compress` tool's `content` argument",
+    ),
+    "anthropic gentle nudge states the required delivery shape",
+  );
+  assert.ok(
+    gentle.text.includes("Never emit `<analysis>` or `<summary>` tags"),
+    "anthropic gentle nudge names the envelope it must not emit",
+  );
+  assert.ok(
+    gentle.text.includes("a reply without a tool call ends the turn"),
+    "anthropic gentle nudge explains why the envelope breaks the turn",
+  );
+});
+
+test("anthropic lane: emergency and tier nudges carry the same note", () => {
+  const emergency = renderNudgeText(
+    makeDecision({ contextUsage: 0.95, breakdown: { emergencyOverride: 1 } }),
+    undefined,
+    {},
+    "anthropic",
+  );
+  assert.ok(
+    emergency.text.includes(
+      "Write the summary ONLY as the `compress` tool's `content` argument",
+    ),
+  );
+
+  const t2 = renderNudgeText(
+    makeDecision({ contextUsage: 0.5, tier: 2, tierTargetBlocks: [] }),
+    undefined,
+    {},
+    "anthropic",
+  );
+  assert.ok(
+    t2.text.includes(
+      "Write the summary ONLY as the `compress` tool's `content` argument",
+    ),
+  );
+});
+
+test("other lanes and the protocol-neutral default stay unchanged", () => {
+  const note =
+    "Write the summary ONLY as the `compress` tool's `content` argument";
+  for (const protocol of ["openai", "responses", "google"] as const) {
+    const rendered = renderNudgeText(
+      makeDecision({ contextUsage: 0.5 }),
+      undefined,
+      {},
+      protocol,
+    );
+    assert.ok(
+      !rendered.text.includes(note),
+      `${protocol} lane keeps its own wording`,
+    );
+  }
+  const neutral = renderNudgeText(makeDecision({ contextUsage: 0.5 }));
+  assert.ok(
+    !neutral.text.includes(note),
+    "omitted protocol stays protocol-neutral",
+  );
+});
+
+test("anthropic lane note adds no blank-line artifacts beyond the baseline", () => {
+  // An empty ranges table already leaves a triple newline in the protocol-neutral
+  // render (pre-existing, unrelated to the lane note), so compare against the
+  // baseline rather than asserting an absolute.
+  const base = renderNudgeText(makeDecision({ contextUsage: 0.5 }));
+  const anthropic = renderNudgeText(
+    makeDecision({ contextUsage: 0.5 }),
+    undefined,
+    {},
+    "anthropic",
+  );
+  const triples = (s: string) => (s.match(/\n\n\n/g) ?? []).length;
+  assert.equal(
+    triples(anthropic.text),
+    triples(base.text),
+    "the lane note introduces no extra blank-line run",
+  );
+  assert.ok(
+    anthropic.text.endsWith("ends the turn."),
+    "the lane note is the final line, not a dangling separator",
+  );
 });

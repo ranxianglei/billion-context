@@ -314,8 +314,14 @@ test("exposure telemetry: periodic info line with liveConns breakdown (#1452)", 
     let harness: Harness | null = null;
     try {
         harness = await startProxy(upstream, false);
-        await new Promise((r) => setTimeout(r, 400));
-        const line = captured.find((c) => /\[exposure\] uptime=/.test(c.msg));
+        // Deadline poll instead of a fixed sleep: under CI load a fixed window can
+        // elapse before the first interval tick lands (#3409 CI flake class).
+        const deadline = Date.now() + 5000;
+        let line = captured.find((c) => /\[exposure\] uptime=/.test(c.msg));
+        while (!line && Date.now() < deadline) {
+            await new Promise((r) => setTimeout(r, 10));
+            line = captured.find((c) => /\[exposure\] uptime=/.test(c.msg));
+        }
         assert.ok(line, `expected [exposure] telemetry line, got: ${captured.map((c) => c.msg).join(" | ")}`);
         assert.match(line!.msg, /liveConns=\d+ tcpHandles=\d+ handles=\d+ sessions=\d+ blindTunnels=\d+ inFlight=\d+/);
         assert.equal(line!.level, "info");
@@ -400,7 +406,27 @@ test("retired stall guard: mid-stream silence survives any short window even wit
             },
         );
         req.end(STREAM_BODY);
-        await new Promise((r) => setTimeout(r, 2000));
+        // Wait for the first chunk by EVENT-LOOP TICKS, not wall clock: client,
+        // proxy and upstream share this process, so a runner stall freezes the
+        // round trip AND any Date.now() deadline together — the ~42s
+        // windows-latest freeze in run 38930761011 (#3435) would blow past a
+        // wall-clock budget before the chunk lands. Ticks measure process-
+        // relative progress (the frame the retired 400ms guard itself lives in):
+        // a few ticks on healthy runners; a dead stream is bounded by the tick
+        // cap and by BILI_UPSTREAM_TIMEOUT_MS cutting it with an in-band frame.
+        let tick = 0;
+        while (seen.join("").length === 0 && tick < 500) {
+            await new Promise((r) => setTimeout(r, 10));
+            tick++;
+        }
+        // Observation floor in the same tick frame (~2s nominal): keep watching
+        // until ≥200 ticks have elapsed since the request, so the negative
+        // assertions still cover a window far past the retired 400ms guard's
+        // old cut point (#3409 fix intent).
+        while (tick < 200) {
+            await new Promise((r) => setTimeout(r, 10));
+            tick++;
+        }
         const soFar = seen.join("");
         assert.ok(soFar.length > 0, "first chunk should have flowed through");
         assert.ok(!soFar.includes("stream error"), `retired guard must not emit a truncation error: ${soFar.slice(0, 300)}`);

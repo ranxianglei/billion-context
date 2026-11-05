@@ -9,8 +9,44 @@
   },
   "billionContextReleaseNotes": {
     "schema": 1,
-    "updated": "2026-10-06",
+    "updated": "2026-10-26",
     "releases": [
+      {
+        "version": "0.1.208",
+        "date": "2026-10-25",
+        "tier": "critical",
+        "summary": "修复 0.1.207 升级后大存储打不开的问题:0.1.207 的 v8 存储迁移一次性把整个库读进内存,大库(数 GB)首次打开内存耗尽,且每次启动都重新失败,表现为卡死或反复崩溃(#4677)。本版改为逐会话迁移、崩溃自动续跑,并打印进度日志。EN: large unified stores bricked by the 0.1.207 v8 migration (whole-store load = OOM on every launch) now migrate one session per transaction, resume after a crash, and log progress. 大存储用户请立即升级;已卡住的用户升级后重启即自动续跑,不要手改 user_version。"
+      },
+      {
+        "version": "0.1.207",
+        "date": "2026-10-24",
+        "tier": "recommended",
+        "summary": "存储可靠性修复(0.1.203–0.1.204 用户请直接升到本版):折叠上下文不再因模型/窗口切换悄悄膨胀直至会话超窗;修复图片会话媒体引用泄漏与存储校验误报(#4390/#4506/#4444)。EN: storage reliability fixes — folded context no longer silently regrows after model/window switches; media-ref leak and false digest drift fixed. v0.1.203–204 users upgrade immediately."
+      },
+      {
+        "version": "0.1.203",
+        "date": "2026-10-21",
+        "tier": "critical",
+        "summary": "修复电脑休眠/会话重启/网络波动后重试请求 400:此前 dsh 重试不带会话身份,压缩状态丢失、整段历史裸发上游拒绝(#4082/#4101/#4094/#4116);修复上下文爆满/token 暴涨:超窗保险丝+超限请求不再裸发(#4090);修复 skill 目录保护失效导致的缓存 miss(#3799)。本版共 119 项变更,另修复 70+ 缺陷、新增 10+ 功能,完整清单见 https://github.com/ranxianglei/billion-context/releases/tag/v0.1.203 。升级到 ≥0.1.203 并重启一次 dsh。"
+      },
+      {
+        "version": "0.1.193",
+        "date": "2026-10-12",
+        "tier": "critical",
+        "summary": "修复 dsh 等切换模型/协议导致会话 fork、压缩状态失效、上下文暴涨问题(#2791);修复 dsh、codex 等自动压缩拦截失效问题(#2763);修复 codex 等压缩后缓存泄露、token 大量浪费问题(#2733);支持新的统一存储(默认关,实验中)(#2671)。升级后重启一次 dsh。"
+      },
+      {
+        "version": "0.1.192",
+        "date": "2026-10-10",
+        "tier": "critical",
+        "summary": "DSH desktop: a native-compaction checkpoint on the anthropic/google lanes left the prefix cache unrecoverable — persistent misses, heavy token waste (#2658, #2596); 0.1.189 added the rebase fallback to openai/responses only, this release extends it (#2664). Restart dsh. 丨 桌面版:原生压缩 checkpoint 落到 anthropic/google 线后前缀缓存无法恢复、token 大量浪费(#2658、#2596);0.1.189 只补了 openai/responses,本版补齐(#2664)。升级后重启 dsh。"
+      },
+      {
+        "version": "0.1.191",
+        "date": "2026-10-10",
+        "tier": "recommended",
+        "summary": "dsh: long sessions could hit a false \"native compaction detected\" — any history that merely quoted the dsh checkpoint marker (assistant reasoning, tool output) plus fold drift reset ACP compression state, re-paying the whole prefix (#2621). Detection now only trusts genuine dsh checkpoints. 丨 dsh:超长会话会被误判\"发生原生压缩\"——历史里仅引用了 dsh 检查点标记(助手推理/工具输出)+正常折叠漂移就会重置压缩状态、重付整个前缀(#2621);现在检测只认真正的 dsh 检查点。"
+      },
       {
         "version": "0.1.186",
         "date": "2026-10-06",

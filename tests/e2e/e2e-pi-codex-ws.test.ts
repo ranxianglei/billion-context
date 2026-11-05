@@ -512,14 +512,19 @@ test("A: explicit websocket — intercepted, stamped, compress/decompress round 
     assert.ok(sentinelRef, "sentinel message carries an ACP ref tag");
     const minRef = userRefs.reduce((a, b) => (Number(a.slice(1)) < Number(b.slice(1)) ? a : b));
 
-    ok("fold", await piRun(ctx, `WS_FOLD_REQUEST_B64 ${b64({ content: [{ startId: minRef, endId: sentinelRef, summary: SUMMARY }] })}`, { resume: true }));
+    ok("fold", await piRun(ctx, `WS_FOLD_REQUEST_B64 ${b64({ content: `${minRef}–${sentinelRef} fold\n${SUMMARY}` })}`, { resume: true }));
     const foldedRow = mock.rows.filter((r) => r.transport === "ws").find((r) => toolResult(r, "compress")?.includes("Compressed"));
     assert.ok(foldedRow, "compress executed and reported the fold");
 
     ok("status", await piRun(ctx, "WS_STATUS post-fold recall", { resume: true }));
     const statusRow = mock.rows.filter((r) => r.transport === "ws").find((r) => toolResult(r, "acp_status"));
     assert.ok(statusRow, "acp_status executed after the fold");
-    const blockId = toolResult(statusRow!, "acp_status")!.match(/\bb(\d+)\b/)?.[1];
+    // Harvest the block id from the COMPRESSED BLOCKS section only. The
+    // naive /\bb(\d+)\b/ lottery: the ACTIVE SURFACE line carries the build
+    // stamp "(b<shortsha>)", and a PR merge ref whose abbreviated SHA is 'b'
+    // followed by digits (e.g. b288144) matches FIRST and hijacks the harvest
+    // (observed on #2736, run 38119865934: decompress b288144 → not found).
+    const blockId = toolResult(statusRow!, "acp_status")!.match(/COMPRESSED BLOCKS[^\n]*\n[\s\S]*?\n\s+b(\d+) \(/)?.[1];
     assert.ok(blockId, "acp_status report lists the compressed block (need its bN ref)");
     const statusJson = JSON.stringify(statusRow!.full);
     assert.ok(!statusJson.includes(SENTINEL), "post-fold request no longer carries the folded bulk");
@@ -580,14 +585,21 @@ test("B: auto — successful WS still routes, previous_response_id continuation 
     assert.ok(sentinelRef && userRefs.length >= 2, `user-message ACP refs present (${userRefs.length})`);
     const minRef = userRefs.reduce((a, b) => (Number(a.slice(1)) < Number(b.slice(1)) ? a : b));
 
-    ok("fold", await piRun(ctx, `WS_FOLD_REQUEST_B64 ${b64({ content: [{ startId: minRef, endId: sentinelRef, summary: SUMMARY }] })}`, { resume: true }));
+    ok("fold", await piRun(ctx, `WS_FOLD_REQUEST_B64 ${b64({ content: `${minRef}–${sentinelRef} fold\n${SUMMARY}` })}`, { resume: true }));
 
     // Delta frames emerge inside multi-call tool-loop processes (pi's
     // websocketSessionCache is per-process): A/E show them on the final call of
     // an acp_status loop, never on single-prompt runs. Mirror A's proven shape.
     ok("status", await piRun(ctx, "WS_STATUS", { resume: true }));
 
-    const cont = wsRows().find((r) => typeof r.body.previous_response_id === "string" && Array.isArray(r.body.input) && r.full.length > (r.body.input as unknown[]).length);
+    // findLast, not find (#2880): the fold turn's own FIRST upstream call can
+    // itself arrive as a previous_response_id delta frame — by definition it
+    // predates compress execution, so its expanded full can never carry the
+    // "Compressed" tool result. Picking the LATEST continuation (the status
+    // turn's final call) keeps the fold-result assertion below deterministic
+    // regardless of which turns
+    // pi's per-process websocketSessionCache happens to send incrementally.
+    const cont = wsRows().findLast((r) => typeof r.body.previous_response_id === "string" && Array.isArray(r.body.input) && r.full.length > (r.body.input as unknown[]).length);
     assert.ok(cont, "previous_response_id incremental continuation observed and expanded");
     assert.ok(cont!.full.some((i) => i.type === "function_call_output" && String(i.output ?? "").includes("Compressed")), "continuation frame carries the fold result");
 
@@ -599,7 +611,7 @@ test("B: auto — successful WS still routes, previous_response_id continuation 
     assert.match(biliLog(ctx), /forward WS/);
 });
 
-test("C: auto — upstream WS refusal surfaces cleanly; explicit sse unaffected", { skip: skipReason, timeout: 900_000 }, async (t) => {
+test("C: auto — upstream WS refusal falls back to HTTP egress; explicit sse unaffected", { skip: skipReason, timeout: 900_000 }, async (t) => {
     let ctx: Ctx | undefined;
     let ctxSse: Ctx | undefined;
     const mock = await startMock({ failUpgrade: true, getRowsPath: () => (ctx ? path.join(ctx.work, "rows.json") : undefined) });
@@ -614,15 +626,19 @@ test("C: auto — upstream WS refusal surfaces cleanly; explicit sse unaffected"
     });
     ctx = await startCtx("auto", mock.port);
 
-    // Topology change disclosed with #2111: interception moves the client
-    // handshake onto bili (local — always succeeds), so an upstream refusal now
-    // lands on bili's UPSTREAM leg. pi classifies that as a mid-stream failure
-    // (websocketStarted=true → throw, no same-turn SSE fallback; pre-intercept
-    // only a client-side handshake failure triggered recordWebSocketSseFallback).
+    // #3342: interception moves the client handshake onto bili (local — always
+    // succeeds), so an upstream WS refusal lands on bili's UPSTREAM leg — where
+    // bili now falls back to the supplier's plain HTTP/SSE leg instead of failing
+    // the turn. This mock refuses the upgrade (503) yet still serves POST/SSE on
+    // the same port, so the ping completes transparently over HTTP and pi sees a
+    // normal success. pi does no same-turn SSE fallback of its own (#2111: a
+    // mid-stream WS failure just throws), so success here can only mean bili's
+    // internal HTTP fallback carried the turn end-to-end.
     const r = await piRun(ctx, "ping fallback");
-    assert.notEqual(r.code, 0, `mid-stream WS failure surfaces as an error (exit ${r.code})`);
-    assert.match(r.stderr, /Responses WebSocket handshake failed|provider_transport_failure/, "pi reported the transport failure");
-    assert.ok(mock.stats.wsConnections >= 1, "bili attempted the upstream WS connection");
+    assert.equal(r.code, 0, `WS refusal falls back to HTTP egress (exit ${r.code})\n${r.stderr.slice(-2000)}`);
+    assert.ok(r.stdout.includes("WS_E2E_OK"), "the turn's response returned through the HTTP fallback");
+    assert.ok(mock.stats.wsConnections >= 1, "bili attempted the upstream WS connection before falling back");
+    assert.ok(mock.rows.some((x) => x.transport === "http"), "bili served the turn over the upstream's HTTP/SSE leg");
     assert.match(biliLog(ctx), /codex-responses-ws/, "client leg reached bili's WS bridge lane");
 
     // Explicit sse stays usable against the same WS-refusing upstream.
@@ -672,7 +688,7 @@ test("D: explicit sse — regression guard, full fold cycle over HTTP", { skip: 
     assert.ok(sentinelRef && userRefs.length >= 2, `user-message ACP refs present (${userRefs.length})`);
     const minRef = userRefs.reduce((a, b) => (Number(a.slice(1)) < Number(b.slice(1)) ? a : b));
 
-    ok("fold", await piRun(ctx, `WS_FOLD_REQUEST_B64 ${b64({ content: [{ startId: minRef, endId: sentinelRef, summary: SUMMARY }] })}`, { resume: true }));
+    ok("fold", await piRun(ctx, `WS_FOLD_REQUEST_B64 ${b64({ content: `${minRef}–${sentinelRef} fold\n${SUMMARY}` })}`, { resume: true }));
     ok("recall", await piRun(ctx, "final recall", { resume: true }));
 
     // Re-capture AFTER fold/recall: preFoldRows is a pre-fold snapshot.
@@ -706,7 +722,14 @@ test("E: two subagent-style sessions share one proxy — distinct state, identic
         assert.ok(r.stdout.includes("WS_E2E_OK"));
     };
 
-    ok("X warmup", await piRun(ctxX, "alpha marker ALPHA_X_SEED"));
+    // #5428 flipped the pi lane's DEFAULT posture to inline (in-process proxy):
+    // left unpinned, X's proxy would die with its pi process and unregister its
+    // instance record — nothing left to discover, nothing for Y to attach to.
+    // This scenario pins the legacy spawn/attach posture it was built on;
+    // scenarios A–D intentionally ride the new inline default.
+    const legacyPosture: NodeJS.ProcessEnv = { BILI_PI_INLINE: "0" };
+
+    ok("X warmup", await piRun(ctxX, "alpha marker ALPHA_X_SEED", { extraEnv: legacyPosture }));
     const origin = proxyOriginOf(ctxX);
     assert.ok(origin, "X's proxy origin discovered from its instance record");
     // Y attaches to X's proxy (real subagent posture: inherited
@@ -717,7 +740,7 @@ test("E: two subagent-style sessions share one proxy — distinct state, identic
 
     // Same tool args ({}) from both sessions, interleaved.
     const [xStatus, yStatus] = await Promise.all([
-        piRun(ctxX, "WS_STATUS alpha status", { resume: true }),
+        piRun(ctxX, "WS_STATUS alpha status", { resume: true, extraEnv: legacyPosture }),
         piRun(ctxY, "WS_STATUS beta status", { resume: true, extraEnv: yEnv }),
     ]);
     ok("X status", xStatus);
@@ -747,7 +770,7 @@ test("E: two subagent-style sessions share one proxy — distinct state, identic
 
     // Concurrent plain turns, same proxy, no cross-talk afterwards.
     const [xFin, yFin] = await Promise.all([
-        piRun(ctxX, "concurrent X tail", { resume: true }),
+        piRun(ctxX, "concurrent X tail", { resume: true, extraEnv: legacyPosture }),
         piRun(ctxY, "concurrent Y tail", { resume: true, extraEnv: yEnv }),
     ]);
     ok("X concurrent", xFin);

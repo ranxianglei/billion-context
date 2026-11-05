@@ -41,6 +41,34 @@ const knobs = await import("../src/knobs.js");
 const { UPSTREAM_TIMEOUT_MS, REPLAY_MAX_ATTEMPTS, REPLAY_BASE_DELAY_MS } = await import("../src/fetch-util.js");
 const { PROXY_KEEPALIVE_MAX_MS } = await import("../src/upstream-proxy.js");
 
+test("#3128 limits: defaults 5/10/5 GiB, file tier, env precedence, garbage falls back", () => {
+    clearConfig();
+    assert.equal(knobs.limitsReceiveBytes(), 5 * 1024 * 1024 * 1024);
+    assert.equal(knobs.limitsDecodedBytes(), 10 * 1024 * 1024 * 1024);
+    assert.equal(knobs.limitsOutboundBytes(), 5 * 1024 * 1024 * 1024);
+
+    setConfig({ network: { receiveBodyBytes: 111, decodedBodyBytes: 222, outboundBodyBytes: 333 } });
+    assert.equal(knobs.limitsReceiveBytes(), 111);
+    assert.equal(knobs.limitsDecodedBytes(), 222);
+    assert.equal(knobs.limitsOutboundBytes(), 333);
+
+    withEnv({ BILI_RECEIVE_BODY_BYTES: "999", BILI_DECODED_BODY_BYTES: "888", BILI_OUTBOUND_BODY_BYTES: "777" }, () => {
+        assert.equal(knobs.limitsReceiveBytes(), 999);
+        assert.equal(knobs.limitsDecodedBytes(), 888);
+        assert.equal(knobs.limitsOutboundBytes(), 777);
+    });
+
+    // non-numeric / non-positive values resolve to the default and never throw
+    setConfig({ network: { receiveBodyBytes: "big", decodedBodyBytes: -3, outboundBodyBytes: 0 } });
+    assert.equal(knobs.limitsReceiveBytes(), 5 * 1024 * 1024 * 1024);
+    assert.equal(knobs.limitsDecodedBytes(), 10 * 1024 * 1024 * 1024);
+    assert.equal(knobs.limitsOutboundBytes(), 5 * 1024 * 1024 * 1024);
+    withEnv({ BILI_RECEIVE_BODY_BYTES: "junk" }, () => {
+        assert.equal(knobs.limitsReceiveBytes(), 5 * 1024 * 1024 * 1024);
+    });
+    clearConfig();
+});
+
 test("defaults: no env, no file", () => {
     clearConfig();
     assert.equal(knobs.upstreamTimeoutMs(), UPSTREAM_TIMEOUT_MS);
@@ -53,9 +81,10 @@ test("defaults: no env, no file", () => {
     assert.equal(knobs.exposureLogIntervalMs(), 3_600_000);
     assert.equal(knobs.streamKeepAliveMs(), 15_000);
     assert.equal(knobs.preflightHoldGraceMs(), 30_000);
-    assert.equal(knobs.preflightDeadEndCooldownMs(), 5 * 60_000);
+    // (#4079) the #726 dead-end cooldown knob was removed with the mechanism.
     assert.equal(knobs.proxyKeepAliveMaxMs(), PROXY_KEEPALIVE_MAX_MS);
     assert.equal(knobs.postResponseLingerMs(), 5_000);
+    assert.equal(knobs.allowPrivateHttpProviders(), false);
     assert.equal(knobs.mitmHandshakeTimeoutMs(), 10_000);
     assert.equal(knobs.persistEnabled(), true);
     assert.equal(knobs.persistZstdEnabled(), false);
@@ -96,9 +125,9 @@ test("file tier: every migrated block resolves from the config file", () => {
         network: {
             upstreamTimeoutMs: 60000, requestWatchdogMs: 90000, keepAliveTimeoutMs: 7000,
             clientErrorBackstopMs: 45000, exposureLogIntervalMs: 0, streamKeepAliveMs: 20000,
-            preflightHoldMs: 40000, preflightDeadEndCooldownMs: 60000, replayRetryMax: 5,
+            preflightHoldMs: 40000, replayRetryMax: 5,
             replayRetryBaseMs: 250, maxShrinkPerCompress: 0.4, proxyKeepAliveMaxMs: 60000,
-            postResponseLingerMs: 12345,
+            postResponseLingerMs: 12345, allowPrivateHttpProviders: true,
         },
         persist: { enabled: false, zstd: true, debounceMs: 900, tailTokens: 4096, epermAlertThreshold: 9, epermAlertRepeatMs: 1200 },
         sessions: { max: 64, gc: { enabled: true, maxAgeDays: 3, maxTokens: 2000000, intervalMs: 60000 } },
@@ -124,12 +153,12 @@ test("file tier: every migrated block resolves from the config file", () => {
     assert.equal(knobs.exposureLogIntervalMs(), 0);
     assert.equal(knobs.streamKeepAliveMs(), 20000);
     assert.equal(knobs.preflightHoldGraceMs(), 40000);
-    assert.equal(knobs.preflightDeadEndCooldownMs(), 60000);
     assert.equal(knobs.replayMaxAttempts(), 5);
     assert.equal(knobs.replayBaseDelayMs(), 250);
     assert.equal(knobs.maxShrinkPerCompress(), 0.4);
     assert.equal(knobs.proxyKeepAliveMaxMs(), 60000);
     assert.equal(knobs.postResponseLingerMs(), 12345);
+    assert.equal(knobs.allowPrivateHttpProviders(), true);
     assert.equal(knobs.mitmHandshakeTimeoutMs(), 1234);
     assert.equal(knobs.persistEnabled(), false);
     assert.equal(knobs.persistZstdEnabled(), true);
@@ -290,6 +319,181 @@ test("hot reload: rewriting the file between calls changes resolution", () => {
     assert.equal(knobs.streamKeepAliveMs(), 222);
     clearConfig();
     assert.equal(knobs.streamKeepAliveMs(), 15_000);
+});
+
+test("dump GC caps: default off, floors, explicit-off env wins (#2412)", () => {
+    clearConfig();
+    assert.equal(knobs.dumpGcMaxTotalBytes(), null);
+    assert.equal(knobs.dumpGcMaxAgeMs(), null);
+
+    setConfig({ diagnostics: { maxTotalBytes: 8 * 1024 * 1024, maxAgeDays: 7 } });
+    assert.equal(knobs.dumpGcMaxTotalBytes(), 8 * 1024 * 1024);
+    assert.equal(knobs.dumpGcMaxAgeMs(), 7 * 86_400_000);
+
+    // floors: 1 MiB for bytes, 1 h for age
+    setConfig({ diagnostics: { maxTotalBytes: 1024, maxAgeDays: 0.001 } });
+    assert.equal(knobs.dumpGcMaxTotalBytes(), 1 << 20);
+    assert.equal(knobs.dumpGcMaxAgeMs(), (1 / 24) * 86_400_000);
+
+    // 0/negative file values = off
+    setConfig({ diagnostics: { maxTotalBytes: 0, maxAgeDays: -3 } });
+    assert.equal(knobs.dumpGcMaxTotalBytes(), null);
+    assert.equal(knobs.dumpGcMaxAgeMs(), null);
+
+    // a SET env var always wins over the file tier — including explicit off
+    setConfig({ diagnostics: { maxTotalBytes: 8 * 1024 * 1024, maxAgeDays: 7 } });
+    withEnv({ BILI_DUMP_MAX_TOTAL_BYTES: "16777216", BILI_DUMP_MAX_AGE_DAYS: "3" }, () => {
+        assert.equal(knobs.dumpGcMaxTotalBytes(), 16777216);
+        assert.equal(knobs.dumpGcMaxAgeMs(), 3 * 86_400_000);
+    });
+    withEnv({ BILI_DUMP_MAX_TOTAL_BYTES: "0" }, () => {
+        assert.equal(knobs.dumpGcMaxTotalBytes(), null);
+    });
+    withEnv({ BILI_DUMP_MAX_TOTAL_BYTES: "garbage" }, () => {
+        assert.equal(knobs.dumpGcMaxTotalBytes(), null);
+    });
+    withEnv({ BILI_DUMP_MAX_AGE_DAYS: "-1" }, () => {
+        assert.equal(knobs.dumpGcMaxAgeMs(), null);
+    });
+    clearConfig();
+});
+
+test("sessions warm/resident budgets: file tier + env precedence (#2803)", () => {
+    clearConfig();
+    // #3050 R3 ②-0: warm set is off by default (lazy first touch) — set warmMax to opt back in
+    assert.equal(knobs.sessionWarmMax(), 0);
+    assert.equal(knobs.sessionWarmMaxBytes(), 64 * 1024 * 1024);
+    assert.equal(knobs.sessionResidentMaxBytes(), 512 * 1024 * 1024);
+
+    setConfig({ sessions: { warmMax: 3, warmMaxBytes: 123456, residentMaxBytes: 777 } });
+    assert.equal(knobs.sessionWarmMax(), 3);
+    assert.equal(knobs.sessionWarmMaxBytes(), 123456);
+    assert.equal(knobs.sessionResidentMaxBytes(), 777);
+
+    // explicit 0 is honored (warm nothing / zero budget) — not swallowed by `|| default`
+    setConfig({ sessions: { warmMax: 0, warmMaxBytes: 0, residentMaxBytes: 0 } });
+    assert.equal(knobs.sessionWarmMax(), 0);
+    assert.equal(knobs.sessionWarmMaxBytes(), 0);
+    assert.equal(knobs.sessionResidentMaxBytes(), 0);
+
+    // garbage / negative file values fall back to the defaults
+    setConfig({ sessions: { warmMax: -2, warmMaxBytes: "big", residentMaxBytes: -1 } });
+    assert.equal(knobs.sessionWarmMax(), 0);
+    assert.equal(knobs.sessionWarmMaxBytes(), 64 * 1024 * 1024);
+    assert.equal(knobs.sessionResidentMaxBytes(), 512 * 1024 * 1024);
+
+    withEnv({ BILI_SESSION_WARM_MAX: "5", BILI_SESSION_WARM_MAX_BYTES: "999", BILI_SESSION_RESIDENT_MAX_BYTES: "42" }, () => {
+        assert.equal(knobs.sessionWarmMax(), 5);
+        assert.equal(knobs.sessionWarmMaxBytes(), 999);
+        assert.equal(knobs.sessionResidentMaxBytes(), 42);
+    });
+    withEnv({ BILI_SESSION_WARM_MAX: "garbage" }, () => {
+        assert.equal(knobs.sessionWarmMax(), 0);
+    });
+    clearConfig();
+});
+
+test("#2984 allowPrivateHttpProviders: positive env judgment, file tier, env wins", () => {
+    clearConfig();
+    assert.equal(knobs.allowPrivateHttpProviders(), false, "default off");
+    setConfig({ network: { allowPrivateHttpProviders: true } });
+    assert.equal(knobs.allowPrivateHttpProviders(), true, "file tier");
+    withEnv({ BILI_ALLOW_PRIVATE_HTTP_PROVIDERS: "0" }, () => {
+        assert.equal(knobs.allowPrivateHttpProviders(), false, "set env owns the knob: explicit off beats file on");
+    });
+    withEnv({ BILI_ALLOW_PRIVATE_HTTP_PROVIDERS: "true" }, () => {
+        assert.equal(knobs.allowPrivateHttpProviders(), true);
+    });
+    setConfig({});
+    withEnv({ BILI_ALLOW_PRIVATE_HTTP_PROVIDERS: "yes" }, () => {
+        assert.equal(knobs.allowPrivateHttpProviders(), false, "only 1/true enable — garbage env is off");
+    });
+    clearConfig();
+});
+
+test("#3331 guardrail knobs: bash-timeout default 60 (#3066 anti-hang), file tier, env wins; 0 disables; cap/repetition defaults on", () => {
+    clearConfig();
+    assert.equal(knobs.guardrailBashTimeout(), 60, "default 60s — #3066 owner intent, unsupervised bash hung pi sessions");
+    assert.equal(knobs.guardrailMaxOutputBytes(), 50_000, "default cap 50KB");
+    assert.equal(knobs.guardrailRepetition(), true, "loop-breaker default on");
+
+    setConfig({ guardrails: { bashTimeout: 45, maxOutputBytes: 12345, repetition: false } });
+    assert.equal(knobs.guardrailBashTimeout(), 45, "file tier");
+    assert.equal(knobs.guardrailMaxOutputBytes(), 12345, "file tier");
+    assert.equal(knobs.guardrailRepetition(), false, "file tier");
+
+    withEnv({ BILI_GUARDRAIL_BASH_TIMEOUT: "120" }, () => {
+        assert.equal(knobs.guardrailBashTimeout(), 120, "env wins");
+    });
+    withEnv({ BILI_GUARDRAIL_BASH_TIMEOUT: "0" }, () => {
+        assert.equal(knobs.guardrailBashTimeout(), undefined, "0 = off (pi-native), even with the file tier on");
+    });
+    withEnv({ BILI_GUARDRAIL_MAX_OUTPUT_BYTES: "0" }, () => {
+        assert.equal(knobs.guardrailMaxOutputBytes(), undefined, "0 disables the cap");
+    });
+    withEnv({ BILI_GUARDRAIL_REPETITION: "0" }, () => {
+        assert.equal(knobs.guardrailRepetition(), false, "env off beats file off/on alike");
+    });
+    clearConfig();
+});
+
+test("#3406 text-run threshold knob: default 200 (#3260 parity), file tier, env wins; 0 disables", () => {
+    clearConfig();
+    assert.equal(knobs.guardrailTextRunThreshold(), 200, "default 200 — unchanged from the pre-knob constant");
+    assert.equal(knobs.DEFAULT_TEXT_RUN_THRESHOLD, 200, "exported default pins the documented 200");
+
+    setConfig({ guardrails: { textRunThreshold: 500 } });
+    assert.equal(knobs.guardrailTextRunThreshold(), 500, "file tier");
+
+    withEnv({ BILI_GUARDRAIL_TEXT_RUN_THRESHOLD: "1000" }, () => {
+        assert.equal(knobs.guardrailTextRunThreshold(), 1000, "env wins over the file tier");
+    });
+    withEnv({ BILI_GUARDRAIL_TEXT_RUN_THRESHOLD: "250.9" }, () => {
+        assert.equal(knobs.guardrailTextRunThreshold(), 250, "fractional floors");
+    });
+    withEnv({ BILI_GUARDRAIL_TEXT_RUN_THRESHOLD: "0" }, () => {
+        assert.equal(knobs.guardrailTextRunThreshold(), 0, "0 = lane off, even with the file tier set");
+    });
+    withEnv({ BILI_GUARDRAIL_TEXT_RUN_THRESHOLD: "-5" }, () => {
+        assert.equal(knobs.guardrailTextRunThreshold(), 0, "negative = off (same convention as bashTimeout)");
+    });
+    withEnv({ BILI_GUARDRAIL_TEXT_RUN_THRESHOLD: "garbage" }, () => {
+        assert.equal(knobs.guardrailTextRunThreshold(), 200, "garbage env falls back to the default, not off");
+    });
+    setConfig({ guardrails: { textRunThreshold: 0 } });
+    assert.equal(knobs.guardrailTextRunThreshold(), 0, "file tier 0 disables too");
+    setConfig({ guardrails: { textRunThreshold: "big" } });
+    assert.equal(knobs.guardrailTextRunThreshold(), 200, "garbage file value falls back to the default");
+    clearConfig();
+});
+
+test("#3619 stagger knobs: undefined default (caller composes), ms file tier, duration STRINGS in the file tier, env raw ms", () => {
+    clearConfig();
+    assert.equal(knobs.updateStaggerMinDelayMs(), undefined, "no local setting — caller composes remote+builtin");
+    assert.equal(knobs.updateStaggerMaxDelayMs(), undefined);
+
+    setConfig({ update: { staggerMinDelayMs: 900_000, staggerMaxDelayMs: 43_200_000 } });
+    assert.equal(knobs.updateStaggerMinDelayMs(), 900_000, "numeric file tier = raw ms");
+    assert.equal(knobs.updateStaggerMaxDelayMs(), 43_200_000);
+
+    setConfig({ update: { staggerMinDelayMs: "15m", staggerMaxDelayMs: "12h" } });
+    assert.equal(knobs.updateStaggerMinDelayMs(), 900_000, "string file tier parsed (#3619)");
+    assert.equal(knobs.updateStaggerMaxDelayMs(), 43_200_000);
+
+    setConfig({ update: { staggerMinDelayMs: "1d12h", staggerMaxDelayMs: "2d" } });
+    assert.equal(knobs.updateStaggerMinDelayMs(), 129_600_000, "combined segments");
+
+    withEnv({ BILI_UPDATE_STAGGER_MIN_MS: "0" }, () => {
+        assert.equal(knobs.updateStaggerMinDelayMs(), 0, "env 0 wins over the file tier (legacy immediate)");
+    });
+    withEnv({ BILI_UPDATE_STAGGER_MIN_MS: "not-a-number" }, () => {
+        assert.equal(knobs.updateStaggerMinDelayMs(), undefined, "garbage env = not set (env tier stays raw ms)");
+    });
+    setConfig({ update: { staggerMinDelayMs: "garbage" } });
+    assert.equal(knobs.updateStaggerMinDelayMs(), undefined, "garbage file value = not set, never guessed");
+    setConfig({ update: { staggerMinDelayMs: 0 } });
+    assert.equal(knobs.updateStaggerMinDelayMs(), 0, "file tier 0 is a valid explicit opt-out");
+    clearConfig();
 });
 
 test("teardown", () => {

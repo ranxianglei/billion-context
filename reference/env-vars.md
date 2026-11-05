@@ -13,6 +13,12 @@ precisely so knobs don't bloat the environment. Precedence everywhere:
 **env var > config file > built-in default**, resolved in exactly one place
 (`src/knobs.ts`).
 
+> **Lifecycle vs. existence.** This file governs whether a knob MAY be an env var.
+> Whether an existing one is TEMPORARY (a cap / kill-switch / experiment with a
+> release condition) is tracked in [`LIFECYCLE.md`](../LIFECYCLE.md) (#3249) —
+> every `BILI_*` read in `src/` must be registered there; CI enforces it via
+> `scripts/lifecycle-ledger-guard.mjs`.
+
 ## Where a knob lives
 
 | Category | Home | Examples |
@@ -63,5 +69,34 @@ precisely so knobs don't bloat the environment. Precedence everywhere:
   `compress` hierarchy. `imageBilling`/`imageTokenCap`, which DO have
   provider/model tiers, remain in the providers table.
 - **Precedence contract pinned by test:** `tests/knobs-config-precedence.test.ts`
-  asserts env > file > default, set-garbage-env byte-exactness, and hot-reload
-  of the file tier.
+   asserts env > file > default, set-garbage-env byte-exactness, and hot-reload
+   of the file tier.
+
+## Test-infra escape hatches (scripts/-only, never product knobs)
+
+A small class of env vars exists purely for the local test harness — read by
+`scripts/*`, NEVER by `src/` or `src/knobs.ts`, and therefore NOT config-file
+knobs. They carry no provider/model dimension, are never shipped behavior, and
+stay OUT of CONFIGURATION.md (that surface is for user-facing knobs). They are
+documented HERE instead so the discipline ("document or don't ship") still
+holds without polluting the product config surface.
+
+| Var | Read by | Effect | Default |
+|-----|---------|--------|---------|
+| `BILI_TEST_FORCE` | `scripts/test-suite-lock.mjs` only | Set to `1`/`true`/`yes` to deliberately bypass the per-machine test-suite mutex (#3103) and let a second full `npm test` run share the machine with a live one. Untyped escape hatch for the known limitation the lock cannot cover (orphan daemons from a SIGKILLed suite, cross-clone contention); a normal single run never sets it. | unset = lock enforced |
+| `BILI_TEST_LEAK_GUARD` | `scripts/test-suite-lock.mjs` only | Set to `0`/`false`/`no`/`off` to disable the #5107 leak guard (the post-run diff of the PRODUCTION sessions dir that fails `npm test` when NEW files appeared). The guard is ON by default; this is its false-positive door — a live bili instance starting a brand-new session during a long local run looks like a leak. A normal single run never sets it. | unset = guard enforced |
+
+`BILI_TEST_FORCE` is the escape door the suite lock points at when a sibling
+run is detected (`[bili:test] a test suite is already running … to proceed
+anyway: BILI_TEST_FORCE=1 npm test`). Because it changes nothing about a
+single-run's behavior and is invisible to production code, it needs neither a
+config tier nor owner-gated config-surface review — only this one-line entry.
+
+`BILI_TEST_LEAK_GUARD` is the same class for the #5107 leak guard: the
+wrapper snapshots the real sessions tree before the run and diffs after —
+NEW files fail the suite (a test escaped hermetic isolation), modified
+pre-existing files only warn (a concurrently live instance can touch them).
+The paired mechanism that makes the guard rarely fire is
+`tests/preload-test-env.mjs`, which redirects every test process' ambient
+data roots (`BILI_SESSIONS_DIR`, `BILI_CONFIG_FILE`, all four XDG homes) to a
+per-process temp root — see reference/testing.md.

@@ -275,7 +275,7 @@ export async function gcSessionFiles(opts?: { dir?: string; store?: SessionStore
         result.removed++;
         result.bytesFreed += st.size;
         deletedSessions.add(file);
-        // #1995 review ②: the stripImages restore spill tree
+        // #1995 review ②: the image-restore spill tree
         // (<state>/retrieve/img/<sessionId>/) shares this session's lifecycle —
         // refs are per-session, so once the file is gone the spills are
         // unreachable. Co-delete; anything this deterministic path misses (null

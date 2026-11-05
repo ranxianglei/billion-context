@@ -23,12 +23,16 @@ import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 
 test("clampOutputBudget: reduces an oversized request so input+output fits", () => {
     // window 262144, input ~130k, requested 131072 (the #453 repro shape).
+    // #5278: judged on the safety-inflated estimate (x1.12) so an understating
+    // estimator cannot eat the margin.
     const capped = clampOutputBudget(131_072, 130_000, 262_144);
     assert.ok(capped !== undefined, "must clamp");
-    const margin = Math.max(2048, Math.ceil(130_000 * 0.05));
-    assert.equal(capped, 262_144 - 130_000 - margin, "cap = window - input - margin");
+    const safeEst = Math.ceil(130_000 * 1.12);
+    const margin = Math.max(2048, Math.ceil(safeEst * 0.05));
+    assert.equal(capped, 262_144 - safeEst - margin, "cap = window - safe estimate - margin");
     assert.ok(capped < 131_072, "clamped below the requested budget");
-    assert.ok((capped ?? 0) + 130_000 <= 262_144, "input + clamped output never exceeds the window");
+    // teeth for the #5278 failure mode: even a 5%-understated real input fits.
+    assert.ok((capped ?? 0) + Math.ceil(130_000 * 1.05) <= 262_144, "understated input + clamped output never exceeds the window");
 });
 
 test("clampOutputBudget: no-op when the request already fits", () => {
@@ -57,7 +61,7 @@ test("estimateInputTokens: counts system + tools on turn 1 (lastInputTokens=0)",
     assert.ok(withSystem > 900, "a 4000-char system contributes ~1000 tokens");
 });
 
-function mkNudge(over: Partial<Pick<NudgeDecision, "shouldInject" | "contextUsage" | "compressibleRanges">> = {}): NudgeDecision {
+function mkNudge(over: Partial<Pick<NudgeDecision, "shouldInject" | "contextUsage" | "compressibleRanges" | "breakdown">> = {}): NudgeDecision {
     const breakdown = { usage: 0, growth: 0, growthReference: 0, effectiveThreshold: 0, nudgeGrowthTokens: 0, growthFloor: 0, hasPendingNudge: 0, overLimit: 0, emergencyOverride: 0, pendingT1: 0, pendingT2: 0, pendingT3: 0, maxPending: 0 };
     return { shouldInject: false, reason: "test", compressibleRanges: [], contextUsage: 0, tier: null, breakdown, ...over };
 }
@@ -116,6 +120,52 @@ test("emergencyNudge: minCompressRange 0 (default) keeps the legacy any-non-empt
     assert.equal(emergencyNudge(mkNudge({ contextUsage: 0.75, compressibleRanges: subThreshold })), true, "no third arg = old behavior");
     assert.equal(emergencyNudge(mkNudge({ contextUsage: 0.75, compressibleRanges: subThreshold }), undefined, 0), true, "explicit 0 = old behavior");
     assert.equal(emergencyNudge(mkNudge({ contextUsage: 0.99 })), false, "empty list still never overrides");
+});
+
+// #3006: the escalation line sits INSIDE the kernel's non-pressure band (below
+// its 75% over-limit line), where the kernel's refusal grounds are cadence/mass,
+// not benefit. The override must additionally honor the kernel's own
+// minimum-benefit floor (breakdown.maxPending vs breakdown.minPressureBenefit —
+// the pair its pressure branch compares, #198): otherwise near-boundary
+// sessions fold in zero-yield loops, each sub-benefit fold rewriting the prefix
+// (cache miss) while reclaiming almost nothing. Fixtures mirror the issue's
+// suggested regression cases.
+function bd(over: Record<string, number> = {}): NudgeDecision["breakdown"] {
+    return { usage: 0, growth: 0, growthReference: 0, effectiveThreshold: 0, nudgeGrowthTokens: 50000, growthFloor: 22500, hasPendingNudge: 0, overLimit: 0, emergencyOverride: 0, pendingT1: 0, pendingT2: 0, pendingT3: 0, maxPending: 0, ...over };
+}
+
+test("emergencyNudge: #3006 case 1 — hovering at 70–74% with sub-benefit mass never forces a fold", () => {
+    // the confirmed event shape: usage 80651/114688 (70%), one executable
+    // range, maxPending 4760 below the default floor max(5000, 1% of window).
+    assert.equal(emergencyNudge(mkNudge({ contextUsage: 0.703, compressibleRanges: executable, breakdown: bd({ maxPending: 4760, minPressureBenefit: 5000 }) }), undefined, 5000), false);
+});
+
+test("emergencyNudge: #3006 case 2 — over-limit min-benefit suppression is never overridden either", () => {
+    // usage past the kernel's 75% pressure line; the kernel refused there with
+    // "max pending 4941 < min benefit 5000". The host line must not resurrect
+    // the very fold the kernel's strongest band declined.
+    assert.equal(emergencyNudge(mkNudge({ contextUsage: 0.76, compressibleRanges: executable, breakdown: bd({ maxPending: 4941, minPressureBenefit: 5000 }) }), undefined, 5000), false);
+});
+
+test("emergencyNudge: #3006 case 3 — repeated boundary hover stays silent until real mass accumulates", () => {
+    const hover = mkNudge({ contextUsage: 0.71, compressibleRanges: executable, breakdown: bd({ maxPending: 4200, minPressureBenefit: 5000 }) });
+    for (let i = 0; i < 5; i++) assert.equal(emergencyNudge(hover, undefined, 5000), false, `hover turn ${i}: sub-benefit mass, no injection`);
+    // once the largest executable range crosses the benefit floor the rescue fires again:
+    assert.equal(emergencyNudge(mkNudge({ contextUsage: 0.71, compressibleRanges: executable, breakdown: bd({ maxPending: 5000, minPressureBenefit: 5000 }) }), undefined, 5000), true, "at the floor (kernel uses >=)");
+    assert.equal(emergencyNudge(mkNudge({ contextUsage: 0.71, compressibleRanges: executable, breakdown: bd({ maxPending: 6000, minPressureBenefit: 5000 }) }), undefined, 5000), true, "above the floor");
+});
+
+test("emergencyNudge: #3006 case 4 — genuine near-window protection stays intact", () => {
+    // 99% usage with real foldable mass: the override still forces the nudge.
+    assert.equal(emergencyNudge(mkNudge({ contextUsage: 0.99, compressibleRanges: executable, breakdown: bd({ maxPending: 20000, minPressureBenefit: 5000 }) }), undefined, 5000), true);
+    // scaled floor on a big window (max(5000, 1% x limit)): 1M window => 10k.
+    assert.equal(emergencyNudge(mkNudge({ contextUsage: 0.99, compressibleRanges: executable, breakdown: bd({ maxPending: 8000, minPressureBenefit: 10000 }) }), undefined, 5000), false, "below the scaled floor");
+    assert.equal(emergencyNudge(mkNudge({ contextUsage: 0.99, compressibleRanges: executable, breakdown: bd({ maxPending: 10000, minPressureBenefit: 10000 }) }), undefined, 5000), true);
+});
+
+test("emergencyNudge: #3006 — hand-built decisions without breakdown fields keep the pre-fix semantics", () => {
+    // mkNudge's default breakdown lacks minPressureBenefit: legacy fallback.
+    assert.equal(emergencyNudge(mkNudge({ contextUsage: 0.75, compressibleRanges: executable })), true);
 });
 
 // ---- integration: real proxy + upstream -------------------------------------
@@ -181,8 +231,10 @@ async function drive(o: DriveOpts): Promise<{ turn2Body: Record<string, unknown>
         return { turn2Body, turn2MessageCount: ((turn2Body.messages ?? []) as unknown[]).length };
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 }

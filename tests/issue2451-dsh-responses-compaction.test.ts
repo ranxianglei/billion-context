@@ -143,8 +143,10 @@ async function startHarness(modelFold = false): Promise<Harness> {
         bodies,
         close: async () => {
             proxy.close();
+            proxy.closeIdleConnections?.();
             await once(proxy, "close");
             upstream.close();
+            upstream.closeIdleConnections?.();
             await once(upstream, "close");
         },
     };
@@ -208,7 +210,8 @@ test("e2e #2451: dsh replaying [checkpoint, retained tail] on /v1/responses reba
         const s = dshSession(conv)!;
         assert.equal((s.state.blocks ?? []).filter((b) => b.active).length, 0, "no active blocks survive the rebase");
         assert.equal((s.state.blocks ?? []).length, 0, "block list is empty after the boundary reset");
-        assert.equal(Object.keys(s.state.messageRefs.byRaw).length, 3, "refs were re-seeded onto exactly the compacted view (checkpoint + 2 retained)");
+        // #2592/F5: 3 re-seeded entries + the pinned ref floor.
+        assert.equal(Object.keys(s.state.messageRefs.byRaw).length, 4, "refs were re-seeded onto exactly the compacted view (checkpoint + 2 retained + ref-floor)");
         assert.ok(s.metadata.nativeCompactionBoundary, "native-compaction boundary is recorded");
         assert.equal((s.metadata.nativeCompactionBoundary as { pendingRebase?: boolean }).pendingRebase, false, "rebase consumed within the same request");
         assert.ok(s.metadata.nativeCompactionAt, "nativeCompactionAt recorded by the reset");
@@ -230,7 +233,7 @@ test("e2e #2451: dsh replaying [checkpoint, retained tail] on /v1/responses reba
         assert.equal(r2.status, 200, "post-compaction turn succeeds");
         await r2.text();
         const s2 = dshSession(conv)!;
-        assert.equal(Object.keys(s2.state.messageRefs.byRaw).length, 4, "refs accumulate append-only after the rebase");
+        assert.equal(Object.keys(s2.state.messageRefs.byRaw).length, 5, "refs accumulate append-only after the rebase");
     } finally {
         await h.close();
     }
@@ -290,7 +293,7 @@ test("negative #2451: decimated checkpoint replay on a session that was NEVER ds
         await r.text();
         const s = listSessions().find((x) => x.meta.label === conv)!;
         assert.ok(s.metadata.nativeCompactionBoundary === undefined, "no boundary recorded without the dsh binding");
-        assert.ok(Object.keys(s.state.messageRefs.byRaw).length > 3, `ref map not re-seeded (got ${Object.keys(s.state.messageRefs.byRaw).length} ids — a rebase would leave exactly 3)`);
+        assert.ok(Object.keys(s.state.messageRefs.byRaw).length > 4, `ref map not re-seeded (got ${Object.keys(s.state.messageRefs.byRaw).length} ids — a rebase would leave exactly 4)`);
     } finally {
         await h.close();
     }

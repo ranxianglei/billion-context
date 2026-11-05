@@ -11,8 +11,14 @@
  *   bili start --config FILE      path to config file (default: XDG)
  *   bili start --passthrough      forward without compression
  *   bili pi/codex/claude/omp [args]   start a proxy + launch a client via cert-MITM
+ *   bili -i pi                     launch pi on the IN-PROCESS engine (≡ bili pi-inline)
+ *   bili -s pi                     force the proxy posture: spawn/attach, never inline
  *   bili export [id] [--full]     export a persisted session as a handoff doc
+ *                                  (--jsonl: deterministic JSONL dump #2671)
  *   bili acp-cache diff <dir>     attribute cache breaks from ACP_DUMP_BODY dumps
+ *   bili sessions ls|rm|archive|restore [id]   manage persisted sessions
+ *   bili storage gc [--days N]    run the storage sweep now (--dry-run plans only)
+ *   bili pack install <spec>      install a custom compress prompt pack from npm (#5319)
  *   bili test pi                  non-polluting pi smoke test
  *   bili --version
  *   bili --help
@@ -22,20 +28,29 @@
  * — flags are just convenient overrides).
  */
 import { loadOptions, ensureConfigTemplate } from "./config.js";
-import { startServer } from "./server.js";
+import { startServer, restartForceCloseOf } from "./server.js";
+import { serveStartupFailurePage } from "./startup-failure-page.js";
+import { ensureSqliteEngine } from "./storage/engine-bootstrap.js";
+import { recordEngineBootstrap } from "./storage/runtime-status.js";
 import { configFile as defaultConfigFile } from "./paths.js";
 import { log as loggerLog } from "./logger.js";
 import { createAutoRestartHandler } from "./restart.js";
 import { checkForUpdate, startAutoUpdate } from "./update.js";
-import { startAdvisoryWatcher, getAdvisoryState, advisoryDeferring, advisoryBlocksVersion } from "./advisory.js";
+import { registerUpdateActions } from "./server/update-actions.js";
+import { startAdvisoryWatcher, getAdvisoryState, advisoryDeferring, advisoryBlocksVersion, advisoryAwaitingFirstCheck } from "./advisory.js";
 import { startReleaseNotesWatcher } from "./update-notes.js";
+import { startRemoteNoticesWatcher } from "./remote-notices.js";
+import { hydrateNoticeReceipts } from "./notice-store.js";
 import { resolveProxy } from "./upstream-proxy.js";
 import { runMcpStdio } from "./mcp.js";
 import { PLUGIN_AGENTS, isPluginAgent, pluginInstall, pluginRemove, pluginStatusAll, pluginUpdate, renderPluginList, warnActivePluginSessions, type PluginAgent } from "./plugin-install.js";
 import { runLaunch, runTestPi, isLaunchClient, type ClientName } from "./launcher.js";
 import { exportSession } from "./export.js";
+import { runSessionsCommand, runStorageGcCommand } from "./storage-maintenance.js";
+import { installPackFromNpm, removePackFile } from "./pack-install.js";
+import { listResolvedPacks } from "./compress-settings.js";
 import { renderJson, renderText, runDiff } from "./acp-cache-diff.js";
-import { renderDoctorReport, runDoctor } from "./doctor.js";
+import { fixDshLedgers, renderDoctorReport, renderLedgerFixReport, runDoctor } from "./doctor.js";
 import { VERSION, PACKAGE_NAME, BUILD_COMMIT } from "./version.js";
 
 const HELP = `bili ${VERSION} — billion-context proxy
@@ -44,6 +59,8 @@ Usage:
   bili [start] [options]           start the proxy (default: reads ${defaultConfigFile()})
   bili pi [opts --] [args]         start a proxy + launch pi against it (cert-MITM)
   bili pi-test [opts --] [args]    like bili pi but injects --no-extensions (clean test)
+  bili pi-inline [opts --] [args]  launch pi on the in-process engine — no proxy at all (BILI_PI_INLINE)
+  bili opencode-inline [opts --] [args]  launch opencode on the in-process engine — no proxy at all (BILI_OPENCODE_INLINE)
   bili codex [opts --] [args]      start a proxy + launch codex against it (cert-MITM)
   bili claude [opts --] [args]     start a proxy + launch claude against it (cert-MITM)
   bili omp [opts --] [args]        start a proxy + launch omp against it (cert-MITM)
@@ -62,13 +79,38 @@ Usage:
   bili mcode [opts --] [args]      start a proxy + launch MiniMax Code against it (cert-MITM)
   bili aider [opts --] [args]      start a proxy + launch aider against it (cert-MITM)
   bili copilot [opts --] [args]    start a proxy + launch Copilot CLI against it (cert-MITM)
+  bili kiro [opts --] [args]       start a proxy + launch Kiro CLI (kiro-cli) against it (cert-MITM)
   bili amp [opts --] [args]        start a proxy + launch Amp against it (cert-MITM)
   bili crush [opts --] [args]      start a proxy + launch Crush against it (cert-MITM)
   bili zed [opts --] [args]        start a proxy + launch the Zed editor against it (cert-MITM)
   bili goose [opts --] [args]      start a proxy + launch Goose against it (base-URL redirect)
   bili test pi                     non-polluting pi smoke test through the proxy
   bili export [session] [--full]   list sessions / export one as a Markdown handoff
-                                    (--full includes original messages; --output FILE)
+                                    (--full includes original messages; --output FILE;
+                                    --jsonl renders a deterministic JSONL dump from the
+                                    unified tables, falling back to the legacy tail)
+  bili sessions ls                  list persisted sessions: id, label, size (decoded
+                                    bytes), last-updated, storage status (active/archived)
+  bili sessions rm <id>             delete one session outright — files + index.db rows,
+                                    shared-content refs released; VACUUMs afterwards
+                                    (--no-vacuum skips the shrink)
+  bili sessions archive <id>        move one session out of index.db into the single
+                                    append-only archive log (rows swept, restorable)
+   bili sessions restore <id>        bring an archived session back into index.db
+   bili sessions foreign-blocks      list fold blocks whose covered messages never
+                                     belonged to their session's transcript (dry-run;
+                                     --apply reversibly archives them, --restore
+                                     <sid>:<bid> brings one back). Catches legacy
+                                     cross-session fold blocks that linger after upgrade
+   bili storage gc                   run the storage sweep now (#3911): archive sessions
+                                    older than storage.archiveAfterDays (default 365),
+                                    release unreferenced content, shrink index.db
+                                    (--days N overrides the age; --vacuum full|incremental;
+                                    prints the sweep plan first, --dry-run stops there)
+  bili pack install <npm-spec>     npm-install a custom compress prompt pack
+  bili pack list / remove <name>   list resolvable packs / delete a local pack file
+                                   (--project targets ./.billion-context/packs/ instead;
+                                    install also accepts --force to replace an existing pack)
   bili acp-cache diff <dir>        offline prefix-diff attribution over ACP_DUMP_BODY
                                    dumps: pairs adjacent requests per session and classifies
                                    each (pure-append / mid-stream-rewrite / prefix-stable-miss);
@@ -77,7 +119,10 @@ Usage:
   bili update                      check for & install a newer version now
   bili doctor                      audit every install lane: versions, owners,
                                     freshness vs registry, running proxy processes
-                                    (read-only; --json for machine-readable output)
+                                    (read-only; --json for machine-readable output);
+                                    --fix converges drifted dsh-profile ledgers
+                                    (manifest/lockfile/copy) to the on-disk copy
+                                    and prints every change it makes
   bili plugin install <agent>      install the thin plugin into a host (pi/omp/
                                     claude/codex/opencode/dsh/kimi; original backed up once)
                                     --with-mcp (opencode only) also adds the mcp.bili
@@ -95,18 +140,20 @@ Usage:
   bili --version                   print version
   bili --help                      show this help
 
-Launcher (bili pi / bili codex / bili claude / bili omp / bili opencode / bili hermes / bili dsh / bili codebuddy / bili qoder / bili trae / bili jcode / bili kimi / bili gemini / bili iflow / bili qwen / bili antigravity / bili mcode / bili aider / bili copilot / bili amp / bili crush / bili zed / bili goose):
+Launcher (bili pi / bili codex / bili claude / bili omp / bili opencode / bili hermes / bili dsh / bili codebuddy / bili qoder / bili trae / bili jcode / bili kimi / bili gemini / bili iflow / bili qwen / bili antigravity / bili mcode / bili aider / bili copilot / bili amp / bili crush / bili zed / bili goose / bili kiro):
   Brings up a proxy on an independent port (a fresh instance every launch), then runs the client pointed at it via HTTPS_PROXY + the proxy's
   MITM CA — no config-file edits. Discovered HTTPS upstream domains are
   auto-whitelisted for MITM so the proxy TLS-terminates exactly the hosts the
   client uses; HTTP / localhost providers go direct. pi/claude/qoder trust the CA
-  via NODE_EXTRA_CA_CERTS, codex/trae/jcode/aider/copilot/amp/crush/zed via SSL_CERT_FILE
+  via NODE_EXTRA_CA_CERTS, codex/trae/jcode/aider/copilot/amp/crush/zed via SSL_CERT_FILE, kiro via both
   (aider also REQUESTS_CA_BUNDLE). Goose trusts neither (rustls), so it is redirected per-endpoint instead. Proxy killed on client exit.
   bili flags (-F, --mitm-domain, --port, ...) must precede the client name;
   everything after the client name is passed through to the client.
     bili pi                               # launch pi through the proxy
     bili pi -- print "hi"                 # args after the client are passed through
     bili pi-test                          # pi through the proxy with extensions off (proxy owns compression)
+    bili pi-inline                        # pi with the in-process engine — no proxy, no MITM certs
+    bili opencode-inline                  # opencode with the in-process engine — no proxy, no MITM certs
     bili codex                            # launch codex through the proxy
     bili claude                           # launch claude through the proxy
     bili omp                              # launch omp through the proxy (pi-based; /bili/ rewrite)
@@ -120,10 +167,11 @@ Launcher (bili pi / bili codex / bili claude / bili omp / bili opencode / bili h
     bili gemini                           # launch Gemini CLI through the proxy (GOOGLE_GEMINI_BASE_URL /bili/ rewrite; API-key & gateway auth)
     bili iflow                            # launch iFlow CLI through the proxy (IFLOW_BASE_URL /bili/ rewrite of apis.iflow.cn/v1)
     bili qwen                             # launch Qwen Code through the proxy (cert-MITM; DashScope/Qwen gateways whitelisted by default, custom relays via --mitm-domain)
-    bili antigravity                      # launch Antigravity CLI (agy) through the proxy (CLOUD_CODE_URL /bili/ rewrite of cloudcode-pa.googleapis.com)
+    bili antigravity                      # launch Antigravity CLI (agy) through the proxy (CLOUD_CODE_URL /bili/ rewrite of daily-cloudcode-pa.googleapis.com — real default upstream, #3129)
     bili mcode                            # launch MiniMax Code through the proxy (cert-MITM; provider hosts from ~/.minimax*/config.yaml or the official agent.minimax.* endpoints)
     bili aider                            # launch aider through the proxy (cert-MITM; endpoint from OPENAI_API_BASE/--openai-api-base/.aider.conf.yml or api.openai.com+api.anthropic.com by default)
     bili copilot                          # launch Copilot CLI through the proxy (cert-MITM; api.githubcopilot.com + plan subdomains whitelisted by default)
+    bili kiro                             # launch Kiro CLI through the proxy (cert-MITM; runtime.<region>.kiro.dev model gateways whitelisted; developer/system roles re-voiced as user)
     bili amp                              # launch Amp through the proxy (cert-MITM; ampcode.com whitelisted by default)
     bili crush                            # launch Crush through the proxy (cert-MITM; api.anthropic.com/api.openai.com/openrouter.ai + crush.json base_urls whitelisted)
     bili zed                              # launch the Zed editor through the proxy (cert-MITM; built-in provider hosts + settings.json api_urls whitelisted; Linux TLS env)
@@ -133,6 +181,10 @@ Launcher (bili pi / bili codex / bili claude / bili omp / bili opencode / bili h
     bili -F http://127.0.0.1:7897 codex   # route bili's upstream through a proxy (gost-style -F)
 
 Options (override config file / env):
+  -i, --inline                     run the client's compression IN-PROCESS (pi/opencode;
+                                   same as "bili pi-inline"; must precede the client name)
+  -s, --server                     force the proxy posture — spawn/attach, never inline
+                                   (pi/opencode; overrides an inherited BILI_PI_INLINE=1)
   -F <url>                         upstream proxy to forward through (gost-style;
                                    http://host:port; must precede the client name)
   --port <N>                       listen port (start: 8787; launcher default: random free port)
@@ -153,7 +205,7 @@ Docs: https://github.com/ranxianglei/billion-context
 `;
 
 type Parsed = {
-    command: "start" | "update" | "doctor" | "help" | "version" | "launch" | "test" | "export" | "plugin-register" | "mcp" | "plugin" | "acp-cache";
+    command: "start" | "update" | "doctor" | "help" | "version" | "launch" | "test" | "export" | "plugin-register" | "mcp" | "plugin" | "acp-cache" | "sessions" | "storage" | "pack";
     client?: ClientName;
     clientArgs: string[];
     mitmDomains: string[];
@@ -161,16 +213,30 @@ type Parsed = {
     exportSelector?: string;
     exportOutput?: string;
     exportFull?: boolean;
+    exportJsonl?: boolean;
     registerConversationId?: string;
     pluginAction?: "install" | "remove" | "update" | "list";
     pluginAgent?: PluginAgent;
     pluginWithMcp?: boolean;
+    packAction?: "install" | "remove" | "list";
+    packSpec?: string;
+    packProject?: boolean;
+    packForce?: boolean;
     acpCacheDir?: string;
     acpCacheLog?: string;
     acpCacheNoLog?: boolean;
     acpCacheSession?: string;
+    sessionsSub?: "ls" | "rm" | "archive" | "restore" | "foreign-blocks";
+    sessionsTarget?: string;
+    sessionsNoVacuum?: boolean;
+    sessionsApply?: boolean;
+    sessionsRestoreTarget?: string;
+    storageDays?: number;
+    storageVacuum?: "full" | "incremental";
+    storageDryRun?: boolean;
     jsonOutput?: boolean;
     doctorJson?: boolean;
+    doctorFix?: boolean;
 };
 
 export function parseArgs(argv: string[]): Parsed {
@@ -179,20 +245,35 @@ export function parseArgs(argv: string[]): Parsed {
     const positional: string[] = [];
     let client: ClientName | undefined;
     let clientArgs: string[] = [];
+    let posture: "inline" | "server" | undefined;
     const mitmDomains: string[] = [];
     let exportSelector: string | undefined;
     let registerConversationId: string | undefined;
     let exportOutput: string | undefined;
     let exportFull = false;
+    let exportJsonl = false;
     let pluginAction: Parsed["pluginAction"];
     let pluginAgent: Parsed["pluginAgent"];
     let pluginWithMcp = false;
+    let packAction: Parsed["packAction"];
+    let packSpec: string | undefined;
+    let packProject = false;
+    let packForce = false;
     let acpCacheDir: string | undefined;
     let acpCacheLog: string | undefined;
     let acpCacheNoLog = false;
     let acpCacheSession: string | undefined;
+    let sessionsSub: Parsed["sessionsSub"];
+    let sessionsTarget: string | undefined;
+    let sessionsNoVacuum = false;
+    let sessionsApply = false;
+    let sessionsRestoreTarget: string | undefined;
+    let storageDays: number | undefined;
+    let storageVacuum: Parsed["storageVacuum"];
+    let storageDryRun = false;
     let jsonOutput = false;
     let doctorJson = false;
+    let doctorFix = false;
 
     for (let i = 0; i < argv.length; i++) {
         const a = argv[i]!;
@@ -213,6 +294,22 @@ export function parseArgs(argv: string[]): Parsed {
             case "--version":
             case "-V":
                 command = "version";
+                break;
+            case "-i":
+            case "--inline":
+                if (posture === "server") {
+                    console.error("bili: -i/--inline and -s/--server are mutually exclusive — pick one");
+                    process.exit(2);
+                }
+                posture = "inline";
+                break;
+            case "-s":
+            case "--server":
+                if (posture === "inline") {
+                    console.error("bili: -i/--inline and -s/--server are mutually exclusive — pick one");
+                    process.exit(2);
+                }
+                posture = "server";
                 break;
             case "--debug":
                 overrides.ACP_DEBUG = "1";
@@ -241,6 +338,9 @@ export function parseArgs(argv: string[]): Parsed {
             case "--full":
                 exportFull = true;
                 break;
+            case "--jsonl":
+                exportJsonl = true;
+                break;
             case "--output": {
                 const val = argv[++i];
                 if (val === undefined) {
@@ -253,10 +353,64 @@ export function parseArgs(argv: string[]): Parsed {
             case "--with-mcp":
                 pluginWithMcp = true;
                 break;
+            case "--project":
+                packProject = true;
+                break;
+            case "--force":
+                packForce = true;
+                break;
             case "--json":
                 jsonOutput = true;
                 doctorJson = true;
                 break;
+            case "--fix":
+                doctorFix = true;
+                break;
+            case "--no-vacuum":
+                sessionsNoVacuum = true;
+                break;
+            case "--apply":
+                sessionsApply = true;
+                break;
+            case "--restore": {
+                const val = argv[++i];
+                if (val === undefined) {
+                    console.error(`bili: ${a} requires a value (<sessionId>:<blockId>)`);
+                    process.exit(2);
+                }
+                sessionsRestoreTarget = val;
+                break;
+            }
+            case "--dry-run":
+                storageDryRun = true;
+                break;
+            case "--days": {
+                const val = argv[++i];
+                if (val === undefined) {
+                    console.error(`bili: ${a} requires a value`);
+                    process.exit(2);
+                }
+                const n = Number(val);
+                if (!Number.isInteger(n) || n < 0) {
+                    console.error(`bili: --days expects a non-negative integer (got "${val}")`);
+                    process.exit(2);
+                }
+                storageDays = n;
+                break;
+            }
+            case "--vacuum": {
+                const val = argv[++i];
+                if (val === undefined) {
+                    console.error(`bili: ${a} requires a value`);
+                    process.exit(2);
+                }
+                if (val !== "full" && val !== "incremental") {
+                    console.error(`bili: --vacuum expects full or incremental (got "${val}")`);
+                    process.exit(2);
+                }
+                storageVacuum = val as "full" | "incremental";
+                break;
+            }
             case "--no-log":
                 acpCacheNoLog = true;
                 break;
@@ -317,12 +471,13 @@ export function parseArgs(argv: string[]): Parsed {
 
     // First positional (if any) is the command. "start" | "update" | "test"
     // are recognized; an unknown command is an error.
-    if (client) {
+    const informational = command === "help" || command === "version";
+    if (!informational && client) {
         command = "launch";
-    } else if (positional.length > 0) {
+    } else if (!informational && positional.length > 0) {
         const cmd = positional[0]!;
         if (cmd === "start") {
-            command = command === "help" || command === "version" ? command : "start";
+            command = "start";
         } else if (cmd === "update") {
             command = "update";
         } else if (cmd === "doctor") {
@@ -377,17 +532,79 @@ export function parseArgs(argv: string[]): Parsed {
                 console.error("bili acp-cache diff: dump-dir is required");
                 process.exit(2);
             }
+        } else if (cmd === "sessions") {
+            command = "sessions";
+            const sub = positional[1];
+            if (sub === "ls" || sub === "foreign-blocks") {
+                sessionsSub = sub;
+            } else if (sub === "rm" || sub === "archive" || sub === "restore") {
+                sessionsSub = sub;
+                sessionsTarget = positional[2];
+                if (sessionsTarget === undefined) {
+                    console.error(`bili sessions ${sub}: <id> is required (try "bili sessions ${sub} <session-id>")`);
+                    process.exit(2);
+                }
+            } else {
+                console.error(`bili sessions: unknown action "${sub ?? ""}" (try "bili sessions ls|rm|archive|restore|foreign-blocks")`);
+                process.exit(2);
+            }
+        } else if (cmd === "pack" || cmd === "packs") {
+            command = "pack";
+            const action = positional[1];
+            if (action !== "install" && action !== "remove" && action !== "list") {
+                console.error(`bili pack: unknown action "${action ?? ""}" (try "bili pack install <npm-spec> | remove <name> | list")`);
+                process.exit(2);
+            }
+            packAction = action;
+            const arg = positional[2];
+            if (packAction !== "list" && arg === undefined) {
+                console.error(`bili pack ${packAction}: <${packAction === "install" ? "npm-spec" : "name"}> is required`);
+                process.exit(2);
+            }
+            packSpec = arg;
+        } else if (cmd === "storage") {
+            command = "storage";
+            if (positional[1] !== "gc") {
+                console.error(`bili storage: unknown action "${positional[1] ?? ""}" (try "bili storage gc")`);
+                process.exit(2);
+            }
         } else {
             console.error(`bili: unknown command "${cmd}" (try "bili --help")`);
             process.exit(2);
         }
     }
 
-    return { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, jsonOutput, doctorJson };
+    // -i/-s posture flags (#5428): translate onto the existing lanes so the
+    // launcher needs no new plumbing — `-i pi` IS `bili pi-inline` (env scrub
+    // + extension preflight + BILI_PI_INLINE=1, no proxy spawned), and
+    // `-s pi` pins BILI_PI_INLINE=0 on the child so an inherited/ambient
+    // inline env can't flip it while the launcher proxy runs.
+    if (posture !== undefined) {
+        if (!client) {
+            console.error(`bili: ${posture === "inline" ? "-i/--inline" : "-s/--server"} needs a client lane — e.g. \`bili -${posture === "inline" ? "i" : "s"} pi\``);
+            process.exit(2);
+        }
+        const inlineVariant = client === "pi" || client === "pi-inline" ? "pi-inline" : client === "opencode" || client === "opencode-inline" ? "opencode-inline" : undefined;
+        if (inlineVariant === undefined) {
+            console.error(`bili: -i/-s only apply to the pi and opencode lanes (got "${client}")`);
+            process.exit(2);
+        }
+        if (posture === "inline") {
+            client = inlineVariant;
+        } else if (client === inlineVariant) {
+            console.error(`bili: ${client} IS the inline lane — use \`bili -s ${inlineVariant === "pi-inline" ? "pi" : "opencode"}\``);
+            process.exit(2);
+        } else {
+            if (inlineVariant === "pi-inline") overrides.BILI_PI_INLINE = "0";
+            else overrides.BILI_OPENCODE_INLINE = "0";
+        }
+    }
+
+    return { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, sessionsSub, sessionsTarget, sessionsNoVacuum, sessionsApply, sessionsRestoreTarget, storageDays, storageVacuum, storageDryRun, jsonOutput, doctorJson, doctorFix, packAction, packSpec, packProject, packForce };
 }
 
 export async function main(): Promise<void> {
-    const { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, jsonOutput, doctorJson } = parseArgs(process.argv.slice(2));
+    const { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, sessionsSub, sessionsTarget, sessionsNoVacuum, sessionsApply, sessionsRestoreTarget, storageDays, storageVacuum, storageDryRun, jsonOutput, doctorJson, doctorFix, packAction, packSpec, packProject, packForce } = parseArgs(process.argv.slice(2));
     if (command === "help") {
         process.stdout.write(HELP);
         return;
@@ -500,12 +717,51 @@ export async function main(): Promise<void> {
             return;
         }
     }
+    if (command === "pack") {
+        try {
+            if (packAction === "list") {
+                for (const p of listResolvedPacks()) {
+                    console.log(`${p.name}\t${p.version ?? "-"}\t${p.source}${p.description ? `  ${p.description}` : ""}`);
+                }
+                return;
+            }
+            if (packAction === "install") {
+                const r = installPackFromNpm(packSpec!, { project: packProject, force: packForce });
+                console.log(`installed pack "${r.name}"${r.version ? ` v${r.version}` : ""} -> ${r.file}`);
+                return;
+            }
+            if (packAction === "remove") {
+                console.log(`removed ${removePackFile(packSpec!, packProject)}`);
+                return;
+            }
+        } catch (error) {
+            console.error(`bili pack: ${error instanceof Error ? error.message : String(error)}`);
+            process.exit(1);
+        }
+        return;
+    }
     if (command === "export") {
         try {
-            const text = await exportSession(exportSelector, { output: exportOutput, full: exportFull });
+            const text = await exportSession(exportSelector, { output: exportOutput, full: exportFull, jsonl: exportJsonl });
             process.stdout.write(text + "\n");
         } catch (error) {
             console.error(`bili export: ${error instanceof Error ? error.message : String(error)}`);
+            process.exit(1);
+        }
+        return;
+    }
+    if (command === "sessions" || command === "storage") {
+        // Storage maintenance (#3928): standalone, no proxy needed — same
+        // shape as export/doctor. The module owns all store access; failures
+        // carry their own exit codes (1 = operation failed, 2 = usage).
+        try {
+            const r = command === "sessions"
+                ? await runSessionsCommand({ sub: sessionsSub!, target: sessionsTarget, json: jsonOutput, noVacuum: sessionsNoVacuum, apply: sessionsApply, restoreTarget: sessionsRestoreTarget })
+                : await runStorageGcCommand({ days: storageDays, vacuum: storageVacuum, dryRun: storageDryRun, json: jsonOutput });
+            process.stdout.write(r.text);
+            if (r.code !== 0) process.exit(r.code);
+        } catch (error) {
+            console.error(`bili ${command}: ${error instanceof Error ? error.message : String(error)}`);
             process.exit(1);
         }
         return;
@@ -529,7 +785,17 @@ export async function main(): Promise<void> {
         }
         try {
             const report = await runDoctor({ packageName: PACKAGE_NAME, runningVersion: VERSION, resolveProxy: updaterResolveProxy, updateTag, advisoryUrl });
-            process.stdout.write(doctorJson ? JSON.stringify(report, null, 2) + "\n" : renderDoctorReport(report));
+            if (doctorFix) {
+                // #3496: explicit repair pass — the read-only audit above stays
+                // read-only; --fix is the only thing that writes dsh-profile
+                // ledgers, and it prints every change it makes.
+                const fixes = fixDshLedgers();
+                report.ledgerFixes = fixes;
+                process.stdout.write(doctorJson ? JSON.stringify(report, null, 2) + "\n" : renderDoctorReport(report) + "\n" + renderLedgerFixReport(fixes));
+                if (fixes.some((f) => f.error !== undefined || f.residualFindings.length > 0)) process.exitCode = 1;
+            } else {
+                process.stdout.write(doctorJson ? JSON.stringify(report, null, 2) + "\n" : renderDoctorReport(report));
+            }
         } catch (error) {
             console.error(`bili doctor: ${error instanceof Error ? error.message : String(error)}`);
             process.exit(1);
@@ -584,18 +850,43 @@ export async function main(): Promise<void> {
     // than a bare error. No-op if it already exists.
     ensureConfigTemplate();
     const opts = loadOptions();
-    const server = await startServer(opts);
+    // #2833: SQLite engine self-bootstrap — bounded (60s budget, #3338) and fail-safe; only
+    // fetches when unified storage is requested AND no builtin/host engine
+    // exists, so the common case costs nothing. Must complete before the first
+    // session store opens (the store resolves its engine at construction).
+    const bootstrapOutcome = await ensureSqliteEngine({
+        resolveProxy: (url) => resolveProxy(opts.routes, opts.proxy, url, opts.proxyFallback),
+    });
+    recordEngineBootstrap(bootstrapOutcome);
+    let server: Awaited<ReturnType<typeof startServer>>;
+    try {
+        server = await startServer(opts);
+    } catch (err) {
+        // #5096: a launcher-spawned child that dies pre-listen holds the
+        // port with a failure page instead of leaving the web UI unreachable;
+        // resolves immediately (rethrow, normal exit-1 path) when manual.
+        await serveStartupFailurePage(opts, err);
+        throw err;
+    }
+
+    // #3754: config-file edits don't hot-reload — this process holds whatever
+    // loadOptions() resolved at startup until restart. Log the effective
+    // update-lane values once so an operator can verify what actually took
+    // effect (the #3752 "I set autoUpdate:false and nothing changed" trap).
+    loggerLog("info", `[update] effective settings (this process, until restart): autoUpdate=${opts.autoUpdate} advisoryCheck=${opts.advisoryCheck} releaseNotesCheck=${opts.releaseNotesCheck} autoRestartOnUpdate=${opts.autoRestartOnUpdate ?? false}`);
 
     // Start background auto-update after the server is listening so a slow
     // registry check never delays startup or races the listen socket.
-    if (opts.autoUpdate) {
-        // Resolver reads opts fields per call, so web-UI hot-reload of proxy
-        // settings (server.ts mutates opts in place) is picked up live (#609).
-        startAutoUpdate({
+    // Resolver reads opts fields per call, so web-UI hot-reload of proxy
+    // settings (server.ts mutates opts in place) is picked up live (#609).
+    // #3719: one shared options object — the background loop and the web
+    // 更新/Updates tab's manual actions run on identical throttle/lock/
+    // proxy/advisory gates.
+    const updateOpts = {
             packageName: PACKAGE_NAME,
             currentVersion: VERSION,
             autoUpdate: true,
-            resolveProxy: (url) => resolveProxy(opts.routes, opts.proxy, url, opts.proxyFallback),
+            resolveProxy: (url: string) => resolveProxy(opts.routes, opts.proxy, url, opts.proxyFallback),
             updateTag: opts.updateTag,
             // F2 (review): an advisory whose target cannot be resolved on the
             // registry must not stall the normal self-update loop forever —
@@ -605,6 +896,11 @@ export async function main(): Promise<void> {
             // never install a candidate that falls inside a freshly parsed
             // affected range (rollback-form advisories cover latest too).
             advisoryBlocksVersion,
+            // #2456: defer the post-restart follow-latest install until the
+            // advisory's first check has consulted its feed — otherwise the
+            // update loop's first check races it and installs an affected
+            // latest before the #1588-A candidate gate can see the range.
+            advisoryAwaitingFirstCheck,
             onStaleInstall: createAutoRestartHandler({
                 enabled: opts.autoRestartOnUpdate ?? false,
                 packageName: PACKAGE_NAME,
@@ -615,9 +911,15 @@ export async function main(): Promise<void> {
                     return addr && typeof addr === "object" ? addr.port : opts.port;
                 },
                 log: loggerLog,
+                destroyLingeringSockets: restartForceCloseOf(server),
             }),
-        });
+        };
+    // The manual channel is independent of the auto channel: installs whose
+    // auto-update is off still need the panel's 立即检查/升级 buttons to work.
+    if (opts.autoUpdate) {
+        startAutoUpdate(updateOpts);
     }
+    registerUpdateActions(updateOpts);
     // #1481: the advisory watcher runs independently of autoUpdate — its whole
     // point is to reach installs whose auto-update is off.
     if (opts.advisoryCheck) {
@@ -636,6 +938,7 @@ export async function main(): Promise<void> {
                     return addr && typeof addr === "object" ? addr.port : opts.port;
                 },
                 log: loggerLog,
+                destroyLingeringSockets: restartForceCloseOf(server),
             }),
         });
     }
@@ -651,4 +954,13 @@ export async function main(): Promise<void> {
             resolveProxy: (url) => resolveProxy(opts.routes, opts.proxy, url, opts.proxyFallback),
         });
     }
+    // #5548 P3: remote announcements feed (display-only, like release notes)
+    // — independent of autoUpdate for the same reason as the other watchers.
+    startRemoteNoticesWatcher({
+        remoteAnnouncementsUrl: opts.remoteAnnouncementsUrl,
+        resolveProxy: (url) => resolveProxy(opts.routes, opts.proxy, url, opts.proxyFallback),
+    });
+    // #5548: notice dismissal receipts ride the unified storage — hydrate the
+    // in-memory view once at boot (and migrate any legacy JSON file one time).
+    void hydrateNoticeReceipts();
 }

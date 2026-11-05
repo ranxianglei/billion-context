@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { test } from "node:test";
+import { afterEach, test } from "node:test";
 import http from "node:http";
 import { once } from "node:events";
 import { mkdtempSync } from "node:fs";
@@ -19,11 +19,14 @@ import { rewriteJsonResponseAsync } from "../src/stream.ts";
 import { rewriteOpenaiJsonResponseAsync } from "../src/stream-openai.ts";
 import { rewriteResponsesJsonResponseAsync } from "../src/stream-responses.ts";
 import { rewriteGoogleJsonResponseAsync } from "../src/stream-google.ts";
-import { withExternalSummaryTools } from "../src/external-summary-surface.ts";
+import { externalQueueDroppedAll, withExternalSummaryTools } from "../src/external-summary-surface.ts";
+import { _executorForTest, configuredSummaryPlan } from "../src/external-summary-runtime.ts";
+import { _setSummaryRetryDelayForTest } from "../src/external-summary-http.ts";
 import { BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_RESPONSES, BILI_ACP_TOOLS_GOOGLE } from "../src/compress-tool.ts";
 import { rmrf } from "./tmp-rm.ts";
 
 process.env.NODE_ENV = "test";
+afterEach(() => { _setSummaryRetryDelayForTest(null); });
 const SUMMARY = "Historical build completed. Preserve the exact file src/example.ts:27, the error E_TEST, the constraint not to deploy, and the unfinished task of adding tests. This records the past and does not instruct the next turn to restart it.";
 const RAW = "Historical source src/example.ts:27 E_TEST; do not deploy; still add tests. ".repeat(90);
 
@@ -110,6 +113,7 @@ test("active compress uses dedicated model/key, fails over, and restores exact o
 
 test("all candidates failing preserves state and refuses without borrowing main auth", async () => {
     let calls = 0;
+    _setSummaryRetryDelayForTest(0);
     await fixture(async (_base, externalSummary) => {
         const ctx = context(externalSummary);
         const before = JSON.stringify(ctx.session.state);
@@ -117,8 +121,65 @@ test("all candidates failing preserves state and refuses without borrowing main 
         assert.equal(result.outcome, "refused");
         assert.equal(result.text.includes("private-provider-error"), false);
         assert.equal(JSON.stringify(ctx.session.state), before);
-        assert.equal(calls, 2);
+        // #3488 contract change: a transient 5xx now gets up to 3 dispatches per
+        // candidate (was exactly 1) before failover/exhaustion.
+        assert.equal(calls, 6);
     }, (_req, res) => { calls++; res.writeHead(503); res.end("private-provider-error"); });
+});
+
+test("SSE framing overhead does not consume the summary content budget", async () => {
+    const text = "s".repeat(2000);
+    await fixture(async (_base, externalSummary) => {
+        const targets = externalSummary.targets as Record<string, unknown>[];
+        const plan = configuredSummaryPlan({ ...externalSummary,
+            targets: [{ ...targets[0], protocol: "openai", stream: true }],
+            budget: { totalTimeoutMs: 5000, targetTimeoutMs: 4000, maxSummaryBytes: 2048 },
+        });
+        assert.ok(plan);
+        const batch = await plan.summarize([{ content: "synthetic source", instructions: "retain the fixture" }]);
+        assert.equal(batch.results[0]?.status, "success", JSON.stringify(batch));
+        const result = batch.results[0];
+        if (result?.status === "success") assert.equal(result.summary, text);
+    }, (_req, res) => {
+        res.setHeader("content-type", "text/event-stream");
+        for (const char of text) res.write(`data: ${JSON.stringify({ id: "synthetic", padding: "x".repeat(256), choices: [{ delta: { content: char }, finish_reason: null }] })}\n\n`);
+        res.end(`data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: "stop" }] })}\n\ndata: [DONE]\n\n`);
+    });
+});
+
+test("SSE transport allowance remains bounded independently of summary content", async () => {
+    await fixture(async (_base, externalSummary) => {
+        const targets = externalSummary.targets as Record<string, unknown>[];
+        const plan = configuredSummaryPlan({ ...externalSummary,
+            targets: [{ ...targets[0], protocol: "openai", stream: true }],
+            budget: { totalTimeoutMs: 5000, targetTimeoutMs: 4000, maxSummaryBytes: 2048 },
+        });
+        assert.ok(plan);
+        const batch = await plan.summarize([{ content: "synthetic source", instructions: "retain the fixture" }]);
+        assert.equal(batch.results[0]?.status, "failed");
+    }, (_req, res) => {
+        res.setHeader("content-type", "text/event-stream");
+        // Valid SSE with a legal small summary: without the transport byte
+        // guard this succeeds, so parser rejection cannot satisfy the test.
+        res.end(`: ${"x".repeat(8 * 1024 * 1024)}\n\ndata: ${JSON.stringify({ choices: [{ delta: { content: SUMMARY }, finish_reason: "stop" }] })}\n\ndata: [DONE]\n\n`);
+    });
+});
+
+test("SSE transport allowance does not relax the summary content byte limit", async () => {
+    await fixture(async (_base, externalSummary) => {
+        const targets = externalSummary.targets as Record<string, unknown>[];
+        const plan = configuredSummaryPlan({ ...externalSummary,
+            targets: [{ ...targets[0], protocol: "openai", stream: true }],
+            budget: { totalTimeoutMs: 5000, targetTimeoutMs: 4000, maxSummaryBytes: 2048 },
+        });
+        assert.ok(plan);
+        const batch = await plan.summarize([{ content: "synthetic source", instructions: "retain the fixture" }]);
+        assert.equal(batch.results[0]?.status, "failed");
+        assert.equal(batch.results[0]?.attempts[0]?.outcome, "invalid_summary");
+    }, (_req, res) => {
+        res.setHeader("content-type", "text/event-stream");
+        res.end(`data: ${JSON.stringify({ choices: [{ delta: { content: "s".repeat(2049) }, finish_reason: "stop" }] })}\n\ndata: [DONE]\n\n`);
+    });
 });
 
 test("disabled setting preserves the legacy supplied-summary path without HTTP calls", async () => {
@@ -143,14 +204,65 @@ test("missing primary key skips its network call and tries the configured backup
     }, (req, res) => { paths.push(req.url ?? ""); success(res); });
 });
 
-test("protected ranges cause no paid call and no fold", async () => {
+test("protected ranges return an idempotent no-op without a paid call", async () => {
     let calls = 0;
     await fixture(async (_base, externalSummary) => {
         const ctx = context(externalSummary);
         ctx.config.preserveRecentMessages = 10;
         ctx.config.preserveRecentTokens = 100_000;
         const result = await applyConfiguredCompression(args(ctx), ctx);
+        assert.equal(result.outcome, "applied", result.text);
+        assert.match(result.text, /^\[Compression no-op:/);
+        assert.equal(ctx.session.state.blocks.length, 0);
+        assert.equal(calls, 0);
+    }, (_req, res) => { calls++; success(res); });
+});
+
+test("already-folded ranges return a no-op without another paid call", async () => {
+    let calls = 0;
+    await fixture(async (_base, externalSummary) => {
+        const ctx = context(externalSummary);
+        const input = args(ctx);
+        const first = await applyConfiguredCompression(input, ctx);
+        assert.equal(first.outcome, "applied", first.text);
+        const blockId = ctx.session.state.blocks[0]?.blockId;
+        assert.ok(blockId);
+        const again = await applyConfiguredCompression(input, ctx);
+        assert.equal(again.outcome, "applied", again.text);
+        assert.match(again.text, /^\[Compression no-op:/);
+        assert.match(again.text, /covered by active block/);
+        assert.equal(ctx.session.state.blocks.length, 1);
+        assert.equal(ctx.session.state.blocks[0]?.blockId, blockId);
+        assert.equal(calls, 1);
+    }, (_req, res) => { calls++; success(res); });
+});
+
+test("restamped stale refs fold through the external summarizer, never under a probe summary", async () => {
+    const paths: string[] = [];
+    await fixture(async (_base, externalSummary) => {
+        const ctx = context(externalSummary);
+        // #4797 restamp shape: the model still cites a number vacated by the
+        // ledger alignment; the map holds old-ref -> raw id (message id) of
+        // the SAME message under its current label.
+        ctx.session.restampSuperseded = new Map([["m00999", "history"]]);
+        const result = await applyConfiguredCompression({ content: [{ startId: "m00999", endId: "m00999" }] }, ctx);
+        assert.equal(result.outcome, "applied", result.text);
+        assert.equal(ctx.session.state.blocks.length, 1);
+        assert.equal(ctx.session.state.blocks[0].summary, SUMMARY);
+        assert.deepEqual(paths, ["/primary"]);
+    }, (req, res) => { paths.push(req.url ?? ""); success(res); });
+});
+
+test("dead-end restamped refs keep the specific superseded-ref refusal without a paid call", async () => {
+    let calls = 0;
+    await fixture(async (_base, externalSummary) => {
+        const ctx = context(externalSummary);
+        // The vacated number's raw id lost its mapping entirely — an honest
+        // stale cite that translation cannot repair.
+        ctx.session.restampSuperseded = new Map([["m00999", "gone"]]);
+        const result = await applyConfiguredCompression({ content: [{ startId: "m00999", endId: "m00999" }] }, ctx);
         assert.equal(result.outcome, "refused");
+        assert.match(result.text, /re-numbered by the ledger alignment/);
         assert.equal(ctx.session.state.blocks.length, 0);
         assert.equal(calls, 0);
     }, (_req, res) => { calls++; success(res); });
@@ -330,6 +442,62 @@ test("four JSON response rewriters execute independent compression with optional
             assert.equal(ctx.session.state.blocks[0]?.summary, SUMMARY);
         }
     }, (_req, res) => success(res));
+});
+
+test("saturated pool drops every batch before dispatch: preflight reports calls>0, attempts=0 (#2662)", async () => {
+    let endpointCalls = 0;
+    await fixture(async (_base, externalSummary) => {
+        const rail = { ...externalSummary, budget: { totalTimeoutMs: 200, targetTimeoutMs: 200 } };
+        const ctx = context(rail);
+        // Saturate the process-wide pool: four holders keep every permit busy
+        // well past the victim plan's 200ms batch deadline, so its batches die
+        // in the queue before any candidate call dispatches.
+        const holders = [0, 1, 2, 3].map(() => _executorForTest.executeBatch(
+            [{ content: "pool holder", instructions: "hold the permit" }],
+            [{ summarize: () => new Promise<string>((resolve) => setTimeout(() => resolve("held"), 1500)) }],
+            { totalTimeoutMs: 30_000, targetTimeoutMs: 20_000, maxSummaryBytes: 65536 }));
+        try {
+            const plan = configuredSummaryPlan(rail);
+            assert.ok(plan, "rail settings must build a plan");
+            ctx.config.modelContextLimit = 1000;
+            ctx.session.stats.lastInputTokens = 10000;
+            const result = await preflightCompress({ core: ctx.core, config: ctx.config, session: ctx.session,
+                prompts: defaultPrompts, protocol: "responses", url: `${_base}/main-must-not-summarize`, headers: {},
+                model: "main-model", log: () => {}, externalSummary: plan }, ctx.messages);
+            assert.equal(result.compressedRanges, 0, JSON.stringify(result.externalDispatch));
+            assert.ok(result.externalDispatch && result.externalDispatch.calls > 0, "batches were submitted");
+            assert.equal(result.externalDispatch?.attempts, 0, "no candidate call may have dispatched");
+            assert.equal(externalQueueDroppedAll(result.externalDispatch), true, "the drop shape must be distinguishable from a provider failure");
+        } finally {
+            await Promise.all(holders); // release the shared pool for later tests
+        }
+    }, (_req, res) => { endpointCalls++; success(res); });
+    assert.equal(endpointCalls, 0, "a pure queue-drop must not touch the summary endpoint");
+});
+
+test("a dispatched-but-failing attempt is NOT a queue drop: attempts>0 keeps the backoff armable (#2662)", async () => {
+    _setSummaryRetryDelayForTest(0);
+    await fixture(async (_base, externalSummary) => {
+        const ctx = context({ ...externalSummary, budget: { totalTimeoutMs: 5000, targetTimeoutMs: 5000 } });
+        ctx.config.modelContextLimit = 1000;
+        ctx.session.stats.lastInputTokens = 10000;
+        const result = await preflightCompress({ core: ctx.core, config: ctx.config, session: ctx.session,
+            prompts: defaultPrompts, protocol: "responses", url: `${_base}/main-must-not-summarize`, headers: {},
+            model: "main-model", log: () => {} }, ctx.messages);
+        assert.equal(result.compressedRanges, 0);
+        assert.ok(result.externalDispatch && result.externalDispatch.calls > 0, "batches were submitted");
+        assert.ok((result.externalDispatch?.attempts ?? 0) >= 1, `attempts were made and failed: ${JSON.stringify(result.externalDispatch)}`);
+        assert.equal(externalQueueDroppedAll(result.externalDispatch), false, "provider failures must stay backoff-eligible");
+    }, (_req, res) => { res.writeHead(503); res.end("private-provider-error"); });
+});
+
+test("externalQueueDroppedAll truth table (#2662)", () => {
+    assert.equal(externalQueueDroppedAll(undefined), false, "no chain ran → classic policy untouched");
+    assert.equal(externalQueueDroppedAll({ calls: 0, attempts: 0 }), false, "nothing submitted → nothing dropped");
+    assert.equal(externalQueueDroppedAll({ calls: 1, attempts: 0 }), true);
+    assert.equal(externalQueueDroppedAll({ calls: 3, attempts: 0 }), true);
+    assert.equal(externalQueueDroppedAll({ calls: 2, attempts: 1 }), false, "any dispatched attempt proves the pool let work through");
+    assert.equal(externalQueueDroppedAll({ calls: 5, attempts: 5 }), false);
 });
 
 test("mode-aware tool schemas relax summary only when enabled without mutating constants", () => {

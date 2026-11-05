@@ -114,9 +114,9 @@ function validate(entries, file, idMap) {
       if (typeof e[f] !== "string" || e[f] === "") fail(ctx + ": missing or empty field " + f);
     }
     if (!GROUPS.some((g) => g[0] === e.group)) fail(ctx + ': unknown group "' + e.group + '"');
-    for (const f of ["desc_en", "desc_zh"]) {
-      if (e[f].includes("`")) fail(ctx + ": backtick forbidden in " + f);
-    }
+    // desc_* flow ONLY into the markdown tables below, where backticks are valid inline code.
+    if (typeof e.default_zh === "string" && e.default_zh === "") fail(ctx + ": empty default_zh");
+    if (typeof e.default_zh !== "undefined" && typeof e.default_zh !== "string") fail(ctx + ": default_zh must be a string");
     const hasId = typeof e.id === "string" && e.id !== "";
     const hasRender = typeof e.render === "string";
     const hasSiteGroup = typeof e.site_group === "string";
@@ -178,7 +178,8 @@ function genParamRef(entries, lang) {
       const dep = e.deprecated === true ? (lang === "zh" ? " _(已弃用)_" : " _(deprecated)_") : "";
       const envCol = e.kind === "env-only" ? "—" : e.env && e.env.length ? e.env.join(", ") : "—";
       const desc = lang === "zh" ? e.desc_zh : e.desc_en;
-      out.push("| `" + e.key + "` | " + mdCell(e.type) + " | " + mdCell(e.default) + " | " + mdCell(envCol) + " | " + mdCell(desc) + dep + " |");
+      const def = lang === "zh" && typeof e.default_zh === "string" ? e.default_zh : e.default;
+      out.push("| `" + e.key + "` | " + mdCell(e.type) + " | " + mdCell(def) + " | " + mdCell(envCol) + " | " + mdCell(desc) + dep + " |");
     }
     out.push("");
   }

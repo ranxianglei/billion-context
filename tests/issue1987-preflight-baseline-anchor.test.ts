@@ -147,8 +147,10 @@ test("e2e #1987: post-fold usage baseline anchors to the shipped payload, not th
         assert.equal(s.stats.lastInputTokensSource, "estimate", "no usage report lands on the converged turn, so the estimate of the shipped payload wins");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });

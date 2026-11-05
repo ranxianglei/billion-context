@@ -5,6 +5,8 @@
 // minimal structural declarations — the bundled artifact imports NOTHING
 // from the host at runtime (the host duck-types us in).
 
+import type { MessageRenderer } from "@earendil-works/pi-coding-agent";
+import { Box, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -13,8 +15,18 @@ import { awaitNativeProxyOrigin } from "./native-bootstrap.js";
 import { disposeSubagentSelfReg, selfRegisterForSession, type SubagentSelfRegState } from "./pi-subagent-registry.js";
 import { isModelApiUrl, nativeInterceptInstalled } from "./native-intercept.js";
 import { wirePiSubagents } from "./pi-subagents.js";
-import { detectProxyBase, destinationRoutedThroughProxy, fetchManifest, forwardTool, fetchStatus, fetchProxyVersion, postIdentityRegister, reportRuntimeInfoOnChange, armedIdleNotice, noSessionWarning, nonHttpProvidersFromEnv, type ManifestTool } from "./shared.js";
+import { wireToolGuardrails } from "./tool-guardrails.js";
+import { clearIncrementalProbe, noteHostMsgIdHint, INCREMENTAL_TURN_MARKER_HEADER, incrementalEnvelopeConversationId, incrementalWireHash, noteIncrementalRejection, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, pullIncrementalReceipt, sweepStale, wireMessagesLookAnthropic, type HostMsgIdHintEntry, type IncrementalWireMessage } from "./incremental-client.js";
+import { laneMsgIdsForOpenAiWire, laneMsgIdsForWire, lanePinnableContent } from "./pi-msgids.js";
+import * as pfChannel from "./pf-channel.js";
+import { validateMsgIds } from "../msgid-pin.js";
+import type { DirectSendPrep } from "./native-intercept.js";
+import { asciiHeaderValue, detectProxyBase, destinationRoutedThroughProxy, fetchManifest, forwardTool, fetchStatus, fetchProxyVersion, postIdentityRegister, reportRuntimeInfoOnChange, armedIdleNotice, noSessionWarning, nonHttpProvidersFromEnv, type ForwardedToolResult, type ManifestTool } from "./shared.js";
 import { createForkAdopter } from "./fork-adopt.js";
+import { logHostEvent } from "./host-log.js";
+import { plainHttpTrusted } from "../private-host.js";
+import { allowPrivateHttpProviders, guardrailBashTimeout, guardrailMaxOutputBytes, guardrailRepetition } from "../knobs.js";
+import { hostProfileFor } from "../host-profiles.js";
 
 export type Ctx = {
     sessionManager?: { getSessionId?: () => string; getHeader?: () => unknown; getBranch?: () => unknown } | undefined;
@@ -39,7 +51,11 @@ export type Ctx = {
 };
 
 type TextBlock = { type: "text"; text: string };
-type ToolResult = { content: TextBlock[]; isError?: boolean };
+// #2752: `details` is pi's AgentToolResult metadata channel (persisted with the
+// session, excluded from model input) — bili uses it to expose the endpoint's
+// machine-readable outcome/blocksCreated to analysis tooling. Older pi hosts
+// ignore unknown result fields.
+type ToolResult = { content: TextBlock[]; isError?: boolean; details?: unknown };
 
 type ToolDefinition = {
     name: string;
@@ -65,6 +81,7 @@ type ExtensionAPI = {
     on: (event: string, handler: (event: never, ctx: Ctx) => unknown) => void;
     registerTool: (tool: ToolDefinition) => void;
     registerCommand?: (name: string, options: { description?: string; handler: (args: string, ctx: CommandCtx) => void | Promise<void> }) => void;
+    registerMessageRenderer?: (customType: string, renderer: MessageRenderer) => void;
     // #2186: acp_delegate (inlined from billion-context-pi-subagents) injects
     // completion notifications through the host's persistent transcript
     // channel; optional because older hosts and non-pi hosts lack it.
@@ -88,6 +105,12 @@ type ExtensionAPI = {
     // #2322: current session name (pi /name); optional because older hosts
     // lack it (the session_info_changed event is the primary channel).
     getSessionName?: () => string | undefined;
+    // #3542: the ACTIVE tool loadout — the set pi declares to the model and
+    // its dispatcher checks, distinct from the registry (getAllTools). pi's
+    // /tree rewind resets it from the transcript, so a registered tool can be
+    // missing from it; optional because older hosts lack it.
+    getActiveTools?: () => string[];
+    setActiveTools?: (toolNames: string[]) => void;
 };
 
 function agentName(override: string | undefined): string {
@@ -140,8 +163,9 @@ const AGENT_PROVIDER_API: Record<string, "anthropic" | "openai" | "responses" | 
  *  the RESOLVED api key, in memory only — so summary chains can reference
  *  them ("glm/glm-5") without duplicating the dialing config in bili's
  *  file. Skips OAuth providers, auth.json credentials ("stored" — never
- *  collected by design), unmappable apis and baseUrls that point back at
- *  this proxy. Returns true when done (or permanently unavailable) so the
+ *  collected by design), unmappable apis, baseUrls that point back at this
+ *  proxy, and plain-HTTP non-loopback baseUrls (#2585 — the server would
+ *  refuse them). Returns true when done (or permanently unavailable) so the
  *  caller can stop retrying; throws on transient failures. */
 export async function reportAgentProviders(ctx: Ctx, agent: string): Promise<boolean> {
     const proxyBase = proxyBaseForCtx(ctx);
@@ -180,7 +204,19 @@ export async function reportAgentProviders(ctx: Ctx, agent: string): Promise<boo
         // testing detectProxyBase() !== undefined (which would skip the
         // whole table whenever BILLION_CONTEXT_PROXY is set).
         let selfLoop = true;
-        try { selfLoop = new URL(baseUrl).origin === new URL(proxyBase).origin; } catch { selfLoop = true; }
+        try {
+            const u = new URL(baseUrl);
+            // #2585/#2984: untrusted plain-HTTP would be refused server-side
+            // (key over plaintext) — pre-skip and say so. Same shared predicate
+            // as the server gate (src/private-host.ts); the warn text stays
+            // generic because it also covers public hosts. No url in the warn:
+            // a baseUrl may carry inline credentials.
+            if (u.protocol === "http:" && !plainHttpTrusted(u, allowPrivateHttpProviders())) {
+                logHostEvent("warn", "[native-client]", `bili-plugin(${agent}): agent-providers: provider "${id}" not reported — plain-HTTP non-loopback baseUrl (bili refuses to register it, its apiKey would travel over plaintext) (#2585)`);
+                continue;
+            }
+            selfLoop = u.origin === new URL(proxyBase).origin;
+        } catch { selfLoop = true; }
         if (selfLoop) continue;
         const status = registry.getProviderAuthStatus(id);
         if (status?.configured !== true || status.source === "stored") continue;
@@ -208,7 +244,20 @@ export async function reportAgentProviders(ctx: Ctx, agent: string): Promise<boo
         body: JSON.stringify({ agent, providers }),
         signal: AbortSignal.timeout(10_000),
     });
-    if (!res.ok) throw new Error(`agent-providers HTTP ${res.status}`);
+    let body: { error?: unknown; skipped?: unknown };
+    try { body = JSON.parse(await res.text()); } catch { body = {}; }
+    if (!res.ok) {
+        // #2585: the response body names what was refused — surface it, don't
+        // leave the user with a bare status code.
+        const detail = typeof body.error === "string" && body.error.length > 0 ? body.error.slice(0, 300) : "";
+        throw new Error(detail.length > 0 ? `agent-providers HTTP ${res.status}: ${detail}` : `agent-providers HTTP ${res.status}`);
+    }
+    for (const s of Array.isArray(body.skipped) ? body.skipped : []) {
+        const item = s as { name?: unknown; reason?: unknown };
+        if (typeof item.name === "string" && typeof item.reason === "string") {
+            logHostEvent("warn", "[native-client]", `bili-plugin(${agent}): agent-providers: provider "${item.name}" not registered by bili: ${item.reason} — bili-side references to it stay unresolved (#2585)`);
+        }
+    }
     return true;
 }
 
@@ -318,6 +367,108 @@ export function parentConversationIdOf(ctx: Ctx): string | undefined {
     return undefined;
 }
 
+// #2469: parentSession proves LINEAGE, not seeding. Pi's session header has
+// no seed marker, but the evidence sits in the child's own branch: fork()
+// copies the parent's entries verbatim, and pi persists the turn's user
+// message BEFORE its first provider request (runAgentLoop emits the prompt
+// messages' message_end — session-manager.appendMessage — ahead of the
+// stream's onPayload hook), so a seeded child's branch already holds
+// parent-length + 1 messages at first request, while a spawned subagent
+// (newSession({parentSession}), inherit_context off) holds only its own task
+// prompt. Counting the branch's conversation messages distinguishes the two
+// at zero network cost; hosts without getBranch (or where it throws) yield
+// undefined and keep today's always-attempt behavior (fail toward capability).
+// The hash prefix match inside tryForkAdoption stays the final gate either
+// way (#2394 opencode-lane contract), so a misclassified attempt only costs
+// one snapshot GET.
+export const FORK_SEED_MIN_REPLAYED_MESSAGES = 2;
+
+export function replayedMessageCount(ctx: Ctx): number | undefined {
+    try {
+        const branch = ctx.sessionManager?.getBranch?.();
+        if (!Array.isArray(branch)) return undefined;
+        let count = 0;
+        for (const entry of branch) {
+            if (entry !== null && typeof entry === "object" && (entry as { type?: unknown }).type === "message") count += 1;
+        }
+        return count;
+    } catch {
+        return undefined;
+    }
+}
+
+/** #4491 omp msgids wiring: (id, role) of the branch's message entries in
+ *  session order — the hint the fetch-layer incremental planner
+ *  (omp-native) aligns against the ACTUALLY-sent wire messages and carries
+ *  as `msgIds` when they match 1:1. Non-message entries (model_change,
+ *  native-compaction summaries) are skipped — they have no message id, so a
+ *  summary that DID become a wire message leaves the counts short and the
+ *  alignment refuses the whole field (all-or-nothing). An entry without a
+ *  stable id yields an empty one, which the consumer's screen rejects the
+ *  same way. Total: a missing/throwing getBranch yields [] — this request
+ *  cannot vouch ids, and [] forces the degrade instead of leaving a stale
+ *  earlier hint in place. */
+export function ompBranchMsgIdEntries(ctx: Ctx): HostMsgIdHintEntry[] {
+    const out: HostMsgIdHintEntry[] = [];
+    try {
+        const branch = ctx.sessionManager?.getBranch?.();
+        if (!Array.isArray(branch)) return out;
+        for (const entry of branch) {
+            if (entry === null || typeof entry !== "object" || (entry as { type?: unknown }).type !== "message") continue;
+            const id = (entry as { id?: unknown }).id;
+            const role = (entry as { message?: { role?: unknown } | null }).message?.role;
+            out.push({ id: typeof id === "string" ? id : "", role: typeof role === "string" ? role : "" });
+        }
+    } catch {
+        return [];
+    }
+    return out;
+}
+
+// #2583: OMP's Cowork transport (can1357/oh-my-pi 642892ae, proxy handling
+// e22a5ff2) picks egress PER MODEL: default anthropic/anthropic-messages
+// requests go out over node:https DIRECTLY — stable header order, HTTP/1.1,
+// streaming decompression — and never touch globalThis.fetch, so the
+// fetch-layer routing claim of the native mode does not hold for them. Only
+// an explicit proxy setting (PI_PROXY / PI_PROXY_<PROVIDER>) pushes them back
+// onto Bun's own fetch (which the patch then sees), as do exotic request
+// shapes (Request input, non-record headers, non-string body, non-https).
+// The stamped prompt_cache_key's sole consumer is the proxy itself
+// (#1403/#1579); on the direct path the field rides verbatim into Anthropic's
+// strict schema and 400s every request ("prompt_cache_key: Extra inputs are
+// not permitted"). This mirrors the host's own selection predicate exactly
+// (defaultFetchForModel + getProxyForProvider) — an evidence-permitlist entry
+// with source-level proof, not a URL heuristic. Missing provider/api fields
+// cannot conclude bypass, so they keep today's optimistic stamp (older hosts
+// still route through globalThis.fetch — fail-safe toward #1579).
+export function ompCoworkTransportBypassesFetch(
+    model: { provider?: string; api?: string } | undefined,
+    env: NodeJS.ProcessEnv = process.env,
+): boolean {
+    if (model?.provider !== "anthropic" || model?.api !== "anthropic-messages") return false;
+    // getProxyForProvider("anthropic"): PI_PROXY_ANTHROPIC (raw truthy) || PI_PROXY (trimmed).
+    const hasProviderProxy = (env.PI_PROXY_ANTHROPIC ?? "").length > 0;
+    const hasGlobalProxy = (env.PI_PROXY ?? "").trim().length > 0;
+    if (hasProviderProxy || hasGlobalProxy) return false;
+    // HTTPS_PROXY is deliberately NOT routing evidence here: the Cowork
+    // transport's node:https stack ignores env proxies entirely (proven
+    // live 2026-10-17, Anthropic req_011Cg7cujfgv4xLjuRvLMqvg — a loopback
+    // HTTPS_PROXY was set and the stamped body still reached the upstream
+    // direct, 400). Only PI_PROXY / PI_PROXY_ANTHROPIC push Cowork onto
+    // Bun's fetch, where the patch can see and the proxy can consume it.
+    return true;
+}
+
+// Once per process per model — the bypass is a property of the installed host
+// build, not of individual requests, so repeating it per call would spam logs.
+const coworkBypassNoted = new Set<string>();
+function noteOmpCoworkBypass(modelId: string): void {
+    const key = modelId || "<unknown>";
+    if (coworkBypassNoted.has(key) || coworkBypassNoted.size >= 64) return;
+    coworkBypassNoted.add(key);
+    logHostEvent("warn", "[native-client]", `bili-plugin(omp): ${key} leaves this host through the host-native direct TLS transport (OMP Cowork transport, #2583) — those requests bypass bili's fetch interception and go DIRECT (uncompressed, invisible to the proxy). The prompt_cache_key identity stamp is withheld so the field can never leak into the upstream body.`);
+}
+
 // omp's chat-completions payloads carry NO conversation signal (no
 // prompt_cache_key / session / user, and no session header — verified by dump),
 // so the proxy's openai identity falls to a content fingerprint that never
@@ -343,7 +494,25 @@ export function parentConversationIdOf(ctx: Ctx): string | undefined {
 // proxy's anonymous prefix-affinity sessions (#309): compression still works,
 // /acp lookup by session id does not — acceptable vs a guaranteed 400.
 export function stampPromptCacheKey(event: unknown, ctx: Ctx, agent: string): Record<string, unknown> | undefined {
-    if (agent !== "omp") return undefined;
+    // #3482 site 3: the identity-stamp CHANNEL is a registry property — omp
+    // stamps the body pck, pi stamps x-bili-plugin-conversation in
+    // before_provider_headers (which outranks the body field). No adapter-side
+    // name gate.
+    const profile = hostProfileFor(agent);
+    if (!profile.stampsBodyPromptCacheKey) return undefined;
+    // #2583 (hoisted): the Cowork withhold must gate EVERY stamp path, not
+    // just the unrouted fallback below. On the launcher cert-MITM lane
+    // (HTTPS_PROXY + BILI_MITM_HOSTS) destinationRoutedThroughProxy() is
+    // true, which skipped this check entirely — yet Cowork traffic never
+    // rides globalThis.fetch on that lane either, so the stamp could fire
+    // on a transport the fetch intercept cannot consume and ride verbatim
+    // into Anthropic's strict schema (#1403's 400 on every delegation).
+    // #3482 site 2: whether that transport is even POSSIBLE is a registry
+    // property; the env observation below is the per-request truth.
+    if (profile.coworkTransportPossible && ompCoworkTransportBypassesFetch(ctx.model, process.env)) {
+        noteOmpCoworkBypass(ctx.model?.id ?? (ctx.model?.baseUrl ?? ""));
+        return undefined;
+    }
     if (!destinationRoutedThroughProxy(ctx.model?.baseUrl)) {
         // #1579: native omp mode routes at the FETCH layer — the model
         // baseUrl stays the real upstream, so the launcher-shaped checks
@@ -417,13 +586,21 @@ function renderAcpStatus(s: Record<string, unknown>): string {
     return lines.join("\n");
 }
 
+function outcomeDetailsOf(output: ForwardedToolResult): Record<string, unknown> | undefined {
+    if (output.outcome === undefined && output.blocksCreated === undefined) return undefined;
+    const details: Record<string, unknown> = {};
+    if (output.outcome !== undefined) details.outcome = output.outcome;
+    if (output.blocksCreated !== undefined) details.blocksCreated = output.blocksCreated;
+    return details;
+}
+
 function manifestToTool(proxyBase: string, tool: ManifestTool, agent: string): ToolDefinition {
     return {
         name: tool.name,
         description: tool.description,
         parameters: tool.inputSchema,
         loadMode: "essential",
-        execute: async (_toolCallId, params, signal, _onUpdate, ctx) => {
+        execute: async (toolCallId, params, signal, _onUpdate, ctx) => {
             const conversationId = sessionIdOf(ctx) ?? "unknown";
             try {
                 // #2416: read the LIVE base — a native respawn after a proxy
@@ -443,12 +620,16 @@ function manifestToTool(proxyBase: string, tool: ManifestTool, agent: string): T
                 // rebinding (onRoutedOriginObserved) converges env back to the
                 // observed routed origin.
                 const base = proxyBaseForCtx(ctx) ?? proxyBase;
-                const output = await forwardTool(base, conversationId, tool.name, params, signal, conversationId !== "unknown");
+                const output = await forwardTool(base, conversationId, tool.name, params, signal, conversationId !== "unknown", toolCallId);
                 // #2204: a business failure (e.g. a refused export) must reach
                 // the host as isError — rendering it as plain success text is
                 // what hid the #2204 write failures from OMP.
-                if (output.failed) return { content: [{ type: "text", text: output.text }], isError: true };
-                return { content: [{ type: "text", text: output.text }] };
+                // #2752: the structured business state rides pi's details channel
+                // on BOTH branches — a refused/failure receipt carries its
+                // outcome too, so analysis tooling can classify every call.
+                const details = outcomeDetailsOf(output);
+                if (output.failed) return { content: [{ type: "text", text: output.text }], isError: true, details };
+                return { content: [{ type: "text", text: output.text }], details };
             } catch (err) {
                 return { content: [{ type: "text", text: `bili tool error: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
             }
@@ -489,7 +670,70 @@ function noProxyWarning(agent: string): string {
 
 const RETRY_INTERVAL_MS = 10000;
 
-type RegisterState = { sid?: string; toolsFor?: string; toolsReady?: boolean; pending?: Promise<void>; retryAt?: number; identityAt?: string; carriedSids?: Set<string>; retryIntervalMs: number; manifestPrime?: { base: string; tools: Promise<ManifestTool[] | undefined> } };
+type RegisterState = { sid?: string; toolsFor?: string; toolsReady?: boolean; pending?: Promise<void>; retryAt?: number; identityAt?: string; carriedSids?: Set<string>; retryIntervalMs: number; manifestPrime?: { base: string; tools: Promise<ManifestTool[] | undefined> }; registeredTools?: ManifestTool[] };
+
+// #2708: pi rebuilds its executable tool list per request — _refreshToolRegistry() walks
+// the live extension instances' tool maps into _toolRegistry, and setActiveToolsByName()
+// filters the active names through _toolRegistry.has(name), silently dropping any name it
+// no longer holds. If that rebuild runs while our instance's map is empty (a runtime
+// replacement / reload mid-session), the ACP tools leave the registry + active set while the
+// transcript keeps declaring them — the model then calls tools pi rejects by name forever,
+// and the once-per-sid gate below would never re-register them. Self-heal by probing the
+// host's real registry and re-asserting vanished tools: registerTool is idempotent (dedup by
+// name) and post-bind triggers a registry refresh, so a per-request re-assert is cheap and
+// safe. No registry query (older pi / omp) or a throwing query → no-op, never a blind re-register.
+function reassertDroppedTools(pi: ExtensionAPI, state: RegisterState, agent: string, proxyBase: string): void {
+    const tools = state.registeredTools;
+    if (tools === undefined || tools.length === 0) return;
+    const probe = (pi as { getAllTools?: () => Array<{ name?: unknown }> }).getAllTools;
+    if (typeof probe !== "function") return;
+    let present: Set<string>;
+    try {
+        present = new Set(probe.call(pi).map((t) => (typeof t?.name === "string" ? t.name : "")).filter((n): n is string => n.length > 0));
+    } catch {
+        return; // query rejected (e.g. stale ctx) — never re-register blindly
+    }
+    const missing = tools.map((t) => t.name).filter((name) => !present.has(name));
+    if (missing.length === 0) return;
+    logHostEvent("warn", "[native-client]", `bili-plugin(${agent}): ${missing.length} bili tool(s) dropped from the host registry (${missing.join(", ")}) — re-registering (#2708)`);
+    for (const t of tools) pi.registerTool(manifestToTool(proxyBase, t, agent));
+}
+
+// #3542: a pi /tree rewind (navigateTree) resets the ACTIVE tool loadout to what
+// the surviving transcript system entries declare (_restoreToolsFromTranscript),
+// discarding the entry that declared our tools whenever it sits after the rewind
+// target — the normal case, since the manifest handshake is async and lands after
+// the first turn's declaration. The definitions stay in the registry, so #2708's
+// probe sees nothing missing, but pi dispatches on the loadout: every later call
+// fails with "Tool X not found" until restart. session_tree fires right after the
+// reset and before the next _startRun, so re-assert there. Additive-only (names
+// the host currently holds are never removed), mirroring pi's own reload()
+// precedent of re-activating all extension tools. No loadout query/setter (older
+// pi / omp) or a throwing query → no-op, never a blind set.
+function reassertLoadoutAfterTree(pi: ExtensionAPI, state: RegisterState, agent: string): void {
+    const tools = state.registeredTools;
+    if (tools === undefined || tools.length === 0) return;
+    const getActive = pi.getActiveTools;
+    const setActive = pi.setActiveTools;
+    if (typeof getActive !== "function" || typeof setActive !== "function") return;
+    let active: string[];
+    try {
+        const names = getActive.call(pi);
+        if (!Array.isArray(names)) return;
+        active = names.filter((n): n is string => typeof n === "string");
+    } catch {
+        return; // stale ctx — same guard as reassertDroppedTools
+    }
+    const present = new Set(active);
+    const missing = tools.map((t) => t.name).filter((name) => !present.has(name));
+    if (missing.length === 0) return;
+    try {
+        setActive.call(pi, [...active, ...missing]);
+    } catch {
+        return; // setter rejected — never break the navigation
+    }
+    logHostEvent("warn", "[native-client]", `bili-plugin(${agent}): ${missing.length} bili tool(s) dropped from the active loadout by a tree navigation (${missing.join(", ")}) — re-asserting (#3542)`);
+}
 
 async function registerTools(pi: ExtensionAPI, ctx: Ctx, state: RegisterState, agent: string, awaitNativeOrigin = true): Promise<void> {
     let proxyBase = proxyBaseForCtx(ctx);
@@ -499,7 +743,12 @@ async function registerTools(pi: ExtensionAPI, ctx: Ctx, state: RegisterState, a
     // so a successful registration is not re-fetched on every provider
     // request — the manifest is session-independent anyway.
     const sid = sessionIdOf(ctx) ?? "";
-    if (sid === state.sid) return;
+    if (sid === state.sid) {
+        // #2708: already registered for this sid — but pi may have rebuilt its
+        // registry since and dropped our tools. Re-assert if they vanished.
+        reassertDroppedTools(pi, state, agent, proxyBase);
+        return;
+    }
     if (state.pending !== undefined) return state.pending;
     if (state.retryAt !== undefined && Date.now() < state.retryAt) return;
     const wait = state.retryIntervalMs;
@@ -517,7 +766,7 @@ async function registerTools(pi: ExtensionAPI, ctx: Ctx, state: RegisterState, a
                 tools = await fetchManifest(proxyBase);
             } catch (err) {
                 state.retryAt = Date.now() + wait;
-                console.error(`bili-plugin(${agent}): manifest fetch failed: ${err instanceof Error ? err.message : String(err)} — retrying in ${wait / 1000}s`);
+                logHostEvent("error", "[native-client]", `bili-plugin(${agent}): manifest fetch failed: ${err instanceof Error ? err.message : String(err)} — retrying in ${wait / 1000}s`);
                 return;
             }
         }
@@ -528,6 +777,9 @@ async function registerTools(pi: ExtensionAPI, ctx: Ctx, state: RegisterState, a
             if (state.toolsFor !== sid) {
                 for (const t of tools) pi.registerTool(manifestToTool(proxyBase, t, agent));
                 state.toolsFor = sid;
+                // #2708: remember what we put in the host registry so the
+                // per-request re-assert can detect a later drop.
+                state.registeredTools = tools;
             }
             state.toolsReady = true;
             state.retryAt = undefined;
@@ -553,16 +805,20 @@ async function registerTools(pi: ExtensionAPI, ctx: Ctx, state: RegisterState, a
                     // wire mode forever (the early return above blocks every
                     // retry).
                     state.retryAt = Date.now() + wait;
-                    console.error(`bili-plugin(${agent}): identity register failed (${err instanceof Error ? err.message : String(err)}) — retrying in ${wait / 1000}s`);
+                    logHostEvent("error", "[native-client]", `bili-plugin(${agent}): identity register failed (${err instanceof Error ? err.message : String(err)}) — retrying in ${wait / 1000}s`);
                     return;
                 }
             }
             state.sid = sid;
+            // #2708: a same-id session_start skips the register loop above
+            // (toolsFor already === sid), so re-assert here too — otherwise a
+            // drop during that window wouldn't heal until the next request.
+            reassertDroppedTools(pi, state, agent, proxyBase);
         } catch (err) {
             state.sid = undefined;
             state.toolsFor = undefined;
             state.retryAt = Date.now() + wait;
-            console.error(`bili-plugin(${agent}): tool registration deferred (${err instanceof Error ? err.message : String(err)}) — retrying in ${wait / 1000}s`);
+            logHostEvent("error", "[native-client]", `bili-plugin(${agent}): tool registration deferred (${err instanceof Error ? err.message : String(err)}) — retrying in ${wait / 1000}s`);
         }
     })();
     try {
@@ -572,10 +828,83 @@ async function registerTools(pi: ExtensionAPI, ctx: Ctx, state: RegisterState, a
     }
 }
 
+// #3304: pi's payload swap happens INSIDE the runner (before_provider_request
+// returns the replacement), so the fetch layer cannot correlate a request by
+// object identity. Instead it sniffs the outgoing body for the incremental
+// envelope — the same shape test the lane's divert runs server-side — and
+// restores the original stashed under the envelope's conversationId. Pi sends
+// model requests strictly sequentially per session (the same invariant
+// pendingIncrementalAcks relies on), so one entry per conversation is exact.
+const PI_ORIGINAL_TTL_MS = 5 * 60_000;
+const piIncrementalOriginals = new Map<string, { body: string; at: number }>();
+
+function stashPiIncrementalOriginal(conversationId: string, payload: unknown): void {
+    const now = Date.now();
+    sweepStale(piIncrementalOriginals, PI_ORIGINAL_TTL_MS);
+    piIncrementalOriginals.set(conversationId, { body: JSON.stringify(payload), at: now });
+}
+
+function takePiIncrementalOriginal(conversationId: string): string | null {
+    const entry = piIncrementalOriginals.get(conversationId);
+    if (entry === undefined || Date.now() - entry.at >= PI_ORIGINAL_TTL_MS) return null;
+    return entry.body;
+}
+
+export function __resetPiIncrementalOriginalsForTests(): void {
+    piIncrementalOriginals.clear();
+}
+
+/** Test-only: seed the stash directly (driving the full extension event
+ *  chain just for this is not worth it). */
+export function __stashPiIncrementalOriginalForTests(conversationId: string, payload: unknown): void {
+    stashPiIncrementalOriginal(conversationId, payload);
+}
+
+/** #3304: prepareDirectSend for the pi/omp extension lanes (pi-native arms
+ *  it on its NativeInterceptState). A body that IS an incremental envelope
+ *  was swapped by maybeIncrementalTurn → restore the stashed original
+ *  (or refuse when the stash aged out); any other body is a standalone
+ *  full-resend request → as-is. */
+export function createPiDirectSendGuard(): (url: string, input: string | URL | Request, init: RequestInit | undefined) => Promise<DirectSendPrep> {
+    return async (_url, input, init) => {
+        let text: string | undefined;
+        try {
+            if (typeof init?.body === "string") {
+                text = init.body;
+            } else if (input instanceof Request) {
+                text = await input.clone().text();
+            }
+        } catch {
+            text = undefined; // unreadable body — treat as standalone
+        }
+        if (text === undefined || text.length === 0) return { outcome: "as-is" };
+        let parsed: unknown;
+        try {
+            parsed = JSON.parse(text);
+        } catch {
+            return { outcome: "as-is" };
+        }
+        const sid = incrementalEnvelopeConversationId(parsed);
+        if (sid === undefined) return { outcome: "as-is" };
+        const body = takePiIncrementalOriginal(sid);
+        return body === null ? { outcome: "unrestorable" } : { outcome: "restored", body };
+    };
+}
+
 export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalMs?: number }): (pi: ExtensionAPI) => void {
     return function biliPlugin(pi: ExtensionAPI): void {
         const agent = agentName(agentOverride);
         const state: RegisterState = { retryIntervalMs: opts?.retryIntervalMs ?? RETRY_INTERVAL_MS };
+        // #3066/#3516: tool-output guardrails (output cap / bash timeout /
+        // repetition loop-break); knobs resolve env > file > default so the
+        // documented BILI_GUARDRAIL_* / guardrails.* switches work end-to-end.
+        // maxBytes maps knob-undefined(disabled) → 0(no cap): wireToolGuardrails
+        // treats undefined as its 50KB default, not as "off".
+        wireToolGuardrails(pi, {
+            bashTimeout: guardrailBashTimeout(),
+            maxBytes: guardrailMaxOutputBytes() ?? 0,
+            repetition: guardrailRepetition(),
+        });
         // #2336: one successful agent-providers report per plugin instance;
         // retried on later session_starts while the proxy base is unknown
         // (native mode resolves it asynchronously).
@@ -680,7 +1009,7 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
             try {
                 return (await fetchStatus(proxyBase, sid)) !== undefined;
             } catch (err) {
-                console.error(`bili-plugin(${agent}): compaction ownership probe failed (${err instanceof Error ? err.message : String(err)}) — leaving native compaction enabled`);
+                logHostEvent("error", "[native-client]", `bili-plugin(${agent}): compaction ownership probe failed (${err instanceof Error ? err.message : String(err)}) — leaving native compaction enabled`);
                 return false;
             }
         };
@@ -731,14 +1060,47 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                 try {
                     const switched = await pi.setModel?.({ ...model, baseUrl: rewritten });
                     if (switched === false) {
-                        console.error(`bili-plugin: omp setModel(${provider}/${String(model.id)}) rejected (no API key) — traffic for this provider goes direct`);
+                        logHostEvent("error", "[native-client]", `bili-plugin: omp setModel(${provider}/${String(model.id)}) rejected (no API key) — traffic for this provider goes direct`);
                     }
                 } catch (err) {
-                    console.error(`bili-plugin: omp setModel failed: ${err instanceof Error ? err.message : String(err)} — traffic goes direct`);
+                    logHostEvent("error", "[native-client]", `bili-plugin: omp setModel failed: ${err instanceof Error ? err.message : String(err)} — traffic goes direct`);
                 }
             };
             pi.on("session_start", (_event, ctx) => repin(ctx));
             pi.on("session_switch", (_event, ctx) => repin(ctx));
+        }
+        if (agent === "pi" && typeof pi.registerMessageRenderer === "function") {
+            pi.registerMessageRenderer("bili-acp-status", (message, { expanded, outputPad }, theme) => {
+                if (expanded) return undefined;
+                const text = typeof message.content === "string" ? message.content
+                    : message.content.filter((part) => part.type === "text").map((part) => part.text).join("\n");
+                const lines = text.split("\n");
+                // Block-detail line shape is owned by the kernel's buildStatusPanel
+                // (kernel/src/panel/panel.ts); if it ever changes, folding degrades to full display.
+                const collapsed = lines.filter((line) => !/^  \[b\d+\] T\d+ /.test(line));
+                if (collapsed.length === lines.length) return undefined;
+                const box = new Box(outputPad ?? 1, 1, (line) => theme.bg("customMessageBg", line));
+                box.addChild(new Text(theme.fg("customMessageLabel", "\x1b[1m[bili-acp-status]\x1b[22m"), 0, 0));
+                box.addChild(new Spacer(1));
+                box.addChild(new Markdown(collapsed.join("\n"), 0, 0, {
+                    heading: (value) => theme.fg("mdHeading", value),
+                    link: (value) => theme.fg("mdLink", value),
+                    linkUrl: (value) => theme.fg("mdLinkUrl", value),
+                    code: (value) => theme.fg("mdCode", value),
+                    codeBlock: (value) => theme.fg("mdCodeBlock", value),
+                    codeBlockBorder: (value) => theme.fg("mdCodeBlockBorder", value),
+                    quote: (value) => theme.fg("mdQuote", value),
+                    quoteBorder: (value) => theme.fg("mdQuoteBorder", value),
+                    hr: (value) => theme.fg("mdHr", value),
+                    listBullet: (value) => theme.fg("mdListBullet", value),
+                    bold: (value) => theme.bold(value),
+                    italic: (value) => theme.italic(value),
+                    underline: (value) => theme.underline(value),
+                    strikethrough: (value) => theme.strikethrough(value),
+                }, { color: (value) => theme.fg("customMessageText", value) }));
+                box.addChild(new Text(theme.fg("dim", "Ctrl+O to expand full ACP report"), 0, 0));
+                return box;
+            });
         }
         if (typeof pi.registerCommand === "function") {
             pi.registerCommand("acp", {
@@ -776,7 +1138,7 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                             version = undefined;
                         }
                         if (version !== undefined) {
-                            notify(armedIdleNotice(version), "info");
+                            notify(armedIdleNotice(version, proxyBase), "info");
                         } else {
                             notify(noSessionWarning(), "warning");
                         }
@@ -794,7 +1156,7 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                             pi.sendMessage({ customType: "bili-acp-status", content: text, display: true });
                             return;
                         } catch (err) {
-                            console.error(`bili-plugin(${agent}): sendMessage failed (${err instanceof Error ? err.message : String(err)}) — falling back to notify`);
+                            logHostEvent("error", "[native-client]", `bili-plugin(${agent}): sendMessage failed (${err instanceof Error ? err.message : String(err)}) — falling back to notify`);
                         }
                     }
                     notify(text, "info");
@@ -842,7 +1204,7 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                             pi.sendMessage({ customType: "bili-acp-cache", content: wrapCacheReport(text), display: true });
                             return;
                         } catch (err) {
-                            console.error(`bili-plugin(${agent}): sendMessage failed (${err instanceof Error ? err.message : String(err)}) — falling back to notify`);
+                            logHostEvent("error", "[native-client]", `bili-plugin(${agent}): sendMessage failed (${err instanceof Error ? err.message : String(err)}) — falling back to notify`);
                         }
                     }
                     notify(text, "info");
@@ -915,13 +1277,28 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                             pi.sendMessage({ customType: "bili-acp-rule", content: wrapRuleReport(text), display: true });
                             return;
                         } catch (err) {
-                            console.error(`bili-plugin(${agent}): sendMessage failed (${err instanceof Error ? err.message : String(err)}) — falling back to notify`);
+                            logHostEvent("error", "[native-client]", `bili-plugin(${agent}): sendMessage failed (${err instanceof Error ? err.message : String(err)}) — falling back to notify`);
                         }
                     }
                     notify(text, "info");
                 },
             });
         }
+        // Await tool registration in before_agent_start so cold-start native
+        // sessions register ACP tools BEFORE pi's _prepareRun freezes Turn 1's
+        // active tool loadout and <codemode_catalog> system prompt. Without this,
+        // session_start's unawaited registerTools(..., false) can lose the race
+        // with native proxy boot, registerTools only completes later inside
+        // before_provider_headers/before_provider_request (after Turn 1's
+        // system prompt is already built), and Turn 2 emits a mid-conversation
+        // role:"system" codemode_catalog diff.
+        pi.on("before_agent_start", async (_event, ctx) => {
+            try {
+                await registerTools(pi, ctx, state, agent);
+            } catch (err) {
+                logHostEvent("error", "[native-client]", `bili-plugin(${agent}): tool registration failed (${err instanceof Error ? err.message : String(err)}) — riding wire mode for this turn`);
+            }
+        });
         pi.on("before_provider_headers", async (event, ctx) => {
             try {
                 // #1243: on the native lane the proxy origin lands via an async
@@ -946,7 +1323,7 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                 try {
                     await registerTools(pi, ctx, state, agent);
                 } catch (err) {
-                    console.error(`bili-plugin(${agent}): tool registration failed (${err instanceof Error ? err.message : String(err)}) — riding wire mode for this request`);
+                    logHostEvent("error", "[native-client]", `bili-plugin(${agent}): tool registration failed (${err instanceof Error ? err.message : String(err)}) — riding wire mode for this request`);
                 }
                 // The x-bili-plugin marker tells the proxy "the client owns the
                 // ACP tools natively — skip wire-level injection". Ownership is
@@ -961,6 +1338,15 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                         state.carriedSids.add(sid);
                     }
                     headers["x-bili-plugin"] = agent;
+                    // #3248: when the lane advertises incremental turns, declare
+                    // the divert intent. Declaring is safe — the lane shape-tests
+                    // the body, so full-resend turns (retries, dead conversations,
+                    // side lanes) ride the normal pipeline anyway. pi only: omp
+                    // never emits before_provider_headers, so its requests carry
+                    // no x-bili-plugin marker and the divert would never fire.
+                    if (agent === "pi" && proxyBase !== undefined && await probeIncrementalTurns(proxyBase)) {
+                        headers[INCREMENTAL_TURN_MARKER_HEADER] = "1";
+                    }
                     const window = ctx.model?.contextWindow;
                     if (typeof window === "number" && Number.isFinite(window) && window > 0) {
                         headers["x-bili-plugin-context-window"] = String(Math.floor(window));
@@ -970,14 +1356,15 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                     // maxTokens lives on the model object when configured.
                     const modelId = ctx.model?.id;
                     if (typeof modelId === "string" && modelId.length > 0) {
-                        headers["x-bili-plugin-model"] = modelId;
+                        const modelHeader = asciiHeaderValue(modelId);
+                        if (modelHeader !== undefined) headers["x-bili-plugin-model"] = modelHeader;
                         const maxOut = (ctx.model as { maxTokens?: unknown } | undefined)?.maxTokens;
                         if (typeof maxOut === "number" && Number.isFinite(maxOut) && maxOut > 0) headers["x-bili-plugin-max-output"] = String(Math.floor(maxOut));
                         reportRuntimeInfoOnChange(proxyBase, { agent, model: modelId, contextWindow: typeof window === "number" && window > 0 ? Math.floor(window) : undefined, maxOutput: typeof maxOut === "number" && maxOut > 0 ? Math.floor(maxOut) : undefined, baseURL: ctx.model?.baseUrl, source: "client-config" });
                     }
                 }
             } catch (err) {
-                console.error(`bili-plugin(${agent}): header stamp skipped (${err instanceof Error ? err.message : String(err)})`);
+                logHostEvent("error", "[native-client]", `bili-plugin(${agent}): header stamp skipped (${err instanceof Error ? err.message : String(err)})`);
             }
         });
         // omp never emits before_provider_headers — where pi stamps the
@@ -1016,8 +1403,79 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
         // the shared coordinator; the per-sid parent cache avoids re-reading
         // the parent session file (64KB sync read in parentConversationIdOf)
         // on every model request.
-        const forkAdopter = createForkAdopter((line) => console.error(`bili-plugin(${agent}): ${line}`));
+        const forkAdopter = createForkAdopter((line) => logHostEvent("error", "[native-client]", `bili-plugin(${agent}): ${line}`));
         const forkParents = new Map<string, string | undefined>();
+        const forkSeedVerdicts = new Map<string, "seeded" | "lineage-only" | "unknown">();
+        // #3248 incremental turns: outbound plans awaiting their ack. Keyed by
+        // conversation id; one entry per in-flight incremental turn (pi sends
+        // model requests strictly sequentially per session). Cleared on the
+        // after_provider_response ack, dropped on failure.
+        const pendingIncrementalAcks = new Map<string, { messages: IncrementalWireMessage[]; system: unknown; base: string }>();
+        async function maybeIncrementalTurn(event: { payload?: unknown }, ctx: Ctx): Promise<unknown> {
+            if (state.toolsReady !== true) return undefined; // no marker stamped → must not replace
+            const payload = event.payload as { messages?: unknown; system?: unknown } | undefined;
+            if (payload === null || typeof payload !== "object" || !Array.isArray((payload as { messages?: unknown }).messages)) return undefined;
+            if (!wireMessagesLookAnthropic(payload.messages)) return undefined; // anthropic wire only — OpenAI tool shapes resend full (#3433)
+            const sid = sessionIdOf(ctx);
+            if (sid === undefined || sid.length === 0) return undefined;
+            let proxyBase = proxyBaseForCtx(ctx);
+            if (proxyBase === undefined) proxyBase = await awaitNativeProxyOrigin();
+            if (proxyBase === undefined) return undefined;
+            if (!(await probeIncrementalTurns(proxyBase))) return undefined;
+            // #4352: the response-header ack channel is transport-dependent —
+            // pi's after_provider_response only exposes headers for some
+            // provider transports, and a missed ack makes EVERY next turn
+            // re-seed the full history (the 2026-10-22 incident: turn 2 sent
+            // sinceSeq=0 again). Before planning, reconcile any still-pending
+            // un-acked turn by PULLING the lane's receipt and adopting it only
+            // when the boundary hash proves the canonical absorbed OUR last
+            // message — never on mere seq progress (a foreign full-resend can
+            // advance the canonical too).
+            const pendingAck = pendingIncrementalAcks.get(sid);
+            if (pendingAck !== undefined && pendingAck.messages.length > 0) {
+                const receipt = await pullIncrementalReceipt(proxyBase, sid);
+                const expected = incrementalWireHash(pendingAck.messages[pendingAck.messages.length - 1]);
+                if (receipt !== null && receipt.appliedSeq > 0 && receipt.boundary === expected) {
+                    pendingIncrementalAcks.delete(sid);
+                    piIncrementalOriginals.delete(sid);
+                    noteIncrementalAck(sid, receipt.appliedSeq, pendingAck.messages, pendingAck.system);
+                }
+            }
+            const plan = planIncrementalTurn({
+                conversationId: sid,
+                // The marker divert uses the ORIGINAL request URL server-side;
+                // this path is only a placeholder for the direct-endpoint form.
+                path: "/v1/messages",
+                messages: payload.messages as IncrementalWireMessage[],
+                system: "system" in payload ? payload.system : undefined,
+                request: payload as Record<string, unknown>,
+            });
+            if (plan.mode === "skip") return undefined;
+            // #3304: stash the ORIGINAL payload under this conversation — the
+            // direct-send guard restores it if the proxy dies before the
+            // swapped envelope lands on the wire.
+            stashPiIncrementalOriginal(sid, payload);
+            pendingIncrementalAcks.set(sid, { messages: payload.messages as IncrementalWireMessage[], system: "system" in payload ? payload.system : undefined, base: proxyBase });
+            const body = JSON.parse((plan as { body: string }).body) as { messages: IncrementalWireMessage[]; msgIds?: string[] };
+            // #4491 pi msgids wiring: attach the pi session's stable message
+            // ids (aligned to the FULL outgoing wire) sliced to the plan's
+            // delta messages, all-or-nothing — one unresolvable message, a
+            // multi-block delta message (the lane pins 1:1 onto the flattened
+            // core messages and 400s otherwise), or a poison-shaped id leaves
+            // the field off entirely and the turn rides content-derived ids.
+            let branch: unknown;
+            try {
+                branch = ctx.sessionManager?.getBranch?.();
+            } catch {
+                branch = undefined;
+            }
+            const ids = laneMsgIdsForWire(payload.messages, branch);
+            if (ids !== undefined && body.messages.every((m) => lanePinnableContent(m.content))) {
+                const sliced = ids.slice(ids.length - body.messages.length);
+                if (sliced.length === body.messages.length && validateMsgIds(sliced, sliced.length).ok) body.msgIds = sliced;
+            }
+            return body;
+        }
         async function maybeAdoptForkChild(event: unknown, ctx: Ctx): Promise<void> {
             if (state.toolsReady !== true) return;
             const sid = sessionIdOf(ctx);
@@ -1025,12 +1483,63 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
             if (!forkParents.has(sid)) forkParents.set(sid, parentConversationIdOf(ctx));
             const parent = forkParents.get(sid);
             if (parent === undefined || parent === "" || parent === sid) return;
+            // #2469: seeding evidence is evaluated ONCE per sid — the first
+            // model request IS the adoption window (later requests can only
+            // CHILD_CONFLICT), so a lineage-only verdict can never lose a
+            // later adoption opportunity. Lineage-only children skip every
+            // network call; their derivedFrom link (registerTools) stays
+            // read-only.
+            if (!forkSeedVerdicts.has(sid)) {
+                const count = replayedMessageCount(ctx);
+                const verdict = count === undefined ? "unknown" : count >= FORK_SEED_MIN_REPLAYED_MESSAGES ? "seeded" : "lineage-only";
+                forkSeedVerdicts.set(sid, verdict);
+                if (verdict === "lineage-only") {
+                    logHostEvent("warn", "[native-client]", `bili-plugin(${agent}): fork adoption for ${sid} skipped — lineage-only child (${count} message(s) in its own branch, no replayed parent history); the derivedFrom link stays read-only (#2469)`);
+                }
+            }
+            if (forkSeedVerdicts.get(sid) === "lineage-only") return;
             let proxyBase = proxyBaseForCtx(ctx);
             if (proxyBase === undefined) proxyBase = await awaitNativeProxyOrigin();
             if (proxyBase === undefined) return;
             await forkAdopter.maybeAdopt({ base: proxyBase, parent, child: sid, body: (event as { payload?: unknown } | undefined)?.payload });
         }
         pi.on("before_provider_request", async (event, ctx) => {
+            // #5403/#5418 unified watermark channel: capture THIS request's
+            // host msgids per family for the ONE chokepoint emitter. Runs on
+            // EVERY model request — including the OpenAI-family turns the
+            // incremental divert shape-gates away (#3433). A failed resolution
+            // CLEARS the previous list; a stale anchor is worse than no field.
+            {
+                const pfSid = sessionIdOf(ctx);
+                if (pfSid !== undefined && pfSid.length > 0) {
+                    const payload = (event as { payload?: unknown } | undefined)?.payload;
+                    const msgs = payload === null || typeof payload !== "object" ? undefined : (payload as { messages?: unknown }).messages;
+                    let branch: unknown;
+                    try {
+                        branch = ctx.sessionManager?.getBranch?.();
+                    } catch {
+                        branch = undefined;
+                    }
+                    pfChannel.pfCaptureIds(
+                        pfSid,
+                        Array.isArray(msgs) && msgs.length > 0
+                            ? wireMessagesLookAnthropic(msgs)
+                                ? laneMsgIdsForWire(msgs, branch)
+                                : laneMsgIdsForOpenAiWire(msgs, branch)
+                            : undefined,
+                    );
+                }
+            }
+            // #4491 omp msgids: snapshot the branch's stable entry ids BEFORE
+            // any await below — the hint must be the generation of THIS
+            // payload. The fetch-layer planner (omp-native) reads it back by
+            // the prompt_cache_key conversation id and carries `msgIds` only
+            // when the ids align 1:1 with the actually-sent messages; any
+            // mismatch degrades to no field, never a misaligned array.
+            if (agent === "omp") {
+                const hintSid = sessionIdOf(ctx);
+                if (hintSid !== undefined && hintSid.length > 0) noteHostMsgIdHint(hintSid, ompBranchMsgIdEntries(ctx));
+            }
             // omp emits this per model request (but never before_provider_headers);
             // it doubles as the retry driver when the session_start manifest
             // fetch raced the proxy startup. Cached by sid, throttled by retryAt.
@@ -1048,7 +1557,7 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
             try {
                 await registerTools(pi, ctx, state, agent);
             } catch (err) {
-                console.error(`bili-plugin(${agent}): tool registration failed (${err instanceof Error ? err.message : String(err)}) — riding wire mode for this request`);
+                logHostEvent("error", "[native-client]", `bili-plugin(${agent}): tool registration failed (${err instanceof Error ? err.message : String(err)}) — riding wire mode for this request`);
             }
             if (agent === "omp") {
                 // #1531: awaited so the report lands BEFORE this request's
@@ -1056,7 +1565,7 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                 try {
                     await reportOmpRuntimeInfo(ctx);
                 } catch (err) {
-                    console.error(`bili-plugin(omp): runtime-info report failed (${err instanceof Error ? err.message : String(err)}) — riding legacy window resolution`);
+                    logHostEvent("error", "[native-client]", `bili-plugin(omp): runtime-info report failed (${err instanceof Error ? err.message : String(err)}) — riding legacy window resolution`);
                 }
             }
             // #2399 stage 2: adoption must win the race with the child's first
@@ -1066,10 +1575,77 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
             try {
                 await maybeAdoptForkChild(event, ctx);
             } catch (err) {
-                console.error(`bili-plugin(${agent}): fork adoption failed (${err instanceof Error ? err.message : String(err)}) — starting the session fresh (#2399)`);
+                logHostEvent("error", "[native-client]", `bili-plugin(${agent}): fork adoption failed (${err instanceof Error ? err.message : String(err)}) — starting the session fresh (#2399)`);
+            }
+            // #3248 incremental turns: pi only (the divert needs the
+            // x-bili-plugin marker this extension stamps in
+            // before_provider_headers — omp never fires that hook). Replaces
+            // the full-resend payload with the delta; skips prompt-cache-key
+            // stamping when it does (the lane owns cache stability through
+            // the server-side canonical).
+            if (agent === "pi") {
+                try {
+                    const replaced = await maybeIncrementalTurn(event, ctx);
+                    if (replaced !== undefined) return replaced;
+                } catch (err) {
+                    logHostEvent("error", "[native-client]", `bili-plugin(${agent}): incremental turn skipped (${err instanceof Error ? err.message : String(err)}) — full resend this turn`);
+                }
             }
             return stampPromptCacheKey(event, ctx, agent);
         });
+        // #3248 incremental turns: the ack channel. after_provider_response
+        // fires with status + headers BEFORE the stream is consumed, so the
+        // x-bili-applied-seq header is readable here. 200 → record the ack
+        // (the server seq is the only sinceSeq authority); 409 → sticky
+        // per-conversation fallback (seed always resyncs, so a delta 409 means
+        // genuine drift pi's own retry loop cannot repair); 503 → drop the
+        // probe cache so the next turn re-probes (rollout flag or sidecar
+        // liveness changed on the lane).
+        pi.on("after_provider_response", ((event: unknown, ctx: Ctx) => {
+            try {
+                const sid = sessionIdOf(ctx);
+                if (sid === undefined || sid.length === 0) return;
+                const pending = pendingIncrementalAcks.get(sid);
+                if (pending === undefined) return;
+                const status = (event as { status?: unknown }).status;
+                const headers = (event as { headers?: Record<string, unknown> }).headers;
+                const seq = headers?.["x-bili-applied-seq"];
+                if (status === 200 && !(typeof seq === "string" && /^\d+$/.test(seq))) {
+                    // 200 without an ack header CANNOT be the marker'd response —
+                    // the lane stamps x-bili-applied-seq on every diverted
+                    // response that reaches the forward (incremental-lane.ts
+                    // writeHead wrap). It is a concurrent full-resend response
+                    // for this conversation: keep the pending entry for the
+                    // marker'd response still in flight.
+                    return;
+                }
+                pendingIncrementalAcks.delete(sid);
+                piIncrementalOriginals.delete(sid); // #3304: turn settled — original no longer needed
+                if (status === 200) {
+                    noteIncrementalAck(sid, Number(seq), pending.messages, pending.system);
+                    return;
+                }
+                if (status === 409) {
+                    // #3369: one 409 resets the conversation state — the next
+                    // turn re-seeds with resync:true (never 409s) instead of
+                    // permanently downgrading to full resend. Only a streak of
+                    // consecutive 409s (no ack between) trips the sticky kill.
+                    const verdict = noteIncrementalRejection(sid);
+                    logHostEvent("warn", "[native-client]", `bili-plugin(${agent}): incremental turn rejected (seq drift) for ${sid} — ${verdict === "dead" ? "sticky fallback to full resend (rejection circuit)" : "re-seeding with a full resync next turn"} (#3369)`);
+                    return;
+                }
+                if (status === 503) {
+                    // #3369: 503 means the lane is temporarily unavailable
+                    // (sidecar boot / rollout flip) — the conversation's ack
+                    // state is still valid, so do NOT kill it. Just drop the
+                    // probe cache; the next turn re-probes and resumes.
+                    clearIncrementalProbe(pending.base);
+                    logHostEvent("warn", "[native-client]", `bili-plugin(${agent}): incremental turns unavailable on the lane — re-probing next turn (conversation state preserved, #3369)`);
+                }
+            } catch (err) {
+                logHostEvent("error", "[native-client]", `bili-plugin(${agent}): incremental ack handling failed (${err instanceof Error ? err.message : String(err)})`);
+            }
+        }) as unknown as (...args: unknown[]) => void);
         pi.on("session_start", (_event, ctx) => {
             if (!agentProvidersDone) {
                 agentProvidersDone = true;
@@ -1079,7 +1655,7 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                     agentProvidersDone = false;
                 }).catch((err: unknown) => {
                     agentProvidersDone = false;
-                    console.warn(`bili-plugin(${agent}): agent-providers report failed (${err instanceof Error ? err.message : String(err)}) — bili-side provider references to host models stay unresolved`);
+                    logHostEvent("warn", "[native-client]", `bili-plugin(${agent}): agent-providers report failed (${err instanceof Error ? err.message : String(err)}) — bili-side provider references to host models stay unresolved`);
                 });
             }
             if (agent === "pi") {
@@ -1088,10 +1664,10 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                     agent,
                     sessionId: sessionIdOf(ctx),
                     filePath: entryFile,
-                    log: (m) => console.warn(`bili-plugin(pi): ${m}`),
+                    log: (m) => logHostEvent("warn", "[native-client]", `bili-plugin(pi): ${m}`),
                 });
                 if (regReason !== "registered" && regReason !== "registered-already") {
-                    console.warn(`bili-plugin(pi): subagent self-registration skipped (${regReason})`);
+                    logHostEvent("warn", "[native-client]", `bili-plugin(pi): subagent self-registration skipped (${regReason})`);
                 }
             }
             state.sid = undefined;
@@ -1103,7 +1679,7 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
             // per-event handlers below get a fresh ctx each time and are the
             // ones that await the origin (#1243 pattern); launcher mode is
             // unaffected (its base resolves synchronously).
-            void registerTools(pi, ctx, state, agent, false).catch((err: unknown) => console.error(`bili-plugin(${agent}): ${err instanceof Error ? err.message : String(err)}`));
+            void registerTools(pi, ctx, state, agent, false).catch((err: unknown) => logHostEvent("error", "[native-client]", `bili-plugin(${agent}): ${err instanceof Error ? err.message : String(err)}`));
             // #2322: a resumed session may carry a name without ever firing
             // session_info_changed (nothing changed) — stamp the current
             // value once per session start so the proxy label follows it.
@@ -1121,6 +1697,9 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
         pi.on("session_shutdown", () => {
             disposeSubagentSelfReg(subagentReg);
         });
+        // #3542: a /tree rewind resets the active loadout from the transcript —
+        // re-assert ours right after the reset (see reassertLoadoutAfterTree).
+        pi.on("session_tree", () => reassertLoadoutAfterTree(pi, state, agent));
         // omp fires session_compact on in-session native compaction (sid does
         // not rotate), so the proxy reuses stale state — notify it to archive
         // the now-unreachable blocks (#395). Fire-and-forget: a failed

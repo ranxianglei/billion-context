@@ -116,8 +116,10 @@ test("#749 anthropic wire: acp_rule injected alongside ACP tools when rules enab
         assert.equal(names.filter((n) => n === "acp_rule").length, 1, "acp_rule appears exactly once");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         up.server.close();
+        up.server.closeIdleConnections?.();
         await once(up.server, "close");
     }
 });
@@ -137,8 +139,10 @@ test("#1399 anthropic wire: acp_rule NOT injected when unset (opt-in)", async ()
         assert.ok(!names.includes("acp_rule"), `acp_rule absent while unset — opt-in (got: ${names.join(", ")})`);
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         up.server.close();
+        up.server.closeIdleConnections?.();
         await once(up.server, "close");
     }
 });
@@ -158,8 +162,10 @@ test("#749 anthropic wire: acp_rule NOT injected when explicitly disabled", asyn
         assert.ok(!names.includes("acp_rule"), `acp_rule absent when disabled (got: ${names.join(", ")})`);
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         up.server.close();
+        up.server.closeIdleConnections?.();
         await once(up.server, "close");
     }
 });
@@ -186,8 +192,10 @@ test("#749 openai wire: acp_rule function tool injected when rules enabled", asy
         assert.equal(names.filter((n) => n === "acp_rule").length, 1, "acp_rule appears exactly once");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         up.server.close();
+        up.server.closeIdleConnections?.();
         await once(up.server, "close");
     }
 });
@@ -209,8 +217,10 @@ test("#749 responses wire: acp_rule flat tool injected when rules enabled", asyn
         assert.equal(names.filter((n) => n === "acp_rule").length, 1, "acp_rule appears exactly once");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         up.server.close();
+        up.server.closeIdleConnections?.();
         await once(up.server, "close");
     }
 });
@@ -238,8 +248,10 @@ test("#749 anthropic wire: client-supplied tools merge without duplicating acp_r
         assert.ok(names.includes("compress"), "missing ACP tools still appended");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         up.server.close();
+        up.server.closeIdleConnections?.();
         await once(up.server, "close");
     }
 });

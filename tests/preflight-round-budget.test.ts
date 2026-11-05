@@ -140,8 +140,10 @@ test("e2e preflight: a payload that needs more folds than one round allows is st
         assert.ok(markers < MESSAGES * FILLER_REPEATS, `the fold must drop raw range text, still carried ${markers}`);
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });
@@ -186,8 +188,10 @@ test("e2e preflight: beyond the round budget the fail-fast reports the post-fold
         assert.equal(CALLS.filter((c) => c.raw.includes('"stream":true')).length, 0, "the over-window payload was NOT forwarded");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });

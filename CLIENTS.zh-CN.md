@@ -9,14 +9,18 @@
 
 两条通道，同一个插件(#941):
 
-- **启动器:** `bili dsh` 经 `--patch` overlay(`~/.dsh-bili/.bili-acp.patch.yml`)注入完整原生插件 —— 每个 profile 启动即注册 bili 工具，模型请求盖 `x-bili-plugin` + dsh 会话 id(plugin 模式)，`/acp` 会话绑定。同一份 patch 同时禁用 dsh 原生自动压缩(`compaction-basic` → `auto: false`);手动 `/compact` 仍可用。
-- **Profile 安装(免启动器)——统一泳道(#966):** `bili plugin install dsh` 对每个已存在的 profile 执行 `dsh plugin --profile <name> add billion-context` —— pnpm 把包装进各 profile 自己的 `node_modules`,dsh 自动挂载包内 patch 层(`dsh.bundle.patch.yml`)。装哪个源取决于 bili 自身的安装形态(#925):npm 安装传注册表名,checkout/dev 构建传绝对路径(`link:` 依赖,本地改动实时生效)。旧版受管块(`# bili begin` / `# bili end`,#966 之前的安装所写)在安装与卸载时都会被剥离 —— 用户条目与注释保留,清空的文件还原占位 `[]`。先在每个 profile 里跑过一次 dsh 让目录存在。插件加载时自拉起代理(已有健康实例则附看，不重复拉;父进程 pid 看门狗)，经全局 fetch 补丁把模型流量改写为 `<proxy>/bili/<上游URL>`，原样注册清单工具，并按工具就绪门控 plugin 模式头(第一轮走 wire 模式)。退出开关:`BILI_NATIVE_DSH=0`。卸载:`bili plugin remove dsh` 或 `dsh plugin --profile <name> remove billion-context` —— 两者走同一通道。经注册表安装要求 npm 上已发布含 `dsh.bundle.patch.yml` 的版本。若 add 后 dsh 启动即报 `billion-context/dsh` 的 `ERR_MODULE_NOT_FOUND`,说明 profile 从陈旧的包元数据缓存里解析到了不含 bundle 子路径导出的旧版本(#953)——固定版本重装:`dsh plugin --profile <name> add billion-context@latest`。
+- **启动器:** `bili dsh` 经 `--patch` overlay(`~/.dsh-bili/.bili-acp.patch.yml`)注入完整原生插件 —— 每个 profile 启动即注册 bili 工具，模型请求盖 `x-bili-plugin` + dsh 会话 id(plugin 模式)，`/acp` 会话绑定。同一份 patch 同时禁用 dsh 原生自动压缩(宿主平面 `compaction-basic` → `auto: false`,web profile 的 preset 实例由 #3354 加载期 overlay 关闭);非 web profile 下手动 `/compact` 仍可用。
+- **Profile 安装(免启动器)——统一泳道(#966):** `bili plugin install dsh` 对每个已存在的 profile 执行 `dsh plugin --profile <name> add billion-context` —— pnpm 把包装进各 profile 自己的 `node_modules`,dsh 自动挂载包内 patch 层(`dsh.bundle.patch.yml`)。装哪个源取决于 bili 自身的安装形态(#925):npm 安装传注册表名,checkout/dev 构建传绝对路径(`link:` 依赖,本地改动实时生效)。旧版受管块(`# bili begin` / `# bili end`,#966 之前的安装所写)在安装与卸载时都会被剥离 —— 用户条目与注释保留,清空的文件还原占位 `[]`。先在每个 profile 里跑过一次 dsh 让目录存在。插件加载时自拉起代理(已有健康实例则附看，不重复拉;父进程 pid 看门狗)，经全局 fetch 补丁把模型流量改写为 `<proxy>/bili/<上游URL>`，原样注册清单工具，并按工具就绪门控 plugin 模式头(第一轮走 wire 模式)。退出开关:`BILI_NATIVE_DSH=0`。卸载:`bili plugin remove dsh` 或 `dsh plugin --profile <name> remove billion-context` —— 两者走同一通道。经注册表安装要求 npm 上已发布含 `dsh.bundle.patch.yml` 的版本;请装 npm 形态 —— 直接填 GitHub 地址装到的是没有 `dist/` 的源码(入口悬空、dsh 静默跳过该 bundle;安装期守卫现在会响亮失败并给出正确装法,#2471)。若 add 后 dsh 启动即报 `billion-context/dsh` 的 `ERR_MODULE_NOT_FOUND`,说明 profile 从陈旧的包元数据缓存里解析到了不含 bundle 子路径导出的旧版本(#953)——固定版本重装:`dsh plugin --profile <name> add billion-context@latest`。
 - **桌面应用(Electron 宿主):** 同一插件也运行在 deepseek-harness **desktop** 应用内(经其应用内插件管理器安装)。此时 bootstrap 在应用进程内拉起代理:该进程的 `process.execPath` 是 Electron 二进制而非 Node,GUI 的 PATH 又不含常规安装目录 —— `resolveNodeRuntime`(#819/#1429)先探测众所周知的安装位置(`/opt/homebrew/bin`、`/usr/local/bin`、Volta 等),再回退到以纯 Node 方式运行应用自身二进制(`ELECTRON_RUN_AS_NODE=1`,强制注入子进程 env),于是无需 PATH 里有独立 Node 也能零配置压缩;设 `BILLION_CONTEXT_NODE` 可强制指定某个 Node(优先于两者)。#1429 之前该路径在 spawn 前抛错,所有会话静默降级为直连(不压缩),只能从 bili.log 里发现。
 - **自动更新保持各 profile 同步:** 刷新有两个触发器 —— 全局自更新完成后,以及**profile 自己的代理**在周期检查里发现注册表有新版本时(全局 bili 从不运行也一样刷新,#1196 —— 插件市场安装的用户往往根本没有全局安装)。两种触发器都扫描 `~/.dsh/profiles/*/package.json`,把注册表钉住的 `billion-context` 依赖刷新到目标版本(全局触发器刷到新全局版本,自触发刷到注册表最新),统一经 dsh 自己的 `plugin add` 通道,绝不在位覆盖 —— 加载的插件与代理从此不再漂移(#953);钉在本地源的 profile 不动。刷新是尽力而为,失败下个周期重试,绝不会让代理或更新本身失败。
 - **已报告:Profile 安装下部分传输零代理流量(#1158,调查中):** dsh `llm-pi-ai` 层的部分传输服务会话**从未有任何模型请求到达代理**(日志无 `processTurn`,调用 bili 工具返回 404 "no model request has arrived"),而同宿主的其他 provider 正常。根因仍在用运行时证据定性 —— 候选:传输层 fetch 形态(SDK 注入 fetch / 非全局 dispatcher)或宿主侧归属缺口导致流量未被 takeover gate 认领。检测:此类情况会打一次性 `[plugin] NO MODEL REQUESTS seen for conversation …` 告警,dsh 插件还会把归属 gate 放行的每个端点各记一条日志(每进程一次)。期间可靠规避:改用 `bili dsh` 启动 —— 启动器的 settings overlay 会把那些 provider 的 `baseURL` 重写为 `/bili/` URL,无论传输层使用哪种 fetch、归属状态如何,流量都必然过代理。
-- **Web profile 说明(#1772):** 当 profile 的 bundles 含 `@deepseek-ai/dsh-web-app` 时,真正运行的 `compaction-basic` 实例位于 agent preset(`preset-standard.config.plugins`)内部 —— dsh 的 patch 引擎只按 id 索引顶层条目与真 group(`group: true` 且 config 为数组)的子项,preset 内的嵌套行任何 patch 层都够不到。于是 bundle 里的 `auto: false` 落在 web-app 已禁用的宿主平面行上,preset 实例保持自动压缩开启。此类 profile 启动时插件打一条一次性 `[dsh-client]` 告警;ACP 压缩不受影响。
+- **Web profile 压缩(#1772,#3354 解决):** 当 profile 的 bundles 含 `@deepseek-ai/dsh-web-app` 时,真正运行的 `compaction-basic` 实例位于 agent preset(`preset-standard.config.plugins`)内部 —— dsh 的 patch 引擎只按 id 索引顶层条目与真 group(`group: true` 且 config 为数组)的子项,preset 内的嵌套行任何 patch 层都无法**按 id 直寻**。于是 bundle 里的 `auto: false` 落在 web-app 已禁用的宿主平面行上、什么都没改。#3354 起 bili 在**加载期**补上这一环:一个**常驻**的 bundle 条目 `bili-compaction-gate`(与 `bili-native` 并列的独立 cordis 条目,由同一组 patch 层挂载,因此 `bili-native` 被禁用或 kill-switch 时它仍然存活,#3662)注册一个 cordis `internal/config` overlay(移植自 deshark42/dsh-compaction-basic-disable,MIT),在 bili 持有该泳道期间把 preset 里的 `compaction-basic` 与 `command-compact` 行标记为 `disabled: true`;#4147 起该匹配是**结构化**的 —— 任何 entry 的 `config.plugins` 里嵌套了这两个包的行都会被禁用,自定义/本地 preset 与官方 preset 一视同仁(`dsh.bundle.patch.yml` 里的四个门控 id 只是对官方 roster 的顺序保险,不是覆盖边界);bundle patch 里的 preset 门控行让每个 Web preset 在注册前等待该 overlay 的服务。这些 profile 里原生自动压缩同样关闭(且 `/compact` 在那里不可用 —— 这是**预期行为而非 bug**(#4002):该泳道的压缩由 bili 接管,preset 的 compact 命令与自动压缩被有意一并撤下;按设计**没有**重新打开的开关(#3651/#3666),见 CONFIGURATION.md);ACP 压缩不受影响。启动的一次性 `[dsh-client]` 日志会列出 overlay 实际改写过的 entry(#3962),patch 行落空(如 roster 改名)无需翻宿主 loader 日志即可见。overlay 依赖 dsh 的内部钩子、对版本敏感 —— 若在新/旧 dsh 构建上仍见到 dsh 压缩 checkpoint 落地,回退到 #2474 配方:profile 层 patch(你 profile 自己的 `cordis.patch.yml`,在所有 bundle 之后生效)用同 id + **完整快照** `config` 整体覆盖 preset-standard —— 从 `dsh --profile <name> --dump-config` 抄下完整的 preset config,在其 `compaction-basic` 行下加 `config.auto: false`,把结果追加进 `cordis.patch.yml`。Config 替换是**整体语义**(片段会静默丢掉一切未重述的键 —— 不只是其他插件,连 preset 自己的 `id`/`order` 身份也会丢,可能使 roster 无法识别该 preset);`- insert:` 同 id 则是在末尾追加一条死行而非合并。dsh 升级 preset 后快照冻结 roster、需重抄一次。此类 profile 启动时插件打一条一次性 `[dsh-client]` 日志,说明两条路径。
+- **禁用与移除插件的区别(#3662):** #3662 之前,禁用 `bili-native`(dsh 插件管理器,或任何 patch 层里写 `disabled: true`)会把门控服务的**唯一**提供方一并移除,而 preset 行仍在等它 —— 四个 Web preset 永久 pending,新建/恢复会话全部报 `Unknown agent preset: standard`。现在该服务住在独立的常驻条目 `bili-compaction-gate` 里:禁用或 kill-switch(`BILLION_CONTEXT_PLUGIN=0`)`bili-native` 只是把泳道交还 dsh **原生行为** —— preset 正常注册、原生自动压缩恢复,bili 压缩则完全关闭。请勿禁用 `bili-compaction-gate` 本身 —— 那会重新造成「砖」。要彻底卸载:从 profile 的 `dsh.profile.bundles`(及其依赖)里移除 `billion-context` 后重启 —— 整个 patch 层消失,`compaction-basic` 回到原生默认 `auto: true`。若卡在 #3662 之前的版本且插件已被禁用:升级即自愈(patch 层按 bundles 里列出的包装载,与 `bili-native` 的启用状态无关);手动解砖是在 HOME 层 patch `$DSH_HOME/cordis.patch.yml`(`DSH_HOME` 未设时为 `~/.dsh/cordis.patch.yml`)追加四行 `- id: preset-standard` / `preset-ptc` / `preset-minimal` / `preset-cordis`,各配 `inject: null` —— 顶层键为整体替换,清掉 pending 锁。
+- **全局副本在加载期抢占 profile 副本(#2891):** dsh 解析 `dsh.profile.bundles` 里的裸包名 `billion-context` 时是 installation-anchor-first —— 先在自己的安装树(全局 npm root)里找,再找 profile 的 `node_modules`。因此只要机器上存在一份全局 `billion-context`,dsh 就加载**全局那份**,profile 里装的被静默忽略 —— 不崩溃、无日志。两者版本不一致时,实际运行的可能与 profile 声明的不同(例如 #1590 之前的全局没有 `dsh.client` web 面,设置页菜单凭空消失)。这一事实默认情况下处处不可见:`bili doctor` 现在会按 profile 逐一标记任何版本不一致的全局/本地对(#2891);用 `dsh --profile <name> --dump-config`(读该 bundle 的 `name:` 行)可核对 dsh 实际加载了哪份。
 
-`bili dsh` 启动下插件**附看**(attach)启动器的代理(不二次拉起)。裸上游 URL 与 spawn 模式一样重写为 `<proxy>/bili/<url>`(回环代理目标永不被代理 env 拦截，等于直接绕开 MITM)；已经路由的 `/bili/` 前缀请求原样放行、只盖章。已知局限:手动 `/compact` 没有 dsh 侧事件钩子，其边界交给内核的自然 ingest diff(非 web profile 下自动压缩已关，影响罕见;web profile 见上方 #1772 说明)。
+`bili dsh` 启动下插件**附看**(attach)启动器的代理(不二次拉起)。裸上游 URL 与 spawn 模式一样重写为 `<proxy>/bili/<url>`(回环代理目标永不被代理 env 拦截，等于直接绕开 MITM)；已经路由的 `/bili/` 前缀请求原样放行、只盖章。已知局限:手动 `/compact` 没有 dsh 侧事件钩子，其边界交给内核的自然 ingest diff(自动压缩现已处处关闭 —— 宿主平面经 bundle patch,web profile 的 preset 经 #3354 加载期 overlay;见上方 Web profile 说明)。
+
+**宿主侧上下文计量与模型实际视图按设计不一致(#2837):**plugin 模式下宿主本地持久会话日志有意保持无损 —— 完整未折叠历史会因前缀缓存与严格回显而重发(见 TECHNICAL-NOTES.md「两种压缩模式」)。因此宿主或其插件从该本地日志算出的任何计量,量的都是**未折叠的本地表面**,而不是下一次请求实际携带的量;压缩生效期间本地数字远高于真实输入属预期,不是压缩卡死。有效尺寸以代理为准:读 `/acp`(或 `GET /__bili/plugin/status` 的 `contextTokens`,来源见 `contextTokensSource`),不要本地重新推算。
 
 ## Kimi Code(Moonshot)
 
@@ -27,6 +31,7 @@
 - **Plugin 模式盖章:** 只有当 ACP 工具清单已在存活代理上验证通过后,块里才会写入 `custom_headers = { x-bili-plugin = "kimi" }` —— 此前流量走 wire 模式。由于 `custom_headers` 按 provider 静态生效,无法承载逐请求的窗口/模型头(会在模型切换后过期),所以 runtime-info 上报只在自举时发生(客户端配置里有模型 + 上下文窗口 + 最大输出就一并上报)。
 - **看门狗与生命周期:** MCP 子进程每 30 s 探测一次代理。attach 模式下永远等待(绝不碰用户自己的代理);spawn 模式下代理死亡则重新拉起并把路由改写到新 origin。恢复失败时移除受管块,让流量退回直连上游而不是打到死端口。会话结束时 kimi 杀掉 MCP 子进程,父进程 pid 看门狗随之收掉拉起的代理。多个并发 TUI 共享第一个拉起的代理;它消失后其余会话自动重新拉起并改路。
 - **已知局限:** 子代理会话各自得到独立的派生代理会话(kimi 不暴露稳定的会话 id;工具调用经每次调用的 `conversation_id` 参数绑定);kimi 的原生自动压缩**没有**被推后 —— ACP 压缩只是先触发,与启动器模式一致。退出开关:`BILI_NATIVE_KIMI=0`。
+- **模型/Provider 切换后流量离开代理(#2954):** 路由只覆盖自举时别名化的默认模型(`bili-kimi`)。`/model` 切换到任何其他模型或第三方 provider 会完全绕过 bili —— 无压缩、无统计 —— 直到之后的某个会话再次自举到别名上。这是单别名设计(#963)有意的爆炸半径取舍:代理挂掉时只有被别名的模型受影响,其余模型继续直连可用;全面接管多 provider 需要就地改写每个用户自有的 `[providers.*]` base_url,违反受管块「标记之外绝不触碰用户内容」的不变量。别名本身逐字继承源模型的 `capabilities` / `support_efforts` / `default_effort`(#2954),且 config.toml 里所有 `[models.*]` 的窗口在拉起时经 `BILI_LAUNCHER_MODEL_WINDOWS` 送达代理,任何流过的模型的逐请求窗口解析都保持准确。
 
 ## Gemini 系(Gemini CLI / iFlow CLI / Qwen Code / Antigravity)
 
@@ -58,17 +63,19 @@
   `CLOUD_CODE_URL` 环境变量覆盖(已在 v2.19.1 二进制中验证:*"Overriding
   CloudCodeServerURL via CLOUD_CODE_URL environment variable"*),形态与
   gemini-cli 的 base-URL 钩子相同。启动器设置
-  `CLOUD_CODE_URL=<proxy>/bili/<upstream>`(默认上游
-  `https://cloudcode-pa.googleapis.com`;如果你自己导出了 `CLOUD_CODE_URL`,
-  该值会被中继经过代理)。无 MITM、无需装 CA。代理**按 path 识别 wire**:
+   `CLOUD_CODE_URL=<proxy>/bili/<upstream>`(默认上游
+   `https://daily-cloudcode-pa.googleapis.com` —— Antigravity 真实默认;裸
+   `cloudcode-pa` 主机在 `/v1internal:*` 上 400,#3129;如果你自己导出了
+   `CLOUD_CODE_URL`,该值会被中继经过代理)。无 MITM、无需装 CA。代理**按 path 识别 wire**:
   `:streamGenerateContent` / `:generateContent` / `:countTokens` 请求走
   Google 原生适配器,与 `bili gemini` 一样被压缩。若服务端改用 gRPC 方法
   path(`/google.internal.cloud.code.v1internal.CloudCode/*`),这些请求不被
   识别、原样透传不压缩 —— 属优雅降级,确认后可用按 lane 的 `protocol`
   声明(#1909)修复。若 Google 将来移除该环境钩子,退路是证书 MITM:
-  language_server 遵循 `HTTPS_PROXY` 且不锁定证书,把
-  `cloudcode-pa.googleapis.com` 加进 `"mitm".domains` 并信任 bili 根 CA
-  即可。桌面端与 IDE 扩展共用同一条 language_server 通道;启动器只驱动
+   language_server 遵循 `HTTPS_PROXY` 且不锁定证书,把
+   `daily-cloudcode-pa.googleapis.com`(Antigravity 真实默认端点;裸
+   `cloudcode-pa` 名称在 `/v1internal:*` 上 400,#3129)加进 `"mitm".domains`
+   并信任 bili 根 CA 即可。桌面端与 IDE 扩展共用同一条 language_server 通道;启动器只驱动
   CLI —— 桌面用户可手动导出 `CLOUD_CODE_URL`,或直接用上面的 MITM 配方。
 
 四者都没有 native 模式:均无环内工具注入接缝(gemini-cli 扩展只到自定义命令,
@@ -83,8 +90,8 @@ fork 继承同一面;Antigravity 自带用户插件系统 —— `plugins/<name>
 三种对齐模式:`bili hermes`(启动器,证书 MITM —— README 快速上手 方式 2)、`/bili/` URL 前缀、原生插件模式(`bili plugin install hermes`,#958)。hermes CLI agent 的插件 API 只有 Python(`desktop/plugin.js` SDK 属于另一个 Desktop app),所以原生插件是随 npm 包分发的一个纯标准库 Python 模块:
 
 - **安装:** `bili plugin install hermes` 把 `plugin.yaml` + `__init__.py` 拷进 `~/.hermes/plugins/billion-context/`,写一个机器自管的 `bili.json` sidecar(指向全局 bili 安装的 `dist/index.js` + node 路径),并经 hermes 自己的通道启用插件(`hermes plugins enable billion-context` —— CLI 不在 PATH 上时改为打印同一条命令)。新开一个 hermes 会话生效。卸载:`bili plugin remove hermes`;全局更新后刷新:`bili plugin update hermes`。
-- **生命周期:** 加载时插件先附着到健康的运行中代理,否则在临时端口自拉起(父进程 pid 看门狗在 hermes 退出时收掉它;并发启动走与启动器相同的 starting-marker 仲裁协议)。只有代理确认健康后,才用 `HTTPS_PROXY` / `https_proxy` + `SSL_CERT_FILE`(bili 组合 CA bundle —— 当前 hermes 经此解析环境信任;`HERMES_CA_BUNDLE` 保留给旧版本)把 hermes 的 httpx 栈指向它 —— **从不改动** `~/.hermes/config.yaml`。provider 的 https 域名从 hermes 配置读出并加入 MITM 白名单;其余域名与启动器模式一样盲隧道。拉不出健康代理时插件静默退场,流量直连(不压缩、无死端口)。
-- **Plugin 模式盖章:** `llm_request` 中间件打 `x-bili-plugin: hermes` + 会话 id(= hermes session id,gateway 多会话安全)+ 模型,已知后再加 `x-bili-plugin-max-output` —— 且只在 ACP 工具已对着存活代理清单注册完之后;第一轮走 wire 模式。`pre_api_request` hook 捕获生效的 `max_tokens`,把 runtime-info(模型 + 最大输出)推给代理。`compress` / `decompress` / `acp_status` 注册为真正的 hermes 工具,由代理既有的插件端点提供。
+- **生命周期:** 加载时插件先附着到健康的运行中代理 —— #2905 起按泳道:本 hermes lane 的实例第一,其他已声明 lane 的实例绝不 attach(要搭车需在 `native.attachLanePriority` 里列出),8787 用户区守护是最后兜底 —— 否则在临时端口自拉起(声明 `lane: hermes`,别的泳道骑不上来;父进程 pid 看门狗在 hermes 退出时收掉它;并发启动走与启动器相同的 starting-marker 仲裁协议)。只有代理确认健康后,才用 `HTTPS_PROXY` / `https_proxy` + `SSL_CERT_FILE`(bili 组合 CA bundle —— 当前 hermes 经此解析环境信任;`HERMES_CA_BUNDLE` 保留给旧版本)把 hermes 的 httpx 栈指向它 —— **从不改动** `~/.hermes/config.yaml`。provider 的 https 域名从 hermes 配置读出并加入 MITM 白名单;其余域名与启动器模式一样盲隧道。拉不出健康代理时插件静默退场,流量直连(不压缩、无死端口)。
+- **Plugin 模式盖章:** `llm_request` 中间件打 `x-bili-plugin: hermes` + 会话 id(= hermes session id,gateway 多会话安全)+ 模型,已知后再加 `x-bili-plugin-max-output`,宿主 per-model 窗口已知时再加 `x-bili-plugin-context-window`(读自 `HERMES_HOME/context_length_cache.yaml`,键为 `<model>@<base_url>`;同模型多上游窗口不一致时宁缺毋猜,#3261)—— 且只在 ACP 工具已对着存活代理清单注册完之后;第一轮走 wire 模式。`pre_api_request` hook 捕获生效的 `max_tokens`,把 runtime-info(模型 + 最大输出 + 上下文窗口)推给代理。`compress` / `decompress` / `acp_status` 注册为真正的 hermes 工具,由代理既有的插件端点提供。
 - **已知局限:** 走 hermes Codex-wire 传输发出的请求可能丢掉逐请求头面,这类配置在该传输暴露头之前停留在 wire 模式。`BILLION_CONTEXT_PROXY` 已设置(启动器管着代理)或定义了 `BILI_PROVIDER_REWRITES` 时插件整体退场。退出开关:`BILI_NATIVE_HERMES=0`。
 
 ## ZCode（Z.ai / bigmodel coding plan）
@@ -106,6 +113,10 @@ fork 继承同一面;Antigravity 自带用户插件系统 —— `plugins/<name>
 
 ## Codex(OpenAI Codex CLI)
 
+**模型目录临时断网（#3993）。** 经 Bili 转发的带认证 `GET https://chatgpt.com/backend-api/codex/models` 请求，在网络故障或 HTTP 500/502/503/504 时可使用最近一次完整有效的目录，避免临时发现失败导致 Codex 丢失已知窗口和工具能力。私有缓存位于既有 XDG 缓存目录的 `codex-model-catalog-v1` 子目录，按完整 URL/客户端版本以及认证、账号、组织、项目的指纹隔离，不保存原始凭证；每份最多 1 MiB、最多 16 份、最长六小时。在线发现优先，离线命中不会延长有效期；有可用缓存时，网络及响应体等待上限为四秒。客户端取消、401/403、其他明确错误和无效/空目录不会转成缓存成功。冷缓存、过期或凭证变化仍需要在线发现成功。离线返回不清除上游熔断，也不代表模型推理端点可达。不修改推理载荷、压缩模式或已配置上下文上限。
+
+**窗口对齐。** 客户端 plugin/runtime 上报及启动器传递的窗口优先于发布时的 Codex 模型表。没有上报时，本机代理只读其 `CODEX_HOME`（默认 `~/.codex`）下的 `models_cache.json` 和基础 `config.toml`，将 `model_context_window` 限制在匹配模型的 `max_context_window` 内，再应用 `effective_context_window_percent`（Codex 默认 95）；后续请求会跟随缓存更新。元数据缺失、不可读或无效时，保留内置表及未知模型 272K 的既有回退。远程代理或其他客户端 profile 应通过现有启动器/runtime 机制传递实际窗口，或设置既有的 `compress.modelContextLimit`；代理本机缓存不能证明另一台机器的配置。输出预留仍正常生效。
+
 Codex 是唯一一个插件安装无法自给自足的客户端。接缝矩阵可以解释:claude 有 SessionStart hook + 受管 settings 块,zcode 有可改写 `baseURL` 的 provider store —— codex 两者都没有。它的模型流量只能经环境变量路由(`HTTPS_PROXY` / `SSL_CERT_FILE` —— `bili codex` 正是这么做的);默认 ChatGPT-登录 provider 没有可改写的配置缝,managed `model_providers` 块会强制 `env_key` API-key 认证、**废掉订阅登录**;而 MCP 子进程无法向父进程注入 env,所以插件永远路由不了 codex 本体流量。三种姿势:
 
 | 姿势 | 你能得到什么 |
@@ -113,6 +124,9 @@ Codex 是唯一一个插件安装无法自给自足的客户端。接缝矩阵�
 | `bili codex`(启动器) | 全功能零配置:自管 lane 代理(#1660 端口区,粘性口)+ 注入 codex 的证书 MITM env —— 工具与压缩兼得 |
 | `bili plugin install codex` + 在跑的 bili + 自行导出 `HTTPS_PROXY` | 自己管 env 的 power user:工具 + 压缩 |
 | 只装 `bili plugin install codex` | codex 里出现四个工具但没有对话被代理、无话可操作;全不可达时 `tools/list` 报 -32003(`bili proxy unreachable … — start bili or set BILI_MCP_PROXY`) |
+
+**并发会话(#3203)。** 同一项目目录、同一 `CODEX_HOME` 下可以同时跑多个 `bili codex`:每次启动各取一个独立的每会话 overlay 槽位(`<CODEX_HOME>-bili-s<N>`,池上限 16)和各自的 lane 代理,路由、MCP 会话绑定、压缩状态互不串线。共享状态默认(codex ≥ 0.147.0)下,两个会话的历史都落在真实 home 的同一个活库上,退出顺序不影响保留 —— 见 CONFIGURATION.md 的 `BILI_CODEX_STATE_MODE`。旧版二进制或 `BILI_CODEX_STATE_MODE=legacy` 保持每 home 一个独占 overlay:第二个并发启动会被 `BILI_OVERLAY_BUSY` 拒绝。
+
 
 安装写入 `~/.codex/config.toml` 单个 `[mcp_servers.bili]` 块(command = node,args = dist/mcp.js)。#1660 去掉了安装时烘焙 origin(#403:烘焙的 URL 在漂移/重启后变成死端口,工具永远指向它);shell 在会话启动时解析代理 —— env `BILI_MCP_PROXY` > 活实例登记(任一 lane 的代理,或 `bili start` 守护)> 8787 用户区默认 —— 漂移或重启后绝不残留死 URL,shell 直接附着到活着的那个。会话绑定是 headless 的:启动器在 spawn 时传 `BILI_CONVERSATION_ID`,插件 shell 否则绑定下一个新会话;逐调用的 `conversation_id` 覆盖与其他客户端一致(#760)。Codex ≥0.160 还在每次 `tools/call` 的 `_meta.threadId` 里盖上真实 thread id;shell 按调用消费(严格校验、绝不写回 spawn 时的全局绑定),优先级高于过期的 `BILI_CONVERSATION_ID` 残留与模型抄写的 `conversation_id`(#2024)。
 
@@ -131,6 +145,16 @@ Windows 上默认 npm 安装把 `codex.cmd` shim 放上 PATH,它的 `%*` 转发�
 - **绕行 / power-user 旋钮:** `BILI_CLIENT_BIN=<path>` 仍最高优先——指向真实 `codex.exe`(或经 node 运行的脚本入口)即可完全绕开 shim。
 
 已在 windows-latest CI 上对真实全局 `@openai/codex` 安装验证(`tests/win-cmd-argv.test.ts`,`ci-windows-codex.yml` 硬门禁):完整语料——空参数、普通空格、嵌入引号、TOML `-c` 值、JSON、Unicode、尾反斜杠、`%COMSPEC%`、`!VAR!`、`&|<>^()`——逐项与调用方数组相等地到达子进程。
+
+### Composer 预测(Codex Desktop):自定义 provider 的线程没有资格(#3408)
+
+Codex Desktop 的 Composer 预测功能有一道**客户端资格门槛**,在任何预测请求能到达 billion-context 之前执行:它检查被恢复源线程的**实际 provider**,要求是内置 `openai` provider —— 其他任何 provider 都会选中 `unsupported_provider`,客户端直接返回、不生成预测(对 Desktop 26.1013.3656.0 的静态检查,#3408)。门槛读的是*线程*的 provider,而不是当前全局默认值:预测路径以特殊预测模式 fork 源线程,该调用不提供独立的预测 provider,所以改全局默认也不会让既有线程重新获得资格。后果:
+
+- **自定义 provider 的线程永远不显示预测** —— 这是客户端的设计,不是 bili 缺陷。预测请求根本到不了代理,bili 侧没有可修可配的东西;看不到预测相关的网关流量是预期现象,不是请求被丢的证据。
+- **保 provider 的传输在机制上保住资格。** 证书 MITM 路由(`bili codex` 启动器注入的 `HTTPS_PROXY` + `SSL_CERT_FILE`)在 provider 层之下拦截:codex 自己的配置与 provider 选择原样不动,线程保留内置 `openai` provider 身份与官方 ChatGPT 认证 —— 正是门槛读取的东西。Desktop 构建上的运行时确认仍待完成(尚无配对 A/B);若你能在该传输下于 Desktop 上证实或证伪预测行为,请到 #3408 回报。
+- **没有任何受支持的配置能为自定义 provider 线程恢复预测。** 任何走自定义 `model_providers` 条目的路由 —— API-key 认证、第三方一键安装在内 —— 按构造都落在门槛的不合格一侧(这类条目同时废掉订阅登录,见上文)。把自定义 provider 改名冒充 `openai`,或打补丁修改客户端资格检查,不受支持,也不会被文档化为绕行方案。
+
+经验法则:要预测 → 留在内置 OpenAI provider 路由上;要自定义 provider → 接受这些线程里不会出现预测。
 
 ## Pi(pi.dev coding agent)
 
@@ -182,11 +206,31 @@ pi-subagents(pi.dev 上的包)为前台/后台子代理运行派生**子会话**
 
 值得知道的注意事项:
 
-- **限制性 `tools:` 白名单的角色会自动拿回 ACP 通道(#2268)。** frontmatter `tools:` 列表未包含任何 ACP 工具名的角色——全部 7 个内置角色都是如此(如 `delegate` 只列 `read,grep,find,ls,bash,edit,write,contact_supervisor`)——在 #2185 具名 plugin 化之后**不再**丢失交互式压缩。bili 按请求检测这类 child(pi-subagents 会在每个子会话的 system prompt 打上 `<active_agent name="…">` 标记;门控还要求请求的 tools 数组未暴露任何 bili 可注入的工具名),并为其走 **proxy-style 压缩通道**:wire 注入 ACP 工具 + nudge、服务端执行、`acp_summary` carrier——同时保留 #2185 的具名 plugin 会话身份。无需任何配置改动;角色的原白名单在 wire 上原样保留,白名单中途变更会在下一个请求自愈。范围仅限 nicobailon/pi-subagents 的 child(标记是它的),其他 plugin host 不受影响。若上游日后移除该标记,这些角色会退回 #2268 之前的行为(具名会话、无本地 ACP 工具)。
+- **限制性 `tools:` 白名单的角色会自动拿回 ACP 通道(#2268)。** frontmatter `tools:` 列表未包含任何 ACP 工具名的角色——全部 7 个内置角色都是如此(如 `delegate` 只列 `read,grep,find,ls,bash,edit,write,contact_supervisor`)——在 #2185 具名 plugin 化之后**不再**丢失交互式压缩。bili 按请求检测这类 child(pi-subagents 会在每个子会话的 system prompt 打上完整的 `<active_agent name="…">` 标记;检测只针对 system prompt 载体,历史消息中仅引用该标记的主会话不受影响(#2694);门控还要求请求的 tools 数组——含 namespace 包装声明——未暴露任何 bili 可注入的工具名),并为其走 **proxy-style 压缩通道**:wire 注入 ACP 工具 + nudge、服务端执行、`acp_summary` carrier——同时保留 #2185 的具名 plugin 会话身份。无需任何配置改动;角色的原白名单在 wire 上原样保留,白名单中途变更会在下一个请求自愈。范围仅限 nicobailon/pi-subagents 的 child(标记是它的),其他 plugin host 不受影响。若上游日后移除该标记,这些角色会退回 #2268 之前的行为(具名会话、无本地 ACP 工具)。
   - 暴露**任一** ACP/bili 可注入名的角色保持纯 plugin 模式(重复的工具声明会被上游拒绝),因此**部分授予不受支持**——要么一个都不给,要么全给(`compress,decompress,search_context,acp_status[,acp_cache]`)。
   - 想让某个特定角色用本地注册(plugin-carrier)的工具?保留手动授权:省略 `tools:` 字段或在其中补上 ACP 工具名即可。
 - **后台 child 存在一个请求的注册竞争**(ACP 工具从第二个请求起出现),所有模式下均为既有现象。
 - **行为变更披露:** 前台 child 从匿名 proxy 模式(`pfa-*`)升级为具名 plugin 模式(child 会话 id + 父会话血统)。信息严格更多,但任何以 `pfa-*` 身份做键的工具将看到不同的 id。
+
+## Kiro CLI(AWS)
+
+`bili kiro [opts --] [args]` 起代理并启动 `kiro-cli`(先查 `PATH`,否则 `~/.local/bin/kiro-cli`;`BILI_CLIENT_BIN` 可覆盖)。`--` 之后的参数原样交给 `kiro-cli`,例如 `bili kiro -- chat --resume`。
+
+**Kiro 的模型通信(kiro-cli 2.37 实测)。** 代理的模型调用走 **OpenAI Responses wire**:`POST https://runtime.<region>.kiro.dev/v1/responses`,体为 `{ model, input, tools, stream, origin, profileArn, metadata }`,以 `text/event-stream` 流回。Kiro **每轮重放完整历史**(它的系统提示作为 `user` 项放在 `input[0]`),用 bearer token 鉴权(请求体无签名,改写后依然有效),并遵守 `HTTPS_PROXY`。其余运行时调用(`KiroRuntimeService.*`,`/` 上的 AWS-JSON)不是模型 wire,逐字节转发;日志里会出现一次「unrecognized path」,属预期。
+
+**这条车道做了什么。**
+
+- **只对模型网关做 cert-MITM:** `runtime.us-east-1`、`runtime.eu-central-1`、`runtime.us-gov-east-1`、`runtime.us-gov-west-1`(`.kiro.dev`)。管理、认证、遥测主机仍盲隧道。其它主机用 `--mitm-domain` 添加。
+- **CA:** 合并 bundle 同时写入 `SSL_CERT_FILE`(Rust 外壳的 rustls 会**替换**根证书,所以必须带上系统根)与 `NODE_EXTRA_CA_CERTS`(内置 Node 代理服务,增量)。`NO_PROXY` 让回环(本地代理服务、MCP)直连。
+- **角色(内置 compat):** 网关只接受 `user` / `assistant` 消息项。bili 注入的压缩提示是 `developer` 项,网关以 `400 This request contains parameters or input that are not supported`(`param: input[0]`)拒绝;`system` 同样失败。对 Kiro 流量(User-Agent `KiroCLI/…` 或 `x-amzn-kiro-origin`,且主机为 `runtime.*.kiro.dev`),bili 自动把 `developer`/`system` 改写为 `user`。优先级最低:配置里的 `compat.roles` 与学到的角色按键覆盖它。不变量判官按原角色看待注入提示,不会误报 I1。
+- **会话身份:** Kiro 的首项(系统提示)跨进程不是字节稳定的,内容前缀亲和会让每次 `kiro-cli chat --resume` 新建会话。bili 把 `metadata["kiro:conversation_id"]` 提升为会话 id(`kiro-<id>`,只覆盖内容指纹,从不覆盖真实会话头 / `session_id` / `prompt_cache_key`),压缩状态因此跨 resume 保留。
+
+**说明。**
+
+- Kiro 自带的自动压缩保持开启作兜底;bili 折叠得更早,很少触发。只想用 bili:`kiro-cli settings chat.disableAutoCompaction true`(Kiro 全局设置;改回 `false` 撤销)。
+- Kiro 的流不带 usage 上报,nudge 决策用 bili 本地 token 估算(日志里的 `upstream success without usage report` 属预期)。
+- Kiro 的 `reasoning` 项带签名(`encrypted_content`),原样保留;随所在回合一起折叠。
+- 不用启动器的手动方式:以 `BILI_MITM_DOMAINS=runtime.us-east-1.kiro.dev` 启动 `bili`,再以 `HTTPS_PROXY=http://127.0.0.1:8787`、`SSL_CERT_FILE` 与 `NODE_EXTRA_CA_CERTS` 指向 `~/.local/share/billion-context/ca/combined-ca.pem` 启动 `kiro-cli`。
 
 ## 收养未列表的客户端(任何模型 baseURL 可配的客户端)(#2340)
 

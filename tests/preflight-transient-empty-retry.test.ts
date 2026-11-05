@@ -7,7 +7,6 @@ process.env.NODE_ENV = "test";
 process.env.BILI_REPLAY_RETRY_MAX = "1";
 // Zero backoff so the transient-retry legs run instantly.
 process.env.BILI_REPLAY_RETRY_BASE_MS = "0";
-process.env.BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS = "400";
 
 import { defaultConfig } from "acp-kernel";
 import { startServer } from "../src/server.ts";
@@ -188,7 +187,9 @@ test("#1767 transient content_filter empties: same-span retries recover the turn
         assert.equal(sess?.metadata?.preflightDeadEnd, undefined, "successful preflight must not leave a dead-end marker");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         upstream.close();
+        upstream.closeIdleConnections?.();
         await new Promise<void>((resolve, reject) => {
             void Promise.allSettled([once(proxy, "close"), once(upstream, "close")]).then(() => resolve(), reject);
         });
@@ -197,7 +198,7 @@ test("#1767 transient content_filter empties: same-span retries recover the turn
 
 // Plain-text over-window history (the #726 shape): unlike tool outputs, prose
 // messages survive the outbound fold at full size, so the retry request also
-// fails the fit gate and must hit the dead-end cooldown instead of forwarding.
+// fails the fit gate again and must re-run the bounded walk instead of forwarding.
 function longPlainInput(): unknown[] {
     const items: unknown[] = [];
     for (let i = 0; i < 12; i++) {
@@ -207,7 +208,7 @@ function longPlainInput(): unknown[] {
     return items;
 }
 
-test("#1767 systemic content_filter: bounded summary calls, diagnosis surfaced, dead-end arms, nothing forwarded", async () => {
+test("#1767 systemic content_filter: bounded summary calls, diagnosis surfaced, retries re-run bounded, nothing forwarded", async () => {
     const calls: Call[] = [];
     const upstream = makeUpstream(calls, 0, true);
     upstream.listen(0, "127.0.0.1");
@@ -233,16 +234,19 @@ test("#1767 systemic content_filter: bounded summary calls, diagnosis surfaced, 
         assert.ok(!calls.some((c) => !c.summary), "nothing may be forwarded on failure");
 
         const sess = listSessions().find((s) => s.id.includes("s1767-deadend"));
-        assert.ok(sess?.metadata?.preflightDeadEnd, "zero-progress failure must arm the dead-end marker");
+        assert.equal(sess?.metadata?.preflightDeadEnd, undefined, "(#4079) no dead-end marker may persist");
 
         const callsBeforeRetry = calls.length;
         const r2 = await driveResponses(proxyPort, upstreamPort, "s1767-deadend", "gpt-7-sol", longPlainInput());
-        assert.equal(r2.status, 502, `cooldown must fail fast, got ${r2.status}`);
+        assert.equal(r2.status, 502, `the retry must fail fast again, got ${r2.status}`);
         await r2.text();
-        assert.equal(calls.length, callsBeforeRetry, "cooldown must spend ZERO upstream calls");
+        const retrySummaries = calls.slice(callsBeforeRetry).filter((c) => c.summary);
+        assert.ok(retrySummaries.length >= 2 && retrySummaries.length <= 32, `the re-run walk is itself bounded (#4079 trade), got ${retrySummaries.length}`);
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         upstream.close();
+        upstream.closeIdleConnections?.();
         await new Promise<void>((resolve, reject) => {
             void Promise.allSettled([once(proxy, "close"), once(upstream, "close")]).then(() => resolve(), reject);
         });
@@ -256,7 +260,9 @@ test("#1767 empty-summary classifier: transient vs size-driven", () => {
         choices: [{ index: 0, message: { role: "assistant", content: "" }, finish_reason: "content_filter" }],
     });
     const cfDetail = diagnoseEmptySummary(cf, JSON.parse(cf));
-    assert.match(cfDetail, /plain-JSON completion with empty content \(finish_reason=content_filter, answered as model=deepseek\/deepseek-v4\.1-flash\)/);
+    // #2832: the fingerprint gained a text_chars part; content_filter stays
+    // TRANSIENT (it is not a normal stop) despite the zero-text body.
+    assert.match(cfDetail, /plain-JSON completion with empty content \(finish_reason=content_filter, text_chars=0, answered as model=deepseek\/deepseek-v4\.1-flash\)/);
     assert.equal(emptySummaryIsSizeDriven(cfDetail), false, "content_filter empty completion is transient");
     const len = JSON.stringify({ choices: [{ index: 0, message: { role: "assistant", content: "" }, finish_reason: "length" }] });
     assert.equal(emptySummaryIsSizeDriven(diagnoseEmptySummary(len, JSON.parse(len))), true, "finish_reason=length is size-driven");

@@ -40,6 +40,10 @@ function makeSession(): Session {
 test("normalizeUpstreamOrigin: URL forms collapse to origin, garbage degrades safely", () => {
     assert.equal(normalizeUpstreamOrigin("http://a:8080/v1/chat/completions?x=1"), "http://a:8080");
     assert.equal(normalizeUpstreamOrigin("https://a:8443"), "https://a:8443");
+    // #2645: a provider route's mitm:// config-lookup scheme must collapse to its
+    // https egress key, or it normalizes to the opaque "null" origin and can never
+    // match the https origin the egress path records (pck ablation / baseline compare).
+    assert.equal(normalizeUpstreamOrigin("mitm://a:8443/v1/chat"), "https://a:8443");
     assert.equal(normalizeUpstreamOrigin("  http://a  "), "http://a");
     assert.equal(normalizeUpstreamOrigin(""), undefined);
     assert.equal(normalizeUpstreamOrigin(undefined), undefined);
@@ -325,8 +329,10 @@ test("e2e F1: a relay billing below the local estimator teaches k̂<1 — the ca
         assert.equal(calls.filter((c) => c.stream).length, 3, "all three turns were forwarded as-is");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });
@@ -376,10 +382,13 @@ test("e2e F2: a route switch demotes the stale usage-baseline — the small post
         assert.equal(a.calls.filter((c) => c.summary).length, 0, "no preflight summarization on the original route either");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         a.server.close();
+        a.server.closeIdleConnections?.();
         await once(a.server, "close");
         b.server.close();
+        b.server.closeIdleConnections?.();
         await once(b.server, "close");
     }
 });

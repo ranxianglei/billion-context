@@ -390,12 +390,27 @@ export function createGoogleAdapter(
             // immediate forwarding on the assumption it would be replayed whole
             // at settle; when settle decides nothing replays, the prose still
             // has to reach the client (master lost even UNEDITED sibling text
-            // in all-proxy chunks through this same path).
+            // in all-proxy chunks through this same path). #3158: standalone
+            // thoughtSignature parts count too — a resynthesized chunk must not
+            // strip them either.
             const prosePartsOf = (obj: Record<string, unknown>): GooglePart[] => {
                 const cands = obj.candidates as Array<Record<string, unknown>> | undefined;
                 const ps = (cands?.[0]?.content as { parts?: GooglePart[] } | undefined)?.parts;
                 if (!Array.isArray(ps)) return [];
-                return ps.filter((p): p is GooglePart => !!p && typeof p === "object" && p.functionCall === undefined && typeof p.text === "string" && p.text.length > 0);
+                return ps.filter((p): p is GooglePart => !!p && typeof p === "object" && p.functionCall === undefined
+                    && ((typeof p.text === "string" && p.text.length > 0) || (typeof p.thoughtSignature === "string" && p.thoughtSignature.length > 0)));
+            };
+            // #3158: parts whose only payload is a thoughtSignature — no text,
+            // no functionCall. They model no structured event and were silently
+            // dropped from the client's stream; the loop also records them so a
+            // proxy-tool rebuild carries them back on the re-request.
+            const standaloneSigParts = (obj: Record<string, unknown>): Array<GooglePart & { thoughtSignature: string }> => {
+                const cands = obj.candidates as Array<Record<string, unknown>> | undefined;
+                const ps = (cands?.[0]?.content as { parts?: GooglePart[] } | undefined)?.parts;
+                if (!Array.isArray(ps)) return [];
+                return ps.filter((p): p is GooglePart & { thoughtSignature: string } => !!p && typeof p === "object" && p.functionCall === undefined
+                    && (typeof p.text !== "string" || p.text.length === 0)
+                    && typeof p.thoughtSignature === "string" && p.thoughtSignature.length > 0);
             };
             // Decide proxy-vs-real from the buffered calls and emit events: real
             // calls → raw part replay (verbatim parts, original signatures/ids)
@@ -415,6 +430,9 @@ export function createGoogleAdapter(
                     for (const { parsed } of rawCallChunks) {
                         const prose = prosePartsOf(parsed);
                         if (prose.length > 0) yield { kind: "meta", chunk: buildChunk(prose) } as ParsedStreamEvent;
+                        for (const sp of standaloneSigParts(parsed)) {
+                            yield { kind: "standalone_signature", signature: sp.thoughtSignature } as ParsedStreamEvent;
+                        }
                     }
                     return;
                 }
@@ -442,6 +460,12 @@ export function createGoogleAdapter(
                         // its withheld prose still has to reach the client.
                         const prose = prosePartsOf(parsed);
                         if (prose.length > 0) yield { kind: "meta", chunk: buildChunk(prose) } as ParsedStreamEvent;
+                    }
+                    // #3158: every classification above keeps this chunk's
+                    // standalone signature parts on the wire; record them once
+                    // so a proxy-tool rebuild carries them back too.
+                    for (const sp of standaloneSigParts(parsed)) {
+                        yield { kind: "standalone_signature", signature: sp.thoughtSignature } as ParsedStreamEvent;
                     }
                 }
                 for (const [idx, tc] of pending) {
@@ -572,6 +596,34 @@ export function createGoogleAdapter(
                 if (callIndexes.length > 0) {
                     const storedParsed = editedParts ? cloneChunk(parsed, { parts: editedParts }) : parsed;
                     rawCallChunks.push({ json: editedParts ? JSON.stringify(storedParsed) : json, parsed: storedParsed, callIndexes });
+                }
+                // #3158: standalone thoughtSignature parts modeled no event above
+                // and vanished from the client's stream. When nothing else in the
+                // chunk was forwarded, hand them to the client verbatim: the
+                // whole frame when nothing was held by the filter and it carries
+                // no finish to leak, otherwise a wrapper carrying just those
+                // parts (it must not smuggle filter-held text bytes; an early
+                // finishReason is dropped so the loop's synthetic completion
+                // stays the sole terminal). Record them whenever the chunk
+                // carries them — even when a sibling text/thought part already
+                // took the whole frame to the client: the signature is then
+                // client-visible but absent from the proxy-tool rebuild unless
+                // recorded here.
+                if (callIndexes.length === 0) {
+                    const sigParts = standaloneSigParts(parsed);
+                    if (sigParts.length > 0) {
+                        if (!emitted) {
+                            yield* flushFilter();
+                            const hasTextPart = parts.some((p) => p && typeof p === "object" && typeof p.text === "string" && p.text.length > 0);
+                            const chunk = !hasTextPart && !finishReason
+                                ? rawBuf
+                                : sseFrame(cloneChunk(parsed, { parts: sigParts, ...(finishReason ? { dropFinishReason: true } : {}) }));
+                            yield { kind: "meta", chunk } as ParsedStreamEvent;
+                        }
+                        for (const sp of sigParts) {
+                            yield { kind: "standalone_signature", signature: sp.thoughtSignature } as ParsedStreamEvent;
+                        }
+                    }
                 }
                 if (!emitted && callIndexes.length === 0 && !finishReason && parts.length === 0) {
                     yield { kind: "meta", chunk: rawBuf, firstRoundOnly: true } as ParsedStreamEvent;

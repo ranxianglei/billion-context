@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
 import http from "node:http";
+import os from "node:os";
+import path from "node:path";
 import { once } from "node:events";
 import test from "node:test";
 
@@ -211,14 +214,16 @@ test("#1569 A4: legacy catalog.model.list seam still works (build parity)", asyn
     }
 });
 
-test("#1569 A5: every seam empty → header unstamped + exactly ONE console.warn", async () => {
+test("#1569 A5: every seam empty → header unstamped + exactly ONE degradation line in bili.log", async () => {
     const proxy = await startMiniProxy();
     globalThis.__miniOrigin = proxy.origin;
-    const warnings: string[] = [];
+    // #2831: this degradation line moved from console.warn to bili.log (host-safe channel).
+    const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bili-1569a5-state-"));
+    const termLines: string[] = [];
     const origWarn = console.warn;
-    console.warn = (...args: unknown[]) => { warnings.push(args.map(String).join(" ")); };
+    console.warn = (...args: unknown[]) => { termLines.push(args.map(String).join(" ")); };
     try {
-        await withEnv1569({ BILLION_CONTEXT_PROXY: undefined, BILLION_CONTEXT_PLUGIN: undefined }, async () => {
+        await withEnv1569({ BILLION_CONTEXT_PROXY: undefined, BILLION_CONTEXT_PLUGIN: undefined, XDG_STATE_HOME: stateHome }, async () => {
             const fake = makeMinimalCtx({
                 model: { list: async () => ({ data: [] }) },
                 catalog: {
@@ -232,9 +237,17 @@ test("#1569 A5: every seam empty → header unstamped + exactly ONE console.warn
                 const r2 = await fake.fire({ providerID: "prov", id: "missing" });
                 await new Promise((r) => setTimeout(r, 50));
                 assert.equal(r2["x-bili-plugin-context-window"], undefined, "no window header when no seam yields a limit");
-                const mine = warnings.filter((w) => w.includes("x-bili-plugin-context-window goes unstamped"));
-                assert.equal(mine.length, 1, `exactly one degradation warning, got: ${JSON.stringify(warnings)}`);
+                const logFile = path.join(stateHome, "billion-context", "bili.log");
+                const mine = (fs.existsSync(logFile) ? fs.readFileSync(logFile, "utf8") : "")
+                    .split("\n")
+                    .filter((l) => l.length > 0 && l.includes("x-bili-plugin-context-window goes unstamped"));
+                assert.equal(mine.length, 1, `exactly one degradation warning, got: ${JSON.stringify(mine)}`);
                 assert.match(mine[0], /opencode\.json limit\.context is NOT reaching the proxy/);
+                assert.equal(
+                    termLines.filter((w) => w.includes("x-bili-plugin-context-window goes unstamped")).length,
+                    0,
+                    "#2831: must not reach the terminal surface",
+                );
             } finally {
                 cleanup();
             }
@@ -242,6 +255,7 @@ test("#1569 A5: every seam empty → header unstamped + exactly ONE console.warn
     } finally {
         console.warn = origWarn;
         await proxy.close();
+        fs.rmSync(stateHome, { recursive: true, force: true });
     }
 });
 
@@ -439,8 +453,10 @@ async function runAnchorCase(sessionId: string, reportUsage: boolean): Promise<{
     } finally {
         setLogCapture(null);
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         relay.server.close();
+        relay.server.closeIdleConnections?.();
         await once(relay.server, "close");
     }
 }

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, readdirSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, statSync } from "node:fs";
 import path from "node:path";
 import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
@@ -167,7 +167,9 @@ test("#841 unknown conversation_id → FAILED with id echoed", () => {
 test("#841 foreign no-match and empty-state strings carry session scope", () => {
     const s1 = makeSession("s1");
     const core = compressInto(s1);
-    assert.match(executeSearchContext({ query: "zzz-no-such-topic" }, core, s1.state, "pfa-old").text, /^\[No blocks matched "zzz-no-such-topic" in session pfa-old\]$/);
+    // #2751: negative result is scoped to what was actually searched (active
+    // topics/summaries), never phrased as "history doesn't contain it".
+    assert.match(executeSearchContext({ query: "zzz-no-such-topic" }, core, s1.state, "pfa-old").text, /^\[No blocks matched "zzz-no-such-topic" among 1 block\(s\) in session pfa-old\. Scope = compressed topics\/summaries \(active \+ folded-away\)/);
     assert.equal(executeSearchContext({ query: "anything" }, createCore(), createInitialState(), "pfa-old").text, "[No compressed blocks exist yet in session pfa-old — nothing to search.]");
 });
 
@@ -197,7 +199,9 @@ test("#841 cold-loaded historical session: read-only, file untouched, no save sc
 
         const allFiles: string[] = [];
         for (const d of readdirSync(dir)) {
-            if (!d.startsWith(".")) for (const f of readdirSync(path.join(dir, d))) allFiles.push(path.join(dir, d, f));
+            // Unified-storage sidecars (index.db, WAL files) sit at the top
+            // level next to the protocol dirs — only descend into directories.
+            if (!d.startsWith(".") && statSync(path.join(dir, d)).isDirectory()) for (const f of readdirSync(path.join(dir, d))) allFiles.push(path.join(dir, d, f));
         }
         assert.ok(allFiles.length > 0, "session file must exist");
         const before = allFiles.map((f) => readFileSync(f, "utf8"));

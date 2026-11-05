@@ -30,8 +30,9 @@
 //     before, sharing ONE forked session across successive reviews.
 //
 // The fork id format `<rawId>|sub:<sha256(system)[0..16]>` is unchanged, so
-// downstream consumers (the #2244 personaForkTarget routing, the #2170
-// designNamespaced canary) keep working. Empty system text stays
+// downstream consumers (the #2601 persona-lineage routing in plugin.ts —
+// host-stamped management calls follow the live `|sub:` descendant — and
+// the #2170 designNamespaced canary) keep working. Empty system text stays
 // non-anchoring (kernel semantics): system-less auxiliary calls keep riding
 // the main session verbatim.
 //
@@ -45,13 +46,54 @@
 import { createHash } from "node:crypto";
 import { prefixAffinity } from "./prefix-affinity.js";
 
-const anchors = new Map<string, string>();
+const anchors = new Map<string, { fp: string; system: string; model?: string }>();
 
 function personaFingerprint(systemText: string): string {
     return createHash("sha256").update(systemText, "utf8").digest("hex").slice(0, 16);
 }
 
-type PersonaAnchorAction = "claim" | "match" | "migrate" | "fork" | "passthrough";
+/** #2601 B': fold to lowercase alphanumerics so a display-name render of
+ *  {{model}} ("GLM 4.6") and the x-bili-plugin-model key ("glm-4.6") compare
+ *  equal — the host declares both facts in its own vocabularies. */
+function foldModel(s: string): string {
+    return s.toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+/** #2601 B': header-corroborated model-drift absorption. The fork
+ *  conjunction is "fp changed AND the chain is discontinuous"; a model
+ *  switch whose chain ALSO broke (e.g. dsh local compaction rewrote the
+ *  recorded bytes in the same window) still forks even with #2719's
+ *  churn-tolerant continuity. Absorb the fp half when TWO independent
+ *  host declarations corroborate the drift:
+ *    1. the plugin model header actually changed (old anchor model ≠ this
+ *       request's model — the host re-declared its model target), and
+ *    2. the system line-diff is confined to lines that name the old model
+ *       (before) / the new model (after) — the {{model}} template recompute.
+ *  No host-specific phrasing is hardcoded: only the header-declared names
+ *  are matched, folded. Anything else (AGENTS.md edit lines, timestamp
+ *  plugin lines, review-policy rewrites) keeps the conjunction intact. */
+function modelDriftAbsorbed(
+    anchored: { system: string; model?: string },
+    newSystem: string,
+    newModel: string | undefined,
+): boolean {
+    const oldModel = anchored.model;
+    if (oldModel === undefined || newModel === undefined) return false;
+    if (oldModel === newModel || foldModel(oldModel) === foldModel(newModel)) return false;
+    const a = anchored.system.split("\n");
+    const b = newSystem.split("\n");
+    if (a.length !== b.length) return false;
+    let changed = 0;
+    for (let i = 0; i < a.length; i++) {
+        if (a[i] === b[i]) continue;
+        changed++;
+        if (!foldModel(a[i]!).includes(foldModel(oldModel))) return false;
+        if (!foldModel(b[i]!).includes(foldModel(newModel))) return false;
+    }
+    return changed > 0;
+}
+
+type PersonaAnchorAction = "claim" | "match" | "migrate" | "migrate-model" | "fork" | "passthrough";
 
 interface PersonaKeyResolution {
     key: string;
@@ -63,18 +105,38 @@ interface PersonaKeyResolution {
  * `messages` is the protocol's conversation message list (the same list
  * prefix-affinity hashes — top-level system fields are not part of it).
  */
-export function resolvePersonaKey(rawId: string, systemText: string, messages: unknown[]): PersonaKeyResolution {
+export function resolvePersonaKey(
+    rawId: string,
+    systemText: string,
+    messages: unknown[],
+    model?: string,
+): PersonaKeyResolution {
     if (!systemText) return { key: rawId, action: "passthrough" };
     const fp = personaFingerprint(systemText);
     const anchored = anchors.get(rawId);
     if (anchored === undefined) {
-        anchors.set(rawId, fp);
+        anchors.set(rawId, { fp, system: systemText, model });
         return { key: rawId, action: "claim" };
     }
-    if (anchored === fp) return { key: rawId, action: "match" };
+    if (anchored.fp === fp) {
+        // fp identical but the host re-declared a different model: keep the
+        // record fresh ONLY when the declared name actually renders in the
+        // system text (fold containment) — the recorded model must stay a
+        // name the model identity line really contains, or the old-side
+        // containment in modelDriftAbsorbed would stop matching. An alias
+        // switch that does not re-render {{model}} keeps the old name.
+        if (model !== undefined && model !== anchored.model && foldModel(anchored.system).includes(foldModel(model))) {
+            anchors.set(rawId, { ...anchored, model });
+        }
+        return { key: rawId, action: "match" };
+    }
     if (prefixAffinity.chainContinues(messages, rawId)) {
-        anchors.set(rawId, fp);
+        anchors.set(rawId, { fp, system: systemText, model });
         return { key: rawId, action: "migrate" };
+    }
+    if (modelDriftAbsorbed(anchored, systemText, model)) {
+        anchors.set(rawId, { fp, system: systemText, model });
+        return { key: rawId, action: "migrate-model" };
     }
     return { key: `${rawId}|sub:${fp}`, action: "fork" };
 }
@@ -94,19 +156,22 @@ export function personaNamespace(
     systemText: string,
     messages: unknown,
     log: (level: "info" | "warn" | "error", message: string) => void,
+    model?: string,
 ): string {
     const list = Array.isArray(messages) ? messages : [];
     const text = typeof systemText === "string" && systemText.trim().length > 0 ? systemText : "";
-    const res = resolvePersonaKey(rawId, text, list);
+    const res = resolvePersonaKey(rawId, text, list, model);
     if (res.action === "migrate") {
         log("info", `[persona] persona text changed mid-conversation but the history continues ${rawId}'s chain — anchor migrated, compression state stays on the raw key (#2241/#2250)`);
+    } else if (res.action === "migrate-model") {
+        log("info", `[persona] persona text changed with a discontinued chain, but the drift is a header-corroborated model switch (${model}) — anchor migrated, compression state stays on the raw key (#2601)`);
     }
     return res.key;
 }
 
 /** Current anchor fingerprint for a raw id (test/diagnostic surface). */
 export function personaAnchorOf(rawId: string): string | undefined {
-    return anchors.get(rawId);
+    return anchors.get(rawId)?.fp;
 }
 
 export function resetPersonaAnchorsForTest(): void {

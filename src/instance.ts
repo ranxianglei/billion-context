@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { resolveZonePortBase } from "./config.js";
 import { stateDir } from "./paths.js";
@@ -134,6 +135,21 @@ export function writeZonePort(lane: string, port: number, file: string = portZon
  *  base (BILI_ZONE_PORT override). Explicit user overrides
  *  (BILI_CLAUDE_NATIVE_PORT / BILI_ZCODE_PORT) are resolved separately by
  *  the lanes and imply strict-port launches. */
+/** #3654/#3116: append a diagnostic line to the spawner-owned per-port log
+ *  (%TMPDIR%/bili-proxy-<port>.log) — the exact file a spawner failure message
+ *  points users at. Post-#2864 the child mutes its stderr leg into bili.log as
+ *  soon as its logger is live, so a child that dies during listen setup leaves
+ *  that file EMPTY (the "0 bytes" dead-end); this writes the child-side truth
+ *  there. Named by the PREFERRED port (what the spawner uses for the file
+ *  name); the line itself names the port actually tried. Line grammar mirrors
+ *  logger.ts so mixed writers stay greppable. Best-effort: a failed append
+ *  never affects the exit. */
+export function writeSpawnPortLog(preferredPort: number, line: string): void {
+    try {
+        fs.appendFileSync(path.join(os.tmpdir(), `bili-proxy-${preferredPort}.log`), `${line}\n`, "utf8");
+    } catch {}
+}
+
 export function lanePreferredPort(lane: string, env: NodeJS.ProcessEnv = process.env, file: string = portZoneFilePath()): number {
     return readZonePort(lane, file) ?? resolveZonePortBase(env);
 }
@@ -165,6 +181,141 @@ export function findSameLanePredecessor(
     return undefined;
 }
 
+/** #3801: the config-shape cells of a registered instance, normalized the
+ *  way every consumer already normalizes them (discoverLiveInstances):
+ *  absent fields ARE the empty value — a marker written before a cell
+ *  existed records nothing, which means "none". */
+export interface InstanceShape {
+    host: string;
+    passthrough: boolean;
+    mitmDomains: string[];
+    modelWindows: Record<string, number>;
+    modelMaxOutputs: Record<string, number>;
+}
+
+export function entryShape(e: Pick<RegistryEntry, "host" | "passthrough" | "mitmDomains" | "modelWindows" | "modelMaxOutputs">): InstanceShape {
+    return {
+        host: e.host ?? "",
+        passthrough: Boolean(e.passthrough),
+        mitmDomains: e.mitmDomains ?? [],
+        modelWindows: e.modelWindows ?? {},
+        modelMaxOutputs: e.modelMaxOutputs ?? {},
+    };
+}
+
+/** #3801: order-sensitive domain comparison (the launcher's want-side
+ *  projection compares positionally too) plus exact map equality on the two
+ *  per-model tables — the same cells instanceShapeMismatch judges on attach. */
+export function sameInstanceShape(a: InstanceShape, b: InstanceShape): boolean {
+    if (a.host !== b.host || a.passthrough !== b.passthrough) return false;
+    if (a.mitmDomains.length !== b.mitmDomains.length || !a.mitmDomains.every((d, i) => d === b.mitmDomains[i])) return false;
+    const wa = Object.keys(a.modelWindows);
+    const wb = Object.keys(b.modelWindows);
+    if (wa.length !== wb.length || !wa.every((k) => a.modelWindows[k] === b.modelWindows[k])) return false;
+    const ma = Object.keys(a.modelMaxOutputs);
+    const mb = Object.keys(b.modelMaxOutputs);
+    if (ma.length !== mb.length || !ma.every((k) => a.modelMaxOutputs[k] === b.modelMaxOutputs[k])) return false;
+    return true;
+}
+
+/** #3801: classify the LIVE same-lane holder of a contended port against OUR
+ *  build. "twin" = identical code AND identical config shape — a true
+ *  duplicate: this launch could have attached to it, nothing is draining, so
+ *  laddering +1 would strand the newcomer as an orphan nobody routes to
+ *  (#3044). The duplicate must exit loudly; the serving instance wins.
+ *  "drifted" = identical code, DIFFERENT config shape (the client's model
+ *  config was edited after the holder spawned — #3801). It is NOT attachable
+ *  and therefore NOT a duplicate: the newcomer ladders off to a free port and
+ *  serves there while the holder keeps serving its own sessions untouched —
+ *  dying here instead wedges the lane behind the stale instance forever
+ *  (attach rejects it, rotation never applies to a same-version drift, and
+ *  the sticky port keeps pointing at it). Wrong port/lane, dead pid, or a
+ *  different/missing fingerprint never classify (those are predecessors or
+ *  foreign squatters, handled by their own paths). */
+export interface SameLanePeer {
+    kind: "twin" | "drifted";
+    entry: RegistryEntry;
+}
+
+export function classifySameLanePeer(
+    entries: RegistryEntry[],
+    port: number,
+    lane: string | undefined,
+    ownFingerprint: string | undefined,
+    sameShape: (e: RegistryEntry) => boolean,
+): SameLanePeer | undefined {
+    if (!lane || !ownFingerprint) return undefined;
+    for (const e of entries) {
+        if (e.port !== port || e.lane !== lane) continue;
+        if (!isPidAlive(e.pid)) continue;
+        // #4982: a draining instance stamped portReleasedAt when its listener
+        // closed — its pid still lives but the socket no longer does, so it
+        // cannot be the EADDRINUSE holder even though every other identity cell
+        // matches. This is exactly the stale-twin misclassification that killed
+        // #4982's CI child while a cross-lane instance owned the freed port.
+        if (e.portReleasedAt !== undefined) continue;
+        if (e.codeFingerprint !== ownFingerprint) continue;
+        return { kind: sameShape(e) ? "twin" : "drifted", entry: e };
+    }
+    return undefined;
+}
+
+/** #4341: a registry twin is safe to adopt before persistence initialization
+ * only after the listener proves the same pid + instance identity. A stale
+ * marker, pid reuse, or foreign listener must fall through to the existing
+ * bind/EADDRINUSE policy instead of causing a false adopt. */
+export async function findVerifiedSameLaneTwin(
+    entries: RegistryEntry[],
+    port: number,
+    lane: string | undefined,
+    ownFingerprint: string | undefined,
+    sameShape: (e: RegistryEntry) => boolean,
+    healthOf: (origin: string) => Promise<{ pid?: number; instanceId?: string } | undefined>,
+): Promise<RegistryEntry | undefined> {
+    for (const entry of entries) {
+        const peer = classifySameLanePeer([entry], port, lane, ownFingerprint, sameShape);
+        if (peer?.kind !== "twin") continue;
+        const health = await healthOf(peer.entry.origin);
+        if (health?.pid === peer.entry.pid && health.instanceId === peer.entry.instanceId) return peer.entry;
+    }
+    return undefined;
+}
+
+/** #4977: the recovery-window complement to findVerifiedSameLaneTwin. A registry
+ *  twin whose health probe is SILENT while its socket still accepts connections
+ *  is present but unserviceable — dying or event-loop-wedged (#3654 three-state
+ *  liveness), NOT a healthy peer. The verified path correctly refuses to adopt
+ *  such an occupant; pre-#4977 the child then proceeded into persistence
+ *  initialization, opening index.db under the zombie before its own listen
+ *  failed EADDRINUSE — a real two-writer window on one store (#3923/#3959) plus
+ *  a misleading "another process is already writing" report, all on a round
+ *  that ends in the twin-collision exit anyway (the late EADDRINUSE policy
+ *  classifies the same registry evidence and fail-fasts). Positive-evidence-only
+ *  discipline (#4341): the socket check runs FIRST and is decisive in the
+ *  negative — no live listener means nothing to adjudicate (stale marker over a
+ *  free or foreign port), so we fall through and let the bind proceed; a health
+ *  probe that ANSWERS also falls through — matches belong to the verified path,
+ *  mismatches must not be refused here. */
+export async function findPresentUnverifiedSameLaneTwin(
+    entries: RegistryEntry[],
+    port: number,
+    lane: string | undefined,
+    ownFingerprint: string | undefined,
+    sameShape: (e: RegistryEntry) => boolean,
+    healthOf: (origin: string) => Promise<{ pid?: number; instanceId?: string } | undefined>,
+    socketAlive: (origin: string) => Promise<boolean>,
+): Promise<RegistryEntry | undefined> {
+    for (const entry of entries) {
+        const peer = classifySameLanePeer([entry], port, lane, ownFingerprint, sameShape);
+        if (peer?.kind !== "twin") continue;
+        if (!(await socketAlive(entry.origin))) continue;
+        const health = await healthOf(entry.origin);
+        if (health !== undefined) continue;
+        return entry;
+    }
+    return undefined;
+}
+
 /** #1225: content identity of a bili entry script (sha256 of its bytes).
  *  The spawned child records this for ITS script; an attaching launcher
  *  compares it against the hash of the script it would spawn — so "same
@@ -185,6 +336,28 @@ export function entryScriptFingerprint(scriptPath?: string): string | undefined 
     }
     scriptFingerprints.set(resolved, digest);
     return digest;
+}
+
+/** #4125: env channel carrying the SPAWNER's entry-script hash to its child
+ *  (set by the launcher at spawn time). */
+export const SPAWN_FINGERPRINT_ENV = "BILI_SPAWN_FINGERPRINT";
+
+const SHA256_HEX_RE = /^[0-9a-f]{64}$/;
+
+/** #4125: fingerprint a CHILD records for itself — preferring the value its
+ *  spawner computed from the very script it exec'd ($BILI_SPAWN_FINGERPRINT)
+ *  over re-hashing. Re-hashing is unsafe across the spawn window: an in-place
+ *  update (auto-update extraction between the spawner's hash and the child's
+ *  own read) changes the bytes under both feet, so spawner-side attach/rotate
+ *  gates keyed on digest X would be judging against a child registry record
+ *  saying digest Y — one side sees a mismatch where the other sees its own
+ *  twin. The env value is trusted only when well-formed sha256 hex; garbage or
+ *  absence (manual / unspawned starts) falls back to the local re-hash, which
+ *  is pre-fix behavior. */
+export function resolveOwnFingerprint(spawnedValue: string | undefined, scriptPath: string | undefined): string | undefined {
+    const trimmed = spawnedValue?.trim();
+    if (trimmed !== undefined && SHA256_HEX_RE.test(trimmed)) return trimmed;
+    return entryScriptFingerprint(scriptPath);
 }
 
 /** tmp+fsync+rename (same shape as web/api.ts atomicWriteConfig) — a torn
@@ -331,6 +504,29 @@ export function isPidAlive(pid: number): boolean {
     }
 }
 
+export interface PidProbe {
+    alive: boolean;
+    /** Errno code of the failed kill-0 (e.g. "ESRCH"); undefined when the
+     *  probe succeeded or no probe ran at all (invalid pid). */
+    errCode?: string;
+}
+
+/** #3890: kill-0 with errno visibility. On Windows Node maps every
+ *  OpenProcess failure other than ERROR_ACCESS_DENIED to ESRCH, so a LIVE
+ *  process can read dead with no way to tell which Win32 error caused it.
+ *  Callers that act destructively on a dead verdict log errCode on first
+ *  sight so field episodes can be attributed. */
+export function probePid(pid: number): PidProbe {
+    if (!Number.isInteger(pid) || pid <= 0) return { alive: false };
+    try {
+        process.kill(pid, 0);
+        return { alive: true };
+    } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        return { alive: code === "EPERM", errCode: code };
+    }
+}
+
 export interface RegistryEntry {
     instanceId: string;
     pid: number;
@@ -349,6 +545,22 @@ export interface RegistryEntry {
     modelMaxOutputs?: Record<string, number>;
     lane?: string;
     codeFingerprint?: string;
+    /** #4982: set when this instance released its listening socket (graceful
+     *  shutdown start). The process can stay alive for seconds-to-minutes while
+     *  it drains keep-alive connections and flushes state — during that window
+     *  it CANNOT be the EADDRINUSE holder of `port` anymore, so consumers that
+     *  judge PORT OWNERSHIP (classifySameLanePeer) must skip marked entries,
+     *  while consumers that wait for the process to EXIT (findSameLanePredecessor
+     *  → wait-predecessor) keep counting them. */
+    portReleasedAt?: number;
+    /** #5046: resolved sessions directory (BILI_SESSIONS_DIR or the XDG
+     *  default) — lets the #394 warning judge by DIRECTORY instead of lane
+     *  overlap alone: a peer whose lanes overlap but whose sessions dir
+     *  differs shares no state (isolated via BILI_SESSIONS_DIR), and the
+     *  "will write the same sessions directory" claim would be factually
+     *  wrong for it. Absent in markers written by pre-#5046 builds →
+     *  treated as shared (conservative). */
+    sessionsDir?: string;
 }
 
 /** Cross-instance liveness registry (#394/#527): one marker file per instance
@@ -416,6 +628,8 @@ function coerceEntry(value: unknown): RegistryEntry | undefined {
         ...(Object.keys(maxOutputs).length > 0 ? { modelMaxOutputs: maxOutputs } : {}),
         ...(typeof o.lane === "string" && o.lane !== "" ? { lane: o.lane } : {}),
         ...(typeof o.codeFingerprint === "string" && o.codeFingerprint !== "" ? { codeFingerprint: o.codeFingerprint } : {}),
+        ...(typeof o.portReleasedAt === "number" && Number.isFinite(o.portReleasedAt) ? { portReleasedAt: o.portReleasedAt } : {}),
+        ...(typeof o.sessionsDir === "string" && o.sessionsDir !== "" ? { sessionsDir: o.sessionsDir } : {}),
     };
 }
 
@@ -493,19 +707,40 @@ function lanesOverlap(a: string | undefined, b: string | undefined): boolean {
     return a === undefined || b === undefined || a === b;
 }
 
+/** #5046: true only when BOTH sides report a sessions directory and they
+ *  differ after normalization. Unknown on either side = "not proven apart" →
+ *  false (conservative): pre-#5046 markers carry no dir, so isolation cannot
+ *  be claimed for them. */
+function sessionsDirsDiffer(a: string | undefined, b: string | undefined): boolean {
+    if (a === undefined || b === undefined) return false;
+    const x = path.resolve(a);
+    const y = path.resolve(b);
+    return process.platform === "win32" ? x.toLowerCase() !== y.toLowerCase() : x !== y;
+}
+
 /** Live registered peers whose lanes overlap ours (undeclared lane overlaps
  *  everything — a manual `bili start` daemon can serve any client). */
 function liveOverlappingPeers(ownInstanceId: string, ownLane: string | undefined): RegistryEntry[] {
     return readAllRegistryEntries().filter((e) => e.instanceId !== ownInstanceId && isPidAlive(e.pid) && lanesOverlap(ownLane, e.lane));
 }
 
-export function registerInstanceAndWarn(entry: RegistryEntry, warn: (msg: string) => void): string[] {
+export function registerInstanceAndWarn(entry: RegistryEntry, warn: (msg: string) => void, info?: (msg: string) => void): string[] {
     const warned: string[] = [];
     for (const other of liveOverlappingPeers(entry.instanceId, entry.lane)) {
         const laneNote = entry.lane !== undefined && other.lane !== undefined ? ` on lane "${entry.lane}"` : "";
-        warn(
-            `another bili instance is running (pid ${other.pid}, ${other.origin})${laneNote} — both processes will write the same sessions directory; stop one to avoid state pollution (#394)`,
-        );
+        if (info !== undefined && sessionsDirsDiffer(entry.sessionsDir, other.sessionsDir)) {
+            // #5046: the storage-side second-writer guard keys on the sessions
+            // directory — once proven apart, this peer shares no state and the
+            // warn-level "stop one" advice is a false positive that drowns real
+            // signal; report it informationally instead.
+            info(
+                `another bili instance is running (pid ${other.pid}, ${other.origin})${laneNote} — different sessions directories (ours: ${entry.sessionsDir}, theirs: ${other.sessionsDir}); no shared state, informational only (#394/#5046)`,
+            );
+        } else {
+            warn(
+                `another bili instance is running (pid ${other.pid}, ${other.origin})${laneNote} — both processes will write the same sessions directory; stop one to avoid state pollution (#394)`,
+            );
+        }
         warned.push(other.instanceId);
     }
     reapDeadMarkers(entry.instanceId);
@@ -521,17 +756,26 @@ export function registerInstanceAndWarn(entry: RegistryEntry, warn: (msg: string
  *  the registry on a slow tick and warn once per newly-seen live peer.
  *  Returns the newly-warned instance ids so the caller can remember them. */
 export function warnOnNewPeers(
-    own: { instanceId: string; lane?: string },
+    own: { instanceId: string; lane?: string; sessionsDir?: string },
     previouslyWarned: ReadonlySet<string>,
     warn: (msg: string) => void,
+    info?: (msg: string) => void,
 ): string[] {
     const fresh: string[] = [];
     for (const other of liveOverlappingPeers(own.instanceId, own.lane)) {
         if (previouslyWarned.has(other.instanceId)) continue;
         const laneNote = own.lane !== undefined && other.lane !== undefined ? ` on lane "${other.lane}"` : "";
-        warn(
-            `another bili instance appeared while this process was already running (pid ${other.pid}, ${other.origin})${laneNote} — both processes write the same sessions directory; stop one to avoid state pollution (#394/#2401)`,
-        );
+        if (info !== undefined && sessionsDirsDiffer(own.sessionsDir, other.sessionsDir)) {
+            // #5046: same criterion as registerInstanceAndWarn — proven-apart
+            // peers are informational, never the "stop one" advice.
+            info(
+                `another bili instance appeared while this process was already running (pid ${other.pid}, ${other.origin})${laneNote} — different sessions directories (ours: ${own.sessionsDir}, theirs: ${other.sessionsDir}); no shared state, informational only (#394/#2401/#5046)`,
+            );
+        } else {
+            warn(
+                `another bili instance appeared while this process was already running (pid ${other.pid}, ${other.origin})${laneNote} — both processes write the same sessions directory; stop one to avoid state pollution (#394/#2401)`,
+            );
+        }
         fresh.push(other.instanceId);
     }
     return fresh;
@@ -569,5 +813,23 @@ export function discoverLiveInstances(): ProxyInstanceFile[] {
 export function unregisterInstance(instanceId: string): void {
     try {
         fs.unlinkSync(registryEntryFile(instanceId));
+    } catch {}
+}
+
+/** #4982: withdraw the port-ownership claim the moment the listening socket
+ *  closes (graceful shutdown start). The drain can outlive the release by
+ *  minutes (keep-alive pins, slow flushes), and during that window a stale
+ *  "I hold port N" marker let a same-lane newcomer misclassify us as its twin
+ *  and die with the adopt signal while a cross-lane instance owned the freed
+ *  socket (#4982). Rewrites ONLY our own marker file with the stamp —
+ *  per-instance files mean no cross-process read-modify-write. Best-effort:
+ *  a failed mark degrades to the pre-#4982 behavior, where the health
+ *  verification in the EADDRINUSE path still catches the stale claim. */
+export function markPortReleased(instanceId: string): void {
+    try {
+        const file = registryEntryFile(instanceId);
+        const entry = coerceEntry(safeReadJson(file));
+        if (!entry || entry.portReleasedAt !== undefined) return;
+        atomicWriteJson({ ...entry, portReleasedAt: Date.now() }, file);
     } catch {}
 }

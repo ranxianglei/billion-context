@@ -613,3 +613,101 @@ test("register landing after the child's first request still links late (#1362)"
         await close(relay);
     }
 });
+
+/** #2986: read a session record straight off disk by id (namespacing-agnostic),
+ *  returning its metadata.derivedFromSessionId or undefined. Plain JSON only —
+ *  the store defaults to unframed JSON (no zstd/encryption), so a raw parse is
+ *  exact. Framed files fail the parse and are skipped. */
+function diskLineageId(dir: string, id: string): string | undefined {
+    const stack = [dir];
+    while (stack.length > 0) {
+        const cur = stack.pop()!;
+        let entries: fs.Dirent[];
+        try { entries = fs.readdirSync(cur, { withFileTypes: true }); } catch { continue; }
+        for (const e of entries) {
+            const full = path.join(cur, e.name);
+            if (e.isDirectory()) { stack.push(full); continue; }
+            if (!e.name.endsWith(".json")) continue;
+            try {
+                const parsed = JSON.parse(fs.readFileSync(full, "utf8")) as Record<string, unknown>;
+                const rec = parsed.payload && typeof parsed.payload === "object" ? parsed.payload : parsed;
+                if ((rec as { id?: unknown }).id !== id) continue;
+                const meta = (rec as { metadata?: { derivedFromSessionId?: unknown } }).metadata;
+                return typeof meta?.derivedFromSessionId === "string" ? meta.derivedFromSessionId : undefined;
+            } catch { /* non-JSON / framed — skip */ }
+        }
+    }
+    return undefined;
+}
+
+test("derivedFromSessionId is durable on disk within a tick, not the debounce window (#2986)", async () => {
+    _reset_for_test();
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-lineage-persist-"));
+    // Huge debounce: if the link persisted ONLY via the debounced cadence it
+    // would be ABSENT from disk for the whole poll window below. Only an
+    // immediate write at link establishment can make it appear in time.
+    _setStoreForTest(new SessionStore({ enabled: true, dir, debounceMs: 60_000 }));
+    setRegistryForTest({});
+    const run = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const parentConv = `pfa-parent-${run}`;
+    const childConv = `pfa-child-dur-${run}`;
+
+    const state: RelayState = { upstreamReqs: [], compressed: false };
+    const relay = startMockUpstream(state);
+    await listen(relay);
+    const relayPort = (relay.address() as { port: number }).port;
+    const proxy = await startServer(proxyOpts(relayPort));
+    await listen(proxy);
+    const proxyPort = (proxy.address() as { port: number }).port;
+    const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${relayPort}/v1/chat/completions`;
+
+    const preExisting = new Set(listSessions().map((s) => s.id));
+    const newSessions = () => listSessions().filter((s) => !preExisting.has(s.id));
+    try {
+        // Grow the parent under its own conversation id until a block folds.
+        const history: ChatMsg[] = [];
+        for (let i = 1; i <= 8; i++) {
+            history.push({ role: "user", content: `run ${run} parent turn ${i}: ${FILLER.repeat(12)}` });
+            const reply = await chat(url, history, parentConv);
+            assert.ok(reply.length > 0, `parent turn ${i} must produce a reply`);
+            history.push({ role: "assistant", content: reply });
+        }
+        const parent = newSessions()[0]!;
+        assert.ok(parent.state.blocks.filter((b) => b.active).length >= 1, "parent must have a folded block");
+
+        // The child reports its derivation at register (identity mode).
+        const reg = await fetch(`http://127.0.0.1:${proxyPort}/__bili/plugin/register`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ conversationId: childConv, agent: "pi", identity: true, parentConversationId: parentConv }),
+        });
+        assert.ok(reg.ok, "register must succeed");
+
+        // The child's FIRST request carries an EMPTY history (a kind child that
+        // relies entirely on the parent chain for decompress/search_context).
+        const piHeaders = { "x-bili-plugin": "pi", "x-bili-plugin-conversation": childConv };
+        const childReply = await chat(url, [{ role: "user", content: `run ${run} child first turn: ${FILLER.repeat(12)}` }], "", piHeaders);
+        assert.ok(childReply.length > 0, "child turn must produce a reply");
+
+        const child = newSessions().find((s) => s.id !== parent.id);
+        assert.ok(child, "child conversation must resolve to its own session");
+        assert.equal(child.metadata.derivedFromSessionId, parent.id, "in-memory link established");
+
+        // The defect #2986 fixes: within the debounce window the link must ALREADY
+        // be on disk. Poll up to 3s — far below the 60s debounce, far above the
+        // immediate-write latency. A debounce-only persist leaves this undefined.
+        const deadline = Date.now() + 3000;
+        let lineage: string | undefined;
+        for (;;) {
+            lineage = diskLineageId(dir, child.id);
+            if (lineage !== undefined) break;
+            if (Date.now() >= deadline) break;
+            await new Promise((r) => setTimeout(r, 50));
+        }
+        assert.equal(lineage, parent.id, "derivedFromSessionId must be durable on disk within a tick, not the debounce window (#2986)");
+    } finally {
+        await close(proxy);
+        await close(relay);
+        rmrf(dir);
+    }
+});

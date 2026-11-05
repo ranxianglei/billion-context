@@ -146,6 +146,54 @@ test("prune preserves first user message even when covered", () => {
   assert.equal(result[1]!.id, "m3");
 });
 
+test("#3642: the first-user pin spans the opening wire message's whole core run", () => {
+  const state = createInitialState();
+  state.blocks.push(
+    makeBlock({ blockId: "b1", effectiveMessageIds: ["m1", "m2", "m3"] }),
+  );
+  // Canonical granularity splits one wire message into one core per part:
+  // the opening message is a text + image core RUN sharing wireIndex 0;
+  // m3 is a DIFFERENT wire user message. Everything is covered — the pin
+  // must keep the whole opening run (image bytes included) and still let
+  // the unrelated m3 fold away.
+  const messages: CoreMessage[] = [
+    { id: "m1", role: "user", contentType: "text", text: "m1", wireIndex: 0 },
+    {
+      id: "m2",
+      role: "user",
+      contentType: "text",
+      text: "m2",
+      wireIndex: 0,
+    },
+    { id: "m3", role: "user", contentType: "text", text: "m3", wireIndex: 1 },
+    { id: "m4", role: "assistant", contentType: "text", text: "m4" },
+  ].map((m) => m as CoreMessage);
+  const result = prune(messages, state, { injectSummaries: false });
+
+  assert.deepEqual(
+    result.map((m) => m.id),
+    ["m1", "m2", "m4"],
+  );
+});
+
+test("#3642: kernel-rendered cores (no wireIndex) never extend the pin run", () => {
+  const state = createInitialState();
+  state.blocks.push(
+    makeBlock({ blockId: "b1", effectiveMessageIds: ["m1", "m2"] }),
+  );
+  const messages: CoreMessage[] = [
+    { id: "m1", role: "user", contentType: "text", text: "m1", wireIndex: 0 },
+    { id: "m2", role: "user", contentType: "text", text: "m2" },
+    { id: "m3", role: "assistant", contentType: "text", text: "m3" },
+  ].map((m) => m as CoreMessage);
+  const result = prune(messages, state, { injectSummaries: false });
+
+  assert.deepEqual(
+    result.map((m) => m.id),
+    ["m1", "m3"],
+  );
+});
+
 test("prune without summary injection only removes covered messages", () => {
   const state = createInitialState();
   state.blocks.push(makeBlock({ blockId: "b1", effectiveMessageIds: ["m2"] }));
@@ -155,6 +203,28 @@ test("prune without summary injection only removes covered messages", () => {
   assert.deepEqual(
     result.map((m) => m.id),
     ["m1", "m3"],
+  );
+});
+
+test("prune without summary injection keeps rendered copies of consumed blocks (#2733)", () => {
+  const state = createInitialState();
+  state.blocks.push(
+    makeBlock({ blockId: "b1", active: false, effectiveMessageIds: ["m2"] }),
+    makeBlock({
+      blockId: "b2",
+      effectiveMessageIds: ["m3"],
+      directBlockIds: ["b1"],
+    }),
+  );
+  const rendered = msg("acp_summary_b1");
+  const messages = [msg("m1"), rendered, msg("m4")];
+  const result = prune(messages, state, { injectSummaries: false });
+
+  // No fresh render exists when injection is off, so the already-rendered
+  // copy stays instead of being silently deleted.
+  assert.deepEqual(
+    result.map((m) => m.id),
+    ["m1", "acp_summary_b1", "m4"],
   );
 });
 
@@ -290,4 +360,37 @@ test("processTurn tolerates id-less host-shaped messages (pre-#233 lenience, #42
   });
   assert.ok(Array.isArray(turn.messages), "turn completes without throwing");
   assert.equal(turn.state.blocks.length, 0, "no blocks from a crash-free pass");
+});
+
+// #3641/#3640: unresolved summary anchors — the covered substrate is off the
+// wire (host-native compaction, truncation, offload churn) — must never park
+// at the very tail riding AFTER the user's newest question. The insertion
+// point is the renovation zone (messages every upcoming turn rewrites
+// anyway), so cache is unharmed, and the model answers the question first.
+test("#3640: unresolved anchor parks BEFORE the newest user message, never at the tail", () => {
+  const state = createInitialState();
+  state.blocks.push(
+    makeBlock({ blockId: "b1", summary: "orphaned history summary", effectiveMessageIds: ["gone1", "gone2"] }),
+  );
+  const messages = [
+    msg("keep1", "assistant"),
+    msg("keep2", "assistant"),
+    msg("q", "user"), // the newest question
+  ];
+  const result = prune(messages, state);
+  const anchorIdx = result.findIndex((m) => m.id === "acp_summary_b1");
+  const qIdx = result.findIndex((m) => m.id === "q");
+  assert.ok(anchorIdx >= 0, "the orphaned summary still renders (snapshot survives)");
+  assert.ok(qIdx > anchorIdx, `summary (idx ${anchorIdx}) must precede the newest user turn (idx ${qIdx})`);
+});
+
+test("#3641: no user turn on the wire → legacy tail placement preserved", () => {
+  const state = createInitialState();
+  state.blocks.push(
+    makeBlock({ blockId: "b1", summary: "s", effectiveMessageIds: ["gone1"] }),
+  );
+  const messages = [msg("a1", "assistant"), msg("a2", "assistant")];
+  const result = prune(messages, state);
+  assert.equal(result[result.length - 1]!.id, "acp_summary_b1",
+    "assistant-only history keeps the pre-doctrine tail placement");
 });

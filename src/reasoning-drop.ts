@@ -1,4 +1,5 @@
 import type { BiliMessage } from "acp-kernel/wire";
+import { isMcpBiliCompress } from "./config.js";
 
 /** [#651] Drop oversized reasoning (thinking) from closed-round `compress`
  *  tool calls at request time — the billion-context twin of
@@ -49,16 +50,19 @@ export function resolveReasoningDrop(cfg?: CompressReasoningConfig): Required<Co
  *     long agentic sessions do close rounds; a call without a result, or
  *     whose result is still the last message, is in flight and never
  *     touched;
- *  2. selector: `contentType: "tool-call"` with `toolName === "compress"`
- *     (other protected tools would need their own explicit config);
+ *  2. selector: `contentType: "tool-call"` whose name counts as bili's
+ *     compress tool — bare `compress` OR the MCP-prefixed form
+ *     (`isMcpBiliCompress`, #2970/#3222: hosts that surface the tool through
+ *     MCP re-sent `mcp__bili__compress`, which this pass used to miss);
  *  3. size: the run of reasoning messages immediately preceding the call
  *     (contiguous, as emitted by anthropicToCore/openaiToCore/responsesToCore)
  *     totals strictly more than `threshold` chars.
  *  Pure: never mutates the input; idempotent; fail-safe (any error returns
- *  the input unchanged). */
-export function dropCompressReasoning(messages: BiliMessage[], cfg?: CompressReasoningConfig): BiliMessage[] {
+ *  an empty set / the input unchanged). */
+export function dropCompressReasoningIds(messages: BiliMessage[], cfg?: CompressReasoningConfig): Set<string> {
     const { drop, threshold } = resolveReasoningDrop(cfg);
-    if (!drop || messages.length === 0) return messages;
+    const ids = new Set<string>();
+    if (!drop || messages.length === 0) return ids;
     try {
         const last = messages.length - 1;
         const resultAt = new Map<string, number>();
@@ -68,10 +72,9 @@ export function dropCompressReasoning(messages: BiliMessage[], cfg?: CompressRea
                 resultAt.set(m.toolCallId, i);
             }
         }
-        const dropIdx = new Set<number>();
         for (let i = 0; i <= last; i++) {
             const m = messages[i]!;
-            if (m.contentType !== "tool-call" || m.toolName !== "compress") continue;
+            if (m.contentType !== "tool-call" || typeof m.toolName !== "string" || !isMcpBiliCompress(m.toolName)) continue;
             const ri = typeof m.toolCallId === "string" ? resultAt.get(m.toolCallId) : undefined;
             if (ri === undefined || ri <= i || ri >= last) continue;
             let total = 0;
@@ -81,12 +84,17 @@ export function dropCompressReasoning(messages: BiliMessage[], cfg?: CompressRea
                 j--;
             }
             if (total > threshold) {
-                for (let k = j + 1; k < i; k++) dropIdx.add(k);
+                for (let k = j + 1; k < i; k++) ids.add(messages[k]!.id);
             }
         }
-        if (dropIdx.size === 0) return messages;
-        return messages.filter((_, idx) => !dropIdx.has(idx));
     } catch {
-        return messages;
+        // fail-safe: report nothing to drop rather than corrupt the view
     }
+    return ids;
+}
+
+export function dropCompressReasoning(messages: BiliMessage[], cfg?: CompressReasoningConfig): BiliMessage[] {
+    const ids = dropCompressReasoningIds(messages, cfg);
+    if (ids.size === 0) return messages;
+    return messages.filter((m) => !ids.has(m.id));
 }

@@ -1,5 +1,8 @@
+import { pckKeyAbated } from "./pck-probe.js";
 import { isCodexClient } from "./codex-compact.js";
-import { isLoopbackAddress } from "./util.js";
+import { claudeLaneTokenIn } from "./claude-lane-token.js";
+import { resolveWireClientProfile } from "./server/lane-decisions.js";
+import type { PromptCacheRouting } from "./config.js";
 
 export type ConversationIdentity = {
     value: string;
@@ -66,14 +69,36 @@ export function conversationHeaderSource(headers: Record<string, string | string
     // x-mavis-session-id: MiniMax Code (mcode) stamps its per-conversation id
     // on every model request (#1050). Client-specific name — same trust class
     // as the claude/grok headers above.
+    // x-opencode-session-id: OpenCode 2.x stamps the request's OWN session id
+    // here on every model request, while x-session-affinity / X-Session-Id /
+    // x-opencode-session all carry the INHERITED cache-routing affinity
+    // (parentID ?? fork source ?? own id — the provider prefix-cache grouping
+    // key, verified against opencode core model-request.ts + affinity.ts).
+    // Keying on the affinity would merge a parent and all of its subagent/
+    // fork siblings onto one mutable ACP state (#2779). 1.x stamped its own
+    // id into those affinity headers instead, so this restores 1.x isolation
+    // for 2.x traffic and is inert for 1.x (header absent); root sessions are
+    // unchanged either way (affinity === own id). Client-specific name — same
+    // trust class as the headers above.
     const pluginMarker = typeof headers["x-bili-plugin"] === "string";
-    const names = ["x-bili-plugin-conversation", "x-claude-code-session-id", "x-grok-session-id", "x-grok-conv-id", "x-mavis-session-id", "x-session-affinity", "x-acp-session", "x-session-id", "x-opencode-session", "session-id", "session_id"];
+    const names = ["x-bili-plugin-conversation", "x-claude-code-session-id", "x-grok-session-id", "x-grok-conv-id", "x-mavis-session-id", "x-opencode-session-id", "x-session-affinity", "x-acp-session", "x-session-id", "x-opencode-session", "session-id", "session_id"];
     for (const name of names) {
         if (name === "x-bili-plugin-conversation" && !pluginMarker) continue;
         const v = headers[name];
         if (typeof v === "string" && v.trim().length > 0) return { name, value: v.trim() };
     }
     return undefined;
+}
+
+/** Memory workers replay the parent history but keep their tool tail private. */
+export function zcodeMemoryConversation(parent: string, headers: Record<string, string | string[] | undefined>): string | undefined {
+    if (headers["x-zcode-query-source"] !== "project_memory_extract"
+        || headers["x-zcode-session-type"] !== "other"
+        || headers["x-session-id"] !== parent) return undefined;
+    const query = headers["x-query-id"];
+    if (typeof query !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(query)) return undefined;
+    // |sub: descendants can take over host-stamped management calls; workers cannot.
+    return `${parent}|aux:zcode-memory:${query}`;
 }
 
 /** #1106/#1102: whether the Responses-wire instructions fingerprint should
@@ -90,9 +115,11 @@ export function conversationHeaderSource(headers: Record<string, string | string
  *    predicate); the fingerprint still matters for root threads and older
  *    codex builds, detected by the turn-metadata header or the user agent
  *    (same convention as isCodexClient, #645).
- *  - claude over Responses (#970): subagents SHARE the main agent's session
- *    id (the Anthropic path splits them via claudeSubagentSplit; a claude
- *    client on the Responses wire only has this fingerprint).
+ *  - claude code (#970/#4352): subagents SHARE the main agent's session id
+ *    on every wire (the anthropic path also separates them via the order
+ *    resolver when its two-signal header gate misses — see
+ *    claudeAnthropicPersonaOrderApplies below; the responses wire relies on
+ *    this fingerprint alone).
  *
  * Everyone else keys VERBATIM: instructions drift mid-id means "same
  * conversation, evolved system context" (software upgrade, plugin install,
@@ -108,18 +135,89 @@ export function conversationHeaderSource(headers: Record<string, string | string
  * by instructions must be added here (same evidence-per-client discipline as
  * #1104, inverted).
  */
-export function instructionsFingerprintApplies(headers: Record<string, string | string[] | undefined>): boolean {
-    const turnMeta = headers["x-codex-turn-metadata"];
-    if (typeof turnMeta === "string" && turnMeta.trim().length > 0) return true;
-    // One definition of "codex traffic" process-wide (every other codex path in
-    // server.ts uses isCodexClient, #645). Its lenient fallback — a UA
-    // component starting with lowercase "codex" (#1641) — stays CASE-SENSITIVE
-    // precisely because a case-insensitive match would pull non-codex relays
-    // with "Codex"-shaped UAs back into the fingerprint and re-fork them
-    // mid-conversation (#1106); only known codex prefixes (incl. Codex
-    // Desktop, #1169) match case-insensitively.
-    if (isCodexClient(headers)) return true;
-    return conversationHeaderSource(headers)?.name === "x-claude-code-session-id";
+/** Name-free wire observations for the lane-decisions client registry
+ * (#3482): present header names, the resolved conversation-source header,
+ * and the codex user-agent fact. Shared by every predicate below so the
+ * signal extraction stays single-sourced. */
+function wireClientSignals(headers: Record<string, string | string[] | undefined>, personaSplitOff?: boolean): { headerNames: Set<string>; conversationSourceName: string | undefined; codexUserAgent: boolean; personaSplitOff?: boolean } {
+    const headerNames = new Set<string>();
+    for (const [name, value] of Object.entries(headers ?? {})) {
+        const first = Array.isArray(value) ? value[0] : value;
+        if (typeof first === "string" && first.trim().length > 0) headerNames.add(name);
+    }
+    return {
+        headerNames,
+        conversationSourceName: conversationHeaderSource(headers)?.name,
+        codexUserAgent: isCodexClient(headers),
+        personaSplitOff,
+    };
+}
+
+export function instructionsFingerprintApplies(headers: Record<string, string | string[] | undefined>, personaSplitOff?: boolean): boolean {
+    // Detection only — the client-identity DECISION (who keys by
+    // instructions) lives in the lane-decisions wire-client registry
+    // (#3482 site 4): the header-name literals are registry data, not
+    // scattered comparisons. Signals are name-free observations here.
+    // personaSplitOff (#5456): host-level opt-out threaded from ProxyOptions
+    // so resolveWireClientProfile can strip instructionsFingerprintKeyed
+    // without mutating WIRE_CLIENTS literals.
+    return resolveWireClientProfile(wireClientSignals(headers, personaSplitOff)).instructionsFingerprintKeyed;
+}
+
+/** #4352: whether THIS request's claude-code-over-Anthropic traffic should
+ * ride the continuity-aware order resolver (personaConversationOrder) for
+ * persona separation when the #970 two-signal header gate
+ * (claudeSubagentAgentId) misses.
+ *
+ * Evidence (v0.1.204 field report, #4352): Claude Code stamps ONE session id
+ * on every model request of a session INCLUDING Task-tool subagents, and the
+ * VS Code extension build's subagent requests carry no agent-id headers at
+ * all — so claudeSubagentAgentId misses and those subagents ride the raw
+ * parent id, where their disjoint short histories accumulate fold-reconcile
+ * drop events until epoch confirmation fires substrate-destruction and the
+ * parent's refs go permanently DEAD (compress rejected for the rest of the
+ * session). Routing such traffic through the order resolver separates exactly
+ * those disjoint rides onto |sub:<fp> lanes while a continuing main
+ * conversation keeps the raw key on order+content evidence (#2944) — the same
+ * mechanism the dsh lane uses (#1916).
+ *
+ * Detection only — the client-identity DECISION lives in the lane-decisions
+ * wire-client registry (#3482 site 4), same shape as
+ * instructionsFingerprintApplies above. */
+export function claudeAnthropicPersonaOrderApplies(headers: Record<string, string | string[] | undefined>): boolean {
+    return resolveWireClientProfile(wireClientSignals(headers)).personaOrderKeyed;
+}
+
+/** #5095 (D1-C): extract the bili SubagentStart lane token from an Anthropic
+ *  request's messages. The hook injects the token into the dispatch's FIRST
+ *  user message, so the scan stops at the first user message — a marker
+ *  pasted by the user into a LATER message must never fork the main
+ *  conversation off its raw key. Content shapes: bare string, or a block
+ *  array where only `type:"text"` blocks are scanned (the hook context may
+ *  sit inside a <system-reminder> wrapper; the marker is matched as a
+ *  substring, so the wrapper shape does not matter). Returns undefined when
+ *  absent — the overwhelmingly common case (main turns, other hosts,
+ *  un-upgraded installs) keeps resolution byte-identical to before. */
+export function claudeSubagentLaneTokenOf(messages: unknown): string | undefined {
+    if (!Array.isArray(messages)) return undefined;
+    for (const msg of messages) {
+        if (msg === null || typeof msg !== "object") continue;
+        const m = msg as { role?: unknown; content?: unknown };
+        if (m.role !== "user") continue;
+        if (typeof m.content === "string") return claudeLaneTokenIn(m.content);
+        if (Array.isArray(m.content)) {
+            for (const block of m.content) {
+                if (block === null || typeof block !== "object") continue;
+                const b = block as { type?: unknown; text?: unknown };
+                if (b.type === "text" && typeof b.text === "string") {
+                    const tok = claudeLaneTokenIn(b.text);
+                    if (tok !== undefined) return tok;
+                }
+            }
+        }
+        return undefined;
+    }
+    return undefined;
 }
 
 /** #1916/#1307/#1314: whether the persona fingerprint (session id + system
@@ -151,9 +249,16 @@ export function instructionsFingerprintApplies(headers: Record<string, string | 
  *  turns hash stably and never fork mid-conversation. A mid-session system
  *  change (AGENTS.md edit, permission-preset switch, dsh upgrade) forks ONCE
  *  — same class as a resume re-pay, and semantically right: a different
- *  operating context IS a different persona. Proxy restart resets the
- *  kernel's in-memory anchor; the persona that arrives first claims the raw
- *  key (normally the main turn — review only fires alongside tool calls).
+ *  operating context IS a different persona. When the change is a plain
+ *  model/provider switch whose history keeps continuing the raw key's chain
+ *  (byte-exact, or re-serialization-churn-equal per the #2601 normalized
+ *  tail fingerprint in prefix-affinity), the anchor MIGRATES instead of
+ *  forking — and a fork that still legitimately happens is followed by the
+ *  host-stamped management-call routing (#2601 lineage follow in plugin.ts),
+ *  so compression state never strands on a stale parent. Proxy restart
+ *  resets the kernel's in-memory anchor; the persona that arrives first
+ *  claims the raw key (normally the main turn — review only fires alongside
+ *  tool calls).
  *
  *  Future hosts that reuse one session id across personas must be ADDED HERE
  *  with traffic evidence (see AGENTS.md §2 Key Design Decisions), never
@@ -190,6 +295,36 @@ export function openaiSystemTextForPersona(body: { messages?: unknown }): string
     return texts.join("\n\n");
 }
 
+/** #5095 D1-B: per-run discriminator for the claude-anthropic derived-persona
+ *  lane key. Same-type subagents re-dispatched under one parent id carry a
+ *  byte-identical system (the persona tag), so the dispatch task prompt —
+ *  the first user message with extractable text — is what tells runs apart;
+ *  it is unique per run and stable for the agent's whole lifetime. Users
+ *  whose content holds no top-level text (pure tool_result) are skipped. ""
+ *  when nothing is usable → the call site degrades to the two-segment lane
+ *  key. Body-only read: no header literals here (B-class guard). */
+export function anthropicFirstUserFrag(messages: unknown): string {
+    const list = Array.isArray(messages) ? messages : [];
+    const cap = 1024;
+    for (const m of list) {
+        if (m === null || typeof m !== "object" || (m as { role?: unknown }).role !== "user") continue;
+        const content = (m as { content?: unknown }).content;
+        if (typeof content === "string") {
+            if (content.length > 0) return content.slice(0, cap);
+        } else if (Array.isArray(content)) {
+            const parts: string[] = [];
+            for (const part of content) {
+                if (part !== null && typeof part === "object" && (part as { type?: unknown }).type === "text" && typeof (part as { text?: unknown }).text === "string") {
+                    parts.push((part as { text: string }).text);
+                }
+            }
+            const joined = parts.join("\n\n");
+            if (joined.length > 0) return joined.slice(0, cap);
+        }
+    }
+    return "";
+}
+
 /**
  * Return only an identity the client already supplied. Generated identities
  * remain proxy-internal so billion-context does not invent upstream headers.
@@ -199,43 +334,60 @@ export function affinityToken(identity: ConversationIdentity): string | undefine
 }
 
 /**
- * #2218: decide whether the proxy stamps `prompt_cache_key` into an outbound
- * OpenAI chat body on behalf of a plugin host (dsh desktop) whose ONLY
- * identity signal is the bili-internal x-bili-plugin-conversation header.
- * Body-keyed relays (the workbuddy panel reads the body only: metadata →
- * conversation_id → prompt_cache_key → content digest) cannot see any
- * header, so without the stamp every plugin-lane request falls to a content
- * digest and any account migration freezes the provider prefix cache.
- * sub2api's OpenAI wire reads headers first (x-session-id wins), which the
- * buildForwardTarget x-session-id fix already covers — the body stamp is
- * specifically for the body-only relay family.
+ * #2218/#2645: decide what to do with `prompt_cache_key` on an outbound
+ * OpenAI chat body.
  *
- * Returns true only when ALL of:
- *  - the plugin lane owns the identity (the winning conversation header is
- *    the bili-internal one, not a header the upstream could read itself);
- *  - the client sent no prompt_cache_key of its own (client value wins);
- *  - the destination is admin-configured (provider-rewritten route) or
- *    loopback — deliberate relay/local deployments. Strict direct APIs can
- *    400 unknown body params (#1403), so unrouted non-loopback forwards
- *    stay unstamped.
+ * "stamp" — the proxy writes its own conversation id into the field. Only the
+ * internal plugin lane qualifies (the winning conversation header is the
+ * bili-internal x-bili-plugin-conversation one — body-keyed relays such as
+ * the workbuddy panel read the body only and would otherwise fall to a
+ * content digest) and the client sent no key of its own (client value wins).
+ *
+ * #2645 probe-and-remember (replaces the old destination-shape gate): under
+ * `routing` auto/enabled, stamping applies to every destination shape —
+ * loopback pools, docker/LAN/VPS pools, plain remote relays alike all keep
+ * their affinity signal (the static loopback/rewritten-route heuristics hurt
+ * the two big pool populations while trying to protect strict direct APIs).
+ * The protection comes from the egress A/B seam (src/server/relay.ts +
+ * src/pck-probe.ts): when an egress carrying the key 400s, the identical
+ * request is re-sent once without it — accepted ⇒ causation confirmed and this
+ * exact origin+model pair stops being stamped for the process lifetime
+ * (in-memory, restart resets, surfaced via log/acp_status/web panel); still
+ * failing ⇒ inconclusive, nothing learned. Client-supplied keys pass through
+ * verbatim UNTIL their pair is A/B-ablated, after which they are withheld too
+ * (otherwise every turn re-paid the 400 round trip); that withholding is
+ * likewise in-memory and visible on the same surfaces. The A/B seam works in
+ * EVERY routing mode, including disabled (it still guards client keys).
+ *
+ * #5079 routing switch: `routing === "disabled"` (the default) never stamps —
+ * bili writes no prompt_cache_key of its own at all. A key echoing the
+ * conversation id back on the plugin lane (`sessionId`) is bili's own prior
+ * emission (dsh PI_CACHE_RETENTION / the omp/dsh extension stamp), not a
+ * client value, so it is dropped too; any other client value stays
+ * client-owned and passes through even under disabled.
  */
-export function shouldStampRelayAffinityPck(
+type RelayAffinityPckDecision = "stamp" | "keep-client" | "drop";
+
+export function resolveRelayAffinityPck(
     identityHeaderName: string | undefined,
     clientPck: unknown,
-    routeRewrittenUrl: string | undefined,
+    egressUrl: string | undefined,
     upstreamOrigin: string,
-): boolean {
-    if (identityHeaderName !== "x-bili-plugin-conversation") return false;
-    if (clientPck !== undefined) return false;
-    if (routeRewrittenUrl !== undefined) return true;
-    try {
-        const hostname = new URL(upstreamOrigin).hostname;
-        // "localhost" is loopback but not matched by isLoopbackAddress (127.x/::1
-        // only); a silent miss here would reproduce the zero-signal bug (#2218).
-        return hostname === "localhost" || isLoopbackAddress(hostname);
-    } catch {
-        return false;
-    }
+    routing: PromptCacheRouting,
+    sessionId?: string,
+    modelId?: unknown,
+): RelayAffinityPckDecision {
+    const ablated = pckKeyAbated(egressUrl, upstreamOrigin, modelId);
+    const internalLane = identityHeaderName === "x-bili-plugin-conversation";
+    const raw = typeof clientPck === "string" ? clientPck.trim() : "";
+    // #5079: the plugin lane's identity always derives from the bili-internal
+    // header (pck promotion only fires without one), so a body key equal to
+    // the session id here can only be bili's own machinery echoing back.
+    const biliOwned = internalLane && raw.length > 0 && sessionId !== undefined && raw === sessionId;
+    if (clientPck !== undefined && !biliOwned) return ablated ? "drop" : "keep-client";
+    if (ablated || !internalLane) return "drop";
+    if (routing === "disabled") return "drop";
+    return "stamp";
 }
 
 /**

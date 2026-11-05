@@ -78,7 +78,7 @@ async function harness(wire: Wire) {
         assert.equal(r.status, 200);
         return await r.json() as Status;
     };
-    return { send, status, forwarded, setUsage: (value: boolean) => { usage = value; }, setFail: () => { fail = true; }, close: async () => { store.cancelAll(); proxy.close(); upstream.close(); await Promise.all([once(proxy, "close"), once(upstream, "close")]); } };
+    return { send, status, forwarded, setUsage: (value: boolean) => { usage = value; }, setFail: () => { fail = true; }, close: async () => { store.cancelAll(); proxy.close(); proxy.closeIdleConnections?.(); upstream.close(); upstream.closeIdleConnections?.(); await Promise.all([once(proxy, "close"), once(upstream, "close")]); } };
 }
 
 for (const wire of ["anthropic", "openai", "responses", "google"] as const) {

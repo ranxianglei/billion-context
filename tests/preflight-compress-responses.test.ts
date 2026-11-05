@@ -42,7 +42,10 @@ function fcEvents(callId: string, args: string): string {
 function longInput() {
     const input: { type: string; role: string; content: string }[] = [];
     for (let i = 0; i < 12; i++) {
-        input.push({ type: "message", role: i % 2 === 0 ? "user" : "assistant", content: `Message ${i} of the long conversation. ` + `MARKER_${i}_content_`.repeat(250) });
+        // #3298: repeat(235) keeps ~700 est-tokens of margin under the 10k window
+        // after the preflight fold — repeat(250) was knife-edge against the
+        // injected system-prompt size and flipped the #330 soft-zone relaxation.
+        input.push({ type: "message", role: i % 2 === 0 ? "user" : "assistant", content: `Message ${i} of the long conversation. ` + `MARKER_${i}_content_`.repeat(235) });
     }
     return input;
 }
@@ -147,7 +150,7 @@ test("e2e #280 (Responses): restored session with lastInputTokens=0 → prefligh
         assert.ok((sA!.state.blocks ?? []).some((b) => b.active), "session A compressed once");
 
         // --- Session B: the rebind/restore — a FRESH session (lastInputTokens=0)
-        // receives the full raw history (~13k tokens > the 10k window). Preflight
+        // receives the full raw history (~12k tokens > the 10k window). Preflight
         // must compress it before forward; the raw history must never be replayed
         // verbatim. ---
         const rB = await fetch(url, {
@@ -175,8 +178,10 @@ test("e2e #280 (Responses): restored session with lastInputTokens=0 → prefligh
         assert.equal(sB!.stats.lastInputTokens, 1000, "the real usage report lands after the recovered forward");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });

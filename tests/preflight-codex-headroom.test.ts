@@ -85,8 +85,10 @@ async function withProxy(mode: "intercept" | "pass", run: (h: {
         }) });
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
         if (previousMode === undefined) delete process.env.BILI_CODEX_COMPACT;
         else process.env.BILI_CODEX_COMPACT = previousMode;

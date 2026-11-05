@@ -129,8 +129,10 @@ test("#970: concurrent requests on the same session id forward concurrently (no 
         assert.equal(peekSession(SESSION)!.stats.requests, 3, "follow-up must land on the same session");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });

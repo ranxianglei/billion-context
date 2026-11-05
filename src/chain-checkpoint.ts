@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import type { WireProtocol } from "./util.js";
+import { normalizeGoogleUserPartOrder, type GooglePart } from "acp-kernel/wire";
 
 // #1357/#1395/#1421 — Chain Checkpoint (first-processor-wins idempotent interop).
 // A request-level checkpoint marks a request that already passed through a
@@ -542,15 +543,17 @@ export function insertCheckpointCarrier(parsed: unknown, wire: WireProtocol, tag
         const role = typeof c.role === "string" ? c.role : "user";
         if (role !== "model") {
             const parts = Array.isArray(c.parts) ? (c.parts as unknown[]) : [];
+            // #3159: plain text after a functionResponse part 400s on Vertex —
+            // normalize whichever way the carrier lands (replace-in-place or append).
             const pi = parts.length - 1;
             const pp = parts[pi];
             if (pp && typeof pp === "object" && !Array.isArray(pp)) {
                 const ppo = pp as Record<string, unknown>;
                 if (Object.keys(ppo).length === 1 && typeof ppo.text === "string" && parseChainCheckpoint(ppo.text)) {
-                    return { ...body, contents: [...contents.slice(0, li), { ...c, parts: [...parts.slice(0, pi), { text: tag }] }] };
+                    return { ...body, contents: [...contents.slice(0, li), { ...c, parts: normalizeGoogleUserPartOrder([...parts.slice(0, pi), { text: tag }] as GooglePart[]) }] };
                 }
             }
-            return { ...body, contents: [...contents.slice(0, li), { ...c, parts: [...parts, { text: tag }] }] };
+            return { ...body, contents: [...contents.slice(0, li), { ...c, parts: normalizeGoogleUserPartOrder([...parts, { text: tag }] as GooglePart[]) }] };
         }
     }
     return { ...body, contents: [...contents, { role: "user", parts: [{ text: tag }] }] };

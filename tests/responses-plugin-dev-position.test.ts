@@ -28,9 +28,12 @@
 //   T3 head-neutral: a leading additional_tools item does not break the
 //       head run — the head developer item is still hoisted, front block
 //       injected right after it, stable;
-//   T4 proxy pin (negative): native/proxy mode keeps the hoist semantics
-//       (#1085 anchor path) — notifications are NOT re-emitted as
-//       in-place developer items.
+//   T4 proxy pin (negative): non-Codex native/proxy mode keeps the hoist
+//       semantics (#1085 anchor path) — notifications are NOT re-emitted as
+//       in-place developer items;
+//   T5 codex proxy pin (#3227): native Codex proxy mode takes the plugin-mode
+//       projection path — mid-history developer items ride IN PLACE, front
+//       block byte-stable across notification appends.
 
 import { test } from "node:test";
 import assert from "node:assert";
@@ -93,7 +96,7 @@ function sseText(text: string): string[] {
 
 interface Captured { raw: string; input: Record<string, unknown>[] }
 
-async function driveResponses(steps: Step[], mode: "plugin" | "proxy"): Promise<Captured[]> {
+async function driveResponses(steps: Step[], mode: "plugin" | "proxy" | "codex-proxy"): Promise<Captured[]> {
     const conv = `devpos-${mode}-${Date.now().toString(36)}`;
     const capturedRaw: string[] = [];
 
@@ -155,6 +158,7 @@ async function driveResponses(steps: Step[], mode: "plugin" | "proxy"): Promise<
             } else {
                 headers["x-acp-session"] = conv;
             }
+            if (mode === "codex-proxy") headers["user-agent"] = "codex_cli_rs/0.147.0";
             const resp = await fetch(base, { method: "POST", headers, body: JSON.stringify(buildBody(hist)) });
             if (resp.status !== 200) {
                 const detail = (await resp.text()).slice(0, 300);
@@ -164,8 +168,10 @@ async function driveResponses(steps: Step[], mode: "plugin" | "proxy"): Promise<
         }
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
         if (prevXdg === undefined) delete process.env.XDG_STATE_HOME;
         else process.env.XDG_STATE_HOME = prevXdg;
@@ -209,7 +215,10 @@ function indexOfText(c: Captured, needle: string): number {
 }
 
 function notifItems(c: Captured, needle: string): Record<string, unknown>[] {
-    return c.input.filter((it) => it.role === "developer" && it.type === undefined && it.content === needle);
+    // #4166: codec-native in-place re-emission prepends the kernel ref tag
+    // (`<acp …>mNNNNN</acp>`) to the item content like every other text
+    // message — match by containment, not byte equality.
+    return c.input.filter((it) => it.role === "developer" && (it.type === undefined || it.type === "message") && typeof it.content === "string" && it.content.includes(needle));
 }
 
 test("responses plugin mode: mid-history developer notifications are position-preserved; front block byte-stable (#1638)", async () => {
@@ -315,7 +324,7 @@ test("responses plugin mode: leading additional_tools stays head-neutral — hea
     assert.equal(notifItems(caps[1]!, NOTIF1).length, 1, `${L(1)}: NOTIF1 in-place occurrences != 1`);
 });
 
-test("responses proxy mode: hoist semantics unchanged — notifications are not re-emitted in place (#1638 negative pin)", async () => {
+test("responses proxy mode: mid-history notifications now ride in place too (#4166 unified contract)", async () => {
     const steps: Step[] = [
         { send: [D(SYS), T(1)] },
         { send: [A(1), D(NOTIF1), T(2)] },
@@ -325,13 +334,65 @@ test("responses proxy mode: hoist semantics unchanged — notifications are not 
     const L = (i: number) => `devpos/proxy t${i + 1}`;
     const t2 = caps[1]!;
 
-    // Native/proxy mode keeps the hoist (#1085 anchor path owns stability):
-    // the notification must not appear as an in-place developer item.
-    assert.equal(notifItems(t2, NOTIF1).length, 0, `${L(1)}: proxy mode must keep hoist semantics — NOTIF1 was re-emitted in place`);
-    // Client content still reaches the upstream somewhere (merged front
-    // block or anchor diff note) — never silently dropped.
-    assert.ok(t2.raw.includes(NOTIF1), `${L(1)}: NOTIF1 vanished from the forwarded body`);
-    // Front block exists and carries the head system text.
+    // #4166: position preservation is codec-native now — the mid-history
+    // developer notification rides IN PLACE in proxy mode exactly like
+    // plugin/codex mode (the old #1638 proxy hoist is gone; strict
+    // single-system upstreams keep the merged HEAD only, #377).
+    assert.equal(notifItems(t2, NOTIF1).length, 1, `${L(1)}: NOTIF1 must be re-emitted in place exactly once`);
+    // Front block exists and carries ONLY the head system text — never the
+    // notification (front block stays byte-stable across turns).
     const f = frontDev(t2);
     assert.ok(f.content.includes(SYS), `${L(1)}: front block lost the head system text`);
+    assert.ok(!f.content.includes(NOTIF1), `${L(1)}: notification leaked into the front block`);
+    const f1 = frontDev(caps[0]!);
+    assert.equal(JSON.stringify(f.content), JSON.stringify(f1.content), "front block bytes differ across turns");
+});
+
+test("responses codex proxy mode: mid-history developer items ride in place; front block byte-stable (#3227)", async () => {
+    const steps: Step[] = [
+        { send: [D(SYS), T(1)] },
+        { send: [A(1), D(NOTIF1), T(2)] },
+        { send: [A(2), D(NOTIF2), T(3)] },
+    ];
+    const caps = await driveResponses(steps, "codex-proxy");
+    assert.equal(caps.length, 3, "expected 3 outbound bodies");
+    const L = (i: number) => `devpos/codex t${i + 1}`;
+
+    // Front developer block: hoisted head instructions only, never the
+    // notifications, byte-identical across ALL turns — the pre-fix codex
+    // proxy path merged every appended notification into this first item
+    // and invalidated the upstream prefix cache on each turn.
+    const fronts = caps.map((c) => frontDev(c));
+    for (const f of fronts) {
+        assert.ok(f.content.includes(SYS), `${L(0)}: front block lost the head system text`);
+        assert.ok(!f.content.includes(NOTIF1), `front block must not absorb ${JSON.stringify(NOTIF1)}`);
+        assert.ok(!f.content.includes(NOTIF2), `front block must not absorb ${JSON.stringify(NOTIF2)}`);
+    }
+    assert.equal(JSON.stringify(fronts[1]!.content), JSON.stringify(fronts[0]!.content), "t2 front block bytes differ from t1 (prefix cache would miss)");
+    assert.equal(JSON.stringify(fronts[2]!.content), JSON.stringify(fronts[0]!.content), "t3 front block bytes differ from t1 (prefix cache would miss)");
+
+    // Notifications ride in place: exactly once, easy-form intact
+    // ({role:"developer", content} — restored type, no sentinel), positioned
+    // between the prior assistant answer and the next user question.
+    const n1 = notifItems(caps[1]!, NOTIF1);
+    assert.equal(n1.length, 1, `${L(1)}: NOTIF1 in-place occurrences ${n1.length} != 1`);
+    const a1 = indexOfText(caps[1]!, "a1 devpos answer 1");
+    const q2 = indexOfText(caps[1]!, "q2 devpos question 2");
+    assert.ok(a1 >= 0 && q2 >= 0, `${L(1)}: anchor items missing (a1@${a1}, q2@${q2})`);
+    const n1Idx = caps[1]!.input.indexOf(n1[0]!);
+    assert.ok(n1Idx > a1 && n1Idx < q2, `${L(1)}: NOTIF1 at index ${n1Idx} not between a1@${a1} and q2@${q2}`);
+    assert.equal(notifItems(caps[1]!, NOTIF2).length, 0, `${L(1)}: NOTIF2 must not exist yet`);
+    assert.equal(notifItems(caps[2]!, NOTIF1).length, 1, `${L(2)}: NOTIF1 dropped from history`);
+    assert.equal(notifItems(caps[2]!, NOTIF2).length, 1, `${L(2)}: NOTIF2 in-place occurrences != 1`);
+
+    // Append-only bodies: after stripping volatile tail items, the previous
+    // outbound input is an exact byte-prefix of the next.
+    for (let i = 1; i < caps.length; i++) {
+        const prev = stripVolatileTail(caps[i - 1]!.input);
+        const cur = stripVolatileTail(caps[i]!.input);
+        assert.equal(JSON.stringify(cur.slice(0, prev.length)), JSON.stringify(prev), `${L(i)}: previous input is not a byte-prefix of the next (mid-history mutation)`);
+    }
+
+    // The in-window sentinel must never leak to the wire.
+    for (const c of caps) assert.ok(!c.raw.includes("__bili_inplace_sysdev"), "sentinel type leaked into forwarded body");
 });

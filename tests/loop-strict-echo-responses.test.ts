@@ -16,7 +16,7 @@ import { rmrf } from "./tmp-rm.ts";
 // Responses-wire request whose assistant run lost its reasoning item across a compress
 // fold was rejected by strict-echo gateways (reasoning_content_missing). Full arc driven
 // here: main-path 400 learns the flag → the next main-path forward and the loop
-// re-request (whose compress ack pair forms its own orphan run) both carry a blank
+// re-request (whose proxy-tool ack pair forms its own orphan run) both carry a blank
 // reasoning item at each orphan run start.
 
 interface Captured {
@@ -183,11 +183,15 @@ test("#1479: responses-wire main path and loop re-request carry the blank strict
         }
         res.writeHead(200, { "content-type": "text/event-stream" });
         if (n === 2) {
+            // acp_status vehicle: the point is the re-request carrying the
+            // blanked echo, not compression. A failing compress ends the turn
+            // before any re-request (#4186) and would silently un-test the
+            // loop-path repair this file exists for.
             res.write(sse("response.created", { type: "response.created", response: { id: "resp-r1", status: "in_progress", output: [] } }));
-            res.write(sse("response.output_item.added", { type: "response.output_item.added", output_index: 0, item: { type: "function_call", id: "fc-loop", call_id: "call-loop-1", name: "compress", arguments: "" } }));
-            res.write(sse("response.function_call_arguments.delta", { type: "response.function_call_arguments.delta", item_id: "fc-loop", delta: "{\"content\":[]}" }));
-            res.write(sse("response.function_call_arguments.done", { type: "response.function_call_arguments.done", item_id: "fc-loop", arguments: "{\"content\":[]}" }));
-            res.write(sse("response.output_item.done", { type: "response.output_item.done", output_index: 0, item: { type: "function_call", id: "fc-loop", call_id: "call-loop-1", name: "compress", arguments: "{\"content\":[]}" } }));
+            res.write(sse("response.output_item.added", { type: "response.output_item.added", output_index: 0, item: { type: "function_call", id: "fc-loop", call_id: "call-loop-1", name: "acp_status", arguments: "" } }));
+            res.write(sse("response.function_call_arguments.delta", { type: "response.function_call_arguments.delta", item_id: "fc-loop", delta: "{}" }));
+            res.write(sse("response.function_call_arguments.done", { type: "response.function_call_arguments.done", item_id: "fc-loop", arguments: "{}" }));
+            res.write(sse("response.output_item.done", { type: "response.output_item.done", output_index: 0, item: { type: "function_call", id: "fc-loop", call_id: "call-loop-1", name: "acp_status", arguments: "{}" } }));
             res.write(sse("response.completed", { type: "response.completed", response: { id: "resp-r1", status: "completed", output: [], usage: { input_tokens: 100, output_tokens: 5 } } }));
         } else {
             res.write(sse("response.created", { type: "response.created", response: { id: "resp-r2", status: "in_progress", output: [] } }));
@@ -219,13 +223,13 @@ test("#1479: responses-wire main path and loop re-request carry the blank strict
 
         const reRequest = JSON.parse(seenBodies[2]!) as { model: string; input: Item[] };
         assert.equal(reRequest.model, "gpt-test");
-        const loopFcIdx = reRequest.input.findIndex((it) => it.type === "function_call" && it.name === "compress");
-        assert.ok(loopFcIdx > 0, "loop re-request carries the compress ack pair");
+        const loopFcIdx = reRequest.input.findIndex((it) => it.type === "function_call" && it.name === "acp_status");
+        assert.ok(loopFcIdx > 0, "loop re-request carries the acp_status ack pair");
         let runStart = loopFcIdx;
         while (runStart > 0 && isRunItem(reRequest.input[runStart - 1])) runStart--;
         assert.ok(
             reRequest.input.slice(runStart, loopFcIdx + 1).some(isBlankReasoning),
-            "loop re-request injected the blank echo into the run carrying the compress pair",
+            "loop re-request injected the blank echo into the run carrying the proxy-tool pair",
         );
         assert.equal(orphanRunCount(reRequest.input), 0, "loop re-request carries no orphan runs");
         assert.ok(

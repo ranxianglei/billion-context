@@ -120,7 +120,7 @@ async function driveResponsesPreflight(proxyPort: number, upstreamPort: number, 
 
 function closeAll(servers: http.Server[]): Promise<void> {
     return new Promise<void>((resolve, reject) => {
-        void Promise.allSettled(servers.map((s) => { s.close(); return once(s, "close"); })).then(() => resolve(), reject);
+        void Promise.allSettled(servers.map((s) => { s.close(); s.closeIdleConnections?.(); return once(s, "close"); })).then(() => resolve(), reject);
     });
 }
 

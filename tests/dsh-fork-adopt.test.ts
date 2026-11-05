@@ -24,7 +24,7 @@ for (const key of ["XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_CON
 const hash = (v: unknown) => createHash("sha256").update(JSON.stringify(v)).digest("hex");
 
 // ---------------------------------------------------------------------------
-// Hash parity with the server (#2399): the proxy's publicForkInputMatches
+// Hash parity with the server (#2399): the proxy's publicForkInputCheck
 // rejects a child replay whose prefix hashes drift from the receipt, so the
 // agent-side recipe must stay byte-identical to src/plugin.ts.
 // ---------------------------------------------------------------------------
@@ -226,6 +226,53 @@ test("tryForkAdoption degrades on snapshot failures without posting", async () =
     assert.equal(calls.some((c) => c.url.includes("/__bili/plugin/fork")), false);
 });
 
+test("tryForkAdoption surfaces bounded snapshot diagnostics instead of a bare status (#2469)", async () => {
+    const calls: Recorded[] = [];
+    const unavailable = routerFetch({ snapshot: () => new Response(JSON.stringify({ ok: false, status: "unavailable", code: "SNAPSHOT_UNAVAILABLE", error: "Error: multimodal or opaque content cannot be compared by text" }), { status: 409, headers: { "content-type": "application/json" } }) }, calls);
+    const result = await tryForkAdoption({ base: "http://proxy", parentConversationId: "parent", childConversationId: "child", body: parentBody, fetchImpl: unavailable });
+    assert.deepEqual(result, { outcome: "degraded", reason: "snapshot http 409 SNAPSHOT_UNAVAILABLE (Error: multimodal or opaque content cannot be compared by text)" });
+    assert.equal(calls.length, 1, "one snapshot attempt, no fork POST");
+    assert.equal(calls.every((c) => !c.url.includes("/__bili/plugin/fork")), true);
+});
+
+test("tryForkAdoption sanitizes control characters out of snapshot diagnostics (#2469)", async () => {
+    const dirty = { ok: false, code: "SNAP\x00SHOT\r\nCODE", error: "a\x01b\tc long ".repeat(10) };
+    const calls: Recorded[] = [];
+    const fetchImpl = routerFetch({ snapshot: () => new Response(JSON.stringify(dirty), { status: 409 }) }, calls);
+    const result = await tryForkAdoption({ base: "http://proxy", parentConversationId: "parent", childConversationId: "child", body: parentBody, fetchImpl });
+    assert.equal(result.outcome, "degraded");
+    const reason = (result as { reason: string }).reason;
+    assert.ok(!/[\u0000-\u001f\u007f]/.test(reason), "no control characters survive into the log line");
+    // "SNAP\x00SHOT\r\nCODE" -> "SNAP SHOT CODE"; each "a\x01b\tc long " iteration
+    // becomes "a b c long " (11 chars x10 = 109, under the 120 cap: no ellipsis).
+    assert.match(reason, /^snapshot http 409 SNAP SHOT CODE \(a b c long( a b c long){9}\)$/);
+});
+
+test("tryForkAdoption degrades safely on non-JSON or oversized snapshot error bodies (#2469)", async () => {
+    const nonJson = routerFetch({ snapshot: () => new Response("<html>gateway exploded</html>", { status: 409 }) }, []);
+    assert.deepEqual(await tryForkAdoption({ base: "http://proxy", parentConversationId: "parent", childConversationId: "child", body: parentBody, fetchImpl: nonJson }), { outcome: "degraded", reason: "snapshot http 409" });
+    // A body past the 1KB read cap is truncated mid-JSON: parsing must fail
+    // closed to the status-only reason, never hang or buffer unboundedly.
+    const oversized = routerFetch({ snapshot: () => new Response(JSON.stringify({ ok: false, code: "BIG", error: "x".repeat(5000) }), { status: 409 }) }, []);
+    assert.deepEqual(await tryForkAdoption({ base: "http://proxy", parentConversationId: "parent", childConversationId: "child", body: parentBody, fetchImpl: oversized }), { outcome: "degraded", reason: "snapshot http 409" });
+});
+
+test("tryForkAdoption ends google children before any network request; responses go through the protocol (#2469)", async () => {
+    // Responses is projected client-side now (#2469 stage 2): the child gets a
+    // real snapshot GET and degrades on the identity match like any other wire.
+    const responsesCalls: Recorded[] = [];
+    const responsesFetch = routerFetch({ snapshot: () => jsonRes(snapshotFixture(seedCore)), fork: () => jsonRes({ ok: true }, 201) }, responsesCalls);
+    const responses = await tryForkAdoption({ base: "http://proxy", parentConversationId: "parent", childConversationId: "child", body: { model: "gpt", input: [{ type: "message", role: "user", content: "hi" }] }, fetchImpl: responsesFetch });
+    assert.deepEqual(responses, { outcome: "degraded", reason: "no prefix match" });
+    assert.equal(responsesCalls.filter((c) => c.url.includes("snapshot")).length, 1, "the responses child reaches the snapshot");
+    assert.equal(responsesCalls.filter((c) => c.url.endsWith("/__bili/plugin/fork")).length, 0, "...but posts no fork receipt for a mismatch");
+    const googleCalls: Recorded[] = [];
+    const googleFetch = routerFetch({ snapshot: () => jsonRes(snapshotFixture(seedCore)) }, googleCalls);
+    const google = await tryForkAdoption({ base: "http://proxy", parentConversationId: "parent", childConversationId: "child", body: { contents: [{ role: "user", parts: [{ text: "hi" }] }] }, fetchImpl: googleFetch });
+    assert.deepEqual(google, { outcome: "degraded", reason: "wire unsupported (google)" });
+    assert.equal(googleCalls.length, 0);
+});
+
 test("tryForkAdoption surfaces fork rejections and replays", async () => {
     const conflict = routerFetch({ snapshot: () => jsonRes(snapshotFixture(seedCore)), fork: () => jsonRes({ ok: false, code: "CHILD_CONFLICT" }, 409) }, []);
     const rejected = await tryForkAdoption({ base: "http://proxy", parentConversationId: "parent", childConversationId: "child", body: parentBody, fetchImpl: conflict });
@@ -274,10 +321,21 @@ test("manifestForkCapable caches per base and resets for tests", async () => {
     assert.equal(manifestCalls, 2);
 });
 
+test("manifestForkCapable accepts fork protocol v2 manifests (#2671 Phase 2b)", async () => {
+    resetForkCapabilityCacheForTest();
+    // A v2 proxy (current server) must stay fork-capable from the adoption
+    // client's point of view; unknown future majors stay gated off.
+    const v2 = (async () => jsonRes({ capabilities: { fork: { protocolVersion: 2, acceptsProtocolVersions: [1, 2] } } })) as unknown as typeof fetch;
+    assert.equal(await manifestForkCapable("http://v2-proxy", v2), true);
+    const v3 = (async () => jsonRes({ capabilities: { fork: { protocolVersion: 3 } } })) as unknown as typeof fetch;
+    assert.equal(await manifestForkCapable("http://v3-proxy", v3), false);
+    resetForkCapabilityCacheForTest();
+});
+
 // ---------------------------------------------------------------------------
 // Full chain against a real proxy: an OpenAI-wire dsh parent, adoption via
 // tryForkAdoption, then the child's replayed request must be ACCEPTED (the
-// server's publicForkInputMatches binds the receipt) and a divergent second
+// server's publicForkInputCheck binds the receipt) and a divergent second
 // fork for the same child id must be refused.
 // ---------------------------------------------------------------------------
 
@@ -307,7 +365,7 @@ async function fullChainHarness() {
     await once(proxy, "listening");
     const paddr = proxy.address();
     assert(paddr && typeof paddr === "object");
-    return { store, upstreamUrl, origin: `http://127.0.0.1:${paddr.port}`, close: async () => { store.cancelAll(); proxy.close(); upstream.close(); await Promise.all([once(proxy, "close"), once(upstream, "close")]); } };
+    return { store, upstreamUrl, origin: `http://127.0.0.1:${paddr.port}`, close: async () => { store.cancelAll(); proxy.close(); proxy.closeIdleConnections?.(); upstream.close(); upstream.closeIdleConnections?.(); await Promise.all([once(proxy, "close"), once(upstream, "close")]); } };
 }
 
 test("full chain: dsh fork child adopts the parent state and its replay is accepted (#2399)", async () => {

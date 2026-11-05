@@ -5,11 +5,14 @@
 // never saw the pixels). acp-kernel 0.0.85 (PR #365) fixed the dominant
 // class: user-message content parts are ALL carried through verbatim via the
 // rawOpenaiContentParts sidecar, so user messages no longer drop anything.
-// The remaining drop class is NON-user roles: the codec still reduces e.g.
-// assistant content to text-only (stringContent), so parts riding those
-// messages (assistant-carried images/attachments some clients emit) still
-// vanish. This detector scans the RAW body for that surviving drop class so
-// the proxy can log a one-time warn instead of staying silent.
+// The remaining drop class is assistant/tool roles plus the LEADING
+// system/developer run: the codec still reduces those to text-only
+// (stringContent), so parts riding them (assistant-carried
+// images/attachments some clients emit) still vanish. Mid-conversation
+// system/developer messages ride verbatim via the rawOpenaiMessage sidecar
+// since #4166 and no longer belong to the drop class. This detector scans
+// the RAW body for that surviving drop class so the proxy can log a one-time
+// warn instead of staying silent.
 
 function isObj(v: unknown): v is Record<string, unknown> {
     return typeof v === "object" && v !== null;
@@ -21,8 +24,9 @@ interface DroppedOpenaiPartsReport {
     firstIndex: number;
 }
 
-// Kernel 0.0.85+: non-user roles still go through text-only reduction
-// (stringContent), so only text survives there.
+// Kernel 0.0.85+/0.0.150: assistant/tool roles and the leading system/developer
+// run still go through text-only reduction (stringContent), so only text
+// survives there (mid system/developer ride the rawOpenaiMessage sidecar, #4166).
 const DEFAULT_PRESERVED = new Set(["text"]);
 
 export function droppedOpenaiParts(body: unknown): DroppedOpenaiPartsReport | null {
@@ -32,9 +36,14 @@ export function droppedOpenaiParts(body: unknown): DroppedOpenaiPartsReport | nu
     let count = 0;
     const types = new Set<string>();
     let firstIndex = -1;
+    let pastHead = false;
     for (let i = 0; i < messages.length; i++) {
         const m = messages[i];
-        if (!isObj(m) || !Array.isArray(m.content)) continue;
+        if (!isObj(m)) continue;
+        const isSysDev = m.role === "system" || m.role === "developer";
+        if (isSysDev && pastHead) continue;
+        if (!isSysDev) pastHead = true;
+        if (!Array.isArray(m.content)) continue;
         if (m.role === "user") continue;
         for (const p of m.content) {
             if (!isObj(p) || DEFAULT_PRESERVED.has(typeof p.type === "string" ? p.type : "<no-type>")) continue;

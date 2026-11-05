@@ -108,8 +108,10 @@ async function startRig(inputTokens = 500, log = false): Promise<Rig> {
 
 function closeRig(rig: Rig): Promise<void> {
     rig.proxy.close();
+    rig.proxy.closeIdleConnections?.();
     return once(rig.proxy, "close").then(() => {
         rig.upstream.close();
+        rig.upstream.closeIdleConnections?.();
         return once(rig.upstream, "close");
     }) as Promise<void>;
 }

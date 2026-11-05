@@ -207,19 +207,20 @@ test("pi plugin wiring: session_info_changed reports rename and clear end-to-end
 
         // Rename: event name lands on the session via the endpoint.
         await fire({ type: "session_info_changed", name: "My named session" });
-        await onceTick();
+        await waitUntil(() => session.meta.hostTitle === "My named session" && namePosts === 1);
         assert.equal(session.meta.hostTitle, "My named session", "rename reported through the real endpoint");
         assert.equal(namePosts, 1, "rename POSTed exactly once");
 
         // Dedupe: an identical event must not re-POST (the map suppresses).
+        // Immediate asserts are safe: suppression is decided synchronously at
+        // dispatch, and step 1's settled success left the map armed.
         await fire({ type: "session_info_changed", name: "My named session" });
-        await onceTick();
         assert.equal(session.meta.hostTitle, "My named session");
         assert.equal(namePosts, 1, "identical event suppressed — no re-POST");
 
         // Clear: name: undefined → empty string → hostTitle removed.
         await fire({ type: "session_info_changed", name: undefined });
-        await onceTick();
+        await waitUntil(() => session.meta.hostTitle === undefined && namePosts === 2);
         assert.equal(session.meta.hostTitle, undefined, "clear reported (undefined name → empty string)");
         assert.equal(namePosts, 2, "clear POSTed once");
     } finally {
@@ -229,8 +230,16 @@ test("pi plugin wiring: session_info_changed reports rename and clear end-to-end
     }
 });
 
-function onceTick(): Promise<void> {
-    return new Promise((resolve) => setTimeout(resolve, 50));
+// reportSessionName is fire-and-forget by design (a report must never block
+// the host event loop), so poll its observable effect instead of sleeping a
+// fixed tick — a fixed sleep flakes whenever one loopback round-trip exceeds
+// it (#2953).
+async function waitUntil(condition: () => boolean, timeoutMs = 2000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (!condition()) {
+        if (Date.now() > deadline) throw new Error("timed out waiting for the session-name POST to settle");
+        await new Promise<void>((resolve) => setTimeout(resolve, 10));
+    }
 }
 
 type PiHandler = (event: unknown, ctx: unknown) => unknown;

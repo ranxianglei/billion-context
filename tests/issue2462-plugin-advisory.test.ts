@@ -3,8 +3,9 @@
 // these plugins are not compressors; they burn prefix-cache hits host-side and
 // bili already isolates them into a sub-session.
 // Detection keys off ENABLEMENT, not installation: the advisory fires only when
-// the dsh loader id (`auto-review`) appears as a top-level entry in cordis.patch.yml —
-// mere presence in package.json deps must NOT trigger it (installed-but-off / bundled).
+// the dsh loader id (`auto-review`) appears as a top-level, NOT-disabled entry in
+// cordis.patch.yml (#3838) — mere presence in package.json deps must NOT trigger
+// it (installed-but-off / bundled), and neither must an explicitly disabled entry.
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -34,10 +35,13 @@ function assertTestOwned(file: string, root: string): void {
         `refusing to write outside test-owned root ${root}: ${file}`);
 }
 function writeProfilePatch(root: string, profile: string, ids: string[]): void {
+    writeProfilePatchLines(root, profile, ids.map((id) => `- id: ${id}`));
+}
+function writeProfilePatchLines(root: string, profile: string, lines: string[]): void {
     const file = path.join(root, "dsh", "profiles", profile, "cordis.patch.yml");
     assertTestOwned(file, root);
     fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.writeFileSync(file, [ ...ids.map((id) => `- id: ${id}`), "" ].join("\n"));
+    fs.writeFileSync(file, [...lines, ""].join("\n"));
 }
 function writeProfilePkg(root: string, pkg: Record<string, unknown>): void {
     const file = path.join(root, "dsh", "profiles", "main", "package.json");
@@ -107,6 +111,35 @@ test("#2462: multiple profiles enabling the same plugin report once", () => {
     _clearCostAdvisoryCache();
     const root = tmp("bili-2462-multi-");
     writeProfilePatch(root, "a", [PATCH_ID]);
+    writeProfilePatch(root, "b", [PATCH_ID]);
+    assert.equal(detectCostAdvisories(hermeticEnv(root)).length, 1);
+});
+
+test("#3838: entry present but disabled:true yields NO advisory (explicitly off plugins must not warn)", () => {
+    _clearCostAdvisoryCache();
+    const root = tmp("bili-3838-disabled-");
+    writeProfilePatchLines(root, "main", ["- id: llm-pi-ai", `- id: ${PATCH_ID}`, "  disabled: true"]);
+    assert.deepEqual(detectCostAdvisories(hermeticEnv(root)), []);
+});
+
+test("#3838: disabled:false is NOT disabling — explicitly enabled still reports", () => {
+    _clearCostAdvisoryCache();
+    const root = tmp("bili-3838-enabled-flag-");
+    writeProfilePatchLines(root, "main", [`- id: ${PATCH_ID}`, "  disabled: false"]);
+    assert.equal(detectCostAdvisories(hermeticEnv(root)).length, 1);
+});
+
+test("#3838: disabled:true on an UNRELATED entry does not silence the advisory", () => {
+    _clearCostAdvisoryCache();
+    const root = tmp("bili-3838-other-disabled-");
+    writeProfilePatchLines(root, "main", ["- id: other-plugin", "  disabled: true", `- id: ${PATCH_ID}`]);
+    assert.equal(detectCostAdvisories(hermeticEnv(root)).length, 1);
+});
+
+test("#3838: disabled in one profile but enabled in another still reports once", () => {
+    _clearCostAdvisoryCache();
+    const root = tmp("bili-3838-cross-profile-");
+    writeProfilePatchLines(root, "a", [`- id: ${PATCH_ID}`, "  disabled: true"]);
     writeProfilePatch(root, "b", [PATCH_ID]);
     assert.equal(detectCostAdvisories(hermeticEnv(root)).length, 1);
 });

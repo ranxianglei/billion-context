@@ -38,6 +38,7 @@ import { lanePreferredPort } from "./instance.js";
 import { claudeNativeInstalled, isBiliClaudeBaseUrl, repinClaudeManagedBaseUrl } from "./plugin-install.js";
 import { claudeRoutingWarningFile } from "./paths.js";
 import { nativeBootstrapGate, proxyEnvOrigin } from "./agent/native-bootstrap.js";
+import { vertexEnabled } from "./vertex.js";
 
 /** dist/claude-native-bootstrap.js → sibling dist/index.js (the package
  *  bin). ensureProxyRunning's default (process.argv[1]) would re-invoke THIS
@@ -87,13 +88,17 @@ export function planClaudeNativeBootstrap(env: NodeJS.ProcessEnv): { action: "ex
 const BYPASS_ENTRYPOINTS = new Set(["claude-desktop"]);
 
 /** Pure detection (#2290): does this session environment indicate the managed
- *  ANTHROPIC_BASE_URL will not be honored? Two independent signals, either
+ *  ANTHROPIC_BASE_URL will not be honored? Three signals, any of which
  *  suffices:
  *   - CLAUDE_CODE_ENTRYPOINT names a known overriding host (Claude Desktop);
- *   - the session env carries an ANTHROPIC_BASE_URL that is not a bili URL.
- *  In a healthy terminal session neither fires: claude does not inject its
- *  settings.env into hook children, so the var is absent unless something
- *  external set it. Exported for tests. */
+ *   - the session env carries an ANTHROPIC_BASE_URL that is not a bili URL;
+ *   - the session is a Vertex session (CLAUDE_CODE_USE_VERTEX on, which makes
+ *     ANTHROPIC_BASE_URL inert) whose ANTHROPIC_VERTEX_BASE_URL is missing or
+ *     is not a bili URL — without this third check a Vertex session passes the
+ *     two above and bypasses the managed block unreported.
+ *  In a healthy terminal session none fire: claude does not inject its
+ *  settings.env into hook children, so the vars are absent unless something
+ *  external set them. Exported for tests. */
 export function claudeNativeRoutingCheck(env: NodeJS.ProcessEnv): { bypassed: boolean; reasons: string[] } {
     const reasons: string[] = [];
     const entrypoint = env.CLAUDE_CODE_ENTRYPOINT?.trim().toLowerCase();
@@ -103,6 +108,18 @@ export function claudeNativeRoutingCheck(env: NodeJS.ProcessEnv): { bypassed: bo
     const url = env.ANTHROPIC_BASE_URL?.trim();
     if (url !== undefined && url.length > 0 && !isBiliClaudeBaseUrl(url)) {
         reasons.push(`session environment carries ANTHROPIC_BASE_URL=${url}, which is not the managed bili URL`);
+    }
+    // Vertex routes on ANTHROPIC_VERTEX_BASE_URL and ignores ANTHROPIC_BASE_URL
+    // entirely, so the checks above can pass while nothing reaches bili: either
+    // the variable is absent (claude then derives the aiplatform host itself)
+    // or it points somewhere that is not a bili URL.
+    if (vertexEnabled(env)) {
+        const vertexUrl = env.ANTHROPIC_VERTEX_BASE_URL?.trim();
+        if (vertexUrl === undefined || vertexUrl.length === 0) {
+            reasons.push("CLAUDE_CODE_USE_VERTEX is on and ANTHROPIC_VERTEX_BASE_URL is unset — claude derives the Vertex host itself, so the managed ANTHROPIC_BASE_URL cannot route this session through bili");
+        } else if (!isBiliClaudeBaseUrl(vertexUrl)) {
+            reasons.push(`session environment carries ANTHROPIC_VERTEX_BASE_URL=${vertexUrl}, which is not the managed bili URL`);
+        }
     }
     return { bypassed: reasons.length > 0, reasons };
 }
@@ -154,9 +171,11 @@ type ExecFn = (cmd: string, args: string[]) => string | null;
  *  the closest analog of the #2439 console flash: a host that owns no console
  *  makes Windows allocate a NEW console window for any unhidden console child).
  *  windowsHide is a documented no-op off Windows, so the ps path is untouched.
+ *  #2834: explicit stdio keeps a failed probe's stderr off the host terminal
+ *  (default stdio forwards it); the catch degrades to null either way.
  *  Exported pure so tests can pin it without spawning anything. */
-export function procTableExecOptions(): { encoding: BufferEncoding; timeout: number; windowsHide: boolean } {
-    return { encoding: "utf8", timeout: 5000, windowsHide: true };
+export function procTableExecOptions(): { encoding: BufferEncoding; timeout: number; windowsHide: boolean; stdio: ["ignore", "pipe", "ignore"] } {
+    return { encoding: "utf8", timeout: 5000, windowsHide: true, stdio: ["ignore", "pipe", "ignore"] };
 }
 
 function defaultExec(cmd: string, args: string[]): string | null {

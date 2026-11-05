@@ -44,6 +44,10 @@ export interface CompressParseDiagnostics {
   kind: CompressParseKind;
   /** True when the winning parse came from single→double quote repair. */
   quoteSalvage?: boolean;
+  /** True when a flat single-range call carried its summary text in the
+   * `content` STRING alongside top-level refs ({content, startId, endId})
+   * — the two schema-advertised shapes merged — and was recovered. */
+  flatSummarySalvage?: boolean;
   /** True when a non-array `content` value (single entry object or nested
    *  `ranges` array) was recovered into the canonical array form (#470). */
   contentSalvage?: boolean;
@@ -211,7 +215,28 @@ function parseObjectValue(
         diag.kind = "ok";
         return finish(ranges, diag);
       }
-      diag.kind = "content-not-array";
+      if (entries.length === 0 || entries.every(isHeaderlessLineEntry)) {
+        // No refs headers inside the string: the text may be the SUMMARY of
+        // a single flat range whose bounds sit at the TOP level — the two
+        // schema-advertised shapes ("content = ONE plain string" + the
+        // {startId, endId} single-range form) merged into one call.
+        // Observed live as bursts of identical `content-not-array`
+        // rejections while the model retried the same valid-intent call.
+        const flat = flatSingleRangeFromContent(value, content, callId);
+        if (flat !== undefined) {
+          diag.flatSummarySalvage = true;
+          diag.kind = "ok";
+          return finish([flat], diag);
+        }
+      }
+      // Refs-bearing entries that failed validation are a real line-form
+      // attempt (report no-valid-ranges + reasons); all-headerless text was
+      // never line-form (keep the generic content-not-array classification).
+      diag.invalidItems = invalid;
+      if (reasons.length > 0) diag.invalidReasons = reasons;
+      diag.kind = entries.some((e) => !isHeaderlessLineEntry(e))
+        ? "no-valid-ranges"
+        : "content-not-array";
       return finish([], diag);
     }
     entries = parsed.entries;
@@ -256,6 +281,62 @@ function parseObjectValue(
       ? "ok"
       : "no-valid-ranges";
   return finish(ranges, diag);
+}
+
+// A split line entry whose first line carries NO refs at all — pure prose.
+// Only headerless content is eligible for the flat single-range recovery
+// below (text with refs headers must keep its line-form reading, whatever
+// its validation outcome).
+function isHeaderlessLineEntry(e: unknown): boolean {
+  if (typeof e !== "string") return false;
+  const nl = e.indexOf("\n");
+  const head = (nl === -1 ? e : e.slice(0, nl)).trim();
+  return !REF_PAIR_IN_LINE.test(head) && !SINGLE_REF_IN_LINE.test(head);
+}
+
+// Flat single-range recovery: summary text in the `content` STRING with
+// bounds at the top level ({content, startId, endId, topic?}). Applies only
+// when the content string carries NO refs headers of its own — a line-form
+// string with headers was already parsed (or reported) above. A JSON-encoded
+// {summary, topic} object inside the string (gateway double-encode) is
+// unwrapped first. Returns undefined when the shape does not fit.
+function flatSingleRangeFromContent(
+  value: Record<string, unknown>,
+  content: string,
+  callId: string | undefined,
+): CompressRangeSpec | undefined {
+  const start =
+    stringOr(value["startRef"]) ??
+    stringOr(value["startId"]) ??
+    stringOr(value["messageId"]);
+  const end =
+    stringOr(value["endRef"]) ??
+    stringOr(value["endId"]) ??
+    stringOr(value["messageId"]);
+  if (start === undefined || end === undefined) return undefined;
+  let summary = stringOr(value["summary"]);
+  let topic = stringOr(value["topic"]);
+  if (summary === undefined) {
+    const inner = tryParseLenient(stripFence(content.trim()));
+    if (
+      inner !== null &&
+      typeof inner === "object" &&
+      !Array.isArray(inner)
+    ) {
+      const o = inner as Record<string, unknown>;
+      summary = stringOr(o["summary"]);
+      if (topic === undefined) topic = stringOr(o["topic"]);
+    }
+    if (summary === undefined) {
+      const text = content.trim();
+      if (text.length > 0) summary = text;
+    }
+  }
+  if (summary === undefined) return undefined;
+  const entry: Record<string, unknown> = { startRef: start, endRef: end, summary };
+  if (topic !== undefined) entry["topic"] = topic;
+  const outcome = validateEntry(entry, callId);
+  return "range" in outcome ? outcome.range : undefined;
 }
 
 function parseContentArray(
@@ -375,8 +456,16 @@ type EntryOutcome = { range: CompressRangeSpec } | { reason: string };
 // anchored (^): summaries cite mNNNNN/bN refs routinely, so an unanchored
 // scan would let a citation inside a headerless entry supply fake bounds.
 const REF_PAIR_IN_LINE =
-  /^([mb]\d{1,7})\s*(?:[-\u2013\u2014\u2026~]|\.\.\.|to)\s*([mb]\d{1,7})\b/i;
+  /^([mb]\d{1,7})\s*(?:[-\u2013\u2014\u2026~\u2212\uFF0D]|\.{2,3}|to)\s*([mb]\d{1,7})\b/i;
+// #5555 audit: ".." joins the accepted separators alongside "..." — pre-fix only the
+// three-dot form parsed while an error message advertised two dots (and a
+// two-dot header was silently swallowed by splitLineEntries instead).
 const SINGLE_REF_IN_LINE = /^([mb]\d{1,7})\b/i;
+// An unrecognized divider between two refs (punctuation run + a ref right
+// after) — the pair regex missed a separator variant. Folding as a single
+// ref would silently compress ONE message of a many-message range.
+const UNRECOGNIZED_REF_SEP_RE =
+  /^\s*[^\p{L}\p{N}\s]{1,3}\s*[mb]\d{1,7}\b/iu;
 
 function normalizeLineRef(raw: string): string {
   const lower = raw.toLowerCase();
@@ -403,12 +492,25 @@ function parseLineEntry(
     const single = SINGLE_REF_IN_LINE.exec(head);
     if (single === null)
       return { reason: "line entry: no mNNNNN/bN refs in header" };
+    // A second ref behind an unrecognized separator means this was meant to
+    // be a PAIR — accept it as a single ref and the fold would silently
+    // cover ONE message of a many-message range. Reject with a precise
+    // reason so the caller restates the range with a known separator.
+    const rest = head.slice(single.index + single[0].length);
+    if (UNRECOGNIZED_REF_SEP_RE.test(rest))
+      return {
+        reason: "line entry: refs separator not recognized — refusing to narrow a ref pair to its first ref (use -, –, —, …, ~, .., or to)",
+      };
     startRef = normalizeLineRef(single[1]!);
     endRef = startRef;
     afterRefs = single.index + single[0].length;
   }
   if (summary.length === 0)
-    return { reason: "line entry: missing summary after the refs header line" };
+    // #4521: name the two most common shapes behind this parse error — a
+    // stray note line about an already-folded range, and a block rewrite
+    // written as refs — so the model fixes the entry instead of resending it
+    // verbatim (each resend was a full failed round-trip).
+    return { reason: "line entry: missing summary after the refs header line (every entry needs refs THEN its summary text on the same or the next line; a note about an already-folded range does not belong in the batch — drop it; to rewrite an existing block use a bN..bM block-id header entry)" };
   const explicitTopic = head.slice(afterRefs).trim();
   const range: CompressRangeSpec = {
     startRef,
@@ -439,7 +541,7 @@ export function deriveTopicFromSummary(summary: string): string | undefined {
 }
 
 const LINE_ENTRY_REFS_RE =
-  /[mb]\d{1,7}\s*(?:[-\u2013\u2014\u2026~]|\.\.\.|to)\s*[mb]\d{1,7}\b/iy;
+  /[mb]\d{1,7}\s*(?:[-\u2013\u2014\u2026~\u2212\uFF0D]|\.{2,3}|to)\s*[mb]\d{1,7}\b/iy;
 const WHITESPACE_RE = /\s/;
 
 function skipWhitespace(s: string, i: number): number {

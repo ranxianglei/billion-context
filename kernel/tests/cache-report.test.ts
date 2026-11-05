@@ -4,6 +4,7 @@ import {
   buildCacheReport,
   computeFoldEconomics,
   decomposeSample,
+  FOLD_CLAIM_COLD_ROUNDS,
   formatCacheReport,
   type CacheSample,
   type FoldEvent,
@@ -540,4 +541,72 @@ test("formatCacheReport summary lists every fold when few, with TTL spike idle g
   const text = formatCacheReport(buildCacheReport(samples, folds), "s4");
   assert.match(text, /#1 .*S=20\.0K.* → (NOT PAID BACK|PAID BACK|\?)/);
   assert.ok(!text.includes("more folds omitted"));
+});
+
+test("#2929 fold cold-tail claim: the client-echo re-bill is fold-owned until a warm line retires", () => {
+  // Degenerate head fold (X=3K): proxy re-request (s2) is claimed today, the
+  // client echo (s3) and the cold recovery tail (s4) must ALSO carry foldSeq —
+  // before #2929 s3/s4 fell into the unattributed ttlRepay residual and tripped
+  // the cache-seam detector. A warm line (s5) retires the window; a later cold
+  // blip (s6, real provider eviction) is NOT swallowed by the old fold.
+  const samples = [
+    sample(0, 100_000, 99_000),   // warm baseline
+    sample(1, 51_000, 5_000),     // proxy re-request after fold: 9.8%
+    sample(2, 55_000, 5_100),     // client echo re-bill: 9.3%
+    sample(3, 60_000, 42_000),    // recovery: 70% (still < 85 warm line)
+    sample(4, 65_000, 60_000),    // warm: 92% — retires the claim window
+    sample(5, 66_000, 30_000),    // unrelated later cold blip: 45%
+  ];
+  const folds: FoldEvent[] = [
+    { at: T0 + 0.5 * min, tokensCompressed: 50_000, firstFoldStartTokens: 3_000, viewBefore: 100_000, viewAfter: 50_500 },
+  ];
+  const r = buildCacheReport(samples, folds);
+  const [, s2, s3, s4, s5, s6] = r.lines;
+  assert.equal(s2!.foldSeq, 1, "re-request claimed (first claim, unconditional)");
+  assert.equal(s2!.compRepay, 46_000);
+  assert.equal(s3!.foldSeq, 1, "client-echo re-bill claimed (#2929)");
+  assert.equal(s3!.compRepay, 45_900);
+  assert.equal(s3!.ttlRepay, 0, "echo residual no longer lands in the unattributed bucket");
+  assert.equal(s4!.foldSeq, 1, "cold recovery tail claimed");
+  assert.equal(s4!.compRepay, 13_000);
+  assert.equal(s5!.foldSeq, null, "warm line is never claimed as a continuation");
+  assert.equal(s5!.compRepay, 0);
+  assert.equal(s6!.foldSeq, null, "window closed — later cold blip is NOT the fold's");
+  assert.equal(s6!.ttlRepay, 35_000, "blip falls to the unattributed residual");
+  assert.equal(r.totals.ttlRepay, 36_000, "1K baseline residual + the 35K post-window blip");
+  assert.equal(r.folds[0]!.T, 46_000 + 45_900 + 13_000, "fold economics absorb the full cold tail");
+});
+
+test("#2929 fold cold-tail claim: FOLD_CLAIM_COLD_ROUNDS bounds the window without a warm line", () => {
+  const samples = [
+    sample(0, 100_000, 99_000),
+    sample(1, 51_000, 5_000),
+    sample(2, 52_000, 5_100),
+    sample(3, 53_000, 5_200),
+    sample(4, 54_000, 5_300),
+    sample(5, 55_000, 5_400),     // 5th post-fold sample: window exhausted
+  ];
+  const folds: FoldEvent[] = [
+    { at: T0 + 0.5 * min, tokensCompressed: 50_000, firstFoldStartTokens: 3_000, viewBefore: 100_000, viewAfter: 50_500 },
+  ];
+  const r = buildCacheReport(samples, folds);
+  const claimCount = r.lines.filter((l) => l.foldSeq === 1).length;
+  assert.equal(claimCount, FOLD_CLAIM_COLD_ROUNDS, "exactly the bound — never an open-ended claim");
+  assert.equal(r.lines[5]!.foldSeq, null);
+  assert.ok(r.lines[5]!.ttlRepay > 0, "post-window residual is unattributed again");
+});
+
+test("#2929 fold cold-tail claim: a warm FIRST post-fold sample claims once and retires", () => {
+  const samples = [
+    sample(0, 100_000, 99_000),
+    sample(1, 51_000, 50_000),   // 98% warm immediately after a tiny fold
+    sample(2, 52_000, 20_000),   // later cold blip must not be swallowed
+  ];
+  const folds: FoldEvent[] = [
+    { at: T0 + 0.5 * min, tokensCompressed: 5_000, firstFoldStartTokens: 3_000, viewBefore: 100_000, viewAfter: 95_500 },
+  ];
+  const r = buildCacheReport(samples, folds);
+  assert.equal(r.lines[1]!.foldSeq, 1, "first claim is unconditional even on a warm line");
+  assert.equal(r.lines[2]!.foldSeq, null, "retired by the warm first sample");
+  assert.ok(r.lines[2]!.ttlRepay > 0);
 });

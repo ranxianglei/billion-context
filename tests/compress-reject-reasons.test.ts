@@ -70,3 +70,47 @@ test("#362: diagnostics flow — valid parse returns ranges + ok diagnostics", (
     assert.equal(parsed.diagnostics.ok, true);
     assert.equal(parsed.diagnostics.kind, "ok");
 });
+
+// ---------------------------------------------------------------------------
+// Flat single-range: summary text in the content STRING + top-level bounds —
+// the two schema-advertised shapes merged into one call. Live incident:
+// six identical kind=content-not-array rejections in a single compress burst
+// while the model retried the same valid-intent call.
+// ---------------------------------------------------------------------------
+
+test("flat single-range call with summary text in content parses (live incident shape)", () => {
+    const parsed = parseCompressInput({
+        content: "Investigated the repro loop; root cause was the parse gate rejecting valid payloads.",
+        startId: "b114",
+        endId: "b114",
+        topic: "repro loop",
+    });
+    assert.equal(parsed.diagnostics.ok, true);
+    assert.equal(parsed.diagnostics.flatSummarySalvage, true);
+    assert.equal(parsed.ranges.length, 1);
+    assert.equal(parsed.ranges[0]?.startRef, "b114");
+    assert.equal(parsed.ranges[0]?.endRef, "b114");
+    assert.ok(parsed.ranges[0]?.summary.startsWith("Investigated the repro loop"));
+});
+
+test("flat single-range salvage also unwraps a JSON-encoded summary object in content", () => {
+    const parsed = parseCompressInput({
+        content: JSON.stringify({ summary: "encoded summary body", topic: "inner" }),
+        startId: "m00150",
+        endId: "m00168",
+    });
+    assert.equal(parsed.diagnostics.ok, true);
+    assert.equal(parsed.ranges[0]?.summary, "encoded summary body");
+    assert.equal(parsed.ranges[0]?.topic, "inner");
+});
+
+test("line-form string content with refs headers is not redirected to flat salvage", () => {
+    const parsed = parseCompressInput({
+        content: "m00010–m00020 topic\nsummary line.",
+        startId: "m00001",
+        endId: "m00030",
+    });
+    assert.equal(parsed.diagnostics.ok, true);
+    assert.equal(parsed.diagnostics.flatSummarySalvage, undefined);
+    assert.equal(parsed.ranges[0]?.startRef, "m00010");
+});

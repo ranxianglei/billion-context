@@ -36,6 +36,21 @@ function clusterRoot(id: string): string | null {
  * forms of a covered root, non-h_ ids, roots without a covered copy) keep the
  * converter's numbering untouched — renumbering those would only churn the
  * prefix cache.
+ *
+ * INACTIVE blocks (#2695): their covered ids join the dodge set, because a
+ * genuinely new instance landing on a dead block's number resurrects the
+ * block in sync ("some covered id present") and its summary carrier starts
+ * rendering — for content the instance was never part of. Renumbering
+ * against a dead block is gated by cluster-root continuity: only when some
+ * sibling of the same root was live last pass (the arriving instance is a
+ * NEW extension of a continuing cluster). A block that is inactive at
+ * pipeline start cannot itself have any covered id in `prior` (sync would
+ * have kept it alive otherwise), so "inactive-covered collision + sibling
+ * in prior" is exactly the new-extension-onto-dead-block shape. A
+ * whole-root arrival that is new to `prior` — a client rewinding to a
+ * checkpoint that still holds the folded originals — keeps the converter's
+ * ids and the block legitimately resurrects (carrier + prune, the #462
+ * economy restored).
  */
 export function remintCoveredLiveIds(
   messages: CoreMessage[],
@@ -43,7 +58,14 @@ export function remintCoveredLiveIds(
 ): CoreMessage[] {
   const coveredBases = new Set<string>();
   for (const id of coveredMessageIds(state)) coveredBases.add(baseIdOf(id));
-  if (coveredBases.size === 0) return messages;
+  const inactiveBases = new Set<string>();
+  for (const block of state.blocks) {
+    if (block.active) continue;
+    for (const id of block.effectiveMessageIds) {
+      inactiveBases.add(baseIdOf(id));
+    }
+  }
+  if (coveredBases.size === 0 && inactiveBases.size === 0) return messages;
   // Pre-feature persisted state has no prior-pass snapshot: fall back to
   // renumber-nothing (0.0.95 semantics) for this one pass. The snapshot is
   // written below in processTurn, so the next pass discriminates correctly.
@@ -62,12 +84,19 @@ export function remintCoveredLiveIds(
   const next = [...messages];
   let changed = false;
   for (const [root, idxs] of groups) {
-    // Only renumber when some live instance claims an id a folded copy owns;
-    // otherwise the converter's numbering is already collision-free here.
-    const conflict = idxs.some((i) =>
-      coveredBases.has(baseIdOf(messages[i]!.id)),
+    // Only renumber when some live instance claims an id a folded copy owns
+    // (active or inactive); otherwise the converter's numbering is already
+    // collision-free here.
+    const conflict = idxs.some(
+      (i) =>
+        coveredBases.has(baseIdOf(messages[i]!.id)) ||
+        inactiveBases.has(baseIdOf(messages[i]!.id)),
     );
     if (!conflict) continue;
+    // #2695: an inactive block's covered id is only renumbered away when the
+    // same root shows prior-pass continuity (see header) — a whole-root
+    // rewind keeps its ids so the block can resurrect.
+    const rootContinues = idxs.some((i) => prior.has(messages[i]!.id));
     // Renumbered ids must dodge both folded-claimed numbers and ids other
     // live instances of this root already hold (untouched ones keep theirs).
     const liveIds = new Set(idxs.map((i) => baseIdOf(messages[i]!.id)));
@@ -75,15 +104,19 @@ export function remintCoveredLiveIds(
     for (const i of idxs) {
       const id = messages[i]!.id;
       const exactCovered = coveredBases.has(baseIdOf(id));
+      const exactCoveredInactive = inactiveBases.has(baseIdOf(id));
       // Only a genuinely new instance is renumbered: its exact id is claimed
       // by a folded copy AND it was absent from the previous pass. Everything
       // else — the folded original's own resend (prior.has), converter-numbered
-      // "_n" forms that no folded copy claims, the live un-folded bare — keeps
-      // the converter's numbering; renumbering those would only churn the
+      // "_n" forms that no folded copy claims, the live un-folded bare, and
+      // (#2695) a whole-root rewind onto an inactive block — keeps the
+      // converter's numbering; renumbering those would only churn the
       // prefix cache and let summarized content escape prune (#462).
-      if (!exactCovered || prior.has(id)) continue;
+      if (prior.has(id)) continue;
+      if (!exactCovered && !(exactCoveredInactive && rootContinues)) continue;
       while (
         coveredBases.has(`${root}_${k}`) ||
+        inactiveBases.has(`${root}_${k}`) ||
         liveIds.has(`${root}_${k}`) ||
         prior.has(`${root}_${k}`)
       )

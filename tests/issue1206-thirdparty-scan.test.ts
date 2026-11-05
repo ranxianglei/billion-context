@@ -8,7 +8,7 @@ process.env.NODE_ENV = "test";
 
 import { createInitialState } from "acp-kernel";
 import type { Session } from "../src/session.ts";
-import { clearScanCache, conflictScanEnabled, isDesignBenign, isKnownDisplayOnlyPlugin, isOpencodeAcpEntry, isSiblingConflictDetail, scanClientPlugins, sniffScanClient, type ThirdPartyFinding } from "../src/thirdparty-scan.js";
+import { clearScanCache, conflictScanEnabled, isDesignBenign, isDisplayOnlyConflictDetail, isKnownDisplayOnlyPlugin, isOpencodeAcpEntry, isSiblingConflictDetail, parsePluginConflictDetail, scanClientPlugins, sniffScanClient, type ThirdPartyFinding } from "../src/thirdparty-scan.js";
 import { CONFLICT_LEDGER_MAX, conflictEventsOf, formatConflictSection, recordConflict, summarizeConflicts } from "../src/conflict-watch.js";
 import { resolveHermesHome, resolveKimiHome, resolveOmpHome, resolvePiHome } from "../src/client-config.js";
 import { SessionStore, _setStoreForTest } from "../src/persist.js";
@@ -375,7 +375,10 @@ test("formatConflictSection lists last 10 events with guidance", () => {
     assert.ok(lines.some((l) => l.includes("reaped 2")));
     assert.ok(!lines.some((l) => l.includes("reaped 0 ")), "only the last 10 events are listed");
     assert.ok(lines.some((l) => l.includes("/__bili/stats")), "overflow pointer present");
-    assert.ok(lines.some((l) => l.toLowerCase().includes("one compressor")), "guidance footer present");
+    // #2545: orphan reaps are UNCONFIRMED signals (observed change, cause not
+    // identified) — guidance exists but must not read as a confirmed conflict.
+    assert.ok(lines.some((l) => l.includes("UNCONFIRMED signal")), "soft unconfirmed-signal guidance present");
+    assert.ok(!lines.some((l) => l.toLowerCase().includes("keep exactly one compressor")), "no imperative for unconfirmed signals");
 });
 
 test("formatConflictSection marks [suspected] as name-only and softens the footer when nothing confirmed (#1736)", () => {
@@ -387,11 +390,19 @@ test("formatConflictSection marks [suspected] as name-only and softens the foote
     assert.ok(!lines.some((l) => l.toLowerCase().includes("one compressor")), "no confirmed events -> no hard remove/disable command");
 
     const s2 = makeSession();
-    recordConflict(s2, "third-party-plugin", "opencode: opencode-acp (global config)");
+    // #2545: a sibling standing down next to an orphan reap is NOT confirmed foreign
+    // evidence — the strong footer requires a real non-suspected plugin finding.
+    recordConflict(s2, "third-party-plugin", "pi: npm:real-compressor-x (/u/.pi/settings.json)");
     recordConflict(s2, "orphan-reap", "1 block(s) deactivated: b1");
     const lines2 = formatConflictSection(conflictEventsOf(s2));
     assert.ok(lines2.some((l) => l.toLowerCase().includes("one compressor")), "confirmed events keep the strong footer");
     assert.ok(!lines2.some((l) => l.includes("[suspected] = name-only")), "no note when nothing is suspected");
+
+    const s3 = makeSession();
+    recordConflict(s3, "third-party-plugin", "opencode: opencode-acp (global config)");
+    recordConflict(s3, "orphan-reap", "1 block(s) deactivated: b1");
+    const lines3 = formatConflictSection(conflictEventsOf(s3));
+    assert.ok(!lines3.some((l) => l.toLowerCase().includes("keep exactly one compressor")), "sibling + unconfirmed signal stays in the soft tier (#2261/#2545)");
 });
 
 test("summarizeConflicts aggregates across sessions", () => {
@@ -430,6 +441,33 @@ test("isKnownDisplayOnlyPlugin resolves bare/npm-versioned/path forms, rejects l
     assert.ok(!isKnownDisplayOnlyPlugin("my-pi-compact-transcript-fork"), "substring lookalike NOT excluded");
     assert.ok(!isKnownDisplayOnlyPlugin("context-compactor"), "real compressor not excluded");
     assert.ok(!isKnownDisplayOnlyPlugin("pi-context"), "unrelated name not excluded");
+});
+
+test("isKnownDisplayOnlyPlugin exempts verified read-only context viewer in every spec form (#2545)", () => {
+    assert.ok(isKnownDisplayOnlyPlugin("pi-context-inspector"));
+    assert.ok(isKnownDisplayOnlyPlugin("npm:pi-context-inspector"));
+    assert.ok(isKnownDisplayOnlyPlugin("npm:pi-context-inspector@1.3.0"));
+    assert.ok(isKnownDisplayOnlyPlugin("/u/.pi/agent/npm/node_modules/pi-context-inspector/index.js"));
+    assert.ok(isKnownDisplayOnlyPlugin("C:\\Users\\Administrator\\.pi\\agent\\npm\\node_modules\\pi-context-inspector\\index.js"), "windows path form");
+    assert.ok(!isKnownDisplayOnlyPlugin("my-pi-context-inspector-fork"), "lookalike NOT excluded");
+    assert.ok(!isKnownDisplayOnlyPlugin("pi-context-compressor"), "a real compressor sharing the prefix stays flagged");
+});
+
+test("pi scan: pi-context-inspector never flagged in any spec form, real compressors still flagged (#2545)", () => {
+    clearScanCache();
+    const root = tmp("bili-2545-pi-");
+    const cwd = tmp("bili-2545-pi-cwd-");
+    const env: NodeJS.ProcessEnv = { ...hermeticEnv(root), PI_HOME: path.join(root, ".pi", "agent") };
+    const home = resolvePiHome(env);
+    assertTestOwned(path.join(home, "settings.json"), root);
+    // the issue's exact install shape (npm spec as pi-managed) plus a bare name and a
+    // REAL compressor that must stay flagged.
+    writeFile(path.join(home, "settings.json"), JSON.stringify({
+        packages: ["npm:billion-context", "npm:pi-context-inspector", "npm:pi-context-inspector@1.3.0", "npm:context-compactor"],
+    }));
+    const res = scanClientPlugins("pi", { env, cwd });
+    assert.ok(!res.findings.some((f) => f.entry.includes("pi-context-inspector")), "read-only viewer never flagged, any spec form");
+    assert.ok(res.findings.some((f) => f.entry === "npm:context-compactor" && f.match === "keyword"), "real compressor still flagged");
 });
 
 test("isSiblingConflictDetail maps recorded details back to sibling entries (#2261)", () => {
@@ -493,4 +531,187 @@ test("formatConflictSection: sibling-only ledgers drop the one-compressor comman
     recordConflict(mixed, "third-party-plugin", "pi: npm:real-compressor-x (/home/dog/.pi/agent/settings.json)");
     const mixedText = formatConflictSection(conflictEventsOf(mixed)).join("\n");
     assert.ok(mixedText.toLowerCase().includes("keep exactly one compressor"), "any non-sibling event keeps the strong footer");
+});
+
+// #2545: evidence tiers — verified read-only viewers are neutralized at display
+// time (stock ledgers written by pre-#1736 keyword rules carry them as
+// [suspected]), and unconfirmed signals never escalate into a confirmed
+// double-compression verdict.
+
+test("parsePluginConflictDetail splits client/entry/source/suspected; non-plugin shapes stay undefined (#2545)", () => {
+    assert.deepEqual(
+        parsePluginConflictDetail("pi: npm:context-forge (/home/dog/.pi/agent/settings.json) [suspected]"),
+        { client: "pi", entry: "npm:context-forge", source: "/home/dog/.pi/agent/settings.json", suspected: true });
+    assert.deepEqual(
+        parsePluginConflictDetail("opencode: opencode-acp (global config)"),
+        { client: "opencode", entry: "opencode-acp", source: "global config", suspected: false });
+    // the issue's own stock record shape — Windows path inside the parens must parse.
+    const w = parsePluginConflictDetail("pi: npm:pi-context-inspector (C:\\Users\\Administrator\\.pi\\agent\\settings.json) [suspected]");
+    assert.equal(w?.entry, "npm:pi-context-inspector");
+    assert.equal(w?.suspected, true);
+    assert.equal(parsePluginConflictDetail("event 5"), undefined);
+    assert.equal(parsePluginConflictDetail("47/247 incoming message(s) carry pre-turn refs of 290 known"), undefined);
+});
+
+test("isDisplayOnlyConflictDetail neutralizes stock records of verified read-only viewers (#2545)", () => {
+    assert.ok(isDisplayOnlyConflictDetail("pi: npm:pi-context-inspector (C:\\Users\\Administrator\\.pi\\agent\\settings.json) [suspected]"), "the issue's exact stock detail");
+    assert.ok(isDisplayOnlyConflictDetail("pi: pi-compact-transcript (/u/.pi/settings.json)"));
+    assert.ok(!isDisplayOnlyConflictDetail("pi: npm:context-forge (/home/dog/.pi/agent/settings.json) [suspected]"));
+    assert.ok(!isDisplayOnlyConflictDetail("dsh: dsh-context (profile/package.json) [suspected]"));
+    assert.ok(!isDisplayOnlyConflictDetail("event 5"), "non-plugin shapes never classify");
+});
+
+test("summarizeConflicts counts displayOnly and activeConfirmed tiers (#2545/#2912)", () => {
+    const a = makeSession();
+    recordConflict(a, "third-party-plugin", "pi: npm:pi-context-inspector (C:\\Users\\Administrator\\.pi\\agent\\settings.json) [suspected]");
+    recordConflict(a, "third-party-plugin", "pi: npm:context-forge (/home/dog/.pi/agent/settings.json) [suspected]");
+    const b = makeSession();
+    // #2912: only an INFERRED landing is confirmed-tier now — a marker-detected one was already rebased onto.
+    recordConflict(b, "native-compaction-inferred", "codex: compaction framing absent on replay; bili refused 3 client-native call(s) (#2709)");
+    const s = summarizeConflicts([a, b]);
+    assert.equal(s.events, 3);
+    assert.equal(s.suspected, 2);
+    assert.equal(s.displayOnly, 1, "the inspector record classifies as display-only (overlaps suspected)");
+    assert.equal(s.activeConfirmed, 1, "only the INFERRED native-compaction landing is confirmed-tier");
+    assert.equal(s.active, 3);
+});
+
+test("#2912: a pure recovered (marker-detected) native-compaction ledger is NOT confirmed-tier", () => {
+    const r = makeSession();
+    recordConflict(r, "native-compaction", "dsh native compaction: 12/14 covered id(s) replaced; ACP state rebased (#2432)");
+    const s = summarizeConflicts([r]);
+    assert.equal(s.events, 1);
+    assert.equal(s.activeConfirmed, 0, "recovered landing already rebased onto (#2372/#2432) — handled stock, not confirmed evidence");
+});
+
+test("formatConflictSection: display-only-only ledger stands down neutrally (#2545)", () => {
+    const s = makeSession();
+    recordConflict(s, "third-party-plugin", "pi: npm:pi-context-inspector (C:\\Users\\Administrator\\.pi\\agent\\settings.json) [suspected]");
+    recordConflict(s, "third-party-plugin", "pi: npm:pi-context-inspector@1.3.0 (C:\\Users\\Administrator\\.pi\\agent\\settings.json) [suspected]");
+    const text = formatConflictSection(conflictEventsOf(s)).join("\n");
+    assert.ok(text.includes("verified non-compressing plugin"), "names the verified non-compressing tier");
+    assert.ok(!text.includes("Two compressors on one conversation"), "header claim requires confirmed/native evidence");
+    assert.ok(!text.toLowerCase().includes("keep exactly one compressor"), "no removal command for non-compressors");
+    assert.ok(text.includes("/__bili/conflicts/clear"), "points at the clear path");
+});
+
+test("formatConflictSection: rewrite signal + display-only stock stays an UNCONFIRMED diagnosis (#2545)", () => {
+    const s = makeSession();
+    recordConflict(s, "unannounced-rewrite", "47/247 incoming message(s) carry pre-turn refs of 290 known");
+    recordConflict(s, "third-party-plugin", "pi: npm:pi-context-inspector (C:\\Users\\Administrator\\.pi\\agent\\settings.json) [suspected]");
+    const text = formatConflictSection(conflictEventsOf(s)).join("\n");
+    assert.ok(text.includes("UNCONFIRMED signal"), "tiered as unconfirmed");
+    assert.ok(text.includes("cause is not confirmed"), "cause explicitly unidentified");
+    assert.ok(!text.includes("Two compressors on one conversation"), "header claim requires confirmed/native evidence");
+    assert.ok(!text.toLowerCase().includes("keep exactly one compressor"), "no imperative without confirmed evidence");
+});
+
+test("formatConflictSection: stale confirmed stock next to a fresh signal -> verify-then-clear, not live alarm (#2545)", () => {
+    const s = makeSession();
+    s.metadata.conflictEvents = [
+        { at: Date.now() - 30 * 86_400_000, kind: "third-party-plugin", detail: "pi: npm:real-compressor-x (/home/dog/.pi/agent/settings.json)" },
+        { at: Date.now(), kind: "unannounced-rewrite", detail: "47/247 incoming message(s) carry pre-turn refs of 290 known" },
+    ];
+    const text = formatConflictSection(conflictEventsOf(s)).join("\n");
+    assert.ok(text.includes("older than 7 days (historical stock)"), "confirmed ledger graded by its own age");
+    assert.ok(text.includes("Two compressors on one conversation"), "header claim holds while confirmed evidence exists");
+    assert.ok(!text.toLowerCase().includes("keep exactly one compressor"), "stock confirmed events get verify-then-clear, not the live command");
+});
+
+// #2969: @openma/deepseek-harness-acp — the "-acp" suffix names the Agent Client
+// Protocol, not the acp-kernel ecosystem marker. The adapter is verified NOT to
+// compress (its shipped cordis.patch.yml disables dsh native compaction features),
+// so it must be exempted by exact name AND its stock [suspected] records neutralized
+// at display time — while real compressors and runtime evidence stay fully visible.
+
+test("isKnownDisplayOnlyPlugin exempts the dsh ACP protocol adapter in every spec form, rejects lookalikes (#2969)", () => {
+    assert.ok(isKnownDisplayOnlyPlugin("@openma/deepseek-harness-acp"));
+    assert.ok(isKnownDisplayOnlyPlugin("npm:@openma/deepseek-harness-acp"));
+    assert.ok(isKnownDisplayOnlyPlugin("npm:@openma/deepseek-harness-acp@0.4.37"));
+    assert.ok(isKnownDisplayOnlyPlugin("/u/dsh/profiles/desktop/node_modules/@openma/deepseek-harness-acp/index.js"));
+    assert.ok(isKnownDisplayOnlyPlugin("C:\\Users\\Administrator\\dsh\\profiles\\desktop\\node_modules\\@openma\\deepseek-harness-acp\\index.js"), "windows path form");
+    assert.ok(!isKnownDisplayOnlyPlugin("@openma/deepseek-harness-acp-fork"), "scoped lookalike NOT excluded");
+    assert.ok(!isKnownDisplayOnlyPlugin("deepseek-harness-acp"), "unscoped lookalike NOT excluded");
+    assert.ok(!isKnownDisplayOnlyPlugin("@other/deepseek-harness-acp"), "other scope NOT excluded");
+});
+
+test("dsh scan: ACP protocol adapter alone yields NO finding; real compressors still flagged (#2969)", () => {
+    clearScanCache();
+    const root = tmp("bili-2969-dsh-");
+    const env: NodeJS.ProcessEnv = { ...hermeticEnv(root), DSH_HOME: path.join(root, "dsh") };
+    const pkg = path.join(root, "dsh", "profiles", "desktop", "package.json");
+    assertTestOwned(pkg, root);
+    writeFile(pkg, JSON.stringify({
+        dependencies: {
+            "billion-context": "^0.1.0",
+            "@openma/deepseek-harness-acp": "^0.4.0",
+            "@deepseek-ai/dsh-compaction-basic": "0.2.0-rc.2",
+        },
+    }));
+    const res = scanClientPlugins("dsh", { env, cwd: root });
+    const names = res.findings.map((f) => f.entry);
+    assert.ok(!names.some((n) => n.includes("@openma/deepseek-harness-acp")), "protocol adapter never flagged in any spec form");
+    assert.ok(names.includes("@deepseek-ai/dsh-compaction-basic"), "real compressor still flagged");
+});
+
+test("isDisplayOnlyConflictDetail neutralizes stock records of the dsh ACP adapter (#2969)", () => {
+    assert.ok(isDisplayOnlyConflictDetail("dsh: @openma/deepseek-harness-acp (/home/u/.dsh/profiles/desktop/package.json) [suspected]"), "the issue's exact stock detail shape");
+    assert.ok(isDisplayOnlyConflictDetail("dsh: npm:@openma/deepseek-harness-acp@0.4.37 (/u/dsh/profiles/desktop/package.json) [suspected]"));
+    assert.ok(!isDisplayOnlyConflictDetail("dsh: @openma/deepseek-harness-acp-fork (/u/dsh/profiles/desktop/package.json) [suspected]"), "lookalike stays suspected");
+    assert.ok(!isDisplayOnlyConflictDetail("event 5"), "non-plugin shapes never classify");
+});
+
+test("summarizeConflicts counts the ACP adapter record as displayOnly, overlapping suspected (#2969)", () => {
+    const a = makeSession();
+    recordConflict(a, "third-party-plugin", "dsh: @openma/deepseek-harness-acp (/u/dsh/profiles/desktop/package.json) [suspected]");
+    recordConflict(a, "third-party-plugin", "dsh: dsh-context-compressor (/u/dsh/profiles/desktop/package.json) [suspected]");
+    const s = summarizeConflicts([a]);
+    assert.equal(s.events, 2);
+    assert.equal(s.suspected, 2, "both records are name-only matches on the raw counter");
+    assert.equal(s.displayOnly, 1, "only the adapter record classifies as non-compressing");
+    assert.equal(s.activeConfirmed, 0, "no confirmed-tier evidence from names alone");
+});
+
+test("formatConflictSection: ACP-adapter-only ledger stands down neutrally, no fix footer (#2969)", () => {
+    const s = makeSession();
+    recordConflict(s, "third-party-plugin", "dsh: @openma/deepseek-harness-acp (/u/dsh/profiles/desktop/package.json) [suspected]");
+    recordConflict(s, "third-party-plugin", "dsh: @openma/deepseek-harness-acp (/u/dsh/profiles/desktop/package.json) [suspected]");
+    const text = formatConflictSection(conflictEventsOf(s)).join("\n");
+    assert.ok(text.includes("verified non-compressing plugin"), "names the verified non-compressing tier");
+    assert.ok(!text.includes("Two compressors on one conversation"), "header claim requires confirmed/native evidence");
+    assert.ok(!text.toLowerCase().includes("keep exactly one compressor"), "no removal command for non-compressors");
+    assert.ok(!text.includes("\n\nFix"), "no per-client fix footer for a neutral ledger");
+    assert.ok(text.includes("/__bili/conflicts/clear"), "points at the clear path");
+});
+
+test("formatConflictSection: pure-[suspected] ledger drops the imperative fix footer (#2969)", () => {
+    const s = makeSession();
+    recordConflict(s, "third-party-plugin", "dsh: dsh-context-compressor (/u/dsh/profiles/desktop/package.json) [suspected]");
+    const text = formatConflictSection(conflictEventsOf(s)).join("\n");
+    assert.ok(text.includes("[suspected] = name-only"), "explains the suspected marker");
+    assert.ok(text.includes("do not drop a read-only tool"), "verify-first advice present");
+    assert.ok(!text.includes("\n\nFix"), "no imperative per-client fix footer when nothing is confirmed");
+    assert.ok(!text.includes("disable the client's own auto-compaction"), "no disable/restart command for name-only guesses");
+    assert.ok(!text.includes("Detecting other compression plugins"), "docs pointer rides with the footer");
+
+    const s2 = makeSession();
+    recordConflict(s2, "third-party-plugin", "dsh: dsh-context-compressor (/u/dsh/profiles/desktop/package.json) [suspected]");
+    recordConflict(s2, "unannounced-rewrite", "47/247 incoming message(s) carry pre-turn refs of 290 known");
+    const text2 = formatConflictSection(conflictEventsOf(s2)).join("\n");
+    assert.ok(text2.includes("\n\nFix"), "unconfirmed-signal tier keeps the remediation footer");
+    assert.ok(text2.includes("UNCONFIRMED signal"), "signal framing intact");
+});
+
+test("formatConflictSection: ACP adapter record next to a HANDLED native landing drops to the suspected tier (#2969/#2912)", () => {
+    const s = makeSession();
+    recordConflict(s, "third-party-plugin", "dsh: @openma/deepseek-harness-acp (/u/dsh/profiles/desktop/package.json) [suspected]");
+    recordConflict(s, "native-compaction", "codex: compaction_trigger item");
+    const text = formatConflictSection(conflictEventsOf(s)).join("\n");
+    // #2912: the marker-detected native landing is already rebased onto (handled stock), so it
+    // no longer arms the confirmed double-compression header — only the name-only-suspected
+    // plugin remains, governing the verify-first tier (supersedes #2969's pre-#2912 premise).
+    assert.ok(!text.includes("Two compressors on one conversation"), "handled native landing must not re-arm the double-compression header");
+    assert.ok(!text.includes("client's OWN native compaction landing"), "no confirmed-native rebuild advice for a handled landing");
+    assert.ok(text.includes("ALREADY rebased onto"), "the handled-native calm framing is present");
+    assert.ok(text.includes("name-only keyword match"), "the suspected plugin is still flagged for verification");
 });

@@ -39,7 +39,7 @@ const run = process.env.ACP_TEST_CANARY === "1";
 
 const REPO_ROOT = path.resolve(import.meta.dirname, "..", "..");
 const DIST_ENTRY = path.join(REPO_ROOT, "dist", "index.js");
-const PKG = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, "package.json"), "utf8")) as { name: string; version: string; files: string[] };
+const PKG = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, "package.json"), "utf8")) as { name: string; version: string; files: string[]; scripts?: Record<string, string> };
 
 const NEW_VERSION = PKG.version; // the just-published number
 
@@ -91,7 +91,13 @@ async function makeFixtureTarball(work: string, version: string): Promise<string
     fs.mkdirSync(packs, { recursive: true });
     const stage = path.join(work, "fixtures", version);
     fs.mkdirSync(stage, { recursive: true });
-    fs.writeFileSync(path.join(stage, "package.json"), `${JSON.stringify({ ...PKG, version }, null, 2)}\n`);
+    // The staged copy models a PUBLISHED artifact: registry installs never run
+    // prepare, and scripts/ is outside `files`, so drop the hook referencing
+    // the non-shipped guard script (#2471).
+    fs.writeFileSync(
+        path.join(stage, "package.json"),
+        `${JSON.stringify({ ...PKG, version, scripts: Object.fromEntries(Object.entries(PKG.scripts ?? {}).filter(([name]) => name !== "prepare")) }, null, 2)}\n`,
+    );
     for (const entry of PKG.files) {
         const src = path.join(REPO_ROOT, entry);
         if (fs.existsSync(src)) await fs.promises.cp(src, path.join(stage, entry), { recursive: true });
@@ -317,6 +323,11 @@ test("release canary: no-op self-update keeps every channel healthy (#1811)", { 
         const webCopyDir = seedDshProfile(envBase, "web", STALE_VERSION);
         envBase.BILI_UPDATE_REGISTRY = registry.url;
         envBase.BILI_UPDATE_CHECK_INTERVAL_MS = "1000";
+        // #3619 pins: see e2e-update-state — this suite asserts convergence
+        // timing (40 s/60 s waits); a staggered draw would starve them.
+        envBase.BILI_UPDATE_STAGGER_MIN_MS = "0";
+        envBase.BILI_UPDATE_STAGGER_MAX_MS = "0";
+        envBase.BILI_UPDATE_POLICY_URL = "http://127.0.0.1:1/no-policy.json";
 
         // ── phase 1: boot the behind-machine as a live proxy ──
         const port = await freePort();

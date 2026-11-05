@@ -1,4 +1,5 @@
 import type { WireProtocol } from "./util.js";
+import { normalizeGoogleUserPartOrder, type GooglePart } from "acp-kernel/wire";
 
 /** Append `text` as a trailing user turn on the wire's own request body.
  *
@@ -44,7 +45,9 @@ export function appendTrailingUserText(protocol: WireProtocol, body: string | Bu
         const arr = contents as Record<string, unknown>[];
         const last = arr[arr.length - 1];
         if (last && typeof last === "object" && last.role === "user" && Array.isArray(last.parts)) {
-            last.parts = [...(last.parts as unknown[]), { text }];
+            // #3159: plain text after a functionResponse part 400s on Vertex —
+            // keep the canonical order when merging into a tool-result tail.
+            last.parts = normalizeGoogleUserPartOrder([...(last.parts as unknown[]), { text }] as GooglePart[]);
         } else {
             arr.push({ role: "user", parts: [{ text }] });
         }

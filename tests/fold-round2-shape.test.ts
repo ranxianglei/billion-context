@@ -127,7 +127,7 @@ test("#1592 chat fold round-2 renders the next turn's shape (no run separators, 
             hist.push({ role: "tool", tool_call_id: `call_t${t}`, content: `total 8\n` + FILLER(200 + t, 9) });
         }
     } finally {
-        server.close(); upstream.close();
+        server.close(); server.closeIdleConnections?.(); upstream.close(); upstream.closeIdleConnections?.();
         await Promise.allSettled([once(server, "close"), once(upstream, "close")]);
     }
 

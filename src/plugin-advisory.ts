@@ -18,7 +18,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import { dshProfileDirs } from "./dsh-channel.js";
+import { dshProfileDirs, parseDshPatchEntries } from "./dsh-channel.js";
 
 interface CostAdvisory {
     id: string;
@@ -40,10 +40,11 @@ const KNOWN_COST_PLUGINS: ReadonlyArray<{ client: string; id: string; name: stri
 const SCAN_TTL_MS = 5 * 60 * 1000;
 let cache: { key: string; at: number; result: CostAdvisory[] } | undefined;
 
-// Top-level "- id: <value>" patch entries across every dsh profile's
-// cordis.patch.yml. `\S+` stops at whitespace so trailing config/comments are
-// naturally excluded; surrounding quotes are stripped. Per-line and forgiving —
-// a malformed line simply yields no id.
+// Enabled top-level patch-entry loader ids across every dsh profile's
+// cordis.patch.yml — entries carrying `disabled: true` in their own block do
+// NOT count (#3838: presence of the id line alone used to fire the advisory
+// for explicitly disabled plugins). Parsed by the shared dsh-channel entry
+// scanner so this gate and the #2861 disable check share one discipline.
 function dshEnabledPatchIds(env: NodeJS.ProcessEnv): Set<string> {
     const ids = new Set<string>();
     let dirs: string[];
@@ -52,7 +53,6 @@ function dshEnabledPatchIds(env: NodeJS.ProcessEnv): Set<string> {
     } catch {
         return ids;
     }
-    const itemRe = /^\s*-\s*id\s*:\s*(\S+)/;
     for (const dir of dirs) {
         let text: string;
         try {
@@ -60,13 +60,8 @@ function dshEnabledPatchIds(env: NodeJS.ProcessEnv): Set<string> {
         } catch {
             continue;
         }
-        for (const line of text.split(/\r?\n/)) {
-            const m = line.match(itemRe);
-            if (!m) continue;
-            let v = m[1];
-            if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) v = v.slice(1, -1);
-            v = v.trim();
-            if (v.length > 0) ids.add(v);
+        for (const e of parseDshPatchEntries(text)) {
+            if (!e.disabled) ids.add(e.id);
         }
     }
     return ids;

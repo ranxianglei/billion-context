@@ -1,12 +1,16 @@
-// #1995: recovery channel for stripImages. Stripping drops historical image
-// parts with no trace left behind — decompress is text-only and image_full only
-// covers downsampled originals (#1095), so once an image is stripped the model
-// can never see those pixels again. The client re-sends full raw history every
-// turn, so the original bytes are always present in the incoming request; this
-// module indexes them by kernel-assigned mNNNNN ref (via each message's stable
-// id) so decompress({ imageRef }) can pull a specific image back. Delivery is
+// #1995/#2607: recovery channel for folded images. Default folding archives
+// media off the wire (#2640) and decompress is text-only, so without this
+// module the model could never see folded-away pixels again. The client
+// re-sends full raw history every turn, so the original bytes are always
+// present in the incoming request; this module indexes them by
+// kernel-assigned mNNNNN ref (via each message's stable id) so
+// decompress({ imageRef }) can pull a specific image back. Delivery is
 // file-first (a host-readable path the model opens with its read tool) — uniform
 // across all four wires, no per-protocol inline-image rendering required.
+// (The former `compress.stripImages` sliding-window strip — and its
+// fold-anchored anthropic cutoff — was removed: it broke the prompt cache
+// every turn on three of four wires and duplicated what default folding now
+// does cache-safely.)
 //
 // Scope note: this only recovers images bili itself can see in the inbound
 // request. A plugin-mode agent that folded an image away in its OWN local store
@@ -151,12 +155,12 @@ export function messageImageBytes(m: CoreMessage): RestorableImage[] {
             }
             const fr = part.functionResponse;
             if (isObj(fr) && Array.isArray(fr.parts)) {
-                // Review ⑤: mirror the strip side's Gemini-3 $ref guard (kernel
-                // strip-images.ts) — when `response` points at a part via
-                // {"$ref": displayName} the strip side leaves the part untouched,
+                // Review ⑤: mirror the strip side's Gemini-3 $ref guard (from the
+                // removed kernel strip-images.ts; kept for parity) — when
+                // `response` points at a part via
+                // {"$ref": displayName} the bytes are not inline,
                 // so there is nothing to restore: skip indexing (harmless waste,
-                // not corruption, but the index and the strip disagree for no
-                // reason without this).
+                // not corruption).
                 const refGuarded = JSON.stringify(fr.response ?? null).includes('"$ref"');
                 if (!refGuarded) {
                     for (const np of fr.parts) {
@@ -206,12 +210,42 @@ function coreMsgsOf(result: unknown): CoreMessage[] | undefined {
     return undefined;
 }
 
+// #2824: raw-text pre-check — can this body carry indexable image bytes at
+// ALL? buildIncomingImageIndex pays a full wire→core conversion of the whole
+// history (twice per request with the post-prepare refresh) only to discover
+// there are no images; on a 32MiB no-image session that was ~170ms of the
+// 0.1.193 local-time regression per turn. OVER-APPROXIMATE BY DESIGN: a false
+// positive costs one wasted conversion, a false negative would silently drop
+// image recovery. The markers mirror EVERY shape messageImageBytes indexes:
+//   - openai/responses (+anthropic source.url): data-URL strings (the exact
+//     domain parseDataUrl accepts — any media type, `;base64` optional);
+//   - anthropic source.type "base64": raw base64 payload, NO data: prefix;
+//   - google inlineData parts (top-level AND nested in functionResponse):
+//     raw base64 .data field, NO data: prefix.
+// Keyed markers tolerate JSON whitespace ("type": "base64" vs "type":"base64").
+export function bodyMightCarryImages(bodyText: string, protocol: WireProtocol): boolean {
+    switch (protocol) {
+        case "anthropic":
+            return /"data:[^;,"]+(?:;base64)?,/i.test(bodyText) || /"type"\s*:\s*"base64"/.test(bodyText);
+        case "google":
+            return /"inlineData"\s*:/.test(bodyText);
+        default:
+            return /"data:[^;,"]+(?:;base64)?,/i.test(bodyText);
+    }
+}
+
+/** Warn-once dedupe for inbound-index conversion failures: the catch must
+ * stay fail-open (empty index, request unaffected) but never SILENT — #2824
+ * class. Keyed by protocol + error signature; bounded by distinct error
+ * shapes, which is a handful per process. */
+const conversionWarned = new Set<string>();
+
 /** Parse the INBOUND wire body into core messages and index every carried image
  *  by its mNNNNN ref. A message is indexed only when it is already known to the
  *  session (`state.messageRefs.byRaw[message.id]` resolves) — brand-new tail
- *  messages have no ref yet and sit inside the keep window anyway, so they are
- *  never strip targets. Returns an empty map when nothing is recoverable (no
- *  images, no refs, or an unparseable body). */
+ *  messages have no ref yet and sit inside the protected tail anyway, so
+ *  folding never archives them. Returns an empty map when nothing is
+ *  recoverable (no images, no refs, or an unparseable body). */
 export function buildIncomingImageIndex(
     parsed: unknown,
     protocol: WireProtocol,
@@ -229,7 +263,17 @@ export function buildIncomingImageIndex(
             case "google": result = googleToCore(parsed as GoogleRequestBody); break;
             case "responses": result = responsesToCore(parsed as ResponsesRequestBody); break;
         }
-    } catch {
+    } catch (e) {
+        // Fail-open by design (an unparseable body must not kill the request),
+        // but visible: a converter throw here silently disables image recovery
+        // for every session carrying that shape — exactly how the #3642
+        // single-object-content TypeError hid (#2824). One warn per signature
+        // per process so a broken shape logs once, not twice per turn.
+        const sig = `${protocol}:${String((e as Error)?.message ?? e).slice(0, 120)}`;
+        if (!conversionWarned.has(sig)) {
+            conversionWarned.add(sig);
+            loggerLog("warn", `[image-restore] inbound index conversion failed — images in affected sessions are NOT recoverable until this wire shape is handled (${sig}; #2824 class — please report the body shape)`);
+        }
         return index;
     }
     const msgs = coreMsgsOf(result);
@@ -259,82 +303,34 @@ export function buildIncomingImageIndex(
     return index;
 }
 
-/** Protocol-dispatching convenience: run the inbound body through the wire
- *  → core converter and return the flattened core messages (or undefined when
- *  the body does not parse for that protocol). */
-export function coreMessagesFor(
-    parsed: unknown,
-    protocol: WireProtocol,
-): BiliMessage[] | undefined {
-    let result: unknown;
-    try {
-        switch (protocol) {
-            case "anthropic": result = anthropicToCore(parsed as AnthropicRequestBody); break;
-            case "openai": result = openaiToCore(parsed as OpenAIRequestBody); break;
-            case "google": result = googleToCore(parsed as GoogleRequestBody); break;
-            case "responses": result = responsesToCore(parsed as ResponsesRequestBody); break;
-        }
-    } catch {
-        return undefined;
-    }
-    return coreMsgsOf(result);
-}
-
-/** #1995 gap 2 — fold-anchored strip cutoff for stripImages.
- *
- *  Today the strip window SLIDES (`len - keepRecent`), so every new message
- *  moves the byte boundary of the outgoing body one message earlier: the
- *  prompt cache breaks at that point every turn, and the most expensive bytes
- *  in the window (images) are re-billed as cache writes forever. Instead, when
- *  an active fold exists we anchor the cutoff to fold coverage: strip exactly
- *  the wire messages covered by (or older than) the latest active fold. The
- *  cutoff then only moves on compression events, so the stripped prefix is
- *  byte-stable between folds and the cache break stays put.
- *
- *  ANTHROPIC ONLY, deliberately. Anchoring is only safe where stripping does
- *  not perturb kernel message ids: anthropic's strip placeholder "[image]" is
- *  byte-identical to the id seed the converter derives for image blocks, so a
- *  stripped image keeps the id the fold recorded at compression time. The
- *  other three wires flip ids on strip (openai/google drop to "" vs "[image]";
- *  responses concatenates text+"[image]"), so anchoring there would orphan
- *  fold coverage at T+1 — they keep the sliding window until their
- *  placeholders are made id-neutral (follow-up to #1995).
- *
- *  Returns `undefined` when there is no anchor (no active fold covers any
- *  message with a known wire index), so the caller falls back to the sliding
- *  window. */
-export function foldAnchoredCutoff(
+/** #2607: post-prepare refresh of the incoming-image index. prepare assigns
+ *  numeric refs to this turn's NEW messages — and archivable media now folds by
+ *  default — so their pixels must be archived BEFORE preflight or the model can
+ *  fold them away unrecoverably. Re-indexes the same raw body against the
+ *  post-prepare state and MERGES into the existing index (union by on-disk
+ *  path): the entry-time pass already spilled files, and merging guards against
+ *  any future ref pruning inside prepare. writeRestoredImage's skip-if-exists
+ *  keeps the second pass to one stat per known image. */
+export function refreshIncomingImageIndex(
     parsed: unknown,
     protocol: WireProtocol,
     state: CompressionState,
-): number | undefined {
-    if (protocol !== "anthropic") return undefined;
-    const blocks = (state as { blocks?: { active?: boolean; effectiveMessageIds?: string[] }[] })?.blocks;
-    if (!Array.isArray(blocks)) return undefined;
-    const covered = new Set<string>();
-    for (const b of blocks) {
-        if (!b?.active) continue;
-        for (const id of b.effectiveMessageIds ?? []) covered.add(id);
+    sessionId: string,
+    existing: Map<string, IndexedImage[]> | undefined,
+): Map<string, IndexedImage[]> {
+    const fresh = buildIncomingImageIndex(parsed, protocol, state, sessionId);
+    if (fresh.size === 0) return existing ?? new Map();
+    const merged = existing ? new Map(existing) : new Map<string, IndexedImage[]>();
+    const seen = new Set<string>();
+    for (const imgs of merged.values()) for (const im of imgs) seen.add(im.path);
+    for (const [ref, imgs] of fresh) {
+        const kept = imgs.filter((im) => !seen.has(im.path));
+        if (kept.length === 0) continue;
+        for (const im of kept) seen.add(im.path);
+        const prev = merged.get(ref);
+        merged.set(ref, prev ? [...prev, ...kept] : kept);
     }
-    if (covered.size === 0) return undefined;
-    const msgs = coreMessagesFor(parsed, protocol);
-    if (!msgs) return undefined;
-    let last = -1;
-    let boundaryFull = false;
-    for (const m of msgs) {
-        if (m.wireIndex === undefined) continue;
-        if (covered.has(m.id)) {
-            if (m.wireIndex > last) { last = m.wireIndex; boundaryFull = true; }
-        } else if (m.wireIndex === last) {
-            // A core message sharing the boundary wire message but NOT covered
-            // (e.g. an image block in the same anthropic message the fold
-            // stopped before): stripping that wire message would strip a LIVE
-            // image, so the boundary message itself stays intact.
-            boundaryFull = false;
-        }
-    }
-    if (last < 0) return undefined;
-    return last + (boundaryFull ? 1 : 0);
+    return merged;
 }
 
 /** Best-effort expiry for spilled restore files (#1995): `decompress imageRef`

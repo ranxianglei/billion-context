@@ -658,6 +658,13 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                     yield* settleNamelessDiag();
                     terminalKind = "incomplete";
                     terminalRaw = rawBuf;
+                    // #2904: a max-output truncation that left nothing visible is
+                    // degenerate too (budget spent on reasoning before any
+                    // prose/tool call). The completed branch already warns; the
+                    // incomplete one did not — that gap is why #2904's
+                    // reasoning-only length turns logged no degenerate signal.
+                    const incDetails = (obj.response as Record<string, unknown> | undefined)?.incomplete_details as Record<string, unknown> | undefined;
+                    maybeWarnDegenerate(typeof incDetails?.reason === "string" ? incDetails.reason : "incomplete");
                     yield { kind: "done", finishReason: "incomplete" } as ParsedStreamEvent;
                 } else if (type === "response.failed" || type === "response.error") {
                     yield* flushFilter();

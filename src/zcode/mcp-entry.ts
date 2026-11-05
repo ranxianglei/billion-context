@@ -33,53 +33,96 @@ const WATCHDOG_INTERVAL_MS = 30000;
 const WATCHDOG_FAILURE_LIMIT = 3;
 const HANDOFF_TIMEOUT_MS = 5000;
 
+export interface ZcodeWatchdogDeps {
+    readonly probe?: typeof probeProxyHealth;
+    readonly ensure?: (opts: Parameters<typeof ensureProxyRunning>[0]) => Promise<{ origin: string }>;
+    readonly route?: typeof routeZcodeConfig;
+    readonly activate?: typeof activateZcodePluginMode;
+    readonly repair?: (selfOrigin: string) => Promise<void>;
+    readonly intervalMs?: number;
+    readonly failureLimit?: number;
+}
+
+export interface ZcodeWatchdogState {
+    readonly origin: string;
+    readonly policy: ZcodeRoutePolicy;
+}
+
+export interface MutableZcodeWatchdogState extends ZcodeWatchdogState {
+    origin: string;
+    failures: number;
+}
+
+function buildEnsureOpts(): Parameters<typeof ensureProxyRunning>[0] {
+    // #1660: same zone semantics as
+    // zcode/native.ts defaultEnsureProxy — explicit
+    // BILI_ZCODE_PORT is strict; otherwise port 0 lets the
+    // launcher resolve the zone preference AND settle the
+    // actually-bound port sticky (#1660).
+    const explicit = resolveZcodeNativePort();
+    return { host: LAUNCHER_DEFAULT_HOST, port: explicit ?? 0, passthrough: false, debug: false, strictPort: explicit !== undefined, lane: "zcode" };
+}
+
+async function defaultEnsure(opts: Parameters<typeof ensureProxyRunning>[0]): Promise<{ origin: string }> {
+    const handle = await ensureProxyRunning(opts, { scriptPath: nativeProxyScriptPath() });
+    return { origin: handle.origin };
+}
+
+/** #1821: one watchdog tick. Healthy OR recovery-completed → counter reset.
+ *  Unhealthy × limit: an externally-owned attach posture (explicit user pin)
+ *  only waits — that proxy is not ours to respawn. Every other case
+ *  (self-spawned OR attached to a lane-owned instance at bootstrap) runs the
+ *  same ensureProxyRunning recovery the spawn path used, so a dead lane proxy
+ *  heals mid-session instead of stranding the session until the next session
+ *  boot. #3813: the counter cools ONLY after a completed recovery — a throwing
+ *  ensure (transient spawn/EADDRINUSE) leaves it hot so the next tick retries
+ *  immediately rather than re-accumulating to the limit (~90s). */
+export async function zcodeWatchdogTick(state: MutableZcodeWatchdogState, externallyOwned: boolean, deps: ZcodeWatchdogDeps, log: (msg: string) => void): Promise<void> {
+    const probe = deps.probe ?? probeProxyHealth;
+    const repair = deps.repair ?? ((selfOrigin: string) => repairSharedStoreDrift({ selfOrigin, log }));
+    if (await probe(state.origin)) {
+        state.failures = 0;
+    } else if (state.failures + 1 < (deps.failureLimit ?? WATCHDOG_FAILURE_LIMIT)) {
+        state.failures += 1;
+    } else {
+        if (externallyOwned) {
+            log(`attached proxy ${state.origin} unhealthy — user-owned attach posture, waiting for it to recover`);
+            state.failures = 0;
+        } else {
+            const ensure = deps.ensure ?? defaultEnsure;
+            const { origin } = await ensure(buildEnsureOpts());
+            if (origin !== state.origin) {
+                process.env.BILI_MCP_PROXY = origin;
+                const route = deps.route ?? routeZcodeConfig;
+                const routed = await route({ origin, log, policy: state.policy });
+                if (!routed) throw new Error("proxy respawned but the zcode config rewrite failed");
+                const activate = deps.activate ?? activateZcodePluginMode;
+                await activate(routed, { log });
+                state.origin = origin;
+                log(`proxy respawned at ${origin} — config re-routed`);
+            } else {
+                log(`proxy ${origin} recovered without a re-route`);
+            }
+            state.failures = 0;
+        }
+    }
+    await repair(state.origin);
+}
+
 function startWatchdog(
-    state: { origin: string; policy: ZcodeRoutePolicy },
-    attached: boolean,
+    state: MutableZcodeWatchdogState,
+    externallyOwned: boolean,
     log: (msg: string) => void,
+    deps: ZcodeWatchdogDeps = {},
 ): void {
-    let failures = 0;
     let busy = false;
     const timer = setInterval(() => {
         if (busy) return;
         busy = true;
-        void watchdogTick().catch((err) => log(`watchdog error: ${err instanceof Error ? err.message : String(err)}`))
+        void zcodeWatchdogTick(state, externallyOwned, deps, log)
+            .catch((err) => log(`watchdog error: ${err instanceof Error ? err.message : String(err)}`))
             .finally(() => { busy = false; });
-
-        async function watchdogTick(): Promise<void> {
-            if (await probeProxyHealth(state.origin)) {
-                failures = 0;
-            } else {
-                failures += 1;
-                if (failures >= WATCHDOG_FAILURE_LIMIT) {
-                    if (attached) {
-                        log(`attached proxy ${state.origin} unhealthy — waiting for it to recover`);
-                    } else {
-                        // #1660: same zone semantics as
-                        // zcode/native.ts defaultEnsureProxy — explicit
-                        // BILI_ZCODE_PORT is strict; otherwise port 0 lets the
-                        // launcher resolve the zone preference AND settle the
-                        // actually-bound port sticky (#1660).
-                        const explicit = resolveZcodeNativePort();
-                        const handle = await ensureProxyRunning(
-                            { host: LAUNCHER_DEFAULT_HOST, port: explicit ?? 0, passthrough: false, debug: false, strictPort: explicit !== undefined, lane: "zcode" },
-                            { scriptPath: nativeProxyScriptPath() },
-                        );
-                        if (handle.origin !== state.origin) {
-                            process.env.BILI_MCP_PROXY = handle.origin;
-                            const routed = await routeZcodeConfig({ origin: handle.origin, log, policy: state.policy });
-                            if (!routed) throw new Error("proxy respawned but the zcode config rewrite failed");
-                            await activateZcodePluginMode(routed, { log });
-                            state.origin = handle.origin;
-                            log(`proxy respawned at ${handle.origin} — config re-routed`);
-                        }
-                    }
-                    failures = 0;
-                }
-            }
-            await repairSharedStoreDrift({ selfOrigin: state.origin, log });
-        }
-    }, WATCHDOG_INTERVAL_MS);
+    }, deps.intervalMs ?? WATCHDOG_INTERVAL_MS);
     timer.unref?.();
 }
 
@@ -196,8 +239,8 @@ export async function main(): Promise<void> {
     await activateZcodePluginMode(applied, { log });
     // #1622: the watchdog respawn path must re-route with the SAME policy
     // (BILI_ZCODE_ROUTE / providers direct) — not the hardcoded default.
-    const state = { origin: applied.origin, policy: zcodePolicyFromEnv(process.env) };
-    startWatchdog(state, bootstrap.attached, log);
+    const state = { origin: applied.origin, policy: zcodePolicyFromEnv(process.env), failures: 0 };
+    startWatchdog(state, bootstrap.externallyOwned, log);
     installExitHandoff(state, log);
     runMcpStdio();
 }

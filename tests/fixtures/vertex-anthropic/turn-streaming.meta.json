@@ -1,0 +1,42 @@
+{
+  "kind": "captured",
+  "source": {
+    "client": "claude-cli/2.1.300 (external, sdk-cli)",
+    "capturedAt": "2026-10-15T20:18:32.819Z",
+    "capturedBy": "projects/billion-context-vertex-ai/tools/dumb-recorder.mjs (loopback listener, no validation)",
+    "howToRegenerate": "see projects/billion-context-vertex-ai/capture/FINDINGS.md \u00a77"
+  },
+  "request": {
+    "method": "POST",
+    "path": "/bili/anthropic/https://aiplatform.googleapis.com/v1/projects/aolshev-playground/locations/global/publishers/anthropic/models/claude-opus-5-5:streamRawPredict",
+    "headers": {
+      "accept": "application/json",
+      "authorization": "Bearer <redacted:253 chars>",
+      "content-type": "application/json",
+      "user-agent": "claude-cli/2.1.300 (external, sdk-cli)",
+      "anthropic-beta": "claude-code-20250219,interleaved-thinking-2025-05-14,web-search-2025-03-05,tool-search-tool-2025-10-19,effort-2025-11-24,dangerous-tool-use-2026-09-03,afk-mode-2026-01-31",
+      "anthropic-dangerous-direct-browser-access": "true",
+      "anthropic-version": "2023-06-01",
+      "x-app": "cli",
+      "x-claude-code-session-id": "9f7c3af9-2007-4b0d-8c0c-db84fb1c18b8",
+      "x-stainless-arch": "x64",
+      "x-stainless-lang": "js",
+      "x-stainless-os": "Linux",
+      "x-stainless-package-version": "0.128.0",
+      "x-stainless-retry-count": "0",
+      "x-stainless-runtime": "node",
+      "x-stainless-runtime-version": "v26.3.0",
+      "x-stainless-timeout": "600",
+      "connection": "keep-alive",
+      "host": "127.0.0.1:18791",
+      "accept-encoding": "gzip, deflate, br, zstd",
+      "content-length": "45101"
+    }
+  },
+  "body": {
+    "file": "turn-streaming.body.json",
+    "bytes": 45101,
+    "sha256": "cd5d133702f2c4648edbc613b06406ce8f5b5bc08221a8e94e85838cd7a2f8a5",
+    "note": "stored exactly as received; re-serializing the parsed body does not reproduce these bytes"
+  }
+}

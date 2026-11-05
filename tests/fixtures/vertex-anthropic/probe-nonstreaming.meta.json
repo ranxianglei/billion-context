@@ -1,0 +1,40 @@
+{
+  "kind": "captured",
+  "source": {
+    "client": "claude-cli/2.1.300 (external, sdk-cli)",
+    "capturedAt": "2026-10-15T20:18:32.668Z",
+    "capturedBy": "projects/billion-context-vertex-ai/tools/dumb-recorder.mjs (loopback listener, no validation)",
+    "howToRegenerate": "see projects/billion-context-vertex-ai/capture/FINDINGS.md \u00a77"
+  },
+  "request": {
+    "method": "POST",
+    "path": "/bili/anthropic/https://aiplatform.googleapis.com/v1/projects/aolshev-playground/locations/global/publishers/anthropic/models/claude-haiku-4-5@20251001:rawPredict",
+    "headers": {
+      "accept": "application/json",
+      "authorization": "Bearer <redacted:253 chars>",
+      "content-type": "application/json",
+      "user-agent": "claude-cli/2.1.300 (external, sdk-cli)",
+      "anthropic-version": "2023-06-01",
+      "x-app": "cli",
+      "x-claude-code-session-id": "9f7c3af9-2007-4b0d-8c0c-db84fb1c18b8",
+      "x-stainless-arch": "x64",
+      "x-stainless-lang": "js",
+      "x-stainless-os": "Linux",
+      "x-stainless-package-version": "0.128.0",
+      "x-stainless-retry-count": "0",
+      "x-stainless-runtime": "node",
+      "x-stainless-runtime-version": "v26.3.0",
+      "x-stainless-timeout": "8",
+      "connection": "keep-alive",
+      "host": "127.0.0.1:18791",
+      "accept-encoding": "gzip, deflate, br, zstd",
+      "content-length": "492"
+    }
+  },
+  "body": {
+    "file": "probe-nonstreaming.body.json",
+    "bytes": 492,
+    "sha256": "499293b20cc196749c22660d4f54d8afd326cb035c45527709254606d2248229",
+    "note": "stored exactly as received; re-serializing the parsed body does not reproduce these bytes"
+  }
+}

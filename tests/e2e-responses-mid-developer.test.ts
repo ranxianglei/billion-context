@@ -201,8 +201,10 @@ async function withHarness(handler: (raw: string, bodies: string[]) => string, f
         await fn(h);
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 }
@@ -378,7 +380,7 @@ test("#1999 non-stream JSON loop: mid developer marker re-voiced, leading develo
     }
 });
 
-test("#1999 non-stream JSON loop: client-origin mid system re-voiced, head prefix untouched", async () => {
+test("#4166 non-stream JSON loop: client-origin mid system rides verbatim (no re-voice, #1999 contract superseded)", async () => {
     const bodies: Record<string, unknown>[] = [];
     const previousFetch = globalThis.fetch;
     globalThis.fetch = (async (_u: unknown, init?: RequestInit) => {
@@ -400,10 +402,14 @@ test("#1999 non-stream JSON loop: client-origin mid system re-voiced, head prefi
         const input = bodies[0]!.input as Array<{ type: string; role?: string; content?: unknown }>;
         assert.equal(input[0]?.role, "developer", "leading developer head must stay developer");
         assert.equal(input[1]?.role, "system", "system inside the leading prefix must stay system (head-class, index 1)");
-        assert.equal(input[3]?.role, "user", `mid system must be re-voiced to user, got "${input[3]?.role}"`);
-        assert.ok(JSON.stringify(input[3]?.content).includes("OMP-style"), "content preserved verbatim through the re-voicing");
-        const bad = findMidSysDev(JSON.stringify(bodies[0]));
-        assert.equal(bad, null, `strict-backend invariant violated: role "${bad?.role}" at index ${bad?.index}`);
+        // #4166: a client-origin mid system message is DATA — it rides the
+        // re-request verbatim (same role, same position, same bytes). Only
+        // bili's own carriers are re-voiced; silently re-voicing client
+        // system messages is exactly the #1999/#4159 class of corruption
+        // (strict backends reject the shape the CLIENT chose to send — that
+        // rejection is honest forwarding, not something bili may mask).
+        assert.equal(input[3]?.role, "system", `client mid system must ride verbatim, got "${input[3]?.role}"`);
+        assert.ok(JSON.stringify(input[3]?.content).includes("OMP-style"), "content preserved verbatim");
     } finally {
         globalThis.fetch = previousFetch;
     }

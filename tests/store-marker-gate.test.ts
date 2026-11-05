@@ -78,8 +78,10 @@ async function startHarness(marker: boolean): Promise<Harness> {
         captured,
         close: async () => {
             proxy.close();
+            proxy.closeIdleConnections?.();
             await once(proxy, "close");
             upstream.close();
+            upstream.closeIdleConnections?.();
             await once(upstream, "close");
         },
     };

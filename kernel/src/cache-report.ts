@@ -63,6 +63,17 @@ export interface PriceProfile {
   q?: number;
 }
 
+/** #2929: a fold claims not only its first following sample but the whole
+ *  post-fold COLD TAIL — until a warm line proves the provider re-cached or
+ *  this many samples have elapsed (#1847 switch discipline, mirrored for
+ *  folds). Rationale: the first post-fold request (the proxy's re-request)
+ *  is attributed today, but the client-echo re-bill 25–66s later carried no
+ *  fold stamp and fell into the unattributed TTL residual, tripping the
+ *  cache-seam detector with "no fold attribution". Warm hit that retires
+ *  the window (same threshold as the host's WARM_HIT_PCT). */
+export const FOLD_CLAIM_WARM_HIT_PCT = 85;
+export const FOLD_CLAIM_COLD_ROUNDS = 4;
+
 export interface SampleDecomposition {
   missed: number;
   newContent: number;
@@ -331,24 +342,49 @@ export function buildCacheReport(
 
   type Dec = SampleDecomposition & { foldSeq: number | null };
   const decs: Dec[] = [];
+  // #2929: per-fold cold-tail claim state. A fold claims its FIRST following
+  // sample unconditionally (the materialization re-bill), then keeps claiming
+  // subsequent cold samples until a warm line (>= FOLD_CLAIM_WARM_HIT_PCT)
+  // proves re-cache or it has claimed FOLD_CLAIM_COLD_ROUNDS samples. A warm
+  // sample is never claimed as a continuation (it proves the damage is over).
+  const foldClaims: number[] = folds.map(() => 0);
+  const foldRetired: boolean[] = folds.map(() => false);
   for (let i = 0; i < samples.length; i++) {
     const s = samples[i]!;
     const prev = i > 0 ? samples[i - 1]! : null;
-    const prevAt = prev ? prev.at : Number.NEGATIVE_INFINITY;
+    const warm = s.input > 0 && hitPct(s.input, s.cached) >= FOLD_CLAIM_WARM_HIT_PCT;
     const pending: FoldEvent[] = [];
+    const pendingIdx: number[] = [];
     let pendingBase = 0;
     for (let j = 0; j < folds.length; j++) {
       const fj = folds[j]!;
-      if (fj.at <= prevAt) continue;
       if (fj.at > s.at) break;
-      if (pending.length === 0) pendingBase = j;
-      pending.push(fj);
+      if (foldRetired[j]) continue;
+      // First claim is unconditional; a warm continuation proves re-cache and
+      // is not the fold's damage anymore.
+      if (foldClaims[j] === 0 || !warm) {
+        if (pending.length === 0) pendingBase = j;
+        pending.push(fj);
+        pendingIdx.push(j);
+      }
     }
     const d = decomposeSample(prev, s, pending);
     decs.push({
       ...d,
       foldSeq: d.foldIndex !== null ? pendingBase + d.foldIndex + 1 : null,
     });
+    for (const j of pendingIdx) {
+      foldClaims[j] = foldClaims[j]! + 1;
+      if (foldClaims[j]! >= FOLD_CLAIM_COLD_ROUNDS) foldRetired[j] = true;
+    }
+    // A warm line retires EVERY open window — claimed or not this sample
+    // (#1847 discipline: it proves the provider re-cached, so a later cold
+    // blip is a new, unrelated event and must not be swallowed).
+    if (warm) {
+      for (let j = 0; j < folds.length; j++) {
+        if (folds[j]!.at <= s.at) foldRetired[j] = true;
+      }
+    }
   }
 
   const totals: CacheTotals = {

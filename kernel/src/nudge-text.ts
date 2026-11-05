@@ -10,6 +10,12 @@ import { defaultPrompts } from "./prompts.js";
 import type { Prompts } from "./prompts.js";
 import { orderedRefPair } from "./refs.js";
 
+/**
+ * Wire protocol of the lane this nudge is rendered for. `undefined` means the
+ * caller did not declare one; the text then stays protocol-neutral.
+ */
+export type NudgeProtocol = "anthropic" | "openai" | "responses" | "google";
+
 export type NudgeVoice = "gentle" | "emergency";
 
 export interface NudgePromptSections {
@@ -114,6 +120,7 @@ export function formatRanges(
     toolPct: number;
     textPct: number;
     dangerous: boolean;
+    noMergeBefore: boolean;
   }
   const refNum = (ref: string): number => {
     const m = ref.match(/\d+/);
@@ -139,6 +146,7 @@ export function formatRanges(
       protectedCount: 0,
       protectedTools: [],
       dangerous: r.dangerous ?? false,
+      noMergeBefore: r.noMergeBefore ?? false,
     });
   }
   for (const r of protectedRanges) {
@@ -160,6 +168,7 @@ export function formatRanges(
       protectedCount: r.count,
       protectedTools: [...r.tools],
       dangerous: false,
+      noMergeBefore: r.noMergeBefore ?? false,
     });
   }
   // Order/merge by POSITION, never ref number: refs can be non-monotonic vs array
@@ -170,7 +179,9 @@ export function formatRanges(
   const merged: Merged[] = [];
   for (const e of entries) {
     const last = merged[merged.length - 1];
-    if (last && e.startPos <= last.endPos + 1) {
+    // #3192/#3205: a dead-hole boundary has no index gap, so position adjacency
+    // alone would bridge across it — honor the flag set by buildCompressibleRanges.
+    if (last && !e.noMergeBefore && e.startPos <= last.endPos + 1) {
       last.endRef = e.endRef;
       last.endNum = Math.max(last.endNum, e.endNum);
       last.endPos = Math.max(last.endPos, e.endPos);
@@ -243,12 +254,27 @@ function compact(parts: string[]): string[] {
  *  onto query-only surfaces (acp_status). So the reminder is now ONE static
  *  line — never expanded, never range-aware, identical for every nudge. */
 export const ONE_CALL_HINT =
-  "ONE call, ONE string — fold every range you keep into a single compress call: content entries ({startId, endId, summary, topic?}) or one plain string holding one block per range ('m00150–m00220 topic' header line, then the summary). Ranges you still need can wait — they reappear in later nudges; never split the batch across separate calls.";
+  "ONE call, ONE string — fold every range you keep into a single compress call: one JSON-escaped string holding one block per range ('m00150–m00220 topic' header line, then the summary). Ranges you still need can wait — they reappear in later nudges; never split the batch across separate calls.";
+
+/**
+ * Extra guidance appended to the nudge when the lane speaks the Anthropic
+ * Messages protocol.
+ *
+ * Anthropic-shaped lanes (top-level `system`, `thinking` blocks, `tool_use`
+ * blocks) prime the model for the Claude-Code compaction envelope — it tends
+ * to write `<analysis>...</analysis><summary>...</summary>` as its reply text
+ * instead of putting the summary in the `compress` tool's `content` argument.
+ * A reply with no tool call ends the turn, so the session stalls until the
+ * user types "continue". This line names the failure and the required shape.
+ */
+const ANTHROPIC_LANE_NOTE =
+  "Write the summary ONLY as the `compress` tool's `content` argument. Never emit `<analysis>` or `<summary>` tags in your reply text — they are not parsed, and a reply without a tool call ends the turn.";
 
 export function renderNudgeText(
   decision: NudgeDecision,
   prompts: Prompts = defaultPrompts,
   sections: NudgePromptSections = {},
+  protocol?: NudgeProtocol,
 ): RenderedNudge {
   const breakdownStr = formatBreakdown(decision.contextBreakdown);
   const rangesStr = formatRanges(
@@ -256,6 +282,7 @@ export function renderNudgeText(
     decision.protectedRanges ?? [],
   );
   const blockMapStr = formatBlockMap(decision.activeBlockSpans ?? []);
+  const laneNote = protocol === "anthropic" ? ANTHROPIC_LANE_NOTE : null;
   const isEmergency =
     !!decision.breakdown?.emergencyOverride || !!decision.breakdown?.overLimit;
 
@@ -281,11 +308,12 @@ export function renderNudgeText(
         triggerLine,
         ...(guidance === null ? [] : [guidance]),
         blockList,
-        `Example: compress({ content: [{ startId: "${startId}", endId: "${endId}", summary: "..." }] })`,
+        `Example: compress({ content: "${startId}–${endId} optional topic\\nsummary markdown..." })`,
         "",
         prompts.howToCompressRules,
         "",
         isT2 ? prompts.tier2DistillRules : prompts.tier3CondenseRules,
+        ...(laneNote === null ? [] : ["", laneNote]),
       ]).join("\n"),
     };
   }
@@ -307,6 +335,7 @@ export function renderNudgeText(
         ...(blockMapStr ? ["", blockMapStr] : []),
         "",
         ONE_CALL_HINT,
+        ...(laneNote === null ? [] : ["", laneNote]),
       ]).join("\n"),
     };
   }
@@ -324,7 +353,8 @@ export function renderNudgeText(
       rangesStr,
       ...(blockMapStr ? ["", blockMapStr] : []),
       "",
-      `💡 If you compress, fold the ranges you keep in ONE call — pass multiple content entries (\`content: [{...}, {...}]\`) or ONE plain string holding every range, each block starting with its 'mNNNNN–mNNNNN topic' header line (most robust through lossy gateways). Ranges the task still needs can wait — they reappear in later nudges.`,
+      `💡 If you compress, fold the ranges you keep in ONE call — ONE plain string holding every range, each block starting with its 'mNNNNN–mNNNNN topic' header line (a valid JSON string: \\" and \\n). Ranges the task still needs can wait — they reappear in later nudges.`,
+      ...(laneNote === null ? [] : ["", laneNote]),
     ]).join("\n"),
   };
 }

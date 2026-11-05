@@ -1,28 +1,31 @@
 import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { configFile } from "../paths.js";
+import { configDir, configFile } from "../paths.js";
+import { defaultPrompts, isValidPackName, sanitizePackSurface, type PromptPackFile } from "acp-kernel";
+import { resolveCompressSurfaceDetailed } from "../compress-settings.js";
 import {
-    allowDshCompactionState,
     collectNamedProviders,
+    isUrlLikeKey,
     loadNamedProviders,
-    normalizeLegacyAllowDshCompaction,
+    parseBiliConfig,
+    parseCacheKeepaliveSettings,
     parseCompressSettings,
     parseNamedProviderRecipe,
     parseRouteEntry,
     parseUpstreamProxyMode,
     passthroughState,
     rejectLegacyRoute,
-    safeReadJson,
-    type DshFileSettings,
     type UpstreamProxyMode,
 } from "../config.js";
 import { log } from "../logger.js";
 import { validateHttpProxy } from "../upstream-proxy.js";
-import { SummaryCredentialStore } from "../external-summary-credentials.js";
+import { SummaryCredentialStore, type SummaryCredentialState } from "../external-summary-credentials.js";
 import { parseExternalSummaryChain, expandExternalSummaryChain } from "../external-summary-settings.js";
 import { agentProviderRecipes, agentRegistryStatus } from "../agent-providers.js";
+import { billingOverrides, parseBillingSettings, resolveBillingPrice, type BillingPrice } from "../billing.js";
+import { buildOverview } from "./sessions-data.js";
 
 type ConfigShape = Record<string, unknown> & {
     providers?: Record<string, unknown>;
@@ -30,20 +33,33 @@ type ConfigShape = Record<string, unknown> & {
     upstreamProxyMode?: string;
 };
 
-function readConfig(): ConfigShape {
-    const parsed = safeReadJson(configFile());
-    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as ConfigShape : {};
+// #3572: parse bili's own config file through the SAME tolerant parser the runtime
+// loader uses (loadConfigFile → parseBiliConfig), else a JSONC config that works at
+// runtime would show "not valid JSON" here and block every PUT. A genuinely malformed
+// file still throws — that is what keeps the PUT-block guard in configParseError honest.
+function readConfigRaw(): { value: unknown; error: string | null } {
+    if (!existsSync(configFile())) return { value: undefined, error: null };
+    let raw: string;
+    try { raw = readFileSync(configFile(), "utf8").replace(/^\uFEFF/, ""); }
+    catch { return { value: undefined, error: null }; }
+    try { return { value: parseBiliConfig(raw), error: null }; }
+    catch (e) { return { value: undefined, error: String(e) }; }
 }
 
-/** The config file exists on disk but does not parse as JSON (hand-edited
- *  comment, trailing comma, …). Distinct from "missing": a broken file must
- *  never be silently rebuilt from {} by a PUT — that would wipe every field
- *  the loader could not read. */
+function readConfig(): ConfigShape {
+    const { value } = readConfigRaw();
+    return value && typeof value === "object" && !Array.isArray(value) ? value as ConfigShape : {};
+}
+
+/** The config file exists on disk but does not parse as JSON/JSONC (genuinely broken
+ *  syntax, not just comments/trailing commas which are valid JSONC per #3572). Distinct
+ *  from "missing": a broken file must never be silently rebuilt from {} by a PUT — that
+ *  would wipe every field the loader could not read. Only real syntax errors block it. */
 function configParseError(): string | null {
     if (!existsSync(configFile())) return null;
-    const parsed = safeReadJson(configFile());
-    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return null;
-    return `config file is not valid JSON: ${configFile()}`;
+    const { value, error } = readConfigRaw();
+    if (value && typeof value === "object" && !Array.isArray(value)) return null;
+    return `config file is not valid JSON: ${configFile()}${error ? ` (${error})` : ""}`;
 }
 
 /** Raw inline `providers` block exactly as written in the config file. The
@@ -86,11 +102,111 @@ function atomicWriteConfig(config: ConfigShape): void {
     }
 }
 
+// ---------------------------------------------------------------------------
+// #5328: user-dir prompt-pack management. These are the ONLY routes that
+// write under <configDir>/packs/ — the web editor's 新建/编辑/删除 buttons hit
+// them so users never have to touch a terminal or file path. Builtin and
+// shipped packs are read-only by construction (they live in code, not files);
+// the client shows "override with a same-named file" guidance for them.
+// Names arrive pre-shaped by the /__bili/ route regex; re-validate here so
+// the handlers stay safe for any future caller.
+
+function userPackFile(name: string): string {
+    return join(configDir(), "packs", `${name}.json`);
+}
+
+export function packSurfaceHasContent(surface: ReturnType<typeof sanitizePackSurface>): boolean {
+    return Object.entries(surface).some(([, value]) =>
+        value !== undefined &&
+        (typeof value !== "object" || value === null ? true : Object.keys(value).length > 0));
+}
+
+export async function handleUserPackGet(res: ServerResponse, name: string): Promise<void> {
+    if (!isValidPackName(name)) return sendError(res, 400, `invalid pack name: ${name}`);
+    const file = userPackFile(name);
+    if (!existsSync(file)) return sendError(res, 404, `no user pack named "${name}"`);
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ name, path: file, json: readFileSync(file, "utf8") }));
+}
+
+export async function handleUserPackPut(req: IncomingMessage, res: ServerResponse, name: string): Promise<void> {
+    if (!isValidPackName(name)) return sendError(res, 400, `invalid pack name: ${name}`);
+    const raw = await readJsonBody(req);
+    if (!raw || typeof raw !== "object" || Array.isArray(raw) || typeof (raw as Record<string, unknown>).json !== "string")
+        return sendError(res, 400, 'expected { "json": "<pack JSON text>" }');
+    let parsed: unknown;
+    try { parsed = JSON.parse((raw as Record<string, unknown>).json as string); }
+    catch (error) { return sendError(res, 400, `pack json is not valid JSON: ${String(error)}`); }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
+        return sendError(res, 400, "pack top level must be a JSON object");
+    // Sanitize exactly like dir-pack loading (createDirPackSource): nonsense
+    // values are dropped at save time instead of biting at resolution time,
+    // and a pack that resolves to an empty surface is refused rather than
+    // silently written.
+    if (!packSurfaceHasContent(sanitizePackSurface(parsed as PromptPackFile)))
+        return sendError(res, 400, "no recognized pack fields (promptSections / prompts / nudgeSections / toolPrompts / adapters)");
+    const file = userPackFile(name);
+    mkdirSync(dirname(file), { recursive: true });
+    const tempPath = `${file}.${process.pid}.${randomUUID()}.tmp`;
+    let descriptor: number | undefined;
+    try {
+        descriptor = openSync(tempPath, "wx", 0o644);
+        writeFileSync(descriptor, JSON.stringify(parsed, null, 2) + "\n", "utf8");
+        fsyncSync(descriptor);
+        closeSync(descriptor);
+        descriptor = undefined;
+        renameSync(tempPath, file);
+    } catch (error) {
+        if (descriptor !== undefined) closeSync(descriptor);
+        try { unlinkSync(tempPath); } catch { }
+        return sendError(res, 500, `failed to write user pack: ${String(error)}`);
+    }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ ok: true, path: file }));
+}
+
+export async function handleUserPackDelete(res: ServerResponse, name: string): Promise<void> {
+    if (!isValidPackName(name)) return sendError(res, 400, `invalid pack name: ${name}`);
+    const file = userPackFile(name);
+    if (!existsSync(file)) return sendError(res, 404, `no user pack named "${name}"`);
+    unlinkSync(file);
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ ok: true }));
+}
+
+// #5344: base texts for the guided pack editor (form tab). Mirrors the
+// tri-state resolution buildCompressSystemPrompt performs: absent key ->
+// kernel default text; null -> removed (empty); string -> verbatim.
+const PACK_TEMPLATE_NAMES = ["default", "chat", "lean"] as const;
+type PackTemplate = { description?: string; philosophy: string; howToCompress: string };
+
+function packTemplateFor(name: string): PackTemplate {
+    const resolution = resolveCompressSurfaceDetailed({ promptPack: name });
+    const sections = resolution.surface.promptSections ?? {};
+    const pick = (key: "philosophy" | "howToCompress"): string => {
+        const override = sections[key];
+        if (override === null) return "";
+        if (typeof override === "string") return override;
+        return key === "philosophy" ? defaultPrompts.compressPhilosophy : defaultPrompts.howToCompressRules;
+    };
+    return { philosophy: pick("philosophy"), howToCompress: pick("howToCompress") };
+}
+
+export async function handlePackTemplatesGet(res: ServerResponse): Promise<void> {
+    const packs: Record<string, PackTemplate> = {};
+    for (const name of PACK_TEMPLATE_NAMES) packs[name] = packTemplateFor(name);
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ packs }));
+}
+
 export async function handleConfigGet(res: ServerResponse): Promise<void> {
     const upstream = readUpstreamSettings();
     const config = readConfig();
     const rawCompress = config.compress && typeof config.compress === "object" ? config.compress as Record<string, unknown> : undefined;
     const credentialStatus: Record<string, boolean> = {};
+    // #3488: additive five-state view (missing vs invalid value vs unreadable
+    // store) alongside the legacy boolean record scripts already consume.
+    const credentialDetail: Record<string, SummaryCredentialState> = {};
     let hideInvalidSummary = false;
     // Disabled chains skip strict target validation (an inert chain must not
     // brick the config view), so surface credential status from the raw
@@ -112,7 +228,11 @@ export async function handleConfigGet(res: ServerResponse): Promise<void> {
                 ? Object.values(loadNamedProviders()).flatMap((recipe) => recipe.credentialRef !== undefined ? [`secret:${recipe.credentialRef}`] : recipe.apiKeyEnv !== undefined ? [`env:${recipe.apiKeyEnv}`] : [])
                 : rawCredentialRefs(rawCompress.externalSummary);
             const store = new SummaryCredentialStore();
-            for (const ref of refs) credentialStatus[ref] = store.configured(ref);
+            for (const ref of refs) {
+                const state = store.status(ref);
+                credentialStatus[ref] = state === "configured";
+                credentialDetail[ref] = state;
+            }
         } catch {
             // A manually edited invalid block can contain inline credentials.
             // Never echo that block through either structured or raw config GET.
@@ -130,9 +250,9 @@ export async function handleConfigGet(res: ServerResponse): Promise<void> {
         upstreamProxyMode: upstream.mode,
         compress: config.compress ?? null,
         externalSummaryCredentials: credentialStatus,
+        externalSummaryCredentialStatus: credentialDetail,
         agentProviders: agentRegistryStatus(),
         passthrough: passthroughState(process.env),
-        allowDshCompaction: allowDshCompactionState(process.env),
         ...(existsSync(configFile()) ? { raw: hideInvalidSummary ? JSON.stringify(config, null, 2) : readFileSync(configFile(), "utf8") } : {}),
         ...(parseError ? { parseError } : {}),
     }, null, 2));
@@ -173,8 +293,9 @@ export async function handleConfigPut(
     const hasCompress = Object.prototype.hasOwnProperty.call(body, "compress");
     const hasPassthrough = Object.prototype.hasOwnProperty.call(body, "passthrough");
     const hasDsh = Object.prototype.hasOwnProperty.call(body, "dsh");
+    const hasBilling = Object.prototype.hasOwnProperty.call(body, "billing");
     const hasFile = Object.prototype.hasOwnProperty.call(body, "file");
-    if (!hasProviders && !hasProxy && !hasMode && !hasCompress && !hasPassthrough && !hasDsh && !hasFile) return sendError(res, 400, "expected providers, upstream proxy, compress, passthrough, dsh compaction settings, or the full config file");
+    if (!hasProviders && !hasProxy && !hasMode && !hasCompress && !hasPassthrough && !hasDsh && !hasBilling && !hasFile) return sendError(res, 400, "expected providers, upstream proxy, compress, billing, passthrough, or the full config file");
     // Raw whole-file save (web config card): validate the known fields exactly like the
     // structured payload, then replace the ENTIRE config — preserving unknown keys such
     // as promptPack/ccr that per-field PUTs cannot touch.
@@ -182,11 +303,12 @@ export async function handleConfigPut(
         if (typeof body.file !== "string") return sendError(res, 400, "file must be a string (raw config JSON text)");
         let next: ConfigShape;
         try {
-            const p = JSON.parse(body.file);
+            const p = parseBiliConfig(body.file);
             if (!p || typeof p !== "object" || Array.isArray(p)) throw new Error("top level must be a JSON object");
-            const rec = p as Record<string, unknown>;
-            normalizeLegacyAllowDshCompaction(rec);
-            next = rec as ConfigShape;
+            // #3666: legacy dsh.* / top-level allowDshCompaction keys are no
+            // longer relocated — whole-file saves preserve them verbatim (the
+            // load path warns once that they are ignored).
+            next = p as ConfigShape;
         } catch (error) {
             return sendError(res, 400, `file is not valid JSON: ${String(error)}`);
         }
@@ -200,8 +322,10 @@ export async function handleConfigPut(
                 if (!url || !route) return sendError(res, 400, `invalid provider entry: ${url || "(empty)"}`);
                 // Named entries may carry a dialing recipe (baseUrl/api/...) —
                 // validate its shape at save time too, so the chain
-                // references below can only fail on dangling names.
-                if (!/^https?:\/\//.test(url)) {
+                // references below can only fail on dangling names. Classify
+                // URL lanes via the runtime's isUrlLikeKey (incl. mitm://), not
+                // an https-only regex, or documented lanes mis-fail (#5620).
+                if (!isUrlLikeKey(url)) {
                     try { parseNamedProviderRecipe(value); } catch (error) {
                         return sendError(res, 400, `invalid recipe on named provider "${url}": ${String(error)}`);
                     }
@@ -215,6 +339,9 @@ export async function handleConfigPut(
         }
         if (next.upstreamProxyMode !== undefined && (typeof next.upstreamProxyMode !== "string" || !["auto", "manual", "direct"].includes(next.upstreamProxyMode))) return sendError(res, 400, "upstreamProxyMode must be auto, manual, or direct");
         if (next.compress !== undefined && next.compress !== null && parseCompressSettings(next.compress) === undefined) return sendError(res, 400, "invalid compress settings");
+        // #4899: same loud validation for the billing block in whole-file saves.
+        if (next.billing !== undefined && next.billing !== null && parseBillingSettings(next.billing) === undefined) return sendError(res, 400, 'invalid billing settings (expected { prices: { "<model>": { input, output?, cacheRead?, cacheWrite? } } }, prices in $/Mtok)');
+        if (next.cacheKeepalive !== undefined && next.cacheKeepalive !== null && parseCacheKeepaliveSettings(next.cacheKeepalive) === undefined) return sendError(res, 400, "invalid cacheKeepalive settings");
         // The chain references named recipes — validate the expansion against
         // the providers table BEING SAVED (not the on-disk one), so a save
         // cannot strand the config on a dangling reference. Only enabled
@@ -237,12 +364,9 @@ export async function handleConfigPut(
         }
         if (next.passthrough !== undefined && next.passthrough !== null && typeof next.passthrough !== "boolean") return sendError(res, 400, "passthrough must be a boolean or null");
         if (next.passthrough === true && passthroughState(process.env).source === "env") return sendError(res, 409, "passthrough is forced by the ACP_PASSTHROUGH environment variable (or --passthrough flag); unset it and restart to change here");
-        const fileDshFlag = ((next.dsh ?? {}) as Partial<DshFileSettings>).allowDshCompaction;
-        if (fileDshFlag !== undefined && fileDshFlag !== null && typeof fileDshFlag !== "boolean") return sendError(res, 400, "dsh.allowDshCompaction must be a boolean");
-        if (fileDshFlag === true || fileDshFlag === false) {
-            const dshForced = allowDshCompactionState(process.env);
-            if (dshForced.source === "env" && fileDshFlag !== dshForced.enabled) return sendError(res, 409, "dsh.allowDshCompaction is forced by the BILI_ALLOW_DSH_COMPACTION environment variable; unset it and restart to change here");
-        }
+        // #3666: dsh.* settings were removed — whole-file saves preserve any
+        // leftover dsh keys verbatim (the load path warns once that they are
+        // ignored), so there is nothing to validate or reconcile here.
         try {
             atomicWriteConfig(next);
             onChanged?.();
@@ -319,6 +443,14 @@ export async function handleConfigPut(
         }
     }
 
+    // #4899: billing prices — the pricing editor's structured save. An empty
+    // prices map deletes the block (registry defaults take over again).
+    let billing: ReturnType<typeof parseBillingSettings>;
+    if (hasBilling) {
+        billing = body.billing === null ? undefined : parseBillingSettings(body.billing);
+        if (billing === undefined && body.billing !== null) return sendError(res, 400, 'invalid billing settings (expected { prices: { "<model>": { input, output?, cacheRead?, cacheWrite? } } }, prices in $/Mtok)');
+    }
+
     // #405: the panel must be able to READ and CLEAR passthrough. An env
     // ACP_PASSTHROUGH (or --passthrough flag, which lands in env) outranks
     // the file on every reload — a file write would be a silent no-op, so
@@ -332,21 +464,11 @@ export async function handleConfigPut(
         }
     }
 
-    // #2028: same read/clear contract as passthrough (#405) — an env
-    // BILI_ALLOW_DSH_COMPACTION outranks the file on every reload, so a
-    // contradicting file write would be a silent no-op: refuse with the exact
-    // way out instead. A matching write or a clear (null) stays allowed.
+    // #3666: dsh.* settings were removed — the wire guard now refuses dsh
+    // native compaction unconditionally, so any dsh write is rejected loudly
+    // instead of silently ignored (loud-reject rule for user config).
     if (hasDsh) {
-        const dshBody = (body.dsh ?? {}) as Partial<DshFileSettings>;
-        if (dshBody.allowDshCompaction !== null && dshBody.allowDshCompaction !== undefined && typeof dshBody.allowDshCompaction !== "boolean") {
-            return sendError(res, 400, "dsh.allowDshCompaction must be a boolean or null");
-        }
-        if (dshBody.allowDshCompaction === true || dshBody.allowDshCompaction === false) {
-            const dshState = allowDshCompactionState(process.env);
-            if (dshState.source === "env" && dshBody.allowDshCompaction !== dshState.enabled) {
-                return sendError(res, 409, "dsh.allowDshCompaction is forced by the BILI_ALLOW_DSH_COMPACTION environment variable; unset it and restart to change here");
-            }
-        }
+        return sendError(res, 400, "dsh.* settings were removed (#3651): dsh native compaction is refused unconditionally — delete the key(s) from your config");
     }
 
     const config = readConfig();
@@ -364,15 +486,9 @@ export async function handleConfigPut(
         if (body.passthrough === true) config.passthrough = true;
         else delete config.passthrough;
     }
-    if (hasDsh) {
-        const curDsh = (config.dsh ?? undefined) as Partial<DshFileSettings> | undefined;
-        if (((body.dsh ?? {}) as Partial<DshFileSettings>).allowDshCompaction === true) {
-            config.dsh = { ...curDsh, allowDshCompaction: true };
-        } else if (curDsh) {
-            const rest: Partial<DshFileSettings> = { ...curDsh };
-            delete rest.allowDshCompaction;
-            config.dsh = Object.keys(rest).length > 0 ? rest : undefined;
-        }
+    if (hasBilling) {
+        if (billing && Object.keys(billing.prices).length > 0) config.billing = billing;
+        else delete config.billing;
     }
     try {
         atomicWriteConfig(config);
@@ -384,8 +500,8 @@ export async function handleConfigPut(
     if (hasProviders) changed.push(`${Object.keys(rawProviders ?? {}).length} routes`);
     if (hasProxy || hasMode) changed.push("network");
     if (hasCompress) changed.push("compress");
+    if (hasBilling) changed.push("billing");
     if (hasPassthrough) changed.push("passthrough");
-    if (hasDsh) changed.push("dsh compaction");
     log("info", `[acp-web] configuration updated (${changed.join(", ") || "none"})`);
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ ok: true, providers: hasProviders && rawProviders ? Object.keys(rawProviders).length : undefined }));
@@ -394,6 +510,38 @@ export async function handleConfigPut(
 function sendError(res: ServerResponse, status: number, message: string): void {
     res.writeHead(status, { "content-type": "application/json" });
     res.end(JSON.stringify({ error: message }));
+}
+
+/** #4899: the pricing editor's data source — every model the panel has seen
+ *  (recent sessions), each resolved against user overrides first, then the
+ *  models.dev registry snapshot. `price: null` means unpriced: the UI shows
+ *  tokens only and offers manual entry, never fabricated dollars. */
+export async function handlePricingGet(res: ServerResponse): Promise<void> {
+    const recent = await buildOverview();
+    const seen = new Map<string, string | undefined>();
+    for (const s of recent.recent) {
+        if (!s.model) continue;
+        let host: string | undefined;
+        if (s.upstreamOrigin) {
+            try { host = new URL(s.upstreamOrigin).host; } catch { host = undefined; }
+        }
+        if (!seen.has(s.model)) seen.set(s.model, host);
+    }
+    // Override keys that no recent session uses stay editable/listed so a
+    // user can inspect and remove them without running the model first.
+    const overrides = billingOverrides();
+    for (const key of Object.keys(overrides)) if (!seen.has(key)) seen.set(key, undefined);
+    const models = [...seen.entries()].map(([model, host]) => {
+        const price = resolveBillingPrice(model, host);
+        return {
+            model,
+            ...(host ? { host } : {}),
+            ...(price ? { price } : { price: null }),
+            ...(overrides[model] ? { override: overrides[model] as BillingPrice } : {}),
+        };
+    });
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ path: configFile(), overrides, models }, null, 2));
 }
 
 function readJsonBody(req: IncomingMessage): Promise<unknown> {

@@ -7,6 +7,9 @@ import { mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 process.env.NODE_ENV = "test";
+// #4004/#4242: envelope-corruption rejection is the legacy-layer guard; pin
+// it so the unified index cannot mask the tampered envelope.
+process.env.BILI_STORAGE_UNIFIED = "legacy";
 
 import { createInitialState, defaultConfig } from "acp-kernel";
 import { startServer } from "../src/server.ts";
@@ -312,19 +315,21 @@ test("e2e: restart restores k̂ + usage anchor — the over-raw resend forwards 
         s.stats.lastInputTokensSource = "estimate";
         s.metadata.anonymousPrefixAffinity = { depth: 22, tailHash: "i2129-test-tail", via: "prefix" };
 
-        // Simulated restart: snapshot the terminal state to disk (what the
-        // debounced persist would eventually have captured), wipe memory, swap
-        // in a fresh store — the next request hits the buildSession() reload path.
+        // Simulated restart: snapshot the terminal state, then QUIESCE the old
+        // store (drain in-flight writes + cancel leftover debounces) and swap in
+        // the reload store BEFORE reading — a real restart stops the old process
+        // writing, so reading while it can still save races it under CI load.
         await store.writeNow(s);
         await store.flushAll([]);
+        store.cancelAll();
+        _resetSessionsForTest();
+        store2 = new SessionStore({ dir, debounceMs: 5, enabled: true });
+        _setStoreForTest(store2);
         const env = JSON.parse(readFileSync(findRecordFile(dir), "utf8")) as { payload: { stats?: StatsBlob; metadata?: StatsBlob } };
         assert.equal(env.payload.stats?.calibratedEstimate, preRestart.k, "k̂ must be on disk after restart");
         assert.equal(env.payload.stats?.lastUsageGradeTokens, preRestart.anchor, "usage anchor must be on disk after restart");
         assert.equal(env.payload.stats?.localInputEstimate, preRestart.est, "per-turn estimate must be on disk after restart");
         assert.ok(env.payload.metadata?.anonymousPrefixAffinity, "PFA stamp must be on disk after restart");
-        _resetSessionsForTest();
-        store2 = new SessionStore({ dir, debounceMs: 5, enabled: true });
-        _setStoreForTest(store2);
 
         // Phase 3 — READY resend: the raw local estimate crosses the target
         // while the calibrated one stays under. Pre-fix the dropped k̂ fired
@@ -348,8 +353,10 @@ test("e2e: restart restores k̂ + usage anchor — the over-raw resend forwards 
         assert.equal(calls.filter((c) => c.stream).length, 4, "all four requests were forwarded as-is");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
         store.cancelAll();
         store2?.cancelAll();

@@ -1,5 +1,6 @@
 import type { CoreMessage } from "acp-kernel";
 import { coreToResponses, patchResponsesInput, responsesToCore, type BiliMessage, type ResponseContentPart, type ResponseInputItem, type ResponsesProjection, type ResponsesRequestBody } from "acp-kernel/wire";
+import { isRenderedSummaryMessage } from "acp-kernel";
 import { systemToUser } from "./util.js";
 
 export function responsesToolImageParts(item: unknown): ResponseContentPart[] | undefined {
@@ -91,7 +92,7 @@ export function mergeAdjacentConfigurationUpdates(items: readonly ResponseInputI
 // compressed block's summary as role:"system" anchored mid-history, and
 // coreToResponses projects that to a `developer` item AT ITS POSITION — strict
 // single-system backends (Qwen3-family "system-first" chat templates) 400 the
-// whole session after any fold. Re-voice surviving system/developer core
+// whole session after any fold. Re-voice surviving summary-carrier core
 // messages as user BEFORE the codec so they ride mid-history exactly like the
 // chat wire's systemToUser does; the head system prompt is untouched (it rides
 // instructions / the injected leading developer item, never this path). No-op
@@ -99,8 +100,12 @@ export function mergeAdjacentConfigurationUpdates(items: readonly ResponseInputI
 // plugin mode stripKernelSummaries removes the anchor when the compress pair
 // rides inbound history, but pruned or line-form echoes leave it behind — this
 // re-voicing is what keeps the wire legal then.
+// #4166: the re-voicing is narrowed to bili's OWN carriers
+// (isRenderedSummaryMessage) — client-origin mid system/developer cores are
+// conversation data and re-emit verbatim through their rawResponsesItem
+// sidecar; they are NOT rewritten here.
 export function patchResponsesInputWithToolImages(projection: ResponsesProjection, messages: CoreMessage[]): string | ResponseInputItem[] {
-    const voiced = systemToUser(messages);
+    const voiced = systemToUser(messages, (m) => isRenderedSummaryMessage(m));
     const input = patchResponsesInput(projection, voiced);
     if (typeof input === "string") return input;
     const byOriginal = new Map<unknown, ResponseInputItem>();
@@ -115,8 +120,9 @@ export function patchResponsesInputWithToolImages(projection: ResponsesProjectio
 }
 
 // #1999: same pre-codec re-voicing as patchResponsesInputWithToolImages above.
+// #4166: carriers only — client-origin mid system/developer stays verbatim.
 export function coreToResponsesWithToolImages(messages: CoreMessage[], customToolCallIds: Set<string> = new Set()): ResponseInputItem[] {
-    return systemToUser(messages).flatMap((message) => {
+    return systemToUser(messages, (m) => isRenderedSummaryMessage(m)).flatMap((message) => {
         const rebuilt = rebuildToolImages(message);
         return rebuilt ? [rebuilt] : coreToResponses([message], customToolCallIds);
     });

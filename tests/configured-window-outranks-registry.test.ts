@@ -93,8 +93,10 @@ function url(rig: Rig): string {
 
 async function closeRig(rig: Rig): Promise<void> {
     rig.proxy.close();
+    rig.proxy.closeIdleConnections?.();
     await once(rig.proxy, "close");
     rig.upstream.close();
+    rig.upstream.closeIdleConnections?.();
     await once(rig.upstream, "close");
 }
 

@@ -126,3 +126,42 @@ test("fork-child title-gen rides the #388 passthrough and never pollutes the chi
         await h.close();
     }
 });
+
+test("an advisory-adopted first request that is a declared side request still rides the #388 passthrough (#3741)", async () => {
+    const h = await harness();
+    try {
+        // 1. fork parent -> child at the full 3-message prefix
+        const snapshot = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body as { status: string; parentRevision: string; orderedMessages: unknown[] };
+        assert.ok(snapshot.status !== "error");
+        const orderedMessages = snapshot.orderedMessages.slice(0, 3);
+        const fork = await h.request("/__bili/plugin/fork", { protocolVersion: 1, parentConversationId: "parent", childConversationId: "forkchild", parentRevision: snapshot.parentRevision, branchPoint: { messageCount: 3, orderHash: hash(orderedMessages) }, orderedMessages, idempotencyKey: "fork-title-adopted" });
+        assert.equal(fork.status, 201, JSON.stringify(fork.body));
+        const revBefore = ((await h.request("/__bili/plugin/snapshot?conversationId=forkchild")).body as { parentRevision: string }).parentRevision;
+
+        // 2. FIRST child request is a dsh title-gen shape (agent=title) whose replayed history
+        //    DRIFTS from the inherited prefix. Pre-#3757 this 409'd forever; now the advisory gate
+        //    adopts it — and declared side intent must STILL divert it to the #388 passthrough
+        //    (publicForkPrefix stays false on mismatch, so the lane heuristics keep their say).
+        const driftedHistory = h.messages.map((m, i) => i === 0 ? { ...m, content: "drifted first message" } : m);
+        const titleMessages = [...driftedHistory, { role: "assistant", content: "child continuation" }, { role: "user", content: "Generate a title." }];
+        const upstreamHitsBefore = h.forwarded.length;
+        await h.dshSend("forkchild", titleMessages, "title", "You generate short titles.", 1024);
+        assert.equal(h.forwarded.length, upstreamHitsBefore + 1, "adopted side request still reaches the upstream");
+
+        const session = resolveConversation("forkchild").session!;
+        assert.ok(session.metadata.publicForkReceipt !== undefined, "fork receipt recorded on the child session");
+        assert.equal(session.stats.requests, 0, "a declared side request never counts as a fork-child main request, even when adopted");
+        const revAfter = ((await h.request("/__bili/plugin/snapshot?conversationId=forkchild")).body as { parentRevision: string }).parentRevision;
+        assert.equal(revAfter, revBefore, "adopted title-gen must not grow the fork-child session snapshot");
+        assert.ok(!JSON.stringify(session.pluginSnapshot).includes("Generate a title."), "title instruction never lands in the child's kernel session");
+        const titleForward = h.forwarded.at(-1)! as { messages?: { content: unknown }[] };
+        assert.ok(titleForward.messages?.some((m) => JSON.stringify(m.content).includes("Generate a title.")), "the forwarded title request carries the title instruction");
+
+        // 3. the child's first MAIN turn afterwards still runs the full pipeline normally:
+        //    the adoption was one-shot advisory signal, not a lane reclassification.
+        await h.dshSend("forkchild", [...titleMessages, { role: "assistant", content: "A Title" }, { role: "user", content: "continue working" }], "main", "MAIN OPERATING SYSTEM", 256);
+        assert.equal(session.stats.requests, 1, "the next main turn counts as a fork-child main request");
+    } finally {
+        await h.close();
+    }
+});

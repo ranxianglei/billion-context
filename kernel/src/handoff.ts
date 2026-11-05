@@ -72,7 +72,13 @@ export function renderHandoff(input: HandoffInput): string {
   );
   lines.push("");
   const folded = input.folded === true;
-  const view = full || folded ? coreMessages : prune(coreMessages, state);
+  const view =
+    full || folded
+      ? coreMessages
+      : // Handoff docs have no provider prefix cache at stake: keep the
+        // chronological head placement for summaries of older, absent material
+        // (#2733 made the request path pin-safe instead).
+        prune(coreMessages, state, { headSummaryAnchors: true });
   lines.push(
     full && !folded
       ? `## Full conversation (${coreMessages.length} messages)`

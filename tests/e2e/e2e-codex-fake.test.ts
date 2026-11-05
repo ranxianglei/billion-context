@@ -13,6 +13,10 @@ const MODEL = process.env.E2E_MODEL ?? "qwen3.8-27b";
 const TMO = Number(process.env.E2E_TMO ?? 120_000);
 const FAKE_UPSTREAM = path.join(import.meta.dirname, "fake-upstream.mjs");
 const WORK_ROOT = path.join(process.cwd(), "tmp");
+const EXTERNAL_ATTACH = (process.env.E2E_CODEX_ATTACH_ORIGIN ?? "").trim();
+const UPSTREAM_HOST = (process.env.E2E_UPSTREAM_HOST ?? "127.0.0.1").trim();
+const UPSTREAM_URL_HOST =
+	(process.env.E2E_UPSTREAM_URL_HOST ?? (UPSTREAM_HOST === "0.0.0.0" ? "host.docker.internal" : UPSTREAM_HOST)).trim();
 fs.mkdirSync(WORK_ROOT, { recursive: true });
 // codex discovers AGENTS.md by walking UP from its spawn cwd (#815): keep the
 // cwd outside the repo tree or the whole repo doc leaks into every request.
@@ -70,7 +74,18 @@ function filler(i: number, lines: number): string {
 	return out.join("\n");
 }
 
-type OracleEntry = { t: number; model: string; stream: boolean; isSummary: boolean; inputLen: number; input: unknown[] };
+type OracleEntry = {
+	t: number;
+	model: string;
+	stream: boolean;
+	isSummary: boolean;
+	inputLen: number;
+	plugin: string | null;
+	tools: string[];
+	nativeTool: string | null;
+	functionCallOutputs: Array<{ callId: string; output: unknown }>;
+	input: unknown[];
+};
 
 function flatContent(c: unknown): string {
 	if (typeof c === "string") return c;
@@ -109,11 +124,12 @@ type Ctx = {
 	reqLog: string;
 	fakePid?: number;
 	proxyPid?: number;
+	external: boolean;
 	resumed: boolean;
 	turnCount: number;
 };
 
-async function startCtx(contextWindow: number): Promise<Ctx> {
+async function startCtx(contextWindow: number, fakeEnv: Record<string, string> = {}): Promise<Ctx> {
 	const work = fs.mkdtempSync(path.join(WORK_ROOT, "e2e-codex-fake-"));
 	const ctx: Ctx = {
 		work,
@@ -123,6 +139,7 @@ async function startCtx(contextWindow: number): Promise<Ctx> {
 		port: await freePort(),
 		fakePort: await freePort(),
 		reqLog: path.join(work, "fake-requests.jsonl"),
+		external: EXTERNAL_ATTACH.length > 0,
 		resumed: false,
 		turnCount: 0,
 	};
@@ -130,7 +147,7 @@ async function startCtx(contextWindow: number): Promise<Ctx> {
 
 	await assertPortDead(ctx.fakePort); // #1689: prove still free right before the child binds it
 	const fake = spawn(process.execPath, [FAKE_UPSTREAM], {
-		env: { ...process.env, FAKE_PORT: String(ctx.fakePort), FAKE_HOST: "127.0.0.1", FAKE_REQLOG: ctx.reqLog, FAKE_MODEL: MODEL },
+		env: { ...process.env, FAKE_PORT: String(ctx.fakePort), FAKE_HOST: UPSTREAM_HOST, FAKE_REQLOG: ctx.reqLog, FAKE_MODEL: MODEL, ...fakeEnv },
 		stdio: ["ignore", "pipe", "pipe"],
 	});
 	ctx.fakePid = fake.pid;
@@ -143,28 +160,32 @@ async function startCtx(contextWindow: number): Promise<Ctx> {
 		"",
 		"[model_providers.e2e]",
 		'name = "OpenAI"',
-		`base_url = "http://127.0.0.1:${ctx.port}/bili/http://127.0.0.1:${ctx.fakePort}/v1"`,
+		ctx.external
+			? `base_url = "${EXTERNAL_ATTACH}/bili/http://${UPSTREAM_URL_HOST}:${ctx.fakePort}/v1"`
+			: `base_url = "http://127.0.0.1:${ctx.port}/bili/http://127.0.0.1:${ctx.fakePort}/v1"`,
 		'wire_api = "responses"',
 		'env_key = "E2E_UPSTREAM_KEY"',
 		"",
 	].join("\n"));
 
-	await assertPortDead(ctx.port); // #1689: prove still free right before the child binds it
-	const logPath = path.join(work, "bili.log");
-	const proxy = spawn(process.execPath, [DIST, "start", "--port", String(ctx.port), "--no-auto-update"], {
-		env: {
-			...process.env,
-			XDG_CONFIG_HOME: ctx.xdg.config,
-			XDG_CACHE_HOME: ctx.xdg.cache,
-			XDG_STATE_HOME: ctx.xdg.state,
-			BILLION_CONTEXT_NO_AUTO_UPDATE: "1",
-			...windowEnv(contextWindow),
-		},
-		stdio: ["ignore", "ignore", "pipe"],
-	});
-	ctx.proxyPid = proxy.pid;
-	proxy.stderr!.on("data", (c: Buffer) => { try { fs.appendFileSync(logPath, c); } catch { /* noop */ } });
-	await waitFor(`http://127.0.0.1:${ctx.port}/__bili/health`, 30_000, "bili proxy");
+	if (!ctx.external) {
+		await assertPortDead(ctx.port); // #1689: prove still free right before the child binds it
+		const logPath = path.join(work, "bili.log");
+		const proxy = spawn(process.execPath, [DIST, "start", "--port", String(ctx.port), "--no-auto-update"], {
+			env: {
+				...process.env,
+				XDG_CONFIG_HOME: ctx.xdg.config,
+				XDG_CACHE_HOME: ctx.xdg.cache,
+				XDG_STATE_HOME: ctx.xdg.state,
+				BILLION_CONTEXT_NO_AUTO_UPDATE: "1",
+				...windowEnv(contextWindow),
+			},
+			stdio: ["ignore", "ignore", "pipe"],
+		});
+		ctx.proxyPid = proxy.pid;
+		proxy.stderr!.on("data", (c: Buffer) => { try { fs.appendFileSync(logPath, c); } catch { /* noop */ } });
+		await waitFor(`http://127.0.0.1:${ctx.port}/__bili/health`, 30_000, "bili proxy");
+	}
 	return ctx;
 }
 
@@ -280,6 +301,65 @@ test("under-window: no compression occurs (control)", { skip: skipReason }, asyn
 	assert.ok(oracle.every((o) => !o.isSummary), "control turn must make no summarization calls");
 });
 
+test("native tools: real codex uses bili-injected ACP tools without MCP", { skip: skipReason, timeout: 300_000 }, async (t) => {
+	const ctx = await startCtx(60_000, { FAKE_NATIVE_TOOL: "acp_status" });
+	t.after(() => teardown(ctx));
+
+	const config = fs.readFileSync(path.join(ctx.codexHome, "config.toml"), "utf8");
+	assert.doesNotMatch(config, /\[mcp_servers\./i, "this lane must not register bili through MCP");
+
+	const r = await turn(ctx, "请执行原生注入验收, 只回复: 收到");
+	assert.equal(r.code, 0, `codex exec should succeed (got ${r.code})\nbili log:\n${logs(ctx)}`);
+
+	const oracle = readOracle(ctx.reqLog);
+	const injected = oracle.find((o) => !o.isSummary && o.nativeTool === "acp_status");
+	assert.ok(injected, `upstream never saw bili's injected ACP tool surface: ${JSON.stringify(oracle)}`);
+	assert.equal(injected.plugin, null, "codex must use proxy-mode wire injection, not a plugin header");
+	assert.ok(injected.tools.includes("compress"), `compress tool missing from injected surface: ${injected.tools.join(",")}`);
+	assert.ok(injected.tools.includes("acp_status"), `acp_status tool missing from injected surface: ${injected.tools.join(",")}`);
+
+	const executed = oracle.find((o) => !o.isSummary && o.functionCallOutputs.some((out) => out.callId.startsWith("call_native_")));
+	assert.ok(executed, `bili never re-requested with function_call_output; log:\n${logs(ctx)}`);
+	const output = String(executed.functionCallOutputs.find((out) => out.callId.startsWith("call_native_"))?.output ?? "");
+	assert.match(output, /context|window|token|session|messages/i, `unexpected acp_status result: ${output}`);
+	assert.match(logs(ctx), /proxy tool executed; re-requesting/, "server-side native tool execution was not logged");
+});
+
+test(
+	"native tools: real codex reaches an external Docker bili without MCP",
+	{
+		skip:
+			skipReason ??
+			(EXTERNAL_ATTACH.length === 0
+				? "set E2E_CODEX_ATTACH_ORIGIN=http://127.0.0.1:8787 to exercise a running Docker proxy"
+				: undefined),
+		timeout: 300_000,
+	},
+	async (t) => {
+		const ctx = await startCtx(60_000, { FAKE_NATIVE_TOOL: "acp_status" });
+		t.after(() => teardown(ctx));
+
+		const config = fs.readFileSync(path.join(ctx.codexHome, "config.toml"), "utf8");
+		assert.match(config, new RegExp(`base_url = "${EXTERNAL_ATTACH.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/bili/`));
+		assert.doesNotMatch(config, /\[mcp_servers\./i, "this lane must not register bili through MCP");
+
+		const r = await turn(ctx, "请执行 Docker 原生注入验收, 只回复: 收到");
+		assert.equal(r.code, 0, `codex exec should succeed (got ${r.code})`);
+
+		const oracle = readOracle(ctx.reqLog);
+		const injected = oracle.find((o) => !o.isSummary && o.nativeTool === "acp_status");
+		assert.ok(injected, `Docker bili never injected ACP tools: ${JSON.stringify(oracle)}`);
+		assert.equal(injected.plugin, null, "codex must use proxy-mode wire injection, not a plugin header");
+		assert.ok(injected.tools.includes("compress"), `compress tool missing from injected surface: ${injected.tools.join(",")}`);
+		assert.ok(injected.tools.includes("acp_status"), `acp_status tool missing from injected surface: ${injected.tools.join(",")}`);
+
+		const executed = oracle.find((o) => !o.isSummary && o.functionCallOutputs.some((out) => out.callId.startsWith("call_native_")));
+		assert.ok(executed, "Docker bili never re-requested with function_call_output");
+		const output = String(executed.functionCallOutputs.find((out) => out.callId.startsWith("call_native_"))?.output ?? "");
+		assert.match(output, /context|window|token|session|messages/i, `unexpected acp_status result: ${output}`);
+	},
+);
+
 test("#1802: a hostile user .env cannot reroute a bili-launched codex", { skip: skipReason, timeout: 300_000 }, async (t) => {
 	// The #1802 blind spot: nothing here runs through startCtx/turn (those
 	// pre-bake the proxy into base_url). This launch goes through the REAL
@@ -376,8 +456,14 @@ test("#1802: a hostile user .env cannot reroute a bili-launched codex", { skip: 
 	assert.ok(oracle.length > 0, "fake upstream received no requests — routing was rerouted away from bili");
 
 	// The overlay .env pins this launch's routing and preserves the user's
-	// innocent variables; the real .env stays byte-identical.
-	const overlayEnvPath = path.join(`${codexHome}-bili`, ".env");
+	// innocent variables; the real .env stays byte-identical. Shared-mode
+	// launches (#2222/#3203) use a per-session slot (<home>-bili-s<N>); legacy
+	// mode uses the fixed <home>-bili. Scan both shapes — this test launches
+	// once, so exactly one overlay must exist.
+	const overlayDir = fs.readdirSync(path.dirname(codexHome), { withFileTypes: true })
+		.find((d) => d.isDirectory() && d.name.startsWith(`${path.basename(codexHome)}-bili`));
+	assert.ok(overlayDir, "no codex overlay found beside the real home after the launch");
+	const overlayEnvPath = path.join(path.dirname(codexHome), overlayDir.name, ".env");
 	assert.ok(fs.existsSync(overlayEnvPath), "the overlay must own the generated .env (#1806)");
 	const overlayEnv = fs.readFileSync(overlayEnvPath, "utf8");
 	assert.match(overlayEnv, /^HTTP_PROXY=http:\/\/127\.0\.0\.1:\d+$/m, "HTTP_PROXY must be pinned to this launch's bili origin");
@@ -631,23 +717,28 @@ test("#2195: two sequential bili launches keep every thread in the real home", {
 	assert.equal(c2, c1 + 1, `the second launch's thread must ALSO be in the real home's active db (#2195): before=${c1} after=${c2}`);
 	for (const n of fs.readdirSync(codexHome)) assert.ok(!n.includes("bili-conflict"), `no quarantined generation on sequential runs: ${n}`);
 
-	// Launch 3 in flight: the NEXT active overlay must already carry A+B
-	// (the acceptance criterion beyond the exit-time write-back). The overlay
-	// db exists from the copy phase until this launch's finalize, so poll it.
+	// Launch 3 in flight: the NEXT active state must already carry A+B (the
+	// acceptance criterion beyond the exit-time write-back). Legacy mode
+	// carries them in the in-flight overlay copy (present from the copy phase
+	// until this launch's finalize); shared mode (#2222) carries them in the
+	// REAL home's live db, where launch 3's own thread lands as count c2+1.
 	const run3 = launcherRun("t3", "请只回复: 收到#3");
 	const overlayDb = path.join(`${codexHome}-bili`, "state_5.sqlite");
-	let overlayCount = -1;
+	const realDb = path.join(codexHome, "state_5.sqlite");
+	let saw = -1;
+	let sawAllThreadsBeforeExit = false;
 	const pollStart = Date.now();
-	while (Date.now() - pollStart < 90_000) {
+	while (!sawAllThreadsBeforeExit && Date.now() - pollStart < 90_000) {
 		if (fs.existsSync(overlayDb)) {
-			try {
-				overlayCount = threadCountOf(overlayDb);
-				break;
-			} catch { /* transient lock mid-copy/mid-write: retry */ }
+			try { saw = threadCountOf(overlayDb); } catch { /* transient lock mid-copy/mid-write: retry */ }
+			sawAllThreadsBeforeExit = saw >= c2;
+		} else if (fs.existsSync(realDb)) {
+			try { saw = threadCountOf(realDb); } catch { /* transient lock mid-write: retry */ }
+			sawAllThreadsBeforeExit = saw >= c2 + 1;
 		}
-		await new Promise((r) => setTimeout(r, 250));
+		if (!sawAllThreadsBeforeExit) await new Promise((r) => setTimeout(r, 250));
 	}
-	assert.ok(overlayCount >= c2, `the next launch's active overlay must carry all previous threads (saw ${overlayCount}, need >= ${c2})`);
+	assert.ok(sawAllThreadsBeforeExit, `the next launch's active state must already carry all previous threads (saw ${saw}, need >= ${c2} in the legacy overlay or >= ${c2 + 1} in the shared real-home db)`);
 	await run3;
 	assert.equal(realThreads(), c2 + 1, "launch 3's thread writes back on top of A+B");
 	for (const n of fs.readdirSync(codexHome)) assert.ok(!n.includes("bili-conflict"), `no quarantined generation after launch 3: ${n}`);
@@ -847,4 +938,355 @@ test("#2197: a user -c base_url override selects the target AND still routes thr
 	assert.equal(r.oracles[0].length, 0, "the base-config endpoint must stay untouched once the user overrides it");
 	assertRoutedThroughBili(r.oracles[1], "CLI-overridden endpoint");
 	assertThreadRecorded(r.codexHome);
+});
+
+test("#2222: shared state — the live db stays in the real home across bili and native runs", { skip: skipReason, timeout: 480_000 }, async (t) => {
+	// Issue #2222: with CODEX_SQLITE_HOME pointed at the real home (shared
+	// state mode, the new default for codex >= 0.147.0), codex keeps its
+	// WAL-mode state db on the SINGLE physical path in the REAL home instead
+	// of bili copying it into the overlay per launch. Consequences pinned
+	// here: the launcher announces the mode, the overlay never holds any
+	// sqlite files, each thread lands directly in the live db, and a NATIVE
+	// run (no bili) sees the history immediately — no merge-back window, no
+	// .bili-conflict generation possible.
+	const work = fs.mkdtempSync(path.join(WORK_ROOT, "e2e-codex-2222-"));
+	const codexCwd = fs.mkdtempSync(path.join(CWD_ROOT, "cwd-"));
+	const codexHome = path.join(work, "codex-home");
+	const xdg = {
+		config: path.join(work, "xdg-config"),
+		cache: path.join(work, "xdg-cache"),
+		state: path.join(work, "xdg-state"),
+	};
+	for (const d of [codexHome, xdg.config, xdg.cache, xdg.state]) fs.mkdirSync(d, { recursive: true });
+	const fakePort = await freePort();
+	let fake: ReturnType<typeof spawn> | undefined;
+	t.after(() => { if (fake?.pid) { try { process.kill(fake.pid, "SIGKILL"); } catch { /* gone */ } } });
+
+	await assertPortDead(fakePort);
+	fake = spawn(process.execPath, [FAKE_UPSTREAM], {
+		env: { ...process.env, FAKE_PORT: String(fakePort), FAKE_HOST: "127.0.0.1", FAKE_MODEL: MODEL },
+		stdio: ["ignore", "pipe", "pipe"],
+	});
+	await waitFor(`http://127.0.0.1:${fakePort}/v1/models`, 15_000);
+
+	fs.writeFileSync(path.join(codexHome, "config.toml"), [
+		`model = "${MODEL}"`,
+		'model_provider = "e2e"',
+		"",
+		"[model_providers.e2e]",
+		'name = "OpenAI"',
+		`base_url = "http://127.0.0.1:${fakePort}/v1"`,
+		'wire_api = "responses"',
+		'env_key = "E2E_UPSTREAM_KEY"',
+		"",
+	].join("\n"));
+
+	const childEnv: NodeJS.ProcessEnv = { ...process.env };
+	for (const k of [
+		"BILLION_CONTEXT_PROXY", "BILI_PROVIDER_REWRITES", "BILI_MITM_HOSTS", "BILI_MCP_PROXY",
+		"BILI_NATIVE_CLAUDE", "BILLION_CONTEXT_PLUGIN", "BILI_ZONE_PORT", "BILI_CLAUDE_NATIVE_PORT",
+		"BILI_UPSTREAM_PROXY", "ACP_PORT", "SSL_CERT_FILE",
+		"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+		"http_proxy", "https_proxy", "all_proxy", "no_proxy",
+		// This lane pins the SHARED mechanism itself: an inherited mode override
+		// or foreign sqlite home would silently move the db elsewhere and turn
+		// the assertions into noise.
+		"BILI_CODEX_STATE_MODE", "CODEX_SQLITE_HOME",
+	]) delete childEnv[k];
+
+	const launcherRun = (label: string, prompt: string): Promise<void> => new Promise((resolve, reject) => {
+		const lastFile = path.join(work, `${label}.last`);
+		const logFile = path.join(work, `${label}.log`);
+		const child = spawn(process.execPath, [DIST, "codex", "exec", "--skip-git-repo-check", "--output-last-message", lastFile, prompt], {
+			cwd: codexCwd,
+			env: {
+				...childEnv,
+				CODEX_HOME: codexHome,
+				XDG_CONFIG_HOME: xdg.config,
+				XDG_CACHE_HOME: xdg.cache,
+				XDG_STATE_HOME: xdg.state,
+				BILLION_CONTEXT_NO_AUTO_UPDATE: "1",
+				BILI_CLIENT_BIN: CODEX_BIN,
+				E2E_UPSTREAM_KEY: "fake",
+				RUST_LOG: "error",
+				...windowEnv(60_000),
+			},
+			stdio: ["ignore", "ignore", "pipe"],
+		});
+		child.stderr!.on("data", (c: Buffer) => { try { fs.appendFileSync(logFile, c); } catch { /* noop */ } });
+		const timer = setTimeout(() => { try { child.kill("SIGKILL"); } catch { /* gone */ } reject(new Error(`${label} timed out after ${TMO * 2}ms`)); }, TMO * 2);
+		child.on("exit", (code) => {
+			clearTimeout(timer);
+			const tail = fs.existsSync(logFile) ? fs.readFileSync(logFile, "utf8").slice(-4000) : "";
+			if ((code ?? -1) !== 0) reject(new Error(`${label} exited with code=${code}\nlauncher stderr:\n${tail}`));
+			else if (!fs.existsSync(lastFile) || !/收到#/.test(fs.readFileSync(lastFile, "utf8"))) reject(new Error(`${label}: the fake upstream never answered\nlauncher stderr:\n${tail}`));
+			else resolve();
+		});
+	});
+
+	const assertNoSqliteInOverlay = (): void => {
+		// #3203: shared-mode overlays are per-session slots (<home>-bili-s<N>)
+		// beside the real home; scan every one of them.
+		const parent = path.dirname(codexHome);
+		const prefix = `${path.basename(codexHome)}-bili`;
+		for (const n of fs.readdirSync(parent)) {
+			if (!n.startsWith(prefix)) continue;
+			const p = path.join(parent, n);
+			if (!fs.lstatSync(p).isDirectory()) continue;
+			const offenders = fs.readdirSync(p).filter((x) => /\.(db|sqlite|sqlite3)(-.*)?$/.test(x));
+			assert.deepEqual(offenders, [], `overlay ${n} must hold no sqlite files in shared mode, got ${JSON.stringify(offenders)}`);
+		}
+	};
+	const assertNoConflicts = (): void => {
+		for (const n of fs.readdirSync(codexHome)) assert.ok(!n.includes("bili-conflict"), `no quarantined generation in the real home: ${n}`);
+	};
+	const threadsInRealHome = (): number => {
+		assert.ok(sqliteMod, "node:sqlite unavailable for db assertions");
+		const p = path.join(codexHome, "state_5.sqlite");
+		const db = new sqliteMod.DatabaseSync(p, { readOnly: true });
+		try {
+			const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").all().map((r) => String(r.name));
+			const threadTable = tables.find((x) => /thread/i.test(x));
+			assert.ok(threadTable, `state_5.sqlite must carry a thread table, got ${JSON.stringify(tables)}`);
+			return Number(db.prepare(`SELECT COUNT(*) AS c FROM ${threadTable}`).get()!.c);
+		} finally {
+			db.close();
+		}
+	};
+
+	// Launch 1: the shared-state mechanism must be ACTIVE (not silently
+	// degraded to legacy), and the thread lands straight in the real home.
+	await launcherRun("t1", "请只回复: 收到#1");
+	assert.match(fs.readFileSync(path.join(work, "t1.log"), "utf8"), /codex state shared/, "the shared-state mechanism must be active for a modern codex");
+	assert.ok(fs.existsSync(path.join(codexHome, "state_5.sqlite")), "the live db must live in the real home from the very first launch");
+	const c1 = threadsInRealHome();
+	assert.ok(c1 >= 1, "first launch's thread record must be readable in the real home");
+	assertNoSqliteInOverlay();
+	assertNoConflicts();
+
+	// Launch 2: the second thread lands in the SAME live db — no copy, no
+	// merge-back, nothing to adjudicate.
+	await launcherRun("t2", "请只回复: 收到#2");
+	const c2 = threadsInRealHome();
+	assert.equal(c2, c1 + 1, `the second launch's thread must land directly in the shared live db: before=${c1} after=${c2}`);
+	assertNoSqliteInOverlay();
+	assertNoConflicts();
+
+	// Native codex (NO bili) resumes the latest session immediately — under
+	// the old overlay mechanism this was only guaranteed AFTER bili's
+	// exit-time write-back; here there is no write-back window at all.
+	const lastFile3 = path.join(work, "t3.last");
+	const native = spawn(CODEX_BIN, ["exec", "--skip-git-repo-check", "--output-last-message", lastFile3, "resume", "--last", "请只回复: 收到#3"], {
+		cwd: codexCwd,
+		env: {
+			...childEnv,
+			CODEX_HOME: codexHome,
+			XDG_CONFIG_HOME: xdg.config,
+			XDG_CACHE_HOME: xdg.cache,
+			XDG_STATE_HOME: xdg.state,
+			E2E_UPSTREAM_KEY: "fake",
+			RUST_LOG: "error",
+		},
+		stdio: ["ignore", "ignore", "pipe"],
+	});
+	const code3 = await new Promise<number>((resolve, reject) => {
+		const timer = setTimeout(() => { try { native.kill("SIGKILL"); } catch { /* gone */ } reject(new Error("native codex resume timed out")); }, TMO * 2);
+		native.on("exit", (c) => { clearTimeout(timer); resolve(c ?? -1); });
+	});
+	assert.equal(code3, 0, "native codex resume must succeed off the shared live db");
+	assert.match(fs.readFileSync(lastFile3, "utf8"), /收到#2/, "the resumed session must carry launch 2's turn back into the model's view");
+});
+
+test("#3203: two concurrent bili codex sessions on ONE CODEX_HOME both run and keep their history", { skip: skipReason, timeout: 480_000 }, async (t) => {
+	// Issue #3203: two terminals, same project dir, same CODEX_HOME — both
+	// `bili codex` launches must work. Pre-#3203 the second one died with
+	// BILI_OVERLAY_BUSY because every launch shared the fixed-name overlay
+	// under an exclusive lease. Now each shared-mode launch takes its own
+	// slot (<home>-bili-s<N>) while the state db stays canonical in the real
+	// home (#2222), so both sessions route through their own proxy and land
+	// their threads in the SAME live db with nothing to arbitrate.
+	const work = fs.mkdtempSync(path.join(WORK_ROOT, "e2e-codex-3203-"));
+	const codexCwd = fs.mkdtempSync(path.join(CWD_ROOT, "cwd-"));
+	const codexHome = path.join(work, "codex-home");
+	const xdg = {
+		config: path.join(work, "xdg-config"),
+		cache: path.join(work, "xdg-cache"),
+		state: path.join(work, "xdg-state"),
+	};
+	for (const d of [codexHome, xdg.config, xdg.cache, xdg.state]) fs.mkdirSync(d, { recursive: true });
+	const fakePort = await freePort();
+	let fake: ReturnType<typeof spawn> | undefined;
+	t.after(() => { if (fake?.pid) { try { process.kill(fake.pid, "SIGKILL"); } catch { /* gone */ } } });
+
+	await assertPortDead(fakePort);
+	fake = spawn(process.execPath, [FAKE_UPSTREAM], {
+		env: { ...process.env, FAKE_PORT: String(fakePort), FAKE_HOST: "127.0.0.1", FAKE_MODEL: MODEL },
+		stdio: ["ignore", "pipe", "pipe"],
+	});
+	await waitFor(`http://127.0.0.1:${fakePort}/v1/models`, 15_000);
+
+	fs.writeFileSync(path.join(codexHome, "config.toml"), [
+		`model = "${MODEL}"`,
+		'model_provider = "e2e"',
+		"",
+		"[model_providers.e2e]",
+		'name = "OpenAI"',
+		`base_url = "http://127.0.0.1:${fakePort}/v1"`,
+		'wire_api = "responses"',
+		'env_key = "E2E_UPSTREAM_KEY"',
+		"",
+	].join("\n"));
+
+	const childEnv: NodeJS.ProcessEnv = { ...process.env };
+	for (const k of [
+		"BILLION_CONTEXT_PROXY", "BILI_PROVIDER_REWRITES", "BILI_MITM_HOSTS", "BILI_MCP_PROXY",
+		"BILI_NATIVE_CLAUDE", "BILLION_CONTEXT_PLUGIN", "BILI_ZONE_PORT", "BILI_CLAUDE_NATIVE_PORT",
+		"BILI_UPSTREAM_PROXY", "ACP_PORT", "SSL_CERT_FILE",
+		"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+		"http_proxy", "https_proxy", "all_proxy", "no_proxy",
+		// Pin the mechanism itself: an inherited mode override or foreign
+		// sqlite home would silently move the db and mute the assertions.
+		"BILI_CODEX_STATE_MODE", "CODEX_SQLITE_HOME",
+	]) delete childEnv[k];
+
+	const launcherRun = (label: string, prompt: string): Promise<void> => new Promise((resolve, reject) => {
+		const lastFile = path.join(work, `${label}.last`);
+		const logFile = path.join(work, `${label}.log`);
+		const child = spawn(process.execPath, [DIST, "codex", "exec", "--skip-git-repo-check", "--output-last-message", lastFile, prompt], {
+			cwd: codexCwd,
+			env: {
+				...childEnv,
+				CODEX_HOME: codexHome,
+				XDG_CONFIG_HOME: xdg.config,
+				XDG_CACHE_HOME: xdg.cache,
+				XDG_STATE_HOME: xdg.state,
+				BILLION_CONTEXT_NO_AUTO_UPDATE: "1",
+				BILI_CLIENT_BIN: CODEX_BIN,
+				E2E_UPSTREAM_KEY: "fake",
+				RUST_LOG: "error",
+				...windowEnv(60_000),
+			},
+			stdio: ["ignore", "ignore", "pipe"],
+		});
+		child.stderr!.on("data", (c: Buffer) => { try { fs.appendFileSync(logFile, c); } catch { /* noop */ } });
+		const timer = setTimeout(() => { try { child.kill("SIGKILL"); } catch { /* gone */ } reject(new Error(`${label} timed out after ${TMO * 2}ms`)); }, TMO * 2);
+		child.on("exit", (code) => {
+			clearTimeout(timer);
+			const tail = fs.existsSync(logFile) ? fs.readFileSync(logFile, "utf8").slice(-4000) : "";
+			if ((code ?? -1) !== 0) reject(new Error(`${label} exited with code=${code}\nlauncher stderr:\n${tail}`));
+			else if (!fs.existsSync(lastFile) || !/收到#/.test(fs.readFileSync(lastFile, "utf8"))) reject(new Error(`${label}: the fake upstream never answered\nlauncher stderr:\n${tail}`));
+			else resolve();
+		});
+	});
+
+	const assertNoSqliteInOverlay = (): void => {
+		const parent = path.dirname(codexHome);
+		const prefix = `${path.basename(codexHome)}-bili`;
+		for (const n of fs.readdirSync(parent)) {
+			if (!n.startsWith(prefix)) continue;
+			const p = path.join(parent, n);
+			if (!fs.lstatSync(p).isDirectory()) continue;
+			const offenders = fs.readdirSync(p).filter((x) => /\.(db|sqlite|sqlite3)(-.*)?$/.test(x));
+			assert.deepEqual(offenders, [], `overlay ${n} must hold no sqlite files in shared mode, got ${JSON.stringify(offenders)}`);
+		}
+	};
+	const assertNoConflicts = (): void => {
+		for (const n of fs.readdirSync(codexHome)) assert.ok(!n.includes("bili-conflict"), `no quarantined generation in the real home: ${n}`);
+	};
+	const threadsInRealHome = (): number => {
+		assert.ok(sqliteMod, "node:sqlite unavailable for db assertions");
+		const p = path.join(codexHome, "state_5.sqlite");
+		const db = new sqliteMod.DatabaseSync(p, { readOnly: true });
+		try {
+			const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").all().map((r) => String(r.name));
+			const threadTable = tables.find((x) => /thread/i.test(x));
+			assert.ok(threadTable, `state_5.sqlite must carry a thread table, got ${JSON.stringify(tables)}`);
+			return Number(db.prepare(`SELECT COUNT(*) AS c FROM ${threadTable}`).get()!.c);
+		} finally {
+			db.close();
+		}
+	};
+	const slotDirs = (): string[] => {
+		const parent = path.dirname(codexHome);
+		const prefix = `${path.basename(codexHome)}-bili-s`;
+		return fs.readdirSync(parent).filter((n) => {
+			if (!n.startsWith(prefix)) return false;
+			try { return fs.lstatSync(path.join(parent, n)).isDirectory(); } catch { return false; }
+		});
+	};
+
+	// Pre-warm the fresh home with ONE sequential session before the
+	// concurrent pair. codex ≤0.147.0 applies its sqlx migrations
+	// non-atomically when first opening a brand-new state db: two codex
+	// processes cold-starting milliseconds apart can interleave those
+	// migrations and one of them aborts its whole state-runtime init ("while
+	// executing migration 2: table logs already exists" — WARN only, hidden at
+	// RUST_LOG=error), so that session's thread row is never written although
+	// its rollout JSONL survives on disk. That race is upstream of bili (which
+	// owns neither codex's schema nor its migrations), is not what this lane
+	// tests, and does not occur in #3203's real scenario — two terminals in
+	// the SAME project almost always share an already-migrated home. The warm
+	// session closes the fresh-db window so the concurrency asserts below are
+	// deterministic.
+	await launcherRun("warm", "请只回复: 收到#1");
+	const c0 = threadsInRealHome();
+
+	// THE assertion of this issue: BOTH launches start at the same moment and
+	// both must complete — pre-#3203 exactly one of them exited 1 with
+	// BILI_OVERLAY_BUSY before spawning codex.
+	// Digit suffixes: the fake answers with the FIRST 收到#<digits> it sees in
+	// the request, so each session's marker must be digit-shaped.
+	await Promise.all([
+		launcherRun("cA", "请只回复: 收到#11"),
+		launcherRun("cB", "请只回复: 收到#12"),
+	]);
+
+	const lanes = new Map<string, string>();
+	for (const label of ["cA", "cB"]) {
+		const log = fs.readFileSync(path.join(work, `${label}.log`), "utf8");
+		assert.match(log, /codex state shared/, `${label}: the shared-state mechanism must be active`);
+		assert.ok(!log.includes("BILI_OVERLAY_BUSY"), `${label}: must not be refused by the overlay lease\n${log.slice(-2000)}`);
+		// Each session's proxy runs on its OWN per-session lane — the #3044
+		// twin rule matches same lane+port+build, so a shared "codex" lane is
+		// exactly what made the second concurrent launch die at EADDRINUSE.
+		const m = log.match(/proxy runs on lane (codex-s\d+)/);
+		assert.ok(m, `${label}: the launcher must declare its per-session proxy lane\n${log.slice(-2000)}`);
+		lanes.set(label, m[1]);
+	}
+	assert.notEqual(lanes.get("cA"), lanes.get("cB"), `concurrent sessions must run on distinct proxy lanes: ${JSON.stringify([...lanes])}`);
+
+	// Each session took its own slot from the bounded pool.
+	const slots = slotDirs();
+	assert.ok(slots.length >= 2, `expected >=2 per-session slots beside the real home, got ${JSON.stringify(slots)}`);
+
+	// Both threads landed in the SAME live db — neither session's history was
+	// lost to arbitration, regardless of which process exited first.
+	const cEnd = threadsInRealHome();
+	assert.equal(cEnd, c0 + 2, `both concurrent threads must survive in the shared live db: before=${c0} after=${cEnd}`);
+	assertNoSqliteInOverlay();
+	assertNoConflicts();
+	assert.ok(fs.existsSync(path.join(codexHome, "installation_id")), "one canonical installation_id must exist in the real home");
+
+	// A NATIVE run (no bili) resumes one of the two sessions immediately —
+	// exit order of the two bili processes must not matter.
+	const lastFile3 = path.join(work, "c3.last");
+	const native = spawn(CODEX_BIN, ["exec", "--skip-git-repo-check", "--output-last-message", lastFile3, "resume", "--last", "请只回复: 收到#C"], {
+		cwd: codexCwd,
+		env: {
+			...childEnv,
+			CODEX_HOME: codexHome,
+			XDG_CONFIG_HOME: xdg.config,
+			XDG_CACHE_HOME: xdg.cache,
+			XDG_STATE_HOME: xdg.state,
+			E2E_UPSTREAM_KEY: "fake",
+			RUST_LOG: "error",
+		},
+		stdio: ["ignore", "ignore", "pipe"],
+	});
+	const code3 = await new Promise<number>((resolve, reject) => {
+		const timer = setTimeout(() => { try { native.kill("SIGKILL"); } catch { /* gone */ } reject(new Error("native codex resume timed out")); }, TMO * 2);
+		native.on("exit", (c) => { clearTimeout(timer); resolve(c ?? -1); });
+	});
+	assert.equal(code3, 0, "native codex resume must succeed after two concurrent bili sessions");
+	assert.match(fs.readFileSync(lastFile3, "utf8"), /收到#1[12]/, "the resumed session must carry one of the concurrent turns back into the model's view");
 });

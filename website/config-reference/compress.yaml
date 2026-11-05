@@ -62,6 +62,16 @@ entries:
     desc_zh: "分层 token 质量触发阈值；每层未设置时回退到派生默认值，缺省/空对象＝老的统一行为（#2376）。"
     site_en: "Per-tier token-mass trigger thresholds for the T1/T2/T3 paths; each unset sub-field keeps its derived value (T1 = growth step, T2/T3 = step × 1.5)."
     site_zh: "T1/T2/T3 路径的分层 token 质量触发阈值；未设置的子字段保持派生值（T1＝增长步长，T2/T3＝步长 × 1.5）。"
+  - key: compress.minPressureBenefitTokens
+    type: "number (≥ 0)"
+    default: "max(5000, limit × 1%)"
+    group: compress
+    id: cw.mpbt
+    render: compress-row
+    desc_en: "Minimum reclaimable tokens a pressure-band nudge must have to fire; on inflated-meter routes raise it so folds batch into big events instead of high-frequency small-yield churn (#3211). Explicit 0 = legacy any-pending."
+    desc_zh: "压力带 nudge 触发所需的最小可回收 token 数；虚报表线路调大它，让折叠攒成大批量而非高频小折（#3211）。显式 0＝老的任意 pending 行为。"
+    site_en: "Minimum reclaimable tokens for a pressure-band nudge to fire (default max(5000, limit × 1%)); explicit 0 restores legacy any-pending behavior (#3211)."
+    site_zh: "压力带 nudge 触发所需的最小可回收 token 数（默认 max(5000, 上限×1%)）；显式 0 恢复老的任意 pending 行为（#3211）。"
   - key: compress.nudgeModelDecided
     type: boolean
     default: "off (unset)"
@@ -82,26 +92,46 @@ entries:
     desc_zh: "nudgeModelDecided 所用模型决策 side call 的输出预算（token）。必须 > 0。"
     site_en: "Output budget (tokens) of the model-decision side call (default 200). Must be > 0."
     site_zh: "模型决策 side call 的输出预算（token，默认 200）。必须 > 0。"
+  - key: compress.requireNudge
+    type: boolean
+    default: "off (unset)"
+    group: compress
+    id: cw.rnug
+    render: compress-row
+    desc_en: "Forbid UNPROMPTED model-initiated compression (#5683): a compress call is refused unless a compression nudge actually reached the model in the current turn (advisory, decide-directive and emergency injections all arm; loop rounds of the same turn keep the arm, the next un-nudged turn disarms). Refusal sends the model an error receipt instead of folding; bili's own overflow backstop folds are exempt. For models that fold on their own (e.g. qwen 27b); can be scoped per provider/model. Off unless explicitly enabled."
+    desc_zh: "禁止未提示的模型主动压缩（#5683）：只有当前轮次压缩提醒真正送达模型时（advisory、模型自决指令、紧急提醒都算；\"gated\"/\"vetoed\"/\"skipped\" 不算）才允许 compress，否则拒绝并回错误回执；同一轮内的多次 loop 请求保持武装，下一个未提示轮次自动解除。bili 自己的溢出兜底折叠不受影响。针对会自行乱压的模型（如 qwen 27b），可按 provider/model 单独开启。默认关闭。"
+    site_en: "Forbid unprompted compression (off by default): a model compress call is refused unless a nudge actually reached the model this turn; the refusal returns an error receipt instead of folding."
+    site_zh: "禁止未提示压缩（默认关闭）：只有本轮压缩提醒真正送达模型时才允许模型调用 compress，否则拒绝并回错误回执。"
+  - key: compress.requireRecommendation
+    type: boolean
+    default: "off (unset)"
+    group: compress
+    id: cw.rrec
+    render: compress-row
+    desc_en: "Forbid OUT-OF-BOUNDS model-initiated compression (#5683): every submitted range must stay within what bili currently recommends folding — the same live compressible set the nudge text and acp_status show (this request's prepare-time offer when present, else a live recompute). Judgment is by COVERAGE: subdividing a recommended span passes, and messages already folded into active blocks (refolds updating an existing summary) are exempt. A range carrying any other live message is refused whole with an error receipt naming the offending span(s). Off unless explicitly enabled."
+    desc_zh: "禁止越界的模型主动压缩（#5683）：提交的每个范围必须落在 bili 当前推荐折叠的集合内——即 nudge 文案与 acp_status 展示的同一份实时可压缩列表（有本轮 prepare 快照用快照，否则实时重算）。按「覆盖」判定而非精确相等：把推荐跨度拆小段通过；已折进活跃块的消息豁免（重折已有块更新摘要合法）。范围里含任何其他仍存活的消息则整体拒绝，回执点名越界跨度并指向 acp_status。默认关闭。"
+    site_en: "Forbid out-of-bounds compression (off by default): only ranges bili currently recommends may be folded; subdividing a listed span or refolding an existing block stays legal."
+    site_zh: "禁止越界压缩（默认关闭）：只允许折叠 bili 当前推荐的范围；拆分推荐跨度、重折已有块更新摘要仍合法。"
   - key: compress.streamSummary
     type: boolean
     default: "false (unset)"
     group: compress
     id: cw.ssm
     render: compress-row
-    desc_en: "Force preflight summarization to run as a streaming (SSE) call from the first attempt. Needed when the upstream sits behind a gateway that times out long non-streaming completions (e.g. Cloudflare HTTP 524): the error-driven self-learn only sees 400 \"stream required\" rejections and never arms on gateway timeouts."
-    desc_zh: "强制 preflight 摘要从首次尝试起就走流式（SSE）请求。适用于上游位于会掐断长非流式补全的网关之后（如 Cloudflare HTTP 524）：错误驱动的自学习只认 400 \"stream required\"，网关超时永远无法触发。"
-    site_en: "Force streaming (SSE) summarization from the first attempt — an escape hatch for upstreams behind gateways that time out long non-streaming calls (e.g. Cloudflare 524), which the error-driven self-learn cannot detect."
-    site_zh: "强制摘要从首次起走流式（SSE）——用于上游在会掐断长非流式调用的网关之后（如 Cloudflare 524），错误自学习无法感知该场景。"
+    desc_en: "Force preflight summarization to run as a streaming (SSE) call from the first attempt. The error-driven self-learn handles stream-mandating upstreams on its own (any 400 on a non-streaming summary triggers a one-shot SSE probe, #2494) but NEVER arms on gateway timeouts (e.g. Cloudflare HTTP 524): set this where such a gateway sits between bili and the origin, or simply to skip the one probe round-trip."
+    desc_zh: "强制 preflight 摘要从首次尝试起就走流式（SSE）请求。要求流式的上游现在由错误驱动自学习自动处理（非流式摘要的任何 400 都会触发一次性 SSE 探测，#2494），但网关超时（如 Cloudflare HTTP 524）永远无法触发自学习：在此类网关位于 bili 与源站之间时设置此项，或用于省去一次探测往返。"
+    site_en: "Force streaming (SSE) summarization from the first attempt — stream-mandating upstreams now self-heal via a one-shot SSE probe on any non-streaming 400 (#2494); kept as the escape hatch for gateways that time out long non-streaming calls (e.g. Cloudflare 524), which the self-learn cannot detect, or to skip the one probe round-trip."
+    site_zh: "强制摘要从首次起走流式（SSE）——要求流式的上游现在通过任何非流式 400 上的一次性 SSE 探测自愈（#2494）；保留作为会掐断长非流式调用的网关（如 Cloudflare 524）的逃生通道（自学习无法感知该场景），也可用于省去一次探测往返。"
   - key: compress.preserveRecentMessages
     type: number
-    default: "kernel ≈5"
+    default: "3"
     group: compress
     id: cw.prm
     render: compress-row
     desc_en: "The most recent messages stay soft-protected from folds."
     desc_zh: "最近的消息软保护、免于折叠。"
-    site_en: "Kernel default ≈5: the most recent messages stay soft-protected from folds."
-    site_zh: "内核默认约 5：最近消息软保护、免于折叠。"
+    site_en: "Kernel default 3 (tuned 5 → 3, #3058): the most recent messages stay soft-protected from folds."
+    site_zh: "内核默认 3（5 → 3，#3058）：最近消息软保护、免于折叠。"
   - key: compress.preserveRecentTokens
     type: number
     default: "kernel ≈5000"
@@ -122,6 +152,26 @@ entries:
     desc_zh: "可折叠片段的最小字符数；更短的永不折叠。"
     site_en: "Smallest foldable range, in characters (kernel default ≈5000) — shorter ranges never fold."
     site_zh: "可折叠片段的最小字符数（内核默认约 5000），更短的永不折叠。"
+  - key: compress.maxSummaryLength
+    type: number
+    default: "kernel 20000"
+    group: compress
+    id: cw.msl
+    render: compress-row
+    desc_en: "Hard character cap on ONE generated summary; longer replies are rejected whole (no truncation, no retry). External summarizers are told this exact cap up front (#3635). 0 = unbounded."
+    desc_zh: "单条生成摘要的硬字符上限；超长的回复被整段拒绝（不截断、不重试）。外部摘要模型会被提前告知这个确切上限（#3635）。0 = 不限制。"
+    site_en: "Hard cap, in characters, on one generated summary (kernel default 20000): longer replies are rejected whole by the kernel check or the external-summary executor. External summarizers receive this exact cap in their instructions (#3635); 0 disables the cap."
+    site_zh: "单条生成摘要的硬上限，单位为字符（内核默认 20000）：超长的回复由内核检查或外部摘要执行器整段拒绝。外部摘要模型的指令中会写明这个确切上限（#3635）；0 禁用上限。"
+  - key: compress.minSummaryLength
+    type: number
+    default: "kernel 50"
+    group: compress
+    id: cw.mnl
+    render: compress-row
+    desc_en: "Character floor for generated summaries; shorter replies are rejected whole. 0 = disabled. External summarizers are held to the same floor (#3635)."
+    desc_zh: "生成摘要的字符下限；过短的回复被整段拒绝。0 = 禁用。外部摘要模型受同一下限约束（#3635）。"
+    site_en: "Floor, in characters, for generated summaries (kernel default 50): shorter replies are rejected whole; 0 disables the floor. External summarizers are held to the same floor (#3635)."
+    site_zh: "生成摘要的下限，单位为字符（内核默认 50）：过短的回复被整段拒绝；0 禁下限。外部摘要模型受同一下限约束（#3635）。"
   - key: compress.reconcile
     type: "\"off\" | \"warn\" | \"repair\""
     default: "\"repair\""
@@ -133,6 +183,28 @@ entries:
     desc_zh: "客户端在轮次之间回退或改写历史时校准已折叠状态。"
     site_en: "\"off\" | \"warn\" | \"repair\" (default repair): reconcile folded state when the client rewinds or rewrites history between turns."
     site_zh: "\"off\" | \"warn\" | \"repair\"（默认 repair）：客户端在轮次之间回退或改写历史时校准已折叠状态。"
+  - key: compress.compressAtFoldPoint
+    type: boolean
+    default: "false"
+    env: BILI_COMPRESS_AT_FOLD_POINT
+    group: compress
+    id: cw.cafp
+    render: compress-row
+    desc_en: "EXPERIMENTAL, default off: move a still-visible compress call/result pair from its original (tail-adjacent) slot to its own fold point in the re-sent view, i.e. [folded region] – [pair] – [protected messages], so weak-attention models stop reading a trailing tool exchange as a fresh command. View-only transform: refs and state untouched, recomputed identically on every turn; off = byte-identical layout."
+    desc_zh: "实验性，默认关闭：把仍可见的压缩调用/结果对从原位置（贴近尾部）移到它自己的折叠点，即 [已折叠区]–[调用对]–[保护消息]，避免弱注意力模型把历史末尾的工具交换当成新命令。纯视图变换：refs 与状态不变、每轮重算结果一致；关闭时布局字节级不变。"
+    site_en: "EXPERIMENTAL boolean (default false): relocate a visible compress call/result pair to its fold point in the outbound view so a trailing tool exchange is not mistaken for a new user command. View-only and deterministic per turn; off = byte-identical to the default layout."
+    site_zh: "实验性布尔开关（默认 false）：把可见的压缩调用/结果对移到出站视图的折叠点处，避免历史末尾的工具交换被模型误读为新命令。纯视图变换、每轮确定性重算；关闭 = 与原布局字节级一致。"
+  - key: compress.compressAtFoldPointClearThinking
+    type: boolean
+    default: "false"
+    env: BILI_COMPRESS_AT_FOLD_POINT_CLEAR_THINKING
+    group: compress
+    id: cw.cafct
+    render: compress-row
+    desc_en: "Second opt-in riding on compress.compressAtFoldPoint: when the pair is repositioned, also drop the contiguous run of unsigned reasoning cores immediately preceding it (the model's thinking about this very fold), so the moved pair starts clean. Inert unless the main switch is on; signed thinking blocks and strict reasoning-echo sessions are never touched (#1658/#684)."
+    desc_zh: "依附于 compress.compressAtFoldPoint 的第二层开关：调用对被挪位的一瞬间，同时丢掉紧邻其前的未签名思考段（模型对本次折叠本身的思考），让挪位后的开头更干净。主开关关闭时无效；带签名的思考块与严格推理回显会话绝不受影响（#1658/#684）。"
+    site_en: "EXPERIMENTAL boolean (default false): together with compress.compressAtFoldPoint, clear the unsigned thinking run immediately before a relocated compress pair at the moment of repositioning. Never touches signed thinking or strict reasoning-echo sessions (#1658/#684); inert while the main switch is off."
+    site_zh: "实验性布尔开关（默认 false）：配合 compress.compressAtFoldPoint，在调用对被挪位的同时清掉其紧邻之前的未签名思考段。绝不触碰带签名的思考块与严格推理回显会话（#1658/#684）；主开关关闭时无效。"
   - key: compress.promptPack
     type: "string (builtin: \"default\", \"lean\")"
     default: "builtin \"default\""
@@ -143,16 +215,6 @@ entries:
     desc_zh: "压缩提示词包，按 项目包 → 用户包 → 内置 解析；不受 acknowledgePromptsRisk 门控。"
     site_en: "Compression prompt pack, resolved project pack → user pack → builtin. Builtins: \"default\" and \"lean\" (one-line tool descriptions). Not gated by acknowledgePromptsRisk."
     site_zh: "压缩提示词包，按 项目包 → 用户包 → 内置 解析。内置：\"default\" 与 \"lean\"（单行工具描述）。不受 acknowledgePromptsRisk 门控。"
-  - key: compress.stripImagesKeepRecent
-    type: number
-    default: "5"
-    group: compress
-    id: cw.sikr
-    render: compress-row
-    desc_en: "With stripImages on, images inside the N newest messages are kept (fallback window when no fold anchors the boundary)."
-    desc_zh: "开启剥离图片时，最新 N 条消息内的图片保留（无折叠锚定时的回退窗口）。"
-    site_en: "With stripImages on, images inside the N newest messages (default 5) are kept."
-    site_zh: "开启剥离图片时，最新 N 条消息（默认 5）内的图片保留。"
   - key: compress.tiers
     type: boolean
     default: "true"
@@ -203,16 +265,6 @@ entries:
     desc_zh: "减法形式：近期区工具减去本列表得到完全保护；此处空数组按笔误拒绝。"
     site_en: "Subtraction form: recent-zone tools minus this list get full protection. An empty array here is rejected as a typo."
     site_zh: "减法形式：近期区工具减去本列表得到完全保护；此处空数组按笔误拒绝。"
-  - key: compress.stripImages
-    type: boolean
-    default: "false"
-    group: compress
-    id: ct.si
-    render: compress-row
-    desc_en: "Strip image payloads from foldable history."
-    desc_zh: "从可折叠历史中剥离图片载荷。"
-    site_en: "Strip image payloads from foldable history (off by default)."
-    site_zh: "从可折叠历史中剥离图片载荷（默认关）。"
   - key: compress.visibilityMarkers
     type: boolean
     default: "true"
@@ -223,16 +275,27 @@ entries:
     desc_zh: "在 compress/decompress/search_context/acp_status 结果后追加可见性标记；关闭可抑制模型模仿叙述。"
     site_en: "Append 📦/❌ visibility markers after compress/decompress/search_context/acp_status results (on by default; off stops imitated narration)."
     site_zh: "在 compress/decompress/search_context/acp_status 结果后追加 📦/❌ 可见性标记（默认开；关闭可抑制模型模仿叙述）。"
+  - key: compress.messageTimestamps
+    type: boolean
+    default: "true"
+    env: BILI_MESSAGE_TIMESTAMPS
+    group: compress
+    id: ct.mt
+    render: compress-row
+    desc_en: "Attach immutable wall-clock time stamps to compressed-message records: time= on the wire's ACP tags, a [start – end] coverage span in compress receipts, and an Occurred line in summaries. ON by default: each message gets one immutable first-sight stamp rendered deterministically, so re-rendered history stays byte-stable (no prompt-cache cost beyond the one enabling-restart prefix rewrite). Set false to reproduce the pre-#4313 bytes exactly."
+    desc_zh: "为压缩消息记录附加不可变墙钟时间戳：线上 ACP 标签的 time=\"…\" 属性、压缩回执指纹行的 [start – end] 覆盖跨度、渲染摘要的 Occurred 行。默认开启：每条消息首次出现时铸不可变戳、确定性渲染（历史重发字节稳定）；设为 false 可精确复现特性前（pre-#4313）的线上字节。"
+    site_en: "Message timestamps (#4313): first-sight wall-clock stamps shown as time= on compression tags, coverage spans in receipts and Occurred lines in summaries; ON by default. Set `compress.messageTimestamps: false` or env BILI_MESSAGE_TIMESTAMPS=0 to keep every byte identical to pre-feature master. Env wins when defined (0 forces off, any other value forces on); resolved once per instance — changing the flag needs a restart, and the first restart with the flag on pays one frozen-prefix cache rewrite per active session."
+    site_zh: "消息时间戳（#4313）：首次出现时铸不可变墙钟戳，展示为压缩标签的 time= 属性、回执覆盖跨度、摘要 Occurred 行；默认开启。设 `compress.messageTimestamps: false` 或 env BILI_MESSAGE_TIMESTAMPS=0 可让线上字节与特性前逐字节一致。env 有定义时优先（0 强制关，其他值强制开）；实例启动时一次性解析——改开关需重启，开关生效后的首个重启每个活跃会话付一次冻结前缀缓存重写。"
   - key: compress.rules
     type: boolean
     default: "false"
     group: compress
     id: ct.rules
     render: compress-row
-    desc_en: "Persistent model reminders delivered through an injected acp_rule tool, hard-protected from folds; pi/omp expose an /acp-rule command."
-    desc_zh: "通过注入的 acp_rule 工具提供持久模型提醒——对折叠硬保护；pi/omp 提供 /acp-rule 命令。"
-    site_en: "Off by default: persistent model reminders delivered through an injected acp_rule tool, hard-protected from folds. pi/omp expose an /acp-rule command."
-    site_zh: "默认关：通过注入的 acp_rule 工具提供持久模型提醒——对折叠硬保护。pi/omp 提供 /acp-rule 命令。"
+    desc_en: "Persistent model reminders delivered through an injected acp_rule tool, hard-protected from folds; pi/omp expose an /acp-rule command. Proxy-mode only — inert in plugin mode, where the host owns the tool surface."
+    desc_zh: "通过注入的 acp_rule 工具提供持久模型提醒——对折叠硬保护；pi/omp 提供 /acp-rule 命令。仅代理模式生效——插件模式下宿主自管工具面，此项无效。"
+    site_en: "Off by default: persistent model reminders delivered through an injected acp_rule tool, hard-protected from folds. pi/omp expose an /acp-rule command. Proxy-mode only — inert in plugin mode."
+    site_zh: "默认关：通过注入的 acp_rule 工具提供持久模型提醒——对折叠硬保护。pi/omp 提供 /acp-rule 命令。仅代理模式生效——插件模式下无效。"
   - key: compress.injectTool
     type: boolean
     default: "true"
@@ -271,10 +334,10 @@ entries:
     group: compress
     id: co.absorb
     render: obj-item
-    desc_en: "Opt-in instant distillation of large tool results into short abstracts; originals go to the content store."
-    desc_zh: "可选即时蒸馏：把大段工具结果蒸馏成短摘要，原文进内容库。"
-    site_en: "<code>absorb</code> — opt-in instant distillation of large tool results into short abstracts; originals go to the content store (<span class='mech'>enabled, minToolTokens (default 1000), contextThresholdPct, excludeTools, toolName \"absorb\"</span>)."
-    site_zh: "<code>absorb</code> —— 可选即时蒸馏：把大段工具结果蒸馏成短摘要，原文进内容库（<span class='mech'>enabled, minToolTokens(默认 1000), contextThresholdPct, excludeTools, toolName \"absorb\"</span>）。"
+    desc_en: "Opt-in instant distillation of tool results into short abstracts; originals go to the content store. By default only image-bearing results qualify."
+    desc_zh: "可选即时蒸馏：把工具结果蒸馏成短摘要，原文进内容库。默认仅图片类结果参与。"
+    site_en: "<code>absorb</code> — opt-in instant distillation of tool results into short abstracts; originals go to the content store; by default only image-bearing results qualify (<span class='mech'>enabled, minToolTokens (default 1000), contextThresholdPct, excludeTools, mediaOnly (default true), toolName \"absorb\"</span>)."
+    site_zh: "<code>absorb</code> —— 可选即时蒸馏：把工具结果蒸馏成短摘要，原文进内容库；默认仅图片类结果参与（<span class='mech'>enabled, minToolTokens(默认 1000), contextThresholdPct, excludeTools, mediaOnly(默认 true), toolName \"absorb\"</span>）。"
   - key: compress.ccr
     type: object
     default: "enabled in proxy mode since v2"
@@ -285,6 +348,16 @@ entries:
     desc_zh: "内容缓存与回取：大输出无损存到会话旁、替换为首段摘录+指针，模型用 acp_retrieve 取回原文；无上限、永不清除。"
     site_en: "<code>ccr</code> — content cache &amp; retrieve: large outputs are stored losslessly beside the session and replaced by a head excerpt plus pointer; the model fetches originals back via <code>acp_retrieve</code>. No cap or eviction; on by default in proxy mode since v2 (<span class='mech'>enabled, minToolTokens (~4000), excludeTools, toolName \"acp_retrieve\", maxHeadChars</span>)."
     site_zh: "<code>ccr</code> —— 内容缓存与回取：大输出无损存到会话旁、替换为首段摘录+指针，模型用 <code>acp_retrieve</code> 取回原文；无上限、永不清除；自 v2 起代理模式默认开（<span class='mech'>enabled, minToolTokens(~4000), excludeTools, toolName \"acp_retrieve\", maxHeadChars</span>）。"
+  - key: compress.search
+    type: object
+    default: "off"
+    group: compress
+    id: co.searchRoot
+    render: obj-item
+    desc_en: "Search-behavior settings for search_context; currently holds planAware re-ranking."
+    desc_zh: "search_context 的检索行为设置；当前含 planAware 重排。"
+    site_en: "<code>search</code> — search-behavior settings for search_context; currently holds <code>planAware</code>."
+    site_zh: "<code>search</code> —— search_context 的检索行为设置；当前含 <code>planAware</code>。"
   - key: compress.search.planAware
     type: boolean
     default: "false"
@@ -295,16 +368,6 @@ entries:
     desc_zh: "开启后 search_context 候选按当前计划状态重排；关闭时结果逐字节不变。"
     site_en: "<code>search.planAware</code> — off by default: when on, search_context candidates are re-ranked against current plan state (latest-wins todos + last user turn); off keeps byte-identical lexical results."
     site_zh: "<code>search.planAware</code> —— 默认关：开启后 search_context 候选按当前计划状态重排（todo 最新优先 + 上一轮用户消息）；关闭时结果逐字节不变。"
-  - key: compress.imageCompression
-    type: object
-    default: "opt-in (disabled)"
-    group: compress
-    id: co.img
-    render: obj-item
-    desc_en: "Opt-in lossy downscale via optional sharp before sending; image_full restores originals; proxy mode only."
-    desc_zh: "可选有损缩放（依赖可选 sharp）后再发送；image_full 取回原图；仅限代理模式。"
-    site_en: "<code>imageCompression</code> — opt-in lossy downscale via optional sharp before sending (<span class='mech'>enabled, minTokens 512, maxDimension 1280, quality 80, format \"webp\"</span>); <code>image_full</code> restores originals; proxy mode only."
-    site_zh: "<code>imageCompression</code> —— 可选有损缩放（依赖可选 sharp）后再发送（<span class='mech'>enabled, minTokens 512, maxDimension 1280, quality 80, format \"webp\"</span>）；<code>image_full</code> 取回原图；仅限代理模式。"
   - key: compress.prompts
     type: "Partial<Prompts>"
     default: "unset (kernel doctrine)"
@@ -345,6 +408,16 @@ entries:
     desc_zh: "w/r/q 相对输入价的比率（写入/缓存读/输出）；仅供报告，不影响触发条件或线上行为。"
     site_en: "<code>priceProfile</code> — <span class='mech'>w / r / q</span> ratios normalized to the input price (write / cache-read / output); unset ⇒ models.dev $/Mtok registry rows, kernel fallback {1, 0.1, 4}. Report-only — never affects triggers or the wire."
     site_zh: "<code>priceProfile</code> —— <span class='mech'>w / r / q</span> 相对输入价的比率（写入/缓存读/输出）；未设置 ⇒ 取 models.dev $/Mtok 注册表行，内核兜底 {1, 0.1, 4}。仅供报告，不影响触发条件或线上行为。"
+  - key: compress.externalSummary
+    type: object
+    default: "opt-in (disabled)"
+    group: compress
+    id: co.es
+    render: obj-item
+    desc_en: "Sends compression summaries to separately configured models referenced from the providers table; whole-chain replace semantics at all three compress levels."
+    desc_zh: "把压缩摘要交给 providers 表引用的独立配置模型；三级 compress 均为整链替换语义。"
+    site_en: "<code>externalSummary</code> — optional chain of external summary models, each target a \"provider/model\" reference into the <code>providers</code> table; disabled unless <code>enabled</code> is true, targets tried in order with fall-through (<span class='mech'>enabled, targets, budget {totalTimeoutMs, targetTimeoutMs, maxSummaryBytes}, concurrency, autoFold, autoFoldTargetTokens</span>). Whole-chain replace semantics at all three compress levels."
+    site_zh: "<code>externalSummary</code> —— 可选的外部摘要模型链，每个目标为指向 <code>providers</code> 表的 \"provider/model\" 引用；<code>enabled</code> 为 true 才启用，目标按顺序尝试、失败落到下一个（<span class='mech'>enabled, targets, budget {totalTimeoutMs, targetTimeoutMs, maxSummaryBytes}, concurrency, autoFold, autoFoldTargetTokens</span>）。三级 compress 均为整链替换语义。"
   - key: compress.acknowledgePromptsRisk
     type: boolean
     default: "false"
@@ -385,6 +458,12 @@ entries:
     group: compress
     desc_en: "Registered name of the absorb tool."
     desc_zh: "absorb 工具的注册名。"
+  - key: compress.absorb.mediaOnly
+    type: boolean
+    default: "true"
+    group: compress
+    desc_en: "Restrict absorption to tool results that carry media (images). Image bytes are exempt from minToolTokens since they are not counted in text. Set false to restore legacy full-text absorption of any large result."
+    desc_zh: "仅吸收携带媒体（图片）的工具结果；图片字节不计入文本 token，故豁免 minToolTokens 门槛。置 false 恢复对任意大结果的全文吸收（旧行为）。"
   - key: compress.ccr.enabled
     type: boolean
     default: "true (proxy mode)"
@@ -415,36 +494,6 @@ entries:
     group: compress
     desc_en: "Maximum head-excerpt length left inline at the storage pointer."
     desc_zh: "存储指针处内联首段摘录的最大长度。"
-  - key: compress.imageCompression.enabled
-    type: boolean
-    default: "false"
-    group: compress
-    desc_en: "Enable lossy image downscaling (requires the optional sharp dependency)."
-    desc_zh: "启用有损图片缩放（需要可选依赖 sharp）。"
-  - key: compress.imageCompression.minTokens
-    type: number
-    default: "512"
-    group: compress
-    desc_en: "Only downscale images whose counted tokens exceed this."
-    desc_zh: "只对计得 token 超过该值的图片做缩放。"
-  - key: compress.imageCompression.maxDimension
-    type: number
-    default: "1280"
-    group: compress
-    desc_en: "Largest output dimension after downscaling."
-    desc_zh: "缩放后的最大输出边长。"
-  - key: compress.imageCompression.quality
-    type: number
-    default: "80"
-    group: compress
-    desc_en: "Encoder quality (1–100)."
-    desc_zh: "编码质量（1–100）。"
-  - key: compress.imageCompression.format
-    type: string
-    default: "\"webp\""
-    group: compress
-    desc_en: "Output image format."
-    desc_zh: "输出图片格式。"
   - key: compress.prompts.compressPhilosophy
     type: string
     default: "unset (kernel text)"

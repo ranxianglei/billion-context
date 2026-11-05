@@ -23,6 +23,30 @@ test("comfly relay host is deliberately unmapped so it takes the relay scan (#14
     assert.equal(providerFromHost("ai.comfly.org"), undefined);
 });
 
+test("providerFromHost maps Anthropic-on-Vertex hosts, global and location-shaped (#3323)", () => {
+    assert.equal(providerFromHost("aiplatform.googleapis.com"), "anthropic");
+    // Regional hosts put the location in a PREFIX the "."-delimited suffix scan
+    // cannot reach, with a label that itself contains a dash.
+    assert.equal(providerFromHost("us-east5-aiplatform.googleapis.com"), "anthropic");
+    assert.equal(providerFromHost("europe-west1-aiplatform.googleapis.com"), "anthropic");
+    // Multi-region hosts put it in the first label instead.
+    assert.equal(providerFromHost("aiplatform.us.rep.googleapis.com"), "anthropic");
+    assert.equal(providerFromHost("aiplatform.eu.rep.googleapis.com"), "anthropic");
+    // Case-folded like every other host.
+    assert.equal(providerFromHost("AIPLATFORM.GOOGLEAPIS.COM"), "anthropic");
+    // Boundary discipline: a host that merely ends in the Vertex domain, or one
+    // whose location label is empty, stays unmapped rather than guessed. Note
+    // what is deliberately NOT a boundary case: the location label is arbitrary
+    // (`evil-aiplatform.googleapis.com` is location "evil"), so the prefix shape
+    // cannot reject a bogus label — that rejection belongs to the launcher's
+    // location guard (VERTEX_LOCATION_RE in src/vertex.ts), which is where a
+    // label is interpolated into a hostname. This map is advisory only.
+    assert.equal(providerFromHost("aiplatform.googleapis.com.evil.com"), undefined);
+    assert.equal(providerFromHost("-aiplatform.googleapis.com"), undefined);
+    assert.equal(providerFromHost("aiplatform..rep.googleapis.com"), undefined);
+    assert.equal(providerFromHost("aiplatform.googleapis.com.evil"), undefined);
+});
+
 test("peekRegistryContext returns undefined with a cold cache (never fetches)", () => {
     _resetForTest();
     assert.equal(peekRegistryContext("MiniMax-M2.1", "api.minimax.chat"), undefined);

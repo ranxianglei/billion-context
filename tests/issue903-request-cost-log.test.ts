@@ -152,8 +152,10 @@ test("e2e: per-request cost line reports msg count, inbound wire size and local 
     } finally {
         setLogCapture(null);
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });

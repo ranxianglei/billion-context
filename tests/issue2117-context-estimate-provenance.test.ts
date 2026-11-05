@@ -356,8 +356,10 @@ test("e2e: forward() publishes both calibers; usage wins the display after settl
         assert.ok(s!.stats.contextEstimateTokens! < (s!.stats.localInputEstimate ?? 0) / 2, `calibrated estimate (${s!.stats.contextEstimateTokens}) must be far below the bound (${s!.stats.localInputEstimate})`);
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });

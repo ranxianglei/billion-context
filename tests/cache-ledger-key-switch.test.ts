@@ -133,7 +133,7 @@ test("a byte-identical re-note without headers inherits the prior fingerprint (#
     assert.equal(l1.keyFp, keyA);
 });
 
-test("a model change outranks a co-occurring key change; the counters stay independent (#2131)", () => {
+test("a model change outranks a co-occurring key change; the shadowed counter stays silent (#2131 #2784)", () => {
     const session = makeSession();
     session.metadata.lastModel = "glm-5.3";
     const keyA = fp("sk-account-one");
@@ -143,10 +143,13 @@ test("a model change outranks a co-occurring key change; the counters stay indep
     session.metadata.lastModel = "deepseek-v4.1";
     turn(session, "b3", keyB, T0 + 3000, 11_000, 0);
     const r = buildSessionCacheReport(session);
-    // Both dimensions OBSERVED the change (independent event counters)…
+    // ONE narrative cause per line (#2784): the model switch narrates it; the rotation that rode
+    // along on the same request no longer books its own zero-token event. The raw observation
+    // stays on the line itself (kw flag + fingerprint pair).
     assert.equal(r.modelSwitches.count, 1);
-    assert.equal(r.keySwitches.count, 1);
-    // …but the partition charges the residual to the model only.
+    assert.equal(r.keySwitches.count, 0);
+    assert.deepEqual(r.keySwitches.events, []);
+    // The partition charges the residual to the model only.
     assert.equal(r.modelSwitches.missedTokens, 10_500);
     assert.equal(r.keySwitches.missedTokens, 0);
     assert.equal(r.invalidation.model, 10_500);

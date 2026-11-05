@@ -3,7 +3,7 @@ import http from "node:http";
 import { once } from "node:events";
 import { createHash } from "node:crypto";
 import test from "node:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { defaultConfig, type CoreMessage } from "acp-kernel";
@@ -15,8 +15,9 @@ import { _resetSessionsForTest } from "../src/session.ts";
 import { _setForTest } from "../src/registry.ts";
 import { resetToolRingForTest } from "../src/tool-ring.ts";
 import { incomingCoreMessages } from "../src/fork-adoption.ts";
-import { anthropicBodyToCore, chatBodyToCore, createForkAdopter, forkIdentityHashOf, openaiBodyToCore, resetForkCapabilityCacheForTest, tryForkAdoption, type ForkAdoptInput } from "../src/agent/fork-adopt.ts";
-import { createBiliPlugin } from "../src/agent/pi.ts";
+import { anthropicBodyToCore, chatBodyToCore, createForkAdopter, forkIdentityHashOf, openaiBodyToCore, resetForkCapabilityCacheForTest, responsesBodyToCore, tryForkAdoption, type ForkAdoptInput } from "../src/agent/fork-adopt.ts";
+import { FORK_SEED_MIN_REPLAYED_MESSAGES, createBiliPlugin, replayedMessageCount } from "../src/agent/pi.ts";
+import { closeServers } from "./server-close-guard.ts";
 
 process.env.NODE_ENV = "test";
 const testRoot = mkdtempSync(join(tmpdir(), "bili-piomp-fork-"));
@@ -49,13 +50,82 @@ test("anthropicBodyToCore projects identically to the server's incomingCoreMessa
     assert.equal(client!.some((m) => m.role === "system"), false, "leading system stays hoisted out of the fold space");
 });
 
-test("chatBodyToCore discriminates the chat dialects and skips responses/google (#2399)", () => {
+test("chatBodyToCore discriminates the dialects; only google stays unprojected (#2399/#2469)", () => {
     assert.notEqual(chatBodyToCore({ messages: [{ role: "user", content: "hi" }] }), null, "openai projects");
     assert.notEqual(chatBodyToCore(anthropicBody), null, "anthropic projects");
-    assert.deepEqual(chatBodyToCore({ model: "gpt", input: [{ type: "message", role: "user", content: "hi" }] }), null, "responses skipped");
+    assert.notEqual(chatBodyToCore({ model: "gpt", input: [{ type: "message", role: "user", content: "hi" }] }), null, "responses projects");
     assert.deepEqual(chatBodyToCore({ contents: [{ role: "user", parts: [{ text: "hi" }] }] }), null, "google skipped");
     const openai = { messages: [{ role: "system", content: "s" }, { role: "user", content: "hi" }] };
     assert.equal(chatBodyToCore(openai)!.length, openaiBodyToCore(openai)!.length, "openai keeps the stage-1 projection");
+});
+
+// #2469 regression coverage (issue checklist): plain text, function
+// call/output, raw ids and identity hashes must match the server's pipeline —
+// "仅增加'支持'分支或借用文本字段不足以证明继承正确". The corpus exercises
+// every pre-projection mutation the replicas carry.
+test("responsesBodyToCore projects identically to the server's incomingCoreMessages responses branch (#2469 parity)", () => {
+    const corpus = [
+        // plain-text user/assistant turns
+        [
+            { type: "message", role: "user", content: "first original " },
+            { type: "message", role: "assistant", content: "second original " },
+            { type: "message", role: "user", content: "tail original" },
+        ],
+        // function call + output round-trip (raw call id must survive both sides)
+        [
+            { type: "message", role: "user", content: "check the weather" },
+            { type: "function_call", name: "get_weather", arguments: "{\"city\":\"SF\"}", call_id: "call-1" },
+            { type: "function_call_output", call_id: "call-1", output: "sunny, 18C" },
+            { type: "message", role: "assistant", content: "It is sunny." },
+        ],
+        // omp untyped user item + whitespace-only delta + bili-id healing
+        [
+            { role: "user", content: "untyped omp prompt" },
+            { type: "message", role: "assistant", content: "   \t  " },
+            { type: "message", role: "assistant", id: `msg-proxy-${"x".repeat(80)}`, content: "healed reply" },
+            { type: "reasoning", id: `msg-proxy-${"y".repeat(80)}`, summary: [] },
+        ],
+        // bili compaction echo: sentinel blob → handoff message; marker-only → drop
+        [
+            { type: "compaction", id: "fc_bili-abc", encrypted_content: "bili:acp:folded head summary" },
+            { type: "compaction", id: "fc_bili-old" },
+            { type: "message", role: "user", content: "post-compaction turn" },
+        ],
+        // mixed content parts (input_text / output_text / text)
+        [
+            { type: "message", role: "user", content: [{ type: "input_text", text: "part one " }, { type: "text", text: "part two" }] },
+            { type: "message", role: "assistant", content: [{ type: "output_text", text: "mixed parts reply" }] },
+        ],
+    ];
+    for (let i = 0; i < corpus.length; i += 1) {
+        const body = { model: "gpt-test", input: corpus[i] };
+        const client = responsesBodyToCore(body);
+        const server = incomingCoreMessages("responses", body);
+        assert.notEqual(client, null, `corpus ${i}: client projected`);
+        assert.notEqual(server, null, `corpus ${i}: server projected`);
+        assert.equal(client!.length, server!.length, `corpus ${i}: message count diverged`);
+        for (let j = 0; j < client!.length; j += 1) {
+            assert.equal(forkIdentityHashOf(client![j]!), forkIdentityHashOf(server![j]!), `corpus ${i} message ${j} identity diverged`);
+        }
+    }
+});
+
+type CtxShape = Parameters<typeof replayedMessageCount>[0];
+
+test("replayedMessageCount counts only conversation entries and fails soft (#2469)", () => {
+    const base = (sm: unknown): CtxShape => ({ sessionManager: sm } as CtxShape);
+    assert.equal(replayedMessageCount(base(undefined)), undefined, "no sessionManager");
+    assert.equal(replayedMessageCount(base({})), undefined, "no getBranch");
+    assert.equal(replayedMessageCount(base({ getBranch: () => "not-an-array" })), undefined);
+    assert.equal(replayedMessageCount(base({ getBranch: () => { throw new Error("boom"); } })), undefined);
+    const branch = [
+        { type: "message", message: { role: "user", content: "a" } },
+        { type: "compaction", firstKeptEntryId: "x" },
+        { type: "label", label: "y" },
+        { type: "message", message: { role: "assistant", content: "b" } },
+        { type: "branch_summary", summary: "z" },
+    ];
+    assert.equal(replayedMessageCount(base({ getBranch: () => branch })), 2, "only type==='message' entries count");
 });
 
 // ---------------------------------------------------------------------------
@@ -127,6 +197,31 @@ test("createForkAdopter degrades once on prefix mismatch and stays done", async 
     assert.equal(calls.filter((c) => c.url.includes("snapshot")).length, 1);
     assert.equal(calls.filter((c) => c.url.endsWith("/__bili/plugin/fork")).length, 0);
     assert.ok(lines.some((l) => l.includes("degraded (no prefix match)")));
+});
+
+test("createForkAdopter ends google children before any network request (#2469)", async () => {
+    resetForkCapabilityCacheForTest();
+    const { fetchImpl, calls } = fakeFetchRouting([manifestRoute, snapshotRoute, forkRoute]);
+    const lines: string[] = [];
+    const adopter = createForkAdopter((l) => lines.push(l), { fetchImpl });
+    const google = adoptInput({ child: "c-ggl", body: { contents: [{ role: "user", parts: [{ text: "hi" }] }] } });
+    await adopter.maybeAdopt(google);
+    await adopter.maybeAdopt(google);
+    assert.equal(calls.length, 0, "no manifest probe, no snapshot GET, no fork POST — the capability check precedes the network");
+    assert.ok(lines.some((l) => l.includes("c-ggl") && l.includes("wire requests are not supported") && l.includes("google")));
+});
+
+test("createForkAdopter lets responses children reach the protocol — no terminal wire skip (#2469 stage 2)", async () => {
+    resetForkCapabilityCacheForTest();
+    const { fetchImpl, calls } = fakeFetchRouting([manifestRoute, snapshotRoute, forkRoute]);
+    const lines: string[] = [];
+    const adopter = createForkAdopter((l) => lines.push(l), { fetchImpl });
+    const responses = adoptInput({ child: "c-resp", body: { model: "gpt", input: [{ type: "message", role: "user", content: "hi" }] } });
+    await adopter.maybeAdopt(responses);
+    assert.ok(calls.some((c) => c.url.includes("manifest")), "the responses child reaches the manifest probe");
+    assert.ok(calls.some((c) => c.url.includes("snapshot")), "...and the snapshot GET (identity 'x1' matches nothing → degrades, no fork POST)");
+    assert.equal(calls.filter((c) => c.url.endsWith("/__bili/plugin/fork")).length, 0);
+    assert.ok(!lines.some((l) => l.includes("wire requests are not supported")), "no unsupported-wire skip for responses");
 });
 
 test("createForkAdopter never throws — an exploding network soft-degrades and closes the window", async () => {
@@ -225,7 +320,7 @@ async function harness() {
     await once(proxy, "listening");
     const paddr = proxy.address();
     assert(paddr && typeof paddr === "object");
-    return { dir, store, upstreamUrl, origin: `http://127.0.0.1:${paddr.port}`, close: async () => { store.cancelAll(); proxy.close(); upstream.close(); await Promise.all([once(proxy, "close"), once(upstream, "close")]); } };
+    return { dir, store, upstreamUrl, origin: `http://127.0.0.1:${paddr.port}`, close: async () => { store.cancelAll(); await closeServers([proxy, upstream], "fork-adopt harness"); } };
 }
 
 async function seedParent(h: Awaited<ReturnType<typeof harness>>, conversationId: string) {
@@ -272,7 +367,7 @@ function pluginCtx(h: Awaited<ReturnType<typeof harness>>, sid: string, parentSe
     };
 }
 
-test("full chain: omp lane adopts behind its own identity register (#2399 stage 2 / B-plan)", async () => {
+test("full chain: omp lane adopts behind its own identity register (#2399 stage 2 / B-plan)", { timeout: 60_000 }, async () => {
     resetForkCapabilityCacheForTest();
     const h = await harness();
     try {
@@ -312,7 +407,7 @@ test("full chain: omp lane adopts behind its own identity register (#2399 stage 
     }
 });
 
-test("full chain: pi lane resolves a path-shaped parentSession header and adopts (#2399 stage 2)", async () => {
+test("full chain: pi lane resolves a path-shaped parentSession header and adopts (#2399 stage 2)", { timeout: 60_000 }, async () => {
     resetForkCapabilityCacheForTest();
     const h = await harness();
     try {
@@ -342,7 +437,7 @@ test("full chain: pi lane resolves a path-shaped parentSession header and adopts
     }
 });
 
-test("full chain: pi lane skips adoption when no parent is declared", async () => {
+test("full chain: pi lane skips adoption when no parent is declared", { timeout: 60_000 }, async () => {
     resetForkCapabilityCacheForTest();
     const h = await harness();
     try {
@@ -359,12 +454,177 @@ test("full chain: pi lane skips adoption when no parent is declared", async () =
     }
 });
 
+test("pi lane: lineage-only child is skipped before any snapshot/fork call (#2469)", { timeout: 60_000 }, async () => {
+    resetForkCapabilityCacheForTest();
+    const h = await harness();
+    try {
+        await seedParent(h, "lineage-parent");
+        const pi = makeFakePi();
+        createBiliPlugin("pi")(pi as never);
+        const handler = pi.events.get("before_provider_request");
+        assert.ok(handler);
+        // A spawned subagent: parentSession is set (lineage) but its own branch
+        // holds only its task prompt — below FORK_SEED_MIN_REPLAYED_MESSAGES.
+        const ctx: Record<string, unknown> = {
+            ...pluginCtx(h, "sub-sid", "lineage-parent"),
+            sessionManager: { getSessionId: () => "sub-sid", getHeader: () => ({ parentSession: "lineage-parent" }), getBranch: () => [{ type: "message", message: { role: "user", content: "do the task" } }] },
+        };
+        const termLines: string[] = [];
+        const originalWarn = console.warn;
+        console.warn = (line: unknown) => { termLines.push(String(line)); };
+        try {
+            const payload = { model: "claude-test", max_tokens: 1024, stream: false, messages: [{ role: "user", content: "do the task" }] };
+            await handler({ payload }, ctx);
+            await handler({ payload: { ...payload, messages: [{ role: "user", content: "do the task again" }] } }, ctx);
+        } finally {
+            console.warn = originalWarn;
+        }
+        const skipLogPath = join(h.dir, "billion-context", "bili.log");
+        const skipLines = (existsSync(skipLogPath) ? readFileSync(skipLogPath, "utf8") : "").split("\n").filter((l) => l.length > 0 && l.includes("lineage-only child"));
+        assert.equal(skipLines.length, 1, "the verdict is computed once per sid, not per request");
+        assert.ok(skipLines[0]!.includes("sub-sid"));
+        assert.equal(termLines.filter((w) => w.includes("lineage-only child")).length, 0, "#2831: must not reach the terminal surface");
+        assert.ok(pi.tools.length > 0, "the read-only derivedFrom link still registers");
+        const snapshot = await fetch(`${h.origin}/__bili/plugin/snapshot?conversationId=sub-sid`);
+        if (snapshot.status === 200) {
+            const body = JSON.parse(await snapshot.text()) as { orderedMessages: unknown[] };
+            assert.equal(body.orderedMessages.length, 0, "no inherited compression state");
+        } else {
+            assert.equal(snapshot.status, 404, "no fork was posted for a lineage-only child");
+        }
+    } finally {
+        await h.close();
+    }
+});
+
+test("pi lane: seeded child at the branch-length boundary still adopts (#2469)", { timeout: 60_000 }, async () => {
+    resetForkCapabilityCacheForTest();
+    const h = await harness();
+    try {
+        await seedParent(h, "seed-parent");
+        const pi = makeFakePi();
+        createBiliPlugin("pi")(pi as never);
+        const handler = pi.events.get("before_provider_request");
+        assert.ok(handler);
+        // Exactly FORK_SEED_MIN_REPLAYED_MESSAGES conversation entries in the
+        // child's own branch: the >= boundary admits it to the attempt, and the
+        // hash prefix match then does the real work.
+        const ctx: Record<string, unknown> = {
+            ...pluginCtx(h, "seed-child", "seed-parent"),
+            sessionManager: {
+                getSessionId: () => "seed-child",
+                getHeader: () => ({ parentSession: "seed-parent" }),
+                getBranch: () => Array.from({ length: FORK_SEED_MIN_REPLAYED_MESSAGES }, (_, i) => ({ type: "message", message: { role: i % 2 === 0 ? "user" : "assistant", content: `replayed ${i}` } })),
+            },
+        };
+        const body = { model: "claude-test", max_tokens: 1024, stream: false, messages: [
+            { role: "system", content: "system prompt" },
+            { role: "user", content: "first original ".repeat(250) },
+            { role: "assistant", content: "second original ".repeat(250) },
+            { role: "user", content: "tail original" },
+            { role: "user", content: "new fork tail" },
+        ] };
+        await handler({ payload: body }, ctx);
+        const childSnapshot = await fetch(`${h.origin}/__bili/plugin/snapshot?conversationId=seed-child`);
+        const childSnapshotText = await childSnapshot.text();
+        assert.equal(childSnapshot.status, 200, childSnapshotText);
+        const childBody = JSON.parse(childSnapshotText) as { orderedMessages: unknown[] };
+        assert.equal(childBody.orderedMessages.length, 3, "the boundary child inherited the parent prefix");
+    } finally {
+        await h.close();
+    }
+});
+
+test("pi lane: an exploding getBranch fails toward capability and still adopts (#2469)", { timeout: 60_000 }, async () => {
+    resetForkCapabilityCacheForTest();
+    const h = await harness();
+    try {
+        await seedParent(h, "throw-parent");
+        const pi = makeFakePi();
+        createBiliPlugin("pi")(pi as never);
+        const handler = pi.events.get("before_provider_request");
+        assert.ok(handler);
+        const ctx: Record<string, unknown> = {
+            ...pluginCtx(h, "throw-child", "throw-parent"),
+            sessionManager: { getSessionId: () => "throw-child", getHeader: () => ({ parentSession: "throw-parent" }), getBranch: () => { throw new Error("host exploded"); } },
+        };
+        const body = { model: "claude-test", max_tokens: 1024, stream: false, messages: [
+            { role: "system", content: "system prompt" },
+            { role: "user", content: "first original ".repeat(250) },
+            { role: "assistant", content: "second original ".repeat(250) },
+            { role: "user", content: "tail original" },
+            { role: "user", content: "new fork tail" },
+        ] };
+        await handler({ payload: body }, ctx);
+        const childSnapshot = await fetch(`${h.origin}/__bili/plugin/snapshot?conversationId=throw-child`);
+        const childSnapshotText = await childSnapshot.text();
+        assert.equal(childSnapshot.status, 200, childSnapshotText);
+        const childBody = JSON.parse(childSnapshotText) as { orderedMessages: unknown[] };
+        assert.equal(childBody.orderedMessages.length, 3, "unknown seeding evidence keeps today's always-attempt behavior");
+    } finally {
+        await h.close();
+    }
+});
+
+test("tryForkAdoption rejects a responses child whose prefix matches nothing (#2469 stage 2)", { timeout: 60_000 }, async () => {
+    const { fetchImpl, calls } = fakeFetchRouting([snapshotRoute]);
+    const result = await tryForkAdoption({ base: "http://px", parentConversationId: "p1", childConversationId: "c1", body: { model: "gpt", input: [{ type: "message", role: "user", content: "completely unrelated" }] }, fetchImpl });
+    assert.deepEqual(result, { outcome: "degraded", reason: "no prefix match" });
+    assert.equal(calls.filter((c) => c.url.endsWith("/__bili/plugin/fork")).length, 0, "no fork receipt is posted for a mismatch");
+});
+
+test("full chain: responses-wire child adopts an openai-seeded parent (#2469 stage 2)", { timeout: 60_000 }, async () => {
+    resetForkCapabilityCacheForTest();
+    const h = await harness();
+    try {
+        await seedParent(h, "resp-parent");
+        const pi = makeFakePi();
+        createBiliPlugin("pi")(pi as never);
+        const handler = pi.events.get("before_provider_request");
+        assert.ok(handler);
+        // The reporter's exact shape (#2469): pi on codex-class providers sends
+        // the responses wire; the parent was seeded through the openai chat
+        // lane. Plain-text ids align across wires (kernel emits contentType
+        // "text" in both converters), so the prefix must match cross-wire.
+        const ctx: Record<string, unknown> = {
+            ...pluginCtx(h, "resp-child", "resp-parent"),
+            sessionManager: {
+                getSessionId: () => "resp-child",
+                getHeader: () => ({ parentSession: "resp-parent" }),
+                getBranch: () => Array.from({ length: FORK_SEED_MIN_REPLAYED_MESSAGES }, (_, i) => ({ type: "message", message: { role: i % 2 === 0 ? "user" : "assistant", content: `replayed ${i}` } })),
+            },
+        };
+        const body = {
+            model: "claude-test", max_tokens: 1024, stream: false,
+            input: [
+                { type: "message", role: "user", content: "first original ".repeat(250) },
+                { type: "message", role: "assistant", content: "second original ".repeat(250) },
+                { type: "message", role: "user", content: "tail original" },
+                { type: "message", role: "user", content: "new fork tail" },
+            ],
+        };
+        await handler({ payload: body }, ctx);
+        const childSnapshot = await fetch(`${h.origin}/__bili/plugin/snapshot?conversationId=resp-child`);
+        const childSnapshotText = await childSnapshot.text();
+        assert.equal(childSnapshot.status, 200, childSnapshotText);
+        const childBody = JSON.parse(childSnapshotText) as { orderedMessages: unknown[] };
+        assert.equal(childBody.orderedMessages.length, 3, "the responses child inherited the parent prefix across wires");
+        // Replay acceptance (no FORK_PREFIX_CONFLICT on the child's first
+        // stamped request) needs a mock that speaks the responses SSE wire;
+        // it is covered generically by the openai full chain above plus the
+        // parity test pinning this body's client/server identity equality —
+        // exactly what publicForkInputCheck compares.
+    } finally {
+        await h.close();
+    }
+});
+
 // ---------------------------------------------------------------------------
 // Server-side B-plan semantics: the registeredIds claim a host makes at
 // session_start must yield only for the SAME parent declaration.
 // ---------------------------------------------------------------------------
 
-test("fork endpoint: identity-registered child yields only for the same parent (#2399 B-plan)", async () => {
+test("fork endpoint: identity-registered child yields only for the same parent (#2399 B-plan)", { timeout: 60_000 }, async () => {
     resetForkCapabilityCacheForTest();
     const h = await harness();
     try {

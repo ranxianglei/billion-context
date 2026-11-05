@@ -14,10 +14,10 @@ README 三种使用方式背后的机制级说明。README 里每种方式只保
 |---|---|---|
 | 本会话拉起的代理 | ✅ | 出生即 armed |
 | 其他会话的 armed 共享代理(watcher 集,#1186) | ✅ | 共享本就是设计 |
-| 手工 `bili start` 常驻守护进程(用户主权区,#1660) | ✅ 默认附着 | **用户主权区**实例(无 lane、无 launch token):用户刻意维护 —— 其寿命与版本由你自己负责;仅当 `BILI_NATIVE_ATTACH_EXTERNAL=0/false` 显式关门时才拒绝 |
+| 手工 `bili start` 常驻守护进程(用户主权区,#1660) | 🔶 视情况 | **用户主权区**实例(无 lane、无 launch token):一台**已武装**的(受管共享代理,#1225)会被任何兼容 client lane 搭车;一台**未武装**的手动守护在默认(`attachPolicy: own-lane`,#2877)下**不会**被 lane 型 hook 搭车 —— 它自行派生。仅在 `attachPolicy: global-fallback`(pre-#2877)或 `attachExternal=1` 下被搭。无论哪种,寿命与版本由你自己负责 |
 | 未武装的 **lane 型**代理(崩溃会话孤儿;pre-#1330 不可验证) | ❌ 大声拒绝 | 生命周期漂移症状(#1335):搭乘等于静默复用无人管理的代理 |
 
-hook 附着前先探测候选者的 `/__bili/health`:armed → 附着并注册 watcher(现状不变);**用户主权区**候选无论看门狗状态默认附着(#1660)—— 用户刻意维护该守护进程;未武装的 **lane 型**候选(崩溃会话孤儿,或 pre-#1330 构建根本不报 `watchdog` 字段 —— 不可验证,按 unarmed 处理)被**大声拒绝**,本会话在自管端口区自拉起代理(基准口 `18787` 或该 lane 粘性漂移记录;出生即 armed、随最后一个会话消亡,#1186 watcher 语义)。版本偏斜仍被修住:代码指纹检查先行,重建/更新后的安装即使经用户主权区豁免也永不搭乘陈旧守护进程。代价:无可附着实例时每会话多一个短命代理进程(会话状态在磁盘上共享,压缩连续性不受影响);多实例告警(#394)相应变多。**逃生舱:** 配置文件 `"native": { "attachExternal": true }` 或 `BILI_NATIVE_ATTACH_EXTERNAL=1` 把附着扩展到 *lane 型*监听者(无论看门狗状态,含 pre-#1330 构建)—— 那些守护进程的寿命与版本由你自己负责;`0`/`false` 对所有人关门,包括用户主权区守护进程,强制各 lane 自拉新代理。kimi/dsh 的显式用户指定附着(`BILLION_CONTEXT_ATTACH` / 预置 `BILLION_CONTEXT_PROXY`)完全不经过发现路径,构造上豁免。
+hook 附着前先探测候选者的 `/__bili/health`:armed → 附着并注册 watcher(现状不变);一台**已武装的用户主权区**候选无论 lane 亲和策略都附着(受管共享代理,#1225);一台**未武装的用户主权区**(手动)候选仅在 `attachPolicy: global-fallback`(pre-#2877)或 `attachExternal=1` 下附着 —— 默认(`own-lane`)lane 型 hook 自行派生(#2877);未武装的 **lane 型**候选(崩溃会话孤儿,或 pre-#1330 构建根本不报 `watchdog` 字段 —— 不可验证,按 unarmed 处理)被**大声拒绝**,本会话在自管端口区自拉起代理(基准口 `18787` 或该 lane 粘性漂移记录;出生即 armed、随最后一个会话消亡,#1186 watcher 语义)。版本偏斜仍被修住:代码指纹检查先行,重建/更新后的安装即使经用户主权区豁免也永不搭乘陈旧守护进程。代价:无可附着实例时每会话多一个短命代理进程(会话状态在磁盘上共享,压缩连续性不受影响);多实例告警(#394)相应变多。**逃生舱:** 配置文件 `"native": { "attachExternal": true }` 或 `BILI_NATIVE_ATTACH_EXTERNAL=1` 把附着扩展到 *lane 型*监听者(无论看门狗状态,含 pre-#1330 构建)—— 那些守护进程的寿命与版本由你自己负责;`attachExternal` 只管辖 **lane 型**守护的*生命周期门禁*(它并不开/关对 user-zone 的附着 —— 那个轴是 `attachPolicy`);`attachUrl`(env `BILI_MCP_PROXY` / `--origin`)钉住显式目标 origin。kimi/dsh 的显式用户指定附着(`BILLION_CONTEXT_ATTACH` / 预置 `BILLION_CONTEXT_PROXY`)完全不经过发现路径,构造上豁免。
 
 附着发现在**所有**存活实例间是 lane 感知的(#1232):启动器探测实例注册表里的每一条存活记录,而不只是单个实例文件(last-writer-wins —— 并发多客户端下它可能指向别的客户端的代理),并对每个候选应用上面的门禁。兼容候选中,lane 与启动器自身声明一致的最新实例胜出;未声明 lane 的实例(用户主权区守护进程)在 lane 轴上通配,且门禁默认豁免(#1660)。`another bili instance is running` 告警(#394)也是 lane 感知的:同 lane 或无 lane 共存时触发,两个*不同声明* lane 之间保持沉默(它们的会话文件互不相交)。
 
@@ -39,7 +39,9 @@ hook 附着前先探测候选者的 `/__bili/health`:armed → 附着并注册 w
 | 逐请求头(门控在 `x-bili-plugin`) | 每次模型请求 | `x-bili-plugin-context-window`、`x-bili-plugin-max-output`、`x-bili-plugin-model` |
 | `POST /__bili/plugin/runtime-info`(回环地址) | 插件自举 + 任一上报字段变更 | `{agent, model, contextWindow?, maxOutput?, baseURL?, conversationId?, source}` |
 
-窗口解析顺序:`anthropic-beta` 协商 > 逐请求 plugin 头 > runtime-info > launcher 环境变量 > 路由配置 > models.dev 注册表 > 内置表。runtime-info 这一步:带 `x-bili-plugin` 头的请求读**按 agent 的条目**(agent+model 必须匹配);不带该头的请求解析以 `conversationId` 记录的**会话级条目**,键与会话绑定的同一会话信号一致(客户端会话头、自定义 session 头或请求体的 `prompt_cache_key`)—— 无论哪种,model 都必须匹配(#1531:omp 打 `prompt_cache_key` 但不打 plugin 头,且主/子代理会话共用 agent 名却跑不同模型)。上报的 `maxOutput` 仅在请求体自带输出预算缺席时兜底。现有实现:`src/agent/pi.ts`(覆盖 pi 与 omp)、`src/agent/opencode-native.ts`(v1)、`src/agent/opencode-v2.ts`、`src/agent/dsh-native.ts`、`src/kimi/native-mcp.ts`(仅自举时上报 —— kimi 的 provider `custom_headers` 是静态的,逐请求头会在模型切换后过期)、`hermes-plugin/__init__.py`(Python 插件:经 `llm_request` 中间件打逐请求头,`pre_api_request` hook 捕获最大输出)—— 其他客户端接入请遵循同一协议。
+窗口解析顺序:`anthropic-beta` 协商 > 逐请求 plugin 头 > runtime-info > launcher 环境变量 > 路由配置 > models.dev 注册表 > 内置表。runtime-info 这一步:带 `x-bili-plugin` 头的请求读**按 agent 的条目**(agent+model 必须匹配);不带该头的请求解析以 `conversationId` 记录的**会话级条目**,键与会话绑定的同一会话信号一致(客户端会话头、自定义 session 头或请求体的 `prompt_cache_key`)—— 无论哪种,model 都必须匹配(#1531:omp 打 `prompt_cache_key` 但不打 plugin 头,且主/子代理会话共用 agent 名却跑不同模型)。上报的 `maxOutput` 仅在请求体自带输出预算缺席时兜底。现有实现:`src/agent/pi.ts`(覆盖 pi 与 omp)、`src/agent/opencode-native.ts`(v1)、`src/agent/opencode-v2.ts`、`src/agent/dsh-native.ts`、`src/kimi/native-mcp.ts`(仅自举时上报 —— kimi 的 provider `custom_headers` 是静态的,逐请求头会在模型切换后过期)、`hermes-plugin/__init__.py`(Python 插件:经 `llm_request` 中间件打逐请求头,`pre_api_request` hook 捕获最大输出与宿主 per-model 上下文窗口 —— 窗口读自 hermes 自己的 `HERMES_HOME/context_length_cache.yaml`,任何缺失/歧义 fail-open(#3261))—— 其他客户端接入请遵循同一协议。
+
+**omp:当 OMP 的 Cowork 传输接管出口时,不打 `prompt_cache_key`(#2583/#3556)。**native omp 模式下,打上的 `prompt_cache_key` 是唯一的逐请求会话信号,其唯一消费者是 bili 自己的 fetch 层拦截器(把模型 URL 改写成 `<proxy>/bili/<url>` 并在转发前剥掉该字段)。较新的 OMP 构建带有 "Cowork 传输"(2026-07-30 引入,can1357/oh-my-pi `642892ae`;代理处理 `e22a5ff2`):默认 `anthropic`/`anthropic-messages` 请求经 node:https **直发** —— 除非显式代理环境变量(`PI_PROXY` / `PI_PROXY_ANTHROPIC`)把它们推回 Bun 的 fetch,否则根本不经过 `globalThis.fetch`。自 #3556 起,`bili omp` 启动器自行关闭了这一缺口:除非用户已设置 `PI_PROXY` / `PI_PROXY_ANTHROPIC`,否则它会导出 `PI_PROXY_ANTHROPIC=<proxy origin>`,因此在默认启动器通道上,Cowork 走可压缩通道(打上的 key 由代理消费并剥离),而非直发。打戳放弃同时门控 cert-MITM 通道 —— #3556 把它提到了目的地路由检查之上,嵌套放置会完全跳过它。在那条路径上打戳会让字段原样进入 Anthropic 严格 schema(HTTP 400 `prompt_cache_key: Extra inputs are not permitted`)。打戳闸门(`src/agent/pi.ts` 的 `stampPromptCacheKey` → `ompCoworkTransportBypassesFetch`)镜像 OMP 自己的按模型出口选择:证明直发时不打戳,并每进程每模型警告一次。后果:这些直发请求不经压缩、对代理匿名(身份/面板/账单退化 —— 与 #1403 同一取舍);其余 lane(launcher `/bili/` 改写、MITM 白名单、其他 provider/api、配置了代理的宿主)不受影响。已知残留:`NO_PROXY`/`no_proxy` 规则命中模型 host 时,即使设置了 `PI_PROXY` / `PI_PROXY_ANTHROPIC`,OMP 的代理处理也会被静默 —— 请求直发但已打戳(同类 400);这类 host 应从 `NO_PROXY` 中移除而非依赖打戳闸门。反向不对称是 fail-safe 的:OMP 的按形状 fetch 回退(Request 对象入参、非 record headers、不支持的 body)即使没有任何代理环境变量也会走回 `globalThis.fetch`,那里放弃打戳只退化身份、不会硬失败。完整覆盖需要宿主侧变更(Cowork 出口改走 `globalThis.fetch`)—— 作为边界注记记录在 #2583。
 
 launcher 环境变量这档覆盖纯代理客户端(无进程内插件):`bili <client>` 启动时读客户端自己的模型配置(codex 的 `model_context_window` / `model_max_output_tokens`,pi / omp 的 `contextWindow` / `maxTokens`,opencode 的 `limit.context` / `limit.output`,codebuddy 的 `maxInputTokens` / `maxOutputTokens`),经 `BILI_LAUNCHER_MODEL_WINDOWS` / `BILI_LAUNCHER_MODEL_MAX_OUTPUTS` 交给代理(#971)。插件上报 —— 若存在 —— 永远优先于它。
 
@@ -101,7 +103,7 @@ bili 永不拥有用户数据:每个被启动的客户端都跑在**真实 home*
 三种故障形态共享 `src/session-self-heal.ts` 里的同一族检测器,每请求评估一次(prepare 之后,仅有 nudge 的主车道;旁路/侧请求车道不积累信用):
 
 - **D2 僵尸插件车道** —— 插件已卸载(或 MCP 子进程已死)但已开着的客户端窗口仍带着插件绑定(粘滞 `metadata.pluginAgent`)。信号:连续 5 轮(`SELF_HEAL_WINDOW`)被 nudge、**无** `x-bili-plugin` 头、线上**无** bili 工具声明、**零**压缩缩减。补救:**降级为代理模式** —— 单点 `pluginMode` 翻转(`pluginAgent !== undefined && !pluginLaneDegraded(session)`)线上回注 ACP 工具、重新接管压缩 rewriter/CCR 盖章/absorb,并**保留 nudge**(工具回来了)。线上注入不可用时(`compress.injectTool=false` → `degradeAvailable=false`)退为**静默 nudge**。恢复:**活的**插件头(`pluginLaneRestore`,在 `pluginMode` 翻转**之前**调用,首个带头请求即恢复 plugin 模式 —— 恢复信号绝不能用粘滞 `pluginAgent`,否则降级一轮后即被自己清掉)。绑定保留、永不抹除。
-- **D1 nudge 空转**(非插件泛化)—— 连续 5 轮被 nudge 却零缩减、零 bili 工具调用。补救:在全部四处 `willInjectNudge` 门加 `&& !nudgeSuppressed(session)`(覆盖 emergency 路径)。恢复:任一次压缩缩减或 bili 工具调用即解除。
+- **D1 nudge 空转**(非插件泛化)—— 连续 5 轮被 nudge 却零缩减、零 bili 工具调用。补救:在全部四处 `willInjectNudge` 门加 `&& !nudgeSuppressed(session)`(覆盖 emergency 路径)。恢复:任一次压缩缩减或 bili 工具调用即解除——或者在 `SELF_HEAL_SUPPRESS_CAP_MS`(10 分钟)内两者皆无时,抑制到时自解并重新武装(#3004/#3008:上下文单调增长时永远产生不了恢复证据,纯证据式解除曾把建议通道锁死一个多小时而用量停在 ~75%)。重新武装是有界的:再空转完整一个 `SELF_HEAL_WINDOW`(5 轮)才会再次抑制;决策梯的 fallback 逃逸在抑制期间仍可打出一次性 legacy 建议(`consumeFallback` 重置计数)。
 - **D3 网关杀摘要** —— **非流式** preflight 摘要以 HTTP 524/504(Cloudflare 类)死亡时不再原地重试(旧的 transient 重试对着死网关每次烧 ~100 秒);会话在**首次**命中即学习 `metadata.preflightStreamSummary = true` 并改用 SSE 重取摘要 —— 与手动 `compress.streamSummary` 旋钮(#2133)同一学习存储,自动武装。级联双向被尊重:任一级显式 `streamSummary: false`(global → provider → model)即操作员 opt-out —— 两条学习路径都不武装、已学习的旧标志被忽略(`PreflightDeps.streamSummaryOff`)。
 
 可观测:`session.metadata.selfHeal = { detected, action, since }` 进 `/__bili/sessions`、web UI 挂"自愈"徽标、每次转换一行 `[self-heal]` 日志(检测+恢复)。`bili plugin remove <client>` 尽力查询活代理(instance 文件 → `GET /__bili/sessions`,2.5 秒超时,失败静默),该客户端近 **10 分钟**内有活跃会话时打印提示。
@@ -116,3 +118,49 @@ bili 永不拥有用户数据:每个被启动的客户端都跑在**真实 home*
 4. **用户发送的消息永不被改写。** 用户自己片段的逐字回声在武装清洗下也保留(#463 豁免,按请求文本匹配,不按形状)。
 
 出口审计网(#2248)保持仅记日志:裸出口(未识别帧、解析失败)原样转发并打 `[tag-echo] raw exit` 日志,新泄漏形状可见而不改线上行为。由 `tests/unified-acp-invariants.test.ts` 钉住(8 个测试,两条 lane)。
+
+## OpenAI 聊天线路的 `prompt_cache_key`:默认处处打戳,严格上游用受控 A/B 保护(#2218/#2645/#3556)
+
+dsh 插件道中,body-keyed 中转站能读到的身份信号只有一个:请求体的 `prompt_cache_key`(会话头 `x-bili-plugin-conversation` 是 bili 内部头、不会以原名转发;读头的中转拿的是 `x-session-id`)。两个相互冲突的群体在这里相遇:严格的直连 API 会对未知 body 字段回 400 —— 而且严格性是**同源按模型**的(#2645:同一个 NVIDIA 网关下,一个模型收这个 key,它的兄弟模型拒收);而号池(包括**远端**中转池)把这个 key 当前缀缓存路由来读,在哪里丢它都会无声地拉低那些会话的缓存命中(#1403 类的反面)。目的地形状的门控裁决不了这件事:只给回环盖章(#2649 的尝试)治好了严格 API,却让两类最大的池子群体(docker 网桥/局域网/VPS/域名池)失去亲和。最终设计 = **默认全盖章 + 实证自愈(probe-and-remember)**,在 #2649 评审中由 owner 定案:
+
+- **打戳**(`resolveRelayAffinityPck`,`src/session-id.ts`)—— 插件道对**一切**目的地默认盖 `prompt_cache_key=<会话 id>`;客户端自带的 key 在其配对被 A/B 证实前原样透传。零配置面:无新配置字段、无环境变量、无 CLI 旗标。
+- **探测**(`src/server/relay.ts`,与 #552 兼容阶梯同一 buffered-body 缝)—— 出口体带着该 key 的**第一个** 400 触发:把同一 payload 去掉 `prompt_cache_key` 后重发一次。重试成功 ⇒ 因果坐实:采用该响应,把 `origin(+model)` 记入进程内存(`src/pck-probe.ts` —— **仅内存**,重启重新探测)。重试也失败 ⇒ 不是这字段的锅:丢弃重试,把原始 400 原样转发,什么都不学 —— key 保留,下一轮再探(400 成因很多;只有 A/B 判词可以停用)。每请求至多探一次;无循环。
+- **记忆效应** —— 被停用的配对在后续轮次同时停掉 bili 自己的戳和客户端自带的 key(否则每轮都要重付一次 400 往返)。粒度是 origin+model:共享池源上一个严格模型不影响兄弟模型。解析不了的 origin 一律 fail-open(保持盖章)。
+- **可见性** —— 首次停用打 WARN 日志,写明 origin/model、受影响会话、以及号池提示(该目的地可能是你的中转/号池,前缀缓存亲和可能下降);`acp_status` 段与网页面板横幅(中英)展示当前停用列表与会话;脚本可经 `GET /__bili/status` 的 `pckSuppressions` 字段读取。全程进程级状态,重启即清空并重新探测。
+- **双模式推理** —— 只有插件道(注册 agent / dsh 插件,内部会话头在场)会打戳;纯代理模式双向都是原样透传,逐字节不变。
+
+pi/omp 线路沿用各自的独立打戳门(上文 Responses 线路的 `prompt_cache_key` 提升、Cowork 弃戳)——本节只讲 OpenAI **聊天**线路。
+
+### #5079:政策反转 —— 自注入默认关闭,一个开关管住两条 wire
+
+owner 定案(取代 #2649 的默认全盖章裁决):大量服务见到这个字段会直接拒绝请求,而这类服务无法预先枚举 —— 所以 bili 不再主动写自己的 `prompt_cache_key`,除非用户要求。闸门是**既有**的 `promptCache.routing` 开关(`ACP_PROMPT_CACHE_ROUTING`,或 Web UI 快速配置),现在同时管住 bili 在**两条 wire** 上的自注入 —— 不新增任何配置面:
+
+- `"disabled"`(新默认;无法识别的值一律落到这里):bili 任何地方都不写自己的 key。客户端自带的 key 不受此闸门影响 —— 任何模式下都原样转发(上面的 A/B 探测记忆仍会撤掉已被证实拒收该 key 的 origin+model 组合上的客户端 key)。
+- `"auto"`:完全等于 #5079 之前的行为 —— chat wire 每个插件车道请求都盖,Responses wire 仅对 `api.openai.com` 注入。
+- `"enabled"`:所有支持的车道都盖/注(Responses wire:任意 host)。
+
+chat wire 上 bili 自己 vs 客户端自带:插件车道上,请求体里等于绑定会话 id 的 key 只可能是 bili 自己的机制回显(让客户端 key 赢得身份绑定的提升机制要求内部会话头缺席),因此算 bili 自注入、`"disabled"` 下被剥掉;其他取值保持客户端所有、原样转发。Responses wire 同理:显式 body key 等于会话 id 且身份未被提升时算 bili 自己打的(omp/dsh 扩展所打);身份已提升则说明是客户端提供的。
+
+升级提示(owner 要求):运行 `"disabled"` 的实例展示一次性提示 —— Web 面板横幅(可关闭,按实例持久化在 state 目录 `upgrade-notices.json`)、`acp_status` 一行、启动日志一行 —— 点名应切回 `"auto"`/`"enabled"` 的人群:workbuddy panel/hub 之类的中转站与号池,缺了这个 key 流量随机路由、前缀缓存亲和下降。直连官方 API 的用户忽略即可。关闭提示不会改动 routing 的值。
+
+测试:`tests/issue5079-pck-default-off.test.ts`(解析兜底、双 wire 矩阵含 bili 回显行、提示模块、默认关/auto 成对的活代理出口断言)+ `tests/issue2218-relay-affinity-signal.test.ts` 的更新矩阵。
+
+## 全量重发水位快路径(#5403 / #5418)
+
+插件车道宿主(dsh threads 模型等——每轮把完整历史加新尾巴整体重发的客户端)过去每轮要付三笔钱:整包 body 的 `JSON.parse`、全量 `openaiToCore` 转换、以及把结果 AST 钉进 `session.lastMessages` 跨轮驻留(`snapshotMessages`)。#5403 的规模(2 万消息、每轮约 81 MiB 入站)下,这一对就是两小时内六次撞爆 JS 堆上限的生产者。
+
+现在这条车道携带一个水位线。每个成功的插件车道 chat-completions 响应都会盖 `x-bili-pf-seq` = 该请求 `messages` 数组的服务端实测元素数 T。T 由 `src/server/fastpath-scan.ts` 的单遍结构扫描器测出(字符遍历 + 字符串状态机):它验证足够的 JSON 以可信,但只分配跨度偏移——无 AST、无全量解析。客户端收敛为**一台状态机**(`src/agent/pf-channel.ts`)+ **一个发戳点**:全局 fetch 拦截(`src/agent/native-intercept.ts`)对全部插件车道模型请求盖 `x-bili-pf-count`(与下文 v2 tail-ids)——`/bili/` 路由分支、provider URL 重写分支(attach 模式、V1 fetch patch)、**以及直连代理的自分支**(provider URL 直指 bili 根,dsh profile bundle 即此类)三条出网点盖戳+学习对称(自分支是容器化 gate 跑出「该车道静默永不盖戳」后补的)——车道从此不再各自实现握手。
+
+**与增量车道(#3248/#4491)的关系——可同开、互不双处理**:两机制打的是同一个痛点(插件宿主全量重发),但按**请求形状逐回合分轨**。dsh shim 的 divert 只接 **anthropic wire** body(`wireMessagesLookAnthropic`;OpenAI tool 形态 `role:"tool"`/`tool_calls` 恒走全量重发,#3433)——而 #5403 恰是相反的线(chat-completions / openai profile),增量车道在那种会话里从不发散。所以两条是互补不是竞争:anthropic-wire 插件会话归增量车道,OpenAI chat-completions 插件会话归水位快路径。单个请求恒走其中一条路(shim 逐回合二选一);服务端对带 `x-bili-plugin-turn` 标记的请求整体跳过水位判定(不打混合标),divert 响应不盖 pf-seq(盖的是 `x-bili-applied-seq`);lane 重入的合成请求头上游用显式白名单(`PASSTHROUGH_HEADERS`),不含 pf-* → 握手头经这条路也漏不出去。残留无害情形:混用会话里陈旧 `x-bili-pf-count` 可能多陪跑一次验证轮,响应当轮重盖真值即收敛。
+
+身份通道 v2/v3(owner 层级 msgid>顺序>hash,#11):裸 count 只按**位置**钉边界——保元素数改写的客户端不可见。我们的 shim 在环时,请求额外携带 `x-bili-pf-tail-ids`:元素 K−1(上一轮锚点)的宿主 msgid + 全部新增元素——「几个,不是几十个」。宿主不在 chat-completions body 里发 id,但我们注入的扩展能从宿主上下文读到(与增量信封同一套逐元素规则,#4491),因此不需要宿主发版。线上形态为**逐段**百分号编码(`ids.map(encodeURIComponent).join(",")`):分隔逗号保持字面量、id 内部的逗号走 %2C,服务端「先拆后解」对任意 id 字母表都无歧义。**不做对齐证明**(owner 裁定 2026-11-02:宿主本就压缩/改写历史,证明门槛与现实对抗、反而杀死通道——msgid 永不复用,顺序在已验证增量窗内绑定身份,字节级头部比对才是边界真值)。采集因此是**逐槽**的:拿不到可用宿主 id 的元素(native-compaction 摘要 `acp_summary_*`、persona 副车、外来形状、重复 id)随未知槽占位符 `?`(线上 `%3F`)旅行,不毒害邻居;只有整份都解析不出来才清空存储。判决:长度不符/真实 id 重复/坏段 ⇒ **静默降级本轮、不计熔断**(shim↔代理失步靠 legacy 路径+重盖戳自愈);prevId ≠ 存锚 ⇒ UNcredited,且仅当**两侧都是已知 id**时才校验——任一侧是 `?` = 无身份主张(不惩罚)。缺头 ⇒ 纯计数模式,v2 之前的一切行为逐字不变。车道覆盖是**协议统一**的(owner 裁定:客户端之间只允许「在哪拿到 id」不同,其余一律归一):dsh 从宿主 dispatch 上下文逐槽直读(`pfSlotIdsOf`,`?` 占位,见上);pi 用共享 entry walker 按出体族对齐 session branch 条目(anthropic `laneMsgIdsForWire`,openai-chat `laneMsgIdsForOpenAiWire`);opencode 复用其 messages-transform 钩子为增量信封已对齐的同一份验证列表(#4491),omp 用 fetch 层「宿主 `before_provider_request` 暂存 branch 条目 vs 实际出体」的对齐结果(`ompTurnMsgIds`,与信封共用同一份;**仅跑 anthropic wire 回合**——其严格 count+role 证明桥不过 config-assembled 前导 system 段,失败清空会抹掉共享钩子对同一会话刚落下的列表;openai 形回合由共享 `laneMsgIdsForOpenAiWire` 解析器单独覆盖,#2583)。pi/opencode/omp 的 walker 解析器仍是全有全无、整份失败即清空存储列表(它们的失败意味着**位置知识本身缺失**,清空是诚实的)——无法证明的请求降级回纯计数,绝不骑陈旧锚点;dsh 逐槽采集不受此限(见上)。一条协议注记:chat-completions 的 body 以前导 system|developer 元素开头,它们由 config/state 组装、**没有 branch entry**;openai 解析器用位置钉死的合成令牌(`bili-ps-<i>`——槽位稳定、字符安全、不可能与 8-hex uuid entry id 混淆)覆盖该前导段,链不会死在第一个 system 元素上,槽位挪动则像真实改写一样诚实断锚(UNcredited,自愈)。
+
+命中条件:窗口起点 K 已定局、进程内种子(上一轮的 canonical cores,模块级 `WeakMap<Session, …>`,刻意放在 Session 对象之外,让面板字段分解如实反映会话真相)恰在该 count、同模型下盖过戳。**v4 计数降级(owner 裁定 2026-11-02)**:某轮带形状合格且宽度与服务端账本吻合(`len = T − K + 1`,服务端重验)的 `x-bili-pf-tail-ids` 列表时,K 取自**服务端账本**(`seed.stampT`),回带的 `x-bili-pf-count` 该轮降级为纯诊断——缺失或错乱的回显不再产生 miss(决策串留痕 `hit(no-count)` / `hit(count-off=N)`,永不喂熔断);无合格列表时 pre-v4 阶梯逐字节不变(回带值须等于 `stampT` 且严格小于 T)。前 8 个元素重转后 system 逐字一致、窗口首非 system/developer(hoist 会失步 `reconcileSystemAnchor`)。命中时管道拿到的是「[种子 cores] + [尾窗 [K..T) 现解析的 cores]」而非全量解析,且 `snapshotMessages` 只钉尾窗。尾窗 cores 必须按前缀重新编号:`openaiToCore` 铸造 cluster id 按调用内出现次序(`h_<sha256-16>` 基名加 `_N` 后缀)、`wireIndex` 取自所给数组的位置——前缀里出现过同样内容基名的,窗口这边必须接上序号,否则账本身份契约就断;K=1 时不重编号甚至会把两条不同的 wire 消息**合并**成一条(prune 的 first-user-pin 在同一 wireIndex 上扩展 run)。
+
+失败即软着陆(反偏离锁):legacy 管道代码**原封未动**——本特性只在调用方喂进去的输入上做替换,任何疑点(无/坏/旧 stamp——除非 v4 账本级 tail-ids 列表撑场、count 倒退、零增长——零增长即便带合格单元素列表也保 `no-progress`(空窗会钉空 `lastMessages` 基线)、模型切换、头部漂移、hoist 险、扫描失败、熔断器持有)整轮回退到那条没动过的全量路径,然后**重新盖戳**,客户端一轮之内收敛到真值。5 次连续「可归因」(credited)miss 触发熔断,车道停摆一小时不再取命中——持有期间仍持续扫描并盖戳(如果持有期不发戳,客户端水位线就永远卡在旧值,这个死锁在上线前已被单元测试抓住并钉死)。可归因指能证明不是我们错(客户端说谎或改写了历史);未播种/零增长这类 miss 免费。
+
+声明的信任边界(§7.4——必须人工评审,禁止自动合并):**保元素数不变的前缀字节改写不可检测**——锚点除外:v2 在锚点比对 carried prevId 与存锚,id 重铸 = 一次 UNcredited miss + 下一轮自愈。这就是跳过逐条字节复核的全部代价;该代价已过 §7.4 人工评审,故以**实验性灰度**出厂——默认仅约 5% 的安装开启(owner 裁定 2026-11-02:先小流量,web 面板对全部安装显示一次性公告直到关闭、快速配置提供三态开关),A/B 黄金测试钉死出站字节逐字一致,并提供 per-install 开/关(`rollout.features.pluginFullResendWatermark: true|false` / `BILI_ROLLOUT_PLUGIN_FULL_RESEND_WATERMARK=1|0`)。破坏性改写(通告 compaction、截断、重排)都会改变 count,在任何陈旧 core 喂给内核之前就被判掉——在 v4 下这道拦截从客户端回显移到宽度算式本身:前缀收缩要求一个非正宽度,任何 id 列表都不可能满足,credited `ahead` / `seed-stale` 判决与 pre-v4 完全一致地触发。
+
+诚实边界:(1) 一旦多模态尾部(含 `image_url` 的 content array)进入缓存,该段历史此后整段降级回 legacy 全量轮——kernel 按位置区分 user 图片消息在尾部与在历史中部的渲染,冻结缓存无法做到位置无关地复现 legacy 字节;纯文本工作负载(#5403 报告者的形态)不受影响。(2) 每次命中会现解析头部 8 个元素,只为做 system-run 校验。(3) 两个 `x-bili-pf-*` 头都在转发上游前剥掉(`UPSTREAM_HOP_HEADERS`)——协议头绝不漏进模型流量。
+
+实测(出处:`tests/issue5403-watermark-fastpath.test.ts`,同语料 hermetic 双代理 A/B):命中轮完全跳过全量解析/转换/钉存;含一个 multipart 图片落位回合的 8 回合语料上,常驻 `lastMessages` 8684 B → 1210 B(7.2×);全程出站字节与 legacy 逐字一致(仅 kernel `time="…"` 属性归一);两个阶段捕获到的上游请求里均无 `x-bili-pf-*`。单元覆盖:`tests/fastpath.test.ts`(verdict 阶梯全表,含熔断 TTL 解除后重播种)、`tests/fastpath-scanner.test.ts`(对抗 JSON 表、深度上限、surrogate 对、5 万元素规模)、`tests/lane-decisions-matrix.test.ts`(门矩阵,双向)。

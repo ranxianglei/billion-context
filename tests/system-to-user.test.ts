@@ -85,3 +85,18 @@ test("systemToUser: the issue #377 wire shape — mid-stream block summaries bec
     }
     assert.deepEqual(out.map((m) => m.content), ["m00240", "b1", "m00250", "b2", "m00329"]);
 });
+
+test("systemToUser #4166: with a predicate only approved messages re-voice — client mid system stays system", () => {
+    const msgs: Array<{ role: string; content: string; id?: string }> = [
+        { role: "user", content: "u1" },
+        { role: "system", content: "summary-b3", id: "acp_summary_b3" },
+        { role: "system", content: "tool_addition client data" },
+        { role: "user", content: "u2" },
+    ];
+    const isCarrier = (m: { role: string; content: string; id?: string }): boolean =>
+        typeof m.id === "string" && m.id.startsWith("acp_summary_") && m.role === "system";
+    const out = systemToUser(msgs, (m) => isCarrier(m));
+    assert.deepEqual(out.map((m) => m.role), ["user", "user", "system", "user"], "carrier re-voiced, client system verbatim");
+    assert.equal(out[2], msgs[2], "client mid system message must be the SAME object (untouched)");
+});
+

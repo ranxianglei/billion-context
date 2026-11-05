@@ -93,6 +93,7 @@ function listen(srv: http.Server): Promise<void> {
 }
 async function closeServer(srv: http.Server): Promise<void> {
     srv.close();
+    srv.closeIdleConnections?.();
     await Promise.race([once(srv, "close"), new Promise((r) => setTimeout(r, 2000))]);
 }
 

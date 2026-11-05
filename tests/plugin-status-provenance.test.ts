@@ -83,7 +83,7 @@ async function harness() {
         const wait = new Promise<void>((resolve) => { release = resolve; });
         gate = { entered, wait };
         return { waiting, release };
-    }, close: async () => { store.cancelAll(); proxy.close(); upstream.close(); await Promise.all([once(proxy, "close"), once(upstream, "close")]); } };
+    }, close: async () => { store.cancelAll(); proxy.close(); proxy.closeIdleConnections?.(); upstream.close(); upstream.closeIdleConnections?.(); await Promise.all([once(proxy, "close"), once(upstream, "close")]); } };
 }
 
 test("HTTP usage -> compress -> decompress -> request keeps context provenance separate from billing", async (t) => {

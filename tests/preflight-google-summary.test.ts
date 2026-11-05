@@ -150,8 +150,10 @@ test("e2e preflight (#829): a Gemini summary reply that streams although the cal
         assert.ok(markers < 12 * 250, `the folded payload must drop raw marker text, still carried ${markers}`);
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });
@@ -184,8 +186,10 @@ test("e2e preflight (#829): the JSON summary of a non-streaming Gemini call is r
         assert.ok(body.includes("forwarded to the model"), `the model reply reached the client, got: ${body.slice(0, 300)}`);
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });

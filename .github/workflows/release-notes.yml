@@ -77,6 +77,27 @@ jobs:
                 console.error(e.version, ': date must be YYYY-MM-DD, got', JSON.stringify(e.date));
                 process.exit(1);
               }
+              // #3719 item4: optional bilingual summary + version targeting.
+              if (e.summaryZh !== undefined && (typeof e.summaryZh !== 'string' || !e.summaryZh.trim())) {
+                console.error(e.version, ': summaryZh must be a non-empty string when present');
+                process.exit(1);
+              }
+              if (e.summaryZh !== undefined && e.summaryZh.length > 400) {
+                console.error(e.version, ': summaryZh too long (' + e.summaryZh.length + ' chars, cap 400)');
+                process.exit(1);
+              }
+              if (e.minVersion !== undefined && !semver.valid(e.minVersion)) {
+                console.error(e.version, ': minVersion must be valid semver, got', JSON.stringify(e.minVersion));
+                process.exit(1);
+              }
+              if (e.maxVersion !== undefined && !semver.valid(e.maxVersion)) {
+                console.error(e.version, ': maxVersion must be valid semver, got', JSON.stringify(e.maxVersion));
+                process.exit(1);
+              }
+              if (e.minVersion !== undefined && e.maxVersion !== undefined && semver.gt(e.minVersion, e.maxVersion)) {
+                console.error(e.version, ': minVersion must be <= maxVersion');
+                process.exit(1);
+              }
             }
           "
 

@@ -1,6 +1,37 @@
 import { baseIdOf, summaryMessageId } from "./prune.js";
 import type { CompressionState, CoreMessage } from "./types.js";
 
+/** #4316 layer 3: true when any visible message's ledgerSeq stamp falls
+ * inside the block's exact interval claim. Unbounded blocks and unstamped
+ * views answer false — the id path decides those. The -1/-1 "no claim"
+ * sentinel (PR #4725 N1) also answers false: it is absence of evidence, not
+ * a positional claim (a [0,0] row IS a real claim over seq 0). */
+function blockSeqPresent(
+  block: { startSeq?: number; endSeq?: number },
+  messages: CoreMessage[],
+): boolean {
+  if (
+    typeof block.startSeq !== "number" ||
+    typeof block.endSeq !== "number" ||
+    block.startSeq < 0 ||
+    block.endSeq < block.startSeq
+  ) {
+    return false;
+  }
+  for (const message of messages) {
+    const seq = message.ledgerSeq;
+    if (
+      typeof seq === "number" &&
+      Number.isInteger(seq) &&
+      seq >= block.startSeq &&
+      seq <= block.endSeq
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
 export interface SyncResult {
   state: CompressionState;
   deactivated: string[];
@@ -46,6 +77,42 @@ export function syncBlocks(
     nextBlockId: state.nextBlockId,
     nextRunId: state.nextRunId,
     deadRefs: state.deadRefs ? [...state.deadRefs] : undefined,
+    // #3769 orphan-cleanup ledgers — same carry set as cloneState: dropping any
+    // of these here would wipe them before the hide-compress-calls node reads
+    // them (this node runs first), silently disabling both the fold-gated sweep
+    // and the legacy hiddenOrphanRefs upgrade-compat clause every turn.
+    hiddenOrphanRefs: state.hiddenOrphanRefs ? [...state.hiddenOrphanRefs] : undefined,
+    sweptOrphanCallIds: state.sweptOrphanCallIds ? [...state.sweptOrphanCallIds] : undefined,
+    pendingOrphanSweepMinRef: state.pendingOrphanSweepMinRef,
+    // #3939 ③: the truncation latch must survive the sync node — dropping it
+    // here would re-expose clipped bytes mid-history after a sync carried the
+    // rest of the state (#3691 oscillation via the sync path).
+    emergencyTruncateLatch: state.emergencyTruncateLatch
+      ? state.emergencyTruncateLatch.map((e) => ({ ref: e.ref, text: e.text }))
+      : undefined,
+    // #3939 ②: the render deferral must survive sync — losing it would stamp
+    // migration tags mid-history after a sync carried the ref map (#3805).
+    renderDeferredRefs: state.renderDeferredRefs
+      ? [...state.renderDeferredRefs]
+      : undefined,
+    // #3939 ⑤: the view latch must survive sync — losing it re-derives
+    // transform output mid-history after a sync carried the state (#3805).
+    viewLatches: state.viewLatches
+      ? Object.fromEntries(
+          Object.entries(state.viewLatches).map(([k, v]) => [k, { ...v }]),
+        )
+      : undefined,
+    viewLatchConfigDigest: state.viewLatchConfigDigest,
+    // #4797: the one-time ledger-alignment gate MUST survive the sync clone —
+    // dropping it re-arms restampRefsToLedger on every turn, re-populating
+    // the host's superseded map forever (the "one-time" restamp stops being
+    // one-time; reference/ref-keyed-surfaces.md, flag-propagation contract).
+    refLedgerAligned: state.refLedgerAligned,
+    // #4313: first-sight time stamps must survive the sync clone — dropping
+    // them here would re-mint every stamped message a fresh wall-clock value
+    // on the very next turn (timestamp drift = receipt range churn, and the
+    // stored-value contract of the tag's time attribute broken).
+    tsStamps: state.tsStamps ? { ...state.tsStamps } : undefined,
   };
 
   // Refs are additive (assignRefs never removes them from messageRefs), so
@@ -89,9 +156,15 @@ export function syncBlocks(
     // (pruned view) is still present — the summary IS the block's visible
     // representation. Without this, hosts passing pruned views would lose
     // block activity every turn.
+    // #4316 layer 3: a block with an exact ledger interval is also still
+    // present when ANY visible message carries a ledgerSeq stamp inside the
+    // interval — the host restored/re-stamped the originals (fresh ids, same
+    // positions), and the positional claim survives the id churn that the
+    // id-membership check above just missed.
     const stillPresent =
       block.effectiveMessageIds.some((id) => presentBases.has(baseIdOf(id))) ||
-      presentIds.has(summaryMessageId(block.blockId));
+      presentIds.has(summaryMessageId(block.blockId)) ||
+      blockSeqPresent(block, messages);
     if (!stillPresent) {
       block.active = false;
       deactivated.push(block.blockId);

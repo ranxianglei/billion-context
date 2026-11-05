@@ -4,9 +4,10 @@ import type { ProxyOptions } from "../config.js";
 import { type AnthropicRequestBody, type GoogleFunctionDeclaration, type GoogleTool, type OpenAITool } from "acp-kernel/wire";
 import { appendSystemText } from "../util.js";
 import { absorbEnabled, absorbToolName } from "../absorb.js";
-import { BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, BILI_ACP_TOOLS_GOOGLE, BILI_ACP_TOOLS_GOOGLE_NO_RANGE, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_OPENAI_NO_RANGE, BILI_ACP_TOOLS_RESPONSES, buildAbsorbSystemPrompt, buildAcpTagsOnlyPrompt, buildCompressSystemPrompt, withMarkerIntegrityNote, withSummaryBudgetNote } from "../compress-tool.js";
-import { externalSummaryEnabled, withExternalSummaryTools } from "../external-summary-surface.js";
+import { BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, BILI_ACP_TOOLS_GOOGLE, BILI_ACP_TOOLS_GOOGLE_NO_RANGE, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_OPENAI_NO_RANGE, BILI_ACP_TOOLS_RESPONSES, buildAbsorbSystemPrompt, buildAcpTagsOnlyPrompt, buildCompressSystemPrompt, packOwnsDescription, ptcNoteMode, withAcpNotes, withAcpNotesOpenAI, withMarkerIntegrityNote, withMcpDialectNote, withSummaryBudgetNote, withProjectAttribution } from "../compress-tool.js";
+import { conversationPromptSections, externalSummaryEnabled, messageTimestampSections, withExternalSummaryTools } from "../external-summary-surface.js";
 import { forceTextProtocol as knobForceTextProtocol, renderNone as knobRenderNone } from "../knobs.js";
+import { GENERATION_BOUNDARY_NOTE } from "../generation-boundary.js";
 
 export function injectSystem(
     parsed: AnthropicRequestBody,
@@ -15,18 +16,25 @@ export function injectSystem(
     config: Config,
     surface?: PackSurface,
     visibilityMarkers = true,
+    suppressCompressPrompt = false,
+    mcpDialectNote = false,
+    generationBoundaryActive = false,
 ): string | AnthropicRequestBody["system"] {
     // ONLY the static compress prompt goes into the system block — it is the
     // prefix-cache anchor and must stay byte-stable across turns. The nudge
     // (which changes every turn) is appended as a trailing user message by
     // the caller (prepareAnthropic), never merged into system.
     const parts: string[] = [];
-    if (opts.compress.injectTool) parts.push(withMarkerIntegrityNote(withSummaryBudgetNote(buildCompressSystemPrompt(prompts, surface?.promptSections), externalSummaryEnabled(config)), visibilityMarkers));
+    let acpStandingPushed = false;
+    if (opts.compress.injectTool && !suppressCompressPrompt) { parts.push(withProjectAttribution(withMcpDialectNote(withMarkerIntegrityNote(withSummaryBudgetNote(buildCompressSystemPrompt(prompts, messageTimestampSections(conversationPromptSections(surface?.promptSections, externalSummaryEnabled(config)))), externalSummaryEnabled(config)), visibilityMarkers), mcpDialectNote))); acpStandingPushed = true; }
     else if (!knobRenderNone()) {
         // #1881: the NEVER-echo prohibition follows the rendered tags, not the tool switch.
-        const tagsOnly = buildAcpTagsOnlyPrompt("function", prompts, surface?.promptSections);
-        if (tagsOnly) parts.push(tagsOnly);
+        const tagsOnly = buildAcpTagsOnlyPrompt("function", prompts, messageTimestampSections(surface?.promptSections));
+        if (tagsOnly) { parts.push(tagsOnly); acpStandingPushed = true; }
     }
+    // #4305: standing generation-boundary note — rides the ACP standing block,
+    // byte-stable once detected; never on a view that carries no ACP surface.
+    if (generationBoundaryActive && acpStandingPushed) parts.push(GENERATION_BOUNDARY_NOTE);
     if (opts.compress.injectTool && absorbEnabled(config)) parts.push(buildAbsorbSystemPrompt(absorbToolName(config)));
     if (parts.length === 0) return parsed.system;
     // #1876: APPEND the prompt as a trailing block (client blocks byte-exact)
@@ -60,12 +68,17 @@ function mergeOwnedTools<T>(tools: readonly T[] | undefined, acp: readonly T[], 
 export function injectTool(tools: unknown[] | undefined, extras?: readonly { name: string }[], toolPrompts?: ToolPrompts, ccrOn = false, externalOn = false): unknown[] {
     // #1712: decompress's startId/endId execute only on CCR-armed sessions
     // (#1179), so serve the no-range schema when CCR is off.
-    const acp = withExternalSummaryTools(applyAcpToolOverrides(ccrOn ? BILI_ACP_TOOLS_ANTHROPIC : BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, toolPrompts), externalOn);
+    // #3252: when the client's own tools are code-mode-shaped (run_code
+    // present), the ACP entries get the exempt note — see compress-tool.ts.
+    const mode = ptcNoteMode((tools ?? []).map((t) => (t as { name?: string })?.name));
+    const acp = withAcpNotes(withExternalSummaryTools(applyAcpToolOverrides(ccrOn ? BILI_ACP_TOOLS_ANTHROPIC : BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, toolPrompts), externalOn), mode, packOwnsDescription(toolPrompts));
     return mergeOwnedTools<unknown>(tools, acp, extras ?? [], (t) => (t as { name?: string })?.name);
 }
 
 export function injectOpenaiTool(tools: OpenAITool[] | undefined, extras?: readonly OpenAITool[], toolPrompts?: ToolPrompts, ccrOn = false, externalOn = false): OpenAITool[] {
-    const acp = withExternalSummaryTools(applyAcpToolOverrides(ccrOn ? BILI_ACP_TOOLS_OPENAI : BILI_ACP_TOOLS_OPENAI_NO_RANGE, toolPrompts), externalOn) as OpenAITool[];
+    // #3252: exempt note when the client tools are run_code-shaped.
+    const mode = ptcNoteMode((tools ?? []).map((t) => t?.function?.name));
+    const acp = withAcpNotesOpenAI(withExternalSummaryTools(applyAcpToolOverrides(ccrOn ? BILI_ACP_TOOLS_OPENAI : BILI_ACP_TOOLS_OPENAI_NO_RANGE, toolPrompts), externalOn) as OpenAITool[], mode, packOwnsDescription(toolPrompts));
     return mergeOwnedTools<OpenAITool>(tools, acp, extras ?? [], (t) => t?.function?.name);
 }
 
@@ -74,7 +87,11 @@ export function injectOpenaiTool(tools: OpenAITool[] | undefined, extras?: reado
  *  (`tools[].functionDeclarations[]`), so presence is collected across every
  *  entry and the missing declarations are appended as one new entry. */
 export function injectGoogleTool(tools: GoogleTool[] | undefined, extra?: { name: string }[], toolPrompts?: ToolPrompts, ccrOn = false, externalOn = false): GoogleTool[] {
-    const acp = withExternalSummaryTools(applyAcpToolOverrides(ccrOn ? BILI_ACP_TOOLS_GOOGLE : BILI_ACP_TOOLS_GOOGLE_NO_RANGE, toolPrompts), externalOn) as GoogleFunctionDeclaration[];
+    // #3252: exempt note when the client tools are run_code-shaped.
+    const clientNames: (string | undefined)[] = [];
+    for (const tool of tools ?? []) for (const decl of tool?.functionDeclarations ?? []) clientNames.push(decl?.name);
+    const mode = ptcNoteMode(clientNames);
+    const acp = withAcpNotes(withExternalSummaryTools(applyAcpToolOverrides(ccrOn ? BILI_ACP_TOOLS_GOOGLE : BILI_ACP_TOOLS_GOOGLE_NO_RANGE, toolPrompts), externalOn) as GoogleFunctionDeclaration[], mode, packOwnsDescription(toolPrompts));
     const wanted: { name: string }[] = extra ? [...acp, ...extra] : [...acp];
     if (!Array.isArray(tools)) return [{ functionDeclarations: wanted as GoogleFunctionDeclaration[] }];
     const present = new Set<string>();
@@ -99,6 +116,8 @@ export const FORCE_TEXT_PROTOCOL = knobForceTextProtocol();
  *  loop dispatches on. Idempotent. */
 export function injectResponsesTool(tools: unknown[] | undefined, toolsToAdd: readonly { name: string }[] = BILI_ACP_TOOLS_RESPONSES, toolPrompts?: ToolPrompts, externalOn = false): unknown[] {
     // #920 rule via mergeOwnedTools: bili owns these names (see core above).
-    const base = withExternalSummaryTools(applyAcpToolOverrides(toolsToAdd, toolPrompts), externalOn);
+    // #3252: exempt note when the client tools are run_code-shaped.
+    const mode = ptcNoteMode((tools ?? []).map((t) => (t as { name?: string })?.name));
+    const base = withAcpNotes(withExternalSummaryTools(applyAcpToolOverrides(toolsToAdd, toolPrompts), externalOn), mode, packOwnsDescription(toolPrompts));
     return mergeOwnedTools<unknown>(tools, base, [], (t) => (t as { name?: string })?.name);
 }

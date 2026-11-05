@@ -61,19 +61,45 @@ export function isDesignBenign(finding: ThirdPartyFinding, pluginAgent: string |
     return false;
 }
 
-/** #2261: reverse-map a recorded conflict detail back to its plugin entry so
- *  display surfaces can tell bili's OWN siblings apart from true third parties
- *  — every other surface labels the whole "third-party-plugin" kind as a
- *  foreign compressor, which mislabels first-party siblings and commands
- *  removal of extensions that stand down by design (#820/#920). Detail shape
- *  (single producer, server.ts scan site): "<client>: <entry> (<source>)[ [suspected]]".
- *  Classifying at display time (not record time) also covers stock ledgers
- *  written by older versions before any sibling tag existed. */
-export function isSiblingConflictDetail(detail: string): boolean {
+/** #2261/#2545: parse a recorded third-party-plugin conflict detail back into
+ *  its identity parts so display surfaces can classify what the record actually
+ *  names. Detail shape (single producer, server.ts scan site):
+ *  "<client>: <entry> (<source>)[ [suspected]]". Classifying at display time
+ *  (not record time) also covers stock ledgers written by older versions before
+ *  any of these tags existed. Non-plugin detail shapes (unannounced-rewrite /
+ *  orphan-reap / native-compaction) never match. */
+interface ParsedPluginConflictDetail {
+    client: string;
+    entry: string;
+    source: string;
+    suspected: boolean;
+}
+
+export function parsePluginConflictDetail(detail: string): ParsedPluginConflictDetail | undefined {
     const m = /^(\S+): (.+) \((.+)\)( \[suspected\])?$/.exec(detail.trim());
-    if (!m) return false;
-    const entry = m[2]!;
-    return isLegacyBcpEntry(entry) || isOpencodeAcpEntry(entry);
+    if (!m) return undefined;
+    return { client: m[1]!, entry: m[2]!, source: m[3]!, suspected: m[4] !== undefined };
+}
+
+/** #2261: true when the recorded detail names bili's OWN sibling extension
+ *  (billion-context-pi / opencode-acp) — first-party family that stands down
+ *  while bili drives the session (#820/#920), never a foreign-compressor alarm. */
+export function isSiblingConflictDetail(detail: string): boolean {
+    const p = parsePluginConflictDetail(detail);
+    if (!p) return false;
+    return isLegacyBcpEntry(p.entry) || isOpencodeAcpEntry(p.entry);
+}
+
+/** #2545/#2969: true when the recorded detail names a VERIFIED non-compressing
+ *  plugin from KNOWN_NON_COMPRESSORS. Such records were only ever written as
+ *  [suspected] by the keyword rules (pre-#1736 matched bare "context"; the
+ *  ecosystem-marker rule misfires on "acp" naming Agent Client Protocol), and
+ *  must count for NO conflict severity on any display surface — the plugin
+ *  does not compress. */
+export function isDisplayOnlyConflictDetail(detail: string): boolean {
+    const p = parsePluginConflictDetail(detail);
+    if (!p) return false;
+    return isKnownDisplayOnlyPlugin(p.entry);
 }
 
 const SCAN_CACHE_TTL_MS = 5 * 60 * 1000;
@@ -84,7 +110,9 @@ const SCAN_CACHE_TTL_MS = 5 * 60 * 1000;
 // "context-viewer"/"context-memory" share the domain without compressing and
 // flooded the suspected tier with false positives. A real compressor carries
 // an action token (compress*/compact*/summar*) or the ecosystem marker "acp".
-// \b keeps embedded words ("context7", a docs plugin) from matching.
+// \b keeps embedded words ("context7", a docs plugin) from matching. Verified
+// non-compressors whose names collide with these tokens are exempted below in
+// KNOWN_NON_COMPRESSORS (#2324/#2545/#2969).
 const KEYWORD_RE = /\b(compress\w*|compact\w*|acp|summar\w*)\b/i;
 
 const cache = new Map<string, { at: number; result: ScanResult }>();
@@ -164,26 +192,43 @@ export function isOpencodeAcpEntry(entry: string): boolean {
     return bare === "opencode-acp" || /^opencode-acp@/.test(bare) || /(^|[/\\])opencode-acp([/\\]|$)/.test(trimmed);
 }
 
-// #2324: third-party plugins VERIFIED to touch only terminal rendering / tool-output
-// folding and never the model context — so a name like "pi-compact-transcript" must not
-// raise a compression-conflict alarm. Matched as an EXACT token — bare name, npm spec
-// (with or without version), or a bounded path segment — mirroring isOpencodeAcpEntry's
-// discipline so the two can't drift. Deliberately NOT a transcript/display substring rule:
-// a real compressor ("context-compactor") or a lookalike ("my-pi-compact-transcript-fork")
-// must still flag. Evidence-backed, one entry at a time.
-const KNOWN_DISPLAY_ONLY = new Set<string>([
+// #2324/#2545/#2969: third-party plugins VERIFIED to never compress the model
+// context — so their names must not raise a compression-conflict alarm. Two
+// evidence classes: read-only display/viewer plugins, and protocol adapters
+// whose keyword hit is a pure name collision ("acp" = Agent Client Protocol,
+// not the acp-kernel ecosystem marker). Matched as an EXACT token — bare name,
+// npm spec (with or without version), or a bounded path segment — mirroring
+// isOpencodeAcpEntry's discipline so the two can't drift. Deliberately NOT a
+// substring rule: a real compressor ("context-compactor") or a lookalike
+// ("my-pi-compact-transcript-fork") must still flag. Evidence-backed, one entry at a time.
+const KNOWN_NON_COMPRESSORS = new Set<string>([
     // pi terminal extension: folds tool output / re-lays AssistantMessage rendering,
     // registers display toggles; README states "changes display only" — no context
     // replacement or compression handler (#2324).
     "pi-compact-transcript",
+    // pi context viewer: read-only /context overlay showing tokens, system prompt,
+    // tools and messages; its source registers only /context and reads context/tool
+    // info — no compression or history-rewrite API (#2545). Pre-#1736 keyword rules
+    // matched its name (bare "context") and wrote stock [suspected] ledger records;
+    // isDisplayOnlyConflictDetail neutralizes those at display time.
+    "pi-context-inspector",
+    // dsh ACP protocol adapter: the "-acp" suffix names the Agent Client Protocol,
+    // NOT the acp-kernel compression ecosystem — a pure keyword collision (#2969).
+    // Its shipped cordis.patch.yml disables dsh native compaction features
+    // (compaction-basic / command-compact / tool-result-pruner); no observed double
+    // compression. Stock [suspected] records are neutralized at display time.
+    "@openma/deepseek-harness-acp",
 ]);
 
 export function isKnownDisplayOnlyPlugin(entry: string): boolean {
     const trimmed = entry.trim();
     const bare = trimmed.replace(/^npm:/, "");
-    for (const name of KNOWN_DISPLAY_ONLY) {
+    for (const name of KNOWN_NON_COMPRESSORS) {
         if (bare === name || bare.startsWith(name + "@")) return true;
-        const esc = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        // Scoped names carry an inner "/" — widen it to EITHER separator so the
+        // bounded path-segment match holds on Windows paths too (#2969); unscoped
+        // names pass through split/join unchanged.
+        const esc = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").split("/").join("[/\\\\]");
         if (new RegExp(`(^|[/\\\\])${esc}([/\\\\]|$)`).test(trimmed)) return true;
     }
     return false;

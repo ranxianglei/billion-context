@@ -4,12 +4,16 @@ import { initFooterStatus, updateFooterStatus, disposeFooterStatus } from "./foo
 const DELEGATE_WIDGET_KEY = "billion-context-pi-delegates";
 const REFRESH_MS = 500;
 const MAX_TASK_LEN = 48;
+// Silence this long on a running run warrants a warning before the idle
+// watchdog (default 5 min) kills it.
+const STALL_WARN_MS = 120_000;
 
 interface WidgetRun {
   runId: string;
   agent: string;
   task: string;
   startedAt: number;
+  lastActivityAt?: number;
 }
 
 type RunsSnapshot = () => WidgetRun[];
@@ -48,7 +52,12 @@ function renderLines(runs: WidgetRun[]): string[] | undefined {
     : `acp_delegate · ${runs.length} running`;
   const rows = runs.map((r) => {
     const elapsed = Math.max(0, Math.round((now - r.startedAt) / 1000));
-    return `  ● ${r.agent} (${elapsed}s) — ${truncateTask(r.task)}`;
+    let row = `  ● ${r.agent} (${elapsed}s) — ${truncateTask(r.task)}`;
+    if (r.lastActivityAt !== undefined && now - r.lastActivityAt >= STALL_WARN_MS) {
+      const mins = Math.max(1, Math.floor((now - r.lastActivityAt) / 60_000));
+      row += ` ⚠ no activity ${mins}m`;
+    }
+    return row;
   });
   const hint = fleetShortcut
     ? `  /acp-fleet · ${formatShortcutLabel(fleetShortcut)} — inspect`

@@ -247,8 +247,10 @@ test("e2e #604: relay 5xx on near-window payload → arm → next retry truncate
         assert.equal(s2?.stats.lastInputTokens, 5000, "real usage report overwrote the armed value");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         relay.server.close();
+        relay.server.closeIdleConnections?.();
         await once(relay.server, "close");
     }
 });
@@ -302,8 +304,10 @@ test("e2e #604: network-level failure arms the emergency shrink too", async () =
         assert.equal(s2?.stats.lastInputTokens, 5000, "real usage report overwrote the armed value");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         relay.server.close();
+        relay.server.closeIdleConnections?.();
         await once(relay.server, "close");
     }
 });
@@ -333,8 +337,10 @@ test("e2e #604: 4xx (auth) must NOT arm — no distortion of the usage signal", 
         assert.equal(s!.stats.lastInputTokens, 0, "4xx must not raise lastInputTokens (no usage signal distortion)");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         relay.server.close();
+        relay.server.closeIdleConnections?.();
         await once(relay.server, "close");
     }
 });

@@ -2,6 +2,8 @@ import { log as loggerLog } from "./logger.js";
 import type { NamedProviderRecipe } from "./config.js";
 import type { SummaryBudget } from "./external-summary.js";
 import type { PreflightProtocol } from "./preflight.js";
+import { plainHttpTrusted } from "./private-host.js";
+import { allowPrivateHttpProviders } from "./knobs.js";
 
 interface ExternalSummaryTarget {
     name: string;
@@ -24,6 +26,20 @@ export interface ExternalSummarySettings {
     enabled: boolean;
     targets: ExternalSummaryTarget[];
     budget: SummaryBudget;
+    /** [#2657] Shared summary-queue pool size while this chain's work is in
+     *  flight: integer [SUMMARY_CONCURRENCY_MIN, SUMMARY_CONCURRENCY_MAX],
+     *  default SUMMARY_CONCURRENCY_DEFAULT. Absent → the executor's base
+     *  size; present → the pool grows to it for the batch lifetime (the
+     *  largest request among in-flight batches wins; see the executor). */
+    concurrency?: number;
+    /** [#autoFold] Proxy-driven growth folding: when true, preflight folds
+     *  the conversation down to `autoFoldTargetTokens` (default half the
+     *  model window) BEFORE forwarding — the model never sees a nudge and
+     *  never drafts compression plans. Requires the chain itself to stay
+     *  enabled; an unresolvable target disables the chain and thus the
+     *  auto-fold (nudges come back). */
+    autoFold?: boolean;
+    autoFoldTargetTokens?: number;
 }
 
 /** A chain as it sits in the config file: model references into the named
@@ -32,12 +48,21 @@ export interface ExternalSummarySettings {
 export interface ExternalSummaryChain {
     enabled: boolean;
     targets: string[];
-    budget: SummaryBudget;
+    budget?: SummaryBudget;
+    concurrency?: number;
+    autoFold?: boolean;
+    autoFoldTargetTokens?: number;
 }
 
 const SUMMARY_DEFAULT_BUDGET: Readonly<SummaryBudget> = {
     totalTimeoutMs: 50_000, targetTimeoutMs: 25_000, maxSummaryBytes: 64 * 1024,
 };
+
+/** [#2657] Shared summary-queue pool size: one process-wide executor serves
+ *  every session, so the knob sizes THAT pool (it cannot be per-session). */
+const SUMMARY_CONCURRENCY_MIN = 1;
+const SUMMARY_CONCURRENCY_MAX = 32;
+export const SUMMARY_CONCURRENCY_DEFAULT = 4;
 
 export function validSummaryCredentialName(value: string): boolean {
     return /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(value);
@@ -63,13 +88,80 @@ function text(value: unknown, limit: number): string {
     return value.trim();
 }
 
+export const AUTO_FOLD_TARGET_MIN = 8_192;
+const AUTO_FOLD_TARGET_MAX = 10_000_000;
+
+/** [#3444] A growth fold must be EXPECTED to save at least this much to run,
+ *  and a fold that actually saved less arms the backoff instead of re-firing
+ *  next request: below this, the fixed cost of an external-summary round trip
+ *  (latency + quota + cache invalidation) outweighs the saving — a sub-floor
+ *  target used to burn such marginal folds on EVERY request (fold storm). */
+export const AUTO_FOLD_MIN_BENEFIT_TOKENS = 4_096;
+
+/** [#autoFold] Both parsers share the exact switch/target semantics: the
+ *  target is only meaningful with the switch on; the switch defaults to
+ *  half the model window at trigger time. */
+function parseAutoFold(settings: Record<string, unknown>): { autoFold?: boolean; autoFoldTargetTokens?: number } {
+    let autoFold: boolean | undefined;
+    if (settings.autoFold !== undefined) {
+        if (typeof settings.autoFold !== "boolean") throw new Error("External summary autoFold must be boolean");
+        autoFold = settings.autoFold;
+    }
+    let autoFoldTargetTokens: number | undefined;
+    if (settings.autoFoldTargetTokens !== undefined) {
+        if (typeof settings.autoFoldTargetTokens !== "number" || !Number.isSafeInteger(settings.autoFoldTargetTokens)
+            || settings.autoFoldTargetTokens < AUTO_FOLD_TARGET_MIN || settings.autoFoldTargetTokens > AUTO_FOLD_TARGET_MAX) {
+            throw new Error(`External summary autoFoldTargetTokens must be an integer between ${AUTO_FOLD_TARGET_MIN} and ${AUTO_FOLD_TARGET_MAX}`);
+        }
+        autoFoldTargetTokens = settings.autoFoldTargetTokens;
+    }
+    // A target without the switch is inert config noise, not an error; the
+    // switch without a target is the normal "half the window" default.
+    if (autoFold !== true) return {};
+    return { autoFold, ...(autoFoldTargetTokens !== undefined ? { autoFoldTargetTokens } : {}) };
+}
+
+/** [#2657] Pool sizing rides the same enabled-gate as autoFold: parsed only
+ *  on an enabled chain, absent → undefined → the executor's base size. */
+function parseConcurrency(settings: Record<string, unknown>): { concurrency?: number } {
+    if (settings.concurrency === undefined) return {};
+    const value = settings.concurrency;
+    if (typeof value !== "number" || !Number.isSafeInteger(value)
+        || value < SUMMARY_CONCURRENCY_MIN || value > SUMMARY_CONCURRENCY_MAX) {
+        throw new Error(`External summary concurrency must be an integer between ${SUMMARY_CONCURRENCY_MIN} and ${SUMMARY_CONCURRENCY_MAX}`);
+    }
+    return { concurrency: value };
+}
+
 function parseBudget(raw: unknown): SummaryBudget {
     const rawBudget = raw === undefined ? {} : object(raw);
     knownKeys(rawBudget, ["totalTimeoutMs", "targetTimeoutMs", "maxSummaryBytes"]);
-    const totalTimeoutMs = integer(rawBudget.totalTimeoutMs, SUMMARY_DEFAULT_BUDGET.totalTimeoutMs, 100, 50_000);
+    // totalTimeoutMs bounds the WHOLE batch (one shared deadline across every
+    // chunk); a big-session fold runs a dozen or more chunks, so the cap needs
+    // real headroom. Long waits are safe — preflight holds the client with SSE
+    // keep-alives past its undici body timeout (#2484/#1647).
+    const totalTimeoutMs = integer(rawBudget.totalTimeoutMs, SUMMARY_DEFAULT_BUDGET.totalTimeoutMs, 100, 600_000);
     const targetTimeoutMs = integer(rawBudget.targetTimeoutMs, Math.min(SUMMARY_DEFAULT_BUDGET.targetTimeoutMs, totalTimeoutMs), 100, totalTimeoutMs);
     const maxSummaryBytes = integer(rawBudget.maxSummaryBytes, SUMMARY_DEFAULT_BUDGET.maxSummaryBytes, 128, 1024 * 1024);
     return { totalTimeoutMs, targetTimeoutMs, maxSummaryBytes };
+}
+
+const seenAutoFoldInertWarnings = new Set<string>();
+
+/** [#autoFold] Surface the silent no-op: `autoFold`/`autoFoldTargetTokens` are
+ *  read only once the chain is enabled (parseAutoFold runs after the enabled
+ *  gate), so setting them on a disabled — or omitted-`enabled` — chain does
+ *  nothing. Warn once per distinct knob-set instead of failing silently; purely
+ *  diagnostic, changes no behavior. */
+function noteAutoFoldIgnored(settings: Record<string, unknown>): void {
+    const wantsAutoFold = settings.autoFold === true;
+    const hasTarget = settings.autoFoldTargetTokens !== undefined;
+    if (!wantsAutoFold && !hasTarget) return;
+    const sig = `${wantsAutoFold ? "f" : "-"}:${hasTarget ? "t" : "-"}`;
+    if (seenAutoFoldInertWarnings.has(sig)) return;
+    seenAutoFoldInertWarnings.add(sig);
+    const knobs = `${wantsAutoFold ? "autoFold" : ""}${wantsAutoFold && hasTarget ? " + " : ""}${hasTarget ? "autoFoldTargetTokens" : ""}`;
+    loggerLog("warn", `[external-summary] ${knobs} set but "enabled" is not true — the chain is off, so it has no effect. Set "enabled": true to activate auto-fold.`);
 }
 
 /** External summary chain, three-level like every other `compress` field:
@@ -78,10 +170,11 @@ function parseBudget(raw: unknown): SummaryBudget {
  *  against the providers table at expansion time (expandExternalSummaryChain). */
 export function parseExternalSummaryChain(value: unknown): ExternalSummaryChain {
     const settings = object(value);
-    knownKeys(settings, ["enabled", "targets", "budget"]);
+    knownKeys(settings, ["enabled", "targets", "budget", "concurrency", "autoFold", "autoFoldTargetTokens"]);
     if (settings.enabled !== undefined && typeof settings.enabled !== "boolean") throw new Error("External summary enabled must be boolean");
     const enabled = settings.enabled === true;
     if (!enabled) {
+        noteAutoFoldIgnored(settings);
         // A disabled chain never reads targets or budget — rejecting the
         // whole compress block over a stale typo here would disable
         // compression itself. Strict validation re-engages the moment the
@@ -97,7 +190,7 @@ export function parseExternalSummaryChain(value: unknown): ExternalSummaryChain 
         if (slash <= 0 || slash === target.length - 1) throw new Error(`External summary target "${target}" must reference a provider and model as "provider/model"`);
         return target;
     });
-    return { enabled, targets, budget: parseBudget(settings.budget) };
+    return { enabled, targets, budget: parseBudget(settings.budget), ...parseConcurrency(settings), ...parseAutoFold(settings) };
 }
 
 /** Expand chain references against the named providers table. THROWS on an
@@ -107,7 +200,7 @@ export function parseExternalSummaryChain(value: unknown): ExternalSummaryChain 
  *  (#2336 agent-registry form) — it expands to an inline-key target instead
  *  of a credential reference. */
 export function expandExternalSummaryChain(chain: ExternalSummaryChain, recipes: Record<string, NamedProviderRecipe & { apiKey?: string }>): ExternalSummarySettings {
-    if (!chain.enabled) return { enabled: false, targets: [], budget: chain.budget };
+    if (!chain.enabled) return { enabled: false, targets: [], budget: chain.budget ?? SUMMARY_DEFAULT_BUDGET };
     const names = new Set<string>();
     const targets = chain.targets.map((ref): ExternalSummaryTarget => {
         const slash = ref.indexOf("/");
@@ -128,7 +221,8 @@ export function expandExternalSummaryChain(chain: ExternalSummaryChain, recipes:
         const credentialRef = recipe.apiKeyEnv ? `env:${recipe.apiKeyEnv}` : `secret:${recipe.credentialRef}`;
         return { name, protocol: recipe.api, url: derivedSummaryEndpoint(recipe, model, stream), model, ...(inlineKey !== undefined ? { apiKey: inlineKey } : { credentialRef }), contextWindow, outputTokens, stream };
     });
-    return { enabled: true, targets, budget: chain.budget };
+    return { enabled: true, targets, budget: chain.budget ?? SUMMARY_DEFAULT_BUDGET
+        , ...(chain.concurrency !== undefined ? { concurrency: chain.concurrency } : {}), ...parseAutoFold(chain as unknown as Record<string, unknown>) };
 }
 
 /** Derive the full request endpoint from a recipe's baseUrl + api type —
@@ -147,8 +241,7 @@ function derivedSummaryEndpoint(recipe: NamedProviderRecipe, model: string, stre
         path = /\/+v\d+[a-z]*$/.test(base) ? suffix : `/v1${suffix}`;
     }
     const url = new URL(`${base}${path}`);
-    const loopback = ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
-    if ((url.protocol !== "https:" && !(url.protocol === "http:" && loopback)) || url.username || url.password || url.hash
+    if ((url.protocol !== "https:" && !(url.protocol === "http:" && plainHttpTrusted(url, allowPrivateHttpProviders()))) || url.username || url.password || url.hash
         || [...url.searchParams.keys()].some((key) => key !== "alt")
         || url.pathname.includes("/bili/") || url.pathname.startsWith("/__bili/")) throw new Error(`External summary endpoint derived from "${recipe.baseUrl}" is not usable; use HTTPS and no embedded credentials or proxy recursion`);
     return url.href;
@@ -164,10 +257,11 @@ function derivedSummaryEndpoint(recipe: NamedProviderRecipe, model: string, stre
 export function parseExternalSummarySettings(value: unknown, options: { inlineKeys?: boolean } = {}): ExternalSummarySettings {
     const inlineKeys = options.inlineKeys === true;
     const settings = object(value);
-    knownKeys(settings, ["enabled", "targets", "budget"]);
+    knownKeys(settings, ["enabled", "targets", "budget", "concurrency", "autoFold", "autoFoldTargetTokens"]);
     if (settings.enabled !== undefined && typeof settings.enabled !== "boolean") throw new Error("External summary enabled must be boolean");
     const enabled = settings.enabled === true;
     if (!enabled) {
+        noteAutoFoldIgnored(settings);
         return { enabled: false, targets: [], budget: SUMMARY_DEFAULT_BUDGET };
     }
     if (settings.targets !== undefined && !Array.isArray(settings.targets)) throw new Error("External summary targets must be an array");
@@ -185,8 +279,7 @@ export function parseExternalSummarySettings(value: unknown, options: { inlineKe
         const endpoint = text(target.url, 2048);
         let url: URL;
         try { url = new URL(endpoint); } catch { throw new Error("Invalid external summary endpoint"); }
-        const loopback = ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
-        if ((url.protocol !== "https:" && !(url.protocol === "http:" && loopback)) || url.username || url.password || url.hash
+        if ((url.protocol !== "https:" && !(url.protocol === "http:" && plainHttpTrusted(url, allowPrivateHttpProviders()))) || url.username || url.password || url.hash
             || [...url.searchParams.keys()].some((key) => key !== "alt")
             || url.pathname.includes("/bili/") || url.pathname.startsWith("/__bili/")) throw new Error("Invalid external summary endpoint; use HTTPS and no embedded credentials or proxy recursion");
         const inlineKey = inlineKeys ? target.apiKey : undefined;
@@ -208,7 +301,7 @@ export function parseExternalSummarySettings(value: unknown, options: { inlineKe
         }
         return { name, protocol, url: url.href, model, ...(inlineKey !== undefined ? { apiKey: inlineKey } : { credentialRef }), contextWindow, outputTokens, stream: target.stream === true };
     });
-    return { enabled: true, targets, budget: parseBudget(settings.budget) };
+    return { enabled: true, targets, budget: parseBudget(settings.budget), ...parseConcurrency(settings), ...parseAutoFold(settings) };
 }
 
 const seenExpansionWarnings = new Set<string>();

@@ -1,0 +1,415 @@
+// Tool-output guardrails migrated from billion-context-pi (#3066); wired into
+// createBiliPlugin for pi and omp via knobs (env > config file > default).
+// Defaults since #3331: output cap 50KB ON, repetition loop-breaker ON,
+// bash-timeout injection 60s ON (#3066 owner intent — an unsupervised bash
+// call could hang a pi session for a whole day; BILI_GUARDRAIL_BASH_TIMEOUT=0
+// restores pi-native no-default behavior, N tunes the seconds). The default
+// lives in knobs.ts, NOT here: a caller resolving through knobs must be able
+// to disable end-to-end by passing undefined. The temp-file dump on
+// bash timeout/oversize is done by the PI HOST (path surfaced via result
+// details.fullOutputPath) — we only reference it in the cap notice and never
+// write the file ourselves.
+
+import { createHash } from "node:crypto";
+import type { ExtensionAPI } from "./pi.js";
+
+const DEFAULT_TOOL_OUTPUT_MAX_BYTES = 50_000;
+const REPETITION_GUARD_DEFAULTS = { warn: 3, abort: 5 } as const;
+/** Recovery-mode hard-abort offset past the abort threshold (#5505). */
+const RECOVERY_BACKSTOP_OFFSET = 5;
+
+type ContentPart = { type: string; text?: string; [key: string]: unknown };
+type ToolContent = ContentPart[];
+
+type ToolCallEventLike = {
+    toolName: string;
+    toolCallId: string;
+    input: Record<string, unknown> & { timeout?: number };
+};
+type ToolResultEventLike = {
+    toolName: string;
+    toolCallId: string;
+    content: ToolContent;
+    isError?: boolean;
+    details?: { fullOutputPath?: string } & Record<string, unknown>;
+};
+
+// Local view of the host ctx we touch (not imported from pi.ts to avoid a
+// cycle); the real Ctx is structurally assignable since every field is optional.
+type GuardrailCtx = {
+    sessionManager?: { getSessionId?: () => string } | undefined;
+    ui?: { notify?: (message: string, type?: string) => void } | undefined;
+    abort?: (() => void) | undefined;
+};
+
+// Vendored rather than imported from the host: omp's compat bundle may omit the
+// named export, and a missing named export fails the whole module at load time.
+export function isBashToolResult(e: ToolResultEventLike): boolean {
+    return e.toolName === "bash";
+}
+function isBashToolCall(e: ToolCallEventLike): boolean {
+    return e.toolName === "bash";
+}
+
+/** When `defaultTimeout` is a positive number and the call omitted `timeout`,
+ *  return `defaultTimeout` (inject it). Any other defaultTimeout (undefined,
+ *  0, negative, NaN) means NO injection — the call goes out exactly as the
+ *  model wrote it. There is no built-in fallback: the decision lives with the
+ *  knobs layer (#3331 — pi's bash tool documents timeout as optional with no
+ *  host default; injecting one silently is a behavior change for pi users). */
+export function resolveBashTimeout(
+    input: { timeout?: number },
+    defaultTimeout: number | undefined,
+): number | undefined {
+    if (input.timeout !== undefined) return undefined;
+    const d: number | undefined = defaultTimeout;
+    if (d === undefined || !Number.isFinite(d) || d <= 0) return undefined;
+    return d;
+}
+
+export function capToolOutput(
+    content: ToolContent,
+    maxBytes: number | undefined,
+    fullPath?: string,
+): ToolContent | undefined {
+    const max = maxBytes ?? DEFAULT_TOOL_OUTPUT_MAX_BYTES;
+    if (!Number.isFinite(max) || max <= 0) return undefined;
+    const kept: ContentPart[] = [];
+    const texts: string[] = [];
+    for (const c of content) {
+        if (c.type === "text") texts.push(c.text ?? "");
+        else kept.push(c);
+    }
+    if (texts.length === 0) return undefined;
+    const combined = texts.join("\n");
+    const total = Buffer.byteLength(combined, "utf8");
+    if (total <= max) return undefined;
+    const head = keepHead(combined, max);
+    const dropped = total - Buffer.byteLength(head, "utf8");
+    kept.push({ type: "text", text: head + buildCapNotice(dropped, max, fullPath) });
+    return kept;
+}
+
+const TIMEOUT_RE = /Command timed out after (\d+) seconds/;
+
+export function detectBashTimeout(content: ToolContent): number | undefined {
+    for (const c of content) {
+        if (c.type !== "text") continue;
+        const m = c.text?.match(TIMEOUT_RE);
+        if (m) return Number(m[1]);
+    }
+    return undefined;
+}
+
+function appendTrailingText(content: ToolContent, notice: string): ToolContent {
+    const next = [...content];
+    for (let i = next.length - 1; i >= 0; i--) {
+        const part = next[i];
+        if (part && part.type === "text") {
+            next[i] = { type: "text", text: (part.text ?? "") + notice };
+            return next;
+        }
+    }
+    next.push({ type: "text", text: notice });
+    return next;
+}
+
+export function appendTimeoutNotice(content: ToolContent, secs: number): ToolContent {
+    return appendTrailingText(content, buildTimeoutNotice(secs));
+}
+
+function keepHead(str: string, maxBytes: number): string {
+    const buf = Buffer.from(str, "utf8");
+    if (buf.length <= maxBytes) return str;
+    // Walk back off a UTF-8 continuation byte so we never split a multibyte
+    // sequence (entry guarantees buf.length > maxBytes, so buf[end] is in range).
+    let end = maxBytes;
+    while (end > 0 && (buf[end] & 0xc0) === 0x80) end--;
+    let head = buf.subarray(0, end).toString("utf8");
+    const nl = head.lastIndexOf("\n");
+    if (nl >= Math.floor(maxBytes / 2)) head = head.slice(0, nl);
+    return head;
+}
+
+function buildCapNotice(dropped: number, maxBytes: number, fullPath?: string): string {
+    const where = fullPath
+        ? `Full output saved to: ${fullPath} — read it to see everything.`
+        : "To see more, narrow the query or redirect output to a file and read the relevant slice.";
+    return `\n\n[ACP guardrail: output capped at ${formatBytes(maxBytes)} (~${formatBytes(dropped)} dropped). ${where}]`;
+}
+
+function buildTimeoutNotice(secs: number): string {
+    const suggested = Math.min(Math.max(Math.ceil(secs * 2), 120), 3600);
+    return `\n\n[ACP guardrail: command killed after ${secs}s. To give it more time, re-run the bash tool with a larger \`timeout\` argument (e.g. \`"timeout": ${suggested}\`).]`;
+}
+
+function formatBytes(n: number): string {
+    return n >= 1024 ? `${(n / 1024).toFixed(1)}KB` : `${n}B`;
+}
+
+// --- Generic tool-call repetition guard (ported from bcp #308; escalation
+// retuned by #5225) ---
+// A greedy small model can re-emit the same (assistant -> toolResult) pair every
+// turn; token penalties can't break that attractor, so we key on canonical
+// identity of consecutive calls (arguments compared key-order-insensitively via
+// canonicalStringify). Escalation has TWO dimensions (#5225):
+// 1) Rapidity: any arg/tool change resets the run, and so does a previous
+//    identical call that actually EXECUTED for >= REPEAT_SLOW_CALL_MS —
+//    wall-clock work between repeats means long-polling external state (e.g.
+//    an MCP wait tool), not a rapid degenerate loop. Escalation only continues
+//    while the run stays rapid. Without duration evidence (missing/out-of-order
+//    results) the count-only behavior stands, which is the fail-safe direction.
+// 2) Staging: warnings up to the `warn` threshold; at the `abort` threshold
+//    REFUSE that one call with an explicit final warning while keeping the turn
+//    alive (a model mid-legit-poll can still react — a refused call produces no
+//    result, so no duration evidence accumulates and the ladder advances);
+//    ONLY the next identical call refuses AND aborts the turn. The old
+//    single-step warn->kill aborted legitimate bounded polling (wait tools
+//    re-issue identical args by design; the result changes with external
+//    state, the arguments do not) before its deadline.
+const REPEAT_SLOW_CALL_MS = 5000;
+export function canonicalStringify(value: unknown): string {
+    if (value === null || value === undefined || typeof value !== "object") {
+        try {
+            return JSON.stringify(value) ?? "null";
+        } catch {
+            return String(value);
+        }
+    }
+    if (Array.isArray(value)) {
+        return `[${value.map((v) => canonicalStringify(v)).join(",")}]`;
+    }
+    const entries = Object.entries(value as Record<string, unknown>)
+        .filter(([, v]) => v !== undefined)
+        .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+    return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${canonicalStringify(v)}`).join(",")}}`;
+}
+
+export function repetitionFingerprint(toolName: string, input: unknown): string {
+    const payload = `${toolName}\u0000${canonicalStringify(input ?? {})}`;
+    try {
+        return createHash("sha1").update(payload).digest("hex");
+    } catch {
+        return `unhashable:${toolName}`;
+    }
+}
+
+type RepetitionAction = "none" | "warn" | "final-refuse" | "abort" | "soft-stop" | "hard-abort";
+interface RepetitionDecision {
+    action: RepetitionAction;
+    count: number;
+    fingerprint: string;
+    toolName: string;
+    /** Count at which a hard ctx.abort() fires (abortThreshold + 5). For default
+     *  thresholds (warn=3, abort=5), backstop is 10, so hard-abort triggers on call 10. */
+    backstop: number;
+}
+
+export class RepetitionTracker {
+    private lastFp: string | null = null;
+    private count = 0;
+    private lastCompleted: { fp: string; durationMs: number } | null = null;
+    private pendingStarts = new Map<string, { fp: string; startedAt: number }>();
+    constructor(
+        private readonly thresholds: { warn: number; abort: number; recovery?: boolean },
+    ) {}
+    note(toolName: string, input: unknown, toolCallId?: string, now: number = Date.now()): RepetitionDecision {
+        const fp = repetitionFingerprint(toolName, input);
+        const done = this.lastCompleted;
+        if (done && done.fp === fp && done.durationMs >= REPEAT_SLOW_CALL_MS) {
+            // prior identical call did real wall-clock work -> long-poll, restart the run
+            this.lastFp = null;
+            this.count = 0;
+        }
+        if (fp === this.lastFp) this.count += 1;
+        else {
+            this.lastFp = fp;
+            this.count = 1;
+        }
+        if (toolCallId !== undefined) this.pendingStarts.set(toolCallId, { fp, startedAt: now });
+        let action: RepetitionAction = "none";
+        const backstop = this.thresholds.abort + RECOVERY_BACKSTOP_OFFSET;
+        if (this.thresholds.recovery && this.count >= backstop) action = "hard-abort";
+        else if (this.thresholds.recovery && this.count > this.thresholds.abort) action = "soft-stop";
+        else if (this.count > this.thresholds.abort) action = "abort";
+        else if (this.count === this.thresholds.abort) action = "final-refuse";
+        else if (this.count >= this.thresholds.warn) action = "warn";
+        return { action, count: this.count, fingerprint: fp, toolName, backstop };
+    }
+    /** Feed a tool_result back in so the next note() knows how long the call took.
+     *  Unknown/missing ids are ignored — without duration evidence the count-only
+     *  behavior stands (#5225 fail-safe). */
+    complete(toolCallId: string | undefined, now: number = Date.now()): void {
+        if (toolCallId === undefined) return;
+        const p = this.pendingStarts.get(toolCallId);
+        if (!p) return;
+        this.pendingStarts.delete(toolCallId);
+        this.lastCompleted = { fp: p.fp, durationMs: Math.max(0, now - p.startedAt) };
+    }
+    reset(): void {
+        this.lastFp = null;
+        this.count = 0;
+        this.lastCompleted = null;
+        this.pendingStarts.clear();
+    }
+    /** Invariant: stays bounded — blocked calls never fire tool_result, so the
+     *  handler completes them explicitly (#5505). */
+    get pendingCallCount(): number {
+        return this.pendingStarts.size;
+    }
+}
+
+function buildRepetitionWarnNotice(toolName: string, count: number): string {
+    return `\n\n[ACP guardrail: WARNING — you have issued ${count} CONSECUTIVE identical \`${toolName}\` calls in quick succession (same tool, equivalent arguments — key order aside). If nothing changed since the last result, re-issuing this exact call will not help; if you are deliberately waiting/polling external state, one LONGER wait beats repeated short polls. Continuing the identical call escalates to a hard refusal before the turn is aborted.]`;
+}
+
+function buildRepetitionFinalRefuseNotice(toolName: string, count: number): string {
+    return `[ACP guardrail: REFUSED — you issued ${count} consecutive identical \`${toolName}\` calls in quick succession (equivalent arguments, key order aside). This call was refused and NOT executed. FINAL WARNING: if the very next call is identical again, the guardrail will take stronger action. If you were waiting/polling external state, issue ONE longer wait instead (larger duration argument) or stop and report to the user. Changing the tool or ANY argument restarts the count.]`;
+}
+
+function buildRepetitionAbortNotice(toolName: string, count: number): string {
+    return `[ACP guardrail: BLOCKED — you issued ${count} consecutive identical \`${toolName}\` calls in quick succession despite the final refusal. This call was refused and NOT executed. You MUST change strategy: use different arguments, a different tool, or stop and report to the user. Do not re-issue the identical call. The turn has been aborted.`;
+}
+
+function buildRepetitionSoftStopNotice(toolName: string, count: number, backstop: number): string {
+    return `[ACP guardrail: BLOCKED — you issued ${count} consecutive identical \`${toolName}\` calls in quick succession despite the final refusal. This call was refused and NOT executed; identical calls will keep being refused while the turn continues. You MUST change strategy: use different arguments, a different tool, or stop and report to the user. Do not re-issue the identical call. If ${backstop} identical calls in a row are reached, the turn will be forcibly terminated.`;
+}
+
+export interface GuardrailOptions {
+    /** Seconds to inject as `timeout` when a bash call omits it. undefined =
+     *  no injection (default; pi-native semantics). */
+    bashTimeout?: number;
+    /** Combined text-output byte cap per tool result. undefined = 50KB
+     *  default; 0 = no cap. */
+    maxBytes?: number;
+    repetition?: boolean | { enabled?: boolean; warn?: number; abort?: number; recovery?: boolean };
+}
+
+function positiveInt(v: unknown, fallback: number): number {
+    return typeof v === "number" && Number.isFinite(v) && v > 0 ? Math.floor(v) : fallback;
+}
+
+function resolveRepetition(g: GuardrailOptions["repetition"]): { enabled: boolean; warn: number; abort: number; recovery: boolean } {
+    if (g === false) return { enabled: false, warn: REPETITION_GUARD_DEFAULTS.warn, abort: REPETITION_GUARD_DEFAULTS.abort, recovery: false };
+    const obj = g && typeof g === "object" ? g : {};
+    const warn = positiveInt(obj.warn, REPETITION_GUARD_DEFAULTS.warn);
+    const abort = Math.max(positiveInt(obj.abort, REPETITION_GUARD_DEFAULTS.abort), warn + 1);
+    const recovery = (obj as { recovery?: boolean }).recovery === true;
+    return { enabled: obj.enabled !== false, warn, abort, recovery };
+}
+
+export function wireToolGuardrails(pi: ExtensionAPI, opts: GuardrailOptions = {}): void {
+    const trackers = new Map<string, RepetitionTracker>();
+    const pendingWarns = new Map<string, number>();
+    const repCfg = resolveRepetition(opts.repetition);
+    const bashTimeout = opts.bashTimeout; // undefined = no injection (knobs decide)
+    const maxBytes = opts.maxBytes ?? DEFAULT_TOOL_OUTPUT_MAX_BYTES;
+
+    pi.on("tool_call", (event, rawCtx) => {
+        const ctx = rawCtx as unknown as GuardrailCtx;
+        const e = event as unknown as ToolCallEventLike;
+        if (isBashToolCall(e)) {
+            const t = resolveBashTimeout(e.input, bashTimeout);
+            if (t !== undefined) e.input.timeout = t;
+        }
+        if (!repCfg.enabled) return;
+        const sid = ctx?.sessionManager?.getSessionId?.() ?? "";
+        let tracker = trackers.get(sid);
+        if (!tracker) {
+            tracker = new RepetitionTracker(repCfg);
+            trackers.set(sid, tracker);
+        }
+        const decision = tracker.note(e.toolName, e.input, e.toolCallId);
+        if (decision.action === "final-refuse") {
+            const msg = buildRepetitionFinalRefuseNotice(decision.toolName, decision.count);
+            if (ctx?.ui?.notify) ctx?.ui?.notify(`[ACP] ${msg}`, "warning");
+            // CLEANUP: blocked calls never fire tool_result, so without this
+            // pendingStarts entries would accumulate forever.
+            tracker.complete(e.toolCallId);
+            // Deliberately NO ctx.abort() here: the refusal itself IS the final
+            // warning. The model sees this text and can still react (change
+            // args / pick another tool => the run resets). Only the NEXT
+            // identical call kills the turn (#5225: legitimate bounded polling
+            // must survive the warning stage).
+            return { block: true, reason: msg };
+        }
+        if (decision.action === "soft-stop") {
+            // Recovery mode (repetition.recovery): refuse WITHOUT killing the turn —
+            // the stuck-report steers the model instead of ctx.abort() (#5505).
+            // Termination stays guaranteed by the hard-abort backstop below.
+            const msg = buildRepetitionSoftStopNotice(decision.toolName, decision.count, decision.backstop);
+            if (ctx?.ui?.notify) ctx?.ui?.notify(`[ACP] ${msg}`, "warning");
+            // CLEANUP: blocked calls never fire tool_result, so without this
+            // pendingStarts entries would accumulate forever. Safe: 0ms duration
+            // < REPEAT_SLOW_CALL_MS (5000ms), won't reset the run.
+            tracker.complete(e.toolCallId);
+            return { block: true, reason: msg };
+        }
+        if (decision.action === "hard-abort") {
+            // Recovery-mode backstop: forced termination for models that ignore
+            // every refusal (#5505).
+            const msg = buildRepetitionAbortNotice(decision.toolName, decision.count);
+            if (ctx?.ui?.notify) ctx?.ui?.notify(`[ACP] ${msg}`, "warning");
+            // CLEANUP before abort: blocked calls never fire tool_result (#5505).
+            tracker.complete(e.toolCallId);
+            try {
+                ctx?.abort?.();
+            } catch {
+                // mid-tool abort is best-effort; the block below guarantees the refusal
+            }
+            return { block: true, reason: msg };
+        }
+        if (decision.action === "abort") {
+            const msg = buildRepetitionAbortNotice(decision.toolName, decision.count);
+            if (ctx?.ui?.notify) ctx?.ui?.notify(`[ACP] ${msg}`, "warning");
+            // CLEANUP: blocked calls never fire tool_result, so without this
+            // pendingStarts entries would accumulate forever (#5505). Safe: 0ms
+            // duration < REPEAT_SLOW_CALL_MS (5000ms), won't reset the run.
+            tracker.complete(e.toolCallId);
+            try {
+                ctx?.abort?.();
+            } catch {
+                // mid-tool abort is best-effort; the block below guarantees the refusal
+            }
+            return { block: true, reason: msg };
+        }
+        if (decision.action === "warn") {
+            pendingWarns.set(e.toolCallId, decision.count);
+        }
+    });
+
+    pi.on("tool_result", (event, rawCtx) => {
+        const e = event as unknown as ToolResultEventLike;
+        const ctx = rawCtx as unknown as GuardrailCtx;
+        trackers.get(ctx?.sessionManager?.getSessionId?.() ?? "")?.complete(e.toolCallId);
+        const isBash = isBashToolResult(e);
+        const fullPath = isBash ? e.details?.fullOutputPath : undefined;
+        const timeoutSecs = isBash && e.isError ? detectBashTimeout(e.content) : undefined;
+
+        let modified: ToolContent | undefined;
+        const next = capToolOutput(e.content, maxBytes, fullPath);
+        if (next) modified = next;
+
+        if (timeoutSecs !== undefined) {
+            modified = appendTimeoutNotice(modified ?? e.content, timeoutSecs);
+        }
+
+        const warnCount = pendingWarns.get(e.toolCallId);
+        if (warnCount !== undefined) {
+            pendingWarns.delete(e.toolCallId);
+            modified = appendTrailingText(modified ?? e.content, buildRepetitionWarnNotice(e.toolName, warnCount));
+        }
+
+        if (modified) return { content: modified };
+    });
+
+    pi.on("input", (event, rawCtx) => {
+        const ctx = rawCtx as unknown as GuardrailCtx;
+        if ((event as unknown as { source?: string }).source === "extension") return;
+        trackers.get(ctx?.sessionManager?.getSessionId?.() ?? "")?.reset();
+    });
+    pi.on("session_shutdown", (_e, rawCtx) => {
+        const ctx = rawCtx as unknown as GuardrailCtx;
+        trackers.delete(ctx?.sessionManager?.getSessionId?.() ?? "");
+    });
+}

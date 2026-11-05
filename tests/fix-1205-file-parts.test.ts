@@ -64,8 +64,10 @@ test("raw-body probe fires on file parts even without any image_url marker", () 
 });
 
 // Kernel 0.0.85 (PR #365) carries ALL user-message non-text parts through
-// the rawOpenaiContentParts sidecar, so the drop detector no longer flags
-// user messages — only non-user roles (text-only reduction) still drop.
+// the rawOpenaiContentParts sidecar, and #4166 carries mid-conversation
+// system/developer messages through the rawOpenaiMessage sidecar — so the
+// drop detector no longer flags either; only assistant/tool roles and the
+// leading system/developer run (text-only reduction) still drop.
 
 test("droppedOpenaiParts stays silent for DeepSeek-style file refs on user messages (kernel 0.0.85+ preserves them)", () => {
     const body = openaiBody([{ role: "user", content: [{ type: "text", text: "what is in this image?" }, deepseekFilePart] }]);
@@ -97,6 +99,25 @@ test("droppedOpenaiParts unions types across non-user messages and keeps the ear
         { role: "tool", content: [{ type: "file", file_id: "f" }] },
     ]);
     assert.deepEqual(droppedOpenaiParts(body), { count: 2, types: ["custom_thing", "file"], firstIndex: 1 });
+});
+
+test("droppedOpenaiParts stays silent for mid-conversation system/developer messages (verbatim sidecar, #4166)", () => {
+    const body = openaiBody([
+        { role: "system", content: "head policy" },
+        { role: "user", content: "hi" },
+        { role: "system", content: [{ type: "text", text: "declared tools:" }, { type: "tool_addition", name: "web_search" }] },
+        { role: "assistant", content: "ok" },
+        { role: "developer", content: [{ type: "tool_addition", name: "other" }] },
+    ]);
+    assert.equal(droppedOpenaiParts(body), null);
+});
+
+test("droppedOpenaiParts still counts the leading system/developer run (hoisted into systemText text-only)", () => {
+    const body = openaiBody([
+        { role: "system", content: [{ type: "text", text: "head" }, { type: "tool_addition", name: "t" }] },
+        { role: "user", content: "hi" },
+    ]);
+    assert.deepEqual(droppedOpenaiParts(body), { count: 1, types: ["tool_addition"], firstIndex: 0 });
 });
 
 test("droppedOpenaiParts counts typeless non-user parts and tolerates degenerate shapes", () => {

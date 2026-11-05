@@ -222,8 +222,11 @@ test("#2432: conflict footer stops presenting host-native landings as a second c
     recordConflict(s, "unannounced-rewrite", "359/1611 incoming message(s) carry pre-turn refs of 2196 known");
     recordConflict(s, "native-compaction", "dsh native compaction: 12/14 covered id(s) replaced by the compacted history; ACP state rebased (#2432)");
     const mixed = formatConflictSection(conflictEventsOf(s)).join("\n");
-    assert.match(mixed, /client's OWN native compaction landing/, "footer names the host-side source");
+    // #2912: the host-native landing is handled stock (rebased onto), so the footer no longer
+    // names it as the driver; the lone observed rewrite carries the (unconfirmed) diagnosis.
+    assert.match(mixed, /UNCONFIRMED signal/, "the observed rewrite carries the diagnosis");
     assert.doesNotMatch(mixed, /Keep exactly ONE compressor/, "no second-plugin hunt command when nothing foreign was confirmed");
+    assert.doesNotMatch(mixed, /Two compressors on one conversation/, "handled native landing must not re-arm the double-compression header");
 
     const s2 = makeSession();
     recordConflict(s2, "third-party-plugin", "some-other-compressor plugin detected [confirmed]");
@@ -233,5 +236,8 @@ test("#2432: conflict footer stops presenting host-native landings as a second c
     recordConflict(s3, "third-party-plugin", "maybe-a-compressor [suspected]");
     recordConflict(s3, "native-compaction", "dsh native compaction: 3/4 covered id(s) replaced; ACP state rebased (#2432)");
     const suspectedMixed = formatConflictSection(conflictEventsOf(s3)).join("\n");
-    assert.match(suspectedMixed, /client's OWN native compaction landing/, "suspected-only foreign names do not keep the hunt command either (#1736 tiering)");
+    // #2912: with the recovered native landing out of the confirmed tier, the name-only
+    // [suspected] plugin governs the (verify-first) tier, not the host-native framing.
+    assert.match(suspectedMixed, /Every event above is \[suspected\]/, "name-only tier governs when nothing is confirmed");
+    assert.doesNotMatch(suspectedMixed, /Keep exactly ONE compressor/, "suspected-only foreign names do not keep the hunt command either (#1736 tiering)");
 });

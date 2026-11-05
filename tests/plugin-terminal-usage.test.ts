@@ -111,7 +111,7 @@ async function harness(terminal: Record<string, unknown>, late = "") {
             await drain();
             store.cancelAll();
             const closed = Promise.all([once(proxy, "close"), once(upstream, "close")]);
-            proxy.close(); upstream.close();
+            proxy.close(); proxy.closeIdleConnections?.(); upstream.close(); upstream.closeIdleConnections?.();
             await closed;
         },
     };

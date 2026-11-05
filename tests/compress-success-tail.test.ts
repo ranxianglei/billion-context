@@ -135,8 +135,9 @@ test("#2404: a rejected range keeps advertising the still-offered remainder (rec
 });
 
 test("#1387: clean success that drains every compressible range emits the stop signal (pi #521)", () => {
-    // Default preserveRecentMessages: 5 → after folding m00001–m00002 the rest
-    // (m00003–m00007) sits in the protected recent zone: nothing actionable left.
+    // Pin preserveRecentMessages: 5 — the premise below needs m00003–m00007 inside
+    // the protected recent zone; #3058 moved the kernel default to 3, where m00003
+    // becomes compressible and the stop signal never fires.
     const msgs = [
         textMsg("raw_1", "user", "x".repeat(20000)),
         textMsg("raw_2", "assistant", "x".repeat(20000)),
@@ -146,7 +147,7 @@ test("#1387: clean success that drains every compressible range emits the stop s
         textMsg("raw_6", "assistant", "x".repeat(5000)),
         textMsg("raw_7", "user", "x".repeat(5000)),
     ];
-    const ctx = withRefs(makeCtx(msgs));
+    const ctx = withRefs(makeCtx(msgs, { preserveRecentMessages: 5 }));
     ctx.session.stats.lastInputTokens = 80000;
     const out = runApply(ctx, { content: [{ startId: "m00001", endId: "m00002", summary: "TAIL-TEST-SUMMARY-PAYLOAD-LONG-ENOUGH-FOR-THE-KERNEL-MIN-LENGTH-CHECK" }] });
     assert.ok(out.startsWith("[Compressed"), `expected success, got: ${out.slice(0, 120)}`);
@@ -213,9 +214,10 @@ test("#2029: estimate-grade baseline must not suppress the stop signal via phant
 });
 
 test("#1387: partial failure (some ranges rejected) keeps the old silent tail", () => {
-    // m00003–m00007 sit entirely in the protected recent zone under the default
-    // config; pairing that range with a valid one exercises the partial-failure
-    // gate: no stop verdict while errors are still owed an answer (pi #521).
+    // Pin preserveRecentMessages: 5 (old default; #3058 moved it to 3): m00003–m00007
+    // must sit entirely in the protected recent zone so pairing that range with a
+    // valid one exercises the partial-failure gate — no stop verdict while errors
+    // are still owed an answer (pi #521).
     const msgs = [
         textMsg("raw_1", "user", "x".repeat(20000)),
         textMsg("raw_2", "assistant", "x".repeat(20000)),
@@ -225,7 +227,7 @@ test("#1387: partial failure (some ranges rejected) keeps the old silent tail", 
         textMsg("raw_6", "assistant", "x".repeat(5000)),
         textMsg("raw_7", "user", "x".repeat(5000)),
     ];
-    const ctx = withRefs(makeCtx(msgs));
+    const ctx = withRefs(makeCtx(msgs, { preserveRecentMessages: 5 }));
     ctx.session.stats.lastInputTokens = 80000;
     const out = runApply(ctx, { content: [
         { startId: "m00001", endId: "m00002", summary: "TAIL-TEST-SUMMARY-PAYLOAD-LONG-ENOUGH-FOR-THE-KERNEL-MIN-LENGTH-CHECK" },
@@ -237,7 +239,59 @@ test("#1387: partial failure (some ranges rejected) keeps the old silent tail", 
         assert.ok(true, "atomic batch rejection (kernel-owned semantics)");
         return;
     }
+    // #4521: a valid range paired with an all-protected range is now partial
+    // SUCCESS, not failure — the protected range becomes a no-op warning on
+    // the receipt instead of a batch rejection. Since nothing failed and the
+    // recompute finds nothing else compressible, the stop signal correctly
+    // fires (this is the loop-terminator the failing session never got).
     assert.ok(out.startsWith("[Compressed"), `partial success expected, got: ${out.slice(0, 120)}`);
-    assert.ok(!out.includes(NO_RANGES_REMAIN_TEXT), "stop signal suppressed on partial failure:\n" + out);
-    assert.ok(!out.includes(RANGES_HEADER), "no ranges advertised on partial failure:\n" + out);
+    assert.match(out, /Range m00003\.\.m00007 folded nothing.*protected zone/s);
+    assert.match(out, /do not resend this range/);
+    assert.ok(out.includes(NO_RANGES_REMAIN_TEXT), "stop signal after a warning-only partial success:\n" + out);
+    assert.ok(!out.includes(RANGES_HEADER), "no ranges advertised when nothing compressible remains:\n" + out);
+});
+
+test("#1387: tail recompute respects the kernel's own eligibility (shouldInject=false leftovers are not advertised)", () => {
+    // #3058 moved preserveRecentMessages 5 → 3: under the default, folding
+    // m00001–m00002 leaves m00003 outside the protection window, and the live
+    // recompute returns a nudge DECISION STRUCT whose ranges list m00003 even
+    // though the kernel itself judged it below threshold/floor (shouldInject
+    // === false, reason "max compressible … < threshold …"). Advertising such
+    // ranges in the receipt re-nags at zero pressure — the disease #1387
+    // (pi #521) fixed. The tail must honor shouldInject: sub-threshold
+    // leftovers never list; the stop signal fires instead. (The two tests
+    // above pin preserveRecentMessages: 5 for their protection premise; this
+    // one pins the default-config behavior the unpinned tests used to cover.)
+    const msgs = [
+        textMsg("raw_1", "user", "x".repeat(20000)),
+        textMsg("raw_2", "assistant", "x".repeat(20000)),
+        textMsg("raw_3", "user", "x".repeat(5000)),
+        textMsg("raw_4", "assistant", "x".repeat(5000)),
+        textMsg("raw_5", "user", "x".repeat(5000)),
+        textMsg("raw_6", "assistant", "x".repeat(5000)),
+        textMsg("raw_7", "user", "x".repeat(5000)),
+    ];
+    const ctx = withRefs(makeCtx(msgs)); // default config — no preserve pin
+    ctx.session.stats.lastInputTokens = 80000;
+    const out = runApply(ctx, { content: [{ startId: "m00001", endId: "m00002", summary: "TAIL-TEST-SUMMARY-PAYLOAD-LONG-ENOUGH-FOR-THE-KERNEL-MIN-LENGTH-CHECK" }] });
+    assert.ok(out.startsWith("[Compressed"), `expected success, got: ${out.slice(0, 120)}`);
+    assert.ok(!out.includes(RANGES_HEADER), "a sub-threshold leftover must not be advertised:\n" + out);
+    assert.ok(!out.includes("m00003"), "the below-threshold residue must stay unlisted:\n" + out);
+    assert.ok(out.includes(NO_RANGES_REMAIN_TEXT), "stop signal fires when the kernel itself would not nudge:\n" + out);
+});
+
+test("#1387: tail recompute still advertises ranges under real pressure (shouldInject=true)", () => {
+    // Control for the test above: same live-recompute path, but the session is
+    // over-limit with material compressible content left (preserve 0, window
+    // 200k, input 240k). The kernel injects (shouldInject === true) and the
+    // receipt must list the remaining range — the stop signal must NOT fire.
+    const msgs = Array.from({ length: 12 }, (_, i) => textMsg(`raw_${i + 1}`, i % 2 === 0 ? "user" : "assistant", "x".repeat(5000)));
+    const ctx = withRefs(makeCtx(msgs, { preserveRecentMessages: 0, preserveRecentTokens: 0 }));
+    ctx.session.stats.lastInputTokens = 240000; // over the 200k window
+    ctx.session.stats.lastInputTokensSource = "usage";
+    const out = runApply(ctx, { content: [{ startId: "m00001", endId: "m00004", summary: "TAIL-TEST-SUMMARY-PAYLOAD-LONG-ENOUGH-FOR-THE-KERNEL-MIN-LENGTH-CHECK" }] });
+    assert.ok(out.startsWith("[Compressed"), `expected success, got: ${out.slice(0, 120)}`);
+    assert.ok(out.includes(RANGES_HEADER), "live ranges must be advertised under real pressure:\n" + out);
+    assert.ok(out.includes("m00005"), "the unfolded over-limit range must be listed:\n" + out);
+    assert.ok(!out.includes(NO_RANGES_REMAIN_TEXT), "stop signal must not fire while over-limit ranges remain:\n" + out);
 });

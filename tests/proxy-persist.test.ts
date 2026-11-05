@@ -1,4 +1,8 @@
 import { test } from "node:test";
+// #4004/#4242: this file pins the LEGACY envelope layer (guard semantics,
+// directory shape). Full mode adds index.db to the dir and serves
+// unified-first — both would make these assertions nondeterministic.
+process.env.BILI_STORAGE_UNIFIED = "legacy";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
@@ -387,10 +391,15 @@ await withTempStore("one-time migration re-keys legacy hash-id sessions to their
     b.stats.requests = 1;
     await store.writeNow(b);
 
-    const fileB = jsonFilesUnder(dir).find((f) => JSON.parse(readFileSync(f, "utf8")).id === legacyB)!;
-    const envB = JSON.parse(readFileSync(fileB, "utf8"));
-    envB.savedAt -= 1000; // A is newer → A wins the same-label collision
-    writeFileSync(fileB, JSON.stringify(envB));
+    // Explicit, well-separated savedAt pins so the same-label winner is
+    // deterministic regardless of wall-clock jitter between the writes (#4140 instance 4).
+    const base = Date.now();
+    for (const [id, savedAt] of [[legacyA, base + 2 * 60_000], [legacyB, base + 60_000]] as const) {
+        const f = jsonFilesUnder(dir).find((x) => JSON.parse(readFileSync(x, "utf8")).id === id)!;
+        const env = JSON.parse(readFileSync(f, "utf8"));
+        env.savedAt = savedAt;
+        writeFileSync(f, JSON.stringify(env));
+    }
 
     // A fresh store mirrors a new process: no discovered-file cache.
     const cold = new SessionStore({ dir, debounceMs: 5, enabled: true });

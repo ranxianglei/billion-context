@@ -137,10 +137,12 @@ $out | ForEach-Object { '{"d":"' + $_ + '"}' }`;
  *  (dsh desktop / Electron) makes Windows allocate a NEW console window for any
  *  unhidden console child — that is the black box users saw flash once per
  *  bundle rebuild. #997/#999 swept the other call sites; this one arrived with
- *  #1807. windowsHide is a documented no-op off Windows. Exported pure so tests
- *  can pin it without opening a window. */
-export function osStoreExecOptions(): { timeout: number; maxBuffer: number; windowsHide: boolean } {
-    return { timeout: 30_000, maxBuffer: 16 * 1024 * 1024, windowsHide: true };
+ *  #1807. windowsHide is a documented no-op off Windows. #2834: explicit stdio —
+ *  a failed export must not forward the child's stderr onto the host terminal;
+ *  stderr stays piped because the warn log below consumes the captured error
+ *  text. Exported pure so tests can pin it without opening a window. */
+export function osStoreExecOptions(): { timeout: number; maxBuffer: number; windowsHide: boolean; stdio: ["ignore", "pipe", "pipe"] } {
+    return { timeout: 30_000, maxBuffer: 16 * 1024 * 1024, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] };
 }
 
 function splitPemBlocks(text: string): string[] {
@@ -177,7 +179,7 @@ export function collectOsStorePems(platform: NodeJS.Platform = process.platform)
                 // drop the certificates already collected from the others.
                 try {
                     const out = execFileSync("/usr/bin/security", ["find-certificate", "-a", "-p", k],
-                        { encoding: "utf8", timeout: 15_000, maxBuffer: 16 * 1024 * 1024 });
+                        { encoding: "utf8", timeout: 15_000, maxBuffer: 16 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"] });
                     pems.push(...splitPemBlocks(out));
                 } catch { failures++; }
             }
@@ -215,7 +217,27 @@ function writeCombinedBundle(): void {
     for (const pem of tls.rootCertificates) add(pem);
     add(rootCertPem!);
     const body = [...byFingerprint.values()].map((pem) => (pem.endsWith("\n") ? pem : pem + "\n")).join("");
-    fs.writeFileSync(file, body, { mode: 0o644 });
+    try {
+        fs.writeFileSync(file, body, { mode: 0o644 });
+    } catch (err) {
+        // #5103: an OS-level write refusal (AV/Defender holding the dir,
+        // Windows integrity control on a low-integrity launcher, boot-time
+        // components still initializing — the #3823 class) must not brick the
+        // whole proxy when a functionally valid bundle already sits on disk:
+        // it carries the current root CA, which is what MITM needs; the merged
+        // public roots are freshness, not correctness. Reuse it and warn loud;
+        // the next startup retries the rebuild. No usable bundle (fresh
+        // install, or one missing our root) still fails fast as before.
+        let reusable = false;
+        try {
+            reusable = fs.readFileSync(file, "utf8").includes(rootCertPem!.trim());
+        } catch { /* absent or unreadable file — nothing to reuse */ }
+        if (!reusable) throw err;
+        loggerLog(
+            "warn",
+            `[ca] cannot rebuild ${file} (${String(err).slice(0, 200)}) — continuing with the EXISTING bundle (it still carries the current root CA). This is an OS-level write refusal, not a code fault — on Windows check the Node runtime's integrity label FIRST (icacls \"<path-to-node.exe>\"; a Low label is refused for Medium-labeled files even with correct ACLs, #5154), then antivirus/Defender exclusions for %USERPROFILE%\\.local\\share\\billion-context\\ (#3823); the rebuild retries on the next startup.`,
+        );
+    }
 }
 
 function generateRootCA(): { cert: string; key: string } {

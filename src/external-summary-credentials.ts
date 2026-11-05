@@ -2,10 +2,27 @@ import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readF
 import { dirname } from "node:path";
 import { randomUUID } from "node:crypto";
 import { configFile } from "./paths.js";
-import { validSummaryCredentialName } from "./external-summary-settings.js";
+import { loadConfigFile, loadNamedProviders, loadRoutes, type NamedProviderRecipe } from "./config.js";
+import { expandExternalSummaryChain, parseExternalSummaryChain, validSummaryCredentialName } from "./external-summary-settings.js";
 
 function validKey(value: unknown): value is string {
     return typeof value === "string" && value.length > 0 && value.length <= 8192 && !/[\x00-\x20\x7f]/.test(value);
+}
+
+/** #3488: resolve() has three distinct failure shapes (reference unset, value
+ *  unusable, store unreadable) plus success; configured() collapsed all of
+ *  them to `false`, so the UI could not tell an unset env var from a value
+ *  full of whitespace or a corrupt private store. */
+export type SummaryCredentialState = "configured" | "missing" | "invalid_value" | "store_unreadable" | "invalid_reference";
+
+export function describeCredentialState(reference: string, state: SummaryCredentialState): string {
+    switch (state) {
+        case "configured": return `${reference} resolves to a usable credential`;
+        case "missing": return reference.startsWith("env:") ? `environment variable ${reference.slice(4)} is not set` : `credential "${reference.slice(7)}" is not in the private store`;
+        case "invalid_value": return `environment variable ${reference.slice(4)} holds an unusable value (empty, whitespace/control characters, or over 8192 chars)`;
+        case "store_unreadable": return "the private credential store is unreadable (permissions or contents)";
+        case "invalid_reference": return `${reference} is not a valid credential reference`;
+    }
 }
 
 /** Separate from configFile(): normal config GET/raw exports never read these bytes. */
@@ -43,6 +60,20 @@ export class SummaryCredentialStore {
         try { return this.resolve(reference, env) !== undefined; } catch { return false; }
     }
 
+    status(reference: string, env: NodeJS.ProcessEnv = process.env): SummaryCredentialState {
+        if (/^env:[A-Za-z_][A-Za-z0-9_]*$/.test(reference)) {
+            const value = env[reference.slice(4)];
+            return value === undefined ? "missing" : validKey(value) ? "configured" : "invalid_value";
+        }
+        if (reference.startsWith("secret:") && validSummaryCredentialName(reference.slice(7))) {
+            let values: Record<string, string>;
+            try { values = this.read(); } catch { return "store_unreadable"; }
+            // Stored values are validated on write, so a present entry is always usable.
+            return values[reference.slice(7)] === undefined ? "missing" : "configured";
+        }
+        return "invalid_reference";
+    }
+
     set(name: string, key: string | null): void {
         if (!validSummaryCredentialName(name) || (key !== null && !validKey(key))) throw new Error("Invalid external summary credential");
         mkdirSync(dirname(this.path), { recursive: true, mode: 0o700 });
@@ -70,4 +101,61 @@ export class SummaryCredentialStore {
             unlinkSync(`${this.path}.lock`);
         }
     }
+}
+
+/** #3488: readable problems for ONE raw chain block (file form). Unparseable
+ *  blocks and unresolvable references both return [] — those surfaces are
+ *  owned elsewhere (config validation / web save 400 / the request-path
+ *  one-shot warn), and boot cannot see agent-registered recipes (#2336), so
+ *  reporting a reference problem here would false-alarm on every start for
+ *  chains that resolve fine once the plugin host registers its layer. */
+export function auditExternalSummaryCredentials(block: unknown, recipes: Record<string, NamedProviderRecipe>, env: NodeJS.ProcessEnv = process.env): string[] {
+    let chain;
+    try { chain = parseExternalSummaryChain(block); } catch { return []; }
+    if (!chain.enabled) return [];
+    let targets;
+    try { targets = expandExternalSummaryChain(chain, recipes).targets; }
+    catch { return []; }
+    const store = new SummaryCredentialStore();
+    const problems: string[] = [];
+    for (const target of targets) {
+        const ref = target.credentialRef ?? (target.apiKey === undefined ? "" : "(inline)");
+        if (ref === "") problems.push(`target ${target.name}: recipe carries no apiKeyEnv/credentialRef and no inline key`);
+        else if (ref !== "(inline)") {
+            const state = store.status(ref, env);
+            if (state !== "configured") problems.push(`target ${target.name}: ${describeCredentialState(ref, state)}`);
+        }
+    }
+    return problems;
+}
+
+/** #3488: boot-time scan of every EFFECTIVE enabled external-summary chain.
+ *  Walks the same cascade mergeCompress uses (global → route → model, whole
+ *  chain replace) so shadowed blocks are not reported, and identity-dedupes
+ *  because one file object can be effective for many slots. Returns
+ *  human-readable problem lines (empty when everything resolves). */
+export function auditStartupSummaryCredentials(env: NodeJS.ProcessEnv = process.env): string[] {
+    // #3572/#3488: read the global block through loadConfigFile()'s tolerant
+    // JSONC parser (the same one the runtime loader uses). safeReadJson is
+    // strict JSON — a commented config silently evaluated to `file === null`
+    // here, skipping the boot audit for every global externalSummary chain
+    // while route-level chains (loadRoutes → loadConfigFile) still audited.
+    const compress = loadConfigFile().compress;
+    const globalBlock = compress && typeof compress === "object" && !Array.isArray(compress) ? (compress as { externalSummary?: unknown }).externalSummary : undefined;
+    const routes = loadRoutes(env);
+    const recipes = loadNamedProviders(env);
+    const seen = new Set<unknown>();
+    const problems: string[] = [];
+    const audit = (block: unknown): void => {
+        if (block === undefined || seen.has(block)) return;
+        seen.add(block);
+        for (const problem of auditExternalSummaryCredentials(block, recipes, env)) problems.push(problem);
+    };
+    audit(globalBlock);
+    for (const route of Object.values(routes)) {
+        const routeBlock = route.compress?.externalSummary;
+        audit(routeBlock ?? globalBlock);
+        for (const model of Object.values(route.models ?? {})) audit(model.compress?.externalSummary ?? routeBlock ?? globalBlock);
+    }
+    return problems;
 }

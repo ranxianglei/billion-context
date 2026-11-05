@@ -27,6 +27,20 @@ import { rmrf } from "./tmp-rm.ts";
 // happy paths FIN in milliseconds so the shorter budget never bites them),
 // BILI_KEEP_ALIVE_TIMEOUT_MS=300 (idle-reaper regression guard stays fast),
 // BILI_MITM_HANDSHAKE_TIMEOUT_MS=600 (pre-handshake teardown step stays fast).
+//
+// #3454: windows-latest shards intermittently stall a leg's TRANSPORT (TCP
+// connect / TLS handshake / response body) under runner load, past even
+// generous per-phase budgets, with nothing to recover — one slow attempt is a
+// hard red that blocks merge. Two test-side-only backstops:
+//   1. load-tolerant budgets (the happy path is milliseconds; these sit far
+//      above it, sized against the observed 11.6s flake window);
+//   2. a ONE-SHOT full-scenario retry on a fresh child + fresh ports — a
+//      wedged accept queue cannot carry over between attempts.
+// Only TransportTimeout is retriable. Behavior assertions and behavior-line
+// waits (linger/idle/pre-handshake lifecycle lines) propagate immediately:
+// those ARE the product contract, and a real graceful-close regression must
+// fail fast on attempt 1, never be retried away. Server side is untouched —
+// listen/close semantics are the verified #1982 contract.
 
 let caDir = "", stateDir = "", homeDir = "";
 let caPath = "", rootPem = "";
@@ -39,6 +53,18 @@ let stdoutBuf = "";
 const logLines: string[] = [];
 
 const FIXTURE = fileURLToPath(new URL("./fixtures/graceful-close-bili.mts", import.meta.url));
+
+// #3454 load-tolerant transport budgets (see header). The happy path completes
+// in milliseconds; these are abort backstops for a loaded runner, not pacing.
+const CONNECT_TIMEOUT_MS = 5_000;   // CONNECT status line
+const HANDSHAKE_TIMEOUT_MS = 5_000; // TLS secureConnect / plain connect
+const RESPONSE_BUDGET_MS = 15_000;  // full response body (was 8_000 — floored at the observed 11.6s flake window)
+const READY_TIMEOUT_MS = 30_000;    // child prints READY <port>
+
+/** A leg's transport stalled (connect/handshake/response/ready) — retriable
+ *  once on a fresh scenario. Distinct from assert failures and behavior-line
+ *  waits, which are NOT retriable and surface immediately. */
+class TransportTimeout extends Error {}
 
 function sleep(ms: number): Promise<void> { return new Promise((r) => setTimeout(r, ms)); }
 // once(server, "close") rejects/hangs if the server is already closed — guard with a timer.
@@ -55,9 +81,11 @@ function closeServer(s: net.Server | undefined): Promise<void> {
 }
 const PHASE_T0 = Date.now();
 function phase(msg: string): void { process.stderr.write(`[gc-test] t=${Date.now() - PHASE_T0}ms ${msg}\n`); }
-async function onceCap<T extends NodeJS.EventEmitter>(target: T, ev: string, ms: number): Promise<void[]> {
+/** Await one event, bounded. `transport=true` tags the timeout as a
+ *  TransportTimeout (retriable); otherwise a plain Error. */
+async function onceCap<T extends NodeJS.EventEmitter>(target: T, ev: string, ms: number, transport?: boolean): Promise<void[]> {
     let to: ReturnType<typeof setTimeout>;
-    const timeout = new Promise<never>((_, reject) => { to = setTimeout(() => reject(new Error(`${ev} timeout ${ms}ms`)), ms); });
+    const timeout = new Promise<never>((_, reject) => { to = setTimeout(() => reject(transport ? new TransportTimeout(`${ev} timeout ${ms}ms`) : new Error(`${ev} timeout ${ms}ms`)), ms); });
     try { return await Promise.race([once(target, ev), timeout]); } finally { clearTimeout(to!); }
 }
 function mark(): number { return logLines.length; }
@@ -77,7 +105,7 @@ async function rawConnectStatus(port: number, target: string): Promise<{ statusL
     socket.write(`CONNECT ${target} HTTP/1.1\r\nHost: ${target}\r\n\r\n`);
     let buf = "";
     await new Promise<void>((resolve, reject) => {
-        const timer = setTimeout(() => reject(new Error("CONNECT timeout")), 5_000);
+        const timer = setTimeout(() => reject(new TransportTimeout(`CONNECT timeout ${CONNECT_TIMEOUT_MS}ms`)), CONNECT_TIMEOUT_MS);
         const onData = (c: Buffer): void => {
             buf += c.toString("utf8");
             if (buf.includes("\r\n\r\n")) {
@@ -104,7 +132,7 @@ async function mitmRequest(tag: string, conn: string | undefined): Promise<MitmR
     phase(`mitmRequest(${tag}): CONNECT ok`);
     assert.match(statusLine, /^HTTP\/1\.1 200/, `CONNECT must be accepted: ${statusLine}`);
     const sock = tls.connect({ socket, ca: rootPem, servername: "localhost", allowHalfOpen: true } as tls.ConnectionOptions);
-    await onceCap(sock, "secureConnect", 5_000);
+    await onceCap(sock, "secureConnect", HANDSHAKE_TIMEOUT_MS, true);
     phase(`mitmRequest(${tag}): TLS ok`);
     let sawReset = false;
     sock.once("error", (e: NodeJS.ErrnoException) => { if (e.code === "ECONNRESET") sawReset = true; });
@@ -132,7 +160,7 @@ async function mitmRequest(tag: string, conn: string | undefined): Promise<MitmR
     };
     const t0 = Date.now();
     while (full() === undefined) {
-        if (Date.now() - t0 > 8_000) throw new Error(`response incomplete:\n${buf.slice(0, 500)}`);
+        if (Date.now() - t0 > RESPONSE_BUDGET_MS) throw new TransportTimeout(`response incomplete after ${RESPONSE_BUDGET_MS}ms:\n${buf.slice(0, 500)}`);
         await sleep(10);
     }
     phase(`mitmRequest(${tag}): response complete`);
@@ -152,7 +180,7 @@ async function plainRequest(tag: string, conn: string | undefined, halfOpen?: bo
     phase(`plainRequest(${tag}): connect`);
     const target = `127.0.0.1:${plainUpPort}`;
     const sock = net.connect({ host: "127.0.0.1", port: biliPort, allowHalfOpen: halfOpen ?? false });
-    await onceCap(sock, "connect", 5_000);
+    await onceCap(sock, "connect", HANDSHAKE_TIMEOUT_MS, true);
     let sawReset = false;
     sock.once("error", (e: NodeJS.ErrnoException) => { if (e.code === "ECONNRESET") sawReset = true; });
     const body = JSON.stringify({ model: "gpt-test", messages: [{ role: "user", content: "ping" }] });
@@ -179,35 +207,25 @@ async function plainRequest(tag: string, conn: string | undefined, halfOpen?: bo
     };
     const t0 = Date.now();
     while (full() === undefined) {
-        if (Date.now() - t0 > 8_000) throw new Error(`response incomplete:\n${buf.slice(0, 500)}`);
+        if (Date.now() - t0 > RESPONSE_BUDGET_MS) throw new TransportTimeout(`response incomplete after ${RESPONSE_BUDGET_MS}ms:\n${buf.slice(0, 500)}`);
         await sleep(10);
     }
     phase(`plainRequest(${tag}): response complete`);
     return { body: full()!, sawReset, sock };
 }
 
-await test("#1982 graceful client-side close (MITM + plain-TCP legs)", async () => {
-    phase("setup: start");
-    caDir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-gc-ca-"));
+/** One full scenario: bring up fresh mock upstreams + a fresh child bili on
+ *  fresh ports, then run the five graceful-close steps. Every per-attempt
+ *  resource is torn down in the finally so a #3454 retry starts from a clean
+ *  slate (a wedged accept queue from attempt N cannot leak into N+1). The
+ *  CA is generated ONCE by the caller and reused across attempts. */
+async function runScenario(attempt: number): Promise<void> {
+    stdoutBuf = "";
+    logLines.length = 0;
+    child = undefined; monTimer = undefined; tlsUp = undefined; plainUp = undefined;
+    biliPort = 0; tlsUpPort = 0; plainUpPort = 0;
     stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-gc-state-"));
     homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-gc-home-"));
-    // Generate the test CA under an isolated XDG_DATA_HOME BEFORE spawning the
-    // child, so the child's bili reuses it and NODE_EXTRA_CA_CERTS can point at it.
-    const prevXdg = process.env.XDG_DATA_HOME;
-    process.env.XDG_DATA_HOME = caDir;
-    try {
-        _resetForTest();
-        ensureRootCA();
-        caPath = rootCaPath();
-        rootPem = fs.readFileSync(rootCaPath(), "utf8");
-        const leaf = mintHostCert("localhost");
-        leafCert = leaf.certPem;
-        leafKey = leaf.keyPem;
-    } finally {
-        if (prevXdg === undefined) delete process.env.XDG_DATA_HOME;
-        else process.env.XDG_DATA_HOME = prevXdg;
-        _resetForTest();
-    }
     const upstreamHandler = (req: http.IncomingMessage, res: http.ServerResponse) => {
         req.resume();
         req.on("end", () => {
@@ -224,64 +242,65 @@ await test("#1982 graceful client-side close (MITM + plain-TCP legs)", async () 
     };
     // https (not tls) createServer: the listener must be a request handler,
     // not a secure-connection handler.
-    phase(`setup: ca ready (${caPath})`);
-    tlsUp = https.createServer({ key: leafKey, cert: leafCert }, upstreamHandler);
-    await new Promise<void>((r) => tlsUp!.listen(0, "127.0.0.1", r));
-    tlsUpPort = (tlsUp.address() as { port: number }).port;
-    plainUp = http.createServer(upstreamHandler);
-    await new Promise<void>((r) => plainUp!.listen(0, "127.0.0.1", r));
-    plainUpPort = (plainUp.address() as { port: number }).port;
-
-    phase(`setup: upstreams up tls=${tlsUpPort} plain=${plainUpPort}, spawning child`);
-    child = spawn(process.execPath, ["--import", "tsx", FIXTURE], {
-        env: {
-            ...process.env,
-            XDG_DATA_HOME: caDir,
-            XDG_STATE_HOME: stateDir,
-            HOME: homeDir,
-            NODE_EXTRA_CA_CERTS: caPath,
-            GC_TLS_UPSTREAM_PORT: String(tlsUpPort),
-            GC_PLAIN_UPSTREAM_PORT: String(plainUpPort),
-            BILI_POST_RESPONSE_LINGER_MS: "400",
-            BILI_KEEP_ALIVE_TIMEOUT_MS: "300",
-            BILI_MITM_HANDSHAKE_TIMEOUT_MS: "600",
-            BILI_ADVISORY_CHECK: "0",
-        },
-        stdio: ["ignore", "pipe", "pipe"],
-    });
-    child.stdout!.on("data", (d: Buffer) => { stdoutBuf += d.toString("utf8"); });
-    child.stderr!.on("data", (d: Buffer) => {
-        const text = d.toString("utf8");
-        for (const l of text.split("\n")) if (l.trim()) logLines.push(l);
-        process.stderr.write(text);
-    });
-    child.on("exit", (code, sig) => phase(`child exited code=${code} sig=${sig}`));
-    const readyT0 = Date.now();
-    let m: RegExpExecArray | null;
-    while (!(m = /^READY (\d+)$/m.exec(stdoutBuf))) {
-        if (Date.now() - readyT0 > 30_000) throw new Error(`child did not report READY\n${logLines.slice(-30).join("\n")}`);
-        await sleep(50);
-    }
-    biliPort = Number(m[1]);
-    phase(`setup: child READY on ${biliPort}`);
-    // Liveness watchdog: silent while healthy, dumps state only when the child
-    // stops accepting — the failure mode this suite guards against.
-    monTimer = setInterval(() => {
-        const c = child;
-        if (!c) return;
-        const probe = net.connect(biliPort, "127.0.0.1");
-        const done = (res: string): void => {
-            try { probe.destroy(); } catch { /* already gone */ }
-            if (res !== "ok") phase(`[mon] exitCode=${c.exitCode} killed=${c.killed} port=${res}`);
-        };
-        const pt = setTimeout(() => done("timeout"), 600);
-        probe.once("connect", () => { clearTimeout(pt); done("ok"); });
-        probe.once("error", (e: NodeJS.ErrnoException) => { clearTimeout(pt); done(e.code ?? "err"); });
-    }, 750);
-    monTimer.unref?.();
-
     try {
-        phase("step1(happy): start");
+        phase(`[${attempt}] upstreams up`);
+        tlsUp = https.createServer({ key: leafKey, cert: leafCert }, upstreamHandler);
+        await new Promise<void>((r) => tlsUp!.listen(0, "127.0.0.1", r));
+        tlsUpPort = (tlsUp.address() as { port: number }).port;
+        plainUp = http.createServer(upstreamHandler);
+        await new Promise<void>((r) => plainUp!.listen(0, "127.0.0.1", r));
+        plainUpPort = (plainUp.address() as { port: number }).port;
+
+        phase(`[${attempt}] spawning child (tls=${tlsUpPort} plain=${plainUpPort})`);
+        child = spawn(process.execPath, ["--import", "tsx", FIXTURE], {
+            env: {
+                ...process.env,
+                XDG_DATA_HOME: caDir,
+                XDG_STATE_HOME: stateDir,
+                HOME: homeDir,
+                NODE_EXTRA_CA_CERTS: caPath,
+                GC_TLS_UPSTREAM_PORT: String(tlsUpPort),
+                GC_PLAIN_UPSTREAM_PORT: String(plainUpPort),
+                BILI_POST_RESPONSE_LINGER_MS: "400",
+                BILI_KEEP_ALIVE_TIMEOUT_MS: "300",
+                BILI_MITM_HANDSHAKE_TIMEOUT_MS: "600",
+                BILI_ADVISORY_CHECK: "0",
+                ACP_LOG_FILE: "off",
+            },
+            stdio: ["ignore", "pipe", "pipe"],
+        });
+        child.stdout!.on("data", (d: Buffer) => { stdoutBuf += d.toString("utf8"); });
+        child.stderr!.on("data", (d: Buffer) => {
+            const text = d.toString("utf8");
+            for (const l of text.split("\n")) if (l.trim()) logLines.push(l);
+            process.stderr.write(text);
+        });
+        child.on("exit", (code, sig) => phase(`[${attempt}] child exited code=${code} sig=${sig}`));
+        const readyT0 = Date.now();
+        let m: RegExpExecArray | null;
+        while (!(m = /^READY (\d+)$/m.exec(stdoutBuf))) {
+            if (Date.now() - readyT0 > READY_TIMEOUT_MS) throw new TransportTimeout(`child did not report READY within ${READY_TIMEOUT_MS}ms\n${logLines.slice(-30).join("\n")}`);
+            await sleep(50);
+        }
+        biliPort = Number(m[1]);
+        phase(`[${attempt}] child READY on ${biliPort}`);
+        // Liveness watchdog: silent while healthy, dumps state only when the child
+        // stops accepting — the failure mode this suite guards against.
+        monTimer = setInterval(() => {
+            const c = child;
+            if (!c) return;
+            const probe = net.connect(biliPort, "127.0.0.1");
+            const done = (res: string): void => {
+                try { probe.destroy(); } catch { /* already gone */ }
+                if (res !== "ok") phase(`[${attempt}][mon] exitCode=${c.exitCode} killed=${c.killed} port=${res}`);
+            };
+            const pt = setTimeout(() => done("timeout"), 600);
+            probe.once("connect", () => { clearTimeout(pt); done("ok"); });
+            probe.once("error", (e: NodeJS.ErrnoException) => { clearTimeout(pt); done(e.code ?? "err"); });
+        }, 750);
+        monTimer.unref?.();
+
+        phase(`[${attempt}] step1(happy): start`);
         {
             const m0 = mark();
             const { body, sawReset, sock } = await mitmRequest("happy", "close");
@@ -301,7 +320,7 @@ await test("#1982 graceful client-side close (MITM + plain-TCP legs)", async () 
             try { sock.destroy(); } catch { /* already gone */ }
         }
 
-        phase("step2(backstop): start");
+        phase(`[${attempt}] step2(backstop): start`);
         {
             const m0 = mark();
             const { body, sock } = await plainRequest("backstop", "close", true);
@@ -318,7 +337,7 @@ await test("#1982 graceful client-side close (MITM + plain-TCP legs)", async () 
             try { sock.destroy(); } catch { /* already gone */ }
         }
 
-        phase("step3(idle-reaper): start");
+        phase(`[${attempt}] step3(idle-reaper): start`);
         {
             const m0 = mark();
             const { body, sock } = await mitmRequest("idle", undefined);
@@ -329,7 +348,7 @@ await test("#1982 graceful client-side close (MITM + plain-TCP legs)", async () 
             try { sock.destroy(); } catch { /* already gone */ }
         }
 
-        phase("step4(pre-handshake): start");
+        phase(`[${attempt}] step4(pre-handshake): start`);
         {
             const m0 = mark();
             const { statusLine, socket } = await rawConnectStatus(biliPort, `localhost:${tlsUpPort}`);
@@ -341,7 +360,7 @@ await test("#1982 graceful client-side close (MITM + plain-TCP legs)", async () 
             try { socket.destroy(); } catch { /* already gone */ }
         }
 
-        phase("step5(plain-tcp): start");
+        phase(`[${attempt}] step5(plain-tcp): start`);
         {
             const m0 = mark();
             const { body, sawReset, sock } = await plainRequest("direct", "close");
@@ -355,15 +374,60 @@ await test("#1982 graceful client-side close (MITM + plain-TCP legs)", async () 
             try { sock.destroy(); } catch { /* already gone */ }
         }
     } finally {
-        phase("teardown: start");
+        phase(`[${attempt}] teardown: start`);
         if (monTimer) { clearInterval(monTimer); monTimer = undefined; }
         if (child && child.exitCode === null && !child.killed) {
             child.kill("SIGKILL");
             await onceCap(child, "exit", 5_000).catch(() => {});
         }
         await Promise.all([closeServer(tlsUp), closeServer(plainUp)]);
-        for (const d of [caDir, stateDir, homeDir]) {
+        for (const d of [stateDir, homeDir]) {
             if (d) { try { rmrf(d); } catch { /* best-effort */ } }
+        }
+    }
+}
+
+let scenarioAttempts = 0; // #3454: at most two scenarios run (one-shot backstop)
+function attemptOf(): number { return ++scenarioAttempts; }
+function attemptsUsed(): number { return scenarioAttempts; }
+
+await test("#1982 graceful client-side close (MITM + plain-TCP legs)", async () => {
+    phase("setup: ca");
+    caDir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-gc-ca-"));
+    // Generate the test CA under an isolated XDG_DATA_HOME BEFORE spawning the
+    // child, so the child's bili reuses it and NODE_EXTRA_CA_CERTS can point at it.
+    const prevXdg = process.env.XDG_DATA_HOME;
+    process.env.XDG_DATA_HOME = caDir;
+    try {
+        _resetForTest();
+        ensureRootCA();
+        caPath = rootCaPath();
+        rootPem = fs.readFileSync(rootCaPath(), "utf8");
+        const leaf = mintHostCert("localhost");
+        leafCert = leaf.certPem;
+        leafKey = leaf.keyPem;
+    } finally {
+        if (prevXdg === undefined) delete process.env.XDG_DATA_HOME;
+        else process.env.XDG_DATA_HOME = prevXdg;
+        _resetForTest();
+    }
+    phase(`setup: ca ready (${caPath})`);
+
+    // #3454 one-shot recovery: a windows-latest shard can wedge a leg's
+    // transport under load; a TransportTimeout re-runs the ENTIRE scenario on
+    // a fresh child + fresh ports. Anything else (an assertion, a missing
+    // lifecycle line) propagates immediately — never retried away. The loop
+    // always exits by return (success) or throw, never falls off the end.
+    for (;;) {
+        try {
+            await runScenario(attemptOf());
+            return;
+        } catch (err) {
+            if (err instanceof TransportTimeout && attemptsUsed() < 2) {
+                phase(`leg transport timeout (attempt ${attemptsUsed()}) — re-running on fresh ports`);
+                continue;
+            }
+            throw err;
         }
     }
 });

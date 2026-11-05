@@ -1,4 +1,5 @@
 import type { CoreMessage } from "acp-kernel";
+import { isRenderedSummaryMessage } from "acp-kernel";
 import { coreToOpenai, injectOpenaiSystem } from "acp-kernel/wire";
 import { buildVisibilityMarker } from "./core.js";
 import { composeStreamFilters, createBiliArtifactFilter, createIdentityStreamFilter, createMarkerLineFilter, createTagEchoFilter } from "./tag-echo-filter.js";
@@ -240,7 +241,10 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
             // runtime state), so coreMessages no longer carries it — re-inject
             // the CLIENT's original system ahead of the compress prompt,
             // mirroring the anthropic adapter's anthropicSystem path.
-            const messages = systemToUser(hardenOpenaiAssistantContent(coreToOpenai(coreMessages)));
+            // #4166: re-voice ONLY bili's own summary carriers; client-origin
+            // mid system/developer cores re-emit verbatim (rawOpenaiMessage
+            // sidecar) and must match the prepare lane byte-for-byte.
+            const messages = hardenOpenaiAssistantContent(coreToOpenai(systemToUser(coreMessages, (m) => isRenderedSummaryMessage(m))));
             const withSys = injectOpenaiSystem(messages, [clientSystem, systemPrompt].filter((p): p is string => typeof p === "string" && p.length > 0));
             const withNotes = notes && notes.length > 0
                 ? [...withSys, ...notes.map((text) => ({ role: "user" as const, content: text }))]
@@ -521,8 +525,38 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                 }
                 const delta = choice.delta as Record<string, unknown> | undefined;
                 const finishReason = typeof choice.finish_reason === "string" ? choice.finish_reason : undefined;
-                const frameToolCalls = delta?.tool_calls as Array<Record<string, unknown>> | undefined;
+                // #4466: some gateways (Tencent CodeBuddy) stamp `tool_calls: []`
+                // on every chunk of a plain text response — an empty array is
+                // truthy, so a bare truthiness check would route text frames
+                // into the tool absorb path and withhold their client-visible
+                // bytes forever. Only a NON-empty array is a tool-call frame
+                // (same predicate as filterRealToolFragments below).
+                const frameToolCalls = Array.isArray(delta?.tool_calls) && delta.tool_calls.length > 0
+                    ? (delta.tool_calls as Array<Record<string, unknown>>)
+                    : undefined;
                 if (frameToolCalls) absorbToolCallDeltas(frameToolCalls);
+
+                // #4488: include_usage relays may deliver usage on a trailing frame whose
+                // choices array stays NON-empty — one choice with an EMPTY delta and no
+                // finish_reason (OpenAI's own include_usage final-chunk shape, or a gateway
+                // variant of it). It matches neither the !choice branch above nor the
+                // finishReason branch below, so its usage never reached the internal ledger
+                // (settleUsageReport) and nudge froze on the last stale sample (growth=0,
+                // context grows until 502) even though the raw frame was still forwarded to
+                // the client. Harvest it here; the guards (no finish_reason, empty delta
+                // object) keep every content / finish / tool-call frame out. Deliberately no
+                // `continue`: the frame falls through to the empty-delta meta forward below
+                // unchanged, so the client-visible stream stays byte-identical to pre-fix and
+                // only the ledger gains the sample.
+                if (parsed.usage && !finishReason && delta && Object.keys(delta).length === 0) {
+                    const u = parsed.usage as Record<string, unknown>;
+                    yield {
+                        kind: "usage",
+                        inputTokens: typeof u.prompt_tokens === "number" ? u.prompt_tokens : undefined,
+                        outputTokens: typeof u.completion_tokens === "number" ? u.completion_tokens : undefined,
+                        cachedTokens: openaiCachedTokens(u),
+                    } as ParsedStreamEvent;
+                }
 
                 if (finishReason) {
                     yield* flushFilter();

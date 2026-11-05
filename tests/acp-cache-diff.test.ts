@@ -103,6 +103,30 @@ test("runDiff: healthy array-append pair classifies pure-append (json-tail), usa
     } finally { rmrf(dir); }
 });
 
+test("runDiff: #3331 CRLF dump files parse — header block terminated by \\r\\n\\r\\n still classifies pure-append", () => {
+    const dir = tmpdir("acp-diff-crlf-");
+    try {
+        // same healthy pair as the LF test above, but every dump file uses
+        // CRLF line endings in the request line + headers + blank separator
+        const crlfDump = (ts: number, sid: string, kind: "REQ" | "INCOMING", body: string): void => {
+            const name = `${ts}-${sid}-${kind}.txt`;
+            const head = ["POST /v1/chat/completions", "content-type: application/json", "x-cache-probe: 1"].join("\r\n");
+            fs.writeFileSync(path.join(dir, name), `${head}\r\n\r\n${body}`);
+        };
+        const tA = T_A, tB = T_B;
+        crlfDump(tA, "ses_crlf", "INCOMING", chatBody("gpt-x", [M1]));
+        crlfDump(tA + 1, "ses_crlf", "REQ", chatBody("gpt-x", [M1]));
+        crlfDump(tB, "ses_crlf", "INCOMING", chatBody("gpt-x", [M1, M2]));
+        crlfDump(tB + 1, "ses_crlf", "REQ", chatBody("gpt-x", [M1, M2]));
+        const report = runDiff(dir, { noLog: true });
+        assert.equal(report.totalPairs, 1, "CRLF dumps found and paired");
+        const p = report.sessions[0]!.pairs[0]!;
+        assert.equal(p.category, "pure-append");
+        assert.equal(p.outgoingAppend?.kind, "json-tail");
+        assert.equal(p.incomingAppend?.kind, "json-tail");
+    } finally { rmrf(dir); }
+});
+
 test("runDiff: incoming append + outgoing mid-stream drift attributes proxy (#1249 shape)", () => {
     const dir = tmpdir("acp-diff-proxy-");
     try {

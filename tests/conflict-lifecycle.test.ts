@@ -94,7 +94,10 @@ test("formatConflictSection: header age split + advice switches with liveness (#
     ];
     const mixedText = formatConflictSection(mixed, now).join("\n");
     assert.ok(mixedText.includes("(1 active · 1 historical; active = within 7 days)"), mixedText);
-    assert.ok(mixedText.includes("Keep exactly ONE compressor"), "recent event keeps the imperative advice");
+    // #2545: unannounced rewrites alone are UNCONFIRMED signals — a fresh one no
+    // longer escalates to the imperative one-compressor command (cause unverified).
+    assert.ok(mixedText.includes("UNCONFIRMED signal"), "tiered as unconfirmed diagnosis");
+    assert.ok(!mixedText.includes("Keep exactly ONE compressor"), "no imperative without confirmed evidence");
 
     const allOld: ConflictEvent[] = [
         { at: now - 30 * DAY, kind: "unannounced-rewrite", detail: "stock" },

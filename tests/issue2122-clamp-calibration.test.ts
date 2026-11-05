@@ -14,8 +14,9 @@ process.env.NODE_ENV = "test";
 // Fix: scale the LOCAL-EST side by the per-route estimator calibration k̂ (#1933 F1,
 // learned from measured/local pairs on the same route), exactly as the preflight
 // gate already does — the usage-grade baseline stays unscaled. These tests pin
-// both the incident arithmetic (raw path still clamps 32768 -> 3357) and the fix
-// (calibrated path leaves 32768 untouched).
+// both the incident arithmetic (raw path still clamps 32768 -> 4096, the #3071
+// capability floor of the naive 3357 cap) and the fix (calibrated path leaves
+// 32768 untouched).
 
 import type { CoreMessage } from "acp-kernel";
 import { clampOutgoingOutput, estimateInputTokens } from "../src/server/budget.ts";
@@ -34,15 +35,17 @@ test("#2122 fixture: raw local estimate reproduces the incident's input~137237",
     assert.equal(rawLocalEst(), 137_237);
 });
 
-test("#2122 repro: without calibration the raw est overrides the usage baseline and clamps 32768 -> 3357", () => {
+test("#2122 repro: without calibration the raw est overrides the usage baseline and clamps 32768 -> 4096 (#3071 floor)", () => {
     const body: Record<string, unknown> = { max_tokens: 32_768 };
     clampOutgoingOutput(body, "max_tokens", {
         systemText: "", tools: [], processedMessages: MSGS,
         lastInputTokens: 81_678, lastInputTokensSource: "usage",
         nativeWindow: 147_456, imageTokens: 0,
     }, "t2122", () => {});
-    // margin = max(2048, ceil(137237*0.05)=6862); cap = floor(147456-137237-6862) = 3357
-    assert.equal(body.max_tokens, 3_357);
+    // margin = max(2048, ceil(137237*0.05)=6862); naive cap = floor(147456-137237-6862) = 3357.
+    // #3071 floors the emitted budget at min(4096, headroom 10219) = 4096 — the old
+    // 3357 pin was exactly the sub-floor starvation the capability floor removes.
+    assert.equal(body.max_tokens, 4_096);
 });
 
 test("#2122 fix: calibrated local side restores provider-consistent headroom — no clamp", () => {

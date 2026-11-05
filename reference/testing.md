@@ -10,7 +10,109 @@
 ```bash
 npm run build          # tsup bundle (inlines acp-kernel)
 npm run typecheck      # tsc --noEmit --project tsconfig.json (src + tests)
-npm test               # node --import tsx --test tests/*.test.ts
+npm test               # scripts/test-suite-lock.mjs run → node --import <preloads> --test tests/*.test.ts
+```
+
+## Test-runner preload: storage baseline + dir sandbox
+
+Every suite entry point (`npm test` via `scripts/test-suite-lock.mjs`, CI via
+`scripts/run-ci-tests.mjs`) loads `tests/preload-storage-baseline.mjs` before
+the tests. It does two things:
+
+1. `BILI_STORAGE_UNIFIED ??= "legacy"` — keeps the broad wire/e2e corpus on
+   the legacy storage baseline (the storage family pins and overrides its own
+   modes; see the preload header, #2815).
+2. **Default-dir sandbox** — `XDG_DATA_HOME` / `XDG_STATE_HOME` /
+   `XDG_CACHE_HOME` are pointed at a per-run temp tree (`$TMPDIR/bili-test-dirs-*`)
+   unless already set. A suite that builds a store or server without pinning a
+   directory otherwise resolves through the XDG defaults straight into your
+   REAL `~/.local/{share,state,cache}/billion-context` — envelopes, index.db
+   rows, and state bookkeeping land beside production data (found while
+   triaging #5082: a local run of `tests/anthropic-cache-control.test.ts`
+   wrote `sess-1639-*` rows and `sessions/anthropic/127.0.0.1_*` envelopes
+   into the live sessions dir). Tests that pin their own `XDG_*` are
+   unaffected (`||=` — empty counts as unset, matching the lock script's XDG
+   handling); set the three vars yourself to deliberately run against real
+   machine state. The contract is pinned by `tests/preload-sandbox-dirs.test.ts`.
+
+Targeted runs inherit the same protection when you include the preload in the
+loader chain (recommended form for local single-file runs):
+
+```bash
+node --import ./tests/preload-storage-baseline.mjs --import tsx --test tests/<area>.test.ts
+```
+
+A bare `node --import tsx --test ...` still works (the storage family pins its
+own dirs), but any suite that relies on DEFAULT path resolution will write
+into your real machine state — prefer the preload chain.
+
+## CI: test schedule (#2816)
+
+The main CI `test` job does not run the flat `npm test` glob — it runs
+`node scripts/run-ci-tests.mjs`, which runs the same top-level suites with an
+explicit `--test-concurrency=4`. Baseline logs prove the old runner default
+(`availableParallelism()-1`) was already concurrent — the sum of per-test
+durations (~630s ubuntu / ~1110s windows) fits inside the step wall
+(373s / 688s) only if several files ran at once; pinning c=4 makes that
+explicit with one slot per core. A two-phase prototype (serial "live" phase +
+concurrent pool) was measured first and rejected: the serial phase idled the
+other cores for 3-4 min without buying stability, because live/process suites
+have run mixed with the rest on these dedicated runners for months (#1248's
+flakes were loaded local sandboxes — gated by `ACP_TEST_CLAUDE_NATIVE`, not CI).
+
+The script self-checks on every run: a new top-level `tests/*.test.ts` that
+matches a process-spawn pattern but is NOT registered in its `LIVE_FILES` list
+fails the job. When you add a suite that spawns processes, register it in
+`scripts/run-ci-tests.mjs` and review its concurrency assumptions (#1248:
+per-file XDG homes, `listen(0)` ports, no machine-global state) before it
+rides c=4 unreviewed.
+
+Scheduling only — same tests, same assertions, same env vars; local
+`npm test` is untouched.
+
+Since #3143 the `test` job also SHARDS across the matrix: each leg runs one of
+three balanced slices (`CI_TEST_SHARD="i/3"`), partitioned by
+`scripts/run-ci-tests.mjs` with deterministic LPT bin-packing over file size —
+total (union of shards == every file) and disjoint (no file in two shards), so no
+test is ever skipped and the LIVE_FILES tripwire still scans the full set in every
+shard. The suite had grown past one runner's ~c=4 ceiling (~656 files / ~190k LOC →
+~20 min wall on windows), so sharding cut the wall ~3x (~7 min) at zero coverage
+cost. Tune by editing the `shard:` list in `.github/workflows/ci.yml` AND its `/3`
+denominator together (they must stay equal).
+
+The `static-gates` job (same os×node matrix) runs typecheck + kernel suite +
+pi-subagents suite + build IN PARALLEL with the `test` job; they used to be
+sequential steps ahead of the tests (~90s of critical path per leg).
+
+## Hermetic data roots (#5107)
+
+Running the suite on a machine that also has bili installed must never touch
+the developer's real data tree. Two layers enforce this:
+
+1. **Preload redirect** — `tests/preload-test-env.mjs` (wired into
+   `scripts/test-suite-lock.mjs`, `scripts/run-ci-tests.mjs`, and the
+   `test:e2e*` npm scripts as an `--import`) points every test process'
+   ambient roots at a per-process temp dir: `BILI_SESSIONS_DIR`,
+   `BILI_CONFIG_FILE` (absent config), and all four XDG homes. Each test FILE
+   runs in its own process, so each gets its own root — parallel shards never
+   collide, and the OS tmp cleanup discards them. Per-test isolation
+   (`_setStoreForTest`, mkdtemp dirs, explicit env) still wins; the preload
+   only replaces the ambient default, so a test that forgets isolation
+   degrades to a throwaway root instead of the production tree.
+2. **Leak guard** — `npm test` (via `scripts/test-suite-lock.mjs run`)
+   snapshots the PRODUCTION sessions dir (`BILI_SESSIONS_DIR` →
+   `$XDG_DATA_HOME/billion-context/sessions` → `~/.local/share/…`, resolved
+   from the wrapper's pre-isolation env) before the run and diffs after: NEW
+   files fail the suite, modified pre-existing files only warn (a concurrently
+   live bili instance can touch its own sessions). Escape hatch for the
+   false-positive case: `BILI_TEST_LEAK_GUARD=0 npm test`
+   (reference/env-vars.md).
+
+Bare targeted runs outside `npm test` do NOT load the preloads on their
+own — carry them explicitly or they resolve the real default roots:
+
+```bash
+node --import ./tests/preload-test-env.mjs --import tsx --test tests/<file>.test.ts
 ```
 
 ## Local Testing & Install
@@ -67,7 +169,33 @@ Rules:
   — an acp-kernel pin bump IS a pipeline change) plus manual dispatch for anything
   else. It needs repo secrets `E2E_UPSTREAM_URL` / `E2E_UPSTREAM_KEY`; a hosted
   runner cannot reach `127.0.0.1` upstreams, and events without secret access
-  (fork PRs) skip the run gracefully instead of failing.
+   (fork PRs) skip the run gracefully instead of failing.
+
+## CI: registry installs must be retry-protected (#2611)
+
+A transient runner↔registry blip (`ECONNRESET` / `network aborted`) during a
+setup-phase `npm i -g <cli>` or `npm ci` used to red an otherwise-green PR with
+no test code ever running (#2541 run 38032380794; rerun-failed-jobs turned it
+green on the same head). Root cause: npm's built-in fetch retry defaults to only
+2 tries. Every job that touches the npm registry therefore carries this
+job-level `env:` block — it raises the retry budget so a ~10s jitter rides out
+instead of aborting setup, and because it is job-level it covers EVERY registry
+op in the job (the global CLI install AND `npm ci`, plus any build-time fetch):
+
+```yaml
+    env:
+      npm_config_fetch_retries: '5'
+      npm_config_fetch_retry_mintimeout: '5000'
+      npm_config_fetch_retry_maxtimeout: '60000'
+```
+
+Bounded by design: worst case ~+2 min of backoff before a genuine sustained
+outage still fails fast (each job also carries its own `timeout-minutes`). Copy
+the block verbatim into any NEW e2e/setup lane that installs from the registry so
+the pattern never re-scatters unpinned. Deliberately NOT applied around
+`npm publish` (the artifact/release lanes): a publish is non-idempotent — if the
+first upload commits server-side but its response resets, a fetch-retry re-POSTs
+and can trip E409 / double-publish, which is worse than the original failure mode.
 
 ## E2E: Real-Image Billing Lane (`npm run test:e2e:image`)
 

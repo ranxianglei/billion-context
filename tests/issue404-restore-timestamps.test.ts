@@ -84,17 +84,34 @@ await test("boot restore: lastSeen=savedAt, restored flag, freshness-keyed trunc
         writeEnvelope(dir, "sess-B", 5000, 5000);
         writeEnvelope(dir, "sess-C", 2000, 8000);
 
+        // #3050 R3: the warm set is OFF by default — boot hydrates nothing and
+        // the same restore semantics apply lazily at first touch.
         _resetSessionsForTest(2);
         await initSessions();
+        assert.equal(peekSession("sess-A"), undefined, "new default: boot warms nothing");
+        assert.equal(peekSession("sess-C"), undefined);
+        const lazy = store.loadSync("sess-A");
+        assert.ok(lazy, "on-demand load hydrates the session");
+        assert.equal(lazy.lastSeen, 9000, "lazy-restored lastSeen is the on-disk savedAt, not the load moment");
+        assert.equal(lazy.restored, true, "lazy-restored sessions carry the restored flag until first request");
 
-        const a = peekSession("sess-A");
-        const b = peekSession("sess-B");
-        const c = peekSession("sess-C");
-        assert.ok(a && c, "the two freshest sessions by max(createdAt, savedAt) survive boot truncation");
-        assert.equal(b, undefined, "newer-created but idle-since-boot session loses its slot to the active-but-old one");
-        assert.equal(a!.lastSeen, 9000, "restored lastSeen is the on-disk savedAt, not the restore moment");
-        assert.equal(a!.restored, true, "restored sessions are flagged until their first request in this process");
-        assert.equal(c!.restored, true);
+        // Opt back into the #2803 eager warm set: the boot-time freshness-keyed
+        // truncation still holds.
+        process.env.BILI_SESSION_WARM_MAX = "2";
+        _resetSessionsForTest(2);
+        await initSessions();
+        try {
+            const a = peekSession("sess-A");
+            const b = peekSession("sess-B");
+            const c = peekSession("sess-C");
+            assert.ok(a && c, "the two freshest sessions by max(createdAt, savedAt) survive boot truncation");
+            assert.equal(b, undefined, "newer-created but idle-since-boot session loses its slot to the active-but-old one");
+            assert.equal(a!.lastSeen, 9000, "restored lastSeen is the on-disk savedAt, not the restore moment");
+            assert.equal(a!.restored, true, "restored sessions are flagged until their first request in this process");
+            assert.equal(c!.restored, true);
+        } finally {
+            delete process.env.BILI_SESSION_WARM_MAX;
+        }
 
         // fallback=latest must resolve the session with REAL post-boot
         // activity, never a restored one — the 245-way-tie regression.
@@ -102,7 +119,7 @@ await test("boot restore: lastSeen=savedAt, restored flag, freshness-keyed trunc
         assert.notEqual(active.restored, true, "a session created by a live request is not restored");
         const statusDeps = { core: createCore(), config: defaultConfig(200000), log: (_l: string, _m: string) => {} };
         const res1 = mockRes();
-        handlePluginStatus("never-seen", res1.res, statusDeps, true);
+        await handlePluginStatus("never-seen", res1.res, statusDeps, true);
         const body1 = JSON.parse(res1.body) as { ok: boolean; fallback?: boolean; label: string | null };
         assert.equal(res1.status, 200);
         assert.equal(body1.ok, true);
@@ -112,7 +129,7 @@ await test("boot restore: lastSeen=savedAt, restored flag, freshness-keyed trunc
         // All sessions restored (no activity since boot): refuse to guess.
         _resetSessionsForTest();
         const res2 = mockRes();
-        handlePluginStatus("never-seen", res2.res, statusDeps, true);
+        await handlePluginStatus("never-seen", res2.res, statusDeps, true);
         assert.equal(res2.status, 404);
         assert.ok(res2.body.includes("since boot"), "explicit no-post-boot-activity error instead of a readdir-order guess");
     } finally {

@@ -110,10 +110,14 @@ function reFetchProbe(): { calls: () => number; bodies: () => string[]; restore:
     return { calls: () => n, bodies: () => bodies, restore: () => { globalThis.fetch = orig; } };
 }
 
-test("loop #3: compress round → re-request fires (model continues with result), marker shown", async () => {
+test("loop #3: proxy-tool round → re-request fires (model continues with result), marker shown", async () => {
+    // acp_status drives the re-request deterministically: a bare-session
+    // compress fails kernel validation and enters the #5220 recovery-receipt
+    // path (receipt re-request with stripped frames), which would muddy this
+    // plain re-request assertion.
     const round1 = [
         sse("response.created", { response: { id: "resp_1", status: "in_progress" } }),
-        fcEvents(0, "call_c", "compress", JSON.stringify({ content: [{ startId: "m00001", endId: "m00002", summary: "s" }] })),
+        fcEvents(0, "call_s", "acp_status", "{}"),
         COMPLETED,
     ].join("");
     const probe = reFetchProbe();
@@ -124,8 +128,8 @@ test("loop #3: compress round → re-request fires (model continues with result)
             { model: "gpt-4o", input: [], stream: true },
             { url: "http://mock", headers: {} },
         );
-        assert.ok(probe.calls() >= 1, "re-request fires after compress so the model can continue");
-        assert.ok(out.includes("[ACP]"), "compress marker shown");
+        assert.ok(probe.calls() >= 1, "re-request fires after the proxy tool so the model can continue");
+        assert.ok(out.includes("[ACP]"), "marker shown");
         assert.ok(/event: response\.completed/.test(out), "graceful completion");
     } finally {
         probe.restore();
@@ -155,9 +159,12 @@ test("loop #4: decompress round → re-request fires (model continues with resul
 });
 
 test("loop #6: philosophy systemPrompt is transient — appears in the ONE re-request body, does not accumulate across rounds", async () => {
+    // acp_status drives the single re-request deterministically (a bare-session
+    // compress ends the turn under the failed-only breaker, #156/#4186); the
+    // philosophy prompt rides every buildRequest regardless of tool (#649).
     const round1 = [
         sse("response.created", { response: { id: "resp_1", status: "in_progress" } }),
-        fcEvents(0, "call_c", "compress", JSON.stringify({ content: [{ startId: "m00001", endId: "m00002", summary: "s" }] })),
+        fcEvents(0, "call_s", "acp_status", "{}"),
         COMPLETED,
     ].join("");
     const probe = reFetchProbe();
@@ -169,7 +176,7 @@ test("loop #6: philosophy systemPrompt is transient — appears in the ONE re-re
             { url: "http://mock", headers: {} },
         );
         const bodies = probe.bodies();
-        assert.equal(bodies.length, 1, "exactly one re-request body (one compress → one continuation)");
+        assert.equal(bodies.length, 1, "exactly one re-request body (one proxy tool → one continuation)");
         assert.ok(bodies[0].includes("COMPRESSION PHILOSOPHY") || bodies[0].includes("compress"), "philosophy present in the re-request (transient, not accumulated)");
     } finally {
         probe.restore();
@@ -266,12 +273,19 @@ test("loop external summary: streaming compress uses the configured model and cr
 });
 
 test("loop #8 (B3): textProtocol compress round → marker shown, re-request fires", async () => {
-    const ctx = makeCtx([
-        textMsg("m00001", "user", "hello"),
-        textMsg("m00002", "assistant", "hi"),
-    ]);
+    // Successful compress (real refs + kernel-sized range) so the round does
+    // not trip the failed-only breaker (#156/#4186).
+    const ctx = withRefs(makeCtx([
+        textMsg("raw_1", "user", bigText(5000)),
+        textMsg("raw_2", "assistant", bigText(5000)),
+        textMsg("raw_3", "user", bigText(5000)),
+        textMsg("raw_4", "assistant", bigText(5000)),
+        textMsg("raw_5", "user", bigText(5000)),
+        textMsg("raw_6", "assistant", bigText(5000)),
+        textMsg("raw_7", "user", bigText(5000)),
+    ]));
     ctx.textProtocol = true;
-    const compressArgs = JSON.stringify({ content: [{ startId: "m00001", endId: "m00002", summary: "s" }] });
+    const compressArgs = JSON.stringify({ content: [{ startId: "m00001", endId: "m00002", summary: "PAIR-SUMMARY-PAYLOAD-THAT-IS-LONG-ENOUGH-FOR-THE-KERNEL-MIN-LENGTH-CHECK" }] });
     const round1 = [
         sse("response.created", { response: { id: "resp_1", status: "in_progress" } }),
         fcEvents(0, "call_c", "compress", compressArgs),
@@ -502,14 +516,15 @@ test("loop #9 (S2): responses round yields usage → session.stats populated (nu
 
 test("loop #10 (S3): upstream 500 mid-loop terminates cleanly (timer cleared, no hang)", async () => {
     process.env.BILI_REPLAY_RETRY_BASE_MS = "1";
+    // acp_status guarantees the re-request this test needs; a bare-session
+    // compress would end the turn before any fetch under #156/#4186.
     const ctx = makeCtx([
         textMsg("m00001", "user", "hello"),
         textMsg("m00002", "assistant", "hi"),
     ]);
-    const compressArgs = JSON.stringify({ content: [{ startId: "m00001", endId: "m00002", summary: "s" }] });
     const round1 = [
         sse("response.created", { response: { id: "resp_1", status: "in_progress" } }),
-        fcEvents(0, "call_c", "compress", compressArgs),
+        fcEvents(0, "call_s", "acp_status", "{}"),
         COMPLETED,
     ].join("");
     let fetchCalls = 0;
@@ -594,8 +609,14 @@ test("loop #422a: successful compress → re-request carries the refreshed fold 
     }
 });
 
-// Scope guard: a FAILED compress changes no state — no refresh, stale view kept.
-test("loop #422b: failed compress → no fold refresh (stale view kept)", async () => {
+// Scope guard: a FAILED compress changes no state — no refresh (#422b scope
+// unchanged). #5220 contract: such a round no longer ends the turn — the retry
+// body carries ONE plain assistant recovery receipt whose bytes equal the ❌
+// marker already streamed to the client; this round's ephemeral tool frames
+// are stripped first so they never reach upstream (#1548/#4186 seam). The
+// fixture resubmits the identical failing call on round 2 → the #156
+// signature breaker stops exactly one re-request.
+test("loop #422b/#5220: failed compress → no fold refresh; recovery-receipt re-request; identical resubmit breaks", async () => {
     const ctx = withRefs(
         makeCtx([
             textMsg("m00001", "user", "hello"),
@@ -610,19 +631,26 @@ test("loop #422b: failed compress → no fold refresh (stale view kept)", async 
         COMPLETED,
     ].join("");
     const probe = reFetchProbe();
+    let refreshCalls = 0;
     try {
         ctx.refreshFolded = () => {
+            refreshCalls++;
             throw new Error("refreshFolded must NOT be called for a failed compress");
         };
-        await drain(
+        const out = await drain(
             new Response(round1, { status: 200 }).body!,
             ctx,
             { model: "gpt-4o", input: [], stream: true },
             { url: "http://mock", headers: {} },
         );
-        assert.ok(probe.calls() >= 1, "re-request still fires so the model sees the failure");
-        assert.ok(probe.bodies()[0]!.includes("hello"), "stale view preserved on failure");
-        assert.ok(probe.bodies()[0]!.includes("Compression FAILED"), "failure surfaced to the model");
+        assert.equal(refreshCalls, 0, "no fold refresh for a failed compress");
+        assert.equal(probe.calls(), 1, "recovery-receipt re-request fired once; the identical round-2 resubmit hits the #156 signature breaker");
+        const body = probe.bodies()[0]!;
+        assert.ok(body.includes("❌") && body.includes("FAILED"), "retry body carries the recovery receipt as assistant text");
+        assert.ok(!body.includes("function_call") && !body.includes("call_id"), "ephemeral failed frames stay off the wire (#1548/#4186) — receipt only");
+        assert.ok(!body.includes(compressArgs), "the failing arguments did NOT ride upstream inside an ephemeral frame (receipt carries marker text only)");
+        assert.ok(out.includes("Compression FAILED"), "failure receipt surfaced to the client so the reason survives the turn");
+        assert.ok(/event: response\.completed/.test(out), "graceful completion (not degenerate empty)");
     } finally {
         probe.restore();
     }

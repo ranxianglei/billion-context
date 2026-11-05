@@ -67,6 +67,8 @@ test("conflictRemediation: one line per known client, generic fallback for the r
     assert.ok(cl.includes("bili claude"), cl);
     const cx = conflictRemediation("codex");
     assert.ok(cx.includes("BILI_CODEX_COMPACT=intercept"), cx);
+    assert.ok(cx.includes("#3008"), cx);
+    assert.ok(!cx.includes("never transits"), "#3008: the inline auto-compact DOES transit as an ordinary turn — the old copy was false");
     assert.equal(conflictRemediation("pi"), conflictRemediation("omp"), "pi and omp share the carriage-evidence hint");
     assert.ok(conflictRemediation("pi").includes("report client + bili version"));
     const gen = conflictRemediation(undefined);
@@ -188,4 +190,41 @@ test("web wiring: banner consumes conflicts.clients, session-detail card consume
     assert.ok(WEB_CLIENT.includes("conflictHintBlock(c.clients)"), "banner wired to summarizeConflicts clients[]");
     assert.ok(WEB_CLIENT.includes("conflictHintLine(d.conflictClient)"), "session-detail card wired to conflictClient");
     assert.ok(WEB_CLIENT.includes("window.bili_conflictHintBlock = conflictHintBlock;"), "test seam export present");
+});
+
+test("formatConflictSection: identity-orphan-only ledger gets identity-loss framing, not the [suspected]-plugin bucket (#2802 review)", () => {
+    const orphan = (at: number): ConflictEvent[] => [
+        { at, kind: "identity-orphan", detail: "anonymous anthropic request replayed this conversation without client identity (normalized tail match at depth 19); session orphaned to a fresh pfa-c911250bdddebd02 fork — fold continuity lost (#2791 family)" },
+    ];
+
+    const activeText = formatConflictSection(orphan(Date.now() - 60_000), Date.now(), "dsh").join("\n");
+    assert.ok(activeText.includes("possible identity-loss replays"), activeText);
+    assert.ok(activeText.includes("does NOT prove"), activeText);
+    assert.ok(activeText.includes("Original session state is retained"), activeText);
+    assert.ok(!activeText.includes("THIS session's fold continuity broke"), activeText);
+    assert.ok(!activeText.includes("or start a fresh conversation"), activeText);
+    assert.ok(activeText.includes("NO second compressor to hunt for"), activeText);
+    assert.ok(activeText.includes("pfa-c911250bdddebd02"), "raw event line still names the fork");
+    // the misclassification this test pins: no plugin-hunt advice, no per-client
+    // auto-compaction remediation footer, no third-party-plugin docs pointer on a
+    // bili-owned diagnostic
+    assert.ok(!activeText.includes("confirm each named plugin"), activeText);
+    assert.ok(!activeText.includes("Fix (dsh):"), activeText);
+    assert.ok(!activeText.includes("disable the client's own auto-compaction"), activeText);
+    assert.ok(!activeText.endsWith(CONFLICT_DOCS_POINTER), activeText);
+
+    const stockText = formatConflictSection(orphan(Date.now() - 30 * DAY), Date.now()).join("\n");
+    assert.ok(stockText.includes("historical stock"), stockText);
+    assert.ok(stockText.includes("clear this ledger"), stockText);
+    assert.ok(!stockText.endsWith(CONFLICT_DOCS_POINTER), stockText);
+});
+
+test("formatConflictSection: mixed orphan + suspected ledger keeps the existing suspected tier verbatim (#2802 review)", () => {
+    const events: ConflictEvent[] = [
+        { at: Date.now() - 60_000, kind: "third-party-plugin", detail: "name-only match: some-compressor [suspected]" },
+        { at: Date.now() - 30_000, kind: "identity-orphan", detail: "session orphaned to a fresh pfa-c911250bdddebd02 fork" },
+    ];
+    const text = formatConflictSection(events, Date.now(), "dsh").join("\n");
+    assert.ok(text.includes("confirm each named plugin"), text);
+    assert.ok(text.endsWith(CONFLICT_DOCS_POINTER), text);
 });

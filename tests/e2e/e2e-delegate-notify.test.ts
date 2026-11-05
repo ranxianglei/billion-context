@@ -10,13 +10,20 @@
 //   BUGGY    => the notification only ever appears after the queue is exhausted
 //               (queueIdx == N): parked in the host follow-up queue until the
 //               whole main task ends (the #2320 defect).
-// Under the two-tier commit design (busy tier appends into the `context` event
-// before the next LLM call; idle tier sends ONE steering message when settled)
-// NOTHING may park in the host follow-up/steer queue during the task, so the
-// sampler additionally asserts pendingMessageCount stays 0 while busy.
+// Under the boundary-commit design (busy tier sends ONE steering message at
+// the next `turn_end`, right before the loop drains it into the next LLM call;
+// idle tier sends ONE steering message when settled) the notification is always
+// a PERSISTED user message (#2546): it parks in the host steering queue only
+// transiently (commit -> drain, one macrotask apart) and then lives in the
+// session forever. The sampler therefore asserts pendingMessageCount never
+// stacks above 1 while busy (stacking = double-queued notifications), and the
+// oracle asserts the notification PERSISTS: once delivered, every later
+// request of the conversation still carries it (notifCount >= 1) — the old
+// request-local `context` append vanished after exactly one request, which is
+// what dropped stateful upstream sessions off their cache.
 // Scenario B proves the no-further-input property: after the scripted prompt is
 // fully consumed, a late completion must still reach the model — either by
-// committing into the initial run's final context or by steer auto-starting a
+// committing at the initial run's final turn_end or by steer auto-starting a
 // new turn from idle.
 //
 // Gated by ACP_TEST_E2E_NATIVE=1 (same gate as e2e-native-pi.test.ts; needs
@@ -314,11 +321,13 @@ async function runScenario(name: string, prompt: string, totalDirectives: number
           check("run continued AFTER notification (later bash round)", needsLater ? laterTool : true, needsLater ? `laterBash=${laterTool}` : "notification landed on final directive — continuation n/a");
           const nearStreaming = pi.states.some((s) => s.isStreaming && Math.abs(s.t - R.t) <= 2500);
           check("main task streaming around consumption", nearStreaming, `samplesNear=${JSON.stringify(pi.states.filter((s) => Math.abs(s.t - R.t) <= 2500).map((s) => ({ isStreaming: s.isStreaming, pending: s.pendingMessageCount })))}`);
-          // The busy tier commits straight into the model context: nothing may
-          // park in the host follow-up/steer queue during the task (parking is
-          // exactly the #2320 defect).
+          // The busy tier commits at turn_end and the loop drains the steering
+          // queue into the next LLM call moments later: the notification parks
+          // in the queue TRANSIENTLY (that is the mechanism, #2546), so pending
+          // may briefly be 1 — but never stack above it (stacking = a second,
+          // double-queued notification). Quiescence below requires it back to 0.
           const maxPending = Math.max(0, ...pi.states.map((s) => s.pendingMessageCount ?? 0));
-          check("no follow-up queue parking during the task (maxPending == 0)", maxPending === 0, `maxPending=${maxPending}`);
+          check("no stacked parking during the task (maxPending <= 1)", maxPending <= 1, `maxPending=${maxPending}`);
         } else {
           // Two valid delivery shapes, both proving "no further user input was
           // needed": (a) IDLE tier — host already settled, steer auto-starts a
@@ -329,6 +338,16 @@ async function runScenario(name: string, prompt: string, totalDirectives: number
           const idleAround = preArrival.length > 0 && preArrival.every((s) => !s.isStreaming);
           const busyCommit = preArrival.some((s) => s.isStreaming);
           check("delivered with no further input (idle auto-start or in-run commit)", idleAround || busyCommit, `preArrivalSamples=${JSON.stringify(preArrival.map((s) => ({ isStreaming: s.isStreaming, pending: s.pendingMessageCount })))}`);
+        }
+        // #2546: the notification is a PERSISTED session message — every later
+        // request of this conversation must still carry it (the buggy
+        // request-local append disappeared after exactly one request, which is
+        // what dropped stateful upstream sessions off their cache).
+        const laterRows = prows.filter((r) => r.t > R.t && !r.title);
+        const missing = laterRows.filter((r) => !(typeof r.notifCount === "number" && r.notifCount >= 1));
+        check("notification persists in every later request (#2546)", missing.length === 0, `later=${laterRows.length}, missing=${missing.map((r) => `q${r.queueIdx}:${r.toolName ?? "txt"}(notif=${r.notifCount ?? "n/a"})`).join(",")}`);
+        if (name === "midtask") {
+          check("persistence window observed (requests followed the delivery)", laterRows.length > 0, `later=${laterRows.length}`);
         }
       }
       if (name === "idle") {

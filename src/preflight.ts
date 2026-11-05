@@ -1,4 +1,5 @@
 import {
+    BLOCKED_REF,
     countMessageTokens,
     defaultCountTokens,
     viableRanges,
@@ -7,7 +8,10 @@ import {
     type CoreMessage,
     type Prompts,
     type PackSurface,
+    type NudgeDecision,
 } from "acp-kernel";
+import { createHash } from "node:crypto";
+import { yieldToEventLoop } from "./yield-loop.js";
 import { buildCompressSystemPrompt, parseCompressInput } from "./compress-tool.js";
 import { IMAGE_PLACEHOLDER, imagePlaceholdersForSummary } from "./image-note.js";
 import { applyAbsorbView } from "./absorb.js";
@@ -16,12 +20,22 @@ import { applyRanges, normalizeRangeOrder, type RewriteCtx } from "./stream.js";
 import { fetchWithTimeout, isTransientUpstreamError, replayMaxAttempts, replayBackoffMs, sleep, UpstreamHttpError } from "./fetch-util.js";
 import { dumpSummaryRejection } from "./error-dump.js";
 import { proxyDispatcher } from "./upstream-proxy.js";
+import { isTlsTrustCode, tlsTrustRemediation, TLS_TRUST_CODES } from "./upstream-fail.js";
 import { lastCompressSuffix, type Session } from "./session.js";
+import { epochConfirmPending } from "./fold-reconcile.js";
+import { deadSkipKeys, filterDeadRanges, parseStructuralEmptyVerdict, recordDeadRange } from "./dead-ranges.js";
 import { peekRegistryOutputLimit } from "./registry.js";
 import { safePrefix } from "./text-safe.js";
 import { applyEstimateCalibration, currentCalibrationFactor } from "./util.js";
 import { configuredSummaryPlan, type ConfiguredSummaryPlan } from "./external-summary-runtime.js";
+import { messageTimestampSections } from "./external-summary-surface.js";
+import { isCodexClient } from "./codex-compact.js";
+import { describeExternalSummaryFailure, summaryLengthBudgetClause } from "./external-summary.js";
+// #3635: the failure description moved to the leaf module next to its data
+// type; re-exported here for importers that historically reached it via preflight.
+export { describeExternalSummaryFailure };
 import type { ResolvedKernelConfig } from "./compress-settings.js";
+import { newExternalCallId } from "./external-summary-marker.js";
 
 // #247: proactive pre-forward compression. When the session's real context
 // (previous turn's upstream input_tokens) exceeds the current model's window
@@ -29,9 +43,14 @@ import type { ResolvedKernelConfig } from "./compress-settings.js";
 // overflows at forward time and the reactive nudge can never fire — the
 // request itself is rejected by the upstream, so the model never sees the
 // nudge and every subsequent request overflows identically (stuck session).
-// This module compresses the oldest compressible ranges first, via dedicated
-// summarization calls sized to fit the smaller window, before the payload is
-// forwarded.
+// This module compresses the highest-payoff compressible ranges first —
+// outside the soft-protected recent zone, largest span per summarization call
+// (#2682: a call costs the same wall clock for 6K or 64K tokens, and the head
+// range re-grows after each fold, so age-order starved the big ranges behind
+// endless head re-folds); ranges that enter the zone exist only after a
+// #330/#1841 relax and stay oldest-first within it, never outranking old
+// content — via dedicated summarization calls sized to fit the smaller
+// window, before the payload is forwarded.
 
 export const MAX_PREFLIGHT_ROUNDS = 16;
 const CHUNK_FRACTION = 0.6;
@@ -53,6 +72,23 @@ const MAX_SUMMARY_OUTPUT_TOKENS = 32768;
 // #574: bound on upstream summarization calls per invocation — the multi-range
 // walk can otherwise spend a call per viable range in a block-dense history.
 export const MAX_SUMMARY_CALLS_PER_PREFLIGHT = 16;
+// #2678/#2667: how many disjoint ranges one preflight round nominates into a
+// SINGLE external-summary batch call. Sized at the executor pool's default
+// concurrency (src/external-summary-runtime.ts): beyond that, extra work items
+// only queue inside the same pass. Ranges past the cap fold through the
+// serial walk in later rounds exactly as before.
+const MAX_PREFLIGHT_SUMMARY_BATCH = 4;
+// #2952 Design A: bounded tier-distillation recovery. When raw-range folding
+// alone cannot close the window gap but distilling existing lower-tier BLOCKS
+// (T1->T2, T2->T3) can, preflight performs the distillation ITSELF — the model
+// is blocked from doing it because its next turn is refused by this very
+// fail-fast (the deadlock reported in #2952). Hard caps keep it bounded: at most
+// MAX_TIER_DISTILL_CALLS summary calls per invocation, and each call's source
+// content is capped (TIER_DISTILL_SOURCE_CHAR_BUDGET) so one recovery cannot
+// bill an unbounded prompt. Never entered for tiers=false or emergency digest
+// mode (no LLM lane), so those paths stay byte-identical.
+const MAX_TIER_DISTILL_CALLS = 6;
+const TIER_DISTILL_SOURCE_CHAR_BUDGET = 60_000;
 // #1819: net-shrink monotonicity tolerance for fold acceptance. A weak
 // summarizer can regurgitate a verbose re-narration that EXCEEDS its own
 // range: the flat maxSummaryLength cap bounds absolute size only, so such a
@@ -82,12 +118,33 @@ const TRANSIENT_EMPTY_SUMMARY_RETRIES = 2;
 // few extra calls instead of burning the full budget on doomed draws.
 // Reset alongside summaryCalls when soft protection is relaxed (#575-merge).
 const TRANSIENT_EMPTY_RETRY_BUDGET = 4;
+// #2832: a completion that ends NORMALLY (end_turn / stop / completed) with
+// ZERO answer text is not a blip — the model spent its whole turn in the
+// thinking channel and stopped cleanly, or the relay stripped the text
+// blocks. Re-sending the identical payload returns the identical empty
+// answer, so unlike #1767's transient empties (content_filter, truncated
+// streams) it earns no same-span retry, and unlike #726's size-driven empties
+// halving the span cannot help either: a normal stop is not a size signal.
+// K consecutive such answers on the same (host, model) arm a session-level
+// dead-probe verdict that stops further probing for this session until a
+// probe succeeds again (canary probe per invocation — see preflightCompress).
+const DETERMINISTIC_EMPTY_STICKY_LIMIT = 3;
 // #1841: slack on the futility verdicts below. Range token estimates carry
 // ±~20% error on mixed CJK/Latin/code, and a fold's summary re-enters the
 // payload, so realizable saving is strictly below span mass. Fail CLOSED:
 // skip a doomed round only when the shortfall survives this slack — when
 // unsure, walk exactly as before.
 const FUTILITY_SLACK = 1.2;
+
+// #5408: when the #4288 fit-forward exit judges on ESTIMATE ONLY (no usage
+// baseline backing it) and the payload estimate reaches this fraction of the
+// HARD window limit, warn: the local estimate excludes the system prompt +
+// tool definitions and provider-side counting, so "fits by our scale" can
+// still overflow upstream (the incident forwarded ~542K actual against a
+// 500K window with zero bili warnings). Observability only — the forward
+// still happens (blocking would defeat #4288); the overflow-arm rescue folds
+// next turn if upstream rejects (#1195).
+const FIT_FORWARD_ESTIMATE_ONLY_MARGIN = 0.85;
 // #2383: entry overshoot (entryTokens / window) above which the LLM fold path
 // is PROVABLY unable to converge in this invocation — it exceeds the raised
 // budget's maximum coverage (MAX_PREFLIGHT_ROUNDS * 2 rounds x CHUNK_FRACTION
@@ -177,11 +234,22 @@ export interface PreflightDeps {
     config: Config;
     /** Best-effort target below the hard window; never relax recent protection for headroom alone. */
     compressionTarget?: number;
+    /** Display-only: why this walk runs — "growth" (auto-fold floor) vs "overflow" (window). Labels the applied blocks' topic so panels/logs can tell auto-folds from emergency folds. */
+    compressReason?: "growth" | "overflow";
     prompts: Prompts;
     surface?: PackSurface;
     protocol: PreflightProtocol;
     url: string;
     headers: Record<string, string>;
+    /** #3226: re-sign hook for body-covering signature lanes (CodeArts APIG
+     *  SDK-HMAC-SHA256 and peers). The summarization call sends a body bili built
+     *  itself, so any inbound signature that covered the ORIGINAL request body is
+     *  invalid here; the caller supplies the same signer the main forward uses
+     *  (#1884 re-sign arm) so the summary egress carries a signature over its OWN
+     *  bytes instead of someone else's (which the gateway rejects with 401
+     *  body-hash-mismatch, killing compression on signed lanes). Absent for
+     *  unsigned traffic — summaryHeaders then clones the inbound auth as-is. */
+    resign?: (headers: Record<string, string>, body: string) => void;
     model: string;
     proxyUrl?: string;
     signal?: AbortSignal;
@@ -216,6 +284,12 @@ interface PreflightFailure {
     kind: PreflightFailureKind;
     /** A temporary transport failure, not evidence that this context cannot be compressed. */
     retryable?: boolean;
+    /** Pure fold-math proved NO combination of folds can close the gap regardless of
+     * upstream health (#3461) — the host answers non-retryable 4xx instead of a
+     * transient 502. Relay-dependent exhaustion (empty/truncated/incomplete
+     * summaries, budget draws, pool saturation) deliberately leaves this unset:
+     * those walks can succeed on retry once the relay recovers. */
+    deterministic?: boolean;
     /** Upstream HTTP status when kind === "upstream" and the failure was an HTTP response. */
     status?: number;
     /** Human-readable cause (safe to surface to the client). */
@@ -227,7 +301,27 @@ interface PreflightFailure {
 // unusable branch carries a diagnosis of what the body actually contained so
 // it is logged and surfaced in the fail-fast message instead of the generic
 // "summary too short".
-type SummaryOutcome = { summary: string } | { unusable: string; transient?: boolean };
+type SummaryOutcome = { summary: string; external?: boolean } | { unusable: string; transient?: boolean; deterministic?: boolean; external?: never };
+
+// Persistence can replace the session state while a summary request is in flight.
+function foldTargetKey(block: Session["state"]["blocks"][number], state: Session["state"]): string {
+    return JSON.stringify([
+        block.directMessageIds,
+        block.effectiveMessageIds,
+        block.directBlockIds.map((id) => {
+            const source = state.blocks.find((candidate) => candidate.blockId === id);
+            return source && [source.blockId, source.tier, source.topic, source.summary, source.directMessageIds, source.effectiveMessageIds, source.directBlockIds];
+        }),
+    ]);
+}
+
+function previewFoldTargetKey(core: CompressionCore, messages: CoreMessage[], state: Session["state"], config: Config, startRef: string, endRef: string): string | undefined {
+    const summary = "x".repeat(Math.max(MIN_SUMMARY_CHARS, config.compress.minSummaryLength));
+    const preview = core.applyCompression({ messages, state, config, ranges: [{ startRef, endRef, summary }] });
+    const known = new Set(state.blocks.map((block) => block.blockId));
+    const target = preview.state.blocks.find((block) => !known.has(block.blockId));
+    return target && foldTargetKey(target, state);
+}
 
 export interface PreflightResult {
     compressedRanges: number;
@@ -250,9 +344,19 @@ export interface PreflightResult {
      *  unknown-baseline ones (#553 — the optimistic figure can undershoot by
      *  up to ~4x on dense replays, so only the upper bound proves a fit). */
     fitsWindow: boolean;
-    /** Why the loop stopped while the payload still overflows the window.
-     *  Undefined when the payload fits. */
+    /** 循环因窗口仍溢出或客户端取消而停止的原因。
+     *  即使压缩后的内容已能放入窗口，也必须保留取消状态。 */
     failure?: PreflightFailure;
+    /** #2662: external-chain dispatch telemetry, present only when a chain
+     *  ran; calls > 0 && attempts === 0 = pool dropped every batch before
+     *  dispatch (congestion, not provider failure). */
+    externalDispatch?: { calls: number; attempts: number };
+    /** #2638: some round saw at least one range that passed every list-level gate
+     *  (viability, minCompressRange, dead-range memory). The caller uses it to tell a
+     *  failed fold chain (candidates existed, none delivered — backoff is right) from
+     *  lean steady state (nothing foldable remained at all — arming the auto-fold
+     *  backoff would only cycle classic nudges at dead spans). */
+    hadFoldableCandidates: boolean;
 }
 
 function refMaps(messages: CoreMessage[], state: Session["state"]): { refToIdx: Map<string, number>; idxToRef: Map<number, string> } {
@@ -282,10 +386,53 @@ function refNum(ref: string): number {
 // clamp, the image-cost textSide) carries billed-caliber mass. Without it the
 // k̂ sample divides a bill that includes thinking by an estimate that
 // excludes it, and thinking-heavy routes learn an inflated factor.
+// #5116: the estimator runs on EVERY outbound turn over the RESENT full
+// history, so the CJK-aware scan is O(total conversation bytes) per request
+// and O(turns × bytes) per session — the single largest per-turn CPU item on
+// big-context lanes. A message's estimate is a pure function of its identity
+// (text + thinkingTokens), and kernel-minted ids are content digests, so an
+// id-keyed memo makes every call after the first a Map lookup: steady state
+// pays O(new messages) instead of O(full history) and repeated calls within
+// one turn (preflight arming, window gates, output clamp, relay) all hit.
+// Only `h_` digest ids are cached — test fixtures and reserved ids
+// (`acp_summary_*`) may reuse an id across differing texts and bypass it.
+// Kernel ids are *logical* identity, not a digest of the counted text, so two
+// same-id messages can still differ in counted text: (a) converters seed
+// tool-call ids with canonicalToolArgs(args) (whitespace/key-order only — the
+// character multiset, and therefore the CJK-aware count, is unchanged) while
+// CoreMessage.text keeps the verbatim args; (b) view renders (renderTags,
+// snapshot render) rewrite text in place and keep ids. The key therefore also
+// carries text length: every length-changing rewrite misses (a safe recount),
+// and the canonicalization deltas from (a) are count-invariant by construction.
+const messageTokenMemo = new Map<string, number>();
+const MESSAGE_TOKEN_MEMO_CAP = 200_000;
+const KERNEL_MINTED_ID = /^h_[0-9a-f]{16}(?:_\d+)?$/;
+
 export function estimateCoreMessages(messages: CoreMessage[]): number {
     let tokens = 0;
-    for (const m of messages) tokens += countMessageTokens(m, defaultCountTokens);
+    for (const m of messages) {
+        const id = m.id;
+        if (KERNEL_MINTED_ID.test(id)) {
+            const textLength = m.text === undefined ? -1 : m.text.length;
+            const key = `${id}|${textLength}|${m.thinkingTokens ?? ""}`;
+            const cached = messageTokenMemo.get(key);
+            if (cached !== undefined) {
+                tokens += cached;
+                continue;
+            }
+            const counted = countMessageTokens(m, defaultCountTokens);
+            if (messageTokenMemo.size >= MESSAGE_TOKEN_MEMO_CAP) messageTokenMemo.clear();
+            messageTokenMemo.set(key, counted);
+            tokens += counted;
+        } else {
+            tokens += countMessageTokens(m, defaultCountTokens);
+        }
+    }
     return tokens;
+}
+
+export function clearEstimateCoreMessagesMemoForTests(): void {
+    messageTokenMemo.clear();
 }
 
 // #554: side requests bypass the pipeline (#388) and are forwarded VERBATIM,
@@ -331,12 +478,112 @@ export function estimateCoreMessagesUpper(messages: CoreMessage[]): number {
     return chars;
 }
 
+// #2490: UTF-8 byte twin of the char upper bound. Chars and bytes diverge on
+// CJK (1 char = 3 bytes, real density as low as ~1.5 chars/token) — a pure-CJK
+// monster can be char-harmless yet byte-doomed, so the doomed-probe guard
+// prices the floor in bytes: even the densest tokenizer observed on a live
+// route compresses agent traffic to ~6.8 bytes/token (#2122), so a core-text
+// mass beyond window×7.5 bytes cannot fit under ANY plausible tokenizer and
+// forwarding it "to acquire evidence" is a guaranteed 400, not an experiment.
+export function estimateCoreMessagesUpperBytes(messages: CoreMessage[]): number {
+    let bytes = 0;
+    for (const m of messages) bytes += Buffer.byteLength(m.text ?? "", "utf8");
+    return bytes;
+}
+
+// #4079: the byte floor above prices every message independently — that is what
+// a tokenizer charges (a repeat is billed again, never free) — but it cannot
+// tell a payload that GREW from one that was REPEATED. Those need different
+// fixes: repeated content points at whatever built the message list (fold/view),
+// grown content at the conversation itself. Today only the byte total is logged,
+// so an operator looking at "12 MB" against a baseline the same session just
+// measured at 387K tokens has nothing to act on. Grouping the core text by
+// sha256 costs one pass and is paid only on the refusal path.
+// Review of #4290: the kernel's render-refs node (default strategy
+// "text-only") prepends a UNIQUE ref tag to every
+// rendered text message, so hashing raw m.text groups nothing — two
+// byte-identical payloads differ only in their ref and read as distinct,
+// pinning duplicateRatio at 0.000 for every multi-message proxy-mode payload
+// (defeating the diagnostic's whole point). Strip the leading well-formed tag
+// so the profile measures CONTENT redundancy. totalBytes then trails the
+// doomed-probe byte floor (estimateCoreMessagesUpperBytes, tagged) by the tag
+// overhead only (~44B/message) — reconcilable at MB scale.
+// Shape follows invariant-judge's RENDER_TAG_RE (`/\n?\x3cacp\s[^>]*\x3e.../`),
+// not a fixed attr list: the renderer injects the tag on its own line, and the
+// attr set is the renderer's to change. An over-strict prefix fails SILENTLY —
+// the ratio just goes back to 0.000 and nothing says so — so widening here is
+// cheaper than re-learning that in six months.
+const ACP_REF_TAG_PREFIX = /^\n?\x3cacp\s[^>]*\x3em\d+\x3c\/acp\x3e\n?/;
+
+export function measureCoreTextDuplication(messages: CoreMessage[]): { messageCount: number; totalBytes: number; uniqueBytes: number; distinctTexts: number } {
+    const distinct = new Map<string, number>();
+    let totalBytes = 0;
+    let messageCount = 0;
+    for (const m of messages) {
+        const text = (m.text ?? "").replace(ACP_REF_TAG_PREFIX, "");
+        const bytes = Buffer.byteLength(text, "utf8");
+        if (bytes === 0) continue;
+        messageCount++;
+        totalBytes += bytes;
+        const key = createHash("sha256").update(text, "utf8").digest("base64");
+        if (!distinct.has(key)) distinct.set(key, bytes);
+    }
+    let uniqueBytes = 0;
+    for (const bytes of distinct.values()) uniqueBytes += bytes;
+    return { messageCount, totalBytes, uniqueBytes, distinctTexts: distinct.size };
+}
+
+export function describeCoreTextDuplication(messages: CoreMessage[]): string {
+    const d = measureCoreTextDuplication(messages);
+    if (d.totalBytes === 0) return "core text is empty";
+    const ratio = 1 - d.uniqueBytes / d.totalBytes;
+    return `${d.messageCount} message(s), ${d.totalBytes}B core over ${d.distinctTexts} distinct text(s), ${d.uniqueBytes}B unique, duplicateRatio=${ratio.toFixed(3)} — repeats are billed as tokens; a high ratio means the payload grew by repetition (fold/view build), not by content (#4079)`;
+}
+
 function spanUnitsOf(messages: CoreMessage[], startIdx: number, endIdx: number, countText: (text: string) => number): number {
     let units = 0;
     for (let i = startIdx; i <= endIdx && i < messages.length; i++) {
         units += countText(messages[i].text ?? "");
     }
     return units;
+}
+
+// #2672: a range boundary must name a message the kernel can resolve. Protected
+// messages hold the BLOCKED sentinel in byRaw and ephemeral injections hold no
+// ref at all; a boundary landing on either makes applyCompression reject the
+// whole range ("Invalid boundary ref(s)"). Snap [lo,hi] inward to the nearest
+// usable indices; null when nothing usable remains (nothing to fold there).
+function snapToUsableBounds(
+    idxToRef: Map<number, string>,
+    lo: number,
+    hi: number,
+): [number, number] | null {
+    let l = lo;
+    let h = hi;
+    const usable = (i: number): boolean => {
+        const ref = idxToRef.get(i);
+        return ref !== undefined && ref !== BLOCKED_REF;
+    };
+    while (l <= h && !usable(l)) l += 1;
+    while (h >= l && !usable(h)) h -= 1;
+    return l <= h ? [l, h] : null;
+}
+
+// #726/#2672: push the two halves of a failed span onto the worklist (oldest
+// half first), adjusting each inner boundary past protected/unreferenced
+// messages so the split itself can never mint an unresolvable boundary. A half
+// left with no usable message is dropped instead of pushed.
+function pushSpanHalves(
+    idxToRef: Map<number, string>,
+    spans: Array<[number, number]>,
+    cs: number,
+    ce: number,
+): void {
+    const mid = Math.floor((cs + ce) / 2);
+    const upper = snapToUsableBounds(idxToRef, mid + 1, ce);
+    if (upper) spans.push(upper);
+    const lower = snapToUsableBounds(idxToRef, cs, mid);
+    if (lower) spans.push(lower);
 }
 
 // Message-level splitChunks cannot shrink a span dominated by one huge
@@ -382,6 +629,52 @@ function truncateSummaryToLimit(text: string, maxChars: number, minChars: number
     if (cut < minChars) cut = room;
     const out = `${text.slice(0, cut)}${marker}`;
     return out.length <= maxChars && out.trim().length >= minChars ? out : null;
+}
+
+// #4740: merge away poison fragments — chunks whose char mass is below
+// the kernel's minCompressRange gate. applyCompression counts msg.text
+// chars and rejects such a range ATOMICALLY, so folding it wastes a whole
+// round (and in the batch lane, one span per range, the range never folds
+// at all). Extend the FOLLOWING chunk to swallow the fragment; a trailing
+// fragment folds into the previous chunk instead. Budget discipline is
+// preserved downstream: the summarizer request content is split by budget
+// (splitSummaryContent), and the alternative to merging is a guaranteed
+// kernel rejection, not a smaller request.
+function mergeSubMinimumFragments(
+    messages: CoreMessage[],
+    spans: Array<[number, number]>,
+    minChars: number,
+    isCoveredIdx?: (idx: number) => boolean,
+): Array<[number, number]> {
+    if (minChars <= 0 || spans.length === 0) return spans;
+    const chars = (s: [number, number]) => {
+        let total = 0;
+        for (let i = s[0]; i <= s[1]; i++) total += (messages[i]?.text ?? "").length;
+        return total;
+    };
+    const out: Array<[number, number]> = [];
+    let fragStart = -1;
+    for (let i = 0; i < spans.length; i++) {
+        const s = spans[i]!;
+        const run: [number, number] = fragStart >= 0 ? [fragStart, s[1]] : [s[0], s[1]];
+        const blockedByCoverage = i + 1 < spans.length && (isCoveredIdx?.(spans[i + 1]![0]) ?? false);
+        if (chars(run) < minChars && i < spans.length - 1 && !blockedByCoverage) {
+            fragStart = run[0];
+            continue;
+        }
+        // Known corner (round-2 review F3, master parity): a sub-min fragment
+        // blocked by coverage with nothing ahead and nothing behind to absorb
+        // it is still emitted — the kernel's apply gate rejects it at the cheap
+        // preview (no LLM call), the walk skips the span and retries next
+        // round; bounded churn, never poison beyond this span. Merging across
+        // the covered boundary would fold covered content into a new range —
+        // worse than the churn.
+        // A trailing fragment (nothing ahead to swallow it) folds backward.
+        if (chars(run) < minChars && out.length > 0) out[out.length - 1]![1] = run[1];
+        else out.push(run);
+        fragStart = -1;
+    }
+    return out;
 }
 
 // minUnits: never close a chunk below this many countText units while more
@@ -447,7 +740,7 @@ function windowClampedOutput(base: number, window: number | undefined, system: s
     return Math.min(base, Math.max(MIN_CLAMPED_SUMMARY_OUTPUT, headroom));
 }
 
-export function summaryPayload(protocol: PreflightProtocol, model: string, system: string, content: string, stream: boolean, includeMaxOutputTokens: boolean, host?: string, window?: number, billingBlock?: { type: "text"; text: string }): Record<string, unknown> {
+export function summaryPayload(protocol: PreflightProtocol, model: string, system: string, content: string, stream: boolean, includeMaxOutputTokens: boolean, host?: string, window?: number, billingBlock?: { type: "text"; text: string }, codexClient?: boolean): Record<string, unknown> {
     const maxOutputTokens = windowClampedOutput(summaryOutputTokens(model, host), window, system, content);
     if (protocol === "anthropic") {
         // #2189: carry the client's billing-attribution block as system[0] with
@@ -474,15 +767,31 @@ export function summaryPayload(protocol: PreflightProtocol, model: string, syste
     // #663: max_output_tokens is optional — omit it once the upstream has
     // rejected the parameter (learned per URL+model); the model's default
     // output cap then applies.
-    const payload: Record<string, unknown> = { model, instructions: system, input: [{ role: "user", content }], stream, store: false };
+    // #2733: new-api / anyrouter-family codex relays validate inbound calls as
+    // "legitimate Codex requests" — input must be typed message items AND carry
+    // include:["reasoning.encrypted_content"] (the real codex CLI's signature,
+    // sent unconditionally by codex-rs core client.rs); anything else is 400
+    // invalid_responses_request. The main path forwards real codex bytes
+    // verbatim, so only bili's own side-channel summary call was rejected
+    // (preflight lane dead → codex local auto-compaction won the race).
+    // Non-codex clients keep the minimal shape byte-identical.
+    const input = codexClient
+        ? [{ type: "message", role: "user", content: [{ type: "input_text", text: content }] }]
+        : [{ role: "user", content }];
+    const payload: Record<string, unknown> = { model, instructions: system, input, stream, store: false };
+    if (codexClient) payload.include = ["reasoning.encrypted_content"];
     if (includeMaxOutputTokens) payload.max_output_tokens = maxOutputTokens;
     return payload;
 }
 
 // #626: some upstreams (ChatGPT-login codex backend) reject non-stream calls
-// outright with 400 "Stream must be set to true". Match the rejection broadly
-// enough to cover phrasing variants, narrowly enough that an unrelated 400
-// mentioning neither word never triggers a pointless stream retry.
+// outright with 400 "Stream must be set to true". #2494: no phrase list can
+// enumerate every vendor's wording for the same policy ("Non-stream chat
+// request is currently not supported", code 11101, defeats the original
+// regex), so the regex no longer GATES the adaptation — a 400 on a
+// NON-STREAMING summary call is itself the signal (the shape was rejected)
+// and gets exactly one SSE probe. The regex survives only to pick the more
+// specific log line.
 const STREAM_REQUIRED_RE = /\bstream\b[^\n]{0,60}\btrue\b/i;
 
 // #663: the same ChatGPT-login codex backend rejects the Responses
@@ -795,6 +1104,41 @@ export function emptySummaryIsSizeDriven(diagnosis: string): boolean {
     return /context_length_exceeded|too long|finish_reason=length\b|stop_reason=max_tokens\b|reason=max_output_tokens\b/i.test(diagnosis);
 }
 
+// #2832: a plain-JSON completion that ended NORMALLY (end_turn / stop /
+// completed) yet carries ZERO answer text is deterministic for this
+// (model, host) pair — the model spent its whole turn in the thinking
+// channel and stopped cleanly, or the relay dropped the text blocks.
+// Re-sending the identical payload yields the identical empty answer, so it
+// earns neither #1767's same-span retries nor #726's halving recovery (a
+// normal stop is not a size signal). SSE bodies (json === null) are never
+// classified here — truncation mid-stream stays the transient case #1767/#780
+// defend. A non-zero answer under MIN_SUMMARY_CHARS also stays off this path:
+// only a genuinely EMPTY normal stop proves the probe path itself is dead.
+export function isDeterministicEmptyCompletion(protocol: PreflightProtocol, json: unknown): boolean {
+    if (!json || typeof json !== "object") return false;
+    if (extractSummaryText(protocol, json as Record<string, unknown>).trim().length > 0) return false;
+    const o = json as Record<string, unknown>;
+    switch (protocol) {
+        case "anthropic": {
+            return o.stop_reason === "end_turn" && Array.isArray(o.content);
+        }
+        case "openai": {
+            const choices = o.choices;
+            if (!Array.isArray(choices) || choices.length === 0) return false;
+            const first = choices[0];
+            if (!first || typeof first !== "object") return false;
+            return (first as Record<string, unknown>).finish_reason === "stop";
+        }
+        case "responses": {
+            if (!Array.isArray(o.output)) return false;
+            if (typeof o.status === "string" && o.status !== "completed") return false;
+            return true;
+        }
+        default:
+            return false;
+    }
+}
+
 export function diagnoseEmptySummary(text: string, json?: unknown): string {
     if (json && typeof json === "object") {
         // #2309: the Responses terminal check runs FIRST — a failed response
@@ -856,12 +1200,79 @@ function emptyCompletionDetail(json: Record<string, unknown>): string | null {
     if (Array.isArray(choices) && choices.length > 0) {
         const first = choices[0];
         if (!first || typeof first !== "object") return null;
-        const fr = (first as Record<string, unknown>).finish_reason;
+        const choice = first as Record<string, unknown>;
+        const fr = choice.finish_reason;
         if (typeof fr === "string") parts.push(`finish_reason=${fr}`);
+        // #2832: block-level fingerprint — an EMPTY answer with a NORMAL stop
+        // reason is only diagnosable when the log shows where the model's
+        // output went (thinking-only vs relay-stripped text vs truly nothing).
+        const message = choice.message;
+        if (message && typeof message === "object") {
+            const msg = message as Record<string, unknown>;
+            if (typeof msg.content === "string") {
+                parts.push(`text_chars=${msg.content.length}`);
+            } else if (Array.isArray(msg.content)) {
+                let textBlocks = 0;
+                for (const part of msg.content) {
+                    if (part && typeof part === "object" && typeof (part as Record<string, unknown>).text === "string") textBlocks += 1;
+                }
+                parts.push(`text_blocks=${textBlocks}`);
+            }
+            if (typeof msg.reasoning_content === "string" && msg.reasoning_content.length > 0) {
+                parts.push(`reasoning_chars=${msg.reasoning_content.length}`);
+            }
+        }
     } else if (typeof json.stop_reason === "string") {
         parts.push(`stop_reason=${json.stop_reason}`);
+        if (Array.isArray(json.content)) {
+            let textBlocks = 0;
+            let thinkingBlocks = 0;
+            let reasoningChars = 0;
+            for (const block of json.content) {
+                if (!block || typeof block !== "object") continue;
+                const b = block as Record<string, unknown>;
+                if (b.type === "text") textBlocks += 1;
+                else if (b.type === "thinking" || b.type === "redacted_thinking") {
+                    thinkingBlocks += 1;
+                    if (typeof b.thinking === "string") reasoningChars += b.thinking.length;
+                }
+            }
+            parts.push(`text_blocks=${textBlocks}`);
+            if (thinkingBlocks > 0) parts.push(`thinking_blocks=${thinkingBlocks}`);
+            if (reasoningChars > 0) parts.push(`reasoning_chars=${reasoningChars}`);
+        }
     } else if (Array.isArray(json.output)) {
         if (typeof json.status === "string") parts.push(`status=${json.status}`);
+        // #2832 responses shape: mirror extractSummaryText's counting — text
+        // parts only from message items, reasoning chars from reasoning items.
+        let textParts = 0;
+        let reasoningChars = 0;
+        for (const item of json.output) {
+            if (!item || typeof item !== "object") continue;
+            const it = item as Record<string, unknown>;
+            const itemType = typeof it.type === "string" ? it.type : "";
+            if (itemType === "reasoning") {
+                for (const arr of [it.content, it.summary]) {
+                    if (!Array.isArray(arr)) continue;
+                    for (const p of arr) {
+                        if (p && typeof p === "object" && typeof (p as Record<string, unknown>).text === "string") {
+                            reasoningChars += ((p as Record<string, unknown>).text as string).length;
+                        }
+                    }
+                }
+            } else if (itemType === "" || itemType === "message") {
+                const content = it.content;
+                if (!Array.isArray(content)) continue;
+                for (const p of content) {
+                    if (!p || typeof p !== "object") continue;
+                    const part = p as Record<string, unknown>;
+                    const partType = typeof part.type === "string" ? part.type : "";
+                    if ((partType === "" || partType === "output_text") && typeof part.text === "string") textParts += 1;
+                }
+            }
+        }
+        parts.push(`text_parts=${textParts}`);
+        if (reasoningChars > 0) parts.push(`reasoning_chars=${reasoningChars}`);
     } else {
         return null;
     }
@@ -869,24 +1280,27 @@ function emptyCompletionDetail(json: Record<string, unknown>): string | null {
     return parts.length > 0 ? ` (${parts.join(", ")})` : "";
 }
 
-async function summarizeRange(deps: PreflightDeps, content: string, startRef: string, endRef: string, lengthBudget?: number): Promise<SummaryOutcome> {
+async function summarizeRange(deps: PreflightDeps, content: string, startRef: string, endRef: string, lengthBudget?: number, systemOverride?: string): Promise<SummaryOutcome> {
     // #1775: the cap used to be enforced only after the fact — an over-cap
     // assembly was discarded wholesale (the #1775 incident). Tell the model the
     // character budget up front so the first attempt already fits. Below
     // MIN_SUMMARY_CHARS the instruction would be counterproductive (the kernel
     // minimum-summary gate rejects such output anyway), so omit it.
-    const system =
-        buildCompressSystemPrompt(deps.prompts, deps.surface?.promptSections) +
+    // #2952: systemOverride carries a tier-distillation TASK (T2/T3 rules) in
+    // place of the default tier-1 TASK; absent → byte-identical default below.
+    const system = systemOverride ?? buildCompressSystemPrompt(deps.prompts, messageTimestampSections(deps.surface?.promptSections)) +
         `\n\nTASK: The conversation segment below (messages ${startRef}–${endRef}) must be compressed because the session context exceeds the current model's window. Write a tier-1 compression summary of the segment following every rule above. Output ONLY the summary text — no preamble, no closing remarks, no tool calls.` +
-        (lengthBudget !== undefined && lengthBudget >= MIN_SUMMARY_CHARS
-            ? `\n\nLENGTH BUDGET: Your ENTIRE response must be AT MOST ${lengthBudget} characters total — longer output is rejected by the pipeline. Be dense: compact bullets, no filler or repetition.`
-            : "");
+        summaryLengthBudgetClause(lengthBudget, MIN_SUMMARY_CHARS);
     if (deps.externalSummary) {
         const batch = await deps.externalSummary.summarize([{ instructions: system, content, minSummaryChars: MIN_SUMMARY_CHARS,
             maxSummaryChars: deps.config.compress.maxSummaryLength }], deps.signal);
         const result = batch.results[0];
-        return result?.status === "success" ? { summary: result.summary }
-            : { unusable: "configured external summary candidates failed or exceeded their budget", transient: false };
+        // Observability parity with the model-tool path (external-summary-compress
+        // logs "[external-summary] completed" there): this path used to be fully
+        // silent on success, which made executor attribution impossible from logs.
+        deps.log("info", `[external-summary] completed (preflight) 1/1 range(s); ${describeExternalSummaryFailure(batch)}`);
+        return result?.status === "success" ? { summary: result.summary, external: true }
+            : { unusable: describeExternalSummaryFailure(batch), transient: false };
     }
     // #626: the session remembers upstreams that require stream:true, so the
     // extra 400 round-trip is paid at most once per session (persisted with
@@ -895,10 +1309,13 @@ async function summarizeRange(deps: PreflightDeps, content: string, startRef: st
     // most once (guarded below), so the compatibility retries are bounded:
     // at most one extra attempt per capability, in either rejection order.
     // #2133: compress.streamSummary forces SSE from the first attempt — the
-    // learn path above only sees 400 "stream required" rejections, which a
-    // gateway timeout (524) never produces. #2155: an explicit cascade FALSE
-    // (streamSummaryOff) opts the request out of SSE summaries entirely — both
-    // learn paths stay disarmed and a stale learned flag is ignored.
+    // learn path below only sees 400 rejections of a NON-STREAMING attempt
+    // (#2494: any wording; originally just "stream … true") plus the 524/504
+    // first-hit timeout, which a gateway that cuts long non-streaming
+    // completions with a timeout status never produces as a 400. #2155: an
+    // explicit cascade FALSE (streamSummaryOff) opts the request out of SSE
+    // summaries entirely — all learn paths stay disarmed and a stale learned
+    // flag is ignored.
     let stream = !deps.streamSummaryOff && (deps.session.metadata.preflightStreamSummary === true || deps.forceStreamSummary === true);
     let includeMaxOutputTokens = !(deps.protocol === "responses" && hasLearnedNoMaxOutputTokens(deps));
     for (;;) {
@@ -918,13 +1335,25 @@ async function summarizeRange(deps: PreflightDeps, content: string, startRef: st
             }
             if (err instanceof UpstreamHttpError && err.status === 400) {
                 let adapted = false;
-                if (!stream && !deps.streamSummaryOff && STREAM_REQUIRED_RE.test(err.body)) {
+                const paramRejected = deps.protocol === "responses" && includeMaxOutputTokens && MAX_OUTPUT_TOKENS_REJECTED_RE.test(err.body);
+                // #2494: probe on ANY wording (see STREAM_REQUIRED_RE note) —
+                // except when the 400 has an identified specific cause (the
+                // max_output_tokens parameter below): then the correct
+                // single-variable adaptation is dropping the param and keeping
+                // the transport, and if the upstream ALSO mandates streaming
+                // its next 400 triggers the probe. Also excluded: the Google
+                // wire, whose summary payload carries no stream field
+                // (:streamGenerateContent always streams), so the probe would
+                // only repeat the identical request.
+                if (!stream && !deps.streamSummaryOff && deps.protocol !== "google" && !paramRejected) {
                     deps.session.metadata.preflightStreamSummary = true;
                     stream = true;
                     adapted = true;
-                    deps.log("info", "[preflight] upstream requires stream for summaries; retrying with SSE (learned for this session)");
+                    deps.log("info", STREAM_REQUIRED_RE.test(err.body)
+                        ? "[preflight] upstream requires stream for summaries; retrying with SSE (learned for this session)"
+                        : "[preflight] non-streaming summary rejected with HTTP 400; probing once with SSE — upstream likely requires streaming (learned for this session, #2494)");
                 }
-                if (deps.protocol === "responses" && includeMaxOutputTokens && MAX_OUTPUT_TOKENS_REJECTED_RE.test(err.body)) {
+                if (paramRejected) {
                     rememberNoMaxOutputTokens(deps);
                     includeMaxOutputTokens = false;
                     adapted = true;
@@ -945,15 +1374,7 @@ const TRANSIENT_SUMMARY_CODES = new Set(["ECONNRESET", "ECONNREFUSED", "EPIPE", 
 const SUMMARY_DIAGNOSTIC_CODES = new Set([
     ...TRANSIENT_SUMMARY_CODES, "ETIMEDOUT", "UND_ERR_ABORTED",
     "UND_ERR_HEADERS_TIMEOUT", "UND_ERR_BODY_TIMEOUT", "Z_DATA_ERROR", "Z_BUF_ERROR", "Z_MEM_ERROR",
-    "ERR_TLS_CERT_ALTNAME_INVALID", "CERT_HAS_EXPIRED", "DEPTH_ZERO_SELF_SIGNED_CERT", "DEPTH_ZERO_UNTRUSTED_ROOT",
-    "SELF_SIGNED_CERT_IN_CHAIN", "UNABLE_TO_VERIFY_LEAF_SIGNATURE", "UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
-]);
-// Certificate-TRUST codes: the failure is "this CA chain is not trusted here"
-// (corporate interception / MITM), not "the upstream is broken" — the
-// client-facing error must say so and name the remedy (#1987).
-const TLS_TRUST_HINT_CODES = new Set([
-    "ERR_TLS_CERT_ALTNAME_INVALID", "CERT_HAS_EXPIRED", "DEPTH_ZERO_SELF_SIGNED_CERT", "DEPTH_ZERO_UNTRUSTED_ROOT",
-    "SELF_SIGNED_CERT_IN_CHAIN", "UNABLE_TO_VERIFY_LEAF_SIGNATURE", "UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
+    ...TLS_TRUST_CODES, // #3776: single source of truth lives in upstream-fail.js
 ]);
 
 class SummaryTransportError extends Error {
@@ -987,9 +1408,15 @@ async function requestSummaryBody(deps: PreflightDeps, body: string, stream: boo
         let stage: "request" | "response body" = "request";
         let retryDetail: string;
         try {
+            // #3226: build the header set first so a signed lane can re-sign over
+            // the summary's OWN bytes — forwarding the inbound signature verbatim
+            // (it covers the original request body) makes the gateway reject the
+            // summary call with 401 body-hash-mismatch and kill compression.
+            const outHeaders = { "content-type": "application/json", ...summaryHeaders(deps) };
+            deps.resign?.(outHeaders, body);
             const result = await fetchWithTimeout(deps.url, {
                 method: "POST",
-                headers: { "content-type": "application/json", ...summaryHeaders(deps) },
+                headers: outHeaders,
                 body,
                 dispatcher: proxyDispatcher(deps.proxyUrl),
             }, undefined, deps.signal);
@@ -1050,7 +1477,7 @@ async function requestSummaryBody(deps: PreflightDeps, body: string, stream: boo
 const SSE_DATA_LINE_RE = /(?:^|\n)data:/;
 
 async function requestSummary(deps: PreflightDeps, system: string, content: string, stream: boolean, includeMaxOutputTokens: boolean): Promise<SummaryOutcome> {
-    const text = await requestSummaryBody(deps, JSON.stringify(summaryPayload(deps.protocol, deps.model, system, content, stream, includeMaxOutputTokens, safeHost(deps.url), deps.config.modelContextLimit, deps.billingBlock)), stream);
+    const text = await requestSummaryBody(deps, JSON.stringify(summaryPayload(deps.protocol, deps.model, system, content, stream, includeMaxOutputTokens, safeHost(deps.url), deps.config.modelContextLimit, deps.billingBlock, isCodexClient(deps.headers))), stream);
     let json: unknown;
     try {
         json = JSON.parse(text);
@@ -1071,13 +1498,33 @@ async function requestSummary(deps: PreflightDeps, system: string, content: stri
     }
     if (summary.length < MIN_SUMMARY_CHARS) {
         const diagnosis = diagnoseEmptySummary(text, json);
-        deps.log("warn", `[preflight] summary too short (${summary.length} chars): ${diagnosis}`);
-        return { unusable: diagnosis, transient: !emptySummaryIsSizeDriven(diagnosis) };
+        // #2832: a normal-stop empty completion is deterministic — retrying the
+        // identical payload cannot succeed, so it is neither transient nor
+        // size-driven; the walk's dead-probe verdict counts it instead.
+        const deterministic = isDeterministicEmptyCompletion(deps.protocol, json);
+        deps.log("warn", `[preflight] summary too short (${summary.length} chars): ${diagnosis}${deterministic ? " [deterministic empty completion: normal stop with zero text — retrying the identical payload cannot succeed]" : ""}`);
+        return deterministic
+            ? { unusable: diagnosis, transient: false, deterministic: true }
+            : { unusable: diagnosis, transient: !emptySummaryIsSizeDriven(diagnosis) };
     }
     return { summary };
 }
 
 const ABORTED_FAILURE: PreflightFailure = { kind: "aborted", detail: "the client disconnected during preflight compression" };
+
+// #2832: persisted half of the dead-probe verdict (see the constant above).
+// Lives in session metadata like #626's learned stream flag so a verdict
+// armed on one turn survives into later turns of the same session; the
+// (host, model) key makes a stale entry inert after a model or relay switch.
+type DeterministicProbeState = { key: string; strikes: number; dead: boolean };
+
+function readDeterministicProbeState(metadata: Record<string, unknown>): DeterministicProbeState | undefined {
+    const stored = metadata["deterministicEmptyProbe"];
+    if (!stored || typeof stored !== "object") return undefined;
+    const o = stored as Record<string, unknown>;
+    if (typeof o["key"] !== "string" || typeof o["strikes"] !== "number" || typeof o["dead"] !== "boolean") return undefined;
+    return { key: o["key"], strikes: o["strikes"], dead: o["dead"] };
+}
 
 // #330: the soft-protected recent zone (preserveRecentMessages /
 // preserveRecentTokens / most-recent user message) can cover ALL foldable
@@ -1098,6 +1545,28 @@ function relaxedConfig(config: Config): Config {
 // not usage, so this is safe.
 function noEmergencyTruncate(config: Config): Config {
     return { ...config, modelContextLimit: config.modelContextLimit * 100 };
+}
+
+// #2682: farthest ref of unprotected content under the ORIGINAL protection
+// config — the tier boundary between content outside the soft-protected recent
+// zone and content inside it when walking a relaxed view. CPU-only probe
+// mirroring the #1841 convention (kernel entry points return new state without
+// mutating the input); re-derived every round because a zone fold slides the
+// last-N window forward, so a cached boundary would re-promote zone content.
+function recentZoneBoundaryRef(deps: PreflightDeps, messages: CoreMessage[], tokenCount: number): number {
+    const probe = deps.core.processTurn({
+        messages,
+        state: deps.session.state,
+        config: noEmergencyTruncate(ccrLoopConfig(deps.session, deps.config)),
+        tokenCount,
+        renderTags: "text-only",
+        contentStore: contentStoreOf(deps.session),
+    });
+    let boundary = -1;
+    for (const r of probe.nudge?.compressibleRanges ?? []) {
+        boundary = Math.max(boundary, refNum(r.endRef));
+    }
+    return boundary;
 }
 
 // #2383: CPU-only stand-in for the LLM summary in the emergency-fold regime.
@@ -1125,21 +1594,71 @@ interface DeterministicDigestOptions {
     countText: (text: string) => number;
 }
 
+// Labels are built by the digest entry collectors as `assistant tool-call <verb>`
+// and `tool result <verb>` (space-separated, see the entry builders below) — a
+// tool call and its result count as one logical action, so both collapse to the
+// verb ("Structure: 178×bash" for 89 calls + 89 results).
+function digestLabelCategory(label: string): string {
+    const m = /^(?:assistant tool-call|tool result) (\S+)/.exec(label);
+    if (m) return m[1];
+    return label;
+}
+
 export function deterministicDigest(entries: DigestEntry[], startRef: string, endRef: string, opts: DeterministicDigestOptions): string {
     const { maxSummary, minSummaryLength, shrinkBound, countText } = opts;
     const totalChars = entries.reduce((sum, entry) => sum + entry.text.length, 0);
     const header = `[deterministic digest ${startRef}:${endRef}] ${entries.length} message(s), ~${totalChars} char(s) total. Emergency fast-path under extreme overflow (#2383): structural digest, no LLM summary; originals preserved - decompress this block to restore them verbatim.`;
+
+    // #4224: one-line structural conclusion — counts by message category so
+    // the digest conveys WHAT happened even when per-entry excerpts are trimmed.
+    let structureLine = "";
+    if (entries.length > 0) {
+        const counts = new Map<string, number>();
+        for (const e of entries) {
+            const cat = digestLabelCategory(e.label);
+            counts.set(cat, (counts.get(cat) ?? 0) + 1);
+        }
+        const parts = [...counts.entries()]
+            .sort((a, b) => b[1] - a[1])
+            .map(([cat, n]) => `${n}\u00d7${cat}`);
+        structureLine = `Structure: ${parts.join(", ")}.`;
+    }
+
     const fits = (form: string): boolean =>
         countText(form) <= shrinkBound && (maxSummary === undefined || maxSummary <= 0 || form.length <= maxSummary);
     const line = (entry: DigestEntry, headChars: number): string => {
         const head = headChars > 0 ? ` :: ${entry.text.replace(/\s+/g, " ").trim().slice(0, headChars)}` : "";
         return `[${entry.ref} ${entry.label}] ${entry.text.length}ch${head}`;
     };
-    for (const headChars of [DIGEST_HEAD_CHARS, 0]) {
+    const preamble = entries.length > 0 ? `${header}\n${structureLine}\n` : header;
+
+    // #4224: dynamic head-length trimming. Instead of all-or-nothing (120→0→
+    // header-only), compute the per-line head budget from the remaining space
+    // so large spans keep short excerpts rather than losing them entirely.
+    const tryForm = (headChars: number): string | null => {
+        if (entries.length === 0) {
+            const form = preamble;
+            return fits(form) ? form : null;
+        }
         const body = entries.map((entry) => line(entry, headChars)).join("\n");
-        const form = entries.length > 0 ? `${header}\n${body}` : header;
-        if (fits(form)) return form;
+        const form = `${preamble}${body}`;
+        return fits(form) ? form : null;
+    };
+
+    const candidates: number[] = [DIGEST_HEAD_CHARS];
+    if (maxSummary !== undefined && maxSummary > 0 && entries.length > 0) {
+        const n = entries.length;
+        const baseLen = preamble.length + entries.reduce((s, e) => s + line(e, 0).length + 1, 0);
+        const computed = Math.floor((maxSummary - baseLen - 4 * n + 1) / n);
+        if (computed >= 24 && computed < DIGEST_HEAD_CHARS) candidates.push(computed);
+        if (computed < 24) candidates.push(24);
     }
+    candidates.push(0);
+    for (const hc of candidates) {
+        const form = tryForm(hc);
+        if (form !== null) return form;
+    }
+    if (fits(preamble)) return preamble;
     if (fits(header)) return header;
     // Pathological: even the header cannot fit the bounds — emit a minimal
     // marker padded to the kernel's minimum so the block still applies.
@@ -1150,6 +1669,20 @@ export function deterministicDigest(entries: DigestEntry[], startRef: string, en
 }
 
 export async function preflightCompress(deps: PreflightDeps, messages: CoreMessage[]): Promise<PreflightResult> {
+    // #3641: epoch confirmation pending — the fold state and the resent
+    // history share nothing (wholesale replacement, no word evidence), so any
+    // fold computed here would summarize a substrate whose anchor set can
+    // never re-anchor. Pause folding for this session (verbatim passthrough)
+    // and say so once per pass at debug level: the error line lives at the
+    // escalation site (fold-reconcile). The FIRST realigned pass clears the
+    // latch (resetFoldDriftState), resuming folding automatically — no
+    // restart, no manual reset. Import direction: preflight → fold-reconcile
+    // is acyclic (fold-reconcile never imports preflight).
+    if (epochConfirmPending(deps.session)) {
+        deps.log("debug", `[preflight] fold epoch confirmation pending for ${deps.session.id} — compression paused (verbatim passthrough) until the resent history realigns (#3641)`);
+        const paused = estimateCoreMessages(messages) + (deps.wireOverhead ?? 0);
+        return { compressedRanges: 0, savedTokens: 0, payloadEstimate: paused, rangesRemaining: 0, fitsWindow: paused <= deps.config.modelContextLimit, hadFoldableCandidates: false };
+    }
     const limit = deps.config.modelContextLimit;
     // #1843 dual-channel accounting: fold decisions run on the TEXT channel —
     // text estimate vs `target − imageReserve`. Algebraically the same firing
@@ -1168,15 +1701,29 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     // as absent (raw estimate) rather than deciding with a cross-model scale.
     const kFactor = currentCalibrationFactor(deps.session.stats, deps.session.metadata?.lastModel);
     const kOrigin = deps.session.stats.calibratedEstimateOrigin;
+    // #3645: kernel range.tokens are the UNCALIBRATED count, but
+    // result.payloadEstimate (hence every deficit derived from it) sits on the
+    // CALIBRATED scale once a matching-origin k̂ is set (#1933 F1). Folding a
+    // raw-mass range removes its mass from the text, so its calibrated saving
+    // is bounded by mass*k̂ — compare the foldable pool to the deficit on that
+    // same scale, or a k̂>1 session inflates the deficit ×k̂ against an
+    // un-scaled mass and the gate calls a recoverable round futile. Identity
+    // for k̂=1 / absent / mismatched-origin (applyEstimateCalibration → raw), so
+    // the uncalibrated #1841 path stays byte-identical.
+    const calibrateFoldMass = (rawMass: number): number => applyEstimateCalibration(rawMass, kFactor, kOrigin, deps.upstreamOrigin);
     let textTarget = Math.max(0, Math.min(limit, deps.compressionTarget ?? limit) - imageReserve);
-    const result: PreflightResult = { compressedRanges: 0, savedTokens: 0, payloadEstimate: applyEstimateCalibration(estimateCoreMessages(messages) + wireOverhead, kFactor, kOrigin, deps.upstreamOrigin) + imageReserve, rangesRemaining: 0, fitsWindow: true };
+    const result: PreflightResult = { compressedRanges: 0, savedTokens: 0, payloadEstimate: applyEstimateCalibration(estimateCoreMessages(messages) + wireOverhead, kFactor, kOrigin, deps.upstreamOrigin) + imageReserve, rangesRemaining: 0, fitsWindow: true, hadFoldableCandidates: false };
+    // #4288: set when the round-top fit exit fired — the walk ended in a
+    // forward decision, and no later verdict may override it (see the final
+    // failure stamp below).
+    let fitExitForward = false;
     if (limit <= 0) return result;
     if (deps.externalSummary === undefined) {
         try {
             // The plan rides the request Config rail: deps.config is this
             // request's resolved Config (three-level cascade), so the plan
             // always matches the settings the wire path itself resolved.
-            deps = { ...deps, externalSummary: configuredSummaryPlan((deps.config as ResolvedKernelConfig).externalSummary) };
+            deps = { ...deps, externalSummary: configuredSummaryPlan((deps.config as ResolvedKernelConfig).externalSummary, deps.session.id) };
         } catch (error) {
             const detail = error instanceof Error ? error.message : String(error);
             deps.log("warn", `[external-summary] configuration unavailable; using legacy preflight: ${detail}`);
@@ -1186,6 +1733,12 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     // applyCompression rejects ranges below config.compress.minCompressRange
     // chars, so never spend a summarization call on a chunk that can't apply.
     const minChars = deps.config.compress.minCompressRange;
+    // #4740/#1372: fragment merging must not glue a poison fragment onto a
+    // span that begins with an already-covered message — that span's pure
+    // "already covered" preview verdict IS the #1372 diagnosable trace.
+    const coveredRawIds = new Set<string>();
+    for (const b of deps.session.state.blocks) if (b.active) for (const id of b.effectiveMessageIds) coveredRawIds.add(id);
+    const coveredIdx = (idx: number): boolean => coveredRawIds.has(messages[idx]?.id ?? "");
     // The fit check runs on the real post-fold payload size, not on
     // stats.lastInputTokens: a session without a measured baseline
     // (lastInputTokens == 0 — fresh, or forked/reloaded after an ACP
@@ -1214,6 +1767,11 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     // skipSet keys are stable across folds because refs are content-fingerprinted,
     // so a range found unusable is never retried within this invocation.
     const skipSet = new Set<string>();
+    // #2638: seed with the session-level memory of spans whose previews returned a
+    // structural "no new compressible messages" verdict — without this, every request
+    // re-nominates and re-rejects them (the permanent rejection loop). The kernel keeps
+    // advertising them, so the list-level filter below and this seed share one source.
+    for (const key of deadSkipKeys(deps.session)) skipSet.add(key);
     // #1372: every silent skip leaves a trace — preflight and the plugin compress
     // path judge the same range at different pipeline positions, so their verdicts
     // can legitimately diverge; recording where+why makes the divergence diffable.
@@ -1222,10 +1780,62 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         if (skipReasons.length < 8 && !skipReasons.includes(reason)) skipReasons.push(safePrefix(reason, 200));
     };
     let subMinNoted = false;
+    let deadNoted = false;
+    let deadDroppedTotal = 0;
     let summaryCalls = 0;
     let budgetHit = false;
     let transientRetryBudget = TRANSIENT_EMPTY_RETRY_BUDGET;
+    // #2832: dead-probe verdict for the MODEL summary path. Keyed by
+    // (host, model) — evidence against one relay/model pair says nothing
+    // about another. Gated off when an external summary lane is configured:
+    // the walk's probes then run through that executor, not the model path
+    // this verdict describes.
+    const probeGated = !deps.externalSummary;
+    const probeKey = `${safeHost(deps.url) ?? "?"}|${deps.model}`;
+    let probeState = probeGated ? readDeterministicProbeState(deps.session.metadata) : undefined;
+    let probeDead = probeGated && probeState?.dead === true && probeState.key === probeKey;
+    if (probeDead) {
+        deps.log("info", `[preflight] carrying the dead-probe verdict from a previous turn for ${probeKey}: at most one canary probe this turn; configure compress.externalSummary or switch the model to restore folding (#2832)`);
+    }
+    // One canary probe per invocation is always allowed while dead: it is how
+    // a self-healed relay clears the verdict, and it bounds the waste to one
+    // billed call per turn instead of today's retry budget per span.
+    let canarySpent = false;
+    const stickyFailureDetail =
+        `the summary probe path is dead for ${probeKey}: ${DETERMINISTIC_EMPTY_STICKY_LIMIT} consecutive completions ended normally (end_turn/stop/completed) with zero answer text — ` +
+        `the model answered inside its thinking channel or the relay strips text blocks, so every probe bills the span and returns the same empty answer. ` +
+        `Restore folding by configuring compress.externalSummary (a working summary model), switching the session's model, or fixing the relay's thinking/text handling (#2832)`;
+    const recordDeterministicEmpty = (): void => {
+        if (!probeGated) return;
+        let st = probeState;
+        if (!st || st.key !== probeKey) st = { key: probeKey, strikes: 0, dead: false };
+        st.strikes += 1;
+        if (!probeDead && st.strikes >= DETERMINISTIC_EMPTY_STICKY_LIMIT) {
+            probeDead = true;
+            st.dead = true;
+            canarySpent = true;
+            deps.log("warn", `[preflight] dead-probe verdict armed: ${st.strikes} consecutive deterministic empty completions (normal stop, zero text) for ${probeKey}. Every further probe bills the span and returns the same empty answer — stopping further probes this turn (one canary probe per turn until a probe succeeds). Restore folding by configuring compress.externalSummary (a working summary model), switching the session's model, or fixing the relay's thinking/text handling (block fingerprints in the lines above; #2832)`);
+        }
+        probeState = st;
+        deps.session.metadata["deterministicEmptyProbe"] = st;
+    };
+    const clearDeterministicProbe = (): void => {
+        const st = probeState;
+        if (!probeGated || !st || st.key !== probeKey) return;
+        deps.log("info", `[preflight] summary probe for ${probeKey} answered with usable text again — clearing the dead-probe verdict (${st.strikes} strike(s) recorded)`);
+        delete deps.session.metadata["deterministicEmptyProbe"];
+        probeState = undefined;
+        probeDead = false;
+    };
     let rangesTried = 0;
+    // #2657×#2678 fusion: set when a round's whole external-summary batch died
+    // in the shared pool's queue (deadline, zero dispatched attempts). Later
+    // rounds would queue behind the same holders with fresh budgets each,
+    // serializing the whole turn behind the congestion — stop instead and let
+    // the next turn retry into a (hopefully) drained pool. Zero dispatched
+    // attempts keeps the #2662 no-backoff path intact.
+    let poolQueueDrop = false;
+    const triedKeys = new Set<string>();
     let rangesRemaining = 0;
     // #1933 F3: scale the depth budgets with the entry overshoot (coverage-bound
     // note atop the file). A raised budget is only a ceiling — well-behaved
@@ -1256,11 +1866,243 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     if (emergencyFold) {
         deps.log("warn", `[preflight] payload ~${entryLocal} tok vs window ${limit} (~${entryOvershoot.toFixed(1)}x) exceeds the LLM fold path's coverage bound (${EMERGENCY_FOLD_COVERAGE}x) — folding with deterministic digests instead of summarization calls; originals stay restorable via decompress (#2383)`);
     }
+    let foldOrderLogged = false;
+    // #2952 Design A: bounded tier-distillation recovery (caps + rationale in
+    // the constant comments above). The gates below DEFER their terminal verdict
+    // here when raw-range folding cannot close the gap but merging existing
+    // lower-tier blocks might; the post-walk funnel is the single execution point
+    // so every exhaustion path (deferred gate, mid-walk bail, natural exhaustion)
+    // gets exactly one bounded chance before any fail-fast verdict is final.
+    const tiersEnabled = (deps.config as ResolvedKernelConfig).tiers?.enabled !== false;
+    let tierRecoveryAttempted = false;
+    const eligibleForTierRecovery = (): boolean => {
+        if (!tiersEnabled || tierRecoveryAttempted || deps.signal?.aborted || emergencyFold) return false;
+        if (summaryCalls >= summaryBudget) return false;
+        const active = deps.session.state.blocks.filter((b) => b.active);
+        return active.filter((b) => b.tier === 1).length >= 2 || active.filter((b) => b.tier === 2).length >= 2;
+    };
+    type TierRecoveryResult = { recovered: boolean; callsUsed: number; netSaved: number; honestDetail: string };
+    const attemptTierRecovery = async (): Promise<TierRecoveryResult> => {
+        let callsUsed = 0;
+        let netSaved = 0;
+        // #4227: the most recent measurement's nudge offer — pinned into the
+        // distill fold's ctx so its receipt tail judges from the same
+        // source/scope/moment as the recovery's own processTurn call.
+        let measuredNudge: NudgeDecision | undefined;
+        const measureEst = (): number => {
+            const turn = deps.core.processTurn({
+                messages, state: deps.session.state, config: noEmergencyTruncate(ccrLoopConfig(deps.session, activeConfig)),
+                tokenCount: currentTokens, renderTags: "text-only", contentStore: contentStoreOf(deps.session),
+            });
+            measuredNudge = turn.nudge;
+            deps.session.state = turn.state;
+            adoptContentStore(deps.session, turn.contentStore);
+            const view = applyAbsorbView(turn.messages, turn.state, activeConfig, currentTokens);
+            const est = applyEstimateCalibration(estimateCoreMessages(view) + wireOverhead, kFactor, kOrigin, deps.upstreamOrigin) + imageReserve;
+            result.payloadEstimate = est;
+            // #2952 review: keep the char-count UPPER bound fresh through recovery.
+            // Since #3146 the fit gate reads result.payloadEstimate (set above) for
+            // every regime, so finalUpper no longer drives fitsWindow — but it still
+            // feeds processTurn's tokenCount and the over-window continue/failure
+            // signals below, so a recovery that only lowers the point estimate would
+            // leave those meters stale. Recompute here, same caliber as the main loop.
+            if (!baselineKnown) {
+                finalUpper = estimateCoreMessagesUpper(view) + imageReserve + wireOverhead;
+                currentTokens = Math.max(currentTokens, finalUpper);
+            }
+            return est;
+        };
+        // Wire-position helpers. The distillation span is [first..last] by MESSAGE
+        // index, and the kernel folds EVERYTHING in that span — including any unfolded
+        // raw messages and any other active blocks between the selected ones (#2952
+        // review: a b-ref range is a span, not a set of blocks). The summary input must
+        // therefore cover the whole span or those messages are silently dropped. Enumerate
+        // the span as ordered atoms: each active block contributes its summary once, each
+        // uncovered message its own text.
+        const msgIndex = new Map<string, number>();
+        for (let i = 0; i < messages.length; i++) msgIndex.set(messages[i]!.id, i);
+        const spanExtent = (ids: readonly string[]): [number, number] => {
+            let lo = Number.POSITIVE_INFINITY, hi = -1;
+            for (const id of ids) { const ix = msgIndex.get(id); if (ix === undefined) continue; if (ix < lo) lo = ix; if (ix > hi) hi = ix; }
+            return lo <= hi ? [lo, hi] : [-1, -1];
+        };
+        const spanContent = (lo: number, hi: number): string => {
+            const cover = new Map<string, string>();
+            for (const b of deps.session.state.blocks) if (b.active) for (const id of b.effectiveMessageIds) cover.set(id, b.blockId);
+            const parts: string[] = [];
+            let i = lo;
+            while (i <= hi) {
+                const m = messages[i];
+                const cid = m ? cover.get(m.id) : undefined;
+                if (cid) {
+                    const blk = deps.session.state.blocks.find((x) => x.blockId === cid);
+                    if (blk) parts.push(`[summarized ${blk.topic ? `${blk.blockId}: ${blk.topic}` : blk.blockId}]\n${blk.summary}`);
+                    while (i <= hi) { const mm = messages[i]; if (mm && cover.get(mm.id) === cid) i++; else break; }
+                } else {
+                    if (m) parts.push(`[${m.role}] ${m.text ?? ""}`);
+                    i++;
+                }
+            }
+            return parts.join("\n\n");
+        };
+        let stopReason: "fit" | "exhausted" | "cap" | "unavailable" | "no-shrink" = "fit";
+        // #3646: name WHY the candidate search ended — "no eligible blocks",
+        // "unpositionable", and "source-budget-blocked" are three different truths
+        // the old blanket "every compression tier is exhausted" conflated.
+        let exhaustedWhy: string | undefined;
+        let est = measureEst();
+        while (callsUsed < MAX_TIER_DISTILL_CALLS && summaryCalls < summaryBudget && est >= limit && !deps.signal?.aborted) {
+            const active = deps.session.state.blocks.filter((b) => b.active);
+            const t1 = active.filter((b) => b.tier === 1);
+            const t2 = active.filter((b) => b.tier === 2);
+            // Tier preference keeps the finer T1->T2 merge first — but a BLOCKED
+            // preferred tier (fewer than two positionable blocks, or every span over
+            // the source budget) must not end recovery: the other supported tier gets
+            // its turn before the search is declared exhausted (#3646).
+            const pools: Array<{ tier: number; blocks: typeof active }> = [];
+            if (t1.length >= 2) pools.push({ tier: 1, blocks: t1 });
+            if (t2.length >= 2) pools.push({ tier: 2, blocks: t2 });
+            const poolProblems: string[] = [];
+            let chosen: { sourceTier: number; first: (typeof active)[number]; last: (typeof active)[number]; lo: number; hi: number } | undefined;
+            for (const pool of pools) {
+                const positioned = pool.blocks
+                    .map((b) => ({ b, ext: spanExtent(b.effectiveMessageIds) }))
+                    .filter((p) => p.ext[0] >= 0)
+                    .sort((x, y) => x.ext[0] - y.ext[0]);
+                if (positioned.length < 2) {
+                    poolProblems.push(`tier-${pool.tier}: only ${positioned.length} of ${pool.blocks.length} active block(s) positionable on the wire (need two)`);
+                    continue;
+                }
+                // Earliest wire-ordered start whose forward run reaches a second block
+                // without the full span crossing the source budget, measured on REAL
+                // content (blocks + any inter-block messages) and checked BEFORE
+                // committing each addition so the last one cannot overshoot (#2952
+                // review). Advancing past a start whose first pair already overshoots
+                // is what the front-only picker missed (#3646).
+                let cFirst = -1, cLast = -1, cLo = -1, cHi = -1;
+                for (let s = 0; s < positioned.length && cLast < 0; s++) {
+                    let lo = positioned[s]!.ext[0], hi = positioned[s]!.ext[1];
+                    let lastIdx = s;
+                    for (let e = s + 1; e < positioned.length; e++) {
+                        const ext = positioned[e]!.ext;
+                        const nLo = Math.min(lo, ext[0]), nHi = Math.max(hi, ext[1]);
+                        if (spanContent(nLo, nHi).length > TIER_DISTILL_SOURCE_CHAR_BUDGET) break;
+                        lo = nLo; hi = nHi; lastIdx = e;
+                    }
+                    if (lastIdx > s) { cFirst = s; cLast = lastIdx; cLo = lo; cHi = hi; }
+                }
+                if (cLast < 0) {
+                    poolProblems.push(`tier-${pool.tier}: no two-block span stayed under the ${TIER_DISTILL_SOURCE_CHAR_BUDGET.toLocaleString("en-US")}-character source budget`);
+                    continue;
+                }
+                chosen = { sourceTier: pool.tier, first: positioned[cFirst]!.b, last: positioned[cLast]!.b, lo: cLo, hi: cHi };
+                // T1 preference: the FIRST pool with a candidate wins. Without this
+                // break the later T2 pool would overwrite a feasible T1 choice and
+                // condense coarser T2->T3 before the finer T1->T2 merge (#3646 review).
+                break;
+            }
+            if (!chosen) {
+                stopReason = "exhausted";
+                exhaustedWhy = pools.length === 0
+                    ? "no tier held two or more active blocks to distill"
+                    : poolProblems.join("; ");
+                break;
+            }
+            const { sourceTier, first, last, lo, hi } = chosen;
+            const rules = sourceTier === 1 ? deps.prompts.tier2DistillRules : deps.prompts.tier3CondenseRules;
+            const system = buildCompressSystemPrompt(deps.prompts, messageTimestampSections(deps.surface?.promptSections))
+                + `\n\n${rules}\n\nTASK: The tier-${sourceTier} block summaries below must be distilled into ONE tier-${sourceTier + 1} summary because the session context exceeds the model window and raw-message folding alone cannot close the gap. Follow every rule above. Output ONLY the distilled summary text — no preamble, no closing remarks, no tool calls.`;
+            const content = spanContent(lo, hi);
+            const targetKey = previewFoldTargetKey(deps.core, messages, deps.session.state, activeConfig, first.blockId, last.blockId);
+            if (targetKey === undefined) {
+                stopReason = "unavailable";
+                break;
+            }
+            let outcome;
+            try {
+                outcome = await summarizeRange(deps, content, first.blockId, last.blockId, undefined, system);
+            } catch (error) {
+                // #2952 review: a thrown summary error (network/relay) must stop
+                // recovery like the normal path does, not escape to the caller.
+                // #3226: an UpstreamHttpError carries the upstream body — surface a
+                // snippet like the normal-round path so a signed-lane 401 ("body hash
+                // mismatch x-sdk-content-sha256") self-diagnoses instead of masquerading
+                // as "futile round / net ~0 tokens saved".
+                const distillBodySnippet = error instanceof UpstreamHttpError ? safePrefix(error.body.trim(), 200) : "";
+                const distillDetail = error instanceof UpstreamHttpError
+                    ? `HTTP ${error.status} after ${error.attempts} attempt(s)${distillBodySnippet ? `: ${distillBodySnippet}` : ""}`
+                    : safePrefix(error instanceof Error ? error.message : String(error), 200);
+                deps.log("warn", `[preflight] tier-${sourceTier}->${sourceTier + 1} distillation summary call failed (${distillDetail}); stopping recovery (#2952)`);
+                stopReason = "unavailable";
+                break;
+            }
+            if ("unusable" in outcome) {
+                deps.log("warn", `[preflight] tier-${sourceTier}->${sourceTier + 1} distillation produced no usable summary (${outcome.unusable}); stopping recovery (#2952)`);
+                stopReason = "unavailable";
+                break;
+            }
+            if (previewFoldTargetKey(deps.core, messages, deps.session.state, activeConfig, first.blockId, last.blockId) !== targetKey) {
+                deps.log("warn", `[preflight] discarded tier-distillation summary: fold targets changed while awaiting the summary`);
+                stopReason = "unavailable";
+                break;
+            }
+            const ctx: RewriteCtx = { core: deps.core, config: activeConfig, messages, session: deps.session, lastNudge: measuredNudge, log: (m) => deps.log("info", m) };
+            const fold = parseCompressInput({ content: [{ startId: first.blockId, endId: last.blockId, summary: outcome.summary, topic: `preflight tier-${sourceTier + 1} distill (#2952)` }] });
+            const applied = applyRanges(fold, ctx, { loopTracking: false });
+            if (applied.outcome === "refused") {
+                deps.log("warn", `[preflight] tier distillation apply refused: ${safePrefix(applied.text, 200)}; stopping recovery (#2952)`);
+                stopReason = "unavailable";
+                break;
+            }
+            deps.session.stats.lastInputTokens += defaultCountTokens(outcome.summary);
+            const after = measureEst();
+            const gained = est - after;
+            callsUsed += 1;
+            summaryCalls += 1;
+            // #2952 review: count the distillation as a real fold so the caller
+            // rebuilds THIS round's outbound request from the recovered state
+            // (server.ts only rebuilds when compressedRanges > 0).
+            result.compressedRanges += 1;
+            result.savedTokens += Math.max(0, gained);
+            if (gained <= 0) {
+                deps.log("warn", `[preflight] tier-${sourceTier}->${sourceTier + 1} distillation netted ${gained} tokens (no shrink); stopping recovery (#2952)`);
+                stopReason = "no-shrink";
+                break;
+            }
+            netSaved += gained;
+            est = after;
+            if (est < limit) { stopReason = "fit"; break; }
+            deps.log("info", `[preflight] tier-${sourceTier}->${sourceTier + 1} distillation merged b-range ${first.blockId}..${last.blockId} into one block; net -${gained} tok, payload ~${after} vs window ${limit} (${callsUsed}/${MAX_TIER_DISTILL_CALLS} calls, #2952)`);
+        }
+        if (stopReason === "fit" && est >= limit) stopReason = "cap";
+        const recovered = est < limit;
+        if (recovered) currentTokens = Math.min(currentTokens, est);
+        const overBy = Math.max(0, est - limit);
+        // #2952 review: name WHY recovery ended — claim "every tier is exhausted"
+        // only when there was genuinely nothing left to distill; a call-cap hit or an
+        // unavailable summary is not tier exhaustion. #3646: when the search really
+        // found no candidate, say WHICH gate blocked it instead of the blanket claim.
+        const why = stopReason === "exhausted" ? (exhaustedWhy ?? "every compression tier is exhausted")
+            : stopReason === "cap" ? `the bounded distillation call budget was reached after ${callsUsed} call(s)`
+            : stopReason === "unavailable" ? "the distillation summary was unavailable"
+            : "a distillation pass produced no further shrink";
+        const honestDetail =
+            `futile round: folding compressible raw messages plus tier distillation (${callsUsed} summary call(s), net ~${netSaved} tokens saved) still leaves the payload ~${overBy} tokens over the window — ${why}. ` +
+            `These figures are measured on the post-fold wire view; the separately displayed context total additionally floors on the upstream usage baseline, which also bills the system prompt and tool definitions. ` +
+            `Raise the model context window or restart the session.`;
+        return { recovered, callsUsed, netSaved, honestDetail };
+    };
     for (let round = 0; round < effectiveRoundCap; round++) {
         if (deps.signal?.aborted) {
             failure = ABORTED_FAILURE;
             break;
         }
+        if (poolQueueDrop) break;
+        // #4528: each round re-runs the full O(messages) kernel pass over the
+        // resent history; yield between rounds so UI/API requests on the same
+        // listener are served instead of queueing behind the whole compression
+        // run.
+        await yieldToEventLoop();
         // Re-run the pipeline each round: a successful compress hides its
         // range behind a new block, changing the visible view; refs stay
         // stable per-session snapshots (#387), but which ranges are
@@ -1307,30 +2149,106 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             // #558-merge: the upper-bound regime also carries the image/wire
             // floors — they are real billed costs the fold can never remove
             // (#470/#488 postdate this PR's fork point).
+            // #3146: the char-count bound pins currentTokens so the kernel keeps
+            // marking ranges compressible WHILE folding, but it NO LONGER boosts
+            // decisionTokens — the per-round exit and the final fit judge on the
+            // calibrated CJK-aware estimate (payloadEstimate), not raw char count.
+            // Chars-as-tokens made a fitting payload unsatisfiable (#3146): the
+            // bound stayed over-window no matter how much folded, so a successful
+            // fold still failed fast after burning every round. Char count remains
+            // the TRIGGER arm only (server.ts decisionTrigger), where erring early
+            // is harmless.
             finalUpper = estimateCoreMessagesUpper(turn.messages) + imageReserve + wireOverhead;
             currentTokens = Math.max(currentTokens, finalUpper);
-            decisionTokens = Math.max(decisionTokens, estimateCoreMessagesUpper(turn.messages) + wireOverhead);
         }
         // The caller's forward/fail-fast gate uses the payload's own estimate
         // (the floor can be stale — see PreflightResult.payloadEstimate).
         result.payloadEstimate = roundText + imageReserve;
         if (startTokens < 0) startTokens = currentTokens;
-        if (decisionTokens < textTarget) break;
+        // #4288: the round-boundary exit must judge on the payload's OWN estimate —
+        // the same floorless quantity the caller's forward gate trusts (#1839/#1492) —
+        // NOT on decisionTokens, which is floored by the session's usage baseline.
+        // After a mid-session switch to a smaller-window model that baseline was
+        // measured under the prior (wider) model and sits above the new target, so a
+        // floored comparison never trips and the loop burns the whole slow
+        // summarization ladder on a payload that already fits (the client then times
+        // out mid-ladder and the session appears stuck).
+        // Judge against the round's fold TARGET, not the hard window limit: callers
+        // may still demand folding on a window-fitting payload — a compressionTarget
+        // below the window (external summary plans, #a66353ac target stability) or a
+        // headroom reservation (codex native compaction, #68f6bfe3).
+        // Compare TEXT to TEXT: roundText is the text-space estimate and textTarget
+        // already subtracts imageReserve, while payloadEstimate is total-space
+        // (roundText + imageReserve) — a total-to-text comparison subtracts the
+        // reserve twice and misses the exit on image lanes.
+        // EXCEPTION (#1195/#987, the reason the original #4294 was reverted): an
+        // OVERFLOW-ARM baseline is upstream rejection evidence for THIS request —
+        // the provider's own counting rejected this exact payload, so the local
+        // text estimate (which cannot see provider-side counting, cache stamps,
+        // tokenizers that differ from ours) may NOT outrank it. Under an arm the
+        // floored decisionTokens comparator stays: the #1195 in-request rescue
+        // must keep folding until the payload fits the STATED window on the
+        // upstream's scale. The arm is one-shot (#1110) and retires on the next
+        // real usage report, so this exception cannot resurrect the #4288
+        // marathon — that burn was driven by a stale USAGE-sourced baseline
+        // measured under a prior wider-window model, which keeps the floorless
+        // roundText path.
+        const armedBaseline = deps.session.stats.lastInputTokensSource === "overflow-arm";
+        if (armedBaseline ? decisionTokens < textTarget : roundText < textTarget) {
+            // #4288: the walk ends in a fit-forward — the caller's gate judges
+            // on the same floorless payloadEstimate and forwards. The final
+            // verdict below must not stamp an exhausted/failure verdict over
+            // this exit just because the STALE-floored currentTokens still
+            // reads over-limit.
+            fitExitForward = true;
+            if (baselineFloor >= textTarget && !armedBaseline) {
+                deps.log("info", `[preflight] payload fits by its own estimate (~${Math.round(result.payloadEstimate)}/${textTarget} target, window ${limit}); stopping instead of folding further despite a higher usage baseline (~${Math.round(baselineFloor)} tok measured under a prior model/route) — forwarding (#4288)`);
+            }
+            if (!armedBaseline && baselineFloor < textTarget && result.payloadEstimate >= FIT_FORWARD_ESTIMATE_ONLY_MARGIN * limit) {
+                deps.log("warn", `[preflight] fit-forward on estimate only: ~${Math.round(result.payloadEstimate)} tok vs window ${limit} with no usage measurement backing the fit (baseline ~${Math.round(baselineFloor)}) — the local estimate excludes the system prompt + tool definitions, so upstream may still reject with context overflow; if it does, the overflow-arm rescue folds next turn (#5408/#4288)`);
+            }
+            break;
+        }
         // #847: drop sub-minimum ranges at list level too — every chunk of a
         // sub-min range fails the apply-side gate, so walking them only burns
         // rounds and misreports "N viable ranges tried"; with them gone the
         // empty-list path below can reach the #330 soft-zone relaxation.
         const viable = viableRanges(turn.nudge?.compressibleRanges ?? []);
-        const ranges = viable.filter((r) => minChars <= 0 || (r.chars ?? r.tokens * 4) >= minChars);
+        const aboveMin = viable.filter((r) => minChars <= 0 || (r.chars ?? r.tokens * 4) >= minChars);
+        // #2638: spans whose previews returned a structural "no new compressible
+        // messages" verdict can never fold through plain refs — the kernel keeps
+        // advertising them, so without this filter every round re-walks and
+        // re-previews them. Exact key match only: a wider range that merely
+        // contains a dead chunk keeps its live members.
+        let ranges = filterDeadRanges(deps.session, aboveMin);
+        const deadDropped = aboveMin.length - ranges.length;
+        if (deadDropped > 0) {
+            deadDroppedTotal += deadDropped;
+            if (!deadNoted) {
+                deadNoted = true;
+                deps.log("debug", `[preflight] ${deadDropped} candidate range(s) suppressed: previously-dead structural verdicts (#2638)`);
+            }
+        }
         // #1372: the list-level minCompressRange filter used to drop sub-minimum
         // ranges silently — "no compressible ranges remain" gave no hint that
         // ranges existed but were all under the gate.
-        if (ranges.length === 0 && viable.length > 0 && !subMinNoted) {
+        if (ranges.length === 0 && aboveMin.length === 0 && viable.length > 0 && !subMinNoted) {
             subMinNoted = true;
             deps.log("warn", `[preflight] ${viable.length} viable range(s) are below minCompressRange (${minChars} chars); none foldable`);
             noteSkip(`all ${viable.length} viable range(s) below minCompressRange (${minChars} chars)`);
         }
         rangesRemaining = ranges.length;
+        if (ranges.length > 0) result.hadFoldableCandidates = true;
+        // Field reports of the preflight marathon cut at the #568 hold line
+        // with zero round visibility (both 0.1.195 fork incidents): 19 LLM
+        // rounds × tens of seconds upstream each, nothing in between. One
+        // info line per LLM round — and every 32nd digest round in the
+        // CPU-only emergency regime, where hundreds of rounds are cheap —
+        // makes the marathon observable WHILE it runs instead of only via
+        // the exhaustion verdict afterwards.
+        if (!emergencyFold || (round & 31) === 0) {
+            deps.log("info", `[preflight] round ${round + 1}/${effectiveRoundCap}: payload ~${Math.round(result.payloadEstimate)} tok vs window ${limit} (deficit ${Math.max(0, Math.round(result.payloadEstimate - limit))}), ${ranges.length} viable range(s)`);
+        }
         if (baselineKnown && ranges.length > 0) {
             // #1841: round-level futility gate. A fold removes its span's mass
             // at best (its summary re-enters the payload), so the sum of all
@@ -1360,7 +2278,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             }, 0);
             let potential = resolvableMass(ranges);
             const deficit = result.payloadEstimate - limit;
-            if (potential > 0 && deficit > 0 && potential * FUTILITY_SLACK < deficit) {
+            if (potential > 0 && deficit > 0 && calibrateFoldMass(potential) * FUTILITY_SLACK < deficit) {
                 if (!relaxed) {
                     // The soft-protected recent zone is not in `ranges` yet; #330
                     // makes it foldable on relax. Probe the relaxed view (CPU-only,
@@ -1375,24 +2293,40 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                         renderTags: "text-only",
                         contentStore: contentStoreOf(deps.session),
                     });
-                    const relaxedRanges = viableRanges(probe.nudge?.compressibleRanges ?? []).filter((r) => minChars <= 0 || (r.chars ?? r.tokens * 4) >= minChars);
+                    // #2638: structural verdicts hold under relax too (coverage-based, zone-independent) — dead mass cannot close the gap either.
+                    const relaxedRanges = filterDeadRanges(deps.session, viableRanges(probe.nudge?.compressibleRanges ?? []).filter((r) => minChars <= 0 || (r.chars ?? r.tokens * 4) >= minChars));
                     const relaxedPotential = resolvableMass(relaxedRanges);
-                    if (relaxedPotential * FUTILITY_SLACK >= deficit) {
+                    if (calibrateFoldMass(relaxedPotential) * FUTILITY_SLACK >= deficit) {
                         activeConfig = relaxedConfig(deps.config);
                         relaxed = true;
                         textTarget = Math.max(0, limit - imageReserve);
                         summaryCalls = 0;
                         budgetHit = false;
                         transientRetryBudget = TRANSIENT_EMPTY_RETRY_BUDGET;
-                        deps.log("warn", `[preflight] foldable mass outside the protected recent zone (~${potential} tok) cannot close the ${deficit}-tok gap; relaxing soft protection up front and retrying (#1841)`);
+                        deps.log("warn", `[preflight] foldable mass outside the protected recent zone (~${calibrateFoldMass(potential)} tok) cannot close the ${deficit}-tok gap; relaxing soft protection up front and retrying (#1841)`);
                         continue;
                     }
                     // The relaxed pool is the superset: quote it as the true bound.
                     potential = relaxedPotential;
                 }
                 const zoneNote = relaxed ? ", including the relaxed recent zone" : "";
-                failure = { kind: "exhausted", detail: `futile round: the maximum possible saving from all foldable content (~${potential} tokens${zoneNote}) is below the required reduction (~${deficit} tokens) — no combination of folds can bring the payload under the target. Raise the model context window or restart the session.` };
-                deps.log("warn", `[preflight] skipping futile round: max possible saving ~${potential} tok < required ~${deficit} tok${zoneNote}; zero summarization calls spent (#1841)`);
+                // #2952 Design A: raw-range folding (even with the recent zone
+                // relaxed) cannot close the gap, but distilling existing
+                // lower-tier BLOCKS might — and the model cannot do it because its
+                // next turn is refused by this very fail-fast (the deadlock in
+                // #2952). Defer the verdict to the post-walk recovery funnel
+                // instead of declaring futility here. Never entered for tiers=false
+                // or emergency digest mode, so both paths stay byte-identical.
+                if (eligibleForTierRecovery()) {
+                    deps.log("info", `[preflight] raw-fold pool (~${calibrateFoldMass(potential)} tok${zoneNote}) below deficit (~${deficit} tok); deferring to bounded tier-distillation recovery (#2952)`);
+                    break;
+                }
+                // #3461: structurally doomed only when NO draw ever came back
+                // unusable and the pool never dropped — an unusable draw means
+                // the shortfall may be the relay, not the content, and the
+                // retry/canary machinery (#726/#2832) owns that case.
+                failure = { kind: "exhausted", deterministic: lastUnusableDetail === undefined && !poolQueueDrop, detail: `futile round: the maximum possible saving from all foldable content (~${calibrateFoldMass(potential)} tokens${zoneNote}) is below the required reduction (~${deficit} tokens) — no combination of folds can bring the payload under the target. Raise the model context window or restart the session.` };
+                deps.log("warn", `[preflight] skipping futile round: max possible saving ~${calibrateFoldMass(potential)} tok < required ~${deficit} tok${zoneNote}; zero summarization calls spent (#1841)`);
                 break;
             }
         }
@@ -1403,7 +2337,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             // estimate (not currentTokens, which is floored by a possibly-stale
             // lastInputTokens from a prior model): if the real payload already
             // fits, stop instead of folding protected content.
-            if (!relaxed && (baselineKnown ? result.payloadEstimate : finalUpper) >= limit) {
+            if (!relaxed && result.payloadEstimate >= limit) {
                 activeConfig = relaxedConfig(deps.config);
                 relaxed = true;
                 textTarget = Math.max(0, limit - imageReserve);
@@ -1417,12 +2351,51 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                 deps.log("warn", "[preflight] no compressible ranges outside the protected recent zone; relaxing soft protection (preserveRecentMessages/Tokens -> 0) and retrying");
                 continue;
             }
-            failure = { kind: "exhausted", detail: relaxed ? relaxedExhaustedDetail : subMinNoted
+            // #3461: every subcase here is structural — nothing compressible
+            // remains (or nothing above minCompressRange, or the whole relaxed
+            // zone already folded) — so no retry against a healthier relay can
+            // change the verdict.
+            // #2952 Design A: "nothing compressible" can still leave a rescue —
+            // every raw message already inside a block (view = carriers only)
+            // is exactly the distillable state. Defer to the post-walk
+            // recovery funnel instead of failing here, same as the futility
+            // gate above; tiers=false / emergency digest never enter this way.
+            if (eligibleForTierRecovery()) {
+                deps.log("info", `[preflight] no compressible ranges remain${relaxed ? " even with the soft zone relaxed" : ""}; deferring to bounded tier-distillation recovery (#2952)`);
+                break;
+            }
+            failure = { kind: "exhausted", deterministic: true, detail: relaxed ? relaxedExhaustedDetail : subMinNoted
                 ? `no foldable compressible ranges remain: all ${viable.length} viable range(s) are below minCompressRange (${minChars} chars)`
-                : "no compressible ranges remain in the conversation" };
+                : deadNoted
+                    ? `no foldable compressible ranges remain: ${deadDroppedTotal} range(s) carry previously-dead structural verdicts (#2638)`
+                    : "no compressible ranges remain in the conversation" };
             break;
         }
-        const ordered = [...ranges].sort((a, b) => refNum(a.startRef) - refNum(b.startRef));
+        // #2682: two-tier dispatch order. Tier 1 = ranges entirely outside the
+        // soft-protected recent zone: payoff order, largest first — a
+        // summarization call costs the same wall clock whether it folds 6K or
+        // 64K tokens (measured 25-44s/call regardless of size), and the head
+        // range re-grows after each fold (its block + newer messages form one
+        // bigger range again), so oldest-first re-folded an almost-exhausted
+        // head every round while the largest ranges never got dispatched
+        // within the pass budget. Age order breaks ties of equal mass.
+        // Tier 2 = ranges entering the soft-protected recent zone (present
+        // only after a #330/#1841 relax): they stay oldest-first — #330's
+        // stated policy ("relax the soft zone (oldest-first within it)") —
+        // and never outrank old unfolded content: pure mass order would let
+        // one giant relaxed range eat the active working set before moderate
+        // old ranges do.
+        const zoneBoundary = relaxed ? recentZoneBoundaryRef(deps, messages, currentTokens) : null;
+        const tierOf = (r: (typeof ranges)[number]): number => (zoneBoundary !== null && refNum(r.endRef) > zoneBoundary ? 2 : 1);
+        const ordered = [...ranges].sort((a, b) =>
+            tierOf(a) - tierOf(b) ||
+            (tierOf(a) === 1 ? b.tokens - a.tokens : 0) ||
+            refNum(a.startRef) - refNum(b.startRef));
+        if (!foldOrderLogged && ordered.length > 0) {
+            foldOrderLogged = true;
+            const shown = ordered.slice(0, 8).map((r) => `${r.startRef}:${r.endRef} (${r.tokens} tok${tierOf(r) === 2 ? ", zone" : ""})`).join(", ");
+            deps.log("info", `[preflight] fold order (largest first outside the recent zone, #2682): ${shown}${ordered.length > 8 ? `, ... (+${ordered.length - 8} more)` : ""}`);
+        }
         let appliedThisRound = 0;
         // #1841: set when the mid-walk futility check stops the walk before
         // every range was tried; the round-end site turns it into a failure
@@ -1430,7 +2403,277 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         let futileBail = false;
         let bailRemaining = 0;
         let bailDeficit = 0;
-        for (let oi = 0; oi < ordered.length; oi++) {
+        // Shared fold commit for this round: applies one parsed range to the
+        // session state and nets its accounting, exactly as the serial walk did
+        // inline before #2678 hoisted it so the batch path below commits through
+        // the same code (one apply path, no drifted copies). Returns false when
+        // the kernel refused the fold (the caller records the skip and moves on).
+        const commitFold = (skipKey: string, startRef: string, endRef: string, summary: string, effectiveMessageIds: readonly string[], externalFold: boolean, targetKey: string): boolean => {
+            const state = deps.session.state;
+            const preview = deps.core.applyCompression({ messages, state, config: activeConfig, ranges: [{ startRef, endRef, summary }] });
+            const known = new Set(state.blocks.map((block) => block.blockId));
+            const target = preview.state.blocks.find((block) => !known.has(block.blockId));
+            if (!target || foldTargetKey(target, state) !== targetKey) {
+                deps.log("warn", `[preflight] discarded summary for ${skipKey}: fold targets changed while awaiting the summary`);
+                noteSkip(`${skipKey}: fold targets changed while awaiting the summary`);
+                skipSet.add(skipKey);
+                return false;
+            }
+            const ctx: RewriteCtx = {
+                core: deps.core,
+                config: activeConfig,
+                messages,
+                session: deps.session,
+                // #4227: pin the receipt tail to THIS round's own nudge offer —
+                // the same source/scope/moment the walk above just acted on.
+                // Without it, postCompressTail falls back to a live recompute
+                // judged on statusInputBaseline (the previous request's usage-
+                // grade input tokens): in an overflow marathon that baseline is
+                // far below the window while the ACTUAL payload is 19x over, so
+                // the tail printed "No compressible ranges remain" in the very
+                // fold whose walk logged "102 viable range(s)" (#4224/#4227).
+                lastNudge: turn.nudge,
+                log: (msg) => deps.log("info", msg),
+            };
+            const creditBefore = deps.session.stats.compressCreditTokens;
+            // #2146: internal lane — must not arm the model-facing loop breaker.
+            const fold = parseCompressInput({ content: [{ startId: startRef, endId: endRef, summary, topic: deps.compressReason === "growth" ? "preflight auto-fold (growth)" : "preflight overflow compress" }] });
+            if (externalFold) for (const range of fold.ranges) range.compressCallId = newExternalCallId();
+            const applied = applyRanges(fold, ctx, { loopTracking: false });
+            if (applied.outcome === "refused") {
+                deps.log("warn", `[preflight] ${applied.text}`);
+                noteSkip(`${skipKey}: apply failed — ${safePrefix(applied.text.replace(/^\[Compression (?:FAILED|refused)[:\s]*/, ""), 200)}`);
+                skipSet.add(skipKey);
+                return false;
+            }
+            // #1993: a fold succeeded after an earlier rejection in this walk — the
+            // payload shrank, so the stale failure no longer describes the end
+            // state; clear it so a later exhaustion reports its own reason (and a
+            // fitting result reports none at all).
+            failure = undefined;
+            // The summary itself re-enters the payload; net its cost against
+            // both the folded size and the session's input baseline. Without a
+            // baseline currentTokens is char-based, so net the folded span's
+            // char count against it instead of the token-based credit.
+            const compressed = deps.session.stats.compressCreditTokens - creditBefore;
+            const folded = baselineKnown ? compressed : messages.filter((message) => effectiveMessageIds.includes(message.id)).reduce((total, message) => total + (message.text ?? "").length, 0);
+            currentTokens = Math.max(0, currentTokens - folded + countText(summary));
+            // The apply path (stream.ts applyRanges) already netted the gross
+            // fold out of lastInputTokens and credited compressCreditTokens;
+            // add the re-entering summary's cost back so the baseline tracks
+            // the post-fold payload size exactly once (#3450 trace: arm 1048576
+            // → −gross +summary = 1047168 after one fold).
+            deps.session.stats.lastInputTokens += defaultCountTokens(summary);
+            appliedThisRound += 1;
+            result.compressedRanges += 1;
+            return true;
+        };
+        // #2678/#2667: fold several disjoint ranges in ONE external-summary call
+        // so the executor's pool runs them concurrently — the pass's wall clock
+        // becomes the slowest chunk instead of k sequential ~20-40s calls (the
+        // shared per-pass deadline used to cut multi-range passes off with whole
+        // ranges never dispatched). Nomination mirrors the walk below: same span
+        // choice (oldest full-budget chunk first), same preview/content/chunking
+        // gates, and a rejected preview or empty render does NOT poison the
+        // range's skipSet. A range the batch cannot summarize is left out of the
+        // skipSet on purpose: later rounds re-nominate it while siblings keep
+        // folding in batches, and once the batch applies nothing in a round the
+        // serial walk below takes it over with halving/transient retries. Gated
+        // on the external lane (the legacy streaming lane has no batch executor)
+        // and on ≥2 viable ranges (a single range keeps the legacy path
+        // byte-identically).
+        if (!emergencyFold && ordered.length >= 2 && !budgetHit) {
+            const batchPlan = deps.externalSummary;
+            if (batchPlan) {
+                type BatchNomination = {
+                    skipKey: string;
+                    startRef: string;
+                    endRef: string;
+                    content: string;
+                    chunks: string[];
+                    instructions: string;
+                    effectiveMessageIds: string[];
+                    targetKey: string;
+                    spanUnits: number;
+                    offset: number;
+                };
+                const nominations: BatchNomination[] = [];
+                let workTotal = 0;
+                let reservedCalls = 0;
+                for (let oi = 0; oi < ordered.length && nominations.length < MAX_PREFLIGHT_SUMMARY_BATCH; oi++) {
+                    const range = ordered[oi];
+                    const skipKey = `${range.startRef}:${range.endRef}`;
+                    if (skipSet.has(skipKey)) continue;
+                    const { refToIdx } = refMaps(messages, deps.session.state);
+                    const startIdx = refToIdx.get(range.startRef);
+                    const endIdx = refToIdx.get(range.endRef);
+                    if (startIdx === undefined || endIdx === undefined || startIdx > endIdx) {
+                        skipSet.add(skipKey);
+                        const why = startIdx === undefined
+                            ? `start ref ${range.startRef} is absent from the current messages`
+                            : endIdx === undefined
+                                ? `end ref ${range.endRef} is absent from the current messages`
+                                : `position resolution inverted the range (${startIdx} > ${endIdx})`;
+                        deps.log("warn", `[preflight] skipping range ${skipKey}: ${why}`);
+                        noteSkip(`${skipKey}: ${why}`);
+                        continue;
+                    }
+                    if (!triedKeys.has(skipKey)) {
+                        triedKeys.add(skipKey);
+                        rangesTried += 1;
+                    }
+                    // #4740: the min-chars floor applies in BOTH regimes. With
+                    // minUnits = 0 a pair range whose tool-result alone exceeds the
+                    // budget split into [call-only fragment][oversized result], and
+                    // the fragment's preview is atomically rejected by the kernel's
+                    // minCompressRange gate (a 64-char call vs min 5000) — in this
+                    // batch lane the range then never folds at all (one span per
+                    // range), and in the walk it burns a preview per round.
+                    const spans = mergeSubMinimumFragments(messages, splitChunks(messages, startIdx, endIdx, budget, baselineKnown ? 0 : minChars, countText), minChars, coveredIdx).slice().reverse();
+                    const span = spans.pop();
+                    if (!span) continue;
+                    const [cs, ce] = span;
+                    const maps = refMaps(messages, deps.session.state);
+                    let startRef = maps.idxToRef.get(cs);
+                    let endRef = maps.idxToRef.get(ce);
+                    if (!startRef || !endRef) {
+                        deps.log("warn", `[preflight] dropping span ${cs}..${ce} of range ${skipKey}: boundary message has no ref in the current state`);
+                        noteSkip(`${skipKey}: span ${cs}..${ce} boundary message has no ref`);
+                        continue;
+                    }
+                    if (refNum(startRef) > refNum(endRef)) {
+                        deps.log("warn", `[preflight] normalized reversed range ${startRef}–${endRef} → ${endRef}–${startRef} (non-monotonic refs after client history rewrite, #1001)`);
+                        [startRef, endRef] = [endRef, startRef];
+                    }
+                    const preview = deps.core.applyCompression({
+                        messages,
+                        state: deps.session.state,
+                        config: activeConfig,
+                        ranges: [{ startRef, endRef, summary: "x".repeat(Math.max(MIN_SUMMARY_CHARS, activeConfig.compress.minSummaryLength)) }],
+                    });
+                    const previousBlockIds = new Set(deps.session.state.blocks.map((block) => block.blockId));
+                    const planned = preview.state.blocks.find((block) => !previousBlockIds.has(block.blockId));
+                    if (!planned) {
+                        const verdict = safePrefix([...preview.result.errors, ...preview.result.warnings].join("; "), 300)
+                            || "the kernel created no block and reported no error";
+                        deps.log("warn", `[preflight] preview rejected range ${skipKey}: ${verdict}`);
+                        noteSkip(`${skipKey}: preview rejected — ${verdict}`);
+                        // No skipSet here, mirroring the walk: a rejected span (e.g. a
+                        // sub-minimum tail) must not poison the whole range — its older
+                        // chunks may still be foldable in later rounds.
+                        continue;
+                    }
+                    // Direct raw messages render host-side (#781 image notes live in
+                    // BiliMessage sidecars the kernel never sees); consumed child
+                    // blocks render through the kernel from the original state.
+                    // Byte-identical to the walk's renderer below.
+                    const idxById = new Map(messages.map((m, i) => [m.id, i]));
+                    const byRaw = deps.session.state?.messageRefs?.byRaw;
+                    const parts: string[] = [];
+                    const droppedParts: string[] = [];
+                    for (const id of planned.directMessageIds) {
+                        const i = idxById.get(id);
+                        if (i === undefined) { droppedParts.push(`message ${id} not found in current messages`); continue; }
+                        const m = messages[i];
+                        let text = m.text ?? "";
+                        const notes = imagePlaceholdersForSummary(m, byRaw?.[m.id]);
+                        if (notes.length > 0) {
+                            const note = notes.join(" ");
+                            text = text === IMAGE_PLACEHOLDER ? note : text ? `${text}\n${note}` : note;
+                        }
+                        if (!text) { droppedParts.push(`message ${id} rendered no text`); continue; }
+                        const label =
+                            m.contentType === "tool-call"
+                                ? `assistant tool-call ${m.toolName ?? "?"}`
+                                : m.contentType === "tool-result"
+                                    ? `tool result ${m.toolName ?? "?"}`
+                                    : m.contentType === "reasoning"
+                                        ? "assistant reasoning"
+                                        : m.role;
+                        parts.push(`[${label}]\n${text}`);
+                    }
+                    for (const nid of planned.directBlockIds) {
+                        const nb = deps.session.state.blocks.find((b) => b.blockId === nid);
+                        if (!nb) { droppedParts.push(`child block ${nid} missing from state`); continue; }
+                        const label = nb.topic ? `${nb.blockId}: ${nb.topic}` : nb.blockId;
+                        parts.push(`[summarized ${label}]\n${nb.summary}`);
+                    }
+                    if (droppedParts.length > 0) {
+                        deps.log("debug", `[preflight] range ${skipKey}: ${droppedParts.length} part(s) rendered nothing (${droppedParts.slice(0, 3).join("; ")})`);
+                    }
+                    const content = parts.join("\n\n");
+                    if (content.length === 0) {
+                        deps.log("warn", `[preflight] planned block for range ${skipKey} rendered no text: ${droppedParts.slice(0, 5).join("; ") || "all parts empty"}`);
+                        noteSkip(`${skipKey}: planned block rendered no text (${droppedParts.slice(0, 3).join("; ") || "all parts empty"})`);
+                        // No skipSet here either (walk parity): an empty render for one
+                        // span does not make the rest of the range unrenderable.
+                        continue;
+                    }
+                    const spanUnits = baselineKnown
+                        ? planned.compressedTokens
+                        : messages.filter((message) => planned.effectiveMessageIds.includes(message.id)).reduce((total, message) => total + (message.text ?? "").length, 0);
+                    const chunks = splitSummaryContent(content, budget, countText);
+                    // Track reservations locally: they count against the pass
+                    // budget only once the batch actually fires (≥2 nominations).
+                    // A sub-batch set falls through to the walk, which reserves
+                    // its own calls — committing here too would double-book them.
+                    if (summaryCalls + reservedCalls + chunks.length > summaryBudget) break;
+                    reservedCalls += chunks.length;
+                    // Same system prompt summarizeRange builds for the serial path
+                    // (per-chunk length budget spread over maxSummaryLength, #1775).
+                    const maxSummary = activeConfig.compress.maxSummaryLength;
+                    const perChunkBudget = maxSummary > 0 ? Math.floor((maxSummary - (chunks.length - 1) * SUMMARY_JOIN_GAP) / chunks.length) : undefined;
+                    const instructions =
+                        buildCompressSystemPrompt(deps.prompts, messageTimestampSections(deps.surface?.promptSections)) +
+                        `\n\nTASK: The conversation segment below (messages ${startRef}–${endRef}) must be compressed because the session context exceeds the current model's window. Write a tier-1 compression summary of the segment following every rule above. Output ONLY the summary text — no preamble, no closing remarks, no tool calls.` +
+                        summaryLengthBudgetClause(perChunkBudget, MIN_SUMMARY_CHARS);
+                    nominations.push({ skipKey, startRef, endRef, content, chunks, instructions, effectiveMessageIds: [...planned.effectiveMessageIds], targetKey: foldTargetKey(planned, deps.session.state), spanUnits, offset: workTotal });
+                    workTotal += chunks.length;
+                }
+                if (nominations.length >= 2) {
+                    summaryCalls += reservedCalls;
+                    const workItems = nominations.flatMap((nom) => nom.chunks.map((chunk) => ({ content: chunk, instructions: nom.instructions, minSummaryChars: MIN_SUMMARY_CHARS, maxSummaryChars: deps.config.compress.maxSummaryLength })));
+                    const batch = await batchPlan.summarize(workItems, deps.signal);
+                    const assembled = nominations.map((nom): string | undefined => {
+                        const entries = batch.results.slice(nom.offset, nom.offset + nom.chunks.length);
+                        if (entries.length < nom.chunks.length || entries.some((entry) => entry.status !== "success")) return undefined;
+                        const candidate = entries.map((entry) => (entry.status === "success" ? entry.summary : "")).join("\n\n");
+                        // Acceptance identical to the walk: absolute cap, then net-
+                        // shrink monotonicity (#861/#1775/#1819), rescue-truncate
+                        // when truncating still nets savings.
+                        const shrinkOk = (text: string): boolean => countText(text) <= nom.spanUnits * NET_SHRINK_TOLERANCE;
+                        const maxSummary = activeConfig.compress.maxSummaryLength;
+                        if (maxSummary <= 0 || candidate.length <= maxSummary) {
+                            return shrinkOk(candidate) ? candidate : undefined;
+                        }
+                        if (candidate.length < nom.content.length) {
+                            const rescued = truncateSummaryToLimit(candidate, maxSummary, activeConfig.compress.minSummaryLength);
+                            if (rescued !== null && shrinkOk(rescued)) {
+                                deps.log("warn", `[preflight] range ${nom.skipKey}: assembled summary ${candidate.length} chars exceeded maxSummaryLength (${maxSummary}); truncated to ${rescued.length} chars`);
+                                return rescued;
+                            }
+                        }
+                        return undefined;
+                    });
+                    const successful = assembled.filter((candidate) => candidate !== undefined).length;
+                    deps.log("info", `[external-summary] completed (preflight) ${successful}/${nominations.length} range(s); calls=${workItems.length}; ${describeExternalSummaryFailure(batch)}`);
+                    if (batch.status === "deadline" && batch.results.every((entry) => entry.attempts.length === 0)) {
+                        poolQueueDrop = true;
+                        deps.log("warn", `[external-summary] the whole batch died in the shared pool queue before a single candidate dispatched (deadline, 0 attempts) — pool congestion; stopping this fold instead of queueing further rounds, the next turn retries (#2657 × #2678 fusion)`);
+                    }
+                    for (let ni = 0; ni < nominations.length; ni++) {
+                        const candidate = assembled[ni];
+                        if (candidate === undefined) continue;
+                        const nom = nominations[ni];
+                        commitFold(nom.skipKey, nom.startRef, nom.endRef, candidate, nom.effectiveMessageIds, true, nom.targetKey);
+                    }
+                }
+            }
+        }
+        // #4224: emergency digests are CPU-only (zero upstream calls), so the
+        // LLM-path "one fold per round" cap wastes hundreds of rounds.
+        const maxFoldsPerRound = emergencyFold ? Infinity : 1;
+        for (let oi = 0; oi < ordered.length && appliedThisRound < maxFoldsPerRound && !poolQueueDrop; oi++) {
             const range = ordered[oi];
             if (decisionTokens < textTarget) break;
             if (deps.signal?.aborted) {
@@ -1440,8 +2683,19 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             if (budgetHit) break;
             const skipKey = `${range.startRef}:${range.endRef}`;
             if (skipSet.has(skipKey)) continue;
+            // #2832: dead-probe verdict with the canary spent — no range in this
+            // walk can fold (they all share the same dead model path), so stop
+            // the walk with the actionable detail instead of probing again.
+            if (probeGated && probeDead && canarySpent) {
+                noteSkip(`${skipKey}: summary probe path dead for ${probeKey} — no further probes this turn (#2832)`);
+                failure = { kind: "exhausted", detail: stickyFailureDetail };
+                break;
+            }
             const { refToIdx } = refMaps(messages, deps.session.state);
-            if (baselineKnown) {
+            // #4224: skip the mid-walk futility bail in the emergency path —
+            // each fold is free (CPU-only), so "cannot fully close the gap"
+            // is not a reason to stop folding.
+            if (baselineKnown && !emergencyFold) {
                 // #1841: mid-walk futility bail. Ranges already consumed,
                 // skipped, or unresolvable cannot yield saving; when the live
                 // untried rest of the walk cannot close the gap either, stop
@@ -1461,11 +2715,11 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                     if (si !== undefined && ei !== undefined && si <= ei) remaining += rj.tokens;
                 }
                 const deficit = result.payloadEstimate - limit;
-                if (remaining > 0 && deficit > 0 && remaining * FUTILITY_SLACK < deficit) {
+                if (remaining > 0 && deficit > 0 && calibrateFoldMass(remaining) * FUTILITY_SLACK < deficit) {
                     futileBail = true;
-                    bailRemaining = remaining;
+                    bailRemaining = calibrateFoldMass(remaining);
                     bailDeficit = deficit;
-                    deps.log("warn", `[preflight] remaining foldable mass (~${remaining} tok) cannot close the ~${deficit}-tok gap; stopping further summarization calls (#1841)`);
+                    deps.log("warn", `[preflight] remaining foldable mass (~${calibrateFoldMass(remaining)} tok) cannot close the ~${deficit}-tok gap; stopping further summarization calls (#1841)`);
                     break;
                 }
             }
@@ -1482,7 +2736,10 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                 noteSkip(`${skipKey}: ${why}`);
                 continue;
             }
-            rangesTried += 1;
+            if (!triedKeys.has(skipKey)) {
+                triedKeys.add(skipKey);
+                rangesTried += 1;
+            }
             // minUnits only in the char regime: with the optimistic token budget a
             // sub-minimum chunk is already rare, and keeping minUnits = 0 there
             // preserves the historical packing exactly.
@@ -1492,7 +2749,9 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             // prime suspect for an empty summary is a CHUNK_FRACTION-sized chunk
             // exceeding the upstream's real input cap, and halving recovers
             // exactly those cases. Bounded by the per-regime call budget below.
-            const spans: Array<[number, number]> = splitChunks(messages, startIdx, endIdx, budget, baselineKnown ? 0 : minChars, countText).slice().reverse();
+            // #4740: floor in both regimes — see the batch nomination comment.
+            // Sub-floor fragments were guaranteed-rejected previews, not packing.
+            const spans: Array<[number, number]> = mergeSubMinimumFragments(messages, splitChunks(messages, startIdx, endIdx, budget, baselineKnown ? 0 : minChars, countText), minChars, coveredIdx).slice().reverse();
             while (spans.length > 0) {
                 if (decisionTokens < textTarget) break;
                 if (deps.signal?.aborted) {
@@ -1500,17 +2759,39 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                     break;
                 }
                 if (budgetHit) break;
+                // #2832: verdict armed mid-walk (this range's own draw was the
+                // last strike) — abandon the remaining sub-spans CPU-only; they
+                // would all hit the same wall and the next range's gate stops
+                // the whole walk.
+                if (probeGated && probeDead && canarySpent) {
+                    noteSkip(`${skipKey}: summary probe path dead for ${probeKey} — remaining sub-span(s) not probed (#2832)`);
+                    skipSet.add(skipKey);
+                    break;
+                }
                 const span = spans.pop();
                 if (!span) break;
-                const [cs, ce] = span;
                 const maps = refMaps(messages, deps.session.state);
-                let startRef = maps.idxToRef.get(cs);
-                let endRef = maps.idxToRef.get(ce);
-                if (!startRef || !endRef) {
-                    deps.log("warn", `[preflight] dropping span ${cs}..${ce} of range ${skipKey}: boundary message has no ref in the current state`);
-                    noteSkip(`${skipKey}: span ${cs}..${ce} boundary message has no ref`);
+                // #2672: the old guard dropped the WHOLE span when a boundary
+                // lacked a plain ref, but protected messages hold the truthy
+                // BLOCKED sentinel — so a blind halving midpoint on one passed
+                // the guard, reached the kernel as "Invalid boundary ref(s)",
+                // and killed both halves at once. Snap instead: a span loses at
+                // most its unreferencable rim (the kernel excludes such messages
+                // from the block anyway).
+                const bounds = snapToUsableBounds(maps.idxToRef, span[0], span[1]);
+                const bStart = bounds?.[0];
+                const bEnd = bounds?.[1];
+                const startRef0 = bStart !== undefined ? maps.idxToRef.get(bStart) : undefined;
+                const endRef0 = bEnd !== undefined ? maps.idxToRef.get(bEnd) : undefined;
+                if (bStart === undefined || bEnd === undefined || !startRef0 || !endRef0) {
+                    deps.log("warn", `[preflight] dropping span ${span[0]}..${span[1]} of range ${skipKey}: no message carries a usable ref (protected or unreferenced)`);
+                    noteSkip(`${skipKey}: span ${span[0]}..${span[1]} has no usable ref boundary`);
                     continue;
                 }
+                let cs = bStart;
+                let ce = bEnd;
+                let startRef = startRef0;
+                let endRef = endRef0;
                 // #1001: after a client history rewrite, ref numbers are not monotonic
                 // with position — emit ascending pairs (the kernel resolves by
                 // position anyway; this keeps specs, logs and the summary prompt honest).
@@ -1534,8 +2815,22 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                         || "the kernel created no block and reported no error";
                     deps.log("warn", `[preflight] preview rejected range ${skipKey}: ${verdict}`);
                     noteSkip(`${skipKey}: preview rejected — ${verdict}`);
+                    // #2638: ONLY the structural "no new compressible messages" verdicts are
+                    // regime-independent — coverage-based, they hold under the #330 relax flip
+                    // too, so the span is skipped for the rest of this invocation and
+                    // remembered across invocations. Zone/min-gate/length verdicts can clear
+                    // mid-invocation (relax, newer messages) and stay retryable. #4521 moved
+                    // the structural-empty verdicts from FAILED errors to success warnings
+                    // ("folded nothing — ..."); raw errors AND warnings, not a truncated
+                    // rendering: the named-block list must survive intact.
+                    const named = parseStructuralEmptyVerdict([...preview.result.errors, ...preview.result.warnings].join("\n"));
+                    if (named !== null) {
+                        skipSet.add(skipKey);
+                        recordDeadRange(deps.session, startRef, endRef, named);
+                    }
                     continue;
                 }
+                const targetKey = foldTargetKey(planned, deps.session.state);
                 // Direct raw messages render host-side: #781 image notes live in BiliMessage
                 // sidecars the kernel never sees. Consumed child blocks render through the
                 // kernel from the original state so they stay summaries.
@@ -1590,6 +2885,10 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                 }
                 let summary: string | null = null;
                 let outcome: SummaryOutcome | undefined;
+                // Any-part external flag: chunked folds assemble one block from
+                // several summarizeRange parts, so the marker must survive the
+                // assembly (it tags the applied block, not the individual calls).
+                let externalFold = false;
                 // #2383: hoisted out of the LLM path below — the emergency digest
                 // branch needs the span's mass for its net-shrink bound before any
                 // summary exists; units match the post-fold accounting.
@@ -1625,6 +2924,9 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                                 break;
                             }
                             summaryCalls += 1;
+                            // #2832: while the verdict is dead this call is the
+                            // invocation's one canary probe.
+                            if (probeGated && probeDead) canarySpent = true;
                             let part = await summarizeRange(deps, chunk, startRef, endRef, perChunkBudget);
                             let transientTries = 0;
                             while (
@@ -1642,10 +2944,13 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                                 summaryCalls += 1;
                                 part = await summarizeRange(deps, chunk, startRef, endRef, perChunkBudget);
                             }
+                            if ("unusable" in part && part.deterministic) recordDeterministicEmpty();
                             if ("unusable" in part) {
                                 outcome = part;
                                 break;
                             }
+                            if (part.external) externalFold = true;
+                            else clearDeterministicProbe();
                             parts.push(part.summary);
                         }
                         if (!budgetHit && !outcome && parts.length === chunks.length) {
@@ -1720,9 +3025,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                                 && ce > cs && spanUnitsOf(messages, cs, ce, countText) >= floorUnits) {
                                 lastUnusableDetail = `HTTP ${err.status}: ${bodySnippet}`;
                                 deps.log("warn", `[preflight] chunk ${startRef}:${endRef} rejected with HTTP ${err.status}; retrying with smaller chunks`);
-                                const mid = Math.floor((cs + ce) / 2);
-                                spans.push([mid + 1, ce]);
-                                spans.push([cs, mid]);
+                                pushSpanHalves(maps.idxToRef, spans, cs, ce);
                                 continue;
                             }
                         } else if (deps.signal?.aborted) {
@@ -1734,9 +3037,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                             // the client regardless of which code surfaced (a cert problem is not more
                             // terminal than a gzip corruption). Only an abort (client gone / idle budget)
                             // is not worth retrying; keep that case's field omitted as before.
-                            const caNote = err.code !== undefined && TLS_TRUST_HINT_CODES.has(err.code)
-                                ? " This looks like TLS certificate interception (corporate proxy/MITM): install the corporate root CA for Node.js via NODE_EXTRA_CA_CERTS=/path/to/ca.pem, or run node with --use-system-ca."
-                                : "";
+                            const caNote = isTlsTrustCode(err.code) ? ` — ${tlsTrustRemediation()}` : "";
                             failure = { kind: "upstream", detail: `the summarization call failed: ${err.message}${caNote}`, ...(err.aborted ? {} : { retryable: true }) };
                             deps.log("warn", `[preflight] summarization failed: ${err.message}`);
                         } else {
@@ -1749,12 +3050,22 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                 if (summary === null) {
                     const unusableDetail = outcome && "unusable" in outcome ? outcome.unusable : "unknown";
                     if (outcome) lastUnusableDetail = unusableDetail;
+                    // #2832: a deterministic empty (normal stop, zero text) is not
+                    // size-driven — halving would only re-bill doomed draws
+                    // against the same wall, so skip straight to the give-up.
+                    // The strike may have armed the dead-probe verdict, which
+                    // stops the whole walk at the next range's gate.
+                    const deterministicUnusable = outcome !== undefined && "unusable" in outcome && outcome.deterministic === true;
+                    if (deterministicUnusable) {
+                        deps.log("warn", `[preflight] range ${skipKey} got a deterministic empty summary (${unusableDetail}); skipping without halving — a normal stop with zero text is not size-driven (#2832)`);
+                        noteSkip(`${skipKey}: deterministic empty summary (${unusableDetail})`);
+                        skipSet.add(skipKey);
+                        break;
+                    }
                     const floorUnits = baselineKnown ? 2 * MIN_CHUNK_TOKENS : 2 * minChars;
                     if (ce > cs && spanUnitsOf(messages, cs, ce, countText) >= floorUnits) {
                         deps.log("warn", `[preflight] chunk ${startRef}:${endRef} produced no usable summary (${unusableDetail}); retrying with smaller chunks`);
-                        const mid = Math.floor((cs + ce) / 2);
-                        spans.push([mid + 1, ce]);
-                        spans.push([cs, mid]);
+                        pushSpanHalves(maps.idxToRef, spans, cs, ce);
                         continue;
                     }
                     deps.log("warn", `[preflight] range ${skipKey} produced no usable summary even at minimum size (${unusableDetail}); skipping it`);
@@ -1762,40 +3073,10 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                     skipSet.add(skipKey);
                     break;
                 }
-                const ctx: RewriteCtx = {
-                    core: deps.core,
-                    config: activeConfig,
-                    messages,
-                    session: deps.session,
-                    log: (msg) => deps.log("info", msg),
-                };
-                const creditBefore = deps.session.stats.compressCreditTokens;
-                // #2146: internal lane — must not arm the model-facing loop breaker.
-                const applied = applyRanges(parseCompressInput({ content: [{ startId: startRef, endId: endRef, summary, topic: "preflight overflow compress" }] }), ctx, { loopTracking: false });
-                if (applied.outcome === "refused") {
-                    deps.log("warn", `[preflight] ${applied.text}`);
-                    noteSkip(`${skipKey}: apply failed — ${safePrefix(applied.text.replace(/^\[Compression FAILED[:\s]*/, ""), 200)}`);
-                    skipSet.add(skipKey);
-                    break;
-                }
-                // #1993: a fold succeeded after an earlier rejection in this walk — the
-                // payload shrank, so the stale failure no longer describes the end
-                // state; clear it so a later exhaustion reports its own reason (and a
-                // fitting result reports none at all).
-                failure = undefined;
-                // The summary itself re-enters the payload; net its cost against
-                // both the folded size and the session's input baseline. Without a
-                // baseline currentTokens is char-based, so net the folded span's
-                // char count against it instead of the token-based credit.
-                const compressed = deps.session.stats.compressCreditTokens - creditBefore;
-                const folded = baselineKnown ? compressed : messages.filter((message) => planned.effectiveMessageIds.includes(message.id)).reduce((total, message) => total + (message.text ?? "").length, 0);
-                currentTokens = Math.max(0, currentTokens - folded + countText(summary));
-                deps.session.stats.lastInputTokens += defaultCountTokens(summary);
-                appliedThisRound += 1;
-                result.compressedRanges += 1;
+                commitFold(skipKey, startRef, endRef, summary, planned.effectiveMessageIds, outcome?.external || externalFold, targetKey);
                 break;
             }
-            if (appliedThisRound > 0) break;
+            if (appliedThisRound >= maxFoldsPerRound) break;
             if (failure || budgetHit) break;
         }
         if (appliedThisRound === 0) {
@@ -1808,10 +3089,21 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                 // #1372 contract: per-range skip notes are the diagnosis of WHY
                 // candidates died — carry them into the bail verdict too.
                 const skipNote = skipReasons.length > 0 ? ` Skipped: ${skipReasons.slice(0, 3).join(" | ")}.` : "";
-                failure = { kind: "exhausted", detail: `futile round: after the folds so far, the remaining foldable content (~${bailRemaining} tokens${zoneNote}) cannot close the ~${bailDeficit}-token gap to the target even if every remaining range folded successfully.${skipNote} Raise the model context window or restart the session.` };
+                // #2952 Design A: some raw folds landed but the remaining RAW pool
+                // can't close the gap — distilling existing lower-tier blocks might.
+                // Defer to the post-walk recovery funnel instead of failing here
+                // (tiers=false / emergency digest never enter this branch).
+                if (eligibleForTierRecovery()) {
+                    deps.log("info", `[preflight] remaining raw-fold pool (~${bailRemaining} tok${zoneNote}) below deficit (~${bailDeficit} tok); deferring to bounded tier-distillation recovery (#2952)`);
+                    break;
+                }
+                // #3461: doomed regardless of relay health only when no draw came
+                // back unusable and the pool never dropped — landed folds prove
+                // the relay worked, so the residual shortfall is real content.
+                failure = { kind: "exhausted", deterministic: lastUnusableDetail === undefined && !poolQueueDrop, detail: `futile round: after the folds so far, the remaining foldable content (~${bailRemaining} tokens${zoneNote}) cannot close the ~${bailDeficit}-token gap to the target even if every remaining range folded successfully.${skipNote} Raise the model context window or restart the session.` };
                 break;
             }
-            if (!failure && !budgetHit && !relaxed && (baselineKnown ? result.payloadEstimate : finalUpper) >= limit) {
+            if (!failure && !budgetHit && !relaxed && result.payloadEstimate >= limit) {
                 activeConfig = relaxedConfig(deps.config);
                 relaxed = true;
                 summaryCalls = 0;
@@ -1824,32 +3116,65 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         }
     }
     if (currentTokens >= limit && !failure) {
-        // #726: carry the most recent unusable-summary diagnosis into the
-        // fail-fast message — "no range could be compressed" with no reason is
-        // undiagnosable from the client side.
-        // #1372: carry the actual per-range skip reasons too — the old hardcoded
-        // parenthetical claimed causes that often had not happened (e.g. "below
-        // minCompressRange" for a range that died before any summary call).
-        const unusableNote = lastUnusableDetail ? ` Last unusable summary: ${safePrefix(lastUnusableDetail, 300)}.` : "";
-        const skipNote = skipReasons.length > 0 ? ` Skipped: ${skipReasons.slice(0, 3).join(" | ")}.` : "";
-        if (budgetHit) {
-            failure = { kind: "exhausted", detail: `the preflight summarization budget (${summaryBudget} calls per protection regime) was exhausted before the payload fit the window${unusableNote}${skipNote}` };
-        } else if (relaxed && result.compressedRanges > 0) {
-            failure = { kind: "exhausted", detail: `${relaxedExhaustedDetail}${skipNote}` };
-        } else if (result.compressedRanges === 0) {
-            const cause = skipReasons.length > 0
-                ? skipReasons.slice(0, 3).join(" | ")
-                : "each was below minCompressRange, had an unusable summary, or failed to apply";
-            failure = { kind: "exhausted", detail: rangesTried === 0
-                ? `no viable range could be compressed: ${cause}${unusableNote}`
-                : `no range could be compressed across ${rangesTried} viable range${rangesTried === 1 ? "" : "s"}: ${cause}${unusableNote}` };
-        } else {
-            failure = { kind: "exhausted", detail: `the compress budget was exhausted after ${effectiveRoundCap} rounds${unusableNote}${skipNote}` };
+        // #2952 Design A: last-resort bounded tier-distillation recovery before any
+        // exhaustion verdict is final. Reached from a deferred futility gate, a
+        // deferred mid-walk bail, or natural walk exhaustion alike — exactly one
+        // bounded chance per invocation. On success currentTokens drops under the
+        // window and the verdict branches below are skipped entirely; on failure it
+        // installs the honest all-tier-exhaustion detail. Never entered for
+        // tiers=false / emergency digest mode, so those paths keep their exact
+        // prior verdicts.
+        if (!tierRecoveryAttempted && eligibleForTierRecovery()) {
+            tierRecoveryAttempted = true;
+            const rec = await attemptTierRecovery();
+            deps.log("info", `[preflight] tier-distillation recovery finished: ${rec.recovered ? "recovered" : "not recovered"}; ${rec.callsUsed} summary call(s), net ~${rec.netSaved} tok saved (#2952)`);
+            if (!rec.recovered) {
+                failure = { kind: "exhausted", detail: rec.honestDetail };
+            }
+        }
+        if (currentTokens >= limit && !failure) {
+            // #726: carry the most recent unusable-summary diagnosis into the
+            // fail-fast message — "no range could be compressed" with no reason is
+            // undiagnosable from the client side.
+            // #1372: carry the actual per-range skip reasons too — the old hardcoded
+            // parenthetical claimed causes that often had not happened (e.g. "below
+            // minCompressRange" for a range that died before any summary call).
+            const unusableNote = lastUnusableDetail ? ` Last unusable summary: ${safePrefix(lastUnusableDetail, 300)}.` : "";
+            const skipNote = skipReasons.length > 0 ? ` Skipped: ${skipReasons.slice(0, 3).join(" | ")}.` : "";
+            if (budgetHit) {
+                failure = { kind: "exhausted", detail: `the preflight summarization budget (${summaryBudget} calls per protection regime) was exhausted before the payload fit the window${unusableNote}${skipNote}` };
+            } else if (relaxed && result.compressedRanges > 0) {
+                // #3461: "folded everything compressible" is only a structural
+                // verdict when nothing was lost to unusable draws or pool drops.
+                failure = { kind: "exhausted", deterministic: lastUnusableDetail === undefined && !poolQueueDrop, detail: `${relaxedExhaustedDetail}${skipNote}` };
+            } else if (result.compressedRanges === 0) {
+                const cause = poolQueueDrop
+                    ? "the shared summary pool was saturated and no summary call was ever dispatched (scheduler congestion, not a chain failure; auto-fold retries next turn)"
+                    : skipReasons.length > 0
+                        ? skipReasons.slice(0, 3).join(" | ")
+                        : "each was below minCompressRange, had an unusable summary, or failed to apply";
+                // #3461: zero dispatches means the walk never touched the relay —
+                // the shortfall is structural unless the pool itself dropped work.
+                failure = { kind: "exhausted", deterministic: rangesTried === 0 && !poolQueueDrop && lastUnusableDetail === undefined, detail: rangesTried === 0
+                    ? `no viable range could be compressed: ${cause}${unusableNote}`
+                    : `no range could be compressed across ${rangesTried} viable range${rangesTried === 1 ? "" : "s"}: ${cause}${unusableNote}` };
+            } else {
+                failure = { kind: "exhausted", detail: `the compress budget was exhausted after ${effectiveRoundCap} rounds${unusableNote}${skipNote}` };
+            }
         }
     }
     result.rangesRemaining = rangesRemaining;
     result.savedTokens = Math.max(0, startTokens - currentTokens);
-    if (currentTokens >= limit) result.failure = failure;
-    result.fitsWindow = baselineKnown ? result.payloadEstimate < limit : finalUpper < limit;
+    if (deps.signal?.aborted) failure = ABORTED_FAILURE;
+    // #4288: a fit-forward exit outranks the stale-floored currentTokens —
+    // the payload fits by its own estimate and the caller forwards it; an
+    // exhausted verdict here would report a marathon that did not happen.
+    if ((currentTokens >= limit && !fitExitForward) || failure?.kind === "aborted") result.failure = failure;
+    // #3146: both regimes judge fit on the calibrated CJK-aware estimate — the
+    // char-count upper bound was the trigger arm, never the reject-forward gate.
+    result.fitsWindow = result.payloadEstimate < limit;
+    if (deps.externalSummary !== undefined) {
+        result.externalDispatch = { calls: deps.externalSummary.stats.calls, attempts: deps.externalSummary.stats.attempts };
+    }
     return result;
 }

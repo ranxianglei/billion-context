@@ -250,3 +250,59 @@ test("missing lastPassIds falls back to renumber-nothing for one pass (#462)", (
   );
   assert.equal(out.length, 1);
 });
+
+test("renumbers a new cluster extension off an INACTIVE block's covered ids (#2695)", () => {
+  const state = createInitialState();
+  // b2 died when the host decimated its substrate; its covered numbers are
+  // h_.._5.._7 of the duplicated-reply cluster.
+  const dead = folded([`${HASH}_5`, `${HASH}_6`, `${HASH}_7`]);
+  dead.active = false;
+  state.blocks.push(dead);
+  // Last pass carried the continuing cluster h_.._0.._4 (a live sibling of
+  // the same root) — so h_.._5 arriving now is a new extension, not a rewind.
+  state.lastPassIds = [
+    EARLY,
+    HASH,
+    `${HASH}_1`,
+    `${HASH}_2`,
+    `${HASH}_3`,
+    `${HASH}_4`,
+  ];
+  const out = remintCoveredLiveIds(
+    [
+      msg(EARLY, "hi"),
+      msg(HASH, "a"),
+      msg(`${HASH}_1`, "a"),
+      msg(`${HASH}_2`, "a"),
+      msg(`${HASH}_3`, "a"),
+      msg(`${HASH}_4`, "a"),
+      msg(`${HASH}_5`, "a"),
+    ],
+    state,
+  );
+  const five = out.find((m) => (m.text ?? "") === "a" && m.id === `${HASH}_5`);
+  assert.ok(!five, "the dead block's h_.._5 must not be re-occupied");
+  const minted = out[out.length - 1]!;
+  assert.equal(minted.id, `${HASH}_8`, "dodges the dead block's _5.._7");
+  assert.equal(out[1]!.id, HASH, "continuing instances keep their ids");
+});
+
+test("keeps a whole-root rewind onto an inactive block intact (#2695)", () => {
+  const state = createInitialState();
+  const dead = folded([HASH, `${HASH}_1`]);
+  dead.active = false;
+  state.blocks.push(dead);
+  // Prior pass saw none of this root (client trimmed it away); the arrival
+  // is a rewind to a checkpoint that still holds the folded originals — an
+  // echo class, not a new extension.
+  state.lastPassIds = [EARLY];
+  const out = remintCoveredLiveIds(
+    [msg(EARLY, "hi"), msg(HASH, "a"), msg(`${HASH}_1`, "a")],
+    state,
+  );
+  assert.deepEqual(
+    out.map((m) => m.id),
+    [EARLY, HASH, `${HASH}_1`],
+    "rewind echoes keep the converter ids so the block can resurrect",
+  );
+});

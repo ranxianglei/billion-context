@@ -143,10 +143,12 @@ test("openai: user image_url content part is restored", () => {
         ],
     };
     const { msgs } = openaiToCore(body);
-    assert.ok(msgs[0]?.text?.startsWith("what is this?"), "text preserved");
-    assert.equal(msgs[0]?.imageMediaType, "image/png");
-    assert.equal(msgs[0]?.imageBase64, IMG_DATA);
-    assert.ok(msgs[0]?.rawOpenaiContent, "rawOpenaiContent sidecar stored");
+    assert.equal(msgs.length, 2, "one core per content part");
+    assert.equal(msgs[0]?.text, "what is this?", "text core is verbatim");
+    assert.equal(msgs[1]?.text, "[image]", "image core uses the canonical marker");
+    assert.equal(msgs[1]?.imageMediaType, "image/png");
+    assert.equal(msgs[1]?.imageBase64, IMG_DATA);
+    assert.ok(msgs[1]?.rawOpenaiContent, "rawOpenaiContent sidecar stored");
     const rebuilt = coreToOpenai(msgs);
     const u = rebuilt[0]!;
     assert.equal(u.role, "user");
@@ -174,10 +176,12 @@ test("responses: user input_image is restored via rawResponsesItem", () => {
         ],
     };
     const { msgs } = responsesToCore(body);
-    assert.ok(msgs[0]?.text?.startsWith("see this"), "text preserved");
-    assert.equal(msgs[0]?.imageMediaType, "image/png");
-    assert.equal(msgs[0]?.imageBase64, IMG_DATA);
-    assert.ok(msgs[0]?.rawResponsesItem, "rawResponsesItem sidecar stored");
+    assert.equal(msgs.length, 2, "one core per content part");
+    assert.equal(msgs[0]?.text, "see this", "text core is verbatim");
+    assert.equal(msgs[1]?.text, "[image]", "image core uses the canonical marker");
+    assert.equal(msgs[1]?.imageMediaType, "image/png");
+    assert.equal(msgs[1]?.imageBase64, IMG_DATA);
+    assert.ok(msgs[1]?.rawResponsesItem, "rawResponsesItem sidecar stored");
     const rebuilt = coreToResponses(msgs);
     assert.equal(rebuilt.length, 1);
     const m = rebuilt[0] as { type: string; content: unknown };

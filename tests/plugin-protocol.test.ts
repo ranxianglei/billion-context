@@ -157,8 +157,10 @@ async function startHarness(
         captured,
         close: async () => {
             proxy.close();
+            proxy.closeIdleConnections?.();
             await once(proxy, "close");
             upstream.close();
+            upstream.closeIdleConnections?.();
             await once(upstream, "close");
         },
     };
@@ -240,11 +242,11 @@ test("plugin manifest serves the exact wire tool schemas, headers and version", 
         // #1192: every extra tool (absorb, acp_rule) is opt-in and only advertised
         // when enabled — hosts register manifest tools verbatim, so a disabled
         // tool must not be listed. acp_cache stays in the base toolset.
-        assert.deepEqual([...manifest.toolNames].sort(), ["acp_cache", "acp_status", "compress", "decompress", "search_context"]);
+        assert.deepEqual([...manifest.toolNames].sort(), ["acp_cache", "acp_read_original_image", "acp_status", "compress", "decompress", "search_context"]);
         const names = manifest.tools.anthropic!.map((t) => String(t.name)).sort();
-        assert.deepEqual(names, ["acp_cache", "acp_status", "compress", "decompress", "search_context"]);
-        assert.equal(manifest.tools.openai!.length, 5);
-        assert.equal(manifest.tools.responses!.length, 5);
+        assert.deepEqual(names, ["acp_cache", "acp_read_original_image", "acp_status", "compress", "decompress", "search_context"]);
+        assert.equal(manifest.tools.openai!.length, 6);
+        assert.equal(manifest.tools.responses!.length, 6);
         // #841: search_context's conversation_id doubles as a cross-session
         // read-only search target — its param description must carry the
         // historical-search wording in every wire shape.
@@ -267,8 +269,31 @@ test("plugin manifest serves the exact wire tool schemas, headers and version", 
     }
 });
 
+// #1192 (regression): with rules enabled in the base config the
+// manifest advertises acp_rule again — enabling the feature must not
+// shrink the toolset dsh/pi/omp/MCP shims register.
+test("plugin manifest: acp_rule advertised when rules enabled in config", async () => {
+    const h = await startHarness([textScript()], { ...defaultConfig(400_000), rules: { enabled: true } });
+    try {
+        const resp = await fetch(`http://127.0.0.1:${h.proxyPort}/__bili/plugin/manifest`);
+        assert.equal(resp.status, 200);
+        const manifest = (await resp.json()) as { toolNames: string[]; tools: Record<string, Array<Record<string, unknown>>> };
+        assert.deepEqual([...manifest.toolNames].sort(), ["acp_cache", "acp_read_original_image", "acp_rule", "acp_status", "compress", "decompress", "search_context"]);
+        for (const shape of ["anthropic", "openai", "responses"] as const) {
+            const listed = manifest.tools[shape]!.map((t) => {
+                const fn = t.function as { name?: unknown } | undefined;
+                return typeof t.name === "string" ? t.name : (typeof fn?.name === "string" ? fn.name : "");
+            });
+            assert.ok(listed.includes("acp_rule"), `${shape} has acp_rule`);
+            assert.equal(listed.length, 7);
+        }
+    } finally {
+        await h.close();
+    }
+});
+
 // #1192 (regression): with absorb + rules enabled in the base config the
-// manifest advertises all seven tools again — enabling the features must not
+// manifest advertises all eight tools again — enabling the features must not
 // shrink the toolset dsh/pi/omp/MCP shims register.
 test("plugin manifest: absorb and acp_rule advertised when enabled in config", async () => {
     const h = await startHarness([textScript()], { ...defaultConfig(400_000), absorb: { enabled: true, toolName: "absorb", minToolTokens: 4000, contextThresholdPct: 0, excludeTools: [] }, rules: { enabled: true } });
@@ -276,7 +301,7 @@ test("plugin manifest: absorb and acp_rule advertised when enabled in config", a
         const resp = await fetch(`http://127.0.0.1:${h.proxyPort}/__bili/plugin/manifest`);
         assert.equal(resp.status, 200);
         const manifest = (await resp.json()) as { toolNames: string[]; tools: Record<string, Array<Record<string, unknown>>> };
-        assert.deepEqual([...manifest.toolNames].sort(), ["absorb", "acp_cache", "acp_rule", "acp_status", "compress", "decompress", "search_context"]);
+        assert.deepEqual([...manifest.toolNames].sort(), ["absorb", "acp_cache", "acp_read_original_image", "acp_rule", "acp_status", "compress", "decompress", "search_context"]);
         for (const shape of ["anthropic", "openai", "responses"] as const) {
             const listed = manifest.tools[shape]!.map((t) => {
                 const fn = t.function as { name?: unknown } | undefined;
@@ -284,7 +309,7 @@ test("plugin manifest: absorb and acp_rule advertised when enabled in config", a
             });
             assert.ok(listed.includes("absorb"), `${shape} has absorb`);
             assert.ok(listed.includes("acp_rule"), `${shape} has acp_rule`);
-            assert.equal(listed.length, 7);
+            assert.equal(listed.length, 8);
         }
     } finally {
         await h.close();
@@ -302,14 +327,14 @@ test("plugin manifest: absorb advertised when enabled in the global compress blo
         const resp = await fetch(`http://127.0.0.1:${h.proxyPort}/__bili/plugin/manifest`);
         assert.equal(resp.status, 200);
         const manifest = (await resp.json()) as { toolNames: string[]; tools: Record<string, Array<Record<string, unknown>>> };
-        assert.deepEqual([...manifest.toolNames].sort(), ["absorb", "acp_cache", "acp_status", "compress", "decompress", "search_context"]);
+        assert.deepEqual([...manifest.toolNames].sort(), ["absorb", "acp_cache", "acp_read_original_image", "acp_status", "compress", "decompress", "search_context"]);
         for (const shape of ["anthropic", "openai", "responses"] as const) {
             const listed = manifest.tools[shape]!.map((t) => {
                 const fn = t.function as { name?: unknown } | undefined;
                 return typeof t.name === "string" ? t.name : (typeof fn?.name === "string" ? fn.name : "");
             });
             assert.ok(listed.includes("absorb"), `${shape} has absorb`);
-            assert.equal(listed.length, 6);
+            assert.equal(listed.length, 7);
         }
     } finally {
         await h.close();
@@ -324,7 +349,7 @@ test("plugin manifest: absorb omitted when the global compress block disables it
         const resp = await fetch(`http://127.0.0.1:${h.proxyPort}/__bili/plugin/manifest`);
         assert.equal(resp.status, 200);
         const manifest = (await resp.json()) as { toolNames: string[] };
-        assert.deepEqual([...manifest.toolNames].sort(), ["acp_cache", "acp_status", "compress", "decompress", "search_context"]);
+        assert.deepEqual([...manifest.toolNames].sort(), ["acp_cache", "acp_read_original_image", "acp_status", "compress", "decompress", "search_context"]);
     } finally {
         await h.close();
     }
@@ -449,7 +474,7 @@ test("plugin tool API executes compress under the session lock; next request fol
         assert.equal(searchResp.status, 200);
         const searchJson = (await searchResp.json()) as { ok: boolean; result: string };
         assert.equal(searchJson.ok, true);
-        assert.match(searchJson.result, /plugin-side compress of the two early turns/, "block summary must be retrievable via search_context");
+        assert.match(searchJson.result, /\u3010plugin\u3011-side compress of the two early turns/, "block summary must be retrievable via search_context");
     } finally {
         await h.close();
     }
@@ -635,6 +660,53 @@ test("plugin mode: streamed response forwards verbatim while usage is sniffed in
     }
 });
 
+test("plugin handoff includes the completed reply before another request", async () => {
+    const h = await startHarness([textScript()]);
+    try {
+        const conv = "plug-handoff-latest";
+        await callPluginAnthropic(h, conv, [{ role: "user", content: "hello" }]);
+        const stats = await (await fetch(`http://127.0.0.1:${h.proxyPort}/__bili/stats`)).json() as {
+            sessions: Array<{ id: string; label?: string }>;
+        };
+        const id = stats.sessions.find((s) => s.label === conv)!.id;
+        const detail = await (await fetch(`http://127.0.0.1:${h.proxyPort}/__bili/sessions/${id}/detail`)).json() as { handoffMd: string; outputTokens: number };
+        assert.match(detail.handoffMd, /### assistant\n\nplain answer/);
+        assert.equal(detail.outputTokens, 7);
+        await callPluginAnthropic(h, conv, [
+            { role: "user", content: "hello" },
+            { role: "assistant", content: "plain answer" },
+            { role: "user", content: "continue" },
+        ]);
+        const next = await (await fetch(`http://127.0.0.1:${h.proxyPort}/__bili/sessions/${id}/detail`)).json() as { handoffMd: string };
+        assert.equal(next.handoffMd.split("plain answer").length - 1, 2, "one historical reply and one newly completed reply");
+    } finally {
+        await h.close();
+    }
+});
+
+test("proxy handoff includes the completed reply for streaming and JSON requests", async () => {
+    const h = await startHarness([textScript()]);
+    try {
+        for (const stream of [true, false]) {
+            const id = `proxy-handoff-${stream}`;
+            const response = await fetch(`http://127.0.0.1:${h.proxyPort}/bili/http://127.0.0.1:${h.upstreamPort}/v1/messages`, {
+                method: "POST",
+                headers: { "content-type": "application/json", "x-acp-session": id },
+                body: JSON.stringify({ model: "claude-test", max_tokens: 1024, stream, messages: [{ role: "user", content: "hello" }] }),
+            });
+            assert.equal(response.status, 200);
+            await response.text();
+            const detailResponse = await fetch(`http://127.0.0.1:${h.proxyPort}/__bili/sessions/${id}/detail`);
+            assert.equal(detailResponse.status, 200);
+            const detail = await detailResponse.json() as { handoffMd: string };
+            assert.match(detail.handoffMd, /### assistant\n/);
+            assert.ok(detail.handoffMd.includes(stream ? "plain answer" : "non-stream answer"));
+        }
+    } finally {
+        await h.close();
+    }
+});
+
 test("plugin mode: relay-echoed message_delta input_tokens:0 must not zero the sniffed input", async () => {
     // Some relays echo a schema-shaped usage in message_delta with
     // input_tokens: 0 (the spec field is normally absent — message_start is
@@ -776,6 +848,85 @@ test("plugin-reported context window becomes the nudge denominator and is visibl
     }
 });
 
+// Hermes defers plugin toolsets through tool_search, so a healthy plugin session sends requests
+// whose tools array carries NONE of the ACP names. Those requests must still bind the plugin
+// identity and budget (that is exactly what /acp reads) while compression falls back to the proxy —
+// signalled by x-bili-plugin-compression: proxy. The pure plugin lane (no such header) keeps
+// suppressing wire injection, and a plain client cannot reach the override without the agent marker.
+test("x-bili-plugin-compression: proxy keeps plugin identity, moves compression server-side", async () => {
+    const h = await startHarness([textScript(), textScript(), textScript(), textScript()]);
+    try {
+        const post = async (headers: Record<string, string>, tools: unknown[] | undefined): Promise<void> => {
+            const resp = await fetch(`http://127.0.0.1:${h.proxyPort}/bili/http://127.0.0.1:${h.upstreamPort}/v1/messages`, {
+                method: "POST",
+                headers: { "content-type": "application/json", ...headers },
+                body: JSON.stringify({
+                    model: "claude-test",
+                    max_tokens: 1024,
+                    stream: true,
+                    system: UPSTREAM_SYSTEM,
+                    messages: [{ role: "user", content: "hello" }],
+                    ...(tools ? { tools } : {}),
+                }),
+            });
+            for await (const _ of resp.body ?? []) { /* drain */ }
+            assert.equal(resp.status, 200);
+        };
+        const forwarded = (index: number): string[] => {
+            const parsed = JSON.parse(h.captured[index]!.body) as { tools?: Array<Record<string, unknown>> };
+            return (parsed.tools ?? []).map((t) => String(t.name ?? ""));
+        };
+        const roleTool = [{ name: "read_file", description: "read a file", input_schema: { type: "object" } }];
+        const CORE = ["compress", "decompress", "acp_status"];
+
+        // A: deferred toolset + override -> wire injection, plugin identity and budget intact.
+        await post({
+            "x-bili-plugin": "hermes",
+            "x-bili-plugin-conversation": "sess-defer",
+            "x-bili-plugin-compression": "proxy",
+            "x-bili-plugin-context-window": "500000",
+        }, roleTool);
+        const a = forwarded(0);
+        for (const name of CORE) assert.ok(a.includes(name), `proxy must inject ${name}; got ${a.join(",")}`);
+        assert.ok(a.includes("read_file"), "the client's own tools survive");
+        const status = (await (await fetch(
+            `http://127.0.0.1:${h.proxyPort}/__bili/plugin/status?conversationId=sess-defer`,
+        )).json()) as { ok: boolean; contextLimit: number | null; pluginAgent: string | null; requests: number };
+        assert.equal(status.ok, true, "the hermes session id resolves — /acp works in fallback mode");
+        assert.equal(status.pluginAgent, "hermes");
+        assert.equal(status.contextLimit, 500000, "the plugin-reported window still sizes the budget");
+        assert.equal(status.requests, 1);
+
+        // B: partial snapshot (one ACP name present) — nothing is injected twice.
+        await post({
+            "x-bili-plugin": "hermes",
+            "x-bili-plugin-conversation": "sess-defer-partial",
+            "x-bili-plugin-compression": "proxy",
+        }, [{ name: "compress", description: "x", input_schema: { type: "object" } }]);
+        const b = forwarded(1);
+        assert.equal(b.filter((n) => n === "compress").length, 1, "compress not duplicated");
+        for (const name of ["decompress", "acp_status"]) assert.ok(b.includes(name), `${name} still injected`);
+
+        // C: no override header -> pure plugin lane, unchanged (no injection).
+        await post({
+            "x-bili-plugin": "hermes",
+            "x-bili-plugin-conversation": "sess-pure",
+        }, roleTool);
+        for (const name of CORE) assert.ok(!forwarded(2).includes(name), `pure plugin lane must not inject ${name}`);
+
+        // D: the override without the agent marker is inert — an anonymous proxy-mode request (which
+        // injects anyway) must not be bound to a plugin conversation by the header alone.
+        await post({
+            "x-bili-plugin-conversation": "sess-plain",
+            "x-bili-plugin-compression": "proxy",
+        }, roleTool);
+        const plain = await fetch(`http://127.0.0.1:${h.proxyPort}/__bili/plugin/status?conversationId=sess-plain`);
+        assert.equal(plain.status, 404, "marker-less conversation id is never bound");
+    } finally {
+        await h.close();
+    }
+});
+
 test("headless launcher registrations expire after the TTL (no stale poisoning)", () => {
     _resetPluginStateForTest();
     const t0 = Date.now();
@@ -791,4 +942,14 @@ test("headless launcher registrations expire after the TTL (no stale poisoning)"
         Date.now = realNow;
         _resetPluginStateForTest();
     }
+});
+
+test("headless launcher registration selection preserves unrelated non-MCP lanes", () => {
+    queuePluginRegister("select-mcp", "mcp", false);
+    queuePluginRegister("select-pi", "pi", false);
+    const mcpFirst = takePendingPluginRegister((candidate) => candidate.agent === "mcp");
+    assert.equal(mcpFirst?.conversationId, "select-mcp");
+    const pi = takePendingPluginRegister((candidate) => candidate.agent !== "mcp");
+    assert.equal(pi?.conversationId, "select-pi");
+    assert.equal(takePendingPluginRegister(), undefined);
 });

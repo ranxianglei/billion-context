@@ -104,6 +104,13 @@ function popcount(x: number): number {
     return (Math.imul(x, 0x01010101) >>> 24);
 }
 
+/** #2824: real SimHash evaluations (memo misses) since process start — test
+ *  observability for the "no unused sketch computation" regression. */
+let simhashComputeCount = 0;
+export function simhashComputeCountForTest(): number {
+    return simhashComputeCount;
+}
+
 /** Sketch for a canonical message, memoized by its sha256 item hash (the
  *  caller already computes that hash for the chain, so a cache hit costs one
  *  Map lookup and a miss costs one simhash — never a second stringify). */
@@ -117,6 +124,7 @@ export function sketchForCanonical(canonical: string, itemHash?: string): string
         return hit;
     }
     const sketch = simhashHex(canonical);
+    simhashComputeCount++;
     if (sketchMemo.size >= SKETCH_MEMO_CAP) {
         const oldest = sketchMemo.keys().next().value;
         if (oldest !== undefined) sketchMemo.delete(oldest);

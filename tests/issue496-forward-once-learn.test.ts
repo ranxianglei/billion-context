@@ -128,20 +128,25 @@ mitm: { enabled: false, domains: [] },
 
         // --- Request 2: overflow EVIDENCE now exists → NO forward-once → fail-fast ---
         const r2 = await fetch(url, { method: "POST", headers, body: screenshotPayload() });
-        assert.equal(r2.status, 502, "second request fails fast instead of forwarding again");
+        // #3461: the image payload is over-window per bili's own meter and no
+        // fold can close the gap — a structurally doomed verdict answers 413
+        // (non-retryable) instead of the legacy 502.
+        assert.equal(r2.status, 413, "second request fails fast instead of forwarding again");
         const err2 = JSON.parse(await r2.text()) as { error?: { code?: string } };
         assert.equal(err2.error?.code, "preflight_compress_failed");
         assert.deepEqual(streamForwards, [true], "request 2 was NEVER forwarded (loop broken after one rejection)");
 
         // --- Request 3: stable — still fail-fast, still exactly one forward total ---
         const r3 = await fetch(url, { method: "POST", headers, body: screenshotPayload() });
-        assert.equal(r3.status, 502, "third request also fails fast");
+        assert.equal(r3.status, 413, "third request also fails fast (cooldown replays the same verdict, #3461)");
         await r3.text();
         assert.deepEqual(streamForwards, [true], "still exactly one forward total (no re-forwarding loop)");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });

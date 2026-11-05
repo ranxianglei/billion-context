@@ -1,0 +1,63 @@
+{
+  "fixture": "Claude Code on Vertex AI (Anthropic publisher wire)",
+  "wire": "anthropic, Vertex endpoint shape",
+  "why": "phase 0 of the Vertex port: freeze the wire before implementing it. Requests are captured from the real client; responses are doc-derived until a live call is possible (the project's partner-model quota is zero).",
+  "client": "claude-cli/2.1.300 (external, sdk-cli)",
+  "capturedAt": "2026-10-15",
+  "upstream": {
+    "baseUrlInClient": "http://127.0.0.1:<recorder>/bili/anthropic/https://aiplatform.googleapis.com/v1",
+    "note": "the client appends /projects/... to ANTHROPIC_VERTEX_BASE_URL verbatim, so the /v1 segment must be in the base URL: Vertex serves /v1/projects/... and 404s the version-less path"
+  },
+  "artifacts": [
+    {
+      "file": "turn-streaming.body.json",
+      "kind": "captured",
+      "bytes": 45101,
+      "sha256": "cd5d133702f2c4648edbc613b06406ce8f5b5bc08221a8e94e85838cd7a2f8a5",
+      "note": "stored exactly as received; the client emits compact JSON with raw UTF-8, which JS re-serialization reproduces byte-for-byte, so the digest here (not the formatting) is what proves the fixture still matches the capture"
+    },
+    {
+      "file": "turn-streaming.meta.json",
+      "kind": "captured",
+      "bytes": 1899,
+      "sha256": "9a5f36abee13fe77758dd1572f4cf5ebe91a7b528009916c9a8698fe459986db",
+      "note": "method, path and headers as received, plus the body digest"
+    },
+    {
+      "file": "probe-nonstreaming.body.json",
+      "kind": "captured",
+      "bytes": 492,
+      "sha256": "499293b20cc196749c22660d4f54d8afd326cb035c45527709254606d2248229",
+      "note": "stored exactly as received; the client emits compact JSON with raw UTF-8, which JS re-serialization reproduces byte-for-byte, so the digest here (not the formatting) is what proves the fixture still matches the capture"
+    },
+    {
+      "file": "probe-nonstreaming.meta.json",
+      "kind": "captured",
+      "bytes": 1644,
+      "sha256": "6774fb4422aeff4c3d431873a6705191280864c6353fcc4e3f363cf171f90f3f",
+      "note": "method, path and headers as received, plus the body digest"
+    },
+    {
+      "file": "response-message.json",
+      "kind": "doc-derived",
+      "bytes": 316,
+      "sha256": "1480af42f8c7766e428c33c9bfd1082415fb4f8e6dfa7e74ef78d581a2bf9637",
+      "note": "non-streaming Message shape; Vertex-specific id prefix msg_vrtx_, model echoed, stop_reason/stop_sequence/usage per the documented example",
+      "sources": [
+        "https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/partner-models/claude/use-claude (rawPredict response example)",
+        "https://platform.claude.com/docs/en/build-with-claude/streaming (event flow and the worked SSE example)"
+      ]
+    },
+    {
+      "file": "response-stream.sse",
+      "kind": "doc-derived",
+      "bytes": 799,
+      "sha256": "17f0998c3ce07fbea81bf0a202d7ded13cff24040f795e43b704329147cc0ee9",
+      "note": "SSE transcript: message_start, content_block_start, ping, content_block_delta, content_block_stop, message_delta, message_stop",
+      "sources": [
+        "https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/partner-models/claude/use-claude (rawPredict response example)",
+        "https://platform.claude.com/docs/en/build-with-claude/streaming (event flow and the worked SSE example)"
+      ]
+    }
+  ]
+}

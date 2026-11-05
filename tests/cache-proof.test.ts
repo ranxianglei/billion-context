@@ -43,7 +43,15 @@
 //            chat wire): the re-sent body carries the continuation nudge
 //            MERGED into the last user turn (appendTrailingUserText contract:
 //            back-to-back user turns break provider replay grouping) — zero
-//            byte churn anywhere else, even when the proxy re-requests itself.
+//            byte churn anywhere else, even when the proxy re-requests itself;
+//   HOSTCOMPACT (decimation, chat wire, #2596 proxy-mode twin): the CLIENT
+//            replaces its ENTIRE history with a compacted view while folds
+//            are ACTIVE. Cache-safe contract: head/tail stable; the wire
+//            carries exactly the compacted core (shrunk); the destroyed
+//            folds' summary carriers must NOT linger (no orphan flapping);
+//            every later growth turn is append-stable from the compacted
+//            base; and the pipeline re-arms — a fresh fold eventually lands
+//            as a clean FOLD transition (self-heal, not a silent replay).
 //
 // Carrier contract (increment A): volatility is DECLARED per carrier and
 // located structurally instead of positionally (no "last N elements may
@@ -84,6 +92,8 @@ import { once } from "node:events";
 import { defaultConfig } from "acp-kernel";
 import { startServer } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
+import { getSession } from "../src/session.ts";
+import { conflictEventsOf } from "../src/conflict-watch.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { DEGENERATE_RETRY_NUDGE } from "../src/degenerate-retry.ts";
@@ -103,6 +113,14 @@ const NOTE_MARKERS: string[] = [
     "If you compress, fold the ranges you keep in ONE call",
     "Only use IDs from visible messages above",
     "[TIER ",
+    // #5555 CI triage: the compact ref-refresh line (kernel emitCompress
+    // statusLine, appended as a dedicated trailing user element on every
+    // wire) is the same volatile-trailer design as the banner above; without
+    // declaring it, any phase where TWO consecutive requests each carry its
+    // own refresh line breaks positional alignment on the growth pair
+    // between them (observed once prompt byte counts shifted the nudge one
+    // turn earlier).
+    "[ACP status:",
 ];
 const THRESHOLD = 64 * 1024; // high enough that no fold can fire before MIN_FOLD_T
 const MODEL_A = "gpt-proof-a";
@@ -216,6 +234,32 @@ const sha16 = (b: string): string => createHash("sha256").update(b, "utf8").dige
 const elText = (buf: Buffer, L: Layout, i: number): string => {
     const [s, e] = L.elems[i]!;
     return buf.subarray(s, e).toString("utf8");
+};
+
+// Text blocks of a message element, normalized across the four wires'
+// shapes (chat/anthropic content string or content blocks, google parts,
+// responses message items). Carriers ride as dedicated blocks on chat but
+// are APPENDED to the anchor message's content array on anthropic/google,
+// so carrier identity is compared at BLOCK granularity: exact block-text
+// equality, no fuzzy matching, no anchor-prefix sensitivity.
+const elBlocks = (buf: Buffer, L: Layout, i: number): string[] => {
+    let el: unknown;
+    try { el = JSON.parse(elText(buf, L, i)); } catch { return [elText(buf, L, i)]; }
+    if (el === null || typeof el !== "object") return [elText(buf, L, i)];
+    const e = el as Record<string, unknown>;
+    const blockText = (b: unknown): string => (b !== null && typeof b === "object" && typeof (b as Record<string, unknown>).text === "string" ? (b as Record<string, unknown>).text as string : "");
+    if (Array.isArray(e.parts)) return e.parts.map(blockText);
+    if (typeof e.content === "string") return [e.content];
+    if (Array.isArray(e.content)) return e.content.map(blockText);
+    if (typeof e.text === "string") return [e.text];
+    return [elText(buf, L, i)];
+};
+const bodyBlocks = (i: number, bodies: string[], field: string): string[] => {
+    const B = Buffer.from(bodies[i]!, "utf8");
+    const L = layoutOf(B, field);
+    const out: string[] = [];
+    for (let j = 0; j < L.elems.length; j++) out.push(...elBlocks(B, L, j));
+    return out;
 };
 
 function leadingEqual(prev: Buffer, cur: Buffer, P: Layout, C: Layout): number {
@@ -979,6 +1023,12 @@ function runProof(wire: Wire, bodies: string[], urls: string[], ev: ProofEvents)
 }
 
 
+// #3400: pin legacy wire economics - the default-on acp_read_original_image tool
+// adds ~200 tokens per request, shifting this scenario's nudge timing so the
+// fold/rearm arithmetic moves by design. Fidelity here is compaction behavior,
+// not egress policy (tests/issue3400-image-rescale.test.ts covers that).
+process.env.BILI_IMAGE_RESCALE = "0";
+
 test("cache proof (openai chat wire): byte-stable growth, failure paths, param drift, folds", { timeout: 120_000 }, async () => {
     const { bodies, urls, ev } = await driveProof("chat", "proof-chat", 200_000);
     assert.ok(ev.retry.length === 1, "transport-retry scenario must have produced a resend pair");
@@ -1065,4 +1115,507 @@ test("cache proof (degenerate refetch, chat wire): re-request is a pure tail app
         else process.env.XDG_STATE_HOME = prevXdg;
         rmrf(tmp);
     }
+});
+
+/** HOSTCOMPACT (decimation, chat wire — #2596 proxy-mode twin): a plain
+ *  client (no plugin headers) replaces its ENTIRE history with a compacted
+ *  view while folds are active. Byte-level contract:
+ *    - decimation turn: head/tail bytes stable, core carries exactly the
+ *      compacted view (shrunk), and NONE of the destroyed folds' summary
+ *      carriers linger on the wire (an orphan carrier would flap the prefix
+ *      cache on every later turn — the #2596 complaint, proxy-mode shape);
+ *    - every post-decimation growth turn is a clean GROWTH pair (append-
+ *      stable from the compacted base — the cache recovers);
+ *    - the pipeline re-arms: once the compacted history regrows past the
+ *      threshold, a fresh fold lands as a clean FOLD-A/FOLD-B transition
+ *      (self-heal, not a silent full replay). */
+async function driveHostCompact(wire: Wire, ctx: number): Promise<void> {
+    const sessionId = `proof-decim-${wire}`;
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), `proof-decim-${wire}-`));
+    const prevXdg = process.env.XDG_STATE_HOME;
+    process.env.XDG_STATE_HOME = tmp;
+    delete process.env.ACP_DUMP_BODY;
+    const bodies: string[] = [];
+    const state: JudgeState = { wire, bodies, urls: [], turn: 0, destroyOnNext: false, tagOnlyNext: false, suppressTrigger: false };
+    // minTurns=8 (not MIN_FOLD_T=11): this scenario has no scripted pre-fold
+    // events to protect, and the regrowth phase needs the seed folds to land
+    // early enough that decimation provably destroys ACTIVE folds.
+    const trigger = makeProofTrigger(THRESHOLD, 8);
+    const HOST_COMPACT = "HOST-COMPACTION: earlier work covered modules 0-9; harness built, folds landed.";
+    let upstream: http.Server | undefined;
+    let proxy: http.Server | undefined;
+    try {
+        upstream = startJudgeUpstream(state, trigger);
+        upstream.listen(0, "127.0.0.1");
+        await listen(upstream);
+        const upstreamPort = (upstream.address() as { port: number }).port;
+        _setStoreForTest(new SessionStore({ enabled: false }));
+        setRegistryForTest({});
+        // Not proofProxyOptions: this scenario needs the aggressive nudge
+        // cadence (nudgeGrowthTokens 500, as the plugin suite drives) so the
+        // decimated body regains enough refs fast for the trigger's
+        // refs>=12 gate — the re-arm must happen within the scripted turns.
+        proxy = await startServer({
+            ...proofProxyOptions(upstreamPort, ctx, true),
+            compress: { injectTool: true, injectNudge: true, nudgeGrowthTokens: 500 },
+        });
+        await listen(proxy);
+        const proxyPort = (proxy.address() as { port: number }).port;
+        const url = wire === "responses" ? `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/responses`
+            : wire === "anthropic" ? `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`
+            : wire === "google" ? `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1beta/models/${MODEL_A}:streamGenerateContent?alt=sse`
+            : `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/chat/completions`;
+        const hist: Item[] = [];
+        const pushUser = (text: string): void => {
+            if (wire === "responses") hist.push({ type: "message", role: "user", content: text });
+            else if (wire === "google") hist.push({ role: "user", parts: [{ text }] });
+            else hist.push({ role: "user", content: text });
+        };
+        const pushAssistant = (t: number, text: string): void => {
+            if (wire === "responses") hist.push({ type: "message", id: `msg_a${t}`, role: "assistant", content: text });
+            else if (wire === "google") hist.push({ role: "model", parts: [{ text }] });
+            else hist.push({ role: "assistant", content: text });
+        };
+        const makePayload = (): Item =>
+            wire === "responses" ? { model: MODEL_A, stream: true, instructions: "You are a test assistant.", input: [...hist] }
+            : wire === "anthropic" ? { model: MODEL_A, max_tokens: 1024, stream: true, system: "You are a test assistant.", messages: [...hist] }
+            : wire === "google" ? { contents: [...hist], systemInstruction: { parts: [{ text: "you are a test assistant" }] }, generationConfig: { maxOutputTokens: 4096 } }
+            : { model: MODEL_A, stream: true, messages: [...hist] };
+        const send = async (t: number, suppress: boolean): Promise<void> => {
+            state.turn = t;
+            state.suppressTrigger = suppress;
+            const res = await fetch(url, { method: "POST", headers: { "content-type": "application/json", "x-acp-session": sessionId }, body: JSON.stringify(makePayload()) });
+            if (!res.ok) throw new Error(`${wire} decim turn ${t}: HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`);
+            const reply = extractReply(wire, await res.text());
+            if (reply) pushAssistant(t, reply);
+            state.suppressTrigger = false;
+        };
+        // 1) seed: 12 fat turns — at least one proxy-side fold lands
+        if (wire === "chat") hist.push({ role: "system", content: "You are a coding agent operating in a sandbox." });
+        for (let t = 0; t < 12; t++) {
+            pushUser(`Turn ${t}: please analyze module ${t}. ` + FILLER(t, 6));
+            await send(t, false);
+        }
+        assert.ok(trigger.calls() >= 1, `${wire}: seed must land >=1 fold (got ${trigger.calls()})`);
+        const seedFolds = trigger.calls();
+        // 2) decimate: [system?, compacted head, retained tail] — fatter
+        // compacted base (≈34KB) so the regrowth phase crosses the 64KB
+        // trigger threshold deterministically within the scripted turns
+        const retainedUser = `Turn 10 recap: please analyze module 10. ` + FILLER(10, 8);
+        // Unique retained bytes (NOT a byte-identical seed reply): a real
+        // host compaction rewrites its retained tail as a fresh summary, so
+        // no fold anchor can re-match it. This is what keeps the post-
+        // decimation wire strictly append-stable: stale blocks find no
+        // anchor, go through destroy escalation, and never render carriers.
+        // (Byte-identical retention re-anchors blocks onto the survivor and
+        // produces a few turns of bounded carrier healing — observed during
+        // development, noted in the PR body, deliberately not pinned here.)
+        const retainedAssistant = "Retained tail: final analysis of module 11 delivered, integration green. " + FILLER(11, 8);
+        hist.length = 0;
+        if (wire === "chat") hist.push({ role: "system", content: "You are a coding agent operating in a sandbox." });
+        pushUser(HOST_COMPACT + " " + FILLER(90, 8));
+        pushUser(retainedUser);
+        pushAssistant(11, retainedAssistant);
+        await send(12, true);
+        const decimIdx = bodies.findIndex((b) => b.includes("HOST-COMPACTION"));
+        assert.ok(decimIdx > 0, `${wire}: decimation body captured`);
+        // 3) regrow: enough turns to deterministically cross the threshold
+        //    and let the fresh fold's round-2 settle (FOLD-B needs a body
+        //    AFTER the round-2)
+        for (let t = 13; t < 22; t++) {
+            pushUser(`Turn ${t}: please analyze module ${t}. ` + FILLER(t, 6));
+            await send(t, false);
+        }
+        if (process.env.PROOF_DUMP) {
+            const dir = path.join(process.env.PROOF_DUMP, `decim-${wire}`);
+            fs.mkdirSync(dir, { recursive: true });
+            bodies.forEach((b, idx) => fs.writeFileSync(path.join(dir, `${String(idx).padStart(3, "0")}.json`), b));
+        }
+        assert.ok(trigger.calls() > seedFolds, `${wire}: pipeline must re-arm after decimation (folds ${seedFolds} -> ${trigger.calls()})`);
+
+        // ---- classify every pair ----
+        const lines: string[] = [];
+        const field = FIELD[wire];
+        const r2All = bodies.map((_, i) => i).filter((i) => isRound2Body(wire, JSON.parse(bodies[i]!) as Item));
+        const r2s = new Set(r2All);
+        const prev = bodies[decimIdx - 1]!;
+        const cur = bodies[decimIdx]!;
+        const PB = Buffer.from(prev, "utf8");
+        const CB = Buffer.from(cur, "utf8");
+        const P = layoutOf(PB, field);
+        const C = layoutOf(CB, field);
+        assert.ok(headEq(PB, CB, P, C), `${wire} pair#${decimIdx}->#${decimIdx + 1}: head bytes mutated across host compaction`);
+        assert.ok(tailEq(PB, CB, P, C), `${wire} pair#${decimIdx}->#${decimIdx + 1}: post-array suffix mutated across host compaction`);
+        assert.ok(coreLen(CB, C) < coreLen(PB, P), `${wire} pair#${decimIdx}->#${decimIdx + 1}: decimated core must SHRINK (got ${coreLen(PB, P)} -> ${coreLen(CB, C)})`);
+        assert.ok(!cur.includes("Cache-proof fold summary"), `${wire} pair#${decimIdx}->#${decimIdx + 1}: destroyed folds' summary carriers lingered on the wire (orphan flapping, #2596)`);
+        assert.ok(cur.includes(HOST_COMPACT) && cur.includes("Turn 10 recap"), `${wire} pair#${decimIdx}->#${decimIdx + 1}: compacted view must be forwarded`);
+        assert.ok(!cur.includes("acp_loop_"), `${wire} pair#${decimIdx}->#${decimIdx + 1}: acp_loop_ artifact leaked`);
+        lines.push(`proof[${wire}] pair#${decimIdx}->#${decimIdx + 1} HOSTCOMPACT ok core=${coreLen(PB, P)}->${coreLen(CB, C)} carriers-dropped lcp=${lcpBytes(PB, CB)}/${CB.length} sha=${sha16(cur)}`);
+        // #2695 bounded healing window: an unannounced host compaction
+        // orphans fold blocks whose carriers may keep riding the wire until
+        // the zombie-reap streak (3 majority-absent passes) removes them.
+        // A zombie carrier is DEFINED here as a summary element whose exact
+        // text already appeared pre-decimation (the destroyed seed folds'
+        // carriers); the window closes at the LAST body still carrying one.
+        // After that: strictly append-stable growth, clean fold transitions,
+        // and the zombie never returns. Without the reap the zombie rides
+        // every later fold round-2 — the bound below is the regression pin.
+        const seedCarrierTexts = new Set<string>();
+        for (let i = 0; i < decimIdx; i++) {
+            for (const t of bodyBlocks(i, bodies, field)) {
+                if (t.includes(SUMMARY_MARKER)) seedCarrierTexts.add(t);
+            }
+        }
+        const bodyHasZombie = (i: number): boolean => bodyBlocks(i, bodies, field).some((t) => seedCarrierTexts.has(t));
+        const bodyHasCarrierText = (i: number, text: string): boolean => bodyBlocks(i, bodies, field).includes(text);
+        // Kernel root-fix regression pin (#2695): the flap signature was a
+        // zombie carrier toggling in/out across turns — new cluster
+        // extensions kept re-occupying the dead block's covered ids and
+        // resurrecting it every other pass. With remint dodging inactive
+        // blocks, carrier visibility after decimation is MONOTONE: once a
+        // seed carrier drops off the wire it never comes back.
+        for (const t of seedCarrierTexts) {
+            let seen = false;
+            let dropped = false;
+            for (let i = decimIdx + 1; i < bodies.length; i++) {
+                if (bodyHasCarrierText(i, t)) {
+                    assert.ok(
+                        !dropped,
+                        `${wire}: seed carrier toggled back on body #${i} after dropping — zombie flap (kernel root-fix, #2695)`,
+                    );
+                    seen = true;
+                } else if (seen) {
+                    dropped = true;
+                }
+            }
+        }
+        let lastDirty = -1;
+        for (let i = decimIdx; i < bodies.length; i++) {
+            if (i === decimIdx) continue; // decim body is clean by the pair assert above
+            if (bodyHasZombie(i)) lastDirty = i;
+        }
+        assert.ok(lastDirty > decimIdx, `${wire}: scenario drifted: expected zombie carriers to ride at least one post-decimation body`);
+        const ZOMBIE_SETTLE_BOUND = 9; // bodies after decimIdx; measured with the reap active
+        assert.ok(lastDirty - decimIdx <= ZOMBIE_SETTLE_BOUND, `${wire}: zombie flap not bounded: zombie carrier last seen on body #${lastDirty}, ${lastDirty - decimIdx} bodies after decimation #${decimIdx} (bound ${ZOMBIE_SETTLE_BOUND}, #2695)`);
+
+        let postFold = false;
+        for (let i = 1; i < bodies.length; i++) {
+            if (i === decimIdx) continue;
+            // The window extends ONE body past the last zombie sighting: the
+            // pair that DROPS the final zombie carrier is (lastDirty,
+            // lastDirty+1) and is classified at i = lastDirty+1 — the deletion
+            // itself is the bounded healing, not a divergence.
+            const inWindow = i > decimIdx && i <= lastDirty + 1;
+            if (inWindow) {
+                if (r2s.has(i)) {
+                    // Settling fold: the rearm round-2 may still carry zombie
+                    // carriers from the destroyed seed folds (the reap lands
+                    // after this body is forwarded). The rearm fold itself
+                    // must still work: carrier present, core shrunk, and no
+                    // NEW zombie spawned beyond what round-1 already had.
+                    const PB = Buffer.from(bodies[i - 1]!, "utf8");
+                    const RB = Buffer.from(bodies[i]!, "utf8");
+                    const P = layoutOf(PB, field);
+                    const R = layoutOf(RB, field);
+                    assert.ok(firstSummaryEl(RB, R) >= 0, `${wire} fold@req#${i}: rearm round-2 lacks its summary carrier (no self-heal)`);
+                    assert.ok(countSummaryEls(RB, R) <= countSummaryEls(PB, P) + 1, `${wire} fold@req#${i}: settling round-2 spawned a NEW zombie carrier (#2695)`);
+                    assert.ok(coreLen(RB, R) < coreLen(PB, P), `${wire} fold@req#${i}: rearm round-2 must shrink the core`);
+                    lines.push(`proof[${wire}] pair#${i - 1}->#${i} SETTLING-FOLD ok summaries=${countSummaryEls(PB, P)}->${countSummaryEls(RB, R)} (zombie ride bounded, #2695)`);
+                    postFold = true;
+                } else {
+                    lines.push(`proof[${wire}] pair#${i}->#${i + 1} SETTLING (bounded zombie churn, #2695)`);
+                }
+                continue;
+            }
+            if (r2s.has(i)) {
+                checkFoldPre(wire, bodies, field, i, lines);
+                if (i + 1 < bodies.length && i + 1 !== decimIdx) checkFoldNext(wire, bodies, field, i, lines);
+                if (i > decimIdx) postFold = true;
+            } else if (r2s.has(i - 1)) {
+                continue; // classified by checkFoldNext above
+            } else {
+                checkGrowth(wire, bodies, field, i, lines);
+            }
+        }
+        assert.ok(postFold, `${wire}: post-decimation fold must occur (self-heal)`);
+
+        // Direct teeth on the fix (#2695): the reap must have fired, archived
+        // the orphaned block, and KEPT its content for derived decompress.
+        const session = getSession(sessionId);
+        const reaps = conflictEventsOf(session).filter((e) => e.kind === "orphan-reap");
+        assert.ok(reaps.length > 0, `${wire}: orphan-reap conflict event recorded (#2695)`);
+        const reapedIds = reaps.flatMap((e) => e.detail.match(/\[([^\]]+)\]/)?.[1]?.split(", ") ?? []);
+        assert.ok(reapedIds.length > 0, `${wire}: orphan-reap detail names the reaped blocks (got: ${reaps[0]?.detail})`);
+        for (const id of reapedIds) {
+            assert.ok(session.blockContents.has(id), `${wire}: reaped block ${id} content retained for decompress (#395 semantics)`);
+            const coverage = session.metadata.foldCoverageByBlock as Record<string, unknown> | undefined;
+            assert.ok(!coverage || coverage[id] === undefined, `${wire}: reaped block ${id} stripped from foldCoverageByBlock`);
+        }
+        lines.push(`proof[${wire}] REAP ok blocks=${reapedIds.join(",")} content-retained coverage-stripped`);
+        for (const l of lines) console.log(l);
+        console.log(`proof[${wire}-decim] VERDICT bodies=${bodies.length} decimIdx=${decimIdx} folds=${trigger.calls()} unexplainedDivergences=0`);
+    } finally {
+        await closeServer(proxy);
+        await closeServer(upstream);
+        if (prevXdg === undefined) delete process.env.XDG_STATE_HOME;
+        else process.env.XDG_STATE_HOME = prevXdg;
+        rmrf(tmp);
+    }
+}
+
+test("cache proof (host compaction, chat wire): decimated replay drops orphan carriers and re-arms cleanly", { timeout: 180_000 }, async () => {
+    await driveHostCompact("chat", 200_000);
+});
+
+test("cache proof (host compaction, anthropic wire): decimated replay drops orphan carriers and re-arms cleanly", { timeout: 180_000 }, async () => {
+    await driveHostCompact("anthropic", 400_000);
+});
+
+test("cache proof (host compaction, responses wire): decimated replay drops orphan carriers and re-arms cleanly", { timeout: 180_000 }, async () => {
+    await driveHostCompact("responses", 200_000);
+});
+
+test("cache proof (host compaction, google wire): decimated replay drops orphan carriers and re-arms cleanly", { timeout: 180_000 }, async () => {
+    await driveHostCompact("google", 1_000_000);
+});
+
+/** RE-FOLD (chain generation, #2733/#2741): the corpus gap this file had —
+ *  every scripted fold was FORWARD (citing the current view's oldest
+ *  UNCOVERED refs), so no test ever exercised a fold whose range swallows
+ *  PRIOR coverage: the chain re-fold, production's dominant long-session
+ *  geometry (session 01a1210e folds rooted at the pinned m00001; #2733
+ *  89.6K-line log). Byte-level contract for the generation boundary:
+ *    - PIN: the pinned first user message keeps its history slot across the
+ *      re-fold — pre-#2755 the merged summary anchored on the lineage's
+ *      earliest effective id (= the pin), splicing AHEAD of it and
+ *      collapsing the provider prefix cache to the constant head on every
+ *      fold (the per-fold double penalty behind #2741's numbers);
+ *    - CONSUMED-CARRIER DROP: the swallowed generation's carrier must not
+ *      render beside its successor (loop-path stale copies, #2755
+ *      knownSummaryIds) — carrier count is net-zero across the boundary;
+ *    - REFOLD-A: bytes before the old carrier's slot stay stable (the
+ *      divergence starts at the replaced carrier, never earlier);
+ *    - REFOLD-B: the next steady turn shares bytes through the new carrier
+ *      (no follow-up penalty), then plain GROWTH resumes. */
+async function driveRefoldChain(wire: Wire, ctx: number): Promise<void> {
+    const sessionId = `proof-refold-${wire}`;
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), `proof-refold-${wire}-`));
+    const prevXdg = process.env.XDG_STATE_HOME;
+    process.env.XDG_STATE_HOME = tmp;
+    delete process.env.ACP_DUMP_BODY;
+    const bodies: string[] = [];
+    const state: JudgeState = { wire, bodies, urls: [], turn: 0, destroyOnNext: false, tagOnlyNext: false, suppressTrigger: false };
+    // Gen-1 lands during the seed (minTurns 8); gen-2 is the ROOTED chain
+    // re-fold — it cites the session's FIRST EVER ref (captured before any
+    // fold hides it), exactly like a model citing m00001 late in a session.
+    let firstRef: string | undefined;
+    let refolds = 0;
+    const trigger = makeProofTrigger(THRESHOLD, 8);
+    const baseShould = trigger.should;
+    const baseArgs = trigger.args;
+    trigger.should = (body: string, turn: number): boolean => {
+        if (firstRef === undefined) {
+            // NOT parseRefIds(body)[0] — that first tag is the tool-doc EXAMPLE
+            // ref (constant across bodies); anchor on the pin message itself.
+            const pin = /<(?:acp|dcp-message-id)[^>]*>\s*(m\d+)\s*<\/(?:acp|dcp-message-id)>\s*[^<]{0,64}?Turn 0: please analyze module 0/.exec(body);
+            if (pin) firstRef = pin[1];
+        }
+        return baseShould(body, turn);
+    };
+    trigger.args = (refs: string[]): string => {
+        if (trigger.calls() <= 1) return baseArgs(refs);
+        refolds++;
+        const end = refs[refs.length - 6]!;
+        return JSON.stringify({
+            content: [{
+                startId: firstRef!,
+                endId: end,
+                topic: "proof refold",
+                summary: `Rooted re-fold summary covering ${firstRef}..${end}: chain generation swallows prior coverage, modules revisited, builds re-verified.`,
+            }],
+        });
+    };
+    const GEN1_TEXT = "Cache-proof fold summary";
+    const GEN2_TEXT = "Rooted re-fold summary";
+    let upstream: http.Server | undefined;
+    let proxy: http.Server | undefined;
+    try {
+        upstream = startJudgeUpstream(state, trigger);
+        upstream.listen(0, "127.0.0.1");
+        await listen(upstream);
+        const upstreamPort = (upstream.address() as { port: number }).port;
+        _setStoreForTest(new SessionStore({ enabled: false }));
+        setRegistryForTest({});
+        proxy = await startServer({
+            ...proofProxyOptions(upstreamPort, ctx, true),
+            compress: { injectTool: true, injectNudge: true, nudgeGrowthTokens: 500 },
+        });
+        await listen(proxy);
+        const proxyPort = (proxy.address() as { port: number }).port;
+        const url = wire === "responses" ? `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/responses`
+            : wire === "anthropic" ? `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`
+            : wire === "google" ? `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1beta/models/${MODEL_A}:streamGenerateContent?alt=sse`
+            : `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/chat/completions`;
+        const hist: Item[] = [];
+        const pushUser = (text: string): void => {
+            if (wire === "responses") hist.push({ type: "message", role: "user", content: text });
+            else if (wire === "google") hist.push({ role: "user", parts: [{ text }] });
+            else hist.push({ role: "user", content: text });
+        };
+        const pushAssistant = (t: number, text: string): void => {
+            if (wire === "responses") hist.push({ type: "message", id: `msg_a${t}`, role: "assistant", content: text });
+            else if (wire === "google") hist.push({ role: "model", parts: [{ text }] });
+            else hist.push({ role: "assistant", content: text });
+        };
+        const makePayload = (): Item =>
+            wire === "responses" ? { model: MODEL_A, stream: true, instructions: "You are a test assistant.", input: [...hist] }
+            : wire === "anthropic" ? { model: MODEL_A, max_tokens: 1024, stream: true, system: "You are a test assistant.", messages: [...hist] }
+            : wire === "google" ? { contents: [...hist], systemInstruction: { parts: [{ text: "you are a test assistant" }] }, generationConfig: { maxOutputTokens: 4096 } }
+            : { model: MODEL_A, stream: true, messages: [...hist] };
+        const send = async (t: number): Promise<void> => {
+            state.turn = t;
+            const res = await fetch(url, { method: "POST", headers: { "content-type": "application/json", "x-acp-session": sessionId }, body: JSON.stringify(makePayload()) });
+            if (!res.ok) throw new Error(`${wire} refold turn ${t}: HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`);
+            const reply = extractReply(wire, await res.text());
+            if (reply) pushAssistant(t, reply);
+        };
+        // 1) seed: 12 fat turns — generation-1 forward fold lands
+        if (wire === "chat") hist.push({ role: "system", content: "You are a coding agent operating in a sandbox." });
+        for (let t = 0; t < 12; t++) {
+            pushUser(`Turn ${t}: please analyze module ${t}. ` + FILLER(t, 6));
+            await send(t);
+        }
+        assert.ok(trigger.calls() >= 1, `${wire}: generation-1 fold must land during seed (got ${trigger.calls()})`);
+        assert.ok(firstRef !== undefined, `${wire}: first-ever ref must be captured pre-fold`);
+        // 2) regrow past the threshold — the next firing cites firstRef: the
+        //    ROOTED chain re-fold (production geometry, #2733)
+        let stopT = 11;
+        for (let t = 12; t < 24 && refolds === 0; t++) {
+            pushUser(`Turn ${t}: please analyze module ${t}. ` + FILLER(t, 6));
+            await send(t);
+            stopT = t;
+        }
+        assert.ok(refolds >= 1, `${wire}: rooted chain re-fold must fire (got ${refolds})`);
+        // 3) steady follow-ups — FOLD-B needs a body AFTER the re-fold round-2
+        for (let t = stopT + 1; t <= stopT + 3; t++) {
+            pushUser(`Turn ${t}: please analyze module ${t}. ` + FILLER(t, 6));
+            await send(t);
+        }
+        if (process.env.PROOF_DUMP) {
+            const dir = path.join(process.env.PROOF_DUMP, `refold-${wire}`);
+            fs.mkdirSync(dir, { recursive: true });
+            bodies.forEach((b, idx) => fs.writeFileSync(path.join(dir, `${String(idx).padStart(3, "0")}.json`), b));
+        }
+
+        // ---- classify the generation boundary ----
+        const lines: string[] = [];
+        const field = FIELD[wire];
+        const r2All = bodies.map((_, i) => i).filter((i) => isRound2Body(wire, JSON.parse(bodies[i]!) as Item));
+        const r2s = new Set(r2All);
+        // The deterministic byte-threshold trigger may fit MORE THAN ONE
+        // re-fold cycle into the scripted window when injected prompt length
+        // shifts body sizes (#2750 wording change added ~500B/body); classify
+        // every rooted re-fold, not just the first.
+        const refoldIdxs = r2All.filter((i) => bodies[i]!.includes(GEN2_TEXT));
+        const refoldSet = new Set(refoldIdxs);
+        const lastRefold = refoldIdxs[refoldIdxs.length - 1]!;
+        assert.ok(refoldIdxs.length >= 1, `${wire}: rooted re-fold round-2 body not found`);
+        for (const refoldIdx of refoldIdxs) {
+            assert.ok(!bodies[refoldIdx]!.includes("Compression FAILED"), `${wire} refold@req#${refoldIdx}: rooted compress failed to resolve`);
+        }
+        const pinIdx = wire === "anthropic" || wire === "google" ? 0 : 1; // chat keeps system at [0]; responses embeds the developer message as input[0]; anthropic/google hoist it out of the array
+        const pinTextOf = (i: number): string => {
+            const B = Buffer.from(bodies[i]!, "utf8");
+            const L = layoutOf(B, field);
+            assert.ok(L.elems.length > pinIdx, `${wire} body#${i}: no pin element`);
+            return elText(B, L, pinIdx);
+        };
+        // PIN (#2733): the pinned first user message keeps its slot across the
+        // re-fold — pre-#2755 the merged summary spliced AHEAD of it (chat:
+        // separate element before the pin; anthropic/google: carrier text part
+        // merged INTO the pin's content array, ahead of the pin part).
+        const pinMarker = "Turn 0: please analyze module 0";
+        for (let i = refoldIdxs[0]! - 1; i < bodies.length; i++) {
+            assert.ok(
+                pinTextOf(i).includes(pinMarker),
+                `${wire} body#${i}: pinned first user message lost its history slot across the re-fold — summary preceded the pin (per-fold prefix collapse, #2733/#2755)`,
+            );
+            const raw = bodies[i]!;
+            const pinAt = raw.indexOf(pinMarker);
+            const sumAt = raw.indexOf(SUMMARY_MARKER);
+            assert.ok(
+                sumAt === -1 || pinAt < sumAt,
+                `${wire} body#${i}: summary bytes precede the pinned first user message (carrier merged into the pin's slot ahead of it, #2733/#2755)`,
+            );
+        }
+        // CONSUMED-CARRIER DROP + REFOLD-A: net-zero carrier count; bytes
+        // before the replaced carrier stable; core shrinks. Runs for EVERY
+        // rooted re-fold cycle.
+        for (const refoldIdx of refoldIdxs) {
+            const pre = bodies[refoldIdx - 1]!;
+            const r2 = bodies[refoldIdx]!;
+            const PB = Buffer.from(pre, "utf8");
+            const RB = Buffer.from(r2, "utf8");
+            const P = layoutOf(PB, field);
+            const R = layoutOf(RB, field);
+            assert.ok(headEq(PB, RB, P, R), `${wire} refold@req#${refoldIdx}: re-fold mutated the head`);
+            assert.equal(countSummaryEls(RB, R), countSummaryEls(PB, P), `${wire} refold@req#${refoldIdx}: consumed generation's carrier must not render beside its successor (net-zero carrier count, #2755 knownSummaryIds)`);
+            assert.ok(r2.includes(GEN2_TEXT), `${wire} refold@req#${refoldIdx}: successor carrier missing`);
+            assert.ok(!r2.includes(GEN1_TEXT), `${wire} refold@req#${refoldIdx}: swallowed generation-1 carrier leaked beside the successor (stale loop copy, #2733)`);
+            const k = leadingEqual(PB, RB, P, R);
+            const f = firstSummaryEl(RB, R);
+            assert.ok(k >= f, `${wire} refold@req#${refoldIdx}: re-fold mutated pre-carrier element[${k}] (anchor=[${f}]) — upstream cache match collapses before the carrier (REFOLD-A, #2741)`);
+            assert.ok(coreLen(RB, R) < coreLen(PB, P), `${wire} refold@req#${refoldIdx}: re-fold core must shrink`);
+            lines.push(`proof[${wire}] pair#${refoldIdx - 1}->#${refoldIdx} REFOLD-A ok pin-stable carriers=${countSummaryEls(PB, P)}->${countSummaryEls(RB, R)}(net-zero) lcp=${lcpBytes(PB, RB)}/${RB.length} sha=${sha16(r2)}`);
+            // REFOLD-B: the next steady turn shares bytes THROUGH the successor
+            // carrier (the #2741 follow-up penalty), then plain GROWTH resumes.
+            // Skipped when the next body is itself a re-fold — that pair is
+            // covered by the next cycle's REFOLD-A.
+            if (refoldIdx + 1 < bodies.length && !refoldSet.has(refoldIdx + 1)) {
+                const next = bodies[refoldIdx + 1]!;
+                const NB = Buffer.from(next, "utf8");
+                const N = layoutOf(NB, field);
+                const last = lastSummaryEl(RB, R);
+                const kb = leadingEqual(RB, NB, R, N);
+                assert.ok(kb > last, `${wire} refold@req#${refoldIdx}: follow-up diverges at element[${kb}] BEFORE the successor carrier [${last}] — follow-up prefix penalty (REFOLD-B, #2741)`);
+                assert.equal(countSummaryEls(NB, N), countSummaryEls(RB, R), `${wire} refold@req#${refoldIdx}: follow-up lost or gained a carrier`);
+                lines.push(`proof[${wire}] pair#${refoldIdx}->#${refoldIdx + 1} REFOLD-B ok stable-through-carrier(anchor=[${last}]) sha=${sha16(next)}`);
+            }
+        }
+        for (let i = 1; i < bodies.length; i++) {
+            if (refoldSet.has(i) || refoldSet.has(i - 1)) continue;
+            if (r2s.has(i)) {
+                if (i + 1 < bodies.length) checkFoldNext(wire, bodies, field, i, lines);
+                else checkFoldPre(wire, bodies, field, i, lines);
+            } else if (r2s.has(i - 1)) {
+                continue;
+            } else if (i > lastRefold + 1) {
+                checkGrowth(wire, bodies, field, i, lines);
+            }
+        }
+        for (const l of lines) console.log(l);
+        console.log(`proof[${wire}-refold] VERDICT bodies=${bodies.length} refolds=@${refoldIdxs.join(",")} folds=${trigger.calls()} refolds=${refolds} unexplainedDivergences=0`);
+    } finally {
+        await closeServer(proxy);
+        await closeServer(upstream);
+        if (prevXdg === undefined) delete process.env.XDG_STATE_HOME;
+        else process.env.XDG_STATE_HOME = prevXdg;
+        rmrf(tmp);
+    }
+}
+
+test("cache proof (re-fold generation, chat wire): chain re-fold rooted at the pin keeps the head stable", { timeout: 180_000 }, async () => {
+    await driveRefoldChain("chat", 200_000);
+});
+
+test("cache proof (re-fold generation, anthropic wire): chain re-fold rooted at the pin keeps the head stable", { timeout: 180_000 }, async () => {
+    await driveRefoldChain("anthropic", 400_000);
+});
+
+test("cache proof (re-fold generation, responses wire): chain re-fold rooted at the pin keeps the head stable", { timeout: 180_000 }, async () => {
+    await driveRefoldChain("responses", 200_000);
+});
+
+test("cache proof (re-fold generation, google wire): chain re-fold rooted at the pin keeps the head stable", { timeout: 180_000 }, async () => {
+    await driveRefoldChain("google", 1_000_000);
 });

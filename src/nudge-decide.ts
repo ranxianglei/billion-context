@@ -183,6 +183,39 @@ export function consumeFallback(metadata: Record<string, unknown>): void {
     metadata[LADDER_KEY] = 0;
 }
 
+/** #3004: reasoning-family fields a host stamps on its MAIN request and that
+ *  the decision side call must NOT inherit. The side call rides `{...parsed}`,
+ *  so a host-side reasoning knob (dsh's cordis patch sets
+ *  `reasoningEffort: max` on its default model) reaches the side call verbatim
+ *  — with the tiny output budget (default 200) any reasoning mass burns the
+ *  whole budget before the one-line JSON answer exists: the upstream answers
+ *  with an empty message.content, parseDecision reads "", and the round dies
+ *  as an "empty response" hard failure feeding the ladder for reasons the
+ *  link never had. The decision wants a plain short text answer, so every
+ *  lane strips its own reasoning knobs here; the main request is untouched. */
+export function stripDecisionReasoningFields(
+    protocol: "anthropic" | "openai" | "google" | "responses",
+    body: Record<string, unknown>,
+): void {
+    if (protocol === "openai") {
+        delete body["reasoning_effort"];
+        delete body["reasoning"];
+        delete body["thinking"];
+    } else if (protocol === "anthropic") {
+        delete body["thinking"];
+        delete body["interleaved_thinking"];
+    } else if (protocol === "google") {
+        // thinkingConfig rides nested under generationConfig on the Gemini
+        // wire; the spread above copies generationConfig wholesale, so strip
+        // both the (rare) top-level position and the nested one.
+        delete body["thinkingConfig"];
+        const gc = body["generationConfig"];
+        if (gc !== null && typeof gc === "object") delete (gc as Record<string, unknown>)["thinkingConfig"];
+    } else {
+        delete body["reasoning"];
+    }
+}
+
 /** Pull the model's answer text out of a NON-streaming completion body,
  *  proto-agnostically. Returns "" when no text part exists (tool-call-only or
  *  empty response \u2014 the caller treats that as a failed parse). */

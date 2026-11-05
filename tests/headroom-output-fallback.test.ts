@@ -136,8 +136,10 @@ async function turn2MessageCount(s: Scenario): Promise<number> {
         return (received[1] as unknown[]).length;
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 }

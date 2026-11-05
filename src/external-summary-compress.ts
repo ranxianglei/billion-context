@@ -1,12 +1,17 @@
 import { collectBlockContent } from "acp-kernel";
 import { buildCompressSystemPrompt, parseCompressInput, type ParsedRange } from "./compress-tool.js";
+import { messageTimestampSections } from "./external-summary-surface.js";
 import { configuredSummaryPlan } from "./external-summary-runtime.js";
 import type { ResolvedKernelConfig } from "./compress-settings.js";
-import { applyRanges, normalizeRangeOrder, type RewriteCtx } from "./stream.js";
+import { applyRanges, noVisibleContextRefusal, normalizeRangeOrder, recoverEvictedView, supersededRefRejection, type RewriteCtx } from "./stream.js";
 import { compressResult, type ProxyToolResult } from "./proxy-tool-result.js";
 import { imagePlaceholders } from "./image-note.js";
-import type { SummaryWork } from "./external-summary.js";
-import { randomUUID } from "node:crypto";
+import { describeExternalSummaryFailure, summaryLengthBudgetClause, type SummaryWork } from "./external-summary.js";
+import { newExternalCallId } from "./external-summary-marker.js";
+
+// Re-exported for callers that historically imported it here; the canonical
+// home is the leaf module (kept import-graph-light for display surfaces).
+export { EXTERNAL_SUMMARY_CALL_ID_PREFIX, isExternalSummaryBlock, newExternalCallId } from "./external-summary-marker.js";
 
 function withOptionalSummaries(input: unknown): unknown {
     let value = input;
@@ -34,12 +39,23 @@ export async function applyConfiguredCompression(input: unknown, ctx: RewriteCtx
     // The plan rides the request Config rail (#833: ctx.config is the
     // session's effective Config — same cascade that produced the wire).
     let plan;
-    try { plan = configuredSummaryPlan((ctx.config as ResolvedKernelConfig).externalSummary); }
+    try { plan = configuredSummaryPlan((ctx.config as ResolvedKernelConfig).externalSummary, ctx.session.id); }
     catch { return compressResult("[Compression FAILED: external summary configuration is invalid. Nothing compressed.]", "refused", 0); }
     if (!plan) return applyRanges(parseCompressInput(input, callId), ctx);
     const parsed = parseCompressInput(withOptionalSummaries(input), callId);
     if (parsed.ranges.length === 0) return applyRanges(parsed, ctx);
     normalizeRangeOrder(parsed.ranges);
+    recoverEvictedView(ctx);
+    const noView = noVisibleContextRefusal(ctx, parsed.ranges);
+    if (noView) return noView;
+    // #5558: resolve superseded refs BEFORE the probe preview — the preview
+    // judges foldability while applyRanges re-resolves refs on every entry, so
+    // judging on untranslated refs lets an unanchorable stale cite read as "no
+    // change" here yet translate and fold under a synthetic probe summary in
+    // there, committing content without the configured external summarizer.
+    // One projection for judgment AND execution (#3236 discipline).
+    const resolved = supersededRefRejection(parsed.ranges, ctx.session);
+    if (resolved.rejection !== null) return applyRanges({ ...parsed, ranges: resolved.translatedRanges }, ctx);
     const state = ctx.session.state;
     const revision = ctx.session.revisionEpoch;
     const messages = (ctx.compressMessages ?? ctx.messages).map((message) => {
@@ -48,8 +64,9 @@ export async function applyConfiguredCompression(input: unknown, ctx: RewriteCtx
     });
     const work: SummaryWork[] = [];
     const valid: ParsedRange[] = [];
+    let hasProbeChanges = false;
     // Kernel protection and aggregate size checks must see the complete batch.
-    const probes = parsed.ranges.map((range, index) => {
+    const probes = resolved.translatedRanges.map((range, index) => {
         const maximum = Math.min(ctx.config.compress.maxSummaryLength, range.summaryMaxChars ?? Infinity);
         const length = Math.min(maximum, Math.max(64, ctx.config.compress.minSummaryLength));
         return { ...range, summary: (`external-probe-${index}:`).padEnd(length, "x").slice(0, length) };
@@ -62,6 +79,7 @@ export async function applyConfiguredCompression(input: unknown, ctx: RewriteCtx
         const blocks = preview.state.blocks.filter((candidate) => candidate.summary === probes[index].summary
             && before.get(candidate.blockId)?.summary !== candidate.summary);
         if (blocks.length === 0) continue;
+        hasProbeChanges = true;
         const content = blocks.map((block) => {
             const collected = collectBlockContent(state, block, source, { full: false }).text;
             if (collected.trim()) return collected;
@@ -79,24 +97,39 @@ export async function applyConfiguredCompression(input: unknown, ctx: RewriteCtx
                 .map(({ topic, summary }) => ({ topic, summary })),
         });
         valid.push(range);
-        work.push({ content, reference, minSummaryChars: ctx.config.compress.minSummaryLength,
-            maxSummaryChars: Math.min(range.summaryMaxChars ?? Infinity, ctx.config.compress.maxSummaryLength),
-            instructions: `${ctx.session.meta.summaryInstructions ?? buildCompressSystemPrompt()}\nWrite a faithful summary of the selected range ${range.startRef}-${range.endRef}. Preserve task status, constraints, decisions, exact code identifiers, paths and errors, and unfinished objectives with their source message refs. Submitted summary hints are non-authoritative. Never summarize or change the read-only reference.` });
+        // #3635: state the EXACT cap the validator enforces in the instructions
+        // — the preflight path has told its summarizers this number since #1775;
+        // without it the compress path asked for output it could never accept.
+        const maxSummaryChars = Math.min(range.summaryMaxChars ?? Infinity, ctx.config.compress.maxSummaryLength);
+        work.push({ content, reference, minSummaryChars: ctx.config.compress.minSummaryLength, maxSummaryChars,
+            instructions: `${ctx.session.meta.summaryInstructions ?? buildCompressSystemPrompt(undefined, messageTimestampSections(undefined))}\nWrite a faithful summary of the selected range ${range.startRef}-${range.endRef}. Preserve task status, constraints, decisions, exact code identifiers, paths and errors, and unfinished objectives with their source message refs. Submitted summary hints are non-authoritative. Never summarize or change the read-only reference.`
+                + summaryLengthBudgetClause(maxSummaryChars, ctx.config.compress.minSummaryLength) });
     }
-    if (work.length === 0) return compressResult("[Compression FAILED: no selected range passed the existing kernel protection checks. Nothing compressed.]", "refused", 0);
+    if (work.length === 0) {
+        // #5558: an unchanged preview can be an already-covered/protected no-op
+        // or a kernel refusal; the normal path supplies that truthful receipt.
+        // If a probe changed state but yielded no content, never fold a hint
+        // without the configured external summary.
+        if (!hasProbeChanges) return applyRanges({ ...parsed, ranges: probes }, ctx);
+        return compressResult("[Compression FAILED: no selected range passed the existing kernel protection checks. Nothing compressed.]", "refused", 0);
+    }
     const batch = await plan.summarize(work, signal);
     if (signal?.aborted || ctx.session.state !== state || ctx.session.revisionEpoch !== revision) return compressResult("[Compression FAILED: cancelled or session changed while generating external summaries. Nothing compressed.]", "refused", 0);
     const successful: ParsedRange[] = [];
     for (const [index, result] of batch.results.entries()) {
-        if (result.status === "success") successful.push({ ...valid[index], summary: result.summary, compressCallId: `external-summary-${randomUUID()}` });
+        if (result.status === "success") successful.push({ ...valid[index], summary: result.summary, compressCallId: newExternalCallId() });
     }
-    ctx.log(`[external-summary] completed ${successful.length}/${parsed.ranges.length} range(s); batch=${batch.status}`);
-    if (successful.length === 0) return compressResult("[Compression FAILED: all configured external summary candidates failed or exceeded their budget. Nothing compressed; do not retry unchanged configuration.]", "refused", 0);
+    // #3635: full failure description (parity with the preflight log line) so
+    // an over-cap rejection is visible with its length reason, not bare "batch=finished".
+    ctx.log(`[external-summary] completed ${successful.length}/${parsed.ranges.length} range(s); ${describeExternalSummaryFailure(batch)}`);
+    // #4833: the bounded attempt diagnostics (source + budgets + outcomes) ride
+    // the tool result too — enums and numbers only, never payload bytes.
+    if (successful.length === 0) return compressResult(`[Compression FAILED: all configured external summary candidates failed or exceeded their budget. Nothing compressed; do not retry unchanged configuration — summaries longer than the configured cap are rejected whole, so raise compress.maxSummaryLength or request less via per-range summaryMaxChars.] [${describeExternalSummaryFailure(batch)}]`, "refused", 0);
     const applied = applyRanges({ ...parsed, ranges: successful }, ctx);
     // Client call arguments carry only an optional hint, never the generated summary.
     // In-place refolds retain their old call id in the kernel; keep their anchor too.
     for (const block of ctx.session.state.blocks) {
-        if (before.get(block.blockId)?.restoredInline && !block.restoredInline) block.compressCallId = `external-summary-${randomUUID()}`;
+        if (before.get(block.blockId)?.restoredInline && !block.restoredInline) block.compressCallId = newExternalCallId();
     }
     if (successful.length < parsed.ranges.length && (applied.blocksCreated ?? 0) > 0) return {
         ...applied, outcome: "partial", text: `${applied.text}\n[External summary: ${parsed.ranges.length - successful.length} selected range(s) were not compressed.]`,

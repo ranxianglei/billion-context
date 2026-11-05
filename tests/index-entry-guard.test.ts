@@ -21,8 +21,27 @@ const root = path.resolve(import.meta.dirname, "..");
 
 // CI runs `npm test` before `npm run build`; exercise the BUILT entry (the
 // file hosts actually import) and build on demand when dist/ is absent.
+/** #3182 family: a STALE dist is worse than a missing one — the test then
+ * exercises last week's product code and "fails" on fixes that exist (the
+ * #3044 marked-replacement hang was exactly this). Rebuild when any src/
+ * source is newer than the built entry. */
+function distStale(entry: string): boolean {
+    let newest = 0;
+    const walk = (dir: string): void => {
+        for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+            const p = path.join(dir, e.name);
+            if (e.isDirectory()) walk(p);
+            else if (/\.(ts|tsx)$/.test(e.name)) newest = Math.max(newest, fs.statSync(p).mtimeMs);
+        }
+    };
+    walk(path.join(root, "src"));
+    return fs.statSync(entry).mtimeMs < newest;
+}
+let distBuiltOnce = false;
 function ensureDistBuilt(entry: string): void {
-    if (!fs.existsSync(entry)) {
+    if (distBuiltOnce && fs.existsSync(entry) && !distStale(entry)) return;
+    distBuiltOnce = true;
+    if (!fs.existsSync(entry) || distStale(entry)) {
         execFileSync(process.execPath, [path.join(root, "node_modules", "tsup", "dist", "cli-default.js")], { cwd: root, stdio: "pipe", timeout: 300_000 });
     }
     assert.ok(fs.existsSync(entry), `build did not produce ${entry}`);

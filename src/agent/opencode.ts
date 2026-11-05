@@ -22,6 +22,7 @@ import { nativeProxyScriptPath, singleFlight } from "./native-bootstrap.js";
 import { createLiveOriginResolver, installNativeFetchIntercept, isModelApiUrl, replaceRequestTarget, routedBiliModelUrl, type NativeInterceptState } from "./native-intercept.js";
 import { createOpencodeV2Setup, type V2HttpRequestEvent, type V2State } from "./opencode-v2.js";
 import { fetchProxyVersion } from "./shared.js";
+import { logHostEvent } from "./host-log.js";
 
 export { showAcpText } from "./opencode-acp-command.js";
 export type {
@@ -111,7 +112,7 @@ async function respawnOwnProxy(): Promise<string | undefined> {
         process.env.BILLION_CONTEXT_PROXY = handle.origin;
         return handle.origin;
     } catch (err) {
-        console.error(`[bili-opencode] proxy respawn failed — model traffic goes direct (uncompressed): ${err instanceof Error ? err.message : String(err)}`);
+        logHostEvent("error", "[native-client]", `[bili-opencode] proxy respawn failed — model traffic goes direct (uncompressed): ${err instanceof Error ? err.message : String(err)}`);
         return undefined;
     }
 }
@@ -148,7 +149,7 @@ const route = intercept === undefined ? undefined : (() => {
         if (live === undefined) {
             if (!warned) {
                 warned = true;
-                console.error("[bili-opencode] no live bili proxy — model requests go direct (uncompressed)");
+                logHostEvent("error", "[native-client]", "[bili-opencode] no live bili proxy — model requests go direct (uncompressed)");
             }
             s.proxyBase = undefined;
             if (upstream !== undefined) replaceRequestTarget(e, upstream);

@@ -52,6 +52,38 @@ function makeFakeChild(pid: number): SpawnChild {
 
 const MANAGED_BASE_URL = "http://127.0.0.1:8788/bili/https://api.anthropic.com";
 
+// Vertex port, phase 1 (decisions 4/7): the native-install override carries BOTH
+// variables, since the managed block's static ANTHROPIC_BASE_URL is dead when
+// CLAUDE_CODE_USE_VERTEX=1. The payload shape is the only thing that changes; the
+// win32 temp-file mechanism is untouched.
+const MANAGED_VERTEX_BASE_URL = "http://127.0.0.1:8788/bili/anthropic/https://aiplatform.googleapis.com/v1";
+
+test("#1292 buildClaudeSettingsArg: extra Vertex override rides the inline payload (POSIX)", () => {
+    const r = buildClaudeSettingsArg("linux", MANAGED_BASE_URL, { ANTHROPIC_VERTEX_BASE_URL: MANAGED_VERTEX_BASE_URL });
+    assert.equal(r.tmpFile, undefined);
+    assert.deepEqual(r.clientArgs, [
+        "--settings",
+        JSON.stringify({ env: { ANTHROPIC_BASE_URL: MANAGED_BASE_URL, ANTHROPIC_VERTEX_BASE_URL: MANAGED_VERTEX_BASE_URL } }),
+    ]);
+});
+
+test("#1292 buildClaudeSettingsArg: extra Vertex override rides the temp file on win32", () => {
+    const r = buildClaudeSettingsArg("win32", MANAGED_BASE_URL, { ANTHROPIC_VERTEX_BASE_URL: MANAGED_VERTEX_BASE_URL });
+    try {
+        assert.ok(r.tmpFile !== undefined);
+        assert.deepEqual(JSON.parse(fs.readFileSync(r.tmpFile!, "utf8")), {
+            env: { ANTHROPIC_BASE_URL: MANAGED_BASE_URL, ANTHROPIC_VERTEX_BASE_URL: MANAGED_VERTEX_BASE_URL },
+        });
+    } finally {
+        if (r.tmpFile) rmrf(r.tmpFile);
+    }
+});
+
+test("#1292 buildClaudeSettingsArg: no extra env → payload identical to the pre-port shape", () => {
+    const r = buildClaudeSettingsArg("linux", MANAGED_BASE_URL, undefined);
+    assert.deepEqual(r.clientArgs, ["--settings", JSON.stringify({ env: { ANTHROPIC_BASE_URL: MANAGED_BASE_URL } })]);
+});
+
 test("#1292 buildClaudeSettingsArg: non-win32 keeps the inline JSON (pre-fix behavior preserved)", () => {
     for (const platform of ["linux", "darwin", "freebsd"] as const) {
         const r = buildClaudeSettingsArg(platform, MANAGED_BASE_URL);

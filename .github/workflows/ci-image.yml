@@ -6,7 +6,8 @@ on:
   # rescue) — it costs nothing to run but there is no reason to spend a
   # runner on doc-only diffs. Manual dispatch covers everything else.
   pull_request:
-    branches: [master]
+    types: [opened, synchronize, reopened, labeled]
+    branches: [master, agent-relay]  # #3468: agent PRs target the relay branch
     paths:
       - "src/image-*.ts"
       - "src/preflight.ts"
@@ -18,14 +19,55 @@ on:
       # a kernel change IS a pipeline change (#1289-class guard; #2092).
       - "kernel/**"
       - "package-lock.json"
+  schedule:
+    - cron: '15/30 * * * *'
+    # three-layer CI: 30-min smart cron — gate skips when master HEAD is unchanged since the last green scheduled run
   workflow_dispatch:
 
 concurrency:
-  group: ci-image-${{ github.ref }}
-  cancel-in-progress: true
+  # #3772: a non-ci:full `labeled` run is skip-scoped by its gate job below —
+  # keep it in its own group so it can never cancel the in-flight real run.
+  group: ci-image-${{ github.ref }}${{ (github.event_name == 'pull_request' && github.event.action == 'labeled' && github.event.label.name != 'ci:full') && '-skip' || '' }}
+  # #3331: cancel-in-progress applies WITHIN the group too — a 30-min cron whose
+  # run outlives the interval would kill its predecessor mid-suite (tokens spent,
+  # no green recorded, gate can never skip). Cancel only same-ref superseded
+  # runs; scheduled runs queue behind each other instead.
+  cancel-in-progress: ${{ github.event_name != 'schedule' }}
 
 jobs:
+  # three-layer CI: this lane only runs on demand (ci:full label / dispatch)
+  # or on the 30-min cron when master moved since the last green scheduled run.
+  gate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      run: ${{ steps.g.outputs.run }}
+    steps:
+      - id: g
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ' ') }}
+          LABEL_EVENT: ${{ github.event.label.name }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          run=true
+          if [ "$EVENT" = "pull_request" ]; then
+            # only the ci:full label itself may trigger; other label events skip
+            if [ -n "$LABEL_EVENT" ] && [ "$LABEL_EVENT" != "ci:full" ]; then run=false
+            elif ! grep -qw ci:full <<<"$PR_LABELS"; then run=false; fi
+          elif [ "$EVENT" = "schedule" ]; then
+            LAST=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/ci-image.yml/runs?event=schedule&status=success&per_page=1" --jq '.workflow_runs[0].head_sha // ""' 2>/dev/null || echo "")
+            echo "last green scheduled head: ${LAST:-none}; current: $HEAD_SHA"
+            if [ "$LAST" = "$HEAD_SHA" ]; then run=false; fi
+          fi
+          echo "run=$run" >> "$GITHUB_OUTPUT"
   image-billing:
+    needs: [gate]
+    if: needs.gate.outputs.run == 'true'
     name: real-image billing e2e (hermetic corpus, zero tokens)
     runs-on: ubuntu-latest
     timeout-minutes: 10

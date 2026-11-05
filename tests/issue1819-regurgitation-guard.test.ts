@@ -46,7 +46,7 @@ function startSummaryServer(replyText: string): Promise<Attempted> {
     return new Promise((resolve) => {
         server.once("listening", () => {
             const { port } = server.address() as { port: number };
-            resolve({ port, bodies, close: async () => { server.close(); await once(server, "close"); } });
+            resolve({ port, bodies, close: async () => { server.close(); server.closeIdleConnections?.(); await once(server, "close"); } });
         });
     });
 }
@@ -122,11 +122,15 @@ test("#1819 preflight: a genuinely shrinking summary still folds (no false rejec
     }
 });
 
-test("#1819 receipt: an expanding fold reports the net growth instead of claiming savings alone", () => {
+// #2748 supersedes the #1819 manual-path honesty NOTE: a regurgitated (net-
+// neutral/expanding) summary on the PLAIN compress path is now REFUSED before
+// the state commits, so it neither creates a block nor re-pays the prefix
+// cache — instead of committing and appending a "[Net context change]" note.
+test("#2748 manual compress: an expanding fold is refused BEFORE commit (state + cache untouched)", () => {
     const core = createCore();
     const config = defaultConfig(200_000) as Config;
     config.compress.maxSummaryLength = 0;
-    const session = getSession(`issue1819-${randomUUID()}`);
+    const session = getSession(`issue2748-${randomUUID()}`);
     const msgs: CoreMessage[] = [];
     for (let i = 0; i < 12; i++) {
         msgs.push({
@@ -141,15 +145,71 @@ test("#1819 receipt: an expanding fold reports the net growth instead of claimin
     const logs: string[] = [];
     const ctx = { core, config, messages: turn.messages, session, log: (msg: string) => { logs.push(msg); } };
 
-    const healthy = applyRanges(parseCompressInput({ content: [{ startId: "m00001", endId: "m00002", summary: "First summary: messages 1-2 covered the initial phase in detail." }] }), ctx as never).text;
-    assert.match(healthy, /~(\d[\d,]*) tokens saved/, `base line stays parseable: ${healthy}`);
-    assert.ok(!healthy.includes("[Net context change") && !healthy.includes("[No net shrink"),
-        `a shrinking fold claims savings without correction: ${healthy}`);
+    // Regression guard: a genuinely shrinking fold MUST still land — the new
+    // gate must not false-reject healthy folds.
+    const healthy = applyRanges(parseCompressInput({ content: [{ startId: "m00001", endId: "m00002", summary: "First summary: messages 1-2 covered the initial phase in detail." }] }), ctx as never);
+    assert.equal(healthy.outcome, "applied", `a shrinking fold must apply: ${healthy.text}`);
+    assert.match(healthy.text, /~(\d[\d,]*) tokens saved/, `base line stays parseable: ${healthy.text}`);
+    assert.ok(!healthy.text.includes("[Net context change") && !healthy.text.includes("[No net shrink"),
+        `a shrinking fold claims savings without correction: ${healthy.text}`);
+    assert.equal(session.state.blocks.length, 1, "the healthy fold materialized exactly one block");
 
-    const bloated = applyRanges(parseCompressInput({ content: [{ startId: "m00003", endId: "m00004", summary: "R".repeat(40_000) }] }), ctx as never).text;
-    assert.match(bloated, /\[Compressed m00003–m00004 → 1 block\(s\)/, `the fold itself still lands: ${bloated.slice(0, 120)}`);
-    assert.match(bloated, /~(\d[\d,]*) tokens saved/, "the base line pattern core.ts parses stays intact");
-    assert.match(bloated, /\[Net context change: \+\d+ tokens — the new summary is larger than what it replaced; this fold grew the context instead of shrinking it\.\]/,
-        `the net-growth correction is appended: ${bloated}`);
-    assert.ok(logs.some((line) => line.includes("[Net context change")), "the corrected receipt reaches the log copy too");
+    // Regurgitation fixture: a summary far larger than its own span — the
+    // no-net-shrink case the gate must refuse before any state lands.
+    const blocksBefore = session.state.blocks.length;
+    const stateRefBefore = session.state;
+    const bloated = applyRanges(parseCompressInput({ content: [{ startId: "m00003", endId: "m00004", summary: "R".repeat(40_000) }] }), ctx as never);
+    assert.equal(bloated.outcome, "refused", `an expanding fold must be refused, not committed: ${bloated.text}`);
+    assert.equal(bloated.reason, "gate:no-net-shrink", `machine-readable reason: ${bloated.reason}`);
+    assert.equal(bloated.blocksCreated, 0, "no block is reported as created");
+    assert.match(bloated.text, /Compression refused: no net shrink/, `refusal is explicit: ${bloated.text}`);
+    assert.match(bloated.text, /Nothing was folded/, "the receipt states nothing was folded");
+    assert.match(bloated.text, /Do not re-issue this same range and summary/, "guidance breaks the infinite-retry loop");
+    assert.ok(!bloated.text.includes("[Compressed "), `no fake success line: ${bloated.text.slice(0, 120)}`);
+    assert.equal(session.state.blocks.length, blocksBefore, "no new block materialized from the expanding fold");
+    assert.equal(session.state, stateRefBefore, "state object uncommitted — prefix cache left untouched");
+    assert.ok(logs.some((line) => line.includes("compress REFUSED")), "the refusal reaches the server log copy");
+});
+
+test("#2748 mixed batch: a net-negative batch is refused wholesale; a net-positive batch applies", () => {
+    const core = createCore();
+    const config = defaultConfig(200_000) as Config;
+    config.compress.maxSummaryLength = 0;
+    const session = getSession(`issue2748mix-${randomUUID()}`);
+    const msgs: CoreMessage[] = [];
+    for (let i = 0; i < 12; i++) {
+        msgs.push({
+            id: `h_${i}`,
+            role: i % 2 === 0 ? "user" : "assistant",
+            contentType: "text",
+            text: `\x3cacp tokens="2K" type="text"\x3em${String(i + 1).padStart(5, "0")}\x3c/acp\x3e\nHistorical detail ${i}. ${"x".repeat(3000)}`,
+        });
+    }
+    const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount: 9999, renderTags: "text-only" });
+    session.state = turn.state;
+    const ctx = { core, config, messages: turn.messages, session, log: (_msg: string) => {} };
+
+    // Two spans, both carrying bloated summaries → aggregate net delta < 0.
+    // The batch must be refused as a whole (not silently committed, not
+    // misreported as a partial success).
+    const negBatch = applyRanges(parseCompressInput({ content: [
+        { startId: "m00001", endId: "m00002", summary: "R".repeat(20_000) },
+        { startId: "m00003", endId: "m00004", summary: "R".repeat(20_000) },
+    ] }), ctx as never);
+    assert.equal(negBatch.outcome, "refused", `a net-negative batch must be refused: ${negBatch.text}`);
+    assert.equal(negBatch.reason, "gate:no-net-shrink");
+    assert.equal(negBatch.blocksCreated, 0);
+    assert.equal(session.state.blocks.length, 0, "nothing committed from a net-negative batch");
+
+    // Same spans, now with compact summaries → aggregate net delta > 0 → the
+    // batch applies (the net-positive case keeps working end-to-end). The
+    // refused batch above committed nothing, so m00001–m00004 are still live
+    // and outside the protected recent zone.
+    const posBatch = applyRanges(parseCompressInput({ content: [
+        { startId: "m00001", endId: "m00002", summary: "Span 1-2 summarized briefly; filler is disposable." },
+        { startId: "m00003", endId: "m00004", summary: "Span 3-4 summarized briefly; filler is disposable." },
+    ] }), ctx as never);
+    assert.equal(posBatch.outcome, "applied", `a net-positive batch must apply: ${posBatch.text}`);
+    assert.ok((posBatch.blocksCreated ?? 0) >= 1, `at least one block landed: ${posBatch.text}`);
+    assert.ok(session.state.blocks.length >= 1, "committed state gained block(s)");
 });

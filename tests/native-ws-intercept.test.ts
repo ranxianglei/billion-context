@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import type { NativeInterceptState } from "../src/agent/native-intercept.ts";
+import { liveStateSlotEffect, type NativeInterceptState } from "../src/agent/native-intercept.ts";
 import { _resetForTest, codexResponsesWsTarget, installNativeWebSocketIntercept, nativeWebSocketInterceptInstalled, rewriteCodexResponsesWsUrl } from "../src/agent/native-ws-intercept.ts";
 
 // Same @types/node quirk as in src: the listener callback type is not global.
@@ -250,6 +250,71 @@ test("instanceof holds against both the wrapper and the underlying constructor",
         const ws = new top(UPSTREAM_WS, {});
         assert.ok(ws instanceof FakeWs);
         assert.ok(ws instanceof top);
+    });
+});
+
+// ——— Live-state routing across hot-reimport (#3558) ————————————————
+
+test("install: a hot-reimport rebinds WS routing to the new instance's state (#3558)", async () => {
+    await withPatchedGlobal(async () => {
+        // Two distinct module instances: A booted first, B is the FRESH state a
+        // host hot-reimport re-applies in the SAME process with no reset between.
+        const dispatchedA: Array<[string, string]> = [];
+        const dispatchedB: Array<[string, string]> = [];
+        const stateA: NativeInterceptState = {
+            origin: "http://127.0.0.1:40901",
+            ready: Promise.resolve("http://127.0.0.1:40901"),
+            onDispatch: (url, action) => dispatchedA.push([url, action]),
+        };
+        const stateB: NativeInterceptState = {
+            origin: "http://127.0.0.1:40902",
+            ready: Promise.resolve("http://127.0.0.1:40902"),
+            onDispatch: (url, action) => dispatchedB.push([url, action]),
+        };
+        assert.equal(installNativeWebSocketIntercept(stateA), true);
+        // The hot-reimport path: install again with B's state. One wrapper per
+        // process (returns false) but the shared live slot must rebind to B.
+        assert.equal(installNativeWebSocketIntercept(stateB), false);
+        const ws = new (WsCtor<FakeWs>())(UPSTREAM_WS, {});
+        assert.ok(ws instanceof FakeWs);
+        // Routing must follow B — the newest applied instance: B's origin rewrite
+        // AND B's dispatch evidence. Pre-#3558 the wrapper closed over A → 40901.
+        assert.equal(ws.url, "ws://127.0.0.1:40902/bili/https://chatgpt.com/backend-api/codex/responses");
+        assert.deepEqual(dispatchedB, [["ws://127.0.0.1:40902/bili/https://chatgpt.com/backend-api/codex/responses", "rewrite"]]);
+        assert.deepEqual(dispatchedA, []);
+    });
+});
+
+test("install: a same-instance re-activation outranks an older activation's late dispose (#3558)", async () => {
+    await withPatchedGlobal(async () => {
+        // Deactivate/reactivate (#2082/#2101) re-applies the SAME module-level
+        // state object under a fresh context. If activation 1's effect cleanup
+        // fires LATE — after activation 2's apply() already rebound the slot —
+        // object identity cannot tell the activations apart; only the install
+        // generation can. A wrong clear silently drops WS routing to direct.
+        const state: NativeInterceptState = { origin: ORIGIN, ready: Promise.resolve(ORIGIN) };
+        assert.equal(installNativeWebSocketIntercept(state), true);
+        // Activation 1's effect runs post-commit: capture its disposer.
+        const disposeActivation1 = liveStateSlotEffect(state)();
+        // Re-activation: same state object, fresh context, no reset in between.
+        assert.equal(installNativeWebSocketIntercept(state), false);
+        disposeActivation1();
+        const ws = new (WsCtor<FakeWs>())(UPSTREAM_WS, {});
+        // The late dispose must be a no-op: routing still rides the rebound slot.
+        assert.equal(ws.url, REWRITTEN);
+    });
+});
+
+test("install: the latest activation's own teardown clears the slot to clean direct (#3558)", async () => {
+    await withPatchedGlobal(async () => {
+        const state: NativeInterceptState = { origin: ORIGIN, ready: Promise.resolve(ORIGIN) };
+        assert.equal(installNativeWebSocketIntercept(state), true);
+        // The activation's own teardown fires: generation + identity both match
+        // the current slot, so the clear lands.
+        liveStateSlotEffect(state)()();
+        const ws = new (WsCtor<FakeWs>())(UPSTREAM_WS, {});
+        // Empty slot → the model WS shape passes through direct, unrewritten.
+        assert.equal(ws.url, UPSTREAM_WS);
     });
 });
 

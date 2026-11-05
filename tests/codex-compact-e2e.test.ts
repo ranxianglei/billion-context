@@ -172,8 +172,10 @@ async function withHarness(opts: { mode?: string; firstTurnTokens: number; stric
         await fn(h);
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
         delete process.env.BILI_CODEX_COMPACT;
     }
@@ -557,3 +559,93 @@ for (const variant of [
         });
     });
 }
+
+// ---------------------------------------------------------------------------
+// #3008: prompt-form auto-compact. Codex's LOCAL inline auto-compact travels
+// as an ordinary turn — full history + SUMMARIZATION_PROMPT template as the
+// last user message (no trigger field, no /responses/compact endpoint). The
+// only wire signature is the prompt text. When the gate passes, bili forges
+// the completion (one assistant message = codex's summary_suffix) and skips
+// upstream — otherwise the request re-caches the full unfolded history
+// (720k tokens in the #3008 incident) and, if the model returns no assistant
+// content, codex adopts a placeholder summary (template + old message).
+// ---------------------------------------------------------------------------
+
+import { CODEX_COMPACT_PROMPT_ANCHOR } from "../src/codex-compact.ts";
+
+function promptFormBody(sessionId: string) {
+    return {
+        model: "gpt-resp",
+        stream: true,
+        session_id: sessionId,
+        instructions: "You are the test coding agent.",
+        input: [
+            ...conversation(),
+            { type: "message", role: "user", content: [{ type: "input_text", text: `${CODEX_COMPACT_PROMPT_ANCHOR} Create a handoff summary for another LLM that will resume the task.` }] },
+        ],
+    };
+}
+
+test("prompt-form auto-compact is intercepted and forged locally (#3008)", async () => {
+    await withHarness({ firstTurnTokens: 100, mode: "intercept" }, async (h) => {
+        const after = await setupCompressedSession(h);
+        const response = await fetch(h.url, {
+            method: "POST",
+            headers: { "content-type": "application/json", "user-agent": CODEX_UA },
+            body: JSON.stringify(promptFormBody(SESSION)),
+        });
+        assert.equal(response.status, 200);
+        const text = await response.text();
+        assert.match(response.headers.get("content-type")!, /text\/event-stream/);
+        assert.ok(text.includes("MAIN-SUMMARY-SETUP-CONTEXT-FOLDED"), "forged assistant message carries the block summary");
+        assert.match(text, /"type":"response\.output_item\.done"/, "codex records this item as its compaction output");
+        assert.match(text, /"type":"response\.completed"/, "codex parser requires completed with id + usage");
+        await new Promise((r) => setTimeout(r, 60));
+        assert.equal(h.bodies.length, after, "upstream not contacted for the intercepted auto-compact");
+        const s = listSessions().find((x) => x.meta.label === SESSION);
+        assert.ok(s, "session tracked");
+        const captured = s!.metadata.codexForgedSummaries as string[] | undefined;
+        assert.ok(captured && captured.length > 0, "summaries captured for post-compaction re-injection");
+    });
+});
+
+test("prompt-form auto-compact passes through when no block exists to hand off (#3008)", async () => {
+    await withHarness({ firstTurnTokens: 100, mode: "intercept" }, async (h) => {
+        const response = await fetch(h.url, {
+            method: "POST",
+            headers: { "content-type": "application/json", "user-agent": CODEX_UA },
+            body: JSON.stringify(promptFormBody("prompt-form-no-blocks")),
+        });
+        assert.equal(response.status, 200);
+        await response.text();
+        assert.ok(await reachesUpstreamRequests(h, 1, 2_000), "gate failed (no active block) → forwarded verbatim");
+    });
+});
+
+test("prompt-form auto-compact passes through in pass mode (#3008)", async () => {
+    await withHarness({ firstTurnTokens: 100, mode: "pass" }, async (h) => {
+        const after = await setupCompressedSession(h);
+        const response = await fetch(h.url, {
+            method: "POST",
+            headers: { "content-type": "application/json", "user-agent": CODEX_UA },
+            body: JSON.stringify(promptFormBody("prompt-form-pass")),
+        });
+        assert.equal(response.status, 200);
+        await response.text();
+        assert.ok(await reachesUpstreamRequests(h, after + 1, 2_000), "kill-switch pass → forwarded");
+    });
+});
+
+test("prompt-form detection is codex-only: same template from a non-codex client forwards", async () => {
+    await withHarness({ firstTurnTokens: 100, mode: "intercept" }, async (h) => {
+        const body = promptFormBody("prompt-form-not-codex");
+        const response = await fetch(h.url, {
+            method: "POST",
+            headers: { "content-type": "application/json", "user-agent": "openai-node/3.0" },
+            body: JSON.stringify(body),
+        });
+        assert.equal(response.status, 200);
+        await response.text();
+        assert.ok(await reachesUpstreamRequests(h, 1, 2_000), "non-codex UA → ordinary turn");
+    });
+});

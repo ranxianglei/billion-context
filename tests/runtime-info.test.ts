@@ -300,7 +300,9 @@ async function startHarness(): Promise<Harness> {
         upstreamPort,
         close: async () => {
             proxy.close();
+            proxy.closeIdleConnections?.();
             upstream.close();
+            upstream.closeIdleConnections?.();
             await Promise.allSettled([once(proxy, "close"), once(upstream, "close")]);
             if (prevStateHome === undefined) delete process.env.XDG_STATE_HOME;
             else process.env.XDG_STATE_HOME = prevStateHome;
@@ -400,8 +402,10 @@ describe("runtime-info in the native-window chain (#955, e2e)", () => {
         assert.equal(status.pluginAgent, "omp");
         assert.equal(status.model, "test-model");
         assert.equal(status.windowSource, "runtime-info");
-        // 262144 − min(32768, headroom cap × 262144) = 262144 − 32768
-        assert.equal(status.contextLimit, 229376);
+        // #4205: the status surface reports the UNRESERVED window N; the
+        // reserved band (N − min(maxOut, cap×N) = 229376 here) is recorded in
+        // metadata.reservedContextLimit for decision consumers.
+        assert.equal(status.contextLimit, 262144);
         assert.equal(status.runtimeInfo?.contextWindow, 262144);
     });
 
@@ -422,21 +426,23 @@ describe("runtime-info in the native-window chain (#955, e2e)", () => {
             return (await fetch(`http://127.0.0.1:${h!.proxyPort}/__bili/plugin/status?conversationId=${sid}`)).json() as Promise<{ windowSource: string | null; contextLimit: number | null }>;
         };
 
+        // #4205: status reports the unreserved window N per entry (the
+        // reserved bands 229376 / 983040 live in reservedContextLimit).
         await postReport("astra", 262144, 32768, "sid-a");
         const a1 = await ask("astra", "sid-a");
         assert.equal(a1.windowSource, "runtime-info");
-        assert.equal(a1.contextLimit, 229376);
+        assert.equal(a1.contextLimit, 262144);
 
         await postReport("gemini", 1048576, 65536, "sid-b");
         const b1 = await ask("gemini", "sid-b");
         assert.equal(b1.windowSource, "runtime-info");
-        assert.equal(b1.contextLimit, 983040);
+        assert.equal(b1.contextLimit, 1048576);
 
         // old code: B's report clobbered the single omp slot → A regressed to
         // registry-peek here. Conversation-scoped storage keeps A intact.
         const a2 = await ask("astra", "sid-a");
         assert.equal(a2.windowSource, "runtime-info");
-        assert.equal(a2.contextLimit, 229376);
+        assert.equal(a2.contextLimit, 262144);
     });
 
     it("#1531: a per-agent header still wins exclusively over a conversation entry", async () => {
@@ -458,8 +464,10 @@ describe("runtime-info in the native-window chain (#955, e2e)", () => {
         assert.equal(resp.status, 200);
         const status = await (await fetch(`http://127.0.0.1:${h!.proxyPort}/__bili/plugin/status?conversationId=sid-h`)).json() as { windowSource: string | null; contextLimit: number | null };
         assert.equal(status.windowSource, "runtime-info");
-        // 100000 − min(10000, cap × 100000) = 90000 — the AGENT-SLOT entry, not the conv entry's 229376
-        assert.equal(status.contextLimit, 90000);
+        // #4205: status reports unreserved N — the AGENT-SLOT entry's 100000,
+        // not the conv entry's 262144 (reserved bands 90000 / 229376 live in
+        // reservedContextLimit).
+        assert.equal(status.contextLimit, 100000);
     });
 
     it("#1531: no conversation signal + no header still misses (plain clients unchanged)", async () => {

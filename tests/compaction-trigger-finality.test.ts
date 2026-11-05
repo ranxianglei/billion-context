@@ -70,7 +70,13 @@ test("e2e #280r2 (Responses): trailing compaction_trigger stays final — nudge 
         upstream: "http://127.0.0.1",
         routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "gpt-resp": { context: 15_000 } } } },
         modelContextLimit: 15_000,
-        kernelConfig: defaultConfig(15_000),
+        // #3006: the escalation override now honors the kernel's minimum-benefit
+        // floor, which this sub-floor fixture (4400-char ranges < 5000-char
+        // minCompressRange) trips — no nudge would fire at all anymore. Pin this
+        // fixture to legacy any-pending semantics (explicit 0 restores them on
+        // BOTH layers, kernel pressure branch and host override) so it keeps
+        // testing trigger finality / injection machinery, not the benefit floor.
+        kernelConfig: { ...defaultConfig(15_000), nudge: { ...defaultConfig(15_000).nudge, minPressureBenefitTokens: 0 } },
         compress: { injectTool: true, injectNudge: true },
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",
@@ -131,8 +137,10 @@ test("e2e #280r2 (Responses): trailing compaction_trigger stays final — nudge 
         assert.ok(bodies[bodies.length - 1].includes("Context limit reached"), "nudge still injected on a normal request");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });

@@ -25,7 +25,7 @@ const realSkip = !run
 const REPO_ROOT = path.resolve(import.meta.dirname, "..", "..");
 const DIST_ENTRY = path.join(REPO_ROOT, "dist", "index.js");
 
-const PKG = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, "package.json"), "utf8")) as { name: string; version: string; files: string[] };
+const PKG = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, "package.json"), "utf8")) as { name: string; version: string; files: string[]; scripts?: Record<string, string> };
 const OLD_VERSION = PKG.version;
 const NEW_VERSION = bumpPatch(OLD_VERSION);
 
@@ -63,7 +63,14 @@ async function makeFixtureTarball(work: string, version: string, opts?: { bare?:
     fs.mkdirSync(packs, { recursive: true });
     const stage = path.join(work, "fixtures", version);
     fs.mkdirSync(stage, { recursive: true });
-    const stagedPkg = opts?.bare ? { ...PKG, version, dependencies: {}, optionalDependencies: {} } : { ...PKG, version };
+    const stagedBase = opts?.bare ? { ...PKG, version, dependencies: {}, optionalDependencies: {} } : { ...PKG, version };
+    // The staged copy models a PUBLISHED artifact: registry installs never run
+    // prepare, and scripts/ is outside `files`, so drop the hook referencing
+    // the non-shipped guard script (#2471).
+    const stagedPkg = {
+        ...stagedBase,
+        scripts: Object.fromEntries(Object.entries(stagedBase.scripts ?? {}).filter(([name]) => name !== "prepare")),
+    };
     fs.writeFileSync(path.join(stage, "package.json"), `${JSON.stringify(stagedPkg, null, 2)}\n`);
     for (const entry of PKG.files) {
         const src = path.join(REPO_ROOT, entry);

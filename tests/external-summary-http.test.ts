@@ -2,8 +2,9 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import { afterEach, test } from "node:test";
 import { ExternalSummaryExecutor, type SummaryWork } from "../src/external-summary.ts";
-import { createSummaryHttpCandidate, type SummaryHttpTarget } from "../src/external-summary-http.ts";
+import { createSummaryHttpCandidate, _setSummaryRetryDelayForTest, _summaryRetryDelaysForTest, type SummaryHttpTarget } from "../src/external-summary-http.ts";
 import { _liveUpstreamTimersForTest } from "../src/fetch-util.ts";
+import { setLogCapture } from "../src/logger.ts";
 import type { PreflightProtocol } from "../src/preflight.ts";
 
 process.env.NODE_ENV = "test";
@@ -12,7 +13,11 @@ const budget = { totalTimeoutMs: 4000, targetTimeoutMs: 1500, maxSummaryBytes: 2
 const summary = "Retained decisions, evidence, constraints and unfinished objectives.";
 const frame = (value: unknown) => `data: ${JSON.stringify(value)}\n\n`;
 
-afterEach(() => assert.equal(_liveUpstreamTimersForTest(), 0));
+afterEach(() => {
+    _setSummaryRetryDelayForTest(null);
+    setLogCapture(null);
+    assert.equal(_liveUpstreamTimersForTest(), 0);
+});
 
 function completion(protocol: PreflightProtocol, text = summary): object {
     if (protocol === "responses") return { status: "completed", output_text: text };
@@ -82,9 +87,29 @@ for (const protocol of ["responses", "anthropic", "openai", "google"] as const) 
     }
 }
 
-for (const status of [400, 401, 403, 429, 500, 503]) {
-    test(`external summary HTTP: ${status} switches once to the backup without leaking errors`, async () => {
+for (const protocol of ["responses", "anthropic", "openai", "google"] as const) {
+    for (const [label, ending] of [["LF", "\n"], ["CRLF", "\r\n"], ["CR", "\r"]] as const) {
+        for (const complete of [true, false]) {
+            test(`external summary HTTP: ${protocol} ${complete ? "accepts complete" : "rejects unterminated"} ${label} SSE`, async () => {
+                const stream = streamCompletion(protocol);
+                const body = (complete ? stream : stream.slice(0, -1)).replace(/\n/g, ending);
+                await upstream((_req, res) => {
+                    res.setHeader("content-type", "text/event-stream");
+                    res.end(body);
+                }, async (url) => {
+                    const candidate = createSummaryHttpCandidate(target(url, protocol, true), 4096);
+                    if (complete) assert.equal(await candidate.summarize(work, AbortSignal.timeout(4000)), summary);
+                    else await assert.rejects(candidate.summarize(work, AbortSignal.timeout(4000)), { message: "External summary response did not complete" });
+                });
+            });
+        }
+    }
+}
+
+for (const status of [400, 401, 403]) {
+    test(`external summary HTTP: ${status} fails fast to the backup without leaking errors`, async () => {
         const paths: string[] = [];
+        _setSummaryRetryDelayForTest(0);
         await upstream((req, res) => {
             paths.push(req.url ?? "");
             res.writeHead(req.url === "/primary" ? status : 200);
@@ -97,8 +122,108 @@ for (const status of [400, 401, 403, 429, 500, 503]) {
             assert.equal(JSON.stringify(result).includes("test-summary-key"), false);
         });
         assert.deepEqual(paths, ["/primary", "/backup"]);
+        assert.deepEqual(_summaryRetryDelaysForTest(), []);
     });
 }
+
+for (const status of [429, 500, 503]) {
+    test(`external summary HTTP: transient ${status} retries twice then switches to the backup without leaking errors`, async () => {
+        const paths: string[] = [];
+        const lines: string[] = [];
+        _setSummaryRetryDelayForTest(0);
+        setLogCapture((_level, msg) => lines.push(msg));
+        await upstream((req, res) => {
+            paths.push(req.url ?? "");
+            res.writeHead(req.url === "/primary" ? status : 200);
+            res.end(req.url === "/primary" ? "private-error test-summary-key" : JSON.stringify(completion("responses")));
+        }, async (url) => {
+            const result = await new ExternalSummaryExecutor(1).execute(work, [createSummaryHttpCandidate(target(`${url}/primary`), 4096), createSummaryHttpCandidate(target(`${url}/backup`), 4096)], budget);
+            assert.equal(result.status, "success");
+            if (result.status === "success") assert.equal(result.targetIndex, 1);
+            // #3488: results stay leak-free while the LOCAL log carries the
+            // per-attempt status + truncated body.
+            assert.equal(JSON.stringify(result).includes("private-error"), false);
+            assert.equal(JSON.stringify(result).includes("test-summary-key"), false);
+            assert.equal(lines.filter((line) => line.includes(`rejected: HTTP ${status}`)).length, 3);
+            assert.ok(lines.some((line) => line.includes(`rejected: HTTP ${status}`) && line.includes("private-error")));
+        });
+        assert.deepEqual(paths, ["/primary", "/primary", "/primary", "/backup"]);
+        assert.deepEqual(_summaryRetryDelaysForTest(), [1000, 2000]);
+    });
+}
+
+test("external summary HTTP: a transient 429 with Retry-After recovers on the second dispatch", async () => {
+    let hits = 0;
+    _setSummaryRetryDelayForTest(0);
+    await upstream((_req, res) => {
+        hits++;
+        // "7" deliberately differs from the attempt-1 backoff fallback (1000 ms)
+        // so this assertion proves the header value won, not the backoff default.
+        if (hits === 1) { res.writeHead(429, { "retry-after": "7" }); res.end("rate limited"); return; }
+        res.end(JSON.stringify(completion("responses")));
+    }, async (url) => {
+        const result = await new ExternalSummaryExecutor(1).execute(work, [createSummaryHttpCandidate(target(url), 4096)], budget);
+        assert.equal(result.status, "success");
+        if (result.status === "success") assert.equal(result.targetIndex, 0);
+    });
+    assert.equal(hits, 2);
+    assert.deepEqual(_summaryRetryDelaysForTest(), [7000]);
+});
+
+test("external summary HTTP: a hostile Retry-After is capped so it cannot eat the attempt budget", async () => {
+    let hits = 0;
+    _setSummaryRetryDelayForTest(0);
+    await upstream((_req, res) => {
+        hits++;
+        if (hits === 1) { res.writeHead(429, { "retry-after": "999" }); res.end("rate limited"); return; }
+        res.end(JSON.stringify(completion("responses")));
+    }, async (url) => {
+        const result = await new ExternalSummaryExecutor(1).execute(work, [createSummaryHttpCandidate(target(url), 4096)], budget);
+        assert.equal(result.status, "success");
+    });
+    assert.equal(hits, 2);
+    assert.deepEqual(_summaryRetryDelaysForTest(), [15000]);
+});
+
+test("external summary HTTP: a risk-control 403 body retries like a rate limit", async () => {
+    let hits = 0;
+    _setSummaryRetryDelayForTest(0);
+    await upstream((_req, res) => {
+        hits++;
+        if (hits < 3) { res.writeHead(403); res.end('{"code":3007,"msg":"captcha verify failed"}'); return; }
+        res.end(JSON.stringify(completion("responses")));
+    }, async (url) => {
+        const result = await new ExternalSummaryExecutor(1).execute(work, [createSummaryHttpCandidate(target(url), 4096)], budget);
+        assert.equal(result.status, "success");
+    });
+    assert.equal(hits, 3);
+});
+
+test("external summary HTTP: a pre-response socket death retries then recovers", async () => {
+    let hits = 0;
+    _setSummaryRetryDelayForTest(0);
+    await upstream((_req, res) => {
+        hits++;
+        if (hits === 1) { res.destroy(); return; }
+        res.end(JSON.stringify(completion("responses")));
+    }, async (url) => {
+        const result = await new ExternalSummaryExecutor(1).execute(work, [createSummaryHttpCandidate(target(url), 4096)], budget);
+        assert.equal(result.status, "success");
+    });
+    assert.equal(hits, 2);
+});
+
+test("external summary HTTP: an exhausted transient chain logs every attempt and fails closed", async () => {
+    const lines: string[] = [];
+    _setSummaryRetryDelayForTest(0);
+    setLogCapture((_level, msg) => lines.push(msg));
+    await upstream((_req, res) => { res.writeHead(503); res.end("upstream unavailable"); }, async (url) => {
+        const result = await new ExternalSummaryExecutor(1).execute(work, [createSummaryHttpCandidate(target(url), 4096)], budget);
+        assert.equal(result.status, "failed");
+        assert.deepEqual(result.attempts, [{ targetIndex: 0, outcome: "error" }]);
+    });
+    assert.equal(lines.filter((line) => line.includes("rejected: HTTP 503")).length, 3);
+});
 
 for (const protocol of ["responses", "anthropic", "openai", "google"] as const) {
     test(`external summary HTTP: ${protocol} rejects partial JSON rather than folding a truncated summary`, async () => {
@@ -144,7 +269,12 @@ test("external summary HTTP: a stalled response is cancelled before the backup a
     }, async (url) => {
         const result = await new ExternalSummaryExecutor(1).execute(work, [createSummaryHttpCandidate(target(`${url}/primary`), 4096), createSummaryHttpCandidate(target(`${url}/backup`), 4096)], { ...budget, targetTimeoutMs: 150 });
         assert.equal(result.status, "success");
-        assert.deepEqual(result.attempts, [{ targetIndex: 0, outcome: "timeout" }, { targetIndex: 1, outcome: "success" }]);
+        if (result.status !== "success") throw new Error("unreachable");
+        assert.equal(result.attempts.length, 2);
+        assert.equal(result.attempts[0].outcome, "timeout");
+        // #4833: the stalled primary's timeout names its source and budget.
+        assert.match(result.attempts[0].detail ?? "", /^target-timeout 150ms \(elapsed \d+ms\)$/);
+        assert.equal(result.attempts[1].outcome, "success");
     });
     assert.deepEqual(paths, ["/primary", "/backup"]);
 });

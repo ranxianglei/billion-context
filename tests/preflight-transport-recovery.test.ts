@@ -72,6 +72,7 @@ async function withUpstream(handler: (res: http.ServerResponse, attempt: number)
     } finally {
         const closed = once(server, "close");
         server.close();
+        server.closeIdleConnections?.();
         server.closeAllConnections();
         await closed;
     }
@@ -245,7 +246,7 @@ test("preflight marks TLS trust failures client-retryable without in-loop retry 
             assert.equal(result.failure?.retryable, true, `${code}: client-retryable`);
             if (withHint) {
                 assert.match(result.failure?.detail ?? "", /NODE_EXTRA_CA_CERTS/);
-                assert.match(result.failure?.detail ?? "", /--use-system-ca/);
+                assert.match(result.failure?.detail ?? "", /security software/);
             } else {
                 assert.doesNotMatch(result.failure?.detail ?? "", /NODE_EXTRA_CA_CERTS/);
             }

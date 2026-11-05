@@ -32,11 +32,13 @@ import { safeSuffix } from "./text-safe.js";
 import { cacheDir } from "./paths.js";
 import { log as loggerLog, type Logger } from "./logger.js";
 import { refreshDshProfileBundles, isDshProfileCopy, dshProfileDirs, dshProfileDependsOnBili, dshProfileDepSpec, isRegistryDepSpec, DSH_PACKAGE, DSH_DESKTOP_PROFILE } from "./dsh-channel.js";
+import { convergeDshLedger } from "./dsh-ledger.js";
 import { isPiNpmCopy, piNpmEntrySpec, runPiAsync, PI_NPM_SPEC } from "./pi-channel.js";
 import { resolveDshHome, resolveKimiHome, resolveOmpHome, resolvePiHome } from "./client-config.js";
 import { proxyDispatcher } from "./upstream-proxy.js";
 import type { FetchOptions } from "./fetch-util.js";
-import { updateRegistryBase as knobUpdateRegistryBase, updateCheckIntervalMs as knobUpdateCheckIntervalMs } from "./knobs.js";
+import { updateRegistryBase as knobUpdateRegistryBase, updateCheckIntervalMs as knobUpdateCheckIntervalMs, updatePolicyUrl as knobUpdatePolicyUrl, updateStaggerMinDelayMs as knobUpdateStaggerMinDelayMs, updateStaggerMaxDelayMs as knobUpdateStaggerMaxDelayMs } from "./knobs.js";
+import { POLICY_URL_DEFAULT, ensureStaggerDraw, loadUpdatePolicy, resolveStaggerWindow, resolveUpgradeCandidate, setPlannedUpgrade, staggerKey } from "./update-policy.js";
 
 // BILI_UPDATE_REGISTRY overrides the registry base URL (full URL, e.g. a
 // loopback verdaccio in the hermetic e2e suite, #1153). Unset = production
@@ -353,6 +355,63 @@ export function _installBackoffStateForTest(): Record<string, { count: number; n
     const out: Record<string, { count: number; nextRetryAt: number }> = {};
     for (const [key, b] of installBackoffs) out[key] = { count: b.count, nextRetryAt: b.nextRetryAt };
     return out;
+}
+
+// #3754: persistent install attribution. Install-success logs are per-process
+// ephemeral — after a restart nothing on the machine says WHICH channel put
+// the current version on disk (auto-update loop, manual `bili update`, or an
+// advisory force-install). A tiny cross-process ledger closes the gap: every
+// successful in-place install records {from, version, source, at}, written
+// under the same cross-process lock that serialized the install itself, so
+// the file always reflects the most recent successful install. Reads fail
+// open: absent/unreadable/corrupt → undefined (the status field simply goes
+// missing instead of failing the endpoint).
+const LAST_INSTALL_FILE = path.join(cacheDir(), ".last-install.json");
+
+export interface LastInstallRecord {
+    from?: string;
+    version: string;
+    source: "auto-update" | "manual" | `advisory:${string}`;
+    at: number;
+}
+
+function parseLastInstallDoc(raw: string): LastInstallRecord | undefined {
+    const doc = JSON.parse(raw) as { v?: unknown; record?: unknown };
+    if (!doc || typeof doc !== "object" || doc.v !== 1) return undefined;
+    const r = doc.record as Record<string, unknown> | null;
+    if (!r || typeof r !== "object") return undefined;
+    if (typeof r.version !== "string" || typeof r.source !== "string" || typeof r.at !== "number") return undefined;
+    if (!Number.isFinite(r.at)) return undefined;
+    if (r.from !== undefined && typeof r.from !== "string") return undefined;
+    return { from: r.from as string | undefined, version: r.version, source: r.source as LastInstallRecord["source"], at: r.at };
+}
+
+/** #3754: live read of the most recent successful in-place install. Fresh per
+ *  call (deliberately uncached) so the status surface reflects installs done
+ *  by OTHER processes since this one started. Absent/corrupt → undefined. */
+export async function getLastInstall(): Promise<LastInstallRecord | undefined> {
+    try {
+        return parseLastInstallDoc(await readFile(LAST_INSTALL_FILE, "utf-8"));
+    } catch {
+        return undefined;
+    }
+}
+
+/** Best-effort atomic write (tmp+rename); never rejects — an unwritable cache
+ *  dir degrades to log-only attribution (same bias as the backoff state). */
+async function persistLastInstall(from: string | undefined, version: string, source: LastInstallRecord["source"]): Promise<void> {
+    try {
+        await mkdir(path.dirname(LAST_INSTALL_FILE), { recursive: true });
+        const tmp = `${LAST_INSTALL_FILE}.${process.pid}.tmp`;
+        await writeFile(tmp, JSON.stringify({ v: 1, record: { ...(from ? { from } : {}), version, source, at: Date.now() } }), "utf-8");
+        await rename(tmp, LAST_INSTALL_FILE);
+    } catch {
+        // best-effort: attribution must never fail the install
+    }
+}
+
+export async function _resetLastInstallForTest(): Promise<void> {
+    await rm(LAST_INSTALL_FILE, { force: true });
 }
 
 function backoffKey(installDir: string | undefined, version: string): string {
@@ -694,12 +753,24 @@ interface HostManagedInstall {
 // allowed to overwrite in place. Residual second-writer risk with the app's
 // own manager is explicitly accepted by the owner; reverting means dropping
 // this check.
-function isDshDesktopBiliCopy(installDir: string, real: string, env: NodeJS.ProcessEnv): boolean {
-    const anchor = path.join(resolveDshHome(env), "profiles", DSH_DESKTOP_PROFILE).split(path.sep).join("/");
+// #2972-L3: pure path-membership predicate split out so the case-sensitivity
+// policy is unit-testable off-Windows. ci=true lowercases both sides (Windows
+// paths are case-insensitive — a DSH_HOME spelled with different casing than the
+// resolved install dir must still match, or the #2894 manifest sync is silently
+// skipped and the copy is misread as pnpm-owned); ci=false stays byte-exact (POSIX).
+export function dshDesktopCopyPathMatches(installDir: string, real: string, anchor: string, suffix: string, ci: boolean): boolean {
+    const a = ci ? anchor.toLowerCase() : anchor;
+    const suf = ci ? suffix.toLowerCase() : suffix;
     return [installDir, real].some((dir) => {
         const norm = dir.split(path.sep).join("/");
-        return norm.startsWith(anchor + "/") && norm.endsWith(`/node_modules/${DSH_PACKAGE}`);
+        const n = ci ? norm.toLowerCase() : norm;
+        return n.startsWith(a + "/") && n.endsWith(suf);
     });
+}
+
+function isDshDesktopBiliCopy(installDir: string, real: string, env: NodeJS.ProcessEnv): boolean {
+    const anchor = path.join(resolveDshHome(env), "profiles", DSH_DESKTOP_PROFILE).split(path.sep).join("/");
+    return dshDesktopCopyPathMatches(installDir, real, anchor, `/node_modules/${DSH_PACKAGE}`, process.platform === "win32");
 }
 
 /** #1234/#2199: true when `installDir` is the OpenCode v2 plugin-manager CACHE
@@ -999,6 +1070,16 @@ export type UpdateOptions = {
      *  predicate fails open; a forced manual check still proceeds. Absent =
      *  no-op. */
     advisoryBlocksVersion?: (version: string) => boolean;
+    /** #2456: returns true while the advisory watcher is running but has not
+     *  yet completed its first feed consultation this process. Consulted on the
+     *  normal loop's post-restart path BEFORE it installs the registry latest:
+     *  a rollback-form advisory (#1588-A) leaves this disk clean while latest
+     *  stays affected, and the advisoryBlocksVersion gate below is blind until
+     *  the advisory's first check lands — deferring one cycle (cheaper than
+     *  installing a known-affected version and rolling it back) closes the
+     *  startup race. A forced manual check still proceeds. Absent = no-op (so
+     *  auto-update-only installs, where the watcher never runs, never defer). */
+    advisoryAwaitingFirstCheck?: () => boolean;
     /** Fired whenever this process detects the on-disk install is newer than
      *  the running code (#811): right after a successful in-place install and
      *  on every subsequent up-to-date check while the process stays stale.
@@ -1116,6 +1197,12 @@ export async function refreshDshProfileCopy(
         log("info", `[update] dsh profile bundle up to date (current=${currentVersion} latest=${latest} tag=${normalizeUpdateTag(opts.updateTag)})`);
         return;
     }
+    // #3619: the periodic self-check obeys the same policy gate as the global
+    // lane (hold / pin / block / stagger). The post-global-install convergence
+    // paths deliberately bypass it: that version already passed the gate.
+    const gate = await passUpdatePolicyGate({ packageName: opts.packageName, currentVersion, latest, tag: normalizeUpdateTag(opts.updateTag), force: false, resolveProxy: opts.resolveProxy });
+    if ("reason" in gate) return;
+    const target = gate.candidate;
     log("info", `[update] dsh profile bundle is stale (${currentVersion} \u2192 ${latest}) \u2014 refreshing via dsh's plugin channel`);
     const lock = await tryAcquireLock();
     if (!lock) {
@@ -1123,8 +1210,8 @@ export async function refreshDshProfileCopy(
         return;
     }
     try {
-        await runProfileBundlesRefresh(latest, log, env);
-        await refreshDshDesktopCopy(latest, log, env);
+        await runProfileBundlesRefresh(target, log, env);
+        await refreshDshDesktopCopy(target, log, env);
     } finally {
         await lock.release();
     }
@@ -1225,6 +1312,16 @@ export async function refreshPiNpmCopy(
         log("info", `[update] pi npm copy up to date (current=${currentVersion} latest=${latest} tag=${normalizeUpdateTag(opts.updateTag)})`);
         return;
     }
+    // #3619: same policy gate as the other lanes. pi's owner channel
+    // (`pi update --extension <spec>`) installs whatever LATEST resolves to —
+    // it cannot express a stepped target, so a pin/block that moves the
+    // candidate below latest is a skip here rather than a wrong install.
+    const gate = await passUpdatePolicyGate({ packageName: opts.packageName, currentVersion, latest, tag: normalizeUpdateTag(opts.updateTag), force: false, resolveProxy: opts.resolveProxy });
+    if ("reason" in gate) return;
+    if (gate.candidate !== latest) {
+        log("info", `[update] policy selected ${gate.candidate} below dist-tag ${latest}; not driving pi update (it would install ${latest}) — manual escape: pi update --extension ${PI_NPM_SPEC}@${gate.candidate}`);
+        return;
+    }
     if (await backoffInCooldown(ownerLaneKey("pi-npm", latest))) return; // #2192: inside the backoff window — no spawn
     log("info", `[update] pi npm copy is stale (${currentVersion} → ${latest}) — refreshing via pi's update channel`);
     const lock = await tryAcquireLock();
@@ -1319,6 +1416,87 @@ export async function convergeDshProfileBundles(
     }
 }
 
+/** #3619: the shared policy gate every automatic upgrade path passes through
+ *  after "newer version found": remote policy fetch (fail-open) → hold →
+ *  pinned/blocked candidate resolution → stagger draw. Returns `{candidate}`
+ *  on go or `{reason}` on stop; stop reasons are logged here, deduped per
+ *  process. Manual updates (force=true) skip hold + stagger but still resolve
+ *  pinned/blocked — those are version-level facts, not pacing. Never throws:
+ *  any unexpected failure degrades to the legacy immediate install of the
+ *  dist-tag version. */
+const policyGateLogged = new Set<string>();
+
+function policyGateLogOnce(key: string, message: string): void {
+    if (policyGateLogged.has(key)) return;
+    policyGateLogged.add(key);
+    loggerLog("info", message);
+}
+
+async function passUpdatePolicyGate(args: {
+    packageName: string;
+    currentVersion: string;
+    latest: string;
+    tag: string;
+    force: boolean;
+    resolveProxy?: (url: string) => string | undefined;
+}): Promise<{ candidate: string } | { reason: string }> {
+    const { force } = args;
+    try {
+        const policy = await loadUpdatePolicy({ url: knobUpdatePolicyUrl() ?? POLICY_URL_DEFAULT, resolveProxy: args.resolveProxy });
+        const doc = policy.doc;
+        if (!force && doc?.hold) {
+            setPlannedUpgrade(undefined);
+            policyGateLogOnce("policy:hold", `[update] HOLD active in the remote update policy — ${args.latest} is available but auto-upgrade is frozen fleet-wide until the owner lifts it; manual escape: \`bili update\` (bypasses hold) or npm install -g ${args.packageName}@${args.latest} (#3619)`);
+            return { reason: "hold" };
+        }
+        let candidate = args.latest;
+        if (doc && (doc.pinned !== null || doc.blocked.length > 0)) {
+            const res = await resolveUpgradeCandidate({
+                currentVersion: args.currentVersion,
+                latest: args.latest,
+                doc,
+                packumentUrl: `${REGISTRY_BASE}/${encodeURIComponent(args.packageName)}`,
+                resolveProxy: args.resolveProxy,
+            });
+            if (res.kind === "deferred") {
+                setPlannedUpgrade(undefined);
+                policyGateLogOnce("policy:deferred", `[update] ${res.reason} (#3619)`);
+                return { reason: "deferred" };
+            }
+            if (res.kind === "none") {
+                setPlannedUpgrade(undefined);
+                policyGateLogOnce(`policy:none:${res.reason}`, `[update] ${res.reason} — staying at ${args.currentVersion} (#3619)`);
+                return { reason: "none" };
+            }
+            candidate = res.candidate;
+            if (candidate !== args.latest) {
+                policyGateLogOnce(`policy:stepped:${args.latest}->${candidate}`, `[update] installing ${candidate} instead of dist-tag ${args.latest} per the remote policy (#3619)`);
+            }
+        }
+        if (!force) {
+            const win = resolveStaggerWindow(candidate, doc, knobUpdateStaggerMinDelayMs(), knobUpdateStaggerMaxDelayMs());
+            const now = Date.now();
+            const draw = await ensureStaggerDraw({ key: staggerKey(args.tag, candidate), minDelayMs: win.minMs, maxDelayMs: win.maxMs, now });
+            if (draw.at > now) {
+                setPlannedUpgrade({ tag: args.tag, version: candidate, at: draw.at });
+                const mins = Math.max(1, Math.round((draw.at - now) / 60_000));
+                policyGateLogOnce(`policy:stagger:${args.tag}:${candidate}:${draw.at}`, `[update] staggered rollout (#3619): upgrade to ${candidate} scheduled for ${new Date(draw.at).toISOString()} (~${mins} min from now; window ${(win.minMs / 60_000 | 0)}-${(win.maxMs / 60_000 | 0)} min)`);
+                return { reason: "stagger" };
+            }
+        }
+        setPlannedUpgrade(undefined);
+        return { candidate };
+    } catch (e) {
+        policyGateLogOnce(`policy:gatefail:${String(e)}`, `[update] policy gate failed (${String(e)}) — proceeding with the legacy immediate install (#3619)`);
+        return { candidate: args.latest };
+    }
+}
+
+/** Test seam: clear the gate's per-process log dedupe. */
+export function _resetPolicyGateForTest(): void {
+    policyGateLogged.clear();
+}
+
 /** Run a single check (throttled unless `force`). Safe to call frequently. */
 export async function checkForUpdate(opts: UpdateOptions, force = false): Promise<void> {
     if (!opts.autoUpdate && !force) return;
@@ -1381,6 +1559,20 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
             return;
         }
 
+        // #2456: this machine may be CLEAN (not itself affected) while the
+        // registry latest sits inside a rollback-form advisory's range, and the
+        // advisoryBlocksVersion gate below cannot see that range until the
+        // advisory's first check has landed. Installing latest before then pulls
+        // the machine back into the defect and the watcher rolls it back again
+        // (the post-restart ping-pong). Defer this cycle instead — a late update
+        // is cheaper than an affected-version round-trip. Non-forced path only;
+        // once the advisory's first check completes the predicate goes false and
+        // the normal loop resumes (or the gate above skips the affected candidate).
+        if (!force && opts.advisoryAwaitingFirstCheck?.()) {
+            loggerLog("info", "[update] deferring this cycle: the advisory's first check has not landed yet (#2456) \u2014 will follow latest next cycle once its state is known");
+            return;
+        }
+
         loggerLog("info", `[update] checking npm registry for ${opts.packageName}${sinceLastSec < 0 ? " (startup check)" : sinceLastSec === 0 ? "" : ` (last check ${sinceLastSec}s ago)`}\u2026`);
 
         // Follow the configured dist-tag channel (default "latest"): an
@@ -1439,20 +1631,48 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
             return;
         }
 
-        const tarballUrl = data.dist?.tarball;
-        const integrity = data.dist?.integrity;
-        const shasum = data.dist?.shasum;
+        // #3619: remote update policy + staggered rollout. The gate resolves
+        // the final install candidate (pin ceiling / blocked stepping) and the
+        // per-version upgrade moment; any gate failure degrades to the legacy
+        // immediate install of the dist-tag version (fail-open).
+        const gate = await passUpdatePolicyGate({
+            packageName: opts.packageName,
+            currentVersion,
+            latest,
+            tag,
+            force,
+            resolveProxy: opts.resolveProxy,
+        });
+        if ("reason" in gate) return;
+        const target = gate.candidate;
+
+        let tarballUrl = data.dist?.tarball;
+        let integrity = data.dist?.integrity;
+        let shasum = data.dist?.shasum;
+        if (target !== latest) {
+            // The policy moved the target off the dist-tag version — resolve
+            // THAT version's own registry doc. The policy file can only
+            // subtract from registry truth, never name what gets installed.
+            const steppedDoc = await fetchVersionDoc(opts, opts.packageName, target);
+            if (!steppedDoc?.tarball) {
+                loggerLog("warn", `[update] registry has no tarball for policy-selected ${target}, skipping`);
+                return;
+            }
+            tarballUrl = steppedDoc.tarball;
+            integrity = steppedDoc.integrity;
+            shasum = steppedDoc.shasum;
+        }
         if (!tarballUrl) {
             loggerLog("warn", `[update] registry response for ${latest} had no tarball URL`);
             return;
         }
 
-        const bkey = backoffKey(installDir, latest);
+        const bkey = backoffKey(installDir, target);
         if (!force && (await backoffInCooldown(bkey))) {
             return;
         }
 
-        loggerLog("info", `[update] new version found: ${currentVersion} \u2192 ${latest}, downloading\u2026`);
+        loggerLog("info", `[update] new version found: ${currentVersion} \u2192 ${target}${target !== latest ? ` (dist-tag says ${latest})` : ""}, downloading\u2026`);
 
         // Acquire lock to prevent concurrent updates across processes.
         const lock = await tryAcquireLock();
@@ -1461,17 +1681,18 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
             return;
         }
         try {
-            const result = await installViaTarball(latest, tarballUrl, installDir, integrity, shasum, egressDispatcher(opts, tarballUrl));
+            const result = await installViaTarball(target, tarballUrl, installDir, integrity, shasum, egressDispatcher(opts, tarballUrl));
             if (result.ok) {
                 await clearInstallBackoff(bkey);
-                loggerLog("info", `[update] installed ${currentVersion} \u2192 ${latest}. Restart to finish.`);
+                await persistLastInstall(currentVersion, target, force ? "manual" : "auto-update");
+                loggerLog("info", `[update] installed ${currentVersion} \u2192 ${target}. Restart to finish.`);
                 // #966: dsh profile copies load their own plugin+proxy from the
                 // profile's node_modules — without this they would keep running
                 // the old version next to the new global one (#953). Best-effort:
                 // never fails the update itself.
-                await runProfileBundlesRefresh(latest, loggerLog);
-                await refreshDshDesktopCopy(latest, loggerLog, process.env, opts.resolveProxy);
-                notifyStaleInstall(opts, latest);
+                await runProfileBundlesRefresh(target, loggerLog);
+                await refreshDshDesktopCopy(target, loggerLog, process.env, opts.resolveProxy);
+                notifyStaleInstall(opts, target);
             } else {
                 await recordInstallFailure(bkey, result.error ?? "unknown error", installDir);
                 logInstallLocationOnce(installDir, opts.packageName, loggerLog);
@@ -1628,6 +1849,13 @@ export async function installViaTarball(
     // callers.
     if (await isGitWorkingTree(installDir)) {
         return { ok: false, error: `install dir is a git working tree (${installDir}) \u2014 refusing to overwrite a source checkout (use npm install -g)` };
+    }
+
+    let real = installDir;
+    try {
+        real = realpathSync(installDir);
+    } catch {
+        // nonexistent or unreadable — evaluate the literal path
     }
 
     // #991 single-writer: refuse to overwrite a host-managed copy (pnpm
@@ -1853,6 +2081,26 @@ export async function installViaTarball(
     }
     await rm(workDir, { recursive: true, force: true });
 
+    // #2894/#3496: the dsh desktop lane is the only one bili overwrites in
+    // place while the host's pnpm bookkeeping lags behind. Converting the copy
+    // WITHOUT converting the ledgers leaves a latent wedge: dsh's in-app
+    // plugin manager reconciles node_modules against the stale records on the
+    // user's next "install" click (silently reverting the update), or a
+    // hand-edited manifest (#3160) makes the next `pnpm install` 404. So every
+    // in-place write converges ALL writable ledgers — manifest spec AND
+    // lockfile record — to the version just installed, as one transaction.
+    // Local pins stay respected; a ledger-sync failure logs but never fails
+    // the install (the copy itself is verified and standing).
+    if (isDshDesktopBiliCopy(installDir, real, env)) {
+        const profileDir = path.join(resolveDshHome(env), "profiles", DSH_DESKTOP_PROFILE);
+        const conv = convergeDshLedger(profileDir, version);
+        if (conv.error !== undefined) {
+            loggerLog("warn", `[update] dsh ${DSH_DESKTOP_PROFILE} profile copy replaced at ${version} but its ledgers were not converged (${conv.error}) — dsh may revert the copy on its next plugin install; rerun 'bili doctor --fix'`);
+        } else if (conv.changed.length > 0) {
+            loggerLog("info", `[update] dsh ${DSH_DESKTOP_PROFILE} profile ledgers converged to ${version}: ${conv.details.map((d) => `${d.file} ${d.field} ${d.before} → ${d.after}`).join("; ")}`);
+        }
+    }
+
     return { ok: true };
 }
 
@@ -1958,6 +2206,7 @@ export async function forceInstallVersion(
         if (diskUnderLock === targetVersion) return { ok: true };
         const result = await installViaTarball(targetVersion, doc.tarball, installDir, doc.integrity, doc.shasum, egressDispatcher(opts, doc.tarball));
         if (result.ok) {
+            await persistLastInstall(diskUnderLock ?? opts.currentVersion, targetVersion, `advisory:${advisoryId}`);
             loggerLog("info", `[update] advisory ${advisoryId}: installed ${diskUnderLock ?? opts.currentVersion} → ${targetVersion}. Restart to finish.`);
             await runProfileBundlesRefresh(targetVersion, loggerLog);
             await refreshDshDesktopCopy(targetVersion, loggerLog, process.env, opts.resolveProxy);

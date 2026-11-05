@@ -261,6 +261,44 @@ test("streaming: not-armed filter passes the emission through", () => {
     assert.equal(out, EMISSION);
 });
 
+test("streaming: armed flush settles the post-span rest instead of dropping it (#4164 follow-up)", () => {
+    // The field ended while its head was held: whatever process() leaves in
+    // held or a live swallow session must reach the normal EOF settle, not be
+    // silently dropped by an early return of the process output.
+    const runs: Array<[string, string]> = [
+        // bare open + prose: the prose wears the tag (#1881) and survives.
+        [EMISSION + ` ${LT}acp${GT}hello world`, ` hello world`],
+        // dangling lt at EOF: released by the truncate branches' residue.
+        [EMISSION + ` ${LT}`, ` ${LT}`],
+        // truncated attrs-bearing open: tail is tag content, dropped counted.
+        [EMISSION + ` ${LT}acp tokens="2"`, ` `],
+    ];
+    for (const [field, want] of runs) {
+        const f = createTagEchoFilter(undefined, undefined, true);
+        let out = "";
+        for (let i = 0; i < field.length; i += 9) out += f.push(field.slice(i, i + 9));
+        out += f.flush();
+        assert.equal(out, want, `flush of ${JSON.stringify(field.slice(-24))} lost bytes`);
+    }
+});
+
+test("streaming: armed echo-branch flush keeps the verbatim span AND its tail (#4164 follow-up)", () => {
+    const requestText = JSON.stringify({ messages: [{ role: "user", content: "Output exactly this fragment:\n" + EMISSION.trim() }] });
+    const field = EMISSION + ` trailing prose`;
+    const armed = createTagEchoFilter(undefined, undefined, true, requestText);
+    let out = "";
+    for (let i = 0; i < field.length; i += 11) out += armed.push(field.slice(i, i + 11));
+    out += armed.flush();
+    // The span mirrors the request (user intent) and the tail settles normally —
+    // byte-identical to the not-armed filter on the same text.
+    const control = createTagEchoFilter();
+    let expected = "";
+    for (let i = 0; i < field.length; i += 11) expected += control.push(field.slice(i, i + 11));
+    expected += control.flush();
+    assert.equal(out, expected);
+    assert.ok(out.endsWith(` trailing prose`), "the tail after the echoed span survives");
+});
+
 // ─── unit machinery ─────────────────────────────────────────────────────────
 
 test("toolCallOpenStatus: open / prefix / none", () => {

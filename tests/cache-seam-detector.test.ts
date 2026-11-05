@@ -156,6 +156,19 @@ test("seam detector: byte-stable resend attributes to PROVIDER-SIDE MISS, not a 
     assert.match(handleAcpCache(s).text, /PROVIDER-SIDE MISS/);
 });
 
+test("seam detector: PROVIDER-SIDE MISS section mentions the stateful-upstream render-tag check (#2483)", () => {
+    const s = makeSession();
+    const same = body(["a", "b"]);
+    noteForwardedBody(s, same);
+    settle(s, T0, 100_000, 99_000);
+    noteForwardedBody(s, same);
+    settle(s, T0 + 1000, 100_000, 20_000);
+    const text = handleAcpCache(s).text;
+    assert.match(text, /PROVIDER-SIDE MISS/);
+    assert.match(text, /stateful-upstream check \(#2483\)/);
+    assert.match(text, /diagnostics\.renderNone=true/);
+});
+
 test("seam detector: tail-append turn attributes to PROVIDER-SIDE MISS, not a seam (#2059)", () => {
     const s = makeSession();
     noteForwardedBody(s, body(["a", "b"]));

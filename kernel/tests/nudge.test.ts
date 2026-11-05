@@ -263,18 +263,46 @@ test("nudge: baseline correction when tokens drop significantly", () => {
   );
 
   // Token drops below baseline - nudgeGrowthTokens (10000 - 6000 = 4000)
-  // 3000 < 4000 → baseline corrected to 3000
+  // 3000 < 4000 → baseline corrected to 3000. #3674 low-water marks: the
+  // drop no longer needs to span a full interval — ANY lower reading rides
+  // the baseline (and the shown reference) down on the very next sample.
   const turn3 = core.processTurn({ messages, state, config, tokenCount: 3000 });
   assert.equal(
     turn3.state.nudge.lastPerMessageNudgeTokens,
     3000,
-    "baseline corrected on significant drop",
+    "baseline rides down with any drop (low-water mark, #3674)",
   );
   assert.equal(
     turn3.state.nudge.lastNudgeShownTokens,
-    0,
-    "pending nudge cleared",
+    3000,
+    "shown reference rides down too (pending flag survives, level retires, #3674)",
   );
+});
+
+test("nudge: baseline rides down on a drop shorter than one interval (#3674)", () => {
+  // The #3674 dead-zone: a compression settles over several turns and the
+  // first post-reset reading (the old weld point) sits interval-minus-eps
+  // above the real level. The old event-gated reset needed a SINGLE drop
+  // spanning the full interval; the low-water mark follows on the next turn.
+  const core = createCore();
+  const config = buildConfig(); // nudgeGrowthTokens 6000 for this window
+  const messages = makeMessages(10);
+  let state = createInitialState();
+
+  // post-compression weld at the transitional reading
+  state = core.processTurn({ messages, state, config, tokenCount: 9210 }).state;
+  assert.equal(state.nudge.lastPerMessageNudgeTokens, 9210, "weld at transitional reading");
+
+  // context settles 5210 lower — shorter than the 6000 interval, old code
+  // dead-zoned here forever (growth pinned at -5210)
+  state = core.processTurn({ messages, state, config, tokenCount: 4000 }).state;
+  assert.equal(state.nudge.lastPerMessageNudgeTokens, 4000, "baseline follows the settle");
+
+  // growth is measured from the valley again — climb back to 6300 is +2300,
+  // and with the 10-message fixture the cadence gates behave as if the
+  // baseline had always been 4000.
+  const turn = core.processTurn({ messages, state, config, tokenCount: 6300 });
+  assert.equal(turn.state.nudge.lastPerMessageNudgeTokens, 4000, "baseline holds the valley while climbing");
 });
 
 test("nudge: compress resets baseline, preventing feedback loop", () => {
@@ -1211,15 +1239,39 @@ test("re-baseline after a tokenCount scale drop also resets per-tier cadence sta
     40_000,
     "baseline re-anchored at the new scale",
   );
+  // #3674 low-water marks: the shown reference and the per-tier stamps no
+  // longer clear on a drop event — they ride down with the same reading, so
+  // the pending-nudge semantics (shown > 0) survive while the levels stop
+  // dead-zoning `tokenCount - reference >= growthFloor` at the old scale.
   assert.equal(
     stamped.lastNudgeShownTokens,
-    0,
-    "shared cadence baseline cleared",
+    40_000,
+    "shown reference rides down to the new scale",
   );
   assert.deepEqual(
     stamped.lastShownByTier,
-    {},
-    "per-tier cadence stamps must not survive a scale drop",
+    { 1: 40_000, 2: 40_000 },
+    "per-tier cadence stamps ride down to the new scale",
+  );
+
+  // The tier windows must be REACHABLE at the new scale: after climbing one
+  // growthFloor above the lowered stamps the tier gates open again (T1
+  // re-fires, and its stamp moves to the inject reading).
+  const climb = core.processTurn({
+    messages,
+    state: turn.state,
+    config,
+    tokenCount: 40_000 + 5_000, // floor 5000 for this fixture
+  });
+  assert.equal(
+    climb.nudge.shouldInject,
+    true,
+    `tier gates reachable at the new scale, got reason: ${climb.nudge.reason}`,
+  );
+  assert.equal(
+    climb.state.nudge.lastShownByTier[1],
+    45_000,
+    "T1 stamp advances to the re-fire reading",
   );
 });
 
@@ -1263,15 +1315,19 @@ test("downward reset re-anchors when count drops below the shown reference even 
     9_000,
     "baseline re-anchored at the settled level",
   );
+  // #3674: the stale shown reference no longer clears to 0 — it rides down
+  // to the settled reading, so the pending-nudge flag survives while the
+  // #478 phantom level is retired on this very sample (no full-interval drop
+  // needed). Per-tier stamps follow the same rule.
   assert.equal(
     turn3.state.nudge.lastNudgeShownTokens,
-    0,
-    "stale shown reference cleared",
+    9_000,
+    "shown reference rides down to the settled level",
   );
-  assert.deepEqual(
-    turn3.state.nudge.lastShownByTier,
-    {},
-    "per-tier stamps cleared with the shown reference",
+  assert.equal(
+    turn3.state.nudge.lastShownByTier[1],
+    9_000,
+    "per-tier stamps ride down with the shown reference",
   );
 
   // Cadence must be alive again: growth 6000 >= floor 5000 from the fresh reference.

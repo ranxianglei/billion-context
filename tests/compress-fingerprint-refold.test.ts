@@ -94,15 +94,15 @@ test("#1294 P1: long two-section summary yields an exact fingerprint line", () =
     const s = storedSummary(ctx.session.state, "b1");
     const head = s.slice(0, 30).replace(/\r?\n/g, " ");
     const tailText = s.slice(-100).replace(/\r?\n/g, " ");
-    assert.ok(out.includes(`\n · b1 summary ${s.length}ch · head "${head}" … tail "${tailText}"`), out);
+    assert.ok(out.includes(`\n · b1 full summary ${s.length}ch · head "${head}" … tail "${tailText}"`), out);
     // #1387: the continuation tail may follow the fingerprint line — pin the
     // whole receipt shape so no other content can sneak in. Here the tiny
     // recent-tail messages fall under the viability floor, so the drained
     // clean success carries exactly the stop signal.
     assert.deepEqual(
         out.split("\n").slice(2),
-        ["", "No compressible ranges remain — the context is already at its minimum; continue the task without compressing."],
-        "header + fingerprint + #1387 stop tail only",
+        [STEERING_2544, "", "No compressible ranges remain — the context is already at its minimum; continue the task without compressing."],
+        "header + fingerprint + #2544 steering + #1387 stop tail only",
     );
 });
 
@@ -111,7 +111,7 @@ test("#1294 P1: short summary (< 30 chars) — head equals tail equals the whole
     const ctx = makeCtx();
     seedTurn(ctx, [["user", "hello there"], ["assistant", "x".repeat(500)]]);
     const out = applyRanges(parseCompressInput({ content: [{ startId: "m00001", endId: "m00002", summary: "tiny fold" }] }), ctx).text;
-    assert.ok(out.includes(`\n · b1 summary 9ch · head "tiny fold" … tail "tiny fold"`), out);
+    assert.ok(out.includes(`\n · b1 full summary 9ch · head "tiny fold" … tail "tiny fold"`), out);
 });
 
 test("#1294 P1: mixed CJK/Latin summary with newlines is flattened deterministically", () => {
@@ -123,7 +123,7 @@ test("#1294 P1: mixed CJK/Latin summary with newlines is flattened deterministic
     const s = storedSummary(ctx.session.state, "b1");
     const head = s.slice(0, 30).replace(/\r?\n/g, " ");
     const tailText = s.slice(-100).replace(/\r?\n/g, " ");
-    assert.ok(out.includes(`\n · b1 summary ${s.length}ch · head "${head}" … tail "${tailText}"`), out);
+    assert.ok(out.includes(`\n · b1 full summary ${s.length}ch · head "${head}" … tail "${tailText}"`), out);
     assert.ok(head.includes(" "), "newline inside the head window became a space");
 });
 
@@ -141,8 +141,8 @@ test("#1294 P1: one fingerprint line per created block in a multi-range call", (
     assert.match(out, /→ 2 block\(s\)/, out.split("\n")[0]);
     const s1 = storedSummary(ctx.session.state, "b1");
     const s2 = storedSummary(ctx.session.state, "b2");
-    assert.ok(out.includes(`\n · b1 summary ${s1.length}ch · head "early summary one" … tail "early summary one"`), out);
-    assert.ok(out.includes(`\n · b2 summary ${s2.length}ch · head "late summary two" … tail "late summary two"`), out);
+    assert.ok(out.includes(`\n · b1 full summary ${s1.length}ch · head "early summary one" … tail "early summary one"`), out);
+    assert.ok(out.includes(`\n · b2 full summary ${s2.length}ch · head "late summary two" … tail "late summary two"`), out);
 });
 
 test("#1294 P1: a failed re-compress emits no fingerprint lines and keeps its receipt shape", () => {
@@ -152,7 +152,10 @@ test("#1294 P1: a failed re-compress emits no fingerprint lines and keeps its re
     const ok = applyRanges(parseCompressInput({ content: [{ startId: "m00001", endId: "m00002", summary: "one" }] }), ctx).text;
     assert.ok(ok.includes("tokens saved"), ok);
     const again = applyRanges(parseCompressInput({ content: [{ startId: "m00001", endId: "m00002", summary: "two" }] }), ctx).text;
-    assert.ok(again.startsWith("[Compression FAILED"), again.split("\n")[0]);
+    // #4521: re-compressing the same range is the idempotent no-op — success-
+    // shaped receipt, still no fingerprint lines (nothing was stored).
+    assert.ok(again.startsWith("[Compression no-op"), again.split("\n")[0]);
+    assert.match(again, /do not resend/);
     assert.doesNotMatch(again, /… tail "/);
 });
 
@@ -262,7 +265,7 @@ test("#1615: head cut straddling a surrogate pair drops the high half, receipt s
     // old slice(0, 30) ended exactly on the high surrogate.
     const s = "x".repeat(29) + "\u{1F4E5}" + "y".repeat(5);
     const out = applyRanges(parseCompressInput({ content: [{ startId: "m00001", endId: "m00002", summary: s }] }), ctx).text;
-    assert.ok(out.includes(`\n · b1 summary 36ch · head "${"x".repeat(29)}" … tail "${s}"`), out);
+    assert.ok(out.includes(`\n · b1 full summary 36ch · head "${"x".repeat(29)}" … tail "${s}"`), out);
     assert.ok(!hasUnpairedSurrogate(out), `receipt carries a lone surrogate: ${out}`);
 });
 
@@ -274,7 +277,7 @@ test("#1615: tail cut straddling a surrogate pair drops the low half, receipt st
     // started exactly on the low surrogate.
     const s = "\u{1F4E5}" + "x".repeat(99);
     const out = applyRanges(parseCompressInput({ content: [{ startId: "m00001", endId: "m00002", summary: s }] }), ctx).text;
-    assert.ok(out.includes(`\n · b1 summary 101ch · head "${"\u{1F4E5}"}${"x".repeat(28)}" … tail "${"x".repeat(99)}"`), out);
+    assert.ok(out.includes(`\n · b1 full summary 101ch · head "${"\u{1F4E5}"}${"x".repeat(28)}" … tail "${"x".repeat(99)}"`), out);
     assert.ok(!hasUnpairedSurrogate(out), `receipt carries a lone surrogate: ${out}`);
 });
 
@@ -304,4 +307,34 @@ test("#1615: lone surrogates already present in the input summary are scrubbed t
     assert.ok(out.includes(`head "${"x".repeat(28)}\uFFFDm"`), out);
     assert.ok(out.includes(`tail "${"x".repeat(27)}\uFFFD${"m".repeat(60)}\uFFFD${"w".repeat(11)}"`), out);
     assert.ok(!hasUnpairedSurrogate(out), `receipt carries a lone surrogate: ${out}`);
+});
+
+const STEERING_2544 = "Fingerprints show head/tail only — every summary is stored in full. To retrieve a specific detail from a new block, call search_context({ query }) first; decompress only if the excerpt doesn't answer it.";
+
+test("#2544: receipt states summaries are stored in full and steers to search_context before decompress", () => {
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    const ctx = makeCtx();
+    seedTurn(ctx, [
+        ["user", "early part"], ["assistant", "a".repeat(1000)],
+        ["user", "middle part"], ["assistant", "b".repeat(1000)],
+    ]);
+    const out = applyRanges(parseCompressInput({ content: [
+        { startId: "m00001", endId: "m00002", summary: "early summary one" },
+        { startId: "m00003", endId: "m00004", summary: "late summary two" },
+    ] }), ctx).text;
+    const lines = out.split("\n");
+    let lastFp = -1;
+    for (let i = 0; i < lines.length; i++) {
+        if (lines[i].startsWith(" · b") && lines[i].includes("full summary ")) lastFp = i;
+    }
+    assert.ok(lastFp > 0, `fingerprint lines present: ${out}`);
+    assert.equal(lines[lastFp + 1], STEERING_2544, "steering directly after the last fingerprint, nothing between");
+    // A no-op re-compress (#4521) has no fingerprints and must not carry the note.
+    const again = applyRanges(parseCompressInput({ content: [{ startId: "m00001", endId: "m00002", summary: "two" }] }), ctx).text;
+    assert.ok(again.startsWith("[Compression no-op"), again.split("\n")[0]);
+    assert.ok(!again.includes(STEERING_2544), "no steering without fingerprints");
+    // The log copy diverges by design (#1718): length-only fingerprints, no note.
+    const logLine = ctx.logs.find((l) => l.startsWith("[acp-proxy: [Compressed")) ?? "";
+    assert.ok(logLine, ctx.logs.join("\n"));
+    assert.ok(!logLine.includes(STEERING_2544), "log copy carries no steering note");
 });

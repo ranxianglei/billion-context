@@ -6,6 +6,8 @@ import {
   googleSystemText,
   googleToCore,
   injectGoogleSystem,
+  normalizeGoogleUserPartOrder,
+  type GooglePart,
   type GoogleRequestBody,
 } from "../src/wire/google.js";
 import {
@@ -13,7 +15,6 @@ import {
   detectWireFormat,
   isWireFormat,
 } from "../src/wire/formats.js";
-import { stripHistoricalImages } from "../src/wire/strip-images.js";
 
 const IMG =
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
@@ -111,9 +112,14 @@ test("google: systemInstruction is hoisted out of the fold space", () => {
 
 test("google: model maps to assistant, user to user, thought parts to reasoning", () => {
   const { msgs } = googleToCore(ompBody());
+  // #3642 canonical granularity: every content part is its own core (the
+  // anthropic codec's model), so the [text, image] user content yields two
+  // user cores and the model turn yields reasoning + text (the opaque
+  // executableCode part rides the preceding text core's raw sidecar).
   assert.deepEqual(
     msgs.map((m) => `${m.role}/${m.contentType}`),
     [
+      "user/text",
       "user/text",
       "assistant/reasoning",
       "assistant/text",
@@ -123,13 +129,17 @@ test("google: model maps to assistant, user to user, thought parts to reasoning"
     ],
   );
   assert.equal(msgs[0]!.text, "run the tests");
-  assert.equal(msgs[0]!.imageMediaType, "image/png");
-  assert.equal(msgs[0]!.imageBase64, IMG);
-  assert.equal(msgs[1]!.text, "List the files first.");
-  assert.equal(msgs[3]!.toolName, "bash");
-  assert.equal(msgs[3]!.toolCallId, "call_list");
-  assert.equal(msgs[3]!.text, '{"cmd":"ls"}');
-  assert.equal(msgs[4]!.text, '{"output":"a.ts\\nb.ts"}');
+  assert.equal(msgs[0]!.imageMediaType, undefined);
+  assert.equal(msgs[1]!.text, "[image]");
+  assert.equal(msgs[1]!.imageMediaType, "image/png");
+  assert.equal(msgs[1]!.imageBase64, IMG);
+  assert.equal(msgs[2]!.text, "List the files first.");
+  assert.equal(msgs[4]!.toolName, "bash");
+  assert.equal(msgs[4]!.toolCallId, "call_list");
+  assert.equal(msgs[4]!.text, '{"cmd":"ls"}');
+  // #3658: google functionResponse single-key {output} objects unwrap into
+  // plain text — the tool-result core text is "a.ts\nb.ts", not a JSON blob.
+  assert.equal(msgs[5]!.text, "a.ts\nb.ts");
 });
 
 test("google: functionResponse parts become tool cores ahead of the user core", () => {
@@ -290,6 +300,9 @@ test("google: sidecar signature and image rebuild a core that lost its raw parts
   // Simulate a core whose raw parts array is gone (a host-set message), where
   // only the scalar sidecars remain.
   const rebuilt = coreToGoogle(msgs.map(({ rawGoogleParts, ...rest }) => rest));
+  // #3642: the [text, image] user run rebuilds as ONE content with the
+  // text part first and the image core's sidecar re-rendered as inlineData
+  // (the "[image]" marker never re-renders as a text part).
   assert.deepEqual(rebuilt[0]!.parts, [
     { text: "run the tests" },
     { inlineData: { mimeType: "image/png", data: IMG } },
@@ -318,7 +331,7 @@ test("google: sidecar signature and image rebuild a core that lost its raw parts
       functionResponse: {
         name: "bash",
         response: { output: "second, no id" },
-        id: msgs[5]!.toolCallId,
+        id: msgs[6]!.toolCallId,
       },
     },
   ]);
@@ -365,66 +378,6 @@ test("injectGoogleSystem goes into the leading user content, else prepends one",
   assert.equal(injectGoogleSystem(contents, []), contents);
 });
 
-test("strip-images: google drops inlineData/fileData from old contents only", () => {
-  const body = {
-    contents: [
-      {
-        role: "user",
-        parts: [
-          { text: "old" },
-          { inlineData: { mimeType: "image/png", data: IMG } },
-          {
-            fileData: {
-              fileUri: "https://example.com/x.png",
-              mimeType: "image/png",
-            },
-          },
-        ],
-      },
-      { role: "model", parts: [{ text: "seen" }] },
-      {
-        role: "user",
-        parts: [
-          { text: "new" },
-          { inlineData: { mimeType: "image/jpeg", data: IMG } },
-        ],
-      },
-    ],
-  };
-  const r = stripHistoricalImages(body, "google", 1);
-  assert.equal(r.removed, 2);
-  const contents = rebuiltContents(r.body);
-  assert.deepEqual(contents[0], { role: "user", parts: [{ text: "old" }] });
-  assert.equal(contents[1], body.contents[1]);
-  assert.equal(contents[2], body.contents[2]);
-});
-
-test("strip-images: image-only google contents collapse to a text placeholder", () => {
-  const body = {
-    contents: [
-      {
-        role: "user",
-        parts: [{ inlineData: { mimeType: "image/png", data: IMG } }],
-      },
-      { role: "model", parts: [{ text: "seen" }] },
-    ],
-  };
-  const r = stripHistoricalImages(body, "google", 1);
-  assert.equal(r.removed, 1);
-  const contents = rebuiltContents(r.body);
-  assert.deepEqual(contents[0], {
-    role: "user",
-    parts: [{ text: "[image]" }],
-  });
-  assert.equal(contents[1], body.contents[1]);
-  const untouched = stripHistoricalImages(
-    { contents: [{ role: "user", parts: [{ text: "no image" }] }] },
-    "google",
-    1,
-  );
-  assert.equal(untouched.removed, 0);
-});
-
 test("google: edited core text re-renders plain while sibling raw parts and signature survive", () => {
   const body: GoogleRequestBody = {
     contents: [
@@ -449,4 +402,79 @@ test("google: edited core text re-renders plain while sibling raw parts and sign
     { text: "hello [m00002]", thoughtSignature: "sig-t" },
     { videoMetadata: { startOffset: 0 } },
   ]);
+});
+
+test("normalizeGoogleUserPartOrder: stable partition; signed/thought/non-text parts never move", () => {
+  const fr: GooglePart = {
+    functionResponse: { name: "add", response: { result: 66 }, id: "c1" },
+  };
+  const pure: GooglePart[] = [
+    { text: "hello" },
+    { inlineData: { mimeType: "image/png", data: "x" } },
+  ];
+  assert.equal(normalizeGoogleUserPartOrder(pure), pure);
+  assert.deepEqual(
+    normalizeGoogleUserPartOrder([
+      fr,
+      { text: "nudge" },
+      { inlineData: { mimeType: "image/png", data: "x" } },
+      { text: "more" },
+    ]),
+    [
+      { text: "nudge" },
+      { text: "more" },
+      fr,
+      { inlineData: { mimeType: "image/png", data: "x" } },
+    ],
+  );
+  const signed: GooglePart = { text: "signed", thoughtSignature: "sig" };
+  const thought: GooglePart = { text: "thinking", thought: true };
+  assert.deepEqual(
+    normalizeGoogleUserPartOrder([fr, signed, thought, { text: "plain" }]),
+    [{ text: "plain" }, fr, signed, thought],
+  );
+});
+
+test("coreToGoogle rebuilds a mixed user run with plain text before functionResponse parts (#3159)", () => {
+  const body: GoogleRequestBody = {
+    contents: [
+      { role: "user", parts: [{ text: "go" }] },
+      {
+        role: "model",
+        parts: [{ functionCall: { name: "add", args: { a: 37, b: 29 }, id: "c1" } }],
+      },
+      {
+        role: "user",
+        parts: [
+          { functionResponse: { name: "add", response: { result: 66 }, id: "c1" } },
+          { text: "nudge" },
+        ],
+      },
+    ],
+  };
+  const contents = coreToGoogle(googleToCore(body).msgs);
+  assert.deepEqual(contents[2]!.parts, [
+    { text: "nudge" },
+    { functionResponse: { name: "add", response: { result: 66 }, id: "c1" } },
+  ]);
+});
+
+test("an already-safe user part order round-trips byte-identical through coreToGoogle (#3159)", () => {
+  const body: GoogleRequestBody = {
+    contents: [
+      { role: "user", parts: [{ text: "go" }] },
+      {
+        role: "model",
+        parts: [{ functionCall: { name: "add", args: { a: 37, b: 29 }, id: "c1" } }],
+      },
+      {
+        role: "user",
+        parts: [
+          { text: "nudge" },
+          { functionResponse: { name: "add", response: { result: 66 }, id: "c1" } },
+        ],
+      },
+    ],
+  };
+  assert.deepEqual(coreToGoogle(googleToCore(body).msgs), body.contents);
 });

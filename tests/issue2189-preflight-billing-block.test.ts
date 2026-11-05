@@ -219,8 +219,10 @@ test("#2189 anthropic summary carries the client billing-attribution block at sy
         assert.ok(lastForward?.body.includes(BILLING_TEXT), "the MAIN forward still carries the client attribution block (main lane untouched)");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });
@@ -251,13 +253,15 @@ test("#2189 legacy string system keeps the byte-identical summary shape", async 
         }
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });
 
-test("#2189 bare-Error 429 fails fast after ONE attempt, retryable=false, arms the dead-end cooldown", async () => {
+test("#2189 bare-Error 429 fails fast after ONE attempt, retryable=false, retries re-run bounded", async () => {
     const lines: string[] = [];
     setLogCapture((_level, msg) => { lines.push(msg); });
     const calls: Call[] = [];
@@ -280,21 +284,25 @@ test("#2189 bare-Error 429 fails fast after ONE attempt, retryable=false, arms t
         assert.equal(summaries.length, 1, `must not burn the 3-attempt replay budget, got ${summaries.length} summary calls`);
         assert.ok(lines.some((l) => l.includes("suspected credential-shape rejection")), "named warn log present");
         const sess = listSessions().find((s) => s.id.includes("s2189-shape"));
-        assert.ok(sess?.metadata?.preflightDeadEnd, "zero-progress shape rejection arms the dead-end marker");
+        assert.equal(sess?.metadata?.preflightDeadEnd, undefined, "(#4079) no dead-end marker is written anymore");
 
-        // The identical retry spends ZERO upstream calls while the cooldown is warm.
+        // The identical retry re-runs the walk and fails the same deterministic
+        // way (shape rejection) without re-burning the 3-attempt replay budget.
         const before = calls.length;
         const r3 = await drive(proxyPort, upstreamPort, "s2189-shape", body2);
         assert.equal(r3.status, 503);
         const j3 = (await r3.json()) as { error?: { message?: string; retryable?: boolean } };
         assert.equal(j3.error?.retryable, false);
-        assert.ok(j3.error?.message?.includes("Preflight will not call the upstream again"), `cooldown suffix missing: ${j3.error?.message}`);
-        assert.equal(calls.length, before, "cooldown path must not touch the upstream");
+        assert.ok(j3.error?.message?.includes("credential-shape"), `detail still names the cause, got: ${j3.error?.message}`);
+        const retrySummaries = calls.slice(before).filter((c) => !c.stream);
+        assert.equal(retrySummaries.length, 1, `the re-run walk spends exactly one summary probe (#4079 trade), got ${retrySummaries.length}`);
     } finally {
         setLogCapture(null);
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });
@@ -321,12 +329,14 @@ test("#2189 a genuine rate limit keeps the legacy 3-attempt replay and retryable
         assert.equal(calls.filter((c) => !c.stream).length, 3, "full replay budget burned (legacy behavior)");
         assert.ok(lines.some((l) => l.includes("[preflight] summary attempt 2 got HTTP 429")), "retry log present");
         const sess = listSessions().find((s) => s.id.includes("s2189-genuine"));
-        assert.equal(sess?.metadata?.preflightDeadEnd, undefined, "genuine limit must NOT arm the dead-end cooldown");
+        assert.equal(sess?.metadata?.preflightDeadEnd, undefined, "genuine limit writes no dead-end marker (#4079)");
     } finally {
         setLogCapture(null);
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });

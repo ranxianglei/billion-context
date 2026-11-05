@@ -79,10 +79,15 @@ test("hideConsumedCompressCalls records refs of hidden orphan calls only", () =>
     existing: state.messageRefs,
     nextIndex: 1,
   }).map;
+  state.sweptOrphanCallIds = ["c1"];
 
   const result = hideConsumedCompressCalls(state, messages);
 
-  assert.equal(result.hidden, 2, "oldest orphan pair is hidden");
+  assert.equal(
+    result.hidden,
+    2,
+    "previously-swept orphan pair stays hidden (#3769)",
+  );
   assert.deepEqual(
     result.hiddenOrphanRefs,
     ["m00001", "m00002"],

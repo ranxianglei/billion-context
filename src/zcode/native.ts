@@ -115,7 +115,7 @@ async function withConfigLock<T>(dataDir: string, fn: () => T): Promise<T> {
     }
 }
 
-interface ZcodeRouteApplied {
+export interface ZcodeRouteApplied {
     readonly origin: string;
     readonly port: number;
     readonly kind: ZcodeStoreKind;
@@ -369,6 +369,12 @@ export type BootstrapMode =
     | {
         readonly mode: "active";
         readonly attached: boolean;
+        /** #1821: true ONLY for an explicit user pin (attach posture) — a
+         *  proxy this session does not own, which the MCP watchdog must
+         *  never respawn. attached=true alone can also mean "a lane-owned
+         *  proxy happened to be alive at bootstrap" — that one IS bili-
+         *  managed and gets watchdog recovery. */
+        readonly externallyOwned: boolean;
         readonly routed: ZcodeRouteApplied | undefined;
     };
 
@@ -477,7 +483,7 @@ export async function bootstrapZcodeNative(opts: BootstrapZcodeOptions = {}): Pr
 
     const routed = await routeZcodeConfig({ origin, env, dataDir, log, policy });
     if (routed) log(`routed ${routed.wrapped.map((w) => w.id).join(", ")} via ${origin} → ${routed.upstream}`);
-    return { mode: "active", attached, routed };
+    return { mode: "active", attached, externallyOwned: plan.mode === "attach", routed };
 }
 
 async function defaultEnsureProxy(): Promise<{ origin: string; attached: boolean }> {

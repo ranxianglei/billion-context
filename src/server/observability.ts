@@ -64,3 +64,16 @@ export function getUnrecognizedPathStats(): UnrecognizedPathStats {
 export function isModelDiscoveryPath(path: string): boolean {
     return path.replace(/\/+$/, "").endsWith("/models");
 }
+
+// #3129: Antigravity fires seven non-model /v1internal:* control-plane POSTs
+// (loadCodeAssist, fetchUserInfo, retrieveUserQuotaSummary, listExperiments,
+// fetchAdminControls, fetchAvailableModels, writeTrajectoryAcls) at startup and
+// during a session. Expected passthroughs — exempt from the "unrecognized path"
+// warn/stats like isModelDiscoveryPath. The three model endpoints are matched by
+// googlePathKind and never reach this path, so they are excluded by the lookahead.
+export function isV1InternalControlPlanePath(path: string): boolean {
+    // The proxy sees these as `/bili/<origin>/v1internal:<ep>` — match the
+    // endpoint by suffix so the routing prefix doesn't defeat the exemption.
+    const p = path.split("?", 2)[0];
+    return /\/v1internal:(?!streamGenerateContent$|generateContent$|countTokens$)/.test(p);
+}

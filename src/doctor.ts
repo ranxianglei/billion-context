@@ -2,7 +2,9 @@
 // (global + per-host) and every registered proxy process: which copy each lane
 // loads, who owns its updates, and how fresh it is against the registry. Turns
 // the #991/#1196 single-writer & install-lane contract into an auditable
-// output; never writes to any lane.
+// output; never writes to any lane. The sole exception is `--fix` (#3496):
+// an explicit user-triggered pass that converges drifted dsh-profile ledgers
+// (manifest spec / lockfile record / on-disk copy) and prints every change.
 
 import fs from "node:fs";
 import path from "node:path";
@@ -11,6 +13,8 @@ import { PLUGIN_AGENTS, UPDATE_CHANNEL, claudeDesktopPresent, inspectLanePresenc
 import { findInstallDir, fetchRegistryVersion, hostManagedInstall, isGitWorkingTree, isVersionNewer, lastUpdateCheckTime, normalizeUpdateTag, staleInstallStatus } from "./update.js";
 import { describeAdvisory, evaluateAdvisories, type AdvisoryEvaluation } from "./advisory.js";
 import { claudeRoutingWarningFile } from "./paths.js";
+import { dshProfileDirs } from "./dsh-channel.js";
+import { convergeDshLedger, dshProfileLedgerFindings, readDshLedgerState, type LedgerChangeDetail, type LedgerFinding } from "./dsh-ledger.js";
 
 type LaneVerdict = "ok" | "stale" | "frozen" | "broken" | "absent";
 
@@ -57,12 +61,24 @@ export interface DoctorProcess {
     staleCopy?: boolean;
 }
 
+interface DshLedgerFixRow {
+    profile: string;
+    findingsBefore: LedgerFinding[];
+    changed: string[];
+    details: LedgerChangeDetail[];
+    notes: string[];
+    error?: string;
+    residualFindings: LedgerFinding[];
+}
+
 export interface DoctorReport {
     generatedAt: number;
     packageName: string;
     global: DoctorGlobalInfo;
     lanes: DoctorLane[];
     processes: DoctorProcess[];
+    /** #3496: set only when `--fix` ran — what the repair pass changed per profile. */
+    ledgerFixes?: DshLedgerFixRow[];
 }
 
 interface DoctorOpts {
@@ -71,6 +87,11 @@ interface DoctorOpts {
     resolveProxy?: (url: string) => string | undefined;
     updateTag?: string;
     advisoryUrl?: string;
+}
+
+interface LaneCtx {
+    packageName: string;
+    global: DoctorGlobalInfo;
 }
 
 const REFERENCE_LANES = new Set<PluginAgent>(["omp", "claude", "codex", "kimi", "zcode", "hermes"]);
@@ -99,6 +120,25 @@ export function globalVerdict(g: Pick<DoctorGlobalInfo, "form" | "diskVersion" |
     if (g.form === "checkout") return "frozen";
     if (g.diskVersion !== undefined && g.registryVersion !== undefined && isVersionNewer(g.registryVersion, g.diskVersion)) return "stale";
     return "ok";
+}
+
+/** #2891 (#953/#1803): dsh resolves bare bundle names installation-anchor-first, so a
+ *  machine-global copy silently shadows a divergent profile-local one — surfaced nowhere
+ *  before. Pure decision (no fs). Returns the warning, or undefined when there is no
+ *  profile copy, no global copy, or both versions match (harmless). */
+export function dshBundleShadowWarning(args: {
+    packageName: string;
+    globalInstallDir?: string;
+    globalDiskVersion?: string;
+    profileName: string;
+    bundleInstalled: boolean;
+    profileCopyVersion?: string;
+}): string | undefined {
+    if (!args.bundleInstalled || args.profileCopyVersion === undefined) return undefined;
+    if (args.globalInstallDir === undefined) return undefined;
+    if (args.globalDiskVersion !== undefined && args.globalDiskVersion === args.profileCopyVersion) return undefined;
+    const gv = args.globalDiskVersion !== undefined ? `v${args.globalDiskVersion}` : "version unreadable";
+    return `shadowed copy: a machine-global ${args.packageName} (${args.globalInstallDir}, ${gv}) coexists with this profile's own copy (v${args.profileCopyVersion}); dsh resolves bare bundle names installation-anchor-first (#953/#1803) and loads whichever sits in its own install tree — with divergent versions you may be running a build different from what the profile declares (e.g. a pre-#1590 global lacks the dsh.client web face, so the settings-page menu silently vanishes). Verify which copy dsh actually loads: 'dsh --profile ${args.profileName} --dump-config' (read the bundle 'name:' line)`;
 }
 
 export async function runDoctor(opts: DoctorOpts): Promise<DoctorReport> {
@@ -142,7 +182,7 @@ export async function runDoctor(opts: DoctorOpts): Promise<DoctorReport> {
     const lanes: DoctorLane[] = [];
     for (const agent of PLUGIN_AGENTS) {
         try {
-            lanes.push(...laneRowsFor(agent, inspectLanePresence(agent), registryVersion));
+            lanes.push(...laneRowsFor(agent, inspectLanePresence(agent), registryVersion, { packageName: opts.packageName, global: g }));
         } catch (err) {
             lanes.push({
                 agent,
@@ -173,7 +213,40 @@ export async function runDoctor(opts: DoctorOpts): Promise<DoctorReport> {
     return { generatedAt: Date.now(), packageName: opts.packageName, global: g, lanes, processes };
 }
 
-function laneRowsFor(agent: PluginAgent, presence: ReturnType<typeof inspectLanePresence>, registryVersion: string | undefined): DoctorLane[] {
+/** #3496: the explicit repair pass behind `bili doctor --fix`. Converges every
+ *  DRIFTED dsh profile to its on-disk copy version; healthy profiles and
+ *  skip-condition profiles (local pin, no dep, no copy) get ZERO writes. The
+ *  desktop profile IS included here — detection excludes it by design (#3224
+ *  option A: bili is its in-place writer), but explicit repair must reach the
+ *  very profile where the #3160 incident happened. Pure local file ops; never
+ *  throws (dsh never ran → []). */
+export function fixDshLedgers(env: NodeJS.ProcessEnv = process.env): DshLedgerFixRow[] {
+    let dirs: string[];
+    try {
+        dirs = dshProfileDirs(env);
+    } catch {
+        return [];
+    }
+    const rows: DshLedgerFixRow[] = [];
+    for (const dir of dirs) {
+        const profile = path.basename(dir);
+        const findingsBefore = dshProfileLedgerFindings(dir, { includeDesktop: true });
+        if (findingsBefore.length === 0) continue;
+        const res = convergeDshLedger(dir, readDshLedgerState(dir).copyVersion!);
+        rows.push({
+            profile,
+            findingsBefore,
+            changed: res.changed,
+            details: res.details,
+            notes: res.notes,
+            error: res.error,
+            residualFindings: dshProfileLedgerFindings(dir, { includeDesktop: true }),
+        });
+    }
+    return rows;
+}
+
+function laneRowsFor(agent: PluginAgent, presence: ReturnType<typeof inspectLanePresence>, registryVersion: string | undefined, ctx: LaneCtx): DoctorLane[] {
     const kind = REFERENCE_LANES.has(agent) ? "reference" : "host-managed";
     const base: Omit<DoctorLane, "agent" | "installed" | "detail" | "targetExists" | "copyVersion" | "verdict" | "reason"> = {
         kind,
@@ -193,6 +266,8 @@ function laneRowsFor(agent: PluginAgent, presence: ReturnType<typeof inspectLane
             };
             if (row.verdict === "frozen") row.reason = "local-pin dep spec — no live update path; point it at a registry version or rebuild manually (AGENTS.md install-lane contract)";
             else if (row.verdict === "broken") row.reason = "profile depends on billion-context but the bundle copy is missing — rerun 'bili plugin install dsh'";
+            const shadow = dshBundleShadowWarning({ packageName: ctx.packageName, globalInstallDir: ctx.global.installDir, globalDiskVersion: ctx.global.diskVersion, profileName: p.name, bundleInstalled: p.bundleInstalled, profileCopyVersion: p.copyVersion });
+            if (shadow !== undefined) row.warnings = [...(row.warnings ?? []), shadow];
             return row;
         });
     }
@@ -291,5 +366,33 @@ export function renderDoctorReport(report: DoctorReport): string {
     const zombies = report.processes.filter((p) => !p.alive).length;
     lines.push("");
     lines.push(`summary: ${counts.ok} ok, ${counts.stale} stale, ${counts.frozen} frozen, ${counts.broken} broken, ${counts.absent} absent; processes: ${report.processes.length - zombies} live, ${zombies} zombie`);
+    return lines.join("\n") + "\n";
+}
+
+/** #3496: render the --fix pass. Explicit-trigger contract: every file touched
+ *  and every before→after value is printed; a profile that could not be fully
+ *  converged says so with the reason instead of claiming success. */
+export function renderLedgerFixReport(rows: DshLedgerFixRow[]): string {
+    const lines: string[] = [];
+    lines.push("dsh ledger fix (--fix)");
+    if (rows.length === 0) {
+        lines.push("  no drifted dsh profiles — nothing written");
+        return lines.join("\n") + "\n";
+    }
+    for (const row of rows) {
+        const verdict = row.error !== undefined ? "FAILED" : row.residualFindings.length > 0 ? "PARTIAL" : "converged";
+        lines.push(`  ${row.profile.padEnd(12)} ${verdict.padEnd(10)} drift was: ${row.findingsBefore.map((f) => f.kind).join(", ")}`);
+        for (const d of row.details) lines.push(`  ${"".padEnd(12)} ${d.file}: ${d.field} ${d.before} → ${d.after}`);
+        for (const n of row.notes) lines.push(`  ${"".padEnd(12)} note: ${n}`);
+        if (row.error !== undefined) lines.push(`  ${"".padEnd(12)} ${row.error}`);
+        else if (row.residualFindings.length > 0) {
+            for (const f of row.residualFindings) lines.push(`  ${"".padEnd(12)} still drifted: ${f.detail}`);
+        }
+        if (verdict === "converged" && row.changed.some((c) => c === "pnpm-lock.yaml" || c === "package-lock.json")) {
+            lines.push(`  ${"".padEnd(12)} the lockfile now records the on-disk copy's version — if that copy did not come from a normal install/self-update, verify its provenance before the next package-manager run (#3160/#3164)`);
+        }
+    }
+    lines.push("");
+    lines.push("rerun 'bili doctor' to confirm every profile is clean");
     return lines.join("\n") + "\n";
 }

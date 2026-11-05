@@ -1,34 +1,65 @@
 name: Bugfix Release (carve-out)
 
-# Dedicated emergency / hotfix publish channel (#2011).
+# Dedicated emergency / hotfix publish channel (#2011), PR-gated since #2851.
 #
 # Publishes a version cut from a NON-master ref -- e.g. a released tag plus a
 # single fix -- STRICTLY excluding the unreleased work that has since
-# accumulated on master. This is the mechanism the owner requested for the
-# v0.1.182 emergency: ship ONLY the integer max_tokens fix without dragging in
-# the ~70 commits already merged to master after v0.1.181.
+# accumulated on master. First used for the v0.1.182 emergency: ship ONLY the
+# integer max_tokens fix without dragging in the ~70 commits already merged to
+# master after v0.1.181.
 #
 # Unlike release.yml (which builds the POST-MERGE MASTER tree on push-to-master,
 # so it can never exclude master's existing commits), this checks out and
-# publishes the pushed/dispatched REF itself -- the artifact is exactly that
-# ref's tree, nothing else.
+# publishes the CARVE-OUT PR HEAD tree itself -- the artifact is exactly that
+# tree, nothing else.
 #
-# Triggered ONLY by pushes to branches under `bugfix-release/**`, or a manual
-# workflow_dispatch against such a ref. Guarded so it can never:
+# GATE MODEL (#2851): the carve-out branch is opened as a PR against master and
+# publishes ONLY when that PR is MERGED -- the same human review gate as every
+# normal release. Pushing a bugfix-release/** branch triggers NOTHING (the old
+# silent-push auto-publish was removed). The head branch keeps the
+# bugfix-release/ prefix as the carve-out MARKER: release.yml's detection
+# deliberately does not match it, so merging the PR cannot double-publish the
+# post-merge master through the normal channel.
+#
+# NOTE 2026-10-25: the workflow_dispatch trigger was REMOVED after a concurrent
+# agent session abused manual dispatch to publish v0.1.208 outside the intended
+# flow (see #4718); the human PR merge became the only ignition shape.
+# NOTE 2026-10-28 (owner decision; revives the 5de4103c/#3613 emergency valve
+# whose step gates this file kept all along): workflow_dispatch returns AS THE
+# EMERGENCY VALVE ONLY — and hardened against a repeat of #4718: fast mode
+# engages solely when `fast` is checked AND `confirm_fast` is typed exactly
+# "FAST PUBLISH CONFIRMED" (see FAST_ON below). Any default or programmatic
+# dispatch silently keeps the slow safe path.
+#
+# Guarded so it can never:
 #   - move `latest` backwards (target must be strictly newer than npm latest);
 #   - re-publish an already-live version;
 #   - ship a sub-0.1.0 line (#1385);
-#   - publish a stable version with no release-notes entry (#1870).
+#   - publish a stable version with no release-notes entry (#1870);
+#   - act on fork PRs (secrets unavailable) or on non-merged closes.
 #
-# It does NOT touch master: no merge, no direct push to master. The tag points
-# at the hotfix ref; master advances independently on its next normal release.
+# Master interaction: merging the carve-out PR brings the version bump INTO
+# master (master then equals npm latest). Master advances independently on its
+# next normal release, which MUST be higher than the carve-out version.
 
 on:
-  push:
-    branches: [ 'bugfix-release/**' ]
+  pull_request:
+    types: [closed]
+    branches: [master]
   workflow_dispatch:
-    inputs: {}
-
+    # Emergency valve only — see the 2026-10-28 header note. Slow-safe unless
+    # BOTH signals arrive together.
+    inputs:
+      fast:
+        description: "EMERGENCY fast publish: skip the full-CI dispatch/gate and the full npm test. Keeps every version guard + npm ci + typecheck + build. Owner-owned risk."
+        type: boolean
+        required: false
+        default: false
+      confirm_fast:
+        description: "TYPE EXACTLY: FAST PUBLISH CONFIRMED — anything else (blank included) keeps the normal slow path."
+        type: string
+        required: false
+        default: ""
 concurrency:
   group: bugfix-release
   cancel-in-progress: false
@@ -36,21 +67,78 @@ concurrency:
 jobs:
   release:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      # Fast mode = BOTH explicit signals (typed-phrase guard vs accidental/
+      # automated dispatches, #4718). Non-dispatch events see FAST_ON=false.
+      FAST_ON: ${{ inputs.fast == true && inputs.confirm_fast == 'FAST PUBLISH CONFIRMED' }}
     permissions:
       contents: write
       id-token: write
+      actions: write
     steps:
-      - uses: actions/checkout@v4
+      - name: Ensure jq (2026-10 runner images are unreliable about it — always install our own)
+        run: |
+          type -a jq || true
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL "https://github.com/jqlang/jq/releases/download/jq-1.8.1/jq-linux-amd64" -o "$HOME/.local/bin/jq"
+          chmod +x "$HOME/.local/bin/jq"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/jq" --version
+
+      - name: Validate trigger + resolve the publish ref
+        id: resolve
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            MERGED="$(jq -r '.pull_request.merged' "$GITHUB_EVENT_PATH")"
+            BRANCH="$(jq -r '.pull_request.head.ref' "$GITHUB_EVENT_PATH")"
+            SAME_REPO="$(jq -r '(.pull_request.base.repo.full_name == .pull_request.head.repo.full_name)' "$GITHUB_EVENT_PATH")"
+            SHA="$(jq -r '.pull_request.head.sha' "$GITHUB_EVENT_PATH")"
+            if [ "$MERGED" != "true" ]; then
+              echo "::notice::PR $GITHUB_EVENT_NUMBER closed without merging — nothing to publish"
+              exit 0
+            fi
+            case "$BRANCH" in
+              bugfix-release/*) ;;
+              *)
+                echo "::notice::head branch '$BRANCH' is not a bugfix-release/* carve-out branch — nothing to publish"
+                exit 0
+                ;;
+            esac
+            if [ "$SAME_REPO" != "true" ]; then
+              echo "::error::fork PRs cannot use the carve-out channel (repo secrets are unavailable for them)"
+              exit 1
+            fi
+          else
+            BRANCH="$GITHUB_REF_NAME"
+            SHA=""
+          fi
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "proceed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout
+        if: steps.resolve.outputs.proceed == 'true'
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
+      - name: Switch to the carve-out PR head (pre-merge tree)
+        if: steps.resolve.outputs.proceed == 'true' && github.event_name == 'pull_request'
+        run: |
+          SHA="${{ steps.resolve.outputs.sha }}"
+          git rev-parse --verify --quiet "${SHA}^{commit}" >/dev/null || git fetch origin "$SHA"
+          git checkout --detach "$SHA"
+
       - uses: actions/setup-node@v4
+        if: steps.resolve.outputs.proceed == 'true'
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org
 
       - name: Read version
         id: version
+        if: steps.resolve.outputs.proceed == 'true'
         run: |
           V="$(node -p "require('./package.json').version")"
           case "$V" in
@@ -60,9 +148,31 @@ jobs:
               ;;
           esac
           echo "version=$V" >> $GITHUB_OUTPUT
-          echo "::notice::Publishing carve-out from ref '${GITHUB_REF_NAME}' @ ${GITHUB_SHA} -> v$V (master NOT involved)"
+          REF="${{ steps.resolve.outputs.branch }}"
+          SHA="${{ steps.resolve.outputs.sha }}"
+          [ -z "$SHA" ] && SHA="$(git rev-parse HEAD)"
+          echo "::notice::Publishing carve-out from '$REF' @ ${SHA:0:12} -> v$V (master NOT involved)"
+
+      - name: Verify plugin manifests match package.json (#4449)
+        # The four plugin manifests carry their own version fields — the
+        # marketplaces use them for UPDATE DETECTION, so a release whose
+        # manifests disagree with package.json ships a plugin that never
+        # prompts users to upgrade. Drift = red release, nothing shipped.
+        # See reference/release.md.
+        if: steps.resolve.outputs.proceed == 'true'
+        # #4576 follow-up: lanes cut from a pre-#4449 tag do not carry the
+        # manifest sync script at all -- fail-open with a notice there instead
+        # of MODULE_NOT_FOUND (same existence-guard philosophy as release-manual's
+        # lane guard).
+        run: |
+          if [ -f scripts/sync-codex-plugin-version.mjs ]; then
+            node scripts/sync-codex-plugin-version.mjs --check
+          else
+            echo "::notice::this tree predates #4449 (no scripts/sync-codex-plugin-version.mjs) — manifest sync check skipped for the pre-#4449 lane"
+          fi
 
       - name: Publish guard (monotonic + not-already-live)
+        if: steps.resolve.outputs.proceed == 'true'
         run: |
           VER="${{ steps.version.outputs.version }}"
           LATEST="$(npm view billion-context version)"
@@ -87,6 +197,7 @@ jobs:
         # declarations — only severe releases need one; ordinary releases ship
         # silently with NO entry. Missing entry => notice + pass; present
         # entry => validated and logged.
+        if: steps.resolve.outputs.proceed == 'true'
         run: |
           VER="${{ steps.version.outputs.version }}"
           case "$VER" in
@@ -102,8 +213,30 @@ jobs:
             console.log('release-notes entry ok:', entry.version, '[' + entry.tier + ']', entry.summary.slice(0, 80));
           " "$VER"
 
-      - name: Pre-flight gate
+      - name: Full CI dispatch (all lanes, publish sha)
+        # Policy (2026-10-10, after the v0.1.192 carve-out): every release
+        # channel must run the COMPLETE CI set at the exact publish sha before
+        # npm publish. In the PR-gated flow the lanes already ran on the PR
+        # head sha (path-filtered pull_request triggers) — dispatch only what
+        # has no run there (idempotent); the Full CI gate after the pre-flight
+        # blocks publish until green.
+        # EMERGENCY fast mode (owner 2026-10-17): dispatch is already a
+        # human-picked ref; with fast=true the human explicitly owns skipping
+        # this lane matrix — version guards and the build sanity below still
+        # run.
+        if: steps.resolve.outputs.proceed == 'true' && env.FAST_ON != 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          GITHUB_SHA="${{ steps.resolve.outputs.sha }}"
+          [ -z "$GITHUB_SHA" ] && GITHUB_SHA="$(git rev-parse HEAD)"
+          export GITHUB_SHA
+          export GITHUB_REF_NAME="${{ steps.resolve.outputs.branch }}"
+          node scripts/release-ci-gate.mjs --dispatch
+
+      - name: Pre-flight gate (full suite)
         # keep the claude-native live e2e subtests in this pre-publish gate (#1248)
+        if: steps.resolve.outputs.proceed == 'true' && env.FAST_ON != 'true'
         env:
           ACP_TEST_CLAUDE_NATIVE: "1"
         run: |
@@ -112,8 +245,36 @@ jobs:
           npm test
           npm run build
 
+      - name: Pre-flight gate (fast mode — build sanity only)
+        # EMERGENCY fast mode: keep the cheap sanity (install/typecheck/build)
+        # so a broken tree still fails loudly, but skip the full npm test —
+        # the lane matrix above was skipped by explicit human choice.
+        if: steps.resolve.outputs.proceed == 'true' && env.FAST_ON == 'true'
+        run: |
+          echo "::warning::FAST MODE by '${{ github.actor }}' (workflow_dispatch fast=true + typed confirmation) — full CI lanes and the full npm test SKIPPED. Publish sanity = version guards + npm ci + typecheck + build only."
+          npm ci
+          npm run typecheck
+          npm run build
+
+      - name: Full CI gate (all lanes green at this sha)
+        # Hard precondition for publish: lanes dispatched above (plus the PR's
+        # own lane runs at the head sha) ran in parallel with the pre-flight;
+        # wait them out now. Any red lane or timeout ⇒ release fails, nothing
+        # is published.
+        if: steps.resolve.outputs.proceed == 'true' && env.FAST_ON != 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CI_GATE_TIMEOUT_MIN: "60"
+        run: |
+          GITHUB_SHA="${{ steps.resolve.outputs.sha }}"
+          [ -z "$GITHUB_SHA" ] && GITHUB_SHA="$(git rev-parse HEAD)"
+          export GITHUB_SHA
+          export GITHUB_REF_NAME="${{ steps.resolve.outputs.branch }}"
+          node scripts/release-ci-gate.mjs --wait
+
       - name: Check if prerelease
         id: pre
+        if: steps.resolve.outputs.proceed == 'true'
         run: |
           if echo "${{ steps.version.outputs.version }}" | grep -q '-'; then
             echo "tag=dev" >> $GITHUB_OUTPUT
@@ -124,6 +285,7 @@ jobs:
           fi
 
       - name: Create tag
+        if: steps.resolve.outputs.proceed == 'true'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -131,11 +293,13 @@ jobs:
           git push origin "v${{ steps.version.outputs.version }}" || true
 
       - name: Publish
+        if: steps.resolve.outputs.proceed == 'true'
         run: npm publish --tag ${{ steps.pre.outputs.tag }} --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Create GitHub Release
+        if: steps.resolve.outputs.proceed == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |

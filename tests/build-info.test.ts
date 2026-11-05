@@ -1,11 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { spawn, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import * as net from "node:net";
 import * as path from "node:path";
 import * as fs from "node:fs";
 import * as os from "node:os";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { VERSION, BUILD_COMMIT, versionWithCommit, PACKAGE_NAME, gitFallbackExecOptions } from "../src/version.js";
 
 const root = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -29,11 +29,43 @@ test("versionWithCommit renders the banner form", () => {
 
 // #2441: pin the git-fallback exec options so a future "simplification" cannot
 // drop windowsHide (a console-less GUI host would flash a console per spawn).
-test("gitFallbackExecOptions: spawns hidden (GUI hosts flash a console otherwise)", () => {
+// #2834: and cannot drop the explicit stdio either — without it Node forwards
+// a failed probe's stderr onto the host terminal at every module load.
+test("gitFallbackExecOptions: spawns hidden and keeps a failed probe's stderr off the terminal", () => {
     const opts = gitFallbackExecOptions();
     assert.equal(opts.windowsHide, true, "an unhidden console child makes Windows allocate a console window");
     assert.equal(opts.encoding, "utf8");
     assert.equal(opts.timeout, 10_000);
+    assert.deepEqual([...opts.stdio], ["ignore", "pipe", "ignore"], "stdout must stay piped (carries the commit hash), stderr ignored");
+});
+
+// #2834: an npm install lives outside any git checkout, so the fallback probe
+// fails there by design — and must fail silently. Run the real options through
+// a real failing git in a child process and assert nothing reaches its stderr.
+test("git fallback probe is silent when the dir is not a git checkout (#2834)", (t) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-nogit-"));
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    // Some sandboxes point TMPDIR at a git worktree; there the probe cannot
+    // fail, so the silence assertion would verify nothing — skip honestly
+    // (same convention as the dist-gated skips above).
+    try {
+        execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd: dir });
+        t.skip("tmpdir is inside a git checkout — the probe cannot fail there");
+        return;
+    } catch {}
+    const versionUrl = pathToFileURL(path.join(root, "src", "version.ts")).href;
+    const script = [
+        'import { execFileSync } from "node:child_process";',
+        `import { gitFallbackExecOptions } from ${JSON.stringify(versionUrl)};`,
+        'try {',
+        '  execFileSync("git", ["rev-parse", "--short", "HEAD"], { ...gitFallbackExecOptions(), cwd: process.argv[1] });',
+        '} catch (e) {',
+        '  if (typeof e?.status !== "number" || e.status === 0) console.error("PROBE-DID-NOT-FAIL");',
+        "}",
+    ].join("\n");
+    const r = spawnSync(process.execPath, ["--import", "tsx", "--input-type=module", "-e", script, dir], { encoding: "utf8" });
+    assert.equal(r.status, 0, `probe child crashed: ${r.stderr}`);
+    assert.equal(r.stderr, "", "a failing probe must not reach the host terminal");
 });
 
 test("--version prints semver plus commit and stays regex-friendly", { skip: !fs.existsSync(distEntry) && "dist not built yet (npm run build)" }, () => {

@@ -8,7 +8,19 @@
 // semantics (#1106/#1148: content is identity): a system change whose
 // history BYTE-EXACTLY CONTINUES the raw key's chain migrates the anchor
 // (same conversation — compression state stays); a history-discontinuous
-// request (auto-review blob) still forks onto `<id>|sub:<fp>`.
+// MAIN-LANE request still forks onto `<id>|sub:<fp>`. (The auto-review
+// blob itself no longer reaches this resolver: since #4438 it rides the
+// stateless side passthrough.)
+//
+// #2989 dual-run: since the #2815 wiring swap the PRODUCTION path is
+// src/session-resolve.ts (order+id claim, fragment guard rails) — the
+// e2e rigs below already exercise it through startServer. The unit block
+// pins the RETIRED ladder as a characterization 瞄点; its live twin runs
+// the SAME corpus through resolveSessionOrder and shares one key
+// expectation wherever the two agree (they do on every row here — the
+// designed differences are action vocabulary and evidence source: v2
+// reaches the migrated raw key through order+head-fragments, not through
+// prefix-affinity chains).
 
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -22,7 +34,10 @@ import { defaultConfig } from "acp-kernel";
 import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { prefixAffinity } from "../src/prefix-affinity.ts";
+// retired-module pin: persona-anchor — characterization 瞄点 only; production
+// routes through src/session-resolve.ts since #2815 (gate: scripts/check-test-import-graph.mjs).
 import { personaAnchorOf, resolvePersonaKey, resetPersonaAnchorsForTest } from "../src/persona-anchor.ts";
+import { resetSessionOrderForTest, resolveSessionOrder } from "../src/session-resolve.ts";
 import { _rememberedForTest, _resetPluginStateForTest } from "../src/plugin.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
@@ -101,6 +116,52 @@ test("resolvePersonaKey: claim → match → migrate (continuing history) → fo
     assert.equal(resolvePersonaKey("unit-conv", SYSTEM_A, extended).action, "migrate", "equal-depth byte-exact replay continues the chain");
 });
 
+// #2989 live twin: the SAME corpus through the wired resolver (what
+// handle.ts calls since #2815). Every row shares one KEY expectation with
+// the retired-ladder block above; the designed differences are action
+// vocabulary (claim/match/migrate/fork → claim/continue/reanchor/
+// derived-persona) and evidence source (v2: order + head fragments, not
+// prefix-affinity chains — the persona lane is chain-free).
+test("live twin: same corpus through resolveSessionOrder — every row lands on the same key", () => {
+    resetSessionOrderForTest();
+    const chain = msgs(6, "u");
+
+    // first arrival claims (shared key)
+    assert.deepEqual({ key: resolveSessionOrder("unit-twin", chain, SYSTEM_A).key }, { key: "unit-twin" });
+    // same system keeps the raw key (old: match → new: continue)
+    assert.equal(resolveSessionOrder("unit-twin", chain, SYSTEM_A).key, "unit-twin");
+    // empty tag is non-anchoring at the library level too (shared key). In
+    // PRODUCTION an empty system never reaches the resolver — handle.ts
+    // routes it verbatim upstream of this call (see the anthropic/openai
+    // personaSystemText === "" branches) — so the retired ladder's
+    // passthrough action has no wired counterpart to pin here.
+    assert.equal(resolveSessionOrder("unit-twin", chain, "").key, "unit-twin");
+    // model switch on a CONTINUING history → raw key (old: migrate via
+    // chainContinues; new: reanchor via order+head-fragments — shared key)
+    const extended = [...chain, { role: "user", content: "u-new-" + "z".repeat(64) }];
+    const migrated = resolveSessionOrder("unit-twin", extended, SYSTEM_B);
+    assert.equal(migrated.key, "unit-twin");
+    assert.equal(migrated.action, "reanchor");
+    // a review-shaped request does NOT continue → fork onto its own lane
+    // (SHARED key: both implementations mint |sub:<sha256(tag)[0..16]>)
+    const reviewList = [{ role: "user", content: "Conversation transcript (flattened):\nuser: build it\nDecide: risky?" }];
+    const forkRes = resolveSessionOrder("unit-twin", reviewList, REVIEW_SYSTEM);
+    assert.equal(forkRes.key, forkKey("unit-twin", REVIEW_SYSTEM));
+    assert.equal(forkRes.action, "derived-persona");
+    // a diverged tail under the OLD system after the migration forks in BOTH
+    // (old: conservative chain break; new: no head-fragment evidence) —
+    // shared key, different fork lane from the review's
+    const diverged = chain.map((m, i) => (i === chain.length - 1 ? { ...m, content: "rewritten-tail-" + "z".repeat(64) } : m));
+    const divRes = resolveSessionOrder("unit-twin", diverged, SYSTEM_A);
+    assert.equal(divRes.key, forkKey("unit-twin", SYSTEM_A));
+    assert.notEqual(divRes.key, forkRes.key, "distinct personas get distinct lanes");
+    // byte-exact replay of the migrated history under the OLD system: the
+    // recorded skeleton IS that history (tag B), so order+fragments prove
+    // continuation → raw again (old: migrate via equal-depth chain replay;
+    // SHARED key)
+    assert.equal(resolveSessionOrder("unit-twin", extended, SYSTEM_A).key, "unit-twin");
+});
+
 // ---------------------------------------------------------------------------
 // e2e rigs (openai + anthropic lanes), mirroring dsh-persona-fingerprint.
 // ---------------------------------------------------------------------------
@@ -128,7 +189,9 @@ async function startRig(): Promise<Rig> {
     setRegistryForTest({});
     _resetSessionsForTest();
     _resetPluginStateForTest();
-    resetPersonaAnchorsForTest();
+    // #2989: live-module hygiene — the e2e path resolves through
+    // session-resolve; the retired anchor map is no longer on it.
+    resetSessionOrderForTest();
     const dir = mkdtempSync(join(testRoot, "run-"));
     for (const key of ["XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME"]) process.env[key] = dir;
     const proxy = await startServer({
@@ -160,12 +223,14 @@ async function startRig(): Promise<Rig> {
 
 async function closeRig(rig: Rig): Promise<void> {
     rig.proxy.close();
+    rig.proxy.closeIdleConnections?.();
     await once(rig.proxy, "close");
     rig.upstream.close();
+    rig.upstream.closeIdleConnections?.();
     await once(rig.upstream, "close");
 }
 
-test("e2e openai lane #2241: model switch keeps the raw key (anchor migration); review still forks; switch back migrates again", async () => {
+test("e2e openai lane #2241/#4438: model switch keeps the raw key (anchor migration); review rides stateless passthrough; switch back migrates again", async () => {
     const rig = await startRig();
     const CONV = "dshc-openai";
     try {
@@ -200,7 +265,10 @@ test("e2e openai lane #2241: model switch keeps the raw key (anchor migration); 
         assert.ok(Object.keys(getSession(CONV).state.messageRefs.byRaw).length > refsA, "refs keep accumulating on the same session (compression state preserved)");
         assert.ok((_rememberedForTest().get(CONV)?.processed.length ?? 0) >= 13, "remembered snapshot tracks the switched history");
 
-        // A review request under the SAME id still forks (isolation intact).
+        // A review request under the SAME id rides the stateless side
+        // passthrough (#4438 supersedes the #2241-era fork): nothing minted,
+        // main session byte-for-byte untouched.
+        const refsBeforeReview = Object.keys(getSession(CONV).state.messageRefs.byRaw).length;
         const r3 = await fetch(url, {
             method: "POST",
             headers,
@@ -213,12 +281,11 @@ test("e2e openai lane #2241: model switch keeps the raw key (anchor migration); 
                 ],
             }),
         });
+        assert.equal(r3.status, 200, "the review forwarded through the side passthrough");
         await r3.text();
-        const fork = forkKey(CONV, REVIEW_SYSTEM);
-        const forkSession = peekSession(fork);
-        assert.ok(forkSession, "review request still forks onto its own session");
-        assert.equal(forkSession.stats.requests, 1, "forked session served the review");
+        assert.equal(peekSession(forkKey(CONV, REVIEW_SYSTEM)), undefined, "review request minted NO forked session (#4438 stateless passthrough)");
         assert.equal(getSession(CONV).stats.requests, 2, "main session untouched by the review");
+        assert.equal(Object.keys(getSession(CONV).state.messageRefs.byRaw).length, refsBeforeReview, "main refs untouched by the review");
 
         // Switch BACK to model A (history continues) → migrate again, raw key.
         const back = [...switched, { role: "user", content: "back on A-" + "z".repeat(64) }];

@@ -6,7 +6,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
-import factory, { ompTrafficRidesBili, shouldBootstrapNativeOmp, planNativeOmp, armNativeOmp, _resetNativeStateForTest, _setSpawnForTest, _stateRespawnForTest } from "../src/agent/omp-native.ts";
+import factory, { ompTrafficRidesBili, shouldBootstrapNativeOmp, planNativeOmp, armNativeOmp, _resetNativeStateForTest, _setSpawnForTest, _stateRespawnForTest, _noteRoutedForTest } from "../src/agent/omp-native.ts";
 import { applyOmpFirstEventTimeout, nativeProxyScriptPath, ompFirstEventTimeoutValue, OMP_FIRST_EVENT_TIMEOUT_DEFAULT_MS, OMP_FIRST_EVENT_TIMEOUT_ENV } from "../src/agent/native-bootstrap.ts";
 import { pluginInstall, pluginRemove, pluginStatusAll, selfPackageRoot, ompPluginLoadedFrom } from "../src/plugin-install.ts";
 import { rmrf } from "./tmp-rm.ts";
@@ -14,6 +14,13 @@ import { rmrf } from "./tmp-rm.ts";
 // #1135 wiring tests drive verifyAttachAndRecover against a dead target — cap
 // the routed-evidence grace so the probe fails fast instead of paying the 5s default.
 process.env.BILI_ATTACH_EVIDENCE_GRACE_MS = "30";
+
+// #3501: a dev shell running omp through a launcher exports a live attach
+// target; verifyAttachAndRecover reads BILLION_CONTEXT_ATTACH explicitly, so
+// every suite below must start from a clean slate or it silently binds to the
+// real proxy instead of the mock it set up.
+delete process.env.BILLION_CONTEXT_ATTACH;
+delete process.env.BILLION_CONTEXT_PROXY;
 
 // #957 coexistence: markNativeHost must be set synchronously during module
 // evaluation so any in-process bili extension backs off in THIS process.
@@ -270,6 +277,107 @@ test("#1135 wiring: a healthy attach target stays attached (no migration, no spa
         server.close();
         if (savedProxy === undefined) delete process.env.BILLION_CONTEXT_PROXY;
         else process.env.BILLION_CONTEXT_PROXY = savedProxy;
+        _resetNativeStateForTest();
+    }
+});
+
+// — #3501: an explicit attach endpoint stays authoritative over routed model-origin evidence —
+
+const R3501_UPSTREAM = "https://api.deepseek.com/v1/chat/completions";
+
+async function startGatedModelOrigin(): Promise<{ origin: string; close: () => void; manifestHits: () => number }> {
+    let hits = 0;
+    const server = createServer((req, res) => {
+        if (req.url === "/__bili/plugin/manifest") hits++;
+        res.statusCode = 403;
+        res.end();
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
+    return {
+        origin: `http://127.0.0.1:${(server.address() as AddressInfo).port}`,
+        close: () => { server.closeAllConnections?.(); void server.close(); },
+        manifestHits: () => hits,
+    };
+}
+
+test("#3501 wiring: pre-planted routed evidence from an admin-gated origin does not displace an explicit attach", async () => {
+    const attach = createServer((req, res) => {
+        if (req.url === "/__bili/plugin/manifest") {
+            res.setHeader("content-type", "application/json");
+            res.end(JSON.stringify({ version: "0.1.175", tools: [] }));
+            return;
+        }
+        res.statusCode = 404;
+        res.end();
+    });
+    await new Promise<void>((r) => attach.listen(0, "127.0.0.1", () => r()));
+    const attachOrigin = `http://127.0.0.1:${(attach.address() as AddressInfo).port}`;
+    const model = await startGatedModelOrigin();
+    try {
+        _resetNativeStateForTest();
+        process.env.BILLION_CONTEXT_ATTACH = attachOrigin;
+        _noteRoutedForTest(`${model.origin}/bili/${R3501_UPSTREAM}`);
+        let spawned = 0;
+        _setSpawnForTest(async () => {
+            spawned++;
+            return "http://127.0.0.1:7777";
+        });
+        armNativeOmp({ mode: "attach", attachOrigin });
+        const landed = await _stateRespawnForTest()!();
+        assert.equal(landed, attachOrigin, "recovery probes the explicit plugin endpoint, not the model-only origin");
+        assert.equal(spawned, 0, "a second proxy must not be spawned for an API-only model route");
+        assert.equal(model.manifestHits(), 0, "pre-existing model-route evidence must not override explicit attach");
+        assert.equal(process.env.BILLION_CONTEXT_PROXY, attachOrigin);
+    } finally {
+        attach.closeAllConnections?.();
+        attach.close();
+        model.close();
+        delete process.env.BILLION_CONTEXT_ATTACH;
+        delete process.env.BILLION_CONTEXT_PROXY;
+        _setSpawnForTest(undefined);
+        _resetNativeStateForTest();
+    }
+});
+
+test("#3501 wiring: late routed evidence from an admin-gated origin does not rebind away from a healthy explicit attach", async () => {
+    const attach = createServer((req, res) => {
+        if (req.url === "/__bili/plugin/manifest") {
+            res.setHeader("content-type", "application/json");
+            res.end(JSON.stringify({ version: "0.1.175", tools: [] }));
+            return;
+        }
+        res.statusCode = 404;
+        res.end();
+    });
+    await new Promise<void>((r) => attach.listen(0, "127.0.0.1", () => r()));
+    const attachOrigin = `http://127.0.0.1:${(attach.address() as AddressInfo).port}`;
+    const model = await startGatedModelOrigin();
+    try {
+        _resetNativeStateForTest();
+        process.env.BILLION_CONTEXT_ATTACH = attachOrigin;
+        let spawned = 0;
+        _setSpawnForTest(async () => {
+            spawned++;
+            return "http://127.0.0.1:7777";
+        });
+        armNativeOmp({ mode: "attach", attachOrigin });
+        const landed = await _stateRespawnForTest()!();
+        assert.equal(landed, attachOrigin, "healthy explicit target resolves to itself");
+        _noteRoutedForTest(`${model.origin}/bili/${R3501_UPSTREAM}`);
+        const deadline = Date.now() + 5000;
+        while (model.manifestHits() < 1 && Date.now() < deadline) {
+            await new Promise((r) => setTimeout(r, 10));
+        }
+        assert.equal(model.manifestHits(), 1, "the hook liveness-probes the late routed origin exactly once");
+        assert.equal(process.env.BILLION_CONTEXT_PROXY, attachOrigin, "a failing probe must not rebind off the healthy explicit endpoint");
+        assert.equal(spawned, 0);
+    } finally {
+        attach.closeAllConnections?.();
+        attach.close();
+        model.close();
+        delete process.env.BILLION_CONTEXT_ATTACH;
+        delete process.env.BILLION_CONTEXT_PROXY;
+        _setSpawnForTest(undefined);
         _resetNativeStateForTest();
     }
 });

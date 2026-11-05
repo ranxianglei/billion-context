@@ -97,10 +97,10 @@ test("discoverRoutes: qwen default → cert-MITM whitelist of stock Qwen/DashSco
     assert.deepEqual(routes.httpEnvRoutes, []);
 });
 
-test("discoverRoutes: antigravity default → CLOUD_CODE_URL /bili/ rewrite of cloudcode-pa.googleapis.com (#2115)", () => {
+test("discoverRoutes: antigravity default → CLOUD_CODE_URL /bili/ rewrite of daily-cloudcode-pa.googleapis.com (#2115)", () => {
     assert.deepEqual(discoverRoutes("antigravity", {}), {
         ...EMPTY_ROUTES,
-        httpRewrites: [{ key: "CLOUD_CODE_URL", realUpstream: "https://cloudcode-pa.googleapis.com" }],
+        httpRewrites: [{ key: "CLOUD_CODE_URL", realUpstream: "https://daily-cloudcode-pa.googleapis.com" }],
     });
 });
 
@@ -122,7 +122,7 @@ test("discoverRoutes: antigravity unparseable CLOUD_CODE_URL → empty routes (c
 
 test("discoverRoutes: antigravity blank base URL behaves like unset (default upstream)", () => {
     assert.deepEqual(discoverRoutes("antigravity", { antigravity: { baseUrl: "   " } }).httpRewrites,
-        [{ key: "CLOUD_CODE_URL", realUpstream: "https://cloudcode-pa.googleapis.com" }]);
+        [{ key: "CLOUD_CODE_URL", realUpstream: "https://daily-cloudcode-pa.googleapis.com" }]);
 });
 
 test("buildGeminiEnv: wraps the rewrite target under /bili/, no proxy/CA env (GATEWAY mode goes direct)", () => {

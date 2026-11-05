@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
@@ -287,6 +287,167 @@ test("#2298: boot scan silently skips co-resident CCR content-store files (no in
         );
         assert.ok(!logs.some((line) => line.includes(".content-store.json")), "content-store file never surfaces in boot logs");
     } finally {
+        _setStoreForTest(new SessionStore({ enabled: false }));
+        rmrf(dir);
+    }
+});
+
+// #2674: the CCR content-store companion write is atomic (same-dir temp +
+// rename, mirroring kernel StateStore.writeInner). Pin the contract end-to-end:
+// a successful save leaves no temp orphans; a failed save preserves the previous
+// envelope byte-identical and stays dirty; a crashed write (orphaned temp) leaves
+// the live envelope retrievable; a hand-truncated file degrades loudly to fresh;
+// and the boot sweep clears every leftover .tmp-* orphan (not just .tmp-enc-*).
+
+function findTmpOrphans(root: string): string[] {
+    const out: string[] = [];
+    for (const d of readdirSync(root)) {
+        const p = path.join(root, d);
+        if (!statSync(p).isDirectory()) continue;
+        for (const f of readdirSync(p)) {
+            if (f.startsWith(".tmp-")) out.push(path.join(p, f));
+        }
+    }
+    return out;
+}
+
+test("#2674: successful content-store save leaves no .tmp-* orphans (temp + rename)", () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "bili-ccr-atomic-"));
+    const store = new SessionStore({ dir, debounceMs: 0 });
+    _setStoreForTest(store);
+    try {
+        const session = getSession(`ccr-atomic-${Math.random().toString(36).slice(2)}`);
+        storeEffectiveCcr(session, { enabled: true, minToolTokens: 50 });
+        adoptContentStore(session, turnWith(ccrConfig()).contentStore);
+        const ref = Object.keys(session.contentStore!.byRef)[0]!;
+        assert.ok(store.flushSync(session), "session + content-store persisted");
+        assert.ok(findEnvelope(dir), "content-store envelope written");
+        assert.deepEqual(findTmpOrphans(dir), [], "no .tmp-* orphan left behind after a successful save");
+        assert.ok(store.loadContentStore(session)?.byRef[ref], "stored original still retrievable");
+    } finally {
+        store.cancelAll();
+        _setStoreForTest(new SessionStore({ enabled: false }));
+        rmrf(dir);
+    }
+});
+
+// #2674: skipped on win32 — the forced failure below uses chmodSync(0o500),
+// which NTFS ignores (POSIX-only); node:fs has no portable EACCES primitive, so
+// the byte-identical assertion would flip there. Atomicity stays pinned on
+// Windows by the no-orphan / crashed-temp / boot-sweep pins.
+test("#2674: a failed content-store save leaves the previous envelope byte-identical and stays dirty", {
+    skip: process.platform === "win32" ? "chmod-based EACCES injection is POSIX-only (NTFS ignores mode bits), #2674" : false,
+}, () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "bili-ccr-atomicfail-"));
+    const logs: string[] = [];
+    const store = new SessionStore({ dir, debounceMs: 60_000, log: (level, msg) => logs.push(`${level}:${msg}`) });
+    _setStoreForTest(store);
+    try {
+        const session = getSession(`ccr-atomicfail-${Math.random().toString(36).slice(2)}`);
+        storeEffectiveCcr(session, { enabled: true, minToolTokens: 50 });
+        adoptContentStore(session, turnWith(ccrConfig()).contentStore);
+        assert.ok(store.flushSync(session));
+        const file = findEnvelope(dir)!;
+        const protoDir = path.dirname(file);
+        const v1 = readFileSync(file);
+
+        adoptContentStore(session, turnTwoResults(ccrConfig()).contentStore);
+        assert.ok(session.contentStore?.byRef.m00005, "second turn adds a new stored ref");
+        chmodSync(protoDir, 0o500);
+        try {
+            store.scheduleSave(session);
+            assert.ok(readFileSync(file).equals(v1), "previous envelope byte-identical after the failed write");
+            assert.equal(session.contentStoreDirty, true, "failed save re-marks the store dirty for retry");
+            assert.ok(logs.some((l) => l.includes("content-store write failed")), "the failure was warned");
+            assert.deepEqual(findTmpOrphans(dir), [], "the failed temp was unlinked — none left behind");
+        } finally {
+            chmodSync(protoDir, 0o700);
+        }
+    } finally {
+        store.cancelAll();
+        _setStoreForTest(new SessionStore({ enabled: false }));
+        rmrf(dir);
+    }
+});
+
+test("#2674: a crashed content-store write (orphaned temp) leaves the live envelope retrievable", () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "bili-ccr-atomiccrash-"));
+    const store = new SessionStore({ dir, debounceMs: 0 });
+    _setStoreForTest(store);
+    try {
+        const session = getSession(`ccr-atomiccrash-${Math.random().toString(36).slice(2)}`);
+        storeEffectiveCcr(session, { enabled: true, minToolTokens: 50 });
+        adoptContentStore(session, turnWith(ccrConfig()).contentStore);
+        const ref = Object.keys(session.contentStore!.byRef)[0]!;
+        assert.ok(store.flushSync(session));
+        const file = findEnvelope(dir)!;
+        const liveBefore = readFileSync(file);
+
+        // Simulate a process death BETWEEN the temp write and the rename: a
+        // truncated temp sits beside the still-intact live envelope. Pre-fix the
+        // crash truncated the live file itself and dropped every stored original.
+        const orphan = path.join(path.dirname(file), `.tmp-${path.basename(file, ".json")}-99999-1`);
+        writeFileSync(orphan, liveBefore.subarray(0, Math.floor(liveBefore.length / 2)), "utf8");
+        assert.ok(existsSync(orphan), "post-crash state: truncated temp present");
+
+        assert.ok(readFileSync(file).equals(liveBefore), "live envelope byte-identical — the crash hit the temp, not the file");
+        assert.ok(store.loadContentStore(session)?.byRef[ref], "the stored original is still retrievable after the crash");
+    } finally {
+        store.cancelAll();
+        _setStoreForTest(new SessionStore({ enabled: false }));
+        rmrf(dir);
+    }
+});
+
+test("#2674: a hand-truncated content-store file degrades to a fresh store, loudly warned", () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "bili-ccr-atomictrunc-"));
+    const logs: string[] = [];
+    const store = new SessionStore({ dir, debounceMs: 0, log: (level, msg) => logs.push(`${level}:${msg}`) });
+    _setStoreForTest(store);
+    try {
+        const session = getSession(`ccr-atomictrunc-${Math.random().toString(36).slice(2)}`);
+        storeEffectiveCcr(session, { enabled: true, minToolTokens: 50 });
+        adoptContentStore(session, turnWith(ccrConfig()).contentStore);
+        assert.ok(store.flushSync(session));
+        const file = findEnvelope(dir)!;
+        const full = readFileSync(file);
+
+        writeFileSync(file, full.subarray(0, Math.floor(full.length / 2)), "utf8");
+        const loaded = store.loadContentStore(session);
+        assert.equal(loaded, null, "corrupt envelope degrades to a fresh store (retrieve misses, no crash)");
+        assert.ok(logs.some((l) => l.includes("malformed, starting fresh") || l.includes("unreadable, starting fresh")), "the degradation was loudly warned");
+    } finally {
+        store.cancelAll();
+        _setStoreForTest(new SessionStore({ enabled: false }));
+        rmrf(dir);
+    }
+});
+
+test("#2674: boot sweep removes leftover .tmp-* orphans (not just .tmp-enc-*)", async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "bili-ccr-atomicsweep-"));
+    const writer = new SessionStore({ dir, debounceMs: 0 });
+    _setStoreForTest(writer);
+    try {
+        const session = getSession(`ccr-atomicsweep-${Math.random().toString(36).slice(2)}`);
+        storeEffectiveCcr(session, { enabled: true, minToolTokens: 50 });
+        adoptContentStore(session, turnWith(ccrConfig()).contentStore);
+        assert.ok(writer.flushSync(session));
+        const file = findEnvelope(dir)!;
+        const protoDir = path.dirname(file);
+
+        const csOrphan = path.join(protoDir, `.tmp-${path.basename(file, ".json")}-99999-1`);
+        const encOrphan = `${file}.tmp-enc-99999-1700000000000`;
+        writeFileSync(csOrphan, "stale content-store temp");
+        writeFileSync(encOrphan, "stale codec temp");
+
+        const booted = new SessionStore({ dir, debounceMs: 0 });
+        const loaded = await booted.boot();
+        assert.ok(loaded.has(session.id), "the session still loads at boot");
+        assert.equal(existsSync(csOrphan), false, "leftover .tmp-* content-store temp swept");
+        assert.equal(existsSync(encOrphan), false, "legacy .tmp-enc-* temp still swept");
+        assert.ok(existsSync(file), "the live envelope itself is NOT swept");
+    } finally {
+        writer.cancelAll();
         _setStoreForTest(new SessionStore({ enabled: false }));
         rmrf(dir);
     }

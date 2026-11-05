@@ -15,15 +15,28 @@ import { rmrf } from "./tmp-rm.ts";
 import { supportsDirectorySymlink } from "./platform-capabilities.ts";
 
 // LOCK_FILE is frozen at update.ts module load — redirect the cache tree
-// BEFORE importing it (same discipline as auto-restart.test.ts).
+// BEFORE importing it (same discipline as auto-restart.test.ts). #3619: this
+// suite pins dsh-channel mechanics, not rollout timing — legacy immediate
+// upgrades (stagger 0/0) + unroutable policy URL keep it hermetic.
 const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-selfrefresh-")));
 process.env.XDG_CACHE_HOME = path.join(root, "cache");
+// A developer machine's real bili config (e.g. update.registry pointing at a
+// local verdaccio) would leak into this suite and route the mocked registry
+// lookups elsewhere — isolate the config tree too (same as update-policy.test.ts).
+process.env.XDG_CONFIG_HOME = path.join(root, "config");
+process.env.BILI_UPDATE_STAGGER_MIN_MS = "0";
+process.env.BILI_UPDATE_STAGGER_MAX_MS = "0";
+process.env.BILI_UPDATE_POLICY_URL = "http://127.0.0.1:1/no-policy.json";
 
 const { refreshDshProfileCopy } = await import("../src/update.ts");
 const { isDshProfileCopy, _setDshRunnersForTest } = await import("../src/dsh-channel.ts");
 
 after(() => {
     delete process.env.XDG_CACHE_HOME;
+    delete process.env.XDG_CONFIG_HOME;
+    delete process.env.BILI_UPDATE_STAGGER_MIN_MS;
+    delete process.env.BILI_UPDATE_STAGGER_MAX_MS;
+    delete process.env.BILI_UPDATE_POLICY_URL;
     rmrf(root);
 });
 
@@ -111,7 +124,10 @@ function makeFixture(version: string): Fixture {
 async function withRegistry<T>(version: string | undefined, fn: (fetches: { count: number }) => Promise<T>): Promise<T> {
     const original = globalThis.fetch;
     const fetches = { count: 0 };
-    globalThis.fetch = (() => {
+    // Only registry traffic is counted/mocked; anything else (e.g. the #3619
+    // update-policy fetch) passes through to the real fetch untouched.
+    globalThis.fetch = ((input: string | URL | Request, init?: RequestInit) => {
+        if (!String(input).includes("registry.npmjs.org")) return original(input, init);
         fetches.count += 1;
         return version === undefined
             ? Promise.resolve(new Response("nope", { status: 500 }))
@@ -125,14 +141,25 @@ async function withRegistry<T>(version: string | undefined, fn: (fetches: { coun
 }
 
 /** Records `dsh plugin …` invocations (platform-neutral, mirroring
- *  dsh-refresh.test.ts's recorder). */
-function recordingAsyncRunner(calls: string[]): (plan: DshPlan) => Promise<{ stdout: string; stderr: string }> {
+ *  dsh-refresh.test.ts's recorder). #5642: a successful op materializes the
+ *  requested version into the profile's node_modules, mirroring what the real
+ *  channel leaves behind — refreshDshProfileBundles verifies that outcome
+ *  instead of trusting the exit code. */
+function recordingAsyncRunner(dshHome: string, calls: string[]): (plan: DshPlan) => Promise<{ stdout: string; stderr: string }> {
     return async (plan) => {
         const base = path.basename(plan.command).toLowerCase();
         const tokens = base === "cmd.exe" || base === "cmd"
             ? (plan.args[3] ?? "").replace(/^"|"$/g, "").split(" ").map((t) => t.replace(/^"|"$/g, "")).filter((t) => t.length > 0).slice(1)
             : [...plan.args];
         calls.push(tokens.join(" "));
+        const name = tokens[tokens.indexOf("--profile") + 1];
+        const spec = tokens[tokens.length - 1];
+        const version = spec.startsWith("billion-context@") ? spec.slice("billion-context@".length) : undefined;
+        if (name !== undefined && version !== undefined) {
+            const copy = path.join(dshHome, "profiles", name, "node_modules", "billion-context");
+            fs.mkdirSync(copy, { recursive: true });
+            fs.writeFileSync(path.join(copy, "package.json"), JSON.stringify({ name: "billion-context", version }));
+        }
         return { stdout: "", stderr: "" };
     };
 }
@@ -149,7 +176,7 @@ test("refreshDshProfileCopy: stale registry-pinned profile refreshes via dsh's c
     const calls: string[] = [];
     const { log, entries } = makeLog();
     try {
-        _setDshRunnersForTest({ async: recordingAsyncRunner(calls) });
+        _setDshRunnersForTest({ async: recordingAsyncRunner(fx.dshHome, calls) });
         await withRegistry("0.1.140", async (fetches) => {
             await refreshDshProfileCopy(fx.installDir, OPTS, fx.env, log);
             assert.equal(fetches.count, 1, "one registry lookup");
@@ -167,7 +194,7 @@ test("refreshDshProfileCopy: up-to-date copy never spawns dsh", async () => {
     const calls: string[] = [];
     const { log, entries } = makeLog();
     try {
-        _setDshRunnersForTest({ async: recordingAsyncRunner(calls) });
+        _setDshRunnersForTest({ async: recordingAsyncRunner(fx.dshHome, calls) });
         await withRegistry("0.1.140", async () => {
             await refreshDshProfileCopy(fx.installDir, OPTS, fx.env, log);
         });
@@ -184,7 +211,7 @@ test("refreshDshProfileCopy: registry unreachable → warn, no spawn, no throw",
     const calls: string[] = [];
     const { log, entries } = makeLog();
     try {
-        _setDshRunnersForTest({ async: recordingAsyncRunner(calls) });
+        _setDshRunnersForTest({ async: recordingAsyncRunner(fx.dshHome, calls) });
         await withRegistry(undefined, async () => {
             await refreshDshProfileCopy(fx.installDir, OPTS, fx.env, log);
         });
@@ -204,7 +231,7 @@ test("refreshDshProfileCopy: non-dsh install dir returns before any registry fet
         fs.writeFileSync(path.join(installDir, "package.json"), JSON.stringify({ name: "billion-context", version: "0.1.139" }));
         const env = { ...process.env, DSH_HOME: path.join(base, "dsh") };
         const calls: string[] = [];
-        _setDshRunnersForTest({ async: recordingAsyncRunner(calls) });
+        _setDshRunnersForTest({ async: recordingAsyncRunner(path.join(base, "dsh"), calls) });
         await withRegistry("0.1.140", async (fetches) => {
             await refreshDshProfileCopy(installDir, OPTS, env, () => {});
             assert.equal(fetches.count, 0, "no registry fetch for a non-dsh copy");
@@ -225,7 +252,7 @@ test("refreshDshProfileCopy: a live update lock defers the refresh to the next c
     fs.mkdirSync(lockDir, { recursive: true });
     fs.writeFileSync(lockFile, JSON.stringify({ pid: process.pid, ts: Date.now() }), { flag: "wx" });
     try {
-        _setDshRunnersForTest({ async: recordingAsyncRunner(calls) });
+        _setDshRunnersForTest({ async: recordingAsyncRunner(fx.dshHome, calls) });
         await withRegistry("0.1.140", async () => {
             await refreshDshProfileCopy(fx.installDir, OPTS, fx.env, log);
         });

@@ -40,13 +40,15 @@ test("e2e proxy smoke: compress tool-call -> re-request -> round-2 streams in re
                     "content-type": "text/event-stream",
                     "cache-control": "no-cache",
                 });
+                // m00001 is the leading system message; m00002/m00003 are the
+                // two big fillers the fold must actually cover.
                 const compressArgs = JSON.stringify({
                     content: [
                         {
-                            startId: "m00001",
-                            endId: "m00002",
+                            startId: "m00002",
+                            endId: "m00003",
                             topic: "smoke",
-                            summary: "smoke test summary",
+                            summary: "smoke test round trip: fixture history folded into one block",
                         },
                     ],
                 });
@@ -148,13 +150,25 @@ test("e2e proxy smoke: compress tool-call -> re-request -> round-2 streams in re
     const proxyPort = (proxy.address() as { port: number }).port;
 
     const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/chat/completions`;
-    const big = "x".repeat(3000);
+    // History shaped so the mock's m00002–m00003 fold genuinely SUCCEEDS: the
+    // two leading fillers clear the 5000-char minCompressRange and the seven
+    // trailing ones push them past the soft-protected recent zone
+    // (preserveRecentTokens walks back 5000 tokens from the tail). A failed
+    // compress ends the turn under #156/#4186 and would un-test this path.
+    const big = "x".repeat(4000);
     const body = {
         model: "gpt-test",
         stream: true,
         messages: [
             { role: "system", content: "You are a test assistant." },
             { role: "user", content: big },
+            { role: "assistant", content: big },
+            { role: "user", content: big },
+            { role: "assistant", content: big },
+            { role: "user", content: big },
+            { role: "assistant", content: big },
+            { role: "user", content: big },
+            { role: "assistant", content: big },
             { role: "user", content: big },
         ],
     };

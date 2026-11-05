@@ -1,0 +1,24 @@
+{
+  "mcpServers": {
+    "bili": {
+      "command": "node",
+      "args": [
+        "./mcp-server.mjs"
+      ],
+      "env_vars": [
+        "BILI_MCP_PROXY",
+        "BILI_CONVERSATION_ID",
+        "PATH",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "USERPROFILE",
+        "HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_STATE_HOME",
+        "TMPDIR"
+      ],
+      "startup_timeout_sec": 30
+    }
+  }
+}

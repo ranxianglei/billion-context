@@ -95,9 +95,64 @@ test("executeSearchContext: zero active blocks → explicit empty-state message 
     assert.equal(executeSearchContext({ query: "anything" }, core, state).text, "[No compressed blocks exist yet — nothing to search.]");
 });
 
-test("executeSearchContext: active block exists but none match → no-match string", () => {
+test("executeSearchContext: active block exists but none match → scope-limited no-match (#2751)", () => {
     const { core, state } = makeSessionWithBlock();
-    assert.match(executeSearchContext({ query: "zzz-no-such-topic" }, core, state).text, /^\[No blocks matched "zzz-no-such-topic"\]$/);
+    // Negative result states what was searched (active + folded-away blocks) and never
+    // reads as "history doesn't contain it".
+    assert.match(executeSearchContext({ query: "zzz-no-such-topic" }, core, state).text, /^\[No blocks matched "zzz-no-such-topic" among 1 block\(s\)\. Scope = compressed topics\/summaries \(active \+ folded-away\)/);
+});
+
+test("executeSearchContext: inactive (consumed) block still searchable, marked inactive (#4154)", () => {
+    const { core, state } = makeSessionWithBlock();
+    state.blocks[0]!.active = false;
+    const out = executeSearchContext({ query: "auth token" }, core, state).text;
+    assert.match(out, /^Found 1 block\(s\) for "auth token":/);
+    assert.ok(out.includes("[inactive — folded away; decompress b"), "inactive marker with restore pointer");
+});
+
+test("executeSearchContext: original folded text matches when no summary does (#4154)", () => {
+    const { core, state } = makeSessionWithBlock();
+    const needle = "xyzzy-verbatim-only-in-original";
+    const out = executeSearchContext(
+        { query: needle },
+        core,
+        state,
+        undefined,
+        undefined,
+        () => [{ blockId: state.blocks[0]!.blockId, text: `plain original text containing ${needle} verbatim` }],
+    ).text;
+    assert.ok(out.includes("Original-text hit(s)"), "original-text section present");
+    assert.ok(out.includes("(original text, not in any summary)"), "hit line typed as original text");
+    assert.ok(out.includes(needle), "query echoed inside the original preview");
+});
+
+test("executeSearchContext: no-match + originals provider → note that folded originals were searched (#4154)", () => {
+    const { core, state } = makeSessionWithBlock();
+    const out = executeSearchContext(
+        { query: "zzz-no-such-topic" },
+        core,
+        state,
+        undefined,
+        undefined,
+        () => [{ blockId: state.blocks[0]!.blockId, text: "auth token original text" }],
+    ).text;
+    assert.match(out, /^\[No blocks matched "zzz-no-such-topic" among 1 block\(s\)\. Scope = compressed topics\/summaries \(active \+ folded-away\) \+ the folded original text/);
+});
+
+test("executeSearchContext: throwing originals provider degrades to summary-only search (#4154)", () => {
+    const { core, state } = makeSessionWithBlock();
+    const out = executeSearchContext(
+        { query: "auth token" },
+        core,
+        state,
+        undefined,
+        undefined,
+        () => {
+            throw new Error("boom");
+        },
+    ).text;
+    assert.match(out, /^Found 1 block\(s\) for "auth token":/);
+    assert.ok(!out.includes("Original-text hit(s)"), "no original section on provider failure");
 });
 
 test("executeSearchContext: matching block → Found listing with id/topic/preview", () => {
@@ -105,7 +160,9 @@ test("executeSearchContext: matching block → Found listing with id/topic/previ
     const out = executeSearchContext({ query: "auth token" }, core, state).text;
     assert.match(out, /^Found \d+ block\(s\) for "auth token":/);
     assert.ok(out.includes("(T"), "tier present");
-    assert.ok(out.includes("auth token exchange"), "summary preview present");
+    // #2751: the distinctive matched term is surfaced + marked inside the window.
+    assert.ok(out.includes("\u3010auth\u3011"), "distinctive term marked");
+    assert.ok(out.includes("token exchange and refresh design decisions"), "summary preview present");
 });
 
 test("executeSearchContext: clamp cut straddling an astral char leaves no lone surrogate (#816)", () => {

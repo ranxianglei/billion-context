@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
-import { defaultConfig, createInitialState, IMAGE_FULL_TOOL_NAME } from "acp-kernel";
+import { defaultConfig, createInitialState } from "acp-kernel";
 import { startServer, stripLeakedBiliTools, BILI_TOOL_NAMES } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { PROXY_TOOL_NAMES, ABSORB_TOOL_NAME, RETRIEVE_TOOL_NAME, RULE_TOOL_NAME } from "../src/compress-tool.ts";
@@ -59,9 +59,9 @@ test("stripLeakedBiliTools: google functionDeclarations (one entry may declare m
 });
 
 test("stripLeakedBiliTools: opt-in bili extras count as bili-owned", () => {
-    const body = { model: "m", tools: [openAiTool(ABSORB_TOOL_NAME), openAiTool(RULE_TOOL_NAME), openAiTool(RETRIEVE_TOOL_NAME), openAiTool(IMAGE_FULL_TOOL_NAME)] };
+    const body = { model: "m", tools: [openAiTool(ABSORB_TOOL_NAME), openAiTool(RULE_TOOL_NAME), openAiTool(RETRIEVE_TOOL_NAME)] };
     assert.equal(stripLeakedBiliTools(body), true);
-    for (const n of [ABSORB_TOOL_NAME, RULE_TOOL_NAME, RETRIEVE_TOOL_NAME, IMAGE_FULL_TOOL_NAME]) {
+    for (const n of [ABSORB_TOOL_NAME, RULE_TOOL_NAME, RETRIEVE_TOOL_NAME]) {
         assert.ok(BILI_TOOL_NAMES.has(n), `${n} in the bili set`);
     }
 });
@@ -164,8 +164,10 @@ async function startRig(): Promise<Rig> {
 
 async function closeRig(rig: Rig): Promise<void> {
     rig.proxy.close();
+    rig.proxy.closeIdleConnections?.();
     await once(rig.proxy, "close");
     rig.upstream.close();
+    rig.upstream.closeIdleConnections?.();
     await once(rig.upstream, "close");
 }
 

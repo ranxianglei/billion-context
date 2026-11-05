@@ -5,7 +5,7 @@ import type { Config, CoreMessage } from "acp-kernel";
 import { createCore, createInitialState, assignRefs, emptyRefMap, defaultConfig } from "acp-kernel";
 import type { Session } from "../src/session.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
-import { applyRanges, beyondFrontierNote, type RewriteCtx } from "../src/stream.ts";
+import { applyRanges, beyondFrontierNote, frontierClampNote, type RewriteCtx } from "../src/stream.ts";
 import { parseCompressInput } from "../src/compress-tool.ts";
 
 _setStoreForTest(new SessionStore({ enabled: false }));
@@ -137,6 +137,38 @@ test("#2146: beyondFrontierNote unit shapes", () => {
     assert.equal(beyondFrontierNote(emptyState, [{ startRef: "m00001", endRef: "m00002" }]), "", "no mapped refs");
 });
 
+test("#4252: partially-past-frontier ranges get the ceiling clamp note", () => {
+    const res = assignRefs([textMsg("r1", "assistant", "abc"), textMsg("r2", "assistant", "def")], { existing: emptyRefMap(), nextIndex: 0 });
+    const state = createInitialState();
+    state.messageRefs = res.map;
+    // start inside, end above: the incident shape (allocation lags rendering)
+    const note = frontierClampNote(state, [{ startRef: "m00001", endRef: "m00006" }], "");
+    assert.match(note, /highest stored ref \(m00002\)/, "names the ceiling");
+    assert.match(note, /Retry with endId ≤ m00002/, "gives the actionable clamp");
+    // suppressed when the all-above note already fired
+    assert.equal(frontierClampNote(state, [{ startRef: "m00006", endRef: "m00010" }], "beyond"), "", "beyond note takes precedence");
+    // fully in-frontier ranges get nothing
+    assert.equal(frontierClampNote(state, [{ startRef: "m00001", endRef: "m00002" }], ""), "", "in-frontier suppresses");
+    // b-refs have no cross-namespace ordering — never fire
+    assert.equal(frontierClampNote(state, [{ startRef: "b1", endRef: "b9" }], ""), "", "block-id endpoints ignored");
+    // empty state / empty ranges
+    assert.equal(frontierClampNote(createInitialState(), [{ startRef: "m00001", endRef: "m00002" }], ""), "", "no mapped refs");
+    assert.equal(frontierClampNote(state, [], ""), "", "empty range list");
+});
+
+test("#4252: mixed receipt names the ceiling instead of generic guidance", () => {
+    const msgs: CoreMessage[] = [
+        textMsg("raw_1", "assistant", "a".repeat(800)),
+        textMsg("raw_2", "assistant", "b".repeat(800)),
+    ];
+    const ctx = makeCtx(msgs);
+    const mixed = applyRanges(parseCompressInput(compressArgs("m00001", "m00010")), ctx).text;
+    assert.ok(mixed.startsWith("[Compression FAILED:"), "still fails");
+    assert.match(mixed, /highest stored ref \(m00002\)/, "clamp note present for start-in/end-out");
+    assert.match(mixed, /Retry with endId ≤ m00002/, "actionable clamp in the receipt");
+    assert.match(mixed, /m00010/, "the above-frontier endpoint stays verbatim (typo-correctable)");
+});
+
 test("#2146: loopTracking:false (preflight lane) never touches the model-facing streak", () => {
     const ctx = makeCtx(fixtureMessages());
     for (let i = 0; i < 5; i++) {
@@ -159,7 +191,8 @@ test("#2146: stale-generation receipts scrub the phantom refs; in-frontier failu
     assert.match(stale, /\[stale-ref\]/, "scrubbed marker takes their place");
 
     const mixed = applyRanges(parseCompressInput(compressArgs("m00001", "m00009")), ctx).text;
-    assert.ok(mixed.startsWith("[Compression FAILED:"), "still fails");
-    assert.ok(!mixed.includes("above this session's highest ref"), "note suppressed (start inside frontier)");
-    assert.match(mixed, /m00009/, "an in-frontier unknown endpoint stays verbatim — a real typo the model can correct");
+    assert.ok(mixed.startsWith("[Compressed "), "#4521 flip: an out-frontier endId clamps to the highest allocated ref instead of failing");
+    assert.match(mixed, /endId="m00009" is above this session's highest allocated ref \(m00008\)/, "the receipt names the clamp");
+    assert.match(mixed, /clamped to it/, "the model is told what happened to its endpoint");
+    assert.match(mixed, /m00009/, "the above-frontier endpoint stays verbatim (typo-correctable)");
 });

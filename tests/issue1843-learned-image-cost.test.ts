@@ -234,8 +234,10 @@ test("e2e #1843 L1: learned image cost rescues a session the bytes prior bricks"
         assert.equal(stats.summaryCalls, 0, "no folding was needed — text fit all along");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });

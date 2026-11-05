@@ -17,15 +17,15 @@ entries:
     default: "false"
     env: ACP_DUMP_BODY
     group: diagnostics
-    desc_en: "Dump full request/response bodies to the log for troubleshooting."
-    desc_zh: "把完整请求/响应体转储到日志用于排障。"
+    desc_en: "Dump full request/response bodies to the log for troubleshooting. Dumps are PLAINTEXT and may contain credentials — scrub before sharing (#4482)."
+    desc_zh: "把完整请求/响应体转储到日志用于排障。转储内容为明文，可能包含凭据——分享前必须清洗（#4482）。"
   - key: diagnostics.dumpReq
     type: boolean
     default: "true"
     env: ACP_DUMP_REQ
     group: diagnostics
-    desc_en: "Log outgoing upstream request metadata per call."
-    desc_zh: "逐次调用记录发往上游的请求元数据。"
+    desc_en: "Log outgoing upstream request metadata per call; with dumpBody on, also gates the plaintext body dumps (scrub before sharing, #4482)."
+    desc_zh: "逐次调用记录发往上游的请求元数据；开启 dumpBody 时同时是明文请求体转储的闸门（分享前必须清洗，#4482）。"
   - key: diagnostics.rawDumpDir
     type: string
     default: "<state dir>/raw"
@@ -38,8 +38,8 @@ entries:
     default: "false"
     env: BILI_DUMP_4XX
     group: diagnostics
-    desc_en: "Persist upstream 4xx responses to disk for post-mortem inspection."
-    desc_zh: "把上游 4xx 响应落盘以便事后检查。"
+    desc_en: "Persist upstream 4xx responses to disk for post-mortem inspection. Bodies are PLAINTEXT and may contain credentials — scrub before sharing (#4482)."
+    desc_zh: "把上游 4xx 响应落盘以便事后检查。转储内容为明文，可能包含凭据——分享前必须清洗（#4482）。"
   - key: diagnostics.dump4xxMaxBytes
     type: number
     default: "2097152 (floor 1024)"
@@ -47,6 +47,20 @@ entries:
     group: diagnostics
     desc_en: "Size cap for a single 4xx dump file."
     desc_zh: "单个 4xx 转储文件的大小上限。"
+  - key: diagnostics.maxTotalBytes
+    type: number
+    default: "unset (off)"
+    env: BILI_DUMP_MAX_TOTAL_BYTES
+    group: diagnostics
+    desc_en: "Total-size cap for debug dump dirs (dumps/, raw/, SSE dump dir); oldest files deleted first when exceeded (floor 1 MiB). Dumps have no rotation by default and can grow tens of GB/day under active capture (#2412)."
+    desc_zh: "调试转储目录（dumps/、raw/、SSE dump 目录）的总大小上限；超限时按最旧优先删除（下限 1 MiB）。转储默认无任何轮转，持续捕获下每天可增长数十 GB（#2412）。"
+  - key: diagnostics.maxAgeDays
+    type: number
+    default: "unset (off)"
+    env: BILI_DUMP_MAX_AGE_DAYS
+    group: diagnostics
+    desc_en: "Age cap in days for debug dump dirs; files older than this are deleted (floor 1 h). Off by default."
+    desc_zh: "调试转储目录的保留天数上限；超过该天数的文件被删除（下限 1 小时）。默认关闭。"
   - key: diagnostics.renderNone
     type: boolean
     default: "false"
@@ -54,6 +68,13 @@ entries:
     group: diagnostics
     desc_en: "Disable all ACP tag rendering (raw wire study mode)."
     desc_zh: "禁用所有 ACP 标签渲染（原始线路研究模式）。"
+  - key: diagnostics.invariantJudge
+    type: boolean
+    default: "true"
+    env: BILI_INVARIANT_JUDGE
+    group: diagnostics
+    desc_en: "Keep the I1/I2 outbound-invariant judge armed as an L1 advisory (#3938): every request's outbound bytes are reconciled against the client's inbound history; violations log at warn, clean verdicts at debug, traffic is never blocked. Set false or BILI_INVARIANT_JUDGE=0 to silence it."
+    desc_zh: "保持 I1/I2 出站不变量判官以 L1 advisory 形态开启（#3938）：每笔请求的出站字节都与客户端入站历史对账，违规以 warn 记录、干净判定以 debug 记录，绝不阻塞流量。设为 false 或 BILI_INVARIANT_JUDGE=0 可静默。"
   - key: diagnostics.noInjectTool
     type: boolean
     default: "false"
@@ -113,10 +134,10 @@ entries:
     group: diagnostics
     id: tt.ccx
     site_group: adv
-    desc_en: "Handle Codex /responses/compact inside bili (intercept, default) or forward it upstream (pass)."
-    desc_zh: "在 bili 内处理 Codex /responses/compact（intercept，默认）还是转给上游（pass）。"
-    site_en: "<code>codexCompact</code> — intercept | pass (default intercept): handle Codex /responses/compact inside bili or forward upstream."
-    site_zh: "<code>codexCompact</code> —— intercept | pass（默认 intercept）：在 bili 内处理 Codex /responses/compact，还是转给上游。"
+    desc_en: "Handle Codex's compaction requests inside bili (intercept, default) or forward them upstream (pass): the explicit forms (compaction_trigger + /responses/compact) and the inline auto-compact that transits as an ordinary turn, detected by its SUMMARIZATION_PROMPT template (#3008) — a user-overridden compact_prompt falls out of detection and transits verbatim; a compaction bili only observed (pass/gate) is rebased post-hoc (#2372)."
+    desc_zh: "在 bili 内处理 Codex 的压缩请求（intercept，默认）还是转给上游（pass）：覆盖显式形态（compaction_trigger + /responses/compact）与以普通请求形态过线的内联自动压缩（按 SUMMARIZATION_PROMPT 模板检测，#3008）—— 用户自定义 compact_prompt 后锚点失配、按原样转发；bili 仅旁路观察到的压缩（pass/安全阀放行）走事后 rebase（#2372）。"
+    site_en: "<code>codexCompact</code> — intercept | pass (default intercept): handle Codex's compaction requests in bili or forward upstream — explicit forms plus the inline auto-compact transiting as an ordinary turn (prompt-form detection, #3008; overridden compact_prompt transits verbatim)."
+    site_zh: "<code>codexCompact</code> —— intercept | pass（默认 intercept）：在 bili 内处理 Codex 压缩请求或转给上游 —— 显式形态 + 以普通请求形态过线的内联自动压缩（prompt 文本检测，#3008；自定义 compact_prompt 按原样转发）。"
   - key: ccrRetrievalTtlMs
     type: number
     default: "600000 (0 disables retrieval)"

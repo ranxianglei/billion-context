@@ -135,6 +135,8 @@ function bigConversation(): Array<{ role: string; content: string }> {
 type TimedResponse = {
     status: number;
     headers: http.IncomingHttpHeaders;
+    /** epoch ms when the request was created */
+    t0: number;
     tHeaderMs: number;
     body: string;
 };
@@ -150,6 +152,7 @@ function timedPost(url: string, headers: Record<string, string>, body: string): 
                 resolve({
                     status: res.statusCode ?? 0,
                     headers: res.headers,
+                    t0,
                     tHeaderMs,
                     body: Buffer.concat(chunks).toString("utf8"),
                 });
@@ -164,8 +167,9 @@ function timedPost(url: string, headers: Record<string, string>, body: string): 
  *  first — the 32768 cap no longer identifies them since #987 clamps it to
  *  the window headroom) is slow; the forward call gets `forwardStatus`
  *  immediately. */
-function startUpstream(forwardStatus: number, forwardBody: string, summaryFails: boolean): Promise<{ server: http.Server; port: number; forwards: () => number }> {
+function startUpstream(forwardStatus: number, forwardBody: string, summaryFails: boolean): Promise<{ server: http.Server; port: number; forwards: () => number; summaryDoneMs: () => number }> {
     let forwards = 0;
+    let summaryDoneMs = 0;
     const server = http.createServer((req, res) => {
         const chunks: Buffer[] = [];
         req.on("data", (c: Buffer) => chunks.push(c));
@@ -176,6 +180,7 @@ function startUpstream(forwardStatus: number, forwardBody: string, summaryFails:
             const msgs = parsed.messages;
             if (Array.isArray(msgs) && msgs.length === 2 && msgs[0]?.role === "system") {
                 setTimeout(() => {
+                    summaryDoneMs = Date.now();
                     if (summaryFails) {
                         res.writeHead(429, { "content-type": "application/json" });
                         res.end(JSON.stringify({ error: { message: "rate limited", type: "rate_limit_error" } }));
@@ -193,7 +198,7 @@ function startUpstream(forwardStatus: number, forwardBody: string, summaryFails:
     });
     return new Promise((resolve) => {
         server.listen(0, "127.0.0.1", () => {
-            resolve({ server, port: (server.address() as { port: number }).port, forwards: () => forwards });
+            resolve({ server, port: (server.address() as { port: number }).port, forwards: () => forwards, summaryDoneMs: () => summaryDoneMs });
         });
     });
 }
@@ -239,7 +244,13 @@ test("gap 3: non-stream + preflight 429 after early commit → structured JSON e
         );
         assert.equal(r.status, 200, "status was committed early and cannot become 503 anymore");
         assert.equal(r.headers["x-bili-preflight"], "compressing");
-        assert.ok(r.tHeaderMs < SLOW_MS, `headers arrived before summarization finished (${r.tHeaderMs}ms)`);
+        // #3228: RELATIVE invariant (headers before the mock's actual summarization
+        // completion), not an absolute wall-clock bound — a loaded runner stalls both
+        // timers equally and eats the fixed margin while behavior stays correct (same
+        // fix as #3152-C in preflight-hold). Early-commit regression lands headers at
+        // response end, i.e. AFTER summarization finished, so order still catches it.
+        assert.ok(up.summaryDoneMs() > 0, "the slow summarization call completed");
+        assert.ok(r.tHeaderMs < up.summaryDoneMs() - r.t0, `headers arrived before summarization finished (${r.tHeaderMs}ms vs ${up.summaryDoneMs() - r.t0}ms)`);
         assert.ok(r.body.startsWith(" "), "whitespace keep-alive precedes the JSON body");
         const json = JSON.parse(r.body) as { error?: { code?: string; message?: string; retryable?: boolean } };
         assert.equal(json.error?.code, "preflight_compress_failed", "structured error body under the committed 200");
@@ -247,8 +258,10 @@ test("gap 3: non-stream + preflight 429 after early commit → structured JSON e
         assert.equal(up.forwards(), 0, "the over-window payload was NOT forwarded");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         up.server.close();
+        up.server.closeIdleConnections?.();
         await once(up.server, "close");
     }
 });
@@ -269,8 +282,10 @@ test("gap 4: non-stream + upstream 400 after early commit → verbatim upstream 
         assert.equal(up.forwards(), 1);
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         up.server.close();
+        up.server.closeIdleConnections?.();
         await once(up.server, "close");
     }
 });
@@ -317,8 +332,10 @@ test("gap 5: repeated client aborts on proxy-openai-sse → upstream destroyed, 
         assert.equal(_liveUpstreamTimersForTest(), 0, "no accumulated timers after the storm");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });

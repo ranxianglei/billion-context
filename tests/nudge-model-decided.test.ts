@@ -147,8 +147,10 @@ async function runScenario(sessionId: string, modelDecided: boolean, verdict: st
         };
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 }

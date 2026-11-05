@@ -5,6 +5,13 @@ import { EventEmitter } from "node:events";
 import { BodyTooLargeError, readBody } from "../src/server.ts";
 import { MAX_REQUEST_BYTES } from "../src/fetch-util.ts";
 
+// #3128: assert the LEGACY byte-budget behavior at the old 100 MiB cap. Pin the knob to
+// that exact value so this stays independent of the new 5 GiB shipped default (the default
+// itself is covered by knobs-config-precedence). node --test isolates each file's process.
+process.env.BILI_RECEIVE_BODY_BYTES = "104857600";
+process.env.BILI_DECODED_BODY_BYTES = "209715200";
+process.env.BILI_OUTBOUND_BODY_BYTES = "104857600";
+
 test("readBody: returns buffer for a normal request", async () => {
     const buf = Buffer.from("hello");
     const req = Readable.from([buf]) as never;

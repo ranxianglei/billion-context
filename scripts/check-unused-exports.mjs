@@ -24,7 +24,9 @@ const root = process.cwd();
 const ENTRY_FILES = new Set([
     "src/index.ts",
     "src/mcp.ts",
+    "src/claude-mcp-entry.ts",
     "src/claude-native-bootstrap.ts",
+    "src/claude-subagent-hook.ts",
     "src/agent/pi.ts",
     "src/agent/pi-native.ts",
     "src/agent/omp.ts",
@@ -33,6 +35,7 @@ const ENTRY_FILES = new Set([
     "src/agent/opencode-native.ts",
     "src/agent/dsh-acp.ts",
     "src/agent/dsh-native.ts",
+    "src/agent/dsh-compaction-gate.ts",
     "src/kimi/native-mcp.ts",
     "src/kimi/bootstrap-hook.ts",
     "src/zcode/mcp-entry.ts",
@@ -40,7 +43,12 @@ const ENTRY_FILES = new Set([
     "src/agent/dsh-native-client.ts",
 ]);
 
-const files = execFileSync("git", ["ls-files", "src/", "tests/", "scripts/", "*.ts", "*.mjs", "*.cjs"], {
+// `--others --exclude-standard` pulls in NEW, not-yet-committed files too:
+// a brand-new module is exactly where INTERNAL_ONLY leaks happen, and a
+// tracked-only scan would pass locally right before CI fails on the same
+// tree (hit on #3273: the fresh src/agent/incremental-client.ts was
+// untracked at the local gate run).
+const files = execFileSync("git", ["ls-files", "--cached", "--others", "--exclude-standard", "src/", "tests/", "scripts/", "*.ts", "*.mjs", "*.cjs"], {
     cwd: root,
     encoding: "utf8",
 }).split("\n").filter(f => f && !f.startsWith("kernel/") && !f.startsWith("pi-subagents/") && f !== "scripts/check-unused-exports.mjs");
@@ -71,6 +79,25 @@ const WAIVERS = new Map([
     // are truth-table-pinned for reasons unrelated to export hygiene.
     // Remove this waiver when the symbols gain external use or move files.
     ["src/server/side-request.ts", new Set(["DemoteGateSignals", "SideLaneSignals", "SideLaneDecision"])],
+    // #R3 memory diagnostics: the two payload interfaces are referenced only
+    // inside src/session.ts (callers use them structurally); the functions
+    // themselves have cross-file refs (admin.ts, tests/) and need none.
+    ["src/session.ts", new Set(["ResidentFieldBreakdown", "MemoryReport"])],
+    // #3754 install attribution: the /__bili/status lastInstall payload
+    // interface is referenced only inside src/update.ts (admin.ts consumes it
+    // structurally via Awaited<ReturnType<typeof getLastInstall>>); keep the
+    // export so the wire shape stays named at its definition site.
+    ["src/update.ts", new Set(["LastInstallRecord"])],
+    // #5146 /__bili/upstreams read contract: the two report payload interfaces
+    // are referenced only inside src/upstream-alerts.ts (admin.ts consumes
+    // getUpstreamHealthReport() structurally via JSON.stringify); keep the
+    // exports so the wire shape stays named at its definition site.
+    ["src/upstream-alerts.ts", new Set(["UpstreamHealthEntry", "UpstreamHealthReport"])],
+    // #3962 gate telemetry: the coverage record crosses the gate/dsh-native
+    // BUNDLE boundary on the globalThis channel — consumers use it
+    // structurally through dshCompactionGateTelemetry()'s return type; keep
+    // the export so the channel payload stays named at its definition site.
+    ["src/agent/dsh-compaction-disable.ts", new Set(["DshCompactionGateTelemetry"])],
 ]);
 
 const findings = [];

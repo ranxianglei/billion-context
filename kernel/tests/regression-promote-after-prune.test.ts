@@ -581,15 +581,17 @@ test("promote-after-prune: m-ref range consumes a block that covers the first us
     tokenCount: 5000,
   });
   const visibleIds = turn.messages.map((m) => m.id);
-  // Prune keeps the first user message and inserts the summary at the block's
-  // earliest raw position — BEFORE the surviving raw, so the summary index
-  // differs from the raw's index.
+  // Prune keeps the first user message (the #2733 pin — provider
+  // prefix-cache head) and inserts the summary AFTER it, so the summary
+  // index differs from the raw's index. b1's anchor resolution still finds
+  // raw-1 (the block covers the pin), which is what the consumption checks
+  // below exercise.
   assert.ok(visibleIds.includes(summaryMessageId("b1")));
   assert.ok(visibleIds.includes("raw-1"), "first user message survives prune");
   assert.ok(!visibleIds.includes("raw-5"), "covered raws are hidden");
   assert.ok(
-    visibleIds.indexOf(summaryMessageId("b1")) < visibleIds.indexOf("raw-1"),
-    "summary precedes the surviving raw",
+    visibleIds.indexOf(summaryMessageId("b1")) > visibleIds.indexOf("raw-1"),
+    "summary sits after the pinned first user message (#2733 head-stability)",
   );
 
   const startRef = turn.state.messageRefs.byRaw["raw-1"]!;

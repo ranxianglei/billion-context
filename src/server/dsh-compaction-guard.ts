@@ -131,6 +131,66 @@ export function isDshCompactionCall(protocol: string | null, parsed: unknown): b
     return finalUser.trimStart().startsWith(DSH_COMPACTION_INSTRUCTION_PREFIX);
 }
 
+/** #2709: raw-ASCII sniff of the instruction marker — the first 48 bytes of
+ * DSH_COMPACTION_INSTRUCTION_PREFIX. Used as a cheap prefilter on the
+ * passthrough lane so ordinary background traffic (title-gen, plugin calls)
+ * never pays a JSON.parse; a hit still goes through the full marker-decisive
+ * check below, so a conversation that merely MENTIONS the instruction string
+ * in ordinary text does not false-positive (the real check requires the final
+ * user message to START with the prefix). Exported so the client-side fetch
+ * patch (#2763) mirrors the EXACT same bytes instead of re-deriving the
+ * length. */
+export const DSH_COMPACTION_MARKER_SNIFF = DSH_COMPACTION_INSTRUCTION_PREFIX.slice(0, 48);
+
+/** #2709 process-level count of passthrough-lane refusals (no session exists
+ * on that lane, so the per-session #2490 ledger cannot record them). Exported
+ * mutable record for tests and future stats surfacing. */
+export const dshPassthroughGuardStats = { refusals: 0 };
+
+/** #2709: the passthrough lane (x-bili-passthrough, #1117) relays byte-untouched
+ * with "no session, no injection, no guard" — which made it the one lane dsh's
+ * agentless background compaction could still LAND through: the takeover gate
+ * refuses attribution for agentless callers while the settings overlay has
+ * already routed the URL to /bili/, so the native patch stamps the request and
+ * it relays verbatim BELOW the #1835 pipeline guard (field report: 45 refused
+ * through the pipeline, 4 landed through this lane). This runs the same
+ * marker-decisive detection on the passthrough body. Fail-open like #1835:
+ * anything undecodable/unparseable returns false and the request relays exactly
+ * as before. `decode` is supplied by the caller (bounded decode + admission
+ * accounting, reusing the standard request-body budget). */
+export async function detectPassthroughDshCompactionCall(
+    protocol: string | null,
+    bodyBuffer: Buffer,
+    contentEncoding: string | undefined,
+    decode: (encoding: string, body: Buffer) => Promise<Buffer>,
+): Promise<boolean> {
+    if (protocol === null) return false;
+    let candidate: Buffer | undefined;
+    if (bodyBuffer.includes(DSH_COMPACTION_MARKER_SNIFF)) {
+        candidate = bodyBuffer;
+    } else {
+        // A declared content-encoding hides the marker from the raw sniff —
+        // decode a bounded COPY (the relay below still forwards the original
+        // bytes; nothing here may reassign bodyBuffer or drop the header).
+        if (contentEncoding === undefined || contentEncoding === "" || contentEncoding === "identity") return false;
+        let decoded: Buffer;
+        try {
+            decoded = await decode(contentEncoding, bodyBuffer);
+        } catch {
+            return false;
+        }
+        if (!decoded.includes(DSH_COMPACTION_MARKER_SNIFF)) return false;
+        candidate = decoded;
+    }
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(candidate.toString("utf8"));
+    } catch {
+        return false;
+    }
+    return isDshCompactionCall(protocol, parsed);
+}
+
 // #2432: dsh compaction-basic's CHECKPOINT FRAMING — the single replacement
 // user message a LANDED compaction writes into the client's history
 // (CHECKPOINT_PREAMBLE + SUMMARY_OPEN_TAG … SUMMARY_CLOSE_TAG,
@@ -147,17 +207,71 @@ export const DSH_CHECKPOINT_PREAMBLE_PREFIX =
 // missing ids are ordinary drift (edit/truncate), not a region replacement.
 export const DSH_LOCAL_COMPACTION_MIN_MISSING = 8;
 
-/** True when any RESENT core message carries dsh checkpoint framing (preamble
- *  at message start, or the open tag anywhere — the tag sits mid-message after
- *  preamble + blank line). Used by the prepare-openai detector (#2432) to tell
- *  a landed native compaction apart from ordinary history churn. Reads the
- *  core-flattened text first (BiliMessage/CoreMessage carry prose in `.text`),
- *  falling back to a raw wire content field for direct callers. */
-export function carriesDshLocalCompactionSummary(msgs: readonly { text?: unknown; content?: unknown }[]): boolean {
+/** True when a freshly-LANDED dsh checkpoint is present in the resent history.
+ *  Used by the prepare-openai / prepare-responses detectors (#2432) to tell a
+ *  landed native compaction apart from ordinary history churn.
+ *
+ *  A LANDED checkpoint is specifically ONE user-role, plain-text message
+ *  (dsh-compaction-basic replaces the shadowed region with a single
+ *  user/message whose text starts with CHECKPOINT_PREAMBLE; the open tag sits
+ *  mid-message after preamble + blank line). #2621 taught that matching the
+ *  framing BYTES ALONE is a false-positive machine: the string survives
+ *  anywhere history QUOTES it — a tool result that read a transcript
+ *  containing it, the model citing it in reasoning, bili's own compress
+ *  summaries quoting it, an assistant message paraphrasing the preamble. And
+ *  #4438 proved the QUOTE class is live even among novel messages: dsh's
+ *  auto-review snapshot replays retained history that CONTAINS a landed
+ *  checkpoint inside its FILTERED_HISTORY section, and the freshly-synthesized
+ *  blob passes the novelty gate by construction (new content-hash id) — one
+ *  such 433KiB aux request wiped a live session's entire fold state. So three
+ *  gates tighten the match to "a checkpoint just landed":
+ *
+ *   ① CARRIER — the message must be role="user" AND plain text
+ *      (contentType "text" when typed). Tool results, reasoning blocks,
+ *      tool-call arguments, and assistant prose are excluded outright. On the
+ *      Anthropic lane a tool_result rides inside a wire role:"user" message but
+ *      flattens to role="tool"/contentType="tool-result" (kernel
+ *      anthropicToCore), so the role gate alone already drops it; the
+ *      contentType gate is kept as belt-and-suspenders for any lane that maps
+ *      a structured user block to a non-text contentType.
+ *   ② NOVELTY — the message's raw id must NOT already be in the pre-turn ref
+ *      map (`knownIds`, = Object.keys(session.state.messageRefs.byRaw) taken
+ *      BEFORE processTurn). A freshly-landed checkpoint is by definition a NEW
+ *      message; a historical quote/replay hits an OLD id. This closes the
+ *      residual of ①: a user who literally typed/pasted the framing into a
+ *      user message in an EARLIER turn is replayed as an old id, not a landing.
+ *   ③ STANDALONE (#4438) — the message must START with the framing
+ *      (preamble-first today; tag-first if the preamble ever drops out). A
+ *      landed checkpoint IS the whole message; a quote embeds it inside other
+ *      content. This costs nothing against real landings and removes the
+ *      mid-blob false positive entirely. Consequence accepted per this file's
+ *      version-pin doctrine (header): if dsh rewords BOTH the preamble AND
+ *      moves the tag off the message head, detection degrades to a miss —
+ *      the pre-#2432 unannounced-rewrite archive path — never a false
+ *      positive wiping live fold state.
+ *
+ *  Reads the core-flattened text first (BiliMessage/CoreMessage carry prose in
+ *  `.text`), falling back to a raw wire content field for direct callers. When
+ *  `knownIds` is omitted the novelty gate is skipped (carrier gate only) —
+ *  every in-repo caller passes it. */
+export function carriesDshLocalCompactionSummary(
+    msgs: readonly { id?: unknown; role?: unknown; contentType?: unknown; text?: unknown; content?: unknown }[],
+    knownIds?: ReadonlySet<string>,
+): boolean {
     for (const m of msgs) {
+        // ① CARRIER (#2621): only a user-role plain-text message can be a
+        // checkpoint. Exclude every other producer of the marker string.
+        if (m.role !== "user" || (m.contentType !== undefined && m.contentType !== "text")) continue;
+        // ② NOVELTY (#2621): a freshly-landed checkpoint is a NEW id; a quoted
+        // or replayed mention is an old id already in the pre-turn ref map.
+        if (knownIds !== undefined && typeof m.id === "string" && knownIds.has(m.id)) continue;
         const text = typeof m.text === "string" && m.text !== "" ? m.text : textOfContent(m.content);
         if (text === "") continue;
-        if (text.includes(DSH_CHECKPOINT_OPEN_TAG) || text.startsWith(DSH_CHECKPOINT_PREAMBLE_PREFIX)) return true;
+        // ③ STANDALONE (#4438): the framing must open the message — see the
+        // gate list above for why mid-text matching is a false-positive
+        // machine on synthesized aux blobs that quote old checkpoints.
+        const head = text.trimStart();
+        if (head.startsWith(DSH_CHECKPOINT_PREAMBLE_PREFIX) || head.startsWith(DSH_CHECKPOINT_OPEN_TAG)) return true;
     }
     return false;
 }
@@ -167,27 +281,53 @@ export type Refusal = { status: number; body: unknown };
 const REFUSAL_MESSAGE =
     `dsh native compaction call refused by billion-context: bili owns compression on this lane (#1729, cf. #1772/#1206). ` +
     `A landed dsh compaction checkpoint durably shadows the raw conversation history, which destroys the proxy's compression substrate. ` +
-    `To run dsh native compaction on this lane anyway, opt in explicitly: "allowDshCompaction": true in the bili config (web UI) or env BILI_ALLOW_DSH_COMPACTION=1 (#2028).`;
+    `No action is needed: your conversation is intact and bili compresses automatically as turns grow too large — if the session is currently over its window, it starts folding on the next turn (#3453). ` +
+    `This refusal is unconditional and terminal (bili_final) — the same call will be refused every time, so stop retrying (#3013: one session burned 5069 refused retries); the former allowDshCompaction opt-in was removed (#3651, superseding #2028); ` +
+    `to keep dsh-side checkpoints out entirely, apply host-side suppression instead (#3354/#2474).`;
+
+/** #3013/#3022 (A1): the refusal is a DECISION, not a transient error — dsh's
+ * retry loop is driven by its own raw pressure ledger which nothing on bili's
+ * side can shrink (#2490), so every retry of the same call fails identically.
+ * `bili_final: true` gives clients an unambiguous machine-readable terminal
+ * marker to latch and stop retrying (consumption needs dsh-upstream
+ * coordination; `retryable:false` alone did not stop the field-reported
+ * 5038-retry storm). Present at the top level of both protocol shapes and,
+ * for the openai error envelope (where `retryable` lives), inside `error`
+ * too. */
+const BILI_FINAL_FIELD = "bili_final" as const;
 
 /** Protocol-shaped refusal body (mirrors the #554 side-request guard shape so
- * clients render it natively). 403: a policy refusal, not a malformed
- * request — the caller's own retry logic must not treat it as transient. */
+ * clients render it natively). 422: a policy refusal of this one request — not
+ * 401/403 (clients classify those as a credential failure and may disable the
+ * credential) and not 408/409/429/5xx (SDK retry logic treats those as
+ * transient). */
 export function dshCompactionRefusal(protocol: string): Refusal {
     if (protocol === "anthropic") {
         return {
-            status: 403,
-            body: { type: "error", error: { type: "invalid_request_error", message: REFUSAL_MESSAGE } },
+            status: 422,
+            body: { type: "error", [BILI_FINAL_FIELD]: true, error: { type: "invalid_request_error", message: REFUSAL_MESSAGE } },
         };
     }
     return {
-        status: 403,
+        status: 422,
         body: {
+            [BILI_FINAL_FIELD]: true,
             error: {
                 type: "server_error",
                 code: "dsh_compaction_refused",
                 message: REFUSAL_MESSAGE,
                 retryable: false,
+                [BILI_FINAL_FIELD]: true,
             },
         },
     };
 }
+
+/** #3013/#3022 (A3): cadence for the pipeline-lane storm log. The first
+ * refusal warns once (once-warn dedup on session.metadata), then refusals are
+ * silent unless this many more arrive — the field-reported storm re-fired
+ * every ~328ms for hours with ZERO log lines after the first, leaving the
+ * user staring at a stuck "生成中" with no clue (#3013). Same cadence caps the
+ * passthrough lane's per-refusal warn so an agentless storm cannot spam the
+ * log either. Constant, not config (#2155 precedent). */
+export const DSH_REFUSAL_STORM_LOG_EVERY = 100;

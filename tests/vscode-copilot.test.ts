@@ -223,13 +223,20 @@ test("vscode-copilot #177 (2): client cancel aborts upstream and frees the sessi
         assert.equal(resp.status, 200);
         assert.ok(resp.body, "proxy returned a response body");
 
-        const reader = resp.body as unknown as AsyncIterable<Uint8Array>;
-        let gotSome = false;
-        for await (const chunk of reader) {
-            gotSome = Buffer.from(chunk).toString("utf8").length > 0;
-            if (gotSome) break;
+        const reader = resp.body!.getReader();
+        // Read exactly one non-empty chunk, then abort WITH THE BODY STILL
+        // ACTIVE — the real vscode-cancel shape. The old shape aborted AFTER a
+        // for-await break (iterator return() already cancelled the body), so the
+        // signal had nothing pending and undici could leave the client socket
+        // up instead of destroying it — on a windows-24 runner that lingered
+        // past the whole 5s poll window (run 38896091237 red, same-commit rerun
+        // green: flake, not a regression).
+        for (;;) {
+            const { done, value } = await reader.read();
+            if (done || (value && value.length > 0)) break;
         }
         clientAbort.abort();
+        try { await reader.cancel(); } catch { /* already aborted */ }
 
         const aborted = await abortSeen;
         assert.ok(aborted, "upstream fetch was not aborted after client cancel");

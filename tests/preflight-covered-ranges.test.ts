@@ -23,7 +23,7 @@ async function runCoveredRange(protectLatest = false, pairBoundary = false, unkn
         { id: "covered", role: "assistant", contentType: "text", text: "HIDDEN_RAW ".repeat(80000) },
         ...Array.from({ length: 10 }, (_, i): CoreMessage => ({ id: `middle-${i}`, role: i % 2 ? "assistant" : "user", contentType: "text", text: `MIDDLE_${i} `.repeat(500) })),
         { id: "large-call", role: "assistant", contentType: "tool-call", toolName: "large_result", toolCallId: "large", text: "{}" },
-        { id: "large-result", role: "tool", contentType: "tool-result", toolName: "large_result", toolCallId: "large", text: "LATEST_LARGE ".repeat(unknownBaseline ? 10000 : 90000) },
+        { id: "large-result", role: "tool", contentType: "tool-result", toolName: "large_result", toolCallId: "large", text: "LATEST_LARGE ".repeat(unknownBaseline ? 40000 : 90000) },
     ];
     const turn = core.processTurn({ messages, state: createInitialState(), config: { ...config, modelContextLimit: 27200000 }, tokenCount: 300000, renderTags: "text-only" });
     const coveredRef = turn.state.messageRefs.byRaw.covered;
@@ -61,6 +61,7 @@ async function runCoveredRange(protectLatest = false, pairBoundary = false, unkn
     } finally {
         const closed = once(upstream, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         upstream.closeAllConnections();
         await closed;
     }
@@ -94,10 +95,17 @@ test("preflight summarizes the complete tool pair before the kernel consumes its
     assert.ok(summaries.join("").includes("LATEST_LARGE ".repeat(90000)), "no tool-result tail may be folded without entering a summary request");
 });
 
-test("unknown-baseline preflight relaxes protection using the conservative upper bound", async () => {
+// #3146: the unknown-baseline fit judgment moved from the char-count upper bound
+// to the calibrated CJK-aware estimate. The relax path still fires — but only
+// when the CALIBRATED size genuinely overflows the window (large-result is sized
+// so its CJK-aware tokens exceed the 100k window), not merely because the raw
+// char count does. A payload whose real size already fits now forwards without
+// burning folds (see preflight-fork-estimate.test.ts).
+test("unknown-baseline preflight relaxes protection when the calibrated estimate overflows the window", async () => {
     const { result, summaries } = await runCoveredRange(false, false, true);
     assert.equal(result.fitsWindow, true, JSON.stringify(result));
-    assert.ok(summaries.join("").includes("LATEST_LARGE ".repeat(10000)));
+    assert.ok(result.compressedRanges > 0);
+    assert.ok(summaries.join("").includes("LATEST_LARGE ".repeat(40000)));
 });
 
 

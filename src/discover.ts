@@ -1,9 +1,11 @@
-// MITM domain auto-discovery. Cycle-free: imports only from client-config.js.
+// MITM domain auto-discovery. Cycle-free: imports only from client-config.js and
+// vertex.js (a leaf with no imports at all).
 // MUST NOT import from launcher.ts (launcher → mitm → discover → launcher).
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { loadClientConfig, resolvePiHome, resolveOmpHome, resolveCodebuddyHome, resolveQoderHome, resolveTraeHome, resolveZcodeHome, zcodePersonalConfigFiles, opencodeConfigFiles, aiderConfFiles, nonEmpty, QODER_DEFAULT_MODEL_HOSTS, TRAE_DEFAULT_MODEL_HOSTS, AIDER_DEFAULT_MODEL_HOSTS, OPENCODE_DEFAULT_MODEL_HOSTS, type ClientConfig } from "./client-config.js";
+import { vertexHostForLocation } from "./vertex.js";
 
 const TTL_MS = 2000;
 
@@ -32,7 +34,14 @@ export function extractHttpsHosts(config: ClientConfig): string[] {
         out.push(host);
     };
 
-    if (nonEmpty(config.claude?.anthropicBaseUrl)) push(config.claude!.anthropicBaseUrl);
+    // Vertex ignores ANTHROPIC_BASE_URL, so when that lane is on Vertex the host
+    // that matters is the one derived from CLOUD_ML_REGION — or the explicit
+    // ANTHROPIC_VERTEX_BASE_URL when one is configured. The anthropic default is
+    // then never dialed, and whitelisting it would describe traffic that cannot
+    // happen.
+    const claudeVertex = config.claude?.vertexEnabled ? vertexHostForLocation(config.claude.vertexRegion, config.claude.vertexBaseUrl) : null;
+    if (claudeVertex) push(claudeVertex.host);
+    else if (nonEmpty(config.claude?.anthropicBaseUrl)) push(config.claude!.anthropicBaseUrl);
     if (config.codex) {
         for (const prov of Object.values(config.codex.providers)) push(prov.baseUrl);
         push(config.codex.openaiBaseUrl);

@@ -8,8 +8,6 @@ process.env.NODE_ENV = "test";
 process.env.BILI_REPLAY_RETRY_MAX = "1";
 // Zero backoff so the transient-retry legs run instantly.
 process.env.BILI_REPLAY_RETRY_BASE_MS = "0";
-// Short dead-end cooldown so the expiry leg stays fast.
-process.env.BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS = "400";
 
 import { defaultConfig } from "acp-kernel";
 import { startServer } from "../src/server.ts";
@@ -34,7 +32,7 @@ import { diagnoseEmptySummary, emptySummaryIsSizeDriven, extractSummaryText } fr
 // same-span re-draw); (d) end-to-end in BOTH proxy and plugin modes the
 // partial text never reaches the wire — only the recovered complete summary
 // does; (e) a persistently-incomplete upstream fails fast carrying the
-// diagnosis and arms the dead-end cooldown.
+// diagnosis and fails fast (#4079: the cooldown itself is removed).
 
 const PARTIAL = "PARTIAL SUMMARY: completed the first change; the unresolved requirements and remaining work are";
 const FULL = "FULL SUMMARY: every change in the segment is complete; the previously unresolved requirements were resolved and no remaining work is left.";
@@ -139,7 +137,7 @@ async function drive(proxyPort: number, upstreamPort: number, session: string, m
 }
 
 async function closeAll(...servers: http.Server[]): Promise<void> {
-    for (const s of servers) s.close();
+    for (const s of servers) { s.close(); s.closeIdleConnections?.(); }
     await Promise.allSettled(servers.map((s) => once(s, "close")));
 }
 
@@ -281,7 +279,7 @@ test("#2309 transient incomplete (no size reason) re-draws the SAME span before 
     }
 });
 
-test("#2309 persistent incomplete JSON fails fast with the diagnosis and arms the cooldown", async () => {
+test("#2309 persistent incomplete JSON fails fast with the diagnosis, retries re-run bounded", async () => {
     const forwards: string[] = [];
     const infos: SummaryInfo[] = [];
     const upstream = makeUpstream((res, info) => {
@@ -308,13 +306,13 @@ test("#2309 persistent incomplete JSON fails fast with the diagnosis and arms th
         assert.equal(forwards.length, 0, "nothing may be forwarded on failure");
 
         const sess = listSessions().find((s) => s.id.includes("s2309-deadend"));
-        assert.ok(sess?.metadata?.preflightDeadEnd, "zero-progress failure must arm the dead-end marker");
+        assert.equal(sess?.metadata?.preflightDeadEnd, undefined, "(#4079) no dead-end marker may persist");
 
         const callsBeforeRetry = infos.length;
         const r2 = await drive(proxyPort, upstreamPort, "s2309-deadend", "gpt-7-sol", longResponsesInput(12), { "x-acp-session": "s2309-deadend" });
-        assert.equal(r2.status, 502, `cooldown must fail fast, got ${r2.status}`);
+        assert.equal(r2.status, 502, `the retry must fail fast again, got ${r2.status}`);
         await r2.text();
-        assert.equal(infos.length, callsBeforeRetry, "cooldown must spend ZERO upstream calls");
+        assert.ok(infos.length > callsBeforeRetry && infos.length - callsBeforeRetry <= 32, `the re-run walk is itself bounded (#4079 trade), got +${infos.length - callsBeforeRetry}`);
     } finally {
         await closeAll(proxy, upstream);
     }

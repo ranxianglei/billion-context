@@ -78,6 +78,7 @@ test("#987 summary max_tokens clamped to window headroom on small windows", asyn
         assert.ok(sawClamp, "the clamp must actually engage on this window (some call below the 32k default)");
     } finally {
         server.close();
+        server.closeIdleConnections?.();
         await once(server, "close");
     }
 });
@@ -122,6 +123,7 @@ test("#987 summary max_tokens keeps the 32k default when headroom is ample", asy
         }
     } finally {
         server.close();
+        server.closeIdleConnections?.();
         await once(server, "close");
     }
 });

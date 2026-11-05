@@ -12,20 +12,27 @@ import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { listSessions, _resetSessionsForTest } from "../src/session.ts";
 
-// #553: an ANONYMOUS request (no stable identity header/body field) resolves
-// its session by prefix affinity. After an ACP compression breaks the chain
-// hash, the client's replay mints a NEW session id (a fork) with
-// lastInputTokens == 0 — yet it carries the full raw history. That payload was
-// judged by the optimistic chars/4 estimator alone; code/JSON replays run far
-// denser than 4 chars/token, so an over-window payload estimated UNDER the
-// window triggered nothing and was forwarded raw (upstream 400 / long-prefill
-// timeout). These tests assert the fixed behavior: unknown-baseline anonymous
-// sessions are judged by the char-count upper bound (never undershoots),
-// preflight compresses, and the rebuilt payload fits.
+// #553 / #3146: an ANONYMOUS request (no stable identity header/body field)
+// resolves its session by prefix affinity. After an ACP compression breaks the
+// chain hash the client's replay mints a NEW session id (a fork) with
+// lastInputTokens == 0 — yet it carries the full raw history.
 //
-// The mock upstream ENFORCES the model window like a real provider, counting
-// every character of the request body's text (the worst-case dense-code
-// regime where tokens ≈ chars — the exact case the chars/4 estimator misses).
+// #553 fixed the UNDERSHOOT: such a session is TRIGGERED on the char-count
+// upper bound (never undershoots dense replays). #3146 found the mirror
+// failure: that same char bound was ALSO used as the REJECT-FORWARD gate, so a
+// payload whose REAL token count fits the window but whose CHAR COUNT exceeds
+// it was judged over-window and fail-fasted (502) after burning every preflight
+// round — even though the fold succeeded and the upstream would have billed far
+// under the window. Fix: the char bound stays the TRIGGER arm only; every fit
+// decision (per-round exit, final fitsWindow, the early no-ranges gate) judges
+// on the calibrated CJK-aware estimate.
+//
+// The mock upstream therefore ENFORCES the model window on a REALISTIC
+// tokenizer — the same CJK-aware caliber bili itself estimates with (CJK
+// ideographs/syllables ~1 token each, everything else ~1 token / 4 chars). The
+// original #553 mock counted every character as a token (tokens ≈ chars), a
+// pathological density no live route sustains that #3146 deliberately stops
+// defending against with slow compress-to-fit.
 
 const SUMMARY_TEXT =
     "PREFLIGHT FORK SUMMARY: the segment covered a multi-step implementation session. " +
@@ -45,37 +52,46 @@ function okSse(inputTokens: number): string {
     );
 }
 
-function textLen(b: unknown): number {
+// Realistic tokenizer model matching bili's own CJK-aware estimator (kernel
+// defaultCountTokens): CJK ideographs/syllables bill ~1 token each, everything
+// else ~1 token per 4 characters.
+function realisticTokens(text: string): number {
+    const cjk = (text.match(/[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]/g) ?? []).length;
+    return cjk + Math.ceil((text.length - cjk) / 4);
+}
+
+function textBlockTokens(b: unknown): number {
     if (b && typeof b === "object") {
         const t = (b as { text?: unknown }).text;
-        if (typeof t === "string") return t.length;
+        if (typeof t === "string") return realisticTokens(t);
     }
     return 0;
 }
 
-function contentChars(c: unknown): number {
-    if (typeof c === "string") return c.length;
+function contentTokens(c: unknown): number {
+    if (typeof c === "string") return realisticTokens(c);
     if (!Array.isArray(c)) return 0;
-    return c.reduce((n, b) => n + textLen(b), 0);
+    return c.reduce((n, b) => n + textBlockTokens(b), 0);
 }
 
-// Worst-case tokenizer model: 1 token per character (dense code/JSON).
-function bodyChars(raw: string): number {
+// Realistic token count of the request body's text (system + messages).
+function bodyTokens(raw: string): number {
     let parsed: { system?: unknown; messages?: Array<{ content?: unknown }> } = {};
     try {
         parsed = JSON.parse(raw);
     } catch {
         return 0;
     }
-    let total = contentChars(parsed.system);
-    for (const m of parsed.messages ?? []) total += contentChars(m.content);
+    let total = contentTokens(parsed.system);
+    for (const m of parsed.messages ?? []) total += contentTokens(m.content);
     return total;
 }
 
 // 12 alternating messages of dense code-like ASCII, ~4k chars each → ~48k
-// chars total. By the optimistic chars/4 estimator that is only ~12k tokens
-// (< the 40k window — no trigger today); by the char-count upper bound it is
-// ~48k (>= the window — preflight must fire).
+// CHARS total (exceeds the 40k window as a raw character count) but only
+// ~12k REALISTIC TOKENS (well under the 40k window). This is the exact #3146
+// shape: the old char-count reject-forward gate read it as over-window; the
+// calibrated CJK-aware estimate correctly reads it as fitting.
 function denseConversation(): Array<{ role: string; content: string }> {
     const line = (i: number) =>
         `const handler_${i} = (req: Request, res: Response) => { res.status(200).json({ status: "ok", id: ${i}, ts: Date.now() }); };`;
@@ -87,9 +103,8 @@ function denseConversation(): Array<{ role: string; content: string }> {
     return msgs;
 }
 
-test("e2e: fork/fresh session (lastInputTokens=0) with dense history that estimates under the window → preflight compresses before forward", async () => {
+test("e2e: fork/fresh session (lastInputTokens=0) whose realistic size fits the window but whose char count exceeds it → forwarded without a false context-full error (#3146)", async () => {
     const calls: Array<{ stream: boolean; body: string }> = [];
-    let streamCalls = 0;
     const upstream = http.createServer((req, res) => {
         const chunks: Buffer[] = [];
         req.on("data", (c: Buffer) => chunks.push(c));
@@ -102,10 +117,10 @@ test("e2e: fork/fresh session (lastInputTokens=0) with dense history that estima
                 /* keep {} */
             }
             calls.push({ stream: !!parsed.stream, body: raw });
-            // Enforce the model window on EVERY call, like a real provider:
-            // the raw (uncompressed) dense history overflows it, so without
-            // preflight the forward itself gets a 400.
-            if (bodyChars(raw) > WINDOW) {
+            // Enforce the model window on EVERY call, like a real provider, on a
+            // REALISTIC tokenizer. The raw dense history bills ~12k tokens, under
+            // the 40k window — so a correct fit judgment forwards it successfully.
+            if (bodyTokens(raw) > WINDOW) {
                 res.writeHead(400, { "content-type": "application/json" });
                 res.end(JSON.stringify({
                     type: "error",
@@ -113,22 +128,8 @@ test("e2e: fork/fresh session (lastInputTokens=0) with dense history that estima
                 }));
                 return;
             }
-            if (parsed.stream) {
-                streamCalls += 1;
-                res.writeHead(200, { "content-type": "text/event-stream" });
-                res.end(okSse(1000));
-            } else {
-                res.writeHead(200, { "content-type": "application/json" });
-                res.end(JSON.stringify({
-                    id: "msg_summary",
-                    type: "message",
-                    role: "assistant",
-                    model: "claude-small",
-                    content: [{ type: "text", text: SUMMARY_TEXT }],
-                    stop_reason: "end_turn",
-                    usage: { input_tokens: 500, output_tokens: 50 },
-                }));
-            }
+            res.writeHead(200, { "content-type": "text/event-stream" });
+            res.end(okSse(1000));
         });
     });
     upstream.listen(0, "127.0.0.1");
@@ -167,44 +168,42 @@ test("e2e: fork/fresh session (lastInputTokens=0) with dense history that estima
     try {
         // No identity header or body field: the request is ANONYMOUS, so the
         // proxy resolves its session by prefix affinity — exactly what a fork
-        // looks like after an ACP compression broke the chain hash (new pfa-
-        // id, lastInputTokens = 0, full raw history replayed). The optimistic
-        // estimate (~12k) is under the 40k window, so the old code forwarded
-        // raw and the mock answered 400.
+        // looks like after an ACP compression broke the chain hash (new pfa-id,
+        // lastInputTokens = 0, full raw history replayed). Its raw char count
+        // (~48k) exceeds the 40k window, but its realistic token count (~12k)
+        // fits. The old char-count reject-forward gate judged it over-window and
+        // fail-fast 502'd (after burning preflight rounds); the fix judges it on
+        // the calibrated estimate and forwards.
         const r = await fetch(`http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`, {
             method: "POST",
             headers: { "content-type": "application/json" },
             body: JSON.stringify({ model: "claude-small", max_tokens: 1024, stream: true, messages: denseConversation() }),
         });
-        assert.equal(r.status, 200, "the fork-session request succeeds (no context-full error)");
+        assert.equal(r.status, 200, "the fork/fresh session forwards successfully (no false context-full error, #3146)");
         await r.text();
 
+        // #3146: the calibrated estimate already fits the window, so preflight
+        // burns ZERO summarization rounds — the old char-count fit gate would
+        // have folded (≥1 call) or fail-fast 502'd here.
         const summaryCalls = calls.filter((c) => !c.stream);
-        assert.ok(summaryCalls.length >= 1, `preflight made summarization call(s) before forwarding (got ${summaryCalls.length})`);
-        for (const c of summaryCalls) {
-            assert.ok(c.body.includes("Compression") || c.body.includes("compress"), "summarization call carries the compression rules");
-        }
-
-        const s = listSessions()[0];
-        const activeBlocks = (s?.state.blocks ?? []).filter((b) => b.active);
-        assert.ok(activeBlocks.length >= 1, `preflight created compression block(s) (got ${activeBlocks.length})`);
-        assert.ok(activeBlocks.every((b) => b.summary === SUMMARY_TEXT), "blocks hold the upstream-written summaries");
+        assert.equal(summaryCalls.length, 0, "preflight makes no summarization call: the calibrated estimate already fits the window (#3146)");
 
         const forwards = calls.filter((c) => c.stream);
         const lastForward = forwards[forwards.length - 1];
         assert.ok(lastForward, "a forward happened");
-        assert.ok(bodyChars(lastForward.body) <= WINDOW, "the forwarded payload fits the enforced window");
-        assert.ok(!lastForward.body.includes("CODE_1_"), "compressed messages are out of the payload");
+        assert.ok(bodyTokens(lastForward.body) <= WINDOW, "the forwarded payload fits the enforced (realistic) window");
         assert.ok(lastForward.body.includes("CODE_11_"), "recent messages remain in the payload");
-        assert.ok(lastForward.body.includes(SUMMARY_TEXT), "the preflight summary is in the rebuilt payload");
 
-        // The successful turn's usage report corrects the char-based figure
-        // to the measured size — the session is not stuck on an inflated one.
+        // The successful turn's usage report corrects the estimate to the
+        // measured size — the session is not stuck on an inflated figure.
+        const s = listSessions()[0];
         assert.equal(s?.stats.lastInputTokens, 1000);
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });
@@ -295,8 +294,10 @@ test("e2e: fresh session whose history genuinely fits the window → no prefligh
         assert.equal((s?.state.blocks ?? []).filter((b) => b.active).length, 0, "no blocks created");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });

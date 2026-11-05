@@ -65,7 +65,12 @@ test("Web UI exposes upstream controls without inline handlers", async () => {
     const port = (proxy.address() as { port: number }).port;
     const base = `http://127.0.0.1:${port}`;
     try {
-        const ui = await (await fetch(`${base}/__bili/`)).text();
+        const uiRes = await fetch(`${base}/__bili/`);
+        const ui = await uiRes.text();
+        // #4958 negative direction: the sandbox CSP + nosniff pair is scoped to
+        // the blog ASSET route only — the panel HTML route must not gain it.
+        assert.equal(uiRes.headers.get("content-security-policy"), null);
+        assert.equal(uiRes.headers.get("x-content-type-options"), null);
         assert.match(ui, /Codex（ChatGPT 登录）/);
         assert.match(ui, /上游网络/);
         assert.match(ui, /Fork me on GitHub/);
@@ -386,10 +391,11 @@ test("PUT /__bili/config refuses to overwrite a config file that does not parse"
     const root = path.join(tmpdir(), `bili-put-broken-${process.pid}-${Date.now()}`);
     mkdirSync(root, { recursive: true });
     const biliConfig = path.join(root, "billion-context.json");
-    // Hand-edited file with a trailing comma — JSON.parse fails, the loader
-    // sees {}. A PUT must NOT rebuild from {} (that would silently drop the
-    // user's modelContextLimit etc.); it must 409 until the syntax is fixed.
-    writeFileSync(biliConfig, '{"providers":{},"modelContextLimit":333000,}\n', "utf8");
+    // Hand-edited file with REAL corruption (a value cut off mid-key) — unparseable even as
+    // JSONC, so the loader sees {}. A PUT must NOT rebuild from {} (that would silently drop
+    // the user's modelContextLimit etc.); it must 409 until fixed by hand. (A bare trailing
+    // comma is no longer such corruption: #3572 makes it valid JSONC that parses normally.)
+    writeFileSync(biliConfig, '{"providers":{},"modelContextLimit":\n', "utf8");
     const prevConfig = process.env.BILI_CONFIG_FILE;
     process.env.BILI_CONFIG_FILE = biliConfig;
     const opts: ProxyOptions = {

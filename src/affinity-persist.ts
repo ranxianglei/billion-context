@@ -99,7 +99,15 @@ function writeSnapshot(): void {
         const snapshot = { version: 1, entries };
         const tmp = `${file}.tmp`;
         fs.mkdirSync(path.dirname(file), { recursive: true });
-        fs.writeFileSync(tmp, JSON.stringify(snapshot));
+        // fsync before rename: a crash between write and rename otherwise leaves
+        // a size-correct, VDL=0 zero file (#3157).
+        const fd = fs.openSync(tmp, "w");
+        try {
+            fs.writeFileSync(fd, JSON.stringify(snapshot));
+            fs.fsyncSync(fd);
+        } finally {
+            fs.closeSync(fd);
+        }
         fs.renameSync(tmp, file);
         if (disk !== null) {
             const mineIds = new Set(mine.map((e) => e.sessionId));

@@ -9,7 +9,7 @@ import {
   responsesToCore,
   type ResponsesRequestBody,
 } from "../src/wire/responses.js";
-import { deriveMessageId } from "../src/wire/message-id.js";
+import { deriveCanonicalMessageId } from "../src/wire/identity.js";
 import { applyAbsorb, isAbsorbCandidate } from "../src/absorb.js";
 import { isMessageProtected, isNeverPreserveRecent } from "../src/protected.js";
 import { defaultConfig } from "../src/config.js";
@@ -107,10 +107,13 @@ test("anthropicToCore result ids stay stable under the toolName backfill", () =>
   const bashResult = msgs.find(
     (m) => m.contentType === "tool-result" && m.toolCallId === "tu_1",
   )!;
+  // #3642: canonical seed = toolName + text (the wire pairing id is out —
+  // transport plumbing, not content). The backfill stability invariant is
+  // unchanged: the seeded toolName is exactly the paired backfill.
   assert.equal(
     bashResult.id,
-    deriveMessageId("tool", "tool-result", ANTHROPIC_TEXT, {
-      toolCallId: "tu_1",
+    deriveCanonicalMessageId("tool", "tool-result", ANTHROPIC_TEXT, {
+      toolName: "bash",
     }),
   );
 });
@@ -328,10 +331,11 @@ test("responsesToCore output ids stay stable under the toolName backfill", () =>
   const fnResult = msgs.find(
     (m) => m.contentType === "tool-result" && m.toolCallId === "fc_1",
   )!;
+  // #3642: canonical seed = toolName + text (wire call_id out of the seed).
   assert.equal(
     fnResult.id,
-    deriveMessageId("tool", "tool-result", "z".repeat(480), {
-      toolCallId: "fc_1",
+    deriveCanonicalMessageId("tool", "tool-result", "z".repeat(480), {
+      toolName: "bash",
     }),
   );
 });

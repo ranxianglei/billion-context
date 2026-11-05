@@ -32,7 +32,10 @@ function sse(type: string, data: unknown): string {
     return `event: ${type}\ndata: ${JSON.stringify(data)}\n\n`;
 }
 
-const COMPRESS_ARGS = JSON.stringify({ content: [{ startId: "m00001", endId: "m00002", summary: "s" }] });
+// acp_status, not compress: the vehicle only needs to force a re-request. A
+// failing compress ends the turn before any re-request (#4186), which would
+// silently un-test the round-2 truncation surface this file exists for.
+const STATUS_ARGS = "{}";
 
 const TRUNCATED_CONCLUSION = [
     sse("message_start", { type: "message_start", message: { id: "msg_1", usage: { input_tokens: 10 } } }),
@@ -47,10 +50,10 @@ const COMPLETE_CONCLUSION = TRUNCATED_CONCLUSION + [
     sse("message_stop", { type: "message_stop" }),
 ].join("");
 
-const ROUND1_COMPRESS = [
+const ROUND1_STATUS = [
     sse("message_start", { type: "message_start", message: { id: "msg_0", usage: { input_tokens: 10 } } }),
-    sse("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "tool_use", id: "toolu_1", name: "compress", input: {} } }),
-    sse("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: COMPRESS_ARGS } }),
+    sse("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "tool_use", id: "toolu_1", name: "acp_status", input: {} } }),
+    sse("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: STATUS_ARGS } }),
     sse("content_block_stop", { type: "content_block_stop", index: 0 }),
     sse("message_delta", { type: "message_delta", delta: { stop_reason: "tool_use" }, usage: { output_tokens: 7 } }),
     sse("message_stop", { type: "message_stop" }),
@@ -114,8 +117,8 @@ test("control: normally completed round still ends without any error marker", as
     assert.match(out, /stop_reason.*end_turn/);
 });
 
-test("truncated round after a compress round (conclusion dies mid-stream) is visible", async () => {
-    const out = await drain(streamOf(ROUND1_COMPRESS), [TRUNCATED_CONCLUSION], makeCtx());
-    assert.ok(out.includes("[ACP]"), "compress visibility marker should be present");
+test("truncated round after a proxy-tool round (conclusion dies mid-stream) is visible", async () => {
+    const out = await drain(streamOf(ROUND1_STATUS), [TRUNCATED_CONCLUSION], makeCtx());
+    assert.ok(out.includes("[ACP]"), "proxy-tool visibility marker should be present");
     assert.ok(out.includes("upstream stream truncated (no completion event; round 2"), "round-2 truncation must surface");
 });

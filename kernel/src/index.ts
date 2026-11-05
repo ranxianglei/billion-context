@@ -28,6 +28,8 @@ export {
   refForRaw,
   rawForRef,
   BLOCKED_REF,
+  restampRefsToLedger,
+  type RefRestampOutcome,
 } from "./refs.js";
 export {
   prune,
@@ -92,6 +94,8 @@ export {
   leanPack,
   LEAN_HOW_TO_COMPRESS,
   leanHowToCompress,
+  LEAN_HOW_TO_COMPRESS_TIMESTAMPED,
+  TIMELINE_RULE_LINE,
   builtinSource,
   createDirPackSource,
   createPackResolver,
@@ -130,6 +134,8 @@ export {
   buildCacheReport,
   computeFoldEconomics,
   decomposeSample,
+  FOLD_CLAIM_COLD_ROUNDS,
+  FOLD_CLAIM_WARM_HIT_PCT,
   formatCacheReport,
   summarizeFoldEconomics,
 } from "./cache-report.js";
@@ -152,14 +158,14 @@ export type { HandoffInput, HandoffMeta, HandoffBlockFull } from "./handoff.js";
 export { isToolMessage } from "./message-kind.js";
 export { hideConsumedCompressCalls } from "./hide-consumed.js";
 export type { HideConsumedResult } from "./hide-consumed.js";
+// Experimental fold-point carrier relocation (default off) — host-side mirror
+// sites (round-2 re-render, S4 plugin render) call the same pure function.
+export { relocateCompressCarriers, planRelocateCompressCarriers } from "./relocate-compress.js";
+export type { RelocateOptions, RelocatePlan, RelocateMove } from "./relocate-compress.js";
 export {
   ABSORB_TOOL_NAME,
   ABSORB_TOOL,
   ABSORB_TOOL_OPENAI,
-  IMAGE_FULL_TOOL_NAME,
-  IMAGE_FULL_TOOL,
-  IMAGE_FULL_TOOL_OPENAI,
-  IMAGE_FULL_TOOL_RESPONSES,
 } from "./compress-tools.js";
 export {
   RETRIEVE_TOOL_NAME,
@@ -172,6 +178,7 @@ export {
   createContentStore,
   hashContent,
   storeOriginal,
+  restampContentStore,
   retrieveByRef,
   hasStoredRef,
   contentStoreStats,
@@ -279,39 +286,6 @@ export type {
   EvaluateCrushInput,
   ApplyCrushResult,
 } from "./crush.js";
-export {
-  DEFAULT_IMAGE_COMPRESSION_CONFIG,
-  resolveImageCompressionConfig,
-  PIXEL_IMAGE_FALLBACK_TOKENS,
-  parseImageDimensions,
-  parseImageDimensionsFromBase64,
-  pixelTileEstimate,
-  estimateImageTokens,
-  createHeuristicClassifier,
-  DEFAULT_SCREENSHOT_CLASSIFIER,
-  decideImageRoute,
-  buildImageFullSystemNote,
-  parseImageFullInput,
-  recordImageShrink,
-  isImageFullRestored,
-  imageShrinksForRef,
-  applyImageFull,
-  resetImageFullState,
-  IMAGE_FULL_FAILURE_MARKER,
-} from "./image-compress.js";
-export type {
-  ImageDimensions,
-  ImageMeta,
-  ScreenshotClassifier,
-  HeuristicClassifierOptions,
-  ImageRouteReason,
-  DownsampleRecipe,
-  ImageRoutingDecision,
-  ParsedImageFull,
-  ImageStoreEntry,
-  ImageFullInput,
-  ImageFullOutcome,
-} from "./image-compress.js";
 export { rebuildCompressionState } from "./rebuild.js";
 export type { RebuildResult, RebuildPorts } from "./rebuild.js";
 export { parseCompressArgs } from "./parse-compress-input.js";
@@ -324,6 +298,7 @@ export {
   renderVisibleRefs,
   renderRefsNode,
   createRenderRefsNode,
+  formatTagTime,
 } from "./render-refs.js";
 export type { RenderStrategy } from "./render-refs.js";
 export { resolveTransformChannel } from "./transform-channel.js";
@@ -364,6 +339,7 @@ export {
   collectLatestProtected,
   collectProtectedToolCallIds,
   hasMediaPayload,
+  hasUnrecoverableMediaPayload,
   isMessageLatestProtected,
   isMessageProtected,
   isMessageProtectedWithPairing,

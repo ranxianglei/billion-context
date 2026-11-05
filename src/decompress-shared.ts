@@ -1,10 +1,12 @@
 import {
+    blockDocs,
     collectBlockContent,
     markBlockRestoredInline,
     matchToolMessagePattern,
     parseBoundary,
     retrieveByRef,
     retrievedMessageId,
+    searchBlocks,
     toolPathOf,
     type CompressionBlock,
     type CompressionCore,
@@ -12,6 +14,8 @@ import {
     type Config,
     type CoreMessage,
     type InlineRestoreResult,
+    type SearchDoc,
+    type SearchResult,
 } from "acp-kernel";
 import { existsSync, mkdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve as resolvePath } from "node:path";
@@ -168,10 +172,20 @@ export function resolveDecompress(
     args: Record<string, unknown>,
     ctx: ProxyToolCtx,
 ): ProxyToolResult {
-    // #1995: image recovery is a distinct mode selected by imageRef (an mNNNNN ref,
-    // or "list"), independent of blockId/range — intercepted first so an image-ref
-    // call never trips the blockId-required gate below.
-    if (args.imageRef !== undefined) {
+    // #1995: image recovery is a distinct mode selected by a VALID imageRef — a
+    // non-blank string (mNNNNN ref or "list"), independent of blockId/range,
+    // intercepted first so an image-ref call never trips the blockId gate below.
+    // #2626: key on a NON-BLANK VALUE, not field presence — hosts/models emit
+    // ""/whitespace/null for optional fields, and presence-based dispatch hijacked
+    // the text path (valid blockId + imageRef:"" returned the image-list receipt
+    // instead of restoring the block). Blank/null/undefined ⇒ unspecified → fall
+    // through to block/range restore; a non-string non-null value is a loud param
+    // error, not a silent default to the image list.
+    const ir = args.imageRef;
+    if (ir != null && typeof ir !== "string") {
+        return toolFail('[decompress FAILED: imageRef must be a string (an mNNNNN ref or "list") — omit it to restore a text block]');
+    }
+    if (typeof ir === "string" && ir.trim() !== "") {
         return resolveImageRestore(args, ctx);
     }
     const rawBlockId = args.blockId;
@@ -180,7 +194,17 @@ export function resolveDecompress(
     }
     const blockId = rawBlockId.trim();
     const block = ctx.core.decompress(blockId, ctx.session.state);
-    if (!block) return resolveDerivedDecompress(args, ctx, blockId);
+    if (!block) {
+        // Removed-from-state blocks (the #2695 reap path, or a future archive
+        // that drops blocks) still carry their preCompactionArchive entry: fail
+        // with the real reason instead of the misleading "not found" — the
+        // model got here by citing a ref from a summary it legitimately saw.
+        const selfArchived = preCompactionArchiveOf(ctx.session)[blockId];
+        if (selfArchived !== undefined) {
+            return toolFail(`[decompress FAILED: block ${blockId} is an archived block (${selfArchived.reason}) — it was removed from live state along with its covered substrate and cannot be restored.]`);
+        }
+        return resolveDerivedDecompress(args, ctx, blockId);
+    }
     const archived = preCompactionArchiveOf(ctx.session);
     if (archived[blockId] !== undefined) {
         return toolFail(`[decompress FAILED: block ${blockId} is a pre-compaction archive — its content was in the history BEFORE the client's native compaction and is no longer reachable (replaced by the client's compaction summary). decompress is unavailable for archived blocks.]`);
@@ -192,7 +216,7 @@ export function resolveDecompress(
         return resolveDecompressRange(args, ctx, block);
     }
 
-    const full = args.full === true;
+    const full = args.full === true || args.full === "true";
     const cached = ctx.session.blockContents.get(blockId);
     let body: string;
     let count: number;
@@ -269,13 +293,13 @@ function resolveImageRestore(args: Record<string, unknown>, ctx: ProxyToolCtx): 
     const raw = typeof args.imageRef === "string" ? args.imageRef.trim() : "";
     if (raw === "" || raw.toLowerCase() === "list") {
         if (!index || index.size === 0) {
-            return toolOk("[No restorable images right now — this request carries no indexed historical images (stripImages must be enabled and the client must resend them).]");
+            return toolOk("[No restorable images right now — this request carries no indexed historical images (the client must resend history bytes for them to be indexed).]");
         }
         const lines = describeRestorable(index);
         return toolOk(`[Restorable images (${lines.length}):]\n${lines.join("\n")}\nRestore one with decompress({ imageRef: "<ref>" }); it is written to a file you open with the read tool.`);
     }
     if (!index) {
-        return toolFail(`[decompress FAILED: no image history is indexed for this request (stripImages off?) — cannot restore "${raw}".]`);
+        return toolFail(`[decompress FAILED: no image history is indexed for this request — cannot restore "${raw}".]`);
     }
     const imgs = index.get(raw);
     if (!imgs || imgs.length === 0) {
@@ -399,7 +423,11 @@ function resolveDecompressRange(args: Record<string, unknown>, ctx: ProxyToolCtx
     for (const { raw, num } of cov.raws) {
         if (!pickedSet.has(raw)) continue;
         const r = retrieveByRef(store, `m${String(num).padStart(5, "0")}`);
-        if (r.ok) {
+        // #4733: a ref whose stored entry belongs to a DIFFERENT raw id is a
+        // post-restamp frozen alias — serving it here would silently restore
+        // another message's original under this one's citation. Treat as
+        // not-found and fall through to the view text.
+        if (r.ok && r.entry.rawId === raw) {
             parts.push(r.entry.toolName ? `[${r.entry.toolName} • stored]\n${r.text}` : `[${r.entry.kind} • stored]\n${r.text}`);
             restoredFromStore++;
             continue;
@@ -548,14 +576,20 @@ function resolveDerivedDecompress(
 ): ProxyToolResult {
     for (const anc of derivedAncestorSessions(ctx.session)) {
         const block = ctx.core.decompress(blockId, anc.state);
-        if (!block) continue;
+        if (!block) {
+            const ancArchived = preCompactionArchiveOf(anc)[blockId];
+            if (ancArchived !== undefined) {
+                return toolFail(`[decompress FAILED: block ${blockId} is an archived block in derived session ${anc.id} (${ancArchived.reason}) — it was removed from live state along with its covered substrate and cannot be restored.]`);
+            }
+            continue;
+        }
         if (preCompactionArchiveOf(anc)[blockId] !== undefined) {
             return toolFail(`[decompress FAILED: block ${blockId} is a pre-compaction archive in derived session ${anc.id} — its content was replaced by the client's compaction summary and is no longer reachable.]`);
         }
         if (hasRangeArgs(args)) {
             return toolFail(`[decompress FAILED: range restore (startId/endId) of derived-parent blocks is not supported — decompress "${blockId}" without range args (#1333)]`);
         }
-        const full = args.full === true;
+        const full = args.full === true || args.full === "true";
         const cached = anc.blockContents.get(blockId);
         const view = cached ? (full ? cached.full : (cached.one ?? cached.full)) : undefined;
         const body = view?.text || block.summary;
@@ -664,18 +698,156 @@ type SearchPlanOpts = {
     protectedPatterns?: string[];
 };
 
+// #2751: preview windowing. The old fixed head-clamp (safePrefix 200) hid a hit
+// whose only occurrence sat past char 200, and "Found N" was indistinguishable
+// from "N is all that exists". Center the preview on the pool-rarest matched
+// term (marking it) so unique-match evidence survives truncation; budget stays
+// at the old 200-char total so output never grows unbounded.
+const SNIPPET_TOTAL = 200;
+const SNIPPET_AHEAD = 80;
+
+// Code-unit-safe middle slice — never leaves a lone surrogate at an edge
+// (#816/#828/#1615: hand-sliced model-visible text must reuse this discipline).
+function safeMidSlice(text: string, start: number, end: number): string {
+    let s = start;
+    let e = end;
+    if (s > 0 && s < text.length) {
+        const c = text.charCodeAt(s);
+        if (c >= 0xdc00 && c <= 0xdfff) s += 1;
+    }
+    if (e > 0 && e < text.length) {
+        const c = text.charCodeAt(e - 1);
+        if (c >= 0xd800 && c <= 0xdbff) e -= 1;
+    }
+    return text.slice(s, e);
+}
+
+function poolTermFrequency(pool: CompressionBlock[], terms: string[]): Map<string, number> {
+    const freq = new Map<string, number>();
+    const lower = terms.map((t) => t.toLowerCase()).filter(Boolean);
+    for (const t of lower) if (!freq.has(t)) freq.set(t, 0);
+    for (const b of pool) {
+        const hay = `${b.topic ?? ""}\n${b.summary}`.toLowerCase();
+        for (const t of lower) if (hay.includes(t)) freq.set(t, (freq.get(t) ?? 0) + 1);
+    }
+    return freq;
+}
+
+// Most distinctive query term present in this block's summary = fewest
+// containing blocks, tie → earliest occurrence. Null when no term is in the
+// summary body (hit then lives in the topic, already shown in the header line).
+function pickAnchorTerm(summary: string, terms: string[], freq: Map<string, number>): { term: string; index: number } | null {
+    const lower = summary.toLowerCase();
+    let best: { term: string; index: number; freq: number } | null = null;
+    for (const t of terms) {
+        const tl = t.toLowerCase();
+        if (!tl) continue;
+        const i = lower.indexOf(tl);
+        if (i === -1) continue;
+        const f = freq.get(tl) ?? 0;
+        if (!best || f < best.freq || (f === best.freq && i < best.index)) best = { term: tl, index: i, freq: f };
+    }
+    return best ? { term: best.term, index: best.index } : null;
+}
+
+function markFirstMatch(text: string, needle: string): string {
+    const idx = text.toLowerCase().indexOf(needle);
+    if (idx === -1) return text;
+    return text.slice(0, idx) + "\u3010" + text.slice(idx, idx + needle.length) + "\u3011" + text.slice(idx + needle.length);
+}
+
+function evidenceSnippet(summary: string, terms: string[], freq: Map<string, number>): string {
+    const anchor = pickAnchorTerm(summary, terms, freq);
+    if (!anchor) return summary.length > SNIPPET_TOTAL ? safePrefix(summary, SNIPPET_TOTAL) + "..." : summary;
+    const start = Math.max(0, anchor.index - SNIPPET_AHEAD);
+    const end = Math.min(summary.length, start + SNIPPET_TOTAL);
+    const win = markFirstMatch(safeMidSlice(summary, start, end), anchor.term);
+    return (start > 0 ? "... " : "") + win + (end < summary.length ? " ..." : "");
+}
+
+// #2751: for a long multi-term query, if a term is absent from every returned
+// block yet present in lower-ranked candidates, steer the model to narrow to it
+// rather than reading "absent from top-N" as "absent from history". At most once.
+function narrowingHint(terms: string[], returned: CompressionBlock[], ranked: CompressionBlock[]): string {
+    if (terms.length < 3) return "";
+    const returnedSet = new Set(returned);
+    const lowerCands = ranked.filter((b) => !returnedSet.has(b));
+    if (lowerCands.length === 0) return "";
+    const contains = (b: CompressionBlock, tl: string): boolean =>
+        (b.topic ?? "").toLowerCase().includes(tl) || b.summary.toLowerCase().includes(tl);
+    let best: { term: string; count: number } | null = null;
+    for (const t of terms) {
+        const tl = t.toLowerCase();
+        if (!tl) continue;
+        if (returned.some((b) => contains(b, tl))) continue;
+        const count = lowerCands.filter((b) => contains(b, tl)).length;
+        if (count === 0) continue;
+        if (!best || count < best.count || (count === best.count && t.length > best.term.length)) best = { term: t, count };
+    }
+    if (!best) return "";
+    return `[tip: none of the top ${returned.length} results contain "${best.term}" but ${best.count} lower-ranked candidate(s) do — try searching "${best.term}" alone to surface its block directly]`;
+}
+
+/** Folded-original-text provider: yields the full pre-fold text of every
+ *  block the host still has content for (session.blockContents — resident or
+ *  lazy-reloaded from the store). Used by search_context to look PAST the
+ *  model-written summaries into the verbatim originals (#4154: a consumed
+ *  block's content is reachable today only via decompress; search pretended
+ *  it did not exist). Providers are an enhancement: failures degrade to
+ *  summary-only search, never fail the tool call. */
+type OriginalTextProvider = () => Array<{ blockId: string; text: string }>;
+
+// Strip rendered acp ref tags from folded originals before indexing: the
+// wrapper (`tokens="506" type="text"`) is protocol chrome, not content —
+// left in, every query containing "token" or "type" would false-positive
+// against every block. The inner message ref (mNNNNN) is kept: it is the
+// anchor the model needs to plan a range decompress.
+const ACP_TAG_RE = /\x3cacp\s[^\x3e]*\x3e([^\x3c]*)\x3c\/acp\x3e/g;
+function stripAcpTags(text: string): string {
+    return text.replace(ACP_TAG_RE, "$1");
+}
+
+function originalTextsOf(session: Session): OriginalTextProvider {
+    return () => {
+        const out: Array<{ blockId: string; text: string }> = [];
+        for (const [blockId, content] of session.blockContents) {
+            const text = content?.full?.text;
+            if (typeof text === "string" && text.length > 0) out.push({ blockId, text: stripAcpTags(text) });
+        }
+        return out;
+    };
+}
+
 export function executeSearchContext(
     args: Record<string, unknown>,
-    core: CompressionCore,
+    _core: CompressionCore,
     state: CompressionState,
     foreignSessionId?: string,
     plan?: SearchPlanOpts,
+    originals?: OriginalTextProvider,
 ): ProxyToolResult {
     const query = typeof args.query === "string" ? args.query : "";
     if (query.length === 0) return toolFail("[search_context FAILED: query is required]");
     const scope = foreignSessionId ? ` in session ${foreignSessionId}` : "";
-    const limit = typeof args.limit === "number" && args.limit > 0 ? Math.floor(args.limit) : 5;
-    const pool = core.search(query, state);
+    const rawLimit = typeof args.limit === "number" ? args.limit : typeof args.limit === "string" && /^\d+$/.test(args.limit.trim()) ? Number(args.limit.trim()) : NaN;
+    const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? Math.floor(rawLimit) : 5;
+    const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
+    // #4154: the pool is EVERY block (active + inactive/consumed), ranked by
+    // the kernel's public search surface (blockDocs + searchBlocks) instead
+    // of the active-only core.search wrapper. A consumed block's summary is
+    // real history the model can still act on — it must stay findable, with
+    // the render marking it inactive so decompress is the obvious next step.
+    // Algorithm = "substring" with a ~zero floor: the default "hybrid"
+    // algorithm's fuzzy n-gram component surfaces blocks for garbage queries
+    // (non-matches become weak matches), which would regress the #2751
+    // no-match answer; substring + minScore 1e-9 keeps the exact current
+    // semantics — one literal occurrence is a positive signal, never
+    // silently dropped (#2158), zero occurrences = no match.
+    const blockById = new Map(state.blocks.map((b) => [b.blockId, b]));
+    const pool = searchBlocks(blockDocs(state), query, { limit: state.blocks.length, algorithm: "substring", minScore: 1e-9 })
+        .map((r) => blockById.get(r.ref))
+        .filter((b): b is CompressionBlock => b !== undefined);
+    const freq = poolTermFrequency(pool, terms);
     let ranked = pool;
     let scored: Array<{ block: CompressionBlock; score: number }> | null = null;
     if (plan && !foreignSessionId && pool.length > limit) {
@@ -689,30 +861,81 @@ export function executeSearchContext(
         }
     }
     const blocks = ranked.slice(0, limit);
-    if (blocks.length === 0) {
+    // #4154: second corpus — the verbatim pre-fold text of every block the
+    // host still holds. Capped at `limit` extra lines; blocks already ranked
+    // via their summary are not repeated. Exceptions degrade to nothing:
+    // original-text hits are strictly additive.
+    const origHits: Array<{ r: SearchResult; spanText: string | null; count: number }> = [];
+    if (originals) {
+        try {
+            const entries = originals().filter((e) => blockById.has(e.blockId) && e.text.length > 0);
+            if (entries.length > 0) {
+                const docs = entries.map((e): SearchDoc => ({
+                    kind: "block",
+                    ref: `${e.blockId}!orig`,
+                    text: e.text,
+                    title: `original content of ${e.blockId}`,
+                    blockId: e.blockId,
+                    tier: blockById.get(e.blockId)?.tier ?? 1,
+                }));
+                // #4154: skip blocks whose summary already earned a line above —
+                // the original-text corpus only ADDS hits, never repeats them.
+                const already = new Set(blocks.map((b) => b.blockId));
+                for (const r of searchBlocks(docs, query, { limit: entries.length, algorithm: "substring", minScore: 1e-9 })) {
+                    if (!r.blockId || already.has(r.blockId)) continue;
+                    const block = blockById.get(r.blockId);
+                    if (!block) continue;
+                    const span = coveredRefSpan(state, block);
+                    origHits.push({ r, spanText: span?.text ?? null, count: span?.count ?? 0 });
+                    if (origHits.length >= limit) break;
+                }
+            }
+        } catch {
+            // originals are best-effort; never fail the search
+        }
+    }
+    if (blocks.length === 0 && origHits.length === 0) {
         // #1875: an empty result is a valid answer to a query, not a failure.
-        if (!state.blocks.some((b) => b.active)) return toolOk(`[No compressed blocks exist yet${scope} — nothing to search.]`);
-        return toolOk(`[No blocks matched "${query}"${scope}]`);
+        if (state.blocks.length === 0) return toolOk(`[No compressed blocks exist yet${scope} — nothing to search.]`);
+        const origNote = originals ? " + the folded original text" : "";
+        return toolOk(`[No blocks matched "${query}" among ${state.blocks.length} block(s)${scope}. Scope = compressed topics/summaries (active + folded-away)${origNote} — NOT visible messages or other sessions; absence here ≠ never-discussed.]`);
     }
     const lines = blocks.map((b) => {
         const topic = b.topic ?? "(no topic)";
-        const preview = b.summary.length > 200 ? safePrefix(b.summary, 200) + "..." : b.summary;
+        const preview = evidenceSnippet(b.summary, terms, freq);
         // #1179 CCR v2: covered message-ref span(s) — connect block space to
         // store space so the model can target acp_retrieve / range decompress
         // at individual messages instead of whole blocks.
         const span = coveredRefSpan(state, b);
         const spanNote = span ? ` [${span.text} · ${span.count} msgs]` : "";
-        return `${b.blockId} (T${b.tier}) "${topic}"${spanNote}\n  ${preview}`;
+        // #4154: inactive = folded away by a later fold; still findable, and
+        // decompress is the documented way back to its full summary.
+        const inactiveNote = b.active ? "" : ` [inactive — folded away; decompress ${b.blockId} restores it]`;
+        return `${b.blockId} (T${b.tier}) "${topic}"${spanNote}${inactiveNote}\n  ${preview}`;
     });
+    const origLines = origHits.map(({ r, spanText, count }) =>
+        `${r.blockId} (original text, not in any summary)${spanText ? ` [${spanText}${count ? ` · ${count} msgs` : ""}]` : ""}\n  ${r.preview}`
+    );
     let steering = "";
     if (scored && plan && !foreignSessionId && blocks.length > 0) {
         const returned = new Set(blocks);
         steering = buildSteering(scored.filter((s) => returned.has(s.block)), state, plan.session);
     }
+    const truncNote = ranked.length > blocks.length
+        ? `\n\n[truncated: showing ${blocks.length} of ${ranked.length} candidates by relevance — pass limit:${ranked.length} to see the rest]`
+        : "";
+    const tip = narrowingHint(terms, blocks, ranked);
+    const tipNote = tip ? `\n\n${tip}` : "";
+    const origSection = origLines.length > 0
+        ? `\n\nOriginal-text hit(s) — verbatim folded content that no summary mentions; decompress the block for the full record:\n${origLines.join("\n")}`
+        : "";
     const note = foreignSessionId
         ? `\n\n[Read-only search of historical session ${foreignSessionId}. Block ids are per-session namespaces — decompress acts on the current session only. For bulk content use bili export ${foreignSessionId} [--full].]`
         : "";
-    return toolOk(`Found ${blocks.length} block(s) for "${query}"${scope}:\n\n${lines.join("\n\n")}${steering}${note}`);
+    const header = blocks.length === 0
+        ? `Found 0 summary block(s) for "${query}"${scope} — but ${origHits.length} folded original(s) match:`
+        : `Found ${blocks.length} block(s) for "${query}"${scope}:`;
+    return toolOk(`${header}\n\n${lines.join("\n\n")}${truncNote}${steering}${tipNote}${origSection}${note}`);
 }
 
 // #841: resolve a requested session id to its compression state without
@@ -737,10 +960,14 @@ export function executeSearchContextTarget(
     const plan: SearchPlanOpts | undefined = ctx && effectiveSearchPlanAware(ctx.session)
         ? { messages: ctx.messages, session: ctx.session, log: ctx.log, protectedPatterns: ctx.config.protectedLatestTools }
         : undefined;
+    // #4154: wherever a Session object backs the state being searched, its
+    // blockContents (resident or lazy-reloaded from the store) feeds the
+    // folded-original-text corpus.
+    const ownOriginals = ctx ? originalTextsOf(ctx.session) : undefined;
     // #1125: honor the param description's "Defaults to the current conversation" —
     // the literal "current" (any case) resolves to this session, not the foreign lookup.
     if (!requested || requested === sessionId || requested.toLowerCase() === "current") {
-        const local = executeSearchContext(args, core, state, undefined, plan);
+        const local = executeSearchContext(args, core, state, undefined, plan, ownOriginals);
         // #1333: a derived session (pi RLM child) has no blocks of its own —
         // fall back to the recorded parent chain (read-only) instead of a
         // bare "nothing to search".
@@ -748,8 +975,8 @@ export function executeSearchContextTarget(
             const self2 = peekSession(sessionId);
             if (self2) {
                 for (const anc of derivedAncestorSessions(self2)) {
-                    if (!core.search(String(args.query ?? ""), anc.state).length) continue;
-                    return executeSearchContext(args, core, anc.state, anc.id);
+                    if (!searchBlocks(blockDocs(anc.state), String(args.query ?? ""), { limit: anc.state.blocks.length, algorithm: "substring", minScore: 1e-9 }).length) continue;
+                    return executeSearchContext(args, core, anc.state, anc.id, undefined, originalTextsOf(anc));
                 }
             }
         }
@@ -758,8 +985,11 @@ export function executeSearchContextTarget(
     // A self-reference under an alias form (canonical pfa-* id) keeps plain
     // current-session semantics — no "historical session" framing.
     const self = peekSession(requested) ?? findSessionByCanonicalId(requested);
-    if (self?.id === sessionId) return executeSearchContext(args, core, state, undefined, plan);
+    if (self?.id === sessionId) return executeSearchContext(args, core, state, undefined, plan, ownOriginals);
+    const resident = self ?? undefined;
     const foreign = resolveForeignSessionState(requested);
     if (!foreign) return toolFail(`[search_context FAILED: unknown session "${requested}"]`);
-    return executeSearchContext(args, core, foreign, requested);
+    // Store-only sessions have no Session object in memory — their folded
+    // originals are not reachable here; the search degrades to summaries.
+    return executeSearchContext(args, core, foreign, requested, undefined, resident ? originalTextsOf(resident) : undefined);
 }

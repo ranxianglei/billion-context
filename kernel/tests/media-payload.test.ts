@@ -2,8 +2,12 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { openaiToCore, coreToOpenai } from "../src/wire/openai.js";
 import type { OpenAIRequestBody } from "../src/wire/openai.js";
-import { hasMediaPayload } from "../src/protected.js";
+import {
+  hasMediaPayload,
+  hasUnrecoverableMediaPayload,
+} from "../src/protected.js";
 import { assignRefs, BLOCKED_REF } from "../src/refs.js";
+import { MEDIA_REFS_MARKER } from "../src/media-refs.js";
 import { buildCompressibleRanges } from "../src/recommend.js";
 import { createCore } from "../src/compress.js";
 import { createInitialState } from "../src/state.js";
@@ -81,10 +85,11 @@ test("openai: [text, file] round-trips the file part verbatim", () => {
   ]);
   const { msgs } = openaiToCore(body);
   assert.equal(msgs.length, 1);
-  // Pre-existing stringContent semantics: array entries join with "\n" and
-  // non-text entries contribute "" — same as today's [text, image] messages.
-  // The id derives from this text, so the shape must not change.
-  assert.equal(msgs[0]?.text, "what is in this file?\n");
+  // #3642 canonical granularity: the text part is its own core carrying the
+  // part's bytes verbatim (no "\n" joining anymore); the opaque file part
+  // rides the preceding text core's plural sidecar so the rebuild keeps the
+  // wire part order. The id derives from the part text.
+  assert.equal(msgs[0]?.text, "what is in this file?");
   assert.deepEqual(
     msgs[0]?.rawOpenaiContentParts,
     [FILE_PART],
@@ -104,6 +109,37 @@ test("openai: [text, file] round-trips the file part verbatim", () => {
     FILE_PART,
     "file part re-emitted verbatim",
   );
+});
+
+test("openai: [file, text, file] keeps every opaque part (#1205)", () => {
+  const fileA = { type: "file", file_id: "file-api-aaa" };
+  const fileB = { type: "file", file_id: "file-api-bbb" };
+  const body = bodyOf([
+    {
+      role: "user",
+      content: [
+        fileA,
+        { type: "text", text: "compare these files" },
+        fileB,
+      ],
+    },
+  ]);
+  const { msgs } = openaiToCore(body);
+  assert.equal(msgs.length, 1);
+  assert.equal(msgs[0]?.text, "compare these files");
+  // The leading-opaque flush must not clobber the part accumulated AFTER
+  // the text core: both ride the plural sidecar, relative order intact.
+  assert.deepEqual(msgs[0]?.rawOpenaiContentParts, [fileA, fileB]);
+
+  const content = rebuiltUserContent(
+    msgs,
+  ) as Array<Record<string, unknown>>;
+  assert.ok(Array.isArray(content));
+  assert.deepEqual(content, [
+    { type: "text", text: "compare these files" },
+    fileA,
+    fileB,
+  ]);
 });
 
 test("openai: lone [file] part survives with empty text", () => {
@@ -145,14 +181,22 @@ test("openai: single data-URL image keeps legacy singular sidecar shape", () => 
     },
   ]);
   const { msgs } = openaiToCore(body);
-  assert.ok(msgs[0]?.rawOpenaiContent, "singular sidecar preserved");
+  // #3642: [text, image] splits into a text core + an image core carrying
+  // the canonical "[image]" marker; the singular raw sidecar lives on the
+  // image core. The rebuild merges the run back into ONE message with the
+  // marker never re-rendered as a text part.
+  assert.equal(msgs.length, 2);
+  assert.equal(msgs[0]?.text, "look");
+  assert.equal(msgs[0]?.rawOpenaiContent, undefined);
+  assert.equal(msgs[1]?.text, "[image]");
+  assert.ok(msgs[1]?.rawOpenaiContent, "singular sidecar preserved");
   assert.equal(
-    msgs[0]?.rawOpenaiContentParts,
+    msgs[1]?.rawOpenaiContentParts,
     undefined,
     "no plural sidecar for a lone image",
   );
-  assert.equal(msgs[0]?.imageBase64, IMG_DATA);
-  assert.equal(msgs[0]?.imageMediaType, "image/png");
+  assert.equal(msgs[1]?.imageBase64, IMG_DATA);
+  assert.equal(msgs[1]?.imageMediaType, "image/png");
 
   const content = rebuiltUserContent(msgs);
   assert.ok(Array.isArray(content));
@@ -174,7 +218,12 @@ test("openai: multi-image plural sidecar unchanged", () => {
     },
   ]);
   const { msgs } = openaiToCore(body);
-  assert.equal(msgs[0]?.rawOpenaiContentParts?.length, 2);
+  // #3642: each image is its own core with its singular raw sidecar; the
+  // rebuild merges the [text, image, image] run back into one message.
+  assert.equal(msgs.length, 3);
+  assert.equal(msgs[0]?.text, "two pics");
+  assert.ok(msgs[1]?.rawOpenaiContent);
+  assert.ok(msgs[2]?.rawOpenaiContent);
   const content = rebuiltUserContent(msgs);
   assert.ok(Array.isArray(content));
   assert.deepEqual(
@@ -265,27 +314,368 @@ test("hasMediaPayload detects each sidecar carrier and ignores plain/tool-result
   );
 });
 
-test("assignRefs gives media messages a BLOCKED ref", () => {
+test("hasUnrecoverableMediaPayload pins only control-plane state and refless media (#5620)", () => {
+  assert.equal(
+    hasUnrecoverableMediaPayload(textMsg("a", "user", "x")),
+    false,
+  );
+  // OpenAI chat
+  assert.equal(
+    hasUnrecoverableMediaPayload(mediaUserMsg("b", "x", { imageBase64: "AQ" })),
+    false,
+    "bare imageBase64 sidecar carries no external ref",
+  );
+  assert.equal(
+    hasUnrecoverableMediaPayload(
+      mediaUserMsg("c", "x", {
+        rawOpenaiContent: { type: "image_url", image_url: { url: DATA_URL } },
+      }),
+    ),
+    false,
+    "singular data-URL image is archivable",
+  );
+  assert.equal(
+    hasUnrecoverableMediaPayload(
+      mediaUserMsg("d", "x", {
+        rawOpenaiContent: {
+          type: "image_url",
+          image_url: { url: "https://example.com/x.png" },
+        },
+      }),
+    ),
+    false,
+    "remote URL image is ref-recoverable — the handle rides the summary (#5620)",
+  );
+  assert.equal(
+    hasUnrecoverableMediaPayload(
+      mediaUserMsg("e", "x", { rawOpenaiContent: FILE_PART }),
+    ),
+    false,
+    "file ref in singular slot is ref-recoverable (#5620)",
+  );
+  assert.equal(
+    hasUnrecoverableMediaPayload(
+      mediaUserMsg("f", "x", {
+        rawOpenaiContentParts: [
+          { type: "image_url", image_url: { url: DATA_URL } },
+        ],
+      }),
+    ),
+    false,
+  );
+  assert.equal(
+    hasUnrecoverableMediaPayload(
+      mediaUserMsg("g", "x", {
+        rawOpenaiContentParts: [
+          { type: "image_url", image_url: { url: DATA_URL } },
+          { type: "image_url", image_url: { url: "https://example.com/y.png" } },
+        ],
+      }),
+    ),
+    false,
+    "one remote URL among inline images makes the message ref-recoverable (#5620)",
+  );
+  assert.equal(
+    hasUnrecoverableMediaPayload(
+      mediaUserMsg("h", "x", { rawOpenaiContentParts: [FILE_PART] }),
+    ),
+    false,
+    "DeepSeek file ref is ref-recoverable — the id rides the summary (#5620; #1205 bytes stay unrecoverable)",
+  );
+  assert.equal(
+    hasUnrecoverableMediaPayload(
+      mediaUserMsg("h2", "x", {
+        rawOpenaiContentParts: [{ type: "mystery", blob: "zzz" }],
+      }),
+    ),
+    true,
+    "unknown opaque part without a re-access handle still pins (#5620 conservative enumeration)",
+  );
+  // Anthropic
+  assert.equal(
+    hasUnrecoverableMediaPayload(
+      mediaUserMsg("i", "x", {
+        rawAnthropicBlock: {
+          type: "image",
+          source: { type: "base64", media_type: "image/png", data: IMG_DATA },
+        },
+      }),
+    ),
+    false,
+  );
+  assert.equal(
+    hasUnrecoverableMediaPayload(
+      mediaUserMsg("j", "x", {
+        rawAnthropicBlock: {
+          type: "image",
+          source: { type: "url", url: "https://example.com/x.png" },
+        },
+      }),
+    ),
+    false,
+    "anthropic url-source remote image is ref-recoverable (#5620)",
+  );
+  assert.equal(
+    hasUnrecoverableMediaPayload(
+      mediaUserMsg("k", "x", {
+        rawAnthropicBlock: {
+          type: "image",
+          source: { type: "url", url: DATA_URL },
+        },
+      }),
+    ),
+    false,
+    "data: URL in a url source still carries bytes",
+  );
+  assert.equal(
+    hasUnrecoverableMediaPayload(
+      mediaUserMsg("l", "x", {
+        rawAnthropicBlock: { type: "redacted_thinking", data: "xxx" },
+      }),
+    ),
+    false,
+    "thinking-family carriers are not media",
+  );
+  assert.equal(
+    hasUnrecoverableMediaPayload(
+      mediaUserMsg("m", "x", {
+        rawAnthropicBlock: {
+          type: "tool_result",
+          content: [
+            {
+              type: "document",
+              source: { type: "url", url: "https://example.com/d.pdf" },
+            },
+          ],
+        },
+      }),
+    ),
+    true,
+    "non-image tool_result content blocks pin",
+  );
+  // Responses
+  assert.equal(
+    hasUnrecoverableMediaPayload(
+      mediaUserMsg("n", "x", {
+        rawResponsesItem: {
+          content: [{ type: "input_image", image_url: DATA_URL }],
+        },
+      }),
+    ),
+    false,
+  );
+  assert.equal(
+    hasUnrecoverableMediaPayload(
+      mediaUserMsg("o", "x", {
+        rawResponsesItem: {
+          content: [
+            { type: "input_image", image_url: "https://example.com/x.png" },
+          ],
+        },
+      }),
+    ),
+    false,
+    "responses-wire remote input_image is ref-recoverable (#5620)",
+  );
+  assert.equal(
+    hasUnrecoverableMediaPayload(
+      mediaUserMsg("p", "x", {
+        rawResponsesItem: {
+          type: "custom_tool_call_output",
+          output: [{ type: "input_image", image_url: DATA_URL }],
+        },
+      }),
+    ),
+    false,
+    "tool-output nested input_image is archivable",
+  );
+  assert.equal(
+    hasUnrecoverableMediaPayload(
+      mediaUserMsg("q", "x", {
+        rawResponsesItem: {
+          type: "message",
+          content: [{ type: "input_text", text: "hi" }],
+        },
+      }),
+    ),
+    false,
+  );
+  // Google
+  assert.equal(
+    hasUnrecoverableMediaPayload(
+      mediaUserMsg("r", "x", {
+        rawGoogleParts: [
+          { inlineData: { mimeType: "image/png", data: IMG_DATA } },
+        ],
+      }),
+    ),
+    false,
+  );
+  assert.equal(
+    hasUnrecoverableMediaPayload(
+      mediaUserMsg("s", "x", {
+        rawGoogleParts: [
+          { fileData: { mimeType: "image/png", fileUri: "gs://bucket/img.png" } },
+        ],
+      }),
+    ),
+    false,
+    "fileData URI ref is ref-recoverable — the URI rides the summary (#5620/#2609)",
+  );
+  assert.equal(
+    hasUnrecoverableMediaPayload(
+      mediaUserMsg("t", "x", {
+        rawGoogleParts: [{ videoMetadata: { startTime: "0.0" } }],
+      }),
+    ),
+    true,
+    "videoMetadata reference pins",
+  );
+  assert.equal(
+    hasUnrecoverableMediaPayload(
+      mediaUserMsg("u", "x", {
+        rawGoogleParts: [
+          {
+            functionResponse: {
+              name: "screenshot",
+              parts: [
+                { fileData: { mimeType: "image/png", fileUri: "gs://b/i.png" } },
+              ],
+            },
+          },
+        ],
+      }),
+    ),
+    false,
+    "nested functionResponse fileData is ref-recoverable (#5620)",
+  );
+  assert.equal(
+    hasUnrecoverableMediaPayload(
+      mediaUserMsg("v", "x", { rawGoogleParts: [{ text: "plain" }] }),
+    ),
+    false,
+  );
+});
+
+test("assignRefs folds archivable and ref-based media like text; only refless media gets BLOCKED (#5620)", () => {
   const messages = [
     textMsg("a", "user", "alpha"),
     mediaUserMsg("img", "", { imageBase64: IMG_DATA }),
+    mediaUserMsg("refimg", "", {
+      rawOpenaiContent: {
+        type: "image_url",
+        image_url: { url: "https://example.com/x.png" },
+      },
+    }),
+    mediaUserMsg("file", "", { rawOpenaiContentParts: [FILE_PART] }),
+    mediaUserMsg(
+      "mystery",
+      "",
+      { rawOpenaiContentParts: [{ type: "mystery", blob: "zzz" }] },
+    ),
     textMsg("b", "assistant", "beta"),
   ];
   const state = createInitialState();
   const res = assignRefs(messages, {
     existing: state.messageRefs,
     nextIndex: 1,
-    isProtected: hasMediaPayload,
+    isProtected: hasUnrecoverableMediaPayload,
   });
   assert.equal(res.map.byRaw["a"], "m00001");
-  assert.equal(res.map.byRaw["img"], BLOCKED_REF);
+  assert.equal(res.map.byRaw["img"], "m00002");
+  assert.equal(res.map.byRaw["refimg"], "m00003", "#5620: citable");
+  assert.equal(res.map.byRaw["file"], "m00004", "#5620: citable");
+  assert.equal(res.map.byRaw["mystery"], BLOCKED_REF);
+  assert.equal(res.map.byRaw["b"], "m00005");
+});
+
+test("assignRefs migrates a legacy BLOCKED ref to a fresh number when protection lifts", () => {
+  const messages = [
+    textMsg("a", "user", "alpha"),
+    mediaUserMsg("img", "", { imageBase64: IMG_DATA }),
+    textMsg("b", "assistant", "beta"),
+  ];
+  const state = createInitialState();
+  // Legacy session shape: the image was pinned under #1188 before #2607 lifted
+  // the exemption for archivable media.
+  state.messageRefs.byRaw["a"] = "m00001";
+  state.messageRefs.byRaw["img"] = BLOCKED_REF;
+  state.messageRefs.byRaw["b"] = "m00002";
+  const res = assignRefs(messages, {
+    existing: state.messageRefs,
+    nextIndex: 3,
+    isProtected: hasUnrecoverableMediaPayload,
+  });
+  assert.equal(res.map.byRaw["a"], "m00001");
+  assert.equal(res.map.byRaw["img"], "m00003", "fresh number — never a reuse");
   assert.equal(res.map.byRaw["b"], "m00002");
 });
 
-test("buildCompressibleRanges never spans a media message", () => {
+test("buildCompressibleRanges spans archivable media (foldable since #2607)", () => {
   const messages = [
     textMsg("a", "user", "alpha ".repeat(50).trim()),
     mediaUserMsg("img", "see attached", { imageBase64: IMG_DATA }),
+    textMsg("b", "assistant", "beta ".repeat(50).trim()),
+  ];
+  const state = createInitialState();
+  state.messageRefs = assignRefs(messages, {
+    existing: state.messageRefs,
+    nextIndex: 1,
+  }).map;
+  const ranges = buildCompressibleRanges(messages, state, config());
+
+  const refToIndex = new Map(
+    messages.map((m, i) => [state.messageRefs.byRaw[m.id], i]),
+  );
+  const mediaIndex = messages.findIndex((m) => m.id === "img");
+  assert.ok(
+    ranges.compressible.some((r) => {
+      const s = refToIndex.get(r.startRef)!;
+      const e = refToIndex.get(r.endRef)!;
+      return s <= mediaIndex && mediaIndex <= e;
+    }),
+    "archivable media no longer splits the compressible range",
+  );
+});
+
+test("buildCompressibleRanges spans ref-based media since #5620", () => {
+  const messages = [
+    textMsg("a", "user", "alpha ".repeat(50).trim()),
+    mediaUserMsg("img", "see attached", {
+      rawOpenaiContent: {
+        type: "image_url",
+        image_url: { url: "https://example.com/x.png" },
+      },
+    }),
+    textMsg("b", "assistant", "beta ".repeat(50).trim()),
+  ];
+  const state = createInitialState();
+  state.messageRefs = assignRefs(messages, {
+    existing: state.messageRefs,
+    nextIndex: 1,
+  }).map;
+  const ranges = buildCompressibleRanges(messages, state, config());
+
+  const refToIndex = new Map(
+    messages.map((m, i) => [state.messageRefs.byRaw[m.id], i]),
+  );
+  const mediaIndex = messages.findIndex((m) => m.id === "img");
+  assert.ok(
+    ranges.compressible.some((r) => {
+      const s = refToIndex.get(r.startRef)!;
+      const e = refToIndex.get(r.endRef)!;
+      return s <= mediaIndex && mediaIndex <= e;
+    }),
+    "ref-based media no longer splits the compressible range (#5620)",
+  );
+});
+
+test("buildCompressibleRanges still never spans a refless media message", () => {
+  const messages = [
+    textMsg("a", "user", "alpha ".repeat(50).trim()),
+    mediaUserMsg("img", "see attached", {
+      rawOpenaiContentParts: [{ type: "mystery", blob: "zzz" }],
+    }),
     textMsg("b", "assistant", "beta ".repeat(50).trim()),
   ];
   const state = createInitialState();
@@ -306,7 +696,7 @@ test("buildCompressibleRanges never spans a media message", () => {
     const e = refToIndex.get(r.endRef)!;
     assert.ok(
       !(s <= mediaIndex && mediaIndex <= e),
-      `range ${r.startRef}..${r.endRef} must not span the media message`,
+      `range ${r.startRef}..${r.endRef} must not span the refless media message`,
     );
   }
   for (const r of ranges.protected) {
@@ -314,7 +704,7 @@ test("buildCompressibleRanges never spans a media message", () => {
     const e = refToIndex.get(r.endRef)!;
     assert.ok(
       !(s <= mediaIndex && mediaIndex <= e),
-      "media message must not be advertised as protected either",
+      "refless media must not be advertised as protected either",
     );
   }
   assert.ok(
@@ -323,7 +713,7 @@ test("buildCompressibleRanges never spans a media message", () => {
   );
 });
 
-test("applyCompression excludes media messages from the block and warns", () => {
+test("applyCompression folds archivable media into the block (#2607)", () => {
   const core = createCore();
   const state = createInitialState();
   const messages = [
@@ -359,17 +749,118 @@ test("applyCompression excludes media messages from the block and warns", () => 
   );
   assert.equal(result.state.blocks.length, 1);
   const block = result.state.blocks[0]!;
+  assert.deepEqual(block.directMessageIds.sort(), ["img", "t1", "t2", "u"]);
+  assert.ok(
+    !result.result.warnings.some((w) => w.includes("unrecoverable")),
+    `no unrecoverable warning expected, got: ${JSON.stringify(result.result.warnings)}`,
+  );
+});
+
+test("applyCompression folds ref-based media and records its handle in the summary (#5620)", () => {
+  const core = createCore();
+  const state = createInitialState();
+  const messages = [
+    textMsg("u", "user", "the task"),
+    textMsg("t1", "assistant", "thinking out loud"),
+    mediaUserMsg("img", "see the screenshot", {
+      rawOpenaiContent: {
+        type: "image_url",
+        image_url: { url: "https://example.com/x.png" },
+      },
+    }),
+    textMsg("t2", "assistant", "analyzing"),
+    textMsg("u2", "user", "and now?"),
+  ];
+  state.messageRefs = assignRefs(messages, {
+    existing: state.messageRefs,
+    nextIndex: 1,
+  }).map;
+
+  const result = core.applyCompression({
+    ranges: [
+      {
+        startRef: "m00001",
+        endRef: "m00004",
+        summary: "task + analysis summarized",
+        topic: "work",
+      },
+    ],
+    messages,
+    state,
+    config: config(),
+  });
+
+  assert.equal(
+    result.result.errors.length,
+    0,
+    JSON.stringify(result.result.errors),
+  );
+  assert.equal(result.state.blocks.length, 1);
+  const block = result.state.blocks[0]!;
+  assert.deepEqual(block.directMessageIds.sort(), ["img", "t1", "t2", "u"]);
+  assert.ok(
+    block.summary.includes(MEDIA_REFS_MARKER),
+    `handle section appended, got: ${JSON.stringify(block.summary)}`,
+  );
+  assert.ok(
+    block.summary.includes("- https://example.com/x.png"),
+    `handle listed verbatim, got: ${JSON.stringify(block.summary)}`,
+  );
+  assert.ok(
+    !result.result.warnings.some((w) => w.includes("unrecoverable")),
+    `no unrecoverable warning expected, got: ${JSON.stringify(result.result.warnings)}`,
+  );
+});
+
+test("applyCompression excludes refless media from the block and warns", () => {
+  const core = createCore();
+  const state = createInitialState();
+  const messages = [
+    textMsg("u", "user", "the task"),
+    textMsg("t1", "assistant", "thinking out loud"),
+    mediaUserMsg("img", "see the screenshot", {
+      rawOpenaiContentParts: [{ type: "mystery", blob: "zzz" }],
+    }),
+    textMsg("t2", "assistant", "analyzing"),
+    textMsg("u2", "user", "and now?"),
+  ];
+  state.messageRefs = assignRefs(messages, {
+    existing: state.messageRefs,
+    nextIndex: 1,
+  }).map;
+
+  const result = core.applyCompression({
+    ranges: [
+      {
+        startRef: "m00001",
+        endRef: "m00004",
+        summary: "task + analysis summarized",
+        topic: "work",
+      },
+    ],
+    messages,
+    state,
+    config: config(),
+  });
+
+  assert.equal(
+    result.result.errors.length,
+    0,
+    JSON.stringify(result.result.errors),
+  );
+  assert.equal(result.state.blocks.length, 1);
+  const block = result.state.blocks[0]!;
   assert.ok(
     !block.directMessageIds.includes("img"),
-    "media message not folded",
+    "unrecoverable media not folded",
   );
   assert.ok(
     !block.effectiveMessageIds.includes("img"),
-    "media message not recorded as covered",
+    "unrecoverable media not recorded as covered",
   );
   assert.deepEqual(block.directMessageIds.sort(), ["t1", "t2", "u"]);
   assert.ok(
-    result.result.warnings.some((w) => w.includes("image/attachment")),
+    result.result.warnings.some((w) => w.includes("unrecoverable media")),
     `warning present, got: ${JSON.stringify(result.result.warnings)}`,
   );
 });
@@ -380,8 +871,20 @@ const TR_IMG = {
   type: "image",
   source: { type: "base64", media_type: "image/png", data: IMG_DATA },
 };
+const TR_IMG_URL = {
+  type: "image",
+  source: { type: "url", url: "https://example.com/x.png" },
+};
+const TR_DOC = {
+  type: "document",
+  source: { type: "url", url: "https://example.com/d.pdf" },
+};
 
-function mediaToolResult(id: string, text: string): CoreMessage {
+function mediaToolResult(
+  id: string,
+  text: string,
+  img: object = TR_IMG,
+): CoreMessage {
   return Object.assign(
     {
       id,
@@ -395,21 +898,36 @@ function mediaToolResult(id: string, text: string): CoreMessage {
       rawAnthropicBlock: {
         type: "tool_result",
         tool_use_id: "t1",
-        content: [{ type: "text", text: "done" }, TR_IMG],
+        content: [{ type: "text", text: "done" }, img],
       },
     },
   );
 }
 
-test("hasMediaPayload detects image blocks inside a tool_result sidecar", () => {
+test("media predicates split tool_result images by recoverability", () => {
   assert.equal(
     hasMediaPayload(mediaToolResult("r", "done\n")),
     true,
     "image block in content array counts as media payload",
   );
+  assert.equal(
+    hasUnrecoverableMediaPayload(mediaToolResult("r", "done\n")),
+    false,
+    "base64 image is archivable",
+  );
+  assert.equal(
+    hasUnrecoverableMediaPayload(mediaToolResult("ru", "done\n", TR_IMG_URL)),
+    false,
+    "remote URL image in tool_result is ref-recoverable (#5620)",
+  );
+  assert.equal(
+    hasUnrecoverableMediaPayload(mediaToolResult("rd", "done\n", TR_DOC)),
+    true,
+    "document block in tool_result still pins (no established ref semantics)",
+  );
 });
 
-test("buildCompressibleRanges never spans a media tool_result and never strands its call", () => {
+test("buildCompressibleRanges spans an archivable media tool_result with its call (#2607)", () => {
   const messages = [
     textMsg("u", "user", "alpha ".repeat(50).trim()),
     {
@@ -435,12 +953,100 @@ test("buildCompressibleRanges never spans a media tool_result and never strands 
   );
   const resIdx = messages.findIndex((m) => m.id === "res");
   const callIdx = messages.findIndex((m) => m.id === "call");
+  assert.ok(
+    ranges.compressible.some((r) => {
+      const s = refToIndex.get(r.startRef)!;
+      const e = refToIndex.get(r.endRef)!;
+      return s <= resIdx && resIdx <= e;
+    }),
+    "archivable media tool_result no longer splits the range",
+  );
+  assert.ok(
+    ranges.compressible.some((r) => {
+      const s = refToIndex.get(r.startRef)!;
+      const e = refToIndex.get(r.endRef)!;
+      return s <= callIdx && callIdx <= e;
+    }),
+    "its paired call stays foldable too",
+  );
+});
+
+test("buildCompressibleRanges spans a ref-based media tool_result with its call since #5620", () => {
+  const messages = [
+    textMsg("u", "user", "alpha ".repeat(50).trim()),
+    {
+      id: "call",
+      role: "assistant" as const,
+      contentType: "tool-call" as const,
+      toolName: "screenshot",
+      toolCallId: "t1",
+      text: "{}",
+    },
+    mediaToolResult("res", "done\n", TR_IMG_URL),
+    textMsg("b", "assistant", "beta ".repeat(50).trim()),
+  ];
+  const state = createInitialState();
+  state.messageRefs = assignRefs(messages, {
+    existing: state.messageRefs,
+    nextIndex: 1,
+  }).map;
+  const ranges = buildCompressibleRanges(messages, state, config());
+
+  const refToIndex = new Map(
+    messages.map((m, i) => [state.messageRefs.byRaw[m.id], i]),
+  );
+  const resIdx = messages.findIndex((m) => m.id === "res");
+  const callIdx = messages.findIndex((m) => m.id === "call");
+  assert.ok(
+    ranges.compressible.some((r) => {
+      const s = refToIndex.get(r.startRef)!;
+      const e = refToIndex.get(r.endRef)!;
+      return s <= resIdx && resIdx <= e;
+    }),
+    "ref-based media tool_result no longer splits the range (#5620)",
+  );
+  assert.ok(
+    ranges.compressible.some((r) => {
+      const s = refToIndex.get(r.startRef)!;
+      const e = refToIndex.get(r.endRef)!;
+      return s <= callIdx && callIdx <= e;
+    }),
+    "its paired call stays foldable too",
+  );
+});
+
+test("buildCompressibleRanges still never spans a refless media tool_result and never strands its call", () => {
+  const messages = [
+    textMsg("u", "user", "alpha ".repeat(50).trim()),
+    {
+      id: "call",
+      role: "assistant" as const,
+      contentType: "tool-call" as const,
+      toolName: "screenshot",
+      toolCallId: "t1",
+      text: "{}",
+    },
+    mediaToolResult("res", "done\n", TR_DOC),
+    textMsg("b", "assistant", "beta ".repeat(50).trim()),
+  ];
+  const state = createInitialState();
+  state.messageRefs = assignRefs(messages, {
+    existing: state.messageRefs,
+    nextIndex: 1,
+  }).map;
+  const ranges = buildCompressibleRanges(messages, state, config());
+
+  const refToIndex = new Map(
+    messages.map((m, i) => [state.messageRefs.byRaw[m.id], i]),
+  );
+  const resIdx = messages.findIndex((m) => m.id === "res");
+  const callIdx = messages.findIndex((m) => m.id === "call");
   for (const r of ranges.compressible) {
     const s = refToIndex.get(r.startRef)!;
     const e = refToIndex.get(r.endRef)!;
     assert.ok(
       !(s <= resIdx && resIdx <= e),
-      `range ${r.startRef}..${r.endRef} must not span the media tool_result`,
+      `range ${r.startRef}..${r.endRef} must not span the refless media tool_result`,
     );
     assert.ok(
       !(s <= callIdx && callIdx <= e),
@@ -453,7 +1059,7 @@ test("buildCompressibleRanges never spans a media tool_result and never strands 
   );
 });
 
-test("applyCompression keeps a media tool_result and its paired call visible together", () => {
+test("applyCompression folds an archivable media tool_result with its paired call (#2607)", () => {
   const core = createCore();
   const state = createInitialState();
   const messages = [
@@ -495,21 +1101,104 @@ test("applyCompression keeps a media tool_result and its paired call visible tog
   );
   assert.equal(result.state.blocks.length, 1);
   const block = result.state.blocks[0]!;
+  assert.deepEqual(block.directMessageIds.sort(), ["call", "res", "u", "u2"]);
+  assert.ok(
+    !result.result.warnings.some((w) => w.includes("unrecoverable")),
+    `no unrecoverable warning expected, got: ${JSON.stringify(result.result.warnings)}`,
+  );
+  assert.ok(
+    !result.result.warnings.some((w) => w.includes("tool call/result pair")),
+    `no pair-withdrawal expected, got: ${JSON.stringify(result.result.warnings)}`,
+  );
+});
+
+test("applyCompression keeps an unrecoverable media tool_result and its paired call visible together", () => {
+  const core = createCore();
+  const state = createInitialState();
+  const messages = [
+    textMsg("u", "user", "the task"),
+    {
+      id: "call",
+      role: "assistant" as const,
+      contentType: "tool-call" as const,
+      toolName: "screenshot",
+      toolCallId: "t1",
+      text: "{}",
+    },
+    mediaToolResult("res", "done\n", TR_DOC),
+    textMsg("u2", "user", "and now?"),
+  ];
+  state.messageRefs = assignRefs(messages, {
+    existing: state.messageRefs,
+    nextIndex: 1,
+  }).map;
+
+  const result = core.applyCompression({
+    ranges: [
+      {
+        startRef: "m00001",
+        endRef: "m00004",
+        summary: "task summarized",
+        topic: "work",
+      },
+    ],
+    messages,
+    state,
+    config: config(),
+  });
+
+  assert.equal(
+    result.result.errors.length,
+    0,
+    JSON.stringify(result.result.errors),
+  );
+  assert.equal(result.state.blocks.length, 1);
+  const block = result.state.blocks[0]!;
   assert.deepEqual(block.directMessageIds.sort(), ["u", "u2"]);
   assert.ok(
     !block.effectiveMessageIds.includes("res"),
-    "media tool_result not folded",
+    "unrecoverable media tool_result not folded",
   );
   assert.ok(
     !block.effectiveMessageIds.includes("call"),
     "paired call withdrawn with its result (pair atomicity)",
   );
   assert.ok(
-    result.result.warnings.some((w) => w.includes("image/attachment")),
+    result.result.warnings.some((w) => w.includes("unrecoverable media")),
     `media warning present, got: ${JSON.stringify(result.result.warnings)}`,
   );
   assert.ok(
     result.result.warnings.some((w) => w.includes("tool call/result pair")),
     `pair-withdrawal warning present, got: ${JSON.stringify(result.result.warnings)}`,
+  );
+});
+
+test("openai: non-array single-object content never throws (legacy empty-text core)", () => {
+  // #2824 corpus regression: some clients emit a lone content-part object
+  // instead of an array. Pre-#3642 this mapped to stringContent() === ""
+  // with no sidecars; the #3642 per-part rewrite iterated `m.content` and
+  // threw TypeError "m.content is not iterable" — a wire-tolerance break
+  // (buildIncomingImageIndex catches, but every other consumer would not).
+  // Contract: non-array non-string content degrades to the legacy empty-text
+  // core, byte-compatible with the old codec, and coreToOpenai still renders
+  // a round-trippable body.
+  const body = bodyOf([
+    {
+      role: "user",
+      content: {
+        type: "image_url",
+        image_url: { url: DATA_URL },
+      },
+    },
+  ]);
+  const { msgs } = openaiToCore(body);
+  assert.equal(msgs.length, 1, "one core, not a throw");
+  assert.equal(msgs[0]?.contentType, "text");
+  assert.equal(msgs[0]?.text, "", "legacy mapping: stringContent(object) === ''");
+  assert.equal(msgs[0]?.imageBase64, undefined, "no image sidecar from non-array content");
+  const back = coreToOpenai(msgs as Parameters<typeof coreToOpenai>[0]);
+  assert.ok(
+    Array.isArray(back) && back.length >= 1,
+    "round-trip renders",
   );
 });

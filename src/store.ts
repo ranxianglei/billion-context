@@ -58,6 +58,27 @@ export function ccrEnabled(session: Session | undefined): boolean {
     return effectiveCcr(session)?.enabled === true;
 }
 
+// #3400: per-request stamp of the acp_read_original_image TOOL registration gate.
+// The rescale PASS itself runs on every lane (governed by the BILI_IMAGE_RESCALE
+// knob); only the manifest registration and the annotation's invocation entry
+// follow this stamp — codex/plugin lanes get size-only notes.
+const EFFECTIVE_IMAGE_RESCALE_KEY = "effectiveImageRescale";
+
+/** Stamp whether acp_read_original_image may be registered for this session's
+ *  lane (per-request; mirrors the storeEffectiveCcr site). */
+export function storeEffectiveImageRescale(session: Session, armed: boolean | undefined): void {
+    // Absent == not armed (imageRescaleToolArmed reads === true). Writing only the
+    // armed state keeps non-armed lanes' metadata byte-identical to pre-#3400
+    // (storage-render digests pin that shape).
+    if (armed === true) session.metadata[EFFECTIVE_IMAGE_RESCALE_KEY] = true;
+    else delete session.metadata[EFFECTIVE_IMAGE_RESCALE_KEY];
+}
+
+/** Read back the #3400 tool-registration stamp. */
+export function imageRescaleToolArmed(session: Session | undefined): boolean {
+    return session?.metadata[EFFECTIVE_IMAGE_RESCALE_KEY] === true;
+}
+
 /** Model-facing retrieve tool name for this session: the config `ccr.toolName`
  *  override when set, else the kernel default. */
 export function retrieveToolName(session: Session | undefined): string {
@@ -92,10 +113,18 @@ export function ccrPluginWireOk(protocol: string): boolean {
 
 /** Lazily materialize the session's kernel content-store envelope: loaded
  *  from the session's content-store.json on first touch, fresh when the file
- *  is absent (or corrupt — degraded to retrieve misses, never a crash). */
+ *  is absent; corrupt originals are refused under bounded startup (#2803)
+ *  and degrade to a warned fresh store for legacy direct callers. */
 export function contentStoreOf(session: Session): MessageContentStore {
     if (!session.contentStore) {
-        session.contentStore = getStore().loadContentStore(session) ?? createContentStore();
+        // #2960 ③: unified-first. In full mode the index row's ccr mirror is
+        // at least as fresh as the sidecar (the sidecar saves payload-first
+        // in the same persist cycle that ingests the row), and it survives a
+        // lost/deleted sidecar. Legacy/shadow modes and rollback keep the
+        // file path unchanged.
+        session.contentStore = getStore().unifiedCcrFor(session.id)
+            ?? getStore().loadContentStore(session)
+            ?? createContentStore();
     }
     return session.contentStore;
 }
@@ -105,9 +134,24 @@ export function contentStoreOf(session: Session): MessageContentStore {
  *  only when new entries appeared, so a no-growth turn costs nothing. */
 export function adoptContentStore(session: Session, store: MessageContentStore): void {
     const prev = session.contentStore;
-    const added = prev
-        ? Object.entries(store.byRef).filter(([ref]) => !(ref in prev.byRef))
-        : Object.entries(store.byRef);
+    // #4788 phase-2 dropped prev can be a lazy re-materialize proxy whose disk
+    // proof vanished after the drop (envelope lost/corrupted). Touching it
+    // throws by design (#2674 payload-first discipline) — but nothing READABLE
+    // lived in that proxy (its loader already failed), so an unrecoverable
+    // prev degrades to "no prior refs" instead of aborting the turn: the
+    // incoming store stays authoritative and the session survives to its next
+    // save instead of hard-erroring on every subsequent touch.
+    let prevRefs: Set<string> | null = null;
+    if (prev) {
+        try {
+            prevRefs = new Set(Object.keys(prev.byRef));
+        } catch (err) {
+            loggerLog("warn", `[ccr] lazy content store for ${session.id} could not be re-materialized during adopt (${String(err instanceof Error ? err.message : err)}) — proceeding with the incoming store as the full set`);
+        }
+    }
+    const added = !prev || prevRefs === null
+        ? Object.entries(store.byRef)
+        : Object.entries(store.byRef).filter(([ref]) => !prevRefs!.has(ref));
     session.contentStore = store;
     if (added.length === 0) return;
     let saved = 0;

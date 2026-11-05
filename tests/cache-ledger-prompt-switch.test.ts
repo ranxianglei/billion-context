@@ -4,6 +4,7 @@ import {
     buildSessionCacheReport,
     handleAcpCache,
     noteForwardedBody,
+    readPromptSwitchStats,
     settleUsageReport,
 } from "../src/cache-ledger.ts";
 import type { Session } from "../src/session.ts";
@@ -17,6 +18,7 @@ import type { Session } from "../src/session.ts";
 const T0 = Date.parse("2026-10-07T02:40:00Z");
 const FP_A = "aaaaaa1111bbbbbb";
 const FP_B = "cccccc2222dddddd";
+const FP_C = "eeeeee3333ffffff";
 
 let seq = 0;
 function makeSession(): Session {
@@ -127,7 +129,7 @@ test("lanes without a noted system never fabricate rewrite events (#2350 sparsen
     assert.deepEqual(r.promptSwitches.events, []);
 });
 
-test("a model change outranks a co-occurring prompt rewrite; counters stay independent (#2350 priority)", () => {
+test("a model change outranks a co-occurring prompt rewrite; the shadowed counter stays silent (#2350 #2784)", () => {
     const session = makeSession();
     session.metadata.lastModel = "gpt-6.1-sol";
     turn(session, "b1", FP_A, T0 + 1000, 10_000, 9_000);
@@ -135,10 +137,12 @@ test("a model change outranks a co-occurring prompt rewrite; counters stay indep
     session.metadata.lastModel = "glm-5.3";
     turn(session, "b3", FP_B, T0 + 3000, 11_000, 0);
     const r = buildSessionCacheReport(session);
-    // Both dimensions OBSERVED the change (independent event counters)…
+    // ONE narrative cause per line: the model switch narrates it; the fingerprint flip that rode
+    // along on the same request no longer books its own zero-token event (#2784).
     assert.equal(r.modelSwitches.count, 1);
-    assert.equal(r.promptSwitches.count, 1);
-    // …but the partition charges the residual to the model only.
+    assert.equal(r.promptSwitches.count, 0);
+    assert.deepEqual(r.promptSwitches.events, []);
+    // The partition still charges the residual to the model only.
     assert.equal(r.modelSwitches.missedTokens, 10_500);
     assert.equal(r.promptSwitches.missedTokens, 0);
     assert.equal(r.invalidation.model, 10_500);
@@ -146,20 +150,51 @@ test("a model change outranks a co-occurring prompt rewrite; counters stay indep
     assert.equal(r.totals.residual, 0);
 });
 
-test("a prompt rewrite outranks a co-occurring wire switch (#2350 priority)", () => {
+test("a prompt rewrite outranks a co-occurring wire switch; the shadowed counter stays silent (#2350 #2784)", () => {
     const session = makeSession();
     session.metadata.lastModel = "gpt-6.1-sol";
     turn(session, "b1", FP_A, T0 + 1000, 10_000, 9_000, "openai");
     turn(session, "b2", FP_A, T0 + 2000, 10_500, 10_000, "openai");
     turn(session, "b3", FP_B, T0 + 3000, 11_000, 0, "anthropic");
     const r = buildSessionCacheReport(session);
+    assert.equal(causeOf(session, 3), "prompt");
     assert.equal(r.promptSwitches.count, 1);
-    assert.equal(r.wireSwitches.count, 1);
+    assert.equal(r.wireSwitches.count, 0);
     assert.equal(r.promptSwitches.missedTokens, 10_500);
     assert.equal(r.wireSwitches.missedTokens, 0);
     assert.equal(r.invalidation.prompt, 10_500);
     assert.equal(r.invalidation.wire, 0);
     assert.equal(r.totals.residual, 0);
+});
+
+test("a dsh-style model switch narrates ONE cause; a later genuine rewrite still fires (#2784)", () => {
+    const session = makeSession();
+    session.metadata.lastModel = "deepseek-v4";
+    turn(session, "b1", FP_A, T0 + 1000, 10_000, 9_000);
+    turn(session, "b2", FP_A, T0 + 2000, 10_500, 10_000);
+    // dsh re-renders the active model into its system prompt on every switch: the
+    // fingerprint flips on the SAME request as the model change.
+    session.metadata.lastModel = "deepseek-v4-pro";
+    turn(session, "b3", FP_B, T0 + 3000, 11_000, 0);
+    const r = buildSessionCacheReport(session);
+    assert.equal(causeOf(session, 3), "model");
+    assert.equal(r.modelSwitches.count, 1);
+    assert.equal(r.modelSwitches.missedTokens, 10_500);
+    // No shadowed zero-token event → the web chip gate (count>0 || tokens>0) renders nothing.
+    assert.equal(readPromptSwitchStats(session)?.count, 0);
+    assert.equal(readPromptSwitchStats(session)?.missedTokens, 0);
+    // The raw observation survives on the line itself…
+    const led = (session.metadata as Record<string, { lines: Array<{ sf?: number }> }> & object)["cacheLedger"]!;
+    assert.equal(led.lines[2]!.sf, 1);
+    // …and the baseline advanced with it: a LATER genuine host rewrite still fires.
+    turn(session, "b4", FP_C, T0 + 4000, 11_500, 0);
+    const r2 = buildSessionCacheReport(session);
+    assert.equal(causeOf(session, 4), "prompt");
+    assert.equal(r2.promptSwitches.count, 1);
+    assert.equal(r2.modelSwitches.count, 1);
+    const ev = r2.promptSwitches.events[0]!;
+    assert.equal(ev.from, FP_B);
+    assert.equal(ev.to, FP_C);
 });
 
 test("handleAcpCache surfaces a PROMPT SWITCHES section with fingerprints only (#2350)", () => {

@@ -5,13 +5,13 @@ import type { Config, CoreMessage } from "acp-kernel";
 import { createCore, createInitialState } from "acp-kernel";
 import type { Session } from "../src/session.ts";
 import { runCompressLoop, createOpenaiAdapter, createAnthropicAdapter, createResponsesAdapter } from "../src/loop/index.ts";
-import { stripAcpTags, createTagEchoFilter, containsRenderTagText, containsToolCallXmlFragment, mayStartRenderTag } from "../src/loop/tag-echo-filter.ts";
+import { stripAcpTags, createTagEchoFilter, containsRenderTagText, containsToolCallXmlFragment, mayStartRenderTag, isOrphanMarkupText } from "../src/loop/tag-echo-filter.ts";
 import { rewriteJsonResponse } from "../src/stream.ts";
 import { rewriteOpenaiJsonResponse } from "../src/stream-openai.ts";
 import { rewriteResponsesJsonResponse } from "../src/stream-responses.ts";
 import { buildCompressSystemPrompt } from "../src/compress-tool.ts";
 import { setLogCapture } from "../src/logger.ts";
-import { degenerateTurnWarning } from "../src/degenerate-turn.ts";
+import { degenerateTurnWarning, isMaxOutputReason } from "../src/degenerate-turn.ts";
 
 const TAG = (ref: string, tokens = 177) => `\x3cacp tokens="${tokens}" type="text">${ref}\x3c/acp>`;
 const LT = "\x3c";
@@ -116,9 +116,11 @@ test("stripAcpTags: malformed close (missing >) does not eat following content (
     const content = "这是真实的正文内容，不应被过滤器吃掉。".repeat(12);
     const malformed = `${LT}acp tokens="245" type="text">m01998${LT}/acp` + content;
     const out = stripAcpTags(malformed);
-    assert.ok(out.includes(content), "real content survives the malformed close (not eaten)");
-    assert.ok(out.includes("m01998"), "the ref is preserved");
-    assert.notEqual(out, "m01998", "not stripped to the bare ref");
+    // #2862 behavior change (was: ref+close survived as visible residue):
+    // the attested echo makes the ref glued to the unterminated close head a
+    // dead unit - it dies whole. The original #644 guarantee (real content
+    // is never eaten) is unchanged.
+    assert.equal(out, content, "dead unit dies whole; real content survives byte-exact");
 });
 
 test("streaming filter matches stripAcpTags for a malformed close at every split position (#644)", () => {
@@ -147,9 +149,8 @@ test("stripAcpTags: malformed close with trailing space does not eat following c
     const content = "这是真实的正文内容，不应被过滤器吃掉。".repeat(12);
     const malformed = `${LT}acp tokens="245" type="text">m01998${LT}/acp ` + content;
     const out = stripAcpTags(malformed);
-    assert.ok(out.includes(content), "real content survives the malformed close (not eaten)");
-    assert.ok(out.includes("m01998"), "the ref is preserved");
-    assert.notEqual(out, "m01998", "not stripped to the bare ref");
+    // Same #2862 evolution as the no-whitespace variant above.
+    assert.equal(out, " " + content, "dead unit dies whole; real content survives byte-exact");
 });
 
 test("streaming filter matches stripAcpTags for the incident-shape malformed close at every split position (#644)", () => {
@@ -203,6 +204,35 @@ test("streaming filter matches stripAcpTags for every split position", () => {
             assert.equal(out, expected, `seed=${seed} full=${JSON.stringify(full)}`);
         }
     }
+});
+
+// #4179: prose GLUED to a multi-ref run + orphan close. When the chunk boundary
+// falls between prose and run, the leftmost ORPHAN_REF_CLOSE match sits at the
+// buffer head and its head is voided by the cross-chunk lookbehind (#644); the
+// fix must re-scan for the valid MID-RUN start (a ref preceded by a joiner)
+// instead of abandoning the drop, or the deletion depends on the chunking.
+test("streaming filter matches stripAcpTags for a word-glued multi-ref orphan run at every split position (#4179)", () => {
+    const cases = [
+        `textm00123\u2013m00124${CLOSE} tail.`,
+        `textm00123,m00124${CLOSE} tail.`,
+        `textm00123-m00124${CLOSE} tail.`,
+        `textm00123\u2013m00124,m00125${CLOSE} tail.`,
+        `text m00123\u2013m00124${CLOSE} tail.`,
+        `textm00124${CLOSE} tail.`,
+    ];
+    for (const full of cases) {
+        const expected = stripAcpTags(full);
+        for (let split = 0; split <= full.length; split++) {
+            const f = createTagEchoFilter();
+            const out = f.push(full.slice(0, split)) + f.push(full.slice(split)) + f.flush();
+            assert.equal(out, expected, `split=${split} full=${JSON.stringify(full)}`);
+        }
+    }
+    // Pin the drop semantics explicitly (parity alone would track any future
+    // whole-text drift): word-glued head ref survives; joiner + last ref + close
+    // die as one unit; a single word-glued ref is NOT an orphan (lone close only).
+    assert.equal(stripAcpTags(`textm00123\u2013m00124${CLOSE} tail.`), `textm00123\u2013 tail.`);
+    assert.equal(stripAcpTags(`textm00124${CLOSE} tail.`), `textm00124 tail.`);
 });
 
 test("streaming filter: unterminated open tag at flush is dropped", () => {
@@ -502,6 +532,38 @@ test("streaming filter still drops a ref echo whose open tag arrives alone in a 
     visible += f.flush();
     assert.equal(visible, "");
     assert.ok(f.dropped());
+});
+
+// #4169: a nested bare open inside an attrs payload must take the same verdict
+// in streaming as in whole-text (LONE_OPEN pass) — the close-resolution release
+// used to hand the body to the client verbatim, leaking the nested tag while
+// whole-text stripped it.
+test("streaming strips a nested bare open inside an attrs payload like whole-text, at every split (#4169)", () => {
+    const full = `A ${OPEN}tokens="1" type="text">junk${LT}acp>text${CLOSE}B.`;
+    const expected = stripAcpTags(full);
+    assert.equal(expected, "A junktextB.", "whole-text reference strips the nested bare open");
+    for (let split = 0; split <= full.length; split++) {
+        const f = createTagEchoFilter();
+        const out = f.push(full.slice(0, split)) + f.push(full.slice(split)) + f.flush();
+        assert.equal(out, expected, `split=${split}`);
+    }
+});
+
+test("streaming matches whole-text for nested structures inside attrs payloads (#4169)", () => {
+    const shapes = [
+        `A ${OPEN}tokens="1" type="text">x${LT}acp>y${CLOSE}z${CLOSE}B.`,
+        `A ${OPEN}tokens="1" type="text">x${LT}acp tokens="2">y${CLOSE}z${CLOSE}B.`,
+        `A ${OPEN}tokens="1" type="text">${LT}acp>m00001${CLOSE}${CLOSE}B.`,
+        `A ${OPEN}tokens="1" type="text">x${LT}acp tokens="2 y${CLOSE}z`,
+    ];
+    for (const full of shapes) {
+        const expected = stripAcpTags(full);
+        for (let split = 0; split <= full.length; split++) {
+            const f = createTagEchoFilter();
+            const out = f.push(full.slice(0, split)) + f.push(full.slice(split)) + f.flush();
+            assert.equal(out, expected, `split=${split} full=${JSON.stringify(full)}`);
+        }
+    }
 });
 
 // #1731 replaced the old open-side attr caps ({0,256}/{0,512}): a longer run
@@ -841,6 +903,30 @@ test("degenerateTurnWarning fires only on terminal zero-text zero-tool turns (#6
     assert.match(degenerateTurnWarning({ ...base, sawThinking: false, text: { inputChars: 0, outputChars: 0, dropped: false, dropCount: 0 } }) ?? "", /no visible text emitted/);
 });
 
+test("degenerateTurnWarning also fires on max-output truncations that left nothing visible (#2904)", () => {
+    const empty = { inputChars: 0, outputChars: 0, dropped: false, dropCount: 0 };
+    // Every wire's native max-output word must be recognized as a limit reason.
+    for (const [reason, terminalReason, wire] of [
+        ["length", "stop", "openai"],
+        ["max_tokens", "end_turn", "anthropic"],
+        ["MAX_TOKENS", "STOP", "google"],
+        ["incomplete", "completed", "responses"],
+        ["max_output_tokens", "completed", "responses"],
+    ] as Array<[string, string, string]>) {
+        const msg = degenerateTurnWarning({ reason, terminalReason, toolCalls: 0, text: empty, sawThinking: true, wire });
+        assert.match(msg ?? "", new RegExp(`\\[degenerate-turn\\] ${wire}: turn ended ${reason} \\(max-output\\)`), `${reason} flagged as max-output`);
+        assert.match(msg ?? "", /pathologically small/, "points at the too-small outgoing budget");
+    }
+    // A truncated turn that DID emit prose or a tool call is not degenerate here.
+    assert.equal(degenerateTurnWarning({ reason: "length", terminalReason: "stop", toolCalls: 0, text: { inputChars: 5, outputChars: 3, dropped: false, dropCount: 0 }, sawThinking: true, wire: "openai" }), null);
+    assert.equal(degenerateTurnWarning({ reason: "length", terminalReason: "stop", toolCalls: 1, text: empty, sawThinking: true, wire: "openai" }), null);
+    // Non-limit non-terminal reasons stay silent (no over-match).
+    assert.equal(degenerateTurnWarning({ reason: "content_filter", terminalReason: "stop", toolCalls: 0, text: empty, sawThinking: true, wire: "openai" }), null);
+    assert.equal(isMaxOutputReason("stop_sequence"), false);
+    assert.equal(isMaxOutputReason("length"), true);
+    assert.equal(isMaxOutputReason(undefined), false);
+});
+
 test("anthropic adapter warns on degenerate typo-tag-only turn (#673)", async () => {
     const logs: string[] = [];
     setLogCapture((_level, msg) => { logs.push(msg); });
@@ -1084,4 +1170,24 @@ test("#2348 v4: ordinary tag-laden turns are byte-stable through both modes", ()
             assert.equal(out, expected, `n=${n} chunk=${chunk}: streaming must be byte-exact`);
         }
     }
+});
+
+// #2769 item 3 (filter-semantics pin): the chat-pipe fold sites account the
+// push output (`released`) and the flush output (the folded `tail`) as two
+// separate contributions. This pins the premise that makes their interplay
+// non-trivial: ONE push can return a NON-EMPTY released prefix while leaving
+// pending state whose flush() returns NON-ORPHAN prose — with onDrop firing in
+// between. A bare opening (#1881) does exactly this: pre-open text releases
+// immediately, the opening is dropped, and the post-open remainder stays held
+// until EOF, where it resolves as content ("prose wearing a tag", #1720/#2023).
+test("#2769: flush() can return non-orphan prose after a non-empty release with a drop", () => {
+    let drops = 0;
+    const f = createTagEchoFilter(() => drops++);
+    const released = f.push(`pre${LT}acp\x3e    `);
+    assert.equal(released, "pre", "pre-open text releases before the swallow starts");
+    assert.equal(drops, 1, "the bare opening is dropped and onDrop fires");
+    assert.ok(f.pending(), "the post-open remainder is still held");
+    const tail = f.flush();
+    assert.equal(tail, "    ", "the held remainder resolves as content at EOF");
+    assert.equal(isOrphanMarkupText(tail), false, "that content is NOT orphan markup — the pipe must count it as prose");
 });

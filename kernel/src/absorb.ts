@@ -2,8 +2,10 @@ import { rawForRef, refForRaw, BLOCKED_REF } from "./refs.js";
 import { ACP_TOOL_NAMES, ABSORB_TOOL_NAME } from "./compress-tools.js";
 import { isStoredPlaceholderText } from "./ccr.js";
 import {
+  collectFailedCompressCallIds,
   collectLatestProtected,
   collectProtectedToolCallIds,
+  hasMediaPayload,
   isMessageLatestProtected,
   isMessageProtectedWithPairing,
   matchToolPattern,
@@ -91,6 +93,7 @@ export function isAbsorbCandidate(
   config: Config,
   latest?: LatestProtected,
   protectedCallIds?: Set<string>,
+  failedCompressCallIds?: Set<string>,
 ): boolean {
   if (msg.contentType !== "tool-result" || !msg.toolCallId) return false;
   if (isStoredPlaceholderText(msg.text ?? "")) return false;
@@ -101,6 +104,7 @@ export function isAbsorbCandidate(
       msg,
       config,
       protectedCallIds ?? NO_PROTECTED_CALLS,
+      failedCompressCallIds,
     )
   )
     return false;
@@ -108,6 +112,7 @@ export function isAbsorbCandidate(
   for (const pattern of cfg.excludeTools) {
     if (msg.toolName && matchToolPattern(msg.toolName, pattern)) return false;
   }
+  if (cfg.mediaOnly && !hasMediaPayload(msg)) return false;
   return true;
 }
 
@@ -164,13 +169,26 @@ export function appendAbsorbPrompts(
   let promptedCount = 0;
   const latest = collectLatestProtected(messages, config);
   const protectedCallIds = collectProtectedToolCallIds(messages, config);
+  const failedCompressCallIds = collectFailedCompressCallIds(messages, config);
   const out = messages.map((msg) => {
-    if (!isAbsorbCandidate(msg, config, latest, protectedCallIds)) return msg;
+    if (
+      !isAbsorbCandidate(
+        msg,
+        config,
+        latest,
+        protectedCallIds,
+        failedCompressCallIds,
+      )
+    )
+      return msg;
     if (absorbedIds.has(msg.id)) return msg;
     const text = msg.text ?? "";
     if (text.includes(ABSORB_PROMPT_MARKER)) return msg;
     const tokens = countTokens(text);
-    if (tokens < cfg.minToolTokens) return msg;
+    // #3402: image bytes are not in msg.text, so countTokens(text) never reaches
+    // minToolTokens for a media result — exempt it or the feature is dead.
+    const mediaExempt = cfg.mediaOnly && hasMediaPayload(msg);
+    if (!mediaExempt && tokens < cfg.minToolTokens) return msg;
     const ref = refForRaw(state.messageRefs, msg.id);
     if (!ref || ref === BLOCKED_REF) return msg;
     promptedCount++;
@@ -305,6 +323,15 @@ export function applyAbsorb(input: AbsorbInput): AbsorbOutcome {
       resultText: `absorb failed: ref ${input.ref} is a ${target.contentType}, not a tool result.`,
     };
   }
+  // #3371 discipline: screening and execution must share one judgment — a
+  // mediaOnly session never absorbs a target that isAbsorbCandidate would skip.
+  if (cfg.mediaOnly && !hasMediaPayload(target)) {
+    return {
+      state: input.state,
+      ok: false,
+      resultText: `absorb failed: ${input.ref} carries no media payload — absorb is scoped to image-bearing results (compress.absorb.mediaOnly).`,
+    };
+  }
   if (isAcpOrConfiguredTool(target.toolName, cfg)) {
     return {
       state: input.state,
@@ -317,6 +344,7 @@ export function applyAbsorb(input: AbsorbInput): AbsorbOutcome {
       target,
       input.config,
       collectProtectedToolCallIds(input.messages, input.config),
+      collectFailedCompressCallIds(input.messages, input.config),
     ) ||
     isMessageLatestProtected(
       target,
@@ -359,6 +387,11 @@ export function applyAbsorb(input: AbsorbInput): AbsorbOutcome {
       ...input.state.stats,
       absorbedTokens: (input.state.stats.absorbedTokens ?? 0) + tokens,
     },
+    // #3939 ⑤: the absorb call is a deliberate history-rewriting action (a
+    // fold-class boundary, same family as applyCompression) — release the
+    // view latch here so the hide lands THIS turn, not at some later fold.
+    // Keeps absorb's instant-reclaim contract; quiet turns stay latched.
+    viewLatches: undefined,
   };
 
   const bloat =

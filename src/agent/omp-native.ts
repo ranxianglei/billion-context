@@ -25,7 +25,10 @@ import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST } from "../launcher.js";
 import { createBiliPlugin } from "./pi.js";
 import { applyOmpFirstEventTimeout, markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, setNativeOriginWaiter, singleFlight } from "./native-bootstrap.js";
 import { installNativeFetchIntercept, noteRoutedOrigin, observeRoutedOrigin, readyOrigin, type NativeInterceptState } from "./native-intercept.js";
+import { clearIncrementalProbe, createPrepareDirectSend, hostMsgIdHintFor, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalAck, noteIncrementalRejection, planIncrementalTurn, probeIncrementalTurns, rememberOriginalBody, sweepStale, wireMessagesLookAnthropic, type IncrementalWireMessage } from "./incremental-client.js";
+import * as pfChannel from "./pf-channel.js";
 import { fetchProxyVersion, waitForProxyVersion } from "./shared.js";
+import { logHostEvent } from "./host-log.js";
 
 /** Decides whether the native bootstrap should run in this process. */
 export function shouldBootstrapNativeOmp(env: NodeJS.ProcessEnv): boolean {
@@ -66,6 +69,188 @@ function errMessage(err: unknown): string {
 
 const state: NativeInterceptState = { origin: undefined, ready: Promise.resolve(undefined) };
 
+// #3248 phase 2: incremental-turn divert for omp. omp never emits header
+// events, so the ONLY identity signal at the fetch layer is the
+// `prompt_cache_key` body field the omp extension stamps (pi.ts
+// stampPromptCacheKey — present exactly when the plugin is active). The
+// beforeSend hook reads it as the conversation id, plans the incremental
+// body, swaps init.body and stamps the plugin headers DIRECTLY ON init —
+// plugin mode is safe here: x-bili-plugin-conversation gets the same value
+// wire mode already resolves to via preferPromptCacheKeyIdentity, so the
+// session id does not fork. #3329: each planned turn is keyed by a fresh
+// per-request turn id stamped onto init's headers (x-bili-turn-id) —
+// several sessions share one provider URL, and keying the pending table by
+// URL mis-attributes a late response to whichever session planned last on
+// that URL. The #3378 single-flight guard per URL is KEPT on top of turn-id
+// keying (#3340 rebase decision): while a marker'd request for this URL is
+// still awaiting its ack, later requests on the same URL ride the normal
+// pipeline — attribution answers "which ack consumes which pending", the
+// guard answers "no second conversion on this URL until the first is acked
+// or ages out"; dropping the guard is a separate follow-up.
+interface IncrementalPendingTurn {
+    sid: string;
+    url: string;
+    messages: IncrementalWireMessage[];
+    system: unknown;
+    base: string;
+    at: number;
+}
+/** Keyed by per-request turn id (#3329); each entry remembers the URL it
+ *  was planned on so the #3378 single-flight guard can scan for live
+ *  same-URL entries. */
+const incPendingOmp = new Map<string, IncrementalPendingTurn>();
+
+/** Planned turns age out (onResponse only fires on successful sends — a
+ *  network-dead request must not pin its slot forever). Memory hygiene only
+ *  (#3329): attribution is exact per turn id. Mirrors opencode. */
+const INC_PENDING_TTL_MS = 30_000;
+
+/** #4491 omp msgids: align the host's branch-entry ids (stashed by the omp
+ *  extension's before_provider_request for this conversation id) against the
+ *  ACTUALLY-sent wire messages — count + role, pairwise. Returns the id
+ *  sequence only on a provable 1:1 match; any mismatch (branch out of sync
+ *  with the sent history, a native-compaction summary that became a wire
+ *  message but has no entry id, an aux persona, an older host without
+ *  getBranch) returns undefined and the turn rides without the field. The
+ *  sent messages are the alignment authority: a sequence that cannot be
+ *  proven parallel is never sent — a misaligned id would pin the wrong
+ *  identity server-side, while a missing field merely falls back to
+ *  content-derived ids. */
+function ompTurnMsgIds(sid: string, messages: IncrementalWireMessage[]): string[] | undefined {
+    const hint = hostMsgIdHintFor(sid);
+    if (hint === undefined || hint.length !== messages.length) return undefined;
+    const ids: string[] = [];
+    for (let i = 0; i < hint.length; i++) {
+        if (hint[i].role !== messages[i].role) return undefined;
+        ids.push(hint[i].id);
+    }
+    return ids;
+}
+
+/** Test hook: drop all planned turns (module state across suites). */
+export function __resetOmpIncrementalForTests(): void {
+    incPendingOmp.clear();
+}
+
+export async function ompIncrementalBeforeSend(url: string, init: RequestInit | undefined): Promise<void> {
+    try {
+        if (init === undefined || typeof init.body !== "string") { return; }
+        sweepStale(incPendingOmp, INC_PENDING_TTL_MS);
+        // #3378 single-flight (kept over #3329's removal per the rebase
+        // decision): while a marker'd request for this URL is still awaiting
+        // its ack, later requests ride the normal pipeline. Pending entries
+        // are keyed by turn id (#3329), so the guard scans for a live entry
+        // stashed on THIS url (sweepStale above already aged out the stale
+        // ones — an aged entry must not block a fresh conversion).
+        // The guard must run BEFORE planIncrementalTurn: planning claims the
+        // turn's msgIds client-side (#4491), and a plan this guard then
+        // discards would burn those ids — the host's retry screens against
+        // the burned claims and silently drops the whole msgIds field.
+        let inflight = false;
+        for (const pending of incPendingOmp.values()) {
+            if (pending.url === url && Date.now() - pending.at < INC_PENDING_TTL_MS) { inflight = true; break; }
+        }
+        if (inflight) { return; }
+        let parsed: unknown;
+        try {
+            parsed = JSON.parse(init.body);
+        } catch {
+            return;
+        }
+        if (parsed === null || typeof parsed !== "object") return;
+        const b = parsed as { messages?: unknown; model?: unknown; system?: unknown; prompt_cache_key?: unknown };
+        if (typeof b.model !== "string" || !Array.isArray(b.messages)) { return; }
+        const sid = typeof b.prompt_cache_key === "string" ? b.prompt_cache_key.trim() : "";
+        if (sid.length === 0) { return; }
+        // #5403/#5418: feed the SAME proven id list into the shared watermark
+        // channel (the fetch chokepoint emits x-bili-pf-count + tail-ids; core
+        // = pf-channel.ts) on EVERY parsed ANTHROPIC-WIRE model request —
+        // converting turns ride the envelope, skipped/degraded/full-resend
+        // turns ride this field instead. A failed alignment (undefined)
+        // CLEARS the stored list like every other adapter — never ride a
+        // stale one. OpenAI-shaped turns are deliberately NOT re-screened
+        // here: ompTurnMsgIds' strict count+role proof cannot bridge the
+        // config-assembled leading system|developer run of real egress (no
+        // branch entry ⇒ guaranteed length mismatch ⇒ clear), and this
+        // planner runs AFTER the shared before_provider_request capture — a
+        // clear here would ERASE that resolver's position-aware list
+        // (bili-ps-N tokens) for the same conversation id. Openai-wire turns
+        // stay covered by that resolver alone (#2583 per-model egress).
+        const anthropicWire = wireMessagesLookAnthropic(b.messages);
+        let turnMsgIds: string[] | undefined;
+        if (anthropicWire) {
+            turnMsgIds = ompTurnMsgIds(sid, b.messages as IncrementalWireMessage[]);
+            pfChannel.pfCaptureIds(sid, turnMsgIds);
+        }
+        if (!anthropicWire) { return; }
+        const base = state.origin;
+        if (base === undefined) { return; }
+        if (!(await probeIncrementalTurns(base))) { return; }
+        const plan = planIncrementalTurn({ conversationId: sid, path: "/v1/messages", messages: b.messages as IncrementalWireMessage[], system: b.system as unknown, request: b as { model?: unknown } & Record<string, unknown>, msgIds: turnMsgIds });
+        if (plan.mode === "skip") { return; }
+        const turnId = newIncrementalTurnId();
+        // #3304: stash the pre-swap body under this turn's id — if the proxy
+        // dies before the send lands, the direct-send guard restores these
+        // bytes instead of forwarding the lane-only payload upstream.
+        rememberOriginalBody(turnId, init.body);
+        init.body = plan.body;
+        const headers = new Headers(init.headers);
+        headers.set("x-bili-plugin", "omp");
+        headers.set("x-bili-plugin-conversation", sid);
+        headers.set(INCREMENTAL_TURN_MARKER_HEADER, "1");
+        headers.set(INCREMENTAL_TURN_ID_HEADER, turnId);
+        init.headers = headers;
+        incPendingOmp.set(turnId, { sid, url, messages: b.messages as IncrementalWireMessage[], system: b.system as unknown, base, at: Date.now() });
+    } catch (e) {
+        // never break the host's request on adapter failure
+    }
+}
+
+state.beforeSend = ompIncrementalBeforeSend;
+// #3304: the omp swap stamps the turn id atomically with the body, so the
+// strict shared guard applies — mutated + unrestorable ⇒ refuse locally.
+state.prepareDirectSend = createPrepareDirectSend();
+
+export function ompIncrementalOnResponse(_url: string, response: Response, headers?: Record<string, string>): void {
+    const turnId = headers?.[INCREMENTAL_TURN_ID_HEADER];
+    if (turnId === undefined) return; // not an incremental dispatch — nothing to attribute (#3329)
+    const pending = incPendingOmp.get(turnId);
+    if (pending === undefined) return; // unknown/stale turn — nothing to attribute
+    const seq = response.headers.get("x-bili-applied-seq");
+    if (response.status === 200 && (seq === null || !Number.isFinite(Number(seq)))) {
+        // 200 without an ack header CANNOT be the marker'd response — the
+        // lane stamps x-bili-applied-seq on every diverted response that
+        // reaches the forward (incremental-lane.ts writeHead wrap). It is a
+        // concurrent full-resend response on the shared model-endpoint URL:
+        // keep the pending entry for the marker'd response still in flight.
+        return;
+    }
+    incPendingOmp.delete(turnId);
+    try {
+        if (response.status === 200) {
+            noteIncrementalAck(pending.sid, Number(seq), pending.messages, pending.system);
+            return;
+        }
+        if (response.status === 409) {
+            // #3369: reset (re-seed next turn) unless the rejection circuit
+            // trips — one drift must not permanently kill the conversation.
+            const verdict = noteIncrementalRejection(pending.sid);
+            logHostEvent("warn", "[native-client]", `[omp] incremental turn rejected (409) — conversation ${pending.sid} ${verdict === "dead" ? "falls back to full resend (rejection circuit)" : "re-seeds with a full resync next turn"} (#3369)`);
+            return;
+        }
+        if (response.status === 503) {
+            // #3369: lane temporarily unavailable — keep the conversation's
+            // ack state; just force a re-probe on the next turn.
+            clearIncrementalProbe(pending.base);
+            logHostEvent("warn", "[native-client]", `[omp] incremental turns unavailable (503) — conversation ${pending.sid} state preserved, re-probing next turn (#3369)`);
+        }
+    } catch {
+        // observability only
+    }
+}
+
+state.onResponse = ompIncrementalOnResponse;
+
 async function bootstrap(): Promise<string | undefined> {
     try {
         const handle = await ensureProxyRunning(
@@ -77,7 +262,7 @@ async function bootstrap(): Promise<string | undefined> {
         process.env.BILLION_CONTEXT_PROXY = origin;
         return origin;
     } catch (err) {
-        console.error(`bili-native: proxy bootstrap failed — model traffic goes direct (uncompressed): ${errMessage(err)}`);
+        logHostEvent("error", "[native-client]", `bili-native: proxy bootstrap failed — model traffic goes direct (uncompressed): ${errMessage(err)}`);
         return undefined;
     }
 }
@@ -107,44 +292,50 @@ export function _setSpawnForTest(fn?: () => Promise<string | undefined>): void {
  *  fallback origin, or undefined when nothing came up. */
 export async function verifyAttachAndRecover(attachOrigin: string): Promise<string | undefined> {
     // #1365: routed evidence outranks the planned origin — probe where the
-    // model channel actually points, not where the env says it should.
-    const home = state.routedOrigin ?? attachOrigin;
+    // model channel actually points, not where the env says it should. An
+    // EXPLICIT BILLION_CONTEXT_ATTACH outranks both: it names the plugin API
+    // endpoint directly, and a routed model origin may be a plain model-only
+    // path (e.g. an admin-gated port) that never exposes the plugin manifest.
+    const explicitAttachOrigin = nativeAttachOrigin(process.env);
+    const home = explicitAttachOrigin ?? state.routedOrigin ?? attachOrigin;
     const version = await fetchProxyVersion(home).catch(() => undefined);
     if (version !== undefined) {
         // Restore the readyOrigin short-circuit — a runtime recovery clears
         // state.origin before re-probing, and a transient blip must not leave
         // it dangling.
-        state.origin = home;
-        process.env.BILLION_CONTEXT_PROXY = home;
+        publishOrigin(home);
         return home;
     }
-    const pinned = state.routedOrigin ?? (await observeRoutedOrigin(state));
+    const pinned = explicitAttachOrigin ?? state.routedOrigin ?? (await observeRoutedOrigin(state));
     if (pinned !== undefined) {
         const back = await waitForProxyVersion(pinned);
         if (back !== undefined) {
-            state.origin = back;
-            process.env.BILLION_CONTEXT_PROXY = back;
-            console.log(`bili-native(omp): attach target ${pinned} is healthy again — attached, no second instance spawned`);
+            publishOrigin(back);
+            logHostEvent("info", "[native-client]", `bili-native(omp): attach target ${pinned} is healthy again — attached, no second instance spawned`);
             return back;
         }
-        console.error(`bili-native(omp): attach target ${pinned} is down and this process's model channel is pinned to it — refusing to spawn a second instance (bili tools would 404 against the other one). Start your proxy at ${pinned} or unset BILLION_CONTEXT_PROXY; bili keeps re-checking and self-heals when it comes back.`);
+        logHostEvent(
+            "error",
+            "[native-client]",
+            explicitAttachOrigin !== undefined
+                ? `bili-native(omp): explicit attach target ${pinned} unreachable within the health deadline — refusing to spawn a second instance (your declared endpoint stays authoritative). Start your proxy at ${pinned} or unset BILLION_CONTEXT_ATTACH; bili keeps re-checking and self-heals when it comes back.`
+                : `bili-native(omp): attach target ${pinned} is down and this process's model channel is pinned to it — refusing to spawn a second instance (bili tools would 404 against the other one). Start your proxy at ${pinned} or unset BILLION_CONTEXT_PROXY; bili keeps re-checking and self-heals when it comes back.`,
+        );
         state.origin = undefined;
         return undefined;
     }
-    console.error(`bili-native(omp): attach target ${attachOrigin} is not healthy — falling back to a spawned proxy`);
+    logHostEvent("error", "[native-client]", `bili-native(omp): attach target ${attachOrigin} is not healthy — falling back to a spawned proxy`);
     delete process.env.BILLION_CONTEXT_PROXY;
     state.attach = false;
-    state.origin = undefined;
+    publishOrigin(undefined, false); // env already cleared above
+
     const start = singleFlight(_spawnForTest ?? bootstrap);
     state.respawn = start;
     // Publish whatever origin lands on BOTH the shared state and the env —
     // env readers (compaction reporter, /acp status) must never disagree with
     // what the route resolves, whoever produced the origin.
     const landed = start().then((o) => {
-        if (o !== undefined) {
-            state.origin = o;
-            process.env.BILLION_CONTEXT_PROXY = o;
-        }
+        if (o !== undefined) publishOrigin(o);
         return o;
     });
     state.ready = landed;
@@ -186,7 +377,7 @@ export function armNativeOmp(p: typeof plan): void {
                     if (version === undefined || state.origin === origin) return;
                     state.origin = origin;
                     process.env.BILLION_CONTEXT_PROXY = origin;
-                    console.warn(`bili-native(omp): model channel pinned to ${origin} — rebinding bili tools there`);
+                    logHostEvent("warn", "[native-client]", `bili-native(omp): model channel pinned to ${origin} — rebinding bili tools there`);
                 });
             };
             state.ready = start();
@@ -227,6 +418,28 @@ if (process.env.NODE_TEST_CONTEXT === undefined && ompTrafficRidesBili(process.e
 // patch globalThis.fetch or bootstrap a real proxy from inside a test run.
 if (process.env.NODE_TEST_CONTEXT === undefined && plan.mode !== "off") {
     installNativeFetchIntercept(state);
+}
+
+/** Test hook: point the module state at a lane origin (the incremental
+ *  beforeSend reads state.origin as its probe base). */
+let originPinnedForTest = false;
+
+/** Publish a discovered origin to the shared state + env. Every async
+ *  discovery path funnels through here so a test-pinned base (see
+ *  _setOmpOriginForTest) survives attach verify / respawn landing at an
+ *  arbitrary point during a suite — without the guard the pin gets clobbered
+ *  mid-test and probes race off to the REAL lane. */
+function publishOrigin(origin: string | undefined, envToo = true): void {
+    if (originPinnedForTest) return;
+    state.origin = origin;
+    if (!envToo) return;
+    if (origin === undefined) delete process.env.BILLION_CONTEXT_PROXY;
+    else process.env.BILLION_CONTEXT_PROXY = origin;
+}
+
+export function _setOmpOriginForTest(origin: string | undefined): void {
+    originPinnedForTest = origin !== undefined;
+    state.origin = origin;
 }
 
 /** Test hook: expose the armed runtime-recovery seam (mirrors pi/opencode/dsh). */

@@ -126,13 +126,23 @@ export async function runPiAsync(args: string[], env: NodeJS.ProcessEnv = proces
     }
 }
 
+/** On-disk root of the pi-managed npm copy of billion-context — exactly where
+ *  pi materializes the settings entry. resolvePiHome() ALREADY includes the
+ *  host's agent segment (~/.pi/agent by default, or PI_CODING_AGENT_DIR /
+ *  PI_HOME), so callers must never append another "agent" (#2850). Single
+ *  source of truth shared by isPiNpmCopy() and the doctor/plugin-list lane
+ *  presence probe. */
+export function piNpmCopyRoot(env: NodeJS.ProcessEnv = process.env): string {
+    return path.join(resolvePiHome(env), "npm", "node_modules", PI_PACKAGE);
+}
+
 /** True when `installDir` is the pi-managed npm copy of billion-context
  *  (<piHome>/npm/node_modules/billion-context, as pi materializes the
  *  settings entry), literal or after symlink resolution. Such a copy has no
  *  global bili driving its refresh — the proxy running FROM it is the only
  *  candidate to drive pi's own channel. */
 export function isPiNpmCopy(installDir: string, env: NodeJS.ProcessEnv = process.env): boolean {
-    const root = path.join(resolvePiHome(env), "npm", "node_modules", PI_PACKAGE);
+    const root = piNpmCopyRoot(env);
     let real = installDir;
     try {
         real = fs.realpathSync(installDir);

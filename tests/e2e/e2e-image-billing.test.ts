@@ -408,8 +408,10 @@ test("e2e real payload: bytes route 743x-poisoned, learned cost rescues, baselin
         assert.notEqual(baseline, WINDOW - 2_000, "stale stamped baseline replaced");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });
@@ -443,8 +445,10 @@ test("e2e default route: auto->pixels de-poisoned, malformed image rides along, 
         assert.equal(entry?.fp, "pixels:0", "default route learns under the pixels fingerprint");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });

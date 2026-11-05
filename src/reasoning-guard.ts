@@ -1,4 +1,5 @@
 import { fetchWithTimeout } from "./fetch-util.js";
+import { scrubLoneSurrogatesOnWire } from "./text-safe.js";
 import { normalizeSseLineEndings, finalizeSseLineEndings } from "./sse-util.js";
 import { awaitDrain } from "./server/stream-io.js";
 
@@ -540,13 +541,17 @@ export async function runReasoningGuard(p: GuardParams): Promise<void> {
             prepareNextRound(st);
             st.roundNo++;
             const nextBody = nextRoundBody(st.baseBody, [...st.origInput, ...st.replayTail]);
+            // #816 family: the replayed tail can carry lone surrogate halves —
+            // scrub the wire body (and what resign signs) or strict upstreams
+            // reject the whole round.
+            const roundBodyStr = scrubLoneSurrogatesOnWire(JSON.stringify(nextBody));
             let roundRes: Awaited<ReturnType<typeof fetchWithTimeout>>;
-            p.resign?.(p.reqHeaders, JSON.stringify(nextBody));
+            p.resign?.(p.reqHeaders, roundBodyStr);
             try {
                 roundRes = await fetchWithTimeout(p.upstreamUrl, {
                     method: "POST",
                     headers: p.reqHeaders,
-                    body: JSON.stringify(nextBody),
+                    body: roundBodyStr,
                     dispatcher: p.dispatcher,
                 }, undefined, p.signal);
             } catch {

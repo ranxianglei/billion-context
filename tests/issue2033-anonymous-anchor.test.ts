@@ -1,9 +1,23 @@
 import assert from "node:assert/strict";
 import http from "node:http";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { once } from "node:events";
 import test from "node:test";
 
 process.env.NODE_ENV = "test";
+
+// Hermetic state dirs (#2806 review): A1/A2 drive genuine ANONYMOUS clients —
+// prefix affinity mints pfa-* sessions and persists them to
+// prefix-affinity.json in the shared default state dir. Without isolation the
+// scenarios hydrate and co-write the chains of every sibling test file running
+// concurrently in the same CI job (dozens of foreign chains showed up in the
+// suites' own hydration logs), which flipped the anchor assertions. Same idiom
+// as tests/prefix-affinity-orphan.test.ts (#2719).
+const hermeticRoot = fs.mkdtempSync(path.join(os.tmpdir(), "bc-2806-anonanchor-"));
+for (const key of ["XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME"]) process.env[key] = hermeticRoot;
+test.after(() => fs.rmSync(hermeticRoot, { recursive: true, force: true }));
 
 // #2033: effectiveTokenCount took the anonymous-prefix-affinity branch BEFORE
 // checking lastUsageGradeTokens (src/server.ts), so an anonymous session that

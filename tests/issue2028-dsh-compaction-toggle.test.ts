@@ -1,9 +1,11 @@
-// #2028: web-configurable dsh native compaction switch (allowDshCompaction).
-// Pins: (a) config resolution matrix (file / env / default), (b) the web API
-// GET/PUT contract incl. the env-forced 409, (c) the end-to-end behavior flip —
-// the #1729 wire guard refuses dsh compaction envelopes by default, forwards
-// them once the switch is flipped ON through the LIVE web API (hot reload),
-// and refuses again once cleared.
+// #2028/#3666: the allowDshCompaction escape hatch is REMOVED — dsh native
+// compaction is refused unconditionally by the #1729 wire guard on every lane.
+// This suite pins the removal contract: (a) legacy file keys (nested dsh.* and
+// the bare top-level position) and the stale env var are ignored, each with a
+// one-time deprecation warning; (b) the refusal message states the
+// unconditional contract with no dead opt-in pointers; (c) the web API no
+// longer exposes the field, rejects structured dsh writes loudly, and
+// whole-file saves preserve leftover keys verbatim (still inert).
 import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
@@ -13,11 +15,31 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { defaultConfig } from "acp-kernel";
 import { startServer } from "../src/server.ts";
-import { allowDshCompactionState, loadOptions, type ProxyOptions } from "../src/config.ts";
+import { loadOptions, loadRoutes, type ProxyOptions } from "../src/config.ts";
 import { DSH_COMPACTION_INSTRUCTION_PREFIX, dshCompactionRefusal } from "../src/server/dsh-compaction-guard.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
+import { setLogCapture } from "../src/logger.ts";
 import { rmrf } from "./tmp-rm.ts";
+
+type Captured = { level: string; msg: string };
+
+const REMOVED_MARK = "was removed (#3651";
+const UNKNOWN_KEY_PREFIX = "[acp-config] ignoring unknown top-level config key(s): ";
+
+function removedWarns(captured: Captured[]): Captured[] {
+    return captured.filter((e) => e.level === "warn" && e.msg.startsWith("[acp-config]") && e.msg.includes(REMOVED_MARK));
+}
+
+function unknownKeyWarns(captured: Captured[]): Captured[] {
+    return captured.filter((e) => e.level === "warn" && e.msg.startsWith(UNKNOWN_KEY_PREFIX));
+}
+
+function captureLogs(): { captured: Captured[]; stop: () => void } {
+    const captured: Captured[] = [];
+    setLogCapture((level, msg) => captured.push({ level, msg }));
+    return { captured, stop: () => setLogCapture(null) };
+}
 
 /** Point BILI_CONFIG_FILE at a temp file (or a missing path when body is
  *  null) for the duration of fn, restoring the previous value afterwards. */
@@ -36,37 +58,75 @@ function withConfig(body: string | null, fn: () => void): void {
     }
 }
 
-function envWith(value: string | undefined): NodeJS.ProcessEnv {
-    const env: NodeJS.ProcessEnv = {};
-    if (value !== undefined) env.BILI_ALLOW_DSH_COMPACTION = value;
-    return env;
-}
-
-test("#2028: allowDshCompaction resolution — file, env, default OFF", () => {
-    withConfig(null, () => assert.equal(loadOptions(envWith(undefined)).allowDshCompaction, false, "default OFF (#1729 behavior unchanged)"));
-    withConfig('{"dsh":{"allowDshCompaction":true}}', () => assert.equal(loadOptions(envWith(undefined)).allowDshCompaction, true, "file enables (nested dsh.* section)"));
-withConfig('{"allowDshCompaction":true}', () => assert.equal(loadOptions(envWith(undefined)).allowDshCompaction, true, "legacy top-level location still enables (auto-relocated)"));
-    withConfig('{"dsh":{"allowDshCompaction":true}}', () => assert.equal(loadOptions(envWith("0")).allowDshCompaction, false, "env 0 beats file"));
-    withConfig(null, () => assert.equal(loadOptions(envWith("1")).allowDshCompaction, true, "env 1 enables"));
-    withConfig(null, () => assert.equal(loadOptions(envWith("yes")).allowDshCompaction, true, "non-\"0\" env values enable (house BILI_ boolean semantics)"));
+test("#3666: legacy dsh.allowDshCompaction file key is ignored with a one-time deprecation warning", () => {
+    const { captured, stop } = captureLogs();
+    try {
+        withConfig('{"dsh":{"allowDshCompaction":true}}', () => {
+            loadRoutes();
+            let warns = removedWarns(captured);
+            assert.equal(warns.length, 1, `expected 1 removal warning, got: ${captured.map((e) => e.msg).join(" | ")}`);
+            assert.ok(warns[0].msg.includes("dsh.allowDshCompaction"), warns[0].msg);
+            assert.ok(!unknownKeyWarns(captured).some((e) => e.msg.includes("dsh")), "the recognized dsh section must not trip the unknown-key warning");
+            loadRoutes();
+            assert.equal(removedWarns(captured).length, 1, "identical key set must not repeat the warning");
+        });
+    } finally {
+        stop();
+    }
 });
 
-test("#2028: allowDshCompactionState source resolution", () => {
-    withConfig(null, () => assert.deepEqual(allowDshCompactionState(envWith(undefined)), { enabled: false, source: null }));
-    withConfig('{"dsh":{"allowDshCompaction":true}}', () => assert.deepEqual(allowDshCompactionState(envWith(undefined)), { enabled: true, source: "file" }));
-withConfig('{"allowDshCompaction":true}', () => assert.deepEqual(allowDshCompactionState(envWith(undefined)), { enabled: true, source: "file" }));
-    withConfig('{"dsh":{"allowDshCompaction":true}}', () => assert.deepEqual(allowDshCompactionState(envWith("0")), { enabled: false, source: "env" }));
-    withConfig(null, () => assert.deepEqual(allowDshCompactionState(envWith("1")), { enabled: true, source: "env" }));
+test("#3666: the live dsh.authoredCompaction key (#3723/#3901) never trips the removed-key warning", () => {
+    const { captured, stop } = captureLogs();
+    try {
+        withConfig('{"dsh":{"authoredCompaction":false}}', () => {
+            loadRoutes();
+            assert.equal(removedWarns(captured).length, 0, `a live key must not be named in a removal warning: ${captured.map((e) => e.msg).join(" | ")}`);
+        });
+    } finally {
+        stop();
+    }
 });
 
-test("#2028: refusal message points at the real opt-in (stale preset reference removed)", () => {
+test("#3666: legacy top-level allowDshCompaction gets its own warning, not the generic unknown-key one", () => {
+    const { captured, stop } = captureLogs();
+    try {
+        withConfig('{"allowDshCompaction":true}', () => {
+            loadRoutes();
+            assert.ok(!unknownKeyWarns(captured).some((e) => e.msg.includes("allowDshCompaction")), "removed key must not be flagged as an unknown typo");
+            const warns = removedWarns(captured);
+            assert.equal(warns.length, 1, `expected 1 removal warning, got: ${captured.map((e) => e.msg).join(" | ")}`);
+            assert.ok(warns[0].msg.includes('top-level "allowDshCompaction"'), warns[0].msg);
+        });
+    } finally {
+        stop();
+    }
+});
+
+test("#3666: stale BILI_ALLOW_DSH_COMPACTION env warns once per process and changes nothing", () => {
+    const { captured, stop } = captureLogs();
+    try {
+        loadOptions({ BILI_ALLOW_DSH_COMPACTION: "1" });
+        let warns = removedWarns(captured);
+        assert.equal(warns.length, 1, `expected 1 env removal warning, got: ${captured.map((e) => e.msg).join(" | ")}`);
+        assert.ok(warns[0].msg.includes("BILI_ALLOW_DSH_COMPACTION"), warns[0].msg);
+        loadOptions({ BILI_ALLOW_DSH_COMPACTION: "1" });
+        warns = removedWarns(captured);
+        assert.equal(warns.length, 1, "env warning is once per process");
+        assert.ok(!("allowDshCompaction" in loadOptions({})), "the option itself is gone from ProxyOptions");
+    } finally {
+        stop();
+    }
+});
+
+test("#3666: refusal message states the unconditional contract (dead opt-in pointers gone)", () => {
     const body = dshCompactionRefusal("openai").body as { error: { message: string } };
     assert.ok(!body.error.message.includes("standard-bili-auto-off"), "stale preset reference must be gone");
-    assert.ok(body.error.message.includes("allowDshCompaction") && body.error.message.includes("BILI_ALLOW_DSH_COMPACTION"), body.error.message);
+    assert.ok(body.error.message.includes("unconditional") && body.error.message.includes("#3651"), body.error.message);
+    assert.ok(!body.error.message.includes("BILI_ALLOW_DSH_COMPACTION"), "dead env pointer must be gone");
 });
 
 // ---------------------------------------------------------------------------
-// Integration: real bili server + real mock upstream, live hot-reload flip.
+// Integration: real bili server + real mock upstream, live web API contract.
 
 function closeServer(server: http.Server): Promise<void> {
     server.closeAllConnections?.();
@@ -124,7 +184,7 @@ async function get(port: number, reqPath: string): Promise<{ status: number; bod
     return promise;
 }
 
-test("#2028: the web toggle flips the #1729 wire guard live (refuse -> forward -> refuse)", async () => {
+test("#3666: web API no longer exposes or accepts the switch; the guard refuses unconditionally", async () => {
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
     const root = path.join(tmpdir(), `bili-2028-${process.pid}-${Date.now()}`);
@@ -185,74 +245,35 @@ test("#2028: the web toggle flips the #1729 wire guard live (refuse -> forward -
     const cfgJson = async (): Promise<Record<string, unknown>> => JSON.parse((await get(port, "/__bili/config")).body);
 
     try {
-        // A: default — exposed state + wire refusal, nothing reaches upstream.
-        assert.deepEqual(await cfgJson().then((c) => c.allowDshCompaction), { enabled: false, source: null });
+        // A: GET no longer exposes the field; the default wire refusal stands.
+        assert.ok(!("allowDshCompaction" in (await cfgJson())), "GET must not expose the removed field");
         let r = await compactionPost();
-        assert.equal(r.status, 403, `default must refuse (got ${r.status}: ${r.body})`);
+        assert.equal(r.status, 422, `default must refuse (got ${r.status}: ${r.body})`);
         assert.equal(JSON.parse(r.body).error.code, "dsh_compaction_refused");
         assert.equal(received.length, 0, "refused call never reaches the upstream");
 
-        // B: enable through the live web API → hot-forward, byte-exact envelope.
+        // B: structured dsh write → loud 400, file untouched, refusal stands.
         r = await put(port, "/__bili/config", { dsh: { allowDshCompaction: true } });
-        assert.equal(r.status, 200, r.body);
-        assert.equal(JSON.parse(readFileSync(cfgFile, "utf8")).dsh.allowDshCompaction, true, "file gained the key under dsh.*");
-        assert.deepEqual((await cfgJson()).allowDshCompaction, { enabled: true, source: "file" });
+        assert.equal(r.status, 400, r.body);
+        assert.match(r.body, /removed/);
+        assert.equal(readFileSync(cfgFile, "utf8"), '{"providers":{}}\n', "rejected write must leave the file untouched");
         r = await compactionPost();
-        assert.equal(r.status, 200, `allowed call must be forwarded (got ${r.status}: ${r.body})`);
-        assert.equal(received.length, 1, "forwarded to the upstream");
-        assert.ok(received[0].includes(DSH_COMPACTION_INSTRUCTION_PREFIX), "envelope forwarded byte-exact");
+        assert.equal(r.status, 422, "nothing can lift the guard any more");
+        assert.equal(received.length, 0);
 
-        // C: clear (null) → key removed, guard active again.
-        r = await put(port, "/__bili/config", { dsh: { allowDshCompaction: null } });
-        assert.equal(r.status, 200, r.body);
-        const clearedFile = JSON.parse(readFileSync(cfgFile, "utf8"));
-        assert.ok(!clearedFile.dsh || !("allowDshCompaction" in clearedFile.dsh), "key cleared from the file");
-        assert.deepEqual((await cfgJson()).allowDshCompaction, { enabled: false, source: null });
-        r = await compactionPost();
-        assert.equal(r.status, 403, "guard restored after clear");
-        assert.equal(received.length, 1, "still refused after clear");
-
-        // D: validation errors.
-        r = await put(port, "/__bili/config", { dsh: { allowDshCompaction: "yes" } });
-        assert.equal(r.status, 400);
-        assert.match(r.body, /must be a boolean or null/);
-        r = await put(port, "/__bili/config", {});
-        assert.equal(r.status, 400);
-        assert.match(r.body, /dsh compaction settings/);
-
-        // E: whole-file save honors the same field.
+        // C: whole-file save preserves a leftover dsh key verbatim (no
+        // relocation any more) — and the key stays inert.
         r = await put(port, "/__bili/config", { file: JSON.stringify({ providers: {}, dsh: { allowDshCompaction: true } }) });
         assert.equal(r.status, 200, r.body);
-        assert.equal(JSON.parse(readFileSync(cfgFile, "utf8")).dsh.allowDshCompaction, true);
-        r = await put(port, "/__bili/config", { file: JSON.stringify({ providers: {}, allowDshCompaction: true }) });
-        assert.equal(r.status, 200, r.body);
-        const relocatedFile = JSON.parse(readFileSync(cfgFile, "utf8"));
-        assert.equal(relocatedFile.dsh.allowDshCompaction, true, "legacy top-level key relocated into dsh.* on save");
-        assert.ok(!("allowDshCompaction" in relocatedFile), "top-level position no longer present");
-        r = await put(port, "/__bili/config", { file: JSON.stringify({ providers: {} }) });
-        assert.equal(r.status, 200, r.body);
-        assert.ok(!("allowDshCompaction" in JSON.parse(readFileSync(cfgFile, "utf8"))));
+        assert.deepEqual(JSON.parse(readFileSync(cfgFile, "utf8")).dsh, { allowDshCompaction: true }, "leftover key preserved verbatim");
+        r = await compactionPost();
+        assert.equal(r.status, 422, "a preserved legacy key must stay inert");
+        assert.equal(received.length, 0);
 
-        // F: env-forced contradiction → 409 (mirrors the #405 passthrough contract).
-        process.env.BILI_ALLOW_DSH_COMPACTION = "0";
-        try {
-            r = await put(port, "/__bili/config", { dsh: { allowDshCompaction: true } });
-            assert.equal(r.status, 409, r.body);
-            assert.match(r.body, /BILI_ALLOW_DSH_COMPACTION/);
-            r = await put(port, "/__bili/config", { dsh: { allowDshCompaction: false } });
-            assert.equal(r.status, 200, "matching write allowed");
-            r = await put(port, "/__bili/config", { dsh: { allowDshCompaction: null } });
-            assert.equal(r.status, 200, "clear allowed under env force");
-            r = await put(port, "/__bili/config", { file: JSON.stringify({ dsh: { allowDshCompaction: true } }) });
-            assert.equal(r.status, 409, "whole-file contradiction refused");
-            process.env.BILI_ALLOW_DSH_COMPACTION = "1";
-            r = await put(port, "/__bili/config", { dsh: { allowDshCompaction: false } });
-            assert.equal(r.status, 409, "env=1 forces allow; writing false contradicts");
-            r = await put(port, "/__bili/config", { dsh: { allowDshCompaction: true } });
-            assert.equal(r.status, 200, "matching write allowed");
-        } finally {
-            delete process.env.BILI_ALLOW_DSH_COMPACTION;
-        }
+        // D: empty-body validation survives the surface shrink.
+        r = await put(port, "/__bili/config", {});
+        assert.equal(r.status, 400);
+        assert.match(r.body, /expected providers/);
     } finally {
         if (prevConfig === undefined) delete process.env.BILI_CONFIG_FILE;
         else process.env.BILI_CONFIG_FILE = prevConfig;

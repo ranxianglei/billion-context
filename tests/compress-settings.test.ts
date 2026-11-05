@@ -238,27 +238,6 @@ test("resolveCompress: prompts cascade end-to-end via provider routes", () => {
     assert.equal(p.howToCompressRules, "MODEL RULES");
 });
 
-test("mergeCompress: stripImages + stripImagesKeepRecent cascade deepest-wins per field", () => {
-    const merged = mergeCompress(
-        { stripImages: true, stripImagesKeepRecent: 5 },
-        { stripImagesKeepRecent: 3 },
-        { stripImagesKeepRecent: 1 },
-    );
-    assert.equal(merged.stripImages, true);
-    assert.equal(merged.stripImagesKeepRecent, 1);
-});
-
-test("parseCompressSettings: parses stripImages (bool) + stripImagesKeepRecent (number)", () => {
-    const ok = parseCompressSettings({ stripImages: true, stripImagesKeepRecent: 7 });
-    assert.equal(ok?.stripImages, true);
-    assert.equal(ok?.stripImagesKeepRecent, 7);
-    // Absent keys stay undefined (no default injected at parse time).
-    assert.equal(parseCompressSettings({})?.stripImages, undefined);
-    // Malformed types are rejected (whole object discarded).
-    assert.equal(parseCompressSettings({ stripImages: "yes" }), undefined);
-    assert.equal(parseCompressSettings({ stripImagesKeepRecent: "many" }), undefined);
-});
-
 test("mergeCompress: outputHeadroomMaxPct cascades deepest-wins per field (#896)", () => {
     const merged = mergeCompress(
         { outputHeadroomMaxPct: 1 },

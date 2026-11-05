@@ -10,6 +10,19 @@ import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
+import { getSession } from "../src/session.ts";
+import { normalizeUpstreamOrigin } from "../src/util.ts";
+
+// #4185: an identified fresh session whose preflight ends in deterministic
+// exhaustion now forwards once for upstream arbitration instead of failing
+// fast locally. This pin asserts the LOCAL futility-skip contract, so it
+// carries a settled usage baseline to keep testing the evidence-driven path.
+function seedEvidence(upstreamPort: number, sessionId: string): void {
+    const s = getSession(sessionId);
+    s.stats.lastInputTokens = 100;
+    s.stats.lastInputTokensSource = "usage";
+    s.stats.lastInputTokensOrigin = normalizeUpstreamOrigin(`http://127.0.0.1:${upstreamPort}`);
+}
 
 // #1841: when the cumulative mass of ALL foldable content cannot close the gap
 // between the payload and the preflight target, the old behavior walked every
@@ -122,8 +135,10 @@ async function boot(): Promise<{ proxyPort: number; upstreamPort: number; cleanu
         upstreamPort,
         cleanup: async () => {
             proxy.close();
+            proxy.closeIdleConnections?.();
             await once(proxy, "close");
             upstream.close();
+            upstream.closeIdleConnections?.();
             await once(upstream, "close");
         },
     };
@@ -163,9 +178,10 @@ test("#1841 A: a payload whose foldable pool cannot close the gap skips the roun
             plain("user", "ok"),
             plain("assistant", "done"),
         ];
+        seedEvidence(p.upstreamPort, "issue1841-futility-skip");
         const resp = await post(p, "issue1841-futility-skip", messages);
         const body = await resp.text();
-        assert.equal(resp.status, 502, `a futile round must fail fast: HTTP ${resp.status} ${body.slice(0, 240)}`);
+        assert.equal(resp.status, 413, `a futile round must fail fast non-retryably (#3461): HTTP ${resp.status} ${body.slice(0, 240)}`);
         const json = JSON.parse(body) as { error?: { code?: string; message?: string } };
         assert.equal(json.error?.code, "preflight_compress_failed");
         assert.match(json.error?.message ?? "", /futile round/, `names the futility verdict (got: ${json.error?.message})`);
@@ -244,6 +260,9 @@ test("#1841 B: mid-walk bail stops before summarizing ranges that cannot change 
         ];
         const resp = await post(p, "issue1841-futility-midbail", messages);
         const body = await resp.text();
+        // Relay-dependent by fixture design (every summary comes back empty):
+        // a healthy relay could still fold the drawn range, so this verdict
+        // stays the retryable 502 — unlike case A's zero-call structural 413.
         assert.equal(resp.status, 502, `a bailed walk must fail fast: HTTP ${resp.status} ${body.slice(0, 240)}`);
         const json = JSON.parse(body) as { error?: { code?: string; message?: string } };
         assert.equal(json.error?.code, "preflight_compress_failed");

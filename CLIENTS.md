@@ -17,13 +17,22 @@ Two lanes, same plugin (#941):
   `--patch` overlay (`~/.dsh-bili/.bili-acp.patch.yml`) — every profile
   boots with the bili tools registered natively, model requests carry
   `x-bili-plugin` + the dsh session id (plugin mode), and `/acp` is
-  session-bound. dsh's native auto-compaction is disabled in the same patch
-  (`compaction-basic` → `auto: false`); manual `/compact` stays available.
+   session-bound. dsh's native auto-compaction is disabled in the same patch
+   (host-plane `compaction-basic` → `auto: false`; web-profile preset
+   instances are disabled at load time by the #3354 overlay); manual
+   `/compact` stays available in non-web profiles. The
+  same patch also adds `MALFORMED_RESPONSE` to the built-in DeepSeek routes'
+  retry whitelist, so one sampling flake that breaks a tool-call argument JSON
+  retries instead of killing the turn (#2605).
 - **Profile install (no launcher) — one lane (#966):** `bili plugin install
   dsh` runs `dsh plugin --profile <name> add billion-context` for every
   existing profile — pnpm installs the package into each profile's own
   `node_modules`, and dsh mounts the bundled patch layer
-  (`dsh.bundle.patch.yml`) automatically. The spec follows how bili itself
+  (`dsh.bundle.patch.yml`) automatically — besides mounting `bili-native` and
+  disabling dsh's auto-compaction, it adds `MALFORMED_RESPONSE` to the built-in
+  DeepSeek routes' retry whitelist (#2605); the profile's own
+  `cordis.patch.yml` applies later, so a full `retryPolicy` written there
+  overrides it. The spec follows how bili itself
   was installed (#925): an npm-form install passes the registry name, a
   checkout/dev build passes its absolute path (a `link:` dependency, so
   local work stays live). Legacy managed blocks (`# bili begin` /
@@ -37,7 +46,10 @@ Two lanes, same plugin (#941):
   (round 1 rides wire mode). Opt-out: `BILI_NATIVE_DSH=0`. Remove with
   `bili plugin remove dsh` or `dsh plugin --profile <name> remove
   billion-context` — both go through the same channel. Registry installs
-  require a published release that carries `dsh.bundle.patch.yml`. If dsh
+  require a published release that carries `dsh.bundle.patch.yml`; use the
+  npm form — a GitHub source address installs source without `dist/` (the
+  entry points dangle and dsh silently skips the bundle; the install-time
+  guard fails loudly instead, #2471). If dsh
   fails to boot right after an add with `ERR_MODULE_NOT_FOUND` on
   `billion-context/dsh`, the profile resolved a pre-bundle copy from a stale
   package-metadata cache (#953) — re-add pinned: `dsh plugin --profile
@@ -80,14 +92,85 @@ Two lanes, same plugin (#941):
    settings overlay rewrites those providers' `baseURL`s to `/bili/` URLs, so
    the traffic reaches the proxy regardless of which fetch the transport uses
    or what the attribution state is.
- - **Web-profile caveat (#1772):** when a profile's bundles include
-   `@deepseek-ai/dsh-web-app`, the running `compaction-basic` instance lives
-   inside an agent preset (`preset-standard.config.plugins`) that no patch
-   layer can reach by id — dsh's patch engine indexes only top-level rows and
-   true group children — so the bundled `auto: false` lands on web-app's
-   already-disabled host-plane row and the preset instance keeps
-   auto-compaction ON. The plugin logs a one-time `[dsh-client]` warning at
-   boot in such profiles; ACP compression is unaffected.
+  - **Web-profile compaction (#1772, resolved by #3354):** when a profile's
+    bundles include `@deepseek-ai/dsh-web-app`, the running `compaction-basic`
+    instance lives inside an agent preset (`preset-standard.config.plugins`).
+    No patch layer can address that NESTED row by id — dsh's patch engine
+    indexes only top-level rows and true group children — so the bundled
+    `auto: false` lands on web-app's already-disabled host-plane row and
+     changes nothing. Since #3354 bili closes the gap at LOAD TIME: an
+     always-on bundle entry `bili-compaction-gate` — a separate cordis entry
+     beside `bili-native`, mounted by the same patch layers, so it stays
+     alive when `bili-native` is disabled or kill-switched (#3662) —
+     registers a cordis `internal/config` overlay (vendored from
+     deshark42/dsh-compaction-basic-disable, MIT) that marks the preset's
+     `compaction-basic` and `command-compact` rows `disabled: true` while
+     bili owns the lane, and the preset gate rows in the bundle patch make
+     each Web preset wait for that overlay's service before it can register.
+     Native
+    auto-compaction is OFF in these profiles too (and `/compact` is
+    unavailable there — that is EXPECTED, not a bug (#4002): bili owns
+    compression on the lane, so the preset's compact command and its
+    auto-compaction are both stood down deliberately; there is no
+    re-enable switch by design (#3651/#3666), see CONFIGURATION.md);
+    ACP compression is unaffected. Since #4147 the overlay matches
+    STRUCTURALLY — any entry whose resolved `config.plugins` nests
+    `compaction-basic`/`command-compact` rows gets them disabled, custom
+    and profile-local presets exactly like the factory ones (the four
+    gate-row ids in `dsh.bundle.patch.yml` are ordering insurance for the
+    factory roster, not the coverage boundary — a profile shipping other
+    preset ids is covered by the structural walk). The one-time `[dsh-client]`
+    boot note names the actual entries the overlay rewrote (#3962), so a
+    patch-row miss on a renamed roster is visible without reading the host
+    loader log. The overlay rides an
+    INTERNAL dsh hook and is version-sensitive — if you still see a dsh
+    compaction checkpoint land on a newer/older dsh build, fall back to the
+    #2474 recipe: a profile-level patch (your profile's `cordis.patch.yml`,
+    applied after every bundle) overrides preset-standard by id with a
+    FULL-SNAPSHOT `config` — copy the complete preset config from
+    `dsh --profile <name> --dump-config`, add `config.auto: false` under its
+    `compaction-basic` row, append the result to `cordis.patch.yml`. Config
+    replacement is WHOLESALE: a partial snippet silently drops everything not
+    restated — including the preset's own `id`/`order` identity, which can
+    leave the preset unrecognized by the roster — and `- insert:` with the
+    same id appends a second dead row instead of merging. The snapshot also
+    freezes the roster until re-copied after a dsh preset update. The plugin
+     logs a one-time `[dsh-client]` note naming both paths at boot in such
+     profiles.
+   - **Disabling vs removing the plugin (#3662):** pre-#3662, disabling
+     `bili-native` (dsh plugin manager, or `disabled: true` in any patch
+     layer) removed the ONLY provider of the gate service while the preset
+     rows kept waiting on it — all four Web presets stayed pending forever
+     and every new/resumed session failed with
+     `Unknown agent preset: standard`. The service now lives in the
+     separate always-on `bili-compaction-gate` entry: disabling or
+     kill-switching (`BILLION_CONTEXT_PLUGIN=0`) `bili-native` hands the
+     lane back to STOCK dsh behavior — presets boot normally and native
+     auto-compaction returns; compression is simply off. Do NOT disable
+     `bili-compaction-gate` itself — that re-creates the brick. To fully
+     uninstall, remove `billion-context` from the profile's
+     `dsh.profile.bundles` (and its dependency) and restart: the whole
+     patch layer disappears and `compaction-basic` returns to stock
+     `auto: true`. If you are stuck on a pre-#3662 version with the plugin
+     already disabled, upgrading self-heals (the patch layer mounts from
+     whatever package is listed in bundles, regardless of `bili-native`'s
+     state); the manual un-brick is appending four rows to the HOME-layer
+     patch `$DSH_HOME/cordis.patch.yml` (`~/.dsh/cordis.patch.yml` when
+     `DSH_HOME` is unset) — `- id: preset-standard` / `preset-ptc` /
+     `preset-minimal` / `preset-cordis`, each with `inject: null`. Top-level
+     keys are replaced wholesale, clearing the pending latch.
+   - **Global copy shadows the profile copy at load time (#2891):** dsh resolves
+    the bare `billion-context` name in `dsh.profile.bundles` installation-
+    anchor-first — from its own install tree (the global npm root) before the
+    profile's `node_modules`. So if a machine-global `billion-context` exists
+    alongside a profile-local one, dsh loads the GLOBAL copy and the profile's
+    is silently ignored — no crash, no log entry. When the two differ you may be
+    running a build different from what the profile declares (e.g. a pre-#1590
+    global lacks the `dsh.client` web face, so the settings-page menu just
+    vanishes). This is invisible everywhere by default: `bili doctor` now flags
+    any divergent global-vs-profile pair per profile (#2891); verify what dsh
+    actually loaded with `dsh --profile <name> --dump-config` (read the bundle's
+    `name:` line).
 
 Under a `bili dsh` launch the plugin ATTACHES to the launcher's proxy (no
 second spawn). Raw upstream URLs rewrite to `<proxy>/bili/<url>` like
@@ -95,8 +178,32 @@ spawn mode (a loopback proxy target is never proxied, so the MITM envs are
 simply bypassed); already-routed `/bili/`-prefixed requests pass through
 untouched except for header stamping. Known limitation: manual
 `/compact` has no dsh-side event hook, so its boundary is left to the
-kernel's natural ingest diff (auto-compaction is off in non-web profiles, so
-this is rare; see the #1772 caveat above for web profiles).
+kernel's natural ingest diff (auto-compaction is now off everywhere — host
+plane via the bundle patch, web-profile presets via the #3354 load-time
+overlay; see the web-profile note above).
+
+**Host-side context meters diverge from the model's view by design (#2837):**
+in plugin mode the host's durable session log
+deliberately stays lossless — the full unfolded history is re-sent for
+prefix-cache and strict-echo reasons (TECHNICAL-NOTES.md, "Two compression
+modes"). Any meter a host or its plugins compute from that local log therefore
+measures the UNFOLDED local surface, not what the next request actually
+carries — a local figure far above the real input while compression is active
+is expected, not a stuck compressor. The effective size is the proxy's: read
+`/acp` (or `GET /__bili/plugin/status` → `contextTokens`, provenance in
+`contextTokensSource`) instead of re-deriving it locally.
+
+**The dsh client ships a Context tab for this (#3862):** the native plugin
+registers a session-scoped `Context` tab in dsh's conversation view (right of
+Chat/Trajectory). It reads `GET /__bili/plugin/status` cross-origin from the
+dsh web app and renders the same breakdown the `/acp` panel computes live:
+the post-compression sent total against the window limit, category segments
+(system+tools / tools / text / code / summaries), the usage-grade billed
+anchor on its own labeled scale, and recent fold/switch events with reclaimed
+tokens. It refreshes every 10 s; when the running proxy predates this build
+the tab degrades to a restart notice plus an open-Web-UI button instead of
+guessing. Plain React from dsh's own runtime — no iframe, no added
+dependencies.
 
 ## Kimi Code (Moonshot)
 
@@ -152,6 +259,19 @@ small node scripts that do the work around the client:
   per-call `conversation_id` argument), and kimi's native auto-compaction is
   NOT pushed out — ACP compression simply fires first, as in launcher mode.
    Opt-out: `BILI_NATIVE_KIMI=0`.
+- **Model/provider switch leaves the proxy (#2954):** routing covers ONLY the
+  default model aliased at bootstrap (`bili-kimi`). A `/model` switch to any
+  other model or third-party provider bypasses bili entirely — no compression,
+  no stats — until a later session bootstraps on an alias again. Deliberate
+  blast-radius tradeoff of the single-alias design (#963): if the proxy dies,
+  only the aliased model is affected while every other model keeps working
+  direct; full multi-provider takeover would rewrite every user-owned
+  `[providers.*]` base_url in place, violating the managed-block "never touch
+  user content outside the markers" invariant. The alias itself inherits the
+  source model's `capabilities` / `support_efforts` / `default_effort`
+  verbatim (#2954), and every `[models.*]` window in config.toml reaches the
+  proxy at spawn (`BILI_LAUNCHER_MODEL_WINDOWS`) so per-request window
+  resolution stays accurate for whatever flows through.
 
 ## Hermes (Nous Research)
 
@@ -166,12 +286,20 @@ pure-stdlib Python module shipped inside the npm package:
   `__init__.py` into `~/.hermes/plugins/billion-context/`, writes a
   machine-owned `bili.json` sidecar pointing at the global bili install
   (`dist/index.js` + node path), and enables the plugin through hermes' own
-  channel (`hermes plugins enable billion-context` — if the CLI isn't on PATH
-  the same command is printed instead). Start a new hermes session to
-  activate. Remove with `bili plugin remove hermes`; refresh with
-  `bili plugin update hermes` after a global update.
-- **Lifecycle:** at load the plugin attaches to a healthy running proxy or
-  spawns its own on an ephemeral port (parent-pid watchdog tears it down when
+   channel (`hermes plugins enable billion-context` — if the CLI isn't on PATH
+   the same command is printed instead). Start a new hermes session to
+   activate. Remove with `bili plugin remove hermes`; refresh with
+   `bili plugin update hermes` after a global update. An installed or
+   refreshed plugin only takes effect in a **new** hermes session — the
+   injected code lives in the host process, so a running session keeps its old
+   copy until restarted (a still-running older proxy shows up as the usual
+   stale banner, see README Self-update).
+- **Lifecycle:** at load the plugin attaches to a healthy running proxy —
+  lane-aware since #2905: its own hermes-lane instance first, another
+  declared lane's instance NEVER (list it in `native.attachLanePriority` to
+  opt in), the 8787 user-zone daemon as last-resort fallback — or spawns its
+  own on an ephemeral port (declared `lane: hermes` so no other lane can ride
+  it; parent-pid watchdog tears it down when
   hermes exits; concurrent starts arbitrate through the same starting-marker
   protocol the launcher uses). Only once the proxy is verified healthy does it
   point hermes' httpx stack at it via `HTTPS_PROXY` / `https_proxy` +
@@ -184,11 +312,25 @@ pure-stdlib Python module shipped inside the npm package:
 - **Plugin-mode stamping:** an `llm_request` middleware stamps
   `x-bili-plugin: hermes` + conversation id (= the hermes session id, so
   gateway multi-session stays safe) + model, and `x-bili-plugin-max-output`
-  once known — ONLY after the ACP tools are registered against the live proxy
-  manifest; round 1 rides wire mode. A `pre_api_request` hook captures the
-  effective `max_tokens` and pushes runtime-info (model + max output) to the
-  proxy. `compress` / `decompress` / `acp_status` are registered as real
-  hermes tools served by the proxy's existing plugin endpoints.
+  once known — plus `x-bili-plugin-context-window` when the host's own
+  per-model window is known (read from `HERMES_HOME/context_length_cache.yaml`,
+  keyed `<model>@<base_url>`; ambiguous entries are never guessed, #3261) —
+  ONLY after the ACP tools are registered against the live proxy manifest;
+  round 1 rides wire mode. A `pre_api_request` hook captures the effective
+  `max_tokens` and pushes runtime-info (model + max output + context window)
+   to the proxy. `compress` / `decompress` / `acp_status` are registered as
+   real hermes tools served by the proxy's existing plugin endpoints.
+- **In-session commands (#3697):** the plugin registers `/acp` and
+  `/acp-cache` through hermes' `PluginContext.register_command`, so they show
+  up in slash-command help/completion like any built-in. `/acp` renders this
+  session's ACP status panel straight from the proxy (version + build in the
+  header); when the host can't name the current session it falls back to the
+  most recently active one and says so on the first line. `/acp-cache` prints
+  the same cache report as the `acp_cache` tool. This is NOT hermes' own
+  `hermes acp` CLI subcommand (an ACP client entry point) — different surface,
+  unrelated feature. Command registration needs `register_command` on the host
+  (present in the 2026.9.x builds); older builds skip just the two commands
+  while the tools keep working.
 - **Known limitations:** requests going out hermes' Codex-wire transport may
   drop the per-request header surface, so such setups stay in wire mode until
   that transport exposes headers. Inert when `BILLION_CONTEXT_PROXY` is set
@@ -323,6 +465,20 @@ two small node scripts that do the work around the client:
 
 ## Codex (OpenAI Codex CLI)
 
+**Temporary catalog outages (#3993).** For authenticated `GET https://chatgpt.com/backend-api/codex/models` requests routed through Bili, a last-valid complete catalog can cover transport failures and HTTP 500/502/503/504. This prevents transient discovery failure from discarding Codex's known context/tool capabilities. The private cache is under the existing XDG cache directory (`codex-model-catalog-v1`); it is isolated by full URL/client version and credential/account/org/project fingerprints, contains no raw credentials, and is limited to 1 MiB per catalog, 16 entries and six hours. Online discovery always takes precedence; offline hits do not extend age. With a usable cache the network/body deadline is four seconds. Caller cancellation, 401/403, other explicit errors and invalid/empty catalogs do not become cached success. Cold, expired or changed-credential requests still need successful discovery. Offline replay does not clear the upstream circuit or prove inference reachability. No inference payload, compression mode or configured context limit is changed.
+
+**Window alignment.** Client-reported plugin/runtime windows and launcher windows
+take precedence over the bundled Codex model table. Without a report, a local
+proxy reads `models_cache.json` and the base `config.toml` under its `CODEX_HOME`
+(default `~/.codex`); `model_context_window` is capped by the matching model's
+`max_context_window`, then reduced by `effective_context_window_percent` (Codex's
+default is 95). Cache changes are picked up on subsequent requests. Missing,
+unreadable or invalid metadata falls back to the bundled table and its existing
+272K unknown-model limit. For a remote proxy or a different client profile, pass
+the client's window through the existing launcher/runtime reporting mechanism
+or set the existing `compress.modelContextLimit`; the proxy's local cache is not
+evidence of another machine's configuration. Output headroom still applies.
+
 Codex is the one client a plugin install cannot make self-sufficient. The seam
 matrix explains why: claude has a `SessionStart` hook + managed settings block,
 zcode has a provider store whose `baseURL` can be rewritten — codex has neither.
@@ -338,6 +494,8 @@ so the plugin can never route codex's own traffic. Three postures:
 | `bili codex` (launcher) | Full zero-config: a self-managed lane proxy (#1660 zone, sticky port) + cert-MITM env injected into codex — tools *and* compression |
 | `bili plugin install codex` + a running bili + self-exported `HTTPS_PROXY` | Tools + compression for power users who manage their own env |
 | `bili plugin install codex` alone | The four tools appear in codex but no conversation is proxied, so there is nothing for them to act on; `tools/list` fails with -32003 (`bili proxy unreachable … — start bili or set BILI_MCP_PROXY`) when nothing is reachable |
+
+**Concurrent sessions (#3203).** Several `bili codex` launches may run at once in the same project directory with the same `CODEX_HOME`: each launch takes its own per-session overlay slot (`<CODEX_HOME>-bili-s<N>`, pool of 16) and its own lane proxy, so routing, MCP conversation binding, and compression state never cross between sessions. With the shared-state default (codex ≥ 0.147.0) both sessions' history lands in the ONE live state db in the real home and survives any exit order — see `BILI_CODEX_STATE_MODE` in CONFIGURATION.md. Older binaries, or `BILI_CODEX_STATE_MODE=legacy`, keep one exclusive overlay per home: the second concurrent launch is refused with `BILI_OVERLAY_BUSY`.
 
 The install writes a single `[mcp_servers.bili]` block into `~/.codex/config.toml`
 (command = node, args = dist/mcp.js). #1660 removed the install-time origin bake
@@ -423,6 +581,16 @@ corpus — empty arg, plain spaces, embedded quotes, TOML `-c` values, JSON,
 Unicode, trailing backslashes, `%COMSPEC%`, `!VAR!`, `&|<>^()` — arrives at the
 child process item-by-item identical to the caller array.
 
+### Composer predictions (Codex Desktop): custom-provider threads are ineligible (#3408)
+
+Codex Desktop's Composer-prediction feature has a **client-side eligibility gate** that runs before any prediction request could reach billion-context: it checks the resumed source thread's *actual* provider and requires the built-in `openai` provider — any other provider selects `unsupported_provider` and the client returns without generating a prediction (static inspection of Desktop 26.1013.3656.0, #3408). The gate reads the *thread's* provider, not the current global default: the prediction path forks the source thread in a special prediction mode whose call supplies no independent prediction provider, so changing the global default does not re-qualify an existing thread. Consequences:
+
+- **Custom-provider threads never show predictions** — by design of the client, not a bili defect. No prediction request ever reaches the proxy, so there is nothing on the bili side to fix or configure; absence of gateway traffic for a prediction is expected, not evidence of a dropped request.
+- **Provider-preserving transport keeps eligibility intact mechanically.** Cert-MITM routing (the `HTTPS_PROXY` + `SSL_CERT_FILE` the `bili codex` launcher injects) intercepts below the provider layer: codex's own config and provider selection are untouched, so the thread keeps its built-in `openai` provider identity and official ChatGPT auth — exactly what the gate reads. Runtime confirmation on a Desktop build is still pending (no matched A/B yet); if you can confirm or refute predictions under this transport on Desktop, report back in #3408.
+- **No supported configuration restores predictions on custom-provider threads.** Any route through a custom `model_providers` entry — API-key auth, third-party one-click installs included — sits on the ineligible side of the gate by construction (such entries also drop the subscription login, above). Renaming a custom provider to impersonate `openai`, or patching the client's eligibility check, is unsupported and will not be documented as a workaround.
+
+Rule of thumb: need predictions → stay on the built-in OpenAI provider route; need a custom provider → accept that predictions will not appear in those threads.
+
 ## Gemini family (Gemini CLI / iFlow CLI / Qwen Code / Antigravity)
 
 Four launchers for the gemini-cli architecture family (#1043 tier 1). Three of
@@ -460,9 +628,10 @@ the four have a base-URL env hook; one doesn't:
   override (verified in the v2.19.1 binary: *"Overriding CloudCodeServerURL
   via CLOUD_CODE_URL environment variable"*) — same shape as the gemini-cli
   base-URL hook. The launcher sets
-  `CLOUD_CODE_URL=<proxy>/bili/<upstream>` (default upstream
-  `https://cloudcode-pa.googleapis.com`; if you export your own
-  `CLOUD_CODE_URL`, that value is relayed through the proxy instead). No MITM,
+   `CLOUD_CODE_URL=<proxy>/bili/<upstream>` (default upstream
+   `https://daily-cloudcode-pa.googleapis.com` — Antigravity's real default;
+   the bare `cloudcode-pa` host 400s on `/v1internal:*`, #3129; if you export
+   your own `CLOUD_CODE_URL`, that value is relayed through the proxy instead). No MITM,
   no CA install. The proxy recognizes the wire **by path**:
   `:streamGenerateContent` / `:generateContent` / `:countTokens` requests are
   routed to the Google-native adapter and compressed like `bili gemini`. If
@@ -470,9 +639,11 @@ the four have a base-URL env hook; one doesn't:
   (`/google.internal.cloud.code.v1internal.CloudCode/*`), those requests are
   not recognized and relay verbatim without compression — a graceful degrade,
   fixable with a per-lane `protocol` declaration (#1909) once confirmed.
-  Fallback if Google ever removes the env hook: cert-MITM — the
-  language_server honors `HTTPS_PROXY` and does not pin certificates, so add
-  `cloudcode-pa.googleapis.com` to `"mitm".domains` and trust bili's root CA.
+   Fallback if Google ever removes the env hook: cert-MITM — the
+   language_server honors `HTTPS_PROXY` and does not pin certificates, so add
+   `daily-cloudcode-pa.googleapis.com` (Antigravity's real default endpoint;
+   the bare `cloudcode-pa` name 400s on `/v1internal:*`, #3129) to
+   `"mitm".domains` and trust bili's root CA.
   The desktop app and the IDE extension share this same language_server
   channel; the launcher drives the CLI specifically — desktop users can export
   `CLOUD_CODE_URL` manually or use the MITM recipe.
@@ -593,9 +764,12 @@ Caveats worth knowing:
   `delegate` lists `read,grep,find,ls,bash,edit,write,contact_supervisor`) —
   no longer loses interactive compression after the #2185 named-plugin fix.
   bili detects such children per request (pi-subagents stamps every child
-  session's system prompt with an `<active_agent name="…">` marker; the gate
-  also requires the request's tools array to expose none of the names bili
-  would inject) and serves them through the **proxy-style compression
+  session's system prompt with a complete `<active_agent name="…">` marker;
+  detection is scoped to the system-prompt carriers, so a main session whose
+  history merely quotes the marker keeps its own channel (#2694); the gate
+  also requires the request's tools array — including namespace-wrapped
+  declarations — to expose none of the names bili would inject) and serves
+  them through the **proxy-style compression
   channel**: wire-injected ACP tools + nudge, server-side execution,
   `acp_summary` carrier — while keeping the named plugin-session identity
   from #2185. No configuration change required; the role's original allowlist
@@ -616,6 +790,26 @@ Caveats worth knowing:
   proxy mode (`pfa-*`) to named plugin mode (child session id + parent
   lineage). Strictly more information, but anything keyed on `pfa-*`
   identities will observe different ids.
+
+## Kiro CLI (AWS)
+
+`bili kiro [opts --] [args]` starts a proxy and launches `kiro-cli` (resolved from `PATH`, else `~/.local/bin/kiro-cli`; `BILI_CLIENT_BIN` overrides). Everything after `--` goes to `kiro-cli`, e.g. `bili kiro -- chat --resume`.
+
+**How Kiro talks to its model (observed on kiro-cli 2.37).** The agent's model calls are the **OpenAI Responses wire**: `POST https://runtime.<region>.kiro.dev/v1/responses` with `{ model, input, tools, stream, origin, profileArn, metadata }`, streamed back as `text/event-stream`. Kiro replays the **full history every turn** (its system prompt rides `input[0]` as a `user` item), authenticates with a bearer token (no body signature, so a rewritten body stays valid), and honors `HTTPS_PROXY`. Its other runtime calls (`KiroRuntimeService.*`, AWS-JSON at `/`) are not a model wire and are relayed byte-for-byte; they show up once as an "unrecognized path" in the log, which is expected.
+
+**What the lane does.**
+
+- **cert-MITM, model gateways only:** `runtime.us-east-1`, `runtime.eu-central-1`, `runtime.us-gov-east-1`, `runtime.us-gov-west-1` (`.kiro.dev`). Management, auth and telemetry hosts stay blind-tunneled. Add others with `--mitm-domain`.
+- **CA:** the combined bundle on both `SSL_CERT_FILE` (the Rust shell's rustls *replaces* its roots, so system roots must ride along) and `NODE_EXTRA_CA_CERTS` (the bundled Node agent server, additive). `NO_PROXY` keeps loopback (the local agent server, MCP servers) direct.
+- **Roles (built-in compat):** the gateway accepts only `user` / `assistant` message items. bili's injected compress prompt is a `developer` item, which the gateway rejects with `400 This request contains parameters or input that are not supported` (`param: input[0]`); `system` fails the same way. For Kiro traffic (User-Agent `KiroCLI/…` or `x-amzn-kiro-origin`, on a `runtime.*.kiro.dev` host) bili re-voices `developer`/`system` → `user` automatically. Lowest precedence: `compat.roles` in your config and learned roles still win per key. The invariant judge sees the injected prompt with its original role, so no false I1 warning.
+- **Session identity:** Kiro's first item (its system prompt) is not byte-stable across processes, so content-prefix affinity would mint a fresh session for every `kiro-cli chat --resume`. bili promotes `metadata["kiro:conversation_id"]` to the session id (`kiro-<id>`, only over a content fingerprint, never over a real conversation header / `session_id` / `prompt_cache_key`), so compression state survives resumes.
+
+**Notes.**
+
+- Kiro's own auto-compaction stays on as a backstop; bili folds earlier, so it rarely triggers. To rely on bili alone: `kiro-cli settings chat.disableAutoCompaction true` (global Kiro setting; undo with `false`).
+- Kiro's stream carries no usage report, so nudge decisions use bili's local token estimates (`upstream success without usage report` in the log is expected).
+- Kiro's `reasoning` items are signed (`encrypted_content`) and are kept verbatim; they fold away with their turn.
+- Manual setup without the launcher: run `bili` with `BILI_MITM_DOMAINS=runtime.us-east-1.kiro.dev`, then start `kiro-cli` with `HTTPS_PROXY=http://127.0.0.1:8787`, `SSL_CERT_FILE` and `NODE_EXTRA_CA_CERTS` pointing at `~/.local/share/billion-context/ca/combined-ca.pem`.
 
 ## Adopting unlisted clients (any client with a configurable model base URL) (#2340)
 

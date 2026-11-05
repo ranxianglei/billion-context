@@ -39,10 +39,15 @@ export const PACKAGE_NAME = readPkgField("name", "billion-context");
  *  / dist without build-info.json). A host that owns no console (dsh desktop /
  *  Electron) makes Windows allocate a NEW console window for any unhidden
  *  console child — same failure domain as #2439/#2440. windowsHide is a
- *  documented no-op off Windows. Exported pure so tests can pin it without
- *  touching git. */
-export function gitFallbackExecOptions(): { encoding: BufferEncoding; timeout: number; windowsHide: boolean } {
-    return { encoding: "utf8", timeout: 10_000, windowsHide: true };
+ *  documented no-op off Windows. #2834: explicit stdio — an npm install lives
+ *  outside any git checkout, so the probe fails there by design; without an
+ *  explicit stdio Node forwards the failed child's locale-localized "fatal:"
+ *  stderr onto the host terminal at every module load. stdout stays piped
+ *  (it carries the commit hash), stderr is ignored (the catch already degrades
+ *  to "unknown" — the message adds nothing). Exported pure so tests can pin it
+ *  without touching git. */
+export function gitFallbackExecOptions(): { encoding: BufferEncoding; timeout: number; windowsHide: boolean; stdio: ["ignore", "pipe", "ignore"] } {
+    return { encoding: "utf8", timeout: 10_000, windowsHide: true, stdio: ["ignore", "pipe", "ignore"] };
 }
 
 let cachedCommit: string | undefined;

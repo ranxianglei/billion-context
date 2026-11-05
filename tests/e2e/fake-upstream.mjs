@@ -15,6 +15,7 @@ const PORT = Number(process.env.FAKE_PORT || 8199);
 const HOST = process.env.FAKE_HOST || "127.0.0.1";
 const REQLOG = process.env.FAKE_REQLOG || path.join(process.cwd(), "tmp", "fake-requests.jsonl");
 const MODEL = process.env.FAKE_MODEL || "qwen3.8-27b";
+const NATIVE_TOOL = (process.env.FAKE_NATIVE_TOOL || "").trim();
 try { fs.mkdirSync(path.dirname(REQLOG), { recursive: true }); } catch { /* noop */ }
 
 let n = 0;
@@ -74,6 +75,36 @@ function isSummaryRequest(parsed) {
 	return /must be compressed because the session context exceeds|Write a \*?\*?(tier-1|\d+-tier) compression summary/.test(ins);
 }
 
+function nativeToolCall(parsed) {
+	if (!NATIVE_TOOL || isSummaryRequest(parsed)) return null;
+	const tools = Array.isArray(parsed.tools) ? parsed.tools : [];
+	if (!tools.some((tool) => tool?.name === "compress")) return null;
+	if ((parsed.input || []).some((item) => item?.type === "function_call_output")) return null;
+	return { callId: `call_native_${++n}`, name: NATIVE_TOOL, arguments: "{}" };
+}
+
+function functionCallEvents(call, inTok) {
+	const id = uid();
+	const itemId = `fc_${id}`;
+	const item = {
+		type: "function_call",
+		id: itemId,
+		call_id: call.callId,
+		name: call.name,
+		arguments: call.arguments,
+		status: "completed",
+	};
+	const outTok = estOut(call.arguments);
+	return [
+		["response.created", { type: "response.created", response: { id, status: "in_progress", output: [] } }],
+		["response.output_item.added", { type: "response.output_item.added", output_index: 0, item: { ...item, arguments: "" } }],
+		["response.function_call_arguments.delta", { type: "response.function_call_arguments.delta", item_id: itemId, output_index: 0, delta: call.arguments }],
+		["response.function_call_arguments.done", { type: "response.function_call_arguments.done", item_id: itemId, output_index: 0, arguments: call.arguments }],
+		["response.output_item.done", { type: "response.output_item.done", output_index: 0, item }],
+		["response.completed", { type: "response.completed", response: { id, status: "completed", output: [item], usage: { input_tokens: inTok, output_tokens: outTok, total_tokens: inTok + outTok } } }],
+	];
+}
+
 function messageEvents(text, inTok) {
 	const id = uid();
 	const msgId = `msg_${id}`;
@@ -106,6 +137,27 @@ function jsonResponse(res, text, inTok) {
 	}));
 }
 
+function functionCallJsonResponse(res, call, inTok) {
+	const id = uid();
+	const item = {
+		type: "function_call",
+		id: `fc_${id}`,
+		call_id: call.callId,
+		name: call.name,
+		arguments: call.arguments,
+		status: "completed",
+	};
+	res.writeHead(200, { "content-type": "application/json" });
+	res.end(JSON.stringify({
+		id,
+		object: "response",
+		status: "completed",
+		model: MODEL,
+		output: [item],
+		usage: { input_tokens: inTok, output_tokens: estOut(call.arguments), total_tokens: inTok + estOut(call.arguments) },
+	}));
+}
+
 const server = http.createServer((req, res) => {
 	try {
 		if (req.method === "GET" && /\/models$/.test(req.url)) {
@@ -120,15 +172,31 @@ const server = http.createServer((req, res) => {
 				let parsed = {};
 				try { parsed = JSON.parse(raw || "{}"); } catch { /* noop */ }
 				const summary = isSummaryRequest(parsed);
+				const nativeCall = nativeToolCall(parsed);
 				let text;
 				if (summary) text = buildFakeSummary(allInputText(parsed.input));
 				else text = answerFor(lastUserText(parsed.input));
 				try {
 					const ins = typeof parsed.instructions === "string" ? parsed.instructions : "";
-					fs.appendFileSync(REQLOG, JSON.stringify({ t: Date.now(), model: parsed.model, stream: !!parsed.stream, isSummary: summary, inputLen: raw.length, insLen: ins.length, input: parsed.input }) + "\n");
+					fs.appendFileSync(REQLOG, JSON.stringify({
+						t: Date.now(),
+						model: parsed.model,
+						stream: !!parsed.stream,
+						isSummary: summary,
+						inputLen: raw.length,
+						insLen: ins.length,
+						plugin: req.headers["x-bili-plugin"] ?? null,
+						tools: (parsed.tools || []).map((tool) => tool?.name),
+						nativeTool: nativeCall?.name ?? null,
+						functionCallOutputs: (parsed.input || [])
+							.filter((item) => item?.type === "function_call_output")
+							.map((item) => ({ callId: item.call_id, output: item.output })),
+						input: parsed.input,
+					}) + "\n");
 				} catch { /* noop */ }
 				const inTok = estIn(raw);
-				if (parsed.stream) sse(res, messageEvents(text, inTok));
+				if (parsed.stream) sse(res, nativeCall ? functionCallEvents(nativeCall, inTok) : messageEvents(text, inTok));
+				else if (nativeCall) functionCallJsonResponse(res, nativeCall, inTok);
 				else jsonResponse(res, text, inTok);
 			});
 			return;

@@ -1,6 +1,24 @@
 import assert from "node:assert/strict";
-import test from "node:test";
+import { AsyncLocalStorage } from "node:async_hooks";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { after, test } from "node:test";
 import { installNativeFetchIntercept, type NativeInterceptState } from "../src/agent/native-intercept.js";
+
+// #2827: the fetch-chain diagnostics now land in the shared bili.log instead
+// of the terminal. Keep this whole suite hermetic: point XDG_STATE_HOME at a
+// throwaway dir for the life of the file (node --test runs each file in its
+// own process) so no test event ever reaches a developer's real log file.
+const STATE_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "bili-selfheal-state-"));
+const PREV_XDG_STATE_HOME = process.env.XDG_STATE_HOME;
+process.env.XDG_STATE_HOME = STATE_ROOT;
+const CHAIN_LOG_FILE = path.join(STATE_ROOT, "billion-context", "bili.log");
+after(() => {
+    if (PREV_XDG_STATE_HOME === undefined) delete process.env.XDG_STATE_HOME;
+    else process.env.XDG_STATE_HOME = PREV_XDG_STATE_HOME;
+    fs.rmSync(STATE_ROOT, { recursive: true, force: true });
+});
 
 function fakeFetch(sink: string[]) {
     return (async (input: string | URL | Request, _init?: RequestInit) => {
@@ -118,8 +136,11 @@ async function withScope<T>(anchor: typeof fetch, fn: (ctx: { scope: ReturnType<
         const result = await fn({ scope, sink });
         return { sink, result };
     } finally {
-        globalThis.fetch = saved;
+        // Reset BEFORE restoring ambient fetch: otherwise the restore routes
+        // through the live #1158 guard and emits a spurious third-party-install
+        // diagnostic for pure test teardown (#2685).
         _resetForTest();
+        globalThis.fetch = saved;
     }
 }
 
@@ -344,4 +365,279 @@ test("#1662: a steady-state foreign wrapper wrapping bili's chain stays in the c
     // top link), and the request reached the native fetch exactly once.
     assert.deepEqual(seenByWrapper, ["http://127.0.0.1:40001/bili/http://127.0.0.1:8199/v1/messages"]);
     assert.deepEqual(nativeSink, ["http://127.0.0.1:40001/bili/http://127.0.0.1:8199/v1/messages"]);
+});
+
+// Mirrors pi-web-access's marker, install guard, scoped proxy and loopback bypass.
+function webAccessProxy() {
+    const proxy = new AsyncLocalStorage<boolean>();
+    let installs = 0;
+    let calls = 0;
+    return {
+        get installs() { return installs; },
+        get calls() { return calls; },
+        install() {
+            const base = globalThis.fetch;
+            if (Reflect.get(base, "__piWebAccessProxyFetch") === true) return;
+            const wrapper = (async (input: string | URL | Request, init?: RequestInit) => {
+                calls++;
+                const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
+                if (proxy.getStore() && url.hostname !== "127.0.0.1") return new Response("via-web-proxy");
+                return base(input, init);
+            }) as typeof fetch;
+            Object.defineProperty(wrapper, "__piWebAccessProxyFetch", { value: true });
+            installs++;
+            globalThis.fetch = wrapper;
+        },
+        run<T>(fn: () => T): T {
+            this.install();
+            return proxy.run(true, fn);
+        },
+    };
+}
+
+for (const first of ["bili", "web-access"]) {
+    test(`pi-web-access: ${first} installs first, 1000 proxy scopes keep one wrapper and routing`, async () => {
+        const nativeSink: string[] = [];
+        await withScope(fakeFetch(nativeSink), async () => {
+            const web = webAccessProxy();
+            if (first === "web-access") web.install();
+            const decisions: string[] = [];
+            installNativeFetchIntercept({
+                origin: "http://127.0.0.1:40001", ready: Promise.resolve("http://127.0.0.1:40001"),
+                onDispatch: (_url, action) => { decisions.push(action); },
+            });
+            web.install();
+            const top = globalThis.fetch;
+            assert.equal(Reflect.get(top, "__piWebAccessProxyFetch"), true);
+            for (let i = 0; i < 1000; i++) {
+                assert.equal(await web.run(() => globalThis.fetch("https://example.invalid/article")).then(r => r.text()), "via-web-proxy");
+                assert.equal(globalThis.fetch, top);
+            }
+            await web.run(() => globalThis.fetch("https://api.example.invalid/v1/messages", { method: "POST" }));
+            await globalThis.fetch("https://example.invalid/direct");
+            assert.equal(web.installs, 1);
+            assert.equal(web.calls, 1002);
+            assert.deepEqual(decisions.filter(action => action === "rewrite"), ["rewrite"]);
+        });
+        assert.deepEqual(nativeSink, [
+            "http://127.0.0.1:40001/bili/https://api.example.invalid/v1/messages",
+            "https://example.invalid/direct",
+        ]);
+    });
+}
+
+test("pi-web-access: preserve an older proxy wrapper and still truncate unknown history beneath it", async () => {
+    const nativeSink: string[] = [];
+    await withScope(fakeFetch(nativeSink), async () => {
+        installNativeFetchIntercept({ origin: "http://127.0.0.1:40001", ready: Promise.resolve("http://127.0.0.1:40001") });
+        let unknownCalls = 0;
+        for (let i = 0; i < 16000; i++) {
+            const base = globalThis.fetch;
+            globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+                unknownCalls++;
+                return base(input, init);
+            }) as typeof fetch;
+        }
+        const web = webAccessProxy();
+        web.install();
+        await web.run(async () => {
+            const base = globalThis.fetch;
+            globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => base(input, init)) as typeof fetch;
+            const response = await globalThis.fetch("https://example.invalid/article");
+            assert.equal(await response.text(), "via-web-proxy");
+            assert.equal(web.installs, 1);
+            await globalThis.fetch("https://api.example.invalid/v1/messages", { method: "POST" });
+        });
+        assert.equal(web.calls, 2);
+        assert.equal(unknownCalls, 0);
+    });
+    assert.deepEqual(nativeSink, ["http://127.0.0.1:40001/bili/https://api.example.invalid/v1/messages"]);
+});
+
+test("pi-web-access: the marker follows the live downstream after a dead closure is re-anchored", async () => {
+    const nativeSink: string[] = [];
+    await withScope(fakeFetch(nativeSink), async ({ scope }) => {
+        scope.open();
+        Object.defineProperty(globalThis.fetch, "__piWebAccessProxyFetch", { value: true });
+        let respawns = 0;
+        installNativeFetchIntercept({
+            origin: "http://127.0.0.1:40001", ready: Promise.resolve("http://127.0.0.1:40001"),
+            respawn: async () => { respawns++; return undefined; },
+        });
+        const top = globalThis.fetch;
+        assert.equal(Reflect.get(top, "__piWebAccessProxyFetch"), true);
+        scope.close();
+        await top("https://api.example.invalid/v1/messages", { method: "POST" });
+        assert.notEqual(Reflect.get(top, "__piWebAccessProxyFetch"), true);
+        const web = webAccessProxy();
+        web.install();
+        assert.equal(await web.run(() => globalThis.fetch("https://example.invalid/article")).then(r => r.text()), "via-web-proxy");
+        assert.equal(web.installs, 1);
+        assert.equal(respawns, 0);
+    });
+    assert.deepEqual(nativeSink, ["http://127.0.0.1:40001/bili/https://api.example.invalid/v1/messages"]);
+});
+
+// #2685/#2827: diagnostics-only refinement of the #1158 third-party-install
+// notice. A recognized pi-web-access FIRST install is a supported coexistence
+// handshake (its own guard makes it the only one, #2435) — it must not read as
+// an "evict attempt" fault. Unknown wrappers and any LATER (repeat/abnormal)
+// marked install keep the full diagnostic.
+// #2827 moved EVERY one of these events off stdout/stderr: they fire inside
+// the host agent process where the terminal IS the interactive TUI, so a
+// console write lands on the physical screen and pollutes the input box until
+// the next redraw. The events now go to the shared bili.log — severity +
+// wording are pinned against the FILE below, and TUI safety is pinned as zero
+// bili bytes on console AND on the raw process streams. The routing machinery
+// itself is covered by the suites above.
+function withDiagnosticsCapture<T>(fn: () => Promise<T> | T): Promise<{ result: T; warns: string[]; logs: string[]; errors: string[]; out: string[]; err: string[]; lines: string[] }> {
+    const warns: string[] = [];
+    const logs: string[] = [];
+    const errors: string[] = [];
+    const out: string[] = [];
+    const err: string[] = [];
+    const origWarn = console.warn;
+    const origLog = console.log;
+    const origError = console.error;
+    const origOutWrite = process.stdout.write;
+    const origErrWrite = process.stderr.write;
+    fs.mkdirSync(path.dirname(CHAIN_LOG_FILE), { recursive: true });
+    fs.writeFileSync(CHAIN_LOG_FILE, "");
+    console.warn = (...args: unknown[]) => { warns.push(args.map((a) => String(a)).join(" ")); };
+    console.log = (...args: unknown[]) => { logs.push(args.map((a) => String(a)).join(" ")); };
+    console.error = (...args: unknown[]) => { errors.push(args.map((a) => String(a)).join(" ")); };
+    process.stdout.write = ((chunk: unknown) => { out.push(String(chunk)); return true; }) as typeof process.stdout.write;
+    process.stderr.write = ((chunk: unknown) => { err.push(String(chunk)); return true; }) as typeof process.stderr.write;
+    return Promise.resolve(fn()).then((result) => ({
+        result, warns, logs, errors, out, err,
+        lines: fs.readFileSync(CHAIN_LOG_FILE, "utf8").split("\n").filter((l) => l.length > 0),
+    })).finally(() => {
+        console.warn = origWarn;
+        console.log = origLog;
+        console.error = origError;
+        process.stdout.write = origOutWrite;
+        process.stderr.write = origErrWrite;
+    });
+}
+
+/** #2827 TUI-safety assertion: no bili diagnostic may reach the host terminal
+ *  through ANY channel (console methods or raw stream writes). */
+function assertNoTerminalBili(out: string[], err: string[]): void {
+    const terminal = [...out, ...err].join("");
+    assert.ok(!terminal.includes("[bili-native]"), `terminal streams received bili diagnostics: ${terminal}`);
+}
+
+test("#2685: bili-first — supported first web-access install is quietly adopted (proxy runs, model routed once)", async () => {
+    const nativeSink: string[] = [];
+    const decisions: string[] = [];
+    const { warns, logs, errors, out, err, lines } = await withDiagnosticsCapture(async () => {
+        await withScope(fakeFetch(nativeSink), async () => {
+            installNativeFetchIntercept({
+                origin: "http://127.0.0.1:40001", ready: Promise.resolve("http://127.0.0.1:40001"),
+                onDispatch: (_url, action) => { decisions.push(action); },
+            });
+            const web = webAccessProxy();
+            web.install();
+            assert.equal(web.installs, 1);
+            assert.equal(await web.run(() => globalThis.fetch("https://example.invalid/article")).then(r => r.text()), "via-web-proxy");
+            await globalThis.fetch("https://api.example.invalid/v1/messages", { method: "POST" });
+        });
+    });
+    assert.equal(warns.length, 0);
+    assert.equal(logs.length, 0);
+    assert.equal(errors.length, 0);
+    assertNoTerminalBili(out, err);
+    assert.ok(lines.some(l => l.includes("[info]") && l.includes("[native-client]") && l.includes("adopted pi-web-access proxy fetch as downstream")));
+    assert.deepEqual(decisions.filter(a => a === "rewrite"), ["rewrite"]);
+    assert.deepEqual(nativeSink, ["http://127.0.0.1:40001/bili/https://api.example.invalid/v1/messages"]);
+});
+
+test("#2685: web-access-first — normal first coexistence emits no third-party-install warning", async () => {
+    const nativeSink: string[] = [];
+    const { warns, logs, errors, out, err, lines } = await withDiagnosticsCapture(async () => {
+        await withScope(fakeFetch(nativeSink), async () => {
+            const web = webAccessProxy();
+            web.install();
+            installNativeFetchIntercept({ origin: "http://127.0.0.1:40001", ready: Promise.resolve("http://127.0.0.1:40001") });
+            assert.equal(web.installs, 1);
+            // bili adopts the existing marked wrapper as its initial downstream
+            // (no setter write happens), so no third-party-install notice fires.
+            await globalThis.fetch("https://api.example.invalid/v1/messages", { method: "POST" });
+        });
+    });
+    assert.equal(warns.length, 0);
+    assert.equal(logs.length, 0);
+    assert.equal(errors.length, 0);
+    assertNoTerminalBili(out, err);
+    assert.equal(lines.filter(l => l.includes("[native-client]")).length, 0);
+    assert.deepEqual(nativeSink, ["http://127.0.0.1:40001/bili/https://api.example.invalid/v1/messages"]);
+});
+
+test("#2685: unknown third-party install still warns, with neutral 'install N' wording (no 'evict')", async () => {
+    const nativeSink: string[] = [];
+    const { warns, logs, errors, out, err, lines } = await withDiagnosticsCapture(async () => {
+        await withScope(fakeFetch(nativeSink), async () => {
+            installNativeFetchIntercept({ origin: "http://127.0.0.1:40001", ready: Promise.resolve("http://127.0.0.1:40001") });
+            globalThis.fetch = fakeFetch([]);
+        });
+    });
+    assert.equal(warns.length, 0);
+    assert.equal(logs.length, 0);
+    assert.equal(errors.length, 0);
+    assertNoTerminalBili(out, err);
+    const diag = lines.filter(l => l.includes("[native-client]"));
+    assert.equal(diag.length, 1);
+    assert.match(diag[0], /\[warn\]/);
+    assert.match(diag[0], /third-party globalThis\.fetch install detected \(#1158\)/);
+    assert.match(diag[0], /install 1/);
+    assert.doesNotMatch(diag[0], /evict/i);
+});
+
+test("#2685: a SECOND marked install still warns — the compat marker never blanket-suppresses the diagnostic", async () => {
+    const nativeSink: string[] = [];
+    const { warns, logs, errors, out, err, lines } = await withDiagnosticsCapture(async () => {
+        await withScope(fakeFetch(nativeSink), async () => {
+            installNativeFetchIntercept({ origin: "http://127.0.0.1:40001", ready: Promise.resolve("http://127.0.0.1:40001") });
+            const mark = (base: typeof fetch) => {
+                const w = (async (input: string | URL | Request, init?: RequestInit) => base(input, init)) as typeof fetch;
+                Object.defineProperty(w, "__piWebAccessProxyFetch", { value: true });
+                return w;
+            };
+            globalThis.fetch = mark(globalThis.fetch); // first marked → quiet adopt note
+            globalThis.fetch = mark(globalThis.fetch); // second marked → must warn
+        });
+    });
+    assert.equal(warns.length, 0);
+    assert.equal(logs.length, 0);
+    assert.equal(errors.length, 0);
+    assertNoTerminalBili(out, err);
+    const diags = lines.filter(l => l.includes("[native-client]"));
+    assert.equal(diags.length, 2);
+    assert.ok(diags.some(l => l.includes("[info]") && l.includes("adopted pi-web-access proxy fetch as downstream")));
+    const warnLine = diags.find(l => l.includes("[warn]"));
+    assert.notEqual(warnLine, undefined);
+    assert.match(warnLine!, /third-party globalThis\.fetch install detected \(#1158\)/);
+    assert.doesNotMatch(warnLine!, /evict/i);
+});
+
+test("#2827: first web-access adoption writes nothing to the host terminal and repeat proxy scopes stay quiet", async () => {
+    const nativeSink: string[] = [];
+    const { out, err, lines } = await withDiagnosticsCapture(async () => {
+        await withScope(fakeFetch(nativeSink), async () => {
+            installNativeFetchIntercept({ origin: "http://127.0.0.1:40001", ready: Promise.resolve("http://127.0.0.1:40001") });
+            const web = webAccessProxy();
+            // First proxy use installs the wrapper → the adopt event fires here.
+            assert.equal(await web.run(() => globalThis.fetch("https://example.invalid/article")).then(r => r.text()), "via-web-proxy");
+            // Repeat ordinary proxy-scope calls must not re-emit anything.
+            for (let i = 0; i < 3; i++) {
+                assert.equal(await web.run(() => globalThis.fetch("https://example.invalid/article")).then(r => r.text()), "via-web-proxy");
+            }
+            await globalThis.fetch("https://api.example.invalid/v1/messages", { method: "POST" });
+        });
+    });
+    assertNoTerminalBili(out, err);
+    const diags = lines.filter(l => l.includes("[native-client]"));
+    assert.equal(diags.length, 1);
+    assert.match(diags[0], /\[info\] \[v=[^\]]+\] \[native-client\] \[bili-native\] adopted pi-web-access proxy fetch as downstream \(supported coexistence, #2435\)/);
+    assert.deepEqual(nativeSink, ["http://127.0.0.1:40001/bili/https://api.example.invalid/v1/messages"]);
 });

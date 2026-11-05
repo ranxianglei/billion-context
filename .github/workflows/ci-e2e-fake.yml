@@ -1,18 +1,75 @@
 name: e2e-fake-codex
 
 on:
+  # three-layer CI (#3295): pull_request feeds the ci:full label gate + the
+  # paths filter (where present) only — the pre-#3295 "#3085: every PR by
+  # default" rule no longer holds; plain PRs are covered by ci.yml's core
+  # matrix, master by ci.yml core runs + the gated scheduled full runs.
   pull_request:
+    types: [opened, synchronize, reopened, labeled]
+  schedule:
+    - cron: '11/30 * * * *'
+    # three-layer CI: 30-min smart cron — gate skips when master HEAD is unchanged since the last green scheduled run
   workflow_dispatch:
 
 concurrency:
-  group: e2e-fake-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # #2637 plan #3: schedule-safe group — master pushes must not cancel the
+  # day's nightly run; same-ref pushes still supersede each other.
+  # #3772: a non-ci:full `labeled` run is skip-scoped by its gate job below —
+  # keep it in its own group so it can never cancel the in-flight real run.
+  group: e2e-fake-${{ github.event_name == 'schedule' && 'nightly' || github.ref }}${{ (github.event_name == 'pull_request' && github.event.action == 'labeled' && github.event.label.name != 'ci:full') && '-skip' || '' }}
+  # #3331: cancel-in-progress applies WITHIN the group too — a 30-min cron whose
+  # run outlives the interval would kill its predecessor mid-suite (tokens spent,
+  # no green recorded, gate can never skip). Cancel only same-ref superseded
+  # runs; scheduled runs queue behind each other instead.
+  cancel-in-progress: ${{ github.event_name != 'schedule' }}
 
 jobs:
+  # three-layer CI: this lane only runs on demand (ci:full label / dispatch)
+  # or on the 30-min cron when master moved since the last green scheduled run.
+  gate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      run: ${{ steps.g.outputs.run }}
+    steps:
+      - id: g
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ' ') }}
+          LABEL_EVENT: ${{ github.event.label.name }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          run=true
+          if [ "$EVENT" = "pull_request" ]; then
+            # only the ci:full label itself may trigger; other label events skip
+            if [ -n "$LABEL_EVENT" ] && [ "$LABEL_EVENT" != "ci:full" ]; then run=false
+            elif ! grep -qw ci:full <<<"$PR_LABELS"; then run=false; fi
+          elif [ "$EVENT" = "schedule" ]; then
+            LAST=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/ci-e2e-fake.yml/runs?event=schedule&status=success&per_page=1" --jq '.workflow_runs[0].head_sha // ""' 2>/dev/null || echo "")
+            echo "last green scheduled head: ${LAST:-none}; current: $HEAD_SHA"
+            if [ "$LAST" = "$HEAD_SHA" ]; then run=false; fi
+          fi
+          echo "run=$run" >> "$GITHUB_OUTPUT"
   e2e-fake:
+    needs: [gate]
+    if: needs.gate.outputs.run == 'true'
     name: real codex vs deterministic fake upstream (zero tokens)
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # Transient runner↔registry blips (ECONNRESET) must not red a PR (#2611):
+    # raise npm's built-in fetch retry (default 2) so a ~10s jitter rides out
+    # instead of aborting setup. Job-level → covers every registry op here
+    # (global CLI install AND `npm ci`). Bounded: worst case ~+2 min before a
+    # genuine sustained outage still fails fast.
+    env:
+      npm_config_fetch_retries: '5'
+      npm_config_fetch_retry_mintimeout: '5000'
+      npm_config_fetch_retry_maxtimeout: '60000'
     steps:
       - uses: actions/checkout@v4
 
@@ -43,7 +100,9 @@ jobs:
         if: failure()
         run: |
           mkdir -p tmp/e2e-artifacts
-          for d in tmp/e2e-codex-fake-*; do [ -d "$d" ] && cp -r "$d" tmp/e2e-artifacts/ || true; done
+          # Every hermetic workdir this suite creates (#1802 env / #1965 / #2195 /
+          # #2222 / #3203 lanes use their own prefixes, not e2e-codex-fake-).
+          for d in tmp/e2e-codex-fake-* tmp/e2e-codex-env-* tmp/e2e-codex-1965-* tmp/e2e-codex-2195-* tmp/e2e-codex-2222-* tmp/e2e-codex-3203-*; do [ -d "$d" ] && cp -r "$d" tmp/e2e-artifacts/ || true; done
 
       - uses: actions/upload-artifact@v4
         if: failure()

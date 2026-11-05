@@ -4,10 +4,10 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { globalVerdict, laneVerdict, renderDoctorReport, runDoctor, type DoctorLane, type DoctorProcess, type DoctorReport } from "../src/doctor.ts";
+import { dshBundleShadowWarning, globalVerdict, laneVerdict, renderDoctorReport, runDoctor, type DoctorLane, type DoctorProcess, type DoctorReport } from "../src/doctor.ts";
 import { PLUGIN_AGENTS, inspectLanePresence } from "../src/plugin-install.ts";
 import { rmrf } from "./tmp-rm.ts";
 
@@ -61,6 +61,62 @@ test("globalVerdict: checkout is frozen regardless of registry; registry newer t
     assert.equal(globalVerdict({ form: "npm", diskVersion: "0.1.143", registryVersion: "0.1.144" }), "stale");
     assert.equal(globalVerdict({ form: "npm", diskVersion: "0.1.143", registryVersion: "0.1.143" }), "ok");
     assert.equal(globalVerdict({ form: "host-managed", diskVersion: "0.1.143" }), "ok");
+});
+
+test("#2891: dshBundleShadowWarning fires only when a machine-global copy coexists with a divergent profile copy", () => {
+    assert.equal(dshBundleShadowWarning({ packageName: "billion-context", globalInstallDir: "/g/bc", globalDiskVersion: "0.1.135", profileName: "web", bundleInstalled: false, profileCopyVersion: undefined }), undefined);
+    assert.equal(dshBundleShadowWarning({ packageName: "billion-context", globalInstallDir: undefined, globalDiskVersion: undefined, profileName: "web", bundleInstalled: true, profileCopyVersion: "0.1.194" }), undefined);
+    assert.equal(dshBundleShadowWarning({ packageName: "billion-context", globalInstallDir: "/g/bc", globalDiskVersion: "0.1.194", profileName: "web", bundleInstalled: true, profileCopyVersion: "0.1.194" }), undefined);
+    const w = dshBundleShadowWarning({ packageName: "billion-context", globalInstallDir: "/g/bc", globalDiskVersion: "0.1.135", profileName: "web", bundleInstalled: true, profileCopyVersion: "0.1.194" });
+    assert.ok(typeof w === "string" && w.includes("v0.1.135") && w.includes("v0.1.194") && w.includes("installation-anchor-first") && w.includes("dsh --profile web --dump-config"), `expected divergent-version shadow warning, got: ${w}`);
+    assert.ok(dshBundleShadowWarning({ packageName: "billion-context", globalInstallDir: "/g/bc", globalDiskVersion: undefined, profileName: "web", bundleInstalled: true, profileCopyVersion: "0.1.194" }) !== undefined);
+});
+
+test("#2891: a dsh lane carrying the shadow warning renders under its row without touching the verdict", () => {
+    const text = renderDoctorReport(syntheticReport({
+        lanes: [
+            { agent: "dsh:web", kind: "host-managed", installed: true, detail: "dep spec: ^0.1.194", copyVersion: "0.1.194", verdict: "stale", registryVersion: "0.1.195", warnings: ["shadowed copy: a machine-global billion-context (/g/bc, v0.1.135) coexists with this profile's own copy (v0.1.194)"] },
+        ],
+    }));
+    assert.match(text, /⚠️ shadowed copy/);
+    assert.match(text, /dsh:web\s+stale \(v0\.1\.194 → v0\.1\.195\)\s+host-managed/);
+});
+
+test("#2891: runDoctor wires the shadow warning onto the divergent dsh profile lane and stays silent when versions match", async () => {
+    const base = mkdtempSync(path.join(tmpdir(), "bc-doctor-shadow-run-"));
+    const runWithFetch = mockFetch(() => new Response(JSON.stringify({ name: "billion-context", version: "999.0.0" }), { status: 200, headers: { "Content-Type": "application/json" } }));
+    // For runDoctor the running test process IS the machine-global copy: findInstallDir
+    // walks up from src/update.ts to this repo root (#1628). Pin the profile fixture
+    // against that real disk version — divergent vs equal — instead of faking a global dir.
+    const repoPkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { version?: unknown };
+    const repoVersion = typeof repoPkg.version === "string" ? repoPkg.version : undefined;
+    assert.ok(repoVersion, "the repo package.json must carry its own version");
+    try {
+        await runWithFetch(async () => {
+            const cases: Array<[string, string]> = [["divergent", "999.999.999"], ["equal", repoVersion]];
+            for (const [profileName, copyVersion] of cases) {
+                const home = path.join(base, profileName);
+                const profileDir = path.join(home, "dsh", "profiles", profileName);
+                const copyDir = path.join(profileDir, "node_modules", "billion-context");
+                mkdirSync(copyDir, { recursive: true });
+                writeFileSync(path.join(profileDir, "package.json"), JSON.stringify({ dependencies: { "billion-context": "^0.1.140" }, dsh: { profile: { bundles: ["billion-context"] } } }));
+                writeFileSync(path.join(copyDir, "package.json"), JSON.stringify({ name: "billion-context", version: copyVersion }));
+                await withEnv({ ...doctorSandboxEnv(home), DSH_HOME: path.join(home, "dsh") }, async () => {
+                    const report = await runDoctor({ packageName: "billion-context", runningVersion: "0.1.143" });
+                    const lane = report.lanes.find((l) => l.agent === `dsh:${profileName}`);
+                    assert.ok(lane !== undefined, `dsh:${profileName} lane present`);
+                    if (copyVersion === repoVersion) {
+                        assert.equal(lane?.warnings, undefined, `matching versions must not warn: ${JSON.stringify(lane?.warnings)}`);
+                    } else {
+                        assert.ok(lane?.warnings?.some((w) => w.startsWith("shadowed copy:") && w.includes(`v${repoVersion}`)), `divergent versions must warn, got: ${JSON.stringify(lane?.warnings)}`);
+                        assert.match(renderDoctorReport(report), /⚠️ shadowed copy/);
+                    }
+                });
+            }
+        });
+    } finally {
+        rmrf(base);
+    }
 });
 
 function syntheticReport(overrides?: { lanes?: DoctorLane[]; processes?: DoctorProcess[] }): DoctorReport {
@@ -147,6 +203,107 @@ test("inspectLanePresence dsh: local pin flags a frozen dev lane, registry pin r
             assert.equal(main?.pinned, false);
             assert.equal(main?.copyVersion, "0.1.140");
             assert.equal(laneVerdict({ installed: true, targetMissing: false, frozen: false, copyVersion: main?.copyVersion, registryVersion: "999.0.0" }), "stale");
+        });
+    } finally {
+        rmrf(base);
+    }
+});
+
+test("#2850: inspectLanePresence pi: npm lane resolves the real copy root for every spec form", () => {
+    const base = mkdtempSync(path.join(tmpdir(), "bc-doctor-pi-npm-"));
+    try {
+        const piHome = path.join(base, "pi");
+        const realCopy = path.join(piHome, "npm", "node_modules", "billion-context");
+        mkdirSync(realCopy, { recursive: true });
+        writeFileSync(path.join(realCopy, "package.json"), JSON.stringify({ name: "billion-context", version: "0.1.143" }));
+        // Decoy at the OLD buggy probe path (<piHome>/agent/npm/...) — must never be read.
+        const decoy = path.join(piHome, "agent", "npm", "node_modules", "billion-context");
+        mkdirSync(decoy, { recursive: true });
+        writeFileSync(path.join(decoy, "package.json"), JSON.stringify({ name: "billion-context", version: "9.9.9" }));
+        mkdirSync(piHome, { recursive: true });
+        const settings = (packages: string[]): void => writeFileSync(path.join(piHome, "settings.json"), JSON.stringify({ packages }));
+        for (const spec of ["npm:billion-context", "npm:billion-context@0.1.150", "npm:billion-context@latest"]) {
+            settings([spec]);
+            withEnv({ PI_CODING_AGENT_DIR: piHome }, () => {
+                const p = inspectLanePresence("pi");
+                assert.equal(p.installed, true);
+                assert.equal(p.form, "npm");
+                assert.deepEqual(p.targets, [realCopy], `${spec}: target must be the real pi materialization dir`);
+                assert.equal(p.copyVersion, "0.1.143", `${spec}: the decoy at the old wrong path must not leak`);
+            });
+        }
+        // Copy not materialized yet → empty targets (the doctor hint applies), still installed/npm.
+        settings(["npm:billion-context"]);
+        rmrf(realCopy);
+        withEnv({ PI_CODING_AGENT_DIR: piHome }, () => {
+            const p = inspectLanePresence("pi");
+            assert.equal(p.installed, true);
+            assert.equal(p.form, "npm");
+            assert.deepEqual(p.targets, []);
+            assert.equal(p.copyVersion, undefined);
+        });
+    } finally {
+        rmrf(base);
+    }
+});
+
+test("#2850: inspectLanePresence pi: absolute-path entry keeps local-path semantics; corrupt settings stays a probe failure", () => {
+    const base = mkdtempSync(path.join(tmpdir(), "bc-doctor-pi-abs-"));
+    try {
+        const piHome = path.join(base, "pi");
+        // A real dev checkout is named billion-context — the recognition regex
+        // keys off that basename (or a node_modules/billion-context segment).
+        const absRoot = path.join(base, "billion-context");
+        mkdirSync(absRoot, { recursive: true });
+        mkdirSync(piHome, { recursive: true });
+        writeFileSync(path.join(absRoot, "package.json"), JSON.stringify({ name: "billion-context", version: "0.1.142" }));
+        writeFileSync(path.join(piHome, "settings.json"), JSON.stringify({ packages: [absRoot] }));
+        withEnv({ PI_CODING_AGENT_DIR: piHome }, () => {
+            const p = inspectLanePresence("pi");
+            assert.equal(p.installed, true);
+            assert.equal(p.form, "local-path");
+            assert.deepEqual(p.targets, [absRoot]);
+            assert.equal(p.copyVersion, "0.1.142");
+        });
+        // Corrupt settings: single-source probe propagates the parse error (no false absent).
+        writeFileSync(path.join(piHome, "settings.json"), "{ not json");
+        withEnv({ PI_CODING_AGENT_DIR: piHome }, () => {
+            assert.throws(() => inspectLanePresence("pi"), /not valid JSON/);
+        });
+    } finally {
+        rmrf(base);
+    }
+});
+
+test("#2850: runDoctor pi npm lane verdicts off the real copy and drops the false materialize hint", async () => {
+    const base = mkdtempSync(path.join(tmpdir(), "bc-doctor-pi-run-"));
+    const piHome = path.join(base, "pi");
+    const realCopy = path.join(piHome, "npm", "node_modules", "billion-context");
+    mkdirSync(realCopy, { recursive: true });
+    writeFileSync(path.join(realCopy, "package.json"), JSON.stringify({ name: "billion-context", version: "0.1.143" }));
+    writeFileSync(path.join(piHome, "settings.json"), JSON.stringify({ packages: ["npm:billion-context"] }));
+    const registryDoc = (version: string): Response => new Response(JSON.stringify({ name: "billion-context", version }), { status: 200, headers: { "Content-Type": "application/json" } });
+    try {
+        await mockFetch(() => registryDoc("999.0.0"))(async () => {
+            await withEnv({ ...doctorSandboxEnv(base), PI_CODING_AGENT_DIR: piHome }, async () => {
+                const report = await runDoctor({ packageName: "billion-context", runningVersion: "0.1.143" });
+                const pi = report.lanes.find((l) => l.agent === "pi");
+                assert.equal(pi?.installed, true);
+                assert.equal(pi?.copyVersion, "0.1.143");
+                assert.equal(pi?.verdict, "stale");
+                assert.match(renderDoctorReport(report), /stale \(v0\.1\.143 → v999\.0\.0\)/);
+                assert.ok(!(pi?.detail ?? "").includes("materializes"), `copy exists — no false hint: ${pi?.detail}`);
+            });
+        });
+        // Copy genuinely absent → the pre-materialization hint applies again.
+        rmrf(realCopy);
+        await mockFetch(() => registryDoc("999.0.0"))(async () => {
+            await withEnv({ ...doctorSandboxEnv(base), PI_CODING_AGENT_DIR: piHome }, async () => {
+                const report = await runDoctor({ packageName: "billion-context", runningVersion: "0.1.143" });
+                const pi = report.lanes.find((l) => l.agent === "pi");
+                assert.equal(pi?.installed, true);
+                assert.match(pi?.detail ?? "", /pi materializes the npm copy on next startup/);
+            });
         });
     } finally {
         rmrf(base);

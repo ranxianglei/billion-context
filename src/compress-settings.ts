@@ -1,17 +1,13 @@
-import { DEFAULT_ABSORB_CONFIG, DEFAULT_CCR_CONFIG, DEFAULT_IMAGE_COMPRESSION_CONFIG, defaultPrompts, resolvePrompts, createPackResolver, defaultPackSources, isValidPackName, type AbsorbConfig, type Config, type CcrConfig, type ImageCompressionConfig, type PackSurface, type Prompts } from "acp-kernel";
+import { DEFAULT_ABSORB_CONFIG, DEFAULT_CCR_CONFIG, defaultPrompts, resolvePrompts, createPackResolver, builtinSource, createDirPackSource, isValidPackName, type AbsorbConfig, type Config, type CcrConfig, type Pack, type PackSurface, type Prompts } from "acp-kernel";
 import * as path from "node:path";
-import { findRoute, type CompressSettings, type NamedProviderRecipe, type ProviderRoutes } from "./config.js";
+import { findRoute, resolveModelEntryOnRoute, type CompressSettings, type NamedProviderRecipe, type ProviderRoutes } from "./config.js";
 import { configDir } from "./paths.js";
 import { log as loggerLog } from "./logger.js";
 import { expandExternalSummaryChainTolerant, type ExternalSummarySettings } from "./external-summary-settings.js";
+import { resolveCompressAtFoldPoint, resolveCompressAtFoldPointClearThinking } from "./knobs.js";
+import { shippedPacksSource } from "./chat-pack.js";
 
 export type { CompressSettings } from "./config.js";
-
-/** Host-side policy default for `compress.stripImagesKeepRecent` (#617): how
- *  many of the most recent messages keep their image payloads when stripping
- *  is enabled. The strip mechanism itself lives in acp-kernel's wire layer
- *  (kernel #215) — only the opt-in policy stays host-side. */
-export const DEFAULT_STRIP_IMAGES_KEEP_RECENT = 5;
 
 /** Resolve a raw `contextLimit` value to an absolute token count.
  *  - `number` → used as-is (absolute window).
@@ -64,7 +60,6 @@ export function mergeCompress(
     const absorbLevels = [global?.absorb, provider?.absorb, model?.absorb].filter(Boolean) as NonNullable<CompressSettings["absorb"]>[];
     const ccrLevels = [global?.ccr, provider?.ccr, model?.ccr].filter(Boolean) as NonNullable<CompressSettings["ccr"]>[];
     const searchLevels = [global?.search, provider?.search, model?.search].filter(Boolean) as NonNullable<CompressSettings["search"]>[];
-    const imageCompressionLevels = [global?.imageCompression, provider?.imageCompression, model?.imageCompression].filter(Boolean) as NonNullable<CompressSettings["imageCompression"]>[];
     const reasoningLevels = [global?.reasoning, provider?.reasoning, model?.reasoning].filter(Boolean) as NonNullable<CompressSettings["reasoning"]>[];
     const reasoningGuardLevels = [global?.reasoningGuard, provider?.reasoningGuard, model?.reasoningGuard].filter(Boolean) as NonNullable<CompressSettings["reasoningGuard"]>[];
     const outputSteeringLevels = [global?.outputSteering, provider?.outputSteering, model?.outputSteering].filter(Boolean) as NonNullable<CompressSettings["outputSteering"]>[];
@@ -78,12 +73,17 @@ export function mergeCompress(
         maxContextLimit: pick("maxContextLimit"),
         emergencyThresholdPercent: pick("emergencyThresholdPercent"),
         nudgeGrowthTokens: pick("nudgeGrowthTokens"),
+        minPressureBenefitTokens: pick("minPressureBenefitTokens"),
         tierNudgeTokens: tierNudgeLevels.length > 0 ? Object.assign({}, ...tierNudgeLevels) : undefined,
         nudgeModelDecided: pick("nudgeModelDecided"),
         nudgeDecisionMaxTokens: pick("nudgeDecisionMaxTokens"),
+        requireNudge: pick("requireNudge"),
+        requireRecommendation: pick("requireRecommendation"),
         preserveRecentMessages: pick("preserveRecentMessages"),
         preserveRecentTokens: pick("preserveRecentTokens"),
         minCompressRangeChars: rangeOf(model) ?? rangeOf(provider) ?? rangeOf(global),
+        maxSummaryLength: pick("maxSummaryLength"),
+        minSummaryLength: pick("minSummaryLength"),
         tiers: pick("tiers"),
         protectedLatestTools: pick("protectedLatestTools"),
         protectedTools: pick("protectedTools"),
@@ -94,12 +94,13 @@ export function mergeCompress(
         absorb: absorbLevels.length > 0 ? Object.assign({}, ...absorbLevels) : undefined,
         ccr: ccrLevels.length > 0 ? Object.assign({}, ...ccrLevels) : undefined,
         search: searchLevels.length > 0 ? Object.assign({}, ...searchLevels) : undefined,
-        imageCompression: imageCompressionLevels.length > 0 ? Object.assign({}, ...imageCompressionLevels) : undefined,
         rules: pick("rules"),
 
-        stripImages: pick("stripImages"),
-        stripImagesKeepRecent: pick("stripImagesKeepRecent"),
         visibilityMarkers: pick("visibilityMarkers"),
+        // #4313 (PR #5236): display gate — global level only; provider/model
+        // values are merged here but the consumer (resolveMessageTimestamps)
+        // reads the GLOBAL setting, mirroring the single shared core.
+        messageTimestamps: pick("messageTimestamps"),
         streamSummary: pick("streamSummary"),
         // `reasoning` is a third nested-object field merged sub-field-wise
         // exactly like `absorb`/`prompts`: a model-level `threshold` must not
@@ -109,6 +110,10 @@ export function mergeCompress(
         outputSteering: outputSteeringLevels.length > 0 ? Object.assign({}, ...outputSteeringLevels) : undefined,
         priceProfile: priceProfileLevels.length > 0 ? Object.assign({}, ...priceProfileLevels) : undefined,
         reconcile: pick("reconcile"),
+        // Experimental fold-point carrier relocation (env-resolved later, in
+        // applyCompressSettings; here only the file tiers cascade).
+        compressAtFoldPoint: pick("compressAtFoldPoint"),
+        compressAtFoldPointClearThinking: pick("compressAtFoldPointClearThinking"),
         promptPack: pick("promptPack"),
         // Whole-chain replace (same semantics as `tiers`/`rules`): an
         // `externalSummary` object at a deeper level replaces the entire
@@ -128,7 +133,7 @@ export function resolveCompress(
     global?: CompressSettings,
 ): CompressSettings {
     const route = findRoute(routes, upstreamUrl);
-    return mergeCompress(global, route?.compress, model ? route?.models?.[model]?.compress : undefined);
+    return mergeCompress(global, route?.compress, resolveModelEntryOnRoute(route, model).entry?.compress);
 }
 
 let warnedPromptsRisk = false;
@@ -169,24 +174,35 @@ interface SurfaceResolution {
     packVersion?: string;
 }
 
+function packResolver(
+    dirs?: { projectDir?: string; userDirs?: readonly string[] },
+): ReturnType<typeof createPackResolver> {
+    // #5319: host-shipped packs sit between the user dirs and the kernel
+    // builtin registry — same-name user/project files still win, and the
+    // kernel registry itself stays untouched (Kernel Boundary: adding a pack
+    // must not require a kernel/** change).
+    return createPackResolver([
+        createDirPackSource("project", dirs?.projectDir ?? path.join(process.cwd(), ".billion-context", "packs")),
+        ...(dirs?.userDirs ?? [path.join(configDir(), "packs")]).map((dir) => createDirPackSource("user", dir)),
+        shippedPacksSource,
+        builtinSource,
+    ]);
+}
+
 /** Resolve the pack surface for one request: `promptPack` names a pack in the
- *  kernel's resolver chain [project `./.billion-context/packs` > user
- *  `<configDir>/packs` > builtin registry]. Unknown names fall back to the
- *  identity surface ({} — kernel defaults everywhere) with a one-time-per-name
- *  warning, so a typo never degrades the compression prompts. Directory
- *  layout is host policy; resolution/sanitization is the kernel's. */
+ *  host's resolver chain [project `./.billion-context/packs` > user
+ *  `<configDir>/packs` > shipped host-bundled packs (`chat`, #5319) > kernel
+ *  builtin registry]. Unknown names fall back to the identity surface
+ *  ({} — kernel defaults everywhere) with a one-time-per-name warning, so a
+ *  typo never degrades the compression prompts. Directory layout is host
+ *  policy; resolution/sanitization is the kernel's. */
 export function resolveCompressSurfaceDetailed(
     s: CompressSettings,
     dirs?: { projectDir?: string; userDirs?: readonly string[] },
 ): SurfaceResolution {
     const name = s.promptPack;
     if (typeof name !== "string" || name === "default" || !isValidPackName(name)) return { surface: {}, packName: "default" };
-    const resolver = createPackResolver(
-        defaultPackSources({
-            projectDir: dirs?.projectDir ?? path.join(process.cwd(), ".billion-context", "packs"),
-            userDirs: dirs?.userDirs ?? [path.join(configDir(), "packs")],
-        }),
-    );
+    const resolver = packResolver(dirs);
     const pack = resolver.resolve(name);
     if (!pack) {
         if (!warnedUnknownPack.has(name)) {
@@ -196,6 +212,14 @@ export function resolveCompressSurfaceDetailed(
         return { surface: {}, packName: "default" };
     }
     return { surface: pack.surface, packName: name, packVersion: pack.version };
+}
+
+/** Every pack resolvable by name right now (first-wins per name) — the panel
+ *  picker's inventory (#5319 web half). Same chain as per-request resolution. */
+export function listResolvedPacks(
+    dirs?: { projectDir?: string; userDirs?: readonly string[] },
+): Pack[] {
+    return packResolver(dirs).listPacks();
 }
 
 export function resolveCompressSurface(
@@ -265,11 +289,7 @@ export function hasCompressSettings(s: CompressSettings): boolean {
   *    been verified locally. Host arming (server.ts) further gates it behind
   *    the retrieve tool channel, so plugin mode / no-channel wires stay
   *    inert regardless.
-   *  - `imageCompression` → `imageCompression` (kernel ImageCompressionConfig,
-   *    acp-kernel >= 0.0.84; #1095 pre-compression of image blocks). Unset
-   *    fields inherit DEFAULT_IMAGE_COMPRESSION_CONFIG. Absent
-   *    `s.imageCompression` leaves `base.imageCompression` untouched — the
-   *    feature stays off unless some level enables it. */
+ */
 // Config as resolved for the kernel, plus preserveRecentTools — the knob
 // lands in acp-kernel 0.0.93 (acp-kernel#428) but the resolved object is
 // built and typed here regardless of the installed kernel's Config so both
@@ -288,6 +308,11 @@ export function resolveAbsorbSettings(s: CompressSettings["absorb"]): AbsorbConf
         minToolTokens: s.minToolTokens ?? d.minToolTokens,
         contextThresholdPct: s.contextThresholdPct !== undefined ? parsePercent(s.contextThresholdPct) : d.contextThresholdPct,
         excludeTools: s.excludeTools ?? [...d.excludeTools],
+        // #3402: bili's default stance is media-scoped — the revival exists to fix
+        // image pile-up (#3398) and to kill the old full-text over-compression. The
+        // kernel ships mediaOnly neutral (unset); this is the single place the
+        // default-on policy is applied. Explicit false restores pre-revival full-text.
+        mediaOnly: s.mediaOnly ?? true,
     };
 }
 
@@ -304,6 +329,13 @@ export function applyCompressSettings(base: Config, limit: number, s: CompressSe
         nudge.growthFloor = s.nudgeGrowthTokens;
         nudge.growthCap = s.nudgeGrowthTokens;
     }
+    // Experimental fold-point carrier relocation (#view-transform-A): the env
+    // tier wins over every file level per knob doctrine (#2030), resolved
+    // per request like every other wire-facing knob. Off = byte-identical
+    // pre-change behavior (the kernel node fast-paths to the same array ref).
+    // #3211: explicit 0 is meaningful (legacy any-pending pressure behavior),
+    // so pass it through instead of skipping like the growth-token knobs.
+    if (s.minPressureBenefitTokens !== undefined) nudge.minPressureBenefitTokens = s.minPressureBenefitTokens;
     if (s.tierNudgeTokens !== undefined) {
         const tg: NonNullable<Config["nudge"]["tierGrowthTokens"]> = {};
         if (typeof s.tierNudgeTokens.t1 === "number") tg.t1 = s.tierNudgeTokens.t1;
@@ -331,17 +363,6 @@ export function applyCompressSettings(base: Config, limit: number, s: CompressSe
             maxHeadChars: s.ccr.maxHeadChars ?? d.maxHeadChars,
         };
     }
-    let imageCompression: ImageCompressionConfig | undefined;
-    if (s.imageCompression !== undefined) {
-        const d = DEFAULT_IMAGE_COMPRESSION_CONFIG;
-        imageCompression = {
-            enabled: s.imageCompression.enabled === true,
-            minTokens: s.imageCompression.minTokens ?? d.minTokens,
-            maxDimension: s.imageCompression.maxDimension ?? d.maxDimension,
-            quality: s.imageCompression.quality ?? d.quality,
-            format: s.imageCompression.format ?? d.format,
-        };
-    }
     const resolved: ResolvedKernelConfig = {
         ...base,
         modelContextLimit: limit,
@@ -353,6 +374,10 @@ export function applyCompressSettings(base: Config, limit: number, s: CompressSe
         compress: {
             ...base.compress,
             minCompressRange: s.minCompressRangeChars ?? s.minCompressRange ?? base.compress.minCompressRange,
+            // #3635: previously unmapped, so a configured cap never reached the
+            // resolved kernel config (panel PUT and file edits were both inert).
+            maxSummaryLength: s.maxSummaryLength ?? base.compress.maxSummaryLength,
+            minSummaryLength: s.minSummaryLength ?? base.compress.minSummaryLength,
         },
         protectedLatestTools: s.protectedLatestTools ?? base.protectedLatestTools,
         protectedTools: s.protectedTools ?? base.protectedTools,
@@ -367,7 +392,13 @@ export function applyCompressSettings(base: Config, limit: number, s: CompressSe
         externalSummary: s.externalSummary !== undefined ? expandExternalSummaryChainTolerant(s.externalSummary, recipes) : (base as ResolvedKernelConfig).externalSummary,
         ...(absorb !== undefined ? { absorb } : {}),
         ...(ccr !== undefined ? { ccr } : {}),
-        ...(imageCompression !== undefined ? { imageCompression } : {}),
+        // Fold-point carrier relocation pair: explicit pass-through so an unset
+        // flag never leaks a stale base value into the resolved config.
+        compressAtFoldPoint: resolveCompressAtFoldPoint(process.env, s.compressAtFoldPoint),
+        compressAtFoldPointClearThinking: resolveCompressAtFoldPointClearThinking(
+            process.env,
+            s.compressAtFoldPointClearThinking,
+        ),
         ...(s.rules !== undefined ? { rules: { enabled: s.rules === true } } : {}),
     };
     return resolved;
@@ -401,6 +432,13 @@ export function resolveRequestConfig(
 ): ResolvedKernelConfig {
     const compress = resolveCompress(routes, embeddedUrl, model, globalCompress);
     const limit = resolveContextLimitValue(compress.modelContextLimit, native ?? base.modelContextLimit);
-    if (!hasCompressSettings(compress) && limit === base.modelContextLimit) return base;
+    // #5470 opt-in reachability: an env-only enablement of either fold-point
+    // switch is invisible to hasCompressSettings (env never joins the file
+    // cascade), so without these checks such a lane would hit the short-circuit
+    // below and the knob would silently die. Both-falsy keeps the original
+    // short-circuit byte-for-byte (zero behavior change when nothing is set).
+    const cafAt = resolveCompressAtFoldPoint(process.env, compress.compressAtFoldPoint);
+    const cafCt = resolveCompressAtFoldPointClearThinking(process.env, compress.compressAtFoldPointClearThinking);
+    if (!hasCompressSettings(compress) && limit === base.modelContextLimit && !cafAt && !cafCt) return base;
     return applyCompressSettings(base, limit, compress, namedProviders ?? {});
 }

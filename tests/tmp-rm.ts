@@ -9,9 +9,16 @@ import { rmSync } from "node:fs";
 // ubuntu-22 release-gate leg — the failing suite's late debounced session
 // flush (5ms debounce recreating <tmp>/<provider>/) kept the tree alive past
 // every retry under full-suite load. Escalate with exponential backoff so
-// teardown can always outlive a bounded writer burst; the full window is
-// ~3.2s and is only paid when a race actually happens.
-const RETRY_DELAYS_MS = [25, 50, 100, 200, 400, 800, 1600] as const;
+// teardown can always outlive a bounded writer burst; the ladder below sums
+// the full window and is only paid when a race actually happens.
+//
+// #2908: #2816's c=4 concurrent test scheduling raised per-runner load, and a
+// win-latest leg then lost the race on EBUSY unlinking sessions/index.db — a
+// transient Windows AV/indexer lock outlasting the old ~3.2s window (#2799
+// family). A probe confirmed the harness holds NO self-handle at rmrf time
+// (flushAllSessions closes the store's shadow first), so this is not masking
+// an in-process leak: it re-sizes the external-lock budget to the c=4 reality.
+const RETRY_DELAYS_MS = [25, 50, 100, 200, 400, 800, 1600, 3200, 3200] as const;
 
 /** Sync sleep that is legal on any thread in Node (blocks the event loop —
  * exactly what a teardown-path retry wants; no pending I/O ordering to keep). */
