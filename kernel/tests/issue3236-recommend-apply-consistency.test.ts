@@ -199,7 +199,7 @@ function assertAdvertisedApplyCleanly(
   }
 }
 
-test("#3236 A/A2: burst with delayed results — doomed units screened out; every advertised unit applies cleanly", () => {
+test("#3236 A/A2: burst with delayed results folds atomically at any distance (#5751); every advertised unit applies cleanly", () => {
   const core = createCore();
   const cfg = config();
   for (const interleave of [false, true]) {
@@ -216,23 +216,11 @@ test("#3236 A/A2: burst with delayed results — doomed units screened out; ever
     const ranges = processed.nudge?.compressibleRanges ?? [];
     assert.ok(ranges.length > 0, `${label}: content must still be advertised`);
 
-    if (!interleave) {
-      // Scenario A: the delayed results sit far past the 20-slot widening
-      // window, so NO projection of a range spanning the burst can fold —
-      // such units must not be advertised.
-      const burstLo = refIdx.get(state.messageRefs.byRaw["R"]!)!;
-      const burstHi = refIdx.get(state.messageRefs.byRaw["RS1"]!)!;
-      for (const r of ranges) {
-        const s = refIdx.get(r.startRef);
-        const e = refIdx.get(r.endRef);
-        assert.notEqual(s, undefined, `${label}: start ${r.startRef} resolvable`);
-        assert.notEqual(e, undefined, `${label}: end ${r.endRef} resolvable`);
-        assert.ok(
-          !(s! <= burstHi && e! >= burstLo),
-          `${label}: advertised ${r.startRef}-${r.endRef} still spans the split burst`,
-        );
-      }
-    }
+    // #5751: pair widening is id-exact over the whole array, so delayed
+    // results at ANY distance pull in — Scenario A's "no projection can
+    // fold the burst" is gone. Both interleave modes fold the burst
+    // atomically now, so the old "must not span the burst" pin is retired;
+    // the advertised-applies-cleanly contract below is the guard that matters.
     for (const r of ranges) {
       const applied = core.applyCompression({
         ranges: [{ startRef: r.startRef, endRef: r.endRef, summary: "steady-state fold" }],
@@ -247,36 +235,25 @@ test("#3236 A/A2: burst with delayed results — doomed units screened out; ever
       );
     }
 
-    // Manual submit of the raw burst span pins both behaviors: in A the gate
-    // still throws the wire-validity error (screening hides the unit, it does
-    // not bless it); in A2 the late results land inside the widening window,
-    // the span pulls them in and withdraws only the unreachable tail, so the
-    // same span legitimately folds.
+    // Manual submit of the raw burst span: #5751's id-exact widening pulls
+    // the delayed results in from any distance (A2's window rationale is
+    // gone), so A and A2 fold identically now — the span folds whole.
     const doomed = core.applyCompression({
       ranges: [{
         startRef: state.messageRefs.byRaw["R"]!,
         endRef: state.messageRefs.byRaw["RS1"]!,
-        summary: "manual doomed span",
+        summary: "manual burst span",
       }],
       messages: all,
       state: structuredClone(state),
       config: cfg,
     });
-    if (!interleave) {
-      assert.equal(doomed.result.blocksCreated, 0);
-      assert.match(
-        doomed.result.errors.join(" "),
-        /Range would split 1 turn\(s\) and 4 tool call\/result pair\(s\)/,
-        doomed.result.errors.join(" "),
-      );
-    } else {
-      assert.equal(
-        doomed.result.errors.length,
-        0,
-        `A2: self-healing span should fold, got: ${doomed.result.errors.join("; ")}`,
-      );
-      assert.equal(doomed.result.blocksCreated, 1);
-    }
+    assert.equal(
+      doomed.result.errors.length,
+      0,
+      `${label}: burst span should fold atomically with its delayed results, got: ${doomed.result.errors.join("; ")}`,
+    );
+    assert.equal(doomed.result.blocksCreated, 1);
   }
 });
 
@@ -301,10 +278,6 @@ test("#3236 B: two interleaved bursts — advertised clean, gate intact on manua
     const e = refIdx.get(r.endRef);
     assert.notEqual(s, undefined, `start ${r.startRef} resolvable`);
     assert.notEqual(e, undefined, `end ${r.endRef} resolvable`);
-    assert.ok(
-      !(s! <= burstHi && e! >= burstLo),
-      `advertised ${r.startRef}-${r.endRef} still spans the split double burst`,
-    );
     const applied = core.applyCompression({
       ranges: [{ startRef: r.startRef, endRef: r.endRef, summary: "steady-state fold" }],
       messages: all,
@@ -318,22 +291,24 @@ test("#3236 B: two interleaved bursts — advertised clean, gate intact on manua
     );
   }
 
+  // #5751: the double burst folds atomically — the id-exact widening pulls
+  // both bursts' delayed results (LA2..LB3) in from any distance.
   const doomed = core.applyCompression({
     ranges: [{
       startRef: state.messageRefs.byRaw["RA"]!,
       endRef: state.messageRefs.byRaw["RB_RS1"]!,
-      summary: "manual doomed span",
+      summary: "manual double-burst span",
     }],
     messages: all,
     state: structuredClone(state),
     config: cfg,
   });
-  assert.equal(doomed.result.blocksCreated, 0);
-  assert.match(
-    doomed.result.errors.join(" "),
-    /Range would split 2 turn\(s\) and 4 tool call\/result pair\(s\)/,
-    doomed.result.errors.join(" "),
+  assert.equal(
+    doomed.result.errors.length,
+    0,
+    `double-burst span should fold atomically, got: ${doomed.result.errors.join("; ")}`,
   );
+  assert.equal(doomed.result.blocksCreated, 1);
 });
 
 test("#3236: healthy complete turns remain advertised and apply cleanly (no over-screening)", () => {
@@ -373,7 +348,7 @@ test("#3236: healthy complete turns remain advertised and apply cleanly (no over
   );
 });
 
-test("#3236: acp_status uncompressed rows flag doomed spans but keep them visible", () => {
+test("#3236: acp_status uncompressed rows keep spans visible, flag only what stays doomed", () => {
   const core = createCore();
   const cfg = config();
   const { state, all } = buildTwoBursts(core, cfg);
@@ -390,14 +365,12 @@ test("#3236: acp_status uncompressed rows flag doomed spans but keep them visibl
       l.includes(state.messageRefs.byRaw["RA"]!) &&
       l.includes(state.messageRefs.byRaw["RB_RS1"]!),
   );
-  assert.ok(burstLine, "burst row must stay listed (flagged, not dropped)");
+  assert.ok(burstLine, "burst row must stay listed");
+  // #5751: id-exact widening reaches the delayed results at any distance, so
+  // the double burst is foldable — the row loses its doom flag.
   assert.ok(
-    burstLine!.includes("\u26a0 not foldable"),
-    `burst row must carry the flag: ${burstLine}`,
-  );
-  assert.ok(
-    burstLine!.includes("would split 2 turn(s)"),
-    `burst row must name the split: ${burstLine}`,
+    !burstLine!.includes("\u26a0"),
+    `burst row must be unflagged now: ${burstLine}`,
   );
 
   const fillerLine = lines.find(
