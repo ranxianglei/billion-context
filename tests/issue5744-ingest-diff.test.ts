@@ -289,3 +289,23 @@ test("#5744: forced full-path save converges to the exact state the diff path le
     shadow.record(mkLegacy(SID, 202, 0, null));
     assert.equal(snapshot(), diffState, "full-path save reproduces the diff-path end state exactly");
 });
+
+test("#5744: slow-ingest diagnostics expose WAL size and the last checkpoint triple", (t) => {
+    const dir = tmpdir("bili-5744c-waldiag-");
+    t.after(() => rmBestEffort(dir));
+    const { shadow, store } = openPair(dir);
+    t.after(() => shadow.close());
+    t.after(() => store.close());
+
+    // Exactly 20 ingests so the periodic checkpoint tick (every 20th successful
+    // ingest) fires on the store the shadow writes through.
+    for (let turn = 0; turn < 20; turn++) {
+        shadow.record(mkLegacy(SID, 10 + turn, 0, null));
+    }
+    const syncStore = (shadow as unknown as { sync: UnifiedStore }).sync;
+    const suffix = syncStore.walDiagnosticsSuffix();
+    assert.ok(typeof suffix === "string" && suffix.length > 0, "WAL forensics available once a WAL file exists");
+    assert.ok(suffix.includes("WAL"), `suffix carries the WAL size: ${suffix}`);
+    assert.ok(suffix.includes("lastCheckpoint=(busy="), `last tick triple present: ${suffix}`);
+    assert.ok(suffix.includes("checkpointed=") && suffix.includes("took="), `tick duration present: ${suffix}`);
+});

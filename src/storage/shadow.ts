@@ -515,7 +515,11 @@ export class UnifiedShadow {
             this.stats.ingests++;
             const ingestMs = Math.round(performance.now() - tIngestStart);
             if (ingestMs > SLOW_INGEST_WARN_MS) {
-                loggerLog("warn", `[storage] slow-ingest: ${legacy.id} path=${ingestPath} took=${ingestMs}ms — synchronous per-save storage work is starving the event loop (#5744); path=full means the delta fast path fell back (watermark missing/cleared or tail shape changed)`);
+                // #5744: attach WAL forensics so a stall spike can be attributed
+                // to a checkpoint burst (multi-second tick inside the window)
+                // instead of per-row statement cost — read-only, warn path only.
+                const walSuffix = this.sync.walDiagnosticsSuffix() ?? "";
+                loggerLog("warn", `[storage] slow-ingest: ${legacy.id} path=${ingestPath} took=${ingestMs}ms${walSuffix} — synchronous per-save storage work is starving the event loop (#5744); path=full means the delta fast path fell back (watermark missing/cleared or tail shape changed)`);
             }
             // #3133 sampled verification: ingest integrity is already guarded
             // by the SQLite write path; the read-back digest is a migration

@@ -434,6 +434,10 @@ export class UnifiedStore {
     private readonly db: SqliteDatabase;
     /** #3250: successful-ingest counter driving the WAL_CHECKPOINT_EVERY_INGESTS cadence. */
     private ingestCount = 0;
+    /** #5744: last periodic checkpoint result (plus its wall time) for the
+     * slow-ingest warn line — lets an operator attribute a stall spike to a
+     * checkpoint burst instead of guessing. Null until the first tick. */
+    private lastWalTick: { busy: number; log: number; checkpointed: number; ms: number } | null = null;
     /** #4175: the live foreign pid found holding <db>.lock at open, if any. */
     private readonly foreignLockHolder: { pid: number } | null;
     private readonly lockPath: string | null;
@@ -1414,14 +1418,36 @@ export class UnifiedStore {
         try {
             // Log the result: operators tuning storage.walJournalSizeLimitBytes
             // need to see whether ticks are actually reclaiming frames.
+            const t0 = performance.now();
             const row = this.db.prepare("PRAGMA wal_checkpoint(PASSIVE)").get() as { busy: number; log: number; checkpointed: number };
+            const ms = Math.round(performance.now() - t0);
+            this.lastWalTick = { busy: row.busy, log: row.log, checkpointed: row.checkpointed, ms };
             loggerLog(
                 "debug",
-                `[storage] periodic WAL checkpoint at ingest ${this.ingestCount}: busy=${row.busy} log=${row.log} checkpointed=${row.checkpointed}`,
+                `[storage] periodic WAL checkpoint at ingest ${this.ingestCount}: busy=${row.busy} log=${row.log} checkpointed=${row.checkpointed} took=${ms}ms`,
             );
         } catch (err) {
             loggerLog("debug", `[storage] periodic WAL checkpoint failed at ingest ${this.ingestCount}: ${String(err)}`);
         }
+    }
+
+    /** #5744: read-only WAL forensics for the slow-ingest warn line — current
+     * WAL size plus the last periodic checkpoint's (busy, log, checkpointed)
+     * triple and duration. A slow save whose window contains a multi-second
+     * tick is a checkpoint burst, not per-row statement cost; the two must be
+     * told apart from the log alone. Returns null when there is nothing to
+     * report (no WAL file). Never throws into the caller. */
+    walDiagnosticsSuffix(): string | null {
+        let walBytes: number;
+        try {
+            walBytes = statSync(`${this.dbPath}-wal`).size;
+        } catch {
+            return null;
+        }
+        const tick = this.lastWalTick
+            ? ` lastCheckpoint=(busy=${this.lastWalTick.busy} log=${this.lastWalTick.log} checkpointed=${this.lastWalTick.checkpointed} took=${this.lastWalTick.ms}ms)`
+            : "";
+        return `, ${formatDbSize(walBytes)} WAL${tick}`;
     }
 
     /** Full-ingest path of ingestSession, extracted for readability: the
