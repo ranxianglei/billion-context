@@ -267,3 +267,16 @@ test("anthropicFirstUserFrag strips leading <system-reminder> blocks so long sha
     assert.notEqual(discA, discB, "subagents with >1024 chars shared <system-reminder> and distinct task prompts must not collide");
 });
 
+test("anthropicFirstUserFrag reminder-strip edges: string path, reminders-only fallback, no-reminder output unchanged", () => {
+    const reminder = `<system-reminder>\nShared CLAUDE.md context.\n</system-reminder>`;
+    // String content: leading reminder stripped, the task text is what discriminates.
+    const stringWithReminder = anthropicFirstUserFrag([{ role: "user", content: `${reminder}Task arm C: check the billing lane` }]);
+    assert.equal(stringWithReminder, "Task arm C: check the billing lane", "string content strips the leading reminder before slicing");
+    // Reminders-only message: nothing left after stripping → fall back to the ORIGINAL text (never "").
+    const onlyReminders = `${reminder}<system-reminder>\nSecond reminder block.\n</system-reminder>`;
+    assert.equal(anthropicFirstUserFrag([{ role: "user", content: onlyReminders }]), onlyReminders.slice(0, 1024), "reminders-only falls back to the original text");
+    // No reminder at all: byte-identical to the pre-strip behavior (common case untouched).
+    const plain = `plain task ${"x".repeat(1500)}`;
+    assert.equal(anthropicFirstUserFrag([{ role: "user", content: plain }]), plain.slice(0, 1024), "reminder-free text is sliced exactly as before");
+});
+
