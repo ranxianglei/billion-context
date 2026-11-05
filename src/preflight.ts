@@ -3129,7 +3129,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             const rec = await attemptTierRecovery();
             deps.log("info", `[preflight] tier-distillation recovery finished: ${rec.recovered ? "recovered" : "not recovered"}; ${rec.callsUsed} summary call(s), net ~${rec.netSaved} tok saved (#2952)`);
             if (!rec.recovered) {
-                // #5766/#3461: only the structurally-exhausted ending (span-math proved no legal
+                // #5764/#3461: only the structurally-exhausted ending (span-math proved no legal
                 // two-block span / not enough positionable blocks — e.g. oversized inline media
                 // blowing every span past TIER_DISTILL_SOURCE_CHAR_BUDGET) is deterministic →
                 // 413 not-forwarded; cap/unavailable/no-shrink are relay/budget-dependent and MUST
