@@ -347,6 +347,27 @@ describe("#5715 partial interior loss with a surviving direct-ID majority is NOT
             "strong direct continuity on an already-pending session recovers compression");
     });
 
+    test("an explained head cut keeps its own note — the majority note stays silent", () => {
+        // 30 fully-covered turns; the host drops the OLDEST ten (a head cut —
+        // truncationExplained territory, #2695) while twenty ride verbatim,
+        // which is ALSO a strict direct-ID majority. The #2695 note owns this
+        // episode: the #5715 majority note must not fire a second line
+        // mislabeling the head cut as "interior" loss.
+        const old: CoreMessage[] = [];
+        for (let i = 0; i < 30; i++) {
+            old.push(msg(`t${i}`, i % 2 ? "user" : "assistant",
+                `history turn ${i} with distinctive vocabulary marker word ${i} for shingle coverage`));
+        }
+        const session = fakeSession(old.map((m) => m.id as string), old);
+        reconcileFoldCoverage(session, old, repair()); // warm pass: coverage established
+        const logs: string[] = [];
+        for (let pass = 0; pass < 4; pass++) reconcileFoldCoverage(session, old.slice(10), repair((l, m) => logs.push(`${l}: ${m}`)));
+        assert.ok(logs.some((line) => line.startsWith("info") && /truncat/i.test(line)),
+            "the #2695 truncation note still names the head cut");
+        assert.ok(!logs.some((line) => line.includes("partial interior loss")),
+            "an already-explained episode is not double-reported as interior loss");
+    });
+
     test("genuine wholesale replacement STILL escalates (the gate did not weaken detection)", () => {
         const { old, covered } = interiorLossFixture();
         const session = fakeSession(covered, old, "dsh");

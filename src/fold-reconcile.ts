@@ -2454,12 +2454,17 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
                 opts.log("info",
                     `${tag}[fold-reconcile] ${realUnmatched.length} covered id(s) missing with no anchor match${expectedNote}, but this pass stripped ${opts.markerStripped} raw marker artifact(s) — covered ids minted from marker-laden bytes churn once the strip engine cleans the resent history; benign on stateless resend (content still on the wire, re-folds re-cover), tolerated (#2815/#2789)`);
             }
-        } else if (hardDirectMajority && nonReasoningUnmatched >= FOLD_DRIFT_ESCALATE_MIN_UNMATCHED) {
+        } else if (hardDirectMajority && nonReasoningUnmatched >= FOLD_DRIFT_ESCALATE_MIN_UNMATCHED
+                && !shapeExplained && !truncationExplained && !tailTruncationExplained) {
             // #5715: a surviving direct-ID majority AT THE MASS BAR is PARTIAL
             // loss, not the "fold silently lost" the generic warn below names —
             // report it once per episode at info level (acceptance, not repair).
             // Sub-mass-bar single edits keep the honest per-pass warn below. The
             // #3641 verdict above already kept this from latching epoch-confirm.
+            // Already-explained episodes (shape churn / head / tail truncation)
+            // own their own one-per-episode note — reporting them here too would
+            // print a second line mislabeling a head/tail cut as "interior"
+            // loss, so they fall through to the original per-pass warn.
             if (session.metadata[METADATA_MAJORITY_LOSS_NOTED] !== true) {
                 session.metadata[METADATA_MAJORITY_LOSS_NOTED] = true;
                 opts.log("info", `${tag}[fold-reconcile] ${realUnmatched.length} covered id(s) missing but ${presentHard}/${coveredHard} hard-covered id(s) still ride verbatim on the wire — partial interior loss, fold substrate healthy, no epoch confirmation (#5715)`);
