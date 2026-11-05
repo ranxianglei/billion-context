@@ -4594,6 +4594,47 @@ export function probeNodeMajor(candidate: string, env: NodeJS.ProcessEnv): numbe
     }
 }
 
+/** #5663: the identity a candidate reports about itself — its own execPath and,
+ *  when it is an Electron binary running as Node, the Electron version. */
+interface NodeRuntimeIdentity {
+    execPath: string;
+    electron?: string;
+}
+
+/** #5663: prove the IDENTITY of a candidate that already passed the version
+ *  gate — run it and ask for its own execPath plus whether it carries an
+ *  Electron version. A PATH entry named node can be another desktop app's
+ *  Electron-as-node shim (`ELECTRON_RUN_AS_NODE=1 exec <app>/Contents/MacOS/<app> "$@"`):
+ *  `--version` answers v24.x, so the #3383 gate accepts it, but spawning it makes
+ *  the daemon execute a FOREIGN application's binary — on macOS the Local Network
+ *  grant (judged per responsible app + code signature) then denies every
+ *  non-gateway LAN connect from the daemon (instant EHOSTUNREACH while curl from
+ *  the same host works). Real Node reports no electron version; an
+ *  Electron-as-node process reports both its own (usually foreign) execPath and
+ *  the version. Any failure (timeout, non-JSON output, non-node program) yields
+ *  undefined — the caller treats that as "identity unprovable" and keeps the
+ *  pre-#5663 version-only verdict (fail-open: this gate must never break an
+ *  exotic-but-working runtime it cannot identify). */
+export function probeNodeIdentity(candidate: string, env: NodeJS.ProcessEnv): NodeRuntimeIdentity | undefined {
+    try {
+        const out = execFileSync(candidate, ["-e", "process.stdout.write(JSON.stringify({ p: process.execPath, e: process.versions.electron || null }))"], {
+            windowsHide: true,
+            timeout: 5000,
+            encoding: "utf8",
+            stdio: ["ignore", "pipe", "pipe"],
+            env,
+        });
+        const parsed = JSON.parse(out.trim()) as { p?: unknown; e?: unknown };
+        if (typeof parsed.p !== "string" || parsed.p.length === 0) return undefined;
+        return {
+            execPath: parsed.p,
+            electron: typeof parsed.e === "string" ? parsed.e : undefined,
+        };
+    } catch {
+        return undefined;
+    }
+}
+
 /** #3383: floor for the Node major version the proxy entry requires — must
  *  track "engines".node in package.json. */
 export const MIN_PROXY_NODE_MAJOR = 20;
@@ -4625,7 +4666,11 @@ function looksLikeNodeExecutable(p: string, platform: NodeJS.Platform): boolean 
  *  or install dir, wrapper target included) must prove it is Node via
  *  probeNodeMajor before being accepted — a foreign program named node(.exe)
  *  that ignores arguments and exits 0 (Microsoft HPC Pack's cluster CLI) used
- *  to be accepted verbatim, crash-looping every spawn forever. */
+ *  to be accepted verbatim, crash-looping every spawn forever. #5663: passing
+ *  --version is not enough — the candidate must also not be ANOTHER application's
+ *  Electron binary running as Node (an Electron-as-node shim named node answers
+ *  v24.x to --version), or the daemon ends up executing a foreign bundle whose
+ *  owner app holds no Local Network grant on macOS. */
 export function resolveNodeRuntime(
     execPath: string = process.execPath,
     env: NodeJS.ProcessEnv = process.env,
@@ -4634,6 +4679,7 @@ export function resolveNodeRuntime(
     electronVersion: string | undefined = typeof process.versions.electron === "string" ? process.versions.electron : undefined,
     probeWrapper: (candidate: string, env: NodeJS.ProcessEnv) => string | undefined = probeNodeWrapperTarget,
     probeNode: (candidate: string, env: NodeJS.ProcessEnv) => number | undefined = probeNodeMajor,
+    probeIdentity: (candidate: string, env: NodeJS.ProcessEnv) => NodeRuntimeIdentity | undefined = probeNodeIdentity,
 ): string {
     const base = path.basename(execPath).toLowerCase();
     if (base === "node" || base === "node.exe") return execPath;
@@ -4668,7 +4714,23 @@ export function resolveNodeRuntime(
             // ignore the hop and validate the candidate itself below.
         }
         const major = probeNode(subject, env);
-        if (major === undefined || major < MIN_PROXY_NODE_MAJOR) return undefined;
+        if (major === undefined || major < MIN_PROXY_NODE_MAJOR) {
+            teeLog("warn", `bili: skipping ${candidate} — not a usable Node runtime (--version did not report v${MIN_PROXY_NODE_MAJOR}+; set BILLION_CONTEXT_NODE if this is wrong, #3383)`);
+            return undefined;
+        }
+        // #5663: identity gate. A version answer proves nothing about WHOSE
+        // binary runs: an Electron-as-node shim named node reports v24.x but
+        // executes a foreign app's bundle, and macOS then denies its LAN egress
+        // per that app's (absent) Local Network grant. Reject only when the
+        // candidate PROVES itself to be Electron from a different executable
+        // than this host — an unprovable identity keeps the old verdict
+        // (fail-open), and the host's own binary is the sanctioned #1429
+        // fallback anyway.
+        const identity = probeIdentity(subject, env);
+        if (identity?.electron && identity.execPath.toLowerCase() !== execPath.toLowerCase()) {
+            teeLog("warn", `bili: skipping ${candidate} — reports v${major}.x but is an Electron-as-node process of ${identity.execPath} (Electron ${identity.electron}), a different application than this host (${execPath}); such a daemon loses macOS Local Network authorization (instant EHOSTUNREACH to LAN upstreams) — set BILLION_CONTEXT_NODE to a real Node (#5663)`);
+            return undefined;
+        }
         return subject;
     };
     // join with the SIMULATED platform's separators: a posix-style PATH on
@@ -4706,8 +4768,13 @@ export function resolveNodeRuntime(
             const candidate = dir.endsWith("/") || dir.endsWith("\\") ? dir + name : dir + "/" + name;
             if (!existsImpl(candidate)) continue;
             const resolved = resolveDiscovered(candidate);
-            if (resolved !== undefined) return resolved;
-            teeLog("warn", `bili: skipping ${candidate} — not a usable Node runtime (--version did not report v${MIN_PROXY_NODE_MAJOR}+; set BILLION_CONTEXT_NODE if this is wrong, #3383)`);
+            if (resolved !== undefined) {
+                // #5663: make the daemon's true executable visible at startup —
+                // the field failure was invisible because nothing logged which
+                // binary the daemon actually ran under.
+                teeLog("info", `bili: proxy runtime resolved: ${resolved}${resolved.toLowerCase() !== candidate.toLowerCase() ? ` (via wrapper ${candidate})` : ""}`);
+                return resolved;
+            }
         }
     }
     // #1429: last resort inside an Electron host — its own binary runs as plain
