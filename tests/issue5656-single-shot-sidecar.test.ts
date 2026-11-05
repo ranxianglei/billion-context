@@ -260,7 +260,12 @@ test("e2e #5656 negative: a tool-less multi-message MAIN turn still goes through
         const stub = peekSession(CONV);
         const refs1 = stub ? Object.keys(stub.state.messageRefs.byRaw).length : 0;
         const reqs1 = stub ? stub.stats.requests : 0;
-        assert.ok(refs1 === 0 && reqs1 === 0, `tool-less single-shot turn 1 rides the side lane (refs=${refs1}, requests=${reqs1})`);
+        // #5687 follow-up: this residual is REVOKED. A tool-less turn 1 that
+        // carries a conversation-sized output budget (64000 here) is a MAIN turn,
+        // not a utility sidecar: the small-budget requirement is what keeps it on
+        // the kernel path. Pinning the old "rides the side lane" behavior here is
+        // exactly what let #2817/#5403 regress.
+        assert.ok(refs1 >= 1 && reqs1 >= 1, `tool-less turn 1 with a conversation budget goes through the full pipeline (refs=${refs1}, requests=${reqs1})`);
         // Turn 2 replays history (user+assistant+user): NOT single-shot — full
         // pipeline, claims the raw key, compression state builds.
         const r2 = await fetch(url, {
