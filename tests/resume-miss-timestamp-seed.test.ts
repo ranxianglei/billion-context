@@ -186,9 +186,14 @@ test("resume-inheritance MISS seeds the timestamp ledger from the closest tracke
         await closeServers([proxy1], "miss-seed phase 1");
     }
 
-    // Phase 2: fresh process state — the equal-depth replay under a NEW id is not a resume
-    // (byte-exact equal-depth replay is ruled out by design), so the gate misses; the closest
-    // chain must still donate its timestamp ledger before the first request serves.
+    // Phase 2: fresh process state, NEW id. #5608 v3 reshaped this replay into the REAL
+    // production shape (dsh desktop restart): the whole old history BYTE-IDENTICAL plus
+    // ONE genuinely new turn — strictly deeper than the tracked chain, fully verified
+    // common prefix. That is the only shape the weak-adoption gate accepts; the old
+    // fixture was an equal-depth verbatim replay, which v2 adopted unconditionally and
+    // which #1486 rules out by design (two unrelated sessions may legally resend the
+    // same bytes under different ids — adopting there smuggles foreign blocks across
+    // lanes, measured on #3686 in CI).
     _resetSessionsForTest();
     const store2 = new SessionStore({ dir: dir + "/sessions", enabled: true, debounceMs: 60_000 });
     _setStoreForTest(store2);
@@ -199,17 +204,47 @@ test("resume-inheritance MISS seeds the timestamp ledger from the closest tracke
     const paddr2 = proxy2.address();
     assert(paddr2 && typeof paddr2 === "object");
     try {
-        const r2 = await fetch(`http://127.0.0.1:${paddr2.port}/bili/${upstreamUrl}/v1/messages`, { method: "POST", headers: { "content-type": "application/json", "x-acp-session": "new" }, body: JSON.stringify({ model: "claude-test", max_tokens: 1024, stream: false, messages }) });
+        const beforeT2 = Date.now();
+        // v3 continuation shape — mirrors the production telemetry (#5608): the
+        // desktop re-sends the SAME history with recent-tail drift (it re-renders
+        // tool outputs/markers/session bits differently on reload) and appends
+        // the new turn. The drifted tail defeats byte-exact matching (the strong
+        // path needs an exact match), so this request lands on the WEAK rung.
+        // Had the client replayed faithfully, findResumeParent above would have
+        // adopted via the strong #1486 path instead — both rungs must carry the
+        // ledger; this test pins the miss fallback specifically.
+        const drifted = [
+            ...messages.slice(0, 7),
+            { role: "assistant", content: "miss-seed answer four (re-rendered by the desktop on reload)" },
+            { role: "user", content: "miss-seed turn five — the new turn after the restart" },
+        ];
+        const r2 = await fetch(`http://127.0.0.1:${paddr2.port}/bili/${upstreamUrl}/v1/messages`, { method: "POST", headers: { "content-type": "application/json", "x-acp-session": "new" }, body: JSON.stringify({ model: "claude-test", max_tokens: 1024, stream: false, messages: drifted }) });
         assert.equal(r2.status, 200, await r2.text());
         const fresh = getSession("new");
-        assert.deepEqual(fresh.state.tsStamps, oldStamps, "the miss seeded the ledger from the closest chain instead of letting the stamp node mint now-times for days-old history");
-        // #5608 v2: the miss path no longer seeds timestamps alone — it runs full
-        // weak adoption from the closest chain, so the proof line is the adoption
-        // log naming the weak relationship (same intent: seeding is logged, not silent).
+        const childStamps = fresh.state.tsStamps;
+        assert.ok(childStamps && Object.keys(childStamps).length > 0, "phase 2 session has a stamp ledger");
+        // The days-old ledger rides over wholesale (seed copies every parent
+        // entry, orphaned ids included): no days-old value is re-minted:
+        for (const [key, val] of Object.entries(oldStamps!)) {
+            assert.equal(childStamps[key], val, `days-old stamp ${key} must ride over from the closest chain, not be re-minted now`);
+        }
+        // The NEW work mints now-time entries only for itself: the appended turn
+        // (and possibly the drifted tail message whose raw-id changed identity).
+        // Never for the pre-drift history:
+        const newKeys = Object.keys(childStamps!).filter((k) => !(k in oldStamps!));
+        assert.ok(newKeys.length >= 1 && newKeys.length <= 2, `only the fresh/drifted turns are minted (${newKeys.length} new keys: ${JSON.stringify(newKeys)}), not the whole history`);
+        for (const k of newKeys) {
+            const s = childStamps![k];
+            assert.ok(s >= beforeT2 - 5_000 && s <= Date.now() + 5_000, `fresh entry ${k} carries a live now-time in ms (got ${s}, request at ${beforeT2})`);
+        }
+        // #5608: the miss path runs full weak adoption from the closest chain, so the
+        // proof line is the adoption log naming the weak relationship (seeding is logged, not silent).
         assert.ok(logs.some((l) => l.includes("weakly resumed closest chain after byte-exact miss") && l.includes("old")), "weak adoption is logged, not silent");
     } finally {
         setLogCapture(null);
         store2.closeQuietly();
+        // shared singleton hygiene: leave no chain behind for later tests in this file
+        prefixAffinity.forget("new");
         await closeServers([proxy2, upstream], "miss-seed phase 2");
         if (prevStampEnv === undefined) delete process.env.BILI_MESSAGE_TIMESTAMPS;
         else process.env.BILI_MESSAGE_TIMESTAMPS = prevStampEnv;
@@ -262,6 +297,98 @@ function weakFixtures() {
     } as unknown as Session;
     return { parsed, msgs, parent, child };
 }
+
+test("weak-adoption gate: equal-depth replays and truncated subviews start FRESH (#5608 v3)", { timeout: 90_000 }, async () => {
+    const dir = mkdtempSync(join(tmpdir(), "bili-miss-gate-"));
+    for (const key of ["XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME"]) process.env[key] = dir;
+    const prevStampEnv = process.env.BILI_MESSAGE_TIMESTAMPS;
+    delete process.env.BILI_MESSAGE_TIMESTAMPS;
+    _resetSessionsForTest();
+    // Ten distinct messages: the miss diagnostics only judge chains at or above
+    // MIN_RESUME_PREFIX (8) — the truncated subview below stays just above that
+    // floor so it still produces a closest candidate.
+    const messages = [
+        { role: "user", content: "gate turn one with enough substance to fingerprint" },
+        { role: "assistant", content: "gate answer one" },
+        { role: "user", content: "gate turn two" },
+        { role: "assistant", content: "gate answer two" },
+        { role: "user", content: "gate turn three" },
+        { role: "assistant", content: "gate answer three" },
+        { role: "user", content: "gate turn four" },
+        { role: "assistant", content: "gate answer four" },
+        { role: "user", content: "gate turn five" },
+        { role: "assistant", content: "gate answer five" },
+    ];
+    const upstream = http.createServer((req, res) => {
+        req.resume();
+        req.on("end", () => {
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ id: "msg_test", role: "assistant", content: [{ type: "text", text: "answer" }], usage: { input_tokens: 1000, output_tokens: 10 } }));
+        });
+    });
+    upstream.listen(0, "127.0.0.1");
+    await once(upstream, "listening");
+    const uaddr = upstream.address();
+    assert(uaddr && typeof uaddr === "object");
+    const upstreamUrl = `http://127.0.0.1:${uaddr.port}`;
+    const options = { port: 0, host: "127.0.0.1", upstream: upstreamUrl, routes: { [upstreamUrl]: { models: { "claude-test": { context: 400000 } } } }, modelContextLimit: 400000, kernelConfig: defaultConfig(400000), compress: { injectTool: true, injectNudge: true, preserveRecentMessages: 1, preserveRecentTokens: 0, minCompressRangeChars: 100 }, promptCache: { routing: "auto" }, sessionHeader: "x-acp-session", log: true, debug: false, passthrough: false, autoUpdate: false, mitm: { enabled: false, domains: [] } } as ProxyOptions;
+
+    // Phase 1: build the 8-message chain under id "old" and persist it.
+    const store1 = new SessionStore({ dir: dir + "/sessions", enabled: true, debounceMs: 60_000 });
+    _setStoreForTest(store1);
+    _setForTest({});
+    const proxy1 = await startServer(options);
+    await once(proxy1, "listening");
+    const paddr1 = proxy1.address();
+    assert(paddr1 && typeof paddr1 === "object");
+    try {
+        const r1 = await fetch(`http://127.0.0.1:${paddr1.port}/bili/${upstreamUrl}/v1/messages`, { method: "POST", headers: { "content-type": "application/json", "x-acp-session": "old" }, body: JSON.stringify({ model: "claude-test", max_tokens: 1024, stream: false, messages }) });
+        assert.equal(r1.status, 200, await r1.text());
+        flushPrefixAffinity();
+        prefixAffinity.forget("old");
+        assert.ok(store1.flushSync(getSession("old")), "phase 1 session persisted");
+    } finally {
+        store1.closeQuietly();
+        await closeServers([proxy1], "miss-gate phase 1");
+    }
+
+    // Phase 2: fresh process state. Two resends that must BOTH stay fresh — the
+    // v2 bug shipped exactly these shapes being adopted (#3686 CI red): an
+    // equal-depth byte-exact replay under a new id, then a shorter subview of
+    // what the replay itself just tracked.
+    _resetSessionsForTest();
+    const store2 = new SessionStore({ dir: dir + "/sessions", enabled: true, debounceMs: 60_000 });
+    _setStoreForTest(store2);
+    const logs: string[] = [];
+    setLogCapture((level, msg) => { if (level === "info") logs.push(msg); });
+    const proxy2 = await startServer(options);
+    await once(proxy2, "listening");
+    const paddr2 = proxy2.address();
+    assert(paddr2 && typeof paddr2 === "object");
+    const post2 = (id: string, msgs: unknown[]) => fetch(`http://127.0.0.1:${paddr2.port}/bili/${upstreamUrl}/v1/messages`, { method: "POST", headers: { "content-type": "application/json", "x-acp-session": id }, body: JSON.stringify({ model: "claude-test", max_tokens: 1024, stream: false, messages: msgs }) });
+    try {
+        const eq = await post2("eq-replay", messages);
+        assert.equal(eq.status, 200, await eq.text());
+        const trunc = await post2("trunc-resend", messages.slice(0, 9));
+        assert.equal(trunc.status, 200, await trunc.text());
+        assert.ok(!logs.some((l) => l.includes("weakly resumed closest chain")), `neither misfire shape may be adopted weakly, saw: ${JSON.stringify(logs.filter((l) => l.includes("resume-inheritance")))}`);
+        assert.ok(logs.some((l) => l.includes("eq-replay") && l.includes("equal-depth shape")), "the equal-depth replay names its rejection reason");
+        assert.ok(logs.some((l) => l.includes("trunc-resend") && l.includes("truncated shape")), "the truncated resend names its rejection reason");
+        const eqStamps = getSession("eq-replay").state.tsStamps;
+        const truncStamps = getSession("trunc-resend").state.tsStamps;
+        assert.ok(eqStamps && Object.keys(eqStamps).length > 0, "the equal-depth replay mints its OWN ledger (no inheritance)");
+        assert.notStrictEqual(truncStamps, eqStamps, "the truncated resend holds a distinct ledger object");
+    } finally {
+        setLogCapture(null);
+        store2.closeQuietly();
+        // shared singleton hygiene: leave no chain behind for later tests
+        prefixAffinity.forget("eq-replay");
+        prefixAffinity.forget("trunc-resend");
+        await closeServers([proxy2, upstream], "miss-gate phase 2");
+        if (prevStampEnv === undefined) delete process.env.BILI_MESSAGE_TIMESTAMPS;
+        else process.env.BILI_MESSAGE_TIMESTAMPS = prevStampEnv;
+    }
+});
 
 test("maybeAdoptResume weak path (via): seeds refs+stamps+blocks and logs the WEAK relationship (#5608)", () => {
     _setStoreForTest(new SessionStore({ enabled: false }));
