@@ -140,7 +140,10 @@ test("#5744: steady-state saves touch O(new) refs rows, never the full history",
     const dir = tmpdir("bili-5744-steady-");
     try {
         const { shadow, store } = openPair(dir);
-        const meter = instrument(store);
+        // record() writes through the shadow's OWN store instance — a second
+        // connection to the same file. A meter on the standalone handle above
+        // would count zero statements and make every budget below vacuous.
+        const meter = instrument((shadow as unknown as { sync: UnifiedStore }).sync);
         try {
             const n0 = 100;
             let legacy = mkLegacy("steady", n0);
@@ -162,8 +165,10 @@ test("#5744: steady-state saves touch O(new) refs rows, never the full history",
                     n0 + turn * 2,
                     `turn ${turn}: ledger must track the session`,
                 );
+                // >= 2: the old-set read plus the upsert batch must actually
+                // execute — a zero count means the meter watches no writes.
                 assert.ok(
-                    meter.refsTouching() <= 3,
+                    meter.refsTouching() >= 2 && meter.refsTouching() <= 3,
                     `turn ${turn}: ${meter.refsTouching()} refs statements for +2 rows (old code: ~${n0 + turn * 2 + 1})`,
                 );
             }
@@ -193,7 +198,7 @@ test("#5744: compaction-shaped renumber reconciles in bounded statements without
     const dir = tmpdir("bili-5744-renumber-");
     try {
         const { shadow, store } = openPair(dir);
-        const meter = instrument(store);
+        const meter = instrument((shadow as unknown as { sync: UnifiedStore }).sync);
         try {
             const n = 120;
             const pruned = 20; // first 20 ids are "reaped": survivors shift down
@@ -211,7 +216,7 @@ test("#5744: compaction-shaped renumber reconciles in bounded statements without
             // of the ~100 moved rows (≤ ceil(100/160) statements) — and NOT
             // the old n+1 replace storm.
             assert.ok(
-                meter.refsTouching() <= 6,
+                meter.refsTouching() >= 2 && meter.refsTouching() <= 6,
                 `${meter.refsTouching()} refs statements for a full renumber (old code: ${n + 1})`,
             );
 
