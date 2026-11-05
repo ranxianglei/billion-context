@@ -1700,11 +1700,12 @@ export class UnifiedStore {
             this.db.prepare("DELETE FROM refs WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM ccr_entries WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM conversations WHERE session_id = ?").run(sessionId);
-            // #5643: fastpath v6 identity-plane partitions hang off this
-            // session through the ext registry (persist.ts
-            // PF_V6_SID_REGISTRY_EXT_KEY); cascade their ledger/log/ckpt rows
-            // in the SAME transaction so deletion leaves no cross-plane
-            // orphans (tables exist by migration invariant).
+            // #5643/#5664: fastpath v6 plane partitions hang off this session
+            // through the ext registry (persist.ts PF_V6_SID_REGISTRY_EXT_KEY);
+            // cascade BOTH planes — the three identity tables AND the three
+            // render-snapshot tables (#5664) — in the SAME transaction so
+            // deletion leaves no cross-plane orphans (all six tables exist by
+            // migration invariant once the registry row does).
             const pfRegRow = this.db
                 .prepare("SELECT value_json FROM session_ext WHERE session_id = ? AND key = 'pf:v6-sids'")
                 .get(sessionId) as { value_json: string } | undefined;
@@ -1719,6 +1720,9 @@ export class UnifiedStore {
                     this.db.prepare("DELETE FROM pf_rows WHERE sid = ?").run(sid);
                     this.db.prepare("DELETE FROM pf_log WHERE sid = ?").run(sid);
                     this.db.prepare("DELETE FROM pf_ckpt WHERE sid = ?").run(sid);
+                    this.db.prepare("DELETE FROM pf_render WHERE sid = ?").run(sid);
+                    this.db.prepare("DELETE FROM pf_render_log WHERE sid = ?").run(sid);
+                    this.db.prepare("DELETE FROM pf_render_ckpt WHERE sid = ?").run(sid);
                 }
             }
             this.db.prepare("DELETE FROM session_ext WHERE session_id = ?").run(sessionId);

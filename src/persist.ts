@@ -2284,7 +2284,10 @@ export class SessionStore {
     /** Session teardown (#5643 §8 test 19 third clause): sweep the pf plane
      *  for EVERY sid this relay session was ever issued. Reads the registry
      *  from ext FIRST (deleteSession sweeps session_ext itself), then deletes
-     *  rows/log/ckpt. Safe to call when nothing was ever issued. */
+     *  all SIX plane tables — identity rows/log/ckpt AND the #5664 render
+     *  snapshot tables (deleteSession's own cascade covers them in-txn too;
+     *  this facade is the standalone maintenance entry). Safe to call when
+     *  nothing was ever issued. */
     pfDeleteForSession(sessionId: string): void {
         if (!this.shadow || this.shadow.stats.disabled) return;
         const reg = this.shadow.getSessionExt(sessionId, this.PF_V6_SID_REGISTRY_EXT_KEY) as string[] | undefined;

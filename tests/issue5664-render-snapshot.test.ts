@@ -360,6 +360,32 @@ test("unit: session cascade wipes render tables; v12 re-migration is a no-op", (
     } finally { h.cleanup(); }
 });
 
+// Real deletion path pin: `bili sessions rm` / boot dedup reach the planes
+// through UnifiedStore.deleteSession ONLY — pfDeleteForSession is not on that
+// path. Both planes must be swept by the same cascade or every removed
+// session leaks its render-snapshot tables forever.
+test("unit: removeSession's real path wipes identity AND render planes together", async () => {
+    const h = makeH("cascade-rm");
+    try {
+        const b1 = makeBody([{ role: "user", content: "hello" }]);
+        const r1 = v6Eval(h, "s-cas-rm", b1, ["id0"]);
+        r1.fin();
+        const sid = r1.sid!;
+        const cast = commitRenderCapture({ sessionId: "s-cas-rm", store: h.store, sid, mode: "legacy", caps: capsFor("none"), rowStrings: ['{"a":1}', '{"b":2}'], sums: { estCum: 2, textCum: 2, imgCum: 0 } });
+        assert.equal(cast.op, "cast");
+        assert.equal(h.store.pfRenderRows(sid).length, 2);
+        assert.ok(h.store.pfMeta(sid) !== null && h.store.pfMeta(sid)!.log.length > 0, "identity plane has data too");
+        await h.store.removeSession("s-cas-rm");
+        const db = new DatabaseSync(path.join(h.dir, "index.db"));
+        try {
+            for (const t of ["pf_rows", "pf_log", "pf_ckpt", "pf_render", "pf_render_log", "pf_render_ckpt"]) {
+                const row = db.prepare(`SELECT COUNT(*) AS n FROM ${t}`).get() as { n: number } | undefined;
+                assert.equal(row?.n, 0, `${t} must be empty after session deletion`);
+            }
+        } finally { db.close(); }
+    } finally { h.cleanup(); }
+});
+
 // ---------------------------------------------------------------------------
 // Golden tier: FAST emit == legacy emit at EVERY engaged turn, byte-for-byte,
 // across arm → steady fast rounds → client compaction (turn 8) → audit
