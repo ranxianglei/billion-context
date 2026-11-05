@@ -107,6 +107,10 @@ export const LIVE_FILES = [
     // #4612: spawns an idle node child as the "other live process" fixture;
     // binds no ports, mkdtemp-isolated per test
     "tests/issue4612-gc-online-guard.test.ts",
+    // #5631 restart survival: real bili proxy children under OS signals
+    // (SIGTERM/SIGKILL/clean shutdown). Private mkdtemp homes per lane-arm,
+    // probed-free ports re-probed on every restart — no band reuse.
+    "tests/issue5631-restart-survival.test.ts",
 ];
 
 /** Band width per live file: the zone ladder drifts +1 per EADDRINUSE retry;
