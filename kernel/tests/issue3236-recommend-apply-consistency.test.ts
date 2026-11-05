@@ -21,14 +21,26 @@ function config(): Config {
   return {
     tiers: { enabled: false },
     nudge: {
-      maxContextLimitPct: 0.55, minContextLimitPct: 0.45, frequency: 5, iterationThreshold: 15,
-      force: "soft", growthRatio: 0.05, growthFloor: 6000, growthCap: 50000,
-      minGrowthFloor: 5000, minGrowthRatio: 0.45, emergencyThresholdPct: 0.98,
+      maxContextLimitPct: 0.55,
+      minContextLimitPct: 0.45,
+      frequency: 5,
+      iterationThreshold: 15,
+      force: "soft",
+      growthRatio: 0.05,
+      growthFloor: 6000,
+      growthCap: 50000,
+      minGrowthFloor: 5000,
+      minGrowthRatio: 0.45,
+      emergencyThresholdPct: 0.98,
     },
     promotionThreshold: 5,
     truncate: { threshold: 1 },
     merge: { maxSummaryLength: 3000, minOldGenBlocks: 3 },
-    compress: { minCompressRange: 5000, maxSummaryLength: 20000, minSummaryLength: 1 },
+    compress: {
+      minCompressRange: 5000,
+      maxSummaryLength: 20000,
+      minSummaryLength: 1,
+    },
     protectedTools: [],
     preserveRecentMessages: 0,
     preserveRecentTokens: 0,
@@ -44,7 +56,14 @@ function mk(
   toolCallId?: string,
   len = 1500,
 ): CoreMessage {
-  return { id, role, contentType: ct, toolName, toolCallId, text: "x".repeat(len) };
+  return {
+    id,
+    role,
+    contentType: ct,
+    toolName,
+    toolCallId,
+    text: "x".repeat(len),
+  };
 }
 
 interface Scenario {
@@ -158,7 +177,10 @@ function buildTwoBursts(
   return { state, all };
 }
 
-function refIndexMap(state: CompressionState, all: CoreMessage[]): Map<string, number> {
+function refIndexMap(
+  state: CompressionState,
+  all: CoreMessage[],
+): Map<string, number> {
   const map = new Map<string, number>();
   all.forEach((m, i) => {
     const ref = state.messageRefs.byRaw[m.id];
@@ -186,7 +208,13 @@ function assertAdvertisedApplyCleanly(
   assert.ok(ranges.length > 0, `${label}: fresh content must be advertised`);
   for (const r of ranges) {
     const applied = core.applyCompression({
-      ranges: [{ startRef: r.startRef, endRef: r.endRef, summary: "steady-state fold" }],
+      ranges: [
+        {
+          startRef: r.startRef,
+          endRef: r.endRef,
+          summary: "steady-state fold",
+        },
+      ],
       messages: all,
       state: structuredClone(state),
       config: cfg,
@@ -223,7 +251,13 @@ test("#3236 A/A2: burst with delayed results folds atomically at any distance (#
     // the advertised-applies-cleanly contract below is the guard that matters.
     for (const r of ranges) {
       const applied = core.applyCompression({
-        ranges: [{ startRef: r.startRef, endRef: r.endRef, summary: "steady-state fold" }],
+        ranges: [
+          {
+            startRef: r.startRef,
+            endRef: r.endRef,
+            summary: "steady-state fold",
+          },
+        ],
         messages: all,
         state: structuredClone(state),
         config: cfg,
@@ -239,11 +273,13 @@ test("#3236 A/A2: burst with delayed results folds atomically at any distance (#
     // the delayed results in from any distance (A2's window rationale is
     // gone), so A and A2 fold identically now — the span folds whole.
     const doomed = core.applyCompression({
-      ranges: [{
-        startRef: state.messageRefs.byRaw["R"]!,
-        endRef: state.messageRefs.byRaw["RS1"]!,
-        summary: "manual burst span",
-      }],
+      ranges: [
+        {
+          startRef: state.messageRefs.byRaw["R"]!,
+          endRef: state.messageRefs.byRaw["RS1"]!,
+          summary: "manual burst span",
+        },
+      ],
       messages: all,
       state: structuredClone(state),
       config: cfg,
@@ -279,7 +315,13 @@ test("#3236 B: two interleaved bursts — advertised clean, gate intact on manua
     assert.notEqual(s, undefined, `start ${r.startRef} resolvable`);
     assert.notEqual(e, undefined, `end ${r.endRef} resolvable`);
     const applied = core.applyCompression({
-      ranges: [{ startRef: r.startRef, endRef: r.endRef, summary: "steady-state fold" }],
+      ranges: [
+        {
+          startRef: r.startRef,
+          endRef: r.endRef,
+          summary: "steady-state fold",
+        },
+      ],
       messages: all,
       state: structuredClone(state),
       config: cfg,
@@ -294,11 +336,13 @@ test("#3236 B: two interleaved bursts — advertised clean, gate intact on manua
   // #5751: the double burst folds atomically — the id-exact widening pulls
   // both bursts' delayed results (LA2..LB3) in from any distance.
   const doomed = core.applyCompression({
-    ranges: [{
-      startRef: state.messageRefs.byRaw["RA"]!,
-      endRef: state.messageRefs.byRaw["RB_RS1"]!,
-      summary: "manual double-burst span",
-    }],
+    ranges: [
+      {
+        startRef: state.messageRefs.byRaw["RA"]!,
+        endRef: state.messageRefs.byRaw["RB_RS1"]!,
+        summary: "manual double-burst span",
+      },
+    ],
     messages: all,
     state: structuredClone(state),
     config: cfg,
