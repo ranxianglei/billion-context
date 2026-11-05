@@ -2205,7 +2205,7 @@ test("harvest-stall: full compliance (>= 50% harvest) never latches — T1 keeps
     state: s1,
     config,
   }).state;
-  assert.equal(s2.nudge.t1HarvestStall, false, "a delivering channel clears/never sets the stall");
+  assert.equal(s2.nudge.t1HarvestStall, undefined, "a delivering channel clears/never sets the stall");
   const turn = core.processTurn({ messages, state: s2, config, tokenCount: 56000 });
   assert.equal(turn.nudge.shouldInject, true);
   assert.equal(turn.nudge.tier, 1, "no stall → legacy T1-first arbitration unchanged");
@@ -2223,7 +2223,7 @@ test("harvest-stall: a distillation fold clears a latched stall regardless of ra
     state: s2,
     config,
   }).state;
-  assert.equal(s3.nudge.t1HarvestStall, false, "progress on the higher tiers clears the stall");
+  assert.equal(s3.nudge.t1HarvestStall, undefined, "progress on the higher tiers clears the stall");
   const turn = core.processTurn({ messages, state: s3, config, tokenCount: 56000 });
   assert.equal(turn.nudge.shouldInject, true);
   assert.equal(turn.nudge.tier, 1, "stall cleared → T1 may take the slot again");

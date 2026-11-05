@@ -883,16 +883,16 @@ export function createCore(ports: Ports = {}): CompressionCore {
       const producedDistillation = state.blocks.some(
         (b) => !preFoldBlockIds.has(b.blockId) && b.tier >= 2,
       );
-      if (producedDistillation) {
-        // Progress on the higher tiers clears the latch even when no T1 fire
-        // is being measured right now — the channel moved where it counts.
-        state.nudge.t1HarvestStall = false;
-      }
       const armedT1Pending = state.nudge.lastT1FirePending;
       state.nudge.lastT1FirePending = undefined;
+      // Absent-only storage (#5698): "no stall" is the ABSENCE of the key, never a stored
+      // false — a stored false would serialize into every measured session's snapshot
+      // and drift the persistence goldens for zero information.
       if (!producedDistillation && armedT1Pending !== undefined && armedT1Pending > 0) {
-        state.nudge.t1HarvestStall =
-          tokensCompressed / armedT1Pending < STALL_HARVEST_RATIO;
+        if (tokensCompressed / armedT1Pending < STALL_HARVEST_RATIO) state.nudge.t1HarvestStall = true;
+        else delete state.nudge.t1HarvestStall;
+      } else if (producedDistillation) {
+        delete state.nudge.t1HarvestStall;
       }
       // A successful compression is by definition viable progress — restart
       // the terminal-floor streak so the escape signal can only fire again

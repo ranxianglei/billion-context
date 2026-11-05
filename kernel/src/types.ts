@@ -170,7 +170,9 @@ export interface NudgeState {
    *  leg crossed its own threshold (dropping the legacy "> t1Eff" demand) and
    *  removes T1 from the pressure candidates whenever the remaining tiers can
    *  clear minPressureBenefit. Cleared by a harvest at/above the ratio or by a
-   *  distillation fold. Optional (absent = false = legacy arbitration). */
+   *  distillation fold. Optional, absent-only storage: a latch stores true, a clear
+   *  DELETES the key rather than storing false, so feature-inactive snapshots stay
+   *  byte-identical to pre-#5698 ones. Absent = no stall = legacy arbitration. */
   t1HarvestStall?: boolean;
 }
 
