@@ -3,11 +3,16 @@
 // Golden equation under test: on every engaged turn the emit array built as
 // [cached prefix rows] + [freshly mapped tail] (fast rounds) must be BYTE-
 // IDENTICAL to what the legacy full-pipeline path emits (arm / audit /
-// caps-flip rollback rounds). The kernel is untouched; this lane caches
-// egress bytes, not semantics — equivalence with the full pass is the
-// contract. B-version compaction semantics hold throughout: client-side
-// element deletion is IGNORED by the identity plane (ledger grows forward
-// only), so both arms grow identically and stay byte-comparable.
+// rollback rounds). The kernel is untouched; this lane caches egress bytes,
+// not semantics — equivalence with the full pass is the contract.
+//
+// NO-RECAST REGIME (owner ruling 2026-11-05, sealed during #5689 review):
+// recast is FORBIDDEN in every scenario — any stored-row divergence (byte
+// diff, shrink, caps flip that changed bytes, checksum corruption,
+// unverifiable pre-existing snapshot) KILLS the plane for that sid
+// permanently (persisted kind='dead' log entry) and the session rides the
+// legacy full path forever after. Storage is strictly append-only (+ dead
+// markers); arm cast is legal exactly once, onto an empty table.
 //
 // Harness: unit-level against a REAL sqlite sidecar (UnifiedShadow shadow
 // mode), mirroring tests/fastpath-v6-msgid.test.ts; the kernel runs as a
@@ -119,8 +124,8 @@ test("unit: diffRowLists verdicts", () => {
     assert.equal(diffRowLists([], ["a"]), "append");
     assert.equal(diffRowLists(["a", "b"], ["a", "b"]), "equal");
     assert.equal(diffRowLists(["a", "b"], ["a", "b", "c"]), "append");
-    assert.equal(diffRowLists(["a", "b"], ["a", "X"]), "recast");   // middle mutation
-    assert.equal(diffRowLists(["a", "b", "c"], ["a"]), "recast");   // shrink
+    assert.equal(diffRowLists(["a", "b"], ["a", "X"]), "diverged");   // middle mutation
+    assert.equal(diffRowLists(["a", "b", "c"], ["a"]), "diverged");   // shrink
 });
 
 test("unit: cast → steady appends → hydrate-from-disk fold survives mirror loss", (t) => {
@@ -195,7 +200,7 @@ test("gate: red reasons are a stable vocabulary", (t) => {
     } finally { h.cleanup(); }
 });
 
-test("unit: S4 checksum tamper kills the mirror (hydrate-failed, loudly logged)", (t) => {
+test("unit: S4 checksum tamper KILLS the plane durably (loudly logged)", (t) => {
     const h = makeH("s4");
     try {
         const b1 = makeBody([{ role: "user", content: "hello" }]);
@@ -218,7 +223,82 @@ test("unit: S4 checksum tamper kills the mirror (hydrate-failed, loudly logged)"
             maxPos: 0, tokenCount: 10, modelContextLimit: MODEL_LIMIT, caps,
             snapshotLaneActive: false, absorbActive: false, ccrOn: false, foldUsagePending: false, markerNonZero: false,
         });
-        assert.deepEqual(g, { ok: false, reason: "hydrate-failed" });
+        // No-recast ruling: corruption is no longer self-healable via a
+        // forced recast — the FIRST hydration attempt reports the DURABLE
+        // reason and persists the death verdict.
+        assert.deepEqual(g, { ok: false, reason: "lane-dead" });
+        const meta = h.store.pfRenderMeta(sid);
+        assert.ok(meta !== null && meta.log.some((e) => e.kind === "dead"), "corruption must persist a kind='dead' verdict");
+    } finally { h.cleanup(); }
+});
+
+test("unit: structural divergence KILLS the plane permanently (no-recast ruling 2026-11-05)", (t) => {
+    const h = makeH("die");
+    try {
+        const b1 = makeBody([{ role: "user", content: "hello" }]);
+        const r1 = v6Eval(h, "s-die", b1, ["id0"]);
+        r1.fin();
+        const sid = r1.sid!;
+        const caps = capsFor("text-only");
+        assert.equal(commitRenderCapture({ sessionId: "s-die", store: h.store, sid, log: h.log, mode: "legacy", caps, rowStrings: ['{"i":0}', '{"i":1}'], sums: { estCum: 2, textCum: 2, imgCum: 0 } }).op, "cast");
+        assert.equal(commitRenderCapture({ sessionId: "s-die", store: h.store, sid, log: h.log, mode: "steady", caps, rowStrings: ['{"i":2}'], sums: { estCum: 1, textCum: 1, imgCum: 0 } }).op, "append");
+        // Middle-byte mutation lands on a full-path round. The old design
+        // repaired with a recast; the ruling forbids that ⇒ kill instead.
+        const logsBefore = h.log.lines.length;
+        const op = commitRenderCapture({ sessionId: "s-die", store: h.store, sid, log: h.log, mode: "legacy", caps, rowStrings: ['{"i":0}', '{"X":9}', '{"i":2}'], sums: { estCum: 3, textCum: 3, imgCum: 0 } });
+        assert.deepEqual(op, { committed: false, op: "none" });
+        assert.equal(h.store.pfRenderRows(sid).length, 3, "stored rows stay immutable after a divergence");
+        assert.equal(h.store.pfRenderCkptIntact(sid), true, "the kill writes NO checkpoint (strictly append-only)");
+        assert.ok(h.log.lines.slice(logsBefore).some((l) => l.level === "error" && l.msg.includes("KILLED PERMANENTLY")),
+            `kill must be loudly logged, got ${JSON.stringify(h.log.lines.slice(logsBefore))}`);
+        const meta = h.store.pfRenderMeta(sid);
+        assert.ok(meta !== null && meta.log.some((e) => e.kind === "dead"), "death verdict persisted as kind='dead'");
+        const base = {
+            sessionId: "s-die", session: { id: "s-die", state: createInitialState() } as unknown as Session,
+            store: h.store, engagedHit: true, armedTurn: false, isTitleGen: false, sid,
+            maxPos: 2, tokenCount: 50, modelContextLimit: MODEL_LIMIT, caps,
+            snapshotLaneActive: false, absorbActive: false, ccrOn: false, foldUsagePending: false, markerNonZero: false,
+        };
+        assert.deepEqual(renderPlaneGate(base), { ok: false, reason: "lane-dead" }, "positive: dead sid reports the durable reason");
+        // Negative side (#3617): neither re-capture nor a restart-wipe'd
+        // re-arm can bring the lane back — no rewriting of stored rows EVER.
+        assert.deepEqual(commitRenderCapture({ sessionId: "s-die", store: h.store, sid, mode: "legacy", caps, rowStrings: ['{"i":0}', '{"X":9}', '{"i":2}'], sums: { estCum: 3, textCum: 3, imgCum: 0 } }),
+            { committed: false, op: "none" }, "re-capture into a dead plane is refused");
+        assert.equal(h.store.pfRenderRows(sid).length, 3);
+    } finally { h.cleanup(); }
+});
+
+test("unit: plane death persists across restart (no re-arm ever)", (t) => {
+    const h = makeH("pdeath");
+    try {
+        const b1 = makeBody([{ role: "user", content: "hello" }]);
+        const r1 = v6Eval(h, "s-pdeath", b1, ["id0"]);
+        r1.fin();
+        const sid = r1.sid!;
+        const caps = capsFor("text-only");
+        assert.equal(commitRenderCapture({ sessionId: "s-pdeath", store: h.store, sid, mode: "legacy", caps, rowStrings: ['{"a":1}', '{"a":2}'], sums: { estCum: 2, textCum: 2, imgCum: 0 } }).op, "cast");
+        assert.equal(commitRenderCapture({ sessionId: "s-pdeath", store: h.store, sid, mode: "legacy", caps, rowStrings: ['{"a":1}', '{"MUTATED":2}'], sums: { estCum: 2, textCum: 2, imgCum: 0 } }).committed, false);
+        // Process-restart simulation: wipe ALL in-memory plane state (the
+        // death set included) and reopen the SAME sidecar (cascade pattern).
+        _resetWatermarkV6RenderTestState();
+        const shadow2 = UnifiedShadow.maybeOpen(h.dir, { BILI_STORAGE_UNIFIED: "shadow" }, (r) => r as never);
+        assert.ok(shadow2, "second open must tolerate the existing sidecar");
+        const store2 = new SessionStore({ dir: path.join(h.dir, "sessions"), enabled: true, shadow: shadow2 });
+        const g = renderPlaneGate({
+            sessionId: "s-pdeath", session: { id: "s-pdeath", state: createInitialState() } as unknown as Session,
+            store: store2, engagedHit: true, armedTurn: false, isTitleGen: false, sid,
+            maxPos: 1, tokenCount: 10, modelContextLimit: MODEL_LIMIT, caps,
+            snapshotLaneActive: false, absorbActive: false, ccrOn: false, foldUsagePending: false, markerNonZero: false,
+        });
+        assert.deepEqual(g, { ok: false, reason: "lane-dead" }, "persisted kind='dead' verdict binds the NEW process too");
+        assert.equal(store2.pfRenderRows(sid).length, 2, "row table stays frozen");
+        // An explicit arming-style full capture through the new store is
+        // refused — the lane is dead until session teardown, period.
+        assert.equal(
+            commitRenderCapture({ sessionId: "s-pdeath", store: store2, sid, mode: "legacy", caps, rowStrings: ['{"a":1}', '{"a":2}'], sums: { estCum: 2, textCum: 2, imgCum: 0 } }).committed,
+            false, "re-arm through a fresh process is impossible",
+        );
+        shadow2.close();
     } finally { h.cleanup(); }
 });
 
@@ -252,8 +332,12 @@ test("unit: session cascade wipes render tables; v12 re-migration is a no-op", (
 
 // ---------------------------------------------------------------------------
 // Golden tier: FAST emit == legacy emit at EVERY engaged turn, byte-for-byte,
-// across arm → steady fast rounds → client compaction (turn 8) → strategy
-// strategy-flip recast (turn 14) → audit cadence (fires for real at turn 10) → restart-hydration continuation.
+// across arm → steady fast rounds → client compaction (turn 8) → audit
+// cadence (fires for real at turn 10) → strategy flip (turn 14) → restart.
+// No-recast ruling: the flip's byte divergence KILLS the plane at turn 14;
+// every later round rides lane-dead legacy (bytes still oracle-exact), the
+// stored table freezes at death, and the persisted verdict survives phase 3's
+// process-restart reset (hydration refuses re-arm).
 // ---------------------------------------------------------------------------
 
 test("golden: cached-prefix splice equals the legacy full-path bytes end-to-end", async (t) => {
@@ -266,7 +350,8 @@ test("golden: cached-prefix splice equals the legacy full-path bytes end-to-end"
     // (ledger grows forward only), views and rows keep growing, and the
     // golden equation must still hold element-stable (ids follow elements,
     // never positions). Strategy flips text-only→none at turn 14 ⇒ caps flip
-    // ⇒ forced legacy recast round, then steady on the new byte form.
+    // ⇒ forced legacy round; its bytes diverge from the stored rows ⇒ the
+    // plane KILLS (no recast exists anymore) and turns 15-16 ride lane-dead.
     const ELEMENTS: Msg[] = Array.from({ length: 16 }, (_, i) => ({ role: i % 2 === 0 ? "user" : "assistant", content: `content number ${i}` }));
     const STABLE_ID = (i: number) => `eid-${i}`;
     const clientBody = (tn: number): Msg[] => {
@@ -301,8 +386,9 @@ test("golden: cached-prefix splice equals the legacy full-path bytes end-to-end"
     const stateB: AgentState = createInitialState();
     const sessB = { id: "s-gold-b", state: stateB } as unknown as Session;
     let sidB: string | undefined;
-    let fastRounds = 0, castOps = 0, recastOps = 0, legacyRounds = 0;
+    let fastRounds = 0, castOps = 0, legacyRounds = 0;
     let totalSubmittedRows = 0; // volume discipline pin (see final assert)
+    let steadySubmittedRows = 0; // anti-duplicate-append pin (see final assert)
     let totalSubmittedText = 0;
     for (let tn = 1; tn <= 16; tn++) {
         const strategy = strategyOf(tn);
@@ -384,27 +470,38 @@ test("golden: cached-prefix splice equals the legacy full-path bytes end-to-end"
         // this tier exercises is the accumulation ALGEBRA — each row counted
         // exactly once with its own cost, tail-only deltas on steady rounds.
         const rowCost = (rs: string[]): number => rs.reduce((s, x) => s + x.length, 0);
-        const op = commitRenderCapture({
-            sessionId: "s-gold-b", store: hB.store, sid: sidB!, mode, caps, rowStrings: srcRows,
-            sums: { estCum: rowCost(srcRows), textCum: rowCost(srcRows), imgCum: 0 },
-        });
+        let op: { committed: boolean; op: "none" | "append" | "cast" } = { committed: false, op: "none" };
+        // No-recast regime: once the lane dies, production stops paying for
+        // capture strings entirely (the seam skips the station-2 commit); the
+        // lane rides pure legacy until the session ends. Mirror that here.
+        if (!(mode === "legacy" && !gate.ok && gate.reason === "lane-dead")) {
+            op = commitRenderCapture({
+                sessionId: "s-gold-b", store: hB.store, sid: sidB!, log: hB.log, mode, caps, rowStrings: srcRows,
+                sums: { estCum: rowCost(srcRows), textCum: rowCost(srcRows), imgCum: 0 },
+            });
+        }
         totalSubmittedRows += srcRows.length;
         totalSubmittedText += rowCost(srcRows);
-        if (op.committed) {
-            if (op.op === "cast") castOps++;
-            else if (op.op === "recast") recastOps++;
-        }
+        if (mode === "steady") steadySubmittedRows += srcRows.length;
+        if (op.committed && op.op === "cast") castOps++;
         // THE golden equation: lane emit == legacy oracle, byte for byte.
         assert.deepEqual(rebuilt.map((m) => JSON.stringify(m)), goldens[tn - 1].rows,
             `turn ${tn} (${mode}${gate.ok ? "" : `, reason=${gate.reason}`}): lane emit diverged from legacy oracle`);
         assert.equal(stateB.blocks.length, 0, "assumption pin: no folds materialize in this synthetic conv");
         v.fin(); // plane advances AFTER capture — same order as prepare-openai
-        // Structural regression pin (review round 1, tail-only fix): the render
-        // table must track the identity ledger one-row-per-element at every
-        // turn boundary — a duplicate-append corruption shows up here instantly
-        // instead of hiding behind the byte equation.
-        assert.equal(hB.store.pfRenderRows(sidB!).length, watermarkV6DebugState("s-gold-b").worlds[sidB!]!.maxPos + 1,
-            `turn ${tn}: render table drifted from identity ledger (rows=${hB.store.pfRenderRows(sidB!).length})`);
+        // Structural regression pin (review round 1, tail-only fix): while the
+        // plane is ALIVE the render table must track the identity ledger
+        // one-row-per-element at every turn boundary — a duplicate-append
+        // corruption shows up here instantly instead of hiding behind the byte
+        // equation. After a death the table freezes (nothing re-commits), so
+        // pin the frozen invariant instead.
+        const dbgNow = watermarkV6RenderDebugState("s-gold-b").sids.some((w) => w.dead);
+        if (!dbgNow) {
+            assert.equal(hB.store.pfRenderRows(sidB!).length, watermarkV6DebugState("s-gold-b").worlds[sidB!]!.maxPos + 1,
+                `turn ${tn}: render table drifted from identity ledger (rows=${hB.store.pfRenderRows(sidB!).length})`);
+        } else {
+            assert.equal(hB.store.pfRenderRows(sidB!).length, 13, `turn ${tn} post-death: row table must stay frozen`);
+        }
     }
     assert.equal(castOps, 1, "exactly one cast (the arm turn)");
     // Audit cadence exercised FOR REAL (review round 2): with the flip deferred
@@ -415,26 +512,32 @@ test("golden: cached-prefix splice equals the legacy full-path bytes end-to-end"
     assert.deepEqual(gateSeq.filter((r) => r === "audit-due"), ["audit-due"], `expected exactly one audit-due round, got ${JSON.stringify(gateSeq)}`);
     assert.equal(gateSeq.indexOf("audit-due"), 9, `audit-due expected at loop index 9 (turn 10), got ${JSON.stringify(gateSeq)}`);
     assert.equal(gateSeq[10], "fast", `round right after the audit must recover to fast, got ${JSON.stringify(gateSeq)}`);
-    // ≥ 12 fast rounds = at least TWO full audit waves served green: the first
-    // proves the lane runs, the second proves any legacy round CONSUMES the
-    // audit obligation (pre-fix, tick froze at N and every later turn rode
-    // legacy forever — masked at the time by per-round recasts).
-    assert.ok(fastRounds >= 12, `expected ≥2 audit waves of fast rounds, got ${fastRounds} (audit obligation not consumed?)`);
-    assert.ok(recastOps >= 1, "strategy flip at turn 14 must force ≥1 recast");
-    assert.ok(legacyRounds >= 2, `arm + audit/caps-flip rounds must ride legacy (got ${legacyRounds})`);
+    // Exactly two fast waves before death: 2-9 (pre-audit) + 11-13 (post-audit).
+    assert.ok(fastRounds >= 11, `expected ≥11 fast rounds (two audit waves minus the post-death rounds), got ${fastRounds}`);
+    // NO-RECAST RULING pins: the API offers no recast op at all (the old
+    // counter cannot even be written); the flip's divergent bytes die the
+    // lane at turn 14, and every subsequent round reports the durable reason.
+    assert.equal(gateSeq.indexOf("caps-mismatch"), 13, `flip red expected at loop index 13 (turn 14), got ${JSON.stringify(gateSeq)}`);
+    assert.equal(gateSeq.indexOf("lane-dead"), 14, `first death report expected at loop index 14 (turn 15), got ${JSON.stringify(gateSeq)}`);
+    assert.ok(legacyRounds >= 5, `arm + audit + flip + post-death rounds must ride legacy (got ${legacyRounds})`);
     // Volume discipline (steady deltas must stay O(new) per round, never
     // O(full list)): pre-tail-fix behavior re-submitted the whole list each
     // green round ⇒ ~8×final volume here.
     const finalRowCount = hB.store.pfRenderRows(sidB!).length;
-    assert.ok(totalSubmittedRows <= 3 * finalRowCount,
-        `submitted row-volume ${totalSubmittedRows} vs final table ${finalRowCount} — steady rounds must append tails, not full lists`);
-    // S4 truth intact at the end; mirror agrees with the last golden shape
+    assert.equal(finalRowCount, 13, "row table froze at the death turn (no rewrite, no further commit)");
+    // Volume discipline — steady rounds must stay O(new): every row enters
+    // the table AT MOST ONCE via a steady append (a duplicate-append
+    // corruption would push this past the table size). Legacy full lists are
+    // inherent to their (rare) rounds and are not pinned.
+    assert.ok(steadySubmittedRows <= finalRowCount,
+        `steady-mode submissions ${steadySubmittedRows} exceeded table size ${finalRowCount} — rows must be appended at most once`);
+    // S4 truth intact at the end; mirror froze together with the table
     assert.equal(hB.store.pfRenderCkptIntact(sidB!), true);
     const dbgLhs = watermarkV6RenderDebugState("s-gold-b");
     assert.ok(Array.isArray(dbgLhs.sids) && dbgLhs.sids.length > 0, "render debug state must list the mirror");
-    const lhsRows = dbgLhs.sids[dbgLhs.sids.length - 1].rows;
-    const rhsRows = goldens[goldens.length - 1].rows.length;
-    assert.equal(lhsRows, rhsRows, "mirror row count must equal last golden row count");
+    const lastW = dbgLhs.sids[dbgLhs.sids.length - 1];
+    assert.equal(lastW.dead, true, "debug state must surface the death verdict");
+    assert.equal(lastW.rows, 13, "mirror row count froze at death");
     // Sums algebra pin (review P1-2): every row's cost entered the cumulative
     // ledger EXACTLY once — a frozen-window double-count would overshoot here.
     const finalRowCost = hB.store.pfRenderRows(sidB!).reduce((s, r) => s + (r.rowJson?.length ?? 0), 0);
@@ -453,9 +556,11 @@ test("golden: cached-prefix splice equals the legacy full-path bytes end-to-end"
         tokenCount: 100, modelContextLimit: MODEL_LIMIT, caps: capsFor("none"),
         snapshotLaneActive: false, absorbActive: false, ccrOn: false, foldUsagePending: false, markerNonZero: false, log: hB.log,
     });
-    assert.ok(g17.ok === true || g17.reason === "audit-due",
-        `post-restart gate must hydrate from disk (got ${JSON.stringify(g17)})`);
-    if (g17.ok) assert.equal(g17.rw.rows.length, goldens.at(-1)!.rows.length, "hydrated row count must match the pre-restate capture");
+    // The persisted kind='dead' verdict survives the process-restart wipe:
+    // hydration REFUSES to re-arm a dead plane (no-recast ruling — there is
+    // no rebuild path), and the identity lane keeps working independently.
+    assert.deepEqual(g17, { ok: false, reason: "lane-dead" },
+        `post-restart gate must honor the persisted death verdict (got ${JSON.stringify(g17)})`);
     v17.fin();
     hB.cleanup();
 });

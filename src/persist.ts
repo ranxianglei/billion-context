@@ -2314,7 +2314,6 @@ export class SessionStore {
         sid: string,
         args: {
             rows: { pos: number; rowJson: string | null }[];
-            deletes?: number[];
             logEntries: { kind: string; payloadJson: string }[];
             checkpointMetaJson?: string;
             ts?: number;

@@ -3,9 +3,12 @@
 //
 //   station 1  inbound / identity finalize (per turn, existing #5652 lane)
 //   station 2  this snapshot: steady rounds APPEND one captured row per new
-//               element; compression rounds (arm/audit/fallback) DIFF against
-//               the stored rows and either append or RECAST — and a recast
-//               FORCES an S4-checksum checkpoint in the same transaction.
+//               element; full-path rounds (arm/audit/fallback) DIFF against
+//               the stored rows and APPEND the tail on growth. A RECAST IS
+//               FORBIDDEN IN EVERY SCENARIO (owner ruling 2026-11-05):
+//               any divergence requiring a stored-row rewrite/deletion — or
+//               any post-death rebuild — KILLS the plane for that sid
+//               permanently and the session rides the legacy full path.
 //   station 3  outbound emit: prefix rows pass through verbatim from disk;
 //               only the bounded window tail runs a kernel pass per request.
 //
@@ -25,9 +28,11 @@
 //  G2 capture point = the exact array the baseline emits (rebuiltMessages
 //     before system/ephemeral injection); steady capture stores raw strings
 //     + parsed caches so the prefix never gets re-parsed or re-stringified.
-//  G3 S4 death verdict — a checksum-corrupt checkpoint kills the plane for
-//     that sid at hydration; the next legacy turn's diff self-heals with a
-//     fresh forced checkpoint. Never guess, never forward corrupt bytes.
+//  G3 death verdict — a checksum-corrupt checkpoint, a structurally
+//     diverged capture, or any unverifiable pre-existing snapshot kills the
+//     plane for that sid PERMANENTLY (persisted as a kind='dead' log entry,
+//     surviving restarts). No recast, no re-arm: byte-safety comes from
+//     stopping, not from repairing. Never guess, never forward corrupt bytes.
 //  P7 mirrors are caches (LRU byte budget); losing one = DB re-read.
 import type { SessionStore } from "../persist.js";
 import type { Session } from "../session.js";
@@ -64,7 +69,9 @@ export const PF_RENDER_EMERGENCY_RATIO = 0.9;
 const MIRROR_BYTE_BUDGET = 256 * 1024 * 1024;
 let mirrorBytes = 0;
 
-/** Capabilities fingerprint — any change forces a recast (cheap, correct). */
+/** Capabilities fingerprint — any change red-gates the lane (caps-mismatch);
+ *  if the legacy round's bytes then diverge from the stored rows the plane
+ *  is killed for this sid (no-recast regime). */
 export interface RenderCaps {
     v: 1;
     model: string;
@@ -109,6 +116,8 @@ export interface RenderWorld {
     textCum: number;
     /** Cumulative image-reserve contribution of frozen rows. */
     imgCum: number;
+    /** Set when this sid's plane is dead (no-recast regime) — diagnostic. */
+    dead?: boolean;
     /** Green (fast-served) engaged-turn tick — % PF_RENDER_AUDIT_EVERY === 0
      *  ⇒ audit due. Consumed (zeroed) by ANY legacy full-capture round served,
      *  which IS the audit (the full byte path ran to completion).
@@ -120,6 +129,30 @@ export interface RenderWorld {
 const mirrors = new Map<string, RenderWorld>();
 /** relay session id → pf sids owned by it (teardown sweep). */
 const sessionSids = new Map<string, Set<string>>();
+
+/** Owner ruling 2026-11-05 (#5689 review): NO recast in ANY scenario.
+ *  Structural divergence (byte diff/shrink), caps flips that changed stored
+ *  bytes, S4 corruption, row-table inconsistency, unverifiable pre-existing
+ *  snapshots — all land here. A dead sid NEVER arms, hydrates, gates green,
+ *  or commits again. The verdict is persisted as a kind='dead' log entry so
+ *  every future process instance reaches the same conclusion. */
+const deadSids = new Set<string>();
+
+export function killRenderPlane(store: SessionStore, sid: string, reason: string, log?: LogFn): void {
+    if (!deadSids.has(sid)) {
+        deadSids.add(sid);
+        const rw = mirrors.get(sid);
+        if (rw) rw.dead = true;
+        log?.("error", `[${sid}] #5664 render plane KILLED PERMANENTLY (no-recast regime): ${reason}`);
+        try {
+            store.pfRenderCommit(sid, { rows: [], logEntries: [{ kind: "dead", payloadJson: JSON.stringify({ reason }) }] });
+        } catch {
+            /* soft: the in-memory verdict still binds this process; a storage
+             * failure means the NEXT process rediscovers the same condition
+             * through its own integrity checks (S4 / row table / cast guard) */
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Mirror lifecycle
@@ -170,8 +203,9 @@ export function clearWatermarkV6Render(sessionId: string): void {
  *  Returns null on ANY inconsistency — caller serves the baseline path. */
 function hydrateMirror(store: SessionStore, sid: string, log?: LogFn): RenderWorld | null {
     try {
+        if (deadSids.has(sid)) return null;
         if (!store.pfRenderCkptIntact(sid)) {
-            log?.("error", `[${sid}] #5664 render checkpoint S4 checksum mismatch — plane judged dead for this sid until a forced recast heals it`);
+            killRenderPlane(store, sid, "S4 checkpoint checksum mismatch (corrupt metadata)", log);
             return null;
         }
         const rowsRaw = store.pfRenderRows(sid);
@@ -190,13 +224,16 @@ function hydrateMirror(store: SessionStore, sid: string, log?: LogFn): RenderWor
             expectedCount = m.rowCount;
             capsJson = metaRead.ckpt.metaJson;
             for (const e of metaRead.log) {
-                const p = JSON.parse(e.payloadJson) as { de?: number; dt?: number; di?: number; n?: number; capsJson?: string } & Partial<RenderMeta>;
-                if (e.kind === "cast" || e.kind === "recast") {
+                const p = JSON.parse(e.payloadJson) as { de?: number; dt?: number; di?: number; n?: number; capsJson?: string; reason?: string } & Partial<RenderMeta>;
+                if (e.kind === "dead") {
+                    killRenderPlane(store, sid, `persisted death verdict: ${p.reason ?? "unknown"}`, log);
+                    return null;
+                }
+                if (e.kind === "cast") {
                     estCum = p.estCum ?? 0;
                     textCum = p.textCum ?? 0;
                     imgCum = p.imgCum ?? 0;
                     expectedCount = p.rowCount ?? -1;
-                    if (e.kind === "recast" && p.capsJson !== undefined) capsJson = p.capsJson;
                 } else if (e.kind === "append") {
                     estCum += p.de ?? 0;
                     textCum += p.dt ?? 0;
@@ -212,24 +249,22 @@ function hydrateMirror(store: SessionStore, sid: string, log?: LogFn): RenderWor
         for (let i = 0; i < rowsRaw.length; i++) {
             const rj = rowsRaw[i].rowJson;
             if (rj === null || rowsRaw[i].pos !== i) {
-                // Row table inconsistent on disk (tombstone where a row must
-                // be, or a gap): judge the plane dead LOUDLY — same discipline
-                // as an S4 checksum mismatch, never a silent fallback.
-                log?.("error", `[${sid}] #5664 render plane judged dead: row-table inconsistency at pos ${rowsRaw[i].pos} (expected contiguous ${i})`);
+                killRenderPlane(store, sid, `row-table inconsistency at pos ${rowsRaw[i].pos} (expected contiguous ${i})`, log);
                 return null;
             }
             rows[i] = rj;
             try {
                 rowsParsed[i] = JSON.parse(rj);
             } catch {
-                log?.("error", `[${sid}] #5664 render plane judged dead: row parse failed at pos ${i}`);
+                killRenderPlane(store, sid, `row parse failed at pos ${i}`, log);
                 return null;
             }
         }
         if (expectedCount !== -1 && expectedCount !== rows.length) {
             // Base sums no longer line up with the row table — the log fold
-            // disagrees with truth. Caller will serve legacy; the next
-            // capture diff (full arrays both sides) heals with a recast.
+            // disagrees with truth. Only a rewrite of stored rows could fix
+            // that, which is forbidden: kill the plane permanently.
+            killRenderPlane(store, sid, `log-fold disagrees with row table (expectedCount=${expectedCount}, rows=${rows.length})`, log);
             return null;
         }
         let caps: RenderCaps | undefined;
@@ -243,9 +278,13 @@ function hydrateMirror(store: SessionStore, sid: string, log?: LogFn): RenderWor
             const inner = (parsed.caps as RenderCaps | undefined);
             caps = inner && inner.v === 1 ? inner : (parsed.v === 1 ? parsed : undefined);
         } else {
-            return null; // rows without capabilities = cannot gate safely
+            killRenderPlane(store, sid, "stored rows without capabilities (cannot gate safely)", log);
+            return null;
         }
-        if (!caps || caps.v !== 1) return null;
+        if (!caps || caps.v !== 1) {
+            killRenderPlane(store, sid, "unparseable capabilities fingerprint", log);
+            return null;
+        }
         const rw: RenderWorld = { sid, rows, rowsParsed, caps, estCum, textCum, imgCum, auditTick: 0 };
         touchMirror(rw);
         return rw;
@@ -287,6 +326,12 @@ export type RenderGateDecision =
     | { ok: false; reason: string }
     | { ok: true; rw: RenderWorld; F: number };
 
+/** Stable red-reason vocabulary (test-pinned, one per condition): not-engaged,
+ *  arm-turn, title-gen, plane-unavailable, pressure, snapshot-lane,
+ *  blocks-active, fold-pending, absorb-active, ccr-on, markers, lane-dead,
+ *  hydrate-failed, caps-mismatch, audit-due, no-rows, no-plane-geometry,
+ *  rows-misaligned. */
+
 /** G1 conservative conjunction — every red condition returns the reason so
  *  the lane stays debuggable; the fallback path is unchanged baseline. */
 export function renderPlaneGate(args: RenderGateArgs): RenderGateDecision {
@@ -302,9 +347,12 @@ export function renderPlaneGate(args: RenderGateArgs): RenderGateDecision {
     if (args.absorbActive) return off("absorb-active");
     if (args.ccrOn) return off("ccr-on");
     if (args.markerNonZero) return off("markers");
+    if (deadSids.has(args.sid)) return off("lane-dead");
     let rw = mirrors.get(args.sid);
     if (rw === undefined) rw = hydrateMirror(args.store, args.sid, args.log) ?? undefined;
-    if (rw === undefined) return off("hydrate-failed");
+    // hydrate's own integrity failures persist a death verdict before
+    // returning null — report the durable reason, not the transient one.
+    if (rw === undefined) return off(deadSids.has(args.sid) ? "lane-dead" : "hydrate-failed");
     if (!capsEqual(rw.caps, args.caps)) return off("caps-mismatch");
     if (rw.auditTick % PF_RENDER_AUDIT_EVERY === 0 && rw.auditTick > 0) return off("audit-due");
     if (rw.rows.length < 1) return off("no-rows");
@@ -313,9 +361,9 @@ export function renderPlaneGate(args: RenderGateArgs): RenderGateDecision {
     // number one row per ledger element (row i ↔ pos i), so at GATE time —
     // which runs BEFORE this round's finalize advances the plane —
     // rows.length must equal maxPos+1. A mismatch means an earlier commit
-    // failed soft (disk ahead/behind the mirror): fall back and let the
-    // legacy diff+forced checkpoint self-heal rather than splice on a
-    // misaligned window.
+    // failed soft (disk ahead/behind the mirror): fall back to the legacy
+    // byte path; the plane cannot self-heal anymore (no-recast regime) —
+    // a persistent misalignment will die its next structural diff.
     if (rw.rows.length !== args.maxPos + 1) return off("rows-misaligned");
     registerSidForSession(args.sessionId, args.sid);
     // Window input = last F identity elements (+ new cores added by caller);
@@ -325,8 +373,8 @@ export function renderPlaneGate(args: RenderGateArgs): RenderGateDecision {
 }
 
 /** Bumped once per GREEN round (prepare-openai gate block). The obligation is
- *  consumed by any legacy full-capture round (commitRenderCapture zeroes it):
- *  cadence = "one full pass per PF_RENDER_AUDIT_EVERY fast rounds", red turns
+ *  consumed by any legacy full-capture round (commitRenderCapture zeroes it).
+ *  Cadence = "one full pass per PF_RENDER_AUDIT_EVERY fast rounds", red turns
  *  included among those full passes. */
 export function bumpAuditTick(sid: string): void {
     const rw = mirrors.get(sid);
@@ -395,17 +443,19 @@ export interface CaptureArgs {
     log?: LogFn;
 }
 
-/** 'equal' | 'append' | 'recast' — prefix-identical growth vs rewrite. */
-export function diffRowLists(prev: string[], cur: string[]): "equal" | "append" | "recast" {
+/** 'equal' | 'append' | 'diverged' — prefix-identical growth vs anything
+ *  else (byte diff, shrink, non-monotonic growth). Under the no-recast
+ *  ruling every 'diverged' verdict KILLS the plane. */
+export function diffRowLists(prev: string[], cur: string[]): "equal" | "append" | "diverged" {
     if (prev.length === cur.length) {
-        for (let i = 0; i < prev.length; i++) if (prev[i] !== cur[i]) return "recast";
+        for (let i = 0; i < prev.length; i++) if (prev[i] !== cur[i]) return "diverged";
         return "equal";
     }
     if (cur.length > prev.length) {
-        for (let i = 0; i < prev.length; i++) if (prev[i] !== cur[i]) return "recast";
+        for (let i = 0; i < prev.length; i++) if (prev[i] !== cur[i]) return "diverged";
         return "append";
     }
-    return "recast";
+    return "diverged";
 }
 
 /** sids whose row payload carried a literal NUL and were therefore refused
@@ -413,11 +463,15 @@ export function diffRowLists(prev: string[], cur: string[]): "equal" | "append" 
  *  — storing would corrupt the row with S4 unable to see it, since the
  *  checksum only covers checkpoint meta). Loud-once, then fail-soft per turn:
  *  the in-memory mirror keeps serving this process's lifetime; disk simply
- *  stops advancing until restart/caps-flip recast is possible again. */
+ *  stops advancing until restart or caps change allows re-capture again. */
 const nulRejectedSids = new Set<string>();
 
-export function commitRenderCapture(args: CaptureArgs): { committed: boolean; op: "none" | "append" | "cast" | "recast" } {
+export function commitRenderCapture(args: CaptureArgs): { committed: boolean; op: "none" | "append" | "cast" } {
     const { store, sid, caps, log } = args;
+    if (deadSids.has(sid)) {
+        // Belt-and-braces behind the gate: a dead sid NEVER arms/commits again.
+        return { committed: false, op: "none" };
+    }
     const hasNul = args.rowStrings.some((rj) => rj.includes("\u0000"));
     if (hasNul) {
         if (!nulRejectedSids.has(sid)) {
@@ -436,10 +490,16 @@ export function commitRenderCapture(args: CaptureArgs): { committed: boolean; op
     }
     const metaJson = (m: RenderMeta): string => JSON.stringify(m);
     if (rw === undefined || rw.rows.length === 0) {
-        // No usable base: full cast with a FORCED checkpoint (self-healing
-        // first use / post-death rebuild). Legacy turns only reach here with
-        // full arrays, which is exactly what a cast needs.
+        // Arm cast — allowed ONLY onto an empty table. The snapshot is
+        // forged exactly ONCE per sid (owner ruling 2026-11-05: no recast,
+        // no post-death rebuild): if rows already exist on disk, we cannot
+        // verify them here and rewriting them is forbidden ⇒ kill.
         if (args.mode === "legacy") {
+            const preExisting = store.pfRenderRows(sid);
+            if (preExisting.length > 0) {
+                killRenderPlane(store, sid, `arm refused over non-empty rows (${preExisting.length} pre-existing, unverifiable)`, log);
+                return { committed: false, op: "none" };
+            }
             const rows = args.rowStrings;
             const m: RenderMeta = { v: 1, caps, rowCount: rows.length, estCum: args.sums.estCum, textCum: args.sums.textCum, imgCum: args.sums.imgCum };
             const okSeq = store.pfRenderCommit(sid, {
@@ -476,8 +536,7 @@ export function commitRenderCapture(args: CaptureArgs): { committed: boolean; op
     }
     // A full-path round IS the audit regardless of verdict (the legacy byte
     // path ran to completion) — consume the cadence obligation here, or a
-    // clean long run would dead-lock on "audit-due" after N ticks (only
-    // cast/recast zeroed it before this fix).
+    // clean long run would dead-lock on "audit-due" after N ticks.
     if (args.mode === "legacy") rw.auditTick = 0;
     // legacy full-capture: diff against truth, minimal commit.
     const verdict = diffRowLists(rw.rows, args.rowStrings);
@@ -509,23 +568,14 @@ export function commitRenderCapture(args: CaptureArgs): { committed: boolean; op
         touchMirror(rw);
         return { committed: true, op: "append" };
     }
-    // recast — client-side structural change (compaction & friends) or caps
-    // flip: rewrite covered ordinals, physically drop the excess, and FORCE
-    // the L1 checkpoint in the same transaction (owner ruling).
-    const rows = args.rowStrings;
-    const oldMaxPos = rw.rows.length - 1;
-    const deletes = oldMaxPos >= rows.length ? Array.from({ length: oldMaxPos + 1 - rows.length }, (_, i) => rows.length + i) : [];
-    const m: RenderMeta = { v: 1, caps, rowCount: rows.length, estCum: args.sums.estCum, textCum: args.sums.textCum, imgCum: args.sums.imgCum };
-    const okSeq = store.pfRenderCommit(sid, {
-        rows: rows.map((rj, pos) => ({ pos, rowJson: rj })),
-        deletes: deletes.length > 0 ? deletes : undefined,
-        logEntries: [{ kind: "recast", payloadJson: JSON.stringify({ ...m, capsJson: JSON.stringify(caps) }) }],
-        checkpointMetaJson: metaJson(m),
-    });
-    if (okSeq === null) return { committed: false, op: "none" };
-    const parsed = rows.map((rj) => safeParse(rj));
-    mirrors.set(sid, { sid, rows: [...rows], rowsParsed: parsed, caps: { ...caps }, estCum: args.sums.estCum, textCum: args.sums.textCum, imgCum: args.sums.imgCum, auditTick: 0 });
-    return { committed: true, op: "recast" };
+    // DIVERGED (byte diff at any position, or shrink): the ONLY repair the
+    // old design offered was a recast — rewriting covered ordinals and
+    // deleting the excess. Owner ruling 2026-11-05 forbids that in every
+    // scenario: the plane is KILLED PERMANENTLY instead and the session
+    // rides the legacy full path from here on (bytes stay correct; the
+    // cache simply never serves this sid again).
+    killRenderPlane(store, sid, `structural divergence (stored=${rw.rows.length} rows, captured=${args.rowStrings.length})`, log);
+    return { committed: false, op: "none" };
 }
 
 function safeParse(json: string): unknown {
@@ -543,7 +593,8 @@ function safeParse(json: string): unknown {
 export interface RenderDebugWorld {
     sid: string;
     rows: number;
-    caps: RenderCaps;
+    dead: boolean;
+    caps: RenderCaps | undefined;
     estCum: number;
     textCum: number;
     imgCum: number;
@@ -556,7 +607,10 @@ export function watermarkV6RenderDebugState(sessionId: string): { sids: RenderDe
     if (set) {
         for (const sid of set) {
             const rw = mirrors.get(sid);
-            if (rw) sids.push({ sid, rows: rw.rows.length, caps: rw.caps, estCum: rw.estCum, textCum: rw.textCum, imgCum: rw.imgCum, auditTick: rw.auditTick });
+            sids.push({
+                sid, rows: rw?.rows.length ?? 0, dead: deadSids.has(sid),
+                caps: rw?.caps, estCum: rw?.estCum ?? 0, textCum: rw?.textCum ?? 0, imgCum: rw?.imgCum ?? 0, auditTick: rw?.auditTick ?? 0,
+            });
         }
     }
     return { sids };
@@ -567,5 +621,6 @@ export function _resetWatermarkV6RenderTestState(): void {
     mirrors.clear();
     sessionSids.clear();
     nulRejectedSids.clear();
+    deadSids.clear();
     mirrorBytes = 0;
 }

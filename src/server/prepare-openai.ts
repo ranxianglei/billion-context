@@ -85,6 +85,11 @@ export async function prepareOpenai(
     // #5664 green verdict carrier (declared here so the clamp/estimate/capture
     // consumers AFTER the try block see it; assigned at the gate below).
     let renderFast: { rw: RenderWorld; F: number; maxPos: number; sid: string } | null = null;
+    // #5664 no-recast regime (owner ruling 2026-11-05): once this sid's plane
+    // is durably dead the session rides pure legacy FOREVER — skip building
+    // capture strings entirely (an O(full history) stringify on every later
+    // turn would be pure waste: the module refuses the commit anyway).
+    let renderLaneDead = false;
     // #3222: #651's reasoning-drop plan, computed on the INBOUND history before
     // core.processTurn — see planReasoningDrop for why the post-turn view is
     // too late (the kernel hides consumed call+result pairs inside it).
@@ -279,6 +284,7 @@ export async function prepareOpenai(
                 renderFast = { rw: renderGate.rw, F: renderGate.F, maxPos: renderGeom.maxPos, sid: renderSid };
             } else {
                 log("debug", `[${sessionId}] #5664 render lane off (${renderGate.reason}) — baseline full path`);
+                if (renderGate.reason === "lane-dead") renderLaneDead = true;
             }
         }
         // #2432: dsh desktop's native compaction can LAND without ever
@@ -523,8 +529,10 @@ export async function prepareOpenai(
             // Station 3: prefix rows pass through verbatim (cached parses);
             // the mapped tail replaces the last F stored rows AND extends them.
             // The byte check against the stored suffix is the sole guard — on
-            // mismatch redo the legacy full pass THIS turn (the next capture
-            // self-heals the rows with a recast + forced checkpoint).
+            // mismatch redo the legacy full pass THIS turn; there is no row
+            // repair anymore (no-recast ruling 2026-11-05) — if the stored
+            // rows and truth genuinely diverge, the next full-path capture
+            // kills this sid's plane permanently instead of recasting.
             const mappedAll = await mapEgress(processedMessages);
             const rw = renderFast.rw;
             const wpWindowLen = wpHit?.windowCores.length ?? 0;
@@ -540,7 +548,7 @@ export async function prepareOpenai(
                 renderedTailObjects = [...committedTail];
                 log("debug", `[${sessionId}] #5664 render snapshot FAST emit (prefix=${rw.rows.length - renderFast.F} cached rows, tail=${committedTail.length} mapped)`);
             } else {
-                log("warn", `[${sessionId}] #5664 render snapshot byte mismatch vs stored rows — legacy full pass this turn (next audit heals the rows)`);
+                log("warn", `[${sessionId}] #5664 render snapshot byte mismatch vs stored rows — legacy full pass this turn (no row repair exists: the next full-path capture kills the plane instead of recasting)`);
                 renderFast = null;
                 const turnFull = core.processTurn({ messages: renderMsgs, state: session.state, config: loopConfig, tokenCount, renderTags: renderStrategy, contentStore: contentStoreOf(session) });
                 session.state = turnFull.state;
@@ -554,7 +562,10 @@ export async function prepareOpenai(
             }
         } else {
             rebuiltMessages = await mapEgress(processedMessages);
-            renderedCaptureStrings = rebuiltMessages.map((m) => JSON.stringify(m));
+            // Lane-durably-dead sessions never arm/commit again — keep the
+            // strings null so station 2 skips both their build (O(n) per
+            // turn) and the doomed commit call.
+            if (!renderLaneDead) renderedCaptureStrings = rebuiltMessages.map((m) => JSON.stringify(m));
             renderedTailObjects = [];
             renderedImageDelta = 0;
         }
@@ -774,9 +785,11 @@ export async function prepareOpenai(
         if (Object.keys(wpResponseHeaders).length === 0) wpResponseHeaders = undefined;
     }
     // #5664 station 2 — ONE snapshot commit per engaged turn: steady append
-    // (fast rounds), arm cast / audit diff / recast with FORCED checkpoint
-    // (full-path rounds carry the complete captured array). Fail-soft for
-    // this turn only — the identity plane already committed independently.
+    // (fast rounds), arm cast / audit diff / divergence-KILL (full-path
+    // rounds carry the complete captured array; owner ruling 2026-11-05:
+    // recast is forbidden — any structural divergence kills the lane for the
+    // sid). Fail-soft for this turn only — the identity plane already
+    // committed independently.
     if (renderedCaptureStrings !== null && renderCapturedSid !== null && renderCapturedCaps !== null && featureEnabled("watermarkV6Render")) {
         const store = getStore();
         if (store.pfRenderAvailable()) {

@@ -2622,18 +2622,18 @@ export class UnifiedStore {
     }
 
     /** Atomic turn commit for the render plane (#5664): upsert `rows`
-     *  (pos may move — a recast rewrites covered ordinals), physically drop
-     *  `deletes` (ordinals that no longer exist after a rewrite), journal
-     *  `logEntries` at strictly increasing ls_seq, and — when
+     *  (pos values must be contiguous ascending; under the no-recast ruling
+     *  covered ordinals are NEVER rewritten in place), journal `logEntries`
+     *  at strictly increasing ls_seq — including the kind='dead' verdict
+     *  that persists a plane death forever — and — when
      *  `checkpointMetaJson` is given — fold the whole log into a fresh ckpt
-     *  WITH its S4 checksum in the SAME transaction (the forced checkpoint
-     *  of a compression round). Any throw → rollback → byte-identical plane.
+     *  WITH its S4 checksum in the SAME transaction (the arm cast). Any
+     *  throw → rollback → byte-identical plane.
      *  Returns the next free ls_seq. */
     pfRenderCommit(
         sid: string,
         args: {
             rows: { pos: number; rowJson: string | null }[];
-            deletes?: number[];
             logEntries: { kind: string; payloadJson: string }[];
             checkpointMetaJson?: string;
             ts?: number;
@@ -2645,10 +2645,6 @@ export class UnifiedStore {
                 "INSERT INTO pf_render (sid, pos, row_json) VALUES (?, ?, ?) ON CONFLICT (sid, pos) DO UPDATE SET row_json = excluded.row_json",
             );
             for (const r of args.rows) insRow.run(sid, r.pos, r.rowJson);
-            if (args.deletes && args.deletes.length > 0) {
-                const ph = args.deletes.map(() => "?").join(", ");
-                this.db.prepare(`DELETE FROM pf_render WHERE sid = ? AND pos IN (${ph})`).run(sid, ...args.deletes);
-            }
             // Continuation must clear BOTH the surviving log tail AND the
             // checkpoint watermark: a fresh checkpoint ABSORBS its own log
             // entries (delete below), so MAX(log) can sit BEHIND ckpt_ls_seq;
