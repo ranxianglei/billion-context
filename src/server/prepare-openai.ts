@@ -701,7 +701,15 @@ export async function prepareOpenai(
     rebuiltMessages = normalizeStrictEchoReasoning(rebuiltMessages, isStrictReasoningEcho(session, upstreamOrigin, modelIdOf(parsed)), log, sessionId);
     const rebuilt: OpenAIRequestBody = { ...parsed, messages: rebuiltMessages, tools: toolsOut as OpenAITool[] | undefined };
     warnReasoningPairs(rebuiltMessages, log, sessionId);
-    clampOutgoingOutput(rebuilt as Record<string, unknown>, typeof (parsed as Record<string, unknown>).max_completion_tokens === "number" ? "max_completion_tokens" : "max_tokens", { systemText: openaiSystemText, tools: toolsOut, processedMessages, inputEstBaseTokens: renderFast !== null ? renderFast.rw.textCum : undefined, lastInputTokens: session.stats.lastInputTokens, lastInputTokensSource: session.stats.lastInputTokensSource, nativeWindow, headroomWindow: config.modelContextLimit, imageTokens: renderFast !== null ? renderFast.rw.imgCum + renderedImageDelta : imageReserveFor(session, "openai", rebuilt, opts, billingUpstream ?? upstreamOrigin), kFactor: currentCalibrationFactor(session.stats, session.metadata?.lastModel), kOrigin: session.stats.calibratedEstimateOrigin, origin: billingUpstream ?? upstreamOrigin, ledgerFloorTokens: dshLedgerFloorTokens(session.metadata), knownOutputCeiling: resolveKnownOutputCeiling(req.headers, parsed as Record<string, unknown>, opts.routes, billingUpstream ?? upstreamOrigin, opts.sessionHeader, modelIdOf(parsed)) }, sessionId, log, (c) => { session.stats.lastOutputClamp = { ...c, at: Date.now() }; });
+    // #5664 review (round 2): the rw.*Cum cumulants already cover the last F
+    // frozen rows, which the per-turn estimate terms re-price from
+    // processedMessages — feed only the NEW tail past F into those terms (and
+    // subtract the frozen window from the clamp base), or every green round
+    // double-counts a whole window.
+    const rf = renderFast;
+    const rfTail = rf !== null ? processedMessages.slice(Math.min(rf.F, processedMessages.length)) : processedMessages;
+    const rfFrozenEst = rf !== null ? estimateCoreMessages(rf.rw.rowsParsed.slice(Math.max(0, rf.rw.rows.length - rf.F)) as CoreMessage[]) : 0;
+    clampOutgoingOutput(rebuilt as Record<string, unknown>, typeof (parsed as Record<string, unknown>).max_completion_tokens === "number" ? "max_completion_tokens" : "max_tokens", { systemText: openaiSystemText, tools: toolsOut, processedMessages, inputEstBaseTokens: rf !== null ? Math.max(0, rf.rw.textCum - rfFrozenEst) : undefined, lastInputTokens: session.stats.lastInputTokens, lastInputTokensSource: session.stats.lastInputTokensSource, nativeWindow, headroomWindow: config.modelContextLimit, imageTokens: renderFast !== null ? renderFast.rw.imgCum + renderedImageDelta : imageReserveFor(session, "openai", rebuilt, opts, billingUpstream ?? upstreamOrigin), kFactor: currentCalibrationFactor(session.stats, session.metadata?.lastModel), kOrigin: session.stats.calibratedEstimateOrigin, origin: billingUpstream ?? upstreamOrigin, ledgerFloorTokens: dshLedgerFloorTokens(session.metadata), knownOutputCeiling: resolveKnownOutputCeiling(req.headers, parsed as Record<string, unknown>, opts.routes, billingUpstream ?? upstreamOrigin, opts.sessionHeader, modelIdOf(parsed)) }, sessionId, log, (c) => { session.stats.lastOutputClamp = { ...c, at: Date.now() }; });
     // prompt_cache_retention is an OpenAI-host-only cache directive; the dsh
     // launcher forces PI_CACHE_RETENTION=long (for the session-id
     // prompt_cache_key) which makes the client also emit it. Third-party
@@ -750,14 +758,13 @@ export async function prepareOpenai(
         // #5664: render-lane rounds bound every walk to the new tail — the
         // frozen prefix basis rides the persistent per-plane cumulants (cast
         // absolute, appended per round, rebaselined end-to-end each audit).
-        const rf = renderFast;
         const imageReserve = rf !== null ? rf.rw.imgCum + renderedImageDelta : imageReserveFor(session, "openai", rebuilt, opts, billingUpstream ?? upstreamOrigin);
-        session.stats.localInputEstimate = (rf !== null ? rf.rw.estCum + estimateCoreMessagesUpper(processedMessages) : estimateCoreMessagesUpper(processedMessages.length > 0 ? processedMessages : originalMessages))
+        session.stats.localInputEstimate = (rf !== null ? rf.rw.estCum + estimateCoreMessagesUpper(rfTail) : estimateCoreMessagesUpper(processedMessages.length > 0 ? processedMessages : originalMessages))
             + countSystemAndToolsTokens(openaiOutboundSystem || openaiSystemText, toolsOut)
             + imageReserve;
         // #1933 F1: billed-caliber twin (chars/4) for the k̂ learning pair —
         // see the anthropic-lane counterpart above.
-        session.stats.lastLocalTextEstimate = (rf !== null ? rf.rw.textCum + estimateCoreMessages(processedMessages) : estimateCoreMessages(processedMessages.length > 0 ? processedMessages : originalMessages))
+        session.stats.lastLocalTextEstimate = (rf !== null ? rf.rw.textCum + estimateCoreMessages(rfTail) : estimateCoreMessages(processedMessages.length > 0 ? processedMessages : originalMessages))
             + countSystemAndToolsTokens(openaiOutboundSystem || openaiSystemText, toolsOut)
             + imageReserve;
         const openaiPairOrigin = billingUpstream ?? upstreamOrigin;
