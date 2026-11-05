@@ -18,7 +18,11 @@ import type { Config, CoreMessage } from "../src/types.js";
 //       pay the minimum benefit;
 //   (D) tiers disabled ⇒ the flag is never consulted;
 //   (E) fire-pending stamping is consume-once (only the first fold after a
-//       fire is judged).
+//       fire is judged);
+//   (F) stalled but distill mass sub-threshold ⇒ NO escalation (T1 keeps
+//       firing, no marker) — the gate's negative direction (#3617);
+//   (G) tier-3 condense escalates ahead of T1/T2 while stalled; without the
+//       flag the same pre-decision state falls back to T1 (normal ladder).
 function buildConfig(overrides: Partial<Config> = {}): Config {
   return {
     tiers: { enabled: true, tier2Trigger: 5, tier3Trigger: 10 },
@@ -292,4 +296,93 @@ test("#5698 (E): only the first fold after a fire is judged (consume-once)", () 
     config,
   });
   assert.equal(second.state.nudge.t1HarvestStall, false);
+});
+
+test("#5698 (F): stalled but distill mass sub-threshold — no escalation", () => {
+  const core = createCore();
+  const config = buildConfig();
+  const messages = makeMessages(10);
+  let state = createInitialState();
+  state = core.processTurn({ messages, state, config, tokenCount: 50_000 })
+    .state;
+  const turn = core.processTurn({ messages, state, config, tokenCount: 60_000 });
+  state = turn.state;
+  assert.equal(turn.nudge.tier, 1);
+
+  // Tiny partial fold: harvests far less than STALL_HARVEST_RATIO of the offer
+  // (stall set) AND the new tier-1 block's summary mass (~250 tokens) stays
+  // below the T2 threshold (7500), so no distill tier qualifies.
+  const folded = core.applyCompression({
+    ranges: [{ startRef: refOf(state, "m0"), endRef: refOf(state, "m0"), summary: "s".repeat(1000) }],
+    messages,
+    state,
+    config,
+  });
+  state = folded.state;
+  assert.equal(state.nudge.t1HarvestStall, true, "tiny partial fold stalls");
+
+  // Negative direction (#3617): a stalled T1 channel must NOT escalate to a
+  // distill tier whose own mass is sub-threshold — T1 keeps firing, no marker.
+  const next = core.processTurn({ messages, state, config, tokenCount: 60_000 });
+  assert.equal(next.nudge.tier, 1, `reason: ${next.nudge.reason}`);
+  assert.doesNotMatch(next.nudge.reason ?? "", /\[T1 harvest stall\]/);
+});
+
+test("#5698 (G): tier-3 condense escalates ahead of T1/T2 while stalled", () => {
+  const core = createCore();
+  const config = buildConfig();
+  const messages = makeMessages(10);
+  let state = createInitialState();
+  state = core.processTurn({ messages, state, config, tokenCount: 50_000 })
+    .state;
+  const turn = core.processTurn({ messages, state, config, tokenCount: 60_000 });
+  state = turn.state;
+  assert.equal(turn.nudge.tier, 1);
+
+  // Tiny partial fold sets the stall (same shape as F).
+  const folded = core.applyCompression({
+    ranges: [{ startRef: refOf(state, "m0"), endRef: refOf(state, "m0"), summary: "s".repeat(1000) }],
+    messages,
+    state,
+    config,
+  });
+  state = folded.state;
+  assert.equal(state.nudge.t1HarvestStall, true, "tiny partial fold stalls");
+
+  // Seed an active tier-2 block whose summary mass qualifies for T3
+  // (10k tokens >= 7500) and dominates the tier-1 pile — the normal T3 leg
+  // can never win (it additionally requires t3Pen > t1Eff ~49k), so only the
+  // stall path routes here. syncBlocks only evicts blocks whose anchor ids
+  // vanish from the messages, so the seeded block survives the next turn.
+  const t1 = state.blocks.find((b) => b.active && b.tier === 1)!;
+  const preDecision = {
+    ...state,
+    blocks: [
+      ...state.blocks,
+      {
+        ...t1,
+        blockId: "bT3",
+        tier: 2 as const,
+        summary: "y".repeat(40_000),
+        directMessageIds: [],
+        directBlockIds: [t1.blockId],
+      },
+    ],
+  };
+
+  const escalated = core.processTurn({ messages, state: preDecision, config, tokenCount: 60_000 });
+  assert.equal(escalated.nudge.tier, 3, `expected T3 escalation: ${escalated.nudge.reason}`);
+  assert.match(escalated.nudge.reason ?? "", /T3 condense ready: 1 tier-2 blocks/);
+  assert.match(escalated.nudge.reason ?? "", /\[T1 harvest stall\]/);
+
+  // Counterfactual: the SAME pre-decision state without the stall flag falls
+  // back to T1 on the normal ladder (t3Pen 10k never exceeds t1Eff).
+  const unstalled = core.processTurn({
+    messages,
+    state: { ...preDecision, nudge: { ...preDecision.nudge, t1HarvestStall: false } },
+    config,
+    tokenCount: 60_000,
+  });
+  assert.equal(unstalled.nudge.tier, 1, `reason: ${unstalled.nudge.reason}`);
+  assert.doesNotMatch(unstalled.nudge.reason ?? "", /\[T1 harvest stall\]/);
 });
