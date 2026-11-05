@@ -35,14 +35,53 @@ const SLOW_MS = 1500;
 // Raised to 10s after 6s still flaked three consecutive runs on windows-latest
 // node22 shard 2 (master c78ecb4b + ci-fixes c49bf8b1/12b988ff, all closed=0,
 // same cell, sibling shards green — load latency, not a teardown regression;
-// recorded under #4599). If it flakes again at 10s, investigate a real teardown
-// hang instead of raising further.
-const ABORT_TEARDOWN_BUDGET_MS = 10000;
+// recorded under #4599). Flaked once more at 10s (master 9dc4c945, run
+// 41686972484, 2026-11-03: openai-sse + anthropic-sse closed=0 after the full
+// poll, ~11s each; same code green on the ubuntu22/24 and windows24 shard-2
+// siblings, pass durations 23–352ms). The mandated "investigate a real
+// teardown hang" audit found none: relay.ts arms res.on("close") ->
+// clientAbort.abort() synchronously with no linger/backstop on this path, and
+// no commit since d244ffff touched destroy/abort wiring — the residual latency
+// is runner-side event-loop starvation on loaded Windows runners. Hence a
+// platform-scoped budget instead of another flat raise: win32 doubles to 20s
+// (every recorded starvation instance was windows-latest — node22+24, multiple
+// shards, #3665/#4347 era — ubuntu never showed the signature), keeping the
+// tight 10s gate everywhere else so a genuine teardown hang still fails fast.
+// Flaked once more at 20s (ci-fixes c37293b6, run 41776902208, 2026-11-04:
+// openai-sse closed=0 after the full poll, duration 20518ms; anthropic/
+// responses/json siblings 131–410ms in the same run; master main CI green
+// 40min earlier at 23a826d3 — same load-starvation draw, not a regression).
+// That closes out the flat-raise ladder: the poller and the upstream mock
+// share ONE event loop with whatever is starving the runner, so a close event
+// cannot be delivered faster than the loop itself — an absolute wall-clock
+// budget measures the runner, not the teardown. The budget is therefore
+// extended by the poll's OWN measured event-loop lag (each tick that lands
+// late adds its lateness), capped at 2×base so a genuine hang still fails: on
+// a healthy loop the gate stays byte-for-byte the flat budget (zero
+// extension); under starvation the window grows with the measured lag up to
+// 2×base (win32: 20s base ⇒ ≤40s — the same ceiling a flat 40s raise would
+// give unconditionally, applied only when lag is actually observed). Same
+// relative-invariant discipline as the #3228/#3152-C error-delivery cells.
+const ABORT_TEARDOWN_BUDGET_MS = process.platform === "win32" ? 20000 : 10000;
+const TEARDOWN_POLL_MS = 100;
+
+/** May the teardown poll keep going? base + measured event-loop lag, capped
+ *  at 2×base — see the budget comment above for the starvation mechanics. */
+function teardownPollContinues(elapsedMs: number, baseMs: number, lagMs: number): boolean {
+    return elapsedMs < baseMs + Math.min(lagMs, baseMs);
+}
 
 async function awaitUpstreamTeardown(socketsClosed: () => number): Promise<void> {
-    const deadline = Date.now() + ABORT_TEARDOWN_BUDGET_MS;
-    while (socketsClosed() < 1 && Date.now() < deadline) {
-        await new Promise((r) => setTimeout(r, 100));
+    const base = ABORT_TEARDOWN_BUDGET_MS;
+    const t0 = Date.now();
+    let lagMs = 0;
+    let last = t0;
+    while (socketsClosed() < 1 && teardownPollContinues(Date.now() - t0, base, lagMs)) {
+        await new Promise((r) => setTimeout(r, TEARDOWN_POLL_MS));
+        const now = Date.now();
+        const lateBy = now - last - TEARDOWN_POLL_MS;
+        if (lateBy > 0) lagMs += lateBy;
+        last = now;
     }
 }
 
@@ -392,4 +431,14 @@ test("error-delivery x proxy-openai-sse: preflight failure after the early commi
         up.server.closeIdleConnections?.();
         await once(up.server, "close");
     }
+});
+
+test("abort x teardown-budget arithmetic: measured lag extends the window, capped at 2×base", () => {
+    const base = 10_000;
+    assert.equal(teardownPollContinues(9_999, base, 0), true, "healthy loop: inside the flat budget");
+    assert.equal(teardownPollContinues(10_000, base, 0), false, "healthy loop: boundary unchanged (zero lag ⇒ old flat gate byte-for-byte)");
+    assert.equal(teardownPollContinues(12_000, base, 5_000), true, "measured event-loop lag extends the window");
+    assert.equal(teardownPollContinues(15_000, base, 5_000), false, "extension equals the measured lag, no more");
+    assert.equal(teardownPollContinues(19_999, base, 999_999), true, "runaway lag cannot push the window past 2×base");
+    assert.equal(teardownPollContinues(20_000, base, 999_999), false, "hard ceiling at 2×base guarantees termination");
 });

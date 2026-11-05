@@ -286,6 +286,30 @@ export type CompressSettings = {
     /** #2228: output budget (tokens) of the decision side call. Default 200
      *  (same ceiling class as SIDE_REQUEST_MAX_TOKENS). Must be > 0. */
     nudgeDecisionMaxTokens?: number;
+    /** #5683: forbid UNPROMPTED model-initiated compression. When true at some
+     *  level, a compress call is refused unless a compression nudge actually
+     *  reached the model in the current turn (post-gate delivery fact: the
+     *  round's nudgeOutcome was "injected" — advisory, decide-directive and
+     *  emergency injections all arm it; loop rounds within the same turn keep
+     *  the arm, the next un-nudged turn disarms). Refusal sends the model an
+     *  error receipt instead of folding. bili's own overflow backstop folds
+     *  (preflight/auto-fold, no model call involved) are exempt — availability
+     *  is unaffected. Host-only (not passed to the kernel); off unless
+     *  explicitly enabled at some level. Deepest level wins PER FIELD across
+     *  global → provider → model, like every other compress field. */
+    requireNudge?: boolean;
+    /** #5683: forbid OUT-OF-BOUNDS model-initiated compression. When true at
+     *  some level, every submitted range must stay within what bili currently
+     *  recommends folding — the same live compressible set the nudge text and
+     *  acp_status show (this request's prepare-time offer when present, else a
+     *  live recompute; viable + dead-ref + minCompressRange filters). Judgment
+     *  is by COVERAGE, not equality: subdividing a recommended span into
+     *  smaller chunks passes, and messages already folded into active blocks
+     *  (refolds updating an existing summary) are exempt. A range carrying any
+     *  other live message is refused whole with an error receipt naming the
+     *  offending span(s). Host-only; off unless explicitly enabled at some
+     *  level. Deepest level wins PER FIELD across global → provider → model. */
+    requireRecommendation?: boolean;
     /** Trailing messages never offered for compression
      *  (kernel `preserveRecentMessages`). */
     preserveRecentMessages?: number;
@@ -2417,6 +2441,7 @@ const KNOWN_TOP_LEVEL_KEYS = new Set([
 const COMPRESS_SETTING_FIELDS = new Set([
     "modelContextLimit", "maxContextLimit", "emergencyThresholdPercent",
     "nudgeGrowthTokens", "minPressureBenefitTokens", "tierNudgeTokens", "nudgeModelDecided", "nudgeDecisionMaxTokens",
+    "requireNudge", "requireRecommendation",
     "preserveRecentMessages", "preserveRecentTokens",
     "minCompressRange", "minCompressRangeChars",
     "outputHeadroomMaxPct", "tiers", "protectedLatestTools", "protectedTools",
@@ -3186,6 +3211,13 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
             continue;
         }
         out[key] = obj[key];
+    }
+    // #5683: unprompted/out-of-bounds compression policy gates — plain booleans,
+    // off unless explicitly set (an explicit false at a deeper level disables).
+    for (const key of ["requireNudge", "requireRecommendation"] as const) {
+        if (!(key in obj)) continue;
+        if (typeof obj[key] !== "boolean") ok = false;
+        else out[key] = obj[key];
     }
     // #3211: an explicit 0 is meaningful (legacy any-pending), so validate
     // >= 0 instead of takeNumber's plain finite check.
