@@ -1821,13 +1821,18 @@ test("#2592/#2709: unattributed raw-URL POST without the marker still sends dire
     assert.deepEqual(sink, ["https://api.deepseek.com/chat/completions"]);
 });
 
-test("#2592/#2709: marker hit but proxy not ready falls open to a direct send", async () => {
+test("#2592/#2709/#5686: marker-decisive compaction POST with dead proxy refuses LOCALLY instead of falling open", async () => {
+    // Pre-#5686 this case fell open to a direct send — exactly the leak
+    // window that let dsh checkpoints land under bili's feet (#5517 cluster).
+    // The decisive marker + no usable proxy combination now refuses with a
+    // protocol-shaped 422; nothing reaches the upstream provider.
     const state: NativeInterceptState = { origin: undefined, ready: Promise.resolve(undefined), takeoverGate: () => false };
     const { sink } = await withPatch(state, async (fetch) => {
         const res = await fetch("https://api.deepseek.com/chat/completions", { method: "POST", body: dshCompactionEnvelope() });
-        assert.equal(res.status, 200);
+        assert.equal(res.status, 422);
+        assert.equal(res.headers.get("x-bili-gate"), "dsh-compaction-refused");
     });
-    assert.deepEqual(sink, ["https://api.deepseek.com/chat/completions"]);
+    assert.deepEqual(sink, [], "no upstream fetch — local refusal only");
 });
 
 test("#2592/#2709: Uint8Array body with the marker diverts; URLSearchParams form-encoding cannot carry the raw marker", async () => {
