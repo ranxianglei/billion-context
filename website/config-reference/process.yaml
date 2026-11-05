@@ -87,15 +87,15 @@ entries:
     default: "true"
     env: BILI_THROTTLE_429
     group: process
-    desc_en: "Egress-side 429 governor (#4204): after consecutive upstream 429s, further sends to that origin+credential are answered locally with zero egress instead of being forwarded; set false to restore the legacy always-forward behavior."
-    desc_zh: "出站 429 治理器（#4204）：同一 origin+凭据连续收到上游 429 后，后续请求在本地应答（零出站）而不再转发；设为 false 恢复旧的总是转发行为。"
+    desc_en: "Egress-side 429 governor (#4204): repeated upstream 429s are answered locally instead of forwarded. Account limits and unrecognized/malformed responses hold origin+credential; only KeyRing's exact `keyring_model_temporarily_unavailable` code with a matching request model holds origin+credential+model, leaving other models eligible. A mismatch or missing model remains account-wide; false restores the legacy always-forward behavior."
+    desc_zh: "出站 429 治理器（#4204）：连续上游 429 会在本地应答而不再转发。账号限额及无法识别/格式错误的响应按 origin+凭据持有；只有 KeyRing 精确返回 `keyring_model_temporarily_unavailable` 且响应模型与请求模型完全相同时，才按 origin+凭据+模型持有，让其他模型继续可用。模型不匹配或缺失仍按账号级处理；设为 false 恢复旧的总是转发行为。"
   - key: network.throttle429MaxConsecutive
     type: number
     default: "5"
     env: BILI_THROTTLE_429_MAX_CONSECUTIVE
     group: process
-    desc_en: "Consecutive upstream 429s before the hold turns terminal (local 424 outside every known SDK retry set); one probe per backoff window keeps checking until any non-429 response clears it."
-    desc_zh: "连续上游 429 达到该次数后 hold 转为终局（本地 424，不在任何已知 SDK 重试集合内）；每个退避窗口仍放行一次探测，直到出现非 429 响应清除。"
+    desc_en: "Consecutive upstream 429s before the hold turns terminal (local 424 outside every known SDK retry set); one probe per backoff window keeps checking until any non-429 response clears an account hold, or the matching model's non-429 response clears its model hold."
+    desc_zh: "连续上游 429 达到该次数后 hold 转为终局（本地 424，不在任何已知 SDK 重试集合内）；每个退避窗口仍放行一次探测，直到账号级 hold 收到任意非 429 响应，或模型级 hold 收到同一模型的非 429 响应后清除。"
   - key: network.throttle429BaseDelayMs
     type: number
     default: "2000"

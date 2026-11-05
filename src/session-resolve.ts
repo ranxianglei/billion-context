@@ -349,6 +349,23 @@ export function resolveSessionOrder(rawId: string, history: unknown, personaTag?
             record(rawId, turns, tagHash, effectiveModel);
             return { key: rawId, action: "reanchor", reason: "persona text changed but the recorded history continues inside the incoming — anchor migrated (#4778)" };
         }
+        // #5686: fifth rung — the composite field failure behind the
+        // |sub:-drift cluster (#5517/#5656 reports): a native-compaction
+        // checkpoint LANDS (head cells replaced by one summary message) while
+        // the host simultaneously rotates its per-turn system prompt (dsh NEXT
+        // harness-state banners). The incoming is then SHORTER than the
+        // recorded skeleton with tagChanged true, which defeats every rung
+        // above (head fragments broken by the summary, no model switch, chain
+        // depth insufficient, length gate false) and deterministically forks
+        // the live lane onto <rawId>|sub:<fp16(tag)> — whose first visible
+        // message is the checkpoint sentence itself. The fix is the exact
+        // mirror of the tag-LESS shorter-reanchor below (same two tests, same
+        // TAIL_WINDOW, no extra floor): a byte-identical fragment-verified
+        // tail cannot belong to a different conversation (MESSAGE-IDENTITY).
+        if (kinds.length > 0 && kinds.length < recorded.kinds.length && tailAligns(kinds, recorded.kinds) && fragTailEquals(kinds.length)) {
+            record(rawId, turns, tagHash, effectiveModel);
+            return { key: rawId, action: "reanchor", reason: "persona text changed but the shorter incoming keeps the recorded conversation's fragment-verified tail — head rewrite under a new system prompt, anchor kept (#5686)" };
+        }
         // #5095 D1-B: a non-empty discriminator (only the claude-anthropic
         // headless-subagent call site passes one) widens the key into a
         // three-segment form so distinct same-type runs never share a
@@ -454,6 +471,23 @@ export function applyOrderSnapshot(entries: OrderSkeletonEntry[]): number {
  *  ladder consumed (systemText, model) and keyed by system-hash; the v2
  *  resolver is content-blind and keys by order+id with fragment guards,
  *  so those parameters are simply gone. */
-export function personaConversationOrder(rawId: string, history: unknown, personaTag?: string, declaredModel?: string, laneToken?: string, laneDiscriminator?: string): string {
-    return resolveSessionOrder(rawId, history, personaTag ?? "", declaredModel, laneToken, laneDiscriminator).key;
+/** #5686 visibility seam (optional): observers of state-changing outcomes.
+ *  Production used to discard everything but the key, so every fork
+ *  (derived-*) and migration (reanchor) ran with zero durable trace — the
+ *  drift cluster had to be reverse-engineered from field screenshots. Claim
+ *  and continue stay silent (steady-state volume); the caller decides what
+ *  to log. The callback is best-effort: a throwing observer must never break
+ *  resolution. */
+type SessionResolveObserver = (rawId: string, r: SessionOrderResolution) => void;
+
+export function personaConversationOrder(rawId: string, history: unknown, personaTag?: string, declaredModel?: string, laneToken?: string, laneDiscriminator?: string, onResolve?: SessionResolveObserver): string {
+    const res = resolveSessionOrder(rawId, history, personaTag ?? "", declaredModel, laneToken, laneDiscriminator);
+    if (onResolve !== undefined) {
+        try {
+            onResolve(rawId, res);
+        } catch {
+            // observer hook — diagnostics only
+        }
+    }
+    return res.key;
 }
