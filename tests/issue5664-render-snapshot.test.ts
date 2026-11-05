@@ -302,6 +302,29 @@ test("unit: plane death persists across restart (no re-arm ever)", (t) => {
     } finally { h.cleanup(); }
 });
 
+test("unit: thrown row-table read defers arming without killing (transient ≠ death)", () => {
+    const h = makeH("defer");
+    try {
+        const b1 = makeBody([{ role: "user", content: "hello" }]);
+        const r1 = v6Eval(h, "s-defer", b1, ["id0"]);
+        r1.fin();
+        const sid = r1.sid!;
+        const caps = capsFor("text-only");
+        // Prototype-chain wrapper: every store method resolves to the REAL
+        // sidecar except pfRenderRows, which throws — a transient SELECT
+        // failure while everything else is healthy.
+        const flakyStore: SessionStore = Object.create(h.store);
+        flakyStore.pfRenderRows = () => { throw new Error("io hiccup"); };
+        assert.deepEqual(
+            commitRenderCapture({ sessionId: "s-defer", store: flakyStore, sid, mode: "legacy", caps, rowStrings: ['{"i":0}', '{"i":1}'], sums: { estCum: 2, textCum: 2, imgCum: 0 } }),
+            { committed: false, op: "none" }, "a thrown read must fail soft for this round, not crash the caller");
+        // Negative side (#3617): no death verdict may persist from a transient
+        // error — the very next round with a healthy store arms normally.
+        assert.equal(commitRenderCapture({ sessionId: "s-defer", store: h.store, sid, mode: "legacy", caps, rowStrings: ['{"i":0}', '{"i":1}'], sums: { estCum: 2, textCum: 2, imgCum: 0 } }).op, "cast");
+        assert.equal(h.store.pfRenderRows(sid).length, 2);
+    } finally { h.cleanup(); }
+});
+
 // Review round 1 blind-spot pins (issue #5664): session teardown must wipe the
 // three render tables in the same cascade, and re-running the migration on an
 // already-v12 sidecar must be a no-op that leaves rows untouched.

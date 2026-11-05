@@ -495,7 +495,18 @@ export function commitRenderCapture(args: CaptureArgs): { committed: boolean; op
         // no post-death rebuild): if rows already exist on disk, we cannot
         // verify them here and rewriting them is forbidden ⇒ kill.
         if (args.mode === "legacy") {
-            const preExisting = store.pfRenderRows(sid);
+            let preExisting: { pos: number; rowJson: string | null }[];
+            try {
+                preExisting = store.pfRenderRows(sid);
+            } catch {
+                // A THROWN read is a transient storage hiccup, not evidence of
+                // divergence: defer the arm to the next round (fail soft)
+                // instead of killing over it — and never propagate, station 2
+                // runs outside prepare-openai's try block, a throw here would
+                // fail the whole request.
+                log?.("warn", `[${sid}] #5664 render arm deferred this round: row-table read threw`);
+                return { committed: false, op: "none" };
+            }
             if (preExisting.length > 0) {
                 killRenderPlane(store, sid, `arm refused over non-empty rows (${preExisting.length} pre-existing, unverifiable)`, log);
                 return { committed: false, op: "none" };
