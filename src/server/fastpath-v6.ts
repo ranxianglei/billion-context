@@ -62,8 +62,9 @@
 //  for 60 minutes — traffic then rides the baseline lanes (served, not
 //  refused) so a stable client-unfixable fault cannot become a 400 loop;
 //  parking and recovery are loudly logged. Configuration-level cohort
-//  exclusion (non-shim carriers, plane-down nodes, parked sessions) is NOT
-//  a fault: it passes silently to the v5/legacy lanes.
+//  exclusion (non-shim carriers, plane-down nodes, parked sessions, and
+//  tunnel-origin requests whose identity channel is absent by construction —
+//  #5760) is NOT a fault: it passes silently to the v5/legacy lanes.
 import type { CoreMessage } from "acp-kernel";
 import type { OpenAIRequestBody } from "acp-kernel/wire";
 import { openaiToCore } from "acp-kernel/wire";
@@ -537,7 +538,7 @@ export function evaluateWatermarkV6(
     bodyText: string,
     req: http.IncomingMessage,
     session: Session,
-    input: { pluginMode: boolean; titleGen: boolean; model: string },
+    input: { pluginMode: boolean; titleGen: boolean; model: string; tunnelOrigin?: boolean },
     log: (level: string, msg: string) => void,
 ): V6Outcome | null {
     // --- configuration gate (silent pass-throughs) --------------------------
@@ -568,6 +569,18 @@ export function evaluateWatermarkV6(
     // not narrows in this TS build).
     const rawIds = req.headers[PF_TAIL_IDS_HEADER];
     if (!isSingleHeaderValue(rawIds)) {
+        // #5760: the hard gate's premise — "lane traffic always comes from a
+        // native shim that stamps the handshake" — holds only off-tunnel.
+        // /bili/ tunnel traffic is a plain HTTP client with NO in-process
+        // fetch interception, so an absent channel there is structural, not
+        // drift: exclude from the cohort (silent pass to v5/legacy, same as
+        // sessRaw===null above) instead of faulting every turn. A shimmed
+        // host routed THROUGH /bili/ still stamps the headers and enters the
+        // gate unchanged; present-but-bad channels stay faults for ALL origins.
+        if (input.tunnelOrigin === true) {
+            log("debug", `[${session.id}] v6 excluded: tunnel-origin request without the identity channel (no in-process shim on this wire) — baseline lanes serve`);
+            return null;
+        }
         const d = `identity channel incomplete: ${PF_TAIL_IDS_HEADER} absent`;
         recordFault(store, session.id, d, log);
         throw new FastpathV6IdentityFault(d);

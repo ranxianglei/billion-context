@@ -64,6 +64,7 @@ export async function prepareOpenai(
     billingUpstream?: string,
     decide?: DecideConfig,
     bodyText?: string,
+    tunnelOrigin?: boolean,
 ): Promise<Prepared> {
     const sessionId = session.id;
     const stream = parsed.stream === true;
@@ -154,7 +155,7 @@ export async function prepareOpenai(
     let v6Evaluated: V6Outcome | null = null;
     const wpModel = typeof parsed.model === "string" ? parsed.model : "";
     if (bodyText !== undefined && pluginMode && !isTitleGen && featureEnabled("watermarkV6MsgId")) {
-        v6Evaluated = evaluateWatermarkV6(bodyText, req, session, { pluginMode, titleGen: isTitleGen, model: wpModel }, log);
+        v6Evaluated = evaluateWatermarkV6(bodyText, req, session, { pluginMode, titleGen: isTitleGen, model: wpModel, tunnelOrigin: tunnelOrigin === true }, log);
         if (v6Evaluated !== null) {
             wpFullText = bodyText; // whole-wire image accounting stays honest
             log("debug", `[${session.id}] fastpath v6 ${v6Evaluated.hit ? "HIT" : v6Evaluated.decision}${v6Evaluated.measuredT !== undefined ? ` T=${v6Evaluated.measuredT}` : ""}`);
