@@ -147,6 +147,16 @@ export interface NudgeState {
    *  by applyCompression alongside the other baselines. */
   absorbedDebt?: number;
   absorbCount?: number;
+  /** #5698: pendingT1 (effective) recorded at the last tier-1 nudge fire —
+   *  the denominator for T1 harvest-stall detection. Consumed by the first
+   *  applyCompression after the fire; re-recorded at every tier-1 fire. */
+  lastT1FirePending?: number;
+  /** #5698: the last tier-1 fire was answered by a fold harvesting <
+   *  STALL_HARVEST_RATIO of the offered pending — the T1 channel is not
+   *  draining (partial model compliance). While set, tier arbitration lets
+   *  a mass-qualified T2/T3 fire ahead of T1 instead of starving forever.
+   *  Cleared by a compliant harvest or any distillation. */
+  t1HarvestStall?: boolean;
 }
 
 export interface CompressionStats {
