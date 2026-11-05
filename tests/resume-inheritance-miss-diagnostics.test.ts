@@ -35,6 +35,7 @@ test("resume-inheritance-miss: equal-depth replay under another id reports kind 
     assert.equal(report.best!.tailWindowIntact, true);
     assert.match(describeResumeMiss(report), /EQUAL-DEPTH replay \(10 cells == incoming 10\)/);
     assert.match(describeResumeMiss(report), /either a duplicate conversation or a branch taken at the parent's last-request depth — content cannot distinguish/, "equal-depth must not assert a cause content cannot establish");
+    assert.match(describeResumeMiss(report), /eligible for fork inheritance \(#5738\)/, "#5738: equal-depth is a fork shape — named as adoptable, not rejected by design");
 });
 
 test("resume-inheritance-miss: head break names the first diverging cell with hash digests (#4264)", () => {
@@ -83,20 +84,54 @@ test("resume-inheritance-miss: deep chain broken before the stored window report
     assert.match(describeResumeMiss(report), /tail window \(cells 2\.\.129\) byte-intact — break sits BEFORE cell 2/);
 });
 
-test("resume-inheritance-miss: truncated replay is reported distinctly from a head break (#4264)", () => {
+test("resume-inheritance-miss: a byte-exact shorter replay reports kind prefix-of-chain, not truncated (#5738 F3)", () => {
     const r = new PrefixAffinityResolver();
     const parent = Array.from({ length: 10 }, (_, i) => user(`full parent turn ${i} with substance`));
     const fp = r.chainFingerprint(parent)!;
     r.note("sess-parent", fp.depth, fp.tailHash, fp.itemHashes);
 
     const trimmed = parent.slice(0, 9);
-    assert.equal(r.findResumeParent(trimmed, "child"), null, "trimmed history is not a resume");
+    assert.equal(r.findResumeParent(trimmed, "child"), null, "trimmed history is not a RESUME (strictly-deeper gate unchanged)");
     const report = r.diagnoseResumeMiss(trimmed, "child");
-    assert.equal(report.best!.kind, "truncated");
+    assert.equal(report.best!.kind, "prefix-of-chain", "#5738 F3: every inspectable cell byte-identical — fork shape, split out of 'truncated'");
     assert.equal(report.best!.chainDepth, 10);
     assert.equal(report.best!.incomingDepth, 9);
+    assert.equal(report.best!.windowStart, 0);
+    assert.equal(report.best!.firstDivergence, null);
     assert.equal(report.best!.tailWindowIntact, true, "the visible cells form a clean prefix");
-    assert.match(describeResumeMiss(report), /LONGER than the incoming history \(9 cells\)/);
+    assert.match(describeResumeMiss(report), /byte-exact PREFIX \(visible cells 0\.\.8 intact\)/);
+    assert.match(describeResumeMiss(report), /eligible for fork inheritance \(#5738\)/);
+});
+
+test("resume-inheritance-miss: a shorter replay WITH a break still reports kind truncated (#5738 F3 negative)", () => {
+    const r = new PrefixAffinityResolver();
+    const parent = Array.from({ length: 10 }, (_, i) => user(`full parent turn ${i} with substance`));
+    const fp = r.chainFingerprint(parent)!;
+    r.note("sess-parent", fp.depth, fp.tailHash, fp.itemHashes);
+
+    const trimmed = parent.slice(0, 9);
+    trimmed[3] = user("re-encoded fourth turn — drift inside the window");
+    const report = r.diagnoseResumeMiss(trimmed, "child");
+    assert.equal(report.best!.kind, "truncated", "a break inside the inspectable window is NOT a verified prefix");
+    assert.equal(report.best!.firstDivergence, 3);
+    assert.equal(report.best!.tailWindowIntact, false);
+    assert.match(describeResumeMiss(report), /first divergence at cell 3 \(stored [0-9a-f]{8} vs incoming [0-9a-f]{8}\)/);
+});
+
+test("resume-inheritance-miss: shorter-than-the-uninspectable-head stays honestly truncated (#5738 F3 negative)", () => {
+    const r = new PrefixAffinityResolver();
+    const long = Array.from({ length: 200 }, (_, i) => user(`deep chain message number ${i} with substance`));
+    const fp = r.chainFingerprint(long)!;
+    r.note("sess-long", fp.depth, fp.tailHash, fp.itemHashes);
+    // Chain 200 deep → stored trailing window starts at cell 72; an incoming
+    // of 40 cells has ZERO overlap — no evidence either way.
+    const shortIn = long.slice(0, 40);
+    const report = r.diagnoseResumeMiss(shortIn, "child");
+    assert.equal(report.best!.kind, "truncated", "zero inspectable overlap must not claim a verified prefix");
+    assert.equal(report.best!.windowStart, 72);
+    assert.equal(report.best!.firstDivergence, null);
+    assert.equal(report.best!.tailWindowIntact, false);
+    assert.match(describeResumeMiss(report), /zero inspectable overlap/);
 });
 
 test("resume-inheritance-miss: absent parent chains report zero eligible at debug granularity (#4264)", () => {
