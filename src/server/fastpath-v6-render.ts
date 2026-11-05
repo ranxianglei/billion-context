@@ -69,15 +69,19 @@ export const PF_RENDER_EMERGENCY_RATIO = 0.9;
 const MIRROR_BYTE_BUDGET = 256 * 1024 * 1024;
 let mirrorBytes = 0;
 
-/** Capabilities fingerprint — any change red-gates the lane (caps-mismatch);
- *  if the legacy round's bytes then diverge from the stored rows the plane
- *  is killed for this sid (no-recast regime). */
+/** Identity fingerprint — the ONLY dimensions that may change the stored
+ *  row contents: the kernel-side rewrite surface (render strategy,
+ *  reasoning-drop predicate) plus the core-shape class (multimodal).
+ *  Any change red-gates that turn (caps-mismatch); if a subsequent legacy
+ *  full pass then diverges from the stored rows the plane is killed for
+ *  this sid (no-recast regime). model/maxDim/toolArmed are DELIBERATELY
+ *  ABSENT: they are per-turn mapping-layer inputs (#5643 ruling §5, owner
+ *  2026-11-05) — rows hold the post-rewrite generic core form, which no
+ *  mapping input can alter, so a within-family model switch simply re-maps
+ *  next turn with zero events and never touches snapshot validity. */
 export interface RenderCaps {
     v: 1;
-    model: string;
     strategy: string;
-    maxDim: number;
-    toolArmed: boolean;
     droppable: boolean;
     multimodal: boolean;
 }
@@ -85,10 +89,7 @@ export interface RenderCaps {
 function capsEqual(a: RenderCaps, b: RenderCaps): boolean {
     return (
         a.v === b.v &&
-        a.model === b.model &&
         a.strategy === b.strategy &&
-        a.maxDim === b.maxDim &&
-        a.toolArmed === b.toolArmed &&
         a.droppable === b.droppable &&
         a.multimodal === b.multimodal
     );
@@ -105,9 +106,14 @@ interface RenderMeta {
 
 export interface RenderWorld {
     sid: string;
-    /** Outbound JSON string per rendered ordinal, contiguous 0..n-1. */
+    /** Canonical post-kernel-rewrite generic core-form JSON per rendered
+     *  ordinal (contiguous 0..n-1 over surviving elements). NEVER mapped
+     *  wire bytes: the outbound message is re-mapped from these cores EVERY
+     *  turn with that turn's model/mapping inputs (#5643 ruling §5 ②). */
     rows: string[];
-    /** Parsed caches of `rows` (same index) — the splice reads these. */
+    /** Parsed caches of `rows` (same index) — the green round splices these
+     *  core rows ahead of the window output; they double as next round's
+     *  verify baseline, so no downstream consumer may alias-mutate them. */
     rowsParsed: unknown[];
     caps: RenderCaps;
     /** Cumulative Σ estimateCoreMessagesUpper over all current rows. */
@@ -131,11 +137,14 @@ const mirrors = new Map<string, RenderWorld>();
 const sessionSids = new Map<string, Set<string>>();
 
 /** Owner ruling 2026-11-05 (#5689 review): NO recast in ANY scenario.
- *  Structural divergence (byte diff/shrink), caps flips that changed stored
- *  bytes, S4 corruption, row-table inconsistency, unverifiable pre-existing
- *  snapshots — all land here. A dead sid NEVER arms, hydrates, gates green,
- *  or commits again. The verdict is persisted as a kind='dead' log entry so
- *  every future process instance reaches the same conclusion. */
+ *  Structural divergence (byte diff/shrink at the core-form boundary), S4
+ *  corruption, row-table inconsistency, unverifiable pre-existing snapshots
+ *  — all land here. Caps changes cannot alter stored bytes anymore (mapping
+ *  inputs sit outside the fingerprint, #5643 ruling §5 ③): their failure
+ *  mode is a red gate turn, absorbed by the audit cadence. A dead sid NEVER
+ *  arms, hydrates, gates green, or commits again. The verdict is persisted
+ *  as a kind='dead' log entry so every future process instance reaches the
+ *  same conclusion. */
 const deadSids = new Set<string>();
 
 export function killRenderPlane(store: SessionStore, sid: string, reason: string, log?: LogFn): void {
@@ -385,10 +394,11 @@ export function bumpAuditTick(sid: string): void {
 // Fast-round verification + splice (station 3)
 // ---------------------------------------------------------------------------
 
-/** Compare the mapped first-F fast outputs against the stored suffix. The
- *  caller has already run the SAME mapping chain (rescale→harden→
- *  coreToOpenai→systemToUser voice fn) as the baseline capture, so this is
- *  a pure byte compare. Returns false on ANY difference (incl. length). */
+/** Compare THIS round's first-F rewritten window cores against the stored
+ *  suffix AT THE CORE-FORM BOUNDARY (#5643 ruling §5 ③: the tripwire sits
+ *  on post-rewrite generic cores — never on mapped wire bytes; the mapping
+ *  chain runs fresh every turn and its inputs are excluded from identity).
+ *  Pure byte compare. Returns false on ANY difference (incl. length). */
 export function verifyRenderWindow(fastEmitsJson: string[], rw: RenderWorld, F: number): boolean {
     if (fastEmitsJson.length < F) return false;
     const start = rw.rows.length - F;
@@ -399,9 +409,11 @@ export function verifyRenderWindow(fastEmitsJson: string[], rw: RenderWorld, F: 
     return true;
 }
 
-/** Splice: prefix parsed rows (cached — zero parse/stringify cost) + mapped
- *  fast tail. Row indices align with rendered ordinals (probe-verified
- *  positional determinism; the byte check above is the tripwire). */
+/** Splice: prefix parsed CORE rows (cached) + this round's rewritten core
+ *  tail. Row indices align with rendered ordinals (probe-verified
+ *  positional determinism; the core-form byte check above is the tripwire).
+ *  The concatenated core sequence then passes through the FULL mapping
+ *  chain fresh this turn (#5643 ruling §5 ②) — nothing mapped is cached. */
 export function spliceOutboundRows<T>(rw: RenderWorld, F: number, tail: T[]): T[] {
     const prefixLen = rw.rows.length - F;
     if (prefixLen < 0) throw new Error("#5664 splice prefix underflow");

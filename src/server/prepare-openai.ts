@@ -252,10 +252,7 @@ export async function prepareOpenai(
             renderCapturedSid = renderSid;
             const rcaps: RenderCaps = {
                 v: 1,
-                model: modelIdOf(parsed) ?? "",
                 strategy: renderStrategy,
-                maxDim: imageRescaleMaxDim(),
-                toolArmed: imageRescaleToolArmed(session),
                 droppable: loopConfig.compressAtFoldPointClearThinking === true,
                 multimodal: wpHit.seedMultimodal === true || wpHit.windowCores.some((m) => Array.isArray((m as { content?: unknown }).content)),
             };
@@ -526,29 +523,36 @@ export async function prepareOpenai(
         const mapEgress = async (pms: CoreMessage[]): Promise<OpenAIMessage[]> =>
             hardenOpenaiAssistantContent(coreToOpenai(systemToUser(await applyImageRescalePass(pms as BiliMessage[], { session, sessionId, log, maxDim: imageRescaleMaxDim(), toolArmed: imageRescaleToolArmed(session) }), summaryVoiceFn)));
         if (renderFast !== null) {
-            // Station 3: prefix rows pass through verbatim (cached parses);
-            // the mapped tail replaces the last F stored rows AND extends them.
-            // The byte check against the stored suffix is the sole guard — on
-            // mismatch redo the legacy full pass THIS turn; there is no row
-            // repair anymore (no-recast ruling 2026-11-05) — if the stored
-            // rows and truth genuinely diverge, the next full-path capture
-            // kills this sid's plane permanently instead of recasting.
-            const mappedAll = await mapEgress(processedMessages);
+            // Station 3 (#5643 ruling §5, owner 2026-11-05 — canonical flow):
+            // stored rows are the POST-REWRITE GENERIC CORE FORM, so the
+            // tripwire compares this round's rewritten window cores against
+            // the stored suffix AT THAT BOUNDARY (never mapped wire bytes).
+            // On match the full core sequence (cached prefix ++ window
+            // output) passes through the mapping chain FRESH this turn —
+            // rescale/harden/coreToOpenai/voice/serialize all run with THIS
+            // turn's model/maxDim/toolArmed inputs; nothing mapped is cached.
+            // On mismatch redo the legacy full pass THIS turn; there is no
+            // row repair (no-recast ruling) — if stored rows and truth
+            // genuinely diverge, the next full-path capture kills this sid's
+            // plane permanently instead of recasting.
             const rw = renderFast.rw;
-            const wpWindowLen = wpHit?.windowCores.length ?? 0;
-            const committedTail = mappedAll.slice(0, Math.min(renderFast.F + wpWindowLen, mappedAll.length));
-            // Image reserve DELTA covers only this turn's NEW rows — the F
-            // frozen-window rows' reserve already sits in rw.imgCum; counting
-            // them again here drifts the ledger by a whole window each green
-            // round (review P1-2). slice(F) aligns with the captured tail.
-            renderedImageDelta = imageReserveFor(session, "openai", { model: parsed.model, messages: committedTail.slice(renderFast.F) } as unknown as OpenAIRequestBody, opts, billingUpstream ?? upstreamOrigin);
-            if (verifyRenderWindow(committedTail.slice(0, renderFast.F).map((m) => JSON.stringify(m)), rw, renderFast.F)) {
-                rebuiltMessages = spliceOutboundRows(rw, renderFast.F, committedTail);
-                renderedCaptureStrings = [...rw.rows.slice(0, rw.rows.length - renderFast.F), ...committedTail.map((m) => JSON.stringify(m))];
-                renderedTailObjects = [...committedTail];
-                log("debug", `[${sessionId}] #5664 render snapshot FAST emit (prefix=${rw.rows.length - renderFast.F} cached rows, tail=${committedTail.length} mapped)`);
+            const winCores = processedMessages;
+            if (verifyRenderWindow(winCores.slice(0, renderFast.F).map((m) => JSON.stringify(m)), rw, renderFast.F)) {
+                const fullCores = spliceOutboundRows<CoreMessage>(rw, renderFast.F, winCores);
+                rebuiltMessages = await mapEgress(fullCores);
+                // Image reserve DELTA covers only this turn's NEW elements —
+                // the F frozen-window rows' reserve already sits in rw.imgCum;
+                // counting them again drifts the ledger by a whole window each
+                // green round (review P1-2). The full sequence is
+                // [prefix n-F][frozen F][kNew], so the kNew fresh tails start
+                // at index n = rw.rows.length — slice(len) is exactly them.
+                // Billing metadata: computed on the fresh map.
+                renderedImageDelta = imageReserveFor(session, "openai", { model: parsed.model, messages: rebuiltMessages.slice(rw.rows.length) } as unknown as OpenAIRequestBody, opts, billingUpstream ?? upstreamOrigin);
+                renderedCaptureStrings = winCores.slice(renderFast.F).map((m) => JSON.stringify(m));
+                renderedTailObjects = [...winCores];
+                log("debug", `[${sessionId}] #5664 render snapshot FAST emit (prefix=${rw.rows.length - renderFast.F} cached core rows, tail=${winCores.length - renderFast.F} new cores, outbound=${rebuiltMessages.length} re-mapped this turn)`);
             } else {
-                log("warn", `[${sessionId}] #5664 render snapshot byte mismatch vs stored rows — legacy full pass this turn (no row repair exists: the next full-path capture kills the plane instead of recasting)`);
+                log("warn", `[${sessionId}] #5664 render snapshot core-form mismatch vs stored rows — legacy full pass this turn (no row repair exists: the next full-path capture kills the plane instead of recasting)`);
                 renderFast = null;
                 const turnFull = core.processTurn({ messages: renderMsgs, state: session.state, config: loopConfig, tokenCount, renderTags: renderStrategy, contentStore: contentStoreOf(session) });
                 session.state = turnFull.state;
@@ -556,7 +560,7 @@ export async function prepareOpenai(
                 const pmFull = applyReasoningDrop(stripKernelSummaries(turnFull.messages, turnFull.state), planReasoningDrop(renderMsgs, reasoning, isStrictReasoningEcho(session, upstreamOrigin, modelIdOf(parsed))), log, sessionId);
                 processedMessages = pmFull;
                 rebuiltMessages = await mapEgress(pmFull);
-                renderedCaptureStrings = rebuiltMessages.map((m) => JSON.stringify(m));
+                renderedCaptureStrings = pmFull.map((m) => JSON.stringify(m));
                 renderedTailObjects = [];
                 renderedImageDelta = 0;
             }
@@ -564,8 +568,9 @@ export async function prepareOpenai(
             rebuiltMessages = await mapEgress(processedMessages);
             // Lane-durably-dead sessions never arm/commit again — keep the
             // strings null so station 2 skips both their build (O(n) per
-            // turn) and the doomed commit call.
-            if (!renderLaneDead) renderedCaptureStrings = rebuiltMessages.map((m) => JSON.stringify(m));
+            // turn) and the doomed commit call. Rows store the post-rewrite
+            // core form (#5643 §5), so capture from cores, never wire bytes.
+            if (!renderLaneDead) renderedCaptureStrings = processedMessages.map((m) => JSON.stringify(m));
             renderedTailObjects = [];
             renderedImageDelta = 0;
         }

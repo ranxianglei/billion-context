@@ -1,18 +1,25 @@
 // #5664 — station 2/3: outbound-row render-snapshot plane for the v6 lane.
 //
-// Golden equation under test: on every engaged turn the emit array built as
-// [cached prefix rows] + [freshly mapped tail] (fast rounds) must be BYTE-
+// Golden equation under test: on every engaged turn the outbound emit built
+// as [cached prefix core rows] ++ [this round's rewritten window cores]
+// passed through the FULL mapping chain fresh (fast rounds) must be BYTE-
 // IDENTICAL to what the legacy full-pipeline path emits (arm / audit /
-// rollback rounds). The kernel is untouched; this lane caches egress bytes,
-// not semantics — equivalence with the full pass is the contract.
+// rollback rounds). The kernel is untouched.
+//
+// CANONICAL-FLOW REGIME (#5643 ruling §5, owner 2026-11-05): stored rows
+// hold the POST-REWRITE GENERIC CORE FORM — the only plane boundary the
+// mapping layer (model/maxDim/toolArmed/voice/harden/serialize) can never
+// alter — and NOTHING mapped/cached survives across turns: every emit runs
+// the entire chain end-to-end. Equivalence with the full pass is the
+// contract, enforced here against a legacy oracle.
 //
 // NO-RECAST REGIME (owner ruling 2026-11-05, sealed during #5689 review):
-// recast is FORBIDDEN in every scenario — any stored-row divergence (byte
-// diff, shrink, caps flip that changed bytes, checksum corruption,
-// unverifiable pre-existing snapshot) KILLS the plane for that sid
-// permanently (persisted kind='dead' log entry) and the session rides the
-// legacy full path forever after. Storage is strictly append-only (+ dead
-// markers); arm cast is legal exactly once, onto an empty table.
+// recast is FORBIDDEN in every scenario — any stored-row divergence (core-form
+// diff vs the rewritten window, shrink, non-append capture on a live lane,
+// checksum corruption, unverifiable pre-existing snapshot) KILLS the plane
+// for that sid permanently (persisted kind='dead' log entry) and the session
+// rides the legacy full path forever after. Storage is strictly append-only
+// (+ dead markers); arm cast is legal exactly once, onto an empty table.
 //
 // Harness: unit-level against a REAL sqlite sidecar (UnifiedShadow shadow
 // mode), mirroring tests/fastpath-v6-msgid.test.ts; the kernel runs as a
@@ -66,7 +73,7 @@ function mapEgress(pms: CoreMessage[]): OpenAIMessage[] {
 }
 
 function capsFor(strategy: string): RenderCaps {
-    return { v: 1, model: "m", strategy, maxDim: 1_600, toolArmed: false, droppable: false, multimodal: false };
+    return { v: 1, strategy, droppable: false, multimodal: false };
 }
 
 /** Shallow-adopt a returned state into a stable object identity (the session
@@ -466,25 +473,27 @@ test("golden: cached-prefix splice equals the legacy full-path bytes end-to-end"
             stateB.nextRuleId = Math.max(stateB.nextRuleId ?? 1, (scratch as AgentState).nextRuleId ?? 1);
             const pmW = stripKernelSummaries(tW.messages, tW.state as never);
 
-            const mappedAll = mapEgress(pmW);
-            const committedTail = mappedAll.slice(0, Math.min(F + (v.outcome.hit?.windowCores.length ?? 0), mappedAll.length));
-            const vv = verifyRenderWindow(committedTail.slice(0, F).map((m) => JSON.stringify(m)), rw, F);
-            assert.equal(vv, true, `turn ${tn}: window verify failed — tail bytes drifted vs stored rows`);
-            rebuilt = spliceOutboundRows<OpenAIMessage>(rw, F, committedTail);
-            captureStrings = [...rw.rows.slice(0, rw.rows.length - F), ...committedTail.map((m) => JSON.stringify(m))];
+            // #5643 §5 canonical-flow regime: rows store the POST-REWRITE
+            // GENERIC CORE FORM — verify at that boundary, then pass the full
+            // core sequence through the mapping chain fresh this turn.
+            const vv = verifyRenderWindow(pmW.slice(0, F).map((m) => JSON.stringify(m)), rw, F);
+            assert.equal(vv, true, `turn ${tn}: window verify failed — core form drifted vs stored rows`);
+            rebuilt = mapEgress(spliceOutboundRows<CoreMessage>(rw, F, pmW));
+            captureStrings = [...rw.rows.slice(0, rw.rows.length - F), ...pmW.slice(F).map((m) => JSON.stringify(m))];
             // steady-mode contract: only THIS turn's new rows are appended to
             // the plane (the slice past the F frozen window); the full list
             // stays in captureStrings for the golden equation below.
-            steadyAppendRows = committedTail.slice(F).map((m) => JSON.stringify(m));
+            steadyAppendRows = pmW.slice(F).map((m) => JSON.stringify(m));
             mode = "steady";
             fastRounds++;
         } else {
             // legacy full path over the engaged view (production shape)
             const tF = core.processTurn({ messages: hit !== null ? [...hit.view] : (openaiToCore(JSON.parse(bodyText) as never) as unknown as { msgs: CoreMessage[] }).msgs, state: stateB, config: cfg, tokenCount, renderTags: strategy });
             adoptState(stateB, tF.state as unknown as AgentState);
-            const mappedAll = mapEgress(stripKernelSummaries(tF.messages, tF.state as never));
+            const pmF = stripKernelSummaries(tF.messages, tF.state as never);
+            const mappedAll = mapEgress(pmF);
             rebuilt = mappedAll;
-            captureStrings = mappedAll.map((m) => JSON.stringify(m));
+            captureStrings = pmF.map((m) => JSON.stringify(m));
             mode = "legacy";
             legacyRounds++;
         }
@@ -507,6 +516,14 @@ test("golden: cached-prefix splice equals the legacy full-path bytes end-to-end"
         totalSubmittedText += rowCost(srcRows);
         if (mode === "steady") steadySubmittedRows += srcRows.length;
         if (op.committed && op.op === "cast") castOps++;
+        // #5643 §5 shape pin: every stored row is POST-REWRITE CORE FORM —
+        // core identity fields present, wire bytes impossible (neither field
+        // exists on OpenAIMessage).
+        if (op.committed) for (const s of srcRows) {
+            const rowObj = JSON.parse(s) as { id?: unknown; contentType?: unknown };
+            assert.equal(typeof rowObj.id, "string", "stored row must be core form, not mapped wire bytes");
+            assert.equal(typeof rowObj.contentType, "string", "stored row must be core form, not mapped wire bytes");
+        }
         // THE golden equation: lane emit == legacy oracle, byte for byte.
         assert.deepEqual(rebuilt.map((m) => JSON.stringify(m)), goldens[tn - 1].rows,
             `turn ${tn} (${mode}${gate.ok ? "" : `, reason=${gate.reason}`}): lane emit diverged from legacy oracle`);
