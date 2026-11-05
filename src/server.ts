@@ -12,7 +12,7 @@ import type { ProxyOptions, ResignSettings } from "./config.js";
 export type { ProxyOptions } from "./config.js";
 import { loadNamedProviders, loadOptions, loadRoutes } from "./config.js";
 import { resetProxyCache } from "./upstream-proxy.js";
-import { withExitDeadline } from "./restart.js";
+import { withExitDeadline } from "./exit-deadline.js";
 import { effectivePromptCacheRouting, FALLBACK_EFFECTIVE_WINDOW_FLOOR, findRoute, findRouteKey, lookupContextLimit, resolveConfiguredContextLimit, resolveConfiguredOutputLimit, resolveCompressProtocol, resolveMessageTimestamps, resolveResignSettings } from "./config.js";
 import { contextFromRegistry, loadRegistry, peekRegistryContext, peekRegistryOutputLimit, peekRegistryPriceProfile } from "./registry.js";
 import { codexAlignedWindow } from "./codex-models.js";
@@ -1731,7 +1731,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
             // #5753: affinity/order now settle into sqlite — await their queued
             // writes so a graceful exit loses nothing recorded this run.
             // #5757: the await is deadline-bounded — a wedged volume must not
-            // hold the exit hostage (see withExitDeadline in restart.ts).
+            // hold the exit hostage (see src/exit-deadline.ts).
             await withExitDeadline("unified-store flushes (affinity/order/resign)", (async () => {
                 await flushPrefixAffinity();
                 await flushOrderSkeletons();
