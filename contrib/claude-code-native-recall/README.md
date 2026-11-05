@@ -1,11 +1,12 @@
 # billion-claude-recall
 
-Claude Code 与 OpenCode 的本地归档召回：保留宿主原生压缩，通过 hooks/原生适配器与 MCP 找回已归档内容，不改变模型请求 URL 或经过中转代理。
+Claude Code、OpenCode 与 DSH 的本地归档召回：保留宿主原生压缩，通过 hooks/原生适配器与 MCP 找回已归档内容，不改变模型请求 URL 或经过中转代理。
 
 2026-11-05 v0.3.2：为未启用 schema union 重写的官方 Claude Code 去掉 `recall_get` 输入 schema 的根级 `anyOf`，在工具说明和服务端继续校验 turn/locator 组合。官方未修改 CLI 2.1.318、DeepSeek 官方 Flash、low 模式下已实测原生手动 `/compact`、compact/resume hooks、两阶段真实模型搜索与全文分页取回。162 项离线回归通过。最新能力与验证边界见 [验证说明](VALIDATION.md)。本 PR 提供源码更新，不代表已合并、发布到 npm 或安装到用户电脑。
 
 - Claude Code：下文安装及使用说明。
 - OpenCode V2.2.5：[安装与显式启用](opencode/README.zh-CN.md)、[原生接口契约](opencode/API_CONTRACT.zh-CN.md)。完整适配器和共享归档核心均在本目录；无需分别覆盖安装两个版本。
+- DSH 0.2.0-rc.2：[安装、原生接口与安全边界](dsh/README.zh-CN.md)、[验证记录](dsh/VALIDATION.zh-CN.md)。复用共享归档核心，不改现有 Claude Code 或 OpenCode 安装方式。
 - English overview and verification limits: [VALIDATION.md](VALIDATION.md).
 
 ## 安装

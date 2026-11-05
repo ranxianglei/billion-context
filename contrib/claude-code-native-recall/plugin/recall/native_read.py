@@ -105,7 +105,7 @@ def _snapshot(session_id, highwater_seq=None, highwater_event_id=None, *, host='
     if not path.is_file() or path.is_symlink():
         _error('archive_missing', 'No durable archive exists for this session')
     rows = archive.records(session_id)
-    if host not in ('opencode', 'claude-code') or not rows or any(r.get('identity', {}).get('host') != host for r in rows):
+    if host not in ('opencode', 'claude-code', 'dsh') or not rows or any(r.get('identity', {}).get('host') != host for r in rows):
         _error('host_mismatch', 'Archive facts do not match the requested host')
     if highwater_seq is None:
         highwater_seq = max(r['seq'] for r in rows)
@@ -114,7 +114,11 @@ def _snapshot(session_id, highwater_seq=None, highwater_event_id=None, *, host='
     if boundary is None or (highwater_event_id is not None and boundary['event_id'] != highwater_event_id):
         _error('revision_missing', 'The referenced durable archive boundary is missing or changed')
     prefix = [r for r in rows if r['seq'] <= highwater_seq]
-    turns = transcript._project_opencode_records(prefix) if host == 'opencode' else _cc_turns(prefix)
+    if host == 'dsh':
+        import dsh_read
+        turns = dsh_read.project_records(prefix)
+    else:
+        turns = transcript._project_opencode_records(prefix) if host == 'opencode' else _cc_turns(prefix)
     return turns, highwater_seq, boundary['event_id']
 
 
@@ -151,6 +155,8 @@ def revision(session_id, turn):
         # Preserve OpenCode v1 revision tokens already returned to callers.
         value = {'version': 1, 'session_id': session_id,
             'native_user_id': _anchor(turn), 'text_sha256': _digest(turn['text'])}
+    if turn.get('host') == 'dsh':
+        value['host'] = 'dsh'
     return hashlib.sha256(_dump(value).encode('utf-8')).hexdigest()
 
 
@@ -161,17 +167,17 @@ def locator(session_id, turn, highwater_seq, highwater_event_id):
             'anchor_kind': turn['_cc_anchor']['kind'] if turn.get('_cc_anchor') else None,
             'anchor_id': _anchor(turn), 'branch': 'main', 'highwater_seq': highwater_seq,
             'highwater_event_id': highwater_event_id, 'text_sha256': _digest(turn['text'])}
-    return {'version': 1, 'host': 'opencode', 'session_id': session_id,
+    return {'version': 1, 'host': turn.get('host', 'opencode'), 'session_id': session_id,
         'native_user_id': _anchor(turn), 'highwater_seq': highwater_seq,
         'highwater_event_id': highwater_event_id, 'text_sha256': _digest(turn['text'])}
 
 
 def _validate_locator(value):
-    if not isinstance(value, dict) or type(value.get('version')) is not int or value.get('version') != 1 or value.get('host') not in ('opencode', 'claude-code'):
+    if not isinstance(value, dict) or type(value.get('version')) is not int or value.get('version') != 1 or value.get('host') not in ('opencode', 'claude-code', 'dsh'):
         _error('invalid_locator', 'Unsupported native locator')
     if value['host'] == 'claude-code' and (value.get('anchor_kind') not in ('cc_user_uuid', 'archive_turn_id') or value.get('branch') != 'main'):
         _error('invalid_locator', 'CC locator requires an explicit main-session anchor kind')
-    anchor_key = 'native_user_id' if value['host'] == 'opencode' else 'anchor_id'
+    anchor_key = 'anchor_id' if value['host'] == 'claude-code' else 'native_user_id'
     for key, maximum in [('session_id', 200), (anchor_key, 256),
                           ('highwater_event_id', 256), ('text_sha256', 64)]:
         if not isinstance(value.get(key), str) or not value[key] or len(value[key]) > maximum:
@@ -202,7 +208,7 @@ def get(*, locator_value=None, session_id=None, turn=None, expected_revision=Non
             _error('invalid_argument', 'Do not combine a locator with a different session or a numeric turn')
         session_id = reference['session_id']
         turns, highwater, boundary = _snapshot(session_id, reference['highwater_seq'], reference['highwater_event_id'], host=host)
-        anchor_key = 'native_user_id' if host == 'opencode' else 'anchor_id'
+        anchor_key = 'anchor_id' if host == 'claude-code' else 'native_user_id'
         found = []
         for candidate in turns:
             try:

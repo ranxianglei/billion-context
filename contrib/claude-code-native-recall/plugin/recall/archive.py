@@ -174,7 +174,7 @@ def _recover(d, db):
             record = json.loads(first.readline())
         if isinstance(record, dict) and record.get('identity', {}).get('host'):
             _set_meta(db, 'host', record['identity']['host'])
-            if record['identity']['host'] == 'opencode':
+            if record['identity']['host'] in ('opencode', 'dsh'):
                 _set_meta(db, 'native_parent', record['identity'].get('parent_session'))
     with open(path, 'r+b') as stream:
         stream.seek(offset)
@@ -215,7 +215,7 @@ def _recover(d, db):
                 _set_meta(db, 'project', rec['identity']['project'])
             if rec.get('identity', {}).get('host'):
                 _set_meta(db, 'host', rec['identity']['host'])
-            if rec.get('identity', {}).get('host') == 'opencode':
+            if rec.get('identity', {}).get('host') in ('opencode', 'dsh'):
                 _set_meta(db, 'native_parent', rec['identity'].get('parent_session'))
             src = rec.get('source', {})
             if src.get('checkpoint'):
@@ -548,7 +548,7 @@ def entries(sid):
     return [r['entry'] for r in records(sid) if r['kind'] == 'event']
 
 
-def append_native(sid, project, observations, parent_id=None):
+def append_native(sid, project, observations, parent_id=None, *, host='opencode'):
     """Persist JSON-serializable OpenCode V2 observations without rewriting them.
 
     Observation timestamps are provenance, never a native revision. Identity plus
@@ -556,6 +556,8 @@ def append_native(sid, project, observations, parent_id=None):
     the same revision remain separate facts. The caller explicitly opts in and
     supplies one session only; this function never scans host data or attachments.
     """
+    if host not in ('opencode', 'dsh'):
+        raise ValueError('Unsupported native host')
     session_dir(sid)
     if not isinstance(project, str) or not pathlib.Path(project).is_absolute():
         raise ValueError('OpenCode project must be an absolute canonical path')
@@ -587,13 +589,13 @@ def append_native(sid, project, observations, parent_id=None):
         db = _connect(d)
         try:
             _recover(d, db)
-            if _meta(db, 'host') not in (None, 'opencode'):
+            if _meta(db, 'host') not in (None, host):
                 raise ValueError('Session already belongs to another host')
             if _meta(db, 'project') not in (None, project):
                 raise ValueError('Session already belongs to another project')
-            if _meta(db, 'host') == 'opencode' and _meta(db, 'native_parent') != parent_id:
+            if _meta(db, 'host') == host and _meta(db, 'native_parent') != parent_id:
                 raise ValueError('Session parent identity cannot change')
-            _set_meta(db, 'host', 'opencode')
+            _set_meta(db, 'host', host)
             _set_meta(db, 'project', project)
             _set_meta(db, 'native_parent', parent_id)
             archive_path = d / 'events.jsonl'
@@ -601,11 +603,11 @@ def append_native(sid, project, observations, parent_id=None):
             appended = 0
             with open(archive_path, 'ab') as out:
                 for observation, entity, revision in prepared:
-                    identity = {'host': 'opencode', 'project': project, 'session': sid,
+                    identity = {'host': host, 'project': project, 'session': sid,
                                 'branch': 'main' if parent_id is None else 'child',
                                 'parent_session': parent_id, **entity}
                     # Caller fields cannot replace the scoped host identity.
-                    identity.update(host='opencode', project=project, session=sid,
+                    identity.update(host=host, project=project, session=sid,
                                     branch='main' if parent_id is None else 'child', parent_session=parent_id)
                     key = _digest([identity, observation['kind'], revision, observation['payload']])
                     if db.execute('SELECT 1 FROM events WHERE key=?', (key,)).fetchone():
@@ -613,7 +615,7 @@ def append_native(sid, project, observations, parent_id=None):
                     seq = _meta(db, 'seq', 0) + 1
                     record = {'version': VERSION, 'seq': seq, 'event_id': key, 'kind': 'event',
                               'identity': identity,
-                              'source': {'path': 'opencode://' + sid, 'native_revision': revision,
+                              'source': {'path': host + '://' + sid, 'native_revision': revision,
                                          'origin': observation.get('origin'),
                                          'observed_at': observation.get('observed_at')},
                               'entry': observation, 'attachments': _attachments(observation['payload']),
@@ -630,7 +632,7 @@ def append_native(sid, project, observations, parent_id=None):
             _set_meta(db, 'legacy_migrated', True)
             _commit_index(db)
             return {'session_id': sid, 'appended': appended, 'count': _meta(db, 'seq', 0),
-                    'durable': True, 'host': 'opencode', 'main_session': parent_id is None}
+                    'durable': True, 'host': host, 'main_session': parent_id is None}
         finally:
             db.close()
 
