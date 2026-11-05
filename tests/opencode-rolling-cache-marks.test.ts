@@ -125,6 +125,13 @@ function messageBreakpoints(body: Record<string, unknown>): number {
     return n;
 }
 
+// Rendered ACP tags embed a wall-clock time attribute, so two independent
+// instances differ in it even when every other byte matches — compare
+// substance, not when each instance happened to run.
+function withoutTagTime(value: unknown): unknown {
+    return JSON.parse(JSON.stringify(value, (_k, v: unknown) => (typeof v === "string" ? v.replace(/ time="[^"]*"/g, "") : v)));
+}
+
 const CONV = "ses_rolling_marks";
 const laneHeaders = { "x-bili-plugin": "opencode", "x-bili-plugin-conversation": CONV, "x-acp-session": CONV };
 
@@ -174,7 +181,7 @@ test("rolling cache_control: deltas after the seed, upstream bodies identical to
         assert.deepEqual(modes.slice(1), requests.slice(1).map(() => "delta"), "a moving breakpoint never forces a resync");
         assert.equal(inc.forwarded.length, base.forwarded.length);
         for (let i = 0; i < requests.length; i++) {
-            assert.equal(JSON.stringify(inc.forwarded[i].messages), JSON.stringify(base.forwarded[i].messages), `request ${i}: assembled messages byte-identical to the host's full resend`);
+            assert.equal(JSON.stringify(withoutTagTime(inc.forwarded[i].messages)), JSON.stringify(withoutTagTime(base.forwarded[i].messages)), `request ${i}: assembled messages byte-identical to the host's full resend`);
             assert.equal(messageBreakpoints(inc.forwarded[i]), messageBreakpoints({ messages: requests[i] }), `request ${i}: only the host's rolling breakpoints (no accumulation)`);
         }
         const last = sizes[sizes.length - 1];
@@ -197,7 +204,7 @@ test("rolling cache_control: a retouch against a cold canonical answers 409 and 
         const { modes } = await runIncremental(inc, requests, { restartBefore: 3 });
         assert.deepEqual(modes, ["seed", "delta", "delta", "delta:409", "seed", "delta", "delta"], "cold canonical: one 409, one re-seed, then deltas again");
         for (let i = 0; i < requests.length; i++) {
-            assert.equal(JSON.stringify(inc.forwarded[i].messages), JSON.stringify(base.forwarded[i].messages), `request ${i} byte-identical after recovery`);
+            assert.equal(JSON.stringify(withoutTagTime(inc.forwarded[i].messages)), JSON.stringify(withoutTagTime(base.forwarded[i].messages)), `request ${i} byte-identical after recovery`);
         }
     } finally {
         await inc.close();
@@ -236,7 +243,7 @@ test("rolling marks: repeated prompts retain distinct IDs and match full resend"
         const { modes } = await runIncremental(inc, requests);
         assert.deepEqual(modes, ["seed", ...requests.slice(1).map(() => "delta")]);
         for (let i = 0; i < requests.length; i++) {
-            assert.equal(JSON.stringify(inc.forwarded[i].messages), JSON.stringify(base.forwarded[i].messages));
+            assert.equal(JSON.stringify(withoutTagTime(inc.forwarded[i].messages)), JSON.stringify(withoutTagTime(base.forwarded[i].messages)));
             assert.equal(messageBreakpoints(inc.forwarded[i]), messageBreakpoints({ messages: requests[i] }));
         }
     } finally { await inc.close(); }
@@ -300,7 +307,7 @@ for (const kind of ["document", "image", "tool-result", "signed-thinking"] as co
             const { modes } = await runIncremental(inc, requests);
             assert.deepEqual(modes, ["seed", "delta"]);
             for (let i = 0; i < requests.length; i++) {
-                assert.equal(JSON.stringify(inc.forwarded[i].messages), JSON.stringify(base.forwarded[i].messages));
+                assert.equal(JSON.stringify(withoutTagTime(inc.forwarded[i].messages)), JSON.stringify(withoutTagTime(base.forwarded[i].messages)));
             }
         } finally { await inc.close(); }
     });
@@ -332,7 +339,7 @@ for (const removed of ["signature", "is_error"] as const) {
             const good = await inc.post("/__bili/plugin/turn", JSON.stringify(body), laneHeaders);
             assert.equal(good.status, 200, "same sequence still accepts the exact original");
             assert.equal(inc.forwarded.length, before + 1);
-            assert.deepEqual(inc.forwarded.at(-1)?.messages, base.forwarded.at(-1)?.messages, "rejected retouch changed neither payload nor the valid retry's rendered output");
+            assert.deepEqual(withoutTagTime(inc.forwarded.at(-1)?.messages), withoutTagTime(base.forwarded.at(-1)?.messages), "rejected retouch changed neither payload nor the valid retry's rendered output");
         } finally { await inc.close(); }
     });
 }
