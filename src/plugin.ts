@@ -3785,7 +3785,10 @@ function traeUsageSample(payload: Record<string, unknown>): UsageSample {
     if (input !== undefined) sample.inputTokens = input;
     const output = num(payload["completion_tokens"]);
     if (output !== undefined) sample.outputTokens = output;
-    const cached = num(payload["cache_read_input_tokens"]);
+    // #5713/#779: same cached-token ladder as the proxy-lane adapter —
+    // openai-vocabulary fields first, this wire's native counter last.
+    const pd = payload["prompt_tokens_details"] as Record<string, unknown> | undefined;
+    const cached = num(pd?.["cached_tokens"]) ?? num(payload["prompt_cache_hit_tokens"]) ?? num(payload["cache_read_input_tokens"]);
     if (cached !== undefined) sample.cachedTokens = cached;
     const creation = num(payload["cache_creation_input_tokens"]);
     if (creation !== undefined) sample.creationTokens = creation;
