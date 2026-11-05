@@ -433,3 +433,41 @@ test("#3236: acp_status uncompressed rows keep spans visible, flag only what sta
   });
   assert.ok(!legacy.includes("\u26a0"), "legacy output gains no flags");
 });
+
+// #3617 gate discipline: the doom flag must be pinned in BOTH directions.
+// The re-pin above only asserts the unflagged direction (#5751 made those
+// spans foldable), so keep one genuinely un-foldable row — the whole tail
+// inside the soft-protected zone — and assert the flag still fires.
+test("#3236: acp_status doom flag still fires for a genuinely doomed row", () => {
+  const core = createCore();
+  const cfg = config();
+  const { state, all } = buildHeadFold(core, cfg);
+  all.push(
+    mk("X1", "user", "text", undefined, undefined, 200),
+    mk("X2", "assistant", "text", undefined, undefined, 200),
+  );
+  state.messageRefs = assignRefs(all, {
+    existing: state.messageRefs,
+    nextIndex: 3,
+  }).map;
+
+  // Both tail messages sit in the soft-protected zone, so no projection of
+  // their row can fold — the doom flag must fire.
+  const zoned = { ...cfg, preserveRecentMessages: 2 };
+  const report = buildStatusReport(state, all, defaultCountTokens, {
+    scope: "uncompressed",
+    view: "ranges",
+    config: zoned,
+    originalMessages: all,
+  });
+  const lines = report.split("\n");
+  for (const id of ["X1", "X2"]) {
+    const ref = state.messageRefs.byRaw[id]!;
+    const line = lines.find((l) => l.includes(ref));
+    assert.ok(line, `${id} row must stay listed`);
+    assert.ok(
+      line!.includes("\u26a0 not foldable"),
+      `zoned ${id} row must carry the doom flag: ${line}`,
+    );
+  }
+});
