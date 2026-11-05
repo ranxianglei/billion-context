@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
 import { defaultConfig, createInitialState, defaultCountTokens } from "acp-kernel";
-import { startServer, isSideRequest, outputBudgetField, restoreOutputBudget, sideRequestGuard, resolveKnownOutputCeiling, _resetNoOutputCeilingWarningsForTest, _resetDshMidBandWarningsForTest, OUTPUT_RESTORE_ABSOLUTE_FLOOR } from "../src/server.ts";
+import { startServer, isSideRequest, isStructuredOutputCall, outputBudgetField, restoreOutputBudget, sideRequestGuard, resolveKnownOutputCeiling, _resetNoOutputCeilingWarningsForTest, _resetDshMidBandWarningsForTest, OUTPUT_RESTORE_ABSOLUTE_FLOOR } from "../src/server.ts";
+import { resolveSideLane, SIDE_REQUEST_MAX_TOKENS } from "../src/server/side-request.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { recordPluginRuntimeInfo, _resetPluginStateForTest } from "../src/plugin.ts";
 import { estimateRawBodyTokens, estimateRawBodyBreakdown } from "../src/preflight.ts";
@@ -54,6 +55,30 @@ test("isSideRequest: a toolless structured-output request is a side request", ()
     assert.equal(isSideRequest({ max_tokens: 64000, response_format: "json_object" }), false, "non-object response_format");
     assert.equal(isSideRequest({ max_tokens: 64000, response_format: { type: "json_object" }, tools: [{ type: "function", function: { name: "f" } }] }), false, "#546 still wins: a tool-carrying structured request is a main turn");
     assert.equal(isSideRequest({ max_tokens: 64000, response_format: { type: "json_object" } }, "main"), false, "explicit main persona outranks the shape");
+});
+
+test("isStructuredOutputCall: the predicate is self-contained for the restoreOutputBudget skip (#2500 parity)", () => {
+    // handle.ts consults this predicate independently of the #546 guard, so the
+    // no-tools veto lives IN the predicate — a tool-carrying structured request
+    // must never be demoted into the high-water skip by a standalone caller.
+    assert.equal(isStructuredOutputCall({ max_tokens: 64000, response_format: { type: "json_object" } }), true, "toolless chat json_object");
+    assert.equal(isStructuredOutputCall({ max_output_tokens: 64000, text: { format: { type: "json_schema" } } }), true, "toolless responses text.format");
+    assert.equal(isStructuredOutputCall({ max_tokens: 64000, response_format: { type: "json_object" }, tools: [{}] }), false, "any tool entry vetoes (#546)");
+    assert.equal(isStructuredOutputCall({ max_tokens: 64000, response_format: { type: "text" } }), false, "plain text format does not count");
+    assert.equal(isStructuredOutputCall(null), false, "null body");
+    assert.equal(isStructuredOutputCall("nope"), false, "non-object body");
+});
+
+test("resolveSideLane: the #5073 label names the structured-output shape in the log line", () => {
+    assert.equal(
+        resolveSideLane({ countTokens: false, responsesCompact: false, protocol: "openai", stripApplied: false, sideIntent: true, requestAgent: undefined, sideLabel: "structured-output utility call (#5073)" }).reason,
+        "structured-output utility call (#5073)",
+    );
+    // Without a label the historical reason strings stay byte-stable.
+    assert.equal(
+        resolveSideLane({ countTokens: false, responsesCompact: false, protocol: "openai", stripApplied: false, sideIntent: true, requestAgent: undefined }).reason,
+        `max_tokens<=${SIDE_REQUEST_MAX_TOKENS}`,
+    );
 });
 
 test("isSideRequest: host-declared side-request agent outranks the token-budget heuristic (#1699)", () => {
@@ -806,7 +831,7 @@ test("e2e: opencode v2 title-gen is classified by intent, not token budget (#169
     }
 });
 
-test("e2e: a toolless structured-output request is forwarded without injected tools", async () => {
+test("e2e: a toolless structured-output request rides the #388 passthrough — no injection, no high-water poison (#5073)", async () => {
     const rig = await startRig();
     try {
         const url = `http://127.0.0.1:${rig.proxyPort}/bili/http://127.0.0.1:${rig.upstreamPort}/v1/chat/completions`;
@@ -815,22 +840,44 @@ test("e2e: a toolless structured-output request is forwarded without injected to
             { role: "system", content: "Extract facts from the conversation." },
             { role: "user", content: "User: I moved to Lisbon last spring." },
         ];
-        // Control: the same shape without response_format is a main turn and gets the wire tools.
-        const rControl = await fetch(url, { method: "POST", headers, body: JSON.stringify({ model: MODEL, stream: true, max_tokens: 64000, messages }) });
+        // Main turn: the same toolless shape WITHOUT response_format is a real
+        // turn — it gets the ACP tools injected and learns a 1024 high-water.
+        // That is the value the side call's 64000 budget must NOT overwrite
+        // (the #1897/#2500 poisoning class).
+        const rControl = await fetch(url, { method: "POST", headers, body: JSON.stringify({ model: MODEL, stream: true, max_tokens: 1024, messages }) });
         assert.equal(rControl.status, 200);
         await rControl.text();
         const controlTools = (rig.lastBody as { tools?: unknown[] } | null)?.tools;
         assert.ok(Array.isArray(controlTools) && controlTools.length > 0, "control: a toolless main turn gets the ACP tools injected");
+        const s1 = getSession(SESSION);
+        assert.ok(s1, "session exists after the main request");
+        assert.equal(s1.metadata.outputBudgetHighWater, 1024, "high-water learned from the healthy main turn");
+        const stateAfterMain = JSON.stringify(s1.state);
+        const statsAfterMain = JSON.stringify(s1.stats);
+        const snapshotAfterMain = JSON.stringify(s1.lastMessages);
+        const requestsAfterMain = s1.stats.requests;
 
+        // The Hindsight fact-extraction shape: no tools, response_format, a 64000
+        // budget that would seed the high-water were restoreOutputBudget not skipped.
         const body = { model: MODEL, stream: true, max_tokens: 64000, messages, response_format: { type: "json_object" } };
         const rFix = await fetch(url, { method: "POST", headers, body: JSON.stringify(body) });
         assert.equal(rFix.status, 200);
         await rFix.text();
-        const fwd = rig.lastBody as { tools?: unknown; messages?: unknown; response_format?: unknown } | null;
+        const fwd = rig.lastBody as { tools?: unknown; messages?: unknown; response_format?: unknown; max_tokens?: unknown } | null;
         assert.ok(fwd, "upstream received the request");
         assert.equal(fwd?.tools, undefined, "no tools injected beside response_format");
-        assert.deepEqual(fwd?.messages, messages, "messages forwarded verbatim");
+        assert.deepEqual(fwd?.messages, messages, "messages forwarded verbatim (no prompt/render tags injected)");
         assert.deepEqual(fwd?.response_format, body.response_format, "response_format untouched");
+        assert.equal(fwd?.max_tokens, 64000, "utility-call budget must NOT be mutated by restoreOutputBudget");
+
+        // Kernel state, stats, snapshot, counter and high-water all untouched (#388).
+        const s2 = getSession(SESSION);
+        assert.ok(s2, "session still exists after the side request");
+        assert.equal(JSON.stringify(s2.state), stateAfterMain, "side request must NOT mutate kernel state");
+        assert.equal(JSON.stringify(s2.stats), statsAfterMain, "side request must NOT mutate stats");
+        assert.equal(JSON.stringify(s2.lastMessages), snapshotAfterMain, "side request must NOT clobber the message snapshot");
+        assert.equal(s2.stats.requests, requestsAfterMain, "side request must NOT increment the main request counter");
+        assert.equal(s2.metadata.outputBudgetHighWater, 1024, "the 64000 utility budget must NOT seed the high-water (#1897/#2500 class)");
     } finally {
         await closeRig(rig);
     }
