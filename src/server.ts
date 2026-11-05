@@ -100,6 +100,7 @@ import { queryLogLines } from "./web/logs-query.js";
 import { configFile, defaultLogFile, sessionsDir, stateDir } from "./paths.js";
 import { atomicWriteInstanceFile, clearProxyInstanceFile, classifySameLanePeer, entryShape, findPresentUnverifiedSameLaneTwin, findSameLanePredecessor, findVerifiedSameLaneTwin, isPidAlive, listInstances, markPortReleased, probePid, readProxyInstanceFile, registerInstanceAndWarn, resolveOwnFingerprint, sameInstanceShape, SPAWN_FINGERPRINT_ENV, unregisterInstance, warnOnNewPeers, writeSpawnPortLog, type InstanceShape, type PidProbe, type ProxyInstanceFile, type RegistryEntry, type SameLanePeer } from "./instance.js";
 import { createServedMarkerWriter, peerStillContests, reapStaleWriterMarkers, writerMarkerDir, type ServedMarkerWriter } from "./served-markers.js";
+import { hotAdoptionProbe, setHotAdoptionProbe } from "./adoption-guard.js";
 import { recordSplitBrainContest, registerSplitBrainEvidenceCheck } from "./storage/runtime-status.js";
 import { holderProbeOrigin, mayClobberPointer, probeHolderForHint, probeOwnerInfo, resolvePortClaim, verifyEntryOwnsPort } from "./port-owner.js";
 import { armEventLoopWatchdog } from "./event-loop-watchdog.js";
@@ -1372,6 +1373,11 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
             registerSplitBrainEvidenceCheck((contest) =>
                 peerStillContests(markerDir, instanceId, contest.peer.instanceId, contest.sessionId, Date.now()));
             setGlobalSessionCommitListener((id) => servedWriter?.noteServed(id));
+            // #394/#5624: turn the same writer markers into hot-adoption
+            //  refusals — a session this instance never owned but a live peer
+            //  committed within the contest window must not be adopted or
+            //  written here (split-brain double-write). See src/adoption-guard.ts.
+            setHotAdoptionProbe(hotAdoptionProbe(markerDir, instanceId));
         }
         const nOverrides = Object.keys(opts.routes).length;
         // #2864: stamp pid + instance id into the banner — 24 identical

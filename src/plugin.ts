@@ -21,6 +21,7 @@ import type { ProxyToolResult } from "./proxy-tool-result.js";
 import { normalizeSseLineEndings, finalizeSseLineEndings } from "./sse-util.js";
 import { composeStreamFilters, containsBiliInternalText, containsEchoResidue, containsMarkerLineText, containsRenderTagText, containsToolCallEmissionText, containsToolCallXmlFragment, createBiliArtifactFilter, createIdentityStreamFilter, createMarkerLineFilter, createTagEchoFilter, isOrphanMarkupText, mayStartBiliInternal, mayStartDegenerateRenderTag, mayStartMarkerLine, mayStartRenderTag, mayStartToolCallEmission, stripAcpTags, stripAnthropicText, stripOpenaiChatText, stripResponsesText, type TagEchoFilter } from "./loop/tag-echo-filter.js";
 import { log as loggerLog } from "./logger.js";
+import { hotWritersOf, describeHotWriter } from "./adoption-guard.js";
 import { scanModelOutputForPhantomAttachments } from "./phantom-attachment.js";
 import { ccrEnabled, ccrLoopConfig, contentStoreOf, retrieveToolName } from "./store.js";
 import { emitStreamError, emitUpstreamTruncation } from "./stream-error.js";
@@ -1317,11 +1318,29 @@ export function forkParentRevisionLegacy(session: Session): string {
 // every later getSessionAsync of the id for the process lifetime.
 async function resolveForkConversation(id: string): Promise<Session | undefined> {
     if (peekSession(id)) return peekSession(id);
-    if (await getStore().loadAsync(id)) return getSessionAsync(id);
+    // #394/#5624: adopting a session a LIVE peer instance is actively
+    //  writing is the split-brain state (two writers, one envelope — drift,
+    //  frozen rows). Management calls WRITE (withSessionLock + scheduleSave),
+    //  so refuse the disk adoption and let callers answer their honest
+    //  404/fail-closed; the error line names the peer. After the peer exits
+    //  its marker stops contesting and the id resolves again (handoff safe).
+    if (await getStore().loadAsync(id)) {
+        const hot = hotWritersOf(id);
+        if (hot.length > 0) {
+            loggerLog("error", `[plugin] conversation ${id} exists but another live instance is writing it (${hot.map(describeHotWriter).join(", ")}) — refusing to adopt it here; compress/status calls for it fail until that instance exits (#394)`);
+            return undefined;
+        }
+        return getSessionAsync(id);
+    }
     const { session, entry } = resolveConversation(id);
     if (session) return session;
     const persistedId = entry?.sessionId ?? id;
     if (!(await getStore().loadAsync(persistedId))) return undefined;
+    const persistedHot = hotWritersOf(persistedId);
+    if (persistedHot.length > 0) {
+        loggerLog("error", `[plugin] conversation ${id} (alias of ${persistedId}) exists but another live instance is writing it (${persistedHot.map(describeHotWriter).join(", ")}) — refusing to adopt it here; compress/status calls for it fail until that instance exits (#394)`);
+        return undefined;
+    }
     return getSessionAsync(persistedId);
 }
 
@@ -2178,6 +2197,19 @@ export async function handlePluginTool(
                 : "unknown plugin conversation (id registered but its session is not resident in this proxy instance — a fresh model request re-binds it)",
         }));
         return;
+    }
+    // #394/#5624: the session may be hot on a live peer even when it
+    //  resolved from THIS process's memory (adopted before the peer started,
+    //  or the client load-balanced its turns across instances) — executing a
+    //  proxy tool writes the session, so this is the last write-vector gate.
+    {
+        const hot = hotWritersOf(session.id);
+        if (hot.length > 0) {
+            deps.log("error", `[plugin] tool "${tool}" refused for session ${session.id}: another live instance is writing it (${hot.map(describeHotWriter).join(", ")}) — stop one instance or point this client at the writer (#394)`);
+            res.writeHead(409, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: false, error: `this conversation is currently being served by another bili instance (${describeHotWriter(hot[0]!)}); stop that instance or route this client to it, then retry` }));
+            return;
+        }
     }
     // Absorb/rules enablement is per-session (last resolved config), so the
     // gate needs the session — it runs after the lookup above.

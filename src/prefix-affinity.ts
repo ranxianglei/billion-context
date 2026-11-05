@@ -138,6 +138,11 @@ export interface AnonymousAffinity {
      *  full prefix at the resume evidence floor. Diagnostics only: no adoption
      *  and no proof that the identified client stopped using its original id. */
     orphanSuspect?: string[];
+    /** #394 hot-adoption refusal: chains the resolver MATCHED but did not
+     *  adopt because a live peer instance is actively writing them (the
+     *  request fell through to another candidate or a fresh mint).
+     *  Diagnostics only — never used for matching. */
+    refusedAdoption?: string[];
 }
 
 /** #2265 simhash-adoption policy. Second rung of the identity ladder: run
@@ -603,7 +608,13 @@ export class PrefixAffinityResolver {
      * Returns null when the request carries no usable conversation signal
      * (caller keeps the #286 explicit 400).
      */
-    resolve(input: unknown[]): AnonymousAffinity | null {
+    resolve(input: unknown[], refuseAdoption?: (sessionId: string) => boolean): AnonymousAffinity | null {
+        // #394/#5624: `refuseAdoption` receives every candidate that PASSES a
+        //  rung's match gates; a refused candidate is skipped (the remaining
+        //  candidates compete normally, all-refused falls through to the
+        //  fresh mint) and recorded in `refusedAdoption` so the caller can
+        //  log the split-brain refusal — see src/adoption-guard.ts.
+        const refused: string[] = [];
         // #2791: the identity chain hashes the WIRE-NEUTRAL projection of
         //  the transcript, so the same conversation resolves identically on
         //  every protocol (a stateless client switching openai ↔ anthropic
@@ -657,6 +668,10 @@ export class PrefixAffinityResolver {
                 if (v1Depth === 0 || entry.depth > v1Depth) continue;
                 if (v1Hashes[entry.depth - 1] !== entry.tailHash) continue;
             }
+            if (refuseAdoption?.(entry.sessionId)) {
+                if (!refused.includes(entry.sessionId)) refused.push(entry.sessionId);
+                continue;
+            }
             const better = !best
                 || (entry.hv === 2 && best.hv === 1)
                 || (entry.hv === best.hv && (entry.depth > best.depth || (entry.depth === best.depth && entry.lastSeen > best.lastSeen)));
@@ -674,6 +689,7 @@ export class PrefixAffinityResolver {
                 sketches: incSketches,
                 userFlags: incUserFlags.slice(-MAX_STORED_ITEMS),
                 ...(tailFragments ? { tailFragments } : {}),
+                ...(refused.length > 0 ? { refusedAdoption: refused } : {}),
             };
         }
 
@@ -719,6 +735,10 @@ export class PrefixAffinityResolver {
                     if (incFrags[i] !== storedFrags[i]) { prefix = false; break; }
                 }
                 if (!prefix) continue;
+                if (refuseAdoption?.(entry.sessionId)) {
+                    if (!refused.includes(entry.sessionId)) refused.push(entry.sessionId);
+                    continue;
+                }
                 if (!cont || depth > cont.depth || (depth === cont.depth && entry.lastSeen > cont.lastSeen)) cont = entry;
             }
             if (cont) {
@@ -733,6 +753,7 @@ export class PrefixAffinityResolver {
                     sketches: incSketches,
                     userFlags: incUserFlags.slice(-MAX_STORED_ITEMS),
                     ...(tailFragments ? { tailFragments } : {}),
+                    ...(refused.length > 0 ? { refusedAdoption: refused } : {}),
                 };
             }
         }
@@ -752,7 +773,7 @@ export class PrefixAffinityResolver {
         //     conversation diverges hard somewhere, which is exactly what
         //     distinguishes adoption from the #1115 symmetric mid-chain match.
         if (simhashAdoptionEnabled && incomingDepth > 0) {
-            const adopted = this.simhashAdopt(incomingDepth, incSketches, incItemHashes, incUserFlags);
+            const adopted = this.simhashAdopt(incomingDepth, incSketches, incItemHashes, incUserFlags, refuseAdoption, refused);
             if (adopted) {
                 return {
                     sessionId: adopted.sessionId,
@@ -766,6 +787,7 @@ export class PrefixAffinityResolver {
                     userFlags: incUserFlags.slice(-MAX_STORED_ITEMS),
                     adoption: { coverage: adopted.coverage, meanHamming: adopted.meanHamming },
                     ...(tailFragments ? { tailFragments } : {}),
+                    ...(refused.length > 0 ? { refusedAdoption: refused } : {}),
                 };
             }
         }
@@ -814,6 +836,7 @@ export class PrefixAffinityResolver {
             ...(tailFragments ? { tailFragments } : {}),
             ...(lineage ? { lineage } : {}),
             ...(orphanSuspect ? { orphanSuspect } : {}),
+            ...(refused.length > 0 ? { refusedAdoption: refused } : {}),
         };
     }
 
@@ -855,7 +878,7 @@ export class PrefixAffinityResolver {
      *  SKETCH_TTL_MS, whose depth the incoming list equals or exceeds by at
      *  most ALIGN_TAIL_APPEND_MAX. Alignment is head-anchored over the
      *  positions both sides have sketches for. */
-    private simhashAdopt(incomingDepth: number, incSketches: string[], itemHashes: string[], incUserFlags: boolean[]): { sessionId: string; depth: number; coverage: number; meanHamming: number } | null {
+    private simhashAdopt(incomingDepth: number, incSketches: string[], itemHashes: string[], incUserFlags: boolean[], refuseAdoption?: (sessionId: string) => boolean, refusedOut?: string[]): { sessionId: string; depth: number; coverage: number; meanHamming: number } | null {
         if (incSketches.length < ALIGN_MIN_DEPTH) return null;
         const now = Date.now();
         let winner: { entry: ChainEntry; coverage: number; meanHamming: number } | null = null;
@@ -905,6 +928,10 @@ export class PrefixAffinityResolver {
                 if (incUserFlags[rawPos] && itemHashes[rawPos] === entryHashes[i]) exactUser++;
             }
             if (exactUser < ALIGN_EXACT_ANCHOR_MIN) continue;
+            if (refuseAdoption?.(entry.sessionId)) {
+                if (refusedOut && !refusedOut.includes(entry.sessionId)) refusedOut.push(entry.sessionId);
+                continue;
+            }
             passing++;
             if (passing > 1) return null; // ambiguous — refuse to guess
             winner = { entry, coverage, meanHamming: total / alignLen };
