@@ -16,6 +16,7 @@ export function createInitialState(): CompressionState {
       anchors: {},
       lastShownByTier: {},
       lastInjectedTier: null,
+      t1HarvestStall: false,
     },
     stats: {
       tokensCompressed: 0,

@@ -168,6 +168,16 @@ type RangeResolution =
  *  clears the latch, so normal sessions hold a handful at most. Oldest drop. */
 const MAX_TRUNCATE_LATCH = 64;
 
+/** #5698: harvest ratio below which a successful T1-shaped fold counts as a
+ *  stalled T1 channel. The nudge offered `lastT1FirePending` raw tokens; if
+ *  the fold that followed reclaimed less than half of it, the model is only
+ *  partially complying and t1Eff stays pinned high forever — the exact shape
+ *  where the legacy mass legs (`t2Pen > t1Eff`) can never fire and the tier-2
+ *  backlog grows unboundedly while every slot re-fires T1. A distillation
+ *  fold (new block tier >= 2) clears the stall regardless of ratio: it is by
+ *  definition progress on the higher tiers. */
+const STALL_HARVEST_RATIO = 0.5;
+
 function rangeError(
   spec: { startRef: string; endRef: string },
   message: string,
@@ -862,6 +872,28 @@ export function createCore(ports: Ports = {}): CompressionCore {
       // tracked — a fresh cadence starts from a clean slate.
       state.nudge.absorbedDebt = 0;
       state.nudge.absorbCount = 0;
+      // T1 harvest-stall measurement (#5698): compare what this fold actually
+      // reclaimed against the raw mass the last T1 nudge offered. A
+      // distillation fold (new tier >= 2 block) clears the flag regardless of
+      // ratio — progress on the higher tiers by definition; otherwise a
+      // harvest below STALL_HARVEST_RATIO latches the flag so decideNudge stops
+      // spending slots re-firing the unresponsive channel. Consume-once
+      // either way; no-op calls (blocksCreated === 0) leave the armed value in
+      // place, so only real folds count as evidence.
+      const producedDistillation = state.blocks.some(
+        (b) => !preFoldBlockIds.has(b.blockId) && b.tier >= 2,
+      );
+      if (producedDistillation) {
+        // Progress on the higher tiers clears the latch even when no T1 fire
+        // is being measured right now — the channel moved where it counts.
+        state.nudge.t1HarvestStall = false;
+      }
+      const armedT1Pending = state.nudge.lastT1FirePending;
+      state.nudge.lastT1FirePending = undefined;
+      if (!producedDistillation && armedT1Pending !== undefined && armedT1Pending > 0) {
+        state.nudge.t1HarvestStall =
+          tokensCompressed / armedT1Pending < STALL_HARVEST_RATIO;
+      }
       // A successful compression is by definition viable progress — restart
       // the terminal-floor streak so the escape signal can only fire again
       // after N fresh stuck events (#300).
@@ -1486,6 +1518,12 @@ const nudgeNode: PipelineNode = {
         // Rotation memory (#509): survives the compression-success reset so a
         // compliant model draining raw ranges cannot restart every T1/T2 tie.
         stamped.lastInjectedTier = nudge.tier;
+        // Harvest-stall arming (#5698): remember how much raw mass this T1
+        // nudge offered so the next successful fold can measure what the T1
+        // channel actually delivered (consume-once in applyCompression).
+        if (nudge.tier === 1) {
+          stamped.lastT1FirePending = nudge.breakdown.pendingT1;
+        }
       }
     }
 
@@ -2163,7 +2201,21 @@ function decideNudge(input: NudgeInput): NudgeDecision {
     // changes the reason label/voice; truncate.threshold remains the
     // independent last resort when there is genuinely nothing to compress.
     const candidates: CompressionTier[] = [1];
+    let stallDroppedT1 = false;
     if (config.tiers.enabled) {
+      // T1 harvest-stall (#5698): max-pending arbitration keeps picking the
+      // unresponsive T1 channel — its pending stays high precisely BECAUSE
+      // nothing folds it. With the stall flag latched and the remaining tiers
+      // able to clear the benefit floor, drop T1 so the tier that actually
+      // delivers gets the slot. Below the floor the drop would suppress the
+      // whole nudge — keep the legacy behavior instead.
+      if (
+        state.nudge.t1HarvestStall === true &&
+        Math.max(t2Pen, t3Pen) >= minPressureBenefit
+      ) {
+        candidates.length = 0;
+        stallDroppedT1 = true;
+      }
       candidates.push(2, 3);
     }
     let best: CompressionTier | null = null;
@@ -2183,7 +2235,7 @@ function decideNudge(input: NudgeInput): NudgeDecision {
       injectedReason =
         best === 1
           ? `${label} T1: max effective pending ${bestPending}, usage ${Math.round(usage * 100)}%`
-          : `${label} T${best} distill: max pending ${bestPending} (T1 effective ${t1Eff}, T2 ${t2Pen}, T3 ${t3Pen}), usage ${Math.round(usage * 100)}%`;
+          : `${label} T${best} distill: max pending ${bestPending} (T1 effective ${t1Eff}, T2 ${t2Pen}, T3 ${t3Pen}), usage ${Math.round(usage * 100)}%${stallDroppedT1 ? " [T1 harvest stall]" : ""}`;
     }
   } else if (growthReady) {
     // Explicit count-triggered candidates (#509): reachable on the growth path
@@ -2209,7 +2261,39 @@ function decideNudge(input: NudgeInput): NudgeDecision {
         }
       }
     }
-    if (countCandidates.length > 0) {
+    // T1 harvest-stall override (#5698): while the T1 channel demonstrably
+    // fails to deliver (last successful T1-shaped fold harvested below
+    // STALL_HARVEST_RATIO of the offered mass — partial compliance pins t1Eff
+    // high forever), a higher tier whose MASS leg crossed its OWN threshold
+    // takes the slot before T1 keeps firing into the same unresponsive
+    // channel. The legacy mass legs additionally demanded "> t1Eff", which
+    // made them structurally unreachable in this shape; the stall flag IS the
+    // evidence the lower channel cannot deliver, so the demand is dropped
+    // here and only here. Cadence rules unchanged; if neither higher tier is
+    // ready/cadence-open the cascade below runs legacy (stall only redirects
+    // when a delivering channel exists). Absent flag (legacy states) =
+    // byte-identical arbitration.
+    let stallChosen: CompressionTier | null = null;
+    let stallReason = "";
+    if (config.tiers.enabled && state.nudge.t1HarvestStall === true) {
+      if (t2Pen >= tierThresholds[2]) {
+        const lastShown = state.nudge.lastShownByTier[2] ?? 0;
+        if (lastShown === 0 || tokenCount - lastShown >= growthFloor) {
+          stallChosen = 2;
+          stallReason = `T2 distill ready: ${tiers[2]!.targetBlocks.length} tier-1 blocks (${t2Pen} tokens) >= ${tierThresholds[2]}${config.nudge.tierGrowthTokens?.t2 === undefined ? " (1.5x)" : ""}, T1 effective ${t1Eff} [T1 harvest stall], usage ${Math.round(usage * 100)}%`;
+        }
+      } else if (t3Pen >= tierThresholds[3]) {
+        const lastShown = state.nudge.lastShownByTier[3] ?? 0;
+        if (lastShown === 0 || tokenCount - lastShown >= growthFloor) {
+          stallChosen = 3;
+          stallReason = `T3 condense ready: ${tiers[3]!.targetBlocks.length} tier-2 blocks (${t3Pen} tokens) >= ${tierThresholds[3]}${config.nudge.tierGrowthTokens?.t3 === undefined ? " (1.5x)" : ""}, T1 effective ${t1Eff} [T1 harvest stall], usage ${Math.round(usage * 100)}%`;
+        }
+      }
+    }
+    if (stallChosen !== null) {
+      injectedTier = stallChosen;
+      injectedReason = stallReason;
+    } else if (countCandidates.length > 0) {
       // Slot rotation (#509): T1 keeps first pick until it has gone
       // (lastInjectedTier !== 1 — fresh state, or the previous slot was a
       // distill); then the slot hands to a count-ready tier, oldest cadence

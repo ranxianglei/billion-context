@@ -155,6 +155,23 @@ export interface NudgeState {
    *  by applyCompression alongside the other baselines. */
   absorbedDebt?: number;
   absorbCount?: number;
+
+  /** #5698: the raw T1 pending mass (decision breakdown.pendingT1) recorded
+   *  when the most recent T1 nudge fired (growth or pressure path). Consumed
+   *  by the next successful applyCompression, which compares its own
+   *  tokensCompressed against it to set or clear t1HarvestStall — this is how
+   *  partial compliance ("every nudge folds only a few K") becomes measurable
+   *  as T1-channel ineffectiveness instead of invisible. Optional for
+   *  pre-#5698 persisted states (absent = nothing armed = no measurement). */
+  lastT1FirePending?: number;
+  /** #5698: latched by applyCompression when the last successful T1-shaped
+   *  fold harvested less than STALL_HARVEST_RATIO of the offered mass. While
+   *  set, decideNudge routes the growth-path slot to a higher tier whose MASS
+   *  leg crossed its own threshold (dropping the legacy "> t1Eff" demand) and
+   *  removes T1 from the pressure candidates whenever the remaining tiers can
+   *  clear minPressureBenefit. Cleared by a harvest at/above the ratio or by a
+   *  distillation fold. Optional (absent = false = legacy arbitration). */
+  t1HarvestStall?: boolean;
 }
 
 export interface CompressionStats {

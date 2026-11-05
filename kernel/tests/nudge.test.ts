@@ -2104,3 +2104,262 @@ test("nudge: first-sight bypass falls silent once usage drops below the band (#1
     "20% < 45% band → drain complete, pacing resumes",
   );
 });
+
+// ---------------------------------------------------------------------------
+// T1 harvest-stall detection (#5698)
+//
+// Mass model: each makeMessages message ≈ 5000 tokens (20000 chars / 4);
+// block summary mass = summaryChars / 4. Under buildConfig the derived
+// thresholds are T1 = 6000, T2/T3 = 9000 (1.5x), growthFloor = 5000,
+// minPressureBenefit = 5000. The shared fixture below reproduces the
+// production starvation shape: a mass-ready T2 (10000 tokens of tier-1
+// summaries) sitting behind a persistently high T1 effective pending
+// (~50K of raw compressible messages) — where the legacy cascade's
+// "> t1Eff" demand makes the T2 mass leg structurally unreachable.
+// ---------------------------------------------------------------------------
+
+type StallCore = ReturnType<typeof createCore>;
+
+function stallFixture(
+  core: StallCore,
+  overrides: Partial<Config> = {},
+): { config: Config; messages: CoreMessage[]; state: CompressionState } {
+  const config = buildConfig({
+    tiers: { enabled: true, tier2Trigger: 1000, tier3Trigger: 2000 },
+    compress: { minCompressRange: 5000, maxSummaryLength: 0, minSummaryLength: 0 },
+    ...overrides,
+  });
+  const messages = makeMessages(14);
+  let state = createInitialState();
+  state = core.processTurn({ messages, state, config, tokenCount: 10000 }).state;
+  // Four T1 blocks anchored to m0..m3 (they cover those messages): 10000-char
+  // summaries each → T2 pending 4 × 2500 = 10000 >= 9000. m4..m13 stay raw
+  // (~50K) so T1 effective keeps clearing its own 6000 threshold forever.
+  // nextBlockId advances past the injected ids — block ids are never reused
+  // (kernel contract), so real folds must not collide with b1..b4.
+  state = {
+    ...state,
+    nextBlockId: 5,
+    blocks: t1Blocks([["m0"], ["m1"], ["m2"], ["m3"]], 10000),
+  };
+  return { config, messages, state };
+}
+
+/** Drive one T1 nudge fire (arming the harvest measurement), return state. */
+function armT1Fire(
+  core: StallCore,
+  config: Config,
+  messages: CoreMessage[],
+  state: CompressionState,
+): CompressionState {
+  const turn = core.processTurn({ messages, state, config, tokenCount: 55000 });
+  if (turn.nudge.tier !== 1 || !turn.nudge.shouldInject) {
+    throw new Error(`expected a T1 arm fire, got tier=${turn.nudge.tier} inject=${turn.nudge.shouldInject}: ${turn.nudge.reason}`);
+  }
+  return turn.state;
+}
+
+/** One lazy fold: a single ~5K message of the ~50K offered. */
+function lazyFold(
+  core: StallCore,
+  config: Config,
+  messages: CoreMessage[],
+  state: CompressionState,
+): CompressionState {
+  return core.applyCompression({
+    ranges: [{ startRef: "m00005", endRef: "m00005", summary: "one small fold" }],
+    messages,
+    state,
+    config,
+  }).state;
+}
+
+test("harvest-stall: lazy partial folds latch the stall and hand the slot to mass-ready T2 (#5698)", () => {
+  const core = createCore();
+  const { config, messages, state: s0 } = stallFixture(core);
+  const s1 = armT1Fire(core, config, messages, s0);
+  assert.ok(
+    (s1.nudge.lastT1FirePending ?? 0) > 0,
+    "the T1 fire arms the offered-mass measurement",
+  );
+  const s2 = lazyFold(core, config, messages, s1);
+  assert.equal(s2.nudge.t1HarvestStall, true, "harvest << 50% of offered latches the stall");
+  assert.equal(s2.nudge.lastT1FirePending, undefined, "measurement is consume-once");
+  const turn = core.processTurn({ messages, state: s2, config, tokenCount: 56000 });
+  assert.equal(turn.nudge.shouldInject, true);
+  assert.equal(
+    turn.nudge.tier,
+    2,
+    "stalled T1 yields the slot to the mass-ready T2 instead of re-firing into the same channel",
+  );
+  assert.match(turn.nudge.reason, /\[T1 harvest stall\]/);
+});
+
+test("harvest-stall: full compliance (>= 50% harvest) never latches — T1 keeps the slot (#5698)", () => {
+  const core = createCore();
+  const { config, messages, state: s0 } = stallFixture(core);
+  const s1 = armT1Fire(core, config, messages, s0);
+  const s2 = core.applyCompression({
+    ranges: [{ startRef: "m00005", endRef: "m00012", summary: "eager batch fold" }],
+    messages,
+    state: s1,
+    config,
+  }).state;
+  assert.equal(s2.nudge.t1HarvestStall, false, "a delivering channel clears/never sets the stall");
+  const turn = core.processTurn({ messages, state: s2, config, tokenCount: 56000 });
+  assert.equal(turn.nudge.shouldInject, true);
+  assert.equal(turn.nudge.tier, 1, "no stall → legacy T1-first arbitration unchanged");
+});
+
+test("harvest-stall: a distillation fold clears a latched stall regardless of ratio (#5698)", () => {
+  const core = createCore();
+  const { config, messages, state: s0 } = stallFixture(core);
+  const s1 = armT1Fire(core, config, messages, s0);
+  const s2 = lazyFold(core, config, messages, s1);
+  assert.equal(s2.nudge.t1HarvestStall, true);
+  const s3 = core.applyCompression({
+    ranges: [{ startRef: "b1", endRef: "b4", summary: "tier-2 distillation" }],
+    messages,
+    state: s2,
+    config,
+  }).state;
+  assert.equal(s3.nudge.t1HarvestStall, false, "progress on the higher tiers clears the stall");
+  const turn = core.processTurn({ messages, state: s3, config, tokenCount: 56000 });
+  assert.equal(turn.nudge.shouldInject, true);
+  assert.equal(turn.nudge.tier, 1, "stall cleared → T1 may take the slot again");
+});
+
+test("harvest-stall: legacy persisted state without the flag keeps byte-identical arbitration (#5698)", () => {
+  const core = createCore();
+  const { config, messages, state: s0 } = stallFixture(core);
+  // Simulate a pre-#5698 snapshot restored mid-session: neither stall field
+  // exists at all, and the timing stamps read like a just-compressed session
+  // (so first-sight mass is ready and arbitration is actually reached).
+  const legacy: CompressionState = {
+    ...s0,
+    nudge: {
+      ...s0.nudge,
+      lastPerMessageNudgeTokens: 0,
+      lastNudgeShownTokens: 0,
+    },
+  };
+  delete legacy.nudge.t1HarvestStall;
+  delete legacy.nudge.lastT1FirePending;
+  const turn = core.processTurn({ messages, state: legacy, config, tokenCount: 56000 });
+  assert.equal(turn.nudge.shouldInject, true);
+  assert.equal(
+    turn.nudge.tier,
+    1,
+    "absent flag = no stall evidence = legacy T1-first short-circuit (t2Pen 10000 >= 9000 stays unreachable)",
+  );
+  assert.doesNotMatch(turn.nudge.reason, /\[T1 harvest stall\]/);
+});
+
+test("harvest-stall: pressure band drops T1 from candidates when the remaining tiers clear the benefit floor (#5698)", () => {
+  const core = createCore();
+  const { config, messages, state: s0 } = stallFixture(core);
+  const s1 = armT1Fire(core, config, messages, s0);
+  const s2 = lazyFold(core, config, messages, s1);
+  assert.equal(s2.nudge.t1HarvestStall, true);
+  const turn = core.processTurn({ messages, state: s2, config, tokenCount: 95000 });
+  assert.equal(turn.nudge.shouldInject, true, "95% usage sits in the pressure band");
+  assert.equal(
+    turn.nudge.tier,
+    2,
+    "max-pending arbitration would pick T1 (~45K) — the stall drops it for the delivering T2",
+  );
+  assert.match(turn.nudge.reason, /\[T1 harvest stall\]/);
+});
+
+test("harvest-stall: pressure band keeps T1 when the remaining tiers cannot clear the benefit floor (#5698)", () => {
+  const core = createCore();
+  const { config, messages, state: s0 } = stallFixture(core);
+  const s1 = armT1Fire(core, config, messages, s0);
+  const s2 = lazyFold(core, config, messages, s1);
+  // Shrink the tier-1 backlog below the 5000-token benefit floor: dropping T1
+  // here would suppress the whole nudge, so legacy behavior must win.
+  const pair = t1Blocks([["m0"], ["m1"]], 8000);
+  const s3: CompressionState = {
+    ...s2,
+    blocks: [
+      { ...s2.blocks[s2.blocks.length - 1]!, active: true },
+      ...pair,
+    ],
+  };
+  const turn = core.processTurn({ messages, state: s3, config, tokenCount: 95000 });
+  assert.equal(turn.nudge.shouldInject, true);
+  assert.equal(
+    turn.nudge.tier,
+    1,
+    "stall below the benefit floor must NOT suppress the only actionable channel",
+  );
+  assert.doesNotMatch(turn.nudge.reason, /\[T1 harvest stall\]/);
+});
+
+test("harvest-stall: the stall redirect still respects per-tier cadence (#5698)", () => {
+  const core = createCore();
+  const { config, messages, state: s0 } = stallFixture(core);
+  const s1 = armT1Fire(core, config, messages, s0);
+  const s2 = lazyFold(core, config, messages, s1);
+  assert.equal(s2.nudge.t1HarvestStall, true);
+  // Stamp T2 as having fired 100 tokens ago (< growthFloor 5000).
+  const s3: CompressionState = {
+    ...s2,
+    nudge: { ...s2.nudge, lastShownByTier: { ...s2.nudge.lastShownByTier, 2: 55900 } },
+  };
+  const turn = core.processTurn({ messages, state: s3, config, tokenCount: 56000 });
+  assert.equal(turn.nudge.shouldInject, true);
+  assert.equal(
+    turn.nudge.tier,
+    1,
+    "cadence-unmet T2 falls back to the legacy cascade (T1 fires, as before)",
+  );
+});
+
+test("harvest-stall: no-op calls are not evidence — the armed measurement survives until a real fold (#5698)", () => {
+  const core = createCore();
+  const { config, messages, state: s0 } = stallFixture(core);
+  const s1 = armT1Fire(core, config, messages, s0);
+  const armedBefore = s1.nudge.lastT1FirePending ?? 0;
+  assert.ok(armedBefore > 0);
+  // Target a range already covered by the injected T1 blocks → consumed skip.
+  const noop = core.applyCompression({
+    ranges: [{ startRef: "m00001", endRef: "m00002", summary: "already folded" }],
+    messages,
+    state: s1,
+    config,
+  });
+  assert.equal(noop.result.blocksCreated, 0, "covered range commits nothing");
+  assert.equal(noop.result.noop, true);
+  assert.equal(
+    noop.state.nudge.lastT1FirePending,
+    armedBefore,
+    "a no-op leaves the armed measurement in place",
+  );
+  assert.notEqual(noop.state.nudge.t1HarvestStall, true, "no evidence yet, no latch");
+  const s2 = lazyFold(core, config, messages, noop.state);
+  assert.equal(s2.nudge.t1HarvestStall, true, "the first REAL fold measures and latches");
+});
+
+test("harvest-stall: explicit count triggers keep working independently of the stall flag (#5698 × #509)", () => {
+  const core = createCore();
+  const { config, messages, state: s0 } = stallFixture(core, {
+    tiers: { enabled: true, tier2Trigger: 3, tier3Trigger: 2000 },
+  });
+  // Shrink the tier-1 backlog to THREE blocks whose summaries total well below
+  // the 9000-token mass threshold (3 × 1000 = 3000) — mass leg NOT ready,
+  // count leg IS (3 >= tier2Trigger 3).
+  const small = t1Blocks([["m0"], ["m1"], ["m2"]], 4000);
+  const sA: CompressionState = { ...s0, blocks: small };
+  const s1 = armT1Fire(core, config, messages, sA);
+  const s2 = lazyFold(core, config, messages, s1);
+  assert.equal(s2.nudge.t1HarvestStall, true);
+  const turn = core.processTurn({ messages, state: s2, config, tokenCount: 56000 });
+  assert.equal(turn.nudge.shouldInject, true);
+  assert.equal(
+    turn.nudge.tier,
+    2,
+    "count-ready T2 reaches the slot through the #509 pool even though the stall mass leg is not ready",
+  );
+  assert.doesNotMatch(turn.nudge.reason, /\[T1 harvest stall\]/);
+});
