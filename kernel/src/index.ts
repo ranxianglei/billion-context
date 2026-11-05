@@ -94,6 +94,8 @@ export {
   leanPack,
   LEAN_HOW_TO_COMPRESS,
   leanHowToCompress,
+  LEAN_HOW_TO_COMPRESS_TIMESTAMPED,
+  TIMELINE_RULE_LINE,
   builtinSource,
   createDirPackSource,
   createPackResolver,
@@ -156,6 +158,10 @@ export type { HandoffInput, HandoffMeta, HandoffBlockFull } from "./handoff.js";
 export { isToolMessage } from "./message-kind.js";
 export { hideConsumedCompressCalls } from "./hide-consumed.js";
 export type { HideConsumedResult } from "./hide-consumed.js";
+// Experimental fold-point carrier relocation (default off) — host-side mirror
+// sites (round-2 re-render, S4 plugin render) call the same pure function.
+export { relocateCompressCarriers, planRelocateCompressCarriers } from "./relocate-compress.js";
+export type { RelocateOptions, RelocatePlan, RelocateMove } from "./relocate-compress.js";
 export {
   ABSORB_TOOL_NAME,
   ABSORB_TOOL,
@@ -292,6 +298,7 @@ export {
   renderVisibleRefs,
   renderRefsNode,
   createRenderRefsNode,
+  formatTagTime,
 } from "./render-refs.js";
 export type { RenderStrategy } from "./render-refs.js";
 export { resolveTransformChannel } from "./transform-channel.js";

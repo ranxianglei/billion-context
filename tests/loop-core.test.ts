@@ -264,22 +264,30 @@ test("loop #5: limit-hit graceful — 10 re-request rounds never degenerate empt
     }
 });
 
-// #156/#4186: a failed-only mutating round completes immediately. The failed
-// frames are ephemeral (#1548): never persisted, never seen by the client.
-// Re-requesting after them lets the frames reach upstream once and then vanish
-// from the next client request — an unsanctioned mid-history rewrite of the
-// provider's frozen prefix (the seam #4186 measured in 7/17 fuzz seeds).
-// Breaking on the FIRST failed-only round keeps them off the wire entirely;
-// the streamed ❌ receipt carries the reason into the client's next turn.
-test("loop #156/#4186: failed-only compress round → completes after round 1 with ZERO re-requests", async () => {
+// #5220 (history #156/#4186): a failed-only mutating round NO LONGER ends the
+// turn. The failure is fed back to the model as a plain assistant recovery
+// receipt — bytes identical to the ❌ marker already streamed to the client —
+// so the model decides what to do next instead of a fabricated "length"
+// finish silently killing a running task (no client on any wire auto-
+// continues "length"). The retry body must NOT carry this round's ephemeral
+// tool frames (#1548/#4186 seam): receipt only. Bounded by the restored #156
+// narrow breaker: re-submitting the IDENTICAL failing call (same signature)
+// is pure ping-pong and still breaks — that is exactly what this fixture
+// produces on round 2, so it runs ONE re-request then completes.
+test("loop #5220: failed-only compress round → recovery-receipt re-request, identical resubmit breaks", async () => {
     const failingRound = [
         sse("response.created", { response: { id: "resp_1", status: "in_progress" } }),
         fcEvents(0, "call_c", "compress", JSON.stringify({ content: [{ startId: "m00001", endId: "m00002", summary: "s" }] })),
         COMPLETED,
     ].join("");
     let fetchCalls = 0;
+    const bodies: string[] = [];
     const orig = globalThis.fetch;
-    globalThis.fetch = (async () => { fetchCalls++; return new Response(failingRound, { status: 200 }); }) as typeof fetch;
+    globalThis.fetch = (async (_url: string, init?: RequestInit) => {
+        fetchCalls++;
+        if (init?.body !== undefined) bodies.push(String(init.body));
+        return new Response(failingRound, { status: 200 });
+    }) as typeof fetch;
     try {
         const out = await drain(
             new Response(failingRound, { status: 200 }).body!,
@@ -287,9 +295,12 @@ test("loop #156/#4186: failed-only compress round → completes after round 1 wi
             { model: "gpt-4o", input: [], stream: true },
             { url: "http://mock", headers: {} },
         );
-        assert.equal(fetchCalls, 0, "the failed frame NEVER reached upstream — no re-request was sent at all");
+        assert.equal(fetchCalls, 1, "first-time failure re-requests ONCE (recovery receipt); the identical round-2 resubmit hits the #156 signature breaker");
         assert.ok(/response\.completed/.test(out), "graceful completion present (not degenerate empty)");
         assert.ok(out.includes("❌"), "failure receipt surfaced to the client so the reason survives the turn");
+        const body = bodies[0]!;
+        assert.ok(body.includes("❌"), "retry body carries the recovery receipt as assistant text");
+        assert.ok(!body.includes("function_call") && !body.includes("call_c"), "ephemeral failed frames stay off the wire (#1548/#4186) — receipt only");
     } finally {
         globalThis.fetch = orig;
     }

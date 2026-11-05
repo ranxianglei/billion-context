@@ -33,12 +33,16 @@ function restoreEnv(snap: EnvSnap): void {
 }
 
 /** Pin every path-relevant env var (unset ones deleted so homedir fallbacks can
- *  never reach the real machine's dirs) AND $HOME (so os.homedir() is
+ *  never reach the real machine's dirs) AND HOME/USERPROFILE (so os.homedir() is
  *  deterministic); all restored in finally. */
 function withEnv<T>(home: string | undefined, overrides: Record<string, string | undefined>, fn: () => T): T {
     const saved = saveEnv();
     const savedHome = process.env.HOME;
-    if (home !== undefined) process.env.HOME = home;
+    const savedProfile = process.env.USERPROFILE;
+    if (home !== undefined) {
+        process.env.HOME = home;
+        process.env.USERPROFILE = home;
+    }
     for (const k of ENV_KEYS) {
         if (overrides[k] !== undefined) process.env[k] = overrides[k];
         else delete process.env[k];
@@ -49,13 +53,13 @@ function withEnv<T>(home: string | undefined, overrides: Record<string, string |
         restoreEnv(saved);
         if (savedHome === undefined) delete process.env.HOME;
         else process.env.HOME = savedHome;
+        if (savedProfile === undefined) delete process.env.USERPROFILE;
+        else process.env.USERPROFILE = savedProfile;
     }
 }
 
 test("#4427 maskPathsForPublish rewrites this machine's $HOME to ~, anchored on both flanks", () => {
-    const savedHome = process.env.HOME;
-    process.env.HOME = "/home/alice";
-    try {
+    withEnv("/home/alice", {}, () => {
         assert.equal(maskPathsForPublish("/home/alice/.local/share/billion-context/x.db"), "~/.local/share/billion-context/x.db");
         assert.equal(maskPathsForPublish("open failed at /home/alice/db"), "open failed at ~/db");
         assert.equal(maskPathsForPublish('ENOENT: no such file or directory, open \'/home/alice/index.db\''), "ENOENT: no such file or directory, open '~/index.db'");
@@ -65,16 +69,11 @@ test("#4427 maskPathsForPublish rewrites this machine's $HOME to ~, anchored on 
         // (host masking is a separate net; the path masker must not corrupt URLs)
         assert.equal(maskPathsForPublish("https://relay.internal/home/alice/doc.pdf"), "https://relay.internal/home/alice/doc.pdf", "URL pathname not rewritten");
         assert.equal(maskPathsForPublish("~/.already-tilded"), "~/.already-tilded", "idempotent on already-tilded text");
-    } finally {
-        if (savedHome === undefined) delete process.env.HOME;
-        else process.env.HOME = savedHome;
-    }
+    });
 });
 
 test("#4427 redactForPublish composes secret scrub + host mask + home-path strip in one pass", () => {
-    const savedHome = process.env.HOME;
-    process.env.HOME = "/home/bob";
-    try {
+    withEnv("/home/bob", {}, () => {
         const out = redactForPublish("probe https://user:SecretPass@db.internal:3306/app?token=FAKE_TOKEN at /home/bob/.cache/x authorization: bearer sk-live-abcdef1234567890 failed");
         assert.ok(!out.includes("db.internal"), "private URL host masked");
         assert.ok(!out.includes("SecretPass"), "URL userinfo password dropped");
@@ -84,10 +83,7 @@ test("#4427 redactForPublish composes secret scrub + host mask + home-path strip
         assert.ok(out.includes("~/.cache/x"), "path stays actionable via ~");
         assert.ok(!out.includes("sk-live-abcdef1234567890"), "bearer token scrubbed");
         assert.ok(out.includes("<masked"), "redaction marker visible");
-    } finally {
-        if (savedHome === undefined) delete process.env.HOME;
-        else process.env.HOME = savedHome;
-    }
+    });
 });
 
 test("#4427 storage-legacy-only blob leaks no credentials, private hosts, or home paths (unconditional)", () => {

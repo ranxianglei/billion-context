@@ -14,3 +14,25 @@
 //
 // ??= keeps an explicit shell/CI env authoritative for ad-hoc experiments.
 process.env.BILI_STORAGE_UNIFIED ??= "legacy";
+
+// Default-dir sandbox. Suites that build stores/servers WITHOUT pinning a
+// directory resolve through the XDG defaults into the developer's REAL
+// ~/.local/{share,state,cache}/billion-context: envelopes, index.db rows,
+// state bookkeeping (rollout-id, prefix-affinity, proxy-origin) and caches
+// land beside production data (found while triaging #5082 — a local run of
+// tests/anthropic-cache-control.test.ts wrote `sess-1639-*` rows and
+// sessions/anthropic/127.0.0.1_* envelopes into the live sessions dir; the
+// legacy baseline above stops the SQLite rows but NOT those files). Point the
+// defaults at a per-run temp tree instead. ||= keeps a non-empty explicit
+// environment authoritative (empty counts as unset, matching the XDG handling
+// in scripts/test-suite-lock.mjs): CI containers and tests that pin their own
+// XDG_* win unchanged, and setting the three vars yourself deliberately
+// re-attaches a run to the real machine state.
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+
+const sandboxRoot = mkdtempSync(path.join(tmpdir(), "bili-test-dirs-"));
+process.env.XDG_DATA_HOME ||= path.join(sandboxRoot, "data");
+process.env.XDG_STATE_HOME ||= path.join(sandboxRoot, "state");
+process.env.XDG_CACHE_HOME ||= path.join(sandboxRoot, "cache");
