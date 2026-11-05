@@ -368,7 +368,7 @@ test("#4666 mysql: v8 upgrade collapses duplicates, crash-safe stamp gate, retir
         const H = await createMysqlHarness(t);
         let be: StorageBackend | undefined;
         try {
-            // Fresh install lands at v10.
+            // Fresh install lands at v11.
             be = await openBackend("mysql", H.dsn);
             await be.init?.();
             assert.equal(await H.stamp(), String(STORAGE_SCHEMA_VERSION), "fresh install stamped the current version");
@@ -537,9 +537,9 @@ test("#4666 mysql: concurrent boots serialize on the migration lock",
             assert.equal(Number(released[0].ok), 1, "lock released exactly once");
             locker.release();
             await migrating;
-            // #4796 raised STORAGE_SCHEMA_VERSION to 9; every other stamp pin in
-            // this file moved with it — this one was left on v8, so the mysql
-            // lane asserted a version the migrator no longer writes.
+            // #4796 raised STORAGE_SCHEMA_VERSION to 9 and #5539 raised it to 11;
+            // every other stamp pin in this file has been re-swept twice for
+            // exactly this reason. Derive it instead of hardcoding a literal.
             assert.equal(await H.stamp(), String(STORAGE_SCHEMA_VERSION), "migration completed after the lock freed");
             const s1 = await H.q("SELECT seq FROM messages WHERE session_id = 's1' ORDER BY seq");
             assert.deepEqual(s1.map((r) => Number(r.seq)), [1, 2, 3, 5], "fixture collapsed exactly once — no double-delete");
