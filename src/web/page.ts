@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { rootCaPath } from "../ca.js";
+import { combinedCaPath } from "../ca.js";
 import { WEB_CLIENT } from "./client.js";
 import { WEB_STYLES } from "./styles.js";
 import { translate } from "./i18n.js";
@@ -15,7 +15,7 @@ function escapeHtml(value: string): string {
 // light|dark → <html data-theme=…>); see the #2559 note in styles.ts.
 export function renderPage(origin: string, version: string, embed = false, theme?: "light" | "dark"): string {
     const o = escapeHtml(origin);
-    const caPath = rootCaPath();
+    const caPath = combinedCaPath();
     const caPathEsc = escapeHtml(caPath);
     const caReady = existsSync(caPath);
     // #3536/#4830: declare the bundled icon explicitly so browsers (dsh
