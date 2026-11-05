@@ -193,7 +193,11 @@ test("issue #2817 regression: identified persona, PLUGIN-MODE fold on openai lan
         assert.ok(blocksAfterFold.length >= 1, "plugin-mode fold landed on the openai lane");
         const foldedBody = bodies.openai[bodies.openai.length - 1]!;
         assert.ok(!foldedBody.includes(EARLY_FILLER_TAG), "covered head content folded away on the openai lane");
-        assert.equal(main.stats.requests, 9);
+        // #5656 residual: turn 1 is a tool-less single-shot shape and rides the
+        // verbatim side lane (kernel no-touch), so stats.requests counts from
+        // turn 2 — eight counted turns after nine wire turns. The fork teeth
+        // below are unchanged: a fork would still show as a missing increment.
+        assert.equal(main.stats.requests, 8);
 
         // Turns 10-12: openai lane stays folded.
         for (let t = 10; t <= 12; t++) {
@@ -202,7 +206,7 @@ test("issue #2817 regression: identified persona, PLUGIN-MODE fold on openai lan
             await resp.text();
             hist.push({ role: "assistant", text: `Reply about chapter ${t}: acknowledged. ` + FILLER(t, 0.2) });
         }
-        assert.equal(getSession(CONV).stats.requests, 12, "12 openai turns all rode the raw key");
+        assert.equal(getSession(CONV).stats.requests, 11, "12 openai turns rode the raw key (turn 1 rides the #5656 side lane, uncounted)");
         assert.deepEqual(getSession(CONV).state.blocks.map((b) => b.blockId), blocksAfterFold, "fold blocks stable on the openai lane");
 
         // Phase B — THE INCIDENT: cross-wire model switch. The whole conversation
@@ -226,7 +230,7 @@ test("issue #2817 regression: identified persona, PLUGIN-MODE fold on openai lan
 
         // 1) THE incident assertion: the switch turn rides the RAW persona key.
         //    Pre-fix it forked — stats.requests stays at 12 and a `|sub:` husk serves.
-        assert.equal(getSession(CONV).stats.requests, 13, `switch turn must keep riding the RAW persona key (fork would leave it at 12: incident #2817)`);
+        assert.equal(getSession(CONV).stats.requests, 12, `switch turn must keep riding the RAW persona key (fork would leave it at 11: incident #2817)`);
         // 2) Fold attachment on the switched wire: covered early content ABSENT.
         assert.equal((switchBody.match(new RegExp(EARLY_FILLER_TAG, "g")) ?? []).length, 0, "covered early content must NOT replay raw on the switch turn (incident blast)");
         // 3) The upstream blast metric: the covered volume must actually stay
@@ -254,7 +258,7 @@ test("issue #2817 regression: identified persona, PLUGIN-MODE fold on openai lan
         const r14Text = await r14.text();
         if (r14.status !== 200) assert.fail(`anthropic turn 14: ${r14.status}: ${r14Text.slice(0, 200)}`);
         const followUp = bodies.anthropic[bodies.anthropic.length - 1]!;
-        assert.equal(getSession(CONV).stats.requests, 14, "follow-up turn still rides the raw key");
+        assert.equal(getSession(CONV).stats.requests, 13, "follow-up turn still rides the raw key");
         assert.equal((followUp.match(new RegExp(EARLY_FILLER_TAG, "g")) ?? []).length, 0, "covered content stays folded on the follow-up turn");
     } finally {
         proxy.close();
