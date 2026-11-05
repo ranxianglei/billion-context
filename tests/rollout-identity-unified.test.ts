@@ -70,3 +70,21 @@ test("brand-new install bootstraps via wx file race, then mirrors to kv", async 
     await hydrateRolloutIdentity();
     assert.equal(rolloutInstallId(), fresh, "stable across restarts via kv");
 });
+
+// #5757: tests/snapshot-render-chain.test.ts installs a PARTIAL store stub
+// (tail-view methods only, no unified KV) and drives the hot path through
+// featureEnabled → rolloutInstallId. Before the kvStore() gate, any
+// unified-mode caller crashed with "setKvAsync is not a function" — exactly
+// what killed both windows CI shards.
+test("partial store stubs degrade to the file path instead of crashing", async () => {
+    const { _setStoreForTest, _resetStoreForTest } = await import("../src/persist.js");
+    const partialStub = { unifiedTailSeqs: () => [], closeQuietly: () => {} };
+    _setStoreForTest(partialStub as unknown as ReturnType<typeof getStore>);
+    let got = "";
+    try {
+        got = rolloutInstallId(); // must NOT throw against a KV-less store
+    } finally {
+        _resetStoreForTest(); // restore the env-pinned singleton for later runs
+    }
+    assert.match(got, /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i, "id still served from the legacy carrier");
+});

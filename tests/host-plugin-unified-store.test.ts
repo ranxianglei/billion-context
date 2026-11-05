@@ -72,3 +72,28 @@ test("unknown ids stay rejected on every carrier", () => {
     _resetHostPluginDismissalsForTest();
     assert.ok(!dismissedHostPlugins().has("foreign-id"));
 });
+
+// #5757 review fix: a dismissal landing BEFORE the boot hydration used to
+// lazily create the cache, which made the hydrate bail — blocking the
+// one-time file→kv migration (and hiding sibling rows) for the process
+// lifetime. The hydrate must run and union instead.
+test("a pre-hydration dismissal no longer blocks the migration", async () => {
+    try { fs.rmSync(legacyFile); } catch { /* fresh volume */ }
+    await getStore().deleteKvAsync("host-plugins", "dsh-context");
+    _resetHostPluginDismissalsForTest();
+
+    // the admin action lands before cli-start hydration has run:
+    assert.equal(dismissHostPlugin("dsh-context"), true);
+    // meanwhile the file carries known + file-only content: hydrate must fold
+    // it in (and the kv row from the dismiss above must survive the union)
+    fs.mkdirSync(stateBili, { recursive: true });
+    fs.writeFileSync(legacyFile, JSON.stringify({ dismissed: ["dsh-context", "junk-pre-hydration"] }, null, 2));
+    await new Promise((r) => setTimeout(r, 50)); // let the queued receipt land in kv
+    await hydrateHostPluginDismissals();
+
+    const seen = dismissedHostPlugins();
+    assert.ok(seen.has("dsh-context"), "the dismissed id is still visible");
+    assert.ok(seen.has("junk-pre-hydration"), "hydration ran despite the pre-existing lazy cache");
+    const rows = await getStore().listKvAsync("host-plugins");
+    assert.ok(rows.some((r) => r.key === "dsh-context"), "receipt landed in kv_store");
+});

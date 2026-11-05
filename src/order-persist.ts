@@ -6,7 +6,7 @@ import path from "node:path";
 import { applyOrderSnapshot, orderSnapshot, type OrderSkeletonEntry } from "./session-resolve.js";
 import { stateDir } from "./paths.js";
 import { log } from "./logger.js";
-import { getStore, unifiedKvActive } from "./persist.js";
+import { kvStore } from "./persist.js";
 
 /**
  * #3397: session-order skeleton persistence. The resolver's recorded
@@ -161,28 +161,46 @@ function writeSnapshotLegacy(): void {
  *  union), merge ours in fresher-wins, re-apply bounds, write back. Writes are
  *  chained so back-to-back schedules never lose updates against each other. */
 function persistUnifiedNow(): void {
+    const store = kvStore();
+    if (!store) return;
     kvChain = kvChain.then(async () => {
         let live: OrderSkeletonEntry[] | null = null;
         try {
-            live = parseStoreDoc(await getStore().getKvAsync(ORDER_NS, ORDER_KEY));
+            live = parseStoreDoc(await store.getKvAsync(ORDER_NS, ORDER_KEY));
         } catch {
             live = null;
         }
         const mine = orderSnapshot();
         const merged = live === null ? mine : mergeWithDisk(mine, live);
         const entries = normalizeForWrite(merged);
-        await getStore().setKvAsync(ORDER_NS, ORDER_KEY, { version: 1, entries });
-    }).catch((err) => kvWarnOnce("persist", err));
+        await store.setKvAsync(ORDER_NS, ORDER_KEY, { version: 1, entries });
+    }).catch((err) => {
+        kvWarnOnce("persist", err);
+        // #5757 review fix: a failed RMW demotes this process back onto the
+        // LEGACY FILE path (every subsequent timer/flush writes there) —
+        // matching what the warning promises; a healthy store stays primary.
+        kvReady = false;
+    });
 }
 
 /** Once per process (wired at cli start): layer the kv snapshot over what the
  *  sync boot hydrate loaded, and migrate any legacy-file rows the store lacks.
  *  Never throws. */
 export async function hydrateOrderUnified(): Promise<void> {
-    if (kvReady || !unifiedKvActive()) return;
+    const store = kvStore();
+    if (kvReady || !store) return;
     try {
-        const kvEntries = parseStoreDoc(await getStore().getKvAsync(ORDER_NS, ORDER_KEY)) ?? [];
-        const hadRow = kvEntries.length > 0;
+        let raw: unknown;
+        try {
+            raw = await store.getKvAsync(ORDER_NS, ORDER_KEY);
+        } catch {
+            raw = undefined;
+        }
+        const kvEntries = parseStoreDoc(raw) ?? [];
+        // Presence-based predicate (mirrors the affinity twin): an empty but
+        // PRESENT row still counts as migrated, so sibling lanes' empties are
+        // not re-uploaded over every boot (#5757).
+        const hadRow = raw !== undefined && raw !== null;
         const fileEntries = readDiskEntries() ?? [];
         const merged = fileEntries.length === 0
             ? kvEntries
@@ -194,7 +212,7 @@ export async function hydrateOrderUnified(): Promise<void> {
         // One-time migration: file rows missing from the store travel up once.
         const kvIds = new Set(kvEntries.map((e) => e.id));
         if (!hadRow || fileEntries.some((e) => !kvIds.has(e.id))) {
-            await getStore().setKvAsync(ORDER_NS, ORDER_KEY, { version: 1, entries: normalizeForWrite(merged) });
+            await store.setKvAsync(ORDER_NS, ORDER_KEY, { version: 1, entries: normalizeForWrite(merged) });
             if (!hadRow && merged.length > 0) log("info", `[session-order] migrated ${merged.length} skeleton(s) from the legacy JSON file into unified storage`);
         }
         kvReady = true;
@@ -225,7 +243,7 @@ export function scheduleOrderPersist(): void {
     timer = setTimeout(
         () => {
             timer = null;
-            if (unifiedKvActive() && kvReady) {
+            if (kvReady && kvStore() !== null) {
                 persistUnifiedNow();
             } else {
                 // Pre-hydration window or legacy-only instance: the file keeps
@@ -247,7 +265,7 @@ export async function flushOrderSkeletons(): Promise<void> {
         clearTimeout(timer);
         timer = null;
     }
-    if (unifiedKvActive() && kvReady) {
+    if (kvReady && kvStore() !== null) {
         // Must land even when no mutation waited out its debounce before exit:
         // persistUnifiedNow() is read-modify-write, so running it with nothing
         // changed merely rewrites the identical row (idempotent).

@@ -32,7 +32,7 @@ import path from "node:path";
 import { stateDir } from "./paths.js";
 import { loadConfigFile, type RolloutFeatureOverride, type RolloutFileConfig } from "./config.js";
 import { log as loggerLog } from "./logger.js";
-import { getStore, unifiedKvActive } from "./persist.js";
+import { kvStore } from "./persist.js";
 
 /** One feature's baked-in rollout plan (version-owned, set at release time). */
 export interface RolloutPlan {
@@ -258,9 +258,10 @@ function kvIdWarnOnce(tag: string, err: unknown): void {
  *  present, otherwise import the legacy file into kv one time. Never throws.
  */
 export async function hydrateRolloutIdentity(): Promise<void> {
-    if (kvIdHydrated || !unifiedKvActive()) return;
+    const store = kvStore();
+    if (kvIdHydrated || !store) return;
     try {
-        const doc = await getStore().getKvAsync(ID_NS, ID_KEY);
+        const doc = await store.getKvAsync(ID_NS, ID_KEY);
         const v = doc && typeof doc === "object" ? ((doc as { id?: unknown })["id"] as unknown) : undefined;
         if (typeof v === "string" && /^[0-9a-f-]{8,}$/i.test(v)) {
             kvInstallId = v;
@@ -271,7 +272,7 @@ export async function hydrateRolloutIdentity(): Promise<void> {
         const file = rolloutIdFile();
         const fileCached = idCache.get(file) ?? readIdFile(file);
         if (fileCached !== undefined) {
-            await getStore().setKvAsync(ID_NS, ID_KEY, { id: fileCached });
+            await store.setKvAsync(ID_NS, ID_KEY, { id: fileCached });
             kvInstallId = fileCached;
             idCache.set(file, fileCached);
             loggerLog("info", `[rollout] imported the install id from the legacy JSON file into unified storage (kv_store namespace "${ID_NS}")`);
@@ -345,8 +346,11 @@ export function rolloutInstallId(): string {
     const settled = readIdFile(file) ?? generated;
     // #5753: once the identity is settled, it lives in the unified store; the
     // file remains only as the cross-process bootstrap artifact written above.
-    if (unifiedKvActive() && kvInstallId === null) {
-        void getStore()
+    // (kvStore(): suites may install partial stubs — never call methods that
+    // are absent on them.)
+    const kvs = kvStore();
+    if (kvs && kvInstallId === null) {
+        void kvs
             .setKvAsync(ID_NS, ID_KEY, { id: settled })
             .then(() => { if (kvInstallId === null) kvInstallId = settled; })
             .catch((err) => kvIdWarnOnce("persist", err));

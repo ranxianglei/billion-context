@@ -27,7 +27,7 @@ import path from "node:path";
 import { dshProfileDirs, parseDshPatchEntries } from "./dsh-channel.js";
 import { stateDir } from "./paths.js";
 import { log as loggerLog } from "./logger.js";
-import { getStore, unifiedKvActive } from "./persist.js";
+import { kvStore } from "./persist.js";
 
 interface HostPluginNotice {
     /** Stable notice key — also the dismissal key. */
@@ -158,6 +158,7 @@ const DISMISS_FILE = "host-plugin-notices.json";
 
 let dismissCache: Set<string> | null = null;
 let dismissHydrating = false;
+let dismissHydrated = false;
 let dismissWarned = false;
 
 function dismissWarnOnce(tag: string, err: unknown): void {
@@ -194,26 +195,33 @@ export function dismissedHostPlugins(env: NodeJS.ProcessEnv = process.env): Read
 
 /** Once per process (wired at cli start beside hydrateNoticeReceipts): load
  *  kv rows + import the legacy file one time. Legacy-only instances keep the
- *  pure-file path forever. Never throws. */
+ *  pure-file path forever. Never throws.
+ *  #5757 review fix: UNION into whatever cache exists instead of bailing when
+ *  a pre-hydration dismissHostPlugin already lazily created one — that early
+ *  receipt used to block both the one-time file→kv migration and every
+ *  sibling lane's rows for the whole process lifetime. */
 export async function hydrateHostPluginDismissals(): Promise<void> {
-    if (dismissCache !== null || dismissHydrating || !unifiedKvActive()) return;
+    const store = kvStore();
+    if (dismissHydrated || dismissHydrating || !store) return;
     dismissHydrating = true;
-    const merged = new Set<string>();
-    const known = new Set(KNOWN_HOST_PLUGINS.map((p) => p.id));
     try {
-        const rows = await getStore().listKvAsync(DISMISS_NS);
+        const rows = await store.listKvAsync(DISMISS_NS);
+        // Start from the CURRENT lazy view (a dismissal can land mid-hydration)
+        // so the final assignment clobbers nothing.
+        const merged = new Set(dismissCache ?? []);
         const rowKeys = new Set(rows.map((r) => r.key));
         for (const r of rows) merged.add(r.key);
         const fileKeys = fileDismissed(process.env);
         for (const k of fileKeys) merged.add(k);
         // One-time migration: known ids from the legacy file into kv (raw junk
         // strings stay file-only — the view above still honors them).
+        const known = new Set(KNOWN_HOST_PLUGINS.map((p) => p.id));
         const toImport = [...fileKeys].filter((k) => known.has(k) && !rowKeys.has(k));
         if (toImport.length > 0) {
             const now = Date.now();
             for (const k of toImport) {
                 try {
-                    await getStore().setKvAsync(DISMISS_NS, k, { at: now });
+                    await store.setKvAsync(DISMISS_NS, k, { at: now });
                 } catch (err) {
                     dismissWarnOnce("migrate", err);
                     break;
@@ -221,39 +229,44 @@ export async function hydrateHostPluginDismissals(): Promise<void> {
             }
             loggerLog("info", `[host-plugin] imported ${toImport.length} host-plugin dismissal(s) from the legacy JSON file into unified storage (kv_store namespace "${DISMISS_NS}")`);
         }
+        dismissCache = merged;
+        dismissHydrated = true;
     } catch (err) {
         dismissWarnOnce("hydrate", err);
     }
-    dismissCache = merged;
     dismissHydrating = false;
 }
 
 /** Idempotent. Returns false only for ids outside KNOWN_HOST_PLUGINS. */
 export function dismissHostPlugin(id: string, env: NodeJS.ProcessEnv = process.env): boolean {
     if (!KNOWN_HOST_PLUGINS.some((p) => p.id === id)) return false;
-    if (dismissCache === null) {
-        if (!unifiedKvActive()) {
-            // Legacy-only instance: the pure-file discipline, unchanged.
-            const set = new Set(fileDismissed(env));
-            set.add(id);
-            try {
-                const dir = stateDirFor(env);
-                fs.mkdirSync(dir, { recursive: true });
-                fs.writeFileSync(path.join(dir, DISMISS_FILE), JSON.stringify({ dismissed: [...set].sort() }, null, 2) + "\n");
-            } catch {
-                // best effort: the in-memory answer below still reflects intent
-            }
-            return true;
+    const kvs = kvStore();
+    if (kvs === null && dismissCache === null) {
+        // Legacy-only instance (or a partial store stub without KV methods):
+        // the pure-file discipline, unchanged.
+        const set = new Set(fileDismissed(env));
+        set.add(id);
+        try {
+            const dir = stateDirFor(env);
+            fs.mkdirSync(dir, { recursive: true });
+            fs.writeFileSync(path.join(dir, DISMISS_FILE), JSON.stringify({ dismissed: [...set].sort() }, null, 2) + "\n");
+        } catch {
+            // best effort: the in-memory answer below still reflects intent
         }
+        return true;
+    }
+    if (dismissCache === null) {
         // Unified, hydration not done yet: adopt the file view so this
         // process's receipt does not regress what earlier processes recorded;
         // the boot hydration imports the remaining file keys separately.
         dismissCache = new Set(fileDismissed(env));
     }
     dismissCache.add(id);
-    void getStore()
-        .setKvAsync(DISMISS_NS, id, { at: Date.now() })
-        .catch((err) => dismissWarnOnce("persist", err));
+    // Partial stubs have no KV methods — the in-memory receipt above is the
+    // honest best effort for that degenerate case (#5757).
+    if (kvs) {
+        void kvs.setKvAsync(DISMISS_NS, id, { at: Date.now() }).catch((err) => dismissWarnOnce("persist", err));
+    }
     return true;
 }
 
@@ -261,6 +274,7 @@ export function dismissHostPlugin(id: string, env: NodeJS.ProcessEnv = process.e
 export function _resetHostPluginDismissalsForTest(): void {
     dismissCache = null;
     dismissHydrating = false;
+    dismissHydrated = false;
     dismissWarned = false;
 }
 

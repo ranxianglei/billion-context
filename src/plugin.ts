@@ -6,7 +6,7 @@ import type { ServerResponse } from "node:http";
 import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
-import { CORRUPT_SIBLING_CAP, getStore, pruneCorruptSiblings, storageStatusLabel, unifiedKvActive } from "./persist.js";
+import { CORRUPT_SIBLING_CAP, getStore, pruneCorruptSiblings, storageStatusLabel, kvStore } from "./persist.js";
 import { cloneStoreForRefs } from "./store.js";
 import { acquireInFlight, createSession, getSessionAsync, publishForkSession, diagnoseSuccessWithoutUsage, effectiveConfig, findSessionByCanonicalId, listSessions, markCompactionBoundary, markDirty, noteAbortedTurn, noteTruncatedUpstream, peekSession, releaseInFlight, statusInputBaseline, withSessionLock, type Session } from "./session.js";
 import { clientConversationHeader } from "./session-id.js";
@@ -357,13 +357,16 @@ function writeConversationsFile(): void {
         for (const [k, v] of conversations) obj[k] = v;
         // #5753: unified instances persist to kv_store — SQLite's atomic commit
         // replaces the pid-tmp + fsync + rename dance below.
-        if (unifiedKvActive() && convKvReady) {
+        const store = kvStore();
+        if (convKvReady && store !== null) {
             convChain = convChain.then(
-                () => getStore().setKvAsync(CONV_NS, CONV_KEY, obj),
+                () => store.setKvAsync(CONV_NS, CONV_KEY, obj),
             ).catch((err) => {
                 convWarnOnce("persist", err);
-                // the store side failed: hand the snapshot back to the file so
-                // nothing is lost mid-degradation.
+                // #5757 review fix: a failed write DEMOTES this process back
+                // onto the legacy file path (the rescheduled save below takes
+                // it), instead of retrying a dead store on every 300ms save.
+                convKvReady = false;
                 conversationsDirty = true;
                 scheduleSaveConversations();
             });
@@ -406,7 +409,7 @@ export async function flushConversations(): Promise<void> {
         clearTimeout(conversationsSaveTimer);
         conversationsSaveTimer = undefined;
     }
-    if (unifiedKvActive() && convKvReady) {
+    if (convKvReady && kvStore() !== null) {
         if (conversationsDirty) writeConversationsFile(); // enqueue the queued table
         await convChain;
     } else {
@@ -451,11 +454,12 @@ export function loadConversations(): void {
  *  wins per id; oldest-first re-insertion restores the LRU clock), then
  *  migrate file-only rows into the store exactly once. Never throws. */
 export async function hydratePluginConversationsUnified(): Promise<void> {
-    if (convKvReady || !unifiedKvActive()) return;
+    const store = kvStore();
+    if (convKvReady || !store) return;
     try {
         let raw: unknown;
         try {
-            raw = await getStore().getKvAsync(CONV_NS, CONV_KEY);
+            raw = await store.getKvAsync(CONV_NS, CONV_KEY);
         } catch {
             raw = undefined;
         }
@@ -482,7 +486,7 @@ export async function hydratePluginConversationsUnified(): Promise<void> {
         if (!hadRow || missing.length > 0) {
             const payload: Record<string, ConversationEntry> = {};
             for (const [k, v] of conversations) payload[k] = v;
-            await getStore().setKvAsync(CONV_NS, CONV_KEY, payload);
+            await store.setKvAsync(CONV_NS, CONV_KEY, payload);
             if (missing.length > 0) loggerLog("info", `[plugin] migrated ${missing.length} conversation route(s) from the legacy JSON file into unified storage (#5753)`);
         }
         convKvReady = true;

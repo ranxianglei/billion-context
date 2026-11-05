@@ -4399,3 +4399,24 @@ export function unifiedKvActive(): boolean {
         return false;
     }
 }
+
+/** #5753/#5757: same probe as unifiedKvActive(), but returns the store ONLY
+ *  when it actually exposes the KV methods the migration surfaces use.
+ *  Suites (and future adapters) may install a PARTIAL stub via
+ *  _setStoreForTest — e.g. snapshot-render-chain fakes only the unifiedTail*
+ *  view methods — and those must fall back to the legacy file paths silently
+ *  instead of crashing a hot path on a missing method. */
+export function kvStore(): SessionStore | null {
+    try {
+        const s = _store;
+        if (!s || s.liveStorageStamp === "legacy") return null;
+        if (
+            typeof s.getKvAsync !== "function"
+            || typeof s.setKvAsync !== "function"
+            || typeof s.listKvAsync !== "function"
+        ) return null;
+        return s;
+    } catch {
+        return null;
+    }
+}

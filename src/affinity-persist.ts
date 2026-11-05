@@ -3,7 +3,7 @@ import path from "node:path";
 import { prefixAffinity, type AffinitySnapshotEntry, MAX_TRACKED_SESSIONS } from "./prefix-affinity.js";
 import { stateDir } from "./paths.js";
 import { log } from "./logger.js";
-import { getStore, unifiedKvActive } from "./persist.js";
+import { kvStore } from "./persist.js";
 
 /**
  * #499 P1a: prefix-affinity persistence. The anonymous affinity chains were
@@ -162,28 +162,36 @@ function writeSnapshotLegacy(): void {
  *  union), merge ours in per the #1724 rule, re-apply the cap, write back.
  *  Writes are chained so back-to-back schedules never lose updates. */
 function persistUnifiedNow(): void {
+    const store = kvStore();
+    if (!store) return;
     kvChain = kvChain.then(async () => {
         let live: AffinitySnapshotEntry[] | null = null;
         try {
-            live = parseStoreDoc(await getStore().getKvAsync(AFF_NS, AFF_KEY));
+            live = parseStoreDoc(await store.getKvAsync(AFF_NS, AFF_KEY));
         } catch {
             live = null;
         }
         const mine = prefixAffinity.exportSnapshot();
         const merged = live === null ? { entries: mine, forks: 0 } : mergeWithDisk(mine, live);
         const entries = normalizeForWrite(merged.entries);
-        await getStore().setKvAsync(AFF_NS, AFF_KEY, { version: 1, entries });
+        await store.setKvAsync(AFF_NS, AFF_KEY, { version: 1, entries });
         if (merged.forks > 0) {
             log("info", `[prefix-affinity] unified write resolved ${merged.forks} same-depth fork(s) across instances (#1724)`);
         }
-    }).catch((err) => kvWarnOnce("persist", err));
+    }).catch((err) => {
+        kvWarnOnce("persist", err);
+        // #5757 review fix: failed RMW demotes back onto the LEGACY FILE path
+        // (subsequent timer/flush writes there), matching the warning.
+        kvReady = false;
+    });
 }
 
 /** Presence check independent of content (an empty-but-present row still
  *  counts as migrated, so we don't re-upload over sibling lanes' empties). */
-async function kvRowPresent(): Promise<boolean> {
+async function kvRowPresent(store: ReturnType<typeof kvStore>): Promise<boolean> {
     try {
-        return (await getStore().getKvAsync(AFF_NS, AFF_KEY)) !== undefined;
+        if (!store) return false;
+        return (await store.getKvAsync(AFF_NS, AFF_KEY)) !== undefined;
     } catch {
         return false;
     }
@@ -193,16 +201,17 @@ async function kvRowPresent(): Promise<boolean> {
  *  sync boot hydrate loaded, then migrate legacy-file rows the store lacks.
  *  Never throws. */
 export async function hydrateAffinityUnified(): Promise<void> {
-    if (kvReady || !unifiedKvActive()) return;
+    const store = kvStore();
+    if (kvReady || !store) return;
     try {
         let kvEntries: AffinitySnapshotEntry[] | null = null;
         try {
-            kvEntries = parseStoreDoc(await getStore().getKvAsync(AFF_NS, AFF_KEY));
+            kvEntries = parseStoreDoc(await store.getKvAsync(AFF_NS, AFF_KEY));
         } catch {
             kvEntries = null;
         }
         kvEntries ??= [];
-        const hadRow = await kvRowPresent();
+        const hadRow = await kvRowPresent(store);
         const fileEntries = readDiskEntries() ?? [];
         let merged: { entries: AffinitySnapshotEntry[]; forks: number };
         if (fileEntries.length === 0) merged = { entries: kvEntries, forks: 0 };
@@ -215,7 +224,7 @@ export async function hydrateAffinityUnified(): Promise<void> {
         // One-time migration: file rows missing from the store travel up once.
         const kvIds = new Set(kvEntries.map((e) => e.sessionId));
         if (!hadRow || fileEntries.some((e) => !kvIds.has(e.sessionId))) {
-            await getStore().setKvAsync(AFF_NS, AFF_KEY, { version: 1, entries: normalizeForWrite(merged.entries) });
+            await store.setKvAsync(AFF_NS, AFF_KEY, { version: 1, entries: normalizeForWrite(merged.entries) });
             if (!hadRow && merged.entries.length > 0) log("info", `[prefix-affinity] migrated ${merged.entries.length} chain(s) from the legacy JSON file into unified storage`);
         }
         kvReady = true;
@@ -246,7 +255,7 @@ export function scheduleAffinityPersist(): void {
     timer = setTimeout(
         () => {
             timer = null;
-            if (unifiedKvActive() && kvReady) {
+            if (kvReady && kvStore() !== null) {
                 persistUnifiedNow();
             } else {
                 // Pre-hydration window or legacy-only instance: the file keeps
@@ -267,7 +276,7 @@ export async function flushPrefixAffinity(): Promise<void> {
         clearTimeout(timer);
         timer = null;
     }
-    if (unifiedKvActive() && kvReady) {
+    if (kvReady && kvStore() !== null) {
         // Must land even when no mutation waited out its debounce before exit:
         // persistUnifiedNow() is read-modify-write, so running it with nothing
         // changed merely rewrites the identical row (idempotent).

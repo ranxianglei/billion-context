@@ -55,7 +55,7 @@ import path from "node:path";
 import type http from "node:http";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { cacheDir } from "./paths.js";
-import { closeLogger, type Logger } from "./logger.js";
+import { closeLogger, log, type Logger } from "./logger.js";
 import { flushAllSessions, totalInFlight } from "./session.js";
 import { flushConversations } from "./plugin.js";
 import { flushPrefixAffinity } from "./affinity-persist.js";
@@ -449,26 +449,57 @@ function resumeListening(server: http.Server, host: string, port: number, log: L
     }
 }
 
+/** #5757 review fix: unified-store flushes await sqlite; a wedged volume must
+ *  not hold a graceful exit (or a restart hand-over) hostage forever. The
+ *  pre-migration world flushed to files synchronously and always returned.
+ *  The in-memory view plus whatever landed already is the documented
+ *  fallback on timeout (next boot re-hydrates). */
+const EXIT_FLUSH_DEADLINE_MS = 5000;
+export function withExitDeadline(label: string, op: Promise<unknown>): Promise<void> {
+    return new Promise<void>((resolve) => {
+        let settled = false;
+        const t = setTimeout(() => {
+            if (settled) return;
+            settled = true;
+            log("warn", `[restart] ${label} still pending after ${EXIT_FLUSH_DEADLINE_MS}ms — proceeding`);
+            resolve();
+        }, EXIT_FLUSH_DEADLINE_MS);
+        t.unref?.();
+        void Promise.resolve(op)
+            .catch((err) => log("warn", `[restart] ${label} failed: ${err instanceof Error ? err.message : String(err)}`))
+            .then(() => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(t);
+                resolve();
+            });
+    });
+}
+
 /** #1724: durable-state set captured before the replacement boots — mirrors
  *  what the normal shutdown path persists (conversations + sessions +
  *  prefix-affinity + session-order skeletons #3397). */
 async function defaultPreSpawnFlush(): Promise<void> {
     // #5753: conversations/affinity/order now ride sqlite — settle their
     // queued writes (not just enqueue them) before the replacement boots.
-    await flushConversations();
-    await flushAllSessions();
-    await flushPrefixAffinity();
-    await flushOrderSkeletons();
-    await flushResignPending();
+    await withExitDeadline("pre-spawn storage flushes", (async () => {
+        await flushConversations();
+        await flushAllSessions();
+        await flushPrefixAffinity();
+        await flushOrderSkeletons();
+        await flushResignPending();
+    })());
 }
 
 function defaultFinish(): void {
     void (async () => {
-        await flushConversations();
-        await flushPrefixAffinity();
-        await flushOrderSkeletons();
-        await flushResignPending();
-        await flushAllSessions();
+        await withExitDeadline("final storage flushes", (async () => {
+            await flushConversations();
+            await flushPrefixAffinity();
+            await flushOrderSkeletons();
+            await flushResignPending();
+            await flushAllSessions();
+        })());
         closeLogger();
         process.exit(0);
     })();
