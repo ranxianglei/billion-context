@@ -16,7 +16,7 @@ import {
     UNRECOGNIZED_PATH_TTL_MS,
 } from "../src/server/observability.ts";
 
-// #5764: the UNRECOGNIZED PATHS counter fired on `protocol === null`, which
+// #5763: the UNRECOGNIZED PATHS counter fired on `protocol === null`, which
 // conflated three unrelated states into one diagnostic:
 //   (1) non-POST probes/scans/enumeration (HEAD /responses, GET /models, a GET
 //       path-brute-force) — no body to compress, never going to be compressed,
@@ -71,7 +71,7 @@ async function driveRaw(proxyPort: number, upstreamPort: number, method: string,
     }).then((r) => r.text()).catch(() => { /* server-side state is what's asserted */ });
 }
 
-test("#5764: non-POST to a KNOWN endpoint and non-POST scans are not counted; a model-call to an unknown path is", async () => {
+test("#5763: non-POST to a KNOWN endpoint and non-POST scans are not counted; a model-call to an unknown path is", async () => {
     _resetUnrecognizedPathStatsForTest();
     const upstream = makeUpstream();
     upstream.listen(0, "127.0.0.1");
@@ -101,9 +101,9 @@ test("#5764: non-POST to a KNOWN endpoint and non-POST scans are not counted; a 
     }
 });
 
-test("#5764: stats expose ISO firstSeen/lastSeen additively over paths/total", () => {
+test("#5763: stats expose ISO firstSeen/lastSeen additively over paths/total", () => {
     _resetUnrecognizedPathStatsForTest();
-    const url = "https://unit-5764.example/some/unknown/path";
+    const url = "https://unit-5763.example/some/unknown/path";
     logUnrecognizedPath(() => {}, url);
     const s = getUnrecognizedPathStats();
     const key = Object.keys(s.paths)[0];
@@ -114,11 +114,11 @@ test("#5764: stats expose ISO firstSeen/lastSeen additively over paths/total", (
     assert.ok(s.firstSeen?.[key] && !Number.isNaN(Date.parse(s.firstSeen[key])), "firstSeen is a parseable ISO timestamp");
 });
 
-test("#5764: entries older than the TTL drop out of stats (no permanent residency)", (t) => {
+test("#5763: entries older than the TTL drop out of stats (no permanent residency)", (t) => {
     _resetUnrecognizedPathStatsForTest();
     let now = Date.now();
     t.mock.method(Date, "now", () => now);
-    const url = "https://ttl-5764.example/stale/path";
+    const url = "https://ttl-5763.example/stale/path";
     logUnrecognizedPath(() => {}, url);
     assert.equal(getUnrecognizedPathStats().total, 1, "present right after the hit");
     now += UNRECOGNIZED_PATH_TTL_MS + 60_000;
@@ -127,11 +127,11 @@ test("#5764: entries older than the TTL drop out of stats (no permanent residenc
     assert.deepEqual(stale.paths, {}, "no paths linger past the window");
 });
 
-test("#5764: a repeat hit within the window bumps count + lastSeen, keeps firstSeen", (t) => {
+test("#5763: a repeat hit within the window bumps count + lastSeen, keeps firstSeen", (t) => {
     _resetUnrecognizedPathStatsForTest();
     let now = Date.now();
     t.mock.method(Date, "now", () => now);
-    const url = "https://repeat-5764.example/path";
+    const url = "https://repeat-5763.example/path";
     logUnrecognizedPath(() => {}, url);
     const first = getUnrecognizedPathStats();
     const key = Object.keys(first.paths)[0];
@@ -143,9 +143,9 @@ test("#5764: a repeat hit within the window bumps count + lastSeen, keeps firstS
     assert.notEqual(second.lastSeen?.[key], first.lastSeen?.[key], "lastSeen advanced on the repeat");
 });
 
-test("#5764: reset seam clears the windowed map", () => {
+test("#5763: reset seam clears the windowed map", () => {
     _resetUnrecognizedPathStatsForTest();
-    logUnrecognizedPath(() => {}, "https://reset-5764.example/a");
+    logUnrecognizedPath(() => {}, "https://reset-5763.example/a");
     assert.equal(getUnrecognizedPathStats().total, 1);
     _resetUnrecognizedPathStatsForTest();
     assert.equal(getUnrecognizedPathStats().total, 0);

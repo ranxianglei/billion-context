@@ -235,7 +235,7 @@ test("#393: GET /models does not log an unrecognized-path warn (control: model-c
         await r1.text();
         assert.equal(captured.filter((l) => l.includes("unrecognized path")).length, 0, "/models is a known discovery path");
 
-        // #5764: the counter now fires ONLY for model-call-shaped requests (POST +
+        // #5763: the counter now fires ONLY for model-call-shaped requests (POST +
         // body). A GET to an unknown path is a probe/enumeration — an expected
         // passthrough, never going to be compressed — so it must NOT log. This was
         // the headline false positive (HEAD/GET to known endpoints flagged "not a
@@ -245,7 +245,7 @@ test("#393: GET /models does not log an unrecognized-path warn (control: model-c
         assert.equal(
             captured.filter((l) => l.includes("unrecognized path") && l.includes("totally-unknown-xyz")).length,
             0,
-            "#5764: non-POST probe to an unknown path is not an unrecognized protocol",
+            "#5763: non-POST probe to an unknown path is not an unrecognized protocol",
         );
 
         // Control preserved from #393: a genuinely unknown path still signals — but
