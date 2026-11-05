@@ -551,7 +551,7 @@ def entries(sid):
 
 
 def append_native(sid, project, observations, parent_id=None, *, host='opencode'):
-    """Persist JSON-serializable OpenCode V2 observations without rewriting them.
+    """Persist JSON-serializable native-host observations without rewriting them.
 
     Observation timestamps are provenance, never a native revision. Identity plus
     native revision plus payload is the deduplication key; contradictory values at
@@ -562,9 +562,9 @@ def append_native(sid, project, observations, parent_id=None, *, host='opencode'
         raise ValueError('Unsupported native host')
     session_dir(sid)
     if not isinstance(project, str) or not pathlib.Path(project).is_absolute():
-        raise ValueError('OpenCode project must be an absolute canonical path')
+        raise ValueError('Native project must be an absolute canonical path')
     if str(pathlib.Path(project).resolve()) != project:
-        raise ValueError('OpenCode project must be canonical')
+        raise ValueError('Native project must be canonical')
     if parent_id is not None:
         session_dir(parent_id)
     if not isinstance(observations, list):
@@ -573,7 +573,7 @@ def append_native(sid, project, observations, parent_id=None, *, host='opencode'
     for observation in observations:
         if not isinstance(observation, dict) or observation.get('kind') not in (
                 'event', 'message', 'part', 'tool.raw', 'prompt', 'barrier'):
-            raise ValueError('Unknown OpenCode observation kind')
+            raise ValueError('Unknown native observation kind')
         payload = observation.get('payload')
         if not isinstance(payload, dict):
             raise ValueError('Native payload must be an object')

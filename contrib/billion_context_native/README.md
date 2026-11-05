@@ -123,7 +123,7 @@ Claude Code 的插件名与 marketplace 名均为 `billion_context_native`；插
 
 无动作的检查不记录。
 
-默认未注册较新版本的 `PostCompact` / `StopFailure`。确认宿主支持后可选用同一 `hook.py observe` 入口：PostCompact 只保存宿主完成声明与 compact_summary（摘要不等于原文）；StopFailure 只保存失败观测，不提升成成功助手消息。缺少这些事件时完成/失败状态保留 unknown；Stop、PostToolUseFailure 不返回 additionalContext，不设 decision:block，不触发模型循环。版本事件范围见 [CC 审查报告](../../review/CC_GAP_AUDIT.zh-CN.md)。
+默认未注册较新版本的 `PostCompact` / `StopFailure`。确认宿主支持后可选用同一 `hook.py observe` 入口：PostCompact 只保存宿主完成声明与 compact_summary（摘要不等于原文）；StopFailure 只保存失败观测，不提升成成功助手消息。缺少这些事件时完成/失败状态保留 unknown；Stop、PostToolUseFailure 不返回 additionalContext，不设 decision:block，不触发模型循环。
 
 ## 归档可靠性（第一阶段）
 
