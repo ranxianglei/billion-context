@@ -867,7 +867,7 @@ Top-level keys that control how the proxy listens and behaves globally.
 "pi": {
   "subagents": {
     "enabled": true,              // master switch; false (or "subagents": false) removes tools+prompt+shortcut (new session)
-    "forceEnable": false,        // keep acp_delegate even when a project-scope pi-subagents install is detected (#415)
+    "forceEnable": false,        // keep acp_delegate even when a pi-subagents install (either scope) is detected (#415, #5637)
     "displayUsage": "separate",  // "separate" (own footer block) | "merged" (folded into tool-result usage)
     "maxDepth": 2,               // nesting depth cap, propagated to children
     "syncTimeoutMinutes": 5,     // hard timeout for sync delegates; 0/null disables
@@ -2547,6 +2547,17 @@ Then start a new conversation in the client (direct to upstream) and paste the h
 Codex subagents (e.g. the `guardian_subagent` approval reviewer) reuse the main conversation's `session_id`, so on the wire they look like the same session. Without care their requests inherit the main conversation's compression state — a subagent turn can get its context folded (losing the verbatim user authorization it must read back) and the two roles' usage estimates pollute each other.
 
 billion-context detects this via the `instructions` field: subagent requests carry their own role prompt. The **first** instructions seen for a conversation anchor the main namespace (stable even if the main prompt drifts); any other instructions value maps to a separate `|sub:` namespace with its own empty compression state. Subagent requests are self-contained replays, so the fresh namespace is lossless — and the web UI's session list shows the two namespaces as separate sessions sharing the same client label.
+
+The anchor is not specific to Codex or Claude Code — but the split is deliberate, not automatic: it applies to clients whose traffic has been verified to reuse ONE conversation id across several personas (each sending its own system prompt under the same id), today Codex, Claude Code and DeepSeek Harness. For every other client a changed system prompt mid-conversation means "same conversation, evolved prompt" and stays in the main namespace. A concrete non-Claude case is DeepSeek Harness with `@deepseek-ai/dsh-experimental-auto-review` enabled: the reviewer fires before each pending tool call under its own small fixed system prompt (≈1 KB; the four `ENVIRONMENT` / `PROJECT_INSTRUCTIONS` / `FILTERED_HISTORY` / `PENDING_ACTION` sections ride its user turn), so its row appears alongside the main conversation and is also marked running.
+
+Four readings tell such a lane apart without reading any code:
+
+| Reading | Main conversation | Review / subagent lane |
+| --- | --- | --- |
+| system prompt | the full prompt (tens of KB) | very small (≈1 KB) |
+| compressions | grows over time | 0 |
+| requests | roughly one per turn | roughly one per tool call |
+| cache hit rate | varies | ≈99.9% (stable prefix, only the pending action changes) |
 
 ### Windows: exclude the sessions dir from antivirus (#362)
 
