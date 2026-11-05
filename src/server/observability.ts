@@ -30,16 +30,36 @@ export function logDumpFailure(where: string, err: unknown): void {
 // forwarded unchanged — expected, not an error. Logging every hit spammed the
 // log (~20k lines in one user's capture, #362). Per-path: first 3 at warn, one
 // "suppressed" notice, then silent.
-const unrecognizedPathCounts = new Map<string, number>();
+//
+// #5764: the counter is a WINDOWED view, not a since-start ledger. An entry whose
+// last hit is older than UNRECOGNIZED_PATH_TTL_MS drops out of BOTH the log-
+// suppression state and the /__bili/stats + acp_status panel — a one-off probe
+// from days ago must not stay resident on the panel looking like an active fault.
+// firstSeen/lastSeen are surfaced so the reader can tell "just happened" from "stale".
+export const UNRECOGNIZED_PATH_TTL_MS = 24 * 60 * 60 * 1000;
+type UnrecognizedPathEntry = { count: number; firstSeen: number; lastSeen: number };
+const unrecognizedPathCounts = new Map<string, UnrecognizedPathEntry>();
+
+function pruneExpiredPaths(now: number): void {
+    for (const [key, entry] of unrecognizedPathCounts) {
+        if (now - entry.lastSeen > UNRECOGNIZED_PATH_TTL_MS) unrecognizedPathCounts.delete(key);
+    }
+}
+
 export function logUnrecognizedPath(log: (level: string, msg: string) => void, url: string): void {
     // Strip the query before masking: a varying query (?ts=…) would otherwise
     // split one endpoint into unbounded keys and defeat the rate limit.
     const key = maskUrlsInText(url.split("?")[0]);
-    const n = (unrecognizedPathCounts.get(key) ?? 0) + 1;
-    unrecognizedPathCounts.set(key, n);
-    if (n <= 3) {
+    const now = Date.now();
+    pruneExpiredPaths(now);
+    const existing = unrecognizedPathCounts.get(key);
+    const entry: UnrecognizedPathEntry = existing
+        ? { count: existing.count + 1, firstSeen: existing.firstSeen, lastSeen: now }
+        : { count: 1, firstSeen: now, lastSeen: now };
+    unrecognizedPathCounts.set(key, entry);
+    if (entry.count <= 3) {
         log("warn", `unrecognized path ${key} — not a known protocol (/chat/completions, /llm_raw_chat, /v1/messages, /responses, /responses/compact); forwarding unchanged`);
-    } else if (n === 4) {
+    } else if (entry.count === 4) {
         log("info", `unrecognized path ${key}: forwarding unchanged; further occurrences suppressed`);
     }
 }
@@ -47,15 +67,33 @@ export function logUnrecognizedPath(log: (level: string, msg: string) => void, u
 // #1290: instance-level view of the map above — surfaced at /__bili/stats
 // (unrecognizedPaths) and in the /acp status report so "this path never got
 // compressed" is visible in a status face, not just 3 transient stderr warns.
-type UnrecognizedPathStats = { total: number; paths: Record<string, number> };
+// #5764: windowed by UNRECOGNIZED_PATH_TTL_MS — paths/total reflect only entries
+// still inside the window, and firstSeen/lastSeen (ISO) are additive so scripts
+// that read only paths/total keep working unchanged.
+type UnrecognizedPathStats = {
+    total: number;
+    paths: Record<string, number>;
+    firstSeen?: Record<string, string>;
+    lastSeen?: Record<string, string>;
+};
 export function getUnrecognizedPathStats(): UnrecognizedPathStats {
+    const now = Date.now();
+    pruneExpiredPaths(now);
     const paths: Record<string, number> = {};
+    const firstSeen: Record<string, string> = {};
+    const lastSeen: Record<string, string> = {};
     let total = 0;
-    for (const [path, n] of unrecognizedPathCounts) {
-        paths[path] = n;
-        total += n;
+    for (const [path, entry] of unrecognizedPathCounts) {
+        paths[path] = entry.count;
+        firstSeen[path] = new Date(entry.firstSeen).toISOString();
+        lastSeen[path] = new Date(entry.lastSeen).toISOString();
+        total += entry.count;
     }
-    return { total, paths };
+    return { total, paths, firstSeen, lastSeen };
+}
+
+export function _resetUnrecognizedPathStatsForTest(): void {
+    unrecognizedPathCounts.clear();
 }
 
 // Model-enumeration endpoints clients probe at startup (omp's openai-models-list

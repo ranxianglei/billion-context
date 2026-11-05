@@ -370,6 +370,11 @@ async function handleRequest(
      *  "commandcode"). Undefined for built-in families; drives the envelope
      *  unwrap/rewrap + JSONL codec selection further down the pipeline. */
     let wireFamily: "commandcode" | null = null;
+    /** #5764: snapshot of "does this destination name a known protocol" captured
+     *  BEFORE the decode step below can null `protocol`. The unrecognized-path gate
+     *  (near the forward fallback) keys off this, not off `protocol`, so a decode
+     *  failure on a KNOWN path is not misreported as an unknown destination. */
+    let destinationNamesProtocol = false;
     /** Gemini's model, resolved from the request path (its body never carries
      *  one). Undefined for every other protocol. */
     let googleModel: string | undefined;
@@ -490,6 +495,7 @@ async function handleRequest(
         // body holds none, so this is the only source for every model-keyed
         // decision on that wire.
         vertexModel = protocol === "anthropic" ? vertexAnthropicModelFromPath(urlPath) : undefined;
+        destinationNamesProtocol = protocol !== null;
         // Issue #99: decode body only for known protocols — passthrough requests
         // (e.g. GET /models) must forward raw bytes without content-encoding decode.
         if (!passthroughMark && protocol !== null && bodyBuffer.length > 0) {
@@ -3452,12 +3458,23 @@ async function handleRequest(
         }
     }
     if (!prepared && !forwarded) {
-        if (protocol === null && !opts.passthrough && !routePassthrough && !isModelDiscoveryPath(urlPath) && !isV1InternalControlPlanePath(urlPath)) {
+        // #5764: an "unrecognized path" is a MODEL-CALL-shaped request (POST with a
+        // body) that reached a destination naming no known protocol — NOT any request
+        // that happened not to be compressed. The old `protocol === null` gate conflated
+        // three unrelated states into one counter: (1) non-POST probes/scans/enumeration
+        // (HEAD /responses, GET /models, a GET path-brute-force) carry no body to compress
+        // and were never going to be compressed, yet were flagged "not a known protocol";
+        // (2) a decode failure on a KNOWN path (the decode step above nulled `protocol`);
+        // (3) a genuinely unknown path. Only (3) belongs in this counter — the non-POST
+        // noise is what left 4 stale probes resident on the acp_status panel for 6 days.
+        const modelCallCandidate = req.method === "POST" && bodyBuffer.length > 0;
+        if (modelCallCandidate && protocol === null && !destinationNamesProtocol
+            && !opts.passthrough && !routePassthrough
+            && !isModelDiscoveryPath(urlPath) && !isV1InternalControlPlanePath(urlPath)) {
             // A declared model endpoint (src/model-endpoints.ts) is by definition
-            // a recognized URL — GET/HEAD probes or empty-body POSTs against it
-            // are health checks, not misrouted model traffic; "unrecognized
-            // path" warnings here would be pure noise (#1295 review F6). This
-            // mirrors buildForwardTarget's URL derivation exactly.
+            // a recognized URL — requests against it are not misrouted model traffic;
+            // "unrecognized path" warnings here would be pure noise (#1295 review F6).
+            // This mirrors buildForwardTarget's URL derivation exactly.
             const rawUrl = req.url ?? "";
             const probeTarget = (route ? route.rewrittenUrl : /^https?:\/\//i.test(rawUrl) ? rawUrl : `${opts.upstream}${urlPath}`)
                 .replace(/^mitm:\/\//, "https://");

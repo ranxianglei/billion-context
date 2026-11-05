@@ -109,6 +109,17 @@ function fmtBytes(n: number): string {
     return `${(n / (1024 * 1024)).toFixed(1)}MiB`;
 }
 
+// #5764: human "last seen" age for the windowed unrecognized-path counter, so a
+// stale probe reads as stale rather than as an active fault.
+function ageLabel(msAgo: number): string {
+    if (msAgo < 60_000) return "just now";
+    const m = Math.floor(msAgo / 60_000);
+    if (m < 60) return `${m}m ago`;
+    const h = Math.floor(msAgo / 3_600_000);
+    if (h < 24) return `${h}h ago`;
+    return `${Math.floor(msAgo / 86_400_000)}d ago`;
+}
+
 // #2366: usage fraction at which the PRESSURE NOTE becomes worth showing —
 // below it the window still has headroom and "stop folding" is noise.
 const PRESSURE_NOTE_USAGE_FRACTION = 0.6;
@@ -597,13 +608,21 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
         // #1290: requests whose path matched no known protocol were relayed
         // byte-for-byte and never entered a session — a second reason "no
         // compressed blocks" can mean misrouting rather than a short chat.
+        // #5764: windowed (last 24h) with a per-path last-seen age so a stale
+        // probe reads as stale, not as an active fault; only model-call-shaped
+        // (POST+body) requests reach this counter now, so non-POST probe/scan
+        // noise no longer lands here at all.
+        const nowMs = Date.now();
         const top = Object.entries(unrec.paths)
             .sort((a, b) => b[1] - a[1])
             .slice(0, 10)
-            .map(([p, n]) => `${p}×${n}`)
+            .map(([p, n]) => {
+                const seenAt = unrec.lastSeen?.[p];
+                return seenAt ? `${p}×${n} (last seen ${ageLabel(nowMs - new Date(seenAt).getTime())})` : `${p}×${n}`;
+            })
             .join(", ");
         extra.push("");
-        extra.push(`UNRECOGNIZED PATHS (instance-level): ${unrec.total} request(s) to ${Object.keys(unrec.paths).length} path(s) matched no known protocol (/chat/completions, /llm_raw_chat, /v1/messages, /responses, …) since instance start — they were relayed byte-for-byte and CANNOT be compressed (${top}). If you expected compression here, that endpoint's path is not in bili's protocol table. Exact per-path counts: the unrecognizedPaths field of GET /__bili/stats.`);
+        extra.push(`UNRECOGNIZED PATHS (instance-level): ${unrec.total} model-call request(s) to ${Object.keys(unrec.paths).length} path(s) matched no known protocol (/chat/completions, /llm_raw_chat, /v1/messages, /responses, …) in the last 24h — each carried a body bili could not compress (${top}). If you expected compression here, that endpoint's path is not in bili's protocol table. Exact per-path counts + first/last-seen: the unrecognizedPaths field of GET /__bili/stats.`);
     }
     return toolOk(extra.length > 0 ? `${base}\n${extra.join("\n")}` : base);
 }
