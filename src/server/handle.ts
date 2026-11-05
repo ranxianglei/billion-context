@@ -66,7 +66,7 @@ import { buildForgeResponse, classifierForgeVariant, estimateCjkTokens, isAutoMo
 import { extractConversationId, isV1BackgroundSideRequest, isV1InternalRequest, unwrapV1Internal } from "../v1internal.js";
 import { anthropicBetaContextWindow, BILI_HOP_HEADER, capRegistryWindowByStandard, expandedContextSuffixWindow, launcherContextWindow, launcherMaxOutput, noteUnresolvedModelSession, UNRESOLVED_MODEL_SESSION_THRESHOLD, windowSourceLogged } from "./context-window.js";
 import { NO_IDENTITY_MESSAGE, safeSessionId } from "./headers.js";
-import { demoteGate, hasLeakedBiliToolsOnly, isClaudeCodeTitleRequest, isDshAutoReviewRequest, isDshTitleRequest, isServerToolUtilityCall, isSideRequest, resolveSideLane, restoreOutputBudget, sideRequestGuard, stripLeakedBiliTools } from "./side-request.js";
+import { demoteGate, hasLeakedBiliToolsOnly, isClaudeCodeTitleRequest, isDshAutoReviewRequest, isDshSingleShotSidecar, isDshTitleRequest, isServerToolUtilityCall, isSideRequest, resolveSideLane, restoreOutputBudget, sideRequestGuard, stripLeakedBiliTools } from "./side-request.js";
 import { DSH_COMPACTION_SHAPE_MSGS, DSH_REFUSAL_STORM_LOG_EVERY, detectPassthroughDshCompactionCall, dshCompactionRefusal, dshPassthroughGuardStats, isDshCompactionCall } from "./dsh-compaction-guard.js";
 import { buildDshCompactionForgeBody, renderDshAuthoredCheckpoint } from "./dsh-authored-compaction.js";
 import { artifactSeedHit, detectAcpArtifacts } from "./chain-artifacts.js";
@@ -1064,6 +1064,14 @@ async function handleRequest(
                  // incident topology.
                  || (pluginAgentHeader(req.headers) === "dsh" && sideAgent !== "main"
                      && isDshAutoReviewRequest(protocol, parsed))
+                 // #5656/#5584: the generic dsh single-shot sidecar — no action
+                 // surface + one-shot body, ANY system text. The per-feature
+                 // pins above stay; this closes the structural hole that let
+                 // every NEW sidecar (prompt-enhance in #5656) claim the raw-key
+                 // anchor before the first main turn and exile the real
+                 // conversation onto a persisted `|sub:<fp>` ghost.
+                 || (pluginAgentHeader(req.headers) === "dsh" && sideAgent !== "main"
+                     && isDshSingleShotSidecar(protocol, parsed))
                  // #5135: the claude code title sidecar stays off the raw-key
                  // anchor claim and off the kernel pipeline entirely.
                  || ccTitleSidecar
@@ -2195,10 +2203,17 @@ async function handleRequest(
         const dshReviewSidecar = requestAgent !== "main" && isDshAutoReviewRequest(protocol, parsed)
             && (pluginAgentHeader(req.headers) === "dsh"
                 || (typeof session.metadata.pluginAgent === "string" && session.metadata.pluginAgent === "dsh"));
+        // #5656/#5584: the generic single-shot sidecar joins the intent set so
+        // prompt-enhance-class calls ride the #388 passthrough (kernel
+        // no-touch) instead of claiming the raw-key anchor; the sticky-bound leg
+        // mirrors #4438 — the extension client can arrive unstamped.
+        const dshSingleShotSidecar = requestAgent !== "main" && isDshSingleShotSidecar(protocol, parsed)
+            && (pluginAgentHeader(req.headers) === "dsh"
+                || (typeof session.metadata.pluginAgent === "string" && session.metadata.pluginAgent === "dsh"));
         // #5135: ccTitleSidecar joins the intent set so the title call rides
         // the #388 passthrough (kernel state untouched) like every other
         // recognized side request.
-        const sideIntent = isSideRequest(parsed, requestAgent) || dshTitleSidecar || dshReviewSidecar || ccTitleSidecar;
+        const sideIntent = isSideRequest(parsed, requestAgent) || dshTitleSidecar || dshReviewSidecar || dshSingleShotSidecar || ccTitleSidecar;
         // #388/#2157 follow-up: side requests must not touch kernel state under
         // a public-fork receipt either. The receipt's first-request check above
         // has already accepted this request (inherited prefix matched, or live
@@ -2222,7 +2237,7 @@ async function handleRequest(
         // #2500 server-tool utility shape) diverts under a receipt.
         // #2170 measure 1: the decision itself is resolveSideLane() (pure,
         // truth-table-tested); demotedSide ⊆ lane==="side" by construction.
-        const sideLane = resolveSideLane({ countTokens, responsesCompact, protocol, stripApplied: demotedSide, sideIntent, requestAgent, sideLabel: serverToolUtility ? "server-tool utility call (#2500)" : dshTitleSidecar ? "dsh title-gen sidecar (#2503)" : dshReviewSidecar ? "dsh auto-review sidecar (#4438)" : ccTitleSidecar ? "claude-code title-gen sidecar (#5135)" : undefined });
+        const sideLane = resolveSideLane({ countTokens, responsesCompact, protocol, stripApplied: demotedSide, sideIntent, requestAgent, sideLabel: serverToolUtility ? "server-tool utility call (#2500)" : dshTitleSidecar ? "dsh title-gen sidecar (#2503)" : dshReviewSidecar ? "dsh auto-review sidecar (#4438)" : dshSingleShotSidecar ? "dsh single-shot sidecar (#5656)" : ccTitleSidecar ? "claude-code title-gen sidecar (#5135)" : undefined });
         if (sideLane.lane === "side") {
             // #554: the passthrough below skips EVERY input-side guard by design
             // (#388) — a full-history side request over the window is a
