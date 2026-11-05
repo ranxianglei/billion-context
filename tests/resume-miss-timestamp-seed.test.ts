@@ -223,6 +223,17 @@ test("resume-inheritance MISS seeds the timestamp ledger from the closest tracke
     await once(proxy2, "listening");
     const paddr2 = proxy2.address();
     assert(paddr2 && typeof paddr2 === "object");
+    // #5608 Windows-CI race (run 42066002804): startServer's listening callback
+    // awaits resolvePortClaim BEFORE announceListening runs hydrate-on-listening
+    // (src/server.ts), so the first request can land against an EMPTY tracker —
+    // diagnoseResumeMiss then has no candidate and its diagnostic is debug-level
+    // (invisible to the info capture), silently skipping the whole miss path.
+    // Awaiting hydration here mirrors production (a restarted desktop re-sends
+    // well after startup settled) and makes the race impossible:
+    for (let i = 0; i < 400 && !prefixAffinity.exportSnapshot().some((e) => e.sessionId === "old"); i++) {
+        await new Promise((r) => setTimeout(r, 25));
+    }
+    assert.ok(prefixAffinity.exportSnapshot().some((e) => e.sessionId === "old"), "phase-2 tracker must hold the phase-1 chain before the first request (hydrate-on-listening, #309)");
     try {
         const beforeT2 = Date.now();
         // v3 continuation shape — mirrors the production telemetry (#5608): the
@@ -385,6 +396,17 @@ test("weak-adoption gate: equal-depth replays and truncated subviews start FRESH
     await once(proxy2, "listening");
     const paddr2 = proxy2.address();
     assert(paddr2 && typeof paddr2 === "object");
+    // #5608 Windows-CI race (run 42066002804): startServer's listening callback
+    // awaits resolvePortClaim BEFORE announceListening runs hydrate-on-listening
+    // (src/server.ts), so the first request can land against an EMPTY tracker —
+    // diagnoseResumeMiss then has no candidate and its diagnostic is debug-level
+    // (invisible to the info capture), silently skipping the whole miss path.
+    // Awaiting hydration here mirrors production (a restarted desktop re-sends
+    // well after startup settled) and makes the race impossible:
+    for (let i = 0; i < 400 && !prefixAffinity.exportSnapshot().some((e) => e.sessionId === "old"); i++) {
+        await new Promise((r) => setTimeout(r, 25));
+    }
+    assert.ok(prefixAffinity.exportSnapshot().some((e) => e.sessionId === "old"), "phase-2 tracker must hold the phase-1 chain before the first request (hydrate-on-listening, #309)");
     const post2 = (id: string, msgs: unknown[]) => fetch(`http://127.0.0.1:${paddr2.port}/bili/${upstreamUrl}/v1/messages`, { method: "POST", headers: { "content-type": "application/json", "x-acp-session": id }, body: JSON.stringify({ model: "claude-test", max_tokens: 1024, stream: false, messages: msgs }) });
     try {
         const eq = await post2("eq-replay", messages);
