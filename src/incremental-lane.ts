@@ -165,9 +165,6 @@ function warnDroppedRequestParams(conversationId: string, request: Record<string
     log("warn", `[incremental] ${conversationId}: request parameter(s) not in the forward allowlist were dropped: ${unwarned.join(", ")} — extend REQUEST_PARAM_KEYS (src/incremental-lane.ts) if they must reach the upstream (#3406)`);
 }
 
-/** Wire headers the client may contribute to the forwarded request. */
-const PASSTHROUGH_HEADERS = ["authorization", "anthropic-version", "anthropic-beta"] as const;
-
 /** Canonical prefix per conversation, in memory. Bounded LRU: cold entries
  *  rebuild from the unified messages table on demand (see loadCanonical). */
 const CANONICAL_LIMIT = 16;
@@ -826,23 +823,34 @@ export async function handleIncrementalTurn(
         }
         const bodyBuf = laneBodyBuffer(body, itemsStr);
 
-        const headers: Record<string, string> = {
-            "content-type": "application/json",
-            "content-length": String(bodyBuf.length),
-            host: headerValue(req, "host") ?? "127.0.0.1",
-            // Session identity rides the CLIENT's own conversation header (the
-            // strongest signal in the pipeline) — see laneSessionId().
-            "x-bili-plugin": agent,
-            "x-bili-plugin-conversation": conversationId,
-            accept: headerValue(req, "accept") ?? "application/json",
-        };
+        // Re-enter the pipeline (forward → handleRequest → buildForwardHeaders) with a
+        // synthetic indistinguishable from the ORIGINAL client request, so egress
+        // normalization is the SAME code that serves full-resend traffic (#5658). This
+        // mirrors the marker-divert replay (handle.ts): copy the client's own headers
+        // and drop only the lane-intent marker — do NOT hand-roll a strip list, which
+        // diverges from the proven non-incremental surface and risks upstream rejection.
+        // The only extra corrections are forced by the REBUILT body: its length, and the
+        // encoding marker (an assembled turn body is always plain JSON, so any inbound
+        // content-encoding is stale). Lane identity is stamped below.
+        const headers: Record<string, string> = {};
+        for (const [k, v] of Object.entries(req.headers)) {
+            if (v === undefined) continue;
+            const lower = k.toLowerCase();
+            if (lower === INCREMENTAL_TURN_MARKER_HEADER.toLowerCase()) continue;
+            if (lower === "content-encoding") continue;
+            headers[k] = Array.isArray(v) ? v.join(", ") : v;
+        }
+        // Lane-owned values win, set explicitly (framing matches the assembled body;
+        // session identity rides the client's own conversation value — laneSessionId()).
+        headers["content-type"] = "application/json";
+        headers["content-length"] = String(bodyBuf.length);
+        headers["host"] = headerValue(req, "host") ?? "127.0.0.1";
+        headers["x-bili-plugin"] = agent;
+        headers["x-bili-plugin-conversation"] = conversationId;
+        headers["accept"] = headerValue(req, "accept") ?? "application/json";
         // Plugin capability headers the client may contribute on the turn
         // POST (context window / max output reports for the [window] clamp).
         for (const h of ["x-bili-plugin-context-window", "x-bili-plugin-max-output"] as const) {
-            const v = headerValue(req, h);
-            if (v !== undefined) headers[h] = v;
-        }
-        for (const h of PASSTHROUGH_HEADERS) {
             const v = headerValue(req, h);
             if (v !== undefined) headers[h] = v;
         }
