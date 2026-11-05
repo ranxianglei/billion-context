@@ -155,7 +155,6 @@ async function runClient(origin: string, upstreamUrl: string, sid: string, turns
             "content-type": "application/json",
             "x-acp-session": sid,
             "x-bili-plugin": "dsh",
-            "x-bili-plugin-agent": "main",
         };
         const prev = stamps[stamps.length - 1];
         if (prev !== null && prev !== undefined) headers["x-bili-pf-count"] = String(prev);
