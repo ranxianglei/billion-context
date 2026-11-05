@@ -1187,6 +1187,66 @@ export class UnifiedShadow {
         }
     }
 
+    // #5664 render snapshot plane — same soft-degrade shape as the identity
+    // plane: reads return empty/null, the turn commit returns null (the v6
+    // lane fails soft onto the legacy full path for that turn only).
+
+    pfRenderAvailable(): boolean {
+        if (this.sync === null) return false;
+        try {
+            return this.sync.pfRenderAvailable();
+        } catch {
+            return false;
+        }
+    }
+
+    pfRenderRows(sid: string): { pos: number; rowJson: string | null }[] {
+        if (this.sync === null) return [];
+        try {
+            return this.sync.pfRenderRows(sid);
+        } catch {
+            return [];
+        }
+    }
+
+    /** Throws are NOT swallowed deliberately (same as pfCommitTurn): a failed
+     *  render commit must be loud to the caller. Network backends: null. */
+    pfRenderCommit(
+        sid: string,
+        args: {
+            rows: { pos: number; rowJson: string | null }[];
+            logEntries: { kind: string; payloadJson: string }[];
+            checkpointMetaJson?: string;
+            ts?: number;
+        },
+    ): number | null {
+        if (this.sync === null) return null;
+        return this.sync.pfRenderCommit(sid, args);
+    }
+
+    pfRenderMeta(
+        sid: string,
+    ): {
+        ckpt: { ckptLsSeq: number; metaJson: string; checksum: string; updatedAt: number } | null;
+        log: { lsSeq: number; kind: string; payloadJson: string; ts: number }[];
+    } | null {
+        if (this.sync === null) return null;
+        try {
+            return this.sync.pfRenderMeta(sid);
+        } catch {
+            return null;
+        }
+    }
+
+    pfRenderCkptIntact(sid: string): boolean {
+        if (this.sync === null) return false;
+        try {
+            return this.sync.pfRenderCkptIntact(sid);
+        } catch {
+            return false;
+        }
+    }
+
     deleteSessionExt(sessionId: string, key?: string): number {
         if (this.sync === null) return 0;
         return this.sync.deleteSessionExt(sessionId, key);

@@ -530,3 +530,19 @@ entries:
     group: envonly
     desc_en: "Longest-edge trigger threshold (px) for the egress image downscale pass (#3400); non-numeric or below 128 ignored (default applies). Env-only by design."
     desc_zh: "出站图片降采样 pass 的最长边触发阈值（像素，#3400）；非数字或低于 128 的取值按默认处理。设计上仅环境变量。"
+  - key: BILI_PF_RENDER_WINDOW
+    type: integer
+    default: "8"
+    kind: env-only
+    audience: user
+    group: envonly
+    desc_en: "Bounded render window W for the v6 render-snapshot plane (#5664): how many frozen cores ride the bounded kernel pass beside the new tail window on each steady turn. Probe evidence across three strategies showed a suffix-only W-pass reproduces every element's outbound bytes exactly, so 8 is plenty; values below 1 or non-numeric fall back to 8, capped at 64. Only meaningful while rollout.features.watermarkV6Render is on."
+    desc_zh: "v6 渲染快照平面（#5664）的有界渲染窗口 W：每个稳态轮送入内核的冻结核数量（与新增尾窗并列）。三种策略的探针证据表明后缀 W-pass 能逐字节复现每个元素的出站字节，8 已足够；低于 1 或非数字的取值回退为 8，上限 64。仅在 rollout.features.watermarkV6Render 开启时有意义。"
+  - key: BILI_PF_RENDER_AUDIT_EVERY
+    type: integer
+    default: "8"
+    kind: env-only
+    audience: user
+    group: envonly
+    desc_en: "Scheduled audit cadence N for the v6 render-snapshot plane (#5664): every N engaged hit-turns force ONE full legacy pass whose capture diff re-verifies the stored outbound rows end-to-end (bounds messageRefs/rules merge lag to <= N rounds). Values below 2 or non-numeric fall back to 8, capped at 1024. Any legacy round (red-gate fallback included) resets the counter — it IS an audit. Only meaningful while rollout.features.watermarkV6Render is on."
+    desc_zh: "v6 渲染快照平面（#5664）的计划审计周期 N：每 N 个命中轮强制跑一次全量 legacy pass，其捕获 diff 对已存出站行做端到端复验（把 messageRefs/rules 合并滞后钉在 ≤ N 轮内）。低于 2 或非数字的取值回退为 8，上限 1024。任何 legacy 轮（含红色门控回退）都会清零计数——它本身就是一次审计。仅在 rollout.features.watermarkV6Render 开启时有意义。"

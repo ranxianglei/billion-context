@@ -801,7 +801,7 @@ test("schema v2: dev-window v1 database upgrades in place (identity columns adde
             assert.equal(row!.namespace, "proxy", "namespace backfills with its constant default");
             assert.equal(row!.origin, null, "origin backfills NULL");
             const ver = (store as unknown as { db: { prepare(q: string): { get(): unknown } } }).db.prepare("PRAGMA user_version").get() as { user_version: number };
-            assert.equal(ver.user_version, 11, "schema version stamped to 11 (… v10 immutable message ts column + v11 fastpath-v6 identity plane tables pf_rows/pf_log/pf_ckpt)");
+            assert.equal(ver.user_version, 12, "schema version stamped to 12 (… v10 immutable message ts column + v11 fastpath-v6 identity plane + v12 render snapshot plane)");
             // v3 backfill: every pre-existing sessions row claims its
             // (namespace, conversation_id) identity binding.
             const binding = (store as unknown as { lookupConversation(ns: string, id: string): string | null }).lookupConversation("proxy", "dev-window-1");
@@ -863,7 +863,7 @@ test("schema v10: v9→v10 migration adds messages.ts without backfill; idempote
         try {
             const ver = (reopened as unknown as { db: { prepare(q: string): { get(): unknown } } }).db
                 .prepare("PRAGMA user_version").get() as { user_version: number };
-            assert.equal(ver.user_version, 11, "v9 library migrates to 11");
+            assert.equal(ver.user_version, 12, "v9 library migrates to 12");
             const rows = reopened.getMessages("v10-mig-1") as { seq: number; ts?: number | null }[];
             assert.equal(rows.length, 1, "row survives the migration");
             assert.ok(rows[0].ts === null || rows[0].ts === undefined, "pre-existing row keeps NULL (never backfilled)");

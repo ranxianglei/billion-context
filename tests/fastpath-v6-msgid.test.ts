@@ -469,7 +469,7 @@ test("§8-22 real store deletion cascades every registered world (in-TX registry
         await h.store.removeSession("s-cs");
         const db = new DatabaseSync(path.join(h.dir, "index.db"));
         try {
-            for (const t of ["pf_rows", "pf_log", "pf_ckpt"]) {
+            for (const t of ["pf_rows", "pf_log", "pf_ckpt", "pf_render", "pf_render_log", "pf_render_ckpt"]) {
                 const row = db.prepare(`SELECT COUNT(*) AS n FROM ${t}`).get() as { n: number } | undefined;
                 assert.equal(row?.n, 0, `${t} must be empty after session deletion`);
             }

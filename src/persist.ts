@@ -2284,11 +2284,66 @@ export class SessionStore {
     /** Session teardown (#5643 §8 test 19 third clause): sweep the pf plane
      *  for EVERY sid this relay session was ever issued. Reads the registry
      *  from ext FIRST (deleteSession sweeps session_ext itself), then deletes
-     *  rows/log/ckpt. Safe to call when nothing was ever issued. */
+     *  all SIX plane tables — identity rows/log/ckpt AND the #5664 render
+     *  snapshot tables (deleteSession's own cascade covers them in-txn too;
+     *  this facade is the standalone maintenance entry). Safe to call when
+     *  nothing was ever issued. */
     pfDeleteForSession(sessionId: string): void {
         if (!this.shadow || this.shadow.stats.disabled) return;
         const reg = this.shadow.getSessionExt(sessionId, this.PF_V6_SID_REGISTRY_EXT_KEY) as string[] | undefined;
         if (Array.isArray(reg)) this.shadow.pfDeleteAll(reg);
+    }
+
+    /** #5664 render snapshot plane facade — same guard shape as the identity
+     *  plane: null/empty/false = "plane unavailable right now" and the v6
+     *  lane fails soft onto the legacy full path for that turn only.
+     *  A failed render commit is logged once, then fails soft for THIS turn
+     *  (same as pfCommitTurn above). */
+    pfRenderAvailable(): boolean {
+        if (!this.shadow || this.shadow.stats.disabled) return false;
+        try {
+            return this.shadow.pfRenderAvailable();
+        } catch {
+            return false;
+        }
+    }
+
+    pfRenderRows(sid: string): { pos: number; rowJson: string | null }[] {
+        if (!this.shadow || this.shadow.stats.disabled) return [];
+        return this.shadow.pfRenderRows(sid);
+    }
+
+    pfRenderCommit(
+        sid: string,
+        args: {
+            rows: { pos: number; rowJson: string | null }[];
+            logEntries: { kind: string; payloadJson: string }[];
+            checkpointMetaJson?: string;
+            ts?: number;
+        },
+    ): number | null {
+        if (!this.shadow || this.shadow.stats.disabled) return null;
+        try {
+            return this.shadow.pfRenderCommit(sid, args);
+        } catch (err) {
+            this.log("warn", `[persist] pf render commit failed (${sid}): ${String(err)}`); // loud once, fail-soft for THIS turn
+            return null;
+        }
+    }
+
+    pfRenderMeta(
+        sid: string,
+    ): {
+        ckpt: { ckptLsSeq: number; metaJson: string; checksum: string; updatedAt: number } | null;
+        log: { lsSeq: number; kind: string; payloadJson: string; ts: number }[];
+    } | null {
+        if (!this.shadow || this.shadow.stats.disabled) return null;
+        return this.shadow.pfRenderMeta(sid);
+    }
+
+    pfRenderCkptIntact(sid: string): boolean {
+        if (!this.shadow || this.shadow.stats.disabled) return false;
+        return this.shadow.pfRenderCkptIntact(sid);
     }
 
     /** #5312: reversible single-block archive / restore (see UnifiedStore). */
