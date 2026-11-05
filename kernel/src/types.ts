@@ -133,13 +133,16 @@ export interface NudgeState {
    *  tiers. Using a record (not N named fields) so adding tier 4+ needs no
    *  schema change. */
   lastShownByTier: Record<number, number>;
-  /** Last tier that received a nudge slot (growth or pressure path). Unlike
-   *  lastShownByTier this is NOT cleared by a successful applyCompression: it
-   *  is the rotation memory that keeps an explicitly configured
-   *  tier2Trigger/tier3Trigger alternating with T1 instead of being starved by
-   *  a persistently high T1 pending (#509). Optional for pre-#509 persisted
-   *  states (absent = null = legacy T1-first). */
-  lastInjectedTier?: CompressionTier | null;
+   /** Last tier that received a nudge slot (growth or pressure path). Unlike
+    *  lastShownByTier this is NOT cleared by a successful applyCompression: it
+    *  is the rotation memory that keeps an explicitly configured
+    *  tier2Trigger/tier3Trigger alternating with T1 instead of being starved by
+    *  a persistently high T1 pending (#509). Absent-only storage: a slot stamp
+    *  writes the actual tier and nothing ever stores null — absent = never
+    *  injected = legacy T1-first (the sole reader normalizes undefined via
+    *  `?? null`). A stored null default would serialize into every re-
+    *  hydrated snapshot and drift the storage-corpus pins. */
+   lastInjectedTier?: CompressionTier | null;
 
   /** #5415: growth debt + absorb count booked by the host's #5293
    *  abort-absorb. absorbAbortedTurnGrowth() re-anchors the reference to
