@@ -95,6 +95,18 @@ function capsEqual(a: RenderCaps, b: RenderCaps): boolean {
     );
 }
 
+/** Stable serialization of the kernel's ACTIVE-block multiset — the structural-
+ *  event witness at the snapshot boundary (#5643 补充裁定：快照必须随压缩演进).
+ *  Block ids are never reused and `generation` advances on refold, so this
+ *  string changes iff the fold layer changed the history layout since the
+ *  last recorded signature. Pure server-side evidence; no client inference. */
+export function activeBlocksSignature(blocks: readonly { blockId: string; generation?: string | number; active?: boolean }[]): string {
+    const parts: string[] = [];
+    for (const b of blocks) if (b.active) parts.push(`${b.blockId}:${b.generation ?? 0}`);
+    parts.sort();
+    return parts.join("|");
+}
+
 interface RenderMeta {
     v: 1;
     caps: RenderCaps;
@@ -102,6 +114,10 @@ interface RenderMeta {
     estCum: number;
     textCum: number;
     imgCum: number;
+    /** Active-block signature at this checkpoint (absent on pre-#5643补充裁定
+     *  checkpoints ⇒ ""). Folded forward by post-ckpt 'rebase'/'append' log
+     *  entries during hydration. */
+    blocksSig?: string;
 }
 
 export interface RenderWorld {
@@ -116,6 +132,12 @@ export interface RenderWorld {
      *  verify baseline, so no downstream consumer may alias-mutate them. */
     rowsParsed: unknown[];
     caps: RenderCaps;
+    /** Active-block signature recorded at the LAST commit ("" until any). The
+     *  gate compares it against the live session: a move means the fold layer
+     *  rewrote the layout since we last synchronized — one red "blocks-changed"
+     *  round, then the full pass's diverged capture rebases the table (only
+     *  when THAT round also carries a witness; see commitRenderCapture). */
+    blocksSig: string;
     /** Cumulative Σ estimateCoreMessagesUpper over all current rows. */
     estCum: number;
     /** Cumulative Σ estimateCoreMessages over all current rows. */
@@ -136,15 +158,18 @@ const mirrors = new Map<string, RenderWorld>();
 /** relay session id → pf sids owned by it (teardown sweep). */
 const sessionSids = new Map<string, Set<string>>();
 
-/** Owner ruling 2026-11-05 (#5689 review): NO recast in ANY scenario.
- *  Structural divergence (byte diff/shrink at the core-form boundary), S4
- *  corruption, row-table inconsistency, unverifiable pre-existing snapshots
- *  — all land here. Caps changes cannot alter stored bytes anymore (mapping
- *  inputs sit outside the fingerprint, #5643 ruling §5 ③): their failure
- *  mode is a red gate turn, absorbed by the audit cadence. A dead sid NEVER
- *  arms, hydrates, gates green, or commits again. The verdict is persisted
- *  as a kind='dead' log entry so every future process instance reaches the
- *  same conclusion. */
+/** Owner rulings 2026-11-05. (#5689 review) NO UNWITNESSED recast in ANY
+ *  scenario: structural divergence WITHOUT server-side evidence of a
+ *  structural event, S4 corruption, row-table inconsistency, unverifiable
+ *  pre-existing snapshots — all land here and stay dead forever. The #5643
+ *  补充裁定 opened exactly one door OUT of that candidate set BEFORE death:
+ *  a WITNESSED diverged capture rebases the table (commitRenderCapture's
+ *  'rebase' op) instead of dying. Caps changes cannot alter stored bytes
+ *  anymore (mapping inputs sit outside the fingerprint, #5643 ruling §5 ③):
+ *  their failure mode is a red gate turn, absorbed by the audit cadence.
+ *  A dead sid NEVER arms, hydrates, gates green, or commits again. The
+ *  verdict is persisted as a kind='dead' log entry so every future process
+ *  instance reaches the same conclusion. */
 const deadSids = new Set<string>();
 
 function killRenderPlane(store: SessionStore, sid: string, reason: string, log?: LogFn): void {
@@ -225,15 +250,17 @@ function hydrateMirror(store: SessionStore, sid: string, log?: LogFn): RenderWor
         let imgCum = 0;
         let expectedCount = -1;
         let capsJson = "";
+        let blocksSig = "";
         if (metaRead?.ckpt) {
             const m = JSON.parse(metaRead.ckpt.metaJson) as RenderMeta;
             estCum = m.estCum ?? 0;
             textCum = m.textCum ?? 0;
             imgCum = m.imgCum ?? 0;
             expectedCount = m.rowCount;
+            blocksSig = m.blocksSig ?? "";
             capsJson = metaRead.ckpt.metaJson;
             for (const e of metaRead.log) {
-                const p = JSON.parse(e.payloadJson) as { de?: number; dt?: number; di?: number; n?: number; capsJson?: string; reason?: string } & Partial<RenderMeta>;
+                const p = JSON.parse(e.payloadJson) as { de?: number; dt?: number; di?: number; n?: number; capsJson?: string; reason?: string; sharedPrefix?: number; from?: number; to?: number } & Partial<RenderMeta>;
                 if (e.kind === "dead") {
                     killRenderPlane(store, sid, `persisted death verdict: ${p.reason ?? "unknown"}`, log);
                     return null;
@@ -248,6 +275,12 @@ function hydrateMirror(store: SessionStore, sid: string, log?: LogFn): RenderWor
                     textCum += p.dt ?? 0;
                     imgCum += p.di ?? 0;
                     if (expectedCount >= 0) expectedCount += p.n ?? 0;
+                } else if (e.kind === "rebase") {
+                    // Post-ckpt rebases carry their own fresh checkpoint meta
+                    // (the fold deletes the log), so a surviving 'rebase'
+                    // entry here means an interrupted fold — treat as count
+                    // reset to its journaled target.
+                    if (typeof p.to === "number") expectedCount = p.to;
                 }
             }
         } else {
@@ -294,7 +327,7 @@ function hydrateMirror(store: SessionStore, sid: string, log?: LogFn): RenderWor
             killRenderPlane(store, sid, "unparseable capabilities fingerprint", log);
             return null;
         }
-        const rw: RenderWorld = { sid, rows, rowsParsed, caps, estCum, textCum, imgCum, auditTick: 0 };
+        const rw: RenderWorld = { sid, rows, rowsParsed, caps, blocksSig, estCum, textCum, imgCum, auditTick: 0 };
         touchMirror(rw);
         return rw;
     } catch {
@@ -310,6 +343,12 @@ interface RenderGateArgs {
     sessionId: string;
     session: Session;
     store: SessionStore;
+    /** PRE-TURN active-block signature of the live session ("" = none).
+     *  Compared against the world's last-committed signature: folded sessions
+     *  stay green (compressed history IS steady state once synchronized), a
+     *  signature move lands exactly one "blocks-changed" red round. Optional
+     *  only for the test harness; production callers must pass it. */
+    blocksSig?: string;
     /** true iff this request is an engaged v6 HIT (v6Evaluated.hit !== null). */
     engagedHit: boolean;
     /** true on the arm turn (first registration) — always rides legacy. */
@@ -337,7 +376,7 @@ export type RenderGateDecision =
 
 /** Stable red-reason vocabulary (test-pinned, one per condition): not-engaged,
  *  arm-turn, title-gen, plane-unavailable, pressure, snapshot-lane,
- *  blocks-active, fold-pending, absorb-active, ccr-on, markers, lane-dead,
+ *  blocks-changed, fold-pending, absorb-active, ccr-on, markers, lane-dead,
  *  hydrate-failed, caps-mismatch, audit-due, no-rows, no-plane-geometry,
  *  rows-misaligned. */
 
@@ -351,7 +390,6 @@ export function renderPlaneGate(args: RenderGateArgs): RenderGateDecision {
     if (!args.store.pfRenderAvailable()) return off("plane-unavailable");
     if (args.tokenCount >= PF_RENDER_EMERGENCY_RATIO * args.modelContextLimit) return off("pressure");
     if (args.snapshotLaneActive) return off("snapshot-lane");
-    if (args.session.state.blocks.some((b) => b.active)) return off("blocks-active");
     if (args.foldUsagePending) return off("fold-pending");
     if (args.absorbActive) return off("absorb-active");
     if (args.ccrOn) return off("ccr-on");
@@ -363,6 +401,14 @@ export function renderPlaneGate(args: RenderGateArgs): RenderGateDecision {
     // returning null — report the durable reason, not the transient one.
     if (rw === undefined) return off(deadSids.has(args.sid) ? "lane-dead" : "hydrate-failed");
     if (!capsEqual(rw.caps, args.caps)) return off("caps-mismatch");
+    // #5643 补充裁定：快照必须随压缩演进。 Replaces the old blanket
+    // "blocks-active" red-out: a folded session KEEPS SERVING FAST as long as
+    // nothing changed structurally since the table's own commit. A moved
+    // block multiset (new fold / refold / archive / host-side native
+    // compaction surfaced through the block state) turns the plane red ONCE;
+    // the forced full pass either confirms alignment (equal/append) or
+    // rebases the table on its witnessed diverged capture.
+    if ((rw.blocksSig ?? "") !== (args.blocksSig ?? "")) return off("blocks-changed");
     if (rw.auditTick % PF_RENDER_AUDIT_EVERY === 0 && rw.auditTick > 0) return off("audit-due");
     if (rw.rows.length < 1) return off("no-rows");
     if (args.maxPos < 0) return off("no-plane-geometry");
@@ -449,6 +495,15 @@ interface CaptureArgs {
     sid: string;
     mode: CaptureMode;
     caps: RenderCaps;
+    /** true iff THIS turn carries server-side evidence of a structural event
+     *  (block-multiset signature moved around the kernel pass, dsh native-
+     *  compaction rebase fired, or fold usage consumed). Only a witnessed
+     *  diverged capture may rebase the table; an unwitnessed one kills.
+     *  #5643 补充裁定。 */
+    witness?: boolean;
+    /** Active-block signature AFTER this turn's passes — recorded with the
+     *  commit so the gate's next comparison starts from this round's truth. */
+    blocksSig?: string;
     /** steady: ONLY the new tail raw strings; legacy: the FULL captured rows. */
     rowStrings: string[];
     sums: CaptureSums; // steady: DELTAS for the tail; legacy: ABSOLUTE totals.
@@ -478,7 +533,7 @@ export function diffRowLists(prev: string[], cur: string[]): "equal" | "append" 
  *  stops advancing until restart or caps change allows re-capture again. */
 const nulRejectedSids = new Set<string>();
 
-export function commitRenderCapture(args: CaptureArgs): { committed: boolean; op: "none" | "append" | "cast" } {
+export function commitRenderCapture(args: CaptureArgs): { committed: boolean; op: "none" | "append" | "cast" | "rebase" } {
     const { store, sid, caps, log } = args;
     if (deadSids.has(sid)) {
         // Belt-and-braces behind the gate: a dead sid NEVER arms/commits again.
@@ -524,7 +579,7 @@ export function commitRenderCapture(args: CaptureArgs): { committed: boolean; op
                 return { committed: false, op: "none" };
             }
             const rows = args.rowStrings;
-            const m: RenderMeta = { v: 1, caps, rowCount: rows.length, estCum: args.sums.estCum, textCum: args.sums.textCum, imgCum: args.sums.imgCum };
+            const m: RenderMeta = { v: 1, caps, rowCount: rows.length, estCum: args.sums.estCum, textCum: args.sums.textCum, imgCum: args.sums.imgCum, blocksSig: args.blocksSig ?? "" };
             const okSeq = store.pfRenderCommit(sid, {
                 rows: rows.map((rj, pos) => ({ pos, rowJson: rj })),
                 logEntries: [{ kind: "cast", payloadJson: JSON.stringify({ ...m, capsJson: JSON.stringify(caps) }) }],
@@ -532,7 +587,7 @@ export function commitRenderCapture(args: CaptureArgs): { committed: boolean; op
             });
             if (okSeq === null) return { committed: false, op: "none" };
             const parsed = rows.map((rj) => safeParse(rj));
-            mirrors.set(sid, { sid, rows: [...rows], rowsParsed: parsed, caps: { ...caps }, estCum: args.sums.estCum, textCum: args.sums.textCum, imgCum: args.sums.imgCum, auditTick: 0 });
+            mirrors.set(sid, { sid, rows: [...rows], rowsParsed: parsed, caps: { ...caps }, blocksSig: args.blocksSig ?? "", estCum: args.sums.estCum, textCum: args.sums.textCum, imgCum: args.sums.imgCum, auditTick: 0 });
             registerSidForSession(args.sessionId, sid);
             return { committed: true, op: "cast" };
         }
@@ -565,6 +620,7 @@ export function commitRenderCapture(args: CaptureArgs): { committed: boolean; op
     const verdict = diffRowLists(rw.rows, args.rowStrings);
     if (verdict === "equal") {
         rw.caps = { ...caps }; // keep caps fresh even when bytes match
+        rw.blocksSig = args.blocksSig ?? rw.blocksSig;
         touchMirror(rw);
         return { committed: true, op: "none" };
     }
@@ -588,6 +644,7 @@ export function commitRenderCapture(args: CaptureArgs): { committed: boolean; op
         rw.textCum = args.sums.textCum;
         rw.imgCum = args.sums.imgCum;
         rw.caps = { ...caps };
+        rw.blocksSig = args.blocksSig ?? rw.blocksSig;
         touchMirror(rw);
         return { committed: true, op: "append" };
     }
@@ -597,6 +654,41 @@ export function commitRenderCapture(args: CaptureArgs): { committed: boolean; op
     // scenario: the plane is KILLED PERMANENTLY instead and the session
     // rides the legacy full path from here on (bytes stay correct; the
     // cache simply never serves this sid again).
+    // DIVERGED (byte diff at any position, or shrink): the ORIGINAL design
+    // offered only recast; the owner ruling of 2026-11-05 sealed that door,
+    // and the #5643 补充裁定 re-opened EXACTLY ONE gate in it — a WITNESSED
+    // structural event (the turn's server-side evidence that the fold layer
+    // rewrote the layout: block-multiset signature moved around the kernel
+    // pass, dsh native-compaction rebase, or fold usage consumed) authorizes
+    // a REBASE: the whole table is replaced by THIS capture in one
+    // transaction, journaled as kind='rebase' under a fresh checkpoint.
+    // Without a witness, divergence is still substrate corruption and KILLS
+    // the plane permanently — that semantics is byte-for-byte unchanged.
+    if (args.witness === true) {
+        let common = 0;
+        while (common < rw.rows.length && common < args.rowStrings.length && rw.rows[common] === args.rowStrings[common]) common += 1;
+        const prevLen = rw.rows.length;
+        const m: RenderMeta = { v: 1, caps, rowCount: args.rowStrings.length, estCum: args.sums.estCum, textCum: args.sums.textCum, imgCum: args.sums.imgCum, blocksSig: args.blocksSig ?? rw.blocksSig };
+        const okSeq = store.pfRenderCommit(sid, {
+            replaceAll: true,
+            rows: args.rowStrings.map((rj, pos) => ({ pos, rowJson: rj })),
+            logEntries: [{ kind: "rebase", payloadJson: JSON.stringify({ sharedPrefix: common, from: prevLen, to: args.rowStrings.length }) }],
+            checkpointMetaJson: metaJson(m),
+        });
+        if (okSeq === null) return { committed: false, op: "none" };
+        const parsed = args.rowStrings.map((rj) => safeParse(rj));
+        rw.rows = [...args.rowStrings];
+        rw.rowsParsed = parsed;
+        rw.caps = { ...caps };
+        rw.blocksSig = args.blocksSig ?? rw.blocksSig;
+        rw.estCum = args.sums.estCum;
+        rw.textCum = args.sums.textCum;
+        rw.imgCum = args.sums.imgCum;
+        rw.auditTick = 0; // the rebase round IS the audit — start fresh
+        touchMirror(rw);
+        log?.("info", `[${sid}] #5664 render plane REBASED on witnessed structural event (shared prefix ${common} row(s), table ${prevLen} -> ${args.rowStrings.length} rows)`);
+        return { committed: true, op: "rebase" };
+    }
     killRenderPlane(store, sid, `structural divergence (stored=${rw.rows.length} rows, captured=${args.rowStrings.length})`, log);
     return { committed: false, op: "none" };
 }
