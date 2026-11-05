@@ -35,7 +35,19 @@ import { emitPreflightError } from "../stream-error.js";
 import { agentProviderRecipes } from "../agent-providers.js";
 import { affinityToken, anthropicFirstUserFrag, claudeAnthropicPersonaOrderApplies, conversationHeaderSource, claudeSubagentAgentId, claudeSubagentSplit, claudeSubagentLaneTokenOf, clientConversationHeader, codexTurnIdentity, dshPersonaFingerprintApplies, instructionsFingerprintApplies, openaiSystemTextForPersona, preferPromptCacheKeyIdentity, zcodeMemoryConversation } from "../session-id.js";
 import { preferKiroConversationIdentity } from "../kiro.js";
-import { personaConversationOrder } from "../session-resolve.js";
+import { personaConversationOrder, type SessionOrderResolution } from "../session-resolve.js";
+
+/** #5686: fork/migration visibility on the server side. personaConversation
+ *  used to throw away every outcome but the key, so a production fork
+ *  (derived-*) or migration (reanchor) left NO durable line — the entire
+ *  dsh |sub:-drift cluster had to be reconstructed from user screenshots.
+ *  Log the state-changing outcomes; claim/continue stay silent (they are the
+ *  steady state and would flood the log). derived lanes are the incident
+ *  class → warn level. */
+function onSessionResolveEvent(rawId: string, r: SessionOrderResolution): void {
+    if (r.action !== "reanchor" && !r.action.startsWith("derived-")) return;
+    loggerLog(r.action.startsWith("derived-") ? "warn" : "info", `[session-resolve] ${r.action}: ${rawId} -> ${r.key}${r.reason !== undefined ? ` (${r.reason})` : ""}`);
+}
 import { prefixAffinity, describeResumeMiss, type AnonymousAffinity } from "../prefix-affinity.js";
 import { buildAnonymousProvenance, type AnonymousProvenance } from "../anon-provenance.js";
 import { maybeAdoptForkBlocks, maybeAdoptResume, maybeAdoptDerivedFork } from "../fork-adoption.js";
@@ -1106,8 +1118,11 @@ async function handleRequest(
                           (parsed as GoogleRequestBody).contents,
                           personaSystemText,
                           pluginReportedModel(req.headers),
+                          undefined,
+                          undefined,
+                          onSessionResolveEvent,
                       ))
-                : (googleIdentity?.value ?? googleSignal))
+                  : (googleIdentity?.value ?? googleSignal))
             : protocol === "anthropic"
             ? // #970: a subagent's conversation value gets its own
               // `<id>|sub:<agent-id>` namespace so it lands on its own session
@@ -1135,6 +1150,9 @@ async function handleRequest(
                                (parsed as AnthropicRequestBody).messages,
                                personaSystemText,
                                pluginReportedModel(req.headers),
+                               undefined,
+                               undefined,
+                               onSessionResolveEvent,
                            ))
                      : claudeAnthropicPersonaOrderApplies(req.headers) && opts.subagentSplit !== false
                        && !sideRequestLike && personaSystemText !== ""
@@ -1165,6 +1183,7 @@ async function handleRequest(
                            pluginReportedModel(req.headers),
                            claudeSubagentLaneTokenOf((parsed as AnthropicRequestBody).messages),
                            anthropicFirstUserFrag((parsed as AnthropicRequestBody).messages),
+                           onSessionResolveEvent,
                          )
                        : anthropicIdentity?.value ?? anthropicSignal)
              : protocol === "openai"
@@ -1174,6 +1193,9 @@ async function handleRequest(
                           (parsed as OpenAIRequestBody).messages,
                           personaSystemText,
                           pluginReportedModel(req.headers),
+                          undefined,
+                          undefined,
+                          onSessionResolveEvent,
                       )
                     : openaiIdentity?.value ?? openaiSignal)
               : codexTurn
@@ -1196,6 +1218,9 @@ async function handleRequest(
                           (parsed as ResponsesRequestBody).input,
                           (parsed as ResponsesRequestBody).instructions ?? "",
                           pluginReportedModel(req.headers),
+                          undefined,
+                          undefined,
+                          onSessionResolveEvent,
                       )
                  : opts.stableSystemAnchor && pluginAgentHeader(req.headers) === undefined
                    // #1085: with anchoring on (plain-proxy mode only — see the
@@ -1236,6 +1261,9 @@ async function handleRequest(
                                 (parsed as ResponsesRequestBody).input,
                                 (parsed as ResponsesRequestBody).instructions ?? "",
                                 pluginReportedModel(req.headers),
+                                undefined,
+                                undefined,
+                                onSessionResolveEvent,
                           )
                           : (responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader)))
                       : (responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader));

@@ -14,7 +14,7 @@ import { mediaBytesOfWireBody } from "./media-bytes.js";
 import * as pfChannel from "./pf-channel.js";
 import { probeLiveness, type LivenessVerdict } from "../liveness.js";
 import { BILI_PASSTHROUGH_HEADER, MIN_ASSUMED_WINDOW_TOKENS } from "../util.js";
-import { DSH_COMPACTION_MARKER_SNIFF } from "../server/dsh-compaction-guard.js";
+import { DSH_COMPACTION_MARKER_SNIFF, isDshCompactionCall } from "../server/dsh-compaction-guard.js";
 import { APIG_RESIGN_HEADER, APIG_RESIGN_CREDENTIAL_HEADER, APIG_RESIGN_SCHEME, clearSignedRefusal, encodeApigCredential, inboundSignedScheme, recordSignedRefusal, resignEnabled, resignPassthroughEnabled, signedRefusal } from "../apig-resign.js";
 
 /** #2924: takeover-gate verdict. `true` claims the request; `false` keeps the
@@ -462,39 +462,72 @@ function outgoingHeadersOf(input: string | URL | Request, init?: RequestInit): R
  *  original must stay sendable (#2496). init.body wins over a Request
  *  input's own body (spec: init overrides), mirroring fetchMethodOf. */
 async function dshCompactionMarkerInBody(input: string | URL | Request, init?: RequestInit): Promise<boolean> {
-    const marker = DSH_COMPACTION_MARKER_SNIFF;
+    const text = await readableModelBodyText(input, init);
+    return text !== undefined && text.includes(DSH_COMPACTION_MARKER_SNIFF);
+}
+
+/** #5686: readable plain-text form of a dispatch body for marker probing.
+ *  Returns the full body text, or undefined when the form cannot be read
+ *  without disturbing the dispatch (ReadableStream/FormData bodies) or
+ *  cannot be decoded (#4912 RangeError on oversized buffers) — callers must
+ *  treat undefined as FAIL OPEN, never as evidence either way. A
+ *  Request-object input with no init.body is probed through a CLONE so the
+ *  original stays sendable (#2496); init.body wins over the Request's own
+ *  body (spec: init overrides), mirroring fetchMethodOf. */
+async function readableModelBodyText(input: string | URL | Request, init?: RequestInit): Promise<string | undefined> {
     const body: unknown = init?.body;
     if (body === undefined) {
-        if (input === null || typeof input !== "object" || input instanceof URL) return false;
+        if (input === null || typeof input !== "object" || input instanceof URL) return undefined;
         try {
             const probe = (input as Request).clone();
-            return (await probe.text()).includes(marker);
+            return await probe.text();
         } catch {
-            return false;
+            return undefined;
         }
     }
-    if (typeof body === "string") return body.includes(marker);
-    if (body instanceof URLSearchParams) return body.toString().includes(marker);
+    if (typeof body === "string") return body;
+    if (body instanceof URLSearchParams) return body.toString();
     if (body instanceof Blob) {
         try {
-            return (await body.text()).includes(marker);
+            return await body.text();
         } catch {
-            return false;
+            return undefined;
         }
     }
     if (body instanceof Uint8Array || body instanceof ArrayBuffer) {
         const bytes = body instanceof ArrayBuffer ? body : new Uint8Array(body.buffer as ArrayBuffer, body.byteOffset, body.byteLength);
         try {
-            return new TextDecoder().decode(bytes).includes(marker);
+            return new TextDecoder().decode(bytes);
         } catch {
             // #4912: undecodable buffer (e.g. >V8-max-string-length, where
             // decode throws RangeError) — fail OPEN like every other
             // unreadable form above; the probe must never throw out of the
             // intercept (it runs on EVERY POST, proxy up or down).
-            return false;
+            return undefined;
         }
     }
-    return false;
+    return undefined;
+}
+
+/** #5686: which protocol wire shape this model URL speaks, for the
+ *  client-side marker-DECISIVE check (isDshCompactionCall needs the wire
+ *  family to know whether to read messages[] or input[]). chat/completions
+ *  and bare /completions speak openai; /responses speaks responses; 
+ *  /messages speaks anthropic (openai-compatible gateways included — both
+ *  read messages[]). Google/custom wires are undecidable here and stay out
+ *  of scope exactly like the server-side guard header rules (§PROTOCOL
+ *  COVERAGE). */
+function modelProtocolHintFromUrl(url: string): string | null {
+    let pathname: string;
+    try {
+        pathname = new URL(url).pathname.toLowerCase();
+    } catch {
+        pathname = url.toLowerCase();
+    }
+    if (pathname.includes("/chat/completions") || pathname.endsWith("/completions")) return "openai";
+    if (pathname.includes("/responses")) return "responses";
+    if (pathname.endsWith("/messages")) return "anthropic";
+    return null;
 }
 
 /** #2924: best-effort body size for the gate's oversize arm — strings and
@@ -598,6 +631,26 @@ function unattributedOversizeRefusal(url: string): Response {
         return new Response(JSON.stringify({ type: "error", error: { type: "invalid_request_error", message } }), { status: 422, headers });
     }
     return new Response(JSON.stringify({ error: { type: "server_error", code: "bili_gate_oversize_refusal_unattributed", message, retryable: false } }), { status: 422, headers });
+}
+
+/** #5686: local refusal for a MARKER-DECISIVE dsh native-compaction summarize
+ *  call on a path about to degrade to a DIRECT send (no usable proxy right
+ *  now). Forwarding would let the summarization checkpoint land upstream and
+ *  dsh frame it into a checkpoint that DURABLY SHADOWS the session's raw
+ *  history — irreversible compression-substrate loss (#1729 doctrine); "
+ *  either compress, or refuse" leaves refusal as the only legal outcome here
+ *  (#3651). Distinct from the server's refusal (which needs the session
+ *  ledger): this fires where no bili instance answered at all. Protocol-
+ *  shaped like oversizeRefusal so the host treats it as a policy refusal of
+ *  ONE request; dsh logs 'step compaction failed' and continues the turn. */
+function compactionDirectRefusal(url: string): Response {
+    const message =
+        "billion-context refused this request locally: it is a dsh native-compaction summarize call (final user message starts with the COMPACTION_INSTRUCTION directive), and no usable bili proxy was available at this moment \u2014 sending it directly to the provider would make the summarization checkpoint land durably and shadow this conversation's raw history, destroying bili's compression base (#1729/#5686). This ONE compaction attempt fails; dsh continues the turn normally. Restore or start the bili proxy (or restart the host) so the next compaction can run under bili.";
+    const headers = { "content-type": "application/json", "x-bili-gate": "dsh-compaction-refused" };
+    if (url.endsWith("/messages")) {
+        return new Response(JSON.stringify({ type: "error", error: { type: "invalid_request_error", message } }), { status: 422, headers });
+    }
+    return new Response(JSON.stringify({ error: { type: "server_error", code: "bili_gate_dsh_compaction_refused", message, retryable: false } }), { status: 422, headers });
 }
 
 /** #5405: the empty-slot branch has no attribution and no window knowledge.
@@ -1321,6 +1374,49 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
                 if (degradeLog !== undefined) noteDispatchMode("refused", `bili-native: ${degradeLog} — lane-only payload refused locally instead (#3304)`);
                 logHostEvent("error", "[native-client]", `bili-native: no usable proxy and the request carries a lane-only payload — failing locally instead of sending it to the provider; retry the turn (#3304): ${dispatchUrl}`);
                 throw new TypeError("billion-context: proxy unavailable — the request payload is lane-specific (incremental turn) and cannot be forwarded to the provider directly; retry the turn (#3304)");
+            }
+            // #5686: the last leak window of the #1729 doctrine — every
+            // degraded direct send (no live proxy / respawn exhausted /
+            // gateless host process) used to carry a dsh native-compaction
+            // summarize call STRAIGHT to the provider, whose normal reply dsh
+            // then frames into a checkpoint that DURABLY SHADOWS this session's
+            // raw history (compression substrate destroyed, identity fork
+            // follows — the #5517/#5656 report cluster). "Either compress,
+            // or refuse" (#3651 ruling): with no usable proxy, refusal is the
+            // only legal outcome for THIS call class. Only a MARKER-DECISIVE
+            // call refuses (final user message starts with COMPACTION_
+            // INSTRUCTION via isDshCompactionCall — quoting the directive
+            // mid-body, Google/custom wires, and unreadable/stream bodies keep
+            // today's direct semantics exactly; fail-open per #2496/#4912).
+            // Routed /bili/ dispatches are excluded — they still reach a bili
+            // instance whose own guards (#2043 lane) handle the call with full
+            // session evidence. Synchronous origin test on purpose: awaiting
+            // readyOrigin here would hold every degraded send up to the 15 s
+            // readiness timeout, and each caller below already ran that wait.
+            if (
+                state.origin === undefined &&
+                routedBiliModelUrl(dispatchUrl) === undefined &&
+                fetchMethodOf(defaultInput, init) === "POST" &&
+                isModelApiUrl(dispatchUrl)
+            ) {
+                const bodyText = prep.outcome === "restored" ? prep.body : await readableModelBodyText(defaultInput, init);
+                if (bodyText !== undefined && bodyText.includes(DSH_COMPACTION_MARKER_SNIFF)) {
+                    const hint = modelProtocolHintFromUrl(dispatchUrl);
+                    if (hint !== null) {
+                        let parsed: unknown;
+                        try {
+                            parsed = JSON.parse(bodyText);
+                        } catch {
+                            parsed = undefined;
+                        }
+                        if (parsed !== undefined && isDshCompactionCall(hint, parsed)) {
+                            state.onDispatch?.(dispatchUrl, "refused");
+                            if (degradeLog !== undefined) noteDispatchMode("refused", `bili-native: ${degradeLog} — dsh native compaction summarize call refused locally (#5686)`);
+                            logHostEvent("error", "[native-client]", `bili-native: dsh native compaction summarize call refused LOCALLY (422) instead of a direct send — no usable bili proxy at this moment, and forwarding would let the checkpoint land upstream and durably shadow this session's raw history (#1729/#5686); dsh logs 'step compaction failed' and continues the turn: ${dispatchUrl}`);
+                            return compactionDirectRefusal(dispatchUrl);
+                        }
+                    }
+                }
             }
             // #4516/#4894: without a live proxy the raw history rides straight
             // to the provider — refuse LOCALLY what provably cannot fit the
