@@ -72,6 +72,29 @@ test("#5714 regression (sb- UUID id shape): the same shifted topology migrates i
     assert.equal(res.action, "reanchor");
 });
 
+test("#5714 regression (deletion shift, negative offset): host-side DELETION of an early cell + persona rotation keeps the RAW key", () => {
+    resetSessionOrderForTest();
+    const id = "session-66666666-7777-8888-9999-aaaaaaaaaaaa";
+    const oldHistory = plain(20, "main");
+    // Turn 1: claim the fresh id under persona A, model fixed.
+    const claim = resolveSessionOrder(id, oldHistory, "old-persona", "same-model");
+    assert.equal(claim.key, id);
+    assert.equal(claim.action, "claim");
+
+    // Turn 2: persona rotates A→B AND the host DROPS an early cell from its
+    // own log (index 1), shifting every later cell one index EARLIER, then
+    // appends the fresh turn. The recorded body now sits inside the incoming
+    // at NEGATIVE relative offset — the zero diagonal scores zero agreement,
+    // so pre-fix this forked onto |sub:<fp(B)> exactly like the insertion case.
+    const shifted: M[] = [...oldHistory.slice(1), ...plain(3, "next")];
+    const res = resolveSessionOrder(id, shifted, "new-persona", "same-model");
+    assert.equal(res.key, id, "deleted-and-shifted-but-preserved history keeps the RAW key");
+    assert.equal(res.action, "reanchor");
+    assert.match(res.reason ?? "", /#4778|#5714/);
+    // The skeleton re-anchored to the host's living truth (deletion included).
+    assert.deepEqual(sessionOrderSkeletonOf(id), orderSkeletonOf(shifted));
+});
+
 test("#5714 control: the SHORTER slice still reanchors through #5686 (fifth rung untouched)", () => {
     resetSessionOrderForTest();
     const id = "sess-5714-shorter";
