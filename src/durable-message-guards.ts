@@ -8,7 +8,9 @@
 // @deepseek-ai/dsh-agent-instructions' workspace-instructions baseline
 // (#2447: global + project AGENTS.md merged into ONE message, re-emitted only
 // when baselineIdentity — projectRoot + discovery/budget config, NOT file
-// contents — changes), and the agent-loop runtime-context snapshot (#2481:
+// contents — changes; content edits instead arrive as per-file revision
+// notices on separate messages, #4921), and the agent-loop runtime-context
+// snapshot (#2481:
 // sandbox/approval policy state, self-declared "supersedes earlier
 // runtime-context snapshots" — resent only when the runtime context CHANGES,
 // not every turn) — plus a FOURTH carrier from the dsh PLUGIN ecosystem
@@ -90,6 +92,41 @@ export function dshSkillCatalogPath(msg: CoreMessage): string | undefined {
         : undefined;
 }
 
+/** Line-start-anchored match for the three dsh instruction-file REVISION
+ *  markers (#4921) on their exact evidenced shapes: "Updated instructions
+ *  from: <path>" (existing file edited), "Additional instructions from:
+ *  <path>" (file discovered after the baseline was emitted), "Instructions
+ *  removed: <path>" (file deleted/disabled). Wrapper-independent (the marker
+ *  line itself is the criterion, #2419 discipline); no case folding — the
+ *  three shapes are distinct DSH strings and widening the match only grows
+ *  false-positive surface. Capture group 1 = the file path. */
+const DSH_INSTRUCTION_REVISION_RE = /(?:^|\n)[ \t]*(?:Updated instructions from:|Additional instructions from:|Instructions removed:)[ \t]*(\S+)/;
+
+/** dsh workspace-instructions REVISION identity (#4921): the per-file rule
+ *  change notices injected by @deepseek-ai/dsh-agent-instructions when an
+ *  instruction file's CONTENT changes while its path stays in the baseline
+ *  (source: lib/index.js :262/:283/:285 shapes, validated against real
+ *  session traffic in the #4921 report — 11 real update carriers, 9 folded).
+ *  The host NEVER re-emits the baseline on content change (baselineIdentity
+ *  excludes file contents — see dshWorkspaceInstructionsPath), so each
+ *  revision is the SOLE carrier of its file's current rule text: folding it
+ *  leaves the stale baseline pinned and silently authoritative — the model
+ *  keeps executing changed rules and the correction dies with the fold.
+ *  Each revision projects to its OWN per-path identity instead of sharing
+ *  the baseline's: under the default latest-per-path policy (`durable/*`),
+ *  one shared identity would demote the OLDER instance to foldable — i.e.
+ *  the baseline itself in multi-file sessions — a net loss. Per-path
+ *  grouping keeps the baseline plus the newest notice of every changed file
+ *  live (bounded by the number of distinct files revised); the removed
+ *  notice rides the same group so the newest event per file wins (add →
+ *  remove leaves the invalidation visible, not the superseded rules).
+ *  #2766: assistant-role messages are never carriers (see dshSkillCatalogPath). */
+export function dshWorkspaceInstructionsRevisionPath(msg: CoreMessage): string | undefined {
+    if (msg.role === "assistant" || msg.contentType !== "text" || typeof msg.text !== "string") return undefined;
+    const m = DSH_INSTRUCTION_REVISION_RE.exec(msg.text);
+    return m ? `durable/agents-md-update/${m[1]}` : undefined;
+}
+
 /** dsh workspace-instructions identity (#2447): the durable AGENTS.md baseline
  *  message injected by @deepseek-ai/dsh-agent-instructions — global
  *  (~/.dsh/AGENTS.md) and project instructions merged into ONE user-role
@@ -99,9 +136,12 @@ export function dshSkillCatalogPath(msg: CoreMessage): string | undefined {
  *  baselineIdentity (projectRoot + discovery/budget config, NOT file contents)
  *  changes, so one fold of it silently kills hard constraints like "read X
  *  before any web access" forever. Marker-over-wrapper rationale as #2419.
- *  The match is case-sensitive on purpose — reconciliation change messages
- *  use lowercase variants ("Updated instructions from:") that remain ordinary
- *  consumable history. At most ~one such baseline lives per session
+ *  Content edits do NOT re-emit this message — they arrive as per-file
+ *  revision notices handled by dshWorkspaceInstructionsRevisionPath (#4921),
+ *  which MUST run before this classifier in the lane chain: an update body
+ *  can quote the literal "Instructions from:" label (real traffic, seq=2346
+ *  in the #4921 report) and must land in its own per-path group, not the
+ *  shared baseline identity. At most ~one such baseline lives per session
  *  (replacements are rare identity changes), so pinning every match is
  *  bounded. #2766: assistant-role messages are never carriers (see
  *  dshSkillCatalogPath). */
@@ -240,12 +280,16 @@ function startsWithAsciiCI(hay: string, needle: string): boolean {
     return true;
 }
 
-/** dsh lane classifier: any of the five evidence-backed identities → its
- *  canonical path (four durable carriers + the foldable time-context
- *  injection, #5109). */
+/** dsh lane classifier: any of the evidence-backed dsh identities → its
+ *  canonical path — the durable carriers plus the foldable time-context
+ *  injection (#5109, deliberately outside the `durable/` namespace). The
+ *  workspace-instructions family has TWO classifiers: revision notices first
+ *  (their bodies can quote the baseline label — see
+ *  dshWorkspaceInstructionsRevisionPath), then the shared baseline. */
 function dshDurableToolPath(msg: CoreMessage): string | undefined {
     return (
         dshSkillCatalogPath(msg) ??
+        dshWorkspaceInstructionsRevisionPath(msg) ??
         dshWorkspaceInstructionsPath(msg) ??
         dshRuntimeContextPath(msg) ??
         dshMcpCatalogPath(msg) ??
