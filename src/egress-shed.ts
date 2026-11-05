@@ -46,6 +46,11 @@ export interface ShedStats {
     changed: boolean;
 }
 
+export interface ShedWireImagesResult {
+    body: string;
+    stats: ShedStats;
+}
+
 interface ShedOptions {
     /** Best-effort mNNNNN resolver (session incoming-image index); placeholders quote it. */
     resolveRef?: (mediaType: string, b64: string) => Promise<string | undefined>;
@@ -251,7 +256,7 @@ export async function shedWireImages(
     protocol: WireProtocol,
     targetBytes: number,
     opts: ShedOptions = {},
-): Promise<{ body: string; stats: ShedStats }> {
+): Promise<ShedWireImagesResult> {
     const originalBytes = byteLen(body);
     const noop: ShedStats = { originalBytes, finalBytes: originalBytes, archived: 0, downscaled: 0, changed: false };
     if (targetBytes <= 0 || originalBytes <= targetBytes) return { body, stats: noop };
