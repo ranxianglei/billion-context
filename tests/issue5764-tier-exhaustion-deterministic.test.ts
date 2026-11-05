@@ -7,7 +7,7 @@ import type { Session } from "../src/session.ts";
 import { preflightCompress, type PreflightDeps } from "../src/preflight.ts";
 import { ConfiguredSummaryPlan } from "../src/external-summary-runtime.js";
 
-// #5766: a DSH session whose new turn carried several oversized inline items (six
+// #5764: a DSH session whose new turn carried several oversized inline items (six
 // base64 images, ~130K chars each) made EVERY candidate two-block span cross the
 // 60,000-char tier-distillation source budget, so bounded tier-recovery found no
 // legal span and ended structurally exhausted. That verdict was installed WITHOUT
@@ -64,7 +64,7 @@ function buildSession(o: BuildOpts) {
     const seeded = state.blocks.filter((b) => b.active);
     assert.equal(seeded.length, o.blocks.length, `fixture must seed ${o.blocks.length} tier-1 blocks (got ${seeded.length})`);
     const session: Session = {
-        id: "issue5766-preflight", meta: {}, metadata: {}, state,
+        id: "issue5764-preflight", meta: {}, metadata: {}, state,
         stats: { requests: 1, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: o.limit * 4, compressCreditTokens: 0, contextTokens: o.limit * 4, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0 },
         pendingRetrievals: [], createdAt: Date.now(), lastSeen: Date.now(), blockContents: new Map(), inFlight: 0, persisted: false,
     };
@@ -104,7 +104,7 @@ function makeDeps(core: ReturnType<typeof createCore>, session: Session, config:
     };
 }
 
-test("#5766: a structurally-exhausted tier recovery (every span over budget) is marked deterministic", async () => {
+test("#5764: a structurally-exhausted tier recovery (every span over budget) is marked deterministic", async () => {
     // Three ~40k-char items: any two-block span (~80k) crosses the 60,000-char source
     // budget, so the picker finds no legal candidate — the same gate six oversized
     // inline images trip in production. Recovery must end structurally exhausted and
@@ -126,10 +126,12 @@ test("#5766: a structurally-exhausted tier recovery (every span over budget) is 
     }
 });
 
-test("#5766: a single positionable block (below the two-block gate) is also marked deterministic", async () => {
-    // Only one active tier-1 block survives reconciliation — below the two-block gate,
-    // so no span can ever be assembled. Same structural truth as the over-budget case:
-    // deterministic, not a relay-dependent 502.
+test("#5764: a single positionable block (below the two-block gate) is also marked deterministic", async () => {
+    // Only one active tier-1 block survives reconciliation, so the recovery funnel is
+    // gated out entirely (eligibleForTierRecovery demands two) and the verdict lands on
+    // the #1841 futile-round classification that already carried the flag — this test
+    // pins the below-gate CONTRACT; the new stopReason propagation is pinned by the
+    // other two tests. Either way it is structural, not a relay-dependent 502.
     const { core, config, messages, session } = buildSession({ limit: 10000, blocks: [40000, 40000], tailChars: 200 });
     // Drop the second block's covered messages from the resent wire so reconciliation
     // deactivates it, leaving exactly one active block.
@@ -148,7 +150,7 @@ test("#5766: a single positionable block (below the two-block gate) is also mark
     }
 });
 
-test("#5766 (negative gate): a call-budget-cap ending is NOT marked deterministic (keeps 502-retryable)", async () => {
+test("#5764 (negative gate): a call-budget-cap ending is NOT marked deterministic (keeps 502-retryable)", async () => {
     // Twelve 25k blocks: every pair (~50k) fits, so recovery distills until it hits the
     // six-call cap while the 60k-char tail floor alone still exceeds the window. That is
     // a BUDGET ending, not a structural proof — it must stay non-deterministic so the
