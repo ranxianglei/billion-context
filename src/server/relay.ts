@@ -902,7 +902,10 @@ async function forwardCaptured(
             // [#1343] no response means the attached full text never reached the model —
             // drop-and-log it (a corrective note surfaces on the next qualifying request).
             if (prepared && prepared.attachedRetrievals && prepared.attachedRetrievals.length > 0) dropRetrievals(prepared.session, prepared.attachedRetrievals.map((i) => i.ref), "upstream network failure");
-            throw withUpstreamFailure(new Error(`upstream request failed: ${failure.message}`, { cause: error }), failure.detail);
+            // #2465/#5663: tag the classified transport envelope so the dispatch catch
+            // logs it as ONE line — failure.message already carries
+            // kind/code/errno/syscall/address/port/hint; the stack adds no signal.
+            throw withUpstreamFailure(Object.assign(new Error(`upstream request failed: ${failure.message}`, { cause: error }), { biliTransportFailure: true }), failure.detail);
         }
         // #3701: close 1009 with ZERO events received is a verdict on our frame SIZE, not
         // on endpoint health — the same gateway answers smaller frames fine. Deliberately

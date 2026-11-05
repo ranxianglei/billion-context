@@ -107,6 +107,10 @@ export const LIVE_FILES = [
     // #4612: spawns an idle node child as the "other live process" fixture;
     // binds no ports, mkdtemp-isolated per test
     "tests/issue4612-gc-online-guard.test.ts",
+    // #5631 restart survival: real bili proxy children under OS signals
+    // (SIGTERM/SIGKILL/clean shutdown). Private mkdtemp homes per lane-arm,
+    // probed-free ports re-probed on every restart — no band reuse.
+    "tests/issue5631-restart-survival.test.ts",
     // #5666: process-liveness regression — spawns ONE bare node child (--import
     // tsx) that arms a keepalive through the real scheduler and asserts it exits
     // on its own; the child runs under a per-run mkdtemp XDG sandbox, does no
