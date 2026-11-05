@@ -133,6 +133,17 @@ export interface NudgeState {
    *  tiers. Using a record (not N named fields) so adding tier 4+ needs no
    *  schema change. */
   lastShownByTier: Record<number, number>;
+   /** Last tier that received a nudge slot (growth or pressure path). Unlike
+    *  lastShownByTier this is NOT cleared by a successful applyCompression: it
+    *  is the rotation memory that keeps an explicitly configured
+    *  tier2Trigger/tier3Trigger alternating with T1 instead of being starved by
+    *  a persistently high T1 pending (#509). Absent-only storage: a slot stamp
+    *  writes the actual tier and nothing ever stores null — absent = never
+    *  injected = legacy T1-first (the sole reader normalizes undefined via
+    *  `?? null`). A stored null default would serialize into every re-
+    *  hydrated snapshot and drift the storage-corpus pins. */
+   lastInjectedTier?: CompressionTier | null;
+
   /** #5415: growth debt + absorb count booked by the host's #5293
    *  abort-absorb. absorbAbortedTurnGrowth() re-anchors the reference to
    *  the current meter, which skips not just the aborted turn's unreported
@@ -147,6 +158,25 @@ export interface NudgeState {
    *  by applyCompression alongside the other baselines. */
   absorbedDebt?: number;
   absorbCount?: number;
+
+  /** #5698: the raw T1 pending mass (decision breakdown.pendingT1) recorded
+   *  when the most recent T1 nudge fired (growth or pressure path). Consumed
+   *  by the next successful applyCompression, which compares its own
+   *  tokensCompressed against it to set or clear t1HarvestStall — this is how
+   *  partial compliance ("every nudge folds only a few K") becomes measurable
+   *  as T1-channel ineffectiveness instead of invisible. Optional for
+   *  pre-#5698 persisted states (absent = nothing armed = no measurement). */
+  lastT1FirePending?: number;
+  /** #5698: latched by applyCompression when the last successful T1-shaped
+   *  fold harvested less than STALL_HARVEST_RATIO of the offered mass. While
+   *  set, decideNudge routes the growth-path slot to a higher tier whose MASS
+   *  leg crossed its own threshold (dropping the legacy "> t1Eff" demand) and
+   *  removes T1 from the pressure candidates whenever the remaining tiers can
+   *  clear minPressureBenefit. Cleared by a harvest at/above the ratio or by a
+   *  distillation fold. Optional, absent-only storage: a latch stores true, a clear
+   *  DELETES the key rather than storing false, so feature-inactive snapshots stay
+   *  byte-identical to pre-#5698 ones. Absent = no stall = legacy arbitration. */
+  t1HarvestStall?: boolean;
 }
 
 export interface CompressionStats {
@@ -407,11 +437,15 @@ export interface CompressionState {
 export interface TierConfig {
   enabled: boolean;
   /** Distill to tier 2 once the count of ACTIVE tier-1 blocks reaches this.
-   *  Default 5. Independent of raw-message pending: summaries are ~10:1
-   *  condensed, so a token-mass comparison against T1 pending would starve. */
+   *  Default 1000 (#379: block count is not a need signal, so the path
+   *  defaults OFF; lowering it explicitly opts back in, and a count-ready
+   *  tier then alternates slots with a ready T1 on the growth path instead
+   *  of being short-circuited behind it — #509). Independent of raw-message
+   *  pending: summaries are ~10:1 condensed, so a token-mass comparison
+   *  against T1 pending would starve. */
   tier2Trigger: number;
   /** Condense to tier 3 once the count of ACTIVE tier-2 blocks reaches this.
-   *  Default 10. */
+   *  Default 2000 (#379, see tier2Trigger). */
   tier3Trigger: number;
 }
 

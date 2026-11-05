@@ -15,6 +15,13 @@ export function createInitialState(): CompressionState {
       baselineTokens: 0,
       anchors: {},
       lastShownByTier: {},
+      // #509/#5698: lastInjectedTier, t1HarvestStall and lastT1FirePending are
+      // deliberately NOT initialized — absent (undefined) is the legacy /
+      // never-measured state, and undefined keys drop out of persisted
+      // snapshots entirely, so a fresh or re-hydrated session stays
+      // byte-identical to pre-feature until the mechanism actually fires.
+      // (A stored null/false default serializes into every snapshot and
+      // drifts the storage-corpus + storage-render golden pins.)
     },
     stats: {
       tokensCompressed: 0,
