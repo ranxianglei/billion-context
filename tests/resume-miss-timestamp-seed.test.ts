@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
-import { mkdtempSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BLOCKED_REF, defaultConfig } from "acp-kernel";
@@ -18,6 +18,26 @@ import { flushPrefixAffinity } from "../src/affinity-persist.ts";
 import { closeServers } from "./server-close-guard.ts";
 
 process.env.NODE_ENV = "test";
+
+// #5608 CI triage (windows-latest node-22 shard): both e2e subtests below depend
+// on the phase-1 affinity snapshot surviving into the phase-2 server start
+// (sync flushPrefixAffinity write + hydrate-on-listening read). On a Windows
+// runner the round-trip lost the "old" chain once (#4264-style EMPTY candidate
+// set ⇒ no weak adoption, no named rejection — both assertions fail the same
+// way) without a diagnosable trace. These failure messages therefore carry the
+// exact checkpoint state: what the tracker holds in memory, whether the
+// snapshot file exists, and the captured log lines that name hydrate/miss.
+function phase2Diag(dir: string, logs: string[]): string {
+    const snap = prefixAffinity.exportSnapshot();
+    let snapFile: string;
+    try {
+        const p = join(dir, "billion-context", "prefix-affinity.json");
+        snapFile = existsSync(p) ? `${readFileSync(p, "utf8").length}B` : "<missing>";
+    } catch (e) {
+        snapFile = `ERR ${String(e)}`;
+    }
+    return `[diag] in-memory-chains=${JSON.stringify(snap.map((e) => `${e.sessionId}:${e.depth}`))} snapshot-file=${snapFile} captured-logs=${JSON.stringify(logs.filter((l) => l.includes("resume-inheritance") || l.includes("hydrated")).slice(-6))}`;
+}
 
 /**
  * #5608/#4313 regression pins for the resume-inheritance ledger carry. A stamp
@@ -226,7 +246,7 @@ test("resume-inheritance MISS seeds the timestamp ledger from the closest tracke
         // The days-old ledger rides over wholesale (seed copies every parent
         // entry, orphaned ids included): no days-old value is re-minted:
         for (const [key, val] of Object.entries(oldStamps!)) {
-            assert.equal(childStamps[key], val, `days-old stamp ${key} must ride over from the closest chain, not be re-minted now`);
+            assert.equal(childStamps[key], val, `days-old stamp ${key} must ride over from the closest chain, not be re-minted now ${phase2Diag(dir, logs)}`);
         }
         // The NEW work mints now-time entries only for itself: the appended turn
         // (and possibly the drifted tail message whose raw-id changed identity).
@@ -239,7 +259,7 @@ test("resume-inheritance MISS seeds the timestamp ledger from the closest tracke
         }
         // #5608: the miss path runs full weak adoption from the closest chain, so the
         // proof line is the adoption log naming the weak relationship (seeding is logged, not silent).
-        assert.ok(logs.some((l) => l.includes("weakly resumed closest chain after byte-exact miss") && l.includes("old")), "weak adoption is logged, not silent");
+        assert.ok(logs.some((l) => l.includes("weakly resumed closest chain after byte-exact miss") && l.includes("old")), `weak adoption is logged, not silent ${phase2Diag(dir, logs)}`);
     } finally {
         setLogCapture(null);
         store2.closeQuietly();
@@ -371,9 +391,9 @@ test("weak-adoption gate: equal-depth replays and truncated subviews start FRESH
         assert.equal(eq.status, 200, await eq.text());
         const trunc = await post2("trunc-resend", messages.slice(0, 9));
         assert.equal(trunc.status, 200, await trunc.text());
-        assert.ok(!logs.some((l) => l.includes("weakly resumed closest chain")), `neither misfire shape may be adopted weakly, saw: ${JSON.stringify(logs.filter((l) => l.includes("resume-inheritance")))}`);
-        assert.ok(logs.some((l) => l.includes("eq-replay") && l.includes("equal-depth shape")), "the equal-depth replay names its rejection reason");
-        assert.ok(logs.some((l) => l.includes("trunc-resend") && l.includes("truncated shape")), "the truncated resend names its rejection reason");
+        assert.ok(!logs.some((l) => l.includes("weakly resumed closest chain")), `neither misfire shape may be adopted weakly, saw: ${JSON.stringify(logs.filter((l) => l.includes("resume-inheritance")))} ${phase2Diag(dir, logs)}`);
+        assert.ok(logs.some((l) => l.includes("eq-replay") && l.includes("equal-depth shape")), `the equal-depth replay names its rejection reason ${phase2Diag(dir, logs)}`);
+        assert.ok(logs.some((l) => l.includes("trunc-resend") && l.includes("truncated shape")), `the truncated resend names its rejection reason ${phase2Diag(dir, logs)}`);
         const eqStamps = getSession("eq-replay").state.tsStamps;
         const truncStamps = getSession("trunc-resend").state.tsStamps;
         assert.ok(eqStamps && Object.keys(eqStamps).length > 0, "the equal-depth replay mints its OWN ledger (no inheritance)");
