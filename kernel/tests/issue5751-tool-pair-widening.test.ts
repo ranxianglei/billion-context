@@ -187,7 +187,8 @@ describe("applyCompression with distant pairs (#5751 / #5746)", () => {
       state: s1,
       config: cfg,
     });
-    assert.equal(r.result.blocksCreated, 1);    const block = r.state.blocks.find((b) => b.active);
+    assert.equal(r.result.blocksCreated, 1);
+    const block = r.state.blocks.find((b) => b.active);
     assert.ok(block);
     assert.ok(block!.effectiveMessageIds.includes("call0"));
     assert.ok(block!.effectiveMessageIds.includes("res0"));
