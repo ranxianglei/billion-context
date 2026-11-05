@@ -3,23 +3,33 @@
 // default; upstreams that ROUTE prefix cache by that field (body-keyed relays
 // like the workbuddy panel, header-keyed ones like the workbuddy hub, and
 // account-pool aggregators) lose their affinity signal unless the user turns
-// the switch back on. The notice is shown until dismissed — once per proxy
-// instance, persisted beside instances.json (same discipline as
-// host-plugin-notice.ts: server-side, not per-browser, best-effort fs that
-// never fails a request or a page load). It is only active while the EFFECTIVE
+// the switch back on. The notice is shown until dismissed — once per install,
+// persisted server-side (not per-browser), best-effort persistence that never
+// fails a request or a page load. It is only active while the EFFECTIVE
 // routing is "disabled": users who already chose auto/enabled made the call
 // themselves and are not nagged.
+//
+// #5548: the DISMISSAL RECEIPTS themselves moved into unified storage — see
+// src/notice-store.ts (kv_store namespace "notices"; owner ruling 2026-11-03:
+// state stops being carried in JSON files). This module keeps the public
+// shape (sync reads, sync dismiss) and degrades to the legacy file whenever
+// no unified sidecar exists.
 
 import fs from "node:fs";
 import path from "node:path";
 import { stateDir } from "./paths.js";
+import {
+    addDismissedKeyInMemory,
+    dismissedCache,
+    isBuiltinNoticeId,
+    isValidDismissKey,
+    MAX_DISMISSED_KEYS,
+    persistDismissedKey,
+    unifiedReceiptsActive,
+} from "./notice-store.js";
+import { PCK_NOTICE_ID, WM_FASTPATH_INTRO_ID } from "./notice-store.js";
 
-export const PCK_NOTICE_ID = "pck-default-off";
-// #5403 watermark fastpath experimental-grey intro (owner ruling 2026-11-02):
-// same one-time-per-instance store, its own id so dismissal stays independent.
-export const WM_FASTPATH_INTRO_ID = "wm-fastpath-intro";
-
-const UPGRADE_NOTICE_IDS: ReadonlySet<string> = new Set([PCK_NOTICE_ID, WM_FASTPATH_INTRO_ID]);
+export { PCK_NOTICE_ID, WM_FASTPATH_INTRO_ID };
 
 const DISMISS_FILE = "upgrade-notices.json";
 
@@ -28,7 +38,9 @@ function stateDirFor(env: NodeJS.ProcessEnv): string {
     return v && v.length > 0 ? path.join(path.resolve(v), "billion-context") : stateDir();
 }
 
-export function dismissedUpgradeNotices(env: NodeJS.ProcessEnv = process.env): ReadonlySet<string> {
+/** Legacy-file read: the pre-hydration fallback AND the carrier for
+ *  legacy-only instances. */
+function fileDismissedKeys(env: NodeJS.ProcessEnv): ReadonlySet<string> {
     try {
         const raw = fs.readFileSync(path.join(stateDirFor(env), DISMISS_FILE), "utf8");
         const doc: unknown = JSON.parse(raw);
@@ -41,15 +53,38 @@ export function dismissedUpgradeNotices(env: NodeJS.ProcessEnv = process.env): R
     }
 }
 
+export function dismissedUpgradeNotices(env: NodeJS.ProcessEnv = process.env): ReadonlySet<string> {
+    if (unifiedReceiptsActive()) {
+        const view = dismissedCache();
+        if (view !== null) return view;
+    }
+    return fileDismissedKeys(env);
+}
+
 /** Idempotent. Returns false only for unknown notice ids. */
 export function dismissUpgradeNotice(id: string, env: NodeJS.ProcessEnv = process.env): boolean {
-    if (!UPGRADE_NOTICE_IDS.has(id)) return false;
+    if (!isValidDismissKey(id)) return false;
+    if (unifiedReceiptsActive()) {
+        // unified carrier: in-memory now, durable write fire-and-forget,
+        // eviction enforced synchronously in the memory view (see store).
+        addDismissedKeyInMemory(id);
+        persistDismissedKey(id);
+        return true;
+    }
     const set = new Set(dismissedUpgradeNotices(env));
     set.add(id);
+    // bound the file — built-in ids are protected; overflow evicts alphabetically
+    // (the flat legacy file carries no insertion times, so true FIFO is not possible here)
+    let keys = [...set].sort();
+    while (keys.length > MAX_DISMISSED_KEYS) {
+        const victim = keys.find((k) => !isBuiltinNoticeId(k));
+        if (victim === undefined) break;
+        keys = keys.filter((k) => k !== victim);
+    }
     try {
         const dir = stateDirFor(env);
         fs.mkdirSync(dir, { recursive: true });
-        fs.writeFileSync(path.join(dir, DISMISS_FILE), JSON.stringify({ dismissed: [...set].sort() }, null, 2) + "\n");
+        fs.writeFileSync(path.join(dir, DISMISS_FILE), JSON.stringify({ dismissed: keys }, null, 2) + "\n");
     } catch {
         // best effort: dismissal intent still holds for this process's answers
     }

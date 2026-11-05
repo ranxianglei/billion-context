@@ -17,6 +17,7 @@ import { warnCacheCollapse } from "../cache-warn.js";
 import { stampOutbound } from "../chain-checkpoint.js";
 import { applyCompatDropFields, dropCompatFieldsJson, resolveCompatDropFields } from "../compat-drop.js";
 import { applyCompatRoles, applyCompatRolesJson, detectRoleRejection, detectSystemPlacementError, hasOffHeadSystem, resolveCompatRoles, type CompatRoles } from "../compat-roles.js";
+import { builtinCompatRoles, builtinRoleRestorePoints, withRestoredRoles } from "../kiro.js";
 import { compressLoopResponsesJson } from "../compress-loop-responses.js";
 import { resolveCompress } from "../compress-settings.js";
 import { buildAbsorbSystemPrompt, buildCompressHybridSystemPrompt, buildCompressSystemPrompt, withMarkerIntegrityNote, withMcpDialectNote, withProjectAttribution, withSummaryBudgetNote } from "../compress-tool.js";
@@ -24,7 +25,7 @@ import { detectGenerationBoundary, GENERATION_BOUNDARY_NOTE } from "../generatio
 import { findRoute, resolveDeclaredProtocol, type ProxyOptions } from "../config.js";
 import { makeContinuationRefetch } from "../degenerate-retry.js";
 import { dumpRejectedBody } from "../error-dump.js";
-import { extractWsOversizeError, formatMiB, shedEgressIfOverBudget, shedWireImages, shedWireImagesToCount, type ShedStats } from "../egress-shed.js";
+import { extractWsOversizeError, formatMiB, shedEgressIfOverBudget, shedWireImages, shedWireImagesToCount, type ShedStats, type ShedWireImagesResult } from "../egress-shed.js";
 import { conversationPromptSections, externalSummaryEnabled, messageTimestampSections } from "../external-summary-surface.js";
 import { fakeBufCap, injectFakeCompletionHint, isFakeCompletion, maxFakeCompletionRetries } from "../fake-completion.js";
 import { fetchWithTimeout, fetchWithTransportRetry } from "../fetch-util.js";
@@ -57,7 +58,7 @@ import { safePrefix, safeSuffix, scrubLoneSurrogatesOnWire } from "../text-safe.
 import { clearUpstreamAlertsForHost, noteCircuitFailFastLog, recordUpstreamAlert, recordUpstreamCircuitFailure, recordUpstreamCircuitSuccess, upstreamCircuitBlockReason, upstreamCircuitLastFailureKind, upstreamCircuitRetryAfterSeconds } from "../upstream-alerts.js";
 import { describeUpstreamFailure, formatUpstreamError, proxyDispatcher, recordUpstreamConnection } from "../upstream-proxy.js";
 import { markExpectedFailFast, withUpstreamFailure, type UpstreamFailureKind } from "../upstream-fail.js";
-import { noteUpstreamThrottle429, noteUpstreamThrottleResolved, upstreamThrottleLocalReject } from "../upstream-throttle.js";
+import { keyringModel429Scope, noteUpstreamThrottle429, noteUpstreamThrottleResolved, releaseUpstreamThrottleProbe, requestModelFromBody, upstreamThrottleGate } from "../upstream-throttle.js";
 import { applyEstimateCalibration, currentCalibrationFactor, inspectContextOverflow, isMarkerlessOverflowReject, MIN_ASSUMED_WINDOW_TOKENS, normalizeUpstreamOrigin, usageOutputTotal, usageTotals, type ContextOverflowInfo, type WireProtocol } from "../util.js";
 import { billOutputUsage } from "../billing.js";
 import { DUMP_PLAINTEXT_BANNER } from "../dump-banner.js";
@@ -268,6 +269,7 @@ async function forwardCaptured(
     affinity?: string,
     overflowRefold?: (realWindow: number | undefined) => Promise<{ body: string | Buffer; prepared: Prepared | null } | null>,
     v1Meta?: Record<string, unknown>,
+    throttleModelHint?: string,
 ): Promise<void> {
     const forwardStartedAt = Date.now();
     const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepared.session, () => !res.destroyed) : undefined;
@@ -305,6 +307,9 @@ async function forwardCaptured(
     // forward, or a developer-role 400 would hit mid-stream on retry).
     let compatRoles: CompatRoles | null = null;
     let compatProtocol: "openai" | "responses" | null = null;
+    // Kiro: [input index, original role] for items re-voiced by the built-in map
+    // (judge-only; the wire keeps the rewritten roles).
+    let judgeRoleRestore: Array<[number, string]> = [];
     // #1757 resolved drop list, shared with wireTransform below (re-sent
     // compress-retry bodies must carry the same drops as the initial forward).
     let compatDropPaths: string[] = [];
@@ -379,7 +384,11 @@ async function forwardCaptured(
         // so later requests skip the 400 round-trip. Session-scoped only —
         // config stays user-owned.
         const learned = (prepared?.session.metadata.learnedCompatRoles as CompatRoles | undefined) ?? {};
-        const roles = { ...configured, ...learned };
+        // Kiro CLI: its gateway takes only user/assistant items, so bili's
+        // injected developer prompt would 400 at input[0]. Built-in, lowest
+        // precedence — configured and learned roles still win per key.
+        const builtin = builtinCompatRoles(req.headers, upstreamUrl);
+        const roles = { ...builtin, ...configured, ...learned };
         const protocol = prepared?.protocol ?? route?.explicitProtocol ?? resolveDeclaredProtocol(opts.routes, upstreamUrl) ?? inferWireProtocol(req.url ?? "");
         // compatProtocol is armed even with zero roles: the learn-on-failure
         // retry below needs it, and roles may be learned mid-request.
@@ -391,6 +400,10 @@ async function forwardCaptured(
                 if (applied.rewritten > 0) {
                     wireBody = applied.body;
                     log("info", `[${prepared?.session.id ?? "passthrough"}] [compat] rewrote ${applied.rewritten} message role(s) per compat.roles (${Object.entries(roles).map(([f, t]) => `${f}→${t}`).join(",")})`);
+                    // Kiro: remember which items the BUILT-IN map re-voiced, so the
+                    // invariant judge can see bili's own injected prompt as what it is
+                    // (a developer item) instead of an unexplained user insertion.
+                    if (Object.keys(builtin).length > 0) judgeRoleRestore = builtinRoleRestorePoints(body, protocol, builtin, roles);
                 }
             }
         }
@@ -787,7 +800,8 @@ async function forwardCaptured(
         maybeRunInvariantJudge({
             // #2078: reuse the seam block's single parse of sentBody instead of
             // paying another full JSON.parse of the largest payload per turn.
-            parsed: sentParsed,
+            // Kiro: judge with the built-in role re-voicing undone (see judgeRoleRestore).
+            parsed: withRestoredRoles(sentParsed, judgeRoleRestore),
             // #4241: a render-lane turn's outbound is built from the SERVER
             // transcript (summary anchors + store rows), so its ground truth
             // is the rendered view — reconciling the client's inbound bytes
@@ -833,14 +847,15 @@ async function forwardCaptured(
             hint: "upstream circuit open — the endpoint is unreachable and bili is failing fast instead of resending full context until a probe succeeds",
         }));
     }
-    // #4204: egress-side 429 throttle governor — while consecutive sends to this
-    // origin+credential came back 429, answer LOCALLY (429 + Retry-After under
-    // budget, then a terminal 424 outside every known SDK retry set) instead of
-    // forwarding: a host-driven retry loop must not be amplified into egress
-    // that pins a concurrency-style provider limit for the whole account. Zero
-    // egress while held; one probe per backoff window keeps recovery automatic.
+    // #4204: account-wide holds stay origin+credential scoped. KeyRing's
+    // request-matched model-temporarily-unavailable error gets a separate
+    // origin+credential+model hold so unrelated models remain eligible.
+    const throttleModel = throttleModelHint ?? (typeof prepared?.model === "string" ? prepared.model : requestModelFromBody(wireBody));
+    let throttleProbeToken: symbol | undefined;
     if (req.method !== "GET" && req.method !== "HEAD") {
-        const throttleReject = upstreamThrottleLocalReject(upstreamUrl, headers);
+        const throttleGate = upstreamThrottleGate(upstreamUrl, headers, Date.now(), throttleModel);
+        throttleProbeToken = throttleGate.probeToken;
+        const throttleReject = throttleGate.reject;
         if (throttleReject !== undefined) {
             log(throttleReject.status === 424 ? "warn" : "debug", `[${prepared?.session.id ?? "passthrough"}] [acp-proxy] 429-hold: answered locally with ${throttleReject.status} without egress (#4204)`);
             if (res.headersSent) emitStreamError(res, prepared?.protocol ?? "openai", throttleReject.message, undefined, opts.streamErrorShape);
@@ -848,7 +863,7 @@ async function forwardCaptured(
                 res.writeHead(throttleReject.status, throttleReject.retryAfterSec !== null
                     ? { "content-type": "application/json", "retry-after": String(throttleReject.retryAfterSec) }
                     : { "content-type": "application/json" });
-                res.end(JSON.stringify({ error: { type: "rate_limit_error", code: throttleReject.code, stage: "forward", message: throttleReject.message, retryable: throttleReject.status === 429 } }));
+                res.end(JSON.stringify({ error: { type: "rate_limit_error", code: throttleReject.code, stage: "forward", message: throttleReject.message, retryable: throttleReject.status === 429, ...(throttleReject.model === undefined ? {} : { scope: "model", model: throttleReject.model }) } }));
             }
             return;
         }
@@ -879,6 +894,7 @@ async function forwardCaptured(
     } catch (error) {
         const oversize = extractWsOversizeError(error);
         if (oversize === undefined) {
+            releaseUpstreamThrottleProbe(throttleProbeToken);
             recordUpstreamConnection(upstreamUrl, proxyUrl, error, skippedProxy);
             recordUpstreamAlert(upstreamUrl, error, proxyUrl !== undefined, skippedProxy);
             const failure = describeUpstreamFailure(error, upstreamUrl, proxyUrl, skippedProxy);
@@ -889,7 +905,10 @@ async function forwardCaptured(
             // [#1343] no response means the attached full text never reached the model —
             // drop-and-log it (a corrective note surfaces on the next qualifying request).
             if (prepared && prepared.attachedRetrievals && prepared.attachedRetrievals.length > 0) dropRetrievals(prepared.session, prepared.attachedRetrievals.map((i) => i.ref), "upstream network failure");
-            throw withUpstreamFailure(new Error(`upstream request failed: ${failure.message}`, { cause: error }), failure.detail);
+            // #2465/#5663: tag the classified transport envelope so the dispatch catch
+            // logs it as ONE line — failure.message already carries
+            // kind/code/errno/syscall/address/port/hint; the stack adds no signal.
+            throw withUpstreamFailure(Object.assign(new Error(`upstream request failed: ${failure.message}`, { cause: error }), { biliTransportFailure: true }), failure.detail);
         }
         // #3701: close 1009 with ZERO events received is a verdict on our frame SIZE, not
         // on endpoint health — the same gateway answers smaller frames fine. Deliberately
@@ -905,11 +924,22 @@ async function forwardCaptured(
         const budget = limitsWsOutboundBytes();
         const target = Math.min(sentBytes * 0.85, budget > 0 ? budget : Number.MAX_SAFE_INTEGER);
         if (prepared === null || prepared === undefined || prepared.sidePassthrough || prepared.protocol === undefined || typeof wireBody !== "string" || sentBytes <= 0 || !res.writable || res.writableEnded || res.destroyed) {
+            releaseUpstreamThrottleProbe(throttleProbeToken);
             throw new Error(wsOversizeDiagnosis(sentBytes, undefined, budget));
         }
         const shedSession = prepared.session;
-        const { body: shrunk, stats } = await shedWireImages(wireBody, prepared.protocol, target, { resolveRef: (mt, b64) => refForItemBytes(shedSession, mt, b64) });
-        if (!stats.changed || stats.finalBytes >= sentBytes) throw new Error(wsOversizeDiagnosis(sentBytes, stats, budget));
+        let shedResult: ShedWireImagesResult;
+        try {
+            shedResult = await shedWireImages(wireBody, prepared.protocol, target, { resolveRef: (mt, b64) => refForItemBytes(shedSession, mt, b64) });
+        } catch (error) {
+            releaseUpstreamThrottleProbe(throttleProbeToken);
+            throw error;
+        }
+        const { body: shrunk, stats } = shedResult;
+        if (!stats.changed || stats.finalBytes >= sentBytes) {
+            releaseUpstreamThrottleProbe(throttleProbeToken);
+            throw new Error(wsOversizeDiagnosis(sentBytes, stats, budget));
+        }
         log("info", `[${prepared.session.id}] [ws-byte-shed] upstream closed 1009 with zero events at ${formatMiB(sentBytes)} MiB — shed to ${formatMiB(stats.finalBytes)} MiB (archived=${stats.archived} downscaled=${stats.downscaled}), resending once within this request`);
         try {
             const shrunkWire = scrubLoneSurrogatesOnWire(shrunk);
@@ -946,6 +976,7 @@ async function forwardCaptured(
             }
         } catch (retryErr) {
             log("warn", `[${prepared?.session.id ?? "unknown"}] [ws-byte-shed] shrunken resend failed: ${formatUpstreamError(retryErr, upstreamUrl, proxyUrl, skippedProxy)}`);
+            releaseUpstreamThrottleProbe(throttleProbeToken);
             throw new Error(wsOversizeDiagnosis(sentBytes, stats, budget), { cause: retryErr });
         }
     }
@@ -1603,14 +1634,16 @@ async function forwardCaptured(
         if (bodyText.length > 600) snippet += " …";
         if (!snippet) snippet = "(no body)";
         loggerLog("warn", `[${errSid}] ← upstream ${upstream.status}${reqIdText}: ${snippet}`);
-        // #4204: feed the egress throttle governor with this send's FINAL verdict
-        // (one observation per request — in-request refolds/resends above all
-        // converge into this same response handling). A 429 arms/extends the
-        // hold; ANY other resolved status proves the endpoint is processing
-        // again and clears it.
+        // #4204: feed this send's FINAL verdict. A model-scoped KeyRing 429 is
+        // selected only by its structured code plus exact request-model match;
+        // keyring_all_limited and every ambiguous response remain account-wide.
         if (req.method !== "GET" && req.method !== "HEAD") {
-            if (upstream.status === 429) noteUpstreamThrottle429(upstreamUrl, headers, upstream.headers.get("retry-after"));
-            else noteUpstreamThrottleResolved(upstreamUrl, headers, upstream.status);
+            if (upstream.status === 429) {
+                const modelScope = keyringModel429Scope(upstream.status, throttleModel, errBody);
+                noteUpstreamThrottle429(upstreamUrl, headers, upstream.headers.get("retry-after"), Date.now(), modelScope, throttleProbeToken);
+            } else {
+                noteUpstreamThrottleResolved(upstreamUrl, headers, upstream.status, Date.now(), throttleModel, throttleProbeToken);
+            }
         }
         // #762: persist the exact forwarded body on 4xx (env-gated: BILI_DUMP_4XX=1).
         if (upstream.status >= 400 && upstream.status < 500) {
@@ -1655,11 +1688,9 @@ async function forwardCaptured(
         if (prepared !== null && prepared.responseExtraHeaders !== undefined) Object.assign(respHeaders, prepared.responseExtraHeaders);
         res.writeHead(upstream.status, respHeaders);
     }
-    // #4204: success-side counterpart of the non-2xx observation above — a
-    // resolved 2xx proves the endpoint is accepting sends again, so clear any
-    // hold on this origin+credential (counterpart needed because the non-ok
-    // branch returns early and never reaches this point).
-    if (req.method !== "GET" && req.method !== "HEAD") noteUpstreamThrottleResolved(upstreamUrl, headers, upstream.status);
+    // #4204: a resolved response preserves the existing account-hold recovery
+    // signal and clears only the matching model hold.
+    if (req.method !== "GET" && req.method !== "HEAD") noteUpstreamThrottleResolved(upstreamUrl, headers, upstream.status, Date.now(), throttleModel, throttleProbeToken);
     // #3376: idle prompt-cache keepalive — snapshot the EXACT accepted bytes
     // and arm the TTL-refresh timer. Pipeline-prepared requests only
     // (passthrough stays out of scope); internally gated to anthropic-wire
@@ -1791,6 +1822,7 @@ async function forwardCaptured(
                         makeContinuationRefetch({
                             protocol: "responses",
                             body,
+                            model: throttleModel,
                             upstreamUrl,
                             reqHeaders: buildForwardHeaders(headers), resign: applyResign,
                             proxyUrl,
@@ -1819,6 +1851,7 @@ async function forwardCaptured(
                         makeContinuationRefetch({
                             protocol: prepared.protocol,
                             body,
+                            model: throttleModel,
                             upstreamUrl,
                             reqHeaders: buildForwardHeaders(headers), resign: applyResign,
                             proxyUrl,
@@ -1952,6 +1985,7 @@ async function forwardCaptured(
                     makeContinuationRefetch({
                         protocol: "responses",
                         body,
+                        model: throttleModel,
                         upstreamUrl,
                         reqHeaders: buildForwardHeaders(headers), resign: applyResign,
                         proxyUrl,
@@ -1997,6 +2031,7 @@ async function forwardCaptured(
                     makeContinuationRefetch({
                         protocol: "responses",
                         body,
+                        model: throttleModel,
                         upstreamUrl,
                         reqHeaders: buildForwardHeaders(headers), resign: applyResign,
                         proxyUrl,
@@ -2021,6 +2056,7 @@ async function forwardCaptured(
                     makeContinuationRefetch({
                         protocol: p.protocol,
                         body,
+                        model: throttleModel,
                         wrapBody: v1Active ? v1Wrap : undefined,
                         upstreamUrl,
                         reqHeaders: buildForwardHeaders(headers), resign: applyResign,
@@ -2204,7 +2240,7 @@ async function forwardCaptured(
                 // #3280: egress goes out enveloped via wireTransform, so every
                 // round-2+ response comes back enveloped too — unwrap at the loop's
                 // single adoption point or parseStream sees no candidates.
-                { url: upstreamUrl, headers: reqHeaders, wireTransform, resign: applyResign, responseStreamTransform: v1Active ? v1UnwrapStream : undefined },
+                { url: upstreamUrl, headers: reqHeaders, model: throttleModel, wireTransform, resign: applyResign, responseStreamTransform: v1Active ? v1UnwrapStream : undefined },
                 adapter,
                 systemPrompt,
                 clientAbort.signal,

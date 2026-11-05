@@ -11,6 +11,7 @@ import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
+import { activeThrottleHolds, _resetUpstreamThrottleForTest } from "../src/upstream-throttle.ts";
 
 // Render-tag pieces are assembled from hex escapes so no literal tag sequence
 // appears in this file's source.
@@ -23,6 +24,7 @@ const CLOSE_MARK = `${LT}/acp${GT}`;
 interface Harness {
     proxyPort: number;
     upstreamPort: number;
+    hits(): number;
     close(): Promise<void>;
 }
 
@@ -34,12 +36,18 @@ function openaiChunk(data: unknown): string {
     return `data: ${JSON.stringify(data)}\n\n`;
 }
 
-async function startHarness(compress: { injectTool: boolean; injectNudge: boolean }, scripts: string[][], json: boolean): Promise<Harness> {
+async function startHarness(
+    compress: { injectTool: boolean; injectNudge: boolean },
+    scripts: string[][],
+    json: boolean,
+    statuses: number[] = [],
+): Promise<Harness> {
     let call = 0;
     const upstream = http.createServer((req, res) => {
         req.on("data", () => {});
         req.on("end", () => {
-            res.writeHead(200, { "content-type": json ? "application/json" : "text/event-stream" });
+            const status = statuses[call] ?? 200;
+            res.writeHead(status, { "content-type": status === 429 ? "application/json" : json ? "application/json" : "text/event-stream" });
             const script = scripts[Math.min(call, scripts.length - 1)]!;
             call += 1;
             for (const line of script) res.write(line);
@@ -80,6 +88,7 @@ async function startHarness(compress: { injectTool: boolean; injectNudge: boolea
         return {
             proxyPort,
             upstreamPort,
+            hits: () => call,
             close: async () => {
                 proxy.close();
                 proxy.closeIdleConnections?.();
@@ -424,5 +433,135 @@ test("#475 G3: fake-completion buffering + streaming request answered with JSON 
     } finally {
         delete process.env.BILI_FAKE_COMPLETION_RETRIES;
         await h.close();
+    }
+});
+test("#4204 side-lane continuation 429 remains scoped to its request model", async () => {
+    const previousThrottle = {
+        BILI_THROTTLE_429: process.env.BILI_THROTTLE_429,
+        BILI_THROTTLE_429_MAX_CONSECUTIVE: process.env.BILI_THROTTLE_429_MAX_CONSECUTIVE,
+        BILI_THROTTLE_429_BASE_DELAY_MS: process.env.BILI_THROTTLE_429_BASE_DELAY_MS,
+        BILI_THROTTLE_429_MAX_DELAY_MS: process.env.BILI_THROTTLE_429_MAX_DELAY_MS,
+    };
+    process.env.BILI_THROTTLE_429 = "1";
+    process.env.BILI_THROTTLE_429_MAX_CONSECUTIVE = "5";
+    process.env.BILI_THROTTLE_429_BASE_DELAY_MS = "1000";
+    process.env.BILI_THROTTLE_429_MAX_DELAY_MS = "8000";
+    _resetUpstreamThrottleForTest();
+
+    const modelError = JSON.stringify({
+        error: { code: "keyring_model_temporarily_unavailable", model: "model-a", message: "model unavailable" },
+    });
+    const modelATagOnlyTurn = [
+        openaiChunk({ id: "chatcmpl_side_a", object: "chat.completion.chunk", model: "model-a", choices: [{ index: 0, delta: { role: "assistant" } }] }),
+        openaiChunk({ id: "chatcmpl_side_a", object: "chat.completion.chunk", model: "model-a", choices: [{ index: 0, delta: { content: TAG("m00009") } }] }),
+        openaiChunk({ id: "chatcmpl_side_a", object: "chat.completion.chunk", model: "model-a", choices: [{ index: 0, delta: {}, finish_reason: "stop" }] }),
+        "data: [DONE]\n\n",
+    ];
+    const healthyModelB = [
+        openaiChunk({ id: "chatcmpl_ok", object: "chat.completion.chunk", model: "model-b", choices: [{ index: 0, delta: { role: "assistant", content: "ok" } }] }),
+        openaiChunk({ id: "chatcmpl_ok", object: "chat.completion.chunk", model: "model-b", choices: [{ index: 0, delta: {}, finish_reason: "stop" }] }),
+        "data: [DONE]\n\n",
+    ];
+    const h = await startHarness(
+        { injectTool: false, injectNudge: false },
+        [modelATagOnlyTurn, [modelError], healthyModelB],
+        false,
+        [200, 429, 200],
+    );
+    try {
+        const side = await fetch(`http://127.0.0.1:${h.proxyPort}/bili/http://127.0.0.1:${h.upstreamPort}/v1/chat/completions`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-acp-session": "side-throttle-model", authorization: "Bearer same-key" },
+            body: JSON.stringify({ model: "model-a", max_tokens: 100, stream: true, messages: [{ role: "user", content: "title?" }] }),
+        });
+        assert.equal(side.status, 200);
+        await side.text();
+        assert.equal(h.hits(), 2, "the empty side turn performs exactly one continuation refetch");
+        assert.equal(activeThrottleHolds().length, 1);
+        assert.equal(activeThrottleHolds()[0].model, "model-a", "the continuation's exact KeyRing marker scopes the hold");
+
+        const otherModel = await fetch(`http://127.0.0.1:${h.proxyPort}/bili/http://127.0.0.1:${h.upstreamPort}/v1/chat/completions`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-acp-session": "side-throttle-other", authorization: "Bearer same-key" },
+            body: JSON.stringify({ model: "model-b", max_tokens: 1024, stream: true, messages: [{ role: "user", content: "answer?" }] }),
+        });
+        assert.equal(otherModel.status, 200, "the side retry must not widen its model-local hold to the shared credential");
+        await otherModel.text();
+        assert.equal(h.hits(), 3, "model B reaches the upstream instead of being locally blocked");
+        assert.equal(activeThrottleHolds().length, 1);
+        assert.equal(activeThrottleHolds()[0].model, "model-a", "model B success does not clear model A's hold");
+    } finally {
+        _resetUpstreamThrottleForTest();
+        await h.close();
+        for (const [key, value] of Object.entries(previousThrottle)) {
+            if (value === undefined) delete process.env[key];
+            else process.env[key] = value;
+        }
+    }
+});
+
+test("#4204 Google side-lane stream keeps its path model through continuation throttling", async () => {
+    const previousThrottle = {
+        BILI_THROTTLE_429: process.env.BILI_THROTTLE_429,
+        BILI_THROTTLE_429_MAX_CONSECUTIVE: process.env.BILI_THROTTLE_429_MAX_CONSECUTIVE,
+        BILI_THROTTLE_429_BASE_DELAY_MS: process.env.BILI_THROTTLE_429_BASE_DELAY_MS,
+        BILI_THROTTLE_429_MAX_DELAY_MS: process.env.BILI_THROTTLE_429_MAX_DELAY_MS,
+    };
+    process.env.BILI_THROTTLE_429 = "1";
+    process.env.BILI_THROTTLE_429_MAX_CONSECUTIVE = "5";
+    process.env.BILI_THROTTLE_429_BASE_DELAY_MS = "1000";
+    process.env.BILI_THROTTLE_429_MAX_DELAY_MS = "8000";
+    _resetUpstreamThrottleForTest();
+    const modelError = JSON.stringify({
+        error: { code: "keyring_model_temporarily_unavailable", model: "path-side-a", message: "model unavailable" },
+    });
+    const googleTagOnlyTurn = [
+        `data: ${JSON.stringify({
+            modelVersion: "path-side-a",
+            candidates: [{ index: 0, content: { role: "model", parts: [{ text: TAG("m00009") }] }, finishReason: "STOP" }],
+        })}\n\n`,
+    ];
+    const googleHealthyTurn = [
+        `data: ${JSON.stringify({
+            modelVersion: "path-side-b",
+            candidates: [{ index: 0, content: { role: "model", parts: [{ text: "ok" }] }, finishReason: "STOP" }],
+        })}\n\n`,
+    ];
+    const h = await startHarness(
+        { injectTool: false, injectNudge: false },
+        [googleTagOnlyTurn, [modelError], googleHealthyTurn],
+        false,
+        [200, 429, 200],
+    );
+    try {
+        const first = await fetch(`http://127.0.0.1:${h.proxyPort}/bili/http://127.0.0.1:${h.upstreamPort}/v1beta/models/path-side-a:streamGenerateContent?alt=sse`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-acp-session": "google-side-a", authorization: "Bearer google-side-key" },
+            body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: "title?" }] }], generationConfig: { maxOutputTokens: 64 } }),
+        });
+        assert.equal(first.status, 200);
+        const firstText = await first.text();
+        assert.equal(firstText.includes(OPEN_MARK), false, "path-streamed side response still takes the render-tag strip pipe");
+        assert.equal(h.hits(), 2, "the tag-only side stream issues one continuation refetch");
+        assert.equal(activeThrottleHolds().length, 1);
+        assert.equal(activeThrottleHolds()[0].model, "path-side-a", "the continuation 429 uses the Gemini URL model");
+
+        const second = await fetch(`http://127.0.0.1:${h.proxyPort}/bili/http://127.0.0.1:${h.upstreamPort}/v1beta/models/path-side-b:streamGenerateContent?alt=sse`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-acp-session": "google-side-b", authorization: "Bearer google-side-key" },
+            body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: "answer?" }] }], generationConfig: { maxOutputTokens: 64 } }),
+        });
+        assert.equal(second.status, 200, "the model-A continuation hold does not block another model on the same credential");
+        await second.text();
+        assert.equal(h.hits(), 3);
+        assert.equal(activeThrottleHolds().length, 1);
+        assert.equal(activeThrottleHolds()[0].model, "path-side-a");
+    } finally {
+        _resetUpstreamThrottleForTest();
+        await h.close();
+        for (const [key, value] of Object.entries(previousThrottle)) {
+            if (value === undefined) delete process.env[key];
+            else process.env[key] = value;
+        }
     }
 });

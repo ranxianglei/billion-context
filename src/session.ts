@@ -12,6 +12,7 @@ import type { WireProtocol } from "./util.js";
 import type { InboundSlot, SeamSlot } from "./cache-ledger.js";
 import { isResponsesTurnSeparatorId } from "./turn-separator.js";
 import type { FoldReconcileResult } from "./fold-reconcile.js";
+import type { UnpromptedGate } from "./unprompted-gate.js";
 
 export type BlockView = { text: string; count: number };
 
@@ -336,6 +337,12 @@ export type Session = {
          *  In-memory only: the abort→resume causality spans one process
          *  lifetime, and a restart replants nothing. */
         abortReanchor?: { anchor: number; at: number };
+        /** #5683: the conversation's latest model-round compression-prompt facts
+         *  for the unprompted/out-of-bounds gates (src/unprompted-gate.ts).
+         *  Re-stamped on every prepare; in-memory only — a restart reads the
+         *  all-off default until the first round re-stamps, which is safe: no
+         *  tool call can reach applyRanges before its own round's prepare. */
+        unpromptedGate?: UnpromptedGate;
     };
     id: string;
     /** Identity / descriptive metadata. Populated on first request. */
