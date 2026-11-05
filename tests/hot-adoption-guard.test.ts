@@ -339,7 +339,13 @@ interface GuardHarness {
     stop: () => Promise<void>;
 }
 
-async function bootGuardHarness(): Promise<GuardHarness> {
+// `mode` picks the storage substrate: a cold-adopted non-fork session serves
+//  its snapshot ONLY through the unified raw-tail reconstruction (#5140) —
+//  legacy mode fail-closes with 409 by design, so the disk-adoption subtest
+//  boots "shadow"; the resident-session subtests stay on the legacy default.
+async function bootGuardHarness(mode: "shadow" | "legacy" = "legacy"): Promise<GuardHarness> {
+    const prevMode = process.env.BILI_STORAGE_UNIFIED;
+    process.env.BILI_STORAGE_UNIFIED = mode;
     const dir = mkdtempSync(join(tmpdir(), "hot-adoption-http-"));
     for (const key of ["XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME"]) process.env[key] = dir;
     _resetSessionsForTest();
@@ -365,7 +371,7 @@ async function bootGuardHarness(): Promise<GuardHarness> {
         upstreamUrl,
         storeDir,
         markerFile: (instanceId) => join(dir, "billion-context", "writers", `${instanceId}.json`),
-        stop: async () => { getStore().closeQuietly(); await closeServers([proxy, upstream], "hot-adoption-guard harness"); },
+        stop: async () => { getStore().closeQuietly(); await closeServers([proxy, upstream], "hot-adoption-guard harness"); if (prevMode === undefined) delete process.env.BILI_STORAGE_UNIFIED; else process.env.BILI_STORAGE_UNIFIED = prevMode; },
     };
 }
 
@@ -417,7 +423,7 @@ function forkRequest(snapshot: { parentRevision: string; orderedMessages: unknow
 }
 
 test("#394 plugin plane: disk adoption of a hot session is refused (snapshot 404), uncontested adopts", { timeout: 60_000 }, async () => {
-    const h = await bootGuardHarness();
+    const h = await bootGuardHarness("shadow");
     try {
         await pluginTurn(h, "guard-disk", [{ role: "user", content: "persist me to disk" }]);
         const resident = peekSession("guard-disk");
