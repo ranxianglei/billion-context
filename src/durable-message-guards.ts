@@ -287,6 +287,32 @@ export function dshAgentRelayPath(msg: CoreMessage): string | undefined {
         : undefined;
 }
 
+/** dsh request-image handle annotation (#5142 residual, session evidence
+ *  2026-11-04): the user-role text cell dsh emits beside a pasted image's
+ *  request copy — "Image NAME (sha256:DIGEST); request preview WxHpx."
+ *  plus the normalized-copy access note (requestImageHandleText in
+ *  @deepseek-ai/dsh-llm/lib/types/content.js).
+ *  It rides ONLY the turn its attachment is rendered for; from the next turn
+ *  the same wire slot carries the offload placeholder instead ("[image omitted
+ *  to fit request image limits; …", offloadedImageText), so the handle retires
+ *  one-shot exactly like the ptc paste template above. Session evidence: in a
+ *  cross-provider replay drop this handle was the SINGLE non-reasoning id left
+ *  in an 111-id missing set, and its absence from the expected record kept the
+ *  #2193 reasoning-only verdict from firing for the whole episode — one
+ *  unaccounted text id turned a tolerated switch into a per-turn drift warn.
+ *  Single-marker discipline like every other classifier here: the match is on
+ *  the `; request preview ` separator alone. The offload placeholder opens
+ *  `[image omitted to fit request image limits;` and never carries that
+ *  separator, so a placeholder can never be misread as a live handle (that
+ *  pairing belongs to C3's structural slot evidence). A literal user echo is
+ *  benign in both directions, same argument as dshPastedImagePath. #2766:
+ *  assistant-role messages are never carriers. */
+export function dshImageHandlePath(msg: CoreMessage): string | undefined {
+    return msg.role !== "assistant" && msg.contentType === "text" && typeof msg.text === "string" && msg.text.includes("; request preview ")
+        ? "oneshot/image-handle"
+        : undefined;
+}
+
 /** Case-insensitive ASCII prefix check over the first needle.length chars —
  *  mirrors the asciiCI convention of src/server.ts (kept local so this
  *  module stays dependency-free). */
@@ -302,8 +328,8 @@ function startsWithAsciiCI(hay: string, needle: string): boolean {
     return true;
 }
 
-/** dsh lane classifier: any of the ten evidence-backed identities → its
- *  canonical path (four durable carriers + six foldable one-shot injections).
+/** dsh lane classifier: any of the eleven evidence-backed identities → its
+ *  canonical path (four durable carriers + seven foldable one-shot injections).
  *  Every classified message loses Rule-3 last-user anchor eligibility (#5109/
  *  #5173); only `durable/*` paths are actually pinned by the default policy —
  *  the oneshot/ families ride here purely so an injection can never displace
@@ -319,7 +345,8 @@ function dshDurableToolPath(msg: CoreMessage): string | undefined {
         dshToolJobNoticePath(msg) ??
         dshMnemonPath(msg) ??
         dshSubagentSettledPath(msg) ??
-        dshAgentRelayPath(msg)
+        dshAgentRelayPath(msg) ??
+        dshImageHandlePath(msg)
     );
 }
 
@@ -376,12 +403,13 @@ export const oneShotCarrierPaths: Record<string, DurableMessageClassifier> = {
         dshToolJobNoticePath(msg) ??
         dshMnemonPath(msg) ??
         dshSubagentSettledPath(msg) ??
-        dshAgentRelayPath(msg),
+        dshAgentRelayPath(msg) ??
+        dshImageHandlePath(msg),
 };
 
 /** #5142: raw-content pre-filter markers for the stored-row backfill — the
- *  exact marker strings of the ten dsh classifiers above (eleven markers: the
- *  mnemon family contributes two), so a unified-store
+ *  exact marker strings of the eleven dsh classifiers above (twelve markers:
+ *  the mnemon family contributes two), so a unified-store
  *  row can be screened with cheap substring checks BEFORE JSON.parse (rows
  *  may carry megabytes of base64 media). Lockstep with the classifiers is
  *  enforced in tests/issue5142-expected-rebase.test.ts. */
@@ -397,4 +425,5 @@ export const dshCarrierRawMarkers: readonly string[] = [
     "[MNEMON RUNTIME MEMORY",
     "Background subagent ",
     " sent a message: ",
+    "; request preview ",
 ];

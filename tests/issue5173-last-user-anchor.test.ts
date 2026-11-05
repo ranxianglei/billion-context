@@ -56,7 +56,7 @@ describe("#5173 new dsh injection classifiers", () => {
 });
 
 describe("#5173 registry wiring", () => {
-    test("all ten dsh families resolve in BOTH the slot-exclusion and drift-accounting registries", () => {
+    test("all eleven dsh families resolve in BOTH the slot-exclusion and drift-accounting registries", () => {
         const samples: Array<[string, string]> = [
             ["\x3csystem-reminder\x3e \x3cavailable_skills\x3e updated catalog \x3c/available_skills\x3e", "durable/skill-catalog"],
             ["Instructions from: /home/x/.dsh/AGENTS.md", "durable/agents-md"],
@@ -68,6 +68,7 @@ describe("#5173 registry wiring", () => {
             ["[MNEMON] recall note", "oneshot/mnemon"],
             ["Background subagent session-x finished and will do no further work unless you send it more.", "oneshot/subagent-settled"],
             ["Agent session-y sent a message: over there", "oneshot/agent-relay"],
+            ['Image "x.png" (sha256:2e896b95dec003df); request preview 1600x900px. Normalized copy (read-only; may be resized or re-encoded): "normalized/x.png" (1600x900px, image/png). Source dimensions, format, and byte size may differ.', "oneshot/image-handle"],
         ];
         for (const [text, expected] of samples) {
             const msg = mk("w", "user", text);
@@ -95,7 +96,8 @@ describe("#5173 end-to-end anchor geometry", () => {
             mk("p8", "user", `Agent session-c3d4 sent a message: draft is ready ${PAD}`),
             mk("p9", "user", `\x3cpath\x3ex.png\x3c/path\x3e \x3ctype\x3eimage\x3c/type\x3e \x3ccontent\x3epng bytes\x3c/content\x3e ${PAD}`),
             mk("p10", "user", `background job bash-ef01 (bash: "echo ok") finished [status: completed, exit code: 0]. Read its output with job_output. ${PAD}`),
-            mk("p11", "assistant", `working on the migration ${PAD}`),
+            mk("p11", "user", `Image "x.png" (sha256:2e896b95dec003df); request preview 1600x900px. Normalized copy (read-only; may be resized or re-encoded): "normalized/x.png" (1600x900px, image/png). ${PAD}`),
+            mk("p12", "assistant", `working on the migration ${PAD}`),
         ];
         const core = createCore();
         const state = createInitialState();
