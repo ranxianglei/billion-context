@@ -1,5 +1,38 @@
 import type { CoreMessage } from "./types.js";
 
+/** Per-toolCallId [lowest, highest] position over the WHOLE array (#5751).
+ *  One O(n) pass: a legal history can interleave arbitrarily many messages
+ *  between a call and its result (parallel tool bursts, host-injected
+ *  system/attachment messages), so pairing is id-exact, never
+ *  distance-scanned. Positions are indexed for EVERY message carrying the id
+ *  — including compress halves (#4348: aged compress results do seed, they
+ *  carry no toolName; the compress half of an aged pair must widen INTO the
+ *  range) — and a callId duplicated across messages (host re-echoes a result
+ *  on retry) widens to its extremes so every message claiming the id folds on
+ *  the same side of the boundary.
+ *
+ *  Cost contract: callers screening many units against one immutable array
+ *  must build ONCE per pass and share via
+ *  ProjectionShared.toolPairExtremes — rebuilding per unit is the #5337
+ *  quadratic class (U units x O(n)). */
+export function buildToolPairExtremes(
+  messages: CoreMessage[],
+): Map<string, [number, number]> {
+  const extremes = new Map<string, [number, number]>();
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i];
+    if (!msg || !msg.toolCallId) continue;
+    const cur = extremes.get(msg.toolCallId);
+    if (cur === undefined) {
+      extremes.set(msg.toolCallId, [i, i]);
+    } else {
+      if (i < cur[0]) cur[0] = i;
+      if (i > cur[1]) cur[1] = i;
+    }
+  }
+  return extremes;
+}
+
 /**
  * Adjust compression range boundaries to include tool-call/result pairs.
  *
@@ -9,15 +42,9 @@ import type { CoreMessage } from "./types.js";
  * the requested range. Pull the orphan half INTO the range so the pair is
  * compressed together — zero information loss.
  *
- * Pairing is id-exact, never distance-scanned (#5751): each toolCallId's
- * lowest/highest position is indexed over the WHOLE array once, because a
- * legal history can interleave arbitrarily many messages between a call and
- * its result (parallel tool bursts, host-injected system/attachment
- * messages). The previous capped scan (maxScan=20, stop-on-gap, break-on-
- * empty) left such pairs straddling the fold — the turn-integrity gate then
- * withdrew the pair from every candidate range, so in tool-dense regions no
- * legal range remained ("folding stuck", #5746), or the split reached the
- * wire as a persistent upstream 400.
+ * Pairing resolves through {@link buildToolPairExtremes}; when screening many
+ * units against one immutable array, pass the pre-built map (per-unit rebuild
+ * would pay O(n) each — the #5337 quadratic class).
  *
  * Only MESSAGE-boundary ranges are adjusted. Block-boundary ranges (bN) are
  * left untouched to preserve tier-detection correctness.
@@ -28,29 +55,9 @@ export function adjustBoundariesForToolPairs(
   startIndex: number,
   endIndex: number,
   messages: CoreMessage[],
+  extremes?: Map<string, [number, number]>,
 ): { startIndex: number; endIndex: number } {
-  // Skip compress as a SEED — it's force-protected and always survives
-  // pruning (#4348: aged compress results do seed, they carry no toolName).
-  // Positions are still indexed for EVERY message carrying the id: the
-  // compress half of an aged pair must widen INTO the range (#4348 lace).
-  // A callId duplicated across messages (host re-echoes a result on retry)
-  // widens to its extremes so every message claiming the id folds on the
-  // same side of the boundary.
-  const loById = new Map<string, number>();
-  const hiById = new Map<string, number>();
-  for (let i = 0; i < messages.length; i++) {
-    const msg = messages[i];
-    if (!msg || !msg.toolCallId) continue;
-    const lo = loById.get(msg.toolCallId);
-    const hi = hiById.get(msg.toolCallId);
-    if (lo === undefined || hi === undefined) {
-      loById.set(msg.toolCallId, i);
-      hiById.set(msg.toolCallId, i);
-    } else {
-      if (i < lo) loById.set(msg.toolCallId, i);
-      if (i > hi) hiById.set(msg.toolCallId, i);
-    }
-  }
+  const pairExtremes = extremes ?? buildToolPairExtremes(messages);
 
   // Widen to a fixed point: pulling a mate in can expose callIds whose own
   // mates sit further out (chains of interleaved pairs). Iterations are
@@ -68,14 +75,13 @@ export function adjustBoundariesForToolPairs(
       if (settled.has(msg.toolCallId)) continue;
       if (msg.toolName === "compress") continue;
       settled.add(msg.toolCallId);
-      const lo = loById.get(msg.toolCallId)!;
-      const hi = hiById.get(msg.toolCallId)!;
-      if (lo < newStartIndex) {
-        newStartIndex = lo;
+      const ext = pairExtremes.get(msg.toolCallId)!;
+      if (ext[0] < newStartIndex) {
+        newStartIndex = ext[0];
         changed = true;
       }
-      if (hi > newEndIndex) {
-        newEndIndex = hi;
+      if (ext[1] > newEndIndex) {
+        newEndIndex = ext[1];
         changed = true;
       }
     }
