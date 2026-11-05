@@ -102,10 +102,7 @@ describe("applyCompression with distant pairs (#5751 / #5746)", () => {
 
   it("a straddling range folds the WHOLE pair together (>20 distance) and rebuilds clean", () => {
     const core = createCore();
-    const messages: CoreMessage[] = [
-      textMsg("m0"),
-      toolCall("m1", "c1"),
-    ];
+    const messages: CoreMessage[] = [textMsg("m0"), toolCall("m1", "c1")];
     for (let i = 2; i < 30; i++) messages.push(textMsg(`m${i}`));
     messages.push(toolResult("m30", "c1"), textMsg("m31"));
 
@@ -126,7 +123,8 @@ describe("applyCompression with distant pairs (#5751 / #5746)", () => {
         {
           startRef: "m00001",
           endRef: "m00002",
-          summary: "Fold the first exchange including its late-arriving result.",
+          summary:
+            "Fold the first exchange including its late-arriving result.",
         },
       ],
       messages,
@@ -136,10 +134,7 @@ describe("applyCompression with distant pairs (#5751 / #5746)", () => {
     assert.equal(r.result.blocksCreated, 1);
     const block = r.state.blocks.find((b) => b.active);
     assert.ok(block);
-    assert.ok(
-      block!.effectiveMessageIds.includes("m1"),
-      "tool-call folds",
-    );
+    assert.ok(block!.effectiveMessageIds.includes("m1"), "tool-call folds");
     assert.ok(
       block!.effectiveMessageIds.includes("m30"),
       "distant tool-result folds together with its call",
@@ -180,7 +175,8 @@ describe("applyCompression with distant pairs (#5751 / #5746)", () => {
         {
           startRef: "m00001",
           endRef: "m00025",
-          summary: "First exchanges of the tool-dense region: the opening reads, their late results, and filler turns.",
+          summary:
+            "First exchanges of the tool-dense region: the opening reads, their late results, and filler turns.",
         },
       ],
       messages,
@@ -232,7 +228,8 @@ describe("applyCompression with distant pairs (#5751 / #5746)", () => {
         {
           startRef: "m00001",
           endRef: "m00003",
-          summary: "First block covering a complete exchange: the call, its result, and filler.",
+          summary:
+            "First block covering a complete exchange: the call, its result, and filler.",
         },
       ],
       messages,
@@ -246,7 +243,8 @@ describe("applyCompression with distant pairs (#5751 / #5746)", () => {
         {
           startRef: "b1",
           endRef: "b1",
-          summary: "Distill the first block into its tier-2 essence, keeping the exchange facts.",
+          summary:
+            "Distill the first block into its tier-2 essence, keeping the exchange facts.",
         },
       ],
       messages,
