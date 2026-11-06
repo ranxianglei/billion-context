@@ -183,7 +183,7 @@ describe("#5789 tier-2 merge recovery ladder", () => {
     assert.deepEqual(lostCoverage(before, res.state), [], "state must stay untouched");
   });
 
-  it("conflict owned by a SURVIVING higher-tier block: refuses naming owner and partner", () => {
+  it("conflict owned by a SURVIVING higher-tier block: inherited with warning, clean blocks still distill", () => {
     const core = createCore();
     const messages: CoreMessage[] = [
       { id: "u0", role: "user", contentType: "text", text: LONG },
