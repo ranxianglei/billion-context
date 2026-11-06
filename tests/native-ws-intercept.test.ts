@@ -238,6 +238,16 @@ test("takeoverGate refusal: unattributable connection goes direct", async () => 
         installNativeWebSocketIntercept(state);
         const ws = new (WsCtor<FakeWs>())(UPSTREAM_WS, {});
         assert.equal(ws.url, UPSTREAM_WS);
+        // #5838: an armed gate now settles INSIDE the deferred window (a Promise
+        // verdict must be awaited — the old sync === false check missed it), so
+        // the evidence lands one microtask later; the outcome is unchanged. The
+        // caller's reference stays the shell (delegation only) — assert on the
+        // real connection instead.
+        await tick();
+        await tick();
+        assert.equal(FakeWs.instances.length, 1);
+        assert.equal(FakeWs.instances[0].url, UPSTREAM_WS, "direct — never rewritten");
+        assert.equal(ws.url, UPSTREAM_WS);
         assert.deepEqual(dispatched, [["https://chatgpt.com/backend-api/codex/responses", "refused"]]);
     });
 });
@@ -468,6 +478,211 @@ test("adoption: non-constructor replacements are refused, previous constructor k
         const ws = new (kept as new (...args: unknown[]) => FakeWs)(UPSTREAM_WS, {});
         assert.equal(ws.url, REWRITTEN);
     });
+});
+
+// ——— Per-dispatch preparation (hook-armed lanes, #5838) ————————————————
+
+const DSH_STAMPS = { "x-bili-plugin": "dsh", "x-bili-plugin-conversation": "conv-dsh" };
+
+function dshState(extra?: Partial<NativeInterceptState>): NativeInterceptState {
+    return {
+        origin: ORIGIN,
+        ready: Promise.resolve(ORIGIN),
+        toolsReady: Promise.resolve(undefined),
+        takeoverGate: async () => true,
+        headersFor: () => ({ ...DSH_STAMPS }),
+        ...extra,
+    };
+}
+
+test("#5838: dsh-shaped state routes through the window and stamps ride the upgrade init", async () => {
+    await withPatchedGlobal(async () => {
+        const dispatched: Array<[string, string]> = [];
+        installNativeWebSocketIntercept(dshState({ onDispatch: (url, action) => dispatched.push([url, action]) }));
+        const top = (globalThis as GlobalRecord).WebSocket as unknown as new (...args: unknown[]) => { url: string };
+        const ws = new top(UPSTREAM_WS);
+        assert.ok(!(ws instanceof FakeWs), "shell stands in while the hooks settle");
+        assert.equal(ws.url, UPSTREAM_WS);
+        await tick();
+        await tick();
+        await tick();
+        const [real] = FakeWs.instances;
+        assert.equal(real.url, REWRITTEN);
+        assert.deepEqual(real.ctorArgs[1], { headers: DSH_STAMPS });
+        assert.deepEqual(dispatched, [[REWRITTEN, "rewrite"]]);
+    });
+});
+
+test("#5838: stamps merge onto host headers, win on conflict, never mutate the host object", async () => {
+    await withPatchedGlobal(async () => {
+        installNativeWebSocketIntercept(dshState());
+        const init = { headers: { "session-id": "sess-1", "x-bili-plugin-conversation": "stale" } };
+        new (WsCtor<FakeWs>())(UPSTREAM_WS, init);
+        await tick();
+        await tick();
+        await tick();
+        const [real] = FakeWs.instances;
+        assert.notEqual(real.ctorArgs[1], init, "a rebuilt init object is passed, not the host's");
+        assert.deepEqual(init.headers, { "session-id": "sess-1", "x-bili-plugin-conversation": "stale" }, "host object untouched");
+        assert.deepEqual((real.ctorArgs[1] as { headers: Record<string, string> }).headers, { "session-id": "sess-1", ...DSH_STAMPS }, "fresh stamp wins over the stale one");
+    });
+});
+
+test("#5838: subprotocol string form is wrapped into the object form undici accepts for both fields", async () => {
+    await withPatchedGlobal(async () => {
+        installNativeWebSocketIntercept(dshState());
+        new (WsCtor<FakeWs>())(UPSTREAM_WS, "proto-a");
+        await tick();
+        await tick();
+        await tick();
+        const [real] = FakeWs.instances;
+        assert.deepEqual(real.ctorArgs[1], { protocols: "proto-a", headers: DSH_STAMPS });
+    });
+});
+
+test("#5838: subprotocol array form keeps its entries alongside the stamps", async () => {
+    await withPatchedGlobal(async () => {
+        installNativeWebSocketIntercept(dshState());
+        const protos = ["proto-a", "proto-b"];
+        new (WsCtor<FakeWs>())(UPSTREAM_WS, protos);
+        await tick();
+        await tick();
+        await tick();
+        const [real] = FakeWs.instances;
+        assert.deepEqual(real.ctorArgs[1], { protocols: protos, headers: DSH_STAMPS });
+    });
+});
+
+test("#5838: an async gate refusal settles direct inside the window (the old sync check missed Promise verdicts)", async () => {
+    await withPatchedGlobal(async () => {
+        const dispatched: Array<[string, string]> = [];
+        installNativeWebSocketIntercept(dshState({ takeoverGate: async () => false, onDispatch: (url, action) => dispatched.push([url, action]) }));
+        const ws = new (WsCtor<FakeWs>())(UPSTREAM_WS, {});
+        await tick();
+        await tick();
+        await tick();
+        assert.equal(FakeWs.instances.length, 1);
+        assert.equal(FakeWs.instances[0].url, UPSTREAM_WS, "direct — never rewritten");
+        assert.equal(ws.url, UPSTREAM_WS);
+        assert.deepEqual(dispatched, [["https://chatgpt.com/backend-api/codex/responses", "refused"]]);
+    });
+});
+
+test("#5838: a throwing gate degrades DIRECT instead of hanging the connection", async () => {
+    await withPatchedGlobal(async () => {
+        const dispatched: Array<[string, string]> = [];
+        installNativeWebSocketIntercept(dshState({ takeoverGate: () => { throw new Error("boom"); }, onDispatch: (url, action) => dispatched.push([url, action]) }));
+        const ws = new (WsCtor<FakeWs>())(UPSTREAM_WS, {});
+        await tick();
+        await tick();
+        await tick();
+        assert.equal(FakeWs.instances.length, 1);
+        assert.equal(FakeWs.instances[0].url, UPSTREAM_WS, "direct — never rewritten");
+        assert.equal(ws.url, UPSTREAM_WS);
+        assert.deepEqual(dispatched, [["https://chatgpt.com/backend-api/codex/responses", "refused"]]);
+    });
+});
+
+test("#5838: toolsReady timeout still routes, just without stamps (fetch-lane parity)", async () => {
+    await withPatchedGlobal(async () => {
+        let stamped = false;
+        const state = dshState({
+            toolsReady: new Promise(() => {}),
+            readyTimeoutMs: 50,
+            headersFor: () => (stamped ? { ...DSH_STAMPS } : undefined),
+        });
+        installNativeWebSocketIntercept(state);
+        const init = {};
+        new (WsCtor<FakeWs>())(UPSTREAM_WS, init);
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        await tick();
+        const [real] = FakeWs.instances;
+        assert.equal(real.url, REWRITTEN, "routed even though registration never finished");
+        assert.equal(real.ctorArgs[1], init, "no stamps → host init identity preserved");
+    });
+});
+
+test("#5838: hook order mirrors the fetch lane and beforeSend sees the same init reference", async () => {
+    await withPatchedGlobal(async () => {
+        const order: string[] = [];
+        let resolveTools!: () => void;
+        const toolsReady = new Promise<void>((resolve) => { resolveTools = resolve; });
+        const init = { headers: { "session-id": "sess-order" } };
+        installNativeWebSocketIntercept({
+            origin: ORIGIN,
+            ready: Promise.resolve(ORIGIN),
+            takeoverGate: async () => { order.push("gate"); return true; },
+            toolsReady,
+            beforeSend: async (_url, seen) => { order.push(`beforeSend:${Object.is(seen, init)}`); },
+            headersFor: () => { order.push("headers"); return { ...DSH_STAMPS }; },
+        });
+        new (WsCtor<FakeWs>())(UPSTREAM_WS, init);
+        await tick();
+        await tick();
+        assert.deepEqual(order, ["gate"], "nothing runs before the verdict");
+        resolveTools();
+        await tick();
+        await tick();
+        await tick();
+        assert.deepEqual(order, ["gate", "beforeSend:true", "headers"]);
+    });
+});
+
+test("#5838: non-model sockets stay verbatim even when every hook is armed", async () => {
+    await withPatchedGlobal(async () => {
+        installNativeWebSocketIntercept(dshState({
+            takeoverGate: async () => { throw new Error("must not run for non-model sockets"); },
+        }));
+        const init = { headers: { "sec-x": "1" } };
+        const ws = new (WsCtor<FakeWs>())("wss://example.com/devtools", init);
+        assert.ok(ws instanceof FakeWs, "no deferral for unclaimed URLs");
+        assert.equal(ws.url, "wss://example.com/devtools");
+        assert.equal(ws.ctorArgs[1], init);
+    });
+});
+
+test("#5838 e2e: stamped headers actually ride the real WebSocket upgrade request (undici wire proof)", async () => {
+    const http = await import("node:http");
+    const srv = http.createServer();
+    const seen: Record<string, string | undefined> = {};
+    srv.on("upgrade", (req: { url?: string; headers: Record<string, string | undefined> }, sock: { end: (s: string) => void }) => {
+        seen.url = req.url;
+        seen.plugin = req.headers["x-bili-plugin"];
+        seen.conv = req.headers["x-bili-plugin-conversation"];
+        seen.session = req.headers["session-id"];
+        sock.end("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n");
+    });
+    await new Promise<void>((resolve) => srv.listen(0, "127.0.0.1", resolve));
+    const port = (srv.address() as { port: number }).port;
+    const saved = savedDescriptor();
+    _resetForTest();
+    try {
+        const state: NativeInterceptState = {
+            origin: `http://127.0.0.1:${port}`,
+            ready: Promise.resolve(`http://127.0.0.1:${port}`),
+            toolsReady: Promise.resolve(undefined),
+            headersFor: () => ({ "x-bili-plugin": "dsh", "x-bili-plugin-conversation": "conv-e2e" }),
+        };
+        installNativeWebSocketIntercept(state);
+        // The REAL globalThis WebSocket as the base constructor — no fake.
+        const ws = new (globalThis as GlobalRecord & { WebSocket: new (url: string, init?: unknown) => { addEventListener: (t: string, f: () => void) => void } }).WebSocket(
+            UPSTREAM_WS,
+            { headers: { "session-id": "sess-e2e" } },
+        );
+        await new Promise<void>((resolve) => {
+            ws.addEventListener("error", () => resolve());
+            ws.addEventListener("close", () => resolve());
+            setTimeout(resolve, 5000);
+        });
+        assert.equal(seen.url, "/bili/https://chatgpt.com/backend-api/codex/responses");
+        assert.equal(seen.plugin, "dsh");
+        assert.equal(seen.conv, "conv-e2e");
+        assert.equal(seen.session, "sess-e2e");
+    } finally {
+        _resetForTest();
+        if (saved !== undefined) Object.defineProperty(globalThis, "WebSocket", saved);
+        srv.close();
+    }
 });
 
 // ——— Reset —————————————————————————————————————————————————————————————————————
