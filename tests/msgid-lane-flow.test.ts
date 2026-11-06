@@ -54,9 +54,10 @@ async function harness(pin: boolean): Promise<Harness> {
     resetToolRingForTest();
     __resetIncrementalLaneForTests();
     // #5155: the wrap-up schedules a debounced save instead of a synchronous
-    // writeNow per turn — rows settle shortly AFTER the ack. A short debounce
-    // plus settle() keeps the row reads deterministic; the identity contracts
-    // under test are unchanged.
+    // writeNow per turn — rows settle shortly AFTER the ack. settle() awaits
+    // the store's own landing verdict (afterNextFlush), not a fixed sleep, so
+    // the row reads stay deterministic even when the fsync outruns a sleep
+    // budget under load; the identity contracts under test are unchanged.
     const store = new SessionStore({ dir: dir + "/sessions", enabled: true, debounceMs: 15 });
     _setStoreForTest(store);
     _setForTest({});
@@ -100,7 +101,16 @@ async function harness(pin: boolean): Promise<Harness> {
             db.close();
         }
     };
-    return { turn, forwarded, rows, settle: async () => { await new Promise((resolve) => setTimeout(resolve, 60)); }, close: async () => { await new Promise<void>((resolve) => proxy.close(() => resolve())); store.closeQuietly(); await new Promise<void>((resolve) => upstream.close(() => resolve())); } };
+    const settle = async (): Promise<void> => {
+        // A fixed sleep here raced the debounced save's fsync on loaded
+        // windows-latest runners (the row read saw the pre-turn snapshot —
+        // PR #5644 win22-s2 red). Await the store's landing verdict instead;
+        // a false verdict means a save genuinely failed — fail loud there,
+        // not on the missing row below.
+        const ok = await store.afterNextFlush("conv-msgid-1");
+        assert.ok(ok, "debounced row save landed on disk before the row read");
+    };
+    return { turn, forwarded, rows, settle, close: async () => { await new Promise<void>((resolve) => proxy.close(() => resolve())); store.closeQuietly(); await new Promise<void>((resolve) => upstream.close(() => resolve())); } };
 }
 
 const wmsg = (text: string) => ({ role: "user", content: [{ type: "text", text: text.repeat(200) }] });

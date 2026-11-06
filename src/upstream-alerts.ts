@@ -40,8 +40,12 @@ export interface UpstreamAlert {
  *  - upstream-timeout: fired AFTER connect (headers/body idle budget) — the
  *    request may have reached the upstream, so "cannot reach" would be a lie;
  *  - unknown: unclassified — better silent than a misleading red banner. */
-const ALERT_KINDS: ReadonlySet<UpstreamFailureKind> = new Set([
+// Exported so the taxonomy coverage gate (tests) can assert every connect-
+// stage errno lands in an alertable kind — the #2465 failure mode was exactly
+// a code missing from BOTH this set and the fail-fast set at once. (#5663)
+export const ALERT_KINDS: ReadonlySet<UpstreamFailureKind> = new Set([
     "connect-timeout",
+    "upstream-unreachable",
     "connect-refused",
     "proxy-reset",
     "upstream-reset",
@@ -50,6 +54,18 @@ const ALERT_KINDS: ReadonlySet<UpstreamFailureKind> = new Set([
 ]);
 
 const MAX_ALERTS = 32;
+
+/** #5572: an alert row is a snapshot of NOW (#1682), so it dies when its host stops
+ *  being hit-and-failing. A single stray failure against a provider that then stops
+ *  being requested — a loopback shim that rebound to a fresh ephemeral port after a
+ *  plugin reload, or a user-configured endpoint whose session switched models away —
+ *  otherwise pins the banner forever: the dead port can never succeed again, so
+ *  clearUpstreamAlertsForHost — the only other removal path — can never fire for it.
+ *  Circuit half-open probes are request-driven (consulted per-request, no background
+ *  timer), so an unreferenced host gets neither fresh failures nor probes. Expire rows
+ *  older than this since their LAST failure; a host still actively failing refreshes
+ *  lastSeen on every failing request and stays visible while genuinely down. */
+const ALERT_STALE_MS = 5 * 60_000;
 
 let alerts = new Map<string, UpstreamAlert>();
 
@@ -63,6 +79,17 @@ function hostOf(url: string): string {
 
 function keyFor(kind: UpstreamFailureKind, host: string): string {
     return kind + "\u0000" + host;
+}
+
+/** #5572: drop rows whose last failure predates `now - ALERT_STALE_MS`. Called lazily
+ *  from the two read projections; sweeping ≤MAX_ALERTS entries per read is negligible.
+ *  Deleting the current entry mid-iteration is defined behavior for a Map iterator. */
+function pruneStaleAlerts(now: number): void {
+    if (alerts.size === 0) return;
+    const cutoff = now - ALERT_STALE_MS;
+    for (const [key, a] of alerts) {
+        if (a.lastSeen < cutoff) alerts.delete(key);
+    }
 }
 
 /** #5146: pull the errno off a Node error when present (ECONNREFUSED, ENOTFOUND, …) so the
@@ -116,8 +143,10 @@ export function clearUpstreamAlertsForHost(url: string): void {
     }
 }
 
-/** Active alerts, most recently seen first. Always a fresh array. */
-export function getUpstreamAlerts(): UpstreamAlert[] {
+/** Active alerts, most recently seen first. Always a fresh array. Prunes rows that
+ *  stopped refreshing past ALERT_STALE_MS before projecting (#5572). */
+export function getUpstreamAlerts(now: number = Date.now()): UpstreamAlert[] {
+    pruneStaleAlerts(now);
     return [...alerts.values()].sort((a, b) => b.lastSeen - a.lastSeen);
 }
 
@@ -356,6 +385,7 @@ export interface UpstreamHealthReport {
 }
 
 export function getUpstreamHealthReport(now: number = Date.now()): UpstreamHealthReport {
+    pruneStaleAlerts(now);
     interface Acc {
         alerts: UpstreamAlert[];
         circuit: UpstreamCircuit | null;

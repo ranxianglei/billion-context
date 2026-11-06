@@ -88,6 +88,7 @@ import {
     resolveNodeRuntime,
     probeNodeWrapperTarget,
     probeNodeMajor,
+    probeNodeIdentity,
     MIN_PROXY_NODE_MAJOR,
     stopProxy,
     stopProxyGuarded,
@@ -551,6 +552,99 @@ test("runLaunch pi: native -e plugin injected only when not installed", async ()
         else process.env.PI_BIN = prevPiBin;
         if (prevPiDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
         else process.env.PI_CODING_AGENT_DIR = prevPiDir;
+        if (stubbed) fs.rmSync(distAgent, { force: true });
+        rmrf(home);
+    }
+});
+
+// #5428: -s pi pins the proxy posture on the child. cli.ts records the pin as
+// overrides.BILI_PI_INLINE="0"; the launch path must layer it onto the child
+// env — stripInheritedProxy does NOT touch BILI_PI_INLINE, so without this a
+// hostile inherited BILI_PI_INLINE=1 would still arm the in-process engine in
+// the child while THIS launch's proxy sits idle.
+test("runLaunch pi #5428: -s posture override reaches the child env over a hostile inherited inline var", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-pis-"));
+    const prevHome = process.env.HOME;
+    const prevUserProfile = process.env.USERPROFILE;
+    const prevPiBin = process.env.PI_BIN;
+    const prevPiDir = process.env.PI_CODING_AGENT_DIR;
+    const prevInline = process.env.BILI_PI_INLINE;
+    process.env.HOME = home;
+    if (prevUserProfile !== undefined) process.env.USERPROFILE = home;
+    delete process.env.PI_CODING_AGENT_DIR;
+    // Hostile inheritance: the user's shell exported the inline opt-in.
+    process.env.BILI_PI_INLINE = "1";
+    const fakePi = path.join(home, process.platform === "win32" ? "fake-pi.exe" : "fake-pi");
+    fs.writeFileSync(fakePi, "");
+    process.env.PI_BIN = fakePi;
+    const piHome = path.join(home, ".pi/agent");
+    fs.mkdirSync(piHome, { recursive: true });
+    fs.writeFileSync(path.join(piHome, "models.json"), JSON.stringify({ providers: {} }));
+
+    // runLaunch only injects -e when dist/agent/pi.js exists; create a stub
+    // when running tests from a checkout without a prior build.
+    const root = selfPackageRoot();
+    const distAgent = path.join(root, "dist", "agent", "pi.js");
+    const stubbed = !fs.existsSync(distAgent);
+    if (stubbed) {
+        fs.mkdirSync(path.dirname(distAgent), { recursive: true });
+        fs.writeFileSync(distAgent, "");
+    }
+
+    const childEnvs: NodeJS.ProcessEnv[] = [];
+    const spawnImpl: SpawnFn = (cmd, _args, options) => {
+        if (cmd === fakePi) {
+            childEnvs.push({ ...(options?.env ?? {}) });
+            // runClient resolves on "exit" — fire it on next tick.
+            const child = makeFakeChild(0);
+            const orig = child.on!.bind(child);
+            (child as { on: SpawnChild["on"] }).on = (event, listener) => {
+                orig(event, listener);
+                if (event === "exit") setTimeout(() => listener(0, null), 0);
+                return child;
+            };
+            return child;
+        }
+        return makeFakeChild(42422);
+    };
+    const fetchImpl = async () => ({ ok: true });
+    const fetchHealthInfo = async () => ({ ok: true, pid: 42422 });
+
+    // runLaunch ends with process.exit() — stub it or it kills the test
+    // runner and every test registered after this one silently never runs.
+    const prevExit = process.exit;
+    const exitCalls: number[] = [];
+    process.exit = ((code?: number) => {
+        exitCalls.push(code ?? 0);
+        return undefined as never;
+    }) as typeof process.exit;
+
+    try {
+        // Control: without the pin the hostile inheritance reaches the child.
+        await runLaunch(
+            { client: "pi", clientArgs: [], overrides: {} },
+            { fetchImpl, fetchHealthInfo, spawnImpl, sleep: () => Promise.resolve() },
+        );
+        assert.equal(childEnvs[0]?.BILI_PI_INLINE, "1", "inherited inline var still reaches the child without -s");
+
+        // -s pi: the pin must beat the inheritance in the child env.
+        await runLaunch(
+            { client: "pi", clientArgs: [], overrides: { BILI_PI_INLINE: "0" } },
+            { fetchImpl, fetchHealthInfo, spawnImpl, sleep: () => Promise.resolve() },
+        );
+        assert.equal(childEnvs[1]?.BILI_PI_INLINE, "0", "-s pin overrides the inherited inline var for the child");
+        assert.deepEqual(exitCalls, [0, 0]);
+    } finally {
+        process.exit = prevExit;
+        process.env.HOME = prevHome;
+        if (prevUserProfile === undefined) delete process.env.USERPROFILE;
+        else process.env.USERPROFILE = prevUserProfile;
+        if (prevPiBin === undefined) delete process.env.PI_BIN;
+        else process.env.PI_BIN = prevPiBin;
+        if (prevPiDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+        else process.env.PI_CODING_AGENT_DIR = prevPiDir;
+        if (prevInline === undefined) delete process.env.BILI_PI_INLINE;
+        else process.env.BILI_PI_INLINE = prevInline;
         if (stubbed) fs.rmSync(distAgent, { force: true });
         rmrf(home);
     }
@@ -5005,6 +5099,117 @@ test("probeNodeWrapperTarget: a plain node reports its own execPath (#1887)", ()
     assert.ok(lower.endsWith("node") || lower.endsWith("node.exe"), `expected a node path, got ${out}`);
 });
 
+test("probeNodeIdentity: the running Node reports its own execPath and no electron version; missing executable yields undefined (#5663)", () => {
+    const id = probeNodeIdentity(process.execPath, { ...process.env });
+    assert.ok(id !== undefined, "expected an identity for the running node");
+    assert.equal(id!.execPath.toLowerCase(), process.execPath.toLowerCase());
+    assert.equal(id!.electron, undefined);
+    assert.equal(probeNodeIdentity("/definitely/not/a/node", { ...process.env }), undefined);
+});
+
+test("resolveNodeRuntime: an Electron-as-node shim named node is rejected although --version passes (#5663)", () => {
+    // The field failure: PATH's first `node` is another desktop app's
+    // ELECTRON_RUN_AS_NODE shim answering v24.x to --version. Pre-fix it was
+    // accepted and the daemon ran under a foreign bundle whose owner app holds
+    // no Local Network grant → every LAN upstream connect died EHOSTUNREACH.
+    const shim = "/opt/host/bin/node";
+    const env = { PATH: "/opt/host/bin" };
+    const exists = (p: string): boolean => p === shim;
+    const probeNodeStub = (): number | undefined => 24;
+    const probeIdentityStub = (): { execPath: string; electron?: string } | undefined => ({
+        execPath: "/Applications/Other App.app/Contents/MacOS/Other App",
+        electron: "33.0.0",
+    });
+    // Electron host: the shim is skipped, nothing else exists → host-binary fallback, NOT the shim
+    assert.equal(
+        resolveNodeRuntime(
+            "/Applications/Host App.app/Contents/MacOS/Host App",
+            env,
+            "darwin",
+            exists,
+            "33.0.0",
+            undefined,
+            probeNodeStub,
+            probeIdentityStub,
+        ),
+        "/Applications/Host App.app/Contents/MacOS/Host App",
+    );
+    // non-Electron host: nothing usable resolves → actionable throw, not a doomed spawn
+    assert.throws(
+        () => resolveNodeRuntime("/usr/bin/opencode", env, "linux", exists, undefined, undefined, probeNodeStub, probeIdentityStub),
+        /BILLION_CONTEXT_NODE/,
+    );
+});
+
+test("resolveNodeRuntime: scanning continues past a rejected Electron shim to a real Node later (#5663)", () => {
+    const shim = "C:/shims/node.exe";
+    const real = "C:/Program Files/nodejs/node.exe";
+    const exists = (p: string): boolean => p === shim || p === real;
+    const probeNodeStub = (): number | undefined => 24;
+    const probeIdentityStub = (c: string): { execPath: string; electron?: string } | undefined =>
+        c === shim
+            ? { execPath: "C:/Users/x/AppData/Local/Programs/OtherApp/OtherApp.exe", electron: "33.0.0" }
+            : { execPath: real };
+    assert.equal(
+        resolveNodeRuntime(
+            "C:/Users/x/AppData/Local/Programs/HostApp/HostApp.exe",
+            { PATH: "C:/shims;C:/Program Files/nodejs" },
+            "win32",
+            exists,
+            "33.0.0",
+            undefined,
+            probeNodeStub,
+            probeIdentityStub,
+        ),
+        real,
+    );
+});
+
+test("resolveNodeRuntime: an Electron-as-node shim of the HOST's own binary is accepted, like the sanctioned fallback (#5663)", () => {
+    const shim = "/opt/host/bin/node";
+    const host = "/Applications/Host App.app/Contents/MacOS/Host App";
+    const exists = (p: string): boolean => p === shim;
+    const probeIdentityStub = (): { execPath: string; electron?: string } | undefined => ({
+        execPath: host.toUpperCase().replace("HOST APP", "Host App"), // same file, case drift (APFS is case-insensitive)
+        electron: "33.0.0",
+    });
+    assert.equal(
+        resolveNodeRuntime(host, { PATH: "/opt/host/bin" }, "darwin", exists, "33.0.0", undefined, () => 24, probeIdentityStub),
+        shim,
+    );
+});
+
+test("resolveNodeRuntime: an unprovable identity keeps the pre-#5663 version-only verdict (fail-open)", () => {
+    const exotic = "/opt/host/bin/node";
+    const exists = (p: string): boolean => p === exotic;
+    // identity probe fails (timeout / non-JSON output) → old behavior stands
+    assert.equal(
+        resolveNodeRuntime("/usr/bin/opencode", { PATH: "/opt/host/bin" }, "linux", exists, undefined, undefined, () => 22, () => undefined),
+        exotic,
+    );
+});
+
+test("resolveNodeRuntime: a #1887 re-exec wrapper landing on real Node still passes the identity gate (#5663/#1887)", () => {
+    const wrapper = "C:/shims/node.exe";
+    const real = "C:/mise/installs/node-22.11.0/bin/node.exe";
+    const exists = (p: string): boolean => p === wrapper || p === real;
+    const probeIdentityStub = (c: string): { execPath: string; electron?: string } | undefined =>
+        c === real ? { execPath: real } : undefined;
+    assert.equal(
+        resolveNodeRuntime(
+            "C:/opencode/opencode.exe",
+            { PATH: "C:/shims" },
+            "win32",
+            exists,
+            undefined,
+            () => real,
+            () => 22,
+            probeIdentityStub,
+        ),
+        real,
+    );
+});
+
 test("ensureProxyRunning: spawns the resolved Node runtime, not blind process.execPath (#819)", async () => {
     let spawnedCmd: string | null = null;
     const spawnImpl: SpawnFn = (cmd) => {
@@ -7579,6 +7784,16 @@ test("runLaunch copilot: cert-MITM env (HTTPS_PROXY + combined SSL_CERT_FILE), i
     assert.ok(String(seenEnv.SSL_CERT_FILE).endsWith(path.join("billion-context", "ca", "combined-ca.pem")), String(seenEnv.SSL_CERT_FILE));
     assert.equal(seenEnv.NODE_EXTRA_CA_CERTS, undefined);
     assertInheritedProxyStripped(seenEnv, String(origin));
+});
+
+test("runLaunch kiro: cert-MITM env (HTTPS_PROXY + combined CA on SSL_CERT_FILE and NODE_EXTRA_CA_CERTS), inherited proxy stripped", async () => {
+    const seenEnv = await captureLaunchedClientEnv("kiro");
+    const origin = seenEnv.BILLION_CONTEXT_PROXY;
+    assert.ok(/^http:\/\/127\.0\.0\.1:\d+$/.test(String(origin)), `origin: ${origin}`);
+    const combined = path.join("billion-context", "ca", "combined-ca.pem");
+    assert.ok(String(seenEnv.SSL_CERT_FILE).endsWith(combined), String(seenEnv.SSL_CERT_FILE));
+    assert.ok(String(seenEnv.NODE_EXTRA_CA_CERTS).endsWith(combined), String(seenEnv.NODE_EXTRA_CA_CERTS));
+    assertInheritedProxyStripped(seenEnv, String(origin), { NO_PROXY: "localhost,127.0.0.1,::1", no_proxy: "localhost,127.0.0.1,::1" });
 });
 
 test("runLaunch amp: cert-MITM env (HTTPS_PROXY + combined SSL_CERT_FILE), inherited proxy stripped (#1049)", async () => {
