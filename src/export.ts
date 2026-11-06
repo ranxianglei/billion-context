@@ -48,7 +48,21 @@ function blockLedgerLine(s: Session, b: CompressionBlock): string {
             .filter((r): r is string => r !== null)
             .map((r) => Number(r.slice(1)))
             .filter((n) => Number.isInteger(n) && n >= 1);
-        if (nums.length > 0) range = nums.length === 1 ? indexToRef(nums[0]) : `${indexToRef(Math.min(...nums))}–${indexToRef(Math.max(...nums))}`;
+        if (nums.length > 0) {
+            if (nums.length === 1) {
+                range = indexToRef(nums[0]);
+            } else {
+                // Loop instead of Math.min(...nums): tier-3 blocks of long
+                // sessions can carry more ids than V8's argument-spread limit.
+                let lo = Infinity;
+                let hi = -Infinity;
+                for (const n of nums) {
+                    if (n < lo) lo = n;
+                    if (n > hi) hi = n;
+                }
+                range = `${indexToRef(lo)}–${indexToRef(hi)}`;
+            }
+        }
     }
     const orig = s.blockContents.get(b.blockId)?.full.text.length;
     const status = !b.active ? "consumed" : b.retired ? "retired" : "active";
@@ -172,9 +186,9 @@ export function renderHandoff(s: Session, full: boolean): string {
             : "No active compression blocks and no persisted conversation snapshot (v2 session file). Original messages are only persisted when they are compressed into a block, so this session's conversation content is not available for export.");
         lines.push("");
     }
-    // #5765: retired blocks stay listed (they remain active — only their view
-    // anchor is gone); consumed/inactive blocks stay excluded (#845 contract).
-    for (const b of s.state.blocks.filter((b) => b.active)) {
+    // #5765: `active` includes retired blocks (they remain active — only their
+    // view anchor is gone); consumed/inactive blocks stay excluded (#845 contract).
+    for (const b of active) {
         lines.push(`## Block ${b.blockId}${b.topic ? ` — ${b.topic}` : ""}`);
         lines.push("");
         lines.push(`tier ${b.tier} · ~${b.compressedTokens} tokens compressed · ${fmtDate(b.createdAt)}`);
