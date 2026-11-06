@@ -252,6 +252,26 @@ test("chokepoint self-branch: conversation header from headersFor still emits co
     assert.equal(sink[1].headers["x-bili-pf-tail-ids"], "x3,x4");
 });
 
+test("chokepoint routed branch: conversation header from headersFor still emits count (#5813)", async () => {
+    const sid = "sid-routed-headersfor-1";
+    const { sink } = await withPfPatch(async (fetch, sinkIn) => {
+        // already-routed /bili/ model URL (launcher settings-overlay shape);
+        // the client carries NO conversation header — headersFor is its sole
+        // source, exactly like the rewrite/self shapes above
+        const url = "http://127.0.0.1:41001/bili/http://127.0.0.1:8199/v1/chat/completions";
+        await fetch(url, { method: "POST", body: "{}" });
+        pfChannel.pfLearnStamp({ [CONVO]: sid }, 200, new Headers({ "x-bili-pf-seq": "5" }));
+        pfChannel.pfCaptureIds(sid, ["r1", "r2", "r3", "r4", "r5", "r6"]);
+        await fetch(url, { method: "POST", body: "{}" });
+        assert.equal(sinkIn[0].headers["x-bili-pf-count"], undefined, "routed branch turn 1 unseeded");
+    }, {
+        headersFor: () => ({ [CONVO]: sid, "x-bili-plugin": "dsh" }),
+    });
+    assert.equal(sink[0].headers[CONVO], sid, "headersFor convo header lands on the wire");
+    assert.equal(sink[1].headers["x-bili-pf-count"], "5", "routed branch emits count from headersFor sid");
+    assert.equal(sink[1].headers["x-bili-pf-tail-ids"], "r5,r6");
+});
+
 // --- openai-chat family resolver (#5403/#5418 protocol-unified capture) ---
 
 test("laneMsgIdsForOpenAiWire: leading system slot gets a position token, rest align to branch", () => {
