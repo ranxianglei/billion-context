@@ -286,7 +286,11 @@ export const WEB_CLIENT = `(function () {
         // as an unexplained rewrite (warned-on-impact policy, #2912).
         const confirmedNativeN = kinds["native-compaction-inferred"] || 0;
         const handledNativeN = kinds["native-compaction"] || 0;
-        const signalN = Math.max(0, c.events - pluginN - confirmedNativeN - handledNativeN);
+        // #5786: cross-build id re-mint that fold-reconcile fully RE-ANCHORED (#4131/#3642) —
+        // bili's own recovery, no compaction boundary marked. Recovered stock like
+        // handledNativeN: not a landed-unrecovered signal, so it must not light the alarm.
+        const churnAdoptN = kinds["id-churn-adoption"] || 0;
+        const signalN = Math.max(0, c.events - pluginN - confirmedNativeN - handledNativeN - churnAdoptN);
         const whatParts = [];
         if (confirmedTpN > 0) whatParts.push(t("conflict.what_plugin"));
         if (suspectedN > 0) whatParts.push(t("conflict.what_suspected"));
@@ -320,7 +324,7 @@ export const WEB_CLIENT = `(function () {
         // #2430/#2545: a ledger naming ONLY bili's own siblings or verified read-only viewers
         // stands down completely — compatible family / non-compressors, not conflicts.
         const siblingOnly = !hasConfirmed && suspectedN === 0 && signalN === 0 && siblingN > 0;
-        const neutralOnly = !hasConfirmed && suspectedN === 0 && signalN === 0 && (siblingN + displayOnlyN + handledNativeN) > 0; // #2912: fully-handled (recovered-native-only) ledger also stands down
+        const neutralOnly = !hasConfirmed && suspectedN === 0 && signalN === 0 && (siblingN + displayOnlyN + handledNativeN + churnAdoptN) > 0; // #2912/#5786: fully-handled (recovered-native / adopted-id-churn-only) ledger also stands down
         // #3235 owner rule: the banner is an ALARM for interception FAILURE — evidence a
         // history rewrite actually LANDED unrecovered (confirmed third-party / inferred
         // native landing / unexplained rewrite signal). Co-residence alone (suspected
