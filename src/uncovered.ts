@@ -149,13 +149,19 @@ interface RunEntry {
 }
 
 // #5780: host-side estimate of where the protected claim begins, in ENTRY
-// space (entries skip covered/zero-token messages, so this UNDER-counts the
-// kernel's message-space zone — the conservative direction: it can only make
-// us report more, and the apply-side screen then labels such spans honestly
-// instead of claiming they fold). Claim = last `preserveRecentMessages`
-// entries plus the most recent user anchor (the kernel's two core zone rules);
-// decorative extensions (#2886 pair symmetry, neverPreserveRecentTools) only
-// protect MORE, so missing them errs toward reporting, never toward hiding.
+// space. Claim = last `preserveRecentMessages` entries plus the most recent
+// user anchor (the kernel's two core zone rules). Two biases, both safe:
+// (1) the #2886-family zone extensions (pair-closure pullback,
+// neverPreserveRecentTools, token-based protection) protect MORE than this
+// count+anchor estimate, so it sits behind the true zone start — doomed mass
+// just ahead of the zone is reported and screen-labeled instead of vanishing;
+// (2) when covered/zero-token messages sit INSIDE the recent window, the
+// last-N entries span more than N messages, so the estimate can also reach
+// further back than the naive message-space zone — that corner errs toward
+// SILENCE for doomed mass in that band (bounded by the covered count in the
+// window; degrades to pre-#5780 behavior, never to a false "folds" claim).
+// Neither direction claims a span folds that apply rejects: the screen below
+// labels every reported span.
 function protectedClaimStart(entries: RunEntry[], config: Config): number {
   let start = entries.length - (config.preserveRecentMessages ?? 0);
   for (let i = entries.length - 1; i >= 0; i--) {
