@@ -240,3 +240,25 @@ test("gate (negative direction): legal delta layouts stay byte-identical", () =>
     trailing.messages,
   );
 });
+
+test("fallback warn names the tool for the REAL nested tool_removal wire shape", () => {
+  // Production Claude Code emits tool_removal as { tool: { type: tool_reference,
+  // name } }; the diagnostic must name THAT tool, not print "unknown".
+  const body = {
+    messages: [
+      { role: "assistant", content: [{ type: "text", text: "reply" }] },
+      sys([
+        { type: "text", text: "tools removed" },
+        { type: "tool_removal", tool: { type: "tool_reference", name: T_DOCS } },
+      ]),
+    ],
+  };
+  const calls = captureWarn(() => {
+    const rebuilt = coreToAnthropic(anthropicToCore(body as never).msgs as never);
+    assert.deepEqual(rebuilt.map((m) => m.role), ["assistant", "user"]);
+    assert.ok(!JSON.stringify(rebuilt).includes("tool_removal"));
+  });
+  assert.equal(calls.length, 1);
+  assert.match(calls[0]!, /\[acp-kernel\]/);
+  assert.match(calls[0]!, new RegExp(T_DOCS));
+});
