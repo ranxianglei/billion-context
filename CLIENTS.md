@@ -791,6 +791,26 @@ Caveats worth knowing:
   lineage). Strictly more information, but anything keyed on `pfa-*`
   identities will observe different ids.
 
+## Kiro CLI (AWS)
+
+`bili kiro [opts --] [args]` starts a proxy and launches `kiro-cli` (resolved from `PATH`, else `~/.local/bin/kiro-cli`; `BILI_CLIENT_BIN` overrides). Everything after `--` goes to `kiro-cli`, e.g. `bili kiro -- chat --resume`.
+
+**How Kiro talks to its model (observed on kiro-cli 2.37).** The agent's model calls are the **OpenAI Responses wire**: `POST https://runtime.<region>.kiro.dev/v1/responses` with `{ model, input, tools, stream, origin, profileArn, metadata }`, streamed back as `text/event-stream`. Kiro replays the **full history every turn** (its system prompt rides `input[0]` as a `user` item), authenticates with a bearer token (no body signature, so a rewritten body stays valid), and honors `HTTPS_PROXY`. Its other runtime calls (`KiroRuntimeService.*`, AWS-JSON at `/`) are not a model wire and are relayed byte-for-byte; they show up once as an "unrecognized path" in the log, which is expected.
+
+**What the lane does.**
+
+- **cert-MITM, model gateways only:** `runtime.us-east-1`, `runtime.eu-central-1`, `runtime.us-gov-east-1`, `runtime.us-gov-west-1` (`.kiro.dev`). Management, auth and telemetry hosts stay blind-tunneled. Add others with `--mitm-domain`.
+- **CA:** the combined bundle on both `SSL_CERT_FILE` (the Rust shell's rustls *replaces* its roots, so system roots must ride along) and `NODE_EXTRA_CA_CERTS` (the bundled Node agent server, additive). `NO_PROXY` keeps loopback (the local agent server, MCP servers) direct.
+- **Roles (built-in compat):** the gateway accepts only `user` / `assistant` message items. bili's injected compress prompt is a `developer` item, which the gateway rejects with `400 This request contains parameters or input that are not supported` (`param: input[0]`); `system` fails the same way. For Kiro traffic (User-Agent `KiroCLI/…` or `x-amzn-kiro-origin`, on a `runtime.*.kiro.dev` host) bili re-voices `developer`/`system` → `user` automatically. Lowest precedence: `compat.roles` in your config and learned roles still win per key. The invariant judge sees the injected prompt with its original role, so no false I1 warning.
+- **Session identity:** Kiro's first item (its system prompt) is not byte-stable across processes, so content-prefix affinity would mint a fresh session for every `kiro-cli chat --resume`. bili promotes `metadata["kiro:conversation_id"]` to the session id (`kiro-<id>`, only over a content fingerprint, never over a real conversation header / `session_id` / `prompt_cache_key`), so compression state survives resumes.
+
+**Notes.**
+
+- Kiro's own auto-compaction stays on as a backstop; bili folds earlier, so it rarely triggers. To rely on bili alone: `kiro-cli settings chat.disableAutoCompaction true` (global Kiro setting; undo with `false`).
+- Kiro's stream carries no usage report, so nudge decisions use bili's local token estimates (`upstream success without usage report` in the log is expected).
+- Kiro's `reasoning` items are signed (`encrypted_content`) and are kept verbatim; they fold away with their turn.
+- Manual setup without the launcher: run `bili` with `BILI_MITM_DOMAINS=runtime.us-east-1.kiro.dev`, then start `kiro-cli` with `HTTPS_PROXY=http://127.0.0.1:8787`, `SSL_CERT_FILE` and `NODE_EXTRA_CA_CERTS` pointing at `~/.local/share/billion-context/ca/combined-ca.pem`.
+
 ## Adopting unlisted clients (any client with a configurable model base URL) (#2340)
 
 Every client that lets you **edit its model endpoint and carries an API key** (rather than a login) can ride compression today with a one-line change — no launcher, no code: prepend the proxy origin + `/bili/` to the base URL (`http://127.0.0.1:8787/bili/https://api.example.com/v1`), keep the API key as-is, and run the daemon (`bili start`). What you get is the full pure-proxy treatment: compression + wire-level tool injection. Details and examples: [CONFIGURATION.md → `/bili/` prefix](CONFIGURATION.md#bili-prefix-api-key-clients).
