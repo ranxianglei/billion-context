@@ -18,10 +18,13 @@ on:
     # and release lanes fire on their own master-push triggers), so every
     # merge paid full-shard minutes for a signal nobody saw. Master coverage
     # does not lapse: the :03/:33 schedule cron below re-runs the FULL
-    # matrix whenever master moved since the last green scheduled run
-    # (bounded ~30 min window), and PR-side blocking still gates everything
-    # pre-merge. Release/bugfix push arms stay — they exist because
-    # bot-authored PR checks sit in action_required (#772).
+    # matrix whenever master moved since the last green scheduled run.
+    # Schedule delivery is throttled under load: target 30 min, but measured
+    # 2026-11-06 ≈5 runs/day against the 48-tick spec (median gap ≈4.8h,
+    # worst ≈10.6h over 107 runs) — treat post-merge coverage as a
+    # multi-hour backstop, not a 30-minute one. PR-side blocking still
+    # gates everything pre-merge. Release/bugfix push arms stay — they
+    # exist because bot-authored PR checks sit in action_required (#772).
     branches: ["*_release-v*", "bugfix-release/**", "bugfix-v*", bugfix]
   pull_request:
     # agent-relay: #3468 agent PRs target the relay branch.
@@ -41,8 +44,11 @@ on:
   # Three-layer CI (#3295): PRs pay for the CORE matrix only (master pushes
   # stopped paying in 2026-11-01 — see the push arm above;
   # this cron is now master's standing verifier).
-  # Every 30 minutes this cron asks the plan job whether master moved
+  # Every 30 minutes (spec) this cron ASKS the plan job whether master moved
   # since the last green scheduled run; only then does the FULL matrix run.
+  # Observed delivery is far sparser than the spec (measured 2026-11-06:
+  # ≈5 runs/day vs 48 ticks, median gap ≈4.8h, worst ≈10.6h) — see the
+  # push-arm note above.
   # Lane workflows (e2e/registry/image/theorem/zcode) follow the same gated
   # cron pattern on their own offsets.
   schedule:
