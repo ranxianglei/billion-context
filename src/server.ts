@@ -722,10 +722,21 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         // parentPid 0 — axis disabled, zero behavior change.
         parentPid: offloopOwnerPid,
         // #7 shared-proxy semantics ride on every beat: the worker only reaps
-        // when NO owner is attached, so a multi-host proxy dies when the LAST
-        // host exits. A wedged loop freezes the last known size — sound, because
-        // attaching during a wedge needs an HTTP answer.
-        getWatcherCount: () => liveWatchers?.size ?? 0,
+        // when NO OTHER owner is attached, so a multi-host proxy dies when the
+        // LAST host exits. The probed spawner itself is excluded from the count:
+        // its death is exactly what the probe measures, and removing it from the
+        // set needs the in-loop reaper — starved by the very wedge this axis
+        // exists for (#5449). Without the exclusion the guard freezes at ≥1 and
+        // the off-loop reap degenerates back into the in-loop path. A wedged
+        // loop freezes the last known value — sound, because attaching during a
+        // wedge needs an HTTP answer.
+        getWatcherCount: () => {
+            const s = liveWatchers;
+            if (!s) return 0;
+            let n = s.size;
+            if (offloopOwnerPid !== null && s.has(offloopOwnerPid)) n -= 1;
+            return n;
+        },
         onSpawnFailure: (err) => logMsg(opts, "warn", `[event-loop-watchdog] could not arm (${String(err)}) — continuing unwatched (#4762)`),
     });
 
