@@ -2306,9 +2306,10 @@ export function apply(ctx: PluginContext): void {
         // gate contract already tolerates Promise verdicts (threw arm).
         if (attr.state === "none") {
             // #4829 review: without init there is no body to decode and the
-            // claim can never succeed — settle synchronously so this shape
-            // keeps the OLD verdict class: native-ws-intercept.ts compares
-            // its gate result with === false WITHOUT awaiting.
+            // claim can never succeed — settle synchronously. Both gate
+            // consumers await the verdict today (fetch lane since #4829, WS
+            // lane inside its deferred window since #5838), so this is a fast
+            // path, not a verdict-class contract.
             if (init === undefined) {
                 threwStreak = 0;
                 threwGiveUpNoticed = false;
