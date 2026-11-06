@@ -14,9 +14,11 @@ import type { BiliMessage } from "../src/wire/bili-message.js";
 // sidecar systems out of folds (their tool deltas are functional — see
 // protected.ts), so orphans still arise; coreToAnthropic therefore ends
 // with a POSITION-based backstop: any non-directive
-// system whose first non-system follower is neither an assistant nor the
-// array end is healed — re-voiced to user with tool_update blocks stripped
-// (WC-022), dropped when nothing remains. Legal layouts (assistant next,
+// system in an illegal position is healed — plain systems are re-voiced to
+// user (dropped when nothing remains); #4818: systems carrying functional
+// tool deltas are RELOCATED to the next legal slot instead, because stripping
+// their WC-022 blocks splits paired chains (orphaned tool_removal → hard 400,
+// addition-only carriers → silent tool loss). Legal layouts (assistant next,
 // array end, trailing runs, directive-only anywhere) round-trip verbatim.
 
 function sys(content: AnthropicSystemMessage["content"]): AnthropicSystemMessage {
@@ -100,19 +102,20 @@ test("consecutive orphaned systems before the anchor heal as a whole run", () =>
     { id: "t1", role: "user", contentType: "text", text: "next" },
   ] as never);
   assert.deepEqual(orphans(rebuilt), []);
+  // #4818 split of fates: the PLAIN member keeps the demote-strip path...
   assert.equal(rebuilt[1]!.role, "user");
   assert.deepEqual(rebuilt[1]!.content, S1.content);
-  assert.equal(rebuilt[2]!.role, "user");
-  // #4457/WC-022: tool_update blocks never survive a demotion to user —
-  // the text block alone is re-voiced, byte-identical.
-  assert.deepEqual(rebuilt[2]!.content, [{ type: "text", text: "second" }]);
-  assert.deepEqual(rebuilt[3], {
+  // ...and the tool-delta carrier relocates to the next legal slot (array
+  // end here) with its functional block intact.
+  assert.deepEqual(rebuilt[2], {
     role: "user",
     content: [
       { type: "text", text: "[Compressed conversation section] folded" },
       { type: "text", text: "next" },
     ],
   });
+  assert.equal(rebuilt[3]!.role, "system");
+  assert.deepEqual(rebuilt[3]!.content, S2.content);
 });
 
 test("re-voicing substitutes fresh objects; the stored sidecar is never mutated", () => {
@@ -258,7 +261,10 @@ test("edge arrays are unaffected: empty, user-only, assistant-only", () => {
 
 // --- #4457 backstop edges ---------------------------------------------------
 
-test("#4457: tool-block-only orphaned system is dropped, not re-voiced empty", () => {
+test("#4818: addition-only orphaned carrier relocates instead of being dropped (silent tool loss)", () => {
+  // The old demote path dropped this entry entirely — silently deactivating
+  // the deferred-load tool for the rest of the session with no error and no
+  // log (#4818/@BBleae field report). Relocation keeps the delta live.
   const S = sys([TOOL_ADDITION]);
   const rebuilt = coreToAnthropic([
     { id: "u0", role: "user", contentType: "text", text: "q1" },
@@ -266,12 +272,12 @@ test("#4457: tool-block-only orphaned system is dropped, not re-voiced empty", (
     { id: "u1", role: "user", contentType: "text", text: "after" },
   ] as never);
   assert.deepEqual(orphans(rebuilt), []);
-  // The demotion drops the entry entirely (nothing re-voicable remains);
-  // the neighbouring user turns stay separate entries — the backstop
-  // never merges.
+  // Relocated to the next legal slot (array end); the neighbouring user
+  // turns stay separate entries — the backstop never merges.
   assert.deepEqual(rebuilt, [
     { role: "user", content: [{ type: "text", text: "q1" }] },
     { role: "user", content: [{ type: "text", text: "after" }] },
+    { role: "system", content: [TOOL_ADDITION] },
   ]);
 });
 
@@ -295,8 +301,9 @@ test("#4457: consecutive system run is judged by its first non-system follower",
     sys([{ type: "text", text: "trailing effort" }]),
   ] as AnthropicWireMessage[];
   assert.deepEqual(roundTrip({ messages }), messages);
-  // The same run followed by a user turn is illegal as a whole — every
-  // member is healed (tool blocks stripped, text kept).
+  // The same run followed by a user turn is illegal as a whole — #4818:
+  // the plain member keeps the demote-strip path, the tool-delta carrier
+  // relocates to the next legal slot with its block intact.
   const illegal = [
     { role: "user", content: [{ type: "text", text: "a" }] },
     sys([{ type: "text", text: "tools" }, TOOL_ADDITION]),
@@ -306,7 +313,8 @@ test("#4457: consecutive system run is judged by its first non-system follower",
   const rebuilt = coreToAnthropic(anthropicToCore({ messages: illegal } as never).msgs as never);
   assert.deepEqual(orphans(rebuilt), []);
   assert.equal(rebuilt[1]!.role, "user");
-  assert.deepEqual(rebuilt[1]!.content, [{ type: "text", text: "tools" }]);
-  assert.equal(rebuilt[2]!.role, "user");
-  assert.deepEqual(rebuilt[2]!.content, [{ type: "text", text: "trailing effort" }]);
+  assert.deepEqual(rebuilt[1]!.content, [{ type: "text", text: "trailing effort" }]);
+  assert.deepEqual(rebuilt[2], { role: "user", content: [{ type: "text", text: "b" }] });
+  assert.equal(rebuilt[3]!.role, "system");
+  assert.deepEqual(rebuilt[3]!.content, [{ type: "text", text: "tools" }, TOOL_ADDITION]);
 });
