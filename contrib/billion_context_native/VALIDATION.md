@@ -18,6 +18,18 @@ These changes were checked with synthetic local data and no paid model requests.
 
 Windows 本地验证通过 198 项 Python 测试、8 项 OpenCode 适配检查、11 项主仓库 OpenCode 测试和 74 项主仓库 DSH 测试，类型检查与构建也通过。测试夹具仅补入必要的 Windows 系统路径并显式使用 UTF-8，仍不继承服务商凭据。主仓库全套测试以推送后对应提交的远程 CI 为准。
 
+## Rule-conflict recovery follow-up
+
+A follow-up to `eb6f52373f59e33c2bac83f4b5706e1286a08e07` fixes recovery from already-colliding legacy rule IDs. Ambiguous rules are suspended and reported as `rule_conflict` without breaking the rest of `recall_status`. An explicit `recall_rule(action="clear")` can clear all active rules and the conflict. Replay accepts this reset only from a uniquely completed call with a recognized positive acknowledgment; missing, rejected, failed or ambiguous reset evidence leaves the conflict in place. Previously acknowledged IDs remain reserved, and original archive facts are never deleted or reassigned.
+
+Rule tools, compaction saves and restore validate the complete archived rule history, so an archive-only conflict survives source compaction and a late conflict cannot re-inject a stale saved projection. Saved-only legacy restore remains supported when no original rule calls are available. A successful observed reset establishes a new active-rule boundary while retaining the preceding evidence. This does not make rule mutations atomic or strengthen duplicate/capacity guarantees under stale parallel previews.
+
+本次后续修复让旧重复编号会话可以显式恢复：状态查询保留其他指标并显示冲突；调用 `clear` 会清空全部当前规则，只有唯一、已完成且明确成功的结果才能解除冲突。失败、拒绝、缺失或含歧义的清空证据不会生效。工具查询、压缩前保存和恢复均核对完整归档，避免当前 transcript 压缩后丢失冲突或重新注入过期规则。旧编号保持占用，历史原文不删除、不改写，也不宣称严格原子操作。
+
+Final local follow-up validation passed all 205 Python tests, including 17 rule identity/recovery tests, and the required typecheck/build. Independent review also checked non-main agent isolation, initial archive binding, archive-only conflict persistence and saved-only legacy fallback. This is synthetic validation; it does not add real-model compaction acceptance.
+
+本次最终本地验证通过全部 205 项 Python 测试，其中包含 17 项规则编号与恢复测试，类型检查和构建通过。独立审查还核对了非主 agent 隔离、首次归档绑定、仅存于归档的冲突和旧规则缓存兼容性；没有新增真实模型验收或付费请求。
+
 ## Rename verification boundary
 
 The product, source directory, Claude Code plugin/marketplace and DSH package/runtime are now `billion_context_native`. Claude Code uses the internal MCP key `native` to keep generated tool names within 64 characters; MCP `serverInfo.name` retains the full product name. OpenCode uses the full MCP server key and qualified `billion_context_native_recall_search/get` names (expanded as `billion_context_native_recall_search` and `billion_context_native_recall_get`). Functional operation names and immutable archive identity are unchanged. See [MIGRATION.md](MIGRATION.md) for installation and data-preservation details.

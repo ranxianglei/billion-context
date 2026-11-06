@@ -80,6 +80,9 @@ def _live(args):
         raise ValueError('找不到当前会话的记录文件，请传入 session_id。')
     import archive
     path = archive._regular(str(path.absolute()))
+    facts = archive.session_dir(path.stem) / 'events.jsonl'
+    if facts.exists() and facts.stat().st_size:
+        archive.sync(path.stem, str(path))
     return path.stem, list(tr.read_entries(str(path)))
 
 
@@ -221,6 +224,7 @@ def status(args):
              else 'growth' if ctx >= tr.SOFT else 'below soft')
     recs = store.load_summaries(sid)
     need = store.digest_needed(sid)
+    rules = store.current_rule_state(sid, entries)
     return '\n'.join([
         f'session_id={sid}',
         pr.breakdown(ctx, tr.SOFT, pressure, hard) + f' — {layer}' + (f' (model {tr.current_model(entries)})' if tr.current_model(entries) else ''),
@@ -228,12 +232,12 @@ def status(args):
         f'已压缩次数: {tr.compactions(entries)}，存档轮数: {len(tr.load_archive(sid))}',
         f'摘要: {len(store.active_summaries(recs))} 条生效 / {len(recs)} 条存档'
         + (f'，需要 tier {need[0]} 汇总' if need else ''),
-        f'规则: {len(store.replay_rules(entries, completed_only=True, sid=sid)["rules"])} 条'])
+        f'规则: {len(rules["rules"])} 条' + (f'\n{store.rule_conflict_notice(rules)}' if rules.get('conflict') else '')])
 
 
 def rule(args):
     sid, entries = _live(args)
-    state = store.replay_rules(entries, completed_only=True, sid=sid)
+    state = store.current_rule_state(sid, entries)
     return store.apply_rule(state, args, rule_id=f'rule{uuid.uuid4().int}')
 
 

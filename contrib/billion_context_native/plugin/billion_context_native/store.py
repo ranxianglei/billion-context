@@ -8,6 +8,7 @@ import transcript as tr
 
 RULE_SUFFIX = '__recall_rule'
 MAX_RULES, MAX_RULE_CHARS = 50, 300  # acp-kernel DEFAULT_RULE_LIMITS
+RULE_RESET_ACK = 'Cleared all rules and unresolved rule conflicts. Previous rule IDs remain reserved.'
 DIGEST_AT = tr.BLOCK_CHARS * 3 // 4  # ask for a digest once the restore slot is this full, before it overflows
 
 
@@ -118,6 +119,12 @@ def apply_rule(state, inp, rule_id=None):
     """Apply one recall_rule call to state {'rules': [...], 'next': n}; returns the tool result text."""
     action = str(inp.get('action') or ('add' if inp.get('text') else 'list'))
     rules = state['rules']
+    if state.get('conflict'):
+        if action == 'clear':
+            state['rules'] = []
+            state.pop('conflict')
+            return RULE_RESET_ACK
+        return f'Error: {rule_conflict_notice(state)}'
     if action == 'add':
         text = str(inp.get('text') or '').strip()
         if not text:
@@ -146,6 +153,11 @@ def apply_rule(state, inp, rule_id=None):
     return '\n'.join(f"{i + 1}. [{r['id']}] {r['text']}" for i, r in enumerate(rules)) or 'No rules recorded.'
 
 
+def rule_conflict_notice(state):
+    return ('rule_conflict: ' + state['conflict']
+            + '. Rules are suspended; use recall_rule(action="clear") to reset unresolved rule history.')
+
+
 def replay_rules(entries, completed_only=False, sid=None):
     """Rule state from every recall_rule call in the transcript, oldest first."""
     entries = list(entries)
@@ -155,6 +167,10 @@ def replay_rules(entries, completed_only=False, sid=None):
               and str(out['call'].get('name', '')).endswith(RULE_SUFFIX)] if completed_only
              else tr.tool_uses(entries, RULE_SUFFIX))
     acknowledged = {}
+    def conflict(message):
+        state['rules'] = []
+        state.setdefault('conflict', message)
+
     for call in calls:
         inp = call.get('input') or {}
         outcome = outcomes.get(call.get('id'), {})
@@ -168,39 +184,74 @@ def replay_rules(entries, completed_only=False, sid=None):
         if isinstance(result, str) and result.startswith('Error:'):
             continue
         action = str(inp.get('action') or ('add' if inp.get('text') else 'list'))
+        if action == 'clear':
+            if outcome.get('status') != 'completed':
+                continue
+            positive = isinstance(result, str) and (result == RULE_RESET_ACK or re.fullmatch(r'Cleared \d+ rules\.', result))
+            if not state.get('conflict') or positive:
+                apply_rule(state, inp)
+            continue
         if action == 'add' and isinstance(result, str) and result.startswith('Recorded ['):
             match = re.fullmatch(r'Recorded \[(rule[1-9]\d*)\] (.+)', result, re.DOTALL)
             text = str(inp.get('text') or '').strip()
             if not match or match[2] != text:
-                raise ValueError('Invalid recall_rule acknowledgment')
+                possible = re.match(r'Recorded \[(rule[1-9]\d*)\]', result)
+                if possible:
+                    acknowledged.setdefault(possible[1], call.get('id'))
+                state['next'] += 1
+                conflict('Invalid recall_rule acknowledgment')
+                continue
             rid = match[1]
             if rid in acknowledged:
                 if acknowledged[rid] != call.get('id'):
-                    raise ValueError(f'Conflicting recall_rule acknowledgment for {rid}')
+                    state['next'] += 1
+                    conflict(f'Conflicting recall_rule acknowledgment for {rid}')
                 continue
             if any(rule['id'] == rid for rule in state['rules']):
-                raise ValueError(f'Conflicting recall_rule acknowledgment for {rid}')
+                conflict(f'Conflicting recall_rule acknowledgment for {rid}')
             acknowledged[rid] = call.get('id')
             # Parallel calls can all succeed against the same pre-persistence view.
             # Their confirmed IDs survive replay even across the preview limits.
-            state['rules'].append({'id': rid, 'text': text})
+            if not state.get('conflict'):
+                state['rules'].append({'id': rid, 'text': text})
             state['next'] += 1
         else:
             while action == 'add' and f"rule{state['next']}" in acknowledged:
                 state['next'] += 1
+            if state.get('conflict'):
+                if action == 'add':
+                    acknowledged[f"rule{state['next']}"] = call.get('id')
+                    state['next'] += 1
+                continue
             applied = apply_rule(state, inp)
             if action == 'add' and applied.startswith('Recorded ['):
                 rid = state['rules'][-1]['id']
                 if rid in acknowledged:
-                    raise ValueError(f'Conflicting recall_rule acknowledgment for {rid}')
+                    conflict(f'Conflicting recall_rule acknowledgment for {rid}')
                 acknowledged[rid] = call.get('id')
     return state
 
 
 def save_rules(sid, entries):
-    state = replay_rules(entries, completed_only=True, sid=sid)
+    state = current_rule_state(sid, entries)
     _write_json(tr.session_dir(sid) / 'rules.json', state)
     return len(state['rules'])
+
+
+def current_rule_state(sid, entries):
+    import archive
+    archived = archive.entries(sid)
+    source = archived if _has_rule_calls(archived) else entries
+    if not _has_rule_calls(source):
+        saved = _read_json(tr.session_dir(sid) / 'rules.json', {'rules': [], 'next': 1})
+        if saved.get('conflict'):
+            return saved
+    return replay_rules(source, completed_only=True, sid=sid)
+
+
+def _has_rule_calls(entries):
+    return any(str(out['call'].get('name', '')).endswith(RULE_SUFFIX)
+               for out in tr.tool_outcomes(entries).values())
 
 
 def load_rules(sid):
@@ -208,7 +259,15 @@ def load_rules(sid):
 
 
 def rules_block(sid):
-    rules = load_rules(sid)
+    import archive
+    state = _read_json(tr.session_dir(sid) / 'rules.json', {'rules': []})
+    entries = archive.entries(sid)
+    if _has_rule_calls(entries):
+        state = replay_rules(entries, completed_only=True, sid=sid)
+        _write_json(tr.session_dir(sid) / 'rules.json', state)
+    if state.get('conflict'):
+        return rule_conflict_notice(state)
+    rules = state['rules']
     return '\n'.join([pr.RULES_HEADER] + [f"- [{r['id']}] {r['text']}" for r in rules]) if rules else ''
 
 

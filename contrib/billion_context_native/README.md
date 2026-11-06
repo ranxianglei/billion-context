@@ -70,7 +70,7 @@ Claude Code 的插件名与 marketplace 名均为 `billion_context_native`；插
   - 工具描述里带完整压缩规则。
 - `recall_status(session_id?)`：上下文用量和各阈值、所处层级、是否已 ready、压缩次数、存档轮数、摘要数与规则数。
 - `recall_rule(action="add"|"list"|"delete"|"clear", text?, id?, session_id?)`
-  - 语义同 acp-kernel rules：最多 50 条，每条 ≤ 300 字符，重复的拒绝。新规则返回 `rule` 加十进制 UUID 的稳定 ID；删除时原样使用返回值，不要推算编号。旧 `ruleN` 仍兼容，删除后不复用。已存在的重复 ID 历史会报告冲突，不会猜测归属。
+  - 语义同 acp-kernel rules：最多 50 条，每条 ≤ 300 字符，重复的拒绝。新规则返回 `rule` 加十进制 UUID 的稳定 ID；删除时原样使用返回值，不要推算编号。旧 `ruleN` 仍兼容，删除后不复用。已存在的重复 ID 历史会报告冲突并暂停规则，不会猜测归属；可显式调用 `recall_rule(action="clear")` 清空全部规则并重置冲突。只有观察到该调用的明确成功结果后才恢复正常操作，旧 ID 不复用，归档原文保留。`recall_status` 仍显示其他状态和冲突提示。
 
 `recall_status` 和 `recall_rule` 需要找到当前会话的 transcript：
 - 传了 `session_id` 就用它；

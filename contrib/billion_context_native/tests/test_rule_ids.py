@@ -1,5 +1,6 @@
 """Offline regressions for acknowledged rule identities and transcript replay."""
 from concurrent.futures import ThreadPoolExecutor
+import json
 import os
 import pathlib
 import re
@@ -12,6 +13,7 @@ PLUGIN = pathlib.Path(__file__).resolve().parents[1] / 'plugin' / 'billion_conte
 sys.path.insert(0, str(PLUGIN))
 import mcp_server
 import archive
+import hook
 import store
 
 RULE = 'mcp__plugin_billion_context_native_native__recall_rule'
@@ -40,6 +42,42 @@ class RuleIdentityTest(unittest.TestCase):
         env.start()
         self.addCleanup(env.stop)
         self.root = pathlib.Path(temp.name)
+
+    def conflicting_history(self):
+        calls = [('alpha', {'action': 'add', 'text': 'ALPHA'}), ('beta', {'action': 'add', 'text': 'BETA'})]
+        return history(calls, [('alpha', 'Recorded [rule1] ALPHA'), ('beta', 'Recorded [rule1] BETA')])
+
+    def append_call(self, entries, cid, args, result=None):
+        new = history([(cid, args)], [(cid, result)] if result is not None else None)
+        for i, entry in enumerate(new):
+            entry['uuid'] = f'{cid}-{i}'
+        return entries + new
+
+    def test_recovery_status_keeps_metrics_and_clear_is_available_before_reset_persists(self):
+        entries = self.conflicting_history()
+        with patch.object(mcp_server, '_live', return_value=('rules-session', entries)):
+            status = mcp_server.status({})
+            self.assertIn('session_id=rules-session', status)
+            self.assertIn('Context:', status)
+            self.assertIn('rule_conflict', status)
+            for args in ({'action': 'list'}, {'action': 'add', 'text': 'NEW'}, {'action': 'delete', 'id': 'rule1'}):
+                self.assertTrue(mcp_server.rule(args).startswith('Error: rule_conflict'))
+            ack = mcp_server.rule({'action': 'clear'})
+        self.assertEqual(ack, 'Cleared all rules and unresolved rule conflicts. Previous rule IDs remain reserved.')
+        self.assertIn('conflict', store.replay_rules(entries, completed_only=True))
+
+    def test_recovery_save_replaces_stale_projection_and_restore_reports_conflict(self):
+        sid = 'rules-session'
+        directory = archive.session_dir(sid)
+        directory.mkdir(parents=True)
+        stale = {'rules': [{'id': 'rule99', 'text': 'STALE RULE'}], 'next': 100}
+        (directory / 'rules.json').write_text(json.dumps(stale), encoding='utf-8')
+        self.assertEqual(store.save_rules(sid, self.conflicting_history()), 0)
+        state = json.loads((directory / 'rules.json').read_text(encoding='utf-8'))
+        self.assertEqual(state['rules'], [])
+        self.assertIn('conflict', state)
+        self.assertIn('rule_conflict', store.rules_block(sid))
+        self.assertNotIn('STALE RULE', store.rules_block(sid))
 
     def parallel_add(self, texts, entries=None):
         args = [{'action': 'add', 'text': text} for text in texts]
@@ -136,13 +174,136 @@ class RuleIdentityTest(unittest.TestCase):
 
     def test_malformed_and_reused_acknowledgments_fail_without_reassigning_ids(self):
         for result in ('Recorded [] ALPHA', 'Recorded [rule1] WRONG TEXT'):
-            with self.subTest(result=result), self.assertRaisesRegex(ValueError, 'Invalid recall_rule acknowledgment'):
-                store.replay_rules(history([('one', {'action': 'add', 'text': 'ALPHA'})], [('one', result)]), completed_only=True)
+            with self.subTest(result=result):
+                state = store.replay_rules(history([('one', {'action': 'add', 'text': 'ALPHA'})], [('one', result)]), completed_only=True)
+                self.assertEqual(state['rules'], [])
+                self.assertEqual(state['conflict'], 'Invalid recall_rule acknowledgment')
         calls = [('one', {'action': 'add', 'text': 'ALPHA'}), ('clear', {'action': 'clear'}),
                  ('two', {'action': 'add', 'text': 'BETA'})]
         results = [('one', 'Recorded [rule1] ALPHA'), ('clear', 'Cleared 1 rules.'), ('two', 'Recorded [rule1] BETA')]
-        with self.assertRaisesRegex(ValueError, 'Conflicting recall_rule acknowledgment for rule1'):
-            store.replay_rules(history(calls, results), completed_only=True)
+        state = store.replay_rules(history(calls, results), completed_only=True)
+        self.assertEqual(state['rules'], [])
+        self.assertEqual(state['conflict'], 'Conflicting recall_rule acknowledgment for rule1')
+
+    def test_recovery_successful_reset_then_add_list_delete_and_repeated_evidence(self):
+        entries = self.conflicting_history()
+        with patch.object(mcp_server, '_live', return_value=('rules-session', entries)):
+            ack = mcp_server.rule({'action': 'clear'})
+        reset = self.append_call(entries, 'reset', {'action': 'clear'}, ack)
+        state = store.replay_rules(reset + reset, completed_only=True)
+        self.assertNotIn('conflict', state)
+        self.assertEqual(state['rules'], [])
+        with patch.object(mcp_server, '_live', return_value=('rules-session', reset)):
+            added = mcp_server.rule({'action': 'add', 'text': 'NEW RULE'})
+        rid = acknowledged_id(added)
+        self.assertNotEqual(rid, 'rule1')
+        active = self.append_call(reset, 'new', {'action': 'add', 'text': 'NEW RULE'}, added)
+        with patch.object(mcp_server, '_live', return_value=('rules-session', active)):
+            self.assertIn(f'[{rid}] NEW RULE', mcp_server.rule({'action': 'list'}))
+            deleted = mcp_server.rule({'action': 'delete', 'id': rid})
+        self.assertEqual(deleted, f'Deleted [{rid}] NEW RULE')
+        final = self.append_call(active, 'delete-new', {'action': 'delete', 'id': rid}, deleted)
+        self.assertEqual(store.replay_rules(final, completed_only=True)['rules'], [])
+
+    def test_recovery_requires_unambiguous_observed_positive_reset_completion(self):
+        seed = self.conflicting_history()
+        failed = self.append_call(seed, 'reset', {'action': 'clear'}, store.RULE_RESET_ACK)
+        failed[-1]['message']['content'][0]['is_error'] = True
+        rejected = self.append_call(seed, 'reset', {'action': 'clear'}, 'Error: reset rejected')
+        missing = self.append_call(seed, 'reset', {'action': 'clear'})
+        generic = self.append_call(seed, 'reset', {'action': 'clear'}, 'ok')
+        unrelated = self.append_call(seed, 'not-reset', {'action': 'list'}, store.RULE_RESET_ACK)
+        ambiguous = self.append_call(seed, 'reset', {'action': 'clear'}, store.RULE_RESET_ACK)
+        conflict = self.append_call([], 'reset', {'action': 'clear'}, 'Error: reset rejected')
+        conflict[0]['uuid'] = 'conflicting-reset-owner'
+        conflict[1]['uuid'] = 'conflicting-reset-result'
+        ambiguous += conflict
+        envelope_error = self.append_call(seed, 'reset', {'action': 'clear'})
+        envelope_error.append({'type': 'cc_hook_observation', 'hook_event_name': 'PostToolUse', 'data': {
+            'tool_use_id': 'reset', 'tool_input': {'action': 'clear'},
+            'tool_response': {'isError': True, 'content': [{'type': 'text', 'text': store.RULE_RESET_ACK}]}}})
+        for name, rows in (('failed', failed), ('rejected', rejected), ('missing', missing), ('generic', generic),
+                           ('unrelated', unrelated), ('ambiguous', ambiguous), ('envelope-error', envelope_error)):
+            with self.subTest(name=name):
+                state = store.replay_rules(rows, completed_only=True)
+                self.assertIn('conflict', state)
+                self.assertEqual(state['rules'], [])
+
+    def test_recovery_reserves_old_ids_and_accepts_exact_legacy_clear_ack(self):
+        seed = self.conflicting_history()
+        reset = self.append_call(seed, 'reset', {'action': 'clear'}, 'Cleared 2 rules.')
+        old_id = self.append_call(reset, 'reuse', {'action': 'add', 'text': 'NEW'}, 'Recorded [rule1] NEW')
+        self.assertIn('conflict', store.replay_rules(old_id, completed_only=True))
+        malformed = history([('malformed', {'action': 'add', 'text': 'RIGHT'})], [('malformed', 'Recorded [rule3] WRONG')])
+        malformed = self.append_call(malformed, 'reset', {'action': 'clear'}, store.RULE_RESET_ACK)
+        for i in range(4):
+            malformed = self.append_call(malformed, f'legacy-{i}', {'action': 'add', 'text': f'LEGACY {i}'}, 'ok')
+        state = store.replay_rules(malformed, completed_only=True)
+        self.assertNotIn('conflict', state)
+        self.assertEqual([r['id'] for r in state['rules']], ['rule2', 'rule4', 'rule5', 'rule6'])
+
+    def test_recovery_archive_conflict_survives_source_compaction_and_late_restore(self):
+        sid = 'rules-session'
+        source = self.root / (sid + '.jsonl')
+        first = {'type': 'user', 'uuid': 'original-user', 'message': {'role': 'user', 'content': 'ORIGINAL QUESTION'}}
+        rows = [first] + self.conflicting_history()
+        source.write_text(''.join(json.dumps(row) + '\n' for row in rows), encoding='utf-8')
+        archive.sync(sid, str(source))
+        with patch.object(mcp_server.tr, 'find_transcript', return_value=source):
+            self.assertIn('rule_conflict', mcp_server.status({}))
+        directory = archive.session_dir(sid)
+        stale = {'rules': [{'id': 'rule99', 'text': 'STALE RULE'}], 'next': 100}
+        (directory / 'rules.json').write_text(json.dumps(stale), encoding='utf-8')
+        archive_before = (directory / 'events.jsonl').read_bytes()
+        self.assertIn('rule_conflict', store.rules_block(sid))
+        self.assertEqual((directory / 'events.jsonl').read_bytes(), archive_before)
+        data = {'session_id': sid, 'transcript_path': str(source), 'source': 'resume', 'hook_event_name': 'SessionStart'}
+        with patch.object(hook, 'emit_history') as emit:
+            hook.restore(data, 7)
+        self.assertIn('rule_conflict', emit.call_args.args[2])
+        self.assertNotIn('STALE RULE', emit.call_args.args[2])
+        self.assertTrue((directory / 'events.jsonl').read_bytes().startswith(archive_before))
+        compacted = [{'type': 'system', 'subtype': 'compact_boundary', 'uuid': 'boundary'},
+                     {'type': 'user', 'uuid': 'summary', 'isCompactSummary': True,
+                      'message': {'role': 'user', 'content': 'COMPACTED SUMMARY'}}]
+        source.write_text(''.join(json.dumps(row) + '\n' for row in compacted), encoding='utf-8')
+        with patch.object(mcp_server.tr, 'find_transcript', return_value=source):
+            self.assertIn('rule_conflict', mcp_server.status({}))
+            ack = mcp_server.rule({'action': 'clear'})
+        self.assertEqual(store.save_rules(sid, compacted), 0)
+        self.assertIn('conflict', json.loads((directory / 'rules.json').read_text(encoding='utf-8')))
+        reset = self.append_call(compacted, 'reset', {'action': 'clear'}, ack)
+        source.write_text(''.join(json.dumps(row) + '\n' for row in reset), encoding='utf-8')
+        with patch.object(mcp_server.tr, 'find_transcript', return_value=source):
+            self.assertNotIn('rule_conflict', mcp_server.status({}))
+            added = mcp_server.rule({'action': 'add', 'text': 'AFTER RESET'})
+        active = self.append_call(reset, 'new', {'action': 'add', 'text': 'AFTER RESET'}, added)
+        source.write_text(''.join(json.dumps(row) + '\n' for row in active), encoding='utf-8')
+        hook.precompact({**data, 'trigger': 'manual', 'hook_event_name': 'PreCompact'})
+        with patch.object(hook, 'emit_history') as emit:
+            hook.restore(data, 7)
+        self.assertIn(f'[{acknowledged_id(added)}] AFTER RESET', emit.call_args.args[2])
+        self.assertNotIn('rule_conflict', emit.call_args.args[2])
+        self.assertNotIn('ALPHA', emit.call_args.args[2])
+
+    def test_recovery_keeps_saved_only_legacy_fallback_and_propagates_archive_failures(self):
+        sid = 'rules-session'
+        directory = archive.session_dir(sid)
+        directory.mkdir(parents=True)
+        saved = {'rules': [{'id': 'rule7', 'text': 'LEGACY SAVED RULE'}], 'next': 8}
+        (directory / 'rules.json').write_text(json.dumps(saved), encoding='utf-8')
+        self.assertIn('[rule7] LEGACY SAVED RULE', store.rules_block(sid))
+        source = self.root / (sid + '.jsonl')
+        auxiliary = history([('other-agent', {'action': 'add', 'text': 'OTHER AGENT'})], [('other-agent', 'ok')])
+        auxiliary[0]['agentId'] = 'non-main-agent'
+        source.write_text(''.join(json.dumps(row) + '\n' for row in auxiliary), encoding='utf-8')
+        archive.sync(sid, str(source))
+        self.assertIn('[rule7] LEGACY SAVED RULE', store.rules_block(sid))
+        source.write_text('', encoding='utf-8')
+        with patch.object(mcp_server.tr, 'find_transcript', return_value=source), \
+                patch.object(archive, 'sync', side_effect=OSError('ARCHIVE IO FAILURE')):
+            with self.assertRaisesRegex(OSError, 'ARCHIVE IO FAILURE'):
+                mcp_server.rule({'action': 'clear'})
 
     def test_failed_unknown_and_repeated_evidence_do_not_create_rules_twice(self):
         args = {'action': 'add', 'text': 'ALPHA'}
