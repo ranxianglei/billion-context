@@ -267,11 +267,15 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
   // endpoints resolved IN PLACE (the requested message itself still occupies
   // its slot), containment is judged against the WIDENED span, not the
   // literal window. What must stay fatal is the #5830 producer itself: an
-  // endpoint that RESOLVED ELSEWHERE (stale inherited ref snapping to a
-  // distant inheriting-block anchor) sweeps territory the summary never
-  // described regardless of widening — hold the line at the requested
-  // window then. Unmappable coverage fails closed either way (containment
-  // unprovable).
+   // endpoint that RESOLVED ELSEWHERE (stale inherited ref snapping to a
+   // distant inheriting-block anchor) sweeps territory the summary never
+   // described regardless of widening — hold the line at the requested
+   // window then. Coverage ids carrying NO ref entry (synthetic outbound-only
+   // markers, e.g. #2627 turn separators that legacy polluted views registered
+   // into block coverage) describe no client-side real-history content, so a
+   // replaced summary cannot lose anything they stand for — they ride along.
+   // A block whose ENTIRE coverage is unmappable still fails closed
+   // (containment unprovable).
   if (!isBlockBoundary && consumedBlockIds.length > 0 && filteredIds.length > 0) {
     const startBoundary = parseBoundary(input.startRef);
     const endBoundary = parseBoundary(input.endRef);
@@ -310,20 +314,15 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
         for (const mid of block.effectiveMessageIds) {
           const ref = input.state.messageRefs.byRaw[mid];
           const num = ref === undefined ? null : refToIndex(ref);
-          if (num === null) {
-            outOfSpan = true; // unmappable coverage: containment unprovable
-            break;
-          }
+          if (num === null) continue;
           if (num < spanLo || num > spanHi) outOfSpan = true;
           if (minNum === null || num < minNum) minNum = num;
           if (maxNum === null || num > maxNum) maxNum = num;
         }
-        if (outOfSpan) {
-          offenders.push(
-            minNum !== null && maxNum !== null
-              ? `${consumedId} [${indexToRef(minNum)}..${indexToRef(maxNum)}]`
-              : `${consumedId} [unmapped coverage]`,
-          );
+        if (minNum === null || maxNum === null) {
+          offenders.push(`${consumedId} [unmapped coverage]`);
+        } else if (outOfSpan) {
+          offenders.push(`${consumedId} [${indexToRef(minNum)}..${indexToRef(maxNum)}]`);
         }
       }
       if (offenders.length > 0) {
