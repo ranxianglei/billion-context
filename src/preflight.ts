@@ -52,7 +52,30 @@ import { newExternalCallId } from "./external-summary-marker.js";
 // content — via dedicated summarization calls sized to fit the smaller
 // window, before the payload is forwarded.
 
-export const MAX_PREFLIGHT_ROUNDS = 16;
+const DEFAULT_PREFLIGHT_ROUNDS = 16;
+
+/**
+ * Round caps are the WALL-CLOCK bound of one preflight invocation, and every
+ * round is a full kernel pass over the whole history running on the proxy's
+ * single event-loop thread. A big-history session that needs N rounds therefore
+ * blocks every OTHER session for N x pass-time — observed: a 750k-token session
+ * spent 17 rounds / 207s folding 3149 tokens ("preflight compressed 1 range(s),
+ * ~3149.86 tokens saved in 207392ms") while six unrelated sessions queued, each
+ * reporting local=~100s, and the resulting 303s of event-loop silence tripped
+ * the watchdog hard threshold and exited the proxy.
+ *
+ * Both caps are tunable so a deployment can trade fold coverage for latency
+ * (`BILI_PREFLIGHT_MAX_ROUNDS`, `BILI_PREFLIGHT_EMERGENCY_ROUND_CAP`). Unset =
+ * historical defaults, so behavior is unchanged unless the operator opts in.
+ */
+function preflightCapFromEnv(name: string, fallback: number): number {
+    const raw = process.env[name]?.trim();
+    if (!raw) return fallback;
+    const n = Number.parseInt(raw, 10);
+    return Number.isFinite(n) && n >= 1 ? n : fallback;
+}
+
+export const MAX_PREFLIGHT_ROUNDS = preflightCapFromEnv("BILI_PREFLIGHT_MAX_ROUNDS", DEFAULT_PREFLIGHT_ROUNDS);
 const CHUNK_FRACTION = 0.6;
 const MIN_CHUNK_TOKENS = 2000;
 const MIN_SUMMARY_CHARS = 50;
@@ -160,12 +183,12 @@ const FIT_FORWARD_ESTIMATE_ONLY_MARGIN = 0.85;
 // and the trigger derives from this loop's own coverage math instead of an
 // arbitrary multiplier — normal sessions (one turn of growth per request)
 // never approach it.
-const EMERGENCY_FOLD_COVERAGE = MAX_PREFLIGHT_ROUNDS * 2 * CHUNK_FRACTION;
+const EMERGENCY_FOLD_COVERAGE = DEFAULT_PREFLIGHT_ROUNDS * 2 * CHUNK_FRACTION;
 // Round cap for the emergency regime: every round is CPU-only (kernel walk +
 // digest, no upstream wait), so even the worst case stays at seconds; 512
 // covers ~250x the window at observed per-fold savings (~0.5-0.6x window) —
 // far beyond any realistic resend size.
-const EMERGENCY_ROUND_CAP = 512;
+const EMERGENCY_ROUND_CAP = preflightCapFromEnv("BILI_PREFLIGHT_EMERGENCY_ROUND_CAP", 512);
 // Per-entry head-fragment length in digest form A (form B strips heads when
 // even that does not fit the bounds).
 const DIGEST_HEAD_CHARS = 120;

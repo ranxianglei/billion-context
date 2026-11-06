@@ -44,6 +44,28 @@ const WATCHDOG_CHECK_INTERVAL_MS = 5_000;
 export const WATCHDOG_SOFT_WARN_MS = 30_000;
 export const WATCHDOG_HARD_TIMEOUT_MS = 5 * 60_000;
 
+/**
+ * Env override for the hard threshold (`BILI_WATCHDOG_HARD_TIMEOUT_MS`).
+ *
+ * The hard threshold is the only thing that decides whether a long-but-
+ * legitimate synchronous stretch is treated as a wedge and takes the whole
+ * proxy down with it. It cannot distinguish "wedged forever" from "still
+ * working, will finish in 4 minutes", and a preflight pass over a huge history
+ * is exactly the second kind: observed 207s of continuous block on a
+ * 750k-token session, 3s past the 300s threshold, which exited the proxy and
+ * then failed to respawn (`proxy respawn gave up — model traffic goes direct
+ * (uncompressed)`), so every session lost compression until dsh was restarted.
+ *
+ * Deployments whose worst-case pass exceeds the default can raise it instead of
+ * watching the proxy suicide mid-turn. Unset = historical 300s default.
+ */
+function watchdogHardTimeoutEnvMs(): number | undefined {
+    const raw = process.env.BILI_WATCHDOG_HARD_TIMEOUT_MS?.trim();
+    if (!raw) return undefined;
+    const n = Number(raw);
+    return Number.isFinite(n) && n > 0 ? Math.floor(n) : undefined;
+}
+
 type WatchdogVerdict = "ok" | "warn" | "trip";
 
 /** Pure gap→verdict mapping — the worker's tick logic, unit-testable without
@@ -176,7 +198,7 @@ const WORKER_CODE = [
 export function armEventLoopWatchdog(opts: ArmEventLoopWatchdogOptions = {}): EventLoopWatchdogHandle | undefined {
     const heartbeatMs = opts.heartbeatMs ?? WATCHDOG_HEARTBEAT_MS;
     const softWarnMs = opts.softWarnMs ?? WATCHDOG_SOFT_WARN_MS;
-    const hardTimeoutMs = opts.hardTimeoutMs ?? WATCHDOG_HARD_TIMEOUT_MS;
+    const hardTimeoutMs = opts.hardTimeoutMs ?? watchdogHardTimeoutEnvMs() ?? WATCHDOG_HARD_TIMEOUT_MS;
     const checkIntervalMs = opts.checkIntervalMs ?? WATCHDOG_CHECK_INTERVAL_MS;
     const fatalMode: "exit" | "report" = opts.fatalMode ?? "exit";
 
