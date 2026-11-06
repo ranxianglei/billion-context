@@ -243,7 +243,7 @@ test("rolling marks: repeated prompts retain distinct IDs and match full resend"
         const { modes } = await runIncremental(inc, requests);
         assert.deepEqual(modes, ["seed", ...requests.slice(1).map(() => "delta")]);
         for (let i = 0; i < requests.length; i++) {
-            assert.equal(JSON.stringify(withoutTagTime(inc.forwarded[i].messages)), JSON.stringify(withoutTagTime(base.forwarded[i].messages)));
+            assert.equal(canonMessages(inc.forwarded[i].messages), canonMessages(base.forwarded[i].messages));
             assert.equal(messageBreakpoints(inc.forwarded[i]), messageBreakpoints({ messages: requests[i] }));
         }
     } finally { await inc.close(); }
