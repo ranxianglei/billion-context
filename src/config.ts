@@ -1892,6 +1892,13 @@ export interface PiSubagentsFileConfig {
     /** "skip" (default) — suppress the completion notification when the
      *  model already read the result file; "always" — always inject. */
     notifyIfRead?: "skip" | "always";
+    /** Deliver acp_delegate notifications as a typed custom message carrying a
+     *  versioned details envelope (run identity + launch provenance) alongside
+     *  the SAME model-visible text, so third-party UIs tie a notice to its
+     *  launching turn without parsing prose (#5750). Default false — plain
+     *  user-message delivery, byte-identical to before; hosts without
+     *  ExtensionAPI.sendMessage fall back to the plain path automatically. */
+    notifyStructured?: boolean;
     /** TUI shortcut for the fleet inspector (default "ctrl+alt+d"); ""
      *  disables keyboard registration (/acp-fleet still works). */
     fleetShortcut?: string;
