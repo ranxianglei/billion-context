@@ -605,3 +605,53 @@ test("fold-then-append across a REAL restart: post-fold log entries clear the ck
         } finally { db.close(); }
     } finally { h.cleanup(); }
 });
+
+test("archiving a session sweeps its pf planes too (review BUG-2 regression): no orphaned sid rows survive the tombstone; a restored session re-boots through a fresh arm", () => {
+    const h = makeH("archpf");
+    const SESS = "s-ap";
+    const CARRIER_A = "car-ap-a";
+    try {
+        const log = makeLog();
+        const b1 = makeBody([{ role: "system", content: SYS }, { role: "user", content: "u1" }]);
+        const rA = turn(SESS, CARRIER_A, b1, ["p0", "p1"], log);
+        assert.equal(rA.outcome.decision, "arm");
+        const sidA = rA.sid!;
+        // Second carrier ⇒ second world on the SAME relay session: the
+        // registry holds two sids, so the cascade must reach every partition
+        // of BOTH, not just the newest.
+        const rB = turn(SESS, "car-ap-b", b1, ["p0", "p1"], log);
+        assert.equal(rB.outcome.decision, "arm");
+        const sidB = rB.sid!;
+        assert.notEqual(sidB, sidA, "distinct carriers mint distinct worlds");
+        // A real sessions row for the archive machinery to find (in
+        // production the first plugin turn records one).
+        const db0 = new DatabaseSync(path.join(h.dir, "index.db"));
+        db0.prepare(`INSERT INTO sessions (session_id, created_at, updated_at) VALUES (?, ?, ?)`).run(SESS, Date.now(), Date.now());
+        db0.close();
+        const archDir = path.join(h.dir, "arch");
+        const arch = h.store.unifiedArchiveSession(SESS, archDir);
+        assert.ok(arch !== null && arch.ok, `archive must succeed, got ${JSON.stringify(arch)}`);
+        const db = new DatabaseSync(path.join(h.dir, "index.db"));
+        try {
+            for (const t of ["pf_rows", "pf_log", "pf_ckpt", "pf_render", "pf_render_log", "pf_render_ckpt"]) {
+                for (const sid of [sidA, sidB]) {
+                    const row = db.prepare(`SELECT COUNT(*) AS n FROM ${t} WHERE sid = ?`).get(sid) as { n: number };
+                    assert.equal(row.n, 0, `${t} must be swept by archive — before the fix every archived session's plane rows stayed permanently orphaned behind the deleted registry`);
+                }
+            }
+            const srow = db.prepare(`SELECT status FROM sessions WHERE session_id = ?`).get(SESS) as { status: string };
+            assert.equal(srow.status, "archived", "the sessions row survives as a tombstone, like every other archived session");
+        } finally { db.close(); }
+        // Rebuildability: the planes are a cache, never an identity source.
+        // A restored session whose ledger plane was purged must re-bootstrap
+        // through a FRESH arm (probe-miss ⇒ rule ③) instead of fault-looping
+        // on the dead sids its exported registry still lists.
+        const res = h.store.unifiedRestoreArchived(SESS, archDir);
+        assert.ok(res !== null && res.ok, `restore must succeed, got ${JSON.stringify(res)}`);
+        clearWatermarkV6(SESS);
+        const log2 = makeLog();
+        const rC = turn(SESS, CARRIER_A, b1, ["p0", "p1"], log2);
+        assert.equal(rC.outcome.decision, "arm", `restored session must re-arm cleanly off an empty probe (log=${JSON.stringify(log2.lines.slice(-3))})`);
+        assert.notEqual(rC.sid, sidA, "a FRESH world mint — the old plane bytes are gone by design");
+    } finally { h.cleanup(); }
+});

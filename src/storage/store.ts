@@ -1899,7 +1899,10 @@ export class UnifiedStore {
      *  showing it) and the conversations identity binding survives (identity
      *  is forever; a restore must land on the same session id). Pinned
      *  checkpoints keep their rows + refs. Idempotent: an already-archived
-     *  session is a no-op returning the log path. */
+     *  session is a no-op returning the log path. The six fastpath v6 plane
+     *  partitions (#5643/#5664, sid-keyed through the session_ext registry)
+     *  are swept in the same transaction — a rebuildable cache, never
+     *  exported: a restored session re-boots through a fresh arm. */
 
     archiveSession(sessionId: string, opts: { archiveDir: string }): { ok: boolean; exportPath?: string; reason?: string; contentRowsDeleted?: number } {
         const row = this.getSessionRow(sessionId);
@@ -1920,7 +1923,7 @@ export class UnifiedStore {
         const refsRows = (this.db.prepare("SELECT ord, raw_id, ref, ref_num FROM refs WHERE session_id = ? ORDER BY ord").all(sessionId) as Record<string, unknown>[]);
         const deadRefs = (this.db.prepare("SELECT ord, ref, ref_num, recorded_at FROM dead_refs WHERE session_id = ? ORDER BY ord").all(sessionId) as Record<string, unknown>[]);
         const ccr = (this.db.prepare("SELECT ord, ccr_key, content_hash FROM ccr_entries WHERE session_id = ? ORDER BY ord").all(sessionId) as Record<string, unknown>[]);
-        const ext = (this.db.prepare("SELECT key, value_json FROM session_ext WHERE session_id = ?").all(sessionId) as Record<string, unknown>[]);
+        const ext = (this.db.prepare("SELECT key, value_json, updated_at FROM session_ext WHERE session_id = ?").all(sessionId) as Record<string, unknown>[]);
         const checkpoints = (this.db.prepare("SELECT cp_id, seq_at, block_set_hash, kind, created_at, pinned, label, state_hash FROM checkpoints WHERE session_id = ?").all(sessionId) as Record<string, unknown>[]);
         // --- collect the distinct CAS bodies referenced by those rows ---
         const wanted = new Set<string>();
@@ -1954,6 +1957,36 @@ export class UnifiedStore {
             this.db.prepare("DELETE FROM dead_refs WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM refs WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM ccr_entries WHERE session_id = ?").run(sessionId);
+            // #5652 review BUG-2: archive swept every table EXCEPT the six
+            // fastpath v6 plane partitions, which hang off the session only
+            // through the ext registry (same key deleteSession cascades):
+            // once session_ext died, no sid was referable anymore and every
+            // archived session's plane rows were permanently orphaned —
+            // invisible to gc() and to sessionStorageStats alike. The planes
+            // are a rebuildable CACHE, never an identity source: a restored
+            // session re-boots through a fresh arm (probe-miss ⇒ rule ③), so
+            // dropping them here loses nothing — they are deliberately NOT
+            // exported into the JSONL either (the exported registry rows then
+            // ride restore harmlessly: probes resolve nothing, clean re-arm).
+            const pfRegRow = this.db
+                .prepare("SELECT value_json FROM session_ext WHERE session_id = ? AND key = 'pf:v6-sids'")
+                .get(sessionId) as { value_json: string } | undefined;
+            if (pfRegRow !== undefined) {
+                let pfSids: unknown[] = [];
+                try {
+                    const p = JSON.parse(pfRegRow.value_json);
+                    if (Array.isArray(p)) pfSids = p;
+                } catch { /* corrupt registry: nothing to cascade from */ }
+                for (const sid of pfSids) {
+                    if (typeof sid !== "string") continue;
+                    this.db.prepare("DELETE FROM pf_rows WHERE sid = ?").run(sid);
+                    this.db.prepare("DELETE FROM pf_log WHERE sid = ?").run(sid);
+                    this.db.prepare("DELETE FROM pf_ckpt WHERE sid = ?").run(sid);
+                    this.db.prepare("DELETE FROM pf_render WHERE sid = ?").run(sid);
+                    this.db.prepare("DELETE FROM pf_render_log WHERE sid = ?").run(sid);
+                    this.db.prepare("DELETE FROM pf_render_ckpt WHERE sid = ?").run(sid);
+                }
+            }
             this.db.prepare("DELETE FROM session_ext WHERE session_id = ?").run(sessionId);
             this.db.prepare("UPDATE sessions SET status = 'archived' WHERE session_id = ?").run(sessionId);
             for (const hash of rel) this.releaseContent(hash);
@@ -2035,8 +2068,12 @@ export class UnifiedStore {
             for (const d of dump.deadRefs) insDead.run(sessionId, d.ord, d.ref, d.ref_num, d.recorded_at);
             const insCcr = this.db.prepare("INSERT INTO ccr_entries (session_id, ord, ccr_key, content_hash) VALUES (?, ?, ?, ?)");
             for (const e of dump.ccrEntries) insCcr.run(sessionId, e.ord, e.ccr_key, e.content_hash);
-            const insExt = this.db.prepare("INSERT INTO session_ext (session_id, key, value_json) VALUES (?, ?, ?)");
-            for (const x of dump.sessionExt) insExt.run(sessionId, x.key, x.value_json);
+            // #5652 review: restore used to re-insert ext rows without
+            // updated_at (NOT NULL in DDL) → restoring ANY session carrying a
+            // single ext row threw (v6 sessions always do: sid registry +
+            // guard). Older exports predate the field: fall back to now().
+            const insExt = this.db.prepare("INSERT INTO session_ext (session_id, key, value_json, updated_at) VALUES (?, ?, ?, ?)");
+            for (const x of dump.sessionExt) insExt.run(sessionId, x.key, x.value_json, typeof x.updated_at === "number" ? x.updated_at : Date.now());
             const insCp = this.db.prepare("INSERT INTO checkpoints (cp_id, session_id, seq_at, block_set_hash, kind, created_at, pinned, label, state_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(cp_id) DO NOTHING");
             for (const cp of dump.checkpoints) insCp.run(cp.cp_id, sessionId, cp.seq_at, cp.block_set_hash, cp.kind, cp.created_at, cp.pinned, cp.label ?? null, cp.state_hash);
             this.db
