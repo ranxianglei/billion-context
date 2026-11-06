@@ -87,6 +87,7 @@ or object form:
     "asyncTimeoutMinutes": 30,
     "thinkingLevel": "medium",
     "notifyIfRead": "skip",
+    "notifyStructured": false,
     "displayUsage": "separate",
     "forceEnable": false,
     "fleetShortcut": "ctrl+alt+d",
@@ -112,6 +113,7 @@ or object form:
 | `delegate.thinkingLevel` | string | unset | Global default thinking level (off\|minimal\|low\|medium\|high\|xhigh\|max). Priority: per-call > role > global > Pi default. |
 | `delegate.agents` | object | unset | Per-role defaults: `{ "<role>": { "model": "provider/id", "thinkingLevel": "…" } }`. Invalid models fall back to the parent model with a warning (never fail). |
 | `delegate.notifyIfRead` | `"skip" \| "always"` | `"skip"` | Skip the completion notification when the model already read the result file after the run finished. |
+| `delegate.notifyStructured` | boolean | `false` | Deliver notifications as typed custom messages carrying a versioned `details` envelope (runId/status/agent + launch provenance: originToolCallId/sourceSessionId), so third-party UIs tie each notice to its launching turn without parsing prose (#5750). Model-visible text and steer delivery are unchanged; hosts without `sendMessage` fall back to plain text automatically. |
 | `delegate.fleetShortcut` | string | `"ctrl+alt+d"` | TUI shortcut for the fleet inspector. `""` disables keyboard registration (`/acp-fleet` still works). Moved off `ctrl+alt+f`, which pi-subagents also claims (#412). |
 | `delegatePrompt` | string \| null | built-in | Replace (string) or remove (`null`) the `ACP_DELEGATE NOTIFICATIONS` system-prompt appendix. |
 | `debug` | boolean | `false` | Debug-level events in `~/.pi/acp.log` (shared with billion-context-pi). Env `ACP_DEBUG=1` too. |
