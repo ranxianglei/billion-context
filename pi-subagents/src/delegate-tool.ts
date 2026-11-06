@@ -213,6 +213,13 @@ interface DelegateRun {
   activityFile?: string;
   /** runId of the run this run resumed from (resumeFrom). */
   resumedFrom?: string;
+  /** Tool-call id of the acp_delegate call that launched this run, captured at
+   *  launch so a LATE notification still ties back to its launching turn
+   *  (structured-details envelope, #5750). */
+  originToolCallId?: string;
+  /** Host session id at launch (main-session provenance for nested/codemode
+   *  runs); best-effort — undefined when the host exposes no session id. */
+  sourceSessionId?: string;
   consumed?: boolean;
   /** True once the close handler injected the result as a system
    *  notification (sendUserMessage succeeded). Lets a later wait() avoid
@@ -273,6 +280,64 @@ let delegatePolicy: DelegatePolicy = DEFAULT_DELEGATE_POLICY;
 
 export function setDelegatePolicy(policy: DelegatePolicy): void {
   delegatePolicy = policy;
+}
+
+// ─── Structured delegate-notification envelope (#5750) ───────────────────────
+// Opt-in via delegate.notifyStructured (default false): notifications go out as a
+// typed custom message whose `details` carries versioned run identity + launch
+// provenance, while `content` stays byte-identical to the plain user message (the
+// model sees the same text + steer either way). Lets third-party UIs fold a notice
+// onto its launching turn without parsing prose. Falls back to the plain path when
+// the host lacks ExtensionAPI.sendMessage.
+const DELEGATE_NOTIFY_CUSTOM_TYPE = "billion-context:delegate-notification";
+const DELEGATE_NOTIFY_SCHEMA_VERSION = 1;
+
+interface DelegateNotificationRunRef {
+  runId: string;
+  status: RunStatus;
+  agent?: string;
+  sourceSessionId?: string;
+  originToolCallId?: string;
+}
+
+interface DelegateNotificationDetails {
+  version: number;
+  kind: "terminal" | "usage";
+  runs: DelegateNotificationRunRef[];
+}
+
+function refOfRun(r: DelegateRun): DelegateNotificationRunRef {
+  return { runId: r.runId, status: r.status, agent: r.agent, sourceSessionId: r.sourceSessionId, originToolCallId: r.originToolCallId };
+}
+
+function buildNotificationDetails(kind: "terminal" | "usage", runsList: DelegateRun[]): DelegateNotificationDetails {
+  return { version: DELEGATE_NOTIFY_SCHEMA_VERSION, kind, runs: runsList.map(refOfRun) };
+}
+
+/** Send one notification. Delivered as steer (not followUp — consumed at the next
+ *  safe boundary of the current task AND persisted in-session, #2320/#2546).
+ *  Structured (typed custom message, same text, details extension-only) when
+ *  notifyStructured is on AND the host exposes sendMessage; otherwise the plain
+ *  user message. Returns true only when the host accepted it, so a failed/unavailable
+ *  send leaves the run undelivered for later recovery. */
+function sendDelegateNotification(pi: ExtensionAPI, text: string, details: DelegateNotificationDetails): boolean {
+  const structured = delegatePolicy.notifyStructured && typeof pi.sendMessage === "function";
+  try {
+    if (structured) {
+      pi.sendMessage.call(pi, { customType: DELEGATE_NOTIFY_CUSTOM_TYPE, content: text, display: true, details }, { deliverAs: "steer" });
+      return true;
+    }
+    const send = pi.sendUserMessage;
+    if (typeof send === "function") {
+      send.call(pi, text, { deliverAs: "steer" });
+      return true;
+    }
+    logWarn("delegate", { event: "notify-no-channel", reason: "no send channel available" });
+    return false;
+  } catch (err) {
+    logError("delegate", { event: "notify-send-error", error: String(err), structured });
+    return false;
+  }
 }
 
 // ─── Delegate concurrency gate (#294) ───────────────────────────────────────
@@ -758,7 +823,7 @@ The delegate runs in its own clean pi process — it does NOT see this conversat
     renderResult: (result, options, theme, ctx) => renderDelegateResult(result, options, theme, ctx),
     async execute(toolCallId, params, signal, _onUpdate, ctx): Promise<AgentToolResult<DelegateRenderMeta>> {
       const args = params as DelegateArgs;
-      const { text, meta } = await runDelegate(pi, args, ctx, signal);
+      const { text, meta } = await runDelegate(pi, args, ctx, signal, toolCallId);
       const notice = undeliveredNotice();
       const outcome = notice ? `${notice}\n\n${text}` : text;
       return { details: meta, content: [{ type: "text", text: outcome }] };
@@ -993,21 +1058,10 @@ function commitAtTurnEnd(pi: ExtensionAPI, st: HostNotificationState): void {
     }
     text = buildBatchText(deliverable, mode, () => true);
   }
-  const send = pi.sendUserMessage;
-  let sent = false;
-  if (typeof send === "function") {
-    try {
-      // Steering, not follow-up (#2320/#2546): consumed at the next safe
-      // boundary of the current task AND persisted in the session, unlike the
-      // request-local context append this replaces.
-      send.call(pi, text, { deliverAs: "steer" });
-      sent = true;
-    } catch (err) {
-      logError("delegate", { event: "notify-turn-end-error", error: String(err), runIds: deliverable.map((r) => r.runId).join(",") });
-    }
-  } else {
-    logWarn("delegate", { event: "notify-turn-end-skipped", reason: "sendUserMessage unavailable" });
-  }
+  // Envelope lists every run in the message: primary + recovery-folded runs for a
+  // single, the full batch otherwise.
+  const represented = deliverable.length === 1 ? [deliverable[0]!, ...covered] : deliverable;
+  const sent = sendDelegateNotification(pi, text, buildNotificationDetails("terminal", represented));
   if (sent) {
     for (const r of deliverable) r.injected = true;
     for (const c of covered) c.injected = true;
@@ -1091,22 +1145,10 @@ function flushHostNotifications(pi: ExtensionAPI): void {
     }
     text = buildBatchText(deliverable, mode, (r) => queued.has(r));
   }
-  const send = pi.sendUserMessage;
-  let sent = false;
-  if (typeof send === "function") {
-    try {
-      // Steering, not follow-up (#2320): a follow-up parked here would wait for
-      // the WHOLE task to end before reaching the model; steering is consumed at
-      // the next safe boundary of the current task — which, at the idle tier, is
-      // immediately (an idle host starts a turn right away).
-      send.call(pi, text, { deliverAs: "steer" });
-      sent = true;
-    } catch (err) {
-      logError("delegate", { event: "notify-batch-error", error: String(err), runIds: deliverable.map((r) => r.runId).join(",") });
-    }
-  } else {
-    logWarn("delegate", { event: "notify-batch-skipped", reason: "sendUserMessage unavailable" });
-  }
+  // Envelope lists every run in the message: primary + recovery-folded runs for a
+  // single, the full batch otherwise.
+  const represented = deliverable.length === 1 ? [deliverable[0]!, ...covered] : deliverable;
+  const sent = sendDelegateNotification(pi, text, buildNotificationDetails("terminal", represented));
   if (sent) {
     for (const r of deliverable) r.injected = true;
     for (const c of covered) c.injected = true;
@@ -1425,11 +1467,22 @@ function spawnDelegateChild(opts: {
   return child;
 }
 
+/** Host session id for launch provenance; best-effort (undefined when the host
+ *  exposes no session id or the call throws) so capture never breaks a launch. */
+function safeSourceSessionId(ctx: ExtensionContext): string | undefined {
+  try {
+    return ctx.sessionManager?.getSessionId?.();
+  } catch {
+    return undefined;
+  }
+}
+
 async function runDelegate(
   pi: ExtensionAPI,
   args: DelegateArgs,
   ctx: ExtensionContext,
   signal: AbortSignal | undefined,
+  originToolCallId: string,
 ): Promise<{ text: string; meta: DelegateRenderMeta }> {
   const errorResult = (text: string): { text: string; meta: DelegateRenderMeta } => ({ text, meta: { kind: "delegate", agent: args.agent } });
   const agent = AGENTS[args.agent];
@@ -1505,6 +1558,8 @@ async function runDelegate(
       startedAt: Date.now(),
       status: "queued",
       resumedFrom: args.resumeFrom,
+      originToolCallId,
+      sourceSessionId: safeSourceSessionId(ctx),
     };
     runs.set(runId, run);
     delegateStatusWidget.poke();
@@ -2206,27 +2261,24 @@ export function injectResult(
   activityFile?: string,
   signal?: NodeJS.Signals | null,
 ): boolean {
-  const send = pi.sendUserMessage;
-  if (typeof send !== "function") {
-    debug.event("delegate-inject-skipped", { runId, reason: "sendUserMessage unavailable" });
-    logWarn("delegate", { event: "inject-skipped", runId, reason: "sendUserMessage unavailable" });
+  // Preserve the cheap no-op when the host has no message channel at all:
+  // buildInjectText accumulates usage (separate mode), so don't run it unless we
+  // can actually deliver.
+  const canSend = typeof pi.sendUserMessage === "function" || (delegatePolicy.notifyStructured && typeof pi.sendMessage === "function");
+  if (!canSend) {
+    debug.event("delegate-inject-skipped", { runId, reason: "no send channel available" });
+    logWarn("delegate", { event: "inject-skipped", runId, reason: "no send channel available" });
     return false;
   }
   const { text, covered } = buildInjectText(agent, runId, task, status, code, file, timedOut, usage, mode, usageAlreadyReported, body, activityFile, signal);
-  try {
-    // Steering, not follow-up (#2320): a follow-up parked here would wait out
-    // the whole task before reaching the model; steering is consumed at the
-    // next safe boundary (immediately when the host is idle).
-    send.call(pi, text, { deliverAs: "steer" });
-    // Commit the recovery marking only now: a thrown send above must leave the
-    // covered runs undelivered so a later carrier can still recover them.
-    for (const r of covered) r.injected = true;
-    return true;
-  } catch (err) {
-    debug.event("delegate-inject-error", { runId, error: String(err) });
-    logError("delegate", { event: "inject-error", runId, agent, error: String(err) });
-    return false;
-  }
+  // Envelope lists the primary run plus any recovery runs folded into the text.
+  const primary = runs.get(runId);
+  const represented = primary ? [primary, ...covered] : covered;
+  const sent = sendDelegateNotification(pi, text, buildNotificationDetails("terminal", represented));
+  // Commit the recovery marking only on success: a failed send leaves the covered
+  // runs undelivered so a later carrier can still recover them.
+  if (sent) for (const r of covered) r.injected = true;
+  return sent;
 }
 
 /** Send the inline-fetch usage note (#2913). When a delegate's result reaches
@@ -2246,19 +2298,9 @@ export function emitInlineUsageNote(pi: ExtensionAPI, run: DelegateRun, mode: "m
   if (!block.trim()) return;
   const label = run.status === "failed" ? "FAILED ⚠️" : run.status === "cancelled" ? "cancelled" : "completed";
   const text = `[acp_delegate ${label}] **${run.agent}** (runId \`${run.runId}\`) — usage summary\n${block.replace(/^\s+/, "")}\nThis is an automated system message, NOT a user request.`;
-  const send = pi.sendUserMessage;
-  if (typeof send !== "function") {
-    debug.event("delegate-inline-usage-skipped", { runId: run.runId, reason: "sendUserMessage unavailable" });
-    logWarn("delegate", { event: "inline-usage-skipped", runId: run.runId, reason: "sendUserMessage unavailable" });
-    return;
-  }
-  try {
-    send.call(pi, text, { deliverAs: "steer" });
+  if (sendDelegateNotification(pi, text, buildNotificationDetails("usage", [run]))) {
     run.usageNoted = true;
     debug.event("delegate-inline-usage-note", { runId: run.runId, status: run.status });
-  } catch (err) {
-    debug.event("delegate-inline-usage-error", { runId: run.runId, error: String(err) });
-    logError("delegate", { event: "inline-usage-error", runId: run.runId, error: String(err) });
   }
 }
 
