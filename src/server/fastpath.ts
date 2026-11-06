@@ -34,6 +34,7 @@
 import type { CoreMessage } from "acp-kernel";
 import type { OpenAIRequestBody } from "acp-kernel/wire";
 import { openaiToCore } from "acp-kernel/wire";
+import { createHash, type Hash } from "node:crypto";
 import type http from "node:http";
 import { featureEnabled } from "../rollout.js";
 import { getStore } from "../persist.js";
@@ -60,6 +61,11 @@ interface PFSavedState {
     m: string;
     misses: number;
     disabledAt?: number;
+    /** #5418-self: canonical byte digest (sha256 hex) over the messages
+     *  elements [0..t) as they stood when the response stamped t. Lets the
+     *  proxy stand in for a host that never echoes x-bili-pf-count — see
+     *  hashElementRange. Absent on states written by pre-#5418-self builds. */
+    p?: string;
     /** Last received tail-id list (#5418 v2) — survives restarts so the
      *  prevId continuity check is live on the first turn back. */
     l?: string[];
@@ -123,6 +129,10 @@ export interface FastpathOutcome {
      *  into the (re)seeded state either way so continuity holds across both.
      *  Absent (undefined) for count-only turns or shape-invalid lists. */
     readonly receivedTailIds?: string[];
+    /** #5418-self: digest over the first `measuredT` elements of THIS payload
+     *  — finalize persists it so the next turn can verify its prefix without
+     *  a client echo. Undefined when the scan failed. */
+    readonly fullDigest?: string;
 }
 
 /** #5418 v2: decode the shim's x-bili-pf-tail-ids value.
@@ -155,6 +165,26 @@ function parseTailIds(raw: string): string[] | null {
     return ids;
 }
 
+/** #5418-self: hash the raw source bytes of messages elements [from, to).
+ *  Element spans come from scanMessagesSpans, so this is a byte-exact view of
+ *  exactly the prefix a full parse would consume — no JSON decode involved.
+ *  `base` lets a caller chain further ranges onto one running hash. */
+function hashElementRange(bodyText: string, spans: readonly RawSpan[], from: number, to: number, base?: Hash): Hash {
+    const h = base ?? createHash("sha256");
+    for (let i = from; i < to; i++) {
+        const sp = spans[i];
+        if (sp === undefined) break;
+        h.update(bodyText.slice(sp.start, sp.end));
+    }
+    return h;
+}
+
+/** Digest over the first `count` elements — the value the next turn re-derives
+ *  from its own candidate prefix to prove it is byte-identical. */
+function digestElementRange(bodyText: string, spans: readonly RawSpan[], count: number): string {
+    return hashElementRange(bodyText, spans, 0, count).digest("hex");
+}
+
 function readSaved(sessionId: string): PFSavedState | null {
     try {
         const store = getStore();
@@ -173,6 +203,9 @@ function readSaved(sessionId: string): PFSavedState | null {
             l: Array.isArray(o.l) && o.l.length > 0 && o.l.length <= 2048
                 && (o.l as unknown[]).every((x): x is string => typeof x === "string" && x.length > 0 && x.length <= 512)
                 ? (o.l as string[]) : undefined,
+            // #5418-self: the digest must survive read-back or the self-stamp
+            // never engages (an unvalidated field would be silently dropped).
+            p: typeof o.p === "string" && /^[0-9a-f]{64}$/u.test(o.p) ? o.p : undefined,
         };
     } catch {
         return null;
@@ -231,11 +264,47 @@ export function evaluateWatermarkFastpath(
     if (scan === null) return { hit: null, measuredT: undefined, decision: "scan-broken", creditedMiss: false };
     const T = scan.total;
     const rawStamp = req.headers[PF_COUNT_HEADER];
-    const stamped = typeof rawStamp === "string" && /^\d+$/.test(rawStamp.trim()) ? parseInt(rawStamp.trim(), 10) : NaN;
+    let stamped = typeof rawStamp === "string" && /^\d+$/.test(rawStamp.trim()) ? parseInt(rawStamp.trim(), 10) : NaN;
+    // --- #5418-self: stand in for a host that never echoes the stamp --------
+    // The dsh lane sends no x-bili-pf-count, so every turn used to fall
+    // through to "no-stamp" and re-parse the entire history — the O(messages)
+    // cost this lane exists to remove. The response still stamped T
+    // (x-bili-pf-seq) every turn, and the ledger persisted that T together
+    // with a byte digest of exactly the elements it covered. So the ASSERTION
+    // the echo carries — "the first K elements are the ones you already
+    // parsed" — becomes MEASURABLE here: re-hash this turn's first K elements
+    // and require the digest to be identical. A hit therefore proves the
+    // prefix is byte-identical, which is STRICTLY stronger than the count
+    // echo (an in-place edit of equal width changes the digest but not the
+    // count — the §7.4 hole). No trust is widened; a stale digest costs one
+    // hash pass and falls back to the legacy path unchanged.
+    let selfStamped = false;
+    let selfStampDrift = false;
+    let prefixBase: Hash | undefined;
+    let prefixCount = 0;
+    if (Number.isNaN(stamped) && saved !== null && saved.p !== undefined
+        && saved.m === input.model && saved.t > 0 && saved.t <= T) {
+        const probeBase = hashElementRange(bodyText, scan.messageSpans, 0, saved.t);
+        const probe = probeBase.copy();
+        if (probe.digest("hex") === saved.p) {
+            stamped = saved.t;
+            selfStamped = true;
+            prefixBase = probeBase;
+            prefixCount = saved.t;
+        } else {
+            selfStampDrift = true;
+        }
+    }
+    // Digest for the NEXT turn. On the self-stamp path the prefix hash is
+    // already warmed, so chaining the delta keeps this at one pass over the
+    // body instead of two.
+    const fullDigest = prefixBase !== undefined
+        ? hashElementRange(bodyText, scan.messageSpans, prefixCount, T, prefixBase).digest("hex")
+        : digestElementRange(bodyText, scan.messageSpans, T);
     const miss = (decision: string, credited: boolean, receivedTailIds?: string[]): FastpathOutcome => {
         if (credited) noteCreditedMiss(session.id, decision, log);
         log("info", `[${session.id}] watermark fastpath miss (${decision}) — legacy full-parse this turn`);
-        return { hit: null, measuredT: T, decision, creditedMiss: credited, receivedTailIds };
+        return { hit: null, measuredT: T, decision, creditedMiss: credited, receivedTailIds, fullDigest };
     };
     const seed = seeds.get(session);
     const rawTailIds = req.headers[PF_TAIL_IDS_HEADER];
@@ -257,7 +326,7 @@ export function evaluateWatermarkFastpath(
         && seed !== undefined && seed.model === input.model
         && parsedTailIds.length === T - seed.stampT + 1;
     if (Number.isNaN(stamped)) {
-        if (!idActive) return miss("no-stamp", false);
+        if (!idActive) return miss(selfStampDrift ? "self-stamp-drift" : "no-stamp", false);
     } else if (!idActive) {
         if (stamped > T) return miss("ahead", true);
         if (stamped === T) return miss("no-progress", false);
@@ -336,7 +405,7 @@ export function evaluateWatermarkFastpath(
         // v4 diagnostics ride the decision string (the debug/panel surfaces
         // already print it): pure count mode stays byte-identical "hit" —
         // off-string variants are unreachable there (entry proved stamped===K).
-        const hitDecision = Number.isNaN(stamped) ? "hit(no-count)" : stamped === K ? "hit" : `hit(count-off=${stamped})`;
+        const hitDecision = Number.isNaN(stamped) ? "hit(no-count)" : selfStamped ? "hit(self-stamp)" : stamped === K ? "hit" : `hit(count-off=${stamped})`;
         return {
             hit: {
                 view: [...seed.cores, ...rekeyedWindow] as CoreMessage[],
@@ -345,13 +414,14 @@ export function evaluateWatermarkFastpath(
                 totalT: T,
                 fieldSpans: scan.fieldSpans,
                 windowMessages: windowFragment.messages,
-                seedMultimodal: seed.multimodal || JSON.stringify(windowFragment.messages).includes('"image_url"'),
+                seedMultimodal: tailRunHasImage([...seed.cores, ...rekeyedWindow]),
                 markerCounts: addStripCounts(seed.stripCounts, windowCounts),
             },
             measuredT: T,
             decision: hitDecision,
             creditedMiss: false,
             receivedTailIds: tailIds,
+            fullDigest,
         };
     }
     return miss(seed === undefined ? "unseeded" : "seed-stale", false);
@@ -402,13 +472,28 @@ function baseOfRawId(id: string): string {
     return m === null ? id : id.slice(0, 18);
 }
 
-/** openaiToCore materializes user content-array images as distinct cores
- * carrying an `imagePart`/`rawOpenaiContent` pair — used to detect
- * multimodal tails from already-converted cores (legacy-side seeding). */
-function coresHaveImagePart(cores: readonly CoreMessage[]): boolean {
-    for (const c of cores) {
-        const o = c as { imagePart?: unknown; rawOpenaiContent?: { type?: unknown } };
-        if (o.imagePart === true || o.rawOpenaiContent?.type === "image_url") return true;
+/** #5418-self: only the TRAILING user run is position-sensitive. A mid-history
+ *  image sits inside a run that closed turns ago — coreToOpenai replays its
+ *  parts array identically forever. A trailing image belongs to the run that
+ *  is still open, and its closing shape depends on what arrives next, so a
+ *  stash that swallowed it cannot promise legacy parity. Narrowing the old
+ *  whole-history test to this one case unblocks sessions that merely LOOK
+ *  multimodal: a screenshot buried at message 40 used to keep the lane dead
+ *  for the rest of the session's life. */
+function tailRunHasImage(cores: readonly CoreMessage[]): boolean {
+    for (let i = cores.length - 1; i >= 0; i--) {
+        const c = cores[i] as
+            | {
+                  role?: unknown;
+                  imagePart?: unknown;
+                  rawOpenaiContent?: { type?: unknown };
+                  rawOpenaiContentParts?: { type?: unknown }[];
+              }
+            | undefined;
+        if (c === undefined || c.role !== "user") return false;
+        if (c.imagePart === true || c.rawOpenaiContent?.type === "image_url") return true;
+        const parts = c.rawOpenaiContentParts;
+        if (Array.isArray(parts) && parts.some((p) => p?.type === "image_url")) return true;
     }
     return false;
 }
@@ -446,7 +531,7 @@ function noteCreditedMiss(sessionId: string, decision: string, log: (level: stri
     const staleHold = cur.disabledAt !== undefined && Date.now() - cur.disabledAt >= PF_DISABLED_TTL_MS;
     const misses = (staleHold ? 0 : cur.misses) + 1;
     if (misses >= PF_BREAKER_MISSES) {
-        writeSaved(sessionId, { t: cur.t, m: cur.m, misses, disabledAt: Date.now() });
+        writeSaved(sessionId, { t: cur.t, m: cur.m, misses, disabledAt: Date.now(), p: cur.p });
         log("warn", `[${sessionId}] watermark fastpath disabled for ${Math.round(PF_DISABLED_TTL_MS / 60000)}m after ${misses} consecutive verified misses (last: ${decision}) — legacy full-parse continues`);
     } else {
         writeSaved(sessionId, { ...cur, misses, disabledAt: staleHold ? undefined : cur.disabledAt });
@@ -483,7 +568,7 @@ export function finalizeWatermarkTurn(
             lastTailIds: outcome.receivedTailIds,
             multimodal: outcome.hit.seedMultimodal,
         });
-        writeSaved(session.id, { t: T, m: input.model, misses: 0, l: outcome.receivedTailIds });
+        writeSaved(session.id, { t: T, m: input.model, misses: 0, l: outcome.receivedTailIds, p: outcome.fullDigest });
         headers[PF_SEQ_HEADER] = String(T);
         return headers;
     }
@@ -495,12 +580,12 @@ export function finalizeWatermarkTurn(
             model: input.model,
             stripCounts: input.turnStripCounts,
             lastTailIds: outcome.receivedTailIds,
-            multimodal: coresHaveImagePart(input.legacyCores),
+            multimodal: tailRunHasImage(input.legacyCores),
         });
     }
     // Held (breaker-armed) turns flow through here too and DO restamp: the
     // stamp is how a client converges on truth while the lane stays hit-less.
-    writeSaved(session.id, { t: T, m: input.model, misses: saved?.misses ?? 0, disabledAt: saved?.disabledAt, l: outcome.receivedTailIds });
+    writeSaved(session.id, { t: T, m: input.model, misses: saved?.misses ?? 0, disabledAt: saved?.disabledAt, l: outcome.receivedTailIds, p: outcome.fullDigest });
     headers[PF_SEQ_HEADER] = String(T);
     return headers;
 }
