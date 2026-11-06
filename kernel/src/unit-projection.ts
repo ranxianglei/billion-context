@@ -261,31 +261,64 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
   // the boundary blocks' coverage and the caller named the blocks. Pure
   // resubmits (no new direct messages) are exempt too: they create no block,
   // so there is no replacement to guard against (#4521 no-op class).
+  //
+  // #5531: pair/reasoning boundary widening is the fold's OWN defined scope —
+  // the widened cells ride under the same summary by design, so when both
+  // endpoints resolved IN PLACE (the requested message itself still occupies
+  // its slot), containment is judged against the WIDENED span, not the
+  // literal window. What must stay fatal is the #5830 producer itself: an
+  // endpoint that RESOLVED ELSEWHERE (stale inherited ref snapping to a
+  // distant inheriting-block anchor) sweeps territory the summary never
+  // described regardless of widening — hold the line at the requested
+  // window then. Unmappable coverage fails closed either way (containment
+  // unprovable).
   if (!isBlockBoundary && consumedBlockIds.length > 0 && filteredIds.length > 0) {
     const startBoundary = parseBoundary(input.startRef);
     const endBoundary = parseBoundary(input.endRef);
     if (startBoundary?.kind === "message" && endBoundary?.kind === "message") {
       const windowLo = Math.min(startBoundary.numericId, endBoundary.numericId);
       const windowHi = Math.max(startBoundary.numericId, endBoundary.numericId);
+      const startRaw = input.state.messageRefs.byRef[startBoundary.raw];
+      const endRaw = input.state.messageRefs.byRef[endBoundary.raw];
+      const resolvedEndpointIds = [
+        input.messages[resolved.startIndex]?.id,
+        input.messages[resolved.endIndex]?.id,
+      ];
+      const resolutionInPlace =
+        startRaw !== undefined &&
+        endRaw !== undefined &&
+        resolvedEndpointIds.includes(startRaw) &&
+        resolvedEndpointIds.includes(endRaw);
+      let spanLo = windowLo;
+      let spanHi = windowHi;
+      if (resolutionInPlace) {
+        for (const id of rangeMessageIds) {
+          const ref = input.state.messageRefs.byRaw[id];
+          const num = ref === undefined ? null : refToIndex(ref);
+          if (num === null) continue;
+          if (num < spanLo) spanLo = num;
+          if (num > spanHi) spanHi = num;
+        }
+      }
       const offenders: string[] = [];
       for (const consumedId of consumedBlockIds) {
         const block = blockById(input.state, consumedId);
         if (!block || block.effectiveMessageIds.length === 0) continue;
         let minNum: number | null = null;
         let maxNum: number | null = null;
-        let outOfWindow = false;
+        let outOfSpan = false;
         for (const mid of block.effectiveMessageIds) {
           const ref = input.state.messageRefs.byRaw[mid];
           const num = ref === undefined ? null : refToIndex(ref);
           if (num === null) {
-            outOfWindow = true; // unmappable coverage: containment unprovable
+            outOfSpan = true; // unmappable coverage: containment unprovable
             break;
           }
-          if (num < windowLo || num > windowHi) outOfWindow = true;
+          if (num < spanLo || num > spanHi) outOfSpan = true;
           if (minNum === null || num < minNum) minNum = num;
           if (maxNum === null || num > maxNum) maxNum = num;
         }
-        if (outOfWindow) {
+        if (outOfSpan) {
           offenders.push(
             minNum !== null && maxNum !== null
               ? `${consumedId} [${indexToRef(minNum)}..${indexToRef(maxNum)}]`
@@ -298,7 +331,9 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
           fatal: {
             kind: "window",
             error: new Error(
-              `Range ${input.startRef}..${input.endRef} would merge ${offenders.join(", ")}, whose existing coverage extends beyond the requested ref window (${indexToRef(windowLo)}..${indexToRef(windowHi)}) — folding them would replace their summaries with one that does not cover their span. To merge them deliberately, reference the block ids directly (e.g. compress bN..bM); otherwise narrow the range so its endpoints bound the blocks' coverage.`,
+              resolutionInPlace
+                ? `Range ${input.startRef}..${input.endRef} would merge ${offenders.join(", ")}, whose existing coverage lies outside the fold's span (${indexToRef(spanLo)}..${indexToRef(spanHi)}) — folding them would replace their summaries with one that does not cover their span. To merge them deliberately, reference the block ids directly (e.g. compress bN..bM); otherwise narrow the range.`
+                : `Range ${input.startRef}..${input.endRef} would merge ${offenders.join(", ")}, whose existing coverage extends beyond the requested ref window (${indexToRef(windowLo)}..${indexToRef(windowHi)}) — folding them would replace their summaries with one that does not cover their span. To merge them deliberately, reference the block ids directly (e.g. compress bN..bM); otherwise narrow the range so its endpoints bound the blocks' coverage.`,
             ),
           },
         });
