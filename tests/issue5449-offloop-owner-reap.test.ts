@@ -78,8 +78,45 @@ test("dead owner + wedged loop + no other watchers trips off-loop reap (#5449)",
     }
 });
 
+test("dead spawner still in the watcher SET trips — the guard counts OTHER owners only (#5449/#7)", async () => {
+    // Production wiring shape (src/server.ts): proxyWatchers is seeded with the
+    // spawner pid at creation and only the in-loop reaper removes it — under a
+    // wedge the set still holds the dead owner. The count handler therefore
+    // reports set size minus the probed pid, or this axis could never fire for
+    // a single-spawner orphan (the incident shape).
+    const ownerPid = await spawnEphemeralOwner();
+    const watchers = new Set<number>([ownerPid]);
+    let trippedWith: { gapMs: number, reason?: string } | undefined;
+    const handle = armEventLoopWatchdog({
+        logFile: null,
+        version: "0.0.0-test",
+        heartbeatMs: 20,
+        checkIntervalMs: 20,
+        softWarnMs: 60,
+        hardTimeoutMs: 30_000,
+        parentPid: ownerPid,
+        getWatcherCount: () => Math.max(0, watchers.size - (watchers.has(ownerPid) ? 1 : 0)),
+        fatalMode: "report",
+        onTrip: (gapMs, reason) => { trippedWith = { gapMs, reason }; },
+    });
+    try {
+        assert.ok(handle, "handle expected");
+        await sleep(100);
+        blockMainLoop(400);
+        const deadline = Date.now() + 3_000;
+        while (!trippedWith && Date.now() < deadline) await sleep(20);
+        assert.ok(trippedWith, "trip must not wait for the in-loop reaper to remove the dead spawner from the set");
+        assert.equal(trippedWith.reason, "parent-gone");
+    } finally {
+        handle?.stop();
+        await sleep(20);
+    }
+});
+
 test("dead owner + wedge but ANOTHER watcher attached never trips (#5449/#7 last-owner guard)", async () => {
     const ownerPid = await spawnEphemeralOwner();
+    // Production shape: the set holds the dead spawner plus one other live host.
+    const watchers = new Set<number>([ownerPid, process.pid]);
     let trips = 0;
     const handle = armEventLoopWatchdog({
         logFile: null,
@@ -89,7 +126,7 @@ test("dead owner + wedge but ANOTHER watcher attached never trips (#5449/#7 last
         softWarnMs: 60,
         hardTimeoutMs: 30_000,
         parentPid: ownerPid,
-        getWatcherCount: () => 2,
+        getWatcherCount: () => Math.max(0, watchers.size - (watchers.has(ownerPid) ? 1 : 0)),
         fatalMode: "report",
         onTrip: () => { trips += 1; },
     });
