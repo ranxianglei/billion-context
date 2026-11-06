@@ -66,7 +66,7 @@ export const MESSAGES: Record<Locale, Record<string, string>> = {
         "common.copied_hint": "已复制 ✓",
         "ses.badge_live_tip": "当前进程正在处理的会话（实时数据）",
         "ses.slow_short": "长会话",
-        "ses.slow_tip": "已运行 {n} 轮——宿主侧对话历史只增不减（压缩只缩发给模型的量，不缩宿主自己的文件），步耗时会随之变慢。建议开一个新会话继续。",
+        "ses.slow_tip": "已处理 {n} 次模型请求——宿主侧对话历史只增不减（压缩只缩发给模型的量，不缩宿主自己的文件），步耗时会随之变慢。建议开一个新会话继续。",
         "common.requests": "请求",
         "common.saved": "节省",
         "common.context": "上下文",
