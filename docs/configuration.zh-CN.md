@@ -910,6 +910,7 @@
       "reviewer": { "model": "anthropic/claude-sonnet-4-5", "thinkingLevel": "high" }
     },
     "notifyIfRead": "skip",      // "skip" —— 模型已读结果文件则不再补发完成通知
+    "notifyStructured": false,   // true —— 通知改为带版本化 details 信封（runId/状态+发起溯源）的类型化消息，供第三方 UI 使用；模型可见文本不变（#5750）
     "fleetShortcut": "ctrl+alt+d", // "" 关闭快捷键（/acp-fleet 仍可用）
     "prompt": null,              // 替换（字符串）或移除（null）ACP_DELEGATE NOTIFICATIONS 附录
     "debug": false               // ~/.pi/acp.log 调试事件，仅限子代理子系统
