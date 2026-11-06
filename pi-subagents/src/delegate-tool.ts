@@ -318,13 +318,19 @@ function buildNotificationDetails(kind: "terminal" | "usage", runsList: Delegate
  *  safe boundary of the current task AND persisted in-session, #2320/#2546).
  *  Structured (typed custom message, same text, details extension-only) when
  *  notifyStructured is on AND the host exposes sendMessage; otherwise the plain
- *  user message. Returns true only when the host accepted it, so a failed/unavailable
- *  send leaves the run undelivered for later recovery. */
-function sendDelegateNotification(pi: ExtensionAPI, text: string, details: DelegateNotificationDetails): boolean {
+ *  user message. triggerTurn keeps the structured path wake-equivalent to the
+ *  plain one: pi's sendCustomMessage starts a turn on an IDLE host only when
+ *  triggerTurn is set — without it an idle-tier notice would sit dormant until
+ *  the next activity instead of waking the model like sendUserMessage does
+ *  (#5750 acceptance: wake-up behavior intact). Streaming delivery is unaffected
+ *  (steer either way). `carrier` names the calling site so a failed send stays
+ *  debuggable per tier. Returns true only when the host accepted it, so a
+ *  failed/unavailable send leaves the run undelivered for later recovery. */
+function sendDelegateNotification(pi: ExtensionAPI, text: string, details: DelegateNotificationDetails, carrier: string): boolean {
   const structured = delegatePolicy.notifyStructured && typeof pi.sendMessage === "function";
   try {
     if (structured) {
-      pi.sendMessage.call(pi, { customType: DELEGATE_NOTIFY_CUSTOM_TYPE, content: text, display: true, details }, { deliverAs: "steer" });
+      pi.sendMessage.call(pi, { customType: DELEGATE_NOTIFY_CUSTOM_TYPE, content: text, display: true, details }, { deliverAs: "steer", triggerTurn: true });
       return true;
     }
     const send = pi.sendUserMessage;
@@ -332,10 +338,10 @@ function sendDelegateNotification(pi: ExtensionAPI, text: string, details: Deleg
       send.call(pi, text, { deliverAs: "steer" });
       return true;
     }
-    logWarn("delegate", { event: "notify-no-channel", reason: "no send channel available" });
+    logWarn("delegate", { event: "notify-no-channel", carrier, reason: "no send channel available" });
     return false;
   } catch (err) {
-    logError("delegate", { event: "notify-send-error", error: String(err), structured });
+    logError("delegate", { event: "notify-send-error", carrier, error: String(err), structured });
     return false;
   }
 }
@@ -1061,7 +1067,7 @@ function commitAtTurnEnd(pi: ExtensionAPI, st: HostNotificationState): void {
   // Envelope lists every run in the message: primary + recovery-folded runs for a
   // single, the full batch otherwise.
   const represented = deliverable.length === 1 ? [deliverable[0]!, ...covered] : deliverable;
-  const sent = sendDelegateNotification(pi, text, buildNotificationDetails("terminal", represented));
+  const sent = sendDelegateNotification(pi, text, buildNotificationDetails("terminal", represented), "turn-end");
   if (sent) {
     for (const r of deliverable) r.injected = true;
     for (const c of covered) c.injected = true;
@@ -1148,7 +1154,7 @@ function flushHostNotifications(pi: ExtensionAPI): void {
   // Envelope lists every run in the message: primary + recovery-folded runs for a
   // single, the full batch otherwise.
   const represented = deliverable.length === 1 ? [deliverable[0]!, ...covered] : deliverable;
-  const sent = sendDelegateNotification(pi, text, buildNotificationDetails("terminal", represented));
+  const sent = sendDelegateNotification(pi, text, buildNotificationDetails("terminal", represented), "idle-batch");
   if (sent) {
     for (const r of deliverable) r.injected = true;
     for (const c of covered) c.injected = true;
@@ -2274,7 +2280,7 @@ export function injectResult(
   // Envelope lists the primary run plus any recovery runs folded into the text.
   const primary = runs.get(runId);
   const represented = primary ? [primary, ...covered] : covered;
-  const sent = sendDelegateNotification(pi, text, buildNotificationDetails("terminal", represented));
+  const sent = sendDelegateNotification(pi, text, buildNotificationDetails("terminal", represented), "inject-result");
   // Commit the recovery marking only on success: a failed send leaves the covered
   // runs undelivered so a later carrier can still recover them.
   if (sent) for (const r of covered) r.injected = true;
@@ -2298,7 +2304,7 @@ export function emitInlineUsageNote(pi: ExtensionAPI, run: DelegateRun, mode: "m
   if (!block.trim()) return;
   const label = run.status === "failed" ? "FAILED ⚠️" : run.status === "cancelled" ? "cancelled" : "completed";
   const text = `[acp_delegate ${label}] **${run.agent}** (runId \`${run.runId}\`) — usage summary\n${block.replace(/^\s+/, "")}\nThis is an automated system message, NOT a user request.`;
-  if (sendDelegateNotification(pi, text, buildNotificationDetails("usage", [run]))) {
+  if (sendDelegateNotification(pi, text, buildNotificationDetails("usage", [run]), "inline-usage")) {
     run.usageNoted = true;
     debug.event("delegate-inline-usage-note", { runId: run.runId, status: run.status });
   }
