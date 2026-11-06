@@ -1,5 +1,6 @@
 import type { CoreMessage } from "acp-kernel";
 import { coreToAnthropic, type AnthropicRequestBody } from "acp-kernel/wire";
+import { dedupeAdjacentOutputConfig } from "../dedupe-adjacent-output-config.js";
 import { appendSystemText, declaredInclusiveFromUsage } from "../util.js";
 import { stampAnthropicSystemCacheControl } from "./cache-control.js";
 import { buildVisibilityMarker } from "./core.js";
@@ -307,7 +308,10 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
             // steady path does (`anthropicCacheMarks ?? cacheControls`) — a
             // client-managed session has no bili marks, and dropping its
             // breakpoint leaves the post-fold prefix unwritten to cache.
-            const messages = coreToAnthropic(coreMessages, cacheMarks ?? clientCacheControls);
+            // [#5688] round-2 re-renders from the core view fold reconstruction
+            // can leave adjacent effort directives in — collapse like the
+            // steady egress or the rebuild 400s where the main request passed.
+            const messages = dedupeAdjacentOutputConfig(coreToAnthropic(coreMessages, cacheMarks ?? clientCacheControls));
             // #1876: same append-not-merge rebuild as the steady path's
             // injectSystem — both must emit byte-identical system (F2 seam).
             const system = originalSystem !== undefined ? appendSystemText(systemPrompt, originalSystem) : systemPrompt;
