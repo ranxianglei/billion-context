@@ -10,6 +10,9 @@
     "search_context",
     "acp_status",
     "acp_cache",
+    "acp_retire",
+    "acp_restore",
+    "acp_rewrite",
     "absorb",
     "acp_rule",
     "acp_retrieve",
@@ -132,6 +135,84 @@
                 "full"
               ],
               "description": "\"summary\" (default): totals, verdicts, notable folds, anomalous requests only. \"full\": every retained fold and its line-item breakdown (most-recent window — the output states the cap)."
+            }
+          }
+        }
+      },
+      {
+        "name": "acp_retire",
+        "description": "Retire compressed block(s): their summaries stop being injected into the resident view every turn, freeing that context mass, while decompress/search_context keep working on them and acp_status lists them under RETIRED BLOCKS. Use for old material you no longer need resident. Roll back with acp_restore. Calling convention: if this environment only allows `run_code` to be called directly (code-mode/PTC harness), call this tool from inside a run_code program via the harness's generated SDK; otherwise call it directly as a tool.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "blockId": {
+              "type": "string",
+              "description": "One block id (e.g. b5)"
+            },
+            "ids": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Several block ids in one call (e.g. [\"b3\", \"b7\"])"
+            }
+          }
+        }
+      },
+      {
+        "name": "acp_restore",
+        "description": "Restore retired compression block(s) to the resident view: their summaries re-enter context from the next rebuild. No effect on blocks that are not retired. Calling convention: if this environment only allows `run_code` to be called directly (code-mode/PTC harness), call this tool from inside a run_code program via the harness's generated SDK; otherwise call it directly as a tool.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "blockId": {
+              "type": "string",
+              "description": "One block id (e.g. b5)"
+            },
+            "ids": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Several block ids in one call (e.g. [\"b3\", \"b7\"])"
+            }
+          }
+        }
+      },
+      {
+        "name": "acp_rewrite",
+        "description": "Replace a compressed block's stored summary with shorter text you supply — no re-compression, no regeneration. The previous summary is kept one step deep for rollback; the block's original messages are untouched (decompress still returns them). Pass blockId+summary for one block, or items:[{blockId,summary}] for a batch. Calling convention: if this environment only allows `run_code` to be called directly (code-mode/PTC harness), call this tool from inside a run_code program via the harness's generated SDK; otherwise call it directly as a tool.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "blockId": {
+              "type": "string",
+              "description": "Block id to rewrite (e.g. b5) — single-block form"
+            },
+            "summary": {
+              "type": "string",
+              "description": "The replacement summary text — single-block form"
+            },
+            "items": {
+              "type": "array",
+              "description": "Batch form: several rewrites in one call",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "blockId": {
+                    "type": "string",
+                    "description": "Block id (e.g. b5)"
+                  },
+                  "summary": {
+                    "type": "string",
+                    "description": "Replacement summary text"
+                  }
+                },
+                "required": [
+                  "blockId",
+                  "summary"
+                ]
+              }
             }
           }
         }
@@ -349,6 +430,93 @@
       {
         "type": "function",
         "function": {
+          "name": "acp_retire",
+          "description": "Retire compressed block(s): their summaries stop being injected into the resident view every turn, freeing that context mass, while decompress/search_context keep working on them and acp_status lists them under RETIRED BLOCKS. Use for old material you no longer need resident. Roll back with acp_restore. Calling convention: if this environment only allows `run_code` to be called directly (code-mode/PTC harness), call this tool from inside a run_code program via the harness's generated SDK; otherwise call it directly as a tool.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "blockId": {
+                "type": "string",
+                "description": "One block id (e.g. b5)"
+              },
+              "ids": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Several block ids in one call (e.g. [\"b3\", \"b7\"])"
+              }
+            }
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "acp_restore",
+          "description": "Restore retired compression block(s) to the resident view: their summaries re-enter context from the next rebuild. No effect on blocks that are not retired. Calling convention: if this environment only allows `run_code` to be called directly (code-mode/PTC harness), call this tool from inside a run_code program via the harness's generated SDK; otherwise call it directly as a tool.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "blockId": {
+                "type": "string",
+                "description": "One block id (e.g. b5)"
+              },
+              "ids": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Several block ids in one call (e.g. [\"b3\", \"b7\"])"
+              }
+            }
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "acp_rewrite",
+          "description": "Replace a compressed block's stored summary with shorter text you supply — no re-compression, no regeneration. The previous summary is kept one step deep for rollback; the block's original messages are untouched (decompress still returns them). Pass blockId+summary for one block, or items:[{blockId,summary}] for a batch. Calling convention: if this environment only allows `run_code` to be called directly (code-mode/PTC harness), call this tool from inside a run_code program via the harness's generated SDK; otherwise call it directly as a tool.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "blockId": {
+                "type": "string",
+                "description": "Block id to rewrite (e.g. b5) — single-block form"
+              },
+              "summary": {
+                "type": "string",
+                "description": "The replacement summary text — single-block form"
+              },
+              "items": {
+                "type": "array",
+                "description": "Batch form: several rewrites in one call",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "blockId": {
+                      "type": "string",
+                      "description": "Block id (e.g. b5)"
+                    },
+                    "summary": {
+                      "type": "string",
+                      "description": "Replacement summary text"
+                    }
+                  },
+                  "required": [
+                    "blockId",
+                    "summary"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
           "name": "absorb",
           "description": "Distill a tool result into a compact summary you write. REQUIRED immediately after a tool result ends with an [ACP absorb] instruction: pass its ref and the distilled essentials (outcome, key values, paths:lines, errors, decisions). The original output is then removed from context; your summary is the durable record. If nothing worth keeping survives, say so in the summary (e.g. '(nothing needed)') — that discards the output cleanly.",
           "parameters": {
@@ -546,6 +714,87 @@
                 "full"
               ],
               "description": "\"summary\" (default): totals, verdicts, notable folds, anomalous requests only. \"full\": every retained fold and its line-item breakdown (most-recent window — the output states the cap)."
+            }
+          }
+        }
+      },
+      {
+        "type": "function",
+        "name": "acp_retire",
+        "description": "Retire compressed block(s): their summaries stop being injected into the resident view every turn, freeing that context mass, while decompress/search_context keep working on them and acp_status lists them under RETIRED BLOCKS. Use for old material you no longer need resident. Roll back with acp_restore. Calling convention: if this environment only allows `run_code` to be called directly (code-mode/PTC harness), call this tool from inside a run_code program via the harness's generated SDK; otherwise call it directly as a tool.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "blockId": {
+              "type": "string",
+              "description": "One block id (e.g. b5)"
+            },
+            "ids": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Several block ids in one call (e.g. [\"b3\", \"b7\"])"
+            }
+          }
+        }
+      },
+      {
+        "type": "function",
+        "name": "acp_restore",
+        "description": "Restore retired compression block(s) to the resident view: their summaries re-enter context from the next rebuild. No effect on blocks that are not retired. Calling convention: if this environment only allows `run_code` to be called directly (code-mode/PTC harness), call this tool from inside a run_code program via the harness's generated SDK; otherwise call it directly as a tool.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "blockId": {
+              "type": "string",
+              "description": "One block id (e.g. b5)"
+            },
+            "ids": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Several block ids in one call (e.g. [\"b3\", \"b7\"])"
+            }
+          }
+        }
+      },
+      {
+        "type": "function",
+        "name": "acp_rewrite",
+        "description": "Replace a compressed block's stored summary with shorter text you supply — no re-compression, no regeneration. The previous summary is kept one step deep for rollback; the block's original messages are untouched (decompress still returns them). Pass blockId+summary for one block, or items:[{blockId,summary}] for a batch. Calling convention: if this environment only allows `run_code` to be called directly (code-mode/PTC harness), call this tool from inside a run_code program via the harness's generated SDK; otherwise call it directly as a tool.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "blockId": {
+              "type": "string",
+              "description": "Block id to rewrite (e.g. b5) — single-block form"
+            },
+            "summary": {
+              "type": "string",
+              "description": "The replacement summary text — single-block form"
+            },
+            "items": {
+              "type": "array",
+              "description": "Batch form: several rewrites in one call",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "blockId": {
+                    "type": "string",
+                    "description": "Block id (e.g. b5)"
+                  },
+                  "summary": {
+                    "type": "string",
+                    "description": "Replacement summary text"
+                  }
+                },
+                "required": [
+                  "blockId",
+                  "summary"
+                ]
+              }
             }
           }
         }
