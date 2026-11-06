@@ -10,14 +10,21 @@
 //      enabled ⇔ bucket < percent × 100. Prefix-stable: raising the percent
 //      never drops an already-enabled install (monotonic rollout, 灰度只进
 //      不出). To re-randomize the cohort, change the salt.
-//   3. NESTING — a feature may declare `base`: it is evaluated only inside
-//      the base feature's enabled cohort (灰度 A 的用户里再灰度 B; C→D the
-//      same), so a nested percent is relative to the base population, not
-//      everyone. Base chains of any depth; cycles fail closed (off).
+//   3. NESTING — a feature may declare `base`: its BUCKET decision is made
+//      only inside the base feature's enabled cohort (灰度 A 的用户里再灰度 B;
+//      C→D the same), so a nested percent is relative to the base population,
+//      not everyone. Base chains of any depth; cycles fail closed (off).
+//      Nesting governs the BUCKET TIER ONLY — the force tiers (§4) return
+//      before the nesting check, so an explicitly env/config-forced child runs
+//      even while its base is off/rolled back. CURRENT pinned behavior
+//      (tests/rollout.test.ts "force tier bypasses nesting"), owner
+//      design-confirm pending (#5652 review F10) — do not "fix" it by accident.
 //   4. PRECEDENCE — env `BILI_ROLLOUT_<FEATURE>` ("0"/"false" = off, any
 //      other value = on) > config `rollout.features.<name>.enabled` >
 //      bucketing over percent (config `percent` override > registry default).
-//      A feature absent from the registry AND from the config block is OFF.
+//      The two force tiers short-circuit BEFORE the §3 nesting check (a forced
+//      feature resolves without consulting its `base`). A feature absent from
+//      the registry AND from the config block is OFF.
 //
 // A release that wants to canary a feature adds one entry to ROLLOUT_FEATURES
 // (percent 0–100, optional salt/base); GA = bump to 100, or move the default
@@ -39,7 +46,11 @@ export interface RolloutPlan {
     percent: number;
     /** Hash salt; defaults to the feature name. Changing it re-randomizes the cohort. */
     salt?: string;
-    /** Nested rollout: evaluate this feature only inside `base`'s enabled cohort. */
+    /** Nested rollout: evaluate this feature only inside `base`'s enabled
+     *  cohort — for BUCKET-tier decisions. An explicit env/config force
+     *  resolves BEFORE the nesting check, so a forced child runs even while
+     *  `base` is off (pinned by tests/rollout.test.ts; #5652 review F10 —
+     *  owner design-confirm pending, do not "fix" without ruling). */
     base?: string;
 }
 
