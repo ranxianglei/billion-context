@@ -286,6 +286,9 @@ test("gate: F6 vocabulary completion — every remaining red reason pinned once"
         assert.deepEqual(renderPlaneGate({ ...base, absorbActive: true }), { ok: false, reason: "absorb-active" });
         // "ccr-on": CCR rewrites outbound bytes away from the stored form.
         assert.deepEqual(renderPlaneGate({ ...base, ccrOn: true }), { ok: false, reason: "ccr-on" });
+        // "markers": non-zero marker artifacts rewrite outbound bytes this
+        // round (production caller passes markerArtifactCount(markerCounts)>0).
+        assert.deepEqual(renderPlaneGate({ ...base, markerNonZero: true }), { ok: false, reason: "markers" });
 
         // "hydrate-failed": mirror absent + DISK PLANE ABSENT + no death
         // verdict ⇒ the TRANSIENT reason, never lane-dead. Production shape:
