@@ -2,7 +2,7 @@
 // external summary rewrite (acp_rewrite). The kernel owns the state mutation
 // (kernel/src/block-ops.ts); this module parses tool args, formats receipts,
 // and marks the session dirty so the change persists.
-import { retireBlocks, restoreBlocks, rewriteBlockSummary } from "acp-kernel";
+import { parseBlockIdArg, retireBlocks, restoreBlocks, rewriteBlockSummary } from "acp-kernel";
 import { markDirty, type Session } from "./session.js";
 import { toolFail, toolOk, type ProxyToolResult } from "./proxy-tool-result.js";
 
@@ -33,7 +33,8 @@ export function executeAcpRetire(args: Record<string, unknown>, session: Session
     // Summary chars freed is measured BEFORE the flip so the receipt reports
     // what actually leaves the resident view.
     const freedChars = ids.reduce((sum, id) => {
-        const normalized = id.toLowerCase().startsWith("b") ? id : `b${id}`;
+        const normalized = parseBlockIdArg(id);
+        if (normalized === null) return sum;
         return sum + (session.state.blocks.find((b) => b.blockId === normalized)?.summary.length ?? 0);
     }, 0);
     const outcome = retireBlocks(session.state, ids);
