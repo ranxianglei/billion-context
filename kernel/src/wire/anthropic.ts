@@ -405,8 +405,100 @@ function isDirectiveOnlySystem(e: AnthropicWireMessage): boolean {
 // position, so it is never healed (and never legitimizes a neighbour). Fresh
 // objects only — sidecars stay intact for future verbatim emission once
 // re-legitimized.
+// #4818: carriers of functional tool deltas are RELOCATED instead of demoted
+// (settleToolDeltaPositions): stripping their blocks splits paired chains —
+// a stripped tool_addition leaves a later tool_removal referencing an
+// unknown tool (hard 400 tool_reference_unresolved), and an addition-only
+// carrier silently deactivates deferred-load tools for the rest of the
+// session. Demotion stays their last resort when no legal slot exists.
 function isToolUpdateBlock(b: { type?: unknown }): boolean {
   return b.type === "tool_addition" || b.type === "tool_removal";
+}
+
+/** #4818: does this wire message carry a functional tool delta? */
+function carriesToolDelta(e: AnthropicWireMessage): boolean {
+  return (
+    Array.isArray(e.content) &&
+    e.content.some((b) => isToolUpdateBlock(b as { type?: unknown }))
+  );
+}
+
+/** #4818: are BOTH position halves legal for the system run containing
+ *  index j? Mirrors the demote pass's judgment exactly (run-aware precede
+ *  half; nearest non-system predecessor for the follow half; no predecessor
+ *  at array start is legal by contract). */
+function isLegalSystemSlot(out: AnthropicWireMessage[], j: number): boolean {
+  let k = j + 1;
+  while (k < out.length && out[k]!.role === "system") k++;
+  const next = out[k];
+  if (next && next.role !== "assistant") return false;
+  let p = j - 1;
+  while (p >= 0 && out[p]!.role === "system") p--;
+  return legitimatesFollowSide(p >= 0 ? out[p] : undefined);
+}
+
+/** #4818: relocate misplaced tool-delta carriers instead of demoting them.
+ *  When any carrier sits in an illegal position, remove ALL carriers (order
+ *  preserved) and reinsert them contiguously at the earliest slot at or
+ *  after the first carrier's original index where the whole group is legal.
+ *  Moving system messages never changes any other message's position
+ *  judgment (systems are transparent to both halves), so one group move
+ *  settles the whole set; the search starts at (never before) the first
+ *  carrier's original index so a delta never takes effect earlier than the
+ *  host placed it. Only when NO forward slot exists (nothing but
+ *  assistant-text turns follows, e.g. a trailing run behind a plain
+ *  assistant) do the carriers go back to their original indices and the
+ *  demote pass below handles them per the owner-approved #5438 semantics —
+ *  with a warn naming the dropped tools so silent tool loss stays
+ *  diagnosable. */
+function settleToolDeltaPositions(out: AnthropicWireMessage[]): void {
+  const deltaIdx: number[] = [];
+  let anyIllegal = false;
+  for (let j = 0; j < out.length; j++) {
+    const e = out[j]!;
+    if (e.role !== "system" || isDirectiveOnlySystem(e)) continue;
+    if (!carriesToolDelta(e)) continue;
+    deltaIdx.push(j);
+    if (!isLegalSystemSlot(out, j)) anyIllegal = true;
+  }
+  if (!anyIllegal) return; // cache-safe no-op on healthy sessions
+  const group = deltaIdx.map((i) => out[i]!);
+  for (let d = deltaIdx.length - 1; d >= 0; d--) out.splice(deltaIdx[d]!, 1);
+  let slot = -1;
+  for (let pos = deltaIdx[0]!; pos <= out.length; pos++) {
+    // The group lands at pos..pos+len-1; whatever currently sits at pos in
+    // the reduced array becomes its first non-group follower.
+    if (pos === 0 || !legitimatesFollowSide(out[pos - 1])) continue;
+    let k = pos;
+    while (k < out.length && out[k]!.role === "system") k++;
+    if (out[k] && out[k]!.role !== "assistant") continue;
+    slot = pos;
+    break;
+  }
+  if (slot === -1) {
+    const names = group.flatMap((g) =>
+      (g.content as Array<Record<string, unknown>>).flatMap((b) => {
+        if (b.type === "tool_addition") {
+          const t = b.tool as { definition?: { name?: string } } | undefined;
+          return [t?.definition?.name ?? (b.name as string | undefined) ?? "unknown"];
+        }
+        if (b.type === "tool_removal") {
+          return [
+            (b.tool_reference as string | undefined) ??
+              (b.tool_name as string | undefined) ??
+              "unknown",
+          ];
+        }
+        return [];
+      }),
+    );
+    console.warn(
+      `[acp-kernel] healIllegalSystemPositions: no legal position for tool-delta system(s); demoting and dropping tool_addition/tool_removal block(s) for: ${names.join(", ")}`,
+    );
+    for (let d = 0; d < group.length; d++) out.splice(deltaIdx[d]!, 0, group[d]!);
+    return;
+  }
+  out.splice(slot, 0, ...group);
 }
 
 /** #5438: does this wire message legitimize a following mid-conversation
@@ -429,6 +521,9 @@ function legitimatesFollowSide(m: AnthropicWireMessage | undefined): boolean {
 }
 
 function healIllegalSystemPositions(out: AnthropicWireMessage[]): void {
+  // #4818: tool-delta carriers relocate instead of demoting; everything else
+  // keeps the demote semantics below.
+  settleToolDeltaPositions(out);
   let prevNonSystem = -1;
   for (let j = 0; j < out.length; j++) {
     const e = out[j];
@@ -441,6 +536,10 @@ function healIllegalSystemPositions(out: AnthropicWireMessage[]): void {
       continue;
     }
     if (isDirectiveOnlySystem(e)) continue;
+    // #4818: a carrier the settle pass relocated into a legal slot is done;
+    // an illegal one here is the fallback re-insertion above, which falls
+    // through to the demote below exactly as before.
+    if (carriesToolDelta(e) && isLegalSystemSlot(out, j)) continue;
     let k = j + 1;
     while (k < out.length && out[k]!.role === "system") k++;
     const next = out[k];

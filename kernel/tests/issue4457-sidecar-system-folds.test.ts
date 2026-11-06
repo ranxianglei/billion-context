@@ -11,7 +11,9 @@
 // message or end the array"), 400ing the session forever. This pins both
 // halves of the #4457 fix through the real chain: the protection survives,
 // AND the position-based backstop (wire/anthropic.ts
-// healIllegalSystemPositions) heals the orphan so the session lives.
+// healIllegalSystemPositions) heals the orphan so the session lives —
+// #4818: a tool-delta carrier is relocated to the next legal slot with its
+// blocks intact (plain systems keep the demote-strip path).
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createCore } from "../src/compress.js";
@@ -160,13 +162,16 @@ test("#4457: fold around the never-fold system applies clean; backstop heals the
   );
   const out = coreToAnthropic(view);
   assert.deepEqual(orphanSystems(out), [], JSON.stringify(out));
-  // the orphan healed to a text-only user entry (tool block stripped)
+  // #4818: the orphaned tool-delta carrier is RELOCATED to the next legal
+  // slot with its functional block intact — demote-strip would split its
+  // delta chain (orphaned tool_removal → hard 400 / silent tool loss)
   const healed = out.find((m) =>
     JSON.stringify(m).includes("Updated system prompt section"),
   );
-  assert.ok(healed, "the healed entry must carry the delta's text");
-  assert.equal(healed!.role, "user");
-  assert.ok(!JSON.stringify(healed).includes("tool_addition"));
+  assert.ok(healed, "the relocated entry must carry the delta's text");
+  assert.equal(healed!.role, "system");
+  assert.ok(JSON.stringify(healed).includes("tool_addition"));
+  assert.equal(out[out.length - 1]!, healed, "relocated forward to array end");
   // the fold summary survives into the emission
   assert.ok(JSON.stringify(out).includes("covered early turns"));
 });
