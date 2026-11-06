@@ -8,7 +8,9 @@ import {
   buildIndexByMessageId,
   resolveBoundaries,
   blockVisibleInRange,
+  parseBoundary,
 } from "./boundaries.js";
+import { indexToRef, refToIndex } from "./refs.js";
 import { isSummaryMessageId } from "./prune.js";
 import {
   collectFailedCompressCallIds,
@@ -86,7 +88,7 @@ export interface UnitProjectionInput {
 }
 
 export interface UnitProjectionFatal {
-  kind: "zone" | "split";
+  kind: "zone" | "split" | "window";
   error: Error;
 }
 
@@ -246,6 +248,61 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
     const kept = new Set(filteredIds);
     for (const id of directMessageIds) {
       if (!kept.has(id)) effectiveMessageIds.delete(id);
+    }
+  }
+
+  // #5830: the supplied summary describes exactly the requested ref window
+  // [startRef..endRef]. A plain message-ref range that would CONSUME an active
+  // block whose coverage extends outside that window replaces that block's
+  // wider-span summary with one that never saw part of it — silent
+  // active-summary coverage loss (incident: one tail-range summary left
+  // standing over a merged span back to the conversation start). Block-
+  // boundary merges (bN..bM) are exempt by contract — they exist to absorb
+  // the boundary blocks' coverage and the caller named the blocks. Pure
+  // resubmits (no new direct messages) are exempt too: they create no block,
+  // so there is no replacement to guard against (#4521 no-op class).
+  if (!isBlockBoundary && consumedBlockIds.length > 0 && filteredIds.length > 0) {
+    const startBoundary = parseBoundary(input.startRef);
+    const endBoundary = parseBoundary(input.endRef);
+    if (startBoundary?.kind === "message" && endBoundary?.kind === "message") {
+      const windowLo = Math.min(startBoundary.numericId, endBoundary.numericId);
+      const windowHi = Math.max(startBoundary.numericId, endBoundary.numericId);
+      const offenders: string[] = [];
+      for (const consumedId of consumedBlockIds) {
+        const block = blockById(input.state, consumedId);
+        if (!block || block.effectiveMessageIds.length === 0) continue;
+        let minNum: number | null = null;
+        let maxNum: number | null = null;
+        let outOfWindow = false;
+        for (const mid of block.effectiveMessageIds) {
+          const ref = input.state.messageRefs.byRaw[mid];
+          const num = ref === undefined ? null : refToIndex(ref);
+          if (num === null) {
+            outOfWindow = true; // unmappable coverage: containment unprovable
+            break;
+          }
+          if (num < windowLo || num > windowHi) outOfWindow = true;
+          if (minNum === null || num < minNum) minNum = num;
+          if (maxNum === null || num > maxNum) maxNum = num;
+        }
+        if (outOfWindow) {
+          offenders.push(
+            minNum !== null && maxNum !== null
+              ? `${consumedId} [${indexToRef(minNum)}..${indexToRef(maxNum)}]`
+              : `${consumedId} [unmapped coverage]`,
+          );
+        }
+      }
+      if (offenders.length > 0) {
+        return finish({
+          fatal: {
+            kind: "window",
+            error: new Error(
+              `Range ${input.startRef}..${input.endRef} would merge ${offenders.join(", ")}, whose existing coverage extends beyond the requested ref window (${indexToRef(windowLo)}..${indexToRef(windowHi)}) — folding them would replace their summaries with one that does not cover their span. To merge them deliberately, reference the block ids directly (e.g. compress bN..bM); otherwise narrow the range so its endpoints bound the blocks' coverage.`,
+            ),
+          },
+        });
+      }
     }
   }
 
