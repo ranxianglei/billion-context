@@ -486,7 +486,7 @@ bili --no-auto-update        # 本次启动禁用自动更新
 
 ### 单机多安装共存（#5046）
 
-同一台机器上装了**两份及以上** bili（例如两个 DSH profile——桌面端 + bot，或全局 npm 拷贝与宿主树拷贝并存）时，各自的代理默认都解析到**同一个** XDG 会话目录（`%USERPROFILE%\.local\share\billion-context\sessions\`）和同一份配置文件。开了统一存储（`storage.unified` = shadow/full）后，两个进程会双写同一个 `index.db`：日志出现 `[instances] another bili instance is running …`，lane 重叠时还有 `[storage] … two processes on one index.db corrupt it` 级别的 error；SQLite 写锁争用（`SQLITE_BUSY` / `database is locked`）会让整轮模型请求直接失败，持续双写还有损坏风险。正确做法是**隔离**：给每份安装设独立的 `BILI_SESSIONS_DIR`（配置也要分开时再加 `BILI_CONFIG_FILE`），只加在该安装自己的启动器/profile 环境变量里，不动全局环境。隔离后两份可正常并存，`[instances]` 提示会自动降为 info 级（目录不同 ⇒ 无共享状态）。
+上面的拓扑讲的是部署副本；一台桌面上有它的孪生情形：同一台机器上装了**两份及以上** bili（例如两个 DSH profile——桌面端 + bot，或全局 npm 拷贝与宿主树拷贝并存），各自启动自己的代理，除非隔离，两者解析到**同一个**默认 XDG 会话目录（`%USERPROFILE%\.local\share\billion-context\sessions\`）和同一份配置文件。**多个进程写同一个本地磁盘的 `index.db` 是受支持的拓扑**（#5082/#5091）——SQLite WAL 在本地文件系统上是多进程安全的——所以启动**从不**因存活的同目录写者而阻塞：对端只会表现为一条 info 级 `[storage] process pid … is also using …` 日志行加状态线，仅此而已（2026-10-31 定策，对这种形态撤销了 #5046/B 时代的拒绝启动）。真正剩下危险的，是两份安装并发走**同一个会话**——该情形独立告警（split-brain 竞争，#3923）。如果仍想让每份安装拥有严格分离的历史与存储，给每份装设自己的 `BILI_SESSIONS_DIR`（配置也要分开时再加 `BILI_CONFIG_FILE`），只加在该安装自己的启动器/profile 环境变量里，不动全局环境。注册时不同目录的路径仍会按信息级上报：仅凭路径既不能证明 SQLite 隔离，也不能证明同会话竞争。本地 SQLite WAL 支持不同会话的写者；共享 RWX/NFS 不提供该安全性，且相互独立的部署存储之间不复制、不故障切换。
 
 ### 会话文件清理（#1082）
 
