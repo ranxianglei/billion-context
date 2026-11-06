@@ -39,6 +39,11 @@ import {
 } from "./protected.js";
 import { isToolMessage } from "./message-kind.js";
 import { projectUnit, collectCoverage } from "./unit-projection.js";
+import {
+  appendMediaRefsSection,
+  collectFoldMediaRefs,
+  parseMediaRefsSection,
+} from "./media-refs.js";
 import { evaluateRefold, type RefoldDecision } from "./refold.js";
 import {
   computeProtectedRefs,
@@ -163,6 +168,15 @@ type RangeResolution =
  *  clears the latch, so normal sessions hold a handful at most. Oldest drop. */
 const MAX_TRUNCATE_LATCH = 64;
 
+/** #5698: a tier-1 fold answering the fire that offered `pending` tokens must
+ *  reclaim at least this fraction of the offered mass for the T1 channel to
+ *  count as draining. Partial compliance below it (production #5671: nudges
+ *  offering ~450K answered by 3-6K folds) sets the harvest-stall flag so tier
+ *  arbitration can route to mass-qualified distillation instead of starving
+ *  it behind a never-draining T1. Measured against the fire's pendingT1, so
+ *  eager lanes (fold the whole offer) never trip it. */
+export const STALL_HARVEST_RATIO = 0.5;
+
 function rangeError(
   spec: { startRef: string; endRef: string },
   message: string,
@@ -286,17 +300,21 @@ function applyRefolds(input: {
 }): void {
   validateSummaryLength(input.spec, input.config.compress);
   const targets = new Set(input.blockIds);
-  input.state.blocks = input.state.blocks.map((block) =>
-    targets.has(block.blockId)
-      ? {
-          ...block,
-          summary: input.spec.summary,
-          topic: input.spec.topic ?? block.topic,
-          runId: input.runId,
-          restoredInline: false,
-        }
-      : block,
-  );
+  input.state.blocks = input.state.blocks.map((block) => {
+    if (!targets.has(block.blockId)) return block;
+    // #5620: refold rewrites the stored summary — carry this block's own
+    // MEDIA REFS section forward mechanically.
+    const carriedRefs = parseMediaRefsSection(block.summary).map(
+      scrubLoneSurrogates,
+    );
+    return {
+      ...block,
+      summary: appendMediaRefsSection(input.spec.summary, carriedRefs),
+      topic: input.spec.topic ?? block.topic,
+      runId: input.runId,
+      restoredInline: false,
+    };
+  });
 }
 
 export function createCore(ports: Ports = {}): CompressionCore {
@@ -853,6 +871,25 @@ export function createCore(ports: Ports = {}): CompressionCore {
       // tracked — a fresh cadence starts from a clean slate.
       state.nudge.absorbedDebt = 0;
       state.nudge.absorbCount = 0;
+      // #5698: T1 harvest-stall accounting (consume-once). The tier-1 fire
+      // banked its offered pending; this fold answers it. A distill (any new
+      // block above tier 1) proves the distillation channel delivers — clear
+      // the stall. A message-shaped fold harvesting < STALL_HARVEST_RATIO of
+      // the offered pending is partial compliance: the T1 channel is not
+      // draining while the block pile keeps growing (#5671 treadmill) — set
+      // the stall so arbitration can route to mass-qualified distillation.
+      const distilled = state.blocks
+        .filter((b) => !preFoldBlockIds.has(b.blockId))
+        .some((b) => (b.tier ?? 1) > 1);
+      const firePending = state.nudge.lastT1FirePending;
+      if (distilled) {
+        state.nudge.t1HarvestStall = false;
+        state.nudge.lastT1FirePending = undefined;
+      } else if (firePending !== undefined && firePending > 0) {
+        state.nudge.t1HarvestStall =
+          tokensCompressed < STALL_HARVEST_RATIO * firePending;
+        state.nudge.lastT1FirePending = undefined;
+      }
       // A successful compression is by definition viable progress — restart
       // the terminal-floor streak so the escape signal can only fire again
       // after N fresh stuck events (#300).
@@ -1162,11 +1199,14 @@ const assignRefsNode: PipelineNode = {
       hasProtection && hasPathPatterns
         ? collectProtectedToolCallIds(io.messages, ctx.config)
         : undefined;
-    // Unrecoverable media (remote URLs / file refs with no stored bytes) ride
+    // Unrecoverable media (no stored bytes AND no re-access handle) rides
     // outside msg.text; folding one destroys it permanently with no restore
     // behind it (#1188/#2609), so those messages get a BLOCKED ref — never
-    // advertised, never folded. Archivable inline images fold like text and
-    // stay citable by their numeric ref for decompress({ imageRef }) (#2607).
+    // advertised, never folded. #5620: ref-based media (remote URL / file id)
+    // is NOT blocked — its handle rides the stored summary (media-refs.ts)
+    // and decompress restores the original. Archivable inline images fold
+    // like text and stay citable by their numeric ref for
+    // decompress({ imageRef }) (#2607).
     const protectedFn = (m: CoreMessage) =>
       hasUnrecoverableMediaPayload(m) ||
       (hasProtection
@@ -1471,6 +1511,12 @@ const nudgeNode: PipelineNode = {
           ...stamped.lastShownByTier,
           [nudge.tier]: ctx.tokenCount,
         };
+      }
+      // #5698: bank the offered tier-1 mass as the compliance denominator —
+      // the first applyCompression after this fire compares its harvest
+      // against this number to detect a non-draining T1 channel.
+      if (nudge.tier === 1 && nudge.breakdown) {
+        stamped.lastT1FirePending = nudge.breakdown.pendingT1;
       }
     }
 
@@ -1781,6 +1827,15 @@ function applySingleRange(input: SingleRangeInput): SingleRangeOutcome {
     }
   }
 
+  // #5620: ref-recoverable media folded here keeps its re-access handles in
+  // the stored summary — appended mechanically (never model discretion; on
+  // the wire a URL part is often invisible to the summarizer), and carried
+  // forward from consumed blocks so merges/distillations drop none.
+  const foldMediaRefs = collectFoldMediaRefs(
+    filteredIds.map((id) => input.messages.find((entry) => entry.id === id)),
+    consumedBlockIds.map((id) => blockById(input.state, id)),
+  ).map(scrubLoneSurrogates);
+
   const blockId = allocateBlockId(input.state);
   // #4316 layer 3: resolve the fold's ledger interval before constructing the
   // block. The claim is recorded only when it is EXACT — see
@@ -1794,7 +1849,7 @@ function applySingleRange(input: SingleRangeInput): SingleRangeOutcome {
     runId: input.runId,
     tier: outputTier,
     topic: input.spec.topic,
-    summary: input.spec.summary,
+    summary: appendMediaRefsSection(input.spec.summary, foldMediaRefs),
     directMessageIds: filteredIds,
     effectiveMessageIds: [...effectiveMessageIds],
     directBlockIds: [...consumedBlockIds],
@@ -2060,6 +2115,19 @@ function decideNudge(input: NudgeInput): NudgeDecision {
   const t2Pen = tiers[2]?.pending ?? 0;
   const t3Pen = tiers[3]?.pending ?? 0;
   const maxPending = Math.max(0, t1Eff, t2Pen, t3Pen);
+  // #5698: the T1 channel is PROVEN non-draining — its last fire was answered
+  // by a fold harvesting < STALL_HARVEST_RATIO of the offered pending
+  // (#5671 treadmill: nudges offering ~450K answered by 3-6K folds, forever).
+  // While set, a mass-qualified distillation tier may fire AHEAD of T1
+  // (growth band) and T1 leaves the pressure-band candidate set when a
+  // distill tier can pay the minimum benefit. The stall is an effectiveness
+  // signal on the T1 channel — consistent with #379's "mass is the need
+  // signal": it is consulted only when the distill tier's own mass ALREADY
+  // qualifies. Absent the flag (eager lanes, fresh states, tiers off)
+  // everything decides byte-identically.
+  const t1HarvestStall =
+    config.tiers.enabled && state.nudge.t1HarvestStall === true;
+  let stallEscalated = false;
   // First-sight mass bypass (#194): growthReference seeds to tokenCount when
   // no baseline exists, so a session that ARRIVES with a huge ready mass
   // (stateless full-history ingest / restored state) shows growthSinceReference
@@ -2131,7 +2199,14 @@ function decideNudge(input: NudgeInput): NudgeDecision {
     // the kernel would atomically reject. emergency vs over-limit only
     // changes the reason label/voice; truncate.threshold remains the
     // independent last resort when there is genuinely nothing to compress.
-    const candidates: CompressionTier[] = [1];
+    // #5698: with the T1 channel proven non-draining, max-pending would just
+    // re-select the tier that demonstrated it cannot deliver (T1 447K pending,
+    // 3-6K per nudge) — take T1 out of the running when a distill tier can pay
+    // the minimum benefit, so pressure routes to the channel that works.
+    const candidates: CompressionTier[] = [];
+    if (!(t1HarvestStall && Math.max(t2Pen, t3Pen) >= minPressureBenefit)) {
+      candidates.push(1);
+    }
     if (config.tiers.enabled) {
       candidates.push(2, 3);
     }
@@ -2148,6 +2223,7 @@ function decideNudge(input: NudgeInput): NudgeDecision {
     // resets the baselines and the same EMERGENCY nudge re-injects each turn.
     if (best !== null && bestPending >= minPressureBenefit) {
       injectedTier = best;
+      stallEscalated = t1HarvestStall && best !== 1;
       const label = emergencyOverride ? "EMERGENCY" : "OVER-LIMIT";
       injectedReason =
         best === 1
@@ -2155,10 +2231,40 @@ function decideNudge(input: NudgeInput): NudgeDecision {
           : `${label} T${best} distill: max pending ${bestPending} (T1 effective ${t1Eff}, T2 ${t2Pen}, T3 ${t3Pen}), usage ${Math.round(usage * 100)}%`;
     }
   } else if (growthReady) {
-    if (t1Eff >= tierThresholds[1]) {
+    // #5698 stall escalation: while the T1 channel is proven non-draining,
+    // a distill tier whose own mass qualifies may fire ahead of T1 — without
+    // the normal `> t1Eff` dominance requirement (the treadmill state has
+    // T1 effective 447K vs T2 112K, so dominance can never hold even though
+    // ONE distill call reclaims 91.6% of the floor). Cadence still applies.
+    if (t1HarvestStall && t3Pen >= tierThresholds[3] && t3Pen > t2Pen) {
+      const lastShown = state.nudge.lastShownByTier[3] ?? 0;
+      const cadenceMet =
+        lastShown === 0 || tokenCount - lastShown >= growthFloor;
+      if (cadenceMet) {
+        injectedTier = 3;
+        stallEscalated = true;
+        injectedReason = `T3 condense ready: ${tiers[3]!.targetBlocks.length} tier-2 blocks (${t3Pen} tokens) >= ${tierThresholds[3]}${config.nudge.tierGrowthTokens?.t3 === undefined ? " (1.5x)" : ""} and > T2 ${t2Pen}, usage ${Math.round(usage * 100)}%`;
+      }
+    }
+    if (
+      injectedTier === null &&
+      t1HarvestStall &&
+      t2Pen >= tierThresholds[2]
+    ) {
+      const lastShown = state.nudge.lastShownByTier[2] ?? 0;
+      const cadenceMet =
+        lastShown === 0 || tokenCount - lastShown >= growthFloor;
+      if (cadenceMet) {
+        injectedTier = 2;
+        stallEscalated = true;
+        injectedReason = `T2 distill ready: ${tiers[2]!.targetBlocks.length} tier-1 blocks (${t2Pen} tokens) >= ${tierThresholds[2]}${config.nudge.tierGrowthTokens?.t2 === undefined ? " (1.5x)" : ""}, usage ${Math.round(usage * 100)}%`;
+      }
+    }
+    if (injectedTier === null && t1Eff >= tierThresholds[1]) {
       injectedTier = 1;
       injectedReason = `T1 effective ${t1Eff} >= ${tierThresholds[1]}, growth ${growthSinceReference}, usage ${Math.round(usage * 100)}%`;
     } else if (
+      injectedTier === null &&
       config.tiers.enabled &&
       (t2CountReady || (t2Pen >= tierThresholds[2] && t2Pen > t1Eff))
     ) {
@@ -2172,6 +2278,7 @@ function decideNudge(input: NudgeInput): NudgeDecision {
           : `T2 distill ready: ${tiers[2]!.targetBlocks.length} tier-1 blocks (${t2Pen} tokens) >= ${tierThresholds[2]}${config.nudge.tierGrowthTokens?.t2 === undefined ? " (1.5x)" : ""} and > T1 effective ${t1Eff}, usage ${Math.round(usage * 100)}%`;
       }
     } else if (
+      injectedTier === null &&
       config.tiers.enabled &&
       (t3CountReady ||
         (t3Pen >= tierThresholds[3] && t3Pen > t2Pen && t3Pen > t1Eff))
@@ -2191,6 +2298,9 @@ function decideNudge(input: NudgeInput): NudgeDecision {
   const shouldInject = injectedTier !== null;
   if (shouldInject && firstSightMassReady) {
     injectedReason += " [first-sight mass]";
+  }
+  if (shouldInject && stallEscalated) {
+    injectedReason += " [T1 harvest stall]";
   }
 
   let reason: string;

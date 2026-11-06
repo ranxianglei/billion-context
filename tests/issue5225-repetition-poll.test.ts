@@ -223,3 +223,46 @@ test("RepetitionTracker.reset() clears pending timing and completed evidence", (
     t.complete("r2", T0 + 20_100);
     assert.equal(t.note("w", {}, "r3", T0 + 21_000).count, 2, "post-reset run counts normally (fast evidence honored)");
 });
+
+test("RepetitionTracker: pendingCallCount stays zero when handler cleans up blocked calls (#5505)", () => {
+    // Simulates the wire handler calling note() then complete() for each
+    // blocked call in recovery mode (final-refuse at 5, soft-stop 6-9,
+    // hard-abort at 10). Executed calls (1-4) are completed via tool_result.
+    const t = new RepetitionTracker({ warn: 3, abort: 5, recovery: true });
+    const id = (n: number) => `b${n}`;
+    t.note("w", {}, id(1), T0);
+    t.complete(id(1), T0 + 100);
+    t.note("w", {}, id(2), T0 + 200);
+    t.complete(id(2), T0 + 300);
+    assert.equal(t.note("w", {}, id(3), T0 + 400).action, "warn");
+    t.complete(id(3), T0 + 500);
+    assert.equal(t.note("w", {}, id(4), T0 + 600).action, "warn");
+    t.complete(id(4), T0 + 700);
+    assert.equal(t.note("w", {}, id(5), T0 + 800).action, "final-refuse");
+    t.complete(id(5), T0 + 800);
+    for (let i = 6; i <= 9; i++) {
+        assert.equal(t.note("w", {}, id(i), T0 + i * 100).action, "soft-stop");
+        t.complete(id(i), T0 + i * 100);
+    }
+    assert.equal(t.note("w", {}, id(10), T0 + 1100).action, "hard-abort");
+    t.complete(id(10), T0 + 1100);
+    assert.equal(t.pendingCallCount, 0, "blocked-call entries must not accumulate");
+});
+
+test("RepetitionTracker: default-mode blocked calls (final-refuse + abort) also stay cleaned up (#5505)", () => {
+    const t = new RepetitionTracker({ warn: 3, abort: 5 });
+    const id = (n: number) => `d${n}`;
+    t.note("w", {}, id(1), T0);
+    t.complete(id(1), T0 + 100);
+    t.note("w", {}, id(2), T0 + 200);
+    t.complete(id(2), T0 + 300);
+    t.note("w", {}, id(3), T0 + 400);
+    t.complete(id(3), T0 + 500);
+    t.note("w", {}, id(4), T0 + 600);
+    t.complete(id(4), T0 + 700);
+    assert.equal(t.note("w", {}, id(5), T0 + 800).action, "final-refuse");
+    t.complete(id(5), T0 + 800);
+    assert.equal(t.note("w", {}, id(6), T0 + 900).action, "abort");
+    t.complete(id(6), T0 + 900);
+    assert.equal(t.pendingCallCount, 0, "blocked-call entries must not accumulate in default mode either");
+});

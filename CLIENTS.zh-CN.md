@@ -212,6 +212,26 @@ pi-subagents(pi.dev 上的包)为前台/后台子代理运行派生**子会话**
 - **后台 child 存在一个请求的注册竞争**(ACP 工具从第二个请求起出现),所有模式下均为既有现象。
 - **行为变更披露:** 前台 child 从匿名 proxy 模式(`pfa-*`)升级为具名 plugin 模式(child 会话 id + 父会话血统)。信息严格更多,但任何以 `pfa-*` 身份做键的工具将看到不同的 id。
 
+## Kiro CLI(AWS)
+
+`bili kiro [opts --] [args]` 起代理并启动 `kiro-cli`(先查 `PATH`,否则 `~/.local/bin/kiro-cli`;`BILI_CLIENT_BIN` 可覆盖)。`--` 之后的参数原样交给 `kiro-cli`,例如 `bili kiro -- chat --resume`。
+
+**Kiro 的模型通信(kiro-cli 2.37 实测)。** 代理的模型调用走 **OpenAI Responses wire**:`POST https://runtime.<region>.kiro.dev/v1/responses`,体为 `{ model, input, tools, stream, origin, profileArn, metadata }`,以 `text/event-stream` 流回。Kiro **每轮重放完整历史**(它的系统提示作为 `user` 项放在 `input[0]`),用 bearer token 鉴权(请求体无签名,改写后依然有效),并遵守 `HTTPS_PROXY`。其余运行时调用(`KiroRuntimeService.*`,`/` 上的 AWS-JSON)不是模型 wire,逐字节转发;日志里会出现一次「unrecognized path」,属预期。
+
+**这条车道做了什么。**
+
+- **只对模型网关做 cert-MITM:** `runtime.us-east-1`、`runtime.eu-central-1`、`runtime.us-gov-east-1`、`runtime.us-gov-west-1`(`.kiro.dev`)。管理、认证、遥测主机仍盲隧道。其它主机用 `--mitm-domain` 添加。
+- **CA:** 合并 bundle 同时写入 `SSL_CERT_FILE`(Rust 外壳的 rustls 会**替换**根证书,所以必须带上系统根)与 `NODE_EXTRA_CA_CERTS`(内置 Node 代理服务,增量)。`NO_PROXY` 让回环(本地代理服务、MCP)直连。
+- **角色(内置 compat):** 网关只接受 `user` / `assistant` 消息项。bili 注入的压缩提示是 `developer` 项,网关以 `400 This request contains parameters or input that are not supported`(`param: input[0]`)拒绝;`system` 同样失败。对 Kiro 流量(User-Agent `KiroCLI/…` 或 `x-amzn-kiro-origin`,且主机为 `runtime.*.kiro.dev`),bili 自动把 `developer`/`system` 改写为 `user`。优先级最低:配置里的 `compat.roles` 与学到的角色按键覆盖它。不变量判官按原角色看待注入提示,不会误报 I1。
+- **会话身份:** Kiro 的首项(系统提示)跨进程不是字节稳定的,内容前缀亲和会让每次 `kiro-cli chat --resume` 新建会话。bili 把 `metadata["kiro:conversation_id"]` 提升为会话 id(`kiro-<id>`,只覆盖内容指纹,从不覆盖真实会话头 / `session_id` / `prompt_cache_key`),压缩状态因此跨 resume 保留。
+
+**说明。**
+
+- Kiro 自带的自动压缩保持开启作兜底;bili 折叠得更早,很少触发。只想用 bili:`kiro-cli settings chat.disableAutoCompaction true`(Kiro 全局设置;改回 `false` 撤销)。
+- Kiro 的流不带 usage 上报,nudge 决策用 bili 本地 token 估算(日志里的 `upstream success without usage report` 属预期)。
+- Kiro 的 `reasoning` 项带签名(`encrypted_content`),原样保留;随所在回合一起折叠。
+- 不用启动器的手动方式:以 `BILI_MITM_DOMAINS=runtime.us-east-1.kiro.dev` 启动 `bili`,再以 `HTTPS_PROXY=http://127.0.0.1:8787`、`SSL_CERT_FILE` 与 `NODE_EXTRA_CA_CERTS` 指向 `~/.local/share/billion-context/ca/combined-ca.pem` 启动 `kiro-cli`。
+
 ## 收养未列表的客户端(任何模型 baseURL 可配的客户端)(#2340)
 
 凡是**模型端点可以自己编辑、且用 API key 认证**(而非账号登录)的客户端,今天改一行就能上压缩——无需启动器、无需开发:在 baseURL 前加代理 origin + `/bili/`(`http://127.0.0.1:8787/bili/https://api.example.com/v1`),API key 原样保留,并让代理常驻(`bili start`)。得到的是完整纯代理待遇:压缩 + wire 级工具注入。细节与示例见 [CONFIGURATION.zh-CN.md → `/bili/` 前缀](CONFIGURATION.zh-CN.md#bili-前缀api-key-客户端)。

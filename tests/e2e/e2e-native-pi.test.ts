@@ -458,6 +458,17 @@ function piRun(
       cwd: ctx.piCwd,
       env: {
         ...cleanEnv(),
+        // This suite documents the SPAWN-posture package-native contract:
+        // instance record + proxy origin, per-request wire stamps, the
+        // shared-proxy delegate-child ACP channel (#2268), /__bili/plugin/status
+        // over HTTP. #5428 flipped the pi lane DEFAULT to inline (in-process
+        // engine, no instance record) and this suite was not updated with it:
+        // primary-lane tests then pass for the wrong reason while the
+        // instance-record and delegate-child stamp assertions fail structurally
+        // (CI sentinel incident, #4599). Pin the legacy posture so this
+        // coverage stays deterministic; inline posture is covered by
+        // tests/pi-inline-ws.test.ts and tests/pi-native.test.ts.
+        BILI_PI_INLINE: "0",
         PI_CODING_AGENT_DIR: ctx.piAgentDir,
         XDG_CONFIG_HOME: ctx.xdg.config,
         XDG_CACHE_HOME: ctx.xdg.cache,
