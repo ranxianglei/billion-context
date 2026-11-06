@@ -162,13 +162,14 @@ export {
     type GooseConfig,
     type GooseDirs,
 } from "./client-config.js";
+import { KIRO_DEFAULT_MODEL_HOSTS } from "./kiro.js";
 import { conflictRemediation } from "./conflict-watch.js";
 import { conflictScanEnabled, isDesignBenign, scanClientPlugins } from "./thirdparty-scan.js";
 
 export const LAUNCHER_DEFAULT_HOST = "127.0.0.1";
-export const LAUNCH_CLIENTS = ["pi", "codex", "claude", "omp", "opencode", "hermes", "dsh", "codebuddy", "qoder", "trae", "jcode", "kimi", "gemini", "iflow", "qwen", "mcode", "aider", "copilot", "amp", "crush", "zed", "goose", "antigravity", "pi-test", "pi-inline", "opencode-inline"] as const;
+export const LAUNCH_CLIENTS = ["pi", "codex", "claude", "omp", "opencode", "hermes", "dsh", "codebuddy", "qoder", "trae", "jcode", "kimi", "gemini", "iflow", "qwen", "mcode", "aider", "copilot", "amp", "crush", "zed", "goose", "antigravity", "kiro", "pi-test", "pi-inline", "opencode-inline"] as const;
 export type ClientName = (typeof LAUNCH_CLIENTS)[number];
-type BaseClientName = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh" | "codebuddy" | "qoder" | "trae" | "jcode" | "kimi" | "gemini" | "iflow" | "qwen" | "mcode" | "aider" | "copilot" | "amp" | "crush" | "zed" | "goose" | "antigravity";
+type BaseClientName = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh" | "codebuddy" | "qoder" | "trae" | "jcode" | "kimi" | "gemini" | "iflow" | "qwen" | "mcode" | "aider" | "copilot" | "amp" | "crush" | "zed" | "goose" | "antigravity" | "kiro";
 
 const HEALTH_PATH = "/__bili/health";
 const HEALTH_POLL_INTERVAL_MS = 200;
@@ -261,6 +262,12 @@ interface ProxyHandle {
      *  proxy will outlive every session and ignore config edits until killed;
      *  host-native bootstraps must surface this instead of staying silent. */
     refusedWatcher?: boolean;
+    /** #5641: the OUTCOME of the owner-watcher registration on attach.
+     *  `attached`/transport-ready must not imply the shared proxy's watchdog
+     *  acknowledged us — a transient failure leaves "failed" here even though
+     *  traffic flows fine, and only a later acknowledged heartbeat proves
+     *  recovery. Consumers reasoning about lifecycle guarantees read THIS. */
+    watcherRegistration?: WatcherRegistration;
 }
 
 export interface LauncherDeps {
@@ -853,6 +860,11 @@ export function discoverRoutes(client: ClientName, config: ClientConfig): Discov
         // GitHub's own CI firewall allowlist for the CLI: api.githubcopilot.com
         // plus the per-plan subdomains.
         addStaticHosts(acc, COPILOT_DEFAULT_MODEL_HOSTS, true);
+    } else if (client === "kiro") {
+        // Kiro CLI: no base-URL override; HTTPS_PROXY is honored by both its Rust
+        // shell and its Node agent server, so cert-MITM the model gateways only
+        // (management/telemetry/auth stay blind-tunneled). See src/kiro.ts.
+        addStaticHosts(acc, KIRO_DEFAULT_MODEL_HOSTS, true);
     } else if (client === "amp") {
         // #1049: closed Go binary like copilot; ampcode.com carries both the
         // model leg and the control plane, so one entry covers both.
@@ -983,7 +995,7 @@ export function buildPiEnv(
 // https entry wins, matching the historical sequential assignment). buildPiEnv
 // (JSON manifest + host list envs) and buildClaudePluginEnv (direct-URL mode,
 // returns baseEnv untouched) stay bespoke above/below this table. ---
-type LauncherEnvClient = "codex" | "trae" | "jcode" | "aider" | "copilot" | "amp" | "claude" | "codebuddy" | "qoder" | "gemini" | "iflow" | "qwen" | "antigravity" | "zed";
+type LauncherEnvClient = "codex" | "trae" | "jcode" | "aider" | "copilot" | "amp" | "claude" | "codebuddy" | "qoder" | "gemini" | "iflow" | "qwen" | "antigravity" | "zed" | "kiro";
 
 interface EnvClientPreset {
     /** CA path is written to every listed env var. */
@@ -1038,6 +1050,16 @@ const ENV_CLIENTS: Record<LauncherEnvClient, EnvClientPreset> = {
     copilot: { caKeys: ["SSL_CERT_FILE"], proxy: true, httpProxyOnRouteHttp: false },
     // #1049: amp is a Go binary like copilot — same cert-MITM contract.
     amp: { caKeys: ["SSL_CERT_FILE"], proxy: true, httpProxyOnRouteHttp: false },
+    // Kiro CLI: a Rust shell (rustls; SSL_CERT_FILE REPLACES its roots, hence
+    // the combined bundle) driving a bundled Node agent server (additive
+    // NODE_EXTRA_CA_CERTS). Both honor HTTPS_PROXY. NO_PROXY keeps loopback
+    // legs (the local agent server, MCP servers) direct.
+    kiro: {
+        caKeys: ["SSL_CERT_FILE", "NODE_EXTRA_CA_CERTS"],
+        proxy: true,
+        httpProxyOnRouteHttp: false,
+        extras: [["NO_PROXY", LAUNCHER_LOOPBACK_NO_PROXY], ["no_proxy", LAUNCHER_LOOPBACK_NO_PROXY]],
+    },
     /** No proxy/CA env: the /bili/ URL in ANTHROPIC_BASE_URL (and
      *  ANTHROPIC_VERTEX_BASE_URL) is plain http on loopback, so there is no TLS
      *  hop for a proxy to tunnel and no certificate for NODE_EXTRA_CA_CERTS to
@@ -1187,6 +1209,13 @@ export function buildCopilotEnv(origin: string, caPath: string, baseEnv: NodeJS.
 
 export function buildAmpEnv(origin: string, caPath: string, baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
     return buildClientEnv(ENV_CLIENTS.amp, origin, caPath, baseEnv);
+}
+
+/** Kiro CLI: cert-MITM env (HTTPS_PROXY + the combined CA bundle on both
+ *  SSL_CERT_FILE and NODE_EXTRA_CA_CERTS). Pass the COMBINED bundle: SSL_CERT_FILE
+ *  replaces the Rust shell's trust store, so system roots must ride along. */
+export function buildKiroEnv(origin: string, caPath: string, baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+    return buildClientEnv(ENV_CLIENTS.kiro, origin, caPath, baseEnv);
 }
 
 export function buildCrushEnv(origin: string, caPath: string, baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
@@ -1580,7 +1609,7 @@ export function launcherDirectUrl(env: NodeJS.ProcessEnv): boolean {
  *  (#2115): its model channel is a closed Go binary with no MCP-injection
  *  flag — v1 runs pure wire mode. */
 export function launcherInjectMcp(env: NodeJS.ProcessEnv, base: string, codexUpstream?: string): boolean {
-    if (base === "pi" || base === "omp" || base === "opencode" || base === "hermes" || base === "dsh" || base === "codebuddy" || base === "qoder" || base === "trae" || base === "jcode" || base === "kimi" || base === "gemini" || base === "iflow" || base === "qwen" || base === "antigravity" || base === "mcode" || base === "aider" || base === "copilot" || base === "amp" || base === "crush" || base === "zed" || base === "goose") return false;
+    if (base === "pi" || base === "omp" || base === "opencode" || base === "hermes" || base === "dsh" || base === "codebuddy" || base === "qoder" || base === "trae" || base === "jcode" || base === "kimi" || base === "gemini" || base === "iflow" || base === "qwen" || base === "antigravity" || base === "mcode" || base === "aider" || base === "copilot" || base === "amp" || base === "crush" || base === "zed" || base === "goose" || base === "kiro") return false;
     if (env.BILI_LAUNCHER_PLUGIN === "0") return false;
     if (base === "codex" && env.BILI_LAUNCHER_PLUGIN === undefined && codexUpstream !== undefined && isPrivateUpstreamHost(codexUpstream)) {
         return false;
@@ -4001,14 +4030,49 @@ async function fetchHealthInfoDefault(origin: string, opts?: { noKeepAlive?: boo
 /** Outcome of a session-watcher registration attempt (#1190). */
 export type WatcherRegistration = "ok" | "refused" | "failed";
 
+/** #5641: an actionable rendering of a registration failure — error name and
+ *  message plus the FIRST nested cause that carries one (the transport-level
+ *  reason behind a bare "fetch failed", e.g. ETIMEDOUT/ECONNREFUSED). Some
+ *  failure classes expose no structured `code` (DNS: the errno rides in the
+ *  cause MESSAGE), so the first cause with either is used. Name/message/code
+ *  only: never request bodies or credentials. Exported for the #5641 suite. */
+export function formatWatcherError(err: unknown): string {
+    const head = err instanceof Error
+        ? (err.name !== "Error" ? `${err.name}: ` : "") + err.message
+        : String(err);
+    let detail = head;
+    let cur: unknown = err instanceof Error ? err.cause : undefined;
+    for (let i = 0; i < 3 && cur !== undefined && cur !== null; i++) {
+        const c = cur as Record<string, unknown>;
+        if (typeof c.code === "string" || typeof c.code === "number") {
+            detail += ` [cause: ${c.code}]`;
+            return detail;
+        }
+        if (typeof c.message === "string" && c.message.trim() !== "") {
+            detail += ` [cause: ${c.message}]`;
+            return detail;
+        }
+        cur = c.cause;
+    }
+    return detail;
+}
+
 /** #1190: an ATTACHED shared proxy belongs to whoever SPAWNED it — its
  *  parent-gone watchdog tracks THAT owner's pid, so without registration the
  *  first owner's exit kills every attached session (#7/#1183). Registering our
  *  own owner makes the proxy die only after the LAST owner exits. Never throws:
  *  a failed registration degrades to the pre-fix single-owner behavior.
  *  #1322: returns the outcome so callers can surface a refusal — attaching to
- *  a daemon proxy means the "dies with the session" contract is void. */
+ *  a daemon proxy means the "dies with the session" contract is void.
+ *  #5641: failures warn with origin/pid and the nested cause code so the log
+ *  line is actionable instead of a bare "fetch failed". */
 export async function registerWatcherDefault(origin: string, pid: number): Promise<WatcherRegistration> {
+    // The recovery path depends on WHOSE pid was registered: our own gets an
+    // owner heartbeat that re-registers every beat (and reports recovery); a
+    // foreign pid has no heartbeat, so bounded retries are its whole chance.
+    const tail = pid === process.pid
+        ? "a later heartbeat will re-register us and report recovery"
+        : "no heartbeat runs for a foreign owner pid — registration stays unconfirmed unless a retry succeeds";
     try {
         const res = await fetch(`${origin}/__bili/watcher`, {
             method: "POST",
@@ -4020,12 +4084,12 @@ export async function registerWatcherDefault(origin: string, pid: number): Promi
         // silence stays at this layer, the handle carries the flag instead.
         if (!res.ok) {
             if (res.status === 409) return "refused";
-            console.error(`bili: watcher registration returned HTTP ${res.status} — the shared proxy may exit when its first owner does`);
+            console.error(`bili: watcher registration at ${origin} (owner pid ${pid}) returned HTTP ${res.status} — the shared proxy may exit when its first owner does; ${tail}`);
             return "failed";
         }
         return "ok";
     } catch (err) {
-        console.error(`bili: watcher registration failed — the shared proxy may exit when its first owner does (${err instanceof Error ? err.message : String(err)})`);
+        console.error(`bili: watcher registration at ${origin} (owner pid ${pid}) failed — the shared proxy may exit when its first owner does (${formatWatcherError(err)}); ${tail}`);
         return "failed";
     }
 }
@@ -4571,6 +4635,47 @@ export function probeNodeMajor(candidate: string, env: NodeJS.ProcessEnv): numbe
     }
 }
 
+/** #5663: the identity a candidate reports about itself — its own execPath and,
+ *  when it is an Electron binary running as Node, the Electron version. */
+interface NodeRuntimeIdentity {
+    execPath: string;
+    electron?: string;
+}
+
+/** #5663: prove the IDENTITY of a candidate that already passed the version
+ *  gate — run it and ask for its own execPath plus whether it carries an
+ *  Electron version. A PATH entry named node can be another desktop app's
+ *  Electron-as-node shim (`ELECTRON_RUN_AS_NODE=1 exec <app>/Contents/MacOS/<app> "$@"`):
+ *  `--version` answers v24.x, so the #3383 gate accepts it, but spawning it makes
+ *  the daemon execute a FOREIGN application's binary — on macOS the Local Network
+ *  grant (judged per responsible app + code signature) then denies every
+ *  non-gateway LAN connect from the daemon (instant EHOSTUNREACH while curl from
+ *  the same host works). Real Node reports no electron version; an
+ *  Electron-as-node process reports both its own (usually foreign) execPath and
+ *  the version. Any failure (timeout, non-JSON output, non-node program) yields
+ *  undefined — the caller treats that as "identity unprovable" and keeps the
+ *  pre-#5663 version-only verdict (fail-open: this gate must never break an
+ *  exotic-but-working runtime it cannot identify). */
+export function probeNodeIdentity(candidate: string, env: NodeJS.ProcessEnv): NodeRuntimeIdentity | undefined {
+    try {
+        const out = execFileSync(candidate, ["-e", "process.stdout.write(JSON.stringify({ p: process.execPath, e: process.versions.electron || null }))"], {
+            windowsHide: true,
+            timeout: 5000,
+            encoding: "utf8",
+            stdio: ["ignore", "pipe", "pipe"],
+            env,
+        });
+        const parsed = JSON.parse(out.trim()) as { p?: unknown; e?: unknown };
+        if (typeof parsed.p !== "string" || parsed.p.length === 0) return undefined;
+        return {
+            execPath: parsed.p,
+            electron: typeof parsed.e === "string" ? parsed.e : undefined,
+        };
+    } catch {
+        return undefined;
+    }
+}
+
 /** #3383: floor for the Node major version the proxy entry requires — must
  *  track "engines".node in package.json. */
 export const MIN_PROXY_NODE_MAJOR = 20;
@@ -4602,7 +4707,11 @@ function looksLikeNodeExecutable(p: string, platform: NodeJS.Platform): boolean 
  *  or install dir, wrapper target included) must prove it is Node via
  *  probeNodeMajor before being accepted — a foreign program named node(.exe)
  *  that ignores arguments and exits 0 (Microsoft HPC Pack's cluster CLI) used
- *  to be accepted verbatim, crash-looping every spawn forever. */
+ *  to be accepted verbatim, crash-looping every spawn forever. #5663: passing
+ *  --version is not enough — the candidate must also not be ANOTHER application's
+ *  Electron binary running as Node (an Electron-as-node shim named node answers
+ *  v24.x to --version), or the daemon ends up executing a foreign bundle whose
+ *  owner app holds no Local Network grant on macOS. */
 export function resolveNodeRuntime(
     execPath: string = process.execPath,
     env: NodeJS.ProcessEnv = process.env,
@@ -4611,6 +4720,7 @@ export function resolveNodeRuntime(
     electronVersion: string | undefined = typeof process.versions.electron === "string" ? process.versions.electron : undefined,
     probeWrapper: (candidate: string, env: NodeJS.ProcessEnv) => string | undefined = probeNodeWrapperTarget,
     probeNode: (candidate: string, env: NodeJS.ProcessEnv) => number | undefined = probeNodeMajor,
+    probeIdentity: (candidate: string, env: NodeJS.ProcessEnv) => NodeRuntimeIdentity | undefined = probeNodeIdentity,
 ): string {
     const base = path.basename(execPath).toLowerCase();
     if (base === "node" || base === "node.exe") return execPath;
@@ -4645,7 +4755,23 @@ export function resolveNodeRuntime(
             // ignore the hop and validate the candidate itself below.
         }
         const major = probeNode(subject, env);
-        if (major === undefined || major < MIN_PROXY_NODE_MAJOR) return undefined;
+        if (major === undefined || major < MIN_PROXY_NODE_MAJOR) {
+            teeLog("warn", `bili: skipping ${candidate} — not a usable Node runtime (--version did not report v${MIN_PROXY_NODE_MAJOR}+; set BILLION_CONTEXT_NODE if this is wrong, #3383)`);
+            return undefined;
+        }
+        // #5663: identity gate. A version answer proves nothing about WHOSE
+        // binary runs: an Electron-as-node shim named node reports v24.x but
+        // executes a foreign app's bundle, and macOS then denies its LAN egress
+        // per that app's (absent) Local Network grant. Reject only when the
+        // candidate PROVES itself to be Electron from a different executable
+        // than this host — an unprovable identity keeps the old verdict
+        // (fail-open), and the host's own binary is the sanctioned #1429
+        // fallback anyway.
+        const identity = probeIdentity(subject, env);
+        if (identity?.electron && identity.execPath.toLowerCase() !== execPath.toLowerCase()) {
+            teeLog("warn", `bili: skipping ${candidate} — reports v${major}.x but is an Electron-as-node process of ${identity.execPath} (Electron ${identity.electron}), a different application than this host (${execPath}); such a daemon loses macOS Local Network authorization (instant EHOSTUNREACH to LAN upstreams) — set BILLION_CONTEXT_NODE to a real Node (#5663)`);
+            return undefined;
+        }
         return subject;
     };
     // join with the SIMULATED platform's separators: a posix-style PATH on
@@ -4683,8 +4809,13 @@ export function resolveNodeRuntime(
             const candidate = dir.endsWith("/") || dir.endsWith("\\") ? dir + name : dir + "/" + name;
             if (!existsImpl(candidate)) continue;
             const resolved = resolveDiscovered(candidate);
-            if (resolved !== undefined) return resolved;
-            teeLog("warn", `bili: skipping ${candidate} — not a usable Node runtime (--version did not report v${MIN_PROXY_NODE_MAJOR}+; set BILLION_CONTEXT_NODE if this is wrong, #3383)`);
+            if (resolved !== undefined) {
+                // #5663: make the daemon's true executable visible at startup —
+                // the field failure was invisible because nothing logged which
+                // binary the daemon actually ran under.
+                teeLog("info", `bili: proxy runtime resolved: ${resolved}${resolved.toLowerCase() !== candidate.toLowerCase() ? ` (via wrapper ${candidate})` : ""}`);
+                return resolved;
+            }
         }
     }
     // #1429: last resort inside an Electron host — its own binary runs as plain
@@ -4734,6 +4865,13 @@ const STALE_ROTATION_WAIT_MS = 12_000;
 const SHUTDOWN_REQUEST_TIMEOUT_MS = 3_000;
 const OWNER_HEARTBEAT_INTERVAL_MS = 5_000;
 const OWNER_HEARTBEAT_POST_TIMEOUT_MS = 2_000;
+// #5641: bounded retry budget for a TRANSIENT owner-registration failure on
+// attach. A foreign owner pid has no heartbeat to repair the registration
+// later, so these attempts are its whole chance; worst case ≈ ATTEMPTS × 2s
+// fetch timeout + (ATTEMPTS−1) × backoff ≈ 7s. A 409 refusal is a policy
+// answer, never retried.
+const WATCHER_REG_ATTEMPTS = 3;
+const WATCHER_REG_RETRY_BACKOFF_MS = 500;
 
 export async function requestInstanceShutdown(origin: string): Promise<boolean> {
     try {
@@ -4845,8 +4983,10 @@ export function startOwnerHeartbeat(
     //
     // The `post` seam is preserved verbatim: an overriding caller (the #3544
     // tests record beats without a live server) keeps the in-thread loop, so
-    // existing contracts and testability are untouched.
-    if (post !== undefined) return runOwnerHeartbeatLoop(post, pid, intervalMs);
+    // existing contracts and testability are untouched. #5641: the origin is
+    // passed through so an injected post resolving TRUE reports an
+    // acknowledged beat exactly like the default sender does.
+    if (post !== undefined) return runOwnerHeartbeatLoop(post, pid, intervalMs, origin);
     return runOwnerHeartbeatWorker(origin, pid, intervalMs);
 }
 
@@ -4859,11 +4999,39 @@ export function startOwnerHeartbeat(
  *  above), so one host attests exactly one pid to a given proxy. */
 const ownerHeartbeatWorkers = new Map<string, { stop: () => void; refs: number }>();
 
+/** #5641: origins whose initial owner-watcher registration ended in a
+ *  TRANSIENT failure — an acknowledged beat (an HTTP 2xx from
+ *  /__bili/watcher, which re-adds the pid server-side) promotes them to
+ *  recovered with exactly ONE host-visible notice through the diagnostic
+ *  channel captured at attach time. A resolved fetch returning 409/5xx never
+ *  counts as recovery. Entries die on recovery, on a direct "ok"
+ *  re-registration, or when the origin's last heartbeat stops; a
+ *  foreign-owner-pid entry (no heartbeat runs for it) simply lives until
+ *  process exit or a later direct-"ok" attach to the same origin. Exported
+ *  alongside noteWatcherHeartbeatAck so the regression suite can exercise the
+ *  transition without a full proxy bring-up. */
+const watcherPendingRecovery = new Map<string, { pid: number; diag: (msg: string) => void }>();
+
+export function markWatcherPendingRecovery(origin: string, pid: number, diag: (msg: string) => void): void {
+    watcherPendingRecovery.set(origin, { pid, diag });
+}
+
+export function noteWatcherHeartbeatAck(origin: string): void {
+    const pending = watcherPendingRecovery.get(origin);
+    if (pending === undefined) return;
+    watcherPendingRecovery.delete(origin);
+    pending.diag(
+        `bili: watcher registration recovered at ${origin} (owner pid ${pending.pid}) — the shared proxy's watchdog now tracks this owner again; ` +
+        `the earlier "may exit when its first owner does" warning is cleared`,
+    );
+}
+
 /** In-thread beat loop — the historical shape, kept for injected `post`. */
 function runOwnerHeartbeatLoop(
     post: (body: string) => Promise<unknown>,
     pid: number,
     intervalMs: number,
+    origin?: string,
 ): () => void {
     let stopped = false;
     const beat = async (): Promise<void> => {
@@ -4874,7 +5042,13 @@ function runOwnerHeartbeatLoop(
             });
             if (stopped) return;
             try {
-                await post(JSON.stringify({ pid, hb: true }));
+                // #5641: a post resolving TRUE means the server ACKNOWLEDGED
+                // the beat (defaultOwnerPost resolves res.ok; only a 2xx
+                // re-adds the pid). That is the sole input to the
+                // pending→recovered transition — a resolved non-ok response
+                // must not flip it.
+                const result = await post(JSON.stringify({ pid, hb: true }));
+                if (result === true && origin !== undefined) noteWatcherHeartbeatAck(origin);
             } catch {
                 // transient failure — the next beat retries and the server-side
                 // grace window absorbs single misses
@@ -4896,16 +5070,22 @@ const { origin, pid, intervalMs, timeoutMs } = workerData;
 let stopped = false;
 parentPort.on("message", (m) => { if (m === "stop") stopped = true; });
 const beat = async () => {
+    let acked = false;
     while (!stopped) {
         await new Promise((r) => { const t = setTimeout(r, intervalMs); t.unref?.(); });
         if (stopped) return;
         try {
-            await fetch(origin + "/__bili/watcher", {
+            const res = await fetch(origin + "/__bili/watcher", {
                 method: "POST",
                 headers: { "content-type": "application/json" },
                 body: JSON.stringify({ pid, hb: true }),
                 signal: AbortSignal.timeout(timeoutMs),
             });
+            // #5641: report the FIRST acknowledged beat (a 2xx re-adds our pid
+            // server-side) so a pending registration failure can flip to
+            // recovered. Once only — no per-heartbeat traffic or log spam.
+            // 409/5xx never count: only res.ok does.
+            if (res.ok && !acked) { acked = true; parentPort.postMessage("ack"); }
         } catch {
             // transient — the next beat retries; the server-side grace window
             // absorbs single misses
@@ -4917,9 +5097,11 @@ void beat();
 `;
 
 /** #5152: the beat-worker surface this module drives — injectable so the
- *  crash-fallback path can be exercised without a real thread death. */
+ *  crash-fallback path can be exercised without a real thread death. #5641:
+ *  also surfaces "message" — the worker's one-shot "ack" for its first
+ *  acknowledged beat (#5641 recovery notice). */
 export interface OwnerBeatWorker {
-    on(event: "error", listener: (err: Error) => void): unknown;
+    on(event: "error" | "message", listener: (arg: Error | string) => void): unknown;
     unref(): void;
     postMessage(message: string): void;
     terminate(): Promise<number | undefined>;
@@ -4952,24 +5134,41 @@ export function runOwnerHeartbeatWorker(
     let worker: OwnerBeatWorker | undefined;
     let fallbackStop: (() => void) | undefined;
     try {
-        worker = spawn(OWNER_HEARTBEAT_WORKER_SOURCE, { origin, pid, intervalMs, timeoutMs: OWNER_HEARTBEAT_POST_TIMEOUT_MS });
-        worker.unref();
-        worker.on("error", () => {
+        const beatWorker = spawn(OWNER_HEARTBEAT_WORKER_SOURCE, { origin, pid, intervalMs, timeoutMs: OWNER_HEARTBEAT_POST_TIMEOUT_MS });
+        beatWorker.on("message", (message) => {
+            // #5641: the worker's one-shot "ack" (first 2xx beat) drives the
+            // pending→recovered transition. "stopped" and anything else are
+            // ignored — no per-heartbeat logging.
+            if (message === "ack") noteWatcherHeartbeatAck(origin);
+            // A "message" listener RE-REFS the worker's port (Node MessagePort
+            // semantics) — re-assert the unref contract (#5152: the beat must
+            // never hold the host process open) after every delivery.
+            beatWorker.unref();
+        });
+        beatWorker.on("error", () => {
             // Construction failure is covered by the catch below; this covers a
             // thread that dies MID-FLIGHT: keep attesting from the in-thread
             // loop (its fetch failures keep looping where a dead thread cannot).
             if (!stopped && fallbackStop === undefined) {
-                fallbackStop = runOwnerHeartbeatLoop(defaultOwnerPost(origin), pid, intervalMs);
+                fallbackStop = runOwnerHeartbeatLoop(defaultOwnerPost(origin), pid, intervalMs, origin);
             }
         });
+        // AFTER all listener registrations: attaching "message" re-refs the
+        // port, so an earlier unref would be undone by the attachment itself.
+        beatWorker.unref();
+        worker = beatWorker;
     } catch {
-        return runOwnerHeartbeatLoop(defaultOwnerPost(origin), pid, intervalMs);
+        return runOwnerHeartbeatLoop(defaultOwnerPost(origin), pid, intervalMs, origin);
     }
     const entry = { refs: 1, stop: (): void => { /* replaced below */ } };
     const stop = (): void => {
         if (stopped) return;
         stopped = true;
         ownerHeartbeatWorkers.delete(origin);
+        // #5641: no more beats will come for this origin from this process, so
+        // a pending registration failure can never recover now — drop the
+        // entry; a fresh attach re-marks it.
+        watcherPendingRecovery.delete(origin);
         // Best-effort: tell the worker to stop, then tear it down regardless so
         // a wedged worker can never outlive the host that owns it.
         try { worker?.postMessage("stop"); } catch { /* already gone */ }
@@ -4987,15 +5186,18 @@ export function runOwnerHeartbeatWorker(
     };
 }
 
-/** The default in-thread beat sender (fallback path). */
-function defaultOwnerPost(origin: string): (body: string) => Promise<unknown> {
+/** The default in-thread beat sender (fallback path). #5641: resolves
+ *  res.ok — TRUE is the loop's ack signal for the pending→recovered
+ *  transition; a resolved 409/5xx response stays falsy and never counts. */
+function defaultOwnerPost(origin: string): (body: string) => Promise<boolean> {
     return async (body: string) => {
-        await fetch(`${origin}/__bili/watcher`, {
+        const res = await fetch(`${origin}/__bili/watcher`, {
             method: "POST",
             headers: { "content-type": "application/json" },
             body,
             signal: AbortSignal.timeout(OWNER_HEARTBEAT_POST_TIMEOUT_MS),
         });
+        return res.ok;
     };
 }
 
@@ -5036,12 +5238,25 @@ export async function ensureProxyRunning(
     // (#7/#1183). Awaited before returning: a spawner that dies right after a
     // second session attaches must not beat the registration to the grace
     // window.
+    // #5641: a TRANSIENT failure (transport fault) is retried a small bounded
+    // number of times within WATCHER_REG_ATTEMPTS × 2s + backoffs — for a
+    // foreign owner pid there is no heartbeat to repair it later, and even
+    // for our own pid each retry shortens the unregistered window. "refused"
+    // (409) is a policy answer and is never retried.
+    const registerOwner = async (inst: ProxyInstanceFile): Promise<WatcherRegistration> => {
+        let reg = await registerWatcher(inst.origin, watchPid);
+        for (let attempt = 1; reg === "failed" && attempt < WATCHER_REG_ATTEMPTS; attempt++) {
+            await sleepImpl(WATCHER_REG_RETRY_BACKOFF_MS);
+            reg = await registerWatcher(inst.origin, watchPid);
+        }
+        return reg;
+    };
     const attachTo = async (inst: ProxyInstanceFile): Promise<ProxyHandle> => {
         // #3404: host-safe channel (#3200) — a raw console.* here lands on the
         // physical screen bypassing an in-host TUI renderer (host-log.ts),
         // e.g. into Pi's input draft after herdr session restore.
         attachDiag(`bili: attaching to running proxy at ${inst.origin} (pid ${inst.pid})`);
-        const reg = await registerWatcher(inst.origin, watchPid);
+        const reg = await registerOwner(inst);
         // #3544: keep re-asserting our liveness so the proxy's watchdog ages us
         // out by HEARTBEAT expiry, not just kill(pid,0) (identity-blind under
         // Windows pid reuse). No-op unless we own the pid.
@@ -5050,8 +5265,21 @@ export async function ensureProxyRunning(
         // watchdog (started without BILI_PARENT_PID, e.g. manually on a stable
         // port) — it will outlive every session; host-native bootstraps must
         // say so instead of silently serving a voided lifecycle contract.
-        const handle: ProxyHandle = { origin: inst.origin, port: inst.port, attached: true };
+        // #5641: the handle carries the OUTCOME for every case — attached
+        // traffic does not imply the watchdog acknowledged us.
+        const handle: ProxyHandle = { origin: inst.origin, port: inst.port, attached: true, watcherRegistration: reg };
         if (reg === "refused") handle.refusedWatcher = true;
+        if (reg === "failed") {
+            // The shared proxy may be healthy again on the next beat: remember
+            // the pending failure so the first ACKNOWLEDGED heartbeat flips it
+            // to recovered with one host-visible notice (host-safe channel —
+            // never a raw console.* on the attach path).
+            markWatcherPendingRecovery(inst.origin, watchPid, attachDiag);
+        } else {
+            // A direct "ok" proves registration right now — drop any stale
+            // pending entry for this origin (e.g. a sibling lane failed first).
+            watcherPendingRecovery.delete(inst.origin);
+        }
         return handle;
     };
     const script = deps.scriptPath ?? process.argv[1];
@@ -6065,6 +6293,15 @@ export function resolveClientCommand(
     if (client === "trae") {
         return { command: firstOnPath(["traecli", "trae-cli", "trae"], env) ?? "traecli", prefixArgs: [] };
     }
+    if (client === "kiro") {
+        // The binary is `kiro-cli`; install.sh places it at ~/.local/bin/kiro-cli.
+        const resolved = resolveOnPath("kiro-cli", env);
+        if (resolved) return { command: resolved, prefixArgs: [] };
+        const base = platform === "win32"
+            ? path.join(env.LOCALAPPDATA ?? path.join(os.homedir(), "AppData", "Local"), "kiro-cli", "bin", "kiro-cli")
+            : path.join(os.homedir(), ".local", "bin", "kiro-cli");
+        return { command: probeInstalledBin(base, platform === "win32" ? [".exe", ""] : [""]), prefixArgs: [] };
+    }
     if (client === "kimi") {
         // install.sh / npm postinstall both place the binary at <KIMI_CODE_HOME>/bin/kimi.
         const resolved = resolveOnPath("kimi", env);
@@ -6123,11 +6360,24 @@ function parsePort(raw: string | undefined): number {
     return port;
 }
 
+/** -s/--server posture pins (#5491): parseArgs records them in overrides, but
+ *  the launch path skips the generic env merge the start/update lanes use —
+ *  mirror that merge for these keys so each lane's child-env spread delivers
+ *  the pin to the child. Without this, an ambient BILI_PI_INLINE=1 flips a
+ *  `-s pi` launch onto the inline lane and the launcher proxy idles. */
+export function applyPosturePins(overrides: Record<string, string | undefined>): void {
+    for (const key of ["BILI_PI_INLINE", "BILI_OPENCODE_INLINE"]) {
+        const v = overrides[key];
+        if (v !== undefined) process.env[key] = v;
+    }
+}
+
 export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}): Promise<void> {
     const host = params.overrides.ACP_HOST?.trim() || LAUNCHER_DEFAULT_HOST;
     const port = parsePort(params.overrides.ACP_PORT ?? process.env.ACP_PORT);
     const passthrough = params.overrides.ACP_PASSTHROUGH === "1";
     const debug = params.overrides.ACP_DEBUG === "1";
+    applyPosturePins(params.overrides);
 
     const base = baseClientName(params.client);
     // #535: for pi and omp, discovery must read the REAL home — a stale
@@ -6770,6 +7020,13 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         // via SSL_CERT_FILE combined bundle). No budget env — the CLI manages
         // its own context window.
         env = buildCopilotEnv(origin, resolveCombinedCaPath(process.env), stripInheritedProxy(process.env));
+    } else if (base === "kiro") {
+        // Kiro CLI: cert-MITM (HTTPS_PROXY honored by the Rust shell and the Node
+        // agent server; combined CA bundle on SSL_CERT_FILE + NODE_EXTRA_CA_CERTS).
+        // Kiro's own auto-compaction stays on as a backstop; bili folds earlier,
+        // so it rarely triggers. Turn it off with
+        // `kiro-cli settings chat.disableAutoCompaction true` if you prefer.
+        env = buildKiroEnv(origin, resolveCombinedCaPath(process.env), stripInheritedProxy(process.env));
     } else if (base === "amp") {
         // #1049: cert-MITM like copilot; ampcode.com carries both the model
         // leg and the control plane, so the single whitelist entry covers both.
@@ -7047,6 +7304,7 @@ export async function runTestPi(params: RunTestPiParams, deps: LauncherDeps = {}
     const port = parsePort(params.overrides.ACP_PORT ?? process.env.ACP_PORT);
     const passthrough = params.overrides.ACP_PASSTHROUGH === "1";
     const debug = params.overrides.ACP_DEBUG === "1";
+    applyPosturePins(params.overrides);
 
     const config = loadClientConfig(process.env, process.cwd());
     const domains = dedupeInOrder([

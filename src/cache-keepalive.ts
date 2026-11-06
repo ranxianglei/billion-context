@@ -19,7 +19,7 @@
 // provider adapter interface (Gemini's official cache-refresh API), restart
 // persistence.
 
-import { findRoute, loadConfigFile, type CacheKeepaliveSettings, type ProviderRoutes } from "./config.js";
+import { findRoute, loadConfigFile, resolveModelEntryOnRoute, type CacheKeepaliveSettings, type ProviderRoutes } from "./config.js";
 import { credentialFingerprint } from "./cache-ledger.js";
 import { log as loggerLog } from "./logger.js";
 import { peekSession } from "./session.js";
@@ -92,7 +92,7 @@ export function resolveCacheKeepalive(routes: ProviderRoutes | undefined, upstre
     const g: CacheKeepaliveSettings = loadConfigFile().cacheKeepalive ?? {};
     const route = routes ? findRoute(routes, upstreamUrl) : undefined;
     const p: CacheKeepaliveSettings = route?.cacheKeepalive ?? {};
-    const m: CacheKeepaliveSettings = typeof model === "string" && model.length > 0 ? route?.models?.[model]?.cacheKeepalive ?? {} : {};
+    const m: CacheKeepaliveSettings = resolveModelEntryOnRoute(route, model).entry?.cacheKeepalive ?? {};
     const lvl = <K extends keyof CacheKeepaliveSettings>(k: K): CacheKeepaliveSettings[K] => (m[k] !== undefined ? m[k] : p[k] !== undefined ? p[k] : g[k]);
 
     let assumeTtl: "5m" | "1h" | undefined;
