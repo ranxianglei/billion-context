@@ -26,7 +26,10 @@ import {
 } from "./turn-integrity.js";
 import type { IntegrityPre } from "./turn-integrity.js";
 import { adjustBoundariesForReasoningPairs } from "./reasoning-pairs.js";
-import { adjustBoundariesForToolPairs } from "./tool-pairs.js";
+import {
+  adjustBoundariesForToolPairs,
+  buildToolPairExtremes,
+} from "./tool-pairs.js";
 import type {
   CompressionState,
   CompressionTier,
@@ -157,7 +160,11 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
       }
     }
   }
-  const adjustedIds = applyPairBoundaryAdjustments(resolved, input.messages);
+  const adjustedIds = applyPairBoundaryAdjustments(
+    resolved,
+    input.messages,
+    shared,
+  );
   const skippedCarrierIds = adjustedIds.filter((id) => liveCarrierIds.has(id));
   if (skippedCarrierIds.length > 0) {
     warnings.push(
@@ -248,7 +255,7 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
   });
   if (mediaExcluded.length > 0) {
     warnings.push(
-      `Excluded ${mediaExcluded.length} message(s) carrying unrecoverable media (remote URL / file references with no stored bytes) from compression range — folding would destroy them permanently (billion-context#1188/#2609). Inline images fold normally and stay restorable via decompress({ imageRef }).`,
+      `Excluded ${mediaExcluded.length} message(s) carrying unrecoverable media (no stored bytes and no re-access handle in the message) from compression range — folding would destroy them permanently (billion-context#1188/#2609). Ref-based media (remote URL / file id) folds normally since #5620 with its handle recorded in the summary; inline images fold normally too and stay restorable via decompress({ imageRef }).`,
     );
   }
 
@@ -407,10 +414,16 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
       foldedRef = new Set(effectiveMessageIds);
       for (const id of survivingCoverage) foldedRef.add(id);
     }
+    // #5531: fresh folds judge on their OWN ids alone, so the coverage of OTHER
+    // active blocks must arrive as the invisible set — a covered call is not
+    // kept-visible and cannot strand its turn's reasoning (#564 reverse-split
+    // residue, billion-context#5531). Merges already model post-fold coverage
+    // through foldedRef ∪ survivingCoverage and stay untouched.
     const initial = computeIntegrityWithdrawals(
       input.messages,
       foldedRef,
       shared?.integrityPre,
+      isMerge ? undefined : input.preExistingCoverage,
     );
     splitTurnCount = initial.splitTurnCount;
     splitPairCount = initial.splitPairCount;
@@ -546,6 +559,10 @@ export interface ProjectionShared {
   baseProtectedCallIds: Set<string>;
   /** tool-call/tool-result pairing keyed by toolCallId ?? id. */
   pairByCallId: Map<string, [string, string]>;
+  /** Per-toolCallId [lowest, highest] positions over the whole array —
+   *  #5751 id-exact boundary widening. Rebuilding it per unit is the #5337
+   *  quadratic class (U units x O(n)) — hence shared. Immutable. */
+  toolPairExtremes: Map<string, [number, number]>;
   /** Last visible user anchor (drives the #3953 truncation warning note). */
   anchorMessage: CoreMessage | undefined;
   /** Per-message inputs of computeIntegrityWithdrawals (#684 gate). */
@@ -586,6 +603,7 @@ export function buildProjectionShared(
     agedCompressCallIds,
     baseProtectedCallIds,
     pairByCallId: buildPairMap(messages),
+    toolPairExtremes: buildToolPairExtremes(messages),
     anchorMessage: lastUserAnchor(messages, coveredMessageIds(state), config),
     integrityPre: buildIntegrityPre(messages),
   };
@@ -626,6 +644,7 @@ function applyPairBoundaryAdjustments(
     boundaryKind: string;
   },
   messages: CoreMessage[],
+  shared?: ProjectionShared,
 ): string[] {
   if (resolved.boundaryKind === "block") {
     return resolved.messageIds;
@@ -646,6 +665,7 @@ function applyPairBoundaryAdjustments(
       reasoningAdjusted.startIndex,
       reasoningAdjusted.endIndex,
       messages,
+      shared?.toolPairExtremes,
     );
     const changed =
       toolAdjusted.startIndex !== startIndex ||

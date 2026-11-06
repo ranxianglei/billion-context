@@ -272,26 +272,55 @@ export function evaluateSelfHealRound(session: Session, inputs: SelfHealRoundInp
     }
 }
 
+/** #5527: every location on the wire where a host may declare tools —
+ *  ① the top-level `tools` array (all four protocols), AND
+ *  ② on the Responses wire, the nested `tools` arrays of
+ *     `input[].type === "additional_tools"` preamble items. Codex-shaped
+ *     hosts (the DSH pi-ai codex path, #5527) declare the model-visible
+ *     tools there and send NO top-level `tools`; top-level-only observation
+ *     read that as "no tools at all" (`surface=off(no-tools)` on a lane
+ *     whose model can in fact call compress). Same family as the
+ *     #3600/#3884 omnibus-name misses: the declaration exists, the observer
+ *     just wasn't looking where it lives. Single source of truth for both
+ *     consumers (#3417 discipline: biliToolsDeclaredOnWire +
+ *     observeDeclaredTools). */
+export function declaredToolEntries(parsed: unknown, protocol: string): Array<Record<string, unknown>> {
+    if (parsed === null || typeof parsed !== "object") return [];
+    const body = parsed as Record<string, unknown>;
+    const out: Array<Record<string, unknown>> = [];
+    const pushList = (tools: unknown): void => {
+        if (!Array.isArray(tools)) return;
+        for (const t of tools) if (t !== null && typeof t === "object") out.push(t as Record<string, unknown>);
+    };
+    pushList(body["tools"]);
+    if (protocol === "responses") {
+        const input = body["input"];
+        if (Array.isArray(input)) {
+            for (const item of input) {
+                if (item !== null && typeof item === "object" && (item as Record<string, unknown>)["type"] === "additional_tools") {
+                    pushList((item as Record<string, unknown>)["tools"]);
+                }
+            }
+        }
+    }
+    return out;
+}
+
 /** Live-lane evidence on the request's own tool declarations. In plugin mode
  * the CLIENT declares the bili tools (MCP-registered: mcp__bili__* for
  * zcode/claude-code lanes, bare ACP names for pi/omp extensions) — a healthy
  * bound session re-declares them on every main request, while a zombie (the
  * MCP subprocess removed mid-session) stops declaring them. Tolerant by
  * design: unknown shapes answer false and the header signal still carries
- * the healthy-plugin case. */
+ * the healthy-plugin case. Declarations are read from EVERY wire location
+ * (#5527: declaredToolEntries), not only the top-level `tools` array. */
 export function biliToolsDeclaredOnWire(parsed: unknown, protocol: string, named?: string): boolean {
-    if (parsed === null || typeof parsed !== "object") return false;
-    const body = parsed as Record<string, unknown>;
-    const tools = body["tools"];
     // #3417: with `named`, reachability is judged for the SPECIFIC tool the
     // caller is about to advertise (e.g. the nudge names "compress") — a lane
     // that only exposes acp_status must not arm the compress surface
     // (#3403 review follow-up). Without it, any bili tool counts (legacy use).
     const wanted = (name: string): boolean => named === undefined ? isBiliToolName(name) : name === named;
-    if (!Array.isArray(tools)) return false;
-    for (const t of tools) {
-        if (t === null || typeof t !== "object") continue;
-        const rec = t as Record<string, unknown>;
+    for (const rec of declaredToolEntries(parsed, protocol)) {
         // anthropic / responses: flat { name }.
         const flat = typeof rec["name"] === "string" ? (rec["name"] as string) : undefined;
         if (flat !== undefined && wanted(flat)) return true;
@@ -312,6 +341,5 @@ export function biliToolsDeclaredOnWire(parsed: unknown, protocol: string, named
             }
         }
     }
-    void protocol;
     return false;
 }
