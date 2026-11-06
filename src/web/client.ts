@@ -645,6 +645,8 @@ export const WEB_CLIENT = `(function () {
             + (s.selfHeal ? ' <span class="badge live" style="background:#8a6d3b" title="' + escapeHtml(t("det.self_heal_tip")) + '">' + t("det.self_heal_short") + "</span>" : "")
             + (s.autoModeForge ? ' <span class="badge live" style="background:#6d3b8a" title="' + escapeHtml(t("det.auto_mode_forge_tip")) + '">' + t("det.auto_mode_forge_short") + "</span>" : "")
 + (s.keepalive ? ' <span class="badge live" style="background:#3b6d8a" title="' + escapeHtml(t("det.keepalive_tip") + " · " + s.keepalive.tierLabel + " · " + (s.keepalive.cadenceMs >= 60_000 ? Math.round(s.keepalive.cadenceMs / 60_000) + "min" : Math.round(s.keepalive.cadenceMs / 1000) + "s") + (s.keepalive.lastHitAt ? " · " + t("det.keepalive_last_hit") + " " + timeAgo(new Date(s.keepalive.lastHitAt).toISOString()) : "")) + '">' + t("det.keepalive_short") + "×" + s.keepalive.pingCount + "</span>" : "")
+            // #5796: long-running session — host-side history only grows, per-step cost climbs; badge points at the actionable exit.
+            + (s.slowSession ? ' <span class="badge live" style="background:#8a3b3b" title="' + escapeHtml(t("ses.slow_tip", { n: fmtW(s.slowSession.requests) })) + '">' + t("ses.slow_short") + "</span>" : "")
             + '<span class="row-id">' + escapeHtml(s.id) + "</span></a>";
     }
     // SAVED column prefers ledger-derived net savings; pre-tagging sessions fall back
