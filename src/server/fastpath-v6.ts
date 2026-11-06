@@ -182,6 +182,13 @@ function recordFault(store: SessionStore, sessionId: string, detail: string, log
 }
 
 function creditReset(store: SessionStore, sessionId: string, prevDisabledAt: number | undefined): void {
+    // Reset the LOCAL mirror whenever it exists — unconditionally, even when
+    // storage is unavailable: readGuard is MEMORY-FIRST, so an ext-only reset
+    // leaves this process carrying the stale streak (a sound turn then fails
+    // to clear 4/5 and the NEXT single fault parks at a cumulative-but-not-
+    // consecutive fifth strike — violating the five-CONSECUTIVE contract).
+    const local = guardMem.get(sessionId);
+    if (local !== undefined) guardMem.set(sessionId, { faults: 0, disabledAt: prevDisabledAt });
     try {
         if (!store.replicasAvailable()) return;
         store.setSessionExt(sessionId, "pf:v6-guard", { faults: 0, disabledAt: prevDisabledAt });

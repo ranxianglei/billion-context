@@ -753,3 +753,46 @@ test("§7-A② soft-degrade node: sidecar down ⇒ lane disengages SILENTLY, no 
         }
     } finally { h.cleanup(); }
 });
+
+test("§8-12 breaker streak clears on a sound turn — memory mirror included, not just the ext replica", (t) => {
+    const h = makeH("breakerreset");
+    try {
+        const log = makeLog();
+        const b1 = makeBody([{ role: "system", content: SYS }, { role: "user", content: "hello one" }]);
+        const r1 = turn("s-br", "car-br", b1, ids(2, "-br"), log);
+        assert.equal(r1.outcome.decision, "arm");
+        const b2 = makeBody([...JSON.parse(b1).messages as Msg[], { role: "assistant", content: "hi there" }]);
+
+        // Width-mismatch strike (deterministic, zero side effects on the plane).
+        const strike = (): void => {
+            assertFault(() => evaluateWatermarkV6(b2, {
+                headers: { "x-bili-plugin-conversation": "car-br", [PF_TAIL_IDS_HEADER]: ids(3, "-br").slice(0, 2).join(",") },
+            } as unknown as http.IncomingMessage, { id: "s-br" } as unknown as Session, { pluginMode: true, titleGen: false, model: "m" }, log), "identity width mismatch");
+        };
+        strike(); strike(); strike(); strike();
+        assert.ok(log.lines.some((l) => l.msg.includes("REJECTED (4/5)")), "fourth consecutive strike must be loud");
+
+        // A healthy HIT clears the CONSECUTIVE-fault streak (§8). Before the fix
+        // the reset touched only the advisory ext copy while readGuard is
+        // memory-first — so one more single fault parked this session for 60m
+        // on a cumulative-but-not-consecutive fifth strike.
+        const rHit = turn("s-br", "car-br", b2, ids(3, "-br"), log, r1.sid!);
+        assert.equal(rHit.outcome.decision, "hit");
+        strike();
+        assert.ok(log.lines.some((l) => l.msg.includes("REJECTED (1/5)")), "post-reset strike must start from zero");
+
+        // Same rule on the NO-PROGRESS ride path: ride twice to 3/5, one sound
+        // ride resets, next strike is fresh again.
+        strike(); strike();
+        assert.ok(!log.lines.some((l) => l.msg.includes("PARKED")), "cumulative non-consecutive strikes must not park");
+        for (let i = 0; i < 2; i++) {
+            const ride = turn("s-br", "car-br", b2, ids(3, "-br"), log, r1.sid!);
+            assert.equal(ride.outcome.decision, "no-progress", `healthy ride ${i + 1}`);
+        }
+        strike();
+        assert.ok(!log.lines.some((l) => l.msg.includes("PARKED")), "still no park after the ride-path reset");
+        // "(1/5)" appears exactly thrice overall: once per fresh streak start
+        // (initial strike block, post-hit strike, post-ride strike).
+        assert.equal(log.lines.filter((l) => l.msg.includes("REJECTED (1/5)")).length, 3, "every streak started fresh at exactly 1");
+    } finally { h.cleanup(); }
+});
