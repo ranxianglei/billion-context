@@ -1,8 +1,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  addDelegateUsage,
+  emitInlineUsageNote,
   injectResult,
   makeDelegateTool,
+  resetDelegateUsage,
   scheduleRunNotification,
   setDelegatePolicy,
 } from "../src/delegate-tool.js";
@@ -37,7 +40,7 @@ function mkRun(runId: string, status: "completed" | "failed", over: Record<strin
 type UserEntry = { t: string; o?: { deliverAs?: string } };
 type CustomEntry = {
   m: { customType: string; content: string; display: boolean; details: unknown };
-  o?: { deliverAs?: string };
+  o?: { deliverAs?: string; triggerTurn?: boolean };
 };
 
 /** Mock ExtensionAPI exposing BOTH send channels so a test can assert which fired.
@@ -55,7 +58,7 @@ function mockPi(withSendMessage = true) {
     },
   };
   if (withSendMessage) {
-    pi.sendMessage = (m: CustomEntry["m"], o?: { deliverAs?: string }) => custom.push({ m, o });
+    pi.sendMessage = (m: CustomEntry["m"], o?: { deliverAs?: string; triggerTurn?: boolean }) => custom.push({ m, o });
   }
   const emit = (event: string) => {
     for (const h of handlers.get(event) ?? []) h({});
@@ -123,7 +126,7 @@ test("on + sendMessage present: typed envelope, content byte-identical to the le
   const entry = custom[0]!;
   assert.equal(entry.m.customType, CUSTOM_TYPE);
   assert.equal(entry.m.display, true);
-  assert.deepEqual(entry.o, { deliverAs: "steer" }, "still steering delivery");
+  assert.deepEqual(entry.o, { deliverAs: "steer", triggerTurn: true }, "steering delivery + idle-host wake parity");
   assert.equal(entry.m.content, plainText, "model-visible text byte-identical to the legacy message");
   const d = entry.m.details as Details;
   assert.equal(d.version, 1);
@@ -185,7 +188,7 @@ test("idle wake: single finish delivers the typed envelope immediately", async (
   assert.equal(user.length, 0);
   assert.equal(custom.length, 1);
   assert.equal(custom[0]!.m.customType, CUSTOM_TYPE);
-  assert.deepEqual(custom[0]!.o, { deliverAs: "steer" });
+  assert.deepEqual(custom[0]!.o, { deliverAs: "steer", triggerTurn: true });
   assert.equal((custom[0]!.m.details as Details).kind, "terminal");
 });
 
@@ -199,7 +202,7 @@ test("on: injectResult delivers the typed envelope and reports success", () => {
   assert.equal(user.length, 0);
   assert.equal(custom.length, 1);
   assert.equal(custom[0]!.m.customType, CUSTOM_TYPE);
-  assert.deepEqual(custom[0]!.o, { deliverAs: "steer" });
+  assert.deepEqual(custom[0]!.o, { deliverAs: "steer", triggerTurn: true });
   assert.ok(custom[0]!.m.content.includes("`del_inj`"), "same notification text");
 });
 
@@ -208,6 +211,41 @@ test("off: injectResult keeps the plain path", () => {
   const { pi, user, custom } = mockPi();
   const ok = injectResult(pi, "reviewer", "del_inj2", "review X", "failed", 1, "/tmp/del_inj2.out");
   assert.equal(ok, true);
+  assert.equal(custom.length, 0);
+  assert.equal(user.length, 1);
+  assert.deepEqual(user[0]!.o, { deliverAs: "steer" });
+});
+
+// ─── usage summaries are kind:"usage" (dedup-friendly vs terminal notices) ────
+
+const USAGE_FIXTURE = { input: 150, output: 80, cacheRead: 0, cacheWrite: 0, totalTokens: 230, cost: { input: 0.0015, output: 0.0008, cacheRead: 0, cacheWrite: 0, total: 0.0023 } };
+
+test("on: inline usage note is a typed envelope with kind usage", () => {
+  structuredOn();
+  resetDelegateUsage();
+  addDelegateUsage(USAGE_FIXTURE);
+  const { pi, user, custom } = mockPi();
+  const run = mkRun("del_usage", "completed");
+  emitInlineUsageNote(pi, run, "separate");
+  assert.equal(user.length, 0);
+  assert.equal(custom.length, 1, "typed usage note delivered once");
+  const entry = custom[0]!;
+  assert.equal(entry.m.customType, CUSTOM_TYPE);
+  assert.ok(entry.m.content.includes("usage summary"), "same usage-summary text as before");
+  assert.ok(entry.m.content.includes("`del_usage`"), "names the run");
+  const d = entry.m.details as Details;
+  assert.equal(d.kind, "usage", "distinguishable from terminal notices (dedup-friendly)");
+  assert.equal(d.runs.length, 1);
+  assert.equal(d.runs[0]!.runId, "del_usage");
+  assert.equal(run.usageNoted, true, "marked noted only after successful send");
+});
+
+test("off: inline usage note stays a plain user message", () => {
+  structuredOff();
+  resetDelegateUsage();
+  addDelegateUsage(USAGE_FIXTURE);
+  const { pi, user, custom } = mockPi();
+  emitInlineUsageNote(pi, mkRun("del_usage_off", "completed"), "separate");
   assert.equal(custom.length, 0);
   assert.equal(user.length, 1);
   assert.deepEqual(user[0]!.o, { deliverAs: "steer" });
