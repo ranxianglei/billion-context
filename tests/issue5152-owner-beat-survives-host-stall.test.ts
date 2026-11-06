@@ -53,12 +53,18 @@ async function startReceiver(dir: string): Promise<Receiver> {
     const portFile = `${log}.port`;
     const child = spawn(process.execPath, [RECEIVER, log], { stdio: "ignore", detached: true });
     child.unref();
+    // Wait until the published port VALIDATES, not merely until the file
+    // exists: a partial/empty read must never be mistaken for a real port
+    // (Number("") === 0), even though the receiver now publishes tmp+rename.
+    let port = 0;
     const deadline = Date.now() + 15_000;
-    while (!existsSync(portFile) && Date.now() < deadline) {
+    while (!(Number.isInteger(port) && port > 0) && Date.now() < deadline) {
+        if (existsSync(portFile)) {
+            port = Number(readFileSync(portFile, "utf8").trim());
+        }
         Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
     }
     assert.ok(existsSync(portFile), "receiver must publish its port");
-    const port = Number(readFileSync(portFile, "utf8").trim());
     assert.ok(Number.isInteger(port) && port > 0, `receiver port must be a number, got ${port}`);
     return {
         port,
