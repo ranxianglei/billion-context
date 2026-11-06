@@ -242,6 +242,98 @@ test("gate: red reasons are a stable vocabulary", (t) => {
     } finally { h.cleanup(); }
 });
 
+// F6 review pin (#5652 review round): the gate vocabulary comment claims
+// "test-pinned, one per condition" — this completes the eight conditions
+// that had ZERO assertions repo-wide. Each cell flips exactly ONE input off
+// the green base and asserts the EXACT reason token, following the gate's
+// own evaluation order (renderPlaneGate in src/server/fastpath-v6-render.ts).
+test("gate: F6 vocabulary completion — every remaining red reason pinned once", () => {
+    const h = makeH("f6");
+    try {
+        const b1 = makeBody([
+            { role: "user", content: "a" },
+            { role: "assistant", content: "b" },
+            { role: "user", content: "c" },
+        ]);
+        const r1 = v6Eval(h, "s-f6", b1, ["g8a", "g8b", "g8c"]);
+        assert.equal(r1.outcome.decision, "arm");
+        r1.fin();
+        const sid = r1.sid!;
+        const caps = capsFor("text-only");
+        assert.equal(commitRenderCapture({ sessionId: "s-f6", store: h.store, sid, mode: "legacy", caps, rowStrings: ['{"i":0}', '{"i":1}', '{"i":2}'], sums: { estCum: 3, textCum: 3, imgCum: 0 } }).op, "cast");
+        const geom = watermarkV6DebugState("s-f6").worlds[sid];
+        assert.equal(geom!.maxPos, 2, "three-element arm ⇒ identity plane ends at pos 2");
+        const base = {
+            sessionId: "s-f6", session: { id: "s-f6", state: createInitialState() } as unknown as Session,
+            store: h.store, engagedHit: true, armedTurn: false, isTitleGen: false, sid,
+            maxPos: geom!.maxPos, tokenCount: 500, modelContextLimit: MODEL_LIMIT, caps,
+            snapshotLaneActive: false, absorbActive: false, ccrOn: false, foldUsagePending: false, markerNonZero: false,
+        };
+        const g0 = renderPlaneGate(base);
+        assert.ok(g0.ok, `expected a green control gate, got ${JSON.stringify(g0)}`);
+
+        // "plane-unavailable" (!store.pfRenderAvailable()): the probe fails
+        // before ANY state inspection — driven through the same stub-store
+        // seam the non-ascending pin uses.
+        const downStore: SessionStore = Object.create(h.store);
+        downStore.pfRenderAvailable = () => false;
+        assert.deepEqual(renderPlaneGate({ ...base, store: downStore }), { ok: false, reason: "plane-unavailable" });
+        // "snapshot-lane": the #3756 lane substituted the kernel view.
+        assert.deepEqual(renderPlaneGate({ ...base, snapshotLaneActive: true }), { ok: false, reason: "snapshot-lane" });
+        // "fold-pending": a fold left usage unconsumed for this turn.
+        assert.deepEqual(renderPlaneGate({ ...base, foldUsagePending: true }), { ok: false, reason: "fold-pending" });
+        // "absorb-active": the legacy absorb pass owns the emit this round.
+        assert.deepEqual(renderPlaneGate({ ...base, absorbActive: true }), { ok: false, reason: "absorb-active" });
+        // "ccr-on": CCR rewrites outbound bytes away from the stored form.
+        assert.deepEqual(renderPlaneGate({ ...base, ccrOn: true }), { ok: false, reason: "ccr-on" });
+
+        // "hydrate-failed": mirror absent + DISK PLANE ABSENT + no death
+        // verdict ⇒ the TRANSIENT reason, never lane-dead. Production shape:
+        // an armed sid whose first hit turn gates before station 2 ever casts
+        // (the plane is forged exactly once, on the second v6 turn).
+        const r2 = v6Eval(h, "s-f6b", makeBody([{ role: "user", content: "hello" }]), ["g8d"]);
+        r2.fin();
+        const sid2 = r2.sid!;
+        assert.equal(h.store.pfRenderRows(sid2).length, 0, "armed but never render-cast ⇒ disk plane absent");
+        assert.deepEqual(renderPlaneGate({
+            ...base, sessionId: "s-f6b", session: { id: "s-f6b", state: createInitialState() } as unknown as Session, sid: sid2,
+            maxPos: watermarkV6DebugState("s-f6b").worlds[sid2]!.maxPos,
+        }), { ok: false, reason: "hydrate-failed" }, "an absent plane reports hydrate-failed, NOT lane-dead");
+
+        // "no-rows": an EMPTY-TABLE arm cast is legal through the public seam
+        // (the cast door checks pre-existing rows, not the capture length) —
+        // the degenerate real shape where the kernel emits zero render rows
+        // for the captured view.
+        const r3 = v6Eval(h, "s-f6c", makeBody([{ role: "user", content: "hello" }]), ["g8e"]);
+        r3.fin();
+        const sid3 = r3.sid!;
+        assert.equal(commitRenderCapture({ sessionId: "s-f6c", store: h.store, sid: sid3, mode: "legacy", caps, rowStrings: [], sums: { estCum: 0, textCum: 0, imgCum: 0 } }).op, "cast", "an empty cast onto an empty table commits");
+        assert.deepEqual(renderPlaneGate({
+            ...base, sessionId: "s-f6c", session: { id: "s-f6c", state: createInitialState() } as unknown as Session, sid: sid3,
+            maxPos: watermarkV6DebugState("s-f6c").worlds[sid3]!.maxPos,
+        }), { ok: false, reason: "no-rows" }, "a zero-row world reds out before the alignment check");
+
+        // "rows-misaligned": TWO of the three sub-shapes are reachable
+        // through public seams; the third (positions EMPTY) is structurally
+        // unreachable — every op builds positions 1:1 with rows (cast /
+        // append / rebase / hydrate), so an empty array implies zero rows
+        // and the no-rows condition above shadows it first.
+        // (a) trailing pos past the live plane end — the identity world lag
+        // documented in the gate comment (finalize advances it AFTER station
+        // 2 commits): feed the lagging maxPos.
+        assert.deepEqual(renderPlaneGate({ ...base, maxPos: 1 }), { ok: false, reason: "rows-misaligned" }, "last stored pos > maxPos");
+        // (b) negative leading pos: forge the pos VALUE directly — the
+        // checkpoint meta carries no per-pos data, so the S4 checksum stays
+        // valid untouched. Hydrate accepts strictly ascending values
+        // (-5 < 1 < 2); only the gate's range check can see the damage.
+        const db = new DatabaseSync(path.join(h.dir, "index.db"));
+        db.prepare(`UPDATE pf_render SET pos = -5 WHERE sid = ? AND pos = 0`).run(sid);
+        db.close();
+        _resetWatermarkV6RenderTestState(); // drop the mirrors so the gate re-hydrates from disk
+        assert.deepEqual(renderPlaneGate(base), { ok: false, reason: "rows-misaligned" }, "positions[0] < 0 after re-hydrating the forged table");
+    } finally { h.cleanup(); }
+});
+
 test("unit: S4 checksum tamper KILLS the plane durably (loudly logged)", (t) => {
     const h = makeH("s4");
     try {
