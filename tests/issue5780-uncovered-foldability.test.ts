@@ -200,6 +200,87 @@ test("#5780 P2b: a run fully inside a #2886-closure-extended zone gets the zone 
     assert.match(receipt, /entirely inside the protected zone/, `expected the zone no-op wording, got:\n${receipt}`);
 });
 
+test("#5780 P2c: the user-anchor zone component — mass past the anchor stays plain+actionable; anchor-claimed and fully-zoned mass is never advertised", () => {
+    // Second-repro geometry: everything after the latest (still uncovered)
+    // user message. The audit's relaxed pass zeroes preserveRecentMessages,
+    // which switches OFF the kernel's user-anchor rule (Rule 3,
+    // recommend.ts:150 — coupled to Rule 1) and the token rule alike, so
+    // post-anchor mass reads as zone-hidden although only the user msg itself
+    // is anchored. N=3/tokens=0: zone = last-3 (idx 24..26) ∪ anchor u_2
+    // (idx 18) ∪ #2886 closure pullback (c@23).
+    const fresh = () => {
+        const ctx = withRefs(makeCtx(buildSession(3, 4000, "probe"), { preserveRecentMessages: 3, preserveRecentTokens: 0 }));
+        // idx 0..17: turns 0-1 complete; u_2 stays uncovered → the anchor.
+        const setup = runApply(ctx, foldArgs([{ startRef: refAt(0), endRef: refAt(2 * MSGS_PER_TURN - 1) }]));
+        assert.ok(setup.startsWith("[Compressed"), `setup fold expected to land, got: ${setup.slice(0, 200)}`);
+        return ctx;
+    };
+    const audit = (ctx: Ctx) =>
+        uncoveredHistoryRuns({ core: ctx.core, messages: ctx.messages, state: ctx.session.state, config: ctx.config, tokenCount: 100000 });
+
+    // (a) The foldable head PAST the anchor (turn 2's reasoning+text+first
+    // pair, m00020–m00023) stays plain and folds cleanly — the anchor must
+    // not poison adjacent viable mass.
+    const runs = audit(fresh());
+    const head = runs.find((r) => r.startRef === refAt(19)); // m00020: r_2
+    assert.ok(head, `head run past the anchor missing: ${JSON.stringify(runs)}`);
+    assert.equal(head.endRef, refAt(22), `run expected to stop where the zone starts: ${JSON.stringify(head)}`);
+    assert.equal(head.note, undefined, `viable head must stay unmarked: ${JSON.stringify(head)}`);
+    const receipt = runApply(fresh(), foldArgs([{ startRef: head!.startRef, endRef: head!.endRef }]));
+    assert.ok(receipt.startsWith("[Compressed"), `unmarked head must fold cleanly:\n${receipt.slice(0, 300)}`);
+    // (b) Neither the anchor-claimed user msg nor the zoned tail is advertised
+    // as if it were "older than the protected window".
+    assert.equal(runs.find((r) => r.startRef === refAt(18)), undefined, `anchor-claimed user msg must not be advertised: ${JSON.stringify(runs)}`);
+    assert.equal(runs.find((r) => r.startRef === refAt(23)), undefined, `zoned tail must stay silent: ${JSON.stringify(runs)}`);
+
+    // (c) Whole turn zoned (N=9 window covers every post-anchor message):
+    // nothing is advertised at all — no "older than the window" text may name
+    // a run that apply judges 100% inside the zone (the second-repro
+    // contradiction).
+    const wide = withRefs(makeCtx(buildSession(3, 4000, "probe"), { preserveRecentMessages: 9, preserveRecentTokens: 0 }));
+    const setupW = runApply(wide, foldArgs([{ startRef: refAt(0), endRef: refAt(2 * MSGS_PER_TURN - 1) }]));
+    assert.ok(setupW.startsWith("[Compressed"), `setup fold expected to land, got: ${setupW.slice(0, 200)}`);
+    assert.deepEqual(audit(wide), [], `fully-zoned current turn must stay silent: ${JSON.stringify(audit(wide))}`);
+});
+
+test("#5780 P3: mixed-session sweep — every reported run either folds verbatim or carries its marker (no unmarked+doomed combination)", () => {
+    // 5 turns, N=15: the folds cover [turn 0 + u_1] and [turn 2 + u_3].
+    // Uncovered = turn 1's remainder (clean mid-history hole → plain, folds)
+    // plus turn 3's doomed head (r,a — the group's calls sit behind the zone)
+    // glued to the zoned tail (→ split marker). One audit surfaces BOTH
+    // verdict classes; the sweep asserts the invariant over EVERY reported
+    // run on isolated state copies, so one verdict cannot mutate the geometry
+    // of the next.
+    const fresh = () => {
+        const ctx = withRefs(makeCtx(buildSession(5, 4000, "probe"), { preserveRecentMessages: 15, preserveRecentTokens: 0 }));
+        const setup = runApply(ctx, foldArgs([
+            { startRef: refAt(0), endRef: refAt(MSGS_PER_TURN) },                    // idx 0..9: turn 0 + u_1
+            { startRef: refAt(2 * MSGS_PER_TURN), endRef: refAt(3 * MSGS_PER_TURN) }, // idx 18..27: turn 2 + u_3
+        ]));
+        assert.ok(setup.startsWith("[Compressed"), `setup folds expected to land, got: ${setup.slice(0, 200)}`);
+        return ctx;
+    };
+    const probe = fresh();
+    const runs = uncoveredHistoryRuns({ core: probe.core, messages: probe.messages, state: probe.session.state, config: probe.config, tokenCount: 100000 });
+    const hole = runs.find((r) => r.startRef === refAt(10));   // m00011: turn 1's reasoning
+    const doomed = runs.find((r) => r.startRef === refAt(28)); // m00029: turn 3's reasoning
+    assert.ok(hole && doomed, `hole + doomed runs expected: ${JSON.stringify(runs)}`);
+    assert.equal(hole!.endRef, refAt(17), JSON.stringify(hole));
+    assert.equal(doomed!.endRef, refAt(5 * MSGS_PER_TURN - 1), JSON.stringify(doomed));
+    for (const run of runs) {
+        const receipt = runApply(fresh(), foldArgs([{ startRef: run.startRef, endRef: run.endRef }]));
+        if (run.note === undefined) {
+            assert.ok(receipt.startsWith("[Compressed"), `unmarked run must fold verbatim:\n${receipt.slice(0, 300)}`);
+        } else {
+            assert.ok(receipt.includes("FAILED"), `marked run must be rejected verbatim:\n${receipt}`);
+            if (/split/i.test(run.note)) assert.match(receipt, /would split/);
+            else if (/protected zone/i.test(run.note)) assert.match(receipt, /entirely inside the protected zone/);
+        }
+    }
+    assert.equal(hole!.note, undefined, `hole must stay plain: ${JSON.stringify(hole)}`);
+    assert.match(doomed!.note ?? "", /split/i, `doomed run must carry the split marker: ${JSON.stringify(doomed)}`);
+});
+
 test("#5780 P4: a sub-gate run (below minCompressRange) stays UNMARKED — its rejection is transient and self-teaching", () => {
     // Isolated one-turn hole far from the zone, payload-sized so the hole sits
     // BELOW the 5000-char fold gate (~4.9K across its 9 msgs) while clearing
