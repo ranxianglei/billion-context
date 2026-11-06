@@ -67,7 +67,7 @@ import { buildForgeResponse, classifierForgeVariant, estimateCjkTokens, isAutoMo
 import { extractConversationId, isV1BackgroundSideRequest, isV1InternalRequest, unwrapV1Internal } from "../v1internal.js";
 import { anthropicBetaContextWindow, BILI_HOP_HEADER, capRegistryWindowByStandard, expandedContextSuffixWindow, launcherContextWindow, launcherMaxOutput, noteUnresolvedModelSession, UNRESOLVED_MODEL_SESSION_THRESHOLD, windowSourceLogged } from "./context-window.js";
 import { NO_IDENTITY_MESSAGE, safeSessionId } from "./headers.js";
-import { demoteGate, hasLeakedBiliToolsOnly, isClaudeCodeTitleRequest, isDshAutoReviewRequest, isDshSingleShotSidecar, isDshTitleRequest, isServerToolUtilityCall, isSideRequest, resolveSideLane, restoreOutputBudget, sideRequestGuard, stripLeakedBiliTools } from "./side-request.js";
+import { demoteGate, hasLeakedBiliToolsOnly, isClaudeCodeTitleRequest, isDshAutoReviewRequest, isDshSingleShotSidecar, isDshTitleRequest, isServerToolUtilityCall, isSideRequest, outputBudgetField, readOutputBudget, resolveSideLane, restoreOutputBudget, sideRequestGuard, stripLeakedBiliTools } from "./side-request.js";
 import { DSH_COMPACTION_SHAPE_MSGS, DSH_REFUSAL_STORM_LOG_EVERY, detectPassthroughDshCompactionCall, dshCompactionRefusal, dshPassthroughGuardStats, isDshCompactionCall } from "./dsh-compaction-guard.js";
 import { buildDshCompactionForgeBody, renderDshAuthoredCheckpoint } from "./dsh-authored-compaction.js";
 import { artifactSeedHit, detectAcpArtifacts } from "./chain-artifacts.js";
@@ -2084,7 +2084,22 @@ async function handleRequest(
             // The plugin-stamped lane is the live path; the clientHint arm is defensive —
             // it matches only if some dsh build's wire identity is literally "dsh".
             const dshRestoreLane = pluginAgent === "dsh" || session.metadata.clientHint === "dsh";
+            // #5419: the rescue below mutates `parsed` only. Lanes that re-emit
+            // `bodyBuffer` verbatim (the plugin lane's own normalized body, the
+            // #1117 passthrough, the #920 bypass) then ship the client's starved
+            // value anyway, and the turn dies at max-output with zero visible
+            // text (#2904). Capture the incoming budget and, only when the
+            // rescue actually changed it, rewrite the wire bytes so no
+            // downstream lane can resurrect the starved number.
+            const gateBudgetField = outputBudgetField(parsed);
+            const gateBudgetBefore = gateBudgetField === null ? undefined : readOutputBudget(parsed as Record<string, unknown>, gateBudgetField);
             restoreOutputBudget(parsed, session, log, resolveKnownOutputCeiling(req.headers, parsed as Record<string, unknown>, opts.routes, providerDestUrl, opts.sessionHeader, requestModel), dshRestoreLane);
+            const gateBudgetAfter = gateBudgetField === null ? undefined : readOutputBudget(parsed as Record<string, unknown>, gateBudgetField);
+            if (gateBudgetField !== null && gateBudgetAfter !== undefined && gateBudgetAfter !== gateBudgetBefore && bodyText !== undefined) {
+                bodyBuffer = Buffer.from(JSON.stringify(parsed), "utf8");
+                bodyText = bodyBuffer.toString("utf8");
+                log("info", `[${session.id}] output budget rescue written through to the wire body (${String(gateBudgetBefore)} -> ${String(gateBudgetAfter)}); verbatim lanes forward bodyBuffer, so a parsed-only rescue is re-emitted as the starved value (#546/#2904)`);
+            }
         }
         // #896: the per-scope output-headroom cap (compress.outputHeadroomMaxPct,
         // three-level merge; default 0.25, aligned with billion-context-pi).
