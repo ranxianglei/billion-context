@@ -8,7 +8,7 @@ import {
     positionalFingerprintWorkCount,
     METADATA_EXPECTED_REBASE,
 } from "../src/fold-reconcile.ts";
-import { dshPastedImagePath, dshTimeContextPath, dshToolJobNoticePath, oneShotCarrierPaths, dshCarrierRawMarkers } from "../src/durable-message-guards.ts";
+import { dshImageHandlePath, dshPastedImagePath, dshTimeContextPath, dshToolJobNoticePath, oneShotCarrierPaths, dshCarrierRawMarkers } from "../src/durable-message-guards.ts";
 import type { CoreMessage } from "acp-kernel";
 import type { Session } from "../src/session.ts";
 
@@ -23,7 +23,9 @@ import type { Session } from "../src/session.ts";
 //     control as carriers retire (T1),
 //   - the verdict names expected rebase, not drift/truncation (T1/T2),
 //   - genuine truncation/edits STILL alarm — bidirectional pins (#3617) (T3),
-//   - upgrade residue backfills from stored bytes, once (T4).
+//   - upgrade residue backfills from stored bytes, once (T4),
+//   - the single unaccounted image-handle text id no longer blocks the
+//     reasoning-only verdict (T5).
 const FILLER = "lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor ";
 
 let seq = 0;
@@ -359,6 +361,43 @@ describe("#5142 expected-rebase accounting", () => {
         });
         assert.ok(w2 <= w1 / 2, `second pass ${w2} not far below the backfill pass ${w1} — memoization regressed`);
     });
+
+    test("T5 the lone retired image handle no longer blocks the reasoning-only verdict (live 111-id shape)", () => {
+        // Production shape (session f3b87753, 2026-11-04): a cross-provider
+        // replay drop retired 110 reasoning cores plus exactly ONE text id —
+        // the request-image handle annotation, which no classifier knew. That
+        // single unaccounted id held realUnmatched off the reasoning-only
+        // verdict, so the episode warned as drift on EVERY turn instead of
+        // taking the tolerated #2193 channel. The first pass here seeds
+        // anchors from LIVE bytes (production shape); the handle is retired
+        // before the classifier existed, so this exercises the C2 stored-byte
+        // backfill exactly as production does.
+        const { session, block, logs, opts } = harness("dsh");
+        const reasoning = Array.from({ length: 12 }, (_, i) => ({
+            id: `r${i}`, role: "assistant" as const, contentType: "reasoning" as const,
+            text: `reasoning core ${i} weighing options at length`,
+        })) as CoreMessage[];
+        const handleText = "Image \"image.png\" (sha256:6d0d1ca416fa10d7f2ab80db8bd12eeaf72f2c418a8171308ff7b658d45f9e66); request preview 1657x811px. Normalized copy (read-only; may be resized or re-encoded): \"C:/Users/Suda/.dsh/attachments/v1/objects/6d/6d0d1ca416fa10d7f2ab80db8bd12eeaf72f2c418a8171308ff7b658d45f9e66\" (1657x811px, image/png). Source dimensions, format, and byte size may differ. Copy to a writable path ending in .png before editing.";
+        const handleId = "h_image_handle";
+        const rest = baseHistory(8);
+        block.effectiveMessageIds.push(...reasoning.map((m) => m.id!), handleId, ...rest.map((m) => m.id!));
+        const storedRowLookup = (ids: readonly string[]) => ids.filter((id) => id === handleId).map((id) => ({
+            seq: 1,
+            msgId: id,
+            content: JSON.stringify({ id, role: "user", contentType: "text", text: handleText, wireIndex: 102 }),
+        }));
+        const fullOpts = { ...opts, storedRowLookup };
+        reconcileFoldCoverage(session, [...reasoning, ...rest, { id: handleId, role: "user", contentType: "text", text: handleText } as CoreMessage], fullOpts);
+        const wire = (): CoreMessage[] => [...rest,
+            { id: "f0", role: "user" as const, contentType: "text" as const, text: "post-switch fresh turn zero" },
+            { id: "f1", role: "assistant" as const, contentType: "text" as const, text: "post-switch fresh answer one" }];
+        for (let pass = 1; pass <= 3; pass++) reconcileFoldCoverage(session, wire(), fullOpts);
+        assert.equal(recordOf(session)?.[handleId], "oneshot/image-handle", "the handle takes the expected-rebase channel");
+        assert.equal(logs.filter(([, m]) => m.includes("covered reasoning core(s) dropped by the host")).length, 3, "every pass takes the tolerated #2193 channel");
+        assert.ok(!logs.some(([, m]) => m.includes("resent history drifted")), "one unaccounted text id must not turn a switch into drift");
+        assert.equal(session.metadata.foldDriftStreak, undefined, "tolerated episode accrues no destroy streak");
+        assert.equal(session.metadata.foldDriftEscalated, undefined, "no latch");
+    });
 });
 
 describe("#5142 carrier classifier units", () => {
@@ -389,14 +428,28 @@ describe("#5142 carrier classifier units", () => {
         assert.equal(dshToolJobNoticePath(mk("user", " Background Job abc finished.")), "oneshot/tool-job-notice", "asciiCI prefix like the other auto-injected families");
         assert.equal(dshToolJobNoticePath(mk("assistant", job)), undefined, "assistant echo must never classify (#2766)");
         assert.equal(dshToolJobNoticePath(mk("user", "the background job failed again")), undefined, "marker mid-text is not a carrier");
+        // request-image handle annotation (#5142 residual, production sample):
+        // rides only its attachment's turn, then the slot holds the offload
+        // placeholder instead.
+        const handle = "Image \"image.png\" (sha256:6d0d1ca416fa10d7f2ab80db8bd12eeaf72f2c418a8171308ff7b658d45f9e66); request preview 1657x811px. Normalized copy (read-only; may be resized or re-encoded): \"C:/Users/Suda/.dsh/attachments/v1/objects/6d/6d0d1ca416fa10d7f2ab80db8bd12eeaf72f2c418a8171308ff7b658d45f9e66\" (1657x811px, image/png). Source dimensions, format, and byte size may differ. Copy to a writable path ending in .png before editing.";
+        assert.equal(dshImageHandlePath(mk("user", handle)), "oneshot/image-handle");
+        assert.equal(dshImageHandlePath(mk("assistant", handle)), undefined, "assistant echo must never classify (#2766)");
+        assert.equal(dshImageHandlePath(mk("user", "[image omitted to fit request image limits; \"spawn_preview.png\" (sha256:2e896b95dec003df). Normalized copy (read-only; may be resized or re-encoded): \"normalized/spawn_preview.png\" (1600x900px, image/png).]")), undefined, "the offload placeholder is C3 slot evidence, never a live handle");
+        assert.equal(dshImageHandlePath(mk("user", "Image \"x.png\" (sha256:2e896b95dec003df) with no preview separator")), undefined, "plain image talk is not a handle");
     });
 
     test("dshCarrierRawMarkers stay in lockstep with the dsh lane classifiers", () => {
         const cls = oneShotCarrierPaths.dsh;
         assert.ok(cls !== undefined, "dsh lane must have a classifier registry entry");
-        assert.ok(dshCarrierRawMarkers.length >= 7, "seven known dsh carrier families");
+        assert.ok(dshCarrierRawMarkers.length >= 12, "twelve raw markers for the eleven known dsh carrier families");
+        // Markers that only occur mid-template need their fixed left context to
+        // be a standalone classifiable shape (the relay wrapper's sender-id slot
+        // varies, so the joint alone cannot classify).
+        const MARKER_CONTEXT: Record<string, string> = {
+            " sent a message: ": "Agent session-1",
+        };
         for (const marker of dshCarrierRawMarkers) {
-            const msg = { id: "lk", role: "user" as const, contentType: "text" as const, text: marker } as CoreMessage;
+            const msg = { id: "lk", role: "user" as const, contentType: "text" as const, text: `${MARKER_CONTEXT[marker] ?? ""}${marker}` } as CoreMessage;
             assert.notEqual(cls(msg), undefined, `marker ${JSON.stringify(marker)} no longer matches any dsh classifier`);
         }
     });
