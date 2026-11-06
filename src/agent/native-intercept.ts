@@ -1014,6 +1014,9 @@ export function createLiveOriginResolver(state: NativeInterceptState, deps: Live
     const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
     return async (): Promise<string | undefined> => {
         let ownedThenLost = false;
+        // #5823/#5449: origin released after a busy-window exhaustion — a respawn
+        // returning to it is a re-attach, not a replacement; the log says which.
+        let lostBusyOrigin: string | undefined;
         let lossReason: UnavailableReason | undefined;
         const held = state.origin;
         const gen = generation;
@@ -1078,6 +1081,7 @@ export function createLiveOriginResolver(state: NativeInterceptState, deps: Live
                         logHostEvent("warn", "[native-client]", `bili-native: liveness: ${held} still busy after ${ep.attempts} re-probe(s) over ${busyWaitCapMs}ms — letting go, respawning (#3654)`);
                         ownedThenLost = true;
                         lossReason = "busy-exhausted";
+                        lostBusyOrigin = held;
                         state.origin = undefined;
                     }
                 }
@@ -1109,7 +1113,11 @@ export function createLiveOriginResolver(state: NativeInterceptState, deps: Live
                 // ALIVE — routing to it queues the request behind the saturating
                 // fold; refusing here would fail the very request the adoption
                 // existed to save.
-                logHostEvent("info", "[native-client]", `bili-native: liveness: replacement ${o} BUSY (${v.detail ?? "no health answer"}) — routing anyway, the request will queue (#3654)`);
+                if (o === lostBusyOrigin) {
+                    logHostEvent("warn", "[native-client]", `bili-native: liveness: ${o} still BUSY after let-go (${v.detail ?? "no health answer"}) — bootstrap returned the SAME origin we just released, no different endpoint surfaced; routing anyway, the request will queue until its event loop drains or its watchdog frees the port (#3654/#4811/#4762)`);
+                } else {
+                    logHostEvent("info", "[native-client]", `bili-native: liveness: replacement ${o} BUSY (${v.detail ?? "no health answer"}) — routing anyway, the request will queue (#3654)`);
+                }
                 state.lastUnavailableReason = undefined;
                 return o;
             }
