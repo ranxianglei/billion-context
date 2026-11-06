@@ -2,6 +2,22 @@
 
 This contribution contains Claude Code, OpenCode and DSH integrations, backed by the same append-only local archive and shared search/read core (MCP for Claude Code/OpenCode, native tools for DSH). It does not modify the host's primary model URL, OAuth, the billion-context proxy, or the compression kernel. The OpenCode adapter is explicitly opt-in and currently pins its supported interface to OpenCode V2.2.5.
 
+## Update review (November 6, 2026)
+
+The branch incorporates upstream master `c3dfbe6b21a1b2fc3642594043bc81fd2ae91247` by a history-preserving merge from PR head `8dade6995ba54edb45bd5a796642ba955b04fa15`. The contribution still changes only this directory relative to that master.
+
+New rules use stable `rule<decimal UUID>` IDs. Replay preserves the ID in a successful, input-matching acknowledgment instead of allocating it again; application errors and duplicate evidence do not create mutations. Historical numeric/generic-result transcripts remain supported. Already-corrupt history in which different calls acknowledged the same ID reports a conflict rather than guessing which rule owns it. Parallel successful acknowledgments are retained even when their stale previews both passed duplicate/capacity checks; subsequent additions still enforce the existing limit.
+
+All 14 Claude Code hook launchers quote the selected `RECALL_PYTHON` executable during both probing and execution. A shell regression uses an executable path containing spaces with no fallback interpreter available. This does not introduce a new interpreter-setting alias.
+
+Local verification on Windows/Node 24/Python 3.10 passed all 198 Python tests, including 10 new rule-identity regressions and the hook launcher regression covering all 14 commands. Typecheck, build, the 8 OpenCode synthetic adapter checks, 11 core OpenCode incremental tests and 74 core DSH native tests passed. The core DSH tests used the complete CI preload chain. The contribution's minimal subprocess test environments now retain only required Windows system paths and explicitly select UTF-8 for direct Python children, without inheriting provider credentials. Full root-suite results remain the remote CI verdict on the pushed head.
+
+These changes were checked with synthetic local data and no paid model requests. Earlier real-host compaction results below remain historical evidence; this update does not establish new real-model or full DSH JavaScript acceptance on Windows.
+
+本次更新通过合并上述 master 保留原分支历史。新规则使用稳定的十进制 UUID 编号，回放保留成功响应确认的原 ID；错误结果和重复证据不会变成新的修改。旧编号保持兼容，已有重复 ID 的损坏历史会明确报错。并行调用基于滞后视图而同时成功时，回放保留两条确认记录；后续添加仍检查原有条数上限。全部 14 个 hook 启动命令已修复含空格解释器路径。本轮仅用合成数据，没有新增付费模型调用，也不把历史真实压缩测试算作当前版本验收。
+
+Windows 本地验证通过 198 项 Python 测试、8 项 OpenCode 适配检查、11 项主仓库 OpenCode 测试和 74 项主仓库 DSH 测试，类型检查与构建也通过。测试夹具仅补入必要的 Windows 系统路径并显式使用 UTF-8，仍不继承服务商凭据。主仓库全套测试以推送后对应提交的远程 CI 为准。
+
 ## Rename verification boundary
 
 The product, source directory, Claude Code plugin/marketplace and DSH package/runtime are now `billion_context_native`. Claude Code uses the internal MCP key `native` to keep generated tool names within 64 characters; MCP `serverInfo.name` retains the full product name. OpenCode uses the full MCP server key and qualified `billion_context_native_recall_search/get` names (expanded as `billion_context_native_recall_search` and `billion_context_native_recall_get`). Functional operation names and immutable archive identity are unchanged. See [MIGRATION.md](MIGRATION.md) for installation and data-preservation details.

@@ -20,6 +20,8 @@ import mcp_server
 
 NODE = shutil.which('node')
 ADAPTER = PLUGIN.parents[1] / 'opencode' / 'index.js'
+WINDOWS_ENV = {key: os.environ[key] for key in ('SYSTEMROOT', 'WINDIR')
+               if os.name == 'nt' and key in os.environ}
 
 NODE_REVIEW = r'''
 import assert from 'node:assert/strict';
@@ -148,9 +150,9 @@ class OpenCodeIndependentReviewTest(unittest.TestCase):
 
     def run_bridge(self, request):
         # Pass a minimal synthetic environment; no inherited provider/host credentials.
-        env = {'RECALL_HOME': str(self.root / 'recall'), 'PYTHONDONTWRITEBYTECODE': '1',
+        env = {**WINDOWS_ENV, 'RECALL_HOME': str(self.root / 'recall'), 'PYTHONDONTWRITEBYTECODE': '1',
                'PATH': os.defpath, 'LANG': 'C.UTF-8'}
-        proc = subprocess.run([sys.executable, str(PLUGIN / 'opencode_bridge.py')],
+        proc = subprocess.run([sys.executable, '-X', 'utf8', str(PLUGIN / 'opencode_bridge.py')],
                               input=json.dumps(request), text=True, capture_output=True,
                               env=env, timeout=30)
         self.assertEqual(proc.stderr, '')
@@ -312,11 +314,11 @@ class OpenCodeIndependentReviewTest(unittest.TestCase):
         # Disposable projections must never replace the raw archive as authority.
         (directory / 'turns.jsonl').write_text(json.dumps({'text': 'STALE_DERIVED_CACHE'}) + '\n')
         (directory / 'index.sqlite3').unlink()
-        env = {'RECALL_HOME': str(self.root / 'recall'), 'PYTHONDONTWRITEBYTECODE': '1',
+        env = {**WINDOWS_ENV, 'RECALL_HOME': str(self.root / 'recall'), 'PYTHONDONTWRITEBYTECODE': '1',
                'PATH': os.defpath, 'LANG': 'C.UTF-8'}
         code = ('import sys,json;sys.path.insert(0,sys.argv[1]);import transcript;'
                 'print(json.dumps(transcript.load_archive(sys.argv[2]),ensure_ascii=False))')
-        proc = subprocess.run([sys.executable, '-c', code, str(PLUGIN), self.sid],
+        proc = subprocess.run([sys.executable, '-X', 'utf8', '-c', code, str(PLUGIN), self.sid],
                               text=True, capture_output=True, env=env, timeout=30)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         turns = json.loads(proc.stdout)
@@ -340,7 +342,7 @@ class OpenCodeIndependentReviewTest(unittest.TestCase):
             self.skipTest('Node runtime not installed; Python core checks remain independent')
         script = self.root / 'adapter-review.mjs'
         script.write_text(NODE_REVIEW, encoding='utf-8')
-        env = {'PATH': os.defpath, 'LANG': 'C.UTF-8', 'PYTHONDONTWRITEBYTECODE': '1'}
+        env = {**WINDOWS_ENV, 'PATH': os.defpath, 'LANG': 'C.UTF-8', 'PYTHONDONTWRITEBYTECODE': '1'}
         proc = subprocess.run([NODE, str(script), str(ADAPTER), str(self.root),
                                sys.executable, str(PLUGIN / 'opencode_bridge.py'), case],
                               text=True, capture_output=True, env=env, timeout=30)

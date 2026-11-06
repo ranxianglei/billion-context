@@ -21,6 +21,8 @@ import transcript
 import native_read
 
 SID = 'cc-independent-golden'
+WINDOWS_ENV = {key: os.environ[key] for key in ('SYSTEMROOT', 'WINDIR')
+               if os.name == 'nt' and key in os.environ}
 # A fixed JSONL seed, deliberately retaining escaping, Unicode, an original
 # tool-result failure flag and instruction-looking historical text as data.
 GOLDEN_JSONL = (
@@ -240,13 +242,13 @@ class CCIndependentReviewTest(unittest.TestCase):
         self.source.write_text('', encoding='utf-8')
         request = {'session_id': SID, 'transcript_path': str(self.source),
                    'hook_event_name': 'PreCompact', 'trigger': 'auto'}
-        env = {'RECALL_HOME': str(self.root / 'recall'),
+        env = {**WINDOWS_ENV, 'RECALL_HOME': str(self.root / 'recall'),
                'RECALL_PROJECTS': str(self.root / 'empty-host-projects'),
                'PATH': os.defpath, 'LANG': 'C.UTF-8', 'PYTHONDONTWRITEBYTECODE': '1',
                'RECALL_CC_VERSION': '2.1.105'}  # synthetic operator declaration only
 
         def invoke(environment):
-            return subprocess.run([sys.executable, str(PLUGIN / 'hook.py'), 'precompact'],
+            return subprocess.run([sys.executable, '-X', 'utf8', str(PLUGIN / 'hook.py'), 'precompact'],
                                   input=json.dumps(request), text=True, capture_output=True,
                                   env=environment, timeout=15)
 
