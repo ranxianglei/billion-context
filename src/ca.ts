@@ -198,21 +198,24 @@ export function collectOsStorePems(platform: NodeJS.Platform = process.platform)
     }
 }
 
-// #5802: RFC 5280 KeyUsage extension — OID 2.5.29.15, extnValue an OCTET
-// STRING wrapping a BIT STRING (04 LL | 03 LL <unused-bits> <flags…>).
-// Logical bit 5 (keyCertSign) maps to mask 0x04 of the FIRST flag octet
-// under any valid unused-bits count, so the test is independent of the
-// encoder's padding choice. Scanned on the raw DER because Node's
-// X509Certificate.keyUsage getter is unusable in current runtimes (returns
-// undefined for every cert) and node-forge cannot parse non-RSA subjects —
-// both would misjudge ECDSA CAs.
+// #5802: RFC 5280 KeyUsage extension — OID 2.5.29.15. Per §4.1 the extension
+// body is [BOOLEAN critical] OCTET STRING wrapping a BIT STRING
+// (04 LL | 03 LL <unused-bits> <flags…>); the critical flag is OPTIONAL and
+// skipped when present (RFC-recommended for CA certs, so most real-world
+// anchors carry it). Logical bit 5 (keyCertSign) maps to mask 0x04 of the
+// FIRST flag octet under any valid unused-bits count, so the test is
+// independent of the encoder's padding choice. Scanned on the raw DER because
+// Node's X509Certificate.keyUsage getter is unusable in current runtimes
+// (returns undefined for every cert) and node-forge cannot parse non-RSA
+// subjects — both would misjudge ECDSA CAs.
 const KEY_USAGE_OID = Buffer.from([0x06, 0x03, 0x55, 0x1d, 0x0f]);
 const KEY_CERT_SIGN_BIT = 0x04;
 
 function hasKeyCertSign(raw: Buffer): boolean {
     let i = raw.indexOf(KEY_USAGE_OID);
     while (i >= 0) {
-        const b = i + KEY_USAGE_OID.length;
+        let b = i + KEY_USAGE_OID.length;
+        if (raw[b] === 0x01 && raw[b + 1] === 0x01) b += 3; // optional critical BOOLEAN
         if (raw[b] === 0x04 && (raw[b + 1] === 0x04 || raw[b + 1] === 0x05)
             && raw[b + 2] === 0x03 && (raw[b + 3] === 0x02 || raw[b + 3] === 0x03)) {
             return (raw[b + 5] & KEY_CERT_SIGN_BIT) !== 0;

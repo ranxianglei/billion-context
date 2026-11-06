@@ -232,7 +232,7 @@ test("#5103: write-refused rebuild with NO usable bundle still fails fast", (t) 
 // strictly — one RFC-violating leaf (com.apple.kerberos.kdc, duplicate EKU)
 // aborted codex's whole HTTP client. The combined bundle must hold anchors only.
 
-function forgedPem(spec: { cn: string; basicConstraints?: boolean; keyCertSign?: boolean; digitalSignature?: boolean; keyEncipherment?: boolean; serverAuth?: boolean }): string {
+function forgedPem(spec: { cn: string; basicConstraints?: boolean; keyCertSign?: boolean; digitalSignature?: boolean; keyEncipherment?: boolean; serverAuth?: boolean; kuCritical?: boolean }): string {
     const keys = forge.pki.rsa.generateKeyPair({ bits: 512 });
     const cert = forge.pki.createCertificate();
     cert.publicKey = keys.publicKey;
@@ -249,7 +249,7 @@ function forgedPem(spec: { cn: string; basicConstraints?: boolean; keyCertSign?:
     if (spec.keyCertSign) ku.keyCertSign = true;
     if (spec.digitalSignature) ku.digitalSignature = true;
     if (spec.keyEncipherment) ku.keyEncipherment = true;
-    if (Object.keys(ku).length > 0) exts.push({ name: "keyUsage", ...ku });
+    if (Object.keys(ku).length > 0) exts.push({ name: "keyUsage", ...ku, ...(spec.kuCritical ? { critical: true } : {}) });
     if (spec.serverAuth) exts.push({ name: "extKeyUsage", names: ["serverAuth"] });
     if (exts.length > 0) cert.setExtensions(exts);
     cert.sign(keys.privateKey, forge.md.sha256.create());
@@ -264,6 +264,12 @@ test("#5802: isCaLike keeps anchors, drops serverAuth leaves and unparseable ent
     const legacyAnchor = forgedPem({ cn: "legacy-anchor", keyCertSign: true });
     assert.equal(new crypto.X509Certificate(legacyAnchor).ca, false, "ground truth: no basicConstraints extension");
     assert.ok(isCaLike(legacyAnchor), "keyCertSign without basicConstraints still anchors chains (pre-BC CAs)");
+
+    // RFC 5280 recommends the critical marking for CA certs — the DER scan
+    // must skip the optional critical BOOLEAN between OID and extnValue.
+    const legacyAnchorCritical = forgedPem({ cn: "legacy-anchor-critical", keyCertSign: true, kuCritical: true });
+    assert.equal(new crypto.X509Certificate(legacyAnchorCritical).ca, false, "ground truth: no basicConstraints extension");
+    assert.ok(isCaLike(legacyAnchorCritical), "critical-marked keyCertSign still anchors chains (pre-BC CAs)");
 
     // The com.apple.kerberos.kdc class: identity leaf with a serverAuth EKU, not an anchor.
     const kdcLike = forgedPem({ cn: "com.example.kerberos.kdc", basicConstraints: false, digitalSignature: true, keyEncipherment: true, serverAuth: true });
