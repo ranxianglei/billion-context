@@ -184,11 +184,22 @@ export function buildIntegrityPre(messages: CoreMessage[]): IntegrityPre {
  *
  * The reverse direction stays allowed (#564): reasoning and text may stay
  * visible while the call and its result fold, since that leaves a valid stream.
+ *
+ * Coverage is not "kept". An id in `invisibleIds` is already hidden by an
+ * active block: it neither counts as folding nor as kept-visible. A covered
+ * tool-call therefore cannot strand its turn's reasoning — without this, a
+ * #564 reverse split (call+result inside an existing block, reasoning+text
+ * visible) withdraws the stranded pair wholesale FOREVER: they leave no gap a
+ * range can span, so every later fold reclaims only everything else and the
+ * residue grows monotonically until nothing left is big enough to fold
+ * (billion-context#5531). Omit the parameter for the legacy model where
+ * everything not folded reads as visible.
  */
 export function computeIntegrityWithdrawals(
   messages: CoreMessage[],
   foldedIds: ReadonlySet<string>,
   pre?: IntegrityPre,
+  invisibleIds?: ReadonlySet<string>,
 ): IntegrityWithdrawals {
   const remaining = new Set(foldedIds);
   const withdrawn = new Set<string>();
@@ -213,7 +224,10 @@ export function computeIntegrityWithdrawals(
       );
       if (!foldHasReasoning) continue;
       const keptHasCall = group.some(
-        (id) => !remaining.has(id) && callIds.has(id),
+        (id) =>
+          !remaining.has(id) &&
+          callIds.has(id) &&
+          !invisibleIds?.has(id),
       );
       if (!keptHasCall) continue;
       handledTurns.add(g);

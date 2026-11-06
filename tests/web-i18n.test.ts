@@ -42,6 +42,7 @@ function collectRefs(): Set<string> {
     const pageSrc = readFileSync(join(here, "..", "src", "web", "page.ts"), "utf8");
     const clientSrc = readFileSync(join(here, "..", "src", "web", "client.ts"), "utf8");
     const reportSrc = readFileSync(join(here, "..", "src", "web", "report.ts"), "utf8"); // #3099 server-side report renderer
+    const noticesSrc = readFileSync(join(here, "..", "src", "notices.ts"), "utf8"); // #5548 built-in notice registry
     const refs = new Set<string>();
     for (const m of pageSrc.matchAll(/data-i18n(?:-ph|-title)?="([\w.]+)"/g)) refs.add(m[1]);
     for (const m of pageSrc.matchAll(/zh\("([\w.]+)"\)/g)) refs.add(m[1]);
@@ -52,7 +53,7 @@ function collectRefs(): Set<string> {
     // (t(pair[1])), so those catalog keys are only referenced via bare quoted
     // strings — accept any dot-qualified identifier that appears verbatim in
     // the sources as a live reference too.
-    for (const src of [pageSrc, clientSrc, reportSrc]) {
+    for (const src of [pageSrc, clientSrc, reportSrc, noticesSrc]) {
         for (const m of src.matchAll(/"([a-z][\w]*\.[\w.]+)"/g)) {
             if (/^[a-z][\w]*(\.[\w]+)+$/.test(m[1]) && !m[1].includes("..")) refs.add(m[1]);
         }

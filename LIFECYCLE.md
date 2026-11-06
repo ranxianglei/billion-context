@@ -40,6 +40,7 @@
 | `BILI_NO_CACHE_CONTROL` | compat | 历史 no-cache-control 怪癖保留（knobs.ts:458 明言 "Historical quirk preserved in the env"） | 兼容窗口结束后退役 | 默认 off |
 | `BILI_STREAM_ERROR_SHAPE` | compat | 给无法带内上报错误的 SDK 的流错误形状兼容 | 兼容保留（长期） | 常设兼容旋钮 |
 | `BILI_SUBAGENT_SPLIT` | #970 | subagent 拆分（默认 on） | 成为既定行为后移 §2 | 默认 ON（`=0` 退出） |
+| `BILI_PERSONA_SPLIT` | Responses personaSplit | Responses 线路 instructions 指纹分叉（默认 on；`=0` / `personaSplit: false` 关闭，剥 `instructionsFingerprintKeyed`、保留 identity） | 成为既定行为后移 §2 | 默认 ON（`=0` 退出） |
 | `BILI_RESUME_INHERITANCE` | resume inheritance | resume 继承行为（默认 on） | 同上 | 默认 ON（`=0` 退出） |
 | `BILI_AFFINITY_SIMHASH` | #2265 | simhash adoption kill-switch（`=0` 禁用） | adoption 成为既定行为后移 §2 | 默认 ON |
 | `BILI_CHAIN_CONTENT` | chain 识别 | chain 内容检测（#1683 背景；默认 off，文件可开） | 实验结论出来转正或删 | 默认 off |
@@ -185,6 +186,7 @@
 | `BILI_UPDATE_CHECK_INTERVAL_MS` | update.checkIntervalMs 覆盖（#2030） |
 | `BILI_ADVISORY_CHECK` | 公告检查开关（默认 ON；文件 advisoryCheck:false 退出） |
 | `BILI_ADVISORY_URL` | 公告文档 URL 覆盖 |
+| `BILI_ANNOUNCEMENTS_URL` | 统一公告面远程源 URL 覆盖（#5548，配置键 remoteAnnouncementsUrl；缺省官方 raw 地址，fail-open） |
 | `BILI_RELEASE_NOTES_CHECK` | 发布说明检查（#1870，默认 ON） |
 | `BILI_RELEASE_NOTES_URL` | 发布说明 URL 覆盖 |
 | `BILI_UPDATE_POLICY_URL` | update.policyUrl——更新策略 URL 覆盖（**测试专用**：生产固定官方 repo，#3619 安全边界） |

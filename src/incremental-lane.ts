@@ -165,9 +165,6 @@ function warnDroppedRequestParams(conversationId: string, request: Record<string
     log("warn", `[incremental] ${conversationId}: request parameter(s) not in the forward allowlist were dropped: ${unwarned.join(", ")} — extend REQUEST_PARAM_KEYS (src/incremental-lane.ts) if they must reach the upstream (#3406)`);
 }
 
-/** Wire headers the client may contribute to the forwarded request. */
-const PASSTHROUGH_HEADERS = ["authorization", "anthropic-version", "anthropic-beta"] as const;
-
 /** Canonical prefix per conversation, in memory. Bounded LRU: cold entries
  *  rebuild from the unified messages table on demand (see loadCanonical). */
 const CANONICAL_LIMIT = 16;
@@ -191,6 +188,13 @@ export interface Canonical {
      *  prefix already rendered. */
     renderPrefix: { items: string; len: number; marksVersion: number } | null;
     marksVersion: number;
+    /** Core ids produced by each applied WIRE message, in wire order —
+     *  parallel to the client's acked wire list. Lets a `retouch` (an acked
+     *  message whose only change is its cache_control decoration) re-mark
+     *  exactly that message's core ids. Warm-cache only: null after a cold
+     *  rebuild (the unified rows carry no wire boundaries), where a retouch
+     *  answers 409 and the client resyncs once. */
+    wireSpans?: string[][] | null;
 }
 const canonicalCache = new Map<string, Canonical>();
 const inFlight = new Set<string>();
@@ -530,6 +534,29 @@ export function loadSystem(sessionId: string): unknown {
  *  (src/agent/incremental-client.ts) over the raw wire message — the two
  *  formulas must never diverge or the pull-ack boundary check degrades into
  *  permanent false mismatches. */
+/** Strip only the permitted decoration, never nested tool input/media data. */
+function withoutRawCacheControl(block: unknown): unknown {
+    if (block === null || typeof block !== "object" || Array.isArray(block)) return block;
+    const { cache_control: _mark, ...content } = block as Record<string, unknown>;
+    return content;
+}
+
+/** Compare both directions: deleting a signature/is_error is content drift,
+ *  too. Exclude only fields the host enriches independently of the wire. */
+function sameWireContent(have: BiliMessage, fresh: BiliMessage): boolean {
+    const h = have as unknown as Record<string, unknown>;
+    const f = fresh as unknown as Record<string, unknown>;
+    for (const k of new Set([...Object.keys(h), ...Object.keys(f)])) {
+        if (k === "id" || k === "wireIndex" || k === "ledgerSeq" || k === "ts" || k === "thinkingTokens" || k === "summaryOfBlockId") continue;
+        // A one-message conversion cannot resolve a result's paired tool name.
+        if (k === "toolName" && fresh.contentType === "tool-result" && f[k] === undefined) continue;
+        const oldValue = k === "rawAnthropicBlock" ? withoutRawCacheControl(h[k]) : h[k];
+        const newValue = k === "rawAnthropicBlock" ? withoutRawCacheControl(f[k]) : f[k];
+        if (JSON.stringify(oldValue) !== JSON.stringify(newValue)) return false;
+    }
+    return true;
+}
+
 function hashWireBoundary(m: { role: string; content: unknown }): string {
     return createHash("sha256").update(`${m.role}\u0000${JSON.stringify(m.content)}`).digest("hex").slice(0, 16);
 }
@@ -546,7 +573,9 @@ function applyTurn(
      *  malformed or already-claimed id hard-fails the turn (400) — an id
      *  collision in the ledger would misattribute decompress lookups. */
     deltaIds?: string[],
-): { ok: true; appliedSeq: number; marks: Map<string, unknown> } | { ok: false; status: 400 | 409; error: string; serverSeq: number } {
+    /** Acked wire messages whose cache_control decoration changed (see Canonical.wireSpans). */
+    retouch: { index: number; message: { role: string; content: unknown } }[] = [],
+): { ok: true; appliedSeq: number; marks: Map<string, unknown> } | { ok: false; status: 400 | 409; error: string; serverSeq: number; detail?: string } {
     const serverSeq = entry.msgs.length;
     if (resync) {
         // Full replacement: the client is the source of truth for the whole
@@ -559,6 +588,32 @@ function applyTurn(
     }
     if (!Array.isArray(deltaWire) || (deltaWire.length === 0 && !systemUpdate)) {
         return { ok: false, status: 400, error: "messages must be a non-empty array", serverSeq };
+    }
+    // Retouch validation happens BEFORE any mutation: every retouched message
+    // must map onto known wire spans with identical content (only the
+    // cache_control decoration may differ); anything else is drift → 409 and
+    // the client recovers with a full resync.
+    const retouchMarks: { ids: string[]; marks: Map<string, unknown>; rawBlocks: { message: BiliMessage; block: unknown }[] }[] = [];
+    if (!resync && retouch.length > 0) {
+        const spans = entry.wireSpans;
+        if (spans === null || spans === undefined) return { ok: false, status: 409, error: "seq-mismatch", serverSeq, detail: "retouch without wire spans (cold canonical)" };
+        const byId = new Map(entry.msgs.map((m) => [m.id, m] as const));
+        for (const r of retouch) {
+            const ids = Number.isInteger(r.index) && r.index >= 0 && r.index < spans.length ? spans[r.index] : undefined;
+            if (ids === undefined) return { ok: false, status: 409, error: "seq-mismatch", serverSeq, detail: `retouch index ${String(r.index)} outside ${String(spans.length)} wire spans` };
+            const conv = anthropicToCore({ messages: [r.message] } as never);
+            if (conv.msgs.length !== ids.length) return { ok: false, status: 409, error: "seq-mismatch", serverSeq, detail: `retouch index ${String(r.index)} span ${String(ids.length)} != ${String(conv.msgs.length)}` };
+            const marks = new Map<string, unknown>();
+            const rawBlocks: { message: BiliMessage; block: unknown }[] = [];
+            for (let k = 0; k < ids.length; k++) {
+                const have = byId.get(ids[k]);
+                if (have === undefined || !sameWireContent(have, conv.msgs[k])) return { ok: false, status: 409, error: "seq-mismatch", serverSeq, detail: `retouch index ${String(r.index)} content differs` };
+                const mark = conv.cacheControls.get(conv.msgs[k].id);
+                if (mark !== undefined) marks.set(ids[k], mark);
+                if (conv.msgs[k].rawAnthropicBlock !== undefined) rawBlocks.push({ message: have, block: conv.msgs[k].rawAnthropicBlock });
+            }
+            retouchMarks.push({ ids, marks, rawBlocks });
+        }
     }
     const flat = deltaWire.length === 0 ? { msgs: [], cacheControls: new Map<string, unknown>() } : anthropicToCore({ messages: deltaWire as never } as never);
     let deltaMsgs = flat.msgs;
@@ -573,6 +628,10 @@ function applyTurn(
                 if (!resync && claimed.has(id)) return { ok: false, status: 400, error: "msgIds reuse an existing canonical id", serverSeq };
             }
             deltaMsgs = applyMsgIdPin(flat.msgs, v.ids);
+            // Cache marks address the same core rows: pinning the messages
+            // without their marks silently drops the client's breakpoints.
+            const pinned = new Map(flat.msgs.map((message, i) => [message.id, v.ids[i]]));
+            flat.cacheControls = new Map([...flat.cacheControls].map(([id, mark]) => [pinned.get(id) ?? id, mark]));
         }
         // !v.ok && reason === "length-mismatch": the envelope gate already
         // proved the ids are parallel to the WIRE messages, so a mismatch
@@ -587,7 +646,30 @@ function applyTurn(
     }
     const base = resync ? [] : entry.msgs;
     entry.msgs = [...base, ...deltaMsgs];
-    const marksTouched = flat.cacheControls.size > 0;
+    // Wire spans: core ids per applied wire message (wireIndex is relative
+    // to this turn's delta). Pinned ids (applyMsgIdPin) keep wireIndex.
+    const deltaSpans: string[][] = deltaWire.map(() => []);
+    for (const m of deltaMsgs) {
+        const wi = (m as { wireIndex?: number }).wireIndex;
+        if (typeof wi === "number" && wi >= 0 && wi < deltaSpans.length) deltaSpans[wi].push(m.id);
+    }
+    entry.wireSpans = resync ? deltaSpans : entry.wireSpans === null || entry.wireSpans === undefined ? null : [...entry.wireSpans, ...deltaSpans];
+    // Marks follow the CLIENT's current decoration: a resync re-derives the
+    // marks of every message it carries, and a retouch replaces the marks of
+    // exactly the retouched wire message — so a host's rolling breakpoints
+    // never accumulate past Anthropic's 4-breakpoint limit.
+    let marksTouched = flat.cacheControls.size > 0;
+    if (resync) {
+        for (const m of deltaMsgs) if (entry.marks.delete(m.id)) marksTouched = true;
+    }
+    for (const r of retouchMarks) {
+        // Opaque blocks render verbatim, so their validated decoration must
+        // change along with the separate marks map, after all checks pass.
+        for (const { message, block } of r.rawBlocks) message.rawAnthropicBlock = block;
+        for (const id of r.ids) entry.marks.delete(id);
+        for (const [id, mark] of r.marks) entry.marks.set(id, mark);
+        marksTouched = true;
+    }
     for (const [id, mark] of flat.cacheControls) entry.marks.set(id, mark);
     // #5155: a mark can legally target an id the prefix already rendered
     // (content-derived id collision with a re-sent message), so any cache
@@ -675,6 +757,7 @@ export function handleIncrementalProbe(res: http.ServerResponse, conversationId?
         // #4491: server-owned history for plugin lanes (msgid pinning + the
         // /__bili/plugin/render endpoint). Shims gate their splice on this.
         serverHistory: featureEnabled("pluginLaneServerHistory"),
+        cacheControlRetouch: true,
         ...(conversation !== undefined ? { conversation } : {}),
     });
 }
@@ -740,6 +823,17 @@ export async function handleIncrementalTurn(
         }
     }
 
+    let retouch: { index: number; message: { role: string; content: unknown } }[] = [];
+    if (payload.retouch !== undefined) {
+        if (!Array.isArray(payload.retouch)) return jsonReply(res, 400, { error: "retouch must be an array of { index, message }" });
+        for (const r of payload.retouch as unknown[]) {
+            const ok = r !== null && typeof r === "object" && Number.isInteger((r as { index?: unknown }).index)
+                && laneMessagesLookAnthropic([(r as { message?: unknown }).message]);
+            if (!ok) return jsonReply(res, 400, { error: "retouch entries must be { index: integer, message: anthropic wire message }", conversationId });
+        }
+        retouch = payload.retouch as typeof retouch;
+    }
+
     // Per-conversation turn lock: the ack contract is strictly sequential.
     // The 409 fires only for turns arriving while the holder is INSIDE its
     // response phase (between entry and forward completion) — a concurrent
@@ -775,12 +869,13 @@ export async function handleIncrementalTurn(
                 log("warn", `[incremental] canonical rebuild failed for ${sessionId}: ${rebuilt.err} — requesting client resync`);
                 return jsonReply(res, 409, { error: "seq-mismatch", serverSeq: 0, reason: rebuilt.err, conversationId });
             }
-            entry = { sessionId, msgs: rebuilt.msgs, marks: loadMarks(sessionId), system: loadSystem(sessionId), systemSet: false, boundary: null, renderPrefix: null, marksVersion: 0 };
+            entry = { sessionId, msgs: rebuilt.msgs, marks: loadMarks(sessionId), system: loadSystem(sessionId), systemSet: false, boundary: null, renderPrefix: null, marksVersion: 0, wireSpans: null };
         }
         const msgsBefore = entry.msgs.length;
-        const applied = applyTurn(entry, sinceSeq, resync, deltaWire as never, "system" in payload, deltaIds);
+        const applied = applyTurn(entry, sinceSeq, resync, deltaWire as never, "system" in payload, deltaIds, retouch);
         if (!applied.ok) {
             touchCache(conversationId, entry);
+            log("warn", `[incremental] turn ${conversationId} rejected ${String(applied.status)} ${applied.error}${applied.detail ? ` (${applied.detail})` : ""} since=${String(sinceSeq)} serverSeq=${String(applied.serverSeq)}${resync ? " resync" : ""} delta=${String(deltaWire.length)} retouch=${String(retouch.length)}`);
             return jsonReply(res, applied.status, { error: applied.error, serverSeq: applied.serverSeq, conversationId });
         }
         if ("system" in payload) {
@@ -826,23 +921,34 @@ export async function handleIncrementalTurn(
         }
         const bodyBuf = laneBodyBuffer(body, itemsStr);
 
-        const headers: Record<string, string> = {
-            "content-type": "application/json",
-            "content-length": String(bodyBuf.length),
-            host: headerValue(req, "host") ?? "127.0.0.1",
-            // Session identity rides the CLIENT's own conversation header (the
-            // strongest signal in the pipeline) — see laneSessionId().
-            "x-bili-plugin": agent,
-            "x-bili-plugin-conversation": conversationId,
-            accept: headerValue(req, "accept") ?? "application/json",
-        };
+        // Re-enter the pipeline (forward → handleRequest → buildForwardHeaders) with a
+        // synthetic indistinguishable from the ORIGINAL client request, so egress
+        // normalization is the SAME code that serves full-resend traffic (#5658). This
+        // mirrors the marker-divert replay (handle.ts): copy the client's own headers
+        // and drop only the lane-intent marker — do NOT hand-roll a strip list, which
+        // diverges from the proven non-incremental surface and risks upstream rejection.
+        // The only extra corrections are forced by the REBUILT body: its length, and the
+        // encoding marker (an assembled turn body is always plain JSON, so any inbound
+        // content-encoding is stale). Lane identity is stamped below.
+        const headers: Record<string, string> = {};
+        for (const [k, v] of Object.entries(req.headers)) {
+            if (v === undefined) continue;
+            const lower = k.toLowerCase();
+            if (lower === INCREMENTAL_TURN_MARKER_HEADER.toLowerCase()) continue;
+            if (lower === "content-encoding") continue;
+            headers[k] = Array.isArray(v) ? v.join(", ") : v;
+        }
+        // Lane-owned values win, set explicitly (framing matches the assembled body;
+        // session identity rides the client's own conversation value — laneSessionId()).
+        headers["content-type"] = "application/json";
+        headers["content-length"] = String(bodyBuf.length);
+        headers["host"] = headerValue(req, "host") ?? "127.0.0.1";
+        headers["x-bili-plugin"] = agent;
+        headers["x-bili-plugin-conversation"] = conversationId;
+        headers["accept"] = headerValue(req, "accept") ?? "application/json";
         // Plugin capability headers the client may contribute on the turn
         // POST (context window / max output reports for the [window] clamp).
         for (const h of ["x-bili-plugin-context-window", "x-bili-plugin-max-output"] as const) {
-            const v = headerValue(req, h);
-            if (v !== undefined) headers[h] = v;
-        }
-        for (const h of PASSTHROUGH_HEADERS) {
             const v = headerValue(req, h);
             if (v !== undefined) headers[h] = v;
         }
