@@ -366,7 +366,9 @@ function addStripCounts(a: RawStripCounts, b: RawStripCounts): RawStripCounts {
 // would mint base_N continuing across ALL earlier elements). Bases are
 // content hashes (#3642) and neighbour-independent, so determinism holds:
 // count bases across every earlier-ledger row (pos order), continue _N, and
-// fix wireIndex to the absolute element position.
+// fix wireIndex to the element's NEW LEDGER position (a.pos — equal to its
+// absolute in-body element position only while the world is pure-append;
+// #5652 review F11).
 function baseOfRawId(id: string): string {
     const m = /^h_[0-9a-f]{16}(?:_\d+)?$/u.exec(id);
     return m === null ? id : id.slice(0, 18);
@@ -1015,7 +1017,10 @@ function opportunisticCompact(store: SessionStore, sid: string, world: V6World, 
 
 /** Drop every in-memory mirror + pending commit for a relay session — pair
  *  of clearWatermarkSeed at teardown paths. The DISK plane survives until
- *  pfDeleteForSession (delete-time cascade). */
+ *  pfDeleteForSession (delete-time cascade). MAINTENANCE-ONLY as of the
+ *  #5652 review: NO production call site today (exercised by tests; a future
+ *  relay-teardown path may adopt it) — v5's clearWatermarkSeed has the same
+ *  status; do not read the "teardown paths" wording as an existing wiring. */
 export function clearWatermarkV6(sessionId: string): void {
     const sids = sessionWorlds.get(sessionId);
     if (sids !== undefined) {

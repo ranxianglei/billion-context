@@ -151,11 +151,15 @@ export interface RenderWorld {
     textCum: number;
     /** Cumulative image-reserve contribution of frozen rows. */
     imgCum: number;
-    /** Absolute ledger positions backing `rows` (ascending distinct; index i
-     *  ↔ positions[i]). Dense 0..n-1 holds for every V1 op (the journal is
-     *  a pending DELETE, rows themselves only move via witnessed ops); sparse
-     *  admission stays accepted defensively — emission order is array order,
-     *  and a lagging trailing max is a normal transient (gate span-check). */
+    /** Positions backing `rows` (ascending distinct; index i ↔ positions[i]).
+     *  V1 stores the DENSE ROW ORDINAL (0..n-1; the journal is a pending
+     *  DELETE, rows themselves only move via witnessed ops) — which equals
+     *  the element's ledger position only while NO leading elements were
+     *  absorbed into systemText (a leading-system body offsets the two by
+     *  one row each; #5652 review F9 tracks the coordinate-mix correction,
+     *  and this comment flips with it). Sparse admission stays accepted
+     *  defensively — emission order is array order, and a lagging trailing
+     *  max is a normal transient (gate span-check). */
     positions: number[];
     /** Covered positions journaled at first scene awaiting materialization
      *  (== the mirrored ckpt meta field; both reset together). While > 0 the
@@ -236,6 +240,11 @@ function registerSidForSession(sessionId: string, sid: string): void {
     set.add(sid);
 }
 
+/** Drop every in-memory render mirror for a relay session. MAINTENANCE-ONLY
+ *  as of the #5652 review: NO production call site today (exercised by tests;
+ *  a future relay-teardown path may adopt it) — render analogue of
+ *  fastpath-v6's clearWatermarkV6. The DISK plane (pf_render*) is swept by
+ *  pfDeleteForSession / archiveSession / deleteSession only. */
 export function clearWatermarkV6Render(sessionId: string): void {
     const set = sessionSids.get(sessionId);
     if (!set) return;

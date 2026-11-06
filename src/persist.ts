@@ -2286,8 +2286,12 @@ export class SessionStore {
      *  from ext FIRST (deleteSession sweeps session_ext itself), then deletes
      *  all SIX plane tables — identity rows/log/ckpt AND the #5664 render
      *  snapshot tables (deleteSession's own cascade covers them in-txn too;
-     *  this facade is the standalone maintenance entry). Safe to call when
-     *  nothing was ever issued. */
+     *  archiveSession's does since the #5652 review BUG-2 fix; this facade is
+     *  the standalone maintenance entry). MAINTENANCE-ONLY as of the #5652
+     *  review: NO production call site today (real teardown flows go through
+     *  deleteSession/archiveSession's in-txn cascades; tests exercise this
+     *  directly) — wiring it into relay teardown is open follow-up work, not
+     *  an accident. Safe to call when nothing was ever issued. */
     pfDeleteForSession(sessionId: string): void {
         if (!this.shadow || this.shadow.stats.disabled) return;
         const reg = this.shadow.getSessionExt(sessionId, this.PF_V6_SID_REGISTRY_EXT_KEY) as string[] | undefined;
