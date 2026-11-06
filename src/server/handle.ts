@@ -1757,6 +1757,19 @@ async function handleRequest(
         // as before — no deferral, no timing change).
         if (clientProvided && !anonAffinity && session.stats.requests === 0 && session.metadata.derivedFromSessionId === undefined && session.metadata.publicForkReceipt === undefined && opts.resumeInheritance !== false) {
             const loadParent = (id: string): Session | undefined => peekSession(id) ?? getStore().loadSync(id, { protocol, upstreamOrigin }) ?? undefined;
+            // #5608-B: honest-NULL arm for children continuing a RECOGNIZED
+            // parent out of a FRESH state. When the continuation cannot
+            // inherit its history (below threshold, parent unloadable,
+            // foreign-lane shapes, adoption unsupported/nothing to inherit),
+            // the child's first pass re-sends days-old messages the stamp
+            // node never watched arrive — Date.now() minting there fabricates
+            // "today" for old content (display lie + wrong values propagating
+            // into future lineage stamps). The one-shot flag makes that one
+            // pass yield NULL instead and self-clears afterwards, so genuine
+            // arrivals from later turns still mint. The successful adoption
+            // path arms as well (uniformly cheap): carried parent stamps win
+            // over mints anyway, so only boundary-turn fresh ids are affected.
+            const armHonestNull = () => { session.state.suppressMintingOnce = true; };
             // Claude Code records its fork parent in the transcript
             // (forkedFrom) — authoritative where the byte-exact prefix match
             // below fails: equal-length resumes and re-decorated tails (a
@@ -1843,6 +1856,7 @@ async function handleRequest(
                         const verifiedPrefix = b.firstDivergence === null ? b.chainDepth : b.firstDivergence;
                         const ratio = verifiedPrefix / Math.max(b.chainDepth, 1);
                         if (ratio < WEAK_ADOPT_MIN_PREFIX_RATIO) {
+                            armHonestNull();
                             log("info", `[${sessionId}] [resume-inheritance] miss: starting fresh — closest chain ${b.sessionId} breaks at cell ${b.firstDivergence}/${b.chainDepth} (verified prefix ${(ratio * 100).toFixed(0)}% < ${(WEAK_ADOPT_MIN_PREFIX_RATIO * 100).toFixed(0)}%); not a verified continuation (#5608)`);
                         } else {
                             const best = b.sessionId;
@@ -1858,16 +1872,24 @@ async function handleRequest(
                                         upstreamOrigin,
                                         blocksEnabled: true,
                                         via: "weakly resumed closest chain after byte-exact miss (#5608)",
+                                        // #5608-B: the miss path is exactly the
+                                        // re-rendered-drift shape — uncovered ids
+                                        // may be OLD content, so the boundary
+                                        // batch yields honest NULL.
+                                        armBoundaryNull: true,
                                         log,
                                     });
                                 } else {
+                                    armHonestNull();
                                     log("info", `[${sessionId}] [resume-inheritance] miss: closest chain ${best} is not loadable — starting fresh (#5608)`);
                                 }
                             } catch (err) {
+                                armHonestNull();
                                 log("warn", `[${sessionId}] [resume-inheritance] miss: weak adoption from closest chain ${best} failed (${String(err)}); continuing fresh (#5608)`);
                             }
                         }
                     } else if (b) {
+                        armHonestNull();
                         log("info", `[${sessionId}] [resume-inheritance] miss: starting fresh — closest chain ${b.sessionId} is a ${b.kind} shape (incoming ${b.incomingDepth} vs chain ${b.chainDepth}); only strictly-deeper verified continuations may be adopted weakly (#5608/#1486)`);
                     }
                 }
@@ -1895,6 +1917,7 @@ async function handleRequest(
                         log("warn", `[resume-inheritance] failed (${String(err)}); continuing with fresh state (#1486)`);
                     }
                 } else {
+                    armHonestNull();
                     log("info", `[${sessionId}] [resume-inheritance] matched tracked chain ${resume.sessionId} but the parent session is not loadable — starting fresh (#1486)`);
                 }
             }

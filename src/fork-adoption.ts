@@ -300,6 +300,19 @@ export function applyForkAdoption(session: Session, plan: ForkAdoptionPlan, pare
     // every tagged byte and paying the whole prefix again. #4313 landed after
     // these carries were written, so the ledger was simply never carried.
     seedTimestampsFromParent(session, parent);
+    // #5608-C: carry the parent's visibility mark with the number space. The
+    // child inherits the parent's ref seats (below its fresh pre-pass high
+    // water); gating those seats against the CHILD's fresh mark would strip
+    // the time attrs the parent actually rendered and the provider already
+    // cached. Adopting the parent's mark keeps every inherited line's tag
+    // bytes identical to the parent's wire bytes; boundary-turn arrivals sit
+    // above both marks (assign-refs continues past the reserved space). A
+    // markless (pre-feature) parent stays markless: the node writes the
+    // child's own mark and the inherited lines stay attr-free — which is
+    // exactly how the parent rendered them.
+    if (parent.state.timestampsHighWaterRefSeq !== undefined) {
+        session.state.timestampsHighWaterRefSeq = parent.state.timestampsHighWaterRefSeq;
+    }
     markDirty(session);
 }
 
@@ -462,11 +475,22 @@ export function maybeAdoptResume(args: {
      *  its own so a future reader of the log cannot mistake a byte-exact-MISS
      *  adoption for a clean resume. */
     via?: string;
+    /** #5608-B: caller attests the uncovered incoming ids may be OLD content
+     *  (re-rendered tails after drift, declared-but-unmatched forks), not a
+     *  proven continuation. When set and coverage is incomplete, the child's
+     *  first pass arms honest-NULL so none of the unknown-time ids mint
+     *  "today". The strong byte-exact path NEVER sets this: its uncovered
+     *  suffix sits past the exact prefix and is provably new work. */
+    armBoundaryNull?: boolean;
 }): AdoptionOutcome {
     const { session, parent, sharedDepth, protocol, parsed, upstreamOrigin, blocksEnabled, log } = args;
     const rel = args.via ? `${args.via} ${parent.id}` : `resumed ${parent.id} (${sharedDepth} shared msgs)`;
     const incomingMsgs = incomingCoreMessages(protocol, parsed);
     if (!incomingMsgs) {
+        // #5608-B: the child stays fresh while replaying parent history —
+        // arm honest-NULL so that first pass cannot mint "today" for days-old
+        // messages it never watched arrive.
+        session.state.suppressMintingOnce = true;
         log("info", `[resume-inheritance] ${session.id}: ${rel} but ${protocol} has no adoption support in v1; lineage recorded, refs/blocks not inherited (#1486)`);
         return { adoptedActive: 0, seededRefs: 0 };
     }
@@ -474,10 +498,31 @@ export function maybeAdoptResume(args: {
     const plan = planForkAdoption(parent, ids, { seedAllRefs: true, includeBlocks: blocksEnabled });
     const seededRefs = Object.keys(plan.refs.byRaw).length;
     if (seededRefs === 0 && plan.adoptedActive === 0) {
+        // #5608-B: nothing was inherited — the fresh child still re-sends the
+        // parent's old history next pass; arm honest-NULL for that one pass.
+        session.state.suppressMintingOnce = true;
         log("info", `[resume-inheritance] ${session.id}: ${args.via ? `${args.via} ` : ""}resume of ${parent.id} had nothing to inherit (no overlapping refs${blocksEnabled ? " or fully-present blocks" : ""}); starting fresh (#1486)`);
         return { adoptedActive: 0, seededRefs: 0 };
     }
     applyForkAdoption(session, plan, parent);
+    // #5608-B: arm honest-NULL ONLY where the uncovered ids' times are unknown.
+    // Full coverage: carried parent stamps cover every incoming id and any
+    // uncovered suffix is (for the strong path) provably new work — plain
+    // minting stays honest. Partial coverage with an untrusted tail (weak /
+    // derived): the drifted-or-replayed ids sit in the same first batch as the
+    // genuinely new turn; the kernel cannot split them, so the whole first
+    // pass yields NULL (display-only cost, bounded to the boundary turn — and
+    // unlike a fabricated "today", NULL never propagates into lineage stamps).
+    if (args.armBoundaryNull === true && seededRefs < incomingMsgs.length) {
+        session.state.suppressMintingOnce = true;
+    }
+    // #5608-C: inherit the parent's visibility mark alongside its number
+    // space — seeded refs sit BELOW the child's fresh pre-pass high water,
+    // and gating them against that fresh mark would strip the time attrs the
+    // parent actually rendered (the provider-cached bytes #5609 carries). A
+    // markless parent carries nothing: the node writes the child's own mark
+    // and the inherited lines stay attr-free, matching the parent's wire.
+    session.state.timestampsHighWaterRefSeq = parent.state.timestampsHighWaterRefSeq;
     log(
         "info",
         `[resume-inheritance] ${session.id} ${rel}: inherited ${seededRefs} ref(s) up to ${plan.maxRef || "n/a"}${plan.adoptedActive > 0 ? `, ${plan.adoptedActive} block(s) (~${plan.adoptedTokens} tokens)` : ""}; stale citations now resolve to their original messages (#1486)`,
@@ -521,7 +566,8 @@ export function maybeAdoptDerivedFork(args: {
     const { session, parent, protocol, parsed, upstreamOrigin, enabled, log } = args;
     if (!enabled || session.metadata.derivedBlocksAdopted === true) return;
     try {
-        const outcome = maybeAdoptResume({ session, parent, sharedDepth: 0, protocol, parsed, upstreamOrigin, blocksEnabled: true, log });
+        const outcome = maybeAdoptResume({ session, parent, sharedDepth: 0, protocol, parsed, upstreamOrigin, blocksEnabled: true, // #5608-B: a declared-but-byte-mismatched fork may re-render old lines
+        armBoundaryNull: true, log });
         if (outcome.adoptedActive > 0) {
             session.metadata.derivedBlocksAdopted = true;
         } else {

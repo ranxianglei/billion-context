@@ -259,15 +259,14 @@ test("resume-inheritance MISS seeds the timestamp ledger from the closest tracke
         for (const [key, val] of Object.entries(oldStamps!)) {
             assert.equal(childStamps[key], val, `days-old stamp ${key} must ride over from the closest chain, not be re-minted now ${phase2Diag(dir, logs)}`);
         }
-        // The NEW work mints now-time entries only for itself: the appended turn
-        // (and possibly the drifted tail message whose raw-id changed identity).
-        // Never for the pre-drift history:
+        // #5608-B: the weak path's uncovered ids (the re-rendered drifted line
+        // AND the genuinely appended turn) sit in one undsplittable first
+        // batch, so the adoption arms honest-NULL: NO id of that batch mints
+        // "today" — fabricating would seed false values into future lineage
+        // stamps, while NULL costs only the attribute on ≤2 display lines.
         const newKeys = Object.keys(childStamps!).filter((k) => !(k in oldStamps!));
-        assert.ok(newKeys.length >= 1 && newKeys.length <= 2, `only the fresh/drifted turns are minted (${newKeys.length} new keys: ${JSON.stringify(newKeys)}), not the whole history`);
-        for (const k of newKeys) {
-            const s = childStamps![k];
-            assert.ok(s >= beforeT2 - 5_000 && s <= Date.now() + 5_000, `fresh entry ${k} carries a live now-time in ms (got ${s}, request at ${beforeT2})`);
-        }
+        assert.equal(newKeys.length, 0, `the armed boundary pass mints nothing (${newKeys.length} new keys: ${JSON.stringify(newKeys)}) — honest NULL, not fabricated today (#5608-B)`);
+        assert.ok(Object.keys(oldStamps!).every((k) => k in childStamps!), "every inherited entry rides over");
         // #5608: the miss path runs full weak adoption from the closest chain, so the
         // proof line is the adoption log naming the weak relationship (seeding is logged, not silent).
         assert.ok(logs.some((l) => l.includes("weakly resumed closest chain after byte-exact miss") && l.includes("old")), `weak adoption is logged, not silent ${phase2Diag(dir, logs)}`);
@@ -418,8 +417,12 @@ test("weak-adoption gate: equal-depth replays and truncated subviews start FRESH
         assert.ok(logs.some((l) => l.includes("trunc-resend") && l.includes("truncated shape")), `the truncated resend names its rejection reason ${phase2Diag(dir, logs)}`);
         const eqStamps = getSession("eq-replay").state.tsStamps;
         const truncStamps = getSession("trunc-resend").state.tsStamps;
-        assert.ok(eqStamps && Object.keys(eqStamps).length > 0, "the equal-depth replay mints its OWN ledger (no inheritance)");
-        assert.notStrictEqual(truncStamps, eqStamps, "the truncated resend holds a distinct ledger object");
+        // #5608-B: these FRESH fallbacks re-send OLD history that was NOT
+        // adopted — the first pass must yield honest NULL, not a whole
+        // ledger of fabricated "today" stamps (pre-#5608-B this asserted the
+        // opposite: the very fabrication the ruling removes).
+        assert.ok(!eqStamps || Object.keys(eqStamps).length === 0, `the equal-depth replay arms honest-NULL on its first pass (keys: ${eqStamps ? JSON.stringify(Object.keys(eqStamps)) : "none"}) (#5608-B)`);
+        assert.ok(!truncStamps || Object.keys(truncStamps).length === 0, `the truncated resend arms honest-NULL on its first pass (keys: ${truncStamps ? JSON.stringify(Object.keys(truncStamps)) : "none"}) (#5608-B)`);
     } finally {
         setLogCapture(null);
         store2.closeQuietly();

@@ -981,10 +981,11 @@ for (const storageMode of ["legacy", "full"] as const) {
             parent.contentStore = storeOriginal(createContentStore(), { ref: "m00001", rawId: parent.pluginSnapshot![0].id, text: "CCR original retained independently after restart", kind: "original", tokens: 10, head: "CCR original" });
             parent.contentStoreDirty = true;
             assert(h.store.flushSync(parent));
-            // #4316 PR3/3: only a unified cold load runs the one-time ledger
-            // alignment; the CI legacy baseline retains the original state.
+            // #4316 PR3/3 + #5608-D: cold load NO LONGER runs the one-time
+            // ledger alignment — it must preserve the persisted state
+            // byte-for-byte so the provider prefix survives the restart;
+            // the alignment rides the session's next post-restart fold save.
             const persistedState = JSON.parse(JSON.stringify(parent.state));
-            if (h.store.replicasAvailable()) persistedState.refLedgerAligned = true;
             assert.deepEqual(JSON.parse(JSON.stringify(h.store.loadSync("parent")!.state)), persistedState);
             const snapshot = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;
             const req = forkRequest(snapshot);

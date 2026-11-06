@@ -461,6 +461,11 @@ test("storage unified FULL mode: read path serves from the index with organic im
         const store = new SessionStore({ dir: caseDir, debounceMs: 1, enabled: true });
         const session = store.loadSync(meta.id, { protocol: meta.protocol, upstreamOrigin: "http://127.0.0.1:8199" });
         assert.ok(session, "full-mode loadSync returned null");
+        // #5608-D: cold load no longer aligns the citation space; drive one
+        // simulated fold-save so it settles onto the ledger exactly as the
+        // retired cold-load path used to (expected digest below still does).
+        session.pendingLedgerAlign = true;
+        assert.ok(store.flushSync(session), "post-fold save commits");
         store.closeQuietly();
         // The import must have populated the index even though writeNow never ran.
         const probe = UnifiedStore.open(path.join(caseDir, "index.db"));
@@ -563,6 +568,10 @@ test("storage unified: file-config storage.unified selects the mode; env tier st
         let store = new SessionStore({ dir: caseDir, debounceMs: 1, enabled: true });
         let session = store.loadSync(meta.id, { protocol: meta.protocol, upstreamOrigin: "http://127.0.0.1:8199" });
         assert.ok(session, "file-tier full loadSync returned null");
+        // #5608-D: simulate the post-fold save that settles the citation
+        // space onto the ledger (cold-load alignment retired).
+        session.pendingLedgerAlign = true;
+        assert.ok(store.flushSync(session), "post-fold save commits");
         store.closeQuietly();
         const probeStore = UnifiedStore.open(path.join(caseDir, "index.db"));
         let fileTierDigest = "";

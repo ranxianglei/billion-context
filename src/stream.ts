@@ -1285,6 +1285,10 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
             return compressResult(receipt, "refused", 0, "gate:no-net-shrink");
         }
         ctx.session.state = res.state;
+        // #5608-D: this fold is the session's next legitimate cache-breaking
+        // boundary — flag the one-time #4316 citation-space alignment to ride
+        // it (persist.scheduleSave consumes the marker before serializing).
+        ctx.session.pendingLedgerAlign = true;
         // #2627 backstop: no committed state may carry outbound-only turn-
         // separator ids in coverage (a polluted child would otherwise re-
         // poison higher folds via effectiveMessageIds inheritance). Runs
