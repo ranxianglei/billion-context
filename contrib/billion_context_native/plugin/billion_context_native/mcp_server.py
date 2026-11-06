@@ -2,6 +2,7 @@
 import json
 import sys
 import time
+import uuid
 
 import prompts as pr
 import store
@@ -227,13 +228,13 @@ def status(args):
         f'已压缩次数: {tr.compactions(entries)}，存档轮数: {len(tr.load_archive(sid))}',
         f'摘要: {len(store.active_summaries(recs))} 条生效 / {len(recs)} 条存档'
         + (f'，需要 tier {need[0]} 汇总' if need else ''),
-        f'规则: {len(store.replay_rules(entries, completed_only=True)["rules"])} 条'])
+        f'规则: {len(store.replay_rules(entries, completed_only=True, sid=sid)["rules"])} 条'])
 
 
 def rule(args):
-    _, entries = _live(args)
-    state = store.replay_rules(entries, completed_only=True)
-    return store.apply_rule(state, args)
+    sid, entries = _live(args)
+    state = store.replay_rules(entries, completed_only=True, sid=sid)
+    return store.apply_rule(state, args, rule_id=f'rule{uuid.uuid4().int}')
 
 
 def call(name, args):
