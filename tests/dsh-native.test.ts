@@ -5,7 +5,19 @@ import os from "node:os";
 import path from "node:path";
 import http from "node:http";
 import { pathToFileURL } from "node:url";
-import { apply, planNativeDsh, shouldBootstrapNativeDsh, persistClientEvent, mediaBytesOfWireBody, bodyProvablyOverWindow, _attributionHealthForTest, _resetAttributionHealthForTest, _registerStateForTest, _resetRegisterForTest, _setModelInfoForTest, _nativeStateForTest, _setSpawnForTest, _setThrewRetryForTest, _settleNativeForTest, _stateHeadersForTest, _stateRespawnForTest, _stateTakeoverGateForTest, _stateToolsReadyForTest, _stateBeforeSendForTest, _stateOnResponseForTest, _noteRoutedForTest, _resetRoutedForTest, _resetWebProfileWarningForTest, _resetNonWebTraceForTest, _resetTitlesForTest, type PluginContext } from "../src/agent/dsh-native.ts";
+import { apply, planNativeDsh, shouldBootstrapNativeDsh, persistClientEvent, mediaBytesOfWireBody, bodyProvablyOverWindow, _attributionHealthForTest, _resetAttributionHealthForTest, _registerStateForTest, _resetRegisterForTest, _setModelInfoForTest, _nativeStateForTest, _setSpawnForTest, _setThrewRetryForTest, _settleNativeForTest, _stateHeadersForTest, _stateRespawnForTest, _stateTakeoverGateForTest, _stateToolsReadyForTest, _stateBeforeSendForTest, _stateOnResponseForTest, _noteRoutedForTest, _resetRoutedForTest, _resetWebProfileWarningForTest, _resetNonWebTraceForTest, _resetTitlesForTest, classifyBootstrapFailure, type PluginContext } from "../src/agent/dsh-native.ts";
+
+// owner 2026-10-31: only a missing SQLite engine earns the "upgrade Node.js
+// to v22+" page wording; every other bootstrap failure stays on the generic
+// degraded hint (no false upgrade nudges).
+test("classifyBootstrapFailure — no-engine vs generic launch failure", () => {
+    assert.equal(classifyBootstrapFailure(new Error("[storage:node:sqlite] no SQLite engine available (better-sqlite3 not installed)")), "no-engine");
+    assert.equal(classifyBootstrapFailure(new Error("no SQLite engine available (node:sqlite missing)")), "no-engine");
+    assert.equal(classifyBootstrapFailure("No sqlite engine available"), "no-engine"); // string rejects are classified too
+    assert.equal(classifyBootstrapFailure(new Error("connect ECONNREFUSED 127.0.0.1:8199")), "launch-failed");
+    assert.equal(classifyBootstrapFailure(new Error("attempt to write a readonly database")), "launch-failed");
+    assert.equal(classifyBootstrapFailure(undefined), "launch-failed");
+});
 import { __resetIncrementalClientForTests } from "../src/agent/incremental-client.ts";
 import { isDshCompactionActive, _resetDshCompactionVerdictForTest } from "../src/agent/dsh-compaction-disable.ts";
 import { once } from "node:events";
