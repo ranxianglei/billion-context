@@ -17,6 +17,23 @@
 // (nudge-inject rides lastNudgeShownTokens down and sets it on shouldInject),
 // so the audit must never touch live state. The whole audit is advisory: any
 // failure degrades to "no runs" rather than breaking receipts or status.
+//
+// #5780: listing a run is not claiming it folds. The audit once advertised
+// turn fragments that apply STRUCTURALLY rejects ("Range would split N
+// turn(s)"), costing a round trip and dragging the sibling range down in the
+// atomic batch rollback (#3939). Advertise and execute must share ONE
+// judgment (#3236 doctrine): every final run is now screened through
+// core.applyCompression on a structuredClone of the state with a throwaway
+// summary — the public API (zero kernel surface change), running byte-for-byte
+// the code path a real submission takes. Structurally doomed runs (turn split
+// at the protected boundary / entirely zoned) carry a compact ⚠ note;
+// transient refusals (below the fold-size gate, already covered) stay plain
+// because combined with adjacent mass they DO fold. Any screen failure
+// degrades to "unmarked", consistent with the advisory posture above.
+// Companion fix: a run whose WHOLE body the zone diff claims was silently
+// dropped even when its head predates the protected window (the diff cannot
+// separate "protected" from "structurally withheld") — such runs are now
+// reported and labeled by the screen instead of vanishing.
 
 import {
   BLOCKED_REF,
@@ -38,6 +55,66 @@ interface UncoveredRun {
   endRef: string;
   count: number;
   tokens: number;
+  /** #5780: set when the apply-side judgment says this exact span cannot fold
+   *  RIGHT NOW for structural reasons (turn split at the protected boundary /
+   *  entirely inside the zone). Transient refusals leave it unset. */
+  note?: string;
+}
+
+// #5780: throwaway summary for the apply-side foldability screen. It must clear
+// the kernel's summary-length validation (default minSummaryLength = 50 chars);
+// it is deliberately long so sane user-tuned minimums still pass — an
+// over-tuned minimum degrades gracefully to "unmarked", never to a false note.
+const FOLDABILITY_PROBE_SUMMARY =
+  "Foldability screen probe — judged against the live session state through the same apply path a real compression takes; it is never stored and never rendered.";
+
+// Structural-class markers keyed off the STABLE wording of the kernel's
+// projectUnit fatal errors (kernel/src/unit-projection.ts: "Range would
+// split …", "cannot satisfy turn integrity without unfolding", "entirely
+// within the protected zone") AND its #5253-family soft no-ops (kernel/src/
+// compress.ts: "folded nothing — it lies entirely inside the protected
+// zone … do not resend this range", "all of its content is protected or
+// filtered"). A no-op is the same structural class as the zone fatal:
+// resending the span cannot fold anything until the zone moves. Transient
+// refusals ("too small", already covered, unknown refs) intentionally fall
+// through to unmarked — they self-teach via their own text.
+const SPLIT_NOTE = "\u26a0 not foldable: would split a turn at the protected boundary";
+const ZONE_NOTE = "\u26a0 not foldable: entirely inside the protected zone";
+
+/**
+ * #5780: run the run's exact span through the apply-side judgment on a state
+ * clone (public core API — byte-for-byte the path a real submission takes).
+ * Returns a compact note for structural fatals/no-ops, undefined when the
+ * span folds or its refusal is transient. Any failure → undefined (advisory
+ * degrades).
+ */
+function foldabilityNote(
+  core: CompressionCore,
+  state: CompressionState,
+  config: Config,
+  messages: CoreMessage[],
+  startRef: string,
+  endRef: string,
+): string | undefined {
+  try {
+    const { result } = core.applyCompression({
+      ranges: [{ startRef, endRef, summary: FOLDABILITY_PROBE_SUMMARY }],
+      messages,
+      state: structuredClone(state),
+      config,
+    });
+    if (result.errors.length === 0 && result.blocksCreated > 0) return undefined;
+    for (const err of result.errors) {
+      if (/would split|cannot satisfy turn integrity/.test(err)) return SPLIT_NOTE;
+      if (/entirely within the protected zone/.test(err)) return ZONE_NOTE;
+    }
+    for (const warning of result.warnings) {
+      if (/lies entirely inside the protected zone|all of its content is protected/.test(warning)) return ZONE_NOTE;
+    }
+    return undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 interface UncoveredAuditInput {
@@ -66,6 +143,28 @@ interface RunEntry {
   ref: string;
   num: number;
   tokens: number;
+  role: string;
+  /** Position within the entries array (contiguous-run walk order). */
+  pos: number;
+}
+
+// #5780: host-side estimate of where the protected claim begins, in ENTRY
+// space (entries skip covered/zero-token messages, so this UNDER-counts the
+// kernel's message-space zone — the conservative direction: it can only make
+// us report more, and the apply-side screen then labels such spans honestly
+// instead of claiming they fold). Claim = last `preserveRecentMessages`
+// entries plus the most recent user anchor (the kernel's two core zone rules);
+// decorative extensions (#2886 pair symmetry, neverPreserveRecentTools) only
+// protect MORE, so missing them errs toward reporting, never toward hiding.
+function protectedClaimStart(entries: RunEntry[], config: Config): number {
+  let start = entries.length - (config.preserveRecentMessages ?? 0);
+  for (let i = entries.length - 1; i >= 0; i--) {
+    if (entries[i].role === "user") {
+      start = Math.min(start, i);
+      break;
+    }
+  }
+  return Math.max(0, Math.min(start, entries.length));
 }
 
 function refNum(ref: string): number {
@@ -107,7 +206,7 @@ export function uncoveredHistoryRuns(input: UncoveredAuditInput): UncoveredRun[]
     if (tokens <= 0) return;
     const num = refNum(ref);
     if (num <= 0) return;
-    entries.push({ index, ref, num, tokens });
+    entries.push({ index, ref, num, tokens, role: msg.role, pos: entries.length });
   });
   if (entries.length === 0) return [];
 
@@ -162,18 +261,34 @@ export function uncoveredHistoryRuns(input: UncoveredAuditInput): UncoveredRun[]
   //    window membership errs toward under-reporting, never toward claiming a
   //    protected tail message is leakable mass.
   const out: UncoveredRun[] = [];
+  const claimStart = protectedClaimStart(entries, config);
   for (const run of runs) {
     if (run.some((e) => inAnyWindow(e.num, actionable))) continue;
-    const kept = run.filter((e) => !(inAnyWindow(e.num, relaxedWindows) && !inAnyWindow(e.num, normalWindows)));
-    if (kept.length === 0) continue;
-    const tokens = kept.reduce((sum, e) => sum + e.tokens, 0);
+    let span = run.filter((e) => !(inAnyWindow(e.num, relaxedWindows) && !inAnyWindow(e.num, normalWindows)));
+    if (span.length === 0) {
+      // #5780: the zone diff cannot tell "hidden by the recent window" from
+      // "withheld because structurally doomed" — both are absent from the
+      // normal offer. A head INSIDE the protected claim is a genuine tail
+      // (silent, as before); a head PREDATING it is doomed mass the user can
+      // never fold through ordinary ranges — report the full run and let the
+      // apply-side screen below label it honestly.
+      if (run[0].pos >= claimStart) continue;
+      span = run;
+    }
+    const tokens = span.reduce((sum, e) => sum + e.tokens, 0);
     if (tokens < VIABLE_RANGE_MIN_TOKENS) continue;
-    out.push({
-      startRef: kept[0].ref,
-      endRef: kept[kept.length - 1].ref,
-      count: kept.length,
+    // #5780: advertise only what apply will accept — same judgment as execute.
+    // applyView-first mirrors the production apply call (stream.ts), falling
+    // back to this module's separator-stripped log when no apply view exists.
+    const note = foldabilityNote(core, state, config, input.applyView ?? messages, span[0].ref, span[span.length - 1].ref);
+    const candidate: UncoveredRun = {
+      startRef: span[0].ref,
+      endRef: span[span.length - 1].ref,
+      count: span.length,
       tokens,
-    });
+    };
+    if (note !== undefined) candidate.note = note;
+    out.push(candidate);
   }
   return out;
 }
@@ -185,7 +300,7 @@ export function shortTokenCount(n: number): string {
 }
 
 export function describeUncoveredRuns(runs: UncoveredRun[], maxListed = 5): string {
-  const listed = runs.slice(0, maxListed).map((r) => `${r.startRef}–${r.endRef} (${r.count} msgs, ${shortTokenCount(r.tokens)} tok)`);
+  const listed = runs.slice(0, maxListed).map((r) => `${r.startRef}–${r.endRef} (${r.count} msgs, ${shortTokenCount(r.tokens)} tok${r.note ? `, ${r.note}` : ""})`);
   const rest = runs.length - listed.length;
   return rest > 0 ? `${listed.join(", ")}, +${rest} more run(s)` : listed.join(", ");
 }
