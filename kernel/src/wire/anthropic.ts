@@ -483,8 +483,10 @@ function settleToolDeltaPositions(out: AnthropicWireMessage[]): void {
           return [t?.definition?.name ?? (b.name as string | undefined) ?? "unknown"];
         }
         if (b.type === "tool_removal") {
+          const t = b.tool as { name?: string } | undefined;
           return [
-            (b.tool_reference as string | undefined) ??
+            t?.name ??
+              (b.tool_reference as string | undefined) ??
               (b.tool_name as string | undefined) ??
               "unknown",
           ];
