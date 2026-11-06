@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { readdir, readFile, rm } from "node:fs/promises";
 import * as path from "node:path";
 const { join } = path;
@@ -339,6 +339,61 @@ export function fileNameMatchesId(base: string, id: string, protocol?: string, u
         return canonicalBase === relBase || canonicalBase === flatBase;
     }
     return false;
+}
+
+/** #5779: forensic retention cap for `.corrupt-<ts>` quarantine copies per base
+ *  file, counting the just-created copy. The newest copy carries the forensics;
+ *  older copies of the same base are redundant history of an already-fresh-
+ *  started session. */
+export const CORRUPT_SIBLING_CAP = 1;
+
+/** #5779: bound `.corrupt-<ts>` quarantine copies so a hot session can no
+ *  longer accumulate unbounded forensic weight on disk (issue #5779: 273 ×
+ *  ~0.6 GiB in one tree). Keeps at most CORRUPT_SIBLING_CAP siblings of
+ *  `baseFile` in total — `keepPath` (the just-created copy) always survives
+ *  even under clock skew; older ones are deleted. Best-effort: an unreadable
+ *  dir or a locked file (Windows AV) skips the entry and the next quarantine
+ *  retries the sweep. Returns removal counts for log lines; never throws. */
+export function pruneCorruptSiblings(baseFile: string, keepPath?: string): { removed: number; locked: number } {
+    const dir = path.dirname(baseFile);
+    const prefix = `${path.basename(baseFile)}.corrupt-`;
+    const keepName = keepPath ? path.basename(keepPath) : undefined;
+    let names: string[];
+    try {
+        names = readdirSync(dir);
+    } catch {
+        return { removed: 0, locked: 0 };
+    }
+    const stampOf = (name: string): number => {
+        const n = Number(name.slice(prefix.length));
+        return Number.isFinite(n) ? n : 0;
+    };
+    const others = names.filter((n) => n.startsWith(prefix) && n !== keepName).sort((a, b) => stampOf(b) - stampOf(a));
+    let removed = 0;
+    let locked = 0;
+    for (const name of others.slice(Math.max(0, CORRUPT_SIBLING_CAP - 1))) {
+        try {
+            unlinkSync(path.join(dir, name));
+            removed++;
+        } catch {
+            locked++;
+        }
+    }
+    return { removed, locked };
+}
+
+/** #5779: true when a decode failure is resource exhaustion — V8 reports both
+ *  allocation families ("Array buffer allocation failed", "JavaScript heap out
+ *  of memory") as RangeError. Such a file must NOT be quarantined: the bytes
+ *  are fine, the process just could not afford them this round. The
+ *  "Maximum call stack size exceeded" RangeError is structural pathology
+ *  (genuinely pathological payload depth) and stays on the corruption side. */
+export function isAllocationFailureError(error: unknown): boolean {
+    return error instanceof RangeError && /allocation failed|heap out of memory/i.test(error.message);
+}
+
+function errText(error: unknown): string {
+    return error instanceof Error ? error.message : String(error);
 }
 
 /** Session persistence policy over the kernel StateStore mechanism. The
@@ -1153,14 +1208,24 @@ export class SessionStore {
         }
         let raw: unknown;
         try { raw = JSON.parse(bytes.toString("utf8")); }
-        catch {
+        catch (plainTextError) {
             try { raw = JSON.parse(this.readCodec.decode(bytes)); }
             catch (decodeError) {
                 // #3157 self-heal: a size-correct but undecodable file (a VDL=0
-                // zero file left by a crash between write and rename — now
-                // prevented by the fsync fix) used to throw here on every load,
-                // 502-ing the whole lane until a human deleted the file. Isolate
-                // it beside the original and start this session fresh instead.
+                // torn write — now prevented by #3157's fsync; pre-fix files can
+                // still surface) used to throw here on every load, 502-ing the
+                // whole lane until a human deleted the file. Isolate it beside
+                // the original and start this session fresh instead.
+                // #5779: allocation failure = resource exhaustion, not corruption —
+                // quarantining destroyed a healthy envelope and its fold state, and
+                // the eviction/cold-load loop rebuilt + re-quarantined it (~0.6 GiB
+                // of forensic copies per failure). Classify BOTH errors: an OOM in
+                // the first attempt leaves this catch holding only the codec's own
+                // format error. Leave the file in place; the next load retries.
+                if (isAllocationFailureError(plainTextError) || isAllocationFailureError(decodeError)) {
+                    this.log("error", `[persist] session state ${path.basename(file)} unreadable this round — decode ran out of memory, NOT corruption; file left in place for retry (${errText(plainTextError)} / ${errText(decodeError)})`);
+                    return null;
+                }
                 this.quarantineCorruptState(file, id, decodeError);
                 return null;
             }
@@ -1181,16 +1246,21 @@ export class SessionStore {
      *  (plugin.ts). Best-effort: if the rename fails (Windows AV/indexer lock),
      *  the caller still treats the file as a miss — the session starts fresh and
      *  the next boot retries the isolation. The `.corrupt-<ts>` suffix does not
-     *  end in `.json`, so the directory walkers skip it next boot (it stays for
-     *  forensics; sweepStaleTemps only removes `.tmp-*` orphans). */
+     *  end in `.json`, so the directory walkers skip it next boot. Retention is
+     *  bounded (#5779): pruneCorruptSiblings keeps only the newest
+     *  CORRUPT_SIBLING_CAP copy per base file — the forensic value lives in the
+     *  latest failure, and unbounded copies once filled user disks (~0.6 GiB
+     *  each, hundreds per tree). */
     private quarantineCorruptState(file: string, id: string, cause: unknown): void {
-        const causeText = cause instanceof Error ? cause.message : String(cause);
+        const causeText = errText(cause);
         const quarantinePath = `${file}.corrupt-${Date.now()}`;
         try {
             renameSync(file, quarantinePath);
-            this.log("warn", `[persist] quarantined undecodable session state ${path.basename(file)} → ${path.basename(quarantinePath)}; starting ${id} fresh (${causeText})`);
+            const pruned = pruneCorruptSiblings(file, quarantinePath);
+            const capNote = pruned.removed > 0 ? `; removed ${pruned.removed} older forensic cop${pruned.removed === 1 ? "y" : "ies"} (cap ${CORRUPT_SIBLING_CAP})` : "";
+            this.log("warn", `[persist] quarantined undecodable session state ${path.basename(file)} → ${path.basename(quarantinePath)}; starting ${id} fresh (${causeText})${capNote}`);
         } catch (renameErr) {
-            this.log("error", `[persist] failed to quarantine corrupt session state ${path.basename(file)}; resuming ${id} empty this load (${causeText}; rename: ${renameErr instanceof Error ? renameErr.message : String(renameErr)})`);
+            this.log("error", `[persist] failed to quarantine corrupt session state ${path.basename(file)}; resuming ${id} empty this load (${causeText}; rename: ${errText(renameErr)})`);
         }
     }
 
