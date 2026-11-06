@@ -816,7 +816,7 @@ function fallbackOversizeRefusal(
     return new Response(JSON.stringify({ error: { type: "server_error", code: "bili_gate_oversize_refusal_fallback", message, retryable: true } }), { status: 422, headers });
 }
 
-async function withTimeout<T>(p: Promise<T>, ms: number): Promise<T | undefined> {
+export async function withTimeout<T>(p: Promise<T>, ms: number): Promise<T | undefined> {
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timeout = new Promise<undefined>((resolve) => {
         timer = setTimeout(() => resolve(undefined), ms);

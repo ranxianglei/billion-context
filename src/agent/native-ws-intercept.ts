@@ -24,7 +24,12 @@
 //   * forwards constructor arguments VERBATIM (subprotocols, the `{headers}`
 //     init object carrying session-id + x-bili-plugin* stamped by pi's
 //     before_provider_headers — verified to ride the upgrade request on Node
-//     ≥22 undici and Bun, #2073 Q1);
+//     ≥22 undici and Bun, #2073 Q1). Exception (#5838): lanes that arm the
+//     per-dispatch preparation hooks on their NativeInterceptState (dsh —
+//     its identity stamping lives in state.headersFor, not in a host header
+//     event) run that preparation inside the deferred window and merge the
+//     stamped headers onto the upgrade init; a lane without those hooks sees
+//     byte-identical verbatim forwarding;
 //   * leaves everything else alone: non-model WS (devtools, socket.io, …),
 //     already-/bili/-routed URLs, control-plane paths, other protocols.
 //
@@ -41,7 +46,7 @@
 // matching the fetch lane's give-up semantics. Explicit `sse` remains the
 // documented escape hatch either way.
 
-import { ACTIVE_STATE, ACTIVE_STATE_SEQ, bindLiveStateSlot, noteRoutedOrigin, readyOrigin, type NativeInterceptState } from "./native-intercept.js";
+import { ACTIVE_STATE, ACTIVE_STATE_SEQ, bindLiveStateSlot, noteRoutedOrigin, readyOrigin, withTimeout, type GateVerdict, type NativeInterceptState } from "./native-intercept.js";
 import { logHostEvent } from "./host-log.js";
 
 // @types/node exposes Event/EventTarget globally but keeps the web-platform
@@ -81,6 +86,12 @@ interface WsInstanceLike {
 }
 
 type WsCtor = new (url: string | URL, ...rest: unknown[]) => WsInstanceLike;
+
+// #5838: the deferred window's full verdict — where to connect AND with which
+// constructor arguments. The per-dispatch prep merges stamped headers onto
+// the init, so the rest array is part of the decision, not just the URL; an
+// absent field falls back to the originally requested shape (direct send).
+type WsConnectionPrep = { url?: string; rest?: unknown[] };
 
 type GlobalRecord = Record<PropertyKey, unknown>;
 
@@ -155,7 +166,7 @@ class DeferredWebSocket {
     constructor(
         private readonly requestedUrl: string,
         rest: unknown[],
-        private readonly resolveFinalUrl: () => Promise<string | undefined>,
+        private readonly resolvePrep: () => Promise<WsConnectionPrep | undefined>,
         private readonly construct: (finalUrl: string, rest: unknown[]) => WsInstanceLike,
     ) {
         void this.settle(rest);
@@ -164,16 +175,16 @@ class DeferredWebSocket {
     private async settle(rest: unknown[]): Promise<void> {
         if (this.settled) return;
         this.settled = true;
-        let finalUrl: string | undefined;
+        let prep: WsConnectionPrep | undefined;
         try {
-            finalUrl = await this.resolveFinalUrl();
+            prep = await this.resolvePrep();
         } catch {
-            finalUrl = undefined;
+            prep = undefined;
         }
         // Re-check AFTER the await: a close() may have landed mid-window.
         if (this.cancelled || this.real !== undefined) return;
         try {
-            this.attach(this.construct(finalUrl ?? this.requestedUrl, rest));
+            this.attach(this.construct(prep?.url ?? this.requestedUrl, prep?.rest ?? rest));
         } catch (error) {
             // constructLive exhausted every candidate: surface a socket error +
             // abnormal close so client cleanup proceeds, instead of letting the
@@ -341,6 +352,57 @@ export function nativeWebSocketInterceptInstalled(): boolean {
 let preInstallDesc: PropertyDescriptor | undefined;
 let ourGet: (() => unknown) | undefined;
 
+// #5838: the constructor's second argument when it IS an init object (undici's
+// {headers, protocols, ...} form) — the SAME reference flows through gate →
+// beforeSend → header merge so a hook that rebuilds init.headers (#4082's
+// negotiated-stamp path) lands on the very upgrade request it claimed.
+function wsInitLike(arg: unknown): RequestInit | undefined {
+    return arg !== null && typeof arg === "object" && !Array.isArray(arg) ? (arg as RequestInit) : undefined;
+}
+
+// #5838: rebuild the constructor's rest array with a replaced second argument
+// only when the merge actually produced a new value (host object identity is
+// preserved otherwise — the same byte-identity the fast path has always held).
+function restWithInit(rest: unknown[], replacedFirst: unknown): unknown[] {
+    if (Object.is(replacedFirst, rest[0])) return rest;
+    const next = [...rest];
+    next[0] = replacedFirst;
+    return next;
+}
+
+// #5838: merge bili-stamped headers onto the constructor argument without ever
+// mutating the host's object (rebuild, #3370 discipline). Stamps WIN on name
+// conflict — the same precedence withHeaders gives the fetch lane's stamps.
+// Subprotocol string/array forms are wrapped into the object form undici
+// accepts for BOTH fields (verified on Node ≥22: sec-websocket-protocol and
+// custom headers ride the same upgrade). Unrecognized shapes pass through
+// untouched — a stamp that cannot be expressed safely is dropped, never a
+// connection broken.
+function mergeWsInitHeaders(arg: unknown, extra: Record<string, string> | undefined): unknown {
+    if (extra === undefined || Object.keys(extra).length === 0) return arg;
+    if (arg === undefined || arg === null) return { headers: { ...extra } };
+    if (typeof arg === "string" || Array.isArray(arg)) return { protocols: arg, headers: { ...extra } };
+    if (typeof arg === "object") {
+        const init = { ...(arg as Record<string, unknown>) };
+        const h = init.headers;
+        if (h === undefined || h === null) {
+            init.headers = { ...extra };
+        } else if (h instanceof Headers) {
+            const merged = new Headers(h);
+            for (const [k, v] of Object.entries(extra)) merged.set(k, v);
+            init.headers = merged;
+        } else if (Array.isArray(h)) {
+            init.headers = [...h, ...Object.entries(extra)];
+        } else if (typeof h === "object") {
+            init.headers = { ...(h as Record<string, string>), ...extra };
+        } else {
+            return arg;
+        }
+        return init;
+    }
+    return arg;
+}
+
 /** Install the globalThis.WebSocket wrapper for one native host process.
  *  Idempotent (Symbol.for flag — repeated extension loads are no-ops) and
  *  lifecycle-bound to the same guard as installNativeFetchIntercept: off mode
@@ -409,11 +471,17 @@ export function installNativeWebSocketIntercept(initialState: NativeInterceptSta
             // plugin → pass through direct, never hit a disposed context.
             const state = (globalThis as GlobalRecord)[ACTIVE_STATE] as NativeInterceptState | undefined;
             if (target === undefined || state === undefined) return new RoutedWebSocket(url, ...rest);
-            if (state.takeoverGate !== undefined && state.takeoverGate(target) === false) {
-                state.onDispatch?.(target, "refused");
-                return new RoutedWebSocket(url, ...rest);
-            }
-            const rewrite = (origin: string): unknown => {
+            // #5838: lanes arming the per-dispatch prep hooks (dsh: async
+            // takeover verdict, tools-ready gate, fork-adoption beforeSend,
+            // headersFor stamps) run them INSIDE the deferred window before the
+            // upgrade goes out — an un-awaited gate verdict or a socket opened
+            // ahead of registration would ride wire mode for its whole life
+            // (#1268 shape). Hook-less lanes (pi stamps via its own extension
+            // event) keep today's exact sync paths below.
+            const hooksArmed = state.takeoverGate !== undefined || state.toolsReady !== undefined || state.headersFor !== undefined || state.beforeSend !== undefined;
+            const initLike = wsInitLike(rest[0]);
+            const origin = state.wsOrigin ?? state.origin;
+            if (!hooksArmed && typeof origin === "string") {
                 const rewritten = rewriteCodexResponsesWsUrl(target, origin);
                 // Record the HTTP-shaped origin — the fetch lane records http origins and the
                 // attach-lane comparisons (observeRoutedOrigin / verifyAttachAndRecover) match
@@ -421,17 +489,32 @@ export function installNativeWebSocketIntercept(initialState: NativeInterceptSta
                 noteRoutedOrigin(state, rewritten.replace(/^ws/i, "http"));
                 state.onDispatch?.(rewritten, "rewrite");
                 return new RoutedWebSocket(rewritten, ...rest);
-            };
-            const origin = state.wsOrigin ?? state.origin;
-            if (typeof origin === "string") return rewrite(origin);
-            // Origin still settling → defer the real connection (bounded by
-            // readyOrigin's timeout, same hold the fetch lane applies). A
+            }
+            // Origin settling OR hooks armed → defer the real connection (bounded
+            // by readyOrigin's timeout, same hold the fetch lane applies). A
             // pending wsOrigin (inline bridge booting) rides the same shell:
             // settle undefined → DIRECT degrade below.
             return new DeferredWebSocket(
                 urlStr,
                 rest,
                 async () => {
+                    if (hooksArmed) {
+                        if (state.takeoverGate !== undefined) {
+                            let verdict: GateVerdict;
+                            try {
+                                verdict = await state.takeoverGate(target, undefined, initLike);
+                            } catch (err) {
+                                logHostEvent("error", "[native-client]", `bili-native(ws): takeover gate threw (${err instanceof Error ? err.message : String(err)}) — Codex Responses WebSocket goes DIRECT: ${urlStr}`);
+                                state.onDispatch?.(target, "refused");
+                                return undefined;
+                            }
+                            if (verdict !== true) {
+                                state.onDispatch?.(target, "refused");
+                                return undefined;
+                            }
+                        }
+                        if (state.toolsReady !== undefined) await withTimeout(state.toolsReady, state.readyTimeoutMs ?? 15_000);
+                    }
                     // A pending wsOrigin is the inline bridge booting; bound it
                     // like readyOrigin bounds a bootstrap (20s) so a wedged
                     // cold start cannot hold the construction in CONNECTING
@@ -445,10 +528,20 @@ export function installNativeWebSocketIntercept(initialState: NativeInterceptSta
                         state.onDispatch?.(target, "direct");
                         return undefined;
                     }
+                    if (hooksArmed && state.beforeSend !== undefined) {
+                        try {
+                            await state.beforeSend(target, initLike);
+                        } catch (err) {
+                            logHostEvent("error", "[native-client]", `bili-native(ws): beforeSend hook failed (${err instanceof Error ? err.message : String(err)}) — connection continues (#2399)`);
+                        }
+                    }
                     const rewritten = rewriteCodexResponsesWsUrl(target, settled);
                     noteRoutedOrigin(state, rewritten.replace(/^ws/i, "http"));
                     state.onDispatch?.(rewritten, "rewrite");
-                    return rewritten;
+                    // Merge from the RAW second argument (string/array subprotocol
+                    // forms survive; initLike is the object-only view the hooks see).
+                    const mergedRest = hooksArmed ? restWithInit(rest, mergeWsInitHeaders(rest[0], state.headersFor?.(target))) : rest;
+                    return mergedRest === rest ? { url: rewritten } : { url: rewritten, rest: mergedRest };
                 },
                 constructLive,
             );
