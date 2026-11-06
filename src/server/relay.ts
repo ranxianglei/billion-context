@@ -58,7 +58,7 @@ import { safePrefix, safeSuffix, scrubLoneSurrogatesOnWire } from "../text-safe.
 import { clearUpstreamAlertsForHost, noteCircuitFailFastLog, recordUpstreamAlert, recordUpstreamCircuitFailure, recordUpstreamCircuitSuccess, upstreamCircuitBlockReason, upstreamCircuitLastFailureKind, upstreamCircuitRetryAfterSeconds } from "../upstream-alerts.js";
 import { describeUpstreamFailure, formatUpstreamError, proxyDispatcher, recordUpstreamConnection } from "../upstream-proxy.js";
 import { markExpectedFailFast, withUpstreamFailure, type UpstreamFailureKind } from "../upstream-fail.js";
-import { keyringModel429Scope, noteUpstreamThrottle429, noteUpstreamThrottleResolved, releaseUpstreamThrottleProbe, requestModelFromBody, upstreamThrottleGate } from "../upstream-throttle.js";
+import { keyringModel429Scope, noteUpstreamThrottle429, noteUpstreamThrottleResolved, releaseUpstreamThrottleProbe, requestModelFromBody, type ThrottleLocalReject, upstreamThrottleGate, upstreamThrottlePeekReject } from "../upstream-throttle.js";
 import { applyEstimateCalibration, currentCalibrationFactor, inspectContextOverflow, isMarkerlessOverflowReject, MIN_ASSUMED_WINDOW_TOKENS, normalizeUpstreamOrigin, usageOutputTotal, usageTotals, type ContextOverflowInfo, type WireProtocol } from "../util.js";
 import { billOutputUsage } from "../billing.js";
 import { DUMP_PLAINTEXT_BANNER } from "../dump-banner.js";
@@ -249,6 +249,65 @@ export function armFirstByteWatchdog(o: {
     timer.unref();
     o.signal.addEventListener("abort", () => clearTimeout(timer), { once: true });
     return timer;
+}
+
+// #5795: single source of truth for the local 429/424 hold response — shared by
+// the post-ingest gate below and the pre-ingest fast path in handle.ts so the
+// two sites cannot drift on status/headers/body shape.
+export function answerLocalThrottleReject(
+    res: http.ServerResponse,
+    reject: ThrottleLocalReject,
+    protocol: WireProtocol | null | undefined,
+    streamErrorShape: "protocol" | "completion" | undefined,
+    log: (level: string, msg: string) => void,
+    label?: string,
+): void {
+    log(reject.status === 424 ? "warn" : "debug", `[${label ?? "passthrough"}] [acp-proxy] 429-hold: answered locally with ${reject.status} without egress (#4204)`);
+    if (res.headersSent) {
+        emitStreamError(res, protocol ?? "openai", reject.message, undefined, streamErrorShape);
+        return;
+    }
+    res.writeHead(reject.status, reject.retryAfterSec !== null
+        ? { "content-type": "application/json", "retry-after": String(reject.retryAfterSec) }
+        : { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: { type: "rate_limit_error", code: reject.code, stage: "forward", message: reject.message, retryable: reject.status === 429, ...(reject.model === undefined ? {} : { scope: "model", model: reject.model }) } }));
+}
+
+// #5795: pre-ingest 429-hold fast path. While a hold is active for this
+// origin+credential the send will be answered locally anyway — answering
+// BEFORE prepare skips the O(history) parse/convert/pin cost of a request that
+// will not egress regardless (the held retry storms in the field report cost
+// ~6s of ingest per refused turn on multi-MiB histories). Completes #4204's
+// contract: zero egress while held → also zero ingest while held.
+// Read-only peek: never mints probe tokens or mutates governor state, so the
+// real gate in forwardCaptured keeps owning admission/probe accounting. The
+// conservative edges are deliberate: sub-threshold bodies keep their exact
+// pre-#5795 path (forge/classifier/compact-trigger shapes intercept locally
+// during prepare and must not be pre-empted), and lanes whose credential bili
+// itself overrides (#2336) key holds under the overridden fingerprint which
+// this raw-header peek cannot see — those fall through to the post-ingest gate
+// and are refused there exactly as before.
+export const EARLY_HOLD_GATE_MIN_BYTES = 1024 * 1024;
+
+export function tryAnswerEarlyHold(o: {
+    method?: string;
+    upstreamUrl: string;
+    credHeaders: Record<string, string>;
+    protocol: WireProtocol | null;
+    bodyBytes: number;
+    requestModel?: string;
+    res: http.ServerResponse;
+    streamErrorShape?: "protocol" | "completion";
+    log: (level: string, msg: string) => void;
+    /** Test seam: mirrors the governor's own explicit-now convention. */
+    now?: number;
+}): boolean {
+    if (o.method === "GET" || o.method === "HEAD") return false;
+    if (o.protocol === null || o.bodyBytes < EARLY_HOLD_GATE_MIN_BYTES) return false;
+    const reject = upstreamThrottlePeekReject(o.upstreamUrl, o.credHeaders, o.now ?? Date.now(), o.requestModel);
+    if (reject === undefined) return false;
+    answerLocalThrottleReject(o.res, reject, o.protocol, o.streamErrorShape, o.log, "pre-ingest");
+    return true;
 }
 
 export function forward(...args: Parameters<typeof forwardCaptured>): Promise<void> {
@@ -857,14 +916,7 @@ async function forwardCaptured(
         throttleProbeToken = throttleGate.probeToken;
         const throttleReject = throttleGate.reject;
         if (throttleReject !== undefined) {
-            log(throttleReject.status === 424 ? "warn" : "debug", `[${prepared?.session.id ?? "passthrough"}] [acp-proxy] 429-hold: answered locally with ${throttleReject.status} without egress (#4204)`);
-            if (res.headersSent) emitStreamError(res, prepared?.protocol ?? "openai", throttleReject.message, undefined, opts.streamErrorShape);
-            else {
-                res.writeHead(throttleReject.status, throttleReject.retryAfterSec !== null
-                    ? { "content-type": "application/json", "retry-after": String(throttleReject.retryAfterSec) }
-                    : { "content-type": "application/json" });
-                res.end(JSON.stringify({ error: { type: "rate_limit_error", code: throttleReject.code, stage: "forward", message: throttleReject.message, retryable: throttleReject.status === 429, ...(throttleReject.model === undefined ? {} : { scope: "model", model: throttleReject.model }) } }));
-            }
+            answerLocalThrottleReject(res, throttleReject, prepared?.protocol, opts.streamErrorShape, log, prepared?.session.id);
             return;
         }
     }
