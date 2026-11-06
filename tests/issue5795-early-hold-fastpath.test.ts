@@ -293,12 +293,16 @@ function makeScriptedUpstream(sink: Capture[], first: { status: number; body: st
         req.on("data", (c) => (data += c));
         req.on("end", () => {
             sink.push({ raw: data, headerKeys: Object.keys(req.headers).map((k) => k.toLowerCase()) });
-            if (n === 0 && first !== null) {
+            // Advance on EVERY request: with `first` set, incrementing only on
+            // the 200 path replayed the first response forever, so the
+            // model-scope row's "other model egresses" turn could never see a 200.
+            const isFirst = n === 0 && first !== null;
+            n++;
+            if (isFirst) {
                 res.writeHead(first.status, { "content-type": "application/json" });
                 res.end(first.body);
                 return;
             }
-            n++;
             res.writeHead(200, { "content-type": "application/json" });
             res.end(completionBody());
         });
