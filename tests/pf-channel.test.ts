@@ -109,6 +109,53 @@ test("pf-channel: stamp learning screens input", () => {
     assert.deepEqual(pfChannel.pfRequestHeaders(inH), { "x-bili-pf-count": "7" });
 });
 
+// --- v6 world-id channel (#5643 / #5652 review): slot.v6 learn / echo / retention ---
+
+test("pf-channel: v6 world id — learned once from a 200 response, echoed alongside tail-ids on every later request", () => {
+    const sid = "sid-v6-learn-1";
+    const inH = { [CONVO]: sid };
+    const S = `pf_${"a".repeat(12)}`;
+    pfChannel.pfLearnStamp(inH, 200, new Headers({ "x-bili-pf-seq": "3", "x-bili-pf-session": S }));
+    assert.equal(pfChannel.pfRequestHeaders(inH)["x-bili-pf-session"], S, "the learned world id rides the next request");
+    pfChannel.pfCaptureIds(sid, ["v1", "v2"]);
+    assert.deepEqual(pfChannel.pfRequestHeaders(inH), {
+        "x-bili-pf-count": "3",
+        "x-bili-pf-tail-ids": "v1,v2",
+        "x-bili-pf-session": S,
+    }, "count + tail-ids + world id ride together");
+});
+
+test("pf-channel: v6 world-id screening — malformed forms are not learned, non-2xx never mutates state", () => {
+    const sid = "sid-v6-screen-1";
+    const inH = { [CONVO]: sid };
+    for (const bad of ["pf_short", `PF_${"a".repeat(12)}`, `pf_${"g".repeat(12)}`, "", "pf_", `pf_${"a".repeat(11)}`]) {
+        pfChannel.pfLearnStamp(inH, 200, new Headers({ "x-bili-pf-session": bad }));
+        assert.equal(pfChannel.pfRequestHeaders(inH)["x-bili-pf-session"], undefined, `form ${JSON.stringify(bad)} must not be learned`);
+    }
+    const GOOD = `pf_${"b".repeat(12)}`;
+    pfChannel.pfLearnStamp(inH, 500, new Headers({ "x-bili-pf-seq": "4", "x-bili-pf-session": GOOD }));
+    assert.deepEqual(pfChannel.pfRequestHeaders(inH), {}, "a non-2xx response learns neither the stamp nor the world id");
+});
+
+test("pf-channel: v6 stale retention — slot.v6 is never cleared by later traffic (CURRENT behavior; #5652 review F7(a) owner-decision pending)", () => {
+    const sid = "sid-v6-stale-1";
+    const inH = { [CONVO]: sid };
+    const S1 = `pf_${"c".repeat(12)}`;
+    pfChannel.pfLearnStamp(inH, 200, new Headers({ "x-bili-pf-seq": "2", "x-bili-pf-session": S1 }));
+    // A later v5-style response (stamp only, no session header) must not erase the world
+    pfChannel.pfLearnStamp(inH, 200, new Headers({ "x-bili-pf-seq": "5" }));
+    assert.equal(pfChannel.pfRequestHeaders(inH)["x-bili-pf-session"], S1);
+    // An error response offering a DIFFERENT well-formed sid neither replaces nor clears
+    const S2 = `pf_${"d".repeat(12)}`;
+    pfChannel.pfLearnStamp(inH, 500, new Headers({ "x-bili-pf-session": S2 }));
+    assert.equal(pfChannel.pfRequestHeaders(inH)["x-bili-pf-session"], S1, "S1 persists — the retention this pin nails down");
+    // Why the pin exists: if the server-side disk world goes away (GC / wipe /
+    // migration) while a live host process keeps echoing S1, every turn faults
+    // 400 → parks 60 min → releases → repeats until the host restarts. A fix
+    // like "clear slot.v6 after N consecutive non-2xx" would flip these
+    // assertions deliberately — #5652 review F7(a), owner decision pending.
+});
+
 async function withPfPatch(
     fn: (fetch: typeof globalThis.fetch, sink: RecordedCall[]) => Promise<unknown>,
     extra?: Partial<NativeInterceptState>,

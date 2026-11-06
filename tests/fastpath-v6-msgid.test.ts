@@ -655,3 +655,60 @@ test("archiving a session sweeps its pf planes too (review BUG-2 regression): no
         assert.notEqual(rC.sid, sidA, "a FRESH world mint — the old plane bytes are gone by design");
     } finally { h.cleanup(); }
 });
+
+test("F6 pin: an echoed pf_sid the plane never minted faults loudly with one breaker strike and zero data-plane writes (#5652 review)", () => {
+    const h = makeH("fakeecho");
+    try {
+        const log = makeLog();
+        const b1 = makeBody([{ role: "system", content: SYS }, { role: "user", content: "u1" }]);
+        const r1 = turn("s-fe", "car-fe", b1, ["e0", "e1"], log);
+        assert.equal(r1.outcome.decision, "arm");
+        // Well-formed but never minted: the client-loopback / forged-echo
+        // shape — exactly how mis-attribution starts (#2821 discipline on the
+        // wire). The list contents are known world-A ids; only the ECHO lies.
+        const forged = `pf_${"f".repeat(12)}`;
+        assert.notEqual(r1.sid, forged);
+        const db0 = new DatabaseSync(path.join(h.dir, "index.db"));
+        const countOf = (t: string) => (db0.prepare(`SELECT COUNT(*) AS n FROM ${t}`).get() as { n: number }).n;
+        const rowsBefore = countOf("pf_rows");
+        const logBefore = countOf("pf_log");
+        db0.close();
+        const f = assertFault(() => turn("s-fe", "car-fe", b1, ["e0", "e1"], log, forged), "echo references unknown pf_sid");
+        assert.ok(f.detail.includes(forged), "the refused sid must name itself in the detail");
+        const guard = h.store.getSessionExt("s-fe", "pf:v6-guard") as { faults?: number } | null;
+        assert.equal(guard?.faults, 1, `one strike must land in the breaker, got ${JSON.stringify(guard)}`);
+        const db = new DatabaseSync(path.join(h.dir, "index.db"));
+        try {
+            assert.equal((db.prepare(`SELECT COUNT(*) AS n FROM pf_rows`).get() as { n: number }).n, rowsBefore, "the fault must not register elements");
+            assert.equal((db.prepare(`SELECT COUNT(*) AS n FROM pf_log`).get() as { n: number }).n, logBefore, "the fault must not extend the plane journal");
+        } finally { db.close(); }
+    } finally { h.cleanup(); }
+});
+
+test("F6 pin: one body probing ids from two co-registered worlds under one carrier is refused, never side-chosen (#5652 review)", () => {
+    const h = makeH("multiworld");
+    try {
+        const log = makeLog();
+        const SESS = "s-mw";
+        const CARRIER = "car-mw";
+        const b1 = makeBody([{ role: "system", content: SYS }, { role: "user", content: "u1" }]);
+        // Carrier reuse (the production shape): each all-new-id span re-arms
+        // a fresh world under the SAME sess_raw, so the registry holds both
+        // sids and both row sets resolve through the same probe index.
+        const rA = turn(SESS, CARRIER, b1, ["a0", "a1"], log);
+        assert.equal(rA.outcome.decision, "arm");
+        const rB = turn(SESS, CARRIER, b1, ["b0", "b1"], log);
+        assert.equal(rB.outcome.decision, "arm");
+        assert.notEqual(rB.sid, rA.sid, "distinct all-new spans mint distinct worlds");
+        // The mixed span: T=4 ⇒ width 4, and every id resolves — to a
+        // DIFFERENT world. Design-impossible for a real single conversation
+        // (kernel msgids are globally unique forever), so the lane refuses
+        // instead of choosing a side.
+        const b3 = makeBody([
+            { role: "system", content: SYS }, { role: "user", content: "u1" },
+            { role: "assistant", content: "a1" }, { role: "user", content: "u2" },
+        ]);
+        const f = assertFault(() => turn(SESS, CARRIER, b3, ["a0", "a1", "b0", "b1"], log), "identity span crosses multiple worlds");
+        assert.ok(f.detail.includes(rA.sid!) && f.detail.includes(rB.sid!), `both offending worlds must be named: ${f.detail}`);
+    } finally { h.cleanup(); }
+});
