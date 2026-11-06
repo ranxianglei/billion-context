@@ -712,3 +712,44 @@ test("F6 pin: one body probing ids from two co-registered worlds under one carri
         assert.ok(f.detail.includes(rA.sid!) && f.detail.includes(rB.sid!), `both offending worlds must be named: ${f.detail}`);
     } finally { h.cleanup(); }
 });
+
+test("§7-A② soft-degrade node: sidecar down ⇒ lane disengages SILENTLY, no state moved, recovers on reopen", (t) => {
+    const h = makeH("softdegrade");
+    try {
+        const log = makeLog();
+        // Arm a live world first so the stub is proven against a real armed sid.
+        const b1 = makeBody([{ role: "system", content: SYS }, { role: "user", content: "hello one" }]);
+        const r1 = turn("s-sd", "carrier-sd", b1, ids(2, "-sd"), log);
+        assert.equal(r1.outcome.decision, "arm");
+        assert.ok(r1.sid !== undefined);
+
+        // Close the sidecar from under the lane: pfAvailable() is the §7-A②
+        // soft-degrade node (fastpath-v6.ts) — baseline byte path serves, no 400.
+        const downStore: SessionStoreType = Object.create(h.store);
+        downStore.pfAvailable = () => false;
+        _setStoreForTest(downStore);
+        try {
+            const b2 = makeBody([
+                { role: "system", content: SYS },
+                { role: "user", content: "hello one" },
+                { role: "assistant", content: "hi there" },
+            ]);
+            const req = {
+                headers: {
+                    "x-bili-plugin-conversation": "carrier-sd",
+                    [PF_TAIL_IDS_HEADER]: ids(3, "-sd").map(encodeURIComponent).join(","),
+                    [PF_SESSION_HEADER]: r1.sid!,
+                },
+            } as unknown as http.IncomingMessage;
+            const session = { id: "s-sd" } as unknown as Session;
+            const outcome = evaluateWatermarkV6(b2, req, session, { pluginMode: true, titleGen: false, model: "m" }, log);
+            assert.equal(outcome, null, "soft-degrade must disengage SILENTLY — never a fault, never a fallback 5xx");
+            // Reopen the sidecar: the armed world is untouched and the lane resumes.
+            _setStoreForTest(h.store);
+            const r3 = turn("s-sd", "carrier-sd", b2, ids(3, "-sd"), log, r1.sid!);
+            assert.equal(r3.outcome.decision, "hit", "world must be exactly where the silent turn left it");
+        } finally {
+            _setStoreForTest(h.store);
+        }
+    } finally { h.cleanup(); }
+});
