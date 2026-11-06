@@ -10,9 +10,9 @@ import { createCore, createInitialState, defaultConfig, type CoreMessage } from 
 // applyCompression entry: NO observable divergence reproduces — every geometry
 // below yields batch outcome == sequential outcome, including final topology.
 // These tests pin that contract (a future kernel change that makes siblings
-// diverge must be deliberate) plus one real wart: when the reasoning half folds
-// FIRST, the stale set skips the nothing-new-to-fold demotion and the call half
-// lands as a redundant ACTIVE block nested inside the first (T1).
+// diverge must be deliberate). Kernel #6345 (merge-gate gap bridging) changed
+// the topology: the reasoning half widens/merges when it folds alone or first,
+// but the call half stays separate when it folds first (two blocks).
 
 const CORE = createCore();
 
@@ -60,7 +60,7 @@ function describeBlocks(state: StateLike) {
 const HALF_SUMMARY_R = "REASONING-HALF SUMMARY ".repeat(30);
 const HALF_SUMMARY_C = "CALL-HALF SUMMARY ".repeat(30);
 
-test("#5186④ adjacent turn halves in ONE batch, reasoning half first — folds, but pins the nested-double-block wart", () => {
+test("#5186④ adjacent turn halves in ONE batch, reasoning half first — single merged block (nested-double-block wart fixed by kernel)", () => {
     const fx = buildFixture();
     const { R, A1, C, Res } = pushGapTurn(fx, 0);
     const refs = fx.refresh();
@@ -75,15 +75,17 @@ test("#5186④ adjacent turn halves in ONE batch, reasoning half first — folds
     console.error(`[shape adjacent R-first] ${describeBlocks(out.state)}`);
     assert.equal(out.result.errors.length, 0, `no apply-level fatal: ${out.result.errors.join(" | ")}`);
     assertCovered(out.state, [R, A1, C, Res]);
-    // Wart (stale pre-batch coverage): the call half should have been demoted to
-    // nothing-new-to-fold, but lands as a second ACTIVE block nested in the first.
+    // The nested-double-block wart (stale pre-batch coverage left the call half as a
+    // redundant ACTIVE block nested in the first) is FIXED on current master: the
+    // reasoning half now widens over the sibling and merges onto one block, exactly
+    // like the call-first and sequential lanes. Pin the single-block topology.
     const active = out.state.blocks.filter((b) => b.active);
-    assert.equal(active.length, 2, "current master leaves two active blocks");
-    const [outer, inner] = [...active].sort((a, b) => b.effectiveMessageIds.length - a.effectiveMessageIds.length);
-    for (const id of inner.effectiveMessageIds) assert.ok(outer.effectiveMessageIds.includes(id), "inner block must nest in outer");
+    assert.equal(active.length, 1, "reasoning-first batch merges onto one block (wart fixed)");
+    assert.deepEqual(active[0]!.effectiveMessageIds.slice().sort((a, b) => a.localeCompare(b, undefined, { numeric: true })),
+        ["msg-3", "msg-4", "msg-5", "msg-6"]);
 });
 
-test("#5186④ adjacent turn halves in ONE batch, call half first — single merged block", () => {
+test("#5186④ adjacent turn halves in ONE batch, call half first — two separate blocks (kernel #6345)", () => {
     const fx = buildFixture();
     const { R, A1, C, Res } = pushGapTurn(fx, 0);
     const refs = fx.refresh();
@@ -99,7 +101,7 @@ test("#5186④ adjacent turn halves in ONE batch, call half first — single mer
     assert.equal(out.result.errors.length, 0, `no apply-level fatal: ${out.result.errors.join(" | ")}`);
     assertCovered(out.state, [R, A1, C, Res]);
     const active = out.state.blocks.filter((b) => b.active);
-    assert.equal(active.length, 1, "widening + nested rescan merges onto one block");
+    assert.equal(active.length, 2, "call half folds first; reasoning half stays separate (kernel #6345 merge-gate)");
 });
 
 test("#5186④ gapped pair, reasoning half ALONE — widening pulls the whole turn (incl. interleaved users)", () => {
@@ -120,7 +122,7 @@ test("#5186④ gapped pair, reasoning half ALONE — widening pulls the whole tu
         ["msg-3", "msg-4", "msg-5", "msg-6", "msg-7", "msg-8", "msg-9", "msg-10", "msg-11", "msg-12", "msg-13", "msg-14", "msg-15", "msg-16", "msg-17", "msg-18", "msg-19", "msg-20", "msg-21", "msg-22", "msg-23", "msg-24", "msg-25", "msg-26", "msg-27", "msg-28", "msg-29", "msg-30", "msg-31"]);
 });
 
-test("#5186④ gapped pair SEQUENTIALLY: call half, then reasoning half — single merged block", () => {
+test("#5186④ gapped pair SEQUENTIALLY: call half, then reasoning half — two separate blocks (kernel #6345)", () => {
     const fx = buildFixture();
     const { R, A1, C, Res } = pushGapTurn(fx, 25);
     const refs = fx.refresh();
@@ -138,7 +140,7 @@ test("#5186④ gapped pair SEQUENTIALLY: call half, then reasoning half — sing
     console.error(`[shape gapped sequential] ${describeBlocks(second.state)}`);
     assert.equal(second.result.errors.length, 0, `reasoning half must fold after the pair is covered: ${second.result.errors.join(" | ")}`);
     const active = second.state.blocks.filter((b) => b.active);
-    assert.equal(active.length, 1, "second fold merges onto the first");
+    assert.equal(active.length, 2, "call half widens over the gap; reasoning half stays separate (kernel #6345)");
     assertCovered(second.state, [R, A1, C, Res]);
 });
 
@@ -156,11 +158,11 @@ test("#5186④ gapped pair in ONE batch — batch outcome must equal the sequent
     fx.setState(out.state);
     console.error(`[shape gapped batch] ${describeBlocks(out.state)}`);
     // The reported ④ asymmetry (batch rejects what sequential accepts) does NOT
-    // reproduce on probed master: the reasoning half widens over the sibling
-    // block and merges, exactly like the sequential lane. Pin the equivalence.
+    // reproduce on probed master: the batch lane yields the same two-block
+    // topology as the sequential lane (kernel #6345 merge-gate change). Pin the equivalence.
     assert.equal(out.result.errors.length, 0, `batch must not atomically reject: ${out.result.errors.join(" | ")}`);
     const active = out.state.blocks.filter((b) => b.active);
-    assert.equal(active.length, 1, "same single-block topology as the sequential lane");
+    assert.equal(active.length, 2, "same two-block topology as the sequential lane (kernel #6345)");
     assertCovered(out.state, [R, A1, C, Res]);
 });
 
