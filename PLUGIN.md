@@ -213,6 +213,29 @@ Marker divert (#3248 phase 2 — native extensions): instead of switching the pr
 
 中文集成要点：fork 协议现为 2(服务端同时接受 1)；先读取 manifest 能力及 snapshot，按原文、role、工具身份确认匹配前缀，仅提交该前缀的 orderedMessages，不猜测多模态分支点。被 `compress.protectedTools` 硬排除的消息在两个数组中均为 `"ref": null`（参与顺序与身份、无地址 ref），与其他前缀条目一样逐字提交；ref 合法值仅 `mNNNNN` 字符串或 `null`。父 revision 变化必须重新取快照并重新匹配。子会话使用独立稳定 id，首次请求可追加尚未出站的模型回复，不能重置继承的 refs/blocks。手动摘要使用 snapshot 的 refs 和 `expectedRevision: snapshot.parentRevision` 调用公开 tool；摘要期间历史发生变化时返回 409，不执行旧摘要。状态栏读取 `contextTokens`、`contextTokensSource`、`contextTokensAt`、`model`、`contextLimit`、`contextGeneration`、`sessionId` 与 `sessionRevision`，不得用累计账单 input/cache 冒充有效上下文。手动 compress/decompress 后为独立时间及 generation 的 estimate，不改累计账单或 last-usage 基线；下一次正数 usage 才恢复 usage，零值或缺失 usage 不得复活旧观测。未知来源返回 unavailable，tokens/time/generation 为 null。
 
+### Incremental cache-mark updates
+
+`GET /__bili/plugin/turn` advertises `cacheControlRetouch: true` when the server
+supports changing cache marks on already acknowledged wire messages. This is an
+optional protocol-1 extension: clients MUST NOT send it unless the capability
+is explicitly true. Older servers can ignore unknown envelope fields; an older
+or unadvertised server must receive the original full request when marks move.
+
+A delta can include `retouch: [{ index, message }]`, where `index` is the
+zero-based ordinal in the acknowledged **wire** history and `message` is that
+complete Anthropic wire message with its current block-level `cache_control`.
+Only those decorations may differ. Tool arguments, thinking signatures and
+opaque media bytes must remain identical. The server validates every update
+before applying either the delta or its marks. A changed payload, unknown span,
+or cold canonical returns 409; the client recovers with its existing full-resync
+path. Retouches do not append messages or advance the acknowledgement sequence.
+Their warm wire-to-core span map is rebuilt by a seed; no storage schema change
+is required. The acknowledged boundary still hashes the original wire bytes.
+
+The OpenCode V2 adapter collects acknowledgements from `http.response`, using
+the outgoing request's turn-id header to correlate them. Its request hook can
+therefore send deltas when attached to a proxy without a fetch interceptor.
+
 ## Security
 
 - The tool endpoints sit behind the `/__bili/` admin gate: loopback-only + trusted-origin. A plugin on the same machine as the proxy can call them; nothing else can.
