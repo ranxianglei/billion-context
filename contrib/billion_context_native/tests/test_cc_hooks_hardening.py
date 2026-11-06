@@ -1,6 +1,8 @@
 """Offline CC hook processes: policy capability, incomplete sources and trust."""
 import json
 import os
+import pathlib
+import shutil
 import subprocess
 import sys
 import unittest
@@ -95,6 +97,36 @@ class CCHookHardeningTest(unittest.TestCase):
             self.assertIn(' observe', config[name][0]['hooks'][0]['command'])
         self.assertNotIn('PostCompact', config)
         self.assertNotIn('StopFailure', config)
+
+    def test_hook_launchers_preserve_interpreter_paths_with_spaces(self):
+        if os.name == 'nt':
+            git = shutil.which('git')
+            shell = pathlib.Path(git).parent.parent / 'bin' / 'bash.exe' if git else None
+        else:
+            shell = shutil.which('sh')
+        if not shell or not pathlib.Path(shell).is_file():
+            self.skipTest('Hook commands require a POSIX shell (Git Bash on Windows)')
+        directory = self.root / 'Python environment'
+        directory.mkdir()
+        interpreter = directory / 'python'
+        interpreter.write_text('#!/bin/sh\nprintf "called"; printf "|%s" "$@"; printf "\\n"\n', encoding='utf-8')
+        interpreter.chmod(0o755)
+        env = {**self.env, 'PATH': '', 'RECALL_PYTHON': interpreter.as_posix(),
+               'BILLION_CONTEXT_NATIVE_PYTHON': '/unsupported/interpreter',
+               'CLAUDE_PLUGIN_ROOT': PLUGIN.parent.as_posix()}
+        config = json.loads((PLUGIN.parent / 'hooks' / 'hooks.json').read_text())['hooks']
+        for groups in config.values():
+            for group in groups:
+                for hook in group['hooks']:
+                    with self.subTest(command=hook['command']):
+                        proc = subprocess.run([str(shell), '-c', hook['command']],
+                                              capture_output=True, text=True, env=env, timeout=10)
+                        self.assertEqual(proc.returncode, 0, proc.stderr)
+                        calls = proc.stdout.splitlines()
+                        self.assertEqual(calls[0], 'called|-c|')
+                        self.assertEqual(len(calls), 2)
+                        self.assertTrue(calls[1].startswith('called|-X|utf8|' +
+                                        (PLUGIN / 'hook.py').as_posix() + '|'), calls[1])
 
     def test_replaced_or_mutated_acknowledged_prefix_is_refused(self):
         self.write([user('synthetic original')])
