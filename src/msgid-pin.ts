@@ -44,6 +44,24 @@ export function applyMsgIdPin(msgs: BiliMessage[], ids: string[]): BiliMessage[]
     return msgs.map((m, i) => ({ ...m, id: ids[i] }));
 }
 
+// #5719: the lane resolver's identity input — same degrade-over-mispair
+// discipline as validateMsgIds but WITHOUT the length-equals-messages
+// contract: the fork-exit rung only needs ANY overlap between the incoming
+// ids and a key's recorded ledger, so a short/partial array is still
+// evidence. Absent or malformed → undefined → callers take exactly the
+// pre-#5719 path (strict pinning stays with validateMsgIds' full check).
+export function incomingMsgIdsOf(body: unknown): string[] | undefined {
+    if (typeof body !== "object" || body === null) return undefined;
+    const raw = (body as Record<string, unknown>)[MSG_IDS_BODY_FIELD];
+    if (!Array.isArray(raw) || raw.length === 0) return undefined;
+    for (const v of raw) {
+        if (typeof v !== "string" || v.length === 0 || v.length > MAX_ID_LEN) return undefined;
+        if (v.startsWith(RESERVED_PREFIX)) return undefined;
+        if (/\s|[\u0000-\u001f\u007f]/.test(v)) return undefined;
+    }
+    return raw as string[];
+}
+
 type SeqValidation = { ok: true; seqs: number[] } | { ok: false; reason: string };
 
 /** Strict validation for the seq stamp array: 1-based positive integers,

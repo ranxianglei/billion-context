@@ -26,7 +26,10 @@ import {
 } from "./turn-integrity.js";
 import type { IntegrityPre } from "./turn-integrity.js";
 import { adjustBoundariesForReasoningPairs } from "./reasoning-pairs.js";
-import { adjustBoundariesForToolPairs } from "./tool-pairs.js";
+import {
+  adjustBoundariesForToolPairs,
+  buildToolPairExtremes,
+} from "./tool-pairs.js";
 import type {
   CompressionState,
   CompressionTier,
@@ -157,7 +160,11 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
       }
     }
   }
-  const adjustedIds = applyPairBoundaryAdjustments(resolved, input.messages);
+  const adjustedIds = applyPairBoundaryAdjustments(
+    resolved,
+    input.messages,
+    shared,
+  );
   const skippedCarrierIds = adjustedIds.filter((id) => liveCarrierIds.has(id));
   if (skippedCarrierIds.length > 0) {
     warnings.push(
@@ -552,6 +559,10 @@ export interface ProjectionShared {
   baseProtectedCallIds: Set<string>;
   /** tool-call/tool-result pairing keyed by toolCallId ?? id. */
   pairByCallId: Map<string, [string, string]>;
+  /** Per-toolCallId [lowest, highest] positions over the whole array —
+   *  #5751 id-exact boundary widening. Rebuilding it per unit is the #5337
+   *  quadratic class (U units x O(n)) — hence shared. Immutable. */
+  toolPairExtremes: Map<string, [number, number]>;
   /** Last visible user anchor (drives the #3953 truncation warning note). */
   anchorMessage: CoreMessage | undefined;
   /** Per-message inputs of computeIntegrityWithdrawals (#684 gate). */
@@ -592,6 +603,7 @@ export function buildProjectionShared(
     agedCompressCallIds,
     baseProtectedCallIds,
     pairByCallId: buildPairMap(messages),
+    toolPairExtremes: buildToolPairExtremes(messages),
     anchorMessage: lastUserAnchor(messages, coveredMessageIds(state), config),
     integrityPre: buildIntegrityPre(messages),
   };
@@ -632,6 +644,7 @@ function applyPairBoundaryAdjustments(
     boundaryKind: string;
   },
   messages: CoreMessage[],
+  shared?: ProjectionShared,
 ): string[] {
   if (resolved.boundaryKind === "block") {
     return resolved.messageIds;
@@ -652,6 +665,7 @@ function applyPairBoundaryAdjustments(
       reasoningAdjusted.startIndex,
       reasoningAdjusted.endIndex,
       messages,
+      shared?.toolPairExtremes,
     );
     const changed =
       toolAdjusted.startIndex !== startIndex ||

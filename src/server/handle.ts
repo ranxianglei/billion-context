@@ -74,6 +74,7 @@ import { artifactSeedHit, detectAcpArtifacts } from "./chain-artifacts.js";
 import { piSubagentChannelFallback } from "./pi-subagent-channel.js";
 import { FORCE_TEXT_PROTOCOL } from "./inject.js";
 import { prepareAnthropic } from "./prepare-anthropic.js";
+import { incomingMsgIdsOf } from "../msgid-pin.js";
 import { prepareOpenai } from "./prepare-openai.js";
 import { prepareGoogle, prepareGoogleCountTokens } from "./prepare-google.js";
 import { DUMP_PLAINTEXT_BANNER } from "../dump-banner.js";
@@ -1104,6 +1105,24 @@ async function handleRequest(
                 ? googleSystemText(parsed as GoogleRequestBody)
                 : "";
         const zcodeParentIdentity = responsesIdentity ?? openaiIdentity ?? anthropicIdentity ?? googleIdentity;
+        // #5719: host-stamped message ids riding this request (`biliMsgIds`,
+        // #4491 pipeline). Fed to every persona-order lane as the LAST-RESORT
+        // identity rung: when byte-level evidence was destroyed in the same
+        // turn the system text changed (full compaction ∩ volatile-field
+        // drift), an id overlap proves same-conversation and re-anchors the
+        // raw lane instead of forking a zero-state |sub: child.
+        // undefined = absent → exactly the pre-change path.
+        const inboundMsgIds = incomingMsgIdsOf(parsed);
+        // #5719: the RECORDED side of the msgid identity rung lives in the
+        // UNIFIED STORE — stamped requests pin these very ids onto canonical
+        // message rows (messages.msg_id, #4491), so no parallel JSON ledger
+        // is kept. #5312's view returns the FULL historical id set (live AND
+        // retired rows — retire-don't-delete, #4390), identity-only, no
+        // content hydration. Lazy by contract: resolveSessionOrder invokes
+        // it at most once, and only at a fork exit with non-empty inbound
+        // ids; null = store unavailable → byte-evidence-only path.
+        const storedMsgIdsOf = (rawKey: string): readonly string[] | null =>
+            getStore().unifiedAllMessageIds(rawKey);
         const zcodeMemory = zcodeParentIdentity?.clientProvided
             ? zcodeMemoryConversation(zcodeParentIdentity.value, req.headers)
             : undefined;
@@ -1129,6 +1148,8 @@ async function handleRequest(
                           undefined,
                           undefined,
                           onSessionResolveEvent,
+                          inboundMsgIds,
+                          storedMsgIdsOf,
                       ))
                   : (googleIdentity?.value ?? googleSignal))
             : protocol === "anthropic"
@@ -1161,6 +1182,8 @@ async function handleRequest(
                                undefined,
                                undefined,
                                onSessionResolveEvent,
+                               inboundMsgIds,
+                               storedMsgIdsOf,
                            ))
                      : claudeAnthropicPersonaOrderApplies(req.headers) && opts.subagentSplit !== false
                        && !sideRequestLike && personaSystemText !== ""
@@ -1192,6 +1215,8 @@ async function handleRequest(
                            claudeSubagentLaneTokenOf((parsed as AnthropicRequestBody).messages),
                            anthropicFirstUserFrag((parsed as AnthropicRequestBody).messages),
                            onSessionResolveEvent,
+                           inboundMsgIds,
+                           storedMsgIdsOf,
                          )
                        : anthropicIdentity?.value ?? anthropicSignal)
              : protocol === "openai"
@@ -1204,6 +1229,8 @@ async function handleRequest(
                           undefined,
                           undefined,
                           onSessionResolveEvent,
+                          inboundMsgIds,
+                          storedMsgIdsOf,
                       )
                     : openaiIdentity?.value ?? openaiSignal)
               : codexTurn
@@ -1229,6 +1256,8 @@ async function handleRequest(
                           undefined,
                           undefined,
                           onSessionResolveEvent,
+                          inboundMsgIds,
+                          storedMsgIdsOf,
                       )
                  : opts.stableSystemAnchor && pluginAgentHeader(req.headers) === undefined
                    // #1085: with anchoring on (plain-proxy mode only — see the
@@ -1272,6 +1301,8 @@ async function handleRequest(
                                 undefined,
                                 undefined,
                                 onSessionResolveEvent,
+                                inboundMsgIds,
+                                storedMsgIdsOf,
                           )
                           : (responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader)))
                       : (responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader));
@@ -2087,8 +2118,17 @@ async function handleRequest(
             // an authored answer is bili answering the call, never passing it
             // through. Undecidable shapes (null forge) fall through to the
             // refusal below.
-            const authored = dshAuthoredCompactionEnabled() && session.state.blocks.some((b) => b.active)
-                ? buildDshCompactionForgeBody(protocol as "openai" | "anthropic" | "responses", renderDshAuthoredCheckpoint(session), { inputTokens: Math.max(1, Math.round(inboundBytes / 4)), outputTokens: 0 }, (parsed as { stream?: unknown }).stream === true)
+            const forgeText = dshAuthoredCompactionEnabled() && session.state.blocks.some((b) => b.active)
+                ? renderDshAuthoredCheckpoint(session)
+                : null;
+            // #5811: size the forged usage from the FORGED RESPONSE, not the
+            // replayed envelope — no upstream is contacted on this path, so
+            // prompt_tokens must describe what the host will READ (the
+            // checkpoint), not how much it sent. A replay-sized value crosses
+            // the host's model window at ~window×4 bytes of replay and poisons
+            // every later overflow heuristic that compares usage vs window.
+            const authored = forgeText !== null
+                ? buildDshCompactionForgeBody(protocol as "openai" | "anthropic" | "responses", forgeText, { inputTokens: Math.max(1, estimateCjkTokens(forgeText)), outputTokens: 0 }, (parsed as { stream?: unknown }).stream === true)
                 : null;
             if (authored !== null) {
                 log("info", `[${session.id}] dsh compaction call identified (final user message = COMPACTION_INSTRUCTION, ${inboundMsgs} msgs) — ANSWERED LOCALLY with the bili snapshot (#3733 authored checkpoint): upstream not contacted, dsh records our tagged checkpoint; originals stay recoverable via CCR/export`);
