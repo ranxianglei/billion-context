@@ -111,6 +111,10 @@ export const LIVE_FILES = [
     // (SIGTERM/SIGKILL/clean shutdown). Private mkdtemp homes per lane-arm,
     // probed-free ports re-probed on every restart — no band reuse.
     "tests/issue5631-restart-survival.test.ts",
+    // #5449: spawns one bare `node -e` child purely as a live/dead PID fixture
+    // (like #5046/B's) plus in-process eval workers (like #4762's); binds no
+    // ports — the entry is for the SPAWN_RE tripwire alone
+    "tests/issue5449-offloop-owner-reap.test.ts",
 ];
 
 /** Band width per live file: the zone ladder drifts +1 per EADDRINUSE retry;

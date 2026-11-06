@@ -490,6 +490,14 @@ export interface EngineContext {
     adminCtx: Parameters<typeof handleAdminRoute>[2];
 }
 
+// #7: BILI_PARENT_PID is seeded per-process by the spawning hook. Resolve it
+// once so both creation sites (the engine context and the early watchdog
+// arming below it) agree on what "the spawning owner" means for this process.
+function resolveSpawnOwnerPid(): number | null {
+    const p = Number.parseInt(process.env.BILI_PARENT_PID ?? "", 10);
+    return Number.isInteger(p) && p > 0 && p !== process.pid ? p : null;
+}
+
 export async function createEngineContext(opts: ProxyOptions): Promise<EngineContext> {
     // Configure the tee logger (file + stderr) BEFORE any logging so the very
     // first line (persist status) lands in the file too.
@@ -540,8 +548,7 @@ export async function createEngineContext(opts: ProxyOptions): Promise<EngineCon
     // the first spawner does. Per-server like instanceId above; armed here
     // (before listen) so a racing first registration can never observe an
     // unarmed watchdog.
-    const parentWatchPid = Number.parseInt(process.env.BILI_PARENT_PID ?? "", 10);
-    const initialWatcherPid = Number.isInteger(parentWatchPid) && parentWatchPid > 0 && parentWatchPid !== process.pid ? parentWatchPid : null;
+    const initialWatcherPid = resolveSpawnOwnerPid();
     const proxyWatchers = new Set<number>();
     if (initialWatcherPid !== null) proxyWatchers.add(initialWatcherPid);
     // #3544: last-heartbeat timestamps for watchers that opted in (hb:true on
@@ -673,9 +680,38 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // plugin-injection mode never calls startServer, so the host process can
     // still never trip the self-exit.
     const watchLogFile = configureLogger(opts.logFile ?? defaultLogFile());
+    // #5449: arming precedes engine-context creation (#4762 early-arm window),
+    // where proxyWatchers does not exist yet — resolve the owner pid locally
+    // and hand the worker a ref populated as soon as the context lands.
+    // Pre-listen attaches are impossible (no socket yet), so reading 0 during
+    // that window is sound: a dead spawner mid-startup IS an orphan.
+    const offloopOwnerPid = resolveSpawnOwnerPid();
+    let liveWatchers: Set<number> | undefined;
     armEventLoopWatchdog({
         logFile: watchLogFile,
         version: VERSION,
+        // #5449 off-loop owner-reap axis: the worker probes this pid from its own
+        // event loop, so an orphaned proxy whose loop no longer yields regularly
+        // is reaped ~15-45s after the owner dies instead of holding port + DB
+        // write lock for minutes. Manual `bili start` (no BILI_PARENT_PID) gets
+        // parentPid 0 — axis disabled, zero behavior change.
+        parentPid: offloopOwnerPid,
+        // #7 shared-proxy semantics ride on every beat: the worker only reaps
+        // when NO OTHER owner is attached, so a multi-host proxy dies when the
+        // LAST host exits. The probed spawner itself is excluded from the count:
+        // its death is exactly what the probe measures, and removing it from the
+        // set needs the in-loop reaper — starved by the very wedge this axis
+        // exists for (#5449). Without the exclusion the guard freezes at ≥1 and
+        // the off-loop reap degenerates back into the in-loop path. A wedged
+        // loop freezes the last known value — sound, because attaching during a
+        // wedge needs an HTTP answer.
+        getWatcherCount: () => {
+            const s = liveWatchers;
+            if (!s) return 0;
+            let n = s.size;
+            if (offloopOwnerPid !== null && s.has(offloopOwnerPid)) n -= 1;
+            return n;
+        },
         onSpawnFailure: (err) => logMsg(opts, "warn", `[event-loop-watchdog] could not arm (${String(err)}) — continuing unwatched (#4762)`),
     });
 
@@ -735,6 +771,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
 
     const engine = await createEngineContext(opts);
     const { core, config, log, instanceId, instanceStartedAt, proxyWatchers, watcherLastSeen, initialWatcherPid, adminCtx } = engine;
+    liveWatchers = proxyWatchers;
 
     const dispatch = async (req: http.IncomingMessage, res: http.ServerResponse): Promise<void> => {
         armRequestWatchdog(req, res, log);

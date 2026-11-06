@@ -19,6 +19,18 @@
  * sync slices that complete in seconds to minutes and yield between requests —
  * so the hard threshold is deadlock detection, not load detection.
  *
+ * Second axis (#5449): the same worker probes the SPAWNER'S owner pid off-loop
+ * (`process.kill(pid, 0)` — EPERM counts as alive, #3890 discipline). When the
+ * owner has failed its probe N ticks running, the main loop has been silent ≥
+ * SOFT_WARN_MS (a still-yielding loop reaches its OWN graceful shutdown path
+ * first — this axis only acts where the in-loop reaper cannot), and no other
+ * owner is attached (#7 shared-proxy semantics: die when the LAST owner
+ * exits), the worker exits the process so the spawner respawns onto the freed
+ * port. This closes the orphan window the in-loop watcher cannot close: under
+ * sparse event-loop yields the in-loop reaper's detect→decide chain takes
+ * minutes, while the incident orphan held its port and DB write lock for 33.
+ * A reused pid reads alive, so the probe can miss a reap but never false-trips.
+ *
  * Scope discipline: plugin-injection mode (dist/agent/*) never calls
  * startServer, so a wedged HOST process is never at risk of being killed by
  * this guardrail. Thresholds are deliberately hardcoded — a new config/env
@@ -36,6 +48,12 @@
  * wrote its FATAL line into exactly that dead pipe would wedge ITSELF instead
  * of tripping the exit. try/catch cannot rescue a synchronous blocking write,
  * so the condition has to be structural, not defensive.
+ *
+ * CI rerun trigger (2026-11-07, no behavior change): the only red on this
+ * branch was the documented msgid-lane-flow settle-race load flake (#4599
+ * floor-903 family) — a single stale read right after the #5155 ack/flush
+ * decoupling under CI load; not caused by this diff. This note re-triggers
+ * the matrix.
  */
 import { Worker, type WorkerOptions } from "node:worker_threads";
 
@@ -43,8 +61,13 @@ export const WATCHDOG_HEARTBEAT_MS = 5_000;
 const WATCHDOG_CHECK_INTERVAL_MS = 5_000;
 export const WATCHDOG_SOFT_WARN_MS = 30_000;
 export const WATCHDOG_HARD_TIMEOUT_MS = 5 * 60_000;
+/** Consecutive failed kill-0 probes of the owner before the off-loop axis may
+ *  act (#5449). Mirrors the in-loop watcher's confirm-tick posture (#3890):
+ *  Windows probe errors are transient, one bad read must not kill the proxy. */
+export const WATCHDOG_OWNER_DEAD_CONFIRM_TICKS = 3;
 
 type WatchdogVerdict = "ok" | "warn" | "trip";
+type WatchdogTripReason = "loop-wedge" | "parent-gone";
 
 /** Pure gap→verdict mapping — the worker's tick logic, unit-testable without
  *  spawning anything. `warned` prevents re-warning on every tick. */
@@ -52,6 +75,15 @@ export function watchdogVerdict(gapMs: number, warned: boolean, softWarnMs: numb
     if (gapMs >= hardTimeoutMs) return "trip";
     if (gapMs >= softWarnMs && !warned) return "warn";
     return "ok";
+}
+
+/** Pure predicate for the off-loop owner-reap axis (#5449): true only when ALL
+ *  three hold — the owner failed its kill-0 probe `confirmTicks` times running,
+ *  the main loop has been silent ≥ softWarnMs (a still-yielding loop reaches
+ *  its own graceful shutdown first, so this axis never preempts it), and no
+ *  other owner is attached (#7: die when the LAST owner exits). */
+export function ownerReapVerdict(deadStreak: number, confirmTicks: number, gapMs: number, softWarnMs: number, watcherCount: number): boolean {
+    return deadStreak >= confirmTicks && gapMs >= softWarnMs && watcherCount <= 0;
 }
 
 interface EventLoopWatchdogHandle {
@@ -75,8 +107,16 @@ interface ArmEventLoopWatchdogOptions {
     fatalMode?: "exit" | "report";
     /** Test seam: swap the Worker constructor. */
     spawnWorker?: (code: string, opts: WorkerOptions) => Worker;
-    /** Called (report mode) when the worker trips. */
-    onTrip?: (gapMs: number) => void;
+    /** Owner pid to probe off-loop (#5449): BILI_PARENT_PID on spawned proxies.
+     *  undefined/0 = axis disabled (manual `bili start`) — zero behavior change. */
+    parentPid?: number | null;
+    /** Number of OTHER attached owners — excluding the probed parentPid, whose
+     *  removal from the in-loop set depends on the reaper this axis backstops
+     *  (#5449) — sampled per beat so a wedged loop freezes the last known value
+     *  (#7: reap only when the LAST owner is gone). */
+    getWatcherCount?: () => number;
+    /** Called when the worker trips (report mode). */
+    onTrip?: (gapMs: number, reason?: WatchdogTripReason) => void;
     /** Called once when the worker fails to spawn or dies early. */
     onSpawnFailure?: (err: unknown) => void;
     /** Test seam: pin the TTY verdict so both directions of the stderr gate
@@ -93,14 +133,19 @@ interface WatchdogInitMsg {
     checkIntervalMs: number;
     fatalMode: "exit" | "report";
     stderrTty: boolean;
+    parentPid: number;
+    parentConfirmTicks: number;
+    watcherCount: number;
 }
 interface WatchdogBeatMsg {
     type: "beat";
+    count: number;
 }
 type WatchdogToWorker = WatchdogInitMsg | WatchdogBeatMsg;
 interface WatchdogTripMsg {
     type: "trip";
     gapMs: number;
+    reason?: WatchdogTripReason;
 }
 
 // The worker runs as inline code (eval): dist/index.js is a SINGLE bundled
@@ -119,6 +164,11 @@ const WORKER_CODE = [
     "let lastBeat = Date.now();",
     "let warned = false;",
     "let tripped = false;",
+    "let parentPid = 0;",
+    "let parentConfirmTicks = 3;",
+    "let parentDeadStreak = 0;",
+    "let parentTripped = false;",
+    "let watcherCount = 0;",
     "let timer = null;",
     "let emitStderr = false;",
     "",
@@ -130,6 +180,12 @@ const WORKER_CODE = [
     "",
     "function fmt(ms) {",
     "  return ms >= 1000 ? Math.round(ms / 1000) + \"s\" : ms + \"ms\";",
+    "}",
+    "",
+    // kill-0 liveness probe, #3890 discipline: EPERM means the pid EXISTS but
+    // belongs to someone else — alive. Only ESRCH (and friends) mean gone.
+    "function ownerAlive() {",
+    "  try { process.kill(parentPid, 0); return true; } catch (e) { return e !== null && e.code === \"EPERM\"; }",
     "}",
     "",
     "function line(level, msg) {",
@@ -147,8 +203,20 @@ const WORKER_CODE = [
     "  } else if (v === \"trip\" && !tripped) {",
     "    tripped = true;",
     "    line(\"error\", \"[event-loop-watchdog] FATAL: main event loop silent for \" + fmt(gap) + \" (hard threshold \" + fmt(hardTimeoutMs) + \") — exiting so the spawner can respawn onto the freed port (#4762)\");",
-    "    try { parentPort.postMessage({ type: \"trip\", gapMs: gap }); } catch (e) {}",
+    "    try { parentPort.postMessage({ type: \"trip\", gapMs: gap, reason: \"loop-wedge\" }); } catch (e) {}",
     "    if (fatalMode === \"exit\") process.exit(1);",
+    "  }",
+    // Owner axis (#5449), independent of the loop-gap verdict above: fires only
+    // when ALL of dead-streak / loop-silence / no-other-watchers hold, so a
+    // still-yielding loop always reaches its own graceful shutdown first.
+    "  if (!parentTripped && parentPid > 0) {",
+    "    if (ownerAlive()) { parentDeadStreak = 0; } else { parentDeadStreak++; }",
+    "    if (parentDeadStreak >= parentConfirmTicks && gap >= softWarnMs && watcherCount <= 0) {",
+    "      parentTripped = true;",
+    "      line(\"error\", \"[event-loop-watchdog] FATAL: owner pid \" + parentPid + \" gone (kill-0 x\" + parentConfirmTicks + \" off-loop) with loop silent for \" + fmt(gap) + \" and no other watchers — exiting so the spawner can respawn onto the freed port (#5449)\");",
+    "      try { parentPort.postMessage({ type: \"trip\", gapMs: gap, reason: \"parent-gone\" }); } catch (e) {}",
+    "      if (fatalMode === \"exit\") process.exit(1);",
+    "    }",
     "  }",
     "}",
     "",
@@ -164,11 +232,19 @@ const WORKER_CODE = [
     "    lastBeat = Date.now();",
     "    warned = false;",
     "    tripped = false;",
+    "    parentPid = Number.isInteger(m.parentPid) && m.parentPid > 0 ? m.parentPid : 0;",
+    "    parentConfirmTicks = Number.isInteger(m.parentConfirmTicks) && m.parentConfirmTicks > 0 ? m.parentConfirmTicks : 3;",
+    "    parentDeadStreak = 0;",
+    "    parentTripped = false;",
+    "    watcherCount = Number.isInteger(m.watcherCount) && m.watcherCount >= 0 ? m.watcherCount : 0;",
     "    if (timer === null) timer = setInterval(tick, Math.max(10, Number(m.checkIntervalMs) || 5000));",
     "  } else if (m.type === \"beat\") {",
     "    lastBeat = Date.now();",
     "    warned = false;",
     "    tripped = false;",
+    // count rides every beat; a wedged loop freezes the last known value —
+    // sound, because attaching a new owner during a wedge needs an HTTP answer.
+    "    watcherCount = Number.isInteger(m.count) && m.count >= 0 ? m.count : watcherCount;",
     "  }",
     "});",
 ].join("\n");
@@ -179,6 +255,17 @@ export function armEventLoopWatchdog(opts: ArmEventLoopWatchdogOptions = {}): Ev
     const hardTimeoutMs = opts.hardTimeoutMs ?? WATCHDOG_HARD_TIMEOUT_MS;
     const checkIntervalMs = opts.checkIntervalMs ?? WATCHDOG_CHECK_INTERVAL_MS;
     const fatalMode: "exit" | "report" = opts.fatalMode ?? "exit";
+    // #5449 axis off-switch: non-positive / non-integer pids disable the owner
+    // probe entirely (manual `bili start` passes nothing — zero behavior change).
+    const parentPid = typeof opts.parentPid === "number" && Number.isInteger(opts.parentPid) && opts.parentPid > 0 ? opts.parentPid : 0;
+    const readWatcherCount = (): number => {
+        try {
+            const n = opts.getWatcherCount?.();
+            return typeof n === "number" && Number.isFinite(n) && n >= 0 ? n : 0;
+        } catch {
+            return 0;
+        }
+    };
 
     let worker: Worker;
     try {
@@ -193,7 +280,9 @@ export function armEventLoopWatchdog(opts: ArmEventLoopWatchdogOptions = {}): Ev
     const beatTimer = setInterval(() => {
         if (stopped) return;
         try {
-            worker.postMessage({ type: "beat" } satisfies WatchdogToWorker);
+            // count rides every beat so the worker's last-owner guard sees live
+            // watcher-set changes even between trips (#7 semantics, #5449).
+            worker.postMessage({ type: "beat", count: readWatcherCount() } satisfies WatchdogToWorker);
         } catch {
             // worker already gone — nothing left to heartbeat to.
         }
@@ -206,7 +295,7 @@ export function armEventLoopWatchdog(opts: ArmEventLoopWatchdogOptions = {}): Ev
 
     worker.on("message", (msg: unknown) => {
         const m = msg as Partial<WatchdogTripMsg>;
-        if (m && m.type === "trip" && typeof m.gapMs === "number") opts.onTrip?.(m.gapMs);
+        if (m && m.type === "trip" && typeof m.gapMs === "number") opts.onTrip?.(m.gapMs, m.reason);
     });
     // An unhandled 'error' on a Worker THROWS — swallow it: a dead watchdog
     // worker degrades to "unwatched", never crashes the proxy.
@@ -226,6 +315,9 @@ export function armEventLoopWatchdog(opts: ArmEventLoopWatchdogOptions = {}): Ev
             hardTimeoutMs,
             checkIntervalMs,
             fatalMode,
+            parentPid,
+            parentConfirmTicks: WATCHDOG_OWNER_DEAD_CONFIRM_TICKS,
+            watcherCount: readWatcherCount(),
             stderrTty: opts.stderrTty ?? process.stderr.isTTY === true,
         } satisfies WatchdogInitMsg);
     } catch (err) {
