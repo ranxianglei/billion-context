@@ -151,6 +151,16 @@ export function syncBlocks(
       block.active = false;
       continue;
     }
+    // #5765 retire: the summary is intentionally absent from the view AND the
+    // folded messages are pruned — no presence signal survives by design, so
+    // the stillPresent check below would deactivate the block every turn once
+    // the stale rendered copy leaves the client's history. Deactivation would
+    // let orphan GC reap the stored content and break decompress. Keep it
+    // active: the retired flag is the only switch, acp_restore clears it.
+    if (block.retired) {
+      block.active = true;
+      continue;
+    }
     block.active = true;
     // A block whose raw messages were replaced by its rendered summary
     // (pruned view) is still present — the summary IS the block's visible
