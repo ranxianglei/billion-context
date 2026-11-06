@@ -104,8 +104,10 @@ interface ArmEventLoopWatchdogOptions {
     /** Owner pid to probe off-loop (#5449): BILI_PARENT_PID on spawned proxies.
      *  undefined/0 = axis disabled (manual `bili start`) — zero behavior change. */
     parentPid?: number | null;
-    /** Live size of the in-loop watcher set, sampled per beat so a wedged loop
-     *  freezes the last known value (#7: reap only when the LAST owner is gone). */
+    /** Number of OTHER attached owners — excluding the probed parentPid, whose
+     *  removal from the in-loop set depends on the reaper this axis backstops
+     *  (#5449) — sampled per beat so a wedged loop freezes the last known value
+     *  (#7: reap only when the LAST owner is gone). */
     getWatcherCount?: () => number;
     /** Called when the worker trips (report mode). */
     onTrip?: (gapMs: number, reason?: WatchdogTripReason) => void;
