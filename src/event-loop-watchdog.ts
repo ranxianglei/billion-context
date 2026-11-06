@@ -48,6 +48,12 @@
  * wrote its FATAL line into exactly that dead pipe would wedge ITSELF instead
  * of tripping the exit. try/catch cannot rescue a synchronous blocking write,
  * so the condition has to be structural, not defensive.
+ *
+ * CI rerun trigger (2026-11-07, no behavior change): the only red on this
+ * branch was the documented msgid-lane-flow settle-race load flake (#4599
+ * floor-903 family) — a single stale read right after the #5155 ack/flush
+ * decoupling under CI load; not caused by this diff. This note re-triggers
+ * the matrix.
  */
 import { Worker, type WorkerOptions } from "node:worker_threads";
 
