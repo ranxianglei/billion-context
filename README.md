@@ -397,6 +397,19 @@ tools are called by the model as context grows, gentle growth nudges
 prompt it along the way, and preflight fires as a hard backstop when the input
 alone exceeds the window (#470). Watch it live with `/acp` or the web UI.
 
+**Does compression shrink my client's own conversation file?** No — the most
+common surprise in very long sessions (#5796). Compression shrinks **what is
+sent to the model**: every outgoing request is rebuilt from live blocks plus
+summaries, so the wire stays small however long the conversation runs. The
+client's stored history is user data — bili never rewrites it. On dsh the
+host's auto-compaction is additionally disabled while bili is active (two
+compressors must not fight over one history, #1772/#2474/#3354), so the
+host-side file grows with every turn: each turn takes longer as it grows
+(measured: tens of seconds per turn at ~30K messages, #5796), and the
+practical convergence path is to **start a new session** when it gets heavy.
+The web session list badges sessions at 5,000+ requests (长会话/slow) as a
+reminder that this point has been reached.
+
 **Why does the first compaction wait until ~200k?** Compaction does not
 trigger on absolute window position but on growth intervals: by default the
 first soft compaction fires 50k tokens past the boot content

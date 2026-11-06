@@ -2228,8 +2228,17 @@ async function handleRequest(
             // an authored answer is bili answering the call, never passing it
             // through. Undecidable shapes (null forge) fall through to the
             // refusal below.
-            const authored = dshAuthoredCompactionEnabled() && session.state.blocks.some((b) => b.active)
-                ? buildDshCompactionForgeBody(protocol as "openai" | "anthropic" | "responses", renderDshAuthoredCheckpoint(session), { inputTokens: Math.max(1, Math.round(inboundBytes / 4)), outputTokens: 0 }, (parsed as { stream?: unknown }).stream === true)
+            const forgeText = dshAuthoredCompactionEnabled() && session.state.blocks.some((b) => b.active)
+                ? renderDshAuthoredCheckpoint(session)
+                : null;
+            // #5811: size the forged usage from the FORGED RESPONSE, not the
+            // replayed envelope — no upstream is contacted on this path, so
+            // prompt_tokens must describe what the host will READ (the
+            // checkpoint), not how much it sent. A replay-sized value crosses
+            // the host's model window at ~window×4 bytes of replay and poisons
+            // every later overflow heuristic that compares usage vs window.
+            const authored = forgeText !== null
+                ? buildDshCompactionForgeBody(protocol as "openai" | "anthropic" | "responses", forgeText, { inputTokens: Math.max(1, estimateCjkTokens(forgeText)), outputTokens: 0 }, (parsed as { stream?: unknown }).stream === true)
                 : null;
             if (authored !== null) {
                 log("info", `[${session.id}] dsh compaction call identified (final user message = COMPACTION_INSTRUCTION, ${inboundMsgs} msgs) — ANSWERED LOCALLY with the bili snapshot (#3733 authored checkpoint): upstream not contacted, dsh records our tagged checkpoint; originals stay recoverable via CCR/export`);
