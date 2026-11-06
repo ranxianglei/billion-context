@@ -254,7 +254,7 @@ export function armFirstByteWatchdog(o: {
 // #5795: single source of truth for the local 429/424 hold response — shared by
 // the post-ingest gate below and the pre-ingest fast path in handle.ts so the
 // two sites cannot drift on status/headers/body shape.
-export function answerLocalThrottleReject(
+function answerLocalThrottleReject(
     res: http.ServerResponse,
     reject: ThrottleLocalReject,
     protocol: WireProtocol | null | undefined,
