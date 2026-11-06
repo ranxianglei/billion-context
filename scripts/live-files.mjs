@@ -134,6 +134,10 @@ export const LIVE_FILES = [
     // child binds no port and does no network I/O, so no zone band is needed —
     // the entry is for the tripwire alone, like #3890/#5114
     "tests/integrity-worker-stderr.test.ts",
+    // #5449: spawns one bare `node -e` child purely as a live/dead PID fixture
+    // (like #5046/B's) plus in-process eval workers (like #4762's); binds no
+    // ports — the entry is for the SPAWN_RE tripwire alone
+    "tests/issue5449-offloop-owner-reap.test.ts",
 ];
 
 /** Band width per live file: the zone ladder drifts +1 per EADDRINUSE retry;
