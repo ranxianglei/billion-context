@@ -158,11 +158,14 @@ describe("#5789 tier-2 merge recovery ladder", () => {
     }
   });
 
-  it("block self-range b4..b4: idempotent no-op (zero-width span nests nothing)", () => {
-    // A block referenced against itself resolves to a zero-width span that
-    // nests no block — pre-existing master behavior: an idempotent no-op
-    // success, never an error (a retry here must not arm the breaker or grow
-    // context). Pinned because #5789 touches the adjacent projection paths.
+  it("block self-range b4..b4: idempotent no-op", () => {
+    // A poison block referenced against itself hard-failed on master with
+    // the same turn-integrity refusal as b1..b4 (its own coverage strands
+    // the live k2/l2/r2 conflict and nothing else is left to fold). With
+    // the recovery ladder the projection excludes b4 from consumption and
+    // folds nothing: an idempotent no-op success, never an error (a retry
+    // here must not arm the breaker or grow context). Pinned because #5789
+    // touches the adjacent projection paths.
     const { core, messages, state } = buildUserShapeFixture();
     const before = coveredMessageIds(state);
     const res = core.applyCompression({
