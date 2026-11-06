@@ -5,14 +5,21 @@
 // receipt can then claim "the context is already at its minimum" while tens of
 // thousands of raw tokens keep going upstream. This module answers the one
 // question neither surface could ask before: which contiguous runs of messages
-// are uncovered by any active block, older than the protected recent window,
-// and not in the actionable offer right now?
+// sit outside every active block and the actionable offer right now — older
+// than the protected window, or inside one of its components?
 //
 // Zone exclusion is computed EMPIRICALLY as the diff between two kernel offers
 // (normal config vs preserve-0 config) instead of re-implementing
 // computeProtectedRefs host-side: the kernel's zone rules (#2886 pair symmetry,
 // neverPreserveRecentTools, …) evolve without host notice, and an empirical
-// diff self-maintains. Both passes run on a structuredClone of the session
+// diff self-maintains. The diff therefore only detects the message-window
+// component of the zone: zeroing both preserve knobs also switches off the
+// token rule and the user-anchor rule (kernel Rule 3, coupled to
+// preserveRecentMessages>0), so mass claimed purely by those components reads
+// as zone-hidden — #5780 second repro. The protected-claim estimate below
+// recovers such runs when their head predates the naive claim, and the
+// apply-side screen labels whatever it finds. Both passes run on a
+// structuredClone of the session
 // state — processTurn is not idempotent in its nudge cadence stamps
 // (nudge-inject rides lastNudgeShownTokens down and sets it on shouldInject),
 // so the audit must never touch live state. The whole audit is advisory: any
