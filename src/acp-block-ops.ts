@@ -2,7 +2,7 @@
 // external summary rewrite (acp_rewrite). The kernel owns the state mutation
 // (kernel/src/block-ops.ts); this module parses tool args, formats receipts,
 // and marks the session dirty so the change persists.
-import { parseBlockIdArg, retireBlocks, restoreBlocks, rewriteBlockSummary } from "acp-kernel";
+import { retireBlocks, restoreBlocks, rewriteBlockSummary } from "acp-kernel";
 import { markDirty, type Session } from "./session.js";
 import { toolFail, toolOk, type ProxyToolResult } from "./proxy-tool-result.js";
 
@@ -30,14 +30,14 @@ function opReceipt(toolName: string, outcome: ReturnType<typeof retireBlocks>, v
 export function executeAcpRetire(args: Record<string, unknown>, session: Session): ProxyToolResult {
     const ids = collectBlockIds(args);
     if (ids.length === 0) return toolFail("[acp_retire FAILED: blockId or ids is required]");
-    // Summary chars freed is measured BEFORE the flip so the receipt reports
-    // what actually leaves the resident view.
-    const freedChars = ids.reduce((sum, id) => {
-        const normalized = parseBlockIdArg(id);
-        if (normalized === null) return sum;
-        return sum + (session.state.blocks.find((b) => b.blockId === normalized)?.summary.length ?? 0);
-    }, 0);
     const outcome = retireBlocks(session.state, ids);
+    // Applied ids only, measured after the flip: the summary text survives the
+    // flag change, and counting the raw input list would inflate the receipt
+    // with noop/failed ids.
+    const freedChars = outcome.applied.reduce(
+        (sum, id) => sum + (session.state.blocks.find((b) => b.blockId === id)?.summary.length ?? 0),
+        0,
+    );
     if (outcome.applied.length > 0) markDirty(session);
     return opReceipt("acp_retire", outcome, "retired", `~${freedChars} summary chars leave the resident view; acp_restore({ blockId }) puts one back and decompress/search_context still work on retired blocks`);
 }
@@ -56,27 +56,29 @@ export function executeAcpRewrite(args: Record<string, unknown>, session: Sessio
     if (typeof args.blockId === "string" && typeof args.summary === "string") {
         items.push({ blockId: args.blockId.trim(), summary: args.summary });
     }
+    let skippedItems = 0;
     if (Array.isArray(args.items)) {
         for (const raw of args.items) {
             if (raw && typeof raw === "object" && typeof (raw as Item).blockId === "string" && typeof (raw as Item).summary === "string") {
                 items.push({ blockId: (raw as Item).blockId.trim(), summary: (raw as Item).summary });
+            } else {
+                skippedItems += 1;
             }
         }
     }
     if (items.length === 0) return toolFail('[acp_rewrite FAILED: provide { blockId, summary } or items: [{ blockId, summary }] (batch)]');
     const lines: string[] = [];
     let appliedCount = 0;
-    let failedCount = 0;
     for (const item of items) {
         const res = rewriteBlockSummary(session.state, item.blockId, item.summary);
         if (res.ok) {
             appliedCount += 1;
             lines.push(`${res.blockId} summary replaced (${res.prevChars} → ${res.newChars} chars)`);
         } else {
-            failedCount += 1;
             lines.push(`${res.id}: ${res.reason}`);
         }
     }
+    if (skippedItems > 0) lines.push(`${skippedItems} item(s) skipped — each entry needs string blockId and summary`);
     if (appliedCount > 0) markDirty(session);
     const note = "previous summary kept for rollback; decompress originals are unchanged";
     const text = `[acp_rewrite: ${lines.join("; ")}; ${note}]`;
