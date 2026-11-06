@@ -522,7 +522,9 @@ export function maybeAdoptResume(args: {
     // parent actually rendered (the provider-cached bytes #5609 carries). A
     // markless parent carries nothing: the node writes the child's own mark
     // and the inherited lines stay attr-free, matching the parent's wire.
-    session.state.timestampsHighWaterRefSeq = parent.state.timestampsHighWaterRefSeq;
+    // Guarded: a markless parent must not materialize the key on the child.
+    if (parent.state.timestampsHighWaterRefSeq !== undefined)
+        session.state.timestampsHighWaterRefSeq = parent.state.timestampsHighWaterRefSeq;
     log(
         "info",
         `[resume-inheritance] ${session.id} ${rel}: inherited ${seededRefs} ref(s) up to ${plan.maxRef || "n/a"}${plan.adoptedActive > 0 ? `, ${plan.adoptedActive} block(s) (~${plan.adoptedTokens} tokens)` : ""}; stale citations now resolve to their original messages (#1486)`,

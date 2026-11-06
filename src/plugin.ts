@@ -1605,7 +1605,9 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
             child.state.suppressMintingOnce = true;
             // #5608-C: inherit the parent's visibility mark with its number
             // space (see fork-adoption.ts for the byte-parity rationale).
-            child.state.timestampsHighWaterRefSeq = parent.state.timestampsHighWaterRefSeq;
+            // Guarded: a markless parent must not materialize the key on the child.
+            if (parent.state.timestampsHighWaterRefSeq !== undefined)
+                child.state.timestampsHighWaterRefSeq = parent.state.timestampsHighWaterRefSeq;
             // #2362: inverse of the orphan filter — a dead ref whose message IS
             // in the forked prefix is visible again in the child; refs outside
             // it stay dead (their messages are absent from the child too).

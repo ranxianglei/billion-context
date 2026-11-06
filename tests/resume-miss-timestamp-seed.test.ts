@@ -417,12 +417,16 @@ test("weak-adoption gate: equal-depth replays and truncated subviews start FRESH
         assert.ok(logs.some((l) => l.includes("trunc-resend") && l.includes("truncated shape")), `the truncated resend names its rejection reason ${phase2Diag(dir, logs)}`);
         const eqStamps = getSession("eq-replay").state.tsStamps;
         const truncStamps = getSession("trunc-resend").state.tsStamps;
-        // #5608-B: these FRESH fallbacks re-send OLD history that was NOT
-        // adopted — the first pass must yield honest NULL, not a whole
-        // ledger of fabricated "today" stamps (pre-#5608-B this asserted the
-        // opposite: the very fabrication the ruling removes).
-        assert.ok(!eqStamps || Object.keys(eqStamps).length === 0, `the equal-depth replay arms honest-NULL on its first pass (keys: ${eqStamps ? JSON.stringify(Object.keys(eqStamps)) : "none"}) (#5608-B)`);
-        assert.ok(!truncStamps || Object.keys(truncStamps).length === 0, `the truncated resend arms honest-NULL on its first pass (keys: ${truncStamps ? JSON.stringify(Object.keys(truncStamps)) : "none"}) (#5608-B)`);
+        // #5608-B final stance: unproven identity = brand-new semantics.
+        // These FRESH fallbacks start a NEW conversation as far as bili can
+        // tell (below-threshold / non-deeper shapes are exactly what v3's
+        // gate refuses adoption for), so their ids mint their own fresh
+        // ledger — no inheritance, no arm. (Arming here proved unsound:
+        // cross-lane boilerplate prefixes earn positive overlap against
+        // genuinely new conversations too, and lanes without a kernel pass
+        // could never clear the flag — #554 state deep-equals.)
+        assert.ok(eqStamps && Object.keys(eqStamps).length > 0, `the equal-depth replay mints its OWN fresh ledger like any new conversation (keys: ${eqStamps ? Object.keys(eqStamps).length : "none"}) (#5608-B)`);
+        assert.ok(truncStamps && Object.keys(truncStamps).length > 0, `the truncated resend mints its OWN fresh ledger like any new conversation (keys: ${truncStamps ? Object.keys(truncStamps).length : "none"}) (#5608-B)`);
     } finally {
         setLogCapture(null);
         store2.closeQuietly();

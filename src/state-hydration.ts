@@ -46,8 +46,12 @@ export function mergeState(parsed: CompressionState): CompressionState {
         // rebuilds from disk, and re-arming honest-NULL after a restart would
         // eat genuine first-sight mints of truly new messages; dropping it
         // (the safe default) is what pre-arm states look like anyway.
-        timestampsHighWaterRefSeq:
-            parsed.timestampsHighWaterRefSeq ?? fresh.timestampsHighWaterRefSeq,
+        // Conditional spread: legacy states carry no key and must stay key-free.
+        ...(parsed.timestampsHighWaterRefSeq !== undefined
+            ? { timestampsHighWaterRefSeq: parsed.timestampsHighWaterRefSeq }
+            : fresh.timestampsHighWaterRefSeq !== undefined
+                ? { timestampsHighWaterRefSeq: fresh.timestampsHighWaterRefSeq }
+                : {}),
         terminalStreak: parsed.terminalStreak ?? fresh.terminalStreak,
         nextRuleId: parsed.nextRuleId ?? fresh.nextRuleId,
         // Without this, a restart re-exposes absorbed tool outputs: state
