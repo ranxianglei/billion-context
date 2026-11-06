@@ -546,7 +546,7 @@ function t1Blocks(anchorIds: string[][], summaryChars: number) {
 
 function t2Blocks(count: number, summaryChars: number, effIds: string[]) {
   return Array.from({ length: count }, (_, i) => ({
-    blockId: `t2-${i + 1}`,
+    blockId: `b${1000 + i}`,
     runId: "r2",
     tier: 2 as const,
     summary: "x".repeat(summaryChars),
