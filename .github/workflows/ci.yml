@@ -18,8 +18,14 @@ on:
     # and release lanes fire on their own master-push triggers), so every
     # merge paid full-shard minutes for a signal nobody saw. Master coverage
     # does not lapse: the :03/:33 schedule cron below re-runs the FULL
-    # matrix whenever master moved since the last green scheduled run
-    # (bounded ~30 min window), and PR-side blocking still gates everything
+    # matrix whenever master moved since the last green scheduled run.
+    # That cron is a coarse backstop, not a 30-minute window: its spec is
+    # 48 ticks/day, but measured delivery over 2026-10-16..11-06 was
+    # ~5 runs/day (10.5% of the ticks; median gap 4.8h, worst 10.6h) while
+    # master moved ~128 commits/day, so a landed merge normally gets its
+    # first FULL-matrix verdict hours later, on an already-superseded sha
+    # (2.6% of master commits ever drew a cron run on their own sha, 1.2%
+    # a green one — #5729). PR-side blocking still gates everything
     # pre-merge. Release/bugfix push arms stay — they exist because
     # bot-authored PR checks sit in action_required (#772).
     branches: ["*_release-v*", "bugfix-release/**", "bugfix-v*", bugfix]
@@ -41,7 +47,8 @@ on:
   # Three-layer CI (#3295): PRs pay for the CORE matrix only (master pushes
   # stopped paying in 2026-11-01 — see the push arm above;
   # this cron is now master's standing verifier).
-  # Every 30 minutes this cron asks the plan job whether master moved
+  # Every scheduled tick — nominally 48/day, measured ~5/day delivered,
+  # see the push-arm note above — the plan job asks whether master moved
   # since the last green scheduled run; only then does the FULL matrix run.
   # Lane workflows (e2e/registry/image/theorem/zcode) follow the same gated
   # cron pattern on their own offsets.
