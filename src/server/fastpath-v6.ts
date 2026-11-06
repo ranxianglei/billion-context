@@ -1027,6 +1027,17 @@ export function clearWatermarkV6(sessionId: string): void {
     }
 }
 
+/** Test-only process-death simulation: drop EVERY module-level mirror, not
+ *  just one session's. _resetStoreForTest alone leaves the in-memory planes
+ *  alive, so a "restart" test that skips this hook never exercises disk
+ *  hydration (review #5652 finding: the B1 pin passed vacuously). */
+export function _resetWatermarkV6MirrorsForTest(): void {
+    guardMem.clear();
+    worlds.clear();
+    sessionWorlds.clear();
+    pendingCommits.clear();
+}
+
 /** Introspection for panels/tests: live mirrors of one relay session. */
 export function watermarkV6DebugState(sessionId: string): { liveSids: string[]; worlds: Record<string, { t: number; maxPos: number; seen: number }> } {
     const sids = [...(sessionWorlds.get(sessionId) ?? [])];

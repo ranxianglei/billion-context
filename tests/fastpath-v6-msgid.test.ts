@@ -24,7 +24,7 @@ import type { SessionStore as SessionStoreType } from "../src/persist.ts";
 import { UnifiedShadow } from "../src/storage/shadow.ts";
 import type { Session } from "../src/session.ts";
 import {
-    evaluateWatermarkV6, finalizeWatermarkV6, FastpathV6IdentityFault, watermarkV6DebugState, clearWatermarkV6, PF_SESSION_HEADER,
+    evaluateWatermarkV6, finalizeWatermarkV6, FastpathV6IdentityFault, watermarkV6DebugState, clearWatermarkV6, _resetWatermarkV6MirrorsForTest, PF_SESSION_HEADER,
 } from "../src/server/fastpath-v6.ts";
 import { PF_SEQ_HEADER, PF_TAIL_IDS_HEADER } from "../src/server/fastpath.ts";
 import type { V6Outcome } from "../src/server/fastpath-v6.ts";
@@ -378,6 +378,9 @@ test("§8-16/19 restart hydration: view survives boot cycles across an L1 fold (
         assert.ok(meta !== null && meta.ckpt !== null, "L1 compaction must have fired inside the 40-turn run");
         void meta!.log;
         // --- SIMULATE PROCESS RESTART: drop every mirror, reopen the SAME disk ----
+        // Module-level mirrors OUTSURVIVE _resetStoreForTest — without this
+        // hook the round below hits memory and never exercises hydration.
+        _resetWatermarkV6MirrorsForTest();
         _resetStoreForTest();
         const shadow2 = UnifiedShadow.maybeOpen(h.dir, { BILI_STORAGE_UNIFIED: "shadow" }, (r2) => r2 as never)!;
         const store2 = new SessionStore({ dir: path.join(h.dir, "sessions"), enabled: true, shadow: shadow2 });
@@ -538,5 +541,67 @@ test("restart after compaction: a compacted world echoes cleanly off its ckpt (n
         const r2 = turn("s-co", "car-co", b2, ["c0", "c1", "c2", "c3"], log, sid);
         assert.equal(r2.outcome.decision, "hit", `compacted world must hydrate off the ckpt, log=${JSON.stringify(log.lines.slice(-4))}`);
         assert.equal(r2.headers[PF_SESSION_HEADER], sid, "the SAME world continues — no re-arm, no fault");
+    } finally { h.cleanup(); }
+});
+
+test("fold-then-append across a REAL restart: post-fold log entries clear the ckpt watermark and the folded maxPos advances (review BUG-1 regression)", () => {
+    const h = makeH("foldvis");
+    try {
+        const log = makeLog();
+        const SESS = "s-fv";
+        const CARRIER = "car-fv";
+        // arm T=2 + hit T=3
+        let msgs: Msg[] = [{ role: "system", content: SYS }, { role: "user", content: "u1" }];
+        let r = turn(SESS, CARRIER, makeBody(msgs), ["f0", "f1"], log);
+        assert.equal(r.outcome.decision, "arm");
+        const sid = r.sid!;
+        msgs.push({ role: "assistant", content: "a1" });
+        r = turn(SESS, CARRIER, makeBody(msgs), ["f0", "f1", "f2"], log, sid);
+        assert.equal(r.outcome.decision, "hit");
+        // Fold NOW — exactly what opportunisticCompact does once ≥64 entries
+        // accumulate: checkpoint bound to the CURRENT world state, log wiped
+        // inside the same transaction.
+        const wState = watermarkV6DebugState(SESS).worlds[sid];
+        const metaBefore = h.store.pfMeta(sid);
+        assert.ok(metaBefore !== null && metaBefore.ckpt === null);
+        const foldSeq = metaBefore!.log[metaBefore!.log.length - 1].lsSeq;
+        h.store.pfCompact(sid, { metaJson: JSON.stringify({ v: 1, t: wState.t, maxPos: wState.maxPos }), nextLsSeq: foldSeq });
+        assert.equal(h.store.pfMeta(sid)!.log.length, 0, "the fold absorbed its own log");
+        // Post-fold progress turn (T=4): the new front/geom pair must number
+        // AHEAD of the fold — numbering from MAX(log) alone would re-issue
+        // sequences ≤ ckpt and pfMeta's `ls_seq > ckpt` filter would hide them
+        // forever, freezing the folded world's maxPos one element short.
+        msgs.push({ role: "user", content: "u2" });
+        r = turn(SESS, CARRIER, makeBody(msgs), ["f0", "f1", "f2", "f3"], log, sid);
+        assert.equal(r.outcome.decision, "hit");
+        const metaAfterFoldTurn = h.store.pfMeta(sid)!;
+        assert.ok(metaAfterFoldTurn.log.length >= 2, `the post-fold front/geom pair must be VISIBLE past the ckpt watermark ${foldSeq}, got ${JSON.stringify(metaAfterFoldTurn.log.map((e) => e.lsSeq))}`);
+        assert.ok(metaAfterFoldTurn.log.every((e) => e.lsSeq > foldSeq), `no post-fold sequence may sit at or below the ckpt watermark ${foldSeq}: ${JSON.stringify(metaAfterFoldTurn.log.map((e) => e.lsSeq))}`);
+        // --- REAL process restart: mirrors AND store gone, same disk ---
+        _resetWatermarkV6MirrorsForTest();
+        _resetStoreForTest();
+        const shadow2 = UnifiedShadow.maybeOpen(h.dir, { BILI_STORAGE_UNIFIED: "shadow" }, (r2) => r2 as never)!;
+        const store2 = new SessionStore({ dir: path.join(h.dir, "sessions"), enabled: true, shadow: shadow2 });
+        _setStoreForTest(store2);
+        const log2 = makeLog();
+        // Pure-append turn off the REHYDRATED world: the visible geom entries
+        // must advance maxPos through the post-fold element — otherwise the
+        // next row lands on an occupied ledger position (PK collision → commit
+        // fail-loop) and the served view ships a TRUNCATED prefix.
+        msgs.push({ role: "assistant", content: "a2" });
+        const r5 = turn(SESS, CARRIER, makeBody(msgs), ["f0", "f1", "f2", "f3", "f4"], log2, sid);
+        assert.equal(r5.outcome.decision, "hit", `rehydrated world must ride the lane, log=${JSON.stringify(log2.lines.slice(-4))}`);
+        const view5 = r5.outcome.hit!.view.map((c) => JSON.stringify(c)).join("\n");
+        for (const m of ["u1", "a1", "u2", "a2"]) {
+            assert.ok(view5.includes(JSON.stringify(m)), `view must carry ${JSON.stringify(m)} — no truncated prefix across fold+restart`);
+        }
+        assert.ok(!log2.lines.some((l) => l.msg.includes("degraded") || l.msg.includes("commit failed")),
+            `no finalize hiccup across fold+restart: ${JSON.stringify(log2.lines.slice(-4))}`);
+        assert.equal(watermarkV6DebugState(SESS).worlds[sid].maxPos, 4, "folded maxPos must include the post-fold element");
+        const db = new DatabaseSync(path.join(h.dir, "index.db"));
+        try {
+            const row = db.prepare(`SELECT COUNT(*) AS n FROM pf_rows WHERE sid = ?`).get(sid) as { n: number };
+            assert.equal(row.n, 5, "every element registered exactly once — no collision-driven loss or duplication");
+        } finally { db.close(); }
     } finally { h.cleanup(); }
 });

@@ -2498,8 +2498,19 @@ export class UnifiedStore {
         if (!this.pfAvailable()) throw new Error("pf plane unavailable");
         const nextLsSeq = this.db.transaction((): number => {
             this.pfInsertRows(sid, args.rows);
+            // Continuation must clear BOTH the surviving log tail AND the
+            // checkpoint watermark: a fresh checkpoint ABSORBS its own log
+            // entries (pfCompact deletes them in that tx), so MAX(log) sits
+            // BEHIND ckpt_ls_seq after any fold — numbering from MAX alone
+            // would re-issue sequences ≤ ckpt and those entries would be
+            // invisible to pfMeta forever (post-fold turns silently lost,
+            // stale world.maxPos ⇒ PK collisions on every later progress
+            // turn). Identical guard to pfRenderCommit.
             const start = Number(
-                ((this.db.prepare("SELECT COALESCE(MAX(ls_seq), 0) AS m FROM pf_log WHERE sid = ?").get(sid) as { m: number }).m ?? 0),
+                Math.max(
+                    (this.db.prepare("SELECT COALESCE(MAX(ls_seq), 0) AS m FROM pf_log WHERE sid = ?").get(sid) as { m: number }).m ?? 0,
+                    (this.db.prepare("SELECT ckpt_ls_seq AS n FROM pf_ckpt WHERE sid = ?").get(sid) as { n: number } | undefined)?.n ?? 0,
+                ),
             );
             const insLog = this.db.prepare(
                 "INSERT INTO pf_log (sid, ls_seq, kind, payload_json, born_pos_hi, ts) VALUES (?, ?, ?, ?, ?, ?)",
