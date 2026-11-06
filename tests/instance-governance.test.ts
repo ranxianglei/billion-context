@@ -210,6 +210,7 @@ test("instance registry: registers, warns on a second live instance, prunes dead
             (msg) => warnings.push(msg),
         );
         assert.equal(warnings.length, 1);
+        assert.match(warnings[0], /another bili instance is running/);
         const regDir = path.join(st.dir, "billion-context", "instances");
         const markerNames = () => fs.readdirSync(regDir).filter((n) => n.endsWith(".json")).sort();
         assert.deepEqual(markerNames(), ["a.json", "b.json"]);
@@ -242,6 +243,8 @@ test("instance registry: #394 warning is lane-aware — cross-lane silent, same-
             (msg) => warnings.push(msg),
         );
         assert.equal(warnings.length, 1, "same-lane coexistence warns once (against a)");
+        assert.match(warnings[0], /another bili instance is running/);
+        assert.match(warnings[0], /lane "pi"/);
         registerInstanceAndWarn(
             { instanceId: "d", pid: process.pid, port: 4, origin: "http://127.0.0.1:4", startedAt: 4 },
             (msg) => warnings.push(msg),
@@ -320,6 +323,8 @@ test("instance registry: peer rescan judges by sessions directory like startup d
         assert.deepEqual(fresh, ["b"], "newly-seen live peer reported");
         assert.equal(warnings.length, 0, "proven-apart late peer is informational");
         assert.equal(infos.length, 1);
+        assert.match(infos[0], /appeared while this process was already running/);
+        assert.match(infos[0], /different sessions directories/);
         registerInstanceAndWarn(
             { instanceId: "c", pid: process.pid, port: 3, origin: "http://127.0.0.1:3", startedAt: 3, lane: "pi", sessionsDir: "/s/a" },
             () => {},
@@ -355,6 +360,7 @@ test("instance registry: resident warns once per newly-appearing live peer, reme
         const fresh = warnOnNewPeers({ instanceId: "a" }, seen, (msg) => warnings.push(msg));
         assert.deepEqual(fresh, ["b"], "newly-seen live peer reported");
         assert.equal(warnings.length, 1);
+        assert.match(warnings[0], /appeared while this process was already running/);
         seen.add("b");
         assert.deepEqual(warnOnNewPeers({ instanceId: "a" }, seen, (msg) => warnings.push(msg)), [], "already-warned peer not repeated");
         assert.equal(warnings.length, 1);
@@ -392,6 +398,7 @@ test("instance registry: peer rescan is lane-aware like the startup warning (#24
         );
         const fresh = warnOnNewPeers({ instanceId: "a", lane: "pi" }, new Set<string>(), (m) => warnings.push(m));
         assert.deepEqual(fresh, ["c"], "same-lane late peer warned");
+        assert.match(warnings[0], /lane "pi"/);
     } finally {
         setLogCapture(null);
         st.restore();
@@ -414,6 +421,7 @@ test("instance registry folds a live legacy instances.json entry read-only (no r
             (msg) => warnings.push(msg),
         );
         assert.equal(warnings.length, 1);
+        assert.match(warnings[0], /another bili instance is running/);
         assert.ok(fs.existsSync(path.join(stateRoot, "instances", "new.json")));
         const legacyAfter = JSON.parse(fs.readFileSync(path.join(stateRoot, "instances.json"), "utf8")) as { instances: { instanceId: string }[] };
         assert.deepEqual(legacyAfter.instances.map((e) => e.instanceId), ["legacy"]);
