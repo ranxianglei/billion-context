@@ -1188,16 +1188,11 @@ function createStampTimestampsNode(enabled: boolean): PipelineNode {
       return { ...m, ts };
     });
     if (!changed && !hwmFresh && !suppressed) return io;
-    return {
-      ...io,
-      messages,
-      state: {
-        ...io.state,
-        tsStamps: stamps,
-        timestampsHighWaterRefSeq: hwm,
-        ...(suppressed ? { suppressMintingOnce: undefined } : {}),
-      },
-    };
+    const nextState = { ...io.state, tsStamps: stamps, timestampsHighWaterRefSeq: hwm as number };
+    // Self-clear without a phantom key: omitting the property entirely keeps
+    // key-sensitive state comparisons (and JSON shape) clean.
+    if (suppressed) delete nextState.suppressMintingOnce;
+    return { ...io, messages, state: nextState };
   },
   };
 }
@@ -2515,8 +2510,15 @@ function cloneState(state: CompressionState): CompressionState {
     refLedgerAligned: state.refLedgerAligned,
     // #5608-C/#5608-B: the visibility mark and the honest-NULL arm ride the
     // fold clone with the same contract — losing either re-opens its window.
-    timestampsHighWaterRefSeq: state.timestampsHighWaterRefSeq,
-    suppressMintingOnce: state.suppressMintingOnce,
+    // Conditional spread: legacy states carry neither key and must stay
+    // key-free (an explicit undefined would materialize a phantom key that
+    // every state-shape / state-key digest compares).
+    ...(state.timestampsHighWaterRefSeq !== undefined
+        ? { timestampsHighWaterRefSeq: state.timestampsHighWaterRefSeq }
+        : {}),
+    ...(state.suppressMintingOnce !== undefined
+        ? { suppressMintingOnce: state.suppressMintingOnce }
+        : {}),
   };
 }
 
