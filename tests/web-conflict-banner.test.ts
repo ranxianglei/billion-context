@@ -340,6 +340,24 @@ test("#3235 landed tier: recovered-only ledger stays quiet; a rewrite signal alo
     assert.strictEqual(rewrite.landed, true, "an observed history rewrite is a landed event by definition");
 });
 
+test("#5786 recovered cross-build id re-mint (id-churn-adoption) stays quiet — not a landed signal (#4131/#3642)", () => {
+    const sev = bannerSeverity();
+    // The reporter's exact ledger shape from #5786: one active id-churn-adoption event.
+    const r = sev({ events: 1, kinds: { "id-churn-adoption": 1 }, active: 1 });
+    assert.strictEqual(r.hasConfirmed, false);
+    assert.strictEqual(r.signalN, 0, "a fully-re-anchored adoption is not an unexplained rewrite");
+    assert.strictEqual(r.landed, false, "recovered id churn must not light the alarm banner");
+    assert.strictEqual(r.neutralOnly, true, "adopted-id-churn-only ledger stands down like recovered native-compaction");
+});
+
+test("#5786 mixed ledger: a genuine rewrite still alarms; adopted id-churn adds no false weight", () => {
+    const sev = bannerSeverity();
+    const mixed = sev({ events: 2, kinds: { "id-churn-adoption": 1, "unannounced-rewrite": 1 }, active: 2 });
+    assert.strictEqual(mixed.signalN, 1, "only the rewrite counts as a signal, not the adopted churn");
+    assert.strictEqual(mixed.onKey, "conflict.on_unconfirmed", "the genuine rewrite drives the unconfirmed tier");
+    assert.strictEqual(mixed.landed, true, "an observed history rewrite is a landed event by definition");
+});
+
 test("#3235 banner gate + dismiss + report buttons wired in the client source", () => {
     assert.ok(WEB_CLIENT.includes("sev0.landed && !dismissed"), "gate requires landed-unrecovered evidence and no live dismissal");
     assert.ok(WEB_CLIENT.includes('id="conflicts-dismiss-btn"'), "dismiss button rendered on the banner");
