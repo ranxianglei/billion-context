@@ -1467,6 +1467,76 @@ async function bodyJsonOf(init: RequestInit | undefined): Promise<unknown> {
     }
 }
 
+// #5792: ONE decode+JSON.parse of the request body per request across all
+// pre-send hooks. The same init object threads through maybeRecallBeforeSend /
+// maybeForkAdoptBeforeSend / maybeIncrementalNative, and each used to re-decode
+// + JSON.parse the SAME multi-MiB body independently — OpenAI-wire sessions paid
+// two full parses of the whole history every step before egress, INSIDE the host
+// process (the "host gap" #5792 measured). Memoize on the init identity so the
+// expensive work runs once and every consumer reads the shared result. If a hook
+// swaps init.body mid-chain (fork-adopt, the incremental delta form) the memo
+// invalidates on the changed reference instead of serving a stale parse. The
+// record's wall time + consumer count feed the host-json-parse diagnostic line so
+// a field report can subtract bili's slice from the DSH buildRequest residual.
+interface BodyParseRecord {
+    bodyRef: unknown;
+    promise: Promise<unknown> | undefined;
+    ms: number;
+    consumers: number;
+    inboundBytes: number;
+}
+const bodyParseMemo = new WeakMap<object, BodyParseRecord>();
+// #5792 test seam: genuine decode+parse invocations (a memo hit does not count).
+let bodyParseRealCount = 0;
+
+function inboundBytesOf(raw: unknown): number {
+    if (typeof raw === "string") return raw.length;
+    if (raw instanceof Uint8Array || raw instanceof ArrayBuffer) return raw.byteLength;
+    return 0;
+}
+
+// #5792: shared per-request body parse — undefined on failure (same contract as
+// bodyJsonOf), re-parses only if a consumer swapped init.body since last call.
+async function parsedBodyOnce(init: RequestInit | undefined): Promise<unknown> {
+    if (init === undefined) return undefined;
+    let rec = bodyParseMemo.get(init);
+    if (rec === undefined) {
+        rec = { bodyRef: init.body, promise: undefined, ms: 0, consumers: 0, inboundBytes: inboundBytesOf(init.body) };
+        bodyParseMemo.set(init, rec);
+    }
+    rec.consumers += 1;
+    const cur = init.body;
+    if (rec.promise !== undefined && rec.bodyRef === cur) return rec.promise;
+    const t0 = Date.now();
+    const promise = (async () => {
+        bodyParseRealCount += 1;
+        const value = await bodyJsonOf(init);
+        const r = bodyParseMemo.get(init)!;
+        r.ms = Date.now() - t0;
+        r.inboundBytes = inboundBytesOf(cur);
+        return value;
+    })();
+    rec.bodyRef = cur;
+    rec.promise = promise;
+    return promise;
+}
+
+/** #5792: one concise diagnostic line per request into the shared bili.log
+ * (same file the proxy's `request:` lines land in) so the host-side gap can be
+ * split into bili's parse cost vs the DSH buildRequest residual. Skipped when no
+ * hook parsed this request (tools not ready) — nothing to report. */
+function emitHostParseDiagnostic(init: RequestInit | undefined): void {
+    if (init === undefined) return;
+    const rec = bodyParseMemo.get(init);
+    if (rec === undefined || rec.consumers === 0) return;
+    logHostEvent("info", "[dsh-client]",
+        `bili-native-dsh: host-json-parse=${rec.ms}ms consumers=${rec.consumers} inbound=${rec.inboundBytes}B (#5792)`);
+}
+
+export function _resetBodyParseStatsForTest(): void { bodyParseRealCount = 0; }
+export function _bodyParseStatsForTest(): number { return bodyParseRealCount; }
+export function _parsedBodyOnceForTest(init: RequestInit | undefined): Promise<unknown> { return parsedBodyOnce(init); }
+
 async function maybeForkAdoptBeforeSend(ctx: PluginContext, init: RequestInit | undefined): Promise<void> {
     const child = forkChildVerdict(ctx);
     if (!child.ok) {
@@ -1478,7 +1548,7 @@ async function maybeForkAdoptBeforeSend(ctx: PluginContext, init: RequestInit | 
             `bili-native-dsh: fork adoption for ${child.sid} skipped at the tools-ready gate — this request arrived before bili tool registration completed; later requests can still adopt (#4215)`);
         return;
     }
-    const body = await bodyJsonOf(init);
+    const body = await parsedBodyOnce(init);
     if (body === undefined) {
         noteForkGateOnce(`gate:body-parse:${child.sid}`, "warn",
             `bili-native-dsh: fork adoption for ${child.sid} skipped at the body-parse gate — the request body was not parseable JSON after content-encoding decode, so the replay cannot be projected (#4215/#4829)`);
@@ -1764,7 +1834,7 @@ async function maybeRecallBeforeSend(ctx: PluginContext, url: string, init: Requ
     if (!register.toolsReady || init === undefined) return;
     const attr = attributionOf(ctx);
     if (attr.state === "ok") {
-        const body = await bodyJsonOf(init);
+        const body = await parsedBodyOnce(init);
         if (body === undefined || typeof body !== "object") return;
         const messages = (body as { messages?: unknown }).messages;
         if (!Array.isArray(messages) || messages.length === 0) return;
@@ -2459,6 +2529,7 @@ export function apply(ctx: PluginContext): void {
         await maybeRecallBeforeSend(ctx, url, init);
         await maybeForkAdoptBeforeSend(ctx, init);
         await maybeIncrementalNative(url, init);
+        emitHostParseDiagnostic(init);
     };
     // #3304: the dsh swap stamps the turn id atomically with the body, so the
     // strict shared guard applies — mutated + unrestorable ⇒ refuse locally.
@@ -2497,12 +2568,8 @@ export function apply(ctx: PluginContext): void {
         if (attr.state !== "ok") return;
         const body = init.body;
         if (typeof body !== "string" || body.length === 0) return; // stream/Request bodies ride full resend
-        let parsed: { messages?: unknown; system?: unknown; model?: unknown };
-        try {
-            parsed = JSON.parse(body) as typeof parsed;
-        } catch {
-            return;
-        }
+        const parsed = (await parsedBodyOnce(init)) as { messages?: unknown; system?: unknown; model?: unknown } | undefined;
+        if (parsed === undefined) return;
         if (typeof parsed.model !== "string" || !wireMessagesLookAnthropic(parsed.messages)) return; // anthropic wire only — OpenAI tool shapes (tool_calls / role:"tool") resend full (#3433)
         const base = register.base ?? state.origin;
         if (base === undefined) return;
