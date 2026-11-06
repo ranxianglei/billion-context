@@ -67,7 +67,7 @@ function addBlock(s: Session, blockId: string, opts: { active?: boolean; retired
 const ctxOf = (session: Session) => ({ session }) as unknown as Parameters<typeof executeProxyTool>[2];
 
 test("acp_retire dispatch: batch ids retire, receipt reports freed chars, state flags set", () => {
-    const base = mkdtempSync(path.join(tmpdir(), "issue5767-"));
+    const base = mkdtempSync(path.join(tmpdir(), "issue5765-"));
     const snap = isolate(base);
     try {
         const s = makeSession("t-retire");
@@ -85,7 +85,7 @@ test("acp_retire dispatch: batch ids retire, receipt reports freed chars, state 
 });
 
 test("acp_retire failures: no args / unknown id / malformed id / inactive block", () => {
-    const base = mkdtempSync(path.join(tmpdir(), "issue5767-"));
+    const base = mkdtempSync(path.join(tmpdir(), "issue5765-"));
     const snap = isolate(base);
     try {
         const s = makeSession("t-retire-fail");
@@ -110,7 +110,7 @@ test("acp_retire failures: no args / unknown id / malformed id / inactive block"
 });
 
 test("acp_restore: restores, second call is an honest noop receipt", () => {
-    const base = mkdtempSync(path.join(tmpdir(), "issue5767-"));
+    const base = mkdtempSync(path.join(tmpdir(), "issue5765-"));
     const snap = isolate(base);
     try {
         const s = makeSession("t-restore");
@@ -132,7 +132,7 @@ test("acp_restore: restores, second call is an honest noop receipt", () => {
 });
 
 test("acp_rewrite: single + batch replace in place, previousSummary kept, rejections honest", () => {
-    const base = mkdtempSync(path.join(tmpdir(), "issue5767-"));
+    const base = mkdtempSync(path.join(tmpdir(), "issue5765-"));
     const snap = isolate(base);
     try {
         const s = makeSession("t-rewrite");

@@ -10,7 +10,7 @@ import { retireBlocks, restoreBlocks, rewriteBlockSummary } from "../src/block-o
 import { defaultCountTokens } from "../src/tokenize.js";
 import type { Config, CompressionState, CoreMessage } from "../src/types.js";
 
-// #5765 (mirror #5767) regression: block retire / restore / external summary rewrite.
+// #5765 regression: block retire / restore / external summary rewrite.
 // Retired blocks leave the resident view (no summary anchor injected every turn) while
 // their folded messages stay covered and decompress keeps working; both operations are
 // roll-backable (restore; previousSummary one step deep). Gate discipline: every case
