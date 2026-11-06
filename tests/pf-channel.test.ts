@@ -201,6 +201,57 @@ test("chokepoint: no conversation header ⇒ nothing pf at all", async () => {
     assert.equal(sink[0].headers["x-bili-pf-tail-ids"], undefined);
 });
 
+// #5813 regression: the dsh lane stamps x-bili-plugin-conversation via
+// headersFor, NOT in the client's own request. pfRequestHeaders must see the
+// merged view or it can never find the sid and the count header is silently
+// dropped every turn (the original bug: 3795 evaluations, 0 hits).
+test("chokepoint: conversation header from headersFor (not client) still emits count (#5813)", async () => {
+    const sid = "sid-headersfor-1";
+    const { sink } = await withPfPatch(async (fetch, sinkIn) => {
+        // turn 1: client sends NO conversation header; headersFor provides it
+        await fetch("http://127.0.0.1:8199/v1/chat/completions", {
+            method: "POST",
+            body: "{}",
+        });
+        // simulate the proxy stamping the response
+        pfChannel.pfLearnStamp({ [CONVO]: sid }, 200, new Headers({ "x-bili-pf-seq": "5" }));
+        pfChannel.pfCaptureIds(sid, ["a", "b", "c", "d", "e", "f"]);
+        // turn 2: same shape — client still has no convo header
+        await fetch("http://127.0.0.1:8199/v1/chat/completions", {
+            method: "POST",
+            body: "{}",
+        });
+        assert.equal(sinkIn.length, 2);
+        assert.equal(sinkIn[0].headers["x-bili-pf-count"], undefined, "turn 1 unseeded");
+    }, {
+        headersFor: () => ({ [CONVO]: sid, "x-bili-plugin": "dsh" }),
+    });
+    assert.equal(sink[0].headers[CONVO], sid, "headersFor convo header lands on the wire");
+    assert.equal(sink[1].headers["x-bili-pf-count"], "5", "count emitted from headersFor-provided sid");
+    assert.equal(sink[1].headers["x-bili-pf-tail-ids"], "e,f", "tail-ids ride alongside");
+});
+
+test("chokepoint self-branch: conversation header from headersFor still emits count (#5813)", async () => {
+    const sid = "sid-self-headersfor-1";
+    const { sink } = await withPfPatch(async (fetch, sinkIn) => {
+        await fetch("http://127.0.0.1:41001/v1/chat/completions", {
+            method: "POST",
+            body: "{}",
+        });
+        pfChannel.pfLearnStamp({ [CONVO]: sid }, 200, new Headers({ "x-bili-pf-seq": "3" }));
+        pfChannel.pfCaptureIds(sid, ["x1", "x2", "x3", "x4"]);
+        await fetch("http://127.0.0.1:41001/v1/chat/completions", {
+            method: "POST",
+            body: "{}",
+        });
+        assert.equal(sinkIn[0].headers["x-bili-pf-count"], undefined, "self branch turn 1 unseeded");
+    }, {
+        headersFor: () => ({ [CONVO]: sid, "x-bili-plugin": "dsh" }),
+    });
+    assert.equal(sink[1].headers["x-bili-pf-count"], "3", "self branch emits count from headersFor sid");
+    assert.equal(sink[1].headers["x-bili-pf-tail-ids"], "x3,x4");
+});
+
 // --- openai-chat family resolver (#5403/#5418 protocol-unified capture) ---
 
 test("laneMsgIdsForOpenAiWire: leading system slot gets a position token, rest align to branch", () => {
