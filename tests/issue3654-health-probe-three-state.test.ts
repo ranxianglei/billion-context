@@ -603,6 +603,8 @@ test("B: busy exhaustion whose respawn re-adopts the SAME origin logs re-attach,
     assert.equal(respawnCalls, 1);
     const tail = Buffer.from(fs.readFileSync(logFile)).subarray(before).toString("utf8");
     assert.ok(tail.includes(`liveness: ${HELD} still BUSY after let-go`), `re-attach line names the released origin; got:\n${tail}`);
+    const reattachLine = tail.split("\n").find((l) => l.includes("still BUSY after let-go"));
+    assert.ok(reattachLine?.includes("[warn]"), "the disclosed info→warn level change is pinned on the re-attach line; got:\n" + reattachLine);
     assert.ok(tail.includes("bootstrap returned the SAME origin we just released"), "the operator must see no different endpoint surfaced");
     assert.ok(!tail.includes(`replacement ${HELD} BUSY`), "a same-origin re-attach must not be logged as a replacement");
 });
@@ -625,5 +627,7 @@ test("B: busy exhaustion whose respawn lands a DIFFERENT origin keeps the replac
     assert.equal(respawnCalls, 1);
     const tail = Buffer.from(fs.readFileSync(logFile)).subarray(before).toString("utf8");
     assert.ok(tail.includes(`liveness: replacement ${REPL} BUSY`), `a genuine different-origin adoption keeps its wording; got:\n${tail}`);
+    const replLine = tail.split("\n").find((l) => l.includes(`replacement ${REPL} BUSY`));
+    assert.ok(replLine?.includes("[info]"), "a genuine replacement stays info-level; got:\n" + replLine);
     assert.ok(!tail.includes("still BUSY after let-go"), "no re-attach claim for a different endpoint");
 });
