@@ -1,5 +1,5 @@
 import { fetchWithTimeout } from "./fetch-util.js";
-import { beginProvisionalUpstreamThrottle429, keyringModel429Scope, noteUpstreamThrottleResolved, releaseUpstreamThrottleProbe, requestModelFromBody, reserveUpstreamThrottleClassification, upstreamThrottleGate, type ThrottleClassificationReservation } from "./upstream-throttle.js";
+import { beginProvisionalUpstreamThrottle429, noteUpstreamThrottleResolved, releaseUpstreamThrottleProbe, requestModelFromBody, reserveUpstreamThrottleClassification, throttle429ModelScope, upstreamThrottleGate, type ThrottleClassificationReservation } from "./upstream-throttle.js";
 import { hasCompactionTrigger } from "./codex-compact.js";
 import { proxyDispatcher } from "./upstream-proxy.js";
 import type { WireProtocol } from "./util.js";
@@ -191,7 +191,7 @@ export function makeContinuationRefetch(opts: ContinuationRetryOpts): () => Prom
                     // is the continuation callback's 250ms latency budget.
                     const bodyRead = readSmallThrottleErrorBody(r.response)
                         .then((errorBody) => {
-                            const modelScope = keyringModel429Scope(r.response.status, requestModel, errorBody);
+                            const modelScope = throttle429ModelScope(r.response.status, requestModel, errorBody);
                             settle(modelScope);
                         })
                         .catch(() => {
