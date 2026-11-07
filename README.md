@@ -397,6 +397,19 @@ tools are called by the model as context grows, gentle growth nudges
 prompt it along the way, and preflight fires as a hard backstop when the input
 alone exceeds the window (#470). Watch it live with `/acp` or the web UI.
 
+**Does compression shrink my client's own conversation file?** No — the most
+common surprise in very long sessions (#5796). Compression shrinks **what is
+sent to the model**: every outgoing request is rebuilt from live blocks plus
+summaries, so the wire stays small however long the conversation runs. The
+client's stored history is user data — bili never rewrites it. On dsh the
+host's auto-compaction is additionally disabled while bili is active (two
+compressors must not fight over one history, #1772/#2474/#3354), so the
+host-side file grows with every turn: each turn takes longer as it grows
+(measured: tens of seconds per turn at ~30K messages, #5796), and the
+practical convergence path is to **start a new session** when it gets heavy.
+The web session list badges sessions at 5,000+ requests (长会话/slow) as a
+reminder that this point has been reached.
+
 **Why does the first compaction wait until ~200k?** Compaction does not
 trigger on absolute window position but on growth intervals: by default the
 first soft compaction fires 50k tokens past the boot content
@@ -576,7 +589,7 @@ Knobs people look for first:
 
 Using `bili pi` or the native pi plugin (`bili plugin install pi`) includes built-in subagent support, enabled by default: `acp_delegate`, `acp_delegate_wait`, and `acp_delegate_cancel`. This additional tool surface is specific to pi.
 
-**Keep only one subagent implementation enabled.** If you use the built-in support, remove or disable other pi subagent plugins (for example, `pi-subagents` or a separately installed `billion-context-pi-subagents`) in both user and project settings to avoid overlapping tools, prompts, or behavior. If you prefer another subagent plugin, disable the built-in support instead. A project-scope `pi-subagents` install makes the built-in delegate stand down by default, but a user-scope-only install does not; do not rely on that guard for every installation.
+**Keep only one subagent implementation enabled.** If you use the built-in support, remove or disable other pi subagent plugins (for example, `pi-subagents` or a separately installed `billion-context-pi-subagents`) in both user and project settings to avoid overlapping tools, prompts, or behavior. If you prefer another subagent plugin, disable the built-in support instead. A `pi-subagents` install at either scope (project or user) makes the built-in delegate stand down automatically by default — a user-scope install loads in every project, so the guard applies there too (#5637); set `delegate.forceEnable` to keep `acp_delegate` alongside it.
 
 To disable the built-in subagents while keeping context compression, merge this into `~/.config/billion-context/billion-context.json` (or the file selected by `BILI_CONFIG_FILE`), preserving your other settings:
 

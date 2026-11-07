@@ -7,6 +7,7 @@ import type { ProxyOptions } from "../config.js";
 import { effectivePromptCacheRouting } from "../config.js";
 import { currentCalibrationFactor, hardenOpenaiAssistantContent, systemToUser } from "../util.js";
 import { conversationHeaderSource, resolveRelayAffinityPck } from "../session-id.js";
+import { MSG_IDS_BODY_FIELD, applyMsgIdPin, validateMsgIds } from "../msgid-pin.js";
 import { pluginAgentHeader } from "../plugin.js";
 import { applyReasoningDrop, diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, planReasoningDrop, makeFoldPointReasoningDroppable, reapOrphansLogged, resolveKnownOutputCeiling, runNudgeDecision, stripKernelSummaries, warnDroppedOpenaiParts, warnReasoningPairs, type Prepared } from "../server.js";
 import { yieldToEventLoop } from "../yield-loop.js";
@@ -20,6 +21,7 @@ import { compressBreakerArmed } from "../stream.js";
 import { absorbAbortedTurnGrowth, applyCompactionArchive, coveredRealHistoryIds, detectUnannouncedHistoryRewrite, foldCoverage, markCompactionBoundary, markDirty, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, REWRITE_MIN_INCOMING_TOTAL, snapshotMessages, type PendingRetrieval, type Session } from "../session.js";
 import { carriesDshLocalCompactionSummary, DSH_LOCAL_COMPACTION_MIN_MISSING } from "./dsh-compaction-guard.js";
 import { carriesBiliSnapshotCheckpoint } from "./dsh-authored-compaction.js";
+import { carriesCodexLocalCompactionSummary, CODEX_LOCAL_COMPACTION_MIN_MISSING, isCodexHost } from "../codex-compact.js";
 import { ABSORB_TOOL_NAME, READ_ORIGINAL_IMAGE_TOOL_OPENAI, RULE_TOOL_OPENAI, absorbToolsFor, buildAbsorbSystemPrompt, buildAcpTagsOnlyPrompt, buildCompressSystemPrompt, retrieveToolsFor, withFirstSightDrain, withMarkerIntegrityNote, withMcpDialectNote, withSummaryBudgetNote, withProjectAttribution } from "../compress-tool.js";
 import { absorbToolName, applyAbsorbView, storeEffectiveAbsorb } from "../absorb.js";
 import { adoptContentStore, ccrEnabled, ccrLoopConfig, contentStoreOf, dropRetrievals, imageRescaleToolArmed, pruneExpiredRetrievals, reconcileReloadedRetrievals, renderRetrievalNotes, retrieveToolName, snapshotPendingRetrievals, snapshotRetrievalNotes } from "../store.js";
@@ -64,6 +66,13 @@ export async function prepareOpenai(
 ): Promise<Prepared> {
     const sessionId = session.id;
     const stream = parsed.stream === true;
+    // #5825/#4491 parity: bili-namespaced msgid channel on the openai wire.
+    // Stripped UNCONDITIONALLY — same discipline as the anthropic twin:
+    // the real upstream must never see a field it does not know. Sources:
+    // host body stamps (pi incremental lane) or the #5825 handle-seam
+    // re-stamp of stamped-header/harvested ids.
+    const incomingMsgIds = (parsed as Record<string, unknown>)[MSG_IDS_BODY_FIELD];
+    delete (parsed as Record<string, unknown>)[MSG_IDS_BODY_FIELD];
     // Real wire element count; a watermark hit overrides it with the measured
     // total T (see the #5403/#5418 block below).
     let inboundMessageCount = Array.isArray(parsed.messages) ? parsed.messages.length : 1;
@@ -151,7 +160,8 @@ export async function prepareOpenai(
         // must not feed ids/fingerprints. Capture it and re-inject below —
         // otherwise the proxy would forward payloads without any system.
         const converted = wpHit !== undefined ? { msgs: wpHit.view, systemText: wpHit.systemText } : openaiToCore(parsed);
-        const { msgs, systemText } = converted;
+        let msgs = converted.msgs;
+        let systemText = converted.systemText;
         openaiSystemText = systemText;
         wpSeedSystemText = systemText;
         wpTurnStrip = markerCounts;
@@ -164,6 +174,27 @@ export async function prepareOpenai(
             openaiSystemText = outcome.outbound;
         }
         originalMessages = msgs;
+        // #4491/#5825 parity: pin identity to client-supplied ids (plugin
+        // lanes only — pure proxy traffic has no msgid channel and stays on
+        // snapshot render D), the SAME gated contract as the anthropic twin.
+        // Skipped on watermark hits on purpose: fastpath turns reuse the
+        // seed stash's prefix view whose rows were already pinned when it was
+        // materialized, and the decoded tail window is SHORTER than the
+        // stamped list, so count-parity there would fail by design — pinning
+        // only adds noise.
+        if (wpHit === undefined && pluginMode && incomingMsgIds !== undefined) {
+            if (featureEnabled("pluginLaneServerHistory")) {
+                const v = validateMsgIds(incomingMsgIds, msgs.length);
+                if (v.ok) {
+                    msgs = applyMsgIdPin(msgs, v.ids);
+                    originalMessages = msgs;
+                } else {
+                    log("warn", `[${sessionId}] [msgid] openai-wire pin rejected (${v.reason}) — falling back to content-derived ids (#4491/#5825)`);
+                }
+            } else {
+                log("info", `[${sessionId}] [msgid] openai-wire biliMsgIds present but pluginLaneServerHistory rollout is off for this install — field stripped, ids not pinned (#5825)`);
+            }
+        }
         // #3756 snapshot render: the outbound prefix renders from the unified
         // transcript (server-authoritative, fold-time ids — immune to identity
         // re-mints #3752); only the live tail keeps the client's bytes.
@@ -235,6 +266,35 @@ export async function prepareOpenai(
                 }
             }
         }
+        // #4521: codex's local auto-compaction lands on THIS wire too — a codex
+        // configured for chat completions (wire_api=chat, or a declared
+        // providers[].protocol=openai outranking the URL heuristics, #1909)
+        // never transits /v1/responses, so the #2372 detector there cannot see
+        // it. Before this it fell into the generic unannounced-rewrite path
+        // below: misclassified (unconfirmed-signal tier instead of handled
+        // native-compaction) and WITHOUT the immediate rebase — partially-alive
+        // blocks survived syncBlocks and only the #2695 zombie reap cleaned them
+        // up passes later, leaving a dead-anchor window in between. Same
+        // signature+rebase as the responses lane (#2372): codex identity + its
+        // summary template prefix in resent history + decimated fold coverage →
+        // mark AND rebase NOW so this turn's processTurn seeds fresh refs onto
+        // the compacted view instead of poisoning anchors first (the #2432
+        // death spiral). Runs after the dsh block so a profile matching both
+        // keeps the dsh precedence the responses lane has (dshHit wins there).
+        let codexRebased = false;
+        if (!dshRebased && !isTitleGen && isCodexHost(req.headers) && session.state.blocks.some((b) => b.active)) {
+            const coveredBeforeCodexCompact = coveredRealHistoryIds(session.state.blocks);
+            const codexGap = foldCoverage(coveredBeforeCodexCompact, msgs.map((m) => m.id));
+            if (codexGap && carriesCodexLocalCompactionSummary(msgs)) {
+                const missing = codexGap.expected - codexGap.matched;
+                if (missing >= CODEX_LOCAL_COMPACTION_MIN_MISSING && missing * 2 >= codexGap.expected) {
+                    recordConflict(session, "native-compaction", `codex local auto-compaction: ${missing}/${codexGap.expected} covered id(s) replaced by the compacted history; rebasing ACP state (#2372)`);
+                    log("warn", `[${sessionId}] codex local auto-compaction detected (${codexGap.matched}/${codexGap.expected} covered ids retained) — rebasing ACP state onto the compacted history (#2372/#4521)`);
+                    markNativeCompactionBoundary(session);
+                    codexRebased = reconcileNativeCompactionBoundary(session);
+                }
+            }
+        }
         // [#1921] re-anchor fold coverage onto churned-but-same messages
         // before the #1195 snapshot, so covered ids surviving a client
         // re-serialization stay covered (src/fold-reconcile.ts). The verdict
@@ -259,7 +319,7 @@ export async function prepareOpenai(
         await yieldToEventLoop();
         // #5293: re-anchor the nudge growth reference after a user-aborted turn (no-op otherwise).
         absorbAbortedTurnGrowth(session, tokenCount);
-        const turn = core.processTurn({ messages: renderMsgs, state: session.state, config: loopConfig, tokenCount, renderTags: renderStrategy, contentStore: contentStoreOf(session) });
+        const turn = core.processTurn({ messages: renderMsgs, state: session.state, config: loopConfig, tokenCount, tokenCountSource, renderTags: renderStrategy, contentStore: contentStoreOf(session) });
         session.state = turn.state;
         adoptContentStore(session, turn.contentStore);
         // #4528: split the kernel pass from its post-processing scan passes so
@@ -335,10 +395,11 @@ export async function prepareOpenai(
         // as an announced /compact boundary — syncBlocks above has already
         // deactivated the blocks whose sources left the context. Skipped when
         // the rewrite was just classified as dsh native compaction above
-        // (#2432): it is already recorded as "native-compaction" and rebased —
-        // a second "unannounced-rewrite" entry beside it would present the
-        // substrate destruction as "another compressor fighting you".
-        if (!dshRebased) {
+        // (#2432) or codex local auto-compaction (#2372/#4521): it is already
+        // recorded as "native-compaction" and rebased — a second
+        // "unannounced-rewrite" entry beside it would present the substrate
+        // destruction as "another compressor fighting you".
+        if (!dshRebased && !codexRebased) {
             const rewrite = detectUnannouncedHistoryRewrite(session, knownRefsBefore, msgs.map((m) => m.id), reconcileOutcome);
             if (rewrite.churnExplained) {
                 // #4131: cross-build id re-mint (#3642) — fold-reconcile found every

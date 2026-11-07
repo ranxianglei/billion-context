@@ -721,7 +721,7 @@ const DEGENERATE_FOLD_COVERAGE = 0.8;
  *  serves compress from a volatile in-memory view (session.transient.pluginMessages,
  *  with the fork-only pluginSnapshot as fallback) that is legitimately empty
  *  between model requests once the session object left the resident pool
- *  (512 MiB byte budget, evictOldest) or the process restarted — state (every
+ *  (pool byte budget sessionResidentMaxBytes, evictOldest) or the process restarted — state (every
  *  ref mapping) survives on disk, the message bytes do not (transient is never
  *  persisted; pluginSnapshot persists only for fork sessions, #2077). Feeding
  *  an empty view to the kernel dangles EVERY requested ref, records them all

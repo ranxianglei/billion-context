@@ -99,7 +99,7 @@ import { noteRequest } from "./attach-heartbeat.js";
 import { queryLogLines } from "./web/logs-query.js";
 import { configFile, defaultLogFile, sessionsDir, stateDir } from "./paths.js";
 import { atomicWriteInstanceFile, clearProxyInstanceFile, classifySameLanePeer, entryShape, findPresentUnverifiedSameLaneTwin, findSameLanePredecessor, findVerifiedSameLaneTwin, isPidAlive, listInstances, markPortReleased, probePid, readProxyInstanceFile, registerInstanceAndWarn, resolveOwnFingerprint, sameInstanceShape, SPAWN_FINGERPRINT_ENV, unregisterInstance, warnOnNewPeers, writeSpawnPortLog, type InstanceShape, type PidProbe, type ProxyInstanceFile, type RegistryEntry, type SameLanePeer } from "./instance.js";
-import { createServedMarkerWriter, peerStillContests, reapStaleWriterMarkers, writerMarkerDir, type ServedMarkerWriter } from "./served-markers.js";
+import { createServedMarkerWriter, peerStillContests, processStartMs, reapStaleWriterMarkers, writerMarkerDir, type ServedMarkerWriter } from "./served-markers.js";
 import { recordSplitBrainContest, registerSplitBrainEvidenceCheck } from "./storage/runtime-status.js";
 import { holderProbeOrigin, mayClobberPointer, probeHolderForHint, probeOwnerInfo, resolvePortClaim, verifyEntryOwnsPort } from "./port-owner.js";
 import { armEventLoopWatchdog } from "./event-loop-watchdog.js";
@@ -1347,7 +1347,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         {
             const markerDir = writerMarkerDir(stateDir());
             servedWriter = createServedMarkerWriter(
-                { instanceId, pid: process.pid, origin, version: VERSION, lane: launcherLane },
+                { instanceId, pid: process.pid, origin, version: VERSION, lane: launcherLane, startedAt: processStartMs(Date.now()) },
                 markerDir,
                 (level, msg) => log(level, msg),
                 {
@@ -2551,6 +2551,11 @@ export function warnReasoningPairs(
     if (tracked.fresh.length === 0) return;
     log("warn", `[${sessionId}] reasoning-pair-violated: ${violators.length} assistant tool-call message(s) lack reasoning_content while ${withRc} carry it — strict-echo upstreams (DeepSeek thinking mode) will reject the request; first seen: ${violationNamed(tracked.fresh, tracked.ongoing, tracked.maxRepeat)} (#684/#762/#2864)`);
 }
+
+// [#5688] shared egress repair for adjacent per-turn effort directives —
+// implementation moved to its own leaf module so loop/ can import it without
+// a server.ts import cycle; re-exported here for existing consumers.
+export { dedupeAdjacentOutputConfig } from "./dedupe-adjacent-output-config.js";
 
 /** [#684] Anthropic-wire twin of the openai sentinel, narrowed by [#1327]:
  *  warn only when bili itself lost thinking — a tool_use block that rode an
@@ -4614,11 +4619,15 @@ function formatBytes(n: number): string {
 // bytes are counted with Buffer.byteLength since undici sends UTF-8 bytes even
 // for string bodies (.length would count UTF-16 chars and undercount any
 // non-ASCII injection). Omitted on paths that fail fast without forwarding.
-// #4528: inbound histories past this size pay an O(messages) synchronous scan
-// pass per turn on the main thread, large enough to starve the event loop and
+// #4528: bili's own per-request processing past this WALL-CLOCK budget means
+// synchronous main-thread work large enough to starve the event loop and
 // freeze every endpoint on the same listener — warn so a pathological session
 // shows up in the log instead of being found through a frozen UI.
-const SLOW_SESSION_MSG_WARN = 1000;
+// #5744: the trigger used to be message COUNT (>1000), which cannot separate
+// cost from size — one reporter session saved at 0.8s AND 14.5s at the same
+// ~3k msgs. Wall clock IS the cost; the info line above keeps reporting the
+// count for correlation.
+const SLOW_SESSION_MS_WARN = 1000;
 export function logRequestCost(log: (level: string, msg: string) => void, sessionId: string, msgs: number | null, inboundBytes: number, t0: number, outbound?: string | Buffer): void {
     const ms = Math.max(0, Math.round(performance.now() - t0));
     const outboundField = outbound !== undefined ? `, outbound=${formatBytes(Buffer.byteLength(outbound))}` : "";
@@ -4627,8 +4636,8 @@ export function logRequestCost(log: (level: string, msg: string) => void, sessio
     // #5408: this line is THE observation point — a hot-at-attach session that
     // never produces one is silent compression loss (the incident signature).
     noteRequest(sessionId);
-    if (msgs !== null && msgs > SLOW_SESSION_MSG_WARN) {
-        log("warn", `[${sessionId}] slow-session: ${msgs} msgs / inbound=${formatBytes(inboundBytes)} took local=${ms}ms — per-turn O(messages) synchronous scans are starving the event loop (#4528); consider closing/restarting the session or enabling compression`);
+    if (ms > SLOW_SESSION_MS_WARN) {
+        log("warn", `[${sessionId}] slow-session: ${msgs ?? "?"} msgs / inbound=${formatBytes(inboundBytes)} took local=${ms}ms — synchronous per-turn work is starving the event loop (#4528/#5744); consider closing/restarting the session or enabling compression`);
     }
 }
 
