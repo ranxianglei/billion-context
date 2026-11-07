@@ -458,7 +458,8 @@ export class UnifiedShadow {
             // #4216/#4242: the reap shape (blockContents without their
             // state.blocks entries) is now REPRESENTABLE — planIngest
             // journals the orphan contents into sessions.orphans_json and
-            // the store merges it in the same transaction, while the blocks
+            // the store records it authoritatively in the same transaction
+            // (#5589-C: replacement, not merge), while the blocks
             // stale-sweep drops the reaped rows. The old early-return here
             // froze every subsequent save for such sessions (rows stuck at
             // hours-old state, #4216). Normal ingest for everyone.

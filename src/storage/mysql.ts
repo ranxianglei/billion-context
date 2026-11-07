@@ -712,8 +712,8 @@ export class MysqlBackend implements StorageBackend {
             await c.query(
                 `INSERT INTO sessions (session_id, parent_session_id, fork_point_seq, protocol, label, title, host_title, namespace, origin,
                    status, created_at, updated_at, next_block_id, next_run_id,
-                   meta_json, stats_json, metadata_json, kstate_json, tail_json, ccr_json, last_ingested_seq)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   meta_json, stats_json, metadata_json, kstate_json, tail_json, ccr_json, last_ingested_seq, orphans_json)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                  ON DUPLICATE KEY UPDATE
                    fork_point_seq = IF(parent_session_id IS NULL, VALUES(fork_point_seq), fork_point_seq),
                    parent_session_id = COALESCE(parent_session_id, VALUES(parent_session_id)),
@@ -733,7 +733,8 @@ export class MysqlBackend implements StorageBackend {
                    kstate_json = VALUES(kstate_json),
                    tail_json = VALUES(tail_json),
                    ccr_json = VALUES(ccr_json),
-                   last_ingested_seq = VALUES(last_ingested_seq)`,
+                   last_ingested_seq = VALUES(last_ingested_seq),
+                   orphans_json = VALUES(orphans_json)`,
                 [
                     s.sessionId,
                     s.parentSessionId ?? null,
@@ -756,6 +757,7 @@ export class MysqlBackend implements StorageBackend {
                     s.tailJson,
                     s.ccrJson ?? null,
                     watermark,
+                    s.orphansJson ?? null,
                 ],
             );
             await c.query(
