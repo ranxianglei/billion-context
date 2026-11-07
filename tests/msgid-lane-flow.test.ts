@@ -106,9 +106,18 @@ async function harness(pin: boolean): Promise<Harness> {
         // windows-latest runners (the row read saw the pre-turn snapshot —
         // PR #5644 win22-s2 red). Await the store's landing verdict instead;
         // a false verdict means a save genuinely failed — fail loud there,
-        // not on the missing row below.
+        // not on the missing row below. afterNextFlush resolves on the FIRST
+        // drain event, and under load a stale mid-turn write can still be in
+        // flight when the fresher one gets armed (persist.ts debounce overlap)
+        // — so one verdict can land on the pre-turn snapshot while the full
+        // save sits queued behind it (PR #5791 ubuntu-22 shard red). Every
+        // save for this turn was armed before the ack left, and nothing
+        // re-arms afterwards, so a second drain settles the remainder: an
+        // immediate no-op in the common single-write case.
         const ok = await store.afterNextFlush("conv-msgid-1");
         assert.ok(ok, "debounced row save landed on disk before the row read");
+        const settled = await store.afterNextFlush("conv-msgid-1");
+        assert.ok(settled, "debounced row save landed on disk before the row read");
     };
     return { turn, forwarded, rows, settle, close: async () => { await new Promise<void>((resolve) => proxy.close(() => resolve())); store.closeQuietly(); await new Promise<void>((resolve) => upstream.close(() => resolve())); } };
 }
