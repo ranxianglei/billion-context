@@ -260,7 +260,7 @@ test("#4241: render turn with a host-side history edit — judge reconciles agai
             // non-reporting sessions).
             const tailB = "TAIL_B_".repeat(80);
             _setInvariantJudgeFaultForTest((exitCores: CoreMessage[]) => {
-                const idx = exitCores.findIndex((m) => JSON.stringify(m.content).includes(tailB));
+                const idx = exitCores.findIndex((m) => JSON.stringify(m).includes(tailB));
                 if (idx < 0) throw new Error("teeth: TAIL_B row not found in exit cores");
                 return exitCores.filter((_, i) => i !== idx);
             });
