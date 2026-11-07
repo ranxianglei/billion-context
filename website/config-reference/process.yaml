@@ -447,6 +447,22 @@ entries:
     desc_en: "GC age sweep window in days (#3463, #3901): sessions idle longer than this are archived - one JSON line appended to a single archive log (archive/archive.jsonl under the sessions directory — no per-session file spray), a tombstone row keeps the label and identity, content/media refs are released, and restore is one POST away. 0 disables the age sweep; POST /__bili/storage/gc always runs and takes ?vacuum=full to shrink an existing index.db (auto_vacuum=INCREMENTAL is always on for new writes). The same operations have a CLI layer (#3928): bili storage gc [--days N] [--vacuum full|incremental] [--dry-run], plus bili sessions ls/rm/archive/restore <id> (README 'Storage maintenance CLI' section). Env wins over the file tier."
     desc_zh: "GC 年龄清扫窗口（天，#3463/#3901）：闲置超过该时长的会话被归档 —— 以单行 JSON 追加到单一归档日志（会话目录下的 archive/archive.jsonl——不撒每会话小文件），墓碑行保留标签与身份，释放内容/媒体引用，一条 POST 即可恢复。0 关闭年龄清扫；POST /__bili/storage/gc 始终可用并支持 ?vacuum=full 收缩存量 index.db（新写入始终 auto_vacuum=INCREMENTAL）。同一套操作另有 CLI 层（#3928）：bili storage gc [--days N] [--vacuum full|incremental] [--dry-run]，以及 bili sessions ls/rm/archive/restore <id>（README「存储维护 CLI」一节）。环境变量优先于配置文件层。"
     desc_ja: "日単位の GC 年齢スイープウィンドウ (#3463, #3901): これより長くアイドル状態のセッションはアーカイブされる - 単一のアーカイブログ (セッションディレクトリ配下の archive/archive.jsonl — セッションごとのファイルスプレーなし) に 1 行の JSON が追記され、トombストーン行がラベルとアイデンティティを保持し、コンテンツ/メディア参照が解放され、リストアは 1 つの POST のみで可能。0 は年齢スイープを無効にする; POST /__bili/storage/gc は常に実行され、既存の index.db を縮小するには ?vacuum=full を取る (新規書き込みには常に auto_vacuum=INCREMENTAL が有効)。同じ操作に CLI レイヤーがある (#3928): bili storage gc [--days N] [--vacuum full|incremental] [--dry-run]、および bili sessions ls/rm/archive/restore <id> (README の 'Storage maintenance CLI' セクション)。環境変数がファイル階層より優先される。"
+  - key: storage.snapBase.enabled
+    type: boolean
+    default: "false"
+    kind: file-only
+    audience: user
+    group: process
+    desc_en: "Master flag for the snapshot-table compression plane (#5874, schema v12): arms the four plane tables (l1_world / snap_rows / snap_log / snap_ckpt), the single-transaction commit primitive, and the read-side checksum rebuild (a mismatch permanently wedges that session's plane). Off by default — zero behavior change until set; config-file only, no env tier (#2030 discipline). Wired on the sqlite path only — the mysql backend ignores the flag."
+    desc_zh: "快照表压缩平面的主开关（#5874，schema v12）：启用四张平面表（l1_world / snap_rows / snap_log / snap_ckpt）、单事务提交原语与读侧校验和重建（对不上会永久关死该会话的平面）。默认关闭 —— 不设置时零行为变化；仅配置文件层，无环境变量档（#2030 纪律）。目前只接 sqlite 路径 —— mysql 后端忽略该旗。"
+  - key: storage.snapBase.shadowWrite
+    type: boolean
+    default: "false"
+    kind: file-only
+    audience: user
+    group: process
+    desc_en: "Lane flag for the plane's shadow write, nested under storage.snapBase.enabled (#5874): with both set, every ingest commit additionally derives the plane in its own transaction within the same tick (steady-state delta fast path, otherwise final-state diff; rounds yielding no derivable event write nothing, a crash-dropped round self-heals on the next save). The read side only compares against the legacy rows and never serves them — outbound bytes are unchanged. The lane alone has no effect; rollback = unset (or DROP the four tables + revert user_version)."
+    desc_zh: "平面影子写的车道开关，嵌套在 storage.snapBase.enabled 之下（#5874）：两者都设置后，每次 ingest 提交在同一 tick 内用独立事务推导平面（稳态 delta 走快路，其余走最终态 diff；推导不出事件的轮次不写，crash 丢掉的轮次由下一轮保存自愈）。读侧只与 legacy 行比对、永不对外提供服务 —— 出站字节一个都不变。只开车道不生效；回滚 = 去掉开关（或 DROP 四张表 + user_version 退回）。"
   - key: sessions
     type: object
     default: "{} (all defaults)"
