@@ -321,20 +321,31 @@ export async function findPresentUnverifiedSameLaneTwin(
  *  compares it against the hash of the script it would spawn — so "same
  *  version" is never enough: two installs of 0.1.x with different dist
  *  contents (local rebuild, npm link, unpublished branch) must not be
- *  confused for one codebase. Unreadable file → undefined → never attach. */
-const scriptFingerprints = new Map<string, string>();
+ *  confused for one codebase. Unreadable file → undefined → never attach.
+ *  #5354: the cache follows the FILE, not the process — it is keyed on the
+ *  script's identity (dev/ino/size/mtime/ctime) and re-hashes when that
+ *  changes. The omp plugin lives inside the long-running agent host; a
+ *  path-only cache kept the first build's digest across an in-place update
+ *  (`npm i -g` renames the new dist over the old path), and #4125 then
+ *  stamped every respawned child with it — same code, different registered
+ *  fingerprints, no attach, a laddered lane port per respawn. */
+const scriptFingerprints = new Map<string, { identity: string; digest: string }>();
 export function entryScriptFingerprint(scriptPath?: string): string | undefined {
     if (!scriptPath) return undefined;
     const resolved = path.resolve(scriptPath);
-    const cached = scriptFingerprints.get(resolved);
-    if (cached !== undefined) return cached;
+    let identity: string;
     let digest: string;
     try {
+        const stat = fs.statSync(resolved);
+        identity = `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`;
+        const cached = scriptFingerprints.get(resolved);
+        if (cached?.identity === identity) return cached.digest;
         digest = createHash("sha256").update(fs.readFileSync(resolved)).digest("hex");
     } catch {
+        scriptFingerprints.delete(resolved);
         return undefined;
     }
-    scriptFingerprints.set(resolved, digest);
+    scriptFingerprints.set(resolved, { identity, digest });
     return digest;
 }
 
