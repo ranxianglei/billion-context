@@ -358,10 +358,10 @@ test("#5698 (G): tier-3 condense escalates ahead of T1/T2 while stalled", () => 
   const preDecision = {
     ...state,
     blocks: [
-      ...state.blocks,
+      ...state.blocks.map((block) => ({ ...block, active: false })),
       {
         ...t1,
-        blockId: "bT3",
+        blockId: "b2",
         tier: 2 as const,
         summary: "y".repeat(40_000),
         directMessageIds: [],

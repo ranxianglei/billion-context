@@ -153,7 +153,7 @@ test("pressure: EMERGENCY with only micro T3 pending (120 tokens) is suppressed 
     ...state,
     blocks: [
       {
-        blockId: "t2-1",
+        blockId: "b1",
         runId: "r2",
         tier: 2 as const,
         summary: "x".repeat(480),
