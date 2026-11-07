@@ -167,17 +167,17 @@ export interface BlockRow {
     endSeq: number;
     startRef: number | null;
     endRef: number | null;
-            tier: number;
-            /** JSON of the full BlockView {text, count}. */
-            summary: string;
-            /** #5744: sha256(summary) computed by the planner — lets ingest
-             *  compare against the stored row BEFORE any CAS op, so an
-             *  unchanged block costs neither a re-hash nor a refcount dance. */
-            summaryHash: string;
-            /** JSON of the one-line BlockView, or null (legacy #401 collapse). */
-            one: string | null;
-            /** #5744: sha256(one), or null with `one`. */
-            oneHash: string | null;
+    tier: number;
+    /** JSON of the full BlockView {text, count}. */
+    summary: string;
+    /** #5744: sha256(summary) computed by the planner — lets ingest
+     *  compare against the stored row BEFORE any CAS op, so an
+     *  unchanged block costs neither a re-hash nor a refcount dance. */
+    summaryHash: string;
+    /** JSON of the one-line BlockView, or null (legacy #401 collapse). */
+    one: string | null;
+    /** #5744: sha256(one), or null with `one`. */
+    oneHash: string | null;
     supersedesBlockId: string | null;
     active: boolean;
     createdAt: number;
