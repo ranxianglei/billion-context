@@ -217,10 +217,34 @@ function scanRequestModel(body: string | Uint8Array): string | undefined {
     return undefined;
 }
 
+/** #5865-P2 (throttle review F1): the pre-ingest early-hold gate (handle.ts)
+ *  and the full 429 gate (relay.ts) both need the top-level "model" of the
+ *  SAME request body; walking the multi-MiB document twice per request
+ *  (~1 ms/MiB each) was pure overhead on every proxied POST. Callers that
+ *  share one request-scoped host object (the IncomingMessage) pass it as
+ *  `cacheHost`; the first scan memoizes {body identity, model} on it and the
+ *  second gate returns the memoized model without re-walking. Identity-
+ *  checked on the body itself, so a rewritten/re-encoded body just re-scans
+ *  (correctness before caching). */
+const bodyModelMemo = new WeakMap<object, { body: string | Uint8Array; model: string | undefined }>();
+/** Test surface (resetSessionOrderForTest precedent): count of real scans —
+ *  pins "one scan, two consumers" without a perf harness. */
+let requestModelScanCount = 0;
+export function requestModelScanCountForTest(): number {
+    return requestModelScanCount;
+}
+
 /** Read the top-level request model without materializing a large passthrough body. */
-export function requestModelFromBody(body: string | Uint8Array): string | undefined {
+export function requestModelFromBody(body: string | Uint8Array, cacheHost?: object): string | undefined {
+    if (cacheHost !== undefined) {
+        const memo = bodyModelMemo.get(cacheHost);
+        if (memo !== undefined && memo.body === body) return memo.model;
+    }
+    requestModelScanCount++;
     const model = scanRequestModel(body);
-    return typeof model === "string" && model.length > 0 ? model : undefined;
+    const out = typeof model === "string" && model.length > 0 ? model : undefined;
+    if (cacheHost !== undefined) bodyModelMemo.set(cacheHost, { body, model: out });
+    return out;
 }
 
 /**
