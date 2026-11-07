@@ -121,7 +121,10 @@ export interface ProcessTurnInput {
    * (default on) an ESTIMATE reading never arms the pressure band outright —
    * the injection is deferred one round until a usage-grade reading lands,
    * which costs nothing in practice (the next request carries the report).
-   * Omit for legacy behavior (guard off). Non-pressure tiers are unaffected.
+   * The #5865 backstop bounds that deferral to nudge.maxEstimateHoldRounds
+   * (default 2) consecutive estimate rounds so a backend that NEVER reports
+   * usage cannot starve its pressure nudges forever. Omit for legacy behavior
+   * (guard off). Non-pressure tiers are unaffected.
    */
   tokenCountSource?: "usage" | "estimate";
   /**
@@ -2083,14 +2086,33 @@ function decideNudge(input: NudgeInput): NudgeDecision {
   // bytes the rewrite view is about to drop — observed ~3x billed), and
   // firing EMERGENCY/OVER-LIMIT rewrites keyed to that meter destroys content
   // the bill never saw and burns the prefix cache. Deferring the pressure
-  // action costs at most one round: the very next request carries a fresh
-  // billing report (or a provenance-stable anchor). Billed readings ("usage")
-  // and legacy callers (source omitted) keep byte-identical behavior; opt out
-  // via nudge.requireUsageSampleForPressure = false.
+  // action costs at most one round on reporting backends: the very next
+  // request carries a fresh billing report (or a provenance-stable anchor).
+  // Billed readings ("usage") and legacy callers (source omitted) keep
+  // byte-identical behavior; opt out via nudge.requireUsageSampleForPressure
+  // = false.
+  // #5865 estimate-hold backstop: "at most one round" only holds while the
+  // upstream reports usage. A backend that NEVER does (anonymous zero-
+  // baseline / silent-backend sessions, #728/#553 — where the local estimate
+  // is the ONLY pressure signal) would otherwise be deferred forever, one
+  // estimate round after another. Track the consecutive-estimate streak in
+  // NudgeState and stop deferring once it exceeds nudge.maxEstimateHoldRounds
+  // (default 2): the double-ghost windows the guard exists for stay covered,
+  // and worst-case starvation is capped at two missed opportunities.
+  const estimateHoldStreak =
+    input.tokenCountSource === "estimate"
+      ? (state.nudge.estimateHoldStreak ?? 0) + 1
+      : 0;
+  state.nudge.estimateHoldStreak = estimateHoldStreak > 0 ? estimateHoldStreak : undefined;
+  const maxEstimateHoldRounds = Math.max(
+    0,
+    Math.floor(config.nudge.maxEstimateHoldRounds ?? 2),
+  );
   const pressureDeferredNoSample =
     pressure &&
     input.tokenCountSource === "estimate" &&
-    config.nudge.requireUsageSampleForPressure !== false;
+    config.nudge.requireUsageSampleForPressure !== false &&
+    estimateHoldStreak <= maxEstimateHoldRounds;
 
   const baseline = state.nudge.lastPerMessageNudgeTokens;
   const hadPendingNudge = state.nudge.lastNudgeShownTokens > 0;
@@ -2345,7 +2367,7 @@ function decideNudge(input: NudgeInput): NudgeDecision {
     reason = injectedReason;
   } else if (pressure && pressureDeferredNoSample) {
     const label = emergencyOverride ? "EMERGENCY" : "OVER-LIMIT";
-    reason = `${label}: usage ${Math.round(usage * 100)}% but the meter reading is estimate-grade (no billing sample landed this cycle, max pending ${maxPending}) — pressure injection deferred one round until a usage-grade reading decides; hard-overflow backstop unaffected`;
+    reason = `${label}: usage ${Math.round(usage * 100)}% but the meter reading is estimate-grade (no billing sample landed this cycle, max pending ${maxPending}) — pressure injection held (estimate round ${estimateHoldStreak} of ${maxEstimateHoldRounds}) until a usage-grade reading decides or the estimate-hold backstop elapses; hard-overflow backstop unaffected`;
   } else if (pressure) {
     const label = emergencyOverride ? "EMERGENCY" : "OVER-LIMIT";
     reason =
@@ -2420,6 +2442,7 @@ function decideNudge(input: NudgeInput): NudgeDecision {
     countTokens,
   );
 
+
   return {
     shouldInject,
     reason,
@@ -2440,6 +2463,7 @@ function decideNudge(input: NudgeInput): NudgeDecision {
       overLimit: overLimit ? 1 : 0,
       emergencyOverride: emergencyOverride ? 1 : 0,
       pressureDeferredNoSample: pressureDeferredNoSample ? 1 : 0,
+      estimateHoldStreak,
       minPressureBenefit,
       pendingT1: tiers[1]!.pending,
       pendingT2: tiers[2]!.pending,
