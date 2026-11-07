@@ -515,6 +515,18 @@ export interface Config {
    *  it (billion-context#2970). Unset = bare-name only (byte-identical to
    *  before). Must be pure and cheap: runs once per message per pass. */
   isCompressTool?: (toolName: string) => boolean;
+  /** Host-declared predicate marking a core whose position must never become
+   *  the FINAL block of its assistant message — a signed Anthropic
+   *  thinking/redacted_thinking block (#1658/#1960: signed thinking must
+   *  round-trip with its tool_use sibling and cannot be dropped or rewritten).
+   *  When the core immediately preceding a compress call matches,
+   *  hideConsumedCompressCalls keeps that call+result pair VISIBLE instead of
+   *  hiding it, so the thinking block is never stranded as a thinking-final
+   *  assistant message (upstream 400 "the final block in an assistant message
+   *  cannot be thinking", billion-context#5864). Unset = no protection
+   *  (byte-identical to before). Must be pure and cheap: runs once per hidden
+   *  compress call per pass. */
+  strandedProtectedPredecessor?: (msg: CoreMessage) => boolean;
   /** Host-declared message-level hard protection (billion-context#2419):
    *  when set, ANY message for which the predicate returns true is excluded
    *  from compression exactly like a protectedTools hit — BLOCKED ref in

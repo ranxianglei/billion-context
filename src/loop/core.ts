@@ -1474,7 +1474,7 @@ export async function* runCompressLoop(
                     (pr) => (pr.name === "compress" || pr.name === "decompress") && pr.result.includes("FAILED"),
                 );
                 if (!ctx.textProtocol && !anyCompressFailed) {
-                    const hidden = hideConsumedCompressCalls(ctx.session.state, coreMessages, ctx.config.isCompressTool);
+                    const hidden = hideConsumedCompressCalls(ctx.session.state, coreMessages, ctx.config.isCompressTool, ctx.config.strandedProtectedPredecessor);
                     if (hidden.hidden > 0) {
                         ctx.log(`[acp-loop] round ${round} hideConsumed hid ${hidden.hidden} compress record(s)`);
                         coreMessages.length = 0;
