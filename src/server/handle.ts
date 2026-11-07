@@ -50,6 +50,7 @@ function onSessionResolveEvent(rawId: string, r: SessionOrderResolution): void {
     loggerLog(r.action.startsWith("derived-") ? "warn" : "info", `[session-resolve] ${r.action}: ${rawId} -> ${r.key}${r.reason !== undefined ? ` (${r.reason})` : ""}`);
 }
 import { prefixAffinity, describeResumeMiss, type AnonymousAffinity } from "../prefix-affinity.js";
+import { hotAdoptionRefuser, hotWritersOf, describeHotWriter } from "../adoption-guard.js";
 import { buildAnonymousProvenance, type AnonymousProvenance } from "../anon-provenance.js";
 import { maybeAdoptForkBlocks, maybeAdoptResume, maybeAdoptDerivedFork } from "../fork-adoption.js";
 import { executeThreadsReforge } from "./threads-lane.js";
@@ -1390,7 +1391,7 @@ async function handleRequest(
         // so the pfa-* ledger's producer stays attributable after the fact.
         let anonProvenance: AnonymousProvenance | undefined;
         if (!clientProvided) {
-            anonAffinity = prefixAffinity.resolve(affinityMessageList());
+            anonAffinity = prefixAffinity.resolve(affinityMessageList(), hotAdoptionRefuser());
             if (!anonAffinity) {
                 log("warn", `400: no stable conversation identity on ${protocol} request → ${maskUrlsInText(upstreamOrigin)}; refusing to create a content-fingerprint session (#286)`);
                 res.writeHead(400, { "content-type": "application/json" });
@@ -1398,6 +1399,25 @@ async function handleRequest(
                     ? { type: "error", error: { type: "invalid_request_error", message: NO_IDENTITY_MESSAGE } }
                     : { error: { type: "invalid_request_error", message: NO_IDENTITY_MESSAGE } }));
                 return;
+            }
+            // #394/#5624: the resolver skipped chains a live peer instance is
+            //  actively writing (split-brain refusal — src/adoption-guard.ts).
+            //  Surface it before the per-via logs so the mint below reads as
+            //  the deliberate outcome it is, not a mysterious fork.
+            if (anonAffinity.refusedAdoption !== undefined && anonAffinity.refusedAdoption.length > 0) {
+                const peers = anonAffinity.refusedAdoption
+                    .flatMap((sid) => hotWritersOf(sid).map((w) => `${sid} — ${describeHotWriter(w)}`))
+                    .join("; ");
+                // Residual: a pure byte-identical replay of the refused chain
+                //  re-mints the SAME deterministic pfa id, so the write path
+                //  still lands on the contested session — for that shape the
+                //  #3923 contest alarm + freeze remain the containment.
+                if (anonAffinity.refusedAdoption.includes(anonAffinity.sessionId)) {
+                    log("warn", `[prefix-affinity] session ${anonAffinity.sessionId} is being written by another live bili instance (${peers}) — refusing re-attachment does not help: this history deterministically maps to that session id; the split-brain alarm stays the containment here (#394)`);
+                } else {
+                    log("warn", `[prefix-affinity] not re-attaching session(s) ${anonAffinity.refusedAdoption.join(", ")}: another live bili instance is writing them right now (${peers}) — serving this request as ${anonAffinity.sessionId} instead; keep one conversation on one instance (#394)`);
+                }
+                loggerLog("warn", `[prefix-affinity] hot-adoption refused: ${anonAffinity.refusedAdoption.join(", ")} → serving ${anonAffinity.sessionId}`);
             }
             if (anonAffinity.via === "simhash" && anonAffinity.adoption) {
                 // #2265: the exact chain broke (client-side decorative rewrite,
