@@ -766,6 +766,9 @@ function proofProxyOptions(upstreamPort: number, ctx: number, injectTool: boolea
         modelContextLimit: ctx,
         kernelConfig: defaultConfig(ctx),
         compress: { injectTool, injectNudge: true },
+        // #732/#821 degenerate-refetch proofs below rely on the continuation
+        // retry, which is opt-in (degenerateRetry, default OFF).
+        degenerateRetry: true,
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",
         log: false,

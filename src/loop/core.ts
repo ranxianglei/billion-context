@@ -219,6 +219,14 @@ const MALFORMED_PROXY_TOOL_ARGS_REPLAY = '{"_bili":"model produced non-JSON tool
 export interface LoopCtx {
     core: CompressionCore;
     config: Config;
+    /** Degenerate-turn (#732/#821) and draft-tail (#2303) continuation
+     *  retries armed for this loop run? Opt-in switch, default OFF — the
+     *  relay passes its resolved `degenerateRetry` here (see src/config.ts).
+     *  When false/undefined a degenerate terminal round passes through to
+     *  the client unchanged (one info log names the switch). Cut-recovery
+     *  retries (#2171 truncation re-send, #413-followup visible continuation)
+     *  are NOT governed by this switch — they never inject a nudge. */
+    degenerateRetry?: boolean;
     messages: CoreMessage[];
     /** View handed to applyCompression (see RewriteCtx.compressMessages). */
     compressMessages?: CoreMessage[];
@@ -1200,7 +1208,10 @@ export async function* runCompressLoop(
                 }
 
                 // #732 (completes the auto-retry groundwork of #673/#674), extended by #821: a reasoning model can end a turn with ONLY a thinking block — zero visible text, zero tool calls, status completed — most often right after a post-compress re-request, where it sees the freshly-shrunk context and "wraps up" into a silent thought. The client then receives an empty completed turn and stalls until manually nudged. Retriable when no VISIBLE output reached the client yet (!forwardedVisible): on Responses rounds the framing is suppressed so nothing was forwarded at all; on openai/anthropic a thinking-only prefix WAS streamed verbatim, but it is invisible to host turn semantics and its chunks carry no finish_reason, so appending the retry's content to the same stream is safe. Re-fetch once with a continuation nudge (a plain re-fetch reproduces the same silent output deterministically). One-shot per request. `sawThinking` is mandatory so a genuinely empty (no-reasoning) terminal turn is left untouched — only the "silent thought" shape retries.
-                if (
+                // Opt-in gate: degenerateRetry (default OFF, relay passes it
+                // through LoopCtx). Not armed → the empty terminal turn passes
+                // through unchanged; one info log names the switch.
+                const degenerateZeroOutput =
                     !degenerateRetried &&
                     sawDone &&
                     sawThinking &&
@@ -1216,8 +1227,8 @@ export async function* runCompressLoop(
                     // forwardedVisible: they need forwarded-not-parsed semantics.)
                     assistantText.trim().length === 0 &&
                     calls.length === 0 &&
-                    !signal?.aborted
-                ) {
+                    !signal?.aborted;
+                if (degenerateZeroOutput && ctx.degenerateRetry === true) {
                     degenerateRetried = true;
                     ctx.log(`[acp-loop] round ${round}: degenerate terminal turn (completed, zero visible output); retrying once with continuation nudge (#732/#821)`);
                     loggerLog("warn", `[acp-loop] degenerate-turn auto-retry round ${round} (session ${ctx.session.id})`);
@@ -1246,6 +1257,8 @@ export async function* runCompressLoop(
                         }
                         loggerLog("warn", `[acp-loop] degenerate-turn auto-retry failed round ${round}: ${e instanceof Error ? e.message : String(e)}`);
                     }
+                } else if (degenerateZeroOutput) {
+                    ctx.log(`[acp-loop] round ${round}: degenerate terminal turn (completed, zero visible output); continuation retry not armed on this lane — passing the empty turn through (enable with degenerateRetry: true / BILI_DEGENERATE_RETRY=1)`);
                 }
 
                 // #2303: a terminal turn that DID deliver visible prose but ends with a
@@ -1260,7 +1273,7 @@ export async function* runCompressLoop(
                 // framing-dedup boundary as #413-follow-up). Reuses degenerateRetried
                 // as its budget: a draft-tail retry that degenerates again falls
                 // through to the plain completion, exactly like the #732 twin.
-                if (
+                const draftTailShape =
                     !degenerateRetried &&
                     sawDone &&
                     !truncatedDone &&
@@ -1280,8 +1293,10 @@ export async function* runCompressLoop(
                     // design, not a stalled handoff; retrying it breaks the
                     // compaction (the retry complies too → #870 error).
                     !requestExpectsProseSummary(lastUserSummaryInstruction(coreMessages)) &&
-                    !signal?.aborted
-                ) {
+                    !signal?.aborted;
+                // Opt-in gate: same degenerateRetry switch as the #732/#821 shape
+                // above — default OFF, pass through with one info log.
+                if (draftTailShape && ctx.degenerateRetry === true) {
                     degenerateRetried = true;
                     ctx.log(`[acp-loop] round ${round}: terminal turn ends with a compression-draft closing tag and no tool call; retrying once with continuation nudge (#2303)`);
                     loggerLog("warn", `[acp-loop] draft-tail auto-retry round ${round} (session ${ctx.session.id})`);
@@ -1310,6 +1325,8 @@ export async function* runCompressLoop(
                         }
                         loggerLog("warn", `[acp-loop] draft-tail auto-retry failed round ${round}: ${e instanceof Error ? e.message : String(e)}`);
                     }
+                } else if (draftTailShape) {
+                    ctx.log(`[acp-loop] round ${round}: terminal turn ends with a compression-draft closing tag and no tool call; continuation retry not armed on this lane — passing the turn through (enable with degenerateRetry: true / BILI_DEGENERATE_RETRY=1)`);
                 }
                 break;
             }

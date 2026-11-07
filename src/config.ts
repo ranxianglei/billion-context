@@ -1087,6 +1087,18 @@ export type ProxyOptions = {
      *  BILI_PERSONA_SPLIT=0 or `personaSplit: false` in the config file
      *  (env wins). */
     personaSplit?: boolean;
+    /** Opt-in degenerate-turn continuation retry on the agent-facing plugin and
+     *  proxy chat lanes (#732/#821/#2303; default OFF): when a turn ends with
+     *  zero visible output (reasoning-only silent stop, or output that is
+     *  nothing but a render-tag echo), re-issue the agent's own request ONCE
+     *  with a neutral continuation nudge appended; if the retry is also empty,
+     *  the client gets an in-band #870 error instead of a silently empty turn.
+     *  OFF by default: the nudge re-bills the full request, and on sessions
+     *  already deep in degeneration the retry just degenerates again. The
+     *  compress loop's internal retry is NOT governed by this switch (it
+     *  heals the proxy's own fold requests and stays on).
+     *  Enable with `degenerateRetry: true` or env BILI_DEGENERATE_RETRY=1. */
+    degenerateRetry?: boolean;
     /** Opt-in fork block-adoption (#629, default off). ANONYMOUS clients
      *  (prefix-affinity) that fork their history inherit the parent's
      *  fully-present compression blocks instead of restarting at zero.
@@ -1836,6 +1848,7 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         subagentSplit: (env.BILI_SUBAGENT_SPLIT ?? (fileConfig.subagentSplit === false ? "0" : "1")) !== "0",
         personaSplit: (env.BILI_PERSONA_SPLIT ?? (fileConfig.personaSplit === false ? "0" : "1")) !== "0",
         forkAdoption: (env.BILI_FORK_ADOPTION ?? (fileConfig.forkAdoption === true ? "1" : "0")) !== "0",
+        degenerateRetry: (env.BILI_DEGENERATE_RETRY ?? (fileConfig.degenerateRetry === true ? "1" : "0")) !== "0",
         affinitySimhash: (env.BILI_AFFINITY_SIMHASH ?? (fileConfig.affinitySimhash === false ? "0" : "1")) !== "0",
         resumeInheritance: (env.BILI_RESUME_INHERITANCE ?? (fileConfig.resumeInheritance === false ? "0" : "1")) !== "0",
         chainContentDetection: (env.BILI_CHAIN_CONTENT ?? (fileConfig.chainContentDetection === true ? "1" : "0")) !== "0",
@@ -2107,6 +2120,10 @@ type FileConfig = {
      *  BILI_CHAIN_STAMP=1 wins over the file). Independent of
      *  chainContentDetection. */
     chainEgressStamp?: boolean;
+    /** #732/#821/#2303 opt-in: re-issue a zero-output terminal turn once with
+     *  a continuation nudge on the plugin/proxy lanes. Default false; env
+     *  BILI_DEGENERATE_RETRY=1 or config `degenerateRetry: true` enables. */
+    degenerateRetry?: boolean;
     /** Set `true` to enable the sticky head-system anchor (#1085, default
      *  OFF; env BILI_STABLE_SYSTEM_ANCHOR wins). */
     stableSystemAnchor?: boolean;
@@ -2537,7 +2554,7 @@ const KNOWN_TOP_LEVEL_KEYS = new Set([
     "upstreamProxy", "upstreamProxyMode",
     "logFile", "compress", "promptCache", "mitm", "maskHosts",
     "subagentSplit", "personaSplit", "forkAdoption", "affinitySimhash", "resumeInheritance",
-    "chainContentDetection", "chainEgressStamp", "stableSystemAnchor",
+    "chainContentDetection", "chainEgressStamp", "stableSystemAnchor", "degenerateRetry",
     "rollout",
     "dsh",
     "compat", "imageBilling", "imageTokenCap", "claude", "native", "resign",
