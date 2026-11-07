@@ -282,7 +282,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `compress.preserveRecentTokens` | number | kernel ≈5000 | — | The most recent tokens stay soft-protected from folds. |
 | `compress.minCompressRangeChars` | number (deprecated alias: minCompressRange) | kernel ≈5000 | — | Smallest foldable range, in characters; shorter ranges never fold. |
 | `compress.maxSummaryLength` | number | kernel 20000 | — | Hard character cap on ONE generated summary; longer replies are rejected whole (no truncation, no retry). External summarizers are told this exact cap up front (#3635). 0 = unbounded. |
-| `compress.minSummaryLength` | number | kernel 50 | — | Character floor for generated summaries; shorter replies are rejected whole. 0 = disabled. External summarizers are held to the same floor (#3635). |
+| `compress.minSummaryLength` | number | kernel 50 | — | Character floor for generated summaries: a single range must meet it alone; a multi-range batch passes when its combined summaries reach it (#5894). 0 = disabled. External summarizers remain held to the per-summary floor (#3635). |
 | `compress.reconcile` | "off" \| "warn" \| "repair" | "repair" | BILI_FOLD_RECONCILE | Reconcile folded state when the client rewinds or rewrites history between turns. |
 | `compress.compressAtFoldPoint` | boolean | false | BILI_COMPRESS_AT_FOLD_POINT | EXPERIMENTAL, default off: move a still-visible compress call/result pair from its original (tail-adjacent) slot to its own fold point in the re-sent view, i.e. [folded region] – [pair] – [protected messages], so weak-attention models stop reading a trailing tool exchange as a fresh command. View-only transform: refs and state untouched, recomputed identically on every turn; off = byte-identical layout. |
 | `compress.compressAtFoldPointClearThinking` | boolean | false | BILI_COMPRESS_AT_FOLD_POINT_CLEAR_THINKING | Second opt-in riding on compress.compressAtFoldPoint: when the pair is repositioned, also drop the contiguous run of unsigned reasoning cores immediately preceding it (the model's thinking about this very fold), so the moved pair starts clean. Inert unless the main switch is on; signed thinking blocks and strict reasoning-echo sessions are never touched (#1658/#684). |
@@ -1465,7 +1465,7 @@ For each request, the proxy resolves the settings by longest-URL-prefix match (t
 - **Type:** `number`
 - **Default:** *(kernel default `50`)*
 - **Status:** ACTIVE (#3635)
-- **Description:** Floor, in **characters**, for generated summaries; shorter replies are rejected whole. `0` disables the floor. Maps to the kernel field `compress.minSummaryLength`. Same acceptance history as `maxSummaryLength` (#3635).
+- **Description:** Floor, in **characters**, for generated summaries. A single-range compression must meet it on its own; a multi-range batch passes when its COMBINED summaries reach it — one lazy paragraph no longer sinks the whole batch (#5894). `0` disables the floor. Maps to the kernel field `compress.minSummaryLength`. Same acceptance history as `maxSummaryLength` (#3635); external summarizers remain held to the per-summary floor.
 
 #### `tiers`
 
