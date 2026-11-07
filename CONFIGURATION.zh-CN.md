@@ -104,6 +104,8 @@
 | `rollout.features.identityChannelHarvest` | boolean \| number | 0(关) | BILI_ROLLOUT_IDENTITY_CHANNEL_HARVEST | 身份信道采集的灰度门(#5825):当安装级开关(BILI_IDENTITY_HARVEST)未设置时,允许仅由本灰度键激活回环专属的转录/SQLite 采集(claude-code / codebuddy / mcode / goose / qwen 车道);两者都不设则永不读客户端存储。owner 裁定 2026-11-07:本灰度键与 rollout.features.pluginLaneServerHistory(它管已接纳 id 的行钉住)刻意分离——任一使能方可激活采集。默认 0%,小流量观察退化率后再抬。见 identity-channels.zh-CN.md。 |
 | `rollout.features.pluginLaneServerHistory` | boolean \| number | 0(关) | BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY | 插件车道服务端正史(#4491):对已放量的安装,(a) 插件车道请求可携带与 `messages` 平行的内部字段 `biliMsgIds`,把消息身份钉在客户端提供的 id 上(转发上游前一律剥掉;格式错误的数组告警后忽略,身份投毒形态在增量车道直接硬失败);(b) 仅回环可达的 `POST /__bili/plugin/render` 端点从统一存储渲染出站前缀(折叠区收敛为摘要锚点;任何失步都返回非 2xx,shim 退回本地历史);(c) 增量车道探测响应通告 `serverHistory`。默认 0%,放量前无行为变化。 |
 | `rollout.features.pluginFullResendWatermark` | boolean \| number | 5(实验性灰度) | BILI_ROLLOUT_PLUGIN_FULL_RESEND_WATERMARK | 全量重发水位快路径(#5403/#5418):插件车道 chat-completions 回合若上一轮响应盖有 x-bili-pf-seq,则用回声计数声明重发前缀(结构扫描,不做全量解析);命中时管线只消费钉存的前缀核 + 新增尾巴窗口(出站字节同源可证;任何疑点当轮回退未动过的全量解析路径并重新盖戳,连续五次计名失配将车道按住一小时)。需客户端把戳回声为 x-bili-pf-count(适配的车道回带;其余车道不会命中)。**实验性灰度**——默认仅约 5% 的安装开启(owner 裁定 2026-11-02:先小流量再 GA;web 面板对全部安装显示一次性公告、快速配置提供三态开关);`true` 强制开、`false`(或百分比)/ env = 0 关。见 TECHNICAL-NOTES.zh-CN.md「全量重发水位快路径」。 |
+| `rollout.features.watermarkV6MsgId` | boolean \| number | 0(关) | BILI_ROLLOUT_WATERMARK_V6_MSG_ID | 复合身份增量快路径 v6(#5643):插件车道全量重发回合,当客户端回带逐元素宿主 id(x-bili-pf-tail-ids 尾窗 + x-bili-plugin-conversation 载体)时,用身份集合差而非计数判定重发前缀——仅增量解析新增元素,冻结核自统一存储 sidecar 逐字骑乘。身份硬门:id 列表缺失/格式错/宽度不符/一致性断裂一律以 HTTP 400 拒绝且零副作用(连续五次连击将 v6 按住 60 分钟;按住期间同一流量由基线 v5/legacy 车道承接而非拒绝——停放与恢复均响亮记日志)——绝不静默回退 legacy。按百分比放量时嵌套于 pluginFullResendWatermark(人群 ⊆ v5 灰度人群);强制档(env 覆盖 / 显式 enabled)按钉死设计绕过嵌套检查(src/rollout.ts 头部注释,#5652 review F10 待 owner 裁定)。并依赖统一存储 sidecar(无此设施的节点原样走基线车道)。默认关——仅由显式放量开启。 |
+| `rollout.features.watermarkV6Render` | boolean \| number | 0(关) | BILI_ROLLOUT_WATERMARK_V6_RENDER | v6 渲染快照平面(#5664):复合身份 v6 命中回合中,稳态轮只把最近 W 个冻结核 + 新增尾窗送入内核、把此前已出站的字节逐字拼回,不再跑全量视图扫描(每轮字节校验 verifyRenderWindow;累计估算基数增量推进而非重扫全部 n 行)。任一红色门控条件(not-engaged/arm 轮/title-gen/plane-unavailable/压力 ≥ 模型上限 90%/snapshot-lane/fold-pending/absorb-active/ccr-on/markers/lane-dead/hydrate-failed/caps-mismatch/structural-pending/blocks-changed/每 N 轮计划审计(audit-due)/no-rows/no-plane-geometry/rows-misaligned)当轮回退未动过的全量 legacy 路径并重新捕获——红色时与改动前结构上逐字节一致。存储:统一存储三张 sidecar 表(pf_render / pf_render_log / pf_render_ckpt,schema v13,随会话级联删除);MySQL/网络后端软降级(plane 不可用 → legacy)。可调项:BILI_PF_RENDER_WINDOW(W,默认 8)与 BILI_PF_RENDER_AUDIT_EVERY(N,默认 8)。按百分比放量时嵌套于 watermarkV6MsgId(人群 ⊆ v6 msgid 人群);强制档(env 覆盖 / 显式 enabled)按钉死设计绕过嵌套检查(src/rollout.ts 头部注释,#5652 review F10 待 owner 裁定)。默认关——仅由显式放量开启。 |
 | `maskHosts` | boolean | true | BILI_LOG_MASK_HOSTS | 日志中把非公开目标主机遮成 <private-host>；凭据头无论此开关如何总是遮盖。 |
 | `security.adminRelay` | boolean | false | — | 允许宿主（当前为 dsh web）把它自己入口域名下的整个 /__bili/ 管理面中继到本机代理，使远程浏览器能打开面板（#3373）。默认关闭、仅配置文件。中继跳到达代理时是本机非浏览器客户端（回环源地址 + 回环 Host、无 Origin 头），管理端门槛不变；开启后，凡能访问宿主 web 入口的人都能改配置、写凭据——请先给入口加鉴权/反代。 |
 | `subagentSplit` | boolean | true | BILI_SUBAGENT_SPLIT | Claude 子代理拥有独立会话命名空间（<session>\|sub:<agent-id>），不再排队在主会话锁后。仅 anthropic 线路 —— Responses 线路上本开关无效（见 `subagentSplit` / BOTH-mechanisms 作用域说明）。 |
@@ -439,6 +441,8 @@
 | `BILI_MITM_HOSTS` | string[] (csv) | unset | — | 启动器通道：传给被派生代理的 MITM 白名单主机（区别于配置文件对应项 BILI_MITM_DOMAINS）。 |
 | `BILI_PLUGIN_AGENT` | boolean-ish | off | — | 派生通道：标记插件 agent 进程。 |
 | `BILI_IMAGE_RESCALE_MAX_DIM` | integer | 1600 | — | 出站图片降采样 pass 的最长边触发阈值（像素，#3400）；非数字或低于 128 的取值按默认处理。设计上仅环境变量。 |
+| `BILI_PF_RENDER_WINDOW` | integer | 8 | — | v6 渲染快照平面（#5664）的有界渲染窗口 W：每个稳态轮送入内核的冻结核数量（与新增尾窗并列）。三种策略的探针证据表明后缀 W-pass 能逐字节复现每个元素的出站字节，8 已足够；低于 1 或非数字的取值回退为 8，上限 64。仅在 rollout.features.watermarkV6Render 开启时有意义。 |
+| `BILI_PF_RENDER_AUDIT_EVERY` | integer | 8 | — | v6 渲染快照平面（#5664）的计划审计周期 N：每 N 个命中轮强制跑一次全量 legacy pass，其捕获 diff 对已存出站行做端到端复验（把 messageRefs/rules 合并滞后钉在 ≤ N 轮内）。低于 2 或非数字的取值回退为 8，上限 1024。任何 legacy 轮（含红色门控回退）都会清零计数——它本身就是一次审计。仅在 rollout.features.watermarkV6Render 开启时有意义。 |
 
 <!-- /bili:gen -->
 
@@ -1934,6 +1938,8 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_ROLLOUT_IDENTITY_CHANNEL_HARVEST` | `rollout.features.identityChannelHarvest` | 0 (off) |
 | `BILI_ROLLOUT_PLUGIN_FULL_RESEND_WATERMARK` | `rollout.features.pluginFullResendWatermark` | 5 (experimental grey) |
 | `BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY` | `rollout.features.pluginLaneServerHistory` | 0 (off) |
+| `BILI_ROLLOUT_WATERMARK_V6_MSG_ID` | `rollout.features.watermarkV6MsgId` | 0 (off) |
+| `BILI_ROLLOUT_WATERMARK_V6_RENDER` | `rollout.features.watermarkV6Render` | 0 (off) |
 | `BILI_SESSION_CONTENT_STORE_PIN` | `sessions.contentStorePin` | false |
 | `BILI_SESSION_GC` | `sessions.gc.enabled` | false |
 | `BILI_SESSION_GC_INTERVAL_MS` | `sessions.gc.intervalMs` | 3600000 |

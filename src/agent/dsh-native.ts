@@ -1200,20 +1200,22 @@ function hostMsgIdsOf(messages: unknown): string[] | undefined {
     return ids;
 }
 
-/** #5418 v3 watermark-capture variant of hostMsgIdsOf: per-slot instead of
- *  all-or-nothing. Hosts compress/rewrite histories, so one id-less element
- *  (native-compaction summary, persona sidecar) must NOT poison its
- *  neighbours' ids — unknown slots ride the "?" placeholder and stay in
- *  position (order is the binding carrier, #11). */
+/** #5418 v3 watermark-capture variant of hostMsgIdsOf (F2 ruling,
+ *  owner 2026-11-04): the list rides only when EVERY element resolves a
+ *  real, unique id — one hole anywhere returns undefined and the whole
+ *  capture degrades to count-only. "?" placeholders never travel: the v6
+ *  hard gate treats them as malformed, and hosts are assumed id-complete
+ *  post-compaction (source-analysis issue filed), so a hole means drift.
+ */
 function pfSlotIdsOf(messages: unknown): string[] | undefined {
     if (!Array.isArray(messages) || messages.length === 0) return undefined;
     const out: string[] = [];
     for (const m of messages) {
         let id: unknown = m === null || typeof m !== "object" ? undefined : (m as { id?: unknown }).id;
         if (typeof id !== "string" || id.length === 0 || id.length > 512 || id.startsWith("acp_summary_") || /[\s\p{C}]/u.test(id)) {
-            id = undefined;
+            return undefined; // F2: any hole ⇒ whole table absent, never a "?" slice
         }
-        out.push(typeof id === "string" ? id : pfChannel.PF_SLOT_UNKNOWN);
+        out.push(id);
     }
     return out;
 }
@@ -2031,10 +2033,11 @@ export function apply(ctx: PluginContext): void {
                 const scope: LlmDispatchScope = { sid, msgIds: hostMsgIdsOf(options?.messages) };
                 // #5403/#5418 v3: feed the per-slot id sequence into the
                 // watermark channel (the fetch chokepoint emits count +
-                // tail-ids; core = pf-channel.ts) — "?" slots ride id-less
-                // elements without poisoning the rest. A failed resolution
-                // (no usable message list at all) CLEARS like every other
-                // adapter — never ride a stale one.
+                // tail-ids; core = pf-channel.ts) — F2 ruling: ONE id-less
+                // element anywhere degrades the whole list to absent (no "?"
+                // ever travels). A failed resolution (no usable message list
+                // at all) CLEARS like every other adapter — never ride a
+                // stale one.
                 pfChannel.pfCaptureIds(sid, pfSlotIdsOf(options?.messages));
                 // next() may start the adapter's fetch eagerly (inside this
                 // call), and lazy continuations resume on each advance —
