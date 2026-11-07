@@ -28,6 +28,7 @@ import type { TruncationDiag } from "./stream-error.js";
 import { recordAttributionReport } from "./server/attribution-status.js";
 import type { HandoffReply } from "./server/handoff-response.js";
 import { captureHandoffJson, HANDOFF_REPLY_MAX_BYTES } from "./server/handoff-response.js";
+import { recordServerSideFold } from "./server/fastpath-v6-render.js";
 
 /** #2328 Q2: what the pipes know about the upstream HTTP response whose body
  *  they are piping — threaded in by server.ts so the truncation diag can cite
@@ -2333,6 +2334,18 @@ export async function handlePluginTool(
     }
     releaseInFlight(session);
     if (result === undefined) return;
+    // #5643 附录二：the compression request IS the first scene — journal its
+    // fold coverage into the v6 render snapshot SYNCHRONOUSLY (one tx DML;
+    // the next model turn materializes/verifies as ONE forced red round,
+    // never by guesswork). No-op unless the plane is engaged AND something
+    // structural moved; fail-soft — the tool response never depends on it.
+    if (tool === "compress") {
+        try {
+            recordServerSideFold(session.id, session, getStore(), deps.log);
+        } catch (err) {
+            deps.log("warn", `[${session.id}] [plugin] render first-scene journal failed: ${String(err)}`);
+        }
+    }
     // #760b: evidence-based plugin-mode flip. A successful MCP tool execution proves
     // this session's host owns the bili compression tools, so bind it to plugin mode
     // (sticky) — the next model request stops injecting the duplicate ephemeral wire

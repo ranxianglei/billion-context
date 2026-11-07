@@ -425,6 +425,8 @@ export class UnifiedStore {
     private readonly foreignLockHolder: { pid: number } | null;
     private readonly lockPath: string | null;
     private readonly dbPath: string;
+    /** #5643: cached one-time capability probe for the pf plane (null = not yet probed). */
+    private pfAvail: boolean | null = null;
     /** #4609: the last completed check (sync, cache hit, or background
      * verdict) said the file set is sound — a clean close then refreshes the
      * verdict cache onto the post-checkpoint stats so the next boot skips
@@ -1710,6 +1712,31 @@ export class UnifiedStore {
             this.db.prepare("DELETE FROM refs WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM ccr_entries WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM conversations WHERE session_id = ?").run(sessionId);
+            // #5643/#5664: fastpath v6 plane partitions hang off this session
+            // through the ext registry (persist.ts PF_V6_SID_REGISTRY_EXT_KEY);
+            // cascade BOTH planes — the three identity tables AND the three
+            // render-snapshot tables (#5664) — in the SAME transaction so
+            // deletion leaves no cross-plane orphans (all six tables exist by
+            // migration invariant once the registry row does).
+            const pfRegRow = this.db
+                .prepare("SELECT value_json FROM session_ext WHERE session_id = ? AND key = 'pf:v6-sids'")
+                .get(sessionId) as { value_json: string } | undefined;
+            if (pfRegRow !== undefined) {
+                let pfSids: unknown[] = [];
+                try {
+                    const p = JSON.parse(pfRegRow.value_json);
+                    if (Array.isArray(p)) pfSids = p;
+                } catch { /* corrupt registry: nothing to cascade from */ }
+                for (const sid of pfSids) {
+                    if (typeof sid !== "string") continue;
+                    this.db.prepare("DELETE FROM pf_rows WHERE sid = ?").run(sid);
+                    this.db.prepare("DELETE FROM pf_log WHERE sid = ?").run(sid);
+                    this.db.prepare("DELETE FROM pf_ckpt WHERE sid = ?").run(sid);
+                    this.db.prepare("DELETE FROM pf_render WHERE sid = ?").run(sid);
+                    this.db.prepare("DELETE FROM pf_render_log WHERE sid = ?").run(sid);
+                    this.db.prepare("DELETE FROM pf_render_ckpt WHERE sid = ?").run(sid);
+                }
+            }
             this.db.prepare("DELETE FROM session_ext WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM sessions WHERE session_id = ?").run(sessionId);
             for (const hash of refs) this.releaseContent(hash);
@@ -1872,7 +1899,10 @@ export class UnifiedStore {
      *  showing it) and the conversations identity binding survives (identity
      *  is forever; a restore must land on the same session id). Pinned
      *  checkpoints keep their rows + refs. Idempotent: an already-archived
-     *  session is a no-op returning the log path. */
+     *  session is a no-op returning the log path. The six fastpath v6 plane
+     *  partitions (#5643/#5664, sid-keyed through the session_ext registry)
+     *  are swept in the same transaction — a rebuildable cache, never
+     *  exported: a restored session re-boots through a fresh arm. */
 
     archiveSession(sessionId: string, opts: { archiveDir: string }): { ok: boolean; exportPath?: string; reason?: string; contentRowsDeleted?: number } {
         const row = this.getSessionRow(sessionId);
@@ -1893,7 +1923,7 @@ export class UnifiedStore {
         const refsRows = (this.db.prepare("SELECT ord, raw_id, ref, ref_num FROM refs WHERE session_id = ? ORDER BY ord").all(sessionId) as Record<string, unknown>[]);
         const deadRefs = (this.db.prepare("SELECT ord, ref, ref_num, recorded_at FROM dead_refs WHERE session_id = ? ORDER BY ord").all(sessionId) as Record<string, unknown>[]);
         const ccr = (this.db.prepare("SELECT ord, ccr_key, content_hash FROM ccr_entries WHERE session_id = ? ORDER BY ord").all(sessionId) as Record<string, unknown>[]);
-        const ext = (this.db.prepare("SELECT key, value_json FROM session_ext WHERE session_id = ?").all(sessionId) as Record<string, unknown>[]);
+        const ext = (this.db.prepare("SELECT key, value_json, updated_at FROM session_ext WHERE session_id = ?").all(sessionId) as Record<string, unknown>[]);
         const checkpoints = (this.db.prepare("SELECT cp_id, seq_at, block_set_hash, kind, created_at, pinned, label, state_hash FROM checkpoints WHERE session_id = ?").all(sessionId) as Record<string, unknown>[]);
         // --- collect the distinct CAS bodies referenced by those rows ---
         const wanted = new Set<string>();
@@ -1927,6 +1957,36 @@ export class UnifiedStore {
             this.db.prepare("DELETE FROM dead_refs WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM refs WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM ccr_entries WHERE session_id = ?").run(sessionId);
+            // #5652 review BUG-2: archive swept every table EXCEPT the six
+            // fastpath v6 plane partitions, which hang off the session only
+            // through the ext registry (same key deleteSession cascades):
+            // once session_ext died, no sid was referable anymore and every
+            // archived session's plane rows were permanently orphaned —
+            // invisible to gc() and to sessionStorageStats alike. The planes
+            // are a rebuildable CACHE, never an identity source: a restored
+            // session re-boots through a fresh arm (probe-miss ⇒ rule ③), so
+            // dropping them here loses nothing — they are deliberately NOT
+            // exported into the JSONL either (the exported registry rows then
+            // ride restore harmlessly: probes resolve nothing, clean re-arm).
+            const pfRegRow = this.db
+                .prepare("SELECT value_json FROM session_ext WHERE session_id = ? AND key = 'pf:v6-sids'")
+                .get(sessionId) as { value_json: string } | undefined;
+            if (pfRegRow !== undefined) {
+                let pfSids: unknown[] = [];
+                try {
+                    const p = JSON.parse(pfRegRow.value_json);
+                    if (Array.isArray(p)) pfSids = p;
+                } catch { /* corrupt registry: nothing to cascade from */ }
+                for (const sid of pfSids) {
+                    if (typeof sid !== "string") continue;
+                    this.db.prepare("DELETE FROM pf_rows WHERE sid = ?").run(sid);
+                    this.db.prepare("DELETE FROM pf_log WHERE sid = ?").run(sid);
+                    this.db.prepare("DELETE FROM pf_ckpt WHERE sid = ?").run(sid);
+                    this.db.prepare("DELETE FROM pf_render WHERE sid = ?").run(sid);
+                    this.db.prepare("DELETE FROM pf_render_log WHERE sid = ?").run(sid);
+                    this.db.prepare("DELETE FROM pf_render_ckpt WHERE sid = ?").run(sid);
+                }
+            }
             this.db.prepare("DELETE FROM session_ext WHERE session_id = ?").run(sessionId);
             this.db.prepare("UPDATE sessions SET status = 'archived' WHERE session_id = ?").run(sessionId);
             for (const hash of rel) this.releaseContent(hash);
@@ -2008,8 +2068,12 @@ export class UnifiedStore {
             for (const d of dump.deadRefs) insDead.run(sessionId, d.ord, d.ref, d.ref_num, d.recorded_at);
             const insCcr = this.db.prepare("INSERT INTO ccr_entries (session_id, ord, ccr_key, content_hash) VALUES (?, ?, ?, ?)");
             for (const e of dump.ccrEntries) insCcr.run(sessionId, e.ord, e.ccr_key, e.content_hash);
-            const insExt = this.db.prepare("INSERT INTO session_ext (session_id, key, value_json) VALUES (?, ?, ?)");
-            for (const x of dump.sessionExt) insExt.run(sessionId, x.key, x.value_json);
+            // #5652 review: restore used to re-insert ext rows without
+            // updated_at (NOT NULL in DDL) → restoring ANY session carrying a
+            // single ext row threw (v6 sessions always do: sid registry +
+            // guard). Older exports predate the field: fall back to now().
+            const insExt = this.db.prepare("INSERT INTO session_ext (session_id, key, value_json, updated_at) VALUES (?, ?, ?, ?)");
+            for (const x of dump.sessionExt) insExt.run(sessionId, x.key, x.value_json, typeof x.updated_at === "number" ? x.updated_at : Date.now());
             const insCp = this.db.prepare("INSERT INTO checkpoints (cp_id, session_id, seq_at, block_set_hash, kind, created_at, pinned, label, state_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(cp_id) DO NOTHING");
             for (const cp of dump.checkpoints) insCp.run(cp.cp_id, sessionId, cp.seq_at, cp.block_set_hash, cp.kind, cp.created_at, cp.pinned, cp.label ?? null, cp.state_hash);
             this.db
@@ -2356,6 +2420,371 @@ export class UnifiedStore {
         }
         validateExtKey(key, "key");
         return Number(this.db.prepare("DELETE FROM session_ext WHERE session_id = ? AND key = ?").run(sessionId, key).changes);
+    }
+
+    // ======================================================================
+    // #5643 fastpath v6 identity plane (schema v11): pf_rows / pf_log /
+    // pf_ckpt. DATA plane = pf_rows (strictly append-only; a pos is never
+    // reused — a half-written turn rolls back whole). METADATA plane = LSM:
+    // pf_log (L0 append-only) + pf_ckpt (L1); current state is ALWAYS
+    // fold(ckpt.metaJson, pf_log[ls_seq > ckpt_ls_seq]) — deterministic,
+    // idempotent, the in-memory arrays are a cache nothing depends on.
+    // Availability degrades soft (§7-A②): on nodes where this plane is
+    // unusable the v6 lane stays OFF and traffic rides the legacy path.
+    // Raw host ids are stored untruncated as received (P9); no digest ever
+    // occupies a judgement-relevant position.
+    // ======================================================================
+
+    /** One-time capability probe (table presence), cached. False on pre-v11
+     *  databases (feature gate ignores them) and anywhere the DDL never ran
+     *  — callers treat false as "lane unavailable", never as an error. */
+    pfAvailable(): boolean {
+        if (this.pfAvail !== null) return this.pfAvail;
+        try {
+            const cols = (this.db.prepare("PRAGMA table_info(pf_rows)").all() as unknown as { name?: unknown }[])
+                .map((c) => (typeof c?.name === "string" ? c.name : ""));
+            this.pfAvail = cols.includes("core_json") && cols.includes("ledger_id");
+        } catch {
+            this.pfAvail = false;
+        }
+        return this.pfAvail;
+    }
+
+    /** Data-plane insert: one turn's new rows for `sid`, strictly sequential
+     *  (pos values must be contiguous ascending). Never updates/deletes an
+     *  existing pos. Throws on conflict — the surrounding transaction rolls
+     *  back, leaving the plane exactly as before. */
+    private pfInsertRows(
+        sid: string,
+        rows: { pos: number; ledgerId: string; sessRaw: string; coreId: string; coreJson: string }[],
+    ): void {
+        const ins = this.db.prepare(
+            "INSERT INTO pf_rows (sid, pos, ledger_id, sess_raw, core_id, core_json) VALUES (?, ?, ?, ?, ?, ?)",
+        );
+        for (const r of rows) ins.run(sid, r.pos, r.ledgerId, r.sessRaw, r.coreId, r.coreJson);
+    }
+
+    /** Global identity probe (P8): for the request-level `sessRaw`, which of
+     *  these msgids have been seen before? Returns a map keyed by ledger id
+     *  → { sid, pos }. ONE round-trip per distinct sess_raw (a turn shares
+     *  one request-level sessionid). Cross-sid by design: the index is global.
+     *  First-seen wins on any impossible duplicate (rows are immutable). */
+    pfProbePairs(sessRaw: string, ledgerIds: string[]): Map<string, { sid: string; pos: number }> {
+        const out = new Map<string, { sid: string; pos: number }>();
+        if (ledgerIds.length === 0) return out;
+        const placeholders = ledgerIds.map(() => "?").join(", ");
+        const rows = this.db
+            .prepare(`SELECT ledger_id, sid, MIN(pos) AS pos FROM pf_rows WHERE sess_raw = ? AND ledger_id IN (${placeholders}) GROUP BY ledger_id`)
+            .all(sessRaw, ...ledgerIds) as { ledger_id: string; sid: string; pos: number }[];
+        for (const r of rows) out.set(r.ledger_id, { sid: r.sid, pos: r.pos });
+        return out;
+    }
+
+    /** Metadata-plane read: the L1 checkpoint (if any) plus every L0 entry
+     *  after it, in ls_seq order. Compaction keeps this read bounded (≤64
+     *  entries / ≤64 KB between folds). The sqlite path never throws into
+     *  the request path for a missing row — callers branch on null/empty. */
+    pfMeta(sid: string): {
+        ckpt: { ckptLsSeq: number; metaJson: string; checksum: string; updatedAt: number } | null;
+        log: { lsSeq: number; kind: string; payloadJson: string; bornPosHi: number; ts: number }[];
+    } {
+        const c = this.db.prepare("SELECT ckpt_ls_seq, meta_json, checksum, updated_at FROM pf_ckpt WHERE sid = ?").get(sid) as
+            | { ckpt_ls_seq: number; meta_json: string; checksum: string; updated_at: number }
+            | undefined;
+        const log = this.db
+            .prepare("SELECT ls_seq, kind, payload_json, born_pos_hi, ts FROM pf_log WHERE sid = ? AND ls_seq > ? ORDER BY ls_seq")
+            .all(sid, c === undefined ? 0 : c.ckpt_ls_seq) as { ls_seq: number; kind: string; payload_json: string; born_pos_hi: number; ts: number }[];
+        return {
+            ckpt: c === undefined ? null : { ckptLsSeq: c.ckpt_ls_seq, metaJson: c.meta_json, checksum: c.checksum, updatedAt: c.updated_at },
+            log: log.map((r) => ({ lsSeq: r.ls_seq, kind: r.kind, payloadJson: r.payload_json, bornPosHi: r.born_pos_hi, ts: r.ts })),
+        };
+    }
+
+    /** Newest geom entry (scanning the post-ckpt log backwards). Fold itself
+     *  is owned by the fastpath-v6 module (it defines the meta schema); this
+     *  just surfaces the last-known {t,maxPos} for cheap diagnostics without
+     *  hydrating cores. */
+    pfLatestGeom(sid: string): { t: number; maxPos: number } | null {
+        const { log } = this.pfMeta(sid);
+        for (let i = log.length - 1; i >= 0; i--) {
+            const e = log[i];
+            if (e?.kind !== "geom") continue;
+            try {
+                const p = JSON.parse(e.payloadJson) as { t?: unknown; maxPos?: unknown };
+                if (typeof p.t === "number" && typeof p.maxPos === "number") return { t: p.t, maxPos: p.maxPos };
+            } catch {
+                continue;
+            }
+        }
+        return null;
+    }
+
+    /** Atomic turn finalize (§4.1.3 single-transaction double plane): new
+     *  data-plane rows AND their metadata-plane entries commit together — a
+     *  mid-turn crash leaves zero trace and the client's next full body IS
+     *  the replay source. Log entries are appended at strictly increasing
+     *  ls_seq starting after MAX(ls_seq). Returns the next free ls_seq.
+     *  Any throw → rollback → the plane is byte-identical to before. */
+    pfCommitTurn(
+        sid: string,
+        args: {
+            rows: { pos: number; ledgerId: string; sessRaw: string; coreId: string; coreJson: string }[];
+            logEntries: { kind: string; payloadJson: string; bornPosHi: number; ts?: number }[];
+        },
+    ): number {
+        if (!this.pfAvailable()) throw new Error("pf plane unavailable");
+        const nextLsSeq = this.db.transaction((): number => {
+            this.pfInsertRows(sid, args.rows);
+            // Continuation must clear BOTH the surviving log tail AND the
+            // checkpoint watermark: a fresh checkpoint ABSORBS its own log
+            // entries (pfCompact deletes them in that tx), so MAX(log) sits
+            // BEHIND ckpt_ls_seq after any fold — numbering from MAX alone
+            // would re-issue sequences ≤ ckpt and those entries would be
+            // invisible to pfMeta forever (post-fold turns silently lost,
+            // stale world.maxPos ⇒ PK collisions on every later progress
+            // turn). Identical guard to pfRenderCommit.
+            const start = Number(
+                Math.max(
+                    (this.db.prepare("SELECT COALESCE(MAX(ls_seq), 0) AS m FROM pf_log WHERE sid = ?").get(sid) as { m: number }).m ?? 0,
+                    (this.db.prepare("SELECT ckpt_ls_seq AS n FROM pf_ckpt WHERE sid = ?").get(sid) as { n: number } | undefined)?.n ?? 0,
+                ),
+            );
+            const insLog = this.db.prepare(
+                "INSERT INTO pf_log (sid, ls_seq, kind, payload_json, born_pos_hi, ts) VALUES (?, ?, ?, ?, ?, ?)",
+            );
+            let seq = start;
+            for (const e of args.logEntries) {
+                seq += 1;
+                insLog.run(sid, seq, e.kind, e.payloadJson, e.bornPosHi, e.ts ?? Date.now());
+            }
+            return seq;
+        });
+        if (typeof nextLsSeq !== "number") throw new Error("pf commit turn: transaction returned no sequence");
+        return nextLsSeq;
+    }
+
+    /** L0→L1 compaction (§4.1.3, called opportunistically from finalize —
+     *  no background threads): fold the whole history into a fresh ckpt in
+     *  the SAME transaction that deletes the superseded log entries.
+     *  S4 lesson: the checksum covers the exact metaJson bytes and hydrate
+     *  re-verifies — a mismatch invalidates the ckpt (rebuild from the
+     *  replay source), never guesses. Idempotent under stable stringify at
+     *  the call site. Caller supplies `metaJson` already folded from the
+     *  same history this call deletes. */
+    pfCompact(sid: string, args: { metaJson: string; nextLsSeq: number }): void {
+        if (!this.pfAvailable()) throw new Error("pf plane unavailable");
+        const hash = createHash("sha256").update(args.metaJson).digest("hex");
+        this.db.transaction(() => {
+            this.db
+                .prepare(
+                    "INSERT INTO pf_ckpt (sid, ckpt_ls_seq, meta_json, checksum, updated_at) VALUES (?, ?, ?, ?, ?) " +
+                        "ON CONFLICT (sid) DO UPDATE SET ckpt_ls_seq = excluded.ckpt_ls_seq, meta_json = excluded.meta_json, " +
+                        "checksum = excluded.checksum, updated_at = excluded.updated_at",
+                )
+                .run(sid, args.nextLsSeq, args.metaJson, hash, Date.now());
+            this.db.prepare("DELETE FROM pf_log WHERE sid = ?").run(sid);
+        });
+    }
+
+    /** Should we compact? Contract thresholds (owner may veto): ≥64 entries
+     *  OR ≥64 KB OR 30 min idle since the last entry. The idle gate fires
+     *  only when there IS a tail to fold — empty tails cause no ckpt churn. */
+    pfNeedsCompaction(opts: { entriesAfterCkpt: number; logBytesEstimate: number; lastEntryTsMs: number }): boolean {
+        const PF_COMPACT_ENTRIES = 64; // §4.1.3 threshold (owner may veto)
+        const PF_COMPACT_BYTES = 64 * 1024;
+        const PF_COMPACT_IDLE_MS = 30 * 60 * 1000;
+        if (opts.entriesAfterCkpt >= PF_COMPACT_ENTRIES || opts.logBytesEstimate >= PF_COMPACT_BYTES) return true;
+        return opts.entriesAfterCkpt > 0 && Date.now() - opts.lastEntryTsMs >= PF_COMPACT_IDLE_MS;
+    }
+
+    /** Lightweight ledger id/index scan for one sid, POS ORDER: the raw
+     *  host ledger id + the canonical core-id list for every stored element.
+     *  Strings only (no core_json) — feeds the #3642 rekey base counting
+     *  without hydrating any payload bytes. */
+    pfLedgerIds(sid: string): { pos: number; ledgerId: string; coreId: string }[] | null {
+        if (!this.pfAvailable()) return null;
+        try {
+            const rows = this.db
+                .prepare("SELECT pos, ledger_id, core_id FROM pf_rows WHERE sid = ? ORDER BY pos")
+                .all(sid) as { pos: number; ledger_id: string; core_id: string }[];
+            return rows.map((r) => ({ pos: r.pos, ledgerId: r.ledger_id, coreId: r.core_id }));
+        } catch {
+            return null;
+        }
+    }
+
+    /** Water window rows into a map pos→core_json for rehydration after
+     *  restart (§4.1.4): loads EVERY row in [posFrom,posTo] — v6 worlds
+     *  carry no bili-side fold entries (plugin-lane agents own compression),
+     *  so the caller requests the whole frozen prefix and nothing is left
+     *  behind. No plane → empty map (lane unavailable ⇒ caller serves
+     *  baseline). */
+    pfHydrateWindow(sid: string, posFrom: number, posTo: number): Map<number, string> {
+        const out = new Map<number, string>();
+        if (!this.pfAvailable()) return out;
+        const rows = this.db
+            .prepare("SELECT pos, core_json FROM pf_rows WHERE sid = ? AND pos >= ? AND pos <= ? ORDER BY pos")
+            .all(sid, posFrom, posTo) as { pos: number; core_json: string }[];
+        for (const r of rows) out.set(r.pos, r.core_json);
+        return out;
+    }
+
+    /** Delete EVERYTHING for a set of pf sids (session teardown, §8 test 19
+     *  third clause: retire-region bytes die only with the session). The
+     *  relay-session→pf_sid registry lives in session_ext, which the
+     *  existing deleteSession sweep already removes; this sweeps the three
+     *  tables themselves by the caller-supplied registry. */
+    pfDeleteAll(sids: string[]): void {
+        if (sids.length === 0) return;
+        if (!this.pfAvailable()) return;
+        const ph = sids.map(() => "?").join(", ");
+        this.db.transaction(() => {
+            this.db.prepare(`DELETE FROM pf_rows WHERE sid IN (${ph})`).run(...sids);
+            this.db.prepare(`DELETE FROM pf_log WHERE sid IN (${ph})`).run(...sids);
+            this.db.prepare(`DELETE FROM pf_ckpt WHERE sid IN (${ph})`).run(...sids);
+            this.db.prepare(`DELETE FROM pf_render WHERE sid IN (${ph})`).run(...sids);
+            this.db.prepare(`DELETE FROM pf_render_log WHERE sid IN (${ph})`).run(...sids);
+            this.db.prepare(`DELETE FROM pf_render_ckpt WHERE sid IN (${ph})`).run(...sids);
+        });
+    }
+
+    // ------------------------------------------------------------------
+    // #5664 render snapshot plane — the v6 frozen prefix's OUTBOUND-rendered
+    // rows (final wire form; inbound owns all rewrite/compaction). Same LSM
+    // family as the identity plane: row table = current truth, L0 log
+    // journals ops, L1 ckpt folds with an S4 checksum. Read-only soft
+    // degrade on the sqlite path (missing plane ⇒ empty); writes throw into
+    // the surrounding transaction like every other pf_* write.
+    // ------------------------------------------------------------------
+
+    pfRenderAvailable(): boolean {
+        try {
+            const cols = (this.db.prepare("PRAGMA table_info(pf_render)").all() as unknown as { name?: unknown }[])
+                .map((c) => (typeof c?.name === "string" ? c.name : ""));
+            return cols.includes("row_json") && cols.includes("pos");
+        } catch {
+            return false;
+        }
+    }
+
+    /** Current-truth live rows for one sid in pos order (tombstones — NULL
+     *  rows where the kernel hid the ordinal — ride along as null so the
+     *  ordinal structure stays visible). No plane → empty array (lane
+     *  unavailable ⇒ caller serves baseline). */
+    pfRenderRows(sid: string): { pos: number; rowJson: string | null }[] {
+        const out: { pos: number; rowJson: string | null }[] = [];
+        if (!this.pfRenderAvailable()) return out;
+        try {
+            const rows = this.db
+                .prepare("SELECT pos, row_json FROM pf_render WHERE sid = ? ORDER BY pos")
+                .all(sid) as { pos: number; row_json: string | null }[];
+            for (const r of rows) out.push({ pos: r.pos, rowJson: r.row_json === null ? null : String(r.row_json) });
+        } catch {
+            return [];
+        }
+        return out;
+    }
+
+    /** Atomic turn commit for the render plane (#5664): upsert `rows`
+     *  (pos values must be contiguous ascending; under the no-UNWITNESSED-
+     *  recast ruling covered ordinals are never rewritten in place — the
+     *  single sanctioned rewrite is a WITNESSED rebase (#5643 补充裁定),
+     *  which passes `replaceAll: true` and re-inserts the full captured
+     *  table), journal `logEntries` at strictly increasing ls_seq —
+     *  including the kind='dead' verdict that persists a plane death
+     *  forever — and — when `checkpointMetaJson` is given — fold the whole
+     *  log into a fresh ckpt WITH its S4 checksum in the SAME transaction
+     *  (the arm cast, or a witnessed rebase). Any throw → rollback →
+     *  byte-identical plane.
+     *  Returns the next free ls_seq. */
+    pfRenderCommit(
+        sid: string,
+        args: {
+            rows: { pos: number; rowJson: string | null }[];
+            logEntries: { kind: string; payloadJson: string }[];
+            checkpointMetaJson?: string;
+            /** Witnessed-rebase only: wipe this sid's row table BEFORE the
+             *  upsert so the capture replaces it wholesale (one transaction). */
+            replaceAll?: boolean;
+            ts?: number;
+        },
+    ): number {
+        if (!this.pfRenderAvailable()) throw new Error("render plane unavailable");
+        return this.db.transaction((): number => {
+            if (args.replaceAll) {
+                this.db.prepare("DELETE FROM pf_render WHERE sid = ?").run(sid);
+            }
+            const insRow = this.db.prepare(
+                "INSERT INTO pf_render (sid, pos, row_json) VALUES (?, ?, ?) ON CONFLICT (sid, pos) DO UPDATE SET row_json = excluded.row_json",
+            );
+            for (const r of args.rows) insRow.run(sid, r.pos, r.rowJson);
+            // Continuation must clear BOTH the surviving log tail AND the
+            // checkpoint watermark: a fresh checkpoint ABSORBS its own log
+            // entries (delete below), so MAX(log) can sit BEHIND ckpt_ls_seq;
+            // anything numbered <= ckpt would be invisible to pfRenderMeta
+            // forever (entries written after the fold silently lost).
+            const start = Number(
+                Math.max(
+                    (this.db.prepare("SELECT COALESCE(MAX(ls_seq), 0) AS m FROM pf_render_log WHERE sid = ?").get(sid) as { m: number }).m ?? 0,
+                    (this.db.prepare("SELECT ckpt_ls_seq AS n FROM pf_render_ckpt WHERE sid = ?").get(sid) as { n: number } | undefined)?.n ?? 0,
+                ),
+            );
+            const insLog = this.db.prepare("INSERT INTO pf_render_log (sid, ls_seq, kind, payload_json, ts) VALUES (?, ?, ?, ?, ?)");
+            let seq = start;
+            for (const e of args.logEntries) {
+                seq += 1;
+                insLog.run(sid, seq, e.kind, e.payloadJson, args.ts ?? Date.now());
+            }
+            if (args.checkpointMetaJson !== undefined && seq > 0) {
+                const hash = createHash("sha256").update(args.checkpointMetaJson).digest("hex");
+                this.db
+                    .prepare(
+                        "INSERT INTO pf_render_ckpt (sid, ckpt_ls_seq, meta_json, checksum, updated_at) VALUES (?, ?, ?, ?, ?) " +
+                            "ON CONFLICT (sid) DO UPDATE SET ckpt_ls_seq = excluded.ckpt_ls_seq, meta_json = excluded.meta_json, " +
+                            "checksum = excluded.checksum, updated_at = excluded.updated_at",
+                    )
+                    .run(sid, seq, args.checkpointMetaJson, hash, args.ts ?? Date.now());
+                this.db.prepare("DELETE FROM pf_render_log WHERE sid = ?").run(sid);
+            }
+            return seq;
+        });
+    }
+
+    /** Render-plane metadata read (diagnostics / hydration validation): the
+     *  L1 checkpoint plus post-ckpts L0 entries in ls_seq order. */
+    pfRenderMeta(sid: string): {
+        ckpt: { ckptLsSeq: number; metaJson: string; checksum: string; updatedAt: number } | null;
+        log: { lsSeq: number; kind: string; payloadJson: string; ts: number }[];
+    } | null {
+        if (!this.pfRenderAvailable()) return null;
+        try {
+            const c = this.db.prepare("SELECT ckpt_ls_seq, meta_json, checksum, updated_at FROM pf_render_ckpt WHERE sid = ?").get(sid) as
+                | { ckpt_ls_seq: number; meta_json: string; checksum: string; updated_at: number }
+                | undefined;
+            const log = this.db
+                .prepare("SELECT ls_seq, kind, payload_json, ts FROM pf_render_log WHERE sid = ? AND ls_seq > ? ORDER BY ls_seq")
+                .all(sid, c === undefined ? 0 : c.ckpt_ls_seq) as { ls_seq: number; kind: string; payload_json: string; ts: number }[];
+            return {
+                ckpt:
+                    c === undefined ? null : { ckptLsSeq: c.ckpt_ls_seq, metaJson: c.meta_json, checksum: c.checksum, updatedAt: c.updated_at },
+                log: log.map((r) => ({ lsSeq: r.ls_seq, kind: r.kind, payloadJson: r.payload_json, ts: r.ts })),
+            };
+        } catch {
+            return null;
+        }
+    }
+
+    /** S4: does the checkpoint's checksum cover the EXACT meta bytes? False
+     *  kills the render plane for this sid at the caller (rebuild from the
+     *  replay source — never guess). No ckpt yet = nothing to verify = true.
+     */
+    pfRenderCkptIntact(sid: string): boolean {
+        if (!this.pfRenderAvailable()) return false;
+        const c = this.db.prepare("SELECT meta_json, checksum FROM pf_render_ckpt WHERE sid = ?").get(sid) as
+            | { meta_json: string; checksum: string }
+            | undefined;
+        if (c === undefined) return true;
+        return createHash("sha256").update(c.meta_json).digest("hex") === c.checksum;
     }
 
     /** #4949: circuit-breaker re-enable probe — one REAL committed write
