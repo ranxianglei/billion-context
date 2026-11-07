@@ -2,6 +2,26 @@ import type { Session } from "./session.js";
 import type { OpenAIMessage, ResponseInputItem } from "acp-kernel/wire";
 import type { Logger } from "./logger.js";
 
+const REASONING_ECHO_FIELD = /reasoning_(?:content|text)/i;
+
+/** [#5260] The rejection wording that proves an upstream FORBIDS the reasoning
+ *  echo field as extra (as opposed to demanding it be present). Mistral's
+ *  Pydantic schema answers 422 extra_forbidden with "Extra inputs are not
+ *  permitted"; OpenAI-style validators say "Unrecognized request argument". */
+const REASONING_ECHO_EXTRA_REJECT = /extra[_\s]?(?:inputs?|fields?)|not permitted|unrecognized|unknown field/i;
+
+/** [#5260] A 4xx whose body names the reasoning echo field AND rejects it as
+ *  an extra input — the gateway's own schema does not accept the very field
+ *  bili injected (Mistral serving deepseek-named models: static detection
+ *  #1027 matched the model id, but the message schema forbids the field).
+ *  Only this shape may veto strict echo; a demand-class rejection ("must be
+ *  passed back") contains no extra-marker and keeps learning ON. */
+export function isReasoningEchoForbiddenReject(status: number, body: string): boolean {
+    if (status < 400 || status >= 500) return false;
+    if (!REASONING_ECHO_FIELD.test(body)) return false;
+    return REASONING_ECHO_EXTRA_REJECT.test(body);
+}
+
 /** [#684] Strict-echo reasoning upstreams: DeepSeek documents that
  *  thinking-mode "reasoning_content ... must be passed back to the API" —
  *  a rebuilt request whose assistant tool-call turns lost their reasoning is
@@ -10,8 +30,14 @@ import type { Logger } from "./logger.js";
  *  reasoning_text, #2169 — see the loop's UpstreamHttpError handler), then static
  *  detection: the upstream origin OR the request's own model id (#1027 —
  *  DeepSeek models served from non-deepseek gateways never trip the host
- *  check, so every fresh session re-paid the 400 through the learned flag). */
+ *  check, so every fresh session re-paid the 400 through the learned flag).
+ *  [#5260] Veto wins over BOTH: when the upstream itself rejected the injected
+ *  field as extra (isReasoningEchoForbiddenReject), strict echo stays off for
+ *  the session even though static/learned evidence says on — the gateway's
+ *  schema verdict outranks the name-based heuristics (Mistral + deepseek-named
+ *  models 422'd on every tool-call turn until this landed). */
 export function isStrictReasoningEcho(session: Session, upstreamOrigin: string | undefined, model?: string): boolean {
+    if (session.metadata.strictReasoningEchoVeto === true) return false;
     if (session.metadata.strictReasoningEcho === true) return true;
     if (upstreamOrigin !== undefined && /deepseek/i.test(upstreamOrigin)) return true;
     return typeof model === "string" && model.length > 0 && /deepseek/i.test(model);
