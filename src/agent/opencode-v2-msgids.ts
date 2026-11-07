@@ -31,7 +31,7 @@ const STAMPED_HEADER_MAX_BYTES = 16 * 1024;
  *  acp_summary_ namespace out. */
 const HOST_MSG_ID = /^msg_[A-Za-z0-9]+$/;
 
-export type OpencodeV2MessageLike = { id?: unknown; role?: unknown } | null | undefined;
+type OpencodeV2MessageLike = { id?: unknown; role?: unknown } | null | undefined;
 
 /** Extract the full ordered host-id list from a V2 turn's message array, or
  *  undefined when ANY entry cannot be proven usable (whole-turn degrade). */

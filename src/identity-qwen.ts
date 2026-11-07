@@ -25,7 +25,7 @@ import { alignTailIds, findProjectJsonlFiles, headerFirst, readJsonlTail, regist
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-export function qwenVisibleRows(lines: string[]): Array<{ id: string; role?: string }> {
+function qwenVisibleRows(lines: string[]): Array<{ id: string; role?: string }> {
     const out: Array<{ id: string; role?: string }> = [];
     for (const line of lines) {
         let r: unknown;
