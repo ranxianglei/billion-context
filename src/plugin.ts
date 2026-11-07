@@ -3250,7 +3250,11 @@ export async function pipePluginChatWithStrip(
         // managed fields — audit them (argument frames excluded: #1039).
         if (!openaiFrameHasToolCalls(choices)) auditRawForward(rawEvent);
         if (drain.length > 0) return drain + rawEvent + "\n\n";
-        if (!hadText && anyPending()) return flushTails() + rawEvent + "\n\n";
+        // A non-terminal frame with no text, no tool call and no other delta key
+        // (MTPLX interleaves `delta:{}` progress frames mid-stream) carries nothing
+        // a held tail must precede. Draining on it split a render tag at the frame
+        // and leaked the tail as prose (#5192 shape) — same disease as #2405.
+        if (!hadText && anyPending() && hadTextOtherThanTextFields(choices)) return flushTails() + rawEvent + "\n\n";
         return rawEvent + "\n\n";
     };
     const processAnthropic = (ev: Record<string, unknown>, rawEvent: string): string => {
