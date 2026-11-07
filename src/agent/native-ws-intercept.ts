@@ -28,8 +28,10 @@
 //     per-dispatch preparation hooks on their NativeInterceptState (dsh —
 //     its identity stamping lives in state.headersFor, not in a host header
 //     event) run that preparation inside the deferred window and merge the
-//     stamped headers onto the upgrade init; a lane without those hooks sees
-//     byte-identical verbatim forwarding;
+//     stamped headers onto the upgrade init. Each response.create then awaits
+//     body-aware preparation in its sender's scope; cached sockets refuse changed
+//     identity/model, activation or origin instead of reusing stale upgrade
+//     metadata. A lane without those hooks sees byte-identical forwarding;
 //   * leaves everything else alone: non-model WS (devtools, socket.io, …),
 //     already-/bili/-routed URLs, control-plane paths, other protocols.
 //
@@ -97,6 +99,7 @@ type GlobalRecord = Record<PropertyKey, unknown>;
 
 const CONNECTING = 0;
 const CLOSING = 2;
+const CLOSED = 3;
 
 /** Claim predicate for the Codex Responses WS shape. Returns the scheme-
  *  normalized http(s) upstream URL when this connection should be routed,
@@ -147,6 +150,61 @@ export function rewriteCodexResponsesWsUrl(target: string, origin: string): stri
     return `${proxyWs}/bili/${target}`;
 }
 
+function prepareWsFrames(socket: WsInstanceLike, target: string, state: NativeInterceptState, identity: Record<string, string> | undefined, origin: NativeInterceptState["wsOrigin"], generation: unknown): WsInstanceLike {
+    const assertCurrent = (): void => {
+        if ((globalThis as GlobalRecord)[ACTIVE_STATE] !== state || (globalThis as GlobalRecord)[ACTIVE_STATE_SEQ] !== generation || (state.wsOrigin ?? state.origin) !== origin) {
+            throw new Error("bili-native(ws): plugin state/origin changed; reconnect before sending");
+        }
+    };
+    const send = socket.send.bind(socket);
+    let pending = Promise.resolve();
+    let failed = false;
+    socket.send = (data: unknown): void => {
+        if (socket.readyState !== 1) return send(data);
+        let frame: unknown;
+        if (typeof data === "string") {
+            try { frame = JSON.parse(data); } catch { /* Preserve malformed/control frames. */ }
+        }
+        const isCreate = frame !== null && typeof frame === "object" && (frame as { type?: unknown }).type === "response.create";
+        // Register each continuation in the SENDER's ALS scope, not the upgrade's.
+        pending = pending.then(async () => {
+            if (failed || socket.readyState !== 1) return;
+            assertCurrent();
+            if (!isCreate || typeof data !== "string") return send(data);
+            if (state.toolsReady !== undefined) await withTimeout(state.toolsReady, state.readyTimeoutMs ?? 15_000);
+            assertCurrent();
+            const init: RequestInit = { body: data, headers: identity === undefined ? undefined : { ...identity } };
+            const verdict = await state.takeoverGate?.(target, { bytes: Buffer.byteLength(data) }, init);
+            if (verdict !== undefined && verdict !== true) throw new Error("bili-native(ws): request attribution refused on a reused connection");
+            assertCurrent();
+            await state.beforeSend?.(target, init);
+            assertCurrent();
+            const currentHeaders = state.headersFor?.(target);
+            const current = Object.fromEntries(new Headers(currentHeaders));
+            const prepared = Object.fromEntries(new Headers(init.headers));
+            const keys = new Set([...Object.keys(identity ?? {}), ...Object.keys(current), ...Object.keys(prepared)]);
+            if ([...keys].some(key => identity?.[key] !== current[key] || identity?.[key] !== prepared[key])) {
+                throw new Error("bili-native(ws): request identity/model changed; reconnect before sending");
+            }
+            send(init.body ?? data);
+        }).catch((error: unknown) => {
+            if (failed) return;
+            failed = true;
+            const event = new Event("error");
+            Object.assign(event, { error });
+            socket.dispatchEvent(event);
+            // WHATWG clients allow only 1000 or application codes 3000–4999.
+            try {
+                socket.close(4008, "bili request preparation refused");
+            } catch (closeError) {
+                logHostEvent("error", "[native-client]", `bili-native(ws): refusal close failed (${closeError instanceof Error ? closeError.message : String(closeError)})`);
+                try { socket.close(); } catch { /* Best effort after withholding the frame. */ }
+            }
+        });
+    };
+    return socket;
+}
+
 /** Deferred-connection shell: stands in for the real WebSocket while the
  *  proxy origin is still settling. Listeners/on*-handlers/binaryType recorded
  *  during the window are replayed onto the real instance at attach; accessors
@@ -158,6 +216,7 @@ export function rewriteCodexResponsesWsUrl(target: string, origin: string): stri
 class DeferredWebSocket {
     private real: WsInstanceLike | undefined;
     private cancelled = false;
+    private closed = false;
     private settled = false;
     private listeners = new Map<string, Array<{ el: EventListener | EventListenerObject; once: boolean }>>();
     private handlers: Partial<Record<"onopen" | "onerror" | "onclose" | "onmessage", EventListener | null>> = {};
@@ -175,18 +234,16 @@ class DeferredWebSocket {
     private async settle(rest: unknown[]): Promise<void> {
         if (this.settled) return;
         this.settled = true;
-        let prep: WsConnectionPrep | undefined;
         try {
-            prep = await this.resolvePrep();
-        } catch {
-            prep = undefined;
-        }
-        // Re-check AFTER the await: a close() may have landed mid-window.
-        if (this.cancelled || this.real !== undefined) return;
-        try {
+            const prep = await this.resolvePrep();
+            // Re-check AFTER the await: a close() may have landed mid-window.
+            if (this.cancelled || this.real !== undefined) return;
             this.attach(this.construct(prep?.url ?? this.requestedUrl, prep?.rest ?? rest));
         } catch (error) {
-            // constructLive exhausted every candidate: surface a socket error +
+            if (this.cancelled) return;
+            this.closed = true;
+            // Stale preparation must not silently construct a direct socket.
+            // Surface a socket error +
             // abnormal close so client cleanup proceeds, instead of letting the
             // rejected promise become an unhandledRejection in the host process.
             const errEvent = new Event("error");
@@ -265,7 +322,7 @@ class DeferredWebSocket {
             this.real.close(code, reason);
             return;
         }
-        if (this.cancelled) return;
+        if (this.cancelled || this.closed) return;
         this.cancelled = true;
         queueMicrotask(() => {
             const event = new Event("close");
@@ -275,7 +332,7 @@ class DeferredWebSocket {
     }
 
     get readyState(): number {
-        return this.real?.readyState ?? (this.cancelled ? CLOSING : CONNECTING);
+        return this.real?.readyState ?? (this.closed ? CLOSED : this.cancelled ? CLOSING : CONNECTING);
     }
 
     get url(): string {
@@ -480,7 +537,15 @@ export function installNativeWebSocketIntercept(initialState: NativeInterceptSta
             // event) keep today's exact sync paths below.
             const hooksArmed = state.takeoverGate !== undefined || state.toolsReady !== undefined || state.headersFor !== undefined || state.beforeSend !== undefined;
             const initLike = wsInitLike(rest[0]);
-            const origin = state.wsOrigin ?? state.origin;
+            let origin = state.wsOrigin ?? state.origin;
+            let originSettled = false;
+            const generation = (globalThis as GlobalRecord)[ACTIVE_STATE_SEQ];
+            const assertCurrent = (): void => {
+                if (!hooksArmed) return;
+                if ((globalThis as GlobalRecord)[ACTIVE_STATE] !== state || (globalThis as GlobalRecord)[ACTIVE_STATE_SEQ] !== generation || ((origin !== undefined || originSettled) && (state.wsOrigin ?? state.origin) !== origin)) {
+                    throw new Error("bili-native(ws): plugin activation changed during connection preparation");
+                }
+            };
             if (!hooksArmed && typeof origin === "string") {
                 const rewritten = rewriteCodexResponsesWsUrl(target, origin);
                 // Record the HTTP-shaped origin — the fetch lane records http origins and the
@@ -494,20 +559,25 @@ export function installNativeWebSocketIntercept(initialState: NativeInterceptSta
             // by readyOrigin's timeout, same hold the fetch lane applies). A
             // pending wsOrigin (inline bridge booting) rides the same shell:
             // settle undefined → DIRECT degrade below.
+            let identity: Record<string, string> | undefined;
+            let routed = false;
             return new DeferredWebSocket(
                 urlStr,
                 rest,
                 async () => {
+                    assertCurrent();
                     if (hooksArmed) {
                         if (state.takeoverGate !== undefined) {
                             let verdict: GateVerdict;
                             try {
                                 verdict = await state.takeoverGate(target, undefined, initLike);
                             } catch (err) {
+                                assertCurrent();
                                 logHostEvent("error", "[native-client]", `bili-native(ws): takeover gate threw (${err instanceof Error ? err.message : String(err)}) — Codex Responses WebSocket goes DIRECT: ${urlStr}`);
                                 state.onDispatch?.(target, "refused");
                                 return undefined;
                             }
+                            assertCurrent();
                             if (verdict !== true) {
                                 state.onDispatch?.(target, "refused");
                                 return undefined;
@@ -520,6 +590,13 @@ export function installNativeWebSocketIntercept(initialState: NativeInterceptSta
                     // cold start cannot hold the construction in CONNECTING
                     // forever — it degrades DIRECT below instead.
                     const settled = state.wsOrigin instanceof Promise ? await raceWsOriginBound(state.wsOrigin) : await readyOrigin(state);
+                    if (hooksArmed && origin === undefined) {
+                        const current = state.wsOrigin ?? state.origin;
+                        if (current !== undefined && current !== settled) throw new Error("bili-native(ws): proxy origin changed during bootstrap");
+                        origin = current;
+                    }
+                    originSettled = true;
+                    assertCurrent();
                     if (settled === undefined) {
                         if (!warnedDirect) {
                             warnedDirect = true;
@@ -535,15 +612,22 @@ export function installNativeWebSocketIntercept(initialState: NativeInterceptSta
                             logHostEvent("error", "[native-client]", `bili-native(ws): beforeSend hook failed (${err instanceof Error ? err.message : String(err)}) — connection continues (#2399)`);
                         }
                     }
+                    assertCurrent();
                     const rewritten = rewriteCodexResponsesWsUrl(target, settled);
                     noteRoutedOrigin(state, rewritten.replace(/^ws/i, "http"));
                     state.onDispatch?.(rewritten, "rewrite");
-                    // Merge from the RAW second argument (string/array subprotocol
-                    // forms survive; initLike is the object-only view the hooks see).
-                    const mergedRest = hooksArmed ? restWithInit(rest, mergeWsInitHeaders(rest[0], state.headersFor?.(target))) : rest;
+                    const stamps = hooksArmed ? state.headersFor?.(target) : undefined;
+                    identity = stamps === undefined ? undefined : Object.fromEntries(new Headers(stamps));
+                    routed = true;
+                    // Keep #5839's constructor/subprotocol handling unchanged.
+                    const mergedRest = hooksArmed ? restWithInit(rest, mergeWsInitHeaders(rest[0], stamps)) : rest;
                     return mergedRest === rest ? { url: rewritten } : { url: rewritten, rest: mergedRest };
                 },
-                constructLive,
+                (finalUrl, args) => {
+                    assertCurrent();
+                    const socket = constructLive(finalUrl, args);
+                    return hooksArmed && routed ? prepareWsFrames(socket, target, state, identity, origin, generation) : socket;
+                },
             );
         }
         for (const key of ["CONNECTING", "OPEN", "CLOSING", "CLOSED"] as const) {
