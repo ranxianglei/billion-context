@@ -18,7 +18,6 @@ import { codexAlignedWindow } from "./codex-models.js";
 import { fetchWithTimeout, upstreamTimeoutMs } from "./fetch-util.js";
 import { getUpstreamConnectionStatus, resolveProxy, resolveProxyDecision, proxyDispatcher, type UpstreamProxyDecision } from "./upstream-proxy.js";
 import { buildProxyFailureResponse, isExpectedFailFast, type SkippedProxyInfo } from "./upstream-fail.js";
-import { getUpstreamAlerts } from "./upstream-alerts.js";
 import { hostIdForLog, maskHostPortForLog, setMaskHostsEnabled, maskUrlForLog, maskUrlsInText } from "./log-mask.js";
 // Protocol codecs + the historical-image strip primitive live in the kernel now
 // (single source of truth shared with the omp/pi adapters): import from
@@ -100,7 +99,7 @@ import { noteRequest } from "./attach-heartbeat.js";
 import { queryLogLines } from "./web/logs-query.js";
 import { configFile, defaultLogFile, sessionsDir, stateDir } from "./paths.js";
 import { atomicWriteInstanceFile, clearProxyInstanceFile, classifySameLanePeer, entryShape, findPresentUnverifiedSameLaneTwin, findSameLanePredecessor, findVerifiedSameLaneTwin, isPidAlive, listInstances, markPortReleased, probePid, readProxyInstanceFile, registerInstanceAndWarn, resolveOwnFingerprint, sameInstanceShape, SPAWN_FINGERPRINT_ENV, unregisterInstance, warnOnNewPeers, writeSpawnPortLog, type InstanceShape, type PidProbe, type ProxyInstanceFile, type RegistryEntry, type SameLanePeer } from "./instance.js";
-import { createServedMarkerWriter, peerStillContests, reapStaleWriterMarkers, writerMarkerDir, type ServedMarkerWriter } from "./served-markers.js";
+import { createServedMarkerWriter, peerStillContests, processStartMs, reapStaleWriterMarkers, writerMarkerDir, type ServedMarkerWriter } from "./served-markers.js";
 import { recordSplitBrainContest, registerSplitBrainEvidenceCheck } from "./storage/runtime-status.js";
 import { holderProbeOrigin, mayClobberPointer, probeHolderForHint, probeOwnerInfo, resolvePortClaim, verifyEntryOwnsPort } from "./port-owner.js";
 import { armEventLoopWatchdog } from "./event-loop-watchdog.js";
@@ -114,7 +113,7 @@ import { sanitizeResponsesInputIds, dropWhitespaceResponsesMessages, normalizeRe
 import { CODEX_COMPACT_HEALTH_RATIO, codexCompactMode, codexHealthBarApplies, hasCompactionTrigger, stripBiliCompactionItems, replaceBiliCompactionItems, codexCompactGate, codexCompactGatePre, buildTriggerForgeBody, mergeForgedSummaries } from "./codex-compact.js";
 import { emitPreflightError } from "./stream-error.js";
 import { agentProviderRecipes } from "./agent-providers.js";
-import { affinityToken, claudeSubagentAgentId, claudeSubagentSplit, clientConversationHeader, codexTurnIdentity, conversationHeaderSource, dshPersonaFingerprintApplies, instructionsFingerprintApplies, openaiSystemTextForPersona, preferPromptCacheKeyIdentity, type ConversationIdentity } from "./session-id.js";
+import { affinityToken, claudeSubagentAgentId, claudeSubagentSplit, clientConversationHeader, codexTurnIdentity, conversationHeaderSource, dshPersonaFingerprintApplies, openaiSystemTextForPersona, preferPromptCacheKeyIdentity, type ConversationIdentity } from "./session-id.js";
 import { prefixAffinity, type AnonymousAffinity } from "./prefix-affinity.js";
 import { maybeAdoptForkBlocks, maybeAdoptResume, reconcileDerivedLineage } from "./fork-adoption.js";
 import { flushPrefixAffinity, hydratePrefixAffinity, scheduleAffinityPersist } from "./affinity-persist.js";
@@ -416,7 +415,7 @@ export function googlePathKind(urlPath: string): GooglePathKind | null {
  *  `parsed.model`. Returns undefined when the path carries no model or an
  *  undecodable one. */
 export function googleModelFromPath(urlPath: string): string | undefined {
-    const m = /\/models\/([^/:?]+):(?:streamGenerateContent|generateContent|countTokens)\b/.exec(urlPath);
+    const m = /\/models\/([^:?]+):(?:streamGenerateContent|generateContent|countTokens)\b/.exec(urlPath);
     if (!m || !m[1]) return undefined;
     try {
         return decodeURIComponent(m[1]);
@@ -764,6 +763,10 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
             // feeding the context-free [error] AbortError storm.
             const clientAbort = (e?.name === "AbortError" || /abort/i.test(String(e?.message ?? ""))) && (res.destroyed || res.writableEnded);
             if (clientAbort) log("info", `client aborted mid-stream: ${msg}`);
+            // #2465/#5663: classified transport deaths are already fully described on
+            // one line (kind/code/errno/syscall/address/hint) — stack frames were pure
+            // noise in field EHOSTUNREACH storms (305 failures × 7).
+            else if (err instanceof Error && (err as Error & { biliTransportFailure?: boolean }).biliTransportFailure === true) log("error", msg);
             // #4254: a deliberate circuit-breaker fail-fast logs nothing here — the
             // throttled [warn] at the throw site is the canonical record, so one dead
             // upstream stops re-emitting a per-request [error]+stack on every round.
@@ -1344,7 +1347,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         {
             const markerDir = writerMarkerDir(stateDir());
             servedWriter = createServedMarkerWriter(
-                { instanceId, pid: process.pid, origin, version: VERSION, lane: launcherLane },
+                { instanceId, pid: process.pid, origin, version: VERSION, lane: launcherLane, startedAt: processStartMs(Date.now()) },
                 markerDir,
                 (level, msg) => log(level, msg),
                 {
@@ -1936,6 +1939,11 @@ export type Prepared = {
      *  prompt carries the MCP name-mapping note (withMcpDialectNote). Threads
      *  to the round-2 system rebuild for byte-parity. */
     mcpDialectNote?: boolean;
+    /** #5418 watermark fastpath: extra SUCCESS-response headers built by the
+     *  prepare lane (x-bili-pf-seq = this turn's server-measured element
+     *  count, for client-side watermark convergence). The relay's 2xx path
+     *  merges them onto the upstream response headers. */
+    responseExtraHeaders?: Record<string, string>;
     responsesTextProtocol?: boolean;
     resetAfterSuccess?: boolean;
     responsesProjection?: ResponsesProjection;
@@ -2371,6 +2379,32 @@ export function applyReasoningDrop(
     return out;
 }
 
+/** Predicate factory for the experimental fold-point carrier relocation
+ *  "thinking clear" (kernel Config.reasoningDroppable): a reasoning core may
+ *  be dropped at the moment its compress pair is repositioned ONLY when it
+ *  carries no wire signature. Signed Anthropic thinking/redacted_thinking
+ *  bytes are NEVER rewritten or deleted (#1658 doctrine). Returns undefined
+ *  for sessions where the kernel must not drop anything at all: strict-echo
+ *  upstreams (#684 — reasoning must round-trip with tool_calls) and views
+ *  holding ANY signed thinking block (presence-based gate, same posture as
+ *  planReasoningDrop), so a conservative misclassification can never break a
+ *  signed session. Pure + cheap; install per request. */
+export function makeFoldPointReasoningDroppable(
+    msgs: BiliMessage[],
+    strictEcho: boolean,
+): ((m: import("acp-kernel").CoreMessage) => boolean) | undefined {
+    if (strictEcho) return undefined;
+    if (msgs.some(hasSignedThinkingBlock)) return undefined;
+    return (m: import("acp-kernel").CoreMessage): boolean => {
+        const core = m as BiliMessage;
+        if (core.contentType === "reasoning") {
+            return !(typeof core.thinkingSignature === "string" && core.thinkingSignature.length > 0);
+        }
+        const raw = core.rawAnthropicBlock as { type?: unknown } | undefined;
+        return raw?.type !== "redacted_thinking";
+    };
+}
+
 /** [#651] Strip oversized reasoning from closed compress turns (see
  *  src/reasoning-drop.ts) with an ops log line when anything was dropped.
  *  Standalone form for callers holding an anchor-intact array (tests, ad-hoc
@@ -2517,6 +2551,11 @@ export function warnReasoningPairs(
     if (tracked.fresh.length === 0) return;
     log("warn", `[${sessionId}] reasoning-pair-violated: ${violators.length} assistant tool-call message(s) lack reasoning_content while ${withRc} carry it — strict-echo upstreams (DeepSeek thinking mode) will reject the request; first seen: ${violationNamed(tracked.fresh, tracked.ongoing, tracked.maxRepeat)} (#684/#762/#2864)`);
 }
+
+// [#5688] shared egress repair for adjacent per-turn effort directives —
+// implementation moved to its own leaf module so loop/ can import it without
+// a server.ts import cycle; re-exported here for existing consumers.
+export { dedupeAdjacentOutputConfig } from "./dedupe-adjacent-output-config.js";
 
 /** [#684] Anthropic-wire twin of the openai sentinel, narrowed by [#1327]:
  *  warn only when bili itself lost thinking — a tool_use block that rode an
@@ -3643,6 +3682,31 @@ export function warnRouteMissIfNew(
     return true;
 }
 
+// #5612: complement to warnRouteMissIfNew — a providers key DID match but the
+// model id is absent from that route's per-model table (e.g. client renamed ids
+// /,.→-), so overrides silently drop. Once per upstream+model, hints the rename.
+const modelNameMissWarned = new Set<string>();
+
+export function _resetModelNameMissWarnedForTest(): void {
+    modelNameMissWarned.clear();
+}
+
+export function warnModelNameMissIfNew(
+    origin: string | undefined,
+    model: string | undefined,
+    declaredNames: string[],
+    log: (level: string, msg: string) => void,
+): boolean {
+    if (!origin || !model || declaredNames.length === 0) return false;
+    const key = `${origin}\u0000${model}`;
+    if (modelNameMissWarned.has(key)) return false;
+    modelNameMissWarned.add(key);
+    const shown = declaredNames.slice(0, 8).join(", ");
+    const more = declaredNames.length > 8 ? `, … (+${declaredNames.length - 8})` : "";
+    log("warn", `[route] providers key ${hostIdForLog(origin)} matched but model=${model} is not among its declared per-model entries [${shown}${more}] — its context/output/compress overrides are IGNORED. If the client renames model ids (/ . → -), declare that spelling too; otherwise add "${model}" under the providers key.`);
+    return true;
+}
+
 /** #736 / #2317: the preflight fail-fast "effective window below native" note. The
  *  operator and codex-route-hit texts are preserved byte-for-byte; the new
  *  codex-route-miss branch fires when the shrink is codex-driven AND the request's
@@ -4558,11 +4622,15 @@ function formatBytes(n: number): string {
 // bytes are counted with Buffer.byteLength since undici sends UTF-8 bytes even
 // for string bodies (.length would count UTF-16 chars and undercount any
 // non-ASCII injection). Omitted on paths that fail fast without forwarding.
-// #4528: inbound histories past this size pay an O(messages) synchronous scan
-// pass per turn on the main thread, large enough to starve the event loop and
+// #4528: bili's own per-request processing past this WALL-CLOCK budget means
+// synchronous main-thread work large enough to starve the event loop and
 // freeze every endpoint on the same listener — warn so a pathological session
 // shows up in the log instead of being found through a frozen UI.
-const SLOW_SESSION_MSG_WARN = 1000;
+// #5744: the trigger used to be message COUNT (>1000), which cannot separate
+// cost from size — one reporter session saved at 0.8s AND 14.5s at the same
+// ~3k msgs. Wall clock IS the cost; the info line above keeps reporting the
+// count for correlation.
+const SLOW_SESSION_MS_WARN = 1000;
 export function logRequestCost(log: (level: string, msg: string) => void, sessionId: string, msgs: number | null, inboundBytes: number, t0: number, outbound?: string | Buffer): void {
     const ms = Math.max(0, Math.round(performance.now() - t0));
     const outboundField = outbound !== undefined ? `, outbound=${formatBytes(Buffer.byteLength(outbound))}` : "";
@@ -4571,8 +4639,8 @@ export function logRequestCost(log: (level: string, msg: string) => void, sessio
     // #5408: this line is THE observation point — a hot-at-attach session that
     // never produces one is silent compression loss (the incident signature).
     noteRequest(sessionId);
-    if (msgs !== null && msgs > SLOW_SESSION_MSG_WARN) {
-        log("warn", `[${sessionId}] slow-session: ${msgs} msgs / inbound=${formatBytes(inboundBytes)} took local=${ms}ms — per-turn O(messages) synchronous scans are starving the event loop (#4528); consider closing/restarting the session or enabling compression`);
+    if (ms > SLOW_SESSION_MS_WARN) {
+        log("warn", `[${sessionId}] slow-session: ${msgs ?? "?"} msgs / inbound=${formatBytes(inboundBytes)} took local=${ms}ms — synchronous per-turn work is starving the event loop (#4528/#5744); consider closing/restarting the session or enabling compression`);
     }
 }
 

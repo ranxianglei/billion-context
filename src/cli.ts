@@ -11,6 +11,8 @@
  *   bili start --config FILE      path to config file (default: XDG)
  *   bili start --passthrough      forward without compression
  *   bili pi/codex/claude/omp [args]   start a proxy + launch a client via cert-MITM
+ *   bili -i pi                     launch pi on the IN-PROCESS engine (≡ bili pi-inline)
+ *   bili -s pi                     force the proxy posture: spawn/attach, never inline
  *   bili export [id] [--full]     export a persisted session as a handoff doc
  *                                  (--jsonl: deterministic JSONL dump #2671)
  *   bili acp-cache diff <dir>     attribute cache breaks from ACP_DUMP_BODY dumps
@@ -37,6 +39,8 @@ import { checkForUpdate, startAutoUpdate } from "./update.js";
 import { registerUpdateActions } from "./server/update-actions.js";
 import { startAdvisoryWatcher, getAdvisoryState, advisoryDeferring, advisoryBlocksVersion, advisoryAwaitingFirstCheck } from "./advisory.js";
 import { startReleaseNotesWatcher } from "./update-notes.js";
+import { startRemoteNoticesWatcher } from "./remote-notices.js";
+import { hydrateNoticeReceipts } from "./notice-store.js";
 import { resolveProxy } from "./upstream-proxy.js";
 import { runMcpStdio } from "./mcp.js";
 import { PLUGIN_AGENTS, isPluginAgent, pluginInstall, pluginRemove, pluginStatusAll, pluginUpdate, renderPluginList, warnActivePluginSessions, type PluginAgent } from "./plugin-install.js";
@@ -75,6 +79,7 @@ Usage:
   bili mcode [opts --] [args]      start a proxy + launch MiniMax Code against it (cert-MITM)
   bili aider [opts --] [args]      start a proxy + launch aider against it (cert-MITM)
   bili copilot [opts --] [args]    start a proxy + launch Copilot CLI against it (cert-MITM)
+  bili kiro [opts --] [args]       start a proxy + launch Kiro CLI (kiro-cli) against it (cert-MITM)
   bili amp [opts --] [args]        start a proxy + launch Amp against it (cert-MITM)
   bili crush [opts --] [args]      start a proxy + launch Crush against it (cert-MITM)
   bili zed [opts --] [args]        start a proxy + launch the Zed editor against it (cert-MITM)
@@ -135,12 +140,12 @@ Usage:
   bili --version                   print version
   bili --help                      show this help
 
-Launcher (bili pi / bili codex / bili claude / bili omp / bili opencode / bili hermes / bili dsh / bili codebuddy / bili qoder / bili trae / bili jcode / bili kimi / bili gemini / bili iflow / bili qwen / bili antigravity / bili mcode / bili aider / bili copilot / bili amp / bili crush / bili zed / bili goose):
+Launcher (bili pi / bili codex / bili claude / bili omp / bili opencode / bili hermes / bili dsh / bili codebuddy / bili qoder / bili trae / bili jcode / bili kimi / bili gemini / bili iflow / bili qwen / bili antigravity / bili mcode / bili aider / bili copilot / bili amp / bili crush / bili zed / bili goose / bili kiro):
   Brings up a proxy on an independent port (a fresh instance every launch), then runs the client pointed at it via HTTPS_PROXY + the proxy's
   MITM CA — no config-file edits. Discovered HTTPS upstream domains are
   auto-whitelisted for MITM so the proxy TLS-terminates exactly the hosts the
   client uses; HTTP / localhost providers go direct. pi/claude/qoder trust the CA
-  via NODE_EXTRA_CA_CERTS, codex/trae/jcode/aider/copilot/amp/crush/zed via SSL_CERT_FILE
+  via NODE_EXTRA_CA_CERTS, codex/trae/jcode/aider/copilot/amp/crush/zed via SSL_CERT_FILE, kiro via both
   (aider also REQUESTS_CA_BUNDLE). Goose trusts neither (rustls), so it is redirected per-endpoint instead. Proxy killed on client exit.
   bili flags (-F, --mitm-domain, --port, ...) must precede the client name;
   everything after the client name is passed through to the client.
@@ -166,6 +171,7 @@ Launcher (bili pi / bili codex / bili claude / bili omp / bili opencode / bili h
     bili mcode                            # launch MiniMax Code through the proxy (cert-MITM; provider hosts from ~/.minimax*/config.yaml or the official agent.minimax.* endpoints)
     bili aider                            # launch aider through the proxy (cert-MITM; endpoint from OPENAI_API_BASE/--openai-api-base/.aider.conf.yml or api.openai.com+api.anthropic.com by default)
     bili copilot                          # launch Copilot CLI through the proxy (cert-MITM; api.githubcopilot.com + plan subdomains whitelisted by default)
+    bili kiro                             # launch Kiro CLI through the proxy (cert-MITM; runtime.<region>.kiro.dev model gateways whitelisted; developer/system roles re-voiced as user)
     bili amp                              # launch Amp through the proxy (cert-MITM; ampcode.com whitelisted by default)
     bili crush                            # launch Crush through the proxy (cert-MITM; api.anthropic.com/api.openai.com/openrouter.ai + crush.json base_urls whitelisted)
     bili zed                              # launch the Zed editor through the proxy (cert-MITM; built-in provider hosts + settings.json api_urls whitelisted; Linux TLS env)
@@ -175,6 +181,10 @@ Launcher (bili pi / bili codex / bili claude / bili omp / bili opencode / bili h
     bili -F http://127.0.0.1:7897 codex   # route bili's upstream through a proxy (gost-style -F)
 
 Options (override config file / env):
+  -i, --inline                     run the client's compression IN-PROCESS (pi/opencode;
+                                   same as "bili pi-inline"; must precede the client name)
+  -s, --server                     force the proxy posture — spawn/attach, never inline
+                                   (pi/opencode; overrides an inherited BILI_PI_INLINE=1)
   -F <url>                         upstream proxy to forward through (gost-style;
                                    http://host:port; must precede the client name)
   --port <N>                       listen port (start: 8787; launcher default: random free port)
@@ -235,6 +245,7 @@ export function parseArgs(argv: string[]): Parsed {
     const positional: string[] = [];
     let client: ClientName | undefined;
     let clientArgs: string[] = [];
+    let posture: "inline" | "server" | undefined;
     const mitmDomains: string[] = [];
     let exportSelector: string | undefined;
     let registerConversationId: string | undefined;
@@ -283,6 +294,22 @@ export function parseArgs(argv: string[]): Parsed {
             case "--version":
             case "-V":
                 command = "version";
+                break;
+            case "-i":
+            case "--inline":
+                if (posture === "server") {
+                    console.error("bili: -i/--inline and -s/--server are mutually exclusive — pick one");
+                    process.exit(2);
+                }
+                posture = "inline";
+                break;
+            case "-s":
+            case "--server":
+                if (posture === "inline") {
+                    console.error("bili: -i/--inline and -s/--server are mutually exclusive — pick one");
+                    process.exit(2);
+                }
+                posture = "server";
                 break;
             case "--debug":
                 overrides.ACP_DEBUG = "1";
@@ -444,12 +471,13 @@ export function parseArgs(argv: string[]): Parsed {
 
     // First positional (if any) is the command. "start" | "update" | "test"
     // are recognized; an unknown command is an error.
-    if (client) {
+    const informational = command === "help" || command === "version";
+    if (!informational && client) {
         command = "launch";
-    } else if (positional.length > 0) {
+    } else if (!informational && positional.length > 0) {
         const cmd = positional[0]!;
         if (cmd === "start") {
-            command = command === "help" || command === "version" ? command : "start";
+            command = "start";
         } else if (cmd === "update") {
             command = "update";
         } else if (cmd === "doctor") {
@@ -546,6 +574,32 @@ export function parseArgs(argv: string[]): Parsed {
         }
     }
 
+    // -i/-s posture flags (#5428): translate onto the existing lanes so the
+    // launcher needs no new plumbing — `-i pi` IS `bili pi-inline` (env scrub
+    // + extension preflight + BILI_PI_INLINE=1, no proxy spawned), and
+    // `-s pi` pins BILI_PI_INLINE=0 on the child so an inherited/ambient
+    // inline env can't flip it while the launcher proxy runs.
+    if (posture !== undefined) {
+        if (!client) {
+            console.error(`bili: ${posture === "inline" ? "-i/--inline" : "-s/--server"} needs a client lane — e.g. \`bili -${posture === "inline" ? "i" : "s"} pi\``);
+            process.exit(2);
+        }
+        const inlineVariant = client === "pi" || client === "pi-inline" ? "pi-inline" : client === "opencode" || client === "opencode-inline" ? "opencode-inline" : undefined;
+        if (inlineVariant === undefined) {
+            console.error(`bili: -i/-s only apply to the pi and opencode lanes (got "${client}")`);
+            process.exit(2);
+        }
+        if (posture === "inline") {
+            client = inlineVariant;
+        } else if (client === inlineVariant) {
+            console.error(`bili: ${client} IS the inline lane — use \`bili -s ${inlineVariant === "pi-inline" ? "pi" : "opencode"}\``);
+            process.exit(2);
+        } else {
+            if (inlineVariant === "pi-inline") overrides.BILI_PI_INLINE = "0";
+            else overrides.BILI_OPENCODE_INLINE = "0";
+        }
+    }
+
     return { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, sessionsSub, sessionsTarget, sessionsNoVacuum, sessionsApply, sessionsRestoreTarget, storageDays, storageVacuum, storageDryRun, jsonOutput, doctorJson, doctorFix, packAction, packSpec, packProject, packForce };
 }
 
@@ -631,7 +685,7 @@ export async function main(): Promise<void> {
                     packageName: PACKAGE_NAME,
                     resolveProxy: updaterResolveProxy,
                     updateTag,
-                    globalCheck: () => checkForUpdate({ packageName: PACKAGE_NAME, currentVersion: VERSION, autoUpdate: true, resolveProxy: updaterResolveProxy, updateTag }, true),
+                    globalCheck: async () => { await checkForUpdate({ packageName: PACKAGE_NAME, currentVersion: VERSION, autoUpdate: true, resolveProxy: updaterResolveProxy, updateTag }, true); },
                     log: (_level, msg) => console.log(msg),
                 });
                 for (const line of lines) console.log(line);
@@ -900,4 +954,13 @@ export async function main(): Promise<void> {
             resolveProxy: (url) => resolveProxy(opts.routes, opts.proxy, url, opts.proxyFallback),
         });
     }
+    // #5548 P3: remote announcements feed (display-only, like release notes)
+    // — independent of autoUpdate for the same reason as the other watchers.
+    startRemoteNoticesWatcher({
+        remoteAnnouncementsUrl: opts.remoteAnnouncementsUrl,
+        resolveProxy: (url) => resolveProxy(opts.routes, opts.proxy, url, opts.proxyFallback),
+    });
+    // #5548: notice dismissal receipts ride the unified storage — hydrate the
+    // in-memory view once at boot (and migrate any legacy JSON file one time).
+    void hydrateNoticeReceipts();
 }

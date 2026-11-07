@@ -145,6 +145,23 @@ export function throttle429MaxDelayMs(): number {
     return Number.isFinite(v) && v >= 0 ? v : THROTTLE_429_MAX_DELAY_MS;
 }
 
+/** BILI_THROTTLE_429_SCOPE > network.throttle429Scope > "credential". Hold
+ *  granularity for marker-less upstream 429s (#5199/#5853 decision 1, option
+ *  A): "credential" keeps #5696's conservative default — an unrecognized 429
+ *  body (RPM/quota text, opaque relay rewrites) holds the whole
+ *  origin+credential, freezing every model behind it; "model" keys that hold
+ *  by the send's request model, for gateways that front many independently
+ *  limited models behind one credential (LiteLLM/one-api/opencode.ai-style
+ *  relays). Recognized KeyRing/bili-relay markers keep their own semantics in
+ *  both modes; requests whose model cannot be identified stay
+ *  credential-wide, so worst-case protection never widens beyond legacy.
+ *  Read per settlement so the switch flips live. */
+export function throttle429Scope(): "credential" | "model" {
+    const env = process.env.BILI_THROTTLE_429_SCOPE;
+    const raw = env !== undefined && env !== "" ? env : fileNetwork().throttle429Scope;
+    return raw === "model" ? "model" : "credential";
+}
+
 /** BILI_MAX_SHRINK_PER_COMPRESS > network.maxShrinkPerCompress > unset (no steering). */
 export function maxShrinkPerCompress(): number | undefined {
     const v = tNum("BILI_MAX_SHRINK_PER_COMPRESS", fileNetwork().maxShrinkPerCompress);
@@ -335,11 +352,16 @@ export function guardrailMaxOutputBytes(): number | undefined {
     return n > 0 ? Math.floor(n) : undefined; // 0 or negative = no cap
 }
 
-/** BILI_GUARDRAIL_REPETITION > guardrails.repetition > true (identical-call loop-breaker, warn 3 / abort 5). */
-export function guardrailRepetition(): boolean {
+/** BILI_GUARDRAIL_REPETITION (truthy/disabled) > guardrails.repetition > true
+ *  (identical-call loop-breaker, warn 3 / abort 5). Object form is file-only.
+ *  #5505: object shape { enabled?, warn?, abort?, recovery? }. */
+export function guardrailRepetition(): boolean | { enabled?: boolean; warn?: number; abort?: number; recovery?: boolean } {
     const envRaw = process.env.BILI_GUARDRAIL_REPETITION;
     if (envRaw !== undefined) return !(envRaw === "0" || envRaw === "false");
-    return loadConfigFile().guardrails?.repetition !== false;
+    const val = loadConfigFile().guardrails?.repetition;
+    // undefined → default on; boolean/object forms pass through untouched,
+    // so a file `repetition: false` still disables the guard (#5505 review).
+    return val === undefined ? true : val;
 }
 
 /** #3260 text-run breaker default: parity with pi's findDegenerateRuns minRun
@@ -423,11 +445,15 @@ export function sessionWarmMaxBytes(): number {
     return Number.isFinite(v) && v >= 0 ? Math.floor(v) : 64 * 1024 * 1024;
 }
 
-/** BILI_SESSION_RESIDENT_MAX_BYTES > sessions.residentMaxBytes > 512 MiB (#2803 soft
- *  target for estimated resident session bytes; active/in-flight state stays pinned). */
+/** BILI_SESSION_RESIDENT_MAX_BYTES > sessions.residentMaxBytes > 4 GiB (#2803 soft
+ *  target for estimated resident session bytes; active/in-flight state stays pinned.
+ *  #5779 raised the default from 512 MiB: single sessions routinely exceed half a
+ *  GiB and ping-ponged against the old budget forever — evicted every inter-request
+ *  gap, cold-loaded on every request, which under memory pressure OOM'd the decode
+ *  and manufactured the .corrupt-* disk-fill loop.) */
 export function sessionResidentMaxBytes(): number {
     const v = tInt("BILI_SESSION_RESIDENT_MAX_BYTES", loadConfigFile().sessions?.residentMaxBytes);
-    return Number.isFinite(v) && v >= 0 ? Math.floor(v) : 512 * 1024 * 1024;
+    return Number.isFinite(v) && v >= 0 ? Math.floor(v) : 4 * 1024 * 1024 * 1024;
 }
 
 /** BILI_SESSION_RESIDENT_HARD_MAX_BYTES > sessions.hardMaxBytes > pool soft cap
@@ -937,4 +963,40 @@ export function resolveStorageWalJournalSizeLimit(env: NodeJS.ProcessEnv = proce
     }
     if (typeof fileValue === "number" && Number.isInteger(fileValue) && fileValue > 0) return fileValue;
     return WAL_JOURNAL_SIZE_LIMIT;
+}
+
+/** EXPERIMENTAL fold-point carrier relocation switch (view transform A): when
+ *  on, a still-visible compress call/result pair is moved from its original
+ *  tail-adjacent position to its own fold point, so resent history ends in
+ *  "[folded region] – [pair] – [protected messages]" instead of a tool exchange
+ *  sitting at the very end (which weak-attention models read as a fresh
+ *  command). Pure view-side transform — refs/state untouched, recomputed
+ *  identically every turn; off = byte-identical to the pre-feature layout.
+ *  OPT-IN (default OFF; verified on real models 2026-11-01 #5470, kept opt-in
+ *  per owner decision).
+ *  Env BILI_COMPRESS_AT_FOLD_POINT (0/false/off vs 1/true/on) wins over the
+ *  config-file `compress.compressAtFoldPoint` boolean; absent everywhere = OFF.
+ *  Garbage spellings fall through tiers. Pure: never throws. */
+export function resolveCompressAtFoldPoint(env: NodeJS.ProcessEnv = process.env, fileValue?: unknown): boolean {
+    const raw = env.BILI_COMPRESS_AT_FOLD_POINT?.trim().toLowerCase();
+    if (raw === "1" || raw === "true" || raw === "on") return true;
+    if (raw === "0" || raw === "false" || raw === "off") return false;
+    return typeof fileValue === "boolean" ? fileValue : false;
+}
+
+/** Second opt-in riding on BILI_COMPRESS_AT_FOLD_POINT: drop the contiguous
+ *  run of unsigned reasoning cores immediately preceding a relocated pair at
+ *  the moment of repositioning (the turn's "think" about the fold itself).
+ *  Default OFF; both switches must be set for anything to be dropped, and the
+ *  host additionally refuses any core carrying a wire signature or running
+ *  under strict reasoning-echo (#1658/#684 doctrine — signed bytes are never
+ *  rewritten or deleted).
+ *  Env BILI_COMPRESS_AT_FOLD_POINT_CLEAR_THINKING wins over config-file
+ *  `compress.compressAtFoldPointClearThinking`; absent = OFF. Pure: never
+ *  throws. */
+export function resolveCompressAtFoldPointClearThinking(env: NodeJS.ProcessEnv = process.env, fileValue?: unknown): boolean {
+    const raw = env.BILI_COMPRESS_AT_FOLD_POINT_CLEAR_THINKING?.trim().toLowerCase();
+    if (raw === "1" || raw === "true" || raw === "on") return true;
+    if (raw === "0" || raw === "false" || raw === "off") return false;
+    return typeof fileValue === "boolean" ? fileValue : false;
 }

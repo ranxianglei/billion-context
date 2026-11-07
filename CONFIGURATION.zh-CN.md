@@ -101,10 +101,13 @@
 | `rollout.features.percent` | number | the version's baked-in plan | — | 看到该特性的安装占比(0–100,支持小数)。单调:上调比例不会把已入组的安装踢出;每台安装的桶值是前缀稳定的。 |
 | `rollout.features.salt` | string | the feature name | — | 分桶哈希盐。修改它会重新随机整个分组(唯一的洗牌方式;仅上调 percent 永不洗牌)。 |
 | `rollout.features.base` | string | unset (roll out over everyone) | — | 嵌套灰度:仅在所指特性的已入组人群内评估本特性,percent 相对该人群(B 只放量给 A 的用户;允许链式,环路判为关)。 |
+| `rollout.features.identityChannelHarvest` | boolean \| number | 0(关) | BILI_ROLLOUT_IDENTITY_CHANNEL_HARVEST | 身份信道采集的灰度门(#5825):当安装级开关(BILI_IDENTITY_HARVEST)未设置时,允许仅由本灰度键激活回环专属的转录/SQLite 采集(claude-code / codebuddy / mcode / goose / qwen 车道);两者都不设则永不读客户端存储。owner 裁定 2026-11-07:本灰度键与 rollout.features.pluginLaneServerHistory(它管已接纳 id 的行钉住)刻意分离——任一使能方可激活采集。默认 0%,小流量观察退化率后再抬。见 identity-channels.zh-CN.md。 |
 | `rollout.features.pluginLaneServerHistory` | boolean \| number | 0(关) | BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY | 插件车道服务端正史(#4491):对已放量的安装,(a) 插件车道请求可携带与 `messages` 平行的内部字段 `biliMsgIds`,把消息身份钉在客户端提供的 id 上(转发上游前一律剥掉;格式错误的数组告警后忽略,身份投毒形态在增量车道直接硬失败);(b) 仅回环可达的 `POST /__bili/plugin/render` 端点从统一存储渲染出站前缀(折叠区收敛为摘要锚点;任何失步都返回非 2xx,shim 退回本地历史);(c) 增量车道探测响应通告 `serverHistory`。默认 0%,放量前无行为变化。 |
+| `rollout.features.pluginFullResendWatermark` | boolean \| number | 5(实验性灰度) | BILI_ROLLOUT_PLUGIN_FULL_RESEND_WATERMARK | 全量重发水位快路径(#5403/#5418):插件车道 chat-completions 回合若上一轮响应盖有 x-bili-pf-seq,则用回声计数声明重发前缀(结构扫描,不做全量解析);命中时管线只消费钉存的前缀核 + 新增尾巴窗口(出站字节同源可证;任何疑点当轮回退未动过的全量解析路径并重新盖戳,连续五次计名失配将车道按住一小时)。需客户端把戳回声为 x-bili-pf-count(适配的车道回带;其余车道不会命中)。**实验性灰度**——默认仅约 5% 的安装开启(owner 裁定 2026-11-02:先小流量再 GA;web 面板对全部安装显示一次性公告、快速配置提供三态开关);`true` 强制开、`false`(或百分比)/ env = 0 关。见 TECHNICAL-NOTES.zh-CN.md「全量重发水位快路径」。 |
 | `maskHosts` | boolean | true | BILI_LOG_MASK_HOSTS | 日志中把非公开目标主机遮成 <private-host>；凭据头无论此开关如何总是遮盖。 |
 | `security.adminRelay` | boolean | false | — | 允许宿主（当前为 dsh web）把它自己入口域名下的整个 /__bili/ 管理面中继到本机代理，使远程浏览器能打开面板（#3373）。默认关闭、仅配置文件。中继跳到达代理时是本机非浏览器客户端（回环源地址 + 回环 Host、无 Origin 头），管理端门槛不变；开启后，凡能访问宿主 web 入口的人都能改配置、写凭据——请先给入口加鉴权/反代。 |
-| `subagentSplit` | boolean | true | BILI_SUBAGENT_SPLIT | Claude 子代理拥有独立会话命名空间（<session>\|sub:<agent-id>），不再排队在主会话锁后。 |
+| `subagentSplit` | boolean | true | BILI_SUBAGENT_SPLIT | Claude 子代理拥有独立会话命名空间（<session>\|sub:<agent-id>），不再排队在主会话锁后。仅 anthropic 线路 —— Responses 线路上本开关无效（见 `subagentSplit` / BOTH-mechanisms 作用域说明）。 |
+| `personaSplit` | boolean | true | BILI_PERSONA_SPLIT | 当 instructions 文本变化且入站历史不连续时，把按 instructions 指纹分键的 Responses 车道（Claude Code over /v1/responses；Codex 根线程 / 旧版本构建）分叉出去（默认开）。用环境变量 BILI_PERSONA_SPLIT=0 或配置 personaSplit: false 关闭（环境变量优先）。 |
 | `forkAdoption` | boolean | false | BILI_FORK_ADOPTION | 匿名 fork 会话继承父会话中源内容完整存在于本次请求里的压缩块。 |
 | `autoModeForge.enabled` | boolean | true | BILI_AUTO_MODE_FORGE | Claude Code auto mode 安全分类器请求由 bili 在本地代答放行判定，不再转发上游（#2740）：该旁路零流出、零计费；每条代答写审计日志，会话带提示徽标。false / env 0 恢复纯透传（愿意付费要真判定的用户）。 |
 | `affinitySimhash` | boolean | true | BILI_AFFINITY_SIMHASH | 匿名客户端的 simhash 链对齐收养（#2265）：客户端侧大面积装饰性改写（如 Trae 切模型后给每条 assistant 消息重打模型标签）时，重新挂回既有会话并保留压缩状态，而不是每次新铸会话、从零重折。 |
@@ -137,7 +140,7 @@
 | `native.attachUrl` | string | unset (discover per lane) | BILI_MCP_PROXY | native hook 附着的显式目标源（任意 URL）。设置后，hook 只附着到该精确 origin 而不是自动发现，若其不在线则自行派生；仍需代码兼容并通过生命周期门禁。BILI_MCP_PROXY 环境变量（CLI --origin 亦会设置它）优先于此文件值；空/空白视为未设置。 |
 | `claude.nativePort` | number | unset (lane sticky zone port) | BILI_CLAUDE_NATIVE_PORT | claude 原生车道钩子派生代理的精确端口钉死（严格端口：被占用时响亮拒绝而非跳端口）。 |
 | `pi.subagents` | object \| boolean | {} (acp_delegate enabled with package defaults) | PI_ACP_DELEGATE_FORCE_ENABLE, PI_ACP_DELEGATE_MAX_DEPTH, PI_ACP_DELEGATE_SYNC_TIMEOUT_MINUTES, PI_ACP_DELEGATE_IDLE_TIMEOUT_MINUTES, PI_ACP_DELEGATE_ASYNC_TIMEOUT_MINUTES, PI_ACP_DELEGATE_MAX_CONCURRENT | 内置 pi lane 子代理（acp_delegate）面（#2230 配置搬家）。billion-context.json 的 pi.subagents 段拥有 delegate 配置；acp.json 四键（delegate/delegatePrompt/displayUsage/debug）为已废弃回退源，仅段缺失时读取。prompt 取代 delegatePrompt；debug 限定子代理子系统。布尔简写 subagents: false 整体关闭。完整字段表见 CONFIGURATION.md 的 pi 段。 |
-| `pi.inline` | boolean | false | BILI_PI_INLINE | pi 内联压缩通道（#3278；需手动开启——#4687 收回 #4571 的默认翻转，默认仍是派生代理）：pi 扩展的压缩在进程内完成——不派生代理进程、无临时端口；模型流量与 /__bili//__acp 工具面由进程内引擎经伪源站服务，codex 的 Responses WebSocket 通道走随引擎启动的仅回环 WS 桥，Web UI 走随引擎启动的仅回环监听。设 true（或 BILI_PI_INLINE=1/on/yes/TRUE）开启。解析顺序 env > 文件；显式开启永远压过附着目标，未设置时行为与旧版一致（attach/spawn）。`bili pi-inline` 一键车道会预置该变量。 |
+| `pi.inline` | boolean | true (unset env+file runs inline) | BILI_PI_INLINE | pi 内联压缩通道（#3278；自 #5428 起默认开启，取代 #4687 的手动开启规则）：pi 扩展的压缩在进程内完成——不派生代理进程、无临时端口；模型流量与 /__bili//__acp 工具面由进程内引擎经伪源站服务，codex 的 Responses WebSocket 通道走随引擎启动的仅回环 WS 桥，Web UI 走随引擎启动的仅回环监听。未设置 env+文件时默认内联；显式宣告的附着目标（launcher 预置的 BILLION_CONTEXT_PROXY/ATTACH）仍压过默认，`bili pi` 照旧用 launcher 代理。不想用就 BILI_PI_INLINE=0/false/no/off 或本键设 false——恢复旧的 attach/spawn 姿态。解析顺序 env > 文件 > 默认；显式开启永远压过附着目标。人类入口:`bili -i/--inline pi`(≡ 一键车道)与 `bili -s/--server pi`(钉死代理姿态,压过继承的内联变量)。 |
 | `opencode.inline` | boolean | false | BILI_OPENCODE_INLINE | opencode 内联压缩通道（#3278 移植；需手动开启——按 #4687 决定，默认仍是派生代理）：opencode 插件的压缩在进程内完成——不派生代理进程、无临时端口、无 MITM 证书；模型流量与 /__bili/ 工具面由进程内引擎经伪源站服务（已在 Bun 宿主验证）。设 true（或 BILI_OPENCODE_INLINE=1）开启。解析顺序 env > 文件；显式开启永远压过附着目标，未设置时行为与旧版一致（attach/spawn）。`bili opencode-inline` 一键车道。 |
 
 **MITM 通道**
@@ -164,10 +167,11 @@
 | `network.preflightDeadEndCooldownMs` | number | 300000 | BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS | 死胡同 preflight 后，对同一会话重试校准的冷却时长。 |
 | `network.replayRetryMax` | number | 3 (1 disables replays) | BILI_REPLAY_RETRY_MAX | 同一请求在向上游暴露错误前的最大传输失败重放次数。 |
 | `network.replayRetryBaseMs` | number | 1500 (0 disables the delay) | BILI_REPLAY_RETRY_BASE_MS | 重放之间的基础退避延迟（指数增长）。 |
-| `network.throttle429Enabled` | boolean | true | BILI_THROTTLE_429 | 出站 429 治理器（#4204）：同一 origin+凭据连续收到上游 429 后，后续请求在本地应答（零出站）而不再转发；设为 false 恢复旧的总是转发行为。 |
-| `network.throttle429MaxConsecutive` | number | 5 | BILI_THROTTLE_429_MAX_CONSECUTIVE | 连续上游 429 达到该次数后 hold 转为终局（本地 424，不在任何已知 SDK 重试集合内）；每个退避窗口仍放行一次探测，直到出现非 429 响应清除。 |
+| `network.throttle429Enabled` | boolean | true | BILI_THROTTLE_429 | 出站 429 治理器（#4204）：连续上游 429 会在本地应答而不再转发。账号限额及无法识别/格式错误的响应按 origin+凭据持有；只有 KeyRing 精确返回 `keyring_model_temporarily_unavailable` 且响应模型与请求模型完全相同时，才按 origin+凭据+模型持有，让其他模型继续可用。模型不匹配或缺失仍按账号级处理；设为 false 恢复旧的总是转发行为。 |
+| `network.throttle429MaxConsecutive` | number | 5 | BILI_THROTTLE_429_MAX_CONSECUTIVE | 连续上游 429 达到该次数后 hold 转为终局（本地 424，不在任何已知 SDK 重试集合内）；每个退避窗口仍放行一次探测，直到账号级 hold 收到任意非 429 响应，或模型级 hold 收到同一模型的非 429 响应后清除。 |
 | `network.throttle429BaseDelayMs` | number | 2000 | BILI_THROTTLE_429_BASE_DELAY_MS | 429 hold 的基础退避（每连续一次 429 翻倍、抖动到 [0.5×, 1×]、以 throttle429MaxDelayMs 封顶；上游 Retry-After 更大时优先）。 |
 | `network.throttle429MaxDelayMs` | number | 30000 | BILI_THROTTLE_429_MAX_DELAY_MS | 429 hold 退避的上限，也是终局阶段探测间隔的上限。 |
+| `network.throttle429Scope` | string | credential | BILI_THROTTLE_429_SCOPE | 无标记上游 429 的 hold 粒度（#5199）。`credential`（默认）保持 #5696 的保守语义——凡未携带可识别模型标记（`keyring_model_temporarily_unavailable`，或 bili 中继的 `bili_throttle_hold` scope=model）的 429 均按整个 origin+凭据持有，该凭据下所有模型一起退避等待。`model` 改按发送请求的模型分桶持有，适用于单凭据背后多模型独立限流的网关（LiteLLM/one-api/opencode.ai 类中继，一个模型的 RPM 耗尽不应冻结兄弟模型）；无法识别模型的请求仍按凭据级持有，两种模式下已识别标记的语义均不变。 |
 | `network.maxShrinkPerCompress` | number | unset | BILI_MAX_SHRINK_PER_COMPRESS | 单次压缩允许收缩历史的上限（防塌缩护栏）。 |
 | `network.proxyKeepAliveMaxMs` | number | 55000 (0 = one-shot connections) | BILI_PROXY_KEEPALIVE_MAX_MS | 经出站代理的连接最大存活时长，到期强制重建（规避陈旧 NAT 映射）。 |
 | `network.postResponseLingerMs` | number | 5000 | BILI_POST_RESPONSE_LINGER_MS | 代理主动发起的响应后关闭的优雅关闭预算：socket 挂起等待对端 FIN/TLS close_notify，到点销毁（reason=linger-backstop）。 |
@@ -175,13 +179,17 @@
 | `network.receiveBodyBytes` | number | 5368709120 | BILI_RECEIVE_BODY_BYTES | 单请求读入内存的入站 wire 字节上限，超限在 receive 阶段返回 413。由硬编码 100 MiB 提升到 5 GiB（#3128 owner 决定），使多 GB 单请求被接受而非断连。同时也是解码请求占用两个共享大解码准入槽位的阈值。WebSocket lane 保持固定 100 MiB 表面。 |
 | `network.decodedBodyBytes` | number | 10737418240 | BILI_DECODED_BODY_BYTES | content-encoding 解压（gzip/deflate/br/zstd）后的解码字节上限，解码过程中增量检查（decode 阶段 413）。默认为接收预算的 2 倍，沿用旧的 decode=2×wire 关系；用于防解压炸弹。 |
 | `network.outboundBodyBytes` | number | 5368709120 | BILI_OUTBOUND_BODY_BYTES | 转发到上游的重建请求字节上限（forward 阶段 413），按最终 body 字符串的 UTF-8 字节计。在 fetch 之前检查，超预算的重建不会触发上游看门狗分配。 |
-| `network.wsOutboundBytes` | number | 10485760 | BILI_WS_OUTBOUND_BYTES | 仅针对 WebSocket 通道的软字节预算（#3701）：当最终序列化的 Responses WS 帧超出该预算时，优先从出站副本中裁减较早的图片（归档为占位符备注——原始文件仍保留在会话存储中，可通过 read_original_image / decompress 恢复），随后对剩余内容通过 jimp maxDim 阶梯进行有界降采样。若帧仍超出限制且上游在任何事件发出前即以 1009 关闭连接，则在同一请求内尝试一次严格更小的重发。设为 0 可禁用裁减（即恢复此前的原样发送行为）。HTTP 通道不受影响——硬性拒绝上限仍为 network.outboundBodyBytes。 |
-| `network.httpOutboundBytes` | number | 10485760 | BILI_HTTP_OUTBOUND_BYTES | 面向普通/代理/pi 原生 HTTP 中继通道的软字节预算（#3909）：当最终序列化的请求超出该预算时，优先从出站副本中裁减较早的图片（归档为占位符备注——原始文件仍保留在会话存储中，可通过 read_original_image / decompress 恢复），随后对剩余内容通过 jimp maxDim 阶梯进行有界降采样。它补上图片密集会话留下的缺口：token 空间折叠按 token 决策，而上游按字节/像素解码 CPU 拒收（Cloudflare Worker 503），于是 ~48 MiB 的请求会永远 503、每次重试都重发同样的像素。仅在未安装受管传输（即 spawn 出来的中继）时生效；WebSocket 通道用 network.wsOutboundBytes，受管 HTTP 传输（inline-engine / dsh-inline）在此从不裁减（#3701 Finding 1）。设为 0 可禁用（恢复此前的原样发送）；硬性拒绝上限仍为 network.outboundBodyBytes。 |
+| `network.wsOutboundBytes` | number | 10485760 | BILI_WS_OUTBOUND_BYTES | 仅针对 WebSocket 通道的软字节预算（#3701）：当最终序列化的 Responses WS 帧超出该预算时，优先从出站副本中裁减较早的图片（归档为占位符备注——原始文件仍保留在会话存储中，可通过 read_original_image / decompress 恢复——仅限注册了 bili 工具的通道；拒绝注入工具的 codex 类通道只有尺寸备注），随后对剩余内容通过 jimp maxDim 阶梯进行有界降采样。若帧仍超出限制且上游在任何事件发出前即以 1009 关闭连接，则在同一请求内尝试一次严格更小的重发。设为 0 可禁用裁减（即恢复此前的原样发送行为）。HTTP 通道不受影响——硬性拒绝上限仍为 network.outboundBodyBytes。 |
+| `network.httpOutboundBytes` | number | 10485760 | BILI_HTTP_OUTBOUND_BYTES | 面向普通/代理/pi 原生 HTTP 中继通道的软字节预算（#3909）：当最终序列化的请求超出该预算时，优先从出站副本中裁减较早的图片（归档为占位符备注——原始文件仍保留在会话存储中，可通过 read_original_image / decompress 恢复——仅限注册了 bili 工具的通道；拒绝注入工具的 codex 类通道只有尺寸备注），随后对剩余内容通过 jimp maxDim 阶梯进行有界降采样。它补上图片密集会话留下的缺口：token 空间折叠按 token 决策，而上游按字节/像素解码 CPU 拒收（Cloudflare Worker 503），于是 ~48 MiB 的请求会永远 503、每次重试都重发同样的像素。仅在未安装受管传输（即 spawn 出来的中继）时生效；WebSocket 通道用 network.wsOutboundBytes，受管 HTTP 传输（inline-engine / dsh-inline）在此从不裁减（#3701 Finding 1）。设为 0 可禁用（恢复此前的原样发送）；硬性拒绝上限仍为 network.outboundBodyBytes。 |
 | `network.caFile` | string | unset | BILI_CA_FILE | PEM 文件路径，包含要额外信任的根 CA（#3776），仅作用于 bili 自己的上游 fetch。与 Node 内置根证书及 NODE_EXTRA_CA_CERTS 中的条目合并——从不替换。安全软件做 HTTPS/加密连接扫描（卡巴斯基、企业 DLP）或企业 MITM 代理重签上游时使用：把该厂商根证书导出为 PEM 并指向此键。未设置 = 默认信任，行为逐字节不变。 |
 | `guardrails` | object | {} (all defaults) | — | 守卫集合：pi/omp 插件的工具输出守卫（#3066）及代理侧流式 text-run 守卫（#3406）。 |
 | `guardrails.bashTimeout` | number | 60 | BILI_GUARDRAIL_BASH_TIMEOUT | 模型未写 timeout 时注入到 bash 工具的秒数（#3066 owner 有意为之，#3366 重申：无人看管的 bash 会把 pi 会话挂死一整天——宿主 schema 本身无默认值）。设 N 调整秒数，设 0 关闭注入（恢复 pi 原生行为）。 |
 | `guardrails.maxOutputBytes` | number | 50000 | BILI_GUARDRAIL_MAX_OUTPUT_BYTES | pi/omp 插件中每个工具结果的文本输出合计字节上限（0 禁用）。超限输出从头截断并附指向宿主已存完整输出的提示。 |
-| `guardrails.repetition` | boolean | true | BILI_GUARDRAIL_REPETITION | pi/omp 插件的同一调用循环破除器：快速连续的相同调用（参数比较忽略键序；上一次相同调用若实际执行 ≥5s 视为长轮询并重新计数）从第 3 次起随结果附警告；第 5 次只拒绝这一次调用并发出明确的最后警告（回合保留，合法的等待/轮询此时可改成一次更长的等待继续）；被拒之后仍一字不差地重发同样调用才终止整个回合（#5225）。false 或 env 0 关闭。 |
+| `guardrails.repetition` | boolean \| object | true | BILI_GUARDRAIL_REPETITION | pi/omp 插件的同一调用循环破除器：快速连续的相同调用（参数比较忽略键序；上一次相同调用若实际执行 ≥5s 视为长轮询并重新计数）从第 3 次起随结果附警告；第 5 次只拒绝这一次调用并发出明确的最后警告（回合保留，合法的等待/轮询此时可改成一次更长的等待继续）；被拒之后仍一字不差地重发同样调用才终止整个回合（#5225）。对象形式另接受 `enabled`（默认 true，总开关）、`warn`（默认 3，警告阈值）、`abort`（默认 5，最终拒绝阈值）和 `recovery`（默认 false，选择性的优雅终止模式：调用 6 至 (abort+4) 次被拒绝并附卡死报告（回合保留、不中断宿主回合），直到同一调用连续达到 abort+5 次才强制终止回合（#5505））。false 或 env 0 关闭。对象子字段仅限配置文件（不通过环境变量暴露）。 |
+| `guardrails.repetition.enabled` | boolean | true | — (file-only) | 使用对象形式时控制调用循环破除器的开关。true（默认）启用；false 禁用。简单禁用请用 `repetition: false`（布尔形式）。 |
+| `guardrails.repetition.warn` | number | 3 | — (file-only) | 首次警告阈值。从第 N 次起，相同调用会在结果中附带 WARNING 通知（#3066）。必须小于 `abort`。 |
+| `guardrails.repetition.abort` | number | 5 | — (file-only) | 最终拒绝阈值。此计数之后的下一次相同调用会被阻止并拒绝执行，附带 FINAL WARNING（#5225）。必须大于 `warn`。 |
+| `guardrails.repetition.recovery` | boolean | false | — (file-only) | 选择性的优雅终止模式（#5505）。开启后，最终拒绝（abort）之后的相同调用被拒绝并附卡死报告（软停止，回合保留）。同一调用连续达到 abort+5 次时才强制终止回合（硬保底，默认 10）。false（默认）= 原始行为：第 6 次调用时 ctx.abort()。 |
 | `guardrails.textRunThreshold` | number | 200 | BILI_GUARDRAIL_TEXT_RUN_THRESHOLD | 响应流上解码后模型文本的单字符重复破除器（#3260；#3331 审查后由 #3406 第 1 项补上开关）。连续 N 个相同码点即触发——正常文本远低于默认 200，符号循环的模型会撞上。设 N 调整阈值，设 0（或负数）关闭：合法的长同字符输出（代码注释分隔线、ASCII 分隔线）不会再被中途掐断。thinking/reasoning 通道也在该守卫内。 |
 | `persist` | object | {} (all defaults) | — | 会话落盘持久化（XDG state 目录之下）。 |
 | `persist.enabled` | boolean | true | BILI_PERSIST | 会话记录落盘总开关（0/false 关闭）。 |
@@ -202,7 +210,7 @@
 | `sessions.max` | number | 256 | BILI_MAX_SESSIONS | 内存会话表上限（空闲会话 LRU 逐出）。 |
 | `sessions.warmMax` | number | 0 | BILI_SESSION_WARM_MAX | 有界启动（#2803/#3050）：启动监听前预热加载的最近保存会话数上限，更早的状态按需重新加载。默认 0（不预热——首次访问按需加载一次；设 8 恢复预热行为）。受 sessions.max 封顶。 |
 | `sessions.warmMaxBytes` | number | 67108864 | BILI_SESSION_WARM_MAX_BYTES | 启动预热集的解码字节预算（#2803）。按解码后大小计而非磁盘压缩字节，zstd 归档无法绕过内存上限；单文件超预算则永不预热。 |
-| `sessions.residentMaxBytes` | number | 536870912 | BILI_SESSION_RESIDENT_MAX_BYTES | 驻留会话估算字节的软目标（#2803）。活跃/在途状态始终固定保留；超过目标时，空闲状态随请求完成回写磁盘释放。 |
+| `sessions.residentMaxBytes` | number | 4294967296 | BILI_SESSION_RESIDENT_MAX_BYTES | 驻留会话估算字节的软目标（#2803；#5779 从 512 MiB 提高到 4 GiB——单个会话经常就超过半 GiB，旧预算下会被反复逐出、永远驻留不下来）。活跃/在途状态始终固定保留；超过目标时，空闲状态随请求完成回写磁盘释放。内存小的机器可调低。 |
 | `sessions.hardMaxBytes` | number | (same as `sessions.residentMaxBytes`) | BILI_SESSION_RESIDENT_HARD_MAX_BYTES | 单会话驻留字节的硬上限（#4788，决策 #4792 D1-A）。不同于池软上限——它只能逐出其他冷会话、从不触碰唯一活跃会话——它约束单个会话：在请求结束边界超过上限时，其可丢弃字段（已折叠块的原文、元数据账本、超出有界视图的原始尾巴）会被强制回写磁盘，即使该会话被池逐出豁免；下一轮通过窄盘读透明地重新读取所需内容。只要上一次保存已被证明落盘，安全丢弃就在每个请求边界运行；该上限额外加入单会话告警（warn，限流至 60 秒）。`0` 关闭该检查。 |
 | `sessions.contentStorePin` | boolean | false | BILI_SESSION_CONTENT_STORE_PIN | #4788 二期驻留丢弃的逃生门：把会话内容存储钉在内存（永不折叠）。默认关闭：每次已证明落盘的保存之后，空闲会话的内容存储在请求间隙被释放，需要时从统一索引镜像或伴生文件按需重读；没有可证明落盘副本的会话（如新建 fork 子会话）自动保持驻留。需要零重读延迟且愿意用内存换时可设此项。 |
 | `sessions.gc.enabled` | boolean | false | BILI_SESSION_GC | 过期持久化会话的可选垃圾回收（未开启时用户数据绝不被悄悄清理）。 |
@@ -227,6 +235,7 @@
 | `update.policyUrl` | string | official repo raw URL | BILI_UPDATE_POLICY_URL | 远端自动更新策略文件的覆盖地址（测试接缝——生产固定指向官方仓库）。 |
 | `advisoryCheck` | boolean | true | BILI_ADVISORY_CHECK | 关键缺陷公告监视器；本机版本命中受影响范围时装填推荐修复版本。 |
 | `advisoryUrl` | string | unset (built-in feed) | BILI_ADVISORY_URL | 公告源覆盖地址。 |
+| `remoteAnnouncementsUrl` | string | unset (official feed: GitHub master announcements/remote.json) | BILI_ANNOUNCEMENTS_URL | 远程公告源覆盖地址（#5548）：JSON 文档 {v: 1, entries: [...]}，记录格式与本地公告文件一致；与其他监视器一样约每 3 分钟拉取一次，缓存快照可跨重启/断网存活。无法直连的安装把它指向中继镜像；坏推送会被拒绝并继续显示上一份有效公告。配置目录 announcements/*.json 的本地文件按同 id 覆盖远程/内置公告。 |
 | `releaseNotesCheck` | boolean | true | BILI_RELEASE_NOTES_CHECK | Web 面板里的发布说明源（只抓取缓存、从不安装任何东西）。 |
 | `releaseNotesUrl` | string | unset (built-in feed) | BILI_RELEASE_NOTES_URL | 发布说明源覆盖地址。 |
 
@@ -266,8 +275,12 @@
 | `compress.nudgeGrowthTokens` | number | 50000 (kernel flat cadence) | — | 增长门槛：可折叠片段超出基线增长达到该 token 数才发提醒（按设计恒定，与窗口大小无关）。 |
 | `compress.tierNudgeTokens` | object {t1?, t2?, t3?} | derived (T1 = nudgeGrowthTokens, T2/T3 = ×1.5) | — | 分层 token 质量触发阈值；每层未设置时回退到派生默认值，缺省/空对象＝老的统一行为（#2376）。 |
 | `compress.minPressureBenefitTokens` | number (≥ 0) | max(5000, limit × 1%) | — | 压力带 nudge 触发所需的最小可回收 token 数；虚报表线路调大它，让折叠攒成大批量而非高频小折（#3211）。显式 0＝老的任意 pending 行为。 |
+| `compress.requireUsageSampleForPressure` | boolean | true | — | 幻影压力守卫：本轮读数为本地估算（无计费样本——中断/TTL 丢 usage）时，压力带延后至多 compress.maxEstimateHoldRounds 轮（默认 2）等真样本，再回落到老的估算驱动决定，防止永不回传计费的线路被无限挂起。false＝始终老行为。 |
+| `compress.maxEstimateHoldRounds` | number | 2 | — | 幻影压力守卫的兜底（#5865 裁定）：压力带最多连等多少轮估算读数就必须照估算动手。兜底保证从不回传计费的会话（匿名零基线 fork、静默后端——本地估算是它们唯一的压力信号）也能拿到自动压缩。0＝完全不等待。仅在 requireUsageSampleForPressure 开启时生效。 |
 | `compress.nudgeModelDecided` | boolean | off (unset) | — | 模型自决的压缩时机（#2228）：tier-1 提醒触发时，先通过一次走会话缓存前缀的短 side call 问模型——以当前任务为前提，现在压缩是否划算。严格 JSON 的 "yes" 会注入带程序最终确定范围的明确压缩指令；"no"、格式错误或超时则本轮不注入任何内容。EMERGENCY 档与 tier≥2 蒸馏始终保留原有 advisory。默认关闭，需显式开启。 |
 | `compress.nudgeDecisionMaxTokens` | number | 200 | — | nudgeModelDecided 所用模型决策 side call 的输出预算（token）。必须 > 0。 |
+| `compress.requireNudge` | boolean | off (unset) | — | 禁止未提示的模型主动压缩（#5683）：只有当前轮次压缩提醒真正送达模型时（advisory、模型自决指令、紧急提醒都算；"gated"/"vetoed"/"skipped" 不算）才允许 compress，否则拒绝并回错误回执；同一轮内的多次 loop 请求保持武装，下一个未提示轮次自动解除。bili 自己的溢出兜底折叠不受影响。针对会自行乱压的模型（如 qwen 27b），可按 provider/model 单独开启。默认关闭。 |
+| `compress.requireRecommendation` | boolean | off (unset) | — | 禁止越界的模型主动压缩（#5683）：提交的每个范围必须落在 bili 当前推荐折叠的集合内——即 nudge 文案与 acp_status 展示的同一份实时可压缩列表（有本轮 prepare 快照用快照，否则实时重算）。按「覆盖」判定而非精确相等：把推荐跨度拆小段通过；已折进活跃块的消息豁免（重折已有块更新摘要合法）。范围里含任何其他仍存活的消息则整体拒绝，回执点名越界跨度并指向 acp_status。默认关闭。 |
 | `compress.streamSummary` | boolean | false (unset) | — | 强制 preflight 摘要从首次尝试起就走流式（SSE）请求。要求流式的上游现在由错误驱动自学习自动处理（非流式摘要的任何 400 都会触发一次性 SSE 探测，#2494），但网关超时（如 Cloudflare HTTP 524）永远无法触发自学习：在此类网关位于 bili 与源站之间时设置此项，或用于省去一次探测往返。 |
 | `compress.preserveRecentMessages` | number | 3 | — | 最近的消息软保护、免于折叠。 |
 | `compress.preserveRecentTokens` | number | kernel ≈5000 | — | 最近的 token 软保护、免于折叠。 |
@@ -275,6 +288,8 @@
 | `compress.maxSummaryLength` | number | kernel 20000 | — | 单条生成摘要的硬字符上限；超长的回复被整段拒绝（不截断、不重试）。外部摘要模型会被提前告知这个确切上限（#3635）。0 = 不限制。 |
 | `compress.minSummaryLength` | number | kernel 50 | — | 生成摘要的字符下限；过短的回复被整段拒绝。0 = 禁用。外部摘要模型受同一下限约束（#3635）。 |
 | `compress.reconcile` | "off" \| "warn" \| "repair" | "repair" | BILI_FOLD_RECONCILE | 客户端在轮次之间回退或改写历史时校准已折叠状态。 |
+| `compress.compressAtFoldPoint` | boolean | false | BILI_COMPRESS_AT_FOLD_POINT | 实验性，默认关闭：把仍可见的压缩调用/结果对从原位置（贴近尾部）移到它自己的折叠点，即 [已折叠区]–[调用对]–[保护消息]，避免弱注意力模型把历史末尾的工具交换当成新命令。纯视图变换：refs 与状态不变、每轮重算结果一致；关闭时布局字节级不变。 |
+| `compress.compressAtFoldPointClearThinking` | boolean | false | BILI_COMPRESS_AT_FOLD_POINT_CLEAR_THINKING | 依附于 compress.compressAtFoldPoint 的第二层开关：调用对被挪位的一瞬间，同时丢掉紧邻其前的未签名思考段（模型对本次折叠本身的思考），让挪位后的开头更干净。主开关关闭时无效；带签名的思考块与严格推理回显会话绝不受影响（#1658/#684）。 |
 | `compress.promptPack` | string (builtin: "default", "lean") | builtin "default" | — | 压缩提示词包，按 项目包 → 用户包 → 内置 解析；不受 acknowledgePromptsRisk 门控。 |
 | `compress.tiers` | boolean | true | — | T1→T3 分级蒸馏把折叠成本摊到多代。 |
 | `compress.protectedTools` | string[] | none | — | 全历史硬排除：列出工具的结果永不折叠。路径模式（skill/<name>）可按名指定 skill（#1947）。 |
@@ -361,6 +376,7 @@
 | `BILI_DSH_AUTHORED_COMPACTION` | boolean | true (on, #3901 flip) | — | 让 bili 本地应答 dsh 压缩摘要请求（返回折叠快照而非拒绝，#3733）：身份头 + 内核渲染格式的块摘要，零出口流量；重放经 #2432 再基线识别。 |
 | `BILI_DSH_CONTEXT_TAB` | boolean | true | — | dsh.contextTab 的 env 层（#4237）：0/false 移除 DSH 顶栏「上下文」标签页（其余一切照常工作）；其他取值强制开启并覆盖文件层；缺省 = 按文件层取值（默认 true）。下次页面加载 / dsh 重启生效。 |
 | `BILI_DSH_MAX_TESTED_VERSION` | string | 0.2.0-rc.2 (CI e2e anchor) | — | “dsh native lane 启动提示的“我们测过的最高版本”上限（#4545）：从注入包上方最近的 node_modules/@deepseek-ai/dsh/package.json 读出运行中的构建,**严格高于**上限才弹一条启动提示(持久日志 + 横幅),建议先回滚到上限版本。只覆盖"更新"一个方向:≤ 上限保持静默(旧版已知坏法有专门的失锁探测)。只提示、绝不拦截或阻断流量;新版本验证通过后抬高上限,空字符串 = 关闭本 lane 检查;读不到/解析不了的版本按静默处理。” |
+| `BILI_IDENTITY_HARVEST` | string | off | — | #5825 身份信道接线的采集开关（灰度门控下的回环本地转录/SQLite 采集）：缺省关闭、完全惰性；`all` 或逗号列表（`claude,codebuddy,mcode`）开启对应来源，且仅对回环身份请求生效，同时要求 pluginLaneServerHistory 灰度为开。任何无法判定的情形整轮退化为接线前路径，绝不做部分映射。设计上是开发/验证开关而非调参旋钮。 |
 | `BILI_STORAGE_BACKEND` | sqlite\|mysql | sqlite | — | storage.backend 的环境变量层（#3931）：sqlite（默认）或 mysql（已接线，#3388 第二+三步 —— 保存经异步影子队列入 mysql,同步读走 JSON 信封,replicas/ext/GC/fork 走异步孪生（#4911）;export 同样支持）。优先于文件层。 |
 | `BILI_MYSQL_DSN` | string | unset | — | storage.backend="mysql" 的 MySQL DSN（mysql://user:pass@host:3306/db）（#3388，#3931）。优先于文件键 storage.mysql.dsn。留空 = mysql 后端无法打开;文档化错误会列出两个旋钮。连接池惰性打开;closeQuietlyAsync 排空入队事务并关闭。 |
 | `BILI_STORAGE_ARCHIVE_AFTER_DAYS` | integer | 365 | — | GC 年龄清扫窗口（天，#3463）：闲置超过该时长的会话被归档（单文件归档日志 archive/archive.jsonl 追加一行 + 墓碑行保留标签 + 释放内容/媒体引用）。0 关闭年龄清扫；手动入口 POST /__bili/storage/gc 始终可用。配置文件键 storage.archiveAfterDays 为持久形式。 |
@@ -384,6 +400,7 @@
 | `BILI_SPAWN_WAIT_MS` | number | (built-in) | — | 新派生的代理子进程在启动器延长等待之前的初始健康等待窗口（毫秒）。 |
 | `BILI_SLOW_START_GRACE_MS` | number | (built-in) | — | 对仍存活但仍在启动（慢速存储、杀毒扫描、共享存储锁竞争）的子进程的额外宽限（毫秒）；总启动预算为两者之和。 |
 | `BILI_ATTACH_EVIDENCE_GRACE_MS` | number | (built-in) | — | 挂接归属证据的宽限期。 |
+| `BILI_SILENT_DIRECT_MAX_MB` | number | (built-in) | — | 静默直连超大请求保护上限（MiB）。 |
 | `BILI_PROVIDER_REWRITES` | string | unset | — | 路由前应用的 provider URL 重写规则。 |
 | `BILI_MCP_PROXY` | string | unset | — | 派生通道：插件宿主工具的 MCP 代理目标。 |
 | `BILI_PARENT_PID` | number | unset | — | 派生通道：父进程 id，用于生命周期监管。 |
@@ -404,7 +421,7 @@
 | `BILI_NATIVE_OMP` | boolean-ish | off | — | 宿主姿态：标记 omp 原生插件进程。 |
 | `BILI_NATIVE_OPENCODE` | boolean-ish | off | — | 宿主姿态：标记 opencode 原生插件进程。 |
 | `BILI_NATIVE_PI` | boolean-ish | off | — | 宿主姿态：标记 pi 原生插件进程。 |
-| `BILI_PI_INLINE` | boolean-ish | off (opt-in) | — | 宿主姿态：pi 内联压缩通道（#3278）——pi 扩展在进程内通过伪源站直接压缩，不再另起代理进程；优先于预置的 BILLION_CONTEXT_PROXY 附着目标。需手动开启：#4687 收回 #4571 的默认翻转，不设置时行为与旧版完全一致（attach/spawn）；除 0/false/no/off 外任何非空值均算开启（on/yes/TRUE 均可）。codex 的 Responses WS 流量改走随引擎启动的仅回环桥；桥起不来时该通道退回直连（打 warn），HTTP 压缩仍留在进程内。 |
+| `BILI_PI_INLINE` | boolean-ish | inline when unset (DEFAULT-ON since #5428; explicit 0/false/no/off opts out) | — | 宿主姿态：pi 内联压缩通道（#3278）——pi 扩展在进程内通过伪源站直接压缩，不再另起代理进程；优先于预置的 BILLION_CONTEXT_PROXY 附着目标。自 #5428 起默认开启（取代 #4687 的手动开启规则）：未设置 env+文件时走内联；显式宣告的附着目标仍压过默认，`bili pi` 照旧用 launcher 代理。显式关闭 = 0/false/no/off（或 `"pi": {"inline": false}`）——恢复旧的 attach/spawn 姿态。人类入口：`bili -i/--inline pi` 强制内联，`bili -s/--server pi` 钉死代理姿态（压过继承的内联变量）。除 0/false/no/off 外任何非空值均算开启（on/yes/TRUE 均可）。codex 的 Responses WS 流量改走随引擎启动的仅回环桥；桥起不来时该通道退回直连（打 warn），HTTP 压缩仍留在进程内。 |
 | `BILI_OPENCODE_INLINE` | boolean-ish | off (opt-in) | — | 宿主姿态：opencode 内联压缩通道（#3278 移植）——opencode 插件在进程内通过伪源站直接压缩，不再另起代理进程；优先于预置的 BILLION_CONTEXT_PROXY 附着目标。需手动开启：按 #4687 决定，opencode 通道默认保持旧行为（另起代理），只有本环境变量或 "opencode": {"inline": true} 显式开启才切换；除 0/false/no/off 外任何非空值均算开启（on/yes/TRUE 均可）。已在 Bun 宿主上验证（无 node:sqlite 时引擎 boot/dispatch 正常）。 |
 | `BILI_INLINE_DEBUG` | boolean-ish | off | — | 仅内联通道（#3278）：把引擎日志保留在 stderr 上（默认关闭——内联引擎跑在 pi 进程里，stderr 就是交互终端，每行 [persist]/[storage]/[inline] 都会把输入框挤掉；默认只写 bili.log）。 |
 | `BILI_NATIVE_ZCODE` | boolean-ish | off | — | 宿主姿态：标记 zcode 原生插件进程。 |
@@ -774,6 +791,10 @@
 - **状态：** ACTIVE
 - **说明：** Claude Code subagent 会话拆分（#970/#4352），两套机制都由本开关控制。(1) 携带 `x-claude-code-agent-id` + `x-claude-code-parent-agent-id` 对的 anthropic-wire 请求获得自己的 `<session>\|sub:<agent-id>` 会话 —— 独立的锁链与压缩状态 —— 而不是排在主会话锁后面。(2) 无头 claude code 流量（VS Code 扩展构建：其 subagent 不带 agent-id 头、且与父会话逐字共享第一个 system block，因此双信号门必然不命中，#4352）改走顺序优先会话解析器 —— 历史连续的主会话按顺序+内容证据留在原 key，历史不相交的 subagent 借道则分叉到自己的车道：首条 user 消息上带 bili SubagentStart hook token 时按派发铸键（`<session>\|sub:<fp>:t:<token>`），否则用本 run 首条 user 消息片段作兼底（`<session>\|sub:<fp>:<userFp>`），同一父 id 下反复派发的同型子代理不再共用一条压缩会话（#5095）；既无有效 token、又无可用 user 文本的借道保留两段式 `<session>\|sub:<fp>` 形态。设 `BILI_SUBAGENT_SPLIT=0` 同时关闭两套机制。
 
+> **作用域 — 仅 anthropic 线路。** 走 **Responses** 协议的 Claude Code（带 `x-claude-code-session-id`、上游 `/v1/responses`）**不会**经过 `claudeSubagentSplit`。该车道按 instructions 指纹键控（`WIRE_CLIENTS` → `claude-responses`，见 `src/server/lane-decisions.ts`），`subagentSplit` 管不到 —— 在那里设 `BILI_SUBAGENT_SPLIT=0` 无效。该车道的两条出路：
+> - `personaSplit: false` / `BILI_PERSONA_SPLIT=0`，或
+> - `stableSystemAnchor: true`，把 instructions 漂移当作预期事件，系统提示变更不再把主会话分叉出去。
+
 ### `forkAdoption`
 
 - **类型：** `boolean`
@@ -846,7 +867,7 @@
 "pi": {
   "subagents": {
     "enabled": true,              // 总开关；false（或 "subagents": false）移除工具+提示词+快捷键（新会话生效）
-    "forceEnable": false,        // 检测到项目级 pi-subagents 安装时仍保留 acp_delegate（#415）
+    "forceEnable": false,        // 检测到任一作用域（项目级或用户级）的 pi-subagents 安装时仍保留 acp_delegate（#415、#5637）
     "displayUsage": "separate",  // "separate"（独立 footer 块）| "merged"（并入工具结果用量）
     "maxDepth": 2,               // 嵌套深度上限，向子进程传播
     "syncTimeoutMinutes": 5,     // 同步 delegate 硬超时；0/null 关闭
@@ -1378,6 +1399,13 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 - **状态：** ACTIVE
 - **说明：** 压力带 nudge（usage 已 ≥ `maxContextLimit`）触发前必须有的最小可回收 token 量。压力带按设计绕过增长门控＋节奏门控，所以在决策表被放大（k̂ 放大，#3211）的线路上，几千 token 的可压量就够再触发一次折叠——每次只折到刚够掉出压力带、随即又被顶回去：高频小收益循环（「到线就折、每次只折一点」）。把这个下限调大（例如 ~200k 窗口设 `50000`），低于下限的压力 nudge 会被抑制（日志可见；`truncate.threshold` 仍是安全阀），增长持续累积直到**一批**大到足以把 usage 压出压力带的批量——这正是诚实线路靠增长门控免费获得的节奏。显式 `0` 恢复老的任意 pending 行为。与其他 compress 字段一样跨全局 → provider → model 按**字段**合并。映射到内核字段 `nudge.minPressureBenefitTokens`。
 
+#### `requireUsageSampleForPressure`
+
+- **类型：** `boolean`
+- **默认值：** `true`
+- **状态：** ACTIVE
+- **说明：** 压缩决策计量路径的「幻影压力」守卫。回合被中断、或上游短 TTL 把 usage 报告弄丢时，本轮判定读数只能落回本地估算（字符级上界）——它量的是即将被改写丢掉的入站字节，实测比真实计费高约 3 倍。这种坏表针过去会直接扣 EMERGENCY/OVER-LIMIT 扳机，对着账单里根本没出现过的内容做破坏性改写，还烧掉前缀缓存。开启本守卫后：估算读数下的压力带（usage ≥ `maxContextLimit`）nudge 延后**一轮**——下一次请求必然带着新鲜计费报告（或来源稳定的锚点），拿真数再决定，代价≈0；硬溢出兜底（`truncate.threshold`、preflight 输出钳制）全程照旧武装。计费级读数（"usage"）与不传来源标记的调用方字节不变；非压力档（增长/节拍/初见大量）完全不受该标记影响。显式设 `false` 恢复旧的估算驱动压力注压。与其他 compress 字段一样跨全局 → provider → model 按**字段**合并。映射到内核字段 `nudge.requireUsageSampleForPressure`。
+
 #### `tierNudgeTokens`
 
 - **类型：** `object` — `{ "t1"?: number, "t2"?: number, "t3"?: number }`（每个值为 token 数，≥ 1）
@@ -1397,6 +1425,16 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 - **默认值：** `200`
 - **状态：** ACTIVE (#2228)
 - **说明：** `nudgeModelDecided` 开启时，模型决策 side call 的输出预算（token）。必须 > 0（非法值在配置加载时被拒绝）。
+
+#### `requireNudge` / `requireRecommendation`
+
+- **类型：** `boolean`（各自独立）
+- **默认值：** *（关闭，除非显式设置）*
+- **状态：** ACTIVE (#5683)
+- **说明：** 针对会自行主动压缩的模型的策略门禁（现场案例：qwen 27b 没有任何提示就调用 compress）。两者都是宿主侧字段——不传入内核——与其他 compress 字段一样按字段在 global → provider → model 三级合并，可在 web 面板快速配置卡片或任意配置层级编辑，从下一个请求起热生效。
+  - `requireNudge`（时序门禁）：只有**当前轮次**压缩提醒真正送达过模型（post-gate 投递事实 `nudgeOutcome === "injected"`——advisory 提醒、模型自决指令、紧急提醒都算；"gated"/"vetoed"/"skipped" 不算）才允许模型发起 compress，否则拒绝并回一条错误回执，告知未提示压缩在本线路被禁用、等提醒出现再压。武装在同一轮内的 loop 重请求间保持（一轮响应一个提醒可连续折几次），到下一个未提示轮次自动解除。
+  - `requireRecommendation`（范围门禁）：提交的每个范围必须落在 bili 当前**推荐**折叠的集合内——与 nudge 文案、`acp_status` 展示的同一份实时可压缩列表（有本轮 prepare 快照用快照，否则实时重算，带常规的 viable + dead-ref + `minCompressRangeChars` 过滤）。按「覆盖」判定而非精确相等：把推荐跨度拆成小段通过（bili 自己的首见消化指南就鼓励拆分）；已折进活跃块的消息豁免，重折已有块更新摘要保持合法。范围里含任何其他仍存活消息则整体拒绝，回执点名越界跨度并指向 `acp_status`。
+  - 豁免与交互：bili **自己**的溢出兜底折叠（preflight / auto-fold——不涉及模型调用）两个门禁都豁免，被门禁的会话不会因上下文溢出而死掉；即使 nudge 通道本身被自愈机制抑制（D1），可用性也不受影响。通过宿主自身机制驱动压缩的车道（如 codex 的 compaction trigger——它不是 bili 的提醒）不在时序门禁「已提示」的定义内——若这类车道与目标共用路由，请把这些设置限定到受影响的 provider/model 而不是全局开启。无新增环境变量；未显式开启任何一级时行为不变。
 
 #### `preserveRecentMessages`
 
@@ -1814,6 +1852,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_AFFINITY_SIMHASH` | `affinitySimhash` | true |
 | `BILI_ALLOW_DSH_COMPACTION` | `dsh` | {} |
 | `BILI_ALLOW_PRIVATE_HTTP_PROVIDERS` | `network.allowPrivateHttpProviders` | false |
+| `BILI_ANNOUNCEMENTS_URL` | `remoteAnnouncementsUrl` | unset (official feed: GitHub master announcements/remote.json) |
 | `BILI_AUTO_MODE_FORGE` | `autoModeForge.enabled` | true |
 | `BILI_CACHE_KEEPALIVE` | `cacheKeepalive.enabled` | false |
 | `BILI_CACHE_KEEPALIVE_ARM_WITHOUT_BREAKPOINTS` | `cacheKeepalive.armWithoutBreakpoints` | false |
@@ -1830,6 +1869,8 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_CLIENT_ERROR_BACKSTOP_MS` | `network.clientErrorBackstopMs` | 30000 |
 | `BILI_CODEARTS_REF` | `resign` | {} (armed; built-in scheme sdk-hmac-sha256) |
 | `BILI_CODEX_COMPACT` | `codexCompact` | "intercept" |
+| `BILI_COMPRESS_AT_FOLD_POINT` | `compress.compressAtFoldPoint` | false |
+| `BILI_COMPRESS_AT_FOLD_POINT_CLEAR_THINKING` | `compress.compressAtFoldPointClearThinking` | false |
 | `BILI_DECODED_BODY_BYTES` | `network.decodedBodyBytes` | 10737418240 |
 | `BILI_DECOMPRESS_TMP_CAP` | `decompressTmpCap` | 50 |
 | `BILI_DSH_AUTHORED_COMPACTION` | `dsh.authoredCompaction` | true (on, #3901 flip) |
@@ -1874,7 +1915,8 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_PERSIST_EPERM_ALERT_THRESHOLD` | `persist.epermAlertThreshold` | 5 |
 | `BILI_PERSIST_TAIL_TOKENS` | `persist.tailTokens` | 16384 (0 disables message persistence) |
 | `BILI_PERSIST_ZSTD` | `persist.zstd` | false |
-| `BILI_PI_INLINE` | `pi.inline` | false |
+| `BILI_PERSONA_SPLIT` | `personaSplit` | true |
+| `BILI_PI_INLINE` | `pi.inline` | true (unset env+file runs inline) |
 | `BILI_POST_RESPONSE_LINGER_MS` | `network.postResponseLingerMs` | 5000 |
 | `BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS` | `network.preflightDeadEndCooldownMs` | 300000 |
 | `BILI_PREFLIGHT_HOLD_MS` | `network.preflightHoldMs` | 30000 |
@@ -1891,6 +1933,8 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_RESIGN_PASSTHROUGH` | `resign` | {} (armed; built-in scheme sdk-hmac-sha256) |
 | `BILI_RESUME_INHERITANCE` | `resumeInheritance` | true |
 | `BILI_ROLLOUT_<FEATURE>` | `rollout.features.enabled` | unset (bucket math decides) |
+| `BILI_ROLLOUT_IDENTITY_CHANNEL_HARVEST` | `rollout.features.identityChannelHarvest` | 0 (off) |
+| `BILI_ROLLOUT_PLUGIN_FULL_RESEND_WATERMARK` | `rollout.features.pluginFullResendWatermark` | 5 (experimental grey) |
 | `BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY` | `rollout.features.pluginLaneServerHistory` | 0 (off) |
 | `BILI_SESSION_CONTENT_STORE_PIN` | `sessions.contentStorePin` | false |
 | `BILI_SESSION_GC` | `sessions.gc.enabled` | false |
@@ -1898,7 +1942,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_SESSION_GC_MAX_AGE_DAYS` | `sessions.gc.maxAgeDays` | 7 |
 | `BILI_SESSION_GC_MAX_TOKENS` | `sessions.gc.maxTokens` | 1000000 |
 | `BILI_SESSION_RESIDENT_HARD_MAX_BYTES` | `sessions.hardMaxBytes` | (same as `sessions.residentMaxBytes`) |
-| `BILI_SESSION_RESIDENT_MAX_BYTES` | `sessions.residentMaxBytes` | 536870912 |
+| `BILI_SESSION_RESIDENT_MAX_BYTES` | `sessions.residentMaxBytes` | 4294967296 |
 | `BILI_SESSION_WARM_MAX` | `sessions.warmMax` | 0 |
 | `BILI_SESSION_WARM_MAX_BYTES` | `sessions.warmMaxBytes` | 67108864 |
 | `BILI_SQLITE_AUTO_DOWNLOAD` | `storage.sqliteAutoDownload` | true |
@@ -1915,6 +1959,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_THROTTLE_429_BASE_DELAY_MS` | `network.throttle429BaseDelayMs` | 2000 |
 | `BILI_THROTTLE_429_MAX_CONSECUTIVE` | `network.throttle429MaxConsecutive` | 5 |
 | `BILI_THROTTLE_429_MAX_DELAY_MS` | `network.throttle429MaxDelayMs` | 30000 |
+| `BILI_THROTTLE_429_SCOPE` | `network.throttle429Scope` | credential |
 | `BILI_UPDATE_CHECK_INTERVAL_MS` | `update.checkIntervalMs` | 180000 |
 | `BILI_UPDATE_POLICY_URL` | `update.policyUrl` | official repo raw URL |
 | `BILI_UPDATE_REGISTRY` | `update.registry` | "npmjs" (registry.npmjs.org) |
@@ -1931,6 +1976,10 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `PI_ACP_DELEGATE_MAX_DEPTH` | `pi.subagents` | {} (acp_delegate enabled with package defaults) |
 | `PI_ACP_DELEGATE_SYNC_TIMEOUT_MINUTES` | `pi.subagents` | {} (acp_delegate enabled with package defaults) |
 | `PORT` | `port` | 8787 |
+| `— (file-only)` | `guardrails.repetition.abort` | 5 |
+| `— (file-only)` | `guardrails.repetition.enabled` | true |
+| `— (file-only)` | `guardrails.repetition.recovery` | false |
+| `— (file-only)` | `guardrails.repetition.warn` | 3 |
 <!-- /bili:gen -->
 
 | 变量 | 效果 |
@@ -1986,7 +2035,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `ACP_DUMP_SSE` | 调试用：转储原始 SSE 帧的目录——含压缩重发/截断重试的循环内上游响应（命名 `<ts>-<sid>-loop<N>-raw.sse`），外层 tee 看不到（#1455）。 |
 | `BILI_STREAM_ERROR_SHAPE` | 设为 `"completion"` 恢复 anthropic/openai 线上旧的失败形状（失败文本包在合成的成功完成里）；默认 `"protocol"` = 协议原生错误帧（#1455）。与 `compat.streamErrorShape` 同一开关，此环境变量优先。 |
 | `BILI_LOG_MASK_HOSTS` | 设为 `0` 关闭代理日志的 host 脱敏（#897）：非公开目标主机（私有 relay、内网域名）原样记录，而不是 `<private-host>`。默认开启（#255 —— 日志常被整段贴进公开 issue）；凭据头脱敏与之独立、始终开启。真实目标域名不依赖此开关也可查：`GET /__bili/stats` → `blindTunnels`、`GET /__bili/health`（均仅 loopback），以及 `acp_status` 输出。 |
-| `BILI_SUBAGENT_SPLIT` | 设为 `0` 关闭 Claude Code subagent 会话分流（#970）：默认情况下，anthropic 线路上同时携带 `x-claude-code-agent-id` + `x-claude-code-parent-agent-id` 头的请求（后台 subagent）会获得独立的 `<session>\|sub:<agent-id>` 会话 —— 独立的锁链与压缩状态 —— 不再排在主会话的锁后面。默认开启。配置文件中设 `"subagentSplit": false` 效果相同；环境变量优先。 |
+| `BILI_SUBAGENT_SPLIT` | 设为 `0` 关闭 Claude Code subagent 会话分流（#970）：默认情况下，anthropic 线路上同时携带 `x-claude-code-agent-id` + `x-claude-code-parent-agent-id` 头的请求（后台 subagent）会获得独立的 `<session>\|sub:<agent-id>` 会话 —— 独立的锁链与压缩状态 —— 不再排在主会话的锁后面。默认开启。配置文件中设 `"subagentSplit": false` 效果相同；环境变量优先。Responses 线路：无效 —— 见 `subagentSplit` / BOTH-mechanisms 作用域说明。 |
 | `BILI_FORK_ADOPTION` | 设为 `1` 开启 fork 块继承（#629）：匿名（prefix-affinity）客户端在会话中途分叉历史（编辑重发 / 从更早轮次重新生成）时，新会话直接继承父会话中"源内容在分叉请求里完整存在"的压缩块 —— 而不是从零开始、把共享前缀重新折叠一遍。默认关闭。带自有 id 的 resume-fork 不受此开关管 —— 它们随 `BILI_RESUME_INHERITANCE` 一并继承压缩块（#1834）。配置文件中设 `"forkAdoption": true` 效果相同；环境变量优先。无论开关如何，匿名 fork 发生时日志都会记录可继承的块清单，便于先评估收益再开启。 |
 | `BILI_AFFINITY_SIMHASH` | 设为 `0` 关闭 simhash 链对齐收养（#2265）：匿名请求的精确哈希链被客户端侧大面积装饰性改写（如 Trae 切模型后给每条 assistant 消息重打模型标签）打断时，重新挂回既有会话并保留压缩状态，而不是每次新铸会话、从零重折。护栏：覆盖率 ≥90%（Hamming ≤10）、变异位置 ≥20%（单点编辑仍走 fork，#629）、至少一条字节相同的用户消息、双候选歧义拒猜。默认开启。配置文件中设 `"affinitySimhash": false` 效果相同；环境变量优先。 |
 | `BILI_RESUME_INHERITANCE` | 设为 `0` 关闭 resume 继承（默认开启）（#1486）：当带自有会话 id 的客户端（如 Claude Code 的 `x-claude-code-session-id`）以**新**会话 id 重放完整历史来续接会话时（`cc --resume` 会 fork 出新 UUID），bili 通过字节级前缀匹配（≥8 条消息、append-only 跟踪）识别出它与该客户端已跟踪历史的父子关系，并在续接会话的首个请求上继承父会话的 ref 分配 —— 模型引用的旧代际 refs 因此命中**原始**消息、而不是错配到重新编号的新消息 —— 同时继承源内容完整存在的压缩块（随本继承一并生效，#1834：resume 丢块会导致被折叠原文重新回到线上、上游请求膨胀；旧的 `forkAdoption` 联动门现仅作用于匿名 fork，#629），并记录 `derivedFrom` 血缘。父会话不受影响；新消息在父会话 ref 空间之上继续编号。resume 必须**严格扩展**父历史 —— 同深度的字节级重放（不同 id）视为重复会话而非 resume。匿名会话不受影响（保留自己的 pfa-* 世界，#309）。配置文件中设 `"resumeInheritance": false` 效果相同；环境变量优先。 |
@@ -2023,7 +2072,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_MAX_SESSIONS` | 内存中最多保留的会话数（默认 `256`；LRU 淘汰 —— 磁盘是事实源）。 |
 | `BILI_SESSION_WARM_MAX` | 有界启动（#2803）：监听前启动时最多预加载的最近保存会话数（默认 `0` = 不预热，受 `sessions.max` 封顶）；更早的状态按需重载。设为如 `8` 可恢复对最近集的热加载。文件侧对应：`sessions.warmMax`。 |
 | `BILI_SESSION_WARM_MAX_BYTES` | 启动预热集的解码字节预算（#2803；默认 `67108864` = 64 MiB）。计的是**解码后**尺寸而非磁盘压缩字节，zstd 归档无法绕过内存上限。单文件超预算则永不预热。文件侧对应：`sessions.warmMaxBytes`。 |
-| `BILI_SESSION_RESIDENT_MAX_BYTES` | 常驻会话估算字节的软目标（#2803；默认 `536870912` = 512 MiB）。活跃/in-flight 状态不受此限制（字节预算约束的是空闲缓存而非活跃负载）；超出目标时空闲状态随请求完成回落磁盘。文件侧对应：`sessions.residentMaxBytes`。 |
+| `BILI_SESSION_RESIDENT_MAX_BYTES` | 常驻会话估算字节的软目标（#2803；默认 `4294967296` = 4 GiB，#5779 从 512 MiB 提高）。活跃/in-flight 状态不受此限制（字节预算约束的是空闲缓存而非活跃负载）；超出目标时空闲状态随请求完成回落磁盘。文件侧对应：`sessions.residentMaxBytes`。 |
 | `BILI_PUBLIC_SNAPSHOT_CAP_BYTES` | 为公开 fork API 按插件会话保留的原始 wire 历史快照的大小上限（字节，#2017）。序列化快照超限的插件会话不再可 fork —— `GET /__bili/plugin/snapshot` 与 `POST /__bili/plugin/fork` 以 `409` fail-closed 并注明原因 —— 而不是永久保留无上限的原始历史副本。上限在每次插件模型请求时重新评估：会话缩回上限内（fork 裁剪后或宿主缩短历史）即恢复可 fork。默认 `104857600`（100 MiB）；`0` 完全停用留存（所有会话不可 fork，已有快照在下一次请求时丢弃）。文件孪生键：`plugin.snapshotCapBytes`。 |
 | `BILI_SESSIONS_DIR` | 会话持久化目录（默认 XDG data 目录）。 |
 | `BILI_SESSION_GC` | 过期会话文件清理（#1082）为**可选开启**：设 `1`/`true`/`on` 启用 —— 默认关闭，因为会话文件是用户数据（可导出、可续聊），不应有静默删除策略。启用后，扫描（启动 + 每小时）只在**两个条件同时满足**时删除一个文件：年龄超过 `BILI_SESSION_GC_MAX_AGE_DAYS`，并且"小"到无损 —— 该会话**从未被压缩过**（零折叠块）且最近一次请求体 ≤ 下述 token 上限，这样继续对话只损失一次冷重建（用客户端自己的历史重建），别无其他。安全边界：被压缩过的会话永不删除（其摘要无法无损重建）；内存中仍持有的会话会被跳过，除非该会话自上次落盘后一直空闲；不可读/损坏的文件原地保留；每次删除逐条写审计日志（路径、大小、年龄），另有一次非空扫描的汇总日志；只触碰会话目录；清空后的协议子目录一并删除。注意 resident 守卫是进程内的：共享 `BILI_SESSIONS_DIR` 但不落盘的另一实例（如 `BILI_PERSIST=0`）不会刷新文件 mtime，其仍活跃的会话文件可能老化被扫 —— 代价同样是有限的一次冷重建，且有年龄门兜底。CCR 内容存储（#1097）与会话共享生命周期（#1180）：`<hash>.content-store.json` 伴随文件随其会话文件一起删除；孤儿伴随文件（会话文件已不存在）超过年龄门后被清扫；不可读的伴随文件会连同其会话文件一起保留（绝不猜测）。 |
@@ -2060,6 +2109,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `proxy-reset` | 经代理的连接在响应前死亡（首要嫌疑：代理空闲回收 / 载荷上限 / 节点轮换） | 透明重放，受 `BILI_REPLAY_RETRY_MAX` 约束（默认共 3 次尝试） |
 | `upstream-reset` | 同上，直连（嫌疑在上游/本地网络） | 同上（受 `BILI_REPLAY_RETRY_MAX` 约束） |
 | `connect-refused` | TCP 被拒（配置了代理时指代理，否则指上游） | 同上（受 `BILI_REPLAY_RETRY_MAX` 约束） |
+| `upstream-unreachable` | 主机无路由（ICMP `EHOSTUNREACH` / `ENETUNREACH` / `EHOSTDOWN`）——路由 / ACL / 防火墙 `REJECT`；macOS 另见 Local Network 隐私拒绝（#5663） | 同上（受 `BILI_REPLAY_RETRY_MAX` 约束） |
 | `dns` | 域名解析失败（DNS 服务器 / 主机名拼写错误） | 透明重放，受 `BILI_REPLAY_RETRY_MAX` 约束 |
 | `tls` / `unknown` | TLS/握手失败（CA/MITM）/ 未分类传输故障 | 不重试 |
 
@@ -2096,7 +2146,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `bili hermes [opts --] [args]` | 代理 + **hermes-agent**（`/bili/` 重写） |
 | `bili dsh [opts --] [args]` | 代理 + **deepseek-harness**（`/bili/` 重写；`--profile web "task"` 等参数原样透传） |
 | `bili codebuddy [opts --] [args]` | 代理 + **codebuddy**（Tencent CodeBuddy Code CLI）—— `CODEBUDDY_BASE_URL` `/bili/` 重写,OpenAI chat-completions wire;预算对齐走 `CODEBUDDY_AUTO_COMPACT_WINDOW`(#640) |
-| `bili qoder [opts --] [args]` | 代理 + **qoder** —— 证书 MITM(`HTTPS_PROXY` + `NODE_EXTRA_CA_CERTS`);模型端点硬编码 https(`/bili/` 改写不可用,默认主机表加白名单)(#653) |
+| `bili qoder [opts --] [args]` | 代理 + **qoder CLI**(`qoder`/`qodercli`)—— 证书 MITM(`HTTPS_PROXY` + `NODE_EXTRA_CA_CERTS`);模型端点硬编码 https(`/bili/` 改写不可用,默认主机表加白名单)(#653)。Qoder **Desktop** 是另一条 BYOK/自定义渠道,走 `/bili/` 前缀的明文 OpenAI wire —— 当作普通自定义 provider 指向 bili(不走这条 MITM 车道);官方订阅流量加密,不在范围(#764) |
 | `bili trae [opts --] [args]` | 代理 + **Trae CLI**（字节跳动,闭源 Go 二进制)—— 证书 MITM(`HTTPS_PROXY` + `SSL_CERT_FILE`);模型主机取 `TRAE_CLI_API_HOST` 或默认企业网关(#655) |
 | `bili jcode [opts --] [args]` | 代理 + **jcode**（Rust 终端编码 agent)—— 环境变量式证书 MITM 启动(`HTTPS_PROXY` + `SSL_CERT_FILE`);托管模型主机 `api.z.ai` 默认加白,本地回环 provider 走 `NO_PROXY` 直连 |
 | `bili kimi [opts --] [args]` | 代理 + **Kimi Code**(Moonshot CLI)—— 证书 MITM(`HTTPS_PROXY` + `NODE_EXTRA_CA_CERTS`/`SSL_CERT_FILE`);provider/model 主机取自 `~/.kimi-code/config.toml`(遵循 `KIMI_CODE_HOME`),未声明时用托管 OAuth 端点;回环端点编目并附手动 `/bili/` 前缀提示(#757) |
@@ -2471,6 +2521,17 @@ bili export <id> --full --output handoff.md
 Codex 子代理（如 `guardian_subagent` 审批 reviewer）复用主会话的 `session_id`，在线路上看起来是同一个会话。若不处理，子代理请求会继承主会话的压缩状态 —— 子代理轮次的上下文可能被折叠（丢失它必须逐字读取的用户授权），两个角色的用量估算也会互相污染。
 
 billion-context 通过 `instructions` 字段识别：子代理请求带自己的角色 prompt。会话**首次**看到的 instructions 锚定主命名空间（即使主 prompt 后来漂移也稳定）；任何其他 instructions 值映射到独立的 `|sub:` 命名空间，拥有自己的空白压缩状态。子代理请求是自包含重放，所以新命名空间无损 —— Web UI 的会话列表会把两个命名空间显示为共享同一客户端标签的独立会话。
+
+这个锚定不只对 Codex / Claude Code 成立——但分裂是有意的、按客户端启用的：只有流量已被证实「同一个会话 id 盖在多个角色上、每个角色在该 id 下带自己的 system prompt」的客户端才启用，目前是 Codex、Claude Code 与 DeepSeek Harness。其他客户端的 system prompt 中途变化意味着「同一会话、提示词演进」，仍留在主命名空间。一个非 Claude 的实例是启用了 `@deepseek-ai/dsh-experimental-auto-review` 的 DeepSeek Harness：reviewer 在每次待执行工具调用前用自己的小块固定 system prompt（约 1 KB；`ENVIRONMENT` / `PROJECT_INSTRUCTIONS` / `FILTERED_HISTORY` / `PENDING_ACTION` 四节走的是它的 user 轮）发一次请求，于是它的会话行与主对话并排出现，同样显示「运行中」。
+
+四个读数可以在不读代码的情况下认出这类车道：
+
+| 读数 | 主对话 | 评审 / 子代理车道 |
+| --- | --- | --- |
+| system prompt | 完整提示词（数十 KB） | 很小（约 1 KB） |
+| 压缩次数 | 随时间增长 | 0 |
+| 请求数 | 大致每轮一次 | 大致每次工具调用一次 |
+| 缓存命中率 | 因场景而异 | 约 99.9%（前缀稳定，只有待执行动作在变） |
 
 ### Windows：把会话目录加入杀软排除项（#362）
 

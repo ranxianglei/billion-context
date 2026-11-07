@@ -642,6 +642,11 @@ export function noteClientAbort(session: Session): void {
     lastClientAbort.set(session, Date.now());
 }
 
+// #5795: single source of truth for the credential header names — the 429
+// governor's hold key (upstream-throttle.ts) and the pre-ingest fast path
+// (server/handle.ts) must read exactly these headers or holds go unmatched.
+export const CREDENTIAL_HEADER_NAMES = ["authorization", "x-api-key", "api-key", "x-goog-api-key"] as const;
+
 /** #2131: stable fingerprint of the outbound credential — the ONLY form the
  *  key is ever persisted in (raw secrets never reach the ledger, logs or the
  *  web UI). Checks the standard bearer/api-key headers, case-insensitively;
@@ -651,7 +656,7 @@ export function credentialFingerprint(headers: Record<string, string> | undefine
     let cred: string | undefined;
     for (const [name, value] of Object.entries(headers)) {
         const n = name.toLowerCase();
-        if (n === "authorization" || n === "x-api-key" || n === "api-key" || n === "x-goog-api-key") {
+        if ((CREDENTIAL_HEADER_NAMES as readonly string[]).includes(n)) {
             // Strip the auth-scheme envelope so "Bearer X" (authorization) and
             // a bare "X" (x-api-key) hash to the SAME credential identity.
             const v = value.trim().replace(/^Bearer\s+/i, "").trim();
@@ -678,8 +683,10 @@ export function credentialFingerprint(headers: Record<string, string> | undefine
 
 // #3803: deterministic key-sorted JSON — the fingerprint must be stable under
 // field reordering (a host that emits the same knobs in a different order must
-// NOT flip the cache-partition identity between requests).
-function canonicalJson(v: unknown): string {
+// NOT flip the cache-partition identity between requests). Exported: the
+// persist-side metadata fold gate (#5506) fingerprints with the same
+// canonicalization so live-vs-disk comparisons are like-for-like.
+export function canonicalJson(v: unknown): string {
     if (v === null || typeof v !== "object") return JSON.stringify(v) ?? "null";
     if (Array.isArray(v)) return "[" + v.map(canonicalJson).join(",") + "]";
     const obj = v as Record<string, unknown>;

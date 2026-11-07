@@ -128,6 +128,7 @@ Pick by your client:
 | **aider** | [`billion-context`](https://github.com/ranxianglei/billion-context) via `bili aider` (cert-MITM) or `/bili/` prefix — no native mode (shell-command-only hooks, no tool-injection seam, [#1048](https://github.com/ranxianglei/billion-context/issues/1048)) |
 | **copilot** (GitHub Copilot CLI) | `bili copilot` (launcher, cert-MITM) — closed Go binary, no plugin seam (#1049) |
 | **amp** (Amp CLI) | `bili amp` (launcher, cert-MITM) — closed Go binary, no plugin seam (#1049) |
+| **kiro** (Kiro CLI, AWS) | `bili kiro` (launcher, cert-MITM) — Rust shell + Node agent server, no plugin seam; model traffic is the Responses wire on `runtime.<region>.kiro.dev`, gateway quirks handled built-in — details: [CLIENTS.md](CLIENTS.md#kiro-cli-aws) |
 | **crush** (Charm Crush) | `bili crush` (launcher, cert-MITM) — open-source Go binary, no plugin seam; built-in provider hosts whitelisted, custom `base_url`s auto-discovered from crush.json (#2340) |
 | **zed** (Zed editor) | `bili zed` (launcher, cert-MITM) — open-source Rust editor, no plugin seam; reqwest honors HTTPS_PROXY, CA via SSL_CERT_FILE (Linux env probing); built-in provider hosts whitelisted, custom `api_url`s auto-discovered from settings.json; loopback providers (ollama/lmstudio) stay direct via NO_PROXY (#2340) |
 | **goose** (Goose CLI) | `bili goose` (launcher) — rustls trusts no CA file, so no cert-MITM: openai/anthropic legs via `OPENAI_HOST`/`ANTHROPIC_HOST`, custom providers via a regenerated `GOOSE_PATH_ROOT` overlay (#1049) |
@@ -248,7 +249,7 @@ Notes:
 - `jcode` and `aider` have no native mode (no plugin/MCP/tool-injection seam: #962, #1048) — use `bili jcode` / `bili aider`.
 - `copilot`, `amp` and `goose` are launcher-only (#1049); goose cannot be cert-MITMed (rustls trusts no CA file) and rides plain-HTTP base-URL redirects instead.
 
-### Option 2 — Launcher (`bili pi` / `bili codex` / `bili claude` / `bili omp` / `bili opencode` / `bili hermes` / `bili dsh` / `bili codebuddy` / `bili qoder` / `bili trae` / `bili jcode` / `bili kimi` / `bili gemini` / `bili iflow` / `bili qwen` / `bili antigravity` / `bili mcode` / `bili aider` / `bili copilot` / `bili amp` / `bili goose`)
+### Option 2 — Launcher (`bili pi` / `bili codex` / `bili claude` / `bili omp` / `bili opencode` / `bili hermes` / `bili dsh` / `bili codebuddy` / `bili qoder` / `bili trae` / `bili jcode` / `bili kimi` / `bili gemini` / `bili iflow` / `bili qwen` / `bili antigravity` / `bili mcode` / `bili aider` / `bili copilot` / `bili amp` / `bili goose` / `bili kiro`)
 
 The launcher wraps a client in one command: it starts a proxy on an
 independent port (a fresh instance is always spawned — a port is never
@@ -268,7 +269,7 @@ bili opencode                         # OpenCode (1.x & 2.x): full guide in the 
 bili hermes                           # file-free (#535): hermes proxy env (HTTPS_PROXY + combined CA bundle via SSL_CERT_FILE) — https via CONNECT MITM, http via absolute-form forward proxy; real ~/.hermes untouched
 bili dsh                              # deepseek-harness: full native plugin injected via --patch (#941) — real dsh tools, session-bound /acp + /acp-cache (plugin mode); non-loopback upstreams ride proxy envs, loopback keeps the overlay DSH_HOME rewrite (#535); dsh auto-compaction off everywhere — host plane via the bundle patch, web-profile presets at load time (#1772/#2474/#3354)
 bili codebuddy                        # Tencent CodeBuddy Code CLI: CODEBUDDY_BASE_URL /bili/ rewrite (OpenAI chat completions wire), budget aligned via CODEBUDDY_AUTO_COMPACT_WINDOW; real ~/.codebuddy untouched
-bili qoder                            # qoder: model endpoint is hardcoded https (no /bili/ rewrite possible) — cert-MITM via HTTPS_PROXY + NODE_EXTRA_CA_CERTS, default model hosts whitelisted (#653)
+bili qoder                            # qoder CLI (`qoder`/`qodercli`): model endpoint is hardcoded https (no /bili/ rewrite possible) — cert-MITM via HTTPS_PROXY + NODE_EXTRA_CA_CERTS, default model hosts whitelisted (#653). Qoder Desktop is a separate BYOK/custom channel that speaks plaintext OpenAI over a `/bili/` prefix — point it at bili as a normal custom provider (not this MITM lane); its official-subscription traffic is encrypted and out of scope (#764)
 bili trae                             # Trae CLI (ByteDance, closed Go binary, no base-URL override) — cert-MITM via HTTPS_PROXY + SSL_CERT_FILE, model host from TRAE_CLI_API_HOST or the default enterprise gateway (#655)
 bili jcode                            # jcode (Rust agent harness) — env-only cert-MITM launch: HTTPS_PROXY + SSL_CERT_FILE, model host api.z.ai whitelisted, local loopback providers stay direct via NO_PROXY
 bili kimi                             # Kimi Code CLI (Moonshot): standard proxy envs except an unconditional loopback bypass — https via cert-MITM, http via absolute-form forward proxy; loopback endpoints inventoried with a manual /bili/ hint (#757)
@@ -281,6 +282,7 @@ bili aider                            # Aider (Python pair programmer): cert-MIT
 bili copilot                          # Copilot CLI (GitHub, closed Go binary) — cert-MITM via HTTPS_PROXY + SSL_CERT_FILE, api.githubcopilot.com + per-plan subdomains whitelisted (#1049)
 bili amp                              # Amp CLI (Sourcegraph, closed Go binary) — cert-MITM via HTTPS_PROXY + SSL_CERT_FILE, ampcode.com whitelisted (#1049)
 bili goose                            # Goose (Block, Rust/reqwest): rustls release builds trust no CA file — openai/anthropic legs via OPENAI_HOST/ANTHROPIC_HOST, custom providers via a regenerated GOOSE_PATH_ROOT overlay (/bili/ rewrites, real config untouched) (#1049)
+bili kiro                             # Kiro CLI (AWS): cert-MITM via HTTPS_PROXY + combined CA on SSL_CERT_FILE and NODE_EXTRA_CA_CERTS; only runtime.<region>.kiro.dev is decrypted; developer/system items re-voiced as user for the gateway; session = Kiro's conversation id (survives --resume)
 bili pi --mitm-domain api.foo.com     # add a domain to the MITM whitelist
 ```
 
@@ -395,6 +397,19 @@ tools are called by the model as context grows, gentle growth nudges
 prompt it along the way, and preflight fires as a hard backstop when the input
 alone exceeds the window (#470). Watch it live with `/acp` or the web UI.
 
+**Does compression shrink my client's own conversation file?** No — the most
+common surprise in very long sessions (#5796). Compression shrinks **what is
+sent to the model**: every outgoing request is rebuilt from live blocks plus
+summaries, so the wire stays small however long the conversation runs. The
+client's stored history is user data — bili never rewrites it. On dsh the
+host's auto-compaction is additionally disabled while bili is active (two
+compressors must not fight over one history, #1772/#2474/#3354), so the
+host-side file grows with every turn: each turn takes longer as it grows
+(measured: tens of seconds per turn at ~30K messages, #5796), and the
+practical convergence path is to **start a new session** when it gets heavy.
+The web session list badges sessions at 5,000+ requests (长会话/slow) as a
+reminder that this point has been reached.
+
 **Why does the first compaction wait until ~200k?** Compaction does not
 trigger on absolute window position but on growth intervals: by default the
 first soft compaction fires 50k tokens past the boot content
@@ -430,9 +445,14 @@ declare their context windows under the providers key
 fallback window (route-miss warning, #2317); ③ if the relay rejects bili's
 Anthropic-lane `cache_control` stamps, set `compat.noCacheControl`; ④ loopback
 gateways work out of the box; a gateway on a private non-loopback address may
-additionally need `network.allowPrivateHttpProviders` (#2984). Verified
-end-to-end over all three wires (OpenAI Chat / Responses / Anthropic Messages,
-including cross-protocol conversion), #4433.
+additionally need `network.allowPrivateHttpProviders` (#2984); ⑤ for Claude Code
+native plugin mode (`bili plugin install claude`), set
+`BILI_CLAUDE_UPSTREAM=http://127.0.0.1:3425` before install so the managed block
+wraps the relay into `ANTHROPIC_BASE_URL` (or configure
+`ANTHROPIC_BASE_URL=http://127.0.0.1:8787/bili/http://127.0.0.1:3425` directly;
+`localhost` and `127.0.0.1` both accepted, #5369). Verified end-to-end over all
+three wires (OpenAI Chat / Responses / Anthropic Messages, including
+cross-protocol conversion), #4433.
 
 **Where are logs and session data stored?** Log:
 `~/.local/state/billion-context/bili.log` (also mirrored to stderr); session
@@ -529,6 +549,8 @@ A **long-lived** standalone proxy can keep holding stale OS-resolver state after
 
 Independent of auto-update (#1481): even with `autoUpdate` off, the proxy polls a small companion npm package (`billion-context-advisories`, published by CI from this repo's [`advisories/`](advisories/) directory) on the same 3-minute cadence. Each advisory names a semver range of broken versions (`affected`), the exact version to install (`target` — which may be *older* than the current one, i.e. a rollback), and a user-facing `reason`. When the local version falls inside `affected`, bili force-installs `target` through the self-updater's full safety chain (cross-process lock, backup + verify + rollback; source checkouts and host-managed installs are refused with manual instructions instead) and warns prominently: a one-time `[advisory] ⚠️ …` log line per process per advisory id, a banner on the web UI showing the reason and the exact manual upgrade command, and the active entry under `advisory` in `/__bili/status`. The check is fail-open by design: an unreachable or malformed advisory source only produces a warning — model traffic is never blocked by it. Disable via config (`"advisoryCheck": false`) or env (`BILI_ADVISORY_CHECK=0`); point at a custom document with `"advisoryUrl"` / `BILI_ADVISORY_URL`.
 
+**Announcements** (#5548) — distinct from the defect advisory above, three sources feed the web-UI banners, and equal ids shadow in the order **local file > remote feed > built-in**: (1) *built-in* one-time notices rendered from the UI i18n strings; (2) *local* — drop JSON files into `<config dir>/announcements/*.json` (`~/.config/billion-context/announcements/` by default) and they render automatically: bilingual records with kind-derived color, npm-style `versions` targeting (`>=a.b.c`, `^`, `~`, `[lo hi]`, `||` lists), `percent` grey rollout, time windows, and per-kind priority — one bad file disables only itself; (3) *remote* — this repo's master branch [`announcements/remote.json`](announcements/remote.json) (CI-linted on every PR), fetched on the ~3-minute watcher cadence, whose last-known-good snapshot survives restarts and outages while malformed pushes are rejected; unreachable installs (firewalls) point `"remoteAnnouncementsUrl"` / `BILI_ANNOUNCEMENTS_URL` at a relay mirror of the same document. Dismissal follows each record's declared mode: `persistent` (default, content-addressed — editing a notice shows it again), `instance` (this process run only), or `always` (renders without a close button). Dismissing a built-in intro notice is recorded per install in bili's unified storage (SQLite by default; the MySQL backend works too), so it survives restarts — the old `upgrade-notices.json` state file remains only as fallback on legacy-only installs without a unified sidecar. The official feed currently ships an empty entry list.
+
 ## Configuration
 
 The full configuration reference — config file location, top-level keys,
@@ -567,7 +589,7 @@ Knobs people look for first:
 
 Using `bili pi` or the native pi plugin (`bili plugin install pi`) includes built-in subagent support, enabled by default: `acp_delegate`, `acp_delegate_wait`, and `acp_delegate_cancel`. This additional tool surface is specific to pi.
 
-**Keep only one subagent implementation enabled.** If you use the built-in support, remove or disable other pi subagent plugins (for example, `pi-subagents` or a separately installed `billion-context-pi-subagents`) in both user and project settings to avoid overlapping tools, prompts, or behavior. If you prefer another subagent plugin, disable the built-in support instead. A project-scope `pi-subagents` install makes the built-in delegate stand down by default, but a user-scope-only install does not; do not rely on that guard for every installation.
+**Keep only one subagent implementation enabled.** If you use the built-in support, remove or disable other pi subagent plugins (for example, `pi-subagents` or a separately installed `billion-context-pi-subagents`) in both user and project settings to avoid overlapping tools, prompts, or behavior. If you prefer another subagent plugin, disable the built-in support instead. A `pi-subagents` install at either scope (project or user) makes the built-in delegate stand down automatically by default — a user-scope install loads in every project, so the guard applies there too (#5637); set `delegate.forceEnable` to keep `acp_delegate` alongside it.
 
 To disable the built-in subagents while keeping context compression, merge this into `~/.config/billion-context/billion-context.json` (or the file selected by `BILI_CONFIG_FILE`), preserving your other settings:
 

@@ -5,7 +5,8 @@ import { coreToGoogle, googleToCore, normalizeGoogleUserPartOrder, type BiliMess
 import type { ProxyOptions } from "../config.js";
 import { pluginAgentHeader } from "../plugin.js";
 import { currentCalibrationFactor } from "../util.js";
-import { diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, reapOrphansLogged, resolveKnownOutputCeiling, runNudgeDecision, stripKernelSummaries, usageGradeInputBaseline, type Prepared } from "../server.js";
+import { diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, makeFoldPointReasoningDroppable, reapOrphansLogged, resolveKnownOutputCeiling, runNudgeDecision, stripKernelSummaries, usageGradeInputBaseline, type Prepared } from "../server.js";
+import { isStrictReasoningEcho } from "../strict-echo.js";
 import { yieldToEventLoop } from "../yield-loop.js";
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, resolveDecisionRange, stripDecisionReasoningFields, type DecideConfig } from "../nudge-decide.js";
 import { excludeDeadRefRanges } from "../acp-status.js";
@@ -154,6 +155,10 @@ export async function prepareGoogle(
         // config stripping — only tool availability matters.
         const rulesActive = rulesEnabled(config) && shouldInject;
         const loopConfig = ccrLoopConfig(session, { ...config, absorb: absorbActive ? absorbBlock : undefined });
+        // Experimental fold-point "thinking clear" (default OFF): install the kernel drop predicate only when BOTH switches are set; strict-echo (#684) and signed-thinking views yield none at all (#1658).
+        if (loopConfig.compressAtFoldPointClearThinking) {
+            loopConfig.reasoningDroppable = makeFoldPointReasoningDroppable(renderMsgs, isStrictReasoningEcho(session, upstreamOrigin, model));
+        }
         // #2432/#2658: same post-landing recovery as the openai/responses/
         // anthropic lanes — dsh desktop's native compaction can land without
         // transiting bili (direct-bypass / future gate mismatch); first notice =
@@ -197,7 +202,7 @@ export async function prepareGoogle(
         await yieldToEventLoop();
         // #5293: re-anchor the nudge growth reference after a user-aborted turn (no-op otherwise).
         absorbAbortedTurnGrowth(session, tokenCount);
-        const turn = core.processTurn({ messages: renderMsgs, state: session.state, config: loopConfig, tokenCount, renderTags: renderStrategy, contentStore: contentStoreOf(session) });
+        const turn = core.processTurn({ messages: renderMsgs, state: session.state, config: loopConfig, tokenCount, tokenCountSource, renderTags: renderStrategy, contentStore: contentStoreOf(session) });
         session.state = turn.state;
         adoptContentStore(session, turn.contentStore);
         // #4528: split the kernel pass from its post-processing scan passes so

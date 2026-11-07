@@ -33,7 +33,7 @@ import { applyConfiguredCompression } from "../external-summary-compress.js";
 import { executeSearchContextTarget, resolveDecompress } from "../decompress-shared.js";
 import { toolFail, type ProxyToolResult } from "../proxy-tool-result.js";
 import { fetchWithRetry, UpstreamHttpError } from "../fetch-util.js";
-import { noteUpstreamThrottle429, noteUpstreamThrottleResolved } from "../upstream-throttle.js";
+import { noteUpstreamThrottle429, noteUpstreamThrottleResolved, throttle429ModelScope } from "../upstream-throttle.js";
 import { classifyUpstreamFailure, type SkippedProxyInfo, type UpstreamFailureKind } from "../upstream-fail.js";
 import { formatUpstreamError, proxyDispatcher } from "../upstream-proxy.js";
 import { warnCacheCollapse } from "../cache-warn.js";
@@ -175,6 +175,14 @@ function isThinkingModifiedError(e: unknown): boolean {
     return e instanceof UpstreamHttpError && /cannot be modified/i.test(e.body);
 }
 
+// #5495: a "must be passed back" 400 (DeepSeek — reasoning_content on the chat
+// wire, content[].thinking on its Anthropic-wire endpoint) means thinking is
+// MANDATORY on this upstream. Stripping the replayed thinking and retrying
+// guarantees a second 400 plus a swapped error; propagate the original instead.
+function isReasoningRequiredError(e: unknown): boolean {
+    return e instanceof UpstreamHttpError && /must be passed back/i.test(e.body);
+}
+
 // #1453 client-facing labels for transport failures that end the turn in-band.
 // Deliberately kind-level only: raw error text can embed endpoint hostnames/IPs,
 // which must never reach the client stream (the full masked chain goes to the
@@ -186,6 +194,7 @@ const TRANSPORT_FAILURE_LABELS: Record<UpstreamFailureKind, string> = {
     "upstream-reset": "connection reset by the upstream",
     "connect-refused": "connection refused",
     "connect-timeout": "connect timed out",
+    "upstream-unreachable": "no route to the upstream",
     dns: "name resolution failed",
     tls: "TLS handshake failure",
     unknown: "network error",
@@ -258,6 +267,8 @@ export interface LoopCtx {
 
 export interface RequestOptions {
     url: string;
+    /** Exact request model when this wire carries it in a URL/envelope instead of the body. */
+    model?: string;
     headers: Record<string, string>;
     /** Final-stage wire transform (e.g. compat.roles role rewrite, #552).
      *  Applied to every outgoing body this loop re-sends — truncation retry,
@@ -501,6 +512,7 @@ export async function* runCompressLoop(
         // #2131: also hand over the exact message count — bodies above the
         // forensics cap are stored clipped and parse to zero messages.
         const wireObj = requestOptions.wireTransform ? requestOptions.wireTransform(body) : body;
+        const requestModel = requestOptions.model ?? (typeof wireObj.model === "string" ? wireObj.model : undefined);
         // #816 family: a lone surrogate anywhere in the body (model-authored
         // text, pre-#816 persisted state) serializes as an unpaired \uXXXX
         // escape and strict upstreams reject the WHOLE body (non-retryable
@@ -588,7 +600,10 @@ export async function* runCompressLoop(
             undefined,
             signal,
             (info) => {
-                if (info.status === 429) noteUpstreamThrottle429(requestOptions.url, requestOptions.headers, null); // retry-after isn't carried in ReplayRetryInfo; the settled response below re-notes with the header
+                if (info.status === 429) {
+                    const modelScope = throttle429ModelScope(info.status, requestModel, info.detail);
+                    noteUpstreamThrottle429(requestOptions.url, requestOptions.headers, null, Date.now(), modelScope); // Retry-After is not carried on replay metadata.
+                }
                 // #189: correlate the rejection with the rewrite that
                 // preceded it (shrink ratio + fold point), if any.
                 const lc = lastCompressSuffix(ctx.session.lastCompress);
@@ -603,11 +618,12 @@ export async function* runCompressLoop(
         // (retry-after is not carried on the error) before rethrowing.
         try {
             const upstreamSend = await throttledSend;
-            noteUpstreamThrottleResolved(requestOptions.url, requestOptions.headers, upstreamSend.response.status);
+            noteUpstreamThrottleResolved(requestOptions.url, requestOptions.headers, upstreamSend.response.status, Date.now(), requestModel);
             return upstreamSend;
         } catch (error) {
             if (error instanceof UpstreamHttpError && error.status === 429) {
-                noteUpstreamThrottle429(requestOptions.url, requestOptions.headers, null);
+                const modelScope = throttle429ModelScope(error.status, requestModel, error.body);
+                noteUpstreamThrottle429(requestOptions.url, requestOptions.headers, null, Date.now(), modelScope);
             }
             throw error;
         }
@@ -1306,17 +1322,23 @@ export async function* runCompressLoop(
             // never in coreMessages), and hideConsumedCompressCalls runs each
             // round so consumed compress records cannot re-prime the model.
             if (proxyResults.length > 0) {
-                // #539: only wires that VERIFY thinking+signature pairs need a
-                // signature to replay a thinking block — Anthropic and Gemini 3
-                // (its thoughtSignature is rejected when dropped, same fatality).
-                // OpenAI/DeepSeek and Responses echo reasoning_content back
-                // verbatim and emit no signature — gating on one dropped every
+                // #539/#5495: whether a thinking block NEEDS a signature to be
+                // replayed is upstream evidence, not protocol. Real Claude signs
+                // every round and Gemini 3 rejects a dropped thoughtSignature
+                // (same fatality); but an Anthropic-wire relay that does NOT
+                // sign (DeepSeek's /anthropic endpoint) requires the UNSIGNED
+                // block passed back — gating on protocol alone dropped every
                 // such round's reasoning from the re-request, leaving the
-                // proxy-tool assistant message without reasoning_content
-                // (DeepSeek 400 invalid_request_error: "reasoning_content ...
-                // must be passed back"). Relies on the invariant that the single
+                // tool_use assistant message without its thinking sibling
+                // (400 invalid_request_error: "content[].thinking ... must be
+                // passed back"). Gating on the protocol alone was #539's fix for
+                // the mirror image (OpenAI/DeepSeek chat + Responses echo
+                // reasoning_content verbatim and emit no signature). Require a
+                // signature only when THIS attempt actually saw one; otherwise
+                // replay verbatim. Relies on the invariant that the single
                 // production call site (server.ts) always populates ctx.protocol.
-                const requiresThinkingSignature = ctx.protocol === "anthropic" || ctx.protocol === "google";
+                const requiresThinkingSignature =
+                    (ctx.protocol === "anthropic" || ctx.protocol === "google") && sawSignedThinkingThisAttempt;
                 let reasoningIdx = 0;
                 let textIdx = 0;
                 let redactedIdx = 0;
@@ -1641,13 +1663,16 @@ export async function* runCompressLoop(
                     // On OpenAI/DeepSeek thinking mode reasoning_content is
                     // MANDATORY, so a strip-retry there guarantees another 400 plus
                     // a misleading log — gate the degraded retry to the wires that
-                    // verify signatures.
+                    // verify signatures. #5495: same fatality on an Anthropic-wire
+                    // upstream that makes thinking mandatory WITHOUT signing it —
+                    // a "must be passed back" 400 must propagate, not strip-retry.
                     if (
                         !(e instanceof UpstreamHttpError) ||
                         e.status < 400 ||
                         e.status >= 500 ||
                         degradedRetried ||
                         isThinkingModifiedError(e) ||
+                        isReasoningRequiredError(e) ||
                         (ctx.protocol !== "anthropic" && ctx.protocol !== "google") ||
                         !coreMessages.some(isLoopThinking)
                     ) {
@@ -1700,9 +1725,10 @@ export async function* runCompressLoop(
                 // again (kernel gate prevents the split; this closes the loop).
                 // #2169: match BOTH field spellings — the chat wire says
                 // reasoning_content, DeepSeek's Responses wire says reasoning_text.
+                // #5495: DeepSeek's Anthropic-wire endpoint spells it content[].thinking.
                 if (
                     e.status === 400 &&
-                    /reasoning_(?:content|text)/i.test(e.body) &&
+                    /reasoning_(?:content|text)|content\[\]\.thinking/i.test(e.body) &&
                     ctx.session.metadata.strictReasoningEcho !== true
                 ) {
                     ctx.session.metadata.strictReasoningEcho = true;

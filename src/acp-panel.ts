@@ -182,7 +182,10 @@ const LEGACY_STATUS_SECTION_STARTS = [
     "COMPRESSED — ",
     "UNCOMPRESSED — ",
     "Sorted by ",
+    // #5555: the tip line was reworded off the internal function name; keep
+    // BOTH wordings so sessions carrying either generation strip fully.
     "Tip: buildStatusReport(",
+    "Tip: call again with scope:",
     "BILLED INPUT",
     "NOTE: ",
     "Nudge: ",

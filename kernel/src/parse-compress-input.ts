@@ -456,7 +456,10 @@ type EntryOutcome = { range: CompressRangeSpec } | { reason: string };
 // anchored (^): summaries cite mNNNNN/bN refs routinely, so an unanchored
 // scan would let a citation inside a headerless entry supply fake bounds.
 const REF_PAIR_IN_LINE =
-  /^([mb]\d{1,7})\s*(?:[-\u2013\u2014\u2026~\u2212\uFF0D]|\.\.\.|to)\s*([mb]\d{1,7})\b/i;
+  /^([mb]\d{1,7})\s*(?:[-\u2013\u2014\u2026~\u2212\uFF0D]|\.{2,3}|to)\s*([mb]\d{1,7})\b/i;
+// #5555 audit: ".." joins the accepted separators alongside "..." — pre-fix only the
+// three-dot form parsed while an error message advertised two dots (and a
+// two-dot header was silently swallowed by splitLineEntries instead).
 const SINGLE_REF_IN_LINE = /^([mb]\d{1,7})\b/i;
 // An unrecognized divider between two refs (punctuation run + a ref right
 // after) — the pair regex missed a separator variant. Folding as a single
@@ -538,7 +541,7 @@ export function deriveTopicFromSummary(summary: string): string | undefined {
 }
 
 const LINE_ENTRY_REFS_RE =
-  /[mb]\d{1,7}\s*(?:[-\u2013\u2014\u2026~\u2212\uFF0D]|\.\.\.|to)\s*[mb]\d{1,7}\b/iy;
+  /[mb]\d{1,7}\s*(?:[-\u2013\u2014\u2026~\u2212\uFF0D]|\.{2,3}|to)\s*[mb]\d{1,7}\b/iy;
 const WHITESPACE_RE = /\s/;
 
 function skipWhitespace(s: string, i: number): number {
