@@ -727,8 +727,23 @@ const CONTEXT_WINDOW_HEADER = "x-bili-plugin-context-window";
  *  plausible context window. Normal small direct sends (plugin intentionally
  *  deactivated) must keep working, but a multi-megabyte prompt cannot be
  *  allowed to ride out silently: refuse it locally and tell the user to
- *  restart the host so the interceptor can rebind. */
-export const MAX_SILENT_DIRECT_BODY_BYTES = 2 * 1024 * 1024;
+ *  restart the host so the interceptor can rebind.
+ *
+ *  The arms measure RAW body bytes (#5408) — base64-inflated media included —
+ *  which is deliberately simple but media-blind: an in-window session carrying
+ *  one medium image routinely crosses 2 MiB raw while its real token cost stays
+ *  far under the window. Default raised 2 → 8 MiB by owner ruling (2026-11-07,
+ *  #5826 release review); runaway prompts the guard exists for are tens/hundreds
+ *  of MB, so 8 MiB still stops them. */
+export const MAX_SILENT_DIRECT_BODY_BYTES = 8 * 1024 * 1024;
+
+/** #5826-review knob: `BILI_SILENT_DIRECT_MAX_MB` (megabytes, > 0; fractions
+ *  allowed). Resolved per call so env edits apply without a reload; missing or
+ *  invalid values fall back to the default above. */
+export function silentDirectBodyCapBytes(): number {
+    const mb = Number(process.env.BILI_SILENT_DIRECT_MAX_MB ?? "");
+    return Number.isFinite(mb) && mb > 0 ? Math.floor(mb * 1024 * 1024) : MAX_SILENT_DIRECT_BODY_BYTES;
+}
 
 /** #5405 follow-up: emit at most one state-missing warning per live-state
  *  generation. A missing slot is a process-wide condition, not a per-request
@@ -1279,9 +1294,10 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
                 // rather than init — measure what would actually go out
                 // (clone-probed, capped), or hosts that construct Requests
                 // bypass the guard entirely.
-                const size = await outgoingBodyBytesCapped(input, init, MAX_SILENT_DIRECT_BODY_BYTES);
-                if (size !== undefined && size > MAX_SILENT_DIRECT_BODY_BYTES) {
-                    logHostEvent("error", "[native-client]", `bili-native: intercept state missing — refusing oversized direct model request (${size.toLocaleString("en-US")} B > ${MAX_SILENT_DIRECT_BODY_BYTES.toLocaleString("en-US")} B) with a local 422; the slot will rebind on the next activation (#5405/#5408)`);
+                const cap = silentDirectBodyCapBytes();
+                const size = await outgoingBodyBytesCapped(input, init, cap);
+                if (size !== undefined && size > cap) {
+                    logHostEvent("error", "[native-client]", `bili-native: intercept state missing — refusing oversized direct model request (${size.toLocaleString("en-US")} B > ${cap.toLocaleString("en-US")} B) with a local 422; the slot will rebind on the next activation (#5405/#5408)`);
                     return emptySlotOversizeRefusal(url);
                 }
                 const seq = g[ACTIVE_STATE_SEQ];
@@ -1455,14 +1471,15 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
             // known large windows. A restored body IS what goes out, so it is
             // what gets measured.
             if (degradeLog === undefined && fetchMethodOf(defaultInput, init) === "POST") {
+                const cap = silentDirectBodyCapBytes();
                 const silentBytes = prep.outcome === "restored"
                     ? Buffer.byteLength(prep.body)
                     : measured !== undefined
                       ? measured.bytes
-                      : await outgoingBodyBytesCapped(defaultInput, init, MAX_SILENT_DIRECT_BODY_BYTES);
-                if (silentBytes !== undefined && silentBytes > MAX_SILENT_DIRECT_BODY_BYTES) {
+                      : await outgoingBodyBytesCapped(defaultInput, init, cap);
+                if (silentBytes !== undefined && silentBytes > cap) {
                     state.onDispatch?.(dispatchUrl, "refused");
-                    logHostEvent("error", "[native-client]", `bili-native: unattributed oversized model request refused locally with a 422 (${silentBytes.toLocaleString("en-US")} B > ${MAX_SILENT_DIRECT_BODY_BYTES.toLocaleString("en-US")} B); would be sent uncompressed (#5405/#5408)`);
+                    logHostEvent("error", "[native-client]", `bili-native: unattributed oversized model request refused locally with a 422 (${silentBytes.toLocaleString("en-US")} B > ${cap.toLocaleString("en-US")} B); would be sent uncompressed (#5405/#5408)`);
                     return unattributedByteOversizeRefusal(dispatchUrl);
                 }
             }
