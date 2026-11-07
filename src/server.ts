@@ -4677,7 +4677,7 @@ function logMsg(opts: ProxyOptions, level: string, msg: string): void {
     loggerLog(level, msg);
 }
 
-export { getUnrecognizedPathStats, logDumpFailure, logUnrecognizedPath } from "./server/observability.js";
+export { getUnrecognizedPathStats, logDumpFailure, logUnrecognizedPath, _resetUnrecognizedPathStatsForTest } from "./server/observability.js";
 export { BILI_HOP_HEADER, parseLauncherModelWindows, anthropicBetaContextWindow, capRegistryWindowByStandard, expandedContextSuffixWindow } from "./server/context-window.js";
 export { BILI_TOOL_NAMES, isSideRequest, outputBudgetField, restoreOutputBudget, sideRequestGuard, stripLeakedBiliTools, _resetNoOutputCeilingWarningsForTest, _resetDshMidBandWarningsForTest, OUTPUT_RESTORE_ABSOLUTE_FLOOR, type OutputBudgetField } from "./server/side-request.js";
 export { countSystemAndToolsTokens, estimateInputTokens, estimateWireOverhead, clampOutputBudget, emergencyNudge, projectThinkingMass, type ThinkingMassInput } from "./server/budget.js";
