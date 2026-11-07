@@ -414,6 +414,17 @@ practical convergence path is to **start a new session** when it gets heavy.
 The web session list badges sessions at 5,000+ requests (长会话/slow) as a
 reminder that this point has been reached.
 
+**Frequent nudges don't mean the context is running out.** Nudges fire on the
+growth of compressible content (`compress.nudgeGrowthTokens`, default one step
+per 50,000 tokens), independent of window occupancy — repeated appearances in
+a long session are normal rhythm, not a water-level alarm. The only real danger
+signals are usage reaching the forced-compaction line at `maxContextLimit`
+(default 75%, applied to the effective window after the output reservation is
+subtracted) and preflight firing when the input alone exceeds the window. To
+check actual headroom, read the `Nudge:` line on the `/acp` panel:
+`max compressible X < threshold 50000` means the compressible mass has not
+accumulated a full growth step yet — compressible anytime, not needed now.
+
 **Why does the first compaction wait until ~200k?** Compaction does not
 trigger on absolute window position but on growth intervals: by default the
 first soft compaction fires 50k tokens past the boot content
