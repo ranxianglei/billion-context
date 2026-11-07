@@ -230,6 +230,128 @@ function fp(m: CoreMessage): string {
   return `${m.role}/${m.contentType}${name}${id}|${t}`;
 }
 
+// #4401/#5866: the kernel rewrites kept compress-call args on the outbound wire
+// (kernel/src/hide-consumed.ts): every entry summary longer than 200 chars
+// becomes its exact 199-char prefix + U+2026 stub, and entries whose quoted
+// range no longer resolves live are dropped (relative order preserved). The
+// inbound pair carries the model's verbatim full args, so the two halves of one
+// fold legitimately differ byte-for-byte — the judge must read that sanctioned
+// rewrite as identity, not mid-history-rewrite. Mirrored here (not imported) so
+// the judge stays a leaf; keep LOCKSTEP with SUMMARY_STUB_CHARS / clampPrefix /
+// parseCallText / rangeKey in kernel/src/hide-consumed.ts + truncate.ts.
+const COMPRESS_STUB_CHARS = 200;
+
+function compressStubOf(summary: string): string {
+  let cut = Math.min(COMPRESS_STUB_CHARS - 1, summary.length);
+  if (cut > 0 && (summary.charCodeAt(cut - 1) & 0xfc00) === 0xd800) cut -= 1;
+  return `${summary.slice(0, cut)}\u2026`;
+}
+
+function compressEntryRefs(e: Record<string, unknown>): [string, string] {
+  const s = typeof e.startId === "string" ? e.startId : typeof e.messageId === "string" ? e.messageId : "";
+  const end = typeof e.endId === "string" ? e.endId : typeof e.messageId === "string" ? e.messageId : "";
+  return [s, end];
+}
+
+function deepJsonEqual(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (typeof a !== "object" || typeof b !== "object" || a === null || b === null) return false;
+  if (Array.isArray(a) !== Array.isArray(b)) return false;
+  if (Array.isArray(a) && Array.isArray(b)) {
+    if (a.length !== b.length) return false;
+    return a.every((v, i) => deepJsonEqual(v, b[i]));
+  }
+  const ka = Object.keys(a as Record<string, unknown>);
+  const kb = Object.keys(b as Record<string, unknown>);
+  if (ka.length !== kb.length) return false;
+  return ka.every(
+    (k) => k in (b as Record<string, unknown>) && deepJsonEqual((a as Record<string, unknown>)[k], (b as Record<string, unknown>)[k]),
+  );
+}
+
+interface ParsedCompressArgs {
+  prefix: string;
+  obj: Record<string, unknown>;
+  content: unknown[];
+}
+
+// Mirror of kernel parseCallText (#230 stringified-content shape included).
+// Unparseable args fail safe: the caller falls back to plain byte compare.
+function parseCompressArgs(text: string | undefined): ParsedCompressArgs | null {
+  const raw = text ?? "";
+  const start = raw.indexOf("{");
+  if (start < 0) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw.slice(start));
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object") return null;
+  const obj = parsed as Record<string, unknown>;
+  let content: unknown[] | null = null;
+  if (Array.isArray(obj.content)) {
+    content = obj.content;
+  } else if (typeof obj.content === "string") {
+    try {
+      const inner: unknown = JSON.parse(obj.content);
+      if (Array.isArray(inner)) content = inner;
+    } catch {
+      content = null;
+    }
+  }
+  if (!content || content.length === 0) return null;
+  return { prefix: raw.slice(0, start), obj, content };
+}
+
+function compressEntrySanctioned(ea: Record<string, unknown>, eb: Record<string, unknown>): boolean {
+  const [sa, se] = compressEntryRefs(ea);
+  const [ta, te] = compressEntryRefs(eb);
+  if (!sa || !se || sa !== ta || se !== te) return false;
+  if (ea.summary !== eb.summary) {
+    if (typeof ea.summary !== "string" || ea.summary.length <= COMPRESS_STUB_CHARS) return false;
+    if (eb.summary !== compressStubOf(ea.summary)) return false;
+  }
+  const restA = { ...ea };
+  delete restA.summary;
+  const restB = { ...eb };
+  delete restB.summary;
+  return deepJsonEqual(restA, restB);
+}
+
+// Directional structural proof that b is the sanctioned outbound rewrite of a:
+// same raw prefix, same non-content fields, and b's content list is an
+// order-preserving subsequence of a's where each surviving entry matches its
+// original by exact range key and verbatim-or-exact-stub summary. A fabricated
+// or merely similar rewrite fails one of those gates and stays flagged.
+function isSanctionedCompressTwin(a: CoreMessage, b: CoreMessage): boolean {
+  const pa = parseCompressArgs(a.text);
+  const pb = parseCompressArgs(b.text);
+  if (!pa || !pb) return false;
+  if (pa.prefix !== pb.prefix) return false;
+  const objA = { ...pa.obj };
+  delete objA.content;
+  const objB = { ...pb.obj };
+  delete objB.content;
+  if (!deepJsonEqual(objA, objB)) return false;
+  let i = 0;
+  for (const ebRaw of pb.content) {
+    if (!ebRaw || typeof ebRaw !== "object") return false;
+    const eb = ebRaw as Record<string, unknown>;
+    let found = -1;
+    for (; i < pa.content.length; i++) {
+      const eaRaw = pa.content[i];
+      if (eaRaw && typeof eaRaw === "object" && compressEntrySanctioned(eaRaw as Record<string, unknown>, eb)) {
+        found = i;
+        break;
+      }
+    }
+    if (found < 0) return false;
+    i = found + 1;
+  }
+  return true;
+}
+
 // Identity is content-primary: tool-call ids are re-minted on re-projection
 // (#2821) while bytes stay identical, so a differing toolCallId never vetoes a
 // content-equal pair (order-centric, KDD#11). toolName stays a hard gate.
@@ -239,6 +361,7 @@ function stableEqual(a: CoreMessage, b: CoreMessage): boolean {
   if (isCrushedToolResult(b)) return true;
   if (a.contentType === "tool-result" && isCcrStoredResult(b)) return true; // #4186 G2
   if (isTruncatedTwin(a, b)) return true; // #4186 G3
+  if (a.contentType === "tool-call" && isCompressToolName(a.toolName) && isCompressToolName(b.toolName) && isSanctionedCompressTwin(a, b)) return true; // #4401/#5866
   return normText(a) === normText(b);
 }
 

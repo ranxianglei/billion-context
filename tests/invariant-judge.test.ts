@@ -696,3 +696,96 @@ test("#4401 follow-up: refused dialect receipt folds nothing (regime NOT marked)
   assert.equal(v.folded, false);
   assert.ok(v.violations.some((x) => x.kind === "mid-history-drop"));
 });
+
+// --- #4401/#5866 premise fix: the stubbed call half --------------------------
+// While the pair rides, hideConsumedCompressCalls rewrites the OUTBOUND call
+// half: every content entry whose summary exceeds 200 chars becomes the exact
+// leading stub (kernel/src/hide-consumed.ts compactEntry: clampPrefix(summary,
+// 199) + U+2026), and on id-matched lanes entries whose range is no longer live
+// are dropped (rewriteCompressText). The inbound twin still carries the full
+// text, so plain byte equality never holds for long summaries — without a
+// sanctioned-twin proof the stub reads as a mid-history rewrite and #4401's
+// storm persists for exactly that population. All fixtures here use >200-char
+// summaries on purpose (the earlier ones sit at 15–197 chars, below the stub
+// threshold, which is why the asymmetry was never exercised).
+
+const LONG_SUMMARY = "folded old stuff ".repeat(13); // 221 chars > SUMMARY_STUB_CHARS
+const LONG_SUMMARY_B = "collapsed older span ".repeat(12); // 252 chars
+const STUB_ELLIPSIS = "\u2026";
+function stubOf(s: string): string { return `${s.slice(0, 199)}${STUB_ELLIPSIS}`; }
+
+test("#4401/#5866 POS: >200-char summary — outbound call half is the kernel's exact stub while inbound carries the full text -> green", () => {
+  const head = mk("user", "text", "preamble");
+  const c1 = mk("assistant", "text", "old-1");
+  const c2 = mk("user", "text", "old-2");
+  const tail = mk("user", "text", "new question");
+  const callId = "call_stub1";
+  const fullArgs = JSON.stringify({ content: [{ startId: "m00002", endId: "m00003", summary: LONG_SUMMARY }] });
+  const stubArgs = JSON.stringify({ content: [{ startId: "m00002", endId: "m00003", summary: stubOf(LONG_SUMMARY) }] });
+  assert.notEqual(stubArgs, fullArgs); // sanity: the asymmetry really exists
+  const pairIn = [mk("assistant", "tool-call", fullArgs, { toolName: "compress", toolCallId: callId }), mk("tool", "tool-result", COMPRESS_RECEIPT, { toolName: "compress", toolCallId: callId })];
+  const pairOut = [mk("assistant", "tool-call", stubArgs, { toolName: "compress", toolCallId: callId }), mk("tool", "tool-result", COMPRESS_RECEIPT, { toolName: "compress", toolCallId: callId })];
+  const v = judgeInboundOutbound([head, c1, c2, ...pairIn, tail], [head, ...pairOut, tail], { coveredIds: new Set([c1.id, c2.id]) });
+  assert.equal(v.ok, true, JSON.stringify(v.violations));
+  assert.equal(v.folded, true);
+  assert.equal(v.covered, 2);
+});
+
+test("#4401/#5866 POS: multi-range call with a dead range — outbound drops the dead entry and stubs the live one -> green", () => {
+  const head = mk("user", "text", "preamble");
+  const cells = [mk("assistant", "text", "old-1"), mk("user", "text", "old-2"), mk("assistant", "text", "old-3"), mk("user", "text", "old-4")];
+  const tail = mk("user", "text", "new question");
+  const callId = "call_stub2";
+  const fullArgs = JSON.stringify({ content: [
+    { startId: "m00002", endId: "m00003", summary: LONG_SUMMARY },
+    { startId: "m00005", endId: "m00006", summary: LONG_SUMMARY_B },
+  ] });
+  const stubArgs = JSON.stringify({ content: [{ startId: "m00002", endId: "m00003", summary: stubOf(LONG_SUMMARY) }] });
+  const pairIn = [mk("assistant", "tool-call", fullArgs, { toolName: "compress", toolCallId: callId }), mk("tool", "tool-result", COMPRESS_RECEIPT, { toolName: "compress", toolCallId: callId })];
+  const pairOut = [mk("assistant", "tool-call", stubArgs, { toolName: "compress", toolCallId: callId }), mk("tool", "tool-result", COMPRESS_RECEIPT, { toolName: "compress", toolCallId: callId })];
+  const v = judgeInboundOutbound([head, ...cells, ...pairIn, tail], [head, ...pairOut, tail], { coveredIds: new Set(cells.map((c) => c.id)) });
+  assert.equal(v.ok, true, JSON.stringify(v.violations));
+});
+
+test("#4401/#5866 NEG: same-length clip that is NOT the kernel's exact stub form stays red", () => {
+  const head = mk("user", "text", "preamble");
+  const c1 = mk("assistant", "text", "old-1");
+  const c2 = mk("user", "text", "old-2");
+  const tail = mk("user", "text", "new question");
+  const callId = "call_stub3";
+  const fakeStub = `${LONG_SUMMARY.slice(0, 196)}...`; // ASCII dots, not the kernel's U+2026 form
+  const pairIn = [mk("assistant", "tool-call", JSON.stringify({ content: [{ startId: "m00002", endId: "m00003", summary: LONG_SUMMARY }] }), { toolName: "compress", toolCallId: callId }), mk("tool", "tool-result", COMPRESS_RECEIPT, { toolName: "compress", toolCallId: callId })];
+  const pairOut = [mk("assistant", "tool-call", JSON.stringify({ content: [{ startId: "m00002", endId: "m00003", summary: fakeStub }] }), { toolName: "compress", toolCallId: callId }), mk("tool", "tool-result", COMPRESS_RECEIPT, { toolName: "compress", toolCallId: callId })];
+  const v = judgeInboundOutbound([head, c1, c2, ...pairIn, tail], [head, ...pairOut, tail], { coveredIds: new Set([c1.id, c2.id]) });
+  assert.equal(v.ok, false);
+  assert.ok(v.violations.some((x) => x.kind === "mid-history-rewrite"), JSON.stringify(v.violations));
+});
+
+test("#4401/#5866 NEG: rewritten long summary (different text, similar length class) stays red", () => {
+  const head = mk("user", "text", "preamble");
+  const c1 = mk("assistant", "text", "old-1");
+  const c2 = mk("user", "text", "old-2");
+  const tail = mk("user", "text", "new question");
+  const callId = "call_stub4";
+  const pairIn = [mk("assistant", "tool-call", JSON.stringify({ content: [{ startId: "m00002", endId: "m00003", summary: LONG_SUMMARY }] }), { toolName: "compress", toolCallId: callId }), mk("tool", "tool-result", COMPRESS_RECEIPT, { toolName: "compress", toolCallId: callId })];
+  const pairOut = [mk("assistant", "tool-call", JSON.stringify({ content: [{ startId: "m00002", endId: "m00003", summary: "REWRITTEN ".repeat(28) }] }), { toolName: "compress", toolCallId: callId }), mk("tool", "tool-result", COMPRESS_RECEIPT, { toolName: "compress", toolCallId: callId })];
+  const v = judgeInboundOutbound([head, c1, c2, ...pairIn, tail], [head, ...pairOut, tail], { coveredIds: new Set([c1.id, c2.id]) });
+  assert.equal(v.ok, false);
+  assert.ok(v.violations.some((x) => x.kind === "mid-history-rewrite"), JSON.stringify(v.violations));
+});
+
+test("#4401/#5866 NEG: exit call quoting a range the inbound call never had stays red", () => {
+  const head = mk("user", "text", "preamble");
+  const c1 = mk("assistant", "text", "old-1");
+  const c2 = mk("user", "text", "old-2");
+  const tail = mk("user", "text", "new question");
+  const callId = "call_stub5";
+  const pairIn = [mk("assistant", "tool-call", JSON.stringify({ content: [{ startId: "m00002", endId: "m00003", summary: LONG_SUMMARY }] }), { toolName: "compress", toolCallId: callId }), mk("tool", "tool-result", COMPRESS_RECEIPT, { toolName: "compress", toolCallId: callId })];
+  const pairOut = [mk("assistant", "tool-call", JSON.stringify({ content: [
+    { startId: "m00002", endId: "m00003", summary: stubOf(LONG_SUMMARY) },
+    { startId: "m00099", endId: "m00100", summary: "planted range" },
+  ] }), { toolName: "compress", toolCallId: callId }), mk("tool", "tool-result", COMPRESS_RECEIPT, { toolName: "compress", toolCallId: callId })];
+  const v = judgeInboundOutbound([head, c1, c2, ...pairIn, tail], [head, ...pairOut, tail], { coveredIds: new Set([c1.id, c2.id]) });
+  assert.equal(v.ok, false);
+  assert.ok(v.violations.some((x) => x.kind === "mid-history-rewrite"), JSON.stringify(v.violations));
+});
