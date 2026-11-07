@@ -315,6 +315,14 @@ test("a partial failure (some profiles refreshed, one broken) still records a la
         const target = m?.[1] ?? "?";
         calls.push(`${target}:${joined}`);
         if (target === broken) throw Object.assign(new Error("exit 1"), { status: 1, stderr: "plugin channel down" });
+        // #5642: a clean exit leaves the requested copy readable — mirror that,
+        // otherwise the post-op verification counts every "success" as a broken
+        // op and strikes the lane on its own
+        if (m) {
+            const install = path.join(dshHome, "profiles", target, "node_modules", "billion-context");
+            mkdirSync(install, { recursive: true });
+            writeFileSync(path.join(install, "package.json"), JSON.stringify({ name: "billion-context", version: "2.0.0" }));
+        }
         return { stdout: "", stderr: "" };
     };
     try {
@@ -330,19 +338,21 @@ test("a partial failure (some profiles refreshed, one broken) still records a la
         assert.equal(calls.length, 2, `both profiles attempted once: ${calls.join(" | ")}`);
         assert.equal(_installBackoffStateForTest()[key]?.count, 1, "a partial failure (1 of 2 profiles) records a strike");
 
-        // strikes accumulate the same way as total failures; third strike arms
+        // strikes accumulate the same way as total failures; third strike arms.
+        // (a converged to 2.0.0 in pass #1 and is in-step-skipped since — #1803 —
+        // so passes #2/#3 spawn only for still-stale b.)
         await convergeDshProfileBundles("/nonexistent", "2.0.0", env, log);
         await convergeDshProfileBundles("/nonexistent", "2.0.0", env, log);
         assert.equal(_installBackoffStateForTest()[key]?.count, 3, "third partial failure arms the cooldown");
-        // once armed the whole lane is gated — even healthy profile a stops spawning
+        // once armed the whole lane is gated — even the still-stale profile b stops spawning
         await convergeDshProfileBundles("/nonexistent", "2.0.0", env, log);
-        assert.equal(calls.length, 6, "an armed lane must not spawn for ANY profile, healthy ones included");
+        assert.equal(calls.length, 4, "an armed lane must not spawn for ANY profile, stale ones included");
 
         // manual disarm + repairing b lets the lane run again and a clean pass clears the key
         await clearOwnerLaneBackoff("dsh-profile", "2.0.0");
         _setDshRunnersForTest({ async: failingFor("none") });
         await convergeDshProfileBundles("/nonexistent", "2.0.0", env, log);
-        assert.equal(calls.length, 8, "a disarmed, repaired lane attempts both profiles again");
+        assert.equal(calls.length, 5, "a disarmed, repaired lane attempts the remaining stale profile (a is in-step)");
         assert.equal(_installBackoffStateForTest()[key], undefined, "a clean run clears the lane key");
     } finally {
         _setDshRunnersForTest(undefined);
@@ -526,6 +536,11 @@ test("streaks are shared across bili processes via the cache-dir state file; a m
     };
     const healthy = async (plan: DshPlan) => {
         calls.push(plan.args.join(" "));
+        // #5642: a clean exit leaves the requested copy readable — mirror that,
+        // otherwise the post-op verification counts the "healthy" run as a broken
+        // op and records a strike instead of clearing the key
+        mkdirSync(installDir, { recursive: true });
+        writeFileSync(path.join(installDir, "package.json"), JSON.stringify({ name: "billion-context", version: "2.0.0" }));
         return { stdout: "", stderr: "" };
     };
     try {

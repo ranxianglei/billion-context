@@ -262,6 +262,20 @@ export type CompressSettings = {
      *  level wins PER FIELD across global → provider → model, like every
      *  other compress field. */
     minPressureBenefitTokens?: number;
+    /** Phantom-pressure guard: when the decision meter for this round is a
+     *  LOCAL ESTIMATE rather than a billing sample (the host passed no usage
+     *  report — e.g. right after an aborted turn or a short cache TTL that
+     *  voided sample delivery), the pressure band (usage ≥ maxContextLimit /
+     *  emergency threshold) defers its nudge one round instead of firing
+     *  EMERGENCY/OVER-LIMIT rewrites off a char-bound reading that
+     *  structurally runs ~3x billed. The very next request carries a fresh
+     *  billing report, so deferring costs at most one round; the hard
+     *  overflow backstops stay armed either way. Billed readings keep
+     *  byte-identical behavior and non-pressure tiers are unaffected.
+     *  Default true; set false to restore estimate-driven pressure injection.
+     *  Maps to kernel `nudge.requireUsageSampleForPressure`. Deepest level
+     *  wins PER FIELD, like every other compress field. */
+    requireUsageSampleForPressure?: boolean;
     /** Per-tier nudge growth thresholds in tokens (#2376): independent token
       *  trigger sizes for the T1/T2/T3 mass paths, e.g. keep T1 aggressive for
       *  long tasks while letting T2 distill earlier/later. Each UNSET tier
@@ -286,6 +300,30 @@ export type CompressSettings = {
     /** #2228: output budget (tokens) of the decision side call. Default 200
      *  (same ceiling class as SIDE_REQUEST_MAX_TOKENS). Must be > 0. */
     nudgeDecisionMaxTokens?: number;
+    /** #5683: forbid UNPROMPTED model-initiated compression. When true at some
+     *  level, a compress call is refused unless a compression nudge actually
+     *  reached the model in the current turn (post-gate delivery fact: the
+     *  round's nudgeOutcome was "injected" — advisory, decide-directive and
+     *  emergency injections all arm it; loop rounds within the same turn keep
+     *  the arm, the next un-nudged turn disarms). Refusal sends the model an
+     *  error receipt instead of folding. bili's own overflow backstop folds
+     *  (preflight/auto-fold, no model call involved) are exempt — availability
+     *  is unaffected. Host-only (not passed to the kernel); off unless
+     *  explicitly enabled at some level. Deepest level wins PER FIELD across
+     *  global → provider → model, like every other compress field. */
+    requireNudge?: boolean;
+    /** #5683: forbid OUT-OF-BOUNDS model-initiated compression. When true at
+     *  some level, every submitted range must stay within what bili currently
+     *  recommends folding — the same live compressible set the nudge text and
+     *  acp_status show (this request's prepare-time offer when present, else a
+     *  live recompute; viable + dead-ref + minCompressRange filters). Judgment
+     *  is by COVERAGE, not equality: subdividing a recommended span into
+     *  smaller chunks passes, and messages already folded into active blocks
+     *  (refolds updating an existing summary) are exempt. A range carrying any
+     *  other live message is refused whole with an error receipt naming the
+     *  offending span(s). Host-only; off unless explicitly enabled at some
+     *  level. Deepest level wins PER FIELD across global → provider → model. */
+    requireRecommendation?: boolean;
     /** Trailing messages never offered for compression
      *  (kernel `preserveRecentMessages`). */
     preserveRecentMessages?: number;
@@ -1837,9 +1875,10 @@ export interface PiSubagentsFileConfig {
      *  `"pi": {"subagents": false}`) removes the three tools, the
      *  system-prompt section and the fleet shortcut (new session required). */
     enabled?: boolean;
-    /** Keep acp_delegate active even when a project-scope pi-subagents
-     *  install is detected (#415 stand-down). Default false. Env
-     *  PI_ACP_DELEGATE_FORCE_ENABLE=true/false wins over the file. */
+    /** Keep acp_delegate active even when a pi-subagents install at either
+     *  scope is detected (#415 stand-down, widened to user-scope in #5637).
+     *  Default false. Env PI_ACP_DELEGATE_FORCE_ENABLE=true/false wins over
+     *  the file. */
     forceEnable?: boolean;
     /** "separate" (default) — delegate tokens tracked in their own
      *  accumulator; "merged" — folded into the main session totals. */
@@ -2415,7 +2454,8 @@ const KNOWN_TOP_LEVEL_KEYS = new Set([
 // level down under "compress". Keep in sync with parseCompressSettings.
 const COMPRESS_SETTING_FIELDS = new Set([
     "modelContextLimit", "maxContextLimit", "emergencyThresholdPercent",
-    "nudgeGrowthTokens", "minPressureBenefitTokens", "tierNudgeTokens", "nudgeModelDecided", "nudgeDecisionMaxTokens",
+    "nudgeGrowthTokens", "minPressureBenefitTokens", "requireUsageSampleForPressure", "tierNudgeTokens", "nudgeModelDecided", "nudgeDecisionMaxTokens",
+    "requireNudge", "requireRecommendation",
     "preserveRecentMessages", "preserveRecentTokens",
     "minCompressRange", "minCompressRangeChars",
     "outputHeadroomMaxPct", "tiers", "protectedLatestTools", "protectedTools",
@@ -3186,12 +3226,23 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
         }
         out[key] = obj[key];
     }
+    // #5683: unprompted/out-of-bounds compression policy gates — plain booleans,
+    // off unless explicitly set (an explicit false at a deeper level disables).
+    for (const key of ["requireNudge", "requireRecommendation"] as const) {
+        if (!(key in obj)) continue;
+        if (typeof obj[key] !== "boolean") ok = false;
+        else out[key] = obj[key];
+    }
     // #3211: an explicit 0 is meaningful (legacy any-pending), so validate
     // >= 0 instead of takeNumber's plain finite check.
     if ("minPressureBenefitTokens" in obj) {
         const v = obj.minPressureBenefitTokens;
         if (typeof v !== "number" || !Number.isFinite(v) || v < 0) ok = false;
         else out.minPressureBenefitTokens = Math.floor(v);
+    }
+    if ("requireUsageSampleForPressure" in obj) {
+        if (typeof obj.requireUsageSampleForPressure !== "boolean") ok = false;
+        else out.requireUsageSampleForPressure = obj.requireUsageSampleForPressure;
     }
     for (const key of ["protectedLatestTools", "protectedTools"] as const) {
         if (!(key in obj) || obj[key] === undefined) continue;
