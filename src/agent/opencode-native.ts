@@ -888,7 +888,8 @@ export function createV1ServerHooks(getOrigin: () => string | undefined, ctx: V1
                     };
                 }
             } else {
-                console.error("[bili-opencode-native] v1: zod unavailable — plugin tools skipped; sessions run in proxy mode (wire-injected compress)");
+                // #5706: host-safe channel — raw console.* lands on the opencode TUI terminal.
+                logHostEvent("error", "[native-client]", "[bili-opencode-native] v1: zod unavailable — plugin tools skipped; sessions run in proxy mode (wire-injected compress)");
             }
             if (Object.keys(tools).length > 0) hooks.tool = tools;
         }
@@ -922,13 +923,13 @@ const server = async (ctx: V1PluginContext): Promise<V1Hooks> => {
     // observes network failures and drives state.respawn, so SDK-default
     // providers route again as soon as any proxy is alive.
     if (installNativeFetchIntercept(state)) {
-        console.log("[bili-opencode-native] v1: fetch patch installed (catches providers without an explicit baseURL)");
+        logHostEvent("info", "[native-client]", "[bili-opencode-native] v1: fetch patch installed (catches providers without an explicit baseURL)");
     }
     if (origin === undefined) {
-        console.error("[bili-opencode-native] v1: no live proxy at startup — traffic goes direct until runtime recovery lands one");
+        logHostEvent("error", "[native-client]", "[bili-opencode-native] v1: no live proxy at startup — traffic goes direct until runtime recovery lands one");
         return {};
     }
-    console.log(`[bili-opencode-native] v1 active (proxy ${origin})`);
+    logHostEvent("info", "[native-client]", `[bili-opencode-native] v1 active (proxy ${origin})`);
     let z: ZodLike | undefined;
     try {
         // Opaque specifier on purpose (#3511 P0 follow-up): zod is now bundled
@@ -950,7 +951,7 @@ const server = async (ctx: V1PluginContext): Promise<V1Hooks> => {
         // Pass the host's full ctx object through: V1PluginContext types only
         // what bili uses (client/directory), but the runtime object may carry
         // extra host fields acp's hooks need at action time.
-        legacy = await loadLegacyAcp(ctx, (msg) => console.log(msg));
+        legacy = await loadLegacyAcp(ctx, (msg) => logHostEvent("info", "[native-client]", msg));
     } catch {
         legacy = undefined;
     }
