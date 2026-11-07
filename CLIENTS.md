@@ -205,6 +205,25 @@ the tab degrades to a restart notice plus an open-Web-UI button instead of
 guessing. Plain React from dsh's own runtime — no iframe, no added
 dependencies.
 
+**Coexistence with dsh Developer Tools / experimental inspector (#5148):** the
+native plugin routes model traffic through a guarded `globalThis.fetch`
+accessor — the #1158 self-heal that re-chains any third-party fetch install as
+downstream so routing never silently leaves the proxy. dsh's
+`@deepseek-ai/dsh-experimental-inspector` (enabled by Developer Tools) refuses
+to observe an accessor and throws
+`inspector: globalThis.fetch is an accessor and cannot be observed safely`, so
+that one entry fails to activate while the rest of `dsh web` runs fine. The
+profile loads bili before the inspector, so this is a load-order + mechanism
+clash, not a bili fault — and switching the accessor off
+(`BILI_RECLAIM_FETCH_PATCH=0`) would reintroduce the #1158 silent un-routing, so
+it stays on by default. Workarounds, least impact first: ① set the inspector
+entry's `captureFetch: false` in your profile's `cordis.patch.yml` (rest of the
+inspector stays active); ② disable dsh Developer Tools; ③
+`BILI_RECLAIM_FETCH_PATCH=0` (loses the #1158 self-heal). The clean fix belongs
+on the inspector side — degrade only fetch-capture instead of throwing the whole
+entry. See also the `BILI_RECLAIM_FETCH_PATCH` coexistence note (#3528) in
+CONFIGURATION.md.
+
 ## Kimi Code (Moonshot)
 
 Three aligned modes: `bili kimi` (launcher, cert-MITM — README Quickstart

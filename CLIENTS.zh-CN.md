@@ -22,6 +22,8 @@
 
 **宿主侧上下文计量与模型实际视图按设计不一致(#2837):**plugin 模式下宿主本地持久会话日志有意保持无损 —— 完整未折叠历史会因前缀缓存与严格回显而重发(见 TECHNICAL-NOTES.md「两种压缩模式」)。因此宿主或其插件从该本地日志算出的任何计量,量的都是**未折叠的本地表面**,而不是下一次请求实际携带的量;压缩生效期间本地数字远高于真实输入属预期,不是压缩卡死。有效尺寸以代理为准:读 `/acp`(或 `GET /__bili/plugin/status` 的 `contextTokens`,来源见 `contextTokensSource`),不要本地重新推算。
 
+**与 dsh Developer Tools / 实验版 inspector 共存(#5148):** 原生插件经一个受守卫的 `globalThis.fetch` **访问器**(getter/setter)路由模型流量 —— 这是 #1158 的自愈机制:任何第三方对 fetch 的安装都会被重链为下游,使路由绝不静默离开代理。dsh 的 `@deepseek-ai/dsh-experimental-inspector`(由 Developer Tools 启用)拒绝观察访问器并抛错 `inspector: globalThis.fetch is an accessor and cannot be observed safely`,于是**这一条 entry 激活失败**,而 `dsh web` 其余部分照常运行。profile 先加载 bili、后加载 inspector,所以这是加载顺序 + 机制冲突,不是 bili 的错;而把访问器关掉(`BILI_RECLAIM_FETCH_PATCH=0`)会重新引入 #1158 的静默失路由(模型流量绕开代理但会话照常跑),因此默认保持开启。绕行方案,影响从小到大:① 在 profile 的 `cordis.patch.yml` 里给该 inspector entry 设 `captureFetch: false`(inspector 其余能力保留);② 关闭 dsh Developer Tools;③ `BILI_RECLAIM_FETCH_PATCH=0`(代价是失去 #1158 自愈)。干净的修法应在 inspector 一侧 —— 遇到访问器时只降级 fetch-capture,而不是整条 entry 抛错。另见 CONFIGURATION.md 中 `BILI_RECLAIM_FETCH_PATCH` 的共存提示(#3528)。
+
 ## Kimi Code(Moonshot)
 
 三种对齐模式:`bili kimi`(启动器,证书 MITM —— README 快速上手 方式 2)、`/bili/` URL 前缀,以及原生插件模式(`bili plugin install kimi`,#963)。Kimi Code v2 的插件体系是纯声明式的(`kimi.plugin.json`:MCP server、hooks、skills —— 没有进程内 JS 执行),所以 bili 无法像 pi/opencode/dsh 那样补丁客户端的 fetch 栈。取而代之,插件带两个小型 node 脚本,在客户端外围完成工作:
