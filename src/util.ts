@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import type { AnthropicRequestBody } from "acp-kernel/wire";
+import type { AnthropicRequestBody, ResponseInputItem } from "acp-kernel/wire";
 
 // #920: stamped per request by the opencode thin plugin for LEGACY
 // opencode-acp sessions (acp state on disk). The proxy (server.ts) forwards
@@ -660,6 +660,86 @@ export function hardenOpenaiAssistantContent<T extends { role: string }>(message
         if (c === null || c === undefined) return { ...m, content: "" } as T;
         return m;
     });
+}
+
+/** #5534: strict-JSON upstreams (e.g. infernix-serve) JSON-parse EVERY history
+ *  `tool_calls[*].function.arguments` and reject the whole request on the first
+ *  unparseable payload (500 parse_error.101). bili's own egress can produce such
+ *  payloads: the emergency-truncate / view latches replay clipped text keyed by
+ *  REF alone (kernel/src/compress.ts emergencyTruncateNode, kernel/src/view-latch.ts),
+ *  and a ref renumbered under a live entry (cold-load ledger restamp,
+ *  src/persist.ts maybeRestampToLedger) lands the clip onto whatever message now
+ *  holds the number — including an assistant tool-call core whose `text` IS the
+ *  arguments JSON. This guard is the last line of defense at egress: it replaces
+ *  an already-invalid arguments string with a valid placeholder so strict-JSON
+ *  upstreams accept the request and the session can heal forward. It fires ONLY
+ *  on non-empty strings that fail JSON.parse — valid payloads pass byte-exact
+ *  (#1039 discipline: never rewrite what may be user intent; this rewrites bytes
+ *  no executor could ever use). Precedents: src/loop/adapter-google.ts (google
+ *  wire), src/loop/core.ts MALFORMED_PROXY_TOOL_ARGS_REPLAY (model-side variant).
+ */
+export const NON_JSON_TOOL_ARGS_PLACEHOLDER = '{"_bili":"outbound tool-call arguments were not valid JSON (poisoned by an earlier bili egress fault); replaced with this valid placeholder so strict-JSON upstreams accept the request"}';
+
+function isValidJsonPayload(args: string): boolean {
+    try {
+        JSON.parse(args);
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+function previewBytes(s: string): string {
+    const p = s.slice(0, 64);
+    return p.length < s.length ? `${p}…` : p;
+}
+
+/** OpenAI chat wire: repair non-JSON `tool_calls[*].function.arguments`.
+ *  No-op (returns the same array) when every payload is already valid. */
+export function hardenOpenaiToolCallArguments<T extends { role: string }>(
+    messages: T[],
+    log: (level: string, msg: string) => void,
+    sessionId: string,
+): T[] {
+    let repaired = 0;
+    const out = messages.map((m) => {
+        if (m.role !== "assistant") return m;
+        const tcs = (m as { tool_calls?: unknown }).tool_calls;
+        if (!Array.isArray(tcs)) return m;
+        let touched = false;
+        const nextTcs = tcs.map((tc) => {
+            const fn = (tc as { function?: { name?: unknown; arguments?: unknown } }).function;
+            const args = fn ? fn.arguments : undefined;
+            if (typeof args !== "string" || args.length === 0 || isValidJsonPayload(args)) return tc;
+            touched = true;
+            repaired += 1;
+            log("warn", `[${sessionId}] [wire-guard] outbound tool-call arguments failed JSON validation (tool=${String(fn?.name ?? "?")}, first bytes: ${JSON.stringify(previewBytes(args))}) — replacing with placeholder (#5534)`);
+            return { ...tc, function: { ...fn, arguments: NON_JSON_TOOL_ARGS_PLACEHOLDER } };
+        });
+        if (!touched) return m;
+        return { ...m, tool_calls: nextTcs } as T;
+    });
+    return repaired > 0 ? out : messages;
+}
+
+/** Responses wire: repair non-JSON `function_call` items' `arguments`.
+ *  `custom_tool_call.input` is free-form (not JSON by contract) and untouched.
+ *  No-op (returns the same array) when every payload is already valid. */
+export function hardenResponsesFunctionCallArguments(
+    items: ResponseInputItem[],
+    log: (level: string, msg: string) => void,
+    sessionId: string,
+): ResponseInputItem[] {
+    let repaired = 0;
+    const out = items.map((item) => {
+        if (item.type !== "function_call") return item;
+        const args = item.arguments;
+        if (typeof args !== "string" || args.length === 0 || isValidJsonPayload(args)) return item;
+        repaired += 1;
+        log("warn", `[${sessionId}] [wire-guard] outbound Responses function_call arguments failed JSON validation (name=${String(item.name)}, first bytes: ${JSON.stringify(previewBytes(args))}) — replacing with placeholder (#5534)`);
+        return { ...item, arguments: NON_JSON_TOOL_ARGS_PLACEHOLDER };
+    });
+    return repaired > 0 ? out : items;
 }
 
 // #1876: rebuild the outbound Anthropic `system` by APPENDING bili's added
