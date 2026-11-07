@@ -31,21 +31,101 @@ test("syncBlocks deactivates blocks whose messages are all gone", () => {
   const state = createInitialState();
   state.blocks.push(
     makeBlock({ blockId: "b1", effectiveMessageIds: ["gone1", "gone2"] }),
-    makeBlock({ blockId: "b2", effectiveMessageIds: ["kept", "also-gone"] }),
   );
 
   const result = syncBlocks([msg("kept")], state);
   assert.deepEqual(result.deactivated, ["b1"]);
   assert.equal(result.state.blocks[0]!.active, false);
-  assert.equal(result.state.blocks[1]!.active, true);
 });
 
-test("syncBlocks leaves blocks intact when at least one message remains", () => {
+// #4592: upstream kept a block alive as long as SOME covered message remained.
+// That is exactly the shape a host rewind leaves behind — the survivors are a
+// prefix and the newest end is gone, so the summary describes history that no
+// longer exists. Coverage SHAPE decides, not existence: see the head-gap and
+// holes tests below for the shapes that must KEEP their summary.
+test("syncBlocks deactivates a block whose span was partially truncated (rewind)", () => {
+  const state = createInitialState();
+  state.blocks.push(
+    makeBlock({ blockId: "b1", effectiveMessageIds: ["kept", "also-gone"] }),
+  );
+  const result = syncBlocks([msg("kept")], state);
+  assert.deepEqual(result.deactivated, ["b1"]);
+  assert.equal(result.state.blocks[0]!.active, false);
+});
+
+// #4592: the mirror shape of a rewind. The host dropped OLD history from the
+// head; the summary is the only record of it, so dropping the summary too is the
+// actual loss. This is what makes sliding-window / head-truncating hosts safe.
+test("syncBlocks keeps a block whose oldest coverage the host dropped (head gap)", () => {
+  const state = createInitialState();
+  state.blocks.push(
+    makeBlock({ blockId: "b1", effectiveMessageIds: ["old-1", "old-2", "kept"] }),
+  );
+  const result = syncBlocks([msg("kept"), msg("fresh")], state);
+  assert.deepEqual(result.deactivated, []);
+  assert.equal(result.state.blocks[0]!.active, true);
+});
+
+// #4592: interior gaps are the id-churn shape (client re-serialized its
+// history), never the rewind shape. Do not guess: keep the summary and let
+// fold-reconcile re-key the churned ids.
+test("syncBlocks keeps a block with interior id gaps (churn shape)", () => {
+  const state = createInitialState();
+  state.blocks.push(
+    makeBlock({ blockId: "b1", effectiveMessageIds: ["a", "churned", "c"] }),
+  );
+  const result = syncBlocks([msg("a"), msg("c")], state);
+  assert.deepEqual(result.deactivated, []);
+  assert.equal(result.state.blocks[0]!.active, true);
+});
+
+// #4592: nothing id-shaped survives, but a visible message carries a ledger
+// position INSIDE the block's interval — the churn / merged-pair shape (a merge
+// legitimately covers fewer ids than positions). The positional witness is
+// upstream's #4316 rule, unchanged by the shape decision.
+test("syncBlocks keeps a fully-gone block with a position inside its interval (churn witness)", () => {
+  const state = createInitialState();
+  state.blocks.push(
+    makeBlock({
+      blockId: "b1",
+      effectiveMessageIds: ["gone-1", "gone-2"],
+      startSeq: 1,
+      endSeq: 2,
+    }),
+  );
+  const visible: CoreMessage[] = [
+    { id: "re-minted", role: "user", contentType: "text", text: "merged", ledgerSeq: 2 },
+  ];
+  const result = syncBlocks(visible, state);
+  assert.deepEqual(result.deactivated, []);
+  assert.equal(result.state.blocks[0]!.active, true);
+});
+
+// #4592: no id and no position survives -> dead (the plain deletion shape).
+test("syncBlocks deactivates a fully-gone block with no positional witness", () => {
+  const state = createInitialState();
+  state.blocks.push(
+    makeBlock({
+      blockId: "b1",
+      effectiveMessageIds: ["gone-1"],
+      startSeq: 1,
+      endSeq: 1,
+    }),
+  );
+  const visible: CoreMessage[] = [
+    { id: "newer", role: "user", contentType: "text", text: "newer", ledgerSeq: 9 },
+  ];
+  const result = syncBlocks(visible, state);
+  assert.deepEqual(result.deactivated, ["b1"]);
+  assert.equal(result.state.blocks[0]!.active, false);
+});
+
+test("syncBlocks leaves blocks intact when every covered message remains", () => {
   const state = createInitialState();
   state.blocks.push(
     makeBlock({ blockId: "b1", effectiveMessageIds: ["a", "b"] }),
   );
-  const result = syncBlocks([msg("a")], state);
+  const result = syncBlocks([msg("a"), msg("b")], state);
   assert.deepEqual(result.deactivated, []);
   assert.equal(result.state.blocks[0]!.active, true);
 });
