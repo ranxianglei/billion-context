@@ -7,6 +7,7 @@ import type { ProxyOptions } from "../config.js";
 import { effectivePromptCacheRouting } from "../config.js";
 import { currentCalibrationFactor, hardenOpenaiAssistantContent, systemToUser } from "../util.js";
 import { conversationHeaderSource, resolveRelayAffinityPck } from "../session-id.js";
+import { MSG_IDS_BODY_FIELD, applyMsgIdPin, validateMsgIds } from "../msgid-pin.js";
 import { pluginAgentHeader } from "../plugin.js";
 import { applyReasoningDrop, diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, planReasoningDrop, makeFoldPointReasoningDroppable, reapOrphansLogged, resolveKnownOutputCeiling, runNudgeDecision, stripKernelSummaries, warnDroppedOpenaiParts, warnReasoningPairs, type Prepared } from "../server.js";
 import { yieldToEventLoop } from "../yield-loop.js";
@@ -68,6 +69,13 @@ export async function prepareOpenai(
 ): Promise<Prepared> {
     const sessionId = session.id;
     const stream = parsed.stream === true;
+    // #5825/#4491 parity: bili-namespaced msgid channel on the openai wire.
+    // Stripped UNCONDITIONALLY — same discipline as the anthropic twin:
+    // the real upstream must never see a field it does not know. Sources:
+    // host body stamps (pi incremental lane) or the #5825 handle-seam
+    // re-stamp of stamped-header/harvested ids.
+    const incomingMsgIds = (parsed as Record<string, unknown>)[MSG_IDS_BODY_FIELD];
+    delete (parsed as Record<string, unknown>)[MSG_IDS_BODY_FIELD];
     // Real wire element count; a watermark hit overrides it with the measured
     // total T (see the #5403/#5418 block below).
     let inboundMessageCount = Array.isArray(parsed.messages) ? parsed.messages.length : 1;
@@ -205,7 +213,8 @@ export async function prepareOpenai(
         // must not feed ids/fingerprints. Capture it and re-inject below —
         // otherwise the proxy would forward payloads without any system.
         const converted = wpHit !== undefined ? { msgs: wpHit.view, systemText: wpHit.systemText } : openaiToCore(parsed);
-        const { msgs, systemText } = converted;
+        let msgs = converted.msgs;
+        let systemText = converted.systemText;
         openaiSystemText = systemText;
         wpSeedSystemText = systemText;
         wpTurnStrip = markerCounts;
@@ -218,6 +227,27 @@ export async function prepareOpenai(
             openaiSystemText = outcome.outbound;
         }
         originalMessages = msgs;
+        // #4491/#5825 parity: pin identity to client-supplied ids (plugin
+        // lanes only — pure proxy traffic has no msgid channel and stays on
+        // snapshot render D), the SAME gated contract as the anthropic twin.
+        // Skipped on watermark hits on purpose: fastpath turns reuse the
+        // seed stash's prefix view whose rows were already pinned when it was
+        // materialized, and the decoded tail window is SHORTER than the
+        // stamped list, so count-parity there would fail by design — pinning
+        // only adds noise.
+        if (wpHit === undefined && pluginMode && incomingMsgIds !== undefined) {
+            if (featureEnabled("pluginLaneServerHistory")) {
+                const v = validateMsgIds(incomingMsgIds, msgs.length);
+                if (v.ok) {
+                    msgs = applyMsgIdPin(msgs, v.ids);
+                    originalMessages = msgs;
+                } else {
+                    log("warn", `[${sessionId}] [msgid] openai-wire pin rejected (${v.reason}) — falling back to content-derived ids (#4491/#5825)`);
+                }
+            } else {
+                log("info", `[${sessionId}] [msgid] openai-wire biliMsgIds present but pluginLaneServerHistory rollout is off for this install — field stripped, ids not pinned (#5825)`);
+            }
+        }
         // #3756 snapshot render: the outbound prefix renders from the unified
         // transcript (server-authoritative, fold-time ids — immune to identity
         // re-mints #3752); only the live tail keeps the client's bytes.
@@ -420,7 +450,7 @@ export async function prepareOpenai(
                         for (const c of arr) frozenCores.push(Object.assign(c, { wireIndex: p }));
                     }
                     const scratch = structuredClone(session.state);
-                    const t = core.processTurn({ messages: [...frozenCores, ...wpHit.windowCores], state: scratch, config: loopConfig, tokenCount, renderTags: renderStrategy, contentStore: contentStoreOf(session) });
+                    const t = core.processTurn({ messages: [...frozenCores, ...wpHit.windowCores], state: scratch, config: loopConfig, tokenCount, tokenCountSource, renderTags: renderStrategy, contentStore: contentStoreOf(session) });
                     const liveRefs = session.state.messageRefs as unknown as { byRaw: Record<string, string>; byRef: Record<string, string> };
                     const srcRefs = scratch.messageRefs as unknown as { byRaw: Record<string, string>; byRef: Record<string, string> };
                     for (const [k, v] of Object.entries(srcRefs.byRaw)) if (!(k in liveRefs.byRaw)) liveRefs.byRaw[k] = v;
@@ -437,7 +467,7 @@ export async function prepareOpenai(
                     renderFast = null;
                 }
             }
-            return core.processTurn({ messages: renderMsgs, state: session.state, config: loopConfig, tokenCount, renderTags: renderStrategy, contentStore: contentStoreOf(session) });
+            return core.processTurn({ messages: renderMsgs, state: session.state, config: loopConfig, tokenCount, tokenCountSource, renderTags: renderStrategy, contentStore: contentStoreOf(session) });
         })();
         if (renderFast === null) {
             session.state = turn.state;

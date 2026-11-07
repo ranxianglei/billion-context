@@ -49,6 +49,14 @@ entries:
     group: behavior
     desc_en: "Nested rollout: evaluate this feature only inside the named feature's enabled cohort, so the percent is relative to that population (roll B out to A's users; chains allowed, cycles fail closed)."
     desc_zh: "嵌套灰度:仅在所指特性的已入组人群内评估本特性,percent 相对该人群(B 只放量给 A 的用户;允许链式,环路判为关)。"
+  - key: rollout.features.identityChannelHarvest
+    type: "boolean | number"
+    default: "0 (off)"
+    default_zh: "0(关)"
+    env: BILI_ROLLOUT_IDENTITY_CHANNEL_HARVEST
+    group: behavior
+    desc_en: "Identity-channel harvest cohort gate (#5825): allows the loopback-only transcript/sqlite harvest (src/identity-harvest.ts: claude-code / codebuddy / mcode / goose / qwen lanes) without any per-install env switch, when neither the per-install switch (BILI_IDENTITY_HARVEST) nor this key is set nothing ever reads client storage. Owner ruling 2026-11-07: this cohort key is deliberately separate from rollout.features.pluginLaneServerHistory (which governs row PINNING of admitted ids) — either enabler may activate harvesting. Default 0%; raise after small-cohort observation of the degrade warn-once rate. See docs/identity-channels.md."
+    desc_zh: "身份信道采集的灰度门(#5825):当安装级开关(BILI_IDENTITY_HARVEST)未设置时,允许仅由本灰度键激活回环专属的转录/SQLite 采集(claude-code / codebuddy / mcode / goose / qwen 车道);两者都不设则永不读客户端存储。owner 裁定 2026-11-07:本灰度键与 rollout.features.pluginLaneServerHistory(它管已接纳 id 的行钉住)刻意分离——任一使能方可激活采集。默认 0%,小流量观察退化率后再抬。见 identity-channels.zh-CN.md。"
   - key: rollout.features.pluginLaneServerHistory
     type: "boolean | number"
     default: "0 (off)"
