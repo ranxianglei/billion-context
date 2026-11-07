@@ -74,6 +74,7 @@ export function mergeCompress(
         emergencyThresholdPercent: pick("emergencyThresholdPercent"),
         nudgeGrowthTokens: pick("nudgeGrowthTokens"),
         minPressureBenefitTokens: pick("minPressureBenefitTokens"),
+        requireUsageSampleForPressure: pick("requireUsageSampleForPressure"),
         tierNudgeTokens: tierNudgeLevels.length > 0 ? Object.assign({}, ...tierNudgeLevels) : undefined,
         nudgeModelDecided: pick("nudgeModelDecided"),
         nudgeDecisionMaxTokens: pick("nudgeDecisionMaxTokens"),
@@ -336,6 +337,10 @@ export function applyCompressSettings(base: Config, limit: number, s: CompressSe
     // #3211: explicit 0 is meaningful (legacy any-pending pressure behavior),
     // so pass it through instead of skipping like the growth-token knobs.
     if (s.minPressureBenefitTokens !== undefined) nudge.minPressureBenefitTokens = s.minPressureBenefitTokens;
+    // Phantom-pressure guard: an explicit false is meaningful (legacy
+    // estimate-driven pressure injection), so pass it through instead of
+    // skipping like absent knobs.
+    if (s.requireUsageSampleForPressure !== undefined) nudge.requireUsageSampleForPressure = s.requireUsageSampleForPressure;
     if (s.tierNudgeTokens !== undefined) {
         const tg: NonNullable<Config["nudge"]["tierGrowthTokens"]> = {};
         if (typeof s.tierNudgeTokens.t1 === "number") tg.t1 = s.tierNudgeTokens.t1;
