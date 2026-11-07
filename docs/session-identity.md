@@ -268,6 +268,16 @@ upgrade that changes both the system prompt and the message-record layout
 `<id>|sub:<fp>` with empty compression state. That fork is by design:
 mis-attribution is the most expensive failure in this system (MESSAGE-IDENTITY).
 
+The "content-verified" tail compares the last ≤8 turns in canonical form —
+the identity chain's own hashing input (`neutralTurnCanonical`): kind plus
+logical text/calls. For an assistant turn carrying tool calls the canonical
+form is calls+role only (cross-wire neutrality — OpenAI renders such turns
+with `content: null`), so a prose-only difference inside a calls turn is
+invisible to this rung exactly as it is to the rest of the chain that shares
+the same canonical form. A different conversation must still replay identical
+user questions, tool results and tool calls across the whole tail window to be
+accepted; record regrouping alone can never do that.
+
 **There is no supported command to re-attach a derived lane to its parent,
 and no config knob for it.** The resolution is decided per request from
 evidence only; after a drift, the only sanctioned path is surgery on the

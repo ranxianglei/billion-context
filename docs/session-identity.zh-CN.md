@@ -148,6 +148,8 @@ claude/codex/dsh 在这里不需要任何信号:它们的 subagent 共享同一�
 
 顺序解析器在能验证延续性时(头部延续、头部佐证的模型切换、逐位 fragment 连续段、fragment 或内容校验的尾部——`src/session-resolve.ts`)会把活会话留在原始 id 上。但当宿主在轮换 system prompt 的同一轮里销毁了**全部**字节级证据——例如一次升级同时改了 system prompt 和消息记录布局(#5844),或增长+位移的重放(#5714)——会话就会分叉到 `<id>|sub:<fp>`,压缩状态为空。这是有意设计:误归属(mis-attribution)是本系统代价最高的失败(MESSAGE-IDENTITY)。
 
+「内容校验」的尾部比较的是最后 ≤8 轮的**规范化形式**——身份链自有的 hash 输入(`neutralTurnCanonical`):kind 加逻辑文本/调用。对携带工具调用的 assistant 轮,规范化形式只含 calls+role(跨线中性——OpenAI 会把这类轮渲染为 `content: null`),因此 calls 轮内**仅散文不同**对本档不可见,这与共享同一规范化形式的身份链其余部分完全一致。另一个对话要能被接受,仍须在整段尾窗上重放逐字一致的用户提问、工具结果与工具调用;单纯的消息重打包做不到这一点。
+
 **目前没有任何受支持的命令能把派生车道重新挂回父会话,也没有对应的配置项。** 解析结果每轮只由证据决定;漂移发生后,唯一被认可的恢复路径是对持久化骨架做手术:
 
 1. 先停代理——运行中的守护进程会用内存里的骨架悄悄重写 `<state 目录>/session-order.json`,运行期间做的任何编辑都会丢失(state 目录 = `$XDG_STATE_HOME/billion-context`,默认 `~/.local/state/billion-context/`)。
