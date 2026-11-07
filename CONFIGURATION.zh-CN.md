@@ -101,6 +101,7 @@
 | `rollout.features.percent` | number | the version's baked-in plan | — | 看到该特性的安装占比(0–100,支持小数)。单调:上调比例不会把已入组的安装踢出;每台安装的桶值是前缀稳定的。 |
 | `rollout.features.salt` | string | the feature name | — | 分桶哈希盐。修改它会重新随机整个分组(唯一的洗牌方式;仅上调 percent 永不洗牌)。 |
 | `rollout.features.base` | string | unset (roll out over everyone) | — | 嵌套灰度:仅在所指特性的已入组人群内评估本特性,percent 相对该人群(B 只放量给 A 的用户;允许链式,环路判为关)。 |
+| `rollout.features.identityChannelHarvest` | boolean \| number | 0(关) | BILI_ROLLOUT_IDENTITY_CHANNEL_HARVEST | 身份信道采集的灰度门(#5825):当安装级开关(BILI_IDENTITY_HARVEST)未设置时,允许仅由本灰度键激活回环专属的转录/SQLite 采集(claude-code / codebuddy / mcode / goose / qwen 车道);两者都不设则永不读客户端存储。owner 裁定 2026-11-07:本灰度键与 rollout.features.pluginLaneServerHistory(它管已接纳 id 的行钉住)刻意分离——任一使能方可激活采集。默认 0%,小流量观察退化率后再抬。见 identity-channels.zh-CN.md。 |
 | `rollout.features.pluginLaneServerHistory` | boolean \| number | 0(关) | BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY | 插件车道服务端正史(#4491):对已放量的安装,(a) 插件车道请求可携带与 `messages` 平行的内部字段 `biliMsgIds`,把消息身份钉在客户端提供的 id 上(转发上游前一律剥掉;格式错误的数组告警后忽略,身份投毒形态在增量车道直接硬失败);(b) 仅回环可达的 `POST /__bili/plugin/render` 端点从统一存储渲染出站前缀(折叠区收敛为摘要锚点;任何失步都返回非 2xx,shim 退回本地历史);(c) 增量车道探测响应通告 `serverHistory`。默认 0%,放量前无行为变化。 |
 | `rollout.features.pluginFullResendWatermark` | boolean \| number | 5(实验性灰度) | BILI_ROLLOUT_PLUGIN_FULL_RESEND_WATERMARK | 全量重发水位快路径(#5403/#5418):插件车道 chat-completions 回合若上一轮响应盖有 x-bili-pf-seq,则用回声计数声明重发前缀(结构扫描,不做全量解析);命中时管线只消费钉存的前缀核 + 新增尾巴窗口(出站字节同源可证;任何疑点当轮回退未动过的全量解析路径并重新盖戳,连续五次计名失配将车道按住一小时)。需客户端把戳回声为 x-bili-pf-count(适配的车道回带;其余车道不会命中)。**实验性灰度**——默认仅约 5% 的安装开启(owner 裁定 2026-11-02:先小流量再 GA;web 面板对全部安装显示一次性公告、快速配置提供三态开关);`true` 强制开、`false`(或百分比)/ env = 0 关。见 TECHNICAL-NOTES.zh-CN.md「全量重发水位快路径」。 |
 | `maskHosts` | boolean | true | BILI_LOG_MASK_HOSTS | 日志中把非公开目标主机遮成 <private-host>；凭据头无论此开关如何总是遮盖。 |
@@ -373,6 +374,7 @@
 | `BILI_DSH_AUTHORED_COMPACTION` | boolean | true (on, #3901 flip) | — | 让 bili 本地应答 dsh 压缩摘要请求（返回折叠快照而非拒绝，#3733）：身份头 + 内核渲染格式的块摘要，零出口流量；重放经 #2432 再基线识别。 |
 | `BILI_DSH_CONTEXT_TAB` | boolean | true | — | dsh.contextTab 的 env 层（#4237）：0/false 移除 DSH 顶栏「上下文」标签页（其余一切照常工作）；其他取值强制开启并覆盖文件层；缺省 = 按文件层取值（默认 true）。下次页面加载 / dsh 重启生效。 |
 | `BILI_DSH_MAX_TESTED_VERSION` | string | 0.2.0-rc.2 (CI e2e anchor) | — | “dsh native lane 启动提示的“我们测过的最高版本”上限（#4545）：从注入包上方最近的 node_modules/@deepseek-ai/dsh/package.json 读出运行中的构建,**严格高于**上限才弹一条启动提示(持久日志 + 横幅),建议先回滚到上限版本。只覆盖"更新"一个方向:≤ 上限保持静默(旧版已知坏法有专门的失锁探测)。只提示、绝不拦截或阻断流量;新版本验证通过后抬高上限,空字符串 = 关闭本 lane 检查;读不到/解析不了的版本按静默处理。” |
+| `BILI_IDENTITY_HARVEST` | string | off | — | #5825 身份信道接线的采集开关（灰度门控下的回环本地转录/SQLite 采集）：缺省关闭、完全惰性；`all` 或逗号列表（`claude,codebuddy,mcode`）开启对应来源，且仅对回环身份请求生效，同时要求 pluginLaneServerHistory 灰度为开。任何无法判定的情形整轮退化为接线前路径，绝不做部分映射。设计上是开发/验证开关而非调参旋钮。 |
 | `BILI_STORAGE_BACKEND` | sqlite\|mysql | sqlite | — | storage.backend 的环境变量层（#3931）：sqlite（默认）或 mysql（已接线，#3388 第二+三步 —— 保存经异步影子队列入 mysql,同步读走 JSON 信封,replicas/ext/GC/fork 走异步孪生（#4911）;export 同样支持）。优先于文件层。 |
 | `BILI_MYSQL_DSN` | string | unset | — | storage.backend="mysql" 的 MySQL DSN（mysql://user:pass@host:3306/db）（#3388，#3931）。优先于文件键 storage.mysql.dsn。留空 = mysql 后端无法打开;文档化错误会列出两个旋钮。连接池惰性打开;closeQuietlyAsync 排空入队事务并关闭。 |
 | `BILI_STORAGE_ARCHIVE_AFTER_DAYS` | integer | 365 | — | GC 年龄清扫窗口（天，#3463）：闲置超过该时长的会话被归档（单文件归档日志 archive/archive.jsonl 追加一行 + 墓碑行保留标签 + 释放内容/媒体引用）。0 关闭年龄清扫；手动入口 POST /__bili/storage/gc 始终可用。配置文件键 storage.archiveAfterDays 为持久形式。 |
@@ -1929,6 +1931,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_RESIGN_PASSTHROUGH` | `resign` | {} (armed; built-in scheme sdk-hmac-sha256) |
 | `BILI_RESUME_INHERITANCE` | `resumeInheritance` | true |
 | `BILI_ROLLOUT_<FEATURE>` | `rollout.features.enabled` | unset (bucket math decides) |
+| `BILI_ROLLOUT_IDENTITY_CHANNEL_HARVEST` | `rollout.features.identityChannelHarvest` | 0 (off) |
 | `BILI_ROLLOUT_PLUGIN_FULL_RESEND_WATERMARK` | `rollout.features.pluginFullResendWatermark` | 5 (experimental grey) |
 | `BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY` | `rollout.features.pluginLaneServerHistory` | 0 (off) |
 | `BILI_SESSION_CONTENT_STORE_PIN` | `sessions.contentStorePin` | false |
