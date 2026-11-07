@@ -5,7 +5,7 @@ import { coreToOpenai, injectOpenaiSystem, openaiToCore, type BiliMessage, type 
 import type { CompressReasoningConfig } from "../reasoning-drop.js";
 import type { ProxyOptions } from "../config.js";
 import { effectivePromptCacheRouting } from "../config.js";
-import { currentCalibrationFactor, hardenOpenaiAssistantContent, systemToUser } from "../util.js";
+import { currentCalibrationFactor, hardenOpenaiAssistantContent, hardenOpenaiToolCallArguments, systemToUser } from "../util.js";
 import { conversationHeaderSource, resolveRelayAffinityPck } from "../session-id.js";
 import { pluginAgentHeader } from "../plugin.js";
 import { applyReasoningDrop, diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, planReasoningDrop, makeFoldPointReasoningDroppable, reapOrphansLogged, resolveKnownOutputCeiling, runNudgeDecision, stripKernelSummaries, warnDroppedOpenaiParts, warnReasoningPairs, type Prepared } from "../server.js";
@@ -406,7 +406,9 @@ export async function prepareOpenai(
         // Client-origin mid system/developer messages (DSH tool_addition and
         // friends) are conversation data — they re-emit verbatim through the
         // kernel's rawOpenaiMessage sidecar and must never change voice (#4159).
-        rebuiltMessages = hardenOpenaiAssistantContent(coreToOpenai(systemToUser(egressMessages, (m) => isRenderedSummaryMessage(m))));
+        const argsHardened = hardenOpenaiToolCallArguments(coreToOpenai(systemToUser(egressMessages, (m) => isRenderedSummaryMessage(m))));
+        if (argsHardened.replaced > 0) log("warn", `[${sessionId}] rebuilt ${argsHardened.replaced} empty/unrecoverable tool-call argument(s) with a parseable placeholder so the request stays sendable (#5595)`);
+        rebuiltMessages = hardenOpenaiAssistantContent(argsHardened.messages);
 
         // ONLY the static compress prompt goes into the system message — the
         // system prompt is the prefix-cache anchor and must be byte-stable
