@@ -23,6 +23,16 @@ import { log as loggerLog } from "../logger.js";
 import { openSqliteDatabase, type SqliteDatabase, type SqliteEngineName, type SqliteEngineSource } from "./driver.js";
 import { migrateSchema, storagePragmas, WAL_JOURNAL_SIZE_LIMIT } from "./schema.js";
 import { identityOfStoredContent } from "./identity.js";
+import {
+    applySnapInTransaction,
+    isSnapPlaneDead,
+    markSnapPlaneDead,
+    readSnapView,
+    snapGcCoveredRows,
+    snapL1Record,
+    snapplaneStatusWire,
+    type SnapEvent,
+} from "./snap.js";
 import { recordIntegrityOutcome, recordSecondProcessOwner, recordBackupOutcome } from "./runtime-status.js";
 import { integrityModeFor, writeIntegrityCache, scheduleBackgroundIntegrityCheck, backgroundIntegrityInflightForTests, noteIntegrityCheckRun } from "./integrity-check.js";
 import { sqliteCorruptionDetail } from "./sqlite-errors.js";
@@ -301,6 +311,13 @@ export interface SessionStorageStats {
         sessionExt: number;
         checkpoints: number;
         pinnedCheckpoints: number;
+        /** #5874: snapshot-plane rows for this session (folded + active),
+         *  its log entries past the fold, its fold points, and the L1
+         *  identity entry it owns. Zero for a plane-never-written session. */
+        snapRows: number;
+        snapLogEntries: number;
+        snapCkpts: number;
+        l1Entries: number;
     };
     /** Bytes held in inline JSON columns of this session's rows (sessions
      *  record + blocks payload_json + session_ext value_json) — everything
@@ -474,6 +491,12 @@ export class UnifiedStore {
     private readonly db: SqliteDatabase;
     /** #3250: successful-ingest counter driving the WAL_CHECKPOINT_EVERY_INGESTS cadence. */
     private ingestCount = 0;
+    /** #5874: snapshot-plane flags (storage.snapBase: master ⊃ shadowWrite
+     *  lane). Off ⇒ the plane tables are never touched by the write hook.
+     *  Set from UnifiedStore.open's opts — the constructor stays untouched
+     *  (readSnapshotAsync's reader stores inherit the flag harmlessly: the
+     *  reader connection is query-only and never ingests). */
+    snapPlane: { enabled: boolean; shadowWrite: boolean } = { enabled: false, shadowWrite: false };
     /** #5744: last periodic checkpoint result (plus its wall time) for the
      * slow-ingest warn line — lets an operator attribute a stall spike to a
      * checkpoint burst instead of guessing. Null until the first tick. */
@@ -507,7 +530,7 @@ export class UnifiedStore {
     static open(
         path: string,
         engine?: SqliteEngineName,
-        opts?: { walJournalSizeLimitBytes?: number },
+        opts?: { walJournalSizeLimitBytes?: number; snapBase?: { enabled?: boolean; shadowWrite?: boolean } },
     ): UnifiedStore {
         mkdirSync(dirname(path), { recursive: true });
         const { db, engine: used, source } = openSqliteDatabase(path, engine);
@@ -703,6 +726,16 @@ export class UnifiedStore {
             loggerLog("warn", `[storage] WAL checkpoint on open failed for ${path}: ${String(err)}`);
         }
         const store = new UnifiedStore(db, used, source, lockPath, foreignLockHolder, path);
+        if (opts?.snapBase) {
+            // #5874: the config layer already enforces master⊃lane (the
+            // lane flag only means something with the master flag); the
+            // && here is the storage layer's own belt (a store opened
+            // directly, bypassing knobs, can never shadow without the master).
+            store.snapPlane = {
+                enabled: opts.snapBase.enabled === true,
+                shadowWrite: opts.snapBase.enabled === true && opts.snapBase.shadowWrite === true,
+            };
+        }
         if (integrityOk) store.noteIntegrityOk();
         // #4609: a large store's cache-miss check runs post-open on a second
         // read-only connection — open() returns immediately; the verdict
@@ -1514,7 +1547,286 @@ export class UnifiedStore {
             return true;
         });
         if (ok) this.maybeCheckpointWal();
+        if (ok) this.snapShadowSync(input, delta, opts);
         return ok;
+    }
+
+    // -----------------------------------------------------------------------
+    // #5874 snapshot-table compression foundation — P1 shadow write.
+    //
+    // Runs AFTER the legacy ingest committed, in the same tick, as its own
+    // store transaction. The plane is derived from FINAL DB state (messages
+    // / blocks / plane rows) — never from fuzzy matching — so a round that
+    // cannot be addressed produces no events and the legacy path carries it
+    // (R2). Any throw here is caught: the plane NEVER fails the save, and a
+    // failed plane round self-heals on the next save (the derivation is
+    // idempotent final-state diffing). Lane sessions are excluded (their
+    // transcripts are not authoritative — the main session is).
+    // -----------------------------------------------------------------------
+    private snapShadowSync(
+        input: IngestSessionInput,
+        delta: { trustedSeq: number; boundaryMsgId: string; boundaryHash: string; trustedTailSeqs: number[] } | undefined,
+        opts?: { completeLog?: boolean },
+    ): void {
+        const fl = this.snapPlane;
+        if (!fl.enabled || !fl.shadowWrite) return;
+        const sid = input.session.sessionId;
+        if (this.hasLaneExt(sid)) return; // skip:lane — lane transcripts are not the cohort truth
+        if (isSnapPlaneDead(sid)) return; // dead (R1) — sticky, silent; status surfaces it
+        const now = Date.now();
+        // Stage-0 identity: raw host session id → ledger id (v1 mapping: the
+        // conversation binding, session_id when there is none).
+        const sessRaw =
+            (this.db.prepare("SELECT conversation_id FROM conversations WHERE session_id = ?").get(sid) as { conversation_id: string } | undefined)
+                ?.conversation_id ?? sid;
+        const witness = this.snapWitnessProbe(sid);
+        try {
+            const out = this.db.transaction(() => {
+                const l1 = snapL1Record(this.db, sessRaw, sid, witness, now);
+                if (l1 === "red") {
+                    // Identity conflict (R3 territory): the raw id maps to a
+                    // different ledger. Hard-refuse this round — zero side
+                    // effects on the plane, legacy carries the round.
+                    throw new Error(`l1 red: sess_raw=${sessRaw} maps to another ledger (R3)`);
+                }
+                // Steady-state delta appends take the fast path (no full
+                // scan); everything else is a final-state diff (seed, edit,
+                // rewind, compaction, reap — the bounded passes).
+                const fast = delta ? this.snapFastAppendEvents(sid, input) : null;
+                const events = fast ?? this.snapDeriveEvents(sid);
+                const depth = this.snapLogDepth(sid);
+                const fold = events.some((e) => e.ev === "compact") || depth >= UnifiedStore.SNAP_FOLD_DEPTH;
+                const commit = applySnapInTransaction(this.db, sid, events, { fold, now });
+                snapGcCoveredRows(this.db, sid);
+                return { l1, nEvents: events.length, commit };
+            });
+            // A/B oracle on fold (amortized O(n), off the per-save fast
+            // path): the folded plane must agree with the legacy view —
+            // positions and forms. A mismatch kills the plane for this sid
+            // (R2 as a red door on the read side); the save itself is done
+            // and untouched.
+            if (out.commit.folded) this.snapAbCheck(sid);
+            const kind =
+                out.nEvents === 0
+                    ? "noop"
+                    : out.commit.folded
+                      ? `sync,fold(n=${out.nEvents})`
+                      : `sync(n=${out.nEvents})`;
+            loggerLog("info", `[snaplane] sid=${sid} l1=${out.l1} ${kind} tail=${out.commit.tailSeq}`);
+        } catch (err) {
+            if (!(err instanceof Error) || err.name !== "SnapPlaneDeadError") markSnapPlaneDead(sid);
+            // R2/R3 degrade: the round stays on the legacy path. Log the
+            // decision with the unified vocabulary and stop retrying this
+            // sid for the process lifetime (a persistent derivation error
+            // must not cost a transaction per save; a restart re-verifies
+            // from storage, which is the honest re-arm).
+            loggerLog("warn", `[snaplane] sid=${sid} decision=red:R2 ${String(err).slice(0, 200)}`);
+        }
+    }
+
+    /** Snapshot fold cadence: absorb the log into the ckpt once it holds
+     *  this many entries past the ckpt, or whenever a compact lands (the
+     *  coverage mapping must then be current for the fold view). Keeps the
+     *  log depth bounded (T9). */
+    private static readonly SNAP_FOLD_DEPTH = 128;
+
+    /** L1 witness probe: a sampled fingerprint of the FIRST live ids (the
+     *  head of the id space is what survives rounds — the tail churns). */
+    private snapWitnessProbe(sid: string): string {
+        const rows = this.db
+            .prepare("SELECT msg_id FROM messages WHERE session_id = ? AND retired_at IS NULL ORDER BY seq LIMIT 8")
+            .all(sid) as { msg_id: string }[];
+        return sha256Hex(rows.length ? rows.map((r) => r.msg_id).join("\u0000") : "empty");
+    }
+
+    /** Log entries past the last ckpt for one session (fold heuristic). */
+    private snapLogDepth(sid: string): number {
+        const tail = (this.db.prepare("SELECT COALESCE(MAX(seq), 0) AS m FROM snap_log WHERE sid = ?").get(sid) as { m: number }).m;
+        const ckpt =
+            (this.db.prepare("SELECT ckpt_seq FROM snap_ckpt WHERE sid = ?").get(sid) as { ckpt_seq: number } | undefined)?.ckpt_seq ?? 0;
+        return Math.max(0, tail - ckpt);
+    }
+
+    /** Fast path for steady-state delta appends (no full scan): the delta
+     *  guard already proved every incoming identity is NEW, so the plane
+     *  work is exactly "append n rows at tail+1.." — valid when the plane
+     *  tail equals the pre-append legacy max. Anything else (plane never
+     *  seeded, plane behind the legacy tail, empty delta) returns null and
+     *  the caller takes the final-state diff. */
+    private snapFastAppendEvents(sid: string, input: IngestSessionInput): SnapEvent[] | null {
+        const n = input.messages.length;
+        const maxLive = (this.db.prepare("SELECT COALESCE(MAX(seq), -1) AS m FROM messages WHERE session_id = ? AND retired_at IS NULL").get(sid) as { m: number }).m;
+        const planeTail = (this.db.prepare("SELECT COALESCE(MAX(pos), -1) AS m FROM snap_rows WHERE sid = ?").get(sid) as { m: number }).m;
+        if (planeTail < 0) return null; // plane not seeded — the diff seeds it
+        if (n === 0) return maxLive === planeTail ? [] : null;
+        if (maxLive - n + 1 !== planeTail + 1) return null;
+        // The incoming rows are exactly planeTail+1 .. maxLive; read their
+        // hashes back from the committed messages table (the canonical form
+        // the plane stores — invariant v).
+        const seqs: number[] = [];
+        for (let i = 1; i <= n; i++) seqs.push(planeTail + i);
+        const rows = this.db
+            .prepare(
+                `SELECT m.seq, m.msg_id, m.content_hash, c.byte_len AS clen FROM messages m JOIN content c ON c.hash = m.content_hash WHERE m.session_id = ? AND m.seq IN (${seqs.map(() => "?").join(",")}) ORDER BY m.seq`,
+            )
+            .all(sid, ...seqs) as { seq: number; msg_id: string; content_hash: string; clen: number }[];
+        if (rows.length !== n) return null; // defensive — the guard proved them new
+        const content = this.snapContentByHash(rows.map((r) => r.content_hash));
+        const events: SnapEvent[] = [];
+        for (const r of rows) {
+            const body = content.get(r.content_hash);
+            if (body === undefined) return null; // defensive — hash mismatch is a red door
+            events.push({
+                ev: "append",
+                pos: r.seq,
+                coreIds: [r.msg_id],
+                preJson: null,
+                postJson: body,
+                tokensEst: Math.ceil(r.clen / 4),
+            });
+        }
+        return events;
+    }
+
+    /** Final-state diff: derive the plane events that make the plane agree
+     *  with the committed legacy state. Bounded by the session's live rows
+     *  and blocks (one indexed read each) — this is the reconciliation pass
+     *  the fast path exists to avoid in steady state. */
+    private snapDeriveEvents(sid: string): SnapEvent[] {
+        const live = this.db
+            .prepare(
+                "SELECT m.seq, m.msg_id, m.content_hash, c.byte_len AS clen FROM messages m JOIN content c ON c.hash = m.content_hash WHERE m.session_id = ? AND m.retired_at IS NULL ORDER BY m.seq",
+            )
+            .all(sid) as { seq: number; msg_id: string; content_hash: string; clen: number }[];
+        const plane = this.db
+            .prepare("SELECT pos, core_ids, post_json, active, cover_ref FROM snap_rows WHERE sid = ? ORDER BY pos")
+            .all(sid) as { pos: number; core_ids: string; post_json: string | null; active: number; cover_ref: string | null }[];
+        const covers = this.db
+            .prepare(
+                "SELECT block_id, start_seq, end_seq FROM blocks WHERE session_id = ? AND active = 1 AND start_seq >= 0 AND end_seq >= start_seq ORDER BY start_seq",
+            )
+            .all(sid) as { block_id: string; start_seq: number; end_seq: number }[];
+        const planeByPos = new Map(plane.map((r) => [r.pos, r]));
+        const livePos = new Set(live.map((r) => r.seq));
+        const content = this.snapContentByHash(live.map((r) => r.content_hash));
+        const inCover = (pos: number) => covers.some((c) => pos >= c.start_seq && pos <= c.end_seq);
+        const events: SnapEvent[] = [];
+        // 1) casts / updates / revivals, in pos order (deterministic seqs).
+        for (const m of live) {
+            const body = content.get(m.content_hash);
+            if (body === undefined) throw new Error(`[snaplane] sid=${sid} pos=${m.seq}: content hash ${m.content_hash.slice(0, 12)}… missing from CAS`);
+            const coreIds = [m.msg_id];
+            const p = planeByPos.get(m.seq);
+            const tokensEst = Math.ceil(m.clen / 4);
+            if (!p) {
+                events.push({ ev: "cast", pos: m.seq, coreIds, preJson: null, postJson: body, tokensEst });
+                continue;
+            }
+            if (p.active === 0) {
+                // Revival (retired row back in the transcript, or a
+                // compacted row the host re-presents): re-activate in place,
+                // pre_json becomes the old post (two-form retention). A
+                // still-covered position is re-flipped by the compact
+                // emitted below — the batch lands in the covered state.
+                events.push({ ev: "update", pos: m.seq, postJson: body, coreIds, tokensEst });
+                continue;
+            }
+            if (p.post_json !== body || p.core_ids !== JSON.stringify(coreIds)) {
+                events.push({ ev: "update", pos: m.seq, postJson: body, coreIds, tokensEst });
+            }
+        }
+        // 2) deletions: ACTIVE rows whose position the host transcript no
+        //    longer presents and no block covers (host-side removal has no
+        //    covering block; covered rows go to the compact, which retains
+        //    both forms for forensics).
+        for (const r of plane) {
+            if (r.active === 1 && !livePos.has(r.pos) && !inCover(r.pos)) events.push({ ev: "delete", pos: r.pos });
+        }
+        // 3) compactions LAST (they flip whatever 1) just cast): an active
+        //    block covers a ledger interval — every row inside becomes
+        //    covered (active=0, cover_ref set, both forms kept). Emitted
+        //    only when the batch changes state (an active row inside, or a
+        //    cast landing inside), so steady-state saves do not re-log a
+        //    no-op compact every round.
+        for (const c of covers) {
+            let flip = false;
+            for (const r of plane) if (r.active === 1 && r.pos >= c.start_seq && r.pos <= c.end_seq) { flip = true; break; }
+            if (!flip) for (const m of live) if (m.seq >= c.start_seq && m.seq <= c.end_seq && !planeByPos.has(m.seq)) { flip = true; break; }
+            if (flip) events.push({ ev: "compact", blockId: c.block_id, posRange: [c.start_seq, c.end_seq] });
+        }
+        return events;
+    }
+
+    /** Batch CAS read: hash → stored bytes (string). The plane stores the
+     *  canonical core shape — exactly what the messages table stores. */
+    private snapContentByHash(hashes: string[]): Map<string, string> {
+        const out = new Map<string, string>();
+        const uniq = [...new Set(hashes)];
+        const per = SEQ_SPAN_QUERY_BATCH;
+        for (let i = 0; i < uniq.length; i += per) {
+            const chunk = uniq.slice(i, i + per);
+            const rows = this.db
+                .prepare(`SELECT hash, bytes FROM content WHERE hash IN (${chunk.map(() => "?").join(",")})`)
+                .all(...chunk) as { hash: string; bytes: Buffer | Uint8Array }[];
+            for (const r of rows) out.set(r.hash, Buffer.from(r.bytes).toString("utf8"));
+        }
+        return out;
+    }
+
+    /** A/B oracle (P1): the folded plane must agree with the legacy view.
+     *  Compared: every live ledger position NOT covered by an active block
+     *  ↔ an ACTIVE plane row, and the plane row's post form ↔ the stored
+     *  message content. Covered positions are legitimately inactive in the
+     *  plane (the block summary is their carrier) and are excluded here —
+     *  they are accounted for in the ckpt coverage map (T7). Any mismatch ⇒
+     *  the plane is dead for this sid (R2 as a red door on the read side).
+     *  Called only at fold time — amortized, off the per-save fast path. */
+    private snapAbCheck(sid: string): void {
+        try {
+            const view = readSnapView(this.db, sid);
+            const covers = this.db
+                .prepare("SELECT start_seq, end_seq FROM blocks WHERE session_id = ? AND active = 1 AND start_seq >= 0 AND end_seq >= start_seq")
+                .all(sid) as { start_seq: number; end_seq: number }[];
+            const covered = (pos: number) => covers.some((c) => pos >= c.start_seq && pos <= c.end_seq);
+            const live = this.db
+                .prepare("SELECT seq, content_hash FROM messages WHERE session_id = ? AND retired_at IS NULL ORDER BY seq")
+                .all(sid) as { seq: number; content_hash: string }[];
+            const uncovered = live.filter((r) => !covered(r.seq));
+            const content = this.snapContentByHash(uncovered.map((r) => r.content_hash));
+            const activeByPos = new Map((view?.rows ?? []).filter((r) => r.active === 1).map((r) => [r.pos, r]));
+            if (uncovered.length !== activeByPos.size) {
+                markSnapPlaneDead(sid);
+                loggerLog("warn", `[snaplane] sid=${sid} decision=red:R2 A/B count mismatch (legacy uncovered ${uncovered.length} vs plane active ${activeByPos.size})`);
+                return;
+            }
+            for (const m of uncovered) {
+                const row = activeByPos.get(m.seq);
+                if (!row) {
+                    markSnapPlaneDead(sid);
+                    loggerLog("warn", `[snaplane] sid=${sid} decision=red:R2 A/B: live pos ${m.seq} has no active plane row`);
+                    return;
+                }
+                const body = content.get(m.content_hash);
+                if (row.postJson !== body) {
+                    markSnapPlaneDead(sid);
+                    loggerLog("warn", `[snaplane] sid=${sid} decision=red:R2 A/B: pos ${m.seq} form mismatch`);
+                    return;
+                }
+            }
+        } catch (err) {
+            if (err instanceof Error && err.name === "SnapPlaneDeadError") {
+                // R1 already latched (sticky) — nothing more to do.
+                return;
+            }
+            markSnapPlaneDead(sid);
+            loggerLog("warn", `[snaplane] sid=${sid} decision=red:R2 A/B check failed: ${String(err).slice(0, 200)}`);
+        }
+    }
+
+    /** #5874: the status payload for the /__bili/status wire (flag state +
+     *  plane counters + dead latches). Wire-safe: no Buffer, no functions. */
+    snapplaneStatus() {
+        return snapplaneStatusWire(this.db as unknown as Parameters<typeof snapplaneStatusWire>[0], this.snapPlane);
     }
 
     /** #3250: cadence-tick WAL reclamation (see WAL_CHECKPOINT_EVERY_INGESTS).
@@ -1968,6 +2280,14 @@ export class UnifiedStore {
             this.db.prepare("DELETE FROM conversations WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM session_ext WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM sessions WHERE session_id = ?").run(sessionId);
+            // #5874: the snapshot plane rides the session — rows / log /
+            // ckpt are keyed by sid, the L1 entry by ledger_id. The plane
+            // stores canonical forms INLINE (not CAS), so no release here;
+            // no orphan may survive (T6).
+            this.db.prepare("DELETE FROM snap_rows WHERE sid = ?").run(sessionId);
+            this.db.prepare("DELETE FROM snap_log WHERE sid = ?").run(sessionId);
+            this.db.prepare("DELETE FROM snap_ckpt WHERE sid = ?").run(sessionId);
+            this.db.prepare("DELETE FROM l1_world WHERE ledger_id = ?").run(sessionId);
             for (const hash of refs) this.releaseContent(hash);
             // #4796 follow-up: scoped collection over this session's own
             // released hashes (see collectZeroRefIn) — never the whole table.
@@ -1991,11 +2311,16 @@ export class UnifiedStore {
                     "(SELECT COUNT(*) FROM ccr_entries WHERE session_id = ?) AS ccrEntries, " +
                     "(SELECT COUNT(*) FROM session_ext WHERE session_id = ?) AS ext, " +
                     "(SELECT COUNT(*) FROM checkpoints WHERE session_id = ?) AS cps, " +
-                    "(SELECT COUNT(*) FROM checkpoints WHERE session_id = ? AND pinned = 1) AS pinnedCps",
+                    "(SELECT COUNT(*) FROM checkpoints WHERE session_id = ? AND pinned = 1) AS pinnedCps, " +
+                    "(SELECT COUNT(*) FROM snap_rows WHERE sid = ?) AS snapRows, " +
+                    "(SELECT COUNT(*) FROM snap_log WHERE sid = ?) AS snapLogEntries, " +
+                    "(SELECT COUNT(*) FROM snap_ckpt WHERE sid = ?) AS snapCkpts, " +
+                    "(SELECT COUNT(*) FROM l1_world WHERE ledger_id = ?) AS l1Entries",
             )
-            .get(sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId) as {
+            .get(sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId) as {
             messages: number; media: number; blocks: number; deadRefs: number;
             refs: number; ccrEntries: number; ext: number; cps: number; pinnedCps: number;
+            snapRows: number; snapLogEntries: number; snapCkpts: number; l1Entries: number;
         };
         const inlineBytes =
             ((this.db
@@ -2011,6 +2336,15 @@ export class UnifiedStore {
                 .get(sessionId) as { b: number }).b ?? 0) +
             ((this.db
                 .prepare("SELECT COALESCE(SUM(LENGTH(value_json)), 0) AS b FROM session_ext WHERE session_id = ?")
+                .get(sessionId) as { b: number }).b ?? 0) +
+            // #5874: the plane stores canonical forms INLINE (not CAS) — the
+            // folded rows' pre/post payloads are part of this session's
+            // inline footprint.
+            ((this.db
+                .prepare(
+                    "SELECT COALESCE(SUM(LENGTH(core_ids) + COALESCE(LENGTH(pre_json), 0) + COALESCE(LENGTH(post_json), 0) + COALESCE(LENGTH(cover_ref), 0)), 0) AS b " +
+                        "FROM snap_rows WHERE sid = ?",
+                )
                 .get(sessionId) as { b: number }).b ?? 0);
         const cas = this.db
             .prepare(
@@ -2036,6 +2370,10 @@ export class UnifiedStore {
                 sessionExt: counts.ext,
                 checkpoints: counts.cps,
                 pinnedCheckpoints: counts.pinnedCps,
+                snapRows: counts.snapRows,
+                snapLogEntries: counts.snapLogEntries,
+                snapCkpts: counts.snapCkpts,
+                l1Entries: counts.l1Entries,
             },
             inlineBytes,
             casExclusiveBytes: cas.exclusiveBytes,

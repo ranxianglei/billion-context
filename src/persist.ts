@@ -20,6 +20,7 @@ import {
     sessionResidentHardMaxBytes,
     resolveArchiveAfterDays,
     fileStorageUnified,
+    fileSnapBase,
     fileStorageJsonWriter,
     fileStorageArchiveAfterDays,
     fileStorageWalJournalSizeLimit,
@@ -716,7 +717,7 @@ export class SessionStore {
                 // triggered a paced retry — stamping here kept that read failing
                 // closed for a full cooldown window.
                 this.syncSidecarOpen = { legacyLoad };
-                this.shadow = UnifiedShadow.maybeOpen(this.sessionsDir, process.env, legacyLoad, fileStorageUnified(), fileStorageWalJournalSizeLimit(), fileStorageBackend()) ?? undefined;
+                this.shadow = UnifiedShadow.maybeOpen(this.sessionsDir, process.env, legacyLoad, fileStorageUnified(), fileStorageWalJournalSizeLimit(), fileStorageBackend(), fileSnapBase()) ?? undefined;
             } else {
                 this.shadow = undefined;
             }
@@ -2449,6 +2450,18 @@ export class SessionStore {
         }
     }
 
+    /** #5874: snapshot-plane status for /__bili/status. Null when the
+     *  unified store is unavailable (legacy-only lanes) — the status wire
+     *  then reports the flags with zeroed counters. */
+    snapplaneStatus(): import("./storage/snap.js").SnapPlaneStatusWire | null {
+        if (!this.replicasAvailable()) return null;
+        try {
+            return this.liveShadow().snapplaneStatus();
+        } catch {
+            return null; // sidecar degraded mid-call
+        }
+    }
+
     /** #3928: physical index.db shrink after deletions (`bili sessions rm`).
      *  Throws on failure — the deletion itself is already committed, callers
      *  report the shrink as partial. Throws in legacy-only lanes — check
@@ -3786,7 +3799,7 @@ export class SessionStore {
         const cooldown = shadowReopenCooldownMsOverride ?? SHADOW_REOPEN_COOLDOWN_MS;
         this.sidecarReopenNextAttemptAt = now + cooldown;
         try {
-            this.shadow = UnifiedShadow.maybeOpen(this.sessionsDir, process.env, args.legacyLoad, fileStorageUnified(), fileStorageWalJournalSizeLimit(), fileStorageBackend()) ?? undefined;
+            this.shadow = UnifiedShadow.maybeOpen(this.sessionsDir, process.env, args.legacyLoad, fileStorageUnified(), fileStorageWalJournalSizeLimit(), fileStorageBackend(), fileSnapBase()) ?? undefined;
         } catch (err) {
             // Transient refusal class re-occurred mid-process (unreachable via
             // boot — that path exits first — kept defensive per #5188):

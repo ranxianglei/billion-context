@@ -280,7 +280,9 @@ export class UnifiedShadow {
             : { name: "mysql", source: "network" };
     }
 
-    /** Opens the sidecar when a knob asks for one; null (no cost) otherwise. */
+    /** Opens the sidecar when a knob asks for one; null (no cost) otherwise.
+     *  fileSnapBase (#5874): the two-level plane flags from the config file
+     *  (knobs.fileSnapBase — already master⊃lane resolved). */
     static maybeOpen(
         dir: string,
         env: NodeJS.ProcessEnv = process.env,
@@ -288,6 +290,7 @@ export class UnifiedShadow {
         fileUnified?: string,
         fileWalLimit?: number,
         fileBackend?: string,
+        fileSnapBase?: { enabled: boolean; shadowWrite: boolean },
     ): UnifiedShadow | null {
         const mode = resolveStorageMode(env, fileUnified);
         if (mode === "legacy") return null;
@@ -307,7 +310,10 @@ export class UnifiedShadow {
         let store: UnifiedStore;
         try {
             try {
-                store = UnifiedStore.open(`${dir}/index.db`, undefined, { walJournalSizeLimitBytes: walLimit });
+                store = UnifiedStore.open(`${dir}/index.db`, undefined, {
+                    walJournalSizeLimitBytes: walLimit,
+                    snapBase: fileSnapBase,
+                });
             } catch (err) {
                 // #4175: anything else throwing StorageIntegrityError means quick_check
                 // proved the file set corrupt — handled below WITHOUT moving any file
@@ -394,9 +400,11 @@ export class UnifiedShadow {
         fileWalLimit?: number,
         fileBackend?: string,
         fileMysqlDsn?: string,
+        fileSnapBase?: { enabled: boolean; shadowWrite: boolean },
     ): Promise<UnifiedShadow | null> {
         const backendName = resolveBackendName(env, fileBackend);
-        if (backendName !== "mysql") return UnifiedShadow.maybeOpen(dir, env, legacyLoad, fileUnified, fileWalLimit, fileBackend);
+        if (backendName !== "mysql")
+            return UnifiedShadow.maybeOpen(dir, env, legacyLoad, fileUnified, fileWalLimit, fileBackend, fileSnapBase);
         const mode = resolveStorageMode(env, fileUnified);
         if (mode === "legacy") return null;
         const dsn = (env.BILI_MYSQL_DSN ?? fileMysqlDsn ?? "").trim();
@@ -958,6 +966,13 @@ export class UnifiedShadow {
     sessionStorageStats(sessionId: string): import("./store.ts").SessionStorageStats | null {
         if (this.sync === null) return null;
         return this.sync.sessionStorageStats(sessionId);
+    }
+
+    /** #5874: snapshot-plane status (flag state + counters + dead latches).
+     *  null when there is no sync store (async backend). */
+    snapplaneStatus(): import("./snap.js").SnapPlaneStatusWire | null {
+        if (this.sync === null) return null;
+        return this.sync.snapplaneStatus();
     }
 
     vacuum(mode: "full" | "incremental"): void {
