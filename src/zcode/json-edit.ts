@@ -114,7 +114,7 @@ export function zcodeSigningBlocksRouting(kind: ZcodeStoreKind, policy: ZcodeRou
 /** #809 parity with the in-process natives: a loopback proxy target is never
  *  re-proxied — wrapping it would stack bili onto itself or onto the user's
  *  own local relay. */
-function isLoopbackHttpUrl(url: string): boolean {
+export function isLoopbackHttpUrl(url: string): boolean {
     let parsed: URL;
     try {
         parsed = new URL(url);

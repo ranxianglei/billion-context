@@ -67,4 +67,46 @@ describe("zcode bootstrap-hook entry contract (#2943)", () => {
         clearTimeout(kill);
         assert.equal(code, 0, `zcode hook must exit 0 (got ${code}); stderr=${stderr.join("")}`);
     });
+
+    // #4692: the hook is an independent entry point from the MCP child — the
+    // built-in-account blind spot must be reported on stderr from HERE too.
+    async function runHook(env: NodeJS.ProcessEnv): Promise<{ code: number | null; out: string }> {
+        const hookPath = here("../src/zcode/bootstrap-hook.ts");
+        const e = { ...env };
+        delete e.NODE_TEST_CONTEXT;
+        const child = spawn(process.execPath, ["--import", "tsx", hookPath], { env: e, stdio: ["pipe", "pipe", "pipe"] });
+        const stderr: string[] = [];
+        child.stderr.on("data", (d) => stderr.push(String(d)));
+        child.stdin.write(JSON.stringify({ hook_event_name: "SessionStart", session_id: "t" }));
+        child.stdin.end();
+        const kill = setTimeout(() => child.kill("SIGKILL"), 15000);
+        const code = await new Promise<number | null>((resolve) => {
+            child.on("close", (c) => resolve(c));
+            child.on("error", () => resolve(null));
+        });
+        clearTimeout(kill);
+        return { code, out: stderr.join("") };
+    }
+
+    it("#4692: reports the built-in account on stderr, then fails open (no proxy reachable)", async () => {
+        const env = { ...process.env };
+        env.ZAI_BUSINESS_BASE_URL = "https://api.z.ai";
+        // attach to a dead port: health wait fails after its deadline -> fail-open return BEFORE any store write
+        env.BILLION_CONTEXT_PROXY = "http://127.0.0.1:9";
+        delete env.BILI_NATIVE_ZCODE;
+        delete env.BILI_ZCODE_ROUTE;
+        const { code, out } = await runHook(env);
+        assert.equal(code, 0, `hook must still fail open (got ${code}); stderr=${out}`);
+        assert.match(out, /z\.ai built-in account detected \(ZAI_BUSINESS_BASE_URL=https:\/\/api\.z\.ai\)/);
+        assert.match(out, /BYPASSES bili/);
+    });
+
+    it("#4692: kill-switch opt-out keeps the hook silent about the built-in account", async () => {
+        const env = { ...process.env };
+        env.ZAI_BUSINESS_BASE_URL = "https://api.z.ai";
+        env.BILI_NATIVE_ZCODE = "0";
+        const { code, out } = await runHook(env);
+        assert.equal(code, 0, `hook must exit 0 (got ${code}); stderr=${out}`);
+        assert.doesNotMatch(out, /built-in account detected/);
+    });
 });

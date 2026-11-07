@@ -420,6 +420,20 @@ two small node scripts that do the work around the client:
   `BILI_ZCODE_ROUTE`
   (`plans`/`none`) is a compat escape hatch, and `BILI_ZCODE_SIGNING_FIXED=1`
   flips the #1621 skips off once a ZCode build ships the signing fix.
+- **Built-in account bypass (#4692):** the z.ai **built-in** account connects through
+  `ZAI_BUSINESS_BASE_URL`, an env var that lives in the ZCode MAIN process and never
+  lands in the provider store — so native routing (which rewrites only that store) has
+  no target for it, and its model traffic runs **direct / uncompressed**. A hook/MCP
+  child cannot rewrite the parent's env (the same wall that keeps codex's login provider
+  out of reach, #1660/#403), and there is no config-file seam for this surface, so it
+  cannot be routed natively. bili now logs a loud line at session start whenever it
+  detects a live `ZAI_BUSINESS_BASE_URL` past loopback / any `/bili/` wrapper, so going
+  blind on it is no longer silent. The only in-proxy path is cert-MITM (GUI Settings →
+  Network: HTTP proxy + root CA), which intercepts below the URL layer regardless of how
+  the base URL is derived — confirm on your build that the built-in account's traffic
+  actually rides that proxy setting. Second layer: even once in, zai-series coding-plan
+  model traffic still trips the #661 anti-fraud wall (working-but-uncompressed,
+  #4593/#4610), so this entry does not buy compression for that family.
 - **Watchdog & lifecycle:** the MCP child probes the proxy every 30 s. In
   attach mode it waits forever (it never touches a user-owned proxy); in spawn
   mode a dead proxy is respawned and the routing rewritten to the new origin.
