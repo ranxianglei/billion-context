@@ -166,7 +166,7 @@ const BODY_NO_BP = JSON.stringify({
     system: "plain system",
     messages: [{ role: "user", content: "hi" }],
 });
-// #5667: a breakpoint with no explicit ttl — Anthropic's default ephemeral TTL is 5m.
+// #5665: a breakpoint with no explicit ttl — Anthropic's default ephemeral TTL is 5m.
 const BODY_NO_TTL = JSON.stringify({
     model: "claude-opus-test",
     max_tokens: 1024,
@@ -226,7 +226,7 @@ test("detectKeepaliveTier: 5m / 1h / mixed / nested / none", () => {
         messages: [{ role: "user", content: [{ type: "text", text: "b", cache_control: { type: "ephemeral", ttl: "1h" } }] }],
     };
     assert.equal(detectKeepaliveTier(mixed), "1h");
-    // #5667: a breakpoint without an explicit ttl is Anthropic's default 5m tier,
+    // #5665: a breakpoint without an explicit ttl is Anthropic's default 5m tier,
     // NOT "no breakpoint detected". Only bodies with zero cache_control are undefined.
     assert.equal(detectKeepaliveTier(JSON.parse(BODY_NO_TTL)), "5m");
     const mixedNoTtl = {
@@ -323,7 +323,7 @@ test("arm: 1h breakpoints arm at 1h×0.9", () => {
     assert.equal(_keepaliveEntryForTest(sid)?.cadenceMs, 3_240_000);
 });
 
-// #5667 regression: a breakpoint with no explicit ttl used to return tier
+// #5665 regression: a breakpoint with no explicit ttl used to return tier
 // undefined and silently never arm; it must now arm at the 5m cadence.
 test("arm: no-ttl breakpoints arm at the default 5m tier", () => {
     noteSuccessfulForward(armInput({ wireBody: BODY_NO_TTL }));

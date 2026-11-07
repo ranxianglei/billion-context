@@ -133,7 +133,7 @@ export function detectKeepaliveTier(body: unknown): "5m" | "1h" | undefined {
                 return;
             }
             // A cache_control breakpoint without an explicit ttl uses Anthropic's
-            // default 5-minute TTL, so it is a 5m-tier breakpoint (#5667); only an
+            // default 5-minute TTL, so it is a 5m-tier breakpoint (#5665); only an
             // explicit "1h" lifts the tier.
             found = "5m";
         }
