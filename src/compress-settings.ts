@@ -75,6 +75,7 @@ export function mergeCompress(
         nudgeGrowthTokens: pick("nudgeGrowthTokens"),
         minPressureBenefitTokens: pick("minPressureBenefitTokens"),
         requireUsageSampleForPressure: pick("requireUsageSampleForPressure"),
+        maxEstimateHoldRounds: pick("maxEstimateHoldRounds"),
         tierNudgeTokens: tierNudgeLevels.length > 0 ? Object.assign({}, ...tierNudgeLevels) : undefined,
         nudgeModelDecided: pick("nudgeModelDecided"),
         nudgeDecisionMaxTokens: pick("nudgeDecisionMaxTokens"),
@@ -341,6 +342,9 @@ export function applyCompressSettings(base: Config, limit: number, s: CompressSe
     // estimate-driven pressure injection), so pass it through instead of
     // skipping like absent knobs.
     if (s.requireUsageSampleForPressure !== undefined) nudge.requireUsageSampleForPressure = s.requireUsageSampleForPressure;
+    // #5865 estimate-hold backstop bound — pass through like every numeric
+    // knob (0 is meaningful: it disables the hold).
+    if (s.maxEstimateHoldRounds !== undefined && typeof s.maxEstimateHoldRounds === "number") nudge.maxEstimateHoldRounds = Math.floor(s.maxEstimateHoldRounds);
     if (s.tierNudgeTokens !== undefined) {
         const tg: NonNullable<Config["nudge"]["tierGrowthTokens"]> = {};
         if (typeof s.tierNudgeTokens.t1 === "number") tg.t1 = s.tierNudgeTokens.t1;
