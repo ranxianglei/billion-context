@@ -348,3 +348,47 @@ test("#4737 review: pane surfaces follow the theme and list markdown rules keep 
         assert.match(WEB_STYLES, new RegExp(`\\.block-item \\.body\\.md ${sel},`), `list-mode ${sel} rule keeps its element suffix`);
     }
 });
+
+// #5210: pull a top-level `:root…{ … }` palette block by its selector marker
+// (balanced-brace scan) so the guard can check each scheme independently.
+function paletteBlock(css: string, marker: string): string {
+    const start = css.indexOf(marker);
+    assert.ok(start >= 0, `palette marker found: ${marker}`);
+    const open = css.indexOf("{", start);
+    let depth = 0;
+    for (let i = open; i < css.length; i++) {
+        const ch = css.charAt(i);
+        if (ch === "{") depth++;
+        else if (ch === "}") {
+            depth--;
+            if (depth === 0) return css.slice(start, i + 1);
+        }
+    }
+    throw new Error("unbalanced braces from " + marker);
+}
+
+test("#5210: compression-tree node-box fills follow the theme (readable in dark mode)", () => {
+    const nodes: Array<[string, string]> = [
+        ["\\.g-node rect", "--node-fill"],
+        ["\\.g-node\\.tier-1 rect", "--node-fill-t1"],
+        ["\\.g-node\\.tier-2 rect", "--node-fill-t2"],
+        ["\\.g-node\\.tier-3 rect", "--node-fill-t3"],
+        ["\\.g-node\\.tier-n rect", "--node-fill-n"],
+    ];
+    for (const [selSrc, v] of nodes) {
+        const m = WEB_STYLES.match(new RegExp(`${selSrc} \\{[^}]*\\}`));
+        assert.ok(m, `${selSrc} rule present`);
+        assert.match(m[0], /fill:\s*var\(/, `${selSrc} fill is a CSS var`);
+        assert.match(m[0], new RegExp(`fill:\\s*var\\(\\s*${v}\\s*\\)`), `${selSrc} fill resolves to ${v}`);
+        assert.ok(!/fill:\s*#/.test(m[0]), `${selSrc} fill is not a hardcoded hex`);
+    }
+    // every palette (light :root + both dark blocks) must define the five vars,
+    // else one scheme silently falls back and re-breaks readability.
+    const light = paletteBlock(WEB_STYLES, ":root {");
+    const darkMedia = paletteBlock(WEB_STYLES, ":root:not([data-theme]) {");
+    const darkPinned = paletteBlock(WEB_STYLES, ':root[data-theme="dark"] {');
+    const defs = ["--node-fill:", "--node-fill-t1:", "--node-fill-t2:", "--node-fill-t3:", "--node-fill-n:"];
+    for (const blk of [light, darkMedia, darkPinned]) {
+        for (const d of defs) assert.ok(blk.includes(d), `every palette defines ${d}`);
+    }
+});
