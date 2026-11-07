@@ -1197,6 +1197,24 @@ export async function refreshDshProfileCopy(
         log("info", `[update] dsh profile bundle up to date (current=${currentVersion} latest=${latest} tag=${normalizeUpdateTag(opts.updateTag)})`);
         return;
     }
+    // #2456: post-restart, the advisory watcher may not have completed its
+    // first feed consultation yet — the blocks gate below is blind until it
+    // lands. Defer one cycle instead of pulling a possibly-affected version
+    // through the host channel (which the watcher cannot roll back).
+    if (opts.advisoryAwaitingFirstCheck?.()) {
+        log("info", "[update] dsh profile bundle: deferring this cycle — the advisory's first check has not landed yet (#2456)");
+        return;
+    }
+    // #1588-A: the registry latest may sit inside a freshly parsed advisory's
+    // affected range (rollback form). The global lane skips such candidates
+    // before an in-place install; the host channel must honor the same
+    // blocklist — a defect pulled in via `dsh plugin add` sits outside the
+    // watcher's rollback reach, so this gate is the profile copy's only
+    // defense. Absent predicate = no-op (auto-update-only installs never defer).
+    if (opts.advisoryBlocksVersion?.(latest)) {
+        log("info", `[update] dsh profile bundle: skipping ${latest} — covered by a critical-bug advisory's affected range (#1588); retrying next cycle`);
+        return;
+    }
     // #3619: the periodic self-check obeys the same policy gate as the global
     // lane (hold / pin / block / stagger). The post-global-install convergence
     // paths deliberately bypass it: that version already passed the gate.
@@ -1310,6 +1328,21 @@ export async function refreshPiNpmCopy(
     const currentVersion = diskVersion ?? opts.currentVersion;
     if (!isVersionNewer(latest, currentVersion)) {
         log("info", `[update] pi npm copy up to date (current=${currentVersion} latest=${latest} tag=${normalizeUpdateTag(opts.updateTag)})`);
+        return;
+    }
+    // #2456: the advisory watcher's first feed consultation may not have
+    // landed yet (post-restart) — the blocks gate below is blind until it
+    // does. Defer one cycle rather than driving `pi update` at a possibly-
+    // affected latest (pi's channel sits outside the watcher's rollback).
+    if (opts.advisoryAwaitingFirstCheck?.()) {
+        log("info", "[update] pi npm copy: deferring this cycle — the advisory's first check has not landed yet (#2456)");
+        return;
+    }
+    // #1588-A: same blocklist as the global lane — a rollback-form advisory's
+    // affected range must keep the host channel from pulling the defect in.
+    // Absent predicate = no-op (auto-update-only installs never defer).
+    if (opts.advisoryBlocksVersion?.(latest)) {
+        log("info", `[update] pi npm copy: skipping ${latest} — covered by a critical-bug advisory's affected range (#1588); retrying next cycle`);
         return;
     }
     // #3619: same policy gate as the other lanes. pi's owner channel
