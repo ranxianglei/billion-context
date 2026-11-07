@@ -1,4 +1,4 @@
-import { assignRefs, BLOCKED_REF, highestUsedIndex, indexToRef } from "./refs.js";
+import { assignRefs, BLOCKED_REF, highestUsedIndex, indexToRef, refToIndex } from "./refs.js";
 import { remintCoveredLiveIds } from "./instance-reid.js";
 import { prune } from "./prune.js";
 import { syncBlocks } from "./sync.js";
@@ -1144,23 +1144,55 @@ function createStampTimestampsNode(enabled: boolean): PipelineNode {
     const stamps = { ...(io.state.tsStamps ?? {}) };
     const knownIds = io.state.messageRefs.byRaw;
     let changed = false;
+    // #5608-C: the time-attribute visibility high-water mark is written EXACTLY
+    // once — the moment this session first runs the timestamp pipeline — to the
+    // PRE-PASS highest ref index. Refs minted afterwards exceed it structurally
+    // (assign-refs continues from highest+1); older refs stay excluded until an
+    // edit/fold re-mints them onto a higher seat, whose tag bytes already change
+    // with the new number (the attribute then costs zero extra).
+    // Consequence: flipping #4313 on mid-session (or the default off→on upgrade)
+    // costs ZERO prefix bytes, and a restart never re-opens the window.
+    const hwmFresh = io.state.timestampsHighWaterRefSeq === undefined;
+    const hwm = hwmFresh
+      ? highestUsedIndex(io.state.messageRefs)
+      : (io.state.timestampsHighWaterRefSeq as number);
+    // #5608-B: the host arms this one-shot from a fresh-child-from-parent path.
+    const suppressed = io.state.suppressMintingOnce === true;
     const messages = io.messages.map((m) => {
       if (!m.id || m.id.startsWith(RETRIEVED_ID_PREFIX)) return m;
       const stamped = stamps[m.id];
       if (stamped !== undefined) {
         if (m.ts === stamped) return m;
+        // Attached earlier (persisted before the #5608-C gate existed): keep the
+        // provider-cached bytes verbatim — stability beats retrospective gating.
+        // Unattached: render the attribute only for ELIGIBLE current refs (minted
+        // after the feature became effective for this session).
+        const cur = knownIds[m.id];
+        const seq = cur === undefined ? null : refToIndex(cur);
+        if (seq === null || seq <= hwm) return m;
         changed = true;
         return { ...m, ts: stamped };
       }
       const carried = typeof m.ts === "number" ? m.ts : undefined;
-      const ts = carried ?? (knownIds[m.id] === undefined ? Date.now() : undefined);
+      // #5608-B: while the host arm is set (a FRESH-state child just inherited
+      // a parent's history — resume adoption / fork clone), NEVER mint
+      // Date.now(): those ids' real times are unknown, and fabricating
+      // "today" for old messages is a lie (spec §5; #5608-A display tier).
+      // Carried values still win; everything else stays honest NULL.
+      const ts =
+        carried ??
+        (!suppressed && knownIds[m.id] === undefined ? Date.now() : undefined);
       if (ts === undefined) return m;
       stamps[m.id] = ts;
       changed = true;
       return { ...m, ts };
     });
-    if (!changed) return io;
-    return { ...io, messages, state: { ...io.state, tsStamps: stamps } };
+    if (!changed && !hwmFresh && !suppressed) return io;
+    const nextState = { ...io.state, tsStamps: stamps, timestampsHighWaterRefSeq: hwm as number };
+    // Self-clear without a phantom key: omitting the property entirely keeps
+    // key-sensitive state comparisons (and JSON shape) clean.
+    if (suppressed) delete nextState.suppressMintingOnce;
+    return { ...io, messages, state: nextState };
   },
   };
 }
@@ -2476,6 +2508,17 @@ function cloneState(state: CompressionState): CompressionState {
     // too — same contract as the sync clone (kernel/src/sync.ts); dropping it
     // re-arms the restamp on every applyCompression.
     refLedgerAligned: state.refLedgerAligned,
+    // #5608-C/#5608-B: the visibility mark and the honest-NULL arm ride the
+    // fold clone with the same contract — losing either re-opens its window.
+    // Conditional spread: legacy states carry neither key and must stay
+    // key-free (an explicit undefined would materialize a phantom key that
+    // every state-shape / state-key digest compares).
+    ...(state.timestampsHighWaterRefSeq !== undefined
+        ? { timestampsHighWaterRefSeq: state.timestampsHighWaterRefSeq }
+        : {}),
+    ...(state.suppressMintingOnce !== undefined
+        ? { suppressMintingOnce: state.suppressMintingOnce }
+        : {}),
   };
 }
 
