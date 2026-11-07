@@ -15,8 +15,7 @@ import assert from "node:assert/strict";
 
 import { MSG_IDS_BODY_FIELD, incomingMsgIdsOf, validateMsgIds } from "../src/msgid-pin.js";
 import { collectRequestIds } from "../src/request-membership.js";
-import { pfCaptureIds, pfLearnStamp, pfRequestHeaders } from "../src/agent/pf-channel.js";
-import { PF_SLOT_UNKNOWN } from "../src/server/fastpath.js";
+import { PF_SLOT_UNKNOWN, pfCaptureIds, pfLearnStamp, pfRequestHeaders } from "../src/agent/pf-channel.js";
 import { _hostMsgIdsOfForTest, _pfSlotIdsOfForTest } from "../src/agent/dsh-native.js";
 import { _screenMsgIdsForTest } from "../src/agent/incremental-client.js";
 import { _parseTailIdsForTest } from "../src/server/fastpath.js";
@@ -44,8 +43,7 @@ const CF_CASE: EntryCase = { name: "unicode format U+200B (\\p{C} only)", value:
 const DUP_ALONE: EntryCase = { name: "duplicate / alone", value: [GOOD, GOOD], inboundPasses: true }; // lenient-only again: no dedupe gate
 const DUP_MIXED: EntryCase = { name: "duplicate / mixed", value: [GOOD, GOOD2, GOOD], inboundPasses: true };
 
-const LONG_LIST = Array.from({ length: 2049 }, (_, i) => `bulk_${i}_abcdef00`); // below v6 pf-channel MAX_IDS (16384); the strict validators have NO cap today
-const OVER_CAP_LIST = Array.from({ length: 16_385 }, (_, i) => `cap_${i}_abcdef00`); // > v6 pf-channel MAX_IDS (16384, #5643 F1)
+const LONG_LIST = Array.from({ length: 2049 }, (_, i) => `bulk_${i}_abcdef00`); // > pf-channel MAX_IDS (2048); the strict validators have NO cap today
 
 function objForm(values: unknown[]): Array<{ id?: unknown }> {
     return values.map((v) => ({ id: v }));
@@ -111,13 +109,10 @@ test("structural cases: non-array / empty / width mismatch / bulk cap (#5826 par
     assert.equal(_parseTailIdsForTest(""), null, "parseTailIds empty string -> no segments");
 });
 
-test("per-slot screening: one hole voids the WHOLE list (v6 F2); lenient evidence stays lenient (#5826 parity)", () => {
-    // Re-pin 2026-11-07 after master merge: v6 F2 ruling (owner 2026-11-04,
-    // #5652) supersedes "? travels" — any id-less/invalid slot anywhere makes
-    // the collector return undefined; "?" never reaches the wire.
-    assert.equal(_pfSlotIdsOfForTest(objForm([GOOD, "a b", GOOD2])), undefined, "pfSlotIdsOf mixed: one hole voids the whole list (v6 F2)");
-    assert.equal(_pfSlotIdsOfForTest(objForm(["a b"])), undefined, "pfSlotIdsOf all-bad: absent, not a ?-slice");
-    assert.deepEqual(_pfSlotIdsOfForTest(objForm([GOOD, GOOD2])), [GOOD, GOOD2], "pfSlotIdsOf all-valid passes through");
+test("per-slot screening: bad slots ride ?, never poison neighbours (#5826 parity)", () => {
+    // pfSlotIdsOf (dsh watermark capture): position preserved, bad -> "?".
+    assert.deepEqual(_pfSlotIdsOfForTest(objForm([GOOD, "a b", GOOD2])), [GOOD, PF_SLOT_UNKNOWN, GOOD2], "pfSlotIdsOf mixed");
+    assert.deepEqual(_pfSlotIdsOfForTest(objForm(["a b"])), [PF_SLOT_UNKNOWN], "pfSlotIdsOf all-bad still returns the slot list (channel decides absence)");
     // NOTE: duplicates DO travel here — dedupe lives in pfCaptureIds (asserted next).
 
     // collectRequestIds (settlement evidence): LENOIENT by design — skips
@@ -142,17 +137,13 @@ function pfRoundTrip(t: number, capture: unknown): Record<string, string> {
     return pfRequestHeaders({ "x-bili-plugin-conversation": sid });
 }
 
-test("pf-channel end-to-end handshake: v6 F1 fixed tail window + F2 holes clear the table (#5826 parity)", () => {
-    // Re-pin 2026-11-07 after master merge: v6 F1 ruling (owner 2026-11-04,
-    // #5652) emits ONLY the last PF_TAIL_WINDOW (64) captured ids — no slicing
-    // at learned K; v6 F2 makes any hole/duplicate clear the whole table.
-    assert.deepEqual(pfRoundTrip(3, [GOOD, "mid", GOOD2]), { "x-bili-pf-count": "3", "x-bili-pf-tail-ids": `${GOOD},mid,${GOOD2}` }, "all-known list rides whole (3 < window 64; no K-slice in v6)");
-    assert.deepEqual(pfRoundTrip(3, [GOOD, "a b", GOOD2]), { "x-bili-pf-count": "3" }, "bad middle slot clears the WHOLE table (v6 F2) -> count-only");
-    assert.deepEqual(pfRoundTrip(3, [GOOD, GOOD2, "\u200bcf"]), { "x-bili-pf-count": "3" }, "\\p{C} slot clears the table (v6 F2)");
+test("pf-channel end-to-end screening via the public handshake API (#5826 parity)", () => {
+    assert.deepEqual(pfRoundTrip(3, [GOOD, "mid", GOOD2]), { "x-bili-pf-count": "3", "x-bili-pf-tail-ids": GOOD2 }, "all-known list: tail window slices at learned K");
+    assert.deepEqual(pfRoundTrip(3, [GOOD, "a b", GOOD2]), { "x-bili-pf-count": "3", "x-bili-pf-tail-ids": GOOD2 }, "bad middle slot rides ?; window tail intact");
+    assert.deepEqual(pfRoundTrip(3, [GOOD, GOOD2, "\u200bcf"]), { "x-bili-pf-count": "3", "x-bili-pf-tail-ids": "%3F" }, "\\p{C} slot screens to ? (emitted percent-encoded)");
     assert.deepEqual(pfRoundTrip(3, ["a b", "c d"]), { "x-bili-pf-count": "3" }, "nothing identifiable -> count-only");
-    assert.deepEqual(pfRoundTrip(2, [GOOD, GOOD]), { "x-bili-pf-count": "2" }, "duplicate clears the table (dedupe gate in pfCaptureIds)");
-    assert.deepEqual(pfRoundTrip(3, LONG_LIST), { "x-bili-pf-count": "3", "x-bili-pf-tail-ids": LONG_LIST.slice(-64).map(encodeURIComponent).join(",") }, "bulk list captured under v6 MAX_IDS (16384); emit bounded to the 64-id window");
-    assert.deepEqual(pfRoundTrip(3, OVER_CAP_LIST), { "x-bili-pf-count": "3" }, "MAX_IDS (16384) cap degrades to count-only");
+    assert.deepEqual(pfRoundTrip(2, [GOOD, GOOD]), { "x-bili-pf-count": "2", "x-bili-pf-tail-ids": "%3F" }, "duplicate second slot screens to ?");
+    assert.deepEqual(pfRoundTrip(3, LONG_LIST), { "x-bili-pf-count": "3" }, "MAX_IDS (2048) cap degrades to count-only");
     assert.deepEqual(pfRoundTrip(3, "not-an-array"), { "x-bili-pf-count": "3" }, "failed resolution clears stored list (honest absence beats stale)");
 });
 
