@@ -1985,8 +1985,10 @@ test("#4237: contextTab=false hides the Context tab; absent field fails open to 
         clearTimeout,
     });
     const hidden = await mountClient({ ...baseExtra(), __BILI__: { origin: "http://127.0.0.1:8787", contextTab: false } });
-    // #4254: the shell.overlay availability pill is NOT user-hidable — it rides along
-    // even when the Context tab is hidden (it is an error surface, not a preference).
+    // #4254/#5701: the shell.overlay pill's REGISTRATION is NOT user-hidable — it rides
+    // along even when the Context tab is hidden (it is an error surface, not a
+    // preference). #5701 makes the rendered banner dismissible via ✕ until the failing
+    // set changes; the slot itself stays registered either way.
     assert.deepEqual(hidden.slotsOrder, ["settings.section", "plugins.bundle.config", "shell.overlay"]);
     assert.equal(hidden.optionsBySlot.size, 3);
     assert.ok(!hidden.optionsBySlot.has("conversation.view"), "hidden tab registers nothing");
@@ -2145,4 +2147,74 @@ test("#4254: shell.overlay upstream-unavailable pill polls /__bili/upstreams, re
     assert.ok(!gt.includes("no-host-entry") && !gt.includes("not-an-object"), "malformed entries are dropped");
     assert.ok(gt.includes("1 个上游不可用"), "header counts only surviving rows");
     g.runCleanups();
+});
+
+test("#5701: shell.overlay upstream pill — softened chrome; ✕ dismisses until the failing set changes", async () => {
+    const ORIGIN = "http://127.0.0.1:8787";
+    const intervals: Array<{ id: number; delay: number; fn: () => void }> = [];
+    let nextId = 1;
+    const fakeSetInterval = ((fn: () => void, delay?: number): unknown => {
+        const id = nextId++;
+        intervals.push({ id, delay: delay ?? 0, fn });
+        return id;
+    }) as unknown as typeof setInterval;
+    const fakeClearInterval = ((id: unknown): void => {
+        const i = intervals.findIndex((p) => p.id === id);
+        if (i >= 0) intervals.splice(i, 1);
+    }) as unknown as typeof clearInterval;
+    const textOf = (node: unknown): string => {
+        const out: string[] = [];
+        collectText(node, out);
+        return out.join(" ");
+    };
+    let served: unknown = [{ host: "127.0.0.1:7864", kind: "connect-refused", code: "ECONNREFUSED", count: 9, circuit: { state: "open", nextProbeInMs: 60000 } }];
+    const m = await mountClient({
+        __BILI__: { origin: ORIGIN },
+        fetch: async (url: string) => {
+            const u = String(url);
+            if (u.endsWith("/bili/origin")) return { ok: true, json: async () => ({ origin: ORIGIN }) };
+            if (u.endsWith("/__bili/upstreams")) return { ok: true, json: async () => ({ upstreams: served }) };
+            throw new Error(`unexpected fetch: ${u}`);
+        },
+        setTimeout,
+        clearTimeout,
+        setInterval: fakeSetInterval,
+        clearInterval: fakeClearInterval,
+    }, "shell.overlay");
+    m.resetHooks();
+    m.component();
+    await tick();
+    const tree = m.component() as ElementNode;
+    assert.ok(textOf(tree).includes("127.0.0.1:7864"), "banner renders before dismissal");
+    // The old hard-saturation chrome is gone (#5701): softer border/background,
+    // larger radius and padding, a subtle shadow — text color stays inherited.
+    assert.ok(tree.props !== null, "banner root carries props");
+    const st = tree.props.style as Record<string, unknown>;
+    assert.equal(st.borderRadius, 10, "radius raised to 10px");
+    assert.equal(st.padding, "10px 14px", "padding per #5701");
+    assert.ok(String(st.border).includes("rgba(217,63,11,0.35)"), "border saturation lowered from 0.5");
+    assert.ok(String(st.background).includes("rgba(217,63,11,0.08)"), "background saturation lowered from 0.1");
+    assert.ok(st.boxShadow !== undefined, "subtle shadow present");
+    // ✕ dismisses ...
+    const btn = findButton(tree);
+    assert.ok(btn !== undefined, "the dismiss control exists");
+    assert.ok(btn.props !== null, "dismiss control carries props");
+    (btn.props.onClick as () => void)();
+    assert.equal(m.component(), null, "...the identical failing set renders null");
+    // ...and count/ETA churn of that same set never re-shows it.
+    served = [{ host: "127.0.0.1:7864", kind: "connect-refused", code: "ECONNREFUSED", count: 10, circuit: { state: "open", nextProbeInMs: 30000 } }];
+    intervals[0].fn();
+    await tick();
+    assert.equal(m.component(), null, "count/ETA churn of the dismissed set stays hidden");
+    // A CHANGED failing set re-surfaces the banner.
+    served = [
+        { host: "127.0.0.1:7864", kind: "connect-refused", code: "ECONNREFUSED", count: 10, circuit: null },
+        { host: "10.0.0.5:9000", kind: "connect-timeout", count: 1, circuit: null },
+    ];
+    intervals[0].fn();
+    await tick();
+    const t2 = textOf(m.component());
+    assert.ok(t2.includes("10.0.0.5:9000") && t2.includes("2 个上游不可用"), "changed failing set re-opens the banner");
+    m.runCleanups();
+    assert.deepEqual(intervals, [], "unmount cancels the poll loop");
 });
