@@ -84,5 +84,5 @@ const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" 
   <text x="30" y="840" class="stage">三个结构性痛点 → 一一对应的解决锚点</text>
   ${p}
 </svg>`;
-fs.writeFileSync('arch-mapping.svg', svg);
+fs.writeFileSync('arch-migration.svg', svg);
 console.log('written', svg.length, 'bytes; canvas', W + 'x' + H, '; last content y ≈ 1002');
