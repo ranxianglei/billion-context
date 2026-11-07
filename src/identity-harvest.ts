@@ -7,10 +7,12 @@
 // and the existing consume path — no consumer may read client storage itself.
 // Adapters are self-contained config+reader modules; the registry owns:
 //
-//   1. the kill/scope switch (env BILI_IDENTITY_HARVEST) AND the install-level
-//      rollout gate (pluginLaneServerHistory — the flag every id-pinning
-//      consumer already honors, so harvested ids only flow where they will be
-//      pinned/stamped, never orphaned);
+//   1. the kill/scope switch (env BILI_IDENTITY_HARVEST) OR the install-level
+//      rollout key (identityChannelHarvest, #5825 owner ruling 2026-11-07:
+//      the seam has its OWN cohort ramp so turning one's own install on via
+//      env never requires bumping an unrelated rollout — pluginLaneServerHistory
+//      governs where stamped ids get pinned to rows, which this seam FEEDS);
+//      either may allow a harvest, neither defaulting on;
 //   2. the loopback-only trust boundary (a remote caller may never trigger a
 //      local-file read keyed on headers it controls — same boundary as the
 //      #3248 capabilities probe and the loopback-gated turn path);
@@ -77,9 +79,9 @@ export function registerIdentitySource(source: IdentitySource): void {
     if (!sources.some((s) => s.id === source.id)) sources.push(source);
 }
 
-/** enabled(): "" unset → OFF (wiring ships inert until opted in); "1"/"all" →
- *  every registered source; comma list → scope to named sources. Independent
- *  of the rollout gate: BOTH must allow for a harvest to run. */
+/** enabled(): "" unset → null (no env scope); "1"/"all" → every registered
+ *  source; comma list → scope to named sources. EITHER this switch or the
+ *  identityChannelHarvest rollout may enable harvesting (harvestIdentity). */
 function enabledSources(): Set<string> | null {
     const raw = process.env[ENV] ?? "";
     const v = raw.trim();
@@ -135,9 +137,14 @@ type HarvestResult = { ids: readonly string[]; sourceId: string } | null;
  *  harvesting fills only the absent case. */
 export function harvestIdentity(ctx: IdentityHarvestCtx): HarvestResult {
     if (ctx.expectedLen <= 0) return null;
-    if (!featureEnabled("pluginLaneServerHistory")) return null; // pinned consumers are off → don't touch disk
-    const allowed = enabledSources();
-    if (allowed === null || allowed.size === 0) return null;
+    let allowed = enabledSources();
+    if (allowed === null) {
+        // No per-install env switch: only the cohort-wide rollout key may act
+        // (defaulting OFF), and without an env scope it covers all sources.
+        if (!featureEnabled("identityChannelHarvest")) return null;
+        allowed = new Set(sources.map((s) => s.id));
+    }
+    if (allowed.size === 0) return null;
     if (!isLoopbackAddress(ctx.remoteAddress)) return null; // trust boundary
     for (const source of sources) {
         if (!allowed.has(source.id)) continue;
@@ -177,7 +184,7 @@ export function harvestIdentity(ctx: IdentityHarvestCtx): HarvestResult {
  * and codebuddy (`$CODEBUDDY_CONFIG_DIR/projects/<escaped-cwd>/<conversation-id>.jsonl`,
  * filename == conversation id, measured 2.181.0) share this prober. Returns
  * real files whose realpath stays inside their projects root. */
-export function findProjectJsonlFiles(configDirs: string[], fileBaseName: string): string[] {
+export function findProjectJsonlFiles(configDirs: string[], fileBaseName: string, subdir?: string): string[] {
     const found: string[] = [];
     for (const dir of configDirs) {
         // Config roots may be passed as either `<root>` or `<root>/projects`.
@@ -194,7 +201,7 @@ export function findProjectJsonlFiles(configDirs: string[], fileBaseName: string
         for (const entry of entries) {
             if (!entry.isDirectory()) continue;
             if (++probed > MAX_PROJECT_DIRS) break;
-            const candidate = path.join(root, entry.name, `${fileBaseName}.jsonl`);
+            const candidate = subdir ? path.join(root, entry.name, subdir, `${fileBaseName}.jsonl`) : path.join(root, entry.name, `${fileBaseName}.jsonl`);
             try {
                 const real = fs.realpathSync(candidate);
                 if (!real.startsWith(root + path.sep)) continue; // symlink escape

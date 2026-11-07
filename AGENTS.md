@@ -62,7 +62,7 @@ The full file-by-file map lives in [reference/architecture.md](reference/archite
 
 ### #18 — 身份信道接线：所有车道接进同一采集缝，消费者永不直读客户端存储 (#5825)
 
-身份信号的来源只有两类：**宿主写入**（msgid body 字段 / 轮次信封 `msgIds` / pf 头，按各自 wire）与**自包含采集器**（回环读客户端本地转录/SQLite，`src/identity-harvest.ts` 注册表 + `src/identity-<client>.ts` 适配器）。消费者（#5719 归属档、pin/行链路、membership、水位）**只**从统一缝取数：每请求在 handle 入口对采集注册表取一次快照，结果进入与宿主盖章 id **完全相同**的下游路径——绝不新增任何"逐调用点单独取数"。新车道 = 新适配器文件 + barrel 一行登记 + 文档一行；不改消费者、不复制客户端存储格式。适配器自包含（不 import 其他适配器或服务端内部件）、整轮退化契约（任一环节不判定 → 该轮整体回退接线前路径，绝不做部分映射）、三重门控（rollout × env × 仅回环来源）。已接：claude-code / codebuddy / mcode；其余车道的状态表与信任边界见 docs/identity-channels.md。
+身份信号的来源只有三类：**宿主写入**（msgid body 字段 / 轮次信封 `msgIds` / pf 头，按各自 wire）；**宿主盖戳头**（opencode V2 在自己的 hook 里从当轮自己的结构化消息铸 `x-bili-msg-ids` 请求头——同一事件取值零竞态，任一变体缺 id 即整份作废）与**自包含采集器**（回环读客户端本地转录/SQLite，`src/identity-harvest.ts` 注册表 + `src/identity-<client>.ts` 适配器）。消费者（#5719 归属档、pin/行链路、membership、水位）**只**从统一缝取数：每请求在 handle 入口按「body 字段 > 盖戳头 > 采集」优先级取一次快照，结果进入与宿主盖章 id **完全相同**的下游路径（两条 wire 均已剥除内部字段并在灰度内钉住行身份）——绝不新增任何"逐调用点单独取数"。新车道 = 新适配器文件 + barrel 一行登记 + 文档一行；不改消费者、不复制客户端存储格式。适配器自包含（不 import 其他适配器或服务端内部件）、整轮退化契约（任一环节不判定 → 该轮整体回退接线前路径，绝不做部分映射）、采集使能双门（env `BILI_IDENTITY_HARVEST` 或灰度键 `rollout.features.identityChannelHarvest` 任其一即可、均默认关 × 仅回环来源）。已接：claude-code / codebuddy / mcode / goose / qwen-code + opencode V2 盖戳头；crush/gemini-cli/hermes/iflow 四条按审计结论闭合备忘，其余车道状态表与信任边界见 docs/identity-channels.md。
 
 ### Install-Lane & Update-Ownership Contract (#1196)
 

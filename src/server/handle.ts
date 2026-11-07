@@ -75,7 +75,7 @@ import { artifactSeedHit, detectAcpArtifacts } from "./chain-artifacts.js";
 import { piSubagentChannelFallback } from "./pi-subagent-channel.js";
 import { FORCE_TEXT_PROTOCOL } from "./inject.js";
 import { prepareAnthropic } from "./prepare-anthropic.js";
-import { MSG_IDS_BODY_FIELD, incomingMsgIdsOf } from "../msgid-pin.js";
+import { MSG_IDS_BODY_FIELD, incomingMsgIdsOf, incomingMsgIdsHeader } from "../msgid-pin.js";
 import { harvestIdentity } from "../identity-harvest.js";
 import "../identity-sources.js"; // #5825: register every harvested lane (side effect)
 import { prepareOpenai } from "./prepare-openai.js";
@@ -1149,18 +1149,21 @@ async function handleRequest(
         // raw lane instead of forking a zero-state |sub: child.
         // undefined = absent → exactly the pre-change path.
         const stampedInboundMsgIds = incomingMsgIdsOf(parsed);
-        // #5825: loopback identity HARVEST fills only the absent case. A
-        // loopback client without an explicit body channel (claude-code,
-        // codebuddy) gets its ids aligned 1:1 from its own local transcript;
-        // the registry enforces rollout gate + env switch + loopback boundary
-        // + canonical validation, whole-turn-degrade on any doubt. Stamped
-        // onto the parsed body ONLY on the anthropic wire — prepare-anthropic
-        // already consumes that field and strips it before upstream (#4491);
-        // other wires never had a body-field consume+strip path, so there the
-        // harvested ids feed the resolve rung / membership below via this
-        // local alone and nothing extra is forwarded.
-        let inboundMsgIds = stampedInboundMsgIds;
-        if (stampedInboundMsgIds === undefined && zcodeParentIdentity?.clientProvided) {
+        // #5825 identity-channel sources fill only the absent case. Precedence:
+        // (1) body-field stamps (dsh/opencode/pi host rewrites) — always win;
+        // (2) the STAMPED HEADER channel (`x-bili-msg-ids`) for hosts that
+        // cannot rewrite the body they send — opencode V2 reads ids off its
+        // own structured turn event, comma-joined; one missing/foreign id
+        // drops the whole header client-side, so what arrives here already
+        // passed light validation in incomingMsgIdsHeader;
+        // (3) loopback identity HARVEST from the client's local transcript/
+        // sqlite — registry enforces rollout-or-env gate + loopback boundary
+        // + canonical validation, whole-turn-degrade on any doubt.
+        const headerStampedMsgIds = stampedInboundMsgIds === undefined
+            ? incomingMsgIdsHeader(req.headers["x-bili-msg-ids"])
+            : undefined;
+        let inboundMsgIds = stampedInboundMsgIds ?? headerStampedMsgIds;
+        if (inboundMsgIds === undefined && zcodeParentIdentity?.clientProvided) {
             const openaiLike = protocol === "openai" || protocol === "anthropic" ? (parsed as { messages?: unknown }).messages : undefined;
             if (Array.isArray(openaiLike) && openaiLike.length > 0) {
                 const messageRoles = (openaiLike as Array<{ role?: unknown }>).map((m) => (typeof m?.role === "string" ? m.role : ""));
@@ -1173,11 +1176,19 @@ async function handleRequest(
                 });
                 if (harvested !== null) {
                     inboundMsgIds = [...harvested.ids];
-                    if (protocol === "anthropic") {
-                        (parsed as Record<string, unknown>)[MSG_IDS_BODY_FIELD] = inboundMsgIds;
-                    }
                 }
             }
+        }
+        // The pin-consumers are prepare-anthropic AND prepare-openai (#5825
+        // parity): both read + strip MSG_IDS_BODY_FIELD unconditionally before
+        // it can reach the real upstream, then pin behind the rollout gate.
+        // So a non-body source (header / harvest) stamps the parsed body on
+        // BOTH wires now — nothing extra is ever forwarded either way;
+        // response-ish protocols keep feeding the resolve rung below via this
+        // local alone.
+        if (stampedInboundMsgIds === undefined && inboundMsgIds !== undefined &&
+            (protocol === "openai" || protocol === "anthropic")) {
+            (parsed as Record<string, unknown>)[MSG_IDS_BODY_FIELD] = [...inboundMsgIds];
         }
         // #5719: the RECORDED side of the msgid identity rung lives in the
         // UNIFIED STORE — stamped requests pin these very ids onto canonical

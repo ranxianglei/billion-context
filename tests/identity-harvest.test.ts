@@ -14,12 +14,16 @@ import test from "node:test";
 import { HARVEST_TAIL_BYTES, findProjectJsonlFiles, headerFirst, harvestIdentity, readJsonlTail, registerIdentitySource, resetIdentityHarvestForTest, type IdentityHarvestCtx } from "../src/identity-harvest.js";
 import { claudeVisibleRows, registerClaudeIdentitySource } from "../src/identity-claude.js";
 import { codebuddyVisibleRows, registerCodebuddyIdentitySource } from "../src/identity-codebuddy.js";
+import { registerGooseIdentitySource } from "../src/identity-goose.js";
 import { registerMcodeIdentitySource } from "../src/identity-mcode.js";
+import { registerQwenIdentitySource } from "../src/identity-qwen.js";
 import { conversationHeaderSource } from "../src/session-id.js";
 import { openSqliteDatabase } from "../src/storage/driver.js";
 
 const ENV = "BILI_IDENTITY_HARVEST";
-const ROLLOUT_ENV = "BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY";
+// #5825 owner ruling: the seam has its OWN cohort key — decoupled from
+// pluginLaneServerHistory (that one governs where stamped ids get PINNED).
+const ROLLOUT_ENV = "BILI_ROLLOUT_IDENTITY_CHANNEL_HARVEST";
 
 function withEnv(vars: Record<string, string | undefined>, fn: () => void): void {
     const saved: Record<string, string | undefined> = {};
@@ -42,13 +46,25 @@ function ctx(over: Partial<IdentityHarvestCtx> = {}): IdentityHarvestCtx {
     return { sessionId: "s-1", expectedLen: 2, remoteAddress: "127.0.0.1", headers: {}, ...over };
 }
 
-test("harvest registry: rollout gate AND env switch are both required", () => {
+test("harvest registry: env switch and cohort rollout are INDEPENDENT enablers", () => {
     resetIdentityHarvestForTest();
-    withEnv({ [ENV]: "all", [ROLLOUT_ENV]: undefined }, () => {
-        assert.equal(harvestIdentity(ctx()), null, "env on but rollout off → inert");
+    let snapshotCalls = 0;
+    registerIdentitySource({ id: "gate", matches: () => true, snapshot: () => { snapshotCalls++; return ["a-1", "a-2"]; } });
+    // Nothing enabled at all → inert, no disk access.
+    withEnv({ [ENV]: undefined, [ROLLOUT_ENV]: undefined }, () => {
+        assert.equal(harvestIdentity(ctx()), null, "no env, no rollout → inert (ships off by default)");
+        assert.equal(snapshotCalls, 0);
     });
+    // Per-install env switch alone suffices (the owner-facing knob) and
+    // scopes to the named source.
+    withEnv({ [ENV]: "gate", [ROLLOUT_ENV]: undefined }, () => {
+        assert.deepEqual(harvestIdentity(ctx()), { ids: ["a-1", "a-2"], sourceId: "gate" });
+        assert.equal(snapshotCalls, 1);
+    });
+    // Cohort-wide rollout key alone enables, without an env scope → all sources.
     withEnv({ [ENV]: undefined, [ROLLOUT_ENV]: "1" }, () => {
-        assert.equal(harvestIdentity(ctx()), null, "rollout on but env unset → inert (ships off by default)");
+        assert.deepEqual(harvestIdentity(ctx()), { ids: ["a-1", "a-2"], sourceId: "gate" });
+        assert.equal(snapshotCalls, 2);
     });
 });
 
@@ -232,6 +248,90 @@ test("mcode adapter: sqlite harvest per-turn snapshot, count parity + role spot-
     });
 });
 
+/* ---------------- goose adapter ---------------- */
+
+test("goose adapter: sqlite harvest per-turn snapshot, parity + join gate", () => {
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "ih-goose-"));
+    const dbFile = path.join(dataDir, "data", "sessions.db");
+    fs.mkdirSync(path.dirname(dbFile), { recursive: true });
+    const SID = "20261107_1";
+    const w = openSqliteDatabase(dbFile);
+    try {
+        w.db.exec("CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, message_id TEXT, session_id TEXT NOT NULL, role TEXT, content_json TEXT, created_timestamp INTEGER)");
+        for (const [msgId, role] of [["msg_g1", "user"], ["msg_g2", "assistant"], ["msg_g3", "tool"], ["msg_g4", "user"]]) {
+            w.db.prepare("INSERT INTO messages (message_id, session_id, role, created_timestamp) VALUES (?, ?, ?, ?)").run(msgId, SID, role, 1);
+        }
+        // a foreign session must never leak in; NULL message_id rows are skipped
+        w.db.prepare("INSERT INTO messages (message_id, session_id, role) VALUES (?, ?, ?)").run("other", "20261107_9", "user");
+        w.db.prepare("INSERT INTO messages (message_id, session_id, role) VALUES (?, ?, ?)").run(null, SID, "user");
+    } finally {
+        w.db.close();
+    }
+    resetIdentityHarvestForTest();
+    registerGooseIdentitySource();
+    const base = { "agent-session-id": SID };
+    withEnv({ GOOSE_PATH_ROOT: dataDir, [ENV]: "goose", [ROLLOUT_ENV]: "1" }, () => {
+        const ok = harvestIdentity(ctx({ sessionId: SID, expectedLen: 4, headers: base, messageRoles: ["user", "assistant", "tool", "user"] }));
+        assert.deepEqual(ok?.ids, ["msg_g1", "msg_g2", "msg_g3", "msg_g4"]);
+        // wire claims assistant where storage says tool → whole turn degrades
+        assert.equal(harvestIdentity(ctx({ sessionId: SID, expectedLen: 4, headers: base, messageRoles: ["user", "assistant", "assistant", "user"] })), null);
+        // count mismatch → null
+        assert.equal(harvestIdentity(ctx({ sessionId: SID, expectedLen: 5, headers: base })), null);
+        // join key absent → source never matched
+        assert.equal(harvestIdentity(ctx({ sessionId: SID, expectedLen: 4, headers: {} })), null);
+    });
+});
+
+/* ---------------- qwen adapter ---------------- */
+
+function writeQwenTranscript(root: string, proj: string, sid: string, lines: unknown[]): void {
+    const dir = path.join(root, "projects", proj, "chats");
+    fs.mkdirSync(dir, { recursive: true });
+    const text = lines
+        .map((l) => {
+            // raw strings prefixed with RAW are written verbatim (torn-line fixture)
+            return typeof l === "string" && l.startsWith("RAW:") ? l.slice(4) : JSON.stringify(l);
+        })
+        .join("\n") + "\n";
+    fs.writeFileSync(path.join(dir, `${sid}.jsonl`), text);
+}
+
+test("qwen adapter: chats/<sid>.jsonl harvest, opt-in join + exclusions", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "ih-qwen-"));
+    const SID = "0a1b2c3d-0000-4000-8000-0000000000aa";
+    writeQwenTranscript(root, "projA", SID, [
+        { uuid: "a1a2a3a4-b5b6-4c7d-8e9f-a0b1c2d3e4f5", type: "user" },
+        { uuid: "tool-x", type: "tool_result" },
+        { uuid: "b7e6f5a4-0000-4000-8000-000000000002", type: "assistant" },
+        { uuid: "c8f7a6b5-0000-4000-8000-000000000003", type: "system", subtype: "chat_compression" },
+        { uuid: "d9a8e7c6-0000-4000-8000-000000000004", type: "user", isSidechain: true },
+        { uuid: "e0e1e2e3-4000-5000-6000-a0b1c2d3e4f6", type: "assistant" },
+        "RAW:{\"torn\": true",
+    ]);
+    resetIdentityHarvestForTest();
+    registerQwenIdentitySource();
+    const base = { "x-opencode-session": SID };
+    withEnv({ QWEN_HOME: root, [ENV]: "qwen", [ROLLOUT_ENV]: "1" }, () => {
+        const ok = harvestIdentity(ctx({ sessionId: SID, expectedLen: 3, headers: base, messageRoles: ["user", "assistant", "assistant"] }));
+        assert.deepEqual(ok?.ids, [
+            "a1a2a3a4-b5b6-4c7d-8e9f-a0b1c2d3e4f5",
+            "b7e6f5a4-0000-4000-8000-000000000002",
+            "e0e1e2e3-4000-5000-6000-a0b1c2d3e4f6",
+        ]);
+        // the documented join header is the whole gate — absent → no disk probe
+        assert.equal(harvestIdentity(ctx({ sessionId: SID, expectedLen: 3, headers: {} })), null);
+        // value must match the recognized session exactly
+        assert.equal(harvestIdentity(ctx({ sessionId: "other-sid", expectedLen: 3, headers: { "x-opencode-session": "other-sid" } })), null);
+    });
+    // ambiguous transcript layout (same sid under two project dirs) → none
+    writeQwenTranscript(root, "projB", SID, [{ uuid: "f1f2f3f4-4000-5000-6000-a0b1c2d3e4f7", type: "user" }]);
+    resetIdentityHarvestForTest();
+    registerQwenIdentitySource();
+    withEnv({ QWEN_HOME: root, [ENV]: "qwen", [ROLLOUT_ENV]: "1" }, () => {
+        assert.equal(harvestIdentity(ctx({ sessionId: SID, expectedLen: 3, headers: base })), null);
+    });
+});
+
 /* ---------------- recognition merge ---------------- */
 
 test("session recognition: x-conversation-id sits below client-specific + affinity tier, above bare generics", () => {
@@ -244,4 +344,7 @@ test("session recognition: x-conversation-id sits below client-specific + affini
     assert.equal(src({ "x-conversation-id": "cb-1", "session_id": "gen" })?.value, "cb-1");
     // value travels trimmed
     assert.equal(src({ "x-conversation-id": "  cb-2  " })?.value, "cb-2");
+    // goose's client-specific header rides in the specific tier
+    assert.equal(src({ "agent-session-id": "20261107_1", "session_id": "gen" })?.name, "agent-session-id");
+    assert.equal(src({ "x-claude-code-session-id": "cc-1", "agent-session-id": "20261107_1" })?.name, "x-claude-code-session-id");
 });
