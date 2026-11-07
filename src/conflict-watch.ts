@@ -203,10 +203,17 @@ export function formatConflictSection(events: ConflictEvent[], now: number = Dat
     // landing was fully rebased onto (#2372/#2432) — handled, no ongoing risk. Gated to the
     // pure case so mixed ledgers keep their existing tier verbatim.
     const handledNativeOnly = meaningful.length > 0 && meaningful.every((e) => e.kind === "native-compaction");
+    // #5786: a ledger whose every meaningful event is a cross-build id re-mint that
+    // fold-reconcile fully RE-ANCHORED (#4131/#3642) is bili's own recovery — no second
+    // compressor, no compaction boundary, no data loss. Gated to the pure case so mixed
+    // ledgers keep their existing tier verbatim (same discipline as #2912/#2802-review).
+    const churnAdoptOnly = meaningful.length > 0 && meaningful.every((e) => e.kind === "id-churn-adoption");
     const activeConfirmed = confirmed.some((e) => now - e.at <= CONFLICT_ACTIVE_WINDOW_MS);
     lines.push(`COMPRESSION CONFLICTS — ${events.length} event(s) in this session (${active.length} active · ${historical.length} historical; active = within ${CONFLICT_ACTIVE_WINDOW_MS / 86_400_000} days). ${foreignConfirmed || nativePresent
         ? "Two compressors on one conversation (bili + another compression plugin — third-party or bili's own sibling — or client native compaction) double-compress and corrupt message refs:"
-        : "Diagnostic evidence that something outside bili touched this conversation — how strong that evidence is is tiered below:"}`);
+        : churnAdoptOnly
+            ? "Recorded evidence that bili itself re-minted message ids across builds and fully re-anchored them (no second compressor, no data loss):"
+            : "Diagnostic evidence that something outside bili touched this conversation — how strong that evidence is is tiered below:"}`);
     for (const e of events.slice(-10)) {
         lines.push(`  [${fmtTime(e.at)}] ${e.kind} — ${e.detail}`);
     }
@@ -247,6 +254,15 @@ export function formatConflictSection(events: ConflictEvent[], now: number = Dat
         advice = active.length > 0
             ? "The events above are client-native compaction landings bili ALREADY rebased onto (#2372/#2432): each detected checkpoint rebuilt the fold base, so there is no ongoing double-compression risk and nothing to disable. If you did not expect these sessions to auto-compact, review the client's own auto-compaction setting; otherwise clear this ledger — Web UI conflict banner / session page, or POST /__bili/conflicts/clear?session=<id>."
             : "All events above are client-native compaction landings older than 7 days (historical stock) that bili already rebased onto (#2372/#2432): handled at the time, no ongoing risk. Clear this ledger — Web UI conflict banner / session page, or POST /__bili/conflicts/clear?session=<id>.";
+    } else if (churnAdoptOnly) {
+        // #5786: bili's own cross-build id re-mint, fully adopted by fold-reconcile (every
+        // covered id re-anchored, 0 unmatched) with NO compaction boundary marked — the fold
+        // state survived intact. Not a second compressor and not auto-compaction: nothing to
+        // hunt for or disable. Say so plainly instead of routing the user into the
+        // [suspected]-plugin verify-first errand below.
+        advice = active.length > 0
+            ? "The events above are cross-build id re-mints that bili itself adopted (#4131/#3642): fold-reconcile re-anchored every covered id (0 unmatched) and marked NO compaction boundary, so the fold state survived intact. There is NO second compressor and NO auto-compaction to disable — nothing to act on. Clear this ledger if you want it gone — Web UI conflict banner / session page, or POST /__bili/conflicts/clear?session=<id>."
+            : "All events above are cross-build id re-mints older than 7 days (historical stock) that bili already adopted (#4131/#3642): the fold state was re-anchored intact at the time, no ongoing risk. Clear this ledger — Web UI conflict banner / session page, or POST /__bili/conflicts/clear?session=<id>.";
     } else if (orphanOnly) {
         // A headerless replay does not prove that the original client moved.
         // Older ledgers may contain tail-only matches; neither proves state loss.
