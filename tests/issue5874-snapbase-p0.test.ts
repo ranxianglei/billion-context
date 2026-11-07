@@ -408,9 +408,11 @@ test("#5874 T6: deleteSession cascades the plane tables", () => {
 
 test("#5874 flags: master ⊃ lane, resolved at the store", () => {
     const dir = tmpDir("bili-5874-flags-");
+    const stores: UnifiedStore[] = [];
     try {
         const mk = (p: string, snapBase: { enabled?: boolean; shadowWrite?: boolean } | undefined) => {
             const s = UnifiedStore.open(p, undefined, { snapBase });
+            stores.push(s);
             return s["snapPlane"] as { enabled: boolean; shadowWrite: boolean };
         };
         assert.deepEqual(mk(path.join(dir, "a.db"), { enabled: true, shadowWrite: true }), {
@@ -429,6 +431,8 @@ test("#5874 flags: master ⊃ lane, resolved at the store", () => {
         assert.deepEqual(mk(path.join(dir, "d.db"), { enabled: true }), { enabled: true, shadowWrite: false });
         assert.deepEqual(mk(path.join(dir, "e.db"), undefined), { enabled: false, shadowWrite: false });
     } finally {
+        // Close before rmSync: Windows refuses to unlink open sqlite files (EBUSY).
+        for (const s of stores) s.close();
         fs.rmSync(dir, { recursive: true, force: true });
     }
 });
