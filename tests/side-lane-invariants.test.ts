@@ -349,12 +349,16 @@ test("(F) extracted protocol modules keep the side-lane boundary (#1440 P2 cut 2
 // isDshSingleShotSidecar — same category once more: the generic single-shot
 // dsh sidecar shape predicate (no tools + one-shot body, any system text)
 // consulted to set sideIntent and to keep unknown sidecars off the raw-key
-// anchor before the first main turn can claim it.
+// anchor before the first main turn can claim it. #5073 adds
+// isStructuredOutputCall — same category once more: a pure toolless
+// structured-output shape predicate (no threshold, no session state) consulted
+// to set sideIntent and to keep the call out of the restoreOutputBudget
+// high-water path, exactly like the #2500 server-tool predicate.
 test("(G) extracted pipeline module keeps the side-lane boundary (#1440 P2 cut 3)", () => {
     const text = readFileSync(fileURLToPath(new URL("../src/server/handle.ts", import.meta.url)), "utf8");
     const laneInternals = /\bSIDE_REQUEST_MAX_TOKENS\b|\bSIDE_REQUEST_AGENTS\b|\bDemoteGateSignals\b|\bSideLaneSignals\b|\bSideLaneDecision\b|\bBILI_TOOL_NAMES\b|\bOutputBudgetField\b|\boutputBudgetField\b|\breadOutputBudget\b|\bwriteOutputBudget\b|\b_resetNoOutputCeilingWarningsForTest\b/;
     assert.doesNotMatch(text, laneInternals, "handle.ts must stay decoupled from the side-lane engine internals");
-    const allowlist = new Set(["hasLeakedBiliToolsOnly", "isClaudeCodeTitleRequest", "isDshAutoReviewRequest", "isDshSingleShotSidecar", "isDshTitleRequest", "isServerToolUtilityCall", "isSideRequest", "resolveSideLane", "demoteGate", "stripLeakedBiliTools", "restoreOutputBudget", "sideRequestGuard"]);
+    const allowlist = new Set(["hasLeakedBiliToolsOnly", "isClaudeCodeTitleRequest", "isDshAutoReviewRequest", "isDshSingleShotSidecar", "isDshTitleRequest", "isServerToolUtilityCall", "isSideRequest", "isStructuredOutputCall", "resolveSideLane", "demoteGate", "stripLeakedBiliTools", "restoreOutputBudget", "sideRequestGuard"]);
     let sawImport = false;
     for (const m of text.matchAll(/\{([^}]*)\}\s*from\s*["'][^"']*side-request\.js["']/g)) {
         sawImport = true;
