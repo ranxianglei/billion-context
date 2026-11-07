@@ -302,6 +302,17 @@ entries:
     desc_ja: "匿名フォークは、フォークされたリクエストにソースコンテンツが完全に存在する親の圧縮ブロックを継承します。"
     site_en: "<code>forkAdoption</code> — adopt anonymous forks into their parent session (off by default)."
     site_zh: "<code>forkAdoption</code> —— 匿名 fork 会话并入父会话（默认关）。"
+  - key: degenerateRetry
+    type: boolean
+    default: "false"
+    env: BILI_DEGENERATE_RETRY
+    group: behavior
+    id: tt.degen
+    site_group: beh
+    desc_en: "Opt-in degenerate-turn continuation retry on the agent-facing plugin/proxy lanes (#732/#821/#2303): when a turn ends with zero visible output, re-issue the agent's own request once with a neutral continuation nudge appended; a second empty retry surfaces an in-band #870 error. The compress loop's internal retry is unaffected. Enable with degenerateRetry: true or env BILI_DEGENERATE_RETRY=1."
+    desc_zh: "代理对外车道上的退化轮续传重试（#732/#821/#2303，默认关）：一轮以零可见输出结束时，把客户端自己的请求附加中性续传提示后重发一次；重试仍为空则以带内 #870 错误收尾。压缩循环内部的重试不受此开关影响。用 degenerateRetry: true 或环境变量 BILI_DEGENERATE_RETRY=1 开启。"
+    site_en: "<code>degenerateRetry</code> — one-shot continuation retry for zero-output turns (off by default; BILI_DEGENERATE_RETRY=1 to enable)."
+    site_zh: "<code>degenerateRetry</code> —— 零输出轮的一次性续传重试（默认关；BILI_DEGENERATE_RETRY=1 开启）。"
   - key: autoModeForge.enabled
     type: boolean
     default: "true"
