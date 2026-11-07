@@ -1547,7 +1547,7 @@ export class UnifiedStore {
             return true;
         });
         if (ok) this.maybeCheckpointWal();
-        if (ok) this.snapShadowSync(input, delta, opts);
+        if (ok) this.snapShadowSync(input, delta);
         return ok;
     }
 
@@ -1566,7 +1566,6 @@ export class UnifiedStore {
     private snapShadowSync(
         input: IngestSessionInput,
         delta: { trustedSeq: number; boundaryMsgId: string; boundaryHash: string; trustedTailSeqs: number[] } | undefined,
-        opts?: { completeLog?: boolean },
     ): void {
         const fl = this.snapPlane;
         if (!fl.enabled || !fl.shadowWrite) return;
