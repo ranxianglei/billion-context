@@ -432,6 +432,19 @@ export type CompressSettings = {
      *  rebuilt history. `false` suppresses them entirely, for deployments where
      *  models imitate or narrate around the markers (#862). Default `true`. */
     visibilityMarkers?: boolean;
+    /** #memory-toc: inject a compact one-line index of the session's ACTIVE
+     *  compression blocks (`bN [T2]: topic`) into the system block so the model
+     *  always knows which past milestones are available for
+     *  `search_context`/`decompress` instead of searching blind or re-deriving
+     *  forgotten decisions. Rendered last, so the cache anchor above it stays
+     *  byte-stable between folds. Env: `BILI_MEMORY_TOC`. Default `true`. */
+    memoryToc?: boolean;
+    /** #memory-toc: number of MOST RECENT active blocks rendered in the
+     *  memory index. Older blocks collapse into a single overflow range line;
+     *  `search_context` continues to reach them. A value <= 0 lists every
+     *  active block without truncation. Env: `BILI_MEMORY_TOC_WINDOW`.
+     *  Default 10. */
+    memoryTocWindow?: number;
     /** #4313 (PR #5236; default-on follow-up): stamp each message with its
      *  immutable local time-of-occurrence and render it in the <acp> tag
      *  (`time="..."`) — DEFAULT ON since the leak-audit follow-up: stamps are
@@ -2446,7 +2459,7 @@ const COMPRESS_SETTING_FIELDS = new Set([
     "minCompressRange", "minCompressRangeChars",
     "outputHeadroomMaxPct", "tiers", "protectedLatestTools", "protectedTools",
     "neverPreserveRecentTools", "preserveRecentTools",
-    "visibilityMarkers", "messageTimestamps", "rules", "injectTool", "injectNudge",
+    "visibilityMarkers", "messageTimestamps", "memoryToc", "memoryTocWindow", "rules", "injectTool", "injectNudge",
     "acknowledgePromptsRisk", "absorb", "ccr", "search",
     "prompts", "promptPack", "reasoningGuard", "outputSteering", "priceProfile",
     "reconcile", "streamSummary", "externalSummary",
@@ -3251,6 +3264,15 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
     if ("visibilityMarkers" in obj) {
         if (typeof obj.visibilityMarkers !== "boolean") ok = false;
         else out.visibilityMarkers = obj.visibilityMarkers;
+    }
+    if ("memoryToc" in obj) {
+        if (typeof obj.memoryToc !== "boolean") ok = false;
+        else out.memoryToc = obj.memoryToc;
+    }
+    if ("memoryTocWindow" in obj) {
+        const v = obj.memoryTocWindow;
+        if (typeof v !== "number" || !Number.isFinite(v)) ok = false;
+        else out.memoryTocWindow = Math.trunc(v);
     }
     if ("messageTimestamps" in obj) {
         if (typeof obj.messageTimestamps !== "boolean") ok = false;
