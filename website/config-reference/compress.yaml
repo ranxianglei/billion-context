@@ -92,8 +92,6 @@ entries:
     desc_zh: "幻影压力守卫的兜底（#5865 裁定）：压力带最多连等多少轮估算读数就必须照估算动手。兜底保证从不回传计费的会话（匿名零基线 fork、静默后端——本地估算是它们唯一的压力信号）也能拿到自动压缩。0＝完全不等待。仅在 requireUsageSampleForPressure 开启时生效。"
     site_en: "Caps how many consecutive no-billing-sample rounds the pressure band may wait before deciding on the local estimate anyway (default 2), so a backend that never reports usage still gets automatic compression instead of being held forever; 0 waits not at all."
     site_zh: "限制压力带最多连等多少轮无计费样本的估算读数就必须照估算判（默认 2），保证从不回传计费的后端也能自动压缩、不会永远等待；设 0 表示不等待。"
-    site_en: "When the decision meter has no billing sample this round (aborted turn, short-TTL expiry), pressure-band nudges are deferred one round until a usage-grade reading decides; billed readings keep byte-identical behavior. Set false to restore estimate-driven pressure injection."
-    site_zh: "本轮无计费样本（回合中断、短 TTL 丢 usage）时，压力带 nudge 延后一轮等实际 usage 级读数再决定；计费级读数行为逐字节不变。设 false 恢复旧的估算驱动行为。"
   - key: compress.nudgeModelDecided
     type: boolean
     default: "off (unset)"
