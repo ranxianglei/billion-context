@@ -593,8 +593,14 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         // usage we mint here must not read as an empty context: fall back to
         // estimating the payload itself when lastInputTokens is stale/zero.
         // The reply honors parsed.stream (JSON body when not streaming).
+        // #5500 family (kill-at-reader): an ESTIMATE-grade/unprovenanced arm is
+        // char-bound (~4x tokens) while est is chars/4 — the scales don't
+        // cancel, so a poisoned scalar would inflate the minted input_tokens
+        // and codex's recomputed ledger until the next real report. Only a
+        // trustworthy scalar keeps precedence over the raw-body estimate.
+        const anchorGradeOk = session.stats.lastInputTokensSource === "usage" || session.stats.lastInputTokensSource === "overflow-arm";
         const est = defaultCountTokens(typeof parsed.input === "string" ? parsed.input : JSON.stringify(parsed.input ?? ""));
-        const total = Math.max(session.stats.lastInputTokens, est, 1);
+        const total = Math.max(anchorGradeOk ? session.stats.lastInputTokens : 0, est, 1);
         codexForge = compactForm === "trigger"
             ? {
                 kind: "trigger",

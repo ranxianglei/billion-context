@@ -2971,6 +2971,24 @@ export function effectiveTokenCount(session: Session, msgs: CoreMessage[], inbou
         if (fallback !== null) return { tokens: fallback, source: "estimate" };
         return { tokens: grade, source: "usage" };
     }
+    // #5500 (round 3): a CYCLE-STALE demotion means a usage-grade anchor exists
+    // but the last send's report hasn't settled yet — one lost/absent report
+    // (stream abort, client cancel, flaky upstream) must not hand the meter
+    // the char-count bound: inflating the decision value ~2–4× crosses the
+    // kernel's DESTRUCTIVE emergency-truncate band (0.95×window) on sessions
+    // whose MEASURED size sits safely under it, and the clips LATCH until the
+    // next successful fold (#3939 ③), destroying delivered tool output. Ride
+    // the billing-caliber estimate of that send instead (contextEstimateTokens,
+    // k̂-scaled where provenance matches) — the same replacement reading
+    // staleSmallAnchorFallback returns for its own demotion class (#1595).
+    // Capped by the current payload's own upper bound so a mis-calibrated k̂
+    // can never exceed today's fail-closed worst case. Anchor-less sessions
+    // (no usage-grade source at all) skip this branch and keep #728's
+    // fail-closed bound below: there is nothing fresher to prefer.
+    if (anchorStale) {
+        const scaled = session.stats.contextEstimateTokens ?? 0;
+        if (scaled > 0) return { tokens: Math.min(scaled, raw), source: "estimate" };
+    }
     // #553: zero-baseline ANCHOR-LESS anonymous sessions (prefix-affinity
     // mints/forks/reloads) fall back to the raw-history upper bound — see the
     // function header for why feeding 0 blinds them.
