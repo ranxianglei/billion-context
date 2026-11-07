@@ -111,6 +111,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `subagentSplit` | boolean | true | BILI_SUBAGENT_SPLIT | Claude Code subagents get their own session namespace (<session>\|sub:<agent-id>) instead of queueing behind the main session. Anthropic-wire only — on the Responses wire this switch is a no-op (see the `subagentSplit` / BOTH-mechanisms scope note). |
 | `personaSplit` | boolean | true | BILI_PERSONA_SPLIT | Split the Responses-wire lane keyed by the instructions fingerprint (Claude Code over /v1/responses; Codex root threads / older builds) when the instructions text changes AND the incoming history does not continue the tracked chain (default on). Opt out with env BILI_PERSONA_SPLIT=0 or personaSplit: false (env wins). |
 | `forkAdoption` | boolean | false | BILI_FORK_ADOPTION | Anonymous forks inherit the parent's compression blocks whose source content is fully present in the forked request. |
+| `degenerateRetry` | boolean | false | BILI_DEGENERATE_RETRY | Opt-in degenerate-turn continuation retry on the agent-facing plugin/proxy lanes (#732/#821/#2303): when a turn ends with zero visible output, re-issue the agent's own request once with a neutral continuation nudge appended; a second empty retry surfaces an in-band #870 error. The compress loop's internal retry is unaffected. Enable with degenerateRetry: true or env BILI_DEGENERATE_RETRY=1. |
 | `autoModeForge.enabled` | boolean | true | BILI_AUTO_MODE_FORGE | Answer Claude Code auto-mode safety-classifier calls locally with a forged allow verdict instead of forwarding them upstream (#2740): zero egress, zero billing for that lane; every forged verdict is audit-logged and the session carries a notice badge. false / env 0 restores pure passthrough for users who pay for real verdicts. |
 | `affinitySimhash` | boolean | true | BILI_AFFINITY_SIMHASH | Simhash chain-alignment adoption for anonymous clients (#2265): a client-side pervasive decorative rewrite (e.g. Trae re-stamping model tags on every assistant message) re-attaches the existing session with its compression state instead of minting fresh and re-folding from zero. |
 | `resumeInheritance` | boolean | true | BILI_RESUME_INHERITANCE | Identified clients resuming under a new session id inherit the parent's ref assignments and fully-present compression blocks. |
@@ -1957,6 +1958,7 @@ File keys resolve only when the matching env var is unset. Defaults in parenthes
 | `BILI_COMPRESS_AT_FOLD_POINT_CLEAR_THINKING` | `compress.compressAtFoldPointClearThinking` | false |
 | `BILI_DECODED_BODY_BYTES` | `network.decodedBodyBytes` | 10737418240 |
 | `BILI_DECOMPRESS_TMP_CAP` | `decompressTmpCap` | 50 |
+| `BILI_DEGENERATE_RETRY` | `degenerateRetry` | false |
 | `BILI_DSH_AUTHORED_COMPACTION` | `dsh.authoredCompaction` | true (on, #3901 flip) |
 | `BILI_DSH_CONTEXT_TAB` | `dsh.contextTab` | true |
 | `BILI_DUMP_4XX` | `diagnostics.dump4xx` | false |
