@@ -6,7 +6,7 @@ import type { ServerResponse } from "node:http";
 import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
-import { getStore, storageStatusLabel } from "./persist.js";
+import { CORRUPT_SIBLING_CAP, getStore, pruneCorruptSiblings, storageStatusLabel } from "./persist.js";
 import { cloneStoreForRefs } from "./store.js";
 import { acquireInFlight, createSession, getSessionAsync, publishForkSession, diagnoseSuccessWithoutUsage, effectiveConfig, findSessionByCanonicalId, listSessions, markCompactionBoundary, markDirty, noteAbortedTurn, peekSession, releaseInFlight, statusInputBaseline, withSessionLock, type Session } from "./session.js";
 import { clientConversationHeader } from "./session-id.js";
@@ -379,10 +379,15 @@ export function loadConversations(): void {
     } catch {
         // #406: preserve the corrupt bytes for forensics instead of
         // silently zeroing every route on the next debounced write.
+        // #5779: bound the forensic retention like the session store does.
+        let removedCopies = 0;
         try {
-            fs.renameSync(conversationsFile(), `${conversationsFile()}.corrupt-${Date.now()}`);
+            const backup = `${conversationsFile()}.corrupt-${Date.now()}`;
+            fs.renameSync(conversationsFile(), backup);
+            removedCopies = pruneCorruptSiblings(conversationsFile(), backup).removed;
         } catch {}
-        loggerLog("warn", "[plugin] plugin-conversations.json is corrupt — backed up beside the original, starting an empty routing table");
+        const capNote = removedCopies > 0 ? `; removed ${removedCopies} older forensic cop${removedCopies === 1 ? "y" : "ies"} (cap ${CORRUPT_SIBLING_CAP})` : "";
+        loggerLog("warn", `[plugin] plugin-conversations.json is corrupt — backed up beside the original, starting an empty routing table${capNote}`);
     }
     conversationsDirty = false;
 }
