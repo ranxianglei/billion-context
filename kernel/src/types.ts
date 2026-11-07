@@ -157,6 +157,15 @@ export interface NudgeState {
    *  a mass-qualified T2/T3 fire ahead of T1 instead of starving forever.
    *  Cleared by a compliant harvest or any distillation. */
   t1HarvestStall?: boolean;
+  /** #5865 estimate-hold backstop: count of CONSECUTIVE processTurn events
+   *  whose meter reading was estimate-grade. Reset to 0 by any usage-grade
+   *  reading. Only consulted while nudge.requireUsageSampleForPressure is on:
+   *  the pressure band defers while this count <=
+   *  nudge.maxEstimateHoldRounds and falls back to estimate-driven injection once it exceeds the bound, so a
+   *  backend that never reports usage cannot starve its pressure nudges
+   *  forever. Persisted so the streak survives restarts like the rest of
+   *  NudgeState. */
+  estimateHoldStreak?: number;
 }
 
 export interface CompressionStats {
@@ -473,6 +482,21 @@ export interface NudgeConfig {
    *  Default true; set false to restore estimate-driven pressure injection.
    *  Non-pressure tiers (growth/cadence arms) are unaffected either way. */
   requireUsageSampleForPressure?: boolean;
+  /** #5865 ruling (estimate-hold backstop): while that guard is on, a run of
+   *  consecutive ESTIMATE-grade readings is only held for at most
+   *  `maxEstimateHoldRounds` rounds; from the following round onward the
+   *  pressure band acts on the estimate again (legacy behavior). Without the
+   *  bound, an upstream that NEVER reports usage (anonymous zero-baseline /
+   *  silent-backend sessions — see #728/#553, where the local estimate is
+   *  the only pressure signal) would be deferred forever: every round is
+   *  estimate-grade and the "next request carries a fresh billing report"
+   *  premise never materializes. Default 2: covers the observed double-ghost
+   *  windows (aborted turn + its follow-up before the aborted cycle's report
+   *  can land) while capping worst-case starvation at two missed
+   *  opportunities. 0 disables the hold entirely (the pressure band fires on
+   *  the very first estimate round — same practical effect as
+   *  requireUsageSampleForPressure=false for the pressure band). */
+  maxEstimateHoldRounds?: number;
 }
 
 export interface TruncateConfig {
