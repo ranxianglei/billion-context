@@ -968,11 +968,16 @@ export function createBiliArtifactFilter(onDrop?: (snippet: string) => void): Ta
         const consume = (text: string, isDrop: boolean): void => {
             if (text.length === 0) return;
             if (isDrop) {
+                // Dropped bytes are invisible to the client and must not move
+                // the line-head cursor: a header sitting flush behind a
+                // stripped carrier still leads the VISIBLE field, so the
+                // leading-tier check must see the state from before the drop
+                // (whole-text parity, #5900/#3198).
                 drop(text);
-            } else {
-                parts.push(text);
-                if (/[^\s]/.test(text)) proseEmitted = true;
+                return;
             }
+            parts.push(text);
+            if (/[^\s]/.test(text)) proseEmitted = true;
             atLineStart = text.endsWith("\n");
         };
         let openHeld = false;
@@ -1025,18 +1030,23 @@ export function createBiliArtifactFilter(onDrop?: (snippet: string) => void): Ta
                 buf = buf.slice(span!.end);
                 continue;
             }
-            consume(buf.slice(0, pos), false);
             const tail = buf.slice(pos);
             if (tail.length > CHAIN_TAIL_CAP) {
-                // Over cap without a terminator: not a real carrier (those
-                // are bounded far below the cap) — release as prose, never
-                // drop (#1039 content preservation, cf. #644).
-                consume(tail, false);
-                buf = "";
-            } else {
-                buf = tail;
-                openHeld = true;
+                // Over cap without a terminator: this opening can never be a
+                // real carrier (parser ceiling 512 < cap 640) — never dropped
+                // (#1039 content preservation, cf. #644). Void ONLY the opener
+                // and re-scan what follows: dumping the whole tail raw would
+                // shield line-start headers behind it from the two-tier pass,
+                // and where the dump lands would depend on chunk boundaries
+                // (#5900 sibling, #3198 determinism).
+                const opener = buf.startsWith(CHAIN_OPEN_ESCAPED, pos) ? CHAIN_OPEN_ESCAPED : TAG_OPEN;
+                consume(buf.slice(0, pos + opener.length), false);
+                buf = buf.slice(pos + opener.length);
+                continue;
             }
+            consume(buf.slice(0, pos), false);
+            buf = tail;
+            openHeld = true;
             break;
         }
         if (!swallowing && !openHeld && !holdingLine && buf.length > 0) {
@@ -1063,10 +1073,18 @@ export function createBiliArtifactFilter(onDrop?: (snippet: string) => void): Ta
                 swallowing = false;
             } else if (buf.length > 0) {
                 // holdingLine: the marker line ran to EOF — drop it (whole-text
-                // parity: the line's end IS the field's end). Anything else
-                // (open tails, settled prose) releases as-is.
-                if (holdingLine) drop(buf);
-                else out = buf;
+                // parity: the line's end IS the field's end). Anything else is
+                // raw unsettled text (open tails, held tail-hold fragments):
+                // settle it through the SAME whole-text pass instead of
+                // releasing as-is — a line-start header shielded behind an
+                // unresolved carrier opening must not leak at EOF (#5900/#3198).
+                if (holdingLine) {
+                    drop(buf);
+                } else {
+                    const settled = stripBiliArtifacts(buf);
+                    if (settled !== buf) drop(buf);
+                    out = settled;
+                }
                 buf = "";
                 holdingLine = false;
             }

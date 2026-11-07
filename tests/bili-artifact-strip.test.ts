@@ -272,3 +272,62 @@ test("degenerate-turn gate parity: a fully forged turn yields zero visible outpu
         assert.equal(filter.dropped(), true);
     }
 });
+
+test("streaming: dead carrier opening no longer shields line-start headers behind it (#5900)", () => {
+    // An unterminated <bili-chain opening is prose, but while the filter held
+    // the whole tail behind it, a line-start header further back leaked raw at
+    // flush (short tails) or was stripped inconsistently per chunking once the
+    // tail crossed the void budget (#3198 determinism). Both must match
+    // whole-text now.
+    const deadOpen = `${L}bili-chain v="1" processor="b"`;
+    const shortPayload = `${deadOpen}\n${H2} topic\nbody survives`;
+    const shortExpected = stripBiliArtifacts(shortPayload);
+    assert.equal(shortExpected, `${deadOpen}\nbody survives`, "whole-text: opener prose, marker line drops");
+    for (let k = 0; k <= shortPayload.length; k++) {
+        const f = createBiliArtifactFilter();
+        const out = f.push(shortPayload.slice(0, k)) + f.push(shortPayload.slice(k)) + f.flush();
+        assert.equal(out, shortExpected, `split @${k}: header behind dead opener must match whole-text, got ${JSON.stringify(out)}`);
+    }
+    const longPayload = `${deadOpen}\n${"z".repeat(700)}\n${H2}\ntail`;
+    const longExpected = stripBiliArtifacts(longPayload);
+    assert.equal(longExpected, `${deadOpen}\n${"z".repeat(700)}\ntail`, "whole-text ground truth (over budget)");
+    for (const n of [1, 2, 4, 64, 257, 700]) {
+        const { out } = streamThrough(longPayload, n);
+        assert.equal(out, longExpected, `chunk ${n}: over-budget void must be chunk-boundary independent, got ${JSON.stringify(out)}`);
+    }
+    for (let k = 0; k <= longPayload.length; k += 37) {
+        const f = createBiliArtifactFilter();
+        const out = f.push(longPayload.slice(0, k)) + f.push(longPayload.slice(k)) + f.flush();
+        assert.equal(out, longExpected, `split @${k}: over-budget sweep, got ${JSON.stringify(out)}`);
+    }
+});
+
+test("streaming: second carrier behind a dead opening keeps whole-text parity (#5900)", () => {
+    // Recognition is first-opener-wins (pre-existing boundary, documented in
+    // nextChainSpan): a malformed first opening blocks span validation of a
+    // later well-formed carrier. Pin parity so the void path cannot silently
+    // change that boundary.
+    const deadOpen = `${L}bili-chain v="1" b`;
+    const payload = `${deadOpen}\nmid ${tag()} end\n${H1}\nbody`;
+    const expected = stripBiliArtifacts(payload);
+    assert.ok(expected.includes("bili-chain"), "documented limit: later carrier stays prose");
+    for (const n of [1, 3, 8, 40]) {
+        const { out } = streamThrough(payload, n);
+        assert.equal(out, expected, `chunk ${n}: parity with whole-text, got ${JSON.stringify(out)}`);
+    }
+});
+
+test("streaming: stripped carrier does not unseat a flush-following header from the leading tier (#5900)", () => {
+    // Dropped bytes are invisible to the client: a header sitting flush behind
+    // a removed carrier still leads the VISIBLE field, so the degenerate-turn
+    // swallow must fire exactly as in whole-text (dropped bytes must not move
+    // the line-head cursor).
+    const escBoth = (): string => tag().replace(L, "\\u003c").replace(R, "\\u003e");
+    const payload = `${escBoth()}${H1}body`;
+    assert.equal(stripBiliArtifacts(payload), "", "whole-text: forged carrier + forged block = zero visible output");
+    for (const n of [1, 2, 7, 33]) {
+        const { out, filter } = streamThrough(payload, n);
+        assert.equal(out, "", `chunk ${n}: must converge to zero visible output, got ${JSON.stringify(out)}`);
+        assert.equal(filter.dropped(), true);
+    }
+});
