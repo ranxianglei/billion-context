@@ -430,12 +430,19 @@ export class SessionStore {
      *  nobody else committed since — skipping the full-file read+parse that
      *  costs ~320ms/turn on >40MiB sessions. An unstamped token (no "written")
      *  is unproven and never takes the fast path. Cleared on the direct-write
-     *  paths (restore/rekey) that bypass guardedBuild. */
+     *  paths (restore/rekey) that bypass guardedBuild.
+     *
+     *  #5805: under index-only persistence this process never writes the
+     *  envelope at all, so "written" can never be stamped — the file proof is
+     *  replaced by "writerOffFile", the envelope's stat AT OUR LAST BUILD: an
+     *  unchanged file proves no foreign writer landed since, and the unified
+     *  rows already prove no sibling committed. */
     private readonly ownCommit = new Map<string, {
         requests: number;
         nextBlockId: number;
         builtAtMs: number;
         written?: { size: number; mtimeMs: number };
+        writerOffFile?: string;
         meta?: { protocol?: string; upstreamOrigin?: string };
     }>();
 
@@ -867,7 +874,7 @@ export class SessionStore {
                 const warmProof = session.revisionEpoch; // #4788 D2
                 const warmRec: { v: PersistedSession | null } = { v: null };
                 await this.store.writeNow(id, () => { const r = this.buildRecordForSave(session); warmRec.v = r; return r; });
-                if (warmRec.v) this.committedMetaFp.set(id, this.metaFingerprint(warmRec.v.metadata ?? {})); // #5506: clamp rewrite landed
+                if (warmRec.v) this.noteMetaFp(id, warmRec.v.metadata ?? {}); // #5506: clamp rewrite landed
                 this.noteDurable(id, warmProof); // clamp rewrite landed
                 clamped++;
                 // #3049: the clamp rewrite writes a DIFFERENT payload than any
@@ -1390,7 +1397,7 @@ export class SessionStore {
             const rekeyProof = session.revisionEpoch; // #4788 D2
             const rekeyRec: { v: PersistedSession | null } = { v: null };
             await this.store.writeNow(label, () => { const r = this.buildRecordForSave(session); rekeyRec.v = r; return r; });
-            if (rekeyRec.v) this.committedMetaFp.set(label, this.metaFingerprint(rekeyRec.v.metadata ?? {})); // #5506: rekey rewrite landed
+            if (rekeyRec.v) this.noteMetaFp(label, rekeyRec.v.metadata ?? {}); // #5506: rekey rewrite landed
             this.noteDurable(label, rekeyProof); // rekey rewrite landed
             // #3049: direct write bypassing guardedBuild — the boot rekey
             // rewrites envelopes without the sidecar ingest, so any prior
@@ -2269,158 +2276,6 @@ export class SessionStore {
         }
     }
 
-    // ------------------------------------------------------------------
-    // #5643 fastpath v6 identity plane — same guard shape as every other
-    // unified* facade: null = "plane unavailable right now" (sidecar
-    // missing/disabled/network backend) and the v6 lane fails soft onto
-    // the legacy watermark path. pfCommitTurn does NOT swallow silently:
-    // a turn commit failure is logged once, then fails soft for THAT turn.
-    // ------------------------------------------------------------------
-
-    /** The registry ext key mapping one relay session → every pf_sid it has
-     *  been issued across re-arming rotations (§3.1). Stored as an array of
-     *  sids; rides the session_ext cascade on session deletion. */
-    readonly PF_V6_SID_REGISTRY_EXT_KEY = "pf:v6-sids";
-
-    pfAvailable(): boolean {
-        if (!this.shadow || this.shadow.stats.disabled) return false;
-        try {
-            return this.shadow.pfAvailable();
-        } catch {
-            return false;
-        }
-    }
-
-    pfProbePairs(sessRaw: string, ledgerIds: string[]): Map<string, { sid: string; pos: number }> | null {
-        if (!this.shadow || this.shadow.stats.disabled) return null;
-        return this.shadow.pfProbePairs(sessRaw, ledgerIds);
-    }
-
-    pfMeta(
-        sid: string,
-    ): {
-        ckpt: { ckptLsSeq: number; metaJson: string; checksum: string; updatedAt: number } | null;
-        log: { lsSeq: number; kind: string; payloadJson: string; bornPosHi: number; ts: number }[];
-    } | null {
-        if (!this.shadow || this.shadow.stats.disabled) return null;
-        return this.shadow.pfMeta(sid);
-    }
-
-    pfLatestGeom(sid: string): { t: number; maxPos: number } | null {
-        if (!this.shadow || this.shadow.stats.disabled) return null;
-        return this.shadow.pfLatestGeom(sid);
-    }
-
-    pfCommitTurn(
-        sid: string,
-        args: {
-            rows: { pos: number; ledgerId: string; sessRaw: string; coreId: string; coreJson: string }[];
-            logEntries: { kind: string; payloadJson: string; bornPosHi: number; ts?: number }[];
-        },
-    ): number | null {
-        if (!this.shadow || this.shadow.stats.disabled) return null;
-        try {
-            return this.shadow.pfCommitTurn(sid, args);
-        } catch (err) {
-            this.log("warn", `[persist] pf turn commit failed (${sid}): ${String(err)}`); // loud once, then fail-soft for THIS turn
-            return null;
-        }
-    }
-
-    pfCompact(sid: string, args: { metaJson: string; nextLsSeq: number }): void {
-        if (!this.shadow || this.shadow.stats.disabled) return;
-        try {
-            this.shadow.pfCompact(sid, args);
-        } catch {
-            // compaction is opportunistic; skip this cycle, retry next finalize
-        }
-    }
-
-    pfHydrateWindow(sid: string, posFrom: number, posTo: number): Map<number, string> {
-        if (!this.shadow || this.shadow.stats.disabled) return new Map();
-        return this.shadow.pfHydrateWindow(sid, posFrom, posTo);
-    }
-
-    pfLedgerIds(sid: string): { pos: number; ledgerId: string; coreId: string }[] | null {
-        if (!this.shadow || this.shadow.stats.disabled) return null;
-        return this.shadow.pfLedgerIds(sid);
-    }
-
-    pfNeedsCompaction(opts: { entriesAfterCkpt: number; logBytesEstimate: number; lastEntryTsMs: number }): boolean {
-        if (!this.shadow || this.shadow.stats.disabled) return false;
-        return this.shadow.pfNeedsCompaction(opts);
-    }
-
-    /** Session teardown (#5643 §8 test 19 third clause): sweep the pf plane
-     *  for EVERY sid this relay session was ever issued. Reads the registry
-     *  from ext FIRST (deleteSession sweeps session_ext itself), then deletes
-     *  all SIX plane tables — identity rows/log/ckpt AND the #5664 render
-     *  snapshot tables (deleteSession's own cascade covers them in-txn too;
-     *  archiveSession's does since the #5652 review BUG-2 fix; this facade is
-     *  the standalone maintenance entry). MAINTENANCE-ONLY as of the #5652
-     *  review: NO production call site today (real teardown flows go through
-     *  deleteSession/archiveSession's in-txn cascades; tests exercise this
-     *  directly) — wiring it into relay teardown is open follow-up work, not
-     *  an accident. Safe to call when nothing was ever issued. */
-    pfDeleteForSession(sessionId: string): void {
-        if (!this.shadow || this.shadow.stats.disabled) return;
-        const reg = this.shadow.getSessionExt(sessionId, this.PF_V6_SID_REGISTRY_EXT_KEY) as string[] | undefined;
-        if (Array.isArray(reg)) this.shadow.pfDeleteAll(reg);
-    }
-
-    /** #5664 render snapshot plane facade — same guard shape as the identity
-     *  plane: null/empty/false = "plane unavailable right now" and the v6
-     *  lane fails soft onto the legacy full path for that turn only.
-     *  A failed render commit is logged once, then fails soft for THIS turn
-     *  (same as pfCommitTurn above). */
-    pfRenderAvailable(): boolean {
-        if (!this.shadow || this.shadow.stats.disabled) return false;
-        try {
-            return this.shadow.pfRenderAvailable();
-        } catch {
-            return false;
-        }
-    }
-
-    pfRenderRows(sid: string): { pos: number; rowJson: string | null }[] {
-        if (!this.shadow || this.shadow.stats.disabled) return [];
-        return this.shadow.pfRenderRows(sid);
-    }
-
-    pfRenderCommit(
-        sid: string,
-        args: {
-            rows: { pos: number; rowJson: string | null }[];
-            logEntries: { kind: string; payloadJson: string }[];
-            checkpointMetaJson?: string;
-            replaceAll?: boolean;
-            ts?: number;
-        },
-    ): number | null {
-        if (!this.shadow || this.shadow.stats.disabled) return null;
-        try {
-            return this.shadow.pfRenderCommit(sid, args);
-        } catch (err) {
-            this.log("warn", `[persist] pf render commit failed (${sid}): ${String(err)}`); // loud once, fail-soft for THIS turn
-            return null;
-        }
-    }
-
-    pfRenderMeta(
-        sid: string,
-    ): {
-        ckpt: { ckptLsSeq: number; metaJson: string; checksum: string; updatedAt: number } | null;
-        log: { lsSeq: number; kind: string; payloadJson: string; ts: number }[];
-    } | null {
-        if (!this.shadow || this.shadow.stats.disabled) return null;
-        return this.shadow.pfRenderMeta(sid);
-    }
-
-    pfRenderCkptIntact(sid: string): boolean {
-        if (!this.shadow || this.shadow.stats.disabled) return false;
-        return this.shadow.pfRenderCkptIntact(sid);
-    }
-
     /** #5312: reversible single-block archive / restore (see UnifiedStore). */
     unifiedArchiveBlock(sessionId: string, blockId: string, archiveDir?: string): { ok: boolean; exportPath?: string; reason?: string; contentRowsDeleted?: number } | null {
         if (!this.shadow || this.shadow.stats.disabled) return null;
@@ -2770,7 +2625,7 @@ export class SessionStore {
         record.savedAt = Date.now();
         record.meta = { ...record.meta, restoredFrom: cp.session_id, restoredCheckpoint: cp.cp_id } as PersistedSession["meta"];
         await this.store.writeNow(newId, () => record);
-        this.committedMetaFp.set(newId, this.metaFingerprint(record.metadata ?? {})); // #5506: replica restore landed
+        this.noteMetaFp(newId, record.metadata ?? {}); // #5506: replica restore landed
         shadow.record(record);
         // #3049: the replica record was ingested from the checkpoint payload
         // — the ownership token must mirror exactly those counters.
@@ -2938,12 +2793,34 @@ export class SessionStore {
             return false; // sidecar hiccup — full read decides
         }
         if (!row || row.requests !== own.requests || row.nextBlockId !== own.nextBlockId) return false;
+        // #5805: index-only saves (writerOff, or a per-session envelope freeze)
+        // never touch the file, so "written" never exists and the proof below
+        // would fall back to the expensive full read on EVERY save — on a
+        // 100+ MiB session that was a 138 MB read + parse per turn. Replace it
+        // with the "no foreign writer since our last build" shape: the unified
+        // rows above already prove no sibling committed, and an unchanged
+        // envelope stat proves nothing wrote the file behind our back.
+        if (this.writerOffActive() || this.envelopeFrozen(incoming.id)) {
+            return this.envelopeFileKey(incoming.id, incoming.meta) === own.writerOffFile;
+        }
         const stat = this.statEnvelope(incoming.id, incoming.meta);
         if (!stat) return false;
         if (!own.written) return false; // unproven token (see stampOwnWrite) — full read decides
         if (stat.size !== own.written.size) return false; // any byte-count change is a foreign write (bigger OR smaller)
         if (stat.mtimeMs > own.written.mtimeMs + OWN_WRITE_STAMP_EPSILON_MS) return false;
         return true;
+    }
+
+    /** #5805: cheap identity of the envelope file's current state — the
+     *  index-only lane's stand-in for the "written" post-write stamp. The
+     *  mtime stays at full float precision (NO rounding): an untouched file
+     *  re-stats to the identical value on every supported filesystem, so the
+     *  comparison degrades conservatively (worst case: an extra exact read)
+     *  while rounding would blind the guard to a same-size foreign rewrite
+     *  landing within half a millisecond of the recorded stat (#5805). */
+    private envelopeFileKey(id: string, meta?: { protocol?: string; upstreamOrigin?: string }): string {
+        const stat = this.statEnvelope(id, meta);
+        return stat ? `${stat.size}:${stat.mtimeMs}` : "absent";
     }
 
     /** #3049: stat the envelope the way loadEnvelope would resolve it — the
@@ -3066,6 +2943,11 @@ export class SessionStore {
             nextBlockId: committed.state?.nextBlockId ?? 0,
             builtAtMs: Date.now(),
             written: prev?.written,
+            // #5805: index-only lanes produce no write stamp — record the
+            // envelope's stat as of this build instead (see ownershipFastPath).
+            writerOffFile: this.writerOffActive() || this.envelopeFrozen(id)
+                ? this.envelopeFileKey(id, committed.meta ?? prev?.meta)
+                : undefined,
             meta: committed.meta
                 ? { protocol: committed.meta.protocol, upstreamOrigin: committed.meta.upstreamOrigin }
                 : prev?.meta,
@@ -3180,7 +3062,7 @@ export class SessionStore {
                 try {
                     const rec = this.guardedBuild(session)();
                     this.maybeCutForkBase(session);
-                    this.committedMetaFp.set(session.id, this.metaFingerprint(rec.metadata ?? {})); // #5506: index-only build landed
+                    this.noteMetaFp(session.id, rec.metadata ?? {}); // #5506: index-only build landed
                     // #4788 D2: the index-only build landed synchronously —
                     // run the same settle protocol as a kernel-write land
                     // (invariant #5: this routing path gets equivalent
@@ -3244,7 +3126,7 @@ export class SessionStore {
             this.saveWritesInFlight.add(id);
             void this.store.writeNow(id, armed.build).then(() => {
                 this.stampOwnWrite(id); // #3406: the write LANDED — prove our bytes are on disk
-                if (armed.rec) this.committedMetaFp.set(id, this.metaFingerprint(armed.rec.metadata ?? {})); // #5506: debounced save landed
+                if (armed.rec) this.noteMetaFp(id, armed.rec.metadata ?? {}); // #5506: debounced save landed
                 this.noteDurable(id, proofRevision);
                 this.lastSaveLanded.set(id, true);
                 // #4788 D2: discharge the droppable fields once the debounced
@@ -3418,7 +3300,7 @@ export class SessionStore {
             const proofRevision = session.revisionEpoch; // #4788 D2: capture BEFORE the sync build
             const rec = this.guardedBuild(session)();
             this.maybeCutForkBase(session);
-            this.committedMetaFp.set(session.id, this.metaFingerprint(rec.metadata ?? {})); // #5506: index-only build landed
+            this.noteMetaFp(session.id, rec.metadata ?? {}); // #5506: index-only build landed
             this.noteDurable(session.id, proofRevision); // #4788 D2: index-only build landed
             this.lastSaveLanded.set(session.id, true);
             this.foldResidentTail(session);
@@ -3437,7 +3319,7 @@ export class SessionStore {
             throw err;
         }
         this.stampOwnWrite(session.id); // #3406: the write LANDED — prove our bytes are on disk
-        if (rec.v) this.committedMetaFp.set(session.id, this.metaFingerprint(rec.v.metadata ?? {})); // #5506: immediate save landed
+        if (rec.v) this.noteMetaFp(session.id, rec.v.metadata ?? {}); // #5506: immediate save landed
         this.maybeCutForkBase(session);
         this.noteDurable(session.id, proofRevision);
         this.lastSaveLanded.set(session.id, true);
@@ -3532,6 +3414,18 @@ export class SessionStore {
         return { ...(session.metadata as Record<string, unknown>), biliVersion: VERSION, storageMode: this.liveStorageStamp };
     }
 
+    /** #5805: the persisted-shape metadata fingerprint is consumed by exactly
+     *  one gate — dropResidentMetadata's #5506 fold proof — and index-only
+     *  persistence never folds that field (there is no envelope copy to
+     *  re-materialize from). Hashing the whole metadata record with SHA-256 on
+     *  every save is therefore dead weight in that lane; both stay in step
+     *  here so a lane flip can never leave the fold gate comparing a stale
+     *  proof. */
+    private noteMetaFp(id: string, metadata: Record<string, unknown>): void {
+        if (this.writerOffActive()) return;
+        this.committedMetaFp.set(id, this.metaFingerprint(metadata));
+    }
+
     /** #5506: stable identity of a persisted-shape metadata view — JSON-normalized
      *  (dates → strings, undefined dropped: mirrors what persistence does) then
      *  key-sorted canonicalized (field order must not matter across a disk
@@ -3552,7 +3446,11 @@ export class SessionStore {
      *  exact record a restart would restore). Same refusal semantics as
      *  ②b: an unrecoverable drop throws instead of going empty. */
     private dropResidentMetadata(session: Session): void {
-        if (session.inFlight > 0 || !this.enabled) return;
+        // #5805: an index-only save never writes the envelope, so the lazy
+        // proxies below can only re-materialize from a copy OLDER than memory
+        // (or from the unified index at full cost) — dropping here buys no
+        // safety and costs a re-read on every subsequent turn. Stay resident.
+        if (this.writerOffActive() || session.inFlight > 0 || !this.enabled) return;
         if (isDroppedMetadata(session.metadata)) return;
         if (Object.keys(session.metadata).length === 0) return;
         // #5506: fold ONLY when the disk copy provably carries these exact
@@ -3579,7 +3477,9 @@ export class SessionStore {
      *  store-bound loader (one disk read per burst). Mid-turn saves keep the
      *  resident set; sessions that never persisted keep their plain map. */
     private dropResidentBlockContents(session: Session): void {
-        if (session.inFlight > 0 || !this.enabled) return;
+        // #5805: same index-only rule as dropResidentMetadata — the envelope
+        // this proxy would read back from is stale by construction.
+        if (this.writerOffActive() || session.inFlight > 0 || !this.enabled) return;
         const existing = session.blockContents;
         if (existing instanceof LazyBlockContents) {
             existing.drop();
@@ -3607,7 +3507,10 @@ export class SessionStore {
      *  BILI_SESSION_CONTENT_STORE_PIN restores the previous always-resident
      *  behavior for operators who want it. */
     private dropResidentContentStore(session: Session): void {
-        if (session.inFlight > 0 || !this.enabled) return;
+        // #5805: index-only saves leave the envelope stale; the lazy CCR
+        // loader would restore from the unified mirror at a full read cost
+        // while the resident set is already the freshest copy.
+        if (this.writerOffActive() || session.inFlight > 0 || !this.enabled) return;
         if (isDroppedContentStore(session.contentStore)) return;
         if (session.contentStoreDirty) return; // unsaved growth stays resident until its own save settles
         if (contentStorePinned()) return;     // owner escape hatch
@@ -3710,7 +3613,7 @@ export class SessionStore {
                 return false;
             }
             this.maybeCutForkBase(session);
-            if (rec) this.committedMetaFp.set(session.id, this.metaFingerprint(rec.metadata ?? {})); // #5506: index-only flush landed
+            if (rec) this.noteMetaFp(session.id, rec.metadata ?? {}); // #5506: index-only flush landed
             this.noteDurable(session.id, proofRevision); // #4788 D2: index-only flush landed
             this.lastSaveLanded.set(session.id, true);
             this.foldResidentTail(session);
@@ -3733,7 +3636,7 @@ export class SessionStore {
         const ok = this.store.flushSync(session.id, () => { const r = this.guardedBuild(session)(); syncRec.v = r; return r; });
         if (ok) {
             this.stampOwnWrite(session.id); // #3406: the write LANDED — prove our bytes are on disk
-            if (syncRec.v) this.committedMetaFp.set(session.id, this.metaFingerprint(syncRec.v.metadata ?? {})); // #5506: sync commit landed
+            if (syncRec.v) this.noteMetaFp(session.id, syncRec.v.metadata ?? {}); // #5506: sync commit landed
             this.noteDurable(session.id, proofRevision);
             this.maybeCutForkBase(session);
             this.foldResidentTail(session);
@@ -3764,7 +3667,7 @@ export class SessionStore {
             this.stampOwnWrite(session.id);
         }
         // #5506: the fork record is durable here (envelope or unified row) — prove its metadata
-        this.committedMetaFp.set(session.id, this.metaFingerprint(record.metadata ?? {}));
+        this.noteMetaFp(session.id, record.metadata ?? {});
         this.foldResidentTail(session);
         this.dropResidentBlockContents(session);
         this.dropResidentMetadata(session);
@@ -3787,7 +3690,7 @@ export class SessionStore {
             this.stampOwnWrite(id);
         }
         // #5506: recovered record now durable (envelope written or unified row already held it)
-        this.committedMetaFp.set(id, this.metaFingerprint(record.metadata ?? {}));
+        this.noteMetaFp(id, record.metadata ?? {});
         await this.maybeCutForkBaseAsync(session);
     }
 
@@ -3823,7 +3726,7 @@ export class SessionStore {
         await Promise.all([...armed.entries()].map(([id, slot]) =>
             this.store.writeNow(id, slot.build).then(() => {
                 this.stampOwnWrite(id);
-                if (slot.rec) this.committedMetaFp.set(id, this.metaFingerprint(slot.rec.metadata ?? {})); // #5506: shutdown flush landed
+                if (slot.rec) this.noteMetaFp(id, slot.rec.metadata ?? {}); // #5506: shutdown flush landed
             }).catch((e) => {
                 this.log("error", `[persist] shutdown flush failed for ${id}: ${String(e)}`);
             }),

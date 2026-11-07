@@ -30,30 +30,17 @@ test("pf-channel: count mode; tail-ids ride only a validated list; encoding", ()
     // count-only until ids are captured
     assert.deepEqual(pfChannel.pfRequestHeaders(inH), { "x-bili-pf-count": "2" });
     pfChannel.pfCaptureIds(sid, ["a", "b", "c"]);
-    // #5643 F1 wire form: lists at or under the tail window ride IN FULL
-    // (one segment per body element) — only long lists are windowed
-    assert.deepEqual(pfChannel.pfRequestHeaders(inH), { "x-bili-pf-count": "2", "x-bili-pf-tail-ids": "a,b,c" });
-    // comma inside an id travels %2C; the separator stays literal
+    // K=2 ⇒ [id(K-1)] + new = ["b","c"]; per-segment encode
+    assert.equal(pfChannel.pfRequestHeaders(inH)["x-bili-pf-tail-ids"], "b,c");
+    // comma inside an id travels %2C; the separator stays literal (K=1 ⇒ whole list sent)
     learn(inH, "1");
     pfChannel.pfCaptureIds(sid, ["pre,v1", "new,id"]);
     assert.equal(pfChannel.pfRequestHeaders(inH)["x-bili-pf-tail-ids"], encodeURIComponent("pre,v1") + "," + encodeURIComponent("new,id"));
-    // a short list STILL emits in full (honest presence beats old partial-slice
-    // degradation; the server's hard gate handles geometry, not the client)
+    // a list shorter than K degrades to count-only (never partial)
     const sidShort = "sid-count-short";
     learn({ [CONVO]: sidShort }, "2");
     pfChannel.pfCaptureIds(sidShort, ["x"]);
-    assert.deepEqual(pfChannel.pfRequestHeaders({ [CONVO]: sidShort }), { "x-bili-pf-count": "2", "x-bili-pf-tail-ids": "x" });
-});
-
-test("pf-channel: long captured lists emit ONLY the fixed tail window (#5643 F1)", () => {
-    const sid = "sid-window-1";
-    learn({ [CONVO]: sid }, "99");
-    const many = Array.from({ length: 100 }, (_, i) => `id${i}`);
-    pfChannel.pfCaptureIds(sid, many);
-    const hdr = pfChannel.pfRequestHeaders({ [CONVO]: sid })["x-bili-pf-tail-ids"]!;
-    const segs = decodeURIComponent(hdr).split(",");
-    assert.equal(segs.length, 64, "exactly the last PF_TAIL_WINDOW slots ride, regardless of list length");
-    assert.deepEqual(segs, many.slice(-64), "the window is the TAIL of the captured list (order preserved)");
+    assert.deepEqual(pfChannel.pfRequestHeaders({ [CONVO]: sidShort }), { "x-bili-pf-count": "2" });
 });
 
 test("pf-channel: failed whole-resolution CLEARS the stored list (no stale slice)", () => {
@@ -61,34 +48,30 @@ test("pf-channel: failed whole-resolution CLEARS the stored list (no stale slice
     const inH = { [CONVO]: sid };
     learn(inH, "2");
     pfChannel.pfCaptureIds(sid, ["a", "b"]);
-    assert.deepEqual(pfChannel.pfRequestHeaders(inH), { "x-bili-pf-count": "2", "x-bili-pf-tail-ids": "a,b" });
-    for (const bad of [null, undefined, "not-an-array", [], 42, Array.from({ length: 16_385 }, (_, i) => `m${i}`)]) {
+    assert.equal(pfChannel.pfRequestHeaders(inH)["x-bili-pf-tail-ids"], "b");
+    for (const bad of [null, undefined, "not-an-array", [], 42, Array.from({ length: 2049 }, (_, i) => `m${i}`)]) {
         pfChannel.pfCaptureIds(sid, bad);
         assert.deepEqual(pfChannel.pfRequestHeaders(inH), { "x-bili-pf-count": "2" }, `bad=${String(bad)} must clear`);
     }
 });
 
-test("pf-channel: F2 guarantee branch — ANY id-less slot clears the WHOLE captured table, no '?' on the wire (owner 2026-11-04)", () => {
+test("pf-channel: bad SLOTS ride '?' — one id-less element never poisons the list (owner 2026-11-02)", () => {
     const sid = "sid-slots-1";
     const inH = { [CONVO]: sid };
-    learn(inH, "2"); // stamp known; an id-complete list would ride in full
+    learn(inH, "2"); // K=2 ⇒ this turn's wire carries slots[1..]
     for (const row of [
-        ["ok", 7],
-        ["ok", ""],
-        ["acp_summary_x", "y"],
-        ["a b", "c"],
-        ["c", "c"], // duplicate real id collapses its repeat to a hole
-        ["z".repeat(513), "w"],
+        [["ok", 7], "%3F"],
+        [["ok", ""], "%3F"],
+        [["acp_summary_x", "y"], "y"],
+        [["a b", "c"], "c"],
+        [["c", "c"], "%3F"], // duplicate real id collapses its repeat to unknown
+        [["z".repeat(513), "w"], "w"],
     ] as const) {
-        pfChannel.pfCaptureIds(sid, [...row]);
-        // the mixed span emits NO tail-ids at all — honest absence beats a poisoned slice
-        assert.deepEqual(pfChannel.pfRequestHeaders(inH), { "x-bili-pf-count": "2" }, `slots=${JSON.stringify([...row])} must clear the whole table`);
+        pfChannel.pfCaptureIds(sid, [...row[0]]);
+        assert.equal(pfChannel.pfRequestHeaders(inH)["x-bili-pf-tail-ids"], row[1], `slots=${JSON.stringify(row[0])}`);
     }
-    // negative line: the table RE-ARMS once every element resolves a real unique id again
-    pfChannel.pfCaptureIds(sid, ["q1", "q2"]);
-    assert.deepEqual(pfChannel.pfRequestHeaders(inH), { "x-bili-pf-count": "2", "x-bili-pf-tail-ids": "q1,q2" });
-    // and a later hole clears again — no sticky half-lists either direction
-    pfChannel.pfCaptureIds(sid, ["q3", ""]); 
+    // an ALL-unknown span degrades back to pure count mode (noise beats signal)
+    pfChannel.pfCaptureIds(sid, ["", 7]);
     assert.deepEqual(pfChannel.pfRequestHeaders(inH), { "x-bili-pf-count": "2" });
 });
 
@@ -107,53 +90,6 @@ test("pf-channel: stamp learning screens input", () => {
     // well-formed numeric stamps mutate state — re-learn overwrites
     learn(inH, "7");
     assert.deepEqual(pfChannel.pfRequestHeaders(inH), { "x-bili-pf-count": "7" });
-});
-
-// --- v6 world-id channel (#5643 / #5652 review): slot.v6 learn / echo / retention ---
-
-test("pf-channel: v6 world id — learned once from a 200 response, echoed alongside tail-ids on every later request", () => {
-    const sid = "sid-v6-learn-1";
-    const inH = { [CONVO]: sid };
-    const S = `pf_${"a".repeat(12)}`;
-    pfChannel.pfLearnStamp(inH, 200, new Headers({ "x-bili-pf-seq": "3", "x-bili-pf-session": S }));
-    assert.equal(pfChannel.pfRequestHeaders(inH)["x-bili-pf-session"], S, "the learned world id rides the next request");
-    pfChannel.pfCaptureIds(sid, ["v1", "v2"]);
-    assert.deepEqual(pfChannel.pfRequestHeaders(inH), {
-        "x-bili-pf-count": "3",
-        "x-bili-pf-tail-ids": "v1,v2",
-        "x-bili-pf-session": S,
-    }, "count + tail-ids + world id ride together");
-});
-
-test("pf-channel: v6 world-id screening — malformed forms are not learned, non-2xx never mutates state", () => {
-    const sid = "sid-v6-screen-1";
-    const inH = { [CONVO]: sid };
-    for (const bad of ["pf_short", `PF_${"a".repeat(12)}`, `pf_${"g".repeat(12)}`, "", "pf_", `pf_${"a".repeat(11)}`]) {
-        pfChannel.pfLearnStamp(inH, 200, new Headers({ "x-bili-pf-session": bad }));
-        assert.equal(pfChannel.pfRequestHeaders(inH)["x-bili-pf-session"], undefined, `form ${JSON.stringify(bad)} must not be learned`);
-    }
-    const GOOD = `pf_${"b".repeat(12)}`;
-    pfChannel.pfLearnStamp(inH, 500, new Headers({ "x-bili-pf-seq": "4", "x-bili-pf-session": GOOD }));
-    assert.deepEqual(pfChannel.pfRequestHeaders(inH), {}, "a non-2xx response learns neither the stamp nor the world id");
-});
-
-test("pf-channel: v6 stale retention — slot.v6 is never cleared by later traffic (CURRENT behavior; #5652 review F7(a) owner-decision pending)", () => {
-    const sid = "sid-v6-stale-1";
-    const inH = { [CONVO]: sid };
-    const S1 = `pf_${"c".repeat(12)}`;
-    pfChannel.pfLearnStamp(inH, 200, new Headers({ "x-bili-pf-seq": "2", "x-bili-pf-session": S1 }));
-    // A later v5-style response (stamp only, no session header) must not erase the world
-    pfChannel.pfLearnStamp(inH, 200, new Headers({ "x-bili-pf-seq": "5" }));
-    assert.equal(pfChannel.pfRequestHeaders(inH)["x-bili-pf-session"], S1);
-    // An error response offering a DIFFERENT well-formed sid neither replaces nor clears
-    const S2 = `pf_${"d".repeat(12)}`;
-    pfChannel.pfLearnStamp(inH, 500, new Headers({ "x-bili-pf-session": S2 }));
-    assert.equal(pfChannel.pfRequestHeaders(inH)["x-bili-pf-session"], S1, "S1 persists — the retention this pin nails down");
-    // Why the pin exists: if the server-side disk world goes away (GC / wipe /
-    // migration) while a live host process keeps echoing S1, every turn faults
-    // 400 → parks 60 min → releases → repeats until the host restarts. A fix
-    // like "clear slot.v6 after N consecutive non-2xx" would flip these
-    // assertions deliberately — #5652 review F7(a), owner decision pending.
 });
 
 async function withPfPatch(
@@ -201,7 +137,7 @@ test("chokepoint: routed model request carries count+tail-ids; the response lear
         assert.equal(sinkIn[0].headers["x-bili-pf-count"], undefined, "turn 1 unseeded");
     });
     assert.equal(sink[1].headers["x-bili-pf-count"], "2");
-    assert.equal(sink[1].headers["x-bili-pf-tail-ids"], "m1,m2,m3");
+    assert.equal(sink[1].headers["x-bili-pf-tail-ids"], "m2,m3");
     // the chokepoint fabricates no lane identity of its own
     assert.ok(!("x-bili-plugin" in sink[1].headers), "chokepoint must not add a lane plugin header");
 });
@@ -226,7 +162,7 @@ test("chokepoint: direct-to-proxy self-branch emits and learns (dsh profile shap
         assert.equal(sinkIn[0].headers["x-bili-pf-count"], undefined, "turn 1 unseeded on the self branch too");
     });
     assert.equal(sink[1].headers["x-bili-pf-count"], "4");
-    assert.equal(sink[1].headers["x-bili-pf-tail-ids"], "n1,n2,n3,n4,n5");
+    assert.equal(sink[1].headers["x-bili-pf-tail-ids"], "n4,n5");
 });
 
 test("chokepoint: already-routed /bili/ MODEL url is stamped; __bili/ control-plane never is", async () => {
@@ -249,7 +185,7 @@ test("chokepoint: already-routed /bili/ MODEL url is stamped; __bili/ control-pl
     }, { headersFor: () => ({ "x-bili-plugin": "dsh" }) });
     assert.equal(sink.length, 2);
     assert.equal(sink[0].headers["x-bili-pf-count"], "4");
-    assert.equal(sink[0].headers["x-bili-pf-tail-ids"], "a,b,c,d,e");
+    assert.equal(sink[0].headers["x-bili-pf-tail-ids"], "d,e");
     assert.equal(sink[1].headers["x-bili-pf-count"], undefined);
     assert.equal(sink[1].headers["x-bili-pf-tail-ids"], undefined);
     assert.ok(!sink[1].url.includes("/bili/"), "control plane must not be re-routed");

@@ -176,22 +176,6 @@ test("nested rollout: B evaluated only inside A's cohort, percent relative to it
     });
 });
 
-test("force tier bypasses nesting: forced child runs while its base is off (#5652 review F10 pin)", () => {
-    withFeatures({ a: { percent: 0 }, b: { percent: 100, base: "a" } }, () => {
-        // A at 0% ⇒ nobody in the cohort ⇒ B off for all at the BUCKET tier…
-        assert.equal(rollout.resolveRollout("b", { id: ids[0], env: {}, file: {} }).enabled, false);
-        // …but the force tiers return BEFORE the nesting check, so both explicit
-        // forces still enable B. CURRENT behavior, pinned on purpose — owner
-        // design-confirm pending (#5652 review F10); changing it must be a
-        // deliberate diff here, not an accident.
-        assert.equal(rollout.resolveRollout("b", { id: ids[0], env: { BILI_ROLLOUT_B: "1" }, file: {} }).enabled, true, "env force bypasses parent-off");
-        assert.equal(rollout.resolveRollout("b", { id: ids[0], env: {}, file: { features: { b: { enabled: true } } } }).enabled, true, "config force bypasses parent-off");
-        // Both symmetric negatives hold for the same reason…
-        assert.equal(rollout.resolveRollout("b", { id: ids[0], env: { BILI_ROLLOUT_B: "0" }, file: { features: { b: { enabled: true } } } }).enabled, false, "env 0 still wins over config true");
-        assert.equal(rollout.resolveRollout("b", { id: ids[0], env: {}, file: { features: { b: { enabled: false } } } }).enabled, false, "explicit off still closes the lane");
-    });
-});
-
 test("base cycles fail closed without hanging", () => {
     withFeatures({ x: { percent: 100, base: "y" }, y: { percent: 100, base: "x" }, self: { percent: 100, base: "self" } }, () => {
         for (const f of ["x", "y", "self"]) {
@@ -222,13 +206,8 @@ test("rolloutDecisions: sorted, one per registered feature, real install id", ()
         assert.equal(alpha.enabled, true);
         assert.equal(zeta.enabled, false);
         // percent-0 still flows through the bucketing tier (bucket < 0bp is
-        // never true) — "off" is reserved for features with no percent at all,
-        // plus base-nested members whose base cohort excludes this install
-        // (#5643: watermarkV6MsgId nests under pluginFullResendWatermark).
-        for (const d of ds) {
-            const baseExcluded = d.base !== undefined && !ds.some((x) => x.feature === d.base && x.enabled);
-            assert.equal(d.source, baseExcluded ? "off" : "bucket", d.feature);
-        }
+        // never true) — "off" is reserved for features with no percent at all.
+        for (const d of ds) assert.equal(d.source, "bucket", d.feature);
     });
 });
 
