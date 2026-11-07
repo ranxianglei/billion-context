@@ -5,6 +5,8 @@ carries identity into bili, where it is consumed, and what every new lane must
 do. The design law (owner ruling 2026-11-07): **every client lane wires INTO
 one unified consume seam — no use site ever reads client storage itself.**
 AGENTS.md KDD #18 is the normative statement; this page is the map.
+Companion page (the *determination* side — what bili decides once the ids
+arrive): `docs/session-identity-resolution.md`.
 
 ## 1. The seam
 
