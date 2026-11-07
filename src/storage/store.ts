@@ -1131,8 +1131,11 @@ export class UnifiedStore {
                 .all(s.sessionId) as StoredBlockRow[]) {
                 storedBlocks.set(row.block_id, row);
             }
+            // #5755: Set lookup instead of .some() over every stored block —
+            // the stale sweep was O(B²) on long sessions.
+            const liveBlockIds = new Set(input.blocks.map((b) => b.blockId));
             for (const [blockId, stale] of storedBlocks) {
-                if (input.blocks.some((b) => b.blockId === blockId)) continue;
+                if (liveBlockIds.has(blockId)) continue;
                 // referencing row first, then release (#4242 delete-on-zero)
                 this.db.prepare("DELETE FROM blocks WHERE session_id = ? AND block_id = ?").run(s.sessionId, blockId);
                 this.releaseContent(stale.summary_hash);

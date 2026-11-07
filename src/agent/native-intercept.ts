@@ -642,8 +642,8 @@ async function streamBytesCapped(stream: ReadableStream<Uint8Array>, cap: number
  *  restart (session state is persisted on disk), not another attempt (#3589). */
 function oversizeRefusal(url: string): Response {
     const message =
-        "billion-context refused this request locally: the host's attribution lookup threw mid-request (its agent scope is disposed/closing), so this body cannot be folded into the model's context window — forwarding it uncompressed would be rejected upstream (#2924). " +
-        "While that scope stays dead, retrying this same call will keep failing; restart the client host once (its session state is persisted on disk, so nothing is lost) so the oversized history can be folded back under the window. If you cannot restart, start a fresh session instead.";
+        "billion-context refused this request locally: the host's attribution lookup threw mid-request (its agent scope is disposed/closing), and this body is priced over the model's context window under the calibrated size check (conservative text pricing — every declared byte counts as text, and the bar is the larger of the client-declared window and 1,000,000 tokens) — forwarding it uncompressed would be rejected upstream (#2924). " +
+        "While that scope stays dead, retrying this same call will keep failing; restart the client host once (its session state is persisted on disk, so nothing is lost) so the oversized history can be folded back under the window. If you cannot restart, start a fresh session instead. If the model's real window is larger than the client host declared, fix the host's model declaration and restart — the direct path reopens.";
     const headers = { "content-type": "application/json", "x-bili-gate": "oversize-refusal" };
     if (url.endsWith("/messages")) {
         return new Response(JSON.stringify({ type: "error", error: { type: "invalid_request_error", message } }), { status: 422, headers });
@@ -662,8 +662,8 @@ function oversizeRefusal(url: string): Response {
  *  (there is no broken scope to restart). */
 function unattributedOversizeRefusal(url: string): Response {
     const message =
-        "billion-context refused this request locally: it is not attributed to any bili-managed session, and its body provably exceeds even a 1,000,000-token window — sending it directly to the provider can only be rejected (every retry re-sends the same oversized history, #4068). " +
-        "Route the conversation through a bili-managed session so it can be compressed (check the client's bili plugin attribution), or trim/remove the oversized content (e.g. a giant paste or tool result), or start a fresh session.";
+        "billion-context refused this request locally: it is not attributed to any bili-managed session, and its core text is priced over the model's context window (conservative text pricing — every declared byte counts as text, and the bar is never assumed below the larger of the client-declared window and 1,000,000 tokens) — sending it directly to the provider can only be rejected (every retry re-sends the same oversized history, #4068). " +
+        "If the model's real window is larger than the client host declared, fix the host's model declaration and restart — the direct path reopens. Otherwise, route the conversation through a bili-managed session so it can be compressed (check the client's bili plugin attribution), or trim/remove the oversized content (e.g. a giant paste or tool result), or start a fresh session.";
     const headers = { "content-type": "application/json", "x-bili-gate": "oversize-refusal-unattributed" };
     if (url.endsWith("/messages")) {
         return new Response(JSON.stringify({ type: "error", error: { type: "invalid_request_error", message } }), { status: 422, headers });

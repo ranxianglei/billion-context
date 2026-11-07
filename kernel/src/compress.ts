@@ -2097,8 +2097,11 @@ function decideNudge(input: NudgeInput): NudgeDecision {
   // is the ONLY pressure signal) would otherwise be deferred forever, one
   // estimate round after another. Track the consecutive-estimate streak in
   // NudgeState and stop deferring once it exceeds nudge.maxEstimateHoldRounds
-  // (default 2): the double-ghost windows the guard exists for stay covered,
-  // and worst-case starvation is capped at two missed opportunities.
+  // (default 2): the double-ghost windows the guard exists for stay covered.
+  // Starvation bound: for a usage-reporting backend the streak rarely exceeds
+  // 1, so the cap is ~maxEstimateHoldRounds missed opportunities; for a
+  // silent backend the streak has been accumulating since the session's
+  // first round, so pressure is injected the moment it first arrives.
   const estimateHoldStreak =
     input.tokenCountSource === "estimate"
       ? (state.nudge.estimateHoldStreak ?? 0) + 1

@@ -138,3 +138,22 @@ test("#5199: scope flip is read per settlement — credential-mode account hold 
         _resetUpstreamThrottleForTest();
     });
 });
+
+test("#5199/#5889: a saturated hold map leaves the next model-scoped 429 ungoverned — no phantom hold, one warn", () => {
+    withKnobs({ BILI_THROTTLE_429: "1", BILI_THROTTLE_429_SCOPE: "model" }, () => {
+        _resetUpstreamThrottleForTest();
+        // 64 distinct credentials = a full map of account-wide holds with no
+        // model-scoped hold available to evict (MAX_HOLDS = 64).
+        for (let i = 0; i < 64; i++) {
+            noteUpstreamThrottle429(URL_A, { authorization: `Bearer CRED-${i}` }, null, T0 + i, undefined);
+        }
+        assert.equal(activeThrottleHolds().length, 64);
+        // The 65th key's model-scoped 429 cannot be stored (nothing
+        // model-scoped to evict) and must NOT leave a phantom hold behind —
+        // the send stays governed by nothing, and that fact is said once.
+        noteUpstreamThrottle429(URL_A, { authorization: "Bearer SATURATED" }, null, T0 + 100, throttle429ModelScope(429, MODEL, MARKERLESS_RPM));
+        assert.equal(activeThrottleHolds().length, 64, "no phantom hold on refusal");
+        assert.equal(activeThrottleHolds().some((h) => h.model === MODEL), false, "no model-scoped hold was created");
+        assert.ok(!throttleReject(URL_A, { authorization: "Bearer SATURATED" }, T0 + 101, MODEL), "saturated map leaves this 429 ungoverned");
+    });
+});
