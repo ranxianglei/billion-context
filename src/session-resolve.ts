@@ -161,6 +161,47 @@ function maxAlignedFragRun(kindsA: string[], fragsA: string[], kindsB: string[],
  *  history is the SAME conversation with host-side edits, not a stranger. */
 const CONTINUATION_MIN_RUN = 8;
 
+// #5719 E5: the #3733 authored-checkpoint identity header, as FORGED by
+// src/server/dsh-authored-compaction.ts (BILI_SNAPSHOT_TAG_PREFIX). Pinned
+// locally instead of imported: this module must stay server-free (the wiring
+// direction is handle.ts → here), and the version-pin doctrine
+// (src/server/dsh-compaction-guard.ts header) wants detector constants local.
+// If the producer's bytes drift the scan degrades to a MISS — the pre-#5719
+// fork behavior — never to a false claim.
+const BILI_SNAPSHOT_CONV_RE = /\x3cbili-snapshot v1 [^\x3e]*\bconv="([^"]+)"/;
+
+/** #5719 E5: does the FIRST user message carry our own authored-checkpoint
+ *  identity header declaring exactly `rawId`? A full compaction erases every
+ *  continuation proof the tag-changed rungs demand by definition (recorded
+ *  tail gone, depth collapsed, zero assistant in the first post-compaction
+ *  step) — the self-declaration is the one survivor. Content-blind text
+ *  extraction over all four wire shapes (string content; parts/blocks arrays
+ *  with .text items — openai/anthropic/responses/google alike). Only the
+ *  first user message counts: a LATER quote of a checkpoint (the #4438
+ *  class) must never re-anchor someone else's lane. */
+function selfCheckpointDeclares(history: unknown, rawId: string): boolean {
+    if (!Array.isArray(history)) return false;
+    for (const m of history as unknown[]) {
+        if (m === null || typeof m !== "object") continue;
+        const msg = m as { role?: unknown; content?: unknown; parts?: unknown };
+        if (msg.role !== "user") continue;
+        const c = msg.content !== undefined ? msg.content : msg.parts;
+        let text = "";
+        if (typeof c === "string") {
+            text = c;
+        } else if (Array.isArray(c)) {
+            for (const p of c) {
+                if (p !== null && typeof p === "object" && typeof (p as { text?: unknown }).text === "string") {
+                    text += (p as { text: string }).text;
+                }
+            }
+        }
+        const hit = BILI_SNAPSHOT_CONV_RE.exec(text);
+        return hit !== null && hit[1] === rawId;
+    }
+    return false;
+}
+
 export type SessionOrderResolution = {
     key: string;
     action: "claim" | "continue" | "reanchor" | "derived-aux" | "derived-task" | "derived-persona";
@@ -208,7 +249,10 @@ function record(rawId: string, turns: NeutralTurn[], tagHash: string, model?: st
  *  kinds prefix-align AND head fragments match) migrates the raw key
  *  (#2241/#2250); a tag change whose recorded body still sits verbatim at
  *  its own indices inside the incoming (host-side rewrite of its own log —
- *  #4778) migrates too; only a tag change with NO positional continuation
+ *  #4778) migrates too; a tag change whose first user message carries our
+ *  own authored checkpoint declaring exactly the raw id migrates outright
+ *  (#5719 — full compaction erases every positional proof by definition,
+ *  the self-declaration is the survivor); only a tag change with NO such
  *  evidence forks onto `<rawId>|sub:<fp16(tag)>` — byte-identical to the
  *  old ladder's fork keys, so persisted fork lanes keep their sessions
  *  across the upgrade.
@@ -230,10 +274,42 @@ function record(rawId: string, turns: NeutralTurn[], tagHash: string, model?: st
  *  byte-for-byte, so (id, persona) alone is not injective over RUNS. A
  *  non-empty discriminator widens the fork key to
  *  `<rawId>|sub:<fp16(tag)>:<fp16(disc)>`; every other caller omits both
- *  optional args and keeps the byte-identical old ladder. */
-export function resolveSessionOrder(rawId: string, history: unknown, personaTag?: string, declaredModel?: string, laneToken?: string, laneDiscriminator?: string): SessionOrderResolution {
+ *  optional args and keeps the byte-identical old ladder.
+ *
+ *  `msgIds` (#5719, second-to-last param for source compatibility): the
+ *  host-stamped per-message id array riding the request (`biliMsgIds`, the
+ *  #4491 pipeline — dsh's llm/stream waterfall mints a stable UUID per
+ *  message and resends it unchanged across restarts and compactions). It
+ *  adds ONE rung and nowhere else: at the FORK exits, when every byte-level
+ *  escape was defeated because the host destroyed the evidence in the same
+ *  turn it changed the system text (full compaction ∩ volatile-field drift —
+ *  the #5517/#5719 composite field failure), ANY overlap between the
+ *  incoming ids and the message ids RECORDED under this key in the UNIFIED
+ *  STORE (the messages.msg_id column — #4491 pins these very ids at ingest,
+ *  so there is NO parallel JSON ledger) proves the SAME conversation
+ *  (host-minted random UUIDs cannot collide across distinct conversations)
+ *  and the request re-anchors onto the raw lane instead of forking a
+ *  zero-state `|sub:` child. Requests without stamped ids — or with an
+ *  unavailable store view — take exactly the pre-change path.
+ *
+ *  `readStoredMsgIds` (#5719, LAST param): `(key) => readonly string[] | null`
+ *  — the recorded msg_ids for a conversation key (production:
+ *  getStore().unifiedAllMessageIds — #5312's full historical id set, live AND
+ *  retired rows, identity-only with no content hydration). Invoked AT MOST
+ *  once, and only at a fork exit with non-empty inbound ids; never on the
+ *  hot path. null = store unavailable (latch-off / legacy epoch) →
+ *  byte-evidence only.
+ */
+export function resolveSessionOrder(rawId: string, history: unknown, personaTag?: string, declaredModel?: string, laneToken?: string, laneDiscriminator?: string, msgIds?: string[], readStoredMsgIds?: (rawKey: string) => readonly string[] | null): SessionOrderResolution {
     const list = Array.isArray(history) ? (history as unknown[]) : [];
     const turns = neutralTurns(list);
+    // #5719: normalize the incoming stamped ids ONCE (malformed/absent →
+    // undefined — degrade over half-trust, the fork-exit rung below then
+    // takes exactly the pre-change path).
+    const inboundIds: string[] | undefined =
+        msgIds !== undefined && msgIds.length > 0 && msgIds.every((s) => typeof s === "string" && s.trim().length > 0)
+            ? msgIds
+            : undefined;
     const kinds = turns.map((t) => t.kind);
     const incomingFrags = fragsOf(turns);
     const tag = personaTag !== undefined && personaTag.trim().length > 0 ? personaTag : "";
@@ -282,6 +358,34 @@ export function resolveSessionOrder(rawId: string, history: unknown, personaTag?
     // and never counts as a persona change.
     const effectiveTagHash = tagHash === "" ? recorded.tagHash : tagHash;
     const effectiveModel = model ?? recorded.model;
+    /** Fork-exit last resort: host-minted msgids survive BOTH destructive
+     *  forces (compaction deletes cells, system rewrite deletes fragments),
+     *  so any overlap between the incoming ids and the rows recorded under
+     *  THIS KEY in the unified store is proof of identity — re-anchor
+     *  instead of forking a zero-state sub lane (#5719). The store lookup is
+     *  LAZY (fires only here, with stamped ids present) and null-safe: a
+     *  latched-off / legacy store degrades to the byte-evidence path. */
+    const tryMsgIdRescue = (): SessionOrderResolution | null => {
+        if (inboundIds === undefined || readStoredMsgIds === undefined) return null;
+        const stored = readStoredMsgIds(rawId);
+        if (stored === null || stored.length === 0) return null;
+        const known = new Set(stored);
+        let hits = 0;
+        let firstHit = "";
+        for (const s of inboundIds) {
+            if (known.has(s)) {
+                hits++;
+                if (firstHit === "") firstHit = s;
+            }
+        }
+        if (hits === 0) return null;
+        record(rawId, turns, effectiveTagHash, effectiveModel);
+        return {
+            key: rawId,
+            action: "reanchor",
+            reason: `byte-level continuation failed but ${hits} host message id(s) match rows recorded for this key in the unified store (${firstHit}) — same conversation by sessionid+msgid identity (#5719)`,
+        };
+    };
     if (tagChanged) {
         // Persona guard (owner rule 3). Same id, different persona text:
         // keep raw ONLY with order AND content evidence — the kinds must
@@ -291,6 +395,18 @@ export function resolveSessionOrder(rawId: string, history: unknown, personaTag?
         // else is a different persona under the shared id (#150 fresh
         // task, #1916 auto-review): its own `|sub:<fp16(tag)>` lane,
         // stable across successive calls of the same persona.
+        if (selfCheckpointDeclares(history, rawId)) {
+            // #5719 E5 (first rung — strongest evidence, cheapest check): the
+            // incoming carries bili's OWN authored checkpoint (#3733) whose
+            // identity header declares this exact raw id. Full compaction
+            // erases every continuation proof the rungs below demand by
+            // definition, so no other evidence is demanded here — the marker
+            // IS the proof. record() moves the recorded tagHash to the new
+            // tag, so the next request is tag-unchanged and simply continues;
+            // the `|sub:` fork never happens and the parent lane unfreezes.
+            record(rawId, turns, tagHash, effectiveModel);
+            return { key: rawId, action: "reanchor", reason: "self-authored checkpoint declares this raw id — continuation across full-compaction rewrite (#5719)" };
+        }
         const headN = Math.min(kinds.length, recorded.kinds.length);
         const headAligns = headN > 0 && recorded.kinds.every((k, i) => kinds[i] === k);
         const headFragsEqual = headN > 0 && incomingFrags.slice(0, headN).every((f, i) => f === recorded.frags[i]);
@@ -366,6 +482,11 @@ export function resolveSessionOrder(rawId: string, history: unknown, personaTag?
             record(rawId, turns, tagHash, effectiveModel);
             return { key: rawId, action: "reanchor", reason: "persona text changed but the shorter incoming keeps the recorded conversation's fragment-verified tail — head rewrite under a new system prompt, anchor kept (#5686)" };
         }
+        // #5719: every byte-level escape needs EVIDENCE (fragments/cells/
+        // chain continuity) that the composite field failure destroys in the
+        // same turn — fall back to the only surviving identity carrier.
+        const msgRescue = tryMsgIdRescue();
+        if (msgRescue !== null) return msgRescue;
         // #5095 D1-B: a non-empty discriminator (only the claude-anthropic
         // headless-subagent call site passes one) widens the key into a
         // three-segment form so distinct same-type runs never share a
@@ -413,6 +534,8 @@ export function resolveSessionOrder(rawId: string, history: unknown, personaTag?
         // derived, never the raw key, until the skeleton is re-established.
         // The skeleton-hash discriminator keeps distinct strangers (two
         // subagents under one main id) on distinct compression sessions.
+        const taskRescue = tryMsgIdRescue();
+        if (taskRescue !== null) return taskRescue;
         return { key: `${rawId}|sub:task:${skel8(kinds)}`, action: "derived-task", reason: "no order+fragment alignment with the recorded skeleton" };
     }
     // Shorter than recorded: either head truncation (dsh native compaction
@@ -431,6 +554,8 @@ export function resolveSessionOrder(rawId: string, history: unknown, personaTag?
         record(rawId, turns, effectiveTagHash, effectiveModel);
         return { key: rawId, action: "reanchor", reason: "same persona id, shorter replay — skeleton follows the living end" };
     }
+    const shortRescue = tryMsgIdRescue();
+    if (shortRescue !== null) return shortRescue;
     return {
         key: `${rawId}|sub:task:${skel8(kinds)}`,
         action: "derived-task",
@@ -470,7 +595,14 @@ export function applyOrderSnapshot(entries: OrderSkeletonEntry[]): number {
  *  raw id + the request's history in, the conversation key out. The old
  *  ladder consumed (systemText, model) and keyed by system-hash; the v2
  *  resolver is content-blind and keys by order+id with fragment guards,
- *  so those parameters are simply gone. */
+ *  so those parameters are simply gone.
+ *
+ *  `msgIds` (#5719) and `readStoredMsgIds` (#5719) are deliberately the LAST
+ *  parameters so every existing call site stays source-compatible; pass the
+ *  validated `biliMsgIds` array (src/msgid-pin.ts `incomingMsgIdsOf`) plus
+ *  the unified-store msg_id lookup so the fork-exit rung can prove identity
+ *  by sessionid+msgid when the byte-level evidence was destroyed in the same
+ *  turn (#5517 compound failure). The lookup is invoked lazily, at most once. */
 /** #5686 visibility seam (optional): observers of state-changing outcomes.
  *  Production used to discard everything but the key, so every fork
  *  (derived-*) and migration (reanchor) ran with zero durable trace — the
@@ -480,8 +612,8 @@ export function applyOrderSnapshot(entries: OrderSkeletonEntry[]): number {
  *  resolution. */
 type SessionResolveObserver = (rawId: string, r: SessionOrderResolution) => void;
 
-export function personaConversationOrder(rawId: string, history: unknown, personaTag?: string, declaredModel?: string, laneToken?: string, laneDiscriminator?: string, onResolve?: SessionResolveObserver): string {
-    const res = resolveSessionOrder(rawId, history, personaTag ?? "", declaredModel, laneToken, laneDiscriminator);
+export function personaConversationOrder(rawId: string, history: unknown, personaTag?: string, declaredModel?: string, laneToken?: string, laneDiscriminator?: string, onResolve?: SessionResolveObserver, msgIds?: string[], readStoredMsgIds?: (rawKey: string) => readonly string[] | null): string {
+    const res = resolveSessionOrder(rawId, history, personaTag ?? "", declaredModel, laneToken, laneDiscriminator, msgIds, readStoredMsgIds);
     if (onResolve !== undefined) {
         try {
             onResolve(rawId, res);

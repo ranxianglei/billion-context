@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { readdir, readFile, rm } from "node:fs/promises";
 import * as path from "node:path";
 const { join } = path;
@@ -341,6 +341,61 @@ export function fileNameMatchesId(base: string, id: string, protocol?: string, u
     return false;
 }
 
+/** #5779: forensic retention cap for `.corrupt-<ts>` quarantine copies per base
+ *  file, counting the just-created copy. The newest copy carries the forensics;
+ *  older copies of the same base are redundant history of an already-fresh-
+ *  started session. */
+export const CORRUPT_SIBLING_CAP = 1;
+
+/** #5779: bound `.corrupt-<ts>` quarantine copies so a hot session can no
+ *  longer accumulate unbounded forensic weight on disk (issue #5779: 273 ×
+ *  ~0.6 GiB in one tree). Keeps at most CORRUPT_SIBLING_CAP siblings of
+ *  `baseFile` in total — `keepPath` (the just-created copy) always survives
+ *  even under clock skew; older ones are deleted. Best-effort: an unreadable
+ *  dir or a locked file (Windows AV) skips the entry and the next quarantine
+ *  retries the sweep. Returns removal counts for log lines; never throws. */
+export function pruneCorruptSiblings(baseFile: string, keepPath?: string): { removed: number; locked: number } {
+    const dir = path.dirname(baseFile);
+    const prefix = `${path.basename(baseFile)}.corrupt-`;
+    const keepName = keepPath ? path.basename(keepPath) : undefined;
+    let names: string[];
+    try {
+        names = readdirSync(dir);
+    } catch {
+        return { removed: 0, locked: 0 };
+    }
+    const stampOf = (name: string): number => {
+        const n = Number(name.slice(prefix.length));
+        return Number.isFinite(n) ? n : 0;
+    };
+    const others = names.filter((n) => n.startsWith(prefix) && n !== keepName).sort((a, b) => stampOf(b) - stampOf(a));
+    let removed = 0;
+    let locked = 0;
+    for (const name of others.slice(Math.max(0, CORRUPT_SIBLING_CAP - 1))) {
+        try {
+            unlinkSync(path.join(dir, name));
+            removed++;
+        } catch {
+            locked++;
+        }
+    }
+    return { removed, locked };
+}
+
+/** #5779: true when a decode failure is resource exhaustion — V8 reports both
+ *  allocation families ("Array buffer allocation failed", "JavaScript heap out
+ *  of memory") as RangeError. Such a file must NOT be quarantined: the bytes
+ *  are fine, the process just could not afford them this round. The
+ *  "Maximum call stack size exceeded" RangeError is structural pathology
+ *  (genuinely pathological payload depth) and stays on the corruption side. */
+export function isAllocationFailureError(error: unknown): boolean {
+    return error instanceof RangeError && /allocation failed|heap out of memory/i.test(error.message);
+}
+
+function errText(error: unknown): string {
+    return error instanceof Error ? error.message : String(error);
+}
+
 /** Session persistence policy over the kernel StateStore mechanism. The
  *  public API predates the extraction and is kept stable for session.ts /
  *  server.ts / export.ts. */
@@ -375,12 +430,19 @@ export class SessionStore {
      *  nobody else committed since — skipping the full-file read+parse that
      *  costs ~320ms/turn on >40MiB sessions. An unstamped token (no "written")
      *  is unproven and never takes the fast path. Cleared on the direct-write
-     *  paths (restore/rekey) that bypass guardedBuild. */
+     *  paths (restore/rekey) that bypass guardedBuild.
+     *
+     *  #5805: under index-only persistence this process never writes the
+     *  envelope at all, so "written" can never be stamped — the file proof is
+     *  replaced by "writerOffFile", the envelope's stat AT OUR LAST BUILD: an
+     *  unchanged file proves no foreign writer landed since, and the unified
+     *  rows already prove no sibling committed. */
     private readonly ownCommit = new Map<string, {
         requests: number;
         nextBlockId: number;
         builtAtMs: number;
         written?: { size: number; mtimeMs: number };
+        writerOffFile?: string;
         meta?: { protocol?: string; upstreamOrigin?: string };
     }>();
 
@@ -812,7 +874,7 @@ export class SessionStore {
                 const warmProof = session.revisionEpoch; // #4788 D2
                 const warmRec: { v: PersistedSession | null } = { v: null };
                 await this.store.writeNow(id, () => { const r = this.buildRecordForSave(session); warmRec.v = r; return r; });
-                if (warmRec.v) this.committedMetaFp.set(id, this.metaFingerprint(warmRec.v.metadata ?? {})); // #5506: clamp rewrite landed
+                if (warmRec.v) this.noteMetaFp(id, warmRec.v.metadata ?? {}); // #5506: clamp rewrite landed
                 this.noteDurable(id, warmProof); // clamp rewrite landed
                 clamped++;
                 // #3049: the clamp rewrite writes a DIFFERENT payload than any
@@ -1153,14 +1215,24 @@ export class SessionStore {
         }
         let raw: unknown;
         try { raw = JSON.parse(bytes.toString("utf8")); }
-        catch {
+        catch (plainTextError) {
             try { raw = JSON.parse(this.readCodec.decode(bytes)); }
             catch (decodeError) {
                 // #3157 self-heal: a size-correct but undecodable file (a VDL=0
-                // zero file left by a crash between write and rename — now
-                // prevented by the fsync fix) used to throw here on every load,
-                // 502-ing the whole lane until a human deleted the file. Isolate
-                // it beside the original and start this session fresh instead.
+                // torn write — now prevented by #3157's fsync; pre-fix files can
+                // still surface) used to throw here on every load, 502-ing the
+                // whole lane until a human deleted the file. Isolate it beside
+                // the original and start this session fresh instead.
+                // #5779: allocation failure = resource exhaustion, not corruption —
+                // quarantining destroyed a healthy envelope and its fold state, and
+                // the eviction/cold-load loop rebuilt + re-quarantined it (~0.6 GiB
+                // of forensic copies per failure). Classify BOTH errors: an OOM in
+                // the first attempt leaves this catch holding only the codec's own
+                // format error. Leave the file in place; the next load retries.
+                if (isAllocationFailureError(plainTextError) || isAllocationFailureError(decodeError)) {
+                    this.log("error", `[persist] session state ${path.basename(file)} unreadable this round — decode ran out of memory, NOT corruption; file left in place for retry (${errText(plainTextError)} / ${errText(decodeError)})`);
+                    return null;
+                }
                 this.quarantineCorruptState(file, id, decodeError);
                 return null;
             }
@@ -1181,16 +1253,21 @@ export class SessionStore {
      *  (plugin.ts). Best-effort: if the rename fails (Windows AV/indexer lock),
      *  the caller still treats the file as a miss — the session starts fresh and
      *  the next boot retries the isolation. The `.corrupt-<ts>` suffix does not
-     *  end in `.json`, so the directory walkers skip it next boot (it stays for
-     *  forensics; sweepStaleTemps only removes `.tmp-*` orphans). */
+     *  end in `.json`, so the directory walkers skip it next boot. Retention is
+     *  bounded (#5779): pruneCorruptSiblings keeps only the newest
+     *  CORRUPT_SIBLING_CAP copy per base file — the forensic value lives in the
+     *  latest failure, and unbounded copies once filled user disks (~0.6 GiB
+     *  each, hundreds per tree). */
     private quarantineCorruptState(file: string, id: string, cause: unknown): void {
-        const causeText = cause instanceof Error ? cause.message : String(cause);
+        const causeText = errText(cause);
         const quarantinePath = `${file}.corrupt-${Date.now()}`;
         try {
             renameSync(file, quarantinePath);
-            this.log("warn", `[persist] quarantined undecodable session state ${path.basename(file)} → ${path.basename(quarantinePath)}; starting ${id} fresh (${causeText})`);
+            const pruned = pruneCorruptSiblings(file, quarantinePath);
+            const capNote = pruned.removed > 0 ? `; removed ${pruned.removed} older forensic cop${pruned.removed === 1 ? "y" : "ies"} (cap ${CORRUPT_SIBLING_CAP})` : "";
+            this.log("warn", `[persist] quarantined undecodable session state ${path.basename(file)} → ${path.basename(quarantinePath)}; starting ${id} fresh (${causeText})${capNote}`);
         } catch (renameErr) {
-            this.log("error", `[persist] failed to quarantine corrupt session state ${path.basename(file)}; resuming ${id} empty this load (${causeText}; rename: ${renameErr instanceof Error ? renameErr.message : String(renameErr)})`);
+            this.log("error", `[persist] failed to quarantine corrupt session state ${path.basename(file)}; resuming ${id} empty this load (${causeText}; rename: ${errText(renameErr)})`);
         }
     }
 
@@ -1320,7 +1397,7 @@ export class SessionStore {
             const rekeyProof = session.revisionEpoch; // #4788 D2
             const rekeyRec: { v: PersistedSession | null } = { v: null };
             await this.store.writeNow(label, () => { const r = this.buildRecordForSave(session); rekeyRec.v = r; return r; });
-            if (rekeyRec.v) this.committedMetaFp.set(label, this.metaFingerprint(rekeyRec.v.metadata ?? {})); // #5506: rekey rewrite landed
+            if (rekeyRec.v) this.noteMetaFp(label, rekeyRec.v.metadata ?? {}); // #5506: rekey rewrite landed
             this.noteDurable(label, rekeyProof); // rekey rewrite landed
             // #3049: direct write bypassing guardedBuild — the boot rekey
             // rewrites envelopes without the sidecar ingest, so any prior
@@ -2548,7 +2625,7 @@ export class SessionStore {
         record.savedAt = Date.now();
         record.meta = { ...record.meta, restoredFrom: cp.session_id, restoredCheckpoint: cp.cp_id } as PersistedSession["meta"];
         await this.store.writeNow(newId, () => record);
-        this.committedMetaFp.set(newId, this.metaFingerprint(record.metadata ?? {})); // #5506: replica restore landed
+        this.noteMetaFp(newId, record.metadata ?? {}); // #5506: replica restore landed
         shadow.record(record);
         // #3049: the replica record was ingested from the checkpoint payload
         // — the ownership token must mirror exactly those counters.
@@ -2716,12 +2793,34 @@ export class SessionStore {
             return false; // sidecar hiccup — full read decides
         }
         if (!row || row.requests !== own.requests || row.nextBlockId !== own.nextBlockId) return false;
+        // #5805: index-only saves (writerOff, or a per-session envelope freeze)
+        // never touch the file, so "written" never exists and the proof below
+        // would fall back to the expensive full read on EVERY save — on a
+        // 100+ MiB session that was a 138 MB read + parse per turn. Replace it
+        // with the "no foreign writer since our last build" shape: the unified
+        // rows above already prove no sibling committed, and an unchanged
+        // envelope stat proves nothing wrote the file behind our back.
+        if (this.writerOffActive() || this.envelopeFrozen(incoming.id)) {
+            return this.envelopeFileKey(incoming.id, incoming.meta) === own.writerOffFile;
+        }
         const stat = this.statEnvelope(incoming.id, incoming.meta);
         if (!stat) return false;
         if (!own.written) return false; // unproven token (see stampOwnWrite) — full read decides
         if (stat.size !== own.written.size) return false; // any byte-count change is a foreign write (bigger OR smaller)
         if (stat.mtimeMs > own.written.mtimeMs + OWN_WRITE_STAMP_EPSILON_MS) return false;
         return true;
+    }
+
+    /** #5805: cheap identity of the envelope file's current state — the
+     *  index-only lane's stand-in for the "written" post-write stamp. The
+     *  mtime stays at full float precision (NO rounding): an untouched file
+     *  re-stats to the identical value on every supported filesystem, so the
+     *  comparison degrades conservatively (worst case: an extra exact read)
+     *  while rounding would blind the guard to a same-size foreign rewrite
+     *  landing within half a millisecond of the recorded stat (#5805). */
+    private envelopeFileKey(id: string, meta?: { protocol?: string; upstreamOrigin?: string }): string {
+        const stat = this.statEnvelope(id, meta);
+        return stat ? `${stat.size}:${stat.mtimeMs}` : "absent";
     }
 
     /** #3049: stat the envelope the way loadEnvelope would resolve it — the
@@ -2844,6 +2943,11 @@ export class SessionStore {
             nextBlockId: committed.state?.nextBlockId ?? 0,
             builtAtMs: Date.now(),
             written: prev?.written,
+            // #5805: index-only lanes produce no write stamp — record the
+            // envelope's stat as of this build instead (see ownershipFastPath).
+            writerOffFile: this.writerOffActive() || this.envelopeFrozen(id)
+                ? this.envelopeFileKey(id, committed.meta ?? prev?.meta)
+                : undefined,
             meta: committed.meta
                 ? { protocol: committed.meta.protocol, upstreamOrigin: committed.meta.upstreamOrigin }
                 : prev?.meta,
@@ -2958,7 +3062,7 @@ export class SessionStore {
                 try {
                     const rec = this.guardedBuild(session)();
                     this.maybeCutForkBase(session);
-                    this.committedMetaFp.set(session.id, this.metaFingerprint(rec.metadata ?? {})); // #5506: index-only build landed
+                    this.noteMetaFp(session.id, rec.metadata ?? {}); // #5506: index-only build landed
                     // #4788 D2: the index-only build landed synchronously —
                     // run the same settle protocol as a kernel-write land
                     // (invariant #5: this routing path gets equivalent
@@ -3022,7 +3126,7 @@ export class SessionStore {
             this.saveWritesInFlight.add(id);
             void this.store.writeNow(id, armed.build).then(() => {
                 this.stampOwnWrite(id); // #3406: the write LANDED — prove our bytes are on disk
-                if (armed.rec) this.committedMetaFp.set(id, this.metaFingerprint(armed.rec.metadata ?? {})); // #5506: debounced save landed
+                if (armed.rec) this.noteMetaFp(id, armed.rec.metadata ?? {}); // #5506: debounced save landed
                 this.noteDurable(id, proofRevision);
                 this.lastSaveLanded.set(id, true);
                 // #4788 D2: discharge the droppable fields once the debounced
@@ -3196,7 +3300,7 @@ export class SessionStore {
             const proofRevision = session.revisionEpoch; // #4788 D2: capture BEFORE the sync build
             const rec = this.guardedBuild(session)();
             this.maybeCutForkBase(session);
-            this.committedMetaFp.set(session.id, this.metaFingerprint(rec.metadata ?? {})); // #5506: index-only build landed
+            this.noteMetaFp(session.id, rec.metadata ?? {}); // #5506: index-only build landed
             this.noteDurable(session.id, proofRevision); // #4788 D2: index-only build landed
             this.lastSaveLanded.set(session.id, true);
             this.foldResidentTail(session);
@@ -3215,7 +3319,7 @@ export class SessionStore {
             throw err;
         }
         this.stampOwnWrite(session.id); // #3406: the write LANDED — prove our bytes are on disk
-        if (rec.v) this.committedMetaFp.set(session.id, this.metaFingerprint(rec.v.metadata ?? {})); // #5506: immediate save landed
+        if (rec.v) this.noteMetaFp(session.id, rec.v.metadata ?? {}); // #5506: immediate save landed
         this.maybeCutForkBase(session);
         this.noteDurable(session.id, proofRevision);
         this.lastSaveLanded.set(session.id, true);
@@ -3310,6 +3414,18 @@ export class SessionStore {
         return { ...(session.metadata as Record<string, unknown>), biliVersion: VERSION, storageMode: this.liveStorageStamp };
     }
 
+    /** #5805: the persisted-shape metadata fingerprint is consumed by exactly
+     *  one gate — dropResidentMetadata's #5506 fold proof — and index-only
+     *  persistence never folds that field (there is no envelope copy to
+     *  re-materialize from). Hashing the whole metadata record with SHA-256 on
+     *  every save is therefore dead weight in that lane; both stay in step
+     *  here so a lane flip can never leave the fold gate comparing a stale
+     *  proof. */
+    private noteMetaFp(id: string, metadata: Record<string, unknown>): void {
+        if (this.writerOffActive()) return;
+        this.committedMetaFp.set(id, this.metaFingerprint(metadata));
+    }
+
     /** #5506: stable identity of a persisted-shape metadata view — JSON-normalized
      *  (dates → strings, undefined dropped: mirrors what persistence does) then
      *  key-sorted canonicalized (field order must not matter across a disk
@@ -3330,7 +3446,11 @@ export class SessionStore {
      *  exact record a restart would restore). Same refusal semantics as
      *  ②b: an unrecoverable drop throws instead of going empty. */
     private dropResidentMetadata(session: Session): void {
-        if (session.inFlight > 0 || !this.enabled) return;
+        // #5805: an index-only save never writes the envelope, so the lazy
+        // proxies below can only re-materialize from a copy OLDER than memory
+        // (or from the unified index at full cost) — dropping here buys no
+        // safety and costs a re-read on every subsequent turn. Stay resident.
+        if (this.writerOffActive() || session.inFlight > 0 || !this.enabled) return;
         if (isDroppedMetadata(session.metadata)) return;
         if (Object.keys(session.metadata).length === 0) return;
         // #5506: fold ONLY when the disk copy provably carries these exact
@@ -3357,7 +3477,9 @@ export class SessionStore {
      *  store-bound loader (one disk read per burst). Mid-turn saves keep the
      *  resident set; sessions that never persisted keep their plain map. */
     private dropResidentBlockContents(session: Session): void {
-        if (session.inFlight > 0 || !this.enabled) return;
+        // #5805: same index-only rule as dropResidentMetadata — the envelope
+        // this proxy would read back from is stale by construction.
+        if (this.writerOffActive() || session.inFlight > 0 || !this.enabled) return;
         const existing = session.blockContents;
         if (existing instanceof LazyBlockContents) {
             existing.drop();
@@ -3385,7 +3507,10 @@ export class SessionStore {
      *  BILI_SESSION_CONTENT_STORE_PIN restores the previous always-resident
      *  behavior for operators who want it. */
     private dropResidentContentStore(session: Session): void {
-        if (session.inFlight > 0 || !this.enabled) return;
+        // #5805: index-only saves leave the envelope stale; the lazy CCR
+        // loader would restore from the unified mirror at a full read cost
+        // while the resident set is already the freshest copy.
+        if (this.writerOffActive() || session.inFlight > 0 || !this.enabled) return;
         if (isDroppedContentStore(session.contentStore)) return;
         if (session.contentStoreDirty) return; // unsaved growth stays resident until its own save settles
         if (contentStorePinned()) return;     // owner escape hatch
@@ -3488,7 +3613,7 @@ export class SessionStore {
                 return false;
             }
             this.maybeCutForkBase(session);
-            if (rec) this.committedMetaFp.set(session.id, this.metaFingerprint(rec.metadata ?? {})); // #5506: index-only flush landed
+            if (rec) this.noteMetaFp(session.id, rec.metadata ?? {}); // #5506: index-only flush landed
             this.noteDurable(session.id, proofRevision); // #4788 D2: index-only flush landed
             this.lastSaveLanded.set(session.id, true);
             this.foldResidentTail(session);
@@ -3511,7 +3636,7 @@ export class SessionStore {
         const ok = this.store.flushSync(session.id, () => { const r = this.guardedBuild(session)(); syncRec.v = r; return r; });
         if (ok) {
             this.stampOwnWrite(session.id); // #3406: the write LANDED — prove our bytes are on disk
-            if (syncRec.v) this.committedMetaFp.set(session.id, this.metaFingerprint(syncRec.v.metadata ?? {})); // #5506: sync commit landed
+            if (syncRec.v) this.noteMetaFp(session.id, syncRec.v.metadata ?? {}); // #5506: sync commit landed
             this.noteDurable(session.id, proofRevision);
             this.maybeCutForkBase(session);
             this.foldResidentTail(session);
@@ -3542,7 +3667,7 @@ export class SessionStore {
             this.stampOwnWrite(session.id);
         }
         // #5506: the fork record is durable here (envelope or unified row) — prove its metadata
-        this.committedMetaFp.set(session.id, this.metaFingerprint(record.metadata ?? {}));
+        this.noteMetaFp(session.id, record.metadata ?? {});
         this.foldResidentTail(session);
         this.dropResidentBlockContents(session);
         this.dropResidentMetadata(session);
@@ -3565,7 +3690,7 @@ export class SessionStore {
             this.stampOwnWrite(id);
         }
         // #5506: recovered record now durable (envelope written or unified row already held it)
-        this.committedMetaFp.set(id, this.metaFingerprint(record.metadata ?? {}));
+        this.noteMetaFp(id, record.metadata ?? {});
         await this.maybeCutForkBaseAsync(session);
     }
 
@@ -3601,7 +3726,7 @@ export class SessionStore {
         await Promise.all([...armed.entries()].map(([id, slot]) =>
             this.store.writeNow(id, slot.build).then(() => {
                 this.stampOwnWrite(id);
-                if (slot.rec) this.committedMetaFp.set(id, this.metaFingerprint(slot.rec.metadata ?? {})); // #5506: shutdown flush landed
+                if (slot.rec) this.noteMetaFp(id, slot.rec.metadata ?? {}); // #5506: shutdown flush landed
             }).catch((e) => {
                 this.log("error", `[persist] shutdown flush failed for ${id}: ${String(e)}`);
             }),

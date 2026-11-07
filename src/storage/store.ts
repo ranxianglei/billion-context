@@ -974,6 +974,15 @@ export class UnifiedStore {
                         // unbounded leak #3762/#3901 called out. The
                         // re-ingest path below re-establishes mappings and
                         // refcounts if the row ever reactivates.
+                        // #5756: a row that is ALREADY retired is pure
+                        // bookkeeping — every reader checks only
+                        // NULL/non-NULL, so re-stamping the tombstone and
+                        // re-sweeping its (already-empty) media mappings
+                        // costs O(history) statements per turn on stable
+                        // sessions for no effect. First retirement still
+                        // does the full work below; later sweeps skip the
+                        // row entirely.
+                        if (row.retired_at !== null) continue;
                         this.db
                             .prepare("UPDATE messages SET retired_at = ? WHERE session_id = ? AND seq = ? AND retired_at IS NULL")
                             .run(Date.now(), s.sessionId, row.seq);
