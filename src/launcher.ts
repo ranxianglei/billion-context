@@ -2358,9 +2358,14 @@ export function refreshOverlayHome(
     realHome: string,
     overlay: string,
     generatedFile: string | string[],
-    opts?: { sharedSqlite?: boolean },
+    opts?: { sharedSqlite?: boolean; localOnlyEntries?: ReadonlySet<string> },
 ): boolean {
     const sharedSqlite = opts?.sharedSqlite === true;
+    // #5585: entries the client owns INSIDE the overlay (codex's .tmp staging).
+    // Never linked in from the real home, never merged back into it, and a stale
+    // escaping symlink left by a pre-fix launch is dropped so the client recreates
+    // them as genuine per-overlay paths (their git repos then stay inside home).
+    const localOnlyEntries = opts?.localOnlyEntries;
     const generatedFiles = new Set(Array.isArray(generatedFile) ? generatedFile : [generatedFile]);
     const isGeneratedDraft = (name: string): boolean =>
         [...generatedFiles].some((g) => name.startsWith(`.${g}.`) && name.endsWith(".tmp"));
@@ -2428,6 +2433,16 @@ export function refreshOverlayHome(
             try {
                 st = fs.lstatSync(overlayPath);
             } catch {
+                continue;
+            }
+            // #5585: local-only entries are owned by the client running under this
+            // overlay. A real dir/file is left untouched (never merged back); a
+            // stale escaping symlink from a pre-fix launch is dropped so the client
+            // recreates it as a genuine per-overlay path.
+            if (localOnlyEntries?.has(entry)) {
+                if (st.isSymbolicLink()) {
+                    try { fs.unlinkSync(overlayPath); } catch {}
+                }
                 continue;
             }
             if (st.isSymbolicLink()) {
@@ -2519,6 +2534,7 @@ export function refreshOverlayHome(
         for (const entry of copyPhaseEntries) {
             if (generatedFiles.has(entry)) continue;
             if (sharedSqlite && realDbMembers.has(entry)) continue;
+            if (localOnlyEntries?.has(entry)) continue;
             total += 1;
             const overlayPath = path.join(overlay, entry);
             let present = false;
@@ -3135,13 +3151,14 @@ export function renderCodexDotEnv(userText: string | undefined, values: { origin
  *  (both generations survive, loser as .bili-conflict).
  *
  *  Returns true when nothing remains pending in the overlay. */
-export function finalizeCodexHome(realHome: string, overlay: string, generatedFiles?: readonly string[]): boolean {
+export function finalizeCodexHome(realHome: string, overlay: string, generatedFiles?: readonly string[], localOnlyEntries?: ReadonlySet<string>): boolean {
     const generatedSet = new Set<string>(generatedFiles ?? []);
     const isExcluded = (name: string): boolean =>
         name === SQLITE_ORIGIN_FILE ||
         name === `${SQLITE_ORIGIN_FILE}.tmp` ||
         name === path.basename(overlayLockPath(overlay)) ||
         name === path.basename(overlayLeaseDir(overlay)) || // release-failure residue must never merge into the real home
+        localOnlyEntries?.has(name) === true || // #5585: codex's .tmp stays overlay-owned; never merged back nor relinked
         generatedSet.has(name) ||
         [...generatedSet].some((g) => name.startsWith(`.${g}.`) && name.endsWith(".tmp"));
     let overlayEntries: string[];
@@ -3215,6 +3232,14 @@ export function finalizeCodexHome(realHome: string, overlay: string, generatedFi
  *  directory per session. */
 const CODEX_SESSION_SLOT_MAX = 16;
 
+/** #5585: codex keeps its marketplace/plugin git checkouts under $CODEX_HOME/.tmp.
+ *  Sharing that directory into the overlay via a symlink makes every repo's canonical
+ *  path resolve back into the REAL home, so codex's "trusted Git repository root escapes
+ *  Codex home" containment check rejects each git-backed marketplace update under bili.
+ *  The overlay must own .tmp itself — never link it in from the real home, never merge
+ *  it back out — so those repos stay inside the active home. */
+const CODEX_LOCAL_ONLY_HOME_ENTRIES: ReadonlySet<string> = new Set([".tmp"]);
+
 /** #3203: claim a free per-session slot for this launch. Each slot is an
  *  ordinary overlay with its own lease — concurrent claims serialize on the
  *  atomic lock mkdir, so two launches never share a slot; a slot held by a
@@ -3262,7 +3287,7 @@ function migrateLegacyCodexOverlay(codexHome: string): void {
     if (!st.isDirectory()) return;
     acquireOverlayLease(legacy);
     try {
-        finalizeCodexHome(codexHome, legacy, [".env", "config.toml"]);
+        finalizeCodexHome(codexHome, legacy, [".env", "config.toml"], CODEX_LOCAL_ONLY_HOME_ENTRIES);
     } finally {
         releaseOverlayLease();
     }
@@ -3391,7 +3416,7 @@ export function prepareCodexHome(opts: {
     } else {
         overlay = `${codexHome}-bili`;
     }
-    if (!refreshOverlayHome(codexHome, overlay, generatedFiles, { sharedSqlite: opts.sharedSqlite })) return undefined;
+    if (!refreshOverlayHome(codexHome, overlay, generatedFiles, { sharedSqlite: opts.sharedSqlite, localOnlyEntries: CODEX_LOCAL_ONLY_HOME_ENTRIES })) return undefined;
     if (manageDotEnv) {
         try {
             const st = fs.lstatSync(path.join(overlay, ".env"));
@@ -6630,7 +6655,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
     let opencodeTmpFile: string | undefined;
     let dshOverlayHome: string | undefined;
     let gooseOverlay: GooseOverlay | undefined;
-    let codexOverlay: { realHome: string; overlay: string; generated: readonly string[] } | undefined;
+    let codexOverlay: { realHome: string; overlay: string; generated: readonly string[]; localOnly: ReadonlySet<string> } | undefined;
     const tmpFiles: string[] = [];
     const directUrl = launcherDirectUrl(process.env);
     if (directUrl) {
@@ -7153,7 +7178,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
             if (activeOverlay !== undefined) {
                 const generated: string[] = [".env"];
                 if (codexConversationId !== undefined) generated.push("config.toml");
-                codexOverlay = { realHome: codexRealHome, overlay: activeOverlay, generated };
+                codexOverlay = { realHome: codexRealHome, overlay: activeOverlay, generated, localOnly: CODEX_LOCAL_ONLY_HOME_ENTRIES };
             }
         }
     } else if (base === "codebuddy") {
@@ -7276,7 +7301,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         }
         if (codexOverlay) {
             try {
-                finalizeCodexHome(codexOverlay.realHome, codexOverlay.overlay, codexOverlay.generated);
+                finalizeCodexHome(codexOverlay.realHome, codexOverlay.overlay, codexOverlay.generated, codexOverlay.localOnly);
             } catch {}
         }
         releaseOverlayLease();
