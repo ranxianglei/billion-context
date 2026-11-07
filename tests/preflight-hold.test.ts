@@ -16,6 +16,19 @@ import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
+// #5738 fork adoption is content-driven: keep this suite's affinity chains
+// inside its own process lifetime so a byte-identical fixture under another
+// declared id cannot be adopted as a fork parent and leak fold state across
+// tests or runs (#5748 CI).
+const isoRoot = fs.mkdtempSync(path.join(os.tmpdir(), "preflight-hold-"));
+process.env.XDG_CONFIG_HOME = path.join(isoRoot, "config");
+process.env.XDG_DATA_HOME = path.join(isoRoot, "data");
+process.env.XDG_CACHE_HOME = path.join(isoRoot, "cache");
+process.env.XDG_STATE_HOME = path.join(isoRoot, "state");
 
 // #568: preflight compression previously sent ZERO bytes until it finished —
 // clients with undici's default 300s headersTimeout aborted mid-compression,
@@ -45,7 +58,7 @@ function okSse(inputTokens: number): string {
     );
 }
 
-function bigConversation(): Array<{ role: string; content: string }> {
+function bigConversation(tag = ""): Array<{ role: string; content: string }> {
     const msgs: Array<{ role: string; content: string }> = [];
     // #3298: repeat(250) sat ~16 est-tokens under the 10k window after the
     // preflight fold on old system-prompt sizes — any growth of the injected
@@ -55,7 +68,7 @@ function bigConversation(): Array<{ role: string; content: string }> {
     for (let i = 0; i < 12; i++) {
         const role = i % 2 === 0 ? "user" : "assistant";
         const filler = `MARKER_${i}_content_`.repeat(235);
-        msgs.push({ role, content: `Message ${i} of the long conversation. ${filler}` });
+        msgs.push({ role, content: (i === 0 ? `${tag} ` : "") + `Message ${i} of the long conversation. ${filler}` });
     }
     return msgs;
 }
@@ -164,8 +177,8 @@ test("#568: stream + slow preflight → early 200 + SSE keep-alive, then the rea
         // and its summarization call takes 1.5s ≫ the 300ms grace.
         const r = await timedPost(
             `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`,
-            { "content-type": "application/json", "x-acp-session": "hold-stream-ok-sess" },
-            JSON.stringify({ model: "claude-small", max_tokens: 1024, stream: true, messages: bigConversation() }),
+        { "content-type": "application/json", "x-acp-session": "hold-stream-ok-sess" },
+        JSON.stringify({ model: "claude-small", max_tokens: 1024, stream: true, messages: bigConversation("hold-stream-ok-sess") }),
         );
         assert.equal(r.status, 200);
         assert.equal(String(r.headers["content-type"]), "text/event-stream");
@@ -231,8 +244,8 @@ test("#568: stream + slow preflight 429 → early-committed 200 carries the erro
     try {
         const r = await timedPost(
             `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`,
-            { "content-type": "application/json", "x-acp-session": "hold-stream-429-sess" },
-            JSON.stringify({ model: "claude-small", max_tokens: 1024, stream: true, messages: bigConversation() }),
+        { "content-type": "application/json", "x-acp-session": "hold-stream-429-sess" },
+        JSON.stringify({ model: "claude-small", max_tokens: 1024, stream: true, messages: bigConversation("hold-stream-429-sess") }),
         );
         // The hold already committed 200 before the 429 landed — the client
         // gets the structured error IN-BAND instead of a hang/abort.
@@ -283,7 +296,7 @@ test("#568: Responses protocol + slow preflight 429 → early-committed 200, in-
     const proxyPort = (proxy.address() as { port: number }).port;
 
     try {
-        const input = bigConversation().map((m) => ({ type: "message", role: m.role, content: m.content }));
+        const input = bigConversation("hold-resp-429-sess").map((m) => ({ type: "message", role: m.role, content: m.content }));
         const r = await timedPost(
             `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/responses`,
             { "content-type": "application/json", "x-acp-session": "hold-resp-429-sess" },
@@ -348,7 +361,7 @@ test("#568: non-stream + slow preflight → early 200 + whitespace keep-alive, t
         const r = await timedPost(
             `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/chat/completions`,
             { "content-type": "application/json", "x-acp-session": "hold-json-ok-sess" },
-            JSON.stringify({ model: "gpt-small", max_tokens: 1024, messages: bigConversation() }),
+            JSON.stringify({ model: "gpt-small", max_tokens: 1024, messages: bigConversation("hold-json-ok-sess") }),
         );
         assert.equal(r.status, 200);
         assert.equal(String(r.headers["content-type"]), "application/json");
