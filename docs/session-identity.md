@@ -256,6 +256,41 @@ From then on:
 claude/codex/dsh need nothing here: they share one session id across
 subagents or have no child-session concept at all.
 
+## Persona-lane drift: when re-anchoring is impossible (#5844)
+
+The order resolver keeps the live conversation on the raw id through persona
+text changes whenever it can verify continuation (head continuity,
+header-corroborated model switch, positional fragment runs, fragment- or
+content-verified tails — `src/session-resolve.ts`). When the host destroys ALL
+byte-level evidence in the same turn it rotates its system prompt — e.g. an
+upgrade that changes both the system prompt and the message-record layout
+(#5844), or a grown+shifted replay (#5714) — the conversation forks onto
+`<id>|sub:<fp>` with empty compression state. That fork is by design:
+mis-attribution is the most expensive failure in this system (MESSAGE-IDENTITY).
+
+**There is no supported command to re-attach a derived lane to its parent,
+and no config knob for it.** The resolution is decided per request from
+evidence only; after a drift, the only sanctioned path is surgery on the
+persisted skeleton:
+
+1. Stop the proxy first — the running daemon silently rewrites
+   `<state dir>/session-order.json` from its in-memory skeletons, so any edit
+   made while it runs is lost (state dir = `$XDG_STATE_HOME/billion-context`,
+   default `~/.local/state/billion-context/`).
+2. In `session-order.json`, set the parent entry's `tagHash` to the sha256 hex
+   digest of the host's CURRENT full system text (the field stores the full
+   digest, not a truncated fingerprint), or delete the entry entirely to let
+   the raw id be claimed fresh on the next request.
+3. Restart the proxy; the next request re-anchors onto the raw id and the
+   fold state stored under it becomes live again.
+4. Remove the orphaned derived lane: `bili sessions rm <id>|sub:<fp>`
+   (its rows are otherwise inert but keep growing).
+
+Do NOT merge lanes when the replay content genuinely diverged (a different
+conversation riding the same client id) — that is exactly what the fork
+exists to prevent; the procedure above is for "same conversation, evidence
+destroyed by the host".
+
 ## Future direction
 
 The durable fix is a **client-side identity signal**: a stable
