@@ -14,6 +14,7 @@ import {
     upstreamThrottleGate,
     _resetUpstreamThrottleForTest,
 } from "../src/upstream-throttle.ts";
+import { setLogCapture } from "../src/logger.ts";
 
 const URL_A = "http://gw.example/v1/chat/completions";
 const H_CRED_A: Record<string, string> = { authorization: "Bearer AAA" };
@@ -151,7 +152,18 @@ test("#5199/#5889: a saturated hold map leaves the next model-scoped 429 ungover
         // The 65th key's model-scoped 429 cannot be stored (nothing
         // model-scoped to evict) and must NOT leave a phantom hold behind —
         // the send stays governed by nothing, and that fact is said once.
-        noteUpstreamThrottle429(URL_A, { authorization: "Bearer SATURATED" }, null, T0 + 100, throttle429ModelScope(429, MODEL, MARKERLESS_RPM));
+        const captured: Array<{ level: string; msg: string }> = [];
+        setLogCapture((level, msg) => captured.push({ level, msg }));
+        try {
+            noteUpstreamThrottle429(URL_A, { authorization: "Bearer SATURATED" }, null, T0 + 100, throttle429ModelScope(429, MODEL, MARKERLESS_RPM));
+        } finally {
+            setLogCapture(null);
+        }
+        assert.equal(
+            captured.filter((c) => c.level === "warn" && c.msg.includes("429 hold NOT stored")).length,
+            1,
+            "saturation is reported exactly once",
+        );
         assert.equal(activeThrottleHolds().length, 64, "no phantom hold on refusal");
         assert.equal(activeThrottleHolds().some((h) => h.model === MODEL), false, "no model-scoped hold was created");
         assert.ok(!throttleReject(URL_A, { authorization: "Bearer SATURATED" }, T0 + 101, MODEL), "saturated map leaves this 429 ungoverned");
