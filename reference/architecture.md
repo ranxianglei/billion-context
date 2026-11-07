@@ -37,6 +37,8 @@ billion-context/
 │   ├── event-loop-watchdog.ts    # Worker-thread event-loop wedge detector: self-exit after 5 min of continuous main-loop silence (#4762)
 │   ├── paths.ts                  # XDG paths (config/cache/state) + relocation env vars
 │   ├── logger.ts                 # Tee logger: state-dir file + stderr
+│   ├── log-retention.ts          # Private-log generations: 48h target under a hard byte budget, 0600, honest coverage
+│   ├── log-file-lines.ts         # Streaming line reader over the retained generations (bounded memory, per-file error reporting)
 │   ├── log-mask.ts               # Log safety: masks credentials/endpoints (#255)
 │   ├── version.ts                # Own version identity from package.json at runtime
 │   ├── doctor.ts                 # Read-only advisory evaluation against on-disk version (#1577)
