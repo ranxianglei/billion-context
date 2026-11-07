@@ -121,6 +121,17 @@ export function startWatchdog(state: MutableWatchdogState, plan: { port: number;
     return timer;
 }
 
+/** #5128: origin precedence for a running claude session's ACP tools — the
+ *  managed block's last-repinned URL (exactly what this session's model traffic
+ *  dials) beats a stale install-time BILI_MCP_PROXY pin, which beats live
+ *  discovery. Exported pure for tests. */
+export function resolveClaudeMcpOrigin(managed: string | undefined, env: NodeJS.ProcessEnv = process.env): string {
+    if (managed !== undefined) return managed;
+    const pin = env.BILI_MCP_PROXY?.trim();
+    if (pin !== undefined && pin.length > 0) return pin;
+    return resolveProxyOrigin();
+}
+
 export async function main(opts: WatchdogDeps & { runStdio?: () => void } = {}): Promise<void> {
     if (process.env.NODE_TEST_CONTEXT !== undefined) return;
     configureLogger(defaultLogFile());
@@ -134,8 +145,14 @@ export async function main(opts: WatchdogDeps & { runStdio?: () => void } = {}):
         return;
     }
     // Track what THIS running claude dialed: the managed block's last-repinned
-    // URL wins (settings.json), then the installer pin / live discovery.
-    const state: MutableWatchdogState = { origin: readClaudeManagedBaseUrl() ?? resolveProxyOrigin(), failures: 0 };
+    // URL wins (settings.json), then the installer pin / live discovery (#5128).
+    const managedUrl = readClaudeManagedBaseUrl();
+    const state: MutableWatchdogState = { origin: resolveClaudeMcpOrigin(managedUrl), failures: 0 };
+    // Bridge the fresh origin into the stdio tool calls: resolveProxyOrigin reads
+    // BILI_MCP_PROXY first, so an old installer's baked pin would otherwise
+    // short-circuit the live origin the session actually rides (#5128). Only when
+    // the repinned URL won — otherwise leave discovery live.
+    if (managedUrl !== undefined) process.env.BILI_MCP_PROXY = managedUrl;
     startWatchdog(state, plan, log, opts);
     (opts.runStdio ?? runMcpStdio)();
 }
