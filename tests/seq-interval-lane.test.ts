@@ -17,7 +17,7 @@ import { DatabaseSync } from "node:sqlite";
 import { defaultConfig } from "acp-kernel";
 import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
-import { SessionStore, _setStoreForTest } from "../src/persist.ts";
+import { SessionStore, _setStoreForTest, getStore } from "../src/persist.ts";
 import { _resetPluginStateForTest } from "../src/plugin.ts";
 import { _resetSessionsForTest } from "../src/session.ts";
 import { _setForTest } from "../src/registry.ts";
@@ -122,6 +122,19 @@ async function harness(): Promise<Harness> {
     return { turn, callTool, forwarded, rows, blockRows, settle: async () => { await new Promise((resolve) => setTimeout(resolve, 60)); }, close: async () => { await new Promise<void>((resolve) => proxy.close(() => resolve())); store.closeQuietly(); await new Promise<void>((resolve) => upstream.close(() => resolve())); } };
 }
 
+// #5228: poll until the seed's canonical pointers are durably recorded —
+// the wrap-up chain floats the pointer recording behind the ack (#5155), so
+// a fixed sleep races under parallel load.
+async function waitPtrs(expected: number): Promise<void> {
+    const deadline = Date.now() + 5000;
+    for (;;) {
+        const v = getStore().getSessionExt("conv-seq-1", "inc:canonical-ptrs");
+        if (Array.isArray(v) && v.length >= expected) return;
+        if (Date.now() > deadline) throw new Error(`canonical pointers stalled at ${JSON.stringify(v)} (expected >= ${expected})`);
+        await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+}
+
 const big = (text: string) => text.repeat(600);
 const umsg = (text: string) => ({ role: "user", content: [{ type: "text", text: big(text) }] });
 const amsg = (text: string) => ({ role: "assistant", content: [{ type: "text", text: big(text) }] });
@@ -146,6 +159,10 @@ test("seq interval lane flow: stamps ride the body, fold records the interval, o
         assert.equal(seedBody.biliMsgIds, undefined, "biliMsgIds stripped before the upstream");
         assert.equal(seedBody.biliLedgerSeqs, undefined, "biliLedgerSeqs stripped before the upstream");
 
+        // Pointers must land before turn 2 or its body carries no seq stamps
+        // and the fold below would be recorded id-based (#5228: the flush is
+        // async since #5155; real model turns are seconds apart, far past it).
+        await waitPtrs(12);
         // turn 2: the upstream answers with a compress tool call (raw JSON
         // passes through the plugin lane — the client relays it).
         const foldTurn = await h.turn({ sinceSeq: 12, msgIds: ["u7"], messages: [umsg("fold please")] });
