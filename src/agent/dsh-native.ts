@@ -1227,6 +1227,11 @@ function runLlmDispatch<R>(scope: LlmDispatchScope, operation: () => R): R {
     return runOutsideFetchChain(() => dispatchScope.run(scope, operation));
 }
 
+/** Test-only accessors (#5826 review): pins tests/msgid-rule-parity.test.ts
+ *  drives these collectors directly against the shared reject-class set. */
+export const _hostMsgIdsOfForTest = hostMsgIdsOf;
+export const _pfSlotIdsOfForTest = pfSlotIdsOf;
+
 /** Re-enter the dispatch scope on every iterator advance: generator bodies
  *  resume in the consumer's dynamic context, so each `next()` must run the
  *  adapter's continuation (its awaits, and any fetches it starts) inside the

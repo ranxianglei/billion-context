@@ -56,6 +56,8 @@
 | 测试钩子：`BILI_DSH_RECOVERY_INTERVAL_MS` / `BILI_DSH_RETRY_INTERVAL_MS` / `BILI_MODEL_INFO_RETRY_MS` | #2082 等 | 缩短测试/运维节奏（dsh-native.ts；NODE_TEST_CONTEXT 感知，避免生产误缩） | 永久测试设施，随宿主代码走 | 测试钩子 |
 | `BILI_COMPRESS_AT_FOLD_POINT` | #5470 | compress-at-fold-point 实验性 opt-in（**默认关**；2026-11-01 真实模型验证通过，owner 决定保持 opt-in）：把重放视图中可见的 compress 调用对挪到它自己的折叠点（布局 [已折叠区]–[调用对]–[保护消息]），弱注意力模型不再把历史尾部的工具交换误读成新命令；纯视图变换，关时布局字节级不变；文件键 `compress.compressAtFoldPoint`；含 env-only opt-in 可达性修复（默认短路保持不变） | 更多真实模型积累后转正为默认开（走评审），或按废弃流程删除 | opt-in（默认关） |
 | `BILI_COMPRESS_AT_FOLD_POINT_CLEAR_THINKING` | #5470 | 依附上一开关：挪位瞬间清紧邻的未签名思考段（默认 off，A 关时无效）；strict-echo(#684) 或存在签名思考块(#1658)时整个机制不出手 | 同上 | opt-in（默认 off） |
+| `BILI_PF_RENDER_WINDOW` / `BILI_PF_RENDER_AUDIT_EVERY` | #5664 v6 render-snapshot plane | 实验性渲染快照车道可调项（默认 OFF，嵌套于 watermarkV6MsgId cohort）：W = 稳态轮回放的冻结核数（默认 8）；N = 计划全量审计节奏（默认 8）；读点 src/server/fastpath-v6-render.ts:50-60 | render 平面转正（rollout 100% 且审计计数归稳）后移 §2 常设面，或随车道退役删除 | opt-in（默认 OFF；仅由显式 rollout 开启） |
+| `BILI_IDENTITY_HARVEST` | #5825 / PR #5842 | 身份信道采集 kill/scope 开关（src/identity-harvest.ts）：缺省=OFF（接线以惰性状态出厂）；`1`/`all`=全部已登记来源；逗号列表=按 roster 名圈定；须与 rollout `pluginLaneServerHistory` 及仅回环来源同时放行才生效 | harvest 车道（claude-code/codebuddy/mcode）站稳后按 #2028 模式退役 env（转 file 键）或移 §2 | opt-in（默认 off；rollout 0% 起灰度） |
 
 ## 2. 常设面全量登记表（src/ 实际读取的其余 BILI_* 环境变量）
 
@@ -169,6 +171,7 @@
 | `BILI_CLAUDE_NATIVE_PORT` / `BILI_ZCODE_PORT` | 显式 zone 端口覆盖（strict-port 语义，#1660） |
 | `BILI_ATTACH_EVIDENCE_GRACE_MS` / `BILI_ATTACH_HEALTH_DEADLINE_MS` | native attach 证据宽限窗 / 健康截止窗 |
 | `BILI_SPAWN_WAIT_MS` / `BILI_SLOW_START_GRACE_MS` | launcher spawn 初始健康等待窗 / LIVE 子进程慢启动宽限；总 spawn 预算 = 两者之和（#4947） |
+| `BILI_SILENT_DIRECT_MAX_MB` | silent-direct 超大请求守卫上限（MiB，默认 8；非法值回退默认，#5405/#5826） |
 | `BILI_DSH_BIN` / `BILI_PI_BIN` | dsh / pi 可执行文件覆盖 |
 | `BILI_PLUGIN_AGENT` | `--plugin` 目标 agent 选择（默认 claude） |
 | `BILI_LOG_MASK_HOSTS` | 日志主机名掩码（默认开；`=0` 本地调试退出） |

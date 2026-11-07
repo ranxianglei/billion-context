@@ -38,6 +38,11 @@ export const UPSTREAM_HOP_HEADERS = new Set([
     // applied-seq ack. Pure host↔bili bookkeeping; like the pf-* handshake
     // headers above it must never reach a model endpoint, so strip at egress.
     "x-bili-turn-id",
+    // #5825: stamped msgid channel — opencode V2 (and any host that can't
+    // rewrite its body) rides the host message ids here, comma-joined. Pure
+    // host↔bili bookkeeping like the pf-* handshake above; the real upstream
+    // must never see it.
+    "x-bili-msg-ids",
     "te",
     "trailer",
     "upgrade",

@@ -72,6 +72,16 @@ entries:
     desc_zh: "压力带 nudge 触发所需的最小可回收 token 数；虚报表线路调大它，让折叠攒成大批量而非高频小折（#3211）。显式 0＝老的任意 pending 行为。"
     site_en: "Minimum reclaimable tokens for a pressure-band nudge to fire (default max(5000, limit × 1%)); explicit 0 restores legacy any-pending behavior (#3211)."
     site_zh: "压力带 nudge 触发所需的最小可回收 token 数（默认 max(5000, 上限×1%)）；显式 0 恢复老的任意 pending 行为（#3211）。"
+  - key: compress.requireUsageSampleForPressure
+    type: boolean
+    default: "true"
+    group: compress
+    id: cw.rusfp
+    render: compress-row
+    desc_en: "Phantom-pressure guard: when this round's meter is a local estimate (no billing sample — aborted turn, TTL expiry), the pressure band waits one round for the real sample instead of firing EMERGENCY off an inflated reading. false = legacy."
+    desc_zh: "幻影压力守卫：本轮读数为本地估算（无计费样本——中断/TTL 丢 usage）时，压力带延后一轮等真样本再决定，不拿虚高读数扣 EMERGENCY。false＝老行为。"
+    site_en: "When the decision meter has no billing sample this round (aborted turn, short-TTL expiry), pressure-band nudges are deferred one round until a usage-grade reading decides; billed readings keep byte-identical behavior. Set false to restore estimate-driven pressure injection."
+    site_zh: "本轮无计费样本（回合中断、短 TTL 丢 usage）时，压力带 nudge 延后一轮等实际 usage 级读数再决定；计费级读数行为逐字节不变。设 false 恢复旧的估算驱动行为。"
   - key: compress.nudgeModelDecided
     type: boolean
     default: "off (unset)"
