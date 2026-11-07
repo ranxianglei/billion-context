@@ -1102,6 +1102,164 @@ test("#3542: a throwing loadout query degrades to a no-op", async () => {
     }
 });
 
+test("#4988: a deliberately-off bili tool is not resurrected by tree recovery", async () => {
+    const proxy = await startFakeProxy();
+    try {
+        const pi = makeFakePi();
+        biliPlugin(pi as never);
+        await pi.events.get("session_start")!({}, fakeCtx(proxy));
+        await waitForTools(pi, 2);
+        // compress was declared + active, then deliberately turned off (an
+        // external loadout manager like pi-loadout, or a manual toggle);
+        // acp_status stays active.
+        pi.activeTools.splice(0, pi.activeTools.length, "bash", "read", "acp_status");
+        // navigateTree fires session_before_tree while the loadout is still the
+        // pre-navigation one — that is the observation point.
+        await pi.events.get("session_before_tree")!({ type: "session_before_tree", preparation: {} }, undefined);
+        // The rewind resets the loadout to what survives: acp_status drops out;
+        // compress was already off.
+        pi.activeTools.splice(0, pi.activeTools.length, "bash", "read");
+        await pi.events.get("session_tree")!({ type: "session_tree", newLeafId: null, oldLeafId: "leaf-1" }, undefined);
+        assert.deepEqual([...pi.activeTools].sort(), ["acp_status", "bash", "read"], "only the previously-active tool is recovered");
+        assert.ok(!pi.activeTools.includes("compress"), "the deliberate off survives the navigation");
+        assert.equal(pi.setActiveCalls.length, 1, "exactly one setter call");
+        assert.deepEqual(pi.setActiveCalls[0], ["bash", "read", "acp_status"], "host-held names kept, only the lost one appended");
+    } finally {
+        await proxy.close();
+    }
+});
+
+test("#4988: the deliberate off survives in both handler orders", async () => {
+    const proxy = await startFakeProxy();
+    try {
+        const pi = makeFakePi();
+        biliPlugin(pi as never);
+        await pi.events.get("session_start")!({}, fakeCtx(proxy));
+        await waitForTools(pi, 2);
+        // compress deliberately off, acp_status active — observed pre-nav.
+        pi.activeTools.splice(0, pi.activeTools.length, "bash", "read", "acp_status");
+        await pi.events.get("session_before_tree")!({ type: "session_before_tree", preparation: {} }, undefined);
+
+        // Order A: pi-loadout's session_tree handler runs first and restores its
+        // selection over the raw transcript reset — bili's handler sees the
+        // selection already standing.
+        pi.activeTools.splice(0, pi.activeTools.length, "bash", "read", "acp_status");
+        await pi.events.get("session_tree")!({ type: "session_tree", newLeafId: null, oldLeafId: "leaf-1" }, undefined);
+        assert.equal(pi.setActiveCalls.length, 0, "order A: nothing to fix — no setter call");
+
+        // Order B: bili's handler runs first against the raw reset...
+        pi.activeTools.splice(0, pi.activeTools.length, "bash", "read");
+        await pi.events.get("session_tree")!({ type: "session_tree", newLeafId: null, oldLeafId: "leaf-1" }, undefined);
+        assert.deepEqual([...pi.activeTools].sort(), ["acp_status", "bash", "read"], "order B: only the previously-active tool comes back");
+        // ...then pi-loadout reapplies its selection last.
+        pi.activeTools.splice(0, pi.activeTools.length, "bash", "read", "acp_status");
+        assert.ok(!pi.activeTools.includes("compress"), "order B: the deliberate off still survives");
+        assert.equal(pi.setActiveCalls.length, 1, "exactly one setter call across both orders");
+    } finally {
+        await proxy.close();
+    }
+});
+
+test("#4988: tools that were active before the navigation are still fully recovered", async () => {
+    const proxy = await startFakeProxy();
+    try {
+        const pi = makeFakePi();
+        biliPlugin(pi as never);
+        await pi.events.get("session_start")!({}, fakeCtx(proxy));
+        await waitForTools(pi, 2);
+        pi.activeTools.splice(0, pi.activeTools.length, "bash", "read", "compress", "acp_status");
+        await pi.events.get("session_before_tree")!({ type: "session_before_tree", preparation: {} }, undefined);
+        // The rewind drops BOTH bili tools from the loadout (the #3542 shape).
+        pi.activeTools.splice(0, pi.activeTools.length, "bash", "read");
+        await pi.events.get("session_tree")!({ type: "session_tree", newLeafId: null, oldLeafId: "leaf-1" }, undefined);
+        assert.deepEqual([...pi.activeTools].sort(), ["acp_status", "bash", "compress", "read"], "both previously-active tools are back");
+        assert.equal(pi.setActiveCalls.length, 1, "exactly one setter call");
+        assert.deepEqual(pi.setActiveCalls[0], ["bash", "read", "compress", "acp_status"], "additive-only, registered order");
+    } finally {
+        await proxy.close();
+    }
+});
+
+test("#4988: a navigation before the manifest lands is a no-op; recovery works once registered", async () => {
+    const proxy = await startFakeProxy();
+    try {
+        const pi = makeFakePi();
+        biliPlugin(pi as never);
+        await pi.events.get("session_start")!({}, fakeCtx(proxy));
+        // Navigate while the manifest fetch is still in flight: nothing is
+        // registered yet — neither the sample nor the re-assert may guess.
+        await pi.events.get("session_before_tree")!({ type: "session_before_tree", preparation: {} }, undefined);
+        pi.activeTools.splice(0, pi.activeTools.length, "bash", "read");
+        await pi.events.get("session_tree")!({ type: "session_tree", newLeafId: null, oldLeafId: "leaf-1" }, undefined);
+        assert.equal(pi.setActiveCalls.length, 0, "no blind set before registration");
+        await waitForTools(pi, 2);
+        // Once registered and declared active, a later rewind recovers normally.
+        pi.activeTools.splice(0, pi.activeTools.length, "bash", "read", "compress", "acp_status");
+        await pi.events.get("session_before_tree")!({ type: "session_before_tree", preparation: {} }, undefined);
+        pi.activeTools.splice(0, pi.activeTools.length, "bash", "read");
+        await pi.events.get("session_tree")!({ type: "session_tree", newLeafId: null, oldLeafId: "leaf-1" }, undefined);
+        assert.deepEqual([...pi.activeTools].sort(), ["acp_status", "bash", "compress", "read"], "recovery works after late registration");
+    } finally {
+        await proxy.close();
+    }
+});
+
+// #4988 boundary: when the SOURCE and TARGET branches carry DIFFERENT tool
+// selections, bili's local view cannot tell "the rewind dropped my tool" from
+// "an external manager deliberately keeps it off on THIS branch" — both look
+// like "observed active pre-nav, absent post-nav". The outcome then depends on
+// handler order; these two rows pin the current behavior of each order so a
+// future protocol change (or its absence) is visible as a test change.
+test("#4988: differing branch selections, bili LAST — the pre-nav observation wins (known residual)", async () => {
+    const proxy = await startFakeProxy();
+    try {
+        const pi = makeFakePi();
+        biliPlugin(pi as never);
+        await pi.events.get("session_start")!({}, fakeCtx(proxy));
+        await waitForTools(pi, 2);
+        // Source branch: both bili tools active — that is the pre-nav observation.
+        pi.activeTools.splice(0, pi.activeTools.length, "bash", "read", "compress", "acp_status");
+        await pi.events.get("session_before_tree")!({ type: "session_before_tree", preparation: {} }, undefined);
+        // Rewind to the target branch resets the loadout; the target branch's
+        // selection keeps acp_status on but compress deliberately OFF.
+        pi.activeTools.splice(0, pi.activeTools.length, "bash", "read");
+        pi.activeTools.splice(0, pi.activeTools.length, "bash", "read", "acp_status");
+        // Bili's handler runs AFTER the external manager's: from its vantage
+        // point compress was active pre-nav and is gone — indistinguishable
+        // from a rewind drop, so it comes back. Pinned, not blessed.
+        await pi.events.get("session_tree")!({ type: "session_tree", newLeafId: null, oldLeafId: "leaf-1" }, undefined);
+        assert.deepEqual([...pi.activeTools].sort(), ["acp_status", "bash", "compress", "read"], "pre-nav (source) observation outranks the target's deliberate off when bili runs last");
+        assert.equal(pi.setActiveCalls.length, 1, "exactly one setter call");
+    } finally {
+        await proxy.close();
+    }
+});
+
+test("#4988: differing branch selections, bili FIRST — the target selection wins", async () => {
+    const proxy = await startFakeProxy();
+    try {
+        const pi = makeFakePi();
+        biliPlugin(pi as never);
+        await pi.events.get("session_start")!({}, fakeCtx(proxy));
+        await waitForTools(pi, 2);
+        pi.activeTools.splice(0, pi.activeTools.length, "bash", "read", "compress", "acp_status");
+        await pi.events.get("session_before_tree")!({ type: "session_before_tree", preparation: {} }, undefined);
+        // Raw transcript reset drops both bili tools...
+        pi.activeTools.splice(0, pi.activeTools.length, "bash", "read");
+        // ...and bili's handler runs FIRST, recovering everything it observed.
+        await pi.events.get("session_tree")!({ type: "session_tree", newLeafId: null, oldLeafId: "leaf-1" }, undefined);
+        assert.deepEqual([...pi.activeTools].sort(), ["acp_status", "bash", "compress", "read"], "bili recovers its observed tools over the raw reset");
+        // The external manager applies the TARGET branch's selection last:
+        // compress stays off there. Its write is additive-host-compatible, so
+        // it simply stands as the final state — no further bili interference.
+        pi.activeTools.splice(0, pi.activeTools.length, "bash", "read", "acp_status");
+        assert.ok(!pi.activeTools.includes("compress"), "the target branch's deliberate off survives when bili ran first");
+        assert.equal(pi.setActiveCalls.length, 1, "exactly one setter call — bili's own");
+    } finally {
+        await proxy.close();
+    }
+});
+
 test("#1217: launcher-mode manifest fetch is primed at extension load time", async () => {
     // Correctness of the -p first-request stamp under ANY latency is #1228's
     // awaited ownership claim; this prime is the latency half: the manifest
