@@ -13,6 +13,7 @@ import { FALLBACK_EFFECTIVE_WINDOW_FLOOR, findRoute, findRouteKey, lookupContext
 import { resolveProxyDecision } from "../upstream-proxy.js";
 import { contextFromRegistry, peekRegistryContext, peekRegistryOutputLimit, peekRegistryPriceProfile } from "../registry.js";
 import { stampBillingPrice } from "../billing.js";
+import { recordClientUa } from "../client-ua-registry.js";
 import { codexAlignedWindow } from "../codex-models.js";
 import { DecodedRequestAdmission, DecodedRequestBusyError } from "../request-body-budget.js";
 import { hostIdForLog, maskHeadersForLog, maskUrlForLog, maskUrlsInText } from "../log-mask.js";
@@ -88,6 +89,21 @@ import { ccrPluginWireOk, storeEffectiveCcr, storeEffectiveImageRescale, type Cc
 import { DEFAULT_DECIDE_MAX_TOKENS } from "../nudge-decide.js";
 import { BodyTooLargeError, buildForwardTarget, forward, forwardUpstreamUrl, googleModelFromPath, googlePathKind, headroomEffectiveLogged, headroomFallbackLogged, headerValue, imageBillingFor, imageReserveFor, imageTokenCapFor, isCountTokensRequest, isPreflightFailFast, logRequestCost, NON_CONVERSATION_RELAY_WARN_CAP, nonConversationRelayWarned, prepareCountTokens, preflightCompressIfNeeded, readBody, resolveKnownOutputCeiling, resolveUpstream, resignSettingsFor, selfAddressedLocalPath, scrubAnthropicPck, scrubCompatDrop, vertexAnthropicModelFromPath, warnModelNameMissIfNew, warnRouteMissIfNew, type Prepared } from "../server.js";
 import { normalizeVertexModelId } from "../vertex.js";
+import { CREDENTIAL_HEADER_NAMES } from "../cache-ledger.js";
+import { requestModelFromBody } from "../upstream-throttle.js";
+import { tryAnswerEarlyHold } from "./relay.js";
+
+// #5795: the credential subset of the inbound headers — exactly the names
+// credentialFingerprint reads (CREDENTIAL_HEADER_NAMES), or the fast path's
+// hold key would diverge from the governor's and account holds go invisible.
+function earlyHoldCredHeaders(req: http.IncomingMessage): Record<string, string> {
+    const out: Record<string, string> = {};
+    for (const n of CREDENTIAL_HEADER_NAMES) {
+        const v = headerValue(req, n);
+        if (v !== undefined && v !== "") out[n] = v;
+    }
+    return out;
+}
 
 // #5243: warn-once per model when the live codex model table is unavailable and
 // window sizing falls back to config.toml model_context_window.
@@ -488,6 +504,24 @@ async function handleRequest(
         await forward(req, res, opts, scrubCompatDrop(scrubAnthropicPck(protocol, bodyBuffer, log), compatDropPaths, log), null, core, config, log, route, instanceId, undefined, undefined, undefined, googleModel ?? vertexModel);
         return;
     }
+    // #5795: pre-ingest 429-hold fast path — while the egress governor holds
+    // this origin+credential, refuse BEFORE prepare pays the O(history)
+    // parse/convert/pin cost of a send that will not egress anyway (~6s per
+    // refused turn on the field-reported multi-MiB histories). Sits above the
+    // hop-marker branch so chained-bili relays get the identical local refusal
+    // one stage earlier; sub-threshold bodies and unknown-wire requests fall
+    // through untouched (see tryAnswerEarlyHold).
+    if (tryAnswerEarlyHold({
+        method: req.method,
+        upstreamUrl: forwardUpstreamUrl(req, opts, route),
+        credHeaders: earlyHoldCredHeaders(req),
+        protocol,
+        bodyBytes: bodyBuffer.length,
+        requestModel: googleModel ?? vertexModel ?? requestModelFromBody(bodyBuffer),
+        res,
+        streamErrorShape: opts.streamErrorShape,
+        log,
+    })) return;
     // #300: bili→bili chain detection. If the inbound request already carries
     // the x-bili-hop marker, an upstream bili instance already ran the
     // compression pipeline on it. Processing it again would double-compress
@@ -1673,6 +1707,12 @@ async function handleRequest(
         }
         if (!pluginAgent && typeof session.metadata.pluginAgent === "string") pluginAgent = session.metadata.pluginAgent;
         if (pluginAgent && !pluginConversation) pluginConversation = conversation;
+        // #4649: remember this request's client UA in the bounded registry so a
+        // diagnostics report carries the client's own version (non-dsh lanes
+        // have no profile bundle to read it from). Runs for EVERY model
+        // request — unlike the clientHint block below, which only fills the
+        // session's first-seen hint.
+        recordClientUa(req.headers);
         // #1426 web UI: persist which client this session came from, first hit wins.
         // Plugin agents are already recorded above as metadata.pluginAgent; non-plugin
         // clients fall back to header sniffing, then to a truncated User-Agent hint.

@@ -251,6 +251,10 @@ function screenMsgIds(ids: unknown): ids is string[] {
     return true;
 }
 
+/** Test-only accessor (#5826 review): pins tests/msgid-rule-parity.test.ts.
+ *  Production callers use screenMsgIds directly. */
+export const _screenMsgIdsForTest = screenMsgIds;
+
 /** Delta-turn claim gate: undefined when any candidate id was already sent
  *  on an earlier envelope of this conversation (the lane would 400 — see
  *  msgidClaims); otherwise the ids are claimed and returned. */

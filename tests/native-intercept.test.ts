@@ -593,6 +593,47 @@ test("install: a missing live-state slot refuses an oversized direct model reque
     }
 });
 
+test("the silent-direct ceiling defaults to 8 MiB and honors BILI_SILENT_DIRECT_MAX_MB (#5405 follow-up, #5826 review)", async () => {
+    const savedEnv = process.env.BILI_SILENT_DIRECT_MAX_MB;
+    const saved = globalThis.fetch;
+    _resetForTest();
+    const sink: string[] = [];
+    globalThis.fetch = fakeFetch(sink);
+    try {
+        assert.equal(MAX_SILENT_DIRECT_BODY_BYTES, 8 * 1024 * 1024, "default ceiling is 8 MiB");
+        const state: NativeInterceptState = { origin: "http://127.0.0.1:40913", ready: Promise.resolve("http://127.0.0.1:40913") };
+        assert.equal(installNativeFetchIntercept(state), true);
+        liveStateSlotEffect(state)()();
+        // A ~3 MiB body (the shape of an in-window image-heavy session) died
+        // at the old 2 MiB default with a retryable 422 that could never
+        // succeed; under the new default it rides the clean direct path.
+        const imgish = "x".repeat(3 * 1024 * 1024);
+        assert.equal((await globalThis.fetch("http://127.0.0.1:8199/v1/chat/completions", { method: "POST", body: imgish })).status, 200, "3 MiB passes the 8 MiB default");
+        // The knob lowers the ceiling for installs that want the tight guard.
+        process.env.BILI_SILENT_DIRECT_MAX_MB = "1";
+        const refused = await globalThis.fetch("http://127.0.0.1:8199/v1/chat/completions", { method: "POST", body: imgish });
+        assert.equal(refused.status, 422);
+        assert.equal(refused.headers.get("x-bili-gate"), "oversize-refusal-no-live-state");
+        // Invalid values fall back to the default (tiny body passes again).
+        for (const bad of ["abc", "0", "-2", ""]) {
+            process.env.BILI_SILENT_DIRECT_MAX_MB = bad;
+            assert.equal((await globalThis.fetch("http://127.0.0.1:8199/v1/messages", { method: "POST", body: "{}" })).status, 200);
+        }
+        delete process.env.BILI_SILENT_DIRECT_MAX_MB;
+        assert.equal((await globalThis.fetch("http://127.0.0.1:8199/v1/chat/completions", { method: "POST", body: imgish })).status, 200, "default restored");
+        assert.deepEqual(
+            sink.filter((u) => u.includes("chat/completions")),
+            ["http://127.0.0.1:8199/v1/chat/completions", "http://127.0.0.1:8199/v1/chat/completions"],
+            "only the two default-cap 3 MiB sends pass",
+        );
+    } finally {
+        globalThis.fetch = saved;
+        if (savedEnv === undefined) delete process.env.BILI_SILENT_DIRECT_MAX_MB;
+        else process.env.BILI_SILENT_DIRECT_MAX_MB = savedEnv;
+        _resetForTest();
+    }
+});
+
 test("install: a missing live-state slot logs direct sends once per generation (#5405)", async () => {
     const saved = process.env.XDG_STATE_HOME;
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "bili-5405-state-log-"));
@@ -707,21 +748,33 @@ test("install: incident shape — declared window 262144 with a ~3 MiB body is r
     // of bytes/4 reach; a 3 MiB body sails past it even though it exceeds the
     // declared window by ~3.7×. That is how the 975K-token field shape would
     // have slipped the gate path too.
+    // The #5826 release review raised the DEFAULT ceiling to 8 MiB (owner
+    // ruling: media-blind raw bytes killed in-window image sessions), and at
+    // 8 MiB no body can sit between the ceiling and the 4 MB doom bar — so
+    // this isolation pin sets the knob back to 2 MiB (which also proves the
+    // knob takes effect on the unattributed arm).
+    const savedEnv = process.env.BILI_SILENT_DIRECT_MAX_MB;
+    process.env.BILI_SILENT_DIRECT_MAX_MB = "2";
     const state: NativeInterceptState = {
         origin: "http://127.0.0.1:40911",
         ready: Promise.resolve("http://127.0.0.1:40911"),
         takeoverGate: () => false,
     };
-    const { sink } = await withPatch(state, async (fetch) => {
-        const res = await fetch("http://127.0.0.1:8199/v1/chat/completions", {
-            method: "POST",
-            headers: { "x-bili-plugin-context-window": "262144" },
-            body: "d".repeat(3 * 1024 * 1024),
+    try {
+        const { sink } = await withPatch(state, async (fetch) => {
+            const res = await fetch("http://127.0.0.1:8199/v1/chat/completions", {
+                method: "POST",
+                headers: { "x-bili-plugin-context-window": "262144" },
+                body: "d".repeat(3 * 1024 * 1024),
+            });
+            assert.equal(res.status, 422);
+            assert.equal(res.headers.get("x-bili-gate"), "oversize-refusal-unattributed-bytes", "ceiling arm, not the floored-out doom arm");
         });
-        assert.equal(res.status, 422);
-        assert.equal(res.headers.get("x-bili-gate"), "oversize-refusal-unattributed-bytes", "ceiling arm, not the floored-out doom arm");
-    });
-    assert.deepEqual(sink, []);
+        assert.deepEqual(sink, []);
+    } finally {
+        if (savedEnv === undefined) delete process.env.BILI_SILENT_DIRECT_MAX_MB;
+        else process.env.BILI_SILENT_DIRECT_MAX_MB = savedEnv;
+    }
 });
 
 test("install: degraded proxy-down direct sends keep window-math-only behavior — the ceiling does not apply (#5405/#5408)", async () => {

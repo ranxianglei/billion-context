@@ -142,6 +142,7 @@ function parseTailIds(raw: string): string[] | null {
         let id: string;
         try { id = decodeURIComponent(seg); } catch { return null; }
         if (id.length === 0 || id.length > 512) return null;
+        if (id.startsWith("acp_summary_")) return null; // kernel anchor namespace (#5826 review parity: every other copy screens it; emitters pre-screen today, but the single server-side chokepoint enforces the full canonical set)
         if (/[\s\p{C}]/u.test(id)) return null;
         // #5418 v3 (owner ruling): "?" repeats are EXPECTED — hosts compress/
         // rewrite histories and those elements carry no host id. REAL ids
@@ -154,6 +155,10 @@ function parseTailIds(raw: string): string[] | null {
     }
     return ids;
 }
+
+/** Test-only accessor (#5826 review): pins tests/msgid-rule-parity.test.ts.
+ *  Production callers use parseTailIds directly. */
+export function _parseTailIdsForTest(raw: string): string[] | null { return parseTailIds(raw); }
 
 function readSaved(sessionId: string): PFSavedState | null {
     try {
