@@ -723,13 +723,33 @@ const CONTEXT_LIMIT_TABLE: Array<{ match: RegExp; limit: number }> = [
 // MODEL, and testing the full id first lets the provider segment hijack the
 // match ("Kimi/glm-5" → ^kimi 200K instead of ^glm-5 1M; "deepseek/
 // deepseek-r1" skips the specific ^deepseek-(r1|v3|ocr) rule because of the
-// "/" and falls to broad ^deepseek 1M — #2074). The full id remains the
-// FALLBACK for tails carrying no family signal whose provider segment does
-// ("qwen/qwq-32b").
+// "/" and falls to broad ^deepseek 1M — #2074). Custom-provider gateways go
+// one layer deeper still: "vendor/region:model" ids ("liuyue/cn:
+// deepseek-v4.1-flash" — #5907), where even the basename carries a namespace
+// prefix before the colon. Every root therefore ALSO yields its tail after
+// the LAST colon as a candidate, tested strictly AFTER the un-stripped root:
+// the tail is the last-resort model-part form, and a tag-shaped suffix
+// ("gpt-5:o3-preview" → "o3-preview") could false-match an unrelated family
+// rule if it were tested first. The full id remains the FALLBACK for tails
+// carrying no family signal whose provider segment does ("qwen/qwq-32b").
 function modelRoots(model: string): string[] {
+    const roots: string[] = [];
+    const push = (root: string): void => {
+        if (root.length > 0 && !roots.includes(root)) roots.push(root);
+    };
+    const colonTail = (root: string): string => {
+        const colon = root.lastIndexOf(":");
+        return colon >= 0 && colon < root.length - 1 ? root.slice(colon + 1) : "";
+    };
     const slash = model.lastIndexOf("/");
-    if (slash > 0 && slash < model.length - 1) return [model.slice(slash + 1), model];
-    return [model];
+    const basename = slash > 0 && slash < model.length - 1 ? model.slice(slash + 1) : model;
+    push(basename);
+    push(colonTail(basename));
+    if (basename !== model) {
+        push(model);
+        push(colonTail(model));
+    }
+    return roots;
 }
 
 export function lookupContextLimit(model: string | undefined): number | undefined {
