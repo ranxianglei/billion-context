@@ -2264,6 +2264,13 @@ type FileConfig = {
         /** 429-hold backoff ceiling in ms; also the probe cadence once the hold is terminal (#4204;
          *  was env-only BILI_THROTTLE_429_MAX_DELAY_MS; default 30000). */
         throttle429MaxDelayMs?: number;
+        /** Hold granularity for marker-less upstream 429s (#5199; env BILI_THROTTLE_429_SCOPE; default "credential").
+         *  "credential" — #5696's conservative default: any 429 without a recognized model marker holds the whole
+         *  origin+credential (every model, every session on it). "model" — hold only the send's request model, for
+         *  gateways fronting many independently-limited models behind one credential (LiteLLM/one-api/opencode.ai-style
+         *  relays); requests without an identifiable model remain credential-wide, and recognized KeyRing markers keep
+         *  their own semantics in both modes. */
+        throttle429Scope?: "credential" | "model";
         /** Per-compress shrink steering factor in (0,1] (was BILI_MAX_SHRINK_PER_COMPRESS; default unset). */
         maxShrinkPerCompress?: number;
         /** Outbound proxy keep-alive ceiling, 0 for one-shot (was BILI_PROXY_KEEPALIVE_MAX_MS; default 55000). */
