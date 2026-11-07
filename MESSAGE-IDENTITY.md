@@ -276,6 +276,43 @@ migration, applies to old and new sessions alike, storage-independent
 (legacy JSON, shadow and full modes behave identically; bookkeeping rides
 session metadata). The kernel ledger's content-hash contract is untouched.
 
+## The verified mutation class: host-pruner byte-checked re-anchor (#5395)
+
+The honesty boundary above rejects *fuzzy* content joins. One mutation
+shape admits EXACT verification, and its absence was the costliest residual
+class found in production: a host tool-result pruning plugin splices its
+versioned sentinel between preserved head and tail of a long tool result
+(`dsh-compaction-tool-result-pruner`, dsh desktop). The middle deletion
+breaks every identity channel at once — norm/twin equality, wordbag/simhash
+distance, positional fence — and when the host re-mints the tool-call id
+across projections (#2396) the id channels starve too: the covered id goes
+PERMANENTLY unmatched, re-reported every turn, feeding the #2438/#5223
+escalation (reported: 614 ids × 156 turns/day, ~571K tokens/day unfolded).
+
+The pruner-shape pass (`src/fold-reconcile.ts`; runs LAST in
+`planReconciliation`, after every other claim pass) claims only on positive
+evidence: the resent bytes must literally decompose as head + sentinel +
+tail where head/tail are exact prefix/suffix of the message STORED in bili's
+unified index, with a non-empty deleted middle (the overlap guard). Two
+distinct originals cannot both decompose around the same sentinel into the
+same resent bytes, so mis-attribution is structurally excluded — the
+"verified class" the boundary above left open. Gates: role + content-class
+agreement, strict length shrink against the anchor, k-th backbone order, one
+candidate per old id; deliberately NO toolCallId equality (re-minting is
+exactly the condition that makes the drift permanent). Store unavailable or
+the original row GC'd → honest unmatched, never a guess. The sentinel table
+is built-in code, not configuration: the strings are versioned by their host
+plugin, so a new variant lands as a code change with traffic evidence. Each
+verified claim lands one `host-content-mutation` conflict-ledger event
+(self-limiting: repair mode re-covers the pruned ids, so the next pass sees
+them present and the counter falls back to zero) — the second compressor
+becomes visible on the banner/stats surfaces instead of staying log-only.
+Steady state (no sentinel on the wire) pays zero storage reads.
+
+Proof: `tests/issue5395-pruner-shape.test.ts` (positive gate, every negative
+gate per #3617, k-th discipline, cross-pass convergence, warn-mode parity,
+degradation, zero-read contract).
+
 ## The snapshot render engine: outbound identity moves server-side (#3756)
 
 #3641 classified verdicts when no channel verifies. #3756 removes the
