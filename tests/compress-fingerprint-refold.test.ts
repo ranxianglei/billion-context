@@ -101,8 +101,8 @@ test("#1294 P1: long two-section summary yields an exact fingerprint line", () =
     // clean success carries exactly the stop signal.
     assert.deepEqual(
         out.split("\n").slice(2),
-        [STEERING_2544, "", "No compressible ranges remain — the context is already at its minimum; continue the task without compressing."],
-        "header + fingerprint + #2544 steering + #1387 stop tail only",
+        [STEERING_2544, HISTORICAL_REFS_5186, "", "No compressible ranges remain — the context is already at its minimum; continue the task without compressing."],
+        "header + fingerprint + #2544 steering + #5186 historical-refs note + #1387 stop tail only",
     );
 });
 
@@ -310,6 +310,9 @@ test("#1615: lone surrogates already present in the input summary are scrubbed t
 });
 
 const STEERING_2544 = "Fingerprints show head/tail only — every summary is stored in full. To retrieve a specific detail from a new block, call search_context({ query }) first; decompress only if the excerpt doesn't answer it.";
+// #5186: rides its own line directly after the #2544 steering on every
+// fingerprinted success receipt (proxy lane).
+const HISTORICAL_REFS_5186 = "Refs quoted in stored summaries are historical snapshots: after a session reset (model/upstream switch or native compaction) this session's refs restart from m00001, so an old quote may no longer resolve. Compose ranges only from acp_status output or the live ranges listed in this receipt.";
 
 test("#2544: receipt states summaries are stored in full and steers to search_context before decompress", () => {
     _setStoreForTest(new SessionStore({ enabled: false }));
@@ -329,10 +332,12 @@ test("#2544: receipt states summaries are stored in full and steers to search_co
     }
     assert.ok(lastFp > 0, `fingerprint lines present: ${out}`);
     assert.equal(lines[lastFp + 1], STEERING_2544, "steering directly after the last fingerprint, nothing between");
-    // A no-op re-compress (#4521) has no fingerprints and must not carry the note.
+    assert.equal(lines[lastFp + 2], HISTORICAL_REFS_5186, "#5186 note rides its own line after the steering");
+    // A no-op re-compress (#4521) has no fingerprints and must not carry the notes.
     const again = applyRanges(parseCompressInput({ content: [{ startId: "m00001", endId: "m00002", summary: "two" }] }), ctx).text;
     assert.ok(again.startsWith("[Compression no-op"), again.split("\n")[0]);
     assert.ok(!again.includes(STEERING_2544), "no steering without fingerprints");
+    assert.ok(!again.includes(HISTORICAL_REFS_5186), "no historical-refs note without fingerprints");
     // The log copy diverges by design (#1718): length-only fingerprints, no note.
     const logLine = ctx.logs.find((l) => l.startsWith("[acp-proxy: [Compressed")) ?? "";
     assert.ok(logLine, ctx.logs.join("\n"));
