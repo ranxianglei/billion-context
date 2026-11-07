@@ -2737,7 +2737,10 @@ export async function pipePluginChatWithStrip(
             // The retry degenerated too. An empty turn is indistinguishable from a
             // model that produced nothing and the session reads as idle while it is
             // dead, so the client gets an error the host would never surface (#870).
-            log?.("[plugin] degenerate terminal turn again after the retry; emitting an in-band error (#870)");
+            // #4913: name the signals that qualified so "again after the retry" is
+            // attributable — which of the bare-exemption inputs carried the turn
+            // here, plus the retry's own finish reason.
+            log?.(`[plugin] degenerate terminal turn again after the retry; emitting an in-band error (#870): sawThinking=${sawThinking}, sawStrippedEcho=${sawStrippedEcho}, releasedMarkupChars=${releasedMarkupChars}, draftTail=${draftTail}, finishReason=${reason ?? "none"}, visibleTextChars=${visibleTextChars}`);
             // #870 deliberately chose a COMPLETED turn carrying the error text (visible to the host); keep the legacy shape here regardless of the global streamErrorShape default.
             // #2689: hand the emitter the client-known stream state — the error
             // block opens at the next free index (blocksForwarded), and no
