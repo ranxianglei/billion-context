@@ -251,6 +251,7 @@ export function hideConsumedCompressCalls(
   messages: CoreMessage[],
   isCompressTool: (toolName: string) => boolean = (name) =>
     name === COMPRESS_TOOL_NAME,
+  strandedProtectedPredecessor: (m: CoreMessage) => boolean = () => false,
 ): HideConsumedResult {
   const allBlockCallIds = new Set<string>();
   const activeCallIds = new Set<string>();
@@ -352,6 +353,9 @@ export function hideConsumedCompressCalls(
         }
       }
     }
+    // #5864: hiding this pair would strand a signed thinking block as the
+    // final block of its assistant message (upstream 400); keep it visible.
+    if (hide && i > 0 && strandedProtectedPredecessor(messages[i - 1]!)) hide = false;
     if (hide) hiddenCallIds.add(callId);
     else keepCallIds.add(callId);
   }
