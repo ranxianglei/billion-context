@@ -2742,10 +2742,15 @@ export class SessionStore {
     }
 
     /** #5805: cheap identity of the envelope file's current state — the
-     *  index-only lane's stand-in for the "written" post-write stamp. */
+     *  index-only lane's stand-in for the "written" post-write stamp. The
+     *  mtime stays at full float precision (NO rounding): an untouched file
+     *  re-stats to the identical value on every supported filesystem, so the
+     *  comparison degrades conservatively (worst case: an extra exact read)
+     *  while rounding would blind the guard to a same-size foreign rewrite
+     *  landing within half a millisecond of the recorded stat (#5805). */
     private envelopeFileKey(id: string, meta?: { protocol?: string; upstreamOrigin?: string }): string {
         const stat = this.statEnvelope(id, meta);
-        return stat ? `${stat.size}:${Math.round(stat.mtimeMs)}` : "absent";
+        return stat ? `${stat.size}:${stat.mtimeMs}` : "absent";
     }
 
     /** #3049: stat the envelope the way loadEnvelope would resolve it — the
