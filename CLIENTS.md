@@ -648,6 +648,20 @@ the four have a base-URL env hook; one doesn't:
   channel; the launcher drives the CLI specifically — desktop users can export
   `CLOUD_CODE_URL` manually or use the MITM recipe.
 
+**Long-newline output trips the text-run guard (#5036).** Gemini-family models
+legitimately pad their visible text with long runs of blank lines — a stretch of
+200+ consecutive `\n` is normal for them, not degeneration. bili's output-side
+single-codepoint repetition breaker (#3260/#3946) trips at 200 identical
+codepoints by default, so such turns get cut mid-stream: the log records
+`output-side runaway guard tripped (text-run; …)` and the client receives only a
+half answer. This bites the two Google-model lanes above (`bili gemini`,
+`bili antigravity`) — iFlow/Qwen run different model families. The trip log now
+names the escape hatch directly; if you see mid-turn cuts on these lanes, raise
+the threshold or disable the lane entirely via `guardrails.textRunThreshold` in
+`~/.config/billion-context/billion-context.json` (or env
+`BILI_GUARDRAIL_TEXT_RUN_THRESHOLD`; `0` turns the lane off). Field reference:
+CONFIGURATION.md → Parameter Reference (`guardrails.textRunThreshold`).
+
 None of the four has a native mode: none exposes an in-loop tool injection
 seam (gemini-cli extensions reach custom commands only; the forks inherit
 that surface; Antigravity ships a user-plugin system — `plugins/<name>/`
