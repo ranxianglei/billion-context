@@ -5,8 +5,9 @@
  * the updater, it only holds THIS process's UpdateOptions (registered once by
  * the CLI alongside startAutoUpdate — the SAME object the background loop
  * runs on) and exposes guarded actions on top of its existing exports:
- *   - a forced registry check   → checkForUpdate(opts, true)
- *   - a pinned-version install  → forceInstallVersion(v, dir, opts, "web-panel")
+ *   - a check-only registry pass → checkForUpdate(opts, false, true) (#4791):
+ *     full gate ladder, structured verdict, NO download/install
+ *   - a pinned-version install  → forceInstallVersion(v, dir, opts, "web-panel", "manual-web")
  *     (upgrade to a newer release OR rollback to an older one)
  * Each action carries one in-process dedupe flag so the panel cannot stack
  * concurrent runs — a second concurrent caller gets {ok:true, already:true}
@@ -14,7 +15,7 @@
  * (autoUpdate off, embedded use, tests) degrades to plain error strings;
  * nothing here throws into the HTTP handlers.
  */
-import { checkForUpdate, findInstallDir, forceInstallVersion, lastUpdateCheckTime, readDiskVersion, staleInstallStatus, type UpdateOptions } from "../update.js";
+import { checkForUpdate, findInstallDir, forceInstallVersion, lastUpdateCheckTime, readDiskVersion, staleInstallStatus, type UpdateCheckOutcome, type UpdateOptions } from "../update.js";
 import { getUpdateVisibility } from "../update-notes.js";
 import { log as loggerLog } from "../logger.js";
 
@@ -67,19 +68,26 @@ function looksLikeSemver(v: string): boolean {
     return /^v?[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(v);
 }
 
-/** Force ONE registry check through the shared update options — same lock,
- *  throttle and proxy gates as the background loop (force=true skips the
- *  throttle window and advisory deferrals by design). A concurrent second
- *  call reports {ok:true, already:true}; network failures come back as
- *  {ok:false, error} — never a throw. */
-export async function triggerManualCheck(): Promise<{ ok: boolean; error?: string; already?: boolean }> {
+/** Run ONE check-only registry pass through the shared update options
+ *  (#4791): the full gate ladder runs with every safety gate armed — advisory
+ *  block/deferral, source-checkout guard, single-writer guard, remote policy,
+ *  install backoff — but nothing downloads or installs. force stays FALSE so a
+ *  gate reports its verdict instead of being bypassed; only the throttle
+ *  window is skipped (pacing, not safety) and the last-checked marker still
+ *  refreshes. The structured verdict ({status, latest?, candidate?, note?}) is
+ *  passed through for the panel; installs happen on /__bili/update/install.
+ *  A concurrent second call reports {ok:true, already:true}; failures come
+ *  back as {ok:false, error} — never a throw. */
+export async function triggerManualCheck(): Promise<{ ok: boolean; error?: string; already?: boolean; status?: UpdateCheckOutcome["status"]; latest?: string; candidate?: string; note?: string }> {
     const opts = registeredOpts;
     if (opts === undefined) return { ok: false, error: "self-update not wired in this process" };
     if (checking) return { ok: true, already: true };
     checking = true;
     try {
-        await checkForUpdate(opts, true);
-        return { ok: true };
+        const outcome = await checkForUpdate(opts, false, true);
+        if (outcome === undefined) return { ok: true };
+        if (outcome.status === "error") return { ok: false, error: outcome.note ?? "registry check failed" };
+        return { ok: true, ...outcome };
     } catch (e) {
         loggerLog("warn", `[update] manual web check failed: ${String(e)}`);
         return { ok: false, error: String(e) };
@@ -102,7 +110,7 @@ export async function installVersionAction(v: string): Promise<{ ok: boolean; er
         // Same resolution the background loop uses: explicit override wins
         // (test seam), otherwise walk up from the running module (#1628).
         const dir = opts.installDir ?? (await findInstallDir(opts.packageName));
-        const result = await forceInstallVersion(v, dir, opts, "web-panel");
+        const result = await forceInstallVersion(v, dir, opts, "web-panel", "manual-web");
         loggerLog(result.ok ? "info" : "warn", `[update] web panel install ${v}: ${result.ok ? "installed — restart the host to finish" : `failed (${result.error})`}`);
         return result;
     } catch (e) {
