@@ -54,7 +54,7 @@ import { prepareResponses, prepareResponsesCompact } from "./server/prepare-resp
 import { FORCE_TEXT_PROTOCOL } from "./server/inject.js";
 export { isChatGptCodexUpstream, isCodexResponsesLite, resolvePromptCacheKey, shouldInjectPromptCacheKey } from "./server/prepare-responses.js";
 import { biliToolsDeclaredOnWire, countBiliToolUses, evaluateSelfHealRound, nudgeSuppressed, pluginLaneDegraded, pluginLaneRestore } from "./session-self-heal.js";
-import { getSession, hasProcessedState, listSessions, peekSession, type PendingRetrieval, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, totalInFlight, snapshotMessages, ensureCanonicalId, storeEffectiveConfig, foldCoverage, postRebuildAnchorTokens, setPostRebuildAnchor, tickPostRebuildAnchor, splitSessionWarnings, usageAnchorCycleStale, staleSmallAnchorFallback, RESPONSES_TURN_SEPARATOR_ID_PREFIX } from "./session.js";
+import { getSession, hasProcessedState, listSessions, peekSession, type PendingRetrieval, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, totalInFlight, snapshotMessages, ensureCanonicalId, storeEffectiveConfig, foldCoverage, postRebuildAnchorTokens, setPostRebuildAnchor, tickPostRebuildAnchor, applyPostRebuildBaselineAnchor, splitSessionWarnings, usageAnchorCycleStale, staleSmallAnchorFallback, RESPONSES_TURN_SEPARATOR_ID_PREFIX } from "./session.js";
 import { detectStaleInstall, isVersionNewer } from "./update.js";
 import { decideEaddrinuse, eaddrinuseExitCode, isPortBusyError, postBindCanLadder, UPGRADE_REPLACEMENT_ENV, type FailFastReason } from "./listen-policy.js";
 import { getAdvisoryState, cannotResolveTarget } from "./advisory.js";
@@ -4247,10 +4247,7 @@ export async function preflightCompressIfNeeded(
         // raw body rides; mirror outboundPayloadBreakdown's fallback).
         const rebuiltMsgs = rebuilt.processedMessages.length > 0 ? rebuilt.processedMessages : rebuilt.originalMessages;
         const rebuiltTextSize = estimateCoreMessages(rebuiltMsgs) + overheadEstimate;
-        if (rebuiltTextSize > session.stats.lastInputTokens) {
-            session.stats.lastInputTokens = rebuiltTextSize;
-            session.stats.lastInputTokensSource = "estimate";
-        }
+        applyPostRebuildBaselineAnchor(session, rebuiltTextSize);
         // Same calibrated caliber as the trigger above — gate, per-round exit
         // and this final fit must judge the payload on one scale (#1933 F1).
         // The baseline anchor above stays raw deliberately: it is a floor for
