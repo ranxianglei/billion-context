@@ -3,6 +3,7 @@ import {
     countMessageTokens,
     defaultCountTokens,
     formatRanges,
+    hasUnrecoverableMediaPayload,
     viableRanges,
     type CompressionCore,
     type Config,
@@ -15,6 +16,7 @@ import { conflictClientOf, conflictEventsOf, formatConflictSection } from "./con
 import { getOpenUpstreamCircuits } from "./upstream-alerts.js";
 import { activeThrottleHolds } from "./upstream-throttle.js";
 import { dshLedgerFloorTokens } from "./server/budget.js";
+import { REMOTE_IMAGE_TOKENS } from "./image-tokens.js";
 import { getBlindTunnelStats } from "./mitm.js";
 import { pckAblations } from "./pck-probe.js";
 import { getUnrecognizedPathStats } from "./server/observability.js";
@@ -111,6 +113,88 @@ function fmtBytes(n: number): string {
 // #2366: usage fraction at which the PRESSURE NOTE becomes worth showing —
 // below it the window still has headroom and "stop folding" is noise.
 const PRESSURE_NOTE_USAGE_FRACTION = 0.6;
+// #5620: unrecoverable-media floor — live messages carrying remote-URL / file-ref
+// media can never fold (#1188/#2609) and turn integrity pins the turns around
+// them (#684); when that mass is a meaningful share of the window, name it so a
+// high-usage low-compressible session explains its own floor instead of reading
+// as a broken compressor.
+const MEDIA_FLOOR_REPORT_FRACTION = 0.05;
+// #5620 review fix: the local text meter only sees the "[image]" placeholder
+// for openai-wire image parts (kernel/src/wire/openai.ts) — ~2 tok per remote
+// image against its billed cost, so estimate-only mass never crosses the gate
+// in exactly the sessions this line exists for. Add the billed-grade prior the
+// billing lane already uses for images whose bytes bili never sees
+// (REMOTE_IMAGE_TOKENS, src/image-tokens.ts) per remote-URL image payload.
+// Mirrors the media branches of hasUnrecoverableMediaPayload over the shapes
+// reachable in ctx.messages. Mid-conversation system messages keep their
+// rawAnthropicMessage sidecar in the core array (kernel/src/wire/anthropic.ts),
+// so the predicate's system sidecar branches CAN fire — like any payload with
+// no remote-image branch here (file refs, Google fileData/videoMetadata) they
+// count toward `count` without an image prior.
+interface MediaSidecarView {
+    rawOpenaiContent?: unknown;
+    rawOpenaiContentParts?: unknown;
+    rawAnthropicBlock?: unknown;
+    rawResponsesItem?: unknown;
+}
+const asSidecarObj = (v: unknown): Record<string, unknown> | undefined =>
+    typeof v === "object" && v !== null ? (v as Record<string, unknown>) : undefined;
+// Same inline test as the kernel predicate (isInlineDataUrl): data: URLs carry
+// their bytes and stay archivable (#2607); everything else is remote.
+const isRemoteImageUrl = (u: unknown): boolean =>
+    typeof u === "string" && !/^data:[^;,]+(?:;base64)?,.+$/i.test(u);
+function remoteImagePayloadCount(m: CoreMessage & MediaSidecarView): number {
+    let n = 0;
+    const part = asSidecarObj(m.rawOpenaiContent);
+    if (part?.type === "image_url") {
+        if (isRemoteImageUrl(asSidecarObj(part.image_url)?.url)) n += 1;
+    } else if (Array.isArray(m.rawOpenaiContentParts)) {
+        for (const p of m.rawOpenaiContentParts) {
+            const po = asSidecarObj(p);
+            if (po?.type === "image_url" && isRemoteImageUrl(asSidecarObj(po.image_url)?.url)) n += 1;
+        }
+    }
+    // anthropic wire: url-source images, block-level or inside tool_result.
+    const imgSourceRemote = (source: unknown): boolean => {
+        const s = asSidecarObj(source);
+        return s?.type === "url" ? isRemoteImageUrl(s.url) : false;
+    };
+    const ab = asSidecarObj(m.rawAnthropicBlock);
+    if (ab) {
+        if (ab.type === "image") {
+            if (imgSourceRemote(ab.source)) n += 1;
+        } else if (ab.type === "tool_result" && Array.isArray(ab.content)) {
+            for (const b of ab.content) {
+                const bo = asSidecarObj(b);
+                if (bo?.type === "image" && imgSourceRemote(bo.source)) n += 1;
+            }
+        }
+    }
+    // responses wire: input_image items carry image_url as a bare string.
+    const item = asSidecarObj(m.rawResponsesItem);
+    if (item) {
+        const imgs: unknown[] = [];
+        if (item.type === "input_image") imgs.push(item);
+        for (const key of ["content", "output"] as const) {
+            const arr = item[key];
+            if (Array.isArray(arr))
+                for (const p of arr) if (asSidecarObj(p)?.type === "input_image") imgs.push(p);
+        }
+        for (const p of imgs) if (isRemoteImageUrl(asSidecarObj(p)?.image_url)) n += 1;
+    }
+    return n;
+}
+function mediaFloorMass(messages: readonly CoreMessage[]): { count: number; tokens: number } {
+    let count = 0;
+    let tokens = 0;
+    for (const m of messages) {
+        if (!hasUnrecoverableMediaPayload(m)) continue;
+        count += 1;
+        tokens += countMessageTokens(m, defaultCountTokens);
+        tokens += remoteImagePayloadCount(m as CoreMessage & MediaSidecarView) * REMOTE_IMAGE_TOKENS;
+    }
+    return { count, tokens };
+}
 // #2362: render dead refs as compact ref spans ("m09539, m09543–m09558").
 function formatDeadRefSpans(refs: string[]): string {
     const nums = refs
@@ -277,6 +361,15 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
             // forfeits the cache hit for almost-nothing reclaimed).
             if (!nudge.shouldInject && nudge.contextUsage >= PRESSURE_NOTE_USAGE_FRACTION && nudge.breakdown.maxPending < nudge.breakdown.nudgeGrowthTokens) {
                 extra.push(`PRESSURE NOTE: billed input sits at ${Math.round(nudge.contextUsage * 100)}% of the ${ctx.config.modelContextLimit}-token limit while max compressible mass is only ~${nudge.breakdown.maxPending} tokens — little left to fold. Repeated small folds rewrite the prefix (forfeiting cache hits) while reclaiming almost nothing; continue the task instead of folding again unless pressure climbs further.`);
+            }
+            // #5620: the note above misses the media-wall case — its gate needs
+            // maxPending < growth step, but pinned turns keep a range advertised
+            // forever, so report the never-foldable mass itself whenever it is a
+            // meaningful share of the window.
+            const limit = ctx.config.modelContextLimit;
+            const mediaFloor = mediaFloorMass(ctx.messages);
+            if (mediaFloor.count > 0 && limit > 0 && mediaFloor.tokens >= MEDIA_FLOOR_REPORT_FRACTION * limit) {
+                extra.push(`MEDIA FLOOR: ${mediaFloor.count} live message(s) carry unrecoverable media (remote URL / file references with no stored bytes) ≈ ${mediaFloor.tokens} tok (text estimate + ${REMOTE_IMAGE_TOKENS} tok per remote image; ~${Math.round((100 * mediaFloor.tokens) / limit)}% of the ${limit}-token limit) — these can never fold (#1188/#2609) and turn integrity pins the turns around them (#684); the context floor includes this mass plus system/tools/block anchors. Only fewer such images (or a fresh session) lowers the floor.`);
             }
             // #847: only advertise ranges the submit gate accepts — the gate
             // counts raw chars (minCompressRange), not tokens, so a range can
