@@ -539,10 +539,11 @@ test("#4666 mysql: concurrent boots serialize on the migration lock",
             locker.release();
             await migrating;
             // MySQL carries its OWN schema version (MYSQL_SCHEMA_VERSION), which is
-            // independent of the sqlite unified store's STORAGE_SCHEMA_VERSION: the
-            // v12 fastpath-v6 identity plane and the v13 render-snapshot plane are
-            // sqlite-only, so the mysql number stays behind. Pin the mysql one here;
-            // the sqlite assertions above derive from STORAGE_SCHEMA_VERSION.
+            // independent of the sqlite unified store's STORAGE_SCHEMA_VERSION — two
+            // separate constants that can drift apart over time, so each assertion
+            // pins its own side instead of assuming they move together. Pin the
+            // mysql one here; the sqlite assertions above derive from
+            // STORAGE_SCHEMA_VERSION.
             assert.equal(await H.stamp(), String(MYSQL_SCHEMA_VERSION), "migration completed after the lock freed");
             const s1 = await H.q("SELECT seq FROM messages WHERE session_id = 's1' ORDER BY seq");
             assert.deepEqual(s1.map((r) => Number(r.seq)), [1, 2, 3, 5], "fixture collapsed exactly once — no double-delete");
