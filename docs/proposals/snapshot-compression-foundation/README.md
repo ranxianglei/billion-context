@@ -13,7 +13,7 @@ Replace today's parallel state sources (process memory + kstate JSON + table spr
 
 **raw bytes → protocol conversion (canonical cores) → rewrite/compression → apply to snapshot tables → egress mapping → outbound**
 
-The compression kernel (fold judgment, summaries, prompts, ref/msgid contracts) stays **byte-for-byte untouched**. Sessions whose host supplies both a session id and per-element msgids run entirely on the new chain; hosts without msgids degrade to order-then-hash identity and write into the same tables. Any mismatch anywhere sends that turn back to today's legacy full-resend path (degrade, never guess). Rollback = DROP three tables + flip the flag off — byte-identical return to today.
+The compression kernel (fold judgment, summaries, prompts, ref/msgid contracts) stays **byte-for-byte untouched**. Sessions whose host supplies both a session id and per-element msgids run entirely on the new chain; hosts without msgids degrade to order-then-hash identity and write into the same tables. Any mismatch anywhere sends that turn back to today's legacy full-resend path (degrade, never guess). Rollback = DROP the four new tables + flip the flag off — byte-identical return to today.
 
 Objective ordering is unchanged: **stability / extensibility / generality first, performance is a byproduct** — ask "is the flow correct", not "is it fast".
 
@@ -57,7 +57,13 @@ Today a model request passes through `prepare-*` adapters → `lane-decisions` b
 
 ## 3. Target architecture overview
 
+The full view is **pixel-aligned one-to-one with the §2 current-architecture diagram** — compare side by side to see exactly which part of the global picture changed and how big the blast radius is (grey = untouched · cyan = new stage/table · amber = role change · red dashed = fallback safety net):
+
 ![Target architecture](./assets/arch-target.svg) (bitmap fallback: [arch-target.png](./assets/arch-target.png))
+
+How the six-stage chain flows on the inside — **stage-by-stage expansion** (commit primitive / DDL chips / red-gate band R1–R4 / coexistence routing & rollout rollback):
+
+![Stage expansion](./assets/arch-stages.svg) (bitmap fallback: [arch-stages.png](./assets/arch-stages.png))
 
 Where each piece of today's architecture lands under the new design — **component migration map** (bottom band maps the three structural pain points one-to-one to their fixes):
 
@@ -70,7 +76,7 @@ One-line duties per stage:
 | 0 | Ingress · identity registration | Dual-channel identity + L1 world match decides each row's provenance this turn | **NEW** |
 | 1 | Protocol conversion → canonical cores | Reuse existing wire matrix; span-parse only the identity-diff NEW elements | Existing + one new regression pin |
 | 2 | Rewrite / compression | Kernel untouched; emits structured events; landing timing per appendix-two | Kernel zero-change |
-| 3 | Apply to snapshot tables | Single-transaction commit primitive writes three tables; ckpt meta carries kernel state + coverage map + S4 | **NEW CORE** |
+| 3 | Apply to snapshot tables | Single-transaction commit primitive writes the snap trio (rows/log/ckpt); ckpt meta carries kernel state + coverage map + S4 | **NEW CORE** |
 | 4 | Egress mapping | Live rows ordered by pos ++ fresh-parse of tail window; dual-carrier branch | Read-side rebuild |
 | 5 | Outbound | Tripwire sampling comparison before release upstream | Guard strengthened |
 
@@ -280,7 +286,7 @@ Phase test skeleton (positive+negative pairing applies throughout):
 
 | # | Test | Phase |
 |---|------|-------|
-| T1 | Upgrade additivity pin: pre/post-upgrade existing query behavior byte-identical; DROP-three-tables rollback drill = byte-identical return to today | P0 |
+| T1 | Upgrade additivity pin: pre/post-upgrade existing query behavior byte-identical; DROP-four-new-tables rollback drill = byte-identical return to today | P0 |
 | T2 | Event transaction unit: commit primitive atomicity; seq monotonic across compaction; throw leaves no half-state | P0 |
 | T3 | B1 trap pin × 3 consecutive restarts oracle comparison (hydrated snapshot must carry the active world origin o; frontier movable only by arm/reset) | P1 |
 | T4 | A/B byte-level: on N-turn real corpora, new-chain egress bytes == legacy full-path artifact (modulo time attr) | P1–P3, always on |

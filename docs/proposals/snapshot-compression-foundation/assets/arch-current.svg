@@ -125,7 +125,7 @@
   </g>
   <text x="50" y="668" class="warnb">messages.msgId 列存的是 bili/内核规范 id —— 宿主 msgid 没有落点；sess_raw 无任何表承载。</text>
   <text x="50" y="690" class="warnb">CompressionState 的存活字段由 src/state-hydration.ts mergeState() 单一定义，经 persist.ts 走 kstate JSON 存取。</text>
-  <text x="50" y="730" class="s">#5855（事务骨架 re-land）仍 open/冲突未解 —— 新三表 DDL 必须叠在它落地之后。</text>
+  <text x="50" y="730" class="s">#5855（事务骨架 re-land）仍 open/冲突未解 —— 新四表 DDL 必须叠在它落地之后。</text>
 
   <!-- red warning boxes right -->
   <rect x="1150" y="520" width="380" height="70" rx="8" fill="#fee2e2" stroke="#ef4444"/>
