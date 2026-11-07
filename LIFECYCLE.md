@@ -56,6 +56,7 @@
 | 测试钩子：`BILI_DSH_RECOVERY_INTERVAL_MS` / `BILI_DSH_RETRY_INTERVAL_MS` / `BILI_MODEL_INFO_RETRY_MS` | #2082 等 | 缩短测试/运维节奏（dsh-native.ts；NODE_TEST_CONTEXT 感知，避免生产误缩） | 永久测试设施，随宿主代码走 | 测试钩子 |
 | `BILI_COMPRESS_AT_FOLD_POINT` | #5470 | compress-at-fold-point 实验性 opt-in（**默认关**；2026-11-01 真实模型验证通过，owner 决定保持 opt-in）：把重放视图中可见的 compress 调用对挪到它自己的折叠点（布局 [已折叠区]–[调用对]–[保护消息]），弱注意力模型不再把历史尾部的工具交换误读成新命令；纯视图变换，关时布局字节级不变；文件键 `compress.compressAtFoldPoint`；含 env-only opt-in 可达性修复（默认短路保持不变） | 更多真实模型积累后转正为默认开（走评审），或按废弃流程删除 | opt-in（默认关） |
 | `BILI_COMPRESS_AT_FOLD_POINT_CLEAR_THINKING` | #5470 | 依附上一开关：挪位瞬间清紧邻的未签名思考段（默认 off，A 关时无效）；strict-echo(#684) 或存在签名思考块(#1658)时整个机制不出手 | 同上 | opt-in（默认 off） |
+| `BILI_PF_RENDER_WINDOW` / `BILI_PF_RENDER_AUDIT_EVERY` | #5664 v6 render-snapshot plane | 实验性渲染快照车道可调项（默认 OFF，嵌套于 watermarkV6MsgId cohort）：W = 稳态轮回放的冻结核数（默认 8）；N = 计划全量审计节奏（默认 8）；读点 src/server/fastpath-v6-render.ts:50-60 | render 平面转正（rollout 100% 且审计计数归稳）后移 §2 常设面，或随车道退役删除 | opt-in（默认 OFF；仅由显式 rollout 开启） |
 
 ## 2. 常设面全量登记表（src/ 实际读取的其余 BILI_* 环境变量）
 
@@ -125,8 +126,8 @@
 | `BILI_MAX_SESSIONS` | sessions.max，默认 256 |
 | `BILI_SESSION_GC` | 会话 GC 总开关（`=1/true/on` 启用，默认 off；启用后下面三个参数生效） |
 | `BILI_SESSION_GC_INTERVAL_MS` / `BILI_SESSION_GC_MAX_AGE_DAYS` / `BILI_SESSION_GC_MAX_TOKENS` | 会话 GC 参数（默认 1h / 7d / 1M tokens） |
-| `BILI_SESSION_RESIDENT_MAX_BYTES` | sessions.residentMaxBytes，512 MiB 软上限（#2803） |
-| `BILI_SESSION_RESIDENT_HARD_MAX_BYTES` | sessions.hardMaxBytes，单会话驻留字节硬上限（#4788 D1-A）；默认同 residentMaxBytes（512 MiB），设 0 关闭——补软上限对唯一活跃会话的盲区 |
+| `BILI_SESSION_RESIDENT_MAX_BYTES` | sessions.residentMaxBytes，4 GiB 软上限（#2803；#5779 从 512 MiB 提高） |
+| `BILI_SESSION_RESIDENT_HARD_MAX_BYTES` | sessions.hardMaxBytes，单会话驻留字节硬上限（#4788 D1-A）；默认同 residentMaxBytes（4 GiB），设 0 关闭——补软上限对唯一活跃会话的盲区 |
 | `BILI_SESSION_CONTENT_STORE_PIN` | `=1/true` 保持单会话 CCR 内容存储（byRef/byHash 原文）常驻内存不折叠（#4788 phase 2 / #3916-E；首次触摸时从 unified ccr 镜像或 .content-store.json 侧车重建）；缺省/0/false = 落盘后折叠（默认） |
 | `BILI_SESSION_WARM_MAX_BYTES` | warm 解码字节上限，64 MiB（#2803） |
 | `BILI_PERSIST` | `=0` 关闭持久化（ephemeral/test） |
