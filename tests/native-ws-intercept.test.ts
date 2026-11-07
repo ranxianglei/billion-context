@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { liveStateSlotEffect, type NativeInterceptState } from "../src/agent/native-intercept.ts";
 import { _resetForTest, codexResponsesWsTarget, installNativeWebSocketIntercept, nativeWebSocketInterceptInstalled, rewriteCodexResponsesWsUrl } from "../src/agent/native-ws-intercept.ts";
 
@@ -431,7 +432,7 @@ test("deferred: total construct failure surfaces error + close instead of an unh
             assert.equal(FakeWs.instances.length, 0, "no connection was constructed");
             assert.ok(errors.length === 1 && errors[0] instanceof TypeError, "error event carries the constructor failure");
             assert.deepEqual(closes, [1006], "abnormal close follows the error");
-            assert.equal(ws.readyState, 0, "shell stays CONNECTING with no live socket");
+            assert.equal(ws.readyState, FakeWs.CLOSED, "failed construction is terminal");
         } finally {
             FakeWs.ctorFail = false;
         }
@@ -682,6 +683,230 @@ test("#5838 e2e: stamped headers actually ride the real WebSocket upgrade reques
         _resetForTest();
         if (saved !== undefined) Object.defineProperty(globalThis, "WebSocket", saved);
         srv.close();
+    }
+});
+
+test("DSH prepares every response.create in sender scope, preserves continuation, and refuses model changes", async () => {
+    await withPatchedGlobal(async () => {
+        const scope = new AsyncLocalStorage<string>();
+        const seen: string[] = [];
+        let model = "model-a";
+        let release!: () => void;
+        const adoption = new Promise<void>(resolve => { release = resolve; });
+        const state: NativeInterceptState = {
+            origin: ORIGIN, ready: Promise.resolve(ORIGIN), takeoverGate: async () => true,
+            headersFor: () => ({ "x-bili-plugin": "dsh", "x-bili-model": model }),
+            beforeSend: async (_url, init) => {
+                if (init?.body === undefined) return;
+                seen.push(scope.getStore() ?? "missing");
+                assert.equal(JSON.parse(String(init?.body)).type, "response.create");
+                await adoption;
+            },
+        };
+        installNativeWebSocketIntercept(state);
+        const ws = new (WsCtor<FakeWs>())(UPSTREAM_WS, {});
+        await tick();
+        const [real] = FakeWs.instances;
+        real.readyState = FakeWs.OPEN;
+        const first = JSON.stringify({ type: "response.create", model, input: [] });
+        scope.run("first-dispatch", () => ws.send(first));
+        await tick();
+        assert.equal(real.sent.length, 0, "first frame must await fork preparation");
+        release();
+        await tick();
+        const next = JSON.stringify({ type: "response.create", model, previous_response_id: "test-response", input: [] });
+        scope.run("second-dispatch", () => ws.send(next));
+        await tick();
+        assert.deepEqual(seen, ["first-dispatch", "second-dispatch"]);
+        assert.deepEqual(real.sent, [first, next], "do not expand or strip cached continuation on the client");
+        model = "model-b";
+        ws.send(next);
+        await tick();
+        assert.equal(real.sent.length, 2);
+        assert.equal(real.closed, true, "immutable upgrade metadata requires reconnect");
+    });
+});
+
+for (const change of ["state", "origin", "headers", "gate"] as const) {
+    test(`DSH cached connection refuses changed ${change}`, async () => {
+        await withPatchedGlobal(async () => {
+            let refuse = false;
+            let mutate = false;
+            const state: NativeInterceptState = {
+                origin: ORIGIN, ready: Promise.resolve(ORIGIN),
+                headersFor: () => ({ "x-bili-plugin": "dsh" }),
+                takeoverGate: async () => !refuse,
+                beforeSend: async (_url, init) => { if (mutate && init) init.headers = { "x-bili-plugin": "dsh", "x-bili-plugin-conversation": "changed" }; },
+            };
+            installNativeWebSocketIntercept(state);
+            const ws = new (WsCtor<FakeWs>())(UPSTREAM_WS, {});
+            await tick();
+            const [real] = FakeWs.instances;
+            real.readyState = FakeWs.OPEN;
+            if (change === "state") installNativeWebSocketIntercept({ ...state });
+            if (change === "origin") state.origin = "http://127.0.0.1:9999";
+            if (change === "headers") mutate = true;
+            if (change === "gate") refuse = true;
+            ws.send(JSON.stringify({ type: "response.create", input: [] }));
+            await tick();
+            assert.equal(real.sent.length, 0);
+            assert.equal(real.closed, true);
+        });
+    });
+}
+
+for (const change of ["cached headers", "in-place preparation"] as const) {
+    test(`upgrade identity is immutable against ${change}`, async () => {
+        await withPatchedGlobal(async () => {
+            const identity = { "x-bili-plugin": "dsh", "x-bili-model": "model-a" };
+            const state: NativeInterceptState = {
+                origin: ORIGIN, ready: Promise.resolve(ORIGIN), headersFor: () => identity,
+                beforeSend: async (_url, init) => {
+                    if (change === "in-place preparation" && init?.headers) {
+                        const headers = init.headers as Record<string, string>;
+                        headers["x-bili-model"] = "model-b";
+                    }
+                },
+            };
+            installNativeWebSocketIntercept(state);
+            const ws = new (WsCtor<FakeWs>())(UPSTREAM_WS, {});
+            await tick();
+            const [real] = FakeWs.instances;
+            real.readyState = FakeWs.OPEN;
+            if (change === "cached headers") identity["x-bili-model"] = "model-b";
+            ws.send(JSON.stringify({ type: "response.create", input: [] }));
+            await tick();
+            assert.equal(real.sent.length, 0);
+            assert.equal(real.closed, true);
+            if (change === "in-place preparation") assert.equal(identity["x-bili-model"], "model-a");
+        });
+    });
+}
+
+test("pending upgrade cannot adopt a later activation of the same state", async () => {
+    await withPatchedGlobal(async () => {
+        let release!: () => void;
+        const toolsReady = new Promise<void>(resolve => { release = resolve; });
+        const state: NativeInterceptState = { origin: ORIGIN, ready: Promise.resolve(ORIGIN), toolsReady, headersFor: () => ({ "x-bili-plugin": "dsh" }), beforeSend: async () => undefined };
+        installNativeWebSocketIntercept(state);
+        const ws = new (WsCtor<FakeWs>())(UPSTREAM_WS, {});
+        let closes = 0;
+        ws.addEventListener("close", () => closes++);
+        await tick();
+        installNativeWebSocketIntercept(state);
+        release();
+        await tick();
+        assert.equal(FakeWs.instances.length, 0);
+        assert.equal(closes, 1);
+    });
+});
+
+test("origin changes during asynchronous frame preparation refuse the held frame", async () => {
+    await withPatchedGlobal(async () => {
+        let release!: () => void;
+        const hold = new Promise<void>(resolve => { release = resolve; });
+        const state: NativeInterceptState = { origin: ORIGIN, ready: Promise.resolve(ORIGIN), beforeSend: async (_url, init) => { if (init?.body !== undefined) await hold; } };
+        installNativeWebSocketIntercept(state);
+        const ws = new (WsCtor<FakeWs>())(UPSTREAM_WS, {});
+        await tick();
+        const [real] = FakeWs.instances;
+        real.readyState = FakeWs.OPEN;
+        ws.send(JSON.stringify({ type: "response.create", input: [] }));
+        await tick();
+        state.origin = "http://127.0.0.1:9999";
+        release();
+        await tick();
+        assert.equal(real.sent.length, 0);
+        assert.equal(real.closed, true);
+    });
+});
+
+test("cancelled asynchronous preparation emits no duplicate error or close", async () => {
+    await withPatchedGlobal(async () => {
+        let release!: () => void;
+        const hold = new Promise<void>(resolve => { release = resolve; });
+        installNativeWebSocketIntercept(dshState({ beforeSend: async () => hold }));
+        const ws = new (WsCtor<FakeWs>())(UPSTREAM_WS, {});
+        let errors = 0;
+        let closes = 0;
+        ws.addEventListener("error", () => errors++);
+        ws.addEventListener("close", () => closes++);
+        await tick();
+        ws.close();
+        installNativeWebSocketIntercept(dshState());
+        release();
+        await tick();
+        assert.equal(FakeWs.instances.length, 0);
+        assert.equal(errors, 0);
+        assert.equal(closes, 1);
+    });
+});
+
+test("hooked cold bootstrap accepts the initially undefined origin becoming ready", async () => {
+    await withPatchedGlobal(async () => {
+        const state = pendingState();
+        state.beforeSend = async () => undefined;
+        state.headersFor = () => ({ ...DSH_STAMPS });
+        installNativeWebSocketIntercept(state);
+        const ws = new (WsCtor<FakeWs>())(UPSTREAM_WS, {});
+        await tick();
+        assert.equal(FakeWs.instances.length, 0);
+        state.origin = ORIGIN;
+        state.readyResolve(ORIGIN);
+        await tick();
+        const [real] = FakeWs.instances;
+        assert.equal(real.url, REWRITTEN);
+        real.readyState = FakeWs.OPEN;
+        const frame = JSON.stringify({ type: "response.create", input: [] });
+        ws.send(frame);
+        await tick();
+        assert.deepEqual(real.sent, [frame]);
+    });
+});
+
+test("real native WebSocket refuses stale model metadata with a valid client close code", async () => {
+    const { createServer } = await import("node:http");
+    const { WebSocketServer } = await import("ws");
+    const server = createServer();
+    const wss = new WebSocketServer({ server });
+    const saved = savedDescriptor();
+    let model = "model-a";
+    let acceptFirst!: (data: string) => void;
+    const first = new Promise<string>(resolve => { acceptFirst = resolve; });
+    wss.on("connection", peer => peer.on("message", data => acceptFirst(data.toString())));
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    const origin = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+    let socket: InstanceType<typeof globalThis.WebSocket> | undefined;
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<never>((_resolve, reject) => { timeout = setTimeout(() => reject(new Error("native WebSocket test timed out")), 5000); });
+    _resetForTest();
+    try {
+        installNativeWebSocketIntercept(dshState({ origin, ready: Promise.resolve(origin), headersFor: () => ({ ...DSH_STAMPS, "x-bili-model": model }), beforeSend: async () => undefined }));
+        const Ctor = globalThis.WebSocket as unknown as new (url: string, init: { headers: Record<string, string> }) => InstanceType<typeof globalThis.WebSocket>;
+        socket = new Ctor(UPSTREAM_WS, { headers: { "session-id": "native-test-only" } });
+        const ws = socket;
+        const errors: unknown[] = [];
+        ws.addEventListener("error", event => errors.push(event));
+        await Promise.race([new Promise<void>((resolve, reject) => {
+            ws.addEventListener("open", () => resolve(), { once: true });
+            ws.addEventListener("error", reject, { once: true });
+        }), deadline]);
+        const frame = JSON.stringify({ type: "response.create", model, input: [] });
+        ws.send(frame);
+        assert.equal(await Promise.race([first, deadline]), frame);
+        const closed = new Promise<number>(resolve => ws.addEventListener("close", event => resolve(event.code), { once: true }));
+        model = "model-b";
+        ws.send(frame);
+        assert.equal(await Promise.race([closed, deadline]), 4008);
+        assert.equal(errors.length, 1, "one intentional preparation error, no invalid-code rejection");
+    } finally {
+        if (timeout !== undefined) clearTimeout(timeout);
+        socket?.close();
+        for (const peer of wss.clients) peer.terminate();
+        await new Promise<void>(resolve => wss.close(() => resolve()));
+        await new Promise<void>(resolve => server.close(() => resolve()));
+        _resetForTest();
+        if (saved !== undefined) Object.defineProperty(globalThis, "WebSocket", saved);
     }
 });
 
