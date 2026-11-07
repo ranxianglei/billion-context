@@ -295,7 +295,14 @@ export function tryAnswerEarlyHold(o: {
     credHeaders: Record<string, string>;
     protocol: WireProtocol | null;
     bodyBytes: number;
-    requestModel?: string;
+    /** The request model — or a lazy supplier for it. The supplier form exists
+     *  because the only model source that is not a header read is a full-document
+     *  body scan: callers that pass a supplier pay that O(body) walk ONLY when
+     *  this function actually consults the model (i.e. the body cleared the
+     *  threshold and the wire is known). A sub-threshold or unknown-wire request
+     *  bails out above and never touches the payload (#5898 review: the eager
+     *  scan taxed every proxied POST with a result it could not use). */
+    requestModel?: string | (() => string | undefined);
     res: http.ServerResponse;
     streamErrorShape?: "protocol" | "completion";
     log: (level: string, msg: string) => void;
@@ -304,7 +311,8 @@ export function tryAnswerEarlyHold(o: {
 }): boolean {
     if (o.method === "GET" || o.method === "HEAD") return false;
     if (o.protocol === null || o.bodyBytes < EARLY_HOLD_GATE_MIN_BYTES) return false;
-    const reject = upstreamThrottlePeekReject(o.upstreamUrl, o.credHeaders, o.now ?? Date.now(), o.requestModel);
+    const requestModel = typeof o.requestModel === "function" ? o.requestModel() : o.requestModel;
+    const reject = upstreamThrottlePeekReject(o.upstreamUrl, o.credHeaders, o.now ?? Date.now(), requestModel);
     if (reject === undefined) return false;
     answerLocalThrottleReject(o.res, reject, o.protocol, o.streamErrorShape, o.log, "pre-ingest");
     return true;
@@ -909,7 +917,7 @@ async function forwardCaptured(
     // #4204: account-wide holds stay origin+credential scoped. KeyRing's
     // request-matched model-temporarily-unavailable error gets a separate
     // origin+credential+model hold so unrelated models remain eligible.
-    const throttleModel = throttleModelHint ?? (typeof prepared?.model === "string" ? prepared.model : requestModelFromBody(wireBody));
+    const throttleModel = throttleModelHint ?? (typeof prepared?.model === "string" ? prepared.model : requestModelFromBody(wireBody, req));
     let throttleProbeToken: symbol | undefined;
     if (req.method !== "GET" && req.method !== "HEAD") {
         const throttleGate = upstreamThrottleGate(upstreamUrl, headers, Date.now(), throttleModel);

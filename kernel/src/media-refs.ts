@@ -23,6 +23,15 @@
  * established — the litmus is "can the payload be re-acquired from the
  * surviving text alone?", and an unenumerated shape answers that with no
  * evidence either way.
+ *
+ * #5865-P2 (PR #5865 review F2): the litmus also requires the handle to be
+ * DURABLE. A pre-signed/expiring HTTP(S) URL (S3/GCS/Azure-SAS/CDN tokens)
+ * satisfies "has a ref" but lapses — by the time a folded summary is
+ * decompressed (hours later by definition of folding) the handle is dead and
+ * the payload is gone, whereas pre-#5620 pinned such messages forever. Such
+ * URLs are therefore classified as NON-recoverable (the message keeps
+ * pinning). Deliberately over-eager: a false positive only re-pins one media
+ * message; a false negative silently loses the payload.
  */
 import type { CompressionBlock, CoreMessage } from "./types.js";
 
@@ -48,9 +57,42 @@ function isInlineDataUrl(u: unknown): boolean {
   return typeof u === "string" && /^data:[^;,]+(?:;base64)?,.+$/i.test(u);
 }
 
+/** #5865-P2: query-parameter NAMES that mark an HTTP(S) URL as a
+ *  pre-signed/expiring handle — the enumerated families:
+ *  - cloud-provider signing prefixes (S3 v4 `X-Amz-*`, GCS `X-Goog-*`,
+ *    Azure Blob SAS `X-MS-*`, R2/Cloudflare `X-CF-*`/`X-R2-*`, Aliyun OSS
+ *    `X-OSS-*`… via the generic provider-prefix pattern);
+ *  - explicit expiry keys (`Expires`/`expiry`/`exp`/`ttl` — covers S3 v1
+ *    pre-signing and generic signed-CDN schemes);
+ *  - credential/session keys (`Signature`/`sig`/`token`/`session-token`/
+ *    `security-token`/`auth` — session-bound tokens on private CDNs).
+ *  Non-HTTP refs (DeepSeek `file_id`, `gs://` URIs, bare ids) never match —
+ *  they are durable by definition of the #5620 split. */
+const EPHEMERAL_QUERY_PARAM =
+  /^(?:x-(?:amz|goog|ms|cf|r2|oss|azure)-.*|(?:expires?|expiry|exp|ttl|signature|sig|session-token|security-token|token|auth))$/i;
+
+/** #5865-P2: true when the ref is an HTTP(S) URL whose query carries a
+ *  signed/expiring marker — its re-access is time-bounded, so it must not
+ *  count as a durable re-access handle (see module header). */
+export function looksEphemeralSignedUrl(ref: string): boolean {
+  if (!/^https?:\/\//i.test(ref)) return false;
+  const q = ref.indexOf("?");
+  if (q === -1) return false;
+  for (const pair of ref.slice(q + 1).split("&")) {
+    const eq = pair.indexOf("=");
+    const name = eq === -1 ? pair : pair.slice(0, eq);
+    if (name !== "" && EPHEMERAL_QUERY_PARAM.test(name)) return true;
+  }
+  return false;
+}
+
 function pushRef(refs: string[], ref: unknown): void {
-  if (typeof ref === "string" && ref.length > 0 && !isInlineDataUrl(ref))
-    refs.push(ref);
+  if (typeof ref !== "string" || ref.length === 0 || isInlineDataUrl(ref)) return;
+  // #5865-P2: an expiring handle is not a re-access handle — keep the
+  // message pinned (pre-#5620 behavior) rather than folding bytes whose only
+  // surviving copy dies with the URL.
+  if (looksEphemeralSignedUrl(ref)) return;
+  refs.push(ref);
 }
 
 /** Collect every re-access handle (non-data: URL / file id / fileUri) a

@@ -82,6 +82,7 @@ import { createHash } from "node:crypto";
 import { prefixAffinity } from "./prefix-affinity.js";
 import { isClaudeLaneToken } from "./claude-lane-token.js";
 import { neutralTurns, type NeutralTurn } from "./affinity-neutral.js";
+import { log as loggerLog } from "./logger.js";
 // #3397: skeleton persistence hook (deferred-use ESM cycle with
 // src/order-persist.ts — each side calls the other only inside function
 // bodies, never at module evaluation; see the note on its import).
@@ -365,7 +366,7 @@ export function resolveSessionOrder(rawId: string, history: unknown, personaTag?
      *  instead of forking a zero-state sub lane (#5719). The store lookup is
      *  LAZY (fires only here, with stamped ids present) and null-safe: a
      *  latched-off / legacy store degrades to the byte-evidence path. */
-    const tryMsgIdRescue = (): SessionOrderResolution | null => {
+    const tryMsgIdRescue = (exit: string): SessionOrderResolution | null => {
         if (inboundIds === undefined || readStoredMsgIds === undefined) return null;
         const stored = readStoredMsgIds(rawId);
         if (stored === null || stored.length === 0) return null;
@@ -379,6 +380,13 @@ export function resolveSessionOrder(rawId: string, history: unknown, personaTag?
             }
         }
         if (hits === 0) return null;
+        // #5865-P2 (identity F1 / #5826-P1 follow-up): the promised one-line
+        // trace. The ≥1-overlap rescue re-anchors the WHOLE request on the
+        // raw lane BEFORE the role-fork rungs — whether aux/review dispatches
+        // ever ride stamped ids overlapping the parent's rows is exactly the
+        // evidence the ≥2-vs-≥1 threshold decision needs, so every firing is
+        // logged (hits, exit context, ids) before the threshold is touched.
+        loggerLog("warn", `[session-resolve][msgid-rescue] ${rawId} hits=${hits}/${inboundIds.length} exit=${exit} firstHit=${firstHit} (#5719 overlap-rung reachability evidence)`);
         record(rawId, turns, effectiveTagHash, effectiveModel);
         return {
             key: rawId,
@@ -485,7 +493,7 @@ export function resolveSessionOrder(rawId: string, history: unknown, personaTag?
         // #5719: every byte-level escape needs EVIDENCE (fragments/cells/
         // chain continuity) that the composite field failure destroys in the
         // same turn — fall back to the only surviving identity carrier.
-        const msgRescue = tryMsgIdRescue();
+        const msgRescue = tryMsgIdRescue("tag-changed");
         if (msgRescue !== null) return msgRescue;
         // #5095 D1-B: a non-empty discriminator (only the claude-anthropic
         // headless-subagent call site passes one) widens the key into a
@@ -534,7 +542,7 @@ export function resolveSessionOrder(rawId: string, history: unknown, personaTag?
         // derived, never the raw key, until the skeleton is re-established.
         // The skeleton-hash discriminator keeps distinct strangers (two
         // subagents under one main id) on distinct compression sessions.
-        const taskRescue = tryMsgIdRescue();
+        const taskRescue = tryMsgIdRescue("diverged-order");
         if (taskRescue !== null) return taskRescue;
         return { key: `${rawId}|sub:task:${skel8(kinds)}`, action: "derived-task", reason: "no order+fragment alignment with the recorded skeleton" };
     }
@@ -554,7 +562,7 @@ export function resolveSessionOrder(rawId: string, history: unknown, personaTag?
         record(rawId, turns, effectiveTagHash, effectiveModel);
         return { key: rawId, action: "reanchor", reason: "same persona id, shorter replay — skeleton follows the living end" };
     }
-    const shortRescue = tryMsgIdRescue();
+    const shortRescue = tryMsgIdRescue("shorter-divergent");
     if (shortRescue !== null) return shortRescue;
     return {
         key: `${rawId}|sub:task:${skel8(kinds)}`,
