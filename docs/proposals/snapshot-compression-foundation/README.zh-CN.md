@@ -45,7 +45,7 @@
 
 ## 2. 现状架构与三个结构性问题
 
-![现状架构](./assets/arch-current.png)（矢量版：[arch-current.svg](./assets/arch-current.svg)）
+![现状架构](./assets/arch-current.svg)（位图备选：[arch-current.png](./assets/arch-current.png)）
 
 今天的一条模型请求从入站到出站要经过：`prepare-*` 适配器 → `lane-decisions` 分轨（legacy 全量 / 增量 plugin-turn / v5 watermark 5%灰度 / D-lane 快照渲染 ≈0%灰度）→ 内核 → `coreTo*` 出站映射。状态住在三个地方：进程内存（lastMessages AST、常驻核数组）、统一 SQLite v11 表族、kstate JSON（经 `mergeState()` 水合）。三个结构性问题：
 
@@ -57,7 +57,7 @@
 
 ## 3. 目标架构总览
 
-![目标架构](./assets/arch-target.png)（矢量版：[arch-target.svg](./assets/arch-target.svg)）
+![目标架构](./assets/arch-target.svg)（位图备选：[arch-target.png](./assets/arch-target.png)）
 
 六个阶段的职责一句话版：
 

@@ -45,7 +45,7 @@ All standing rulings from the #5643 body remain in force without restatement her
 
 ## 2. Current architecture & three structural problems
 
-![Current architecture](./assets/arch-current.png) (vector: [arch-current.svg](./assets/arch-current.svg))
+![Current architecture](./assets/arch-current.svg) (bitmap fallback: [arch-current.png](./assets/arch-current.png))
 
 Today a model request passes through `prepare-*` adapters → `lane-decisions` branching (legacy full resend / incremental plugin-turn / v5 watermark 5% rollout / D-lane snapshot render ≈0% rollout) → kernel → `coreTo*` egress mapping. State lives in three places: process memory (lastMessages ASTs, resident core arrays), the unified SQLite v11 table family, and kstate JSON (hydrated through `mergeState()`). Three structural problems:
 
@@ -57,7 +57,7 @@ Today a model request passes through `prepare-*` adapters → `lane-decisions` b
 
 ## 3. Target architecture overview
 
-![Target architecture](./assets/arch-target.png) (vector: [arch-target.svg](./assets/arch-target.svg))
+![Target architecture](./assets/arch-target.svg) (bitmap fallback: [arch-target.png](./assets/arch-target.png))
 
 One-line duties per stage:
 
