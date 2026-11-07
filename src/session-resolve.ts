@@ -630,7 +630,10 @@ export function applyOrderSnapshot(entries: OrderSkeletonEntry[]): number {
         if (!cur || e.lastSeen > cur.lastSeen) {
             // #5844: pre-change snapshots carry no canon column; a malformed
             // one degrades to absent (byte-fragment path only), never trusted.
-            const canon = Array.isArray(e.canon) && e.canon.length > 0 && e.canon.every((c) => typeof c === "string" && CANON_FP_RE.test(c)) ? e.canon : undefined;
+            // The writers keep canon 1:1 with kinds (both derive from the same
+            // turn list in record()), so a length mismatch means the column is
+            // shifted/corrupted — trust nothing from it.
+            const canon = Array.isArray(e.canon) && e.canon.length > 0 && e.canon.length === e.kinds.length && e.canon.every((c) => typeof c === "string" && CANON_FP_RE.test(c)) ? e.canon : undefined;
             skeletons.set(e.id, { kinds: e.kinds, frags: e.frags, canon, tagHash: e.tagHash, model: e.model, lastSeen: e.lastSeen });
             imported++;
         }
