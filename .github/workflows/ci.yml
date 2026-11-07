@@ -447,6 +447,7 @@ jobs:
       - name: Verify kernel boundary rules (#2092)
         env:
           PR_BODY: ${{ github.event.pull_request.body }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           set -euo pipefail
           # GITHUB_HEAD_REF is PR-only; on workflow_dispatch fall back to
@@ -471,9 +472,9 @@ jobs:
             # owner-fired (release fallback / bugfix carve-out lanes), so the
             # human gate has already happened out-of-band; skip only the
             # body check there. Version-discipline rules below still run.
-            if [[ "${GITHUB_EVENT_NAME}" != "workflow_dispatch" ]] \
+            if [[ "${EVENT_NAME:-pull_request}" != "workflow_dispatch" ]] \
               && ! printf '%s' "$PR_BODY" | grep -q 'kernel-change:'; then
-              echo "::error::This PR modifies kernel/ ($KERNEL_TOUCHED) but does not declare 'kernel-change: <reason>' in its body.
+              echo "::error::This PR modifies kernel/ ($KERNEL_TOUCHED) but does not declare 'kernel-change: <reason>' in its body."
               echo "Kernel changes are human-gated: owner approval plus explicit declaration required. See AGENTS.md 'Kernel Boundary'."
               exit 1
             fi
