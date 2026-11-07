@@ -618,8 +618,13 @@ export function snapL1Lookup(db: DbLike, sessRaw: string): L1Entry | null {
 // physically removed. Rows covered by a LIVE block stay (the fold view
 // still renders their summary). "deleted" cover_ref (host removal, no
 // block) releases immediately — the position is gone from the host
-// forever and no summary references it.
-// Returns the number of rows physically removed.
+// forever and no summary references it. Physical removal changes the row
+// set the S4 anchor aggregates over, so any removal re-anchors in the
+// same transaction (a pure-reanchoring fold at the current log tail):
+// without it the last log sumAfter would cover rows that no longer exist
+// and the next readSnapView would trip R1 on a healthy plane (sticky dead
+// latch after an ordinary host-side rewind). Returns the number of rows
+// physically removed.
 // ---------------------------------------------------------------------------
 export function snapGcCoveredRows(db: DbLike, sid: string): number {
     return db.transaction(() => {
@@ -642,6 +647,12 @@ export function snapGcCoveredRows(db: DbLike, sid: string): number {
                 del.run(sid, r.pos);
                 removed += 1;
             }
+        }
+        if (removed > 0) {
+            const tail = db
+                .prepare("SELECT COALESCE(MAX(seq), 0) AS m FROM snap_log WHERE sid = ?")
+                .get(sid) as { m: number };
+            fold(db, sid, tail.m, readRawRows(db, sid), Date.now());
         }
         return removed;
     });
