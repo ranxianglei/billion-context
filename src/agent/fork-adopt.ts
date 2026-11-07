@@ -9,13 +9,17 @@ import { ACP_NAME_ALT } from "../loop/tag-echo-filter.js";
 /**
  * Agent-side fork adoption (#2399): a host extension reads its session header
  * (parent lineage marker — dsh stamps parentSession+isSeeded, pi/omp stamp
- * parentSession alone, opencode V2 derives it from session.created), and
- * before a fork child's first model request replays into the proxy, adopts
- * the parent conversation's compression state through the plugin fork
- * protocol (PLUGIN.md §8). This module is the client half: it projects the
- * outgoing body (openai/anthropic/responses dialects) the same way the
- * server's incomingCoreMessages does, matches the longest parent prefix by
- * identity hash, and posts the fork receipt. The google wire has no
+ * parentSession alone, opencode V2 derives it from session.created plus the
+ * user-fork session.forked event, #5509), and before a fork child's first
+ * model request replays into the proxy, adopts the parent conversation's
+ * compression state through the plugin fork protocol (PLUGIN.md §8). This
+ * module is the client half: it projects the outgoing body
+ * (openai/anthropic/responses dialects) the same way the server's
+ * incomingCoreMessages does, resolves the branch point as the longest
+ * positional role+text prefix of the snapshot's per-message rows (identity
+ * hash fallback when the proxy returns none; a host-declared boundary caps
+ * the count when its message is locatable by rawId — #5509), and posts the
+ * fork receipt. The google wire has no
  * client-side projection yet and is gated off BEFORE any network request
  * (#2469).
  *
@@ -47,6 +51,24 @@ const FORK_TIMEOUT_MS = 15_000;
 // matching and hashing are identity-based, so null flows through untouched.
 export type ForkIdentity = { rawId: string; ref: string | null; identityHash: string };
 
+// #5509: host-declared fork boundary (opencode session.forked / Session.Info.fork.boundary):
+// "before" = the child's history EXCLUDES the boundary message, "through" = includes it.
+export type ForkBoundary = { type?: string; messageID?: string };
+
+/** Validate a host-declared boundary payload; undefined when nothing usable arrives. */
+export function normalizeForkBoundary(raw: unknown): ForkBoundary | undefined {
+    if (raw === null || typeof raw !== "object") return undefined;
+    const rec = raw as Record<string, unknown>;
+    const out: ForkBoundary = {};
+    if (typeof rec.type === "string" && rec.type.length > 0) out.type = rec.type;
+    if (typeof rec.messageID === "string" && rec.messageID.length > 0) out.messageID = rec.messageID;
+    return out.type !== undefined || out.messageID !== undefined ? out : undefined;
+}
+
+// #5509: per-message row from the snapshot endpoint (server forkSnapshot messages[]):
+// role + text stay stable across fold states, unlike the identity-hash components.
+type SnapshotMessageRow = { rawId: string; role: string; text: string | null };
+
 type SnapshotResponse = {
     ok?: boolean;
     protocolVersion?: number;
@@ -55,6 +77,7 @@ type SnapshotResponse = {
     parentRevision?: string;
     orderHash?: string;
     orderedMessages?: ForkIdentity[];
+    messages?: unknown;
 };
 
 type ForkAdoptionResult =
@@ -317,14 +340,79 @@ export function matchForkPrefix(core: CoreMessage[], identities: ForkIdentity[])
     return n;
 }
 
-function snapshotOf(raw: unknown): { parentRevision: string; orderHash: string; orderedMessages: ForkIdentity[] } | null {
+/** #5509: longest prefix of `core` matching the snapshot's per-message rows by
+ *  (role, text), positionally. Strictly broader than matchForkPrefix — an
+ *  identity-equal cell is (role,text)-equal, so the count is never smaller —
+ *  while surviving exactly the components that flip between a folded parent
+ *  ledger and a fresh child replay (summaryOfBlockId, contentType; the #5122
+ *  zero-fold collapse). Undercount-safe: a short match only forfeits
+ *  inheritable blocks, never imports content the child does not replay. */
+export function matchForkTextPrefix(core: CoreMessage[], rows: Array<{ rawId: string; role: string; text: string | null }>): number {
+    let n = 0;
+    while (n < core.length && n < rows.length && core[n]!.role === rows[n]!.role && (core[n]!.text ?? null) === rows[n]!.text) n += 1;
+    return n;
+}
+
+/** #5509: resolve the fork branch point against a host-declared boundary.
+ *  Base count = the positional (role,text) prefix when the proxy returned
+ *  per-message rows (never smaller than the identity count), else the legacy
+ *  identity prefix for older proxies. A boundary whose message is locatable in
+ *  the snapshot by rawId (#3464: host msgid becomes the canonical id) caps the
+ *  count at the declared fork point — "before" excludes the boundary message,
+ *  "through" includes it. An unlocatable boundary message or one whose type is
+ *  neither of the two known kinds contributes nothing (no guessing). */
+export function resolveForkBranchPoint(
+    core: CoreMessage[],
+    snapshot: { orderedMessages: ForkIdentity[]; messages?: Array<{ rawId: string; role: string; text: string | null }> },
+    boundary?: ForkBoundary,
+): { count: number; via: "text" | "identity"; cappedByBoundary: boolean } {
+    const rows = snapshot.messages;
+    const usable = rows !== undefined && rows.length === snapshot.orderedMessages.length ? rows : undefined;
+    const via: "text" | "identity" = usable !== undefined ? "text" : "identity";
+    let count = usable !== undefined ? matchForkTextPrefix(core, usable) : matchForkPrefix(core, snapshot.orderedMessages);
+    let cappedByBoundary = false;
+    if (usable !== undefined && boundary !== undefined) {
+        const bid = boundary.messageID;
+        if (typeof bid === "string" && bid.length > 0 && (boundary.type === "before" || boundary.type === "through")) {
+            const bi = usable.findIndex((row) => row.rawId === bid);
+            if (bi >= 0) {
+                const cap = boundary.type === "through" ? bi + 1 : bi;
+                if (count > cap) {
+                    count = cap;
+                    cappedByBoundary = true;
+                }
+            }
+        }
+    }
+    return { count, via, cappedByBoundary };
+}
+
+function snapshotOf(raw: unknown): { parentRevision: string; orderHash: string; orderedMessages: ForkIdentity[]; messages?: SnapshotMessageRow[] } | null {
     if (raw === null || typeof raw !== "object") return null;
     const snap = raw as SnapshotResponse;
     if (typeof snap.parentRevision !== "string" || typeof snap.orderHash !== "string" || !Array.isArray(snap.orderedMessages)) return null;
     for (const identity of snap.orderedMessages) {
         if (identity === null || typeof identity !== "object" || typeof identity.rawId !== "string" || (identity.ref !== null && typeof identity.ref !== "string") || typeof identity.identityHash !== "string") return null;
     }
-    return { parentRevision: snap.parentRevision, orderHash: snap.orderHash, orderedMessages: snap.orderedMessages };
+    // #5509: keep the per-message rows when they line up 1:1 with the identity
+    // array — branch-point resolution prefers them because role+text survive
+    // fold-state drift that breaks identityHash; proxies without rows leave it
+    // undefined and callers fall back to identity matching.
+    let messages: SnapshotMessageRow[] | undefined;
+    if (Array.isArray(snap.messages) && snap.messages.length === snap.orderedMessages.length) {
+        const rows: SnapshotMessageRow[] = [];
+        let valid = true;
+        for (const entry of snap.messages) {
+            const row = entry as Record<string, unknown> | null;
+            if (row === null || typeof row !== "object" || typeof row.rawId !== "string" || typeof row.role !== "string") {
+                valid = false;
+                break;
+            }
+            rows.push({ rawId: row.rawId, role: row.role, text: typeof row.text === "string" ? row.text : null });
+        }
+        if (valid) messages = rows;
+    }
+    return { parentRevision: snap.parentRevision, orderHash: snap.orderHash, orderedMessages: snap.orderedMessages, messages };
 }
 
 // #2469: error bodies are read BOUNDED — a hostile or misconfigured upstream
@@ -397,6 +485,7 @@ export async function tryForkAdoption(opts: {
     parentConversationId: string;
     childConversationId: string;
     body: unknown;
+    boundary?: ForkBoundary;
     fetchImpl?: typeof fetch;
     log?: (line: string) => void;
 }): Promise<ForkAdoptionResult> {
@@ -428,8 +517,13 @@ export async function tryForkAdoption(opts: {
             return { outcome: "degraded", reason: `snapshot error ${err instanceof Error ? err.message : String(err)}` };
         }
         if (snapshot === null) return { outcome: "degraded", reason: "snapshot malformed" };
-        const branchPoint = matchForkPrefix(core, snapshot.orderedMessages);
-        if (branchPoint === 0) return { outcome: "degraded", reason: "no prefix match" };
+        // #5509: role+text-first so a folded parent ledger cannot collapse the
+        // match to zero; the host-declared boundary caps the count when its
+        // message is locatable. Both are pure functions of body+snapshot, so a
+        // zero here is terminal by construction (retrying changes nothing).
+        const resolved = resolveForkBranchPoint(core, snapshot, opts.boundary);
+        if (resolved.count === 0) return { outcome: "degraded", reason: opts.boundary !== undefined ? "boundary unresolved (child replay shares no prefix with the parent snapshot)" : "no prefix match" };
+        const branchPoint = resolved.count;
         const prefix = snapshot.orderedMessages.slice(0, branchPoint);
         const orderHash = branchPoint === snapshot.orderedMessages.length ? snapshot.orderHash : forkOrderHashOf(prefix);
         const payload = {
@@ -460,7 +554,7 @@ export async function tryForkAdoption(opts: {
             } catch {
                 replayed = false;
             }
-            opts.log?.(`fork child ${opts.childConversationId} adopted parent ${opts.parentConversationId} at branch point ${branchPoint}${replayed ? " (replayed)" : ""} (#2399)`);
+            opts.log?.(`fork child ${opts.childConversationId} adopted parent ${opts.parentConversationId} at branch point ${branchPoint} (${resolved.via}${resolved.cappedByBoundary ? ", boundary-capped" : ""})${replayed ? " (replayed)" : ""} (#2399/#5509)`);
             return { outcome: "adopted", branchPoint, replayed };
         }
         const code = (await readBoundedErrorBody(res)).code;
@@ -502,7 +596,7 @@ export async function manifestForkCapable(base: string, fetchImpl?: typeof fetch
     }
 }
 
-export type ForkAdoptInput = { base: string; parent: string; child: string; body: unknown };
+export type ForkAdoptInput = { base: string; parent: string; child: string; body: unknown; boundary?: ForkBoundary };
 
 /** Per-host fork-adoption coordinator (#2399 stage 2): absorbs the bookkeeping
  *  every host needs (done/attempts/single-flight keyed by child id, the
@@ -558,6 +652,7 @@ export function createForkAdopter(log: (line: string) => void, opts?: { maxAttem
             parentConversationId: input.parent,
             childConversationId: input.child,
             body: input.body,
+            boundary: input.boundary,
             fetchImpl: opts?.fetchImpl,
             log,
         });
