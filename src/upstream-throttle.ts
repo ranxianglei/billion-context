@@ -35,6 +35,7 @@ import {
     throttle429Enabled,
     throttle429MaxConsecutive,
     throttle429MaxDelayMs,
+    throttle429Scope,
 } from "./knobs.js";
 
 /** Bounded state table (same posture as MAX_CIRCUITS in upstream-alerts.ts). */
@@ -239,6 +240,27 @@ export function keyringModel429Scope(
     if (error.code === KEYRING_MODEL_LIMIT_CODE) return requestModel;
     if (error.code === "bili_throttle_hold" && error.scope === "model") return requestModel;
     return undefined;
+}
+
+/**
+ * The hold scope for an observed 429, combining #5696's marker discipline with
+ * the #5199/#5853 knob: a recognized KeyRing / bili-relay marker wins exactly
+ * as before; otherwise, when network.throttle429Scope is "model" and the send
+ * carried an identifiable request model, a marker-less gateway 429 (RPM/quota
+ * text, opaque relay-rewritten bodies — LiteLLM/one-api/opencode.ai shapes
+ * where one model's pool exhaustion must not freeze its siblings) settles
+ * model-scoped instead of credential-wide. Model-less sends keep the legacy
+ * credential key, so worst-case protection never widens beyond legacy.
+ */
+export function throttle429ModelScope(
+    status: number,
+    requestModel: string | undefined,
+    responseBody: string | Uint8Array | null | undefined,
+): string | undefined {
+    const recognized = keyringModel429Scope(status, requestModel, responseBody);
+    if (recognized !== undefined) return recognized;
+    if (status !== 429 || throttle429Scope() !== "model") return undefined;
+    return requestModel !== undefined && requestModel.length > 0 ? requestModel : undefined;
 }
 
 function modelHoldKey(key: string, model: string): string {

@@ -33,7 +33,7 @@ import { applyConfiguredCompression } from "../external-summary-compress.js";
 import { executeSearchContextTarget, resolveDecompress } from "../decompress-shared.js";
 import { toolFail, type ProxyToolResult } from "../proxy-tool-result.js";
 import { fetchWithRetry, UpstreamHttpError } from "../fetch-util.js";
-import { keyringModel429Scope, noteUpstreamThrottle429, noteUpstreamThrottleResolved } from "../upstream-throttle.js";
+import { noteUpstreamThrottle429, noteUpstreamThrottleResolved, throttle429ModelScope } from "../upstream-throttle.js";
 import { classifyUpstreamFailure, type SkippedProxyInfo, type UpstreamFailureKind } from "../upstream-fail.js";
 import { formatUpstreamError, proxyDispatcher } from "../upstream-proxy.js";
 import { warnCacheCollapse } from "../cache-warn.js";
@@ -601,7 +601,7 @@ export async function* runCompressLoop(
             signal,
             (info) => {
                 if (info.status === 429) {
-                    const modelScope = keyringModel429Scope(info.status, requestModel, info.detail);
+                    const modelScope = throttle429ModelScope(info.status, requestModel, info.detail);
                     noteUpstreamThrottle429(requestOptions.url, requestOptions.headers, null, Date.now(), modelScope); // Retry-After is not carried on replay metadata.
                 }
                 // #189: correlate the rejection with the rewrite that
@@ -622,7 +622,7 @@ export async function* runCompressLoop(
             return upstreamSend;
         } catch (error) {
             if (error instanceof UpstreamHttpError && error.status === 429) {
-                const modelScope = keyringModel429Scope(error.status, requestModel, error.body);
+                const modelScope = throttle429ModelScope(error.status, requestModel, error.body);
                 noteUpstreamThrottle429(requestOptions.url, requestOptions.headers, null, Date.now(), modelScope);
             }
             throw error;
