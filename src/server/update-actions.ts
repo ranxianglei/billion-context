@@ -70,10 +70,10 @@ function looksLikeSemver(v: string): boolean {
 
 /** Run ONE check-only registry pass through the shared update options
  *  (#4791): the full gate ladder runs with every safety gate armed — advisory
- *  block/deferral, source-checkout guard, single-writer guard, remote policy,
- *  install backoff — but nothing downloads or installs. force stays FALSE so a
- *  gate reports its verdict instead of being bypassed; only the throttle
- *  window is skipped (pacing, not safety) and the last-checked marker still
+ *  block/deferral, source-checkout guard, single-writer guard, remote policy —
+ *  but nothing downloads or installs. force stays FALSE so a gate reports its
+ *  verdict instead of being bypassed; only the pacing gates (throttle window,
+ *  install-failure backoff) are skipped, and the last-checked marker still
  *  refreshes. The structured verdict ({status, latest?, candidate?, note?}) is
  *  passed through for the panel; installs happen on /__bili/update/install.
  *  A concurrent second call reports {ok:true, already:true}; failures come

@@ -41,8 +41,8 @@ function makeRoot(tag: string): string {
 
 // The five codex-lane evidence lines, byte shapes taken from the actual log
 // sites (src/server/handle.ts not-intercepted forward; src/server/
-// prepare-responses.ts local-auto-compact detection/rebase, both intercepted
-// forge forms, and the forge failure).
+// prepare-openai.ts + prepare-responses.ts local-auto-compact
+// detection/rebase, both intercepted forge forms, and the forge failure).
 const CODEX_LOG_LINES = [
     "[ses_codex1] codex compaction_trigger request not intercepted (BILI_CODEX_COMPACT=pass) — forwarding verbatim (no preflight, no rebuild, no window clamp)",
     "[ses_codex1] codex local auto-compaction detected (320/771 covered ids retained) — rebasing ACP state onto the compacted history (#2372)",

@@ -1524,8 +1524,9 @@ export interface UpdateCheckOutcome {
  *  `checkOnly` (#4791): run the full gate ladder and report its verdict as an
  *  outcome, cutting off BEFORE the download/install tail — the web panel's
  *  "Check now" uses this so a query never installs. Every safety gate stays
- *  armed on this path: they report their verdict instead of being bypassed,
- *  and only the throttle window is skipped (pacing, not safety). Never throws. */
+ *  armed on this path: they report their verdict instead of being bypassed;
+ *  only the pacing gates (throttle window, install-failure backoff) are
+ *  skipped. Never throws. */
 export async function checkForUpdate(opts: UpdateOptions, force = false, checkOnly = false): Promise<UpdateCheckOutcome | undefined> {
     if (!opts.autoUpdate && !force && !checkOnly) return;
     if (inFlight) return;

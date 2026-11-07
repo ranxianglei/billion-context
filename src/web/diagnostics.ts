@@ -134,11 +134,12 @@ function storageLogTail(lines: string[]): string[] {
 // load-time overlay applies to this machine's profiles.
 // #4649: the same evidence chain for the codex lane — before these entries a
 // codex conflict report matched ZERO lines and could not be adjudicated
-// without a manual log round-trip (#4648). One entry per distinct log SITE:
-// the not-intercepted forward (src/server/handle.ts), the inline auto-compact
-// detection + rebase (#3008/#2372), the intercepted forge (trigger form AND
-// endpoint form share the prefix), and the forge failure that passes through
-// (src/server/prepare-responses.ts).
+// without a manual log round-trip (#4648). One entry per distinct message
+// shape (a shape may fire on more than one site): the not-intercepted forward
+// (src/server/handle.ts), the inline auto-compact detection + rebase
+// (#3008/#2372, both openai and responses wires), the intercepted forge
+// (trigger form AND endpoint form share the prefix), and the forge failure
+// that passes through (src/server/prepare-responses.ts).
 const CONFLICT_LOG_PATTERNS = [
     "takeover gate refused",
     "dsh native compaction call identified",
