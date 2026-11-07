@@ -43,7 +43,7 @@ test("#5664 budget: inputEstBaseTokens is additive inside the local-est arm (ide
 });
 
 test("#5664 budget: a usage-grade baseline still wins the max() uncharged by the basis", () => {
-    const msgs = [];
+    const msgs: CoreMessage[] = [];
     // Basis well below the provider-measured total: result stays the baseline
     // EXACTLY — the frozen basis must never re-scale or re-charge a
     // usage-grade reading (that arm feeds #2558/#1492 math verbatim).
