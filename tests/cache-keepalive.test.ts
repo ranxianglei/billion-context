@@ -6,6 +6,11 @@
 import { test, before, after, beforeEach } from "node:test";
 import assert from "node:assert";
 import http from "node:http";
+import { spawn } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import {
     buildPingBody,
@@ -538,4 +543,50 @@ test("keepaliveStatusFor: mirrors armed state, ping history and disarm", async (
     timers.advance(270_000);
     await settle(() => _keepaliveArmedForTest().length === 0);
     assert.equal(keepaliveStatusFor(sid), undefined, "disarmed sessions report no state");
+});
+
+// ---- process-liveness (real timers) ---------------------------------------
+
+test("arm: the real scheduler unrefs its timer, so short-lived processes exit (#5666)", async () => {
+    // A child arms a keepalive through the DEFAULT (non-injected) scheduler and
+    // then does nothing else. The armed cadence timer is that process's only
+    // remaining handle — exactly the inline-lane pi -p / sub-agent shape. With
+    // the fix the timer is unref'd, so the event loop drains and the process
+    // exits on its own; without it the ref'd timer holds the loop open and the
+    // child hangs until the (270 s) timer fires. Hermetic: no network (the ping
+    // URL is never reached before the process is gone).
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "bili-ka-exit-"));
+    for (const d of ["cfg", "state", "data"]) fs.mkdirSync(path.join(tmp, d), { recursive: true });
+    const env = {
+        ...process.env,
+        XDG_CONFIG_HOME: path.join(tmp, "cfg"),
+        XDG_STATE_HOME: path.join(tmp, "state"),
+        XDG_DATA_HOME: path.join(tmp, "data"),
+        ACP_LOG_FILE: "off",
+    };
+    const kaUrl = pathToFileURL(fileURLToPath(new URL("../src/cache-keepalive.ts", import.meta.url))).href;
+    const code = `
+process.env.BILI_CACHE_KEEPALIVE = "1";
+process.env.BILI_CACHE_KEEPALIVE_ASSUME_TTL = "5m";
+const { noteSuccessfulForward } = await import(${JSON.stringify(kaUrl)});
+noteSuccessfulForward({
+    sessionId: "ka-exit", protocol: "anthropic", reqMethod: "POST", sidePassthrough: false, resignLane: false,
+    wireBody: JSON.stringify({ model: "claude-opus-test", max_tokens: 4096, stream: true, system: [{ type: "text", text: "s", cache_control: { type: "ephemeral", ttl: "5m" } }], messages: [{ role: "user", content: "hi" }] }),
+    upstreamUrl: "http://127.0.0.1:9/v1/messages", headers: { "content-type": "application/json" }, dispatcher: undefined, routes: undefined,
+});
+`;
+    const child = spawn(process.execPath, ["--import", "tsx", "--input-type=module", "--eval", code], {
+        cwd: fileURLToPath(new URL("../", import.meta.url)),
+        env,
+        stdio: ["ignore", "pipe", "pipe"],
+    });
+    let out = "";
+    child.stdout?.on("data", (c) => (out += String(c)));
+    child.stderr?.on("data", (c) => (out += String(c)));
+    const exited = new Promise<number | null>((resolve) => child.on("close", (c) => resolve(c)));
+    const timedOut = new Promise<null>((resolve) => setTimeout(() => resolve(null), 10_000).unref());
+    const exitCode = await Promise.race([exited, timedOut]);
+    child.kill();
+    fs.rmSync(tmp, { recursive: true, force: true });
+    assert.equal(exitCode, 0, `an armed keepalive must not hold the event loop open (got ${exitCode === null ? "TIMEOUT — the cadence timer kept the process alive" : `exit code ${exitCode}`})\n--- child output ---\n${out}`);
 });

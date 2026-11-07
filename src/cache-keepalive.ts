@@ -175,8 +175,19 @@ interface KeepaliveEntry {
 
 const registry = new Map<string, KeepaliveEntry>();
 
+/** Real-timer scheduler: every handle is unref'd (#5666) so an armed cadence
+ *  timer never holds the event loop open. Interactive hosts stay alive for
+ *  their own reasons and the pings still fire on schedule; a short-lived
+ *  process (pi -p, a sub-agent) whose only remaining handle is the armed
+ *  keepalive now exits cleanly instead of limping along until maxDurationMs. */
+function realSchedule(fn: () => void, ms: number): ReturnType<typeof setTimeout> {
+    const t = setTimeout(fn, ms);
+    t.unref?.();
+    return t;
+}
+
 let clock: () => number = () => Date.now();
-let scheduleFn: (fn: () => void, ms: number) => ReturnType<typeof setTimeout> = (fn, ms) => setTimeout(fn, ms);
+let scheduleFn: (fn: () => void, ms: number) => ReturnType<typeof setTimeout> = realSchedule;
 let cancelFn: (id: ReturnType<typeof setTimeout>) => void = (id) => clearTimeout(id);
 
 export interface KeepaliveArmInput {
@@ -457,7 +468,7 @@ export function _setKeepaliveSchedulerForTest(sched: FakeScheduler | undefined):
         scheduleFn = (fn, ms) => sched.schedule(fn, ms) as ReturnType<typeof setTimeout>;
         cancelFn = (id) => sched.cancel(id as unknown);
     } else {
-        scheduleFn = (fn, ms) => setTimeout(fn, ms);
+        scheduleFn = realSchedule;
         cancelFn = (id) => clearTimeout(id);
     }
 }
