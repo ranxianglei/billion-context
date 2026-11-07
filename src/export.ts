@@ -354,28 +354,50 @@ export function renderSessionJsonlFromSession(s: Session, full: boolean, content
     return `${lines.join("\n")}\n`;
 }
 
+const NO_PERSISTED_SESSIONS = "No persisted sessions found. Sessions are written under the sessions directory once the proxy has served a request (compression state, compressed originals, and a bounded folded-view snapshot of the recent conversation).";
+
+/** #5062 (found while analyzing #5026): resolve which session a selector picks
+ *  WITHOUT decoding every session on this machine. Unified mode answers from
+ *  one SQL over the sessions table — the same authority `bili export` lists
+ *  from (#2960 R2.1) — then hydrates only that id; previously loadAll()
+ *  decoded every persisted session (all blocks, all retained originals)
+ *  before exporting one, which OOM'd the documented handoff workaround at
+ *  #5026 scale. Without a unified index the historical full scan stays the
+ *  only option; a summary row that fails to hydrate degrades to it too. */
+async function resolveSingleSession(store: SessionStore, selector: string): Promise<Session | "empty"> {
+    const sums = store.unifiedSessionSummaries();
+    if (sums) {
+        if (sums.length === 0) return "empty";
+        const cands = sums.map((r) => ({ id: r.sessionId, label: r.label, protocol: r.protocol, origin: r.origin }));
+        const matches = matchSessionKernel(cands, selector, (c) => c.label);
+        if (matches.length === 0) throw new Error(`no session matches "${selector}" (run "bili export" to list sessions)`);
+        if (matches.length > 1) throw new Error(`selector "${selector}" matches ${matches.length} sessions (${matches.map((m) => m.id).join(", ")}); use the full session id`);
+        const hit = matches[0]!;
+        const loaded = store.loadSync(hit.id, { protocol: hit.protocol, upstreamOrigin: hit.origin });
+        if (loaded) return loaded;
+        process.stderr.write(`[export] unified row for ${hit.id} did not hydrate — falling back to a full scan\n`);
+    }
+    const all = [...(await store.loadAll()).values()];
+    if (all.length === 0) return "empty";
+    const matches = matchSession(all, selector);
+    if (matches.length === 0) throw new Error(`no session matches "${selector}" (run "bili export" to list sessions)`);
+    if (matches.length > 1) throw new Error(`selector "${selector}" matches ${matches.length} sessions (${matches.map((m) => m.id).join(", ")}); use the full session id`);
+    return matches[0]!;
+}
+
 export async function exportSession(selector: string | undefined, opts: ExportOptions = {}): Promise<string> {
     const store = new SessionStore({ dir: opts.dir, enabled: true });
     try {
-    const all = [...(await store.loadAll()).values()];
-    if (all.length === 0) {
-        return "No persisted sessions found. Sessions are written under the sessions directory once the proxy has served a request (compression state, compressed originals, and a bounded folded-view snapshot of the recent conversation).";
-    }
     if (!selector) {
         const list = await listSessions(opts);
+        if (list.length === 0) return NO_PERSISTED_SESSIONS;
         const rows = list.map((s) =>
             `${s.id}${s.label ? `  label=${s.label}` : ""}${s.protocol ? `  [${s.protocol}]` : ""}  blocks=${s.blocks}${s.contextTokens ? `  ctx~${s.contextTokens}` : ""}  ${s.title ?? ""}`
         );
         return ["Persisted sessions:", "", ...rows.map((r) => `  ${r}`), "", "Usage: bili export <session-id|label> [--output handoff.md] [--full]"].join("\n");
     }
-    const matches = matchSession(all, selector);
-    if (matches.length === 0) {
-        throw new Error(`no session matches "${selector}" (run "bili export" to list sessions)`);
-    }
-    if (matches.length > 1) {
-        const ids = matches.map((s) => s.id).join(", ");
-        throw new Error(`selector "${selector}" matches ${matches.length} sessions (${ids}); use the full session id`);
-    }
+    const target = await resolveSingleSession(store, selector);
+    if (target === "empty") return NO_PERSISTED_SESSIONS;
     if (opts.jsonl) {
         // Backend-aware open (#3388 step 2): storage.backend="mysql" + a DSN
         // exports straight from MySQL; everything else (and every fallback)
@@ -389,8 +411,8 @@ export async function exportSession(selector: string | undefined, opts: ExportOp
                     const backend = await openBackend("mysql", dsn);
                     try {
                         await backend.init?.();
-                        if (await backend.getSessionRow(matches[0]!.id)) {
-                            return await renderSessionJsonlFromTables(backend, matches[0]!.id, opts.full ?? false);
+                        if (await backend.getSessionRow(target.id)) {
+                            return await renderSessionJsonlFromTables(backend, target.id, opts.full ?? false);
                         }
                     } finally {
                         await backend.close();
@@ -436,10 +458,10 @@ export async function exportSession(selector: string | undefined, opts: ExportOp
                 // immediately.
                 const backend = await openBackend("sqlite", index);
                 try {
-                    if (await backend.getSessionRow(matches[0]!.id)) {
-                        const disk = store.loadContentStore(matches[0]!);
+                    if (await backend.getSessionRow(target.id)) {
+                        const disk = store.loadContentStore(target);
                         const extra = disk ? new Map(Object.entries(disk.byRef).map(([ref, e]) => [ref, disk.byHash[e.hash] ?? ""] as const)) : undefined;
-                        return await renderSessionJsonlFromTables(backend, matches[0]!.id, opts.full ?? false, extra);
+                        return await renderSessionJsonlFromTables(backend, target.id, opts.full ?? false, extra);
                     }
                 } finally {
                     await backend.close();
@@ -448,9 +470,9 @@ export async function exportSession(selector: string | undefined, opts: ExportOp
                 process.stderr.write(`[export] unified index unreadable (${String(err)}) — falling back to the legacy-tail renderer\n`);
             }
         }
-        return renderSessionJsonlFromSession(matches[0]!, opts.full ?? false, store.loadContentStore(matches[0]!));
+        return renderSessionJsonlFromSession(target, opts.full ?? false, store.loadContentStore(target));
     }
-    const markdown = renderHandoff(matches[0]!, opts.full ?? false);
+    const markdown = renderHandoff(target, opts.full ?? false);
     if (opts.output) {
         mkdirSync(path.dirname(path.resolve(opts.output)), { recursive: true });
         writeFileSync(opts.output, markdown, "utf8");
