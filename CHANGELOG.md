@@ -5,6 +5,9 @@ Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag
 
 ## [Unreleased]
 
+### Changed
+- **自动更新的错峰抽取窗口上限从 48 小时拉长到 7 天**:发现新版本后,每台实例在 15 分钟 – 7 天内随机抽一个时刻到点再升(原来 48 小时)。改动同时落在两处:内置默认值(`STAGGER_MAX_DELAY_DEFAULT_MS`,远程策略文件不可达/未配置时的兑底)和本仓库官方策略文件 `auto-update-policy.json` 的 `default.maxDelay`(2d→7d,远程默认优先于内置,不改它的话内置改动不会生效)。已抽中的时刻按 `(dist-tag, 版本)` 落盘持久化,升级到本版后**不会重摇**——已生效的旧抽取照旧到点执行,只有升级后新发现的版本才在 7 天窗口内抽。手动 `bili update`、`staggerMinDelayMs:0 + staggerMaxDelayMs:0`(或对应环境变量)照旧绕过/恢复立即升级;远程策略与本机 config/env 的优先级不变(本地 > 远程 > 内置)。
+
 ### Fixed
 - **全量压缩与 persona 文本漂移同轮发生时,主会话不再分叉到 `|sub:` 副车道(#5719)**:dsh 全量压缩 checkpoint(#3733 authored checkpoint,把整段历史头替换成一条 user 消息)与系统提示漂移(如 dsh 重启后 GUI 端口重分配写进 system prompt)落在同一轮时,既有的全部位置型 re-anchor 逃生结构性不可达——被记录的尾部按定义已被抹掉、incoming 比记录更短、压缩后首个模型步零 assistant——于是活着的会话确定性地分叉到 `<id>|sub:<fp16(新tag)>`:父车道记录冻结、副车道从零起步(resume-inheritance miss)、事故当天又触发 3 次再压缩 + 1 次 REFUSED turn + 2 次 max-tokens 截断。根因=判定器要求一种全量压缩按定义抹掉的字节级续接证据,而唯一能存活压缩的自足证明——bili 自己铸造的 checkpoint 内嵌的 `conv="<rawId>"` 自声明——从未被读取。现在 tagChanged 分支最前新增 E5 级:**第一条** user 消息携带我方 `\x3cbili-snapshot v1 …\x3e` 身份头且其 conv 与当前 id 逐字相等 → 直接 re-anchor 回主车道(record() 同步更新 tagHash,后续请求即普通 continue)。外部 persona 引用 checkpoint 的情形照旧分叉:要么根本到不了判定层(sideRequestLike 门,#4438),要么标记 conv 不符 / 不在第一条 user 消息。**旧行为→新行为**:该形状从「必然分叉」变为「带自声明时 re-anchor 回主车道」;无标记的形状逐字节不变(回归测试钉住每一既有 rung 的 reason 文案)。tests/issue5719-self-checkpoint-reanchor.test.ts(验收标准 1/2/3 + 四种 wire 形状 + foreign-quote 边界)。
 

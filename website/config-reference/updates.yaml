@@ -68,11 +68,11 @@ entries:
     desc_zh: "#3619 错峰升级：本机基础升级延迟窗口下限；毫秒数字或时长字符串（15m / 2d / 1d12h）；0 = 禁用延迟（恢复立即升级）。远端策略的 default 窗口与按版本 overrides 叠加在其上。"
   - key: update.staggerMaxDelayMs
     type: "number | string"
-    default: "172800000 (built-in 48 h)"
+    default: "604800000 (built-in 7 days)"
     env: BILI_UPDATE_STAGGER_MAX_MS
     group: updates
-    desc_en: "#3619 staggered rollout: upper bound of this machine's base upgrade-delay window; ms number or duration string (48h / 2d); together with min 0 restores legacy immediate upgrades."
-    desc_zh: "#3619 错峰升级：本机基础升级延迟窗口上限；毫秒数字或时长字符串（48h / 2d）；与 min=0 一起恢复立即升级。"
+    desc_en: "#3619 staggered rollout: upper bound of this machine's base upgrade-delay window; ms number or duration string (7d / 168h); together with min 0 restores legacy immediate upgrades."
+    desc_zh: "#3619 错峰升级：本机基础升级延迟窗口上限；毫秒数字或时长字符串（7d / 168h）；与 min=0 一起恢复立即升级。"
   - key: update.policyUrl
     type: string
     default: "official repo raw URL"
