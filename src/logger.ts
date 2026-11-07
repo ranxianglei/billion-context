@@ -42,6 +42,7 @@ import path from "node:path";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { VERSION } from "./version.js";
 import { maskIpsInText, redactSecretsInText } from "./log-mask.js";
+import { integrityLabelDiagnosis } from "./integrity-label.js";
 
 const MAX_BYTES = 10 * 1024 * 1024; // 10 MB → rotate
 
@@ -276,7 +277,13 @@ function warnReopenFailed(err: unknown): void {
     // launcher-spawned child keeps SOME durable output instead of going silent.
     stderrMuted = false;
     const reason = err instanceof Error ? err.message : String(err);
-    const msg = `log file ${logPath ?? "?"} unavailable (${reason}); continuing with stderr-only logging`;
+    let msg = `log file ${logPath ?? "?"} unavailable (${reason}); continuing with stderr-only logging`;
+    // #5155: a win32 EPERM/EACCES on our OWN log file is most often the node
+    // runtime's Low integrity label — and this line is what users see without
+    // digging through %TEMP%, so it carries the remedy, not just the fact.
+    if (process.platform === "win32" && /\b(EPERM|EACCES)\b/.test(reason)) {
+        msg += `; first suspect on Windows — ${integrityLabelDiagnosis(process.execPath)}; otherwise add the log dir to antivirus exclusions`;
+    }
     if (capture) {
         try { capture("warn", msg); } catch { /* best-effort */ }
     }

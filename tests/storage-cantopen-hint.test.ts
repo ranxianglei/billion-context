@@ -50,6 +50,29 @@ test("hint: win32 + CANTOPEN carries the OS-level suspects", () => {
     }
 });
 
+// #5155: evidence order — the runtime's integrity label (the reproducible
+// A/B switch) must rank BEFORE antivirus in both win32 hints (#3617).
+test("hint: win32 ranks the runtime's integrity label before antivirus (#5155/#5154)", () => {
+    const restore = stubPlatform("win32");
+    try {
+        const cantopen = sqliteOpenFailureHint(CANT_OPEN);
+        assert.ok(cantopen.includes("integrity label"), "CANTOPEN names the integrity label");
+        assert.ok(
+            cantopen.indexOf("integrity") < cantopen.indexOf("antivirus"),
+            "CANTOPEN ranks integrity before antivirus",
+        );
+        const readonly = sqliteOpenFailureHint(READONLY);
+        assert.ok(readonly.includes("integrity"), "READONLY names Windows integrity control");
+        assert.ok(
+            readonly.indexOf("integrity") < readonly.indexOf("antivirus"),
+            "READONLY ranks integrity before antivirus",
+        );
+        assert.ok(readonly.includes("/setintegritylevel Medium"), "READONLY carries the fix command");
+    } finally {
+        restore();
+    }
+});
+
 test("hint: win32 + readonly-write points at integrity control with the CORRECT fix direction (#5103/#5154)", () => {
     const restore = stubPlatform("win32");
     try {
