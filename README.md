@@ -612,7 +612,8 @@ Where the value comes from, first hit wins: the plugin's
 marker header), then per-client headers (`x-claude-code-session-id`,
 `x-grok-session-id`/`x-grok-conv-id`, `x-mavis-session-id`,
 `x-opencode-session-id`), then generic
-headers (`x-session-affinity`, `x-acp-session`, `x-session-id`,
+headers (`x-session-affinity`, `x-acp-session`, `x-conversation-id`,
+`x-session-id`,
 `x-opencode-session`, `session-id`/`session_id`), then body fields:
 `session_id` / `metadata.session_id` on the Responses wire, and
 `prompt_cache_key` promoted over the content-fingerprint fallback on the
