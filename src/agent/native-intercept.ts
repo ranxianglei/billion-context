@@ -13,7 +13,7 @@ import { envMillis } from "./native-bootstrap.js";
 import { mediaBytesOfWireBody } from "./media-bytes.js";
 import * as pfChannel from "./pf-channel.js";
 import { probeLiveness, type LivenessVerdict } from "../liveness.js";
-import { BILI_PASSTHROUGH_HEADER, MIN_ASSUMED_WINDOW_TOKENS } from "../util.js";
+import { BILI_PASSTHROUGH_HEADER, CALIBRATED_TEXT_TOKEN_RATIO, MIN_ASSUMED_WINDOW_TOKENS } from "../util.js";
 import { DSH_COMPACTION_MARKER_SNIFF, isDshCompactionCall } from "../server/dsh-compaction-guard.js";
 import { APIG_RESIGN_HEADER, APIG_RESIGN_CREDENTIAL_HEADER, APIG_RESIGN_SCHEME, clearSignedRefusal, encodeApigCredential, inboundSignedScheme, recordSignedRefusal, resignEnabled, resignPassthroughEnabled, signedRefusal } from "../apig-resign.js";
 
@@ -534,11 +534,49 @@ function modelProtocolHintFromUrl(url: string): string | null {
  *  byte buffers only. Stream/FormData bodies and absent bodies yield
  *  undefined, which disables the size arm for that request (the gate then
  *  keeps #1117 semantics — never a false refusal from missing data). */
+// #5613: streamed bodies carry their size in the DECLARED Content-Length even
+// though the bytes are not buffered yet. The over-window fuse needs exactly
+// that number — without it every stream-shaped send fails open by construction
+// (the #5613 bricking shape). The raw body string stays undefined for these,
+// so pricing bills ALL header-declared bytes as core text: the conservative
+// refusal direction, same convention as undecodable buffers (#4912). Small
+// declared sizes (<~3.5 MB against the 1M-token bar) stay under the calibrated
+// estimate and ride through untouched.
+function contentLengthDeclared(init: RequestInit | undefined): number | undefined {
+    const headers = init?.headers;
+    if (headers === undefined) return undefined;
+    try {
+        if (headers instanceof Headers) {
+            const v = headers.get("content-length");
+            return v !== null && v !== "" ? Number(v) : undefined;
+        }
+        if (Array.isArray(headers)) {
+            const entry = headers.find(([k]) => k.toLowerCase() === "content-length");
+            const raw = entry?.[1];
+            const v = Array.isArray(raw) ? String(raw[0] ?? "") : String(raw ?? "");
+            return v !== "" ? Number(v) : undefined;
+        }
+        if (typeof headers === "object") {
+            const entry = Object.entries(headers).find(([k]) => k.toLowerCase() === "content-length");
+            const v = entry?.[1];
+            return typeof v === "string" && v !== "" ? Number(v) : undefined;
+        }
+    } catch {
+        return undefined;
+    }
+    return undefined;
+}
+
 function bodyByteSizeOf(init: RequestInit | undefined): { bytes: number } | undefined {
     const body: unknown = init?.body;
     if (typeof body === "string") return { bytes: Buffer.byteLength(body) };
     if (body instanceof Uint8Array) return { bytes: body.byteLength };
     if (body instanceof ArrayBuffer) return { bytes: body.byteLength };
+    // Stream/readable body: the buffered cases above miss, but a declared
+    // Content-Length still makes the SIZE knowable — price it instead of
+    // silently failing open (#5613).
+    const declared = contentLengthDeclared(init);
+    if (declared !== undefined && Number.isInteger(declared) && declared > 0) return { bytes: declared };
     return undefined;
 }
 
@@ -692,28 +730,38 @@ function unattributedByteOversizeRefusal(url: string): Response {
 // The media-aware byte walk lives in media-bytes.ts (#4111) — the shared
 // home dsh/opencode-native also import from; do not redefine it here.
 
-/** #4111: the shared two-stage doom predicate for every oversize-refusal arm.
- *  Stage 1 prices the RAW body at bytes/4 — exactly the old math, cheap — and
- *  disarms when that is not even provisionally over the #4079-floored window.
- *  Stage 2 runs ONLY on the would-refuse path: re-price on media-excluded
- *  core bytes and disarm when the core text alone still fits (the #4111
- *  false refusal was media mass billed as text). Returns the refusal's
- *  numbers when the body is PROVABLY over (core text alone cannot fit),
- *  undefined otherwise. No body, unreadable body, or unresolvable window →
- *  undefined — callers keep their direct semantics and can never
- *  false-refuse from missing data. */
-export function bodyProvablyOverWindow(
+/** Every oversize-refusal arm prices media-excluded core text at TWO tiers:
+ *  the optimistic bytes/4 FLOOR (a strict lower bound) and the CALIBRATED
+ *  estimate — session-ledger measurement shows this host family's real bodies
+ *  bill upstream ~14% above the floor (#5613: a send that passed every old
+ *  floor-only check still bricked its session upstream). Returns the refusal
+ *  numbers when EITHER tier exceeds the #4079-floored window — `provablyOver`
+ *  marks the stronger floor tier for message wording. A body with no size,
+ *  no raw text, or no resolvable window yields undefined: callers keep their
+ *  direct semantics (#1117) — unknown data can never trigger a refusal.
+ *  Media-excluded stage-2 re-pricing keeps #4111's false-refusal fix: base64
+ *  mass is billed by the upstream's image lane, not as text; undecodable or
+ *  missing raw text bills ALL bytes as core (the conservative direction).
+ *  Stage ordering is cheap-first: the worst-case calibrated estimate on the
+ *  RAW mass disarms without the media walk; the floor short-circuit is gone
+ *  because the calibrated tier fires BELOW the old bar (owner-approved
+ *  fail-close on large history, 2026-11-07). */
+export function bodyOverWindowDetail(
     bodyBytes: number | undefined,
     rawBody: string | undefined,
     declaredWindow: number | undefined,
-): { coreBytes: number; mediaBytes: number; floorTokens: number; window: number; declaredWindow: number } | undefined {
+): { coreBytes: number; mediaBytes: number; floorTokens: number; estTokens: number; provablyOver: boolean; window: number; declaredWindow: number } | undefined {
     if (bodyBytes === undefined || declaredWindow === undefined) return undefined;
     const window = Math.max(declaredWindow, MIN_ASSUMED_WINDOW_TOKENS);
-    if (Math.ceil(bodyBytes / 4) <= window) return undefined;
+    // Worst case: zero media credits → core = full mass. If even THAT fits
+    // the calibrated bar, no raw body can refuse — skip the JSON walk.
+    if (Math.ceil(Math.ceil(bodyBytes / 4) * CALIBRATED_TEXT_TOKEN_RATIO) <= window) return undefined;
     const mediaBytes = rawBody === undefined ? 0 : mediaBytesOfWireBody(rawBody);
     const coreBytes = Math.max(bodyBytes - mediaBytes, 0);
-    if (Math.ceil(coreBytes / 4) <= window) return undefined;
-    return { coreBytes, mediaBytes, floorTokens: Math.ceil(coreBytes / 4), window, declaredWindow };
+    const floorTokens = Math.ceil(coreBytes / 4);
+    const estTokens = Math.ceil(floorTokens * CALIBRATED_TEXT_TOKEN_RATIO);
+    if (estTokens <= window) return undefined;
+    return { coreBytes, mediaBytes, floorTokens, estTokens, provablyOver: floorTokens > window, window, declaredWindow };
 }
 
 /** The model context window every plugin lane stamps onto its model requests
@@ -727,8 +775,23 @@ const CONTEXT_WINDOW_HEADER = "x-bili-plugin-context-window";
  *  plausible context window. Normal small direct sends (plugin intentionally
  *  deactivated) must keep working, but a multi-megabyte prompt cannot be
  *  allowed to ride out silently: refuse it locally and tell the user to
- *  restart the host so the interceptor can rebind. */
-export const MAX_SILENT_DIRECT_BODY_BYTES = 2 * 1024 * 1024;
+ *  restart the host so the interceptor can rebind.
+ *
+ *  The arms measure RAW body bytes (#5408) — base64-inflated media included —
+ *  which is deliberately simple but media-blind: an in-window session carrying
+ *  one medium image routinely crosses 2 MiB raw while its real token cost stays
+ *  far under the window. Default raised 2 → 8 MiB by owner ruling (2026-11-07,
+ *  #5826 release review); runaway prompts the guard exists for are tens/hundreds
+ *  of MB, so 8 MiB still stops them. */
+export const MAX_SILENT_DIRECT_BODY_BYTES = 8 * 1024 * 1024;
+
+/** #5826-review knob: `BILI_SILENT_DIRECT_MAX_MB` (megabytes, > 0; fractions
+ *  allowed). Resolved per call so env edits apply without a reload; missing or
+ *  invalid values fall back to the default above. */
+function silentDirectBodyCapBytes(): number {
+    const mb = Number(process.env.BILI_SILENT_DIRECT_MAX_MB ?? "");
+    return Number.isFinite(mb) && mb > 0 ? Math.floor(mb * 1024 * 1024) : MAX_SILENT_DIRECT_BODY_BYTES;
+}
 
 /** #5405 follow-up: emit at most one state-missing warning per live-state
  *  generation. A missing slot is a process-wide condition, not a per-request
@@ -762,7 +825,7 @@ async function directSendBodyMeasure(input: string | URL | Request, init: Reques
             else if (body instanceof ArrayBuffer) raw = new TextDecoder().decode(new Uint8Array(body));
         } catch {
             // #4912: undecodable buffer (>V8-max-string-length throws
-            // RangeError) → raw unknown; bodyProvablyOverWindow then bills
+            // RangeError) → raw unknown; bodyOverWindowDetail then bills
             // ALL bytes as core text (media=0) — the conservative refusal
             // direction, same convention as the Request branch below
             // returning undefined for unreadable bodies.
@@ -789,7 +852,7 @@ async function directSendBodyMeasure(input: string | URL | Request, init: Reques
  *  gate arms whose remedy is a host restart. */
 function fallbackOversizeRefusal(
     url: string,
-    doom: { coreBytes: number; mediaBytes: number; floorTokens: number; window: number; declaredWindow: number },
+    doom: { coreBytes: number; mediaBytes: number; floorTokens: number; estTokens: number; provablyOver: boolean; window: number; declaredWindow: number },
     reason?: UnavailableReason,
 ): Response {
     // #4824: "send-failed" reads as died here too — the proxy WAS live and
@@ -807,7 +870,7 @@ function fallbackOversizeRefusal(
             ? `the model context window (${doom.window.toLocaleString("en-US")})`
             : `the model context window (${doom.declaredWindow.toLocaleString("en-US")} declared; the local bar never assumes below ${doom.window.toLocaleString("en-US")}, #4079)`;
     const message =
-        `billion-context refused this request locally: ${why}, so this body would go to the provider uncompressed — but its core text alone (~${doom.floorTokens.toLocaleString("en-US")} tok floor estimate from ${doom.coreBytes.toLocaleString("en-US")} B / 4) exceeds ${windowNote}; the provider rejects it and every retry re-sends the same oversized history, so the turn cannot succeed while the proxy stays down (#4516). ` +
+        `billion-context refused this request locally: ${why}, so this body would go to the provider uncompressed — but its core text alone (est ~${doom.estTokens.toLocaleString("en-US")} tok; ${doom.floorTokens.toLocaleString("en-US")} tok optimistic floor${doom.provablyOver ? ", which already exceeds the window on its own" : ""}) exceeds ${windowNote}; the provider rejects it and every retry re-sends the same oversized history, so the turn cannot succeed while the proxy stays down (#4516/#5613). ` +
         "bili keeps retrying the proxy automatically — retry shortly; if this conversation has outgrown the window, start a fresh session.";
     const headers = { "content-type": "application/json", "x-bili-gate": "oversize-refusal-fallback" };
     if (url.endsWith("/messages")) {
@@ -1279,9 +1342,10 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
                 // rather than init — measure what would actually go out
                 // (clone-probed, capped), or hosts that construct Requests
                 // bypass the guard entirely.
-                const size = await outgoingBodyBytesCapped(input, init, MAX_SILENT_DIRECT_BODY_BYTES);
-                if (size !== undefined && size > MAX_SILENT_DIRECT_BODY_BYTES) {
-                    logHostEvent("error", "[native-client]", `bili-native: intercept state missing — refusing oversized direct model request (${size.toLocaleString("en-US")} B > ${MAX_SILENT_DIRECT_BODY_BYTES.toLocaleString("en-US")} B) with a local 422; the slot will rebind on the next activation (#5405/#5408)`);
+                const cap = silentDirectBodyCapBytes();
+                const size = await outgoingBodyBytesCapped(input, init, cap);
+                if (size !== undefined && size > cap) {
+                    logHostEvent("error", "[native-client]", `bili-native: intercept state missing — refusing oversized direct model request (${size.toLocaleString("en-US")} B > ${cap.toLocaleString("en-US")} B) with a local 422; the slot will rebind on the next activation (#5405/#5408)`);
                     return emptySlotOversizeRefusal(url);
                 }
                 const seq = g[ACTIVE_STATE_SEQ];
@@ -1439,11 +1503,11 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
                 : prep.outcome === "restored"
                   ? { bytes: Buffer.byteLength(prep.body), raw: prep.body }
                   : await directSendBodyMeasure(defaultInput, init);
-            const doom = measured !== undefined ? bodyProvablyOverWindow(measured.bytes, measured.raw, declaredWindow) : undefined;
+            const doom = measured !== undefined ? bodyOverWindowDetail(measured.bytes, measured.raw, declaredWindow) : undefined;
             if (doom !== undefined) {
                 state.onDispatch?.(dispatchUrl, "refused");
-                if (degradeLog !== undefined) noteDispatchMode("refused", `bili-native: ${degradeLog} — oversized request refused locally instead (~${doom.floorTokens.toLocaleString("en-US")} tok core-text floor > ${doom.window.toLocaleString("en-US")} tok window)`);
-                logHostEvent("error", "[native-client]", `bili-native: oversized request refused locally instead of direct send — core text ~${doom.floorTokens.toLocaleString("en-US")} tok floor (${doom.coreBytes.toLocaleString("en-US")} B / 4; media ${doom.mediaBytes.toLocaleString("en-US")} B excluded, #4111) exceeds the ${doom.window.toLocaleString("en-US")} tok window: ${dispatchUrl}`);
+                if (degradeLog !== undefined) noteDispatchMode("refused", `bili-native: ${degradeLog} — oversized request refused locally instead (core text est ~${doom.estTokens.toLocaleString("en-US")} tok, ${doom.floorTokens.toLocaleString("en-US")} tok optimistic floor > ${doom.window.toLocaleString("en-US")} tok window)`);
+                logHostEvent("error", "[native-client]", `bili-native: oversized request refused locally instead of direct send — core text est ~${doom.estTokens.toLocaleString("en-US")} tok (${doom.floorTokens.toLocaleString("en-US")} tok optimistic floor; ${doom.coreBytes.toLocaleString("en-US")} B / 4 × ${CALIBRATED_TEXT_TOKEN_RATIO}${doom.mediaBytes > 0 ? `, media ${doom.mediaBytes.toLocaleString("en-US")} B excluded` : ""}, #4111/#5613) exceeds the ${doom.window.toLocaleString("en-US")} tok window: ${dispatchUrl}`);
                 return fallbackOversizeRefusal(dispatchUrl, doom, state.lastUnavailableReason);
             }
             // #5405/#5408: when no window source exists at all, or the gate's
@@ -1455,14 +1519,15 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
             // known large windows. A restored body IS what goes out, so it is
             // what gets measured.
             if (degradeLog === undefined && fetchMethodOf(defaultInput, init) === "POST") {
+                const cap = silentDirectBodyCapBytes();
                 const silentBytes = prep.outcome === "restored"
                     ? Buffer.byteLength(prep.body)
                     : measured !== undefined
                       ? measured.bytes
-                      : await outgoingBodyBytesCapped(defaultInput, init, MAX_SILENT_DIRECT_BODY_BYTES);
-                if (silentBytes !== undefined && silentBytes > MAX_SILENT_DIRECT_BODY_BYTES) {
+                      : await outgoingBodyBytesCapped(defaultInput, init, cap);
+                if (silentBytes !== undefined && silentBytes > cap) {
                     state.onDispatch?.(dispatchUrl, "refused");
-                    logHostEvent("error", "[native-client]", `bili-native: unattributed oversized model request refused locally with a 422 (${silentBytes.toLocaleString("en-US")} B > ${MAX_SILENT_DIRECT_BODY_BYTES.toLocaleString("en-US")} B); would be sent uncompressed (#5405/#5408)`);
+                    logHostEvent("error", "[native-client]", `bili-native: unattributed oversized model request refused locally with a 422 (${silentBytes.toLocaleString("en-US")} B > ${cap.toLocaleString("en-US")} B); would be sent uncompressed (#5405/#5408)`);
                     return unattributedByteOversizeRefusal(dispatchUrl);
                 }
             }

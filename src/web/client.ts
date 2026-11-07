@@ -543,6 +543,80 @@ export const WEB_CLIENT = `(function () {
         if (!p || p === "unknown") return '<span class="dim small">' + escapeHtml(t("protocol.unmarked")) + "</span>";
         return '<span class="badge proto">' + escapeHtml(p) + "</span>";
     }
+    function bindSessionColumns() {
+        document.querySelectorAll(".twide table.data").forEach((table) => {
+            const cols = Array.from(table.querySelectorAll("col"));
+            const headers = Array.from(table.querySelectorAll("thead th"));
+            headers.forEach((header, index) => {
+                if (index === headers.length - 1) return;
+                const label = () => t("ses.resize_column") + ": " + header.textContent;
+                const existing = header.querySelector(".col-resize");
+                if (existing) {
+                    existing.title = t("ses.resize_column");
+                    existing.setAttribute("aria-label", label());
+                    return;
+                }
+                const handle = document.createElement("button");
+                handle.type = "button";
+                handle.className = "col-resize";
+                handle.title = t("ses.resize_column");
+                handle.setAttribute("aria-label", label());
+                const start = () => {
+                    const widths = headers.map((cell) => cell.getBoundingClientRect().width);
+                    const total = table.getBoundingClientRect().width;
+                    table.style.width = total + "px";
+                    table.style.minWidth = "100%";
+                    widths.forEach((width, i) => { if (width > 0) cols[i].style.width = width + "px"; });
+                    table.classList.add("columns-resized");
+                    return widths;
+                };
+                const resize = (initial, delta) => {
+                    const widths = initial.slice();
+                    const direction = delta >= 0 ? 1 : -1;
+                    const receiver = direction > 0 ? index : initial.findIndex((width, i) => i > index && width > 0);
+                    if (receiver < 0 || initial[receiver] <= 0) return;
+                    let remaining = Math.abs(delta);
+                    let transferred = 0;
+                    for (let i = direction > 0 ? index + 1 : index; i >= 0 && i < widths.length; i += direction) {
+                        const available = Math.max(0, initial[i] - (i === 0 ? 120 : 48));
+                        const amount = Math.min(remaining, available);
+                        widths[i] -= amount;
+                        transferred += amount;
+                        remaining -= amount;
+                        if (remaining === 0) break;
+                    }
+                    widths[receiver] += transferred;
+                    widths.forEach((width, i) => { if (initial[i] > 0) cols[i].style.width = width + "px"; });
+                };
+                handle.addEventListener("pointerdown", (ev) => {
+                    if (ev.button !== 0) return;
+                    ev.preventDefault();
+                    try { handle.setPointerCapture(ev.pointerId); } catch (err) {}
+                    let initial = null;
+                    const move = (e) => {
+                        if (!initial) initial = start();
+                        resize(initial, e.clientX - ev.clientX);
+                    };
+                    const stop = () => {
+                        handle.removeEventListener("pointermove", move);
+                        handle.removeEventListener("pointerup", stop);
+                        handle.removeEventListener("pointercancel", stop);
+                        handle.removeEventListener("lostpointercapture", stop);
+                    };
+                    handle.addEventListener("pointermove", move);
+                    handle.addEventListener("pointerup", stop);
+                    handle.addEventListener("pointercancel", stop);
+                    handle.addEventListener("lostpointercapture", stop);
+                });
+                handle.addEventListener("keydown", (ev) => {
+                    if (ev.key !== "ArrowLeft" && ev.key !== "ArrowRight") return;
+                    ev.preventDefault();
+                    resize(start(), ev.key === "ArrowRight" ? 20 : -20);
+                });
+                header.appendChild(handle);
+            });
+        });
+    }
     function hydrate() {
         document.documentElement.lang = locale;
         document.querySelectorAll("[data-i18n]").forEach((el) => { el.textContent = t(el.getAttribute("data-i18n")); });
@@ -550,6 +624,7 @@ export const WEB_CLIENT = `(function () {
         document.querySelectorAll("[data-i18n-title]").forEach((el) => { el.setAttribute("title", t(el.getAttribute("data-i18n-title"))); });
         const tog = $("language-toggle");
         if (tog) tog.textContent = locale === "zh-CN" ? "English" : "中文";
+        bindSessionColumns();
     }
 
     const PAGES = ["overview", "sessions", "config", "updates", "connect", "logs", "blog"];
@@ -645,6 +720,8 @@ export const WEB_CLIENT = `(function () {
             + (s.selfHeal ? ' <span class="badge live" style="background:#8a6d3b" title="' + escapeHtml(t("det.self_heal_tip")) + '">' + t("det.self_heal_short") + "</span>" : "")
             + (s.autoModeForge ? ' <span class="badge live" style="background:#6d3b8a" title="' + escapeHtml(t("det.auto_mode_forge_tip")) + '">' + t("det.auto_mode_forge_short") + "</span>" : "")
 + (s.keepalive ? ' <span class="badge live" style="background:#3b6d8a" title="' + escapeHtml(t("det.keepalive_tip") + " · " + s.keepalive.tierLabel + " · " + (s.keepalive.cadenceMs >= 60_000 ? Math.round(s.keepalive.cadenceMs / 60_000) + "min" : Math.round(s.keepalive.cadenceMs / 1000) + "s") + (s.keepalive.lastHitAt ? " · " + t("det.keepalive_last_hit") + " " + timeAgo(new Date(s.keepalive.lastHitAt).toISOString()) : "")) + '">' + t("det.keepalive_short") + "×" + s.keepalive.pingCount + "</span>" : "")
+            // #5796: long-running session — host-side history only grows, per-step cost climbs; badge points at the actionable exit.
+            + (s.slowSession ? ' <span class="badge live" style="background:#8a3b3b" title="' + escapeHtml(t("ses.slow_tip", { n: fmtW(s.slowSession.requests) })) + '">' + t("ses.slow_short") + "</span>" : "")
             + '<span class="row-id">' + escapeHtml(s.id) + "</span></a>";
     }
     // SAVED column prefers ledger-derived net savings; pre-tagging sessions fall back
@@ -1084,8 +1161,13 @@ function changelogCatOf(rawLine) {
         try {
             const r = await json(API_ROOT + "/update/check", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
             if (r.already) showUpdateResult(t("up.already_in_flight"), true);
-            else if (r.ok) showUpdateResult(t("up.check_ok"), true);
-            else showUpdateResult(String(r.error || t("toast.failed", { msg: "check failed" })), false);
+            else if (!r.ok) showUpdateResult(String(r.error || t("toast.failed", { msg: "check failed" })), false);
+            else if (r.status === "update-available") showUpdateResult(t("up.check_available", { v: String(r.candidate || r.latest || "") }), true);
+            else if (r.status === "up-to-date") showUpdateResult(t("up.check_up_to_date"), true);
+            else if (r.status === "blocked-advisory") showUpdateResult(t("up.check_blocked", { v: String(r.latest || "") }), true);
+            else if (r.status === "deferred-advisory") showUpdateResult(t("up.check_deferred"), true);
+            else if (r.note) showUpdateResult(String(r.note), true);
+            else showUpdateResult(t("up.check_ok"), true);
         } catch (e) {
             showUpdateResult(e.message, false);
         } finally {

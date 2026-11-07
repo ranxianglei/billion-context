@@ -135,7 +135,8 @@ describe("#4484 merge preserves existing block coverage", () => {
     assert.equal(computeIntegrityWithdrawals(messages, after).withdrawn.size, 0);
   });
 
-  it("impossible merge: fails fast up-front without touching existing coverage", () => {
+  // b2 covers ONLY the call half of the Read pair — its tail cut mid-tool-group.
+  function buildMidPairFixture() {
     const core = createCore();
     const messages: CoreMessage[] = [
       { id: "old-user", role: "user", contentType: "text", text: LONG },
@@ -160,9 +161,6 @@ describe("#4484 merge preserves existing block coverage", () => {
     if (seeded.result.blocksCreated !== 1 || seeded.result.errors.length !== 0) {
       throw new Error(`fixture seed failed: ${JSON.stringify(seeded.result)}`);
     }
-    // b2 covers ONLY the call half of the Read pair — its tail cut mid-tool-group.
-    // No consistent non-regressive candidate exists: folding the call splits its
-    // pair, unfolding it strands a message whose only covering block is consumed.
     seeded.state.blocks.push({
       ...seeded.state.blocks[0]!,
       blockId: "b2",
@@ -176,12 +174,44 @@ describe("#4484 merge preserves existing block coverage", () => {
     seeded.state.nextBlockId = 3;
     seeded.state.nextRunId = 3;
     seeded.state.stats.compressionCount = 2;
-    const before = coveredMessageIds(seeded.state);
+    return { core, messages, state: seeded.state };
+  }
+
+  it("mid-pair block inside a larger span: merge completes AROUND it, coverage untouched", () => {
+    const { core, messages, state } = buildMidPairFixture();
+    const before = coveredMessageIds(state);
     const res = core.applyCompression({
       messages,
-      state: seeded.state,
+      state,
       config,
       ranges: [{ startRef: "b1", endRef: "b2", summary: SUMMARY }],
+    });
+    // #5789 evolution: the old gate refused this span outright ("cannot
+    // satisfy turn integrity"); the recovery ladder now keeps the defective
+    // block ACTIVE and folds what can fold around it. The invariant this
+    // suite pins — a merge never drops existing coverage — is unchanged.
+    assert.equal(res.result.errors.length, 0, JSON.stringify(res.result));
+    assert.equal(res.result.blocksCreated, 1);
+    assert.deepEqual(lostCoverage(before, res.state), [], "no existing coverage may be dropped");
+    const byId = new Map(res.state.blocks.map((b) => [b.blockId, b]));
+    assert.equal(byId.get("b2")?.active, true, "defective block stays active with its coverage");
+    assert.deepEqual(new Set(byId.get("b2")!.effectiveMessageIds), new Set(["read-call"]));
+    assert.equal(byId.get("b1")?.active, false, "b1 must be consumed");
+    const merged = res.state.blocks.find((b) => b.active && b.blockId !== "b2");
+    assert.ok(merged, "a merged block must exist");
+    assert.ok(!merged.effectiveMessageIds.includes("read-call"), "the split call must not be re-claimed by the new block");
+    assert.ok(merged.effectiveMessageIds.includes("old-user"));
+    assert.ok(res.result.warnings.some((w) => w.includes("b2")), JSON.stringify(res.result.warnings));
+  });
+
+  it("impossible merge: a range whose only content is the defective block refuses actionably", () => {
+    const { core, messages, state } = buildMidPairFixture();
+    const before = coveredMessageIds(state);
+    const res = core.applyCompression({
+      messages,
+      state,
+      config,
+      ranges: [{ startRef: "b2", endRef: "b2", summary: SUMMARY }],
     });
     assert.equal(res.result.errors.length, 1, JSON.stringify(res.result));
     assert.equal(res.result.blocksCreated, 0);

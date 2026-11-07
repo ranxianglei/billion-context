@@ -395,6 +395,11 @@ export function dshLedgerFloorTokens(metadata: Record<string, unknown> | undefin
 export function emergencyNudge(nudge: NudgeDecision | null | undefined, escalationPct: number = EMERGENCY_NUDGE_ESCALATION_PCT, minCompressRange: number = 0): boolean {
     if (!nudge || nudge.shouldInject) return false;
     if (nudge.contextUsage < escalationPct) return false;
+    // Phantom-pressure guard mirror: the kernel already deferred the pressure
+    // band because the meter was estimate-grade (no billing sample this
+    // cycle) — this early-advertising arm must not re-arm against the same
+    // bad reading. Hand-built decisions without the bit keep pre-fix semantics.
+    if ((nudge.breakdown?.pressureDeferredNoSample ?? 0) === 1) return false;
     if (!nudge.compressibleRanges.some((r) => minCompressRange <= 0 || (r.chars ?? r.tokens * 4) >= minCompressRange)) return false;
     const b = nudge.breakdown;
     const minBenefit = b?.minPressureBenefit;

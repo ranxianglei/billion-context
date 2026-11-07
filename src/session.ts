@@ -728,6 +728,16 @@ export type Session = {
      *  keys off this flag, which survives until the reconcile (or a full
      *  reset) has actually run. */
     ccrReconcilePending?: boolean;
+    /** In-memory only (NOT persisted — buildRecord omits it): timestamp of the
+     *  last full re-materialization from disk in THIS process (#5782), stamped
+     *  by adoptOrCreate's memory-miss reload branch — the path that pays the
+     *  expensive rebuild. While COLD_LOAD_EVICT_GRACE_MS is young, byte-budget
+     *  eviction skips this session: shedding it again would just re-pay the
+     *  materialization on the next touch (the evict↔cold-load thrash that
+     *  minted giant temporaries faster than GC could reclaim them). Boot-warm
+     *  sessions are deliberately NOT stamped — their staleness is real and they
+     *  must stay first in line to go. */
+    coldLoadedAt?: number;
     /** In-memory only (NOT persisted — buildRecord omits it): the most recent
      *  successful compress, set by applyRanges and read by the replay/preflight
      *  retry callbacks to correlate a transient upstream rejection with the
@@ -1111,6 +1121,18 @@ let MAX_SESSIONS = knobMaxSessions();
 let MAX_RESIDENT_BYTES = sessionResidentMaxBytes();
 const residentWeights = new WeakMap<Session, { revision: number; bytes: number }>();
 
+// #5782: how long a freshly re-materialized session is exempt from BYTE-budget
+// eviction (see Session.coldLoadedAt). Long enough to ride out an agent work
+// burst (tool calls run for minutes between model requests), short enough that
+// a genuinely abandoned session frees its slot promptly. Count-cap admission
+// ignores this window (availability floor, logged loudly) — a full pool must
+// still be able to admit.
+const COLD_LOAD_EVICT_GRACE_MS = 10 * 60_000;
+
+function isColdLoadGraced(session: Session): boolean {
+    return session.coldLoadedAt !== undefined && Date.now() - session.coldLoadedAt < COLD_LOAD_EVICT_GRACE_MS;
+}
+
 // #3918: last-known LIVE weight of evicted sessions, stamped at eviction time.
 // The live weight (transient message caches included) is only measurable while
 // the object is resident — a disk reload carries persisted state alone and
@@ -1203,7 +1225,7 @@ export function residentBreakdown(session: Session): ResidentFieldBreakdown {
 export interface MemoryReport {
     pool: { sessions: number; maxSessions: number; residentBytes: number; budgetBytes: number };
     breakdown: ResidentFieldBreakdown;
-    sessions: Array<{ id: string; inFlight: number; lastSeen: number; revision: number; fields: ResidentFieldBreakdown }>;
+    sessions: Array<{ id: string; inFlight: number; lastSeen: number; revision: number; coldLoadedAt?: number; fields: ResidentFieldBreakdown }>;
 }
 
 export function memoryReport(): MemoryReport {
@@ -1219,7 +1241,7 @@ export function memoryReport(): MemoryReport {
         sums.state += fields.state;
         sums.other += fields.other;
         sums.total += fields.total;
-        rows.push({ id: session.id, inFlight: session.inFlight, lastSeen: session.lastSeen, revision: session.revisionEpoch ?? 0, fields });
+        rows.push({ id: session.id, inFlight: session.inFlight, lastSeen: session.lastSeen, revision: session.revisionEpoch ?? 0, coldLoadedAt: session.coldLoadedAt, fields });
     }
     rows.sort((a, b) => b.fields.total - a.fields.total);
     return {
@@ -1243,7 +1265,9 @@ function residentBytes(): number {
  * and the refusal repeats identically forever — the incident's 444 MiB image
  * session ping-ponged against an 87.5 MiB peer under the 512 MiB default.
  * Returns the measured pressure so the refusal receipt says so plainly instead
- * of promising a heal that will not come. */
+ * of promising a heal that will not come. #5782: a RESIDENT session inside its
+ * cold-load grace window is protected from that discharge, so the same shape is
+ * transient again while graced — the claim must say so or the receipt lies. */
 interface ResidentPressure {
     /** True when retrying cannot restore a usable view under the CURRENT pool state. */
     permanent: boolean;
@@ -1262,8 +1286,9 @@ export function residentPressure(id: string): ResidentPressure {
     const total = residentBytes();
     const known = evictedWeights.get(id);
     const weightBytes = known !== undefined ? Math.max(known, self) : resident ? self : undefined;
+    const graced = resident !== undefined && isColdLoadGraced(resident);
     return {
-        permanent: weightBytes !== undefined && weightBytes + (total - self) > MAX_RESIDENT_BYTES,
+        permanent: weightBytes !== undefined && !graced && weightBytes + (total - self) > MAX_RESIDENT_BYTES,
         weightBytes,
         otherBytes: total - self,
         residentBytes: total,
@@ -1272,17 +1297,25 @@ export function residentPressure(id: string): ResidentPressure {
 }
 
 function makeResidentRoom(incoming = 0): void {
-    while (sessions.size >= MAX_SESSIONS || (sessions.size > 0 && residentBytes() + incoming > MAX_RESIDENT_BYTES)) {
-        if (!evictOldest()) {
-            // The byte budget limits the idle cache, not active workload.
-            // Refusing every new conversation while a large request is pinned
-            // turns ordinary concurrent use into a proxy outage. The count
-            // limit remains a hard admission bound.
-            if (sessions.size < MAX_SESSIONS) break;
+    // The count limit is the HARD admission bound: a full pool must free a slot
+    // even when every idle candidate is inside its cold-load grace window
+    // (#5782) — refusing a new conversation would be a proxy outage.
+    while (sessions.size >= MAX_SESSIONS) {
+        if (!evictOldest({ overrideGrace: true })) {
             const reason = [...sessions.values()].every(session => session.inFlight > 0)
                 ? "all in-flight" : "active requests or failed saves prevent safe eviction";
             throw new Error(`session pool exhausted (MAX_SESSIONS=${MAX_SESSIONS}; ${reason})`);
         }
+    }
+    // The byte budget limits the IDLE cache, not active workload (#5782):
+    // shedding a freshly re-materialized session just re-pays its
+    // materialization on the next touch — the evict↔cold-load thrash that
+    // minted giant temporaries faster than GC could reclaim them (#5782's OOM).
+    // When only graced or in-flight sessions remain, the pool sits over budget;
+    // the hot working set stays bounded per-session by sessions.hardMaxBytes and
+    // sheds normally once grace expires.
+    while (sessions.size > 0 && residentBytes() + incoming > MAX_RESIDENT_BYTES) {
+        if (!evictOldest()) break;
     }
 }
 
@@ -1331,15 +1364,21 @@ function adoptOrCreate(id: string, meta: SessionMeta | undefined, reloaded: Sess
         reloaded.lastSeen = Date.now();
         reloaded.restored = false;
         reloaded.persisted = true;
+        reloaded.coldLoadedAt = Date.now(); // #5782: this rebuild just paid the full re-materialization cost
         // A memory-miss reload puts a NEW resident entry back into the pool; the
         // new-session cap guard below is unreachable on this path, so enforce it
         // here or evict-then-revisit grows the pool past MAX_SESSIONS (#1064).
         makeResidentRoom(sessionWeight(reloaded));
+        if (sessionWeight(reloaded) > MAX_RESIDENT_BYTES) {
+            loggerLog("warn", `[session] ${id} live weight ${sessionWeight(reloaded)} bytes exceeds the WHOLE resident pool budget (${MAX_RESIDENT_BYTES} bytes) — the pool cannot hold it alongside peers; raise sessions.residentMaxBytes (env BILI_SESSION_RESIDENT_MAX_BYTES) toward your working-set total or close large sessions (#5782)`);
+        }
         sessions.set(id, reloaded);
         return reloaded;
     }
     if (sessions.size >= MAX_SESSIONS) {
-        const evicted = evictOldest();
+        // Count-cap admission: may override a cold-load grace window (#5782) —
+        // a full pool must still admit.
+        const evicted = evictOldest({ overrideGrace: true });
         if (!evicted) {
             throw new Error(`session pool exhausted (MAX_SESSIONS=${MAX_SESSIONS}; all in-flight)`);
         }
@@ -2005,8 +2044,14 @@ export function coveredRealHistoryIds(blocks: ReadonlyArray<{ readonly active?: 
 
 /** Flush a session to disk and drop it from memory (LRU eviction). Refuses to
  *  evict sessions that are in-flight or whose flush failed (would lose a
- *  never-persisted session permanently). Returns true if a slot was freed. */
-function evictOldest(): boolean {
+ *  never-persisted session permanently). Returns true if a slot was freed.
+ *  #5782: byte-budget callers pass no options — sessions inside their cold-load
+ *  grace window are skipped, so the hot working set may sit over budget instead
+ *  of thrashing (evict↔cold-load re-mints the giant temporaries that OOM'd the
+ *  process). Count-cap callers pass { overrideGrace: true }: when EVERY idle
+ *  candidate is graced they still evict the oldest one, because a full pool
+ *  must admit (availability over cache quality, logged loudly). */
+function evictOldest(opts?: { overrideGrace?: boolean }): boolean {
     let oldestId: string | undefined;
     let oldestSeen = Infinity;
     for (const [id, s] of sessions) {
@@ -2014,6 +2059,7 @@ function evictOldest(): boolean {
         // its half-mutated state then reloading a second object causes
         // split-brain writes to the same file.
         if (s.inFlight > 0) continue;
+        if (!opts?.overrideGrace && isColdLoadGraced(s)) continue;
         if (s.lastSeen < oldestSeen) {
             oldestSeen = s.lastSeen;
             oldestId = id;
@@ -2021,6 +2067,7 @@ function evictOldest(): boolean {
     }
     if (!oldestId) return false;
     const s = sessions.get(oldestId)!;
+    const graceOverride = isColdLoadGraced(s);
     const ok = getStore().flushSync(s);
     if (!ok) {
         // A prior save does not contain the latest mutations. Keep newer
@@ -2033,7 +2080,7 @@ function evictOldest(): boolean {
     // session's message bytes live only here; state reloads from disk but the
     // view self-heals only on the next model request). Log it so operators can
     // correlate ctx=0 receipts with the exact moment a session left memory.
-    loggerLog("info", `[session] evicted ${oldestId} from resident pool (weight ${sessionWeight(s)} bytes, ${sessions.size} session(s) remain, budget ${MAX_RESIDENT_BYTES} bytes)`);
+    loggerLog("info", `[session] evicted ${oldestId} from resident pool (weight ${sessionWeight(s)} bytes, ${sessions.size} session(s) remain, budget ${MAX_RESIDENT_BYTES} bytes${graceOverride ? ", cold-load grace overridden for count-cap admission" : ""})`);
     return true;
 }
 

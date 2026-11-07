@@ -8,6 +8,79 @@ import { LOCALES, MESSAGES, translate } from "../src/web/i18n.ts";
 import { renderPage } from "../src/web/page.ts";
 import { WEB_CLIENT } from "../src/web/client.ts";
 
+test("session column resizing redistributes across each side and keeps both outer edges fixed", () => {
+    const start = WEB_CLIENT.indexOf("    function bindSessionColumns()");
+    const end = WEB_CLIENT.indexOf("    function hydrate()", start);
+    assert.ok(start >= 0 && end > start);
+    const result = vm.runInNewContext(`
+        const cols = [270, 502, 80].map(width => ({ style: { width: width + "px" } }));
+        const handles = [];
+        const headers = cols.map((col, i) => ({
+            textContent: "Column " + i,
+            querySelector: () => handles[i] || null,
+            getBoundingClientRect: () => ({ width: parseFloat(col.style.width) }),
+            appendChild: handle => { handles[i] = handle; }
+        }));
+        const table = {
+            style: {}, classList: { add() {} },
+            getBoundingClientRect: () => ({ width: parseFloat(table.style.width) || 852 }),
+            querySelectorAll: selector => selector === "col" ? cols : headers
+        };
+        const document = {
+            querySelectorAll: () => [table],
+            createElement: () => ({
+                handlers: {}, setAttribute() {}, setPointerCapture() {},
+                addEventListener(name, fn) { this.handlers[name] = fn; },
+                removeEventListener(name) { delete this.handlers[name]; }
+            })
+        };
+        const t = key => key;
+        ${WEB_CLIENT.slice(start, end)}
+        bindSessionColumns();
+        bindSessionColumns();
+        const event = { button: 0, clientX: 100, pointerId: 1, preventDefault() {} };
+        const stray = { button: 0, clientX: 100, pointerId: 3, preventDefault() {} };
+        handles[1].handlers.pointerdown(stray);
+        handles[1].handlers.pointerup();
+        const unpinned = table.style.width === undefined && table.style.minWidth === undefined;
+        handles[0].handlers.pointerdown(event);
+        handles[0].handlers.pointermove({ clientX: 550 });
+        const grown = [cols[0].style.width, cols[1].style.width, cols[2].style.width, table.style.width];
+        handles[0].handlers.pointermove({ clientX: 580 });
+        const cascaded = cols.map(col => col.style.width);
+        handles[0].handlers.pointermove({ clientX: 5000 });
+        const capped = [cols[0].style.width, cols[1].style.width, cols[2].style.width, table.style.width];
+        handles[0].handlers.pointermove({ clientX: 550 });
+        handles[0].handlers.pointercancel();
+        const cleaned = !handles[0].handlers.pointermove;
+        handles[0].handlers.keydown({ key: "ArrowLeft", preventDefault() {} });
+        const keyboard = cols[0].style.width;
+        handles[0].handlers.pointerdown(event);
+        handles[0].handlers.pointermove({ clientX: -1000 });
+        const minimum = cols[0].style.width;
+        handles[0].handlers.pointerup();
+        handles[1].handlers.pointerdown(event);
+        handles[1].handlers.pointermove({ clientX: -1000 });
+        const leftCascade = cols.map(col => col.style.width);
+        handles[1].handlers.pointerup();
+        cols[1].style.width = "0px";
+        handles[0].handlers.keydown({ key: "ArrowRight", preventDefault() {} });
+        const hidden = cols[1].style.width;
+        ({ unpinned, grown, cascaded, capped, cleaned, keyboard, minimum, leftCascade, hidden, minWidth: table.style.minWidth, handles: handles.length });
+    `);
+    assert.equal(result.unpinned, true);
+    assert.equal(JSON.stringify(result.grown), JSON.stringify(["720px", "52px", "80px", "852px"]));
+    assert.equal(JSON.stringify(result.cascaded), JSON.stringify(["750px", "48px", "54px"]));
+    assert.equal(JSON.stringify(result.capped), JSON.stringify(["756px", "48px", "48px", "852px"]));
+    assert.equal(JSON.stringify(result.leftCascade), JSON.stringify(["120px", "48px", "684px"]));
+    assert.equal(result.hidden, "0px");
+    assert.equal(result.cleaned, true);
+    assert.equal(result.keyboard, "700px");
+    assert.equal(result.minimum, "120px");
+    assert.equal(result.minWidth, "100%");
+    assert.equal(result.handles, 2);
+});
+
 const here = dirname(fileURLToPath(import.meta.url));
 const han = /\p{Script=Han}/u;
 const placeholders = (text: string) => [...text.matchAll(/\{(\w+)\}/g)].map((m) => m[1]).sort();

@@ -10,8 +10,8 @@ entries:
     site_group: proc
     desc_en: "Transport timeouts, watchdogs and replay policy for upstream calls."
     desc_zh: "上游调用的传输超时、看门狗与重放策略。"
-    site_en: "<code>network</code> — transport timeouts, replays &amp; the 429 egress governor: <span class='mech'>upstreamTimeoutMs 720000 · requestWatchdogMs 2× · replayRetryMax 3 · replayRetryBaseMs 1500 · keepAliveTimeoutMs 5000 · clientErrorBackstopMs 30000 · exposureLogIntervalMs 3600000 · streamKeepAliveMs 15000 · preflightHoldMs 30000 · preflightDeadEndCooldownMs 300000 · proxyKeepAliveMaxMs 55000 · throttle429Enabled true · throttle429MaxConsecutive 5 · throttle429BaseDelayMs 2000 · throttle429MaxDelayMs 30000</span>."
-    site_zh: "<code>network</code> —— 传输超时、重放与 429 出站治理：<span class='mech'>upstreamTimeoutMs 720000 · requestWatchdogMs 2× · replayRetryMax 3 · replayRetryBaseMs 1500 · keepAliveTimeoutMs 5000 · clientErrorBackstopMs 30000 · exposureLogIntervalMs 3600000 · streamKeepAliveMs 15000 · preflightHoldMs 30000 · preflightDeadEndCooldownMs 300000 · proxyKeepAliveMaxMs 55000 · throttle429Enabled true · throttle429MaxConsecutive 5 · throttle429BaseDelayMs 2000 · throttle429MaxDelayMs 30000</span>。"
+    site_en: "<code>network</code> — transport timeouts, replays &amp; the 429 egress governor: <span class='mech'>upstreamTimeoutMs 720000 · requestWatchdogMs 2× · replayRetryMax 3 · replayRetryBaseMs 1500 · keepAliveTimeoutMs 5000 · clientErrorBackstopMs 30000 · exposureLogIntervalMs 3600000 · streamKeepaliveMs 15000 · preflightHoldMs 30000 · preflightDeadEndCooldownMs 300000 · proxyKeepAliveMaxMs 55000 · throttle429Enabled true · throttle429MaxConsecutive 5 · throttle429BaseDelayMs 2000 · throttle429MaxDelayMs 30000 · throttle429Scope credential</span>."
+    site_zh: "<code>network</code> —— 传输超时、重放与 429 出站治理：<span class='mech'>upstreamTimeoutMs 720000 · requestWatchdogMs 2× · replayRetryMax 3 · replayRetryBaseMs 1500 · keepAliveTimeoutMs 5000 · clientErrorBackstopMs 30000 · exposureLogIntervalMs 3600000 · streamKeepAliveMs 15000 · preflightHoldMs 30000 · preflightDeadEndCooldownMs 300000 · proxyKeepAliveMaxMs 55000 · throttle429Enabled true · throttle429MaxConsecutive 5 · throttle429BaseDelayMs 2000 · throttle429MaxDelayMs 30000 · throttle429Scope credential</span>。"
   - key: network.upstreamTimeoutMs
     type: number
     default: "720000"
@@ -110,6 +110,13 @@ entries:
     group: process
     desc_en: "Ceiling for the 429 hold backoff and for the terminal-phase probe interval."
     desc_zh: "429 hold 退避的上限，也是终局阶段探测间隔的上限。"
+  - key: network.throttle429Scope
+    type: string
+    default: "credential"
+    env: BILI_THROTTLE_429_SCOPE
+    group: process
+    desc_en: "Hold granularity for marker-less upstream 429s (#5199). `credential` (default) keeps #5696's conservative semantics — any 429 without a recognized model marker (`keyring_model_temporarily_unavailable`, or a bili relay's `bili_throttle_hold` scope=model) holds the whole origin+credential, so every model behind that credential waits out the backoff. `model` keys the hold by the send's request model instead, for gateways that front many independently-limited models behind one credential (LiteLLM/one-api/opencode.ai-style relays where one model's RPM exhaustion must not freeze its siblings); requests whose model cannot be identified remain credential-wide, and recognized markers keep their own semantics in both modes."
+    desc_zh: "无标记上游 429 的 hold 粒度（#5199）。`credential`（默认）保持 #5696 的保守语义——凡未携带可识别模型标记（`keyring_model_temporarily_unavailable`，或 bili 中继的 `bili_throttle_hold` scope=model）的 429 均按整个 origin+凭据持有，该凭据下所有模型一起退避等待。`model` 改按发送请求的模型分桶持有，适用于单凭据背后多模型独立限流的网关（LiteLLM/one-api/opencode.ai 类中继，一个模型的 RPM 耗尽不应冻结兄弟模型）；无法识别模型的请求仍按凭据级持有，两种模式下已识别标记的语义均不变。"
   - key: network.maxShrinkPerCompress
     type: number
     default: "unset"
@@ -391,11 +398,11 @@ entries:
     desc_zh: "启动预热集的解码字节预算（#2803）。按解码后大小计而非磁盘压缩字节，zstd 归档无法绕过内存上限；单文件超预算则永不预热。"
   - key: sessions.residentMaxBytes
     type: number
-    default: "536870912"
+    default: "4294967296"
     env: BILI_SESSION_RESIDENT_MAX_BYTES
     group: process
-    desc_en: "Soft target for estimated resident session bytes (#2803). Active/in-flight state stays pinned above it; when over target, idle state discharges back to disk as requests complete."
-    desc_zh: "驻留会话估算字节的软目标（#2803）。活跃/在途状态始终固定保留；超过目标时，空闲状态随请求完成回写磁盘释放。"
+    desc_en: "Soft target for estimated resident session bytes (#2803; raised from 512 MiB to 4 GiB in #5779 — single sessions routinely exceed half a GiB and ping-ponged against the smaller budget forever). Active/in-flight state stays pinned above it; when over target, idle state discharges back to disk as requests complete. Lower it if your machine has little RAM."
+    desc_zh: "驻留会话估算字节的软目标（#2803；#5779 从 512 MiB 提高到 4 GiB——单个会话经常就超过半 GiB，旧预算下会被反复逐出、永远驻留不下来）。活跃/在途状态始终固定保留；超过目标时，空闲状态随请求完成回写磁盘释放。内存小的机器可调低。"
   - key: sessions.hardMaxBytes
     type: number
     default: "(same as `sessions.residentMaxBytes`)"
