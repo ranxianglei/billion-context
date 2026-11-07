@@ -22,6 +22,15 @@
 
 **宿主侧上下文计量与模型实际视图按设计不一致(#2837):**plugin 模式下宿主本地持久会话日志有意保持无损 —— 完整未折叠历史会因前缀缓存与严格回显而重发(见 TECHNICAL-NOTES.md「两种压缩模式」)。因此宿主或其插件从该本地日志算出的任何计量,量的都是**未折叠的本地表面**,而不是下一次请求实际携带的量;压缩生效期间本地数字远高于真实输入属预期,不是压缩卡死。有效尺寸以代理为准:读 `/acp`(或 `GET /__bili/plugin/status` 的 `contextTokens`,来源见 `contextTokensSource`),不要本地重新推算。
 
+**免费模型插件(`x-ofm-signature`)—— 已知冲突,按策略永久拒收(#4632):** dsh 免费模型插件对它 EAC 渠道的每个请求都盖 `x-ofm-signature`(对时间戳+方法+路径+body hash 的 HMAC-SHA256)。服务方屏蔽经 bili 路由的该渠道流量,且其条款不允许第三方代理拦截或重签这些请求 —— 所以 bili **有意不**为该方案提供重签器。该渠道的每个请求都在本地响亮拒收(403,绝不静默改写到上游变验签失败),bili 会在启动横幅、dsh 插件日志与 web UI 里持续告知,并写明你的选项:
+
+- 两个插件都留:该渠道响亮拒收,profile 里其余所有模型照常压缩 —— 不用卸载任何东西;
+- **用 `/bili/` 前缀选择性路由(两边都能用):** 先从 profile 移除 billion-context 插件(`bili plugin remove dsh`)——它装着时会把免费模型渠道的流量拉进代理,拒收就是这么触发的——然后只把想压缩的 provider 设为 `baseURL = http://localhost:8787/bili/<上游>`,免费模型端点保持不动(需运行 `bili start`):这些模型直连且签名有效,其余照常压缩。若你的 profile 开着 dsh 自带自动压缩(web 预设),移除插件后它会回来 —— 最多留一个压缩器;
+- 移除插件且不换路由:整个 profile 直连、无压缩;
+- 等服务方出官方 bili 兼容模式。
+
+**不要**用 `resign["x-ofm-signature"].enabled: false` / `BILI_RESIGN=0` 去「修」它:那会恢复 pre-resign 改写行为,等于向一个本来就屏蔽你的服务方发验签必失败的请求 —— 有账号风险、零收益。立场声明:本项目不支持违反他人协议的软件;针对该方案的兼容处理只为了让你的其余链路能用上 bili。详见 [CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md)(服务端设置 → `resign`)。
+
 ## Kimi Code(Moonshot)
 
 三种对齐模式:`bili kimi`(启动器,证书 MITM —— README 快速上手 方式 2)、`/bili/` URL 前缀,以及原生插件模式(`bili plugin install kimi`,#963)。Kimi Code v2 的插件体系是纯声明式的(`kimi.plugin.json`:MCP server、hooks、skills —— 没有进程内 JS 执行),所以 bili 无法像 pi/opencode/dsh 那样补丁客户端的 fetch 栈。取而代之,插件带两个小型 node 脚本,在客户端外围完成工作:

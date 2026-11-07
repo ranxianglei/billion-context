@@ -41,7 +41,9 @@ import { configFile, stateDir } from "./paths.js";
  * passthrough settings are INERT and the request always refuses. Refusals
  * are remembered (recordSignedRefusal → stateDir()/resign-pending.json) so
  * every bili startup lists still-unresolved schemes next to the listen
- * banner until bili ships their re-signer. resign["<scheme>"].enabled=false
+ * banner until bili ships their re-signer — except schemes whose registry
+ * entry carries a status note, which are permanent-policy refusals that no
+ * re-signer will resolve (#4632). resign["<scheme>"].enabled=false
  * / BILI_RESIGN=0 un-deploy the branch entirely (pre-#1884 rewrite behavior
  * — upstream may reject the rewritten bodies; that choice also clears the
  * reminder).
@@ -69,6 +71,14 @@ interface KnownSignatureScheme {
     label: string;
     source: string;
     builtIn?: boolean;
+    /** #4632: status note rendered into every user-facing channel (refusal
+     *  message, startup banner, dsh boot warning, web UI card) — the registry
+     *  is the single source of truth for a scheme's status, so one change
+     *  updates all channels at once. */
+    note?: string;
+    /** Chinese variant of the note for the bilingual web UI (code channels
+     *  stay English, matching the other refusal messages). */
+    noteZh?: string;
 }
 
 export const KNOWN_SIGNATURE_SCHEMES: Record<string, KnownSignatureScheme> = {
@@ -76,7 +86,16 @@ export const KNOWN_SIGNATURE_SCHEMES: Record<string, KnownSignatureScheme> = {
     "aws4-hmac-sha256": { label: "AWS SigV4 (AWS4-HMAC-SHA256)", source: "AWS SigV4" },
     "hmac-sha256": { label: "generic HMAC-SHA256 authorization", source: "#1884" },
     // dsh-our-free-model EAC channel: HMAC over `${timestamp}\n${METHOD}\n${path}\nsha256(body)`
-    "x-ofm-signature": { label: "dsh-our-free-model EAC gateway signature", source: "#2090" },
+    "x-ofm-signature": {
+        label: "dsh-our-free-model EAC gateway signature",
+        source: "#2090",
+        // #4632: the service blocks bili-routed traffic on this channel and its
+        // terms forbid third-party proxies from intercepting/re-signing; the
+        // note below is rendered by signedRefusal(), the startup banner, the
+        // dsh boot warning and the web UI card (single source of truth).
+        note: "The service side blocks bili-routed traffic on this channel (#4632): its terms do not allow third-party proxies to intercept or re-sign its requests, and bili will not circumvent that block — this project does not support software that violates others' terms of service; the compatibility handling here exists only so the rest of your setup keeps working with bili. Your options: keep bili (these models stay refused locally, never silently broken; everything else compresses normally); or remove the billion-context plugin from the dsh profile (bili plugin remove dsh) and route only the models you want compressed through the /bili/ prefix instead (their base URL becomes http://localhost:8787/bili/<upstream>, the free-model endpoint stays direct, run bili start) — these models then go direct with valid signatures while everything else still compresses; or wait for an official bili-compatible mode from the service. Do NOT restore this channel with resign[\"x-ofm-signature\"].enabled=false / BILI_RESIGN=0 — that ships signature-invalid requests to the upstream. Details: README \"Signed upstreams\" · CLIENTS.md (dsh lane).",
+        noteZh: "服务方在本渠道屏蔽经 bili 的流量（#4632）：其条款不允许第三方代理拦截或重签其请求，bili 不会绕过该屏蔽——本项目不支持违反他人协议的软件，此处的兼容处理仅仅是为了让你的其余链路能继续用 bili。你的选择：保留 bili（这些模型在本地被响亮拒绝、绝不静默坏掉，其余模型正常压缩）；或把 billion-context 插件从 dsh profile 移除（bili plugin remove dsh），改为只把想压缩的模型经 /bili/ 前缀路由（其 base URL 改为 http://localhost:8787/bili/<上游>，免费模型端点保持直连，运行 bili start）——这些模型直连且签名有效，其余照常压缩；或等待服务方提供官方兼容模式。不要用 resign[\"x-ofm-signature\"].enabled=false / BILI_RESIGN=0 恢复该渠道——那会向对方发送验签失败的请求。详见 README「签名上游」· CLIENTS.md（dsh 车道）。",
+    },
 };
 
 /** The minimal signing credential (subset of the plugin's CodeArtsCredential). */
@@ -133,13 +152,18 @@ interface SignedRefusal {
  *  provide the credential — so #1884 shipped the passthrough escape hatch).
  *  Non-built-in schemes have NO pass-through mode at all: they stay refused
  *  until bili ships a re-signer for them, and the message says so instead of
- *  offering a config that would not work. */
+ *  offering a config that would not work. #4632: schemes whose registry entry
+ *  carries a `note` (deliberately blocked channels) get that note as their
+ *  status text instead — we do not promise a re-signer for those. */
 export function signedRefusal(scheme: string, protocol: "anthropic" | "openai"): SignedRefusal {
     const known = KNOWN_SIGNATURE_SCHEMES[scheme];
     const schemeName = known ? `${scheme} (${known.label}, ${known.source})` : scheme;
+    const statusTail = known?.note
+        ? ` ${known.note}`
+        : ` It stays unavailable until bili ships re-signing support for it. Restoring pre-resign handling with {"resign":{"${scheme}":{"enabled":false"}}} / BILI_RESIGN=0 is possible, but the upstream will reject the rewritten body.`;
     const message = scheme === APIG_RESIGN_SCHEME
         ? `bili refused to forward this ${schemeName}-signed request: the signature covers the request body, and any rewrite (context compression) would invalidate it upstream (401 APIG.0301 / SignatureDoesNotMatch). No re-sign credential was available for this scheme. The link WORKS WITHOUT COMPRESSION if you opt in explicitly — that opt-in is the acknowledgment that this link runs uncompressed: add {"resign":{"${scheme}":{"passthrough":true}}} to the config file (${configFile()}) or set env BILI_RESIGN_PASSTHROUGH=1, then restart bili; the bili web UI (/__bili/, Configuration → Signed upstreams) lists this scheme too. Alternatively restore pre-resign handling with {"resign":{"${scheme}":{"enabled":false}}} / BILI_RESIGN=0 — the body is then rewritten and the upstream may reject it. Providing a signing credential (dsh: an enabled codearts account in jet-hub state.json via the dsh credentials service) makes bili re-sign instead of refusing.`
-        : `bili refused to forward this ${schemeName}-signed request: the signature covers the request body, and any rewrite (context compression) would invalidate it upstream (401 SignatureDoesNotMatch). bili has no re-signer for this scheme yet, and by design signed requests are either RE-SIGNED+COMPRESSED or REFUSED — there is no unsigned pass-through mode, so NO configuration can make this link work (passthrough settings do not apply to this scheme). It stays unavailable until bili ships re-signing support for it. Restoring pre-resign handling with {"resign":{"${scheme}":{"enabled":false}}} / BILI_RESIGN=0 is possible, but the upstream will reject the rewritten body.`;
+        : `bili refused to forward this ${schemeName}-signed request: the signature covers the request body, and any rewrite (context compression) would invalidate it upstream (401 SignatureDoesNotMatch). bili has no re-signer for this scheme${known?.note ? "" : " yet"}, and by design signed requests are either RE-SIGNED+COMPRESSED or REFUSED — there is no unsigned pass-through mode, so NO configuration can make this link work (passthrough settings do not apply to this scheme).${statusTail}`;
     if (protocol === "anthropic") {
         return { status: 403, contentType: "application/json", body: JSON.stringify({ type: "error", error: { type: "invalid_request_error", message } }) };
     }

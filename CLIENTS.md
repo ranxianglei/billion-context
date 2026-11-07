@@ -205,6 +205,15 @@ the tab degrades to a restart notice plus an open-Web-UI button instead of
 guessing. Plain React from dsh's own runtime — no iframe, no added
 dependencies.
 
+**Free-model plugin (`x-ofm-signature`) — known conflict, refused permanently (#4632):** the dsh free-model plugin signs every request to its EAC channel with `x-ofm-signature` (HMAC-SHA256 over timestamp + method + path + body hash). The service side blocks bili-routed traffic on this channel, and its terms do not allow third-party proxies to intercept or re-sign those requests — so bili ships NO re-signer for this scheme on purpose. Every request on this channel is refused locally with a loud 403 (never silently rewritten upstream into a failed signature), and bili keeps telling you so at startup, in the dsh plugin log, and in the web UI — with your options spelled out:
+
+- keep both plugins: this channel stays loudly refused, every other model in the profile compresses normally — no uninstall needed;
+- **selective routing via the `/bili/` prefix (keeps both working):** remove the billion-context plugin from the profile (`bili plugin remove dsh`) — while it is installed it pulls the free-model channel's traffic into the proxy, which is what triggers the refusals — then set ONLY the providers you want compressed to `baseURL = http://localhost:8787/bili/<upstream>` and leave the free-model endpoint untouched (`bili start` must be running): those models go direct with valid signatures, everything else still compresses. If your profile runs dsh's own auto-compaction (web presets), it returns when the plugin is removed — leave at most one compactor on;
+- remove the plugin and re-route nothing: the whole profile goes direct, uncompressed;
+- wait for an official bili-compatible mode from the service side.
+
+Do NOT set `resign["x-ofm-signature"].enabled: false` / `BILI_RESIGN=0` to "fix" it: that restores pre-resign rewrite handling, which ships signature-invalid requests to a service side that already blocks you — account risk, zero benefit. Position statement: this project does not support software that violates others' terms of service; the compatibility handling for this scheme exists only so the rest of your setup keeps working with bili. Details: [CONFIGURATION.md](CONFIGURATION.md) (Server Settings → `resign`).
+
 ## Kimi Code (Moonshot)
 
 Three aligned modes: `bili kimi` (launcher, cert-MITM — README Quickstart
