@@ -244,7 +244,7 @@ test("#4331 N3: acp_status stays quiet on a drained session (no section)", () =>
 });
 
 test("#4331 unit: describeUncoveredRuns caps the listing and counts the rest", () => {
-    const runs = Array.from({ length: 7 }, (_, i) => ({ startRef: `m00${100 + i}`, endRef: `m00${110 + i}`, count: 9, tokens: 5000 }));
+    const runs = Array.from({ length: 7 }, (_, i) => ({ startRef: `m00${100 + i}`, endRef: `m00${110 + i}`, count: 9, tokens: 5000, chars: 20000 }));
     const s = describeUncoveredRuns(runs);
     assert.ok(s.includes("+2 more run(s)"), s);
     assert.ok(s.includes("~5K tok"), s);

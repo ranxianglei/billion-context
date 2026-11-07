@@ -38,6 +38,10 @@ interface UncoveredRun {
   endRef: string;
   count: number;
   tokens: number;
+  /** Σ msg.text.length over the kept entries — the exact quantity the kernel's
+   *  too-small gate (kernel/src/compress.ts) sums against minCompressRange, so
+   *  a run with chars < minCompressRange can never be folded as submitted. */
+  chars: number;
 }
 
 interface UncoveredAuditInput {
@@ -66,6 +70,7 @@ interface RunEntry {
   ref: string;
   num: number;
   tokens: number;
+  chars: number;
 }
 
 function refNum(ref: string): number {
@@ -107,7 +112,7 @@ export function uncoveredHistoryRuns(input: UncoveredAuditInput): UncoveredRun[]
     if (tokens <= 0) return;
     const num = refNum(ref);
     if (num <= 0) return;
-    entries.push({ index, ref, num, tokens });
+    entries.push({ index, ref, num, tokens, chars: msg.text?.length ?? 0 });
   });
   if (entries.length === 0) return [];
 
@@ -173,6 +178,7 @@ export function uncoveredHistoryRuns(input: UncoveredAuditInput): UncoveredRun[]
       endRef: kept[kept.length - 1].ref,
       count: kept.length,
       tokens,
+      chars: kept.reduce((sum, e) => sum + e.chars, 0),
     });
   }
   return out;
