@@ -246,11 +246,29 @@ function compactCompressText(text: string | undefined): string | null {
   return changed ? prefix + out : null;
 }
 
+// #5864: does the assistant-message run ending at index `i` contain a protected
+// (signed thinking / redacted_thinking) core anywhere before it? A run is the
+// maximal stretch of consecutive assistant-role cores — exactly what
+// coreToAnthropic renders as ONE assistant message — so the scan stops at the
+// first non-assistant core. Lets the caller keep a compress pair whose thinking
+// sibling is separated from it by intervening text/tool cores in the same turn.
+function runHasStrandedProtectedPredecessor(
+  messages: CoreMessage[],
+  i: number,
+  pred: (m: CoreMessage) => boolean,
+): boolean {
+  for (let j = i - 1; j >= 0 && messages[j]!.role === "assistant"; j--) {
+    if (pred(messages[j]!)) return true;
+  }
+  return false;
+}
+
 export function hideConsumedCompressCalls(
   state: CompressionState,
   messages: CoreMessage[],
   isCompressTool: (toolName: string) => boolean = (name) =>
     name === COMPRESS_TOOL_NAME,
+  strandedProtectedPredecessor: (m: CoreMessage) => boolean = () => false,
 ): HideConsumedResult {
   const allBlockCallIds = new Set<string>();
   const activeCallIds = new Set<string>();
@@ -352,6 +370,14 @@ export function hideConsumedCompressCalls(
         }
       }
     }
+    // #5864: hiding this pair would strand a signed thinking-family block that
+    // sits earlier in the SAME assistant message — an intermediate text/tool
+    // core between the thinking and the call is common, so the immediate
+    // predecessor alone is not enough. Signed thinking must round-trip with its
+    // tool_use sibling (#1658/#1960/#684) or upstream rejects the altered
+    // replay. Keep every compress pair whose assistant run holds a protected
+    // predecessor, not just the one right after the thinking.
+    if (hide && runHasStrandedProtectedPredecessor(messages, i, strandedProtectedPredecessor)) hide = false;
     if (hide) hiddenCallIds.add(callId);
     else keepCallIds.add(callId);
   }
