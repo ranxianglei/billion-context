@@ -64,6 +64,7 @@ import { dshContextTabEnabled, dshContextTabLabel, limitsDecodedBytes } from "..
 import { MIN_ASSUMED_WINDOW_TOKENS } from "../util.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, singleFlight } from "./native-bootstrap.js";
 import { bodyProvablyOverWindow as sharedBodyProvablyOverWindow, installNativeFetchIntercept, liveStateSlotEffect, noteRoutedOrigin, observeRoutedOrigin, routedBiliModelUrl, type GateVerdict, type NativeInterceptState } from "./native-intercept.js";
+import { runOutsideFetchChain } from "./fetch-chain/index.js";
 import { asciiHeaderValue, fetchManifest, fetchProxyVersion, fetchStatus, fetchStatusLatest, forwardTool, reportAttributionHealth, reportRuntimeInfo, waitForProxyVersion, type ManifestTool } from "./shared.js";
 import { createForkAdopter, sideShapedBody } from "./fork-adopt.js";
 import { clearIncrementalProbe, createPrepareDirectSend, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalRejection, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, rememberOriginalBody, sweepStale, wireMessagesLookAnthropic, type IncrementalWireMessage } from "./incremental-client.js";
@@ -1217,15 +1218,30 @@ function pfSlotIdsOf(messages: unknown): string[] | undefined {
     return out;
 }
 
+/** #5614: a model operation must begin OUTSIDE any earlier transport fetch's
+ *  re-entry scope (the dispatchDepth/chainHop stores), or its first request
+ *  looks like mid-descent re-entry and skips the compression entry — see
+ *  runOutsideFetchChain. Re-enter our sid/msgIds scope INSIDE that cleared
+ *  boundary so session attribution and host id capture ride along unchanged. */
+function runLlmDispatch<R>(scope: LlmDispatchScope, operation: () => R): R {
+    return runOutsideFetchChain(() => dispatchScope.run(scope, operation));
+}
+
+/** Test-only accessors (#5826 review): pins tests/msgid-rule-parity.test.ts
+ *  drives these collectors directly against the shared reject-class set. */
+export const _hostMsgIdsOfForTest = hostMsgIdsOf;
+export const _pfSlotIdsOfForTest = pfSlotIdsOf;
+
 /** Re-enter the dispatch scope on every iterator advance: generator bodies
  *  resume in the consumer's dynamic context, so each `next()` must run the
  *  adapter's continuation (its awaits, and any fetches it starts) inside the
- *  same scope the dispatch carried. */
+ *  same scope the dispatch carried. Each boundary also clears the inherited
+ *  fetch-chain re-entry state (#5614) via runLlmDispatch. */
 function wrapScopedIterable<T>(iter: AsyncIterable<T>, scope: LlmDispatchScope): AsyncIterable<T> {
     return {
         [Symbol.asyncIterator]: () => {
-            const it = iter[Symbol.asyncIterator]();
-            const run = <R>(op: () => Promise<R>): Promise<R> => dispatchScope.run(scope, op);
+            const it = runLlmDispatch(scope, () => iter[Symbol.asyncIterator]());
+            const run = <R>(op: () => Promise<R>): Promise<R> => runLlmDispatch(scope, op);
             return {
                 next: () => run(() => it.next()),
                 return: (value?: unknown) => run(() => it.return !== undefined ? it.return(value as never) : Promise.resolve({ done: true, value: value as T })),
@@ -1467,6 +1483,76 @@ async function bodyJsonOf(init: RequestInit | undefined): Promise<unknown> {
     }
 }
 
+// #5792: ONE decode+JSON.parse of the request body per request across all
+// pre-send hooks. The same init object threads through maybeRecallBeforeSend /
+// maybeForkAdoptBeforeSend / maybeIncrementalNative, and each used to re-decode
+// + JSON.parse the SAME multi-MiB body independently — OpenAI-wire sessions paid
+// two full parses of the whole history every step before egress, INSIDE the host
+// process (the "host gap" #5792 measured). Memoize on the init identity so the
+// expensive work runs once and every consumer reads the shared result. If a hook
+// swaps init.body mid-chain (fork-adopt, the incremental delta form) the memo
+// invalidates on the changed reference instead of serving a stale parse. The
+// record's wall time + consumer count feed the host-json-parse diagnostic line so
+// a field report can subtract bili's slice from the DSH buildRequest residual.
+interface BodyParseRecord {
+    bodyRef: unknown;
+    promise: Promise<unknown> | undefined;
+    ms: number;
+    consumers: number;
+    inboundBytes: number;
+}
+const bodyParseMemo = new WeakMap<object, BodyParseRecord>();
+// #5792 test seam: genuine decode+parse invocations (a memo hit does not count).
+let bodyParseRealCount = 0;
+
+function inboundBytesOf(raw: unknown): number {
+    if (typeof raw === "string") return raw.length;
+    if (raw instanceof Uint8Array || raw instanceof ArrayBuffer) return raw.byteLength;
+    return 0;
+}
+
+// #5792: shared per-request body parse — undefined on failure (same contract as
+// bodyJsonOf), re-parses only if a consumer swapped init.body since last call.
+async function parsedBodyOnce(init: RequestInit | undefined): Promise<unknown> {
+    if (init === undefined) return undefined;
+    let rec = bodyParseMemo.get(init);
+    if (rec === undefined) {
+        rec = { bodyRef: init.body, promise: undefined, ms: 0, consumers: 0, inboundBytes: inboundBytesOf(init.body) };
+        bodyParseMemo.set(init, rec);
+    }
+    rec.consumers += 1;
+    const cur = init.body;
+    if (rec.promise !== undefined && rec.bodyRef === cur) return rec.promise;
+    const t0 = Date.now();
+    const promise = (async () => {
+        bodyParseRealCount += 1;
+        const value = await bodyJsonOf(init);
+        const r = bodyParseMemo.get(init)!;
+        r.ms = Date.now() - t0;
+        r.inboundBytes = inboundBytesOf(cur);
+        return value;
+    })();
+    rec.bodyRef = cur;
+    rec.promise = promise;
+    return promise;
+}
+
+/** #5792: one concise diagnostic line per request into the shared bili.log
+ * (same file the proxy's `request:` lines land in) so the host-side gap can be
+ * split into bili's parse cost vs the DSH buildRequest residual. Skipped when no
+ * hook parsed this request (tools not ready) — nothing to report. */
+function emitHostParseDiagnostic(init: RequestInit | undefined): void {
+    if (init === undefined) return;
+    const rec = bodyParseMemo.get(init);
+    if (rec === undefined || rec.consumers === 0) return;
+    logHostEvent("info", "[dsh-client]",
+        `bili-native-dsh: host-json-parse=${rec.ms}ms consumers=${rec.consumers} inbound=${rec.inboundBytes}B (#5792)`);
+}
+
+export function _resetBodyParseStatsForTest(): void { bodyParseRealCount = 0; }
+export function _bodyParseStatsForTest(): number { return bodyParseRealCount; }
+export function _parsedBodyOnceForTest(init: RequestInit | undefined): Promise<unknown> { return parsedBodyOnce(init); }
+
 async function maybeForkAdoptBeforeSend(ctx: PluginContext, init: RequestInit | undefined): Promise<void> {
     const child = forkChildVerdict(ctx);
     if (!child.ok) {
@@ -1478,7 +1564,7 @@ async function maybeForkAdoptBeforeSend(ctx: PluginContext, init: RequestInit | 
             `bili-native-dsh: fork adoption for ${child.sid} skipped at the tools-ready gate — this request arrived before bili tool registration completed; later requests can still adopt (#4215)`);
         return;
     }
-    const body = await bodyJsonOf(init);
+    const body = await parsedBodyOnce(init);
     if (body === undefined) {
         noteForkGateOnce(`gate:body-parse:${child.sid}`, "warn",
             `bili-native-dsh: fork adoption for ${child.sid} skipped at the body-parse gate — the request body was not parseable JSON after content-encoding decode, so the replay cannot be projected (#4215/#4829)`);
@@ -1764,7 +1850,7 @@ async function maybeRecallBeforeSend(ctx: PluginContext, url: string, init: Requ
     if (!register.toolsReady || init === undefined) return;
     const attr = attributionOf(ctx);
     if (attr.state === "ok") {
-        const body = await bodyJsonOf(init);
+        const body = await parsedBodyOnce(init);
         if (body === undefined || typeof body !== "object") return;
         const messages = (body as { messages?: unknown }).messages;
         if (!Array.isArray(messages) || messages.length === 0) return;
@@ -1951,9 +2037,12 @@ export function apply(ctx: PluginContext): void {
                 // adapter — never ride a stale one.
                 pfChannel.pfCaptureIds(sid, pfSlotIdsOf(options?.messages));
                 // next() may start the adapter's fetch eagerly (inside this
-                // call), and lazy continuations resume on each advance — the
-                // run() below covers the former, wrapScopedIterable the latter.
-                return dispatchScope.run(scope, () => wrapScopedIterable(next(), scope));
+                // call), and lazy continuations resume on each advance —
+                // runLlmDispatch covers the former, wrapScopedIterable the
+                // latter; each also clears inherited fetch-chain re-entry
+                // state so a new operation never looks like mid-descent
+                // re-entry (#5614).
+                return runLlmDispatch(scope, () => wrapScopedIterable(next(), scope));
             });
         });
     }
@@ -2459,6 +2548,7 @@ export function apply(ctx: PluginContext): void {
         await maybeRecallBeforeSend(ctx, url, init);
         await maybeForkAdoptBeforeSend(ctx, init);
         await maybeIncrementalNative(url, init);
+        emitHostParseDiagnostic(init);
     };
     // #3304: the dsh swap stamps the turn id atomically with the body, so the
     // strict shared guard applies — mutated + unrestorable ⇒ refuse locally.
@@ -2497,12 +2587,8 @@ export function apply(ctx: PluginContext): void {
         if (attr.state !== "ok") return;
         const body = init.body;
         if (typeof body !== "string" || body.length === 0) return; // stream/Request bodies ride full resend
-        let parsed: { messages?: unknown; system?: unknown; model?: unknown };
-        try {
-            parsed = JSON.parse(body) as typeof parsed;
-        } catch {
-            return;
-        }
+        const parsed = (await parsedBodyOnce(init)) as { messages?: unknown; system?: unknown; model?: unknown } | undefined;
+        if (parsed === undefined) return;
         if (typeof parsed.model !== "string" || !wireMessagesLookAnthropic(parsed.messages)) return; // anthropic wire only — OpenAI tool shapes (tool_calls / role:"tool") resend full (#3433)
         const base = register.base ?? state.origin;
         if (base === undefined) return;
@@ -2684,15 +2770,23 @@ export function apply(ctx: PluginContext): void {
         } catch {
             // older dsh builds without the service: diagnostic only
         }
-        if (bundles !== undefined && bundles.includes("@deepseek-ai/dsh-web-app")) {
-            webProfileWarned = true;
-            // #3806: overlay failed to latch -> escalate the passive note into a boot-time alarm.
-            const gap = detectCompactionOverlayGap(ctx);
-            if (gap !== null) {
-                persistClientEvent(`profile bundles include @deepseek-ai/dsh-web-app and the load-time compaction-disable overlay (#3354) could not latch on this dsh build (${gap}) — dsh native auto-compaction is likely ARMED here. bili's wire-level refusal (#1729) refuses routed compaction calls but CANNOT stop dsh writing its checkpoint locally, so a landed checkpoint will destroy the compression substrate and surface later as a 'compression conflict' banner. Apply the #2474 full-snapshot override of preset-standard in your profile's cordis.patch.yml now (a partial snippet silently drops everything not restated; see CONFIGURATION.md)`);
-            } else {
-                persistClientEvent("profile bundles include @deepseek-ai/dsh-web-app — its agent presets run their own compaction-basic in nested rows no patch layer can address by id (#1772/#2360); bili disables those preset rows at load time via a vendored overlay (deshark42/dsh-compaction-basic-disable, MIT, #3354; since #4147 the match is structural, covering custom presets too), so dsh native auto-compaction stays OFF in this profile (ACP compression unaffected). If you still see a dsh compaction checkpoint land on a newer/older dsh build — the overlay rides cordis' INTERNAL 'internal/config' hook and is version-sensitive — fall back to the #2474 full-snapshot override of preset-standard in your profile's cordis.patch.yml (a partial snippet silently drops everything not restated; see CONFIGURATION.md)." + gateCoverageSuffix());
-            }
+        // #5686: the latch check (pure structural typeof probes on the cordis
+        // host surface — cheap, side-effect-free) runs for EVERY profile
+        // shape now. The pre-#5686 code only called it inside the
+        // @deepseek-ai/dsh-web-app branch, so every other form — in
+        // particular the desktop app-in-bundle layout where NO @deepseek-ai/*
+        // package sits under the profile and the core ships inside the app —
+        // booted SILENTLY when the #3354 disable middleware could not latch:
+        // native auto-compaction armed with zero boot-time signal while bili's
+        // wire refusals were its only backstop.
+        const isWeb = bundles !== undefined && bundles.includes("@deepseek-ai/dsh-web-app");
+        const gap = detectCompactionOverlayGap(ctx);
+        webProfileWarned = true;
+        if (gap !== null) {
+            // #3806/#5686: overlay failed to latch -> boot-time alarm on ANY profile shape.
+            persistClientEvent(`profile${isWeb ? " bundles include @deepseek-ai/dsh-web-app and" : bundles === undefined ? " shape could not be introspected (older dsh build) and" : " (non-web-app bundle list) and"} the load-time compaction-disable overlay (#3354) could not latch on this dsh build (${gap}) — dsh native auto-compaction is likely ARMED here. bili's wire-level refusal (#1729) refuses routed compaction calls but CANNOT stop dsh writing its checkpoint locally, so a landed checkpoint will destroy the compression substrate and surface later as a 'compression conflict' banner. Apply the #2474 full-snapshot override of preset-standard in your profile's cordis.patch.yml now (a partial snippet silently drops everything not restated; see CONFIGURATION.md)`);
+        } else if (isWeb) {
+            persistClientEvent("profile bundles include @deepseek-ai/dsh-web-app — its agent presets run their own compaction-basic in nested rows no patch layer can address by id (#1772/#2360); bili disables those preset rows at load time via a vendored overlay (deshark42/dsh-compaction-basic-disable, MIT, #3354; since #4147 the match is structural, covering custom presets too), so dsh native auto-compaction stays OFF in this profile (ACP compression unaffected). If you still see a dsh compaction checkpoint land on a newer/older dsh build — the overlay rides cordis' INTERNAL 'internal/config' hook and is version-sensitive — fall back to the #2474 full-snapshot override of preset-standard in your profile's cordis.patch.yml (a partial snippet silently drops everything not restated; see CONFIGURATION.md)." + gateCoverageSuffix());
         } else if (bundles !== undefined && !nonWebTraceLogged) {
             // #3651: the web-profile note above is the ONLY confirmation that
             // the #3354 overlay took effect, and it is scoped to dsh-web-app

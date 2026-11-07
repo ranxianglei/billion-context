@@ -99,7 +99,7 @@ import { noteRequest } from "./attach-heartbeat.js";
 import { queryLogLines } from "./web/logs-query.js";
 import { configFile, defaultLogFile, sessionsDir, stateDir } from "./paths.js";
 import { atomicWriteInstanceFile, clearProxyInstanceFile, classifySameLanePeer, entryShape, findPresentUnverifiedSameLaneTwin, findSameLanePredecessor, findVerifiedSameLaneTwin, isPidAlive, listInstances, markPortReleased, probePid, readProxyInstanceFile, registerInstanceAndWarn, resolveOwnFingerprint, sameInstanceShape, SPAWN_FINGERPRINT_ENV, unregisterInstance, warnOnNewPeers, writeSpawnPortLog, type InstanceShape, type PidProbe, type ProxyInstanceFile, type RegistryEntry, type SameLanePeer } from "./instance.js";
-import { createServedMarkerWriter, peerStillContests, reapStaleWriterMarkers, writerMarkerDir, type ServedMarkerWriter } from "./served-markers.js";
+import { createServedMarkerWriter, peerStillContests, processStartMs, reapStaleWriterMarkers, writerMarkerDir, type ServedMarkerWriter } from "./served-markers.js";
 import { recordSplitBrainContest, registerSplitBrainEvidenceCheck } from "./storage/runtime-status.js";
 import { holderProbeOrigin, mayClobberPointer, probeHolderForHint, probeOwnerInfo, resolvePortClaim, verifyEntryOwnsPort } from "./port-owner.js";
 import { armEventLoopWatchdog } from "./event-loop-watchdog.js";
@@ -763,6 +763,10 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
             // feeding the context-free [error] AbortError storm.
             const clientAbort = (e?.name === "AbortError" || /abort/i.test(String(e?.message ?? ""))) && (res.destroyed || res.writableEnded);
             if (clientAbort) log("info", `client aborted mid-stream: ${msg}`);
+            // #2465/#5663: classified transport deaths are already fully described on
+            // one line (kind/code/errno/syscall/address/hint) — stack frames were pure
+            // noise in field EHOSTUNREACH storms (305 failures × 7).
+            else if (err instanceof Error && (err as Error & { biliTransportFailure?: boolean }).biliTransportFailure === true) log("error", msg);
             // #4254: a deliberate circuit-breaker fail-fast logs nothing here — the
             // throttled [warn] at the throw site is the canonical record, so one dead
             // upstream stops re-emitting a per-request [error]+stack on every round.
@@ -1343,7 +1347,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         {
             const markerDir = writerMarkerDir(stateDir());
             servedWriter = createServedMarkerWriter(
-                { instanceId, pid: process.pid, origin, version: VERSION, lane: launcherLane },
+                { instanceId, pid: process.pid, origin, version: VERSION, lane: launcherLane, startedAt: processStartMs(Date.now()) },
                 markerDir,
                 (level, msg) => log(level, msg),
                 {
@@ -2547,6 +2551,11 @@ export function warnReasoningPairs(
     if (tracked.fresh.length === 0) return;
     log("warn", `[${sessionId}] reasoning-pair-violated: ${violators.length} assistant tool-call message(s) lack reasoning_content while ${withRc} carry it — strict-echo upstreams (DeepSeek thinking mode) will reject the request; first seen: ${violationNamed(tracked.fresh, tracked.ongoing, tracked.maxRepeat)} (#684/#762/#2864)`);
 }
+
+// [#5688] shared egress repair for adjacent per-turn effort directives —
+// implementation moved to its own leaf module so loop/ can import it without
+// a server.ts import cycle; re-exported here for existing consumers.
+export { dedupeAdjacentOutputConfig } from "./dedupe-adjacent-output-config.js";
 
 /** [#684] Anthropic-wire twin of the openai sentinel, narrowed by [#1327]:
  *  warn only when bili itself lost thinking — a tool_use block that rode an

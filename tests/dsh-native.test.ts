@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import http from "node:http";
 import { pathToFileURL } from "node:url";
-import { apply, planNativeDsh, shouldBootstrapNativeDsh, persistClientEvent, mediaBytesOfWireBody, bodyProvablyOverWindow, _attributionHealthForTest, _resetAttributionHealthForTest, _registerStateForTest, _resetRegisterForTest, _setModelInfoForTest, _nativeStateForTest, _setSpawnForTest, _setThrewRetryForTest, _settleNativeForTest, _stateHeadersForTest, _stateRespawnForTest, _stateTakeoverGateForTest, _stateToolsReadyForTest, _stateBeforeSendForTest, _stateOnResponseForTest, _noteRoutedForTest, _resetRoutedForTest, _resetWebProfileWarningForTest, _resetNonWebTraceForTest, _resetTitlesForTest, type PluginContext } from "../src/agent/dsh-native.ts";
+import { apply, planNativeDsh, shouldBootstrapNativeDsh, persistClientEvent, mediaBytesOfWireBody, bodyProvablyOverWindow, _attributionHealthForTest, _resetAttributionHealthForTest, _registerStateForTest, _resetRegisterForTest, _setModelInfoForTest, _nativeStateForTest, _setSpawnForTest, _setThrewRetryForTest, _settleNativeForTest, _stateHeadersForTest, _stateRespawnForTest, _stateTakeoverGateForTest, _stateToolsReadyForTest, _stateBeforeSendForTest, _stateOnResponseForTest, _noteRoutedForTest, _resetRoutedForTest, _resetWebProfileWarningForTest, _resetNonWebTraceForTest, _resetTitlesForTest, _resetBodyParseStatsForTest, _bodyParseStatsForTest, _parsedBodyOnceForTest, type PluginContext } from "../src/agent/dsh-native.ts";
 import { __resetIncrementalClientForTests } from "../src/agent/incremental-client.ts";
 import { isDshCompactionActive, _resetDshCompactionVerdictForTest } from "../src/agent/dsh-compaction-disable.ts";
 import { once } from "node:events";
@@ -1266,6 +1266,48 @@ test("#3806 apply(): a degraded web profile alarms loudly instead of the silent 
             assert.match(lines[0], /#2474/);
             assert.match(lines[0], /ARMED/i);
             assert.doesNotMatch(lines[0], /deshark42\/dsh-compaction-basic-disable/);
+            await _stateToolsReadyForTest();
+        });
+    } finally {
+        _setSpawnForTest(undefined);
+        proxy.close();
+        rmrf(home);
+        rmrf(stateHome);
+        _resetRegisterForTest(undefined);
+        _resetWebProfileWarningForTest();
+    }
+});
+
+test("#5686 P0-2 apply(): a degraded NON-WEB profile alarms loudly too (no silent arming)", async () => {
+    const proxy = await startMockProxy([]);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-5686-"));
+    const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-5686-state-"));
+    const logFile = path.join(stateHome, "billion-context", "bili.log");
+    const clientLines = (): string[] => fs.existsSync(logFile)
+        ? fs.readFileSync(logFile, "utf8").split("\n").filter((l) => l.includes("[dsh-client]"))
+        : [];
+    _setSpawnForTest(async () => undefined);
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin, XDG_STATE_HOME: stateHome, BILI_PROVIDER_REWRITES: undefined, BILI_NATIVE_DSH: undefined, BILLION_CONTEXT_PLUGIN: undefined }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            _resetWebProfileWarningForTest();
+            // headless profile (desktop app-in-bundle shape: no @deepseek-ai/*
+            // package under the profile) + a host without the internal/config
+            // hook — pre-#5686 this booted SILENTLY (info trace only).
+            const bare: Parameters<typeof apply>[0] = {
+                tools: { register: () => undefined },
+                commands: { register: () => undefined },
+                agents: {},
+                profileContext: { startedBundles: ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-headless", "billion-context"] },
+            };
+            apply(bare);
+            const lines = clientLines();
+            assert.equal(lines.length, 1);
+            assert.match(lines[0], /non-web-app bundle list/);
+            assert.match(lines[0], /could not latch/i);
+            assert.match(lines[0], /no-config-hook/);
+            assert.match(lines[0], /ARMED/i);
+            assert.match(lines[0], /#2474/);
             await _stateToolsReadyForTest();
         });
     } finally {
@@ -3248,5 +3290,71 @@ test("#1365 apply() attach mode: runtime death with routed evidence — waits th
         rmrf(home);
         _resetRoutedForTest();
         _resetRegisterForTest(undefined);
+    }
+});
+
+// #5792: the shared body-parse memo must dedupe N consumers onto ONE genuine
+// decode+parse per init, hand them the identical parsed value, and re-parse only
+// when a consumer swaps init.body (fork-adopt / the incremental delta form) —
+// serving a stale parse across a body swap would corrupt the downstream shape
+// checks. A failed parse caches as undefined without poisoning later lookups.
+test("#5792: shared body-parse memo dedupes consumers and invalidates on body swap", async () => {
+    _resetBodyParseStatsForTest();
+    const init: RequestInit = { method: "POST", body: JSON.stringify({ n: [1, 2, 3] }) };
+    const v1 = await _parsedBodyOnceForTest(init);
+    const v2 = await _parsedBodyOnceForTest(init);
+    const v3 = await _parsedBodyOnceForTest(init);
+    assert.equal(_bodyParseStatsForTest(), 1, "three consumers, one genuine parse");
+    assert.equal(v1, v2, "consumers share the identical parsed result");
+    assert.equal(v2, v3, "consumers share the identical parsed result");
+
+    init.body = JSON.stringify({ n: [4, 5] });
+    const v4 = await _parsedBodyOnceForTest(init);
+    assert.equal(_bodyParseStatsForTest(), 2, "swapped body forces a fresh parse (no stale reuse)");
+    assert.notEqual(v4, v1, "new body yields a distinct parsed value");
+
+    const bad: RequestInit = { method: "POST", body: "{not json" };
+    assert.equal(await _parsedBodyOnceForTest(bad), undefined, "unparseable body -> undefined");
+    assert.equal(await _parsedBodyOnceForTest(bad), undefined, "failure cached, still undefined");
+    assert.equal(_bodyParseStatsForTest(), 3, "each distinct init parses once");
+});
+
+// #5792: end-to-end through the real pre-send chain. An OpenAI-wire session used
+// to pay TWO full JSON.parse of the whole history inside the host process before
+// egress (recall parsed once, then incremental parsed again and bailed at the
+// anthropic-shape check). The chain must now collapse to exactly one genuine
+// parse while leaving the OpenAI body untouched (full resend).
+test("#5792: dsh pre-send chain parses the request body once per request", async () => {
+    const proxy = await startMockProxy([], undefined, undefined, undefined, true);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-5792-"));
+    const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-5792-state-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin, XDG_STATE_HOME: stateHome, BILI_PROVIDER_REWRITES: undefined, BILI_NATIVE_DSH: undefined, BILLION_CONTEXT_PLUGIN: undefined }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            __resetIncrementalClientForTests();
+            const ctx = mockCtx();
+            ctx.setInitiator({ session: { id: "dsh-5792" } });
+            apply(ctx);
+            await waitFor(() => ctx.registeredTools.length === 1, "manifest tool registration");
+            await _stateToolsReadyForTest();
+            const beforeSend = _stateBeforeSendForTest();
+            assert.ok(beforeSend, "pre-send seam armed");
+            const url = `${proxy.origin}/v1/chat/completions`;
+
+            const original = JSON.stringify({ model: "gpt-test", max_tokens: 64, messages: [
+                { role: "user", content: "list the files" },
+                { role: "assistant", content: null, tool_calls: [{ id: "call_1", type: "function", function: { name: "ls", arguments: "{}" } }] },
+                { role: "tool", tool_call_id: "call_1", content: "a.txt b.txt" },
+            ] });
+            const init: RequestInit = { method: "POST", body: original };
+            _resetBodyParseStatsForTest();
+            await beforeSend(url, init);
+            assert.equal(_bodyParseStatsForTest(), 1, "exactly one decode+parse across the whole pre-send chain (#5792)");
+            assert.equal(init.body, original, "OpenAI shape rides full resend (body untouched)");
+        });
+    } finally {
+        proxy.close();
+        rmrf(home);
+        rmrf(stateHome);
     }
 });
