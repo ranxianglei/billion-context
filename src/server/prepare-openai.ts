@@ -1,7 +1,7 @@
 import http from "node:http";
 import type { CompressionCore, Config, CoreMessage, NudgeDecision, PackSurface, Prompts } from "acp-kernel";
 import { isRenderedSummaryMessage, renderNudgeText, viableRanges } from "acp-kernel";
-import { coreToOpenai, injectOpenaiSystem, openaiToCore, type BiliMessage, type OpenAIMessage, type OpenAIRequestBody, type OpenAITool } from "acp-kernel/wire";
+import { coreToOpenai, injectOpenaiSystem, openaiToCore, type BiliMessage, type OpenAIRequestBody, type OpenAITool } from "acp-kernel/wire";
 import type { CompressReasoningConfig } from "../reasoning-drop.js";
 import type { ProxyOptions } from "../config.js";
 import { effectivePromptCacheRouting } from "../config.js";
@@ -12,7 +12,7 @@ import { applyReasoningDrop, diagNudge, diagTagSummary, deriveTitle, effectiveTo
 import { yieldToEventLoop } from "../yield-loop.js";
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, resolveDecisionRange, stripDecisionReasoningFields, type DecideConfig } from "../nudge-decide.js";
 import { excludeDeadRefRanges } from "../acp-status.js";
-import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode, type FoldReconcileResult } from "../fold-reconcile.js";
+import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "../fold-reconcile.js";
 import { maybeSnapshotView } from "./snapshot-render.js";
 import { storedMessagesFor, storedRowLookupFor } from "../fold-decomposition-lookup.js";
 import { nudgeSuppressed } from "../session-self-heal.js";
@@ -42,9 +42,6 @@ import { injectOpenaiTool, injectTool } from "./inject.js";
 import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
 import { featureEnabled } from "../rollout.js";
 import { evaluateWatermarkFastpath, finalizeWatermarkTurn, type FastpathHit, type FastpathOutcome } from "./fastpath.js";
-import { evaluateWatermarkV6, finalizeWatermarkV6, FastpathV6IdentityFault, PF_SESSION_HEADER, watermarkV6DebugState, type V6Outcome } from "./fastpath-v6.js";
-import { activeBlocksSignature, boundCoveredPositions, bumpAuditTick, commitRenderCapture, renderPlaneGate, spliceOutboundRows, verifyRenderWindow, type RenderCaps, type RenderGateDecision, type RenderWorld } from "./fastpath-v6-render.js";
-import { getStore } from "../persist.js";
 import { collectRequestIds, probeRequestMembership } from "../request-membership.js";
 
 export async function prepareOpenai(
@@ -76,29 +73,6 @@ export async function prepareOpenai(
     let sysNotes: string[] = [];
     let openaiOutboundSystem: string | undefined;
     let processedMessages: CoreMessage[] = [];
-    // #5664 render-snapshot capture carriers (null/empty = no engaged v6 turn
-    // captured this request — the commit block below skips on null).
-    let renderedCaptureStrings: string[] | null = null;
-    let renderedTailObjects: unknown[] = [];
-    let renderedImageDelta = 0;
-    let renderCapturedSid: string | null = null;
-    let renderCapturedCaps: RenderCaps | null = null;
-    // #5643 补充裁定 witnesses (structural events) for this turn's capture —
-    // pre-snapshots here, compared against post-pass state at station 2. The
-    // dsh native-compaction detector sets its flag deeper in the pipeline;
-    // hoisted here so station 2 can read it.
-    let dshRebased = false;
-    let renderPreBlocksSig = "";
-    let renderFoldUsagePre = false;
-    let renderGateReason: string | null = null;
-    // #5664 green verdict carrier (declared here so the clamp/estimate/capture
-    // consumers AFTER the try block see it; assigned at the gate below).
-    let renderFast: { rw: RenderWorld; F: number; maxPos: number; sid: string } | null = null;
-    // #5664 no-recast regime (owner ruling 2026-11-05): once this sid's plane
-    // is durably dead the session rides pure legacy FOREVER — skip building
-    // capture strings entirely (an O(full history) stringify on every later
-    // turn would be pure waste: the module refuses the commit anyway).
-    let renderLaneDead = false;
     // #3222: #651's reasoning-drop plan, computed on the INBOUND history before
     // core.processTurn — see planReasoningDrop for why the post-turn view is
     // too late (the kernel hides consumed call+result pairs inside it).
@@ -142,38 +116,11 @@ export async function prepareOpenai(
     // seed stash minted on identical bytes last turn (#3642 deterministic ids),
     // while head + tail fragments and scalar fields are decoded from raw
     // slices. Every miss falls through to the legacy path byte-identically.
-    // #5643 fastpath v6 — composite-identity lane ((sessionid, msgid)):
-    // evaluated FIRST and owns the turn whenever it engages (hit / arm /
-    // stamped degrade). Its identity fault (FastpathV6IdentityFault)
-    // PROPAGATES on purpose to handle.ts → 400 refusal (§3.2) — nothing
-    // upstream of that mapping may swallow it.
-    // #5403/#5418 watermark fastpath (v5, count-watermark era) follows and
-    // keeps serving non-cohort traffic byte-identically as before.
     let wpHit: FastpathHit | undefined;
     let wpOutcome: FastpathOutcome | null = null;
     let wpFullText: string | undefined;
-    let v6Evaluated: V6Outcome | null = null;
     const wpModel = typeof parsed.model === "string" ? parsed.model : "";
-    if (bodyText !== undefined && pluginMode && !isTitleGen && featureEnabled("watermarkV6MsgId")) {
-        v6Evaluated = evaluateWatermarkV6(bodyText, req, session, { pluginMode, titleGen: isTitleGen, model: wpModel }, log);
-        if (v6Evaluated !== null) {
-            wpFullText = bodyText; // whole-wire image accounting stays honest
-            log("debug", `[${session.id}] fastpath v6 ${v6Evaluated.hit ? "HIT" : v6Evaluated.decision}${v6Evaluated.measuredT !== undefined ? ` T=${v6Evaluated.measuredT}` : ""}`);
-            if (v6Evaluated.hit) {
-                // V6Hit is field-for-field identical to FastpathHit — the same
-                // consumption pattern applies below.
-                wpHit = v6Evaluated.hit;
-                const fields: Record<string, unknown> = {};
-                for (const [key, span] of wpHit.fieldSpans) {
-                    if (key === "messages") fields[key] = wpHit.windowMessages;
-                    else fields[key] = JSON.parse(bodyText.slice(span.start, span.end));
-                }
-                parsed = fields as OpenAIRequestBody;
-                inboundMessageCount = wpHit.totalT;
-            }
-        }
-    }
-    if (v6Evaluated === null && bodyText !== undefined && pluginMode && !isTitleGen && featureEnabled("pluginFullResendWatermark")) {
+    if (bodyText !== undefined && pluginMode && !isTitleGen && featureEnabled("pluginFullResendWatermark")) {
         wpFullText = bodyText;
         wpOutcome = evaluateWatermarkFastpath(bodyText, req, session, { pluginMode, titleGen: isTitleGen, model: wpModel }, log);
         log("debug", `[${session.id}] fastpath ${wpOutcome.hit ? "HIT" : wpOutcome.decision}${wpOutcome.creditedMiss ? "(credited)" : ""}${wpOutcome.measuredT !== undefined ? ` T=${wpOutcome.measuredT}` : ""}`);
@@ -249,57 +196,6 @@ export async function prepareOpenai(
         if (loopConfig.compressAtFoldPointClearThinking) {
             loopConfig.reasoningDroppable = makeFoldPointReasoningDroppable(renderMsgs, isStrictReasoningEcho(session, upstreamOrigin, modelIdOf(parsed)));
         }
-        // #5664 render-snapshot lane — gate at station entry (cheap probes
-        // only). Every red condition keeps the pre-#5664 path byte-for-byte;
-        // a green verdict only swaps the processTurn slot below to a bounded
-        // window pass; the egress splice + byte verification happen at the
-        // capture site. Rollout: watermarkV6Render (default OFF, nested in
-        // the watermarkV6MsgId cohort bucket).
-        const renderSid = v6Evaluated?.extraHeaders?.[PF_SESSION_HEADER] ?? null;
-        const renderGeom = renderSid !== null ? watermarkV6DebugState(sessionId).worlds[renderSid] : undefined;
-        if (wpHit !== undefined && renderSid !== null && renderGeom !== undefined && featureEnabled("watermarkV6Render")) {
-            renderCapturedSid = renderSid;
-            const rcaps: RenderCaps = {
-                v: 1,
-                strategy: renderStrategy,
-                droppable: loopConfig.compressAtFoldPointClearThinking === true,
-                multimodal: wpHit.seedMultimodal === true || wpHit.windowCores.some((m) => Array.isArray((m as { content?: unknown }).content)),
-            };
-            renderCapturedCaps = rcaps;
-            // PRE-TURN structural snapshots (fold layer state BEFORE this
-            // request's own kernel pass) — the diff with the post-pass state
-            // is turn-level evidence that compression moved under us.
-            renderPreBlocksSig = activeBlocksSignature(session.state.blocks);
-            renderFoldUsagePre = session.stats.pendingFoldUsage === true;
-            const renderGate: RenderGateDecision = renderPlaneGate({
-                sessionId,
-                session,
-                store: getStore(),
-                engagedHit: true,
-                armedTurn: v6Evaluated?.armed !== undefined,
-                isTitleGen,
-                sid: renderSid,
-                maxPos: renderGeom.maxPos,
-                tokenCount,
-                modelContextLimit: config.modelContextLimit,
-                caps: rcaps,
-                blocksSig: renderPreBlocksSig,
-                snapshotLaneActive: judgeBaseline !== undefined,
-                absorbActive,
-                ccrOn: pluginMode && ccrEnabled(session),
-                foldUsagePending: session.stats.pendingFoldUsage === true,
-                markerNonZero: markerArtifactCount(markerCounts) > 0,
-                log,
-            });
-            if (renderGate.ok) {
-                bumpAuditTick(renderSid);
-                renderFast = { rw: renderGate.rw, F: renderGate.F, maxPos: renderGeom.maxPos, sid: renderSid };
-            } else {
-                log("debug", `[${sessionId}] #5664 render lane off (${renderGate.reason}) — baseline full path`);
-                if (renderGate.reason === "lane-dead") renderLaneDead = true;
-                renderGateReason = renderGate.reason;
-            }
-        }
         // #2432: dsh desktop's native compaction can LAND without ever
         // transiting bili — its summarizer calls ctx.llm.stream() directly,
         // and manual /compact / idle-session paths have no ALS attribution so
@@ -318,6 +214,7 @@ export async function prepareOpenai(
         // lane does (#2373 commit note). Either signal alone stays on the
         // existing paths: framing paste with intact history has no gap; a gap
         // without framing falls through to detectUnannouncedHistoryRewrite.
+        let dshRebased = false;
         if (!isTitleGen && laneDecisions.profile.compactsClientSide && session.state.blocks.some((b) => b.active)) {
             const coveredBeforeDshCompact = coveredRealHistoryIds(session.state.blocks);
             const dshGap = foldCoverage(coveredBeforeDshCompact, msgs.map((m) => m.id));
@@ -375,12 +272,7 @@ export async function prepareOpenai(
         // #3301: stored decompositions for pre-#2644 anchors whose wire-side
         // backfill can never fire after a wire-shape flip.
         const foldMode = resolveFoldReconcileMode(process.env, opts.compress.reconcile);
-        // #5664: the render lane skips the stored-row walk itself — its fold
-        // coverage rides the audit/full path; the one consumer below is gated
-        // on the same non-null.
-        const reconcileOutcome: FoldReconcileResult | null = renderFast === null
-            ? reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStripped: markerArtifactCount(markerCounts), inboundMessageCount, storedMessages: foldMode === "off" ? undefined : storedMessagesFor(session, sessionId, msgs), storedRowLookup: foldMode === "off" ? undefined : storedRowLookupFor(sessionId) })
-            : null;
+        const reconcileOutcome = reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStripped: markerArtifactCount(markerCounts), inboundMessageCount, storedMessages: foldMode === "off" ? undefined : storedMessagesFor(session, sessionId, msgs), storedRowLookup: foldMode === "off" ? undefined : storedRowLookupFor(sessionId) });
         if (!isTitleGen) noteSystemPromptFingerprint(session, systemText, { sessionId, log });
         // #1195: pre-turn snapshot of the fold's covered ids — syncBlocks inside
         // processTurn may deactivate fully-drifted blocks, erasing them.
@@ -397,54 +289,8 @@ export async function prepareOpenai(
         await yieldToEventLoop();
         // #5293: re-anchor the nudge growth reference after a user-aborted turn (no-op otherwise).
         absorbAbortedTurnGrowth(session, tokenCount);
-        // #5664: green-gated hit rounds run the BOUNDED kernel pass here —
-        // last F frozen cores (hydrated from the identity ledger by absolute
-        // pos) + this turn's new cores, over a SCRATCH state clone. Live-state
-        // sync defers to the next full pass (audit cadence ≤ PF_RENDER_AUDIT_EVERY
-        // bounds every deferred quantity); refs/rules minted inside the clone
-        // merge back below. ANY throw → legacy full pass this turn (P7: disk
-        // is truth, mirrors are caches).
-        const turn = (() => {
-            if (renderFast !== null && wpHit !== undefined) {
-                try {
-                    const posFrom = renderFast.maxPos - renderFast.F + 1;
-                    const winCoresJson = getStore().pfHydrateWindow(renderFast.sid, posFrom, renderFast.maxPos);
-                    const frozenCores: CoreMessage[] = [];
-                    for (let p = posFrom; p <= renderFast.maxPos; p++) {
-                        const rawJson = winCoresJson.get(p);
-                        if (rawJson === undefined) throw new Error(`window-core gap at pos ${p}`);
-                        // A ledger element may carry MULTIPLE cores (system/
-                        // content split) — flatten per fastpath-v6's own
-                        // loader semantics and re-stamp wireIndex from pos.
-                        const arr = JSON.parse(rawJson) as CoreMessage[];
-                        for (const c of arr) frozenCores.push(Object.assign(c, { wireIndex: p }));
-                    }
-                    const scratch = structuredClone(session.state);
-                    const t = core.processTurn({ messages: [...frozenCores, ...wpHit.windowCores], state: scratch, config: loopConfig, tokenCount, renderTags: renderStrategy, contentStore: contentStoreOf(session) });
-                    const liveRefs = session.state.messageRefs as unknown as { byRaw: Record<string, string>; byRef: Record<string, string> };
-                    const srcRefs = scratch.messageRefs as unknown as { byRaw: Record<string, string>; byRef: Record<string, string> };
-                    for (const [k, v] of Object.entries(srcRefs.byRaw)) if (!(k in liveRefs.byRaw)) liveRefs.byRaw[k] = v;
-                    for (const [k, v] of Object.entries(srcRefs.byRef)) if (!(k in liveRefs.byRef)) liveRefs.byRef[k] = v;
-                    for (const r of scratch.rules ?? []) if (!(session.state.rules ?? []).some((x) => x.id === r.id)) (session.state.rules ??= []).push(r);
-                    session.state.nextRuleId = Math.max(session.state.nextRuleId ?? 1, scratch.nextRuleId ?? 1);
-                    return t;
-                } catch (err) {
-                    // Identity-plane faults are deterministic 400s — a
-                    // retry-pass over them would turn fail-fast into
-                    // retry-pass (review P2-6); everything else falls back.
-                    if (err instanceof FastpathV6IdentityFault) throw err;
-                    log("warn", `[${sessionId}] #5664 render window pass failed (${String(err)}) — legacy full pass this turn`);
-                    renderFast = null;
-                }
-            }
-            return core.processTurn({ messages: renderMsgs, state: session.state, config: loopConfig, tokenCount, renderTags: renderStrategy, contentStore: contentStoreOf(session) });
-        })();
-        if (renderFast === null) {
-            session.state = turn.state;
-        }
-        // Content-store adoption is cheap (no-op without new entries) and must
-        // NOT defer to the next full pass: CCR refs minted on a fast round are
-        // already referenced by the outbound placeholder (review P2-4).
+        const turn = core.processTurn({ messages: renderMsgs, state: session.state, config: loopConfig, tokenCount, renderTags: renderStrategy, contentStore: contentStoreOf(session) });
+        session.state = turn.state;
         adoptContentStore(session, turn.contentStore);
         // #4528: split the kernel pass from its post-processing scan passes so
         // each is a bounded synchronous stretch rather than one long block.
@@ -523,7 +369,7 @@ export async function prepareOpenai(
         // recorded as "native-compaction" and rebased — a second
         // "unannounced-rewrite" entry beside it would present the substrate
         // destruction as "another compressor fighting you".
-        if (reconcileOutcome !== null && !dshRebased && !codexRebased) {
+        if (!dshRebased && !codexRebased) {
             const rewrite = detectUnannouncedHistoryRewrite(session, knownRefsBefore, msgs.map((m) => m.id), reconcileOutcome);
             if (rewrite.churnExplained) {
                 // #4131: cross-build id re-mint (#3642) — fold-reconcile found every
@@ -542,13 +388,8 @@ export async function prepareOpenai(
                 markCompactionBoundary(session);
             }
         }
-        // #5664: archive/orphan sweeps ride the full path — the render lane
-        // defers them to the audit/full pass (the conjunction gate guarantees
-        // nothing depends on their having run this round).
-        if (renderFast === null) {
-            applyCompactionArchive(session, activeBefore, new Set(msgs.map((m) => m.id)), log);
-            reapOrphansLogged(session, msgs, log, sessionId);
-        }
+        applyCompactionArchive(session, activeBefore, new Set(msgs.map((m) => m.id)), log);
+        reapOrphansLogged(session, msgs, log, sessionId);
         // [#1271/#1343] plugin mode: acp_retrieve already acked via the tool API; snapshot
         // the queued full text onto THIS forward (stays in the queue until commit/drop, so an
         // upstream failure drops-and-logs it instead of vanishing it).
@@ -560,70 +401,12 @@ export async function prepareOpenai(
         }
         // #3400: egress image rescale — outbound copies only; the originals
         // stay in session state/persistence untouched.
+        const egressMessages = await applyImageRescalePass(processedMessages as BiliMessage[], { session, sessionId, log, maxDim: imageRescaleMaxDim(), toolArmed: imageRescaleToolArmed(session) });
         // #4166: re-voice ONLY bili's own summary carriers (isRenderedSummaryMessage).
         // Client-origin mid system/developer messages (DSH tool_addition and
         // friends) are conversation data — they re-emit verbatim through the
         // kernel's rawOpenaiMessage sidecar and must never change voice (#4159).
-        const summaryVoiceFn = (m: BiliMessage): boolean => isRenderedSummaryMessage(m);
-        const mapEgress = async (pms: CoreMessage[]): Promise<OpenAIMessage[]> =>
-            hardenOpenaiAssistantContent(coreToOpenai(systemToUser(await applyImageRescalePass(pms as BiliMessage[], { session, sessionId, log, maxDim: imageRescaleMaxDim(), toolArmed: imageRescaleToolArmed(session) }), summaryVoiceFn)));
-        if (renderFast !== null) {
-            // Station 3 (#5643 ruling §5, owner 2026-11-05 — canonical flow):
-            // stored rows are the POST-REWRITE GENERIC CORE FORM, so the
-            // tripwire compares this round's rewritten window cores against
-            // the stored suffix AT THAT BOUNDARY (never mapped wire bytes).
-            // On match the full core sequence (cached prefix ++ window
-            // output) passes through the mapping chain FRESH this turn —
-            // rescale/harden/coreToOpenai/voice/serialize all run with THIS
-            // turn's model/maxDim/toolArmed inputs; nothing mapped is cached.
-            // On mismatch redo the legacy full pass THIS turn; there is no
-            // row repair (no-recast ruling) — if stored rows and truth
-            // genuinely diverge, the next full-path capture kills this sid's
-            // plane permanently instead of recasting.
-            const rw = renderFast.rw;
-            const winCores = processedMessages;
-            if (verifyRenderWindow(winCores.slice(0, renderFast.F).map((m) => JSON.stringify(m)), rw, renderFast.F)) {
-                const fullCores = spliceOutboundRows<CoreMessage>(rw, renderFast.F, winCores);
-                rebuiltMessages = await mapEgress(fullCores);
-                // Image reserve DELTA covers only this turn's NEW elements —
-                // the F frozen-window rows' reserve already sits in rw.imgCum;
-                // counting them again drifts the ledger by a whole window each
-                // green round (review P1-2). The full sequence is
-                // [prefix n-F][frozen F][kNew], so the kNew fresh tails start
-                // at index n = rw.rows.length — slice(len) is exactly them.
-                // Billing metadata: computed on the fresh map.
-                renderedImageDelta = imageReserveFor(session, "openai", { model: parsed.model, messages: rebuiltMessages.slice(rw.rows.length) } as unknown as OpenAIRequestBody, opts, billingUpstream ?? upstreamOrigin);
-                renderedCaptureStrings = winCores.slice(renderFast.F).map((m) => JSON.stringify(m));
-                renderedTailObjects = [...winCores];
-                log("debug", `[${sessionId}] #5664 render snapshot FAST emit (prefix=${rw.rows.length - renderFast.F} cached core rows, tail=${winCores.length - renderFast.F} new cores, outbound=${rebuiltMessages.length} re-mapped this turn)`);
-            } else {
-                log("warn", `[${sessionId}] #5664 render snapshot core-form mismatch vs stored rows — legacy full pass this turn (no row repair exists: the next full-path capture kills the plane instead of recasting)`);
-                renderFast = null;
-                const turnFull = core.processTurn({ messages: renderMsgs, state: session.state, config: loopConfig, tokenCount, renderTags: renderStrategy, contentStore: contentStoreOf(session) });
-                session.state = turnFull.state;
-                adoptContentStore(session, turnFull.contentStore);
-                const pmFull = applyReasoningDrop(stripKernelSummaries(turnFull.messages, turnFull.state), planReasoningDrop(renderMsgs, reasoning, isStrictReasoningEcho(session, upstreamOrigin, modelIdOf(parsed))), log, sessionId);
-                processedMessages = pmFull;
-                rebuiltMessages = await mapEgress(pmFull);
-                renderedCaptureStrings = pmFull.map((m) => JSON.stringify(m));
-                renderedTailObjects = [];
-                renderedImageDelta = 0;
-            }
-        } else {
-            rebuiltMessages = await mapEgress(processedMessages);
-            // Capture strings exist ONLY for turns whose render plane can
-            // actually commit them: the gate block ran (renderCapturedSid
-            // set ⇒ v6 engaged hit + watermarkV6Render on) AND the lane is
-            // not durably dead. Building them for anything else would tax
-            // EVERY openai-wire turn (feature OFF included) with an O(n)
-            // full-view stringify that station 2 skips anyway — exactly the
-            // cost class this plane exists to remove. Rows store the
-            // post-rewrite core form (#5643 §5), so capture from cores,
-            // never wire bytes.
-            if (renderCapturedSid !== null && !renderLaneDead) renderedCaptureStrings = processedMessages.map((m) => JSON.stringify(m));
-            renderedTailObjects = [];
-            renderedImageDelta = 0;
-        }
+        rebuiltMessages = hardenOpenaiAssistantContent(coreToOpenai(systemToUser(egressMessages, (m) => isRenderedSummaryMessage(m))));
 
         // ONLY the static compress prompt goes into the system message — the
         // system prompt is the prefix-cache anchor and must be byte-stable
@@ -751,15 +534,7 @@ export async function prepareOpenai(
     rebuiltMessages = normalizeStrictEchoReasoning(rebuiltMessages, isStrictReasoningEcho(session, upstreamOrigin, modelIdOf(parsed)), log, sessionId);
     const rebuilt: OpenAIRequestBody = { ...parsed, messages: rebuiltMessages, tools: toolsOut as OpenAITool[] | undefined };
     warnReasoningPairs(rebuiltMessages, log, sessionId);
-    // #5664 review (round 2): the rw.*Cum cumulants already cover the last F
-    // frozen rows, which the per-turn estimate terms re-price from
-    // processedMessages — feed only the NEW tail past F into those terms (and
-    // subtract the frozen window from the clamp base), or every green round
-    // double-counts a whole window.
-    const rf = renderFast;
-    const rfTail = rf !== null ? processedMessages.slice(Math.min(rf.F, processedMessages.length)) : processedMessages;
-    const rfFrozenEst = rf !== null ? estimateCoreMessages(rf.rw.rowsParsed.slice(Math.max(0, rf.rw.rows.length - rf.F)) as CoreMessage[]) : 0;
-    clampOutgoingOutput(rebuilt as Record<string, unknown>, typeof (parsed as Record<string, unknown>).max_completion_tokens === "number" ? "max_completion_tokens" : "max_tokens", { systemText: openaiSystemText, tools: toolsOut, processedMessages, inputEstBaseTokens: rf !== null ? Math.max(0, rf.rw.textCum - rfFrozenEst) : undefined, lastInputTokens: session.stats.lastInputTokens, lastInputTokensSource: session.stats.lastInputTokensSource, nativeWindow, headroomWindow: config.modelContextLimit, imageTokens: renderFast !== null ? renderFast.rw.imgCum + renderedImageDelta : imageReserveFor(session, "openai", rebuilt, opts, billingUpstream ?? upstreamOrigin), kFactor: currentCalibrationFactor(session.stats, session.metadata?.lastModel), kOrigin: session.stats.calibratedEstimateOrigin, origin: billingUpstream ?? upstreamOrigin, ledgerFloorTokens: dshLedgerFloorTokens(session.metadata), knownOutputCeiling: resolveKnownOutputCeiling(req.headers, parsed as Record<string, unknown>, opts.routes, billingUpstream ?? upstreamOrigin, opts.sessionHeader, modelIdOf(parsed)) }, sessionId, log, (c) => { session.stats.lastOutputClamp = { ...c, at: Date.now() }; });
+    clampOutgoingOutput(rebuilt as Record<string, unknown>, typeof (parsed as Record<string, unknown>).max_completion_tokens === "number" ? "max_completion_tokens" : "max_tokens", { systemText: openaiSystemText, tools: toolsOut, processedMessages, lastInputTokens: session.stats.lastInputTokens, lastInputTokensSource: session.stats.lastInputTokensSource, nativeWindow, headroomWindow: config.modelContextLimit, imageTokens: imageReserveFor(session, "openai", rebuilt, opts, billingUpstream ?? upstreamOrigin), kFactor: currentCalibrationFactor(session.stats, session.metadata?.lastModel), kOrigin: session.stats.calibratedEstimateOrigin, origin: billingUpstream ?? upstreamOrigin, ledgerFloorTokens: dshLedgerFloorTokens(session.metadata), knownOutputCeiling: resolveKnownOutputCeiling(req.headers, parsed as Record<string, unknown>, opts.routes, billingUpstream ?? upstreamOrigin, opts.sessionHeader, modelIdOf(parsed)) }, sessionId, log, (c) => { session.stats.lastOutputClamp = { ...c, at: Date.now() }; });
     // prompt_cache_retention is an OpenAI-host-only cache directive; the dsh
     // launcher forces PI_CACHE_RETENTION=long (for the session-id
     // prompt_cache_key) which makes the client also emit it. Third-party
@@ -805,16 +580,13 @@ export async function prepareOpenai(
     // tiny payload would clobber the conversation's measurement.
     if (!isTitleGen) {
         // One tree walk shared by both calibers (see the anthropic lane).
-        // #5664: render-lane rounds bound every walk to the new tail — the
-        // frozen prefix basis rides the persistent per-plane cumulants (cast
-        // absolute, appended per round, rebaselined end-to-end each audit).
-        const imageReserve = rf !== null ? rf.rw.imgCum + renderedImageDelta : imageReserveFor(session, "openai", rebuilt, opts, billingUpstream ?? upstreamOrigin);
-        session.stats.localInputEstimate = (rf !== null ? rf.rw.estCum + estimateCoreMessagesUpper(rfTail) : estimateCoreMessagesUpper(processedMessages.length > 0 ? processedMessages : originalMessages))
+        const imageReserve = imageReserveFor(session, "openai", rebuilt, opts, billingUpstream ?? upstreamOrigin);
+        session.stats.localInputEstimate = estimateCoreMessagesUpper(processedMessages.length > 0 ? processedMessages : originalMessages)
             + countSystemAndToolsTokens(openaiOutboundSystem || openaiSystemText, toolsOut)
             + imageReserve;
         // #1933 F1: billed-caliber twin (chars/4) for the k̂ learning pair —
         // see the anthropic-lane counterpart above.
-        session.stats.lastLocalTextEstimate = (rf !== null ? rf.rw.textCum + estimateCoreMessages(rfTail) : estimateCoreMessages(processedMessages.length > 0 ? processedMessages : originalMessages))
+        session.stats.lastLocalTextEstimate = estimateCoreMessages(processedMessages.length > 0 ? processedMessages : originalMessages)
             + countSystemAndToolsTokens(openaiOutboundSystem || openaiSystemText, toolsOut)
             + imageReserve;
         const openaiPairOrigin = billingUpstream ?? upstreamOrigin;
@@ -830,14 +602,7 @@ export async function prepareOpenai(
     snapshotMessages(session, wpHit !== undefined ? wpHit.windowCores : originalMessages);
     markDirty(session);
     let wpResponseHeaders: Record<string, string> | undefined;
-    if (v6Evaluated !== null && wpTurnStrip !== undefined) {
-        wpResponseHeaders = finalizeWatermarkV6(session, v6Evaluated, {
-            bodyText: wpFullText,
-            armSystemText: wpSeedSystemText,
-            armStripCounts: wpTurnStrip,
-        }, log);
-        if (Object.keys(wpResponseHeaders).length === 0) wpResponseHeaders = undefined;
-    } else if (wpFullText !== undefined && wpOutcome !== null && wpTurnStrip !== undefined) {
+    if (wpFullText !== undefined && wpOutcome !== null && wpTurnStrip !== undefined) {
         wpResponseHeaders = finalizeWatermarkTurn(session, wpOutcome, {
             model: wpModel,
             legacyCores: originalMessages,
@@ -845,69 +610,6 @@ export async function prepareOpenai(
             turnStripCounts: wpTurnStrip,
         });
         if (Object.keys(wpResponseHeaders).length === 0) wpResponseHeaders = undefined;
-    }
-    // #5664 station 2 — ONE snapshot commit per engaged turn: steady append
-    // (fast rounds), arm cast / audit diff / evidence-addressed APPLY
-    // (#5643 附录二：the table evolves by single-tx row events — covered cells
-    // upserted, prefix bytes + checksums untouched) / witnessed REBASE as
-    // COARSE tier for count-changing layout events / UNWITNESSED divergence-
-    // KILL (full-path rounds carry the complete captured array; #5643 补充
-    // 裁定：快照必须随压缩演进). Fail-soft for this turn only — the identity
-    // plane already committed independently.
-    if (renderedCaptureStrings !== null && renderCapturedSid !== null && renderCapturedCaps !== null && featureEnabled("watermarkV6Render")) {
-        const store = getStore();
-        if (store.pfRenderAvailable()) {
-            // steady-mode contract (CaptureSums "DELTAS for the tail"): rows
-            // AND sums cover ONLY this turn's new elements. The frozen window
-            // rows entered the ledger when they were first captured —
-            // re-appending them shifts every pos forward, doubles the table,
-            // and inflates estCum/textCum/imgCum by a whole window per green
-            // round (review P1-2 + tail-only rows fix). The slice past F is
-            // exactly the appended tail (committedTail was capped at F+kNew).
-            const steadyTailRows = renderFast !== null ? renderedTailObjects.slice(renderFast.F).map((m) => JSON.stringify(m)) : renderedCaptureStrings;
-            const sumsSrc = renderFast !== null ? processedMessages.slice(Math.min(renderFast.F, processedMessages.length)) : processedMessages;
-            // #5643 补充裁定 witness assembly — server-side evidence ONLY:
-            // ① the fold layer's block multiset moved around this turn's own
-            //    kernel pass (proxy-mode compress, kernel-side rebase…); ② the
-            //    dsh native-compaction detector fired (its folds bypass bili
-            //    entirely, #2432 — its reconcile DEACTIVATES blocks, which can
-            //    leave the signature byte-equal, hence the explicit term);
-            // ③ fold usage was pending pre-turn and got consumed by it;
-            // ④ the gate itself had observed the signature move pre-turn
-            //    ("blocks-changed" red sent this request down the full path);
-            // ⑤ the first-scene journal is pending materialization
-            //    ("structural-pending" red forced this full pass — its very
-            //    existence is the evidence).
-            // Absent ALL of them, a diverged capture stays a kill verdict.
-            const renderPostBlocksSig = activeBlocksSignature(session.state.blocks);
-            const renderWitness =
-                dshRebased ||
-                renderPostBlocksSig !== renderPreBlocksSig ||
-                (renderFoldUsagePre && session.stats.pendingFoldUsage !== true) ||
-                renderGateReason === "blocks-changed" ||
-                renderGateReason === "structural-pending";
-            const capOp = commitRenderCapture({
-                sessionId,
-                store,
-                sid: renderCapturedSid,
-                mode: renderFast !== null ? "steady" : "legacy",
-                caps: renderCapturedCaps,
-                rowStrings: steadyTailRows,
-                witness: renderWitness,
-                blocksSig: renderPostBlocksSig,
-                // #5643 附录二：kernel-evidence coverage for the fine-grained
-                // apply tier (legacy turns only — steady never classifies;
-                // empty-block sessions short-circuit before touching storage).
-                coveredPos: renderFast !== null ? undefined : boundCoveredPositions(store, renderCapturedSid, session.state.blocks),
-                sums: {
-                    estCum: estimateCoreMessagesUpper(sumsSrc),
-                    textCum: estimateCoreMessages(sumsSrc),
-                    imgCum: renderFast !== null ? renderedImageDelta : imageReserveFor(session, "openai", rebuilt, opts, billingUpstream ?? upstreamOrigin),
-                },
-                log,
-            });
-            if (capOp.committed) log("debug", `[${sessionId}] #5664 render snapshot capture ${capOp.op} (${renderedCaptureStrings.length} rows)`);
-        }
     }
     return { body: JSON.stringify(rebuilt), parsedBody: rebuilt, session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, judgeBaseline, protocol: "openai", stream, compressInjected: injectTools, pluginMode, mcpDialectNote: laneDecisions.mcpDialect, nudge, nudgeOutcome, prompts, surface, openaiSystemText, systemNotes: sysNotes, renderTags: renderStrategy, responseExtraHeaders: wpResponseHeaders, dropReasoning: (msgs: BiliMessage[]) => applyReasoningDrop(msgs, reasoningPlan, log, sessionId) } as Prepared;
 }

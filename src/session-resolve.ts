@@ -161,6 +161,47 @@ function maxAlignedFragRun(kindsA: string[], fragsA: string[], kindsB: string[],
  *  history is the SAME conversation with host-side edits, not a stranger. */
 const CONTINUATION_MIN_RUN = 8;
 
+// #5719 E5: the #3733 authored-checkpoint identity header, as FORGED by
+// src/server/dsh-authored-compaction.ts (BILI_SNAPSHOT_TAG_PREFIX). Pinned
+// locally instead of imported: this module must stay server-free (the wiring
+// direction is handle.ts → here), and the version-pin doctrine
+// (src/server/dsh-compaction-guard.ts header) wants detector constants local.
+// If the producer's bytes drift the scan degrades to a MISS — the pre-#5719
+// fork behavior — never to a false claim.
+const BILI_SNAPSHOT_CONV_RE = /\x3cbili-snapshot v1 [^\x3e]*\bconv="([^"]+)"/;
+
+/** #5719 E5: does the FIRST user message carry our own authored-checkpoint
+ *  identity header declaring exactly `rawId`? A full compaction erases every
+ *  continuation proof the tag-changed rungs demand by definition (recorded
+ *  tail gone, depth collapsed, zero assistant in the first post-compaction
+ *  step) — the self-declaration is the one survivor. Content-blind text
+ *  extraction over all four wire shapes (string content; parts/blocks arrays
+ *  with .text items — openai/anthropic/responses/google alike). Only the
+ *  first user message counts: a LATER quote of a checkpoint (the #4438
+ *  class) must never re-anchor someone else's lane. */
+function selfCheckpointDeclares(history: unknown, rawId: string): boolean {
+    if (!Array.isArray(history)) return false;
+    for (const m of history as unknown[]) {
+        if (m === null || typeof m !== "object") continue;
+        const msg = m as { role?: unknown; content?: unknown; parts?: unknown };
+        if (msg.role !== "user") continue;
+        const c = msg.content !== undefined ? msg.content : msg.parts;
+        let text = "";
+        if (typeof c === "string") {
+            text = c;
+        } else if (Array.isArray(c)) {
+            for (const p of c) {
+                if (p !== null && typeof p === "object" && typeof (p as { text?: unknown }).text === "string") {
+                    text += (p as { text: string }).text;
+                }
+            }
+        }
+        const hit = BILI_SNAPSHOT_CONV_RE.exec(text);
+        return hit !== null && hit[1] === rawId;
+    }
+    return false;
+}
+
 export type SessionOrderResolution = {
     key: string;
     action: "claim" | "continue" | "reanchor" | "derived-aux" | "derived-task" | "derived-persona";
@@ -220,7 +261,10 @@ function record(rawId: string, turns: NeutralTurn[], tagHash: string, model?: st
  *  kinds prefix-align AND head fragments match) migrates the raw key
  *  (#2241/#2250); a tag change whose recorded body still sits verbatim at
  *  its own indices inside the incoming (host-side rewrite of its own log —
- *  #4778) migrates too; only a tag change with NO positional continuation
+ *  #4778) migrates too; a tag change whose first user message carries our
+ *  own authored checkpoint declaring exactly the raw id migrates outright
+ *  (#5719 — full compaction erases every positional proof by definition,
+ *  the self-declaration is the survivor); only a tag change with NO such
  *  evidence forks onto `<rawId>|sub:<fp16(tag)>` — byte-identical to the
  *  old ladder's fork keys, so persisted fork lanes keep their sessions
  *  across the upgrade.
@@ -378,6 +422,18 @@ export function resolveSessionOrder(rawId: string, history: unknown, personaTag?
         // else is a different persona under the shared id (#150 fresh
         // task, #1916 auto-review): its own `|sub:<fp16(tag)>` lane,
         // stable across successive calls of the same persona.
+        if (selfCheckpointDeclares(history, rawId)) {
+            // #5719 E5 (first rung — strongest evidence, cheapest check): the
+            // incoming carries bili's OWN authored checkpoint (#3733) whose
+            // identity header declares this exact raw id. Full compaction
+            // erases every continuation proof the rungs below demand by
+            // definition, so no other evidence is demanded here — the marker
+            // IS the proof. record() moves the recorded tagHash to the new
+            // tag, so the next request is tag-unchanged and simply continues;
+            // the `|sub:` fork never happens and the parent lane unfreezes.
+            record(rawId, turns, tagHash, effectiveModel);
+            return { key: rawId, action: "reanchor", reason: "self-authored checkpoint declares this raw id — continuation across full-compaction rewrite (#5719)" };
+        }
         const headN = Math.min(kinds.length, recorded.kinds.length);
         const headAligns = headN > 0 && recorded.kinds.every((k, i) => kinds[i] === k);
         const headFragsEqual = headN > 0 && incomingFrags.slice(0, headN).every((f, i) => f === recorded.frags[i]);
