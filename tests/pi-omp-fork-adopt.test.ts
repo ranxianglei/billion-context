@@ -256,6 +256,68 @@ test("createForkAdopter retries transient failures until the cap, then closes (#
     assert.equal(calls.filter((c) => c.url.endsWith("/__bili/plugin/fork")).length, 3, "past the cap the window is closed");
 });
 
+test("tryForkAdoption classifies snapshot failures by the server's structured verdict (#3011)", async () => {
+    const input = adoptInput();
+    const run = (respond: () => Response | Promise<Response>) => tryForkAdoption({ base: input.base, parentConversationId: input.parent, childConversationId: input.child, body: input.body, fetchImpl: fakeFetchRouting([manifestRoute, { match: snapshotRoute.match, respond }]).fetchImpl });
+    const unavailable = (code: string, status = 409) => new Response(JSON.stringify({ ok: false, status: "unavailable", code, error: "raw snapshot unavailable; send a fresh plugin model request" }), { status });
+    // The incident: the proxy's own documented-retryable 409 was classified
+    // terminal by the old regex and gave up after one attempt.
+    const asDegraded = async (p: Promise<Awaited<ReturnType<typeof tryForkAdoption>>>) => { const r = await p; if (r.outcome !== "degraded") throw new Error(`expected degraded, got ${JSON.stringify(r)}`); return r; };
+    assert.deepEqual(await run(() => unavailable("SNAPSHOT_UNAVAILABLE")), { outcome: "degraded", reason: "snapshot http 409 SNAPSHOT_UNAVAILABLE (raw snapshot unavailable; send a fresh plugin model request)", retryable: true });
+    assert.equal((await asDegraded(run(() => unavailable("PARENT_NOT_FOUND", 404)))).retryable, false, "an unknown parent cannot appear mid-process");
+    assert.equal((await asDegraded(run(() => unavailable("BRANCH_POINT_CONFLICT")))).retryable, false, "other 409 codes are deterministic verdicts");
+    const s503 = await asDegraded(run(() => new Response("upstream melted", { status: 503 })));
+    assert.equal(s503.retryable, true, "5xx stays retryable");
+    const boom = await asDegraded(run(async () => { throw new Error("network exploded"); }));
+    assert.equal(boom.retryable, true, "network errors stay retryable");
+});
+
+test("tryForkAdoption classifies fork POST failures by status class (#3011)", async () => {
+    const input = adoptInput();
+    const core = openaiBodyToCore(input.body as Record<string, unknown>)!;
+    const matchSnapshot = { match: snapshotRoute.match, respond: () => Response.json({ ok: true, protocolVersion: 1, status: "exact", parentRevision: hash("rev1"), orderHash: hash("full"), orderedMessages: [{ rawId: "a", ref: "m00001", identityHash: forkIdentityHashOf(core[0]!) }] }) };
+    const run = (respond: () => Response) => tryForkAdoption({ base: input.base, parentConversationId: input.parent, childConversationId: input.child, body: input.body, fetchImpl: fakeFetchRouting([manifestRoute, matchSnapshot, { match: (c: Recorded) => c.url.endsWith("/__bili/plugin/fork"), respond }]).fetchImpl });
+    const conflict = await run(() => new Response(JSON.stringify({ ok: false, code: "CHILD_CONFLICT", error: "child conversation already registered" }), { status: 409 }));
+    if (conflict.outcome !== "degraded") throw new Error(`expected degraded, got ${JSON.stringify(conflict)}`);
+    assert.equal(conflict.retryable, false, "CHILD_CONFLICT latches — this child keeps its id, so the verdict cannot change");
+    assert.match(conflict.reason, /fork http 409 CHILD_CONFLICT/);
+    const fork503 = await run(() => new Response("boom", { status: 503 }));
+    if (fork503.outcome !== "degraded") throw new Error(`expected degraded, got ${JSON.stringify(fork503)}`);
+    assert.equal(fork503.retryable, true, "fork 5xx stays retryable");
+});
+
+test("createForkAdopter retries 409 SNAPSHOT_UNAVAILABLE until the parent recovers (#3011)", async () => {
+    resetForkCapabilityCacheForTest();
+    const core = openaiBodyToCore(adoptInput().body as Record<string, unknown>)!;
+    const recovered = { match: snapshotRoute.match, respond: () => Response.json({ ok: true, protocolVersion: 1, status: "exact", parentRevision: hash("rev1"), orderHash: hash("full"), orderedMessages: [{ rawId: "a", ref: "m00001", identityHash: forkIdentityHashOf(core[0]!) }] }) };
+    let snapshots = 0;
+    const flaky = { match: snapshotRoute.match, respond: () => { snapshots += 1; return snapshots <= 2 ? new Response(JSON.stringify({ ok: false, status: "unavailable", code: "SNAPSHOT_UNAVAILABLE", error: "raw snapshot unavailable; send a fresh plugin model request" }), { status: 409 }) : recovered.respond(); } };
+    const { fetchImpl, calls } = fakeFetchRouting([manifestRoute, flaky, forkRoute]);
+    const lines: string[] = [];
+    const adopter = createForkAdopter((l) => lines.push(l), { fetchImpl });
+    await adopter.maybeAdopt(adoptInput());
+    await adopter.maybeAdopt(adoptInput());
+    assert.equal(lines.filter((l) => l.includes("transient, will retry")).length, 2, "each residency-gap 409 leaves the window open");
+    await adopter.maybeAdopt(adoptInput());
+    assert.equal(calls.filter((c) => c.url.endsWith("/__bili/plugin/fork")).length, 1, "the recovered parent adopts on the third request");
+    assert.ok(!lines.some((l) => l.includes("permanently disabled")));
+});
+
+test("createForkAdopter closes permanently after the cap and says so explicitly (#3011)", async () => {
+    resetForkCapabilityCacheForTest();
+    const unavailable = () => new Response(JSON.stringify({ ok: false, status: "unavailable", code: "SNAPSHOT_UNAVAILABLE", error: "raw snapshot unavailable; send a fresh plugin model request" }), { status: 409 });
+    const { fetchImpl, calls } = fakeFetchRouting([manifestRoute, { match: snapshotRoute.match, respond: unavailable }, forkRoute]);
+    const lines: string[] = [];
+    const adopter = createForkAdopter((l) => lines.push(l), { fetchImpl });
+    for (let i = 0; i < 4; i += 1) await adopter.maybeAdopt(adoptInput());
+    assert.equal(calls.filter((c) => c.url.includes("snapshot")).length, 3, "maxAttempts=3 bounds the retries");
+    assert.equal(calls.filter((c) => c.url.endsWith("/__bili/plugin/fork")).length, 0);
+    assert.ok(lines.some((l) => l.includes("permanently disabled")), "the give-up is explicit, not silent");
+    const after = lines.length;
+    await adopter.maybeAdopt(adoptInput());
+    assert.equal(lines.length, after, "no further attempts or log lines after the latch");
+});
+
 test("createForkAdopter skips side-shaped bodies without consuming the attempt budget (#2399 gate ④)", async () => {
     resetForkCapabilityCacheForTest();
     const core = openaiBodyToCore(adoptInput().body as Record<string, unknown>)!;
@@ -569,7 +631,7 @@ test("pi lane: an exploding getBranch fails toward capability and still adopts (
 test("tryForkAdoption rejects a responses child whose prefix matches nothing (#2469 stage 2)", { timeout: 60_000 }, async () => {
     const { fetchImpl, calls } = fakeFetchRouting([snapshotRoute]);
     const result = await tryForkAdoption({ base: "http://px", parentConversationId: "p1", childConversationId: "c1", body: { model: "gpt", input: [{ type: "message", role: "user", content: "completely unrelated" }] }, fetchImpl });
-    assert.deepEqual(result, { outcome: "degraded", reason: "no prefix match" });
+    assert.deepEqual(result, { outcome: "degraded", reason: "no prefix match", retryable: false });
     assert.equal(calls.filter((c) => c.url.endsWith("/__bili/plugin/fork")).length, 0, "no fork receipt is posted for a mismatch");
 });
 
@@ -649,14 +711,14 @@ test("fork endpoint: identity-registered child yields only for the same parent (
             { role: "system", content: "system prompt" },
             { role: "user", content: "first original ".repeat(250) },
         ] } });
-        assert.deepEqual(conflicted, { outcome: "degraded", reason: "fork http 409 CHILD_CONFLICT" }, "different-parent claim stays a conflict");
+        assert.deepEqual(conflicted, { outcome: "degraded", reason: "fork http 409 CHILD_CONFLICT", retryable: false }, "different-parent claim stays a conflict");
 
         assert.equal((await register("child-bare")).status, 200);
         const bare = await tryForkAdoption({ base: h.origin, parentConversationId: "parent-sid", childConversationId: "child-bare", body: { model: "claude-test", max_tokens: 1024, stream: false, messages: [
             { role: "system", content: "system prompt" },
             { role: "user", content: "first original ".repeat(250) },
         ] } });
-        assert.deepEqual(bare, { outcome: "degraded", reason: "fork http 409 CHILD_CONFLICT" }, "parentless claim stays a conflict");
+        assert.deepEqual(bare, { outcome: "degraded", reason: "fork http 409 CHILD_CONFLICT", retryable: false }, "parentless claim stays a conflict");
     } finally {
         await h.close();
     }
