@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { CompressionBlock } from "acp-kernel";
+import { baseIdOf, summaryMessageId, type CompressionBlock } from "acp-kernel";
 import { statusInputBaseline, type Session } from "./session.js";
 import { codexCompactMode as knobCodexCompactMode } from "./knobs.js";
 
@@ -321,19 +321,135 @@ export function renderForgedSummary(block: Pick<CompressionBlock, "summary" | "t
     return body.length === 0 ? topicLine : `${topicLine}\n${body}`;
 }
 
+// #4600: one handoff-ledger entry. `blockId` carries provenance so superseded
+// entries can be pruned; legacy persisted states hold plain strings (entries
+// without provenance) that stay conservative forever.
+interface ForgedSummaryEntry {
+    text: string;
+    blockId?: string;
+}
+
+// Accepts every shape the ledger has ever persisted (undefined, legacy
+// string[], object entries, mixed garbage) into normalized entries, keeping
+// the append-only exact-text dedup invariant.
+export function normalizeForgedEntries(raw: unknown): ForgedSummaryEntry[] {
+    if (!Array.isArray(raw)) return [];
+    const out: ForgedSummaryEntry[] = [];
+    const seen = new Set<string>();
+    for (const item of raw) {
+        let text: string | undefined;
+        let blockId: string | undefined;
+        if (typeof item === "string") {
+            text = item;
+        } else if (item !== null && typeof item === "object") {
+            const rec = item as { text?: unknown; blockId?: unknown };
+            if (typeof rec.text === "string") {
+                text = rec.text;
+                if (typeof rec.blockId === "string" && rec.blockId.length > 0) blockId = rec.blockId;
+            }
+        }
+        if (text === undefined || seen.has(text)) continue;
+        seen.add(text);
+        out.push(blockId !== undefined ? { text, blockId } : { text });
+    }
+    return out;
+}
+
 // The forged compaction item is opaque to the model and codex truncates its
 // history to [compaction_item, tail…], so the kernel deactivates the blocks
 // covering the truncated prefix on the next replay and their summaries would
 // vanish from the model's view. Capture them (kernel render format) at forge
-// time; the server re-injects them into the developer message every turn
-// (endpoint-form semantics). Append-only + exact-text dedup: a second forge
-// accumulates, re-capture of deactivated blocks adds nothing.
-export function mergeForgedSummaries(existing: string[] | undefined, blocks: readonly CompressionBlock[]): string[] {
-    const merged = existing ? [...existing] : [];
+// time; the server re-injects them into the developer message whenever the
+// echo is absent (#1064). Exact-text dedup: re-capture of an already-listed
+// block adds nothing; each NEW active block appends one entry per forge.
+export function mergeForgedSummaries(existing: unknown, blocks: readonly CompressionBlock[]): ForgedSummaryEntry[] {
+    const merged = normalizeForgedEntries(existing);
+    const byText = new Set(merged.map((e) => e.text));
     for (const block of blocks) {
         if (!block.active) continue;
         const rendered = renderForgedSummary(block);
-        if (!merged.includes(rendered)) merged.push(rendered);
+        if (byText.has(rendered)) continue;
+        byText.add(rendered);
+        merged.push({ text: rendered, blockId: block.blockId });
     }
     return merged;
 }
+
+// #4600: drop ledger entries that are provably redundant. An entry is
+// redundant once a newer-generation block folded the message carrying its
+// summary (summaryMessageId ∈ consumer.effectiveMessageIds) AND that consumer
+// is itself represented — still active (its summary renders live in the
+// conversation) or holding its own ledger entry. Entries whose block was
+// merely deactivated by the post-forge truncation have no consumer: they are
+// the load-bearing fallback debt and stay. Unknown-provenance entries (legacy
+// strings), blocks absent from state, and still-active blocks are kept —
+// pruning is strictly shrinking and never speculative. Returns the same array
+// reference when nothing changed.
+export function pruneForgedEntries(entries: ForgedSummaryEntry[], blocks: readonly CompressionBlock[]): ForgedSummaryEntry[] {
+    if (entries.length === 0) return entries;
+    const byBlockId = new Map(blocks.map((b) => [b.blockId, b]));
+    const represented = new Set(entries.filter((e) => e.blockId !== undefined).map((e) => e.blockId as string));
+    // Only summary ids the ledger actually references need coverage lookups.
+    const consumers = new Map<string, CompressionBlock[]>();
+    for (const e of entries) {
+        if (e.blockId === undefined) continue;
+        const self = byBlockId.get(e.blockId);
+        if (!self || self.active) continue;
+        consumers.set(summaryMessageId(e.blockId), []);
+    }
+    if (consumers.size > 0) {
+        for (const b of blocks) {
+            for (const id of b.effectiveMessageIds ?? []) {
+                const list = consumers.get(baseIdOf(id));
+                if (list) list.push(b);
+            }
+        }
+    }
+    let changed = false;
+    const kept: ForgedSummaryEntry[] = [];
+    for (const e of entries) {
+        if (e.blockId === undefined) { kept.push(e); continue; }
+        const self = byBlockId.get(e.blockId);
+        if (!self || self.active) { kept.push(e); continue; }
+        const superseded = (consumers.get(summaryMessageId(e.blockId)) ?? []).some((c) => c.active || represented.has(c.blockId));
+        if (superseded) { changed = true; continue; }
+        kept.push(e);
+    }
+    return changed ? kept : entries;
+}
+
+// #4600: evidence that a request replays an actual conversation (completed
+// turns) rather than context-only auxiliary traffic (prewarms, sidecars,
+// probes — the #4594 shape). The fallback re-injection exists to protect
+// replayed history from losing its pre-compaction handoff; a request that
+// replays no conversation has nothing to protect and must not pay the
+// accumulated-ledger tax — which used to fail such requests outright with a
+// 413 once the ledger grew past the window.
+const CONVERSATION_ITEM_TYPES = new Set([
+    "function_call",
+    "function_call_output",
+    "custom_tool_call",
+    "custom_tool_call_output",
+    "computer_call",
+    "mcp_call",
+    "reasoning",
+]);
+
+export function carriesConversationTurns(input: unknown): boolean {
+    if (!Array.isArray(input)) return false;
+    for (const item of input) {
+        if (!item || typeof item !== "object") continue;
+        const it = item as { type?: unknown; role?: unknown };
+        // Type-less assistant roles count too (OpenAI easy-input shorthand):
+        // a false positive only wastes tokens, a false negative loses the
+        // handoff — the predicate errs toward injecting.
+        if ((it.type === "message" || it.type === undefined) && it.role === "assistant") return true;
+        if (typeof it.type === "string" && CONVERSATION_ITEM_TYPES.has(it.type)) return true;
+    }
+    return false;
+}
+
+// #4600: observability threshold — warn when the fallback re-injection eats a
+// significant slice of the window (the field case hit ~1.2M tokens against a
+// 375K window before failing preflight). 10% keeps ordinary sessions quiet.
+export const FORGED_SUMMARY_INJECT_WARN_PCT = 0.1;
