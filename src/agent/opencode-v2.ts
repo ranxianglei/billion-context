@@ -52,6 +52,7 @@ import { randomUUID } from "node:crypto";
 import { ACP_TOOLS_OPENAI, ABSORB_TOOL_OPENAI } from "../compress-tool.js";
 import { asciiHeaderValue, fetchManifest, fetchProxyVersion, fetchStatus, fitNoticeDescription, forwardTool, postIdentityRegister, proxyBaseFromEnv, proxyBaseFromUrl, reportCompactionBoundary, reportRuntimeInfoOnChange, V2_SYNTHETIC_TEXT } from "./shared.js";
 import { createForkAdopter } from "./fork-adopt.js";
+import { harvestOpencodeMsgIds } from "./opencode-msgids.js";
 import { logHostEvent } from "./host-log.js";
 
 // OpenCode V2 TUI renders a synthetic message as a visible Notice row only when its display text fits the
@@ -413,6 +414,28 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
 
         const hookReg = await ctx.session?.hook?.("http.request", httpRequestHook);
         if (hookReg) registrations.push(hookReg);
+
+        // #4491 host wiring (V2 seam): harvest the host message ids from the
+        // "context" event — it fires immediately before EVERY provider request
+        // assembly carrying the full { id, role, content }[] conversation plus
+        // sessionID (verified live on 2.0.4, anthropic + openai-compatible
+        // providers alike). With a same-cycle harvest in place, the native
+        // planner can ride real host ids on incremental turns (#5743) instead
+        // of degrading to content-derived identities. Hosts without the seam
+        // keep today's id-less degradation — never fail startup over it.
+        try {
+            const ctxReg = await ctx.session?.hook?.("context", (ev) => {
+                try {
+                    const e = ev as unknown as { sessionID?: unknown; messages?: unknown };
+                    harvestOpencodeMsgIds(typeof e.sessionID === "string" ? e.sessionID : undefined, e.messages);
+                } catch {
+                    // harvest is best-effort only
+                }
+            });
+            if (ctxReg) registrations.push(ctxReg);
+        } catch {
+            // no "context" seam on this build → id-less turns (documented degrade)
+        }
 
         if (options.onResponse !== undefined) {
             const onResponse = options.onResponse;

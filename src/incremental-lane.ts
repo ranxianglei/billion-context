@@ -561,6 +561,38 @@ function hashWireBoundary(m: { role: string; content: unknown }): string {
     return createHash("sha256").update(`${m.role}\u0000${JSON.stringify(m.content)}`).digest("hex").slice(0, 16);
 }
 
+const CONTENT_ID = /^(h_[0-9a-f]{16})(?:_([1-9]\d*))?$/;
+
+/** Continue separately converted content-ID clusters without rewriting any
+ * payload. A sparse restored prefix must skip its highest retained ordinal. */
+export function continueContentClusters(
+    prefix: readonly BiliMessage[],
+    delta: { msgs: BiliMessage[]; cacheControls: Map<string, unknown> },
+): { msgs: BiliMessage[]; cacheControls: Map<string, unknown> } {
+    const offsets = new Map<string, number>();
+    for (const message of prefix) {
+        const hit = CONTENT_ID.exec(message.id);
+        if (!hit) continue;
+        const ordinal = Number(hit[2] ?? 0);
+        if (Number.isSafeInteger(ordinal + 1)) offsets.set(hit[1], Math.max(offsets.get(hit[1]) ?? 0, ordinal + 1));
+    }
+    if (offsets.size === 0) return delta;
+    const renamed = new Map<string, string>();
+    const msgs = delta.msgs.map((message) => {
+        const hit = CONTENT_ID.exec(message.id);
+        if (!hit) return message;
+        const offset = offsets.get(hit[1]) ?? 0;
+        if (offset === 0) return message;
+        const ordinal = offset + Number(hit[2] ?? 0);
+        if (!Number.isSafeInteger(ordinal)) throw new Error("Content identity cluster exceeds safe ordinal range");
+        const id = `${hit[1]}_${ordinal}`;
+        renamed.set(message.id, id);
+        return { ...message, id };
+    });
+    if (renamed.size === 0) return delta;
+    return { msgs, cacheControls: new Map([...delta.cacheControls].map(([id, mark]) => [renamed.get(id) ?? id, mark])) };
+}
+
 function applyTurn(
     entry: Canonical,
     sinceSeq: number,
@@ -615,7 +647,11 @@ function applyTurn(
             retouchMarks.push({ ids, marks, rawBlocks });
         }
     }
-    const flat = deltaWire.length === 0 ? { msgs: [], cacheControls: new Map<string, unknown>() } : anthropicToCore({ messages: deltaWire as never } as never);
+    const converted = deltaWire.length === 0 ? { msgs: [], cacheControls: new Map<string, unknown>() } : anthropicToCore({ messages: deltaWire as never } as never);
+    // A new conversion starts each duplicate cluster at zero. Continue the
+    // acknowledged prefix so a repeated prompt cannot reuse an earlier row's
+    // identity (and receive the new row's cache mark as a side effect).
+    const flat = resync ? converted : continueContentClusters(entry.msgs, converted);
     let deltaMsgs = flat.msgs;
     if (deltaIds !== undefined) {
         const v = validateMsgIds(deltaIds, flat.msgs.length);

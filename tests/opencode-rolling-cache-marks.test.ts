@@ -230,6 +230,45 @@ test("rolling cache_control: a retouch whose content differs from the canonical 
     }
 });
 
+test("rolling marks: repeated prompts retain distinct IDs and match full resend", async () => {
+    const history: Wire[] = [];
+    const requests: Wire[][] = [];
+    for (let i = 0; i < 6; i++) {
+        history.push({ role: "user", content: [{ type: "text", text: "continue" }] });
+        requests.push(decorate(history));
+        history.push({ role: "assistant", content: [{ type: "text", text: "ok" }] });
+    }
+    const base = await harness();
+    try { await runFullResend(base, requests); } finally { await base.close(); }
+    const inc = await harness();
+    try {
+        const { modes } = await runIncremental(inc, requests);
+        assert.deepEqual(modes, ["seed", ...requests.slice(1).map(() => "delta")]);
+        for (let i = 0; i < requests.length; i++) {
+            assert.equal(canonMessages(inc.forwarded[i].messages), canonMessages(base.forwarded[i].messages));
+            assert.equal(messageBreakpoints(inc.forwarded[i]), messageBreakpoints({ messages: requests[i] }));
+        }
+    } finally { await inc.close(); }
+});
+
+test("continued content IDs can be replaced by client pins without losing the new mark", async () => {
+    const inc = await harness();
+    try {
+        const common = { conversationId: CONV, path: "/v1/messages", system: SYSTEM, request: { model: "claude-test", max_tokens: 1024 } };
+        const seed = await inc.post("/__bili/plugin/turn", JSON.stringify({ ...common, sinceSeq: 0, resync: true, messages: [{ role: "user", content: [{ type: "text", text: "continue" }] }] }), laneHeaders);
+        assert.equal(seed.status, 200);
+        const delta = await inc.post("/__bili/plugin/turn", JSON.stringify({ ...common, sinceSeq: seed.appliedSeq, msgIds: ["pinned-reply", "pinned-repeat"], messages: [
+            { role: "assistant", content: [{ type: "text", text: "ok" }] },
+            { role: "user", content: [{ type: "text", text: "continue", cache_control: MARK }] },
+        ] }), laneHeaders);
+        assert.equal(delta.status, 200);
+        const messages = inc.forwarded.at(-1)!.messages as Wire[];
+        assert.equal(messageBreakpoints(inc.forwarded.at(-1)!), 1);
+        assert.deepEqual(messages.at(-1)?.content.at(-1)?.cache_control, MARK);
+        assert.ok(messages[0].content.every((block) => block.cache_control === undefined), "the earlier identical prompt stays unmarked");
+    } finally { await inc.close(); }
+});
+
 test("rolling marks follow client-pinned identities on seed and delta", async () => {
     const inc = await harness();
     try {

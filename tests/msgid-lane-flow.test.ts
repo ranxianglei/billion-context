@@ -143,8 +143,18 @@ test("msgid lane flow: pin carries client ids into rows; edits append fresh rows
         const second = await h.turn({ sinceSeq: 3, resync: true, msgIds: ["u1", "a1"], messages: [umsg("alpha-edited"), amsg("beta")] });
         assert.equal(second.status, 200, "edit resync must not 409");
         assert.equal(second.appliedSeq, 2);
-        await h.settle();
-        rows = h.rows();
+        // #5155/#3798: the wrap-up floats behind the ack, and afterNextFlush's
+        // verdict is scoped to "currently queued or in flight" — on loaded
+        // runners the resync's fresh row can settle one flush cycle after the
+        // first verdict (same race class as #5644 win22-s2, via the verdict
+        // path). Re-probe up to four cycles; the strict assert below keeps the
+        // teeth — a row that never lands still fails, just later.
+        for (let i = 0; ; i++) {
+            await h.settle();
+            rows = h.rows();
+            if (rows.length === 4 || i >= 3) break;
+            await new Promise<void>((resolve) => setTimeout(resolve, 25));
+        }
         assert.equal(rows.length, 4, "an edit lands as a FRESH row (append-only discipline; the old generation stays)");
         const editedRow = rows.find((r) => r.msgId === "u1" && r.content.includes("alpha-edited"));
         assert.ok(editedRow, "fresh row carries the edited bytes under the same client id");
