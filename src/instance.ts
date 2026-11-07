@@ -728,17 +728,16 @@ export function registerInstanceAndWarn(entry: RegistryEntry, warn: (msg: string
     const warned: string[] = [];
     for (const other of liveOverlappingPeers(entry.instanceId, entry.lane)) {
         const laneNote = entry.lane !== undefined && other.lane !== undefined ? ` on lane "${entry.lane}"` : "";
-        if (info !== undefined && sessionsDirsDiffer(entry.sessionsDir, other.sessionsDir)) {
-            // #5046: the storage-side second-writer guard keys on the sessions
-            // directory — once proven apart, this peer shares no state and the
-            // warn-level "stop one" advice is a false positive that drowns real
-            // signal; report it informationally instead.
-            info(
-                `another bili instance is running (pid ${other.pid}, ${other.origin})${laneNote} — different sessions directories (ours: ${entry.sessionsDir}, theirs: ${other.sessionsDir}); no shared state, informational only (#394/#5046)`,
+        if (sessionsDirsDiffer(entry.sessionsDir, other.sessionsDir)) {
+            (info ?? warn)(
+                `another bili instance is running (pid ${other.pid}, ${other.origin})${laneNote} — different sessions directories (ours: ${entry.sessionsDir}, theirs: ${other.sessionsDir}); directory paths alone establish neither SQLite isolation nor same-conversation contention (#394/#5046)`,
             );
         } else {
-            warn(
-                `another bili instance is running (pid ${other.pid}, ${other.origin})${laneNote} — both processes will write the same sessions directory; stop one to avoid state pollution (#394)`,
+            // Registry topology cannot establish competing conversation writers.
+            const storage = entry.sessionsDir !== undefined && other.sessionsDir !== undefined
+                ? "shared sessions directory" : "sessions directory is unknown";
+            (info ?? warn)(
+                `another bili instance is running (pid ${other.pid}, ${other.origin})${laneNote} — ${storage}; sharing local SQLite for distinct conversations is supported; do not concurrently serve the same conversation (#394/#3923)`,
             );
         }
         warned.push(other.instanceId);
@@ -765,15 +764,15 @@ export function warnOnNewPeers(
     for (const other of liveOverlappingPeers(own.instanceId, own.lane)) {
         if (previouslyWarned.has(other.instanceId)) continue;
         const laneNote = own.lane !== undefined && other.lane !== undefined ? ` on lane "${other.lane}"` : "";
-        if (info !== undefined && sessionsDirsDiffer(own.sessionsDir, other.sessionsDir)) {
-            // #5046: same criterion as registerInstanceAndWarn — proven-apart
-            // peers are informational, never the "stop one" advice.
-            info(
-                `another bili instance appeared while this process was already running (pid ${other.pid}, ${other.origin})${laneNote} — different sessions directories (ours: ${own.sessionsDir}, theirs: ${other.sessionsDir}); no shared state, informational only (#394/#2401/#5046)`,
+        if (sessionsDirsDiffer(own.sessionsDir, other.sessionsDir)) {
+            (info ?? warn)(
+                `another bili instance appeared while this process was already running (pid ${other.pid}, ${other.origin})${laneNote} — different sessions directories (ours: ${own.sessionsDir}, theirs: ${other.sessionsDir}); directory paths alone establish neither SQLite isolation nor same-conversation contention (#394/#2401/#5046)`,
             );
         } else {
-            warn(
-                `another bili instance appeared while this process was already running (pid ${other.pid}, ${other.origin})${laneNote} — both processes write the same sessions directory; stop one to avoid state pollution (#394/#2401)`,
+            const storage = own.sessionsDir !== undefined && other.sessionsDir !== undefined
+                ? "shared sessions directory" : "sessions directory is unknown";
+            (info ?? warn)(
+                `another bili instance appeared while this process was already running (pid ${other.pid}, ${other.origin})${laneNote} — ${storage}; sharing local SQLite for distinct conversations is supported; do not concurrently serve the same conversation (#394/#2401/#3923)`,
             );
         }
         fresh.push(other.instanceId);
