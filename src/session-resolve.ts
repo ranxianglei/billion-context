@@ -500,7 +500,7 @@ export function resolveSessionOrder(rawId: string, history: unknown, personaTag?
             record(rawId, turns, tagHash, effectiveModel);
             return { key: rawId, action: "reanchor", reason: "persona text changed but the recorded history continues inside the incoming — anchor migrated (#4778)" };
         }
-        // #5686: fifth rung — the composite field failure behind the
+        // #5686: sixth rung — the composite field failure behind the
         // |sub:-drift cluster (#5517/#5656 reports): a native-compaction
         // checkpoint LANDS (head cells replaced by one summary message) while
         // the host simultaneously rotates its per-turn system prompt (dsh NEXT
