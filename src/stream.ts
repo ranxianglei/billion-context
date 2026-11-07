@@ -713,7 +713,7 @@ function postCompressTail(ctx: RewriteCtx, cleanSuccess: boolean, submitted: Arr
                 // byte-for-byte (#4331's honesty pin stands).
                 const anyFoldable = minChars <= 0 || runs.some((r) => r.chars >= minChars);
                 if (!anyFoldable) {
-                    return `\n\nUncovered history remains — all offered ranges are folded, but ${totalMsgs} msg(s) across ${runs.length} run(s), ${shortTokenCount(totalTok)} tok, sit outside every active block; every run is below the fold-size gate (min ${minChars} chars), so there is no range you can fold right now. Continue the task without compressing — these runs become foldable on their own as more history accumulates.`;
+                    return `\n\nUncovered history remains — all offered ranges are folded, but ${totalMsgs} msg(s) across ${runs.length} run(s), ${shortTokenCount(totalTok)} tok, sit outside every active block; every run is below the fold-size gate (min ${minChars} chars), so no single run can be folded right now. Continue the task without compressing.`;
                 }
                 return `\n\nUncovered history remains — all offered ranges are folded, but ${totalMsgs} msg(s) across ${runs.length} run(s), ${shortTokenCount(totalTok)} tok, sit outside every active block and are not in this call's offer: ${describeUncoveredRuns(runs)}. The context is not at its minimum (runs may sit below the fold-size gate — named for visibility, not as fold suggestions); inspect with acp_status(scope:"uncompressed").`;
             }
