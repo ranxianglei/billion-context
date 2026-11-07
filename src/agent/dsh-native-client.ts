@@ -52,7 +52,7 @@
 // historical latest-session behaviour); while no session exists yet the tab
 // shows an honest hint instead of an empty frame.
 
-import { createElement, useEffect, useState } from "react";
+import { createElement, useEffect, useLayoutEffect, useRef, useState } from "react";
 
 type Dict = Record<string, string>;
 
@@ -153,6 +153,30 @@ const CTX_POLL_MS = 10000;
 // as the per-session Context tab. A dead circuit retries on its own ~60s probe, so
 // 10s keeps the "retry in ~Ns" hint fresh and clears the banner within one tick.
 const UPSTREAM_POLL_MS = 10000;
+// #4406: the Context tab renders a whole conversation surface, so the host
+// composer seat (input, todo dock, goal box) must not stay pinned under it.
+// The host exposes no registration switch for that, so the tab marks its own
+// scroll container and carries the one rule itself — the same shape dsh's own
+// context pane uses (data-lc-surface), scoped to our attribute so the two can
+// never fight over the same node. Approval / question / plan-review panels are
+// takeovers and keep the seat visible.
+const BILI_SURFACE_ATTR = "data-bili-surface";
+const BILI_SURFACE_CSS =
+    "[data-conversation-scroll][data-bili-surface]>[data-composer-seat]:not(:has([data-approval-key],[data-question-key],[data-plan-review-key])){display:none}";
+type BiliSurfaceDoc = {
+    querySelector: (selector: string) => unknown;
+    createElement: (tag: string) => { setAttribute: (name: string, value: string) => void; textContent: string };
+    head: { appendChild: (node: unknown) => void };
+};
+const biliSurfaceDoc = (): BiliSurfaceDoc | undefined => (globalThis as { document?: BiliSurfaceDoc }).document;
+const ensureBiliSurfaceStyle = (): void => {
+    const doc = biliSurfaceDoc();
+    if (doc === undefined || doc.querySelector("style[data-bili-surface]") !== null) return;
+    const style = doc.createElement("style");
+    style.setAttribute("data-bili-surface", "");
+    style.textContent = BILI_SURFACE_CSS;
+    doc.head.appendChild(style);
+};
 
 type CtxStatus = {
     ok: boolean;
@@ -739,6 +763,18 @@ export function apply(ctx: ClientContext): void {
     // request yet / chain-advisory) the tab shows an honest hint, never a
     // stale or empty frame.
     const contextPanel = (): ((props?: Record<string, unknown>) => unknown) => (props) => {
+        const surfaceRef = useRef<{ closest: (selector: string) => unknown } | null>(null);
+        useLayoutEffect(() => {
+            ensureBiliSurfaceStyle();
+            const node = surfaceRef.current;
+            const scroll = node !== null ? node.closest("[data-conversation-scroll]") : null;
+            if (scroll === null) return;
+            const marked = scroll as { setAttribute: (name: string, value: string) => void; removeAttribute: (name: string) => void };
+            marked.setAttribute(BILI_SURFACE_ATTR, "");
+            return () => {
+                marked.removeAttribute(BILI_SURFACE_ATTR);
+            };
+        }, []);
         // The host names this conversation to every conversation.view entry
         // (props.sessionId — the same id the dsh lane stamps on
         // x-bili-plugin-conversation), so the poll targets OUR session. Old
@@ -892,7 +928,7 @@ export function apply(ctx: ClientContext): void {
         }
         return createElement(
             "div",
-            { style: { display: "flex", flexDirection: "column", height: "100%", minWidth: 0, minHeight: 0 } },
+            { ref: surfaceRef, style: { display: "flex", flexDirection: "column", height: "100%", minWidth: 0, minHeight: 0 } },
             origin !== undefined
                 ? createElement(
                     "div",
