@@ -216,15 +216,15 @@ entries:
     site_en: "EXPERIMENTAL boolean (default false): together with compress.compressAtFoldPoint, clear the unsigned thinking run immediately before a relocated compress pair at the moment of repositioning. Never touches signed thinking or strict reasoning-echo sessions (#1658/#684); inert while the main switch is off."
     site_zh: "实验性布尔开关（默认 false）：配合 compress.compressAtFoldPoint，在调用对被挪位的同时清掉其紧邻之前的未签名思考段。绝不触碰带签名的思考块与严格推理回显会话（#1658/#684）；主开关关闭时无效。"
   - key: compress.promptPack
-    type: "string (builtin: \"default\", \"lean\")"
+    type: "string (builtin: \"default\", \"lean\", \"chat\")"
     default: "builtin \"default\""
     group: compress
     id: cw.ppk
     render: compress-row
-    desc_en: "Compression prompt pack, resolved project pack → user pack → builtin; not gated by acknowledgePromptsRisk."
-    desc_zh: "压缩提示词包，按 项目包 → 用户包 → 内置 解析；不受 acknowledgePromptsRisk 门控。"
-    site_en: "Compression prompt pack, resolved project pack → user pack → builtin. Builtins: \"default\" and \"lean\" (one-line tool descriptions). Not gated by acknowledgePromptsRisk."
-    site_zh: "压缩提示词包，按 项目包 → 用户包 → 内置 解析。内置：\"default\" 与 \"lean\"（单行工具描述）。不受 acknowledgePromptsRisk 门控。"
+    desc_en: "Compression prompt pack, resolved project pack → user pack → shipped pack → builtin; not gated by acknowledgePromptsRisk."
+    desc_zh: "压缩提示词包，按 项目包 → 用户包 → 随包附带（chat）→ 内置 解析；不受 acknowledgePromptsRisk 门控。"
+    site_en: "Compression prompt pack, resolved project pack → user pack → shipped pack → builtin. Builtins: \"default\" and \"lean\" (one-line tool descriptions); hosts may also ship a \"chat\" pack (#5319). Not gated by acknowledgePromptsRisk."
+    site_zh: "压缩提示词包，按 项目包 → 用户包 → 随包附带 → 内置 解析。内置：\"default\" 与 \"lean\"（单行工具描述）；宿主可另附 \"chat\" 包（#5319）。不受 acknowledgePromptsRisk 门控。"
   - key: compress.tiers
     type: boolean
     default: "true"

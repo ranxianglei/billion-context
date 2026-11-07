@@ -59,6 +59,18 @@ test("e2e #321 PR-C: rebase only on completed; trigger request forwarded clean",
                     res.end();
                     return;
                 }
+                if (mode === "drift" || mode === "markup") {
+                    // #5175: a native compact turn answers as plain JSON. Its
+                    // context is by definition tag-laden, so the echoed prose
+                    // carries drift residue — that must not reach the client.
+                    // `markup` is the control: genuine markup must survive.
+                    const text = mode === "drift"
+                        ? "acpt> </apct> <acct m17138></apct>  </apct> </apct> <acct m17140></acct> done"
+                        : "x<sup>2</sup> and <span class=\"a\">z</span> done";
+                    res.writeHead(200, { "content-type": "application/json" });
+                    res.end(JSON.stringify({ id: "resp_c", status: "completed", output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text }] }], usage: { input_tokens: 10, output_tokens: 1 } }));
+                    return;
+                }
                 res.writeHead(200, { "content-type": "application/json" });
                 res.end(JSON.stringify({ id: "resp_c", status: "completed", output: [{ type: "message", role: "user", content: "summary" }], usage: { input_tokens: 10, output_tokens: 1 } }));
                 return;
@@ -192,6 +204,23 @@ test("e2e #321 PR-C: rebase only on completed; trigger request forwarded clean",
         assert.equal(r6.status, 200);
         await r6.text();
         assert.equal(pendingRebase("term-jsonok"), true, "JSON output response schedules the rebase");
+
+        // 7. #5175: the non-SSE native compact egress strips render-tag residue.
+        //    A compaction turn's context is by definition tag-laden, so this is
+        //    the likeliest echo leak of any Responses stream. Master forwarded
+        //    it verbatim (2 refs + 2 openers reached the client).
+        const r7 = await postResponses("/responses/compact?mode=drift", { model: "gpt-resp", session_id: "term-drift" });
+        assert.equal(r7.status, 200);
+        const driftText = await r7.text();
+        assert.equal((driftText.match(/m\d{5,}/g) ?? []).length, 0, `no kernel ref may reach the client, got: ${driftText.slice(0, 200)}`);
+        assert.equal((driftText.match(/<(?:acpt|apct|acct|acad|acme|accent|actp)\b/gi) ?? []).length, 0, `no drifted opener may reach the client, got: ${driftText.slice(0, 200)}`);
+        assert.equal(pendingRebase("term-drift"), true, "the strip must not disturb the terminal-state observer");
+
+        // 8. #5175 control: genuine markup on the same egress survives verbatim.
+        const r8 = await postResponses("/responses/compact?mode=markup", { model: "gpt-resp", session_id: "term-markup" });
+        assert.equal(r8.status, 200);
+        const markupText = await r8.text();
+        assert.ok(markupText.includes("x<sup>2</sup>") && markupText.includes("<span class=\\\"a\\\">z</span>"), `genuine markup must survive, got: ${markupText.slice(0, 200)}`);
     } finally {
         proxy.close();
         proxy.closeIdleConnections?.();

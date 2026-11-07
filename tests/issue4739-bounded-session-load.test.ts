@@ -139,6 +139,10 @@ test("full mode: viewFor decodes only pointer rows and matches the full-log deco
         assert.deepEqual(via, reference, "bounded decode byte-equal to the full-log decode");
         assert.equal(delta, expectedPointers, `viewFor read ${delta} message rows for ${expectedPointers} pointer seqs (full log = ${liveSeqs.size})`);
     } finally {
+        // #4739: the unified-full cases open a real sidecar, so teardown must
+        // CLOSE it — Windows refuses to unlink a directory holding an open
+        // index.db (EBUSY), and cancelAll() only clears timers. Same shape as
+        // the #4788 suite fix.
         store.closeQuietly();
         if (prev === undefined) delete process.env.BILI_STORAGE_UNIFIED;
         else process.env.BILI_STORAGE_UNIFIED = prev;
@@ -178,6 +182,10 @@ test("full mode: dropped metadata restores from the index alone (narrow read, no
         assert.ok(again, "envelope rewritten by later save");
         assert.deepEqual(Object.keys(JSON.parse(fs.readFileSync(again, "utf8")).payload.metadata as object).sort(), persistedKeys);
     } finally {
+        // #4739: the unified-full cases open a real sidecar, so teardown must
+        // CLOSE it — Windows refuses to unlink a directory holding an open
+        // index.db (EBUSY), and cancelAll() only clears timers. Same shape as
+        // the #4788 suite fix.
         store.closeQuietly();
         if (prev === undefined) delete process.env.BILI_STORAGE_UNIFIED;
         else process.env.BILI_STORAGE_UNIFIED = prev;
