@@ -227,7 +227,7 @@ os.environ.pop("BILI_CONFIG_FILE", None)
 for k in ("BILLION_CONTEXT_ATTACH", "BILLION_CONTEXT_PROXY", "BILI_NATIVE_HERMES",
           "BILLION_CONTEXT_PLUGIN", "BILI_PROVIDER_REWRITES",
           "HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy",
-          "ALL_PROXY", "all_proxy", "HERMES_CA_BUNDLE", "SSL_CERT_FILE"):
+          "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy", "HERMES_CA_BUNDLE", "SSL_CERT_FILE"):
     os.environ.pop(k, None)
 
 RECORDED = {"tool": [], "runtime_info": [], "watcher": [], "health": [], "status": []}
@@ -906,17 +906,21 @@ elif SCENARIO == "origin-death":
         ready.wait(10)
     out["death_initial_ready"] = (mod._state.get("bootstrap") or {}).get("state")
     out["death_env_routed"] = os.environ.get("HTTPS_PROXY")
+    out["death_http_routed"] = os.environ.get("HTTP_PROXY")
     SLOW["enabled"] = True
     def release_later():
         __import__("time").sleep(1.5)
         SLOW["release"].set()
     threading.Thread(target=release_later, daemon=True).start()
     gap_values = []
+    http_gap = []
     saw_gap = False
     end = __import__("time").monotonic() + 20
     while __import__("time").monotonic() < end:
         v = os.environ.get("HTTPS_PROXY")
         gap_values.append(v)
+        if v != ORIGIN:
+            http_gap.append(os.environ.get("HTTP_PROXY"))
         if v != ORIGIN:
             saw_gap = True
         rec = mod._state.get("bootstrap") or {}
@@ -927,6 +931,8 @@ elif SCENARIO == "origin-death":
     rec = mod._state.get("bootstrap") or {}
     out["death_final_state"] = rec.get("state")
     out["death_final_env"] = os.environ.get("HTTPS_PROXY")
+    out["death_http_gap"] = list(dict.fromkeys(http_gap))
+    out["death_final_http"] = os.environ.get("HTTP_PROXY")
     out["death_tools"] = sorted(ctx.tools.keys())
     out["death_register_calls"] = sum(ctx.reg_counts.values())
     out["death_warnings"] = [w for w in WARNINGS if "is gone" in w]
@@ -1068,6 +1074,9 @@ out.update({
     "pid": os.getpid(),
     "env_https_proxy": os.environ.get("HTTPS_PROXY"),
     "env_https_proxy_lc": os.environ.get("https_proxy"),
+    "env_http_proxy": os.environ.get("HTTP_PROXY"),
+    "env_http_proxy_lc": os.environ.get("http_proxy"),
+    "env_no_proxy": os.environ.get("NO_PROXY"),
     "env_ca_bundle": os.environ.get("HERMES_CA_BUNDLE"),
     "env_ssl_cert_file": os.environ.get("SSL_CERT_FILE"),
     "marker_left": os.path.exists(os.path.join(os.environ["XDG_STATE_HOME"], "billion-context", "proxy-starting")),
@@ -1096,6 +1105,9 @@ interface DriverOut {
     hooks: string[];
     env_https_proxy?: string | null;
     env_https_proxy_lc?: string | null;
+    env_http_proxy?: string | null;
+    env_http_proxy_lc?: string | null;
+    env_no_proxy?: string | null;
     env_ca_bundle?: string | null;
     env_ssl_cert_file?: string | null;
     marker_left?: boolean;
@@ -1183,6 +1195,9 @@ interface DriverOut {
     death_gap_values?: Array<string | null>;
     death_final_state?: string;
     death_final_env?: string | null;
+    death_http_routed?: string | null;
+    death_http_gap?: Array<string | null>;
+    death_final_http?: string | null;
     death_tools?: string[];
     death_register_calls?: number;
     death_warnings?: string[];
@@ -1241,6 +1256,9 @@ describe("python plugin runtime (subprocess)", () => {
         assert.equal(out!.req_unmutated, true);
         assert.equal(out!.env_https_proxy, out!.origin);
         assert.equal(out!.env_https_proxy_lc, out!.origin);
+        assert.equal(out!.env_http_proxy, out!.origin, "a plain-http provider base_url is routed too");
+        assert.equal(out!.env_http_proxy_lc, out!.origin);
+        assert.equal(out!.env_no_proxy, "127.0.0.1,localhost,::1", "loopback stays direct");
         assert.match(out!.env_ca_bundle!, /root-ca\.pem$/);
         assert.match(out!.env_ssl_cert_file!, /combined-ca\.pem$/, "#1375: ambient trust rides the combined bundle");
         const h1 = out!.first_headers!;
@@ -1684,6 +1702,10 @@ describe("python plugin runtime (subprocess)", () => {
         assert.ok(out, err);
         assert.equal(out!.death_initial_ready, "ready");
         assert.equal(out!.death_env_routed, out!.origin);
+        assert.equal(out!.death_http_routed, out!.origin);
+        assert.ok(out!.death_http_gap!.length > 0 && !out!.death_http_gap!.includes(out!.origin),
+            "HTTP_PROXY is unrouted with the HTTPS pair, not left pointing at the dead origin");
+        assert.equal(out!.death_final_http, out!.origin);
         assert.ok(out!.death_gap_values!.includes("http://user-proxy.example:9999"),
             "the unroute RESTORED the pre-existing user proxy instead of deleting the key");
         assert.equal(out!.death_final_state, "ready", "the watchdog re-bootstrapped a healthy origin");
