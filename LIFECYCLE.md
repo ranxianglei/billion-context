@@ -96,7 +96,7 @@
 | `BILI_EXPOSURE_LOG_INTERVAL_MS` | 3600000（0 禁用，垃圾值回落 3600000） |
 | `BILI_MAX_SHRINK_PER_COMPRESS` | unset（不做收缩引导） |
 | `BILI_REPLAY_RETRY_MAX` / `BILI_REPLAY_RETRY_BASE_MS` | 3 / 1500 |
-| `BILI_THROTTLE_429` / `BILI_THROTTLE_429_MAX_CONSECUTIVE` / `BILI_THROTTLE_429_BASE_DELAY_MS` / `BILI_THROTTLE_429_MAX_DELAY_MS` | true / 5 / 2000 / 30000（#4204 出站 429 治理器：同一 origin+凭据连续上游 429 后本地 hold、零出站，退避×抖动、尊重 Retry-After；达上限转终局 424（不在各 SDK 重试集合内），每窗口一次探测自动恢复，任何非 429 响应即清除；`false` 恢复旧的总是转发行为） |
+| `BILI_THROTTLE_429` / `BILI_THROTTLE_429_MAX_CONSECUTIVE` / `BILI_THROTTLE_429_BASE_DELAY_MS` / `BILI_THROTTLE_429_MAX_DELAY_MS` / `BILI_THROTTLE_429_SCOPE` | true / 5 / 2000 / 30000 / credential（#4204 出站 429 治理器：同一 origin+凭据连续上游 429 后本地 hold、零出站，退避×抖动、尊重 Retry-After；达上限转终局 424（不在各 SDK 重试集合内），每窗口一次探测自动恢复，任何非 429 响应即清除；`false` 恢复旧的总是转发行为。#5199：scope=`model` 时无标记 429 按请求模型分桶 hold——单凭据多模型独立限流网关（LiteLLM/one-api 类）一个模型的 RPM 耗尽不再冻结兄弟模型；无法识别模型的请求仍按凭据级） |
 | `BILI_STREAM_KEEPALIVE_MS` | 15000（0 禁用 hold） |
 | `BILI_PREFLIGHT_HOLD_MS` | 30000 |
 | `BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS` | 300000 |

@@ -173,6 +173,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `network.throttle429MaxConsecutive` | number | 5 | BILI_THROTTLE_429_MAX_CONSECUTIVE | Consecutive upstream 429s before the hold turns terminal (local 424 outside every known SDK retry set); one probe per backoff window keeps checking until any non-429 response clears an account hold, or the matching model's non-429 response clears its model hold. |
 | `network.throttle429BaseDelayMs` | number | 2000 | BILI_THROTTLE_429_BASE_DELAY_MS | Base backoff for the 429 hold (doubles per consecutive 429, jittered into [0.5×, 1×], capped by throttle429MaxDelayMs; an upstream Retry-After wins when larger). |
 | `network.throttle429MaxDelayMs` | number | 30000 | BILI_THROTTLE_429_MAX_DELAY_MS | Ceiling for the 429 hold backoff and for the terminal-phase probe interval. |
+| `network.throttle429Scope` | string | credential | BILI_THROTTLE_429_SCOPE | Hold granularity for marker-less upstream 429s (#5199). `credential` (default) keeps #5696's conservative semantics — any 429 without a recognized model marker (`keyring_model_temporarily_unavailable`, or a bili relay's `bili_throttle_hold` scope=model) holds the whole origin+credential, so every model behind that credential waits out the backoff. `model` keys the hold by the send's request model instead, for gateways that front many independently-limited models behind one credential (LiteLLM/one-api/opencode.ai-style relays where one model's RPM exhaustion must not freeze its siblings); requests whose model cannot be identified remain credential-wide, and recognized markers keep their own semantics in both modes. |
 | `network.maxShrinkPerCompress` | number | unset | BILI_MAX_SHRINK_PER_COMPRESS | Cap on how much one compression may shrink history (anti-collapse guard). |
 | `network.proxyKeepAliveMaxMs` | number | 55000 (0 = one-shot connections) | BILI_PROXY_KEEPALIVE_MAX_MS | Max lifetime of a connection through an outbound egress proxy before forcing reconnection (avoids stale NAT mappings). |
 | `network.postResponseLingerMs` | number | 5000 | BILI_POST_RESPONSE_LINGER_MS | Graceful-close budget for proxy-initiated closes after the response completed: the socket is held waiting for the peer's FIN/TLS close_notify and destroyed at the deadline (reason=linger-backstop). |
@@ -1987,6 +1988,7 @@ File keys resolve only when the matching env var is unset. Defaults in parenthes
 | `BILI_THROTTLE_429_BASE_DELAY_MS` | `network.throttle429BaseDelayMs` | 2000 |
 | `BILI_THROTTLE_429_MAX_CONSECUTIVE` | `network.throttle429MaxConsecutive` | 5 |
 | `BILI_THROTTLE_429_MAX_DELAY_MS` | `network.throttle429MaxDelayMs` | 30000 |
+| `BILI_THROTTLE_429_SCOPE` | `network.throttle429Scope` | credential |
 | `BILI_UPDATE_CHECK_INTERVAL_MS` | `update.checkIntervalMs` | 180000 |
 | `BILI_UPDATE_POLICY_URL` | `update.policyUrl` | official repo raw URL |
 | `BILI_UPDATE_REGISTRY` | `update.registry` | "npmjs" (registry.npmjs.org) |
