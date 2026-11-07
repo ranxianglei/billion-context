@@ -274,7 +274,8 @@
 | `compress.nudgeGrowthTokens` | number | 50000 (kernel flat cadence) | — | 增长门槛：可折叠片段超出基线增长达到该 token 数才发提醒（按设计恒定，与窗口大小无关）。 |
 | `compress.tierNudgeTokens` | object {t1?, t2?, t3?} | derived (T1 = nudgeGrowthTokens, T2/T3 = ×1.5) | — | 分层 token 质量触发阈值；每层未设置时回退到派生默认值，缺省/空对象＝老的统一行为（#2376）。 |
 | `compress.minPressureBenefitTokens` | number (≥ 0) | max(5000, limit × 1%) | — | 压力带 nudge 触发所需的最小可回收 token 数；虚报表线路调大它，让折叠攒成大批量而非高频小折（#3211）。显式 0＝老的任意 pending 行为。 |
-| `compress.requireUsageSampleForPressure` | boolean | true | — | 幻影压力守卫：本轮读数为本地估算（无计费样本——中断/TTL 丢 usage）时，压力带延后一轮等真样本再决定，不拿虚高读数扣 EMERGENCY。false＝老行为。 |
+| `compress.requireUsageSampleForPressure` | boolean | true | — | 幻影压力守卫：本轮读数为本地估算（无计费样本——中断/TTL 丢 usage）时，压力带延后至多 compress.maxEstimateHoldRounds 轮（默认 2）等真样本，再回落到老的估算驱动决定，防止永不回传计费的线路被无限挂起。false＝始终老行为。 |
+| `compress.maxEstimateHoldRounds` | number | 2 | — | 幻影压力守卫的兜底（#5865 裁定）：压力带最多连等多少轮估算读数就必须照估算动手。兜底保证从不回传计费的会话（匿名零基线 fork、静默后端——本地估算是它们唯一的压力信号）也能拿到自动压缩。0＝完全不等待。仅在 requireUsageSampleForPressure 开启时生效。 |
 | `compress.nudgeModelDecided` | boolean | off (unset) | — | 模型自决的压缩时机（#2228）：tier-1 提醒触发时，先通过一次走会话缓存前缀的短 side call 问模型——以当前任务为前提，现在压缩是否划算。严格 JSON 的 "yes" 会注入带程序最终确定范围的明确压缩指令；"no"、格式错误或超时则本轮不注入任何内容。EMERGENCY 档与 tier≥2 蒸馏始终保留原有 advisory。默认关闭，需显式开启。 |
 | `compress.nudgeDecisionMaxTokens` | number | 200 | — | nudgeModelDecided 所用模型决策 side call 的输出预算（token）。必须 > 0。 |
 | `compress.requireNudge` | boolean | off (unset) | — | 禁止未提示的模型主动压缩（#5683）：只有当前轮次压缩提醒真正送达模型时（advisory、模型自决指令、紧急提醒都算；"gated"/"vetoed"/"skipped" 不算）才允许 compress，否则拒绝并回错误回执；同一轮内的多次 loop 请求保持武装，下一个未提示轮次自动解除。bili 自己的溢出兜底折叠不受影响。针对会自行乱压的模型（如 qwen 27b），可按 provider/model 单独开启。默认关闭。 |
