@@ -58,7 +58,7 @@ import { safePrefix, safeSuffix, scrubLoneSurrogatesOnWire } from "../text-safe.
 import { clearUpstreamAlertsForHost, noteCircuitFailFastLog, recordUpstreamAlert, recordUpstreamCircuitFailure, recordUpstreamCircuitSuccess, upstreamCircuitBlockReason, upstreamCircuitLastFailureKind, upstreamCircuitRetryAfterSeconds } from "../upstream-alerts.js";
 import { describeUpstreamFailure, formatUpstreamError, proxyDispatcher, recordUpstreamConnection } from "../upstream-proxy.js";
 import { markExpectedFailFast, withUpstreamFailure, type UpstreamFailureKind } from "../upstream-fail.js";
-import { keyringModel429Scope, noteUpstreamThrottle429, noteUpstreamThrottleResolved, releaseUpstreamThrottleProbe, requestModelFromBody, type ThrottleLocalReject, upstreamThrottleGate, upstreamThrottlePeekReject } from "../upstream-throttle.js";
+import { noteUpstreamThrottle429, noteUpstreamThrottleResolved, releaseUpstreamThrottleProbe, requestModelFromBody, throttle429ModelScope, type ThrottleLocalReject, upstreamThrottleGate, upstreamThrottlePeekReject } from "../upstream-throttle.js";
 import { applyEstimateCalibration, currentCalibrationFactor, inspectContextOverflow, isMarkerlessOverflowReject, MIN_ASSUMED_WINDOW_TOKENS, normalizeUpstreamOrigin, usageOutputTotal, usageTotals, type ContextOverflowInfo, type WireProtocol } from "../util.js";
 import { billOutputUsage } from "../billing.js";
 import { DUMP_PLAINTEXT_BANNER } from "../dump-banner.js";
@@ -1694,7 +1694,7 @@ async function forwardCaptured(
         // keyring_all_limited and every ambiguous response remain account-wide.
         if (req.method !== "GET" && req.method !== "HEAD") {
             if (upstream.status === 429) {
-                const modelScope = keyringModel429Scope(upstream.status, throttleModel, errBody);
+                const modelScope = throttle429ModelScope(upstream.status, throttleModel, errBody);
                 noteUpstreamThrottle429(upstreamUrl, headers, upstream.headers.get("retry-after"), Date.now(), modelScope, throttleProbeToken);
             } else {
                 noteUpstreamThrottleResolved(upstreamUrl, headers, upstream.status, Date.now(), throttleModel, throttleProbeToken);

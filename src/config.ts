@@ -276,6 +276,19 @@ export type CompressSettings = {
      *  Maps to kernel `nudge.requireUsageSampleForPressure`. Deepest level
      *  wins PER FIELD, like every other compress field. */
     requireUsageSampleForPressure?: boolean;
+    /** #5865 estimate-hold backstop: how many CONSECUTIVE rounds with an
+     *  estimate-grade meter reading (no billing sample) may hold the
+     *  pressure-band injection before it falls back to firing on the estimate
+     *  anyway. Bounds the #5860 phantom-pressure hold so an upstream that
+     *  NEVER reports usage (anonymous zero-baseline / silent-backend sessions,
+     *  where the local estimate is the only pressure signal) cannot starve its
+     *  automatic compression forever. Default 2 (covers the aborted-turn +
+     *  follow-up ghost windows while capping starvation at two missed rounds);
+     *  0 disables the hold entirely. Maps to kernel
+     *  `nudge.maxEstimateHoldRounds`; only consulted while
+     *  requireUsageSampleForPressure is on. Deepest level wins PER FIELD, like
+     *  every other compress field. */
+    maxEstimateHoldRounds?: number;
     /** Per-tier nudge growth thresholds in tokens (#2376): independent token
       *  trigger sizes for the T1/T2/T3 mass paths, e.g. keep T1 aggressive for
       *  long tasks while letting T2 distill earlier/later. Each UNSET tier
@@ -2264,6 +2277,13 @@ type FileConfig = {
         /** 429-hold backoff ceiling in ms; also the probe cadence once the hold is terminal (#4204;
          *  was env-only BILI_THROTTLE_429_MAX_DELAY_MS; default 30000). */
         throttle429MaxDelayMs?: number;
+        /** Hold granularity for marker-less upstream 429s (#5199; env BILI_THROTTLE_429_SCOPE; default "credential").
+         *  "credential" — #5696's conservative default: any 429 without a recognized model marker holds the whole
+         *  origin+credential (every model, every session on it). "model" — hold only the send's request model, for
+         *  gateways fronting many independently-limited models behind one credential (LiteLLM/one-api/opencode.ai-style
+         *  relays); requests without an identifiable model remain credential-wide, and recognized KeyRing markers keep
+         *  their own semantics in both modes. */
+        throttle429Scope?: "credential" | "model";
         /** Per-compress shrink steering factor in (0,1] (was BILI_MAX_SHRINK_PER_COMPRESS; default unset). */
         maxShrinkPerCompress?: number;
         /** Outbound proxy keep-alive ceiling, 0 for one-shot (was BILI_PROXY_KEEPALIVE_MAX_MS; default 55000). */
@@ -2454,7 +2474,7 @@ const KNOWN_TOP_LEVEL_KEYS = new Set([
 // level down under "compress". Keep in sync with parseCompressSettings.
 const COMPRESS_SETTING_FIELDS = new Set([
     "modelContextLimit", "maxContextLimit", "emergencyThresholdPercent",
-    "nudgeGrowthTokens", "minPressureBenefitTokens", "requireUsageSampleForPressure", "tierNudgeTokens", "nudgeModelDecided", "nudgeDecisionMaxTokens",
+    "nudgeGrowthTokens", "minPressureBenefitTokens", "requireUsageSampleForPressure", "maxEstimateHoldRounds", "tierNudgeTokens", "nudgeModelDecided", "nudgeDecisionMaxTokens",
     "requireNudge", "requireRecommendation",
     "preserveRecentMessages", "preserveRecentTokens",
     "minCompressRange", "minCompressRangeChars",
@@ -3243,6 +3263,11 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
     if ("requireUsageSampleForPressure" in obj) {
         if (typeof obj.requireUsageSampleForPressure !== "boolean") ok = false;
         else out.requireUsageSampleForPressure = obj.requireUsageSampleForPressure;
+    }
+    if ("maxEstimateHoldRounds" in obj) {
+        const v = obj.maxEstimateHoldRounds;
+        if (typeof v !== "number" || !Number.isFinite(v) || v < 0 || !Number.isInteger(v)) ok = false;
+        else out.maxEstimateHoldRounds = Math.floor(v);
     }
     for (const key of ["protectedLatestTools", "protectedTools"] as const) {
         if (!(key in obj) || obj[key] === undefined) continue;
