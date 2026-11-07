@@ -142,7 +142,7 @@
 | **OpenCode V1**(原生插件) | SDK session info 的 `parentID`(每会话解析一次并缓存) |
 | **OpenCode V2**(原生插件) | `session.created` 事件的 `data.parentID` |
 
-claude/codex/dsh 在这里不需要任何信号:它们的 subagent 共享同一个会话 id,或根本没有子会话概念。
+claude/codex 在这里不需要任何信号:它们的子 agent 也打主会话的 id(代理用其他信号分隔这些车道)。dsh 每次 spawn 子代理都铸一个新的会话 id(已对照 deepseek-harness @ 0.2.2-alpha.3 源码核实,#5630),其子会话天然按 id 隔离。
 
 ## 未来方向
 
