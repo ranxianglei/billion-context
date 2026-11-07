@@ -74,10 +74,27 @@ function forkHash(value: unknown): string {
     return createHash("sha256").update(forkStableJson(value), "utf8").digest("hex");
 }
 
+// #5123: canonicalize the identity inputs so serialization/projection noise
+// cannot truncate fork prefix matching. Two relaxations vs the historical
+// tuple, both owner-approved after forensics showed every break on affected
+// sessions was noise, not content loss (97.6%~99.8% of rows align once these
+// two are applied): (1) contentType drops out — a reasoning cell and a text
+// cell with the same text ARE the same history cell (hosts re-project
+// reasoning↔text); (2) tool-call text is JSON-canonicalized — re-stringified
+// arguments differ only in whitespace. role/text/toolName/toolCallId/
+// thinkingTokens/summaryOfBlockId/toolIsError remain hard gates. Must stay
+// byte-identical to src/plugin.ts forkCanonicalText.
+function forkCanonicalText(text: unknown, contentType: unknown): unknown {
+    if (contentType === "tool-call" && typeof text === "string") {
+        try { return JSON.stringify(JSON.parse(text)); } catch { return text; }
+    }
+    return text ?? null;
+}
+
 /** Byte-identical to src/plugin.ts forkMessageIdentityHash. */
 export function forkIdentityHashOf(message: CoreMessage): string {
     const toolIsError = (message as CoreMessage & { toolIsError?: boolean }).toolIsError === true;
-    return forkHash([message.role, message.contentType, message.text ?? null, message.toolName ?? null, message.toolCallId ?? null, message.thinkingTokens ?? null, message.summaryOfBlockId ?? null, toolIsError]);
+    return forkHash([message.role, forkCanonicalText(message.text, message.contentType), message.toolName ?? null, message.toolCallId ?? null, message.thinkingTokens ?? null, message.summaryOfBlockId ?? null, toolIsError]);
 }
 
 /** Byte-identical to src/plugin.ts forkOrderHash (plain JSON.stringify over
@@ -454,11 +471,27 @@ export async function tryForkAdoption(opts: {
         }
         if (res.status === 201 || res.status === 200) {
             let replayed = false;
+            let degraded = false;
+            let inheritedBlocks = 0;
+            let parentBlocks: number | undefined;
             try {
-                const parsed = await res.json() as { replayed?: unknown };
+                const parsed = await res.json() as { replayed?: unknown; degraded?: unknown; inheritedBlocks?: unknown; parentBlocks?: unknown };
                 replayed = parsed.replayed === true;
+                degraded = parsed.degraded === true;
+                inheritedBlocks = Array.isArray(parsed.inheritedBlocks) ? parsed.inheritedBlocks.length : 0;
+                parentBlocks = typeof parsed.parentBlocks === "number" ? parsed.parentBlocks : undefined;
             } catch {
                 replayed = false;
+            }
+            // #5123: server-authoritative degenerate flag — zero inherited fold state while
+            // the parent held blocks (branch point collapsed below every block). Claiming
+            // "adopted" sets publicForkReceipt and skips resume-inheritance, so the child
+            // replays raw on its next turn. Degrade instead: the receipt stays unset, so
+            // the #1486 ref-overlap recovery runs. The server computes this from its own
+            // ledger, so no reliance on a count a mixed-version peer may lack (#5123).
+            if (degraded) {
+                opts.log?.(`fork child ${opts.childConversationId} from parent ${opts.parentConversationId} inherited 0 of ${parentBlocks ?? "?"} blocks (inherited ${inheritedBlocks}, branch point ${branchPoint}/${core.length}); degrading to resume-inheritance (#5123)`);
+                return { outcome: "degraded", reason: `fork inherited 0 of ${parentBlocks ?? "?"} parent blocks (branch point ${branchPoint}/${core.length})` };
             }
             opts.log?.(`fork child ${opts.childConversationId} adopted parent ${opts.parentConversationId} at branch point ${branchPoint}${replayed ? " (replayed)" : ""} (#2399)`);
             return { outcome: "adopted", branchPoint, replayed };
