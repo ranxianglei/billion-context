@@ -46,6 +46,10 @@ test("#5782: a freshly cold-loaded session survives byte-pressure eviction; the 
     const a = getSession("sess-a");
     a.metadata.blob = "a".repeat(100_000); // ≈200 KiB live weight
     markDirty(a);
+    // #5806 layered a 60-second RECENT-TOUCH shield over byte-budget eviction;
+    // age A past it so this fixture keeps pinning its original premise (fresh
+    // creates without a COLD-LOAD stamp are sheddable).
+    a.lastSeen = Date.now() - 180_000;
     acquireInFlight(a);
     releaseInFlight(a);
     const b = getSession("sess-b");
@@ -59,6 +63,7 @@ test("#5782: a freshly cold-loaded session survives byte-pressure eviction; the 
     // Phase 2 — touching A again is a real memory miss: the reload pays the
     // full rebuild, stamps the grace, and the adoption path must NOT evict A
     // to make room — the non-graced peer absorbs the pressure instead.
+    b.lastSeen = Date.now() - 180_000; // #5806: age B or adoption has nothing sheddable
     const a2 = getSession("sess-a");
     assert.notEqual(a2, a, "reload built a NEW object");
     assert.ok(a2.coldLoadedAt !== undefined && Date.now() - a2.coldLoadedAt < 5_000, "cold-load stamp present after reload");
@@ -79,6 +84,7 @@ test("#5782: a freshly cold-loaded session survives byte-pressure eviction; the 
     // Negative direction — grace is a WINDOW, not a pin: once A ages out of
     // it, normal LRU resumes and the byte budget means what it said before.
     a2.coldLoadedAt = Date.now() - 11 * 60_000;
+    a2.lastSeen = Date.now() - 180_000; // #5806: expire BOTH windows, not just the cold-load one
     acquireInFlight(b2);
     releaseInFlight(b2);
     assert.deepEqual(poolIds(), ["sess-b"], "grace expired → A evicted by ordinary LRU again");
@@ -102,7 +108,7 @@ test("#5782: a full pool still admits when every idle candidate is graced (count
         assert.equal(_sessionsSizeForTest(), 2, "pool stayed at the count cap");
         assert.ok(poolIds().includes("s-c"), "C admitted");
         assert.ok(!poolIds().includes("s-a") || !poolIds().includes("s-b"), "one graced victim freed the slot");
-        assert.ok(lines.some(l => l.includes("cold-load grace overridden for count-cap admission")), `override logged loudly: ${JSON.stringify(lines)}`);
+        assert.ok(lines.some(l => l.includes("count-cap admission overriding an eviction-exemption window")), `override logged loudly: ${JSON.stringify(lines)}`);
     } finally {
         setLogCapture(null);
     }
@@ -129,6 +135,7 @@ test("#5782/#3918: an evicted session stays 'permanent' until its reload grants 
     peer.metadata.blob = "y".repeat(60_000); // ≈120 KiB → pair exceeds BUDGET
     markDirty(big);
     markDirty(peer);
+    big.lastSeen = Date.now() - 180_000; // #5806: freshly touched sessions ride out a minute; age big so this fixture pins the pre-#5806 discharge again
     acquireInFlight(big);
     releaseInFlight(big); // discharge evicts big (oldest idle, ungraced)
     assert.deepEqual(poolIds(), ["peer-sess"]);
@@ -147,16 +154,27 @@ test("#5782: a session heavier than the WHOLE budget warns once per cold load wi
         const heavy = getSession("heavy");
         heavy.metadata.blob = "h".repeat(200_000); // ≈400 KiB > BUDGET
         markDirty(heavy);
+        // #5806: while HOT this over-budget giant deliberately rides out the
+        // minute-long shield (that IS the fix); aged, it is sheddable again,
+        // which this fixture's original pins assume.
+        heavy.lastSeen = Date.now() - 180_000;
         acquireInFlight(heavy);
         releaseInFlight(heavy); // sole ungraced resident → evicted by discharge
         assert.deepEqual(poolIds(), [], "ungraced heavy session evicted like before");
         const reloaded = getSession("heavy"); // reload → grace + warn
         assert.ok(reloaded.coldLoadedAt !== undefined);
         assert.ok(warns.some(w => w.includes("exceeds the WHOLE resident pool budget") && w.includes("BILI_SESSION_RESIDENT_MAX_BYTES")), `actionable warn emitted: ${JSON.stringify(warns)}`);
-        const small = getSession("small-sess"); // a normal small reload must NOT warn
+        const small = getSession("small-sess"); // a normal small reload must NOT warn about its own weight
         small.metadata.blob = "s".repeat(1_000);
         markDirty(small);
-        assert.equal(warns.length, 1, "warn is tied to the over-budget measurement, not to every reload");
+        // The WHOLE-budget warn stays tied to the over-budget measurement. #5806
+        // additionally shields the just-reloaded giant while hot, so admitting
+        // `small` may surface ONE rate-limited saturation note on top —
+        // informational, and it must not repeat.
+        assert.equal(warns.filter(w => w.includes("exceeds the WHOLE resident pool budget")).length, 1,
+            `whole-budget warn tied to the measurement: ${JSON.stringify(warns)}`);
+        assert.ok(warns.filter(w => w.includes("pool saturated")).length <= 1,
+            `at most one rate-limited saturation note: ${JSON.stringify(warns)}`);
     } finally {
         setLogCapture(null);
     }
