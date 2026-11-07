@@ -1938,7 +1938,7 @@ test("#1117 apply() installs takeoverGate keyed on currentInitiator attribution"
     }
 });
 
-test("#1158 apply() gate refusal logs each endpoint once per process with attribution state", async () => {
+test("#5613 apply() gate refusal lines: doubling cadence, per-endpoint keys, attribution state (+bili.log)", async () => {
     const proxy = await startMockProxy([]);
     const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-1158-state-"));
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-1158-"));
@@ -1964,22 +1964,26 @@ test("#1158 apply() gate refusal logs each endpoint once per process with attrib
                 assert.equal(await gate(url), false, "unattributed → refused");
                 assert.equal(await gate(url), false, "second refusal of the same endpoint");
                 let lines = refusedLines();
-                assert.equal(lines.length, 1, `expected one refusal line per endpoint, got: ${lines.join(" | ")}`);
+                // #5613 doubling cadence: the first two refusals print (counts 1, 2);
+                // the next re-print waits for count 4.
+                assert.equal(lines.length, 2, `expected doubling-cadence lines at 1 and 2, got: ${lines.join(" | ")}`);
                 // #3651 paste-safe sink: non-public hosts are masked in the line; the dedup key
                 // still uses the full URL, which the count assertions below verify.
                 assert.match(lines[0]!, /https:\/\/<private-host>\/v1\/chat\/completions/);
                 assert.match(lines[0]!, /no active initiator attribution/);
-                // A query string neither spawns a new line nor leaks into it.
+                assert.match(lines[0]!, /refusals so far: 1$/);
+                assert.match(lines[1]!, /refusals so far: 2$/);
+                // A query string shares the endpoint key: count 3 < 4 stays silent, nothing leaks.
                 assert.equal(await gate(`${url}?key=sk-do-not-log`), false);
-                assert.equal(refusedLines().length, 1);
-                assert.ok(!fs.readFileSync(logFile, "utf8").includes("do-not-log"), "query string must not reach the log");
-                // A different endpoint earns its own line.
-                assert.equal(await gate("https://api.other-probe.test/v1/messages"), false);
                 assert.equal(refusedLines().length, 2);
+                assert.ok(!fs.readFileSync(logFile, "utf8").includes("do-not-log"), "query string must not reach the log");
+                // A different endpoint earns its own first line.
+                assert.equal(await gate("https://api.other-probe.test/v1/messages"), false);
+                assert.equal(refusedLines().length, 3);
                 // Attributed traffic claims silently.
                 ctx.setInitiator({ session: { id: "s1158" } });
                 assert.equal(gate(url), true);
-                assert.equal(refusedLines().length, 2);
+                assert.equal(refusedLines().length, 3);
                 assert.equal(errs.filter((e) => e.includes("takeover gate refused")).length, 0, "#2831: must not reach the terminal surface");
             } finally {
                 console.error = origErr;
@@ -1993,7 +1997,7 @@ test("#1158 apply() gate refusal logs each endpoint once per process with attrib
     }
 });
 
-test("#1158 L2 gate three-state: thrown attribution is a distinct state; counts accumulate; transitions re-print (+bili.log)", async () => {
+test("#5613 L2 gate three-state: thrown attribution is a distinct state; doubling cadence re-prints; transitions always re-print (+bili.log)", async () => {
     const proxy = await startMockProxy([]);
     const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-1158e-state-"));
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-1158e-home-"));
@@ -2016,16 +2020,18 @@ test("#1158 L2 gate three-state: thrown attribution is a distinct state; counts 
             const refusedLines = (): string[] => (fs.existsSync(logFile) ? fs.readFileSync(logFile, "utf8") : "").split("\n").filter((l) => l.length > 0 && l.includes("takeover gate refused"));
             try {
                 const url = "https://api.gate-l2.test/v1/chat/completions";
-                // four same-state (none) refusals → exactly one line; counting continues
-                // silently (#4829: the none arm settles async — the recall claim may decode bodies)
+                // four same-state (none) refusals → doubling-cadence lines at 1, 2, 4
+                // (#5613; #4829: the none arm settles async — the recall claim may decode bodies)
                 assert.equal(await gate(url), false);
                 assert.equal(await gate(url), false);
                 assert.equal(await gate(url), false);
                 assert.equal(await gate(url), false);
                 let lines = refusedLines();
-                assert.equal(lines.length, 1, `expected one line for repeated same-state refusals, got: ${lines.join(" | ")}`);
+                assert.equal(lines.length, 3, `expected doubling-cadence lines at 1, 2, 4, got: ${lines.join(" | ")}`);
                 assert.match(lines[0]!, /no active initiator attribution/);
                 assert.match(lines[0]!, /refusals so far: 1$/);
+                assert.match(lines[1]!, /refusals so far: 2$/);
+                assert.match(lines[2]!, /refusals so far: 4$/);
                 // the ALS boundary starts throwing (disposed/closing agent scope) →
                 // new category → re-print carrying the accumulated count.
                 // #2924: `threw` now goes through the bounded settle-retry
@@ -2037,23 +2043,23 @@ test("#1158 L2 gate three-state: thrown attribution is a distinct state; counts 
                 _setThrewRetryForTest({ attempts: 2, delayMs: 1 });
                 assert.equal(await gate(url), false);
                 lines = refusedLines();
-                assert.equal(lines.length, 2, `expected a state-transition re-print, got: ${lines.join(" | ")}`);
-                assert.match(lines[1]!, /currentInitiator\(\) threw \(agent initiator scope is disposed\)/);
-                assert.match(lines[1]!, /refusals so far: 5 \(state none→threw\)$/);
-                // further thrown refusals stay silent again
+                assert.equal(lines.length, 4, `expected a state-transition re-print, got: ${lines.join(" | ")}`);
+                assert.match(lines[3]!, /currentInitiator\(\) threw \(agent initiator scope is disposed\)/);
+                assert.match(lines[3]!, /refusals so far: 5 \(state none→threw\)$/);
+                // further thrown refusals stay silent until the next doubling step or transition
                 assert.equal(await gate(url), false);
-                assert.equal(refusedLines().length, 2);
+                assert.equal(refusedLines().length, 4);
                 // back to plain none → transition the other way, count keeps running
                 ctx.agents.currentInitiator = () => undefined;
                 assert.equal(await gate(url), false);
                 lines = refusedLines();
-                assert.equal(lines.length, 3);
-                assert.match(lines[2]!, /refusals so far: 7 \(state threw→none\)$/);
+                assert.equal(lines.length, 5);
+                assert.match(lines[4]!, /refusals so far: 7 \(state threw→none\)$/);
                 // attributed traffic claims silently — no line
                 ctx.agents.currentInitiator = origCI;
                 ctx.setInitiator({ session: { id: "s1158l2" } });
                 assert.equal(gate(url), true);
-                assert.equal(refusedLines().length, 3);
+                assert.equal(refusedLines().length, 5);
                 // the durable copy carries the same lines into bili.log, [dsh-client]-marked
                 const content = fs.readFileSync(logFile, "utf8");
                 // #3651: the durable line masks non-public upstream hosts (paste-safe sink), loopback stays verbatim.
@@ -2065,6 +2071,54 @@ test("#1158 L2 gate three-state: thrown attribution is a distinct state; counts 
             }
         });
     } finally {
+        proxy.close();
+        rmrf(stateHome);
+        rmrf(home);
+        _resetRegisterForTest(undefined);
+    }
+});
+
+test("#5613 gate refusal line self-describes egressed scale: body bytes + resolved window (or unknown)", async () => {
+    const proxy = await startMockProxy([]);
+    const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-5613d-state-"));
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-5613d-home-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin, XDG_STATE_HOME: stateHome }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            const ctx = mockCtx();
+            // Wire the model services the way a real host would so the gate can
+            // resolve a real window — the #5613 session's egressed scale was
+            // otherwise unprovable from the logs.
+            class Llm5613d {
+                async resolveModelInfo(): Promise<undefined> {
+                    return undefined;
+                }
+            }
+            ctx.setModelServices(new Llm5613d(), { currentSelection: () => ({ provider: "p5613d", model: "m5613d" }) });
+            apply(ctx);
+            await waitFor(() => ctx.registeredTools.length === 1, "initial attach tool registration");
+            const gate = _stateTakeoverGateForTest();
+            assert.ok(gate !== undefined, "takeoverGate installed");
+            const url = "https://api.gate-5613d.test/v1/chat/completions";
+            const logFile = path.join(stateHome, "billion-context", "bili.log");
+            const refusedLines = (): string[] => (fs.existsSync(logFile) ? fs.readFileSync(logFile, "utf8") : "").split("\n").filter((l) => l.length > 0 && l.includes("takeover gate refused"));
+            // A sub-ceiling unattributed body rides #1117 DIRECT; its durable line must
+            // carry the request's own scale — measured body bytes + resolved window.
+            _setModelInfoForTest({ provider: "p5613d", model: "m5613d", contextWindow: 1_000_000 });
+            assert.equal(await gate(url, { bytes: 927_000 }), false, "sub-ceiling unattributed body rides #1117 direct");
+            let lines = refusedLines();
+            assert.equal(lines.length, 1, `expected one refusal line, got: ${lines.join(" | ")}`);
+            assert.match(lines[0]!, / — body 927000B, window 1000000 — refusals so far: 1$/);
+            // Window unresolvable → the SAME line degrades to `window unknown` (never a
+            // fabricated number) and the doubling cadence re-prints at count 2.
+            _setModelInfoForTest();
+            assert.equal(await gate(url, { bytes: 927_000 }), false);
+            lines = refusedLines();
+            assert.equal(lines.length, 2, `expected the doubling-cadence re-print, got: ${lines.join(" | ")}`);
+            assert.match(lines[1]!, / — body 927000B, window unknown — refusals so far: 2$/);
+        });
+    } finally {
+        _setModelInfoForTest();
         proxy.close();
         rmrf(stateHome);
         rmrf(home);

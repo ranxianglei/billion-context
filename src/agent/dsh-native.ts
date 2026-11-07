@@ -2109,14 +2109,15 @@ export function apply(ctx: PluginContext): void {
     // RETRY_INTERVAL_MS until a proxy lands.
     maybeRetry(ctx);
 
-    // #1158 L2: a refusal sends model traffic DIRECT. First refusal per
-    // endpoint logs once; same-state refusals accumulate silently and re-print
-    // only on an attribution STATE change (none↔threw), always carrying the
-    // cumulative count — bounded noise (#1117 silence preserved) while a
-    // "dozens refused, one passed" distribution becomes visible. The durable
-    // copy goes through persistClientEvent: GUI hosts swallow stderr, which is
-    // exactly how the reported zero-traffic case stayed invisible.
-    const gateRefusals = new Map<string, { state: string; count: number }>();
+    // #1158 L2: a refusal sends model traffic DIRECT. The durable line re-prints
+    // on every attribution STATE change (none↔threw) AND on a doubling cadence
+    // of same-state refusals (#5613: counts 1, 2, 4, 8…), always carrying the
+    // cumulative count — bounded noise (~2·log₂ N lines per endpoint-state run,
+    // #1117 silence preserved) while a "dozens refused, one passed" distribution
+    // becomes visible. The durable copy goes through persistClientEvent: GUI
+    // hosts swallow stderr, which is exactly how the reported zero-traffic case
+    // stayed invisible.
+    const gateRefusals = new Map<string, { state: string; count: number; logged: number }>();
     const gateKeyOf = (url: string): string => {
         try {
             const u = new URL(url);
@@ -2187,24 +2188,37 @@ export function apply(ctx: PluginContext): void {
         attrReportedRefusals = 0;
         reportAttrHealth();
     };
-    const refuse = (url: string, attr: GateAttribution): false => {
+    const refuse = (url: string, attr: GateAttribution, detail?: { bytes?: number; window?: number | undefined }): false => {
         const key = gateKeyOf(url);
         const prev = gateRefusals.get(key);
         const count = (prev?.count ?? 0) + 1;
         const changed = prev !== undefined && prev.state !== attr.state;
+        // #5613: repeated same-state refusals used to stay silent after the first
+        // line — dozens of uncompressed egresses left exactly one trace in
+        // bili.log, so a leak ran invisible for hours. Re-print on a doubling
+        // cadence (same bounded-noise discipline as noteAttrRefusal above), and
+        // carry this request's body size + resolved window so any single line
+        // is self-describing (the #5613 session's 927K body was otherwise
+        // unprovable from the logs).
+        const doubled = prev !== undefined && count >= prev.logged * 2;
         if (prev === undefined && gateRefusals.size >= 256) gateRefusals.clear();
-        gateRefusals.set(key, { state: attr.state, count });
-        if (prev === undefined || changed) {
+        const entry = { state: attr.state, count, logged: prev?.logged ?? 0 };
+        if (prev === undefined || changed || doubled) {
             const reason =
                 attr.state === "threw"
                     ? `currentInitiator() threw (${attr.message}) — agent scope disposed/closing mid-request?`
                     : attr.state === "none" && attr.initiatorPresent
                         ? "initiator present but missing session id"
                         : "no active initiator attribution (agentless/background lane, third-party in-process caller, or stale attribution after host resume?)";
-            const suffix = prev !== undefined ? ` (state ${prev.state}→${attr.state})` : "";
-            const line = `bili-native-dsh: model request sent DIRECT (uncompressed) — takeover gate refused ${key}: ${reason} — refusals so far: ${count}${suffix}`;
+            const suffix = changed && prev !== undefined ? ` (state ${prev.state}→${attr.state})` : "";
+            const meas = detail?.bytes !== undefined
+                ? ` — body ${detail.bytes}B, window ${detail.window ?? "unknown"}`
+                : "";
+            const line = `bili-native-dsh: model request sent DIRECT (uncompressed) — takeover gate refused ${key}: ${reason}${meas} — refusals so far: ${count}${suffix}`;
             persistClientEvent(line);
+            entry.logged = count;
         }
+        gateRefusals.set(key, entry);
         if (attr.state !== "ok") {
             noteAttrRefusal(attr.state, {
                 ...(attr.state === "threw" ? { message: attr.message } : {}),
@@ -2258,13 +2272,16 @@ export function apply(ctx: PluginContext): void {
         // model-catalog fallback) — size the bar at max(declared, 1M) so an
         // undersized declaration cannot false-refuse a body the real upstream
         // would accept.
-        const doom = bodyProvablyOverWindow(body, init, effectiveContextWindow(ctx));
+        const declaredWindow = effectiveContextWindow(ctx);
+        const doom = bodyProvablyOverWindow(body, init, declaredWindow);
         if (doom !== undefined) {
             persistClientEvent(`bili-native-dsh: takeover gate refused ${gateKeyOf(url)} LOCALLY (422) — attribution threw and body ≥${doom.floorTokens} tok (core est ${doom.coreBytes}B/4${doom.mediaBytes > 0 ? `, ${doom.mediaBytes}B media excluded` : ""}) exceeds window ${doom.window} (declared ${doom.declaredWindow}; never assumes below ${MIN_ASSUMED_WINDOW_TOKENS}); a direct send would 400 upstream (#2924/#4111)`);
             noteAttrRefusal("threw", { message, endpoint: maskUrlForDiagnostics(gateKeyOf(url)) });
             return "refuse-oversized";
         }
-        return refuse(url, attributionOf(ctx));
+        // #5613: the refusal line must carry the request's own scale — a silent
+        // 927K-token egress is only diagnosable if SOME line says how big it was.
+        return refuse(url, attributionOf(ctx), { bytes: body?.bytes, window: declaredWindow });
     };
     // #4068/#4079: `none` keeps #1117 direct semantics by design — an
     // agentless lane is not ours to manage — but a body whose optimistic
@@ -2280,13 +2297,15 @@ export function apply(ctx: PluginContext): void {
         // #4079: same undersized-declaration guard as the threw arm — the
         // bar never assumes below the 1M common window floor. #4111: same
         // media-aware core-text caliber too (see bodyProvablyOverWindow).
-        const unattributedDoom = bodyProvablyOverWindow(body, init, effectiveContextWindow(ctx));
+        const declaredWindow = effectiveContextWindow(ctx);
+        const unattributedDoom = bodyProvablyOverWindow(body, init, declaredWindow);
         if (unattributedDoom !== undefined) {
             persistClientEvent(`bili-native-dsh: takeover gate refused ${gateKeyOf(url)} LOCALLY (422) — unattributed body ≥${unattributedDoom.floorTokens} tok (core est ${unattributedDoom.coreBytes}B/4${unattributedDoom.mediaBytes > 0 ? `, ${unattributedDoom.mediaBytes}B media excluded` : ""}) exceeds window ${unattributedDoom.window} (declared ${unattributedDoom.declaredWindow}; never assumes below ${MIN_ASSUMED_WINDOW_TOKENS}); a direct send would be a guaranteed upstream rejection (#4068/#4079/#4111)`);
             noteAttrRefusal(attr.state, { endpoint: maskUrlForDiagnostics(gateKeyOf(url)) });
             return "refuse-oversized-unattributed";
         }
-        return refuse(url, attr);
+        // #5613: same self-describing-line contract as the threw arm above.
+        return refuse(url, attr, { bytes: body?.bytes, window: declaredWindow });
     };
     state.takeoverGate = (url, body, init) => {
         const attr = attributionOf(ctx);
