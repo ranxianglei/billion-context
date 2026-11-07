@@ -49,7 +49,7 @@ jobs:
         name: Pack candidate
         run: |
           set -e
-          npm ci || npm install
+          npm install --no-audit --no-fund
           npm run build
           npm pack
       - if: env.ENDPOINT_SET == 'true'

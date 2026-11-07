@@ -82,7 +82,7 @@ jobs:
           cache: npm
 
       - name: Install deps
-        run: npm ci
+        run: npm install --no-audit --no-fund
 
       # tsx resolves `acp-kernel` to its built dist (kernel/ is a workspace
       # package) — same prerequisite as the main test matrix.
