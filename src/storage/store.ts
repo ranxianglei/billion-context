@@ -1131,8 +1131,13 @@ export class UnifiedStore {
                 .all(s.sessionId) as StoredBlockRow[]) {
                 storedBlocks.set(row.block_id, row);
             }
+            // #5898 review (P3): rebuild the O(1) membership set the
+            // pre-#5744 code had — a per-stored-block Array.some over the
+            // incoming blocks is O(stored×incoming) string compares on the
+            // sync record() path that #5744 exists to make cheaper.
+            const incomingBlockIds = new Set(input.blocks.map((b) => b.blockId));
             for (const [blockId, stale] of storedBlocks) {
-                if (input.blocks.some((b) => b.blockId === blockId)) continue;
+                if (incomingBlockIds.has(blockId)) continue;
                 // referencing row first, then release (#4242 delete-on-zero)
                 this.db.prepare("DELETE FROM blocks WHERE session_id = ? AND block_id = ?").run(s.sessionId, blockId);
                 this.releaseContent(stale.summary_hash);
