@@ -1712,6 +1712,35 @@ export const CALIBRATION_CLAMP_MAX = 4;
 // One lucky/degenerate pair must not flip every estimate on the route.
 export const CALIBRATION_SAMPLE_WINDOW = 3;
 const CALIBRATION_CONSISTENCY_RATIO = 2;
+// #4504 (round 2, #2313 shim profile): a local OpenAI-compatible endpoint may
+// bill at a divergent caliber — the #2313 incident shim billed ~200 B/token
+// (chars/40), i.e. ~1/10 of the chars/4 body estimate; overhead dilution pulls
+// the observed sample/pair ratio toward ~0.08, below CALIBRATION_SAMPLE_MIN by
+// design (k̂ must not learn such factors). This floor bounds how far below the
+// own-body band a report may sit and still correspond to its own payload when
+// the incumbent is ESTIMATE-sourced (an unmeasured phantom, not evidence).
+const DIVERGENT_CALIBER_FLOOR = 0.05;
+// #4425: write-side twin of the #4383 reader guard (the read side degrades a
+// stale anchor once it sits far below the established load; the write side
+// must be stricter because here the incumbent is EVIDENCE BEING DESTROYED,
+// not a value being read). A usage sample billing less than one order of
+// magnitude below the session's established input scale (lastInputTokens +
+// active compress credit — resetSessionCompression zeroes the baseline at
+// native-compaction boundaries, so post-compaction small settles bootstrap
+// freely) is an auxiliary/sidecar request that slipped past the side-request
+// lane's evidence allowlist and shared the main session id (#2740 documents
+// the claude-code no-stop s2 shape taking the normal lane; any unrecognized
+// aux shape is the same class). Such a sample is billing-only: it must not
+// clear the emergency shrink arm, wipe overflow evidence, burn the
+// post-rebuild anchor, consume or roll the main turn's k̂ pending pair, or
+// book a cache ledger line whose body pairing points at the aux request
+// (#4425 facets 1–5). Margin: aux samples typically bill <2% of session load
+// (rejected), while the smallest legitimate main settle after an armed round
+// still bills ≥ ~23% of the arm estimate — char-based estimator inflation
+// caps around 4.4× on the measured band (#4383 evidence) — so 1/10 separates
+// the two with margin in both directions. A rejected sample self-heals within
+// one main turn: the next accepted settle refreshes the incumbent scale.
+export const NON_MAIN_USAGE_RATIO = 0.1;
 
 /** #2867/#2973: the canonical incoming system fp is a responses-LANE-ONLY
  *  classification input — its sole writer is prepare-responses'
@@ -1841,11 +1870,90 @@ export function noteOutboundContextEstimates(
     session.stats.contextTokensSource = "estimate";
 }
 
+/** #1933 F1 / #4425: record this request's billed-caliber text estimate as the
+ *  pending k̂ pair (consumed by the next same-route settleUsageReport). Shared
+ *  by all four prepare lanes so the clobber discipline cannot drift per wire.
+ *  #4425: an auxiliary-sized body (< NON_MAIN_USAGE_RATIO × the outstanding
+ *  pair) must NOT replace it — aux requests prepare and settle between main
+ *  turns, and if one swapped in its tiny denominator the main settle would
+ *  consume a (auxEstimate, mainBilled) mispair the plausibility band rejects,
+ *  starving k̂ forever on hosts that fire an aux call before every tool call.
+ *  Keeping the larger pair is safe: append-only histories only grow between
+ *  main turns, so a surviving large pair is either overwritten by the next
+ *  main prepare or consumed in-band by a billed total at least as large as
+ *  its true ratio. */
+export function noteLocalTextEstimate(session: Session, estimate: number, origin?: string): void {
+    const pending = session.stats.lastLocalTextEstimate;
+    if (pending !== undefined && estimate < NON_MAIN_USAGE_RATIO * pending) return;
+    session.stats.lastLocalTextEstimate = estimate;
+    if (origin) session.stats.lastLocalTextEstimateOrigin = origin;
+}
+
 export function settleUsageReport(
     session: Session,
     s: { total: number; reportedCached: number | null; output?: number; protocol?: string; upstream?: string; creation?: number },
     localTextEstimate?: number,
 ): void {
+    // #4425: non-main sample gate — see NON_MAIN_USAGE_RATIO. An auxiliary
+    // request that slipped past the side lane settles here with a tiny total;
+    // running the effect set below would destroy main-turn decision state
+    // (arm, overflow evidence, post-rebuild anchor, k̂ pair, cache-line
+    // pairing). Raw billing stays honest: the tokens were really billed.
+    // Complements the #4805 membership gate, which catches MAIN-scale foreign
+    // payloads by id evidence; this one catches sub-scale samples regardless
+    // of whether any ids exist at all (id-less shapes are exactly where
+    // #4805 is structurally blind).
+    const establishedScale = (session.stats.lastInputTokens ?? 0) + (session.stats.compressCreditTokens ?? 0);
+    if (s.total > 0 && establishedScale > 0 && s.total < NON_MAIN_USAGE_RATIO * establishedScale) {
+        // #4504 (CI follow-up to #4425): sub-scale w.r.t. the incumbent is not,
+        // by itself, aux-shaped. A MAIN turn whose payload shrank — a model
+        // switch onto a smaller window, a preflight fold off a poisoned or armed
+        // incumbent (#1492 self-heal, preflight-compress e2e) — legitimately
+        // bills far below the previous measurement, and those contracts pin
+        // that its real report overwrites such incumbents. The discriminator is
+        // whether the sample matches the prepared body it bills: the pending k̂
+        // pair noted at prepare time on the SAME route. An aux slip's own pair
+        // was refused by noteLocalTextEstimate's clobber guard (body < 1/10 of
+        // the main pair), so its sample sits far outside the protected main
+        // pair's plausibility band; a same-route sample inside the band is this
+        // request's own report and takes the normal settle path below.
+        const pair = session.stats.lastLocalTextEstimate;
+        const pairOrigin = normalizeUpstreamOrigin(session.stats.lastLocalTextEstimateOrigin);
+        const sampleOrigin = normalizeUpstreamOrigin(s.upstream);
+        const consistentWithOwnBody = pair !== undefined && pair >= CALIBRATION_MIN_ESTIMATE
+            && pairOrigin !== undefined && sampleOrigin !== undefined && pairOrigin === sampleOrigin
+            && s.total >= CALIBRATION_SAMPLE_MIN * pair && s.total <= CALIBRATION_SAMPLE_MAX * pair;
+        // #4504 (round 2): two more legitimate sub-scale MAIN shapes the band
+        // above cannot see through. (b) A report measured on a DIFFERENT
+        // upstream than the incumbent's provenance is a route-change recovery
+        // (#2313: baseline measured on a dead route, current route's real scale
+        // ~1/22 of it) — #1933 F2 already treats cross-origin measurements as
+        // non-comparable evidence, so such a sample cannot be an aux slip of
+        // the incumbent's context. (c) Against an ESTIMATE-sourced incumbent
+        // (an unmeasured phantom — poisoned meter, armed round) there is no
+        // real evidence to protect, so a same-route sample corresponding to
+        // its own prepared body is admitted even at a divergent billing
+        // caliber below the calibration band (#2313 b/d: the probe-400 arms
+        // re-stamp the origin to the live route, leaving only the body match).
+        // USAGE-sourced incumbents keep the strict band above — that is the
+        // #4425/#4805 protection surface.
+        const incumbentOrigin = normalizeUpstreamOrigin(session.stats.lastInputTokensOrigin);
+        const crossOriginRecovery = sampleOrigin !== undefined && incumbentOrigin !== undefined
+            && sampleOrigin !== incumbentOrigin;
+        const divergentCaliberRecovery = !crossOriginRecovery
+            && session.stats.lastInputTokensSource === "estimate"
+            && pair !== undefined && pair >= CALIBRATION_MIN_ESTIMATE
+            && pairOrigin !== undefined && pairOrigin === sampleOrigin
+            && s.total >= DIVERGENT_CALIBER_FLOOR * pair && s.total <= CALIBRATION_SAMPLE_MAX * pair;
+        if (!consistentWithOwnBody && !crossOriginRecovery && !divergentCaliberRecovery) {
+            session.stats.inputTokens += s.total;
+            // #4899 parity: the USD ledger bills on this path too — the tokens
+            // were really spent even though no decision state moves.
+            billInputUsage(session, { total: s.total, cached: s.reportedCached, creation: s.creation });
+            loggerLog("info", `[${session.id}] [acp-usage] non-main sample input=${s.total} (<${Math.round(NON_MAIN_USAGE_RATIO * 100)}% of established ${Math.round(establishedScale)}) — decision state kept, billing only (#4425)`);
+            return;
+        }
+    }
     // #793: a zero-total sample carries no information (gateway placeholder or
     // relay echo) — it must not clobber the last trusted lastInputTokens.
     if (s.total > 0) {

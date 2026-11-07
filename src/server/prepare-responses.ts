@@ -6,6 +6,7 @@ import type { CompressReasoningConfig } from "../reasoning-drop.js";
 import { resolveAbsorbSettings } from "../compress-settings.js";
 import { effectivePromptCacheRouting, resolveCompressProtocol, type CompressSettings, type ProxyOptions } from "../config.js";
 import { currentCalibrationFactor, strippedResponseIdWarning } from "../util.js";
+import { noteLocalTextEstimate } from "../cache-ledger.js";
 import { applyReasoningDrop, diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, makeFoldPointReasoningDroppable, planReasoningDrop, repairResponsesAssistantOrdering, reapOrphansLogged, resolveKnownOutputCeiling, runNudgeDecision, stripKernelSummaries, usageGradeInputBaseline, warnResponsesReasoningPairs, type Prepared } from "../server.js";
 import { yieldToEventLoop } from "../yield-loop.js";
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, resolveDecisionRange, stripDecisionReasoningFields, type DecideConfig } from "../nudge-decide.js";
@@ -693,12 +694,11 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         // see the anthropic-lane counterpart above. #4166: mid-history sys/dev
         // items are cores now, so both estimators see the same wire set the
         // preflight base measures.
-        session.stats.lastLocalTextEstimate = estimateCoreMessages(processedMessages.length > 0 ? processedMessages : originalMessages)
+        // #4425: an aux-sized body must not clobber the outstanding main-turn pair.
+        noteLocalTextEstimate(session, estimateCoreMessages(processedMessages.length > 0 ? processedMessages : originalMessages)
             + countSystemAndToolsTokens(responsesDevContent ?? "", toolsOut)
             + loadedToolTokens
-            + imageReserve;
-        const responsesPairOrigin = billingUpstream ?? upstreamOrigin;
-        if (responsesPairOrigin) session.stats.lastLocalTextEstimateOrigin = responsesPairOrigin;
+            + imageReserve, billingUpstream ?? upstreamOrigin);
     }
     snapshotMessages(session, originalMessages);
     markDirty(session);

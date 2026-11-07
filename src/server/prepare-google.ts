@@ -5,6 +5,7 @@ import { coreToGoogle, googleToCore, normalizeGoogleUserPartOrder, type BiliMess
 import type { ProxyOptions } from "../config.js";
 import { pluginAgentHeader } from "../plugin.js";
 import { currentCalibrationFactor } from "../util.js";
+import { noteLocalTextEstimate } from "../cache-ledger.js";
 import { diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, makeFoldPointReasoningDroppable, reapOrphansLogged, resolveKnownOutputCeiling, runNudgeDecision, stripKernelSummaries, usageGradeInputBaseline, type Prepared } from "../server.js";
 import { isStrictReasoningEcho } from "../strict-echo.js";
 import { yieldToEventLoop } from "../yield-loop.js";
@@ -403,10 +404,10 @@ export async function prepareGoogle(
     // responses lanes (same estimateCoreMessages caliber, projected thinking
     // mass included); title-gen side requests skip like the rows above.
     if (!isTitleGen) {
-        session.stats.lastLocalTextEstimate = estimateCoreMessages(processedMessages.length > 0 ? processedMessages : originalMessages)
+        // #4425: an aux-sized body must not clobber the outstanding main-turn pair.
+        noteLocalTextEstimate(session, estimateCoreMessages(processedMessages.length > 0 ? processedMessages : originalMessages)
             + countSystemAndToolsTokens(googleOutboundSystem ?? "", toolsOut)
-            + imageReserveFor(session, "google", rebuilt, opts, upstreamOrigin);
-        if (upstreamOrigin) session.stats.lastLocalTextEstimateOrigin = upstreamOrigin;
+            + imageReserveFor(session, "google", rebuilt, opts, upstreamOrigin), upstreamOrigin);
     }
     snapshotMessages(session, originalMessages);
     markDirty(session);
