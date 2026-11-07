@@ -67,6 +67,10 @@ async function startHarness(
             routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "claude-test": { context: 400_000 }, "gpt-test": { context: 400_000 } } } },
             modelContextLimit: 400_000,
             kernelConfig: defaultConfig(400_000),
+            // The #4204 side-lane tests below rely on the empty-turn
+            // continuation refetch, which is opt-in (degenerateRetry,
+            // default OFF).
+            degenerateRetry: true,
             promptCache: { routing: "auto" },
             compress,
             sessionHeader: "x-acp-session",
