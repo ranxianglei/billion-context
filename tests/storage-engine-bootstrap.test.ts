@@ -961,11 +961,11 @@ test("nodeSqliteUpgradeHint: pins the Node >= 22.5 threshold and the levers (#33
     assert.equal(nodeSqliteUpgradeHint("23.0.0"), "", "23.x ships node:sqlite — no hint");
     assert.equal(nodeSqliteUpgradeHint("24.11.0"), "", "24.x ships node:sqlite — no hint");
     const old = nodeSqliteUpgradeHint("20.20.2");
-    assert.match(old, /Node\.js >= 22\.5/, "the #3385 node version gets the upgrade lever");
+    assert.match(old, /Node\.js 22 or newer/, "the #3385 node version gets the upgrade lever");
     assert.match(old, /npmmirror/, "the hint names the builtin mirrors");
     assert.match(old, /BILI_UPDATE_REGISTRY/, "the hint names the registry override");
-    assert.match(nodeSqliteUpgradeHint("22.4.9"), /Node\.js >= 22\.5/, "22.4.x predates node:sqlite");
-    assert.match(nodeSqliteUpgradeHint("19.9.9"), /Node\.js >= 22\.5/, "19.x predates node:sqlite");
+    assert.match(nodeSqliteUpgradeHint("22.4.9"), /Node\.js 22 or newer/, "22.4.x predates node:sqlite");
+    assert.match(nodeSqliteUpgradeHint("19.9.9"), /Node\.js 22 or newer/, "19.x predates node:sqlite");
     assert.equal(nodeSqliteUpgradeHint("22.5.1"), "", "22.5.1 ships node:sqlite — no hint");
 });
 
