@@ -210,6 +210,14 @@ entries:
     group: envonly
     desc_en: "Grace period for attach ownership evidence."
     desc_zh: "挂接归属证据的宽限期。"
+  - key: BILI_SILENT_DIRECT_MAX_MB
+    type: number
+    default: "(built-in)"
+    kind: env-only
+    audience: user
+    group: envonly
+    desc_en: "Silent-direct oversized guard ceiling (MiB)."
+    desc_zh: "静默直连超大请求保护上限（MiB）。"
   - key: BILI_PROVIDER_REWRITES
     type: string
     default: "unset"

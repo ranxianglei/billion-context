@@ -740,7 +740,7 @@ export const MAX_SILENT_DIRECT_BODY_BYTES = 8 * 1024 * 1024;
 /** #5826-review knob: `BILI_SILENT_DIRECT_MAX_MB` (megabytes, > 0; fractions
  *  allowed). Resolved per call so env edits apply without a reload; missing or
  *  invalid values fall back to the default above. */
-export function silentDirectBodyCapBytes(): number {
+function silentDirectBodyCapBytes(): number {
     const mb = Number(process.env.BILI_SILENT_DIRECT_MAX_MB ?? "");
     return Number.isFinite(mb) && mb > 0 ? Math.floor(mb * 1024 * 1024) : MAX_SILENT_DIRECT_BODY_BYTES;
 }
