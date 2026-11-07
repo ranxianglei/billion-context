@@ -5,7 +5,7 @@ import { coreToResponsesWithToolImages as coreToResponses, patchResponsesInputWi
 import { buildVisibilityMarker } from "./core.js";
 import { hoistTrappedToolItems } from "../tool-pair-order.js";
 import { hashId, strippedResponseIdWarning } from "../util.js";
-import { composeStreamFilters, createBiliArtifactFilter, createIdentityStreamFilter, createMarkerLineFilter, createTagEchoFilter, stripResponsesText, containsBiliInternalText, containsMarkerLineText, containsRenderTagText, containsToolCallEmissionText, ACP_NAME_ALT, type TagEchoFilter } from "./tag-echo-filter.js";
+import { composeStreamFilters, createBareRefHeadFilter, createBiliArtifactFilter, createIdentityStreamFilter, createMarkerLineFilter, createTagEchoFilter, stripResponsesText, containsBareRefHeadWire, containsBiliInternalText, containsEchoResidue, containsMarkerLineText, containsRenderTagText, containsToolCallEmissionText, ACP_NAME_ALT, type TagEchoFilter } from "./tag-echo-filter.js";
 import { degenerateTurnWarning } from "../degenerate-turn.js";
 import { log as loggerLog } from "../logger.js";
 import { normalizeSseLineEndings, finalizeSseLineEndings } from "../sse-util.js";
@@ -378,6 +378,7 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
             // — the absorb section exists on this request's wire iff absorbName
             // was resolved for it).
             const absorbArmedLocal = absorbName !== undefined;
+            // #5259: outermost — the bare-ref head guard acts on final outgoing bytes.
             const makeFilter = () => composeStreamFilters(
                 composeStreamFilters(
                     createTagEchoFilter((snippet) => {
@@ -390,9 +391,14 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                         loggerLog("warn", `[marker-echo] stripped model-emitted ACP confirmation marker: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
                     }),
                 ),
-                createBiliArtifactFilter((snippet) => {
-                    loggerLog("warn", `[bili-artifact] stripped model-emitted internal artifact: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
-                }),
+                composeStreamFilters(
+                    createBiliArtifactFilter((snippet) => {
+                        loggerLog("warn", `[bili-artifact] stripped model-emitted internal artifact: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+                    }),
+                    createBareRefHeadFilter((snippet) => {
+                        loggerLog("warn", `[bare-ref-head] stripped model-emitted bare ref head (#5259): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+                    }),
+                ),
             );
             const tagFilter = makeFilter();
             // Unified ACP invariant: reasoning summaries are the thinking channel —
@@ -509,7 +515,7 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                         // this fallthrough — strip on detection like the message
                         // branches above (stripResponsesText never touches tool
                         // argument fields).
-                        const chunk = (containsRenderTagText(eventStr) || containsMarkerLineText(eventStr) || containsBiliInternalText(eventStr) || (absorbArmedLocal && containsToolCallEmissionText(eventStr))) ? rebuildResponsesEvent(type, stripResponsesText(obj, absorbArmedLocal, shippedRequestText)) : rawBuf;
+                        const chunk = (containsRenderTagText(eventStr) || containsMarkerLineText(eventStr) || containsBiliInternalText(eventStr) || containsEchoResidue(eventStr) || containsBareRefHeadWire(eventStr) || (absorbArmedLocal && containsToolCallEmissionText(eventStr))) ? rebuildResponsesEvent(type, stripResponsesText(obj, absorbArmedLocal, shippedRequestText)) : rawBuf;
                         yield { kind: "meta", chunk, firstRoundOnly: true } as ParsedStreamEvent;
                     }
                 } else if (
@@ -521,7 +527,7 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                     if (mapped) {
                         yield { kind: "meta", chunk: rewriteRefEvent(type, stripResponsesText(obj), mapped), firstRoundOnly: false } as ParsedStreamEvent;
                     } else if (!suppressTextLifecycle) {
-                        const chunk = (containsRenderTagText(eventStr) || containsMarkerLineText(eventStr) || containsBiliInternalText(eventStr) || (absorbArmedLocal && containsToolCallEmissionText(eventStr))) ? rebuildResponsesEvent(type, stripResponsesText(obj, absorbArmedLocal, shippedRequestText)) : rawBuf;
+                        const chunk = (containsRenderTagText(eventStr) || containsMarkerLineText(eventStr) || containsBiliInternalText(eventStr) || containsEchoResidue(eventStr) || containsBareRefHeadWire(eventStr) || (absorbArmedLocal && containsToolCallEmissionText(eventStr))) ? rebuildResponsesEvent(type, stripResponsesText(obj, absorbArmedLocal, shippedRequestText)) : rawBuf;
                         yield { kind: "meta", chunk, firstRoundOnly: true } as ParsedStreamEvent;
                     }
                 } else if (type === "response.output_text.delta") {
@@ -623,7 +629,7 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                             remapped.delete(origId);
                             yield { kind: "meta", chunk: rewriteItemEvent(type, stripResponsesText(obj), mapped), firstRoundOnly: false } as ParsedStreamEvent;
                         } else if (!suppressTextLifecycle) {
-                            const chunk = (containsRenderTagText(eventStr) || containsMarkerLineText(eventStr) || containsBiliInternalText(eventStr) || (absorbArmedLocal && containsToolCallEmissionText(eventStr))) ? rebuildResponsesEvent(type, stripResponsesText(obj, absorbArmedLocal, shippedRequestText)) : rawBuf;
+                            const chunk = (containsRenderTagText(eventStr) || containsMarkerLineText(eventStr) || containsBiliInternalText(eventStr) || containsEchoResidue(eventStr) || containsBareRefHeadWire(eventStr) || (absorbArmedLocal && containsToolCallEmissionText(eventStr))) ? rebuildResponsesEvent(type, stripResponsesText(obj, absorbArmedLocal, shippedRequestText)) : rawBuf;
                             yield { kind: "meta", chunk, firstRoundOnly: true } as ParsedStreamEvent;
                         }
                     } else if (item?.type !== "message" || !suppressTextLifecycle) {
@@ -631,7 +637,7 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                         // this fallthrough — strip on detection like the message
                         // branches above (stripResponsesText never touches tool
                         // argument fields).
-                        const chunk = (containsRenderTagText(eventStr) || containsMarkerLineText(eventStr) || containsBiliInternalText(eventStr) || (absorbArmedLocal && containsToolCallEmissionText(eventStr))) ? rebuildResponsesEvent(type, stripResponsesText(obj, absorbArmedLocal, shippedRequestText)) : rawBuf;
+                        const chunk = (containsRenderTagText(eventStr) || containsMarkerLineText(eventStr) || containsBiliInternalText(eventStr) || containsEchoResidue(eventStr) || containsBareRefHeadWire(eventStr) || (absorbArmedLocal && containsToolCallEmissionText(eventStr))) ? rebuildResponsesEvent(type, stripResponsesText(obj, absorbArmedLocal, shippedRequestText)) : rawBuf;
                         yield { kind: "meta", chunk, firstRoundOnly: true } as ParsedStreamEvent;
                     }
                 } else if (type === "response.completed") {
