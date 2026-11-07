@@ -41,7 +41,7 @@ const ENV = "BILI_IDENTITY_HARVEST";
 export const HARVEST_TAIL_BYTES = 16 * 1024 * 1024;
 export const MAX_PROJECT_DIRS = 2000;
 /** Boundary positions compared when both sides expose roles at them. */
-export const MAX_ROLE_SPOT_CHECK = 4;
+const MAX_ROLE_SPOT_CHECK = 4;
 
 export interface IdentityHarvestCtx {
     /** The recognized conversation-identity value for this request (the raw
@@ -60,7 +60,7 @@ export interface IdentityHarvestCtx {
     messageRoles?: readonly string[] | undefined;
 }
 
-export interface IdentitySource {
+interface IdentitySource {
     /** Roster name ("claude", "codebuddy", ...). Appears in logs/tests. */
     readonly id: string;
     /** Cheap synchronous gate: header presence / id shape. Must not touch disk. */
@@ -128,7 +128,7 @@ export function alignTailIds(ctx: IdentityHarvestCtx, rows: Array<{ id: string; 
     return tail.map((r) => r.id);
 }
 
-export type HarvestResult = { ids: readonly string[]; sourceId: string } | null;
+type HarvestResult = { ids: readonly string[]; sourceId: string } | null;
 
 /** The single call site (handle.ts, once per request, BEFORE persona/fork
  *  resolution consumes identity evidence): host-stamped body ids always win —
