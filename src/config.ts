@@ -2091,8 +2091,16 @@ type FileConfig = {
      *  so `bili pi` keeps its launcher proxy. Opt OUT with `false` (or
      *  BILI_PI_INLINE=0/false/no/off) — restores attach/spawn. Resolved
      *  env > file > default; an explicit inline choice beats an announced
-     *  attach target. */
-     pi?: { subagents?: PiSubagentsFileConfig | boolean; inline?: boolean };
+     *  attach target.
+     *
+     *  `commands`: which of the bili pi-plugin slash commands to register —
+     *  "acp", "acp-cache", "acp-rule", "acp-fleet". Default ["acp",
+     *  "acp-cache"] keeps the status and cache-reconciliation entry points
+     *  while leaving the rarer acp-rule / acp-fleet off the completion list;
+     *  `[]` or `false` registers none; unknown names log a console warning
+     *  and are ignored. Takes effect on the next session (registration runs
+     *  once per session start). */
+     pi?: { subagents?: PiSubagentsFileConfig | boolean; inline?: boolean; commands?: readonly string[] | boolean };
     /** Built-in opencode-lane inline switch (#3278 port, OPT-IN — default
      *  stays the spawned proxy, per owner decision on #4687): run the
      *  opencode lane's compression IN-PROCESS — no proxy server spawned.

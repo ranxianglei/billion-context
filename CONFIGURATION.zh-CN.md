@@ -140,6 +140,7 @@
 | `claude.nativePort` | number | unset (lane sticky zone port) | BILI_CLAUDE_NATIVE_PORT | claude 原生车道钩子派生代理的精确端口钉死（严格端口：被占用时响亮拒绝而非跳端口）。 |
 | `pi.subagents` | object \| boolean | {} (acp_delegate enabled with package defaults) | PI_ACP_DELEGATE_FORCE_ENABLE, PI_ACP_DELEGATE_MAX_DEPTH, PI_ACP_DELEGATE_SYNC_TIMEOUT_MINUTES, PI_ACP_DELEGATE_IDLE_TIMEOUT_MINUTES, PI_ACP_DELEGATE_ASYNC_TIMEOUT_MINUTES, PI_ACP_DELEGATE_MAX_CONCURRENT | 内置 pi lane 子代理（acp_delegate）面（#2230 配置搬家）。billion-context.json 的 pi.subagents 段拥有 delegate 配置；acp.json 四键（delegate/delegatePrompt/displayUsage/debug）为已废弃回退源，仅段缺失时读取。prompt 取代 delegatePrompt；debug 限定子代理子系统。布尔简写 subagents: false 整体关闭。完整字段表见 CONFIGURATION.md 的 pi 段。 |
 | `pi.inline` | boolean | true (unset env+file runs inline) | BILI_PI_INLINE | pi 内联压缩通道（#3278；自 #5428 起默认开启，取代 #4687 的手动开启规则）：pi 扩展的压缩在进程内完成——不派生代理进程、无临时端口；模型流量与 /__bili//__acp 工具面由进程内引擎经伪源站服务，codex 的 Responses WebSocket 通道走随引擎启动的仅回环 WS 桥，Web UI 走随引擎启动的仅回环监听。未设置 env+文件时默认内联；显式宣告的附着目标（launcher 预置的 BILLION_CONTEXT_PROXY/ATTACH）仍压过默认，`bili pi` 照旧用 launcher 代理。不想用就 BILI_PI_INLINE=0/false/no/off 或本键设 false——恢复旧的 attach/spawn 姿态。解析顺序 env > 文件 > 默认；显式开启永远压过附着目标。人类入口:`bili -i/--inline pi`(≡ 一键车道)与 `bili -s/--server pi`(钉死代理姿态,压过继承的内联变量)。 |
+| `pi.commands` | string[] \| boolean | ["acp", "acp-cache"] |  | bili pi 插件注册哪些斜杠命令："acp"、"acp-cache"、"acp-rule"、"acp-fleet"。默认保留状态面板（/acp）与缓存对账（/acp-cache）两个入口，较冷门的 /acp-rule 与 /acp-fleet 不进入补全列表；true 注册全部四个，[] 或 false 一个都不注册。未知命令名告警一次后忽略。会话启动时读取，改配置下一个会话即生效（无需重启代理）。纯 UI 面：关闭命令不影响底层工具（acp_cache / acp_rule 对模型仍可用）与代理。 |
 | `opencode.inline` | boolean | false | BILI_OPENCODE_INLINE | opencode 内联压缩通道（#3278 移植；需手动开启——按 #4687 决定，默认仍是派生代理）：opencode 插件的压缩在进程内完成——不派生代理进程、无临时端口、无 MITM 证书；模型流量与 /__bili/ 工具面由进程内引擎经伪源站服务（已在 Bun 宿主验证）。设 true（或 BILI_OPENCODE_INLINE=1）开启。解析顺序 env > 文件；显式开启永远压过附着目标，未设置时行为与旧版一致（attach/spawn）。`bili opencode-inline` 一键车道。 |
 
 **MITM 通道**
@@ -1808,6 +1809,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 <!-- bili:gen env-map -->
 | 环境变量 | 配置文件键 | 默认值 |
 |---------|------------|--------|
+| `` | `pi.commands` | ["acp", "acp-cache"] |
 | `ACP_AUTO_RESTART_ON_UPDATE` | `autoRestartOnUpdate` | false |
 | `ACP_AUTO_UPDATE` | `autoUpdate` | true |
 | `ACP_COMPRESS_NUDGE` | `compress.injectNudge` | true |
