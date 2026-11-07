@@ -362,7 +362,7 @@ export function mcpBiliToolName(name: string): string {
  *  cannot rewrite in plugin mode). Static string + per-session-stable tool
  *  table = cache-stable, the same premise the surface flag itself rides
  *  (#3403). */
-export const MCP_DIALECT_NOTE = "On this host the context-management tools are exposed under MCP-prefixed names: call `mcp__bili__compress` (not `compress`) — likewise `mcp__bili__decompress`, `mcp__bili__search_context`, `mcp__bili__acp_status`.";
+export const MCP_DIALECT_NOTE = "On this host the context-management tools are exposed under MCP-prefixed names: call `mcp__bili__compress` (not `compress`) — likewise `mcp__bili__decompress`, `mcp__bili__search_context`, `mcp__bili__acp_status`, `mcp__bili__acp_retire`, `mcp__bili__acp_restore`, `mcp__bili__acp_rewrite`.";
 
 export function withMcpDialectNote(prompt: string, on: boolean): string {
     return on ? `${prompt}\n\n${MCP_DIALECT_NOTE}` : prompt;

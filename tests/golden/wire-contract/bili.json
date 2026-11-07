@@ -119,6 +119,84 @@
             }
           }
         }
+      },
+      {
+        "name": "acp_retire",
+        "description": "Retire compressed block(s): their summaries stop being injected into the resident view every turn, freeing that context mass, while decompress/search_context keep working on them and acp_status lists them under RETIRED BLOCKS. Use for old material you no longer need resident. Roll back with acp_restore.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "blockId": {
+              "type": "string",
+              "description": "One block id (e.g. b5)"
+            },
+            "ids": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Several block ids in one call (e.g. [\"b3\", \"b7\"])"
+            }
+          }
+        }
+      },
+      {
+        "name": "acp_restore",
+        "description": "Restore retired compression block(s) to the resident view: their summaries re-enter context from the next rebuild. No effect on blocks that are not retired.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "blockId": {
+              "type": "string",
+              "description": "One block id (e.g. b5)"
+            },
+            "ids": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Several block ids in one call (e.g. [\"b3\", \"b7\"])"
+            }
+          }
+        }
+      },
+      {
+        "name": "acp_rewrite",
+        "description": "Replace a compressed block's stored summary with shorter text you supply — no re-compression, no regeneration. The previous summary is kept one step deep for rollback; the block's original messages are untouched (decompress still returns them). Pass blockId+summary for one block, or items:[{blockId,summary}] for a batch.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "blockId": {
+              "type": "string",
+              "description": "Block id to rewrite (e.g. b5) — single-block form"
+            },
+            "summary": {
+              "type": "string",
+              "description": "The replacement summary text — single-block form"
+            },
+            "items": {
+              "type": "array",
+              "description": "Batch form: several rewrites in one call",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "blockId": {
+                    "type": "string",
+                    "description": "Block id (e.g. b5)"
+                  },
+                  "summary": {
+                    "type": "string",
+                    "description": "Replacement summary text"
+                  }
+                },
+                "required": [
+                  "blockId",
+                  "summary"
+                ]
+              }
+            }
+          }
+        }
       }
     ],
     "openai": [
@@ -255,6 +333,93 @@
             }
           }
         }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "acp_retire",
+          "description": "Retire compressed block(s): their summaries stop being injected into the resident view every turn, freeing that context mass, while decompress/search_context keep working on them and acp_status lists them under RETIRED BLOCKS. Use for old material you no longer need resident. Roll back with acp_restore.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "blockId": {
+                "type": "string",
+                "description": "One block id (e.g. b5)"
+              },
+              "ids": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Several block ids in one call (e.g. [\"b3\", \"b7\"])"
+              }
+            }
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "acp_restore",
+          "description": "Restore retired compression block(s) to the resident view: their summaries re-enter context from the next rebuild. No effect on blocks that are not retired.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "blockId": {
+                "type": "string",
+                "description": "One block id (e.g. b5)"
+              },
+              "ids": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Several block ids in one call (e.g. [\"b3\", \"b7\"])"
+              }
+            }
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "acp_rewrite",
+          "description": "Replace a compressed block's stored summary with shorter text you supply — no re-compression, no regeneration. The previous summary is kept one step deep for rollback; the block's original messages are untouched (decompress still returns them). Pass blockId+summary for one block, or items:[{blockId,summary}] for a batch.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "blockId": {
+                "type": "string",
+                "description": "Block id to rewrite (e.g. b5) — single-block form"
+              },
+              "summary": {
+                "type": "string",
+                "description": "The replacement summary text — single-block form"
+              },
+              "items": {
+                "type": "array",
+                "description": "Batch form: several rewrites in one call",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "blockId": {
+                      "type": "string",
+                      "description": "Block id (e.g. b5)"
+                    },
+                    "summary": {
+                      "type": "string",
+                      "description": "Replacement summary text"
+                    }
+                  },
+                  "required": [
+                    "blockId",
+                    "summary"
+                  ]
+                }
+              }
+            }
+          }
+        }
       }
     ],
     "responses": [
@@ -381,6 +546,87 @@
             }
           }
         }
+      },
+      {
+        "type": "function",
+        "name": "acp_retire",
+        "description": "Retire compressed block(s): their summaries stop being injected into the resident view every turn, freeing that context mass, while decompress/search_context keep working on them and acp_status lists them under RETIRED BLOCKS. Use for old material you no longer need resident. Roll back with acp_restore.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "blockId": {
+              "type": "string",
+              "description": "One block id (e.g. b5)"
+            },
+            "ids": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Several block ids in one call (e.g. [\"b3\", \"b7\"])"
+            }
+          }
+        }
+      },
+      {
+        "type": "function",
+        "name": "acp_restore",
+        "description": "Restore retired compression block(s) to the resident view: their summaries re-enter context from the next rebuild. No effect on blocks that are not retired.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "blockId": {
+              "type": "string",
+              "description": "One block id (e.g. b5)"
+            },
+            "ids": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Several block ids in one call (e.g. [\"b3\", \"b7\"])"
+            }
+          }
+        }
+      },
+      {
+        "type": "function",
+        "name": "acp_rewrite",
+        "description": "Replace a compressed block's stored summary with shorter text you supply — no re-compression, no regeneration. The previous summary is kept one step deep for rollback; the block's original messages are untouched (decompress still returns them). Pass blockId+summary for one block, or items:[{blockId,summary}] for a batch.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "blockId": {
+              "type": "string",
+              "description": "Block id to rewrite (e.g. b5) — single-block form"
+            },
+            "summary": {
+              "type": "string",
+              "description": "The replacement summary text — single-block form"
+            },
+            "items": {
+              "type": "array",
+              "description": "Batch form: several rewrites in one call",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "blockId": {
+                    "type": "string",
+                    "description": "Block id (e.g. b5)"
+                  },
+                  "summary": {
+                    "type": "string",
+                    "description": "Replacement summary text"
+                  }
+                },
+                "required": [
+                  "blockId",
+                  "summary"
+                ]
+              }
+            }
+          }
+        }
       }
     ],
     "google": [
@@ -502,6 +748,84 @@
             }
           }
         }
+      },
+      {
+        "name": "acp_retire",
+        "description": "Retire compressed block(s): their summaries stop being injected into the resident view every turn, freeing that context mass, while decompress/search_context keep working on them and acp_status lists them under RETIRED BLOCKS. Use for old material you no longer need resident. Roll back with acp_restore.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "blockId": {
+              "type": "string",
+              "description": "One block id (e.g. b5)"
+            },
+            "ids": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Several block ids in one call (e.g. [\"b3\", \"b7\"])"
+            }
+          }
+        }
+      },
+      {
+        "name": "acp_restore",
+        "description": "Restore retired compression block(s) to the resident view: their summaries re-enter context from the next rebuild. No effect on blocks that are not retired.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "blockId": {
+              "type": "string",
+              "description": "One block id (e.g. b5)"
+            },
+            "ids": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Several block ids in one call (e.g. [\"b3\", \"b7\"])"
+            }
+          }
+        }
+      },
+      {
+        "name": "acp_rewrite",
+        "description": "Replace a compressed block's stored summary with shorter text you supply — no re-compression, no regeneration. The previous summary is kept one step deep for rollback; the block's original messages are untouched (decompress still returns them). Pass blockId+summary for one block, or items:[{blockId,summary}] for a batch.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "blockId": {
+              "type": "string",
+              "description": "Block id to rewrite (e.g. b5) — single-block form"
+            },
+            "summary": {
+              "type": "string",
+              "description": "The replacement summary text — single-block form"
+            },
+            "items": {
+              "type": "array",
+              "description": "Batch form: several rewrites in one call",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "blockId": {
+                    "type": "string",
+                    "description": "Block id (e.g. b5)"
+                  },
+                  "summary": {
+                    "type": "string",
+                    "description": "Replacement summary text"
+                  }
+                },
+                "required": [
+                  "blockId",
+                  "summary"
+                ]
+              }
+            }
+          }
+        }
       }
     ],
     "responsesReadOnly": [
@@ -611,6 +935,87 @@
                 "full"
               ],
               "description": "\"summary\" (default): totals, verdicts, notable folds, anomalous requests only. \"full\": every retained fold and its line-item breakdown (most-recent window — the output states the cap)."
+            }
+          }
+        }
+      },
+      {
+        "type": "function",
+        "name": "acp_retire",
+        "description": "Retire compressed block(s): their summaries stop being injected into the resident view every turn, freeing that context mass, while decompress/search_context keep working on them and acp_status lists them under RETIRED BLOCKS. Use for old material you no longer need resident. Roll back with acp_restore.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "blockId": {
+              "type": "string",
+              "description": "One block id (e.g. b5)"
+            },
+            "ids": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Several block ids in one call (e.g. [\"b3\", \"b7\"])"
+            }
+          }
+        }
+      },
+      {
+        "type": "function",
+        "name": "acp_restore",
+        "description": "Restore retired compression block(s) to the resident view: their summaries re-enter context from the next rebuild. No effect on blocks that are not retired.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "blockId": {
+              "type": "string",
+              "description": "One block id (e.g. b5)"
+            },
+            "ids": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Several block ids in one call (e.g. [\"b3\", \"b7\"])"
+            }
+          }
+        }
+      },
+      {
+        "type": "function",
+        "name": "acp_rewrite",
+        "description": "Replace a compressed block's stored summary with shorter text you supply — no re-compression, no regeneration. The previous summary is kept one step deep for rollback; the block's original messages are untouched (decompress still returns them). Pass blockId+summary for one block, or items:[{blockId,summary}] for a batch.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "blockId": {
+              "type": "string",
+              "description": "Block id to rewrite (e.g. b5) — single-block form"
+            },
+            "summary": {
+              "type": "string",
+              "description": "The replacement summary text — single-block form"
+            },
+            "items": {
+              "type": "array",
+              "description": "Batch form: several rewrites in one call",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "blockId": {
+                    "type": "string",
+                    "description": "Block id (e.g. b5)"
+                  },
+                  "summary": {
+                    "type": "string",
+                    "description": "Replacement summary text"
+                  }
+                },
+                "required": [
+                  "blockId",
+                  "summary"
+                ]
+              }
             }
           }
         }

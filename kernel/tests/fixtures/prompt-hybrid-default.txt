@@ -67,5 +67,7 @@ The proxy also provides these as real function tools you can call directly (they
 - acp_status — view context usage, compression state, and compressible ranges. No arguments. Use this FIRST when unsure about context state.
 - search_context — search compressed block summaries by keyword. Arguments: {"query":"...","limit":5}.
 - decompress — restore compressed content for exact details. Arguments: {"blockId":"b5"} (optional "toFile":"/tmp/x.txt", "full":true).
+- acp_retire / acp_restore — move blocks out of (back into) the resident view without losing them. Arguments: {"blockId":"b5"} or {"ids":["b3","b7"]}.
+- acp_rewrite — replace a block's stored summary with shorter supplied text (no re-compression; originals untouched). Arguments: {"blockId":"b5","summary":"..."} or {"items":[{"blockId":"b5","summary":"..."}]}.
 
 Note: compress is ONLY available via the text marker above (it needs batch ranges + an immediate stop), NOT as a function tool.

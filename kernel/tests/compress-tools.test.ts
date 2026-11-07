@@ -28,12 +28,22 @@ import {
 test("ACP tool sets classify every ACP tool by mutation semantics", () => {
   assert.deepEqual([...ACP_TOOL_NAMES].sort(), [
     "acp_cache",
+    // #5765 block ops are mutating session-state tools (same tier as compress/decompress).
+    "acp_restore",
+    "acp_retire",
+    "acp_rewrite",
     "acp_status",
     "compress",
     "decompress",
     "search_context",
   ]);
-  assert.deepEqual([...ACP_MUTATING_TOOLS].sort(), ["compress", "decompress"]);
+  assert.deepEqual([...ACP_MUTATING_TOOLS].sort(), [
+    "acp_restore",
+    "acp_retire",
+    "acp_rewrite",
+    "compress",
+    "decompress",
+  ]);
   assert.deepEqual([...ACP_READONLY_TOOLS].sort(), [
     "acp_cache",
     "acp_status",

@@ -30,6 +30,7 @@ import { applyImageRescalePass, executeReadOriginalImage } from "../image-rescal
 import { recordThreadTail } from "../server/thread-tracking.js";
 import { applyRanges } from "../stream.js";
 import { applyConfiguredCompression } from "../external-summary-compress.js";
+import { executeAcpRetire, executeAcpRestore, executeAcpRewrite } from "../acp-block-ops.js";
 import { executeSearchContextTarget, resolveDecompress } from "../decompress-shared.js";
 import { toolFail, type ProxyToolResult } from "../proxy-tool-result.js";
 import { fetchWithRetry, UpstreamHttpError } from "../fetch-util.js";
@@ -87,6 +88,9 @@ export function buildVisibilityMarker(toolName: string, result: string): string 
         decompress: "📤",
         search_context: "🔍",
         acp_status: "📊",
+        acp_retire: "🗄️",
+        acp_restore: "♻️",
+        acp_rewrite: "✂️",
         absorb: "🫧",
     };
     const icon = failed ? "❌" : (icons[toolName] ?? "📦");
@@ -424,6 +428,15 @@ export function executeProxyTool(
     }
     if (toolName === "acp_cache") {
         return handleAcpCache(ctx.session, args);
+    }
+    if (toolName === "acp_retire") {
+        return executeAcpRetire(args, ctx.session);
+    }
+    if (toolName === "acp_restore") {
+        return executeAcpRestore(args, ctx.session);
+    }
+    if (toolName === "acp_rewrite") {
+        return executeAcpRewrite(args, ctx.session);
     }
     const absorb = effectiveAbsorbConfig(ctx.session, ctx.config);
     if (absorb?.enabled === true && toolName === (absorb.toolName ?? ABSORB_TOOL_NAME)) {
