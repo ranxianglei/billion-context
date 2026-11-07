@@ -11,8 +11,9 @@
 // Field repro: claude-code v2.1.316 + mid-conversation-tool-changes
 // contract, bili v0.1.210 / acp-kernel 0.0.175 era. This pins both halves of
 // the fix through the real chain: the position-based backstop now heals
-// follow-side orphans too (same demotion semantics: re-voice to user, strip
-// tool_addition/tool_removal per WC-022, drop when nothing remains), while
+// follow-side orphans too (plain systems keep the demotion semantics:
+// re-voice to user, drop when nothing remains — #4818 routes tool-delta
+// carriers through relocation instead, so their WC-022 blocks survive), while
 // every LEGAL shape round-trips byte-identical (prefix-cache stability,
 // negative-test discipline per #3617). Also pins the new single-source
 // insertion helper insertBeforeTrailingSystemRun that the host's ephemeral
@@ -168,14 +169,16 @@ test("#5438: fold covering the turns AFTER a sidecar leaves it following an assi
   assert.ok(anchorIdx > side, "anchor lands AFTER the surviving sidecar here");
   const out = coreToAnthropic(view as BiliMessage[]);
   assert.deepEqual(orphanSystems(out), [], JSON.stringify(out));
-  // The sidecar's delta TEXT survives the demotion as plain user content;
-  // the tool_addition control block never leaks outside a system (WC-022).
-  assert.equal(out[side]!.role, "user");
-  assert.deepEqual(
-    out[side]!.content,
-    [{ type: "text", text: 'Updated system prompt section "tools":\n<tools>…</tools>' }],
-  );
-  assert.ok(!JSON.stringify(out).includes("tool_addition"));
+  // #4818: the sidecar is a tool-delta carrier — it RELOCATES to the next
+  // legal slot (array end here) with its functional block intact; stripping
+  // it would split its delta chain (orphaned removal → hard 400 / silent
+  // tool loss). Plain systems in this file keep the demote-strip path.
+  const last = out[out.length - 1]!;
+  assert.equal(last.role, "system");
+  assert.deepEqual(last.content, [
+    { type: "text", text: 'Updated system prompt section "tools":\n<tools>…</tools>' },
+    { type: "tool_addition", name: "search" },
+  ]);
 });
 
 // --- client-side case-1 shapes (no fold involved) ---------------------------
