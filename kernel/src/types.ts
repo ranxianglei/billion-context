@@ -470,7 +470,11 @@ export interface CompressValidationConfig {
   minCompressRange: number;
   /** Maximum summary length (chars). Summary exceeding this is rejected unless summaryMaxChars override is used. 0 = disabled. Default 20000. */
   maxSummaryLength: number;
-  /** Minimum summary length (chars). Summary shorter than this is rejected. 0 = disabled. Default 50. */
+  /** Minimum summary length (chars). A single folding range with a shorter
+   *  summary is rejected; a multi-range batch is judged on the COMBINED total
+   *  of its fold candidates' summaries (#5894) — one trivial span may earn a
+   *  short summary without killing the batch. Empty summaries are always
+   *  rejected per range. 0 = disabled. Default 50. */
   minSummaryLength: number;
 }
 
