@@ -286,8 +286,7 @@ test("omp watermark: an aligned branch feeds pf-channel for the chokepoint to st
     pfLearnStamp({ [PF_CONVO]: sid }, 200, new Headers({ "x-bili-pf-seq": "2" }));
     const out = pfRequestHeaders({ [PF_CONVO]: sid });
     assert.equal(out["x-bili-pf-count"], "2");
-    // #5643 full-list wire form: every captured element rides (no K-window math client-side)
-    assert.equal(out["x-bili-pf-tail-ids"], "e1a2b3c4,e5f6a7b8", "K=2 ⇒ both elements ride the full list");
+    assert.equal(out["x-bili-pf-tail-ids"], "e5f6a7b8", "K=2 ⇒ anchor element 1 + new elements");
     round.ack(2);
 });
 
