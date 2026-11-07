@@ -63,7 +63,7 @@ import { decodeRequestBody } from "../content-encoding.js";
 import { dshContextTabEnabled, dshContextTabLabel, limitsDecodedBytes } from "../knobs.js";
 import { MIN_ASSUMED_WINDOW_TOKENS } from "../util.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, singleFlight } from "./native-bootstrap.js";
-import { bodyProvablyOverWindow as sharedBodyProvablyOverWindow, installNativeFetchIntercept, liveStateSlotEffect, noteRoutedOrigin, observeRoutedOrigin, routedBiliModelUrl, type GateVerdict, type NativeInterceptState } from "./native-intercept.js";
+import { bodyOverWindowDetail as sharedBodyOverWindowDetail, installNativeFetchIntercept, liveStateSlotEffect, noteRoutedOrigin, observeRoutedOrigin, routedBiliModelUrl, type GateVerdict, type NativeInterceptState } from "./native-intercept.js";
 import { runOutsideFetchChain } from "./fetch-chain/index.js";
 import { asciiHeaderValue, fetchManifest, fetchProxyVersion, fetchStatus, fetchStatusLatest, forwardTool, reportAttributionHealth, reportRuntimeInfo, waitForProxyVersion, type ManifestTool } from "./shared.js";
 import { createForkAdopter, sideShapedBody } from "./fork-adopt.js";
@@ -608,7 +608,7 @@ function rawBodyStringOf(init: RequestInit | undefined): string | undefined {
             return new TextDecoder().decode(body instanceof Uint8Array ? body : new Uint8Array(body));
         } catch {
             // #4912: undecodable buffer (>V8-max-string-length throws
-            // RangeError) → undefined; sharedBodyProvablyOverWindow then
+            // RangeError) → undefined; sharedBodyOverWindowDetail then
             // bills ALL bytes as core text (media=0) — the conservative
             // refusal direction, same convention as no-init call sites.
             return undefined;
@@ -617,12 +617,12 @@ function rawBodyStringOf(init: RequestInit | undefined): string | undefined {
     return undefined;
 }
 
-export function bodyProvablyOverWindow(
+export function bodyOverWindowDetail(
     body: { bytes: number } | undefined,
     init: RequestInit | undefined,
     declaredWindow: number | undefined,
-): ReturnType<typeof sharedBodyProvablyOverWindow> {
-    return sharedBodyProvablyOverWindow(body?.bytes, rawBodyStringOf(init), declaredWindow);
+): ReturnType<typeof sharedBodyOverWindowDetail> {
+    return sharedBodyOverWindowDetail(body?.bytes, rawBodyStringOf(init), declaredWindow);
 }
 
 function refreshModelInfo(origin: string | undefined, target?: { provider: string; model: string }): void {
@@ -2139,6 +2139,15 @@ export function apply(ctx: PluginContext): void {
     // copy goes through persistClientEvent: GUI hosts swallow stderr, which is
     // exactly how the reported zero-traffic case stayed invisible.
     const gateRefusals = new Map<string, { state: string; count: number }>();
+    // #5613 follow-up (owner-approved 2026-11-07): every DIRECT send is a
+    // money burn that was previously INVISIBLE after the first durable line
+    // per endpoint. The refusal line now repeats on a bounded cadence —
+    // first occurrence, attribution-state change, then every Nth refusal —
+    // so a continuous leak loop (the ds-harness-remote field shape: the same
+    // oversized history retried every turn) stays visible in bili.log without
+    // flooding it; #3651's one-shot sidecar lanes (a handful per worker
+    // lifetime) each stay exactly one line.
+    const DIRECT_SEND_LOG_EVERY = 10;
     const gateKeyOf = (url: string): string => {
         try {
             const u = new URL(url);
@@ -2209,14 +2218,14 @@ export function apply(ctx: PluginContext): void {
         attrReportedRefusals = 0;
         reportAttrHealth();
     };
-    const refuse = (url: string, attr: GateAttribution): false => {
+    const refuse = (url: string, attr: GateAttribution, body?: { bytes: number }): false => {
         const key = gateKeyOf(url);
         const prev = gateRefusals.get(key);
         const count = (prev?.count ?? 0) + 1;
         const changed = prev !== undefined && prev.state !== attr.state;
         if (prev === undefined && gateRefusals.size >= 256) gateRefusals.clear();
         gateRefusals.set(key, { state: attr.state, count });
-        if (prev === undefined || changed) {
+        if (prev === undefined || changed || count % DIRECT_SEND_LOG_EVERY === 0) {
             const reason =
                 attr.state === "threw"
                     ? `currentInitiator() threw (${attr.message}) — agent scope disposed/closing mid-request?`
@@ -2224,7 +2233,14 @@ export function apply(ctx: PluginContext): void {
                         ? "initiator present but missing session id"
                         : "no active initiator attribution (agentless/background lane, third-party in-process caller, or stale attribution after host resume?)";
             const suffix = prev !== undefined ? ` (state ${prev.state}→${attr.state})` : "";
-            const line = `bili-native-dsh: model request sent DIRECT (uncompressed) — takeover gate refused ${key}: ${reason} — refusals so far: ${count}${suffix}`;
+            // Size visibility (#5613): a KNOWN size here means the send fits
+            // under the calibrated bar (bigger ones refused LOCALLY above);
+            // an UNKNOWN one names the remaining blind spot — a streamed or
+            // unreadable body the over-window fuse could not price.
+            const sizeNote = body?.bytes !== undefined
+                ? ` (this body ${body.bytes.toLocaleString("en-US")} B)`
+                : " (body size unknown — streamed/unreadable; the over-window fuse could not run)";
+            const line = `bili-native-dsh: model request sent DIRECT (uncompressed) — takeover gate refused ${key}: ${reason} — refusals so far: ${count}${suffix}${sizeNote}`;
             persistClientEvent(line);
         }
         if (attr.state !== "ok") {
@@ -2264,51 +2280,51 @@ export function apply(ctx: PluginContext): void {
                 if (again.state === "none") return refuseUnattributed(url, again, body, init);
             }
         }
-        // #2924 direction 1: still `threw` AND the body provably cannot fit —
-        // fail this one request locally instead of handing upstream a request
+        // #2924 direction 1: still `threw` AND the body cannot fit — fail
+        // this one request locally instead of handing upstream a request
         // that can only 400 (and, on a >window history, kills the session).
-        // FLOOR estimate (bytes/4) on MEDIA-EXCLUDED core text: refuse only
-        // when the OPTIMISTIC token count already exceeds the window, so the
-        // guard cannot false-refuse — the session ledger shows this host's
-        // real bodies run ABOVE the byte-estimate (calibratedEstimate ~1.14),
-        // and that bias cuts the other way. #4111: the raw byte count includes
-        // base64 media, which bytes/4 billed as ~4× its resolution-billed
-        // reality and false-refused media-heavy bodies — the re-price bills
-        // core text only (the relay egress fuse's caliber). Unknown window or
-        // unreadable body keeps #1117 semantics.
+        // MEDIA-EXCLUDED core text is priced at TWO tiers (#5613, owner-
+        // approved 2026-11-07): the calibrated estimate (optimistic floor ×
+        // 1.14 — the measured billing bias of this host family's bodies)
+        // fires first, so a body whose TRUE cost is over the window no longer
+        // rides into a guaranteed upstream 400 merely because the optimistic
+        // floor sits under it; the bare floor marks the stronger "provably
+        // over" tier in the line below. #4111 keeps the media exclusion
+        // (base64 mass bills through the upstream's image lane, not as text).
+        // Unknown window or unsized body keeps #1117 semantics.
         // #4079: the declared window can be wrong SMALL (stale host config,
-        // model-catalog fallback) — size the bar at max(declared, 1M) so an
-        // undersized declaration cannot false-refuse a body the real upstream
-        // would accept.
-        const doom = bodyProvablyOverWindow(body, init, effectiveContextWindow(ctx));
+        // model-catalog fallback) — the bar never assumes below max(declared, 1M).
+        const doom = bodyOverWindowDetail(body, init, effectiveContextWindow(ctx));
         if (doom !== undefined) {
-            persistClientEvent(`bili-native-dsh: takeover gate refused ${gateKeyOf(url)} LOCALLY (422) — attribution threw and body ≥${doom.floorTokens} tok (core est ${doom.coreBytes}B/4${doom.mediaBytes > 0 ? `, ${doom.mediaBytes}B media excluded` : ""}) exceeds window ${doom.window} (declared ${doom.declaredWindow}; never assumes below ${MIN_ASSUMED_WINDOW_TOKENS}); a direct send would 400 upstream (#2924/#4111)`);
+            persistClientEvent(`bili-native-dsh: takeover gate refused ${gateKeyOf(url)} LOCALLY (422) — attribution threw and body est ~${doom.estTokens} tok ${doom.provablyOver ? "(the optimistic floor alone already exceeds the window)" : `(calibrated estimate over; the optimistic floor ${doom.floorTokens} tok still sits under it)`} vs window ${doom.window} (declared ${doom.declaredWindow}; never assumes below ${MIN_ASSUMED_WINDOW_TOKENS}) — core ${doom.coreBytes}B${doom.mediaBytes > 0 ? `, ${doom.mediaBytes}B media excluded` : ""} (#2924/#4111/#5613); a direct send would 400 upstream`);
             noteAttrRefusal("threw", { message, endpoint: maskUrlForDiagnostics(gateKeyOf(url)) });
             return "refuse-oversized";
         }
-        return refuse(url, attributionOf(ctx));
+        return refuse(url, attributionOf(ctx), body);
     };
     // #4068/#4079: `none` keeps #1117 direct semantics by design — an
-    // agentless lane is not ours to manage — but a body whose optimistic
-    // core-text byte-floor token count already exceeds the window has no
-    // direct future: the raw send 400s/413s upstream and the host retries the
-    // SAME oversized history every turn (the #4068 field shape: a
-    // 6,165,048-token body against a 1,048,580 window, twice). Same floor
-    // math and same never-false-refuse reasoning as the threw arm above
-    // (#2924), including #4111's media exclusion — media mass is billed by the
-    // upstream's image lane, not as text: unknown window or unreadable/stream
-    // body keeps #1117.
+    // agentless lane is not ours to manage — but a body whose CALIBRATED
+    // core-text token estimate reaches the window has no direct future: the
+    // raw send 400s/413s upstream and the host retries the SAME oversized
+    // history every turn (the #4068 field shape: a 6,165,048-token body
+    // against a 1,048,580 window, twice; the #5613 shape: a 1.3M-token
+    // gateway send that passed every floor-only check, then bricked the
+    // whole session when upstream rejected it). Same dual-tier pricing as
+    // the threw arm — calibrated estimate first, the bare floor marking the
+    // "provably over" tier, #4111's media exclusion intact. Unknown window
+    // or unsized/streamed body keeps #1117, now named in the durable line
+    // via refuse()'s size note.
     const refuseUnattributed = (url: string, attr: Exclude<GateAttribution, { state: "ok" }>, body: { bytes: number } | undefined, init: RequestInit | undefined): GateVerdict => {
         // #4079: same undersized-declaration guard as the threw arm — the
         // bar never assumes below the 1M common window floor. #4111: same
-        // media-aware core-text caliber too (see bodyProvablyOverWindow).
-        const unattributedDoom = bodyProvablyOverWindow(body, init, effectiveContextWindow(ctx));
+        // media-aware core-text caliber too (see bodyOverWindowDetail).
+        const unattributedDoom = bodyOverWindowDetail(body, init, effectiveContextWindow(ctx));
         if (unattributedDoom !== undefined) {
-            persistClientEvent(`bili-native-dsh: takeover gate refused ${gateKeyOf(url)} LOCALLY (422) — unattributed body ≥${unattributedDoom.floorTokens} tok (core est ${unattributedDoom.coreBytes}B/4${unattributedDoom.mediaBytes > 0 ? `, ${unattributedDoom.mediaBytes}B media excluded` : ""}) exceeds window ${unattributedDoom.window} (declared ${unattributedDoom.declaredWindow}; never assumes below ${MIN_ASSUMED_WINDOW_TOKENS}); a direct send would be a guaranteed upstream rejection (#4068/#4079/#4111)`);
+            persistClientEvent(`bili-native-dsh: takeover gate refused ${gateKeyOf(url)} LOCALLY (422) — unattributed body est ~${unattributedDoom.estTokens} tok ${unattributedDoom.provablyOver ? "(the optimistic floor alone already exceeds the window)" : `(calibrated estimate over; the optimistic floor ${unattributedDoom.floorTokens} tok still sits under it)`} vs window ${unattributedDoom.window} (declared ${unattributedDoom.declaredWindow}; never assumes below ${MIN_ASSUMED_WINDOW_TOKENS}) — core ${unattributedDoom.coreBytes}B${unattributedDoom.mediaBytes > 0 ? `, ${unattributedDoom.mediaBytes}B media excluded` : ""} (#4068/#4079/#4111/#5613); a direct send would be a guaranteed upstream rejection`);
             noteAttrRefusal(attr.state, { endpoint: maskUrlForDiagnostics(gateKeyOf(url)) });
             return "refuse-oversized-unattributed";
         }
-        return refuse(url, attr);
+        return refuse(url, attr, body);
     };
     state.takeoverGate = (url, body, init) => {
         const attr = attributionOf(ctx);

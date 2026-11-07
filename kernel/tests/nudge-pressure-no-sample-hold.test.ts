@@ -6,12 +6,12 @@ import type { Config, CoreMessage } from "../src/types.js";
 
 // Phantom-pressure guard: pressure band (usage >= maxContextLimitPct /
 // emergencyThresholdPct) + an ESTIMATE-grade meter reading (no billing sample
-// this cycle — aborted turn, cache-TTL expiry) => injection deferred one
-// round instead of firing EMERGENCY/OVER-LIMIT rewrites off a char-bound
-// estimate that structurally runs ~3x billed. Billed readings ("usage") and
-// legacy callers (source omitted) keep byte-identical behavior;
-// nudge.requireUsageSampleForPressure = false restores estimate-driven
-// pressure injection. Non-pressure tiers ignore the source entirely.
+// this cycle — aborted turn, cache-TTL expiry) => injection deferred while
+// the estimate-hold backstop (nudge.maxEstimateHoldRounds, default 2)
+// allows. Billed readings ("usage") and legacy callers (source omitted) keep
+// byte-identical behavior; nudge.requireUsageSampleForPressure = false
+// restores estimate-driven pressure injection immediately.
+// Non-pressure tiers ignore the source entirely.
 
 function buildConfig(overrides: Partial<Config> = {}): Config {
   const base = {
@@ -72,21 +72,21 @@ function runTurn(
   });
 }
 
-test("pressure band + estimate meter defers EMERGENCY injection one round", () => {
+test("pressure band + estimate meter holds EMERGENCY injection inside the backstop window", () => {
   const turn = runTurn(99000, "estimate"); // >= emergencyThresholdPct 0.98
   assert.equal(turn.nudge.shouldInject, false);
   assert.match(turn.nudge.reason, /estimate-grade/);
-  assert.match(turn.nudge.reason, /deferred one round/);
+  assert.match(turn.nudge.reason, /estimate round 1 of 2/);
   assert.match(turn.nudge.reason, /^EMERGENCY:/);
   assert.equal(turn.nudge.breakdown.pressureDeferredNoSample, 1);
   assert.equal(turn.nudge.breakdown.emergencyOverride, 1);
 });
 
-test("pressure band + estimate meter defers OVER-LIMIT too (sub-emergency band)", () => {
+test("pressure band + estimate meter holds OVER-LIMIT too (sub-emergency band)", () => {
   const turn = runTurn(95000, "estimate"); // >= 0.9, < 0.98
   assert.equal(turn.nudge.shouldInject, false);
   assert.match(turn.nudge.reason, /^OVER-LIMIT:/);
-  assert.match(turn.nudge.reason, /deferred one round/);
+  assert.match(turn.nudge.reason, /estimate round 1 of 2/);
   assert.equal(turn.nudge.breakdown.pressureDeferredNoSample, 1);
 });
 
