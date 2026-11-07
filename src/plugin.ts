@@ -3633,7 +3633,11 @@ export async function pipePluginChatWithStrip(
         maybeWarnNamelessToolCalls();
         maybeSummarizeStrips();
         settleWitnesses();
-        if (sawTerminal && !sawReplyError && !res.destroyed && !res.writableEnded) reply?.save();
+        // #4247-followup: persistence answers "did the upstream turn finish?",
+        // never "is the client socket still open?". pi's client hangs up the
+        // moment it holds the terminal frame, so gating this save on client
+        // liveness dropped every pi reply from the handoff render.
+        if (sawTerminal && !sawReplyError) reply?.save();
         if (truncated) {
             reply?.discard();
             // #721 → #2563: the client still owns the stream from here.
@@ -3650,6 +3654,9 @@ export async function pipePluginChatWithStrip(
         settleWitnesses();
         if (res.destroyed || res.writableEnded) {
             log?.("client aborted mid-stream");
+            // A terminal already arrived before the client left: the reply is
+            // complete, so it still belongs in the handoff snapshot.
+            if (sawTerminal && !sawReplyError) reply?.save();
             // #5293: the partial output of an aborted turn never reports usage — record the pre-abort anchor so the first nudge decision after resume can absorb that debt.
             if (session) noteAbortedTurn(session);
             return;
@@ -4504,7 +4511,8 @@ export async function pipePluginResponsesWithStrip(
         maybeSummarizeStrips();
         settleUsage();
         settleWitnesses();
-        if (replyCompleted && !res.destroyed && !res.writableEnded) reply?.save();
+        // Same rule as the chat pipe: upstream completion decides, not the socket.
+        if (replyCompleted) reply?.save();
         // #721 → #2563: never leave the stream hanging on a missing done-family
         // event. Permitlist hosts (pi) get the raw cut for their native
         // classifier; everyone else gets the in-band error frame.
@@ -4518,6 +4526,8 @@ export async function pipePluginResponsesWithStrip(
         settleWitnesses();
         if (res.destroyed || res.writableEnded) {
             log?.("client aborted mid-stream");
+            // Completed turn, dead socket: keep the reply for the handoff render.
+            if (replyCompleted) reply?.save();
             // #5293: same as the chat lane — record the pre-abort anchor for the post-resume re-anchor.
             if (session) noteAbortedTurn(session);
             return;
