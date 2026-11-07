@@ -59,6 +59,10 @@
 
 ![目标架构](./assets/arch-target.svg)（位图备选：[arch-target.png](./assets/arch-target.png)）
 
+现状图里的每一块在新架构下变成什么样子 —— **组件迁移总览**（底部为三个结构性痛点的一一对应解决锚点）：
+
+![组件迁移总览](./assets/arch-migration.svg)（位图备选：[arch-migration.png](./assets/arch-migration.png)）
+
 六个阶段的职责一句话版：
 
 | # | 阶段 | 一句话 | 状态 |

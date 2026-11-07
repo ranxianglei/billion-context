@@ -59,6 +59,10 @@ Today a model request passes through `prepare-*` adapters → `lane-decisions` b
 
 ![Target architecture](./assets/arch-target.svg) (bitmap fallback: [arch-target.png](./assets/arch-target.png))
 
+Where each piece of today's architecture lands under the new design — **component migration map** (bottom band maps the three structural pain points one-to-one to their fixes):
+
+![Component migration map](./assets/arch-migration.svg) (bitmap fallback: [arch-migration.png](./assets/arch-migration.png))
+
 One-line duties per stage:
 
 | # | Stage | One line | Status |
