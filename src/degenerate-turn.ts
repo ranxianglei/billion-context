@@ -72,6 +72,22 @@ export function endsWithDraftClose(text: string): boolean {
     return text.length > 0 && DRAFT_CLOSE_TAIL.test(text);
 }
 
+// #4764: WHICH closing tag sits at the tail decides what the model already has.
+// A </summary> tail means the draft is COMPLETE — the full summary exists, just
+// written in the wrong channel; a </analysis> tail means the draft stopped
+// before the summary block ever started. The retry nudge must name that
+// difference (#2303's single generic nudge ignored both, and on OpenAI-lane
+// compression turns the model read "take your next concrete action" as
+// permission to do anything else — Edit/Bash instead of the compress call).
+export type DraftTailKind = "complete" | "truncated";
+const DRAFT_CLOSE_COMPLETE_TAIL = /\x3c\/summary\x3e\s*$/i;
+export function draftTailKind(text: string): DraftTailKind | null {
+    if (text.length === 0) return null;
+    if (DRAFT_CLOSE_COMPLETE_TAIL.test(text)) return "complete";
+    if (DRAFT_CLOSE_TAIL.test(text)) return "truncated";
+    return null;
+}
+
 // #2612: the #2303 draft-tail shape has a legitimate producer — the CLIENT's
 // own summarization request. Claude Code's compaction (/compact, auto-compact,
 // precomputed compression) instructs the model, in the final user message, to
@@ -90,6 +106,27 @@ const CLIENT_SUMMARY_INSTRUCTION =
     /(?:Wrap your summary in \x3csummary\x3e\x3c\/summary\x3e tags|\x3canalysis\x3e block followed by a \x3csummary\x3e block)/i;
 export function requestExpectsProseSummary(requestText: string | undefined): boolean {
     return typeof requestText === "string" && requestText.length > 0 && CLIENT_SUMMARY_INSTRUCTION.test(requestText);
+}
+
+// #4764: CLIENT_SUMMARY_INSTRUCTION is vendor-brittle — it was written from
+// Claude Code's two compaction wordings, so hosts whose compaction instruction
+// names the tags without either phrase get no suppression and their compliant
+// answer gets retried like a stalled draft (WorkBuddy/CodeBuddy kernel: same
+// draft shape, consumed fine by its own envelope). The tag SHAPE in the final
+// user message is the vendor-agnostic signal that a summary-shaped prose reply
+// is expected. PROXY LANE ONLY: the loop's coreMessages view carries no bili-
+// injected text (the I1 evidence in #4764 proves injections ride the outbound
+// body, not this view), so a tag there can only come from the client. The
+// plugin pipes test the WHOLE shipped body instead, which carries previously
+// injected nudges verbatim — the anthropic lane note contains literal
+// <analysis>/<summary> tags — so a shape match there would suppress the guard
+// forever; those call sites stay lexical-only on purpose. The [a-z_]* prefix
+// catches vendor-suffixed markers (the WorkBuddy kernel's own structural test
+// accepts <conversation_history_summary>, issue #4764 evidence); URLs and
+// hyphenated tags deliberately do not match (':'/'.'/'-' break the run).
+const PROSE_SUMMARY_TAG_SHAPE = /\x3c\/?[a-z_]*(?:summary|analysis)\b/i;
+export function requestExpectsProseSummaryShape(requestText: string | undefined): boolean {
+    return typeof requestText === "string" && requestText.length > 0 && PROSE_SUMMARY_TAG_SHAPE.test(requestText);
 }
 
 /** #2612 proxy-lane twin: the last user message's text, where a client
