@@ -1438,6 +1438,7 @@ const hideCompressCallsNode: PipelineNode = {
       io.state,
       io.messages,
       ctx.config.isCompressTool,
+      ctx.config.strandedProtectedPredecessor,
     );
     // #3769: fold the newly-swept orphans into the persistent monotonic set so
     // they stay hidden across turns/restarts/upgrades, then consume the fold
