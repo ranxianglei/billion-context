@@ -5,6 +5,7 @@ import { reserveOutputHeadroom, systemCarrierTexts } from "../util.js";
 import { type ResolvedImageBilling } from "../image-tokens.js";
 import { ACP_TOOL_NAMES, ABSORB_TOOL_NAME, RETRIEVE_TOOL_NAME, RULE_TOOL_NAME } from "acp-kernel";
 import { READ_ORIGINAL_IMAGE_TOOL_NAME } from "../compress-tool.js";
+import { dshCarrierRawMarkers } from "../durable-message-guards.js";
 
 // #388: side requests (title-gen etc.) share the main session key but must not
 // touch kernel state. Identified by a tiny output budget (same heuristic as
@@ -173,6 +174,32 @@ export function isDshAutoReviewRequest(protocol: string | null, parsed: unknown)
     // message) vetoes — see the comment above the constant.
     return users === 1 && userHasContent;
 }
+/** #5687 follow-up: a sidecar never carries a durable-state marker. dsh injects
+ *  its durable payloads (skills, workspace instructions, MCP catalog, runtime
+ *  context, image typing, job notices) into the FIRST main turn's user blob. A
+ *  tool-less single-user body carrying one of those markers is therefore a MAIN
+ *  turn whose assistant surface happens to be empty — routing it to the verbatim
+ *  side lane skips the kernel, so the classifier can never stamp the carrier's
+ *  BLOCKED ref (#2419/#2446/#2447/#2481) and the wire-byte contracts of
+ *  #2817/#5403 reset. Genuine sidecars (title / enhance / translate /
+ *  auto-review) carry the host's own prompt and no marker, so they keep the
+ *  side lane. */
+function carriesDurableState(text: string): boolean {
+    for (const marker of dshCarrierRawMarkers) if (text.indexOf(marker) >= 0) return true;
+    return false;
+}
+
+/** #5687 follow-up (call-site narrowing): a utility sidecar pins a TINY fixed
+ *  output budget (host presets: prompt-enhance 4096). Agent main turns either
+ *  omit the field (openai wire) or size it from their conversation, so
+ *  `isDshSingleShotSidecar` alone over-matches the FIRST unstyled main turn. */
+const SINGLE_SHOT_SIDECAR_MAX_BUDGET = 8192;
+export function hasSingleShotBudget(parsed: unknown): boolean {
+    if (!parsed || typeof parsed !== "object") return false;
+    const p = parsed as Record<string, unknown>;
+    const budget = p.max_tokens ?? p.max_completion_tokens ?? p.max_output_tokens;
+    return typeof budget === "number" && budget > 0 && budget <= SINGLE_SHOT_SIDECAR_MAX_BUDGET;
+}
 
 // #5656/#5584: dsh's per-feature sidecar pins above (title #2503, auto-review
 // #4438) are whack-a-mole — every NEW one-shot sidecar dsh ships around the
@@ -196,10 +223,12 @@ export function isDshAutoReviewRequest(protocol: string | null, parsed: unknown)
 // A non-empty system carrier is REQUIRED so the kernel's empty-instructions
 // path (aux calls riding the main session through the full pipeline, pinned in
 // tests/dsh-persona-fingerprint.test.ts phase 6) keeps its contract.
-// Residual, accepted: a tool-less MAIN turn 1 matches the single-shot shape and
-// rides the verbatim side lane for that one turn (tiny — nothing to compress);
-// turn 2+ replays history and rejoins the full pipeline. The caller must gate
-// on the dsh lane (evidence-per-client discipline, cf. isDshTitleRequest).
+// Residual, accepted (narrowed by #5687 follow-up): a tool-less MAIN turn 1
+// that ALSO passes the call-site budget screen (small pinned output,
+// hasSingleShotBudget) and carries no durable-state marker still rides the
+// verbatim side lane for that one turn; turn 2+ replays history and rejoins
+// the full pipeline. The caller must gate on the dsh lane
+// (evidence-per-client discipline, cf. isDshTitleRequest).
 export function isDshSingleShotSidecar(protocol: string | null, parsed: unknown): boolean {
     if (protocol === null || !parsed || typeof parsed !== "object") return false;
     const p = parsed as Record<string, unknown>;
@@ -225,8 +254,16 @@ export function isDshSingleShotSidecar(protocol: string | null, parsed: unknown)
         const c = rec.content ?? rec.parts;
         if (typeof c === "string") {
             if (c.length > 0) userHasContent = true;
+            // #5687 follow-up: a durable-state marker means this is a MAIN turn's
+            // injected context, never a utility sidecar.
+            if (carriesDurableState(c)) return false;
         } else if (Array.isArray(c) && c.length > 0) {
             userHasContent = true;
+            for (const part of c) {
+                if (part === null || typeof part !== "object") continue;
+                const text = (part as { text?: unknown }).text;
+                if (typeof text === "string" && carriesDurableState(text)) return false;
+            }
         }
     }
     return users === 1 && userHasContent;
