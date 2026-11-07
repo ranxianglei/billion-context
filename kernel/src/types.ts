@@ -461,6 +461,18 @@ export interface NudgeConfig {
    *  (zero-yield loop, #198). Default: max(5000, round(modelContextLimit ×
    *  0.01)). Set 0 to restore the legacy any-pending behavior. */
   minPressureBenefitTokens?: number;
+  /** Phantom-pressure guard: require the meter reading behind the pressure
+   *  band (usage >= maxContextLimitPct / emergencyThresholdPct) to be
+   *  usage-grade (a billing-sample-backed token count, i.e. the host passed
+   *  processTurn({ tokenCountSource: "usage" })) before injecting an
+   *  EMERGENCY/OVER-LIMIT nudge. Estimate-grade readings (char-bound local
+   *  fallback — e.g. right after an aborted turn or a cache-TTL expiry that
+   *  left no usage report) structurally run high, and acting on them
+   *  rewrites content off a bad meter; deferring costs at most one round
+   *  because the very next request carries a fresh billing report.
+   *  Default true; set false to restore estimate-driven pressure injection.
+   *  Non-pressure tiers (growth/cadence arms) are unaffected either way. */
+  requireUsageSampleForPressure?: boolean;
 }
 
 export interface TruncateConfig {
@@ -723,6 +735,13 @@ export interface NudgeBreakdown {
   /** Max pending across all tiers — compared against minPressureBenefit by the
    *  emergency-truncate node to detect a terminal floor (#300). */
   maxPending: number;
+  /** Open numeric ledger for debug/reason fields. Documented special keys:
+   *   - pressureDeferredNoSample (1/0): the pressure-band injection was
+   *     deferred for lack of a usage-grade sample
+   *     (NudgeConfig.requireUsageSampleForPressure); the host early-
+   *     advertising arm (emergencyNudge) must mirror this bit. Absent on
+   *     hand-built decisions — pre-fix semantics apply there.
+   */
   [key: string]: number;
 }
 
