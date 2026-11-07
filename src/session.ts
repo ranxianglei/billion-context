@@ -1155,6 +1155,22 @@ export function setPostRebuildAnchor(session: Session, tokens: number): void {
     markDirty(session);
 }
 
+// #1987 post-rebuild baseline anchor, hardened by #5880: an upstream-proven
+// overflow-arm tag must NEVER be demoted to estimate-grade by a local payload
+// estimate — demoting drops the evidence floor that keeps an armed session
+// folding instead of trusting optimistic estimates (same doctrine as
+// armFailureShrink, relay.ts #2484). In the #5880 incident the caliber delta
+// between the netted arm value and a fresh estimate of the rebuilt view tipped
+// the inequality on every fold turn, silently disarming the session so its
+// estimate-only forwards 400'd turn after turn.
+export function applyPostRebuildBaselineAnchor(session: Session, rebuiltTextSize: number): void {
+    if (session.stats.lastInputTokensSource === "overflow-arm") return;
+    if (rebuiltTextSize > session.stats.lastInputTokens) {
+        session.stats.lastInputTokens = rebuiltTextSize;
+        session.stats.lastInputTokensSource = "estimate";
+    }
+}
+
 /** Metadata is persisted user-editable JSON — re-validate on read; a corrupt
  *  stamp degrades to "no anchor" (legacy sizing) instead of poisoning the meter. */
 export function postRebuildAnchorTokens(session: Session | undefined): number {
