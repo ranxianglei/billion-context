@@ -464,3 +464,189 @@ test("clearWatermarkSeed forces the next turn back through verification", () => 
     const { out } = runTurn(session, { [PF_COUNT_HEADER]: "3" }, b2);
     assert.equal(out.decision, "unseeded");
 });
+
+// ---------------------------------------------------------------------------
+// #5571 v5 (owner ruling 2026-11-03): identity-only head verification
+// ---------------------------------------------------------------------------
+
+test("v5 id mode: head rewrite under stable host msgids RIDES the stashed prefix and warns", () => {
+    LOGS.length = 0;
+    makeStubStore();
+    const session = freshSession("pf-v5-ride");
+    const b1 = bodyOf([SYS("s"), USR("a"), USR("b")]);
+    assert.equal(runTurn(session, {}, b1).out.decision, "no-stamp");
+    // rewrite "b" IN PLACE and append one user turn; the shim echoes the window host ids.
+    // Pre-v5 this was an uncredited head-prefix-drift miss; under v5 the host
+    // msgid chain (shape + width + prevId) IS the proof — it rides.
+    const b2 = bodyOf([SYS("s"), USR("a"), USR("b-E"), USR("c")]);
+    const { out } = runTurn(session, TAIL(["h-bE", "h-c"]), b2);
+    assert.equal(out.decision, "hit(no-count)", LOGS.join("\n"));
+    // the diagnostic stream must record the drift (feeds M3 re-seeding signals)
+    assert.ok(LOGS.some((l) => l.startsWith("warn") && l.includes("watermark v5")), LOGS.join("\n"));
+});
+
+test("v5: system-text change STILL misses under stable host msgids (pinned deviation — a prompt has no msgid)", () => {
+    LOGS.length = 0;
+    makeStubStore();
+    const session = freshSession("pf-v5-sys");
+    const b1 = bodyOf([SYS("s"), USR("a"), USR("b")]);
+    runTurn(session, {}, b1);
+    const b2 = bodyOf([SYS("CHANGED"), USR("a"), USR("b"), USR("c")]);
+    const { out } = runTurn(session, TAIL(["x1", "x2"]), b2);
+    assert.equal(out.decision, "head-drift", LOGS.join("\n"));
+    assert.equal(out.creditedMiss, true);
+});
+
+test("v5: client session-id swap under stable host msgids misses sess-change, recovers when the conversation returns", () => {
+    LOGS.length = 0;
+    makeStubStore();
+    const session = freshSession("pf-v5-sess");
+    const A: Record<string, string> = { "x-conversation-id": "conv-A" };
+    const b1 = bodyOf([SYS("s"), USR("a"), USR("b")]);
+    runTurn(session, A, b1); // no-stamp; cs captured
+    const b2 = bodyOf([SYS("s"), USR("a"), USR("b"), USR("c")]);
+    const bad = runTurn(session, { ...A, "x-conversation-id": "conv-B", ...TAIL(["p1", "p2"]) }, b2);
+    assert.equal(bad.out.decision, "sess-change", LOGS.join("\n"));
+    // The missed turn went legacy AND the recorded identity follows the
+    // traffic: state now belongs to conv-B, so B's continuous growth RIDES
+    // (window ids open on the swapped turn's last slot) ...
+    const b3 = bodyOf([...JSON.parse(b2).messages, USR("d")]);
+    const contB = runTurn(session, { ...A, "x-conversation-id": "conv-B", ...TAIL(["p2", "q2"]) }, b3);
+    assert.equal(contB.out.decision, "hit(no-count)", LOGS.join("\n"));
+    // ...while the ORIGINAL conversation A returning is ANOTHER identity
+    // event — it pays one more legacy pass (no silent ride across swaps).
+    const b4 = bodyOf([...JSON.parse(b3).messages, USR("e")]);
+    const backA = runTurn(session, { ...A, ...TAIL(["q2", "r2"]) }, b4);
+    assert.equal(backA.out.decision, "sess-change", LOGS.join("\n"));
+});
+
+// ---------------------------------------------------------------------------
+// #5403/#5418 v6 canonical-ledger unification (owner rulings 2026-11-03)
+// ---------------------------------------------------------------------------
+
+test("v6: a mid-history structural mutation pays ONE conservative legacy pass, then rides passthrough-as-new-message (R4/O3)", () => {
+    LOGS.length = 0;
+    const stub = makeStubStore();
+    const session = freshSession("pf-v6-rewrite");
+    const b1 = bodyOf([SYS("s"), USR("a"), USR("b")]);
+    assert.equal(runTurn(session, {}, b1).out.decision, "no-stamp"); // K=3
+    const b2 = bodyOf([SYS("s"), USR("a"), USR("b"), USR("c")]);
+    const h2 = runTurn(session, { [PF_COUNT_HEADER]: "3", ...TAIL(["h-b", "h-c"]) }, b2);
+    assert.equal(h2.out.decision, "hit", LOGS.join("\n")); // K=4, ledger [h-b,h-c]
+    // Structural mutation INSIDE the increment: the verified prefix
+    // [s,a,b,c] is intact (slot K-1 keeps its id h-c), but fresh material X1
+    // arrives BEFORE the still-known id h-b re-sent at the window tail —
+    // "unknown before known" proves rows were inserted/reordered/merged
+    // between two ids this session already saw; pure-append traffic can
+    // never produce it. Verdict (R4/O3): ONE conservative legacy pass.
+    const b3 = bodyOf([SYS("s"), USR("a"), USR("b"), USR("c"), USR("X1"), USR("b")]);
+    const m3 = runTurn(session, { [PF_COUNT_HEADER]: "4", ...TAIL(["h-c", "X1", "h-b"]) }, b3);
+    assert.equal(m3.out.decision, "rewrite-passthrough", LOGS.join("\n"));
+    assert.equal(m3.out.creditedMiss, true, "parity with the pre-v6 credited catches (breaker bounds pathological cycles)");
+    assert.deepEqual(m3.out.receivedTailIds, ["h-c", "X1", "h-b"], "the observed ids still enter the ledger");
+    let lg = readSaved(stub, "pf-v6-rewrite").lg as string[] | undefined;
+    assert.ok(lg && lg.includes("X1") && lg.includes("h-c") && lg.includes("h-b"), `ledger must absorb the rewritten world: ${JSON.stringify(lg)}`);
+    // the NEXT turn rides: same mutated world + one ordinary append — a
+    // clean pure-append to the grown ledger (origin anchored on the re-sent
+    // h-b row): no suppression, no speculative rebuild, convergence in one
+    // pass (count-less echo → hit(no-count)).
+    const b4 = bodyOf([SYS("s"), USR("a"), USR("b"), USR("c"), USR("X1"), USR("b"), USR("e")]);
+    const h4 = runTurn(session, { ...TAIL(["h-b", "h-e"]) }, b4);
+    assert.equal(h4.out.decision, "hit(no-count)", LOGS.join("\n"));
+    assert.ok(h4.headers[PF_SEQ_HEADER] === "7");
+});
+
+test("v6 knob OFF: rewrite-shaped turns fall back to the pre-v6 identity-only ride (diagnostic warn, no ledger verdict)", () => {
+    LOGS.length = 0;
+    makeStubStore();
+    const session = freshSession("pf-v6-knoboff");
+    process.env.BILI_ROLLOUT_WATERMARK_COMPACTION_PASSTHROUGH = "0";
+    try {
+        const b1 = bodyOf([SYS("s"), USR("a"), USR("b")]);
+        assert.equal(runTurn(session, {}, b1).out.decision, "no-stamp");
+        const b2 = bodyOf([SYS("s"), USR("a"), USR("b"), USR("c")]);
+        assert.equal(runTurn(session, { [PF_COUNT_HEADER]: "3", ...TAIL(["h-b", "h-c"]) }, b2).out.decision, "hit", LOGS.join("\n"));
+        // same rewrite shape as the knob-on case — OFF means the v6 layer is
+        // skipped entirely and pre-v6 semantics decide: the list survives
+        // every remaining gate (width, origin pin, head check, id-mode
+        // ride) and HITs — no v6 verdict at all.
+        const b3 = bodyOf([SYS("s"), USR("a"), USR("b"), USR("c"), USR("X1"), USR("b")]);
+        const r3 = runTurn(session, { [PF_COUNT_HEADER]: "4", ...TAIL(["h-c", "X1", "h-b"]) }, b3);
+        assert.equal(r3.out.decision, "hit", LOGS.join("\n"));
+        assert.ok(!LOGS.some((l) => l.includes("rewrite-passthrough")), LOGS.join("\n"));
+        assert.ok(!LOGS.some((l) => l.startsWith("warn")), `no v6 diagnostics may leak when the layer is off:\n${LOGS.join("\n")}`);
+    } finally {
+        delete process.env.BILI_ROLLOUT_WATERMARK_COMPACTION_PASSTHROUGH;
+    }
+});
+
+test("v6: an unidentifiable increment (body grew, no host id in it) hits WITHOUT ledger append and logs R5 (O1/O2 holds)", () => {
+    LOGS.length = 0;
+    makeStubStore();
+    const session = freshSession("pf-v6-unident");
+    const U = PF_SLOT_UNKNOWN;
+    const b1 = bodyOf([SYS("s"), USR("a"), USR("b")]);
+    assert.equal(runTurn(session, {}, b1).out.decision, "no-stamp");
+    const b2 = bodyOf([SYS("s"), USR("a"), USR("b"), ASST("ok")]);
+    const h2 = runTurn(session, { [PF_COUNT_HEADER]: "3", ...TAIL([U, "h-ok"]) }, b2);
+    assert.equal(h2.out.decision, "hit", LOGS.join("\n")); // K=4; ledger [h-ok]
+    // one growth, but the new element carries NO host id at all ("?"): every
+    // verifiable gate agrees, so we replay the stashed snapshot + the new
+    // bytes — never a speculative rebuild — and mark the gap for M3.
+    const b3 = bodyOf([SYS("s"), USR("a"), USR("b"), ASST("ok"), USR("anon")]);
+    const h3 = runTurn(session, { [PF_COUNT_HEADER]: "4", ...TAIL(["h-ok", U]) }, b3);
+    assert.equal(h3.out.decision, "hit", LOGS.join("\n"));
+    assert.ok(JSON.stringify(h3.out.hit?.view ?? []).includes("anon"), "the anonymous increment must still ride");
+    assert.ok(LOGS.some((l) => l.startsWith("warn") && l.includes("[pf-v6] unidentifiable-increment")), LOGS.join("\n"));
+});
+
+test("v6: per-model projections share ONE logical ledger (R6) — one legacy pass builds each model's projection", () => {
+    makeStubStore();
+    const session = freshSession("pf-v6-models");
+    const b1 = bodyOf([SYS("s"), USR("a"), USR("b")], "m-one");
+    assert.equal(runTurn(session, {}, b1).out.decision, "no-stamp"); // K=3 @m-one
+    // model flip: the physical partition rebuilds m-two's projection from the
+    // FULL legacy parse of this turn (count mode — id mode requires model
+    // equality, and the cross-model echo desync self-heals via restamp).
+    const b2 = bodyOf([SYS("s"), USR("a"), USR("b"), USR("c")], "m-two");
+    const r2 = runTurn(session, { [PF_COUNT_HEADER]: "3" }, b2);
+    assert.equal(r2.out.decision, "seed-stale", LOGS.join("\n"));
+    assert.equal(watermarkDebugState(session).model, "m-two");
+    // m-two's projection is now pure incremental appends
+    const b3 = bodyOf([SYS("s"), USR("a"), USR("b"), USR("c"), USR("d")], "m-two");
+    const r3 = runTurn(session, { [PF_COUNT_HEADER]: "4" }, b3);
+    assert.equal(r3.out.decision, "hit", LOGS.join("\n"));
+    // flipping BACK costs exactly one more legacy pass — then m-one resumes
+    // incremental service from the rebuilt projection (its own stale-watermark
+    // semantics untouched).
+    const b4 = bodyOf([SYS("s"), USR("a"), USR("b"), USR("c"), USR("d"), USR("e")], "m-one");
+    const r4 = runTurn(session, { [PF_COUNT_HEADER]: "5" }, b4);
+    assert.equal(r4.out.decision, "seed-stale", LOGS.join("\n"));
+    const b5 = bodyOf([SYS("s"), USR("a"), USR("b"), USR("c"), USR("d"), USR("e"), USR("f")], "m-one");
+    const r5 = runTurn(session, { [PF_COUNT_HEADER]: "6" }, b5);
+    assert.equal(r5.out.decision, "hit", LOGS.join("\n"));
+});
+
+test("v6: ledger FIFO cap — the cumulative host-id table stays bounded while appends continue (obs ≤4KB discipline scaled)", () => {
+    const stub = makeStubStore();
+    const session = freshSession("pf-v6-cap");
+    // two honest turns build a small REAL ledger [h-b,h-c,h-d] under K=4;
+    // simulating a long-lived history means hand-growing the PERSISTED table
+    // to its full 2048-entry capacity (oldest synthetic ids first), which is
+    // exactly the shape readSaved validates back in.
+    const b1 = bodyOf([SYS("s"), USR("a"), USR("b")]);
+    assert.equal(runTurn(session, {}, b1).out.decision, "no-stamp");
+    const b2 = bodyOf([SYS("s"), USR("a"), USR("b"), USR("c")]);
+    assert.equal(runTurn(session, { [PF_COUNT_HEADER]: "3", ...TAIL(["h-b", "h-c"]) }, b2).out.decision, "hit", LOGS.join("\n"));
+    const b3 = bodyOf([SYS("s"), USR("a"), USR("b"), USR("c"), USR("d")]);
+    assert.equal(runTurn(session, { [PF_COUNT_HEADER]: "4", ...TAIL(["h-c", "h-d"]) }, b3).out.decision, "hit", LOGS.join("\n"));
+    const padIds = Array.from({ length: 2045 }, (_, i) => `old-${i}`);
+    stub.ext.set(savedKey("pf-v6-cap"), JSON.stringify({ t: 4, m: "m1", misses: 0, l: ["h-c", "h-d"], lg: [...padIds, "h-b", "h-c", "h-d"] }));
+    const b4 = bodyOf([SYS("s"), USR("a"), USR("b"), USR("c"), USR("d"), USR("e")]);
+    const r4 = runTurn(session, { [PF_COUNT_HEADER]: "5", ...TAIL(["h-d", "h-e"]) }, b4);
+    assert.equal(r4.out.decision, "hit", LOGS.join("\n"));
+    const lg = readSaved(stub, "pf-v6-cap").lg as string[];
+    assert.equal(lg.length, 2048, "cap must hold exactly (FIFO drop oldest)");
+    assert.equal(lg[0], padIds[1], "exactly one oldest drops per single append");
+    assert.deepEqual(lg.slice(-2), ["h-d", "h-e"], "newest appends survive at the tail");
+});

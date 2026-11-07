@@ -13,7 +13,7 @@ import { yieldToEventLoop } from "../yield-loop.js";
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, resolveDecisionRange, stripDecisionReasoningFields, type DecideConfig } from "../nudge-decide.js";
 import { excludeDeadRefRanges } from "../acp-status.js";
 import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "../fold-reconcile.js";
-import { maybeSnapshotView } from "./snapshot-render.js";
+import { maybeSnapshotView, probeTranscriptAlignment } from "./snapshot-render.js";
 import { storedMessagesFor, storedRowLookupFor } from "../fold-decomposition-lookup.js";
 import { nudgeSuppressed } from "../session-self-heal.js";
 import { compressBreakerArmed } from "../stream.js";
@@ -165,6 +165,17 @@ export async function prepareOpenai(
             openaiSystemText = outcome.outbound;
         }
         originalMessages = msgs;
+        // #5403/#5418 v6 (R1) confirmation layer: on a watermark MISS turn
+        // the full parse is already paid — let the CANONICAL transcript
+        // confirm/contradict the ledger's view with a light identity-rows-only
+        // probe (no content bytes), one log per session at most.
+        if (wpOutcome !== null && wpHit === undefined && featureEnabled("snapshotRender")
+                && session.state.blocks.some((b) => b.active)
+                && session.metadata["pfV6ConfirmLogged"] !== true) {
+            session.metadata["pfV6ConfirmLogged"] = true;
+            const probe = probeTranscriptAlignment(session, originalMessages);
+            log("debug", `[${session.id}] [pf-v6] transcript-alignment confirmation after watermark miss (${wpOutcome.decision}): ${probe.anchored ? `anchored (join row ${probe.joinRow})` : `not anchored (${probe.reason ?? "unknown"})`}`);
+        }
         // #3756 snapshot render: the outbound prefix renders from the unified
         // transcript (server-authoritative, fold-time ids — immune to identity
         // re-mints #3752); only the live tail keeps the client's bytes.
