@@ -292,3 +292,90 @@ describe("honesty gates survive the doctrine (no wholesale silencing)", () => {
         assert.notEqual(session.metadata[METADATA_DRIFT_ESCALATED], true, "single-cell churn never mass-escalates");
     });
 });
+
+describe("#5715 partial interior loss with a surviving direct-ID majority is NOT total drift", () => {
+    // 30-turn history, every turn folded in. The host drops TEN INTERIOR turns
+    // (neither a head cut nor a tail rewind) while the other TWENTY ride
+    // verbatim on the wire. The #3641 verdict classifier only saw
+    // claims==0 + unmatched>0 and never counted the twenty surviving DIRECT
+    // matches, so three such passes latched epoch-confirm and paused
+    // compression on a healthy session (#5715 field: 1162/1171 direct-present,
+    // ten interior missing). A strict direct-ID majority is the opposite of
+    // wholesale replacement and must not read as substrate destruction.
+    function interiorLossFixture(): { old: CoreMessage[]; covered: string[]; wire: CoreMessage[] } {
+        const old: CoreMessage[] = [];
+        for (let i = 0; i < 30; i++) {
+            old.push(msg(`t${i}`, i % 2 ? "user" : "assistant",
+                `history turn ${i} with distinctive vocabulary marker word ${i} for shingle coverage`));
+        }
+        const covered = old.map((m) => m.id as string);
+        const removed = new Set([4, 6, 8, 10, 12, 14, 16, 18, 20, 22]); // ten INTERIOR turns
+        const wire = old.filter((_, i) => !removed.has(i));
+        return { old, covered, wire };
+    }
+
+    test("ten interior turns dropped, twenty verbatim: no escalation, no epoch-confirm latch", () => {
+        const { old, covered, wire } = interiorLossFixture();
+        const session = fakeSession(covered, old, "dsh");
+        for (let pass = 0; pass < 4; pass++) reconcileFoldCoverage(session, wire, repair());
+        assert.notEqual(session.metadata[METADATA_DRIFT_ESCALATED], true,
+            "a surviving strict direct-ID majority is not substrate destruction");
+        assert.equal(epochConfirmPending(session), false,
+            "partial interior loss must not ask for an epoch confirmation");
+        const blocks = (session.state as { blocks: Array<{ blockId?: string }> }).blocks;
+        assert.ok(blocks.some((b) => b.blockId === "blk-1"), "the snapshot block is retained, not reaped");
+    });
+
+    test("the same interior-loss shape is tolerated in proxy mode too (lane-agnostic)", () => {
+        const { old, covered, wire } = interiorLossFixture();
+        const session = fakeSession(covered, old); // no pluginAgent -> proxy mode
+        for (let pass = 0; pass < 4; pass++) reconcileFoldCoverage(session, wire, repair());
+        assert.equal(epochConfirmPending(session), false,
+            "direct-ID majority continuity is identity evidence on every lane, not just DSH");
+    });
+
+    test("an already-pending stale latch clears once the healthy majority is back", () => {
+        const { old, covered } = interiorLossFixture();
+        const session = fakeSession(covered, old, "dsh");
+        // A persisted pending latch whose drift streak was already cleared
+        // (#5715 second site: prevStreak===0 must not strand the pause).
+        session.metadata["foldEpochConfirmPending"] = true;
+        assert.equal(epochConfirmPending(session), true, "precondition: the latch is pending");
+        // the original history is back on the wire wholesale -> a clean realigned pass
+        reconcileFoldCoverage(session, old, repair());
+        assert.equal(epochConfirmPending(session), false,
+            "strong direct continuity on an already-pending session recovers compression");
+    });
+
+    test("an explained head cut keeps its own note — the majority note stays silent", () => {
+        // 30 fully-covered turns; the host drops the OLDEST ten (a head cut —
+        // truncationExplained territory, #2695) while twenty ride verbatim,
+        // which is ALSO a strict direct-ID majority. The #2695 note owns this
+        // episode: the #5715 majority note must not fire a second line
+        // mislabeling the head cut as "interior" loss.
+        const old: CoreMessage[] = [];
+        for (let i = 0; i < 30; i++) {
+            old.push(msg(`t${i}`, i % 2 ? "user" : "assistant",
+                `history turn ${i} with distinctive vocabulary marker word ${i} for shingle coverage`));
+        }
+        const session = fakeSession(old.map((m) => m.id as string), old);
+        reconcileFoldCoverage(session, old, repair()); // warm pass: coverage established
+        const logs: string[] = [];
+        for (let pass = 0; pass < 4; pass++) reconcileFoldCoverage(session, old.slice(10), repair((l, m) => logs.push(`${l}: ${m}`)));
+        assert.ok(logs.some((line) => line.startsWith("info") && /truncat/i.test(line)),
+            "the #2695 truncation note still names the head cut");
+        assert.ok(!logs.some((line) => line.includes("partial interior loss")),
+            "an already-explained episode is not double-reported as interior loss");
+    });
+
+    test("genuine wholesale replacement STILL escalates (the gate did not weaken detection)", () => {
+        const { old, covered } = interiorLossFixture();
+        const session = fakeSession(covered, old, "dsh");
+        const foreign: CoreMessage[] = [];
+        for (let i = 0; i < 14; i++) foreign.push(msg(`x${i}`, i % 2 ? "user" : "assistant",
+            `unrelated fresh content ${i} about a brand new topic entirely`));
+        for (let pass = 0; pass < 4; pass++) reconcileFoldCoverage(session, foreign, repair());
+        assert.equal(session.metadata[METADATA_DRIFT_ESCALATED], true, "detection intact: the collapse is still flagged");
+        assert.equal(epochConfirmPending(session), true, "wholesale replacement still asks for an epoch confirmation");
+    });
+});
