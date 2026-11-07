@@ -23,6 +23,8 @@ import { getUpdateVisibility, updateBannerPayload } from "../update-notes.js";
 import { installVersionAction, triggerManualCheck, updateActionsAvailable, updateStateSnapshot } from "./update-actions.js";
 import { getUnrecognizedPathStats } from "./observability.js";
 import { getStore } from "../persist.js";
+import { fileSnapBase } from "../knobs.js";
+import type { SnapPlaneStatusWire } from "../storage/snap.js";
 import { BodyTooLargeError, headerValue, readBody } from "../server.js";
 import { dismissHostPlugin, visibleHostPluginNotices } from "../host-plugin-notice.js";
 import { dismissUpgradeNotice } from "../pck-notice.js";
@@ -1317,7 +1319,35 @@ async function sendStatus(res: http.ServerResponse, opts: ProxyOptions, laneHost
             loggerLog("warn", `split-session canary (#2170): conversation ${w.base} has live traffic under multiple session keys (design persona forks are excluded): ${w.sessions.map((s) => `${s.id} (requests=${s.requests})`).join("; ")}. For a non-persona host this is the #2165 failure shape (stolen anchor / never-compressing split) — investigate if unexpected.`);
         }
     }
-    res.end(JSON.stringify({ version: VERSION, commit: BUILD_COMMIT, origin: laneHost ?? null, diskVersion, stale, lastInstall, updateReady: updateReadyPayload(), autoRestartOnUpdate: opts.autoRestartOnUpdate, advisory: currentAdvisoryPayload(), resolverWedge: getResolverWedgeState(), updatePolicy: updatePolicyPayload(), pluginAdvisories: detectCostAdvisories(process.env), inFlight: totalInFlight(), splitSessions: splitWarnings, conflicts: summarizeConflicts(listSessions()), storage: storageStatusWire(), snapshotShadow: snapshotShadowStatusWire(), attribution: attributionStatusWire() }, null, 2));
+    res.end(JSON.stringify({ version: VERSION, commit: BUILD_COMMIT, origin: laneHost ?? null, diskVersion, stale, lastInstall, updateReady: updateReadyPayload(), autoRestartOnUpdate: opts.autoRestartOnUpdate, advisory: currentAdvisoryPayload(), resolverWedge: getResolverWedgeState(), updatePolicy: updatePolicyPayload(), pluginAdvisories: detectCostAdvisories(process.env), inFlight: totalInFlight(), splitSessions: splitWarnings, conflicts: summarizeConflicts(listSessions()), storage: storageStatusWire(), snapshotShadow: snapshotShadowStatusWire(), snaplane: snapplaneStatusPayload(), attribution: attributionStatusWire() }, null, 2));
+}
+
+// #5874: the snapshot-table plane's /__bili/status field — flag state
+// (master/lane from the config file), counters (sessions/rows/log/folds/L1)
+// and the per-sid dead latches. Store unavailable (legacy-only lane) → the
+// flags with zeroed counters; a throw → all-off with zeroed counters
+// (status is informational and must never take the endpoint down).
+function snapplaneStatusPayload(): SnapPlaneStatusWire {
+    const flags = fileSnapBase() ?? { enabled: false, shadowWrite: false };
+    const zeroed: SnapPlaneStatusWire = {
+        enabled: flags.enabled,
+        shadowWrite: flags.shadowWrite,
+        deadSids: [] as string[],
+        sessions: 0,
+        rows: 0,
+        activeRows: 0,
+        logEntries: 0,
+        ckpts: 0,
+        l1Entries: 0,
+        l1Armed: 0,
+    };
+    try {
+        const st = getStore().snapplaneStatus();
+        if (st === null) return zeroed;
+        return st;
+    } catch {
+        return { ...zeroed, deadSids: [] };
+    }
 }
 
 // #2090 plan A — read-only view backing the web UI's "Signed upstreams" card:

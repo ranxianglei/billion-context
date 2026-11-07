@@ -962,6 +962,24 @@ export function fileStorageWalJournalSizeLimit(): number | undefined {
     return typeof v === "number" && Number.isInteger(v) && v > 0 ? v : undefined;
 }
 
+/** #5874: snapshot-table compression foundation flags — config-file only
+ *  (no env tier: #2030 reserves env for documented-essential categories,
+ *  and this is a rollout knob, not an environment fact). Two-level
+ *  nesting: `storage.snapBase.enabled` is the MASTER flag (the plane is
+ *  allowed to exist); `storage.snapBase.shadowWrite` is the LANE flag
+ *  (the shadow write hook actually runs). The lane flag only counts with
+ *  the master on — resolved here so a config with shadowWrite=true but
+ *  enabled=false (or absent) can never turn the plane on by itself.
+ *  Defaults: both false — the four tables exist (schema v12, additive) but
+ *  stay untouched, and the write hook is a no-op. */
+export function fileSnapBase(): { enabled: boolean; shadowWrite: boolean } | undefined {
+    const v = loadConfigFile().storage?.snapBase;
+    if (v === undefined || v === null || typeof v !== "object") return undefined;
+    const enabled = v.enabled === true;
+    const shadowWrite = v.shadowWrite === true;
+    return { enabled, shadowWrite: enabled && shadowWrite };
+}
+
 /** Tiered storage-migration switch (#2671): legacy | shadow | full. Lives here
  *  per the env-var discipline — env tier BILI_STORAGE_UNIFIED (1/true = shadow,
  *  full/unified = full, 0/false/legacy/garbage = legacy) wins over the

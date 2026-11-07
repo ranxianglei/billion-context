@@ -83,7 +83,17 @@
 //        discipline as v9 (#4796); building them once costs about what
 //        open-time quick_check pays on EVERY open (#4175). Additive-only: an
 //        older build opening a v11 file ignores the extra indexes.
-export const STORAGE_SCHEMA_VERSION = 11;
+//      - v12: snapshot-table compression foundation (#5874 P0) — four
+//        ADDITIVE tables + one index (l1_world / snap_rows / snap_log /
+//        snap_ckpt). No backfill, no rewrite of existing rows: the plane is
+//        dormant until storage.snapBase.enabled turns it on, and rollback is
+//        DROP the four tables + index and rewind user_version — T1 pins the
+//        byte-identical behavior in both directions. Additive-only: an
+//        older build opening a v12 file ignores the extra tables.
+//        NOTE (timing dependency, #5855): the unmerged fastpath re-land also
+//        numbers its two table groups v12/v13; whichever lands second renumbers
+//        its block mechanically (CREATE IF NOT EXISTS shapes are independent).
+export const STORAGE_SCHEMA_VERSION = 12;
 
 /** #3250: cap for `journal_size_limit` (see STORAGE_PRAGMAS). Passive and
  *  auto checkpoints move frames into the main db and reset the write offset
@@ -305,6 +315,78 @@ CREATE INDEX IF NOT EXISTS idx_message_media_media_hash ON message_media(media_h
 CREATE INDEX IF NOT EXISTS idx_checkpoints_state_hash ON checkpoints(state_hash);
 `;
 
+/** #5874 snapshot-table compression foundation (P0, v12) — four additive
+ *  tables + one index, created here so fresh installs and in-place upgrades
+ *  converge on the same shape. The plane is DORMANT unless the
+ *  storage.snapBase config surface turns it on: with the flag off these
+ *  tables stay empty forever, and rollback is DROP + user_version rewind
+ *  (no data migration exists in either direction — pure additivity, T1).
+ *
+ *  l1_world: stage-0 identity ledger — the raw host session id (sess_raw)
+ *  maps to the proxy's ledger identity (ledger_id = sessions.session_id).
+ *  witness_probe is the sampled id fingerprint the arm decision was based on
+ *  (composite-probe evidence). issued_at precedes armed_at until one full
+ *  echo round validates the mapping (the "one round of arming" the proposal
+ *  charges for a fresh identity).
+ *
+ *  snap_rows: the materialized snapshot projection — one row per ledger
+ *  position (pos = messages.seq for the same session). core_ids is the JSON
+ *  array of host message ids bound to the position; pre_json / post_json
+ *  carry the canonical core shape (NEVER wire bytes — invariant v); an
+ *  active=0 row is folded/tombstoned but NEVER physically deleted by events
+ *  (invariant iv — physical cleanup waits for the covering block's archive,
+ *  snapGcCoveredRows). cover_ref names the covering block for folded rows.
+ *
+ *  snap_log: the append-only event stream. seq is strictly monotonic per
+ *  session and always > max(log max, ckpt_seq) (invariant ii — enforced by
+ *  the commit primitive, snap.ts). payload carries the applied event, the
+ *  per-row S4 checksums of the touched rows, and the post-apply aggregate
+ *  checksum over ALL rows (R1's verification anchor). Entries fold into
+ *  snap_ckpt and are truncated at fold time — bounded depth (T9).
+ *
+ *  snap_ckpt: the fold point. ckpt_seq = the last log seq absorbed into the
+ *  rows; checksum = the S4 aggregate over ALL rows at fold time — the read
+ *  side re-derives it and any mismatch kills the plane for the sid (R1);
+ *  meta_json is the three-piece set (kernel state verbatim, coverage
+ *  mapping, folded at fold time). */
+const SNAPBASE_DDL_V12 = `-- #5874 snapshot-table compression foundation (P0, v12).
+CREATE TABLE IF NOT EXISTS l1_world (
+    sess_raw       TEXT PRIMARY KEY,
+    ledger_id      TEXT NOT NULL,
+    witness_probe  TEXT NOT NULL,
+    issued_at      INTEGER NOT NULL,
+    armed_at       INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_l1_ledger ON l1_world(ledger_id);
+CREATE TABLE IF NOT EXISTS snap_rows (
+    sid          TEXT NOT NULL,
+    pos          INTEGER NOT NULL,
+    core_ids     TEXT NOT NULL,
+    pre_json     TEXT,
+    post_json    TEXT,
+    tokens_est   INTEGER NOT NULL DEFAULT 0,
+    active       INTEGER NOT NULL DEFAULT 1,
+    cover_ref    TEXT,
+    updated_at   INTEGER NOT NULL,
+    PRIMARY KEY (sid, pos)
+);
+CREATE TABLE IF NOT EXISTS snap_log (
+    sid        TEXT NOT NULL,
+    seq        INTEGER NOT NULL,
+    kind       TEXT NOT NULL,
+    payload    TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (sid, seq)
+);
+CREATE TABLE IF NOT EXISTS snap_ckpt (
+    sid        TEXT PRIMARY KEY,
+    ckpt_seq   INTEGER NOT NULL,
+    meta_json  TEXT NOT NULL DEFAULT '{}',
+    checksum   TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+`;
+
 /** Applied inside one transaction whenever user_version < STORAGE_SCHEMA_VERSION. */
 export function migrateSchema(db: {
     exec(sql: string): void;
@@ -435,6 +517,17 @@ export function migrateSchema(db: {
             db.exec("CREATE INDEX IF NOT EXISTS idx_ccr_entries_content_hash ON ccr_entries(content_hash)");
             db.exec("CREATE INDEX IF NOT EXISTS idx_message_media_media_hash ON message_media(media_hash)");
             db.exec("CREATE INDEX IF NOT EXISTS idx_checkpoints_state_hash ON checkpoints(state_hash)");
+        }
+        if (from < 12) {
+            // v12 (#5874 P0): snapshot-table compression foundation — four
+            // additive tables + index (l1_world / snap_rows / snap_log /
+            // snap_ckpt). Pure additivity: no backfill, no rewrite of
+            // existing rows; the plane stays dormant until
+            // storage.snapBase.enabled turns it on. Rollback = DROP the four
+            // tables + index and set user_version back (T1 pins the
+            // byte-identical behavior in both directions). Idempotent
+            // CREATEs, same discipline as v9/v11.
+            db.exec(SNAPBASE_DDL_V12);
         }
     });
     if (needV8Backfill) migrateV8Identities(db);
