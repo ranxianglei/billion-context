@@ -69,7 +69,7 @@ import { warnCacheCollapse } from "./cache-warn.js";
 import { currentContextObservation, recordContextObservation, settleUsageReport } from "./cache-ledger.js";
 import { billOutputUsage } from "./billing.js";
 import { promptInputTotal, declaredInclusiveFromUsage, type WireProtocol } from "./util.js";
-import { stateDir } from "./paths.js";
+import { retrievalExportDir, stateDir } from "./paths.js";
 import { lookupToolUseIdSession, lookupToolWitness, recordToolUseId, recordToolWitness } from "./tool-ring.js";
 import { awaitDrain } from "./server/stream-io.js";
 import { incomingCoreMessages } from "./fork-adoption.js";
@@ -2253,7 +2253,7 @@ export async function handlePluginTool(
             }, callId, undefined, deps.signal);
             if (nativeCaller && tool === retrieveToolName(session) && typeof args.ref === "string") {
                 // Preserve the session's export before a same-ref concurrent lookup.
-                const retrieved = applyRetrieve({ store: contentStoreOf(session), ref: args.ref, exportDir: path.join(stateDir(), "retrieve") });
+                const retrieved = applyRetrieve({ store: contentStoreOf(session), ref: args.ref, exportDir: retrievalExportDir(session.id) });
                 if (retrieved.ok && retrieved.toolResultText === toolResult.text) retrievalExport = retrieved.export;
             }
             const creditDelta = (session.stats.compressCreditTokens ?? 0) - creditBefore;

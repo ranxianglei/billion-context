@@ -34,7 +34,7 @@ import {
 } from "acp-kernel/wire";
 import type { CompressionState, CoreMessage } from "acp-kernel";
 import { log as loggerLog } from "./logger.js";
-import { stateDir } from "./paths.js";
+import { retrieveSessionDirName, stateDir } from "./paths.js";
 import { decodeImageDims } from "./image-tokens.js";
 import type { WireProtocol } from "./util.js";
 
@@ -394,23 +394,13 @@ export function describeRestorable(index: Map<string, IndexedImage[]>, cap = 50)
  *  of the path — a flat retrieve/img/ would let two sessions' same-numbered refs
  *  collide, and with skip-if-exists the first session's pixels would be served
  *  for the second session's ref forever (cross-session finding from review). */
-/** Directory name (not path) for a session's spill tree — exported so the
- *  session GC can address the same dir under a test-provided root. */
-export function restoreExportDirName(sessionId: string): string {
-    const safe = sessionId.replace(/[^a-zA-Z0-9_-]/g, "-").slice(0, 100);
-    // Review ①: distinct raw ids that sanitize to the same safe form ("a/b" vs
-    // "a-b", or a >100-char truncation) must not share a directory — salt with
-    // a short hash of the RAW id whenever the sanitizer changed anything. The
-    // salt is deterministic, so the path survives restarts, and post-salt the
-    // map id -> dir is injective (two ids can only collide when both sanitize
-    // AND hash identically). Unsalted ids keep their historical path.
-    return safe === sessionId
-        ? (safe || "session")
-        : `${safe || "session"}-${createHash("sha256").update(sessionId).digest("hex").slice(0, 8)}`;
-}
+// #4699: the session-partitioned naming moved to paths.ts (the CCR text-export
+// dirs share it); re-export under the historical name so the session GC and
+// existing call sites/tests address the same function.
+export { retrieveSessionDirName as restoreExportDirName };
 
 export function restoreExportDir(sessionId: string): string {
-    return join(stateDir(), "retrieve", "img", restoreExportDirName(sessionId));
+    return join(stateDir(), "retrieve", "img", retrieveSessionDirName(sessionId));
 }
 
 function extFor(mediaType: string): string {
