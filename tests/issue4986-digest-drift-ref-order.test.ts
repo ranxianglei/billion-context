@@ -8,14 +8,16 @@ import { SessionStore } from "../src/persist.ts";
 /**
  * #4986: the sampled ingest read-back verify must not report DIGEST DRIFT
  * when the in-memory messageRefs key order diverges from the stored
- * refs-row order. The golden corpora are exactly that shape: byRef sits in
- * ref-number order while byRaw — which finishPlan freezes into row ord at
- * full ingest — sits in a different key order, so the row-rebuilt leg's
- * byRef starts at m00041 while the live leg's starts at m00001. Identical
- * content, different key insertion order. Pre-fix, every such save logged
- * an error-level DIGEST DRIFT and dropped the ingest watermark (full-tail
- * re-ingest next save); post-fix the parity digest compares contents, not
- * key insertion order (#3407/#3113 philosophy).
+ * refs-row order. The folded golden corpus loads with its legacy refs —
+ * since #5599 the one-time re-stamp refuses incomplete ledgers (folded
+ * ghosts own no rows) — so the test synthesizes the divergent shape:
+ * byRaw is rebuilt in reversed insertion order (ref values untouched),
+ * which finishPlan freezes into row ord at full ingest, so the
+ * row-rebuilt leg's byRef starts at a different ref than the live leg's.
+ * Identical content, different key insertion order. Pre-fix, every such
+ * save logged an error-level DIGEST DRIFT and dropped the ingest
+ * watermark (full-tail re-ingest next save); post-fix the parity digest
+ * compares contents, not key insertion order (#3407/#3113 philosophy).
  */
 
 process.env.BILI_PERSIST_ZSTD = "0";
@@ -53,12 +55,21 @@ test("ingest verify ignores messageRefs key-order divergence (#4986)", async () 
         try {
             const session = loadCorpusCase(seed, "folded", "corpus-folded", "anthropic");
 
-            // Precondition: the corpus exhibits the divergent shape — the
-            // row order (byRaw key order, what finishPlan stores as ord)
-            // projects byRef to a DIFFERENT key sequence than the live map's
-            // own key order. Without this the test would pass vacuously.
+            // #5599: cold-load re-stamp now refuses incomplete ledgers, so the
+            // loaded folded corpus no longer carries the divergent shape —
+            // synthesize it: rebuild byRaw in reversed insertion order (ref
+            // values untouched, only key order moves).
+            {
+                const entries = Object.entries(session.state.messageRefs.byRaw).reverse();
+                session.state.messageRefs.byRaw = {};
+                for (const [rawId, ref] of entries) session.state.messageRefs.byRaw[rawId] = ref;
+            }
             const byRaw = session.state.messageRefs.byRaw;
             const byRef = session.state.messageRefs.byRef;
+            // Precondition: the shape exhibits the divergence — the row order
+            // (byRaw key order, what finishPlan stores as ord) projects byRef
+            // to a DIFFERENT key sequence than the live map's own key order.
+            // Without this the test would pass vacuously.
             const rowOrderProjectedRefs = Object.keys(byRaw)
                 .map((rawId) => byRaw[rawId])
                 .filter((ref) => ref !== "BLOCKED" && byRef[ref] !== undefined);

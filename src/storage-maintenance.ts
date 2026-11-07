@@ -1,12 +1,12 @@
 /**
- * `bili sessions …` / `bili storage gc` — CLI plumbing over the existing
+ * `bili sessions …` / `bili storage gc|migrate` — CLI plumbing over the existing
  * persistence + #3911 store maintenance APIs. No new store semantics: every
  * mutation here is the same call the HTTP surface makes (admin.ts), so the
  * two lanes stay structurally identical.
  */
 import { existsSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { SessionStore } from "./persist.js";
+import { SessionStore, type LegacyMigrateReport } from "./persist.js";
 import type { GcPlan } from "./storage/store.js";
 import { fileStorageArchiveAfterDays, resolveArchiveAfterDays } from "./knobs.js";
 import { scanForeignBlocks, applyForeignBlockSweep, type ForeignBlockPlan } from "./foreign-block-sweep.js";
@@ -346,6 +346,61 @@ export async function runStorageGcCommand(opts: {
     }
     try {
         return await runGc(store, opts.days, opts.vacuum, !!opts.dryRun, !!opts.json);
+    } finally {
+        store.closeQuietly();
+    }
+}
+
+function renderMigrate(report: LegacyMigrateReport, dryRun: boolean): string {
+    const lines = [
+        `storage migrate${dryRun ? " (dry run)" : ""}: ${report.scannedFiles} files scanned`,
+        `  imported: ${report.counts.imported}   indexed: ${report.counts.indexed}${dryRun ? `   planned: ${report.counts.planned}` : ""}   drifted: ${report.counts.drifted}   failed: ${report.counts.failed}`,
+    ];
+    const problems = report.results.filter((r) => r.status === "drifted" || r.status === "failed");
+    if (problems.length > 0) {
+        lines.push("");
+        lines.push("problems:");
+        for (const p of problems) {
+            lines.push(`  ${p.status.toUpperCase()}  ${p.id}`);
+            lines.push(`            ${p.file}`);
+            if (p.reason) lines.push(`            ${p.reason}`);
+            if (p.alternates) lines.push(`            (${p.alternates} same-id route file(s) left untouched)`);
+        }
+    } else if (report.results.length > 0) {
+        lines.push(`  all ${report.results.length} session(s) reconciled`);
+    } else {
+        lines.push("  no legacy JSON sessions found");
+    }
+    if (dryRun) lines.push("dry-run: nothing written");
+    else lines.push("note: JSON files were not modified — archive or delete them yourself once this report is clean.");
+    return lines.join("\n");
+}
+
+async function runMigrate(store: SessionStore, dryRun: boolean, json: boolean): Promise<StorageCommandResult> {
+    if (!store.replicasAvailable()) return fail(`storage migrate ${UNIFIED_REQUIRED}`, json);
+    const dbBefore = indexDbSize(store.dir);
+    const report = await store.migrateLegacyToUnified({ dryRun });
+    const dbAfter = indexDbSize(store.dir);
+    const code = dryRun || (report.counts.drifted + report.counts.failed) === 0 ? 0 : 1;
+    if (json) {
+        return { code, text: `${JSON.stringify({ dryRun, ...report, indexDbBefore: dbBefore, indexDbAfter: dbAfter }, null, 2)}\n` };
+    }
+    let text = renderMigrate(report, dryRun);
+    if (!dryRun && dbBefore !== undefined && dbAfter !== undefined) text += `\n  index.db size: ${formatBytes(dbBefore)} -> ${formatBytes(dbAfter)}`;
+    return { code, text: `${text}\n` };
+}
+
+/** #5599 one-shot bulk import of every legacy JSON session into the unified
+ *  SQLite index with per-session digest reconciliation. Read-only over the
+ *  JSON files; exit 1 when any session is drifted or failed. */
+export async function runStorageMigrateCommand(opts: {
+    dryRun?: boolean;
+    json?: boolean;
+    dir?: string;
+}): Promise<StorageCommandResult> {
+    const store = new SessionStore({ dir: opts.dir, enabled: true });
+    try {
+        return await runMigrate(store, !!opts.dryRun, !!opts.json);
     } finally {
         store.closeQuietly();
     }
