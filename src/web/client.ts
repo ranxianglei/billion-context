@@ -370,6 +370,7 @@ export const WEB_CLIENT = `(function () {
             case "codex": return t("conflict.hint.codex");
             case "pi": return t("conflict.hint.pi");
             case "omp": return t("conflict.hint.omp");
+            case "antigravity": return t("conflict.hint.antigravity");
             default: return t("conflict.hint.generic");
         }
     }

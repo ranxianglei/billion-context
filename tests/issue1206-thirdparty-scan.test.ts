@@ -8,7 +8,7 @@ process.env.NODE_ENV = "test";
 
 import { createInitialState } from "acp-kernel";
 import type { Session } from "../src/session.ts";
-import { clearScanCache, conflictScanEnabled, isDesignBenign, isDisplayOnlyConflictDetail, isKnownDisplayOnlyPlugin, isOpencodeAcpEntry, isSiblingConflictDetail, parsePluginConflictDetail, scanClientPlugins, sniffScanClient, type ThirdPartyFinding } from "../src/thirdparty-scan.js";
+import { clearScanCache, conflictScanEnabled, isAntigravityClient, isDesignBenign, isDisplayOnlyConflictDetail, isKnownDisplayOnlyPlugin, isOpencodeAcpEntry, isSiblingConflictDetail, parsePluginConflictDetail, scanClientPlugins, sniffScanClient, type ThirdPartyFinding } from "../src/thirdparty-scan.js";
 import { CONFLICT_LEDGER_MAX, conflictEventsOf, formatConflictSection, recordConflict, summarizeConflicts } from "../src/conflict-watch.js";
 import { resolveHermesHome, resolveKimiHome, resolveOmpHome, resolvePiHome } from "../src/client-config.js";
 import { SessionStore, _setStoreForTest } from "../src/persist.js";
@@ -70,10 +70,20 @@ test("sniffScanClient identifies clients from wire headers", () => {
     assert.equal(sniffScanClient({ "x-claude-code-session-id": "abc" }), "claude");
     assert.equal(sniffScanClient({ "user-agent": "codex_cli_rs/0.50.0" }), undefined);
     assert.equal(sniffScanClient({ "user-agent": "codex desktop/1.0" }), undefined);
+    // antigravity: recognized but no scannable registry — same contract as codex (#4688)
+    assert.equal(sniffScanClient({ "user-agent": "antigravity/hub/2.26.0 (aidev_client; os_type=windows)" }), undefined);
     assert.equal(sniffScanClient({ "x-opencode-session": "ses_123" }), "opencode");
     assert.equal(sniffScanClient({ "x-session-affinity": "ses_abc" }), "opencode");
     assert.equal(sniffScanClient({ "x-session-affinity": "not-a-session" }), undefined);
     assert.equal(sniffScanClient({}), undefined);
+});
+
+test("isAntigravityClient matches the antigravity/hub/ UA prefix only (#4688)", () => {
+    assert.equal(isAntigravityClient({ "user-agent": "antigravity/hub/2.26.0 (aidev_client; os_type=windows; arch=amd64; cl=1005016104)" }), true);
+    assert.equal(isAntigravityClient({ "user-agent": "Antigravity/hub/1.0" }), true);
+    assert.equal(isAntigravityClient({ "user-agent": "my-antigravity-tool/2.0" }), false);
+    assert.equal(isAntigravityClient({}), false);
+    assert.equal(isAntigravityClient({ "user-agent": [] }), false);
 });
 
 test("opencode scan: known conflict + keyword entries, self/context7 skipped", () => {
