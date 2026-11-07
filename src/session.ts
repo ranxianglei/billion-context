@@ -1133,6 +1133,22 @@ function isColdLoadGraced(session: Session): boolean {
     return session.coldLoadedAt !== undefined && Date.now() - session.coldLoadedAt < COLD_LOAD_EVICT_GRACE_MS;
 }
 
+// #5806: how long a recently TOUCHED session stays exempt from BYTE-budget
+// eviction independent of reload history. The 10-minute window above mints
+// only when a session RE-materializes from disk; a hot session that simply
+// stayed resident loses that shield ten minutes later while usage continues,
+// and the next discharge picks it off as "oldest idle" — paying one full
+// reload per window forever instead of never. This shorter window covers that
+// gap: touched within the last minute counts as in use. Count-cap admission
+// ignores it exactly like the cold-load window (availability floor; the victim
+// is flushed to disk before deletion, so overriding costs re-materialization,
+// never state).
+const RECENT_TOUCH_EVICT_GRACE_MS = 60_000;
+
+function isRecentTouchGraced(session: Session): boolean {
+    return Date.now() - session.lastSeen < RECENT_TOUCH_EVICT_GRACE_MS;
+}
+
 // #3918: last-known LIVE weight of evicted sessions, stamped at eviction time.
 // The live weight (transient message caches included) is only measurable while
 // the object is resident — a disk reload carries persisted state alone and
@@ -1151,6 +1167,14 @@ function stampEvictedWeight(id: string, bytes: number): void {
         evictedWeights.delete(oldest);
     }
 }
+
+// #5806: lifetime eviction bookkeeping for /__bili/memory (the issue's ask:
+// operators must be able to SEE the pool shedding, and what it last gave up)
+// plus the saturation-warn rate limiter. Module-level; reset with the pool.
+let evictedTotal = 0;
+let lastEviction: { id: string; weightBytes: number; at: number } | undefined;
+let lastSaturationWarnAt = 0;
+const SATURATION_WARN_INTERVAL_MS = 60_000;
 
 /** Estimate retained objects without serializing a second giant copy. Include
  * originals and last-message caches; counting files alone misses both. */
@@ -1223,7 +1247,18 @@ export function residentBreakdown(session: Session): ResidentFieldBreakdown {
  * budget vs resident totals, per-field sums, and the heaviest sessions.
  * Read-only snapshot — safe to call at any time. */
 export interface MemoryReport {
-    pool: { sessions: number; maxSessions: number; residentBytes: number; budgetBytes: number };
+    pool: {
+        sessions: number;
+        maxSessions: number;
+        residentBytes: number;
+        budgetBytes: number;
+        /** Bytes OVER the budget right now (0 while satisfied). */
+        unsatisfiedBytes: number;
+        /** Lifetime evictions since process boot (#5806 observability). */
+        evictedTotal: number;
+        /** The most recent eviction, if one happened yet. */
+        lastEviction?: { id: string; weightBytes: number; at: number };
+    };
     breakdown: ResidentFieldBreakdown;
     sessions: Array<{ id: string; inFlight: number; lastSeen: number; revision: number; coldLoadedAt?: number; fields: ResidentFieldBreakdown }>;
 }
@@ -1244,8 +1279,9 @@ export function memoryReport(): MemoryReport {
         rows.push({ id: session.id, inFlight: session.inFlight, lastSeen: session.lastSeen, revision: session.revisionEpoch ?? 0, coldLoadedAt: session.coldLoadedAt, fields });
     }
     rows.sort((a, b) => b.fields.total - a.fields.total);
+    const total = residentBytes();
     return {
-        pool: { sessions: sessions.size, maxSessions: MAX_SESSIONS, residentBytes: residentBytes(), budgetBytes: MAX_RESIDENT_BYTES },
+        pool: { sessions: sessions.size, maxSessions: MAX_SESSIONS, residentBytes: total, budgetBytes: MAX_RESIDENT_BYTES, unsatisfiedBytes: Math.max(0, total - MAX_RESIDENT_BYTES), evictedTotal, lastEviction },
         breakdown: sums,
         sessions: rows,
     };
@@ -1286,7 +1322,7 @@ export function residentPressure(id: string): ResidentPressure {
     const total = residentBytes();
     const known = evictedWeights.get(id);
     const weightBytes = known !== undefined ? Math.max(known, self) : resident ? self : undefined;
-    const graced = resident !== undefined && isColdLoadGraced(resident);
+    const graced = resident !== undefined && (isColdLoadGraced(resident) || isRecentTouchGraced(resident));
     return {
         permanent: weightBytes !== undefined && !graced && weightBytes + (total - self) > MAX_RESIDENT_BYTES,
         weightBytes,
@@ -1317,6 +1353,7 @@ function makeResidentRoom(incoming = 0): void {
     while (sessions.size > 0 && residentBytes() + incoming > MAX_RESIDENT_BYTES) {
         if (!evictOldest()) break;
     }
+    notePoolSaturation("makeResidentRoom");
 }
 
 let initialized = false;
@@ -1478,6 +1515,7 @@ export function releaseInFlight(session: Session): void {
     // Active sessions are pinned. Once a request finishes, discharge its
     // growth before admitting more historical sessions into the cache.
     while (residentBytes() > MAX_RESIDENT_BYTES && evictOldest()) { /* bounded cache */ }
+    notePoolSaturation("releaseInFlight");
 }
 
 /** Total in-flight requests across all sessions (sum of per-session
@@ -2042,16 +2080,15 @@ export function coveredRealHistoryIds(blocks: ReadonlyArray<{ readonly active?: 
     return covered;
 }
 
-/** Flush a session to disk and drop it from memory (LRU eviction). Refuses to
- *  evict sessions that are in-flight or whose flush failed (would lose a
- *  never-persisted session permanently). Returns true if a slot was freed.
- *  #5782: byte-budget callers pass no options — sessions inside their cold-load
- *  grace window are skipped, so the hot working set may sit over budget instead
- *  of thrashing (evict↔cold-load re-mints the giant temporaries that OOM'd the
- *  process). Count-cap callers pass { overrideGrace: true }: when EVERY idle
- *  candidate is graced they still evict the oldest one, because a full pool
- *  must admit (availability over cache quality, logged loudly). */
-function evictOldest(opts?: { overrideGrace?: boolean }): boolean {
+/** Pick the eviction victim: OLDEST idle session outside every exemption
+ * window (#5782 cold-load grace, #5806 recent-touch grace). In-flight sessions
+ * never qualify — flushing half-mutated state then reloading a second object
+ * causes split-brain writes to the same file. Byte-budget callers pass false
+ * so the hot working set may sit over budget instead of thrashing (evict↔
+ * cold-load re-mints the giant temporaries that OOM'd #5782's proxy); count-
+ * cap callers pass true — availability outranks both grace windows because a
+ * full pool must still admit (logged loudly at the eviction site). */
+function findEvictionCandidate(overrideGrace: boolean): string | undefined {
     let oldestId: string | undefined;
     let oldestSeen = Infinity;
     for (const [id, s] of sessions) {
@@ -2059,15 +2096,42 @@ function evictOldest(opts?: { overrideGrace?: boolean }): boolean {
         // its half-mutated state then reloading a second object causes
         // split-brain writes to the same file.
         if (s.inFlight > 0) continue;
-        if (!opts?.overrideGrace && isColdLoadGraced(s)) continue;
+        if (!overrideGrace && isColdLoadGraced(s)) continue;
+        if (!overrideGrace && isRecentTouchGraced(s)) continue;
         if (s.lastSeen < oldestSeen) {
             oldestSeen = s.lastSeen;
             oldestId = id;
         }
     }
+    return oldestId;
+}
+
+/** #5806: the byte budget cannot be met right now because every remaining
+ * idle session sits inside an exemption window. Say so once per interval
+ * instead of sitting over budget silently: until sessions close or the knob
+ * moves, memory is bounded by the working set, NOT by sessions.residentMaxBytes.
+ */
+function notePoolSaturation(caller: string): void {
+    if (residentBytes() <= MAX_RESIDENT_BYTES) return;
+    if (findEvictionCandidate(false) !== undefined) return;
+    const now = Date.now();
+    if (now - lastSaturationWarnAt < SATURATION_WARN_INTERVAL_MS) return;
+    lastSaturationWarnAt = now;
+    loggerLog("warn", `[session] pool saturated via ${caller}: ${residentBytes()} bytes vs ${MAX_RESIDENT_BYTES} budget while every idle session is exempt (in use or just reloaded) — memory stays over budget until sessions close or BILI_SESSION_RESIDENT_MAX_BYTES / sessions.residentMaxBytes grows (#5806)`);
+}
+
+/** Flush one session to disk and drop it from memory (LRU eviction via
+ * findEvictionCandidate). Refuses to delete whenever the flush fails — a
+ * failed flush means the latest mutations have no durable copy, so keeping the
+ * session resident is always safer. Returns true if a slot was freed. */
+function evictOldest(opts?: { overrideGrace?: boolean }): boolean {
+    const oldestId = findEvictionCandidate(!!opts?.overrideGrace);
     if (!oldestId) return false;
     const s = sessions.get(oldestId)!;
-    const graceOverride = isColdLoadGraced(s);
+    // The suffix logs when an EXEMPT session was sacrificed anyway — which can
+    // only happen on the override path (findEvictionCandidate never returns a
+    // graced id when overrideGrace is false).
+    const graceOverride = !!opts?.overrideGrace && (isColdLoadGraced(s) || isRecentTouchGraced(s));
     const ok = getStore().flushSync(s);
     if (!ok) {
         // A prior save does not contain the latest mutations. Keep newer
@@ -2076,11 +2140,13 @@ function evictOldest(opts?: { overrideGrace?: boolean }): boolean {
     }
     sessions.delete(oldestId);
     stampEvictedWeight(oldestId, sessionWeight(s));
+    evictedTotal++;
+    lastEviction = { id: oldestId, weightBytes: sessionWeight(s), at: Date.now() };
     // #3126: eviction is the trigger for the empty-view compress window (the
     // session's message bytes live only here; state reloads from disk but the
     // view self-heals only on the next model request). Log it so operators can
     // correlate ctx=0 receipts with the exact moment a session left memory.
-    loggerLog("info", `[session] evicted ${oldestId} from resident pool (weight ${sessionWeight(s)} bytes, ${sessions.size} session(s) remain, budget ${MAX_RESIDENT_BYTES} bytes${graceOverride ? ", cold-load grace overridden for count-cap admission" : ""})`);
+    loggerLog("info", `[session] evicted ${oldestId} from resident pool (weight ${sessionWeight(s)} bytes, ${sessions.size} session(s) remain, budget ${MAX_RESIDENT_BYTES} bytes${graceOverride ? ", count-cap admission overriding an eviction-exemption window" : ""})`);
     return true;
 }
 
@@ -2100,6 +2166,9 @@ export function _resetSessionsForTest(max?: number, maxBytes?: number): void {
     }
     sessions.clear();
     evictedWeights.clear();
+    evictedTotal = 0;
+    lastEviction = undefined;
+    lastSaturationWarnAt = 0;
 }
 
 export function _sessionsSizeForTest(): number {
