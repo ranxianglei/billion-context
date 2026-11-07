@@ -292,7 +292,7 @@ const NOOP_CLASSIFICATION_RESERVATION: ThrottleClassificationReservation = {
     release(): void {},
 };
 
-interface ThrottleLocalReject {
+export interface ThrottleLocalReject {
     /** 429 while under budget (Retry-After attached); 424 terminal. */
     status: 429 | 424;
     code: "bili_throttle_hold" | "bili_throttle_terminal";
@@ -651,6 +651,38 @@ export function upstreamThrottleGate(
     return { probeToken };
 }
 
+/**
+ * #5795: read-only counterpart of upstreamThrottleGate's REJECT branch.
+ * Returns the local rejection a send to this url+headers would receive RIGHT
+ * NOW, without minting probe tokens or mutating any hold state — the real
+ * gate in forward() still owns admission and probe accounting. Used by the
+ * pre-ingest fast path in server/handle.ts to refuse held sends BEFORE they
+ * pay the O(history) parse/convert/pin cost of a request that will not
+ * egress anyway. The reject loop is deliberately duplicated rather than
+ * shared: the gate's loop and its mutation are atomic, while this one must
+ * never mutate — a flag-based shared loop would couple the two.
+ */
+export function upstreamThrottlePeekReject(
+    url: string,
+    headers: Record<string, string>,
+    now: number = Date.now(),
+    requestModel?: string,
+): ThrottleLocalReject | undefined {
+    if (!throttle429Enabled()) return undefined;
+    const { key } = holdKey(url, headers);
+    let rejectState: HoldState | undefined;
+    for (const state of holds.values()) {
+        if (state.accountKey !== key) continue;
+        if (!state.provisional && state.model !== undefined && state.model !== requestModel) continue;
+        if (slotBlocked(state, now)) rejectState = strongerReject(rejectState, state);
+    }
+    for (const group of provisionalGroups.values()) {
+        const state = group.state;
+        if (state.accountKey !== key) continue;
+        if (slotBlocked(state, now)) rejectState = strongerReject(rejectState, state);
+    }
+    return rejectState === undefined ? undefined : makeReject(rejectState, now);
+}
 
 /** Observe a classified upstream 429 verdict for this send. */
 export function noteUpstreamThrottle429(
