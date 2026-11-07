@@ -97,6 +97,17 @@ export const ROLLOUT_FEATURES: Record<string, RolloutPlan> = {
     // cohorts (compressed vs deleted) and detects generation switches.
     // Default 0% — force on with `BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY=1`.
     pluginLaneServerHistory: { percent: 0 },
+    // #5825 identity-channel harvest seam (registry in identity-harvest.ts):
+    // loopback clients without an explicit body channel get stable session+
+    // message identity aligned from their OWN local transcript/sqlite
+    // (claude-code / codebuddy / mcode adapters). The per-install env switch
+    // BILI_IDENTITY_HARVEST alone already enables it; this key exists for a
+    // COHORT-WIDE ramp that never touches anyone's env. Decoupled from
+    // pluginLaneServerHistory on purpose (owner ruling 2026-11-07): that flag
+    // governs whether stamped ids get PINNED to rows, this one governs where
+    // the seam may even read local files — coupling them made opting one's
+    // own install in require bumping an unrelated rollout. Default 0%.
+    identityChannelHarvest: { percent: 0 },
 };
 
 export const BP_MAX = 10_000;
