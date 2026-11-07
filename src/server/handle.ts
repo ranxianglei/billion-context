@@ -75,7 +75,9 @@ import { artifactSeedHit, detectAcpArtifacts } from "./chain-artifacts.js";
 import { piSubagentChannelFallback } from "./pi-subagent-channel.js";
 import { FORCE_TEXT_PROTOCOL } from "./inject.js";
 import { prepareAnthropic } from "./prepare-anthropic.js";
-import { incomingMsgIdsOf } from "../msgid-pin.js";
+import { MSG_IDS_BODY_FIELD, incomingMsgIdsOf } from "../msgid-pin.js";
+import { harvestIdentity } from "../identity-harvest.js";
+import "../identity-sources.js"; // #5825: register every harvested lane (side effect)
 import { prepareOpenai } from "./prepare-openai.js";
 import { prepareGoogle, prepareGoogleCountTokens } from "./prepare-google.js";
 import { DUMP_PLAINTEXT_BANNER } from "../dump-banner.js";
@@ -1146,7 +1148,37 @@ async function handleRequest(
         // drift), an id overlap proves same-conversation and re-anchors the
         // raw lane instead of forking a zero-state |sub: child.
         // undefined = absent → exactly the pre-change path.
-        const inboundMsgIds = incomingMsgIdsOf(parsed);
+        const stampedInboundMsgIds = incomingMsgIdsOf(parsed);
+        // #5825: loopback identity HARVEST fills only the absent case. A
+        // loopback client without an explicit body channel (claude-code,
+        // codebuddy) gets its ids aligned 1:1 from its own local transcript;
+        // the registry enforces rollout gate + env switch + loopback boundary
+        // + canonical validation, whole-turn-degrade on any doubt. Stamped
+        // onto the parsed body ONLY on the anthropic wire — prepare-anthropic
+        // already consumes that field and strips it before upstream (#4491);
+        // other wires never had a body-field consume+strip path, so there the
+        // harvested ids feed the resolve rung / membership below via this
+        // local alone and nothing extra is forwarded.
+        let inboundMsgIds = stampedInboundMsgIds;
+        if (stampedInboundMsgIds === undefined && zcodeParentIdentity?.clientProvided) {
+            const openaiLike = protocol === "openai" || protocol === "anthropic" ? (parsed as { messages?: unknown }).messages : undefined;
+            if (Array.isArray(openaiLike) && openaiLike.length > 0) {
+                const messageRoles = (openaiLike as Array<{ role?: unknown }>).map((m) => (typeof m?.role === "string" ? m.role : ""));
+                const harvested = harvestIdentity({
+                    sessionId: zcodeParentIdentity.value,
+                    expectedLen: openaiLike.length,
+                    remoteAddress: req.socket.remoteAddress,
+                    headers: req.headers as Record<string, string | string[] | undefined>,
+                    messageRoles,
+                });
+                if (harvested !== null) {
+                    inboundMsgIds = [...harvested.ids];
+                    if (protocol === "anthropic") {
+                        (parsed as Record<string, unknown>)[MSG_IDS_BODY_FIELD] = inboundMsgIds;
+                    }
+                }
+            }
+        }
         // #5719: the RECORDED side of the msgid identity rung lives in the
         // UNIFIED STORE — stamped requests pin these very ids onto canonical
         // message rows (messages.msg_id, #4491), so no parallel JSON ledger

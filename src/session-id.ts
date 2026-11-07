@@ -80,8 +80,15 @@ export function conversationHeaderSource(headers: Record<string, string | string
     // for 2.x traffic and is inert for 1.x (header absent); root sessions are
     // unchanged either way (affinity === own id). Client-specific name — same
     // trust class as the headers above.
+    // x-conversation-id: CodeBuddy (`bili n`) stamps its persisted
+    // conversation object id on every model request — measured 2.181.0 across
+    // fresh/-c/-r processes: stable across restarts, survives compaction
+    // (#5825, decision A: merge low-trust recognition; per-message identity
+    // rides the transcript.jsonl harvest in src/identity-codebuddy.ts).
+    // Client-specific name; placed AFTER every stricter client header and the
+    // affinity tier, before the bare generic `session-id` names.
     const pluginMarker = typeof headers["x-bili-plugin"] === "string";
-    const names = ["x-bili-plugin-conversation", "x-claude-code-session-id", "x-grok-session-id", "x-grok-conv-id", "x-mavis-session-id", "x-opencode-session-id", "x-session-affinity", "x-acp-session", "x-session-id", "x-opencode-session", "session-id", "session_id"];
+    const names = ["x-bili-plugin-conversation", "x-claude-code-session-id", "x-grok-session-id", "x-grok-conv-id", "x-mavis-session-id", "x-opencode-session-id", "x-session-affinity", "x-acp-session", "x-conversation-id", "x-session-id", "x-opencode-session", "session-id", "session_id"];
     for (const name of names) {
         if (name === "x-bili-plugin-conversation" && !pluginMarker) continue;
         const v = headers[name];
