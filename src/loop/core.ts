@@ -77,11 +77,20 @@ export function failedCallSignature(name: string, argsJson: string): string {
 
 export function buildVisibilityMarker(toolName: string, result: string): string {
     const lines = result.split("\n").map((l) => l.trim()).filter((l) => l.length > 0);
-    const failed = lines.some((l) =>
-        l.includes("FAILED")
-        || l.includes("not found")
-        || l.includes("is required")
-    );
+    // #5389: the first non-empty line is the authoritative status line for every
+    // proxy tool — every failure receipt carries its keyword THERE ([Compression
+    // FAILED: …], [decompress FAILED: …], [Block bN not found], [search_context
+    // FAILED: query is required], [absorb FAILED: …]; acp_status has no in-text
+    // failure shape at all — handleAcpStatus returns only toolOk, exceptions
+    // surface as the single ❌-prefixed line). Scanning EVERY line misread
+    // model-authored content embedded in SUCCESS receipts (the compress summary
+    // fingerprint excerpt, decompress's restored history, search evidence
+    // snippets, status-report block topics) as a failure whenever it merely
+    // mentioned a keyword.
+    const firstLine = lines[0] ?? "";
+    const failed = firstLine.includes("FAILED")
+        || firstLine.includes("not found")
+        || firstLine.includes("is required");
     const icons: Record<string, string> = {
         compress: "📦",
         decompress: "📤",
