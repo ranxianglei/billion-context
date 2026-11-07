@@ -618,13 +618,35 @@ export function pluginRuntimeInfoFor(agent: string | undefined, model: string | 
     return entry;
 }
 
+/** Clients mint child conversation ids for work that runs on the parent's own
+ *  route+model: omp opens ephemeral turns as `<session>:side:<id>` and
+ *  subagents as `<session>:sub:<id>` (with `:side:conversation:<key>` also
+ *  seen in the wild), and never registers runtime-info under them — the
+ *  window belongs to route+model+tier, so a child resolves up to the nearest
+ *  ancestor that reported one instead of falling to the registry/#1321 cap. */
+const CHILD_CONVERSATION_SUFFIX = /:(?:side(?::conversation)?|sub):[^:]+$/;
+const MAX_CHILD_CONVERSATION_DEPTH = 4;
+
+function parentConversationId(conversationId: string): string | undefined {
+    const parent = conversationId.replace(CHILD_CONVERSATION_SUFFIX, "");
+    return parent !== conversationId && parent.length > 0 ? parent : undefined;
+}
+
 /** Latest runtime-info registered under a conversation id, usable for
- *  `model` only (#1531). */
+ *  `model` only (#1531). A client-minted child id resolves to its nearest
+ *  reporting ancestor; the model check is applied at whichever level answers,
+ *  so a child on a different model never inherits a stale window. */
 export function pluginRuntimeInfoForConversation(conversationId: string | undefined, model: string | undefined): PluginRuntimeInfo | undefined {
     if (conversationId === undefined || model === undefined) return undefined;
-    const entry = pluginRuntimeByConversation.get(conversationId);
-    if (entry === undefined || entry.model !== model) return undefined;
-    return entry;
+    const exact = pluginRuntimeByConversation.get(conversationId);
+    if (exact !== undefined) return exact.model === model ? exact : undefined;
+    let parent = parentConversationId(conversationId);
+    for (let depth = 0; parent !== undefined && depth < MAX_CHILD_CONVERSATION_DEPTH; depth++) {
+        const entry = pluginRuntimeByConversation.get(parent);
+        if (entry !== undefined) return entry.model === model ? entry : undefined;
+        parent = parentConversationId(parent);
+    }
+    return undefined;
 }
 
 /** The narrow conversation signal a header-less runtime-info lookup can
