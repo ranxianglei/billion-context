@@ -69,7 +69,7 @@ function isInlineDataUrl(u: unknown): boolean {
  *  Non-HTTP refs (DeepSeek `file_id`, `gs://` URIs, bare ids) never match —
  *  they are durable by definition of the #5620 split. */
 const EPHEMERAL_QUERY_PARAM =
-  /^(?:x-(?:amz|goog|ms|cf|r2|oss|azure)-|expires?|expiry|exp|ttl|signature|sig|session-token|security-token|token|auth)$/i;
+  /^(?:x-(?:amz|goog|ms|cf|r2|oss|azure)-.*|(?:expires?|expiry|exp|ttl|signature|sig|session-token|security-token|token|auth))$/i;
 
 /** #5865-P2: true when the ref is an HTTP(S) URL whose query carries a
  *  signed/expiring marker — its re-access is time-bounded, so it must not
