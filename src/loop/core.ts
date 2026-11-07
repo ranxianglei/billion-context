@@ -1633,6 +1633,24 @@ export async function* runCompressLoop(
                     // MAX_LOOP_ROUNDS bound any resulting ping-pong.
                     ctx.log(`[acp-loop] round ${round}: failed-only mutating round; all markers deduped (nothing new reached the client), re-requesting without a receipt (#5220)`);
                 }
+                // #5604: the re-request must NEVER end on an assistant turn —
+                // Anthropic rejects that shape ("final assistant content cannot end
+                // with trailing whitespace" when the joined markers end in \n;
+                // outright "assistant message prefill not supported" on Claude 5
+                // models) and the 400 kills the turn, so a subagent dies with
+                // "Agent terminated early due to an API error". The receipt above is
+                // assistant-role BY DESIGN — its bytes mirror what emitMarker already
+                // streamed, so the client echoes them back as assistant content and
+                // the frozen prefix never diverges (#5220 cache invariant); flipping
+                // it to user would break that. When the receipt is present it is the
+                // final message, and even without it a round that opened with model
+                // prose leaves an assistant tail. Cap with a thin user nudge so the
+                // outbound request always ends on a user turn. Ephemeral like the
+                // receipt: never streamed, never persisted, dies with this invocation
+                // → the client never sees it, so no cross-turn seam.
+                if (coreMessages.length > 0 && coreMessages[coreMessages.length - 1].role === "assistant") {
+                    coreMessages.push({ id: `acp_loop_r${round}_rcpt_go`, role: "user", contentType: "text", text: "[bili] The context-management call above did not complete; its result is shown above. Continue the task." });
+                }
             }
 
             ctx.log(`[acp-loop] round ${round}: proxy tool executed; re-requesting so the model sees the result`);
