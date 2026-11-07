@@ -262,6 +262,20 @@ export type CompressSettings = {
      *  level wins PER FIELD across global → provider → model, like every
      *  other compress field. */
     minPressureBenefitTokens?: number;
+    /** Phantom-pressure guard: when the decision meter for this round is a
+     *  LOCAL ESTIMATE rather than a billing sample (the host passed no usage
+     *  report — e.g. right after an aborted turn or a short cache TTL that
+     *  voided sample delivery), the pressure band (usage ≥ maxContextLimit /
+     *  emergency threshold) defers its nudge one round instead of firing
+     *  EMERGENCY/OVER-LIMIT rewrites off a char-bound reading that
+     *  structurally runs ~3x billed. The very next request carries a fresh
+     *  billing report, so deferring costs at most one round; the hard
+     *  overflow backstops stay armed either way. Billed readings keep
+     *  byte-identical behavior and non-pressure tiers are unaffected.
+     *  Default true; set false to restore estimate-driven pressure injection.
+     *  Maps to kernel `nudge.requireUsageSampleForPressure`. Deepest level
+     *  wins PER FIELD, like every other compress field. */
+    requireUsageSampleForPressure?: boolean;
     /** Per-tier nudge growth thresholds in tokens (#2376): independent token
       *  trigger sizes for the T1/T2/T3 mass paths, e.g. keep T1 aggressive for
       *  long tasks while letting T2 distill earlier/later. Each UNSET tier
@@ -2440,7 +2454,7 @@ const KNOWN_TOP_LEVEL_KEYS = new Set([
 // level down under "compress". Keep in sync with parseCompressSettings.
 const COMPRESS_SETTING_FIELDS = new Set([
     "modelContextLimit", "maxContextLimit", "emergencyThresholdPercent",
-    "nudgeGrowthTokens", "minPressureBenefitTokens", "tierNudgeTokens", "nudgeModelDecided", "nudgeDecisionMaxTokens",
+    "nudgeGrowthTokens", "minPressureBenefitTokens", "requireUsageSampleForPressure", "tierNudgeTokens", "nudgeModelDecided", "nudgeDecisionMaxTokens",
     "requireNudge", "requireRecommendation",
     "preserveRecentMessages", "preserveRecentTokens",
     "minCompressRange", "minCompressRangeChars",
@@ -3225,6 +3239,10 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
         const v = obj.minPressureBenefitTokens;
         if (typeof v !== "number" || !Number.isFinite(v) || v < 0) ok = false;
         else out.minPressureBenefitTokens = Math.floor(v);
+    }
+    if ("requireUsageSampleForPressure" in obj) {
+        if (typeof obj.requireUsageSampleForPressure !== "boolean") ok = false;
+        else out.requireUsageSampleForPressure = obj.requireUsageSampleForPressure;
     }
     for (const key of ["protectedLatestTools", "protectedTools"] as const) {
         if (!(key in obj) || obj[key] === undefined) continue;

@@ -110,6 +110,20 @@ export interface ProcessTurnInput {
   state: CompressionState;
   config: Config;
   tokenCount: number;
+  /** Where tokenCount came from:
+   *   - "usage": a billing-grade reading (a fresh upstream input_tokens
+   *     sample or a provenance-stable anchor derived from one).
+   *   - "estimate": a local fallback (char-bound estimate — e.g. right
+   *     after an aborted turn or a cache-TTL expiry that left no usage
+   *     report). Such readings structurally run high relative to what will
+   *     actually be billed.
+   * Feeds the phantom-pressure guard: with nudge.requireUsageSampleForPressure
+   * (default on) an ESTIMATE reading never arms the pressure band outright —
+   * the injection is deferred one round until a usage-grade reading lands,
+   * which costs nothing in practice (the next request carries the report).
+   * Omit for legacy behavior (guard off). Non-pressure tiers are unaffected.
+   */
+  tokenCountSource?: "usage" | "estimate";
   /**
    * Which messages get an <acp> ref tag injected into their text
    * (the render-refs pipeline node). Refs are ALWAYS assigned regardless
@@ -938,6 +952,7 @@ export function createCore(ports: Ports = {}): CompressionCore {
     const ctx: PipelineContext = {
       config: input.config,
       tokenCount: input.tokenCount,
+      tokenCountSource: input.tokenCountSource,
       countTokens,
       contentStore,
     };
@@ -1437,6 +1452,7 @@ const nudgeNode: PipelineNode = {
   run(io, ctx) {
     const nudge = decideNudge({
       tokenCount: ctx.tokenCount,
+      tokenCountSource: ctx.tokenCountSource,
       config: ctx.config,
       state: io.state,
       messages: io.messages,
@@ -1968,6 +1984,7 @@ function validateSummaryLength(
 
 interface NudgeInput {
   tokenCount: number;
+  tokenCountSource?: "usage" | "estimate";
   config: Config;
   state: CompressionState;
   messages: CoreMessage[];
@@ -2058,6 +2075,22 @@ function decideNudge(input: NudgeInput): NudgeDecision {
   // High-pressure band: over maxContextLimitPct (subsumes the emergency
   // threshold). Bypasses growth gate + cadence; gated on effective pending.
   const pressure = overLimit || emergencyOverride;
+  // Phantom-pressure guard: `tokenCount` above can rest on a LOCAL ESTIMATE
+  // instead of a billing sample (char-bound fallback — typically while no
+  // usage report has landed after an aborted turn, or after a cache-TTL
+  // expiry that voided the sample-delivery window). Such readings
+  // structurally overstate what will actually be billed (they measure inbound
+  // bytes the rewrite view is about to drop — observed ~3x billed), and
+  // firing EMERGENCY/OVER-LIMIT rewrites keyed to that meter destroys content
+  // the bill never saw and burns the prefix cache. Deferring the pressure
+  // action costs at most one round: the very next request carries a fresh
+  // billing report (or a provenance-stable anchor). Billed readings ("usage")
+  // and legacy callers (source omitted) keep byte-identical behavior; opt out
+  // via nudge.requireUsageSampleForPressure = false.
+  const pressureDeferredNoSample =
+    pressure &&
+    input.tokenCountSource === "estimate" &&
+    config.nudge.requireUsageSampleForPressure !== false;
 
   const baseline = state.nudge.lastPerMessageNudgeTokens;
   const hadPendingNudge = state.nudge.lastNudgeShownTokens > 0;
@@ -2221,7 +2254,11 @@ function decideNudge(input: NudgeInput): NudgeDecision {
     // Minimum-benefit gate (#198): a sub-threshold pending can never look
     // actionable, no matter how hot the band is — otherwise every "success"
     // resets the baselines and the same EMERGENCY nudge re-injects each turn.
-    if (best !== null && bestPending >= minPressureBenefit) {
+    if (
+      best !== null &&
+      bestPending >= minPressureBenefit &&
+      !pressureDeferredNoSample
+    ) {
       injectedTier = best;
       stallEscalated = t1HarvestStall && best !== 1;
       const label = emergencyOverride ? "EMERGENCY" : "OVER-LIMIT";
@@ -2306,6 +2343,9 @@ function decideNudge(input: NudgeInput): NudgeDecision {
   let reason: string;
   if (injectedTier !== null) {
     reason = injectedReason;
+  } else if (pressure && pressureDeferredNoSample) {
+    const label = emergencyOverride ? "EMERGENCY" : "OVER-LIMIT";
+    reason = `${label}: usage ${Math.round(usage * 100)}% but the meter reading is estimate-grade (no billing sample landed this cycle, max pending ${maxPending}) — pressure injection deferred one round until a usage-grade reading decides; hard-overflow backstop unaffected`;
   } else if (pressure) {
     const label = emergencyOverride ? "EMERGENCY" : "OVER-LIMIT";
     reason =
@@ -2399,6 +2439,7 @@ function decideNudge(input: NudgeInput): NudgeDecision {
       hasPendingNudge: hasPendingNudge ? 1 : 0,
       overLimit: overLimit ? 1 : 0,
       emergencyOverride: emergencyOverride ? 1 : 0,
+      pressureDeferredNoSample: pressureDeferredNoSample ? 1 : 0,
       minPressureBenefit,
       pendingT1: tiers[1]!.pending,
       pendingT2: tiers[2]!.pending,
