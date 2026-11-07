@@ -125,7 +125,16 @@ async function runCase(opts: { anonymous: boolean }): Promise<{
         routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "claude-small": { context: WINDOW } } } },
         modelContextLimit: 400_000,
         kernelConfig: defaultConfig(400_000),
-        compress: { injectTool: true, injectNudge: true },
+        // #5860 shipped the phantom-pressure guard (estimate-grade readings no
+        // longer arm the pressure band); these suites predate it and pin
+        // pre-guard mechanisms (fork regime / image term / judge baseline), so
+        // they opt out via the documented escape hatch — the guard is covered
+        // by its own suites (nudge-pressure-no-sample-armed.test.ts).
+        compress: {
+          injectTool: true,
+          injectNudge: true,
+          requireUsageSampleForPressure: false,
+        },
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",
         log: false,
@@ -265,7 +274,16 @@ async function runImageCase(): Promise<Array<{ stream: boolean; body: string }>>
         routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "claude-small": { context: IMG_WINDOW } } } },
         modelContextLimit: 400_000,
         kernelConfig: defaultConfig(400_000),
-        compress: { injectTool: true, injectNudge: true },
+        // #5860 shipped the phantom-pressure guard (estimate-grade readings no
+        // longer arm the pressure band); these suites predate it and pin
+        // pre-guard mechanisms (fork regime / image term / judge baseline), so
+        // they opt out via the documented escape hatch — the guard is covered
+        // by its own suites (nudge-pressure-no-sample-armed.test.ts).
+        compress: {
+          injectTool: true,
+          injectNudge: true,
+          requireUsageSampleForPressure: false,
+        },
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",
         log: false,
