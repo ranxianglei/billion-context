@@ -456,7 +456,10 @@ type EntryOutcome = { range: CompressRangeSpec } | { reason: string };
 // anchored (^): summaries cite mNNNNN/bN refs routinely, so an unanchored
 // scan would let a citation inside a headerless entry supply fake bounds.
 const REF_PAIR_IN_LINE =
-  /^([mb]\d{1,7})\s*(?:[-\u2013\u2014\u2026~\u2212\uFF0D]|\.\.\.|to)\s*([mb]\d{1,7})\b/i;
+  /^([mb]\d{1,7})\s*(?:[-\u2013\u2014\u2026~\u2212\uFF0D]|\.{2,3}|to)\s*([mb]\d{1,7})\b/i;
+// #5555 audit: ".." joins the accepted separators alongside "..." — pre-fix only the
+// three-dot form parsed while an error message advertised two dots (and a
+// two-dot header was silently swallowed by splitLineEntries instead).
 const SINGLE_REF_IN_LINE = /^([mb]\d{1,7})\b/i;
 // An unrecognized divider between two refs (punctuation run + a ref right
 // after) — the pair regex missed a separator variant. Folding as a single
@@ -503,7 +506,11 @@ function parseLineEntry(
     afterRefs = single.index + single[0].length;
   }
   if (summary.length === 0)
-    return { reason: "line entry: missing summary after the refs header line" };
+    // #4521: name the two most common shapes behind this parse error — a
+    // stray note line about an already-folded range, and a block rewrite
+    // written as refs — so the model fixes the entry instead of resending it
+    // verbatim (each resend was a full failed round-trip).
+    return { reason: "line entry: missing summary after the refs header line (every entry needs refs THEN its summary text on the same or the next line; a note about an already-folded range does not belong in the batch — drop it; to rewrite an existing block use a bN..bM block-id header entry)" };
   const explicitTopic = head.slice(afterRefs).trim();
   const range: CompressRangeSpec = {
     startRef,
@@ -534,7 +541,7 @@ export function deriveTopicFromSummary(summary: string): string | undefined {
 }
 
 const LINE_ENTRY_REFS_RE =
-  /[mb]\d{1,7}\s*(?:[-\u2013\u2014\u2026~\u2212\uFF0D]|\.\.\.|to)\s*[mb]\d{1,7}\b/iy;
+  /[mb]\d{1,7}\s*(?:[-\u2013\u2014\u2026~\u2212\uFF0D]|\.{2,3}|to)\s*[mb]\d{1,7}\b/iy;
 const WHITESPACE_RE = /\s/;
 
 function skipWhitespace(s: string, i: number): number {

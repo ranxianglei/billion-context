@@ -190,6 +190,17 @@ entries:
     desc_zh: "出站图片降采样总开关（#3295/#3400）：大图以缩小形态发给模型，原图在会话存储中保持字节级原样。逐请求实时读取。"
     site_en: "<code>imageRescale</code> — egress downscale switch; large outbound images sent shrunken, originals kept byte-exact in session storage."
     site_zh: "<code>imageRescale</code> —— 出站图片降采样总开关；大图以缩小形态出站，原图在会话存储中保持字节级原样。"
+  - key: billing
+    type: object
+    default: "{}"
+    env: []
+    group: upstream
+    id: tt.billing
+    site_group: up
+    desc_en: "Per-model billing prices (#4899): billing.prices[model] = { input, output?, cacheRead?, cacheWrite? } in USD per million tokens; overrides the models.dev snapshot for the panel's USD spend ledger and saved-dollar estimate. Unpriced models show tokens only."
+    desc_zh: "按模型计费单价（#4899）：billing.prices[模型] = { input, output?, cacheRead?, cacheWrite? }，美元/百万 token；覆盖 models.dev 快照价，驱动面板美元花费台账与省钱折算。无价模型只显示 token。"
+    site_en: "<code>billing.prices</code> — per-model USD/Mtok prices feeding the panel's spend + savings views."
+    site_zh: "<code>billing.prices</code> —— 按模型美元/百万 token 单价，驱动面板花费与省钱视图。"
   - key: maskHosts
     type: boolean
     default: "true"
@@ -218,10 +229,21 @@ entries:
     group: behavior
     id: tt.subagent
     site_group: beh
-    desc_en: "Claude Code subagents get their own session namespace (<session>|sub:<agent-id>) instead of queueing behind the main session."
-    desc_zh: "Claude 子代理拥有独立会话命名空间（<session>|sub:<agent-id>），不再排队在主会话锁后。"
+    desc_en: "Claude Code subagents get their own session namespace (<session>|sub:<agent-id>) instead of queueing behind the main session. Anthropic-wire only — on the Responses wire this switch is a no-op (see the `subagentSplit` / BOTH-mechanisms scope note)."
+    desc_zh: "Claude 子代理拥有独立会话命名空间（<session>|sub:<agent-id>），不再排队在主会话锁后。仅 anthropic 线路 —— Responses 线路上本开关无效（见 `subagentSplit` / BOTH-mechanisms 作用域说明）。"
     site_en: "<code>subagentSplit</code> — Claude subagents get their own session namespace (on by default)."
     site_zh: "<code>subagentSplit</code> —— Claude 子代理拥有独立会话命名空间（默认开）。"
+  - key: personaSplit
+    type: boolean
+    default: "true"
+    env: BILI_PERSONA_SPLIT
+    group: behavior
+    id: tt.persona
+    site_group: beh
+    desc_en: "Split the Responses-wire lane keyed by the instructions fingerprint (Claude Code over /v1/responses; Codex root threads / older builds) when the instructions text changes AND the incoming history does not continue the tracked chain (default on). Opt out with env BILI_PERSONA_SPLIT=0 or personaSplit: false (env wins)."
+    desc_zh: "当 instructions 文本变化且入站历史不连续时，把按 instructions 指纹分键的 Responses 车道（Claude Code over /v1/responses；Codex 根线程 / 旧版本构建）分叉出去（默认开）。用环境变量 BILI_PERSONA_SPLIT=0 或配置 personaSplit: false 关闭（环境变量优先）。"
+    site_en: "<code>personaSplit</code> — Responses-wire instructions-fingerprint split (on by default; set false / BILI_PERSONA_SPLIT=0 to opt out)."
+    site_zh: "<code>personaSplit</code> —— Responses 线路 instructions 指纹分叉（默认开；false / BILI_PERSONA_SPLIT=0 关闭）。"
   - key: forkAdoption
     type: boolean
     default: "false"
@@ -378,11 +400,11 @@ entries:
     desc_zh: "按 Authorization 方案键控的重签名臂：可重签名的模型请求全程重签转发；无法重签的请求本地 403 拒绝，除非该方案经 passthrough 选择原文透传。"
   - key: promptCache.routing
     type: "\"auto\" | \"enabled\" | \"disabled\""
-    default: "auto"
+    default: "disabled"
     env: ACP_PROMPT_CACHE_ROUTING
     group: behavior
-    desc_en: "Prompt-cache routing posture for cache-aware lane selection."
-    desc_zh: "面向缓存感知路由选择的提示词缓存路由姿态。"
+    desc_en: "Posture of bili's own `prompt_cache_key` emission (both wires); client-supplied keys always forward verbatim."
+    desc_zh: "bili 自注入 `prompt_cache_key` 的姿态（两条 wire 同时生效）；客户端自带的 key 永远原样转发。"
   - key: cacheKeepalive.enabled
     type: boolean
     default: "false"
@@ -480,11 +502,11 @@ entries:
     desc_zh: "内置 pi lane 子代理（acp_delegate）面（#2230 配置搬家）。billion-context.json 的 pi.subagents 段拥有 delegate 配置；acp.json 四键（delegate/delegatePrompt/displayUsage/debug）为已废弃回退源，仅段缺失时读取。prompt 取代 delegatePrompt；debug 限定子代理子系统。布尔简写 subagents: false 整体关闭。完整字段表见 CONFIGURATION.md 的 pi 段。"
   - key: pi.inline
     type: boolean
-    default: "false"
+    default: "true (unset env+file runs inline)"
     env: BILI_PI_INLINE
     group: behavior
-    desc_en: "Pi inline lane (#3278; OPT-IN — #4687 reverts the #4571 default flip, default stays the spawned proxy): the pi extension's compression runs IN-PROCESS — no spawned proxy, no ephemeral port; model traffic and the /__bili//__acp tool surface are served by an in-process engine through a pseudo-origin, the codex Responses WebSocket lane by a loopback-only WS bridge, and the Web UI by a loopback-only web listener booted with the engine. Set true (or BILI_PI_INLINE=1/on/yes/TRUE) to enable. Resolved env > file; an explicit inline choice always beats an announced attach target (launcher-set BILLION_CONTEXT_PROXY/ATTACH); when unset the lane behaves exactly as before (attach/spawn). `bili pi-inline` presets the env for the one-command lane."
-    desc_zh: "pi 内联压缩通道（#3278；需手动开启——#4687 收回 #4571 的默认翻转，默认仍是派生代理）：pi 扩展的压缩在进程内完成——不派生代理进程、无临时端口；模型流量与 /__bili//__acp 工具面由进程内引擎经伪源站服务，codex 的 Responses WebSocket 通道走随引擎启动的仅回环 WS 桥，Web UI 走随引擎启动的仅回环监听。设 true（或 BILI_PI_INLINE=1/on/yes/TRUE）开启。解析顺序 env > 文件；显式开启永远压过附着目标，未设置时行为与旧版一致（attach/spawn）。`bili pi-inline` 一键车道会预置该变量。"
+    desc_en: "Pi inline lane (#3278; DEFAULT-ON since #5428, superseding the #4687 opt-in rule): the pi extension's compression runs IN-PROCESS — no spawned proxy, no ephemeral port; model traffic and the /__bili//__acp tool surface are served by an in-process engine through a pseudo-origin, the codex Responses WebSocket lane by a loopback-only WS bridge, and the Web UI by a loopback-only web listener booted with the engine. Unset env+file now runs INLINE; an ANNOUNCED attach target (launcher-set BILLION_CONTEXT_PROXY/ATTACH) still beats the default, so `bili pi` keeps its launcher proxy. Opt OUT with BILI_PI_INLINE=0/false/no/off or this key set false — restores the old attach/spawn posture. Resolved env > file > default; an explicit inline choice always beats an announced attach target. Human surface: `bili -i/--inline pi` (≡ the one-command lane) and `bili -s/--server pi` (pin the proxy posture, beats an inherited inline env)."
+    desc_zh: "pi 内联压缩通道（#3278；自 #5428 起默认开启，取代 #4687 的手动开启规则）：pi 扩展的压缩在进程内完成——不派生代理进程、无临时端口；模型流量与 /__bili//__acp 工具面由进程内引擎经伪源站服务，codex 的 Responses WebSocket 通道走随引擎启动的仅回环 WS 桥，Web UI 走随引擎启动的仅回环监听。未设置 env+文件时默认内联；显式宣告的附着目标（launcher 预置的 BILLION_CONTEXT_PROXY/ATTACH）仍压过默认，`bili pi` 照旧用 launcher 代理。不想用就 BILI_PI_INLINE=0/false/no/off 或本键设 false——恢复旧的 attach/spawn 姿态。解析顺序 env > 文件 > 默认；显式开启永远压过附着目标。人类入口:`bili -i/--inline pi`(≡ 一键车道)与 `bili -s/--server pi`(钉死代理姿态,压过继承的内联变量)。"
   - key: opencode.inline
     type: boolean
     default: "false"

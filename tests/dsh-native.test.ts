@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import http from "node:http";
 import { pathToFileURL } from "node:url";
-import { apply, planNativeDsh, shouldBootstrapNativeDsh, persistClientEvent, mediaBytesOfWireBody, bodyProvablyOverWindow, _attributionHealthForTest, _resetAttributionHealthForTest, _registerStateForTest, _resetRegisterForTest, _setModelInfoForTest, _setSpawnForTest, _setThrewRetryForTest, _settleNativeForTest, _stateHeadersForTest, _stateRespawnForTest, _stateTakeoverGateForTest, _stateToolsReadyForTest, _stateBeforeSendForTest, _stateOnResponseForTest, _noteRoutedForTest, _resetRoutedForTest, _resetWebProfileWarningForTest, _resetNonWebTraceForTest, _resetTitlesForTest, type PluginContext } from "../src/agent/dsh-native.ts";
+import { apply, planNativeDsh, shouldBootstrapNativeDsh, persistClientEvent, mediaBytesOfWireBody, bodyProvablyOverWindow, _attributionHealthForTest, _resetAttributionHealthForTest, _registerStateForTest, _resetRegisterForTest, _setModelInfoForTest, _nativeStateForTest, _setSpawnForTest, _setThrewRetryForTest, _settleNativeForTest, _stateHeadersForTest, _stateRespawnForTest, _stateTakeoverGateForTest, _stateToolsReadyForTest, _stateBeforeSendForTest, _stateOnResponseForTest, _noteRoutedForTest, _resetRoutedForTest, _resetWebProfileWarningForTest, _resetNonWebTraceForTest, _resetTitlesForTest, _resetBodyParseStatsForTest, _bodyParseStatsForTest, _parsedBodyOnceForTest, type PluginContext } from "../src/agent/dsh-native.ts";
 import { __resetIncrementalClientForTests } from "../src/agent/incremental-client.ts";
 import { isDshCompactionActive, _resetDshCompactionVerdictForTest } from "../src/agent/dsh-compaction-disable.ts";
 import { once } from "node:events";
@@ -1278,6 +1278,48 @@ test("#3806 apply(): a degraded web profile alarms loudly instead of the silent 
     }
 });
 
+test("#5686 P0-2 apply(): a degraded NON-WEB profile alarms loudly too (no silent arming)", async () => {
+    const proxy = await startMockProxy([]);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-5686-"));
+    const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-5686-state-"));
+    const logFile = path.join(stateHome, "billion-context", "bili.log");
+    const clientLines = (): string[] => fs.existsSync(logFile)
+        ? fs.readFileSync(logFile, "utf8").split("\n").filter((l) => l.includes("[dsh-client]"))
+        : [];
+    _setSpawnForTest(async () => undefined);
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin, XDG_STATE_HOME: stateHome, BILI_PROVIDER_REWRITES: undefined, BILI_NATIVE_DSH: undefined, BILLION_CONTEXT_PLUGIN: undefined }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            _resetWebProfileWarningForTest();
+            // headless profile (desktop app-in-bundle shape: no @deepseek-ai/*
+            // package under the profile) + a host without the internal/config
+            // hook — pre-#5686 this booted SILENTLY (info trace only).
+            const bare: Parameters<typeof apply>[0] = {
+                tools: { register: () => undefined },
+                commands: { register: () => undefined },
+                agents: {},
+                profileContext: { startedBundles: ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-headless", "billion-context"] },
+            };
+            apply(bare);
+            const lines = clientLines();
+            assert.equal(lines.length, 1);
+            assert.match(lines[0], /non-web-app bundle list/);
+            assert.match(lines[0], /could not latch/i);
+            assert.match(lines[0], /no-config-hook/);
+            assert.match(lines[0], /ARMED/i);
+            assert.match(lines[0], /#2474/);
+            await _stateToolsReadyForTest();
+        });
+    } finally {
+        _setSpawnForTest(undefined);
+        proxy.close();
+        rmrf(home);
+        rmrf(stateHome);
+        _resetRegisterForTest(undefined);
+        _resetWebProfileWarningForTest();
+    }
+});
+
 test("#3354/#3662 apply(): declares lane ownership instead of registering the overlay", async () => {
     const proxy = await startMockProxy([]);
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-cd-"));
@@ -1879,7 +1921,11 @@ test("#1117 apply() installs takeoverGate keyed on currentInitiator attribution"
             const gate = _stateTakeoverGateForTest();
             assert.ok(gate !== undefined, "takeoverGate installed");
             // unattributed (background chain, third-party in-process plugin) → NOT claimed
-            assert.equal(gate("https://api.anthropic.com/v1/messages"), false);
+            const rawNoneGate = gate("https://api.anthropic.com/v1/messages");
+            // #4829 review: the no-init (WS-lane-shaped) call must keep its SYNCHRONOUS
+            // verdict class — native-ws-intercept.ts compares with === false, no await.
+            assert.equal(rawNoneGate, false);
+            assert.equal(await rawNoneGate, false);
             // attributed (the host's own agent chain) → claimed
             ctx.setInitiator({ session: { id: "s1117" } });
             assert.equal(gate("https://api.anthropic.com/v1/messages"), true);
@@ -1914,8 +1960,9 @@ test("#1158 apply() gate refusal logs each endpoint once per process with attrib
             const refusedLines = (): string[] => (fs.existsSync(logFile) ? fs.readFileSync(logFile, "utf8") : "").split("\n").filter((l) => l.length > 0 && l.includes("takeover gate refused"));
             try {
                 const url = "https://api.gate-probe.test/v1/chat/completions";
-                assert.equal(gate(url), false, "unattributed → refused");
-                assert.equal(gate(url), false, "second refusal of the same endpoint");
+                // #4829: the none arm settles async — the recall claim may decode bodies
+                assert.equal(await gate(url), false, "unattributed → refused");
+                assert.equal(await gate(url), false, "second refusal of the same endpoint");
                 let lines = refusedLines();
                 assert.equal(lines.length, 1, `expected one refusal line per endpoint, got: ${lines.join(" | ")}`);
                 // #3651 paste-safe sink: non-public hosts are masked in the line; the dedup key
@@ -1923,11 +1970,11 @@ test("#1158 apply() gate refusal logs each endpoint once per process with attrib
                 assert.match(lines[0]!, /https:\/\/<private-host>\/v1\/chat\/completions/);
                 assert.match(lines[0]!, /no active initiator attribution/);
                 // A query string neither spawns a new line nor leaks into it.
-                assert.equal(gate(`${url}?key=sk-do-not-log`), false);
+                assert.equal(await gate(`${url}?key=sk-do-not-log`), false);
                 assert.equal(refusedLines().length, 1);
                 assert.ok(!fs.readFileSync(logFile, "utf8").includes("do-not-log"), "query string must not reach the log");
                 // A different endpoint earns its own line.
-                assert.equal(gate("https://api.other-probe.test/v1/messages"), false);
+                assert.equal(await gate("https://api.other-probe.test/v1/messages"), false);
                 assert.equal(refusedLines().length, 2);
                 // Attributed traffic claims silently.
                 ctx.setInitiator({ session: { id: "s1158" } });
@@ -1969,11 +2016,12 @@ test("#1158 L2 gate three-state: thrown attribution is a distinct state; counts 
             const refusedLines = (): string[] => (fs.existsSync(logFile) ? fs.readFileSync(logFile, "utf8") : "").split("\n").filter((l) => l.length > 0 && l.includes("takeover gate refused"));
             try {
                 const url = "https://api.gate-l2.test/v1/chat/completions";
-                // four same-state (none) refusals → exactly one line; counting continues silently
-                assert.equal(gate(url), false);
-                assert.equal(gate(url), false);
-                assert.equal(gate(url), false);
-                assert.equal(gate(url), false);
+                // four same-state (none) refusals → exactly one line; counting continues
+                // silently (#4829: the none arm settles async — the recall claim may decode bodies)
+                assert.equal(await gate(url), false);
+                assert.equal(await gate(url), false);
+                assert.equal(await gate(url), false);
+                assert.equal(await gate(url), false);
                 let lines = refusedLines();
                 assert.equal(lines.length, 1, `expected one line for repeated same-state refusals, got: ${lines.join(" | ")}`);
                 assert.match(lines[0]!, /no active initiator attribution/);
@@ -1997,7 +2045,7 @@ test("#1158 L2 gate three-state: thrown attribution is a distinct state; counts 
                 assert.equal(refusedLines().length, 2);
                 // back to plain none → transition the other way, count keeps running
                 ctx.agents.currentInitiator = () => undefined;
-                assert.equal(gate(url), false);
+                assert.equal(await gate(url), false);
                 lines = refusedLines();
                 assert.equal(lines.length, 3);
                 assert.match(lines[2]!, /refusals so far: 7 \(state threw→none\)$/);
@@ -2295,6 +2343,37 @@ test("#4111 mediaBytesOfWireBody/bodyProvablyOverWindow: prices the inline-media
     assert.equal(bodyProvablyOverWindow(undefined, mediaOnlyInit, 1000), undefined, "no body → no size arm");
     assert.equal(bodyProvablyOverWindow({ bytes: mixedBytes }, mixedInit, undefined), undefined, "no window → no size arm");
     assert.notEqual(bodyProvablyOverWindow({ bytes: mixedBytes }, undefined, 1000), undefined, "no init to re-price → media cannot be proven → the raw floor keeps the old (conservative) verdict");
+});
+
+test("#4912 typed-array init.body: an undecodable buffer degrades to the conservative verdict instead of throwing out of the gate face", () => {
+    // Models V8's real limit: only buffers whose decoded form exceeds the
+    // max string length throw RangeError; small decodes keep working.
+    const savedDecoder = globalThis.TextDecoder;
+    const Real = globalThis.TextDecoder;
+    const passthrough = new Real();
+    const bigUrl = `data:image/png;base64,${"A".repeat(4_200_000)}`;
+    const raw = JSON.stringify({ messages: [{ role: "user", content: [{ type: "image_url", image_url: { url: bigUrl } }] }] });
+    const init: RequestInit = { method: "POST", body: new TextEncoder().encode(raw) };
+    const bytes = Buffer.byteLength(raw);
+    try {
+        globalThis.TextDecoder = class {
+            constructor(_label?: string, _options?: unknown) {}
+            decode(buf?: Uint8Array | ArrayBuffer): string {
+                if (buf !== undefined && buf.byteLength > 1_000_000) throw new RangeError("Invalid string length");
+                return passthrough.decode(buf);
+            }
+        } as unknown as typeof TextDecoder;
+        // Pre-fix this call threw RangeError out of the gate face. Now the
+        // undecodable buffer bills ALL bytes as core text (media unprovable).
+        const doom = bodyProvablyOverWindow({ bytes }, init, 1000);
+        assert.ok(doom !== undefined, "undecodable over-bar body keeps the conservative (all-core-text) verdict");
+        assert.equal(doom?.mediaBytes, 0);
+        assert.equal(doom?.coreBytes, bytes);
+    } finally {
+        globalThis.TextDecoder = savedDecoder;
+    }
+    // Decodable twin of the SAME body: media credited exactly → not provably over.
+    assert.equal(bodyProvablyOverWindow({ bytes }, init, 1000), undefined, "the guard must not zero media credits on the normal path");
 });
 
 test("#3581 gate degradation reports event-driven; give-up latch stops pointless settle-retries on a dead scope", async () => {
@@ -2852,6 +2931,67 @@ test("#1365 explicit BILLION_CONTEXT_ATTACH remains the tool endpoint when the r
     }
 });
 
+test("#4894 declaredWindowForDirect: session model beats global default; unknown window fails open", async () => {
+    const proxy = await startMockProxy([]);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-4894-home-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            const ctx = mockCtx();
+            class Llm4894 {
+                async resolveModelInfo(): Promise<undefined> { return undefined; }
+            }
+            ctx.setModelServices(new Llm4894(), { currentSelection: () => ({ provider: "pG4894", model: "mG4894" }) });
+            apply(ctx);
+            await waitFor(() => ctx.registeredTools.length === 1, "initial attach tool registration");
+            // Seed AFTER registration settles: apply()'s inject already fired
+            // one refreshModelInfo for the global target, and its failure-
+            // shaped settle would otherwise clobber the seeded entry.
+            _setModelInfoForTest({ provider: "pS4894", model: "mS4894", contextWindow: 111 });
+            _setModelInfoForTest({ provider: "pG4894", model: "mG4894", contextWindow: 222 });
+            const hook = _nativeStateForTest().declaredWindowForDirect;
+            assert.ok(hook !== undefined, "apply() arms the direct-path window source");
+            // #2381 resolution, minus the plugin-mode gates: the session's own
+            // live header first...
+            ctx.setInitiator({ session: { id: "s4894", requestHeader: () => ({ config: { provider: "pS4894", model: "mS4894" } }) } });
+            assert.equal(hook(), 111, "session model wins over the global default");
+            // ...the host's global default as fallback...
+            ctx.setInitiator({ session: { id: "s4894" } });
+            assert.equal(hook(), 222, "global default when the session carries no header");
+            // ...and a resolvable model without cached window info → undefined
+            // (a wrong model's window is worse than none — fail open).
+            ctx.setInitiator({ session: { id: "s4894", requestHeader: () => ({ config: { provider: "pX4894", model: "mX4894" } }) } });
+            assert.equal(hook(), undefined, "unknown window fails open");
+        });
+    } finally {
+        _setModelInfoForTest();
+        proxy.close();
+        rmrf(home);
+        _resetRegisterForTest(undefined);
+    }
+});
+
+test("#4894 declaredWindowForDirect: no model services at all → undefined (fail-open)", async () => {
+    const proxy = await startMockProxy([]);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-4894b-home-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            const ctx = mockCtx();
+            apply(ctx);
+            await waitFor(() => ctx.registeredTools.length === 1, "initial attach tool registration");
+            const hook = _nativeStateForTest().declaredWindowForDirect;
+            assert.ok(hook !== undefined, "apply() arms the hook regardless of services");
+            assert.equal(hook(), undefined, "no services → no window source → fail-open direct sends");
+        });
+    } finally {
+        _setModelInfoForTest();
+        proxy.close();
+        rmrf(home);
+        _resetRegisterForTest(undefined);
+    }
+});
+
 test("explicit attach keeps the DSH tool base when a late routed model origin denies the manifest", async () => {
     const toolCalls: Array<{ conversationId: string; tool: string; args: unknown }> = [];
     const attach = await startMockProxy(toolCalls);
@@ -3150,5 +3290,71 @@ test("#1365 apply() attach mode: runtime death with routed evidence — waits th
         rmrf(home);
         _resetRoutedForTest();
         _resetRegisterForTest(undefined);
+    }
+});
+
+// #5792: the shared body-parse memo must dedupe N consumers onto ONE genuine
+// decode+parse per init, hand them the identical parsed value, and re-parse only
+// when a consumer swaps init.body (fork-adopt / the incremental delta form) —
+// serving a stale parse across a body swap would corrupt the downstream shape
+// checks. A failed parse caches as undefined without poisoning later lookups.
+test("#5792: shared body-parse memo dedupes consumers and invalidates on body swap", async () => {
+    _resetBodyParseStatsForTest();
+    const init: RequestInit = { method: "POST", body: JSON.stringify({ n: [1, 2, 3] }) };
+    const v1 = await _parsedBodyOnceForTest(init);
+    const v2 = await _parsedBodyOnceForTest(init);
+    const v3 = await _parsedBodyOnceForTest(init);
+    assert.equal(_bodyParseStatsForTest(), 1, "three consumers, one genuine parse");
+    assert.equal(v1, v2, "consumers share the identical parsed result");
+    assert.equal(v2, v3, "consumers share the identical parsed result");
+
+    init.body = JSON.stringify({ n: [4, 5] });
+    const v4 = await _parsedBodyOnceForTest(init);
+    assert.equal(_bodyParseStatsForTest(), 2, "swapped body forces a fresh parse (no stale reuse)");
+    assert.notEqual(v4, v1, "new body yields a distinct parsed value");
+
+    const bad: RequestInit = { method: "POST", body: "{not json" };
+    assert.equal(await _parsedBodyOnceForTest(bad), undefined, "unparseable body -> undefined");
+    assert.equal(await _parsedBodyOnceForTest(bad), undefined, "failure cached, still undefined");
+    assert.equal(_bodyParseStatsForTest(), 3, "each distinct init parses once");
+});
+
+// #5792: end-to-end through the real pre-send chain. An OpenAI-wire session used
+// to pay TWO full JSON.parse of the whole history inside the host process before
+// egress (recall parsed once, then incremental parsed again and bailed at the
+// anthropic-shape check). The chain must now collapse to exactly one genuine
+// parse while leaving the OpenAI body untouched (full resend).
+test("#5792: dsh pre-send chain parses the request body once per request", async () => {
+    const proxy = await startMockProxy([], undefined, undefined, undefined, true);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-5792-"));
+    const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-5792-state-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin, XDG_STATE_HOME: stateHome, BILI_PROVIDER_REWRITES: undefined, BILI_NATIVE_DSH: undefined, BILLION_CONTEXT_PLUGIN: undefined }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            __resetIncrementalClientForTests();
+            const ctx = mockCtx();
+            ctx.setInitiator({ session: { id: "dsh-5792" } });
+            apply(ctx);
+            await waitFor(() => ctx.registeredTools.length === 1, "manifest tool registration");
+            await _stateToolsReadyForTest();
+            const beforeSend = _stateBeforeSendForTest();
+            assert.ok(beforeSend, "pre-send seam armed");
+            const url = `${proxy.origin}/v1/chat/completions`;
+
+            const original = JSON.stringify({ model: "gpt-test", max_tokens: 64, messages: [
+                { role: "user", content: "list the files" },
+                { role: "assistant", content: null, tool_calls: [{ id: "call_1", type: "function", function: { name: "ls", arguments: "{}" } }] },
+                { role: "tool", tool_call_id: "call_1", content: "a.txt b.txt" },
+            ] });
+            const init: RequestInit = { method: "POST", body: original };
+            _resetBodyParseStatsForTest();
+            await beforeSend(url, init);
+            assert.equal(_bodyParseStatsForTest(), 1, "exactly one decode+parse across the whole pre-send chain (#5792)");
+            assert.equal(init.body, original, "OpenAI shape rides full resend (body untouched)");
+        });
+    } finally {
+        proxy.close();
+        rmrf(home);
+        rmrf(stateHome);
     }
 });

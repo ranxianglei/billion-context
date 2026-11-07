@@ -43,7 +43,10 @@ Fetch once at plugin startup.
     "agent": "x-bili-plugin",
     "conversation": "x-bili-plugin-conversation",
     "contextWindow": "x-bili-plugin-context-window",
-    "instructionsMutable": "x-bili-plugin-instructions-mutable"
+    "maxOutput": "x-bili-plugin-max-output",
+    "model": "x-bili-plugin-model",
+    "instructionsMutable": "x-bili-plugin-instructions-mutable",
+    "compression": "x-bili-plugin-compression"
   },
   "toolEndpoint": "/__bili/plugin/tool",
   "statusEndpoint": "/__bili/plugin/status",
@@ -53,7 +56,7 @@ Fetch once at plugin startup.
 }
 ```
 
-Register the tools natively with your agent, in whichever wire format your agent speaks — register exactly what `toolNames` lists. `absorb` appears only when the proxy's config enables it; `acp_rule` is advertised only when the proxy's config enables it (`compress.rules: true`, opt-in). Calling a tool that is known but disabled answers `200` with an explanatory `result` instead of an error (#1192). If `protocolVersion` is higher than you know, still register the tools — extra fields in schemas are ignored by agents.
+Register the tools natively with your agent, in whichever wire format your agent speaks — register exactly what `toolNames` lists. `absorb` appears only when the proxy's config enables it; `acp_rule` is advertised only when the proxy's config enables it (`compress.rules: true`, opt-in). Calling a tool that is known but disabled answers `200` with an explanatory `result` instead of an error (#1192). If `protocolVersion` is higher than you know, still register the tools — extra fields in schemas are ignored by agents. `headers.compression` names an optional per-request override (#4855): when your host keeps the registered ACP tools out of the outgoing request (Hermes defers every plugin toolset behind `tool_search`), stamp `proxy` on that header alongside the identity headers — the proxy then keeps the session identity and model budget bound to your conversation but serves compression through its own wire channel (it injects the tools and executes compress server-side). Use it only when advertised; older proxies omit it, and the proxy honors it only from a request that already carries `headers.agent`.
 
 ### 2. Request headers
 
@@ -209,6 +212,29 @@ Marker divert (#3248 phase 2 — native extensions): instead of switching the pr
 中文增量要点（#3248）：`POST /__bili/plugin/turn`，首次/恢复用 `sinceSeq:0` 全量（种子隐含 `resync:true`，永不 409）；此后每轮只发新增（含上一轮 assistant 回复，客户端自持）。响应即上游原文，`x-bili-applied-seq` 为应用后的长度，下一轮作 `sinceSeq` 回传。409 必须按 serverSeq 对齐或全量重同步；503 表示未开 storage.unified。会话身份沿用客户端自己的 conversation id——增量与全量重发同一会话可任意切换，折叠/工具/状态栏不变。阶段 2（标记分流）：普通模型请求上盖 `x-bili-plugin-turn: 1` 头 + 增量形状 body（顶层 conversationId/sinceSeq/messages、无顶层 model）即可，增量形状 turn 属 lane 流量，与直连 turn 端点同信任级（#3343）：非回环/隧道/不可信源一律 403（其探针本就 403，正常宿主不会远程发增量）；管理前缀（`/__bili/`、`/__acp/`）永不走分流。lane 按原始 URL 转发；探针 `GET /__bili/plugin/turn`；开关 rollout `pluginIncrementalTurns`（默认 0%=零变化，`BILI_ROLLOUT_PLUGIN_INCREMENTAL_TURNS=1` 或配置强制开）。客户端状态机在 src/agent/incremental-client.ts，新宿主复用勿重写。已接宿主：pi/pi-native（同一扩展工厂，后者零代码继承）、dsh-native（fetch 补丁 beforeSend/headersFor/onResponse）、opencode（http.request 钩子 incremental 适配回调换 body+盖章）、omp（无头事件通道，读 body 里 prompt_cache_key 当会话 id，直接在 init 上盖章）；OpenAI 工具形状（tool_calls/role:tool）自动回退全量重发；每 URL 单飞行+30s 过期。
 
 中文集成要点：fork 协议现为 2(服务端同时接受 1)；先读取 manifest 能力及 snapshot，按原文、role、工具身份确认匹配前缀，仅提交该前缀的 orderedMessages，不猜测多模态分支点。被 `compress.protectedTools` 硬排除的消息在两个数组中均为 `"ref": null`（参与顺序与身份、无地址 ref），与其他前缀条目一样逐字提交；ref 合法值仅 `mNNNNN` 字符串或 `null`。父 revision 变化必须重新取快照并重新匹配。子会话使用独立稳定 id，首次请求可追加尚未出站的模型回复，不能重置继承的 refs/blocks。手动摘要使用 snapshot 的 refs 和 `expectedRevision: snapshot.parentRevision` 调用公开 tool；摘要期间历史发生变化时返回 409，不执行旧摘要。状态栏读取 `contextTokens`、`contextTokensSource`、`contextTokensAt`、`model`、`contextLimit`、`contextGeneration`、`sessionId` 与 `sessionRevision`，不得用累计账单 input/cache 冒充有效上下文。手动 compress/decompress 后为独立时间及 generation 的 estimate，不改累计账单或 last-usage 基线；下一次正数 usage 才恢复 usage，零值或缺失 usage 不得复活旧观测。未知来源返回 unavailable，tokens/time/generation 为 null。
+
+### Incremental cache-mark updates
+
+`GET /__bili/plugin/turn` advertises `cacheControlRetouch: true` when the server
+supports changing cache marks on already acknowledged wire messages. This is an
+optional protocol-1 extension: clients MUST NOT send it unless the capability
+is explicitly true. Older servers can ignore unknown envelope fields; an older
+or unadvertised server must receive the original full request when marks move.
+
+A delta can include `retouch: [{ index, message }]`, where `index` is the
+zero-based ordinal in the acknowledged **wire** history and `message` is that
+complete Anthropic wire message with its current block-level `cache_control`.
+Only those decorations may differ. Tool arguments, thinking signatures and
+opaque media bytes must remain identical. The server validates every update
+before applying either the delta or its marks. A changed payload, unknown span,
+or cold canonical returns 409; the client recovers with its existing full-resync
+path. Retouches do not append messages or advance the acknowledgement sequence.
+Their warm wire-to-core span map is rebuilt by a seed; no storage schema change
+is required. The acknowledged boundary still hashes the original wire bytes.
+
+The OpenCode V2 adapter collects acknowledgements from `http.response`, using
+the outgoing request's turn-id header to correlate them. Its request hook can
+therefore send deltas when attached to a proxy without a fetch interceptor.
 
 ## Security
 

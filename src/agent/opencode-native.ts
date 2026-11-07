@@ -77,7 +77,8 @@ import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST, unwrapUpstream, wrapUpstream
 import { createAcpCommandHooks, showAcpText } from "./opencode-acp-command.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, setNativeOriginWaiter, singleFlight } from "./native-bootstrap.js";
 import { createLiveOriginResolver, installNativeFetchIntercept, isModelApiUrl, noteRoutedOrigin, observeRoutedOrigin, readyOrigin, replaceRequestPayload, replaceRequestTarget, routedBiliModelUrl, type LiveOriginResolverDeps, type NativeInterceptState, type UnavailableReason } from "./native-intercept.js";
-import { clearIncrementalProbe, createPrepareDirectSend, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalAck, noteIncrementalRejection, planIncrementalTurn, probeIncrementalTurns, rememberOriginalBody, sweepStale, wireMessagesLookAnthropic, type IncrementalWireMessage } from "./incremental-client.js";
+import { clearIncrementalProbe, createPrepareDirectSend, incrementalCacheRetouchEnabled, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalAck, noteIncrementalRejection, planIncrementalTurn, probeIncrementalTurns, rememberOriginalBody, sweepStale, wireMessagesLookAnthropic, type IncrementalWireMessage } from "./incremental-client.js";
+import * as pfChannel from "./pf-channel.js";
 import { createOpencodeV2Setup, type V2HttpRequestEvent, type V2State } from "./opencode-v2.js";
 import { alignedMsgIdsForWire, harvestOpencodeMsgIds } from "./opencode-msgids.js";
 import { asciiHeaderValue, fetchProxyVersion, postIdentityRegister, reportRuntimeInfoOnChange, waitForProxyVersion, type ForwardedToolResult } from "./shared.js";
@@ -126,15 +127,33 @@ export function planNativeOpencode(env: NodeJS.ProcessEnv, fileInline: boolean |
 
 export type OpencodeNativeRouteDeps = LiveOriginResolverDeps;
 
+/** #4912: the stage-2 media re-pricing of the direct-refusal arm, isolated so
+ *  the undecodable-body path is unit-testable without allocating a multi-GB
+ *  buffer (inject the decoder). A body past V8's max string length (~536MB;
+ *  #3128 admits up to 5GiB) makes TextDecoder.decode throw RangeError — same
+ *  class as a non-JSON body in mediaBytesOfWireBody: no media credit, the whole
+ *  body bills as core text (conservative refusal), never an exception out of
+ *  the route handler. */
+export function wireBodyMediaBytes(body: ArrayBuffer, decode: (buf: ArrayBuffer) => string = (b) => new TextDecoder().decode(b)): number {
+    try {
+        return mediaBytesOfWireBody(decode(body));
+    } catch {
+        return 0;
+    }
+}
+
 /** #3308: client-side mirror of #2924's refuse-oversized arm for this lane
  *  (the V2 route has no takeover gate to carry it). Returns a host-visible
  *  refusal when the proxy is unavailable AND the body provably cannot fit the
  *  model's context window — the core-text floor (bytes/4) exceeds the
  *  window, and #2924's ledger evidence says real text runs ABOVE the floor
  *  (calibratedEstimate ~1.14), so the comparison cannot false-refuse. Unknown
- *  model, unknown window, unreadable or absent body all return undefined and
- *  keep the documented fail-open direct send. The size is measured through a
- *  CLONE — the original Request must stay sendable (#2496 discipline). */
+ *  model, unknown window, or an unmeasurable body all return undefined and keep
+ *  the documented fail-open direct send; a measurable body whose content cannot
+ *  be decoded (past V8's max string length, #4912) gets no media credit — the
+ *  conservative all-core-text refusal instead of an escaped RangeError. The
+ *  size is measured through a CLONE — the original Request must stay sendable
+ *  (#2496 discipline). */
 async function oversizeDirectRefusal(e: V2HttpRequestEvent, s: V2State, reason?: UnavailableReason): Promise<Error | undefined> {
     const model = e.model;
     if (model === undefined || typeof model.providerID !== "string" || typeof model.id !== "string") return undefined;
@@ -151,7 +170,7 @@ async function oversizeDirectRefusal(e: V2HttpRequestEvent, s: V2State, reason?:
     const bytes = body.byteLength;
     if (Math.ceil(bytes / 4) <= window) return undefined;
     // #4121: only re-price would-refuse bodies; inline media is not text.
-    const coreBytes = Math.max(bytes - mediaBytesOfWireBody(new TextDecoder().decode(body)), 0);
+    const coreBytes = Math.max(bytes - wireBodyMediaBytes(body), 0);
     const floorTokens = Math.ceil(coreBytes / 4);
     if (floorTokens <= window) return undefined;
     // #3654: a busy-exhausted refusal must NOT claim "proxy unavailable …
@@ -663,8 +682,14 @@ function lastSessionFromMessages(messages: unknown): string | undefined {
  *  messages.transform hook — the only opencode seam that sees them (V2's
  *  http.request sees just the wire, so V2-shaped turns degrade to
  *  content-derived identities). Never mutates the host's messages. */
-const harvestMsgIdsTransform = async (_input: unknown, output: { messages?: unknown }): Promise<void> => {
+const harvestMsgIdsTransform = async (input: unknown, output: { messages?: unknown }): Promise<void> => {
     harvestOpencodeMsgIds(lastSessionFromMessages(output?.messages), output?.messages);
+    // #5403/#5418 unified watermark channel: feed the ONE chokepoint emitter
+    // with the SAME validated 1:1 list the harvest just aligned — undefined
+    // (any misalignment) CLEARS the previous list; the emitter degrades to
+    // count-only rather than sending a stale anchor.
+    const sid = (input === null || typeof input !== "object" ? undefined : (input as { sessionID?: unknown }).sessionID);
+    if (typeof sid === "string" && sid.length > 0) pfChannel.pfCaptureIds(sid, alignedMsgIdsForWire(sid, output?.messages));
 };
 
 // #1135: dynamic origin getter instead of a captured constant — after a
@@ -932,7 +957,7 @@ const server = async (ctx: V1PluginContext): Promise<V1Hooks> => {
     return createV1ServerHooks(() => state.origin, ctx, { z, legacy });
 };
 
-export default { id: "billion-context-opencode-native", setup: createOpencodeV2Setup({ route: createNativeRoute(state), incremental: maybeIncrementalOpencode }), server };
+export default { id: "billion-context-opencode-native", setup: createOpencodeV2Setup({ route: createNativeRoute(state), incremental: maybeIncrementalOpencode, onResponse: opencodeIncrementalOnHttpResponse }), server };
 
 /** #3248 phase 2: incremental-turn divert for opencode. Runs LAST in the
  *  http.request hook (routing + header stamping already happened, so the
@@ -976,19 +1001,23 @@ export async function maybeIncrementalOpencode(e: V2HttpRequestEvent, s: V2State
         const b = body as { messages?: unknown; model?: unknown; system?: unknown };
         if (typeof b.model !== "string" || !wireMessagesLookAnthropic(b.messages)) return; // anthropic-wire only; OpenAI-tool shapes resend full
         if (!(await probeIncrementalTurns(base))) return;
-        const plan = planIncrementalTurn({ conversationId: sid, path: "/v1/messages", messages: b.messages as IncrementalWireMessage[], system: b.system as unknown, request: b as { model?: unknown } & Record<string, unknown>, msgIds: alignedMsgIdsForWire(sid, b.messages) });
-        if (plan.mode === "skip") return;
         // #3378 single-flight (kept over #3329's removal per the rebase
         // decision): while a marker'd request for this URL is still awaiting
         // its ack, later requests ride the normal pipeline. Pending entries
         // are keyed by turn id (#3329), so the guard scans for a live entry
         // stashed on THIS url (sweepStale above already aged out the stale
         // ones — an aged entry must not block a fresh conversion).
+        // The guard must run BEFORE planIncrementalTurn: planning claims the
+        // turn's msgIds client-side (#4491), and a plan this guard then
+        // discards would burn those ids — the host's retry screens against
+        // the burned claims and silently drops the whole msgIds field.
         let inflight = false;
         for (const pending of incPendingOpencode.values()) {
             if (pending.url === url && Date.now() - pending.at < INC_PENDING_TTL_MS) { inflight = true; break; }
         }
         if (inflight) return;
+        const plan = planIncrementalTurn({ cacheControlRetouch: incrementalCacheRetouchEnabled(base), conversationId: sid, path: "/v1/messages", messages: b.messages as IncrementalWireMessage[], system: b.system as unknown, request: b as { model?: unknown } & Record<string, unknown>, msgIds: alignedMsgIdsForWire(sid, b.messages) });
+        if (plan.mode === "skip") return;
         const turnId = newIncrementalTurnId();
         // #3304: stash before the swap — the opencode replacement happens in
         // this hook, BEFORE the fetch intercept ever sees the request, so
@@ -1077,3 +1106,17 @@ export function opencodeIncrementalOnResponse(_url: string, response: Response, 
 }
 
 state.onResponse = opencodeIncrementalOnResponse;
+
+/** V2 http.response adapter: forwards the SENT request's headers (the turn id
+ *  stamped by maybeIncrementalOpencode rides there) and the upstream response
+ *  to the same ack collector the fetch intercept feeds. Inline mode fires both
+ *  seams for one dispatch; the second call is a no-op because the first one
+ *  already consumed the pending entry. Exported for the native suites. */
+export function opencodeIncrementalOnHttpResponse(e: V2HttpRequestEvent): void {
+    const response = e.response;
+    const req = e.request as Request | undefined;
+    if (response === undefined || req === undefined || typeof req.headers?.get !== "function") return;
+    const turnId = req.headers.get(INCREMENTAL_TURN_ID_HEADER);
+    if (turnId === null) return;
+    opencodeIncrementalOnResponse(typeof req.url === "string" ? req.url : "", response, { [INCREMENTAL_TURN_ID_HEADER]: turnId });
+}

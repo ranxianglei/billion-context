@@ -19,6 +19,7 @@ import { appendAbsorbPrompts, hideAbsorbedMessages } from "./absorb.js";
 import { applyCrushToMessages } from "./crush.js";
 import { applyRetrieve, ccrStoreNode, RETRIEVED_ID_PREFIX } from "./ccr.js";
 import { preTransformSnapshotNode, viewLatchNode } from "./view-latch.js";
+import { relocateCompressCarriers } from "./relocate-compress.js";
 import type { ApplyRetrieveResult, CcrEffect } from "./ccr.js";
 import type { EmergencyTruncateLatchEntry } from "./types.js";
 import { createContentStore } from "./content-store.js";
@@ -38,6 +39,11 @@ import {
 } from "./protected.js";
 import { isToolMessage } from "./message-kind.js";
 import { projectUnit, collectCoverage } from "./unit-projection.js";
+import {
+  appendMediaRefsSection,
+  collectFoldMediaRefs,
+  parseMediaRefsSection,
+} from "./media-refs.js";
 import { evaluateRefold, type RefoldDecision } from "./refold.js";
 import {
   computeProtectedRefs,
@@ -69,6 +75,15 @@ import type {
 
 export interface Ports {
   countTokens?: (text: string) => number;
+  /** #4313 (toggle, PR #5236): enable immutable message timestamps — first-
+   *  sight stamp minting into state.tsStamps and the <acp> tag's time
+   *  attribute on the render node. Default false: neither runs, so a
+   *  flag-off core renders byte-identically to pre-#4313 masters (hydrated
+   *  ts values are carried but never displayed). Set true by hosts whose
+   *  session opted in via compress.messageTimestamps / BILI_MESSAGE_TIMESTAMPS.
+   *  Resolved ONCE per core (instance scope) — storage-layer stamping stays
+   *  unconditional either way, so enabling later renders full history times. */
+  timestamps?: boolean;
 }
 
 export interface CompressionCore {
@@ -153,6 +168,15 @@ type RangeResolution =
  *  clears the latch, so normal sessions hold a handful at most. Oldest drop. */
 const MAX_TRUNCATE_LATCH = 64;
 
+/** #5698: a tier-1 fold answering the fire that offered `pending` tokens must
+ *  reclaim at least this fraction of the offered mass for the T1 channel to
+ *  count as draining. Partial compliance below it (production #5671: nudges
+ *  offering ~450K answered by 3-6K folds) sets the harvest-stall flag so tier
+ *  arbitration can route to mass-qualified distillation instead of starving
+ *  it behind a never-draining T1. Measured against the fire's pendingT1, so
+ *  eager lanes (fold the whole offer) never trip it. */
+export const STALL_HARVEST_RATIO = 0.5;
+
 function rangeError(
   spec: { startRef: string; endRef: string },
   message: string,
@@ -163,6 +187,10 @@ function rangeError(
 function numericBlockId(id: string): number {
   const parsed = /^b(\d+)$/.exec(id);
   return parsed ? Number(parsed[1]) : 0;
+}
+
+function formatK(n: number): string {
+  return n >= 1000 ? `${(n / 1000).toFixed(1)}K` : `${n}`;
 }
 
 function refGateDiagnostics(
@@ -272,21 +300,28 @@ function applyRefolds(input: {
 }): void {
   validateSummaryLength(input.spec, input.config.compress);
   const targets = new Set(input.blockIds);
-  input.state.blocks = input.state.blocks.map((block) =>
-    targets.has(block.blockId)
-      ? {
-          ...block,
-          summary: input.spec.summary,
-          topic: input.spec.topic ?? block.topic,
-          runId: input.runId,
-          restoredInline: false,
-        }
-      : block,
-  );
+  input.state.blocks = input.state.blocks.map((block) => {
+    if (!targets.has(block.blockId)) return block;
+    // #5620: refold rewrites the stored summary — carry this block's own
+    // MEDIA REFS section forward mechanically.
+    const carriedRefs = parseMediaRefsSection(block.summary).map(
+      scrubLoneSurrogates,
+    );
+    return {
+      ...block,
+      summary: appendMediaRefsSection(input.spec.summary, carriedRefs),
+      topic: input.spec.topic ?? block.topic,
+      runId: input.runId,
+      restoredInline: false,
+    };
+  });
 }
 
 export function createCore(ports: Ports = {}): CompressionCore {
   const countTokens = ports.countTokens ?? defaultCountTokens;
+  // #4313 toggle: single gate for both pipeline nodes (stamp + render);
+  // captured once per core so every lane built from this core agrees.
+  const timestampsOn = ports.timestamps === true;
 
   function applyCompression(
     input: ApplyCompressionInput,
@@ -593,6 +628,33 @@ export function createCore(ports: Ports = {}): CompressionCore {
           gateMessage += ` ${reversalNotes.join(" ")}`;
         }
 
+        // #4521: a PURE resubmit (every requested range already consumed,
+        // no dangling/dead refs, nothing countable left) is the idempotent
+        // retry of an already-folded bill of work — historically refused with
+        // "Requested range(s) already compressed", which read as a failure and
+        // dragged another retry. Return it as the no-op success class instead:
+        // same informative text, zero errors, host renders a "[Compression
+        // no-op:" receipt that folds away (#4289 class). Mixed batches (some
+        // consumed + some live-but-too-small) keep the refusal — there is real
+        // work left to re-plan.
+        const pureResubmit =
+          countedRanges === 0 &&
+          consumedRanges.length > 0 &&
+          danglingRefs.length === 0 &&
+          unknownCount === 0;
+        if (pureResubmit) {
+          return {
+            state,
+            result: {
+              blocksCreated: 0,
+              tokensCompressed: 0,
+              errors: [],
+              warnings: [`${gateMessage} Nothing failed and nothing needed redoing — do not resend these ranges.`],
+              noop: true,
+            },
+          };
+        }
+
         // Rejected batches still carry their side effect: the dead-ref
         // tombstones marked above (#2362). The clone differs from input.state
         // ONLY in that field before the gate, so returning it is safe.
@@ -731,7 +793,11 @@ export function createCore(ports: Ports = {}): CompressionCore {
           countTokens,
           preExistingCoverage,
         });
-        blocksCreated += outcome.refolded ? outcome.refolded.length : 1;
+        blocksCreated += outcome.noop
+          ? 0
+          : outcome.refolded
+            ? outcome.refolded.length
+            : 1;
         tokensCompressed += outcome.tokens;
         warnings.push(...outcome.warnings);
       } catch (error) {
@@ -801,6 +867,29 @@ export function createCore(ports: Ports = {}): CompressionCore {
       // (which may have consumed blocks of tier N to produce tier N+1), every
       // tier should be eligible to re-evaluate from the new token count.
       state.nudge.lastShownByTier = {};
+      // #5415: the #5293 abort-absorb debt bank drained with the backlog it
+      // tracked — a fresh cadence starts from a clean slate.
+      state.nudge.absorbedDebt = 0;
+      state.nudge.absorbCount = 0;
+      // #5698: T1 harvest-stall accounting (consume-once). The tier-1 fire
+      // banked its offered pending; this fold answers it. A distill (any new
+      // block above tier 1) proves the distillation channel delivers — clear
+      // the stall. A message-shaped fold harvesting < STALL_HARVEST_RATIO of
+      // the offered pending is partial compliance: the T1 channel is not
+      // draining while the block pile keeps growing (#5671 treadmill) — set
+      // the stall so arbitration can route to mass-qualified distillation.
+      const distilled = state.blocks
+        .filter((b) => !preFoldBlockIds.has(b.blockId))
+        .some((b) => (b.tier ?? 1) > 1);
+      const firePending = state.nudge.lastT1FirePending;
+      if (distilled) {
+        state.nudge.t1HarvestStall = false;
+        state.nudge.lastT1FirePending = undefined;
+      } else if (firePending !== undefined && firePending > 0) {
+        state.nudge.t1HarvestStall =
+          tokensCompressed < STALL_HARVEST_RATIO * firePending;
+        state.nudge.lastT1FirePending = undefined;
+      }
       // A successful compression is by definition viable progress — restart
       // the terminal-floor streak so the escape signal can only fire again
       // after N fresh stuck events (#300).
@@ -829,6 +918,11 @@ export function createCore(ports: Ports = {}): CompressionCore {
         errors,
         warnings,
         ...(notes.length > 0 ? { notes } : {}),
+        // #4521: a batch where every range was a no-op/skip (covered,
+        // protected, refold-blocked skips) committed nothing and failed
+        // nothing — surface the no-op class so the host renders the
+        // success-shaped receipt instead of "FAILED: no blocks created".
+        ...(blocksCreated === 0 && errors.length === 0 ? { noop: true } : {}),
       },
     };
   }
@@ -875,10 +969,38 @@ export function createCore(ports: Ports = {}): CompressionCore {
     }
     const state = { ...result.state, lastPassIds: inboundIds, deadRefs };
     const ccrEffect = result.effects.ccr as CcrEffect | undefined;
+    // #4521: between banner deliveries a compression round can stay armed for
+    // many requests (backoff, tier cadence, model-decided timing). During that
+    // window the model sees NO current refs and starts guessing beyond the
+    // highest allocated ref — every guess a failed round-trip. Emit a compact
+    // boundary line whenever a nudge plan carries offered ranges but its
+    // banner is not being delivered this turn; hosts append it as an ephemeral
+    // trailing user message (same carrier as the nudge, same cache safety).
+    let statusLine: string | undefined;
+    const nudge = result.effects.nudge;
+    // Two shapes authorize the refresh line: a real tiered arm whose banner
+    // is deferred this turn (tier !== null: pressure crossed a threshold but
+    // cadence/backoff holds it), or any plan after at least one banner was
+    // already shown (lastNudgeShownTokens > 0: the model HAS seen refs and
+    // this line only refreshes them). A fresh session's below-threshold plan
+    // (tier === null, nothing shown yet — e.g. an optimistic local estimate)
+    // must stay fully silent: same regime promise as the nudge itself
+    // (#196 regime scoping, #3910 lane baseline).
+    const bannerShown = (result.state.nudge?.lastNudgeShownTokens ?? 0) > 0 || Object.keys(result.state.nudge?.lastShownByTier ?? {}).length > 0;
+    if (nudge && !nudge.shouldInject && (nudge.tier !== null || bannerShown) && (nudge.compressibleRanges?.length ?? 0) > 0) {
+      const highest = highestUsedIndex(state.messageRefs);
+      const offered = nudge.compressibleRanges!
+        .slice(0, 3)
+        .map((r) => `${r.startRef}–${r.endRef} (${formatK(r.tokens)})`)
+        .join(", ");
+      const extra = nudge.compressibleRanges!.length > 3 ? `, +${nudge.compressibleRanges!.length - 3} more` : "";
+      statusLine = `[ACP status: highest allocated ref ${highest > 0 ? indexToRef(highest) : "none"} — refs above it are not minted yet, never guess them; compressible now: ${offered}${extra}; the newest messages stay protected. Use these refs directly; acp_status only if you need the full list.]`;
+    }
     return {
       messages: result.messages,
       state,
       nudge: result.effects.nudge,
+      statusLine,
       terminalEscape: result.effects.terminalEscape,
       truncationSkipped: result.effects.truncationSkipped,
       contentStore: ccrEffect?.store ?? contentStore,
@@ -947,6 +1069,7 @@ export function createCore(ports: Ports = {}): CompressionCore {
   function buildNodes(strategy: RenderStrategy): PipelineNode[] {
     const base: PipelineNode[] = [
       reconcileLiveIdsNode,
+      createStampTimestampsNode(timestampsOn),
       assignRefsNode,
       syncBlocksNode,
       pruneNode,
@@ -957,13 +1080,18 @@ export function createCore(ports: Ports = {}): CompressionCore {
       absorbPromptNode,
       filterNode,
       hideCompressCallsNode,
+      // EXPERIMENTAL, default off (Config.compressAtFoldPoint): move still-visible
+      // carrier pairs onto their fold point. Must run AFTER hide-compress-calls
+      // (whose orphan sweep just settled which carriers survive) and BEFORE
+      // view-latch so the latch records the relocated bytes.
+      relocateCompressCarriersNode,
       viewLatchNode,
       recommendNode,
       nudgeNode,
       emergencyTruncateNode,
     ];
     if (strategy === "none") return base;
-    return [...base, createRenderRefsNode(strategy)];
+    return [...base, createRenderRefsNode(strategy, { timestamps: timestampsOn })];
   }
 
   return {
@@ -989,6 +1117,53 @@ const reconcileLiveIdsNode: PipelineNode = {
     return { ...io, messages: remintCoveredLiveIds(io.messages, io.state) };
   },
 };
+
+// #4313: stamp each message with its immutable local time-of-occurrence,
+// ONCE — for GENUINELY NEW arrivals only. Runs after reconcile-live-ids (so
+// the final post-remint id is what gets stamped, matching ledger rows) and
+// before assign-refs, whose byRaw map is still pre-this-pass: an id absent
+// from it is arriving now (Date.now() mints its stamp); an id already
+// present is a PRE-FEATURE / previously-seen message and must never be
+// backfilled (spec §5 + #3939 philosophy: NULL means unknown, and fabricating
+// "today" for an old message would be a lie). Hydrated ids carry their stored
+// ts (column value) and merely record it here; a persisted stamp outranks any
+// carried value (single source of truth = the ledger). Values persist in
+// state.tsStamps (tokenSnapshot discipline): restarts replay byte-identical
+// tags, and the render path only ever READS the stored value — it never calls
+// Date.now() (prefix-cache invariant). Ephemeral retrieval injections never
+// consume a stamp (same exemption as ref assignment).
+// Factory (#4313 toggle, PR #5236): with `enabled` false the node is a full
+// no-op — it mints nothing, backfills nothing and never touches tsStamps,
+// keeping flag-off sessions byte-identical to pre-#4313 masters (the render
+// side gates independently in render-refs.ts).
+function createStampTimestampsNode(enabled: boolean): PipelineNode {
+  if (!enabled) return { name: "stamp-timestamps", run(io) { return io; } };
+  return {
+  name: "stamp-timestamps",
+  run(io) {
+    const stamps = { ...(io.state.tsStamps ?? {}) };
+    const knownIds = io.state.messageRefs.byRaw;
+    let changed = false;
+    const messages = io.messages.map((m) => {
+      if (!m.id || m.id.startsWith(RETRIEVED_ID_PREFIX)) return m;
+      const stamped = stamps[m.id];
+      if (stamped !== undefined) {
+        if (m.ts === stamped) return m;
+        changed = true;
+        return { ...m, ts: stamped };
+      }
+      const carried = typeof m.ts === "number" ? m.ts : undefined;
+      const ts = carried ?? (knownIds[m.id] === undefined ? Date.now() : undefined);
+      if (ts === undefined) return m;
+      stamps[m.id] = ts;
+      changed = true;
+      return { ...m, ts };
+    });
+    if (!changed) return io;
+    return { ...io, messages, state: { ...io.state, tsStamps: stamps } };
+  },
+  };
+}
 
 const assignRefsNode: PipelineNode = {
   name: "assign-refs",
@@ -1024,11 +1199,14 @@ const assignRefsNode: PipelineNode = {
       hasProtection && hasPathPatterns
         ? collectProtectedToolCallIds(io.messages, ctx.config)
         : undefined;
-    // Unrecoverable media (remote URLs / file refs with no stored bytes) ride
+    // Unrecoverable media (no stored bytes AND no re-access handle) rides
     // outside msg.text; folding one destroys it permanently with no restore
     // behind it (#1188/#2609), so those messages get a BLOCKED ref — never
-    // advertised, never folded. Archivable inline images fold like text and
-    // stay citable by their numeric ref for decompress({ imageRef }) (#2607).
+    // advertised, never folded. #5620: ref-based media (remote URL / file id)
+    // is NOT blocked — its handle rides the stored summary (media-refs.ts)
+    // and decompress restores the original. Archivable inline images fold
+    // like text and stay citable by their numeric ref for
+    // decompress({ imageRef }) (#2607).
     const protectedFn = (m: CoreMessage) =>
       hasUnrecoverableMediaPayload(m) ||
       (hasProtection
@@ -1189,6 +1367,22 @@ const hideCompressCallsNode: PipelineNode = {
   },
 };
 
+const relocateCompressCarriersNode: PipelineNode = {
+  name: "relocate-compress-carriers",
+  run(io, ctx) {
+    const cfg = ctx.config;
+    if (!cfg.compressAtFoldPoint) return io;
+    return {
+      ...io,
+      messages: relocateCompressCarriers(io.messages, io.state, {
+        isCompressTool: cfg.isCompressTool,
+        clearThinking: cfg.compressAtFoldPointClearThinking === true,
+        reasoningDroppable: cfg.reasoningDroppable,
+      }),
+    };
+  },
+};
+
 const recommendNode: PipelineNode = {
   name: "recommend",
   run(io, ctx) {
@@ -1318,6 +1512,12 @@ const nudgeNode: PipelineNode = {
           [nudge.tier]: ctx.tokenCount,
         };
       }
+      // #5698: bank the offered tier-1 mass as the compliance denominator —
+      // the first applyCompression after this fire compares its harvest
+      // against this number to detect a non-draining T1 channel.
+      if (nudge.tier === 1 && nudge.breakdown) {
+        stamped.lastT1FirePending = nudge.breakdown.pendingT1;
+      }
     }
 
     return {
@@ -1343,11 +1543,13 @@ const emergencyTruncateNode: PipelineNode = {
     // content-bound, so an edited message misses its entry and re-judges from
     // scratch; entries whose messages left the view retire; the whole latch
     // resets on the next successful fold (applyCompression).
-    const latch = io.state.emergencyTruncateLatch ?? [];
+    const storedLatch = io.state.emergencyTruncateLatch ?? [];
+    // BLOCKED is shared by protected messages, not a message identity (#5101).
+    const latch = storedLatch.filter((entry) => entry.ref !== BLOCKED_REF);
     const liveRefs = new Set<string>();
     for (const m of io.messages) {
       const ref = io.state.messageRefs.byRaw[m.id];
-      if (ref !== undefined) liveRefs.add(ref);
+      if (ref !== undefined && ref !== BLOCKED_REF) liveRefs.add(ref);
     }
     const latchLive = latch.filter((e) => liveRefs.has(e.ref));
     let messages = io.messages;
@@ -1356,7 +1558,8 @@ const emergencyTruncateNode: PipelineNode = {
       const byRef = new Map(latch.map((e) => [e.ref, e.text]));
       messages = io.messages.map((m) => {
         const ref = io.state.messageRefs.byRaw[m.id];
-        const clipped = ref !== undefined ? byRef.get(ref) : undefined;
+        const clipped =
+          ref !== undefined && ref !== BLOCKED_REF ? byRef.get(ref) : undefined;
         if (clipped === undefined || clipped === m.text) return m;
         replaySaved += Math.max(
           0,
@@ -1366,7 +1569,7 @@ const emergencyTruncateNode: PipelineNode = {
       });
     }
     if (usage < ctx.config.truncate.threshold) {
-      if (latch.length === 0 && prevStreak === 0) return io;
+      if (storedLatch.length === 0 && prevStreak === 0) return io;
       return {
         ...io,
         messages,
@@ -1435,7 +1638,11 @@ const emergencyTruncateNode: PipelineNode = {
     for (const id of trunc.truncatedIds ?? []) {
       const ref = io.state.messageRefs.byRaw[id];
       const clippedMsg = trunc.messages.find((m) => m.id === id);
-      if (ref !== undefined && clippedMsg?.text !== undefined) {
+      if (
+        ref !== undefined &&
+        ref !== BLOCKED_REF &&
+        clippedMsg?.text !== undefined
+      ) {
         clips.push({ ref, text: clippedMsg.text });
       }
     }
@@ -1485,6 +1692,11 @@ interface SingleRangeOutcome {
   /** #400: set when the range ended as an in-place refold instead of creating
    * a fresh block — the ids of the blocks updated (caller counts these, not 1). */
   refolded?: string[];
+  /** #4521: set when the range resolved legally but folded nothing (all
+   *  content already covered, or entirely inside the protected zone). The
+   *  caller counts zero blocks and records the warning instead of rejecting
+   *  the batch — an idempotent resubmit is success-shaped, not a failure. */
+  noop?: boolean;
 }
 
 function applySingleRange(input: SingleRangeInput): SingleRangeOutcome {
@@ -1502,7 +1714,26 @@ function applySingleRange(input: SingleRangeInput): SingleRangeOutcome {
     protectedMessageIds: input.protectedMessageIds,
     warnings,
   });
-  if (projection.fatal) throw projection.fatal.error;
+  if (projection.fatal) {
+    // #4521: a range that lies ENTIRELY inside the protected zone is a legal
+    // no-op, not a failure — the model aimed at the newest tail (exactly the
+    // messages it just produced) and there is nothing it may fold there.
+    // Rejecting it sent retry loops back into the same zone (live incident:
+    // four consecutive zone refusals in session 01a18a4d, 20:09). The
+    // recommendation side still demotes zone fatals to gaps, so advertised
+    // ranges never point here (#3236 unchanged).
+    if (projection.fatal.kind === "zone") {
+      const highest = highestUsedIndex(input.state.messageRefs);
+      return {
+        tokens: 0,
+        warnings: [
+          `Range ${input.spec.startRef}..${input.spec.endRef} folded nothing — it lies entirely inside the protected zone (the last ${input.config.preserveRecentMessages} messages and/or the most recent user message), which always stays visible. Nothing failed; do not resend this range. Session highest allocated ref is ${highest > 0 ? indexToRef(highest) : "none"} — target older ranges only.`,
+        ],
+        noop: true,
+      };
+    }
+    throw projection.fatal.error;
+  }
   const {
     filteredIds,
     consumedBlockIds,
@@ -1547,14 +1778,40 @@ function applySingleRange(input: SingleRangeInput): SingleRangeOutcome {
     }
     const first = consumedBlockIds[0]!;
     const last = consumedBlockIds[consumedBlockIds.length - 1]!;
-    throw new Error(
-      `Range ${input.spec.startRef}..${input.spec.endRef} contains no new compressible messages — every message in it is already covered by active block(s) ${consumedBlockIds.join(
-        ", ",
-      )}. Nothing was compressed. To rewrite or merge those blocks, reference them by block ID (${first}..${last}); otherwise run acp_status and compress a range it reports as compressible.`,
-    );
+    // #4521: full-log hosts resolve covered spans as "ok" (never classified
+    // consumed), so an idempotent resubmit of an already-folded range used to
+    // land HERE and reject the whole batch ("Batch rejected before folding any
+    // range") — the dominant retry-loop driver on pi/plugin sessions. A
+    // covered span with nothing new is a no-op success: zero blocks, zero
+    // errors, one warning that names the covering blocks and how to rewrite
+    // them if that was the intent.
+    return {
+      tokens: 0,
+      warnings: [
+        `Range ${input.spec.startRef}..${input.spec.endRef} folded nothing — every message in it is already covered by active block(s) ${consumedBlockIds.join(
+          ", ",
+        )}. Nothing failed and nothing needed redoing; do not resend this range. To rewrite or merge those blocks, reference them by block ID (${first}..${last}) instead.`,
+      ],
+      noop: true,
+    };
   }
 
-  validateCompressionRange(input, filteredIds, consumedBlockIds.length);
+  validateCompressionRange(input);
+
+  if (filteredIds.length === 0 && consumedBlockIds.length === 0) {
+    // #4521: everything in the range was dropped by content filters
+    // (protected tool pairs, media, …) with no zone hit and no consumed
+    // blocks — same idempotent no-op class as the two above, so the batch is
+    // not poisoned by it.
+    const highest = highestUsedIndex(input.state.messageRefs);
+    return {
+      tokens: 0,
+      warnings: [
+        `Range ${input.spec.startRef}..${input.spec.endRef} folded nothing — all of its content is protected or filtered (protected tool calls/results, media, or the recent-message zone), which always stays visible. Nothing failed; do not resend this range. Session highest allocated ref is ${highest > 0 ? indexToRef(highest) : "none"}.`,
+      ],
+      noop: true,
+    };
+  }
 
   let compressedTokens = 0;
   for (const id of filteredIds) {
@@ -1570,6 +1827,15 @@ function applySingleRange(input: SingleRangeInput): SingleRangeOutcome {
     }
   }
 
+  // #5620: ref-recoverable media folded here keeps its re-access handles in
+  // the stored summary — appended mechanically (never model discretion; on
+  // the wire a URL part is often invisible to the summarizer), and carried
+  // forward from consumed blocks so merges/distillations drop none.
+  const foldMediaRefs = collectFoldMediaRefs(
+    filteredIds.map((id) => input.messages.find((entry) => entry.id === id)),
+    consumedBlockIds.map((id) => blockById(input.state, id)),
+  ).map(scrubLoneSurrogates);
+
   const blockId = allocateBlockId(input.state);
   // #4316 layer 3: resolve the fold's ledger interval before constructing the
   // block. The claim is recorded only when it is EXACT — see
@@ -1583,7 +1849,7 @@ function applySingleRange(input: SingleRangeInput): SingleRangeOutcome {
     runId: input.runId,
     tier: outputTier,
     topic: input.spec.topic,
-    summary: input.spec.summary,
+    summary: appendMediaRefsSection(input.spec.summary, foldMediaRefs),
     directMessageIds: filteredIds,
     effectiveMessageIds: [...effectiveMessageIds],
     directBlockIds: [...consumedBlockIds],
@@ -1664,19 +1930,14 @@ function resolveCoverageInterval(
   return merged;
 }
 
-function validateCompressionRange(
-  input: SingleRangeInput,
-  directMessageIds: string[],
-  consumedBlockCount: number,
-): void {
+function validateCompressionRange(input: SingleRangeInput): void {
   const cfg = input.config.compress;
   validateSummaryLength(input.spec, cfg);
 
-  if (directMessageIds.length === 0 && consumedBlockCount === 0) {
-    throw new Error(
-      "Range contains no compressible messages — all are already covered by active blocks or protected.",
-    );
-  }
+  // #4521: the empty-range case (no direct messages, no consumed blocks)
+  // moved to the caller as an idempotent NO-OP outcome — see applySingleRange.
+  // Throwing here rejected whole batches for ranges that were legal but had
+  // nothing left to fold.
 }
 
 function validateSummaryLength(
@@ -1854,6 +2115,19 @@ function decideNudge(input: NudgeInput): NudgeDecision {
   const t2Pen = tiers[2]?.pending ?? 0;
   const t3Pen = tiers[3]?.pending ?? 0;
   const maxPending = Math.max(0, t1Eff, t2Pen, t3Pen);
+  // #5698: the T1 channel is PROVEN non-draining — its last fire was answered
+  // by a fold harvesting < STALL_HARVEST_RATIO of the offered pending
+  // (#5671 treadmill: nudges offering ~450K answered by 3-6K folds, forever).
+  // While set, a mass-qualified distillation tier may fire AHEAD of T1
+  // (growth band) and T1 leaves the pressure-band candidate set when a
+  // distill tier can pay the minimum benefit. The stall is an effectiveness
+  // signal on the T1 channel — consistent with #379's "mass is the need
+  // signal": it is consulted only when the distill tier's own mass ALREADY
+  // qualifies. Absent the flag (eager lanes, fresh states, tiers off)
+  // everything decides byte-identically.
+  const t1HarvestStall =
+    config.tiers.enabled && state.nudge.t1HarvestStall === true;
+  let stallEscalated = false;
   // First-sight mass bypass (#194): growthReference seeds to tokenCount when
   // no baseline exists, so a session that ARRIVES with a huge ready mass
   // (stateless full-history ingest / restored state) shows growthSinceReference
@@ -1872,8 +2146,40 @@ function decideNudge(input: NudgeInput): NudgeDecision {
     baseline === 0 &&
     usage >= config.nudge.minContextLimitPct &&
     Math.max(t1Eff, t2Pen, t3Pen) >= nudgeGrowthTokens;
+  // #5415: the #5293 abort-absorb re-anchors the growth reference to the
+  // current meter, zeroing growth on every user-aborted turn. Abort-heavy
+  // clients (85 absorbs in one 4.5h log) then never cross the floor and a
+  // huge ready mass sits idle for hours ("growth 4450 < floor 33750, ready:
+  // T1 302220"). The host banks the repeatedly-skipped MEASURED growth into
+  // state.nudge.absorbedDebt and counts the absorbs. Debt (and the drain
+  // guard below) pay ONLY once absorbCount >= 2: a SINGLE abort stays
+  // byte-identically quiet as #5293 pinned — its debt may be large (one
+  // abort after a long quiet stretch banks the whole interval) but it must
+  // not re-fire the cadence on the user's redirect. The SECOND absorb is
+  // the proof the session is abort-heavy, not redirect-polite, so the bank
+  // pays into the floor like live growth and the 209-era cadence recovers.
+  const absorbedDebt = state.nudge.absorbedDebt ?? 0;
+  const absorbCount = state.nudge.absorbCount ?? 0;
+  const repeatAbsorbs = absorbCount >= 2;
+  const payableDebt = repeatAbsorbs ? absorbedDebt : 0;
+  // Backlog-drain guard (#5415; same philosophy as the #194 first-sight
+  // bypass — the floor paces WITHIN a backlog, it must not gate draining
+  // one): when absorbs have REPEATEDLY disturbed the cadence (count >= 2),
+  // no nudge is outstanding (lastNudgeShownTokens === 0 — an ignored nudge
+  // keeps it set, so this never re-fires on an unresponsive session), and
+  // the ready mass is at least double the T1 threshold, drain now instead
+  // of idling behind the starved growth leg. Single-absorb and debt-free
+  // sessions decide byte-identically: the bypass cannot touch them.
+  const backlogDrainReady =
+    repeatAbsorbs &&
+    absorbedDebt > 0 &&
+    state.nudge.lastNudgeShownTokens === 0 &&
+    Math.max(t1Eff, t2Pen, t3Pen) >= 2 * tierThresholds[1] &&
+    usage >= config.nudge.minContextLimitPct;
   const growthReady =
-    firstSightMassReady || growthSinceReference >= growthFloor;
+    firstSightMassReady ||
+    backlogDrainReady ||
+    growthSinceReference + payableDebt >= growthFloor;
   const t2Count = tiers[2]?.targetBlocks.length ?? 0;
   const t3Count = tiers[3]?.targetBlocks.length ?? 0;
 
@@ -1893,7 +2199,14 @@ function decideNudge(input: NudgeInput): NudgeDecision {
     // the kernel would atomically reject. emergency vs over-limit only
     // changes the reason label/voice; truncate.threshold remains the
     // independent last resort when there is genuinely nothing to compress.
-    const candidates: CompressionTier[] = [1];
+    // #5698: with the T1 channel proven non-draining, max-pending would just
+    // re-select the tier that demonstrated it cannot deliver (T1 447K pending,
+    // 3-6K per nudge) — take T1 out of the running when a distill tier can pay
+    // the minimum benefit, so pressure routes to the channel that works.
+    const candidates: CompressionTier[] = [];
+    if (!(t1HarvestStall && Math.max(t2Pen, t3Pen) >= minPressureBenefit)) {
+      candidates.push(1);
+    }
     if (config.tiers.enabled) {
       candidates.push(2, 3);
     }
@@ -1910,6 +2223,7 @@ function decideNudge(input: NudgeInput): NudgeDecision {
     // resets the baselines and the same EMERGENCY nudge re-injects each turn.
     if (best !== null && bestPending >= minPressureBenefit) {
       injectedTier = best;
+      stallEscalated = t1HarvestStall && best !== 1;
       const label = emergencyOverride ? "EMERGENCY" : "OVER-LIMIT";
       injectedReason =
         best === 1
@@ -1917,10 +2231,40 @@ function decideNudge(input: NudgeInput): NudgeDecision {
           : `${label} T${best} distill: max pending ${bestPending} (T1 effective ${t1Eff}, T2 ${t2Pen}, T3 ${t3Pen}), usage ${Math.round(usage * 100)}%`;
     }
   } else if (growthReady) {
-    if (t1Eff >= tierThresholds[1]) {
+    // #5698 stall escalation: while the T1 channel is proven non-draining,
+    // a distill tier whose own mass qualifies may fire ahead of T1 — without
+    // the normal `> t1Eff` dominance requirement (the treadmill state has
+    // T1 effective 447K vs T2 112K, so dominance can never hold even though
+    // ONE distill call reclaims 91.6% of the floor). Cadence still applies.
+    if (t1HarvestStall && t3Pen >= tierThresholds[3] && t3Pen > t2Pen) {
+      const lastShown = state.nudge.lastShownByTier[3] ?? 0;
+      const cadenceMet =
+        lastShown === 0 || tokenCount - lastShown >= growthFloor;
+      if (cadenceMet) {
+        injectedTier = 3;
+        stallEscalated = true;
+        injectedReason = `T3 condense ready: ${tiers[3]!.targetBlocks.length} tier-2 blocks (${t3Pen} tokens) >= ${tierThresholds[3]}${config.nudge.tierGrowthTokens?.t3 === undefined ? " (1.5x)" : ""} and > T2 ${t2Pen}, usage ${Math.round(usage * 100)}%`;
+      }
+    }
+    if (
+      injectedTier === null &&
+      t1HarvestStall &&
+      t2Pen >= tierThresholds[2]
+    ) {
+      const lastShown = state.nudge.lastShownByTier[2] ?? 0;
+      const cadenceMet =
+        lastShown === 0 || tokenCount - lastShown >= growthFloor;
+      if (cadenceMet) {
+        injectedTier = 2;
+        stallEscalated = true;
+        injectedReason = `T2 distill ready: ${tiers[2]!.targetBlocks.length} tier-1 blocks (${t2Pen} tokens) >= ${tierThresholds[2]}${config.nudge.tierGrowthTokens?.t2 === undefined ? " (1.5x)" : ""}, usage ${Math.round(usage * 100)}%`;
+      }
+    }
+    if (injectedTier === null && t1Eff >= tierThresholds[1]) {
       injectedTier = 1;
       injectedReason = `T1 effective ${t1Eff} >= ${tierThresholds[1]}, growth ${growthSinceReference}, usage ${Math.round(usage * 100)}%`;
     } else if (
+      injectedTier === null &&
       config.tiers.enabled &&
       (t2CountReady || (t2Pen >= tierThresholds[2] && t2Pen > t1Eff))
     ) {
@@ -1934,6 +2278,7 @@ function decideNudge(input: NudgeInput): NudgeDecision {
           : `T2 distill ready: ${tiers[2]!.targetBlocks.length} tier-1 blocks (${t2Pen} tokens) >= ${tierThresholds[2]}${config.nudge.tierGrowthTokens?.t2 === undefined ? " (1.5x)" : ""} and > T1 effective ${t1Eff}, usage ${Math.round(usage * 100)}%`;
       }
     } else if (
+      injectedTier === null &&
       config.tiers.enabled &&
       (t3CountReady ||
         (t3Pen >= tierThresholds[3] && t3Pen > t2Pen && t3Pen > t1Eff))
@@ -1953,6 +2298,9 @@ function decideNudge(input: NudgeInput): NudgeDecision {
   const shouldInject = injectedTier !== null;
   if (shouldInject && firstSightMassReady) {
     injectedReason += " [first-sight mass]";
+  }
+  if (shouldInject && stallEscalated) {
+    injectedReason += " [T1 harvest stall]";
   }
 
   let reason: string;
@@ -2011,7 +2359,13 @@ function decideNudge(input: NudgeInput): NudgeDecision {
     if (pendingShort)
       parts.push(`max compressible ${maxPending} < threshold ${minTierThreshold}`);
     if (growthShort)
-      parts.push(`growth ${growthSinceReference} < floor ${growthFloor}`);
+      parts.push(
+        absorbedDebt > 0 && !repeatAbsorbs
+          ? `growth ${growthSinceReference} + absorbed ${absorbedDebt} held (single abort, #5293) < floor ${growthFloor}`
+          : payableDebt > 0
+            ? `growth ${growthSinceReference} + absorbed ${absorbedDebt} across ${absorbCount} aborts < floor ${growthFloor}`
+            : `growth ${growthSinceReference} < floor ${growthFloor}`,
+      );
     if (parts.length === 0)
       parts.push(
         `max compressible ${maxPending}, growth ${growthSinceReference}`,
@@ -2097,6 +2451,10 @@ function cloneState(state: CompressionState): CompressionState {
       byRef: { ...state.messageRefs.byRef },
     },
     tokenSnapshot: { ...(state.tokenSnapshot ?? {}) },
+    // #4313: first-sight time stamps ride every clone — dropping them here
+    // loses the block coverage window (and re-arm nothing: already-refed ids
+    // are never re-minted, so the loss would be silent).
+    tsStamps: state.tsStamps ? { ...state.tsStamps } : undefined,
     nudge: { ...state.nudge, anchors: { ...state.nudge.anchors } },
     stats: { ...state.stats },
     absorbed: (state.absorbed ?? []).map((record) => ({ ...record })),
@@ -2114,6 +2472,10 @@ function cloneState(state: CompressionState): CompressionState {
     pendingOrphanSweepMinRef: state.pendingOrphanSweepMinRef,
     deadRefs: state.deadRefs ? [...state.deadRefs] : undefined,
     lastPassIds: state.lastPassIds ? [...state.lastPassIds] : undefined,
+    // #4797: the one-time ledger-alignment gate must survive the fold clone
+    // too — same contract as the sync clone (kernel/src/sync.ts); dropping it
+    // re-arms the restamp on every applyCompression.
+    refLedgerAligned: state.refLedgerAligned,
   };
 }
 

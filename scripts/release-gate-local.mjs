@@ -58,8 +58,9 @@
 //                         corpus mass leaves the turn viable)
 //
 // Exit code 0 = every ran lane green. Non-zero = at least one red assertion.
-// Evidence (proxy.log, per-turn ndjson, config, corpus) stays in the scratch
-// dir on failure.
+// Evidence (bili.log — the logger's own file; proxy.log keeps only the
+// startup head since #5089 muted the stderr tee — plus per-turn ndjson,
+// config, corpus) stays in the scratch dir on failure.
 
 import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
@@ -251,6 +252,18 @@ async function main() {
   const port = await freePort();
   const profileDir = path.join(baseDir, "dsh-home", "profiles", "gate");
   const proxyLog = path.join(baseDir, "proxy.log");
+  // Evidence channel: bili tees every log line to $XDG_STATE_HOME/billion-
+  // context/bili.log AND (historically) to the captured stderr stream above.
+  // Since master's #5012 the stderr leg mutes itself once the log file proves
+  // live on an undrained pipe — exactly this harness's spawn shape — so
+  // post-boot lines live ONLY in bili.log. Every assertion below greps the
+  // evidence file through mark()/slice(); the channel is decided ONCE on
+  // first use (sticky): bili.log is append-only and never legitimately
+  // disappears mid-run, so re-resolving per call could splice byte offsets
+  // across two different files if either file appeared or vanished late.
+  const biliLog = path.join(baseDir, "xdg", "state", "billion-context", "bili.log");
+  let evidenceChannel = null;
+  const evidenceFile = () => (evidenceChannel ??= fs.existsSync(biliLog) ? biliLog : proxyLog);
   const biliConfig = path.join(baseDir, "bili.json");
 
   const childEnv = {
@@ -266,6 +279,12 @@ async function main() {
     // (observed: latest=<old candidate> for >60s after this round's publish,
     // long enough to fail Lane U's up-to-date assertion inside the 240s poll).
     NPM_CONFIG_CACHE: path.join(baseDir, "npm-cache"),
+    // Pin the log-file channel: an operator-set ACP_LOG_FILE would steer
+    // bili.log out of this scratch tree while the stderr tee still mutes
+    // (the file leg proves live elsewhere) — post-boot assertions would then
+    // red off an empty proxy.log fallback. Empty string resolves to the
+    // default XDG path above (set-but-empty falls back to config/default).
+    ACP_LOG_FILE: "",
     BILI_PROVIDER_REWRITES: "",
     PI_PROVIDER: "",
     BILI_GATE_KEY: "gate-local",
@@ -370,8 +389,13 @@ async function main() {
   fs.writeFileSync(path.join(baseDir, "work", "corpus.md"), buildCorpus(G.corpusTokens));
 
   const ctx = { workDir: path.join(baseDir, "work"), childEnv, proxyLog, port, profileEntry, sessionId: null };
-  const mark = () => fs.statSync(proxyLog).size;
-  const slice = (from, to) => fs.readFileSync(proxyLog, "utf8").slice(from, to ?? undefined);
+  const mark = () => fs.statSync(evidenceFile()).size;
+  const slice = (from, to) => { const f = evidenceFile(); if (f !== proxyLog && !fs.existsSync(f)) throw new Error(`evidence log ${f} vanished`); return fs.readFileSync(f, "utf8").slice(from, to ?? undefined); };
+  // #5524 (folded in from the sibling PR): a startup failure must say WHICH
+  // file(s) hold the evidence — bili.log present means check both, absent
+  // means the logger died before opening its file.
+  const proxyFailHint = (what) =>
+    `${what} — see ${proxyLog}${fs.existsSync(biliLog) ? ` and ${biliLog}` : ` (${biliLog} never appeared — the logger failed before opening its file)`}`;
 
   async function turn(prompt, label) {
     const r = spawnSync(
@@ -399,15 +423,21 @@ async function main() {
 
   // ---- 3. proxy up ----------------------------------------------------------
   log(`starting profile proxy on 127.0.0.1:${port} …`);
-  if (!(await startProxy(ctx))) throw new Error(`proxy did not come up — see ${proxyLog}`);
+  if (!(await startProxy(ctx))) throw new Error(proxyFailHint("proxy did not come up"));
+  if (!fs.existsSync(biliLog)) warn("bili.log missing after proxy boot — evidence falls back to proxy.log; post-boot assertions may red because the stderr tee mutes itself (#5012)");
 
   try {
     // ================= Lane A: compression =================================
     if (!G.skip.includes("a")) {
       log(`\n-- Lane A: fold + post-fold continuity (${G.sglangModel}; window shrunk ${G.bigWindow} → ${G.smallWindow} mid-session)`);
       // T1 at the real window: read + answer, no fold expected (all fresh).
+      // dsh's read elides the MIDDLE of any result over ~8KB (head+tail kept):
+      // a single 90KB/441-line corpus read loses lines ~41–400 — S07 (line ~71)
+      // was never delivered and the t2 payload stayed under the fold threshold
+      // (#4288 then rightly skips folding). Force chunked reads so the whole
+      // corpus actually enters history (35 lines ≈ 7KB < the elision budget).
       const m1 = mark();
-      const t1 = await turn("Read corpus.md in your cwd fully, then reply with ONLY the TITLE line of section S40.", "t1");
+      const t1 = await turn(`Read corpus.md in your cwd fully. The read tool elides the middle of any large result — the file is 441 lines / ~90KB, so read it in EXACTLY these 13 chunks, one read call each, in order: offsets 1, 36, 71, 106, 141, 176, 211, 246, 281, 316, 351, 386, 421 with limit 35 each. After all 13 reads are done, reply with ONLY the TITLE line of section S40.`, "t1");
       ctx.sessionId = ctx.sessionId || t1.sessionId;
       record("A", "turn 1 (read @ real window) completes", t1.ok, t1.ok ? "" : t1.why.slice(0, 160));
       const s1 = slice(m1);
@@ -419,7 +449,7 @@ async function main() {
       // the ~12.3k effective window with corpus now old enough to fold.
       biliConfigFor(G.smallWindow);
       await killProxy();
-      if (!(await startProxy(ctx))) throw new Error(`proxy restart failed — see ${proxyLog}`);
+      if (!(await startProxy(ctx))) throw new Error(proxyFailHint("proxy restart failed"));
 
       const m2 = mark();
       const t2 = await turn("Without reading any file again, and WITHOUT calling any tool (no search_context, no file reads, no commands — tool use invalidates the measurement): reply with ONLY the TITLE line of section S07.", "t2");
@@ -456,14 +486,18 @@ async function main() {
       // also proves folded state survives a proxy restart.
       fs.writeFileSync(path.join(profileDir, "cordis.patch.yml"), cordisFor("zhipuai", G.relayModel));
       await killProxy();
-      if (!(await startProxy(ctx))) throw new Error(`proxy restart failed — see ${proxyLog}`);
+      if (!(await startProxy(ctx))) throw new Error(proxyFailHint("proxy restart failed"));
 
       const m3 = mark();
       const t3 = await turn("Without reading any file again, and WITHOUT calling any tool (no search_context, no file reads, no commands — tool use invalidates the measurement): reply with the TITLE lines of section S07 and section S40, one per line, then the word DONE.", "t3");
       const s3 = slice(m3);
       const pfa3 = /\[sess=(pfa-[0-9a-f]+)\]/.exec(s3)?.[1];
       const forked = pfa3 && pfa3 !== pfaPre && s3.includes(`lineage=forked of ${pfaPre}`);
-      const adopted = /\[fork-adoption\] fork of .*: parent has \d+ adoptable block/.test(s3);
+      // Either the fork adopts the parent's blocks, or it takes the designed
+      // fresh-start path: "no fully-present blocks to adopt … starting fresh;
+      // lineage linked …" (#629/#3925) — the lineage link alone preserves the
+      // folded context via the startup sweep.
+      const adopted = /\[fork-adoption\] fork of [^:]+: (?:parent has \d+ adoptable block|no fully-present blocks to adopt .*starting fresh; lineage linked)/.test(s3);
       record("B", "switch turn completes", t3.ok, t3.ok ? "" : t3.why.slice(0, 160));
       // Same lineage across the switch: either the session continues on the
       // same pfa, or dsh's resume-replay forks it and the fork machinery
@@ -472,8 +506,11 @@ async function main() {
       record("B", "same lineage across switch + proxy restart", (!!pfaPre && pfa3 === pfaPre) || (forked && adopted), forked ? `${pfaPre} -> ${pfa3} (forked + adopted)` : `${pfaPre} -> ${pfa3}`);
       // If a usage-baseline measured on the OLD upstream gets cited while
       // routing to the NEW one, it must be demoted to untrusted (#2283/#2867).
-      // (A forked lineage may have no baseline at all — that's fine.)
-      const noBaseline = !/usage-baseline/.test(s3);
+      // (A forked lineage may have no baseline at all — that's fine, and a
+      // fork legitimately prints "usage-baseline=none"; the old
+      // !/usage-baseline/ pattern matched THAT line and red-flagged a healthy
+      // fork. Only a cited NUMERIC baseline needs the demotion check.)
+      const noBaseline = !/usage-baseline=\d/.test(s3);
       record("B", "cross-upstream baseline demoted when cited", noBaseline || /demoting to untrusted/.test(s3), noBaseline ? "no baseline cited this run" : "demoting to untrusted");
       record("B", "both markers recalled after switch", has(t3.final, CODEWORDS[6]) && has(t3.final, CODEWORDS[39]), `final="${t3.final.trim().slice(0, 90)}"`);
       record("B", `request routed to ${G.relayModel}`, s3.includes(G.relayUrl) || s3.includes(G.relayModel), "");
