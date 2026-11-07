@@ -64,6 +64,7 @@ import { dshContextTabEnabled, dshContextTabLabel, limitsDecodedBytes } from "..
 import { MIN_ASSUMED_WINDOW_TOKENS } from "../util.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, singleFlight } from "./native-bootstrap.js";
 import { bodyProvablyOverWindow as sharedBodyProvablyOverWindow, installNativeFetchIntercept, liveStateSlotEffect, noteRoutedOrigin, observeRoutedOrigin, routedBiliModelUrl, type GateVerdict, type NativeInterceptState } from "./native-intercept.js";
+import { runOutsideFetchChain } from "./fetch-chain/index.js";
 import { asciiHeaderValue, fetchManifest, fetchProxyVersion, fetchStatus, fetchStatusLatest, forwardTool, reportAttributionHealth, reportRuntimeInfo, waitForProxyVersion, type ManifestTool } from "./shared.js";
 import { createForkAdopter, sideShapedBody } from "./fork-adopt.js";
 import { clearIncrementalProbe, createPrepareDirectSend, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalRejection, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, rememberOriginalBody, sweepStale, wireMessagesLookAnthropic, type IncrementalWireMessage } from "./incremental-client.js";
@@ -1217,15 +1218,25 @@ function pfSlotIdsOf(messages: unknown): string[] | undefined {
     return out;
 }
 
+/** #5614: a model operation must begin OUTSIDE any earlier transport fetch's
+ *  re-entry scope (the dispatchDepth/chainHop stores), or its first request
+ *  looks like mid-descent re-entry and skips the compression entry — see
+ *  runOutsideFetchChain. Re-enter our sid/msgIds scope INSIDE that cleared
+ *  boundary so session attribution and host id capture ride along unchanged. */
+function runLlmDispatch<R>(scope: LlmDispatchScope, operation: () => R): R {
+    return runOutsideFetchChain(() => dispatchScope.run(scope, operation));
+}
+
 /** Re-enter the dispatch scope on every iterator advance: generator bodies
  *  resume in the consumer's dynamic context, so each `next()` must run the
  *  adapter's continuation (its awaits, and any fetches it starts) inside the
- *  same scope the dispatch carried. */
+ *  same scope the dispatch carried. Each boundary also clears the inherited
+ *  fetch-chain re-entry state (#5614) via runLlmDispatch. */
 function wrapScopedIterable<T>(iter: AsyncIterable<T>, scope: LlmDispatchScope): AsyncIterable<T> {
     return {
         [Symbol.asyncIterator]: () => {
-            const it = iter[Symbol.asyncIterator]();
-            const run = <R>(op: () => Promise<R>): Promise<R> => dispatchScope.run(scope, op);
+            const it = runLlmDispatch(scope, () => iter[Symbol.asyncIterator]());
+            const run = <R>(op: () => Promise<R>): Promise<R> => runLlmDispatch(scope, op);
             return {
                 next: () => run(() => it.next()),
                 return: (value?: unknown) => run(() => it.return !== undefined ? it.return(value as never) : Promise.resolve({ done: true, value: value as T })),
@@ -2021,9 +2032,12 @@ export function apply(ctx: PluginContext): void {
                 // adapter — never ride a stale one.
                 pfChannel.pfCaptureIds(sid, pfSlotIdsOf(options?.messages));
                 // next() may start the adapter's fetch eagerly (inside this
-                // call), and lazy continuations resume on each advance — the
-                // run() below covers the former, wrapScopedIterable the latter.
-                return dispatchScope.run(scope, () => wrapScopedIterable(next(), scope));
+                // call), and lazy continuations resume on each advance —
+                // runLlmDispatch covers the former, wrapScopedIterable the
+                // latter; each also clears inherited fetch-chain re-entry
+                // state so a new operation never looks like mid-descent
+                // re-entry (#5614).
+                return runLlmDispatch(scope, () => wrapScopedIterable(next(), scope));
             });
         });
     }
