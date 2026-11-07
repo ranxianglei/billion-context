@@ -122,6 +122,108 @@ test("extractPlanState: bounded to the last 40 messages", () => {
     assert.ok(st!.terms.has("kubernetes"), "in-window user turn term present");
 });
 
+// ===================== #5047: status-aware plan signal + explicit-query protection =====================
+// Pre-#5047 the extractor tokenized the ENTIRE latest planning snapshot, so a
+// task's status (stopworded) never changed the extracted terms and repeated
+// completed descriptions could dominate the single active task. #5047 makes a
+// recognized complete TodoWrite/todowrite snapshot contribute only its ACTIVE
+// tier (in_progress, else pending) and lets a discriminating explicit query
+// outrank plan-only affinity.
+
+function foldTwoBlocks(): Folded {
+    const core = createCore();
+    const config = applyCompressSettings(defaultConfig(200_000), 200_000, { absorb: { enabled: true, minToolTokens: 50 }, ccr: { enabled: true, minToolTokens: 50 } }) as Config;
+    const session = getSession(`sp5047-${Math.random().toString(36).slice(2)}`);
+    storeEffectiveCcr(session, { enabled: true, minToolTokens: 50 });
+    const turn = core.processTurn({ messages: makeMsgs(40), state: session.state, config, tokenCount: 9999, renderTags: "text-only" });
+    session.state = turn.state;
+    const ctx = { core, config, messages: turn.messages, session, log: () => {} };
+    applyRanges(parseCompressInput({
+        content: [
+            { startId: "m00001", endId: "m00005", summary: "Authentication history: how login token issuance and validation were built.", topic: "token authentication history" },
+            { startId: "m00006", endId: "m00010", summary: "Ratelimit history: rate limiting middleware added to the token endpoints.", topic: "token ratelimit history" },
+        ],
+    }), ctx);
+    assert.equal(session.state.blocks.filter((b) => b.active).length, 2, "two blocks created");
+    return { core, config, session, msgs: turn.messages };
+}
+
+function todoOnly(todos: Array<Record<string, string>>): CoreMessage[] {
+    return [{ id: "t_plan", role: "assistant", contentType: "tool-call", toolName: "TodoWrite", text: JSON.stringify({ todos }) }];
+}
+
+function optsFor(f: Folded, msgs: CoreMessage[], logs: string[]) {
+    return { messages: msgs, session: f.session, log: (m: string) => logs.push(m), protectedPatterns: f.config.protectedLatestTools };
+}
+
+test("#5047 extractPlanState: recognized snapshot contributes only its active tier", () => {
+    const st = extractPlanState(todoOnly([
+        { content: "zebra stripes migration", status: "completed" },
+        { content: "giraffe feed rollout", status: "in_progress" },
+        { content: "ox herd expansion", status: "pending" },
+    ]));
+    assert.ok(st, "plan state extracted");
+    assert.ok(st!.terms.has("giraffe"), "in_progress description kept");
+    assert.ok(!st!.terms.has("zebra"), "completed description dropped");
+    assert.ok(!st!.terms.has("ox"), "pending description dropped while something is in progress");
+});
+
+test("#5047 extractPlanState: pending tier used when nothing is in progress", () => {
+    const st = extractPlanState(todoOnly([
+        { content: "hyena pack survey", status: "pending" },
+        { content: "impala fence repair", status: "completed" },
+    ]));
+    assert.ok(st, "plan state extracted");
+    assert.ok(st!.terms.has("hyena"), "pending description kept");
+    assert.ok(!st!.terms.has("impala"), "completed description dropped");
+});
+
+test("#5047 extractPlanState: fully terminal snapshot contributes no plan signal", () => {
+    const st = extractPlanState(todoOnly([
+        { content: "lion pride census", status: "completed" },
+        { content: "rhino horn audit", status: "cancelled" },
+    ]));
+    assert.equal(st, null, "all-terminal snapshot + no user turn → no usable plan state");
+});
+
+test("#5047 extractPlanState: unrecognized shapes keep the legacy whole-text fallback", () => {
+    const trunc = extractPlanState([{ id: "t1", role: "assistant", contentType: "tool-call", toolName: "TodoWrite", text: '{"todos":[{"content":"kubernetes upgrade",' }]);
+    assert.ok(trunc && trunc.terms.has("kubernetes"), "invalid JSON falls back to whole-text tokenization");
+    const foreign = extractPlanState(todoOnly([{ content: "wolf den rebuild", status: "on_hold" }]));
+    assert.ok(foreign && foreign.terms.has("wolf"), "unknown status → not a recognized snapshot → whole-text");
+    const missing = extractPlanState(todoOnly([{ content: "camel caravan route" }]));
+    assert.ok(missing && missing.terms.has("camel"), "missing status → whole-text");
+});
+
+test("#5047 extractPlanState: oversized active description is char-capped, not dropped", () => {
+    const big = "elephant tusk inventory ".repeat(200);
+    const st = extractPlanState(todoOnly([{ content: big, status: "in_progress" }]));
+    assert.ok(st, "plan state extracted despite size");
+    assert.ok(st!.terms.has("elephant"), "leading terms survive the cap");
+});
+
+test("#5047 status-swap flips retrieval (the reported repro)", () => {
+    const f = foldTwoBlocks();
+    const a = executeSearchContext({ query: "token", limit: 1 }, f.core, f.session.state, undefined,
+        optsFor(f, todoOnly([{ content: "authentication", status: "completed" }, { content: "ratelimit", status: "in_progress" }]), [])).text;
+    assert.match(a, /Found 1 block\(s\) for "token"/);
+    assert.ok(a.includes('"token ratelimit history"'), "active task's block returned for the ambiguous query");
+    assert.ok(!a.includes('"token authentication history"'), "completed task's block displaced");
+    const b = executeSearchContext({ query: "token", limit: 1 }, f.core, f.session.state, undefined,
+        optsFor(f, todoOnly([{ content: "authentication", status: "in_progress" }, { content: "ratelimit", status: "completed" }]), [])).text;
+    assert.ok(b.includes('"token authentication history"'), "swapping statuses flips the winner");
+    assert.ok(!b.includes('"token ratelimit history"'), "previous winner displaced after the swap");
+});
+
+test("#5047 explicit historical query outranks a less-relevant active task", () => {
+    const f = foldTwoBlocks();
+    const logs: string[] = [];
+    const r = executeSearchContext({ query: "authentication", limit: 1 }, f.core, f.session.state, undefined,
+        optsFor(f, todoOnly([{ content: "authentication", status: "completed" }, { content: "ratelimit", status: "in_progress" }]), logs)).text;
+    assert.ok(r.includes('"token authentication history"'), "explicit discriminating query returns its own block first");
+    assert.ok(!r.includes('"token ratelimit history"'), "plan-active block does not displace an explicit hit");
+});
+
 test("byte-identical output when plan state is absent or the pool fits the limit", () => {
     const f = foldBlocks(true);
     const base = executeSearchContext({ query: "token" }, f.core, f.session.state).text;
