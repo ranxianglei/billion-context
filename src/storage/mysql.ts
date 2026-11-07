@@ -692,16 +692,22 @@ export class MysqlBackend implements StorageBackend {
                         // #4390 historian sweep: retire, don't delete —
                         // TEXT CAS refs stay owned by the retired row; MEDIA
                         // refs release (#4506 — same rationale as sqlite twin).
-                        await c.query(
-                            "UPDATE messages SET retired_at = ? WHERE session_id = ? AND seq = ? AND retired_at IS NULL",
-                            [Date.now(), s.sessionId, num(row.seq)],
-                        );
-                        const retiredMedia = (await c.query(
-                            "SELECT media_hash FROM message_media WHERE session_id = ? AND seq = ?",
-                            [s.sessionId, num(row.seq)],
-                        )) as unknown as Row[][];
-                        await c.query("DELETE FROM message_media WHERE session_id = ? AND seq = ?", [s.sessionId, num(row.seq)]);
-                        for (const rm of retiredMedia[0]) await this.releaseContent(c, String(rm.media_hash));
+                        // #5756 (mirror of the sqlite lane): already-retired
+                        // rows are pure bookkeeping — readers check
+                        // NULL/non-NULL only, so skip the re-stamp and the
+                        // media re-sweep; first retirement does the full work.
+                        if (row.retired_at === null || row.retired_at === undefined) {
+                            await c.query(
+                                "UPDATE messages SET retired_at = ? WHERE session_id = ? AND seq = ? AND retired_at IS NULL",
+                                [Date.now(), s.sessionId, num(row.seq)],
+                            );
+                            const retiredMedia = (await c.query(
+                                "SELECT media_hash FROM message_media WHERE session_id = ? AND seq = ?",
+                                [s.sessionId, num(row.seq)],
+                            )) as unknown as Row[][];
+                            await c.query("DELETE FROM message_media WHERE session_id = ? AND seq = ?", [s.sessionId, num(row.seq)]);
+                            for (const rm of retiredMedia[0]) await this.releaseContent(c, String(rm.media_hash));
+                        }
                     }
                 }
             }
