@@ -153,10 +153,10 @@ entries:
     group: upstream
     id: tt.mcl2
     site_group: up
-    desc_en: "Legacy global window ceiling (highest-priority window source and usage denominator); prefer compress.modelContextLimit."
-    desc_zh: "旧版全局窗口上限（窗口来源中优先级最高，兼作使用率分母）；建议改用 compress.modelContextLimit。"
-    site_en: "<code>modelContextLimit</code> — legacy global window ceiling (default 200000); prefer compress.modelContextLimit."
-    site_zh: "<code>modelContextLimit</code> —— 旧版全局窗口上限（默认 200000）；建议改用 compress.modelContextLimit。"
+    desc_en: "Legacy global DEFAULT window (last-resort fallback in the window ladder: consulted only when no tier evidence, plugin/launcher report, per-route declaration, registry lookup, or built-in table resolves a limit for the model; also the usage-ratio denominator wherever it wins); prefer compress.modelContextLimit."
+    desc_zh: "旧版全局默认窗口（窗口解析阶梯的最后一层兜底：仅当 tier 证据、plugin/launcher 报告、路由声明、注册表查询、内置表都未解析出该模型的上限时才使用；在其生效的会话里兼作使用率分母）；建议改用 compress.modelContextLimit。"
+    site_en: "<code>modelContextLimit</code> — legacy global DEFAULT window (default 200000): last-resort fallback when no other source resolves a limit for the model; does NOT cap a natively-resolved window (#5908); prefer compress.modelContextLimit."
+    site_zh: "<code>modelContextLimit</code> —— 旧版全局默认窗口（默认 200000）：窗口解析的最后一层兜底，其他来源都未解析出该模型上限时才生效；不会封顶已按原生解析出的窗口（#5908）；建议改用 compress.modelContextLimit。"
   - key: imageBilling
     type: "\"auto\" | \"pixels\" | \"bytes\""
     default: "auto (resolves to pixels)"
