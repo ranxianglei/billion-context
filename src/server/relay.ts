@@ -909,7 +909,7 @@ async function forwardCaptured(
     // #4204: account-wide holds stay origin+credential scoped. KeyRing's
     // request-matched model-temporarily-unavailable error gets a separate
     // origin+credential+model hold so unrelated models remain eligible.
-    const throttleModel = throttleModelHint ?? (typeof prepared?.model === "string" ? prepared.model : requestModelFromBody(wireBody));
+    const throttleModel = throttleModelHint ?? (typeof prepared?.model === "string" ? prepared.model : requestModelFromBody(wireBody, req));
     let throttleProbeToken: symbol | undefined;
     if (req.method !== "GET" && req.method !== "HEAD") {
         const throttleGate = upstreamThrottleGate(upstreamUrl, headers, Date.now(), throttleModel);
