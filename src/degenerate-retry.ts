@@ -39,9 +39,14 @@ function releaseThrottleErrorReader(reader: ReadableStreamDefaultReader<Uint8Arr
 // Wording covers BOTH retry shapes: the empty-turn shape (#732/#821) and the
 // draft-tail shape (#2303, visible prose ending in a compression-draft closing
 // tag) — both are "ended without a tool call", and both need the same push:
-// issue the pending action or state the final answer explicitly.
+// produce the turn's actual output, whichever form it takes. The wording is
+// deliberately neutral: it must NOT steer the model toward calling a tool it
+// never planned (the old "issue the tool call you were about to make" presumed
+// an agentic lane) nor toward wrapping up early ("state your final answer"
+// read as an instruction to conclude the task) — the earlier phrasing did
+// both, and on long degenerate sessions it pushed the model the wrong way.
 export const DEGENERATE_RETRY_NUDGE =
-    "[billion-context] Your previous response ended without a tool call. Continue now: take your next concrete action — issue the tool call you were about to make, or state your final answer explicitly.";
+    "[billion-context] Your previous response produced no visible output. Continue now: send your actual response for this turn — the tool call you intended, or your reply text to the user.";
 
 /** The retry body: the forwarded body with the continuation nudge appended as a
  *  trailing user turn. Null when the body cannot carry one. */

@@ -297,6 +297,7 @@ function makeCtx(id: string, protocol: "responses" | "openai" = "openai") {
     return {
         core: createCore(),
         config: { modelContextLimit: 200000 } as Config,
+        degenerateRetry: true,
         messages: [] as CoreMessage[],
         session: {
             id,
@@ -372,7 +373,7 @@ test("#2303 loop: draft-tail terminal turn → one invisible retry with the cont
     assert.equal(fetchCalls, 1, "re-request + exactly one draft-tail auto-retry");
     assert.ok(bodies.length >= 1, "retry request observed");
     assert.ok(
-        bodies[0]!.includes("ended without a tool call"),
+        bodies[0]!.includes("produced no visible output"),
         "the retry body carries the ephemeral continuation nudge",
     );
     // Single-line fragments: inside the SSE frames the draft's newlines are

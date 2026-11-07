@@ -238,7 +238,7 @@ test("the continuation retry body carries the nudge as a trailing user turn", ()
     assert.equal(merged.messages[0]!.role, "user");
     assert.ok(merged.messages[0]!.content.startsWith("hi"), "the original text is preserved");
     assert.ok(
-        merged.messages[0]!.content.includes("ended without a tool call"),
+        merged.messages[0]!.content.includes("produced no visible output"),
         `the nudge text is appended, got: ${merged.messages[0]!.content}`,
     );
 
