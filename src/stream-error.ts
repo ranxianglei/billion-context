@@ -180,6 +180,11 @@ export interface TruncationDiag {
     unparseableForwarded: number;
     /** Sum of decoded upstream bytes across the whole stream. */
     bytes: number;
+    /** #4634: calibrated local estimate of the truncated request's billed input
+     *  tokens — present when the usage chunk never arrived, so the prepare-phase
+     *  estimate is still pending: exactly the case where the provider bills the
+     *  request but bili records no usage for it. */
+    outboundEstimateTokens?: number;
     /** Last ≤5 parsed event labels, oldest first (wire-native `type`, or a
      *  synthesized `chunk`/`chunk:finish=<r>` for wires without one). */
     lastEventTypes: string[];
