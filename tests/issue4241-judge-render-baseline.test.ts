@@ -250,14 +250,22 @@ test("#4241: render turn with a host-side history edit — judge reconciles agai
             }
 
             // teeth: same shape, but the outbound DROPS the last client tail
-            // row (exitCores.length - 2: the engine appends its trailing nudge
-            // as the final wire message, so the last tail row sits one before
-            // it) — the part the render lane owns byte-intact. The rendered
+            // row — the part the render lane owns byte-intact. The rendered
             // PREFIX is exempt by design (#4241: cross-turn prefix stability
             // is seamLcp's/shadow's job); the tail drop must fire.
-            _setInvariantJudgeFaultForTest((exitCores: CoreMessage[]) => exitCores.filter((_, i) => i !== exitCores.length - 2));
+            // Target the drop by content marker, not position: the old
+            // length-2 offset assumed the engine appends a trailing nudge as
+            // the final wire message, which is no longer guaranteed (the
+            // sample-only pressure hold defers estimate-driven nudges on
+            // non-reporting sessions).
+            const tailB = "TAIL_B_".repeat(80);
+            _setInvariantJudgeFaultForTest((exitCores: CoreMessage[]) => {
+                const idx = exitCores.findIndex((m) => textOf(m).includes(tailB));
+                if (idx < 0) throw new Error("teeth: TAIL_B row not found in exit cores");
+                return exitCores.filter((_, i) => i !== idx);
+            });
             verdicts.length = 0;
-            const r3 = await turn(h, [...full2, { role: "user", content: "And one more. " + "TAIL_B_".repeat(80) }], label, null);
+            const r3 = await turn(h, [...full2, { role: "user", content: "And one more. " + tailB }], label, null);
             assert.equal(r3.status, 200, r3.body);
             _setInvariantJudgeFaultForTest(null);
             const main3 = verdicts.filter((v) => v.lane === "main");
