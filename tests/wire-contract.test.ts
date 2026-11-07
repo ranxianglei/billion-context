@@ -265,6 +265,10 @@ test("wire-contract ledger: every rule has a live enforcement clause", () => {
             { input: [{ type: "configuration_update", reasoning: { effort: "medium" } }, { type: "configuration_update", reasoning: { effort: "high" } }] },
             { model: "m", input: [], reasoning: { effort: "high", summary: "auto" } },
             { input: [{ role: "user", content: "u" }, { role: "system", content: "s" }] },
+            // WC-024: the #5670 shape — an output whose call was dropped before the wire boundary.
+            { input: [{ type: "tool_search_output", call_id: "call_00_gone" }] },
+            // WC-025: the #5670 I1 shape — a mid-history call whose output was dropped before the wire boundary.
+            { input: [{ type: "function_call", id: "fc-1", call_id: "c-orphan", name: "f", arguments: "{}" }, { type: "message", role: "user", content: "next" }] },
         ],
         google: [
             { tools: [{ functionDeclarations: [{ name: "bad-name", parameters: { type: "object", properties: {} } }] }] },

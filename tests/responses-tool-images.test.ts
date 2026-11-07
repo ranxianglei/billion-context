@@ -80,8 +80,18 @@ test("Responses rebuild patches tool text without losing images, metadata, or fo
         const expected = [{ ...body.input[0], output: [{ ...output[0], text: updated[0].text }, output[1], { ...output[2], text: "" }, output[3]] }];
         assert.deepEqual(patchResponsesInput(projection, updated), expected);
         assert.deepEqual(coreToResponses(updated, projection.customToolCallIds), expected);
-        for (const layout of [projection, undefined]) {
-            const request = createResponsesAdapter(false, layout).buildRequest(updated, "instructions", body);
+        // #5670: the wire boundary now drops outputs whose call is absent from the outbound
+        // array (fail-closed), so exercise the adapter rebuild on a well-formed pair.
+        const callItem = type === "function_call_output"
+            ? { type: "function_call", call_id: "screenshot-call", name: "screenshot", arguments: "{}" }
+            : { type: "custom_tool_call", call_id: "screenshot-call", input: "" };
+        const pairedBody = { input: [callItem, structuredClone(body.input[0])] as ResponseInputItem[] };
+        const pairedProjection = responsesToCore(pairedBody);
+        const outIdx = pairedProjection.msgs.findIndex((m) => (m as unknown as { rawResponsesItem?: { type?: string } }).rawResponsesItem?.type === type);
+        assert.ok(outIdx >= 0, "projected pair must contain the output message");
+        const pairedUpdated = pairedProjection.msgs.map((m, i) => i === outIdx ? { ...m, text: "updated screenshot explanation" } : m);
+        for (const layout of [pairedProjection, undefined]) {
+            const request = createResponsesAdapter(false, layout).buildRequest(pairedUpdated, "instructions", pairedBody);
             const rebuilt = (request.input as ResponseInputItem[]).filter((item) => item.type === type);
             assert.deepEqual(rebuilt, expected);
         }
