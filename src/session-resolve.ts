@@ -81,7 +81,7 @@ import { createHash } from "node:crypto";
 // never lets a shallow side request clobber a deeper persisted entry.
 import { prefixAffinity } from "./prefix-affinity.js";
 import { isClaudeLaneToken } from "./claude-lane-token.js";
-import { neutralTurns, type NeutralTurn } from "./affinity-neutral.js";
+import { neutralTurns, neutralTurnCanonical, type NeutralTurn } from "./affinity-neutral.js";
 import { log as loggerLog } from "./logger.js";
 // #3397: skeleton persistence hook (deferred-use ESM cycle with
 // src/order-persist.ts — each side calls the other only inside function
@@ -210,13 +210,23 @@ export type SessionOrderResolution = {
     reason?: string;
 };
 
-type Recorded = { kinds: string[]; frags: string[]; tagHash: string; model?: string; lastSeen: number };
+type Recorded = { kinds: string[]; frags: string[]; canon?: string[]; tagHash: string; model?: string; lastSeen: number };
 
 /** #3397: persona-tag identity is carried by its sha256 (the raw text can be
  *  tens of KB of host system prompt; the persisted snapshot must not carry it
  *  and the resolver only ever compares tags for equality). "" = non-anchoring. */
 const tagHashOf = (tag: string): string =>
     tag === "" ? "" : createHash("sha256").update(tag, "utf8").digest("hex");
+
+/** Per-turn canonical fingerprint (#5844): sha256 of neutralTurnCanonical —
+ *  the identity chain's own hashing input (kind + logical text/calls), so it
+ *  survives a host regrouping messages into different records while the
+ *  per-source-message `frags` do not. */
+const canonFp = (turns: NeutralTurn[]): string[] =>
+    turns.map((t) => createHash("sha256").update(neutralTurnCanonical(t), "utf8").digest("hex"));
+
+/** #5844: the persisted canon column's element shape (sha256 hex digest). */
+const CANON_FP_RE = /^[0-9a-f]{64}$/;
 
 /** Order skeletons. #3397: no longer process-memory-only — every mutation is
  *  debounced-persisted (src/order-persist.ts) and hydrated on boot, so a
@@ -229,13 +239,15 @@ export interface OrderSkeletonEntry {
     id: string;
     kinds: string[];
     frags: string[];
+    /** #5844: per-turn canonical fingerprints — absent on pre-change snapshots. */
+    canon?: string[];
     tagHash: string;
     model?: string;
     lastSeen: number;
 }
 
 function record(rawId: string, turns: NeutralTurn[], tagHash: string, model?: string): void {
-    skeletons.set(rawId, { kinds: turns.map((t) => t.kind), frags: fragsOf(turns), tagHash, model, lastSeen: Date.now() });
+    skeletons.set(rawId, { kinds: turns.map((t) => t.kind), frags: fragsOf(turns), canon: canonFp(turns), tagHash, model, lastSeen: Date.now() });
     scheduleOrderPersist();
 }
 
@@ -352,6 +364,21 @@ export function resolveSessionOrder(rawId: string, history: unknown, personaTag?
         const a = incomingFrags.slice(-w);
         const b = recorded.frags.slice(-w);
         return a.length === b.length && a.every((f, i) => f === b[i]);
+    };
+    // #5844: logical-turn twin of fragTailEquals — the last ≤TAIL_WINDOW turns
+    // compared by CANONICAL form (kind + logical text/calls, the identity
+    // chain's own hashing input) instead of per-source-message fragments. A
+    // host upgrade that regroups messages into different records (dsh
+    // 0.2.2-rc.1: assistant text segments merged into adjacent records)
+    // destroys the per-message granularity while every logical turn stays
+    // byte-identical; the canonical comparison sees through the repack. Old
+    // persisted skeletons carry no canon column → false → pre-change path.
+    const canonTailEquals = (n: number): boolean => {
+        if (recorded.canon === undefined) return false;
+        const w = Math.min(TAIL_WINDOW, n);
+        const a = canonFp(turns.slice(-w));
+        const b = recorded.canon.slice(-w);
+        return a.length === b.length && a.every((c, i) => c === b[i]);
     };
     const tagChanged = tagHash !== "" && tagHash !== recorded.tagHash;
     // An EMPTY incoming tag (system-less / instructions-less request) is
@@ -486,9 +513,19 @@ export function resolveSessionOrder(rawId: string, history: unknown, personaTag?
         // mirror of the tag-LESS shorter-reanchor below (same two tests, same
         // TAIL_WINDOW, no extra floor): a byte-identical fragment-verified
         // tail cannot belong to a different conversation (MESSAGE-IDENTITY).
-        if (kinds.length > 0 && kinds.length < recorded.kinds.length && tailAligns(kinds, recorded.kinds) && fragTailEquals(kinds.length)) {
-            record(rawId, turns, tagHash, effectiveModel);
-            return { key: rawId, action: "reanchor", reason: "persona text changed but the shorter incoming keeps the recorded conversation's fragment-verified tail — head rewrite under a new system prompt, anchor kept (#5686)" };
+        if (kinds.length > 0 && kinds.length < recorded.kinds.length && tailAligns(kinds, recorded.kinds)) {
+            const fragOk = fragTailEquals(kinds.length);
+            const canonOk = !fragOk && canonTailEquals(kinds.length);
+            if (fragOk || canonOk) {
+                record(rawId, turns, tagHash, effectiveModel);
+                return {
+                    key: rawId,
+                    action: "reanchor",
+                    reason: canonOk
+                        ? "persona text changed but the shorter incoming keeps the recorded conversation's content-verified tail (host repacked the message records, logical turns intact) — anchor kept (#5686/#5844)"
+                        : "persona text changed but the shorter incoming keeps the recorded conversation's fragment-verified tail — head rewrite under a new system prompt, anchor kept (#5686)",
+                };
+            }
         }
         // #5719: every byte-level escape needs EVIDENCE (fragments/cells/
         // chain continuity) that the composite field failure destroys in the
@@ -582,7 +619,7 @@ export function resetSessionOrderForTest(): void {
 
 /** #3397: persisted-snapshot surface (src/order-persist.ts wire shape). */
 export function orderSnapshot(): OrderSkeletonEntry[] {
-    return [...skeletons.entries()].map(([id, r]) => ({ id, kinds: r.kinds, frags: r.frags, tagHash: r.tagHash, model: r.model, lastSeen: r.lastSeen }));
+    return [...skeletons.entries()].map(([id, r]) => ({ id, kinds: r.kinds, frags: r.frags, ...(r.canon !== undefined ? { canon: r.canon } : {}), tagHash: r.tagHash, model: r.model, lastSeen: r.lastSeen }));
 }
 
 /** Merge a hydrated snapshot: per-id newer lastSeen wins. Returns imported count. */
@@ -591,7 +628,10 @@ export function applyOrderSnapshot(entries: OrderSkeletonEntry[]): number {
     for (const e of entries) {
         const cur = skeletons.get(e.id);
         if (!cur || e.lastSeen > cur.lastSeen) {
-            skeletons.set(e.id, { kinds: e.kinds, frags: e.frags, tagHash: e.tagHash, model: e.model, lastSeen: e.lastSeen });
+            // #5844: pre-change snapshots carry no canon column; a malformed
+            // one degrades to absent (byte-fragment path only), never trusted.
+            const canon = Array.isArray(e.canon) && e.canon.length > 0 && e.canon.every((c) => typeof c === "string" && CANON_FP_RE.test(c)) ? e.canon : undefined;
+            skeletons.set(e.id, { kinds: e.kinds, frags: e.frags, canon, tagHash: e.tagHash, model: e.model, lastSeen: e.lastSeen });
             imported++;
         }
     }
