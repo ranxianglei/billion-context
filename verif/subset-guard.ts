@@ -134,7 +134,7 @@ const GLOBAL_FNS = new Set([
   "isNaN", "isFinite", "parseFloat", "parseInt",
   "String", "Number", "Boolean", "Object", "Array",
   // function-typed parameters (injected ports, uninterpreted):
-  "countTokens", "predicate", "isCompressTool",
+  "countTokens", "predicate", "isCompressTool", "strandedProtectedPredecessor", "pred",
 ]);
 
 /** Namespace roots (Math.x etc.) handled via NAMESPACE_MEMBERS. */
