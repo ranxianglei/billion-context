@@ -65,6 +65,19 @@ import { sha256Hex } from "../storage/store.js";
 
 const MIN_SEAM_RUN = 2;
 
+/** #5632: a seam resting SOLELY on identity signatures (no exact-id cell in the
+ *  run) may not pin a NON-LOCAL join -- one that drops more transcript rows above
+ *  it than it verified below. Exact ids are unambiguous (kernel contract: ids are
+ *  never reused), so an id-anchored run is trusted at any depth; signatures carry
+ *  no id, so two adjacent UNCOVERED rows whose byte-identical twins sit at the
+ *  client tail boundary (host re-minted their ids => byId miss, bySig hit) would
+ *  otherwise chain onto the deep old rows and silently truncate every genuinely
+ *  recent row above them. #3812 guards only run<2 and #4052 excludes only covered
+ *  binds -- neither catches a run>=2 pure-sig deep pair. A non-local sig-only seam
+ *  therefore needs a longer run (>= 3) before it may drop history; local seams
+ *  (join at/near the transcript end) keep today's behavior unchanged. */
+const MIN_NONLOCAL_SIG_SEAM_RUN = 3;
+
 /** #3658 canonical identity signature minus the hash: the tuple the kernel
  *  derives message ids from. Equal signature ⇒ same logical message even
  *  when the id bytes were re-minted by an upgrade. Image cores share the
@@ -353,12 +366,14 @@ function buildView(session: Session, clientMsgs: BiliMessage[]): ViewResult {
         let started = false;
         let run = 0; // #3812: consecutive matched messages since the chain started
         let gapped = false; // #3812: one tolerated unmatched message (the reply lag)
+        let idAnchor = false; // #5632: true once any matched cell came from the byId fast path
         for (let k = clientMsgs.length - 1; k >= 0 && clientMsgs.length - 1 - k < MAX_CHAIN_WALK; k--) {
             const m = clientMsgs[k];
             const sig = identitySig(m);
             let hit = -1;
             const byIdHit = byId.get(m.id);
-            if (byIdHit !== undefined && byIdHit < cursor) hit = byIdHit;
+            const hitById = byIdHit !== undefined && byIdHit < cursor;
+            if (hitById) hit = byIdHit;
             else {
                 const cands = bySig.get(sig);
                 if (cands) {
@@ -394,6 +409,7 @@ function buildView(session: Session, clientMsgs: BiliMessage[]): ViewResult {
                 joinRow = hit; // the join point: the prefix renders every row up to and including it
             }
             run++;
+            if (hitById) idAnchor = true;
             cursor = hit;
         }
         if (!started) return { ok: false, reason: "chain-not-started" }; // nothing chains: epoch-like rewrite, legacy
@@ -403,6 +419,18 @@ function buildView(session: Session, clientMsgs: BiliMessage[]): ViewResult {
         // accepting it renders only the ancient prefix + the one tail message
         // and silently drops everything between. Degrade instead: never guess.
         if (run < MIN_SEAM_RUN) return { ok: false, reason: "seam-too-short" };
+        // #5632: a pure-signature seam (no exact-id cell in the run) may not pin a
+        // non-local join -- one that drops more transcript rows above it than it
+        // verified below. Two adjacent uncovered rows whose byte-identical twins sit
+        // at the client tail boundary (host re-minted their ids => byId miss, bySig
+        // hit) would otherwise chain onto the deep old rows and silently truncate
+        // every genuinely-recent row above them. An id-anchored run is trusted at any
+        // depth (ids are unambiguous); a sig-only run must be local (gapAbove <= run)
+        // or reach MIN_NONLOCAL_SIG_SEAM_RUN before it may drop history. Degrade
+        // instead of guess -- the safe direction.
+        const gapAbove = rows.length - 1 - joinRow;
+        if (!idAnchor && gapAbove > run && run < MIN_NONLOCAL_SIG_SEAM_RUN)
+            return { ok: false, reason: "seam-unverified-depth" };
     }
     const d = joinRow + 1; // prefix = rows[0..d) — everything up to the join; rows beyond (rewound-away tails) never render
     const merged = assembleView(rows, blockSeeds, coveredSeqUnion, d, clientMsgs.slice(clientJoin));
