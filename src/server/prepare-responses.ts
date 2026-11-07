@@ -33,7 +33,7 @@ import { estimateCoreMessages, estimateCoreMessagesUpper } from "../preflight.js
 import { hoistTrappedToolItems } from "../tool-pair-order.js";
 import { isStrictReasoningEcho, modelIdOf, normalizeStrictEchoResponsesInput } from "../strict-echo.js";
 import { reconcileSystemAnchor } from "../system-anchor.js";
-import { buildPromptForgeBody, buildTriggerForgeBody, carriesCodexLocalCompactionSummary, codexCompactGate, codexCompactGatePre, codexCompactMode, hasCompactionPrompt, hasCompactionTrigger, isCodexClient, isCodexHost, mergeForgedSummaries, replaceBiliCompactionItems, stripBiliCompactionItems, CODEX_COMPACT_HEALTH_RATIO, CODEX_LOCAL_COMPACTION_MIN_MISSING } from "../codex-compact.js";
+import { buildPromptForgeBody, buildTriggerForgeBody, carriesCodexLocalCompactionSummary, codexCompactGate, codexCompactGatePre, codexCompactMode, findNativeCodexCheckpoint, hasCompactionPrompt, hasCompactionTrigger, isCodexClient, isCodexHost, mergeForgedSummaries, replaceBiliCompactionItems, stripBiliCompactionItems, CODEX_COMPACT_HEALTH_RATIO, CODEX_LOCAL_COMPACTION_MIN_MISSING } from "../codex-compact.js";
 import type { ConversationIdentity } from "../session-id.js";
 import { pckKeyAbated } from "../pck-probe.js";
 import { reconcilePluginFoldCallIds } from "../plugin.js";
@@ -280,6 +280,7 @@ export async function prepareResponses(
         // #3686: host policy — a declared plugin host with a codex-shaped UA is not codex.
         const codexLane = !isCompactionTrigger && isCodexHost(req.headers);
         const dshLane = !isCompactionTrigger && laneDecisions.profile.compactsClientSide; // #3417 registry property (dsh native compaction, #2432)
+        let localCompactRebased = false;
         if ((codexLane || dshLane) && session.state.blocks.some((b) => b.active)) {
             const coveredBeforeLocalCompact = coveredRealHistoryIds(session.state.blocks);
             const localGap = foldCoverage(coveredBeforeLocalCompact, msgs.map((m) => m.id));
@@ -304,6 +305,40 @@ export async function prepareResponses(
                     }
                     markNativeCompactionBoundary(session);
                     reconcileNativeCompactionBoundary(session);
+                    localCompactRebased = true;
+                }
+            }
+        }
+        // #4929: NEWER codex builds land the local auto-compaction as a NATIVE
+        // Responses compaction item with an OPAQUE provider blob instead of the
+        // legacy text summary — the kernel projection drops it into the preamble
+        // (no core id), so the text detector above can never see it and the fold
+        // coverage of the replaced head simply vanishes from the resent history.
+        // The structural marker is marker-decisive (#2193 doctrine: only a client
+        // that adopted a real OpenAI compaction response carries this wire item,
+        // user text cannot forge one), so NO absolute missing floor applies —
+        // the 8-id floor disambiguates the pasteable TEXT marker only. Identity
+        // is the sha256 of the opaque blob, persisted per session so repeated
+        // echoes and cold loads recognize the SAME checkpoint and preserve later
+        // folds instead of re-basing onto it again. Rebase iff fold coverage was
+        // lost (majority rule) or the old substrate is empty — a checkpoint first
+        // observed with fully intact coverage preserves current folds.
+        if (codexLane && !localCompactRebased) {
+            const nativeFp = findNativeCodexCheckpoint(parsed.input);
+            if (nativeFp !== null && session.metadata.codexCheckpointFp !== nativeFp) {
+                session.metadata.codexCheckpointFp = nativeFp;
+                markDirty(session);
+                const coveredBeforeNativeCompact = coveredRealHistoryIds(session.state.blocks);
+                const nativeGap = foldCoverage(coveredBeforeNativeCompact, msgs.map((m) => m.id));
+                const substrateEmpty = coveredBeforeNativeCompact.size === 0;
+                const coverageLost = nativeGap !== null && (nativeGap.expected - nativeGap.matched) * 2 >= nativeGap.expected;
+                if (substrateEmpty || coverageLost) {
+                    recordConflict(session, "native-compaction", `codex native opaque checkpoint landed (${nativeGap ? `${nativeGap.matched}/${nativeGap.expected}` : "0/0"} covered id(s) retained); rebasing ACP state (#4929)`);
+                    log("warn", `[${sessionId}] codex native opaque checkpoint landed (${nativeGap ? `${nativeGap.matched}/${nativeGap.expected} covered ids retained` : "empty fold substrate"}) — rebasing ACP state onto the compacted history (#4929)`);
+                    markNativeCompactionBoundary(session);
+                    reconcileNativeCompactionBoundary(session);
+                } else {
+                    log("info", `[${sessionId}] codex native opaque checkpoint landed with intact fold coverage (${nativeGap ? `${nativeGap.matched}/${nativeGap.expected}` : "0/0"} covered id(s)) — folds preserved, checkpoint identity recorded for echo/cold-load dedup (#4929)`);
                 }
             }
         }
