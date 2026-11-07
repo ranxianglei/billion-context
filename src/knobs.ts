@@ -428,11 +428,15 @@ export function sessionWarmMaxBytes(): number {
     return Number.isFinite(v) && v >= 0 ? Math.floor(v) : 64 * 1024 * 1024;
 }
 
-/** BILI_SESSION_RESIDENT_MAX_BYTES > sessions.residentMaxBytes > 512 MiB (#2803 soft
- *  target for estimated resident session bytes; active/in-flight state stays pinned). */
+/** BILI_SESSION_RESIDENT_MAX_BYTES > sessions.residentMaxBytes > 4 GiB (#2803 soft
+ *  target for estimated resident session bytes; active/in-flight state stays pinned.
+ *  #5779 raised the default from 512 MiB: single sessions routinely exceed half a
+ *  GiB and ping-ponged against the old budget forever — evicted every inter-request
+ *  gap, cold-loaded on every request, which under memory pressure OOM'd the decode
+ *  and manufactured the .corrupt-* disk-fill loop.) */
 export function sessionResidentMaxBytes(): number {
     const v = tInt("BILI_SESSION_RESIDENT_MAX_BYTES", loadConfigFile().sessions?.residentMaxBytes);
-    return Number.isFinite(v) && v >= 0 ? Math.floor(v) : 512 * 1024 * 1024;
+    return Number.isFinite(v) && v >= 0 ? Math.floor(v) : 4 * 1024 * 1024 * 1024;
 }
 
 /** BILI_SESSION_RESIDENT_HARD_MAX_BYTES > sessions.hardMaxBytes > pool soft cap

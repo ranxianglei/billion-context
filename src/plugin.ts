@@ -6,7 +6,7 @@ import type { ServerResponse } from "node:http";
 import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
-import { getStore, storageStatusLabel } from "./persist.js";
+import { CORRUPT_SIBLING_CAP, getStore, pruneCorruptSiblings, storageStatusLabel } from "./persist.js";
 import { cloneStoreForRefs } from "./store.js";
 import { acquireInFlight, createSession, getSessionAsync, publishForkSession, diagnoseSuccessWithoutUsage, effectiveConfig, findSessionByCanonicalId, listSessions, markCompactionBoundary, markDirty, noteAbortedTurn, peekSession, releaseInFlight, statusInputBaseline, withSessionLock, type Session } from "./session.js";
 import { clientConversationHeader } from "./session-id.js";
@@ -28,6 +28,7 @@ import type { TruncationDiag } from "./stream-error.js";
 import { recordAttributionReport } from "./server/attribution-status.js";
 import type { HandoffReply } from "./server/handoff-response.js";
 import { captureHandoffJson, HANDOFF_REPLY_MAX_BYTES } from "./server/handoff-response.js";
+import { recordServerSideFold } from "./server/fastpath-v6-render.js";
 
 /** #2328 Q2: what the pipes know about the upstream HTTP response whose body
  *  they are piping — threaded in by server.ts so the truncation diag can cite
@@ -379,10 +380,15 @@ export function loadConversations(): void {
     } catch {
         // #406: preserve the corrupt bytes for forensics instead of
         // silently zeroing every route on the next debounced write.
+        // #5779: bound the forensic retention like the session store does.
+        let removedCopies = 0;
         try {
-            fs.renameSync(conversationsFile(), `${conversationsFile()}.corrupt-${Date.now()}`);
+            const backup = `${conversationsFile()}.corrupt-${Date.now()}`;
+            fs.renameSync(conversationsFile(), backup);
+            removedCopies = pruneCorruptSiblings(conversationsFile(), backup).removed;
         } catch {}
-        loggerLog("warn", "[plugin] plugin-conversations.json is corrupt — backed up beside the original, starting an empty routing table");
+        const capNote = removedCopies > 0 ? `; removed ${removedCopies} older forensic cop${removedCopies === 1 ? "y" : "ies"} (cap ${CORRUPT_SIBLING_CAP})` : "";
+        loggerLog("warn", `[plugin] plugin-conversations.json is corrupt — backed up beside the original, starting an empty routing table${capNote}`);
     }
     conversationsDirty = false;
 }
@@ -2328,6 +2334,18 @@ export async function handlePluginTool(
     }
     releaseInFlight(session);
     if (result === undefined) return;
+    // #5643 附录二：the compression request IS the first scene — journal its
+    // fold coverage into the v6 render snapshot SYNCHRONOUSLY (one tx DML;
+    // the next model turn materializes/verifies as ONE forced red round,
+    // never by guesswork). No-op unless the plane is engaged AND something
+    // structural moved; fail-soft — the tool response never depends on it.
+    if (tool === "compress") {
+        try {
+            recordServerSideFold(session.id, session, getStore(), deps.log);
+        } catch (err) {
+            deps.log("warn", `[${session.id}] [plugin] render first-scene journal failed: ${String(err)}`);
+        }
+    }
     // #760b: evidence-based plugin-mode flip. A successful MCP tool execution proves
     // this session's host owns the bili compression tools, so bind it to plugin mode
     // (sticky) — the next model request stops injecting the duplicate ephemeral wire
