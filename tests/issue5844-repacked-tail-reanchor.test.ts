@@ -107,8 +107,16 @@ test("#5844 guardrail: repacked replay with a MUTATED tail cell still forks (str
     resetSessionOrderForTest();
     resolveSessionOrder(ID, seed, S1);
     const mutated: M[] = [...incoming];
-    const lastUser = mutated.length - 2; // …, user(question N), assistant(text+tool_use)
-    mutated[lastUser] = { role: "user", content: "mutated final question — different conversation, same skeleton" };
+    // Mutate the FINAL tool result's text while keeping the repacked layout
+    // (same kinds, same record shape): the fork must come from the
+    // canonical-fingerprint mismatch itself, not from a kind break (a kind
+    // break dies earlier in tailAligns and would pass even without the canon
+    // comparison). A tool-result turn carries its text in the canonical form
+    // (unlike an assistant calls turn, whose canon is calls+role only for
+    // cross-wire neutrality — see affinity-neutral.ts header).
+    const lastTr = mutated.length - 1;
+    assert.equal((mutated[lastTr] as M).role, "user", "shape premise: the replay ends with a tool-result record");
+    mutated[lastTr] = { role: "user", content: [{ type: "tool_result", tool_use_id: `tu-${TURNS - 1}`, content: "mutated final result — different conversation, same skeleton" }] };
     const res = resolveSessionOrder(ID, mutated, S2);
     assert.equal(res.action, "derived-persona");
     assert.equal(res.key, `${ID}|sub:${fp16(S2)}`);
