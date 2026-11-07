@@ -13,6 +13,7 @@ import { FALLBACK_EFFECTIVE_WINDOW_FLOOR, findRoute, findRouteKey, lookupContext
 import { resolveProxyDecision } from "../upstream-proxy.js";
 import { contextFromRegistry, peekRegistryContext, peekRegistryOutputLimit, peekRegistryPriceProfile } from "../registry.js";
 import { stampBillingPrice } from "../billing.js";
+import { recordClientUa } from "../client-ua-registry.js";
 import { codexAlignedWindow } from "../codex-models.js";
 import { DecodedRequestAdmission, DecodedRequestBusyError } from "../request-body-budget.js";
 import { hostIdForLog, maskHeadersForLog, maskUrlForLog, maskUrlsInText } from "../log-mask.js";
@@ -1673,6 +1674,12 @@ async function handleRequest(
         }
         if (!pluginAgent && typeof session.metadata.pluginAgent === "string") pluginAgent = session.metadata.pluginAgent;
         if (pluginAgent && !pluginConversation) pluginConversation = conversation;
+        // #4649: remember this request's client UA in the bounded registry so a
+        // diagnostics report carries the client's own version (non-dsh lanes
+        // have no profile bundle to read it from). Runs for EVERY model
+        // request — unlike the clientHint block below, which only fills the
+        // session's first-seen hint.
+        recordClientUa(req.headers);
         // #1426 web UI: persist which client this session came from, first hit wins.
         // Plugin agents are already recorded above as metadata.pluginAgent; non-plugin
         // clients fall back to header sniffing, then to a truncated User-Agent hint.
