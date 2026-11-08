@@ -1135,7 +1135,10 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         // spec-repeat guard text is dropped here on purpose — one counter,
         // stated once.
         const occurrences = compressFailOccurrencesOf(ctx.session, parseKey);
-        if (occurrences >= 2) {
+        // #4812: collapse to a one-liner only on the tracked lane — the
+        // preflight lane (loopTracking:false) must always return the full
+        // receipt (it never arms and never collapses).
+        if (trackLoop && occurrences >= 2) {
             ctx.log(`[acp-proxy: parse-failure receipt collapsed to one-liner (attempt ${occurrences}, kind=${diagnostics.kind})]`);
             return compressResult(`[Compression FAILED again — this exact call has now failed ${occurrences} time(s) the same way (kind=${diagnostics.kind}); nothing was compressed. The full format guide and eligible ranges are in the FIRST failed receipt above — do not re-send this call verbatim.${loopGuard}]`, "refused", 0, `parse:${diagnostics.kind}`);
         }
