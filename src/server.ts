@@ -84,7 +84,7 @@ import { auditStartupSummaryCredentials } from "./external-summary-credentials.j
 import { applyRanges } from "./stream.js";
 import { attachSubagentSessions } from "./subagent-sessions.js";
 import { buildSessionCacheReport, handleAcpCache, learnedImageReserve, noteClientAbort, readKeySwitchStats, readModelSwitchStats, settleUsageReport } from "./cache-ledger.js";
-import { extractBillingAttributionBlock, extractSummaryFromSse, preflightCompress, estimateCoreMessages, estimateCoreMessagesUpper, estimateCoreMessagesUpperBytes, describeCoreTextDuplication, estimateRawBodyTokens, type PreflightResult } from "./preflight.js";
+import { extractBillingAttributionBlock, extractSummaryFromSse, preflightCompress, estimateCoreMessages, estimateCoreMessagesUpper, estimateCoreMessagesUpperBytes, describeCoreTextDuplication, estimateRawBodyTokens, estimateRawBodyBreakdown, type PreflightResult, type RawBodyBreakdown } from "./preflight.js";
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, DEFAULT_DECIDE_MAX_TOKENS, DECIDE_TIMEOUT_MS, extractDecisionText, ladderMode, parseDecision, recordDecision, resolveDecisionRange, type DecideConfig, type DecisionOutcome } from "./nudge-decide.js";
 import { gcConfigFromEnv, gcSessionFiles } from "./session-gc.js";
 import { countImagesInParsedBody, countImagesInRawBody, imageTokensInRawBody, imageTokensInParsedBody, resolveImageBilling, upstreamHost, type ResolvedImageBilling } from "./image-tokens.js";
@@ -140,6 +140,8 @@ import {
     keepAliveTimeoutMs as knobKeepAliveTimeoutMs,
     keepResponseId as knobKeepResponseId,
     limitsReceiveBytes as knobLimitsReceiveBytes,
+    limitsMaxMessages,
+    limitsIngestBytes as knobLimitsIngestBytes,
     noCompressPrompt as knobNoCompressPrompt,
     noInjectTool as knobNoInjectTool,
     postResponseLingerMs as knobPostResponseLingerMs,
@@ -3746,7 +3748,20 @@ export function buildWindowShrinkNote(args: {
 // tokens are charged separately by the caller (they sit in binary-carrying
 // keys the walk excludes by design). Unparseable bodies return undefined —
 // callers keep the byte-floor fallback for them.
-export function measuredOutboundTokens(prepared: { body: string | Buffer; parsedBody?: unknown }): number | undefined {
+export interface MeasuredOutbound {
+    tokens: number;
+    breakdown: RawBodyBreakdown;
+}
+
+// #5000 item 3: dimension clause for the measured-doom messages — which part
+// of the body carries the mass, so "trim the oversized content" tells the
+// operator WHERE (a 55.2 MiB #5000 body with 1.44 MiB of messages[] means the
+// mass is tools[], not a giant paste).
+export function measuredBreakdownClause(b: RawBodyBreakdown): string {
+    return `messages ~${b.messages.toLocaleString("en-US")} · tools[] ~${b.tools.toLocaleString("en-US")} · system ~${b.system.toLocaleString("en-US")} · other ~${b.other.toLocaleString("en-US")}`;
+}
+
+export function measuredOutbound(prepared: { body: string | Buffer; parsedBody?: unknown }): MeasuredOutbound | undefined {
     let parsed: unknown = prepared.parsedBody;
     if (parsed === undefined) {
         const raw = typeof prepared.body === "string" ? prepared.body : prepared.body.toString("utf8");
@@ -3756,7 +3771,8 @@ export function measuredOutboundTokens(prepared: { body: string | Buffer; parsed
             return undefined;
         }
     }
-    return estimateRawBodyTokens(parsed);
+    const breakdown = estimateRawBodyBreakdown(parsed);
+    return { tokens: breakdown.total, breakdown };
 }
 
 export async function preflightCompressIfNeeded(
@@ -3959,6 +3975,30 @@ export async function preflightCompressIfNeeded(
     if (opts.debug) {
         const billed = session.stats.lastInputTokens > 0 && session.stats.lastInputTokensSource === "usage" ? session.stats.lastInputTokens : "none";
         log("debug", `[${session.id}] [usage-vs-est] upstream-billed=${billed} est=${Math.round(textEstimate)} k̂=${kFactor !== undefined ? kFactor.toFixed(2) : "n/a"} route=${currentOrigin === undefined ? "?" : maskUrlForLog(currentOrigin)} model=${model ?? "?"} baseline-grade=${session.stats.lastInputTokensSource ?? "none"} (#2283)`);
+    }
+    // #5000 item 2: the COUNT dimension — a hard upstream wire constraint on
+    // the messages[] array length that no byte/token estimate can express.
+    // #5000's 55.2 MiB / 26,903-message session cleared EVERY size gate (core
+    // text 1.44 MiB, 2 MiB absolute floor, egress byte floor) and died at the
+    // upstream with the count error. The limit is per-upstream: operators opt
+    // in with BILI_MAX_MESSAGES (or network.maxMessages); 0 = disabled (no
+    // global default — a wrong value must not false-block lanes whose
+    // upstream has no count limit). Doom-only: folding cannot close a
+    // 21,903-message gap inside one preflight round budget (the planner is
+    // token-benefit-driven, #3444), and the actionable remedy is client-side
+    // (restart / rewind). Runs BEFORE the trigger guard: a token-fit
+    // 6,000-message body never triggers preflight yet still 400s upstream —
+    // that IS the #5000 case.
+    const maxMessages = limitsMaxMessages();
+    if (maxMessages > 0) {
+        const msgCount = prepared.processedMessages.length > 0 ? prepared.processedMessages.length : prepared.originalMessages.length;
+        if (msgCount > maxMessages) {
+            const gap = msgCount - maxMessages;
+            const countMessage = `message count ${msgCount.toLocaleString("en-US")} exceeds the upstream wire limit ${maxMessages.toLocaleString("en-US")} (COUNT dimension — the messages[] array length is a hard upstream constraint that no byte/token estimate expresses, #5000: a 26,903-message session cleared every size gate and died at the upstream). Folding cannot close ~${gap.toLocaleString("en-US")} messages inside one preflight; reduce the session history — restart the session or rewind to an earlier point — and retry.`;
+            log("error", `[${session.id}] preflight fail-fast 413 (retryable=false, count gate): ${countMessage}`);
+            noteLocalRefusal(session, currentOrigin, model, limit);
+            return { failFast: true, status: 413, message: countMessage, retryable: false, respond: !res.writableEnded };
+        }
     }
     if (limit <= 0 || !model || !triggerFires) return prepared;
     // #3846: an earlier local 413 for THIS origin+model at an equal or wider
@@ -4394,9 +4434,11 @@ export async function preflightCompressIfNeeded(
     // fallbacks stay binding for those bodies.
     let outboundBudgetTokens: number | undefined;
     let outboundRawTokens: number | undefined;
+    let outboundBreakdown: RawBodyBreakdown | undefined;
     try {
         const outBody: unknown = JSON.parse(typeof outbound.body === "string" ? outbound.body : outbound.body.toString("utf8"));
-        outboundRawTokens = estimateRawBodyTokens(outBody);
+        outboundBreakdown = estimateRawBodyBreakdown(outBody);
+        outboundRawTokens = outboundBreakdown.total;
         const outField = outputBudgetField(outBody);
         const rawBudget = outField !== null ? readOutputBudget(outBody as Record<string, unknown>, outField) : undefined;
         if (typeof rawBudget === "number" && rawBudget > 0) outboundBudgetTokens = rawBudget;
@@ -4432,7 +4474,7 @@ export async function preflightCompressIfNeeded(
         if (outboundRawTokens !== undefined && outboundRawTokens > armMeasuredBar) {
             const outMsgs = outbound.processedMessages.length > 0 ? outbound.processedMessages : outbound.originalMessages;
             log("error", `[${session.id}] preflight 413 measured-body profile (post-fold): ${describeCoreTextDuplication(outMsgs)}`);
-            const measuredDoomMessage = `rebuilt outbound body measures ~${outboundRawTokens.toLocaleString("en-US")} TEXT tokens (system + tools + arguments + messages; CJK-aware count, the #554 guard meter; images billed separately, never doom here — #496/#1800/#857) vs the model window ${armMeasuredBar.toLocaleString("en-US")} (model=${model}); the body ITSELF exceeds the window, so it was NOT forwarded for upstream arbitration. Remove or trim the oversized content (e.g. a giant paste or tool result) and retry.`;
+            const measuredDoomMessage = `rebuilt outbound body measures ~${outboundRawTokens.toLocaleString("en-US")} TEXT tokens (${outboundBreakdown ? measuredBreakdownClause(outboundBreakdown) : "by field: n/a"}; CJK-aware count, the #554 guard meter; images billed separately, never doom here — #496/#1800/#857) vs the model window ${armMeasuredBar.toLocaleString("en-US")} (model=${model}); the body ITSELF exceeds the window, so it was NOT forwarded for upstream arbitration. Remove or trim the oversized dimension named above (e.g. a giant paste or tool result in messages[], or tools[] schemas) and retry.`;
             log("error", `[${session.id}] preflight fail-fast 413 (retryable=false): ${measuredDoomMessage}`);
             noteLocalRefusal(session, currentOrigin, model, limit);
             return { failFast: true, status: 413, message: measuredDoomMessage, retryable: false, respond: !res.writableEnded };
@@ -4531,7 +4573,7 @@ export async function preflightCompressIfNeeded(
         const gateMeasuredBar = typeof resolvedNativeWindow === "number" && resolvedNativeWindow > 0 ? resolvedNativeWindow : limit;
         if (outboundRawTokens !== undefined && outboundRawTokens > gateMeasuredBar) {
             log("error", `[${session.id}] preflight 413 measured-body profile: ${describeCoreTextDuplication(outMsgs)}`);
-            const measuredDoomMessage = `outbound body measures ~${outboundRawTokens.toLocaleString("en-US")} TEXT tokens even after preflight compression (system + tools + arguments + messages; CJK-aware count, the #554 guard meter; images billed separately, never doom here — #496/#1800/#857) vs the model window ${gateMeasuredBar.toLocaleString("en-US")} (model=${model}); the body ITSELF exceeds the window, so it was NOT forwarded. Remove or trim the oversized content (e.g. a giant paste or tool result) and retry.`;
+            const measuredDoomMessage = `outbound body measures ~${outboundRawTokens.toLocaleString("en-US")} TEXT tokens even after preflight compression (${outboundBreakdown ? measuredBreakdownClause(outboundBreakdown) : "by field: n/a"}; CJK-aware count, the #554 guard meter; images billed separately, never doom here — #496/#1800/#857) vs the model window ${gateMeasuredBar.toLocaleString("en-US")} (model=${model}); the body ITSELF exceeds the window, so it was NOT forwarded. Remove or trim the oversized dimension named above (e.g. a giant paste or tool result in messages[], or tools[] schemas) and retry.`;
             log("error", `[${session.id}] preflight fail-fast 413 (retryable=false): ${measuredDoomMessage}`);
             noteLocalRefusal(session, currentOrigin, model, limit);
             return { failFast: true, status: 413, message: measuredDoomMessage, retryable: false, respond: !res.writableEnded };
