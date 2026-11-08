@@ -202,6 +202,8 @@ interface PersistedSession {
         cacheSamples?: number;
         lastInputTokens?: number;
         lastInputTokensSource?: string;
+        emergencyShrinkAt?: number;
+        emergencyShrinkEstimate?: number;
         lastInputTokensOrigin?: string;
         overflowArmTokens?: number;
         overflowArmCompletionReserve?: number;
@@ -4176,6 +4178,10 @@ function buildSession(parsed: PersistedSession): Session {
             // #857: provenance — legacy files lack it; absent stays absent and
             // evidence-grade consumers treat absent as untrusted.
             lastInputTokensSource: stats.lastInputTokensSource === "usage" || stats.lastInputTokensSource === "estimate" || stats.lastInputTokensSource === "overflow-arm" ? stats.lastInputTokensSource : undefined,
+            // Preserve the explanation saved by armFailureShrink alongside its
+            // raised baseline. A real usage settlement clears both markers.
+            emergencyShrinkAt: typeof stats.emergencyShrinkAt === "number" && Number.isFinite(stats.emergencyShrinkAt) && stats.emergencyShrinkAt >= 0 ? stats.emergencyShrinkAt : undefined,
+            emergencyShrinkEstimate: typeof stats.emergencyShrinkEstimate === "number" && Number.isFinite(stats.emergencyShrinkEstimate) && stats.emergencyShrinkEstimate > 0 ? stats.emergencyShrinkEstimate : undefined,
             // #1110: one-shot overflow arm — legacy files lack it; absent = no arm.
             overflowArmTokens: typeof stats.overflowArmTokens === "number" && Number.isFinite(stats.overflowArmTokens) && stats.overflowArmTokens > 0 ? stats.overflowArmTokens : undefined,
             // #3450: proven completion reservation + one-time warn flag — legacy files lack both.
