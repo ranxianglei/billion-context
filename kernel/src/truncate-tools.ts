@@ -28,6 +28,18 @@ export interface TruncateResult {
 
 const TRUNCATION_MARKER = "[truncated for context space]";
 
+/** The exact clip shape truncateLargeToolOutputs writes between the kept
+ *  prefix and suffix: `\n\n...[truncated for context space] — original ~N
+ *  tokens]...\n\n` with the pre-truncation token estimate in N. Exported so
+ *  hosts can recognize their OWN legacy bytes as kernel clips (the egress
+ *  tripwire adopts them) instead of re-typing the wording — a kernel wording
+ *  change must stay in lockstep with that recognition. */
+export const TRUNCATION_CLIP_RE = /\n\n\.\.\.\[truncated for context space\] — original ~\d+ tokens\]\.\.\.\n\n/;
+
+export function buildTruncationClipMarker(tokens: number): string {
+    return `\n\n...${TRUNCATION_MARKER} — original ~${tokens} tokens]...\n\n`;
+}
+
 const DEFAULTS: Required<Omit<TruncateOptions, "includeTextMessages">> = {
   minOutputTokens: 1000,
   keepPrefixChars: 2000,
@@ -106,7 +118,7 @@ export function truncateLargeToolOutputs(
       // INFLATING the context while "saving" tokens. Cap the total keep
       // window to whatever room the original actually leaves below the
       // marker; candidates too small to leave room are skipped verbatim.
-      const marker = `\n\n...${TRUNCATION_MARKER} — original ~${tokens} tokens]...\n\n`;
+      const marker = buildTruncationClipMarker(tokens);
       const maxKeep = original.length - marker.length - 4;
       if (maxKeep < 64) continue;
       const keep = Math.min(

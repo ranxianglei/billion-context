@@ -98,7 +98,7 @@ function foldedSession(sid: string, from = 0, to = 8): { sess: LegacySessionLike
     return { sess, blk, msgs };
 }
 
-function msg(id: string, text: string, role: "user" | "assistant" | "system" = "user"): BiliMessage {
+function msg(id: string, text: string, role: "user" | "assistant" | "system" | "tool" = "user"): BiliMessage {
     return { id, role, contentType: "text", text } as BiliMessage;
 }
 
@@ -670,4 +670,111 @@ test("T20 kernel emergency-truncation clips are adopted; divergent bounds stay r
     const kept = applySnapEgress(resend, state, legacyBad, { ...deps(), sessionId: "t20" });
     assert.equal(kept, legacyBad, "marker with divergent head stays legacy (red)");
     assert.equal(snapEgressStatusWire().fallback, 1);
+});
+
+// T21 (review B1): the tripwire must see the model-visible sidecar fields the
+// codecs prefer over .text. Equal sidecars cut over; a divergent sidecar is a
+// red naming the offending key (remote-URL rotation, thinkingSignature,
+// toolIsError …), never a false green.
+test("T21 sidecar fields are tripwire-visible: equal cuts over, divergent goes red", () => {
+    const { view, state } = planeFor("t21");
+    const withSide = (extra: Record<string, unknown>) => ({
+        ...view,
+        rows: view.rows.map((r) => (r.postJson?.includes('"message 9"')
+            ? { ...r, postJson: JSON.stringify({ ...JSON.parse(r.postJson as string), ...extra }) }
+            : r)) as SnapView["rows"],
+    });
+    const base = { ...msg("m9", "message 9", "user"), contentType: "text" as const, toolCallId: undefined };
+    const resend = clientResend(Array.from({ length: 12 }, (_, i) => ({ id: `m${i + 1}`, text: `message ${i + 1}` })));
+    const legacyFor = (extra: Record<string, unknown> | undefined): BiliMessage[] => [
+        { ...msg(summaryMessageId("blk-c1"), `${SUMMARY_HEADER}\nfolded 1-8`), role: "system" },
+        extra === undefined ? msg("host-9", "message 9", "user") : ({ ...msg("host-9", "message 9", "user"), ...extra } as BiliMessage),
+        msg("host-10", "message 10", "assistant"),
+        msg("host-11", "message 11", "user"),
+        msg("host-12", "message 12", "assistant"),
+    ];
+    // Equal sidecars on both sides → cutover (the digest must not over-red).
+    withStore(withSide({ thinkingSignature: "sig-1" }));
+    const out = applySnapEgress(resend, state, legacyFor({ thinkingSignature: "sig-1" }), { ...deps(), sessionId: "t21" });
+    assert.notEqual(out, legacyFor({ thinkingSignature: "sig-1" }), "equal sidecars cut over");
+    assert.equal(snapEgressStatusWire().cutover, 1);
+    // Rotated remote URL (rawOpenaiContent) plane-old vs legacy-new → red.
+    withStore(withSide({ rawOpenaiContent: { type: "image_url", image_url: { url: "https://old.example/sig" } } }));
+    const legacyNew = legacyFor({ rawOpenaiContent: { type: "image_url", image_url: { url: "https://new.example/sig" } } });
+    const kept = applySnapEgress(resend, state, legacyNew, { ...deps(), sessionId: "t21" });
+    assert.equal(kept, legacyNew, "sidecar divergence keeps legacy");
+    const st = snapEgressStatusWire();
+    assert.equal(st.fallback, 1);
+    // toolIsError divergence is caught too.
+    withStore(withSide({ toolIsError: true }));
+    const legacyErr = legacyFor({ toolIsError: false });
+    const kept2 = applySnapEgress(resend, state, legacyErr, { ...deps(), sessionId: "t21" });
+    assert.equal(kept2, legacyErr);
+    assert.equal(snapEgressStatusWire().fallback, 2);
+});
+
+// T22 (review B3): two ADJACENT trimmed tool results (parallel calls) — the
+// seam walk pairs both by toolCallId, the chain holds, and both clips are
+// adopted: cutover, not a length-red sticky exclude.
+test("T22 adjacent double-trimmed tool results join by toolCallId and cut over", () => {
+    const { view, state } = planeFor("t22");
+    const fullA = "A".repeat(3000);
+    const fullB = "B".repeat(3000);
+    const trimA = "A".repeat(100);
+    const trimB = "B".repeat(100);
+    const rows = view.rows.map((r) => {
+        if (r.postJson?.includes('"message 9"')) {
+            const p = JSON.parse(r.postJson) as Record<string, unknown>;
+            p.contentType = "tool-result"; p.toolCallId = "call-a"; p.text = fullA;
+            return { ...r, postJson: JSON.stringify(p) };
+        }
+        if (r.postJson?.includes('"message 10"')) {
+            const p = JSON.parse(r.postJson) as Record<string, unknown>;
+            p.role = "tool"; p.contentType = "tool-result"; p.toolCallId = "call-b"; p.text = fullB;
+            return { ...r, postJson: JSON.stringify(p) };
+        }
+        return r;
+    });
+    withStore({ ...view, rows: rows as SnapView["rows"] });
+    const resend = [
+        msg("m1", "message 1"),
+        { ...msg("m9", trimA), contentType: "tool-result", toolCallId: "call-a" } as unknown as BiliMessage,
+        { ...msg("m10", trimB), contentType: "tool-result", toolCallId: "call-b" } as unknown as BiliMessage,
+        msg("m11", "message 11"),
+        msg("m12", "message 12", "assistant"),
+    ];
+    const legacy: BiliMessage[] = [
+        { ...msg(summaryMessageId("blk-c1"), `${SUMMARY_HEADER}\nfolded 1-8`), role: "system" },
+        { ...msg("host-9", trimA), contentType: "tool-result", toolCallId: "call-a" } as unknown as BiliMessage,
+        { ...msg("host-10", trimB, "tool"), contentType: "tool-result", toolCallId: "call-b" } as unknown as BiliMessage,
+        msg("host-11", "message 11"),
+        msg("host-12", "message 12", "assistant"),
+    ];
+    const out = applySnapEgress(resend, state, legacy, { ...deps(), sessionId: "t22" });
+    assert.notEqual(out, legacy, "adjacent trimmed pair cuts over (toolCallId seam arm)");
+    assert.equal(out[1]?.text, trimA);
+    assert.equal(out[2]?.text, trimB);
+    assert.equal(snapEgressStatusWire().cutover, 1);
+});
+
+// T23 (review G6): an emptied client body is NOT adopted as a trim.
+test("T23 empty client text is not adoption-eligible", () => {
+    const { view, state } = planeFor("t23");
+    const resend = [
+        msg("m1", "message 1"),
+        { ...msg("m9", ""), contentType: "tool-result", toolCallId: "call-a" } as unknown as BiliMessage,
+        msg("m10", "message 10", "assistant"),
+        msg("m11", "message 11"),
+        msg("m12", "message 12", "assistant"),
+    ];
+    const legacy: BiliMessage[] = [
+        { ...msg(summaryMessageId("blk-c1"), `${SUMMARY_HEADER}\nfolded 1-8`), role: "system" },
+        { ...msg("host-9", "message 9", "user"), contentType: "tool-result", toolCallId: "call-a" } as unknown as BiliMessage,
+        msg("host-10", "message 10", "assistant"),
+        msg("host-11", "message 11"),
+        msg("host-12", "message 12", "assistant"),
+    ];
+    withStore(view);
+    const kept = applySnapEgress(resend, state, legacy, { ...deps(), sessionId: "t23" });
+    assert.equal(kept, legacy, "empty body is not a trim — tripwire judges the divergence");
 });
