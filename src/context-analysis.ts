@@ -20,14 +20,14 @@
 
 import { countMessageTokens, defaultCountTokens, type CoreMessage } from "acp-kernel";
 
-export interface InitMessageEntry {
+interface InitMessageEntry {
     role: string;
     contentType: string;
     toolName?: string;
     estTokens: number;
 }
 
-export interface InitProfile {
+interface InitProfile {
     ts: number;
     messageCount: number;
     totalChars: number;
@@ -36,7 +36,7 @@ export interface InitProfile {
     perMessage: InitMessageEntry[];
 }
 
-export interface NudgeEvent {
+interface NudgeEvent {
     ts: number;
     label: string;
     tier: number | null;
@@ -53,14 +53,14 @@ export interface NudgeEvent {
     matched?: boolean;
 }
 
-export interface HarvestRecord {
+interface HarvestRecord {
     ts: number;
     offered: number;
     got: number;
     ratio: number;
 }
 
-export interface CommitSample {
+interface CommitSample {
     ts: number;
     tokens: number;
 }
@@ -71,7 +71,7 @@ export interface UsageSample {
     limit: number;
 }
 
-export interface TierReadiness {
+interface TierReadiness {
     ts: number;
     t1: number;
     t2: number;
@@ -80,7 +80,7 @@ export interface TierReadiness {
     interval: number;
 }
 
-export interface ContextAnalysis {
+interface ContextAnalysis {
     sessionId: string;
     firstSeen: number;
     lastSeen: number;
@@ -165,7 +165,7 @@ function snapshotInit(messages: CoreMessage[]): InitProfile {
     };
 }
 
-export interface NudgeObservationTurn {
+interface NudgeObservationTurn {
     nudge?: {
         shouldInject: boolean;
         reason: string;
@@ -213,7 +213,7 @@ function ringSlopePerHour(ring: { ts: number; v: number }[], now: number): numbe
 }
 
 /** The plain-language verdict (rule 8: a non-member must understand it). */
-export function buildVerdict(a: ContextAnalysis, now = Date.now()): string[] {
+function buildVerdict(a: ContextAnalysis, now = Date.now()): string[] {
     const out: string[] = [];
     const spanMs = a.lastSeen - a.firstSeen;
     if (spanMs < 60_000) return out; // too young to diagnose
