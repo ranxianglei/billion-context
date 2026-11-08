@@ -35,3 +35,4 @@
 | [lifecycle](lifecycle.md) | Transition-switch ledger / retirement inventory / hygiene record (CI-enforced `BILI_*` coverage) |
 | [auto-merge-guardrails](auto-merge-guardrails.md) | Evidence appendix behind §7 of `AGENTS.md` (AI auto-dev review history) |
 | [unified-loop-spec](unified-loop-spec.md) | Historical design: unified compress-loop spec (implemented; code is the source of truth) |
+| [snapshot-table foundation](proposals/snapshot-compression-foundation/README.md) / [中文](proposals/snapshot-compression-foundation/README.zh-CN.md) | Design record: six-stage fixed chain, single storage truth (#5874). P0+P1 landed in #5901; P2 egress cutover pending owner ruling |
