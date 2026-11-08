@@ -122,7 +122,7 @@ function normTuple(m: BiliMessage): string[] {
     return [m.role, m.contentType, m.toolName ?? "", m.toolCallId ?? "", typeof m.text === "string" ? m.text : "", img];
 }
 
-export function tripwireCompare(plane: BiliMessage[], legacy: BiliMessage[]): { ok: true } | { ok: false; reason: string } {
+export function tripwireCompare(plane: BiliMessage[], legacy: BiliMessage[]): { ok: true } | { ok: false; reason: string; firstDiff?: string } {
     if (plane.length !== legacy.length) {
         return { ok: false, reason: `length(plane=${plane.length},legacy=${legacy.length})` };
     }
@@ -130,7 +130,10 @@ export function tripwireCompare(plane: BiliMessage[], legacy: BiliMessage[]): { 
         const a = normTuple(plane[i]);
         const b = normTuple(legacy[i]);
         for (let f = 0; f < a.length; f++) {
-            if (a[f] !== b[f]) return { ok: false, reason: `shape@${i}:${TRIPWIRE_FIELDS[f]}` };
+            if (a[f] !== b[f]) {
+                const head = (v: unknown) => JSON.stringify(String(v ?? "")).slice(0, 160);
+                return { ok: false, reason: `shape@${i}:${TRIPWIRE_FIELDS[f]}`, firstDiff: `${TRIPWIRE_FIELDS[f]} plane=${head(a[f])} legacy=${head(b[f])}` };
+            }
         }
     }
     return { ok: true };
@@ -381,7 +384,7 @@ export function applySnapEgress(
         egressExcluded.add(deps.sessionId);
         deps.log("warn", `[snaplane] sid=${deps.sessionId} decision=dead:egress sticky exclude after ${n} mismatches (last: ${verdict.reason})`);
     } else {
-        deps.log("warn", `[snaplane] sid=${deps.sessionId} decision=red:egress:${verdict.reason} — legacy egress kept (${n}/${EGRESS_EXCLUDE_AFTER})`);
+        deps.log("warn", `[snaplane] sid=${deps.sessionId} decision=red:egress:${verdict.reason} — legacy egress kept (${n}/${EGRESS_EXCLUDE_AFTER})${verdict.firstDiff ? ` — ${verdict.firstDiff}` : ""}`);
     }
     return legacyProcessed;
 }
