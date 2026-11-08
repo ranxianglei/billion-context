@@ -90,9 +90,14 @@
 //        DROP the four tables + index and rewind user_version — T1 pins the
 //        byte-identical behavior in both directions. Additive-only: an
 //        older build opening a v12 file ignores the extra tables.
-//        NOTE (timing dependency, #5855): the unmerged fastpath re-land also
-//        numbers its two table groups v12/v13; whichever lands second renumbers
-//        its block mechanically (CREATE IF NOT EXISTS shapes are independent).
+//        Applied PROBE-FIRST (table-existence check), NOT version-gated:
+//        the unmerged fastpath re-land (#5855) numbers its two table groups
+//        v12/v13 and landed them into a SHARED database first (field,
+//        2026-11-08: user_version 13 + pf_* present, snap tables absent →
+//        the plane died with "no such table: l1_world"). The probe makes
+//        both merge orderings coexist; whichever branch lands second in
+//        master still renumbers its constant mechanically (hygiene only —
+//        the DDL shapes are independent).
 export const STORAGE_SCHEMA_VERSION = 12;
 
 /** #3250: cap for `journal_size_limit` (see STORAGE_PRAGMAS). Passive and
@@ -395,6 +400,21 @@ export function migrateSchema(db: {
 }): { from: number; to: number } {
     const row = db.prepare("PRAGMA user_version").get() as { user_version: number } | undefined;
     const from = row?.user_version ?? 0;
+    // v12 (#5874) is PROBE-FIRST, not version-gated. A sibling branch may
+    // have consumed the version numbers after v11 for its own additive DDL
+    // while ours was still unmerged — real-world 2026-11-08: #5855 landed
+    // v12+v13 (the pf_* planes) into a SHARED database, and this branch's
+    // old `if (from < 12)` block was skipped by the early return below, so
+    // the plane died on first save with "no such table: l1_world". The DDL
+    // is pure CREATE ... IF NOT EXISTS (no backfill, no rewrite of existing
+    // rows), so it is safe to run at ANY from-version; probing for the
+    // table itself (the discipline v2/v5/v6/v8 already use) makes both
+    // merge orderings coexist without renumbering — the final master
+    // version number stays a mechanical merge-time hygiene step.
+    const hasSnapRows = db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'snap_rows'")
+        .get();
+    if (!hasSnapRows) db.transaction(() => db.exec(SNAPBASE_DDL_V12));
     if (from >= STORAGE_SCHEMA_VERSION) return { from, to: from };
     let needV8Backfill = false;
     db.transaction(() => {
@@ -518,17 +538,13 @@ export function migrateSchema(db: {
             db.exec("CREATE INDEX IF NOT EXISTS idx_message_media_media_hash ON message_media(media_hash)");
             db.exec("CREATE INDEX IF NOT EXISTS idx_checkpoints_state_hash ON checkpoints(state_hash)");
         }
-        if (from < 12) {
-            // v12 (#5874 P0): snapshot-table compression foundation — four
-            // additive tables + index (l1_world / snap_rows / snap_log /
-            // snap_ckpt). Pure additivity: no backfill, no rewrite of
-            // existing rows; the plane stays dormant until
-            // storage.snapBase.enabled turns it on. Rollback = DROP the four
-            // tables + index and set user_version back (T1 pins the
-            // byte-identical behavior in both directions). Idempotent
-            // CREATEs, same discipline as v9/v11.
-            db.exec(SNAPBASE_DDL_V12);
-        }
+        // v12 (#5874 P0): snapshot-table compression foundation — ensured
+        // PROBE-FIRST above (coexists with sibling-branch DDL that consumed
+        // the v12/v13 numbers, see the note before the early return).
+        // Pure additivity: no backfill, no rewrite of existing rows; the
+        // plane stays dormant until storage.snapBase.enabled turns it on.
+        // Rollback = DROP the four tables + index and set user_version back
+        // (T1 pins the byte-identical behavior in both directions).
     });
     if (needV8Backfill) migrateV8Identities(db);
     db.exec(`PRAGMA user_version = ${STORAGE_SCHEMA_VERSION}`);
