@@ -1716,6 +1716,18 @@ export function cacheBlockContent(session: Session, blockId: string, content: Bl
     session.blockContents.set(blockId, content);
 }
 
+// #5984: canonical names of the two compress-failure accounting keys that
+// stream.ts writes — the #2146 consecutive-failure breaker (COMPRESS_LOOP_KEY)
+// and the #847 exact-spec repeat guard (FAIL_STREAK_KEY). Both live on metadata
+// and are cleared on a successful compress; a native-compaction rebase must
+// clear them too, because the ref space they describe is gone (refs restart at
+// m00001). Defined here — not in stream.ts — because resetSessionCompression
+// is the single choke point every rebase funnels through, and session.ts cannot
+// import stream.ts (stream already imports session: a cycle). Exported so both
+// modules share one source of truth for the key names.
+export const COMPRESS_LOOP_KEY = "compressFailStreak";
+export const FAIL_STREAK_KEY = "compressFailKeys";
+
 export function resetSessionCompression(session: Session): void {
     session.state = createInitialState();
     session.blockContents.clear();
@@ -1773,6 +1785,14 @@ export function resetSessionCompression(session: Session): void {
     delete session.metadata.postRebuildAnchor;
     session.stats.contextTokens = 0;
     delete session.stats.contextTokensSource;
+    // #5984: the rebase restarts the ref space, so the compress-failure
+    // accounting written against the pre-rebase generation is void — drop both
+    // keys here (they were the two failure-accounting fields this reset
+    // historically missed; only a successful compress cleared them, letting a
+    // pre-rebase streak carry across the boundary and arm mid-loop on the new
+    // refs). Covered by the trailing markDirty below.
+    delete session.metadata[COMPRESS_LOOP_KEY];
+    delete session.metadata[FAIL_STREAK_KEY];
     session.metadata.nativeCompactionAt = Date.now();
     markDirty(session);
 }
