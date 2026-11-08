@@ -25,7 +25,7 @@ import { stateDir } from "./paths.js";
 import { loadConfigFile } from "./config.js";
 import { log } from "./logger.js";
 import { parseDurationField } from "./duration.js";
-import { UPSTREAM_TIMEOUT_MS, REPLAY_MAX_ATTEMPTS, REPLAY_BASE_DELAY_MS } from "./fetch-util.js";
+import { UPSTREAM_TIMEOUT_MS, UPSTREAM_FIRST_BYTE_MS, REPLAY_MAX_ATTEMPTS, REPLAY_BASE_DELAY_MS } from "./fetch-util.js";
 import { PROXY_KEEPALIVE_MAX_MS } from "./upstream-proxy.js";
 import { WAL_JOURNAL_SIZE_LIMIT } from "./storage/schema.js";
 
@@ -82,6 +82,20 @@ function fileNetwork() {
 export function upstreamTimeoutMs(): number {
     const v = tNum("BILI_UPSTREAM_TIMEOUT_MS", fileNetwork().upstreamTimeoutMs);
     return Number.isInteger(v) && v > 0 ? v : UPSTREAM_TIMEOUT_MS;
+}
+
+/** BILI_UPSTREAM_FIRST_BYTE_MS > network.upstreamFirstByteMs > the full
+ *  upstream timeout (120000s-free default = UPSTREAM_TIMEOUT_MS, so unset =
+ *  byte-identical to the single-phase watchdog). Phase-1 budget: request fully
+ *  sent → first response byte. Bounds "upstream accepted the request but never
+ *  answered" separately from mid-stream silence, which keeps the #1706/#1714
+ *  guarantee that long silent prefills are never truncated by default (#5904:
+ *  a GPU-restart-cold sglang answered one fold in 73s, then accepted the next
+ *  request and never answered — the turn sat silent until the client's 300s
+ *  abort; the release gate now sets 45s here to catch that wedge fast). */
+export function upstreamFirstByteMs(): number {
+    const v = tNum("BILI_UPSTREAM_FIRST_BYTE_MS", fileNetwork().upstreamFirstByteMs);
+    return Number.isInteger(v) && v > 0 ? v : UPSTREAM_FIRST_BYTE_MS;
 }
 
 /** BILI_CA_FILE > network.caFile > unset. Path to a PEM bundle of extra root CAs

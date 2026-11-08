@@ -2247,6 +2247,12 @@ type FileConfig = {
     network?: {
         /** Upstream fetch timeout (was BILI_UPSTREAM_TIMEOUT_MS; default 720000). */
         upstreamTimeoutMs?: number;
+        /** First-byte budget for upstream fetches (BILI_UPSTREAM_FIRST_BYTE_MS; default
+         *  120000). Bounds request-sent → first-response-byte separately from the
+         *  streaming idle budget, so a wedged upstream that accepts requests but never
+         *  answers fails fast instead of silently eating the full 12-minute watchdog
+         *  while the client times out first (#5904). */
+        upstreamFirstByteMs?: number;
         /** Request watchdog budget (was BILI_REQUEST_WATCHDOG_MS; default 2× upstream timeout). */
         requestWatchdogMs?: number;
         /** Server keep-alive timeout (was BILI_KEEP_ALIVE_TIMEOUT_MS; default 5000). */
