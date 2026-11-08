@@ -97,7 +97,7 @@ function rebuild(f: Fixture): Prepared {
 
 function gate(f: Fixture, rebuild: () => Promise<Prepared>) {
     return preflightCompressIfNeeded(f.prepared, rebuild, f.req, Buffer.from(f.prepared.body), f.res,
-        f.opts, f.core, f.config, f.config.modelContextLimit, "test-model", undefined, undefined, undefined, undefined, false, f.log, "abort-test");
+        f.opts, f.core, f.config, f.config.modelContextLimit, "test-model", undefined, undefined, undefined, undefined, undefined, false, f.log, "abort-test");
 }
 
 test("preflight keeps cancellation after an applied fold makes the final payload fit", async () => {
