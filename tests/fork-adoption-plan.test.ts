@@ -139,3 +139,38 @@ test("fork recovery preserves expanded, consumed, missing and blocks-disabled ex
     assert.equal(plan.blocks.find(b => b.blockId === "b1")?.active, false);
     assert.equal(plan.blocks.find(b => b.blockId === "b2")?.active, true);
 });
+
+test("fork adoption deep-copies adopted blocks: mutating the child never leaks into the source", () => {
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    const parent = retainedParent([retainedBlock()]);
+    parent.state = syncBlocks([{ id: "side", role: "user", contentType: "text", text: "short view" }], parent.state).state;
+    const child = { state: createInitialState(), blockContents: new Map() } as unknown as Session;
+    const plan = planForkAdoption(parent, new Set(["raw1", "raw2"]));
+    applyForkAdoption(child, plan, parent);
+    assert.equal(child.state.blocks.length, 1);
+    assert.equal(child.state.blocks[0].active, true);
+    child.state.blocks[0].summary = "MUTATED";
+    child.state.blocks[0].directMessageIds.push("leak");
+    assert.equal(parent.state.blocks[0].summary, "saved summary", "mutating the adopted child must not touch the source summary");
+    assert.deepEqual(parent.state.blocks[0].directMessageIds, ["raw1", "raw2"], "mutating the adopted child must not touch the source ids");
+});
+
+test("fork recovery counts incomplete spans as straddled even while inactive in the source", () => {
+    const inactive = retainedBlock();
+    inactive.active = false;
+    const plan = planForkAdoption(retainedParent([inactive]), new Set(["raw1"]));
+    assert.equal(plan.adoptedActive, 0);
+    assert.equal(plan.straddled, 1, "a partial span is straddled whether or not the source's last view deactivated it");
+});
+
+test("fork adoption carries the covered refs of adopted folds into the child numbering", () => {
+    const parent = retainedParent([retainedBlock()]);
+    parent.state.messageRefs.byRaw.raw1 = "m00001";
+    parent.state.messageRefs.byRaw.raw2 = "m00002";
+    parent.state.messageRefs.byRef["m00001"] = "raw1";
+    parent.state.messageRefs.byRef["m00002"] = "raw2";
+    const plan = planForkAdoption(parent, new Set(["raw1", "raw2"]));
+    assert.equal(plan.refs.byRaw.raw1, "m00001", "covered ref rides along with its fold");
+    assert.equal(plan.refs.byRaw.raw2, "m00002");
+    assert.equal(plan.refs.byRef["m00001"], "raw1");
+});
