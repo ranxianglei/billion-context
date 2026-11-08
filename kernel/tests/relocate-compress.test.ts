@@ -4,6 +4,7 @@ import { createInitialState } from "../src/state.js";
 import {
   planRelocateCompressCarriers,
   relocateCompressCarriers,
+  RELOCATED_POINTER_MARKER,
 } from "../src/relocate-compress.js";
 import type {
   CompressionBlock,
@@ -72,6 +73,7 @@ function pair(callId: string) {
 }
 
 const ids = (ms: CoreMessage[]): string[] => ms.map((m) => m.id);
+const carrierId = (callId: string): string => `acp_reloc_${callId}`;
 
 test("no active block with numeric endRef ⇒ same array reference (no-op fast path)", () => {
   const messages = [msg("a", "m00001", "text")];
@@ -101,10 +103,12 @@ test("inactive block is skipped even with numeric endRef", () => {
   assert.equal(relocateCompressCarriers(messages, state), messages);
 });
 
-test("basic move: pair lands before first surviving core whose ref exceeds endRef", () => {
-  // Fold covered m00001–m00002; protected survivors c (m00003), d (m00004).
-  const a = msg("a", "m00003", "user");
-  const b = msg("b", "m00004", "assistant");
+test("basic relocate: summary carrier lands at the fold point, pair stays in its slot with pointer args", () => {
+  // Fold covered m00001–m00002; protected survivors a (m00003), b (m00004); the
+  // pair sits chronologically AFTER the survivors (the model compressed older
+  // history later on).
+  const a = msg("a", "m00003", "text");
+  const b = msg("b", "m00004", "text");
   const [c, r] = pair("call1");
   const messages = [a, b, c, r];
   const state = stateWith(
@@ -112,63 +116,113 @@ test("basic move: pair lands before first surviving core whose ref exceeds endRe
     { a: "m00003", b: "m00004" },
   );
   const out = relocateCompressCarriers(messages, state);
-  // Survivors a (ref 3 > 2), so the pair must precede a — nothing before it.
-  assert.deepEqual(ids(out), ["call-call1", "res-call1", "a", "b"]);
-  // Original cores are moved by reference, never cloned.
-  assert.equal(out[0], c);
-  assert.equal(out[1], r);
+  // Carrier before the first survivor past the boundary (a, ref 3 > 2); the
+  // pair keeps its chronological slot at the end.
+  assert.deepEqual(ids(out), [carrierId("call1"), "a", "b", "call-call1", "res-call1"]);
+  // Survivors and the result core are forwarded by reference, never cloned.
+  assert.equal(out[1], a);
+  assert.equal(out[2], b);
+  assert.equal(out[4], r);
+  // The call core is a shallow CLONE carrying the pointer args.
+  assert.notEqual(out[3], c);
+  assert.ok(out[3]!.text!.includes(RELOCATED_POINTER_MARKER));
+  assert.ok(out[3]!.text!.includes("b1"));
+  // The input core is not mutated.
+  assert.equal(c.text, "text-of-call-call1");
 });
 
-test("pair already at its fold point keeps relative layout but still normalizes (moved-by-ref)", () => {
-  const a = msg("a", "m00005", "user");
-  const b = msg("b", "m00006", "assistant");
+test("carrier text carries the summary; non-JSON args are used verbatim", () => {
+  const a = msg("a", "m00003", "text");
   const [c, r] = pair("call1");
-  const messages = [c, r, a, b]; // already before all survivors
-  const state = stateWith(
-    [{ blockId: "b1", compressCallId: "call1", startRef: "m00001", endRef: "m00004" }],
-    { a: "m00005", b: "m00006" },
-  );
-  const out = relocateCompressCarriers(messages, state);
-  assert.deepEqual(ids(out), ["call-call1", "res-call1", "a", "b"]);
-});
-
-test("multi-range batch shares one call id ⇒ boundary is max(endRef)", () => {
-  const x = msg("x", "m00008", "user"); // inside later fold range
-  const y = msg("y", "m00011", "assistant"); // only survivor past both folds
-  const [c, r] = pair("callB");
-  // Live views follow ingest (ref) order: x (8) precedes y (11).
-  const messages = [x, c, r, y];
-  const state = stateWith(
-    [
-      { blockId: "b1", compressCallId: "callB", startRef: "m00001", endRef: "m00005" },
-      { blockId: "b2", compressCallId: "callB", startRef: "m00007", endRef: "m00010" },
-    ],
-    { y: "m00011", x: "m00008" },
-  );
-  // Boundary = max(5,10)=10 ⇒ insert before y (11 > 10), after surviving x (8).
-  const out = relocateCompressCarriers(messages, state);
-  assert.deepEqual(ids(out), ["x", "call-callB", "res-callB", "y"]);
-});
-
-test("fold reaches the window end (#4732 regime) ⇒ append at tail", () => {
-  const [c, r] = pair("call1");
-  const a = msg("a", "m00002", "user"); // only core; ref ≤ boundary
+  c.text = "RAW-SUMMARY-BODY";
   const messages = [a, c, r];
   const state = stateWith(
     [{ blockId: "b1", compressCallId: "call1", startRef: "m00001", endRef: "m00002" }],
-    { a: "m00002" },
+    { a: "m00003" },
   );
   const out = relocateCompressCarriers(messages, state);
-  assert.deepEqual(ids(out), ["a", "call-call1", "res-call1"]);
+  const carrier = out[0]!;
+  assert.equal(carrier.id, carrierId("call1"));
+  assert.equal(carrier.role, "user");
+  assert.equal(carrier.contentType, "text");
+  assert.ok(carrier.text!.startsWith(`[bili fold summary — block(s) b1; relocated from compress call call1`));
+  assert.ok(carrier.text!.endsWith("\nRAW-SUMMARY-BODY"));
 });
 
-test("duplicate tool-call cores for one call id ⇒ ambiguous, do not move", () => {
+test("carrier text extracts .content from JSON args (plugin dialect)", () => {
+  const a = msg("a", "m00003", "text");
+  const [c, r] = pair("call1");
+  c.text = JSON.stringify({ content: "SUMMARY-TEXT", ranges: ["m00001-m00002"] });
+  const messages = [a, c, r];
+  const state = stateWith(
+    [{ blockId: "b1", compressCallId: "call1", startRef: "m00001", endRef: "m00002" }],
+    { a: "m00003" },
+  );
+  const out = relocateCompressCarriers(messages, state);
+  const carrier = out[0]!;
+  assert.ok(carrier.text!.includes("SUMMARY-TEXT"));
+  assert.ok(!carrier.text!.includes("SUMMARY-TEXT\"")); // no JSON wrapper residue
+});
+
+test("pointer args are valid JSON embedding the marker and the block ids", () => {
+  const a = msg("a", "m00003", "text");
+  const [c, r] = pair("call1");
+  const messages = [a, c, r];
+  const state = stateWith(
+    [{ blockId: "b1", compressCallId: "call1", startRef: "m00001", endRef: "m00002" }],
+    { a: "m00003" },
+  );
+  const out = relocateCompressCarriers(messages, state);
+  const callOut = out.find((m) => m.id === "call-call1")!;
+  const parsed = JSON.parse(callOut.text!) as { content: string };
+  assert.ok(parsed.content.startsWith(RELOCATED_POINTER_MARKER));
+  assert.ok(parsed.content.includes("b1"));
+  assert.ok(parsed.content.includes("do not re-compress"));
+});
+
+test("already relocated call (marker in args, carrier present) ⇒ same array reference", () => {
+  // Hosts may round-trip a view: carrier ids survive AND the args keep the
+  // pointer. Both probes must independently make the plan a no-op.
+  const a = msg("a", "m00003", "text");
+  const [c, r] = pair("call1");
+  const once = relocateCompressCarriers([a, c, r], stateWith(
+    [{ blockId: "b1", compressCallId: "call1", startRef: "m00001", endRef: "m00002" }],
+    { a: "m00003" },
+  ));
+  // Carrier present ⇒ skip.
+  assert.equal(relocateCompressCarriers(once, stateWith(
+    [{ blockId: "b1", compressCallId: "call1", startRef: "m00001", endRef: "m00002" }],
+    { a: "m00003" },
+  )), once);
+  // Marker only (carrier id stripped by a host round-trip) ⇒ skip.
+  const markerOnly: CoreMessage[] = once.filter((m) => m.id !== carrierId("call1"));
+  assert.equal(relocateCompressCarriers(markerOnly, stateWith(
+    [{ blockId: "b1", compressCallId: "call1", startRef: "m00001", endRef: "m00002" }],
+    { a: "m00003" },
+  )), markerOnly);
+});
+
+test("idempotent: applying twice yields the identical array", () => {
+  const a = msg("a", "m00003", "text");
+  const b = msg("b", "m00004", "text");
+  const [c, r] = pair("call1");
+  const messages = [a, b, c, r];
+  const state = stateWith(
+    [{ blockId: "b1", compressCallId: "call1", startRef: "m00001", endRef: "m00002" }],
+    { a: "m00003", b: "m00004" },
+  );
+  const once = relocateCompressCarriers(messages, state);
+  const twice = relocateCompressCarriers(once, state);
+  assert.equal(twice, once);
+});
+
+test("duplicate tool-call cores for one call id ⇒ ambiguous, do not touch", () => {
   const [c1, r1] = pair("call1");
   const c2 = msg("call-call1-again", null, "tool-call", {
     toolName: "compress",
     toolCallId: "call1",
   });
-  const messages = [msg("a", "m00003", "user"), c1, r1, c2];
+  const messages = [msg("a", "m00003", "text"), c1, r1, c2];
   const state = stateWith(
     [{ blockId: "b1", compressCallId: "call1", startRef: "m00001", endRef: "m00002" }],
     { a: "m00003" },
@@ -183,7 +237,7 @@ test("non-adjacent result (foreign core between call and result) ⇒ skip", () =
   });
   const result = msg("mr", null, "tool-result", { toolCallId: "call1" });
   const foreign = msg("f", "m00003", "text");
-  const messages = [msg("a", "m00004", "user"), call, foreign, result];
+  const messages = [msg("a", "m00004", "text"), call, foreign, result];
   const state = stateWith(
     [{ blockId: "b1", compressCallId: "call1", startRef: "m00001", endRef: "m00002" }],
     { a: "m00004", f: "m00003" },
@@ -197,7 +251,7 @@ test("result with mismatched toolCallId ⇒ not a pair, skip", () => {
     toolCallId: "call1",
   });
   const result = msg("mr", null, "tool-result", { toolCallId: "other" });
-  const messages = [msg("a", "m00003", "user"), call, result];
+  const messages = [msg("a", "m00003", "text"), call, result];
   const state = stateWith(
     [{ blockId: "b1", compressCallId: "call1", startRef: "m00001", endRef: "m00002" }],
     { a: "m00003" },
@@ -206,31 +260,64 @@ test("result with mismatched toolCallId ⇒ not a pair, skip", () => {
 });
 
 test("BLOCKED_REF cores are not qualifying boundaries (durable-BLOCKED edge)", () => {
-  const protectedMsg = msg("prot", "BLOCKED", "user");
+  const protectedMsg = msg("prot", "BLOCKED", "text");
   const [c, r] = pair("call1");
   const messages = [protectedMsg, c, r];
   const state = stateWith(
     [{ blockId: "b1", compressCallId: "call1", startRef: "m00001", endRef: "m00002" }],
     { prot: "BLOCKED" },
   );
-  // Nothing qualifies beyond the boundary ⇒ tail append (position unchanged here).
+  // Nothing qualifies beyond the boundary ⇒ carrier appended at the tail; the
+  // pair stays in its slot untouched except the pointer rewrite.
   const out = relocateCompressCarriers(messages, state);
-  assert.deepEqual(ids(out), ["prot", "call-call1", "res-call1"]);
+  assert.deepEqual(ids(out), ["prot", "call-call1", "res-call1", carrierId("call1")]);
   assert.equal(out[0], protectedMsg);
+});
+
+test("multi-range batch shares one call id ⇒ boundary is max(endRef), pointer lists all blocks", () => {
+  const x = msg("x", "m00008", "text"); // inside later fold range
+  const y = msg("y", "m00011", "text"); // only survivor past both folds
+  const [c, r] = pair("callB");
+  // Live views follow ingest (ref) order: x (8) precedes y (11).
+  const messages = [x, c, r, y];
+  const state = stateWith(
+    [
+      { blockId: "b1", compressCallId: "callB", startRef: "m00001", endRef: "m00005" },
+      { blockId: "b2", compressCallId: "callB", startRef: "m00007", endRef: "m00010" },
+    ],
+    { y: "m00011", x: "m00008" },
+  );
+  // Boundary = max(5,10)=10 ⇒ carrier before y (11 > 10), after x (8).
+  const out = relocateCompressCarriers(messages, state);
+  assert.deepEqual(ids(out), ["x", "call-callB", "res-callB", carrierId("callB"), "y"]);
+  const callOut = out.find((m) => m.id === "call-callB")!;
+  assert.ok(callOut.text!.includes("b1, b2"));
+});
+
+test("fold reaches the window end (#4732 regime) ⇒ carrier appended at tail", () => {
+  const [c, r] = pair("call1");
+  const a = msg("a", "m00002", "text"); // only core; ref ≤ boundary
+  const messages = [a, c, r];
+  const state = stateWith(
+    [{ blockId: "b1", compressCallId: "call1", startRef: "m00001", endRef: "m00002" }],
+    { a: "m00002" },
+  );
+  const out = relocateCompressCarriers(messages, state);
+  assert.deepEqual(ids(out), ["a", "call-call1", "res-call1", carrierId("call1")]);
 });
 
 test("thinking clear: predicate unset ⇒ reasoning kept even with clearThinking set", () => {
   const think = msg("t1", "m00009", "reasoning");
   const [c, r] = pair("call1");
-  const a = msg("a", "m00010", "user");
+  const a = msg("a", "m00010", "text");
   const messages = [think, c, r, a];
   const state = stateWith(
     [{ blockId: "b1", compressCallId: "call1", startRef: "m00001", endRef: "m00008" }],
     { a: "m00010" },
   );
   const out = relocateCompressCarriers(messages, state, { clearThinking: true });
-  // Pair moves before a; thinking follows it (kept).
-  assert.deepEqual(ids(out), ["t1", "call-call1", "res-call1", "a"]);
+  // Pair stays in its slot; thinking kept; carrier before the first ref>8 (a).
+  assert.deepEqual(ids(out), ["t1", "call-call1", "res-call1", carrierId("call1"), "a"]);
 });
 
 test("thinking clear: predicate-gated drop of the contiguous run before the call", () => {
@@ -238,28 +325,30 @@ test("thinking clear: predicate-gated drop of the contiguous run before the call
   const drop1 = msg("d1", "m00007", "reasoning");
   const drop2 = msg("d2", "m00008", "reasoning");
   const [c, r] = pair("call1");
-  const a = msg("a", "m00010", "user");
+  const a = msg("a", "m00010", "text");
   const messages = [keep1, drop1, drop2, c, r, a];
   const state = stateWith(
     [{ blockId: "b1", compressCallId: "call1", startRef: "m00001", endRef: "m00005" }],
     { a: "m00010", k1: "m00006" },
   );
   // Predicate accepts d1/d2 but refuses k1 (e.g. signed) — scan continues PAST
-  // the refused core (documented behaviour). k1 survives with ref 6 > boundary
-  // 5, so the pair lands before it.
+  // the refused core (documented behaviour). Dropped cores never qualify as
+  // boundaries; first qualifying survivor is k1 (6 > 5).
+  // v2: the pair KEEPS its slot (after k1 in the input); only the carrier
+  // moves (before k1, the first qualifying survivor).
   const out = relocateCompressCarriers(messages, state, {
     clearThinking: true,
     reasoningDroppable: (m) => m.id !== "k1",
   });
-  assert.deepEqual(ids(out), ["call-call1", "res-call1", "k1", "a"]);
-  assert.equal(out[2], keep1);
+  assert.deepEqual(ids(out), [carrierId("call1"), "k1", "call-call1", "res-call1", "a"]);
+  assert.equal(out[1], keep1);
 });
 
 test("thinking clear: non-reasoning core stops the walk", () => {
   const textBefore = msg("t0", "m00006", "text");
   const drop = msg("d1", "m00007", "reasoning");
   const [c, r] = pair("call1");
-  const a = msg("a", "m00010", "user");
+  const a = msg("a", "m00010", "text");
   const messages = [textBefore, drop, c, r, a];
   const state = stateWith(
     [{ blockId: "b1", compressCallId: "call1", startRef: "m00001", endRef: "m00005" }],
@@ -269,46 +358,17 @@ test("thinking clear: non-reasoning core stops the walk", () => {
     clearThinking: true,
     reasoningDroppable: () => true,
   });
-  assert.deepEqual(ids(out), ["t0", "call-call1", "res-call1", "a"]);
+  assert.deepEqual(ids(out), ["t0", "call-call1", "res-call1", carrierId("call1"), "a"]);
 });
 
-test("clearThinking without a predicate is a no-op for drops (conservative default)", () => {
-  const drop = msg("d1", "m00007", "reasoning");
-  const [c, r] = pair("call1");
-  const a = msg("a", "m00010", "user");
-  const messages = [drop, c, r, a];
-  const state = stateWith(
-    [{ blockId: "b1", compressCallId: "call1", startRef: "m00001", endRef: "m00005" }],
-    { a: "m00010" },
-  );
-  const out = relocateCompressCarriers(messages, state, { clearThinking: true });
-  assert.deepEqual(ids(out), ["d1", "call-call1", "res-call1", "a"]);
-});
-
-test("idempotent: applying twice yields the identical layout", () => {
-  const a = msg("a", "m00003", "user");
-  const b = msg("b", "m00004", "assistant");
-  const [c, r] = pair("call1");
-  const messages = [a, b, c, r];
-  const state = stateWith(
-    [{ blockId: "b1", compressCallId: "call1", startRef: "m00001", endRef: "m00002" }],
-    { a: "m00003", b: "m00004" },
-  );
-  const once = relocateCompressCarriers(messages, state);
-  const twice = relocateCompressCarriers(once, state);
-  assert.deepEqual(ids(twice), ids(once));
-  for (let i = 0; i < once.length; i++) assert.equal(twice[i], once[i]);
-});
-
-test("interleaved calls: each pair lands at its own boundary regardless of slot order", () => {
-  // A folds m00001–m00005, B folds m00006–m00008; survivors p (m00001? no—p is
-  // pre-fold), q m00009... Construct post-fold reality: survivors only.
-  const s1 = msg("s1", "m00009", "user");
-  const s2 = msg("s2", "m00010", "assistant");
-  const s3 = msg("s3", "m00011", "user");
+test("interleaved calls: carriers land at their boundaries regardless of pair slot order", () => {
+  const s1 = msg("s1", "m00009", "text");
+  const s2 = msg("s2", "m00010", "text");
+  const s3 = msg("s3", "m00011", "text");
   const [pa, ra] = pair("callA");
   const [pb, rb] = pair("callB");
-  // B's pair sits EARLIER than A's although A's boundary (5) is smaller.
+  // B's pair sits EARLIER than A's although A's boundary (5) is smaller; both
+  // pairs keep their slots, only carriers are emitted (k=0 for both).
   const messages = [s1, pb, rb, pa, ra, s2, s3];
   const state = stateWith(
     [
@@ -317,23 +377,23 @@ test("interleaved calls: each pair lands at its own boundary regardless of slot 
     ],
     { s1: "m00009", s2: "m00010", s3: "m00011" },
   );
-  // A: first survivor with ref>5 ⇒ s1 ⇒ k=0. B: same ⇒ k=0 too (both before s1);
-  // tie-break by original callIndex (pb earlier) ⇒ pb,rb then pa,ra.
   const out = relocateCompressCarriers(messages, state);
   assert.deepEqual(ids(out), [
+    carrierId("callB"),
+    carrierId("callA"),
+    "s1",
     "call-callB",
     "res-callB",
     "call-callA",
     "res-callA",
-    "s1",
     "s2",
     "s3",
   ]);
 });
 
-test("two distinct boundaries place pairs at different survivor slots", () => {
-  const t1 = msg("t1", "m00003", "user"); // > 2 (A's boundary) but ≤ 8 (B's)
-  const s2 = msg("s2", "m00009", "assistant"); // > 8
+test("two distinct boundaries place carriers at different survivor slots", () => {
+  const t1 = msg("t1", "m00003", "text"); // > 2 (A's boundary) but ≤ 8 (B's)
+  const s2 = msg("s2", "m00009", "text"); // > 8
   const [pa, ra] = pair("callA");
   const [pb, rb] = pair("callB");
   const messages = [t1, s2, pa, ra, pb, rb];
@@ -347,17 +407,19 @@ test("two distinct boundaries place pairs at different survivor slots", () => {
   const out = relocateCompressCarriers(messages, state);
   // A ⇒ before t1 (ref 3 > 2) ⇒ k=0; B ⇒ before s2 (first ref > 8) ⇒ k=1.
   assert.deepEqual(ids(out), [
+    carrierId("callA"),
+    "t1",
+    carrierId("callB"),
+    "s2",
     "call-callA",
     "res-callA",
-    "t1",
     "call-callB",
     "res-callB",
-    "s2",
   ]);
 });
 
 test("refs are untouched by relocation", () => {
-  const a = msg("a", "m00003", "user");
+  const a = msg("a", "m00003", "text");
   const [c, r] = pair("call1");
   const messages = [a, c, r];
   const state = stateWith(
@@ -375,23 +437,23 @@ test("isCompressTool override honours dialect names", () => {
     toolCallId: "callX",
   });
   const result = msg("mr", null, "tool-result", { toolCallId: "callX" });
-  const a = msg("a", "m00003", "user");
+  const a = msg("a", "m00003", "text");
   const messages = [a, call, result];
   const state = stateWith(
     [{ blockId: "bx", compressCallId: "callX", startRef: "m00001", endRef: "m00002" }],
     { a: "m00003" },
   );
-  // Bare-name matching alone would NOT move this pair.
+  // Bare-name matching alone would NOT relocate this pair.
   assert.equal(relocateCompressCarriers(messages, state), messages);
   // With the host dialect predicate it does.
   const out = relocateCompressCarriers(messages, state, {
     isCompressTool: (n) => n === "acp_compress",
   });
-  assert.deepEqual(ids(out), ["mc", "mr", "a"]);
+  assert.deepEqual(ids(out), [carrierId("callX"), "a", "mc", "mr"]);
 });
 
-test("plan and apply agree on removed indices", () => {
-  const a = msg("a", "m00003", "user");
+test("plan and apply agree: no pair removals in v2, pointer+carrier well-formed", () => {
+  const a = msg("a", "m00003", "text");
   const [c, r] = pair("call1");
   const messages = [a, c, r];
   const state = stateWith(
@@ -400,7 +462,13 @@ test("plan and apply agree on removed indices", () => {
   );
   const plan = planRelocateCompressCarriers(messages, state);
   assert.equal(plan.changed, true);
-  assert.deepEqual([...plan.removedInputIndices].sort((x, y) => x - y), [1, 2]);
+  // v2: the pair is NOT removed — only dropped reasoning ever lands here.
+  assert.deepEqual([...plan.removedInputIndices], []);
   assert.equal(plan.moves.length, 1);
-  assert.equal(plan.moves[0].insertAtOutput, 0);
+  const move = plan.moves[0]!;
+  assert.equal(move.callIndex, 1);
+  assert.equal(move.resultIndex, 2);
+  assert.equal(move.insertAtOutput, 0); // before a (ref 3 > 2)
+  assert.equal(move.carrier.id, carrierId("call1"));
+  assert.ok(move.pointerText.includes(RELOCATED_POINTER_MARKER));
 });

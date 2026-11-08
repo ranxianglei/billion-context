@@ -2262,10 +2262,12 @@ async function forwardCaptured(
                     // against them drops the only cross-turn summary carrier and breaks the byte-prefix
                     // at the fold anchor (post-fold cache floor reset to the stable head).
                     const outBase = [...stripKernelSummaries(viewed as BiliMessage[], turn.state), ...(records as BiliMessage[])] as BiliMessage[];
-                    // Fold-point carrier relocation round-2 mirror (switch A): with the
-                    // switch on, pairs sit at their fold point instead of being
-                    // tail-appended onto the re-request. Idempotent when processTurn's
-                    // node already moved them (view-only + deterministic transform).
+                    // Fold-point summary relocation round-2 mirror (switch A): with
+                    // the switch on, each still-visible compress pair keeps its
+                    // chronological slot but its SUMMARY TEXT is re-emitted at its
+                    // fold point (call args become a pointer — v2 semantics).
+                    // Idempotent when processTurn's node already relocated them
+                    // (view-only + deterministic transform).
                     const out = loopConfig.compressAtFoldPoint
                         ? relocateCompressCarriers(outBase as unknown as CoreMessage[], turn.state, {
                             isCompressTool: loopConfig.isCompressTool,
