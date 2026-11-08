@@ -126,3 +126,15 @@ test("#5981: reading the stamp does not consume it (one cut stream may dispatch 
     const out = runApply(ctx, {});
     assert.ok(out.includes("ARGUMENTS LOST IN TRANSIT"), out);
 });
+
+// Gate direction (bytes present): a shape-drifted call ({ranges: …}, #362)
+// carries bytes, so the empty-call verdict must not apply to it even while a
+// stamp is live — its own receipt and its own ledger charges stay intact.
+test("#5981: a non-empty invalid call with a live stamp keeps its own receipt and ledger charge", () => {
+    const ctx = makeCompressibleCtx();
+    noteTruncatedUpstream(ctx.session, "openai", "eof");
+    const out = runApply(ctx, { ranges: [{ startId: "m00001", endId: "m00002" }] });
+    assert.ok(out.includes("no valid ranges parsed"), out);
+    assert.ok(!out.includes("ARGUMENTS LOST IN TRANSIT"), "corrupt/shape-drifted bytes keep their own diagnosis: " + out);
+    assert.ok(Array.isArray(ctx.session.metadata["compressFailKeys"]), "model-authored bad shapes still charge the #847 guard");
+});
