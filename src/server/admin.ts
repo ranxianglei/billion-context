@@ -428,6 +428,8 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
             opts.auxProxyFallback = fresh.auxProxyFallback;
             opts.compress = fresh.compress;
             opts.compat = fresh.compat;
+            // #5930: the applied file generation travels with the options it was read from.
+            opts.configSourceEpoch = fresh.configSourceEpoch;
             // #5079: routing must hot-apply too — the web switch changes it live.
             opts.promptCache = fresh.promptCache;
             resetProxyCache();
@@ -930,6 +932,8 @@ function handleConfigReload(opts: ProxyOptions, res: http.ServerResponse, log: (
     const reloaded = loadOptions();
     opts.compress = reloaded.compress;
     opts.compat = reloaded.compat;
+    // #5930: the reloaded file generation travels with the options it was read from.
+    opts.configSourceEpoch = reloaded.configSourceEpoch;
     opts.imageBilling = reloaded.imageBilling;
     opts.imageTokenCap = reloaded.imageTokenCap;
     // #6003 phase 2: egress transforms are file-only, so pull them off the fresh

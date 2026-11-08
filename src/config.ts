@@ -997,6 +997,13 @@ export type ProxyOptions = {
         injectTool: boolean;
         injectNudge: boolean;
     };
+    /** #5930: the configFileEpoch() generation the compress/routes/namedProviders
+     *  layers above were resolved from — captured once per loadOptions / web Apply /
+     *  reload. storeEffectiveConfig stamps THIS onto session snapshots (not the live
+     *  hash at store time), so the #2960⑥ stale-stamp guard fires as soon as the file
+     *  moves past the generation the snapshot was actually built from. Optional so
+     *  inline test fixtures (which never exercise the guard) stay terse. */
+    configSourceEpoch?: string;
     promptCache: { routing: PromptCacheRouting };
     /** Wire-compat role map (global level; per-provider `compat.roles` overlays
      *  it per key). `{"developer":"system"}` rewrites developer→system on the
@@ -1658,6 +1665,12 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
     // The canonical, user-editable config. Loaded first so env vars below can
     // override it (env wins for environment-specific overrides).
     const fileConfig = loadConfigFile();
+    // #5930: identity of the file generation these options were resolved from.
+    // Captured HERE (not at session-store time): every layer below is built from
+    // this same read, and sessions must be stamped with this generation — stamping
+    // the live hash at store time let a direct edit between refresh and request
+    // mint a fresh-looking stamp onto a pre-edit snapshot (#2960⑥ guard defeated).
+    const configSourceEpoch = configFileEpoch();
 
     // #4899: parse + publish the billing price overrides here so every reload
     // path (startup, web Apply onChanged, /__bili/config reload) funnels
@@ -1788,6 +1801,7 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
             injectTool: (env.ACP_COMPRESS_TOOL ?? (fileConfig.compress?.injectTool === false ? "0" : "1")) !== "0",
             injectNudge: (env.ACP_COMPRESS_NUDGE ?? (fileConfig.compress?.injectNudge === false ? "0" : "1")) !== "0",
         },
+        configSourceEpoch,
         promptCache: {
             routing: parsePromptCacheRouting(env.ACP_PROMPT_CACHE_ROUTING ?? fileConfig.promptCache?.routing),
         },

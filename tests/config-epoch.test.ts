@@ -5,6 +5,8 @@ import path from "node:path";
 import test from "node:test";
 import { defaultConfig, createInitialState, type Config } from "acp-kernel";
 import { effectiveConfig, storeEffectiveConfig, type Session } from "../src/session.js";
+import { configFileEpoch, loadOptions } from "../src/config.js";
+import { resolveRequestConfig } from "../src/compress-settings.js";
 import { externalSummaryEnabled } from "../src/external-summary-surface.js";
 
 // #3430: the effectiveConfig stamp is only valid while the config SOURCE it was
@@ -13,7 +15,10 @@ import { externalSummaryEnabled } from "../src/external-summary-surface.js";
 // lane → the stamp is refused and the live file tier is re-resolved onto the
 // fallback, so a retired setting (the October externalSummary incident: a
 // user-disabled summary chain kept executing off one old stamp) can never ride
-// a stale snapshot again.
+// a stale snapshot again. #5930 moved stamp capture from store-time to
+// source-load-time: stamps now carry the configFileEpoch() generation the
+// options were loaded from, so a direct file edit goes stale even when no
+// request has re-resolved anything since.
 
 function makeSession(): Session {
     return { id: "cfg-epoch-s1", metadata: {}, stats: {}, state: createInitialState() } as unknown as Session;
@@ -30,9 +35,10 @@ test("config epoch: same-source stamp still wins (merge semantics unchanged)", (
     process.env.BILI_CONFIG_FILE = file;
     try {
         const session = makeSession();
+        const epoch = configFileEpoch(); // the generation these options were loaded from
         const stamped = defaultConfig(200_000);
         stamped.modelContextLimit = 123_456; // a request-cascade override worth keeping
-        storeEffectiveConfig(session, stamped);
+        storeEffectiveConfig(session, stamped, epoch);
         const read = effectiveConfig(session, defaultConfig(200_000));
         assert.equal(read.modelContextLimit, 123_456, "live stamp must win over the fallback");
     } finally {
@@ -48,9 +54,10 @@ test("config epoch: edited file refuses the stamp and re-resolves the live compr
     process.env.BILI_CONFIG_FILE = file;
     try {
         const session = makeSession();
+        const epoch = configFileEpoch();
         const stamped = defaultConfig(200_000);
         stamped.modelContextLimit = 123_456;
-        storeEffectiveConfig(session, stamped);
+        storeEffectiveConfig(session, stamped, epoch);
         // The user edits the file AFTER the stamp: new window, new knob.
         writeFileSync(file, JSON.stringify({ compress: { modelContextLimit: 777_000, nudgeGrowthTokens: 512 } }));
         const read = effectiveConfig(session, defaultConfig(200_000));
@@ -71,7 +78,7 @@ test("config epoch: a retired externalSummary chain cannot ride a stale stamp (t
         const session = makeSession();
         const stamped = defaultConfig(200_000) as Config & { externalSummary?: { enabled: boolean } };
         stamped.externalSummary = { enabled: true };
-        storeEffectiveConfig(session, stamped);
+        storeEffectiveConfig(session, stamped, configFileEpoch());
         assert.equal(externalSummaryEnabled(effectiveConfig(session, defaultConfig(200_000))), true, "precondition: chain on while the file still declares it");
         // The user deletes the chain from the file, but the session never sees
         // another wire request on this instance.
@@ -120,9 +127,10 @@ test("config epoch: byte-identical files at different paths are the same source 
     process.env.BILI_CONFIG_FILE = fileA;
     try {
         const session = makeSession();
+        const epoch = configFileEpoch();
         const stamped = defaultConfig(200_000);
         stamped.modelContextLimit = 123_456;
-        storeEffectiveConfig(session, stamped);
+        storeEffectiveConfig(session, stamped, epoch);
         // A second instance resolving the SAME bytes under a different lane
         // path: identical file tier → the stamp is still a valid resolution.
         process.env.BILI_CONFIG_FILE = fileB;
@@ -152,6 +160,37 @@ test("config epoch: stamps without an epoch keep the legacy behavior (stamp wins
         writeFileSync(file, JSON.stringify({ compress: { modelContextLimit: 777_000 } }));
         const read = effectiveConfig(session, defaultConfig(200_000));
         assert.equal(read.modelContextLimit, 123_456, "legacy stamps (no epoch) keep the documented merge semantics");
+    } finally {
+        delete process.env.BILI_CONFIG_FILE;
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("config epoch #5930: a direct file edit between options-load and the next request goes stale", () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "bili-epoch-5930-"));
+    const file = pinnedConfigFile(dir);
+    process.env.BILI_CONFIG_FILE = file;
+    try {
+        // v1: the generation the process loaded its options from at startup.
+        writeFileSync(file, JSON.stringify({ compress: { modelContextLimit: 333_000 } }));
+        const opts = loadOptions();
+        assert.ok(opts.configSourceEpoch, "loadOptions must carry the source-generation epoch");
+        const session = makeSession();
+        // First wire request: resolve from the loaded options, store latest-wins.
+        let reqConfig = resolveRequestConfig(opts.kernelConfig, opts.routes, undefined, "test-model", undefined, opts.compress);
+        storeEffectiveConfig(session, reqConfig, opts.configSourceEpoch);
+        let read = effectiveConfig(session, opts.kernelConfig);
+        assert.equal(read.modelContextLimit, 333_000, "precondition: the snapshot serves while its source generation is still live");
+        // The user edits the file directly — NO reload / Apply / restart follows.
+        writeFileSync(file, JSON.stringify({ compress: { modelContextLimit: 777_000 } }));
+        // Next wire request: the in-memory options are STILL the v1 generation;
+        // the request re-resolves from them and re-stores (per-request latest-wins).
+        // Pre-#5930 this store re-stamped the LIVE hash onto a pre-edit snapshot,
+        // so the guard could never fire until a reload/restart.
+        reqConfig = resolveRequestConfig(opts.kernelConfig, opts.routes, undefined, "test-model", undefined, opts.compress);
+        storeEffectiveConfig(session, reqConfig, opts.configSourceEpoch);
+        read = effectiveConfig(session, opts.kernelConfig);
+        assert.equal(read.modelContextLimit, 777_000, "stale options-generation stamp must be refused — the live file tier wins");
     } finally {
         delete process.env.BILI_CONFIG_FILE;
         rmSync(dir, { recursive: true, force: true });
