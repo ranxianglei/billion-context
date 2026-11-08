@@ -3733,6 +3733,32 @@ export function buildWindowShrinkNote(args: {
     return head + `it was aligned down to codex's own window perception; set compress.modelContextLimit explicitly if your upstream serves the larger window.`;
 }
 
+// #5000/#4543: the core-text byte floor (estimateCoreMessagesUpperBytes) prices
+// only m.text — tools[], tool_calls[].function.arguments, the system prompt and
+// the JSON envelope are invisible to it, so a body can ride multi-MB over the
+// window on the wire while every projection-based doom gate stays silent
+// (incident #5000: 55.2 MiB wire body whose core text cleared the floor;
+// #4543: a 4.1 MiB CJK body the 7.5 B/tok floor can only see past ~7.5 MB on a
+// 1M window). Price the ACTUAL outbound body instead: the same CJK-aware leaf
+// walk the #554 side-request guard uses (estimateRawBodyTokens) counts every
+// string field of the serialized request — the conservative overcount (ids,
+// roles, structural strings) is the right bias for a fail-closed gate. Image
+// tokens are charged separately by the caller (they sit in binary-carrying
+// keys the walk excludes by design). Unparseable bodies return undefined —
+// callers keep the byte-floor fallback for them.
+export function measuredOutboundTokens(prepared: { body: string | Buffer; parsedBody?: unknown }): number | undefined {
+    let parsed: unknown = prepared.parsedBody;
+    if (parsed === undefined) {
+        const raw = typeof prepared.body === "string" ? prepared.body : prepared.body.toString("utf8");
+        try {
+            parsed = JSON.parse(raw);
+        } catch {
+            return undefined;
+        }
+    }
+    return estimateRawBodyTokens(parsed);
+}
+
 export async function preflightCompressIfNeeded(
     prepared: Prepared,
     runPrepare: () => Promise<Prepared>,
@@ -3986,6 +4012,17 @@ export async function preflightCompressIfNeeded(
         // the operator can verify it by hand. Bytes, not chars: CJK monsters
         // are char-cheap (1 char ≈ 1 token already) but byte-doomed; every legit
         // fitting English payload sits ~4× under the ratio bar.
+        // #5000/#4543: this probe gate keeps the #2490 byte-floor contract
+        // (7.5 B/tok = the densest REAL billing observed, the most conservative
+        // density; the 2MB absolute keeps experiment-sized payloads probing —
+        // the #1001 shape, where real tokenizers compress past any byte-ratio
+        // bar, must stay able to bet one request and settle a usage baseline).
+        // A measured-token tier lives at the gates where a forward is
+        // arbitration of a body preflight already tried to shrink: the #1839
+        // forward-once arm below, the #3146/#4185 post-fold block further down,
+        // and the egress fuse in relay.ts — not here, where the 400 of a probe
+        // is the designed #2313 evidence (refusal record, model/origin-scoped,
+        // TTL) rather than a guaranteed waste.
         const coreTextBytes = estimateCoreMessagesUpperBytes(prepared.processedMessages);
         if (coreTextBytes > Math.max(DOOMED_PROBE_ABSOLUTE_BYTES, limit * DOOMED_PROBE_BYTES_PER_TOKEN)) {
             const byteFloorTokens = Math.ceil(coreTextBytes / DOOMED_PROBE_BYTES_PER_TOKEN);
@@ -4347,6 +4384,25 @@ export async function preflightCompressIfNeeded(
         }
         return outbound;
     }
+    // #5000/#4543/#5885: parse the rebuilt outbound ONCE, up front, for the
+    // measured-body doom tiers below (the #1839 arm and the #3146/#4185 gate)
+    // AND for the output-budget read nativeFitAfterClamp needs. The meter is
+    // the #554 side-request guard's own: it walks every string field of the
+    // serialized body (system + tools + arguments + messages, CJK-aware), so
+    // unlike the m.text byte floor it sees the mass that actually rides the
+    // wire. Parse failure leaves both readings undefined — the byte-floor
+    // fallbacks stay binding for those bodies.
+    let outboundBudgetTokens: number | undefined;
+    let outboundRawTokens: number | undefined;
+    try {
+        const outBody: unknown = JSON.parse(typeof outbound.body === "string" ? outbound.body : outbound.body.toString("utf8"));
+        outboundRawTokens = estimateRawBodyTokens(outBody);
+        const outField = outputBudgetField(outBody);
+        const rawBudget = outField !== null ? readOutputBudget(outBody as Record<string, unknown>, outField) : undefined;
+        if (typeof rawBudget === "number" && rawBudget > 0) outboundBudgetTokens = rawBudget;
+    } catch {
+        outboundBudgetTokens = undefined;
+    }
     // #1839: the two measurements disagree — preflight's own final view
     // (post-fold content + images + wire overhead) fits, but the fresh
     // normal-config rebuild measures over. That divergence produced the
@@ -4357,6 +4413,30 @@ export async function preflightCompressIfNeeded(
     // payload is no longer refused on a stale measurement. One forward
     // only — the #330 relaxed-zone caveat still bounds the risk.
     if (result.compressedRanges > 0 && !unknownBaseline && result.payloadEstimate < limit && !localRefusalHere) {
+        // #5000/#4543/#5885: the disagreement above is between two ESTIMATES — a
+        // MEASURED body is authoritative. If the rebuilt body itself exceeds the
+        // window on the #554 meter, "forwarding once for arbitration" is a
+        // guaranteed 400 (#4543: a 4.1 MiB CJK body measuring 1,121,674 tokens
+        // against a 1M window) and the log's "NOT forwarded" claim would be a
+        // lie (#5885 defect 3) — answer it 413 instead of burning the send.
+        // Bar: the NATIVE window when bili knows it (a body over the upstream's
+        // real window can never fit, on any tokenizer), the headroom limit as
+        // fallback — a meter over-count against the POLICY headroom must not
+        // swallow the #1839/#4185 "fits the native window" forwards.
+        // Images are NOT part of this comparison: an image-dominated overage is
+        // the #496/#1800 billing-arbitration domain (forward, let upstream bill
+        // or 400 for real evidence), not a doom — #857's screenshot turn pins
+        // that. The #554 meter excludes image payloads (image_url/data/url/...),
+        // so `outboundRawTokens` is text-only by construction.
+        const armMeasuredBar = typeof resolvedNativeWindow === "number" && resolvedNativeWindow > 0 ? resolvedNativeWindow : limit;
+        if (outboundRawTokens !== undefined && outboundRawTokens > armMeasuredBar) {
+            const outMsgs = outbound.processedMessages.length > 0 ? outbound.processedMessages : outbound.originalMessages;
+            log("error", `[${session.id}] preflight 413 measured-body profile (post-fold): ${describeCoreTextDuplication(outMsgs)}`);
+            const measuredDoomMessage = `rebuilt outbound body measures ~${outboundRawTokens.toLocaleString("en-US")} TEXT tokens (system + tools + arguments + messages; CJK-aware count, the #554 guard meter; images billed separately, never doom here — #496/#1800/#857) vs the model window ${armMeasuredBar.toLocaleString("en-US")} (model=${model}); the body ITSELF exceeds the window, so it was NOT forwarded for upstream arbitration. Remove or trim the oversized content (e.g. a giant paste or tool result) and retry.`;
+            log("error", `[${session.id}] preflight fail-fast 413 (retryable=false): ${measuredDoomMessage}`);
+            noteLocalRefusal(session, currentOrigin, model, limit);
+            return { failFast: true, status: 413, message: measuredDoomMessage, retryable: false, respond: !res.writableEnded };
+        }
         log("warn", `[${session.id}] preflight view fits (~${result.payloadEstimate}/${limit}) but the rebuilt payload measures over — forwarding once for upstream arbitration (#1839)`);
         return outbound;
     }
@@ -4433,20 +4513,29 @@ export async function preflightCompressIfNeeded(
     // native-fit arm closed; doom bytes (#2490) and #3846 guard every arm.
     const deterministicExhaustion = f?.kind === "exhausted" && f.deterministic;
     const noUpstreamEvidence = session.stats.lastInputTokens <= 0 && statedWall <= 0 && deterministicExhaustion;
-    let outboundBudgetTokens: number | undefined;
-    try {
-        const outBody: unknown = JSON.parse(typeof outbound.body === "string" ? outbound.body : outbound.body.toString("utf8"));
-        const outField = outputBudgetField(outBody);
-        const rawBudget = outField !== null ? readOutputBudget(outBody as Record<string, unknown>, outField) : undefined;
-        if (typeof rawBudget === "number" && rawBudget > 0) outboundBudgetTokens = rawBudget;
-    } catch {
-        outboundBudgetTokens = undefined;
-    }
     const outboundCalibrated = foldedCalibratedSize ?? calibratedPayload;
     const nativeFitAfterClamp = statedWall <= 0 && outboundBudgetTokens !== undefined && typeof resolvedNativeWindow === "number" && resolvedNativeWindow > 0
         && outboundCalibrated + outboundBudgetTokens <= resolvedNativeWindow;
     if ((unknownBaseline || noUpstreamEvidence || nativeFitAfterClamp) && !growthArmed) {
         const outMsgs = outbound.processedMessages.length > 0 ? outbound.processedMessages : outbound.originalMessages;
+        // #5000/#4543: the measured body is the stronger reading — if it exceeds
+        // the window no upstream can accept it, whatever the byte floor says
+        // (the floor only sees m.text; #5000's 55.2 MiB wire body and #4543's
+        // 4.1 MiB CJK body both cleared it). Same bar as the #1839 arm above:
+        // the native window when known (a #4185 headroom over-count must not
+        // false-refuse a natively-fitting body), the headroom limit as
+        // fallback. Measured tier first, byte floor below stays as the
+        // fallback for unparseable bodies.
+        // Same text-only rule as the #1839 arm above: image-dominated overage
+        // belongs to the #496/#1800 billing arbitration, never to a local doom.
+        const gateMeasuredBar = typeof resolvedNativeWindow === "number" && resolvedNativeWindow > 0 ? resolvedNativeWindow : limit;
+        if (outboundRawTokens !== undefined && outboundRawTokens > gateMeasuredBar) {
+            log("error", `[${session.id}] preflight 413 measured-body profile: ${describeCoreTextDuplication(outMsgs)}`);
+            const measuredDoomMessage = `outbound body measures ~${outboundRawTokens.toLocaleString("en-US")} TEXT tokens even after preflight compression (system + tools + arguments + messages; CJK-aware count, the #554 guard meter; images billed separately, never doom here — #496/#1800/#857) vs the model window ${gateMeasuredBar.toLocaleString("en-US")} (model=${model}); the body ITSELF exceeds the window, so it was NOT forwarded. Remove or trim the oversized content (e.g. a giant paste or tool result) and retry.`;
+            log("error", `[${session.id}] preflight fail-fast 413 (retryable=false): ${measuredDoomMessage}`);
+            noteLocalRefusal(session, currentOrigin, model, limit);
+            return { failFast: true, status: 413, message: measuredDoomMessage, retryable: false, respond: !res.writableEnded };
+        }
         const doomBytes = estimateCoreMessagesUpperBytes(outMsgs);
         if (doomBytes > Math.max(DOOMED_PROBE_ABSOLUTE_BYTES, limit * DOOMED_PROBE_BYTES_PER_TOKEN)) {
             const byteFloorTokens = Math.ceil(doomBytes / DOOMED_PROBE_BYTES_PER_TOKEN);

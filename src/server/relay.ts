@@ -69,7 +69,7 @@ import { buildForwardHeaders, connectionNamedHeaders, RESPONSE_ONLY_STRIP_HEADER
 import { bodyDumpEnabled, logDumpFailure } from "./observability.js";
 import { effectiveAbsorbBlock } from "./prepare-responses.js";
 import { awaitDrain, bufferToStream, dumpStreamToFile, pipeThrough, readStreamToBuffer } from "./stream-io.js";
-import { buildForwardTarget, makeFoldPointReasoningDroppable, outboundPayloadBreakdown, registerRequestAbort, beginStreamKeepalive, effectiveTokenCount, googlePathKind, imageBillingFor, imageTokenCapFor, inboundResignCredential, outboundContextEstimates, repairResponsesAssistantOrdering, resolveUpstream, stripKernelSummaries, usageGradeInputBaseline, DOOMED_PROBE_ABSOLUTE_BYTES, DOOMED_PROBE_BYTES_PER_TOKEN, type Prepared } from "../server.js";
+import { buildForwardTarget, makeFoldPointReasoningDroppable, measuredOutboundTokens, outboundPayloadBreakdown, registerRequestAbort, beginStreamKeepalive, effectiveTokenCount, googlePathKind, imageBillingFor, imageTokenCapFor, inboundResignCredential, outboundContextEstimates, repairResponsesAssistantOrdering, resolveUpstream, stripKernelSummaries, usageGradeInputBaseline, DOOMED_PROBE_ABSOLUTE_BYTES, DOOMED_PROBE_BYTES_PER_TOKEN, type Prepared } from "../server.js";
 import { isStrictReasoningEcho, modelIdOf } from "../strict-echo.js";
 
 /** Infer the wire protocol from the request path for compat-role rewrites on
@@ -725,6 +725,33 @@ async function forwardCaptured(
         const fuseWindow = Math.max(declaredWindow, MIN_ASSUMED_WINDOW_TOKENS);
         if (declaredWindow > 0) {
             const fuseMsgs = prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages;
+            // #5000/#4543: the byte floor below prices only m.text — a body whose
+            // mass sits in tools[] / tool arguments / the system prompt clears it
+            // (incident #5000: a 55.2 MiB wire body whose core text cleared the
+            // floor; #4543: a 4.1 MiB CJK body measuring ~1.12M tokens that the
+            // 7.5 B/tok floor cannot see below ~8.4 MB). Price the ACTUAL
+            // outbound body first with the #554 side-request meter (every string
+            // field, CJK-aware) and judge it against the SAME floored bar the
+            // byte floor uses (fuseWindow): the fuse's #4079 contract is
+            // "never block what a largest-common-window upstream might accept",
+            // and that contract binds a measurement just as much as a density
+            // guess — a wrong-small declaration must not false-block a body a
+            // 1M window would take. #4543 still lands: its declared 1,048,580
+            // window sits ABOVE the 1M floor, so floored or not the 1.12M-token
+            // body exceeds it. The byte floor stays as the fallback for
+            // unparseable bodies. No refusal record either way (#3974).
+            const fuseRawTokens = measuredOutboundTokens(prepared);
+            if (fuseRawTokens !== undefined && fuseRawTokens > fuseWindow) {
+                log("warn", `413: [${prepared.session.id}] egress window fuse measured-body profile: ${describeCoreTextDuplication(fuseMsgs)}`);
+                const fuseMessage = `outbound body measures ~${fuseRawTokens.toLocaleString("en-US")} tokens (system + tools + arguments + messages; CJK-aware count, the #554 guard meter) vs the effective model window ${declaredWindow.toLocaleString("en-US")} (bars never assume below ${MIN_ASSUMED_WINDOW_TOKENS} tokens, #4079) (model=${prepared.model ?? "unknown"}); the body ITSELF exceeds the window, so the send was stopped at the egress fuse instead of being forwarded (#5000/#4543/#4068). Remove or trim the oversized content (e.g. a giant paste or tool result) and retry.`;
+                log("warn", `413: [${prepared.session.id}] egress window fuse: ${fuseMessage}`);
+                if (res.headersSent) emitStreamError(res, prepared.protocol, fuseMessage, undefined, opts.streamErrorShape);
+                else {
+                    res.writeHead(413, { "content-type": "application/json" });
+                    res.end(JSON.stringify({ error: { type: "request_too_large", code: "egress_window_fuse", stage: "forward", message: fuseMessage, retryable: false } }));
+                }
+                return;
+            }
             const fuseBytes = estimateCoreMessagesUpperBytes(fuseMsgs);
             if (fuseBytes > Math.max(DOOMED_PROBE_ABSOLUTE_BYTES, fuseWindow * DOOMED_PROBE_BYTES_PER_TOKEN)) {
                 const fuseFloorTokens = Math.ceil(fuseBytes / DOOMED_PROBE_BYTES_PER_TOKEN);

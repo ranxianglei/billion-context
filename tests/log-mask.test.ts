@@ -702,6 +702,39 @@ test("redactSecretsInText: scrubs credential-shaped tokens from free-form text (
     for (const s of negatives) assert.equal(redactSecretsInText(s), s, `must stay verbatim: ${s}`);
 });
 
+test("redactSecretsInText: JSON-quoted credential keys and Groq/Hugging Face keys are scrubbed", () => {
+    // A quote between the key name and the colon ("api_key": "…") used to stop the key=value
+    // rule, so a value without a known key prefix reached the log and the diagnostics blob.
+    assert.equal(
+        redactSecretsInText('{"error":{"message":"invalid","api_key":"0123456789abcdef0123"}}'),
+        '{"error":{"message":"invalid","api_key":"<masked 20 chars>"}}',
+    );
+    assert.equal(
+        redactSecretsInText('{"user":"alice","password":"hunter2hunter2"}'),
+        '{"user":"alice","password":"<masked 14 chars>"}',
+    );
+    assert.equal(
+        redactSecretsInText("{'access_token': 'ya29.a0AfH6SMBx3kL9ZqWv'}"),
+        "{'access_token': '<masked 23 chars>'}",
+    );
+    assert.equal(
+        redactSecretsInText("Invalid API Key: gsk_8fJ2kLmN4pQrS7tUvW9xYz1aBcDeFgHiJkLmNoPqRsTuVwXyZ012"),
+        "Invalid API Key: <masked key>",
+    );
+    assert.equal(redactSecretsInText("auth failed for hf_AbCdEfGhIjKlMnOpQrStUvWxYz12345678"), "auth failed for <masked key>");
+    const negatives = [
+        '{"prompt_tokens":1234,"completion_tokens":5678}',
+        '{"tokens": 1234}',
+        '{"token":"abc"}',
+        '{"max_tokens":4096}',
+        "hf_hub_download failed",
+        "gsk_short",
+    ];
+    for (const s of negatives) assert.equal(redactSecretsInText(s), s, `must stay verbatim: ${s}`);
+    const once = redactSecretsInText('{"api_key":"0123456789abcdef0123"}');
+    assert.equal(redactSecretsInText(once), once, "a second pass is a no-op");
+});
+
 test("maskIpsInText: non-loopback IP literals scrubbed from free-form text (#1718)", () => {
     assert.equal(maskIpsInText("connect ETIMEDOUT 203.0.113.5:8443"), "connect ETIMEDOUT <private-host>:8443");
     assert.equal(maskIpsInText("upstream refused 192.168.1.50:443 after 3 retries"), "upstream refused <private-host>:443 after 3 retries");

@@ -158,7 +158,7 @@
 |-----|------|---------|-----|-------------|
 | `network` | object | {} (all defaults) | — | 上游调用的传输超时、看门狗与重放策略。 |
 | `network.upstreamTimeoutMs` | number | 720000 | BILI_UPSTREAM_TIMEOUT_MS | 单次上游调用的硬上限（12 分钟覆盖慢速深度思考模型）。 |
-| `network.upstreamFirstByteMs` | number | = upstreamTimeoutMs (resolved; 720000 when unset) | BILI_UPSTREAM_FIRST_BYTE_MS | 阶段一预算：请求发出 → 首个响应字节（undici 在首个 body 数据到达时才 resolve fetch）。未设时跟随解析后的 upstreamTimeoutMs——包括把 BILI_UPSTREAM_TIMEOUT_MS 提到 12 分钟以上的部署（#5917 评审：常量 720000 回落会悄悄把它们压回 12 分钟）——行为不变；需要更快约束首字节时延的部署可显式收紧（#5904：上游接收请求后永不应答的卡死，之前会静默拖到客户端中止）。首字节到达后，chunk 间隙静默仍由完整 upstreamTimeoutMs 管辖（#1706/#1714 保证）。发布 gate 设 120000。 |
+| `network.upstreamFirstByteMs` | number | = upstreamTimeoutMs (resolved; 720000 when unset) | BILI_UPSTREAM_FIRST_BYTE_MS | 阶段一预算：请求发出 → 首个响应字节（undici 在首个 body 数据到达时才 resolve fetch）。未设时跟随解析后的 upstreamTimeoutMs——包括把 BILI_UPSTREAM_TIMEOUT_MS 提到 12 分钟以上的部署（#5917 评审：常量 720000 回落会悄悄把它们压回 12 分钟）——行为不变；需要更快约束首字节时延的部署可显式收紧（#5904：上游接收请求后永不应答的卡死，之前会静默拖到客户端中止）。首字节到达后，chunk 间隙静默仍由完整 upstreamTimeoutMs 管辖（#1706/#1714 保证）。当该值被收紧到低于 upstreamTimeoutMs 时，首字节超时成为独立失败类 `upstream-headers-timeout`——因为一个响应字节都未收到，bili 会在代理内按既有重试预算（BILI_REPLAY_RETRY_MAX，默认 3 次）重放，而不是让整步只失败一次；流中途（body）空闲超时仍是 `upstream-timeout` 且不重试。未设时行为与之前逐字节一致（#5807/#5831）。发布 gate 设 120000。 |
 | `network.requestWatchdogMs` | number | 2× upstreamTimeoutMs | BILI_REQUEST_WATCHDOG_MS | 绝对看门狗：即使按调用计时器从未挂上，也强制中止卡死的上游套接字。 |
 | `network.keepAliveTimeoutMs` | number | 5000 | BILI_KEEP_ALIVE_TIMEOUT_MS | 连接池内上游套接字的空闲保活超时。 |
 | `network.clientErrorBackstopMs` | number | 30000 | BILI_CLIENT_ERROR_BACKSTOP_MS | 中止停止读取已提交响应的客户端连接的兜底超时。 |
