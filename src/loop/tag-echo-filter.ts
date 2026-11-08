@@ -374,10 +374,11 @@ function stripBareMismatch(text: string): string {
 // that happens the pair can never resolve inside one buffer and the client
 // renders the imitation one push at a time: the reported leak.
 //
-// Anchored to the WHOLE buffer (this arm is consulted only when no matcher
-// found anything) and gated off every canonical name, so whatever the machine
-// already understands keeps its exact behaviour. The arms are the states a
-// drifted unit occupies at a push boundary:
+// Tail-anchored — the probe matches a suffix of the buffer, not the whole
+// buffer (this arm is consulted only when no matcher found anything) and is
+// gated off every canonical name, so whatever the machine already understands
+// keeps its exact behaviour. The arms are the states a drifted unit occupies
+// at a push boundary:
 //   A  opening still growing         <acpt, <acct tokens="0
 //   B  opening closed, no space      <acpt>, <acpt></, <acpt></ac
 //   C  opening closed, payload       <acct …>m00257, …>m00257</ac
