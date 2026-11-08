@@ -443,7 +443,12 @@ export function clearEstimateCoreMessagesMemoForTests(): void {
 // imageTokensInParsedBody charges those separately. Slightly overcounts (ids,
 // roles, structural strings) — a conservative bias is right for a guard that
 // fails closed.
-const NON_TEXT_BODY_KEYS = new Set(["data", "url", "b64_json", "file_data"]);
+// #5932: `image_url` is the responses-lane/OpenAI data-URL shape (the blob sits
+// DIRECTLY under that key) — counting it as text once made a 40 MB screenshot
+// body "measure" ~10M tokens and doom-gates 413'd image turns that belong in
+// the #496/#1800 billing arbitration. OpenAI chat `image_url.url`, Anthropic
+// `source.data` and Gemini `inline_data.data` were already excluded.
+const NON_TEXT_BODY_KEYS = new Set(["data", "url", "b64_json", "file_data", "image_url"]);
 
 export function estimateRawBodyTokens(parsed: unknown): number {
     let tokens = 0;
