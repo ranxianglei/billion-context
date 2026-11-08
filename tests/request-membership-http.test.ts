@@ -45,7 +45,7 @@ function messages(id?: string): Record<string, unknown>[] {
     return history;
 }
 
-test("HTTP membership abstains on a no-ID request after either foreign or member evidence", async () => {
+test("HTTP membership abstains on a no-ID request and fails closed while the id family is known (#5925)", async () => {
     _resetSessionsForTest();
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
@@ -102,12 +102,17 @@ test("HTTP membership abstains on a no-ID request after either foreign or member
             assert.equal(session.transient?.requestMembership?.member, prior === "member");
             assert.equal(session.stats.lastInputTokens, prior === "foreign" ? 100_000 : 110_000);
             await turn(sid, undefined, 200_000);
-            assert.equal(session.stats.lastInputTokens, 200_000, `${prior} verdict must not outlive its request`);
-            assert.equal(session.transient?.requestMembership, undefined);
+            // #5925: the verdict still clears (abstention unchanged), but an absent verdict no longer
+            // reads as member once the id family is known — the no-ID sample is refused, and the
+            // anchor heals through the next id-carrying report.
+            assert.equal(session.stats.lastInputTokens, prior === "foreign" ? 100_000 : 110_000, `${prior}: a no-ID sample must not settle while the id family is known (#5925)`);
+            assert.equal(session.transient?.requestMembership, undefined, `${prior} verdict must not outlive its request`);
+            await turn(sid, "main-call", 200_000);
+            assert.equal(session.stats.lastInputTokens, 200_000, `${prior}: the next id-carrying report heals the anchor`);
             await turn(sid, "another-foreign-call", 5_000);
             assert.equal(session.stats.lastInputTokens, 200_000, "a later evidenced foreign request is still refused");
         }
-        assert.equal(forwarded, 10);
+        assert.equal(forwarded, 12);
     } finally {
         if (proxy) await close(proxy);
         await close(upstream);
