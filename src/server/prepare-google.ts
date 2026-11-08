@@ -279,6 +279,7 @@ export async function prepareGoogle(
         // so the plane transform is strip-only — same chain, same guard.
         processedMessages = applySnapEgress(msgs, turn.state, processedMessages, {
             sessionId,
+            renderTags: renderStrategy,
             protocol: "google",
             log,
             transform: (m) => stripKernelSummaries(m, turn.state),

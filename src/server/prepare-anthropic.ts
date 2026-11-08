@@ -451,6 +451,7 @@ export async function prepareAnthropic(
         // prepare-openai.ts for the chain rationale).
         processedMessages = applySnapEgress(msgs, turn.state, processedMessages, {
             sessionId,
+            renderTags: renderStrategy,
             protocol: "anthropic",
             log,
             transform: (m) => applyReasoningDrop(stripKernelSummaries(m, turn.state), reasoningPlan, log, sessionId),
