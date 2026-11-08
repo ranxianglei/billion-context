@@ -377,6 +377,12 @@ test("#5874 T16f: soak default — no config section means egress ON for all fou
 });
 
 test("#5874 T18a: kernel render parity — plane rows re-stamped by the kernel renderer match the legacy render byte-for-byte", () => {
+    // CI's preload-test-env pins BILI_MESSAGE_TIMESTAMPS=0 suite-wide; this
+    // suite exercises the ON path, so pin it ON for the duration (env wins
+    // over the config file in resolveMessageTimestamps — setConfig can't).
+    const prevTs = process.env.BILI_MESSAGE_TIMESTAMPS;
+    process.env.BILI_MESSAGE_TIMESTAMPS = "1";
+    try {
     _resetSnapEgressForTests();
     setConfig({});
     const { view, state } = planeFor("sess-p2-env-a");
@@ -410,9 +416,17 @@ test("#5874 T18a: kernel render parity — plane rows re-stamped by the kernel r
     assert.deepEqual(tripwireCompare(out, legacy), { ok: true }, "plane render is payload-identical to the legacy render");
     assert.deepEqual(out.map((m) => [m.id, m.role, m.text]), legacy.map((m) => [m.id, m.role, m.text]), "byte-identical texts (ledgerSeq stamps are plane metadata)");
     assert.match(out[1].text ?? "", new RegExp(`^<acp tokens="[0-9]+" type="text" time="${formatTagTime(TS).replace(/[-: ]/g, "\\$&")}">m00009<`), "row tag comes from the kernel renderer (ref + first-sight time)");
+    } finally {
+        if (prevTs === undefined) delete process.env.BILI_MESSAGE_TIMESTAMPS;
+        else process.env.BILI_MESSAGE_TIMESTAMPS = prevTs;
+    }
 });
 
 test("#5874 T18b: immutable first-sight time — the plane render is stable across turns (no per-resend churn)", () => {
+    // Same ON-path pin as T18a (CI preload pins the env OFF suite-wide).
+    const prevTs = process.env.BILI_MESSAGE_TIMESTAMPS;
+    process.env.BILI_MESSAGE_TIMESTAMPS = "1";
+    try {
     _resetSnapEgressForTests();
     setConfig({});
     const { view, state } = planeFor("sess-p2-env-b");
@@ -447,6 +461,10 @@ test("#5874 T18b: immutable first-sight time — the plane render is stable acro
     assert.equal(snapEgressStatusWire().cutover, 2);
     assert.equal(out1[1].text, out2[1].text, "same tsStamps → identical bytes across turns");
     assert.ok((out1[1].text ?? "").includes(formatTagTime(TS)), "time is the immutable first-sight stamp, not the wall clock");
+    } finally {
+        if (prevTs === undefined) delete process.env.BILI_MESSAGE_TIMESTAMPS;
+        else process.env.BILI_MESSAGE_TIMESTAMPS = prevTs;
+    }
 });
 
 test("#5874 T18c: a client content edit diverges from the plane — tripwire red (byte-strict)", () => {
