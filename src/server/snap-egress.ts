@@ -144,6 +144,30 @@ export function tripwireCompare(plane: BiliMessage[], legacy: BiliMessage[]): { 
 // blockSeeds.
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// ACP resend envelope. The client harness re-wraps each resent message with
+// a per-RESEND tag (`<acp tokens="N" type="T" time="…">mNNNNN</acp>\n`) — the
+// time attribute changes every turn, so the tag can never be stored in the
+// plane. Byte parity for surviving prefix rows is restored by copying the
+// LIVE resend's tagged text onto the identity-matched plane row (id match
+// first, then envelope-stripped signature). The tripwire itself stays
+// byte-strict: adoption only happens on content-equal-modulo-envelope.
+// ---------------------------------------------------------------------------
+
+const ACP_ENVELOPE_RE = /^<acp\s[^>]*>[^<]*<\/acp>\n/;
+
+function stripEnvelope(text: string | undefined): string {
+    return typeof text === "string" && ACP_ENVELOPE_RE.test(text) ? text.replace(ACP_ENVELOPE_RE, "") : (text ?? "");
+}
+
+/** identitySig with the resend envelope normalized away (both sides). */
+function sigOf(m: BiliMessage): string {
+    if (typeof m.text === "string" && ACP_ENVELOPE_RE.test(m.text)) {
+        return identitySig({ ...m, text: stripEnvelope(m.text) } as BiliMessage);
+    }
+    return identitySig(m);
+}
+
 interface EgressRow {
     pos: number;
     ids: Set<string>;
@@ -217,7 +241,7 @@ export function buildSnapEgressView(
     const bySig = new Map<string, number[]>();
     for (let i = rows.length - 1; i >= 0; i--) {
         if (suppressed(rows[i])) continue;
-        const sig = identitySig(rows[i].msg!);
+        const sig = sigOf(rows[i].msg!);
         const list = bySig.get(sig);
         if (list) list.push(i);
         else bySig.set(sig, [i]);
@@ -235,7 +259,7 @@ export function buildSnapEgressView(
             const byIdHit = byId.get(m.id);
             if (byIdHit !== undefined && byIdHit < cursor) hit = byIdHit;
             else {
-                const cands = bySig.get(identitySig(m));
+                const cands = bySig.get(sigOf(m));
                 if (cands) {
                     for (const idx of cands) {
                         if (idx < cursor) {
@@ -269,6 +293,28 @@ export function buildSnapEgressView(
     // Assemble: prefix rows[0..d) minus suppressed, anchors before the first
     // surviving row past their coverage, then the client tail verbatim.
     const d = joinRow + 1;
+
+    // Envelope re-application: walk the resend prefix in order and, for each
+    // surviving plane row, adopt the paired resend message's exact text when
+    // the pair is content-equal modulo the envelope (id match first, then
+    // signature). Rows with no pair keep the plane text — the tripwire then
+    // judges the whole view byte-strictly.
+    let ci = 0;
+    const adoptText = new Map<number, string>();
+    for (let i = 0; i < d && ci < clientJoin; i++) {
+        const r = rows[i];
+        if (suppressed(r)) continue;
+        const planeText = stripEnvelope(r.msg!.text);
+        for (let k = ci; k < clientJoin; k++) {
+            const c = clientMsgs[k];
+            const idHit = r.ids.has(c.id);
+            const sigHit = !idHit && sigOf(c) === sigOf(r.msg!);
+            if (!idHit && !sigHit) continue;
+            if (stripEnvelope(c.text) === planeText) adoptText.set(i, typeof c.text === "string" ? c.text : planeText);
+            ci = k + 1;
+            break;
+        }
+    }
     const merged: BiliMessage[] = [];
     let ai = 0;
     for (let i = 0; i < d; i++) {
@@ -276,8 +322,10 @@ export function buildSnapEgressView(
         while (ai < anchors.length && anchors[ai].anchorPos < r.pos) merged.push(anchors[ai++].msg);
         if (suppressed(r)) continue;
         const m = r.msg!;
-        if (m.ledgerSeq === undefined) m.ledgerSeq = r.pos + 1; // 1-based ledgerSeq stamp (D-lane parseRow parity)
-        merged.push(m);
+        const adopted = adoptText.get(i);
+        const out: BiliMessage = adopted === undefined ? m : ({ ...m, text: adopted } as BiliMessage);
+        if (out.ledgerSeq === undefined) out.ledgerSeq = r.pos + 1; // 1-based ledgerSeq stamp (D-lane parseRow parity)
+        merged.push(out);
     }
     while (ai < anchors.length) merged.push(anchors[ai++].msg);
     const tail = clientMsgs.slice(clientJoin);
