@@ -205,8 +205,9 @@ export async function fetchWithTimeout(
     // small, deliberate number rather than the 12-min default (whose unset
     // value must stay byte-identical to the legacy single-phase watchdog, and
     // whose 3× stacking across retries is exactly what the #5831 decision ruled
-    // out). firstByteBudget < effective ⇔ the knob (or an explicit short caller
-    // timeout) made phase 1 its own, tighter phase.
+    // out). firstByteBudget < effective ⇔ the first-byte source (the knob when
+    // set, else the resolved idle) is strictly tighter than the effective full
+    // budget — e.g. a tightened knob, or a caller timeout LONGER than it.
     const firstByteIsSplit = firstByteBudget < effective;
     let firstByteTripped = false;
     const controller = new AbortController();
