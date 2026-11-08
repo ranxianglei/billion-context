@@ -213,7 +213,7 @@ const LEGACY_STATUS_SECTION_STARTS = [
     "Every event above is an UNCONFIRMED signal",
     "Fix (",
     "Fix: ",
-    "CONFIGURATION.md →",
+    "docs/configuration.md →",
     "CRITICAL ADVISORY (instance-level): ",
     "CRITICAL UPDATE READY (instance-level): ",
     "CRITICAL UPDATE AVAILABLE (instance-level): ",

@@ -12,7 +12,7 @@ import { ACP_NAME_ALT } from "../loop/tag-echo-filter.js";
  * parentSession alone, opencode V2 derives it from session.created), and
  * before a fork child's first model request replays into the proxy, adopts
  * the parent conversation's compression state through the plugin fork
- * protocol (PLUGIN.md §8). This module is the client half: it projects the
+ * protocol (docs/plugin-protocol.md §8). This module is the client half: it projects the
  * outgoing body (openai/anthropic/responses dialects) the same way the
  * server's incomingCoreMessages does, matches the longest parent prefix by
  * identity hash, and posts the fork receipt. The google wire has no
