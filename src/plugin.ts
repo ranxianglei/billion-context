@@ -1219,6 +1219,36 @@ function sessionRevisionOf(session: Session): string {
     return revision;
 }
 
+/** #3011: pick the raw view forkSnapshot serves. pluginSnapshot is the
+ *  canonical guarded copy (#2077), but it is only PERSISTED after a fork
+ *  receipt or explicit retention — any residency gap (LRU evict / host
+ *  restart) loses it until the parent's next model request, which is exactly
+ *  when a fork child needs it most (the child's adoption window precedes its
+ *  first forwarded request). session.lastMessages — written by EVERY prepare*
+ *  with the raw incoming view and persisted unconditionally — covers that
+ *  gap. It also wins when its head diverges from a stale snapshot: after a
+ *  full-cover native compaction the zero-overlap guard freezes pluginSnapshot
+ *  pre-compaction while the state rebase re-issues the refs, so serving the
+ *  stale copy fails closed on "raw/ref mapping inconsistent" forever; the
+ *  head-divergent tail is the freshest raw view the client will replay next.
+ *  A folded tail (lastMessagesFolded) is never a raw source. An EMPTY retained
+ *  copy is still a valid source: a zero-branchpoint fork child legitimately
+ *  holds pluginSnapshot === [] and its own forkSnapshot() (childRevision) must
+ *  serve that emptiness, not report "unavailable". When neither in-memory
+ *  view survived (shadow-mode cold restore, #5140), the verified storage
+ *  reconstruction below is the last rung — same fail-closed contract. */
+function forkSourceMessages(session: Session): { messages: CoreMessage[]; fromTail: boolean } | null {
+    const primary = Array.isArray(session.pluginSnapshot) ? session.pluginSnapshot : undefined;
+    const tail = session.lastMessages && session.lastMessagesFolded !== true && session.lastMessages.length > 0 ? session.lastMessages : undefined;
+    if (!primary) {
+        if (tail) return { messages: tail, fromTail: true };
+        const rebuilt = reconstructRawTailForFork(session);
+        return rebuilt ? { messages: rebuilt, fromTail: true } : null;
+    }
+    if (tail && primary.length > 0 && forkMessageIdentityHash(tail[0]!) !== forkMessageIdentityHash(primary[0]!)) return { messages: tail, fromTail: true };
+    return { messages: primary, fromTail: false };
+}
+
 /** #5140 item 4: a non-retained parent cold-restored in shadow mode loses its
  *  resident pluginSnapshot (persist.ts retention gate) even though index.db
  *  still holds the independently recorded unfolded raw tail. Rebuild that tail
@@ -1299,15 +1329,21 @@ function reconstructRawTailForFork(session: Session): CoreMessage[] | null {
 }
 
 function forkSnapshot(session: Session, source?: CoreMessage[] | null) {
-    const messages = source ?? session.pluginSnapshot ?? reconstructRawTailForFork(session);
-    if (!messages) {
-        const capped = session.metadata.publicSnapshotCapped === true;
-        const base = capped ? "raw snapshot exceeded the retention cap (BILI_PUBLIC_SNAPSHOT_CAP_BYTES); fork is refused rather than retaining an unbounded raw copy" : "raw snapshot unavailable; send a fresh plugin model request";
-        // the capped base names the refusal itself; a gate recorded under it is
-        // incidental (reconstruction may bail before reaching the cap check)
-        const why = capped ? undefined : reconMissReason(session.id);
+    // The retention cap stays a hard refusal even when a recent raw view is
+    // available: serving around it would make the cap unenforceable (#2433).
+    if (session.metadata.publicSnapshotCapped === true) throw new Error("raw snapshot exceeded the retention cap (BILI_PUBLIC_SNAPSHOT_CAP_BYTES); fork is refused rather than retaining an unbounded raw copy");
+    // An explicitly passed view (the fork handler's pre-computed source) wins
+    // outright; otherwise the picker cascades retained copy -> recent raw view
+    // -> verified storage reconstruction. An explicit view IS the retained
+    // copy only by identity — any other served view is non-resident and skips
+    // the retained-copy bookkeeping below.
+    const picked = source ? { messages: source, fromTail: source !== session.pluginSnapshot } : forkSourceMessages(session);
+    if (!picked) {
+        const base = "raw snapshot unavailable; send a fresh plugin model request";
+        const why = reconMissReason(session.id);
         throw new Error(why ? `${base} [reconstruction: ${why}]` : base);
     }
+    const messages = picked.messages;
     // #4266 mechanism 1: signed thinking is no longer an opaque refusal. Wire
     // thinking/redacted_thinking blocks project to a named reasoning message
     // (anthropicToCore), so they are comparable by view. The host-projected
@@ -1321,7 +1357,10 @@ function forkSnapshot(session: Session, source?: CoreMessage[] | null) {
     if (session.metadata.publicSnapshotTextComparable === false) throw new Error("multimodal or opaque content cannot be compared by text");
     const store = contentStoreOf(session);
     const expectedStoredRefs = session.metadata.publicSnapshotStoredRefs;
-    if (Array.isArray(expectedStoredRefs) && expectedStoredRefs.some((ref) => typeof ref !== "string" || !store.byRef[ref])) throw new Error("CCR original index unavailable");
+    // The stored-ref list is bookkeeping for the RETAINED copy; on the tail
+    // path it describes a different (older or reset) view, so only the
+    // per-message CCR checks below apply to what is actually served (#3011).
+    if (!picked.fromTail && Array.isArray(expectedStoredRefs) && expectedStoredRefs.some((ref) => typeof ref !== "string" || !store.byRef[ref])) throw new Error("CCR original index unavailable");
     const indexedHashes = new Set(Object.values(store.byRef).map((entry) => entry.hash));
     if (Object.entries(store.byHash).some(([hash, text]) => !indexedHashes.has(hash) || typeof text !== "string" || createHash("sha256").update(text, "utf8").digest("hex") !== hash)) throw new Error("CCR original payload/index inconsistent");
     if (Object.entries(store.byRef).some(([ref, entry]) => typeof store.byHash[entry.hash] !== "string" || (session.state.messageRefs.byRaw[entry.rawId] !== undefined && (session.state.messageRefs.byRaw[entry.rawId] !== ref || session.state.messageRefs.byRef[ref] !== entry.rawId)))) throw new Error("CCR original alias inconsistent");
@@ -1585,11 +1624,17 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
         await withSessionLock(parent, async () => {
             if (await replay()) return;
             if (conversations.has(request.childConversationId) || pendingRegisters.some((r) => r.conversationId === request.childConversationId) || (registeredIds.has(request.childConversationId) && !forkChildHeldBySameParent(request.childConversationId, request.parentConversationId))) return forkReply(res, 409, { ok: false, code: "CHILD_CONFLICT", error: "child conversation already registered" });
-            // #5140 item 4: a cold non-retained parent has no resident snapshot;
-            // stand in with the verified unified raw tail (no fresh model call).
-            const source = parent.pluginSnapshot ?? reconstructRawTailForFork(parent);
+            // #3011/#5140: the child's raw baseline must come from the SAME source
+            // view the snapshot is served from — retained copy, recent raw view,
+            // or verified storage reconstruction (residency gaps lose the first;
+            // shadow-mode cold restores can leave none until the next model call).
+            const source = forkSourceMessages(parent);
+            if (!source) {
+                const why = reconMissReason(parent.id);
+                return forkReply(res, 409, { ok: false, status: "unavailable", code: "SNAPSHOT_UNAVAILABLE", error: why ? `raw snapshot unavailable; send a fresh plugin model request [reconstruction: ${why}]` : "raw snapshot unavailable; send a fresh plugin model request" });
+            }
             let snapshot: ReturnType<typeof forkSnapshot>;
-            try { snapshot = forkSnapshot(parent, source); }
+            try { snapshot = forkSnapshot(parent, source.messages); }
             catch (err) { return forkReply(res, 409, { ok: false, status: "unavailable", code: "SNAPSHOT_UNAVAILABLE", error: String(err) }); }
             if (snapshot.parentRevision !== request.parentRevision) {
                 // #2671 Phase 2b: accept a stale v1 revision (whole-store hash) from
@@ -1659,7 +1704,7 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
             child.state.stats.tokensCompressed = child.state.blocks.filter((b) => b.active).reduce((sum, b) => sum + b.compressedTokens, 0);
             child.state.stats.compressionCount = blocks.length;
             if (prefix.length === snapshot.orderedMessages.length) child.state.nudge = structuredClone(parent.state.nudge);
-            child.pluginSnapshot = structuredClone(source!.slice(0, request.branchPoint.messageCount));
+            child.pluginSnapshot = structuredClone(source.messages.slice(0, request.branchPoint.messageCount));
             const forkView = prune(child.pluginSnapshot, child.state);
             // Hiding the original pair is safe only if its summary survives the fork.
             child.state.absorbed = structuredClone(parent.state.absorbed?.filter((a) =>
@@ -1726,10 +1771,11 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
             // lazily-persisted parent would drop its snapshot on disk and the next
             // restart would 409. Flush eagerly (publishForkSession precedent) so
             // the flag and the snapshot land in one write.
-            // #5140 item 4: only a SUCCESSFUL fork retains the verified source —
-            // materialize the reconstructed tail on the parent so the flushSync
+            // #5140 item 4 / #3011: only a SUCCESSFUL fork retains the served source —
+            // when it came from a non-resident view (recent raw tail or verified
+            // storage reconstruction), materialize it on the parent so the flushSync
             // below persists the real raw copy for continuity (GET never does).
-            if (source && source !== parent.pluginSnapshot) parent.pluginSnapshot = structuredClone(source);
+            if (source.fromTail) parent.pluginSnapshot = structuredClone(source.messages);
             parent.metadata.publicSnapshotRetained = true;
             if (!getStore().flushSync(parent)) loggerLog("warn", `fork ${request.childConversationId}: parent snapshot flush failed (${parent.id}); the debounced save will retry`);
             forkReply(res, 201, response);
