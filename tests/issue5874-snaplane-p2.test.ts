@@ -71,8 +71,8 @@ function session(id: string, msgs: Array<{ id: string; text: string; role?: "use
     };
 }
 
-/** A folded session: 12 messages, block covers m1..m8 (the T7 shape). */
-function foldedSession(sid: string): { sess: LegacySessionLike; blk: Record<string, unknown>; msgs: Array<{ id: string; text: string }> } {
+/** A folded session: 12 messages, block covers msgs[from..to) (T7 shape: 0..8). */
+function foldedSession(sid: string, from = 0, to = 8): { sess: LegacySessionLike; blk: Record<string, unknown>; msgs: Array<{ id: string; text: string }> } {
     const msgs = Array.from({ length: 12 }, (_, i) => ({ id: `m${i + 1}`, text: `message ${i + 1}` }));
     const byRaw: Record<string, string> = {};
     const byRef: Record<string, string> = {};
@@ -90,7 +90,7 @@ function foldedSession(sid: string): { sess: LegacySessionLike; blk: Record<stri
         summary: "folded 1-8",
         kind: "fold",
         reason: "test",
-        effectiveMessageIds: msgs.slice(0, 8).map((m) => m.id),
+        effectiveMessageIds: msgs.slice(from, to).map((m) => m.id),
         directMessageIds: [] as string[],
     };
     const sess = session(sid, msgs);
@@ -103,10 +103,10 @@ function msg(id: string, text: string, role: "user" | "assistant" | "system" = "
 }
 
 /** Build the plane for the folded session and return its egress view. */
-function planeFor(sid: string): { store: UnifiedStore; view: SnapView; state: CompressionState; blk: Record<string, unknown> } {
+function planeFor(sid: string, from = 0, to = 8): { store: UnifiedStore; view: SnapView; state: CompressionState; blk: Record<string, unknown> } {
     const dir = tmpDir("bili-5874-p2-plane-");
     const store = openPlane(path.join(dir, "index.db"));
-    const { sess, blk } = foldedSession(sid);
+    const { sess, blk } = foldedSession(sid, from, to);
     store.ingestSession(planIngest(sess));
     const view = store.snapEgressView(sid);
     assert.ok(view, "the plane must have rows after ingest");
@@ -476,4 +476,61 @@ test("#5874 T18c: a client content edit diverges from the plane — tripwire red
     const verdict = tripwireCompare(built.msgs, legacy);
     assert.ok(!verdict.ok);
     assert.equal(verdict.reason, "shape@1:text");
+});
+
+// T19a: mid-history block — the anchor takes the EARLIEST covered position
+// (prune pairing parity), not the end of the coverage run.
+test("T19a mid-history block anchors at the earliest covered row", () => {
+    const { view, state } = planeFor("t19a", 4, 8);
+    state.blocks = [state.blocks[0]] as never;
+    const resend = [
+        msg("m1", "message 1"),
+        msg("m2", "message 2", "assistant"),
+        msg("m3", "message 3"),
+        msg("m4", "message 4", "assistant"),
+        msg("m9", "message 9"),
+        msg("m10", "message 10", "assistant"),
+        msg("m11", "message 11"),
+        msg("m12", "message 12", "assistant"),
+    ];
+    const built = buildSnapEgressView(view, resend, state);
+    assert.ok(built.ok);
+    assert.deepEqual(
+        built.msgs.map((m) => m.id),
+        ["m1", "m2", "m3", "m4", "acp_summary_blk-c1", "m9", "m10", "m11", "m12"],
+        "anchor sits where the earliest covered message (m5) used to be",
+    );
+});
+
+// T19b: hosts trim bulky old tool results in resends; a resend text that is a
+// strict PREFIX of the stored plane text is adopted (kernel passes trimmed
+// text through, so legacy egress serves exactly these bytes).
+test("T19b client-trimmed prefix text is adopted on plane prefix rows", () => {
+    const { view, state } = planeFor("t19b");
+    const full = "message 9 ".repeat(40);
+    const trimmed = full.slice(0, 24);
+    const rows = view.rows.map((r) => ({ ...r, postJson: r.postJson?.replace('"message 9"', JSON.stringify(full)) }));
+    const viewFull = { ...view, rows: rows as SnapView["rows"] };
+    const resend = [
+        msg("m1", "message 1"),
+        msg("m9", trimmed),
+        msg("m10", "message 10", "assistant"),
+        msg("m11", "message 11"),
+        msg("m12", "message 12", "assistant"),
+    ];
+    const built = buildSnapEgressView(viewFull, resend, state);
+    assert.ok(built.ok);
+    const m9out = built.msgs.find((m) => m.id === "m9");
+    assert.equal(m9out?.text, trimmed, "trimmed resend text wins over the full stored text");
+    const verdict = tripwireCompare(
+        built.msgs,
+        [
+            msg("acp_summary_blk-c1", `${SUMMARY_HEADER}\nfolded 1-8`, "system"),
+            msg("m9", trimmed),
+            msg("m10", "message 10", "assistant"),
+            msg("m11", "message 11"),
+            msg("m12", "message 12", "assistant"),
+        ],
+    );
+    assert.ok(verdict.ok, `trimmed adoption must reach parity (got ${verdict.ok ? "" : verdict.reason})`);
 });
