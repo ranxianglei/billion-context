@@ -235,14 +235,19 @@ test("#5874 T14: tripwire ignores ids/stamps, compares payload exactly", () => {
     const b = [msg("host-1", "hello"), msg("host-2", "world", "assistant")];
     assert.deepEqual(tripwireCompare(a, b), { ok: true }, "same payload, different ids → match");
     const c = [msg("host-1", "hello"), msg("host-2", "WORLD", "assistant")];
-    assert.deepEqual(tripwireCompare(a, c), { ok: false, reason: "shape@1:text" });
+    const cVerdict = tripwireCompare(a, c);
+    assert.equal(cVerdict.ok, false);
+    assert.equal(cVerdict.ok === false && cVerdict.reason, "shape@1:text");
+    assert.equal(cVerdict.ok === false && cVerdict.firstDiff, `text plane="world" legacy="WORLD"`);
     const d = [msg("host-1", "hello")];
     assert.deepEqual(tripwireCompare(a, d), { ok: false, reason: "length(plane=2,legacy=1)" });
     const imgA = { id: "i1", role: "user", contentType: "image", text: "", imagePart: true, imageBase64: "QUJD" } as unknown as BiliMessage;
     const imgB = { id: "i2", role: "user", contentType: "image", text: "", imagePart: true, imageBase64: "QUJD" } as unknown as BiliMessage;
     const imgC = { id: "i3", role: "user", contentType: "image", text: "", imagePart: true, imageBase64: "REVG" } as unknown as BiliMessage;
     assert.deepEqual(tripwireCompare([imgA], [imgB]), { ok: true }, "image hashed, not id-compared");
-    assert.deepEqual(tripwireCompare([imgA], [imgC]), { ok: false, reason: "shape@0:image" });
+    const imgVerdict = tripwireCompare([imgA], [imgC]);
+    assert.equal(imgVerdict.ok, false);
+    assert.equal(imgVerdict.ok === false && imgVerdict.reason, "shape@0:image");
 });
 
 // ---------------------------------------------------------------------------
