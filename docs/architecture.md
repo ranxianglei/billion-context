@@ -20,7 +20,7 @@ How to read it:
 
 | Module | One line | Pages | Status |
 |---|---|---|---|
-| `storage` | Unified SQLite: table family, kstate, checkpoints, GC | [storage.md](./storage.md) · [zh](./storage.zh-CN.md) | ✅ |
+| `storage` | Unified SQLite: table family, kstate, checkpoints, GC | [storage.md](./architecture/storage.md) · [zh](./architecture/storage.zh-CN.md) | ✅ |
 | `pipeline` | Request pipeline (handle / prepare-* / relay / inject) | — | ⏳ |
 | `lanes` | Host lanes (dsh / pi / opencode / codex / bare proxy + lane-decisions) | — | ⏳ |
 | `kernel` | Compression engine (acp-kernel: folds, summaries, ref ledger) | — | ⏳ |

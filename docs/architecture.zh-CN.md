@@ -20,7 +20,7 @@
 
 | 模块 | 一句话 | 页面 | 状态 |
 |---|---|---|---|
-| `storage` | 统一 SQLite 存储（表族 / kstate / ckpt / GC） | [storage.md](./storage.md) · [EN](./storage.md) | ✅ |
+| `storage` | 统一 SQLite 存储（表族 / kstate / ckpt / GC） | [storage.zh-CN.md](./architecture/storage.zh-CN.md) · [EN](./architecture/storage.md) | ✅ |
 | `pipeline` | 请求管道（handle / prepare-* / relay / inject） | — | ⏳ |
 | `lanes` | 宿主车道（dsh / pi / opencode / codex / 裸代理 + lane-decisions） | — | ⏳ |
 | `kernel` | 压缩内核（acp-kernel：折叠 / 摘要 / ref 账本） | — | ⏳ |
