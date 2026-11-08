@@ -516,7 +516,7 @@ async function forwardCaptured(
     // recognition + hop passthrough are unaffected by this switch.
     if (prepared && !prepared.sidePassthrough && prepared.processedMessages.length > 0 && typeof wireBody === "string" && opts.chainEgressStamp === true) {
         try {
-            const stamped = stampOutbound(JSON.parse(wireBody), prepared.protocol, instanceId);
+            const stamped = stampOutbound(JSON.parse(wireBody), prepared.protocol, instanceId, Date.now(), prepared.model ?? prepared.google?.model);
             if (stamped !== null) {
                 wireBody = JSON.stringify(stamped);
                 log("debug", `[${prepared.session.id}] [stamp] outbound ${prepared.protocol} request carries checkpoint carrier`);
@@ -1876,6 +1876,7 @@ async function forwardCaptured(
                     signal: clientAbort.signal,
                     session: prepared.session,
                     log,
+                    model: prepared.model ?? prepared.google?.model,
                 });
                 pluginBody = bufferToStream(resolvedBuf);
             }
@@ -1913,7 +1914,7 @@ async function forwardCaptured(
                         makeContinuationRefetch({
                             protocol: "responses",
                             body,
-                            model: throttleModel,
+                            model: throttleModel ?? prepared.google?.model,
                             upstreamUrl,
                             reqHeaders: buildForwardHeaders(headers), resign: applyResign,
                             proxyUrl,
@@ -1942,7 +1943,7 @@ async function forwardCaptured(
                         makeContinuationRefetch({
                             protocol: prepared.protocol,
                             body,
-                            model: throttleModel,
+                            model: throttleModel ?? prepared.google?.model,
                             upstreamUrl,
                             reqHeaders: buildForwardHeaders(headers), resign: applyResign,
                             proxyUrl,
@@ -2022,6 +2023,7 @@ async function forwardCaptured(
                 signal: clientAbort.signal,
                 session: prepared.session,
                 log,
+                model: prepared.model ?? prepared.google?.model,
             });
             responseBody = bufferToStream(resolvedBuf);
         }
@@ -2076,7 +2078,7 @@ async function forwardCaptured(
                     makeContinuationRefetch({
                         protocol: "responses",
                         body,
-                        model: throttleModel,
+                        model: throttleModel ?? prepared.google?.model,
                         upstreamUrl,
                         reqHeaders: buildForwardHeaders(headers), resign: applyResign,
                         proxyUrl,
@@ -2122,7 +2124,7 @@ async function forwardCaptured(
                     makeContinuationRefetch({
                         protocol: "responses",
                         body,
-                        model: throttleModel,
+                        model: throttleModel ?? p.google?.model,
                         upstreamUrl,
                         reqHeaders: buildForwardHeaders(headers), resign: applyResign,
                         proxyUrl,
@@ -2147,7 +2149,7 @@ async function forwardCaptured(
                     makeContinuationRefetch({
                         protocol: p.protocol,
                         body,
-                        model: throttleModel,
+                        model: throttleModel ?? p.google?.model,
                         wrapBody: v1Active ? v1Wrap : undefined,
                         upstreamUrl,
                         reqHeaders: buildForwardHeaders(headers), resign: applyResign,
@@ -2497,6 +2499,9 @@ async function resolveFakeCompletion(
         signal: AbortSignal;
         session: Session;
         log: (level: string, msg: string) => void;
+        /** #5392: target model name — lets the google-wire part-order normalize
+         *  skip the WC-018 text-first reorder for Claude models. */
+        model?: string;
         /** #1884: re-sign the retry body before it hits the wire (armed
          *  re-sign lane only; undefined on unsigned traffic). */
         resign?: (headers: Record<string, string>, body: string | Buffer) => void;
@@ -2512,7 +2517,7 @@ async function resolveFakeCompletion(
     const priorStreak = (opts.session.metadata.fakeCompletionStreak as number | undefined) ?? 0;
     if (max > 0 && priorStreak < max && isFakeCompletion(opts.protocol, buffer.toString("utf8"))) {
         for (let attempt = 1; attempt <= max && !opts.signal.aborted; attempt++) {
-            const hinted = injectFakeCompletionHint(opts.protocol, opts.wireBody);
+            const hinted = injectFakeCompletionHint(opts.protocol, opts.wireBody, opts.model);
             if (hinted === null) break;
             const wireHinted = opts.wrapBody ? opts.wrapBody(hinted) : hinted;
             opts.log("warn", `[${sid}] fake completion (tool-call XML, no tool block); retry ${attempt}/${max} with corrective hint`);
