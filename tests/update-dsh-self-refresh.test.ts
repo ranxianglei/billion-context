@@ -141,14 +141,25 @@ async function withRegistry<T>(version: string | undefined, fn: (fetches: { coun
 }
 
 /** Records `dsh plugin …` invocations (platform-neutral, mirroring
- *  dsh-refresh.test.ts's recorder). */
-function recordingAsyncRunner(calls: string[]): (plan: DshPlan) => Promise<{ stdout: string; stderr: string }> {
+ *  dsh-refresh.test.ts's recorder). #5642: a successful op materializes the
+ *  requested version into the profile's node_modules, mirroring what the real
+ *  channel leaves behind — refreshDshProfileBundles verifies that outcome
+ *  instead of trusting the exit code. */
+function recordingAsyncRunner(dshHome: string, calls: string[]): (plan: DshPlan) => Promise<{ stdout: string; stderr: string }> {
     return async (plan) => {
         const base = path.basename(plan.command).toLowerCase();
         const tokens = base === "cmd.exe" || base === "cmd"
             ? (plan.args[3] ?? "").replace(/^"|"$/g, "").split(" ").map((t) => t.replace(/^"|"$/g, "")).filter((t) => t.length > 0).slice(1)
             : [...plan.args];
         calls.push(tokens.join(" "));
+        const name = tokens[tokens.indexOf("--profile") + 1];
+        const spec = tokens[tokens.length - 1];
+        const version = spec.startsWith("billion-context@") ? spec.slice("billion-context@".length) : undefined;
+        if (name !== undefined && version !== undefined) {
+            const copy = path.join(dshHome, "profiles", name, "node_modules", "billion-context");
+            fs.mkdirSync(copy, { recursive: true });
+            fs.writeFileSync(path.join(copy, "package.json"), JSON.stringify({ name: "billion-context", version }));
+        }
         return { stdout: "", stderr: "" };
     };
 }
@@ -165,7 +176,7 @@ test("refreshDshProfileCopy: stale registry-pinned profile refreshes via dsh's c
     const calls: string[] = [];
     const { log, entries } = makeLog();
     try {
-        _setDshRunnersForTest({ async: recordingAsyncRunner(calls) });
+        _setDshRunnersForTest({ async: recordingAsyncRunner(fx.dshHome, calls) });
         await withRegistry("0.1.140", async (fetches) => {
             await refreshDshProfileCopy(fx.installDir, OPTS, fx.env, log);
             assert.equal(fetches.count, 1, "one registry lookup");
@@ -183,7 +194,7 @@ test("refreshDshProfileCopy: up-to-date copy never spawns dsh", async () => {
     const calls: string[] = [];
     const { log, entries } = makeLog();
     try {
-        _setDshRunnersForTest({ async: recordingAsyncRunner(calls) });
+        _setDshRunnersForTest({ async: recordingAsyncRunner(fx.dshHome, calls) });
         await withRegistry("0.1.140", async () => {
             await refreshDshProfileCopy(fx.installDir, OPTS, fx.env, log);
         });
@@ -200,7 +211,7 @@ test("refreshDshProfileCopy: registry unreachable → warn, no spawn, no throw",
     const calls: string[] = [];
     const { log, entries } = makeLog();
     try {
-        _setDshRunnersForTest({ async: recordingAsyncRunner(calls) });
+        _setDshRunnersForTest({ async: recordingAsyncRunner(fx.dshHome, calls) });
         await withRegistry(undefined, async () => {
             await refreshDshProfileCopy(fx.installDir, OPTS, fx.env, log);
         });
@@ -220,7 +231,7 @@ test("refreshDshProfileCopy: non-dsh install dir returns before any registry fet
         fs.writeFileSync(path.join(installDir, "package.json"), JSON.stringify({ name: "billion-context", version: "0.1.139" }));
         const env = { ...process.env, DSH_HOME: path.join(base, "dsh") };
         const calls: string[] = [];
-        _setDshRunnersForTest({ async: recordingAsyncRunner(calls) });
+        _setDshRunnersForTest({ async: recordingAsyncRunner(path.join(base, "dsh"), calls) });
         await withRegistry("0.1.140", async (fetches) => {
             await refreshDshProfileCopy(installDir, OPTS, env, () => {});
             assert.equal(fetches.count, 0, "no registry fetch for a non-dsh copy");
@@ -241,7 +252,7 @@ test("refreshDshProfileCopy: a live update lock defers the refresh to the next c
     fs.mkdirSync(lockDir, { recursive: true });
     fs.writeFileSync(lockFile, JSON.stringify({ pid: process.pid, ts: Date.now() }), { flag: "wx" });
     try {
-        _setDshRunnersForTest({ async: recordingAsyncRunner(calls) });
+        _setDshRunnersForTest({ async: recordingAsyncRunner(fx.dshHome, calls) });
         await withRegistry("0.1.140", async () => {
             await refreshDshProfileCopy(fx.installDir, OPTS, fx.env, log);
         });

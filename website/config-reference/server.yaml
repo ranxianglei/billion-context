@@ -153,10 +153,10 @@ entries:
     group: upstream
     id: tt.mcl2
     site_group: up
-    desc_en: "Legacy global window ceiling (highest-priority window source and usage denominator); prefer compress.modelContextLimit."
-    desc_zh: "旧版全局窗口上限（窗口来源中优先级最高，兼作使用率分母）；建议改用 compress.modelContextLimit。"
-    site_en: "<code>modelContextLimit</code> — legacy global window ceiling (default 200000); prefer compress.modelContextLimit."
-    site_zh: "<code>modelContextLimit</code> —— 旧版全局窗口上限（默认 200000）；建议改用 compress.modelContextLimit。"
+    desc_en: "Legacy global DEFAULT window (last-resort fallback in the window ladder: consulted only when no tier evidence, plugin/launcher report, per-route declaration, registry lookup, or built-in table resolves a limit for the model; also the usage-ratio denominator wherever it wins); prefer compress.modelContextLimit."
+    desc_zh: "旧版全局默认窗口（窗口解析阶梯的最后一层兜底：仅当 tier 证据、plugin/launcher 报告、路由声明、注册表查询、内置表都未解析出该模型的上限时才使用；在其生效的会话里兼作使用率分母）；建议改用 compress.modelContextLimit。"
+    site_en: "<code>modelContextLimit</code> — legacy global DEFAULT window (default 200000): last-resort fallback when no other source resolves a limit for the model; does NOT cap a natively-resolved window (#5908); prefer compress.modelContextLimit."
+    site_zh: "<code>modelContextLimit</code> —— 旧版全局默认窗口（默认 200000）：窗口解析的最后一层兜底，其他来源都未解析出该模型上限时才生效；不会封顶已按原生解析出的窗口（#5908）；建议改用 compress.modelContextLimit。"
   - key: imageBilling
     type: "\"auto\" | \"pixels\" | \"bytes\""
     default: "auto (resolves to pixels)"
@@ -498,8 +498,8 @@ entries:
     default: "{} (acp_delegate enabled with package defaults)"
     env: [PI_ACP_DELEGATE_FORCE_ENABLE, PI_ACP_DELEGATE_MAX_DEPTH, PI_ACP_DELEGATE_SYNC_TIMEOUT_MINUTES, PI_ACP_DELEGATE_IDLE_TIMEOUT_MINUTES, PI_ACP_DELEGATE_ASYNC_TIMEOUT_MINUTES, PI_ACP_DELEGATE_MAX_CONCURRENT]
     group: behavior
-    desc_en: "Built-in pi-lane sub-agents (acp_delegate) surface, #2230 config-home. The pi.subagents section of billion-context.json owns the delegate config; the four acp.json keys (delegate/delegatePrompt/displayUsage/debug) are a deprecated fallback read only while the section is absent. prompt replaces delegatePrompt; debug is scoped to the sub-agent subsystem. Boolean shorthand subagents: false disables the whole surface. Full field table: the pi section in CONFIGURATION.md."
-    desc_zh: "内置 pi lane 子代理（acp_delegate）面（#2230 配置搬家）。billion-context.json 的 pi.subagents 段拥有 delegate 配置；acp.json 四键（delegate/delegatePrompt/displayUsage/debug）为已废弃回退源，仅段缺失时读取。prompt 取代 delegatePrompt；debug 限定子代理子系统。布尔简写 subagents: false 整体关闭。完整字段表见 CONFIGURATION.md 的 pi 段。"
+    desc_en: "Built-in pi-lane sub-agents (acp_delegate) surface, #2230 config-home. The pi.subagents section of billion-context.json owns the delegate config; the four acp.json keys (delegate/delegatePrompt/displayUsage/debug) are a deprecated fallback read only while the section is absent. prompt replaces delegatePrompt; debug is scoped to the sub-agent subsystem. Boolean shorthand subagents: false disables the whole surface. Full field table: the pi section in configuration.md."
+    desc_zh: "内置 pi lane 子代理（acp_delegate）面（#2230 配置搬家）。billion-context.json 的 pi.subagents 段拥有 delegate 配置；acp.json 四键（delegate/delegatePrompt/displayUsage/debug）为已废弃回退源，仅段缺失时读取。prompt 取代 delegatePrompt；debug 限定子代理子系统。布尔简写 subagents: false 整体关闭。完整字段表见 configuration.md 的 pi 段。"
   - key: pi.inline
     type: boolean
     default: "true (unset env+file runs inline)"

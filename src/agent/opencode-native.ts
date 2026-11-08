@@ -77,7 +77,7 @@ import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST, unwrapUpstream, wrapUpstream
 import { createAcpCommandHooks, showAcpText } from "./opencode-acp-command.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, setNativeOriginWaiter, singleFlight } from "./native-bootstrap.js";
 import { createLiveOriginResolver, installNativeFetchIntercept, isModelApiUrl, noteRoutedOrigin, observeRoutedOrigin, readyOrigin, replaceRequestPayload, replaceRequestTarget, routedBiliModelUrl, type LiveOriginResolverDeps, type NativeInterceptState, type UnavailableReason } from "./native-intercept.js";
-import { clearIncrementalProbe, createPrepareDirectSend, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalAck, noteIncrementalRejection, planIncrementalTurn, probeIncrementalTurns, rememberOriginalBody, sweepStale, wireMessagesLookAnthropic, type IncrementalWireMessage } from "./incremental-client.js";
+import { clearIncrementalProbe, createPrepareDirectSend, incrementalCacheRetouchEnabled, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalAck, noteIncrementalRejection, planIncrementalTurn, probeIncrementalTurns, rememberOriginalBody, sweepStale, wireMessagesLookAnthropic, type IncrementalWireMessage } from "./incremental-client.js";
 import * as pfChannel from "./pf-channel.js";
 import { createOpencodeV2Setup, type V2HttpRequestEvent, type V2State } from "./opencode-v2.js";
 import { alignedMsgIdsForWire, harvestOpencodeMsgIds } from "./opencode-msgids.js";
@@ -888,7 +888,8 @@ export function createV1ServerHooks(getOrigin: () => string | undefined, ctx: V1
                     };
                 }
             } else {
-                console.error("[bili-opencode-native] v1: zod unavailable — plugin tools skipped; sessions run in proxy mode (wire-injected compress)");
+                // #5706: host-safe channel — raw console.* lands on the opencode TUI terminal.
+                logHostEvent("error", "[native-client]", "[bili-opencode-native] v1: zod unavailable — plugin tools skipped; sessions run in proxy mode (wire-injected compress)");
             }
             if (Object.keys(tools).length > 0) hooks.tool = tools;
         }
@@ -922,13 +923,13 @@ const server = async (ctx: V1PluginContext): Promise<V1Hooks> => {
     // observes network failures and drives state.respawn, so SDK-default
     // providers route again as soon as any proxy is alive.
     if (installNativeFetchIntercept(state)) {
-        console.log("[bili-opencode-native] v1: fetch patch installed (catches providers without an explicit baseURL)");
+        logHostEvent("info", "[native-client]", "[bili-opencode-native] v1: fetch patch installed (catches providers without an explicit baseURL)");
     }
     if (origin === undefined) {
-        console.error("[bili-opencode-native] v1: no live proxy at startup — traffic goes direct until runtime recovery lands one");
+        logHostEvent("error", "[native-client]", "[bili-opencode-native] v1: no live proxy at startup — traffic goes direct until runtime recovery lands one");
         return {};
     }
-    console.log(`[bili-opencode-native] v1 active (proxy ${origin})`);
+    logHostEvent("info", "[native-client]", `[bili-opencode-native] v1 active (proxy ${origin})`);
     let z: ZodLike | undefined;
     try {
         // Opaque specifier on purpose (#3511 P0 follow-up): zod is now bundled
@@ -950,14 +951,14 @@ const server = async (ctx: V1PluginContext): Promise<V1Hooks> => {
         // Pass the host's full ctx object through: V1PluginContext types only
         // what bili uses (client/directory), but the runtime object may carry
         // extra host fields acp's hooks need at action time.
-        legacy = await loadLegacyAcp(ctx, (msg) => console.log(msg));
+        legacy = await loadLegacyAcp(ctx, (msg) => logHostEvent("info", "[native-client]", msg));
     } catch {
         legacy = undefined;
     }
     return createV1ServerHooks(() => state.origin, ctx, { z, legacy });
 };
 
-export default { id: "billion-context-opencode-native", setup: createOpencodeV2Setup({ route: createNativeRoute(state), incremental: maybeIncrementalOpencode }), server };
+export default { id: "billion-context-opencode-native", setup: createOpencodeV2Setup({ route: createNativeRoute(state), incremental: maybeIncrementalOpencode, onResponse: opencodeIncrementalOnHttpResponse }), server };
 
 /** #3248 phase 2: incremental-turn divert for opencode. Runs LAST in the
  *  http.request hook (routing + header stamping already happened, so the
@@ -1016,7 +1017,7 @@ export async function maybeIncrementalOpencode(e: V2HttpRequestEvent, s: V2State
             if (pending.url === url && Date.now() - pending.at < INC_PENDING_TTL_MS) { inflight = true; break; }
         }
         if (inflight) return;
-        const plan = planIncrementalTurn({ conversationId: sid, path: "/v1/messages", messages: b.messages as IncrementalWireMessage[], system: b.system as unknown, request: b as { model?: unknown } & Record<string, unknown>, msgIds: alignedMsgIdsForWire(sid, b.messages) });
+        const plan = planIncrementalTurn({ cacheControlRetouch: incrementalCacheRetouchEnabled(base), conversationId: sid, path: "/v1/messages", messages: b.messages as IncrementalWireMessage[], system: b.system as unknown, request: b as { model?: unknown } & Record<string, unknown>, msgIds: alignedMsgIdsForWire(sid, b.messages) });
         if (plan.mode === "skip") return;
         const turnId = newIncrementalTurnId();
         // #3304: stash before the swap — the opencode replacement happens in
@@ -1106,3 +1107,17 @@ export function opencodeIncrementalOnResponse(_url: string, response: Response, 
 }
 
 state.onResponse = opencodeIncrementalOnResponse;
+
+/** V2 http.response adapter: forwards the SENT request's headers (the turn id
+ *  stamped by maybeIncrementalOpencode rides there) and the upstream response
+ *  to the same ack collector the fetch intercept feeds. Inline mode fires both
+ *  seams for one dispatch; the second call is a no-op because the first one
+ *  already consumed the pending entry. Exported for the native suites. */
+export function opencodeIncrementalOnHttpResponse(e: V2HttpRequestEvent): void {
+    const response = e.response;
+    const req = e.request as Request | undefined;
+    if (response === undefined || req === undefined || typeof req.headers?.get !== "function") return;
+    const turnId = req.headers.get(INCREMENTAL_TURN_ID_HEADER);
+    if (turnId === null) return;
+    opencodeIncrementalOnResponse(typeof req.url === "string" ? req.url : "", response, { [INCREMENTAL_TURN_ID_HEADER]: turnId });
+}

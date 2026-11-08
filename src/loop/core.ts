@@ -33,7 +33,7 @@ import { applyConfiguredCompression } from "../external-summary-compress.js";
 import { executeSearchContextTarget, resolveDecompress } from "../decompress-shared.js";
 import { toolFail, type ProxyToolResult } from "../proxy-tool-result.js";
 import { fetchWithRetry, UpstreamHttpError } from "../fetch-util.js";
-import { noteUpstreamThrottle429, noteUpstreamThrottleResolved } from "../upstream-throttle.js";
+import { noteUpstreamThrottle429, noteUpstreamThrottleResolved, throttle429ModelScope } from "../upstream-throttle.js";
 import { classifyUpstreamFailure, type SkippedProxyInfo, type UpstreamFailureKind } from "../upstream-fail.js";
 import { formatUpstreamError, proxyDispatcher } from "../upstream-proxy.js";
 import { warnCacheCollapse } from "../cache-warn.js";
@@ -190,10 +190,12 @@ function isReasoningRequiredError(e: unknown): boolean {
 const TRANSPORT_FAILURE_LABELS: Record<UpstreamFailureKind, string> = {
     "client-abort": "aborted",
     "upstream-timeout": "upstream timeout",
+    "upstream-headers-timeout": "upstream sent no first byte in time",
     "proxy-reset": "connection reset by an intermediate proxy",
     "upstream-reset": "connection reset by the upstream",
     "connect-refused": "connection refused",
     "connect-timeout": "connect timed out",
+    "upstream-unreachable": "no route to the upstream",
     dns: "name resolution failed",
     tls: "TLS handshake failure",
     unknown: "network error",
@@ -266,6 +268,8 @@ export interface LoopCtx {
 
 export interface RequestOptions {
     url: string;
+    /** Exact request model when this wire carries it in a URL/envelope instead of the body. */
+    model?: string;
     headers: Record<string, string>;
     /** Final-stage wire transform (e.g. compat.roles role rewrite, #552).
      *  Applied to every outgoing body this loop re-sends — truncation retry,
@@ -509,6 +513,7 @@ export async function* runCompressLoop(
         // #2131: also hand over the exact message count — bodies above the
         // forensics cap are stored clipped and parse to zero messages.
         const wireObj = requestOptions.wireTransform ? requestOptions.wireTransform(body) : body;
+        const requestModel = requestOptions.model ?? (typeof wireObj.model === "string" ? wireObj.model : undefined);
         // #816 family: a lone surrogate anywhere in the body (model-authored
         // text, pre-#816 persisted state) serializes as an unpaired \uXXXX
         // escape and strict upstreams reject the WHOLE body (non-retryable
@@ -596,7 +601,10 @@ export async function* runCompressLoop(
             undefined,
             signal,
             (info) => {
-                if (info.status === 429) noteUpstreamThrottle429(requestOptions.url, requestOptions.headers, null); // retry-after isn't carried in ReplayRetryInfo; the settled response below re-notes with the header
+                if (info.status === 429) {
+                    const modelScope = throttle429ModelScope(info.status, requestModel, info.detail);
+                    noteUpstreamThrottle429(requestOptions.url, requestOptions.headers, null, Date.now(), modelScope); // Retry-After is not carried on replay metadata.
+                }
                 // #189: correlate the rejection with the rewrite that
                 // preceded it (shrink ratio + fold point), if any.
                 const lc = lastCompressSuffix(ctx.session.lastCompress);
@@ -611,11 +619,12 @@ export async function* runCompressLoop(
         // (retry-after is not carried on the error) before rethrowing.
         try {
             const upstreamSend = await throttledSend;
-            noteUpstreamThrottleResolved(requestOptions.url, requestOptions.headers, upstreamSend.response.status);
+            noteUpstreamThrottleResolved(requestOptions.url, requestOptions.headers, upstreamSend.response.status, Date.now(), requestModel);
             return upstreamSend;
         } catch (error) {
             if (error instanceof UpstreamHttpError && error.status === 429) {
-                noteUpstreamThrottle429(requestOptions.url, requestOptions.headers, null);
+                const modelScope = throttle429ModelScope(error.status, requestModel, error.body);
+                noteUpstreamThrottle429(requestOptions.url, requestOptions.headers, null, Date.now(), modelScope);
             }
             throw error;
         }

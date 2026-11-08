@@ -32,6 +32,16 @@ import * as path from "node:path";
  *  Session objects, so resident memory stays O(#sessions × ~1KB) regardless of
  *  total corpus bytes; a single admin request's peak is one decoded file. */
 
+// #5796: the host-side conversation surface (dsh session file, agent
+// transcripts) grows without bound — bili compression shrinks what is SENT to
+// the model, not the host's own history — so per-step cost climbs with it. On
+// plugin lanes (~2 host messages per request, dsh-measured) that becomes
+// visible around 10k messages ≈ 5k requests. The server log warns much earlier
+// (SLOW_SESSION_MSG_WARN = 1000 messages, src/server.ts); this display gate is
+// deliberately higher — the badge should mean "worth starting a new session",
+// not "notable".
+const SLOW_SESSION_REQUESTS_WARN = 5000;
+
 interface WebSessionSummary {
     id: string;
     title?: string;
@@ -42,6 +52,10 @@ interface WebSessionSummary {
      *  false = disk-only (evicted or from before this process started). */
     live: boolean;
     requests: number;
+    /** #5796: set once requests reach SLOW_SESSION_REQUESTS_WARN — the host-side
+     *  history only grows and per-step cost is climbing; the panel badges the row
+     *  so starting a fresh session reads as the actionable exit. */
+    slowSession?: { requests: number };
     contextTokens: number;
     /** #1839: provenance of contextTokens — "usage" = last real usage report,
      *  "estimate" = bounded local estimate (display should mark it as such). */
@@ -959,6 +973,7 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
             : {}),
         live,
         requests,
+        ...(requests >= SLOW_SESSION_REQUESTS_WARN ? { slowSession: { requests } } : {}),
         contextTokens: s.stats.contextTokens,
         ...(s.stats.contextTokensSource ? { contextTokensSource: s.stats.contextTokensSource } : {}),
         tokensSaved,
