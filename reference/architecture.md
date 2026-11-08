@@ -277,6 +277,7 @@ billion-context/
 │   ├── identity-qwen.ts          # Identity harvest source: qwen-code transcript, opt-in join key (#5825)
 │   ├── identity-sources.ts       # Identity source registry barrel: one import registers every lane (#5825)
 │   ├── incremental-lane.ts       # Incremental-turn server lane: delta acks via x-bili-applied-seq (#3248)
+│   ├── incremental-retouch.ts    # Compact cache-retouch entries (index + content hash) for the incremental lane (#6776)
 │   ├── inline-engine.ts          # In-process compression engine behind the pseudo-origin (#3278)
 │   ├── inline-ws.ts              # Loopback-only WS bridge for the inline engine (#3278)
 │   ├── integrity-label.ts        # NTFS mandatory integrity label check for EPERM startup failures (#5154)
