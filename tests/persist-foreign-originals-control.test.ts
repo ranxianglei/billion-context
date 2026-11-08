@@ -148,6 +148,53 @@ test('an outer commit failure preserves pending originals and publishes no owner
     } finally { DatabaseSync.prototype.exec = exec; second?.closeQuietly(); first.closeQuietly(); }
 });
 
+for (const kind of ['malformed', 'null', 'empty', 'binding', 'CAS']) {
+test(`a fresh writer refuses an unreadable originals mirror with durable bindings (${kind})`, async () => {
+    process.env.BILI_STORAGE_UNIFIED = 'full';
+    process.env.BILI_STORAGE_JSON_WRITER = 'off';
+    const dir = mkdtempSync(join(root, 'unreadable-originals-'));
+    const seed = new SessionStore({ dir, enabled: true, debounceMs: 1, log: () => {} });
+    const pending = fixture('unreadable-originals');
+    await seed.writeNow(pending);
+    seed.closeQuietly();
+    const db = new DatabaseSync(join(dir, 'index.db'));
+    let writer: SessionStore | undefined;
+    try {
+        assert.equal(Number(db.prepare('SELECT count(*) AS n FROM ccr_entries WHERE session_id=?').get(pending.id)?.n), 1);
+        let corrupt = db.prepare('SELECT ccr_json FROM sessions WHERE session_id=?').get(pending.id)?.ccr_json as string | null;
+        if (kind === 'malformed') corrupt = 'not valid JSON';
+        if (kind === 'null') corrupt = null;
+        if (kind === 'empty') corrupt = JSON.stringify({ version: 1, byHash: {}, byRef: {} });
+        if (kind === 'binding') {
+            assert.ok(corrupt);
+            const changed = JSON.parse(corrupt);
+            changed.byRef.m00001.head = 'different durable entry metadata';
+            corrupt = JSON.stringify(changed);
+        }
+        db.prepare('UPDATE sessions SET ccr_json=? WHERE session_id=?').run(corrupt, pending.id);
+        if (kind === 'CAS') db.prepare(`UPDATE content SET bytes=? WHERE hash IN
+            (SELECT content_hash FROM ccr_entries WHERE session_id=?)`).run(Buffer.from('changed binding bytes'), pending.id);
+        const bindings = db.prepare('SELECT * FROM ccr_entries WHERE session_id=?').all(pending.id);
+        const bodies = db.prepare(`SELECT c.hash, c.bytes FROM content c JOIN ccr_entries e
+            ON c.hash=e.content_hash WHERE e.session_id=?`).all(pending.id);
+        writer = new SessionStore({ dir, enabled: true, debounceMs: 1, log: () => {} });
+        assert.throws(() => writer!.loadContentStore(pending), /unreadable|missing CCR/,
+            'unreadable authoritative SQL originals must not degrade to an empty or legacy read');
+        assert.ok(pending.contentStore);
+        pending.contentStore = storeOriginal(pending.contentStore, { ref: 'm00002', rawId: 'new-after-corruption',
+            text: 'New exact pending original Ω\u0000', kind: 'tool', tokens: 7, head: 'pending' });
+        pending.contentStoreDirty = true;
+        await assert.rejects(writer.writeNow(pending), /unreadable|missing CCR/,
+            'unreadable authoritative originals must not be replaced by a fresh writer');
+        assert.equal(db.prepare('SELECT ccr_json FROM sessions WHERE session_id=?').get(pending.id)?.ccr_json, corrupt);
+        assert.deepEqual(db.prepare('SELECT * FROM ccr_entries WHERE session_id=?').all(pending.id), bindings);
+        assert.deepEqual(db.prepare(`SELECT c.hash, c.bytes FROM content c JOIN ccr_entries e
+            ON c.hash=e.content_hash WHERE e.session_id=?`).all(pending.id), bodies);
+        assert.equal(pending.contentStoreDirty, true);
+    } finally { writer?.closeQuietly(); db.close(); }
+});
+}
+
 test('a writer advancing after the stale check is refused at the atomic commit boundary', async () => {
     process.env.BILI_STORAGE_UNIFIED = 'full';
     process.env.BILI_STORAGE_JSON_WRITER = 'off';

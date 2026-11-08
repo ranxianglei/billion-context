@@ -15,6 +15,10 @@ import { join } from "node:path";
  *      is refused with renumber guidance instead of folding the wrong range.
  * S15: cold load re-stamps legacy counter refs onto seq+1 exactly once and
  *      records the superseded map on the session.
+ * S16: cold load KEEPS legacy refs when mapped ids own no rows (#5599: an
+ *      imported collapsed ledger must not be stamped — the stamp would
+ *      evict ghost bindings and re-target saved citations at newer bodies);
+ *      a complete ledger still aligns (control half).
  */
 process.env.NODE_ENV = "test";
 process.env.BILI_STORAGE_UNIFIED = "full";
@@ -241,6 +245,99 @@ test("S15: citation-space alignment defers from cold load to the next fold save 
         store3.closeQuietly();
     } finally {
         // restore the singleton-less state for later tests
+        _setStoreForTest({} as never);
+    }
+    rmSync(dir, { recursive: true, force: true });
+});
+
+test("S16: cold load keeps legacy refs when mapped ids own no rows (#5599 folded-tail import)", async () => {
+    const refOf = (i: number): string => `m${String(i).padStart(5, "0")}`;
+    const idOf = (i: number): string => (i <= 6 ? `o${i}` : `t${i - 6}`);
+
+    const dir = join(testRoot, `s16-${Math.random().toString(36).slice(2)}`);
+    const { SessionStore, _setStoreForTest } = await import("../src/persist.ts");
+    try {
+        // Imported collapsed ledger: o1..o6 are folded (bindings live in the
+        // ref ledger, NO message rows), t1..t3 are the resident tail re-based
+        // at seq 0..2, and the saved summary cites m00001. Seeded exactly like
+        // an import does — one ingest of the record as-is.
+        const legacy = legacyLike("pr3-folded-tail", [msg("t1", "assistant"), msg("t2"), msg("t3")]);
+        const byRaw: Record<string, string> = {};
+        const byRef: Record<string, string> = {};
+        for (let i = 1; i <= 9; i++) {
+            byRaw[idOf(i)] = refOf(i);
+            byRef[refOf(i)] = idOf(i);
+        }
+        legacy.state.messageRefs = { byRaw, byRef };
+        legacy.state.blocks = [{
+            blockId: "b1",
+            runId: "r1",
+            tier: 1,
+            summary: "Earlier evidence: m00001.",
+            directMessageIds: ["o1", "o2", "o3", "o4", "o5", "o6"],
+            effectiveMessageIds: ["o1", "o2", "o3", "o4", "o5", "o6"],
+            directBlockIds: [],
+            compressedTokens: 60,
+            createdAt: Date.now(),
+            survivedCount: 0,
+            generation: "young",
+            active: true,
+            startRef: "m00001",
+            endRef: "m00006",
+        }];
+        legacy.state.deadRefs = ["m00001", "m00002", "m00003", "m00004", "m00005", "m00006"];
+        legacy.contentStore = {
+            version: 1,
+            byHash: {},
+            byRef: {
+                m00001: msg("o1", "user", "original body one"),
+                m00007: msg("t1", "assistant", "tail body one"),
+            },
+        };
+        const st = UnifiedStore.open(join(dir, "index.db"), undefined as never) as unknown as UnifiedStore;
+        st.ingestSession(planIngest(legacy));
+        st.close();
+
+        // Cold load from the index alone (fresh store over the same dir).
+        const store = new SessionStore({ enabled: true, dir, debounceMs: 0 });
+        _setStoreForTest(store);
+        const reloaded = store.loadSync("pr3-folded-tail");
+        assert.ok(reloaded, "session loads from the index");
+        for (let i = 1; i <= 9; i++) {
+            assert.equal(reloaded!.state.messageRefs.byRaw[idOf(i)], refOf(i), `${idOf(i)} keeps its legacy ref`);
+        }
+        assert.notEqual((reloaded!.state as { refLedgerAligned?: boolean }).refLedgerAligned, true, "incomplete ledger: alignment skipped, retried on a later cold load");
+        assert.equal(reloaded!.restampSuperseded, undefined);
+        // The saved citation still resolves to the original body, not the tail.
+        const ccr = reloaded!.contentStore as { byRef?: Record<string, { text?: string }> } | undefined;
+        assert.equal(ccr?.byRef?.["m00001"]?.text, "original body one", "m00001 retrieves o1's original");
+        assert.equal(ccr?.byRef?.["m00007"]?.text, "tail body one", "tail binding untouched");
+        store.closeQuietly();
+
+        // Control: the SAME ref map over a COMPLETE ledger (every mapped id
+        // owns a live row) must still align — here it converges to a no-op,
+        // proving the guard discriminates on row coverage, not on folds.
+        const dir2 = join(testRoot, `s16c-${Math.random().toString(36).slice(2)}`);
+        try {
+            const complete = legacyLike("pr3-complete", Array.from({ length: 9 }, (_, k) => msg(idOf(k + 1))));
+            complete.state.messageRefs = { byRaw, byRef };
+            const st2 = UnifiedStore.open(join(dir2, "index.db"), undefined as never) as unknown as UnifiedStore;
+            st2.ingestSession(planIngest(complete));
+            st2.close();
+            const store2 = new SessionStore({ enabled: true, dir: dir2, debounceMs: 0 });
+            _setStoreForTest(store2);
+            const aligned = store2.loadSync("pr3-complete");
+            assert.ok(aligned, "complete-ledger session loads");
+            assert.equal((aligned!.state as { refLedgerAligned?: boolean }).refLedgerAligned, true, "complete ledger still aligns");
+            for (let i = 1; i <= 9; i++) {
+                assert.equal(aligned!.state.messageRefs.byRaw[idOf(i)], refOf(i), `${idOf(i)} already at seq+1 — no-op alignment`);
+            }
+            store2.closeQuietly();
+        } finally {
+            _setStoreForTest({} as never);
+            rmSync(dir2, { recursive: true, force: true });
+        }
+    } finally {
         _setStoreForTest({} as never);
     }
     rmSync(dir, { recursive: true, force: true });

@@ -3190,6 +3190,29 @@ export class UnifiedStore {
         return out;
     }
 
+    /** #5599: which of these msg_ids own at least ONE row (live OR retired).
+     *  Completeness check for the one-time ledger re-stamp: an imported
+     *  collapsed ledger (folded ghosts never got rows; the tail re-based at
+     *  seq 0) must not be stamped, because the stamp evicts the ghost
+     *  bindings onto fresh numbers and re-targets saved citations at newer
+     *  bodies. Native ledgers always qualify — the historian sweep retires
+     *  covered rows instead of deleting them (#4390), so every mapped id
+     *  keeps its row. */
+    backedMsgIds(sessionId: string, msgIds: string[]): Set<string> {
+        const out = new Set<string>();
+        if (msgIds.length === 0) return out;
+        const CHUNK = 500;
+        for (let i = 0; i < msgIds.length; i += CHUNK) {
+            const chunk = msgIds.slice(i, i + CHUNK);
+            const ph = chunk.map(() => "?").join(", ");
+            const rows = this.db
+                .prepare(`SELECT DISTINCT msg_id FROM messages WHERE session_id = ? AND msg_id IN (${ph})`)
+                .all(sessionId, ...chunk) as Record<string, unknown>[];
+            for (const r of rows) out.add(r.msg_id as string);
+        }
+        return out;
+    }
+
     /** #4316 PR3/3: fork adoption clones the parent's rows wholesale so the
      *  child's cloned kernel refs keep pointing at the same ledger positions
      *  (owner decision 2026-10-22: fork copies every number). The child
@@ -3588,21 +3611,43 @@ export class UnifiedStore {
         return this.db.transaction(action);
     }
 
-    getCcr(sessionId: string): MessageContentStore | null {
+    getCcr(sessionId: string, requireValid = false): MessageContentStore | null {
         const row = this.db
             .prepare("SELECT ccr_json FROM sessions WHERE session_id = ?")
             .get(sessionId) as { ccr_json: string | null } | undefined;
-        if (!row || row.ccr_json === null) return null;
+        if (!row || row.ccr_json === null) {
+            if (requireValid) {
+                const indexed = this.db.prepare("SELECT count(*) AS n FROM ccr_entries WHERE session_id = ?").get(sessionId) as { n: number };
+                if (Number(indexed.n) !== 0) throw new Error("Index commit refused: missing CCR mirror with durable bindings");
+            }
+            return null;
+        }
         try {
             const parsed = JSON.parse(row.ccr_json) as MessageContentStore;
             if (parsed && typeof parsed === "object" && parsed.version === 1
                 && parsed.byHash && typeof parsed.byHash === "object"
                 && parsed.byRef && typeof parsed.byRef === "object") {
+                if (requireValid) {
+                    const entries = this.db.prepare(`SELECT e.ccr_key, e.content_hash, c.bytes
+                        FROM ccr_entries e LEFT JOIN content c ON c.hash = e.content_hash
+                        WHERE e.session_id = ?`).all(sessionId) as { ccr_key: string; content_hash: string; bytes: Uint8Array | null }[];
+                    if (entries.length !== Object.keys(parsed.byRef).length) throw new Error("unreadable CCR binding count");
+                    for (const entry of entries) {
+                        if (entry.bytes === null) throw new Error("unreadable CCR binding content");
+                        const bytes = Buffer.from(entry.bytes);
+                        if (createHash("sha256").update(bytes).digest("hex") !== entry.content_hash
+                            || JSON.stringify(parsed.byRef[entry.ccr_key]) !== bytes.toString("utf8")) {
+                            throw new Error("unreadable CCR binding content");
+                        }
+                    }
+                }
                 return parsed;
             }
-        } catch {
+        } catch (err) {
+            if (requireValid) throw new Error("Index commit refused: unreadable CCR mirror", { cause: err });
             // fall through: a corrupt mirror degrades to the file path
         }
+        if (requireValid) throw new Error("Index commit refused: unreadable CCR mirror");
         return null;
     }
 
