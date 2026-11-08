@@ -1821,11 +1821,14 @@ function applySingleRange(input: SingleRangeInput): SingleRangeOutcome {
     // #4521: everything in the range was dropped by content filters
     // (protected tool pairs, media, …) with no zone hit and no consumed
     // blocks — same idempotent no-op class as the two above, so the batch is
-    // not poisoned by it.
+    // not poisoned by it. #5919: the projection may have carried a specific
+    // reason (e.g. a merge skipped because its turn cannot be closed now) —
+    // surface those before the generic explanation.
     const highest = highestUsedIndex(input.state.messageRefs);
     return {
       tokens: 0,
       warnings: [
+        ...warnings,
         `Range ${input.spec.startRef}..${input.spec.endRef} folded nothing — all of its content is protected or filtered (protected tool calls/results, media, or the recent-message zone), which always stays visible. Nothing failed; do not resend this range. Session highest allocated ref is ${highest > 0 ? indexToRef(highest) : "none"}.`,
       ],
       noop: true,
