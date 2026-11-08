@@ -25,7 +25,7 @@ import { stateDir } from "./paths.js";
 import { loadConfigFile } from "./config.js";
 import { log } from "./logger.js";
 import { parseDurationField } from "./duration.js";
-import { UPSTREAM_TIMEOUT_MS, UPSTREAM_FIRST_BYTE_MS, REPLAY_MAX_ATTEMPTS, REPLAY_BASE_DELAY_MS } from "./fetch-util.js";
+import { UPSTREAM_TIMEOUT_MS, REPLAY_MAX_ATTEMPTS, REPLAY_BASE_DELAY_MS } from "./fetch-util.js";
 import { PROXY_KEEPALIVE_MAX_MS } from "./upstream-proxy.js";
 import { WAL_JOURNAL_SIZE_LIMIT } from "./storage/schema.js";
 
@@ -84,9 +84,14 @@ export function upstreamTimeoutMs(): number {
     return Number.isInteger(v) && v > 0 ? v : UPSTREAM_TIMEOUT_MS;
 }
 
-/** BILI_UPSTREAM_FIRST_BYTE_MS > network.upstreamFirstByteMs > UPSTREAM_FIRST_BYTE_MS
- *  (= UPSTREAM_TIMEOUT_MS, so unset = byte-identical to the single-phase
- *  watchdog). Phase-1 budget: request fully sent → first response byte. Bounds
+/** BILI_UPSTREAM_FIRST_BYTE_MS > network.upstreamFirstByteMs > the RESOLVED
+ *  upstreamTimeoutMs() — so unset = byte-identical to the single-phase
+ *  watchdog for EVERY configuration, including deployments that raise
+ *  BILI_UPSTREAM_TIMEOUT_MS above 12 min for >12-min local-model prefills
+ *  (review on #5917 caught the first cut pinning the fallback to the 720000
+ *  constant UPSTREAM_FIRST_BYTE_MS, which would have silently re-capped
+ *  those deployments' first byte at 12 min). Phase-1 budget: request fully
+ *  sent → first response byte. Bounds
  *  "upstream accepted the request but never answered" separately from mid-stream
  *  silence, which keeps the #1706/#1714 guarantee that long silent prefills are
  *  never truncated by default (#5904: a GPU-restart-cold sglang answered one
@@ -95,7 +100,7 @@ export function upstreamTimeoutMs(): number {
  *  catch that wedge fast). */
 export function upstreamFirstByteMs(): number {
     const v = tNum("BILI_UPSTREAM_FIRST_BYTE_MS", fileNetwork().upstreamFirstByteMs);
-    return Number.isInteger(v) && v > 0 ? v : UPSTREAM_FIRST_BYTE_MS;
+    return Number.isInteger(v) && v > 0 ? v : upstreamTimeoutMs();
 }
 
 /** BILI_CA_FILE > network.caFile > unset. Path to a PEM bundle of extra root CAs

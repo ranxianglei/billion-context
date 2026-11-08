@@ -25,12 +25,13 @@ export { MAX_REQUEST_BYTES } from "./request-body-budget.js";
 import { checkOutboundBody } from "./request-body-budget.js";
 export const UPSTREAM_TIMEOUT_MS = 12 * 60 * 1000;
 
-/** Default phase-1 (request → first response byte) budget. Equals the full
- *  idle budget so the default behavior is byte-identical to the pre-#5904
- *  single-phase watchdog — deployments that can bound first-byte latency
- *  tighter (the release gate sets 120000ms) opt in via
- *  BILI_UPSTREAM_FIRST_BYTE_MS / network.upstreamFirstByteMs. */
-export const UPSTREAM_FIRST_BYTE_MS = UPSTREAM_TIMEOUT_MS;
+// NOTE (#5917 review): there is deliberately NO UPSTREAM_FIRST_BYTE_MS default
+// constant here — the unset fallback of the first-byte knob is the RESOLVED
+// upstreamTimeoutMs() (src/knobs.ts), so "unset" stays byte-identical to the
+// pre-#5904 single-phase watchdog for EVERY configuration, including
+// deployments that raise BILI_UPSTREAM_TIMEOUT_MS above 12 min for >12-min
+// local-model prefills. Pinning a 720000 constant here would silently re-cap
+// those deployments' first byte at 12 min.
 
 const liveUpstreamTimers = new Set<ReturnType<typeof setTimeout>>();
 /** Test hook: how many fetchWithTimeout idle-timers are currently armed.

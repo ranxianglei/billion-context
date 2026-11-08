@@ -3,7 +3,6 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
 import {
-    UPSTREAM_FIRST_BYTE_MS,
     UPSTREAM_TIMEOUT_MS,
     fetchWithTimeout,
 } from "../src/fetch-util.ts";
@@ -25,23 +24,35 @@ function restoreEnv(prev: string | undefined): void {
     else process.env[KNOB_ENV] = prev;
 }
 
-test("upstreamFirstByteMs defaults to the full idle budget and honors the env knob", () => {
+test("upstreamFirstByteMs defaults to the RESOLVED idle budget (follows a raised BILI_UPSTREAM_TIMEOUT_MS) and honors the env knob", () => {
     const prev = process.env[KNOB_ENV];
+    const prevIdle = process.env.BILI_UPSTREAM_TIMEOUT_MS;
     try {
         delete process.env[KNOB_ENV];
+        delete process.env.BILI_UPSTREAM_TIMEOUT_MS;
         // Default must be byte-identical to the pre-#5904 single-phase watchdog:
         // no shorter phase-1 bound unless the deployment opts in (#1706/#1714
         // guarantee — long silent prefills are legitimate and never truncated).
         assert.equal(upstreamFirstByteMs(), UPSTREAM_TIMEOUT_MS);
-        assert.equal(upstreamFirstByteMs(), UPSTREAM_FIRST_BYTE_MS);
+        // #5917 review: a deployment that RAISES the idle budget above 12 min
+        // (documented: >12-min local-model prefills) must get the same raised
+        // first-byte budget — the first cut pinned the fallback to the 720000
+        // constant and silently re-capped those deployments at 12 min.
+        process.env.BILI_UPSTREAM_TIMEOUT_MS = "3600000";
+        assert.equal(upstreamFirstByteMs(), 3600000);
+        // An explicit first-byte knob still wins over following the idle budget.
         process.env[KNOB_ENV] = "45000";
         assert.equal(upstreamFirstByteMs(), 45000);
+        delete process.env[KNOB_ENV];
+        // Garbage values fall back to the RESOLVED idle budget, not a constant.
         for (const bad of ["not-a-number", "0", "-5", "1.5"]) {
             process.env[KNOB_ENV] = bad;
-            assert.equal(upstreamFirstByteMs(), UPSTREAM_TIMEOUT_MS, `bad value ${bad}`);
+            assert.equal(upstreamFirstByteMs(), 3600000, `bad value ${bad}`);
         }
     } finally {
         restoreEnv(prev);
+        if (prevIdle === undefined) delete process.env.BILI_UPSTREAM_TIMEOUT_MS;
+        else process.env.BILI_UPSTREAM_TIMEOUT_MS = prevIdle;
     }
 });
 
