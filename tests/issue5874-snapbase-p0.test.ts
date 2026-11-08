@@ -383,9 +383,12 @@ test("#5874 T6: deleteSession cascades the plane tables", () => {
             ]);
             // L1 entry under the session's ledger id.
             snapL1Record(db, "sess-t6", "sess-t6", "probe", Date.now());
-            assert.equal(tableCount(db, "snap_rows"), 1);
-            assert.equal(tableCount(db, "snap_log"), 1);
-            assert.equal(tableCount(db, "l1_world"), 1);
+            // The soak default also made the ingest hook write plane rows,
+            // so assert "at least the manual evidence exists" — the cascade
+            // assertions below are the point of this test.
+            assert.ok(tableCount(db, "snap_rows") >= 1);
+            assert.ok(tableCount(db, "snap_log") >= 1);
+            assert.ok(tableCount(db, "l1_world") >= 1);
             db.close();
             store.deleteSession("sess-t6");
             const db2 = rawDb(p);
@@ -429,7 +432,15 @@ test("#5874 flags: master ⊃ lane, resolved at the store", () => {
             shadowWrite: false,
         });
         assert.deepEqual(mk(path.join(dir, "d.db"), { enabled: true }), { enabled: true, shadowWrite: false });
-        assert.deepEqual(mk(path.join(dir, "e.db"), undefined), { enabled: false, shadowWrite: false });
+        // SOAK (PR #5901): absent config ⇒ 100% ON default while the PR soaks
+        // ci:full + the local gate — REVERT this expectation (and the store/
+        // admin defaults) to { enabled: false, shadowWrite: false } before merge.
+        assert.deepEqual(mk(path.join(dir, "e.db"), undefined), { enabled: true, shadowWrite: true });
+        assert.deepEqual(
+            mk(path.join(dir, "f.db"), { enabled: false, shadowWrite: false }),
+            { enabled: false, shadowWrite: false },
+            "an explicit config can still pin the plane off during the soak",
+        );
     } finally {
         // Close before rmSync: Windows refuses to unlink open sqlite files (EBUSY).
         for (const s of stores) s.close();

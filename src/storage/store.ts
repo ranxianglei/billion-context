@@ -461,8 +461,14 @@ export class UnifiedStore {
      *  lane). Off ⇒ the plane tables are never touched by the write hook.
      *  Set from UnifiedStore.open's opts — the constructor stays untouched
      *  (readSnapshotAsync's reader stores inherit the flag harmlessly: the
-     *  reader connection is query-only and never ingests). */
-    snapPlane: { enabled: boolean; shadowWrite: boolean } = { enabled: false, shadowWrite: false };
+     *  reader connection is query-only and never ingests).
+     *  SOAK DEFAULT (2026-11-08, PR #5901): while the PR soaks ci:full and
+     *  the local real-traffic gate, the plane runs ON for 100% of sessions
+     *  when the config file is silent — REVERT both spots (here and the
+     *  open() fallback below, plus admin.ts's status default) to
+     *  { enabled: false, shadowWrite: false } before merge: the release
+     *  stays default-off per discussion #5874 §9. */
+    snapPlane: { enabled: boolean; shadowWrite: boolean } = { enabled: true, shadowWrite: true };
     /** #5744: last periodic checkpoint result (plus its wall time) for the
      * slow-ingest warn line — lets an operator attribute a stall spike to a
      * checkpoint burst instead of guessing. Null until the first tick. */
@@ -638,14 +644,17 @@ export class UnifiedStore {
             loggerLog("warn", `[storage] WAL checkpoint on open failed for ${path}: ${String(err)}`);
         }
         const store = new UnifiedStore(db, used, source, lockPath, foreignLockHolder, path);
-        if (opts?.snapBase) {
+        {
             // #5874: the config layer already enforces master⊃lane (the
             // lane flag only means something with the master flag); the
             // && here is the storage layer's own belt (a store opened
             // directly, bypassing knobs, can never shadow without the master).
+            // SOAK: config absent ⇒ the soak default ON (see the field
+            // comment above — revert before merge).
+            const f = opts?.snapBase ?? { enabled: true, shadowWrite: true };
             store.snapPlane = {
-                enabled: opts.snapBase.enabled === true,
-                shadowWrite: opts.snapBase.enabled === true && opts.snapBase.shadowWrite === true,
+                enabled: f.enabled === true,
+                shadowWrite: f.enabled === true && f.shadowWrite === true,
             };
         }
         if (integrityOk) store.noteIntegrityOk();

@@ -128,7 +128,7 @@ test("#5874 T4: the shadow plane tracks the legacy view on every save (incl. cra
         {
             const raw = openSqliteDatabase(p).db;
             const plan = planIngest(session("sess-t4", [{ id: "m1", text: "one" }, { id: "m2", text: "two" }, { id: "m3", text: "three" }, { id: "m4", text: "four" }, { id: "m5", text: "five" }]));
-            const s2 = UnifiedStore.open(p); // no plane
+            const s2 = UnifiedStore.open(p, undefined, { snapBase: { enabled: false, shadowWrite: false } }); // plane explicitly OFF: the crash-gap store must not self-heal
             s2.ingestSession(plan);
             s2.close();
             raw.close();
