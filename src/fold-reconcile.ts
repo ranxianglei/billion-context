@@ -2264,14 +2264,21 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
                     for (const id of block.directMessageIds ?? []) deadIds.add(id);
                 }
                 for (const id of deadIds) delete nextAnchors[id];
-                for (let i = nextOrder.length - 1; i >= 0; i--) {
-                    if (deadIds.has(nextOrder[i])) nextOrder.splice(i, 1);
-                }
-                const storedPositions = session.metadata[METADATA_POSITIONS] as { ids?: string[] } | undefined;
+                const storedPositions = session.metadata[METADATA_POSITIONS] as { ids?: string[]; canon?: string[] } | undefined;
                 const positionIds = storedPositions?.ids;
+                const positionCanon = storedPositions?.canon;
+                for (let i = nextOrder.length - 1; i >= 0; i--) {
+                    if (deadIds.has(nextOrder[i])) {
+                        nextOrder.splice(i, 1);
+                        if (positionIds === nextOrder && Array.isArray(positionCanon)) positionCanon.splice(i, 1);
+                    }
+                }
                 if (Array.isArray(positionIds) && positionIds !== nextOrder) {
                     for (let i = positionIds.length - 1; i >= 0; i--) {
-                        if (deadIds.has(positionIds[i])) positionIds.splice(i, 1);
+                        if (deadIds.has(positionIds[i])) {
+                            positionIds.splice(i, 1);
+                            if (Array.isArray(positionCanon)) positionCanon.splice(i, 1);
+                        }
                     }
                 }
                 recordConflict(session, "orphan-reap", `reaped ${reapedCount} zombie fold block(s) [${reaped.join(", ")}]: covered substrate majority-absent for ${FOLD_DRIFT_ESCALATE_PASSES} consecutive passes (#2695)`);
