@@ -84,7 +84,7 @@
 | `upstreamProxy` | string | unset | — | Web 面板手动设置的代理层级（由仪表盘代理编辑器写入）；解析顺序中位于 BILI_UPSTREAM_PROXY 之下。 |
 | `upstreamProxyMode` | "auto" \| "manual" \| "direct" | auto (unset behaves as direct) | BILI_UPSTREAM_PROXY_MODE | 全局代理来源策略：auto（环境变量/系统发现）、manual（仅 Web 面板值）、direct（从不使用代理）。 |
 | `providers` | record url-prefix → route entry | {} | — | 路由表：URL 前缀键到逐 provider 条目（models、compress、compat…）的映射。详见 Providers 章节。 |
-| `modelContextLimit` | number | 200000 | ACP_MODEL_CONTEXT_LIMIT | 旧版全局窗口上限（窗口来源中优先级最高，兼作使用率分母）；建议改用 compress.modelContextLimit。 |
+| `modelContextLimit` | number | 200000 | ACP_MODEL_CONTEXT_LIMIT | 旧版全局默认窗口（窗口解析阶梯的最后一层兜底：仅当 tier 证据、plugin/launcher 报告、路由声明、注册表查询、内置表都未解析出该模型的上限时才使用；在其生效的会话里兼作使用率分母）；建议改用 compress.modelContextLimit。 |
 | `imageBilling` | "auto" \| "pixels" \| "bytes" | auto (resolves to pixels) | BILI_IMAGE_BILLING | 全局图片 token 估算口径；逐请求实时读取，优先于所有逐 provider 设置。 |
 | `imageTokenCap` | number | unset (uncapped) | BILI_IMAGE_TOKEN_CAP | 全局单图 token 上限，叠加在计费口径之上生效；逐请求实时读取。 |
 | `imageRescale` | boolean | true | BILI_IMAGE_RESCALE | 出站图片降采样总开关（#3295/#3400）：大图以缩小形态发给模型，原图在会话存储中保持字节级原样。逐请求实时读取。 |
@@ -687,7 +687,7 @@
 - **类型：** `number`
 - **默认值：** `200000`
 - **状态：** ACTIVE
-- **说明：** 进程级绝对上下文上限（token）—— provider 条目与模型条目都未声明各自上限时的兜底层。可由 `ACP_MODEL_CONTEXT_LIMIT` 覆盖。区别于[压缩调优](#压缩调优)下参与三级合并的 `compress.modelContextLimit` 合并键。
+- **说明：** 进程级绝对上下文上限（token）—— 窗口解析的最后一层兜底：仅当其他所有来源（tier 证据头、plugin/launcher 报告、路由 `models.<m>.context` 声明、注册表查询、内置表）都未解析出该模型的上限时才使用；它不会封顶或覆盖上述任何来源 —— 例如原生窗口解析为 1M 的模型会完全忽略本值（#5908）。由环境变量 `ACP_MODEL_CONTEXT_LIMIT` 或本文件键设置（环境变量优先）。区别于[压缩调优](#压缩调优)下参与三级合并的 `compress.modelContextLimit` 合并键 —— 后者会覆盖一切已解析来源。
 
 ### `providersPath`
 
@@ -1988,7 +1988,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `ACP_PASSTHROUGH` | 设为 `1` 不经压缩直接转发（等同 `"passthrough": true`）。 |
 | `ACP_COMPRESS_TOOL` | 设为 `0` 禁用工具注入（等同 `"compress.injectTool": false`）。 |
 | `ACP_COMPRESS_NUDGE` | 设为 `0` 禁用 nudge 注入（等同 `"compress.injectNudge": false`）。 |
-| `ACP_MODEL_CONTEXT_LIMIT` | 全局覆盖上下文上限（绝对 token 数）。 |
+| `ACP_MODEL_CONTEXT_LIMIT` | 全局默认上下文上限（绝对 token 数）——窗口解析的最后一层兜底：仅当该模型没有任何路由/模型声明、注册表条目或内置表值时才生效，不会封顶已按原生解析出的窗口（#5908）；要固定某个模型的窗口请用 `compress.modelContextLimit`。 |
 | `BILLION_CONTEXT_NODE` | 非 Node 宿主进程拉起代理时显式指定的 Node 可执行文件路径（#819/#1429）。宿主自身不是 Node 时的解析顺序:本覆盖项 → PATH 搜索 + GUI PATH 会遗漏的众所周知安装位置（`/opt/homebrew/bin`、`/usr/local/bin`、Volta 等）→ Electron 宿主自身二进制以纯 Node 运行（`ELECTRON_RUN_AS_NODE=1`，最后手段 —— 因此 deepseek-harness desktop 这类桌面应用零配置即可用）。每个发现的候选项都会用 `--version` 校验，必须报告 major ≥ 20 的 `vX.Y.Z`（#3383）：仅*名字*叫 `node(.exe)` 的外部程序（如 Microsoft HPC Pack 集群 CLI —— 忽略参数、退出码 0）会被跳过并告警，而不是被拉起 —— 若此类程序在你的 PATH 中位于真正的 Node 之前，请显式设置本变量。用于强制指定某个 Node（如比宿主捆绑运行时更新的版本）；始终优先于上述回退。 |
 | `BILI_IMAGE_TOKEN_CAP` | 预检尺寸门、输出钳制与图片压缩统计所用单图 token 估算的统一天花板（#488/#496/#1843）。叠加在任何计费模式之上 —— 适用于路由真实编码器计费低于像素先验的场景。优先于两级配置（[`imageTokenCap`](#imagetokencap)）；每次请求实时读取（无需重启）。不设置 = 回退到配置（`providers.<url>.imageTokenCap`，再全局），默认无上限。 |
 | `BILI_IMAGE_BILLING` | 覆盖预检尺寸门与输出钳制的图片计费模式（#767/#1843）：`pixels` 或 `bytes`。每次请求实时读取（无需重启）；优先于全局 `imageBilling` 与所有按 provider 的 `providers.<url>.imageBilling`。自 #1843 起默认对所有 host 解析为 `pixels`，故用 `bytes` 全进程强制保守字节计费（例如字节计数 relay）—— 更窄的场景仍用按路由设置。详见 [`imageBilling`](#imagebilling)。 |
