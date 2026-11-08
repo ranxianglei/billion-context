@@ -329,8 +329,10 @@ export interface LauncherDeps {
      *  Default hits the real endpoint; tests stub it. */
     fetchHealthInfoNoReuse?: (origin: string) => Promise<HealthInfo | undefined>;
     /** #3544: ask a stale resident to drain+exit (POST /__bili/shutdown).
+     *  The optional budget lets a caller shorten the request timeout for a
+     *  holder that is already known-unresponsive (#5955 wedged takeover).
      *  Default hits the real endpoint; tests stub it. */
-    requestInstanceShutdown?: (origin: string) => Promise<boolean>;
+    requestInstanceShutdown?: (origin: string, timeoutMs?: number) => Promise<boolean>;
     /** #1292: simulated OS for spawn planning and platform-gated arg
      *  construction — tests drive win32 paths from a POSIX host. Defaults
      *  to process.platform. */
@@ -4890,7 +4892,7 @@ const OWNER_HEARTBEAT_POST_TIMEOUT_MS = 2_000;
 const WATCHER_REG_ATTEMPTS = 3;
 const WATCHER_REG_RETRY_BACKOFF_MS = 500;
 
-export async function requestInstanceShutdown(origin: string): Promise<boolean> {
+export async function requestInstanceShutdown(origin: string, timeoutMs: number = SHUTDOWN_REQUEST_TIMEOUT_MS): Promise<boolean> {
     try {
         const res = await fetch(`${origin}/__bili/shutdown`, {
             method: "POST",
@@ -4899,7 +4901,7 @@ export async function requestInstanceShutdown(origin: string): Promise<boolean> 
             // would only extend the drain it is about to run.
             headers: { "content-type": "application/json", connection: "close" },
             body: "{}",
-            signal: AbortSignal.timeout(SHUTDOWN_REQUEST_TIMEOUT_MS),
+            signal: AbortSignal.timeout(timeoutMs),
         });
         return res.ok;
     } catch {
@@ -4988,18 +4990,30 @@ async function rotateStalePredecessor(
 // own — which the event-loop watchdog only guarantees for ≥5min CONTINUOUS
 // blocks; the saturation class never trips it, so the lane lost its proxy
 // indefinitely. Resolution = bounded patience across bring-up cycles, then a
-// supervised forced takeover: ask for a graceful shutdown (insurance for a
-// loop that briefly unblocks — the listener closes on accept), terminate if
-// the listener survives, verify the port released, continue to the normal
-// spawn. The victim loses at most its in-flight turn (sessions persist
+// supervised forced takeover: ask for a graceful shutdown (a loop that
+// briefly unblocks can still answer and close its listener cleanly), terminate
+// if the listener survives, verify the port released, continue to the normal
+// spawn. The stage budgets are deliberately SHORT (field-tuned #5955): after
+// 10 minutes of health silence the graceful path is insurance, not
+// expectation — the whole ladder must not add more than a few seconds on top
+// of the window. The victim loses at most its in-flight turn (sessions persist
 // per-turn); the window bounds worst-case unavailability from ∞ to
 // WEDGED_TAKEOVER_WINDOW_MS instead of risking an immediate kill of a
 // slow-but-alive fold.
 export const WEDGED_TAKEOVER_WINDOW_MS = 600_000; // 10 min = 2× WATCHDOG_HARD_TIMEOUT_MS (event-loop-watchdog.ts)
 export const WEDGED_MIN_OBSERVATIONS = 3;         // distinct bring-up cycles, not milliseconds — retry cadence varies per host
 export const WEDGED_OBSERVATION_STALE_MS = 300_000; // gap > this ⇒ the consecutive run was interrupted ⇒ the window restarts
-const WEDGED_TERM_GRACE_MS = 2_000;               // SIGTERM drain budget before the hard kill (POSIX only)
-const WEDGED_RELEASE_WAIT_MS = 5_000;             // per-stage budget to observe the listener close
+// Escalation-stage budgets, field-tuned (#5955 acceptance run on Windows: the
+// original 3+5+2+5s ladder spent ~12.4s of PURE SPIN against a structurally
+// unresponsive holder before the hard kill released the port in ~250ms). A
+// holder silent on health for 10 minutes will not complete an HTTP round-trip
+// in 3s — if it can answer at all it answers promptly, so every stage is a
+// tight multiple of the 200ms poll interval. Worst case is now ~6s to the
+// release verdict (+settle), not ~15s (+settle).
+const WEDGED_SHUTDOWN_BUDGET_MS = 1_000;          // request timeout for the graceful-shutdown POST
+const WEDGED_POST_SHUTDOWN_WAIT_MS = 2_000;       // budget to observe the listener close after the graceful request
+const WEDGED_TERM_GRACE_MS = 1_000;               // SIGTERM drain budget before the hard kill (POSIX only)
+const WEDGED_POST_KILL_WAIT_MS = 2_000;           // budget to observe the listener close after a hard kill (measured release ≤252ms)
 const WEDGED_POST_KILL_SETTLE_MS = 2_000;         // grace for kernel socket release after an ABRUPT kill before we bind (#5955)
 
 interface WedgedLedgerEntry {
@@ -5187,7 +5201,7 @@ async function resolveWedgedSameLaneHolder(
     birthStamp: (pid: number) => Promise<string | undefined>,
     now: () => number,
     sleep: (ms: number) => Promise<void>,
-    requestShutdown: (origin: string) => Promise<boolean>,
+    requestShutdown: (origin: string, timeoutMs?: number) => Promise<boolean>,
     isConnectable: (origin: string) => Promise<boolean>,
     signalHolder: (pid: number) => void,
     hardKillHolder: (pid: number) => void,
@@ -5246,8 +5260,8 @@ async function resolveWedgedSameLaneHolder(
         console.error(msg);
         teeLog("warn", msg);
         const t0 = now();
-        await requestShutdown(c.inst.origin);
-        let released = await waitForListenerClose(c.inst.origin, isConnectable, now, sleep, WEDGED_RELEASE_WAIT_MS);
+        await requestShutdown(c.inst.origin, WEDGED_SHUTDOWN_BUDGET_MS);
+        let released = await waitForListenerClose(c.inst.origin, isConnectable, now, sleep, WEDGED_POST_SHUTDOWN_WAIT_MS);
         let killedHard = false;
         if (!released) {
             signalHolder(c.inst.pid);
@@ -5256,7 +5270,7 @@ async function resolveWedgedSameLaneHolder(
         if (!released) {
             hardKillHolder(c.inst.pid);
             killedHard = true;
-            released = await waitForListenerClose(c.inst.origin, isConnectable, now, sleep, WEDGED_RELEASE_WAIT_MS);
+            released = await waitForListenerClose(c.inst.origin, isConnectable, now, sleep, WEDGED_POST_KILL_WAIT_MS);
         }
         if (released) {
             if (killedHard) {
@@ -6329,7 +6343,12 @@ function hardKillProxyTree(pid: number, label: string): void {
     try {
         process.kill(pid, "SIGKILL");
     } catch (err) {
-        teeLog("warn", `bili: direct SIGKILL of ${label} ${pid} failed (${err instanceof Error ? err.message : String(err)}) — its listener may survive the cleanup (#4125)`);
+        // ESRCH = the tree is already gone (taskkill reaped it) — the goal is
+        // met; warning there would log a false alarm on EVERY successful win32
+        // takeover (#5955 field report).
+        if ((err as NodeJS.ErrnoException)?.code !== "ESRCH") {
+            teeLog("warn", `bili: direct SIGKILL of ${label} ${pid} failed (${err instanceof Error ? err.message : String(err)}) — its listener may survive the cleanup (#4125)`);
+        }
     }
 }
 
