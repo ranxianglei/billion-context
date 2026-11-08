@@ -29,6 +29,19 @@ export const BILI_PASSTHROUGH_HEADER = "x-bili-passthrough";
 // 1M-token window could hold are stopped.
 export const MIN_ASSUMED_WINDOW_TOKENS = 1_000_000;
 
+// Session-ledger measurement (#5613): the wire bodies this host family sends
+// are billed upstream ~14% ABOVE the optimistic bytes/4 token FLOOR — the
+// floor is a strict lower bound, so a body that sits just under the window in
+// floor terms can already be OVER it in reality (the #5613 shape: a send that
+// passed every old "never false-refuse" check, then bricked the session
+// upstream). The over-window fuses therefore price media-excluded core text
+// at the CALIBRATED estimate (floor × this ratio) and only fail open when
+// even that fits; the bare floor remains the stronger "provably over" tier,
+// kept in the result shape for message wording. Owner-approved 2026-11-07:
+// large histories fail CLOSED locally instead of riding into a guaranteed
+// upstream 400.
+export const CALIBRATED_TEXT_TOKEN_RATIO = 1.14;
+
 /**
  * Cryptographic hash of a string, truncated to a 64-bit id (16 hex chars).
  *

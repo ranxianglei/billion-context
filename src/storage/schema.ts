@@ -83,18 +83,7 @@
 //        discipline as v9 (#4796); building them once costs about what
 //        open-time quick_check pays on EVERY open (#4175). Additive-only: an
 //        older build opening a v11 file ignores the extra indexes.
-//      - v12: fastpath v6 (#5643) composite-identity ledger — three
-//        append-only sidecar tables (pf_rows / pf_log / pf_ckpt), all pure
-//        CREATE IF NOT EXISTS: a pre-v12 install upgrades with zero byte
-//        change, and with the watermarkV6MsgId rollout OFF no traffic ever
-//        touches them. No backfill, no back-compat column juggling — older
-//        builds stop at the version gate and simply ignore the extra tables.
-//      - v13: fastpath v6 render snapshot plane (#5664) — three more
-//        append-oriented sidecar tables (pf_render / pf_render_log /
-//        pf_render_ckpt), same pure CREATE IF NOT EXISTS shape: pre-v13
-//        installs upgrade with zero byte change, and with the
-//        watermarkV6Render rollout OFF no traffic touches them.
-export const STORAGE_SCHEMA_VERSION = 13;
+export const STORAGE_SCHEMA_VERSION = 11;
 
 /** #3250: cap for `journal_size_limit` (see STORAGE_PRAGMAS). Passive and
  *  auto checkpoints move frames into the main db and reset the write offset
@@ -446,84 +435,6 @@ export function migrateSchema(db: {
             db.exec("CREATE INDEX IF NOT EXISTS idx_ccr_entries_content_hash ON ccr_entries(content_hash)");
             db.exec("CREATE INDEX IF NOT EXISTS idx_message_media_media_hash ON message_media(media_hash)");
             db.exec("CREATE INDEX IF NOT EXISTS idx_checkpoints_state_hash ON checkpoints(state_hash)");
-        }
-        if (from < 12) {
-            // v12 (#5643): fastpath v6 identity plane — two planes per the
-            // contract: DATA (pf_rows: the frozen cores themselves, strictly
-            // append-only; a half-written pos is never reused) and METADATA
-            // (pf_log L0 append-only entries + pf_ckpt L1 checkpoint; current
-            // state = fold(ckpt, log-after-ckpt)). Naming keeps the pf_*
-            // namespace of the feature's header/ext footprint. The global
-            // probe index is on (sess_raw, ledger_id): "have we seen this
-            // (sessionid,msgid) pair?" answers pf_sid + pos across restarts
-            // (P8 id immortality); idx_pf_rows_core serves block↔pos binding
-            // for fold rendering. Raw host ids are stored UNTRUNCATED as
-            // received (P9: no digest in any judgement-relevant position).
-            db.exec(`
-CREATE TABLE IF NOT EXISTS pf_rows (
-    sid TEXT NOT NULL,
-    pos INTEGER NOT NULL,
-    ledger_id TEXT NOT NULL,
-    sess_raw TEXT NOT NULL,
-    core_id TEXT NOT NULL,
-    core_json TEXT NOT NULL,
-    PRIMARY KEY (sid, pos)
-);
-CREATE INDEX IF NOT EXISTS idx_pf_rows_ledger ON pf_rows(sess_raw, ledger_id);
-CREATE INDEX IF NOT EXISTS idx_pf_rows_core ON pf_rows(sid, core_id);
-CREATE TABLE IF NOT EXISTS pf_log (
-    sid TEXT NOT NULL,
-    ls_seq INTEGER NOT NULL,
-    kind TEXT NOT NULL,
-    payload_json TEXT NOT NULL,
-    born_pos_hi INTEGER NOT NULL,
-    ts INTEGER NOT NULL,
-    PRIMARY KEY (sid, ls_seq)
-);
-CREATE TABLE IF NOT EXISTS pf_ckpt (
-    sid TEXT NOT NULL,
-    ckpt_ls_seq INTEGER NOT NULL,
-    meta_json TEXT NOT NULL,
-    checksum TEXT NOT NULL,
-    updated_at INTEGER NOT NULL,
-    PRIMARY KEY (sid)
-)`);
-        }
-        if (from < 13) {
-            // v13 (#5664): fastpath v6 RENDER snapshot plane — the frozen
-            // prefix's outbound-rendered rows (the final wire form AFTER all
-            // rewrite/compaction is done inbound; outbound only maps stored
-            // rows to the target protocol, no rewrite, no scan). Same LSM
-            // family as the identity plane: pf_render is the current-truth
-            // row set (pos = rendered-message ordinal; row_json NULL =
-            // tombstone: the kernel hid that ordinal), pf_render_log L0
-            // journals each turn's ops (cast/append/delete/compact),
-            // pf_render_ckpt L1 folds it with an S4 checksum over the exact
-            // meta bytes (hydrate re-verifies; mismatch kills the plane for
-            // that sid — rebuild from the replay source, never guess).
-            db.exec(`
-CREATE TABLE IF NOT EXISTS pf_render (
-    sid TEXT NOT NULL,
-    pos INTEGER NOT NULL,
-    row_json TEXT,
-    PRIMARY KEY (sid, pos)
-);
-CREATE TABLE IF NOT EXISTS pf_render_log (
-    sid TEXT NOT NULL,
-    ls_seq INTEGER NOT NULL,
-    kind TEXT NOT NULL,
-    payload_json TEXT NOT NULL,
-    ts INTEGER NOT NULL,
-    PRIMARY KEY (sid, ls_seq)
-);
-CREATE TABLE IF NOT EXISTS pf_render_ckpt (
-    sid TEXT NOT NULL,
-    ckpt_ls_seq INTEGER NOT NULL,
-    meta_json TEXT NOT NULL,
-    checksum TEXT NOT NULL,
-    updated_at INTEGER NOT NULL,
-    PRIMARY KEY (sid)
-)`);
         }
     });
     if (needV8Backfill) migrateV8Identities(db);

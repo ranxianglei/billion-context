@@ -10,21 +10,14 @@
 //      enabled ⇔ bucket < percent × 100. Prefix-stable: raising the percent
 //      never drops an already-enabled install (monotonic rollout, 灰度只进
 //      不出). To re-randomize the cohort, change the salt.
-//   3. NESTING — a feature may declare `base`: its BUCKET decision is made
-//      only inside the base feature's enabled cohort (灰度 A 的用户里再灰度 B;
-//      C→D the same), so a nested percent is relative to the base population,
-//      not everyone. Base chains of any depth; cycles fail closed (off).
-//      Nesting governs the BUCKET TIER ONLY — the force tiers (§4) return
-//      before the nesting check, so an explicitly env/config-forced child runs
-//      even while its base is off/rolled back. CURRENT pinned behavior
-//      (tests/rollout.test.ts "force tier bypasses nesting"), owner
-//      design-confirm pending (#5652 review F10) — do not "fix" it by accident.
+//   3. NESTING — a feature may declare `base`: it is evaluated only inside
+//      the base feature's enabled cohort (灰度 A 的用户里再灰度 B; C→D the
+//      same), so a nested percent is relative to the base population, not
+//      everyone. Base chains of any depth; cycles fail closed (off).
 //   4. PRECEDENCE — env `BILI_ROLLOUT_<FEATURE>` ("0"/"false" = off, any
 //      other value = on) > config `rollout.features.<name>.enabled` >
 //      bucketing over percent (config `percent` override > registry default).
-//      The two force tiers short-circuit BEFORE the §3 nesting check (a forced
-//      feature resolves without consulting its `base`). A feature absent from
-//      the registry AND from the config block is OFF.
+//      A feature absent from the registry AND from the config block is OFF.
 //
 // A release that wants to canary a feature adds one entry to ROLLOUT_FEATURES
 // (percent 0–100, optional salt/base); GA = bump to 100, or move the default
@@ -46,11 +39,7 @@ export interface RolloutPlan {
     percent: number;
     /** Hash salt; defaults to the feature name. Changing it re-randomizes the cohort. */
     salt?: string;
-    /** Nested rollout: evaluate this feature only inside `base`'s enabled
-     *  cohort — for BUCKET-tier decisions. An explicit env/config force
-     *  resolves BEFORE the nesting check, so a forced child runs even while
-     *  `base` is off (pinned by tests/rollout.test.ts; #5652 review F10 —
-     *  owner design-confirm pending, do not "fix" without ruling). */
+    /** Nested rollout: evaluate this feature only inside `base`'s enabled cohort. */
     base?: string;
 }
 
@@ -75,29 +64,6 @@ export const ROLLOUT_FEATURES: Record<string, RolloutPlan> = {
     // `rollout.features.pluginFullResendWatermark: true|false` (or a percent)
     // / `BILI_ROLLOUT_PLUGIN_FULL_RESEND_WATERMARK=1|0`.
     pluginFullResendWatermark: { percent: 5 },
-    // #5643 fastpath v6: (sessionid,msgid) composite-identity-driven
-    // incremental lane. Replaces the count-watermark guesswork with a hard
-    // identity channel: every body element carries its host msgid listwise,
-    // hits are set-difference lookups against the pf_* ledger plane, and
-    // only NEW elements get parsed (any positions in the body). Identity
-    // faults REFUSE the request loudly (400, zero side effects) instead of
-    // degrading silently; five consecutive faults/misses park the lane for
-    // 60 minutes and traffic rides the baseline lanes. Requires the unified
-    // sidecar storage plane (pf_rows/pf_log/pf_ckpt); without it the lane
-    // soft-degrades per node (baseline behavior, no error). Default 0% —
-    // force on with `rollout.features.watermarkV6MsgId: true` or
-    // `BILI_ROLLOUT_WATERMARK_V6_MSG_ID=1`; bucketed growth stays nested
-    // inside the v5 watermark cohort.
-    watermarkV6MsgId: { percent: 0, base: "pluginFullResendWatermark" },
-    // #5664 station-3 fast emit: v6 identity lanes with a healthy render
-    // snapshot plane serve steady hit turns by splicing the cached outbound
-    // rows (frozen prefix verbatim + bounded window-pass over the last cores)
-    // instead of rescanning n rows; every red gate condition (pressure,
-    // caps mismatch, audit cadence, hydrate failure, byte-mismatch vs the
-    // stored suffix) falls back to this branch's baseline path byte-for-byte.
-    // Requires watermarkV6MsgId + the pf_render plane; nested cohort bucketing
-    // inside the v6 lane. Default 0%.
-    watermarkV6Render: { percent: 0, base: "watermarkV6MsgId" },
     // #4804 WS delta continuation: codex/opencode WebSocket clients that keep a
     // previous_response_id checkpoint stop reconstructing full history on every
     // turn — the session augments the delta with the server-committed previous
@@ -131,6 +97,17 @@ export const ROLLOUT_FEATURES: Record<string, RolloutPlan> = {
     // cohorts (compressed vs deleted) and detects generation switches.
     // Default 0% — force on with `BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY=1`.
     pluginLaneServerHistory: { percent: 0 },
+    // #5825 identity-channel harvest seam (registry in identity-harvest.ts):
+    // loopback clients without an explicit body channel get stable session+
+    // message identity aligned from their OWN local transcript/sqlite
+    // (claude-code / codebuddy / mcode adapters). The per-install env switch
+    // BILI_IDENTITY_HARVEST alone already enables it; this key exists for a
+    // COHORT-WIDE ramp that never touches anyone's env. Decoupled from
+    // pluginLaneServerHistory on purpose (owner ruling 2026-11-07): that flag
+    // governs whether stamped ids get PINNED to rows, this one governs where
+    // the seam may even read local files — coupling them made opting one's
+    // own install in require bumping an unrelated rollout. Default 0%.
+    identityChannelHarvest: { percent: 0 },
 };
 
 export const BP_MAX = 10_000;

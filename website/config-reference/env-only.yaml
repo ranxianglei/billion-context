@@ -26,6 +26,14 @@ entries:
     group: envonly
     desc_en: "Newest-tested @deepseek-ai/dsh build behind the dsh native lane's boot note (#4545): the running client build is resolved from the nearest node_modules/@deepseek-ai/dsh/package.json above the injected bundle; being STRICTLY NEWER than this cap earns ONE boot-time note (durable log record + banner) advising roll-back until support lands. One direction only — at-or-below-cap builds stay silent (known older-build break modes have their own overlay-latch detectors). Warns only — never gates or blocks traffic. Move the cap up as builds get verified; an EMPTY string turns the check off for this lane. Unresolvable/unparseable versions fail open to silence."
     desc_zh: “dsh native lane 启动提示的“我们测过的最高版本”上限（#4545）：从注入包上方最近的 node_modules/@deepseek-ai/dsh/package.json 读出运行中的构建,**严格高于**上限才弹一条启动提示(持久日志 + 横幅),建议先回滚到上限版本。只覆盖"更新"一个方向:≤ 上限保持静默(旧版已知坏法有专门的失锁探测)。只提示、绝不拦截或阻断流量;新版本验证通过后抬高上限,空字符串 = 关闭本 lane 检查;读不到/解析不了的版本按静默处理。”
+  - key: BILI_IDENTITY_HARVEST
+    type: string
+    default: "off"
+    kind: env-only
+    audience: user
+    group: envonly
+    desc_en: "Rollout-gated loopback harvest of client-local transcripts/sqlite for stable message-id lanes (#5825). Unset/empty = OFF (fully inert). `all` or a comma list of source ids (`claude,codebuddy,mcode`) enables matching sources for requests whose identity is loopback; every match also requires the `pluginLaneServerHistory` rollout to be ON. Anything undecidable degrades to the pre-wiring path for the whole turn — never a partial mapping. Dev/verification switch by design (the lanes are already safe per client), not a tuning knob."
+    desc_zh: "#5825 身份信道接线的采集开关（灰度门控下的回环本地转录/SQLite 采集）：缺省关闭、完全惰性；`all` 或逗号列表（`claude,codebuddy,mcode`）开启对应来源，且仅对回环身份请求生效，同时要求 pluginLaneServerHistory 灰度为开。任何无法判定的情形整轮退化为接线前路径，绝不做部分映射。设计上是开发/验证开关而非调参旋钮。"
   - key: BILI_STORAGE_BACKEND
     type: "sqlite|mysql"
     default: "sqlite"
@@ -210,6 +218,14 @@ entries:
     group: envonly
     desc_en: "Grace period for attach ownership evidence."
     desc_zh: "挂接归属证据的宽限期。"
+  - key: BILI_SILENT_DIRECT_MAX_MB
+    type: number
+    default: "(built-in)"
+    kind: env-only
+    audience: user
+    group: envonly
+    desc_en: "Silent-direct oversized guard ceiling (MiB)."
+    desc_zh: "静默直连超大请求保护上限（MiB）。"
   - key: BILI_PROVIDER_REWRITES
     type: string
     default: "unset"
@@ -530,19 +546,3 @@ entries:
     group: envonly
     desc_en: "Longest-edge trigger threshold (px) for the egress image downscale pass (#3400); non-numeric or below 128 ignored (default applies). Env-only by design."
     desc_zh: "出站图片降采样 pass 的最长边触发阈值（像素，#3400）；非数字或低于 128 的取值按默认处理。设计上仅环境变量。"
-  - key: BILI_PF_RENDER_WINDOW
-    type: integer
-    default: "8"
-    kind: env-only
-    audience: user
-    group: envonly
-    desc_en: "Bounded render window W for the v6 render-snapshot plane (#5664): how many frozen cores ride the bounded kernel pass beside the new tail window on each steady turn. Probe evidence across three strategies showed a suffix-only W-pass reproduces every element's outbound bytes exactly, so 8 is plenty; values below 1 or non-numeric fall back to 8, capped at 64. Only meaningful while rollout.features.watermarkV6Render is on."
-    desc_zh: "v6 渲染快照平面（#5664）的有界渲染窗口 W：每个稳态轮送入内核的冻结核数量（与新增尾窗并列）。三种策略的探针证据表明后缀 W-pass 能逐字节复现每个元素的出站字节，8 已足够；低于 1 或非数字的取值回退为 8，上限 64。仅在 rollout.features.watermarkV6Render 开启时有意义。"
-  - key: BILI_PF_RENDER_AUDIT_EVERY
-    type: integer
-    default: "8"
-    kind: env-only
-    audience: user
-    group: envonly
-    desc_en: "Scheduled audit cadence N for the v6 render-snapshot plane (#5664): every N engaged hit-turns force ONE full legacy pass whose capture diff re-verifies the stored outbound rows end-to-end (bounds messageRefs/rules merge lag to <= N rounds). Values below 2 or non-numeric fall back to 8, capped at 1024. Any legacy round (red-gate fallback included) resets the counter — it IS an audit. Only meaningful while rollout.features.watermarkV6Render is on."
-    desc_zh: "v6 渲染快照平面（#5664）的计划审计周期 N：每 N 个命中轮强制跑一次全量 legacy pass，其捕获 diff 对已存出站行做端到端复验（把 messageRefs/rules 合并滞后钉在 ≤ N 轮内）。低于 2 或非数字的取值回退为 8，上限 1024。任何 legacy 轮（含红色门控回退）都会清零计数——它本身就是一次审计。仅在 rollout.features.watermarkV6Render 开启时有意义。"

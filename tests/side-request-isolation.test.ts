@@ -544,6 +544,10 @@ test("estimateRawBodyTokens: counts string leaves, skips binary-carrying keys (#
     assert.equal(estimateRawBodyTokens({ url: "http://x/y".repeat(1000) }), 0, "url field excluded");
     assert.equal(estimateRawBodyTokens({ b64_json: "A".repeat(10_000) }), 0, "b64_json field excluded");
     assert.equal(estimateRawBodyTokens({ file_data: "data:application/pdf;base64,".padEnd(10_000, "A") }), 0, "file_data data-URL excluded");
+    // #5932: responses-lane image — the data-URL sits DIRECTLY under image_url
+    // (not under a `url` key); it must be excluded like every other binary-
+    // carrying field, or a screenshot body "measures" millions of tokens.
+    assert.equal(estimateRawBodyTokens({ image_url: `data:image/png;base64,${"A".repeat(10_000)}` }), 0, "image_url data-URL excluded (#5932)");
     assert.equal(estimateRawBodyTokens(null), 0, "null body");
     assert.equal(estimateRawBodyTokens(42), 0, "non-object body");
     // CJK must not be undercounted by the chars/4 fast path.

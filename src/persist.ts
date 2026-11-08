@@ -493,6 +493,10 @@ export class SessionStore {
      *  names (pid + seq makes collisions across processes/rapid saves
      *  unreachable). */
     private tmpSeq = 0;
+    /** #5865-P2: envelope files that OOM'd on decode (healthy bytes, unreadable
+     *  this round) — the next save for that id snapshots them first instead of
+     *  silently overwriting (see withPreoomSnapshot). */
+    private readonly preoomPending = new Set<string>();
     // #3931 step 3: assigned asynchronously for network backends (mysql) —
     // see the constructor and ready().
     private shadow?: UnifiedShadow;
@@ -873,7 +877,7 @@ export class SessionStore {
                 // negative value is gone from disk.
                 const warmProof = session.revisionEpoch; // #4788 D2
                 const warmRec: { v: PersistedSession | null } = { v: null };
-                await this.store.writeNow(id, () => { const r = this.buildRecordForSave(session); warmRec.v = r; return r; });
+                await this.withPreoomSnapshot(id, session.meta, () => this.store.writeNow(id, () => { const r = this.buildRecordForSave(session); warmRec.v = r; return r; }));
                 if (warmRec.v) this.noteMetaFp(id, warmRec.v.metadata ?? {}); // #5506: clamp rewrite landed
                 this.noteDurable(id, warmProof); // clamp rewrite landed
                 clamped++;
@@ -1231,6 +1235,7 @@ export class SessionStore {
                 // format error. Leave the file in place; the next load retries.
                 if (isAllocationFailureError(plainTextError) || isAllocationFailureError(decodeError)) {
                     this.log("error", `[persist] session state ${path.basename(file)} unreadable this round — decode ran out of memory, NOT corruption; file left in place for retry (${errText(plainTextError)} / ${errText(decodeError)})`);
+                    this.preoomPending.add(file);
                     return null;
                 }
                 this.quarantineCorruptState(file, id, decodeError);
@@ -1244,6 +1249,7 @@ export class SessionStore {
         }
         if (raw && typeof raw === "object" && "payload" in raw && "id" in raw && raw.id !== id) return null;
         if (payload.id !== id) return null;
+        this.preoomPending.delete(file);
         return { id, payload, version: payload.version, savedAt: payload.savedAt };
     }
 
@@ -1271,6 +1277,56 @@ export class SessionStore {
         }
     }
 
+    /** #5865-P2 (PR #5865 review): a session whose envelope OOM'd on decode was
+     *  resumed FRESH — its first save would then atomically replace the healthy
+     *  (but this round unreadable) bytes with the small fresh state: silent
+     *  permanent loss with no forensic copy. When `id` is in `preoomPending`,
+     *  snapshot the pre-existing file to `<file>.corrupt-preoom-<ts>` (same
+     *  `.corrupt-` family ⇒ same cap-1 pruning by pruneCorruptSiblings)
+     *  immediately before the overwriting write. If the write fails, the
+     *  snapshot is renamed back (best effort) so a failed save never strands
+     *  the healthy bytes behind a forensic name. No-op for every id that has
+     *  not OOM'd (one Set lookup). */
+    private withPreoomSnapshot<T>(id: string, meta: { protocol?: string; upstreamOrigin?: string } | undefined, write: () => T): T {
+        const file = path.join(this.sessionsDir, relPathFor(id, meta?.protocol, meta?.upstreamOrigin));
+        if (!this.preoomPending.has(file)) return write();
+        this.preoomPending.delete(file);
+        let snapshotPath: string | null = null;
+        try {
+            if (existsSync(file)) {
+                snapshotPath = `${file}.corrupt-preoom-${Date.now()}`;
+                renameSync(file, snapshotPath);
+                const pruned = pruneCorruptSiblings(file, snapshotPath);
+                const capNote = pruned.removed > 0 ? `; removed ${pruned.removed} older forensic cop${pruned.removed === 1 ? "y" : "ies"} (cap ${CORRUPT_SIBLING_CAP})` : "";
+                this.log("warn", `[persist] preserved pre-OOM session state ${path.basename(file)} → ${path.basename(snapshotPath)} before overwriting it with fresh state (the old envelope was healthy but unreadable under memory pressure)${capNote}`);
+            }
+        } catch (err) {
+            this.log("error", `[persist] failed to preserve pre-OOM session state ${path.basename(file)} before overwrite; proceeding as pre-fix (${errText(err)})`);
+            snapshotPath = null;
+        }
+        if (!snapshotPath) return write();
+        const restore = (): void => {
+            try {
+                if (existsSync(snapshotPath) && !existsSync(file)) renameSync(snapshotPath, file);
+            } catch { /* best effort: the forensic copy stays put */ }
+        };
+        try {
+            const result = write();
+            const asPromise = result as unknown as Promise<unknown> | undefined;
+            if (result && typeof asPromise?.then === "function") {
+                return asPromise.then(
+                    (value) => value,
+                    (error) => { restore(); throw error; },
+                ) as unknown as T;
+            }
+            if (typeof result === "boolean" && !result) restore();
+            return result;
+        } catch (err) {
+            restore();
+            throw err;
+        }
+    }
+
     /** #2671: per-id session build for the directory walks (loadAll/boot).
      *  In full mode this imports the just-parsed envelope into the unified
      *  index and serves the view from there when possible (organic import at
@@ -1290,11 +1346,22 @@ export class SessionStore {
             // #286 rekey, restoreReplica's direct writeNow — all stamp a fresh
             // savedAt at build time).
             const dbAt = this.shadow.sessionUpdatedAt(id);
-            if (dbAt === null || payload.savedAt > dbAt) {
-                this.shadow.importRecord(payload);
-            }
+            let importedNewer = false;
+            if (dbAt === null) this.shadow.importRecord(payload); // organic first open
+            else if (payload.savedAt > dbAt) importedNewer = this.shadow.importRecord(payload) !== null;
             const view = this.shadow.viewFor(id);
-            if (view) return buildSession(viewToRecord(view));
+            if (view) {
+                // #5755: a strictly-newer envelope whose import could not run
+                // (ingest failure) must not lose to the older unified row the
+                // index still holds — serve the envelope we are holding
+                // instead of a rollback through viewFor.
+                if (!importedNewer && dbAt !== null && payload.savedAt > dbAt) {
+                    this.log("warn", `[persist] newer envelope for ${id} (savedAt ${payload.savedAt}) could not be imported — serving the envelope view, unified row kept at ${dbAt}`);
+                    return buildSession(payload);
+                }
+                return buildSession(viewToRecord(view));
+            }
+            return buildSession(payload);
         }
         return buildSession(payload);
     }
@@ -1396,7 +1463,7 @@ export class SessionStore {
             session.id = label;
             const rekeyProof = session.revisionEpoch; // #4788 D2
             const rekeyRec: { v: PersistedSession | null } = { v: null };
-            await this.store.writeNow(label, () => { const r = this.buildRecordForSave(session); rekeyRec.v = r; return r; });
+            await this.withPreoomSnapshot(label, session.meta, () => this.store.writeNow(label, () => { const r = this.buildRecordForSave(session); rekeyRec.v = r; return r; }));
             if (rekeyRec.v) this.noteMetaFp(label, rekeyRec.v.metadata ?? {}); // #5506: rekey rewrite landed
             this.noteDurable(label, rekeyProof); // rekey rewrite landed
             // #3049: direct write bypassing guardedBuild — the boot rekey
@@ -2276,158 +2343,6 @@ export class SessionStore {
         }
     }
 
-    // ------------------------------------------------------------------
-    // #5643 fastpath v6 identity plane — same guard shape as every other
-    // unified* facade: null = "plane unavailable right now" (sidecar
-    // missing/disabled/network backend) and the v6 lane fails soft onto
-    // the legacy watermark path. pfCommitTurn does NOT swallow silently:
-    // a turn commit failure is logged once, then fails soft for THAT turn.
-    // ------------------------------------------------------------------
-
-    /** The registry ext key mapping one relay session → every pf_sid it has
-     *  been issued across re-arming rotations (§3.1). Stored as an array of
-     *  sids; rides the session_ext cascade on session deletion. */
-    readonly PF_V6_SID_REGISTRY_EXT_KEY = "pf:v6-sids";
-
-    pfAvailable(): boolean {
-        if (!this.shadow || this.shadow.stats.disabled) return false;
-        try {
-            return this.shadow.pfAvailable();
-        } catch {
-            return false;
-        }
-    }
-
-    pfProbePairs(sessRaw: string, ledgerIds: string[]): Map<string, { sid: string; pos: number }> | null {
-        if (!this.shadow || this.shadow.stats.disabled) return null;
-        return this.shadow.pfProbePairs(sessRaw, ledgerIds);
-    }
-
-    pfMeta(
-        sid: string,
-    ): {
-        ckpt: { ckptLsSeq: number; metaJson: string; checksum: string; updatedAt: number } | null;
-        log: { lsSeq: number; kind: string; payloadJson: string; bornPosHi: number; ts: number }[];
-    } | null {
-        if (!this.shadow || this.shadow.stats.disabled) return null;
-        return this.shadow.pfMeta(sid);
-    }
-
-    pfLatestGeom(sid: string): { t: number; maxPos: number } | null {
-        if (!this.shadow || this.shadow.stats.disabled) return null;
-        return this.shadow.pfLatestGeom(sid);
-    }
-
-    pfCommitTurn(
-        sid: string,
-        args: {
-            rows: { pos: number; ledgerId: string; sessRaw: string; coreId: string; coreJson: string }[];
-            logEntries: { kind: string; payloadJson: string; bornPosHi: number; ts?: number }[];
-        },
-    ): number | null {
-        if (!this.shadow || this.shadow.stats.disabled) return null;
-        try {
-            return this.shadow.pfCommitTurn(sid, args);
-        } catch (err) {
-            this.log("warn", `[persist] pf turn commit failed (${sid}): ${String(err)}`); // loud once, then fail-soft for THIS turn
-            return null;
-        }
-    }
-
-    pfCompact(sid: string, args: { metaJson: string; nextLsSeq: number }): void {
-        if (!this.shadow || this.shadow.stats.disabled) return;
-        try {
-            this.shadow.pfCompact(sid, args);
-        } catch {
-            // compaction is opportunistic; skip this cycle, retry next finalize
-        }
-    }
-
-    pfHydrateWindow(sid: string, posFrom: number, posTo: number): Map<number, string> {
-        if (!this.shadow || this.shadow.stats.disabled) return new Map();
-        return this.shadow.pfHydrateWindow(sid, posFrom, posTo);
-    }
-
-    pfLedgerIds(sid: string): { pos: number; ledgerId: string; coreId: string }[] | null {
-        if (!this.shadow || this.shadow.stats.disabled) return null;
-        return this.shadow.pfLedgerIds(sid);
-    }
-
-    pfNeedsCompaction(opts: { entriesAfterCkpt: number; logBytesEstimate: number; lastEntryTsMs: number }): boolean {
-        if (!this.shadow || this.shadow.stats.disabled) return false;
-        return this.shadow.pfNeedsCompaction(opts);
-    }
-
-    /** Session teardown (#5643 §8 test 19 third clause): sweep the pf plane
-     *  for EVERY sid this relay session was ever issued. Reads the registry
-     *  from ext FIRST (deleteSession sweeps session_ext itself), then deletes
-     *  all SIX plane tables — identity rows/log/ckpt AND the #5664 render
-     *  snapshot tables (deleteSession's own cascade covers them in-txn too;
-     *  archiveSession's does since the #5652 review BUG-2 fix; this facade is
-     *  the standalone maintenance entry). MAINTENANCE-ONLY as of the #5652
-     *  review: NO production call site today (real teardown flows go through
-     *  deleteSession/archiveSession's in-txn cascades; tests exercise this
-     *  directly) — wiring it into relay teardown is open follow-up work, not
-     *  an accident. Safe to call when nothing was ever issued. */
-    pfDeleteForSession(sessionId: string): void {
-        if (!this.shadow || this.shadow.stats.disabled) return;
-        const reg = this.shadow.getSessionExt(sessionId, this.PF_V6_SID_REGISTRY_EXT_KEY) as string[] | undefined;
-        if (Array.isArray(reg)) this.shadow.pfDeleteAll(reg);
-    }
-
-    /** #5664 render snapshot plane facade — same guard shape as the identity
-     *  plane: null/empty/false = "plane unavailable right now" and the v6
-     *  lane fails soft onto the legacy full path for that turn only.
-     *  A failed render commit is logged once, then fails soft for THIS turn
-     *  (same as pfCommitTurn above). */
-    pfRenderAvailable(): boolean {
-        if (!this.shadow || this.shadow.stats.disabled) return false;
-        try {
-            return this.shadow.pfRenderAvailable();
-        } catch {
-            return false;
-        }
-    }
-
-    pfRenderRows(sid: string): { pos: number; rowJson: string | null }[] {
-        if (!this.shadow || this.shadow.stats.disabled) return [];
-        return this.shadow.pfRenderRows(sid);
-    }
-
-    pfRenderCommit(
-        sid: string,
-        args: {
-            rows: { pos: number; rowJson: string | null }[];
-            logEntries: { kind: string; payloadJson: string }[];
-            checkpointMetaJson?: string;
-            replaceAll?: boolean;
-            ts?: number;
-        },
-    ): number | null {
-        if (!this.shadow || this.shadow.stats.disabled) return null;
-        try {
-            return this.shadow.pfRenderCommit(sid, args);
-        } catch (err) {
-            this.log("warn", `[persist] pf render commit failed (${sid}): ${String(err)}`); // loud once, fail-soft for THIS turn
-            return null;
-        }
-    }
-
-    pfRenderMeta(
-        sid: string,
-    ): {
-        ckpt: { ckptLsSeq: number; metaJson: string; checksum: string; updatedAt: number } | null;
-        log: { lsSeq: number; kind: string; payloadJson: string; ts: number }[];
-    } | null {
-        if (!this.shadow || this.shadow.stats.disabled) return null;
-        return this.shadow.pfRenderMeta(sid);
-    }
-
-    pfRenderCkptIntact(sid: string): boolean {
-        if (!this.shadow || this.shadow.stats.disabled) return false;
-        return this.shadow.pfRenderCkptIntact(sid);
-    }
-
     /** #5312: reversible single-block archive / restore (see UnifiedStore). */
     unifiedArchiveBlock(sessionId: string, blockId: string, archiveDir?: string): { ok: boolean; exportPath?: string; reason?: string; contentRowsDeleted?: number } | null {
         if (!this.shadow || this.shadow.stats.disabled) return null;
@@ -2776,7 +2691,7 @@ export class SessionStore {
         record.id = newId;
         record.savedAt = Date.now();
         record.meta = { ...record.meta, restoredFrom: cp.session_id, restoredCheckpoint: cp.cp_id } as PersistedSession["meta"];
-        await this.store.writeNow(newId, () => record);
+        await this.withPreoomSnapshot(newId, record.meta, () => this.store.writeNow(newId, () => record));
         this.noteMetaFp(newId, record.metadata ?? {}); // #5506: replica restore landed
         shadow.record(record);
         // #3049: the replica record was ingested from the checkpoint payload
@@ -3276,7 +3191,7 @@ export class SessionStore {
             // Errors are logged inside the kernel write chain; swallowing here
             // keeps a failed timer write from becoming an unhandledRejection.
             this.saveWritesInFlight.add(id);
-            void this.store.writeNow(id, armed.build).then(() => {
+            void this.withPreoomSnapshot(id, peekSession(id)?.meta, () => this.store.writeNow(id, armed.build)).then(() => {
                 this.stampOwnWrite(id); // #3406: the write LANDED — prove our bytes are on disk
                 if (armed.rec) this.noteMetaFp(id, armed.rec.metadata ?? {}); // #5506: debounced save landed
                 this.noteDurable(id, proofRevision);
@@ -3465,7 +3380,7 @@ export class SessionStore {
         this.saveWritesInFlight.add(session.id);
         const rec: { v: PersistedSession | null } = { v: null };
         try {
-            await this.store.writeNow(session.id, () => { const r = this.guardedBuild(session)(); rec.v = r; return r; });
+            await this.withPreoomSnapshot(session.id, session.meta, () => this.store.writeNow(session.id, () => { const r = this.guardedBuild(session)(); rec.v = r; return r; }));
         } catch (err) {
             this.saveWritesInFlight.delete(session.id);
             throw err;
@@ -3785,7 +3700,7 @@ export class SessionStore {
         }
         const proofRevision = session.revisionEpoch; // #4788 D2: capture BEFORE the sync commit
         const syncRec: { v: PersistedSession | null } = { v: null };
-        const ok = this.store.flushSync(session.id, () => { const r = this.guardedBuild(session)(); syncRec.v = r; return r; });
+        const ok = this.withPreoomSnapshot<boolean>(session.id, session.meta, () => this.store.flushSync(session.id, () => { const r = this.guardedBuild(session)(); syncRec.v = r; return r; }));
         if (ok) {
             this.stampOwnWrite(session.id); // #3406: the write LANDED — prove our bytes are on disk
             if (syncRec.v) this.noteMetaFp(session.id, syncRec.v.metadata ?? {}); // #5506: sync commit landed
@@ -3815,7 +3730,7 @@ export class SessionStore {
         if (!this.saveContentStore(session)) throw new Error("fork content persistence failed; retry the same request");
         this.noteOwnCommit(session.id, record);
         if (!this.writerOffActive()) {
-            if (!this.store.flushSync(session.id, () => record)) throw new Error("fork envelope persistence failed; retry the same request");
+            if (!this.withPreoomSnapshot<boolean>(session.id, session.meta, () => this.store.flushSync(session.id, () => record))) throw new Error("fork envelope persistence failed; retry the same request");
             this.stampOwnWrite(session.id);
         }
         // #5506: the fork record is durable here (envelope or unified row) — prove its metadata
@@ -3838,7 +3753,7 @@ export class SessionStore {
         if (!this.saveContentStore(session)) throw new Error("fork content recovery failed");
         this.noteOwnCommit(id, record);
         if (!this.writerOffActive()) {
-            if (!this.store.flushSync(id, () => record)) throw new Error("fork envelope recovery failed");
+            if (!this.withPreoomSnapshot<boolean>(id, session.meta, () => this.store.flushSync(id, () => record))) throw new Error("fork envelope recovery failed");
             this.stampOwnWrite(id);
         }
         // #5506: recovered record now durable (envelope written or unified row already held it)
@@ -3876,7 +3791,7 @@ export class SessionStore {
             this.saveBuilders.delete(id);
         }
         await Promise.all([...armed.entries()].map(([id, slot]) =>
-            this.store.writeNow(id, slot.build).then(() => {
+            this.withPreoomSnapshot(id, peekSession(id)?.meta, () => this.store.writeNow(id, slot.build)).then(() => {
                 this.stampOwnWrite(id);
                 if (slot.rec) this.noteMetaFp(id, slot.rec.metadata ?? {}); // #5506: shutdown flush landed
             }).catch((e) => {

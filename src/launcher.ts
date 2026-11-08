@@ -827,7 +827,7 @@ export function discoverRoutes(client: ClientName, config: ClientConfig): Discov
         // user-exported CLOUD_CODE_URL is a relay: wrap IT instead of the
         // stock endpoint (claude semantics). Fallback if Google removes the
         // knob: cert-MITM (the server honors HTTPS_PROXY, no pinning) — see
-        // CLIENTS.md (Gemini family section).
+        // docs/clients.md (Gemini family section).
         // Unparseable base URL: leave routes empty (proxy still runs;
         // Antigravity falls back to its own default endpoint).
         // #3129: Antigravity's real default upstream is daily-cloudcode-pa (the
@@ -4504,7 +4504,7 @@ const INHERITED_PROXY_VARS = [
 ];
 
 /** #3521: internal launcher→child channels carrying THIS launch's options into
- *  the spawned proxy child. They are not user configuration (CONFIGURATION.md:
+ *  the spawned proxy child. They are not user configuration (docs/configuration.md:
  *  "Only the launcher sets it — no user configuration") and only the proxy
  *  child reads them (server.ts / context-window.ts). A value left in the parent
  *  env by an earlier spawn (long-lived desktop hosts, test harnesses, nested
@@ -6982,7 +6982,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         // #2115: CLOUD_CODE_URL points language_server straight at the loopback
         // proxy (undocumented override verified in the v2.19.1 binary); no
         // proxy/CA env needed. Fallback if Google removes the knob: cert-MITM
-        // (the server honors HTTPS_PROXY, no pinning) — CLIENTS.md.
+        // (the server honors HTTPS_PROXY, no pinning) — docs/clients.md.
         env = buildAntigravityEnv(origin, ca, routes.httpRewrites, routes.httpsRewrites, stripInheritedProxy(process.env));
         if (routes.httpRewrites.length === 0 && routes.httpsRewrites.length === 0) {
             console.error(

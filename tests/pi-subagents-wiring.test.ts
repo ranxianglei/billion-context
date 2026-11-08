@@ -381,7 +381,7 @@ test("piSubagentsAdapter maps the pi.subagents section onto the package adapter 
 });
 
 // #2260(F): pins the documented precedence PI_ACP_DELEGATE_* > pi.subagents >
-// acp.json > default (CONFIGURATION.md). The env readers live INSIDE the
+// acp.json > default (docs/configuration.md). The env readers live INSIDE the
 // bundled package's resolveDelegate, so this drives that real function through
 // bili's loader chain — a future package or adapter change that silently drops
 // env must fail here.

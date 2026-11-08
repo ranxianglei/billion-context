@@ -13,6 +13,7 @@ import { FALLBACK_EFFECTIVE_WINDOW_FLOOR, findRoute, findRouteKey, lookupContext
 import { resolveProxyDecision } from "../upstream-proxy.js";
 import { contextFromRegistry, peekRegistryContext, peekRegistryOutputLimit, peekRegistryPriceProfile } from "../registry.js";
 import { stampBillingPrice } from "../billing.js";
+import { recordClientUa } from "../client-ua-registry.js";
 import { codexAlignedWindow } from "../codex-models.js";
 import { DecodedRequestAdmission, DecodedRequestBusyError } from "../request-body-budget.js";
 import { hostIdForLog, maskHeadersForLog, maskUrlForLog, maskUrlsInText } from "../log-mask.js";
@@ -54,7 +55,6 @@ import { buildAnonymousProvenance, type AnonymousProvenance } from "../anon-prov
 import { maybeAdoptForkBlocks, maybeAdoptResume, maybeAdoptDerivedFork } from "../fork-adoption.js";
 import { executeThreadsReforge } from "./threads-lane.js";
 import { resetThreadTailTracking } from "./thread-tracking.js";
-import { FastpathV6IdentityFault } from "./fastpath-v6.js";
 import { resolveClaudeTranscriptLineage } from "../claude-transcript-lineage.js";
 import { consumePluginRegisterFor, pluginAgentHeader, pluginCompressionProxyHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginReportedContextWindow, pluginReportedMaxOutput, pluginReportedModel, pluginRequestAgentHeader, pluginRuntimeInfoFor, pluginRuntimeInfoForConversation, publicForkInputCheck, recordChainVerdict, recordPluginSession, rememberPluginMessages, resolveConversation, runtimeConversationId, takePendingPluginRegister } from "../plugin.js";
 import { scheduleAffinityPersist } from "../affinity-persist.js";
@@ -75,7 +75,9 @@ import { artifactSeedHit, detectAcpArtifacts } from "./chain-artifacts.js";
 import { piSubagentChannelFallback } from "./pi-subagent-channel.js";
 import { FORCE_TEXT_PROTOCOL } from "./inject.js";
 import { prepareAnthropic } from "./prepare-anthropic.js";
-import { incomingMsgIdsOf } from "../msgid-pin.js";
+import { MSG_IDS_BODY_FIELD, incomingMsgIdsOf, incomingMsgIdsHeader } from "../msgid-pin.js";
+import { harvestIdentity } from "../identity-harvest.js";
+import "../identity-sources.js"; // #5825: register every harvested lane (side effect)
 import { prepareOpenai } from "./prepare-openai.js";
 import { prepareGoogle, prepareGoogleCountTokens } from "./prepare-google.js";
 import { DUMP_PLAINTEXT_BANNER } from "../dump-banner.js";
@@ -89,6 +91,21 @@ import { ccrPluginWireOk, storeEffectiveCcr, storeEffectiveImageRescale, type Cc
 import { DEFAULT_DECIDE_MAX_TOKENS } from "../nudge-decide.js";
 import { BodyTooLargeError, buildForwardTarget, forward, forwardUpstreamUrl, googleModelFromPath, googlePathKind, headroomEffectiveLogged, headroomFallbackLogged, headerValue, imageBillingFor, imageReserveFor, imageTokenCapFor, isCountTokensRequest, isPreflightFailFast, logRequestCost, NON_CONVERSATION_RELAY_WARN_CAP, nonConversationRelayWarned, prepareCountTokens, preflightCompressIfNeeded, readBody, resolveKnownOutputCeiling, resolveUpstream, resignSettingsFor, selfAddressedLocalPath, scrubAnthropicPck, scrubCompatDrop, vertexAnthropicModelFromPath, warnModelNameMissIfNew, warnRouteMissIfNew, type Prepared } from "../server.js";
 import { normalizeVertexModelId } from "../vertex.js";
+import { CREDENTIAL_HEADER_NAMES } from "../cache-ledger.js";
+import { requestModelFromBody } from "../upstream-throttle.js";
+import { tryAnswerEarlyHold } from "./relay.js";
+
+// #5795: the credential subset of the inbound headers — exactly the names
+// credentialFingerprint reads (CREDENTIAL_HEADER_NAMES), or the fast path's
+// hold key would diverge from the governor's and account holds go invisible.
+function earlyHoldCredHeaders(req: http.IncomingMessage): Record<string, string> {
+    const out: Record<string, string> = {};
+    for (const n of CREDENTIAL_HEADER_NAMES) {
+        const v = headerValue(req, n);
+        if (v !== undefined && v !== "") out[n] = v;
+    }
+    return out;
+}
 
 // #5243: warn-once per model when the live codex model table is unavailable and
 // window sizing falls back to config.toml model_context_window.
@@ -412,6 +429,13 @@ async function handleRequest(
         if (!passthroughMark && protocol !== null && bodyBuffer.length > 0) {
             try {
                 const decoded = await decodeRequestBody(headerValue(req, "content-encoding"), bodyBuffer, knobLimitsDecodedBytes(), { signal: decodingSignal, onBytes: (bytes) => admission.observe(bytes) });
+                // #5794: identity (uncompressed) bodies never fire the onBytes
+                // hook above — it only runs inside the decompression path — so
+                // they were invisible to the large-body slot budget (a 51.2 MiB
+                // plain-JSON body consumed no slot at all). Observe the decoded
+                // size here; idempotent — a compressed body already observed
+                // via onBytes is admitted and this no-ops.
+                admission.observe(decoded.body.byteLength);
                 bodyBuffer = decoded.body;
                 if (decoded.decoded) delete req.headers["content-encoding"];
             } catch (decErr) {
@@ -489,6 +513,24 @@ async function handleRequest(
         await forward(req, res, opts, scrubCompatDrop(scrubAnthropicPck(protocol, bodyBuffer, log), compatDropPaths, log), null, core, config, log, route, instanceId, undefined, undefined, undefined, googleModel ?? vertexModel);
         return;
     }
+    // #5795: pre-ingest 429-hold fast path — while the egress governor holds
+    // this origin+credential, refuse BEFORE prepare pays the O(history)
+    // parse/convert/pin cost of a send that will not egress anyway (~6s per
+    // refused turn on the field-reported multi-MiB histories). Sits above the
+    // hop-marker branch so chained-bili relays get the identical local refusal
+    // one stage earlier; sub-threshold bodies and unknown-wire requests fall
+    // through untouched (see tryAnswerEarlyHold).
+    if (tryAnswerEarlyHold({
+        method: req.method,
+        upstreamUrl: forwardUpstreamUrl(req, opts, route),
+        credHeaders: earlyHoldCredHeaders(req),
+        protocol,
+        bodyBytes: bodyBuffer.length,
+        requestModel: googleModel ?? vertexModel ?? (() => requestModelFromBody(bodyBuffer, req)),
+        res,
+        streamErrorShape: opts.streamErrorShape,
+        log,
+    })) return;
     // #300: bili→bili chain detection. If the inbound request already carries
     // the x-bili-hop marker, an upstream bili instance already ran the
     // compression pipeline on it. Processing it again would double-compress
@@ -1113,7 +1155,48 @@ async function handleRequest(
         // drift), an id overlap proves same-conversation and re-anchors the
         // raw lane instead of forking a zero-state |sub: child.
         // undefined = absent → exactly the pre-change path.
-        const inboundMsgIds = incomingMsgIdsOf(parsed);
+        const stampedInboundMsgIds = incomingMsgIdsOf(parsed);
+        // #5825 identity-channel sources fill only the absent case. Precedence:
+        // (1) body-field stamps (dsh/opencode/pi host rewrites) — always win;
+        // (2) the STAMPED HEADER channel (`x-bili-msg-ids`) for hosts that
+        // cannot rewrite the body they send — opencode V2 reads ids off its
+        // own structured turn event, comma-joined; one missing/foreign id
+        // drops the whole header client-side, so what arrives here already
+        // passed light validation in incomingMsgIdsHeader;
+        // (3) loopback identity HARVEST from the client's local transcript/
+        // sqlite — registry enforces rollout-or-env gate + loopback boundary
+        // + canonical validation, whole-turn-degrade on any doubt.
+        const headerStampedMsgIds = stampedInboundMsgIds === undefined
+            ? incomingMsgIdsHeader(req.headers["x-bili-msg-ids"])
+            : undefined;
+        let inboundMsgIds = stampedInboundMsgIds ?? headerStampedMsgIds;
+        if (inboundMsgIds === undefined && zcodeParentIdentity?.clientProvided) {
+            const openaiLike = protocol === "openai" || protocol === "anthropic" ? (parsed as { messages?: unknown }).messages : undefined;
+            if (Array.isArray(openaiLike) && openaiLike.length > 0) {
+                const messageRoles = (openaiLike as Array<{ role?: unknown }>).map((m) => (typeof m?.role === "string" ? m.role : ""));
+                const harvested = harvestIdentity({
+                    sessionId: zcodeParentIdentity.value,
+                    expectedLen: openaiLike.length,
+                    remoteAddress: req.socket.remoteAddress,
+                    headers: req.headers as Record<string, string | string[] | undefined>,
+                    messageRoles,
+                });
+                if (harvested !== null) {
+                    inboundMsgIds = [...harvested.ids];
+                }
+            }
+        }
+        // The pin-consumers are prepare-anthropic AND prepare-openai (#5825
+        // parity): both read + strip MSG_IDS_BODY_FIELD unconditionally before
+        // it can reach the real upstream, then pin behind the rollout gate.
+        // So a non-body source (header / harvest) stamps the parsed body on
+        // BOTH wires now — nothing extra is ever forwarded either way;
+        // response-ish protocols keep feeding the resolve rung below via this
+        // local alone.
+        if (stampedInboundMsgIds === undefined && inboundMsgIds !== undefined &&
+            (protocol === "openai" || protocol === "anthropic")) {
+            (parsed as Record<string, unknown>)[MSG_IDS_BODY_FIELD] = [...inboundMsgIds];
+        }
         // #5719: the RECORDED side of the msgid identity rung lives in the
         // UNIFIED STORE — stamped requests pin these very ids onto canonical
         // message rows (messages.msg_id, #4491), so no parallel JSON ledger
@@ -1674,6 +1757,12 @@ async function handleRequest(
         }
         if (!pluginAgent && typeof session.metadata.pluginAgent === "string") pluginAgent = session.metadata.pluginAgent;
         if (pluginAgent && !pluginConversation) pluginConversation = conversation;
+        // #4649: remember this request's client UA in the bounded registry so a
+        // diagnostics report carries the client's own version (non-dsh lanes
+        // have no profile bundle to read it from). Runs for EVERY model
+        // request — unlike the clientHint block below, which only fills the
+        // session's first-seen hint.
+        recordClientUa(req.headers);
         // #1426 web UI: persist which client this session came from, first hit wins.
         // Plugin agents are already recorded above as metadata.pluginAgent; non-plugin
         // clients fall back to header sniffing, then to a truncated User-Agent hint.
@@ -1909,7 +1998,7 @@ async function handleRequest(
             }
         }
         // Two compression modes, decided here per request and bound per session
-        // (see TECHNICAL-NOTES.md "Two compression modes"):
+        // (see docs/technical-notes.md "Two compression modes"):
         //  - pluginMode (x-bili-plugin header / registered agent): the ACP-native
         //    agent (pi/omp) OWNS compression — it executes `compress` locally, the
         //    call+result live in its own re-sent history, and the summary carrier
@@ -3010,26 +3099,7 @@ async function handleRequest(
             if (guardScheme !== undefined && !resignArmable && !guardResign.enabled) {
                 clearSignedRefusal(guardScheme);
             }
-            // #5643 §3.2: fastpath v6 identity hard-gate refusal → structured
-            // 400 (never a 5xx, never a silent fallback). Caught HERE —
-            // outside the pipeline, because the pipeline's tail treats a null
-            // result as "forward the raw body", which would leak an already-
-            // refused request to the model endpoint. The evaluate path wrote
-            // zero data-plane state before throwing, so a fixed retry lands
-            // clean. `forwarded = true` suppresses that tail pass-through.
-            let pendingForward: { body: string | Buffer; prepared: Prepared | null } | null = null;
-            try {
-                pendingForward = await withSessionLock(session, () => runPreparedPipeline(true));
-            } catch (err) {
-                if (err instanceof FastpathV6IdentityFault && !res.headersSent && res.writable !== false) {
-                    loggerLog("error", `[${sessionId}] fastpath v6 identity fault refused: ${err.detail}`);
-                    res.writeHead(400, { "content-type": "application/json" });
-                    res.end(JSON.stringify(err.toJSON()));
-                    forwarded = true;
-                } else {
-                    throw err;
-                }
-            }
+            const pendingForward = await withSessionLock(session, () => runPreparedPipeline(true));
             if (pendingForward) {
                 forwarded = true;
                 // #1195: wire clients (omp/pi on the plain proxy path) treat an
@@ -3044,19 +3114,7 @@ async function handleRequest(
                 // original 400 through verbatim.
                 const overflowRefold = pendingForward.prepared
                     ? async (realWindow: number | undefined): Promise<{ body: string | Buffer; prepared: Prepared | null } | null> => {
-                          const next = await withSessionLock(session, () => runPreparedPipeline(false, realWindow)).catch((e): { body: string | Buffer; prepared: Prepared | null } | null => {
-                              // Refold re-runs prepare → the v6 hard gate can
-                              // fire a SECOND time mid-request. Fail open: hand
-                              // back the original overflow 400 untouched rather
-                              // than turning a fold attempt into a new error
-                              // shape (the first turn's rejection already told
-                              // the client what to fix).
-                              if (e instanceof FastpathV6IdentityFault) {
-                                  loggerLog("error", `[${sessionId}] fastpath v6 identity fault during overflow refold — original 400 passes through: ${e.detail}`);
-                                  return null;
-                              }
-                              throw e;
-                          });
+                          const next = await withSessionLock(session, () => runPreparedPipeline(false, realWindow));
                           if (!next || String(next.body) === String(pendingForward.body)) return null;
                           pendingForward.body = next.body;
                           pendingForward.prepared = next.prepared;
