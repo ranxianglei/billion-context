@@ -84,7 +84,25 @@ test("paired originals retain an independently matching session reference owner"
     } finally { rmrf(dir); }
 });
 
-test("paired originals cannot contradict the session's known reference owner", async () => {
+test("paired originals retain frozen aliases for pruned message IDs without rekeying", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "bili-migrate-originals-frozen-alias-"));
+    try {
+        await seed(dir);
+        const file = join(dir, relPathFor(id, meta.protocol, meta.upstreamOrigin));
+        const record = JSON.parse(readFileSync(file, "utf8"));
+        delete record.payload.state.messageRefs.byRaw[originals.byRef.m90001.rawId];
+        record.payload.state.messageRefs.byRef.m90001 = "a-different-known-message";
+        record.payload.state.messageRefs.byRaw["a-different-known-message"] = "m90001";
+        writeFileSync(file, JSON.stringify(record));
+        const before = readFileSync(file);
+        const result = await runStorageMigrateCommand({ dir, json: true });
+        assert.equal(result.code, 0, "an unmapped frozen original is allowed by the existing fork alias contract");
+        assert.deepEqual(await indexedOriginals(dir), originals, "migration must preserve the original keys and bodies exactly");
+        assert.deepEqual(readFileSync(file), before, "source refs must not be repaired or reassigned");
+    } finally { rmrf(dir); }
+});
+
+test("paired originals cannot contradict a still-mapped message identity", async () => {
     const dir = mkdtempSync(join(tmpdir(), "bili-migrate-originals-owner-"));
     try {
         await seed(dir);
@@ -92,6 +110,8 @@ test("paired originals cannot contradict the session's known reference owner", a
         const record = JSON.parse(readFileSync(file, "utf8"));
         record.payload.state.messageRefs.byRef.m90001 = "a-different-known-message";
         record.payload.state.messageRefs.byRaw["a-different-known-message"] = "m90001";
+        record.payload.state.messageRefs.byRaw[originals.byRef.m90001.rawId] = "m90002";
+        record.payload.state.messageRefs.byRef.m90002 = originals.byRef.m90001.rawId;
         writeFileSync(file, JSON.stringify(record));
         const before = readFileSync(file);
         const result = await runStorageMigrateCommand({ dir, json: true });

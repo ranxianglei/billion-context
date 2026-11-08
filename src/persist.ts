@@ -3223,8 +3223,10 @@ export class SessionStore {
     private migrationOriginals(file: string, embedded?: MessageContentStore, refs?: Session["state"]["messageRefs"]): MessageContentStore | undefined {
         const validateOwners = (originals: MessageContentStore | undefined): MessageContentStore | undefined => {
             for (const [ref, entry] of Object.entries(originals?.byRef ?? {})) {
-                if ((refs?.byRef && Object.hasOwn(refs.byRef, ref) && refs.byRef[ref] !== entry.rawId)
-                    || (refs?.byRaw && Object.hasOwn(refs.byRaw, entry.rawId) && refs.byRaw[entry.rawId] !== ref)) {
+                // Match the existing fork alias contract: pruned IDs retain
+                // frozen original keys; still-mapped IDs must agree both ways.
+                if (refs?.byRaw && Object.hasOwn(refs.byRaw, entry.rawId)
+                    && (refs.byRaw[entry.rawId] !== ref || refs.byRef?.[ref] !== entry.rawId)) {
                     throw new Error(`CCR original reference owner conflicts with session: ${ref}`);
                 }
             }
