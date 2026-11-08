@@ -24,7 +24,7 @@ entries:
     default: "720000 (= upstreamTimeoutMs)"
     env: BILI_UPSTREAM_FIRST_BYTE_MS
     group: process
-    desc_en: "Phase-1 budget: request sent → first response byte (undici resolves the fetch around the first body data). Default equals the full idle budget so behavior is unchanged; tighter deployments opt in (#5904: a wedged upstream that accepts requests but never answering failed silently to the client's abort). After the first byte, chunk-gap silence stays governed by the full upstreamTimeoutMs (#1706/#1714 guarantee). The release gate sets 120000."
+    desc_en: "Phase-1 budget: request sent → first response byte (undici resolves the fetch around the first body data). Default equals the full idle budget so behavior is unchanged; tighter deployments opt in (#5904: a wedged upstream that accepts requests but never answered previously hung silently until the client's abort to the client's abort). After the first byte, chunk-gap silence stays governed by the full upstreamTimeoutMs (#1706/#1714 guarantee). The release gate sets 120000."
     desc_zh: "阶段一预算：请求发出 → 首个响应字节（undici 在首个 body 数据到达时才 resolve fetch）。默认等于完整空闲预算，行为不变；需要更快约束首字节时延的部署可显式收紧（#5904：上游接收请求后永不应答的卡死，之前会静默拖到客户端中止）。首字节到达后，chunk 间隙静默仍由完整 upstreamTimeoutMs 管辖（#1706/#1714 保证）。发布 gate 设 120000。"
   - key: network.requestWatchdogMs
     type: number
