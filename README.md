@@ -440,6 +440,8 @@ wraps the relay into `ANTHROPIC_BASE_URL` (or configure
 three wires (OpenAI Chat / Responses / Anthropic Messages, including
 cross-protocol conversion), #4433.
 
+**Does this work with [opencodex](https://github.com/lidge-jun/opencodex) (`ocx`) — the local Codex/Claude Code gateway with a ChatGPT account pool?** Same pattern: point the client at bili, and point bili at ocx through the `/bili/` prefix — OpenAI-style clients (chat completions and Responses, e.g. Codex) → `OPENAI_BASE_URL=http://localhost:8787/bili/http://127.0.0.1:10100/v1`; Anthropic-style clients → `ANTHROPIC_BASE_URL=http://localhost:8787/bili/http://127.0.0.1:10100`. A dummy key value satisfies clients that require one; it rides through untouched. Keep bili *in front of* ocx rather than behind it: ocx owns the provider credentials and the account pool at its final hop, so only this order keeps compression and pooling working together. Loopback needs no key between the two (ocx's default loopback bind reads no token); a non-loopback bind takes `OPENCODEX_API_AUTH_TOKEN` plus the `x-opencodex-api-key` header per its docs. Request models by ocx's `provider/model` id so routing is deterministic; as with any gateway, routed ids are opaque to bili's window lookup (declare them via `models.<name>.context`) and a mid-session account rebind invalidates the prefix cache (watch `KEY SWITCHES` in `/acp-cache`). Verified end-to-end over all three wires (OpenAI Chat / Responses / Anthropic Messages), bili 0.1.212 × ocx 2.97.0.
+
 **Where are logs and session data stored?** Log:
 `~/.local/state/billion-context/bili.log` (also mirrored to stderr); session
 state: `~/.local/share/billion-context/` (XDG-overridable; Windows AV exclusion
