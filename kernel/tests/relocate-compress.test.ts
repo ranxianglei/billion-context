@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { createInitialState } from "../src/state.js";
+import { createInitialState, isLiveCheckpointCarrier } from "../src/state.js";
 import {
   planRelocateCompressCarriers,
   relocateCompressCarriers,
@@ -147,6 +147,10 @@ test("carrier text carries the summary; non-JSON args are used verbatim", () => 
   assert.equal(carrier.contentType, "text");
   assert.ok(carrier.text!.startsWith(`[bili fold summary — block(s) b1; relocated from compress call call1`));
   assert.ok(carrier.text!.endsWith("\nRAW-SUMMARY-BODY"));
+  // #335 protection: the carrier is a live checkpoint carrier while b1 is
+  // active — plain compress ranges can neither span nor fold it.
+  assert.equal(carrier.summaryOfBlockId, "b1");
+  assert.equal(isLiveCheckpointCarrier(carrier, state), true);
 });
 
 test("carrier text extracts .content from JSON args (plugin dialect)", () => {
@@ -292,6 +296,10 @@ test("multi-range batch shares one call id ⇒ boundary is max(endRef), pointer 
   assert.deepEqual(ids(out), ["x", "call-callB", "res-callB", carrierId("callB"), "y"]);
   const callOut = out.find((m) => m.id === "call-callB")!;
   assert.ok(callOut.text!.includes("b1, b2"));
+  // Multi-block pair anchors the FIRST block for the #335 carrier protection.
+  const carrier = out.find((m) => m.id === carrierId("callB"))!;
+  assert.equal(carrier.summaryOfBlockId, "b1");
+  assert.equal(isLiveCheckpointCarrier(carrier, state), true);
 });
 
 test("fold reaches the window end (#4732 regime) ⇒ carrier appended at tail", () => {

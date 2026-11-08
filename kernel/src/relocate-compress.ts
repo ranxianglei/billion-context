@@ -75,7 +75,9 @@ export interface RelocateMove {
   insertAtOutput: number;
   /** Input indices of dropped reasoning cores (adjacent run before the call). */
   droppedReasoningIndices: number[];
-  /** Synthetic fold-point carrier carrying the relocated summary text. */
+  /** Synthetic fold-point carrier carrying the relocated summary text.
+   *  `summaryOfBlockId` anchors the #335 live-checkpoint-carrier protection
+   *  (plain compress ranges cannot fold it; block-ref distillation can). */
   carrier: CoreMessage;
   /** Replacement args text for the call core (pointer JSON). */
   pointerText: string;
@@ -185,6 +187,20 @@ export function planRelocateCompressCarriers(
       id: carrierIdFor(callId),
       role: "user",
       contentType: "text",
+      // #335 checkpoint-carrier protection: while the block(s) this summary
+      // describes are still active, a PLAIN message-ref compress range can
+      // neither be advertised across this carrier (recommend.ts screens with
+      // isLiveCheckpointCarrier) nor fold it (unit-projection carves it out
+      // and keeps it visible) — a relocated summary must not be re-distilled
+      // as if it were ordinary user text, because the history it summarizes
+      // is already folded away. Once the anchor block is consumed by a
+      // block-ref distillation (which sees and absorbs the carrier text),
+      // this turns stale and the carrier folds like ordinary text — that is
+      // the intended "the RESULT may be compressed later" path. Multi-block
+      // pairs anchor the FIRST block: an active anchor keeps the protection,
+      // and distillations that consume the anchor virtually always span the
+      // sibling blocks created by the same call.
+      summaryOfBlockId: blockIds[0],
       text:
         `[bili fold summary — ${blockLabel}; relocated from compress call ${callId} ` +
         `(the call/result exchange stays in its chronological slot below)]\n${summary}`,
