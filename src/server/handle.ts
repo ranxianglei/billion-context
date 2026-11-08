@@ -31,6 +31,7 @@ import { APIG_RESIGN_CREDENTIAL_HEADER, APIG_RESIGN_HEADER, APIG_RESIGN_SCHEME, 
 import { conflictScanEnabled, isDesignBenign, scanClientPlugins, sniffScanClient } from "../thirdparty-scan.js";
 import { recordConflict } from "../conflict-watch.js";
 import { getStore } from "../persist.js";
+import { isFirstSeenRequest, recoveredFirstSeen, rememberFirstSeen, commitFirstSeenRequest } from "../incremental-first-seen.js";
 import { enterSessionContext, log as loggerLog } from "../logger.js";
 import { codexCompactGatePre, codexCompactMode, hasCompactionTrigger, isCodexHost, replaceBiliCompactionItems } from "../codex-compact.js";
 import { emitPreflightError } from "../stream-error.js";
@@ -3777,7 +3778,29 @@ async function handleRequest(
             // stamp; mode relearned as "full" via the header.
             let pendingForward;
             try {
-                pendingForward = await withSessionLock(session, () => runPreparedPipeline!(true));
+                pendingForward = await withSessionLock(session, async () => {
+                    if (isFirstSeenRequest(req)) {
+                        session.state.tsStamps = recoveredFirstSeen(getStore(), session.id, session.state.tsStamps);
+                    }
+                    const previousStamps = session.state.tsStamps;
+                    const pending = await runPreparedPipeline!(true);
+                    if (pending?.prepared && isFirstSeenRequest(req)) {
+                        const stamps = session.state.tsStamps;
+                        const added = pending.prepared.originalMessages.filter(message => previousStamps?.[message.id] === undefined && stamps?.[message.id] !== undefined);
+                        // Capture actual kernel identities even when client pinning
+                        // is disabled. Failed journal writes retain a retry buffer.
+                        rememberFirstSeen(getStore(), session.id, added, stamps);
+                        const stamp = (messages: NonNullable<typeof session.lastMessages>): NonNullable<typeof session.lastMessages> => messages.map(message => {
+                            const ts = stamps?.[message.id];
+                            return ts === undefined || ts === message.ts ? message : { ...message, ts };
+                        });
+                        if (session.lastMessages) session.lastMessages = stamp(session.lastMessages);
+                        if (session.pluginSnapshot) session.pluginSnapshot = stamp(session.pluginSnapshot);
+                        if (session.decompositionLog) session.decompositionLog = stamp(session.decompositionLog);
+                        commitFirstSeenRequest(req);
+                    }
+                    return pending;
+                });
             } catch (err) {
                 if (err instanceof DeltaReanchorError && !res.destroyed && !res.writableEnded) {
                     log("warn", `[${session.id}] watermark delta re-anchor 400 (${err.reason}) — client resends in full form`);

@@ -1784,6 +1784,13 @@ export function findSessionByCanonicalId(canonicalId: string): Session | undefin
  *  arrays (parse failures) never clobber a good snapshot. */
 export function snapshotMessages(session: Session, messages: CoreMessage[]): void {
     if (messages.length > 0) {
+        // Raw persistence shares these cores with plugin/decomposition
+        // snapshots. Carry the kernel's authoritative first-seen metadata
+        // before any debounced writer can choose its later batch timestamp.
+        for (const message of messages) {
+            const ts = session.state.tsStamps?.[message.id];
+            if (ts !== undefined) message.ts = ts;
+        }
         session.lastMessages = messages;
         session.lastMessagesFolded = false;
         delete session.metadata.handoffResponse;

@@ -1395,6 +1395,11 @@ export class UnifiedShadow {
     // checkpoints), not part of the legacy load path.
     // ------------------------------------------------------------------
 
+    withSessionExtTransaction<T>(action: () => T): T {
+        if (this.sync === null) throw new Error('Synchronous extension transaction unavailable');
+        return this.sync.withSessionExtTransaction(action);
+    }
+
     setSessionExt(sessionId: string, key: string, value: unknown): void {
         if (this.sync === null) return;
         this.sync.setSessionExt(sessionId, key, value);

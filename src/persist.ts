@@ -599,7 +599,7 @@ export class SessionStore {
      *  (armed from enqueue until settle). afterNextFlush must treat these as
      *  pending — otherwise a waiter armed AFTER the debounce arm was consumed
      *  would see "nothing queued" even though its proof is mid-write. */
-    private readonly saveWritesInFlight = new Set<string>();
+    private readonly saveWritesInFlight = new Map<string, number>();
     /** #4788 D2/D1-A: revisionEpoch covered by a durable DISK copy per id —
      *  stamped only by (a) successful save settles and (b) cold loads (a load
      *  IS a disk proof; a fresh stamp also retires any stamp belonging to a
@@ -2736,6 +2736,10 @@ export class SessionStore {
         return this.liveShadow().getSessionExt(sessionId, key);
     }
 
+    withSessionExtTransaction<T>(action: () => T): T {
+        return this.liveShadow().withSessionExtTransaction(action);
+    }
+
     listSessionExt(sessionId: string): { key: string; value: unknown; updatedAt: number }[] {
         return this.liveShadow().listSessionExt(sessionId);
     }
@@ -3436,6 +3440,7 @@ export class SessionStore {
             if (this.writerOffPending.has(session.id)) return;
             const run = (): void => {
                 this.writerOffPending.delete(session.id);
+                this.beginSaveWrite(session.id);
                 // #4788 D2: prove what THIS build covers BEFORE it starts —
                 // the closure reads live state at run time; newer mutations
                 // can only ride along, never be missing, so the spill gate's
@@ -3509,7 +3514,7 @@ export class SessionStore {
                     // without process-level handlers; the next markDirty retries.
                     this.log("error", `[persist] writerOff coalesced build failed for ${session.id}: ${String(err)}`);
                 } finally {
-                    this.drainFlushWaiters(session.id, settledOk);
+                    this.endSaveWrite(session.id, settledOk);
                 }
             };
             this.writerOffPending.set(session.id, run);
@@ -3551,12 +3556,14 @@ export class SessionStore {
             const proofRevision = peekSession(id)?.revisionEpoch;
             // Errors are logged inside the kernel write chain; swallowing here
             // keeps a failed timer write from becoming an unhandledRejection.
-            this.saveWritesInFlight.add(id);
+            this.beginSaveWrite(id);
+            let landed = false;
             void this.withPreoomSnapshot(id, peekSession(id)?.meta, () => this.store.writeNow(id, armed.build)).then(() => {
                 this.stampOwnWrite(id); // #3406: the write LANDED — prove our bytes are on disk
                 if (armed.rec) this.noteMetaFp(id, armed.rec.metadata ?? {}); // #5506: debounced save landed
                 this.noteDurable(id, proofRevision);
                 this.lastSaveLanded.set(id, true);
+                landed = true;
                 // #4788 D2: discharge the droppable fields once the debounced
                 // save has actually settled — before this PR the trio sat on
                 // landed writes that fired MID-request (#4788), where it saw
@@ -3567,12 +3574,11 @@ export class SessionStore {
             }).catch(() => {
                 this.lastSaveLanded.set(id, false);
             }).finally(() => {
-                this.saveWritesInFlight.delete(id);
                 // #5155/#4788 D2: settle waiters even on failure — waiting on a
                 // flush must never wedge a caller past a failed write (the next
                 // turn re-arms the whole path anyway). The verdict tells spill
                 // callers whether a landing proof actually exists.
-                this.drainFlushWaiters(id, this.lastSaveLanded.get(id) === true);
+                this.endSaveWrite(id, landed);
             });
         }, this.debounceMs);
         // #4788: the debounce timer is host-owned periodic upkeep and must not
@@ -3608,6 +3614,21 @@ export class SessionStore {
             // open too -- otherwise the process drains and the verdict is lost.
             this.saveTimers.get(sessionId)?.ref?.();
         });
+    }
+
+    private beginSaveWrite(sessionId: string): void {
+        this.saveWritesInFlight.set(sessionId, (this.saveWritesInFlight.get(sessionId) ?? 0) + 1);
+    }
+
+    private endSaveWrite(sessionId: string, ok: boolean): void {
+        this.lastSaveLanded.set(sessionId, ok);
+        const remaining = (this.saveWritesInFlight.get(sessionId) ?? 1) - 1;
+        if (remaining > 0) {
+            this.saveWritesInFlight.set(sessionId, remaining);
+            return;
+        }
+        this.saveWritesInFlight.delete(sessionId);
+        if (!this.saveTimers.has(sessionId) && !this.writerOffPending.has(sessionId)) this.drainFlushWaiters(sessionId, ok);
     }
 
     private drainFlushWaiters(sessionId: string, ok: boolean): void {
@@ -3733,26 +3754,33 @@ export class SessionStore {
             // sync build subsumes it; later mutations re-arm on their own.
             this.writerOffPending.delete(session.id);
             const proofRevision = session.revisionEpoch; // #4788 D2: capture BEFORE the sync build
-            const rec = this.guardedBuild(session)();
-            this.maybeCutForkBase(session);
-            this.noteMetaFp(session.id, rec.metadata ?? {}); // #5506: index-only build landed
-            if (!this.egressProjectionFrozen(session)) {
-                this.noteDurable(session.id, proofRevision); // #4788 D2: index-only build landed
-                this.lastSaveLanded.set(session.id, true);
-                this.foldResidentTail(session);
-                this.dropResidentBlockContents(session);
-                this.dropResidentMetadata(session);
-                this.dropResidentContentStore(session);
-            } else {
-                // #7474 P2 (ruling 7439): the build above deliberately did NOT
-                // land in the unified store (the op log is the transcript
-                // authority), so the droppable-field discharge — which
-                // reconstructs thinned fields FROM that store — must not run:
-                // a thinned resident metadata/block-content would 502 on the
-                // next turn's re-materialization (#4788 D2). The session keeps
-                // its full residency for its lifetime; the flow table already
-                // holds the same bytes on disk.
-                this.lastSaveLanded.set(session.id, true);
+            this.beginSaveWrite(session.id);
+            let landed = false;
+            try {
+                const rec = this.guardedBuild(session)();
+                this.maybeCutForkBase(session);
+                this.noteMetaFp(session.id, rec.metadata ?? {}); // #5506: index-only build landed
+                if (!this.egressProjectionFrozen(session)) {
+                    this.noteDurable(session.id, proofRevision); // #4788 D2: index-only build landed
+                    this.lastSaveLanded.set(session.id, true);
+                    this.foldResidentTail(session);
+                    this.dropResidentBlockContents(session);
+                    this.dropResidentMetadata(session);
+                    this.dropResidentContentStore(session);
+                } else {
+                    // #7474 P2 (ruling 7439): the build above deliberately did NOT
+                    // land in the unified store (the op log is the transcript
+                    // authority), so the droppable-field discharge — which
+                    // reconstructs thinned fields FROM that store — must not run:
+                    // a thinned resident metadata/block-content would 502 on the
+                    // next turn's re-materialization (#4788 D2). The session keeps
+                    // its full residency for its lifetime; the flow table already
+                    // holds the same bytes on disk.
+                    this.lastSaveLanded.set(session.id, true);
+                }
+                landed = true;
+            } finally {
+                this.endSaveWrite(session.id, landed);
             }
             return;
         }
@@ -3760,24 +3788,30 @@ export class SessionStore {
         // durability arm — clear it so it cannot pin state after eviction.
         this.durabilityArms.delete(session.id);
         const proofRevision = session.revisionEpoch; // #4788 D2: capture BEFORE the chain builds
-        this.saveWritesInFlight.add(session.id);
+        const armed = this.saveTimers.get(session.id);
+        if (armed) {
+            clearTimeout(armed);
+            this.saveTimers.delete(session.id);
+            this.saveBuilders.delete(session.id);
+        }
+        this.beginSaveWrite(session.id);
+        let landed = false;
         const rec: { v: PersistedSession | null } = { v: null };
         try {
             await this.withPreoomSnapshot(session.id, session.meta, () => this.store.writeNow(session.id, () => { const r = this.guardedBuild(session)(); rec.v = r; return r; }));
-        } catch (err) {
-            this.saveWritesInFlight.delete(session.id);
-            throw err;
+            this.stampOwnWrite(session.id); // #3406: prove the committed bytes before any drop
+            if (rec.v) this.noteMetaFp(session.id, rec.v.metadata ?? {});
+            this.maybeCutForkBase(session);
+            this.noteDurable(session.id, proofRevision);
+            this.lastSaveLanded.set(session.id, true);
+            this.foldResidentTail(session);
+            this.dropResidentBlockContents(session);
+            this.dropResidentMetadata(session);
+            this.dropResidentContentStore(session);
+            landed = true;
+        } finally {
+            this.endSaveWrite(session.id, landed);
         }
-        this.stampOwnWrite(session.id); // #3406: the write LANDED — prove our bytes are on disk
-        if (rec.v) this.noteMetaFp(session.id, rec.v.metadata ?? {}); // #5506: immediate save landed
-        this.maybeCutForkBase(session);
-        this.noteDurable(session.id, proofRevision);
-        this.lastSaveLanded.set(session.id, true);
-        this.foldResidentTail(session);
-        this.dropResidentBlockContents(session);
-        this.dropResidentMetadata(session);
-        this.dropResidentContentStore(session);
-        this.drainFlushWaiters(session.id, true);
     }
 
     /** #5874 P2-final: the IN-REQUEST snapshot application — persist the
@@ -4045,7 +4079,14 @@ export class SessionStore {
      *  failure for a never-persisted session or it is lost permanently). */
     flushSync(session: Session): boolean {
         this.consumePendingLedgerAlign(session); // #5608-D: before any serialization
-        if (!this.saveContentStore(session)) return false;
+        const settle = (ok: boolean): boolean => {
+            // A sync eviction supersedes the armed debounce. Its waiters
+            // still need the durable verdict; an older asynchronous write
+            // retains ownership of its own completion when one is running.
+            if (!this.saveWritesInFlight.has(session.id)) this.drainFlushWaiters(session.id, ok);
+            return ok;
+        };
+        if (!this.saveContentStore(session)) return settle(false);
         this.tryRecoverSidecar(); // #5188: eviction-time flushes are also a recovery opportunity
         const frozen = this.envelopeFrozen(session.id);
         if (this.writerOffActive() || frozen || this.egressProjectionFrozen(session)) {
@@ -4062,7 +4103,7 @@ export class SessionStore {
                 // error boundary and relies on false to keep the session
                 // resident — a throw would escape the sync eviction path.
                 this.log("error", `[persist] writerOff flushSync build failed for ${session.id}: ${String(err)}`);
-                return false;
+                return settle(false);
             }
             this.maybeCutForkBase(session);
             if (rec) this.noteMetaFp(session.id, rec.metadata ?? {}); // #5506: index-only flush landed
@@ -4081,7 +4122,7 @@ export class SessionStore {
                 // same bytes on disk.
                 this.lastSaveLanded.set(session.id, true);
             }
-            return true;
+            return settle(true);
         }
         // Mirror the kernel flushSync contract: a sync commit supersedes any
         // armed debounce for this id (its builder would just re-write the
@@ -4105,7 +4146,7 @@ export class SessionStore {
             this.dropResidentMetadata(session);
             this.dropResidentContentStore(session);
         }
-        return ok;
+        return settle(ok);
     }
 
     async persistForkSession(parentId: string, session: Session): Promise<void> {
