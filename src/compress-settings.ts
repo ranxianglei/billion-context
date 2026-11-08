@@ -5,30 +5,10 @@ import { configDir } from "./paths.js";
 import { log as loggerLog } from "./logger.js";
 import { expandExternalSummaryChainTolerant, type ExternalSummarySettings } from "./external-summary-settings.js";
 import { shippedPacksSource } from "./chat-pack.js";
+import { resolveContextLimitValue } from "./util.js"; // #5937: shared with the dsh-native gate; re-exported below for existing importers
 
 export type { CompressSettings } from "./config.js";
-
-/** Resolve a raw `contextLimit` value to an absolute token count.
- *  - `number` → used as-is (absolute window).
- *  - `string` ending in `%` (e.g. `"70%"`) → that fraction of `nativeLimit`.
- *  - any other `string` → parsed as a number (absolute window).
- *  - `undefined` → `nativeLimit` (the model's full window).
- *
- *  `contextLimit` is the **window size** the kernel uses as the denominator for
- *  its usage ratio (`usage = tokens / contextLimit`) — it is NOT a truncation
- *  cap. All ratio-based thresholds (`emergencyThreshold`, truncate) scale off
- *  it, so shrinking it pulls every threshold down proportionally. To leave
- *  headroom, raise/lower `emergencyThreshold` instead. Always returns int ≥ 1. */
-export function resolveContextLimitValue(raw: number | string | undefined, nativeLimit: number): number {
-    if (typeof raw === "number" && Number.isFinite(raw) && raw > 0) return Math.max(1, Math.floor(raw));
-    if (typeof raw === "string") {
-        const pct = /^(\d+(?:\.\d+)?)\s*%$/.exec(raw.trim());
-        if (pct) return Math.max(1, Math.floor((nativeLimit * Number(pct[1])) / 100));
-        const n = Number(raw);
-        if (Number.isFinite(n) && n > 0) return Math.floor(n);
-    }
-    return Math.max(1, Math.floor(nativeLimit));
-}
+export { resolveContextLimitValue };
 
 /** Per-field deepest-wins merge of the three compression config levels. An
  *  `undefined` field at a deeper level does NOT clear a value set at a shallower
