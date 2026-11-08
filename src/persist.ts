@@ -2068,7 +2068,7 @@ export class SessionStore {
                     const rec = parsed ? this.parseBootPayload(parsed.value) : null;
                     if (!parsed || !rec || rec.payload.id !== id) throw new Error("representative file changed between scan and import attempt");
                     decodedBytes = parsed.bytes;
-                    this.migrationOriginals(rep.file, rec.payload.forkContentStore);
+                    this.migrationOriginals(rep.file, rec.payload.forkContentStore, rec.payload.state.messageRefs);
                     status = indexedBefore.has(id) ? "indexed" : "planned";
                 } catch (err) {
                     status = "failed";
@@ -2088,7 +2088,7 @@ export class SessionStore {
                     const idxReq = indexed ? Number(indexed.stats?.requests ?? 0) : 0;
                     const ahead = indexed !== null &&
                         (envReq > idxReq || (envReq === idxReq && Number(rec.payload.state?.nextBlockId ?? 0) > Number(indexed.state?.nextBlockId ?? 0)));
-                    const originals = this.migrationOriginals(rep.file, rec.payload.forkContentStore);
+                    const originals = this.migrationOriginals(rep.file, rec.payload.forkContentStore, rec.payload.state.messageRefs);
                     const completeOriginals = this.mergeOriginalStores([hadRows ? shadow.getCcr(id, true) : null, originals]);
                     const complete = completeOriginals ? { ...rec.payload, forkContentStore: completeOriginals } : rec.payload;
                     let wrote = false;
@@ -3220,21 +3220,30 @@ export class SessionStore {
         return merged;
     }
 
-    private migrationOriginals(file: string, embedded?: MessageContentStore): MessageContentStore | undefined {
+    private migrationOriginals(file: string, embedded?: MessageContentStore, refs?: Session["state"]["messageRefs"]): MessageContentStore | undefined {
+        const validateOwners = (originals: MessageContentStore | undefined): MessageContentStore | undefined => {
+            for (const [ref, entry] of Object.entries(originals?.byRef ?? {})) {
+                if ((refs?.byRef && Object.hasOwn(refs.byRef, ref) && refs.byRef[ref] !== entry.rawId)
+                    || (refs?.byRaw && Object.hasOwn(refs.byRaw, entry.rawId) && refs.byRaw[entry.rawId] !== ref)) {
+                    throw new Error(`CCR original reference owner conflicts with session: ${ref}`);
+                }
+            }
+            return originals;
+        };
         const sidecar = file.endsWith(".fb.json")
             ? `${file.slice(0, -".fb.json".length)}.content-store.json`
             : file.replace(/\.json$/, ".content-store.json");
         let bytes: Buffer;
         try { bytes = readFileSync(sidecar); }
         catch (err) {
-            if ((err as NodeJS.ErrnoException).code === "ENOENT") return this.mergeOriginalStores([embedded]);
+            if ((err as NodeJS.ErrnoException).code === "ENOENT") return validateOwners(this.mergeOriginalStores([embedded]));
             throw new Error("CCR originals sidecar cannot be read", { cause: err });
         }
         let parsed: MessageContentStore;
         try { parsed = JSON.parse(this.readCodec.decode(bytes)) as MessageContentStore; }
         catch (err) { throw new Error("CCR originals sidecar cannot be decoded", { cause: err }); }
         if (parsed == null) throw new Error("malformed CCR originals sidecar");
-        return this.mergeOriginalStores([embedded, parsed]);
+        return validateOwners(this.mergeOriginalStores([embedded, parsed]));
     }
 
     private mergeDurableOriginals(session: Session, disk: MessageContentStore | null): MessageContentStore | undefined {

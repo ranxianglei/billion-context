@@ -69,6 +69,41 @@ test("corrupt paired originals fail migration before a session is acknowledged",
     } finally { rmrf(dir); }
 });
 
+test("paired originals retain an independently matching session reference owner", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "bili-migrate-originals-owner-match-"));
+    try {
+        await seed(dir);
+        const file = join(dir, relPathFor(id, meta.protocol, meta.upstreamOrigin));
+        const record = JSON.parse(readFileSync(file, "utf8"));
+        record.payload.state.messageRefs.byRef.m90001 = originals.byRef.m90001.rawId;
+        record.payload.state.messageRefs.byRaw[originals.byRef.m90001.rawId] = "m90001";
+        writeFileSync(file, JSON.stringify(record));
+        const result = await runStorageMigrateCommand({ dir, json: true });
+        assert.equal(result.code, 0, result.text);
+        assert.deepEqual(await indexedOriginals(dir), originals);
+    } finally { rmrf(dir); }
+});
+
+test("paired originals cannot contradict the session's known reference owner", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "bili-migrate-originals-owner-"));
+    try {
+        await seed(dir);
+        const file = join(dir, relPathFor(id, meta.protocol, meta.upstreamOrigin));
+        const record = JSON.parse(readFileSync(file, "utf8"));
+        record.payload.state.messageRefs.byRef.m90001 = "a-different-known-message";
+        record.payload.state.messageRefs.byRaw["a-different-known-message"] = "m90001";
+        writeFileSync(file, JSON.stringify(record));
+        const before = readFileSync(file);
+        const result = await runStorageMigrateCommand({ dir, json: true });
+        assert.equal(result.code, 1, "a mispaired store must not be attached to a known different owner");
+        assert.equal(JSON.parse(result.text).counts.failed, 1);
+        const store = new SessionStore({ dir, enabled: true });
+        try { assert.deepEqual(store.unifiedListSessionIds(), [], "wrong-owner source must not be partially imported"); }
+        finally { await store.closeQuietlyAsync(); }
+        assert.deepEqual(readFileSync(file), before);
+    } finally { rmrf(dir); }
+});
+
 test("already-indexed sessions cannot hide changed originals on rerun", async () => {
     const dir = mkdtempSync(join(tmpdir(), "bili-migrate-originals-drift-"));
     try {
