@@ -1401,12 +1401,23 @@ class SummaryTransportError extends Error {
 }
 
 async function requestSummaryBody(deps: PreflightDeps, body: string, stream: boolean): Promise<string> {
+    // #5904: log the upstream's origin+path (never the query — it can carry
+    // signed credentials) so progress lines stay greppable per-endpoint.
+    const safeUpstreamLabel = (raw: string): string => {
+        try { const u = new URL(raw); return u.origin + u.pathname; } catch { return "upstream"; }
+    };
     const maxAttempts = replayMaxAttempts();
     for (let attempt = 1; ; attempt++) {
         deps.signal?.throwIfAborted();
         let clearTimer: (() => void) | undefined;
         let stage: "request" | "response body" = "request";
         let retryDetail: string;
+        const sentAt = Date.now();
+        // #5904: a summary attempt could previously wedge between "sent" and
+        // "answered" with NO log line at all — a 5-minute silent hang was
+        // indistinguishable from a slow prefill. Emit send/receive progress so
+        // log timelines show exactly which attempt is in flight and for how long.
+        deps.log("info", `[preflight] summary attempt ${attempt}/${maxAttempts} sent (${body.length}b, stream=${stream}) → ${safeUpstreamLabel(deps.url)}`);
         try {
             // #3226: build the header set first so a signed lane can re-sign over
             // the summary's OWN bytes — forwarding the inbound signature verbatim
@@ -1422,6 +1433,7 @@ async function requestSummaryBody(deps: PreflightDeps, body: string, stream: boo
             }, undefined, deps.signal);
             clearTimer = result.clearTimer;
             stage = "response body";
+            deps.log("info", `[preflight] summary attempt ${attempt} headers received (${result.response.status}) after ${Date.now() - sentAt}ms`);
             const text = await result.response.text();
             deps.signal?.throwIfAborted();
             if (!result.response.ok) throw new UpstreamHttpError(result.response.status, text, attempt);
@@ -1454,6 +1466,7 @@ async function requestSummaryBody(deps: PreflightDeps, body: string, stream: boo
                 if (failure instanceof UpstreamHttpError && failure.status >= 400 && failure.status < 500) {
                     dumpSummaryRejection(failure.status, deps.session.id, body, failure.body);
                 }
+                deps.log("error", `[preflight] summary failed permanently after ${attempt} attempt${attempt === 1 ? "" : "s"} (${Date.now() - sentAt}ms): ${failure.message}`);
                 throw failure;
             }
             retryDetail = failure instanceof UpstreamHttpError ? `HTTP ${failure.status}` : failure.message;

@@ -90,6 +90,7 @@
 | 变量 | 默认 |
 |------|------|
 | `BILI_UPSTREAM_TIMEOUT_MS` | 720000（12 min） |
+| `BILI_UPSTREAM_FIRST_BYTE_MS` | 720000（= upstream timeout；发布 gate 设 120000） |
 | `BILI_REQUEST_WATCHDOG_MS` | 2× upstream timeout |
 | `BILI_KEEP_ALIVE_TIMEOUT_MS` | 5000 |
 | `BILI_CLIENT_ERROR_BACKSTOP_MS` | 30000 |

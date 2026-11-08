@@ -343,6 +343,15 @@ async function main() {
     PI_PROVIDER: "",
     BILI_GATE_KEY: "gate-local",
     ZHIPUAI_GATE_KEY: G.relayKey,
+    // #5904: bound phase-1 (request sent → first response byte) of the proxy's
+    // upstream summary calls. The incident wedge — sglang accepting the request
+    // then never answering — silently ate the client's 300s turn budget. 120s
+    // is 1.6× the slowest LEGITIMATE first byte observed in this environment
+    // (73s to first token for a ~100KB summary prefill on a GPU-restart-cold
+    // sglang), and two attempts fit the 300s turn (120 + backoff + 120 ≈ 245s)
+    // so the wedge surfaces as a real error before the client aborts. Product
+    // default stays the full 12-min idle budget (src/knobs.ts upstreamFirstByteMs).
+    BILI_UPSTREAM_FIRST_BYTE_MS: "120000",
   };
 
   const biliConfigFor = (window) =>

@@ -84,6 +84,25 @@ export function upstreamTimeoutMs(): number {
     return Number.isInteger(v) && v > 0 ? v : UPSTREAM_TIMEOUT_MS;
 }
 
+/** BILI_UPSTREAM_FIRST_BYTE_MS > network.upstreamFirstByteMs > the RESOLVED
+ *  upstreamTimeoutMs() — so unset = byte-identical to the single-phase
+ *  watchdog for EVERY configuration, including deployments that raise
+ *  BILI_UPSTREAM_TIMEOUT_MS above 12 min for >12-min local-model prefills
+ *  (review on #5917 caught the first cut pinning the fallback to the 720000
+ *  constant UPSTREAM_FIRST_BYTE_MS, which would have silently re-capped
+ *  those deployments' first byte at 12 min). Phase-1 budget: request fully
+ *  sent → first response byte. Bounds
+ *  "upstream accepted the request but never answered" separately from mid-stream
+ *  silence, which keeps the #1706/#1714 guarantee that long silent prefills are
+ *  never truncated by default (#5904: a GPU-restart-cold sglang answered one
+ *  fold in 73s, then accepted the next request and never answered — the turn sat
+ *  silent until the client's 300s abort; the release gate sets 120000ms here to
+ *  catch that wedge fast). */
+export function upstreamFirstByteMs(): number {
+    const v = tNum("BILI_UPSTREAM_FIRST_BYTE_MS", fileNetwork().upstreamFirstByteMs);
+    return Number.isInteger(v) && v > 0 ? v : upstreamTimeoutMs();
+}
+
 /** BILI_CA_FILE > network.caFile > unset. Path to a PEM bundle of extra root CAs
  *  trusted by bili's OWN outbound upstream fetch — for security software doing
  *  HTTPS/encrypted-connection scanning (Kaspersky, enterprise DLP) or a corporate
