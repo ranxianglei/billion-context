@@ -21,15 +21,15 @@
 | 模块 | 一句话 | 页面 | 状态 |
 |---|---|---|---|
 | `storage` | 统一 SQLite 存储（表族 / kstate / ckpt / GC） | [storage.zh-CN.md](./architecture/storage.zh-CN.md) · [EN](./architecture/storage.md) | ✅ |
-| `pipeline` | 请求管道（handle / prepare-* / relay / inject） | — | ⏳ |
-| `lanes` | 宿主车道（dsh / pi / opencode / codex / 裸代理 + lane-decisions） | — | ⏳ |
-| `kernel` | 压缩内核（acp-kernel：折叠 / 摘要 / ref 账本） | — | ⏳ |
-| `identity` | 会话与消息身份（session id / persona fork / msgid 通道） | — | ⏳ |
-| `fastpaths` | 快路径（增量车道 / v5 watermark / D-lane 快照渲染） | — | ⏳ |
-| `webui` | Web 面板与 admin 面 | — | ⏳ |
-| `update` | 自更新、advisory、插件安装 | — | ⏳ |
+| `pipeline` | 请求管道（handle / prepare-* / relay / inject） | [pipeline.zh-CN.md](./architecture/pipeline.zh-CN.md) · [EN](./architecture/pipeline.md) | ✅ |
+| `lanes` | 宿主车道（dsh / pi / opencode / codex / 裸代理 + lane-decisions） | [lanes.zh-CN.md](./architecture/lanes.zh-CN.md) · [EN](./architecture/lanes.md) | ✅ |
+| `kernel` | 压缩内核（acp-kernel：折叠 / 摘要 / ref 账本） | [kernel.zh-CN.md](./architecture/kernel.zh-CN.md) · [EN](./architecture/kernel.md) | ✅ |
+| `identity` | 会话与消息身份（session id / persona fork / msgid 通道） | [identity.zh-CN.md](./architecture/identity.zh-CN.md) · [EN](./architecture/identity.md) | ✅ |
+| `fastpaths` | 快路径（增量车道 / v5 watermark / D-lane 快照渲染） | [fastpaths.zh-CN.md](./architecture/fastpaths.zh-CN.md) · [EN](./architecture/fastpaths.md) | ✅ |
+| `webui` | Web 面板与 admin 面 | [webui.zh-CN.md](./architecture/webui.zh-CN.md) · [EN](./architecture/webui.md) | ✅ |
+| `update` | 自更新、advisory、插件安装 | [update.zh-CN.md](./architecture/update.zh-CN.md) · [EN](./architecture/update.md) | ✅ |
 
-`⏳` 页面由同一专项的后续 commit/PR 逐个补齐（每页 = 一篇文档 + 一对图）；上表是唯一账本——CI 校验 `✅` 行必有 en+zh-CN 页面成对、且不存在表外的孤儿页面。
+上表是唯一账本——CI 校验 `✅` 行必有 en+zh-CN 页面成对、且不存在表外的孤儿页面。
 
 ## 与其他文档的关系
 
