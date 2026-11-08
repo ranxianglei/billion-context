@@ -42,7 +42,7 @@ function appendGoogleNudge(contents: GoogleContent[], text: string, model?: stri
     if (last && (last.role ?? "user") !== "model") {
         const parts = Array.isArray(last.parts) ? last.parts : [];
         // #3159: a plain-text tail after a functionResponse part 400s on
-        // Vertex — normalize so the new text leads (#5392: skipped for Claude
+        // Vertex — normalize so the new text leads (#5390: skipped for Claude
         // targets, whose Anthropic-behind-Google backend wants tool_result first).
         return [
             ...contents.slice(0, -1),

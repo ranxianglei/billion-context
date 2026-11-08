@@ -8,7 +8,7 @@ import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { startFakeUpstream } from "./wire-contract-fakes.ts";
 
-// Regression for #5392: Claude-family models routed through Google's v1internal /
+// Regression for #5390: Claude-family models routed through Google's v1internal /
 // Cloud Code Assist wire translate role:"user" parts into Anthropic content blocks
 // IN ORDER, and Anthropic requires every tool_result block to LEAD the user message
 // that follows an assistant tool_use turn — the OPPOSITE of the WC-018 text-first
@@ -76,7 +76,7 @@ async function sendTurn(h: Harness, sessionId: string, contents: unknown[]): Pro
     return res.status;
 }
 
-test("#5392 claude-via-google: a user turn carrying a tool response forwards tool_result(functionResponse) FIRST", async () => {
+test("#5390 claude-via-google: a user turn carrying a tool response forwards tool_result(functionResponse) FIRST", async () => {
     const fake = await startFakeUpstream("google");
     let h: Harness | undefined;
     try {
@@ -117,7 +117,7 @@ test("#5392 claude-via-google: a user turn carrying a tool response forwards too
     }
 });
 
-test("#5392 claude-via-google: the SAME turn on a non-Claude target still normalizes text-first (WC-018 preserved)", async () => {
+test("#5390 claude-via-google: the SAME turn on a non-Claude target still normalizes text-first (WC-018 preserved)", async () => {
     // Guard against the carve-out overreaching: a Gemini-style target must keep
     // getting the WC-018 text-first reorder, or #3159 regresses.
     const fake = await startFakeUpstream("google");

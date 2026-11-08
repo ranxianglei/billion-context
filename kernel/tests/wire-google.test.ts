@@ -479,7 +479,7 @@ test("an already-safe user part order round-trips byte-identical through coreToG
   assert.deepEqual(coreToGoogle(googleToCore(body).msgs), body.contents);
 });
 
-test("normalizeGoogleUserPartOrder: Claude-family target keeps natural responses-first order (#5392)", () => {
+test("normalizeGoogleUserPartOrder: Claude-family target keeps natural responses-first order (#5390)", () => {
   const fr: GooglePart = {
     functionResponse: { name: "add", response: { result: 66 }, id: "c1" },
   };
@@ -495,7 +495,7 @@ test("normalizeGoogleUserPartOrder: Claude-family target keeps natural responses
   }
 });
 
-test("coreToGoogle: Claude-family target emits functionResponse before text (#5392)", () => {
+test("coreToGoogle: Claude-family target emits functionResponse before text (#5390)", () => {
   const body: GoogleRequestBody = {
     contents: [
       { role: "user", parts: [{ text: "go" }] },

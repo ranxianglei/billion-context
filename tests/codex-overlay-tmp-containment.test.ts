@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { prepareCodexHome, refreshOverlayHome, finalizeCodexHome } from "../src/launcher.js";
 
-/** #5585: the codex-local set the launcher passes to the overlay folds. */
+/** #5584: the codex-local set the launcher passes to the overlay folds. */
 const LOCAL_ONLY = new Set([".tmp"]);
 const GENERATED = [".env", "config.toml"];
 
@@ -39,7 +39,7 @@ function resolvesInside(candidate: string, base: string): boolean {
     return c === b || c.startsWith(b + path.sep);
 }
 
-test("#5585: refresh never links the real-home .tmp into the codex overlay", (t) => {
+test("#5584: refresh never links the real-home .tmp into the codex overlay", (t) => {
     const root = mkRoot();
     t.after(() => fs.rmSync(root, { recursive: true, force: true }));
     const real = makeRealHome(root);
@@ -50,7 +50,7 @@ test("#5585: refresh never links the real-home .tmp into the codex overlay", (t)
     assert.ok(fs.existsSync(path.join(real, ".tmp", "marketplaces", "context-mode", ".git", "HEAD")), "real home untouched");
 });
 
-test("#5585: a client-owned .tmp stays inside the overlay across launch + exit (no merge-back, no relink, no pollution)", (t) => {
+test("#5584: a client-owned .tmp stays inside the overlay across launch + exit (no merge-back, no relink, no pollution)", (t) => {
     const root = mkRoot();
     t.after(() => fs.rmSync(root, { recursive: true, force: true }));
     const real = makeRealHome(root);
@@ -79,7 +79,7 @@ test("#5585: a client-owned .tmp stays inside the overlay across launch + exit (
     assert.ok(fs.existsSync(path.join(real, ".tmp", "real-only.marker")), "real home .tmp keeps its own content");
 });
 
-test("#5585: prepareCodexHome migrates a stale escaping .tmp symlink away", (t) => {
+test("#5584: prepareCodexHome migrates a stale escaping .tmp symlink away", (t) => {
     const root = mkRoot();
     t.after(() => fs.rmSync(root, { recursive: true, force: true }));
     const real = makeRealHome(root);
@@ -105,7 +105,7 @@ test("#5585: prepareCodexHome migrates a stale escaping .tmp symlink away", (t) 
     // Absent is the expected steady state: codex recreates .tmp as a genuine per-overlay dir.
 });
 
-test("#5585 negative control: without the exclusion the real-home .tmp IS linked in and escapes", (t) => {
+test("#5584 negative control: without the exclusion the real-home .tmp IS linked in and escapes", (t) => {
     const root = mkRoot();
     t.after(() => fs.rmSync(root, { recursive: true, force: true }));
     const real = makeRealHome(root);

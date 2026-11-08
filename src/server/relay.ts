@@ -2499,7 +2499,7 @@ async function resolveFakeCompletion(
         signal: AbortSignal;
         session: Session;
         log: (level: string, msg: string) => void;
-        /** #5392: target model name — lets the google-wire part-order normalize
+        /** #5390: target model name — lets the google-wire part-order normalize
          *  skip the WC-018 text-first reorder for Claude models. */
         model?: string;
         /** #1884: re-sign the retry body before it hits the wire (armed

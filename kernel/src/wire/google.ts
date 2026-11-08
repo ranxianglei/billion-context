@@ -309,7 +309,7 @@ export function googleToCore(body: GoogleRequestBody): GoogleFlat {
   return { msgs, systemText: googleSystemText(body) };
 }
 
-/** #5392 — Claude-family backends routed through Google's v1internal / Cloud
+/** #5390 — Claude-family backends routed through Google's v1internal / Cloud
  *  Code Assist wire translate role:"user" parts into Anthropic content blocks
  *  IN ORDER, and Anthropic requires every tool_result block to LEAD the user
  *  message that follows an assistant tool_use turn — the OPPOSITE of the Gemini
@@ -328,7 +328,7 @@ const CLAUDE_WIRE_MODEL = /claude/i;
  *  already-safe shapes stay byte-identical (prefix-cache anchor). Signed text
  *  parts, thought parts and all non-text parts keep their relative order —
  *  nothing is dropped, renamed or rewritten.
- *  #5392 — when `opts.model` names a Claude-family target the input order is
+ *  #5390 — when `opts.model` names a Claude-family target the input order is
  *  returned untouched: its natural responses-first shape is exactly what an
  *  Anthropic-behind-Google backend requires, so the text-first partition below
  *  applies only to non-Claude targets. */

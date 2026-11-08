@@ -2361,7 +2361,7 @@ export function refreshOverlayHome(
     opts?: { sharedSqlite?: boolean; localOnlyEntries?: ReadonlySet<string> },
 ): boolean {
     const sharedSqlite = opts?.sharedSqlite === true;
-    // #5585: entries the client owns INSIDE the overlay (codex's .tmp staging).
+    // #5584: entries the client owns INSIDE the overlay (codex's .tmp staging).
     // Never linked in from the real home, never merged back into it, and a stale
     // escaping symlink left by a pre-fix launch is dropped so the client recreates
     // them as genuine per-overlay paths (their git repos then stay inside home).
@@ -2435,7 +2435,7 @@ export function refreshOverlayHome(
             } catch {
                 continue;
             }
-            // #5585: local-only entries are owned by the client running under this
+            // #5584: local-only entries are owned by the client running under this
             // overlay. A real dir/file is left untouched (never merged back); a
             // stale escaping symlink from a pre-fix launch is dropped so the client
             // recreates it as a genuine per-overlay path.
@@ -3158,7 +3158,7 @@ export function finalizeCodexHome(realHome: string, overlay: string, generatedFi
         name === `${SQLITE_ORIGIN_FILE}.tmp` ||
         name === path.basename(overlayLockPath(overlay)) ||
         name === path.basename(overlayLeaseDir(overlay)) || // release-failure residue must never merge into the real home
-        localOnlyEntries?.has(name) === true || // #5585: codex's .tmp stays overlay-owned; never merged back nor relinked
+        localOnlyEntries?.has(name) === true || // #5584: codex's .tmp stays overlay-owned; never merged back nor relinked
         generatedSet.has(name) ||
         [...generatedSet].some((g) => name.startsWith(`.${g}.`) && name.endsWith(".tmp"));
     let overlayEntries: string[];
@@ -3232,7 +3232,7 @@ export function finalizeCodexHome(realHome: string, overlay: string, generatedFi
  *  directory per session. */
 const CODEX_SESSION_SLOT_MAX = 16;
 
-/** #5585: codex keeps its marketplace/plugin git checkouts under $CODEX_HOME/.tmp.
+/** #5584: codex keeps its marketplace/plugin git checkouts under $CODEX_HOME/.tmp.
  *  Sharing that directory into the overlay via a symlink makes every repo's canonical
  *  path resolve back into the REAL home, so codex's "trusted Git repository root escapes
  *  Codex home" containment check rejects each git-backed marketplace update under bili.

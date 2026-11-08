@@ -55,7 +55,7 @@ interface ContinuationRetryOpts {
     body: string | Buffer;
     /** Exact request model: isolates a matching KeyRing model refusal (throttle scope),
      *  and is threaded into the continuation nudge so Claude-through-Google targets keep
-     *  tool_result-first part order (#5392). */
+     *  tool_result-first part order (#5390). */
     model?: string;
     upstreamUrl: string;
     reqHeaders: Record<string, string>;
