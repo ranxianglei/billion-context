@@ -29,6 +29,16 @@ billion-context/
 │   │   ├── prepare-responses.ts  #   Responses request preparation + codex compact/prompt-cache helpers (#1440)
 │   │   ├── relay.ts             #   Upstream relay zone: forward() + fake-completion recovery (#1440 P2 cut 4)
 │   │   ├── side-request.ts       #   Tool-surface check for auxiliary side requests
+│   │   ├── attribution-status.ts #   Takeover-failure visibility from host attribution reports (#3581)
+│   │   ├── dsh-authored-compaction.ts #   Bili-authored dsh compaction: answers the summarize call locally (#3733)
+│   │   ├── fastpath.ts           #   Watermark fastpath: full-resend turns decode head + tail only (#5403)
+│   │   ├── fastpath-scan.ts      #   Zero-decode structural span scan of chat-completions bodies (#5403)
+│   │   ├── lane-decisions.ts     #   Single resolver for per-lane gating decisions (#3417)
+│   │   ├── pi-subagent-channel.ts #   Channel fallback for pi-subagent children missing ACP tools (#2268)
+│   │   ├── snapshot-render.ts    #   Snapshot render: outbound prefix from server transcript (#3756)
+│   │   ├── thread-tracking.ts    #   Anthropic Threads previous_message_id repair (#2701)
+│   │   ├── threads-lane.ts       #   Anthropic Threads lane: mirror, budget, reforge (#2926)
+│   │   ├── update-actions.ts     #   Web Updates tab actions over the self-updater (#3719)
 │   │   └── stream-io.ts          #   Small response-body reader for non-2xx inspection
 │   ├── knobs.ts                  # Single knob resolver: env > config file > default (#2030)
 │   ├── config.ts                 # Config file (billion-context.json) + providers table + loadOptions
@@ -67,11 +77,13 @@ billion-context/
 │   ├── reasoning-guard.ts        # Live-fold guard for signed reasoning payloads
 │   ├── output-steering.ts        # Output-side compression: verbosity steering / effort routing (#1093)
 │   ├── image-tokens.ts           # Image token cost estimation (pixels/bytes modes, #767)
-│   ├── image-compress.ts         # Image-compression policy stamping per request
 │   ├── image-note.ts             # Image-block placeholder → rich note rendering
+│   ├── image-rescale.ts          # Deterministic egress image rescale (outbound copy only, restore receipt) (#3400)
+│   ├── image-restore.ts          # Recovery channel for folded images by mNNNNN ref, file-first (#1995)
 │   ├── absorb.ts                 # absorb tool (kernel ACP_TOOL_NAMES extension)
 │   ├── compress-loop-responses.ts # Compress loop for Responses API format
 │   ├── compress-settings.ts      # Three-level compress config merge (global→provider→model)
+│   ├── chat-pack.ts              # Bundled chat prompt pack: relationship-first compress philosophy (#5319)
 │   ├── compress-tool.ts          # ACP tool surface — thin re-export from acp-kernel
 │   ├── decompress-shared.ts      # Shared decompress logic + large-decompress tmp retention cap
 │   ├── fold-reconcile.ts         # Fold-anchor reconciliation for stable prefix cache
@@ -81,12 +93,19 @@ billion-context/
 │   ├── fork-adoption.ts          # Fork block adoption on mid-history divergence (#629)
 │   ├── prefix-affinity.ts        # Anonymous prefix-affinity session resolution (#309)
 │   ├── affinity-persist.ts       # Prefix-affinity persistence across proxy restarts (#499)
+│   ├── affinity-neutral.ts       # Wire-neutral affinity turn projection across protocol switches (#2791)
+│   ├── affinity-simhash.ts       # 64-bit simhash + Hamming chain alignment for rewritten histories (#2265)
 │   ├── cache-warn.ts             # Upstream prompt-cache collapse warning (#499)
 │   ├── cache-ledger.ts           # Per-round cache usage ledger (wire-protocol aware, #1536)
 │   ├── billing.ts                # Per-model USD prices (#4899): billing.prices overrides > models.dev; stamps per request, bills session.stats.costUsd; panel $ faces derive live from the current price table incl. a compression payback view
 │   ├── acp-status.ts             # acp_status payload (ranges/nudge recomputed live)
 │   ├── acp-panel.ts              # Cache report wrapper for transcript display
 │   ├── acp-cache-diff.ts         # Offline prefix-diff attribution over dumps (#1266)
+│   ├── marker/                   # Inbound marker stripping: one spec table + engine, four wires (#2811)
+│   │   ├── anchors.ts            #   Shared marker anchors: integrity note, silence clause, echo match
+│   │   ├── engine.ts             #   Raw-stage inbound marker strip: one ordered pipeline (#2811)
+│   │   ├── spec.ts               #   Declarative table of marker classes stripped per stage/scope
+│   │   ├── status-body.ts        #   Inbound acp_status report-body stripping (#2789)
 │   ├── chain-checkpoint.ts       # Chain-checkpoint digest match / stale verdict split (#1421)
 │   ├── store.ts                  # Content retrieval store (CCR) + per-request policy stamping
 │   ├── rules-feature.ts          # Model-owned session rules opt-in (#1399)
@@ -102,6 +121,7 @@ billion-context/
 │   ├── compat-drop.ts            # compat.dropFields validation
 │   ├── codex-compact.ts          # Codex compact mode intercept/pass (knob-resolved)
 │   ├── codex-models.ts           # Codex bundled model-table snapshot
+│   ├── codex-models-snapshot.json # Bundled codex model table data (openai/codex main snapshot)
 │   ├── registry.ts               # models.dev context-window registry (live-first, snapshot floor)
 │   ├── registry-snapshot.json    # Bundled full models.dev snapshot (offline floor)
 │   ├── session.ts                # Session model + in-memory store (bounded, MAX_SESSIONS)
@@ -111,17 +131,31 @@ billion-context/
 │   ├── session-gc.ts             # Session-file GC, opt-in (sessions.gc.* / BILI_SESSION_GC*) (#1082)
 │   ├── persist.ts                # On-disk session persistence (kernel StateStore)
 │   ├── persist-eperm.ts          # EPERM/EACCES write-failure alert layer (#362)
+│   ├── storage/                  # Unified storage layer (schema, SQLite engine ladder, backends) (#2671)
+│   │   ├── backend.ts            #   Storage backend contract: sqlite + mysql operation seam (#3931)
+│   │   ├── canonical.ts          #   Shared canonicalization for storage digests (#2671)
+│   │   ├── driver.ts             #   SQLite driver ladder: bun/node builtin, host, self-downloaded (#2833)
+│   │   ├── engine-bootstrap.ts   #   Self-downloads pinned better-sqlite3 prebuilt when no engine exists
+│   │   ├── identity.ts           #   messages-table identity hash: strips position metadata (#4390)
+│   │   ├── ingest.ts             #   Legacy → unified row mapping + legacy view rebuild (#2671)
+│   │   ├── integrity-check.ts    #   Cached + background quick_check off the boot critical path (#4609)
+│   │   ├── mysql.ts              #   MySQL 8.0 backend implementing the storage contract (#3388)
+│   │   ├── runtime-status.ts     #   Runtime storage degradation status for status surfaces (#3040)
+│   │   ├── schema.ts             #   Unified storage schema DDL + migrations (v11)
+│   │   ├── shadow.ts             #   Unified-storage sidecar: shadow double-write / full read flip
+│   │   ├── sqlite-errors.ts      #   Corruption-shaped SQLite error classification (#5108)
+│   │   ├── store.ts              #   UnifiedStore: index.db (WAL) + content blobs, one txn per mutation
 │   ├── encrypt.ts                # At-rest encoding: AES-256-GCM (#708) + zstd (#1080), independent
 │   ├── export.ts                 # Session export (block summaries + originals)
 │   ├── preflight.ts              # Preflight compression gate (hold grace, dead-end cooldown)
 │   ├── external-summary.ts       # Isolated summary executor (ordered failover, deadlines, capacity)
 │   ├── external-summary-http.ts  # Internal single-attempt HTTP candidates using existing summary codecs
 │   ├── external-summary-settings.ts # Global external-summary target and budget validation
-│   ├── external-summary-config.ts # Strict external-summary config loading
 │   ├── external-summary-credentials.ts # Separate atomic credential store
 │   ├── external-summary-runtime.ts # Configured candidate plan and shared executor
 │   ├── external-summary-compress.ts # External summary fold coordinator and state checks
 │   ├── external-summary-surface.ts # Tool/schema and client-facing summary contract
+│   ├── external-summary-marker.ts # Zero-import marker contract for externally summarized blocks
 │   ├── update.ts                 # Self-updater (load-bearing — no-op release protocol) + install lanes
 │   ├── advisory.ts               # Critical-defect advisory watcher (#1481)
 │   ├── plugin-advisory.ts        # dsh cost-advisory detection + TTL cache (#2462)
@@ -174,6 +208,20 @@ billion-context/
 │   │   ├── dsh-native.ts         #   dsh native bootstrap gate (+ persona fingerprint, #1916)
 │   │   ├── dsh-acp.ts            #   dsh /acp command panel
 │   │   ├── dsh-native-client.ts  #   Poll host live-origin route until armed (#1809)
+│   │   ├── client-build-note.ts  #   Soft note when the in-process client build is newer than tested (#4545)
+│   │   ├── conversation-recall.ts #   Fallback identity when host attribution context is missing (#4082)
+│   │   ├── dsh-compaction-disable.ts #   Load-time overlay standing dsh basic compaction down (#3354)
+│   │   ├── dsh-compaction-gate.ts #   Always-on compaction gate entry, independent of bili-native (#3662)
+│   │   ├── fork-adopt.ts         #   Client half of fork adoption: prefix match + receipt (#2399)
+│   │   ├── host-log.ts           #   Host-safe log channel: durable record, zero terminal traffic (#2827)
+│   │   ├── incremental-client.ts #   Host-process incremental-turn client: diff, ack, resync (#3248)
+│   │   ├── opencode-msgids.ts    #   Opencode msgid harvest + wire alignment (#4491)
+│   │   ├── opencode-v2-msgids.ts #   Opencode V2 per-turn msgid extraction + header stamp (#5825)
+│   │   ├── pf-channel.ts         #   Watermark channel client state machine: learn, capture, emit (#5403)
+│   │   ├── pi-inline.ts          #   Pi inline lane: serves INLINE_ORIGIN traffic in-process (#3278)
+│   │   ├── pi-msgids.ts          #   Pi wire-branch lockstep walker resolving host msgids (#4491)
+│   │   ├── pi-subagent-registry.ts #   Self-registration into pi-subagents required-child extensions (#2185)
+│   │   ├── tool-guardrails.ts    #   Tool-output guardrails migrated from billion-context-pi (#3066)
 │   │   └── dsh-native-client-react-shim.d.ts #  Ambient "react" types for the dsh bundle (#1590)
 │   ├── kimi/                     # Kimi native lane
 │   │   ├── bootstrap-hook.ts     #   SessionStart attach-only bootstrap (#963)
@@ -185,6 +233,79 @@ billion-context/
 │   │   ├── json-edit.ts          #   Provider config JSON managed edit
 │   │   ├── mcp-entry.ts          #   Idle/degraded entry candidate proxies (#1892)
 │   │   └── native.ts             #   Routing scope/exemptions policy (#1622)
+│   ├── agent-providers.ts        # In-memory agent-registry provider recipes; file recipes win (#2336)
+│   ├── announcements.ts          # Notice surface registry: record schema + gates shared by builtin/remote/local (#5548)
+│   ├── anon-provenance.ts        # First-writer producer provenance for anonymous pfa-* sessions (#2879)
+│   ├── attach-heartbeat.ts       # Silence alarm for a hot-at-attach session with zero observed requests (#5408)
+│   ├── auto-mode-forge.ts        # Local forged verdicts for the Claude Code auto-mode safety classifier (#2740)
+│   ├── cache-keepalive.ts        # Idle prompt-cache TTL keepalive pings replaying the last egress body (#3376)
+│   ├── claude-mcp-entry.ts       # Per-session Claude native MCP server + mid-session proxy watchdog (#1821)
+│   ├── claude-transcript-lineage.ts # Resume lineage from Claude Code transcript forkedFrom markers (#1486)
+│   ├── client-ua-registry.ts     # Bounded in-memory registry of recently observed client user-agents (#4649)
+│   ├── context-view.ts           # Machine-readable context view for programmatic consumers (#3862)
+│   ├── dead-ranges.ts            # Session memory of structurally empty fold ranges (#2638)
+│   ├── dedupe-adjacent-output-config.ts # Collapses adjacent empty system output_config directives at egress (#5688)
+│   ├── dsh-ledger.ts             # dsh profile three ledgers (manifest/lockfile/copy) read + converged (#3496)
+│   ├── dump-banner.ts            # PLAINTEXT warning header for (and stripped from) body dumps (#4482)
+│   ├── durable-message-guards.ts # Projects host durable-state message carriers to virtual tool paths (#2446)
+│   ├── duration.ts               # Duration string parsing (1d12h) for update-policy keys (#3619)
+│   ├── egress-shed.ts            # Byte-space egress shed: archive/downscale outbound images past lane budget (#3701)
+│   ├── fold-decomposition-lookup.ts # Stored message decompositions for fold-anchor backfill (#3301)
+│   ├── host-profiles.ts          # Per-agent declared-defaults registry, import-free leaf (#3417)
+│   ├── identity-claude.ts        # Identity harvest source: claude-code transcript JSONL uuids (#5825)
+│   ├── identity-codebuddy.ts     # Identity harvest source: codebuddy local transcript jsonl (#5825)
+│   ├── identity-goose.ts         # Identity harvest source: goose sessions.db message rows (#5825)
+│   ├── identity-harvest.ts       # Registry harvesting per-message ids from client local stores (#5825)
+│   ├── identity-mcode.ts         # Identity harvest source: mcode (MiniMax Code) runtime sqlite (#5825)
+│   ├── identity-qwen.ts          # Identity harvest source: qwen-code transcript, opt-in join key (#5825)
+│   ├── identity-sources.ts       # Identity source registry barrel: one import registers every lane (#5825)
+│   ├── incremental-lane.ts       # Incremental-turn server lane: delta acks via x-bili-applied-seq (#3248)
+│   ├── inline-engine.ts          # In-process compression engine behind the pseudo-origin (#3278)
+│   ├── inline-ws.ts              # Loopback-only WS bridge for the inline engine (#3278)
+│   ├── integrity-label.ts        # NTFS mandatory integrity label check for EPERM startup failures (#5154)
+│   ├── invariant-judge.ts        # Outbound-invariant judge: did bili rewrite client history this request (#3842)
+│   ├── lane-credentials.ts       # Per-lane upstream credential override (apiKeyEnv/credentialRef) (#2336)
+│   ├── listen-policy.ts          # EADDRINUSE decision table: same-port wait, twin exit, newer adoption (#3044)
+│   ├── liveness.ts               # Three-state alive/busy/dead liveness probing (#3654)
+│   ├── mitm-domains.ts           # Default MITM domain list + subdomain matcher (cycle-free leaf)
+│   ├── msgid-algebra.ts          # Id-set algebra over client-pinned ids: vanish reason + epoch flip (#4491)
+│   ├── msgid-pin.ts              # Validates + consumes client biliMsgIds/biliLedgerSeqs parallel arrays (#4491)
+│   ├── notice-store.ts           # Notice dismissal receipts in unified kv_store, legacy file fallback (#5548)
+│   ├── notices.ts                # Built-in notice registry: activity predicates + i18n key table (#5548)
+│   ├── nudge-decide.ts           # Model-decided nudge timing over the already-cached prefix (#2228)
+│   ├── order-persist.ts          # Persists session-order skeletons across restarts (#3397)
+│   ├── pack-install.ts           # bili pack install|remove|list: npm-distributable prompt packs (#5319)
+│   ├── pck-notice.ts             # One-time notice for the prompt_cache.routing default flip (#5079)
+│   ├── pck-probe.ts              # Probe-and-remember ablation of prompt_cache_key-rejecting origins (#2645)
+│   ├── persona-anchor.ts         # Continuity-aware persona fork trigger: system drift + chain break (#2241)
+│   ├── phantom-attachment.ts     # Detects fabricated attachment identifiers in model output (#3456)
+│   ├── plugin-compress-salvage.ts # Rescues strict-JSON-failing compress args on the verbatim lane (#2580)
+│   ├── plugin-render.ts          # POST /__bili/plugin/render: outbound prefix from server transcript (#4491)
+│   ├── private-host.ts           # Private-upstream host detection shared by launcher + trust gates (#2984)
+│   ├── proxy-tool-result.ts      # Machine-readable business outcome for proxy tools (#1875)
+│   ├── remote-notices.ts         # Remote announcement feed watcher: fail-open polling, last-known-good snapshot (#5548)
+│   ├── request-membership.ts     # Settle-side membership probe: is this usage report ours (#4805)
+│   ├── resolver-wedge.ts         # Persistent local DNS resolver wedge detector + alarm (#5221)
+│   ├── responses-tool-output.ts  # Responses tool-output image parts: projection + patch helpers
+│   ├── rollout.ts                # Feature rollout: per-install uuid, basis-point buckets, nested cohorts (#3062)
+│   ├── runaway-guard.ts          # Intrinsic stream terminator for runaway tag/codepoint enumeration (#2346)
+│   ├── served-markers.ts         # Per-session writer markers: split-brain visibility (#3923)
+│   ├── session-self-heal.ts      # Degrades zombie plugin sessions back to proxy mode (#2155)
+│   ├── startup-failure-page.ts   # Port-holding failure page when a launcher-spawned proxy dies (#5096)
+│   ├── state-gc.ts               # Opt-in retention GC for dump directories (size/age bounds) (#2412)
+│   ├── state-hydration.ts        # Single mergeState truth; persisted field list derived mechanically (#4242)
+│   ├── storage-maintenance.ts    # bili sessions / bili storage gc CLI over store maintenance APIs (#3911)
+│   ├── turn-separator.ts         # Responses turn-separator id helpers, zero-dependency leaf (#2627)
+│   ├── uncovered.ts              # Uncovered-history audit: runs no active block can reach (#4331)
+│   ├── unprompted-gate.ts        # Gates refusing unprompted model-initiated compress (#5683)
+│   ├── update-policy.ts          # Staggered upgrade draw + remote update-policy file (#3619)
+│   ├── upstream-ca.ts            # Merges network.caFile into bili's own outbound TLS trust (#3776)
+│   ├── upstream-throttle.ts      # Egress-side 429 governor: local hold, backoff, terminal 424 (#4204)
+│   ├── util.ts                   # Shared leaf: wire-protocol type, hash/loopback/origin helpers, usage math
+│   ├── v1internal.ts             # CloudCode/Antigravity v1internal envelope adapter (#3129)
+│   ├── vertex.ts                 # Vertex routing: endpoint host derivation + CLAUDE_CODE_USE_VERTEX detection
+│   ├── win-cmd.ts                # cmd.exe argv safety contract for the comspec wrap path (#2196)
+│   ├── yield-loop.ts             # Cooperative setImmediate yield for long synchronous turns (#4528)
 │   └── web/                      # Web UI (config editor, sessions, logs)
 │       ├── api.ts                #   REST handlers (config get/put with parse-state guard)
 │       ├── blogfeed.ts           #   Panel blog/articles feed from bundled markdown (#4587)
@@ -196,6 +317,10 @@ billion-context/
 │       ├── client.ts             #   Web UI client JS bundle
 │       ├── styles.ts             #   Web UI CSS
 │       ├── i18n.ts               #   Locale message tables (zh-CN/en)
+│       ├── blog-refresh.ts       #   GitHub-master blog overlay refresh, fail-soft (#4906)
+│       ├── diagnostics.ts        #   Ready-to-paste diagnostics blob + GitHub issue link (#3040)
+│       ├── favicon.ts            #   Generated favicon bytes (scripts/gen-favicon.mjs) (#4830)
+│       ├── report.ts             #   Dependency-free session-report builders: Markdown + SVG
 │       └── index.ts              #   Web UI mount (bundle-safe VERSION reuse, #1426)
  ├── kernel/                       # In-repo acp-kernel source (#2092): the compression engine
  │   ├── src/                      #   ~30 modules: processTurn pipeline, wire codecs, persist, panel, filter
