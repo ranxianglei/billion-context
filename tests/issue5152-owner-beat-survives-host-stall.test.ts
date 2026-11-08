@@ -53,13 +53,18 @@ async function startReceiver(dir: string): Promise<Receiver> {
     const portFile = `${log}.port`;
     const child = spawn(process.execPath, [RECEIVER, log], { stdio: "ignore", detached: true });
     child.unref();
+    // Gate on a VALID port, not mere file existence: a non-atomic publication
+    // can leave an empty file behind (observed CI flake: "port ... got 0" on a
+    // loaded shard), which must be re-polled, not asserted on.
     const deadline = Date.now() + 15_000;
-    while (!existsSync(portFile) && Date.now() < deadline) {
+    let raw = "";
+    let port = 0;
+    while (!(Number.isInteger(port) && port > 0) && Date.now() < deadline) {
+        raw = existsSync(portFile) ? readFileSync(portFile, "utf8").trim() : "";
+        port = Number(raw);
         Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
     }
-    assert.ok(existsSync(portFile), "receiver must publish its port");
-    const port = Number(readFileSync(portFile, "utf8").trim());
-    assert.ok(Number.isInteger(port) && port > 0, `receiver port must be a number, got ${port}`);
+    assert.ok(Number.isInteger(port) && port > 0, `receiver must publish its port (file held ${JSON.stringify(raw)})`);
     return {
         port,
         beats: () => (existsSync(log) ? readFileSync(log, "utf8").trim().split("\n").filter(Boolean).map(Number) : []),
