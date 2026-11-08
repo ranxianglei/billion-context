@@ -108,7 +108,7 @@ export type {
   PackSource,
   PackResolver,
 } from "./packs.js";
-export { truncateLargeToolOutputs } from "./truncate-tools.js";
+export { truncateLargeToolOutputs, TRUNCATION_CLIP_RE, buildTruncationClipMarker } from "./truncate-tools.js";
 export type { TruncateOptions, TruncateResult } from "./truncate-tools.js";
 export {
   parseBlockIdArg,

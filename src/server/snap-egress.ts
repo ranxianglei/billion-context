@@ -24,7 +24,7 @@
  * backward seam walk D-lane uses — id fast path, identity-signature fallback,
  * one reply-lag gap tolerated, #3812/#4052 semantics preserved).
  */
-import { defaultCountTokens, renderVisibleRefs, SUMMARY_HEADER, summaryMessageId, type CompressionState, type RenderStrategy } from "acp-kernel";
+import { defaultCountTokens, renderVisibleRefs, TRUNCATION_CLIP_RE, SUMMARY_HEADER, summaryMessageId, type CompressionState, type RenderStrategy } from "acp-kernel";
 import type { BiliMessage } from "acp-kernel/wire";
 import { createHash } from "node:crypto";
 import { loadConfigFile, resolveMessageTimestamps } from "../config.js";
@@ -123,13 +123,61 @@ function noteDegrade(reason: string): void {
 // payload must be identical.
 // ---------------------------------------------------------------------------
 
-const TRIPWIRE_FIELDS = ["role", "contentType", "toolName", "toolCallId", "text", "image"] as const;
+const TRIPWIRE_FIELDS = ["role", "contentType", "toolName", "toolCallId", "text", "image", "sidecars"] as const;
+
+/** Model-visible sidecar fields the codecs PREFER over `.text` — the wire
+ *  emits these verbatim when present (rawAnthropicBlock, rawOpenaiContent,
+ *  rawGoogleParts, …), so a plane/legacy divergence in any of them changes
+ *  the upstream bytes without touching the six plain fields. Key-order-safe
+ *  stable serialization keeps the digest independent of property order. */
+const SIDECAR_KEYS = [
+    "rawAnthropicBlock", "rawAnthropicMessage", "rawOpenaiContent", "rawOpenaiContentParts",
+    "rawResponsesItem", "rawGoogleParts", "thinkingSignature", "googleThoughtSignature",
+    "reasoningContent", "reasoningPresent", "toolIsError", "originalRole", "imageMediaType",
+] as const;
+
+function stableStringify(v: unknown): string {
+    if (v === null || typeof v !== "object") return JSON.stringify(v) ?? "undefined";
+    if (Array.isArray(v)) return `[${v.map(stableStringify).join(",")}]`;
+    const keys = Object.keys(v as Record<string, unknown>).sort();
+    return `{${keys.map((k) => `${JSON.stringify(k)}:${stableStringify((v as Record<string, unknown>)[k])}`).join(",")}}`;
+}
+
+function sidecarDigest(m: BiliMessage): string {
+    const parts: string[] = [];
+    for (const k of SIDECAR_KEYS) {
+        const v = (m as unknown as Record<string, unknown>)[k];
+        if (v === undefined || v === null) continue;
+        parts.push(`${k}=${stableStringify(v)}`);
+    }
+    if (parts.length === 0) return "";
+    return createHash("sha256").update(parts.join("\u0000")).digest("hex").slice(0, 32);
+}
+
+function sidecarDiff(a: BiliMessage, b: BiliMessage): string {
+    for (const k of SIDECAR_KEYS) {
+        const va = (a as unknown as Record<string, unknown>)[k];
+        const vb = (b as unknown as Record<string, unknown>)[k];
+        if (va === undefined || va === null) {
+            if (vb === undefined || vb === null) continue;
+            return `${k}:legacy-only`;
+        }
+        if (vb === undefined || vb === null) return `${k}:plane-only`;
+        if (stableStringify(va) !== stableStringify(vb)) return k;
+    }
+    return "?";
+}
 
 function normTuple(m: BiliMessage): string[] {
     const img = m.imagePart === true
         ? createHash("sha256").update(m.imageBase64 ?? "").digest("hex").slice(0, 24)
         : "";
-    return [m.role, m.contentType, m.toolName ?? "", m.toolCallId ?? "", typeof m.text === "string" ? m.text : "", img];
+    return [m.role, m.contentType, m.toolName ?? "", m.toolCallId ?? "", typeof m.text === "string" ? m.text : "", img, sidecarDigest(m)];
+}
+
+function sidecarValue(m: BiliMessage, key: string): string {
+    const v = (m as unknown as Record<string, unknown>)[key];
+    return v === undefined || v === null ? "<absent>" : safePrefix(stableStringify(v), 200);
 }
 
 export function tripwireCompare(plane: BiliMessage[], legacy: BiliMessage[]): { ok: true } | { ok: false; reason: string; firstDiff?: string } {
@@ -148,6 +196,11 @@ export function tripwireCompare(plane: BiliMessage[], legacy: BiliMessage[]): { 
                 const win = (s: string) => scrubLoneSurrogates(JSON.stringify(s.slice(Math.max(0, seam - 60), seam + 160)));
                 const head = (v: unknown) => safePrefix(JSON.stringify(String(v ?? "")), 400);
                 const tail = (v: unknown) => safeSuffix(JSON.stringify(String(v ?? "")), 200);
+                if (TRIPWIRE_FIELDS[f] === "sidecars") {
+                    // Digest mismatch: name the offending sidecar key, not the hash.
+                    const key = sidecarDiff(plane[i]!, legacy[i]!);
+                    return { ok: false, reason: `shape@${i}:sidecars:${key}`, firstDiff: `sidecars.${key} plane=${safePrefix(sidecarValue(plane[i]!, key), 200)} legacy=${safePrefix(sidecarValue(legacy[i]!, key), 200)}` };
+                }
                 return { ok: false, reason: `shape@${i}:${TRIPWIRE_FIELDS[f]}`, firstDiff: `${TRIPWIRE_FIELDS[f]} plane(len=${sa.length})=${head(a[f])} …seam@${seam}: plane=${win(sa)} legacy=${win(sb)} …tail=${tail(a[f])}|${tail(b[f])}` };
             }
         }
@@ -267,17 +320,23 @@ export function buildSnapEgressView(
 ): { ok: true; msgs: BiliMessage[]; tailCount: number; adopt: { paired: number; adopted: number; trimMiss: number; unpaired: number } } | { ok: false; reason: string } {
     if (!view.rows.length) return { ok: false, reason: "no-plane" };
 
+    let rowUnparsable = false;
     const rows: EgressRow[] = view.rows.map((r) => {
         let msg: BiliMessage | null = null;
         if (r.active === 1 && typeof r.postJson === "string") {
             try {
                 msg = JSON.parse(r.postJson) as BiliMessage;
             } catch {
+                // A corrupt ACTIVE row is not a retire: silently suppressing a
+                // live line would under-serve the plane view (D-lane degrades
+                // row-unparsable for the same reason).
                 msg = null;
+                rowUnparsable = true;
             }
         }
         return { pos: r.pos, ids: new Set(r.coreIds), msg };
     });
+    if (rowUnparsable) return { ok: false, reason: "row-unparsable" };
 
     // Block coverage: effectiveMessageIds → row positions (id mapping, the
     // only authoritative domain — startSeq/endSeq are 1-based and
@@ -315,12 +374,19 @@ export function buildSnapEgressView(
     const byId = new Map<string, number>();
     for (let i = 0; i < rows.length; i++) for (const id of rows[i].ids) byId.set(id, i);
     const bySig = new Map<string, number[]>();
+    const byCall = new Map<string, number[]>();
     for (let i = rows.length - 1; i >= 0; i--) {
         if (suppressed(rows[i])) continue;
         const sig = sigOf(rows[i].msg!);
         const list = bySig.get(sig);
         if (list) list.push(i);
         else bySig.set(sig, [i]);
+        const call = rows[i].msg!.toolCallId;
+        if (typeof call === "string" && call.length > 0) {
+            const clist = byCall.get(call);
+            if (clist) clist.push(i);
+            else byCall.set(call, [i]);
+        }
     }
     let joinRow = -1;
     let clientJoin = clientMsgs.length;
@@ -341,6 +407,22 @@ export function buildSnapEgressView(
                         if (idx < cursor) {
                             hit = idx;
                             break;
+                        }
+                    }
+                }
+                // Tool results carry no host-echoed message id and a trimmed
+                // body fails sigOf — the SAME pairing the adoption walk uses
+                // (tool_call_id keys both sides). Without this arm, two
+                // ADJACENT trimmed results (parallel bulky calls — the common
+                // gate-h shape) miss twice in a row and break the chain.
+                if (hit < 0 && typeof m.toolCallId === "string" && m.toolCallId.length > 0) {
+                    const ccands = byCall.get(m.toolCallId);
+                    if (ccands) {
+                        for (const idx of ccands) {
+                            if (idx < cursor) {
+                                hit = idx;
+                                break;
+                            }
                         }
                     }
                 }
@@ -434,6 +516,10 @@ const TOOL_PRUNE_MARKER = "\n\n[... tool result middle pruned ...]\n\n";
  *  the dsh pruner's head + marker + tail shape. Anything else is an edit and
  *  stays plane-sourced (the byte-strict tripwire judges it). */
 function trimDerived(clientText: string, planeText: string): boolean {
+    // An empty client body is not a trim (startsWith("") is vacuously true) —
+    // refuse it so an emptied resend keeps the plane bytes for the tripwire
+    // to judge.
+    if (clientText.length === 0) return false;
     if (planeText.startsWith(clientText)) return true;
     const mi = clientText.indexOf(TOOL_PRUNE_MARKER);
     if (mi < 0) return false;
@@ -443,12 +529,13 @@ function trimDerived(clientText: string, planeText: string): boolean {
 }
 
 /** Kernel-internal emergency truncation (kernel/src/truncate-tools.ts):
- *  keepPrefixChars + "\n\n...[truncated for context space] — original ~N tokens]...\n\n"
- *  + keepSuffixChars. The clip runs INSIDE processTurn on turn.messages, so
- *  the truncated bytes exist only in the legacy egress — but the transform is
- *  deterministic over the identical plane text, so a verified head+marker+tail
- *  shape is exactly what the kernel produces over that text. */
-const KERNEL_TRUNC_RE = /\n\n\.\.\.\[truncated for context space\] — original ~\d+ tokens\]\.\.\.\n\n/;
+ *  keepPrefixChars + clip marker + keepSuffixChars. The clip runs INSIDE
+ *  processTurn on turn.messages, so the truncated bytes exist only in the
+ *  legacy egress — but the transform is deterministic over the identical
+ *  plane text, so a verified head+marker+tail shape is exactly what the
+ *  kernel produces over that text. The regex is IMPORTED from the kernel so
+ *  a marker wording change cannot silently kill the recognition. */
+const KERNEL_TRUNC_RE = TRUNCATION_CLIP_RE;
 
 function kernelTruncDerived(legacyText: string, planeText: string): boolean {
     const m = KERNEL_TRUNC_RE.exec(legacyText);
@@ -516,7 +603,14 @@ export function applySnapEgress(
         deps.log("warn", `[snaplane] sid=${deps.sessionId} decision=degrade:egress:render-error (${err instanceof Error ? err.message : String(err)})`);
         return legacyProcessed;
     }
-    let planeProcessed = deps.transform(rendered);
+    let planeProcessed: BiliMessage[];
+    try {
+        planeProcessed = deps.transform(rendered);
+    } catch (err) {
+        noteDegrade("transform-error");
+        deps.log("warn", `[snaplane] sid=${deps.sessionId} decision=degrade:egress:transform-error (${err instanceof Error ? err.message : String(err)})`);
+        return legacyProcessed;
+    }
     // Adopt the kernel's own emergency-truncation clips: the clip lives only
     // in the legacy bytes (processTurn output); verified-shape adoption makes
     // the plane side byte-identical. Everything else stays byte-strict.
