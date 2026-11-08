@@ -76,7 +76,7 @@ test("#1029-②: repeated identical malformed calls escalate (2nd+ collapse to a
     const second = bad();
     assert.ok(second.startsWith("[Compression FAILED again"), `second attempt collapses to the one-liner, got: ${second.slice(0, 120)}`);
     assert.match(second, /2 time\(s\)/);
-    assert.ok(!second.includes("Eligible ranges"), "one-liner must not repeat the full guide");
+    assert.doesNotMatch(second, /compress takes ONE 'content' STRING/, "one-liner must not repeat the format lecture");
     assert.match(second, /FIRST failed receipt above/, "one-liner points back at the full receipt");
 });
 
