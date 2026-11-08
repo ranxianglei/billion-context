@@ -2589,6 +2589,12 @@ export async function pipePluginChatWithStrip(
     // swallows the original response object, hence optional.
     upstreamMeta?: UpstreamMeta,
     reply?: HandoffReply,
+    // #5958: how the double-degenerate terminal (#870) is shaped — threaded from
+    // ProxyOptions.streamErrorShape so this lane obeys the same policy as every
+    // other stream-error site. Omitted → protocol-native error frame (the global
+    // default); hosts that need the legacy completed-turn shape opt back in with
+    // streamErrorShape:"completion".
+    streamErrorShape?: "protocol" | "completion",
 ): Promise<void> {
     let reader = stream.getReader();
     let decoder = new TextDecoder("utf-8");
@@ -2795,11 +2801,16 @@ export async function pipePluginChatWithStrip(
             // model that produced nothing and the session reads as idle while it is
             // dead, so the client gets an error the host would never surface (#870).
             log?.("[plugin] degenerate terminal turn again after the retry; emitting an in-band error (#870)");
-            // #870 deliberately chose a COMPLETED turn carrying the error text (visible to the host); keep the legacy shape here regardless of the global streamErrorShape default.
+            // #5958: the terminal shape follows the configured streamErrorShape
+            // (default protocol → a native error frame the host records as a
+            // failure) instead of the old hard-wired completed-turn shape, which
+            // let hosts like DSH book an unfinished turn as stop/completed.
+            // streamErrorShape:"completion" restores the #870 legacy shape for
+            // hosts that need the error text inside a well-formed turn (#2689).
             // #2689: hand the emitter the client-known stream state — the error
             // block opens at the next free index (blocksForwarded), and no
             // message_start is synthesized when the first attempt already sent one.
-            emitStreamError(res, protocol, "the turn degenerated again after the continuation nudge", undefined, "completion", { blockIndex: blocksForwarded, messageStarted: sawMessageStart });
+            emitStreamError(res, protocol, "the turn degenerated again after the continuation nudge", undefined, streamErrorShape, { blockIndex: blocksForwarded, messageStarted: sawMessageStart });
             return true;
         }
         // A turn the model left genuinely bare — no thought, no stripped echo,
