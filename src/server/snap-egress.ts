@@ -383,7 +383,7 @@ export function buildSnapEgressView(
             const sameCall = typeof c.toolCallId === "string" && c.toolCallId === r.msg!.toolCallId;
             const paired = r.ids.has(c.id) || sameCall || sigOf(c) === sigOf(r.msg!);
             if (!paired) continue;
-            if (typeof c.text === "string" && typeof planeText === "string" && planeText.startsWith(c.text)) {
+            if (typeof c.text === "string" && typeof planeText === "string" && trimDerived(c.text, planeText)) {
                 clientText.set(i, c.text);
             }
             ci = k + 1;
@@ -409,6 +409,23 @@ export function buildSnapEgressView(
 }
 
 // ---------------------------------------------------------------------------
+/** dsh's @deepseek-ai/dsh-compaction-tool-result-pruner replaces an
+ *  over-budget tool-result middle with this exact marker, keeping
+ *  headChars/tailChars code points at the ends. */
+const TOOL_PRUNE_MARKER = "\n\n[... tool result middle pruned ...]\n\n";
+
+/** A client body derived from the plane text by trimming: head-only cut, or
+ *  the dsh pruner's head + marker + tail shape. Anything else is an edit and
+ *  stays plane-sourced (the byte-strict tripwire judges it). */
+function trimDerived(clientText: string, planeText: string): boolean {
+    if (planeText.startsWith(clientText)) return true;
+    const mi = clientText.indexOf(TOOL_PRUNE_MARKER);
+    if (mi < 0) return false;
+    const head = clientText.slice(0, mi);
+    const tail = clientText.slice(mi + TOOL_PRUNE_MARKER.length);
+    return planeText.startsWith(head) && planeText.endsWith(tail) && head.length + tail.length < planeText.length;
+}
+
 // Entry point — called by each protocol lane right after the lane computed
 // its legacy processedMessages. Returns the plane view on an exact tripwire
 // match, else the legacy array untouched.
