@@ -3584,6 +3584,10 @@ export class UnifiedStore {
         }));
     }
 
+    withOriginalsTransaction<T>(action: () => T): T {
+        return this.db.transaction(action);
+    }
+
     getCcr(sessionId: string): MessageContentStore | null {
         const row = this.db
             .prepare("SELECT ccr_json FROM sessions WHERE session_id = ?")

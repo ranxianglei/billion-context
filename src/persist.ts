@@ -517,6 +517,7 @@ export class SessionStore {
     // #3931 step 3: assigned asynchronously for network backends (mysql) —
     // see the constructor and ready().
     private shadow?: UnifiedShadow;
+    private readonly originalsBasis = new WeakMap<Session, { refs: Map<string, string>; hashes: Set<string> }>();
     /** Only alive while one synchronous record build hydrates both lazy fields. */
     private residentFieldsForBuild?: {
         id: string;
@@ -752,6 +753,10 @@ export class SessionStore {
      *  loadEnvelope). Bounded server startup refuses corrupt originals;
      *  legacy direct callers retain their warned fresh-store fallback. */
     loadContentStore(session: Session): MessageContentStore | null {
+        if (this.writerOffActive() || this.envelopeFrozen(session.id)) {
+            const originals = this.shadow?.getCcr(session.id);
+            if (originals != null) return originals;
+        }
         return this.readContentStoreRels(session.id, [
             contentStoreRelPathFor(session.id, session.meta.protocol, session.meta.upstreamOrigin),
             contentStoreRelPathFor(session.id),
@@ -762,6 +767,10 @@ export class SessionStore {
      *  checkpoint path has no live Session object, only the frozen record's
      *  meta — same rel-path candidates, same parse-and-degrade semantics. */
     private contentStoreById(id: string, meta?: { protocol?: string; upstreamOrigin?: string } | null): MessageContentStore | null {
+        if (this.writerOffActive() || this.envelopeFrozen(id)) {
+            const originals = this.shadow?.getCcr(id);
+            if (originals != null) return originals;
+        }
         return this.readContentStoreRels(id, [
             contentStoreRelPathFor(id, meta?.protocol, meta?.upstreamOrigin),
             contentStoreRelPathFor(id),
@@ -861,6 +870,10 @@ export class SessionStore {
      *  save retries; the previous envelope stays byte-identical. */
     private saveContentStore(session: Session): boolean {
         if (!this.enabled || !session.contentStoreDirty) return true;
+        if (this.writerOffActive() || this.envelopeFrozen(session.id)) {
+            session.contentStore ??= { version: 1, byHash: {}, byRef: {} };
+            return true;
+        }
         const rel = contentStoreRelPathFor(session.id, session.meta.protocol, session.meta.upstreamOrigin);
         const abs = path.join(this.sessionsDir, rel);
         const tmp = path.join(path.dirname(abs), `.tmp-${path.basename(abs, ".json")}-${process.pid}-${this.tmpSeq++}`);
@@ -3016,6 +3029,66 @@ export class SessionStore {
         }
     }
 
+    private mergeDurableOriginals(session: Session, disk: MessageContentStore | null): MessageContentStore | undefined {
+        const resident = session.contentStore;
+        if (session.contentStoreDirty === true && resident
+            && Object.keys(resident.byRef).length === 0 && Object.keys(resident.byHash).length === 0) return resident;
+        const basis = this.originalsBasis.get(session);
+        if (basis) {
+            for (const [ref, entry] of basis.refs) {
+                if (!disk?.byRef[ref] || canonicalJson(disk.byRef[ref]) !== entry) {
+                    throw new Error(`Index commit refused: CCR generation conflict at ${ref}`);
+                }
+            }
+            for (const hash of basis.hashes) {
+                if (!disk || !Object.hasOwn(disk.byHash, hash)) throw new Error("Index commit refused: CCR generation lost an original body");
+            }
+        } else if (disk) {
+            for (const [ref, entry] of Object.entries(disk.byRef)) {
+                if (!resident?.byRef[ref] || canonicalJson(resident.byRef[ref]) !== canonicalJson(entry)) {
+                    throw new Error(`Index commit refused: unproven CCR generation at ${ref}`);
+                }
+            }
+            for (const hash of Object.keys(disk.byHash)) {
+                if (!resident || !Object.hasOwn(resident.byHash, hash)) throw new Error("Index commit refused: unproven CCR original body generation");
+            }
+        }
+        let merged: MessageContentStore | undefined;
+        for (const store of [disk, resident]) {
+            if (store == null) continue;
+            if (typeof store !== "object" || store.version !== 1 || !store.byHash || !store.byRef
+                || typeof store.byHash !== "object" || typeof store.byRef !== "object"
+                || Array.isArray(store.byHash) || Array.isArray(store.byRef)) throw new Error("malformed CCR originals store");
+            merged ??= { version: 1, byHash: {}, byRef: {} };
+            for (const [hash, text] of Object.entries(store.byHash)) {
+                if (typeof text !== "string" || createHash("sha256").update(text, "utf8").digest("hex") !== hash) {
+                    throw new Error("CCR original body has an invalid content hash");
+                }
+                if (Object.hasOwn(merged.byHash, hash) && merged.byHash[hash] !== text) throw new Error("conflicting CCR original body");
+                merged.byHash[hash] = text;
+            }
+            for (const [ref, entry] of Object.entries(store.byRef)) {
+                if (!entry || typeof entry !== "object" || typeof entry.hash !== "string"
+                    || typeof entry.rawId !== "string" || !Object.hasOwn(store.byHash, entry.hash)) throw new Error("CCR reference has no valid original body");
+                if (Object.hasOwn(merged.byRef, ref) && canonicalJson(merged.byRef[ref]) !== canonicalJson(entry)) throw new Error(`conflicting CCR original reference: ${ref}`);
+                Object.defineProperty(merged.byRef, ref, { value: entry, enumerable: true, writable: true, configurable: true });
+            }
+        }
+        if (merged) {
+            session.contentStore = merged;
+            session.contentStoreDirty = true;
+        }
+        return merged;
+    }
+
+    private rememberOriginalsBasis(session: Session): void {
+        const store = session.contentStore;
+        this.originalsBasis.set(session, {
+            refs: new Map(Object.entries(store?.byRef ?? {}).map(([ref, entry]) => [ref, canonicalJson(entry)])),
+            hashes: new Set(Object.keys(store?.byHash ?? {})),
+        });
+    }
+
     private guardedBuild(session: Session): () => PersistedSession {
         // #2671: capture the storage-mode stamp EAGERLY, at enqueue time —
         // the kernel write chain may invoke the builder on a later tick than
@@ -3029,6 +3102,16 @@ export class SessionStore {
         // the JSON envelope, and the stamp must say legacy for that copy.
         const stamp = this.liveStorageStamp;
         return () => {
+            const requireCommit = this.writerOffActive() || this.envelopeFrozen(session.id);
+            if (requireCommit && !this.shadow) throw new Error("Index commit refused: unified storage unavailable");
+            const settleCcr: Parameters<UnifiedShadow["record"]>[4] = requireCommit && this.shadow && !this.shadow.isAsyncBackend
+                ? (current, counters) => {
+                    if (counters && (session.stats.requests < counters.requests
+                        || (session.stats.requests === counters.requests && session.state.nextBlockId < counters.nextBlockId))) {
+                        throw new Error("Index commit refused: session generation advanced while preparing originals");
+                    }
+                    return this.mergeDurableOriginals(session, current);
+                } : undefined;
             const record = this.buildRecordForSave(session, stamp);
             const disk = this.staleDiskPayload(record);
             if (disk === null) {
@@ -3039,7 +3122,6 @@ export class SessionStore {
                 // re-ingests forever. buildRecord omits it, so the disk file
                 // never carries it.
                 const payload = session.decompositionLog;
-                if (payload !== undefined) session.decompositionLog = undefined;
                 // #2960 ⑤: the table holds the RAW tail (full fidelity); the
                 // envelope keeps its bounded folded view for legacy readers.
                 // ②a caveat: once foldResidentTail has folded the resident
@@ -3056,7 +3138,12 @@ export class SessionStore {
                 this.shadow?.record(payload !== undefined ? { ...record, decompositionLog: payload } : record,
                     tail && tail.length > 0
                         ? { lastMessages: tail, lastMessagesFolded: session.lastMessagesFolded }
-                        : undefined, session.contentStore ?? undefined);
+                        : undefined, session.contentStore ?? undefined, requireCommit, settleCcr);
+                if (payload !== undefined) session.decompositionLog = undefined;
+                if (settleCcr) {
+                    this.rememberOriginalsBasis(session);
+                    session.contentStoreDirty = false;
+                }
                 this.noteOwnCommit(session.id, record);
                 return record;
             }
@@ -3076,7 +3163,11 @@ export class SessionStore {
             // to the live session so serving converges on the same newest-wins
             // arbitration the write side just used.
             this.convergeToDisk(session, disk);
-            this.shadow?.record(disk);
+            this.shadow?.record(disk, undefined, undefined, requireCommit, settleCcr);
+            if (settleCcr) {
+                this.rememberOriginalsBasis(session);
+                session.contentStoreDirty = false;
+            }
             // Rewrite the disk's own payload: content-identical no-op that
             // preserves the newer state while satisfying the write chain.
             this.noteOwnCommit(session.id, disk);

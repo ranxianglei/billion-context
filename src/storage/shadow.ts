@@ -438,7 +438,7 @@ export class UnifiedShadow {
     // engine/engineSource introspection lives in engineInfo (sqlite-only
     // diagnostics widened for network backends); runtime-status reads that.
 
-    /** Ingest + verify one committed record. Never throws.
+    /** Ingest + verify one committed record. Required commits propagate failures.
      *
      *  `rawTail` (#2960 ⑤): the live in-memory conversation tail when the
      *  caller has one. The envelope persists only a pruned+truncated view of
@@ -446,11 +446,25 @@ export class UnifiedShadow {
      *  message log authoritatively, so the ingest uses the raw tail whenever
      *  available; both digest legs go through the same override, so parity
      *  accounting stays honest. */
-    record(record: unknown, rawTail?: { lastMessages: CoreMessage[]; lastMessagesFolded?: boolean }, liveCcr?: MessageContentStore): void {
+    record(record: unknown, rawTail?: { lastMessages: CoreMessage[]; lastMessagesFolded?: boolean }, liveCcr?: MessageContentStore,
+        requireCommit = false,
+        settleCcr?: (current: MessageContentStore | null, counters: { requests: number; nextBlockId: number } | null) => MessageContentStore | undefined): void {
         // #3931 step 3: network backend — the ingest runs on the serial
         // queue (fire-and-forget; failures are logged once per distinct message — never disabled).
         if (this.sync === null) {
+            if (requireCommit) throw new Error("Originals guard requires synchronous SQLite storage");
             this.enqueueAsyncRecord(record, rawTail, liveCcr);
+            return;
+        }
+        if (settleCcr) {
+            if (!requireCommit) throw new Error("Originals guard requires a durable commit");
+            const loaded = this.legacyLoad(record);
+            if (!loaded) throw new Error("Index commit refused: session record could not be loaded");
+            const sync = this.sync;
+            sync.withOriginalsTransaction(() => {
+                const originals = settleCcr(sync.getCcr(loaded.id), sync.sessionCounters(loaded.id));
+                this.record(record, rawTail, originals, true);
+            });
             return;
         }
         // #5627: which stage is running — the failure forensics must name
@@ -459,7 +473,10 @@ export class UnifiedShadow {
         let sessionId: string | undefined;
         try {
             const loaded = this.legacyLoad(record);
-            if (!loaded) return;
+            if (!loaded) {
+                if (requireCommit) throw new Error("Index commit refused: session record could not be loaded");
+                return;
+            }
             sessionId = loaded.id;
             // #4216/#4242: the reap shape (blockContents without their
             // state.blocks entries) is now REPRESENTABLE — planIngest
@@ -642,6 +659,7 @@ export class UnifiedShadow {
             this.consecutiveFailures = 0;
         } catch (err) {
             this.noteIngestFailure(err, phase, sessionId);
+            if (requireCommit) throw err;
         }
     }
 
