@@ -314,3 +314,21 @@ test("#5943: a newer nudge refreshes the credit after consumption", () => {
     const out = runApply(ctx, { content: [{ startId: "m00005", endId: "m00007", summary: SUM }] });
     assert.ok(out.startsWith("[Compressed"), `refreshed credit must pass, got: ${out.slice(0, 160)}`);
 });
+
+test("#5943: a REFUSED fold does not consume the credit — the in-bounds retry stays legal", () => {
+    // The #5943 field pattern: the model tries an out-of-bounds span under
+    // requireRecommendation, gets refused, then retries within bounds. Only a
+    // COMMITTED fold spends the credit — burning it on a refusal would kill
+    // exactly this retry at the next round boundary.
+    const ctx = freshCtx();
+    setOffer(ctx, [offerRange("m00001", "m00004", 4)]);
+    stampUnpromptedGate(ctx.session, { nudgeInjected: true, requireNudge: true, requireRecommendation: true });
+    // m5-m7 are live but NOT offered this round: scope gate refuses them.
+    const refused = runApply(ctx, { content: [{ startId: "m00005", endId: "m00007", summary: SUM }] });
+    assert.ok(refused.startsWith("[Compression REFUSED"), `expected scope refusal, got: ${refused.slice(0, 160)}`);
+    assert.ok(refused.includes("requireRecommendation"), "receipt names the knob:\n" + refused);
+    assert.equal(ctx.session.state.blocks.length, 0, "nothing folded by the refused attempt");
+    stampUnpromptedGate(ctx.session, { nudgeInjected: false, requireNudge: true, requireRecommendation: true }); // round 2
+    const out = runApply(ctx, { content: [{ startId: "m00001", endId: "m00004", summary: SUM }] });
+    assert.ok(out.startsWith("[Compressed"), `a refusal must not burn the credit; the in-bounds retry must pass, got: ${out.slice(0, 160)}`);
+});
