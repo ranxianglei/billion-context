@@ -26,7 +26,7 @@ import { storeEffectiveSearchPlanAware } from "../decompress-shared.js";
 import { externalSummaryEnabled, messageTimestampSections } from "../external-summary-surface.js";
 import { estimateRawBodyTokens } from "../preflight.js";
 import { gcDumpDirIfConfigured } from "../state-gc.js";
-import { imageTokensInParsedBody } from "../image-tokens.js";
+import { countImagesInRawBody, imageTokensInParsedBody } from "../image-tokens.js";
 import { APIG_RESIGN_CREDENTIAL_HEADER, APIG_RESIGN_HEADER, APIG_RESIGN_SCHEME, clearSignedRefusal, decodeApigCredential, inboundSignedScheme, recordSignedRefusal, signedRefusal } from "../apig-resign.js";
 import { conflictScanEnabled, isDesignBenign, scanClientPlugins, sniffScanClient } from "../thirdparty-scan.js";
 import { recordConflict } from "../conflict-watch.js";
@@ -441,20 +441,24 @@ async function handleRequest(
                 // for seconds in the JSON.parse + normalization sweep (the
                 // 51.2 MiB / 29,619-message incident: 5.5–7.2 s per round,
                 // 54.6% of local CPU, 747 s FATAL → cold caches for every
-                // session). Any parseable body above the ingest cost band is
-                // already ≥ ~8M tokens — beyond every real model window — so
-                // refuse it HERE, after decode (which can balloon 10:1) but
-                // before the sweep that costs the seconds. 0 disables the cap
-                // (legacy parse-everything). The RESPONSES lane is exempt:
-                // it is image-first-class (accumulated screenshots are a
-                // supported workload — #3701's 16-noise-PNG body is ~38.5 MiB
-                // of base64 and must reach that lane's own pre-send byte
-                // budget + shed backstop), and a raw byte band cannot tell
-                // image bytes from text bytes. The slot budget + receive cap
-                // above still bound that lane; #5794's 51.2 MiB incident was a
-                // chat-lane text dump, which this band still refuses.
+                // session). Any TEXT-dominated parseable body above the ingest
+                // cost band is already ≥ ~8M tokens — beyond every real model
+                // window — so refuse it HERE, after decode (which can balloon
+                // 10:1) but before the sweep that costs the seconds. 0 disables
+                // the cap (legacy parse-everything).
+                //
+                // Image-bearing bodies are exempt on EVERY lane: base64 pixels
+                // are excluded from the token meter by design ("images billed
+                // separately, never doom on raw bytes" — #496/#1800/#857), so
+                // "over-band = over-window" does not hold for them. #3909's
+                // ~48 MiB image-dense chat requests and #3701's ~38.5 MiB
+                // WS-screenshot bodies are supported workloads governed by the
+                // slot budget, the receive cap and each lane's own shed /
+                // pre-send byte budget. The probe is a cheap substring gate,
+                // so the text-dump rejection (#5794's shape) stays parse-free.
                 const ingestCap = protocol === "responses" ? 0 : knobLimitsIngestBytes();
-                if (ingestCap > 0 && decoded.body.byteLength > ingestCap) {
+                if (ingestCap > 0 && decoded.body.byteLength > ingestCap
+                    && countImagesInRawBody(protocol, decoded.body) === 0) {
                     throw new IngestBodyTooLargeError(ingestCap, decoded.body.byteLength);
                 }
                 bodyBuffer = decoded.body;

@@ -59,14 +59,14 @@ function makeUpstream(): { server: http.Server; calls: Call[] } {
     return { server, calls };
 }
 
-function proxyOptions(routes: Record<string, object>): ProxyOptions {
+function proxyOptions(routes: Record<string, object>, window = WINDOW): ProxyOptions {
     return {
         port: 0,
         host: "127.0.0.1",
         upstream: "http://127.0.0.1",
         routes: routes as ProxyOptions["routes"],
-        modelContextLimit: WINDOW,
-        kernelConfig: defaultConfig(WINDOW, {
+        modelContextLimit: window,
+        kernelConfig: defaultConfig(window, {
             preserveRecentMessages: 2,
             preserveRecentTokens: 2000,
             compress: { minCompressRange: 1000, maxSummaryLength: 20000, minSummaryLength: 50 },
@@ -91,14 +91,14 @@ function proxyOptions(routes: Record<string, object>): ProxyOptions {
 
 type Ctx = { url: string; headers: Record<string, string> };
 
-async function setup(): Promise<{ ctx: Ctx; calls: Call[]; close: () => void }> {
+async function setup(window = WINDOW): Promise<{ ctx: Ctx; calls: Call[]; close: () => void }> {
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
     const { server: upstream, calls } = makeUpstream();
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
     const upstreamPort = (upstream.address() as { port: number }).port;
-    const proxy = await startServer(proxyOptions({ [`http://127.0.0.1:${upstreamPort}`]: { models: { "gpt-test": { context: WINDOW } } } }));
+    const proxy = await startServer(proxyOptions({ [`http://127.0.0.1:${upstreamPort}`]: { models: { "gpt-test": { context: window } } } }, window));
     await once(proxy, "listening");
     const proxyPort = (proxy.address() as { port: number }).port;
     return {
@@ -163,6 +163,41 @@ test("e2e #5794 control: a body under the ingest band is unaffected (the band mu
         assert.equal(under.status, 200, `30 KiB < the 1 MiB band must be accepted (got ${under.status})`);
         await under.text();
         assert.equal(calls.length, 1, "the under-band body reached the upstream");
+    } finally {
+        disarm();
+        await close();
+        rmrf(root);
+    }
+});
+
+test("e2e #5794 image doctrine: an over-band body carrying images is NOT refused at ingest (pixels never doom on raw bytes)", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "bili-5794c-"));
+    const disarm = armIngestBand();
+    // b64 pixels bill at ~1/4 token per char, so a ~1.6 MiB image body is
+    // ~400K tokens in token-space — over the file's 20K window but far under
+    // the 1M window this test arms. The point is the INGEST stage, not the
+    // token meter: an over-band IMAGE body must flow through to the upstream
+    // (governed by the slot budget / receive cap / lane shed), while an
+    // over-band TEXT body is refused before the sweep.
+    const { ctx, calls, close } = await setup(1_000_000);
+    try {
+        const b64 = Buffer.alloc(600 * 1024, 1).toString("base64"); // ~800 KB each
+        const r = await fetch(ctx.url, {
+            method: "POST",
+            headers: { ...ctx.headers },
+            body: JSON.stringify({
+                model: "gpt-test",
+                stream: true,
+                messages: [{ role: "user", content: [
+                    { type: "text", text: "what is in these?" },
+                    { type: "image_url", image_url: { url: `data:image/png;base64,${b64}` } },
+                    { type: "image_url", image_url: { url: `data:image/png;base64,${b64}` } },
+                ] }],
+            }),
+        });
+        const body = await r.text();
+        assert.equal(r.status, 200, `over-band IMAGE body must not be refused at ingest (got ${r.status}): ${body.slice(0, 300)}`);
+        assert.equal(calls.length, 1, "the image body reached the upstream — image mass is governed by the image lanes, not the byte band");
     } finally {
         disarm();
         await close();
