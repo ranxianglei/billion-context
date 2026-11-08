@@ -553,6 +553,24 @@ jobs:
           node-version: 22
       - run: node tools/gen-config-docs.mjs check-coverage
 
+  # #5930 architecture-docs guard (owner ruling 2026-11-08): the docs/architecture
+  # hub is LIVE — mechanical half of the same-PR doc rule. Checks: the
+  # reference/architecture.md file map covers every tracked src/ file (no missing,
+  # no ghosts); the hub module ledger rows match the page pairs (en + .zh-CN);
+  # every active module page links its svg-first diagram + png fallback (all
+  # present); every SVG is basic-well-formed (the en diagram once shipped broken
+  # by an unescaped '&'). Visual freshness is enforced by the same-PR rule in
+  # AGENTS.md + review, not here. Zero-dep: plain node, no install step.
+  architecture-docs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node tools/check-architecture-docs.mjs
+
   # #2643 config-surface guard: closes the two surfaces check-coverage above
   # does not reach — nested config-file leaf fields (only top-level keys were
   # enforced) and CLI --flags (never checked). An undocumented addition goes red

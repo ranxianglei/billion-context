@@ -8,6 +8,7 @@
 | 文档 | 说明 |
 |---|---|
 | [README](../README.md) / [English](../README.zh-CN.md) | 项目入口：是什么、快速上手、架构总览 |
+| [architecture](architecture.zh-CN.md) / [English](architecture.md) | **系统架构总览**（实时维护，owner 裁定 2026-11-08）：整体架构图 + 每模块一页（各配图），见 `docs/architecture/` |
 | [configuration](configuration.zh-CN.md) / [English](configuration.md) | 全量配置参考（由 `website/config-reference/*.yaml` 经 `tools/gen-config-docs.mjs` 生成；手写部分有漂移守卫） |
 | [clients](clients.zh-CN.md) / [English](clients.md) | 各客户端接入深潜：launcher / `/bili/` / 原生插件三种模式如何接线 |
 | [how-it-works](how-it-works.zh-CN.svg) / [English](how-it-works.en.svg) | 一张图：请求流转 + 注入的上下文工具 |
