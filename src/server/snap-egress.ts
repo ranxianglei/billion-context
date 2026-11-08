@@ -131,8 +131,8 @@ export function tripwireCompare(plane: BiliMessage[], legacy: BiliMessage[]): { 
         const b = normTuple(legacy[i]);
         for (let f = 0; f < a.length; f++) {
             if (a[f] !== b[f]) {
-                const head = (v: unknown) => JSON.stringify(String(v ?? "")).slice(0, 160);
-                return { ok: false, reason: `shape@${i}:${TRIPWIRE_FIELDS[f]}`, firstDiff: `${TRIPWIRE_FIELDS[f]} plane=${head(a[f])} legacy=${head(b[f])}` };
+                const head = (v: unknown) => JSON.stringify(String(v ?? "")).slice(0, 400);
+                return { ok: false, reason: `shape@${i}:${TRIPWIRE_FIELDS[f]}`, firstDiff: `${TRIPWIRE_FIELDS[f]} plane(len=${String(a[f] ?? "").length})=${head(a[f])} legacy(len=${String(b[f] ?? "").length})=${head(b[f])}` };
             }
         }
     }
