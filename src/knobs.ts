@@ -23,6 +23,7 @@
 import path from "node:path";
 import { stateDir } from "./paths.js";
 import { loadConfigFile } from "./config.js";
+import { log } from "./logger.js";
 import { parseDurationField } from "./duration.js";
 import { UPSTREAM_TIMEOUT_MS, REPLAY_MAX_ATTEMPTS, REPLAY_BASE_DELAY_MS } from "./fetch-util.js";
 import { PROXY_KEEPALIVE_MAX_MS } from "./upstream-proxy.js";
@@ -155,10 +156,21 @@ export function throttle429MaxDelayMs(): number {
  *  relays). Recognized KeyRing/bili-relay markers keep their own semantics in
  *  both modes; requests whose model cannot be identified stay
  *  credential-wide, so worst-case protection never widens beyond legacy.
- *  Read per settlement so the switch flips live. */
+ *  Read per settlement so the switch flips live. The value match is
+ *  EXACT ("model"/"credential", case-sensitive): anything else — a typo
+ *  like "models" or "Model" — silently falls back to "credential" with
+ *  only this warn (once per distinct misspelling) to say so. */
+let warnedThrottle429ScopeValues: Set<string> | undefined;
 export function throttle429Scope(): "credential" | "model" {
     const env = process.env.BILI_THROTTLE_429_SCOPE;
     const raw = env !== undefined && env !== "" ? env : fileNetwork().throttle429Scope;
+    if (raw !== "model" && raw !== "credential" && raw !== "" && raw !== undefined) {
+        warnedThrottle429ScopeValues ??= new Set<string>();
+        if (!warnedThrottle429ScopeValues.has(raw)) {
+            warnedThrottle429ScopeValues.add(raw);
+            log("warn", `[knobs] network.throttle429Scope: unrecognized value ${JSON.stringify(raw)} — expected exactly "credential" or "model"; falling back to "credential" (#5199). Unrecognized values never enable model-scoped holds.`);
+        }
+    }
     return raw === "model" ? "model" : "credential";
 }
 

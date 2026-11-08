@@ -2148,14 +2148,14 @@ test("#2924 gate `threw` persists: provably-oversized body refuses LOCALLY, ever
             // only 400 upstream.
             assert.equal(await gate(url, { bytes: 4_000_004 }), "refuse-oversized");
             assert.equal(localLines().length, 1, "one durable LOCAL-refusal line");
-            assert.match(localLines()[0]!, /attribution threw and body est ~1140002 tok \(the optimistic floor alone already exceeds the window\) vs window 1000000 \(declared 1000; never assumes below 1000000\)/);
+            assert.match(localLines()[0]!, /attribution threw and body est ~1,140,002 tok \(the optimistic floor alone already exceeds the window\) vs window 1,000,000 \(declared 1,000; never assumes below 1,000,000\)/);
             // #5613 calibrated tier: 4,000,000 B / 4 = 1M tok sits exactly ON
             // the bar in floor terms (not provably over), but ×1.14 →
             // 1,140,000 est > 1M — the measured billing bias says upstream
             // will reject it: refuse locally instead of riding #1117 into a
             // guaranteed 400.
             assert.equal(await gate(url, { bytes: 4_000_000 }), "refuse-oversized");
-            assert.match(localLines()[1]!, /est ~1140000 tok \(calibrated estimate over; the optimistic floor 1000000 tok still sits under it\)/);
+            assert.match(localLines()[1]!, /est ~1,140,000 tok \(calibrated estimate over; the optimistic floor 1,000,000 tok still sits under it\)/);
             // Calibrated boundary pins (bytes/4 floor × 1.14 against the 1M
             // bar): 3,508,768 B → floor 877,192 → est 999,999 ≤ 1M → still
             // DIRECT; 3,508,772 B → floor 877,193 → est 1,000,001 > 1M →
@@ -2214,13 +2214,13 @@ test("#4068 gate `none` oversize arm: an unattributed body that provably cannot 
             // (#4068's 6.16M-token send).
             assert.equal(await gate(url, { bytes: 4_000_004 }), "refuse-oversized-unattributed");
             assert.equal(localLines().length, 1, "one durable LOCAL-refusal line");
-            assert.match(localLines()[0]!, /unattributed body est ~1140002 tok \(the optimistic floor alone already exceeds the window\) vs window 1000000 \(declared 1000; never assumes below 1000000\)/);
+            assert.match(localLines()[0]!, /unattributed body est ~1,140,002 tok \(the optimistic floor alone already exceeds the window\) vs window 1,000,000 \(declared 1,000; never assumes below 1,000,000\)/);
             // #5613 calibrated tier, unattributed arm: floor exactly on the
             // bar, ×1.14 → 1,140,000 est over it → refused locally (this is
             // the exact class of send that bricked sessions in the field
             // while passing every old floor-only check).
             assert.equal(await gate(url, { bytes: 4_000_000 }), "refuse-oversized-unattributed");
-            assert.match(localLines()[1]!, /est ~1140000 tok \(calibrated estimate over; the optimistic floor 1000000 tok still sits under it\)/);
+            assert.match(localLines()[1]!, /est ~1,140,000 tok \(calibrated estimate over; the optimistic floor 1,000,000 tok still sits under it\)/);
             // Calibrated boundary pins (see the threw-arm twin above).
             assert.equal(await gate(url, { bytes: 3_508_768 }), false, "under the calibrated bar keeps #1117 direct semantics");
             assert.equal(await gate(url, { bytes: 3_508_772 }), "refuse-oversized-unattributed", "one more byte trips the calibrated bar");
