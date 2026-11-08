@@ -30,7 +30,7 @@ import { createHash } from "node:crypto";
 import { loadConfigFile, resolveMessageTimestamps } from "../config.js";
 import { getStore } from "../persist.js";
 import { isSnapPlaneDead, type SnapView } from "../storage/snap.js";
-import { safePrefix, safeSuffix } from "../text-safe.js";
+import { safePrefix, safeSuffix, scrubLoneSurrogates } from "../text-safe.js";
 import { identitySig } from "./snapshot-render.js";
 
 /** Same seam discipline as D-lane (#3756): the walk only touches the tail
@@ -141,9 +141,14 @@ export function tripwireCompare(plane: BiliMessage[], legacy: BiliMessage[]): { 
         const b = normTuple(legacy[i]);
         for (let f = 0; f < a.length; f++) {
             if (a[f] !== b[f]) {
+                const sa = String(a[f] ?? "");
+                const sb = String(b[f] ?? "");
+                let seam = 0;
+                while (seam < sa.length && seam < sb.length && sa[seam] === sb[seam]) seam++;
+                const win = (s: string) => scrubLoneSurrogates(JSON.stringify(s.slice(Math.max(0, seam - 60), seam + 160)));
                 const head = (v: unknown) => safePrefix(JSON.stringify(String(v ?? "")), 400);
                 const tail = (v: unknown) => safeSuffix(JSON.stringify(String(v ?? "")), 200);
-                return { ok: false, reason: `shape@${i}:${TRIPWIRE_FIELDS[f]}`, firstDiff: `${TRIPWIRE_FIELDS[f]} plane(len=${String(a[f] ?? "").length})=${head(a[f])} …tail=${tail(a[f])} | legacy(len=${String(b[f] ?? "").length})=${head(b[f])} …tail=${tail(b[f])}` };
+                return { ok: false, reason: `shape@${i}:${TRIPWIRE_FIELDS[f]}`, firstDiff: `${TRIPWIRE_FIELDS[f]} plane(len=${sa.length})=${head(a[f])} …seam@${seam}: plane=${win(sa)} legacy=${win(sb)} …tail=${tail(a[f])}|${tail(b[f])}` };
             }
         }
     }
@@ -259,7 +264,7 @@ export function buildSnapEgressView(
     view: SnapView,
     clientMsgs: BiliMessage[],
     state: CompressionState,
-): { ok: true; msgs: BiliMessage[]; tailCount: number } | { ok: false; reason: string } {
+): { ok: true; msgs: BiliMessage[]; tailCount: number; adopt: { paired: number; adopted: number; trimMiss: number; unpaired: number } } | { ok: false; reason: string } {
     if (!view.rows.length) return { ok: false, reason: "no-plane" };
 
     const rows: EgressRow[] = view.rows.map((r) => {
@@ -372,10 +377,12 @@ export function buildSnapEgressView(
     const d = joinRow + 1;
     let ci = 0;
     const clientText = new Map<number, string>();
+    const adopt = { paired: 0, adopted: 0, trimMiss: 0, unpaired: 0 };
     for (let i = 0; i < d && ci < clientJoin; i++) {
         const r = rows[i];
         if (suppressed(r)) continue;
         const planeText = r.msg!.text;
+        let hit = false;
         for (let k = ci; k < clientJoin; k++) {
             const c = clientMsgs[k];
             // Tool results carry no host-echoed message id (openai wire keys
@@ -384,12 +391,20 @@ export function buildSnapEgressView(
             const sameCall = typeof c.toolCallId === "string" && c.toolCallId === r.msg!.toolCallId;
             const paired = r.ids.has(c.id) || sameCall || sigOf(c) === sigOf(r.msg!);
             if (!paired) continue;
-            if (typeof c.text === "string" && typeof planeText === "string" && trimDerived(c.text, planeText)) {
-                clientText.set(i, c.text);
+            hit = true;
+            adopt.paired++;
+            if (typeof c.text === "string" && typeof planeText === "string") {
+                if (trimDerived(c.text, planeText)) {
+                    clientText.set(i, c.text);
+                    adopt.adopted++;
+                } else if (c.text !== planeText) {
+                    adopt.trimMiss++;
+                }
             }
             ci = k + 1;
             break;
         }
+        if (!hit && r.msg!.contentType === "tool-result" && typeof r.msg!.toolCallId === "string") adopt.unpaired++;
     }
     const merged: BiliMessage[] = [];
     let ai = 0;
@@ -406,7 +421,7 @@ export function buildSnapEgressView(
     while (ai < anchors.length) merged.push(anchors[ai++].msg);
     const tail = clientMsgs.slice(clientJoin);
     for (const m of tail) merged.push(m);
-    return { ok: true, msgs: merged, tailCount: tail.length };
+    return { ok: true, msgs: merged, tailCount: tail.length, adopt };
 }
 
 // ---------------------------------------------------------------------------
@@ -488,6 +503,7 @@ export function applySnapEgress(
     if (verdict.ok) {
         egressStats.cutover++;
         deps.log("info", `[snaplane] sid=${deps.sessionId} egress=cutover n=${planeProcessed.length} tail=${built.tailCount}`);
+        if (built.adopt.trimMiss + built.adopt.unpaired > 0) deps.log("info", `[snaplane] sid=${deps.sessionId} egress=adopt paired=${built.adopt.paired} adopted=${built.adopt.adopted} trimMiss=${built.adopt.trimMiss} unpaired=${built.adopt.unpaired}`);
         return planeProcessed;
     }
     egressStats.fallback++;
@@ -497,7 +513,7 @@ export function applySnapEgress(
         egressExcluded.add(deps.sessionId);
         deps.log("warn", `[snaplane] sid=${deps.sessionId} decision=dead:egress sticky exclude after ${n} mismatches (last: ${verdict.reason})`);
     } else {
-        deps.log("warn", `[snaplane] sid=${deps.sessionId} decision=red:egress:${verdict.reason} — legacy egress kept (${n}/${EGRESS_EXCLUDE_AFTER})${verdict.firstDiff ? ` — ${verdict.firstDiff}` : ""}`);
+        deps.log("warn", `[snaplane] sid=${deps.sessionId} decision=red:egress:${verdict.reason} — legacy egress kept (${n}/${EGRESS_EXCLUDE_AFTER})${verdict.firstDiff ? ` — ${verdict.firstDiff}` : ""} — adopt paired=${built.adopt.paired} adopted=${built.adopt.adopted} trimMiss=${built.adopt.trimMiss} unpaired=${built.adopt.unpaired}`);
     }
     return legacyProcessed;
 }
