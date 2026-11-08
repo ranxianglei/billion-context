@@ -261,6 +261,20 @@ export function createNativeRoute(state: NativeInterceptState, deps: OpencodeNat
         }
         warned = false;
         s.proxyBase = target;
+        if (target === INLINE_ORIGIN) {
+            // #5931: inline mode must NOT bake the pseudo-origin into the wire
+            // bytes. Hosts that pin their egress fetch before the chain is
+            // installed (opencode 2.2.6 / effect 4.1.0's cached Fetch
+            // reference) send the rewritten URL to real DNS and receive an
+            // HTML 302 where SSE belongs — every model request voided. Keep
+            // the real upstream URL intact instead: hosts that DO ride the
+            // chain get the identical `${origin}/bili/` target from the fetch
+            // intercept's own model branch (byte-identical engine input), and
+            // a bypassing host degrades to a direct uncompressed send rather
+            // than voiding. Spawn/attach targets are reachable loopback
+            // origins, so they keep baking the prefix as before.
+            return;
+        }
         replaceRequestTarget(e, `${target}/bili/${url}`);
     };
 }
@@ -465,12 +479,19 @@ export function _noteRoutedForTest(url: string): void {
     noteRoutedOrigin(state, url);
 }
 
+/** Test hook (#5931): hand out the module-level state object so suites can
+ *  bind the shared fetch intercept to it and observe chainEgressSeen. */
+export function _nativeStateForTest(): NativeInterceptState {
+    return state;
+}
+
 /** Test hook: reset the module-level state in place (closures capture the
  *  object reference) so suites can drive armNativeOpencode repeatedly. */
 export function _resetNativeStateForTest(): void {
     state.attach = undefined;
     state.origin = undefined;
     state.routedOrigin = undefined;
+    state.chainEgressSeen = undefined;
     state.onRoutedOriginObserved = undefined;
     state.respawn = undefined;
     state.onGiveUp = undefined;
@@ -980,6 +1001,15 @@ export async function maybeIncrementalOpencode(e: V2HttpRequestEvent, s: V2State
         const base = s.proxyBase;
         const req = e.request as Request | undefined;
         if (!sid || !base || req === undefined || typeof req.clone !== "function") return;
+        // #5931: the swap produces lane-only bytes (the incremental envelope)
+        // that ONLY bili understands. A host whose egress bypasses the
+        // patched fetch would deliver them to the raw upstream — a guaranteed
+        // 400 retry loop. Gate on observed chain egress: a working host's
+        // first chain-carried response sets the flag before its next turn's
+        // hook runs (cost: one deferred seed turn per session), and a
+        // bypassing host stays on safe full resends. Spawn/attach bases are
+        // reachable without the chain, so they never consult the flag.
+        if (base === INLINE_ORIGIN && state.chainEgressSeen !== true) return;
         const url = req.url;
         sweepStale(incPendingOpencode, INC_PENDING_TTL_MS);
         // #3304: keep the ORIGINAL body string — stashed under the turn id
