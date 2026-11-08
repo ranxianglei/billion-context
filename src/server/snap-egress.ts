@@ -191,8 +191,58 @@ interface EgressRow {
 }
 
 interface AnchorSeed {
-    anchorPos: number; // max covered pos of the block
+    insertAt: number; // adjusted full-list row index (prune pairing parity)
     msg: BiliMessage;
+}
+
+/** prune.ts pairing parity: an anchor takes the EARLIEST covered message's
+ *  position, then moves back to the assistant-run start / past the paired
+ *  tool result so it never splits a wire-validated unit. Walks the FULL row
+ *  list — covered rows are still present there (same reasoning as prune:
+ *  covered cores between wire-relevant cores are dropped and the runs merge). */
+function pairSafeAnchorIndex(rows: EgressRow[], earliest: number): number {
+    const n = rows.length;
+    const at = (i: number) => rows[i].msg;
+    // runStart: start of the maximal consecutive assistant-role run containing i.
+    const runStart = new Int32Array(n).fill(-1);
+    for (let i = 0; i < n;) {
+        if (at(i)?.role !== "assistant") { i++; continue; }
+        let j = i;
+        while (j + 1 < n && at(j + 1)?.role === "assistant") j++;
+        for (let k = i; k <= j; k++) runStart[k] = i;
+        i = j + 1;
+    }
+    // prefixEnd[i]: farthest (first result index of an assistant tool-call
+    // before i) + 1.
+    const resultIndexByCallId = new Map<string, number>();
+    for (let i = 0; i < n; i++) {
+        const m = at(i);
+        if (m?.contentType === "tool-result" && typeof m.toolCallId === "string" && !resultIndexByCallId.has(m.toolCallId)) {
+            resultIndexByCallId.set(m.toolCallId, i);
+        }
+    }
+    const prefixEnd = new Int32Array(n + 1);
+    for (let i = 0; i < n; i++) {
+        const m = at(i);
+        let end = 0;
+        if (m?.role === "assistant" && m.contentType === "tool-call" && typeof m.toolCallId === "string") {
+            const r = resultIndexByCallId.get(m.toolCallId);
+            if (r !== undefined) end = r + 1;
+        }
+        prefixEnd[i + 1] = Math.max(prefixEnd[i]!, end);
+    }
+    let safe = earliest;
+    if (safe > 0 && safe < n) {
+        const start = runStart[safe]!;
+        if (start >= 0 && at(safe - 1)?.role === "assistant") safe = start;
+    }
+    if (safe < 0 || safe > n) return safe;
+    for (let guard = 0; guard < n; guard++) {
+        const next = Math.max(safe, prefixEnd[safe]!);
+        if (next === safe) break;
+        safe = next;
+    }
+    return safe;
 }
 
 /** renderSummary parity (kernel/src/prune.ts): topic header line + body. */
@@ -232,19 +282,22 @@ export function buildSnapEgressView(
     const anchors: AnchorSeed[] = [];
     for (const b of state.blocks) {
         if (!b.active) continue;
-        let maxPos = -1;
+        let minPos = -1;
         let any = false;
         for (const id of b.effectiveMessageIds) {
             const p = posById.get(id);
             if (p === undefined) continue;
             any = true;
             coveredPos.add(p);
-            if (p > maxPos) maxPos = p;
+            if (minPos === -1 || p < minPos) minPos = p;
         }
         if (!any) return { ok: false, reason: "block-unanchored" };
-        anchors.push({ anchorPos: maxPos, msg: renderAnchor(b) });
+        // The summary takes the EARLIEST covered message's position (prune
+        // semantics), adjusted past pairing boundaries over the FULL row list.
+        const firstRow = rows.findIndex((r) => r.pos === minPos);
+        anchors.push({ insertAt: pairSafeAnchorIndex(rows, Math.max(firstRow, 0)), msg: renderAnchor(b) });
     }
-    anchors.sort((a, b) => a.anchorPos - b.anchorPos);
+    anchors.sort((a, b) => a.insertAt - b.insertAt);
 
     // Plane-retired rows (delete events, #3285 sweep) never render either.
     const suppressed = (r: EgressRow): boolean => r.msg === null || coveredPos.has(r.pos);
@@ -306,18 +359,43 @@ export function buildSnapEgressView(
         if (run < MIN_SEAM_RUN) return { ok: false, reason: "seam-too-short" };
     }
 
-    // Assemble: prefix rows[0..d) minus suppressed, anchors before the first
-    // surviving row past their coverage, then the client tail verbatim.
+    // Assemble: prefix rows[0..d) minus suppressed, each block's anchor at
+    // its pair-safe position over the full row list, then the client tail
+    // verbatim. Hosts legitimately TRIM bulky old tool results in their
+    // resends (the kernel passes the trimmed text through — that is what the
+    // legacy egress serves); a paired resend whose text is a strict PREFIX of
+    // the plane's stored text is adopted so the plane egress serves the same
+    // trimmed bytes. Anything else (edits, expansions) stays plane-sourced
+    // and the byte-strict tripwire judges the divergence.
     const d = joinRow + 1;
+    let ci = 0;
+    const clientText = new Map<number, string>();
+    for (let i = 0; i < d && ci < clientJoin; i++) {
+        const r = rows[i];
+        if (suppressed(r)) continue;
+        const planeText = r.msg!.text;
+        for (let k = ci; k < clientJoin; k++) {
+            const c = clientMsgs[k];
+            const paired = r.ids.has(c.id) || sigOf(c) === sigOf(r.msg!);
+            if (!paired) continue;
+            if (typeof c.text === "string" && typeof planeText === "string" && planeText.startsWith(c.text)) {
+                clientText.set(i, c.text);
+            }
+            ci = k + 1;
+            break;
+        }
+    }
     const merged: BiliMessage[] = [];
     let ai = 0;
     for (let i = 0; i < d; i++) {
+        while (ai < anchors.length && anchors[ai].insertAt <= i) merged.push(anchors[ai++].msg);
         const r = rows[i];
-        while (ai < anchors.length && anchors[ai].anchorPos < r.pos) merged.push(anchors[ai++].msg);
         if (suppressed(r)) continue;
         const out = r.msg!;
-        if (out.ledgerSeq === undefined) out.ledgerSeq = r.pos + 1; // 1-based ledgerSeq stamp (D-lane parseRow parity)
-        merged.push(out);
+        const trimmed = clientText.get(i);
+        const base: BiliMessage = trimmed === undefined ? out : ({ ...out, text: trimmed } as BiliMessage);
+        if (base.ledgerSeq === undefined) base.ledgerSeq = r.pos + 1; // 1-based ledgerSeq stamp (D-lane parseRow parity)
+        merged.push(base);
     }
     while (ai < anchors.length) merged.push(anchors[ai++].msg);
     const tail = clientMsgs.slice(clientJoin);
