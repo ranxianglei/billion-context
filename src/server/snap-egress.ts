@@ -41,7 +41,7 @@ const EGRESS_EXCLUDE_AFTER = 3;
 
 export type SnapEgressProtocol = "openai" | "anthropic" | "google" | "responses";
 
-export interface SnapEgressDeps {
+interface SnapEgressDeps {
     sessionId: string;
     protocol: SnapEgressProtocol;
     log: (level: string, msg: string) => void;
@@ -78,7 +78,7 @@ const fallbackCounts = new Map<string, number>();
 const degradeReasons = new Map<string, number>();
 const egressStats = { cutover: 0, fallback: 0, planeMiss: 0 };
 
-export interface SnapEgressStatusWire {
+interface SnapEgressStatusWire {
     cutover: number;
     fallback: number;
     planeMiss: number;
