@@ -71,7 +71,7 @@ function hasBuildContextEntries(ctx: unknown): boolean {
 // #2230 config-home: map the `pi.subagents` section of billion-context.json
 // onto the package's adapter shape. Mirrors the package's
 // piSubagentsToAdapter deliberately — no shared code across the two loaders;
-// the FILE FORMAT (documented in CONFIGURATION.md) is the contract. Renames:
+// the FILE FORMAT (documented in docs/configuration.md) is the contract. Renames:
 // `prompt` replaces acp.json's delegatePrompt; `debug` is scoped to the
 // sub-agent subsystem (the top-level proxy `debug` is untouched).
 export function piSubagentsAdapter(section: PiSubagentsFileConfig | boolean): SubagentsAdapterConfig {

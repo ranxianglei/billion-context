@@ -249,7 +249,7 @@ export const MESSAGES: Record<Locale, Record<string, string>> = {
         "conflict.dismiss": "不再提示",
         "conflict.dismissed": "已不再提示；出现新的冲突事件时会再次提醒",
         // #2219: per-client remediation — one actionable line per client; text
-        // mirrors the doc anchors (README opencode / CONFIGURATION.md claude +
+        // mirrors the doc anchors (README opencode / docs/configuration.md claude +
         // BILI_CODEX_COMPACT / pi·omp 接管证据 #851/#1382), full matrix in the docs.
         "conflict.hint_label": "处置方法（按客户端）：",
         "conflict.hint.opencode": "opencode：在 opencode 配置里设 \"compaction\": { \"auto\": false }，或用 bili opencode / bili plugin install opencode（会自动设置）",
@@ -259,7 +259,7 @@ export const MESSAGES: Record<Locale, Record<string, string>> = {
         "conflict.hint.omp": "omp：bili 扩展在接管会话时会自动取消客户端原生自动压缩——仍出现说明缺少接管证据或版本过旧，请报告客户端与 bili 版本",
         "conflict.hint.generic": "关闭客户端自身的自动压缩（或让本会话绕过 bili），然后开新会话——台账按会话隔离，旧记录随旧会话消失",
         "conflict.hint_more": "另有 {n} 个客户端，详见下方 Sessions 页",
-        "conflict.docs": "完整矩阵：CONFIGURATION.md「Detecting other compression plugins (#1206)」",
+        "conflict.docs": "完整矩阵：docs/configuration.md「Detecting other compression plugins (#1206)」",
         "advisory.on": "严重缺陷公告",
         "advisory.desc": "：当前版本存在重大缺陷，bili 正在自动升级到安全版本。原因：",
         "advisory.hint": "。若未自动完成，请手动执行：",
@@ -669,7 +669,7 @@ export const MESSAGES: Record<Locale, Record<string, string>> = {
         "cfg.q_wm_custom": "配置里写了自定义值（百分比/对象），以下方原始 JSON 编辑器为准。",
         "cfg.q_mitm": "MITM 解密域名，逗号分隔（mitm.domains）",
         "cfg.q_more": "更多配置（完整字段说明）",
-        "cfg.q_more_url": "https://github.com/ranxianglei/billion-context/blob/master/CONFIGURATION.zh-CN.md",
+        "cfg.q_more_url": "https://github.com/ranxianglei/billion-context/blob/master/docs/configuration.zh-CN.md",
         "cfg.q_mitm_ph": "api.anthropic.com, open.bigmodel.cn",
         "cfg.state_reached": "HTTP {status} · 可达（认证由客户端负责）",
         "cfg.saved": "已保存到配置文件 ✓",
@@ -995,7 +995,7 @@ export const MESSAGES: Record<Locale, Record<string, string>> = {
         "conflict.dismiss": "Don't show again",
         "conflict.dismissed": "Dismissed — the banner re-arms if a new conflict event lands",
         // #2219: per-client remediation — one actionable line per client; text
-        // mirrors the doc anchors (README opencode / CONFIGURATION.md claude +
+        // mirrors the doc anchors (README opencode / docs/configuration.md claude +
         // BILI_CODEX_COMPACT / pi·omp carriage evidence #851/#1382), full matrix in the docs.
         "conflict.hint_label": "What to do (per client):",
         "conflict.hint.opencode": "opencode: set \"compaction\": { \"auto\": false } in your opencode config (or use bili opencode / bili plugin install opencode, which set it for you)",
@@ -1005,7 +1005,7 @@ export const MESSAGES: Record<Locale, Record<string, string>> = {
         "conflict.hint.omp": "omp: the bili extension cancels the client's native auto-compaction while it carries the conversation — seeing this suggests missing carriage evidence or an old version; report client + bili version",
         "conflict.hint.generic": "disable the client's own auto-compaction (or route this session around bili), then start a fresh session — the ledger is per-session, so old entries clear with the old session",
         "conflict.hint_more": "{n} more client(s) — see the Sessions page below",
-        "conflict.docs": "full matrix: CONFIGURATION.md → \"Detecting other compression plugins (#1206)\"",
+        "conflict.docs": "full matrix: docs/configuration.md → \"Detecting other compression plugins (#1206)\"",
         "advisory.on": "Critical defect advisory",
         "advisory.desc": ": the current version has a major defect; bili is upgrading it automatically to a safe version. Reason:",
         "advisory.hint": ". If it did not complete automatically, run manually:",
@@ -1415,7 +1415,7 @@ export const MESSAGES: Record<Locale, Record<string, string>> = {
         "cfg.q_wm_custom": "A custom value (percent/object) is set in your config — the raw JSON editor below is authoritative.",
         "cfg.q_mitm": "MITM decrypt domains, comma-separated (mitm.domains)",
         "cfg.q_more": "More configuration (full field reference)",
-        "cfg.q_more_url": "https://github.com/ranxianglei/billion-context/blob/master/CONFIGURATION.md",
+        "cfg.q_more_url": "https://github.com/ranxianglei/billion-context/blob/master/docs/configuration.md",
         "cfg.q_mitm_ph": "api.anthropic.com, open.bigmodel.cn",
         "cfg.state_reached": "HTTP {status} · reachable (auth handled by the client)",
         "cfg.saved": "Saved to config file ✓",
