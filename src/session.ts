@@ -794,7 +794,7 @@ type AnonymousPrefixAffinityStamp = {
 // FORK_FAILED). Function fields are re-resolved at read time: effectiveConfig()
 // merges over the base kernelConfig, which carries them again (isToolProtected
 // #2578; isMessageProtected re-resolves from the lane id below).
-export function storeEffectiveConfig(session: Session, config: Config): void {
+export function storeEffectiveConfig(session: Session, config: Config, sourceEpoch?: string): void {
     const cloneSafe: Record<string, unknown> = { ...config };
     for (const key of Object.keys(cloneSafe)) {
         if (typeof cloneSafe[key] === "function") delete cloneSafe[key];
@@ -803,15 +803,27 @@ export function storeEffectiveConfig(session: Session, config: Config): void {
     // #2960⑥: identity of the config source this snapshot was resolved from.
     // effectiveConfig() refuses the snapshot when the source has moved on
     // (file edited, different BILI_CONFIG_FILE lane) — see the reader below.
-    session.metadata["effectiveConfigEpoch"] = configFileEpoch();
+    // #5930: callers pass the epoch of the generation the snapshot was ACTUALLY
+    // resolved from (opts.configSourceEpoch, captured where options loaded) —
+    // never the live hash at store time: a direct file edit between the options
+    // refresh and this request used to mint a fresh stamp onto a pre-edit
+    // snapshot, so the guard could never fire until a reload/restart. Unknown
+    // source identity (no epoch passed) stamps nothing — such snapshots keep
+    // the legacy behavior rather than claiming a freshness they cannot prove.
+    if (typeof sourceEpoch === "string" && sourceEpoch.length > 0) {
+        session.metadata["effectiveConfigEpoch"] = sourceEpoch;
+    }
 }
 
 /** True when the session's effectiveConfig stamp was resolved from a config
  *  source that no longer matches the live file (file edited since the last
  *  wire request, or a different lane's file whose content diverged — the
  *  epoch is a content hash, so byte-identical files validate across
- *  instances). Stamps without an epoch predate the guard and keep the legacy
- *  behavior (stamp wins). */
+ *  instances). #5930: the stamp is the options-generation the snapshot was
+ *  built from (captured at loadOptions / Apply / reload time), so a direct
+ *  file edit goes stale even though no request re-resolved anything. Stamps
+ *  without an epoch predate the guard and keep the legacy behavior
+ *  (stamp wins). */
 function staleEffectiveStamp(session: Session | undefined): boolean {
     const stamped = session?.metadata?.["effectiveConfigEpoch"];
     return typeof stamped === "string" && stamped !== configFileEpoch();
