@@ -4720,6 +4720,17 @@ function formatBytes(n: number): string {
 // ~3k msgs. Wall clock IS the cost; the info line above keeps reporting the
 // count for correlation.
 const SLOW_SESSION_MS_WARN = 1000;
+// #5907 follow-up: the warn fires ONCE per session per process — a 3k-msg
+// session exceeds the wall budget on EVERY turn, so re-logging each turn
+// floods the log while adding nothing; the first occurrence carries the full
+// size picture (msgs + inbound + est tokens) plus the cleanup command. The
+// map is bounded: past the cap the earliest-warned session is evicted so a
+// long-lived proxy with many sessions cannot grow it without bound.
+const SLOW_SESSION_WARNED = new Map<string, number>();
+const MAX_SLOW_SESSION_WARNED = 512;
+export function _resetSlowSessionWarnedForTest(): void {
+    SLOW_SESSION_WARNED.clear();
+}
 export function logRequestCost(log: (level: string, msg: string) => void, sessionId: string, msgs: number | null, inboundBytes: number, t0: number, outbound?: string | Buffer): void {
     const ms = Math.max(0, Math.round(performance.now() - t0));
     const outboundField = outbound !== undefined ? `, outbound=${formatBytes(Buffer.byteLength(outbound))}` : "";
@@ -4728,8 +4739,17 @@ export function logRequestCost(log: (level: string, msg: string) => void, sessio
     // #5408: this line is THE observation point — a hot-at-attach session that
     // never produces one is silent compression loss (the incident signature).
     noteRequest(sessionId);
-    if (ms > SLOW_SESSION_MS_WARN) {
-        log("warn", `[${sessionId}] slow-session: ${msgs ?? "?"} msgs / inbound=${formatBytes(inboundBytes)} took local=${ms}ms — synchronous per-turn work is starving the event loop (#4528/#5744); consider closing/restarting the session or enabling compression`);
+    if (ms > SLOW_SESSION_MS_WARN && !SLOW_SESSION_WARNED.has(sessionId)) {
+        SLOW_SESSION_WARNED.set(sessionId, ms);
+        while (SLOW_SESSION_WARNED.size > MAX_SLOW_SESSION_WARNED) {
+            const oldest = SLOW_SESSION_WARNED.keys().next().value;
+            if (oldest === undefined) break;
+            SLOW_SESSION_WARNED.delete(oldest);
+        }
+        // bytes/4 is the repo-wide optimistic token floor (same caliber as the
+        // oversize gates) — labeled est because JSON overhead skews it high.
+        const estTok = Math.round(inboundBytes / 4);
+        log("warn", `[${sessionId}] slow-session: ${msgs ?? "?"} msgs / inbound=${formatBytes(inboundBytes)} (~${estTok} est tok) took local=${ms}ms — synchronous per-turn work is starving the event loop (#4528/#5744); the session has grown large — consider \`bili sessions rm ${sessionId}\` or enabling compression (#5907)`);
     }
 }
 
