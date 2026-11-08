@@ -149,6 +149,49 @@ test("slow response trips the fetch timeout and falls back", async () => {
     assert.match(getRemoteNoticesState().lastError ?? "", /\S+/, "timeout surfaced as a recorded error");
 });
 
+test("oversized feed is bounded while STREAMING, not after full buffering", async () => {
+    _resetRemoteNoticesForTest();
+    fs.rmSync(snapshotFile, { force: true });
+    // Seed a last-good copy so the oversized push has something to fall back to.
+    const good = [REC()];
+    let s = await serve((res) => res.end(doc(good)));
+    await runRemoteNoticesCheck({ remoteAnnouncementsUrl: s.url, log: () => {} }, true);
+    await s.close();
+
+    // A hostile/lying feed: ~4 MiB of junk with NO Content-Length, dripped in
+    // 64 KiB chunks one every 15 ms. Pre-fix, res.text() materialized ALL of
+    // it before the 512 KiB bound could fire; the capped reader must abandon
+    // the stream shortly past the budget instead.
+    const CHUNK = 64 * 1024;
+    const TOTAL_CHUNKS = 64; // 4 MiB
+    const BUDGET_BYTES = 512 * 1024;
+    let sentBytes = 0;
+    s = await serve(async (res) => {
+        let open = true;
+        res.on("close", () => { open = false; });
+        const chunk = "x".repeat(CHUNK);
+        for (let i = 0; i < TOTAL_CHUNKS && open; i++) {
+            res.write(chunk);
+            sentBytes += CHUNK;
+            if (i < TOTAL_CHUNKS - 1) await new Promise((r) => setTimeout(r, 15));
+        }
+        if (open) res.end();
+    });
+    try {
+        await runRemoteNoticesCheck({ remoteAnnouncementsUrl: s.url, timeoutMs: 8000, log: () => {} }, true);
+        assert.equal(visibleRemoteRecords().length, 1, "oversized push keeps last-good copy");
+        assert.match(getRemoteNoticesState().lastError ?? "", /exceeds/, "size bound surfaced as a recorded error");
+    } finally {
+        await s.close();
+    }
+    // The drip (15 ms/chunk) keeps the server within a few chunks of the
+    // client's read position, so "sent" is an honest proxy for what was
+    // transferred: pre-fix this equals 4 MiB; post-fix it stops just past
+    // the 512 KiB budget plus in-flight/chunk-detection slack (~6 chunks).
+    assert.ok(sentBytes <= BUDGET_BYTES + 6 * CHUNK,
+        `client abandoned the stream early (server sent ${sentBytes} of ${TOTAL_CHUNKS * CHUNK} bytes)`);
+});
+
 test("merging: local shadows remote on equal id; both shadow builtins; priority orders", () => {
     _resetRemoteNoticesForTest();
     fs.rmSync(snapshotFile, { force: true });

@@ -71,6 +71,21 @@ const dispatchDepth = new AsyncLocalStorage<number>();
 const chainHop = new AsyncLocalStorage<unknown>();
 let warnedReentry = false;
 
+/** #5614: run `operation` with BOTH re-entry stores cleared, regardless of the
+ *  surrounding async context. AsyncLocalStorage values persist in ANY callback
+ *  minted inside a `.run()` scope even after that fetch has settled — so a NEW
+ *  model operation whose transport callbacks were created during an earlier
+ *  fetch inherits a stale `dispatchDepth` (plus a non-matching `chainHop`) and
+ *  its first request lands in the depth-1 / depth->=2 branches above, skipping
+ *  `dispatchBody` (the compression entry) and going direct/uncompressed.
+ *  `.exit()` restores "outside any dispatch" for the operation's OWN subtree
+ *  only: the enclosing context (a parent re-entry, a concurrent sibling) is
+ *  untouched, so #1662's foreign-wrapper cutoff still fires INSIDE each
+ *  single-fetch descent and resumes on return. */
+export function runOutsideFetchChain<R>(operation: () => R): R {
+    return dispatchDepth.exit(() => chainHop.exit(operation));
+}
+
 /** #1410: the dead-closure signature. A wrapper whose owner nulled its
  *  closure locals dies exactly like this ("baseFetch is not a function").
  *  Network failures NEVER match: undici throws "fetch failed", provider SDKs
