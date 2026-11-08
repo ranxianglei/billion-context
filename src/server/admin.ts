@@ -501,7 +501,7 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
         return;
     }
 
-    // Cooperative plugin protocol (see src/plugin.ts + PLUGIN.md): the
+    // Cooperative plugin protocol (see src/plugin.ts + docs/plugin-protocol.md): the
     // manifest serves the exact tool schemas the wire injector uses, and the
     // tool endpoint lets an agent-side plugin execute compress/decompress/
     // search_context/acp_status against the session the plugin drives. Both
@@ -598,7 +598,7 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
     // #3901/#3463: unified-storage GC — age-sweep archive + zero-ref
     // collection + optional vacuum. Loopback-gated like every /__bili/
     // route; 501 in legacy mode (same discipline as /__bili/replicas).
-    // #3901 review: the documented form is `?vacuum=full` (CONFIGURATION.md /
+    // #3901 review: the documented form is `?vacuum=full` (docs/configuration.md /
     // issue spec), but exact-match routing dropped any query string — accept
     // both, query wins over body.
     if (req.method === "POST" && (req.url === "/__bili/storage/gc" || req.url?.startsWith("/__bili/storage/gc?"))) {

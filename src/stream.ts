@@ -534,7 +534,7 @@ export function summaryFingerprintLogLine(blockId: string, summary: string): str
 }
 
 // #1718: m.id is a DETERMINISTIC content hash (deriveMessageId: sha256 over
-// role|contentType|toolCallId|toolName|text, see MESSAGE-IDENTITY.md) — logging
+// role|contentType|toolCallId|toolName|text, see docs/message-identity.md) — logging
 // it raw lets identical messages be correlated across sessions/runs/machines
 // and enables offline guessing against low-entropy content. Salt with a
 // per-process random value: joins within one run still work, cross-run

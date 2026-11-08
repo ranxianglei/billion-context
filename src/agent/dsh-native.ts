@@ -669,7 +669,7 @@ function refreshModelInfo(origin: string | undefined, target?: { provider: strin
                 // #2904: forwarded verbatim from the host's defaultMaxTokens — bili never
                 // guesses. An undeclared custom model yields undefined here, emptying the
                 // ceiling chain (poisoned high-water, max-tokens truncation); fix home is
-                // DSH-side (report its configured default). See TECHNICAL-NOTES.md.
+                // DSH-side (report its configured default). See docs/technical-notes.md.
                 maxOutput: typeof info?.defaultMaxTokens === "number" && info.defaultMaxTokens > 0 ? Math.floor(info.defaultMaxTokens) : undefined,
             });
             evictModelInfoEntries();
@@ -1134,6 +1134,23 @@ function maybeRetry(ctx: PluginContext): void {
         return;
     }
     void registerTools(ctx).catch(() => {});
+}
+
+/** #4134: resolves once the ACP tools are registered (toolsReady), the
+ * register has given up (dead), or 2s elapse — whichever first. Polls the
+ * register flag instead of threading a deferred through every landing path
+ * (respawn → origin → manifest → register, plus the recovery timer): cheap
+ * (25ms ticks, bounded 80 of them), and every terminal state already flips
+ * one of the two flags. */
+function registerArmed(): Promise<void> {
+    return new Promise((resolve) => {
+        const startedAt = Date.now();
+        const poll = () => {
+            if (register.toolsReady || register.dead || Date.now() - startedAt > 2000) resolve();
+            else setTimeout(poll, 25);
+        };
+        poll();
+    });
 }
 
 // #1158 L2: three-state attribution for the takeover gate. The old bare catch
@@ -1872,7 +1889,7 @@ async function maybeRecallBeforeSend(ctx: PluginContext, url: string, init: Requ
     init.headers = headers;
 }
 
-export function apply(ctx: PluginContext): void {
+export async function apply(ctx: PluginContext): Promise<void> {
     const plan = planNativeDsh(process.env);
     if (plan.mode === "off") return;
     // #3616: a fresh activation is a fresh origin world — in-flight recoveries
@@ -2800,9 +2817,9 @@ export function apply(ctx: PluginContext): void {
         webProfileWarned = true;
         if (gap !== null) {
             // #3806/#5686: overlay failed to latch -> boot-time alarm on ANY profile shape.
-            persistClientEvent(`profile${isWeb ? " bundles include @deepseek-ai/dsh-web-app and" : bundles === undefined ? " shape could not be introspected (older dsh build) and" : " (non-web-app bundle list) and"} the load-time compaction-disable overlay (#3354) could not latch on this dsh build (${gap}) — dsh native auto-compaction is likely ARMED here. bili's wire-level refusal (#1729) refuses routed compaction calls but CANNOT stop dsh writing its checkpoint locally, so a landed checkpoint will destroy the compression substrate and surface later as a 'compression conflict' banner. Apply the #2474 full-snapshot override of preset-standard in your profile's cordis.patch.yml now (a partial snippet silently drops everything not restated; see CONFIGURATION.md)`);
+            persistClientEvent(`profile${isWeb ? " bundles include @deepseek-ai/dsh-web-app and" : bundles === undefined ? " shape could not be introspected (older dsh build) and" : " (non-web-app bundle list) and"} the load-time compaction-disable overlay (#3354) could not latch on this dsh build (${gap}) — dsh native auto-compaction is likely ARMED here. bili's wire-level refusal (#1729) refuses routed compaction calls but CANNOT stop dsh writing its checkpoint locally, so a landed checkpoint will destroy the compression substrate and surface later as a 'compression conflict' banner. Apply the #2474 full-snapshot override of preset-standard in your profile's cordis.patch.yml now (a partial snippet silently drops everything not restated; see docs/configuration.md)`);
         } else if (isWeb) {
-            persistClientEvent("profile bundles include @deepseek-ai/dsh-web-app — its agent presets run their own compaction-basic in nested rows no patch layer can address by id (#1772/#2360); bili disables those preset rows at load time via a vendored overlay (deshark42/dsh-compaction-basic-disable, MIT, #3354; since #4147 the match is structural, covering custom presets too), so dsh native auto-compaction stays OFF in this profile (ACP compression unaffected). If you still see a dsh compaction checkpoint land on a newer/older dsh build — the overlay rides cordis' INTERNAL 'internal/config' hook and is version-sensitive — fall back to the #2474 full-snapshot override of preset-standard in your profile's cordis.patch.yml (a partial snippet silently drops everything not restated; see CONFIGURATION.md)." + gateCoverageSuffix());
+            persistClientEvent("profile bundles include @deepseek-ai/dsh-web-app — its agent presets run their own compaction-basic in nested rows no patch layer can address by id (#1772/#2360); bili disables those preset rows at load time via a vendored overlay (deshark42/dsh-compaction-basic-disable, MIT, #3354; since #4147 the match is structural, covering custom presets too), so dsh native auto-compaction stays OFF in this profile (ACP compression unaffected). If you still see a dsh compaction checkpoint land on a newer/older dsh build — the overlay rides cordis' INTERNAL 'internal/config' hook and is version-sensitive — fall back to the #2474 full-snapshot override of preset-standard in your profile's cordis.patch.yml (a partial snippet silently drops everything not restated; see docs/configuration.md)." + gateCoverageSuffix());
         } else if (bundles !== undefined && !nonWebTraceLogged) {
             // #3651: the web-profile note above is the ONLY confirmation that
             // the #3354 overlay took effect, and it is scoped to dsh-web-app
@@ -2811,7 +2828,7 @@ export function apply(ctx: PluginContext): void {
             // trace so a field log can tell "overlay registered" from "profile
             // shape unconfirmed".
             nonWebTraceLogged = true;
-            persistClientEvent("profile bundles do not include @deepseek-ai/dsh-web-app — the #3354 load-time compaction-disable middleware is registered anyway (it rewrites any entry's nested compaction-basic/command-compact rows through cordis' version-sensitive internal 'internal/config' hook, covering custom presets as of #4147), but no web-profile disable note applies here; if dsh native auto-compaction still lands in this profile, apply the #2474 full-snapshot override of preset-standard (CONFIGURATION.md) — and note the #1729 wire guard now refuses such native compaction calls unconditionally (the #2028 allowDshCompaction opt-in was removed in #3651)." + gateCoverageSuffix());
+            persistClientEvent("profile bundles do not include @deepseek-ai/dsh-web-app — the #3354 load-time compaction-disable middleware is registered anyway (it rewrites any entry's nested compaction-basic/command-compact rows through cordis' version-sensitive internal 'internal/config' hook, covering custom presets as of #4147), but no web-profile disable note applies here; if dsh native auto-compaction still lands in this profile, apply the #2474 full-snapshot override of preset-standard (docs/configuration.md) — and note the #1729 wire guard now refuses such native compaction calls unconditionally (the #2028 allowDshCompaction opt-in was removed in #3651)." + gateCoverageSuffix());
         }
     }
 
@@ -2831,6 +2848,19 @@ export function apply(ctx: PluginContext): void {
     // node:test drives apply() directly with a mock ctx — never patch
     // globalThis.fetch from inside a test run.
     if (process.env.NODE_TEST_CONTEXT === undefined) installNativeFetchIntercept(state);
+
+    // #4134: hold activation until the ACP tool registration has landed (or
+    // is provably not coming / 2s cap). The host composes each model round
+    // from the CURRENTLY registered tool set, so a fire-and-forget
+    // registration let round 1 fly with the stock tools while round 2
+    // recomposed with the ACP tools + their system sections — busting the
+    // whole prefix cache once per fresh session (and on any resume that
+    // races a slow boot). Awaited here so activation covers the first round
+    // too; bounded so a hung proxy spawn can never stall plugin load.
+    // Tests drive registration explicitly via _spawnForTest — skip the wait
+    // under NODE_TEST_CONTEXT (a mock apply() with no spawn armed would
+    // otherwise burn the full 2s cap on every call).
+    if (process.env.NODE_TEST_CONTEXT === undefined) await registerArmed();
 }
 
 /** Test hook: reset the module-level registration lifecycle so suites can

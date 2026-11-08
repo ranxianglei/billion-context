@@ -519,7 +519,7 @@ async function handleRequest(
         credHeaders: earlyHoldCredHeaders(req),
         protocol,
         bodyBytes: bodyBuffer.length,
-        requestModel: googleModel ?? vertexModel ?? requestModelFromBody(bodyBuffer, req),
+        requestModel: googleModel ?? vertexModel ?? (() => requestModelFromBody(bodyBuffer, req)),
         res,
         streamErrorShape: opts.streamErrorShape,
         log,
@@ -1991,7 +1991,7 @@ async function handleRequest(
             }
         }
         // Two compression modes, decided here per request and bound per session
-        // (see TECHNICAL-NOTES.md "Two compression modes"):
+        // (see docs/technical-notes.md "Two compression modes"):
         //  - pluginMode (x-bili-plugin header / registered agent): the ACP-native
         //    agent (pi/omp) OWNS compression — it executes `compress` locally, the
         //    call+result live in its own re-sent history, and the summary carrier
