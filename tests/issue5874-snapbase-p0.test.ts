@@ -211,6 +211,65 @@ test("#5874 T1b: a fresh install lands at v12 with the four tables", () => {
 // T2 — commit primitive: atomicity, seq monotonicity, red doors.
 // ---------------------------------------------------------------------------
 
+test("#5874 T1c: a sibling-branch database (v13, pf_* planes, no snap tables) coexists — probe-first DDL (field incident 2026-11-08)", () => {
+    const dir = tmpDir("bili-5874-t1c-");
+    try {
+        const p = path.join(dir, "index.db");
+        // 1. A real database with content.
+        {
+            const s1 = UnifiedStore.open(p);
+            s1.ingestSession(planIngest(oneMsgSession("sess-t1c", "hello coexistence")));
+            s1.close();
+        }
+        const before = (() => {
+            const db = rawDb(p);
+            const h = legacyDumpHash(db);
+            db.close();
+            return h;
+        })();
+        // 2. Simulate the field incident EXACTLY: the sibling branch (#5855)
+        //    consumed v12+v13 for its own additive pf_* planes into this
+        //    shared database and knows nothing about ours — its migration
+        //    ran, ours never did (version already "ahead").
+        {
+            const db = rawDb(p);
+            db.exec("DROP TABLE IF EXISTS l1_world");
+            db.exec("DROP TABLE IF EXISTS snap_rows");
+            db.exec("DROP TABLE IF EXISTS snap_log");
+            db.exec("DROP TABLE IF EXISTS snap_ckpt");
+            db.exec("DROP INDEX IF EXISTS idx_l1_ledger");
+            db.exec("CREATE TABLE IF NOT EXISTS pf_rows (sid TEXT PRIMARY KEY, pos INTEGER NOT NULL, payload TEXT NOT NULL)");
+            db.exec("CREATE TABLE IF NOT EXISTS pf_log (sid TEXT NOT NULL, seq INTEGER NOT NULL, payload TEXT NOT NULL, PRIMARY KEY (sid, seq))");
+            db.exec("INSERT INTO pf_rows (sid, pos, payload) VALUES ('sess-t1c', 0, 'sibling data')");
+            db.exec("PRAGMA user_version = 13");
+            db.close();
+        }
+        // 3. Reopen with our code: the probe must create the four snap
+        //    tables WITHOUT touching the sibling's tables and WITHOUT
+        //    downgrading the user_version (13 stays 13).
+        const store = UnifiedStore.open(p, undefined, { snapBase: { enabled: true, shadowWrite: true } });
+        try {
+            const db = rawDb(p);
+            for (const t of ["l1_world", "snap_rows", "snap_log", "snap_ckpt"]) assert.ok(hasTable(db, t), `missing table ${t}`);
+            assert.equal((db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 13, "user_version must not be downgraded");
+            assert.equal((db.prepare("SELECT payload FROM pf_rows WHERE sid = ?").get("sess-t1c") as { payload: string }).payload, "sibling data", "sibling DDL/rows must be untouched");
+            assert.equal(legacyDumpHash(db), before, "legacy tables must be byte-identical across the coexistence upgrade");
+            // 4. The plane is fully functional after the coexistence
+            //    upgrade (the incident's fatal error was exactly this).
+            applySnapCommit(db, "sess-t1c", [
+                { ev: "cast", pos: 0, coreIds: ["m1"], preJson: null, postJson: postJson("hello coexistence"), tokensEst: 1 },
+            ]);
+            assert.equal(tableCount(db, "snap_rows"), 1);
+            assert.equal(tableCount(db, "snap_log"), 1);
+            db.close();
+        } finally {
+            store.close();
+        }
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
 function postJson(text: string): string {
     return JSON.stringify({ role: "user", content: text });
 }
