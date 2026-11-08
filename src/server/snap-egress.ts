@@ -442,6 +442,24 @@ function trimDerived(clientText: string, planeText: string): boolean {
     return planeText.startsWith(head) && planeText.endsWith(tail) && head.length + tail.length < planeText.length;
 }
 
+/** Kernel-internal emergency truncation (kernel/src/truncate-tools.ts):
+ *  keepPrefixChars + "\n\n...[truncated for context space] — original ~N tokens]...\n\n"
+ *  + keepSuffixChars. The clip runs INSIDE processTurn on turn.messages, so
+ *  the truncated bytes exist only in the legacy egress — but the transform is
+ *  deterministic over the identical plane text, so a verified head+marker+tail
+ *  shape is exactly what the kernel produces over that text. */
+const KERNEL_TRUNC_RE = /\n\n\.\.\.\[truncated for context space\] — original ~\d+ tokens\]\.\.\.\n\n/;
+
+function kernelTruncDerived(legacyText: string, planeText: string): boolean {
+    const m = KERNEL_TRUNC_RE.exec(legacyText);
+    if (!m) return false;
+    const head = legacyText.slice(0, m.index);
+    const tail = legacyText.slice(m.index + m[0].length);
+    return head.length > 0 && tail.length > 0
+        && planeText.startsWith(head) && planeText.endsWith(tail)
+        && head.length + tail.length < planeText.length;
+}
+
 // Entry point — called by each protocol lane right after the lane computed
 // its legacy processedMessages. Returns the plane view on an exact tripwire
 // match, else the legacy array untouched.
@@ -498,7 +516,21 @@ export function applySnapEgress(
         deps.log("warn", `[snaplane] sid=${deps.sessionId} decision=degrade:egress:render-error (${err instanceof Error ? err.message : String(err)})`);
         return legacyProcessed;
     }
-    const planeProcessed = deps.transform(rendered);
+    let planeProcessed = deps.transform(rendered);
+    // Adopt the kernel's own emergency-truncation clips: the clip lives only
+    // in the legacy bytes (processTurn output); verified-shape adoption makes
+    // the plane side byte-identical. Everything else stays byte-strict.
+    if (planeProcessed.length === legacyProcessed.length) {
+        for (let i = 0; i < planeProcessed.length; i++) {
+            const a = planeProcessed[i];
+            const b = legacyProcessed[i];
+            if (!a || !b || a.text === b.text) continue;
+            if (typeof a.text === "string" && typeof b.text === "string" && kernelTruncDerived(b.text, a.text)) {
+                planeProcessed = planeProcessed.slice();
+                planeProcessed[i] = { ...a, text: b.text };
+            }
+        }
+    }
     const verdict = tripwireCompare(planeProcessed, legacyProcessed);
     if (verdict.ok) {
         egressStats.cutover++;

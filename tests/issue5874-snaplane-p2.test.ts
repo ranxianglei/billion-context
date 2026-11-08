@@ -622,3 +622,52 @@ test("T19d middle-pruned tool result (dsh pruner shape) adopted", () => {
     const m9bad = built2.msgs.find((m) => (m as { toolCallId?: string }).toolCallId === "call_prune");
     assert.equal(m9bad?.text, full, "a marker-bearing edit with a divergent head stays plane-sourced");
 });
+
+// T20: the kernel's own emergency truncation (kernel/src/truncate-tools.ts)
+// clips oversized tool results inside processTurn — keepPrefix + marker +
+// keepSuffix — so the clipped bytes exist only in the legacy egress. A
+// verified marker shape is adopted byte-for-byte; a marker-bearing body whose
+// head/tail do not bound the plane text is still a red.
+test("T20 kernel emergency-truncation clips are adopted; divergent bounds stay red", () => {
+    const { view, state } = planeFor("t20");
+    const full = "P".repeat(2000) + "MIDDLE".repeat(300) + "S".repeat(2000);
+    const marker = `\n\n...[truncated for context space] — original ~${Math.ceil(full.length / 4)} tokens]...\n\n`;
+    const clipped = "P".repeat(2000) + marker + "S".repeat(2000);
+    const rows = view.rows.map((r) => {
+        if (r.postJson?.includes('"message 9"')) {
+            const parsed = JSON.parse(r.postJson) as Record<string, unknown>;
+            parsed.contentType = "tool-result";
+            parsed.toolCallId = "call_t20";
+            parsed.text = full;
+            return { ...r, postJson: JSON.stringify(parsed) };
+        }
+        return r;
+    });
+    const viewFull = { ...view, rows: rows as SnapView["rows"] };
+    withStore(viewFull);
+    const resend = [
+        msg("m1", "message 1"),
+        { ...msg("m9", full), contentType: "tool-result", toolCallId: "call_t20" } as unknown as BiliMessage,
+        msg("m10", "message 10", "assistant"),
+        msg("m11", "message 11"),
+        msg("m12", "message 12", "assistant"),
+    ];
+    const legacyClipped: BiliMessage[] = [
+        { ...msg(summaryMessageId("blk-c1"), `${SUMMARY_HEADER}\nfolded 1-8`), role: "system" },
+        { ...msg("host-9", clipped), contentType: "tool-result", toolCallId: "call_t20" } as unknown as BiliMessage,
+        msg("host-10", "message 10", "assistant"),
+        msg("host-11", "message 11"),
+        msg("host-12", "message 12", "assistant"),
+    ];
+    const out = applySnapEgress(resend, state, legacyClipped, { ...deps(), sessionId: "t20" });
+    assert.notEqual(out, legacyClipped, "verified kernel clip shape cuts over");
+    assert.equal(out[1]?.text, clipped, "adopted bytes are the kernel clip");
+    assert.equal(snapEgressStatusWire().cutover, 1);
+    // Same marker but a head the plane text does not start with → red, legacy kept.
+    const badClip = "Q".repeat(2000) + marker + "S".repeat(2000);
+    const legacyBad: BiliMessage[] = legacyClipped.map((m) =>
+        (m as { toolCallId?: string }).toolCallId === "call_t20" ? ({ ...msg("host-9", badClip), contentType: "tool-result", toolCallId: "call_t20" } as unknown as BiliMessage) : m);
+    const kept = applySnapEgress(resend, state, legacyBad, { ...deps(), sessionId: "t20" });
+    assert.equal(kept, legacyBad, "marker with divergent head stays legacy (red)");
+    assert.equal(snapEgressStatusWire().fallback, 1);
+});
