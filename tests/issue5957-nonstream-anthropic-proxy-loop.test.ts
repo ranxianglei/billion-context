@@ -12,6 +12,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createCore, type Config, type CoreMessage } from "acp-kernel";
 import { getSession } from "../src/session.ts";
+import { MAX_LOOP_ROUNDS } from "../src/loop/index.ts";
 import { compressLoopAnthropicJson } from "../src/compress-loop-anthropic.ts";
 
 const UNUSED_URL = "https://unused.example/v1/messages";
@@ -248,6 +249,28 @@ test("#5957 compress executes via the same executor; receipt rides the tool_resu
         // Empty session: the fold is refused, but the receipt still rides the
         // tool_result exactly as a successful one would.
         assert.match(String(resultBlock.content), /Compression FAILED/, "compress receipt fed back to the model");
+    } finally {
+        h.restore();
+    }
+});
+
+// Gate discipline (#3617): the MAX_LOOP_ROUNDS limit gate ships with a row — a
+// still-proxy-only response at the limit is NOT executed a second time; it is
+// returned untouched so the one-shot rewriter performs the single execution
+// (bounded degradation to the pre-fix shape).
+test("#5957 limit gate: a still-proxy-only response at MAX_LOOP_ROUNDS defers to the one-shot rewriter", async () => {
+    const proxyOnly = () => anthropicResponse([toolUse("c_loop", "acp_status", {})]);
+    const h = installFetch(Array.from({ length: MAX_LOOP_ROUNDS }, proxyOnly));
+    try {
+        const out = await compressLoopAnthropicJson(
+            proxyOnly(),
+            makeCtx("i5957-limit", () => {}),
+            {},
+            { messages: [{ role: "user", content: "loop" }] },
+            { url: UNUSED_URL, headers: JSON_HEADERS },
+        );
+        assert.equal(h.count(), MAX_LOOP_ROUNDS - 1, "rounds 1..N-1 execute+re-request; round N breaks at the limit without executing");
+        assert.equal(contentOf(out)[0]?.type, "tool_use", "limit response stays proxy-only and unexecuted for the one-shot rewriter");
     } finally {
         h.restore();
     }
