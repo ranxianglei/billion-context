@@ -308,7 +308,7 @@ export async function handle(
                     return;
                 }
                 await handleIncrementalTurn(req, res, log, (syntheticReq, synRes) =>
-                    handleRequest(syntheticReq, synRes, opts, core, config, log, instanceId, instanceStartedAt, proxyWatchers, initialWatcherPid, adminCtx, new DecodedRequestAdmission(), new AbortController().signal), (req.url ?? "/v1/messages").split("?", 2)[0], raw);
+                    handleRequest(syntheticReq, synRes, opts, core, config, log, instanceId, instanceStartedAt, proxyWatchers, initialWatcherPid, adminCtx, new DecodedRequestAdmission(), new AbortController().signal), req.url ?? "/v1/messages", raw);
                 return;
             }
             // Marker'd but full-resend: replay through the normal pipeline with
