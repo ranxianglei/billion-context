@@ -4423,11 +4423,16 @@ export async function preflightCompressIfNeeded(
         // real window can never fit, on any tokenizer), the headroom limit as
         // fallback — a meter over-count against the POLICY headroom must not
         // swallow the #1839/#4185 "fits the native window" forwards.
+        // Images are NOT part of this comparison: an image-dominated overage is
+        // the #496/#1800 billing-arbitration domain (forward, let upstream bill
+        // or 400 for real evidence), not a doom — #857's screenshot turn pins
+        // that. The #554 meter excludes image payloads (image_url/data/url/...),
+        // so `outboundRawTokens` is text-only by construction.
         const armMeasuredBar = typeof resolvedNativeWindow === "number" && resolvedNativeWindow > 0 ? resolvedNativeWindow : limit;
-        if (outboundRawTokens !== undefined && outboundRawTokens + imageTokens > armMeasuredBar) {
+        if (outboundRawTokens !== undefined && outboundRawTokens > armMeasuredBar) {
             const outMsgs = outbound.processedMessages.length > 0 ? outbound.processedMessages : outbound.originalMessages;
             log("error", `[${session.id}] preflight 413 measured-body profile (post-fold): ${describeCoreTextDuplication(outMsgs)}`);
-            const measuredDoomMessage = `rebuilt outbound body measures ~${outboundRawTokens.toLocaleString("en-US")} tokens (system + tools + arguments + messages; CJK-aware count, the #554 guard meter; ~${imageTokens.toLocaleString("en-US")} of it image) vs the model window ${armMeasuredBar.toLocaleString("en-US")} (model=${model}); the body ITSELF exceeds the window, so it was NOT forwarded for upstream arbitration. Remove or trim the oversized content (e.g. a giant paste or tool result) and retry.`;
+            const measuredDoomMessage = `rebuilt outbound body measures ~${outboundRawTokens.toLocaleString("en-US")} TEXT tokens (system + tools + arguments + messages; CJK-aware count, the #554 guard meter; images billed separately, never doom here — #496/#1800/#857) vs the model window ${armMeasuredBar.toLocaleString("en-US")} (model=${model}); the body ITSELF exceeds the window, so it was NOT forwarded for upstream arbitration. Remove or trim the oversized content (e.g. a giant paste or tool result) and retry.`;
             log("error", `[${session.id}] preflight fail-fast 413 (retryable=false): ${measuredDoomMessage}`);
             noteLocalRefusal(session, currentOrigin, model, limit);
             return { failFast: true, status: 413, message: measuredDoomMessage, retryable: false, respond: !res.writableEnded };
@@ -4521,10 +4526,12 @@ export async function preflightCompressIfNeeded(
         // false-refuse a natively-fitting body), the headroom limit as
         // fallback. Measured tier first, byte floor below stays as the
         // fallback for unparseable bodies.
+        // Same text-only rule as the #1839 arm above: image-dominated overage
+        // belongs to the #496/#1800 billing arbitration, never to a local doom.
         const gateMeasuredBar = typeof resolvedNativeWindow === "number" && resolvedNativeWindow > 0 ? resolvedNativeWindow : limit;
-        if (outboundRawTokens !== undefined && outboundRawTokens + imageTokens > gateMeasuredBar) {
+        if (outboundRawTokens !== undefined && outboundRawTokens > gateMeasuredBar) {
             log("error", `[${session.id}] preflight 413 measured-body profile: ${describeCoreTextDuplication(outMsgs)}`);
-            const measuredDoomMessage = `outbound body measures ~${outboundRawTokens.toLocaleString("en-US")} tokens even after preflight compression (system + tools + arguments + messages; CJK-aware count, the #554 guard meter; ~${imageTokens.toLocaleString("en-US")} of it image) vs the model window ${gateMeasuredBar.toLocaleString("en-US")} (model=${model}); the body ITSELF exceeds the window, so it was NOT forwarded. Remove or trim the oversized content (e.g. a giant paste or tool result) and retry.`;
+            const measuredDoomMessage = `outbound body measures ~${outboundRawTokens.toLocaleString("en-US")} TEXT tokens even after preflight compression (system + tools + arguments + messages; CJK-aware count, the #554 guard meter; images billed separately, never doom here — #496/#1800/#857) vs the model window ${gateMeasuredBar.toLocaleString("en-US")} (model=${model}); the body ITSELF exceeds the window, so it was NOT forwarded. Remove or trim the oversized content (e.g. a giant paste or tool result) and retry.`;
             log("error", `[${session.id}] preflight fail-fast 413 (retryable=false): ${measuredDoomMessage}`);
             noteLocalRefusal(session, currentOrigin, model, limit);
             return { failFast: true, status: 413, message: measuredDoomMessage, retryable: false, respond: !res.writableEnded };
