@@ -54,6 +54,17 @@ Two lanes, same plugin (#941):
   `billion-context/dsh`, the profile resolved a pre-bundle copy from a stale
   package-metadata cache (#953) — re-add pinned: `dsh plugin --profile
   <name> add billion-context@latest`.
+- **Boundary — third-party Codex transports:** plugins that build their OWN
+  Codex WebSocket client bypass bili's intercepts by construction. Example
+  found in the wild 2026-11-08: `dsh-codex-subscription` with
+  `connectionMode: websocket` imports the `ws` package directly and swaps
+  `globalThis.WebSocket` for a per-host Proxy, so model frames never pass the
+  global fetch/WS patches — no proxy visibility, ACP tools answer 404, and
+  with native compaction suppressed there is no compaction path at all (the
+  second #5838 source). Use `connectionMode: sse` (the plugin default) until
+  the plugin passes the ambient `globalThis.WebSocket` through when no CONNECT
+  proxy agent is needed; bili cannot intercept module-scoped `ws` imports
+  inside a host-owned profile bundle.
 - **Desktop app (Electron host):** the same plugin also runs inside the
   deepseek-harness **desktop** app, installed through its in-app plugin
   manager. There the bootstrap spawns its proxy from within the app process,
