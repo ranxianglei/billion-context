@@ -75,6 +75,7 @@ billion-context/
 │   ├── stream-error.ts           # Minimal SSE error+finish sequence for failed streams
 │   ├── stream-terminal.ts        # Terminal-state observer for native-compaction responses (#321)
 │   ├── exit-matrix.ts            # Wire-exit × cross-cutting-concern enumeration matrix (#588)
+│   ├── exit-deadline.ts          # 5s cap on the exit flush path (EXIT_FLUSH_DEADLINE_MS, #5753)
 │   ├── degenerate-retry.ts       # Continuation-nudge retry body builder
 │   ├── degenerate-turn.ts        # Degenerate turn (empty/truncated) detection
 │   ├── strict-echo.ts            # Strict-echo reasoning upstream handling (#684)
