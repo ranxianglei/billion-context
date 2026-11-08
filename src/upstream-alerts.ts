@@ -359,7 +359,10 @@ export function getOpenUpstreamCircuits(): UpstreamCircuit[] {
 // conversations point at. Merges the two existing tables into one stable
 // shape: the open circuit is the authoritative "currently down" signal
 // (fail-fast stops minting new alerts once open), while the alert rows carry
-// the actionable hint and cover the pre-circuit window.
+// the actionable hint and cover the pre-circuit window. Both sources share one
+// staleness rule (#5572/#5701): anything whose last activity predates
+// ALERT_STALE_MS drops out — a host that stopped being hit is not evidence of
+// a CURRENT outage, however loudly it failed when it was hit.
 
 export interface UpstreamHealthEntry {
     /** Host[:port] the failing traffic targeted — raw (endpoint is loopback-gated). */
@@ -401,7 +404,18 @@ export function getUpstreamHealthReport(now: number = Date.now()): UpstreamHealt
     };
     for (const a of alerts.values()) touch(a.host).alerts.push(a);
     for (const e of circuits.values()) {
-        if (e.state.openedAt !== null) touch(e.state.host).circuit = e.state;
+        if (e.state.openedAt === null) continue;
+        // #5701: an open circuit with no fresh failures past the SAME staleness
+        // window as the alert rows is not evidence of a CURRENT outage — the host
+        // simply stopped being hit, and the alert rows behind it already aged out.
+        // Left unfiltered it pinned the DSH banner forever (rows with firstSeen/
+        // lastSeen synthesized from openedAt/lastFailure.at). Filter the PROJECTION
+        // only, mirroring pruneStaleAlerts above: the state machine keeps the entry,
+        // so traffic resuming into it still fails fast / probes, and a fresh failure
+        // re-surfaces the row on the very next read.
+        const lastActivity = e.state.lastFailure?.at ?? e.state.openedAt;
+        if (lastActivity < now - ALERT_STALE_MS) continue;
+        touch(e.state.host).circuit = e.state;
     }
     const upstreams: UpstreamHealthEntry[] = [];
     for (const [host, { alerts: hostAlerts, circuit }] of byHost.entries()) {

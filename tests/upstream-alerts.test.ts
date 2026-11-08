@@ -16,6 +16,8 @@ import {
     clearUpstreamAlertsForHost,
     getUpstreamAlerts,
     getUpstreamHealthReport,
+    recordUpstreamCircuitFailure,
+    getOpenUpstreamCircuits,
     _resetUpstreamAlertsForTest,
     _resetUpstreamCircuitsForTest,
     type UpstreamAlert,
@@ -184,6 +186,62 @@ test("health report: /__bili/upstreams projection also drops stale rows (#5572 D
             assert.equal(getUpstreamHealthReport(Date.now()).upstreams.length, 1);
             for (let i = 0; i < 301; i++) advance();
             assert.equal(getUpstreamHealthReport(Date.now()).upstreams.length, 0, "banner source no longer reports the dead port");
+        });
+    } finally {
+        _resetUpstreamAlertsForTest();
+        _resetUpstreamCircuitsForTest();
+    }
+});
+
+// #5701: the gap #5574 left behind — alerts expire after 5 min, but an OPEN
+// circuit with no fresh failures behind it was merged into the report
+// unconditionally, so a host that tripped its circuit and then stopped being
+// hit rendered in the DSH banner forever (rows synthesized from
+// openedAt/lastFailure.at). Same staleness bound as the alert rows, applied to
+// the circuit's last activity; the state machine itself is untouched
+// (fail-fast + half-open probes keep working), so both directions must hold:
+// quiet-for-a-window drops out of the report, still-failing never does.
+
+test("health report: a QUIET open circuit (no fresh failures past the window) drops out of the report (#5701)", () => {
+    _resetUpstreamAlertsForTest();
+    _resetUpstreamCircuitsForTest();
+    try {
+        withClock((advance) => {
+            const url = "http://10.0.0.5:9000/v1/chat/completions";
+            for (let i = 0; i < 3; i++) {
+                recordUpstreamCircuitFailure(url, netError("ECONNREFUSED"), false);
+                advance();
+            }
+            const fresh = getUpstreamHealthReport(Date.now()).upstreams;
+            assert.equal(fresh.length, 1, "open circuit present while fresh");
+            assert.equal(fresh[0].circuit?.state, "open");
+            for (let i = 0; i < 301; i++) advance(); // 301_000ms of silence > 5-min window
+            const stale = getUpstreamHealthReport(Date.now()).upstreams;
+            assert.equal(stale.length, 0, "quiet open circuit ages out of the banner source");
+            const open = getOpenUpstreamCircuits();
+            assert.equal(open.length, 1, "state machine kept the circuit OPEN — only the projection filtered it");
+            assert.equal(open[0].host, "10.0.0.5:9000");
+        });
+    } finally {
+        _resetUpstreamAlertsForTest();
+        _resetUpstreamCircuitsForTest();
+    }
+});
+
+test("health report: a circuit STILL failing stays in the report regardless of age (#5701)", () => {
+    _resetUpstreamAlertsForTest();
+    _resetUpstreamCircuitsForTest();
+    try {
+        withClock((advance) => {
+            const url = "http://10.0.0.6:9000/v1/chat/completions";
+            for (let i = 0; i < 3; i++) recordUpstreamCircuitFailure(url, netError("ECONNREFUSED"), false);
+            for (let i = 0; i < 301; i++) advance();
+            assert.equal(getUpstreamHealthReport(Date.now()).upstreams.length, 0, "quiet first");
+            recordUpstreamCircuitFailure(url, netError("ECONNREFUSED"), false); // fresh failure (half-open probe failed)
+            const [row] = getUpstreamHealthReport(Date.now()).upstreams;
+            assert.ok(row, "a fresh failure re-surfaces the row on the very next read");
+            assert.equal(row.circuit?.state, "open");
+            assert.equal(row.kind, "connect-refused");
         });
     } finally {
         _resetUpstreamAlertsForTest();
