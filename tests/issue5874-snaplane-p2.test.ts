@@ -239,7 +239,7 @@ test("#5874 T14: tripwire ignores ids/stamps, compares payload exactly", () => {
     const cVerdict = tripwireCompare(a, c);
     assert.equal(cVerdict.ok, false);
     assert.equal(cVerdict.ok === false && cVerdict.reason, "shape@1:text");
-    assert.match(cVerdict.ok === false && cVerdict.firstDiff || "", /^text plane\(len=5\)=\"world\" legacy\(len=5\)=\"WORLD\"$/);
+    assert.match(cVerdict.ok === false && cVerdict.firstDiff || "", /^text plane\(len=5\)="world" …tail="world" \| legacy\(len=5\)="WORLD" …tail="WORLD"$/);
     const d = [msg("host-1", "hello")];
     assert.deepEqual(tripwireCompare(a, d), { ok: false, reason: "length(plane=2,legacy=1)" });
     const imgA = { id: "i1", role: "user", contentType: "image", text: "", imagePart: true, imageBase64: "QUJD" } as unknown as BiliMessage;
@@ -551,4 +551,36 @@ test("T19b client-trimmed prefix text is adopted on plane prefix rows", () => {
         ],
     );
     assert.ok(verdict.ok, `trimmed adoption must reach parity (got ${verdict.ok ? "" : verdict.reason})`);
+});
+
+// T19c: tool results have no host-echoed id on the wire and a trimmed body
+// fails the content signature — they pair by toolCallId, and a head-keep
+// trimmed resend (dsh's old-tool-result budget) is adopted byte-for-byte.
+test("T19c tool results pair by toolCallId; head-keep trim adopted", () => {
+    const { view, state } = planeFor("t19c");
+    const full = "corpus page text ".repeat(60);
+    const trimmed = full.slice(0, 120);
+    const rows = view.rows.map((r) => {
+        if (r.postJson?.includes('"message 9"')) {
+            const parsed = JSON.parse(r.postJson) as Record<string, unknown>;
+            parsed.contentType = "tool-result";
+            parsed.toolCallId = "call_abc";
+            parsed.text = full;
+            return { ...r, postJson: JSON.stringify(parsed) };
+        }
+        return r;
+    });
+    const viewFull = { ...view, rows: rows as SnapView["rows"] };
+    const resend = [
+        msg("m1", "message 1"),
+        { ...msg("m9", trimmed), contentType: "tool-result", toolCallId: "call_abc" } as unknown as BiliMessage,
+        msg("m10", "message 10", "assistant"),
+        msg("m11", "message 11"),
+        msg("m12", "message 12", "assistant"),
+    ];
+    const built = buildSnapEgressView(viewFull, resend, state);
+    assert.ok(built.ok, `view must assemble, got ${(built as { reason: string }).reason}`);
+    const m9out = built.msgs.find((m) => (m as { toolCallId?: string }).toolCallId === "call_abc");
+    assert.equal(m9out?.text, trimmed, "trimmed tool body adopted via toolCallId pairing");
+    assert.equal(m9out?.contentType, "tool-result");
 });
