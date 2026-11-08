@@ -4,10 +4,12 @@ import { classifyUpstreamFailure, isFailFastUpstreamKind } from "./upstream-fail
 import { _resetUpstreamCaForTest, upstreamCaIdentity, upstreamExtraCa } from "./upstream-ca.js";
 import {
     upstreamTimeoutMs as knobUpstreamTimeoutMs,
+    upstreamFirstByteMs as knobUpstreamFirstByteMs,
     replayMaxAttempts as knobReplayMaxAttempts,
     replayBaseDelayMs as knobReplayBaseDelayMs,
     maxShrinkPerCompress as knobMaxShrinkPerCompress,
 } from "./knobs.js";
+import { log } from "./logger.js";
 
 /** HTTP robustness helpers for the proxy.
 
@@ -22,6 +24,14 @@ import {
 export { MAX_REQUEST_BYTES } from "./request-body-budget.js";
 import { checkOutboundBody } from "./request-body-budget.js";
 export const UPSTREAM_TIMEOUT_MS = 12 * 60 * 1000;
+
+// NOTE (#5917 review): there is deliberately NO UPSTREAM_FIRST_BYTE_MS default
+// constant here — the unset fallback of the first-byte knob is the RESOLVED
+// upstreamTimeoutMs() (src/knobs.ts), so "unset" stays byte-identical to the
+// pre-#5904 single-phase watchdog for EVERY configuration, including
+// deployments that raise BILI_UPSTREAM_TIMEOUT_MS above 12 min for >12-min
+// local-model prefills. Pinning a 720000 constant here would silently re-cap
+// those deployments' first byte at 12 min.
 
 const liveUpstreamTimers = new Set<ReturnType<typeof setTimeout>>();
 /** Test hook: how many fetchWithTimeout idle-timers are currently armed.
@@ -62,12 +72,15 @@ export function _resetIdleTimerSeamsForTest(): void {
  *  tune it live. Local-model deployments with very large contexts can need
  *  prefills longer than the 12-minute default before their first token.
  *
- *  This budget is the SOLE silence bound by design: there is deliberately no
- *  finer-grained mid-stream stall detector. A #1452-era opt-in guard
+ *  This budget remains the SOLE default silence bound: there is deliberately
+ *  no finer-grained mid-stream stall detector. A #1452-era opt-in guard
  *  (BILI_STREAM_STALL_MS) was retired in #1706/#1714 — local-model
  *  deployments legitimately go silent for minutes mid-stream (thinking
  *  phases, long prefills), so any finite sub-budget false-positived healthy
- *  turns into truncations. Do not re-add a shorter timer here. */
+ *  turns into truncations. Do not re-add a shorter MID-STREAM timer here.
+ *  (#5904 adds only a phase-1 FIRST-BYTE budget knob — request sent → first
+ *  response byte — and its default equals this full budget, so default
+ *  behavior is unchanged; see upstreamFirstByteMs in src/knobs.ts.) */
 export function upstreamTimeoutMs(): number {
     return knobUpstreamTimeoutMs();
 }
@@ -178,17 +191,34 @@ export async function fetchWithTimeout(
 ): Promise<{ response: Response; clearTimer: () => void; stopIdleTimer: () => void }> {
     checkOutboundBody(opts.body);
     const effective = timeoutMs ?? upstreamTimeoutMs();
+    // #5904: two-phase watchdog. Phase 1 (request sent → first response byte)
+    // uses its own budget — min(caller's explicit timeout, the first-byte knob)
+    // — so "upstream accepted the request but never answered" fails (and
+    // logs) distinctly. Default knob value = the full idle budget, so unset =
+    // byte-identical to the old single-phase watchdog. Phase 2 (body
+    // streaming) re-arms to the full idle budget, preserving the #1706/#1714
+    // guarantee that long silent prefills/streams are never truncated.
+    const firstByteBudget = Math.min(timeoutMs ?? Number.POSITIVE_INFINITY, knobUpstreamFirstByteMs());
     const controller = new AbortController();
     let cleared = false;
-    const armTimer = () => {
+    let phase: "first-byte" | "body" = "first-byte";
+    const safeUrl = () => {
+        try { return new URL(url).origin + new URL(url).pathname; } catch { return url.slice(0, 120); }
+    };
+    const armTimer = (delayMs: number) => {
         const t = setTimeout(() => {
             liveUpstreamTimers.delete(t);
+            // The watchdog historically fired SILENTLY — a wedged upstream meant
+            // the fetch rejected with a bare AbortError and nothing in the log
+            // explained it (#5904 forensics: 300s of total silence). Name the
+            // phase and budget every time it trips.
+            log("warn", `upstream watchdog fired (${phase} phase, ${delayMs}ms budget) — ${String(opts.method ?? "GET")} ${safeUrl()} aborted: ${phase === "first-byte" ? "no response headers" : "no body chunk"} in budget`);
             controller.abort();
-        }, idleTimerDelayOverrideMs ?? effective);
+        }, idleTimerDelayOverrideMs ?? delayMs);
         liveUpstreamTimers.add(t);
         return t;
     };
-    let timer = armTimer();
+    let timer = armTimer(firstByteBudget);
     const rearm = () => {
         // A late body chunk can resolve after the consumer already called
         // clearTimer (abandoned response — e.g. a failed retry whose body is
@@ -198,7 +228,8 @@ export async function fetchWithTimeout(
         clearTimeout(timer);
         liveUpstreamTimers.delete(timer);
         idleRearmCount += 1;
-        timer = armTimer();
+        phase = "body";
+        timer = armTimer(effective);
     };
     let onExternalAbort: (() => void) | null = null;
     if (externalSignal) {
@@ -249,6 +280,15 @@ export async function fetchWithTimeout(
         const raw = transport
             ? await transport(url, finalOpts)
             : await fetch(url, finalOpts as RequestInit) as Response;
+        // #5904: phase 1 ends HERE — undici resolves the fetch around the
+        // FIRST BODY DATA (a headers-only-then-silent upstream stays pending,
+        // as observed live: headers written at t=0, fetch resolved at the first
+        // chunk at t=300ms). So phase 1 covers request-sent → first response
+        // byte, and once we get here the remaining silence (inter-chunk gaps,
+        // thinking phases, long prefills) is phase-2 mid-stream silence guarded
+        // by the full idle budget — never the shorter first-byte budget
+        // (#1706/#1714 guarantee).
+        rearm();
         if (raw.body) {
             // Wrap the body so each chunk re-arms the timer (idle timeout); carry
             // status/headers onto a fresh Response so callers see an identical shape.

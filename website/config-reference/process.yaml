@@ -10,8 +10,8 @@ entries:
     site_group: proc
     desc_en: "Transport timeouts, watchdogs and replay policy for upstream calls."
     desc_zh: "上游调用的传输超时、看门狗与重放策略。"
-    site_en: "<code>network</code> — transport timeouts, replays &amp; the 429 egress governor: <span class='mech'>upstreamTimeoutMs 720000 · requestWatchdogMs 2× · replayRetryMax 3 · replayRetryBaseMs 1500 · keepAliveTimeoutMs 5000 · clientErrorBackstopMs 30000 · exposureLogIntervalMs 3600000 · streamKeepAliveMs 15000 · preflightHoldMs 30000 · preflightDeadEndCooldownMs 300000 · proxyKeepAliveMaxMs 55000 · throttle429Enabled true · throttle429MaxConsecutive 5 · throttle429BaseDelayMs 2000 · throttle429MaxDelayMs 30000 · throttle429Scope credential</span>."
-    site_zh: "<code>network</code> —— 传输超时、重放与 429 出站治理：<span class='mech'>upstreamTimeoutMs 720000 · requestWatchdogMs 2× · replayRetryMax 3 · replayRetryBaseMs 1500 · keepAliveTimeoutMs 5000 · clientErrorBackstopMs 30000 · exposureLogIntervalMs 3600000 · streamKeepAliveMs 15000 · preflightHoldMs 30000 · preflightDeadEndCooldownMs 300000 · proxyKeepAliveMaxMs 55000 · throttle429Enabled true · throttle429MaxConsecutive 5 · throttle429BaseDelayMs 2000 · throttle429MaxDelayMs 30000 · throttle429Scope credential</span>。"
+    site_en: "<code>network</code> — transport timeouts, replays &amp; the 429 egress governor: <span class='mech'>upstreamTimeoutMs 720000 · upstreamFirstByteMs 720000 · requestWatchdogMs 2× · replayRetryMax 3 · replayRetryBaseMs 1500 · keepAliveTimeoutMs 5000 · clientErrorBackstopMs 30000 · exposureLogIntervalMs 3600000 · streamKeepAliveMs 15000 · preflightHoldMs 30000 · preflightDeadEndCooldownMs 300000 · proxyKeepAliveMaxMs 55000 · throttle429Enabled true · throttle429MaxConsecutive 5 · throttle429BaseDelayMs 2000 · throttle429MaxDelayMs 30000 · throttle429Scope credential</span>."
+    site_zh: "<code>network</code> —— 传输超时、重放与 429 出站治理：<span class='mech'>upstreamTimeoutMs 720000 · upstreamFirstByteMs 720000 · requestWatchdogMs 2× · replayRetryMax 3 · replayRetryBaseMs 1500 · keepAliveTimeoutMs 5000 · clientErrorBackstopMs 30000 · exposureLogIntervalMs 3600000 · streamKeepAliveMs 15000 · preflightHoldMs 30000 · preflightDeadEndCooldownMs 300000 · proxyKeepAliveMaxMs 55000 · throttle429Enabled true · throttle429MaxConsecutive 5 · throttle429BaseDelayMs 2000 · throttle429MaxDelayMs 30000 · throttle429Scope credential</span>。"
   - key: network.upstreamTimeoutMs
     type: number
     default: "720000"
@@ -19,6 +19,13 @@ entries:
     group: process
     desc_en: "Hard ceiling on a single upstream call (12 min covers slow deep-thinking models)."
     desc_zh: "单次上游调用的硬上限（12 分钟覆盖慢速深度思考模型）。"
+  - key: network.upstreamFirstByteMs
+    type: number
+    default: "= upstreamTimeoutMs (resolved; 720000 when unset)"
+    env: BILI_UPSTREAM_FIRST_BYTE_MS
+    group: process
+    desc_en: "Phase-1 budget: request sent → first response byte (undici resolves the fetch around the first body data). Unset follows the RESOLVED upstreamTimeoutMs — including deployments that raise BILI_UPSTREAM_TIMEOUT_MS above 12 min (#5917 review: a constant 720000 fallback would silently re-cap them) — so behavior is unchanged; tighter deployments opt in (#5904: a wedged upstream that accepts requests but never answered previously hung silently until the client aborted). After the first byte, chunk-gap silence stays governed by the full upstreamTimeoutMs (#1706/#1714 guarantee). The release gate sets 120000."
+    desc_zh: "阶段一预算：请求发出 → 首个响应字节（undici 在首个 body 数据到达时才 resolve fetch）。未设时跟随解析后的 upstreamTimeoutMs——包括把 BILI_UPSTREAM_TIMEOUT_MS 提到 12 分钟以上的部署（#5917 评审：常量 720000 回落会悄悄把它们压回 12 分钟）——行为不变；需要更快约束首字节时延的部署可显式收紧（#5904：上游接收请求后永不应答的卡死，之前会静默拖到客户端中止）。首字节到达后，chunk 间隙静默仍由完整 upstreamTimeoutMs 管辖（#1706/#1714 保证）。发布 gate 设 120000。"
   - key: network.requestWatchdogMs
     type: number
     default: "2× upstreamTimeoutMs"
