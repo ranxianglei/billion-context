@@ -1821,11 +1821,14 @@ function applySingleRange(input: SingleRangeInput): SingleRangeOutcome {
     // #4521: everything in the range was dropped by content filters
     // (protected tool pairs, media, …) with no zone hit and no consumed
     // blocks — same idempotent no-op class as the two above, so the batch is
-    // not poisoned by it.
+    // not poisoned by it. #5919: the projection may have carried a specific
+    // reason (e.g. a merge skipped because its turn cannot be closed now) —
+    // surface those before the generic explanation.
     const highest = highestUsedIndex(input.state.messageRefs);
     return {
       tokens: 0,
       warnings: [
+        ...warnings,
         `Range ${input.spec.startRef}..${input.spec.endRef} folded nothing — all of its content is protected or filtered (protected tool calls/results, media, or the recent-message zone), which always stays visible. Nothing failed; do not resend this range. Session highest allocated ref is ${highest > 0 ? indexToRef(highest) : "none"}.`,
       ],
       noop: true,
@@ -2097,8 +2100,11 @@ function decideNudge(input: NudgeInput): NudgeDecision {
   // is the ONLY pressure signal) would otherwise be deferred forever, one
   // estimate round after another. Track the consecutive-estimate streak in
   // NudgeState and stop deferring once it exceeds nudge.maxEstimateHoldRounds
-  // (default 2): the double-ghost windows the guard exists for stay covered,
-  // and worst-case starvation is capped at two missed opportunities.
+  // (default 2): the double-ghost windows the guard exists for stay covered.
+  // Starvation bound: for a usage-reporting backend the streak rarely exceeds
+  // 1, so the cap is ~maxEstimateHoldRounds missed opportunities; for a
+  // silent backend the streak has been accumulating since the session's
+  // first round, so pressure is injected the moment it first arrives.
   const estimateHoldStreak =
     input.tokenCountSource === "estimate"
       ? (state.nudge.estimateHoldStreak ?? 0) + 1

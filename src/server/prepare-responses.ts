@@ -268,7 +268,7 @@ export async function prepareResponses(
         // drift without recovering (the #2193 escalation is observe-only).
         // TWO producers replay that shape on this wire: codex (rollout event
         // type:"compacted", #2372) and dsh desktop's compaction-basic
-        // checkpoint (#2432) — CONFIGURATION.md names responses "the lane dsh
+        // checkpoint (#2432) — docs/configuration.md names responses "the lane dsh
         // desktop's compaction actually rides" (#2360), yet before the #2451
         // review this slot covered codex only and the dsh desktop scenario
         // fell back into the pre-#2432 death spiral. Detect (client identity

@@ -23,6 +23,7 @@
 import path from "node:path";
 import { stateDir } from "./paths.js";
 import { loadConfigFile } from "./config.js";
+import { log } from "./logger.js";
 import { parseDurationField } from "./duration.js";
 import { UPSTREAM_TIMEOUT_MS, REPLAY_MAX_ATTEMPTS, REPLAY_BASE_DELAY_MS } from "./fetch-util.js";
 import { PROXY_KEEPALIVE_MAX_MS } from "./upstream-proxy.js";
@@ -81,6 +82,25 @@ function fileNetwork() {
 export function upstreamTimeoutMs(): number {
     const v = tNum("BILI_UPSTREAM_TIMEOUT_MS", fileNetwork().upstreamTimeoutMs);
     return Number.isInteger(v) && v > 0 ? v : UPSTREAM_TIMEOUT_MS;
+}
+
+/** BILI_UPSTREAM_FIRST_BYTE_MS > network.upstreamFirstByteMs > the RESOLVED
+ *  upstreamTimeoutMs() — so unset = byte-identical to the single-phase
+ *  watchdog for EVERY configuration, including deployments that raise
+ *  BILI_UPSTREAM_TIMEOUT_MS above 12 min for >12-min local-model prefills
+ *  (review on #5917 caught the first cut pinning the fallback to the 720000
+ *  constant UPSTREAM_FIRST_BYTE_MS, which would have silently re-capped
+ *  those deployments' first byte at 12 min). Phase-1 budget: request fully
+ *  sent → first response byte. Bounds
+ *  "upstream accepted the request but never answered" separately from mid-stream
+ *  silence, which keeps the #1706/#1714 guarantee that long silent prefills are
+ *  never truncated by default (#5904: a GPU-restart-cold sglang answered one
+ *  fold in 73s, then accepted the next request and never answered — the turn sat
+ *  silent until the client's 300s abort; the release gate sets 120000ms here to
+ *  catch that wedge fast). */
+export function upstreamFirstByteMs(): number {
+    const v = tNum("BILI_UPSTREAM_FIRST_BYTE_MS", fileNetwork().upstreamFirstByteMs);
+    return Number.isInteger(v) && v > 0 ? v : upstreamTimeoutMs();
 }
 
 /** BILI_CA_FILE > network.caFile > unset. Path to a PEM bundle of extra root CAs
@@ -155,10 +175,21 @@ export function throttle429MaxDelayMs(): number {
  *  relays). Recognized KeyRing/bili-relay markers keep their own semantics in
  *  both modes; requests whose model cannot be identified stay
  *  credential-wide, so worst-case protection never widens beyond legacy.
- *  Read per settlement so the switch flips live. */
+ *  Read per settlement so the switch flips live. The value match is
+ *  EXACT ("model"/"credential", case-sensitive): anything else — a typo
+ *  like "models" or "Model" — silently falls back to "credential" with
+ *  only this warn (once per distinct misspelling) to say so. */
+let warnedThrottle429ScopeValues: Set<string> | undefined;
 export function throttle429Scope(): "credential" | "model" {
     const env = process.env.BILI_THROTTLE_429_SCOPE;
     const raw = env !== undefined && env !== "" ? env : fileNetwork().throttle429Scope;
+    if (raw !== "model" && raw !== "credential" && raw !== "" && raw !== undefined) {
+        warnedThrottle429ScopeValues ??= new Set<string>();
+        if (!warnedThrottle429ScopeValues.has(raw)) {
+            warnedThrottle429ScopeValues.add(raw);
+            log("warn", `[knobs] network.throttle429Scope: unrecognized value ${JSON.stringify(raw)} — expected exactly "credential" or "model"; falling back to "credential" (#5199). Unrecognized values never enable model-scoped holds.`);
+        }
+    }
     return raw === "model" ? "model" : "credential";
 }
 

@@ -747,7 +747,14 @@ export function noteUpstreamThrottle429(
     const previous = holds.get(stateKey);
     const observedState = createHoldState(key, host, cred, retryAfterHeader, now, previous, scopeModel, false);
     if (previous === undefined) {
-        if (!storeHold(stateKey, observedState, scopeModel !== undefined)) return;
+        if (!storeHold(stateKey, observedState, scopeModel !== undefined)) {
+            // #5199/#5889: the hold map is saturated (MAX_HOLDS full, nothing
+            // model-scoped to evict) — the 429 stays ungoverned instead of
+            // silently pretending a hold exists. Say so: this is the one
+            // condition where marker-less 429 protection quietly disappears.
+            loggerLog("warn", `[acp-proxy] [429-hold] ${host}${scopeModel !== undefined ? ` model "${scopeModel}"` : ""}: 429 hold NOT stored — hold map saturated at ${MAX_HOLDS} with no evictable model-scoped hold; this 429 is ungoverned and requests pass through (#5199)`);
+            return;
+        }
     } else {
         holds.set(stateKey, observedState);
     }

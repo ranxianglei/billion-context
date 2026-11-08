@@ -1,0 +1,81 @@
+**Setup:** billion-context 0.1.212 (`daa082ead`), Claude Code 2.1.311, `claude-haiku-5-5` with adaptive thinking (signature-only thinking blocks), Anthropic wire through LiteLLM to AWS Bedrock. Config: `{"compress":{"modelContextLimit":55573,"nudgeGrowthTokens":2000}}`. Related: #4885, #4886, PR #4898, #5180.
+
+**Steps:**
+1. Ask the agent to read a large file with `Read` (1,500 lines, about 24K tokens), then answer a question.
+2. The nudge makes the model call `compress` on the Read exchange in the same tool loop.
+3. bili logs `Compressed m00004–m00005 ... Excluded 1 protected message(s) m00003 from compression range (recent/last-user zone)`. `m00003` is the signed thinking block that comes before the Read `tool_use`.
+4. The next outbound assistant message is `[thinking A (orphan), thinking B, text...]`. Upstream returns `400 messages.N.content.1: thinking or redacted_thinking blocks in the latest assistant message cannot be modified`.
+
+**Rate:** 11 of 123 upstream requests (8.9%) over 11 three-turn sessions.
+
+**Cause:** `computeProtectedRefs` (`kernel/src/recommend.ts`) skips `neverPreserveRecentTools` matches (`read` by default), so the Read call and result are not protected. Rules 1 and 2 still protect the reasoning core before the call. The #2886 closure covers tool pairs only. Then the advisory carve (`kernel/src/unit-projection.ts:320-323`) removes the protected reasoning from the fold that `adjustBoundariesForReasoningPairs` had widened, and `coreToAnthropic` merges the orphan into the next assistant message.
+
+**Minimal kernel test** (fails on 0.1.212): messages `[user, reasoning(signed) th1, tool-call Read c1, tool-result Read r1 (40K chars), reasoning(signed) th2, tool-call Grep c2, tool-result r2]` with `defaultConfig(100000)`. Expected: `computeProtectedRefs` does not protect `th1`, because its companion `c1` is not protected. Actual: `th1` is protected and `c1` is not.
+
+**Proposed fix:** after the #2886 tool-pair closure, remove a reasoning run from the protected set when its assistant companion is not protected (15 lines, patch attached). With it: 0 of 62 upstream 400s, the same fold savings, and all 1,563 kernel tests pass. PR #4898 also fixes this case (0/35 in our back-port).
+
+A patch for 0.1.212 (about 15 lines in the kernel, plus a regression test) is attached below.
+
+```diff
+diff --git a/kernel/src/recommend.ts b/kernel/src/recommend.ts
+index d2cd66982..d2ffed920 100644
+--- a/kernel/src/recommend.ts
++++ b/kernel/src/recommend.ts
+@@ -192,6 +192,21 @@ export function computeProtectedRefs(
+     }
+   }
+ 
++  for (let i = 0; i < messages.length; i++) {
++    if (messages[i]!.contentType !== "reasoning") continue;
++    let j = i;
++    while (j + 1 < messages.length && messages[j + 1]!.contentType === "reasoning") j++;
++    const companion = messages[j + 1];
++    const companionRef = companion?.id ? state.messageRefs.byRaw[companion.id] : undefined;
++    if (companion?.role === "assistant" && companionRef && companionRef !== "BLOCKED" && !result.has(companionRef)) {
++      for (let k = i; k <= j; k++) {
++        const ref = state.messageRefs.byRaw[messages[k]!.id];
++        if (ref) result.delete(ref);
++      }
++    }
++    i = j;
++  }
++
+   return result;
+ }
+ 
+diff --git a/kernel/tests/bili-fix-reasoning-protect.test.ts b/kernel/tests/bili-fix-reasoning-protect.test.ts
+new file mode 100644
+index 000000000..190bc2041
+--- /dev/null
++++ b/kernel/tests/bili-fix-reasoning-protect.test.ts
+@@ -0,0 +1,28 @@
++import { test } from "node:test";
++import assert from "node:assert/strict";
++import { createInitialState } from "../src/state.js";
++import { assignRefs } from "../src/refs.js";
++import { computeProtectedRefs } from "../src/recommend.js";
++import { defaultConfig } from "../src/config.js";
++import type { CoreMessage } from "../src/types.js";
++
++const messages: CoreMessage[] = [
++  { id: "u", role: "user", contentType: "text", text: "Read data.log and report record 42" },
++  { id: "th1", role: "assistant", contentType: "reasoning", text: "", thinkingSignature: "sig-1" },
++  { id: "c1", role: "assistant", contentType: "tool-call", toolName: "Read", toolCallId: "t1", text: "{}" },
++  { id: "r1", role: "tool", contentType: "tool-result", toolName: "Read", toolCallId: "t1", text: "x".repeat(40000) },
++  { id: "th2", role: "assistant", contentType: "reasoning", text: "", thinkingSignature: "sig-2" },
++  { id: "c2", role: "assistant", contentType: "tool-call", toolName: "Grep", toolCallId: "t2", text: "{}" },
++  { id: "r2", role: "tool", contentType: "tool-result", toolName: "Grep", toolCallId: "t2", text: "42" },
++];
++
++test("signed reasoning is not protected when its tool-call companion is outside the recent zone", () => {
++  const state = createInitialState();
++  state.messageRefs = assignRefs(messages, { existing: state.messageRefs, nextIndex: 1 }).map;
++  const ref = (id: string) => state.messageRefs.byRaw[id]!;
++  const protectedRefs = computeProtectedRefs(messages, state, defaultConfig(100000));
++  assert.equal(protectedRefs.has(ref("c1")), false);
++  assert.equal(protectedRefs.has(ref("th1")), false);
++  assert.equal(protectedRefs.has(ref("th2")), true);
++  assert.equal(protectedRefs.has(ref("c2")), true);
++});
+
+```
