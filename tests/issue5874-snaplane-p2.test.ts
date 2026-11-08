@@ -368,3 +368,88 @@ test("#5874 T16f: soak default — no config section means egress ON for all fou
         assert.ok(flags.cohorts.has(p), `${p} in default cohorts`);
     }
 });
+
+test("#5874 T18a: resend envelope re-applied onto plane prefix rows (byte parity with the live resend)", () => {
+    _resetSnapEgressForTests();
+    setConfig({});
+    const { view, state } = planeFor("sess-p2-env-a");
+    const env = (ref: string, time: string) => `<acp tokens="90" type="text" time="${time}">${ref}</acp>\n`;
+    // Client resends EVERYTHING with fresh envelopes; m9..m12 are the seam
+    // tail, m1..m8 covered (block), and the surviving prefix rows get the
+    // client's exact tagged text adopted.
+    const resend = [
+        msg("m1", env("m00001", "T2") + "message 1"),
+        msg("m2", env("m00002", "T2") + "message 2"),
+        msg("m9", env("m00009", "T2") + "message 9"),
+        msg("m10", env("m00010", "T2") + "message 10"),
+        msg("m11", env("m00011", "T2") + "message 11"),
+        msg("m12", env("m00012", "T2") + "message 12"),
+    ];
+    const built = buildSnapEgressView(view, resend, state);
+    assert.ok(built.ok);
+    assert.equal(built.msgs.length, 5);
+    assert.equal(built.msgs[0].text, `${SUMMARY_HEADER}\nfolded 1-8`, "anchor never carries an envelope");
+    assert.equal(built.msgs[1].text, env("m00009", "T2") + "message 9", "prefix row adopts the live resend envelope");
+    assert.equal(built.msgs[2].text, env("m00010", "T2") + "message 10");
+    assert.equal(built.msgs[3].text, env("m00011", "T2") + "message 11");
+    assert.equal(built.msgs[4].text, env("m00012", "T2") + "message 12", "tail verbatim");
+    // legacy processed: kernel drops the covered m1..m8 by id and keeps the
+    // resent tagged texts for the rest — byte-for-byte identical.
+    const legacy = [
+        msg("acp_summary_blk-c1", `${SUMMARY_HEADER}\nfolded 1-8`, "system"),
+        msg("m9", env("m00009", "T2") + "message 9"),
+        msg("m10", env("m00010", "T2") + "message 10", "assistant"),
+        msg("m11", env("m00011", "T2") + "message 11"),
+        msg("m12", env("m00012", "T2") + "message 12", "assistant"),
+    ];
+    assert.deepEqual(tripwireCompare(built.msgs, legacy), { ok: true });
+});
+
+test("#5874 T18b: a new turn's changed envelope time still matches (per-resend tags)", () => {
+    _resetSnapEgressForTests();
+    setConfig({});
+    const { view, state } = planeFor("sess-p2-env-b");
+    const env = (ref: string, time: string) => `<acp tokens="7" type="text" time="${time}">${ref}</acp>\n`;
+    // Turn 3's resend: same content, NEW envelope times (transport metadata).
+    const resend = [
+        msg("m1", env("m00001", "T3") + "message 1"),
+        msg("m9", env("m00009", "T3") + "message 9"),
+        msg("m10", env("m00010", "T3") + "message 10"),
+        msg("m11", env("m00011", "T3") + "message 11"),
+        msg("m12", env("m00012", "T3") + "message 12"),
+    ];
+    const built = buildSnapEgressView(view, resend, state);
+    assert.ok(built.ok);
+    assert.equal(built.msgs[1].text, env("m00009", "T3") + "message 9", "adopted from THIS resend, not a stale one");
+});
+
+test("#5874 T18c: content edit under an envelope is never adopted (byte-strict)", () => {
+    _resetSnapEgressForTests();
+    setConfig({});
+    const { view, state } = planeFor("sess-p2-env-c");
+    const env = (ref: string) => `<acp tokens="7" type="text" time="T9">${ref}</acp>\n`;
+    // The client rewrote m9's body (edits): pairing finds the id but the
+    // content differs beyond the envelope — plane text stays, tripwire fires.
+    const resend = [
+        msg("m1", env("m00001") + "message 1"),
+        msg("m9", env("m00009") + "message 9 EDITED"),
+        msg("m10", env("m00010") + "message 10"),
+        msg("m11", env("m00011") + "message 11"),
+        msg("m12", env("m00012") + "message 12"),
+    ];
+    const built = buildSnapEgressView(view, resend, state);
+    assert.ok(built.ok);
+    assert.equal(built.msgs[1].text, "message 9", "edited row keeps the plane text (no blind adoption)");
+    // legacy keeps the edited resend (m9 is not covered) → tripwire catches
+    // the text divergence at the very row where adoption was refused.
+    const legacy = [
+        msg("acp_summary_blk-c1", `${SUMMARY_HEADER}\nfolded 1-8`, "system"),
+        msg("m9", env("m00009") + "message 9 EDITED"),
+        msg("m10", env("m00010") + "message 10", "assistant"),
+        msg("m11", env("m00011") + "message 11"),
+        msg("m12", env("m00012") + "message 12", "assistant"),
+    ];
+    const verdict = tripwireCompare(built.msgs, legacy);
+    assert.ok(!verdict.ok);
+    assert.equal(verdict.reason, "shape@1:text");
+});
