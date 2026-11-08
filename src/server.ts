@@ -2826,7 +2826,24 @@ export function diagNudge(turn: { nudge?: { shouldInject: boolean; reason: strin
     // the observed top-level tools so the next omnibus rename is greppable here
     // (`surface=off(top-level=[...])`) instead of arriving as a user incident.
     const offTag = surfaceOff ? `, ${surfaceOff}` : "";
-    return `[${sessionId}] nudge ${inject}: usage=${pct} (${tokenCount}/${limit}), growth=${growth}/${floor} (ref=${ref}, interval=${interval}), pendingT1=${pendingT1}/${interval}${modelTag}${offTag}, reason="${n.reason.slice(0, 120)}"`;
+    // #5928: a meter reading of 0 means unmeasured, not empty — say so on the
+    // line itself (absent whenever tokenCount > 0, so normal turns stay
+    // byte-identical).
+    const baselineTag = tokenCount === 0 ? ", baseline=unknown" : "";
+    return `[${sessionId}] nudge ${inject}: usage=${pct} (${tokenCount}/${limit}), growth=${growth}/${floor} (ref=${ref}, interval=${interval}), pendingT1=${pendingT1}/${interval}${baselineTag}${modelTag}${offTag}, reason="${n.reason.slice(0, 120)}"`;
+}
+
+// #5928: log level for the nudge diagnostic line above. A blind meter
+// (tokenCount === 0) leaves decideNudge structurally idle for that turn; when
+// a foldable backlog already sits at/over its T1 threshold this is an
+// actionable state that must not hide in an info line (#5928's 473K forward
+// idled exactly like this). Injecting or small-backlog turns stay info.
+export function nudgeDiagLogLevel(tokenCount: number, n: { shouldInject: boolean; breakdown?: Record<string, number> } | null | undefined): "info" | "warn" {
+    if (tokenCount !== 0 || n === null || n === undefined || n.shouldInject) return "info";
+    const b = n.breakdown ?? {};
+    const interval = b["nudgeGrowthTokens"] ?? 0;
+    const pendingT1 = b["pendingT1"] ?? 0;
+    return interval > 0 && pendingT1 >= interval ? "warn" : "info";
 }
 
 // Zero-baseline sessions are judged conservatively ONLY when they arrived
