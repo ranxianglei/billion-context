@@ -30,6 +30,7 @@ import { createHash } from "node:crypto";
 import { loadConfigFile, resolveMessageTimestamps } from "../config.js";
 import { getStore } from "../persist.js";
 import { isSnapPlaneDead, type SnapView } from "../storage/snap.js";
+import { safePrefix, safeSuffix } from "../text-safe.js";
 import { identitySig } from "./snapshot-render.js";
 
 /** Same seam discipline as D-lane (#3756): the walk only touches the tail
@@ -140,8 +141,8 @@ export function tripwireCompare(plane: BiliMessage[], legacy: BiliMessage[]): { 
         const b = normTuple(legacy[i]);
         for (let f = 0; f < a.length; f++) {
             if (a[f] !== b[f]) {
-                const head = (v: unknown) => JSON.stringify(String(v ?? "")).slice(0, 400);
-                const tail = (v: unknown) => JSON.stringify(String(v ?? "")).slice(-200);
+                const head = (v: unknown) => safePrefix(JSON.stringify(String(v ?? "")), 400);
+                const tail = (v: unknown) => safeSuffix(JSON.stringify(String(v ?? "")), 200);
                 return { ok: false, reason: `shape@${i}:${TRIPWIRE_FIELDS[f]}`, firstDiff: `${TRIPWIRE_FIELDS[f]} plane(len=${String(a[f] ?? "").length})=${head(a[f])} …tail=${tail(a[f])} | legacy(len=${String(b[f] ?? "").length})=${head(b[f])} …tail=${tail(b[f])}` };
             }
         }
