@@ -1715,6 +1715,16 @@ export function resetSessionCompression(session: Session): void {
     delete session.metadata.postRebuildAnchor;
     session.stats.contextTokens = 0;
     delete session.stats.contextTokensSource;
+    // #5925: the conversation was rebuilt — its host id generation starts
+    // fresh, so the pre-rebase needle is dead. A dead needle would make the
+    // #4805/#5925 fail-closed gate refuse every post-rebase sample forever
+    // (honest main requests carry new ids that never match it); clearing it
+    // re-opens bootstrap until the first id-carrying request replants the
+    // family.
+    if (session.transient) {
+        delete session.transient.latestKnownMsgId;
+        delete session.transient.needlePayloadUpper;
+    }
     session.metadata.nativeCompactionAt = Date.now();
     markDirty(session);
 }

@@ -200,7 +200,7 @@ test("T3d fork inheritance: a fork child carries the parent's needle from turn 1
 });
 
 for (const previousMember of [false, true]) {
-    test(`T3e no-ID request clears a previous ${previousMember ? "member" : "foreign"} verdict`, () => {
+    test(`T3e no-ID request clears the previous ${previousMember ? "member" : "foreign"} verdict and fails closed while the family is known (#5925)`, () => {
         const session = sessionWith(100_000);
         session.transient!.latestKnownMsgId = "main-call";
         probeRequestMembership(session, [previousMember ? "main-call" : "foreign-call"], 5_000);
@@ -208,8 +208,17 @@ for (const previousMember of [false, true]) {
         assert.equal(probeRequestMembership(session, [], 200_000), null);
         assert.equal(session.transient!.requestMembership, undefined);
         assert.equal(session.transient!.latestKnownMsgId, "main-call", "abstention must not move the remembered needle");
+        // #5925: an ABSENT verdict used to read as member here (fail-open) — a
+        // no-id sample settling over the known family's anchor. It must now be
+        // refused while the needle is planted; it still bills cumulatively.
         settleUsageReport(session, { total: 200_000, reportedCached: null, protocol: "openai" });
-        assert.equal(session.stats.lastInputTokens, 200_000);
+        assert.equal(session.stats.lastInputTokens, 100_000, "no-id sample refuses the anchor write once the id family is known");
+        assert.equal(session.stats.inputTokens, 200_000, "the refused sample still counts toward cumulative usage");
+        // The honest main request replants the evidence and heals the anchor.
+        probeRequestMembership(session, ["main-call"], 200_000);
+        assert.ok(!isForeignMembership(session.transient?.requestMembership), "an id-carrying main request re-proves membership");
+        settleUsageReport(session, { total: 200_000, reportedCached: null, protocol: "openai" });
+        assert.equal(session.stats.lastInputTokens, 200_000, "the anchor heals through the next id-carrying report");
         probeRequestMembership(session, ["foreign-call"], 5_000);
         settleUsageReport(session, { total: 5_000, reportedCached: null, protocol: "openai" });
         assert.equal(session.stats.lastInputTokens, 200_000, "subsequent foreign requests still cannot overwrite the anchor");

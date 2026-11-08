@@ -18,7 +18,7 @@ import {
 import { log as loggerLog } from "./logger.js";
 import { METADATA_CANONICAL_SYS_FP, METADATA_FOLD_COVERAGE, METADATA_LAST_RESPONSES_MODE, METADATA_SYSTEM_FP } from "./fold-reconcile.js";
 import { clearPostRebuildAnchor, markDirty, type Session } from "./session.js";
-import { isForeignMembership } from "./request-membership.js";
+import { membershipBlocksSettlement } from "./request-membership.js";
 import { billInputUsage } from "./billing.js";
 import { normalizeUpstreamOrigin } from "./util.js";
 import { toolFail, toolOk, type ProxyToolResult } from "./proxy-tool-result.js";
@@ -1839,6 +1839,11 @@ export function noteOutboundContextEstimates(
     session: Session,
     est: { upperBound: number; scaledText: number; imageTokens: number; calibrated: boolean },
 ): void {
+    // #5925: a sample whose request cannot prove membership must not rewrite
+    // the session's scale readings either — with the anchor write refused, a
+    // poisoned localInputEstimate would still pin effectiveTokenCount's
+    // min(localInputEstimate, raw) fallback at foreign scale.
+    if (membershipBlocksSettlement(session)) return;
     session.stats.localInputEstimate = est.upperBound;
     session.stats.contextEstimateTokens = Math.round(est.scaledText + est.imageTokens);
     session.stats.contextEstimateCalibrated = est.calibrated;
@@ -1865,12 +1870,18 @@ export function settleUsageReport(
         // billing data under a colliding session key (auxiliary host personas
         // stamp the host conversation id on their own tiny payloads). It
         // still counts toward cumulative usage, but it is not this
-        // conversation's truth and must not touch the anchor family. Abstain
-        // paths (no evidence / first turns / #2821 re-mints) settle exactly
-        // as before: the gate only ever refuses the clearly-foreign.
-        if (isForeignMembership(session.transient?.requestMembership)) {
-            const m = session.transient!.requestMembership!;
-            loggerLog("info", `[${session.id}] [membership] usage sample (total=${s.total}) refused anchor write: its request did not carry the conversation's latest message id (needle=${m.needle ?? "-"}) — foreign payload under a shared session id (#4805)`);
+        // conversation's truth and must not touch the anchor family.
+        // #5925: the gate fails CLOSED on absent evidence once the family is
+        // known — a no-id request cannot prove membership, and admitting it
+        // here let a side-lane sample settle over the main anchor (the
+        // bootstrap no-needle case keeps writing, unchanged).
+        if (membershipBlocksSettlement(session)) {
+            const t = session.transient!;
+            const m = t.requestMembership;
+            const why = m
+                ? `its request did not carry the conversation's latest message id (needle=${m.needle ?? "-"})`
+                : `its request carried no message ids while the conversation's id family is known (needle=${t.latestKnownMsgId ?? "-"})`;
+            loggerLog("info", `[${session.id}] [membership] usage sample (total=${s.total}) refused anchor write: ${why} — foreign payload under a shared session id (#4805/#5925)`);
         } else {
         // Net out this turn's compress credit: the post-compress re-request
         // re-sends the unfolded history, so its usage report over-reports the
