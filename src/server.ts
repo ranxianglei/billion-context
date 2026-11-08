@@ -3748,7 +3748,7 @@ export function buildWindowShrinkNote(args: {
 // tokens are charged separately by the caller (they sit in binary-carrying
 // keys the walk excludes by design). Unparseable bodies return undefined —
 // callers keep the byte-floor fallback for them.
-export interface MeasuredOutbound {
+interface MeasuredOutbound {
     tokens: number;
     breakdown: RawBodyBreakdown;
 }
