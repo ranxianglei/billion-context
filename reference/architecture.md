@@ -154,7 +154,7 @@ billion-context/
 │   │   ├── integrity-check.ts    #   Cached + background quick_check off the boot critical path (#4609)
 │   │   ├── mysql.ts              #   MySQL 8.0 backend implementing the storage contract (#3388)
 │   │   ├── runtime-status.ts     #   Runtime storage degradation status for status surfaces (#3040)
-│   │   ├── schema.ts             #   Unified storage schema DDL + migrations (v11)
+│   │   ├── schema.ts             #   Unified storage schema DDL + migrations (v12)
 │   │   ├── shadow.ts             #   Unified-storage sidecar: shadow double-write / full read flip
 │   │   ├── snap.ts               #   Snapshot-table compression foundation: four v12 tables, commit primitive, S4-verified rebuild (#5874)
 │   │   ├── sqlite-errors.ts      #   Corruption-shaped SQLite error classification (#5108)
