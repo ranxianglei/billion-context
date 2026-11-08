@@ -3,7 +3,7 @@ import { collectBlockContent, countMessageTokens, defaultCountTokens, formatRang
 import { loadConfigFile, resolveMessageTimestamps } from "./config.js";
 import { excludeDeadRefRanges, handleAcpStatus, liveCompressionRanges } from "./acp-status.js";
 import { handleAcpCache, prefixTokensBeforeRef, recordCacheFoldsFromBlocks } from "./cache-ledger.js";
-import { type Session, cacheBlockContent, markDirty, residentPressure, scrubTurnSeparatorIds, statusInputBaseline, withoutTurnSeparators } from "./session.js";
+import { type Session, cacheBlockContent, markDirty, residentPressure, scrubTurnSeparatorIds, statusInputBaseline, truncatedUpstreamOf, withoutTurnSeparators } from "./session.js";
 import { COMPRESS_TOOL_NAME, parseCompressInput, ABSORB_TOOL_NAME, type ParsedRange } from "./compress-tool.js";
 import { effectiveAbsorbConfig, executeAbsorb, isProxyToolFor } from "./absorb.js";
 import { executeSearchContextTarget, resolveDecompress } from "./decompress-shared.js";
@@ -1082,6 +1082,20 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
             !isEmptyCall &&
             argLen !== undefined &&
             (diagnostics.kind === "malformed-json" || diagnostics.kind === "truncated");
+        // #5981: an EMPTY call dispatched from a stream that was CUT before its
+        // terminal event is not the model's empty companion call — the argument
+        // deltas never arrived. The bytes are identical by the time the parser
+        // sees them, so only the truncation stamp can tell the two apart. This
+        // branch must run BEFORE the #847/#4812 failure ledgers: those counters
+        // exist to detect a model repeating a spec it authored, and charging a
+        // transport failure to them would (a) arm the model-facing breaker on
+        // failures the model never caused and (b) collapse this receipt into a
+        // do-not-retry refusal precisely when a retry is the correct action.
+        const cutStream = isEmptyCall ? truncatedUpstreamOf(ctx.session) : undefined;
+        if (cutStream !== undefined) {
+            ctx.log(`[acp-proxy: compress arguments lost in transit — the ${cutStream.protocol} stream was cut before its terminal event (${cutStream.cause}); not counted as a model failure]`);
+            return compressResult(`[Compression FAILED: ARGUMENTS LOST IN TRANSIT — the upstream ${cutStream.protocol} stream carrying this call was cut before its terminal event (${cutStream.cause}), so the compress arguments never arrived. The call reached the proxy EMPTY through no fault of yours; nothing was compressed and this is NOT an empty-intent call. RE-ISSUE the compress call with the content you intended: ONE 'content' STRING holding every range, each block starting with its header line 'mNNNNN–mNNNNN optional topic' followed by that block's summary markdown (a JSON-encoded array of {startId, endId, summary} objects is also accepted INSIDE that same string).]`, "refused", 0, `parse:${diagnostics.kind}:lost-in-transit`);
+        }
         const parseKey = `parse:${diagnostics.kind}:${diagnostics.invalidItems}:${rawReasons.slice(0, 3).join("|")}`;
         const guard = recordCompressFailure(
             ctx.session,
