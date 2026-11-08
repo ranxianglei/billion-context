@@ -6314,7 +6314,7 @@ export async function ensureProxyRunning(
  *  stays as the fallback if taskkill itself fails. Failures are surfaced,
  *  never swallowed (#4125): a "killed" holder that survives keeps holding its
  *  listener, and the caller's release verification is what catches that. */
-function hardKillProxyTree(pid: number, label: string): void {
+export function hardKillProxyTree(pid: number, label: string): void {
     if (process.platform !== "win32") {
         try {
             process.kill(pid, "SIGKILL");
