@@ -61,7 +61,7 @@
     "d.cf.th_desc": "What it does",
     "d.cf.routes_intro": "Keys are upstream URL prefixes — longest match wins, boundary-safe. <code>https://</code> keys match /bili/ traffic; <code>mitm://</code> keys match login-client traffic on the MITM lane. An entry with no fields is still an ordinary compressed lane.",
     /* bili:gen site-dict-en */
-    "cw.mcl": "Effective context window (tokens or \"N%\"): denominator of the usage ratio and a hard preflight wall. Highest-priority window source — overrides per-route / per-model declarations plus the top-level default.",
+    "cw.mcl": "Effective context window (tokens or \"N%\"): denominator of the usage ratio and a hard preflight wall. Highest-priority window source below upstream 400 evidence — overrides per-route / per-model declarations plus the top-level default; also the wall for every token-measured egress guard (post-fold fit proof, relay egress fuse, DSH host-side oversize gate), where an explicit declaration disables the fuse's 1M anti-guess floor (#5937).",
     "cw.mxcl": "Forced-compression nudge threshold (default \"75%\"): once history passes this share of the window the nudge fires immediately, bypassing the growth gates. Not a hard cap.",
     "cw.etc": "Default \"95%\": emergency truncation of oversized tool outputs when history passes this share of the window (must be ≥ maxContextLimit).",
     "cw.ohmp": "Cap (0–1, default 0.25) on the share of the window reserved for output via max_tokens.",
@@ -319,7 +319,7 @@
     "d.cf.th_desc": "作用",
     "d.cf.routes_intro": "键是上游 URL 前缀——最长前缀优先、边界安全。<code>https://</code> 键匹配 /bili/ 流量，<code>mitm://</code> 键匹配 MITM 通道的登录客户端流量。不带任何字段的条目仍是普通压缩通道。",
     /* bili:gen site-dict-zh */
-    "cw.mcl": "有效上下文窗口（token 数或 \"N%\"）：使用率的分母，也是硬性 preflight 墙。窗口来源中优先级最高——覆盖路由/模型声明与顶层默认值。",
+    "cw.mcl": "有效上下文窗口（token 数或 \"N%\"）：使用率的分母，也是硬性 preflight 墙。除上游 400 证据外优先级最高的窗口来源——覆盖路由/模型声明与顶层默认值；同时是所有按 token 计量的出站守卫（折后装得下证明、relay 出站熔断、DSH 宿主侧超尺寸闸门）的墙，显式声明时熔断不再套用 1M 防猜测下限（#5937）。",
     "cw.mxcl": "强制压缩提醒阈值（默认 \"75%\"）：历史超过窗口的该占比时提醒立即触发，绕过增长门槛。不是硬上限。",
     "cw.etc": "默认 \"95%\"：历史超过窗口该占比时，对超大工具输出做紧急截断（必须 ≥ maxContextLimit）。",
     "cw.ohmp": "max_tokens 输出预留占窗口的最大比例（0–1，默认 0.25）。",

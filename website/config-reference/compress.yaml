@@ -8,11 +8,11 @@ entries:
     group: compress
     id: cw.mcl
     render: compress-row
-    desc_en: "Effective context window (tokens or N%): denominator of the usage ratio and a hard preflight wall; highest-priority window source."
-    desc_zh: "有效上下文窗口（token 数或 N%）：使用率的分母，也是硬性 preflight 墙；窗口来源中优先级最高。"
+    desc_en: "Effective context window (tokens or N%): denominator of the usage ratio, hard preflight wall, and the wall for every token-measured egress guard (#5937); highest-priority window source below upstream 400 evidence."
+    desc_zh: "有效上下文窗口（token 数或 N%）：使用率的分母、硬性 preflight 墙，以及所有按 token 计量的出站守卫的墙（#5937）；除上游 400 证据外优先级最高的窗口来源。"
     desc_ja: "有効コンテキストウィンドウ（トークン数または N%）：使用率の分母であり、事前チェックのハードウォール。最優先のウィンドウソース。"
-    site_en: "Effective context window (tokens or \"N%\"): denominator of the usage ratio and a hard preflight wall. Highest-priority window source — overrides per-route / per-model declarations plus the top-level default."
-    site_zh: "有效上下文窗口（token 数或 \"N%\"）：使用率的分母，也是硬性 preflight 墙。窗口来源中优先级最高——覆盖路由/模型声明与顶层默认值。"
+    site_en: "Effective context window (tokens or \"N%\"): denominator of the usage ratio and a hard preflight wall. Highest-priority window source below upstream 400 evidence — overrides per-route / per-model declarations plus the top-level default; also the wall for every token-measured egress guard (post-fold fit proof, relay egress fuse, DSH host-side oversize gate), where an explicit declaration disables the fuse's 1M anti-guess floor (#5937)."
+    site_zh: "有效上下文窗口（token 数或 \"N%\"）：使用率的分母，也是硬性 preflight 墙。除上游 400 证据外优先级最高的窗口来源——覆盖路由/模型声明与顶层默认值；同时是所有按 token 计量的出站守卫（折后装得下证明、relay 出站熔断、DSH 宿主侧超尺寸闸门）的墙，显式声明时熔断不再套用 1M 防猜测下限（#5937）。"
   - key: compress.maxContextLimit
     type: "number | \"N%\""
     default: "\"75%\""
