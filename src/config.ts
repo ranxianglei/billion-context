@@ -2458,7 +2458,8 @@ const KNOWN_TOP_LEVEL_KEYS = new Set([
     "rollout",
     "dsh",
     "compat", "imageBilling", "imageTokenCap", "claude", "native", "resign",
-    "pi", "storage", "security",
+    // #5706: FileConfig.opencode (opencode lane block, src/agent/opencode-native.ts).
+    "pi", "opencode", "storage", "security",
     // #4899: per-model billing prices (web panel pricing editor).
     "billing",
     // #2030 subsystem blocks:
