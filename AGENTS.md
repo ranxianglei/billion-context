@@ -15,7 +15,7 @@
 | Language | TypeScript (strict, ESM) |
 | Build | tsup (bundling; inlines the in-repo kernel `kernel/`) |
 | Test | Node.js built-in: `node --import tsx --test tests/*.test.ts` |
-| Runtime Dep | the in-repo compression kernel (`kernel/`, npm name `acp-kernel`, bundled inline at build time) + `zod` (external, only used by `dist/agent/opencode-native.js` V1 tools; `dist/index.js` stays dependency-free) |
+| Runtime Dep | the in-repo compression kernel (`kernel/`, npm name `acp-kernel`, bundled inline at build time) + a small set of lazy external deps: `zod` (exact `4.6.7`, only `dist/agent/opencode-native.js` V1 tools), `mysql2` (opt-in network storage backend, `await import` at backend open), `jimp` (image processing, #3516) — the main entry `dist/index.js` stays dependency-free |
 
 ### Repository Info
 
@@ -30,7 +30,7 @@
 
 ### Module Map
 
-The full file-by-file map lives in [reference/architecture.md](reference/architecture.md) — it drifts as modules land, so **regenerate it when you add/remove a source file; don't trust a stale copy**. Orientation at a glance: `src/server.ts` (+ `src/loop/**` adapters) is the request pipeline; `src/update.ts` is the load-bearing self-updater; `src/persist.ts` + `src/session-id.ts` own persistence/identity; `tests/e2e/` holds the real-client regression suites; the compression engine itself lives in-repo under `kernel/` (the acp-kernel source, #2092).
+The full file-by-file map lives in [reference/architecture.md](reference/architecture.md) — it drifts as modules land, so **regenerate it when you add/remove a source file; don't trust a stale copy** (CI lane `architecture-docs` enforces full `src/` coverage, #5924). Orientation at a glance: `src/server.ts` + `src/server/` (handle / prepare-* / relay / lane-decisions / snapshot-render / threads-lane / fastpath / admin) + `src/loop/**` (core + wire adapters) is the request pipeline; `src/update.ts` is the load-bearing self-updater; `src/persist.ts` + `src/session-id.ts` own persistence/identity; `src/storage/` is the unified storage layer (SQLite by default, opt-in MySQL backend); `tests/e2e/` holds the real-client regression suites; the compression engine itself lives in-repo under `kernel/` (the acp-kernel source, #2092).
 
 ### Key Design Decisions
 
