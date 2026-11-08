@@ -13,6 +13,7 @@
 | [clients](clients.md) / [中文](clients.zh-CN.md) / [日本語](clients.ja.md) | Per-client integration deep dives: how each mode (launcher / `/bili/` / native plugin) wires traffic in |
 | [how-it-works](how-it-works.en.svg) / [中文](how-it-works.zh-CN.svg) | One diagram: request flow + the injected context tools |
 | [README](README.md) / [中文](README.zh-CN.md) / [日本語](README.ja.md) | Directory landing page: section map + the rules that keep this directory live |
+| [storage-relations](storage-relations.en.svg) / [中文](storage-relations.zh.svg) | One diagram: every storage table — what it stores, when it is written/read, which feature it serves (snapshot-table foundation #5901) |
 
 ## Identity & protocol
 

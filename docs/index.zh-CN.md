@@ -13,6 +13,7 @@
 | [clients](clients.zh-CN.md) / [English](clients.md) / [日本語](clients.ja.md) | 各客户端接入深潜：launcher / `/bili/` / 原生插件三种模式如何接线 |
 | [how-it-works](how-it-works.zh-CN.svg) / [English](how-it-works.en.svg) | 一张图：请求流转 + 注入的上下文工具 |
 | [README](README.zh-CN.md) / [English](README.md) / [日本語](README.ja.md) | 目录落地页：分区地图 + 保持本目录不再变乱的规则 |
+| [storage-relations](storage-relations.zh.svg) / [English](storage-relations.en.svg) | 一张图：存储关系——每张表存什么、何时写/读、对接哪个功能（快照表底座 #5901） |
 
 ## 身份与协议
 
