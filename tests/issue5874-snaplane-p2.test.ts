@@ -584,3 +584,41 @@ test("T19c tool results pair by toolCallId; head-keep trim adopted", () => {
     assert.equal(m9out?.text, trimmed, "trimmed tool body adopted via toolCallId pairing");
     assert.equal(m9out?.contentType, "tool-result");
 });
+
+// T19d: the dsh tool-result pruner keeps head+tail and replaces the middle
+// with a fixed marker; that shape is adopted byte-for-byte too.
+test("T19d middle-pruned tool result (dsh pruner shape) adopted", () => {
+    const { view, state } = planeFor("t19d");
+    const full = "X".repeat(3000) + "MIDDLE".repeat(500) + "Y".repeat(1000);
+    const MARKER = "\n\n[... tool result middle pruned ...]\n\n";
+    const pruned = "X".repeat(3000) + MARKER + "Y".repeat(1000);
+    const rows = view.rows.map((r) => {
+        if (r.postJson?.includes('"message 9"')) {
+            const parsed = JSON.parse(r.postJson) as Record<string, unknown>;
+            parsed.contentType = "tool-result";
+            parsed.toolCallId = "call_prune";
+            parsed.text = full;
+            return { ...r, postJson: JSON.stringify(parsed) };
+        }
+        return r;
+    });
+    const viewFull = { ...view, rows: rows as SnapView["rows"] };
+    const resend = [
+        msg("m1", "message 1"),
+        { ...msg("m9", pruned), contentType: "tool-result", toolCallId: "call_prune" } as unknown as BiliMessage,
+        msg("m10", "message 10", "assistant"),
+        msg("m11", "message 11"),
+        msg("m12", "message 12", "assistant"),
+    ];
+    const built = buildSnapEgressView(viewFull, resend, state);
+    assert.ok(built.ok, `view must assemble, got ${(built as { reason: string }).reason}`);
+    const m9out = built.msgs.find((m) => (m as { toolCallId?: string }).toolCallId === "call_prune");
+    assert.equal(m9out?.text, pruned, "head+marker+tail pruned body adopted");
+    // A body with the marker but a divergent head is NOT adopted.
+    const bad = "Z".repeat(3000) + MARKER + "Y".repeat(1000);
+    const badResend = [resend[0], { ...msg("m9", bad), contentType: "tool-result", toolCallId: "call_prune" } as unknown as BiliMessage, ...resend.slice(2)];
+    const built2 = buildSnapEgressView(viewFull, badResend, state);
+    assert.ok(built2.ok);
+    const m9bad = built2.msgs.find((m) => (m as { toolCallId?: string }).toolCallId === "call_prune");
+    assert.equal(m9bad?.text, full, "a marker-bearing edit with a divergent head stays plane-sourced");
+});
