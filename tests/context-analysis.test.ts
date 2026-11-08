@@ -84,16 +84,19 @@ test("heavy-init verdict fires when the first request already carries ≥15% of 
     });
 });
 
-test("idle gate classification: mass / growth / cadence", () => {
+test("idle gate classification: mass / growth / cadence; unclassified (count-ready T2) → other", () => {
     resetContextAnalysisForTest();
     recordNudgeObservation("s-gate", nudgeTurn(30000, 0, 5000, "max compressible 30000 < threshold 50000"), 200_000, 750_000, false);
     recordNudgeObservation("s-gate", nudgeTurn(60000, 0, 5000, "growth 5000 + absorbed 0 held (single abort) < floor 22500"), 201_000, 750_000, false);
-    recordNudgeObservation("s-gate", nudgeTurn(60000, 0, 30000, "blocked: T1 (cadence)"), 202_000, 750_000, false);
-    recordNudgeObservation("s-gate", nudgeTurn(60000, 76_000, 30000, "no tier mass-qualified for distillation"), 203_000, 750_000, false);
+    recordNudgeObservation("s-gate", nudgeTurn(60000, 0, 30000, "max compressible 60000, growth 30000, blocked: T1 (cadence)"), 202_000, 750_000, false);
+    // The kernel emits no distill-specific idle reason — count-ready T2 idles
+    // land in other (T2 readiness is reported from lastReadiness/verdict).
+    recordNudgeObservation("s-gate", nudgeTurn(60000, 76_000, 30000, "max compressible 60000, growth 30000, ready: T2 5 blocks (count)"), 203_000, 750_000, false);
     const v = contextAnalysisView("s-gate")!;
     if (v.idleGates.mass !== 1) throw new Error(`mass: ${JSON.stringify(v.idleGates)}`);
-    if (v.idleGates.growth !== 2) throw new Error("growth: < floor AND no tier mass-qualified");
-    if (v.idleGates.cadence !== 1) throw new Error("cadence");
+    if (v.idleGates.growth !== 1) throw new Error(`growth: ${JSON.stringify(v.idleGates)}`);
+    if (v.idleGates.cadence !== 1) throw new Error(`cadence: ${JSON.stringify(v.idleGates)}`);
+    if (v.idleGates.other !== 1) throw new Error(`other: ${JSON.stringify(v.idleGates)}`);
 });
 
 test("INJECT is recorded and returns a digest line; commit pairs into a harvest record", () => {

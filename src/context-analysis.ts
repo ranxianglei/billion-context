@@ -90,8 +90,10 @@ interface ContextAnalysis {
     injects: NudgeEvent[];
     /** Total INJECT count (survives the cap). */
     injectTotal: number;
-    /** Idle-observation gate counts (which gate held, and how often). */
-    idleGates: { mass: number; growth: number; cadence: number; distill: number; other: number };
+    /** Idle-observation gate counts (which gate held, and how often).
+     *  No distill bucket: the kernel never emits a distill-specific idle
+     *  reason, so T2/T3 readiness is reported from lastReadiness instead. */
+    idleGates: { mass: number; growth: number; cadence: number; other: number };
     /** Harvest pairings, oldest first (capped). */
     harvests: HarvestRecord[];
     /** Per-commit token samples (capped) — powers the drain rate. */
@@ -124,7 +126,7 @@ function touch(id: string): ContextAnalysis {
             requests: 0,
             injects: [],
             injectTotal: 0,
-            idleGates: { mass: 0, growth: 0, cadence: 0, distill: 0, other: 0 },
+            idleGates: { mass: 0, growth: 0, cadence: 0, other: 0 },
             harvests: [],
             commits: [],
             compressCommits: 0,
@@ -274,8 +276,8 @@ export function formatContextAnalysis(sessionId: string, now = Date.now()): stri
         );
     }
     const g = a.idleGates;
-    const gateTotal = g.mass + g.growth + g.cadence + g.distill + g.other;
-    const gateStr = gateTotal > 0 ? ` · idle gates: mass ${g.mass}× / growth ${g.growth}× / cadence ${g.cadence}× / distill ${g.distill}×` : "";
+    const gateTotal = g.mass + g.growth + g.cadence + g.other;
+    const gateStr = gateTotal > 0 ? ` · idle gates: mass ${g.mass}× / growth ${g.growth}× / cadence ${g.cadence}× / other ${g.other}×` : "";
     lines.push(`injects: ${a.injectTotal} in ${fmtHM(spanMs)}${gateStr}`);
     if (a.harvests.length > 0) {
         const under = a.harvests.filter((h) => h.ratio < 0.5).length;
@@ -358,14 +360,14 @@ export function recordNudgeObservation(
         return fmt ? `[context-analysis] ${sessionId} ${label} @${pct}% — ` + fmt.join(" · ") : null;
     }
 
-    // Idle: which gate held? (reason-string classification, log-verified forms)
+    // Idle: which gate held? (reason-string classification against the kernel's
+    // emitted forms: "< threshold", "< floor", ", blocked: Tn (cadence)")
     const reason = n.reason ?? "";
     if (/cadence/i.test(reason)) a.idleGates.cadence++;
     else if (/< threshold/i.test(reason)) a.idleGates.mass++;
-    else if (/< floor/i.test(reason) || /no tier mass-qualified/i.test(reason)) a.idleGates.growth++;
-    else if (/summary-pool|distillation/i.test(reason)) a.idleGates.distill++;
+    else if (/< floor/i.test(reason)) a.idleGates.growth++;
     else a.idleGates.other++;
-    const gateTotal = a.idleGates.mass + a.idleGates.growth + a.idleGates.cadence + a.idleGates.distill + a.idleGates.other;
+    const gateTotal = a.idleGates.mass + a.idleGates.growth + a.idleGates.cadence + a.idleGates.other;
     if (gateTotal > 0 && gateTotal % 60 === 0) {
         const fmt = formatContextAnalysis(sessionId, now);
         return fmt ? `[context-analysis] ${sessionId} ${label} @${pct}% (${reason.slice(0, 80)}) — ` + fmt.join(" · ") : null;
