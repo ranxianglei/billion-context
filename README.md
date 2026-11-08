@@ -79,21 +79,7 @@ Unlike a host's built-in summarizer, compression here is **incremental, reversib
 
 ## How it works
 
-```
-Agent (Claude Code / Codex / Cursor / Aider ...)
-        │  you point the agent's base URL at the proxy
-        ▼
-┌─────────────────┐
-│  billion-context│   1. parse the request (Anthropic or OpenAI shape)
-│     proxy       │   2. run acp-kernel compression on the conversation
-│                 │   3. inject a `compress` tool + compression philosophy
-│                 │   4. forward to the real model API
-│                 │   5. rewrite the streaming response
-└─────────────────┘
-        │
-        ▼
-   real model API (Anthropic / OpenAI / compatible)
-```
+![How it works](docs/how-it-works.en.svg)
 
 ### Context-management tools
 
