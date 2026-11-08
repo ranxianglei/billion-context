@@ -190,6 +190,7 @@ function isReasoningRequiredError(e: unknown): boolean {
 const TRANSPORT_FAILURE_LABELS: Record<UpstreamFailureKind, string> = {
     "client-abort": "aborted",
     "upstream-timeout": "upstream timeout",
+    "upstream-headers-timeout": "upstream sent no first byte in time",
     "proxy-reset": "connection reset by an intermediate proxy",
     "upstream-reset": "connection reset by the upstream",
     "connect-refused": "connection refused",
