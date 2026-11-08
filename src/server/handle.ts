@@ -519,7 +519,7 @@ async function handleRequest(
         credHeaders: earlyHoldCredHeaders(req),
         protocol,
         bodyBytes: bodyBuffer.length,
-        requestModel: googleModel ?? vertexModel ?? requestModelFromBody(bodyBuffer, req),
+        requestModel: googleModel ?? vertexModel ?? (() => requestModelFromBody(bodyBuffer, req)),
         res,
         streamErrorShape: opts.streamErrorShape,
         log,

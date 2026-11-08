@@ -270,7 +270,7 @@ qwen / mcode / aider / copilot / amp / goose      (full list: bili --help)</code
           <li class="tg" data-i18n-html="tg.up"><strong>Upstream &amp; billing</strong></li>
           <li data-i18n-html="tt.upstream"><code>upstream</code> — fallback upstream base URL (ACP_UPSTREAM overrides).</li>
           <li data-i18n-html="tt.proxy"><code>proxy</code> — global outbound proxy. Resolution: per-route → BILI_UPSTREAM_PROXY → Web UI → this value → HTTP(S)_PROXY env → Windows system proxy → direct. Empty string = explicitly direct; SOCKS5 is rejected.</li>
-          <li data-i18n-html="tt.mcl2"><code>modelContextLimit</code> — legacy global window ceiling (default 200000); prefer compress.modelContextLimit.</li>
+          <li data-i18n-html="tt.mcl2"><code>modelContextLimit</code> — legacy global DEFAULT window (default 200000): last-resort fallback when no other source resolves a limit for the model; does NOT cap a natively-resolved window (#5908); prefer compress.modelContextLimit.</li>
           <li data-i18n-html="tt.ib2"><code>imageBilling</code> — global image-token estimation: "auto" (default → pixels), "pixels" or "bytes" (explicit opt-in for byte relays).</li>
           <li data-i18n-html="tt.itc2"><code>imageTokenCap</code> — global per-image token cap; unset = uncapped (BILI_IMAGE_TOKEN_CAP wins, read live).</li>
           <li data-i18n-html="tt.ir2"><code>imageRescale</code> — egress downscale switch; large outbound images sent shrunken, originals kept byte-exact in session storage.</li>

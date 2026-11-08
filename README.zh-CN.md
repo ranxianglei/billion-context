@@ -79,21 +79,7 @@ QQ群:
 
 ## 工作原理
 
-```
-编程助手 (Claude Code / Codex / Cursor / Aider ...)
-        │  你把助手的 base URL 指向 proxy
-        ▼
-┌─────────────────┐
-│  billion-context│   1. 解析请求(Anthropic 或 OpenAI 格式)
-│     proxy       │   2. 对对话运行 acp-kernel 压缩
-│                 │   3. 注入 `compress` 工具 + 压缩哲学
-│                 │   4. 转发到真实模型 API
-│                 │   5. 重写流式响应
-└─────────────────┘
-        │
-        ▼
-   真实模型 API (Anthropic / OpenAI / 兼容厂商)
-```
+![工作原理](docs/how-it-works.zh-CN.svg)
 
 ### 上下文管理工具
 
