@@ -141,7 +141,8 @@ export function tripwireCompare(plane: BiliMessage[], legacy: BiliMessage[]): { 
         for (let f = 0; f < a.length; f++) {
             if (a[f] !== b[f]) {
                 const head = (v: unknown) => JSON.stringify(String(v ?? "")).slice(0, 400);
-                return { ok: false, reason: `shape@${i}:${TRIPWIRE_FIELDS[f]}`, firstDiff: `${TRIPWIRE_FIELDS[f]} plane(len=${String(a[f] ?? "").length})=${head(a[f])} legacy(len=${String(b[f] ?? "").length})=${head(b[f])}` };
+                const tail = (v: unknown) => JSON.stringify(String(v ?? "")).slice(-200);
+                return { ok: false, reason: `shape@${i}:${TRIPWIRE_FIELDS[f]}`, firstDiff: `${TRIPWIRE_FIELDS[f]} plane(len=${String(a[f] ?? "").length})=${head(a[f])} …tail=${tail(a[f])} | legacy(len=${String(b[f] ?? "").length})=${head(b[f])} …tail=${tail(b[f])}` };
             }
         }
     }
@@ -376,7 +377,11 @@ export function buildSnapEgressView(
         const planeText = r.msg!.text;
         for (let k = ci; k < clientJoin; k++) {
             const c = clientMsgs[k];
-            const paired = r.ids.has(c.id) || sigOf(c) === sigOf(r.msg!);
+            // Tool results carry no host-echoed message id (openai wire keys
+            // them by tool_call_id) and a trimmed body fails sigOf — pair them
+            // by toolCallId, which both sides always carry.
+            const sameCall = typeof c.toolCallId === "string" && c.toolCallId === r.msg!.toolCallId;
+            const paired = r.ids.has(c.id) || sameCall || sigOf(c) === sigOf(r.msg!);
             if (!paired) continue;
             if (typeof c.text === "string" && typeof planeText === "string" && planeText.startsWith(c.text)) {
                 clientText.set(i, c.text);
