@@ -180,7 +180,12 @@ test("#5974 case 3 (negative bound): a divergence no folding can absorb never yi
         // fit declared); the corrected walk must say the reconstruction still
         // overflows.
         assert.equal(r.fitsWindow, false, "the corrected scale cannot fit — the walk must not declare a fit");
-        assert.ok(!(r.failure === undefined && r.fitsWindow), "an unabsorbable divergence must surface as a non-fit verdict, never as an early-fit exit");
+        // The mock upstream never transiently fails and no client signal aborts
+        // this call, so any failure here must be the honest exhaustion verdict
+        // — pin the KIND, not just the presence, so a future regression that
+        // misclassifies the bail as a relay failure ("upstream") or an abort is
+        // caught.
+        assert.ok(r.failure === undefined || r.failure.kind === "exhausted", `an unabsorbable divergence must surface as an honest exhaustion verdict, never a relay-failure misclassification (got ${r.failure?.kind ?? "none"})`);
     } finally {
         up.server.close();
         await once(up.server, "close");
