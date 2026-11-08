@@ -65,11 +65,34 @@ test("#5981: empty args from a truncated stream get a re-issue receipt, not the 
     assert.ok(out.includes("ONE 'content' STRING"), `keeps the retry target actionable: ${out}`);
 });
 
-test("#5981: the lost-in-transit receipt does not charge the model's failure ledgers", () => {
+test("#5981: the lost-in-transit receipt does not charge the model's spec repeat guard", () => {
     const ctx = makeCompressibleCtx();
     noteTruncatedUpstream(ctx.session, "openai", "read-error");
     runApply(ctx, {});
-    assert.equal(ctx.session.metadata["compressFailKeys"], undefined, "no #847 streak recorded for a transport failure");
+    assert.equal(ctx.session.metadata["compressFailKeys"], undefined, "the model never sent a spec — the #847 spec ledger must stay clean");
+});
+
+// The re-issue advice must be BOUNDED. A transport that stays broken would
+// otherwise let the model retry a dead stream until the turn dies — the exact
+// runaway the session-level #4812 streak (#2146) exists to stop. So the streak
+// IS charged even though the spec ledger is not.
+test("#5981: repeated lost-in-transit refusals arm the session breaker and collapse the advice", () => {
+    const ctx = makeCompressibleCtx();
+    let out = "";
+    for (let i = 0; i < 5; i++) {
+        noteTruncatedUpstream(ctx.session, "openai", "read-error");
+        out = runApply(ctx, {});
+    }
+    const streak = ctx.session.metadata["compressFailStreak"] as { n: number } | undefined;
+    assert.ok(streak !== undefined && streak.n >= 4, `streak advanced (got ${streak?.n})`);
+    assert.ok(!out.includes("RE-ISSUE the compress call"), "past the threshold the armed refusal replaces the unbounded re-issue: " + out);
+});
+
+test("#5981: a single lost-in-transit refusal is not yet collapsed", () => {
+    const ctx = makeCompressibleCtx();
+    noteTruncatedUpstream(ctx.session, "openai", "read-error");
+    const out = runApply(ctx, {});
+    assert.ok(out.includes("RE-ISSUE the compress call"), out);
 });
 
 // Negative direction (gate discipline, #3617): with no stamp the #1366 receipt
