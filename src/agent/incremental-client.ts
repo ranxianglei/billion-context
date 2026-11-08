@@ -270,7 +270,13 @@ function claimableDeltaMsgIds(conversationId: string, ids: string[]): string[] |
 }
 
 const PROBE_TTL_MS = 30_000;
-const probeCache = new Map<string, { ok: boolean; cacheControlRetouch: boolean; at: number }>();
+const probeCache = new Map<string, { ok: boolean; cacheControlRetouch: boolean; responsesInput: boolean; at: number }>();
+
+export function incrementalResponsesInputEnabled(proxyBase: string): boolean {
+    const cached = probeCache.get(proxyBase);
+    return cached !== undefined && cached.ok && cached.responsesInput && Date.now() - cached.at < PROBE_TTL_MS;
+}
+
 
 /** The optional envelope extension must be positively advertised by the server.
  * Older servers ignore unknown fields, so sending retouches to them is unsafe. */
@@ -287,17 +293,19 @@ export async function probeIncrementalTurns(proxyBase: string, fetchImpl: typeof
     if (cached && now - cached.at < PROBE_TTL_MS) return cached.ok;
     let ok = false;
     let cacheControlRetouch = false;
+    let responsesInput = false;
     try {
         const res = await fetchImpl(`${proxyBase}/__bili/plugin/turn`, { method: "GET", signal: AbortSignal.timeout(3000) });
         if (res.ok) {
-            const body = await res.json() as { enabled?: unknown; cacheControlRetouch?: unknown };
+            const body = await res.json() as { enabled?: unknown; cacheControlRetouch?: unknown; responsesInput?: unknown };
             ok = body.enabled === true;
             cacheControlRetouch = body.cacheControlRetouch === true;
+            responsesInput = body.responsesInput === true;
         }
     } catch {
         ok = false;
     }
-    probeCache.set(proxyBase, { ok, cacheControlRetouch, at: now });
+    probeCache.set(proxyBase, { ok, cacheControlRetouch, responsesInput, at: now });
     return ok;
 }
 

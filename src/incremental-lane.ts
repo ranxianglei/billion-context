@@ -67,6 +67,7 @@ import { pluginAgentHeader, pluginReportedModel } from "./plugin.js";
 import { headerValue, readBody } from "./server.js";
 import { featureEnabled } from "./rollout.js";
 import { MSG_IDS_BODY_FIELD, MSG_SEQS_BODY_FIELD, applyMsgIdPin, validateMsgIds } from "./msgid-pin.js";
+import { handleResponsesInputTurn, resetResponsesInputLane } from "./responses-lane.js";
 
 export const INCREMENTAL_TURN_PATH = "/__bili/plugin/turn";
 
@@ -743,6 +744,7 @@ export function __incrementalPtrChainForTests(conversationId: string): Promise<v
 }
 
 export function __resetIncrementalLaneForTests(): void {
+    resetResponsesInputLane();
     canonicalCache.clear();
     inFlight.clear();
     pendingPtrWork.clear();
@@ -801,6 +803,7 @@ export function handleIncrementalProbe(res: http.ServerResponse, conversationId?
         // /__bili/plugin/render endpoint). Shims gate their splice on this.
         serverHistory: featureEnabled("pluginLaneServerHistory"),
         cacheControlRetouch: true,
+        responsesInput: true,
         ...(conversation !== undefined ? { conversation } : {}),
     });
 }
@@ -839,6 +842,9 @@ export async function handleIncrementalTurn(
         ? originalPath
         : typeof payload.path === "string" && payload.path.length > 0 ? payload.path : "/v1/messages";
     if (!path.startsWith("/") || path.length > 2048) return jsonReply(res, 400, { error: "path must be a relative HTTP path (/v1/messages or /bili/<upstream>/…)" });
+    if (payload.wireFormat === "responses") return handleResponsesInputTurn(req, res, payload, conversationId, path, inFlight, forward);
+    if (payload.wireFormat !== undefined && payload.wireFormat !== "anthropic")
+        return jsonReply(res, 400, { error: "unsupported incremental wire format" });
     const request = payload.request && typeof payload.request === "object" && !Array.isArray(payload.request) ? payload.request as Record<string, unknown> : {};
     const model = typeof payload.model === "string" && payload.model.length > 0 ? payload.model : pluginReportedModel(req.headers);
     const forwarded: Record<string, unknown> = {};
