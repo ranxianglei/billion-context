@@ -974,6 +974,14 @@ export class UnifiedShadow {
         return this.sync.snapplaneStatus();
     }
 
+    /** #5874 P2 (mapEgress): S4-verified plane view for egress assembly.
+     *  null when there is no sync store (async backend) — callers keep the
+     *  legacy egress bytes. */
+    snapEgressView(sessionId: string): import("./snap.js").SnapView | null {
+        if (this.sync === null) return null;
+        return this.sync.snapEgressView(sessionId);
+    }
+
     vacuum(mode: "full" | "incremental"): void {
         if (this.sync === null) throw new Error("[storage] sync vacuum unavailable on a network backend");
         return this.sync.vacuum(mode);

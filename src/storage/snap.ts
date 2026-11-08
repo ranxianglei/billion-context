@@ -55,7 +55,7 @@ export type SnapEvent =
 /** Read-side view of one session's plane (proposal stage 4, mapEgress's
  *  input in P2 — in P1 it is the A/B oracle). `rows` is pos-ordered with
  *  the S4 checksums recomputed; `tailSeq`/`checksum` anchor verification. */
-interface SnapView {
+export interface SnapView {
     sid: string;
     rows: {
         pos: number;

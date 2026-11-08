@@ -1,6 +1,6 @@
 # 提案：快照表式压缩底座（六段固定链，单一存储真源）
 
-> **状态：P0 + P1 已在 [#5901](https://github.com/ranxianglei/billion-context/pull/5901) 实现**（schema v12；影子写 soak，出站零行为变化）；P2（出站切换）仍待 owner 裁定。
+> **状态：P0 + P1 + P2 已在 [#5901](https://github.com/ranxianglei/billion-context/pull/5901) 实现**（schema v12；影子写 soak；P2 = mapEgress 带 tripwire 保护的出站切换，soak 期间随 `ci:full` + 本地 gate 以 100% 运行，发版前与其他 soak 旗一样改回先关后发）。
 > 2026-11-07 作为设计提案撰写；本文件是已落地实现的设计记录。
 > **基线：** origin/master（写于 2026-11-07；存储 schema v11，#5854 已把 v6 整线撤出 master）。
 > **来源讨论：** [#5643](https://github.com/ranxianglei/billion-context/issues/5643)（含定位纠正评论）。
@@ -313,7 +313,7 @@ CI：docker gate + 求解器无关；hermetic，端口 listen(0)（#360 纪律�
 | **P2** | 单车道 hydrate-egress 切源灰度（cohort 首个成员，建议 pi 或 dsh 之一） | 灰度会话读出站来自新表 | T5/T10/T11/T12 + A/B 钉常开 + tripwire 抽样在场；exit switch 一键回退 |
 | **P3** | decompress/export/UI/计费逐一切换；CCR/persona 处置；#3756 退役判断；cohort 名单扩员 | 消费方逐个切换 | T8 + 全矩阵复跑；每期独立 PR |
 
-**E 裁定建议维持**：本期范围到 P0+P1 收手交验收；P2 的字节对等风险集中，独立 PR + 灰度基建齐备后再上。落地形式：#5901 单 PR 同时承载 P0+P1（2026-11-08 落地）；P2 仍按计划另开。
+**E 裁定的 P2 部分被 owner 推翻**：owner 要求单 PR 完成（#5901 现承载 P0+P1+P2）。P2 落地为 `mapEgress`（[src/server/snap-egress.ts](../../../src/server/snap-egress.ts)）：每个出站轮先拼平面视图（锚点 + 存活行 + 客户端尾窗，缝合与 #3756 同法），重放本车道后处理链，归一化完全一致才切出站字节（tripwire 逐轮全量比对 —— 比提案的抽样更严）；任何不一致保留旧字节，同会话累计 3 次不一致粘性排除。cohort = 协议车道（`storage.snapBase.egressCohorts`，默认四条全开），见[配置文档](../../configuration.zh-CN.md)。
 
 ---
 

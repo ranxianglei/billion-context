@@ -23,6 +23,7 @@ import { getUpdateVisibility, updateBannerPayload } from "../update-notes.js";
 import { installVersionAction, triggerManualCheck, updateActionsAvailable, updateStateSnapshot } from "./update-actions.js";
 import { getUnrecognizedPathStats } from "./observability.js";
 import { getStore } from "../persist.js";
+import { snapEgressStatusWire } from "./snap-egress.js";
 import { fileSnapBase } from "../knobs.js";
 import type { SnapPlaneStatusWire } from "../storage/snap.js";
 import { BodyTooLargeError, headerValue, readBody } from "../server.js";
@@ -1319,7 +1320,7 @@ async function sendStatus(res: http.ServerResponse, opts: ProxyOptions, laneHost
             loggerLog("warn", `split-session canary (#2170): conversation ${w.base} has live traffic under multiple session keys (design persona forks are excluded): ${w.sessions.map((s) => `${s.id} (requests=${s.requests})`).join("; ")}. For a non-persona host this is the #2165 failure shape (stolen anchor / never-compressing split) — investigate if unexpected.`);
         }
     }
-    res.end(JSON.stringify({ version: VERSION, commit: BUILD_COMMIT, origin: laneHost ?? null, diskVersion, stale, lastInstall, updateReady: updateReadyPayload(), autoRestartOnUpdate: opts.autoRestartOnUpdate, advisory: currentAdvisoryPayload(), resolverWedge: getResolverWedgeState(), updatePolicy: updatePolicyPayload(), pluginAdvisories: detectCostAdvisories(process.env), inFlight: totalInFlight(), splitSessions: splitWarnings, conflicts: summarizeConflicts(listSessions()), storage: storageStatusWire(), snapshotShadow: snapshotShadowStatusWire(), snaplane: snapplaneStatusPayload(), attribution: attributionStatusWire() }, null, 2));
+    res.end(JSON.stringify({ version: VERSION, commit: BUILD_COMMIT, origin: laneHost ?? null, diskVersion, stale, lastInstall, updateReady: updateReadyPayload(), autoRestartOnUpdate: opts.autoRestartOnUpdate, advisory: currentAdvisoryPayload(), resolverWedge: getResolverWedgeState(), updatePolicy: updatePolicyPayload(), pluginAdvisories: detectCostAdvisories(process.env), inFlight: totalInFlight(), splitSessions: splitWarnings, conflicts: summarizeConflicts(listSessions()), storage: storageStatusWire(), snapshotShadow: snapshotShadowStatusWire(), snaplane: snapplaneStatusPayload(), egress: snapEgressStatusWire(), attribution: attributionStatusWire() }, null, 2));
 }
 
 // #5874: the snapshot-table plane's /__bili/status field — flag state

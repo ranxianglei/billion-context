@@ -2430,6 +2430,18 @@ export class SessionStore {
         }
     }
 
+    /** #5874 P2 (mapEgress): the S4-verified plane view for egress assembly.
+     *  null when the unified store is unavailable or the sid has no plane
+     *  yet — callers keep the legacy egress bytes. */
+    snapEgressView(sessionId: string): import("./storage/snap.js").SnapView | null {
+        if (!this.replicasAvailable()) return null;
+        try {
+            return this.liveShadow().snapEgressView(sessionId);
+        } catch {
+            return null; // sidecar degraded mid-call — degrade, never fail the turn
+        }
+    }
+
     /** #3928: physical index.db shrink after deletions (`bili sessions rm`).
      *  Throws on failure — the deletion itself is already committed, callers
      *  report the shrink as partial. Throws in legacy-only lanes — check

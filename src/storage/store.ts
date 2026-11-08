@@ -31,7 +31,9 @@ import {
     snapGcCoveredRows,
     snapL1Record,
     snapplaneStatusWire,
+    SnapPlaneDeadError,
     type SnapEvent,
+    type SnapView,
 } from "./snap.js";
 import { recordIntegrityOutcome, recordSecondProcessOwner, recordBackupOutcome } from "./runtime-status.js";
 import { integrityModeFor, writeIntegrityCache, scheduleBackgroundIntegrityCheck, backgroundIntegrityInflightForTests, noteIntegrityCheckRun } from "./integrity-check.js";
@@ -1747,6 +1749,22 @@ export class UnifiedStore {
      *  plane counters + dead latches). Wire-safe: no Buffer, no functions. */
     snapplaneStatus() {
         return snapplaneStatusWire(this.db as unknown as Parameters<typeof snapplaneStatusWire>[0], this.snapPlane);
+    }
+
+    /** #5874 P2 (mapEgress): the S4-verified plane view for egress assembly.
+     *  null when the plane has no rows for this sid yet (nothing initialized
+     *  — not a degrade). A fresh R1 verdict (checksum mismatch) latches the
+     *  sticky dead flag and returns null — the caller keeps legacy bytes. */
+    snapEgressView(sessionId: string): SnapView | null {
+        try {
+            return readSnapView(this.db as unknown as Parameters<typeof readSnapView>[0], sessionId);
+        } catch (err) {
+            if (err instanceof SnapPlaneDeadError) {
+                loggerLog("warn", `[snaplane] sid=${sessionId} egress read hit a dead plane (R1) — legacy egress kept`);
+                return null;
+            }
+            throw err;
+        }
     }
 
     /** #3250: cadence-tick WAL reclamation (see WAL_CHECKPOINT_EVERY_INGESTS).

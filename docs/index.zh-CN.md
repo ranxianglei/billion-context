@@ -35,4 +35,4 @@
 | [lifecycle](lifecycle.md) | 过渡开关台账 / 退役模块盘点 / 卫生记录（CI 强制 `BILI_*` 覆盖） |
 | [auto-merge-guardrails](auto-merge-guardrails.md) | `AGENTS.md` §7 背后的证据附录（AI 自动开发评审史） |
 | [unified-loop-spec](unified-loop-spec.md) | 历史设计：统一压缩循环规格（已落地，以代码为准） |
-| [快照表底座](proposals/snapshot-compression-foundation/README.zh-CN.md) / [EN](proposals/snapshot-compression-foundation/README.md) | 设计记录：六段固定链、单一存储真源（#5874）。P0+P1 已在 #5901 落地；P2 出站切换待 owner 裁定 |
+| [快照表底座](proposals/snapshot-compression-foundation/README.zh-CN.md) / [EN](proposals/snapshot-compression-foundation/README.md) | 设计记录：六段固定链、单一存储真源（#5874）。P0+P1+P2 已在 #5901 落地；P2 = 带 tripwire 保护的 mapEgress 出站切换 |
