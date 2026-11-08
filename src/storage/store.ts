@@ -3628,6 +3628,16 @@ export class UnifiedStore {
                 && parsed.byHash && typeof parsed.byHash === "object"
                 && parsed.byRef && typeof parsed.byRef === "object") {
                 if (requireValid) {
+                    if (Array.isArray(parsed.byHash) || Array.isArray(parsed.byRef)) throw new Error("unreadable CCR shape");
+                    for (const [hash, text] of Object.entries(parsed.byHash)) {
+                        if (typeof text !== "string" || createHash("sha256").update(text).digest("hex") !== hash) {
+                            throw new Error("unreadable CCR original body checksum");
+                        }
+                    }
+                    for (const entry of Object.values(parsed.byRef)) {
+                        if (!entry || typeof entry.hash !== "string" || typeof entry.rawId !== "string"
+                            || !Object.hasOwn(parsed.byHash, entry.hash)) throw new Error("unreadable CCR original body binding");
+                    }
                     const entries = this.db.prepare(`SELECT e.ccr_key, e.content_hash, c.bytes
                         FROM ccr_entries e LEFT JOIN content c ON c.hash = e.content_hash
                         WHERE e.session_id = ?`).all(sessionId) as { ccr_key: string; content_hash: string; bytes: Uint8Array | null }[];

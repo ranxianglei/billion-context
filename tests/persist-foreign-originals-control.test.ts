@@ -148,7 +148,7 @@ test('an outer commit failure preserves pending originals and publishes no owner
     } finally { DatabaseSync.prototype.exec = exec; second?.closeQuietly(); first.closeQuietly(); }
 });
 
-for (const kind of ['malformed', 'null', 'empty', 'binding', 'CAS']) {
+for (const kind of ['malformed', 'null', 'empty', 'binding', 'CAS', 'body']) {
 test(`a fresh writer refuses an unreadable originals mirror with durable bindings (${kind})`, async () => {
     process.env.BILI_STORAGE_UNIFIED = 'full';
     process.env.BILI_STORAGE_JSON_WRITER = 'off';
@@ -169,6 +169,12 @@ test(`a fresh writer refuses an unreadable originals mirror with durable binding
             assert.ok(corrupt);
             const changed = JSON.parse(corrupt);
             changed.byRef.m00001.head = 'different durable entry metadata';
+            corrupt = JSON.stringify(changed);
+        }
+        if (kind === 'body') {
+            assert.ok(corrupt);
+            const changed = JSON.parse(corrupt);
+            changed.byHash[Object.keys(changed.byHash)[0]!] = 'Different original body under its unchanged hash';
             corrupt = JSON.stringify(changed);
         }
         db.prepare('UPDATE sessions SET ccr_json=? WHERE session_id=?').run(corrupt, pending.id);
