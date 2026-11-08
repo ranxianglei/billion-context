@@ -23,7 +23,7 @@ import type { Session } from "./session.js";
 export const NUDGE_CREDIT_ROUNDS = 20;
 
 /** Read-side view of the gate: what applyRanges judges on. */
-export interface UnpromptedGate {
+interface UnpromptedGate {
     /** A nudge credit is LIVE right now: some compression nudge actually reached
      *  the model within the last NUDGE_CREDIT_ROUNDS model rounds (post-gate
      *  delivery fact: nudgeOutcome === "injected" — advisory, decide-directive
@@ -37,7 +37,7 @@ export interface UnpromptedGate {
  *  fact (true = a nudge reached the model in this very round); the module turns
  *  it into the credit transition below. `modelRound` (default true) marks genuine
  *  model rounds that decay the window; bypass shapes pass false to hold it. */
-export interface UnpromptedGateStamp {
+interface UnpromptedGateStamp {
     nudgeInjected: boolean;
     requireNudge: boolean;
     requireRecommendation: boolean;
