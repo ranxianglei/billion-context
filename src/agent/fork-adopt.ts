@@ -8,8 +8,9 @@ import { ACP_NAME_ALT } from "../loop/tag-echo-filter.js";
 
 /**
  * Agent-side fork adoption (#2399): a host extension reads its session header
- * (parent lineage marker — dsh stamps parentSession+isSeeded, pi/omp stamp
- * parentSession alone, opencode V2 derives it from session.created), and
+ * (dsh stamps isSeeded plus parentSession on legacy forks or the adoption-only
+ * forkSource.sessionId on newer ordinary forks; pi/omp stamp parentSession
+ * alone; opencode V2 derives it from session.created), and
  * before a fork child's first model request replays into the proxy, adopts
  * the parent conversation's compression state through the plugin fork
  * protocol (docs/plugin-protocol.md §8). This module is the client half: it projects the
