@@ -98,7 +98,7 @@ function foldedSession(sid: string): { sess: LegacySessionLike; blk: Record<stri
     return { sess, blk, msgs };
 }
 
-function msg(id: string, text: string, role: "user" | "assistant" = "user"): BiliMessage {
+function msg(id: string, text: string, role: "user" | "assistant" | "system" = "user"): BiliMessage {
     return { id, role, contentType: "text", text } as BiliMessage;
 }
 
