@@ -56,6 +56,7 @@ type SnapshotResponse = {
     parentRevision?: string;
     orderHash?: string;
     orderedMessages?: ForkIdentity[];
+    comparison?: "raw";
 };
 
 type ForkAdoptionResult =
@@ -329,14 +330,30 @@ export function matchForkPrefix(core: CoreMessage[], identities: ForkIdentity[])
     return n;
 }
 
-function snapshotOf(raw: unknown): { parentRevision: string; orderHash: string; orderedMessages: ForkIdentity[] } | null {
+/** Match an adoption-only fork coordinate by the durable raw message ids.
+ * DSH copies the inherited event objects, so these ids survive opaque/image
+ * content that cannot safely be compared by text. This is deliberately a
+ * separate mode: ordinary legacy parentSession forks keep the strict identity
+ * hash path above. */
+export function matchForkRawPrefix(core: CoreMessage[], identities: ForkIdentity[]): number {
+    let n = 0;
+    while (n < core.length && n < identities.length && typeof core[n]!.id === "string" && core[n]!.id === identities[n]!.rawId) n += 1;
+    return n;
+}
+
+function snapshotOf(raw: unknown): { parentRevision: string; orderHash: string; orderedMessages: ForkIdentity[]; comparison: "text" | "raw" } | null {
     if (raw === null || typeof raw !== "object") return null;
     const snap = raw as SnapshotResponse;
     if (typeof snap.parentRevision !== "string" || typeof snap.orderHash !== "string" || !Array.isArray(snap.orderedMessages)) return null;
     for (const identity of snap.orderedMessages) {
         if (identity === null || typeof identity !== "object" || typeof identity.rawId !== "string" || (identity.ref !== null && typeof identity.ref !== "string") || typeof identity.identityHash !== "string") return null;
     }
-    return { parentRevision: snap.parentRevision, orderHash: snap.orderHash, orderedMessages: snap.orderedMessages };
+    return {
+        parentRevision: snap.parentRevision,
+        orderHash: snap.orderHash,
+        orderedMessages: snap.orderedMessages,
+        comparison: snap.comparison === "raw" ? "raw" : "text",
+    };
 }
 
 // #2469: error bodies are read BOUNDED — a hostile or misconfigured upstream
@@ -411,6 +428,7 @@ export async function tryForkAdoption(opts: {
     body: unknown;
     fetchImpl?: typeof fetch;
     log?: (line: string) => void;
+    allowOpaque?: boolean;
 }): Promise<ForkAdoptionResult> {
     const doFetch = opts.fetchImpl ?? fetch;
     // #2469: deterministic protocol mismatch ends adoption BEFORE any network
@@ -424,15 +442,24 @@ export async function tryForkAdoption(opts: {
     const core = chatBodyToCore(opts.body);
     if (core === null || core.length === 0) return { outcome: "degraded", reason: "body unmappable" };
     const snapshotUrl = `${opts.base}/__bili/plugin/snapshot?conversationId=${encodeURIComponent(opts.parentConversationId)}`;
+    let rawReferenceRequested = false;
     for (let attempt = 0; attempt < 2; attempt += 1) {
         let snapshot: Awaited<ReturnType<typeof snapshotOf>>;
         try {
-            const res = await doFetch(snapshotUrl, { signal: AbortSignal.timeout(SNAPSHOT_TIMEOUT_MS) });
+            const url = rawReferenceRequested ? `${snapshotUrl}&mode=raw` : snapshotUrl;
+            const res = await doFetch(url, { signal: AbortSignal.timeout(SNAPSHOT_TIMEOUT_MS) });
             if (!res.ok) {
                 // #2469: surface the proxy's bounded diagnostics (e.g. 409
                 // SNAPSHOT_UNAVAILABLE + why) instead of hiding them behind a
-                // bare status code.
+                // bare status code. New DSH forkSource coordinates may safely
+                // retry an opaque snapshot through the raw-id reference view;
+                // legacy parentSession forks remain text-comparison-only.
                 const detail = await readBoundedErrorBody(res);
+                if (!rawReferenceRequested && opts.allowOpaque === true && res.status === 409 && detail.code === "SNAPSHOT_UNAVAILABLE") {
+                    rawReferenceRequested = true;
+                    attempt -= 1;
+                    continue;
+                }
                 return { outcome: "degraded", reason: `snapshot http ${res.status}${detail.code ? ` ${detail.code}` : ""}${detail.error ? ` (${detail.error})` : ""}` };
             }
             snapshot = snapshotOf(await res.json());
@@ -440,12 +467,15 @@ export async function tryForkAdoption(opts: {
             return { outcome: "degraded", reason: `snapshot error ${err instanceof Error ? err.message : String(err)}` };
         }
         if (snapshot === null) return { outcome: "degraded", reason: "snapshot malformed" };
-        const branchPoint = matchForkPrefix(core, snapshot.orderedMessages);
+        const branchPoint = snapshot.comparison === "raw"
+            ? matchForkRawPrefix(core, snapshot.orderedMessages)
+            : matchForkPrefix(core, snapshot.orderedMessages);
         if (branchPoint === 0) return { outcome: "degraded", reason: "no prefix match" };
         const prefix = snapshot.orderedMessages.slice(0, branchPoint);
         const orderHash = branchPoint === snapshot.orderedMessages.length ? snapshot.orderHash : forkOrderHashOf(prefix);
         const payload = {
-            protocolVersion: 1,
+            protocolVersion: snapshot.comparison === "raw" ? 2 : 1,
+            ...(snapshot.comparison === "raw" ? { comparison: "raw" as const } : {}),
             parentConversationId: opts.parentConversationId,
             childConversationId: opts.childConversationId,
             parentRevision: snapshot.parentRevision,
@@ -514,7 +544,7 @@ export async function manifestForkCapable(base: string, fetchImpl?: typeof fetch
     }
 }
 
-export type ForkAdoptInput = { base: string; parent: string; child: string; body: unknown };
+export type ForkAdoptInput = { base: string; parent: string; child: string; body: unknown; allowOpaque?: boolean };
 
 /** Per-host fork-adoption coordinator (#2399 stage 2): absorbs the bookkeeping
  *  every host needs (done/attempts/single-flight keyed by child id, the
@@ -572,6 +602,7 @@ export function createForkAdopter(log: (line: string) => void, opts?: { maxAttem
             body: input.body,
             fetchImpl: opts?.fetchImpl,
             log,
+            allowOpaque: input.allowOpaque,
         });
         if (result.outcome === "adopted") {
             done.add(input.child);
