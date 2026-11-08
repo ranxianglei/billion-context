@@ -84,15 +84,15 @@ export function upstreamTimeoutMs(): number {
     return Number.isInteger(v) && v > 0 ? v : UPSTREAM_TIMEOUT_MS;
 }
 
-/** BILI_UPSTREAM_FIRST_BYTE_MS > network.upstreamFirstByteMs > the full
- *  upstream timeout (120000s-free default = UPSTREAM_TIMEOUT_MS, so unset =
- *  byte-identical to the single-phase watchdog). Phase-1 budget: request fully
- *  sent → first response byte. Bounds "upstream accepted the request but never
- *  answered" separately from mid-stream silence, which keeps the #1706/#1714
- *  guarantee that long silent prefills are never truncated by default (#5904:
- *  a GPU-restart-cold sglang answered one fold in 73s, then accepted the next
- *  request and never answered — the turn sat silent until the client's 300s
- *  abort; the release gate now sets 45s here to catch that wedge fast). */
+/** BILI_UPSTREAM_FIRST_BYTE_MS > network.upstreamFirstByteMs > UPSTREAM_FIRST_BYTE_MS
+ *  (= UPSTREAM_TIMEOUT_MS, so unset = byte-identical to the single-phase
+ *  watchdog). Phase-1 budget: request fully sent → first response byte. Bounds
+ *  "upstream accepted the request but never answered" separately from mid-stream
+ *  silence, which keeps the #1706/#1714 guarantee that long silent prefills are
+ *  never truncated by default (#5904: a GPU-restart-cold sglang answered one
+ *  fold in 73s, then accepted the next request and never answered — the turn sat
+ *  silent until the client's 300s abort; the release gate sets 120000ms here to
+ *  catch that wedge fast). */
 export function upstreamFirstByteMs(): number {
     const v = tNum("BILI_UPSTREAM_FIRST_BYTE_MS", fileNetwork().upstreamFirstByteMs);
     return Number.isInteger(v) && v > 0 ? v : UPSTREAM_FIRST_BYTE_MS;

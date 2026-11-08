@@ -28,7 +28,7 @@ export const UPSTREAM_TIMEOUT_MS = 12 * 60 * 1000;
 /** Default phase-1 (request → first response byte) budget. Equals the full
  *  idle budget so the default behavior is byte-identical to the pre-#5904
  *  single-phase watchdog — deployments that can bound first-byte latency
- *  tighter (the release gate sets 45s) opt in via
+ *  tighter (the release gate sets 120000ms) opt in via
  *  BILI_UPSTREAM_FIRST_BYTE_MS / network.upstreamFirstByteMs. */
 export const UPSTREAM_FIRST_BYTE_MS = UPSTREAM_TIMEOUT_MS;
 
