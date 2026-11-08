@@ -429,6 +429,13 @@ async function handleRequest(
         if (!passthroughMark && protocol !== null && bodyBuffer.length > 0) {
             try {
                 const decoded = await decodeRequestBody(headerValue(req, "content-encoding"), bodyBuffer, knobLimitsDecodedBytes(), { signal: decodingSignal, onBytes: (bytes) => admission.observe(bytes) });
+                // #5794: identity (uncompressed) bodies never fire the onBytes
+                // hook above — it only runs inside the decompression path — so
+                // they were invisible to the large-body slot budget (a 51.2 MiB
+                // plain-JSON body consumed no slot at all). Observe the decoded
+                // size here; idempotent — a compressed body already observed
+                // via onBytes is admitted and this no-ops.
+                admission.observe(decoded.body.byteLength);
                 bodyBuffer = decoded.body;
                 if (decoded.decoded) delete req.headers["content-encoding"];
             } catch (decErr) {
