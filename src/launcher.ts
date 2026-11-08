@@ -5018,7 +5018,7 @@ interface WedgedLedgerEntry {
  *  window instead of inheriting the dead occupant's history. Concurrent hosts
  *  sharing one file can race on read-modify-write; the worst case loses one
  *  observation (the window lengthens by one cycle), which is safe. */
-export function wedgedLedgerFilePath(): string {
+function wedgedLedgerFilePath(): string {
     return path.join(stateDir(), "wedged-takeover.json");
 }
 
