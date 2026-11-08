@@ -7,8 +7,8 @@
 
 ## 整体架构（截至 2026-11-08，master，存储 schema v11）
 
-![整体架构](./assets/architecture-current.zh-CN.svg)
-（位图备选：[architecture-current.zh-CN.png](./assets/architecture-current.zh-CN.png)）
+![整体架构](./architecture/assets/architecture-current.zh-CN.svg)
+（位图备选：[architecture-current.zh-CN.png](./architecture/assets/architecture-current.zh-CN.png)）
 
 读图方式：
 

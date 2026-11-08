@@ -7,8 +7,8 @@
 
 ## Overall architecture (as of 2026-11-08, master, storage schema v11)
 
-![Overall architecture](./assets/architecture-current.en.svg)
-(bitmap fallback: [architecture-current.en.png](./assets/architecture-current.en.png))
+![Overall architecture](./architecture/assets/architecture-current.en.svg)
+(bitmap fallback: [architecture-current.en.png](./architecture/assets/architecture-current.en.png))
 
 How to read it:
 

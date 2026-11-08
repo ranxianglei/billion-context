@@ -54,6 +54,16 @@ else {
 const hubDir = join(ROOT, 'docs');
 const hubEn = readFileSync(join(hubDir, 'architecture.md'), 'utf8');
 const hubZh = readFileSync(join(hubDir, 'architecture.zh-CN.md'), 'utf8');
+// hub diagrams: the hub lives in docs/, its images in docs/architecture/assets/ —
+// the link MUST be ./architecture/assets/... (a bare ./assets/ 404s: that bug
+// shipped once with the first hub revision, the rendered image pointed at docs/assets/)
+for (const [hub, lang] of [[hubEn, 'en'], [hubZh, 'zh-CN']]) {
+  for (const ext of ['svg', 'png']) {
+    const link = `./architecture/assets/architecture-current.${lang}.${ext}`;
+    if (!hub.includes(`](${link})`)) fail(`docs/architecture.${lang === 'en' ? '' : 'zh-CN.'}md does not link ${link}`);
+    if (!existsSync(join(hubDir, 'architecture/assets/architecture-current.' + lang + '.' + ext))) fail(`missing hub diagram: docs/architecture/assets/architecture-current.${lang}.${ext}`);
+  }
+}
 const ledgerSlugs = [...hubEn.matchAll(/^\|\s*`([a-z-]+)`\s*\|/gm)].map((m) => m[1]);
 if (ledgerSlugs.length === 0) fail('hub ledger: no module rows parsed from docs/architecture.md');
 const activeSlugs = [];
