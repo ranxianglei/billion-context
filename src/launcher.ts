@@ -330,7 +330,7 @@ export interface LauncherDeps {
     fetchHealthInfoNoReuse?: (origin: string) => Promise<HealthInfo | undefined>;
     /** #3544: ask a stale resident to drain+exit (POST /__bili/shutdown).
      *  Default hits the real endpoint; tests stub it. */
-    requestInstanceShutdown?: (origin: string) => Promise<boolean>;
+    requestInstanceShutdown?: (origin: string, timeoutMs?: number) => Promise<boolean>;
     /** #1292: simulated OS for spawn planning and platform-gated arg
      *  construction — tests drive win32 paths from a POSIX host. Defaults
      *  to process.platform. */
@@ -4890,7 +4890,7 @@ const OWNER_HEARTBEAT_POST_TIMEOUT_MS = 2_000;
 const WATCHER_REG_ATTEMPTS = 3;
 const WATCHER_REG_RETRY_BACKOFF_MS = 500;
 
-export async function requestInstanceShutdown(origin: string): Promise<boolean> {
+export async function requestInstanceShutdown(origin: string, timeoutMs = SHUTDOWN_REQUEST_TIMEOUT_MS): Promise<boolean> {
     try {
         const res = await fetch(`${origin}/__bili/shutdown`, {
             method: "POST",
@@ -4899,7 +4899,10 @@ export async function requestInstanceShutdown(origin: string): Promise<boolean> 
             // would only extend the drain it is about to run.
             headers: { "content-type": "application/json", connection: "close" },
             body: "{}",
-            signal: AbortSignal.timeout(SHUTDOWN_REQUEST_TIMEOUT_MS),
+            // #5955: the wedged-takeover path passes a SHORT budget — a holder
+            // whose health is silent never reads this POST, so the full 3s is dead
+            // weight on the takeover's critical path.
+            signal: AbortSignal.timeout(timeoutMs),
         });
         return res.ok;
     } catch {
@@ -4998,9 +5001,21 @@ async function rotateStalePredecessor(
 export const WEDGED_TAKEOVER_WINDOW_MS = 600_000; // 10 min = 2× WATCHDOG_HARD_TIMEOUT_MS (event-loop-watchdog.ts)
 export const WEDGED_MIN_OBSERVATIONS = 3;         // distinct bring-up cycles, not milliseconds — retry cadence varies per host
 export const WEDGED_OBSERVATION_STALE_MS = 300_000; // gap > this ⇒ the consecutive run was interrupted ⇒ the window restarts
-const WEDGED_TERM_GRACE_MS = 2_000;               // SIGTERM drain budget before the hard kill (POSIX only)
-const WEDGED_RELEASE_WAIT_MS = 5_000;             // per-stage budget to observe the listener close
+const WEDGED_RELEASE_WAIT_MS = 5_000;             // budget to observe the listener close AFTER the hard kill (the only stage that can actually need it)
+// #5955 (measured, win32 acceptance run): taskkill /F /T → first successful
+// bind is 162–252 ms across 4 runs, so 2s is an ~8× safety margin, not a tuned
+// value — kept deliberately conservative because a lost race costs a whole
+// bring-up cycle.
 const WEDGED_POST_KILL_SETTLE_MS = 2_000;         // grace for kernel socket release after an ABRUPT kill before we bind (#5955)
+// #5955: a takeover candidate is BUSY *by construction* (TCP alive, health
+// silent across ≥ WEDGED_MIN_OBSERVATIONS bring-up cycles) — its event loop is
+// saturated, so the graceful stages below are insurance, not a realistic path.
+// Paying the full graceful budget there is pure latency: the measured win32
+// takeover spent 12.4s of 13.8s inside them (3s POST timeout + 5s wait + 2s
+// SIGTERM drain) before the hard kill it always ends in. Short stage budgets
+// cut the worst case to ~4s without removing any stage.
+export const WEDGED_BUSY_REQUEST_TIMEOUT_MS = 750; // shutdown POST budget for a health-silent holder
+const WEDGED_BUSY_GRACE_MS = 500;                 // per-stage budget to observe the listener close
 
 interface WedgedLedgerEntry {
     pid: number;
@@ -5187,7 +5202,7 @@ async function resolveWedgedSameLaneHolder(
     birthStamp: (pid: number) => Promise<string | undefined>,
     now: () => number,
     sleep: (ms: number) => Promise<void>,
-    requestShutdown: (origin: string) => Promise<boolean>,
+    requestShutdown: (origin: string, timeoutMs?: number) => Promise<boolean>,
     isConnectable: (origin: string) => Promise<boolean>,
     signalHolder: (pid: number) => void,
     hardKillHolder: (pid: number) => void,
@@ -5246,12 +5261,14 @@ async function resolveWedgedSameLaneHolder(
         console.error(msg);
         teeLog("warn", msg);
         const t0 = now();
-        await requestShutdown(c.inst.origin);
-        let released = await waitForListenerClose(c.inst.origin, isConnectable, now, sleep, WEDGED_RELEASE_WAIT_MS);
+        // #5955: BUSY by construction — see WEDGED_BUSY_*_MS. Every stage stays,
+        // each gets a short budget instead of the full graceful ladder.
+        await requestShutdown(c.inst.origin, WEDGED_BUSY_REQUEST_TIMEOUT_MS);
+        let released = await waitForListenerClose(c.inst.origin, isConnectable, now, sleep, WEDGED_BUSY_GRACE_MS);
         let killedHard = false;
         if (!released) {
             signalHolder(c.inst.pid);
-            released = await waitForListenerClose(c.inst.origin, isConnectable, now, sleep, WEDGED_TERM_GRACE_MS);
+            released = await waitForListenerClose(c.inst.origin, isConnectable, now, sleep, WEDGED_BUSY_GRACE_MS);
         }
         if (!released) {
             hardKillHolder(c.inst.pid);
@@ -6300,7 +6317,7 @@ export async function ensureProxyRunning(
  *  stays as the fallback if taskkill itself fails. Failures are surfaced,
  *  never swallowed (#4125): a "killed" holder that survives keeps holding its
  *  listener, and the caller's release verification is what catches that. */
-function hardKillProxyTree(pid: number, label: string): void {
+export function hardKillProxyTree(pid: number, label: string): void {
     if (process.platform !== "win32") {
         try {
             process.kill(pid, "SIGKILL");
@@ -6329,7 +6346,13 @@ function hardKillProxyTree(pid: number, label: string): void {
     try {
         process.kill(pid, "SIGKILL");
     } catch (err) {
-        teeLog("warn", `bili: direct SIGKILL of ${label} ${pid} failed (${err instanceof Error ? err.message : String(err)}) — its listener may survive the cleanup (#4125)`);
+        // #5955: ESRCH here means taskkill ALREADY reaped the pid — the goal is
+        // met, and reporting a possible survivor on every single takeover is the
+        // noise that trains operators to ignore this log. Mirrors the POSIX
+        // branch above; any other errno is still surfaced (#4125).
+        if ((err as NodeJS.ErrnoException)?.code !== "ESRCH") {
+            teeLog("warn", `bili: direct SIGKILL of ${label} ${pid} failed (${err instanceof Error ? err.message : String(err)}) — its listener may survive the cleanup (#4125)`);
+        }
     }
 }
 
