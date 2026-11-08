@@ -159,6 +159,16 @@ Env vars are a **scarce surface**: by default a new behavior knob becomes a conf
 - Hex escapes required for any ACP-tag XML in source files (see KDD #2)
 - **No `console.error` in server-side modules** — use `loggerLog(level, msg)` from `src/logger.ts`. Exceptions: `src/cli.ts` (user-facing CLI errors) and `src/index.ts` (pre-logger startup crash).
 
+### Documentation Layout (owner ruling 2026-11-08, #5920)
+
+- **One hub.** All design/config/protocol/identity docs live under `docs/`. The repo root keeps only `README.md`, `README.zh-CN.md`, `AGENTS.md`, `CHANGELOG.md` (plus temporary redirect stubs per rule 5). New docs go in `docs/`, never at the root.
+- **Naming & language.** kebab-case English base name; bilingual (en + `<same>.zh-CN.md`) is the default (en/zh parity per §7.3). A single-language doc must state why in its `docs/index` entry.
+- **Index.** Every new or moved doc must be listed in `docs/index.md` AND `docs/index.zh-CN.md` in the same PR.
+- **Split with `reference/`.** `docs/` = decision/reviewer-facing reference material; `reference/` = AGENTS lazy-loaded construction procedures (build/test/release/git). New how-to procedures → `reference/` (+ AGENTS.md pointer); new concepts/decisions → `docs/`.
+- **Moves/renames.** Leave a one-line redirect stub at the old path and a hygiene-ledger entry in `docs/lifecycle.md` §5 with an explicit removal condition (default: 1–2 releases).
+- **Runtime doc references** (`package.json` `files`, CI diff paths, guard scripts, user-facing strings) use repo-root-relative paths and must be updated in the same PR as the move; a post-move repo-wide relative-link check must pass clean.
+- **Diagrams.** Vector SVG is the default artifact and default display (owner ruling 2026-11-07); ship a PNG fallback alongside, referenced second. Diagrams live in the doc's `assets/` directory.
+
 ## 4. Git Safety Rules (MANDATORY)
 
 | Rule | Enforcement |
