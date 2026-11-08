@@ -14,7 +14,7 @@ import { _resetPluginStateForTest, forkMessageIdentityHash } from "../src/plugin
 import { _resetSessionsForTest } from "../src/session.ts";
 import { _setForTest } from "../src/registry.ts";
 import { resetToolRingForTest } from "../src/tool-ring.ts";
-import { forkIdentityHashOf, forkOrderHashOf, manifestForkCapable, matchForkPrefix, openaiBodyToCore, resetForkCapabilityCacheForTest, tryForkAdoption } from "../src/agent/fork-adopt.ts";
+import { createForkAdopter, forkIdentityHashOf, forkOrderHashOf, manifestForkCapable, matchForkPrefix, matchForkRawPrefix, openaiBodyToCore, resetForkCapabilityCacheForTest, tryForkAdoption } from "../src/agent/fork-adopt.ts";
 import { sideShapedBody } from "../src/agent/dsh-native.ts";
 
 process.env.NODE_ENV = "test";
@@ -113,6 +113,13 @@ test("matchForkPrefix returns the longest hash-equal prefix", () => {
     const unrelated: CoreMessage[] = [{ id: "q", role: "user", contentType: "text", text: "unrelated" }];
     assert.equal(matchForkPrefix(unrelated, identities), 0);
     assert.equal(matchForkPrefix([], identities), 0);
+});
+
+test("matchForkRawPrefix uses durable raw ids for opaque content", () => {
+    const identities = identitiesOf(seedCore).map((identity) => ({ ...identity, identityHash: "opaque" }));
+    assert.equal(matchForkRawPrefix(seedCore, identities), 3);
+    assert.equal(matchForkRawPrefix([{ ...seedCore[0]!, id: "different" }], identities), 0);
+    assert.equal(matchForkRawPrefix([{ ...seedCore[0]!, id: "a" }, { ...seedCore[1]!, id: "b" }], identities), 2);
 });
 
 // ---------------------------------------------------------------------------
@@ -235,6 +242,68 @@ test("tryForkAdoption surfaces bounded snapshot diagnostics instead of a bare st
     assert.deepEqual(result, { outcome: "degraded", reason: "snapshot http 409 SNAPSHOT_UNAVAILABLE (Error: multimodal or opaque content cannot be compared by text)" });
     assert.equal(calls.length, 1, "one snapshot attempt, no fork POST");
     assert.equal(calls.every((c) => !c.url.includes("/__bili/plugin/fork")), true);
+});
+
+test("tryForkAdoption uses raw snapshot fallback only for adoption coordinates", async () => {
+    const body = bodyFor([
+        { role: "user", content: "opaque question" },
+        { role: "assistant", content: "opaque answer", audio: { id: "audio_fixture" } },
+        { role: "user", content: "continue" },
+    ]);
+    const core = openaiBodyToCore(body)!;
+    const orderedMessages = identitiesOf(core).map((identity) => ({ ...identity, identityHash: "opaque" }));
+    const snapshot = { ok: true, protocolVersion: 2, comparison: "raw", status: "exact", sessionId: "parent", parentRevision: "raw-rev", orderHash: hash(orderedMessages), orderedMessages };
+    const calls: Recorded[] = [];
+    const fetchImpl = (async (input: unknown, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input instanceof URL ? input.href : (input as Request).url;
+        const raw = init?.body;
+        const bodyValue = typeof raw === "string" ? JSON.parse(raw) as unknown : undefined;
+        calls.push({ url, method: init?.method ?? "GET", body: bodyValue });
+        if (url.includes("mode=raw")) return jsonRes(snapshot);
+        if (url.includes("/__bili/plugin/snapshot")) return new Response(JSON.stringify({ code: "SNAPSHOT_UNAVAILABLE", error: "multimodal or opaque content cannot be compared by text" }), { status: 409, headers: { "content-type": "application/json" } });
+        if (url.includes("/__bili/plugin/fork")) return jsonRes({ ok: true }, 201);
+        return new Response("{}", { status: 404 });
+    }) as typeof fetch;
+    const result = await tryForkAdoption({ base: "http://proxy", parentConversationId: "parent", childConversationId: "child", body, allowOpaque: true, fetchImpl });
+    assert.deepEqual(result, { outcome: "adopted", branchPoint: core.length, replayed: false });
+    assert.equal(calls.filter((call) => call.url.includes("mode=raw")).length, 1);
+    const fork = calls.find((call) => call.url.includes("/__bili/plugin/fork"))!.body as { protocolVersion: number; comparison?: string };
+    assert.equal(fork.protocolVersion, 2);
+    assert.equal(fork.comparison, "raw");
+    const strictCalls: Recorded[] = [];
+    const strictFetch = routerFetch({ snapshot: () => new Response(JSON.stringify({ code: "SNAPSHOT_UNAVAILABLE" }), { status: 409 }) }, strictCalls);
+    const strict = await tryForkAdoption({ base: "http://proxy", parentConversationId: "parent", childConversationId: "strict-child", body, fetchImpl: strictFetch });
+    assert.deepEqual(strict, { outcome: "degraded", reason: "snapshot http 409 SNAPSHOT_UNAVAILABLE" });
+    assert.equal(strictCalls.length, 1);
+});
+
+test("createForkAdopter forwards adoption-only opaque permission", async () => {
+    const body = bodyFor([
+        { role: "user", content: "opaque question" },
+        { role: "assistant", content: "opaque answer", audio: { id: "audio_fixture" } },
+        { role: "user", content: "continue" },
+    ]);
+    const core = openaiBodyToCore(body)!;
+    const orderedMessages = identitiesOf(core).map((identity) => ({ ...identity, identityHash: "opaque" }));
+    const snapshot = { ok: true, protocolVersion: 2, comparison: "raw", status: "exact", sessionId: "parent", parentRevision: "raw-rev", orderHash: hash(orderedMessages), orderedMessages };
+    const calls: Recorded[] = [];
+    const fetchImpl = (async (input: unknown, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input instanceof URL ? input.href : (input as Request).url;
+        const raw = init?.body;
+        const bodyValue = typeof raw === "string" ? JSON.parse(raw) as unknown : undefined;
+        calls.push({ url, method: init?.method ?? "GET", body: bodyValue });
+        if (url.includes("/__bili/plugin/manifest")) return jsonRes({ capabilities: { fork: { protocolVersion: 2 } } });
+        if (url.includes("mode=raw")) return jsonRes(snapshot);
+        if (url.includes("/__bili/plugin/snapshot")) return new Response(JSON.stringify({ code: "SNAPSHOT_UNAVAILABLE" }), { status: 409 });
+        if (url.includes("/__bili/plugin/fork")) return jsonRes({ ok: true }, 201);
+        return new Response("{}", { status: 404 });
+    }) as typeof fetch;
+    const logs: string[] = [];
+    const adopter = createForkAdopter((line) => logs.push(line), { fetchImpl });
+    await adopter.maybeAdopt({ base: "http://proxy", parent: "parent", child: "child", body, allowOpaque: true });
+    assert.equal(calls.some((call) => call.url.includes("mode=raw")), true);
+    assert.equal(calls.some((call) => call.url.includes("/__bili/plugin/fork")), true);
+    assert.deepEqual(logs, ["fork child child adopted parent parent at branch point 3 (#2399)"]);
 });
 
 test("tryForkAdoption sanitizes control characters out of snapshot diagnostics (#2469)", async () => {

@@ -122,7 +122,7 @@ type AgentLike = {
         // parentSession for ordinary forks; use its sessionId when present.
         header?: {
             parentSession?: unknown;
-            forkSource?: { sessionId?: unknown } | undefined;
+            forkSource?: { sessionId?: unknown; boundary?: unknown } | undefined;
             isSeeded?: unknown;
         } | undefined;
     } | undefined;
@@ -1339,13 +1339,22 @@ export type ForkChildSkipReason =
     | "parent-is-self";
 
 export type ForkChildVerdict =
-    | { ok: true; sid: string; parent: string }
+    | { ok: true; sid: string; parent: string; forkSource?: { boundary: number | null } }
     | { ok: false; reason: ForkChildSkipReason; sid?: string; detail?: string };
 
 /** Resolve the conversation id used by the fork protocol without changing
  *  DSH's ownership semantics. `forkSource.sessionId` is the adoption-only
  *  coordinate emitted by newer DSH ordinary forks; legacy dsh builds and
  *  other hosts continue to use parentSession. */
+function forkSourceOf(header: NonNullable<AgentLike["session"]>["header"]): { sessionId: string; boundary: number | null } | undefined {
+    const source = header?.forkSource;
+    if (source === null || typeof source !== "object" || typeof source.sessionId !== "string" || source.sessionId.length === 0) return undefined;
+    const boundary = source.boundary;
+    if (boundary === null) return { sessionId: source.sessionId, boundary: null };
+    if (typeof boundary === "number" && Number.isSafeInteger(boundary) && boundary >= 0 && !Object.is(boundary, -0)) return { sessionId: source.sessionId, boundary };
+    return undefined;
+}
+
 function forkParentSessionOf(header: NonNullable<AgentLike["session"]>["header"]): string | undefined {
     const source = header?.forkSource;
     if (source !== null && typeof source === "object" && typeof source.sessionId === "string" && source.sessionId.length > 0) {
@@ -1400,7 +1409,8 @@ export function forkChildVerdict(ctx: PluginContext): ForkChildVerdict {
     if (session.header.isSeeded !== true) return { ok: false, reason: "not-seeded", sid };
     if (parent === undefined) return { ok: false, reason: "parent-missing", sid };
     if (parent === sid) return { ok: false, reason: "parent-is-self", sid };
-    return { ok: true, sid, parent };
+    const forkSource = forkSourceOf(session.header);
+    return { ok: true, sid, parent, ...(forkSource ? { forkSource: { boundary: forkSource.boundary } } : {}) };
 }
 
 const forkGateNoted = new Set<string>();
@@ -1620,7 +1630,7 @@ async function maybeForkAdoptBeforeSend(ctx: PluginContext, init: RequestInit | 
             `bili-native-dsh: fork adoption for ${child.sid} skipped at the proxy-base gate — the proxy origin is not known yet, so the fork protocol cannot be reached (#4215)`);
         return;
     }
-    await dshForkAdopter.maybeAdopt({ base, parent: child.parent, child: child.sid, body });
+    await dshForkAdopter.maybeAdopt({ base, parent: child.parent, child: child.sid, body, allowOpaque: child.forkSource !== undefined });
 }
 
 // #1677: session id of the command's invoking agent (host-passed invocation); malformed

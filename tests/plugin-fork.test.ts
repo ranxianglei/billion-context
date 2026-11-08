@@ -1251,6 +1251,42 @@ for (const content of [null, "audio transcript"] as const) {
     });
 }
 
+test("HTTP raw reference fork adopts opaque history by stable ids", { timeout: 60_000 }, async () => {
+    const h = await harness(false, false);
+    try {
+        const messages = [
+            { role: "user", content: "review the audio" },
+            { role: "assistant", content: "audio answer", audio: { id: "audio_fixture" } },
+            { role: "user", content: "continue" },
+        ];
+        const response = await fetch(`${h.origin}/bili/${h.upstreamUrl}/v1/chat/completions`, { method: "POST", headers: { "content-type": "application/json", "x-bili-plugin": "test", "x-bili-plugin-conversation": "opaque-parent" }, body: JSON.stringify({ model: "claude-test", max_tokens: 1024, stream: false, messages }) });
+        assert.equal(response.status, 200, await response.text());
+        const strict = await h.request("/__bili/plugin/snapshot?conversationId=opaque-parent");
+        assert.equal(strict.status, 409, JSON.stringify(strict.body));
+        const raw = await h.request("/__bili/plugin/snapshot?conversationId=opaque-parent&mode=raw");
+        assert.equal(raw.status, 200, JSON.stringify(raw.body));
+        const rawBody = raw.body as SnapshotResponse & { comparison?: string };
+        assert.equal(rawBody.comparison, "raw");
+        const count = rawBody.orderedMessages.length - 1;
+        const prefix = rawBody.orderedMessages.slice(0, count);
+        const fork = await h.request("/__bili/plugin/fork", {
+            protocolVersion: 2,
+            comparison: "raw",
+            parentConversationId: "opaque-parent",
+            childConversationId: "opaque-child",
+            parentRevision: rawBody.parentRevision,
+            branchPoint: { messageCount: count, orderHash: hash(prefix) },
+            orderedMessages: prefix,
+            idempotencyKey: "fork-opaque-child",
+        });
+        assert.equal(fork.status, 201, JSON.stringify(fork.body));
+        const child = resolveConversation("opaque-child").session!;
+        assert.equal(child.metadata.publicSnapshotTextComparable, false);
+        const childRaw = await h.request("/__bili/plugin/snapshot?conversationId=opaque-child&mode=raw");
+        assert.equal(childRaw.status, 200, JSON.stringify(childRaw.body));
+    } finally { await h.close(); }
+});
+
 test("HTTP fork before absorb summary preserves the original pair on the first child request", { timeout: 60_000 }, async () => {
     const h = await harness();
     try {

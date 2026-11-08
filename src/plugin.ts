@@ -1189,6 +1189,7 @@ function comparableHistory(value: unknown): boolean {
 }
 type ForkRequest = {
     protocolVersion: 1 | 2;
+    comparison?: "raw";
     parentConversationId: string;
     childConversationId: string;
     parentRevision: string;
@@ -1415,7 +1416,8 @@ function reconstructRawTailForFork(session: Session): CoreMessage[] | null {
     return out;
 }
 
-function forkSnapshot(session: Session, source?: CoreMessage[] | null) {
+function forkSnapshot(session: Session, source?: CoreMessage[] | null, opts?: { comparison?: "raw" }) {
+    const rawComparison = opts?.comparison === "raw";
     const messages = source ?? session.pluginSnapshot ?? reconstructRawTailForFork(session);
     if (!messages) {
         const capped = session.metadata.publicSnapshotCapped === true;
@@ -1434,8 +1436,9 @@ function forkSnapshot(session: Session, source?: CoreMessage[] | null) {
     // flag every stamped cell as spurious drift on the child's first request.
     // Signed content rides thinkingSignature/googleThoughtSignature inside the
     // identity hash, so only genuinely uncomparable content (images, audio,
-    // publicSnapshotTextComparable === false) still refuses.
-    if (session.metadata.publicSnapshotTextComparable === false) throw new Error("multimodal or opaque content cannot be compared by text");
+    // publicSnapshotTextComparable === false) still refuses. Raw comparison is
+    // an explicit DSH forkSource path for those otherwise opaque messages.
+    if (!rawComparison && session.metadata.publicSnapshotTextComparable === false) throw new Error("multimodal or opaque content cannot be compared by text");
     const store = contentStoreOf(session);
     const expectedStoredRefs = session.metadata.publicSnapshotStoredRefs;
     if (Array.isArray(expectedStoredRefs) && expectedStoredRefs.some((ref) => typeof ref !== "string" || !store.byRef[ref])) throw new Error("CCR original index unavailable");
@@ -1464,7 +1467,7 @@ function forkSnapshot(session: Session, source?: CoreMessage[] | null) {
     // the revision is only the cheap early-exit token.
     const activeBlockSet = session.state.blocks.filter((b) => b.active).map((b) => b.blockId).sort();
     const parentRevision = forkHash({ sessionId: session.id, seq: orderedMessages.length, blockSet: activeBlockSet });
-    return { protocolVersion: 2, status: "exact", sessionId: session.id, parentRevision, orderHash: forkOrderHash(orderedMessages), orderedMessages, messages: messages.map((m, i) => ({ rawId: m.id, ref: orderedMessages[i]!.ref, role: m.role, text: m.text, toolName: m.toolName, toolCallId: m.toolCallId, contentType: m.contentType, toolIsError: forkToolIsError(m) })) };
+    return { protocolVersion: 2, status: "exact", ...(rawComparison ? { comparison: "raw" as const } : {}), sessionId: session.id, parentRevision, orderHash: forkOrderHash(orderedMessages), orderedMessages, messages: messages.map((m, i) => ({ rawId: m.id, ref: orderedMessages[i]!.ref, role: m.role, text: m.text, toolName: m.toolName, toolCallId: m.toolCallId, contentType: m.contentType, toolIsError: forkToolIsError(m) })) };
 }
 
 /** #2671 Phase 2b transition digest: fork protocol v1 hashed the ENTIRE
@@ -1625,14 +1628,14 @@ function forkReply(res: ServerResponse, status: number, body: unknown): void {
     res.end(JSON.stringify(body));
 }
 
-export async function handlePluginSnapshot(conversationId: string, res: ServerResponse): Promise<void> {
+export async function handlePluginSnapshot(conversationId: string, res: ServerResponse, comparison?: "raw"): Promise<void> {
     if (!conversationId) return forkReply(res, 400, { ok: false, code: "INVALID_REQUEST", error: "conversationId is required" });
     const session = await resolveForkConversation(conversationId);
     if (!session) return forkReply(res, 404, { ok: false, code: "PARENT_NOT_FOUND", error: "unknown plugin conversation" });
     acquireInFlight(session);
     try {
         await waitForReconstructionReplicas(session); // #5188 round 3: don't race self-recovery into a 409
-        await withSessionLock(session, () => forkReply(res, 200, { ok: true, conversationId, ...forkSnapshot(session) }));
+        await withSessionLock(session, () => forkReply(res, 200, { ok: true, conversationId, ...forkSnapshot(session, undefined, comparison ? { comparison } : undefined) }));
     } catch (err) {
         forkReply(res, 409, { ok: false, status: "unavailable", code: "SNAPSHOT_UNAVAILABLE", error: String(err) });
     } finally {
@@ -1647,6 +1650,8 @@ function parseForkRequest(payload: string): ForkRequest {
     const identifier = (v: unknown): v is string => typeof v === "string" && v.length > 0 && v.length <= 256 && v.trim() === v && !/[\x00-\x1f\x7f]/.test(v);
     const hash = (v: unknown): v is string => typeof v === "string" && /^[a-f0-9]{64}$/.test(v);
     if (b.protocolVersion !== 1 && b.protocolVersion !== 2) throw new Error("unsupported fork protocolVersion (expected 1 or 2)");
+    if (b.comparison !== undefined && b.comparison !== "raw") throw new Error("unsupported fork comparison (expected raw)");
+    if (b.comparison === "raw" && b.protocolVersion !== 2) throw new Error("raw fork comparison requires protocolVersion 2");
     if (!identifier(b.parentConversationId) || !identifier(b.childConversationId) || !identifier(b.idempotencyKey) || !hash(b.parentRevision)) throw new Error("invalid fork identity/revision");
     if (b.parentConversationId === b.childConversationId) throw new Error("parent and child must differ");
     const point = b.branchPoint as Record<string, unknown> | null;
@@ -1658,7 +1663,7 @@ function parseForkRequest(payload: string): ForkRequest {
         if (!identifier(item.rawId) || !(item.ref === null || (typeof item.ref === "string" && /^m\d{5,}$/.test(item.ref))) || !hash(item.identityHash)) throw new Error("invalid raw/ref identity");
         return { rawId: item.rawId, ref: item.ref, identityHash: item.identityHash };
     });
-    return { protocolVersion: b.protocolVersion, parentConversationId: b.parentConversationId, childConversationId: b.childConversationId, parentRevision: b.parentRevision, branchPoint: { messageCount: point.messageCount as number, orderHash: point.orderHash }, orderedMessages, idempotencyKey: b.idempotencyKey };
+    return { protocolVersion: b.protocolVersion, ...(b.comparison === "raw" ? { comparison: "raw" as const } : {}), parentConversationId: b.parentConversationId, childConversationId: b.childConversationId, parentRevision: b.parentRevision, branchPoint: { messageCount: point.messageCount as number, orderHash: point.orderHash }, orderedMessages, idempotencyKey: b.idempotencyKey };
 }
 
 /** [#2399 stage 2] omp/pi identity-register their session ids at session_start
@@ -1706,7 +1711,7 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
             // stand in with the verified unified raw tail (no fresh model call).
             const source = parent.pluginSnapshot ?? reconstructRawTailForFork(parent);
             let snapshot: ReturnType<typeof forkSnapshot>;
-            try { snapshot = forkSnapshot(parent, source); }
+            try { snapshot = forkSnapshot(parent, source, request.comparison === "raw" ? { comparison: "raw" } : undefined); }
             catch (err) { return forkReply(res, 409, { ok: false, status: "unavailable", code: "SNAPSHOT_UNAVAILABLE", error: String(err) }); }
             if (snapshot.parentRevision !== request.parentRevision) {
                 // #2671 Phase 2b: accept a stale v1 revision (whole-store hash) from
@@ -1806,7 +1811,7 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
                 if (entry && (entry.rawId !== rawId || typeof parentStore.byHash[entry.hash] !== "string")) return forkReply(res, 409, { ok: false, status: "unavailable", code: "PARENT_STATE_INCOMPLETE", error: "CCR original unavailable or alias inconsistent" });
             }
             child.contentStore = cloneStoreForRefs(parentStore, new Set(prefix.filter((m) => m.ref !== null).map((m) => m.ref!))) ?? undefined;
-            child.metadata.publicSnapshotTextComparable = true;
+            child.metadata.publicSnapshotTextComparable = request.comparison === "raw" ? false : true;
             child.metadata.publicSnapshotStoredRefs = Object.keys(child.contentStore?.byRef ?? {});
             for (const key of ["pluginAgent", "lastModel", "effectiveConfig", "effectiveConfigEpoch", "effectiveCcr", "effectiveContextLimit", "reservedContextLimit", "lastWindowSource", "systemPromptTokens"]) if (parent.metadata[key] !== undefined) child.metadata[key] = structuredClone(parent.metadata[key]);
             child.metadata.parentConversationId = request.parentConversationId;
@@ -1839,7 +1844,7 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
                 (child.transient ??= {}).latestKnownMsgId = parent.transient.latestKnownMsgId;
                 child.transient.needlePayloadUpper = parent.transient.needlePayloadUpper;
             }
-            const response = { ok: true, status: crossing.length > 0 ? "expanded" : "exact", protocolVersion: 2, parentConversationId: request.parentConversationId, childConversationId: request.childConversationId, sessionId: child.id, parentRevision: request.parentRevision, childRevision: forkSnapshot(child).parentRevision, branchPoint: request.branchPoint, expandedBlocks: crossing.map((b) => b.blockId), inheritedBlocks: child.state.blocks.map((b) => ({ id: b.blockId, tier: b.tier, active: b.active, expanded: b.expanded === true })), replayed: false };
+            const response = { ok: true, status: crossing.length > 0 ? "expanded" : "exact", protocolVersion: 2, parentConversationId: request.parentConversationId, childConversationId: request.childConversationId, sessionId: child.id, parentRevision: request.parentRevision, childRevision: forkSnapshot(child, undefined, request.comparison === "raw" ? { comparison: "raw" } : undefined).parentRevision, branchPoint: request.branchPoint, expandedBlocks: crossing.map((b) => b.blockId), inheritedBlocks: child.state.blocks.map((b) => ({ id: b.blockId, tier: b.tier, active: b.active, expanded: b.expanded === true })), replayed: false };
             child.metadata.publicForkReceipt = { requestHash, response };
             await publishForkSession(child, parent.id);
             recordPluginSession(request.childConversationId, child.id);
