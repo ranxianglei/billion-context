@@ -18,6 +18,7 @@ import { stampOutbound } from "../chain-checkpoint.js";
 import { applyCompatDropFields, dropCompatFieldsJson, resolveCompatDropFields } from "../compat-drop.js";
 import { applyCompatRoles, applyCompatRolesJson, detectRoleRejection, detectSystemPlacementError, hasOffHeadSystem, resolveCompatRoles, type CompatRoles } from "../compat-roles.js";
 import { builtinCompatRoles, builtinRoleRestorePoints, withRestoredRoles } from "../kiro.js";
+import { compressLoopAnthropicJson } from "../compress-loop-anthropic.js";
 import { compressLoopResponsesJson } from "../compress-loop-responses.js";
 import { resolveCompress } from "../compress-settings.js";
 import { buildAbsorbSystemPrompt, buildCompressHybridSystemPrompt, buildCompressSystemPrompt, withMarkerIntegrityNote, withMcpDialectNote, withProjectAttribution, withSummaryBudgetNote } from "../compress-tool.js";
@@ -2391,6 +2392,21 @@ async function forwardCaptured(
                         { core, config, messages: prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, textProtocol: true, visibilityMarkers, signal: clientAbort.signal },
                         requestBody,
                         { url: upstreamUrl, headers: requestHeaders, wireTransform, resign: applyResign },
+                    );
+                }
+                // #5957: non-stream Anthropic runs the same proxy-tool loop as
+                // the stream path — the one-shot rewriter alone ended the client
+                // turn with the compress receipt (stop_reason end_turn) and the
+                // model never saw the fold result. Terminal/mixed rounds fall
+                // through to the one-shot rewriter below.
+                if (prepared.protocol === "anthropic") {
+                    const requestBody = JSON.parse(typeof body === "string" ? body : body.toString("utf8")) as Record<string, unknown>;
+                    json = await compressLoopAnthropicJson(
+                        json,
+                        ctx,
+                        { proxyUrl, signal: clientAbort.signal },
+                        requestBody,
+                        { url: upstreamUrl, headers: buildForwardHeaders(headers), wireTransform, resign: applyResign },
                     );
                 }
                 // Capture upstream usage so tokenCount (which drives nudge +

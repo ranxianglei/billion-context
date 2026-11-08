@@ -81,6 +81,7 @@ billion-context/
 │   ├── image-rescale.ts          # Deterministic egress image rescale (outbound copy only, restore receipt) (#3400)
 │   ├── image-restore.ts          # Recovery channel for folded images by mNNNNN ref, file-first (#1995)
 │   ├── absorb.ts                 # absorb tool (kernel ACP_TOOL_NAMES extension)
+│   ├── compress-loop-anthropic.ts # Non-stream Anthropic proxy-tool loop (#5957)
 │   ├── compress-loop-responses.ts # Compress loop for Responses API format
 │   ├── compress-settings.ts      # Three-level compress config merge (global→provider→model)
 │   ├── chat-pack.ts              # Bundled chat prompt pack: relationship-first compress philosophy (#5319)
