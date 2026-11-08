@@ -2644,6 +2644,10 @@ export class UnifiedStore {
     // payload is capped so a runaway caller cannot balloon index.db.
     // ------------------------------------------------------------------
 
+    withSessionExtTransaction<T>(action: () => T): T {
+        return this.db.transaction(action);
+    }
+
     setSessionExt(sessionId: string, key: string, value: unknown): void {
         validateExtKey(sessionId, "session id");
         validateExtKey(key, "key");
