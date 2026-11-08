@@ -156,6 +156,7 @@ billion-context/
 │   │   ├── runtime-status.ts     #   Runtime storage degradation status for status surfaces (#3040)
 │   │   ├── schema.ts             #   Unified storage schema DDL + migrations (v11)
 │   │   ├── shadow.ts             #   Unified-storage sidecar: shadow double-write / full read flip
+│   │   ├── snap.ts               #   Snapshot-table compression foundation: four v12 tables, commit primitive, S4-verified rebuild (#5874)
 │   │   ├── sqlite-errors.ts      #   Corruption-shaped SQLite error classification (#5108)
 │   │   ├── store.ts              #   UnifiedStore: index.db (WAL) + content blobs, one txn per mutation
 │   ├── encrypt.ts                # At-rest encoding: AES-256-GCM (#708) + zstd (#1080), independent
