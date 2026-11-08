@@ -29,8 +29,10 @@ export interface UnpromptedGate {
      *  #5943: this is a multi-round credit, not just "the latest round". */
     armed: boolean;
     /** #5943: last round index (t.nudgeCreditRound) for which the current
-     *  credit stays live; 0/absent = no credit window (raw stamp via
-     *  storeUnpromptedGate, e.g. unit tests). */
+     *  credit stays live; 0 = none. A stored gate MISSING the field reads as
+     *  0 through unpromptedGateOf, while stampUnpromptedGate treats it as
+     *  still-live so a legacy raw-stamped arm (storeUnpromptedGate, e.g. unit
+     *  tests) keeps carrying until consumed or refreshed. */
     armedUntilRound?: number;
     /** #5943: the model committed a fold under the current credit — the arm
      *  holds for the rest of this turn and expires at the next stamp. */
