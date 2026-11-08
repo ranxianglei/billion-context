@@ -463,6 +463,22 @@ entries:
     group: process
     desc_en: "Lane flag for the plane's shadow write, nested under storage.snapBase.enabled (#5874): with both set, every ingest commit additionally derives the plane in its own transaction within the same tick (steady-state delta fast path, otherwise final-state diff; rounds yielding no derivable event write nothing, a crash-dropped round self-heals on the next save). The read side only compares against the legacy rows and never serves them — outbound bytes are unchanged. The lane alone has no effect; rollback = unset (or DROP the four tables + revert user_version)."
     desc_zh: "平面影子写的车道开关，嵌套在 storage.snapBase.enabled 之下（#5874）：两者都设置后，每次 ingest 提交在同一 tick 内用独立事务推导平面（稳态 delta 走快路，其余走最终态 diff；推导不出事件的轮次不写，crash 丢掉的轮次由下一轮保存自愈）。读侧只与 legacy 行比对、永不对外提供服务 —— 出站字节一个都不变。只开车道不生效；回滚 = 去掉开关（或 DROP 四张表 + user_version 退回）。"
+  - key: storage.snapBase.egress
+    type: boolean
+    default: "true (soak)"
+    kind: file-only
+    audience: user
+    group: process
+    desc_en: "#5874 P2 (mapEgress): serve the OUTBOUND compressed context from the S4-verified snap plane instead of the in-memory history, tripwire-guarded — the plane view is assembled first (anchor summaries at each covered region + surviving rows + the client tail, the same seam walk as #3756), the lane's exact post-processing is reapplied, and ONLY a normalized exact match (role / contentType / toolName / toolCallId / text / image-hash — ids are metadata) switches the outbound bytes; any mismatch keeps the legacy bytes, and after 3 mismatches the session is sticky-excluded for the process lifetime. Degrades to legacy on: flag off, cohort excluded, plane dead/missing, any assembly failure (each reason surfaces on /__bili/status under snaplane.egress). SOAK DEFAULT ON at 100% — flip to opt-in (`egress: true` only) at the release cut; rollback = `egress: false` (zero bytes change, the plane keeps shadow-writing). Known soft edges (both tripwire-safe): a compression turn's brand-new block lands in the plane only after the debounced save — that one turn rides legacy and the next converges; google countTokens and responses compact secondary processTurn points still ride the legacy source."
+    desc_zh: "#5874 P2（mapEgress）：出站压缩上下文改为从 S4 校验过的快照平面生成，带 tripwire 保护 —— 先拼平面视图（每个覆盖区插一条摘要锚点 + 存活行 + 客户端尾窗，尾窗缝合与 #3756 同法），重放本车道的后处理链，归一化完全一致（role / contentType / toolName / toolCallId / text / 图片哈希 —— id 属元数据不比）才切出站字节；任何不一致都保留旧字节，同一会话累计 3 次不一致就在本进程生命周期内粘性排除。降级回旧路的情形：旗关、cohort 不含、平面死/缺、拼装失败（每个原因都在 /__bili/status 的 snaplane.egress 下可见）。SOAK 默认 100% 全开 —— 发版前改为显式开启（仅 `egress: true`）；回滚 = `egress: false`（零字节变化，平面继续影子写）。已知软边界（均被 tripwire 兜住）：压缩轮的新块要等防抖保存后才落平面 —— 该轮走旧路、下轮收敛；google countTokens 与 responses compact 两个次级 processTurn 点仍走旧源。"
+  - key: storage.snapBase.egressCohorts
+    type: string[]
+    default: "[\"openai\",\"anthropic\",\"google\",\"responses\"]"
+    kind: file-only
+    audience: user
+    group: process
+    desc_en: "Protocol cohorts allowed to cut the egress source over (#5874 P2); a subset of openai/anthropic/google/responses. Sessions whose protocol is absent keep legacy bytes unconditionally (the plane still shadow-writes and tripwires nothing for them). An empty/absent array means all four."
+    desc_zh: "允许切出站源的协议 cohort（#5874 P2），取 openai/anthropic/google/responses 的子集。协议不在名单内的会话无条件保留旧字节（平面照常影子写，也不触发 tripwire）。空/缺省 = 四个全开。"
   - key: sessions
     type: object
     default: "{} (all defaults)"
