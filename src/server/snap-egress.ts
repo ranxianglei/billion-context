@@ -24,7 +24,7 @@
  * backward seam walk D-lane uses — id fast path, identity-signature fallback,
  * one reply-lag gap tolerated, #3812/#4052 semantics preserved).
  */
-import { defaultCountTokens, renderVisibleRefs, TRUNCATION_CLIP_RE, SUMMARY_HEADER, summaryMessageId, type CompressionState, type RenderStrategy } from "acp-kernel";
+import { defaultCountTokens, hideConsumedCompressCalls, renderVisibleRefs, TRUNCATION_CLIP_RE, SUMMARY_HEADER, summaryMessageId, type CompressionState, type RenderStrategy } from "acp-kernel";
 import type { BiliMessage } from "acp-kernel/wire";
 import { createHash } from "node:crypto";
 import { loadConfigFile, resolveMessageTimestamps } from "../config.js";
@@ -182,7 +182,15 @@ function sidecarValue(m: BiliMessage, key: string): string {
 
 export function tripwireCompare(plane: BiliMessage[], legacy: BiliMessage[]): { ok: true } | { ok: false; reason: string; firstDiff?: string } {
     if (plane.length !== legacy.length) {
-        return { ok: false, reason: `length(plane=${plane.length},legacy=${legacy.length})` };
+        // Length reds hide the diverging shape inside the arrays — surface a
+        // compact multiset delta of (role,contentType,toolName) so the log
+        // names WHAT the extra/missing messages are without dumping bodies.
+        const shapeOf = (m: BiliMessage) => `${m.role}/${m.contentType}${m.toolName ? `:${m.toolName}` : ""}`;
+        const counts = new Map<string, number>();
+        for (const m of plane) counts.set(shapeOf(m), (counts.get(shapeOf(m)) ?? 0) + 1);
+        for (const m of legacy) counts.set(shapeOf(m), (counts.get(shapeOf(m)) ?? 0) - 1);
+        const delta = [...counts.entries()].filter(([, n]) => n !== 0).map(([k, n]) => `${n > 0 ? "+" : ""}${n}×${k}`).slice(0, 8).join(",");
+        return { ok: false, reason: `length(plane=${plane.length},legacy=${legacy.length})`, firstDiff: delta || "shape-identical" };
     }
     for (let i = 0; i < plane.length; i++) {
         const a = normTuple(plane[i]);
@@ -580,6 +588,16 @@ export function applySnapEgress(
         return legacyProcessed;
     }
 
+    // Kernel parity, step 1: the hide-compress-calls pipeline node strips
+    // consumed compress tool-call/result pairs (and swept orphans) INSIDE
+    // processTurn, so the legacy bytes never contain them — the plane view
+    // must pass the same exported filter over the same state or it serves
+    // messages the model is not supposed to see again (gate: length-red with
+    // plane LONGER). Idempotent: run against the post-turn state, already-
+    // hidden ids stay hidden.
+    const hidden = hideConsumedCompressCalls(state, built.msgs);
+    let planeMsgs: BiliMessage[] = hidden.messages as BiliMessage[];
+
     // Kernel render parity: hydrate the immutable first-sight timestamps
     // (plane rows are stored pre-render and carry no ts), then run the
     // kernel's own render-refs pass over the view with the same state and
@@ -593,8 +611,8 @@ export function applySnapEgress(
     try {
         const tsStamps = (state as { tsStamps?: Record<string, number> }).tsStamps;
         const hydrated = tsStamps === undefined
-            ? built.msgs
-            : built.msgs.map((m) => m.ts === undefined && typeof m.id === "string" && tsStamps[m.id] !== undefined
+            ? planeMsgs
+            : planeMsgs.map((m) => m.ts === undefined && typeof m.id === "string" && tsStamps[m.id] !== undefined
                 ? ({ ...m, ts: tsStamps[m.id] } as BiliMessage)
                 : m);
         rendered = renderVisibleRefs(hydrated, state, defaultCountTokens, deps.renderTags, flags.timestamps) as BiliMessage[];
