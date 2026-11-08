@@ -1211,7 +1211,7 @@ function mitmTwinCovers(routes: ProviderRoutes, target: URL): boolean {
 /** #3632: on the CONNECT/MITM lane every lookup runs against a rewritten
  *  `mitm://<host>` URL (src/server.ts resolveUpstream), so a plain `https://`
  *  providers key can NEVER match MITM-lane traffic to its host. The scheme
- *  split is intentional (CONFIGURATION.md: one host can serve a login client
+ *  split is intentional (docs/configuration.md: one host can serve a login client
  *  over CONNECT and an API-key client over /bili/ with different settings),
  *  but a lone https:// entry on a MITM-whitelisted host sat silently inert
  *  until a per-request [window] fallback line much later — a 1M window
@@ -1882,7 +1882,7 @@ export function resolveNonHttpProviders(env: NodeJS.ProcessEnv = process.env): s
  *  standalone package's DelegateConfig (billion-context-pi-subagents); the
  *  two renames vs the deprecated acp.json keys: `prompt` replaces
  *  `delegatePrompt`, and `debug` is scoped to the sub-agent subsystem (the
- *  top-level `debug` key stays the proxy's own). See CONFIGURATION.md. */
+ *  top-level `debug` key stays the proxy's own). See docs/configuration.md. */
 export interface PiSubagentsFileConfig {
     /** Master switch, default true. `false` (or the boolean shorthand
      *  `"pi": {"subagents": false}`) removes the three tools, the

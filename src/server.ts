@@ -2311,7 +2311,7 @@ const ACP_TAG_MARK = "\x3cacp ";
 // compression, src/preflight.ts — #247) have NO other carrier: their anchor is
 // the only place the summary reaches the model, so it must survive.
 //
-// Per mode (see TECHNICAL-NOTES.md "Two compression modes"): in plugin/launcher mode the
+// Per mode (see docs/technical-notes.md "Two compression modes"): in plugin/launcher mode the
 // tool call is ALWAYS in the re-sent history (the agent owns compression), so
 // this strips every acp_summary and the carrier is the tool call — recognized
 // by the plugin_<ts> callId minted at the tool API (#1567: an id-match alone
