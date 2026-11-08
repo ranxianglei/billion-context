@@ -15,7 +15,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { SUMMARY_HEADER, summaryMessageId, type CompressionState } from "acp-kernel";
+import { defaultCountTokens, formatTagTime, renderVisibleRefs, SUMMARY_HEADER, summaryMessageId, type CompressionState } from "acp-kernel";
 import type { BiliMessage } from "acp-kernel/wire";
 import { planIngest, type LegacySessionLike } from "../src/storage/ingest.ts";
 import { _resetSnapPlaneDeadForTests, type SnapView } from "../src/storage/snap.ts";
@@ -110,7 +110,8 @@ function planeFor(sid: string): { store: UnifiedStore; view: SnapView; state: Co
     store.ingestSession(planIngest(sess));
     const view = store.snapEgressView(sid);
     assert.ok(view, "the plane must have rows after ingest");
-    return { store, view, state: { blocks: [blk as never] } as unknown as CompressionState, blk };
+    // messageRefs present (empty) — the kernel renderer reads it unconditionally.
+    return { store, view, state: { blocks: [blk as never], messageRefs: { byRaw: {}, byRef: {} }, tsStamps: {} } as unknown as CompressionState, blk };
 }
 
 const clientResend = (msgs: Array<{ id: string; text: string }>): BiliMessage[] =>
@@ -294,6 +295,7 @@ const identity = (m: BiliMessage[]): BiliMessage[] => m;
 const deps = (protocol: SnapEgressProtocol = "openai") => ({
     sessionId: "sess-gate",
     protocol,
+    renderTags: "none" as const,
     log: () => {},
     transform: identity,
 });
@@ -374,85 +376,102 @@ test("#5874 T16f: soak default — no config section means egress ON for all fou
     }
 });
 
-test("#5874 T18a: resend envelope re-applied onto plane prefix rows (byte parity with the live resend)", () => {
+test("#5874 T18a: kernel render parity — plane rows re-stamped by the kernel renderer match the legacy render byte-for-byte", () => {
     _resetSnapEgressForTests();
     setConfig({});
     const { view, state } = planeFor("sess-p2-env-a");
-    const env = (ref: string, time: string) => `<acp tokens="90" type="text" time="${time}">${ref}</acp>\n`;
-    // Client resends EVERYTHING with fresh envelopes; m9..m12 are the seam
-    // tail, m1..m8 covered (block), and the surviving prefix rows get the
-    // client's exact tagged text adopted.
+    withStore(view);
+    // A real post-fold state: refs minted for the anchor + surviving rows,
+    // immutable first-sight timestamps on tsStamps (kernel stamp-timestamps).
+    const TS = 1_234_567_890_123;
+    const ids = ["m9", "m10", "m11", "m12"];
+    const anchorId = summaryMessageId("blk-c1");
+    state.messageRefs = {
+        byRaw: Object.fromEntries([[anchorId, "m00005"], ...ids.map((id, i) => [id, `m0000${9 + i}`])]),
+        byRef: Object.fromEntries([["m00005", anchorId], ...ids.map((id, i) => [`m0000${9 + i}`, id])]),
+    };
+    state.tsStamps = Object.fromEntries([[anchorId, TS - 60_000], ...ids.map((id) => [id, TS])]);
+    // Plain untagged client resend (host transport never carries tags).
     const resend = [
-        msg("m1", env("m00001", "T2") + "message 1"),
-        msg("m2", env("m00002", "T2") + "message 2"),
-        msg("m9", env("m00009", "T2") + "message 9"),
-        msg("m10", env("m00010", "T2") + "message 10"),
-        msg("m11", env("m00011", "T2") + "message 11"),
-        msg("m12", env("m00012", "T2") + "message 12"),
+        msg("m1", "message 1"),
+        msg("m2", "message 2"),
+        ...ids.map((id, i) => msg(id, `message ${9 + i}`, i % 2 === 0 ? "user" : "assistant")),
     ];
-    const built = buildSnapEgressView(view, resend, state);
-    assert.ok(built.ok);
-    assert.equal(built.msgs.length, 5);
-    assert.equal(built.msgs[0].text, `${SUMMARY_HEADER}\nfolded 1-8`, "anchor never carries an envelope");
-    assert.equal(built.msgs[1].text, env("m00009", "T2") + "message 9", "prefix row adopts the live resend envelope");
-    assert.equal(built.msgs[2].text, env("m00010", "T2") + "message 10");
-    assert.equal(built.msgs[3].text, env("m00011", "T2") + "message 11");
-    assert.equal(built.msgs[4].text, env("m00012", "T2") + "message 12", "tail verbatim");
-    // legacy processed: kernel drops the covered m1..m8 by id and keeps the
-    // resent tagged texts for the rest — byte-for-byte identical.
-    const legacy = [
-        msg("acp_summary_blk-c1", `${SUMMARY_HEADER}\nfolded 1-8`, "system"),
-        msg("m9", env("m00009", "T2") + "message 9"),
-        msg("m10", env("m00010", "T2") + "message 10", "assistant"),
-        msg("m11", env("m00011", "T2") + "message 11"),
-        msg("m12", env("m00012", "T2") + "message 12", "assistant"),
+    // The legacy lane output for the same turn: the ideal view stamped by the
+    // kernel's own renderer (this is what turn.messages would have looked like).
+    const idealUntagged: BiliMessage[] = [
+        { ...msg(anchorId, `${SUMMARY_HEADER}\nfolded 1-8`, "system" as const), ts: TS - 60_000 },
+        ...ids.map((id, i) => ({ ...msg(id, `message ${9 + i}`, i % 2 === 0 ? "user" : "assistant"), ts: TS })),
     ];
-    assert.deepEqual(tripwireCompare(built.msgs, legacy), { ok: true });
+    const legacy = renderVisibleRefs(idealUntagged, state, defaultCountTokens, "text-only", true) as BiliMessage[];
+    const out = applySnapEgress(resend, state, legacy, { ...deps(), renderTags: "text-only" as const });
+    assert.notEqual(out, legacy, "cutover returns the plane-sourced array");
+    assert.equal(snapEgressStatusWire().cutover, 1);
+    assert.deepEqual(tripwireCompare(out, legacy), { ok: true }, "plane render is payload-identical to the legacy render");
+    assert.deepEqual(out.map((m) => [m.id, m.role, m.text]), legacy.map((m) => [m.id, m.role, m.text]), "byte-identical texts (ledgerSeq stamps are plane metadata)");
+    assert.match(out[1].text ?? "", new RegExp(`^<acp tokens="[0-9]+" type="text" time="${formatTagTime(TS).replace(/[-: ]/g, "\\$&")}">m00009<`), "row tag comes from the kernel renderer (ref + first-sight time)");
 });
 
-test("#5874 T18b: a new turn's changed envelope time still matches (per-resend tags)", () => {
+test("#5874 T18b: immutable first-sight time — the plane render is stable across turns (no per-resend churn)", () => {
     _resetSnapEgressForTests();
     setConfig({});
     const { view, state } = planeFor("sess-p2-env-b");
-    const env = (ref: string, time: string) => `<acp tokens="7" type="text" time="${time}">${ref}</acp>\n`;
-    // Turn 3's resend: same content, NEW envelope times (transport metadata).
+    withStore(view);
+    const TS = 1_600_000_000_000;
+    const anchorId = summaryMessageId("blk-c1");
+    state.messageRefs = {
+        byRaw: Object.fromEntries([["m9", "m00009"], ["m10", "m00010"], ["m11", "m00011"], ["m12", "m00012"]]),
+        byRef: Object.fromEntries([["m00009", "m9"], ["m00010", "m10"], ["m00011", "m11"], ["m00012", "m12"]]),
+    };
+    state.tsStamps = Object.fromEntries([["m9", TS], ["m10", TS], ["m11", TS], ["m12", TS]]);
     const resend = [
-        msg("m1", env("m00001", "T3") + "message 1"),
-        msg("m9", env("m00009", "T3") + "message 9"),
-        msg("m10", env("m00010", "T3") + "message 10"),
-        msg("m11", env("m00011", "T3") + "message 11"),
-        msg("m12", env("m00012", "T3") + "message 12"),
+        msg("m1", "message 1"),
+        msg("m9", "message 9"),
+        msg("m10", "message 10", "assistant"),
+        msg("m11", "message 11"),
+        msg("m12", "message 12", "assistant"),
     ];
-    const built = buildSnapEgressView(view, resend, state);
-    assert.ok(built.ok);
-    assert.equal(built.msgs[1].text, env("m00009", "T3") + "message 9", "adopted from THIS resend, not a stale one");
+    const run = () => {
+        const unt: BiliMessage[] = [
+            { ...msg(anchorId, `${SUMMARY_HEADER}\nfolded 1-8`, "system" as const) },
+            msg("m9", "message 9"),
+            msg("m10", "message 10", "assistant"),
+            msg("m11", "message 11"),
+            msg("m12", "message 12", "assistant"),
+        ];
+        unt.slice(1).forEach((m, i) => ((m as { ts?: number }).ts = TS));
+        return renderVisibleRefs(unt, state, defaultCountTokens, "text-only", true) as BiliMessage[];
+    };
+    const out1 = applySnapEgress(resend, state, run(), { ...deps(), renderTags: "text-only" as const });
+    const out2 = applySnapEgress(resend, state, run(), { ...deps(), sessionId: "sess-p2-env-b2", renderTags: "text-only" as const });
+    assert.equal(snapEgressStatusWire().cutover, 2);
+    assert.equal(out1[1].text, out2[1].text, "same tsStamps → identical bytes across turns");
+    assert.ok((out1[1].text ?? "").includes(formatTagTime(TS)), "time is the immutable first-sight stamp, not the wall clock");
 });
 
-test("#5874 T18c: content edit under an envelope is never adopted (byte-strict)", () => {
+test("#5874 T18c: a client content edit diverges from the plane — tripwire red (byte-strict)", () => {
     _resetSnapEgressForTests();
     setConfig({});
     const { view, state } = planeFor("sess-p2-env-c");
-    const env = (ref: string) => `<acp tokens="7" type="text" time="T9">${ref}</acp>\n`;
-    // The client rewrote m9's body (edits): pairing finds the id but the
-    // content differs beyond the envelope — plane text stays, tripwire fires.
+    // The client rewrote m9's body (an edit): the seam walk pairs the row by
+    // id, but the plane renders its own stored text — the divergence lands
+    // exactly at that row and the tripwire keeps the legacy bytes.
     const resend = [
-        msg("m1", env("m00001") + "message 1"),
-        msg("m9", env("m00009") + "message 9 EDITED"),
-        msg("m10", env("m00010") + "message 10"),
-        msg("m11", env("m00011") + "message 11"),
-        msg("m12", env("m00012") + "message 12"),
+        msg("m1", "message 1"),
+        msg("m9", "message 9 EDITED"),
+        msg("m10", "message 10", "assistant"),
+        msg("m11", "message 11"),
+        msg("m12", "message 12", "assistant"),
     ];
     const built = buildSnapEgressView(view, resend, state);
     assert.ok(built.ok);
-    assert.equal(built.msgs[1].text, "message 9", "edited row keeps the plane text (no blind adoption)");
-    // legacy keeps the edited resend (m9 is not covered) → tripwire catches
-    // the text divergence at the very row where adoption was refused.
+    assert.equal(built.msgs[1].text, "message 9", "the plane renders its stored text, never the edit");
     const legacy = [
         msg("acp_summary_blk-c1", `${SUMMARY_HEADER}\nfolded 1-8`, "system"),
-        msg("m9", env("m00009") + "message 9 EDITED"),
-        msg("m10", env("m00010") + "message 10", "assistant"),
-        msg("m11", env("m00011") + "message 11"),
-        msg("m12", env("m00012") + "message 12", "assistant"),
+        msg("m9", "message 9 EDITED"),
+        msg("m10", "message 10", "assistant"),
+        msg("m11", "message 11"),
+        msg("m12", "message 12", "assistant"),
     ];
     const verdict = tripwireCompare(built.msgs, legacy);
     assert.ok(!verdict.ok);

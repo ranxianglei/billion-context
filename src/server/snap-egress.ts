@@ -24,10 +24,10 @@
  * backward seam walk D-lane uses — id fast path, identity-signature fallback,
  * one reply-lag gap tolerated, #3812/#4052 semantics preserved).
  */
-import { SUMMARY_HEADER, summaryMessageId, type CompressionState } from "acp-kernel";
+import { defaultCountTokens, renderVisibleRefs, SUMMARY_HEADER, summaryMessageId, type CompressionState, type RenderStrategy } from "acp-kernel";
 import type { BiliMessage } from "acp-kernel/wire";
 import { createHash } from "node:crypto";
-import { loadConfigFile } from "../config.js";
+import { loadConfigFile, resolveMessageTimestamps } from "../config.js";
 import { getStore } from "../persist.js";
 import { isSnapPlaneDead, type SnapView } from "../storage/snap.js";
 import { identitySig } from "./snapshot-render.js";
@@ -43,7 +43,12 @@ export type SnapEgressProtocol = "openai" | "anthropic" | "google" | "responses"
 
 interface SnapEgressDeps {
     sessionId: string;
+    /** Wire-protocol family, gates the cohort check. */
     protocol: SnapEgressProtocol;
+    /** The lane's render strategy (knobRenderNone() gate) — the kernel's
+     *  render-refs node is the LAST pipeline node, so the plane view must
+     *  run the same renderer to reach byte parity on the rendered tags. */
+    renderTags: RenderStrategy;
     log: (level: string, msg: string) => void;
     /** Lane-identical post-processing for the plane view (strip → drop →
      *  repair, exactly what the lane applied to the legacy view). */
@@ -57,15 +62,19 @@ interface SnapEgressDeps {
 
 const DEFAULT_COHORTS: ReadonlySet<SnapEgressProtocol> = new Set(["openai", "anthropic", "google", "responses"]);
 
-export function snapEgressFlags(): { egress: boolean; cohorts: ReadonlySet<SnapEgressProtocol> } {
-    const v = loadConfigFile().storage?.snapBase;
+export function snapEgressFlags(): { egress: boolean; cohorts: ReadonlySet<SnapEgressProtocol>; timestamps: boolean } {
+    const file = loadConfigFile();
+    const v = file.storage?.snapBase;
     // SOAK (#5874 P2): default ON at 100% for the soak + full-CI run.
     // Release cut: change to `v?.egress === true` (opt-in).
     const egress = v?.egress !== false;
     const cohorts = Array.isArray(v?.egressCohorts) && v.egressCohorts.length > 0
         ? new Set<SnapEgressProtocol>(v.egressCohorts as SnapEgressProtocol[])
         : DEFAULT_COHORTS;
-    return { egress, cohorts };
+    // Same resolution the proxy core was built with (server.ts createCore):
+    // env override first, then the file's compress block, default ON.
+    const timestamps = resolveMessageTimestamps(file.compress);
+    return { egress, cohorts, timestamps };
 }
 
 // ---------------------------------------------------------------------------
@@ -148,13 +157,17 @@ export function tripwireCompare(plane: BiliMessage[], legacy: BiliMessage[]): { 
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// ACP resend envelope. The client harness re-wraps each resent message with
-// a per-RESEND tag (`<acp tokens="N" type="T" time="…">mNNNNN</acp>\n`) — the
-// time attribute changes every turn, so the tag can never be stored in the
-// plane. Byte parity for surviving prefix rows is restored by copying the
-// LIVE resend's tagged text onto the identity-matched plane row (id match
-// first, then envelope-stripped signature). The tripwire itself stays
-// byte-strict: adoption only happens on content-equal-modulo-envelope.
+// Render parity. The `<acp tokens=… type=… time=…>mNNNNN</acp>` tags are NOT
+// client resend data — they are system metadata rendered by the kernel's
+// render-refs node (the LAST pipeline node, compress.ts buildNodes) over
+// turn.messages. Plane rows store the clean, pre-render text, so byte parity
+// is reached by re-running the kernel's own renderer over the assembled
+// plane view with the SAME state (refs map, token snapshot domain), strategy
+// and timestamp mode the live turn used. The tag's ref number comes from
+// state.messageRefs, the token count from the deterministic default counter
+// (deterministic recount == the pipeline's frozen snapshot for unchanged
+// text), and the immutable first-sight time from state.tsStamps — all
+// carried on the post-turn state the caller passes in.
 // ---------------------------------------------------------------------------
 
 const ACP_ENVELOPE_RE = /^<acp\s[^>]*>[^<]*<\/acp>\n/;
@@ -296,37 +309,13 @@ export function buildSnapEgressView(
     // Assemble: prefix rows[0..d) minus suppressed, anchors before the first
     // surviving row past their coverage, then the client tail verbatim.
     const d = joinRow + 1;
-
-    // Envelope re-application: walk the resend prefix in order and, for each
-    // surviving plane row, adopt the paired resend message's exact text when
-    // the pair is content-equal modulo the envelope (id match first, then
-    // signature). Rows with no pair keep the plane text — the tripwire then
-    // judges the whole view byte-strictly.
-    let ci = 0;
-    const adoptText = new Map<number, string>();
-    for (let i = 0; i < d && ci < clientJoin; i++) {
-        const r = rows[i];
-        if (suppressed(r)) continue;
-        const planeText = stripEnvelope(r.msg!.text);
-        for (let k = ci; k < clientJoin; k++) {
-            const c = clientMsgs[k];
-            const idHit = r.ids.has(c.id);
-            const sigHit = !idHit && sigOf(c) === sigOf(r.msg!);
-            if (!idHit && !sigHit) continue;
-            if (stripEnvelope(c.text) === planeText) adoptText.set(i, typeof c.text === "string" ? c.text : planeText);
-            ci = k + 1;
-            break;
-        }
-    }
     const merged: BiliMessage[] = [];
     let ai = 0;
     for (let i = 0; i < d; i++) {
         const r = rows[i];
         while (ai < anchors.length && anchors[ai].anchorPos < r.pos) merged.push(anchors[ai++].msg);
         if (suppressed(r)) continue;
-        const m = r.msg!;
-        const adopted = adoptText.get(i);
-        const out: BiliMessage = adopted === undefined ? m : ({ ...m, text: adopted } as BiliMessage);
+        const out = r.msg!;
         if (out.ledgerSeq === undefined) out.ledgerSeq = r.pos + 1; // 1-based ledgerSeq stamp (D-lane parseRow parity)
         merged.push(out);
     }
@@ -370,7 +359,30 @@ export function applySnapEgress(
         return legacyProcessed;
     }
 
-    const planeProcessed = deps.transform(built.msgs);
+    // Kernel render parity: hydrate the immutable first-sight timestamps
+    // (plane rows are stored pre-render and carry no ts), then run the
+    // kernel's own render-refs pass over the view with the same state and
+    // strategy the live turn used. renderMessage strips its own stale tag
+    // before re-stamping, so the pass is idempotent for tail messages that
+    // already carry one from a previous render. The token counts recomputed
+    // by the deterministic default counter equal the pipeline's frozen
+    // snapshot values for unchanged text. Any throw here is an honest
+    // degrade — never unverified bytes.
+    let rendered: BiliMessage[];
+    try {
+        const tsStamps = (state as { tsStamps?: Record<string, number> }).tsStamps;
+        const hydrated = tsStamps === undefined
+            ? built.msgs
+            : built.msgs.map((m) => m.ts === undefined && typeof m.id === "string" && tsStamps[m.id] !== undefined
+                ? ({ ...m, ts: tsStamps[m.id] } as BiliMessage)
+                : m);
+        rendered = renderVisibleRefs(hydrated, state, defaultCountTokens, deps.renderTags, flags.timestamps) as BiliMessage[];
+    } catch (err) {
+        noteDegrade("render-error");
+        deps.log("warn", `[snaplane] sid=${deps.sessionId} decision=degrade:egress:render-error (${err instanceof Error ? err.message : String(err)})`);
+        return legacyProcessed;
+    }
+    const planeProcessed = deps.transform(rendered);
     const verdict = tripwireCompare(planeProcessed, legacyProcessed);
     if (verdict.ok) {
         egressStats.cutover++;

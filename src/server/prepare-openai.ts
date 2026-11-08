@@ -404,6 +404,7 @@ export async function prepareOpenai(
         // any normalized mismatch keeps these legacy bytes).
         processedMessages = applySnapEgress(msgs, turn.state, processedMessages, {
             sessionId,
+            renderTags: renderStrategy,
             protocol: "openai",
             log,
             transform: (m) => applyReasoningDrop(stripKernelSummaries(m, turn.state), reasoningPlan, log, sessionId),

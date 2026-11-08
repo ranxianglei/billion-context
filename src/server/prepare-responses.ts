@@ -426,6 +426,7 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         // exact chain (strip → drop → repair) reapplied to the plane view.
         processedMessages = applySnapEgress(msgs, turn.state, processedMessages, {
             sessionId,
+            renderTags,
             protocol: "responses",
             log,
             transform: (m) => repairResponsesAssistantOrdering(applyReasoningDrop(stripKernelSummaries(m, turn.state), reasoningPlan, log, sessionId), originalMessages).messages,
