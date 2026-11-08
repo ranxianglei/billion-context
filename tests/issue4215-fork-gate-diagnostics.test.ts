@@ -1,9 +1,9 @@
 // #4215/C10a: every skipped fork-adoption entry gate must name itself. The
-// incident (seeded child with the correct parentSession, ZERO adoption trace
-// in the whole log) made "not a fork" vs "a fork we could not see"
-// unanswerable from the log. This suite pins both directions of every gate
-// (#3617 discipline): the skip line fires when it should, exactly once, and
-// plain non-fork traffic stays completely silent.
+// incident (a seeded child with a usable parentSession or forkSource but ZERO
+// adoption trace in the whole log) made "not a fork" vs "a fork we could not
+// see" unanswerable from the log. This suite pins both directions of every
+// gate (#3617 discipline): the skip line fires when it should, exactly once,
+// and plain non-fork traffic stays completely silent.
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs, { mkdtempSync, rmSync } from "node:fs";
@@ -12,7 +12,7 @@ import { once } from "node:events";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { forkChildVerdict, _maybeForkAdoptBeforeSendForTest, _resetForkGateDiagnosticsForTest, _resetRegisterForTest, type ForkChildVerdict, type PluginContext } from "../src/agent/dsh-native.ts";
-import { resetForkCapabilityCacheForTest } from "../src/agent/fork-adopt.ts";
+import { forkIdentityHashOf, forkOrderHashOf, openaiBodyToCore, resetForkCapabilityCacheForTest } from "../src/agent/fork-adopt.ts";
 
 process.env.NODE_ENV = "test";
 const testRoot = mkdtempSync(join(tmpdir(), "bili-issue4215-"));
@@ -20,7 +20,14 @@ test.after(() => rmSync(testRoot, { recursive: true, force: true }));
 for (const key of ["XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME"]) process.env[key] = testRoot;
 const logFile = join(testRoot, "billion-context", "bili.log");
 
-type SessionShape = { id?: unknown; header?: { parentSession?: unknown; isSeeded?: unknown } };
+type SessionShape = {
+    id?: unknown;
+    header?: {
+        parentSession?: unknown;
+        forkSource?: { sessionId?: unknown; boundary?: unknown };
+        isSeeded?: unknown;
+    };
+};
 type AgentShape = { session?: SessionShape };
 
 function ctxWithInitiator(fn: () => AgentShape | undefined): PluginContext {
@@ -37,6 +44,22 @@ const ctxThrowing = (): PluginContext => ctxWithInitiator(() => { throw new Erro
 const ctxPlain = (): PluginContext => ctxWithInitiator(() => ({ session: { id: "plain-sid", header: {} } }));
 const ctxSubagent = (): PluginContext => ctxWithInitiator(() => ({ session: { id: "sub-sid", header: { parentSession: "p1", isSeeded: false } } }));
 const ctxSeeded = (): PluginContext => ctxWithInitiator(() => ({ session: { id: "child-sid", header: { isSeeded: true, parentSession: "parent-sid" } } }));
+const ctxSeededForkSource = (): PluginContext => ctxWithInitiator(() => ({
+    session: { id: "child-sid", header: { isSeeded: true, forkSource: { sessionId: "parent-sid", boundary: 42 } } },
+}));
+const ctxSeededBoth = (): PluginContext => ctxWithInitiator(() => ({
+    session: {
+        id: "child-sid",
+        header: {
+            isSeeded: true,
+            parentSession: "legacy-parent",
+            forkSource: { sessionId: "parent-sid", boundary: 42 },
+        },
+    },
+}));
+const ctxSeededForkSourceProtocol = (): PluginContext => ctxWithInitiator(() => ({
+    session: { id: "fork-source-child-sid", header: { isSeeded: true, forkSource: { sessionId: "parent-sid", boundary: 42 } } },
+}));
 
 const validInit: RequestInit = { body: JSON.stringify({ model: "m", messages: [{ role: "user", content: "hi" }] }) };
 
@@ -69,6 +92,8 @@ test("forkChildVerdict names every shape (#4215)", () => {
         ["plain-session", ctxPlain, { ok: false, reason: "not-seeded", sid: "plain-sid" }],
         ["subagent-carries-parent-without-isSeeded", ctxSubagent, { ok: false, reason: "not-seeded", sid: "sub-sid" }],
         ["seeded-no-parent", () => ctxWithInitiator(() => ({ session: { id: "s1", header: { isSeeded: true } } })), { ok: false, reason: "parent-missing", sid: "s1" }],
+        ["seeded-forkSource", ctxSeededForkSource, { ok: true, sid: "child-sid", parent: "parent-sid" }],
+        ["seeded-forkSource-precedes-legacy-parent", ctxSeededBoth, { ok: true, sid: "child-sid", parent: "parent-sid" }],
         ["seeded-empty-parent", () => ctxWithInitiator(() => ({ session: { id: "s1", header: { isSeeded: true, parentSession: "" } } })), { ok: false, reason: "parent-missing", sid: "s1" }],
         ["seeded-non-string-parent", () => ctxWithInitiator(() => ({ session: { id: "s1", header: { isSeeded: true, parentSession: 7 } } })), { ok: false, reason: "parent-missing", sid: "s1" }],
         ["seeded-self-parent", () => ctxWithInitiator(() => ({ session: { id: "s1", header: { isSeeded: true, parentSession: "s1" } } })), { ok: false, reason: "parent-is-self", sid: "s1" }],
@@ -136,11 +161,64 @@ test("seeded child before the proxy origin is known: one warn naming the proxy-b
     assert.match(lines[0]!, /\[warn\].*skipped at the proxy-base gate/);
 });
 
+test("forkSource parent reaches the adoption protocol before the first request", async () => {
+    resetForkCapabilityCacheForTest();
+    const body = JSON.parse(validInit.body as string) as Record<string, unknown>;
+    const core = openaiBodyToCore(body);
+    assert(core && core.length > 0);
+    const orderedMessages = core.map((message, index) => ({
+        rawId: `raw-${index}`,
+        ref: null,
+        identityHash: forkIdentityHashOf(message),
+    }));
+    const requests: Array<{ method: string; url: string; body?: Record<string, unknown> }> = [];
+    const server = http.createServer(async (req, res) => {
+        const chunks: Buffer[] = [];
+        for await (const chunk of req) chunks.push(Buffer.from(chunk));
+        const raw = Buffer.concat(chunks).toString("utf8");
+        const parsed = raw.length > 0 ? JSON.parse(raw) as Record<string, unknown> : undefined;
+        requests.push({ method: req.method ?? "", url: req.url ?? "", body: parsed });
+        if (req.url === "/__bili/plugin/manifest") {
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ capabilities: { fork: { protocolVersion: 1 } } }));
+            return;
+        }
+        if (req.url?.startsWith("/__bili/plugin/snapshot?")) {
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ parentRevision: "rev-1", orderHash: forkOrderHashOf(orderedMessages), orderedMessages }));
+            return;
+        }
+        if (req.url === "/__bili/plugin/fork" && req.method === "POST") {
+            res.writeHead(201, { "content-type": "application/json" });
+            res.end(JSON.stringify({ replayed: false }));
+            return;
+        }
+        res.writeHead(404);
+        res.end();
+    });
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const address = server.address();
+    assert(address && typeof address === "object");
+    try {
+        _resetRegisterForTest(`http://127.0.0.1:${address.port}`, true);
+        await _maybeForkAdoptBeforeSendForTest(ctxSeededForkSourceProtocol(), validInit);
+    } finally {
+        server.close();
+        server.closeAllConnections?.();
+        await once(server, "close").catch(() => undefined);
+    }
+    const forkRequest = requests.find((request) => request.url === "/__bili/plugin/fork");
+    assert(forkRequest?.body, JSON.stringify(requests));
+    assert.equal(forkRequest.body.parentConversationId, "parent-sid");
+    assert.equal(forkRequest.body.childConversationId, "fork-source-child-sid");
+});
+
 test("malformed seeded lineage: one warn per anomaly naming what is missing (#4215)", async () => {
     freshScenario("http://proxy.invalid", true);
     await _maybeForkAdoptBeforeSendForTest(ctxWithInitiator(() => ({ session: { id: "a1", header: { isSeeded: true } } })), validInit);
     let lines = logLines();
-    assert.equal(lines.filter((l) => /carries no usable parentSession/.test(l)).length, 1, JSON.stringify(lines));
+    assert.equal(lines.filter((l) => /carries no usable parentSession or forkSource/.test(l)).length, 1, JSON.stringify(lines));
     assert.match(lines[0]!, /\[warn\].*fork adoption for a1 skipped/);
     await _maybeForkAdoptBeforeSendForTest(ctxWithInitiator(() => ({ session: { id: "b1", header: { isSeeded: true, parentSession: "b1" } } })), validInit);
     lines = logLines();
