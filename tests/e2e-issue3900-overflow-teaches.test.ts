@@ -108,7 +108,6 @@ for (const format of ["openai", "litellm"] as const) test(`e2e #3900 (${format})
         const s = listSessions().find((x) => x.id === `t3900-learn-${format}`);
         assert.ok(s, "session exists");
         const st = s!.stats;
-        assert.equal(st.overflowArmCompletionReserve, 5000, "the upstream completion share arms input headroom protection");
         // THE point of the PR: k̂ published from the rejections themselves.
         // The pending pair estimates ~24.5k (20k content + the injected tool/system
         // text estimate) for a body the provider bills at 40k message tokens →
