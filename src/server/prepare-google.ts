@@ -12,6 +12,7 @@ import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, r
 import { excludeDeadRefRanges } from "../acp-status.js";
 import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "../fold-reconcile.js";
 import { maybeSnapshotView } from "./snapshot-render.js";
+import { applySnapEgress } from "./snap-egress.js";
 import { storedMessagesFor, storedRowLookupFor } from "../fold-decomposition-lookup.js";
 import { nudgeSuppressed } from "../session-self-heal.js";
 import { compressBreakerArmed } from "../stream.js";
@@ -273,6 +274,15 @@ export async function prepareGoogle(
         if (caLine) log("info", caLine);
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, model, willInjectNudge, decideTier1Arm && !decideFallbackOverride, surfaceOffDetail(laneDecisions, opts.compress.injectTool)));
         processedMessages = stripKernelSummaries(turn.messages, turn.state);
+        // #5874 P2 (mapEgress): tripwire-guarded plane egress. Google's lane
+        // applies NO reasoning drop (#651: thoughtSignature rides verbatim),
+        // so the plane transform is strip-only — same chain, same guard.
+        processedMessages = applySnapEgress(msgs, turn.state, processedMessages, {
+            sessionId,
+            protocol: "google",
+            log,
+            transform: (m) => stripKernelSummaries(m, turn.state),
+        });
         // #1001: a silent client history rewrite takes the same archive+prune path
         // as an announced /compact boundary — syncBlocks above has already
         // deactivated the blocks whose sources left the context.

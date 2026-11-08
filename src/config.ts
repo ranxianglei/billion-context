@@ -2286,7 +2286,18 @@ type FileConfig = {
          *  never serves). The lane only counts with the master on. Both
          *  default OFF: the four v12 tables stay empty and the hook is a
          *  no-op — rollback is DROP tables + user_version rewind. */
-        snapBase?: { enabled?: boolean; shadowWrite?: boolean };
+        snapBase?: {
+            enabled?: boolean;
+            shadowWrite?: boolean;
+            /** #5874 P2 (mapEgress): serve the outbound compressed context
+             *  from the verified snap plane (tripwire-guarded; any normalized
+             *  mismatch keeps the legacy bytes). SOAK default: ON at 100% —
+             *  flip to opt-in (`egress: true` only) at the release cut. */
+            egress?: boolean;
+            /** Protocol cohorts allowed to cut over (subset of
+             *  openai|anthropic|google|responses). Default: all four. */
+            egressCohorts?: string[];
+        };
         /** #3901/#3463: session retention window in days for the GC age
          *  sweep (archive + tombstone + CAS release). 0 disables; env
          *  BILI_STORAGE_ARCHIVE_AFTER_DAYS wins. Default 365. */

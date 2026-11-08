@@ -1,6 +1,6 @@
 # Proposal: Snapshot-Table Compression Foundation (six-stage fixed chain, single storage truth)
 
-> **Status: P0 + P1 implemented in [#5901](https://github.com/ranxianglei/billion-context/pull/5901)** (schema v12; shadow-write soak, zero egress behavior change); P2 (egress cutover) still awaiting owner ruling.
+> **Status: P0 + P1 + P2 implemented in [#5901](https://github.com/ranxianglei/billion-context/pull/5901)** (schema v12; shadow-write soak; P2 = mapEgress tripwire-guarded egress cutover, soak at 100% for the `ci:full` + local-gate run, release flips it back to OFF-before-ship like every soak flag).
 > Written 2026-11-07 as a design proposal; this doc is the design record of the landed implementation.
 > **Baseline:** origin/master (written 2026-11-07; storage schema v11; #5854 has fully reverted the v6 line from master).
 > **Origin thread:** [#5643](https://github.com/ranxianglei/billion-context/issues/5643) (incl. the re-positioning comment).
@@ -313,7 +313,7 @@ CI: docker gate + solver-free; hermetic; ports via listen(0) (#360 discipline).
 | **P2** | Single-lane hydrate-egress cutover gray rollout (first cohort member; suggest pi or dsh) | Gray sessions read egress from new tables | T5/T10/T11/T12 + A/B pins always on + tripwire sampling present; one-click exit switch |
 | **P3** | decompress/export/UI/billing switched one consumer at a time; CCR/persona disposition; #3756 retirement decision; cohort roster expansion | Per-consumer switches | T8 + full matrix rerun; each phase its own PR |
 
-**Ruling E recommendation stands:** this effort scopes to P0+P1, hands off for acceptance; P2 concentrates the byte-parity risk and ships as its own PR once gray-rollout infrastructure is ready. Implemented as a single PR: #5901 carries P0+P1 together (landed 2026-11-08); P2 remains separate as planned.
+**Ruling E recommendation stood down for P2:** the owner directed single-PR completion (#5901 now carries P0+P1+P2). P2 landed as `mapEgress` ([src/server/snap-egress.ts](../../../src/server/snap-egress.ts)): every outbound turn assembles the plane view FIRST (anchors + surviving rows + client tail, the #3756 seam walk), reapplies the lane's exact post-processing, and switches the outbound bytes only on a normalized exact match (tripwire on every turn — stricter than the proposal's sampling); any mismatch keeps the legacy bytes and after 3 mismatches the session is sticky-excluded. Cohorts = protocol lanes (`storage.snapBase.egressCohorts`, default all four), see [configuration](../../configuration.md).
 
 ---
 

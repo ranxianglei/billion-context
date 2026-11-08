@@ -16,6 +16,7 @@ import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, r
 import { excludeDeadRefRanges } from "../acp-status.js";
 import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "../fold-reconcile.js";
 import { maybeSnapshotView } from "./snapshot-render.js";
+import { applySnapEgress } from "./snap-egress.js";
 import { storedMessagesFor, storedRowLookupFor } from "../fold-decomposition-lookup.js";
 import { nudgeSuppressed } from "../session-self-heal.js";
 import { compressBreakerArmed } from "../stream.js";
@@ -399,6 +400,15 @@ export async function prepareOpenai(
         if (caLine) log("info", caLine);
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model, willInjectNudge, decideTier1Arm && !decideFallbackOverride, surfaceOffDetail(laneDecisions, opts.compress.injectTool)));
         processedMessages = applyReasoningDrop(stripKernelSummaries(turn.messages, turn.state), reasoningPlan, log, sessionId);
+        // #5874 P2 (mapEgress): when the S4-verified snap plane can assemble
+        // the same view, switch the outbound source to it (tripwire-guarded;
+        // any normalized mismatch keeps these legacy bytes).
+        processedMessages = applySnapEgress(msgs, turn.state, processedMessages, {
+            sessionId,
+            protocol: "openai",
+            log,
+            transform: (m) => applyReasoningDrop(stripKernelSummaries(m, turn.state), reasoningPlan, log, sessionId),
+        });
         // #1001: a silent client history rewrite takes the same archive+prune path
         // as an announced /compact boundary — syncBlocks above has already
         // deactivated the blocks whose sources left the context. Skipped when

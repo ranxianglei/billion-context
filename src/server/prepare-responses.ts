@@ -16,6 +16,7 @@ import { mergeAdjacentConfigurationUpdates, patchResponsesInputWithToolImages as
 import { dropWhitespaceResponsesMessages, normalizeResponsesMessageItems, sanitizeResponsesInputIds } from "../loop/adapter-responses.js";
 import { METADATA_LAST_RESPONSES_MODE, noteCanonicalSystemFingerprint, reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "../fold-reconcile.js";
 import { buildAnchoredView, maybeSnapshotView, noteAnchoredRender, SnapshotAnchorFallbackError, wsAnchoredPayload } from "./snapshot-render.js";
+import { applySnapEgress } from "./snap-egress.js";
 import { storedMessagesFor, storedRowLookupFor } from "../fold-decomposition-lookup.js";
 import { nudgeSuppressed, pluginLaneDegraded } from "../session-self-heal.js";
 import { compressBreakerArmed } from "../stream.js";
@@ -443,6 +444,14 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         const ordered = repairResponsesAssistantOrdering(applyReasoningDrop(stripKernelSummaries(turn.messages, turn.state), reasoningPlan, log, sessionId), originalMessages);
         processedMessages = ordered.messages;
         separatorSlots = ordered.slots;
+        // #5874 P2 (mapEgress): tripwire-guarded plane egress — the lane's
+        // exact chain (strip → drop → repair) reapplied to the plane view.
+        processedMessages = applySnapEgress(msgs, turn.state, processedMessages, {
+            sessionId,
+            protocol: "responses",
+            log,
+            transform: (m) => repairResponsesAssistantOrdering(applyReasoningDrop(stripKernelSummaries(m, turn.state), reasoningPlan, log, sessionId), originalMessages).messages,
+        });
         // #3477: consume the announced native-compaction boundary (pi session_compact
         // → /__bili/plugin/compact → markCompactionBoundary) exactly once, after the
         // post-compaction history was processed: archives the deactivated blocks,

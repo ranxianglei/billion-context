@@ -13,6 +13,7 @@ import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, r
 import { excludeDeadRefRanges } from "../acp-status.js";
 import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "../fold-reconcile.js";
 import { maybeSnapshotView } from "./snapshot-render.js";
+import { applySnapEgress } from "./snap-egress.js";
 import { storedMessagesFor, storedRowLookupFor } from "../fold-decomposition-lookup.js";
 import { nudgeSuppressed } from "../session-self-heal.js";
 import { compressBreakerArmed } from "../stream.js";
@@ -446,6 +447,14 @@ export async function prepareAnthropic(
         if (caLine) log("info", caLine);
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, resolvedModel ?? parsed.model, willInjectNudge, decideTier1Arm && !decideFallbackOverride, surfaceOffDetail(laneDecisions, opts.compress.injectTool)));
         processedMessages = applyReasoningDrop(stripKernelSummaries(turn.messages, turn.state), reasoningPlan, log, sessionId);
+        // #5874 P2 (mapEgress): tripwire-guarded plane egress (see
+        // prepare-openai.ts for the chain rationale).
+        processedMessages = applySnapEgress(msgs, turn.state, processedMessages, {
+            sessionId,
+            protocol: "anthropic",
+            log,
+            transform: (m) => applyReasoningDrop(stripKernelSummaries(m, turn.state), reasoningPlan, log, sessionId),
+        });
         // #1001: a silent client history rewrite takes the same archive+prune path
         // as an announced /compact boundary — syncBlocks above has already
         // deactivated the blocks whose sources left the context. Skipped when
