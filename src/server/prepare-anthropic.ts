@@ -454,7 +454,7 @@ export async function prepareAnthropic(
             renderTags: renderStrategy,
             protocol: "anthropic",
             log,
-            transform: (m) => applyReasoningDrop(stripKernelSummaries(m, turn.state), reasoningPlan, log, sessionId),
+            transform: (m) => applyReasoningDrop(stripKernelSummaries(attachSubagentSessions(applyAbsorbView(m, session.state, loopConfig, tokenCount), session), turn.state), reasoningPlan, log, sessionId),
         });
         // #1001: a silent client history rewrite takes the same archive+prune path
         // as an announced /compact boundary — syncBlocks above has already

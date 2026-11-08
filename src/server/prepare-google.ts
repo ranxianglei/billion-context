@@ -282,7 +282,7 @@ export async function prepareGoogle(
             renderTags: renderStrategy,
             protocol: "google",
             log,
-            transform: (m) => stripKernelSummaries(m, turn.state),
+            transform: (m) => stripKernelSummaries(attachSubagentSessions(applyAbsorbView(m, session.state, loopConfig, tokenCount), session), turn.state),
         });
         // #1001: a silent client history rewrite takes the same archive+prune path
         // as an announced /compact boundary — syncBlocks above has already

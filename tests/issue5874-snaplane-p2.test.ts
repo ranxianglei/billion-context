@@ -241,7 +241,7 @@ test("#5874 T14: tripwire ignores ids/stamps, compares payload exactly", () => {
     assert.equal(cVerdict.ok === false && cVerdict.reason, "shape@1:text");
     assert.match(cVerdict.ok === false && cVerdict.firstDiff || "", /^text plane\(len=5\)="world" …seam@0: plane="world" legacy="WORLD" …tail="world"\|"WORLD"$/);
     const d = [msg("host-1", "hello")];
-    assert.deepEqual(tripwireCompare(a, d), { ok: false, reason: "length(plane=2,legacy=1)" });
+    assert.deepEqual(tripwireCompare(a, d), { ok: false, reason: "length(plane=2,legacy=1)", firstDiff: "+1×assistant/text" });
     const imgA = { id: "i1", role: "user", contentType: "image", text: "", imagePart: true, imageBase64: "QUJD" } as unknown as BiliMessage;
     const imgB = { id: "i2", role: "user", contentType: "image", text: "", imagePart: true, imageBase64: "QUJD" } as unknown as BiliMessage;
     const imgC = { id: "i3", role: "user", contentType: "image", text: "", imagePart: true, imageBase64: "REVG" } as unknown as BiliMessage;
