@@ -19,7 +19,7 @@ import { attachSubagentSessions, subagentSessionNote, subagentSessionsOf, syncSu
 import { METADATA_DRIFT_ESCALATED } from "./fold-reconcile.js";
 import { safePrefix, safeSuffix, scrubLoneSurrogates } from "./text-safe.js";
 import { applyConfiguredCompression } from "./external-summary-compress.js";
-import { unpromptedGateOf } from "./unprompted-gate.js";
+import { consumeNudgeCredit, unpromptedGateOf } from "./unprompted-gate.js";
 import { describeUncoveredRuns, shortTokenCount, uncoveredHistoryRuns } from "./uncovered.js";
 
 export type RewriteCtx = {
@@ -1046,8 +1046,8 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
     // nudge channel itself is suppressed.
     const gate = trackLoop ? unpromptedGateOf(ctx.session) : undefined;
     if (gate?.requireNudge && !gate.armed) {
-        ctx.log("[acp-proxy: refused unprompted compress — no nudge was injected this turn (compress.requireNudge)]");
-        return compressResult("[Compression REFUSED: unprompted compression is disabled on this route (compress.requireNudge) — you may only call compress in a round where a compression nudge was actually injected, and no nudge accompanied this round. Continue the task without folding; when a nudge appears, follow its ranges.]", "refused", 0, "unprompted");
+        ctx.log("[acp-proxy: refused unprompted compress — no live nudge credit (compress.requireNudge, #5943)]");
+        return compressResult("[Compression REFUSED: unprompted compression is disabled on this route (compress.requireNudge) — you may only call compress while a compression nudge credit is live: it opens when a nudge is actually injected, stays valid for the following rounds until you fold something under it (which consumes it), and a newer nudge refreshes it. No live credit covers this round. Continue the task without folding; when a nudge appears, follow its ranges.]", "refused", 0, "unprompted");
     }
     let { ranges, diagnostics } = parsed;
     if (ranges.length === 0) {
@@ -1285,6 +1285,11 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
             return compressResult(receipt, "refused", 0, "gate:no-net-shrink");
         }
         ctx.session.state = res.state;
+        // #5943: a committed model-initiated fold spends its nudge credit —
+        // the arm holds for the rest of this turn (loop re-requests do not
+        // re-stamp) and dies at the next prepare. No-op when the gate is off
+        // or the fold was not credit-backed.
+        if (trackLoop && r.blocksCreated > 0) consumeNudgeCredit(ctx.session);
         // #2627 backstop: no committed state may carry outbound-only turn-
         // separator ids in coverage (a polluted child would otherwise re-
         // poison higher folds via effectiveMessageIds inheritance). Runs

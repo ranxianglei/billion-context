@@ -120,10 +120,10 @@ entries:
     group: compress
     id: cw.rnug
     render: compress-row
-    desc_en: "Forbid UNPROMPTED model-initiated compression (#5683): a compress call is refused unless a compression nudge actually reached the model in the current turn (advisory, decide-directive and emergency injections all arm; loop rounds of the same turn keep the arm, the next un-nudged turn disarms). Refusal sends the model an error receipt instead of folding; bili's own overflow backstop folds are exempt. For models that fold on their own (e.g. qwen 27b); can be scoped per provider/model. Off unless explicitly enabled."
-    desc_zh: "禁止未提示的模型主动压缩（#5683）：只有当前轮次压缩提醒真正送达模型时（advisory、模型自决指令、紧急提醒都算；\"gated\"/\"vetoed\"/\"skipped\" 不算）才允许 compress，否则拒绝并回错误回执；同一轮内的多次 loop 请求保持武装，下一个未提示轮次自动解除。bili 自己的溢出兜底折叠不受影响。针对会自行乱压的模型（如 qwen 27b），可按 provider/model 单独开启。默认关闭。"
-    site_en: "Forbid unprompted compression (off by default): a model compress call is refused unless a nudge actually reached the model this turn; the refusal returns an error receipt instead of folding."
-    site_zh: "禁止未提示压缩（默认关闭）：只有本轮压缩提醒真正送达模型时才允许模型调用 compress，否则拒绝并回错误回执。"
+    desc_en: "Forbid UNPROMPTED model-initiated compression (#5683): a compress call is refused unless a compression nudge credit is live — a delivered nudge (advisory, decide-directive and emergency injections all arm; \"gated\"/\"vetoed\"/\"skipped\" never) opens a 20-prepare window during which the model may come back and fold; a committed fold consumes the credit (it holds for the rest of the turn and dies at the next round), and a newer nudge refreshes the window (#5943). Refusal sends the model an error receipt instead of folding; bili's own overflow backstop folds are exempt. For models that fold on their own (e.g. qwen 27b); can be scoped per provider/model. Off unless explicitly enabled."
+    desc_zh: "禁止未提示的模型主动压缩（#5683）：只有压缩提醒信用（nudge credit）存活时才允许 compress —— 提醒真正送达模型（advisory、模型自决指令、紧急提醒都算；\"gated\"/\"vetoed\"/\"skipped\" 不算）后开启 20 轮窗口，模型可在窗口内回来压缩；完成一次折叠即消耗信用（本轮内剩余调用仍放行，下一轮边界失效），更新的提醒刷新窗口（#5943）。拒绝时回错误回执而非折叠；bili 自己的溢出兜底折叠不受影响。针对会自行乱压的模型（如 qwen 27b），可按 provider/model 单独开启。默认关闭。"
+    site_en: "Forbid unprompted compression (off by default): a model compress call is refused unless a nudge credit is live — a delivered nudge opens a 20-round window; a committed fold consumes it, a newer nudge refreshes it (#5943). The refusal returns an error receipt instead of folding."
+    site_zh: "禁止未提示压缩（默认关闭）：只有 nudge 信用存活时才允许模型调用 compress —— 提醒送达后开启 20 轮窗口，完成折叠即消耗、更新的提醒刷新（#5943）；否则拒绝并回错误回执。"
   - key: compress.requireRecommendation
     type: boolean
     default: "off (unset)"

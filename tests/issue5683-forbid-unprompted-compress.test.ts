@@ -12,7 +12,7 @@ import { parseCompressSettings } from "../src/config.ts";
 import { mergeCompress } from "../src/compress-settings.ts";
 import { liveCompressionRanges } from "../src/acp-status.js";
 import { applyRanges, type RewriteCtx } from "../src/stream.ts";
-import { storeUnpromptedGate } from "../src/unprompted-gate.ts";
+import { storeUnpromptedGate, stampUnpromptedGate, NUDGE_CREDIT_ROUNDS } from "../src/unprompted-gate.ts";
 
 const SUM = "SUMMARY-PAYLOAD-LONG-ENOUGH-FOR-THE-KERNEL-MIN-LENGTH-CHECK-XYZ";
 
@@ -251,4 +251,66 @@ test("#5683: plugin-lane ctx (no lastNudge) — a span containing a DEAD ref is 
     assert.ok(out.startsWith("[Compression REFUSED"), `expected refusal, got: ${out.slice(0, 160)}`);
     assert.ok(out.includes("out-of-bounds compression is disabled"), "must be OUR receipt, not a kernel one:\n" + out);
     assert.equal(ctx.session.state.blocks.length, 0, "nothing folded");
+});
+
+// ---------------------------------------------------------------------------
+// #5943: the nudge arm is a CREDIT, not a one-round flag. stampUnpromptedGate
+// (the prepare-time entry point used by src/server/handle.ts) carries a
+// delivered nudge forward across NUDGE_CREDIT_ROUNDS prepares; a committed
+// fold consumes the credit; a newer nudge refreshes it.
+// ---------------------------------------------------------------------------
+
+function stamp(ctx: Ctx, nudgeInjected: boolean): void {
+    stampUnpromptedGate(ctx.session, { nudgeInjected, requireNudge: true, requireRecommendation: false });
+}
+
+test("#5943: nudge credit survives un-nudged rounds — delayed fulfillment allowed", () => {
+    const ctx = freshCtx();
+    stamp(ctx, true); // round 1: nudge delivered
+    stamp(ctx, false); // round 2: the model was busy doing other work
+    stamp(ctx, false); // round 3: now it comes back to fold
+    const out = runApply(ctx, { content: [{ startId: "m00001", endId: "m00004", summary: SUM }] });
+    assert.ok(out.startsWith("[Compressed"), `delayed fulfillment inside the credit window must pass, got: ${out.slice(0, 160)}`);
+    assert.equal(ctx.session.state.blocks.length, 1, "the fold committed");
+});
+
+test("#5943: credit expires after NUDGE_CREDIT_ROUNDS un-nudged prepares — refused again", () => {
+    const ctx = freshCtx();
+    stamp(ctx, true); // round 1: credit opens, window = rounds 1..NUDGE_CREDIT_ROUNDS
+    for (let i = 1; i < NUDGE_CREDIT_ROUNDS; i++) stamp(ctx, false); // rounds 2..20: still inside
+    const inside = runApply(ctx, { content: [{ startId: "m00001", endId: "m00004", summary: SUM }] });
+    assert.ok(inside.startsWith("[Compressed"), `round 20 (last of the window) must still pass, got: ${inside.slice(0, 160)}`);
+
+    const ctx2 = freshCtx();
+    stamp(ctx2, true);
+    for (let i = 1; i <= NUDGE_CREDIT_ROUNDS; i++) stamp(ctx2, false); // rounds 2..21: past the window
+    const out = runApply(ctx2, { content: [{ startId: "m00001", endId: "m00004", summary: SUM }] });
+    assert.ok(out.startsWith("[Compression REFUSED"), `expired credit must refuse, got: ${out.slice(0, 160)}`);
+    assert.ok(out.includes("requireNudge"), "receipt names the knob:\n" + out);
+    assert.equal(ctx2.session.state.blocks.length, 0, "nothing folded");
+});
+
+test("#5943: a committed fold consumes the credit — rest of turn holds, next round refuses", () => {
+    const ctx = freshCtx();
+    stamp(ctx, true); // round 1: nudge delivered
+    const first = runApply(ctx, { content: [{ startId: "m00001", endId: "m00004", summary: SUM }] });
+    assert.ok(first.startsWith("[Compressed"), `first fold must pass: ${first.slice(0, 160)}`);
+    // Same turn, no re-stamp: loop re-requests persist — the arm still holds.
+    const second = runApply(ctx, { content: [{ startId: "m00005", endId: "m00007", summary: SUM }] });
+    assert.ok(second.startsWith("[Compressed"), `same-turn re-request must still pass, got: ${second.slice(0, 160)}`);
+    // Next prepare: the consumed credit dies at the round boundary.
+    stamp(ctx, false); // round 2
+    const out = runApply(ctx, { content: [{ startId: "m00005", endId: "m00007", summary: SUM + "-R" }] });
+    assert.ok(out.startsWith("[Compression REFUSED"), `consumed credit must refuse next round, got: ${out.slice(0, 160)}`);
+    assert.ok(out.includes("requireNudge"), "receipt names the knob:\n" + out);
+});
+
+test("#5943: a newer nudge refreshes the credit after consumption", () => {
+    const ctx = freshCtx();
+    stamp(ctx, true); // round 1
+    const first = runApply(ctx, { content: [{ startId: "m00001", endId: "m00004", summary: SUM }] });
+    assert.ok(first.startsWith("[Compressed"), `first fold must pass: ${first.slice(0, 160)}`);
+    stamp(ctx, true); // round 2: a fresh nudge — new window, credit re-armed
+    const out = runApply(ctx, { content: [{ startId: "m00005", endId: "m00007", summary: SUM }] });
+    assert.ok(out.startsWith("[Compressed"), `refreshed credit must pass, got: ${out.slice(0, 160)}`);
 });

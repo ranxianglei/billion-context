@@ -343,6 +343,10 @@ export type Session = {
          *  all-off default until the first round re-stamps, which is safe: no
          *  tool call can reach applyRanges before its own round's prepare. */
         unpromptedGate?: UnpromptedGate;
+        /** #5943: per-session prepare counter that paces the nudge credit
+         *  (src/unprompted-gate.ts stampUnpromptedGate). In-memory only —
+         *  restarts reset the credit along with the gate. */
+        nudgeCreditRound?: number;
     };
     id: string;
     /** Identity / descriptive metadata. Populated on first request. */

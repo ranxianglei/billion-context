@@ -8,7 +8,7 @@ import { performance } from "node:perf_hooks";
 import { defaultPrompts, type CompressionCore, type Config, type PackSurface, type Prompts } from "acp-kernel";
 import { conversationSignalAnthropic, conversationSignalGoogle, conversationSignalOpenai, conversationIdentityResponses, conversationSignalResponses, googleSystemText, type AnthropicRequestBody, type GoogleRequestBody, type OpenAIRequestBody, type ResponsesRequestBody } from "acp-kernel/wire";
 import { resolveCompress, resolveCompressPrompts, resolveCompressSurfaceDetailed, resolveRequestConfig, type CompressSettings } from "../compress-settings.js";
-import { storeUnpromptedGate } from "../unprompted-gate.js";
+import { stampUnpromptedGate } from "../unprompted-gate.js";
 import { FALLBACK_EFFECTIVE_WINDOW_FLOOR, findRoute, findRouteKey, lookupContextLimit, resolveConfiguredOutputLimit, resolveCompressProtocol, resolveDeclaredProtocol, resolveModelEntry, type ProxyOptions } from "../config.js";
 import { resolveProxyDecision } from "../upstream-proxy.js";
 import { contextFromRegistry, peekRegistryContext, peekRegistryOutputLimit, peekRegistryPriceProfile } from "../registry.js";
@@ -2915,17 +2915,23 @@ async function handleRequest(
                         degradeAvailable: opts.compress.injectTool && !knobNoInjectTool(),
                     }, log);
                 }
-                // #5683: stamp this round's compression-prompt facts for the
-                // unprompted/out-of-bounds gates (applyRanges). armed tracks the
-                // SAME post-gate delivery fact as the self-heal credit above —
-                // only an actually delivered nudge ("injected") arms; "gated"
-                // rounds held by the emergency backoff never did reach the model.
-                // Stamped on EVERY round (not just nudge-carrying ones) so an
-                // un-nudged round disarms a stale arm; loop re-requests within
-                // the same turn do not re-run prepare, so the arm persists across
-                // rounds of one turn and dies with the next un-nudged turn.
-                storeUnpromptedGate(session, {
-                    armed: prepared.nudgeOutcome === "injected",
+                // #5683/#5943: stamp this round's compression-prompt facts for
+                // the unprompted/out-of-bounds gates (applyRanges) via the
+                // NUDGE CREDIT. A delivered nudge ("injected" — the SAME
+                // post-gate delivery fact as the self-heal credit above; "gated"
+                // rounds held by the emergency backoff never did reach the model
+                // and never arm) opens a window of NUDGE_CREDIT_ROUNDS prepares
+                // during which the model may come back and fold: real cleanup
+                // work spans several rounds (read ranges, write the summary,
+                // retry after a requireRecommendation refusal), and the old
+                // one-round arm refused exactly that. Un-nudged rounds no longer
+                // disarm immediately — the credit carries forward until it
+                // expires, is consumed by a committed fold, or is refreshed by
+                // a newer nudge. Loop re-requests within the same turn do not
+                // re-run prepare, so the arm still persists across rounds of one
+                // turn.
+                stampUnpromptedGate(session, {
+                    nudgeInjected: prepared.nudgeOutcome === "injected",
                     requireNudge: preparedCs?.requireNudge === true,
                     requireRecommendation: preparedCs?.requireRecommendation === true,
                 });
