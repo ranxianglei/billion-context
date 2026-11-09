@@ -54,7 +54,8 @@ import { prepareResponses, prepareResponsesCompact } from "./server/prepare-resp
 import { FORCE_TEXT_PROTOCOL } from "./server/inject.js";
 export { isChatGptCodexUpstream, isCodexResponsesLite, resolvePromptCacheKey, shouldInjectPromptCacheKey } from "./server/prepare-responses.js";
 import { biliToolsDeclaredOnWire, countBiliToolUses, evaluateSelfHealRound, nudgeSuppressed, pluginLaneDegraded, pluginLaneRestore } from "./session-self-heal.js";
-import { getSession, hasProcessedState, listSessions, peekSession, type PendingRetrieval, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, totalInFlight, snapshotMessages, ensureCanonicalId, storeEffectiveConfig, foldCoverage, postRebuildAnchorTokens, setPostRebuildAnchor, tickPostRebuildAnchor, splitSessionWarnings, usageAnchorCycleStale, staleSmallAnchorFallback, RESPONSES_TURN_SEPARATOR_ID_PREFIX } from "./session.js";
+import { getSession, hasProcessedState, listSessions, peekSession, type PendingRetrieval, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, totalInFlight, snapshotMessages, ensureCanonicalId, storeEffectiveConfig, foldCoverage, postRebuildAnchorTokens, setPostRebuildAnchor, tickPostRebuildAnchor, splitSessionWarnings, usageAnchorCycleStale, staleSmallAnchorFallback } from "./session.js";
+import type { SeparatorManifest } from "./server/responses-ordering.js";
 import { detectStaleInstall, isVersionNewer } from "./update.js";
 import { decideEaddrinuse, eaddrinuseExitCode, isPortBusyError, postBindCanLadder, UPGRADE_REPLACEMENT_ENV, type FailFastReason } from "./listen-policy.js";
 import { getAdvisoryState, cannotResolveTarget } from "./advisory.js";
@@ -95,7 +96,7 @@ import { conflictScanEnabled, isDesignBenign, scanClientPlugins, sniffScanClient
 import { clearConflictEvents, recordConflict, summarizeConflicts } from "./conflict-watch.js";
 import { getStore, setGlobalSessionCommitListener } from "./persist.js";
 import { log as loggerLog, configureLogger, getLogPath, closeLogger, isStreamWriteError, isBenignSocketRaceError, enterSessionContext, muteStderrLeg, onFileLegLive, shouldMuteStderrLegAfterFileLive, logTimestamp } from "./logger.js";
-import { queryLogLines } from "./web/logs-query.js";
+import { configureLogRetention } from "./log-retention.js";
 import { configFile, defaultLogFile, sessionsDir, stateDir } from "./paths.js";
 import { atomicWriteInstanceFile, clearProxyInstanceFile, classifySameLanePeer, entryShape, findPresentUnverifiedSameLaneTwin, findSameLanePredecessor, findVerifiedSameLaneTwin, isPidAlive, listInstances, markPortReleased, probePid, readProxyInstanceFile, registerInstanceAndWarn, resolveOwnFingerprint, sameInstanceShape, SPAWN_FINGERPRINT_ENV, unregisterInstance, warnOnNewPeers, writeSpawnPortLog, type InstanceShape, type PidProbe, type ProxyInstanceFile, type RegistryEntry, type SameLanePeer } from "./instance.js";
 import { createServedMarkerWriter, peerStillContests, processStartMs, reapStaleWriterMarkers, writerMarkerDir, type ServedMarkerWriter } from "./served-markers.js";
@@ -141,6 +142,7 @@ import {
     limitsReceiveBytes as knobLimitsReceiveBytes,
     limitsMaxMessages,
     limitsIngestBytes as knobLimitsIngestBytes,
+    logRetentionPolicy as knobLogRetentionPolicy,
     noCompressPrompt as knobNoCompressPrompt,
     noInjectTool as knobNoInjectTool,
     postResponseLingerMs as knobPostResponseLingerMs,
@@ -491,6 +493,10 @@ export interface EngineContext {
 }
 
 export async function createEngineContext(opts: ProxyOptions): Promise<EngineContext> {
+    // Resolve the private-log retention policy BEFORE the logger opens a file:
+    // this is the acyclic startup boundary (config.ts + knobs.ts import logger.ts,
+    // so the logger can never read them itself). Env > config file > default.
+    configureLogRetention(knobLogRetentionPolicy());
     // Configure the tee logger (file + stderr) BEFORE any logging so the very
     // first line (persist status) lands in the file too.
     const filePath = configureLogger(opts.logFile ?? defaultLogFile());
@@ -644,6 +650,10 @@ export async function createEngineContext(opts: ProxyOptions): Promise<EngineCon
 }
 
 export async function startServer(opts: ProxyOptions): Promise<http.Server> {
+    // Same acyclic startup boundary as createEngineContext: startServer opens the
+    // file leg for the watchdog and the twin exits BEFORE the engine exists, so
+    // the retention policy must already be resolved here (idempotent).
+    configureLogRetention(knobLogRetentionPolicy());
     const launchToken = process.env.BILI_LAUNCH_TOKEN?.trim();
     // #1225: lane identity + code fingerprint recorded into the instance file
     // so later launches can decide reuse by WHO started us and WHICH code we
@@ -1926,6 +1936,12 @@ export type Prepared = {
      *  from the frozen prefix). Undefined = client-authoritative turn, the
      *  judge keeps originalMessages (byte-identical behavior). */
     judgeBaseline?: readonly CoreMessage[];
+    /** #564/#2627: producer-owned Responses ordering separators resolved into
+     *  the exact indexes of `parsedBody.input`. Handed to the invariant judge
+     *  as an explicit argument so it can exempt ONLY bili's own outbound-only
+     *  markers — never client prose that happens to carry identical text. The
+     *  manifest is re-anchored against the final wire array at judge time. */
+    separatorManifest?: SeparatorManifest;
     protocol: WireProtocol;
     stream: boolean;
     compressInjected: boolean;
@@ -2569,18 +2585,26 @@ export { dedupeAdjacentOutputConfig } from "./dedupe-adjacent-output-config.js";
  *  silent. Any remaining fire means another path lost thinking (e.g. a fold
  *  pruned the block while preserving the tool_use) — investigate. [#2864]
  *  identity dedup like the openai twin: each lost tool_use reports once per
- *  episode, not once per request of a persistent violation. */
+ *  episode, not once per request of a persistent violation. [#5998] the
+ *  inbound scan counts SIGNED thinking only: an unsigned thinking block is
+ *  never a replayable asset on any upstream — signature-verifying peers
+ *  reject it ("thinking.signature: Field required") and never-signing relays
+ *  require exactly the bytes they produced verbatim — so its absence from the
+ *  outbound rebuild is by design, not a violation; only a lost SIGNED pair is
+ *  reportable. */
 export function warnAnthropicThinkingPairs(
     inboundMessages: unknown[],
     outboundMessages: unknown[],
     log: (level: string, msg: string) => void,
     sessionId: string,
 ): void {
+    const signedThinking = (b: { type?: string; signature?: unknown }) =>
+        b?.type === "thinking" && typeof b.signature === "string" && b.signature.length > 0;
     const thinkingIds = new Set<string>();
     for (const m of inboundMessages) {
-        const msg = m as { role?: string; content?: Array<{ type?: string; id?: string }> };
+        const msg = m as { role?: string; content?: Array<{ type?: string; id?: string; signature?: unknown }> };
         if (msg?.role !== "assistant" || !Array.isArray(msg.content)) continue;
-        if (!msg.content.some((b) => b?.type === "thinking")) continue;
+        if (!msg.content.some(signedThinking)) continue;
         for (const b of msg.content) {
             if (b?.type === "tool_use" && typeof b.id === "string") thinkingIds.add(b.id);
         }
@@ -2746,61 +2770,6 @@ export function stripKernelSummaries(messages: BiliMessage[], state: Compression
     return messages.filter((m) => !(m.id ?? "").startsWith("acp_summary_") || !carried.has(m.id));
 }
 
-// #564: folding + stripKernelSummaries can merge two assistant turns into one
-// run, which Responses rejects (run order reasoning* -> message* ->
-// function_call*, <=1 reasoning). Rebuild boundaries from the ORIGINAL history
-// AFTER dedup: drop a reasoning whose turn body was wholly folded away (keep
-// originally-reasoning-only turns), else separate the runs with a user marker.
-const RESPONSES_TURN_SEPARATOR = "[The exchange between these two assistant turns was compressed.]";
-
-export function repairResponsesAssistantOrdering(folded: CoreMessage[], original: CoreMessage[]): CoreMessage[] {
-    const runOf = new Map<string, number>();
-    const runHasBody = new Map<number, boolean>();
-    let run = 0;
-    let inRun = false;
-    for (const m of original) {
-        if (m.role === "assistant") {
-            if (!inRun) { run++; inRun = true; }
-            runOf.set(m.id, run);
-            if (m.contentType !== "reasoning") runHasBody.set(run, true);
-        } else {
-            inRun = false;
-        }
-    }
-    const survivorCount = new Map<number, number>();
-    for (const m of folded) {
-        const r = m.role === "assistant" ? runOf.get(m.id) : undefined;
-        if (r !== undefined) survivorCount.set(r, (survivorCount.get(r) ?? 0) + 1);
-    }
-
-    const out: CoreMessage[] = [];
-    let phase = -1;
-    let seenReasoning = false;
-    let sepSeq = 0;
-    const pushSeparator = (): void => {
-        sepSeq++;
-        out.push({ id: `${RESPONSES_TURN_SEPARATOR_ID_PREFIX}${sepSeq}`, role: "user", contentType: "text", text: RESPONSES_TURN_SEPARATOR });
-        phase = -1;
-        seenReasoning = false;
-    };
-    for (const m of folded) {
-        if (m.role !== "assistant") {
-            out.push(m);
-            phase = -1;
-            seenReasoning = false;
-            continue;
-        }
-        const kind = m.contentType === "reasoning" ? "reasoning" : m.contentType === "tool-call" ? "tool-call" : "message";
-        const r = runOf.get(m.id);
-        if (kind === "reasoning" && r !== undefined && runHasBody.get(r) && survivorCount.get(r) === 1) continue;
-        if ((kind === "reasoning" && (phase > 0 || seenReasoning)) || (kind === "message" && phase === 2)) pushSeparator();
-        out.push(m);
-        if (kind === "reasoning") { phase = Math.max(phase, 0); seenReasoning = true; }
-        else if (kind === "message") phase = Math.max(phase, 1);
-        else phase = Math.max(phase, 2);
-    }
-    return out;
-}
 
 export function diagTagSummary(messages: CoreMessage[], sessionId: string, strategy: string): string {
     let textTagged = 0;
@@ -4417,7 +4386,17 @@ export async function preflightCompressIfNeeded(
                     log("info", `[${session.id}] auto-fold steady state: payload fits and no foldable candidates remained — forwarding as-is without backoff (#2638)`);
                 }
             } else {
-                log("warn", `[${session.id}] preflight made no progress but the payload fits; forwarding as-is`);
+                // #5907 facet 3: this exact branch is where an UNATTRIBUTED chain burns
+                // its turn silently — the request carried no conversation identity, so
+                // bili minted a pfa-* chain whose window came from the static ladder
+                // (table / registry / configured / default), never a host report; the
+                // fit verdict rests on the optimistic estimate; and the forward then
+                // dies upstream (400 / stream silence) with nothing in the log naming
+                // the class. An on-site operator reading only bili.log could not tell
+                // "mis-sized anonymous window" from a healthy fit-forward without an
+                // external probe. Name it in the one line they already grep for —
+                // identified sessions keep the original wording verbatim.
+                log("warn", `[${session.id}] preflight made no progress but the payload fits; forwarding as-is${anonymous ? " — unattributed chain (no conversation identity in this request's headers): the effective window came from bili's static ladder, not a host report, and may be mis-sized for the model actually served; if this turn 400s or stalls upstream, make the sending path carry the identity headers so the turn attaches to the real session (#5907)" : ""}`);
             }
         } else if (growthArmed && !queueDroppedAll && result.savedTokens < AUTO_FOLD_MIN_BENEFIT_TOKENS) {
             // [#3444] sub-benefit fold: a full external-summary round trip saved
