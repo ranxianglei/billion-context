@@ -663,7 +663,9 @@ export type CompressSettings = {
      *  and state are untouched; identical layout is recomputed every turn.
      *  Env BILI_COMPRESS_AT_FOLD_POINT wins over every level;
      *  applyCompressSettings resolves it per request. Maps to kernel
-     *  Config.compressAtFoldPoint (acp-kernel >= 0.0.177). */
+     *  Config.compressAtFoldPoint (acp-kernel >= 0.0.177; v2 semantics since
+     *  0.0.188 — summary text relocated to the fold point, pair kept in slot
+     *  with pointer args). */
     compressAtFoldPoint?: boolean;
     /** Second opt-in riding on compressAtFoldPoint (default OFF): also drop
      *  the contiguous run of UNSIGNED reasoning cores immediately preceding a
@@ -2118,8 +2120,16 @@ type FileConfig = {
      *  so `bili pi` keeps its launcher proxy. Opt OUT with `false` (or
      *  BILI_PI_INLINE=0/false/no/off) — restores attach/spawn. Resolved
      *  env > file > default; an explicit inline choice beats an announced
-     *  attach target. */
-     pi?: { subagents?: PiSubagentsFileConfig | boolean; inline?: boolean };
+     *  attach target.
+     *
+     *  `commands`: which of the bili pi-plugin slash commands to register —
+     *  "acp", "acp-cache", "acp-rule", "acp-fleet". Default ["acp",
+     *  "acp-cache"] keeps the status and cache-reconciliation entry points
+     *  while leaving the rarer acp-rule / acp-fleet off the completion list;
+     *  `[]` or `false` registers none; unknown names log a console warning
+     *  and are ignored. Takes effect on the next session (registration runs
+     *  once per session start). */
+     pi?: { subagents?: PiSubagentsFileConfig | boolean; inline?: boolean; commands?: readonly string[] | boolean };
     /** Built-in opencode-lane inline switch (#3278 port, OPT-IN — default
      *  stays the spawned proxy, per owner decision on #4687): run the
      *  opencode lane's compression IN-PROCESS — no proxy server spawned.
@@ -2321,6 +2331,17 @@ type FileConfig = {
          *  SELF_SIGNED_CERT_IN_CHAIN. MERGED with Node's built-in roots, never replacing them.
          *  Env BILI_CA_FILE wins. */
         caFile?: string;
+        /** #5000 item 2: per-upstream hard cap on the messages[] array length — a wire constraint no
+         *  byte/token estimate expresses (the 26,903-message #5000 session cleared every size gate and
+         *  died at the upstream). Per-UPSTREAM on purpose: default 0 = disabled; set it to your upstream's
+         *  known limit and over-count bodies get an actionable 413 (restart / rewind) instead of a
+         *  guaranteed upstream 400. Count only — it never folds. Env BILI_MAX_MESSAGES wins. */
+        maxMessages?: number;
+        /** #5794 item 2: cost band (decoded bytes) for the JSON.parse + normalization sweep AFTER
+         *  decode; a body above it is refused with an actionable 413 before the sweep, because any
+         *  parseable body over 32 MiB is ≥ ~8M tokens — beyond every real model window. 0 disables
+         *  the ingest cap (legacy parse-everything). Env BILI_INGEST_BODY_BYTES wins. */
+        ingestBodyBytes?: number;
     };
     /** Session persistence knobs (#2030) — was BILI_PERSIST_* env-only. */
     persist?: {

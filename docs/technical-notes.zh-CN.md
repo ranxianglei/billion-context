@@ -2,6 +2,13 @@
 
 README 三种使用方式背后的机制级说明。README 里每种方式只保留简洁的用法;「它到底怎么工作」的内容都放在这里,而不是夹在三种方式中间。
 
+## 被拒请求的 token 计量
+
+上下文溢出恢复分别处理上游窗口上限、被拒请求的总量、输入消息量和回复预留量。解析器同时识别 OpenAI/DeepSeek 的括号句式（`requested N tokens (M in the messages, C in the completion)`）及 SGLang/LiteLLM 的冒号句式（`requested a total of N tokens: M tokens from the input messages and C tokens for the completion`）。明确的输入计数进入现有校准环；回复计数触发现有的输出余量预留。只有窗口上限或拆分不完整的错误不会产生虚构计量。插件模式与代理模式共用该解析，不改写声明的模型窗口。
+## 来源短视图之后的 fork 恢复
+
+fork 继承依据子会话重放内容判断保留的压缩块，不直接沿用来源上一次请求的 `active` 标记。来源的一次短请求可能暂时停用某个块，而子会话重放时包含它覆盖的完整原文。完整存在的保留块独立复制并激活；明确解压的块、被高层块消费的子块及跨越 fork 边界的块不会独立激活。被继承高层块的子块作为非活动记录随行。规划和继承均不修改来源会话。
+
 ## 原生插件生命周期(方式 1)
 
 插件加载时**自拉起自己的代理**(已有健康实例则直接复用 —— 父进程 pid 看门狗在客户端退出时收掉它),把模型流量改写到 `<proxy>/bili/<上游URL>`,把 `compress` / `decompress` / `acp_status` 注册为客户端原生工具(plugin 模式),并把 `/acp` 面板绑定到当前会话。插件还会把客户端**自己的模型配置**上报给代理(runtime-info 协议,#955),压缩预算用真实窗口而不是注册表猜测。退出开关:`BILI_NATIVE_PI=0`、`BILI_NATIVE_OMP=0`、`BILI_NATIVE_OPENCODE=0`、`BILI_NATIVE_DSH=0`、`BILI_NATIVE_KIMI=0`、`BILI_NATIVE_HERMES=0`、`BILI_NATIVE_ZCODE=0`。

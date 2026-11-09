@@ -6,6 +6,7 @@ import type { ProxyOptions } from "../config.js";
 import { pluginAgentHeader } from "../plugin.js";
 import { currentCalibrationFactor } from "../util.js";
 import { diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, makeFoldPointReasoningDroppable, reapOrphansLogged, resolveKnownOutputCeiling, runNudgeDecision, stripKernelSummaries, usageGradeInputBaseline, type Prepared } from "../server.js";
+import { recordNudgeObservation } from "../context-analysis.js";
 import { isStrictReasoningEcho } from "../strict-echo.js";
 import { yieldToEventLoop } from "../yield-loop.js";
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, resolveDecisionRange, stripDecisionReasoningFields, type DecideConfig } from "../nudge-decide.js";
@@ -37,15 +38,16 @@ import { effectiveAbsorbBlock } from "./prepare-responses.js";
 import { injectGoogleTool, injectTool } from "./inject.js";
 import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
 
-function appendGoogleNudge(contents: GoogleContent[], text: string): GoogleContent[] {
+function appendGoogleNudge(contents: GoogleContent[], text: string, model?: string): GoogleContent[] {
     const last = contents[contents.length - 1];
     if (last && (last.role ?? "user") !== "model") {
         const parts = Array.isArray(last.parts) ? last.parts : [];
         // #3159: a plain-text tail after a functionResponse part 400s on
-        // Vertex — normalize so the new text leads.
+        // Vertex — normalize so the new text leads (#5390: skipped for Claude
+        // targets, whose Anthropic-behind-Google backend wants tool_result first).
         return [
             ...contents.slice(0, -1),
-            { ...last, parts: normalizeGoogleUserPartOrder([...parts, { text }]) },
+            { ...last, parts: normalizeGoogleUserPartOrder([...parts, { text }], { model }) },
         ];
     }
     return [...contents, { role: "user", parts: [{ text }] }];
@@ -265,6 +267,8 @@ export async function prepareGoogle(
             growthFoldingArmed: growthFoldingArmed(loopConfig, undefined, autoFoldFloor(session)),
             modelWantsIt: turn.nudge !== undefined && (turn.nudge.shouldInject || emergencyNudgeArmed(session, turn.nudge, loopConfig.compress.minCompressRange, tokenCount, loopConfig.nudge.growthFloor)),
         });
+        const caLine = recordNudgeObservation(sessionId, turn, tokenCount, config.modelContextLimit, willInjectNudge, decideTier1Arm && !decideFallbackOverride, surfaceOffDetail(laneDecisions, opts.compress.injectTool));
+        if (caLine) log("info", caLine);
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, model, willInjectNudge, decideTier1Arm && !decideFallbackOverride, surfaceOffDetail(laneDecisions, opts.compress.injectTool)));
         processedMessages = stripKernelSummaries(turn.messages, turn.state);
         // #1001: a silent client history rewrite takes the same archive+prune path
@@ -288,7 +292,7 @@ export async function prepareGoogle(
         // #3400: egress image rescale — outbound copies only; the originals
         // stay in session state/persistence untouched.
         const egressMessages = await applyImageRescalePass(processedMessages as BiliMessage[], { session, sessionId, log, maxDim: imageRescaleMaxDim(), toolArmed: imageRescaleToolArmed(session) });
-        rebuiltContents = coreToGoogle(egressMessages);
+        rebuiltContents = coreToGoogle(egressMessages, { model });
 
         // ONLY the static compress prompt joins the client's system text — the
         // system instruction is the prefix-cache anchor and must stay
@@ -322,7 +326,7 @@ export async function prepareGoogle(
             toolsOut = injectGoogleTool(parsed.tools, [...(absorbActive ? [absorbTools.google] : []), ...(rulesActive ? [RULE_TOOL_GOOGLE] : []), ...(ccrEnabled(session) ? [retrieveToolsFor(retrieveToolName(session)).google] : []), ...(imageRescaleToolArmed(session) ? [READ_ORIGINAL_IMAGE_TOOL_GOOGLE] : [])], surface?.toolPrompts, ccrEnabled(session), externalSummaryEnabled(config));
         }
         if (sysNotes.length > 0) {
-            rebuiltContents = appendGoogleNudge(rebuiltContents, sysNotes.join("\n\n---\n\n"));
+            rebuiltContents = appendGoogleNudge(rebuiltContents, sysNotes.join("\n\n---\n\n"), model);
         }
         if (willInjectNudge && turn.nudge) {
             // #2228: model-decided timing (see prepareAnthropic for the policy):
@@ -335,7 +339,7 @@ export async function prepareGoogle(
                     const rendered = renderNudgeText(turn.nudge, prompts, surface?.nudgeSections, "google");
                     const renderedWithPayload = rendered.text;
                     if (rendered.text) {
-                        rebuiltContents = appendGoogleNudge(rebuiltContents, withMarkerIntegrityNote(withFirstSightDrain(renderedWithPayload, turn.nudge.reason, externalSummaryEnabled(config)), visibilityMarkers));
+                        rebuiltContents = appendGoogleNudge(rebuiltContents, withMarkerIntegrityNote(withFirstSightDrain(renderedWithPayload, turn.nudge.reason, externalSummaryEnabled(config)), visibilityMarkers), model);
                         nudgeOutcome = "injected";
                     } else {
                         nudgeOutcome = "skipped";
@@ -351,7 +355,7 @@ export async function prepareGoogle(
                 if (outcome.kind === "yes") {
                     const span = resolveDecisionRange(outcome, ranges);
                     if (span) {
-                        rebuiltContents = appendGoogleNudge(rebuiltContents, withMarkerIntegrityNote(withFirstSightDrain(buildDirectiveText(span.startRef, span.endRef, outcome.topic), turn.nudge.reason, externalSummaryEnabled(config)), visibilityMarkers));
+                        rebuiltContents = appendGoogleNudge(rebuiltContents, withMarkerIntegrityNote(withFirstSightDrain(buildDirectiveText(span.startRef, span.endRef, outcome.topic), turn.nudge.reason, externalSummaryEnabled(config)), visibilityMarkers), model);
                         nudgeOutcome = "injected";
                     } else {
                         nudgeOutcome = "skipped";
@@ -367,7 +371,7 @@ export async function prepareGoogle(
                     const rendered = renderNudgeText(turn.nudge, prompts, surface?.nudgeSections, "google");
                     const renderedWithPayload = rendered.text;
                     if (rendered.text) {
-                        rebuiltContents = appendGoogleNudge(rebuiltContents, withMarkerIntegrityNote(withFirstSightDrain(renderedWithPayload, turn.nudge.reason, externalSummaryEnabled(config)), visibilityMarkers));
+                        rebuiltContents = appendGoogleNudge(rebuiltContents, withMarkerIntegrityNote(withFirstSightDrain(renderedWithPayload, turn.nudge.reason, externalSummaryEnabled(config)), visibilityMarkers), model);
                         nudgeOutcome = "injected";
                     } else {
                         nudgeOutcome = "skipped";
@@ -423,6 +427,7 @@ export function prepareGoogleCountTokens(
     config: Config,
     log: (level: string, msg: string) => void,
     session: Session,
+    model?: string,
 ): Prepared {
     const sessionId = session.id;
     try {
@@ -431,7 +436,7 @@ export function prepareGoogleCountTokens(
         // counted, but nothing is adopted (state is discarded here too).
         const turn = core.processTurn({ messages: msgs, state: session.state, config: ccrLoopConfig(session, config), tokenCount: usageGradeInputBaseline(session), renderTags: knobRenderNone() ? "none" : "text-only", contentStore: contentStoreOf(session) });
         const stripped = stripKernelSummaries(turn.messages, turn.state);
-        const rebuilt: GoogleRequestBody = { ...parsed, contents: coreToGoogle(stripped as BiliMessage[]) };
+        const rebuilt: GoogleRequestBody = { ...parsed, contents: coreToGoogle(stripped as BiliMessage[], { model }) };
         log("info", `[${sessionId}] countTokens pruned: ${msgs.length} → ${stripped.length} msgs`);
         return {
             body: JSON.stringify(rebuilt),

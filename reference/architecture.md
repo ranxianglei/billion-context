@@ -81,6 +81,7 @@ billion-context/
 │   ├── image-rescale.ts          # Deterministic egress image rescale (outbound copy only, restore receipt) (#3400)
 │   ├── image-restore.ts          # Recovery channel for folded images by mNNNNN ref, file-first (#1995)
 │   ├── absorb.ts                 # absorb tool (kernel ACP_TOOL_NAMES extension)
+│   ├── compress-loop-anthropic.ts # Non-stream Anthropic proxy-tool loop (#5957)
 │   ├── compress-loop-responses.ts # Compress loop for Responses API format
 │   ├── compress-settings.ts      # Three-level compress config merge (global→provider→model)
 │   ├── chat-pack.ts              # Bundled chat prompt pack: relationship-first compress philosophy (#5319)
@@ -242,6 +243,7 @@ billion-context/
 │   ├── claude-mcp-entry.ts       # Per-session Claude native MCP server + mid-session proxy watchdog (#1821)
 │   ├── claude-transcript-lineage.ts # Resume lineage from Claude Code transcript forkedFrom markers (#1486)
 │   ├── client-ua-registry.ts     # Bounded in-memory registry of recently observed client user-agents (#4649)
+│   ├── context-analysis.ts       # Per-session context analysis: init size, nudge cadence, harvest rate, verdict (#5963)
 │   ├── context-view.ts           # Machine-readable context view for programmatic consumers (#3862)
 │   ├── dead-ranges.ts            # Session memory of structurally empty fold ranges (#2638)
 │   ├── dedupe-adjacent-output-config.ts # Collapses adjacent empty system output_config directives at egress (#5688)

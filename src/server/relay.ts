@@ -18,6 +18,7 @@ import { stampOutbound } from "../chain-checkpoint.js";
 import { applyCompatDropFields, dropCompatFieldsJson, resolveCompatDropFields } from "../compat-drop.js";
 import { applyCompatRoles, applyCompatRolesJson, detectRoleRejection, detectSystemPlacementError, hasOffHeadSystem, resolveCompatRoles, type CompatRoles } from "../compat-roles.js";
 import { builtinCompatRoles, builtinRoleRestorePoints, withRestoredRoles } from "../kiro.js";
+import { compressLoopAnthropicJson } from "../compress-loop-anthropic.js";
 import { compressLoopResponsesJson } from "../compress-loop-responses.js";
 import { resolveCompress } from "../compress-settings.js";
 import { buildAbsorbSystemPrompt, buildCompressHybridSystemPrompt, buildCompressSystemPrompt, withMarkerIntegrityNote, withMcpDialectNote, withProjectAttribution, withSummaryBudgetNote } from "../compress-tool.js";
@@ -33,7 +34,7 @@ import { currentFetchTransport } from "../fetch-transport.js";
 import { refForItemBytes } from "../image-rescale.js";
 import { countImagesInParsedBody, countImagesInRawBody, upstreamHost } from "../image-tokens.js";
 import { log as loggerLog } from "../logger.js";
-import { dumpReqAllowed as knobDumpReqAllowed, limitsWsOutboundBytes, rawDumpDir as knobRawDumpDir } from "../knobs.js";
+import { dumpReqAllowed as knobDumpReqAllowed, limitsMaxMessages, limitsWsOutboundBytes, rawDumpDir as knobRawDumpDir } from "../knobs.js";
 import { gcDumpDirIfConfigured } from "../state-gc.js";
 import { applyLaneCredential, laneCredential } from "../lane-credentials.js";
 import { CREDENTIAL_HEADER_RE, maskHeaderForLog, maskHeadersForLog, maskHostPortForDisplay, maskUrlForLog } from "../log-mask.js";
@@ -69,7 +70,7 @@ import { buildForwardHeaders, connectionNamedHeaders, RESPONSE_ONLY_STRIP_HEADER
 import { bodyDumpEnabled, logDumpFailure } from "./observability.js";
 import { effectiveAbsorbBlock } from "./prepare-responses.js";
 import { awaitDrain, bufferToStream, dumpStreamToFile, pipeThrough, readStreamToBuffer } from "./stream-io.js";
-import { buildForwardTarget, makeFoldPointReasoningDroppable, outboundPayloadBreakdown, registerRequestAbort, beginStreamKeepalive, effectiveTokenCount, googlePathKind, imageBillingFor, imageTokenCapFor, inboundResignCredential, outboundContextEstimates, repairResponsesAssistantOrdering, resolveUpstream, stripKernelSummaries, usageGradeInputBaseline, DOOMED_PROBE_ABSOLUTE_BYTES, DOOMED_PROBE_BYTES_PER_TOKEN, type Prepared } from "../server.js";
+import { buildForwardTarget, makeFoldPointReasoningDroppable, measuredBreakdownClause, measuredOutbound, outboundPayloadBreakdown, registerRequestAbort, beginStreamKeepalive, effectiveTokenCount, googlePathKind, imageBillingFor, imageTokenCapFor, inboundResignCredential, outboundContextEstimates, repairResponsesAssistantOrdering, resolveUpstream, stripKernelSummaries, usageGradeInputBaseline, DOOMED_PROBE_ABSOLUTE_BYTES, DOOMED_PROBE_BYTES_PER_TOKEN, type Prepared } from "../server.js";
 import { isStrictReasoningEcho, modelIdOf } from "../strict-echo.js";
 
 /** Infer the wire protocol from the request path for compat-role rewrites on
@@ -186,11 +187,14 @@ function armFailureShrink(prepared: Prepared, log: (level: string, msg: string) 
 /** #3701: user-visible diagnosis for an unrecoverable WS size rejection — names the
  *  exact bytes, why shedding could not fit, and the current budget for context.
  *  Deliberately does NOT suggest raising the budget: the gateway just proved it
- *  rejects this size, so a bigger budget would only send the fat frame again. */
-function wsOversizeDiagnosis(sentBytes: number, stats: ShedStats | undefined, budget: number): string {
-    const why = !stats || (!stats.archived && !stats.downscaled)
+ *  rejects this size, so a bigger budget would only send the fat frame again.
+ *  #4601: `why` overrides the derived reason when shedding was never ATTEMPTED
+ *  (e.g. a verbatim-passthrough body that shedWireImages cannot parse) — claiming
+ *  "no sheddable images" there was a lie about work that was not done. */
+function wsOversizeDiagnosis(sentBytes: number, stats: ShedStats | undefined, budget: number, why?: string): string {
+    const realWhy = why ?? (!stats || (!stats.archived && !stats.downscaled)
         ? "no sheddable images outside the protected recent messages"
-        : `shedding removed ${formatMiB(Math.max(0, sentBytes - stats.finalBytes))} MiB but the remainder is protected recent content`;
+        : `shedding removed ${formatMiB(Math.max(0, sentBytes - stats.finalBytes))} MiB but the remainder is protected recent content`);
     return `WS upstream rejected the ${formatMiB(sentBytes)} MiB request with close 1009 (zero events received) and the payload cannot be reduced further (${why}). Trim older images/history so the frame fits under the wire limit (current pre-send budget: ${budget > 0 ? `${formatMiB(budget)} MiB` : "disabled"} — network.wsOutboundBytes / BILI_WS_OUTBOUND_BYTES).`;
 }
 
@@ -513,7 +517,7 @@ async function forwardCaptured(
     // recognition + hop passthrough are unaffected by this switch.
     if (prepared && !prepared.sidePassthrough && prepared.processedMessages.length > 0 && typeof wireBody === "string" && opts.chainEgressStamp === true) {
         try {
-            const stamped = stampOutbound(JSON.parse(wireBody), prepared.protocol, instanceId);
+            const stamped = stampOutbound(JSON.parse(wireBody), prepared.protocol, instanceId, Date.now(), prepared.model ?? prepared.google?.model);
             if (stamped !== null) {
                 wireBody = JSON.stringify(stamped);
                 log("debug", `[${prepared.session.id}] [stamp] outbound ${prepared.protocol} request carries checkpoint carrier`);
@@ -725,6 +729,50 @@ async function forwardCaptured(
         const fuseWindow = Math.max(declaredWindow, MIN_ASSUMED_WINDOW_TOKENS);
         if (declaredWindow > 0) {
             const fuseMsgs = prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages;
+            // #5000/#4543: the byte floor below prices only m.text — a body whose
+            // mass sits in tools[] / tool arguments / the system prompt clears it
+            // (incident #5000: a 55.2 MiB wire body whose core text cleared the
+            // floor; #4543: a 4.1 MiB CJK body measuring ~1.12M tokens that the
+            // 7.5 B/tok floor cannot see below ~8.4 MB). Price the ACTUAL
+            // outbound body first with the #554 side-request meter (every string
+            // field, CJK-aware) and judge it against the SAME floored bar the
+            // byte floor uses (fuseWindow): the fuse's #4079 contract is
+            // "never block what a largest-common-window upstream might accept",
+            // and that contract binds a measurement just as much as a density
+            // guess — a wrong-small declaration must not false-block a body a
+            // 1M window would take. #4543 still lands: its declared 1,048,580
+            // window sits ABOVE the 1M floor, so floored or not the 1.12M-token
+            // body exceeds it. The byte floor stays as the fallback for
+            // unparseable bodies. No refusal record either way (#3974).
+            // #5000 item 2: the COUNT dimension — no window, tokenizer, or byte
+            // floor sees the messages[] array length (the 26,903-message #5000
+            // session cleared every size gate and died at the upstream). Same
+            // per-upstream opt-in as preflight (BILI_MAX_MESSAGES); the fuse is
+            // the last line for the no-model lane where preflight never ran.
+            const fuseMaxMessages = limitsMaxMessages();
+            if (fuseMaxMessages > 0 && fuseMsgs.length > fuseMaxMessages) {
+                const countMessage = `message count ${fuseMsgs.length.toLocaleString("en-US")} exceeds the upstream wire limit ${fuseMaxMessages.toLocaleString("en-US")} (COUNT dimension — a hard upstream constraint on the messages[] array that no byte/token estimate expresses, #5000); the send was stopped at the egress fuse instead of being forwarded. Reduce the session history — restart the session or rewind to an earlier point — and retry.`;
+                log("warn", `413: [${prepared.session.id}] egress window fuse count gate: ${countMessage}`);
+                if (res.headersSent) emitStreamError(res, prepared.protocol, countMessage, undefined, opts.streamErrorShape);
+                else {
+                    res.writeHead(413, { "content-type": "application/json" });
+                    res.end(JSON.stringify({ error: { type: "request_too_large", code: "egress_window_fuse", stage: "forward", message: countMessage, retryable: false } }));
+                }
+                return;
+            }
+            const fuseMeasured = measuredOutbound(prepared);
+            const fuseRawTokens = fuseMeasured?.tokens;
+            if (fuseMeasured !== undefined && fuseRawTokens !== undefined && fuseRawTokens > fuseWindow) {
+                log("warn", `413: [${prepared.session.id}] egress window fuse measured-body profile: ${describeCoreTextDuplication(fuseMsgs)}`);
+                const fuseMessage = `outbound body measures ~${fuseRawTokens.toLocaleString("en-US")} tokens (${measuredBreakdownClause(fuseMeasured.breakdown)}; CJK-aware count, the #554 guard meter) vs the effective model window ${declaredWindow.toLocaleString("en-US")} (bars never assume below ${MIN_ASSUMED_WINDOW_TOKENS} tokens, #4079) (model=${prepared.model ?? "unknown"}); the body ITSELF exceeds the window, so the send was stopped at the egress fuse instead of being forwarded (#5000/#4543/#4068). Remove or trim the oversized dimension named above (e.g. a giant paste or tool result in messages[], or tools[] schemas) and retry.`;
+                log("warn", `413: [${prepared.session.id}] egress window fuse: ${fuseMessage}`);
+                if (res.headersSent) emitStreamError(res, prepared.protocol, fuseMessage, undefined, opts.streamErrorShape);
+                else {
+                    res.writeHead(413, { "content-type": "application/json" });
+                    res.end(JSON.stringify({ error: { type: "request_too_large", code: "egress_window_fuse", stage: "forward", message: fuseMessage, retryable: false } }));
+                }
+                return;
+            }
             const fuseBytes = estimateCoreMessagesUpperBytes(fuseMsgs);
             if (fuseBytes > Math.max(DOOMED_PROBE_ABSOLUTE_BYTES, fuseWindow * DOOMED_PROBE_BYTES_PER_TOKEN)) {
                 const fuseFloorTokens = Math.ceil(fuseBytes / DOOMED_PROBE_BYTES_PER_TOKEN);
@@ -980,12 +1028,13 @@ async function forwardCaptured(
 
         if (prepared && req.method !== "GET" && req.method !== "HEAD") armFailureShrink(prepared, log, "network failure", outboundPayloadBreakdown(prepared, opts, route, req.url ?? "").armEstimate);
         if (prepared && prepared.attachedRetrievals && prepared.attachedRetrievals.length > 0) dropRetrievals(prepared.session, prepared.attachedRetrievals.map((i) => i.ref), "upstream network failure");
-        const sentBytes = typeof wireBody === "string" ? Buffer.byteLength(wireBody) : 0;
+        // #4601: a non-string (verbatim passthrough) body was reported as 0.0 MiB — measure it.
+        const sentBytes = typeof wireBody === "string" ? Buffer.byteLength(wireBody) : wireBody.byteLength;
         const budget = limitsWsOutboundBytes();
         const target = Math.min(sentBytes * 0.85, budget > 0 ? budget : Number.MAX_SAFE_INTEGER);
         if (prepared === null || prepared === undefined || prepared.sidePassthrough || prepared.protocol === undefined || typeof wireBody !== "string" || sentBytes <= 0 || !res.writable || res.writableEnded || res.destroyed) {
             releaseUpstreamThrottleProbe(throttleProbeToken);
-            throw new Error(wsOversizeDiagnosis(sentBytes, undefined, budget));
+            throw new Error(wsOversizeDiagnosis(sentBytes, undefined, budget, typeof wireBody !== "string" ? "the body is not a JSON wire body (verbatim passthrough) — image shedding cannot apply" : undefined));
         }
         const shedSession = prepared.session;
         let shedResult: ShedWireImagesResult;
@@ -1845,6 +1894,7 @@ async function forwardCaptured(
                     signal: clientAbort.signal,
                     session: prepared.session,
                     log,
+                    model: prepared.model ?? prepared.google?.model,
                 });
                 pluginBody = bufferToStream(resolvedBuf);
             }
@@ -1882,7 +1932,7 @@ async function forwardCaptured(
                         makeContinuationRefetch({
                             protocol: "responses",
                             body,
-                            model: throttleModel,
+                            model: throttleModel ?? prepared.google?.model,
                             upstreamUrl,
                             reqHeaders: buildForwardHeaders(headers), resign: applyResign,
                             proxyUrl,
@@ -1911,7 +1961,7 @@ async function forwardCaptured(
                         makeContinuationRefetch({
                             protocol: prepared.protocol,
                             body,
-                            model: throttleModel,
+                            model: throttleModel ?? prepared.google?.model,
                             upstreamUrl,
                             reqHeaders: buildForwardHeaders(headers), resign: applyResign,
                             proxyUrl,
@@ -1925,6 +1975,7 @@ async function forwardCaptured(
                         wireBodyText,
                         upstreamMeta,
                         reply,
+                        opts.streamErrorShape,
                     );
                 }
             } else {
@@ -1991,6 +2042,7 @@ async function forwardCaptured(
                 signal: clientAbort.signal,
                 session: prepared.session,
                 log,
+                model: prepared.model ?? prepared.google?.model,
             });
             responseBody = bufferToStream(resolvedBuf);
         }
@@ -2045,7 +2097,7 @@ async function forwardCaptured(
                     makeContinuationRefetch({
                         protocol: "responses",
                         body,
-                        model: throttleModel,
+                        model: throttleModel ?? prepared.google?.model,
                         upstreamUrl,
                         reqHeaders: buildForwardHeaders(headers), resign: applyResign,
                         proxyUrl,
@@ -2091,7 +2143,7 @@ async function forwardCaptured(
                     makeContinuationRefetch({
                         protocol: "responses",
                         body,
-                        model: throttleModel,
+                        model: throttleModel ?? p.google?.model,
                         upstreamUrl,
                         reqHeaders: buildForwardHeaders(headers), resign: applyResign,
                         proxyUrl,
@@ -2116,7 +2168,7 @@ async function forwardCaptured(
                     makeContinuationRefetch({
                         protocol: p.protocol,
                         body,
-                        model: throttleModel,
+                        model: throttleModel ?? p.google?.model,
                         wrapBody: v1Active ? v1Wrap : undefined,
                         upstreamUrl,
                         reqHeaders: buildForwardHeaders(headers), resign: applyResign,
@@ -2131,6 +2183,7 @@ async function forwardCaptured(
                     undefined,
                     upstreamMeta,
                     reply,
+                    opts.streamErrorShape,
                 );
             }
         } else if (
@@ -2262,10 +2315,12 @@ async function forwardCaptured(
                     // against them drops the only cross-turn summary carrier and breaks the byte-prefix
                     // at the fold anchor (post-fold cache floor reset to the stable head).
                     const outBase = [...stripKernelSummaries(viewed as BiliMessage[], turn.state), ...(records as BiliMessage[])] as BiliMessage[];
-                    // Fold-point carrier relocation round-2 mirror (switch A): with the
-                    // switch on, pairs sit at their fold point instead of being
-                    // tail-appended onto the re-request. Idempotent when processTurn's
-                    // node already moved them (view-only + deterministic transform).
+                    // Fold-point summary relocation round-2 mirror (switch A): with
+                    // the switch on, each still-visible compress pair keeps its
+                    // chronological slot but its SUMMARY TEXT is re-emitted at its
+                    // fold point (call args become a pointer — v2 semantics).
+                    // Idempotent when processTurn's node already relocated them
+                    // (view-only + deterministic transform).
                     const out = loopConfig.compressAtFoldPoint
                         ? relocateCompressCarriers(outBase as unknown as CoreMessage[], turn.state, {
                             isCompressTool: loopConfig.isCompressTool,
@@ -2364,6 +2419,21 @@ async function forwardCaptured(
                         { core, config, messages: prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, textProtocol: true, visibilityMarkers, signal: clientAbort.signal },
                         requestBody,
                         { url: upstreamUrl, headers: requestHeaders, wireTransform, resign: applyResign },
+                    );
+                }
+                // #5957: non-stream Anthropic runs the same proxy-tool loop as
+                // the stream path — the one-shot rewriter alone ended the client
+                // turn with the compress receipt (stop_reason end_turn) and the
+                // model never saw the fold result. Terminal/mixed rounds fall
+                // through to the one-shot rewriter below.
+                if (prepared.protocol === "anthropic") {
+                    const requestBody = JSON.parse(typeof body === "string" ? body : body.toString("utf8")) as Record<string, unknown>;
+                    json = await compressLoopAnthropicJson(
+                        json,
+                        ctx,
+                        { proxyUrl, signal: clientAbort.signal },
+                        requestBody,
+                        { url: upstreamUrl, headers: buildForwardHeaders(headers), wireTransform, resign: applyResign },
                     );
                 }
                 // Capture upstream usage so tokenCount (which drives nudge +
@@ -2466,6 +2536,9 @@ async function resolveFakeCompletion(
         signal: AbortSignal;
         session: Session;
         log: (level: string, msg: string) => void;
+        /** #5390: target model name — lets the google-wire part-order normalize
+         *  skip the WC-018 text-first reorder for Claude models. */
+        model?: string;
         /** #1884: re-sign the retry body before it hits the wire (armed
          *  re-sign lane only; undefined on unsigned traffic). */
         resign?: (headers: Record<string, string>, body: string | Buffer) => void;
@@ -2481,7 +2554,7 @@ async function resolveFakeCompletion(
     const priorStreak = (opts.session.metadata.fakeCompletionStreak as number | undefined) ?? 0;
     if (max > 0 && priorStreak < max && isFakeCompletion(opts.protocol, buffer.toString("utf8"))) {
         for (let attempt = 1; attempt <= max && !opts.signal.aborted; attempt++) {
-            const hinted = injectFakeCompletionHint(opts.protocol, opts.wireBody);
+            const hinted = injectFakeCompletionHint(opts.protocol, opts.wireBody, opts.model);
             if (hinted === null) break;
             const wireHinted = opts.wrapBody ? opts.wrapBody(hinted) : hinted;
             opts.log("warn", `[${sid}] fake completion (tool-call XML, no tool block); retry ${attempt}/${max} with corrective hint`);

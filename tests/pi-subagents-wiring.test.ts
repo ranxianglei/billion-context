@@ -20,6 +20,9 @@ const HOME = fs.mkdtempSync(path.join(os.tmpdir(), "bili-pi-subagents-home-"));
 process.env.HOME = HOME;
 const BILI_CONFIG_FILE = path.join(HOME, "billion-context.json");
 process.env.BILI_CONFIG_FILE = BILI_CONFIG_FILE;
+// pi.commands default surface is ["acp", "acp-cache"] — the fleet-wiring tests
+// below exercise acp-fleet registration, so opt the command in explicitly.
+fs.writeFileSync(BILI_CONFIG_FILE, JSON.stringify({ pi: { commands: ["acp", "acp-cache", "acp-fleet"] } }));
 
 type Handler = (event: unknown, ctx: unknown) => unknown;
 
