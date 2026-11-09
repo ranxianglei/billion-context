@@ -1087,6 +1087,24 @@ elif SCENARIO == "registry-find":
           "zzz-own": {"origin": ORIGIN, "pid": 4242, "instanceId": "zzz-own", "startedAt": 999}})
     out["rf_dup_pid"] = (mod._find_spawned_in_registry(4242) or {}).get("instance_id")
     out["rf_none"] = mod._find_spawned_in_registry(None)
+elif SCENARIO == "ready-unload":
+    # #5991: env is routed to the live origin while ready, then the host unloads mid-session —
+    # the process-global routing must be restored (or dropped), not left pointing at a port the
+    # plugin no longer serves; a leftover HTTPS_PROXY breaks every LLM call in the process.
+    install_sidecar(False)
+    os.environ["BILLION_CONTEXT_ATTACH"] = ORIGIN
+    ca_dir = os.path.join(os.environ["XDG_DATA_HOME"], "billion-context", "ca")
+    os.makedirs(ca_dir, exist_ok=True)
+    with open(os.path.join(ca_dir, "root-ca.pem"), "w") as f:
+        f.write("dummy-ca\n")
+    with open(os.path.join(ca_dir, "combined-ca.pem"), "w") as f:
+        f.write("dummy-combined-ca\n")
+    user_proxy = "http://user-proxy.example:9999"   # pre-existing host routing — must survive unload
+    os.environ["HTTPS_PROXY"] = user_proxy
+    os.environ["https_proxy"] = user_proxy
+    mod.register(ctx)
+    out["env_routed"] = os.environ.get("HTTPS_PROXY") == ORIGIN
+    ctx.run_unload()
 else:
     raise SystemExit("unknown scenario: " + SCENARIO)
 
@@ -1200,6 +1218,7 @@ interface DriverOut {
     env_after_unload?: string | null;
     mw_after_unload_none?: boolean;
     acp_after_unload?: string | null;
+    env_routed?: boolean;
     register_calls?: number;
     retry_state?: string;
     retry_attempt?: number;
@@ -1770,6 +1789,18 @@ describe("python plugin runtime (subprocess)", () => {
         assert.equal(out!.state_after_reenable, "ready");
         assert.equal(out!.env_after_reenable, out!.origin, "traffic is routed again");
         assert.equal(out!.origin_after_reenable, out!.origin);
+    });
+
+    test("unload with routed env: the process-global proxy is restored to the host's own values (#5991)", () => {
+        if (!PY) return;
+        const { out, err } = runDriver("ready-unload");
+        assert.ok(out, err);
+        assert.equal(out!.env_routed, true, "register() routed traffic through the origin first");
+        assert.equal(out!.env_https_proxy, "http://user-proxy.example:9999",
+            "the host's own proxy is restored verbatim, not left at the plugin's origin port");
+        assert.equal(out!.env_https_proxy_lc, "http://user-proxy.example:9999");
+        assert.equal(out!.env_ca_bundle, null, "a key we added is dropped, not left pointing into our CA dir");
+        assert.equal(out!.env_ssl_cert_file, null);
     });
 });
 
