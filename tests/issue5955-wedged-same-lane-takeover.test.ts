@@ -33,10 +33,12 @@
 
 import test, { beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { setLogCapture } from "../src/logger.ts";
 import type { ProxyInstanceFile } from "../src/instance.ts";
 import { removeStartingMarker } from "../src/instance.ts";
 import {
@@ -44,6 +46,7 @@ import {
     WEDGED_OBSERVATION_STALE_MS,
     WEDGED_TAKEOVER_WINDOW_MS,
     ensureProxyRunning,
+    hardKillProxyTree,
     isWedgedSameLaneCandidate,
     processBirthStamp,
     stepWedgedLedger,
@@ -85,6 +88,7 @@ interface World {
     gracefulShutdown: boolean;
     killReleases: boolean;
     shutdownCalls: string[];
+    shutdownTimeouts: Array<number | undefined>;
     signalCalls: number[];
     killCalls: number[];
     spawnCalls: number;
@@ -99,6 +103,7 @@ function makeWorld(opts: { gracefulShutdown: boolean; killReleases: boolean }): 
         gracefulShutdown: opts.gracefulShutdown,
         killReleases: opts.killReleases,
         shutdownCalls: [],
+        shutdownTimeouts: [],
         signalCalls: [],
         killCalls: [],
         spawnCalls: 0,
@@ -170,8 +175,9 @@ function makeDeps(w: World, holder: ProxyInstanceFile): Deps {
         resolveAttachExternal: () => false,
         resolveAttachPolicy: () => "own-lane",
         attachLanePriority: () => [],
-        requestInstanceShutdown: async (origin: string) => {
+        requestInstanceShutdown: async (origin: string, timeoutMs?: number) => {
             w.shutdownCalls.push(origin);
+            w.shutdownTimeouts.push(timeoutMs);
             w.order.push("shutdown");
             if (w.gracefulShutdown) w.connectable = false;
             return true;
@@ -353,6 +359,59 @@ test("#5955 full path: unresponsive holder → shutdown, then SIGTERM, then hard
     assert.equal(handle.port, PORT);
     assert.ok(handle.child);
     assert.equal(fs.existsSync(ledgerFile), false, "successful forced takeover clears the persisted ledger");
+});
+
+test("#5955 escalation pays a SHORT BUSY budget, not the graceful ladder", async () => {
+    // Measured on the acceptance box (#5955): 12.4s of a 13.8s takeover sat
+    // inside the graceful stages a BUSY holder can never answer (3s POST
+    // timeout + 5s listener wait + 2s SIGTERM drain) before the hard kill it
+    // always needs. The ladder is field-tuned down to 1s + 2s + 1s + 2s, so
+    // the whole escalation must stay inside single-digit seconds of virtual
+    // time — and the POST must never wait out the 3s graceful default.
+    const w = makeWorld({ gracefulShutdown: false, killReleases: true });
+    const holder = wedgedHolder();
+    let handle: Awaited<ReturnType<typeof runCycle>> | undefined;
+    for (let i = 1; i <= 3; i++) {
+        if (i > 1) w.clock.advance(GAP_MS);
+        handle = await runCycle(w, holder);
+    }
+    assert.equal(w.killCalls.length, 0, "still patient before the window elapses");
+
+    w.clock.advance(GAP_MS);
+    const t0 = w.clock.now();
+    handle = await runCycle(w, holder);
+    const escalationMs = w.clock.now() - t0;
+
+    assert.equal(w.killCalls.length, 1, "the escalating cycle still ends in the hard kill");
+    assert.equal(handle?.port, PORT);
+    assert.equal(w.shutdownTimeouts.length, 1, "exactly one graceful shutdown request before the kill");
+    const budget = w.shutdownTimeouts[0];
+    assert.equal(typeof budget, "number", "the BUSY shutdown POST gets an explicit budget");
+    assert.ok((budget as number) > 0 && (budget as number) < 3_000, `BUSY shutdown POST must not wait out the 3s graceful default (got ${budget}ms)`);
+    assert.ok(escalationMs >= 2_000, `the post-kill settle stays conservative (got ${escalationMs}ms)`);
+    assert.ok(escalationMs <= 6_000, `worst-case takeover staging bounded to ~6s (got ${escalationMs}ms)`);
+});
+
+test("#5955 hard kill: a pid already reaped by taskkill is silent, real failures still surface", () => {
+    // win32: taskkill /F /T reaps the tree, then the defensive direct SIGKILL
+    // finds the pid gone and used to emit "its listener may survive the
+    // cleanup (#4125)" on EVERY takeover — noise that hides real survivors.
+    const dead = spawnSync(process.execPath, ["-e", ""], { stdio: "ignore" });
+    assert.equal(dead.status, 0);
+    assert.equal(typeof dead.pid, "number");
+    const lines: string[] = [];
+    setLogCapture((level, msg) => { lines.push(`${level}:${msg}`); });
+    try {
+        hardKillProxyTree(dead.pid as number, "wedged holder");
+    } finally {
+        setLogCapture(null);
+    }
+    assert.equal(lines.filter((l) => l.includes("direct SIGKILL")).length, 0, "a kill that found the pid gone is not a survivor report");
+    assert.equal(
+        lines.filter((l) => l.includes("taskkill")).length,
+        process.platform === "win32" ? 1 : 0,
+        "a real hard-kill failure is still surfaced (#4125)",
+    );
 });
 
 test("#5955 full path: kill fails → fall through to normal spawn, ledger kept, retry next cycle", async () => {
