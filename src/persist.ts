@@ -40,7 +40,7 @@ import { orphanContents, resolveStorageMode, UnifiedShadow, hadIntegrityQuickChe
 import { noteColdLoad } from "./attach-heartbeat.js";
 import { resolveBackendName } from "./storage/backend.js";
 import { toLegacyLike, type LegacySessionLike } from "./storage/ingest.js";
-import { sha256Hex, type CheckpointRow, type MessageRefContentRow } from "./storage/store.js";
+import { sha256Hex, type CheckpointRow, type MessageRefContentRow, type MessageIdContentRow } from "./storage/store.js";
 import { contentStoreOf } from "./store.js";
 import type { WireProtocol } from "./util.js";
 import { currentContextObservation, canonicalJson, CALIBRATION_CLAMP_MAX, CALIBRATION_CLAMP_MIN, CALIBRATION_SAMPLE_MAX, CALIBRATION_SAMPLE_MIN, CALIBRATION_SAMPLE_WINDOW } from "./cache-ledger.js";
@@ -2425,6 +2425,21 @@ export class SessionStore {
         if (!this.shadow || this.shadow.stats.disabled) return null;
         try {
             return this.shadow.messageContentByRefNums(sessionId, refNums);
+        } catch {
+            return null; // sidecar degraded mid-call: treat as unavailable
+        }
+    }
+
+    /** #6029: per-msg_id message bodies from the unified store — the restamp-proof
+     *  web fallback. restampRefsToLedger renumbers the live refs at cold load, so
+     *  a ref-number join (unifiedMessageContentByRefs) misses every row whose live
+     *  ref drifted off its index-time number; msg_id is invariant across restamps.
+     *  Null when the unified store is unavailable — callers keep their legacy
+     *  "missing" posture and never guess. */
+    unifiedMessageContentByIds(sessionId: string, msgIds: readonly string[]): MessageIdContentRow[] | null {
+        if (!this.shadow || this.shadow.stats.disabled) return null;
+        try {
+            return this.shadow.messageContentByMsgIds(sessionId, msgIds);
         } catch {
             return null; // sidecar degraded mid-call: treat as unavailable
         }

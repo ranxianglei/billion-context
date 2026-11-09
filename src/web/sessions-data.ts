@@ -1439,23 +1439,30 @@ function renderDetail(session: Session, live: boolean): WebSessionDetail {
     // absent from BOTH keep the honest missing marker.
     // `directMessageCount` still tells the UI how many were folded either way.
     const messageById = new Map((session.lastMessages || []).map((m) => [m.id, m]));
-    const hydratedByRefNum = new Map<number, { role: string; content: string }>();
+    // #6029: hydrate pruned leaves by their STABLE msg_id (the content-derived
+    // identity), never by the live ref number. restampRefsToLedger renumbers the
+    // live refs at cold load — the #5196 parked band lands on fresh high numbers
+    // while messages.ref_num stays frozen at index time — so a ref-number join
+    // silently misses every renumbered row (~37% of a long session's block-detail
+    // leaves read as "gone"). msg_id never moves under a restamp, so it is the
+    // correct join key; the ref below stays display-only.
+    const hydratedByMsgId = new Map<string, { role: string; content: string }>();
     try {
-        const pending: number[] = [];
+        const pending: string[] = [];
         for (const b of session.state.blocks) {
             for (const raw of b.directMessageIds || []) {
                 if (!messageById.has(raw)) {
                     const r = byRaw[raw];
                     const num = typeof r === "string" ? /^m(\d+)$/.exec(r) : undefined;
-                    if (num) pending.push(Number(num[1]));
+                    if (num) pending.push(raw);
                 }
             }
         }
         if (pending.length > 0) {
-            const rows = getStore().unifiedMessageContentByRefs(session.id, pending);
+            const rows = getStore().unifiedMessageContentByIds(session.id, pending);
             for (const row of rows ?? []) {
                 const text = storedMessageText(row.content);
-                if (text !== null) hydratedByRefNum.set(row.refNum, { role: row.role, content: text });
+                if (text !== null) hydratedByMsgId.set(row.msgId, { role: row.role, content: text });
             }
         }
     } catch {
@@ -1470,10 +1477,11 @@ function renderDetail(session: Session, live: boolean): WebSessionDetail {
             // #3917: a folded message whose bytes are gone from the resident
             // window still gets a row — the ref is the identity the user asked
             // for. #4738: bytes gone from the window but stored are hydrated,
-            // never missed; nothing invented either way.
+            // never missed; nothing invented either way. #6029: the lookup keys
+            // off the stable msg_id (raw), not the possibly-restamped ref number.
             if (!msg) {
                 const num = /^m(\d+)$/.exec(ref);
-                const stored = num ? hydratedByRefNum.get(Number(num[1])) : undefined;
+                const stored = num ? hydratedByMsgId.get(raw) : undefined;
                 out.push(stored ? { ref, role: stored.role, preview: messagePreview(stored.content) } : { ref, missing: true });
                 continue;
             }
@@ -1735,7 +1743,10 @@ export async function buildMessageContent(id: string, ref: string): Promise<Mess
         const num = /^m(\d+)$/.exec(ref);
         if (typeof raw === "string" && num) {
             try {
-                const rows = getStore().unifiedMessageContentByRefs(id, [Number(num[1])]);
+                // #6029: query by the stable msg_id — the live ref may have been
+                // restamped onto a fresh high number while messages.ref_num stays
+                // frozen at index time, so a ref-number join misses the row.
+                const rows = getStore().unifiedMessageContentByIds(id, [raw]);
                 const row = rows && rows.length > 0 ? rows[0] : undefined;
                 const stored = row ? storedMessageText(row.content) : null;
                 if (row && stored !== null) {
