@@ -2793,9 +2793,11 @@ export async function pipePluginChatWithStrip(
      *  re-send on a degenerate completion — one re-issue per request, total. */
     const retryEmptyTurn = async (reason: string | undefined): Promise<boolean> => {
         if (refetch === undefined || truncationRetried) return false;
-        // #2303: a terminal turn whose visible prose ends with a compression-draft
-        // closing tag and no tool call is non-converged even though it has visible
-        // text — the model wrote a handoff/compression draft in prose instead of
+        // #2303: a terminal turn whose visible prose carries a
+        // compression-draft dump (tail close form, or the analysis-to-summary
+        // envelope mid-text, #5175) and no tool call is non-converged even
+        // though it has visible text — the model wrote a handoff/compression
+        // draft in prose instead of
         // issuing the action it described (149 silent stops / 70 sessions, DSH
         // native). Treat it like the empty-turn shape below so at worst the client
         // gets one extra continuation instead of losing the whole turn.
@@ -2844,7 +2846,7 @@ export async function pipePluginChatWithStrip(
         }
         degenerateRetried = true;
         log?.(draftTail
-            ? "[plugin] terminal turn ends with a compression-draft closing tag and no tool call; retrying once with a continuation nudge (#2303)"
+            ? "[plugin] terminal turn carries a compression-draft dump (tail or mid-text envelope) and no tool call; retrying once with a continuation nudge (#2303)"
             : "[plugin] degenerate terminal turn (no usable output); retrying once with a continuation nudge (#732/#821)");
         let next: ReadableStream<Uint8Array> | null = null;
         try {
@@ -4339,8 +4341,9 @@ export async function pipePluginResponsesWithStrip(
     const retryEmptyTurn = async (status: string | undefined): Promise<boolean> => {
         // truncationRetried: one re-issue per request, total — see the chat-pipe twin.
         if (degenerateRetried || truncationRetried || refetch === undefined) return false;
-        // #2303: same shape as the chat-pipe twin — visible prose ending in a
-        // compression-draft closing tag with no function call is non-converged.
+        // #2303: same shape as the chat-pipe twin — visible prose carrying a
+        // compression-draft dump (tail or mid-text envelope, #5175) with no
+        // function call is non-converged.
         // #2612: except when the request itself demands that shape (client
         // compaction summary instruction) — see the chat-pipe twin.
         const draftTail = (visibleTextChars > 0 || heldVisibleChars > 0) && !sawFunctionCall && isDraftDump(proseAcc) && !requestExpectsProseSummary(requestText);
@@ -4368,7 +4371,7 @@ export async function pipePluginResponsesWithStrip(
         }
         degenerateRetried = true;
         log?.(draftTail
-            ? "[plugin] terminal turn ends with a compression-draft closing tag and no function call; retrying once with a continuation nudge (#2303)"
+            ? "[plugin] terminal turn carries a compression-draft dump (tail or mid-text envelope) and no function call; retrying once with a continuation nudge (#2303)"
             : "[plugin] degenerate terminal turn (no visible output); retrying once with a continuation nudge (#732/#821)");
         let next: ReadableStream<Uint8Array> | null = null;
         try {
