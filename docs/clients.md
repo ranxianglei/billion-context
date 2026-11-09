@@ -828,6 +828,7 @@ Verified entry points (community-maintained list — the mechanism is generic):
 | **Void** | custom OpenAI-compatible endpoint setting |
 | **Cursor** (single-model channel) | Settings → Models → OpenAI API key → **Override Base URL** |
 | **Warp** | custom-model base URL setting |
+| **free-pi** (free-pi-cli) | `FREEPI_BASE_URL` env var — native-plugin install lands but the host hardcodes `packages: []`, so the entry is never read (host limitation, reported upstream) |
 
 Notes:
 

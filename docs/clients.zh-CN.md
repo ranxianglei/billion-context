@@ -249,6 +249,7 @@ pi-subagents(pi.dev 上的包)为前台/后台子代理运行派生**子会话**
 | **Void** | 自定义 OpenAI 兼容端点设置 |
 | **Cursor**(单模型通道) | Settings → Models → OpenAI API key → **Override Base URL** |
 | **Warp** | 自定义模型 base URL 设置 |
+| **free-pi**(free-pi-cli) | `FREEPI_BASE_URL` 环境变量——原生插件安装能落地,但宿主硬编码 `packages: []`,该条目永不被读取(宿主局限,已上报给 free-pi) |
 
 注意:
 
