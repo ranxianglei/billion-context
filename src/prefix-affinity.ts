@@ -1213,18 +1213,18 @@ export class PrefixAffinityResolver {
             //  malformed list degrades the entry to exact-hash resolution.
             let sketches: string[] | undefined;
             if (hv === 2 && Array.isArray(e.sketches)) {
-                const valid = (e.sketches as unknown[]).filter(
-                    (s): s is string => typeof s === "string" && /^[0-9a-f]{16}$/.test(s),
-                );
-                if (valid.length >= ALIGN_MIN_DEPTH) sketches = valid.slice(0, SKETCH_MAX_DEPTH);
+                const valid = e.sketches as unknown[];
+                if (valid.every((s): s is string => typeof s === "string" && /^[0-9a-f]{16}$/.test(s)) &&
+                    valid.length >= ALIGN_MIN_DEPTH) sketches = valid.slice(0, SKETCH_MAX_DEPTH);
             }
             // #2265: user-role flags for the ownership-anchor gate — optional,
             //  malformed lists simply degrade the entry (no user anchor → the
             //  simhash rung skips it, exact-hash resolution still works).
             let userFlags: boolean[] | undefined;
             if (sketches !== undefined && Array.isArray(e.userFlags)) {
-                const validU = (e.userFlags as unknown[]).filter((u): u is boolean => typeof u === "boolean");
-                if (validU.length > 0) userFlags = validU.slice(-MAX_STORED_ITEMS);
+                const validU = e.userFlags as unknown[];
+                if (validU.every((u): u is boolean => typeof u === "boolean") &&
+                    validU.length > 0) userFlags = validU.slice(-MAX_STORED_ITEMS);
             }
             const entry: ChainEntry = {
                 sessionId: e.sessionId,
