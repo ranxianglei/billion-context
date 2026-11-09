@@ -276,6 +276,16 @@ const MANGLED_OPEN = new RegExp("\x3c" + NAME + "\\s*=\\s*[^<>]*>");
 const DRIFT_NAME_SRC = "([A-Za-z][A-Za-z0-9_]{0,31})";
 const DRIFT_PAIR = new RegExp("\\x3c" + DRIFT_NAME_SRC + "\\s+(" + REFS_RUN + ")\\s*>\\s*\\x3c\\/\\1\\s*>", "gi");
 const DRIFT_ATTR = new RegExp("\\x3c" + DRIFT_NAME_SRC + "\\s[^<>]*\\btokens\\s*=[^<>]*>\\s*(" + REFS_RUN + ")\\s*\\x3c\\/\\1\\s*>", "gi");
+// #5179 live report (v0.1.213, 2026-11-09): the emission degraded on the NAME
+// instead of mutating it — the identifier replaced wholesale with an
+// underscore-joined word of the emitter's own namespace (`acp_tokens`), body =
+// the bare per-turn token count. No ref, no `tokens=` attribute, non-empty
+// body: every payload shape above misses it, and the name enum cannot grow to
+// meet an open drift set (#2190 round 2). The one provable shape: an
+// `acp`-prefixed name (no English word starts with "acp") wrapping a
+// digits-only body, closed by its OWN name (\1). Structurally impossible as
+// prose; a tool call's argument slot is key="value" pairs, never this (#1039).
+const DRIFT_COUNT = new RegExp("\\x3c(acp[A-Za-z0-9_]{0,28})>\\s*(\\d{1,7})\\s*\\x3c\\/\\1>", "gi");
 
 // #5175: the render tag emitted with NO attributes and an empty body —
 // `<acpt> </acpt>`. The pair rules above require an attribute slot (a bare ref
@@ -393,6 +403,13 @@ const DRIFT_TAIL = new RegExp(
         "\\s[^<>]*>[ \\t]*(?:m\\d*)?[ \\t]*" + DRIFT_CLOSE_FRAGMENT +
         "|" +
         "\\s*>[ \\t]*" + DRIFT_CLOSE_FRAGMENT +
+        "|" +
+        // #5179: the count unit's body — digits where another shape's ref or
+        // whitespace would sit. Without this arm the well-formed unknown open
+        // resolves to prose at the first body char and the digits leak. The close
+        // fragment here tolerates underscores/digits (DRIFT_HEAD's own name class)
+        // because the convicted close carries them.
+        ">[ \\t]*\\d{1,7}[ \\t]*(?:\\x3c\\/?[A-Za-z0-9_]{0,32}>?)?" +
     ")$",
 );
 
@@ -408,7 +425,7 @@ function stripDriftPairs(text: string): string {
     //    mangled `acpt>` is indistinguishable from prose on its own, so the pair
     //    is what makes its removal content-safe (#1760's rule, reused).
     const proven = new Set<string>();
-    for (const re of [DRIFT_PAIR, DRIFT_ATTR]) {
+    for (const re of [DRIFT_PAIR, DRIFT_ATTR, DRIFT_COUNT]) {
         re.lastIndex = 0;
         for (;;) {
             const hit = re.exec(text);
@@ -425,6 +442,7 @@ function stripDriftPairs(text: string): string {
     //    balanced markup of any other name keeps its bytes (#2190 round 3).
     out = out.replace(DRIFT_PAIR, () => "");
     out = out.replace(DRIFT_ATTR, () => "");
+    out = out.replace(DRIFT_COUNT, () => "");
     for (const name of proven) {
         const esc = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
         out = out.replace(new RegExp("\\x3c" + esc + "\\s+[^<>]*>", "gi"), "");
@@ -861,12 +879,18 @@ const RENDER_TAG_DETECT = new RegExp("\x3c\\/?" + NAME + "(?=[\\s>])|\\\\u003c\\
 // #5175: the OPEN name space, expressed as a SHAPE rather than an enumeration.
 // A render-tag imitation is a short letter-led name whose attributes carry
 // `tokens=` (the canonical render attribute) or whose attribute slot is a bare
-// ref. Genuine prose cannot produce either, so the shape admits a future drift
-// (`acq`, `acpx`...) without touching this file. Not anchored to any name.
+// ref; #5179 added a third arm — an `acp`-namespace name whose body is a bare
+// token count (DRIFT_COUNT). Genuine prose cannot produce any of them, so the
+// shapes admit a future drift (`acq`, `acpx`...) without touching this file.
+// Not anchored to any name. The third arm is a superset on purpose: it
+// tolerates open/close disagreement, which DRIFT_COUNT's \1 backreference
+// then rejects in the strip itself.
 const RENDER_SHAPE_GATE = new RegExp(
     "\x3c[A-Za-z][A-Za-z0-9_]{0,31}\\s[^<>]*\\btokens\\s*=" +
     "|" +
-    "\x3c[A-Za-z][A-Za-z0-9_]{0,31}\\s+(" + REFS_RUN + ")\\s*>",
+    "\x3c[A-Za-z][A-Za-z0-9_]{0,31}\\s+(" + REFS_RUN + ")\\s*>" +
+    "|" +
+    "\x3cacp[A-Za-z0-9_]{0,28}>\\s*\\d{1,7}\\s*\x3c\\/acp[A-Za-z0-9_]{0,28}\\s*\x3e",
     "i");
 
 export function containsRenderTagText(s: string): boolean {
@@ -1623,7 +1647,11 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
             DRIFT_PAIR.lastIndex = 0;
             DRIFT_ATTR.lastIndex = 0;
             DRIFT_ATTR_MISMATCH.lastIndex = 0;
-            const dp = DRIFT_PAIR.exec(buf) ?? DRIFT_ATTR.exec(buf) ?? DRIFT_ATTR_MISMATCH.exec(buf);
+            // #5179: DRIFT_COUNT rides the pair rules' path — the unit carries
+            // no ref, so dropping it whole releases no half-formed residue, the
+            // measured failure mode behind the excluded fourth rule above.
+            DRIFT_COUNT.lastIndex = 0;
+            const dp = DRIFT_PAIR.exec(buf) ?? DRIFT_ATTR.exec(buf) ?? DRIFT_ATTR_MISMATCH.exec(buf) ?? DRIFT_COUNT.exec(buf);
             // Orphan unit (#2023): only reached when no opening is live — a
             // close inside a swallow belongs to that pair's content (#1720).
             // The lookbehind class extends across the chunk boundary: a run at

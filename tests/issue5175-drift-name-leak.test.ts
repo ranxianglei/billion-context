@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+    containsRenderTagText,
     createIdentityStreamFilter,
     createTagEchoFilter,
     mayStartDegenerateRenderTag,
@@ -267,6 +268,10 @@ const PARITY_SHAPES: Array<[string, string]> = [
     // It is not emitter evidence, so both lanes must leave it byte-identical.
     ["genuine xml empty pair", "Repository header:\n\x3cfields\x3e\n\t\n\x3c/fields\x3e\n\x3cpage\x3e1\x3c/page\x3e"],
     ["genuine xml answer pair", "Reasoning goes in \x3cthink\x3e\x3c/think\x3e and the answer in \x3canswer\x3e\x3c/answer\x3e tags."],
+    // #5179 live report: the count unit must die whole at every wire cut — a
+    // count-only turn that survived streaming would be visible text and would
+    // defeat the degenerate-turn retry that replaces it with a real answer.
+    ["live report count unit", "\x3cacp_tokens\x3e910\x3c/acp_tokens\x3e"],
 ];
 
 // Two shapes cannot be fixed from the streaming lane and are pinned here as a
@@ -1345,4 +1350,46 @@ test("#5175 A control: the four non-streaming rewriters leave genuine markup and
         const got = extract[name](await pending);
         assert.equal(got, genuine, `${name} rewriter must not rewrite genuine prose/markup`);
     }
+});
+
+// ---------- #5179 live report (v0.1.213, 2026-11-09) ----------
+//
+// Two consecutive assistant turns opened with a first text line
+//   <acp_tokens>910</acp_tokens> / <acp_tokens>502</acp_tokens>
+// (blank line, then the reply body). The emission degraded on the NAME instead
+// of mutating it: not an acp misspelling (acpt/acct/accent) but a different
+// underscore-joined word of the emitter's own namespace, body = the bare
+// per-turn token count. No ref, no tokens= attribute, non-empty body — every
+// payload-shape rule missed it AND the gate never called the stripper. The
+// convicted shape is DRIFT_COUNT: an acp-prefixed name wrapping a digits-only
+// body, closed by its own name.
+
+test("#5179 A: the reported acp_tokens count unit is stripped whole-text", () => {
+    assert.equal(stripAcpTags("\x3cacp_tokens\x3e910\x3c/acp_tokens\x3e"), "");
+});
+
+test("#5179 A: the reported two-line turn drops both units, keeps the body byte-exact", () => {
+    const turn =
+        "\x3cacp_tokens\x3e910\x3c/acp_tokens\x3e\n" +
+        "\n" +
+        "\x3cacp_tokens\x3e502\x3c/acp_tokens\x3e\n" +
+        "\n" +
+        "Actual reply body.";
+    assert.equal(stripAcpTags(turn), "\n\n\n\nActual reply body.");
+});
+
+test("#5179 A negatives: non-acp names, non-digit bodies, mismatched closes survive", () => {
+    assert.equal(stripAcpTags("\x3cfoo\x3e5\x3c/foo\x3e"), "\x3cfoo\x3e5\x3c/foo\x3e");
+    assert.equal(stripAcpTags("\x3cacp_tokens\x3esee below\x3c/acp_tokens\x3e"), "\x3cacp_tokens\x3esee below\x3c/acp_tokens\x3e");
+    assert.equal(stripAcpTags("\x3cacp_tokens\x3e910\x3c/acp_tokenz\x3e"), "\x3cacp_tokens\x3e910\x3c/acp_tokenz\x3e");
+    assert.equal(stripAcpTags("the acp process counts tokens"), "the acp process counts tokens");
+});
+
+test("#5179 A: the gate engages on the count shape, stays off for prose pairs", () => {
+    assert.equal(containsRenderTagText("\x3cacp_tokens\x3e910\x3c/acp_tokens\x3e"), true);
+    assert.equal(containsRenderTagText("\x3cfoo\x3e5\x3c/foo\x3e"), false);
+});
+
+test("#5179 A: the released-span seam strips the count unit too", () => {
+    assert.equal(stripDriftResidue("\x3cacp_tokens\x3e910\x3c/acp_tokens\x3e"), "");
 });
