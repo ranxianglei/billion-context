@@ -3,7 +3,7 @@ import { collectBlockContent, countMessageTokens, defaultCountTokens, formatRang
 import { loadConfigFile, resolveMessageTimestamps } from "./config.js";
 import { excludeDeadRefRanges, handleAcpStatus, liveCompressionRanges } from "./acp-status.js";
 import { handleAcpCache, prefixTokensBeforeRef, recordCacheFoldsFromBlocks } from "./cache-ledger.js";
-import { type Session, cacheBlockContent, markDirty, residentPressure, scrubTurnSeparatorIds, statusInputBaseline, withoutTurnSeparators } from "./session.js";
+import { type Session, cacheBlockContent, markDirty, residentPressure, scrubTurnSeparatorIds, statusInputBaseline, truncatedUpstreamOf, withoutTurnSeparators } from "./session.js";
 import { COMPRESS_TOOL_NAME, parseCompressInput, ABSORB_TOOL_NAME, type ParsedRange } from "./compress-tool.js";
 import { effectiveAbsorbConfig, executeAbsorb, isProxyToolFor } from "./absorb.js";
 import { recordCompressCommit } from "./context-analysis.js";
@@ -1107,6 +1107,33 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
             !isEmptyCall &&
             argLen !== undefined &&
             (diagnostics.kind === "malformed-json" || diagnostics.kind === "truncated");
+        // #5981: an EMPTY call dispatched from a stream that was CUT before its
+        // terminal event is not the model's empty companion call — the argument
+        // deltas never arrived. The bytes are identical by the time the parser
+        // sees them, so only the truncation stamp can tell the two apart. This
+        // branch must run BEFORE the #847/#4812 failure ledgers: those counters
+        // exist to detect a model repeating a spec it authored, and charging a
+        // transport failure to them would (a) arm the model-facing breaker on
+        // failures the model never caused and (b) collapse this receipt into a
+        // do-not-retry refusal precisely when a retry is the correct action.
+        const cutStream = isEmptyCall ? truncatedUpstreamOf(ctx.session) : undefined;
+        if (cutStream !== undefined) {
+            // #5981: the spec-keyed #847 ledger is deliberately NOT charged —
+            // it tells the model "you have requested this exact spec N times",
+            // which is false (the model never sent a spec; the bytes were cut).
+            // The session-level #4812 streak IS charged: a transport that stays
+            // broken must still bound the re-issue advice, or the model retries
+            // a dead stream until the turn dies — the runaway #2146 exists to
+            // stop. At the threshold this collapses into the same armed refusal
+            // every other receipt gets.
+            const lostLoopGuard = trackLoop ? noteCompressLoopFailure(ctx, `lost-in-transit:${diagnostics.kind}`, undefined, "truncated-upstream") : "";
+            const lostArmed = trackLoop ? compressBreakerDetail(ctx.session) : undefined;
+            ctx.log(`[acp-proxy: compress arguments lost in transit — the ${cutStream.protocol} stream was cut before its terminal event (${cutStream.cause}); not counted against the model's spec repeat guard]`);
+            if (lostArmed !== undefined && lostArmed.n > COMPRESS_LOOP_THRESHOLD) {
+                return compressResult(armedRefusalReceipt(lostArmed.n, lostArmed.decayMinutes), "refused", 0, `parse:${diagnostics.kind}:lost-in-transit`);
+            }
+            return compressResult(`[Compression FAILED: ARGUMENTS LOST IN TRANSIT — the upstream ${cutStream.protocol} stream carrying this call was cut before its terminal event (${cutStream.cause}), so the compress arguments never arrived. The call reached the proxy EMPTY through no fault of yours; nothing was compressed and this is NOT an empty-intent call. RE-ISSUE the compress call with the content you intended: ONE 'content' STRING holding every range, each block starting with its header line 'mNNNNN–mNNNNN optional topic' followed by that block's summary markdown (a JSON-encoded array of {startId, endId, summary} objects is also accepted INSIDE that same string).${lostLoopGuard}]`, "refused", 0, `parse:${diagnostics.kind}:lost-in-transit`);
+        }
         const parseKey = `parse:${diagnostics.kind}:${diagnostics.invalidItems}:${rawReasons.slice(0, 3).join("|")}`;
         const guard = recordCompressFailure(
             ctx.session,
