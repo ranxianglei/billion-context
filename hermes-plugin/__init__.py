@@ -1314,10 +1314,6 @@ def _watchdog_loop(sidecar: Dict[str, str], ctx: Any, gen: int) -> None:
             continue
         with _lifecycle_lock:
             if _stopped() or int(_state.get("watchdog_gen") or 0) != gen:
-                # LOCAL PATCH (2026-11-09, #4644-unload): a watchdog retired by unload must not
-                # leave routed env behind — same process-global hazard as _shutdown's fix.
-                if _state.get("env_applied"):
-                    _unroute_env()
                 return
             if (_state.get("origin") != origin or not _state.get("env_applied")
                     or _state.get("recovering")):
@@ -1542,11 +1538,11 @@ def _shutdown() -> None:
     refused by it; the join runs outside the lock, since the bootstrap needs it to observe the
     stop."""
     with _lifecycle_lock:
-        # LOCAL PATCH (2026-11-09, #4644-unload): env written by apply_env is PROCESS-GLOBAL and
-        # the host does NOT dispose of it on unload (upstream assumed it would). Without this,
-        # disabling/unloading the plugin after its origin died leaves HTTPS_PROXY/SSL_CERT_FILE
-        # pointing at the dead port — every LLM call in the process gets Connection refused
-        # until a full gateway restart. Restore before anything else.
+        # apply_env routes host traffic by writing HTTPS_PROXY/SSL_CERT_FILE into the
+        # process-global os.environ, and the host does NOT dispose of that on unload — only of
+        # registrations. Leftover routing at a dead origin port breaks every LLM call in the
+        # process until a full restart (#5991), so restore what apply_env overwrote first.
+        # No-op when env was never applied; _unroute_env runs under this same lock.
         if _state.get("env_applied"):
             _unroute_env()
         stop = _state.get("stop_event")
