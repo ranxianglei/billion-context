@@ -7,6 +7,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { effectivePromptCacheRouting, loadConfigFile } from "./config.js";
+import { resolveDshHome } from "./client-config.js";
 import { dshProfileDirs } from "./dsh-channel.js";
 import { featureOverrideAbsent } from "./rollout.js";
 import { IOT_INCOMPAT_NOTICE_ID, PCK_NOTICE_ID, dismissedUpgradeNotices, pckNoticeActive, WM_FASTPATH_INTRO_ID } from "./pck-notice.js";
@@ -45,14 +46,16 @@ export const NOTICES: readonly NoticeEntry[] = [
     // after its first byte — the measured gap tracked that rewrite call's own
     // latency (p50 ~7s per step) and the extra requests vanished when the
     // plugin was disabled (44% of one session's requests were that shape).
-    // Installed ⇒ warn; presence is the whole predicate, no config knobs.
+    // Installed AND not switched off in its own config ⇒ warn (owner ruling
+    // 2026-11-09: disabling the plugin removes the extra wait, so the notice
+    // must go away with it and only reappear when it is turned back on).
     {
         id: IOT_INCOMPAT_NOTICE_ID,
         tone: "warn",
         keys: { on: "iotcompat.on", desc: "iotcompat.desc", hint: "iotcompat.hint", dismiss: "iotcompat.dismiss_btn" },
         active: () =>
             !dismissedUpgradeNotices(process.env).has(IOT_INCOMPAT_NOTICE_ID) &&
-            probeDshIotThinking(process.env),
+            dshIotThinkingActive(process.env),
     },
 ];
 
@@ -75,6 +78,20 @@ export function probeDshIotThinking(env: NodeJS.ProcessEnv = process.env): boole
     return false;
 }
 
+/** Installed AND effective-enabled. The plugin's own default is enabled
+ *  (its config-store seeds enabled: true), so a missing/unreadable config
+ *  keeps the warning; only an explicit enabled: false silences it. */
+export function dshIotThinkingActive(env: NodeJS.ProcessEnv = process.env): boolean {
+    if (!probeDshIotThinking(env)) return false;
+    try {
+        const raw = fs.readFileSync(path.join(resolveDshHome(env), "plugin-data", "iot-thinking", "config.json"), "utf8");
+        const doc: unknown = JSON.parse(raw);
+        if (doc !== null && typeof doc === "object" && (doc as { enabled?: unknown }).enabled === false) return false;
+    } catch {
+        // absent/broken config ⇒ plugin runs on its default (enabled)
+    }
+    return true;
+}
 
 /** Currently-visible notices, in registry order. Never throws. */
 export function visibleNotices(): Array<{ id: string; tone: "ok" | "warn"; keys: NoticeEntry["keys"] }> {
