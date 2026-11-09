@@ -2790,7 +2790,8 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                     const ei = refToIdx.get(rj.endRef);
                     if (si !== undefined && ei !== undefined && si <= ei) remaining += rj.tokens;
                 }
-                const deficit = result.payloadEstimate - limit;
+                // #5974: corrected scale — keep parity with the pre-walk gate above (the blind view understates the outbound body by viewDeltaCorrection).
+                const deficit = result.payloadEstimate + viewDeltaCorrection - limit;
                 if (remaining > 0 && deficit > 0 && calibrateFoldMass(remaining) * FUTILITY_SLACK < deficit) {
                     futileBail = true;
                     bailRemaining = calibrateFoldMass(remaining);
