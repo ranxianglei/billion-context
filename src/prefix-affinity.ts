@@ -1241,9 +1241,13 @@ export class PrefixAffinityResolver {
             // #2807: optional tail-turn fragments for the append-continuation
             //  rung — hv2 only (a v1 entry's fragments were never noted),
             //  malformed lists degrade the entry to exact-ladder behavior.
+            //  Whole-carrier validation like sketches/userFlags above: a
+            //  filtered middle slot would shift later fragments onto the
+            //  wrong source message.
             if (hv === 2 && Array.isArray(e.tailFrags)) {
-                const validF = (e.tailFrags as unknown[]).filter((f): f is string => typeof f === "string" && /^[0-9a-f]{64}$/.test(f));
-                if (validF.length > 0) entry.tailFrags = validF.slice(0, MAX_TURN_FRAGS);
+                const frags: unknown[] = Array.from(e.tailFrags);
+                if (frags.every((f): f is string => typeof f === "string" && /^[0-9a-f]{64}$/.test(f)) &&
+                    frags.length > 0) entry.tailFrags = frags.slice(0, MAX_TURN_FRAGS);
             }
             this.trackedChains.delete(entry.sessionId);
             this.trackedChains.set(entry.sessionId, entry);
