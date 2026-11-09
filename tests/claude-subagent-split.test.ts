@@ -346,4 +346,3 @@ test("anthropicLaterUserFrag skips the first user message and joins bounded late
     assert.equal(anthropicLaterUserFrag([{ role: "user", content: sharedFirst }]), "", "no later user message → empty (call site keeps the un-widened key)");
     assert.equal(anthropicLaterUserFrag([]), "", "empty body → empty");
 });
-
