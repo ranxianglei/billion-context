@@ -23,6 +23,7 @@
 import path from "node:path";
 import { stateDir } from "./paths.js";
 import { loadConfigFile } from "./config.js";
+import { log } from "./logger.js";
 import { parseDurationField } from "./duration.js";
 import { UPSTREAM_TIMEOUT_MS, REPLAY_MAX_ATTEMPTS, REPLAY_BASE_DELAY_MS } from "./fetch-util.js";
 import { PROXY_KEEPALIVE_MAX_MS } from "./upstream-proxy.js";
@@ -81,6 +82,25 @@ function fileNetwork() {
 export function upstreamTimeoutMs(): number {
     const v = tNum("BILI_UPSTREAM_TIMEOUT_MS", fileNetwork().upstreamTimeoutMs);
     return Number.isInteger(v) && v > 0 ? v : UPSTREAM_TIMEOUT_MS;
+}
+
+/** BILI_UPSTREAM_FIRST_BYTE_MS > network.upstreamFirstByteMs > the RESOLVED
+ *  upstreamTimeoutMs() — so unset = byte-identical to the single-phase
+ *  watchdog for EVERY configuration, including deployments that raise
+ *  BILI_UPSTREAM_TIMEOUT_MS above 12 min for >12-min local-model prefills
+ *  (review on #5917 caught the first cut pinning the fallback to the 720000
+ *  constant UPSTREAM_FIRST_BYTE_MS, which would have silently re-capped
+ *  those deployments' first byte at 12 min). Phase-1 budget: request fully
+ *  sent → first response byte. Bounds
+ *  "upstream accepted the request but never answered" separately from mid-stream
+ *  silence, which keeps the #1706/#1714 guarantee that long silent prefills are
+ *  never truncated by default (#5904: a GPU-restart-cold sglang answered one
+ *  fold in 73s, then accepted the next request and never answered — the turn sat
+ *  silent until the client's 300s abort; the release gate sets 120000ms here to
+ *  catch that wedge fast). */
+export function upstreamFirstByteMs(): number {
+    const v = tNum("BILI_UPSTREAM_FIRST_BYTE_MS", fileNetwork().upstreamFirstByteMs);
+    return Number.isInteger(v) && v > 0 ? v : upstreamTimeoutMs();
 }
 
 /** BILI_CA_FILE > network.caFile > unset. Path to a PEM bundle of extra root CAs
@@ -143,6 +163,34 @@ export function throttle429BaseDelayMs(): number {
 export function throttle429MaxDelayMs(): number {
     const v = tNum("BILI_THROTTLE_429_MAX_DELAY_MS", fileNetwork().throttle429MaxDelayMs);
     return Number.isFinite(v) && v >= 0 ? v : THROTTLE_429_MAX_DELAY_MS;
+}
+
+/** BILI_THROTTLE_429_SCOPE > network.throttle429Scope > "credential". Hold
+ *  granularity for marker-less upstream 429s (#5199/#5853 decision 1, option
+ *  A): "credential" keeps #5696's conservative default — an unrecognized 429
+ *  body (RPM/quota text, opaque relay rewrites) holds the whole
+ *  origin+credential, freezing every model behind it; "model" keys that hold
+ *  by the send's request model, for gateways that front many independently
+ *  limited models behind one credential (LiteLLM/one-api/opencode.ai-style
+ *  relays). Recognized KeyRing/bili-relay markers keep their own semantics in
+ *  both modes; requests whose model cannot be identified stay
+ *  credential-wide, so worst-case protection never widens beyond legacy.
+ *  Read per settlement so the switch flips live. The value match is
+ *  EXACT ("model"/"credential", case-sensitive): anything else — a typo
+ *  like "models" or "Model" — silently falls back to "credential" with
+ *  only this warn (once per distinct misspelling) to say so. */
+let warnedThrottle429ScopeValues: Set<string> | undefined;
+export function throttle429Scope(): "credential" | "model" {
+    const env = process.env.BILI_THROTTLE_429_SCOPE;
+    const raw = env !== undefined && env !== "" ? env : fileNetwork().throttle429Scope;
+    if (raw !== "model" && raw !== "credential" && raw !== "" && raw !== undefined) {
+        warnedThrottle429ScopeValues ??= new Set<string>();
+        if (!warnedThrottle429ScopeValues.has(raw)) {
+            warnedThrottle429ScopeValues.add(raw);
+            log("warn", `[knobs] network.throttle429Scope: unrecognized value ${JSON.stringify(raw)} — expected exactly "credential" or "model"; falling back to "credential" (#5199). Unrecognized values never enable model-scoped holds.`);
+        }
+    }
+    return raw === "model" ? "model" : "credential";
 }
 
 /** BILI_MAX_SHRINK_PER_COMPRESS > network.maxShrinkPerCompress > unset (no steering). */
@@ -235,6 +283,12 @@ const DEFAULT_LIMITS_DECODED_BYTES = 10 * 1024 * 1024 * 1024;
 const DEFAULT_LIMITS_OUTBOUND_BYTES = 5 * 1024 * 1024 * 1024;
 const DEFAULT_WS_OUTBOUND_BYTES = 10 * 1024 * 1024;
 const DEFAULT_HTTP_OUTBOUND_BYTES = 10 * 1024 * 1024;
+// #5794: the ingest cost band (decoded bytes) that may run the JSON.parse /
+// normalization sweep. 32 MiB ≈ the observed 51.2 MiB/29,619-msg incident
+// (5.5–7.2 s per round, 54.6% of local CPU, 747 s event-loop FATAL); any
+// parseable body ABOVE it is already ≥ ~8M tokens = 5–10× the largest model
+// window, so it can never succeed. 0 = no ingest cap (legacy).
+const DEFAULT_INGEST_BODY_BYTES = 32 * 1024 * 1024;
 
 /** BILI_RECEIVE_BODY_BYTES > network.receiveBodyBytes > 5 GiB. Max inbound wire bytes
  *  read into memory per request. #3128: these were hardcoded 100 MiB constants; the
@@ -286,6 +340,29 @@ export function limitsWsOutboundBytes(): number {
 export function limitsHttpOutboundBytes(): number {
     const v = tInt("BILI_HTTP_OUTBOUND_BYTES", loadConfigFile().network?.httpOutboundBytes);
     return Number.isFinite(v) && v >= 0 ? Math.floor(v) : DEFAULT_HTTP_OUTBOUND_BYTES;
+}
+
+/** BILI_INGEST_BODY_BYTES > network.ingestBodyBytes > 32 MiB. Cost band for the
+ *  JSON.parse + normalization sweep AFTER decode (the 51.2 MiB #5794 body spent
+ *  seconds there per round). Bodies above it are refused before the sweep with
+ *  an actionable 413; any parseable body over 32 MiB is ≥ ~8M tokens, i.e.
+ *  beyond every real model window, so nothing valid is blocked. 0 disables the
+ *  ingest cap (legacy parse-everything). */
+export function limitsIngestBytes(): number {
+    const v = tInt("BILI_INGEST_BODY_BYTES", loadConfigFile().network?.ingestBodyBytes);
+    return Number.isFinite(v) && v >= 0 ? Math.floor(v) : DEFAULT_INGEST_BODY_BYTES;
+}
+
+// #5000 item 2: per-upstream hard cap on the messages[] array length — a wire
+// constraint no byte/token estimate expresses (the 26,903-message #5000 session
+// cleared every size gate and died at the upstream). Per-UPSTREAM on purpose:
+// there is no universal value, so the default is 0 = disabled; operators set
+// BILI_MAX_MESSAGES / network.maxMessages to their upstream's known limit and
+// over-limit bodies get an actionable 413 (restart / rewind) instead of a
+// guaranteed upstream 400. Count only — it never folds.
+export function limitsMaxMessages(): number {
+    const v = tInt("BILI_MAX_MESSAGES", loadConfigFile().network?.maxMessages);
+    return Number.isFinite(v) && v > 0 ? Math.floor(v) : 0;
 }
 
 // --- session persistence (was BILI_PERSIST_* env-only) ---
@@ -428,11 +505,15 @@ export function sessionWarmMaxBytes(): number {
     return Number.isFinite(v) && v >= 0 ? Math.floor(v) : 64 * 1024 * 1024;
 }
 
-/** BILI_SESSION_RESIDENT_MAX_BYTES > sessions.residentMaxBytes > 512 MiB (#2803 soft
- *  target for estimated resident session bytes; active/in-flight state stays pinned). */
+/** BILI_SESSION_RESIDENT_MAX_BYTES > sessions.residentMaxBytes > 4 GiB (#2803 soft
+ *  target for estimated resident session bytes; active/in-flight state stays pinned.
+ *  #5779 raised the default from 512 MiB: single sessions routinely exceed half a
+ *  GiB and ping-ponged against the old budget forever — evicted every inter-request
+ *  gap, cold-loaded on every request, which under memory pressure OOM'd the decode
+ *  and manufactured the .corrupt-* disk-fill loop.) */
 export function sessionResidentMaxBytes(): number {
     const v = tInt("BILI_SESSION_RESIDENT_MAX_BYTES", loadConfigFile().sessions?.residentMaxBytes);
-    return Number.isFinite(v) && v >= 0 ? Math.floor(v) : 512 * 1024 * 1024;
+    return Number.isFinite(v) && v >= 0 ? Math.floor(v) : 4 * 1024 * 1024 * 1024;
 }
 
 /** BILI_SESSION_RESIDENT_HARD_MAX_BYTES > sessions.hardMaxBytes > pool soft cap

@@ -16,6 +16,7 @@ type LivePrice = NonNullable<ReturnType<typeof resolveBillingPrice>>;
 import { keepaliveStatusFor, type KeepaliveStatus } from "../cache-keepalive.js";
 import { METADATA_FOLD_COVERAGE } from "../fold-reconcile.js";
 import { markdownToHtml } from "./markdown.js";
+import { contextAnalysisView, type ContextAnalysisView } from "../context-analysis.js";
 import { log } from "../logger.js";
 import { dataDir } from "../paths.js";
 import { isExternalSummaryBlock } from "../external-summary-marker.js";
@@ -32,6 +33,16 @@ import * as path from "node:path";
  *  Session objects, so resident memory stays O(#sessions × ~1KB) regardless of
  *  total corpus bytes; a single admin request's peak is one decoded file. */
 
+// #5796: the host-side conversation surface (dsh session file, agent
+// transcripts) grows without bound — bili compression shrinks what is SENT to
+// the model, not the host's own history — so per-step cost climbs with it. On
+// plugin lanes (~2 host messages per request, dsh-measured) that becomes
+// visible around 10k messages ≈ 5k requests. The server log warns much earlier
+// (SLOW_SESSION_MSG_WARN = 1000 messages, src/server.ts); this display gate is
+// deliberately higher — the badge should mean "worth starting a new session",
+// not "notable".
+const SLOW_SESSION_REQUESTS_WARN = 5000;
+
 interface WebSessionSummary {
     id: string;
     title?: string;
@@ -42,6 +53,10 @@ interface WebSessionSummary {
      *  false = disk-only (evicted or from before this process started). */
     live: boolean;
     requests: number;
+    /** #5796: set once requests reach SLOW_SESSION_REQUESTS_WARN — the host-side
+     *  history only grows and per-step cost is climbing; the panel badges the row
+     *  so starting a fresh session reads as the actionable exit. */
+    slowSession?: { requests: number };
     contextTokens: number;
     /** #1839: provenance of contextTokens — "usage" = last real usage report,
      *  "estimate" = bounded local estimate (display should mark it as such). */
@@ -288,6 +303,11 @@ interface WebSessionDetail extends WebSessionSummary {
      *  resolution as the banner's clients[]); absent when unresolvable or when
      *  there are no conflicts. */
     conflictClient?: string;
+    /** Context analysis: init size, nudge cadence, compression acceptance
+     *  (harvest) rate, and the plain-language verdict — this process's live
+     *  view (in-memory only; absent for sessions this bili process has not
+     *  observed at least twice yet). */
+    contextAnalysis?: ContextAnalysisView;
     /** #2904: no-ceiling output-budget degraded state for this session's last
      *  starved model ({model,value,ts}); absent when none holds. */
     outputBudgetDegraded?: { model: string; value: number; ts: number };
@@ -959,6 +979,7 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
             : {}),
         live,
         requests,
+        ...(requests >= SLOW_SESSION_REQUESTS_WARN ? { slowSession: { requests } } : {}),
         contextTokens: s.stats.contextTokens,
         ...(s.stats.contextTokensSource ? { contextTokensSource: s.stats.contextTokensSource } : {}),
         tokensSaved,
@@ -1519,6 +1540,10 @@ function renderDetail(session: Session, live: boolean): WebSessionDetail {
         handoffTruncated,
         ...(conflicts.length > 0 ? { conflicts } : {}),
         ...(conflictClient ? { conflictClient } : {}),
+        ...(() => {
+            const ca = contextAnalysisView(session.id);
+            return ca ? { contextAnalysis: ca } : {};
+        })(),
         blockDetails: session.state.blocks.map((b) => {
             // Display data: canonicalize to ascending labels so non-monotonic-
             // ref spans don't render reversed in the UI (#2168).
