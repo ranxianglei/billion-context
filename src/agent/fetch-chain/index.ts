@@ -289,13 +289,20 @@ export function installFetchChain(makeDispatch: (send: typeof globalThis.fetch) 
             if (current === top) {
                 // An accessor masks our own top (get: () => top): convert the
                 // slot back to a data property WITHOUT re-wrapping — wrapping
-                // our own top would nest dispatch twice.
+                // our own top would nest dispatch twice. A NON-configurable
+                // accessor makes both steps throw; count that as a failed
+                // repair instead of letting it out of the timer callback —
+                // an uncaughtException there kills the host process.
                 try {
-                    globalThis.fetch = top;
+                    try {
+                        globalThis.fetch = top;
+                    } catch {
+                        Object.defineProperty(globalThis, "fetch", { value: top, writable: true, configurable: true, enumerable: true });
+                    }
+                    failures = globalThis.fetch === top ? 0 : failures + 1;
                 } catch {
-                    Object.defineProperty(globalThis, "fetch", { value: top, writable: true, configurable: true, enumerable: true });
+                    failures += 1;
                 }
-                failures = globalThis.fetch === top ? 0 : failures + 1;
                 giveUpIfExhausted();
                 return;
             }
