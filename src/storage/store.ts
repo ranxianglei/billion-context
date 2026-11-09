@@ -1167,7 +1167,18 @@ export class UnifiedStore {
             // #4313: one wall-clock sample per save batch — rows without a
             //  per-message first-sight stamp all carry the same second.
             const batchTs = Date.now();
+            const existingMessages = new Map<number, { msg_id: string; identity: string; content_hash: string }>();
+            if (!delta && messages.length > 0) {
+                const rows = this.db.prepare("SELECT m.seq, m.msg_id, m.identity, m.content_hash FROM messages m " +
+                    "JOIN content c ON c.hash = m.content_hash AND c.refcount > 0 WHERE m.session_id = ?")
+                    .all(s.sessionId) as { seq: number; msg_id: string; identity: string; content_hash: string }[];
+                for (const row of rows) existingMessages.set(row.seq, row);
+            }
             for (const m of messages) {
+                const existing = existingMessages.get(m.seq);
+                if ((!m.media || m.media.length === 0) && existing && existing.msg_id === m.msgId &&
+                    existing.identity === (m.identity ?? identityOfStoredContent(m.content)) &&
+                    existing.content_hash === (m.contentHash ?? sha256Hex(m.content))) continue;
                 const hash = this.putContent(m.content, m.contentHash);
                 const res = this.db
                     .prepare(
