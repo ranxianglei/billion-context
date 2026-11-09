@@ -54,6 +54,14 @@ Two lanes, same plugin (#941):
   `billion-context/dsh`, the profile resolved a pre-bundle copy from a stale
   package-metadata cache (#953) — re-add pinned: `dsh plugin --profile
   <name> add billion-context@latest`.
+- **Codex WebSocket leg (#5838):** the embedded pi-ai `openai-codex` provider
+  defaults to `transport: auto`, which prefers a direct WebSocket exchange —
+  a successful WS round trip never calls fetch. Builds shipped before the
+  WS-lane fix therefore never see those model requests: ACP tools answer 404
+  and nothing compresses until the context limit. On such builds set
+  `providers.openai-codex.transport` to `sse` (hot settings) so the traffic
+  rides the fetch leg; from the fix release onward the WebSocket leg is
+  intercepted and header-stamped automatically.
 - **Boundary — third-party Codex transports:** plugins that build their OWN
   Codex WebSocket client bypass bili's intercepts by construction. Example
   found in the wild 2026-11-08: `dsh-codex-subscription` with
