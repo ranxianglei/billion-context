@@ -45,7 +45,10 @@ function disarm(id: string): void {
  *  No-op when the saved view is already stale — a long-idle session staying
  *  idle after attach is normal, not a failure. */
 export function noteColdLoad(id: string, source: string, savedAt?: number): void {
-    if (savedAt === undefined) return;
+    if (savedAt === undefined || !Number.isFinite(new Date(savedAt).getTime())) {
+        disarm(id);
+        return;
+    }
     if (Date.now() - savedAt > HOT_ATTACH_WINDOW_MS) {
         disarm(id);
         return;
