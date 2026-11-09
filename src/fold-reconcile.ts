@@ -32,7 +32,7 @@
 // provider turned call_x|fc_0 into call_x_fc_0 on both sides of every pair).
 // That defeats both claim passes by construction, because both key on the
 // toolCallId. Pairing old→new without host knowledge would be guessing, and
-// misattribution is the expensive failure mode (MESSAGE-IDENTITY.md), so the
+// misattribution is the expensive failure mode (docs/message-identity.md), so the
 // pass only COUNTS such cases (an inbound twin with identical normalized
 // content under a different toolCallId) and the drift log line names the
 // cause instead of reading as "mutation or deletion".

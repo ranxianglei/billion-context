@@ -262,6 +262,33 @@ export type CompressSettings = {
      *  level wins PER FIELD across global → provider → model, like every
      *  other compress field. */
     minPressureBenefitTokens?: number;
+    /** Phantom-pressure guard: when the decision meter for this round is a
+     *  LOCAL ESTIMATE rather than a billing sample (the host passed no usage
+     *  report — e.g. right after an aborted turn or a short cache TTL that
+     *  voided sample delivery), the pressure band (usage ≥ maxContextLimit /
+     *  emergency threshold) defers its nudge one round instead of firing
+     *  EMERGENCY/OVER-LIMIT rewrites off a char-bound reading that
+     *  structurally runs ~3x billed. The very next request carries a fresh
+     *  billing report, so deferring costs at most one round; the hard
+     *  overflow backstops stay armed either way. Billed readings keep
+     *  byte-identical behavior and non-pressure tiers are unaffected.
+     *  Default true; set false to restore estimate-driven pressure injection.
+     *  Maps to kernel `nudge.requireUsageSampleForPressure`. Deepest level
+     *  wins PER FIELD, like every other compress field. */
+    requireUsageSampleForPressure?: boolean;
+    /** #5865 estimate-hold backstop: how many CONSECUTIVE rounds with an
+     *  estimate-grade meter reading (no billing sample) may hold the
+     *  pressure-band injection before it falls back to firing on the estimate
+     *  anyway. Bounds the #5860 phantom-pressure hold so an upstream that
+     *  NEVER reports usage (anonymous zero-baseline / silent-backend sessions,
+     *  where the local estimate is the only pressure signal) cannot starve its
+     *  automatic compression forever. Default 2 (covers the aborted-turn +
+     *  follow-up ghost windows while capping starvation at two missed rounds);
+     *  0 disables the hold entirely. Maps to kernel
+     *  `nudge.maxEstimateHoldRounds`; only consulted while
+     *  requireUsageSampleForPressure is on. Deepest level wins PER FIELD, like
+     *  every other compress field. */
+    maxEstimateHoldRounds?: number;
     /** Per-tier nudge growth thresholds in tokens (#2376): independent token
       *  trigger sizes for the T1/T2/T3 mass paths, e.g. keep T1 aggressive for
       *  long tasks while letting T2 distill earlier/later. Each UNSET tier
@@ -636,7 +663,9 @@ export type CompressSettings = {
      *  and state are untouched; identical layout is recomputed every turn.
      *  Env BILI_COMPRESS_AT_FOLD_POINT wins over every level;
      *  applyCompressSettings resolves it per request. Maps to kernel
-     *  Config.compressAtFoldPoint (acp-kernel >= 0.0.177). */
+     *  Config.compressAtFoldPoint (acp-kernel >= 0.0.177; v2 semantics since
+     *  0.0.188 — summary text relocated to the fold point, pair kept in slot
+     *  with pointer args). */
     compressAtFoldPoint?: boolean;
     /** Second opt-in riding on compressAtFoldPoint (default OFF): also drop
      *  the contiguous run of UNSIGNED reasoning cores immediately preceding a
@@ -1184,7 +1213,7 @@ function mitmTwinCovers(routes: ProviderRoutes, target: URL): boolean {
 /** #3632: on the CONNECT/MITM lane every lookup runs against a rewritten
  *  `mitm://<host>` URL (src/server.ts resolveUpstream), so a plain `https://`
  *  providers key can NEVER match MITM-lane traffic to its host. The scheme
- *  split is intentional (CONFIGURATION.md: one host can serve a login client
+ *  split is intentional (docs/configuration.md: one host can serve a login client
  *  over CONNECT and an API-key client over /bili/ with different settings),
  *  but a lone https:// entry on a MITM-whitelisted host sat silently inert
  *  until a per-request [window] fallback line much later — a 1M window
@@ -1855,15 +1884,16 @@ export function resolveNonHttpProviders(env: NodeJS.ProcessEnv = process.env): s
  *  standalone package's DelegateConfig (billion-context-pi-subagents); the
  *  two renames vs the deprecated acp.json keys: `prompt` replaces
  *  `delegatePrompt`, and `debug` is scoped to the sub-agent subsystem (the
- *  top-level `debug` key stays the proxy's own). See CONFIGURATION.md. */
+ *  top-level `debug` key stays the proxy's own). See docs/configuration.md. */
 export interface PiSubagentsFileConfig {
     /** Master switch, default true. `false` (or the boolean shorthand
      *  `"pi": {"subagents": false}`) removes the three tools, the
      *  system-prompt section and the fleet shortcut (new session required). */
     enabled?: boolean;
-    /** Keep acp_delegate active even when a project-scope pi-subagents
-     *  install is detected (#415 stand-down). Default false. Env
-     *  PI_ACP_DELEGATE_FORCE_ENABLE=true/false wins over the file. */
+    /** Keep acp_delegate active even when a pi-subagents install at either
+     *  scope is detected (#415 stand-down, widened to user-scope in #5637).
+     *  Default false. Env PI_ACP_DELEGATE_FORCE_ENABLE=true/false wins over
+     *  the file. */
     forceEnable?: boolean;
     /** "separate" (default) — delegate tokens tracked in their own
      *  accumulator; "merged" — folded into the main session totals. */
@@ -2090,8 +2120,16 @@ type FileConfig = {
      *  so `bili pi` keeps its launcher proxy. Opt OUT with `false` (or
      *  BILI_PI_INLINE=0/false/no/off) — restores attach/spawn. Resolved
      *  env > file > default; an explicit inline choice beats an announced
-     *  attach target. */
-     pi?: { subagents?: PiSubagentsFileConfig | boolean; inline?: boolean };
+     *  attach target.
+     *
+     *  `commands`: which of the bili pi-plugin slash commands to register —
+     *  "acp", "acp-cache", "acp-rule", "acp-fleet". Default ["acp",
+     *  "acp-cache"] keeps the status and cache-reconciliation entry points
+     *  while leaving the rarer acp-rule / acp-fleet off the completion list;
+     *  `[]` or `false` registers none; unknown names log a console warning
+     *  and are ignored. Takes effect on the next session (registration runs
+     *  once per session start). */
+     pi?: { subagents?: PiSubagentsFileConfig | boolean; inline?: boolean; commands?: readonly string[] | boolean };
     /** Built-in opencode-lane inline switch (#3278 port, OPT-IN — default
      *  stays the spawned proxy, per owner decision on #4687): run the
      *  opencode lane's compression IN-PROCESS — no proxy server spawned.
@@ -2219,6 +2257,13 @@ type FileConfig = {
     network?: {
         /** Upstream fetch timeout (was BILI_UPSTREAM_TIMEOUT_MS; default 720000). */
         upstreamTimeoutMs?: number;
+        /** First-byte budget for upstream fetches (BILI_UPSTREAM_FIRST_BYTE_MS; default
+         *  720000 = upstreamTimeoutMs). Bounds request-sent → first-response-byte separately
+         *  from the
+         *  streaming idle budget, so a wedged upstream that accepts requests but never
+         *  answers fails fast instead of silently eating the full 12-minute watchdog
+         *  while the client times out first (#5904). */
+        upstreamFirstByteMs?: number;
         /** Request watchdog budget (was BILI_REQUEST_WATCHDOG_MS; default 2× upstream timeout). */
         requestWatchdogMs?: number;
         /** Server keep-alive timeout (was BILI_KEEP_ALIVE_TIMEOUT_MS; default 5000). */
@@ -2249,6 +2294,13 @@ type FileConfig = {
         /** 429-hold backoff ceiling in ms; also the probe cadence once the hold is terminal (#4204;
          *  was env-only BILI_THROTTLE_429_MAX_DELAY_MS; default 30000). */
         throttle429MaxDelayMs?: number;
+        /** Hold granularity for marker-less upstream 429s (#5199; env BILI_THROTTLE_429_SCOPE; default "credential").
+         *  "credential" — #5696's conservative default: any 429 without a recognized model marker holds the whole
+         *  origin+credential (every model, every session on it). "model" — hold only the send's request model, for
+         *  gateways fronting many independently-limited models behind one credential (LiteLLM/one-api/opencode.ai-style
+         *  relays); requests without an identifiable model remain credential-wide, and recognized KeyRing markers keep
+         *  their own semantics in both modes. */
+        throttle429Scope?: "credential" | "model";
         /** Per-compress shrink steering factor in (0,1] (was BILI_MAX_SHRINK_PER_COMPRESS; default unset). */
         maxShrinkPerCompress?: number;
         /** Outbound proxy keep-alive ceiling, 0 for one-shot (was BILI_PROXY_KEEPALIVE_MAX_MS; default 55000). */
@@ -2279,6 +2331,17 @@ type FileConfig = {
          *  SELF_SIGNED_CERT_IN_CHAIN. MERGED with Node's built-in roots, never replacing them.
          *  Env BILI_CA_FILE wins. */
         caFile?: string;
+        /** #5000 item 2: per-upstream hard cap on the messages[] array length — a wire constraint no
+         *  byte/token estimate expresses (the 26,903-message #5000 session cleared every size gate and
+         *  died at the upstream). Per-UPSTREAM on purpose: default 0 = disabled; set it to your upstream's
+         *  known limit and over-count bodies get an actionable 413 (restart / rewind) instead of a
+         *  guaranteed upstream 400. Count only — it never folds. Env BILI_MAX_MESSAGES wins. */
+        maxMessages?: number;
+        /** #5794 item 2: cost band (decoded bytes) for the JSON.parse + normalization sweep AFTER
+         *  decode; a body above it is refused with an actionable 413 before the sweep, because any
+         *  parseable body over 32 MiB is ≥ ~8M tokens — beyond every real model window. 0 disables
+         *  the ingest cap (legacy parse-everything). Env BILI_INGEST_BODY_BYTES wins. */
+        ingestBodyBytes?: number;
     };
     /** Session persistence knobs (#2030) — was BILI_PERSIST_* env-only. */
     persist?: {
@@ -2423,7 +2486,8 @@ const KNOWN_TOP_LEVEL_KEYS = new Set([
     "rollout",
     "dsh",
     "compat", "imageBilling", "imageTokenCap", "claude", "native", "resign",
-    "pi", "storage", "security",
+    // #5706: FileConfig.opencode (opencode lane block, src/agent/opencode-native.ts).
+    "pi", "opencode", "storage", "security",
     // #4899: per-model billing prices (web panel pricing editor).
     "billing",
     // #2030 subsystem blocks:
@@ -2439,7 +2503,7 @@ const KNOWN_TOP_LEVEL_KEYS = new Set([
 // level down under "compress". Keep in sync with parseCompressSettings.
 const COMPRESS_SETTING_FIELDS = new Set([
     "modelContextLimit", "maxContextLimit", "emergencyThresholdPercent",
-    "nudgeGrowthTokens", "minPressureBenefitTokens", "tierNudgeTokens", "nudgeModelDecided", "nudgeDecisionMaxTokens",
+    "nudgeGrowthTokens", "minPressureBenefitTokens", "requireUsageSampleForPressure", "maxEstimateHoldRounds", "tierNudgeTokens", "nudgeModelDecided", "nudgeDecisionMaxTokens",
     "requireNudge", "requireRecommendation",
     "preserveRecentMessages", "preserveRecentTokens",
     "minCompressRange", "minCompressRangeChars",
@@ -3224,6 +3288,15 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
         const v = obj.minPressureBenefitTokens;
         if (typeof v !== "number" || !Number.isFinite(v) || v < 0) ok = false;
         else out.minPressureBenefitTokens = Math.floor(v);
+    }
+    if ("requireUsageSampleForPressure" in obj) {
+        if (typeof obj.requireUsageSampleForPressure !== "boolean") ok = false;
+        else out.requireUsageSampleForPressure = obj.requireUsageSampleForPressure;
+    }
+    if ("maxEstimateHoldRounds" in obj) {
+        const v = obj.maxEstimateHoldRounds;
+        if (typeof v !== "number" || !Number.isFinite(v) || v < 0 || !Number.isInteger(v)) ok = false;
+        else out.maxEstimateHoldRounds = Math.floor(v);
     }
     for (const key of ["protectedLatestTools", "protectedTools"] as const) {
         if (!(key in obj) || obj[key] === undefined) continue;
