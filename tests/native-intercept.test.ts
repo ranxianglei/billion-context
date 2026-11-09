@@ -593,6 +593,99 @@ test("install: a missing live-state slot refuses an oversized direct model reque
     }
 });
 
+test("install: an empty-slot body under the byte cap but over the model window is refused locally (#5996)", async () => {
+    const saved = globalThis.fetch;
+    _resetForTest();
+    const sink: string[] = [];
+    globalThis.fetch = fakeFetch(sink);
+    try {
+        // A lane that stamps the model window onto every proxied request — this
+        // is the only window source the empty-slot branch can ever see (#4894).
+        const state: NativeInterceptState = {
+            origin: "http://127.0.0.1:40921",
+            ready: Promise.resolve("http://127.0.0.1:40921"),
+            headersFor: () => ({ "x-bili-plugin-context-window": "1000" }),
+        };
+        assert.equal(installNativeFetchIntercept(state), true);
+        // Steady state: one live request rides the proxy. This single route is
+        // what stamps the process-level last-known window the doom check relies on.
+        assert.equal((await globalThis.fetch("http://127.0.0.1:8199/v1/messages", { method: "POST", body: "{}" })).status, 200);
+        assert.equal(sink[0], "http://127.0.0.1:40921/bili/http://127.0.0.1:8199/v1/messages");
+        // Now the slot empties (dsh deactivate/reactivate, #2082/#2101). A 4 MiB
+        // body is under the 8 MiB byte cap yet prices at ~1.19M tokens against the
+        // 1M floor window — the OLD code sent it raw upstream (provider 400); the
+        // fix refuses it locally with the same retryable 422 class as the byte cap.
+        liveStateSlotEffect(state)()();
+        const res = await globalThis.fetch("http://127.0.0.1:8199/v1/messages", { method: "POST", body: "x".repeat(4 * 1024 * 1024) });
+        assert.equal(res.status, 422);
+        assert.equal(res.headers.get("x-bili-gate"), "oversize-refusal-no-live-state");
+        const j = (await res.json()) as { error?: { message: string; retryable: boolean } };
+        assert.match(j.error?.message ?? "", /token/, "refusal names the token-window basis, not the byte ceiling");
+        assert.match(j.error?.message ?? "", /1,000,000/, "names the resolved window");
+        assert.equal(j.error?.retryable, true, "still a retryable policy refusal");
+        // Negative row: a body that fits under the known window still rides direct
+        // while the slot is empty — the guard must not over-refuse in-window work.
+        const inWindow = "x".repeat(1 * 1024 * 1024); // 1 MiB → ~299K est tokens < 1M window
+        assert.equal((await globalThis.fetch("http://127.0.0.1:8199/v1/messages", { method: "POST", body: inWindow })).status, 200, "in-window body stays direct");
+        assert.deepEqual(sink.slice(1), ["http://127.0.0.1:8199/v1/messages"], "only the in-window send reaches the provider");
+    } finally {
+        globalThis.fetch = saved;
+        _resetForTest();
+    }
+});
+
+test("install: an empty-slot body over the window fails OPEN until a lane has stamped one (#5996 cold start)", async () => {
+    const saved = globalThis.fetch;
+    _resetForTest();
+    const sink: string[] = [];
+    globalThis.fetch = fakeFetch(sink);
+    try {
+        // No headersFor → nothing ever stamps the last-known window → cold start.
+        const state: NativeInterceptState = { origin: "http://127.0.0.1:40922", ready: Promise.resolve("http://127.0.0.1:40922") };
+        assert.equal(installNativeFetchIntercept(state), true);
+        liveStateSlotEffect(state)()();
+        // Same 4 MiB shape as above: under the byte cap, over any real window —
+        // but with no window ever seen the fix must NOT invent a refusal; it fails
+        // open to today's byte-cap-only semantics (direct 200).
+        const res = await globalThis.fetch("http://127.0.0.1:8199/v1/messages", { method: "POST", body: "x".repeat(4 * 1024 * 1024) });
+        assert.equal(res.status, 200, "cold start fails open: no window → byte-cap-only direct path");
+        assert.deepEqual(sink, ["http://127.0.0.1:8199/v1/messages"]);
+    } finally {
+        globalThis.fetch = saved;
+        _resetForTest();
+    }
+});
+
+test("install: an empty-slot refusal names a >=1M resolved window verbatim (#5996)", async () => {
+    const saved = globalThis.fetch;
+    _resetForTest();
+    const sink: string[] = [];
+    globalThis.fetch = fakeFetch(sink);
+    try {
+        // Resolved window at/above the 1M floor: declaredWindow === window, so
+        // the refusal must name it as THE window (the short form), not as a
+        // floored local bar — the sibling fallbackOversizeRefusal distinction.
+        const state: NativeInterceptState = {
+            origin: "http://127.0.0.1:40923",
+            ready: Promise.resolve("http://127.0.0.1:40923"),
+            headersFor: () => ({ "x-bili-plugin-context-window": "2000000" }),
+        };
+        assert.equal(installNativeFetchIntercept(state), true);
+        assert.equal((await globalThis.fetch("http://127.0.0.1:8199/v1/messages", { method: "POST", body: "{}" })).status, 200);
+        liveStateSlotEffect(state)()();
+        // 7.5 MiB < 8 MiB cap, ~2.24M est tokens > the 2M resolved window.
+        const res = await globalThis.fetch("http://127.0.0.1:8199/v1/messages", { method: "POST", body: "x".repeat(7.5 * 1024 * 1024) });
+        assert.equal(res.status, 422);
+        assert.equal(res.headers.get("x-bili-gate"), "oversize-refusal-no-live-state");
+        const j = (await res.json()) as { error?: { message: string } };
+        assert.match(j.error?.message ?? "", /2,000,000/, "names the resolved window");
+        assert.doesNotMatch(j.error?.message ?? "", /local bar/, "a >=1M resolved window is named as the window, not the floored bar");
+    } finally {
+        globalThis.fetch = saved;
+        _resetForTest();
+    }
+});
+
 test("the silent-direct ceiling defaults to 8 MiB and honors BILI_SILENT_DIRECT_MAX_MB (#5405 follow-up, #5826 review)", async () => {
     const savedEnv = process.env.BILI_SILENT_DIRECT_MAX_MB;
     const saved = globalThis.fetch;

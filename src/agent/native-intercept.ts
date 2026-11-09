@@ -697,9 +697,30 @@ function compactionDirectRefusal(url: string): Response {
  *  protocol-shaped 422 (not a throw) so the host treats it as a policy
  *  refusal of one request; the slot normally rebinds on the next activation,
  *  so retryable:true is honest. */
-function emptySlotOversizeRefusal(url: string): Response {
+/** #5996: the empty-slot refusal now has TWO bases. The original one (#5405) is
+ *  the byte ceiling; the added one is a token-window doom priced against the
+ *  last window a lane resolved in this process — a sub-ceiling body whose core
+ *  text prices over that window would 400 upstream uncompressed, so refuse it
+ *  here instead. Same 422 policy-refusal class, same retryable remedy (the slot
+ *  rebinds on the next activation); only the stated basis differs. */
+function emptySlotOversizeRefusal(
+    url: string,
+    doom?: NonNullable<ReturnType<typeof bodyOverWindowDetail>>,
+): Response {
+    // Same declared-vs-bar distinction as fallbackOversizeRefusal (#4079): the
+    // doom prices against max(resolved, 1M floor), so when the resolved window
+    // is below the floor, naming the BAR as if the lane had resolved it would
+    // misstate the model's real window.
+    const barNote = doom === undefined
+        ? ""
+        : doom.declaredWindow === doom.window
+          ? `against the ${doom.window.toLocaleString("en-US")} token window the active lane resolved`
+          : `against the ${doom.window.toLocaleString("en-US")} token local bar (${doom.declaredWindow.toLocaleString("en-US")} resolved by the active lane; the bar never assumes below ${MIN_ASSUMED_WINDOW_TOKENS.toLocaleString("en-US")}, #4079)`;
+    const basis = doom === undefined
+        ? "this model request is larger than the silent-direct byte ceiling"
+        : `this model request's core text prices at ~${doom.estTokens.toLocaleString("en-US")} tokens (optimistic floor ${doom.floorTokens.toLocaleString("en-US")}) ${barNote}`;
     const message =
-        "billion-context refused this request locally: the native interceptor's live-state slot is empty (the plugin is between activations or was deactivated), and this model request is larger than the silent-direct byte ceiling — forwarding it would send the prompt to the provider uncompressed (#5405). " +
+        "billion-context refused this request locally: the native interceptor's live-state slot is empty (the plugin is between activations or was deactivated), and " + basis + " — forwarding it would send the prompt to the provider uncompressed (#5405/#5996). " +
         "The slot normally rebinds on the next plugin activation; retry shortly. If it persists, restart the host so the interceptor can rebind.";
     const headers = { "content-type": "application/json", "x-bili-gate": "oversize-refusal-no-live-state" };
     if (url.endsWith("/messages")) {
@@ -806,6 +827,35 @@ function declaredWindowFromHeaders(input: string | URL | Request, init: RequestI
     if (value === undefined) return undefined;
     const n = Number(value);
     return Number.isFinite(n) && n > 0 ? Math.floor(n) : undefined;
+}
+
+/** #5996: the empty-slot branch has NO state and NO stamped header to resolve
+ *  the model window from (headersFor only runs on the proxy branch, #4894), so
+ *  a body under the 8 MiB byte cap but over the token window sailed through raw
+ *  and 400'd upstream (#5996: a CJK-heavy 6.7 MiB / ~2.1M-token body < 8 MiB yet
+ *  far past a 1M window). The one window source available process-wide is the
+ *  LAST value any lane resolved while routing normally — captured here from
+ *  headersFor output on every successful proxy route, which is precisely the
+ *  steady state that precedes a slot-empties event. Undefined until first seen:
+ *  cold start then fails open to today's byte-cap-only semantics. */
+let lastKnownContextWindow: number | undefined;
+
+/** #5996: remember a resolved context window for the empty-slot doom check.
+ *  Most-recent-valid wins across model switches; an invalid value leaves the
+ *  previous one intact. */
+function noteResolvedContextWindow(n: number | undefined): void {
+    if (n === undefined) return;
+    const v = Number(n);
+    if (Number.isFinite(v) && v > 0) lastKnownContextWindow = Math.floor(v);
+}
+
+/** #5996: remember a window that headersFor stamped onto a routed request's
+ *  outgoing headers; a missing/invalid header leaves the previous value intact. */
+function captureStampedWindow(headers: Record<string, string> | undefined): void {
+    if (headers === undefined) return;
+    const v = headers[CONTEXT_WINDOW_HEADER];
+    if (v === undefined) return;
+    noteResolvedContextWindow(Number(v));
 }
 
 /** #4516: measure what a direct send would actually put on the wire — byte
@@ -1356,6 +1406,21 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
                     logHostEvent("error", "[native-client]", `bili-native: intercept state missing — refusing oversized direct model request (${size.toLocaleString("en-US")} B > ${cap.toLocaleString("en-US")} B) with a local 422; the slot will rebind on the next activation (#5405/#5408)`);
                     return emptySlotOversizeRefusal(url);
                 }
+                // #5996: the byte cap alone cannot catch a sub-ceiling body that
+                // still prices over the model's token window (a CJK-heavy 6.7 MiB
+                // body is ~2.1M tokens yet under 8 MiB). Run the SAME window-aware
+                // doom the degraded path uses, against the last window a lane
+                // resolved in this process. No window ever seen (cold start) →
+                // skip: fail open to today's byte-cap-only semantics. The body is
+                // ≤ cap here, so buffering it for the media walk is bounded.
+                if (lastKnownContextWindow !== undefined && size !== undefined) {
+                    const measured = await directSendBodyMeasure(input, init);
+                    const doom = bodyOverWindowDetail(measured?.bytes ?? size, measured?.raw, lastKnownContextWindow);
+                    if (doom !== undefined) {
+                        logHostEvent("error", "[native-client]", `bili-native: intercept state missing — refusing oversized direct model request LOCALLY instead of letting it 400 upstream (core text est ~${doom.estTokens.toLocaleString("en-US")} tok, optimistic floor ${doom.floorTokens.toLocaleString("en-US")} tok${doom.mediaBytes > 0 ? `, media ${doom.mediaBytes.toLocaleString("en-US")} B excluded` : ""}, vs ${doom.window.toLocaleString("en-US")} tok window); the slot will rebind on the next activation (#5996)`);
+                        return emptySlotOversizeRefusal(url, doom);
+                    }
+                }
                 const seq = g[ACTIVE_STATE_SEQ];
                 if (lastMissingStateLogSeq !== seq) {
                     lastMissingStateLogSeq = seq;
@@ -1506,6 +1571,7 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
             // for nothing); unreadable body / body that fits once media is
             // excluded → fail open, exactly like the gate arms.
             const declaredWindow = declaredWindowFromHeaders(defaultInput, init) ?? state.declaredWindowForDirect?.();
+            noteResolvedContextWindow(declaredWindow); // #5996: feed the empty-slot doom check
             const measured = declaredWindow === undefined
                 ? undefined
                 : prep.outcome === "restored"
@@ -1601,6 +1667,7 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
             // only in where their ids are captured (pfChannel.pfCaptureIds).
             const pfExtra = pfChannel.pfRequestHeaders(outgoingHeadersOf(input, init) ?? {});
             const allExtra = { ...(routedExtra ?? {}), ...pfExtra };
+            captureStampedWindow(allExtra); // #5996: remember this lane's resolved window
             let target = url;
             const baked = new URL(url);
             if (replacedOrigins.has(baked.origin)) {
@@ -1850,6 +1917,7 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
         // rewrite path is where attach-mode hosts (and the V1 fetch patch)
         // ride the proxy without a settings overlay.
         const branchExtra = { ...(state.headersFor?.(url) ?? {}), ...pfChannel.pfRequestHeaders(outgoingHeadersOf(input, init) ?? {}), ...(resignExtra ?? {}) };
+        captureStampedWindow(branchExtra); // #5996: remember this lane's resolved window
         try {
             const stamped = withHeaders(first, init, branchExtra);
             const resp = await send(stamped.input, stamped.init);
@@ -1936,6 +2004,7 @@ export function _resetForTest(opts: { anchor?: typeof globalThis.fetch } = {}): 
     delete g[ACTIVE_STATE_SEQ];
     signedDirectSeen.clear();
     lastMissingStateLogSeq = Symbol("unset");
+    lastKnownContextWindow = undefined;
     respawnCooldownOverrideMs = undefined;
     resetFetchChainForTest(opts);
 }
