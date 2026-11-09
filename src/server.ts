@@ -4427,7 +4427,17 @@ export async function preflightCompressIfNeeded(
                     log("info", `[${session.id}] auto-fold steady state: payload fits and no foldable candidates remained — forwarding as-is without backoff (#2638)`);
                 }
             } else {
-                log("warn", `[${session.id}] preflight made no progress but the payload fits; forwarding as-is`);
+                // #5907 facet 3: this exact branch is where an UNATTRIBUTED chain burns
+                // its turn silently — the request carried no conversation identity, so
+                // bili minted a pfa-* chain whose window came from the static ladder
+                // (table / registry / configured / default), never a host report; the
+                // fit verdict rests on the optimistic estimate; and the forward then
+                // dies upstream (400 / stream silence) with nothing in the log naming
+                // the class. An on-site operator reading only bili.log could not tell
+                // "mis-sized anonymous window" from a healthy fit-forward without an
+                // external probe. Name it in the one line they already grep for —
+                // identified sessions keep the original wording verbatim.
+                log("warn", `[${session.id}] preflight made no progress but the payload fits; forwarding as-is${anonymous ? " — unattributed chain (no conversation identity in this request's headers): the effective window came from bili's static ladder, not a host report, and may be mis-sized for the model actually served; if this turn 400s or stalls upstream, make the sending path carry the identity headers so the turn attaches to the real session (#5907)" : ""}`);
             }
         } else if (growthArmed && !queueDroppedAll && result.savedTokens < AUTO_FOLD_MIN_BENEFIT_TOKENS) {
             // [#3444] sub-benefit fold: a full external-summary round trip saved
@@ -4780,6 +4790,17 @@ function formatBytes(n: number): string {
 // ~3k msgs. Wall clock IS the cost; the info line above keeps reporting the
 // count for correlation.
 const SLOW_SESSION_MS_WARN = 1000;
+// #5907 follow-up: the warn fires ONCE per session per process — a 3k-msg
+// session exceeds the wall budget on EVERY turn, so re-logging each turn
+// floods the log while adding nothing; the first occurrence carries the full
+// size picture (msgs + inbound + est tokens) plus the cleanup command. The
+// map is bounded: past the cap the earliest-warned session is evicted so a
+// long-lived proxy with many sessions cannot grow it without bound.
+const SLOW_SESSION_WARNED = new Map<string, number>();
+const MAX_SLOW_SESSION_WARNED = 512;
+export function _resetSlowSessionWarnedForTest(): void {
+    SLOW_SESSION_WARNED.clear();
+}
 export function logRequestCost(log: (level: string, msg: string) => void, sessionId: string, msgs: number | null, inboundBytes: number, t0: number, outbound?: string | Buffer): void {
     const ms = Math.max(0, Math.round(performance.now() - t0));
     const outboundField = outbound !== undefined ? `, outbound=${formatBytes(Buffer.byteLength(outbound))}` : "";
@@ -4788,8 +4809,17 @@ export function logRequestCost(log: (level: string, msg: string) => void, sessio
     // #5408: this line is THE observation point — a hot-at-attach session that
     // never produces one is silent compression loss (the incident signature).
     noteRequest(sessionId);
-    if (ms > SLOW_SESSION_MS_WARN) {
-        log("warn", `[${sessionId}] slow-session: ${msgs ?? "?"} msgs / inbound=${formatBytes(inboundBytes)} took local=${ms}ms — synchronous per-turn work is starving the event loop (#4528/#5744); consider closing/restarting the session or enabling compression`);
+    if (ms > SLOW_SESSION_MS_WARN && !SLOW_SESSION_WARNED.has(sessionId)) {
+        SLOW_SESSION_WARNED.set(sessionId, ms);
+        while (SLOW_SESSION_WARNED.size > MAX_SLOW_SESSION_WARNED) {
+            const oldest = SLOW_SESSION_WARNED.keys().next().value;
+            if (oldest === undefined) break;
+            SLOW_SESSION_WARNED.delete(oldest);
+        }
+        // bytes/4 is the repo-wide optimistic token floor (same caliber as the
+        // oversize gates) — labeled est because JSON overhead skews it high.
+        const estTok = Math.round(inboundBytes / 4);
+        log("warn", `[${sessionId}] slow-session: ${msgs ?? "?"} msgs / inbound=${formatBytes(inboundBytes)} (~${estTok} est tok) took local=${ms}ms — synchronous per-turn work is starving the event loop (#4528/#5744); the session has grown large — consider \`bili sessions rm ${sessionId}\` or enabling compression (#5907)`);
     }
 }
 
