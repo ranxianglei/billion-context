@@ -1638,7 +1638,7 @@ export function parseHermesYaml(text: string): HermesConfig {
                 // hermes accepts base_url / url / api (priority order) — collect
                 // all and resolve after the scan.
                 const apiMatch = /^(base_url|url|api):\s*(\S+)/.exec(trimmed);
-                if (apiMatch) candidates.set(`${current}\u0000${apiMatch[1]}`, apiMatch[2]);
+                if (apiMatch) candidates.set(`${current}\u0000${apiMatch[1]}`, unquote(apiMatch[2]));
             }
         } else {
             // Legacy list: "- name: x" opens an entry; nested base_url/api/url lines.
@@ -1649,10 +1649,10 @@ export function parseHermesYaml(text: string): HermesConfig {
                 current = nameMatch ? nameMatch[1] : `custom-${++anonCount}`;
                 if (!result.providers[current]) result.providers[current] = {};
                 const inlineUrl = /^(?:base_url|api|url):\s*(\S+)/.exec(dashMatch[1]);
-                if (inlineUrl) result.providers[current].api = inlineUrl[1];
+                if (inlineUrl) result.providers[current].api = unquote(inlineUrl[1]);
             } else if (current) {
                 const urlMatch = /^(?:base_url|api|url):\s*(\S+)/.exec(trimmed);
-                if (urlMatch) result.providers[current].api = urlMatch[1];
+                if (urlMatch) result.providers[current].api = unquote(urlMatch[1]);
             }
         }
     }

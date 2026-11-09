@@ -4204,6 +4204,21 @@ test("parseHermesYaml: top-level base_url next to provider: is the stock config 
     assert.deepEqual(Object.keys(dup.providers).sort(), ["alpha"]);
 });
 
+test("parseHermesYaml: quoted endpoint values survive (new URL() rejects quotes)", () => {
+    const q = parseHermesYaml([
+        "providers:",
+        "  bili:",
+        '    base_url: "http://127.0.0.1:8199/v1"',
+        "custom_providers:",
+        "  - name: sg",
+        "    url: 'http://s:1/v1'",
+        '  - api: "http://inline:1/v1"',
+    ].join("\n"));
+    assert.equal(q.providers.bili?.api, "http://127.0.0.1:8199/v1", "dict nested, double-quoted");
+    assert.equal(q.providers.sg?.api, "http://s:1/v1", "list nested, single-quoted");
+    assert.equal(q.providers["custom-1"]?.api, "http://inline:1/v1", "list inline, double-quoted");
+});
+
 test("readHermesConfig + resolveHermesHome", () => {
     assert.equal(resolveHermesHome({ HERMES_HOME: "/tmp/hh" }), "/tmp/hh");
     assert.ok(resolveHermesHome({}).endsWith(path.join(".hermes")));
