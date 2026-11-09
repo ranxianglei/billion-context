@@ -1213,7 +1213,7 @@ export class PrefixAffinityResolver {
             //  malformed list degrades the entry to exact-hash resolution.
             let sketches: string[] | undefined;
             if (hv === 2 && Array.isArray(e.sketches)) {
-                const valid = e.sketches as unknown[];
+                const valid: unknown[] = Array.from(e.sketches);
                 if (valid.every((s): s is string => typeof s === "string" && /^[0-9a-f]{16}$/.test(s)) &&
                     valid.length >= ALIGN_MIN_DEPTH) sketches = valid.slice(0, SKETCH_MAX_DEPTH);
             }
@@ -1222,7 +1222,7 @@ export class PrefixAffinityResolver {
             //  simhash rung skips it, exact-hash resolution still works).
             let userFlags: boolean[] | undefined;
             if (sketches !== undefined && Array.isArray(e.userFlags)) {
-                const validU = e.userFlags as unknown[];
+                const validU: unknown[] = Array.from(e.userFlags);
                 if (validU.every((u): u is boolean => typeof u === "boolean") &&
                     validU.length > 0) userFlags = validU.slice(-MAX_STORED_ITEMS);
             }

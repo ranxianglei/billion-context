@@ -48,3 +48,18 @@ test("valid positional carriers round-trip unchanged", () => {
     assert.equal(restored.importSnapshot([snapshot]), 1);
     assert.deepEqual(restored.exportSnapshot(), [snapshot]);
 });
+
+test("sparse positional carriers are rejected without skipping their holes", () => {
+    const { snapshot } = seed();
+    const sketches = [...snapshot.sketches!];
+    delete sketches[4];
+    const restored = new PrefixAffinityResolver();
+    restored.importSnapshot([{ ...snapshot, sketches }]);
+    assert.equal(restored.exportSnapshot()[0]!.sketches, undefined);
+
+    const userFlags = [...snapshot.userFlags!];
+    delete userFlags[3];
+    restored.importSnapshot([{ ...snapshot, userFlags }]);
+    assert.deepEqual(restored.exportSnapshot()[0]!.sketches, snapshot.sketches);
+    assert.equal(restored.exportSnapshot()[0]!.userFlags, undefined);
+});
