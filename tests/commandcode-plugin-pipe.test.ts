@@ -79,6 +79,59 @@ test("plugin JSONL pipe: clean prose survives to a terminal finish; unresolvable
     assert.equal(lines[1], finish, "finish passes byte-verbatim");
 });
 
+test("plugin JSONL pipe: a render tag split across deltas is stripped as one unit", async () => {
+    // The tag-echo filter's held state must survive delta boundaries — a per-line
+    // flush would release the held tail mid-tag and leak the ref into prose.
+    const finish = JSON.stringify({ type: "finish", finishReason: "stop" });
+    const { res, out } = makeCollector();
+    await pipePluginJsonlWithStrip(jsonlStream([
+        JSON.stringify({ type: "text-delta", text: `hi ${LT}acp tokens="2" type="text">m0` }),
+        JSON.stringify({ type: "text-delta", text: `0001${LT}/acp> there` }),
+        finish,
+    ]), res);
+    const o = out();
+    assert.ok(!o.includes(`${LT}acp`), "no tag fragment leaks to the client");
+    assert.ok(!o.includes("m00001"), "the ref body never reaches visible prose");
+    const lines = o.split("\n").filter((l) => l.length > 0);
+    const text = lines
+        .map((l) => { try { return (JSON.parse(l) as { type?: string; text?: string }).text ?? ""; } catch { return ""; } })
+        .join("");
+    assert.equal(text, "hi  there", "tag stripped as a unit across the delta boundary");
+    assert.equal(lines[lines.length - 1], finish, "finish last, byte-verbatim");
+});
+
+test("plugin JSONL pipe: a held prose prefix survives to the terminal frame", async () => {
+    // A non-ASCII marker-like prefix is held by the forged-marker state machine
+    // waiting for the next chunk; at the terminal frame it must be released to
+    // the client (content preservation), not dropped with the flush.
+    const finish = JSON.stringify({ type: "finish", finishReason: "stop" });
+    const { res, out } = makeCollector();
+    await pipePluginJsonlWithStrip(jsonlStream([
+        JSON.stringify({ type: "text-delta", text: "\u{1F4E6} [" }),
+        finish,
+    ]), res);
+    const lines = out().split("\n").filter((l) => l.length > 0);
+    const text = lines
+        .map((l) => { try { return (JSON.parse(l) as { type?: string; text?: string }).text ?? ""; } catch { return ""; } })
+        .filter((t) => t.length > 0)
+        .join("");
+    assert.ok(text.includes("\u{1F4E6} ["), "held prefix written back before the terminal frame");
+    assert.equal(lines[lines.length - 1], finish, "finish still last");
+});
+
+test("plugin JSONL pipe: a forged marker completed across deltas is fully stripped", async () => {
+    const finish = JSON.stringify({ type: "finish", finishReason: "stop" });
+    const { res, out } = makeCollector();
+    await pipePluginJsonlWithStrip(jsonlStream([
+        JSON.stringify({ type: "text-delta", text: "\u{1F4E6} [" }),
+        JSON.stringify({ type: "text-delta", text: "ACP] fake compression." }),
+        finish,
+    ]), res);
+    const o = out();
+    assert.ok(!o.includes("[ACP]"), "marker head never relayed");
+    assert.ok(!o.includes("fake compression"), "completed forged marker stripped, not leaked as prose");
+});
+
 test("plugin JSONL pipe: read failure mid-stream synthesizes an in-band truncation event", async () => {
     const enc = new TextEncoder();
     const stream = new ReadableStream<Uint8Array>({
