@@ -1559,10 +1559,12 @@ export function readOmpConfig(ompHome: string): OmpConfig {
 }
 
 /** Minimal line-based YAML reader for hermes config.yaml: collects provider
- *  entries from the v12 `providers:` dict (provider key -> `api:` url) and the
- *  legacy `custom_providers:` list (- name: ... / base_url: ...). Anything
- *  else in the file is ignored — only name -> endpoint URL pairs matter for
- *  launcher route discovery. */
+ *  entries from the v12 `providers:` dict (provider key -> `api:` url), the
+ *  legacy `custom_providers:` list (- name: ... / base_url: ...), and the stock
+ *  top-level `base_url`/`url`/`api` next to `provider:` (#6022 — the active
+ *  provider's endpoint when no providers entry covers it). Anything else in the
+ *  file is ignored — only name -> endpoint URL pairs matter for launcher route
+ *  discovery. */
 export function parseHermesYaml(text: string): HermesConfig {
     const result: HermesConfig = { providers: {} };
     const candidates = new Map<string, string>();
@@ -1572,6 +1574,22 @@ export function parseHermesYaml(text: string): HermesConfig {
     let entryIndent = -1;
     let current: string | null = null;
     let anonCount = 0;
+    // YAML scalars may be quoted; the launcher feeds endpoint values straight into
+    // new URL(), which rejects surrounding quotes (Invalid URL) and the entry
+    // would be silently skipped. Strip them where captured.
+    const unquote = (v: string): string => v.replace(/^["']|["']$/g, "");
+    // Top-level endpoint keys (#6022): first occurrence per key wins, resolved
+    // base_url > url > api like per-provider entries.
+    const topLevel: Partial<Record<"base_url" | "url" | "api", string>> = {};
+    let activeProvider = "";
+    const captureTopLevel = (line: string): void => {
+        if (!activeProvider) {
+            const pm = /^provider:\s*["']?([A-Za-z0-9_.-]+)/.exec(line);
+            if (pm) activeProvider = pm[1];
+        }
+        const um = /^(base_url|url|api):\s*(\S+)/.exec(line);
+        if (um && !(um[1] in topLevel)) topLevel[um[1] as "base_url" | "url" | "api"] = unquote(um[2]);
+    };
     for (const rawLine of text.split(/\r?\n/)) {
         const trimmed = rawLine.trim();
         if (!trimmed || trimmed.startsWith("#")) continue;
@@ -1587,9 +1605,12 @@ export function parseHermesYaml(text: string): HermesConfig {
                 sectionIndent = indent;
                 entryIndent = -1;
                 current = null;
+            } else if (indent === 0) {
+                captureTopLevel(trimmed);
             }
             continue;
         }
+
         if (indent <= sectionIndent) {
             // Left the section — re-evaluate this line for a new section start.
             mode = "none";
@@ -1602,6 +1623,8 @@ export function parseHermesYaml(text: string): HermesConfig {
             } else if (/^custom_providers:\s*(#.*)?$/.test(trimmed)) {
                 mode = "list";
                 sectionIndent = indent;
+            } else if (indent === 0) {
+                captureTopLevel(trimmed);
             }
             continue;
         }
@@ -1636,6 +1659,20 @@ export function parseHermesYaml(text: string): HermesConfig {
     for (const name of Object.keys(result.providers)) {
         const pick = candidates.get(`${name}\u0000base_url`) ?? candidates.get(`${name}\u0000url`) ?? candidates.get(`${name}\u0000api`);
         if (pick !== undefined) result.providers[name].api = pick;
+    }
+    // Stock shape (#6022): a top-level base_url/url/api next to provider: is the
+    // active provider's endpoint when its own entry is absent. Both shapes may
+    // coexist in one file — keep both hosts routable rather than guessing which
+    // wins (a missing whitelist entry means blind-tunneled, uncompressed traffic).
+    const topLevelUrl = topLevel.base_url ?? topLevel.url ?? topLevel.api;
+    if (topLevelUrl !== undefined) {
+        const covered = Object.values(result.providers).some((p) => p.api === topLevelUrl);
+        if (!covered) {
+            const taken = new Set(Object.keys(result.providers));
+            let name = activeProvider && !taken.has(activeProvider) ? activeProvider : "top-level";
+            while (taken.has(name)) name += "-x";
+            result.providers[name] = { api: topLevelUrl };
+        }
     }
     return result;
 }
