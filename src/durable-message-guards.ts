@@ -313,38 +313,6 @@ export function dshImageHandlePath(msg: CoreMessage): string | undefined {
         : undefined;
 }
 
-/** dsh image-offload placeholder (#6021, production evidence 2026-11-09):
- *  when DSH's compaction-image-offload rewrites an OLD message's inline image
- *  to fit the route's request budget, the cell's text becomes "[image omitted
- *  to fit request image limits; "NAME" (sha256:…). Normalized copy …]" — or,
- *  on text-only routes, "[image omitted because this model accepts text only;
- *  attachment sha256:…]" (offloadedImageText, @deepseek-ai/dsh-compaction-
- *  image-offload). The rewrite changes the cell's content identity, so bili
- *  re-ingests it as NEW content: fresh ref number, fresh storage sequence and
- *  timestamp — a two-day-old message that now sits at the TAIL of the resent
- *  history. Unclassified, it is a plain user-role text message: once
- *  everything after the newest human request has folded away, that stale prose
- *  is the last visible user message, wins the Rule-3 last-user anchor (#5109)
- *  and gets pinned into the protected zone — the model then answers the stale
- *  topic for the whole turn (the #6021 repro). #5752 shipped the sibling live
- *  handle knowing this slot would next carry this placeholder and deliberately
- *  left it unclassified — this family is that deferral now carrying production
- *  traffic. SUBSTRING match on purpose, unlike the prefix families above: the
- *  placeholder opens the rewritten cell only when the original message was
- *  image-only — a [text, image] message keeps its prose AFTER the "]" tail, so
- *  a prefix match misses the spliced shape (m03269 in the #6021 evidence).
- *  Both route variants share one path (same emitter, same lane, same failure
- *  mode). One-shot like the live handle: the rewritten cell never returns in
- *  its old form, retirement accounted via oneShotCarrierPaths. A literal user
- *  echo of the phrase is benign in both directions (slot exclusion only, stays
- *  foldable). #2766: assistant-role messages are never carriers. */
-export function dshImageOffloadPlaceholderPath(msg: CoreMessage): string | undefined {
-    return msg.role !== "assistant" && msg.contentType === "text" && typeof msg.text === "string" &&
-        (msg.text.includes("image omitted to fit request image limits;") || msg.text.includes("image omitted because this model accepts text only;"))
-        ? "oneshot/image-offload-placeholder"
-        : undefined;
-}
-
 /** Case-insensitive ASCII prefix check over the first needle.length chars —
  *  mirrors the asciiCI convention of src/server.ts (kept local so this
  *  module stays dependency-free). */
@@ -360,8 +328,8 @@ function startsWithAsciiCI(hay: string, needle: string): boolean {
     return true;
 }
 
-/** dsh lane classifier: any of the twelve evidence-backed identities → its
- *  canonical path (four durable carriers + eight foldable one-shot injections).
+/** dsh lane classifier: any of the eleven evidence-backed identities → its
+ *  canonical path (four durable carriers + seven foldable one-shot injections).
  *  Every classified message loses Rule-3 last-user anchor eligibility (#5109/
  *  #5173); only `durable/*` paths are actually pinned by the default policy —
  *  the oneshot/ families ride here purely so an injection can never displace
@@ -378,8 +346,7 @@ function dshDurableToolPath(msg: CoreMessage): string | undefined {
         dshMnemonPath(msg) ??
         dshSubagentSettledPath(msg) ??
         dshAgentRelayPath(msg) ??
-        dshImageHandlePath(msg) ??
-        dshImageOffloadPlaceholderPath(msg)
+        dshImageHandlePath(msg)
     );
 }
 
@@ -437,16 +404,15 @@ export const oneShotCarrierPaths: Record<string, DurableMessageClassifier> = {
         dshMnemonPath(msg) ??
         dshSubagentSettledPath(msg) ??
         dshAgentRelayPath(msg) ??
-        dshImageHandlePath(msg) ??
-        dshImageOffloadPlaceholderPath(msg),
+        dshImageHandlePath(msg),
 };
 
 /** #5142: raw-content pre-filter markers for the stored-row backfill — the
- *  exact marker strings of the twelve dsh classifiers above (fourteen markers:
- *  the mnemon and image-offload-placeholder families contribute two each), so
- *  a unified-store row can be screened with cheap substring checks BEFORE
- *  JSON.parse (rows may carry megabytes of base64 media). Lockstep with the
- *  classifiers is enforced in tests/issue5142-expected-rebase.test.ts. */
+ *  exact marker strings of the eleven dsh classifiers above (twelve markers:
+ *  the mnemon family contributes two), so a unified-store
+ *  row can be screened with cheap substring checks BEFORE JSON.parse (rows
+ *  may carry megabytes of base64 media). Lockstep with the classifiers is
+ *  enforced in tests/issue5142-expected-rebase.test.ts. */
 export const dshCarrierRawMarkers: readonly string[] = [
     "\x3cavailable_skills\x3e",
     "Instructions from:",
@@ -460,6 +426,4 @@ export const dshCarrierRawMarkers: readonly string[] = [
     "Background subagent ",
     " sent a message: ",
     "; request preview ",
-    "image omitted to fit request image limits;",
-    "image omitted because this model accepts text only;",
 ];
