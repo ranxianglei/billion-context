@@ -505,7 +505,7 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
         return;
     }
 
-    // Cooperative plugin protocol (see src/plugin.ts + PLUGIN.md): the
+    // Cooperative plugin protocol (see src/plugin.ts + docs/plugin-protocol.md): the
     // manifest serves the exact tool schemas the wire injector uses, and the
     // tool endpoint lets an agent-side plugin execute compress/decompress/
     // search_context/acp_status against the session the plugin drives. Both
@@ -602,7 +602,7 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
     // #3901/#3463: unified-storage GC — age-sweep archive + zero-ref
     // collection + optional vacuum. Loopback-gated like every /__bili/
     // route; 501 in legacy mode (same discipline as /__bili/replicas).
-    // #3901 review: the documented form is `?vacuum=full` (CONFIGURATION.md /
+    // #3901 review: the documented form is `?vacuum=full` (docs/configuration.md /
     // issue spec), but exact-match routing dropped any query string — accept
     // both, query wins over body.
     if (req.method === "POST" && (req.url === "/__bili/storage/gc" || req.url?.startsWith("/__bili/storage/gc?"))) {
@@ -980,10 +980,12 @@ function handleConflictsClear(url: string, res: http.ServerResponse, log: (level
 
 // ---- #3719: web 更新/Updates tab actions ---------------------------------
 
-/** POST /__bili/update/check — force one registry check through the shared
- *  update options (same lock/throttle/proxy gates as the background loop).
- *  Always HTTP 200: an unwired process answers {ok:false, error} so the panel
- *  can show the string verbatim instead of failing the fetch. */
+/** POST /__bili/update/check — run ONE check-only registry pass through the
+ *  shared update options (#4791): full gate ladder, structured verdict
+ *  ({status, latest?, candidate?, note?}), NO download/install — installs
+ *  happen on /__bili/update/install. Always HTTP 200: an unwired process
+ *  answers {ok:false, error} so the panel can show the string verbatim
+ *  instead of failing the fetch. */
 async function handleUpdateCheck(res: http.ServerResponse): Promise<void> {
     if (!updateActionsAvailable()) {
         res.writeHead(200, { "content-type": "application/json" });

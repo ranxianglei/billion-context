@@ -1129,7 +1129,9 @@
         "minGrowthFloor": 20000,
         "minGrowthRatio": 0.45,
         "emergencyThresholdPct": 0.95,
-        "tier2GrowthMultiplier": 1.5
+        "tier2GrowthMultiplier": 1.5,
+        "requireUsageSampleForPressure": true,
+        "maxEstimateHoldRounds": 2
       },
       "promotionThreshold": 5,
       "truncate": {

@@ -204,6 +204,8 @@ export interface TruncationDiag {
     /** Upstream HTTP status / content-type of the original response, when the
      *  caller still holds them (plugin lane re-fetches lose them by design). */
     upstreamStatus?: number;
+    /** #5951: the failed read itself, named, on a cut the pipe could not replay. */
+    readError?: string;
     upstreamContentType?: string;
 }
 

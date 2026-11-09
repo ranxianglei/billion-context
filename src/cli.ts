@@ -685,7 +685,7 @@ export async function main(): Promise<void> {
                     packageName: PACKAGE_NAME,
                     resolveProxy: updaterResolveProxy,
                     updateTag,
-                    globalCheck: () => checkForUpdate({ packageName: PACKAGE_NAME, currentVersion: VERSION, autoUpdate: true, resolveProxy: updaterResolveProxy, updateTag }, true),
+                    globalCheck: async () => { await checkForUpdate({ packageName: PACKAGE_NAME, currentVersion: VERSION, autoUpdate: true, resolveProxy: updaterResolveProxy, updateTag }, true); },
                     log: (_level, msg) => console.log(msg),
                 });
                 for (const line of lines) console.log(line);

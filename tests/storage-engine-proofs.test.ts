@@ -72,6 +72,11 @@ process.env.BILI_IMAGE_RESCALE = "0";
 // RENDER/STORAGE shape, not observability — keep them free of the new field
 // (the shadow lane has its own suite, tests/snapshot-shadow.test.ts).
 process.env.BILI_SNAPSHOT_SHADOW = "0";
+// #4313 follow-up: message timestamps are ON by default now; the committed
+// render goldens this suite compares against were produced with the display
+// gate OFF (CI preload chain) — pin it here too so bare local runs stay
+// hermetic (#5402).
+process.env.BILI_MESSAGE_TIMESTAMPS = "0";
 
 
 // Same hermeticity contract as the corpus suites: a developer machine with
