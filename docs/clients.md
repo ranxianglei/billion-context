@@ -40,10 +40,15 @@ Two lanes, same plugin (#941):
   remove — user entries and comments survive, an emptied file gets its
   placeholder `[]` back. Run dsh once in each profile first so the profile
   dirs exist. The plugin spawns its own proxy at load (attaches to a healthy
-  one instead of doubling; parent-pid watchdog), rewrites model-API traffic
-  to `<proxy>/bili/<upstream-url>` via a global fetch patch, registers the
-  manifest tools verbatim, and gates plugin-mode headers on tool readiness
-  (round 1 rides wire mode). Opt-out: `BILI_NATIVE_DSH=0`. Remove with
+   one instead of doubling; parent-pid watchdog), rewrites model-API traffic
+   to `<proxy>/bili/<upstream-url>` via global fetch and Codex Responses
+   WebSocket patches (#5838), registers the manifest tools verbatim, and gates
+   plugin-mode headers on tool readiness. WS upgrades await registration and
+   carry DSH session/model headers; every `response.create` awaits attribution
+   and fork preparation. Cached sockets refuse sends after identity/model,
+   plugin activation, or proxy-origin changes, requiring reconnect (or the
+   provider's SSE fallback). Other WebSockets remain untouched. Opt-out:
+   `BILI_NATIVE_DSH=0`. Remove with
   `bili plugin remove dsh` or `dsh plugin --profile <name> remove
   billion-context` — both go through the same channel. Registry installs
   require a published release that carries `dsh.bundle.patch.yml`; use the
@@ -58,10 +63,11 @@ Two lanes, same plugin (#941):
   defaults to `transport: auto`, which prefers a direct WebSocket exchange —
   a successful WS round trip never calls fetch. Builds shipped before the
   WS-lane fix therefore never see those model requests: ACP tools answer 404
-  and nothing compresses until the context limit. On such builds set
-  `providers.openai-codex.transport` to `sse` (hot settings) so the traffic
-  rides the fetch leg; from the fix release onward the WebSocket leg is
-  intercepted and header-stamped automatically.
+   and nothing compresses until the context limit. On such builds set DSH's
+   existing `providers.openai-codex.transport` setting to `sse` (hot settings;
+   no new bili configuration key is needed) so the traffic rides the fetch
+   leg; from the fix release onward the WebSocket leg is intercepted and
+   header-stamped automatically.
 - **Boundary — third-party Codex transports:** plugins that build their OWN
   Codex WebSocket client bypass bili's intercepts by construction. Example
   found in the wild 2026-11-08: `dsh-codex-subscription` with
@@ -680,8 +686,8 @@ integration is the ceiling for v1). Launcher-only by design.
 
 Pi has a full native mode (`bili plugin install pi`, README quickstart
 option 1); this section covers what the one-line table can't — **which model
-transports the native intercept actually covers**. Pi is the only host that
-brings WebSocket model traffic into the loop.
+transports the native intercept actually covers**. DSH also intercepts Codex
+Responses WebSockets (#5838); its host-specific lifecycle is described above.
 
 **Sub-agent config (#2230).** The built-in `acp_delegate` surface (three
 delegate tools, roles, fleet inspector — wired by `bili pi` through the
