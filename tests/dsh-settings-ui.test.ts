@@ -2153,6 +2153,19 @@ test("#4254: shell.overlay upstream-unavailable pill polls /__bili/upstreams, re
     assert.ok(!mt.includes("×2 · 约"), "alert-only (circuit-null) host carries no retry ETA");
     mm.runCleanups();
 
+    // #6026: nextProbeInMs 0 means fail-fast already lifted (probe-eligible, and probes are
+    // request-driven — bili never auto-retries), so the row must NOT render a fake
+    // "约 1s 后重试" countdown; host/kind/tally stay visible.
+    const z = await mountOverlay([{ host: "desktop-dp:18200", kind: "connect-timeout", code: "UND_ERR_CONNECT_TIMEOUT", count: 3, circuit: { state: "open", nextProbeInMs: 0 } }]);
+    z.resetHooks();
+    z.component();
+    await tick();
+    const zt = textOf(z.component());
+    assert.ok(zt.includes("desktop-dp:18200"), "probe-eligible host still renders");
+    assert.ok(zt.includes("connect-timeout") && zt.includes("×3"), "kind + tally stay");
+    assert.ok(!/重试|retry/i.test(zt), "no retry-countdown wording for nextProbeInMs 0 (#6026)");
+    z.runCleanups();
+
     // Defensive parse: malformed entries degrade to fewer rows and never throw —
     // only the well-formed host survives into the banner.
     const g = await mountOverlay([

@@ -819,7 +819,7 @@ elif SCENARIO.startswith("mitm-"):
     os.makedirs(libdir, exist_ok=True)
     with open(os.path.join(libdir, "_bcminiyaml.py"), "w") as f:
         f.write(MINI_YAML_PARSER)
-    if kind in ("pyyaml", "parse"):
+    if kind in ("pyyaml", "parse", "top-level"):
         with open(os.path.join(libdir, "yaml.py"), "w") as f:
             f.write(YAML_STUB_SRC)
     if kind == "ruamel":
@@ -834,17 +834,47 @@ elif SCENARIO.startswith("mitm-"):
     if kind == "none":
         sys.modules["ruamel"] = None  # block the host's ruamel too — nothing may resolve on any host
     sys.path.insert(0, libdir)
-    cfg_text = (
-        "providers:\n"
-        "  openrouter:\n"
-        "    base_url: https://openrouter.ai/api/v1\n"
-        "  legacy:\n"
-        "    url: https://legacy.example.com/v1\n"
-    ) if kind != "parse" else "providers:\n  broken line without any colon\n"
-    with open(os.path.join(os.environ["HERMES_HOME"], "config.yaml"), "w") as f:
-        f.write(cfg_text)
+    if kind == "top-level":
+        # #6022: documented stock shape — top-level base_url next to provider:, no providers map.
+        with open(os.path.join(os.environ["HERMES_HOME"], "config.yaml"), "w") as f:
+            f.write(
+                "provider: nous\n"
+                "base_url: https://inference-api.example.com/v1\n"
+            )
+        out["tl_domains"] = mod.mitm_domains_from_config()
+        out["tl_pbu"] = {
+            "active": mod._provider_base_url("nous"),
+            "unnamed": mod._provider_base_url(None),
+            "other": mod._provider_base_url("other"),
+        }
+        # Mixed shape: per-provider entries win for their own name; top-level answers active/unnamed only.
+        with open(os.path.join(os.environ["HERMES_HOME"], "config.yaml"), "w") as f:
+            f.write(
+                "provider: alpha\n"
+                "providers:\n"
+                "  beta:\n"
+                "    base_url: https://beta.example.com/v1\n"
+                "base_url: https://alpha.example.com/v1\n"
+            )
+        out["mix_domains"] = mod.mitm_domains_from_config()
+        out["mix_pbu"] = {
+            "active": mod._provider_base_url("alpha"),
+            "named": mod._provider_base_url("beta"),
+            "missing": mod._provider_base_url("missing"),
+            "unnamed": mod._provider_base_url(None),
+        }
+    else:
+        cfg_text = (
+            "providers:\n"
+            "  openrouter:\n"
+            "    base_url: https://openrouter.ai/api/v1\n"
+            "  legacy:\n"
+            "    url: https://legacy.example.com/v1\n"
+        ) if kind != "parse" else "providers:\n  broken line without any colon\n"
+        with open(os.path.join(os.environ["HERMES_HOME"], "config.yaml"), "w") as f:
+            f.write(cfg_text)
+        out["mitm_domains"] = mod.mitm_domains_from_config()
     out["mitm_kind"] = kind
-    out["mitm_domains"] = mod.mitm_domains_from_config()
     out["mitm_warnings"] = list(WARNINGS)
 elif SCENARIO == "retry-recover":
     # #4644: attempt 1 hits a still-booting proxy; the backoff retry lands when it comes up.
@@ -1121,6 +1151,10 @@ interface DriverOut {
     mitm_kind?: string;
     mitm_domains?: string[];
     mitm_warnings?: string[];
+    tl_domains?: string[];
+    tl_pbu?: Record<string, string | null>;
+    mix_domains?: string[];
+    mix_pbu?: Record<string, string | null>;
     commands?: Record<string, string>;
     tools_after_reenable?: string[];
     state_after_reenable?: string;
@@ -1869,5 +1903,30 @@ describe("MITM-domain discovery (#2838)", () => {
         assert.equal(out!.mitm_warnings?.length, 1, "exactly one warning");
         assert.match(out!.mitm_warnings![0], /could not parse/);
         assert.match(out!.mitm_warnings![0], /blind-tunnel/);
+    });
+
+    // #6022: the documented stock shape is a top-level base_url next to provider: (no providers map) —
+    // it must be discovered, and _provider_base_url must answer it for the active/unnamed provider only.
+    test("top-level base_url: whitelisted AND scoped to the active provider", () => {
+        if (!PY) {
+            console.warn("skip: no python3/python interpreter on this machine (hermes requires Python 3.11+)");
+            return;
+        }
+        const { out, err } = runDriver("mitm-top-level");
+        assert.ok(out, err);
+        assert.deepEqual(out!.tl_domains, ["inference-api.example.com"]);
+        assert.deepEqual(out!.tl_pbu, {
+            active: "https://inference-api.example.com/v1",
+            unnamed: "https://inference-api.example.com/v1",
+            other: null,
+        });
+        assert.deepEqual(out!.mix_domains, ["beta.example.com", "alpha.example.com"]);
+        assert.deepEqual(out!.mix_pbu, {
+            active: "https://alpha.example.com/v1",
+            named: "https://beta.example.com/v1",
+            missing: null,
+            unnamed: "https://alpha.example.com/v1",
+        });
+        assert.deepEqual(out!.mitm_warnings, [], "happy path must not warn");
     });
 });

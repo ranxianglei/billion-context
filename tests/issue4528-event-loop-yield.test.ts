@@ -2,7 +2,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { performance } from "node:perf_hooks";
 import { yieldToEventLoop } from "../src/yield-loop.js";
-import { logRequestCost } from "../src/server.js";
+import { logRequestCost, _resetSlowSessionWarnedForTest } from "../src/server.js";
 
 // #4528: a large resent history makes bili run many O(messages) synchronous
 // passes back-to-back on Node's single main thread, starving every other
@@ -64,5 +64,24 @@ describe("#4528 logRequestCost slow-session guard", () => {
         logRequestCost(log, "sess-small", 500, 100_000, performance.now() - 40);
         assert.equal(lines.filter(([l]) => l === "warn").length, 0);
         assert.ok(lines.some(([l, m]) => l === "info" && m.includes("sess-small") && m.includes("500 msgs")));
+    });
+
+    it("warns only ONCE per session and carries the size picture plus the cleanup command (#5907)", () => {
+        _resetSlowSessionWarnedForTest();
+        const { lines, log } = capture();
+        logRequestCost(log, "sess-once", 3086, 26_100_000, performance.now() - 8000);
+        // The same session exceeds the wall budget on EVERY turn — the second
+        // slow turn must stay silent (the #5907 field shape: one line per
+        // turn of a long session).
+        logRequestCost(log, "sess-once", 3090, 26_200_000, performance.now() - 9000);
+        const warns = lines.filter(([l]) => l === "warn");
+        assert.equal(warns.length, 1, "second slow turn of the same session must not re-warn");
+        assert.match(warns[0][1], /slow-session: 3086 msgs/);
+        // 26_100_000 B / 4 = 6_525_000 est tok (the repo-wide optimistic floor).
+        assert.match(warns[0][1], /~6525000 est tok/);
+        assert.match(warns[0][1], /bili sessions rm sess-once/);
+        // A DIFFERENT session still gets its own first warning (#3617 both-ways).
+        logRequestCost(log, "sess-other", 2000, 8_000_000, performance.now() - 5000);
+        assert.equal(lines.filter(([l]) => l === "warn").length, 2, "another session keeps its own first warning");
     });
 });

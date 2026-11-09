@@ -12,6 +12,7 @@ import { STATUS_REPORT_CLOSE, STATUS_REPORT_OPEN } from "../acp-panel.js";
 import { credentialFingerprint, generationParamFp, handleAcpCache, lastForwardedBody, noteForwardedBody, noteForwardedImageFacts, settleUsageReport } from "../cache-ledger.js";
 import { billOutputUsage } from "../billing.js";
 import { maybeJudgeContinuity } from "../invariant-judge.js";
+import type { SeparatorSlot } from "../server/responses-ordering.js";
 import { countImagesInParsedBody, countImagesInRawBody } from "../image-tokens.js";
 import { diagnoseSuccessWithoutUsage, lastCompressSuffix, withSessionLock, type Session } from "../session.js";
 import type { BiliMessage } from "acp-kernel/wire";
@@ -243,6 +244,15 @@ export interface LoopCtx {
      *  of the pre-compress view (stale view = model sees zero effect + a
      *  finished deliverable → wraps up and stops). */
      refreshFolded?: (current: CoreMessage[]) => CoreMessage[] | Promise<CoreMessage[]>;
+    /** #564/#2627: producer-recorded ordering-separator slots for the CURRENT
+     *  round's body, read fresh for each continuity check. Round 2+ bodies are
+     *  built from the fold this loop just materialized, so their separators are
+     *  minted here rather than by prepare; without this the continuity judge
+     *  would read a newly added marker as a mid-insertion. */
+    separatorSlots?: () => readonly SeparatorSlot[] | undefined;
+    /** #564/#2627: the core list `separatorSlots` indexes into, as rendered into
+     *  this round's wire. Read together with the slots so the judge maps producer
+     *  identity to a final wire index instead of searching the array. */
     // Which wire protocol produced the usage the loop records. Needed to
     // compute the true context total correctly (Anthropic reports
     // input_tokens as NEW-only; OpenAI/Responses report the TOTAL).
@@ -304,7 +314,13 @@ type RoundPart =
 
 export type ParsedStreamEvent =
     | { kind: "text"; delta: string; raw?: Buffer }
-    | { kind: "reasoning"; delta: string; raw?: Buffer; signature?: string; blockEnd?: boolean }
+    // round2-hold: withheld marks a reasoning PAYLOAD the adapter kept off the
+    // client wire (bili-owned round ≥ 2 on a signing upstream — see
+    // ParseStreamOpts.upstreamSignsThinking). It still feeds the loop's
+    // accounting (re-request rebuild, stats) but must NEVER be forwarded: the
+    // adapter releases the real bytes itself, together with the signature, in
+    // one burst — so a truncation before that signature leaves no client state.
+    | { kind: "reasoning"; delta: string; raw?: Buffer; signature?: string; blockEnd?: boolean; withheld?: boolean }
     // #1960: Anthropic redacted_thinking arrives whole in content_block_start
     // (opaque base64 `data`). The loop must rebuild it byte-exact in position
     // on re-request — Anthropic rejects modified thinking-family blocks — so
@@ -362,13 +378,28 @@ export interface ExtractedTextTriggers {
     calls: ToolCallEmit[];
 }
 
+/**
+ * round2-hold: per-parse evidence the loop has about the upstream, handed to
+ * adapters that must decide whether a payload is replay-safe (this tree: the
+ * anthropic wire's signature-verified thinking).
+ *
+ * `upstreamSignsThinking` is true when the request's history carries a signed
+ * thinking block (the client replayed one) OR an earlier round of this same
+ * turn already observed a signature. Absent/false means "no evidence" — the
+ * adapter must then keep its legacy live-forward behavior: an unsigned relay
+ * has no signature contract to violate.
+ */
+interface ParseStreamOpts {
+    upstreamSignsThinking?: boolean;
+}
+
 export interface CompressLoopAdapter {
     buildRequest(
         coreMessages: CoreMessage[],
         systemPrompt: string,
         requestBody: Record<string, unknown>,
     ): Record<string, unknown>;
-    parseStream(upstream: ReadableStream<Uint8Array>, round: number): AsyncGenerator<ParsedStreamEvent>;
+    parseStream(upstream: ReadableStream<Uint8Array>, round: number, opts?: ParseStreamOpts): AsyncGenerator<ParsedStreamEvent>;
     emitText(delta: string): Buffer;
     emitReasoning?(delta: string): Buffer;
     emitToolCall(call: ToolCallEmit): Buffer;
@@ -556,13 +587,21 @@ export async function* runCompressLoop(
         // overwrites the slot; clipped/oversized bodies retain no full copy and
         // the continuity check silently skips (no false positives from partial
         // forensics). Advisory; never blocks.
-        const prevSentFull = lastForwardedBody(ctx.session)?.full ?? null;
+        const prevSent = lastForwardedBody(ctx.session);
+        const prevSentFull = prevSent?.full ?? null;
         // #3803: generation-parameter fingerprint from the full wire object (never the capped head) —
         // a host reasoning-effort / thinking-config flip re-partitions the provider cache namespace.
         noteForwardedBody(ctx.session, wireBodyStr, wireArr !== undefined ? wireArr.length : null, credentialFingerprint(requestOptions.headers), generationParamFp(wireObj));
-        if (prevSentFull) {
-            maybeJudgeContinuity(prevSentFull, wireBodyStr, ctx.protocol, ctx.session.id);
-        }
+        // #564/#2627: provenance is resolved against the array that belongs to
+        // `wireBodyStr`. Shedding rewrites the body wholesale, so the pre-shed
+        // `wireArr` no longer describes it; rather than map stale indexes (which
+        // would exempt the wrong element), hand over NO array and let the judge
+        // skip the separator exemption for that round. The markers proven for the
+        // previous body are its entry-side ownership; the ones proven for this
+        // body ride its slot to the next round.
+        const ownedSeparatorCores = maybeJudgeContinuity(prevSentFull, wireBodyStr, ctx.protocol, ctx.session.id, ctx.separatorSlots?.(), wireShedRewrote ? undefined : wireArr, prevSent?.ownedSeparatorCores);
+        const sentSlot = lastForwardedBody(ctx.session);
+        if (sentSlot !== undefined && ownedSeparatorCores !== undefined) sentSlot.ownedSeparatorCores = ownedSeparatorCores;
         // #1843 L1: capture the round's image facts for the learning layer — the
         // text side must mirror what outboundPayloadBreakdown bills (messages +
         // wire overhead) so observed image mass = billed total - textSide.
@@ -692,6 +731,15 @@ export async function* runCompressLoop(
     // computed once; the per-attempt side (a signature_delta seen while
     // streaming) is tracked with the other attempt state below.
     const historyHasSignedThinking = bodyHasSignedThinking(requestBody);
+    // round2-hold: two evidence scopes, because the adapter must decide BEFORE
+    // it knows how this attempt ends.
+    //  - attempt: bars the re-fetch once an unsigned block is on the wire
+    //    (#2501 semantics, reset per attempt);
+    //  - turn: "this upstream signs", sticky across every round and retry of
+    //    the request — round 1 of a fresh session signs its thinking even
+    //    though the client's request carried none, and round 2's re-request
+    //    must inherit that proof. The history scope alone would miss it.
+    let sawSignedThinkingThisTurn = false;
 
     // #2701: anthropic Threads continue-turns. On these the conversation
     // lives server-side behind `thread.previous_message_id`; the request body
@@ -850,7 +898,15 @@ export async function* runCompressLoop(
                 sawSignedThinkingThisAttempt = false;
                 fwdBytes = 0;
 
-                for await (const ev of adapter.parseStream(currentUpstream, round)) {
+                // round2-hold: round ≥ 2 is bili's OWN re-request — the client cannot
+                // replay it (round 1 already put its own bytes on the client's wire),
+                // so a truncation there is recoverable only by the loop's blind
+                // re-fetch, which is legitimate only while the dead attempt left NO
+                // stateful bytes. Tell the adapter whether this upstream is known to
+                // sign thinking, so it can keep round-2 thinking off the wire until
+                // the signature makes it valid (see ParseStreamOpts).
+                const parseOpts: ParseStreamOpts = { upstreamSignsThinking: historyHasSignedThinking || sawSignedThinkingThisTurn };
+                for await (const ev of adapter.parseStream(currentUpstream, round, parseOpts)) {
                     if (signal?.aborted) break;
                     if (ev.kind === "text") {
                         assistantText += ev.delta;
@@ -883,9 +939,15 @@ export async function* runCompressLoop(
                             // in-attempt evidence that this upstream signs.
                             unsignedThinkingOnWire = false;
                             sawSignedThinkingThisAttempt = true;
+                            sawSignedThinkingThisTurn = true;
                         }
                         if (ev.blockEnd) reasoningSealed = true;
-                        if (!ctx.textProtocol) {
+                        // round2-hold: `withheld` payload never goes on the wire — the
+                        // adapter is buffering it until the signature and releases the
+                        // real frames itself. Forwarding it here (raw is absent) would
+                        // re-create one block per delta and, worse, hand the client an
+                        // unsigned block a truncation can poison (#2501).
+                        if (!ctx.textProtocol && !ev.withheld) {
                             if (ev.raw) {
                                 recordReplyText("reasoning", ev.delta);
                                 yield fwd(ev.raw);

@@ -1682,6 +1682,9 @@ function changelogCatOf(rawLine) {
                 if (!n || typeof n !== "object" || typeof n.id !== "string") continue;
                 const el = document.createElement("div");
                 el.className = "banner " + (n.tone === "ok" ? "ok" : n.tone === "warn" ? "warn" : "");
+                // .banner is display:none until .show — #5548's loop never added it,
+                // so every merged notice (builtin + file + feed) rendered invisibly.
+                el.classList.add("show");
                 el.dataset.id = n.id;
                 nr.appendChild(el);
                 if (n.source !== "builtin") {

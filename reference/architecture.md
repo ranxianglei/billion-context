@@ -28,6 +28,8 @@ billion-context/
 │   │   ├── prepare-openai.ts     #   OpenAI chat request preparation (#1440)
 │   │   ├── prepare-responses.ts  #   Responses request preparation + codex compact/prompt-cache helpers (#1440)
 │   │   ├── relay.ts             #   Upstream relay zone: forward() + fake-completion recovery (#1440 P2 cut 4)
+│   │   ├── responses-ordering.ts #   #564 Responses assistant-run ordering repair + producer-owned turn-separator provenance (#2627)
+│   │   ├── responses-separator.ts #   Canonical Responses turn-separator literal and carrier predicates (#2627)
 │   │   ├── side-request.ts       #   Tool-surface check for auxiliary side requests
 │   │   ├── attribution-status.ts #   Takeover-failure visibility from host attribution reports (#3581)
 │   │   ├── dsh-authored-compaction.ts #   Bili-authored dsh compaction: answers the summarize call locally (#3733)
@@ -38,6 +40,7 @@ billion-context/
 │   │   ├── snapshot-render.ts    #   Snapshot render: outbound prefix from server transcript (#3756)
 │   │   ├── thread-tracking.ts    #   Anthropic Threads previous_message_id repair (#2701)
 │   │   ├── threads-lane.ts       #   Anthropic Threads lane: mirror, budget, reforge (#2926)
+│   │   ├── thinking-posture.ts   #   Signature-less thinking posture: 400-wording detector + wire strip + session memory (#5998)
 │   │   ├── update-actions.ts     #   Web Updates tab actions over the self-updater (#3719)
 │   │   └── stream-io.ts          #   Small response-body reader for non-2xx inspection
 │   ├── knobs.ts                  # Single knob resolver: env > config file > default (#2030)

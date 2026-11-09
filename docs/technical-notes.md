@@ -275,6 +275,12 @@ its mode (`pm`) and prepare-responses logs one transition line with the reason
 are recorded — never the prompt body. No wire behavior changed: both projections
 stay exactly as before; the switch is now *recorded* instead of misattributed.
 
+## The `/bili/` channel is directly addressable — the fallback when a host hook misses (#5907)
+
+The native-lane takeover works by patching `globalThis.fetch` in the host process and rewriting model URLs to `{proxy}/bili/{original-URL}`. That patch covers exactly ONE thing: calls through the current global fetch. A model client that captured a fetch reference before the plugin installed, uses a non-fetch transport (undici dispatcher, raw http, WebSocket), or runs its turns in another JS realm or process bypasses the patch entirely — and the bypass is invisible BY CONSTRUCTION: the request never reaches the proxy, so bili.log shows nothing for that turn (no session, no forward, no gate refusal). Assignment-based displacement by third parties is different and is NOT silent: since #1158 the guarded accessor logs every foreign install and re-chains it as downstream (logging caps past 16 installs; routing authority never leaves the guard). If the host property is non-configurable or `BILI_RECLAIM_FETCH_PATCH=0`, the classic direct install applies instead — that posture now logs a one-time warning naming the risk and the `/bili/` remedy (#5907).
+
+Because `/bili/{absolute-upstream-URL}` is just a URL prefix, ANY client whose base URL you control can use it directly — no hook required. Pointing a provider `baseURL` at `http://<proxy-host>:<port>/bili/<upstream-base>` is the supported shape for remote agents (configuration.md, `host`) and the recommended fallback when a lane's hook demonstrably misses turns: compression, billing, gate refusals and logging all apply identically, because it is the same channel the hook rewrites to. Caveat: direct clients carry no plugin attribution headers, so their sessions land in the anonymous (`pfa-*`) chain and are sized by the window-resolution ladder like any unattributed traffic (#5907).
+
 ## Responses native chaining is not supported — history must be replayed (#1954)
 
 The Responses-wire adapter (`prepareResponses` in `src/server.ts`, `buildRequest`
