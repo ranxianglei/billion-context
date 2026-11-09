@@ -4,6 +4,10 @@ Mechanism-level details behind the three usage options in the README. The
 README keeps each option concise; the "how it actually works" material lives
 here instead of between the options.
 
+## Fork recovery after a short source view
+
+Fork adoption judges retained compression blocks against the child replay, rather than the source's last `active` flags. A short source request may temporarily deactivate a fold whose complete original span returns in the child. Fully present retained spans are copied as active blocks; explicitly expanded blocks, consumed tier children, and spans crossing the fork boundary are not independently activated. Tier children accompany an adopted ancestor as inactive records. Planning and adoption never mutate the source session.
+
 ## Native plugin lifecycle (Option 1)
 
 At load the plugin **spawns its own proxy** (or attaches to a healthy
