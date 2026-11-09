@@ -6,7 +6,7 @@ import { defaultConfig } from "acp-kernel";
 import { startServer } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _resetSessionsForTest, peekSession } from "../src/session.ts";
-import { anthropicFirstUserFrag, claudeSubagentAgentId, claudeSubagentSplit } from "../src/session-id.ts";
+import { anthropicFirstUserFrag, anthropicLaterUserFrag, claudeSubagentAgentId, claudeSubagentSplit } from "../src/session-id.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 
@@ -278,5 +278,72 @@ test("anthropicFirstUserFrag reminder-strip edges: string path, reminders-only f
     // No reminder at all: byte-identical to the pre-strip behavior (common case untouched).
     const plain = `plain task ${"x".repeat(1500)}`;
     assert.equal(anthropicFirstUserFrag([{ role: "user", content: plain }]), plain.slice(0, 1024), "reminder-free text is sliced exactly as before");
+});
+
+test("anthropicFirstUserFrag advances past a reminders-only first user message to the next run-distinguishing message (#6011)", () => {
+    const boilerplate = `<system-reminder>\n${"Shared CLAUDE.md context.\n".repeat(40)}</system-reminder>`;
+    const messages = [
+        { role: "user", content: boilerplate },
+        { role: "assistant", content: "ok" },
+        { role: "user", content: "Task arm D: inspect the retry ladder" },
+    ];
+    assert.equal(
+        anthropicFirstUserFrag(messages),
+        "Task arm D: inspect the retry ladder",
+        "the reminders-only first message carries no run material — the scan advances instead of falling back to the shared boilerplate",
+    );
+});
+
+test("anthropicFirstUserFrag advances across several uninformative user messages; reminders-only floor still wins when nothing later helps (#6011)", () => {
+    const r1 = `<system-reminder>\nFirst shared block.\n</system-reminder>`;
+    const r2 = `<system-reminder>\nSecond shared block.\n</system-reminder>`;
+    const advanceTwo = [
+        { role: "user", content: r1 },
+        { role: "assistant", content: "ok" },
+        { role: "user", content: r2 },
+        { role: "assistant", content: "ok" },
+        { role: "user", content: "Task arm E: trace the watermark stamp" },
+    ];
+    assert.equal(anthropicFirstUserFrag(advanceTwo), "Task arm E: trace the watermark stamp", "two consecutive reminders-only messages are both skipped");
+    const nothingLater = [
+        { role: "user", content: r1 },
+        { role: "assistant", content: "ok" },
+        { role: "user", content: r2 },
+    ];
+    assert.equal(
+        anthropicFirstUserFrag(nothingLater),
+        r1.slice(0, 1024),
+        "no later material → the FIRST reminders-only message's raw text stays the degradation floor",
+    );
+});
+
+test("anthropicLaterUserFrag skips the first user message and joins bounded later fragments (#6011)", () => {
+    const sharedFirst = `<system-reminder>\n${"Shared boilerplate line.\n".repeat(30)}</system-reminder>`;
+    const u1 = "Task A specifics: gateway_service.go";
+    const u2 = `Task A follow-up ${"y".repeat(600)}`;
+    const u3 = "Task A third";
+    const u4 = "Task A fourth";
+    const u5 = "Task A fifth";
+    const messages = [
+        { role: "user", content: sharedFirst },
+        { role: "assistant", content: "ok" },
+        { role: "user", content: u1 },
+        { role: "assistant", content: "ok" },
+        { role: "user", content: u2 },
+        { role: "assistant", content: "ok" },
+        { role: "user", content: u3 },
+        { role: "assistant", content: "ok" },
+        { role: "user", content: u4 },
+        { role: "assistant", content: "ok" },
+        { role: "user", content: u5 },
+    ];
+    assert.equal(
+        anthropicLaterUserFrag(messages),
+        `${u1}\u0001${u2.slice(0, 512)}\u0001${u3}\u0001${u4}`,
+        "skips the shared first message, caps each segment at 512 chars after strip, stops at four segments",
+    );
+    assert.notEqual(anthropicLaterUserFrag(messages), "", "usable later material produces a non-empty wide fragment");
+    assert.equal(anthropicLaterUserFrag([{ role: "user", content: sharedFirst }]), "", "no later user message → empty (call site keeps the un-widened key)");
+    assert.equal(anthropicLaterUserFrag([]), "", "empty body → empty");
 });
 
