@@ -997,7 +997,7 @@
 - **类型：** `{ enabled?: boolean; zstd?: boolean; debounceMs?: number; maxDelayMs?: number; tailTokens?: number; epermAlertThreshold?: number; epermAlertRepeatMs?: number }`
 - **默认：** `{ enabled: true, zstd: false, debounceMs: 500, maxDelayMs: 5000, tailTokens: 16384, epermAlertThreshold: 5, epermAlertRepeatMs: 0 }`
 - **状态：** ACTIVE
-- **说明：** 会话持久化行为（对应 `BILI_PERSIST`、`BILI_PERSIST_ZSTD`、`BILI_PERSIST_DEBOUNCE_MS`、`BILI_PERSIST_MAX_DELAY_MS`、`BILI_PERSIST_TAIL_TOKENS`、`BILI_PERSIST_EPERM_ALERT_THRESHOLD`、`BILI_PERSIST_EPERM_ALERT_REPEAT_MS`）。`enabled: false` 会话语仅存内存；`zstd: true` 写 `BILIZSTD1` 文件（#1080 owner 决定：纯 JSON 仍是默认，可恢复性优先）；`tailTokens` 约束持久化折叠快照的预算（`0` 完全不持久化消息）；`debounceMs` / `maxDelayMs` 约束会话文件的写盘去抖——窗口每次变更都会重置，max-delay 上限保证持续流量下写入也一定在预算内落盘（主会话写入器与 session-order / prefix-affinity 边车写入器自 #6062 起都走这两个旋钮，此前 5s 上限是硬编码的，在磨损敏感的盘上决定了稳态重写速率）；两个 `eperm*` 键调节 Windows 杀软排除项告警。详见[环境变量表](#环境变量的配置键对照-2030)。
+- **说明：** 会话持久化行为（对应 `BILI_PERSIST`、`BILI_PERSIST_ZSTD`、`BILI_PERSIST_DEBOUNCE_MS`、`BILI_PERSIST_MAX_DELAY_MS`、`BILI_PERSIST_TAIL_TOKENS`、`BILI_PERSIST_EPERM_ALERT_THRESHOLD`、`BILI_PERSIST_EPERM_ALERT_REPEAT_MS`）。`enabled: false` 会话语仅存内存；`zstd: true` 写 `BILIZSTD1` 文件（#1080 owner 决定：纯 JSON 仍是默认，可恢复性优先）；`tailTokens` 约束持久化折叠快照的预算（`0` 完全不持久化消息）；`debounceMs` / `maxDelayMs` 约束会话文件的写盘去抖——窗口每次变更都会重置，max-delay 上限保证持续流量下写入也一定在预算内落盘（该上限只存在于 session-order / prefix-affinity 两个快照写入器——它们的 5s 预算在 #6062 前硬编码、之后才接到这个旋钮，并决定了磨损敏感盘上的稳态重写速率；主会话语写入器用非重置式去抖、不会饿死，因此没有这个上限）；两个 `eperm*` 键调节 Windows 杀软排除项告警。详见[环境变量表](#环境变量的配置键对照-2030)。
 
   **观测物理写入量（#6062）。** 要在磨损敏感（如 QLC）的盘上实测这些旋钮对真实磁盘损耗的影响，在一段代表性负载前后 diff NVMe SMART 计数器：
 
