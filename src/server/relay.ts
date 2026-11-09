@@ -64,6 +64,7 @@ import { applyEstimateCalibration, currentCalibrationFactor, inspectContextOverf
 import { billOutputUsage } from "../billing.js";
 import { DUMP_PLAINTEXT_BANNER } from "../dump-banner.js";
 import { recordPckAblation } from "../pck-probe.js";
+import { detectThinkingSignatureRejection, rememberStrictThinkingPosture, stripUnsignedThinkingFromWire, thinkingPostureIsStrict } from "./thinking-posture.js";
 import { applyOutputSteering, applyOutputSteeringJson } from "../output-steering.js";
 import { estimateWireOverhead } from "./budget.js";
 import { buildForwardHeaders, connectionNamedHeaders, RESPONSE_ONLY_STRIP_HEADERS, safeSessionId, UPSTREAM_HOP_HEADERS } from "./headers.js";
@@ -788,6 +789,25 @@ async function forwardCaptured(
             }
         }
     }
+    // [#5998] strict thinking-signature posture (learned per session by the
+    // probe below): this upstream rejects signature-less thinking blocks, so
+    // drop them before send instead of paying a 400 every turn. The body is
+    // otherwise untouched — signed blocks pass through byte-exact (KDD#10).
+    if (
+        prepared &&
+        !prepared.sidePassthrough &&
+        prepared.protocol === "anthropic" &&
+        req.method !== "GET" &&
+        req.method !== "HEAD" &&
+        typeof wireBody === "string" &&
+        thinkingPostureIsStrict(prepared.session)
+    ) {
+        const dropped = stripUnsignedThinkingFromWire(wireBody);
+        if (dropped.removed > 0) {
+            wireBody = dropped.body;
+            log("debug", `[${prepared.session.id}] [thinking-posture] dropped ${dropped.removed} signature-less thinking block(s) before send (strict upstream learned for this session, #5998)`);
+        }
+    }
     const init: Omit<RequestInit, "dispatcher"> & { dispatcher?: object } = {
         method: req.method ?? "GET",
         headers,
@@ -1297,6 +1317,76 @@ async function forwardCaptured(
                         }
                         retried.clearTimer();
                         log("debug", `[${prepared.session.id}] [pck] A/B retry without prompt_cache_key also failed (${retried.response.status}) — not the key's fault; key stays, original 400 forwarded (#2645)`);
+                    }
+                }
+            }
+        }
+    }
+    // [#5998] learn-on-failure thinking-signature probe: this upstream rejected
+    // the send with the signature-verifying wording ("thinking.signature: Field
+    // required", #2501) and the body carries signature-less thinking blocks —
+    // re-send once with exactly those blocks dropped. Accepted ⇒ causation
+    // confirmed: adopt the retry, remember the strict posture for THIS session
+    // only (later sends drop proactively above). Still failing ⇒ NOT this field
+    // — discard the second response, forward the original 400 verbatim, learn
+    // nothing (same controlled-experiment discipline as the #2645 ladder).
+    // Never-signing relays (#5495) word their 400 differently ("must be passed
+    // back"), so they never enter this branch and keep their verbatim replay.
+    if (
+        prepared &&
+        !prepared.sidePassthrough &&
+        prepared.protocol === "anthropic" &&
+        req.method !== "GET" &&
+        req.method !== "HEAD" &&
+        typeof wireBody === "string" &&
+        upstreamResult.response.status === 400 &&
+        upstreamResult.response.body
+    ) {
+        let tsErrText: string | null = null;
+        try {
+            tsErrText = (await readStreamToBuffer(upstreamResult.response.body)).toString("utf8");
+        } catch {
+            tsErrText = null;
+        }
+        if (tsErrText !== null) {
+            upstreamResult = {
+                response: new Response(tsErrText, {
+                    status: upstreamResult.response.status,
+                    statusText: upstreamResult.response.statusText,
+                    headers: new Headers(upstreamResult.response.headers),
+                }),
+                clearTimer: upstreamResult.clearTimer,
+                stopIdleTimer: upstreamResult.stopIdleTimer,
+            };
+            if (detectThinkingSignatureRejection(400, tsErrText)) {
+                const dropped = stripUnsignedThinkingFromWire(wireBody);
+                if (dropped.removed > 0) {
+                    let retried: Awaited<ReturnType<typeof fetchWithTimeout>> | null = null;
+                    try {
+                        applyResign(headers, dropped.body);
+                        retried = await fetchWithTimeout(upstreamUrl, { ...init, body: v1Wrap(dropped.body) }, undefined, clientAbort.signal);
+                    } catch {
+                        retried = null; // transport failure — inconclusive, original 400 stands
+                    }
+                    if (retried !== null) {
+                        if (retried.response.ok) {
+                            upstreamResult.clearTimer();
+                            wireBody = dropped.body;
+                            rememberStrictThinkingPosture(prepared.session);
+                            markDirty(prepared.session);
+                            log("info", `[${prepared.session.id}] [thinking-posture] upstream rejected signature-less thinking ("${tsErrText.slice(0, 120)}") — stripped ${dropped.removed} block(s), retry accepted; dropping them proactively for this session (#5998)`);
+                            upstreamResult = retried;
+                        } else {
+                            if (retried.response.body) {
+                                try {
+                                    await readStreamToBuffer(retried.response.body);
+                                } catch {
+                                    /* discarded either way */
+                                }
+                            }
+                            retried.clearTimer();
+                            log("warn", `[${prepared.session.id}] [thinking-posture] strip-and-resend probe also failed (${retried.response.status}) — not the unsigned blocks' fault; original 400 forwarded verbatim, nothing learned (#5998)`);
+                        }
                     }
                 }
             }
