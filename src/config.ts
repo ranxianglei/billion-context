@@ -2323,6 +2323,17 @@ type FileConfig = {
          *  SELF_SIGNED_CERT_IN_CHAIN. MERGED with Node's built-in roots, never replacing them.
          *  Env BILI_CA_FILE wins. */
         caFile?: string;
+        /** #5000 item 2: per-upstream hard cap on the messages[] array length — a wire constraint no
+         *  byte/token estimate expresses (the 26,903-message #5000 session cleared every size gate and
+         *  died at the upstream). Per-UPSTREAM on purpose: default 0 = disabled; set it to your upstream's
+         *  known limit and over-count bodies get an actionable 413 (restart / rewind) instead of a
+         *  guaranteed upstream 400. Count only — it never folds. Env BILI_MAX_MESSAGES wins. */
+        maxMessages?: number;
+        /** #5794 item 2: cost band (decoded bytes) for the JSON.parse + normalization sweep AFTER
+         *  decode; a body above it is refused with an actionable 413 before the sweep, because any
+         *  parseable body over 32 MiB is ≥ ~8M tokens — beyond every real model window. 0 disables
+         *  the ingest cap (legacy parse-everything). Env BILI_INGEST_BODY_BYTES wins. */
+        ingestBodyBytes?: number;
     };
     /** Session persistence knobs (#2030) — was BILI_PERSIST_* env-only. */
     persist?: {
