@@ -165,10 +165,17 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
       }
     }
   }
-  const adjustedIds = applyPairBoundaryAdjustments(
+  const adjustedIds = clampAdjustmentAtCoverage(
+    applyPairBoundaryAdjustments(resolved, input.messages, shared),
     resolved,
     input.messages,
-    shared,
+    // Fresh folds pass the active coverage; hand-built inputs without it
+    // (unit tests) keep the legacy unclamped adjustment behavior.
+    input.preExistingCoverage,
+    // #5337 discipline: reuse the shared index map — the clamp runs on every
+    // screened unit, and a per-call map rebuild would resurface the O(units×n)
+    // quadratic the shared context exists to prevent.
+    byId,
   );
   const skippedCarrierIds = adjustedIds.filter((id) => liveCarrierIds.has(id));
   if (skippedCarrierIds.length > 0) {
@@ -910,6 +917,89 @@ function applyPairBoundaryAdjustments(
   }
   const ids: string[] = [];
   for (let i = startIndex; i <= endIndex; i++) {
+    const msg = messages[i];
+    if (msg) ids.push(msg.id);
+  }
+  return ids;
+}
+
+/**
+ * Clamp the pair-boundary ADJUSTMENT's widened head/tail at active-coverage
+ * boundaries (production 2026-11-09 mega-turn incident).
+ *
+ * When a range ends (or starts) right where a block was cut mid-group — a
+ * spine-cut/fold boundary slicing between a round's reasoning and its
+ * tool-call — the pair/reasoning adjustment widens the range ACROSS the
+ * boundary to close the pair, pulling in already-covered members. The drag
+ * makes the block visible in range → nestedBlock/consumed machinery engages
+ * → the merge-integrity path resolves the unit to fold-nothing (fatal=null,
+ * filteredIds=0) or a split fatal: every range ending adjacent to a mid-group
+ * block cut dies at screening. This predates the merge-gate bridging fix —
+ * bridging only exposed it, by finally letting units reach the screen with
+ * that geometry.
+ *
+ * Clamping is safe precisely because the partner half is COVERED: #5531 makes
+ * covered halves invisible to the integrity judge (a covered call cannot
+ * strand its turn's reasoning; a covered result leaves no unanswered
+ * tool_call_id), so folding the visible part while the covered partner stays
+ * covered is the allowed reverse-split shape. The requested span itself is
+ * NEVER clamped — only the adjustment's widening — so hand-built ranges that
+ * deliberately target covered spans (refold candidates) keep resolving.
+ */
+function clampAdjustmentAtCoverage(
+  adjustedIds: string[],
+  resolved: { startIndex: number; endIndex: number; messageIds: string[] },
+  messages: CoreMessage[],
+  coverage?: ReadonlySet<string>,
+  /** Shared id→index map (#5337): reuse the caller's O(n) derivation instead
+   *  of rebuilding it per call on the screening hot path. */
+  indexById?: Map<string, number>,
+): string[] {
+  if (!coverage || coverage.size === 0 || adjustedIds.length === 0) {
+    return adjustedIds;
+  }
+  // Recover the adjusted span's index bounds (ids are contiguous by index —
+  // applyPairBoundaryAdjustments pushes by loop index).
+  let startIdx: number | undefined;
+  let endIdx: number | undefined;
+  if (indexById) {
+    startIdx = indexById.get(adjustedIds[0]!);
+    endIdx = indexById.get(adjustedIds[adjustedIds.length - 1]!);
+  } else {
+    const built = new Map<string, number>();
+    for (let i = 0; i < messages.length; i++) {
+      const id = messages[i]?.id;
+      if (id !== undefined) built.set(id, i);
+    }
+    startIdx = built.get(adjustedIds[0]!);
+    endIdx = built.get(adjustedIds[adjustedIds.length - 1]!);
+  }
+  if (startIdx === undefined || endIdx === undefined) return adjustedIds;
+  const isCovered = (i: number): boolean => {
+    const id = messages[i]?.id;
+    return id !== undefined && coverage.has(id);
+  };
+  // Pull the widened TAIL back to just before the first covered member, and
+  // the widened HEAD forward likewise. Only the WIDENED portion is clamped —
+  // covered ids inside the requested span stay (refold/consumed semantics).
+  let clamped = false;
+  for (let i = resolved.endIndex + 1; i <= endIdx; i++) {
+    if (isCovered(i)) {
+      endIdx = i - 1;
+      clamped = true;
+      break;
+    }
+  }
+  for (let i = resolved.startIndex - 1; i >= startIdx; i--) {
+    if (isCovered(i)) {
+      startIdx = i + 1;
+      clamped = true;
+      break;
+    }
+  }
+  if (!clamped) return adjustedIds;
+  const ids: string[] = [];
+  for (let i = startIdx; i <= endIdx; i++) {
     const msg = messages[i];
     if (msg) ids.push(msg.id);
   }
