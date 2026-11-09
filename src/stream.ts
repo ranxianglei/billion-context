@@ -205,6 +205,15 @@ function clearCompressFailures(session: Session): void {
         markDirty(session);
     }
 }
+// Occurrences of a failure key currently held in the persisted streak ring
+// (read-only companion to recordCompressFailure — call it AFTER the record
+// call so the count includes the just-pushed attempt).
+function compressFailOccurrencesOf(session: Session, key: string): number {
+    if (!key) return 0;
+    const prev = session.metadata[FAIL_STREAK_KEY];
+    const keys = Array.isArray(prev) ? prev.filter((k): k is string => typeof k === "string") : [];
+    return keys.filter((k) => k === key).length;
+}
 
 // #2146: the exact-spec repeat guard above is defeated by a model that walks
 // spec space — one fresh (also failing) range per call. In the incident,
@@ -1051,6 +1060,21 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
     }
     let { ranges, diagnostics } = parsed;
     if (ranges.length === 0) {
+        // compressAtFoldPoint v2 pointer echo (kind=already-folded-echo): the
+        // call's content was the relocation ack text of an earlier fold — the
+        // model copied the most recent compress call's rewritten args as its
+        // template (field report on #5949's v2: four identical
+        // content-not-array receipts in 25 minutes, each receipt feeding the
+        // next retry). Nothing is wrong with the format and nothing is
+        // foldable: ack a no-op instead of lecturing. NOT routed through
+        // recordCompressFailure (no repeat-guard counter for the model to
+        // misread as "the user asked N times"), but loop-tracked so a runaway
+        // echo burst still collapses to the #2146 short refusal.
+        if (diagnostics.kind === "already-folded-echo") {
+            const loopGuard = trackLoop ? noteCompressLoopFailure(ctx, "already-folded-echo") : "";
+            ctx.log("[acp-proxy: compress call echoed a fold-point relocation pointer (compressAtFoldPoint v2) — acked as no-op]");
+            return compressResult(`[bili: nothing was compressed — the text you sent is the relocation pointer of an earlier, already-completed fold (its summary lives at its fold point in the history). Do not re-send it. To fold NEW consumed ranges, issue one compress call whose content holds fresh 'mNNNNN–mNNNNN optional topic' header lines with their summaries.]${loopGuard}`, "refused", 0, "already-folded-echo");
+        }
         ctx.log("[acp-proxy: compress call had no valid ranges; nothing compressed.]");
         const rawReasons = diagnostics.invalidReasons ?? [];
         for (const reason of rawReasons) ctx.log(`[acp-proxy: rejected entry: ${reason}]`);
@@ -1101,6 +1125,22 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         if (armedDetail !== undefined && armedDetail.n > COMPRESS_LOOP_THRESHOLD) {
             ctx.log(`[acp-proxy: parse-failure receipt collapsed to short refusal (breaker armed, n=${armedDetail.n}, kind=${diagnostics.kind})`);
             return compressResult(armedRefusalReceipt(armedDetail.n, armedDetail.decayMinutes), "refused", 0, `parse:${diagnostics.kind}`);
+        }
+        // Repeat-parse-failure collapse: from the 2nd identical parse failure
+        // on, the full format lecture + eligibility list re-appends ~200 words
+        // per retry (the field loop stacked 8 receipts before stopping, and
+        // the per-retry counter fed the model's "the user keeps asking the
+        // same message" misread). The FIRST failure keeps the full teaching
+        // receipt; every repeat gets ONE line pointing back at it. The
+        // spec-repeat guard text is dropped here on purpose — one counter,
+        // stated once.
+        const occurrences = compressFailOccurrencesOf(ctx.session, parseKey);
+        // #4812: collapse to a one-liner only on the tracked lane — the
+        // preflight lane (loopTracking:false) must always return the full
+        // receipt (it never arms and never collapses).
+        if (trackLoop && occurrences >= 2) {
+            ctx.log(`[acp-proxy: parse-failure receipt collapsed to one-liner (attempt ${occurrences}, kind=${diagnostics.kind})]`);
+            return compressResult(`[Compression FAILED again — this exact call has now failed ${occurrences} time(s) the same way (kind=${diagnostics.kind}); nothing was compressed. The full format guide and eligible ranges are in the FIRST failed receipt above — do not re-send this call verbatim.${loopGuard}]`, "refused", 0, `parse:${diagnostics.kind}`);
         }
         if (isEmptyCall) {
             return compressResult(`[Compression FAILED: the call carried no content at all (kind=${diagnostics.kind}) — an empty compress() compresses nothing and can never succeed. Do NOT re-issue an empty call; if you meant to compress, put content as ONE non-empty string in that SAME single call — each block headed by a 'mNNNNN–mNNNNN optional topic' line followed by its summary markdown (a JSON-encoded array of {startId, endId, summary} objects is also accepted INSIDE that same string).${guard}${loopGuard}]`, "refused", 0, `parse:${diagnostics.kind}`);
