@@ -117,6 +117,11 @@ export const LIVE_FILES = [
     // network I/O and binds no port, so no zone band is needed — the entry is for
     // the tripwire alone, like #3890/#5114
     "tests/cache-keepalive.test.ts",
+    // #5955: wedged same-lane takeover rows drive fully mocked children + a fake
+    // clock; the only real spawn is one bare `node -e ""` child used to obtain a
+    // dead pid for the hardKillProxyTree row — no ports, no servers, so the zone
+    // band is irrelevant; the entry is for the tripwire alone, like #3890/#5114
+    "tests/issue5955-wedged-same-lane-takeover.test.ts",
 ];
 
 /** Band width per live file: the zone ladder drifts +1 per EADDRINUSE retry;
