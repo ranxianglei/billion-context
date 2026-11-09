@@ -40,8 +40,12 @@ export interface UpstreamAlert {
  *  - upstream-timeout: fired AFTER connect (headers/body idle budget) — the
  *    request may have reached the upstream, so "cannot reach" would be a lie;
  *  - unknown: unclassified — better silent than a misleading red banner. */
-const ALERT_KINDS: ReadonlySet<UpstreamFailureKind> = new Set([
+// Exported so the taxonomy coverage gate (tests) can assert every connect-
+// stage errno lands in an alertable kind — the #2465 failure mode was exactly
+// a code missing from BOTH this set and the fail-fast set at once. (#5663)
+export const ALERT_KINDS: ReadonlySet<UpstreamFailureKind> = new Set([
     "connect-timeout",
+    "upstream-unreachable",
     "connect-refused",
     "proxy-reset",
     "upstream-reset",
