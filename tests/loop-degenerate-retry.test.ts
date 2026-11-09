@@ -191,6 +191,44 @@ test("#821 O2: genuinely empty (no-reasoning) terminal turn is NOT retried", asy
     assert.equal(fetchCalls, 0, "sawThinking=false → the empty turn passes through untouched");
 });
 
+// #732 follow-up: a thinking model ends the turn with reasoning +
+// whitespace-only text ("\n\n") and no tool call. The 2-char text made the
+// #732 gate read "visible output reached" (assistantText.length>0 &&
+// forwardedVisible) and the retry never fired — the host session stalled
+// until its daemon nudge, which the model also answered with a bare "\n\n".
+
+const OPENAI_THINKING_WSPRIBE = openaiSse([
+    { id: "chatcmpl_w1", object: "chat.completion.chunk", choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }] },
+    { id: "chatcmpl_w1", choices: [{ index: 0, delta: { reasoning_content: "let me check the logs first to understand what happened" }, finish_reason: null }] },
+    { id: "chatcmpl_w1", choices: [{ index: 0, delta: { content: "\n\n" }, finish_reason: null }] },
+    { id: "chatcmpl_w1", choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+]);
+
+const OPENAI_THINKING_REALTEXT = openaiSse([
+    { id: "chatcmpl_w2", object: "chat.completion.chunk", choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }] },
+    { id: "chatcmpl_w2", choices: [{ index: 0, delta: { reasoning_content: "the user asked a question" }, finish_reason: null }] },
+    { id: "chatcmpl_w2", choices: [{ index: 0, delta: { content: "Here is the answer you asked for." }, finish_reason: null }] },
+    { id: "chatcmpl_w2", choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+]);
+
+test("#732-follow-up W1: reasoning + whitespace-only text + stop → the #732 retry now fires (was bypassed via length 2)", async () => {
+    const { out, fetchCalls, bodies } = await drainOpenai(OPENAI_THINKING_WSPRIBE, [OPENAI_GOOD], "deg-w1");
+    assert.equal(fetchCalls, 1, "exactly one degenerate auto-retry fired despite the forwarded \"\\n\\n\"");
+    assert.ok(
+        bodies[0].includes("ended without a tool call"),
+        "the retry body carries the ephemeral continuation nudge",
+    );
+    assert.ok(out.includes("let me check the logs"), "the thinking prefix was streamed to the client");
+    assert.ok(out.includes("\n\n"), "the whitespace-only text reached the client");
+    assert.ok(out.includes("continued after nudge"), "the retried turn's content was delivered on the same stream");
+});
+
+test("#732-follow-up W2: reasoning + real visible text + stop is NOT retried (a delivered answer is not degenerate)", async () => {
+    const { out, fetchCalls } = await drainOpenai(OPENAI_THINKING_REALTEXT, [OPENAI_GOOD], "deg-w2");
+    assert.equal(fetchCalls, 0, "non-whitespace visible text bars the retry — no false positive on a normal answer");
+    assert.ok(out.includes("Here is the answer"), "the normal answer passes through untouched");
+});
+
 // #1862: the degenerate-retry boundary on the Responses wire misfired in two ways.
 // A: a completed reasoning+custom_tool_call turn carries executable output, but the
 // adapter counted zero tool calls, so the gate treated it as degenerate and re-issued
