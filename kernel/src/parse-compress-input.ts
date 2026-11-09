@@ -27,12 +27,20 @@
 import { clampPrefix } from "./truncate.js";
 import type { CompressRangeSpec } from "./types.js";
 
+// The ack text compressAtFoldPoint v2 writes into a completed compress call's
+// rewritten args (see relocate-compress.ts on the branch that introduced it;
+// mirrored here as a literal so this parser change lands independently of
+// that one — keep the two strings identical when both are on master).
+const RELOCATED_POINTER_MARKER =
+  "[bili] compression succeeded — summary relocated";
+
 export type CompressParseKind =
   | "ok"
   | "empty-input"
   | "not-object"
   | "missing-content"
   | "content-not-array"
+  | "already-folded-echo"
   | "malformed-json"
   | "truncated"
   | "no-valid-ranges";
@@ -195,6 +203,17 @@ function parseObjectValue(
   if (Array.isArray(content)) {
     entries = content;
   } else if (typeof content === "string") {
+    // compressAtFoldPoint v2 rewrites a completed compress call's args to a
+    // short ack pointer (relocate-compress.ts). A model that copies its most
+    // recent compress call as a template re-sends that pointer text as the
+    // content of a NEW call — observed live as bursts of identical
+    // content-not-array rejections, each receipt feeding the next retry.
+    // Classify it explicitly so hosts can ack a no-op instead of lecturing
+    // a format that was never wrong.
+    if (content.includes(RELOCATED_POINTER_MARKER)) {
+      diag.kind = "already-folded-echo";
+      return finish([], diag);
+    }
     // Stringified content array: vLLM-style gateways stringify nested
     // arrays, so `content` arrives as a JSON string of the array.
     const parsed = parseContentArray(content);
@@ -227,6 +246,19 @@ function parseObjectValue(
           diag.flatSummarySalvage = true;
           diag.kind = "ok";
           return finish([flat], diag);
+        }
+        // The whole content STRING may instead be ONE stringified entry
+        // object — #470's single-object drift one escaping level deeper (the
+        // gateway stringified the object it left in the content slot, refs
+        // inside the JSON instead of at the top level). Unwrap and validate
+        // it through the shared entry validator before giving up: observed
+        // live as the exact `content-not-array` burst the receipts above
+        // document.
+        const single = stringifiedEntryFromContent(content, callId);
+        if (single !== undefined) {
+          diag.contentSalvage = true;
+          diag.kind = "ok";
+          return finish([single], diag);
         }
       }
       // Refs-bearing entries that failed validation are a real line-form
@@ -294,8 +326,27 @@ function isHeaderlessLineEntry(e: unknown): boolean {
   return !REF_PAIR_IN_LINE.test(head) && !SINGLE_REF_IN_LINE.test(head);
 }
 
+// Stringified-single-entry recovery: the whole `content` STRING is one
+// JSON-encoded entry OBJECT (`"{\"startId\":\"m00150\",\"endId\":\"m00220\",\"summary\":\"…\"}"`)
+// — #470's drift one escaping level deeper. Reached only after line-form and
+// flat-top-level recovery both declined (no refs headers in the string, no
+// top-level bounds), so an ordinary summary text that happens to parse as
+// JSON cannot land here unless it validates as a range. Returns undefined
+// when the parsed object is not a valid entry (then the caller falls through
+// to the generic content-not-array classification).
+function stringifiedEntryFromContent(
+  content: string,
+  callId: string | undefined,
+): CompressRangeSpec | undefined {
+  const parsed = tryParseLenient(stripFence(content.trim()));
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed))
+    return undefined;
+  const outcome = validateEntry(parsed as Record<string, unknown>, callId);
+  return "range" in outcome ? outcome.range : undefined;
+}
+
 // Flat single-range recovery: summary text in the `content` STRING with
-// bounds at the top level ({content, startId, endId, topic?}). Applies only
+// bounds at the top level ({content, startId, endRef, topic?}). Applies only
 // when the content string carries NO refs headers of its own — a line-form
 // string with headers was already parsed (or reported) above. A JSON-encoded
 // {summary, topic} object inside the string (gateway double-encode) is

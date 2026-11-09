@@ -593,6 +593,140 @@ test("install: a missing live-state slot refuses an oversized direct model reque
     }
 });
 
+test("install: an empty-slot body under the byte cap but over the model window is refused locally (#5996)", async () => {
+    const saved = globalThis.fetch;
+    _resetForTest();
+    const sink: string[] = [];
+    globalThis.fetch = fakeFetch(sink);
+    try {
+        // A lane that stamps the model window onto every proxied request — this
+        // is the only window source the empty-slot branch can ever see (#4894).
+        const state: NativeInterceptState = {
+            origin: "http://127.0.0.1:40921",
+            ready: Promise.resolve("http://127.0.0.1:40921"),
+            headersFor: () => ({ "x-bili-plugin-context-window": "1000" }),
+        };
+        assert.equal(installNativeFetchIntercept(state), true);
+        // Steady state: one live request rides the proxy. This single route is
+        // what stamps the process-level last-known window the doom check relies on.
+        assert.equal((await globalThis.fetch("http://127.0.0.1:8199/v1/messages", { method: "POST", body: "{}" })).status, 200);
+        assert.equal(sink[0], "http://127.0.0.1:40921/bili/http://127.0.0.1:8199/v1/messages");
+        // Now the slot empties (dsh deactivate/reactivate, #2082/#2101). A 4 MiB
+        // body is under the 8 MiB byte cap yet prices at ~1.19M tokens against the
+        // 1M floor window — the OLD code sent it raw upstream (provider 400); the
+        // fix refuses it locally with the same retryable 422 class as the byte cap.
+        liveStateSlotEffect(state)()();
+        const res = await globalThis.fetch("http://127.0.0.1:8199/v1/messages", { method: "POST", body: "x".repeat(4 * 1024 * 1024) });
+        assert.equal(res.status, 422);
+        assert.equal(res.headers.get("x-bili-gate"), "oversize-refusal-no-live-state");
+        const j = (await res.json()) as { error?: { message: string; retryable: boolean } };
+        assert.match(j.error?.message ?? "", /token/, "refusal names the token-window basis, not the byte ceiling");
+        assert.match(j.error?.message ?? "", /1,000,000/, "names the resolved window");
+        assert.equal(j.error?.retryable, true, "still a retryable policy refusal");
+        // Negative row: a body that fits under the known window still rides direct
+        // while the slot is empty — the guard must not over-refuse in-window work.
+        const inWindow = "x".repeat(1 * 1024 * 1024); // 1 MiB → ~299K est tokens < 1M window
+        assert.equal((await globalThis.fetch("http://127.0.0.1:8199/v1/messages", { method: "POST", body: inWindow })).status, 200, "in-window body stays direct");
+        assert.deepEqual(sink.slice(1), ["http://127.0.0.1:8199/v1/messages"], "only the in-window send reaches the provider");
+    } finally {
+        globalThis.fetch = saved;
+        _resetForTest();
+    }
+});
+
+test("install: an empty-slot body over the window fails OPEN until a lane has stamped one (#5996 cold start)", async () => {
+    const saved = globalThis.fetch;
+    _resetForTest();
+    const sink: string[] = [];
+    globalThis.fetch = fakeFetch(sink);
+    try {
+        // No headersFor → nothing ever stamps the last-known window → cold start.
+        const state: NativeInterceptState = { origin: "http://127.0.0.1:40922", ready: Promise.resolve("http://127.0.0.1:40922") };
+        assert.equal(installNativeFetchIntercept(state), true);
+        liveStateSlotEffect(state)()();
+        // Same 4 MiB shape as above: under the byte cap, over any real window —
+        // but with no window ever seen the fix must NOT invent a refusal; it fails
+        // open to today's byte-cap-only semantics (direct 200).
+        const res = await globalThis.fetch("http://127.0.0.1:8199/v1/messages", { method: "POST", body: "x".repeat(4 * 1024 * 1024) });
+        assert.equal(res.status, 200, "cold start fails open: no window → byte-cap-only direct path");
+        assert.deepEqual(sink, ["http://127.0.0.1:8199/v1/messages"]);
+    } finally {
+        globalThis.fetch = saved;
+        _resetForTest();
+    }
+});
+
+test("install: an empty-slot refusal names a >=1M resolved window verbatim (#5996)", async () => {
+    const saved = globalThis.fetch;
+    _resetForTest();
+    const sink: string[] = [];
+    globalThis.fetch = fakeFetch(sink);
+    try {
+        // Resolved window at/above the 1M floor: declaredWindow === window, so
+        // the refusal must name it as THE window (the short form), not as a
+        // floored local bar — the sibling fallbackOversizeRefusal distinction.
+        const state: NativeInterceptState = {
+            origin: "http://127.0.0.1:40923",
+            ready: Promise.resolve("http://127.0.0.1:40923"),
+            headersFor: () => ({ "x-bili-plugin-context-window": "2000000" }),
+        };
+        assert.equal(installNativeFetchIntercept(state), true);
+        assert.equal((await globalThis.fetch("http://127.0.0.1:8199/v1/messages", { method: "POST", body: "{}" })).status, 200);
+        liveStateSlotEffect(state)()();
+        // 7.5 MiB < 8 MiB cap, ~2.24M est tokens > the 2M resolved window.
+        const res = await globalThis.fetch("http://127.0.0.1:8199/v1/messages", { method: "POST", body: "x".repeat(7.5 * 1024 * 1024) });
+        assert.equal(res.status, 422);
+        assert.equal(res.headers.get("x-bili-gate"), "oversize-refusal-no-live-state");
+        const j = (await res.json()) as { error?: { message: string } };
+        assert.match(j.error?.message ?? "", /2,000,000/, "names the resolved window");
+        assert.doesNotMatch(j.error?.message ?? "", /local bar/, "a >=1M resolved window is named as the window, not the floored bar");
+    } finally {
+        globalThis.fetch = saved;
+        _resetForTest();
+    }
+});
+
+test("the silent-direct ceiling defaults to 8 MiB and honors BILI_SILENT_DIRECT_MAX_MB (#5405 follow-up, #5826 review)", async () => {
+    const savedEnv = process.env.BILI_SILENT_DIRECT_MAX_MB;
+    const saved = globalThis.fetch;
+    _resetForTest();
+    const sink: string[] = [];
+    globalThis.fetch = fakeFetch(sink);
+    try {
+        assert.equal(MAX_SILENT_DIRECT_BODY_BYTES, 8 * 1024 * 1024, "default ceiling is 8 MiB");
+        const state: NativeInterceptState = { origin: "http://127.0.0.1:40913", ready: Promise.resolve("http://127.0.0.1:40913") };
+        assert.equal(installNativeFetchIntercept(state), true);
+        liveStateSlotEffect(state)()();
+        // A ~3 MiB body (the shape of an in-window image-heavy session) died
+        // at the old 2 MiB default with a retryable 422 that could never
+        // succeed; under the new default it rides the clean direct path.
+        const imgish = "x".repeat(3 * 1024 * 1024);
+        assert.equal((await globalThis.fetch("http://127.0.0.1:8199/v1/chat/completions", { method: "POST", body: imgish })).status, 200, "3 MiB passes the 8 MiB default");
+        // The knob lowers the ceiling for installs that want the tight guard.
+        process.env.BILI_SILENT_DIRECT_MAX_MB = "1";
+        const refused = await globalThis.fetch("http://127.0.0.1:8199/v1/chat/completions", { method: "POST", body: imgish });
+        assert.equal(refused.status, 422);
+        assert.equal(refused.headers.get("x-bili-gate"), "oversize-refusal-no-live-state");
+        // Invalid values fall back to the default (tiny body passes again).
+        for (const bad of ["abc", "0", "-2", ""]) {
+            process.env.BILI_SILENT_DIRECT_MAX_MB = bad;
+            assert.equal((await globalThis.fetch("http://127.0.0.1:8199/v1/messages", { method: "POST", body: "{}" })).status, 200);
+        }
+        delete process.env.BILI_SILENT_DIRECT_MAX_MB;
+        assert.equal((await globalThis.fetch("http://127.0.0.1:8199/v1/chat/completions", { method: "POST", body: imgish })).status, 200, "default restored");
+        assert.deepEqual(
+            sink.filter((u) => u.includes("chat/completions")),
+            ["http://127.0.0.1:8199/v1/chat/completions", "http://127.0.0.1:8199/v1/chat/completions"],
+            "only the two default-cap 3 MiB sends pass",
+        );
+    } finally {
+        globalThis.fetch = saved;
+        if (savedEnv === undefined) delete process.env.BILI_SILENT_DIRECT_MAX_MB;
+        else process.env.BILI_SILENT_DIRECT_MAX_MB = savedEnv;
+        _resetForTest();
+    }
+});
+
 test("install: a missing live-state slot logs direct sends once per generation (#5405)", async () => {
     const saved = process.env.XDG_STATE_HOME;
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "bili-5405-state-log-"));
@@ -707,21 +841,33 @@ test("install: incident shape — declared window 262144 with a ~3 MiB body is r
     // of bytes/4 reach; a 3 MiB body sails past it even though it exceeds the
     // declared window by ~3.7×. That is how the 975K-token field shape would
     // have slipped the gate path too.
+    // The #5826 release review raised the DEFAULT ceiling to 8 MiB (owner
+    // ruling: media-blind raw bytes killed in-window image sessions), and at
+    // 8 MiB no body can sit between the ceiling and the 4 MB doom bar — so
+    // this isolation pin sets the knob back to 2 MiB (which also proves the
+    // knob takes effect on the unattributed arm).
+    const savedEnv = process.env.BILI_SILENT_DIRECT_MAX_MB;
+    process.env.BILI_SILENT_DIRECT_MAX_MB = "2";
     const state: NativeInterceptState = {
         origin: "http://127.0.0.1:40911",
         ready: Promise.resolve("http://127.0.0.1:40911"),
         takeoverGate: () => false,
     };
-    const { sink } = await withPatch(state, async (fetch) => {
-        const res = await fetch("http://127.0.0.1:8199/v1/chat/completions", {
-            method: "POST",
-            headers: { "x-bili-plugin-context-window": "262144" },
-            body: "d".repeat(3 * 1024 * 1024),
+    try {
+        const { sink } = await withPatch(state, async (fetch) => {
+            const res = await fetch("http://127.0.0.1:8199/v1/chat/completions", {
+                method: "POST",
+                headers: { "x-bili-plugin-context-window": "262144" },
+                body: "d".repeat(3 * 1024 * 1024),
+            });
+            assert.equal(res.status, 422);
+            assert.equal(res.headers.get("x-bili-gate"), "oversize-refusal-unattributed-bytes", "ceiling arm, not the floored-out doom arm");
         });
-        assert.equal(res.status, 422);
-        assert.equal(res.headers.get("x-bili-gate"), "oversize-refusal-unattributed-bytes", "ceiling arm, not the floored-out doom arm");
-    });
-    assert.deepEqual(sink, []);
+        assert.deepEqual(sink, []);
+    } finally {
+        if (savedEnv === undefined) delete process.env.BILI_SILENT_DIRECT_MAX_MB;
+        else process.env.BILI_SILENT_DIRECT_MAX_MB = savedEnv;
+    }
 });
 
 test("install: degraded proxy-down direct sends keep window-math-only behavior — the ceiling does not apply (#5405/#5408)", async () => {
@@ -1821,13 +1967,18 @@ test("#2592/#2709: unattributed raw-URL POST without the marker still sends dire
     assert.deepEqual(sink, ["https://api.deepseek.com/chat/completions"]);
 });
 
-test("#2592/#2709: marker hit but proxy not ready falls open to a direct send", async () => {
+test("#2592/#2709/#5686: marker-decisive compaction POST with dead proxy refuses LOCALLY instead of falling open", async () => {
+    // Pre-#5686 this case fell open to a direct send — exactly the leak
+    // window that let dsh checkpoints land under bili's feet (#5517 cluster).
+    // The decisive marker + no usable proxy combination now refuses with a
+    // protocol-shaped 422; nothing reaches the upstream provider.
     const state: NativeInterceptState = { origin: undefined, ready: Promise.resolve(undefined), takeoverGate: () => false };
     const { sink } = await withPatch(state, async (fetch) => {
         const res = await fetch("https://api.deepseek.com/chat/completions", { method: "POST", body: dshCompactionEnvelope() });
-        assert.equal(res.status, 200);
+        assert.equal(res.status, 422);
+        assert.equal(res.headers.get("x-bili-gate"), "dsh-compaction-refused");
     });
-    assert.deepEqual(sink, ["https://api.deepseek.com/chat/completions"]);
+    assert.deepEqual(sink, [], "no upstream fetch — local refusal only");
 });
 
 test("#2592/#2709: Uint8Array body with the marker diverts; URLSearchParams form-encoding cannot carry the raw marker", async () => {

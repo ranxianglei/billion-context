@@ -136,8 +136,9 @@ export async function handlePluginRender(req: http.IncomingMessage, res: http.Se
     // Fold-point carrier relocation mirror (switch A): with the knob on, move
     // still-visible compress pairs from their original slot to their fold point
     // — the same view-only transform the kernel node applies on processTurn,
-    // so the rendered prefix and steady turns agree. S4 has no per-request
-    // strictness context, so move-only (no thinking clear here).
+    // so the rendered prefix and steady turns agree (v2: summary text relocated
+    // to the fold point, pair kept in slot with pointer args). S4 has no
+    // per-request strictness context, so no thinking clear here.
     // KNOWN ASYMMETRY (v1, #5470 review): the knob is read from env + the
     // global `compress` file section only, while steady turns resolve through
     // the full cascade — a key set at a provider/model tier moves pairs on

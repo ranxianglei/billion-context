@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { readdir, readFile, rm } from "node:fs/promises";
 import * as path from "node:path";
 const { join } = path;
@@ -341,6 +341,61 @@ export function fileNameMatchesId(base: string, id: string, protocol?: string, u
     return false;
 }
 
+/** #5779: forensic retention cap for `.corrupt-<ts>` quarantine copies per base
+ *  file, counting the just-created copy. The newest copy carries the forensics;
+ *  older copies of the same base are redundant history of an already-fresh-
+ *  started session. */
+export const CORRUPT_SIBLING_CAP = 1;
+
+/** #5779: bound `.corrupt-<ts>` quarantine copies so a hot session can no
+ *  longer accumulate unbounded forensic weight on disk (issue #5779: 273 ×
+ *  ~0.6 GiB in one tree). Keeps at most CORRUPT_SIBLING_CAP siblings of
+ *  `baseFile` in total — `keepPath` (the just-created copy) always survives
+ *  even under clock skew; older ones are deleted. Best-effort: an unreadable
+ *  dir or a locked file (Windows AV) skips the entry and the next quarantine
+ *  retries the sweep. Returns removal counts for log lines; never throws. */
+export function pruneCorruptSiblings(baseFile: string, keepPath?: string): { removed: number; locked: number } {
+    const dir = path.dirname(baseFile);
+    const prefix = `${path.basename(baseFile)}.corrupt-`;
+    const keepName = keepPath ? path.basename(keepPath) : undefined;
+    let names: string[];
+    try {
+        names = readdirSync(dir);
+    } catch {
+        return { removed: 0, locked: 0 };
+    }
+    const stampOf = (name: string): number => {
+        const n = Number(name.slice(prefix.length));
+        return Number.isFinite(n) ? n : 0;
+    };
+    const others = names.filter((n) => n.startsWith(prefix) && n !== keepName).sort((a, b) => stampOf(b) - stampOf(a));
+    let removed = 0;
+    let locked = 0;
+    for (const name of others.slice(Math.max(0, CORRUPT_SIBLING_CAP - 1))) {
+        try {
+            unlinkSync(path.join(dir, name));
+            removed++;
+        } catch {
+            locked++;
+        }
+    }
+    return { removed, locked };
+}
+
+/** #5779: true when a decode failure is resource exhaustion — V8 reports both
+ *  allocation families ("Array buffer allocation failed", "JavaScript heap out
+ *  of memory") as RangeError. Such a file must NOT be quarantined: the bytes
+ *  are fine, the process just could not afford them this round. The
+ *  "Maximum call stack size exceeded" RangeError is structural pathology
+ *  (genuinely pathological payload depth) and stays on the corruption side. */
+export function isAllocationFailureError(error: unknown): boolean {
+    return error instanceof RangeError && /allocation failed|heap out of memory/i.test(error.message);
+}
+
+function errText(error: unknown): string {
+    return error instanceof Error ? error.message : String(error);
+}
+
 /** Session persistence policy over the kernel StateStore mechanism. The
  *  public API predates the extraction and is kept stable for session.ts /
  *  server.ts / export.ts. */
@@ -375,12 +430,19 @@ export class SessionStore {
      *  nobody else committed since — skipping the full-file read+parse that
      *  costs ~320ms/turn on >40MiB sessions. An unstamped token (no "written")
      *  is unproven and never takes the fast path. Cleared on the direct-write
-     *  paths (restore/rekey) that bypass guardedBuild. */
+     *  paths (restore/rekey) that bypass guardedBuild.
+     *
+     *  #5805: under index-only persistence this process never writes the
+     *  envelope at all, so "written" can never be stamped — the file proof is
+     *  replaced by "writerOffFile", the envelope's stat AT OUR LAST BUILD: an
+     *  unchanged file proves no foreign writer landed since, and the unified
+     *  rows already prove no sibling committed. */
     private readonly ownCommit = new Map<string, {
         requests: number;
         nextBlockId: number;
         builtAtMs: number;
         written?: { size: number; mtimeMs: number };
+        writerOffFile?: string;
         meta?: { protocol?: string; upstreamOrigin?: string };
     }>();
 
@@ -431,6 +493,10 @@ export class SessionStore {
      *  names (pid + seq makes collisions across processes/rapid saves
      *  unreachable). */
     private tmpSeq = 0;
+    /** #5865-P2: envelope files that OOM'd on decode (healthy bytes, unreadable
+     *  this round) — the next save for that id snapshots them first instead of
+     *  silently overwriting (see withPreoomSnapshot). */
+    private readonly preoomPending = new Set<string>();
     // #3931 step 3: assigned asynchronously for network backends (mysql) —
     // see the constructor and ready().
     private shadow?: UnifiedShadow;
@@ -811,8 +877,8 @@ export class SessionStore {
                 // negative value is gone from disk.
                 const warmProof = session.revisionEpoch; // #4788 D2
                 const warmRec: { v: PersistedSession | null } = { v: null };
-                await this.store.writeNow(id, () => { const r = this.buildRecordForSave(session); warmRec.v = r; return r; });
-                if (warmRec.v) this.committedMetaFp.set(id, this.metaFingerprint(warmRec.v.metadata ?? {})); // #5506: clamp rewrite landed
+                await this.withPreoomSnapshot(id, session.meta, () => this.store.writeNow(id, () => { const r = this.buildRecordForSave(session); warmRec.v = r; return r; }));
+                if (warmRec.v) this.noteMetaFp(id, warmRec.v.metadata ?? {}); // #5506: clamp rewrite landed
                 this.noteDurable(id, warmProof); // clamp rewrite landed
                 clamped++;
                 // #3049: the clamp rewrite writes a DIFFERENT payload than any
@@ -1153,14 +1219,25 @@ export class SessionStore {
         }
         let raw: unknown;
         try { raw = JSON.parse(bytes.toString("utf8")); }
-        catch {
+        catch (plainTextError) {
             try { raw = JSON.parse(this.readCodec.decode(bytes)); }
             catch (decodeError) {
                 // #3157 self-heal: a size-correct but undecodable file (a VDL=0
-                // zero file left by a crash between write and rename — now
-                // prevented by the fsync fix) used to throw here on every load,
-                // 502-ing the whole lane until a human deleted the file. Isolate
-                // it beside the original and start this session fresh instead.
+                // torn write — now prevented by #3157's fsync; pre-fix files can
+                // still surface) used to throw here on every load, 502-ing the
+                // whole lane until a human deleted the file. Isolate it beside
+                // the original and start this session fresh instead.
+                // #5779: allocation failure = resource exhaustion, not corruption —
+                // quarantining destroyed a healthy envelope and its fold state, and
+                // the eviction/cold-load loop rebuilt + re-quarantined it (~0.6 GiB
+                // of forensic copies per failure). Classify BOTH errors: an OOM in
+                // the first attempt leaves this catch holding only the codec's own
+                // format error. Leave the file in place; the next load retries.
+                if (isAllocationFailureError(plainTextError) || isAllocationFailureError(decodeError)) {
+                    this.log("error", `[persist] session state ${path.basename(file)} unreadable this round — decode ran out of memory, NOT corruption; file left in place for retry (${errText(plainTextError)} / ${errText(decodeError)})`);
+                    this.preoomPending.add(file);
+                    return null;
+                }
                 this.quarantineCorruptState(file, id, decodeError);
                 return null;
             }
@@ -1172,6 +1249,7 @@ export class SessionStore {
         }
         if (raw && typeof raw === "object" && "payload" in raw && "id" in raw && raw.id !== id) return null;
         if (payload.id !== id) return null;
+        this.preoomPending.delete(file);
         return { id, payload, version: payload.version, savedAt: payload.savedAt };
     }
 
@@ -1181,16 +1259,71 @@ export class SessionStore {
      *  (plugin.ts). Best-effort: if the rename fails (Windows AV/indexer lock),
      *  the caller still treats the file as a miss — the session starts fresh and
      *  the next boot retries the isolation. The `.corrupt-<ts>` suffix does not
-     *  end in `.json`, so the directory walkers skip it next boot (it stays for
-     *  forensics; sweepStaleTemps only removes `.tmp-*` orphans). */
+     *  end in `.json`, so the directory walkers skip it next boot. Retention is
+     *  bounded (#5779): pruneCorruptSiblings keeps only the newest
+     *  CORRUPT_SIBLING_CAP copy per base file — the forensic value lives in the
+     *  latest failure, and unbounded copies once filled user disks (~0.6 GiB
+     *  each, hundreds per tree). */
     private quarantineCorruptState(file: string, id: string, cause: unknown): void {
-        const causeText = cause instanceof Error ? cause.message : String(cause);
+        const causeText = errText(cause);
         const quarantinePath = `${file}.corrupt-${Date.now()}`;
         try {
             renameSync(file, quarantinePath);
-            this.log("warn", `[persist] quarantined undecodable session state ${path.basename(file)} → ${path.basename(quarantinePath)}; starting ${id} fresh (${causeText})`);
+            const pruned = pruneCorruptSiblings(file, quarantinePath);
+            const capNote = pruned.removed > 0 ? `; removed ${pruned.removed} older forensic cop${pruned.removed === 1 ? "y" : "ies"} (cap ${CORRUPT_SIBLING_CAP})` : "";
+            this.log("warn", `[persist] quarantined undecodable session state ${path.basename(file)} → ${path.basename(quarantinePath)}; starting ${id} fresh (${causeText})${capNote}`);
         } catch (renameErr) {
-            this.log("error", `[persist] failed to quarantine corrupt session state ${path.basename(file)}; resuming ${id} empty this load (${causeText}; rename: ${renameErr instanceof Error ? renameErr.message : String(renameErr)})`);
+            this.log("error", `[persist] failed to quarantine corrupt session state ${path.basename(file)}; resuming ${id} empty this load (${causeText}; rename: ${errText(renameErr)})`);
+        }
+    }
+
+    /** #5865-P2 (PR #5865 review): a session whose envelope OOM'd on decode was
+     *  resumed FRESH — its first save would then atomically replace the healthy
+     *  (but this round unreadable) bytes with the small fresh state: silent
+     *  permanent loss with no forensic copy. When `id` is in `preoomPending`,
+     *  snapshot the pre-existing file to `<file>.corrupt-preoom-<ts>` (same
+     *  `.corrupt-` family ⇒ same cap-1 pruning by pruneCorruptSiblings)
+     *  immediately before the overwriting write. If the write fails, the
+     *  snapshot is renamed back (best effort) so a failed save never strands
+     *  the healthy bytes behind a forensic name. No-op for every id that has
+     *  not OOM'd (one Set lookup). */
+    private withPreoomSnapshot<T>(id: string, meta: { protocol?: string; upstreamOrigin?: string } | undefined, write: () => T): T {
+        const file = path.join(this.sessionsDir, relPathFor(id, meta?.protocol, meta?.upstreamOrigin));
+        if (!this.preoomPending.has(file)) return write();
+        this.preoomPending.delete(file);
+        let snapshotPath: string | null = null;
+        try {
+            if (existsSync(file)) {
+                snapshotPath = `${file}.corrupt-preoom-${Date.now()}`;
+                renameSync(file, snapshotPath);
+                const pruned = pruneCorruptSiblings(file, snapshotPath);
+                const capNote = pruned.removed > 0 ? `; removed ${pruned.removed} older forensic cop${pruned.removed === 1 ? "y" : "ies"} (cap ${CORRUPT_SIBLING_CAP})` : "";
+                this.log("warn", `[persist] preserved pre-OOM session state ${path.basename(file)} → ${path.basename(snapshotPath)} before overwriting it with fresh state (the old envelope was healthy but unreadable under memory pressure)${capNote}`);
+            }
+        } catch (err) {
+            this.log("error", `[persist] failed to preserve pre-OOM session state ${path.basename(file)} before overwrite; proceeding as pre-fix (${errText(err)})`);
+            snapshotPath = null;
+        }
+        if (!snapshotPath) return write();
+        const restore = (): void => {
+            try {
+                if (existsSync(snapshotPath) && !existsSync(file)) renameSync(snapshotPath, file);
+            } catch { /* best effort: the forensic copy stays put */ }
+        };
+        try {
+            const result = write();
+            const asPromise = result as unknown as Promise<unknown> | undefined;
+            if (result && typeof asPromise?.then === "function") {
+                return asPromise.then(
+                    (value) => value,
+                    (error) => { restore(); throw error; },
+                ) as unknown as T;
+            }
+            if (typeof result === "boolean" && !result) restore();
+            return result;
+        } catch (err) {
+            restore();
+            throw err;
         }
     }
 
@@ -1213,11 +1346,22 @@ export class SessionStore {
             // #286 rekey, restoreReplica's direct writeNow — all stamp a fresh
             // savedAt at build time).
             const dbAt = this.shadow.sessionUpdatedAt(id);
-            if (dbAt === null || payload.savedAt > dbAt) {
-                this.shadow.importRecord(payload);
-            }
+            let importedNewer = false;
+            if (dbAt === null) this.shadow.importRecord(payload); // organic first open
+            else if (payload.savedAt > dbAt) importedNewer = this.shadow.importRecord(payload) !== null;
             const view = this.shadow.viewFor(id);
-            if (view) return buildSession(viewToRecord(view));
+            if (view) {
+                // #5755: a strictly-newer envelope whose import could not run
+                // (ingest failure) must not lose to the older unified row the
+                // index still holds — serve the envelope we are holding
+                // instead of a rollback through viewFor.
+                if (!importedNewer && dbAt !== null && payload.savedAt > dbAt) {
+                    this.log("warn", `[persist] newer envelope for ${id} (savedAt ${payload.savedAt}) could not be imported — serving the envelope view, unified row kept at ${dbAt}`);
+                    return buildSession(payload);
+                }
+                return buildSession(viewToRecord(view));
+            }
+            return buildSession(payload);
         }
         return buildSession(payload);
     }
@@ -1319,8 +1463,8 @@ export class SessionStore {
             session.id = label;
             const rekeyProof = session.revisionEpoch; // #4788 D2
             const rekeyRec: { v: PersistedSession | null } = { v: null };
-            await this.store.writeNow(label, () => { const r = this.buildRecordForSave(session); rekeyRec.v = r; return r; });
-            if (rekeyRec.v) this.committedMetaFp.set(label, this.metaFingerprint(rekeyRec.v.metadata ?? {})); // #5506: rekey rewrite landed
+            await this.withPreoomSnapshot(label, session.meta, () => this.store.writeNow(label, () => { const r = this.buildRecordForSave(session); rekeyRec.v = r; return r; }));
+            if (rekeyRec.v) this.noteMetaFp(label, rekeyRec.v.metadata ?? {}); // #5506: rekey rewrite landed
             this.noteDurable(label, rekeyProof); // rekey rewrite landed
             // #3049: direct write bypassing guardedBuild — the boot rekey
             // rewrites envelopes without the sidecar ingest, so any prior
@@ -2408,6 +2552,26 @@ export class SessionStore {
     deleteKv(namespace: string, key?: string): number {
         return this.liveShadow().deleteKv(namespace, key);
     }
+
+    /** #3388/#3931 async twins: network backends (mysql) resolve ONLY through
+     *  these — the sync facades above miss-noop there (sync handle absent).
+     *  On sqlite they wrap the very same synchronous calls in one microtask. */
+    setKvAsync(namespace: string, key: string, value: unknown): Promise<void> {
+        return this.liveShadow().setKvAsync(namespace, key, value);
+    }
+
+    getKvAsync(namespace: string, key: string): Promise<unknown> {
+        return this.liveShadow().getKvAsync(namespace, key);
+    }
+
+    listKvAsync(namespace?: string, keyPrefix?: string): Promise<{ namespace: string; key: string; value: unknown; updatedAt: number }[]> {
+        return this.liveShadow().listKvAsync(namespace, keyPrefix);
+    }
+
+    deleteKvAsync(namespace: string, key?: string): Promise<number> {
+        return this.liveShadow().deleteKvAsync(namespace, key);
+    }
+
     private liveShadow(): UnifiedShadow {
         if (!this.replicasAvailable()) throw new Error("[storage] replicas require the unified store (storage.unified=shadow|full or BILI_STORAGE_UNIFIED); this instance runs legacy-only");
         return this.shadow as UnifiedShadow;
@@ -2527,8 +2691,8 @@ export class SessionStore {
         record.id = newId;
         record.savedAt = Date.now();
         record.meta = { ...record.meta, restoredFrom: cp.session_id, restoredCheckpoint: cp.cp_id } as PersistedSession["meta"];
-        await this.store.writeNow(newId, () => record);
-        this.committedMetaFp.set(newId, this.metaFingerprint(record.metadata ?? {})); // #5506: replica restore landed
+        await this.withPreoomSnapshot(newId, record.meta, () => this.store.writeNow(newId, () => record));
+        this.noteMetaFp(newId, record.metadata ?? {}); // #5506: replica restore landed
         shadow.record(record);
         // #3049: the replica record was ingested from the checkpoint payload
         // — the ownership token must mirror exactly those counters.
@@ -2696,12 +2860,34 @@ export class SessionStore {
             return false; // sidecar hiccup — full read decides
         }
         if (!row || row.requests !== own.requests || row.nextBlockId !== own.nextBlockId) return false;
+        // #5805: index-only saves (writerOff, or a per-session envelope freeze)
+        // never touch the file, so "written" never exists and the proof below
+        // would fall back to the expensive full read on EVERY save — on a
+        // 100+ MiB session that was a 138 MB read + parse per turn. Replace it
+        // with the "no foreign writer since our last build" shape: the unified
+        // rows above already prove no sibling committed, and an unchanged
+        // envelope stat proves nothing wrote the file behind our back.
+        if (this.writerOffActive() || this.envelopeFrozen(incoming.id)) {
+            return this.envelopeFileKey(incoming.id, incoming.meta) === own.writerOffFile;
+        }
         const stat = this.statEnvelope(incoming.id, incoming.meta);
         if (!stat) return false;
         if (!own.written) return false; // unproven token (see stampOwnWrite) — full read decides
         if (stat.size !== own.written.size) return false; // any byte-count change is a foreign write (bigger OR smaller)
         if (stat.mtimeMs > own.written.mtimeMs + OWN_WRITE_STAMP_EPSILON_MS) return false;
         return true;
+    }
+
+    /** #5805: cheap identity of the envelope file's current state — the
+     *  index-only lane's stand-in for the "written" post-write stamp. The
+     *  mtime stays at full float precision (NO rounding): an untouched file
+     *  re-stats to the identical value on every supported filesystem, so the
+     *  comparison degrades conservatively (worst case: an extra exact read)
+     *  while rounding would blind the guard to a same-size foreign rewrite
+     *  landing within half a millisecond of the recorded stat (#5805). */
+    private envelopeFileKey(id: string, meta?: { protocol?: string; upstreamOrigin?: string }): string {
+        const stat = this.statEnvelope(id, meta);
+        return stat ? `${stat.size}:${stat.mtimeMs}` : "absent";
     }
 
     /** #3049: stat the envelope the way loadEnvelope would resolve it — the
@@ -2824,6 +3010,11 @@ export class SessionStore {
             nextBlockId: committed.state?.nextBlockId ?? 0,
             builtAtMs: Date.now(),
             written: prev?.written,
+            // #5805: index-only lanes produce no write stamp — record the
+            // envelope's stat as of this build instead (see ownershipFastPath).
+            writerOffFile: this.writerOffActive() || this.envelopeFrozen(id)
+                ? this.envelopeFileKey(id, committed.meta ?? prev?.meta)
+                : undefined,
             meta: committed.meta
                 ? { protocol: committed.meta.protocol, upstreamOrigin: committed.meta.upstreamOrigin }
                 : prev?.meta,
@@ -2938,7 +3129,7 @@ export class SessionStore {
                 try {
                     const rec = this.guardedBuild(session)();
                     this.maybeCutForkBase(session);
-                    this.committedMetaFp.set(session.id, this.metaFingerprint(rec.metadata ?? {})); // #5506: index-only build landed
+                    this.noteMetaFp(session.id, rec.metadata ?? {}); // #5506: index-only build landed
                     // #4788 D2: the index-only build landed synchronously —
                     // run the same settle protocol as a kernel-write land
                     // (invariant #5: this routing path gets equivalent
@@ -3000,9 +3191,9 @@ export class SessionStore {
             // Errors are logged inside the kernel write chain; swallowing here
             // keeps a failed timer write from becoming an unhandledRejection.
             this.saveWritesInFlight.add(id);
-            void this.store.writeNow(id, armed.build).then(() => {
+            void this.withPreoomSnapshot(id, peekSession(id)?.meta, () => this.store.writeNow(id, armed.build)).then(() => {
                 this.stampOwnWrite(id); // #3406: the write LANDED — prove our bytes are on disk
-                if (armed.rec) this.committedMetaFp.set(id, this.metaFingerprint(armed.rec.metadata ?? {})); // #5506: debounced save landed
+                if (armed.rec) this.noteMetaFp(id, armed.rec.metadata ?? {}); // #5506: debounced save landed
                 this.noteDurable(id, proofRevision);
                 this.lastSaveLanded.set(id, true);
                 // #4788 D2: discharge the droppable fields once the debounced
@@ -3176,7 +3367,7 @@ export class SessionStore {
             const proofRevision = session.revisionEpoch; // #4788 D2: capture BEFORE the sync build
             const rec = this.guardedBuild(session)();
             this.maybeCutForkBase(session);
-            this.committedMetaFp.set(session.id, this.metaFingerprint(rec.metadata ?? {})); // #5506: index-only build landed
+            this.noteMetaFp(session.id, rec.metadata ?? {}); // #5506: index-only build landed
             this.noteDurable(session.id, proofRevision); // #4788 D2: index-only build landed
             this.lastSaveLanded.set(session.id, true);
             this.foldResidentTail(session);
@@ -3189,13 +3380,13 @@ export class SessionStore {
         this.saveWritesInFlight.add(session.id);
         const rec: { v: PersistedSession | null } = { v: null };
         try {
-            await this.store.writeNow(session.id, () => { const r = this.guardedBuild(session)(); rec.v = r; return r; });
+            await this.withPreoomSnapshot(session.id, session.meta, () => this.store.writeNow(session.id, () => { const r = this.guardedBuild(session)(); rec.v = r; return r; }));
         } catch (err) {
             this.saveWritesInFlight.delete(session.id);
             throw err;
         }
         this.stampOwnWrite(session.id); // #3406: the write LANDED — prove our bytes are on disk
-        if (rec.v) this.committedMetaFp.set(session.id, this.metaFingerprint(rec.v.metadata ?? {})); // #5506: immediate save landed
+        if (rec.v) this.noteMetaFp(session.id, rec.v.metadata ?? {}); // #5506: immediate save landed
         this.maybeCutForkBase(session);
         this.noteDurable(session.id, proofRevision);
         this.lastSaveLanded.set(session.id, true);
@@ -3290,6 +3481,18 @@ export class SessionStore {
         return { ...(session.metadata as Record<string, unknown>), biliVersion: VERSION, storageMode: this.liveStorageStamp };
     }
 
+    /** #5805: the persisted-shape metadata fingerprint is consumed by exactly
+     *  one gate — dropResidentMetadata's #5506 fold proof — and index-only
+     *  persistence never folds that field (there is no envelope copy to
+     *  re-materialize from). Hashing the whole metadata record with SHA-256 on
+     *  every save is therefore dead weight in that lane; both stay in step
+     *  here so a lane flip can never leave the fold gate comparing a stale
+     *  proof. */
+    private noteMetaFp(id: string, metadata: Record<string, unknown>): void {
+        if (this.writerOffActive()) return;
+        this.committedMetaFp.set(id, this.metaFingerprint(metadata));
+    }
+
     /** #5506: stable identity of a persisted-shape metadata view — JSON-normalized
      *  (dates → strings, undefined dropped: mirrors what persistence does) then
      *  key-sorted canonicalized (field order must not matter across a disk
@@ -3310,7 +3513,11 @@ export class SessionStore {
      *  exact record a restart would restore). Same refusal semantics as
      *  ②b: an unrecoverable drop throws instead of going empty. */
     private dropResidentMetadata(session: Session): void {
-        if (session.inFlight > 0 || !this.enabled) return;
+        // #5805: an index-only save never writes the envelope, so the lazy
+        // proxies below can only re-materialize from a copy OLDER than memory
+        // (or from the unified index at full cost) — dropping here buys no
+        // safety and costs a re-read on every subsequent turn. Stay resident.
+        if (this.writerOffActive() || session.inFlight > 0 || !this.enabled) return;
         if (isDroppedMetadata(session.metadata)) return;
         if (Object.keys(session.metadata).length === 0) return;
         // #5506: fold ONLY when the disk copy provably carries these exact
@@ -3337,7 +3544,9 @@ export class SessionStore {
      *  store-bound loader (one disk read per burst). Mid-turn saves keep the
      *  resident set; sessions that never persisted keep their plain map. */
     private dropResidentBlockContents(session: Session): void {
-        if (session.inFlight > 0 || !this.enabled) return;
+        // #5805: same index-only rule as dropResidentMetadata — the envelope
+        // this proxy would read back from is stale by construction.
+        if (this.writerOffActive() || session.inFlight > 0 || !this.enabled) return;
         const existing = session.blockContents;
         if (existing instanceof LazyBlockContents) {
             existing.drop();
@@ -3365,7 +3574,10 @@ export class SessionStore {
      *  BILI_SESSION_CONTENT_STORE_PIN restores the previous always-resident
      *  behavior for operators who want it. */
     private dropResidentContentStore(session: Session): void {
-        if (session.inFlight > 0 || !this.enabled) return;
+        // #5805: index-only saves leave the envelope stale; the lazy CCR
+        // loader would restore from the unified mirror at a full read cost
+        // while the resident set is already the freshest copy.
+        if (this.writerOffActive() || session.inFlight > 0 || !this.enabled) return;
         if (isDroppedContentStore(session.contentStore)) return;
         if (session.contentStoreDirty) return; // unsaved growth stays resident until its own save settles
         if (contentStorePinned()) return;     // owner escape hatch
@@ -3468,7 +3680,7 @@ export class SessionStore {
                 return false;
             }
             this.maybeCutForkBase(session);
-            if (rec) this.committedMetaFp.set(session.id, this.metaFingerprint(rec.metadata ?? {})); // #5506: index-only flush landed
+            if (rec) this.noteMetaFp(session.id, rec.metadata ?? {}); // #5506: index-only flush landed
             this.noteDurable(session.id, proofRevision); // #4788 D2: index-only flush landed
             this.lastSaveLanded.set(session.id, true);
             this.foldResidentTail(session);
@@ -3488,10 +3700,10 @@ export class SessionStore {
         }
         const proofRevision = session.revisionEpoch; // #4788 D2: capture BEFORE the sync commit
         const syncRec: { v: PersistedSession | null } = { v: null };
-        const ok = this.store.flushSync(session.id, () => { const r = this.guardedBuild(session)(); syncRec.v = r; return r; });
+        const ok = this.withPreoomSnapshot<boolean>(session.id, session.meta, () => this.store.flushSync(session.id, () => { const r = this.guardedBuild(session)(); syncRec.v = r; return r; }));
         if (ok) {
             this.stampOwnWrite(session.id); // #3406: the write LANDED — prove our bytes are on disk
-            if (syncRec.v) this.committedMetaFp.set(session.id, this.metaFingerprint(syncRec.v.metadata ?? {})); // #5506: sync commit landed
+            if (syncRec.v) this.noteMetaFp(session.id, syncRec.v.metadata ?? {}); // #5506: sync commit landed
             this.noteDurable(session.id, proofRevision);
             this.maybeCutForkBase(session);
             this.foldResidentTail(session);
@@ -3518,11 +3730,11 @@ export class SessionStore {
         if (!this.saveContentStore(session)) throw new Error("fork content persistence failed; retry the same request");
         this.noteOwnCommit(session.id, record);
         if (!this.writerOffActive()) {
-            if (!this.store.flushSync(session.id, () => record)) throw new Error("fork envelope persistence failed; retry the same request");
+            if (!this.withPreoomSnapshot<boolean>(session.id, session.meta, () => this.store.flushSync(session.id, () => record))) throw new Error("fork envelope persistence failed; retry the same request");
             this.stampOwnWrite(session.id);
         }
         // #5506: the fork record is durable here (envelope or unified row) — prove its metadata
-        this.committedMetaFp.set(session.id, this.metaFingerprint(record.metadata ?? {}));
+        this.noteMetaFp(session.id, record.metadata ?? {});
         this.foldResidentTail(session);
         this.dropResidentBlockContents(session);
         this.dropResidentMetadata(session);
@@ -3541,11 +3753,11 @@ export class SessionStore {
         if (!this.saveContentStore(session)) throw new Error("fork content recovery failed");
         this.noteOwnCommit(id, record);
         if (!this.writerOffActive()) {
-            if (!this.store.flushSync(id, () => record)) throw new Error("fork envelope recovery failed");
+            if (!this.withPreoomSnapshot<boolean>(id, session.meta, () => this.store.flushSync(id, () => record))) throw new Error("fork envelope recovery failed");
             this.stampOwnWrite(id);
         }
         // #5506: recovered record now durable (envelope written or unified row already held it)
-        this.committedMetaFp.set(id, this.metaFingerprint(record.metadata ?? {}));
+        this.noteMetaFp(id, record.metadata ?? {});
         await this.maybeCutForkBaseAsync(session);
     }
 
@@ -3579,9 +3791,9 @@ export class SessionStore {
             this.saveBuilders.delete(id);
         }
         await Promise.all([...armed.entries()].map(([id, slot]) =>
-            this.store.writeNow(id, slot.build).then(() => {
+            this.withPreoomSnapshot(id, peekSession(id)?.meta, () => this.store.writeNow(id, slot.build)).then(() => {
                 this.stampOwnWrite(id);
-                if (slot.rec) this.committedMetaFp.set(id, this.metaFingerprint(slot.rec.metadata ?? {})); // #5506: shutdown flush landed
+                if (slot.rec) this.noteMetaFp(id, slot.rec.metadata ?? {}); // #5506: shutdown flush landed
             }).catch((e) => {
                 this.log("error", `[persist] shutdown flush failed for ${id}: ${String(e)}`);
             }),
@@ -4156,4 +4368,17 @@ export function _setStoreForTest(store: SessionStore): void {
 export function _resetStoreForTest(): void {
     _store?.closeQuietly();
     _store = null;
+}
+
+/** #5548: advisory probe for the notice-receipt surface — does the EXISTING
+ *  singleton (if any) offer a usable unified KV (shadow/full sidecar)?
+ *  Never creates the store, never throws: false ⇒ callers keep the legacy
+ *  file path (a legacy-only instance has no KV rows to read or write). */
+export function unifiedKvActive(): boolean {
+    try {
+        if (_store === null) return false;
+        return _store.liveStorageStamp !== "legacy";
+    } catch {
+        return false;
+    }
 }
