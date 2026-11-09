@@ -153,7 +153,7 @@ Env vars are a **scarce surface**: by default a new behavior knob becomes a conf
 
 ### Documentation Layout (owner ruling 2026-11-08, #5920)
 
-- **One hub.** All design/config/protocol/identity docs live under `docs/`. The repo root keeps only `README.md`, `README.zh-CN.md`, `AGENTS.md`, `CHANGELOG.md` (plus temporary redirect stubs per rule 5). New docs go in `docs/`, never at the root.
+- **One hub.** All design/config/protocol/identity docs live under `docs/`. The repo root keeps only four **core** entry files — `README.md`, `README.zh-CN.md`, `AGENTS.md`, `CHANGELOG.md` (plus temporary redirect stubs per rule 5) — and recognized community-maintained README translations (`README.<locale>.md`, e.g. `README.ja.md`, approved 2026-11-09, #6000); the four core files stay locked. New non-translation docs go in `docs/`, never at the root.
 - **Naming & language.** kebab-case English base name; bilingual (en + `<same>.zh-CN.md`) is the default (en/zh parity per §7.3). A single-language doc must state why in its `docs/index` entry.
 - **Index.** Every new or moved doc must be listed in `docs/index.md` AND `docs/index.zh-CN.md` in the same PR.
 - **Split with `reference/`.** `docs/` = decision/reviewer-facing reference material; `reference/` = AGENTS lazy-loaded construction procedures + the KDD full text ([design-decisions.md](reference/design-decisions.md)). New how-to procedures → `reference/` (+ AGENTS.md pointer); new concepts/decisions → `docs/`.
