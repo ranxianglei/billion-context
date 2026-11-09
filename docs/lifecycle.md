@@ -136,6 +136,7 @@
 | `BILI_SESSION_WARM_MAX_BYTES` | warm 解码字节上限，64 MiB（#2803） |
 | `BILI_PERSIST` | `=0` 关闭持久化（ephemeral/test） |
 | `BILI_PERSIST_DEBOUNCE_MS` | persist.debounceMs，500 |
+| `BILI_PERSIST_MAX_DELAY_MS` | persist.maxDelayMs，5000——持续写入时待落盘写入的等待上限（#6062） |
 | `BILI_PERSIST_EPERM_ALERT_THRESHOLD` / `BILI_PERSIST_EPERM_ALERT_REPEAT_MS` | EPERM 告警阈值 5 / 重复间隔 0（不限次） |
 | `BILI_PERSIST_TAIL_TOKENS` | persist.tailTokens，16384（0 禁用消息持久化，#401） |
 | `BILI_PERSIST_ZSTD` | `=1/true` 启用 zstd 压缩持久化（owner 决定 #1080，默认 off） |

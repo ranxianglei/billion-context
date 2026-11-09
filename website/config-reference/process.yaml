@@ -283,8 +283,8 @@ entries:
     site_group: proc
     desc_en: "Session persistence to disk under the XDG state dir."
     desc_zh: "会话落盘持久化（XDG state 目录之下）。"
-    site_en: "<code>persist</code> — session persistence to disk: <span class='mech'>enabled true · zstd false · debounceMs 500 · tailTokens 16384 · epermAlertThreshold 5 · epermAlertRepeatMs 0</span>."
-    site_zh: "<code>persist</code> —— 会话落盘持久化：<span class='mech'>enabled true · zstd false · debounceMs 500 · tailTokens 16384 · epermAlertThreshold 5 · epermAlertRepeatMs 0</span>。"
+    site_en: "<code>persist</code> — session persistence to disk: <span class='mech'>enabled true · zstd false · debounceMs 500 · maxDelayMs 5000 · tailTokens 16384 · epermAlertThreshold 5 · epermAlertRepeatMs 0</span>."
+    site_zh: "<code>persist</code> —— 会话落盘持久化：<span class='mech'>enabled true · zstd false · debounceMs 500 · maxDelayMs 5000 · tailTokens 16384 · epermAlertThreshold 5 · epermAlertRepeatMs 0</span>。"
   - key: persist.enabled
     type: boolean
     default: "true"
@@ -306,6 +306,13 @@ entries:
     group: process
     desc_en: "Write debounce window for session files."
     desc_zh: "会话文件写入的去抖窗口。"
+  - key: persist.maxDelayMs
+    type: number
+    default: "5000"
+    env: BILI_PERSIST_MAX_DELAY_MS
+    group: process
+    desc_en: "Cap on how long a pending session-file write may wait under continuous activity — the debounce window restarts on every mutation, so this budget bounds the steady-state rewrite rate on wear-sensitive drives (#6062)."
+    desc_zh: "持续写入时一次待落盘写入最多可等待的时长上限——去抖窗口每次变更都会重置，这个预算决定磨损敏感盘上的稳态重写速率（#6062）。"
   - key: persist.tailTokens
     type: number
     default: "16384 (0 disables message persistence)"
