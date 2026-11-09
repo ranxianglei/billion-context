@@ -56,7 +56,7 @@ describe("#5173 new dsh injection classifiers", () => {
 });
 
 describe("#5173 registry wiring", () => {
-    test("all eleven dsh families resolve in BOTH the slot-exclusion and drift-accounting registries", () => {
+    test("all twelve dsh families resolve in BOTH the slot-exclusion and drift-accounting registries", () => {
         const samples: Array<[string, string]> = [
             ["\x3csystem-reminder\x3e \x3cavailable_skills\x3e updated catalog \x3c/available_skills\x3e", "durable/skill-catalog"],
             ["Instructions from: /home/x/.dsh/AGENTS.md", "durable/agents-md"],
@@ -69,6 +69,7 @@ describe("#5173 registry wiring", () => {
             ["Background subagent session-x finished and will do no further work unless you send it more.", "oneshot/subagent-settled"],
             ["Agent session-y sent a message: over there", "oneshot/agent-relay"],
             ['Image "x.png" (sha256:2e896b95dec003df); request preview 1600x900px. Normalized copy (read-only; may be resized or re-encoded): "normalized/x.png" (1600x900px, image/png). Source dimensions, format, and byte size may differ.', "oneshot/image-handle"],
+            ['[image omitted to fit request image limits; "image.png" (sha256:0e596a186ab8f0c2). Normalized copy (read-only; may be resized or re-encoded): "normalized/image.png" (1584x892px, image/png).]', "oneshot/image-offload-placeholder"],
         ];
         for (const [text, expected] of samples) {
             const msg = mk("w", "user", text);

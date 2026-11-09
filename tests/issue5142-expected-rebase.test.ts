@@ -288,7 +288,13 @@ describe("#5142 expected-rebase accounting", () => {
         const r = reconcileFoldCoverage(session, wire2, fullOpts);
         assert.equal(recordOf(session)?.[img.id!], "image-offload", "the production placeholder must pair structurally at its slot");
         assert.ok(!logs.some(([, m]) => m.includes("resent history drifted")), "production offload must not read as drift");
-        assert.equal(r.expectedRetired, 1);
+        // #6021: the placeholder cell is ALSO a classified one-shot carrier now,
+        // so the production pair accounts BOTH sides — the retired image row
+        // (structural image-offload pairing, channel 3) and the fresh
+        // placeholder cell (channel-1 carrier mark covering its own later
+        // retirement). Pre-#6021 the unclassified placeholder accounted only
+        // the image row (1).
+        assert.equal(r.expectedRetired, 2);
     });
 
     test("T3a real head truncation still alarms — no expected-rebase masking (#3617 negative)", () => {
@@ -441,7 +447,7 @@ describe("#5142 carrier classifier units", () => {
     test("dshCarrierRawMarkers stay in lockstep with the dsh lane classifiers", () => {
         const cls = oneShotCarrierPaths.dsh;
         assert.ok(cls !== undefined, "dsh lane must have a classifier registry entry");
-        assert.ok(dshCarrierRawMarkers.length >= 12, "twelve raw markers for the eleven known dsh carrier families");
+        assert.ok(dshCarrierRawMarkers.length >= 14, "fourteen raw markers for the twelve known dsh carrier families");
         // Markers that only occur mid-template need their fixed left context to
         // be a standalone classifiable shape (the relay wrapper's sender-id slot
         // varies, so the joint alone cannot classify).
