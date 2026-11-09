@@ -8,7 +8,7 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import { CORRUPT_SIBLING_CAP, getStore, pruneCorruptSiblings, storageStatusLabel } from "./persist.js";
 import { cloneStoreForRefs } from "./store.js";
-import { acquireInFlight, createSession, getSessionAsync, publishForkSession, diagnoseSuccessWithoutUsage, effectiveConfig, findSessionByCanonicalId, listSessions, markCompactionBoundary, markDirty, noteAbortedTurn, peekSession, releaseInFlight, statusInputBaseline, withSessionLock, type Session } from "./session.js";
+import { acquireInFlight, createSession, getSessionAsync, publishForkSession, diagnoseSuccessWithoutUsage, effectiveConfig, findSessionByCanonicalId, listSessions, markCompactionBoundary, markDirty, noteAbortedTurn, noteTruncatedUpstream, peekSession, releaseInFlight, statusInputBaseline, withSessionLock, type Session } from "./session.js";
 import { clientConversationHeader } from "./session-id.js";
 import { buildContextView } from "./context-view.js";
 import { ABSORB_TOOL_NAME, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_OPENAI_NO_RANGE, BILI_ACP_TOOLS_RESPONSES_NO_RANGE, PROXY_TOOL_NAMES, READ_ORIGINAL_IMAGE_TOOL, READ_ORIGINAL_IMAGE_TOOL_NAME, READ_ORIGINAL_IMAGE_TOOL_OPENAI, READ_ORIGINAL_IMAGE_TOOL_RESPONSES, RETRIEVE_TOOL_NAME, RULE_TOOL, RULE_TOOL_NAME, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES, SEARCH_CONTEXT_TOOL_NAME, absorbToolsFor, retrieveToolsFor, withAcpNotes, withAcpNotesOpenAI } from "./compress-tool.js";
@@ -3743,6 +3743,7 @@ export async function pipePluginChatWithStrip(
             // Permitlist hosts (pi) get the raw cut — their native layer
             // classifies it as transient and retries; everyone else gets the
             // in-band truncation signal.
+            if (session) noteTruncatedUpstream(session, protocol, "eof");
             emitUpstreamTruncation(res, protocol, finalFinishReason !== undefined, log, buildTruncationDiag("eof"), transparentTruncationApplies(session));
             return;
         }
@@ -3770,6 +3771,7 @@ export async function pipePluginChatWithStrip(
             /* client half-gone; the emission below is best-effort too */
         }
         loggerLog("warn", `[plugin] upstream stream read failed (${protocol}): ${String(e instanceof Error ? e.message : e)} — truncation signal path`);
+        if (session) noteTruncatedUpstream(session, protocol, "read-error");
         emitUpstreamTruncation(res, protocol, finalFinishReason !== undefined, log, buildTruncationDiag("read-error"), transparentTruncationApplies(session));
         return;
     } finally {
@@ -4637,6 +4639,7 @@ export async function pipePluginResponsesWithStrip(
         // event. Permitlist hosts (pi) get the raw cut for their native
         // classifier; everyone else gets the in-band error frame.
         if (!sawTerminal && !res.destroyed && !res.writableEnded) {
+            if (session) noteTruncatedUpstream(session, "responses", "eof");
             emitUpstreamTruncation(res, "responses", false, log, buildTruncationDiag("eof"), transparentTruncationApplies(session));
             return;
         }
@@ -4661,6 +4664,7 @@ export async function pipePluginResponsesWithStrip(
             /* client half-gone; the emission below is best-effort too */
         }
         loggerLog("warn", `[plugin] upstream stream read failed (responses): ${String(e instanceof Error ? e.message : e)} — truncation signal path`);
+        if (session) noteTruncatedUpstream(session, "responses", "read-error");
         emitUpstreamTruncation(res, "responses", false, log, buildTruncationDiag("read-error"), transparentTruncationApplies(session));
         return;
     } finally {

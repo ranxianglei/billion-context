@@ -33,7 +33,7 @@ import { currentFetchTransport } from "../fetch-transport.js";
 import { refForItemBytes } from "../image-rescale.js";
 import { countImagesInParsedBody, countImagesInRawBody, upstreamHost } from "../image-tokens.js";
 import { log as loggerLog } from "../logger.js";
-import { dumpReqAllowed as knobDumpReqAllowed, limitsWsOutboundBytes, rawDumpDir as knobRawDumpDir } from "../knobs.js";
+import { dumpReqAllowed as knobDumpReqAllowed, limitsMaxMessages, limitsWsOutboundBytes, rawDumpDir as knobRawDumpDir } from "../knobs.js";
 import { gcDumpDirIfConfigured } from "../state-gc.js";
 import { applyLaneCredential, laneCredential } from "../lane-credentials.js";
 import { CREDENTIAL_HEADER_RE, maskHeaderForLog, maskHeadersForLog, maskHostPortForDisplay, maskUrlForLog } from "../log-mask.js";
@@ -69,7 +69,7 @@ import { buildForwardHeaders, connectionNamedHeaders, RESPONSE_ONLY_STRIP_HEADER
 import { bodyDumpEnabled, logDumpFailure } from "./observability.js";
 import { effectiveAbsorbBlock } from "./prepare-responses.js";
 import { awaitDrain, bufferToStream, dumpStreamToFile, pipeThrough, readStreamToBuffer } from "./stream-io.js";
-import { buildForwardTarget, makeFoldPointReasoningDroppable, measuredOutboundTokens, outboundPayloadBreakdown, registerRequestAbort, beginStreamKeepalive, effectiveTokenCount, googlePathKind, imageBillingFor, imageTokenCapFor, inboundResignCredential, outboundContextEstimates, repairResponsesAssistantOrdering, resolveUpstream, stripKernelSummaries, usageGradeInputBaseline, DOOMED_PROBE_ABSOLUTE_BYTES, DOOMED_PROBE_BYTES_PER_TOKEN, type Prepared } from "../server.js";
+import { buildForwardTarget, makeFoldPointReasoningDroppable, measuredBreakdownClause, measuredOutbound, outboundPayloadBreakdown, registerRequestAbort, beginStreamKeepalive, effectiveTokenCount, googlePathKind, imageBillingFor, imageTokenCapFor, inboundResignCredential, outboundContextEstimates, repairResponsesAssistantOrdering, resolveUpstream, stripKernelSummaries, usageGradeInputBaseline, DOOMED_PROBE_ABSOLUTE_BYTES, DOOMED_PROBE_BYTES_PER_TOKEN, type Prepared } from "../server.js";
 import { isStrictReasoningEcho, modelIdOf } from "../strict-echo.js";
 
 /** Infer the wire protocol from the request path for compat-role rewrites on
@@ -743,10 +743,27 @@ async function forwardCaptured(
             // window sits ABOVE the 1M floor, so floored or not the 1.12M-token
             // body exceeds it. The byte floor stays as the fallback for
             // unparseable bodies. No refusal record either way (#3974).
-            const fuseRawTokens = measuredOutboundTokens(prepared);
-            if (fuseRawTokens !== undefined && fuseRawTokens > fuseWindow) {
+            // #5000 item 2: the COUNT dimension — no window, tokenizer, or byte
+            // floor sees the messages[] array length (the 26,903-message #5000
+            // session cleared every size gate and died at the upstream). Same
+            // per-upstream opt-in as preflight (BILI_MAX_MESSAGES); the fuse is
+            // the last line for the no-model lane where preflight never ran.
+            const fuseMaxMessages = limitsMaxMessages();
+            if (fuseMaxMessages > 0 && fuseMsgs.length > fuseMaxMessages) {
+                const countMessage = `message count ${fuseMsgs.length.toLocaleString("en-US")} exceeds the upstream wire limit ${fuseMaxMessages.toLocaleString("en-US")} (COUNT dimension — a hard upstream constraint on the messages[] array that no byte/token estimate expresses, #5000); the send was stopped at the egress fuse instead of being forwarded. Reduce the session history — restart the session or rewind to an earlier point — and retry.`;
+                log("warn", `413: [${prepared.session.id}] egress window fuse count gate: ${countMessage}`);
+                if (res.headersSent) emitStreamError(res, prepared.protocol, countMessage, undefined, opts.streamErrorShape);
+                else {
+                    res.writeHead(413, { "content-type": "application/json" });
+                    res.end(JSON.stringify({ error: { type: "request_too_large", code: "egress_window_fuse", stage: "forward", message: countMessage, retryable: false } }));
+                }
+                return;
+            }
+            const fuseMeasured = measuredOutbound(prepared);
+            const fuseRawTokens = fuseMeasured?.tokens;
+            if (fuseMeasured !== undefined && fuseRawTokens !== undefined && fuseRawTokens > fuseWindow) {
                 log("warn", `413: [${prepared.session.id}] egress window fuse measured-body profile: ${describeCoreTextDuplication(fuseMsgs)}`);
-                const fuseMessage = `outbound body measures ~${fuseRawTokens.toLocaleString("en-US")} tokens (system + tools + arguments + messages; CJK-aware count, the #554 guard meter) vs the effective model window ${declaredWindow.toLocaleString("en-US")} (bars never assume below ${MIN_ASSUMED_WINDOW_TOKENS} tokens, #4079) (model=${prepared.model ?? "unknown"}); the body ITSELF exceeds the window, so the send was stopped at the egress fuse instead of being forwarded (#5000/#4543/#4068). Remove or trim the oversized content (e.g. a giant paste or tool result) and retry.`;
+                const fuseMessage = `outbound body measures ~${fuseRawTokens.toLocaleString("en-US")} tokens (${measuredBreakdownClause(fuseMeasured.breakdown)}; CJK-aware count, the #554 guard meter) vs the effective model window ${declaredWindow.toLocaleString("en-US")} (bars never assume below ${MIN_ASSUMED_WINDOW_TOKENS} tokens, #4079) (model=${prepared.model ?? "unknown"}); the body ITSELF exceeds the window, so the send was stopped at the egress fuse instead of being forwarded (#5000/#4543/#4068). Remove or trim the oversized dimension named above (e.g. a giant paste or tool result in messages[], or tools[] schemas) and retry.`;
                 log("warn", `413: [${prepared.session.id}] egress window fuse: ${fuseMessage}`);
                 if (res.headersSent) emitStreamError(res, prepared.protocol, fuseMessage, undefined, opts.streamErrorShape);
                 else {

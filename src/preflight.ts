@@ -469,6 +469,53 @@ export function estimateRawBodyTokens(parsed: unknown): number {
     return tokens;
 }
 
+/** #5000 item 3: which DIMENSION carries the outbound mass. The doom messages
+ *  must say whether it is messages[] (a giant paste / tool result), tools[]
+ *  (84 schemas in #5000), the system prompt, or structural other — "trim the
+ *  oversized content" is actively misleading for a 55.2 MiB body whose
+ *  messages[] is only 1.44 MiB. Same walk + same exclusions as
+ *  estimateRawBodyTokens, split on the TOP-LEVEL field, so `total` always
+ *  equals estimateRawBodyTokens(parsed) exactly. */
+export interface RawBodyBreakdown {
+    total: number;
+    messages: number;
+    tools: number;
+    system: number;
+    other: number;
+}
+
+export function estimateRawBodyBreakdown(parsed: unknown): RawBodyBreakdown {
+    const buckets: [number, number, number, number] = [0, 0, 0, 0]; // messages, tools, system, other
+    const walk = (value: unknown, key: string | undefined, bucket: number): void => {
+        if (typeof value === "string") {
+            if (!key || !NON_TEXT_BODY_KEYS.has(key)) buckets[bucket] += defaultCountTokens(value);
+            return;
+        }
+        if (Array.isArray(value)) {
+            for (const item of value) walk(item, key, bucket);
+            return;
+        }
+        if (value && typeof value === "object") {
+            for (const [k, v] of Object.entries(value as Record<string, unknown>)) walk(v, k, bucket);
+        }
+    };
+    if (parsed && typeof parsed === "object") {
+        for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+            const bucket = k === "messages" ? 0 : k === "tools" ? 1 : k === "system" ? 2 : 3;
+            walk(v, k, bucket);
+        }
+    } else {
+        walk(parsed, undefined, 3);
+    }
+    return {
+        total: buckets[0] + buckets[1] + buckets[2] + buckets[3],
+        messages: buckets[0],
+        tools: buckets[1],
+        system: buckets[2],
+        other: buckets[3],
+    };
+}
+
 // #553: upper-bound variant of estimateCoreMessages — every character counts
 // as one token. A BPE token covers >=1 char (Latin/code) and CJK is already
 // ~1 token/char, so this never undershoots the real count, unlike
