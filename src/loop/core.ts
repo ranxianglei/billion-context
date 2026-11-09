@@ -1230,10 +1230,12 @@ export async function* runCompressLoop(
                 break;
             }
 
-            // #732 follow-up (observability only): the one-shot budget was consumed this
-            // round AND the FINAL attempt (i.e. the retry's own output) still ended with zero
-            // visible output — a double-degenerate turn passing through. The host nudge is the
-            // only remaining safety net, so make the fleet able to count it.
+            // #732 follow-up (observability only): the one-shot PER-REQUEST retry budget
+            // (degenerateRetried — shared with the #2303 draft-tail path, never reset per
+            // round) was already spent earlier in this request, and THIS round still ended
+            // degenerate — zero visible output, no tool call — so nothing will retry it.
+            // The host nudge is the only remaining safety net; make the fleet able to
+            // count these pass-throughs.
             if (
                 degenerateRetried &&
                 sawDone &&
@@ -1247,7 +1249,7 @@ export async function* runCompressLoop(
                 calls.length === 0 &&
                 !signal?.aborted
             ) {
-                loggerLog("warn", `[acp-loop] degenerate-turn DOUBLE-degenerate: the retry output was empty again, round ${round} (session ${ctx.session.id}) — passing through; host nudge is the remaining safety net (#732 follow-up)`);
+                loggerLog("warn", `[acp-loop] degenerate-turn DOUBLE-degenerate: degenerate terminal turn after the per-request retry budget was already spent, round ${round} (session ${ctx.session.id}) — passing through; host nudge is the remaining safety net (#732 follow-up)`);
             }
 
             if (
