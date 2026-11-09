@@ -117,10 +117,12 @@ export const LIVE_FILES = [
     // network I/O and binds no port, so no zone band is needed — the entry is for
     // the tripwire alone, like #3890/#5114
     "tests/cache-keepalive.test.ts",
-    // #5955: wedged same-lane takeover rows drive fully mocked children + a fake
-    // clock; the only real spawn is one bare `node -e ""` child used to obtain a
-    // dead pid for the hardKillProxyTree row — no ports, no servers, so the zone
-    // band is irrelevant; the entry is for the tripwire alone, like #3890/#5114
+    // #5955: the only real child is ONE bare `node -e ""` spawned purely to
+    // hand back an already-reaped pid (win32 taskkill-then-SIGKILL silence);
+    // the takeover ladder itself runs on INJECTED deps — no proxy is started,
+    // no port is bound, no shutdown/kill signal ever reaches the OS. Fixed
+    // fake origins only, so no zone band is needed — the entry is for the
+    // tripwire alone, like #3890/#5114/#5666
     "tests/issue5955-wedged-same-lane-takeover.test.ts",
 ];
 
