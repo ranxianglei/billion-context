@@ -121,9 +121,11 @@ export function dshSkillCatalogPath(msg: CoreMessage): string | undefined {
  *  "one baseline + one revision per touched file".
  *
  *  `durable/*` still matches the suffixed path: matchToolPath compares only
- *  the first segment for a `<prefix>/*` pattern. #2766 role gate as above. */
+ *  the first segment for a `<prefix>/*` pattern. Matched case-sensitively on
+ *  purpose: the three shapes are fixed DSH template literals, so case folding
+ *  would only grow the false-positive surface. #2766 role gate as above. */
 function agentsMdRevisionPath(text: string): string | undefined {
-    const m = /^\s*\x3csystem-reminder\x3e\s*(?:(?:Updated|Additional)\s+instructions\s+from|Instructions\s+removed)\s*:[ \t]*([^\n]+)/i.exec(text);
+    const m = /^\s*\x3csystem-reminder\x3e\s*(?:(?:Updated|Additional)\s+instructions\s+from|Instructions\s+removed)\s*:[ \t]*([^\n]+)/.exec(text);
     if (m === null) return undefined;
     const path = m[1]!.trim();
     return path.length > 0 ? `durable/agents-md-update/${path}` : undefined;
@@ -452,14 +454,18 @@ export const oneShotCarrierPaths: Record<string, DurableMessageClassifier> = {
 };
 
 /** #5142: raw-content pre-filter markers for the stored-row backfill — the
- *  exact marker strings of the eleven dsh classifiers above (twelve markers:
- *  the mnemon family contributes two), so a unified-store
- *  row can be screened with cheap substring checks BEFORE JSON.parse (rows
- *  may carry megabytes of base64 media). Lockstep with the classifiers is
- *  enforced in tests/issue5142-expected-rebase.test.ts. */
+ *  exact marker strings of the eleven dsh classifiers above (fifteen markers:
+ *  the mnemon family contributes two, the workspace-instructions family four),
+ *  so a unified-store row can be
+ *  screened with cheap substring checks BEFORE JSON.parse (rows may carry
+ *  megabytes of base64 media). Lockstep with the classifiers is enforced in
+ *  tests/issue5142-expected-rebase.test.ts. */
 export const dshCarrierRawMarkers: readonly string[] = [
     "\x3cavailable_skills\x3e",
     "Instructions from:",
+    "Updated instructions from:",
+    "Additional instructions from:",
+    "Instructions removed:",
     "Current runtime context",
     "\x3cmcp_catalog\x3e",
     "Time sampled while preparing turn",
