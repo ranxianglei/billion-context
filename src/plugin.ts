@@ -4679,7 +4679,7 @@ export async function pipePluginResponsesWithStrip(
         }
         loggerLog("warn", `[plugin] upstream stream read failed (responses): ${String(e instanceof Error ? e.message : e)} — truncation signal path`);
         if (session) noteTruncatedUpstream(session, "responses", "read-error");
-        emitUpstreamTruncation(res, "responses", false, log, buildTruncationDiag("read-error"), transparentTruncationApplies(session));
+        emitUpstreamTruncation(res, "responses", false, log, buildTruncationDiag("read-error", e), transparentTruncationApplies(session));
         return;
     } finally {
         reader.releaseLock();
