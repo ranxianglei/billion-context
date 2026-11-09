@@ -51,10 +51,15 @@ const tracked = new Map<string, Tracked>();
 function takeSlot(sid: string): Tracked {
     let slot = tracked.get(sid);
     if (slot === undefined) {
-        if (tracked.size >= MAX_TRACKED) tracked.clear();
+        if (tracked.size >= MAX_TRACKED) {
+            const oldest = tracked.keys().next().value;
+            if (oldest !== undefined) tracked.delete(oldest);
+        }
         slot = {};
-        tracked.set(sid, slot);
+    } else {
+        tracked.delete(sid);
     }
+    tracked.set(sid, slot);
     return slot;
 }
 
@@ -116,7 +121,10 @@ export function pfRequestHeaders(incoming: Record<string, string>): Record<strin
     const sid = incoming[CONVERSATION_HEADER];
     if (sid === undefined || sid.length === 0) return {};
     const slot = tracked.get(sid);
-    if (slot === undefined || slot.t === undefined) return {};
+    if (slot === undefined) return {};
+    tracked.delete(sid);
+    tracked.set(sid, slot);
+    if (slot.t === undefined) return {};
     const k = slot.t;
     if (k < 1) return {};
     const out: Record<string, string> = { [COUNT_HEADER]: String(k) };
