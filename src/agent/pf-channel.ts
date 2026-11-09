@@ -42,7 +42,7 @@ const RESERVED_PREFIX = "acp_summary_";
 // list to absent, never a partial list onto the wire).
 const BAD_ID_CHARS = /[\s\p{C}]/u;
 const MAX_IDS = 2048; // long-conversation ceiling; the sliced head stays small
-const MAX_TRACKED = 1024; // sid table cap (same hygiene as the old per-lane maps)
+const MAX_TRACKED = 1024; // sid table cap — at capacity exactly ONE oldest session is evicted (#6044)
 
 type Tracked = { t?: number; ids?: string[] };
 
