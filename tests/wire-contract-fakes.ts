@@ -212,6 +212,14 @@ export const WIRE_RULES: readonly WireRule[] = [
         provenance:
             'bili #5432 production 400s (claude-code v2.1.316 + mid-conversation-tool-changes-2026-07-01 through bili v0.1.210 / acp-kernel 0.0.175) produced BOTH live error strings: "messages.N: role \'system\' must follow a \'user\' message or an \'assistant\' message ending in a server tool result; the directive-only form (content: [] with output_config) is accepted at any position" (follow side) and "messages.N: role \'system\' must precede an \'assistant\' message or end the array" (precede side). Repair: kernel/src/wire/anthropic.ts healIllegalSystemPositions enforces both halves (#5438, PR #5522); this validator is the permanent tripwire on every outbound Anthropic body, both lanes',
     },
+    {
+        id: "WC-024",
+        wire: "anthropic",
+        summary:
+            'a "thinking" content block must carry a non-empty signature — preserved thinking is replayed VERBATIM including its signature (bound to the producing model), so a thinking block without one (e.g. a client transcript that stored reasoning only as {type, text}) can never be accepted by a signature-verifying upstream; rebuild paths sending to such upstreams must not emit those blocks',
+        provenance:
+            'bili #5998 production report (DSH self-compression rewrote session messages and the rebuilt request carried signature-less thinking blocks; an opus→sonnet mid-session switch amplifies the failure because signatures are bound to the producing model). Mechanism verified in code: kernel anthropicToCore stamps thinkingSignature only when the inbound block carries one, while coreToAnthropic re-emits EVERY reasoning core as a thinking block — unsigned cores therefore produce signature-less blocks on the wire, which Anthropic proper rejects ("thinking.signature: Field required", #2501). The two affected upstream personalities are byte-indistinguishable on the inbound wire — never-signing relays (DeepSeek /anthropic, #5495) require the unsigned blocks back verbatim — so the repair is learn-on-failure at bili\'s relay egress seam (src/server/thinking-posture.ts): first "Field required" 400 ⇒ one strip-and-resend probe; accepted ⇒ the session drops unsigned thinking proactively for the rest of its life. Constraint source: Anthropic Messages API extended-thinking contract (preserved thinking must be replayed verbatim); the kernel round-trip suite pins the positive half ("signature reattached — Anthropic rejects thinking without it").',
+    },
 ];
 
 // ---------------------------------------------------------------------------
@@ -317,7 +325,28 @@ function midConversationSystemViolations(messages: unknown[]): string[] {
     return out;
 }
 
-/** WC-001..WC-003, WC-007, WC-010, WC-016, WC-022, WC-023 on an Anthropic /v1/messages body. Returns violation strings. */
+/** WC-024: preserved thinking must be replayed verbatim WITH its signature —
+ *  a thinking block without a non-empty string signature can never be accepted
+ *  upstream (#5998). Shared by both Anthropic lanes (main + Vertex); system
+ *  messages are exempt (they carry no content blocks of this shape). Returns
+ *  violation strings. */
+function unsignedThinkingViolations(messages: unknown[]): string[] {
+    const out: string[] = [];
+    for (let i = 0; i < messages.length; i++) {
+        const m = messages[i];
+        if (!isPlainObject(m) || m.role === "system" || !Array.isArray(m.content)) continue;
+        for (let j = 0; j < m.content.length; j++) {
+            const b = m.content[j];
+            if (!isPlainObject(b) || b.type !== "thinking") continue;
+            const sig = b.signature;
+            if (typeof sig !== "string" || sig.length === 0)
+                out.push(`WC-024 messages[${i}].content[${j}]: thinking block carries no signature — preserved thinking must be replayed verbatim with its signature (#5998)`);
+        }
+    }
+    return out;
+}
+
+/** WC-001..WC-003, WC-007, WC-010, WC-016, WC-022, WC-023, WC-024 on an Anthropic /v1/messages body. Returns violation strings. */
 function validateAnthropicBody(body: unknown): string[] {
     const out: string[] = [];
     if (!isPlainObject(body)) return out;
@@ -329,6 +358,7 @@ function validateAnthropicBody(body: unknown): string[] {
                     out.push(`WC-022 messages[${i}].content: '${b.type}' blocks are only permitted within role:"system" messages`);
         });
     if (Array.isArray(body.messages)) out.push(...midConversationSystemViolations(body.messages));
+    if (Array.isArray(body.messages)) out.push(...unsignedThinkingViolations(body.messages));
     if ("prompt_cache_key" in body)
         out.push("WC-007 top-level prompt_cache_key is not part of the Anthropic Messages API (#1403)");
     // WC-010 runs before the tools early-return: breakpoints can live in
@@ -755,7 +785,7 @@ export function vertexAnthropicPathInfo(url: string): VertexAnthropicPathInfo | 
 
 /** WC-019, lane-scoped: the version lives in the BODY on the Vertex Anthropic wire. Deliberately silent about a
  *  body `model` field — whether Vertex tolerates one is unverified and the real client never sends it. Also enforces
- *  WC-023 (lane-independent position rule, shared with the main anthropic validator — the same Messages API sits
+ *  WC-023 + WC-024 (lane-independent rules, shared with the main anthropic validator — the same Messages API sits
  *  behind both lanes). */
 export function validateVertexAnthropicBody(body: unknown): string[] {
     const out: string[] = [];
@@ -765,6 +795,7 @@ export function validateVertexAnthropicBody(body: unknown): string[] {
             `WC-019 anthropic_version must be "vertex-2023-10-16" in the body on the Vertex Anthropic wire (saw ${JSON.stringify(body.anthropic_version)}) — the version is a body field here, not a header`,
         );
     if (Array.isArray(body.messages)) out.push(...midConversationSystemViolations(body.messages));
+    if (Array.isArray(body.messages)) out.push(...unsignedThinkingViolations(body.messages));
     return out;
 }
 
