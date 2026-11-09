@@ -2905,10 +2905,64 @@ export async function pipePluginChatWithStrip(
         buf = "";
         return true;
     };
+    /** #5951: one-shot re-issue for a cut that landed after reasoning and nothing
+     *  else. The client holds a thinking fragment - not an answer and not a tool
+     *  call - so the turn is unusable as delivered, and the only two outcomes are
+     *  a replay or a dead turn. Replaying duplicates that fragment in the client
+     *  transcript, which is the cheaper failure. An answer, a tool call, a partial
+     *  argument stream, released markup or a stripped echo still keep the #721
+     *  in-band error: regenerating real output would corrupt the turn.
+     *  Shares the single stream-level re-issue budget with retryEmptyTurn and
+     *  retryZeroByteCut, and reuses the mid-turn framing so the retry's blocks
+     *  land after the ones the client already saw. A dangling partial SSE event
+     *  left in `buf` is dropped rather than refusing the replay: those bytes were
+     *  never written to the client, and the abandoned attempt's filter state goes
+     *  with them. `blocksForwarded` keeps the anthropic wire out of this path -
+     *  there a thinking block IS a forwarded block, and its index and signature
+     *  accounting belong to the client. */
+    const retryReasoningOnlyCut = async (cause?: unknown): Promise<boolean> => {
+        if (refetch === undefined) return false;
+        if (degenerateRetried || truncationRetried) return false;
+        // Nothing at all reached the client: retryZeroByteCut owns that shape.
+        if (!sawThinking) return false;
+        // `proseAcc` is not consulted here: the fast path folds reasoning text into
+        // it too, so the two content-only counters are what separate an answer from
+        // a thinking fragment.
+        if (sawToolUse || blocksForwarded > 0 || visibleTextChars > 0 || releasedMarkupChars > 0 ||
+            sawStrippedEcho || answerProse.trim().length > 0 || streams.size > 0) return false;
+        if (res.destroyed || res.writableEnded) return false;
+        let next: ReadableStream<Uint8Array> | null = null;
+        try {
+            next = await refetch();
+        } catch (e) {
+            log?.(`[plugin] reasoning-only cut retry failed (${e instanceof Error ? e.message : String(e)}); falling through to the truncation signal (#5951)`);
+            return false;
+        }
+        if (!next) return false;
+        truncationRetried = true;
+        log?.(`[plugin] upstream stream ${cause === undefined ? "closed" : "failed"} after reasoning-only output; re-issuing the request once (#5951)`);
+        sawTerminal = false;
+        finalFinishReason = undefined;
+        // The first attempt's termination marker must not ride this attempt's
+        // synthetic tail chunks (same reason as retryEmptyTurn, #2769).
+        delete lastChunkMeta["finishReason"];
+        retryIndexOffset = blocksForwarded;
+        inRetry = true;
+        streams.clear();
+        try {
+            await reader.cancel();
+        } catch {
+            /* already closed */
+        }
+        reader = next.getReader();
+        decoder = new TextDecoder("utf-8");
+        buf = "";
+        return true;
+    };
     // #2328 Q2/Q4: the diag snapshot riding every truncation emit below. Built
     // at emit time so the counters reflect the final (possibly retried)
     // attempt; `buf` is whatever partial SSE event the cut left dangling.
-    const buildTruncationDiag = (cause: "eof" | "read-error"): TruncationDiag => ({
+    const buildTruncationDiag = (cause: "eof" | "read-error", readError?: unknown): TruncationDiag => ({
         cause,
         classification: buf.length > 0 && tailLooksTerminal(buf, protocol) ? "terminal-bytes-unrecognized" : "no-terminal-seen",
         protocol,
@@ -2921,6 +2975,9 @@ export async function pipePluginChatWithStrip(
         ...(finalFinishReason !== undefined ? { finishReason: finalFinishReason } : {}),
         visibleChars: visibleTextChars,
         sawStrippedEcho,
+        // #5951: the read error itself, so a cut that was not replayed names its
+        // cause instead of only its classification.
+        ...(cause === "read-error" && readError !== undefined ? { readError: describeReadError(readError) } : {}),
         retryZeroByteCutSpent: truncationRetried,
         retryDegenerateSpent: degenerateRetried,
         ...(upstreamMeta?.status !== undefined ? { upstreamStatus: upstreamMeta.status } : {}),
@@ -3557,11 +3614,21 @@ export async function pipePluginChatWithStrip(
     try {
         let pendingFinal: string | null = null;
         for (;;) {
-            const { done, value } = await reader.read();
+            // #5951: a cut arrives as a failed read as often as a clean EOF. The
+            // same replay owns both, and anything the client can act on rethrows
+            // into the #721 truncation signal below.
+            let step: Awaited<ReturnType<(typeof reader)["read"]>>;
+            try {
+                step = await reader.read();
+            } catch (e) {
+                if (await retryReasoningOnlyCut(e)) continue;
+                throw e;
+            }
+            const { done, value } = step;
             if (done) {
                 // #2171: an EOF with nothing client-visible yet is safely
                 // re-issuable — try the one-shot retry before giving up.
-                if (!sawTerminal && !res.destroyed && !res.writableEnded && (await retryZeroByteCut())) continue;
+                if (!sawTerminal && !res.destroyed && !res.writableEnded && ((await retryZeroByteCut()) || (await retryReasoningOnlyCut()))) continue;
                 // #2323: a CRLF/lone-CR whose final byte arrived last is held back
                 // by the streaming normalizer; resolve it and re-drive the completed
                 // event through the same path below before deciding truncation.
@@ -3741,12 +3808,23 @@ export async function pipePluginChatWithStrip(
         }
         loggerLog("warn", `[plugin] upstream stream read failed (${protocol}): ${String(e instanceof Error ? e.message : e)} — truncation signal path`);
         if (session) noteTruncatedUpstream(session, protocol, "read-error");
-        emitUpstreamTruncation(res, protocol, finalFinishReason !== undefined, log, buildTruncationDiag("read-error"), transparentTruncationApplies(session));
+        emitUpstreamTruncation(res, protocol, finalFinishReason !== undefined, log, buildTruncationDiag("read-error", e), transparentTruncationApplies(session));
         return;
     } finally {
         reader.releaseLock();
         res.end();
     }
+}
+
+/** #5951: name a read failure in the truncation diag. The socket's own code
+ *  (`ECONNRESET`, `UND_ERR_SOCKET`, ...) is what tells a provider disconnect
+ *  apart from a local abort, and it is the only part of the cause that is not
+ *  already implied by `cause="read-error"`. */
+function describeReadError(error: unknown): string {
+    if (!(error instanceof Error)) return String(error).replace(/[\r\n]+/g, " ").slice(0, 200);
+    const code = (error as { code?: unknown }).code;
+    const name = typeof code === "string" && code.length > 0 ? `${error.name}/${code}` : error.name;
+    return `${name}: ${error.message}`.replace(/[\r\n]+/g, " ").slice(0, 200);
 }
 
 function hadTextOtherThanTextFields(choices: unknown): boolean {
@@ -4161,7 +4239,7 @@ export async function pipePluginResponsesWithStrip(
     // last completion-family status observed (a failed/incomplete status on a
     // "truncated" stream changes the diagnosis) and how many done-family
     // frames were still held for the degenerate-turn retry when the cut hit.
-    const buildTruncationDiag = (cause: "eof" | "read-error"): TruncationDiag => ({
+    const buildTruncationDiag = (cause: "eof" | "read-error", readError?: unknown): TruncationDiag => ({
         cause,
         classification: buf.length > 0 && tailLooksTerminal(buf, "responses") ? "terminal-bytes-unrecognized" : "no-terminal-seen",
         protocol: "responses",
@@ -4174,6 +4252,9 @@ export async function pipePluginResponsesWithStrip(
         ...(responseStatus !== undefined ? { responseStatus } : {}),
         visibleChars: visibleTextChars,
         sawStrippedEcho,
+        // #5951: the read error itself, so a cut that was not replayed names its
+        // cause instead of only its classification.
+        ...(cause === "read-error" && readError !== undefined ? { readError: describeReadError(readError) } : {}),
         retryZeroByteCutSpent: truncationRetried,
         retryDegenerateSpent: degenerateRetried,
         heldEvents: heldEvents.length,
@@ -4609,7 +4690,7 @@ export async function pipePluginResponsesWithStrip(
         }
         loggerLog("warn", `[plugin] upstream stream read failed (responses): ${String(e instanceof Error ? e.message : e)} — truncation signal path`);
         if (session) noteTruncatedUpstream(session, "responses", "read-error");
-        emitUpstreamTruncation(res, "responses", false, log, buildTruncationDiag("read-error"), transparentTruncationApplies(session));
+        emitUpstreamTruncation(res, "responses", false, log, buildTruncationDiag("read-error", e), transparentTruncationApplies(session));
         return;
     } finally {
         reader.releaseLock();
