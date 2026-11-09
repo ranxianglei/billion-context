@@ -199,7 +199,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `persist.enabled` | boolean | true | BILI_PERSIST | Master switch for writing session records to disk (0/false turns it off). |
 | `persist.zstd` | boolean | false | BILI_PERSIST_ZSTD | Zstd-compress persisted session files (1/true enables). |
 | `persist.debounceMs` | number | 500 | BILI_PERSIST_DEBOUNCE_MS | Write debounce window for session files. |
-| `persist.maxDelayMs` | number | 5000 | BILI_PERSIST_MAX_DELAY_MS | Cap on how long a pending session-file write may wait under continuous activity. The debounce window restarts on every mutation, so without this cap sustained traffic starves the write indefinitely; it was hardcoded to 5s in the session-order / prefix-affinity writers until #6062 wired both windows through these knobs. |
+| `persist.maxDelayMs` | number | 5000 | BILI_PERSIST_MAX_DELAY_MS | Cap on how long a pending session-file write may wait under continuous activity — the debounce window restarts on every mutation, so this budget bounds the steady-state rewrite rate on wear-sensitive drives (#6062). |
 | `persist.tailTokens` | number | 16384 (0 disables message persistence) | BILI_PERSIST_TAIL_TOKENS | Token-size tail of recent messages kept as raw text for export fidelity. |
 | `persist.epermAlertThreshold` | number | 5 | BILI_PERSIST_EPERM_ALERT_THRESHOLD | Consecutive EPERM write failures before alerting in the log. |
 | `persist.epermAlertRepeatMs` | number | 0 (no repeats) | BILI_PERSIST_EPERM_ALERT_REPEAT_MS | Repeat interval for the EPERM alert; 0 logs it once. |

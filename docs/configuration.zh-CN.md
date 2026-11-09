@@ -199,7 +199,7 @@
 | `persist.enabled` | boolean | true | BILI_PERSIST | 会话记录落盘总开关（0/false 关闭）。 |
 | `persist.zstd` | boolean | false | BILI_PERSIST_ZSTD | zstd 压缩持久化会话文件（1/true 启用）。 |
 | `persist.debounceMs` | number | 500 | BILI_PERSIST_DEBOUNCE_MS | 会话文件写入的去抖窗口。 |
-| `persist.maxDelayMs` | number | 5000 | BILI_PERSIST_MAX_DELAY_MS | 持续写入时一次待落盘写入最多可等待的时长上限。去抖窗口每次变更都会重置，没有这个上限的话持续流量会把写入无限饿死；#6062 之前 session-order / prefix-affinity 两个写入器把它硬编码为 5s。 |
+| `persist.maxDelayMs` | number | 5000 | BILI_PERSIST_MAX_DELAY_MS | 持续写入时一次待落盘写入最多可等待的时长上限——去抖窗口每次变更都会重置，这个预算决定磨损敏感盘上的稳态重写速率（#6062）。 |
 | `persist.tailTokens` | number | 16384 (0 disables message persistence) | BILI_PERSIST_TAIL_TOKENS | 为导出保真保留的最近消息原文 token 尾部大小。 |
 | `persist.epermAlertThreshold` | number | 5 | BILI_PERSIST_EPERM_ALERT_THRESHOLD | 连续 EPERM 写失败达到该次数后在日志中告警。 |
 | `persist.epermAlertRepeatMs` | number | 0 (no repeats) | BILI_PERSIST_EPERM_ALERT_REPEAT_MS | EPERM 告警的重复间隔；0 只记录一次。 |
