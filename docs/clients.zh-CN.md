@@ -117,18 +117,31 @@ fork 继承同一面;Antigravity 自带用户插件系统 —— `plugins/<name>
 
 **窗口对齐。** 客户端 plugin/runtime 上报及启动器传递的窗口优先于发布时的 Codex 模型表。没有上报时，本机代理只读其 `CODEX_HOME`（默认 `~/.codex`）下的 `models_cache.json` 和基础 `config.toml`，将 `model_context_window` 限制在匹配模型的 `max_context_window` 内，再应用 `effective_context_window_percent`（Codex 默认 95）；后续请求会跟随缓存更新。元数据缺失、不可读或无效时，保留内置表及未知模型 272K 的既有回退。远程代理或其他客户端 profile 应通过现有启动器/runtime 机制传递实际窗口，或设置既有的 `compress.modelContextLimit`；代理本机缓存不能证明另一台机器的配置。输出预留仍正常生效。
 
-Codex 是唯一一个插件安装无法自给自足的客户端。接缝矩阵可以解释:claude 有 SessionStart hook + 受管 settings 块,zcode 有可改写 `baseURL` 的 provider store —— codex 两者都没有。它的模型流量只能经环境变量路由(`HTTPS_PROXY` / `SSL_CERT_FILE` —— `bili codex` 正是这么做的);默认 ChatGPT-登录 provider 没有可改写的配置缝,managed `model_providers` 块会强制 `env_key` API-key 认证、**废掉订阅登录**;而 MCP 子进程无法向父进程注入 env,所以插件永远路由不了 codex 本体流量。三种姿势:
+Codex 现在有四个彼此独立的集成面。`bili plugin install codex` 会写入 `[mcp_servers.bili]` 块以提供 ACP 工具，默认添加由 bili 所有的模型路由（经 `<loopback>/bili/<upstream>` 转发原生 Codex CLI 请求），写入一个 `[[hooks.SessionStart]]` 条目运行 `dist/codex/bootstrap-hook.js`，并把 ACP 技能写到 `~/.codex/skills/bili/SKILL.md`。普通 Codex 配置使用顶层 `openai_base_url`；若明确检测到 CC Switch Direct，则改写当前生效的 `[model_providers.<name>].base_url`，保留原生账号与 provider 选择，且不写 CC Switch 数据库。路由目标、原值和 bili 写入的精确值记录在 sidecar；卸载时只还原仍与记录完全一致的字段，后续用户编辑会保留。外部路由冲突或 CC Switch 已重写该字段时会报告冲突并保留现值。CC Switch 切换 provider/模式或同步配置时可能重写路由；bili 不运行 watcher 与之抢写。
 
-| 姿势 | 你能得到什么 |
-|---|---|
-| `bili codex`(启动器) | 全功能零配置:自管 lane 代理(#1660 端口区,粘性口)+ 注入 codex 的证书 MITM env —— 工具与压缩兼得 |
-| `bili plugin install codex` + 在跑的 bili + 自行导出 `HTTPS_PROXY` | 自己管 env 的 power user:工具 + 压缩 |
-| 只装 `bili plugin install codex` | codex 里出现四个工具但没有对话被代理、无话可操作;全不可达时 `tools/list` 报 -32003(`bili proxy unreachable … — start bili or set BILI_MCP_PROXY`) |
+| 方式 | 能力 |
+| --- | --- |
+| `bili codex`(启动器) | 受管 lane 代理与证书 MITM；工具 + 压缩 |
+| `bili plugin install codex` | 原生 Codex 模型路由 + ACP 工具 + SessionStart hook + ACP 技能 |
 
-**并发会话(#3203)。** 同一项目目录、同一 `CODEX_HOME` 下可以同时跑多个 `bili codex`:每次启动各取一个独立的每会话 overlay 槽位(`<CODEX_HOME>-bili-s<N>`,池上限 16)和各自的 lane 代理,路由、MCP 会话绑定、压缩状态互不串线。共享状态默认(codex ≥ 0.147.0)下,两个会话的历史都落在真实 home 的同一个活库上,退出顺序不影响保留 —— 见 configuration.md 的 `BILI_CODEX_STATE_MODE`。旧版二进制或 `BILI_CODEX_STATE_MODE=legacy` 保持每 home 一个独占 overlay:第二个并发启动会被 `BILI_OVERLAY_BUSY` 拒绝。
+**并发会话(#3203)。** 同一项目目录、同一 `CODEX_HOME` 下可以同时跑多个 `bili codex`:每次启动各取一个独立的每会话 overlay 槽位(`<CODEX_HOME>-bili-s<N>`,池上限 16)和各自的 lane 代理,路由、MCP 会话绑定、压缩状态互不串线。共享状态默认(codex ≥ 0.147.0)下,两个会话的历史都落在真实 home 的同一个活库上,退出顺序不影响保留 —— 见 CONFIGURATION.md 的 `BILI_CODEX_STATE_MODE`。旧版二进制或 `BILI_CODEX_STATE_MODE=legacy` 保持每 home 一个独占 overlay:第二个并发启动会被 `BILI_OVERLAY_BUSY` 拒绝。
 
+**四个面各证各的。** MCP 块只证明工具可用，绝不证明模型流量经过 bili；hook 只做 attach（从不 spawn 代理，失败即放行）并把本会话 runtime 上报给已在运行的代理；技能只是告诉模型有哪些 ACP 工具及其用法；只有路由面（外加观测到的真实请求）才与压缩有关。`bili plugin status` 与 `bili doctor` 分别报告这四项，缺哪一项都不会被读成完整安装。
 
-安装写入 `~/.codex/config.toml` 单个 `[mcp_servers.bili]` 块(command = node,args = dist/mcp.js)。#1660 去掉了安装时烘焙 origin(#403:烘焙的 URL 在漂移/重启后变成死端口,工具永远指向它);shell 在会话启动时解析代理 —— env `BILI_MCP_PROXY` > 活实例登记(任一 lane 的代理,或 `bili start` 守护)> 8787 用户区默认 —— 漂移或重启后绝不残留死 URL,shell 直接附着到活着的那个。会话绑定是 headless 的:启动器在 spawn 时传 `BILI_CONVERSATION_ID`,插件 shell 否则绑定下一个新会话;逐调用的 `conversation_id` 覆盖与其他客户端一致(#760)。Codex ≥0.160 还在每次 `tools/call` 的 `_meta.threadId` 里盖上真实 thread id;shell 按调用消费(严格校验、绝不写回 spawn 时的全局绑定),优先级高于过期的 `BILI_CONVERSATION_ID` 残留与模型抄写的 `conversation_id`(#2024)。
+**Hook 与技能的所有权。** `[[hooks.SessionStart]]` 是**数组表**，所以别人写的条目（lean-ctx 之类就住在这里）是**兄弟条目**而不是竞争者：bili **追加**自己的一条、保留全部已有条目，只刷新/删除命令指向自己脚本的那一条。技能同理：同名但非 bili 所有的 `SKILL.md` 完全不碰。
+
+**条目形状有两处硬要求，两种失败模式完全不同：**
+
+- Codex 把 `hooks` 反序列化为**序列**，写成 `[hooks.SessionStart]` + `hooks = [{…}]` 的 map 形式会让整份配置无法加载，进而拖垮宿主（实测 Codex 桌面端只报一个看似无关的 `AbsolutePathBuf deserialized without a base path in model_catalog json`）。这一种是**响的**。
+- 每个条目是 `MatcherGroup`——`{ matcher?, hooks = [ { type = "command", command, timeout } ] }`。把 `type`/`command`/`timeout` 直接写在条目上，这些键在 `MatcherGroup` 上是未知字段，会被 Codex **静默丢弃**：配置照常加载、`codex mcp list` 照常成功，hook 却根本不会注册。这一种是**哑的**，任何"能不能加载"的探测都发现不了——只有 Codex 自己的 `hooks/list` app-server RPC 能看见。
+
+安装器拒绝写入任何一种已知会失败的形状，并会把发现的旧扁平条目**就地升级**。`[features] hooks = true` 是 Codex 的 hook 总开关：没有开启时 bili 会写入 hook 条目并明确提示需要打开，不会替你改写既有的开关值。卸载时 bili 只删自己的条目/文件；技能目录里另有用户文件时目录保留。
+
+`bili service install` 会注册当前用户级的常驻代理服务——Windows 上是 Task Scheduler 登录任务，Linux 上是 systemd 用户单元；其他平台会明确报告服务不受支持，手动方式仍然可用。可用 `bili service status|restart|enable|disable|remove` 管理；注册失败会明确报告。代理关闭时，Codex 配置的 URL 仍是 loopback，请求会在本地端点失败，不会静默回退到上游直连。`bili doctor` 会报告 `proxy-ready`、`configured`、`verified`、`bypassed` 或 `unknown`；只有观测到真实 Codex 模型请求才会标记 `verified`，健康代理或已写配置本身都不能证明已验证。
+
+CC Switch Direct 仅在当前 Codex provider 的 `config.toml` 路由层受支持：这是可撤销的配置写入，不代表 bili 与 CC Switch 的 provider 数据库或同步机制已集成。Routing/Aggregation 仍只检测并报告，不自动改写；发现模式不代表 API 级兼容。bili 不修改 CC Switch 数据库，也不会安装 watcher。ChatGPT 订阅/Desktop 集成仍标为 `待完成/可实现`：实现不会读取、复制、持久化或注入 `auth.json`、cookies 或 session token；Desktop MCP 与模型路由分开，官方登录渠道保持不变。
+
+MCP shell 仍在会话启动时解析代理 —— env `BILI_MCP_PROXY` > 活实例登记(任一 lane 的代理，或 `bili start` 守护)> 8787 用户区默认。会话绑定是 headless 的:启动器在 spawn 时传 `BILI_CONVERSATION_ID`，插件 shell 否则绑定下一个新会话；逐调用的 `conversation_id` 覆盖与其他客户端一致(#760)。Codex ≥0.160 还在每次 `tools/call` 的 `_meta.threadId` 里盖上真实 thread id；shell 按调用消费(严格校验、绝不写回 spawn 时的全局绑定)，优先级高于过期的 `BILI_CONVERSATION_ID` 残留与模型抄写的 `conversation_id`(#2024)。
 
 **Responses 原生链式(一个坑)。** bili 靠重放完整 `input` 来压缩,因此无法跟随 OpenAI 原生的 `previous_response_id` 链式续传:只带增量的续传请求会在上游丢失之前的轮次,却仍返回 200。对 codex 而言今天这不是问题 —— 观察到的构建都发 `store:false` 且从不设置 `previous_response_id`(是观察不是证明;E2E 未覆盖该形态)。若你把走原生链式的 Responses 客户端指向 bili,要么重发完整 input/output 历史,要么设 `ACP_KEEP_RESPONSE_ID=1`;bili 剥掉非空 `previous_response_id` 时现在会记一条 `warn`(#1954)。完整链式支持跟踪在 #1973。见[官方迁移指南](https://developers.openai.com/api/docs/guides/migrate-to-responses)。
 

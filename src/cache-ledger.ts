@@ -22,6 +22,7 @@ import { isForeignMembership } from "./request-membership.js";
 import { billInputUsage } from "./billing.js";
 import { normalizeUpstreamOrigin } from "./util.js";
 import { toolFail, toolOk, type ProxyToolResult } from "./proxy-tool-result.js";
+import { isProxyManagedCredential } from "./codex-integration/cc-switch.js";
 
 // Render window for handleAcpCache's detail:"full" text view (#1489). The
 // ledger itself is unbounded — this only bounds how many lines the text
@@ -677,7 +678,7 @@ export function credentialFingerprint(headers: Record<string, string> | undefine
             }
         }
     }
-    if (cred === undefined) return undefined;
+    if (cred === undefined || isProxyManagedCredential(cred)) return undefined;
     return "sha256:" + createHash("sha256").update(cred, "utf8").digest("hex").slice(0, 12);
 }
 

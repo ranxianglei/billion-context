@@ -479,32 +479,90 @@ the client's window through the existing launcher/runtime reporting mechanism
 or set the existing `compress.modelContextLimit`; the proxy's local cache is not
 evidence of another machine's configuration. Output headroom still applies.
 
-Codex is the one client a plugin install cannot make self-sufficient. The seam
-matrix explains why: claude has a `SessionStart` hook + managed settings block,
-zcode has a provider store whose `baseURL` can be rewritten — codex has neither.
-Its model traffic routes via environment variables only (`HTTPS_PROXY` /
-`SSL_CERT_FILE` — this is how `bili codex` works); the default
-ChatGPT-login provider has no config-file routing seam, and a managed
-`model_providers` block would force `env_key` API-key auth and **drop the
-subscription login**. An MCP server cannot inject env into its parent process,
-so the plugin can never route codex's own traffic. Three postures:
+Codex now has four distinct integration faces. `bili plugin install codex` writes
+the `[mcp_servers.bili]` block for ACP tools, adds a bili-owned Codex model route
+through `<loopback>/bili/<upstream>`, installs a `[[hooks.SessionStart]]` entry
+running `dist/codex/bootstrap-hook.js`, and writes the ACP skill to
+`~/.codex/skills/bili/SKILL.md`. For ordinary Codex configuration the route is
+the top-level `openai_base_url`. When the current
+Codex config is positively detected as CC Switch Direct, bili instead routes
+the active `[model_providers.<name>].base_url`, which Codex actually uses. It
+preserves the native Codex account and provider selection and never writes the
+CC Switch database. The route's target, previous value and exact written value
+are recorded in a bili sidecar; removal restores only the value that still
+exactly matches bili's record, and leaves later user edits intact. A foreign
+route or a provider field changed by CC Switch is reported as a conflict and
+left untouched. CC Switch may rewrite the field during provider/mode changes;
+bili does not run a watcher to compete with those writes.
 
 | Posture | What you get |
-|---|---|
-| `bili codex` (launcher) | Full zero-config: a self-managed lane proxy (#1660 zone, sticky port) + cert-MITM env injected into codex — tools *and* compression |
-| `bili plugin install codex` + a running bili + self-exported `HTTPS_PROXY` | Tools + compression for power users who manage their own env |
-| `bili plugin install codex` alone | The four tools appear in codex but no conversation is proxied, so there is nothing for them to act on; `tools/list` fails with -32003 (`bili proxy unreachable … — start bili or set BILI_MCP_PROXY`) when nothing is reachable |
+| --- | --- |
+| `bili codex` (launcher) | Managed lane proxy and cert-MITM; tools + compression |
+| `bili plugin install codex` | Native Codex model route + ACP tools + SessionStart hook + ACP skill |
 
-**Concurrent sessions (#3203).** Several `bili codex` launches may run at once in the same project directory with the same `CODEX_HOME`: each launch takes its own per-session overlay slot (`<CODEX_HOME>-bili-s<N>`, pool of 16) and its own lane proxy, so routing, MCP conversation binding, and compression state never cross between sessions. With the shared-state default (codex ≥ 0.147.0) both sessions' history lands in the ONE live state db in the real home and survives any exit order — see `BILI_CODEX_STATE_MODE` in configuration.md. Older binaries, or `BILI_CODEX_STATE_MODE=legacy`, keep one exclusive overlay per home: the second concurrent launch is refused with `BILI_OVERLAY_BUSY`.
+**Concurrent sessions (#3203).** Several `bili codex` launches may run at once in the same project directory with the same `CODEX_HOME`: each launch takes its own per-session overlay slot (`<CODEX_HOME>-bili-s<N>`, pool of 16) and its own lane proxy, so routing, MCP conversation binding, and compression state never cross between sessions. With the shared-state default (codex ≥ 0.147.0) both sessions' history lands in the ONE live state db in the real home and survives any exit order — see `BILI_CODEX_STATE_MODE` in CONFIGURATION.md. Older binaries, or `BILI_CODEX_STATE_MODE=legacy`, keep one exclusive overlay per home: the second concurrent launch is refused with `BILI_OVERLAY_BUSY`.
 
-The install writes a single `[mcp_servers.bili]` block into `~/.codex/config.toml`
-(command = node, args = dist/mcp.js). #1660 removed the install-time origin bake
-(#403: a baked URL went stale after drift/reboot and left the tools pointing at
-a dead port); the shell resolves the proxy at session start — env
-`BILI_MCP_PROXY` > the live-instance record (any lane's proxy, or a
-`bili start` daemon) > the 8787 user-zone default — so a drifted or rebooted
-proxy never strands a dead URL, and the shell simply attaches to whatever is
-alive. Session binding is headless: the launcher passes
+
+**Each face proves only itself.** The MCP block proves TOOLS, never that model
+traffic reaches bili. The hook is attach-only (it never spawns a proxy, and
+fails open) and reports this session's runtime to an already-running proxy. The
+skill only tells the model which ACP tools exist. Only the route face — plus an
+observed real request — says anything about compression. `bili plugin status`
+and `bili doctor` report all four separately, so a lane missing one of them can
+never read as a complete install.
+
+**Ownership of the hook and skill faces.** `[[hooks.SessionStart]]` is an ARRAY
+of tables, so a foreign entry (lean-ctx and friends live there) is a sibling,
+not a competitor: bili APPENDS its own entry, keeps every existing one, and
+refreshes/removes only the entry whose command names its own script. The same
+rule covers the skill: a same-named `SKILL.md` bili does not own is left alone.
+
+**The shape of bili's entry is load-bearing in two separate ways**, and each
+failure mode is different:
+
+- Codex deserializes `hooks` as a SEQUENCE, so the `[hooks.SessionStart]` +
+  `hooks = [{…}]` map form makes the whole config unloadable — and an unloadable
+  config takes the host down (observed on Codex Desktop, surfacing only an
+  unrelated-looking `AbsolutePathBuf deserialized without a base path in
+  model_catalog json`). This one is LOUD.
+- Each entry is a `MatcherGroup` — `{ matcher?, hooks = [ { type = "command",
+  command, timeout } ] }`. Handler fields written DIRECTLY on the entry are
+  unknown keys, so Codex drops them **silently**: the config loads, `codex mcp
+  list` succeeds, and the hook simply never registers. This one is SILENT, and a
+  load probe can never detect it — only Codex's own `hooks/list` app-server RPC
+  can.
+
+The installer refuses to write any shape known to fail either way, and upgrades
+an older flat entry it finds in place. `[features] hooks = true` is Codex's
+master switch for hook execution — when it is off, bili writes its entry and
+says so rather than editing a switch value the user set. Uninstall deletes only
+bili's own entry and file, and keeps the skill directory when the user has other
+files in it.
+
+`bili service install` registers a persistent per-user proxy service — a Task
+Scheduler logon task on Windows, a systemd user unit on Linux; other platforms
+report that the service is unsupported and the manual postures still work.
+`bili service status|restart|enable|disable|remove` manage it; failed
+registration is reported explicitly.
+When the proxy is down, Codex's configured URL remains loopback and requests
+fail at the local endpoint; there is no direct-upstream fallback. `bili doctor`
+reports `proxy-ready`, `configured`, `verified`, `bypassed`, or `unknown`.
+`verified` requires an observed Codex model request, while a healthy proxy or a
+written config alone cannot claim verification.
+
+CC Switch Direct is supported only at the current Codex config route layer:
+when Direct is positively detected, bili can wrap the active provider's
+`base_url` with reversible ownership. This is not integration with CC Switch's
+provider database or synchronization mechanism. Routing and Aggregation remain
+detection-only; discovery does not prove API-level compatibility. No CC Switch
+files are modified and bili does not install a competing watcher. ChatGPT subscription/Desktop integration stays
+`待完成/可实现`: the implementation does not read, copy, persist, or inject
+`auth.json`, cookies, or session tokens; Desktop MCP is separate from model
+routing, and official login channels remain intact.
+
+The MCP shell still resolves its proxy at session start — env `BILI_MCP_PROXY`
+> the live-instance record (any lane's proxy, or a `bili start` daemon) > the
+8787 user-zone default. Session binding is headless: the launcher passes
 `BILI_CONVERSATION_ID` at spawn time, and the plugin shell binds the next NEW
 session otherwise; per-call `conversation_id` overrides work as everywhere
 (#760). Codex ≥0.160 additionally stamps the real thread id on every

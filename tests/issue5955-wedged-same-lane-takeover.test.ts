@@ -429,7 +429,14 @@ test("#5955 full path: kill fails → fall through to normal spawn, ledger kept,
     assert.equal(watchingLines(w).length, 2, "only the pre-escalation cycles logged the watching line");
     const entries = readLedger();
     assert.equal(Object.keys(entries).length, 1, "surviving occupant keeps its ledger entry for the retry");
-    assert.equal(Object.values(entries)[0].observations, 5, "observations accumulate across failed escalations");
+    // Five bring-ups, five observations — but the ledger's documented worst case
+    // is a lost read-modify-write (readWedgedLedger contract: "the worst case
+    // loses one observation ... which is safe"), so tolerate exactly that one
+    // loss instead of turning an fs-timing hiccup into a CI flake. Anything
+    // below 4 means observations are NOT bridging the gap (the patience window
+    // would restart every cycle and the takeover could never fire).
+    const observed = Object.values(entries)[0].observations;
+    assert.ok(observed === 5 || observed === 4, `observations accumulate across failed escalations (got ${observed}, expected 5, or 4 for the documented one-observation loss)`);
 });
 
 test("#5955 full path: port:0 bring-up resolves the sticky lane port lazily", async () => {

@@ -13,6 +13,9 @@ import { PLUGIN_AGENTS, UPDATE_CHANNEL, claudeDesktopPresent, inspectLanePresenc
 import { findInstallDir, fetchRegistryVersion, hostManagedInstall, isGitWorkingTree, isVersionNewer, lastUpdateCheckTime, normalizeUpdateTag, staleInstallStatus } from "./update.js";
 import { describeAdvisory, evaluateAdvisories, type AdvisoryEvaluation } from "./advisory.js";
 import { claudeRoutingWarningFile } from "./paths.js";
+import { inspectCodexIntegration, type CodexIntegrationReport } from "./codex-integration/status.js";
+import { detectCcSwitch, type CcSwitchDetection } from "./codex-integration/cc-switch.js";
+import { chatGptDesktopCapability, type ChatGptDesktopCapability } from "./codex-integration/chatgpt-capability.js";
 import { dshProfileDirs } from "./dsh-channel.js";
 import { convergeDshLedger, dshProfileLedgerFindings, readDshLedgerState, type LedgerChangeDetail, type LedgerFinding } from "./dsh-ledger.js";
 
@@ -77,6 +80,9 @@ export interface DoctorReport {
     global: DoctorGlobalInfo;
     lanes: DoctorLane[];
     processes: DoctorProcess[];
+    codexIntegration: CodexIntegrationReport;
+    ccSwitch: CcSwitchDetection;
+    chatGptDesktop: ChatGptDesktopCapability;
     /** #3496: set only when `--fix` ran — what the repair pass changed per profile. */
     ledgerFixes?: DshLedgerFixRow[];
 }
@@ -210,7 +216,9 @@ export async function runDoctor(opts: DoctorOpts): Promise<DoctorReport> {
         };
     });
 
-    return { generatedAt: Date.now(), packageName: opts.packageName, global: g, lanes, processes };
+    const codexIntegration = await inspectCodexIntegration();
+    const ccSwitch = detectCcSwitch();
+    return { generatedAt: Date.now(), packageName: opts.packageName, global: g, lanes, processes, codexIntegration, ccSwitch, chatGptDesktop: chatGptDesktopCapability };
 }
 
 /** #3496: the explicit repair pass behind `bili doctor --fix`. Converges every
@@ -350,6 +358,25 @@ export function renderDoctorReport(report: DoctorReport): string {
         if (lane.reason !== undefined) lines.push(`  ${"".padEnd(12)} ${"".padEnd(34)} ${lane.reason}`);
         for (const w of lane.warnings ?? []) lines.push(`  ${"".padEnd(12)} ${"".padEnd(34)} ⚠️ ${w}`);
     }
+    lines.push("");
+    lines.push("codex model route");
+    lines.push(`  state         ${report.codexIntegration.state}`);
+    lines.push(`  route         ${report.codexIntegration.route}`);
+    lines.push(`  proxy         ${report.codexIntegration.proxyHealthy ? "healthy" : "not verified"}`);
+    lines.push(`  evidence      ${report.codexIntegration.observedCodexRequest ? "Codex request observed" : "no Codex model request observed"}`);
+    lines.push(`  detail        ${report.codexIntegration.detail}`);
+    lines.push("");
+    lines.push("CC Switch");
+    lines.push(`  detected      ${report.ccSwitch.discovered ? "yes" : "no"}`);
+    lines.push(`  mode          ${report.ccSwitch.mode}`);
+    lines.push(`  compatibility ${report.ccSwitch.compatibility}`);
+    lines.push(`  detail        ${report.ccSwitch.detail}`);
+    lines.push("");
+    lines.push("ChatGPT subscription / Desktop");
+    lines.push(`  state         ${report.chatGptDesktop.state}`);
+    lines.push(`  credentials   ${report.chatGptDesktop.credentials}`);
+    lines.push(`  official login ${report.chatGptDesktop.officialLoginChannels}`);
+    lines.push(`  Desktop MCP   ${report.chatGptDesktop.desktopMcp}`);
     lines.push("");
     lines.push("processes");
     if (report.processes.length === 0) {

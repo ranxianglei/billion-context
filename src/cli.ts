@@ -43,7 +43,7 @@ import { startRemoteNoticesWatcher } from "./remote-notices.js";
 import { hydrateNoticeReceipts } from "./notice-store.js";
 import { resolveProxy } from "./upstream-proxy.js";
 import { runMcpStdio } from "./mcp.js";
-import { PLUGIN_AGENTS, isPluginAgent, pluginInstall, pluginRemove, pluginStatusAll, pluginUpdate, renderPluginList, warnActivePluginSessions, type PluginAgent } from "./plugin-install.js";
+import { PLUGIN_AGENTS, codexInstallWithService, codexRemoveWithService, isPluginAgent, pluginInstall, pluginRemove, pluginStatusAll, pluginUpdate, renderPluginList, warnActivePluginSessions, type PluginAgent } from "./plugin-install.js";
 import { runLaunch, runTestPi, isLaunchClient, type ClientName } from "./launcher.js";
 import { exportSession } from "./export.js";
 import { runSessionsCommand, runStorageGcCommand } from "./storage-maintenance.js";
@@ -52,6 +52,7 @@ import { listResolvedPacks } from "./compress-settings.js";
 import { renderJson, renderText, runDiff } from "./acp-cache-diff.js";
 import { fixDshLedgers, renderDoctorReport, renderLedgerFixReport, runDoctor } from "./doctor.js";
 import { VERSION, PACKAGE_NAME, BUILD_COMMIT } from "./version.js";
+import { disableProxyService, enableProxyService, installProxyService, proxyServiceStatus, removeProxyService, restartProxyService } from "./proxy-service/service.js";
 
 const HELP = `bili ${VERSION} — billion-context proxy
 
@@ -134,6 +135,9 @@ Usage:
                                     dsh's channel, host-owned copies are pointed
                                     at their host's updater — never overwritten
   bili plugin list                 show install status + installed (on-disk) version for every host
+  bili service install|status|restart|enable|disable|remove
+                                     manage the per-user logon proxy task (Windows Task
+                                     Scheduler / systemd --user)
   bili mcp                         run the bili MCP server standalone (stdio)
   bili plugin-register <id>        pre-bind a conversation to the plugin mode
                                     (--origin URL, --agent name)
@@ -205,7 +209,7 @@ Docs: https://github.com/ranxianglei/billion-context
 `;
 
 type Parsed = {
-    command: "start" | "update" | "doctor" | "help" | "version" | "launch" | "test" | "export" | "plugin-register" | "mcp" | "plugin" | "acp-cache" | "sessions" | "storage" | "pack";
+    command: "start" | "update" | "doctor" | "help" | "version" | "launch" | "test" | "export" | "plugin-register" | "mcp" | "plugin" | "acp-cache" | "service" | "sessions" | "storage" | "pack";
     client?: ClientName;
     clientArgs: string[];
     mitmDomains: string[];
@@ -216,6 +220,7 @@ type Parsed = {
     exportJsonl?: boolean;
     registerConversationId?: string;
     pluginAction?: "install" | "remove" | "update" | "list";
+    serviceAction?: "install" | "status" | "restart" | "enable" | "disable" | "remove";
     pluginAgent?: PluginAgent;
     pluginWithMcp?: boolean;
     packAction?: "install" | "remove" | "list";
@@ -253,6 +258,7 @@ export function parseArgs(argv: string[]): Parsed {
     let exportFull = false;
     let exportJsonl = false;
     let pluginAction: Parsed["pluginAction"];
+    let serviceAction: Parsed["serviceAction"];
     let pluginAgent: Parsed["pluginAgent"];
     let pluginWithMcp = false;
     let packAction: Parsed["packAction"];
@@ -485,6 +491,15 @@ export function parseArgs(argv: string[]): Parsed {
         } else if (cmd === "export") {
             command = "export";
             exportSelector = positional[1];
+        } else if (cmd === "service") {
+            command = "service";
+            const action = positional[1];
+            if (action === "install" || action === "status" || action === "restart" || action === "enable" || action === "disable" || action === "remove") {
+                serviceAction = action;
+            } else {
+                console.error(`bili service: unknown action "${action ?? ""}" (try "bili service install|status|restart|enable|disable|remove")`);
+                process.exit(2);
+            }
         } else if (cmd === "plugin-register") {
             command = "plugin-register";
             registerConversationId = positional[1];
@@ -600,11 +615,11 @@ export function parseArgs(argv: string[]): Parsed {
         }
     }
 
-    return { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, sessionsSub, sessionsTarget, sessionsNoVacuum, sessionsApply, sessionsRestoreTarget, storageDays, storageVacuum, storageDryRun, jsonOutput, doctorJson, doctorFix, packAction, packSpec, packProject, packForce };
+    return { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, serviceAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, sessionsSub, sessionsTarget, sessionsNoVacuum, sessionsApply, sessionsRestoreTarget, storageDays, storageVacuum, storageDryRun, jsonOutput, doctorJson, doctorFix, packAction, packSpec, packProject, packForce };
 }
 
 export async function main(): Promise<void> {
-    const { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, sessionsSub, sessionsTarget, sessionsNoVacuum, sessionsApply, sessionsRestoreTarget, storageDays, storageVacuum, storageDryRun, jsonOutput, doctorJson, doctorFix, packAction, packSpec, packProject, packForce } = parseArgs(process.argv.slice(2));
+    const { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, serviceAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, sessionsSub, sessionsTarget, sessionsNoVacuum, sessionsApply, sessionsRestoreTarget, storageDays, storageVacuum, storageDryRun, jsonOutput, doctorJson, doctorFix, packAction, packSpec, packProject, packForce } = parseArgs(process.argv.slice(2));
     if (command === "help") {
         process.stdout.write(HELP);
         return;
@@ -652,6 +667,20 @@ export async function main(): Promise<void> {
         runMcpStdio();
         return;
     }
+    if (command === "service") {
+        const operations = {
+            install: installProxyService,
+            status: proxyServiceStatus,
+            restart: restartProxyService,
+            enable: enableProxyService,
+            disable: disableProxyService,
+            remove: removeProxyService,
+        } as const;
+        const result = await operations[serviceAction!]();
+        process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+        if (!result.ok) process.exitCode = 1;
+        return;
+    }
     if (command === "plugin") {
         // Installers read resolveProxyOrigin() (env first) at dispatch time.
         // Apply --origin BEFORE handling the subcommand: the generic env
@@ -697,7 +726,11 @@ export async function main(): Promise<void> {
         }
         if (pluginAction === "install") {
             try {
-                console.log(pluginInstall(pluginAgent!, { withMcp: pluginWithMcp }));
+                console.log(
+                    pluginAgent === "codex"
+                        ? await codexInstallWithService()
+                        : pluginInstall(pluginAgent!, { withMcp: pluginWithMcp }),
+                );
             } catch (error) {
                 console.error(`bili plugin: ${error instanceof Error ? error.message : String(error)}`);
                 process.exit(1);
@@ -707,7 +740,10 @@ export async function main(): Promise<void> {
         if (pluginAction === "remove") {
             try {
                 // #2155: best-effort note about still-open client windows.
-                const removed = pluginRemove(pluginAgent!);
+                const removed =
+                    pluginAgent === "codex"
+                        ? await codexRemoveWithService()
+                        : pluginRemove(pluginAgent!);
                 const warn = await warnActivePluginSessions(pluginAgent!);
                 console.log(warn === "" ? removed : removed + "\n" + warn);
             } catch (error) {

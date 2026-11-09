@@ -434,6 +434,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `BILI_MODEL_INFO_RETRY_MS` | number | (built-in) | — | Test hook: retry interval for model-info lookups. |
 | `BILI_DSH_RETRY_INTERVAL_MS` | number | (built-in) | — | Test hook: retry interval for dsh lane operations. |
 | `BILI_DSH_RECOVERY_INTERVAL_MS` | number | (built-in) | — | Test hook: recovery sweep interval for the dsh lane. |
+| `BILI_CODEX_HOOK_ORIGIN` | string | unset (route origin, then lane discovery) | — | Test hook: explicit proxy origin for the Codex SessionStart bootstrap hook to probe and report to; falls back to the route bili wrote into config.toml, then sticky lane-port discovery. |
 | `ACP_DUMP_DIR` | string | unset | — | Base directory override for wire dump output (path relocation). |
 | `BILI_STREAM_STALL_MS` | number | (built-in) | — | Stall-detection timeout for committed upstream streams (no-byte silence before abort). |
 | `BILI_CLIENT_BIN` | string | unset (PATH lookup) | — | Explicit binary override for the launched client (resolved on PATH). |
