@@ -543,7 +543,7 @@ interface LegacyViewRows {
         ccrJson: string | null;
         orphansJson?: string | null;
     };
-    messages: { seq: number; msgId: string; ref: string | null; content: string }[];
+    messages: { seq: number; msgId: string; ref: string | null; content: string; ts?: number | null }[];
     blocks: { blockId: string; summary: string; one: string | null; payloadJson: string }[];
     deadRefs: { ord: number; ref: string }[];
     refs: { ord: number; rawId: string; ref: string }[];
@@ -659,7 +659,20 @@ export class LegacyViewBuilder {
     }
 
     addMessages(rows: LegacyViewRows["messages"]): void {
-        for (const m of rows) this.messagesBySeq.set(m.seq, JSON.parse(m.content) as CoreMessage);
+        const stamps = this.state.tsStamps;
+        for (const m of rows) {
+            const message = JSON.parse(m.content) as CoreMessage;
+            // The column also carries a batch-time fallback for pre-feature
+            // messages. Only the existing kernel ledger proves a real stamp.
+            if (stamps && typeof stamps === "object" && !Array.isArray(stamps) && Object.hasOwn(stamps, message.id)) {
+                const stamp: unknown = Reflect.get(stamps, message.id);
+                if (typeof stamp !== "number" || !Number.isSafeInteger(stamp) || stamp < 0 || m.ts !== stamp || (message.ts !== undefined && message.ts !== stamp)) {
+                    throw new Error("Stored message timestamp conflicts with durable kernel provenance");
+                }
+                message.ts = stamp;
+            }
+            this.messagesBySeq.set(m.seq, message);
+        }
     }
 
     finish(): LegacyView {
