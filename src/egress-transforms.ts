@@ -85,7 +85,7 @@ const DEFAULT_TIMEOUT_MS = 1000;
 /** Resolve a configured `module` path to an absolute filesystem path. Relative
  *  paths are anchored at the directory holding the config file (matching the
  *  issue's `./plugins/tunnel.mjs` idiom); absolute paths pass through. */
-export function resolveEgressModulePath(module: string): string {
+function resolveEgressModulePath(module: string): string {
     if (isAbsolute(module)) return module;
     return resolve(dirname(configFile()), module);
 }
