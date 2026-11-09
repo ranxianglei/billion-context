@@ -290,7 +290,7 @@ test("#6011 field shape: byte-identical first-user boilerplate across same-type 
     const SHARED_FIRST = "Shared CLAUDE.md boilerplate preamble.";
     const disc = (msgs: Msg[]) => anthropicFirstUserFrag(msgs);
     const wide = (msgs: Msg[]) => anthropicLaterUserFrag(msgs);
-    const ride = (msgs: Msg[]) => resolveSessionOrder(SESSION, msgs, SUB_TAG, undefined, undefined, disc(msgs), wide(msgs));
+    const ride = (msgs: Msg[]) => resolveSessionOrder(SESSION, msgs, SUB_TAG, undefined, undefined, disc(msgs), undefined, undefined, wide(msgs));
 
     resetSessionOrderForTest();
     const claim = resolveSessionOrder(SESSION, history("main", 4), MAIN_TAG);
@@ -371,7 +371,7 @@ test("#6011 negative control: healthy runs with distinct first-user frags never 
         { role: "user", content: "distinct task C prompt" },
         { role: "assistant", content: "c-ok" },
     ];
-    const resC = resolveSessionOrder(SESSION, histC, tag(SUB_AGENT_SYSTEM), undefined, undefined, disc(histC), wide(histC));
+    const resC = resolveSessionOrder(SESSION, histC, tag(SUB_AGENT_SYSTEM), undefined, undefined, disc(histC), undefined, undefined, wide(histC));
     assert.equal(resC.key, forkKey3(SESSION, tag(SUB_AGENT_SYSTEM), "distinct task C prompt"), "no contest on this base key → exact three-segment bytes, no fourth segment");
     const histD: Msg[] = [
         { role: "user", content: "task D one" },
@@ -381,8 +381,8 @@ test("#6011 negative control: healthy runs with distinct first-user frags never 
         { role: "user", content: "task E two" },
         { role: "assistant", content: "e-ok" },
     ];
-    const resD = resolveSessionOrder(SESSION, histD, tag(SUB_AGENT_SYSTEM), undefined, undefined, disc(histD), wide(histD));
-    const resE = resolveSessionOrder(SESSION, histE, tag(SUB_AGENT_SYSTEM), undefined, undefined, disc(histE), wide(histE));
+    const resD = resolveSessionOrder(SESSION, histD, tag(SUB_AGENT_SYSTEM), undefined, undefined, disc(histD), undefined, undefined, wide(histD));
+    const resE = resolveSessionOrder(SESSION, histE, tag(SUB_AGENT_SYSTEM), undefined, undefined, disc(histE), undefined, undefined, wide(histE));
     assert.equal(resD.key, forkKey3(SESSION, tag(SUB_AGENT_SYSTEM), "task D one"), "distinct-first-user twin keeps today's exact key");
     assert.equal(resE.key, forkKey3(SESSION, tag(SUB_AGENT_SYSTEM), "task E two"), "distinct-first-user twin keeps today's exact key");
     assert.notEqual(resD.key, resE.key, "already isolated by the base frag — widening never engages");
@@ -413,7 +413,7 @@ test("#6011 degradation: absent/empty wide discriminator = exactly today's behav
     const resB = resolveSessionOrder(SESSION, histB, SUB_TAG, undefined, undefined, SHARED_FIRST);
     assert.equal(resB.key, resA.key, "without the wide discriminator the pre-change (colliding) behavior is preserved exactly");
     // Explicit empty wide discriminator degrades identically.
-    const resC = resolveSessionOrder(SESSION, histB, SUB_TAG, undefined, undefined, SHARED_FIRST, "");
+    const resC = resolveSessionOrder(SESSION, histB, SUB_TAG, undefined, undefined, SHARED_FIRST, undefined, undefined, "");
     assert.equal(resC.key, resA.key, "empty wide discriminator = absent wide discriminator");
     resetSessionOrderForTest();
 });
