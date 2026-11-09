@@ -2226,10 +2226,11 @@ type FileConfig = {
          *  wins. The proxy hot path stays on sqlite until the step-3 async
          *  swap; the boot notice names that boundary. */
         mysql?: { dsn?: string };
-        /** Phase 3 (#2960): "off" stops writing the legacy JSON envelope while
-         *  storage.unified is "full" — the SQLite index becomes the only
-         *  persistent copy (reads were already unified-first; boot enumerates
-         *  the index union). Ignored with a one-time warning under
+        /** Phase 3 (#2960): "off" stops writing the legacy JSON envelope AND
+         *  the per-session CCR content-store sidecar while storage.unified is
+         *  "full" — the SQLite index (session row + ccr mirror) becomes the
+         *  only persistent copy (reads were already unified-first; boot
+         *  enumerates the index union). Ignored with a one-time warning under
          *  shadow/legacy, where the JSON file remains the sole source of
          *  truth. Env BILI_STORAGE_JSON_WRITER wins; default "on". Rollback =
          *  unset (JSON writing resumes; index-only sessions keep loading via
