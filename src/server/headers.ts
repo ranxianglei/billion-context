@@ -33,9 +33,23 @@ export const UPSTREAM_HOP_HEADERS = new Set([
     "x-bili-pf-count",
     "x-bili-pf-seq",
     "x-bili-pf-tail-ids",
+    // #5658: incremental-lane turn correlation id — the native plugin stamps it
+    // on a diverted model request alongside x-bili-plugin-turn to correlate the
+    // applied-seq ack. Pure host↔bili bookkeeping; like the pf-* handshake
+    // headers above it must never reach a model endpoint, so strip at egress.
+    "x-bili-turn-id",
+    // #5825: stamped msgid channel — opencode V2 (and any host that can't
+    // rewrite its body) rides the host message ids here, comma-joined. Pure
+    // host↔bili bookkeeping like the pf-* handshake above; the real upstream
+    // must never see it.
+    "x-bili-msg-ids",
     "te",
     "trailer",
     "upgrade",
+    // expect: end-to-end per spec (not a §6.1 hop-by-hop), but undici fetch
+    // throws UND_ERR_NOT_SUPPORTED when forwarding it — strip at every egress
+    // site (#5369).
+    "expect",
 ]);
 
 // content-encoding is end-to-end (RFC 9110 §7.2), NOT hop-by-hop — but the two
@@ -87,7 +101,9 @@ export function stripRemoteCompactionBetaFeature(headers: Record<string, string>
 export function buildForwardHeaders(headers: Record<string, string>): Record<string, string> {
     const out: Record<string, string> = {};
     for (const [k, v] of Object.entries(headers)) {
-        if (k.toLowerCase() === "content-length" || k.toLowerCase() === "host") continue;
+        // expect: undici fetch rejects it with UND_ERR_NOT_SUPPORTED — dropped
+        // here so no egress path can forward it (#5369).
+        if (k.toLowerCase() === "content-length" || k.toLowerCase() === "host" || k.toLowerCase() === "expect") continue;
         out[k] = v;
     }
     out["content-type"] = "application/json";

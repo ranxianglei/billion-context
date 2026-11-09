@@ -79,21 +79,7 @@ QQ群:
 
 ## 工作原理
 
-```
-编程助手 (Claude Code / Codex / Cursor / Aider ...)
-        │  你把助手的 base URL 指向 proxy
-        ▼
-┌─────────────────┐
-│  billion-context│   1. 解析请求(Anthropic 或 OpenAI 格式)
-│     proxy       │   2. 对对话运行 acp-kernel 压缩
-│                 │   3. 注入 `compress` 工具 + 压缩哲学
-│                 │   4. 转发到真实模型 API
-│                 │   5. 重写流式响应
-└─────────────────┘
-        │
-        ▼
-   真实模型 API (Anthropic / OpenAI / 兼容厂商)
-```
+![工作原理](docs/how-it-works.zh-CN.svg)
 
 ### 上下文管理工具
 
@@ -112,24 +98,25 @@ QQ群:
 
 | 客户端 | 用这个 |
 |---|---|
-| **pi** | [`billion-context`](https://github.com/ranxianglei/billion-context) —— `bili pi`(启动器)或 `bili plugin install pi`(原生);独立 [`billion-context-pi`](https://github.com/ranxianglei/billion-context-pi) 仍可用 —— 细节见 [CLIENTS.zh-CN.md](CLIENTS.zh-CN.md#pipidev-coding-agent) |
-| **opencode**(1.x / 2.x) | [`billion-context`](https://github.com/ranxianglei/billion-context) —— `bili opencode`(启动器)或 `bili plugin install opencode`(原生);独立 [`opencode-acp`](https://github.com/ranxianglei/opencode-acp) 在 1.x 上仍可用 —— 完整指南:[OpenCode](CLIENTS.zh-CN.md#opencode) |
+| **pi** | [`billion-context`](https://github.com/ranxianglei/billion-context) —— `bili pi`(启动器)或 `bili plugin install pi`(原生);独立 [`billion-context-pi`](https://github.com/ranxianglei/billion-context-pi) 仍可用 —— 细节见 [docs/clients.zh-CN.md](docs/clients.zh-CN.md#pipidev-coding-agent) |
+| **opencode**(1.x / 2.x) | [`billion-context`](https://github.com/ranxianglei/billion-context) —— `bili opencode`(启动器)或 `bili plugin install opencode`(原生);独立 [`opencode-acp`](https://github.com/ranxianglei/opencode-acp) 在 1.x 上仍可用 —— 完整指南:[OpenCode](docs/clients.zh-CN.md#opencode) |
 | **omp** | [`billion-context`](https://github.com/ranxianglei/billion-context)，`bili omp`（内置插件）或 `bili plugin install omp`（自拉起原生插件，免启动器） |
-| **dsh** | [`billion-context`](https://github.com/ranxianglei/billion-context) —— `bili dsh`(启动器,经 `--patch` 注入完整原生插件)或 `bili plugin install dsh` ≡ `dsh plugin --profile <name> add billion-context`(统一泳道)—— 细节见 [CLIENTS.zh-CN.md](CLIENTS.zh-CN.md) |
-| **kimi** | `bili plugin install kimi`(自拉起原生,需 Kimi Code ≥ 2.0.0)或 `bili kimi`(证书 MITM)或 `/bili/` 前缀 —— 细节见 [CLIENTS.zh-CN.md](CLIENTS.zh-CN.md) |
+| **dsh** | [`billion-context`](https://github.com/ranxianglei/billion-context) —— `bili dsh`(启动器,经 `--patch` 注入完整原生插件)或 `bili plugin install dsh` ≡ `dsh plugin --profile <name> add billion-context`(统一泳道)—— 细节见 [docs/clients.zh-CN.md](docs/clients.zh-CN.md) |
+| **kimi** | `bili plugin install kimi`(自拉起原生,需 Kimi Code ≥ 2.0.0)或 `bili kimi`(证书 MITM)或 `/bili/` 前缀 —— 细节见 [docs/clients.zh-CN.md](docs/clients.zh-CN.md) |
 | **hermes** | `bili plugin install hermes`(自拉起原生,Python 插件 #958)或 `bili hermes`(证书 MITM) |
-| **zcode**(Z.ai / bigmodel coding plan) | `bili plugin install zcode`(自拉起原生,#1145)或 GUI「设置 → 网络」证书 MITM 或 `/bili/` 前缀 —— 细节见 [CLIENTS.zh-CN.md](CLIENTS.zh-CN.md) |
+| **zcode**(Z.ai / bigmodel coding plan) | `bili plugin install zcode`(自拉起原生,#1145)或 GUI「设置 → 网络」证书 MITM 或 `/bili/` 前缀 —— 细节见 [docs/clients.zh-CN.md](docs/clients.zh-CN.md) |
 | **claude** | `bili claude`(启动器)或 `bili plugin install claude`(原生姿态,#964 —— 受管 settings 块 + 会话自管代理;见下方"注意") |
-| **codex** | `bili codex`(启动器 —— 全功能零配置姿势)或 `bili plugin install codex`(MCP shell 工具面配套:**先起 bili 再玩** —— shell 不拉代理,也路由不了 codex 本体流量)—— 细节见 [CLIENTS.zh-CN.md](CLIENTS.zh-CN.md#codexopenai-codex-cli) |
+| **codex** | `bili codex`(启动器 —— 全功能零配置姿势)或 `bili plugin install codex`(MCP shell 工具面配套:**先起 bili 再玩** —— shell 不拉代理,也路由不了 codex 本体流量)—— 细节见 [docs/clients.zh-CN.md](docs/clients.zh-CN.md#codexopenai-codex-cli) |
 | **jcode** | [`billion-context`](https://github.com/ranxianglei/billion-context),`bili jcode`(cert-MITM)或 `/bili/` 前缀 —— 无原生模式(编译型 Rust 二进制、无插件接缝,[#962](https://github.com/ranxianglei/billion-context/issues/962)) |
 | **gemini**(Gemini CLI) | `bili gemini`(启动器,`GOOGLE_GEMINI_BASE_URL` `/bili/` 改写)或 `/bili/` 前缀 —— 仅启动器(无环内工具注入接缝,#1043) |
 | **iflow**（iFlow CLI） | `bili iflow`（启动器，`IFLOW_BASE_URL` `/bili/` 改写）或 `/bili/` 前缀 |
 | **qwen**（Qwen Code） | `bili qwen`（启动器，cert-MITM）或 `/bili/` 前缀 |
-| **antigravity**（Antigravity CLI / agy，Google） | `bili antigravity`（启动器，`CLOUD_CODE_URL` 对 `daily-cloudcode-pa.googleapis.com` 的 `/bili/` 改写 —— Antigravity 真实默认上游，#3129）或 `/bili/` 前缀 —— 无插件接缝（闭源 Go language_server；其用户插件面仅可追加、不能拦截模型流，[#2115](https://github.com/ranxianglei/billion-context/issues/2115)）—— 细节见 [CLIENTS.zh-CN.md](CLIENTS.zh-CN.md) |
+| **antigravity**（Antigravity CLI / agy，Google） | `bili antigravity`（启动器，`CLOUD_CODE_URL` 对 `daily-cloudcode-pa.googleapis.com` 的 `/bili/` 改写 —— Antigravity 真实默认上游，#3129）或 `/bili/` 前缀 —— 无插件接缝（闭源 Go language_server；其用户插件面仅可追加、不能拦截模型流，[#2115](https://github.com/ranxianglei/billion-context/issues/2115)）—— 细节见 [docs/clients.zh-CN.md](docs/clients.zh-CN.md) |
 | **mcode**(MiniMax Code) | [`billion-context`](https://github.com/ranxianglei/billion-context),`bili mcode`(cert-MITM)或 `/bili/` 前缀 —— 无原生模式(纯声明式事件钩子,无模型请求接缝,[#1050](https://github.com/ranxianglei/billion-context/issues/1050)) |
 | **aider** | [`billion-context`](https://github.com/ranxianglei/billion-context),`bili aider`(cert-MITM)或 `/bili/` 前缀 —— 无原生模式(仅 shell 命令钩子,无工具注入接缝,[#1048](https://github.com/ranxianglei/billion-context/issues/1048)) |
 | **copilot**(GitHub Copilot CLI) | `bili copilot`(启动器,cert-MITM)—— 闭源 Go 二进制、无插件接缝(#1049) |
 | **amp**(Amp CLI) | `bili amp`(启动器,cert-MITM)—— 闭源 Go 二进制、无插件接缝(#1049) |
+| **kiro**(Kiro CLI,AWS) | `bili kiro`(启动器,cert-MITM)—— Rust 外壳 + Node 代理服务、无插件接缝;模型流量走 `runtime.<region>.kiro.dev` 的 Responses wire,网关差异已内置处理——详见 [docs/clients.zh-CN.md](docs/clients.zh-CN.md#kiro-cliaws) |
 | **crush**(Charm Crush) | `bili crush`(启动器,cert-MITM)—— 开源 Go 二进制、无插件接缝;内置 provider 域加白,crush.json 自定义 `base_url` 自动发现(#2340) |
 | **zed**(Zed 编辑器) | `bili zed`(启动器,cert-MITM)—— 开源 Rust 编辑器、无插件接缝;reqwest 吃 HTTPS_PROXY,CA 走 SSL_CERT_FILE(Linux TLS env 探测);内置 provider 域加白,settings.json 自定义 `api_url` 自动发现;环回 provider(ollama/lmstudio)经 NO_PROXY 保持直连(#2340) |
 | **goose**(Goose CLI) | `bili goose`(启动器)—— rustls 不信任任何 CA 文件,无法 cert-MITM:openai/anthropic 腿经 `OPENAI_HOST`/`ANTHROPIC_HOST`,自定义 provider 经重新生成的 `GOOSE_PATH_ROOT` overlay(#1049) |
@@ -160,7 +147,7 @@ npm install -g billion-context --prefix=~/.local
 - **启动器(免安装):** `bili <client>` 一条命令拉起代理 + 客户端,不碰任何真实配置文件.
 - **改url(最通用):** 在客户端 baseURL 前面加上代理地址 + `/bili/`。
 
-三种方式背后的机制细节(插件生命周期、runtime-info 协议、注入优先级)见 [TECHNICAL-NOTES.zh-CN.md](TECHNICAL-NOTES.zh-CN.md)。
+三种方式背后的机制细节(插件生命周期、runtime-info 协议、注入优先级)见 [docs/technical-notes.zh-CN.md](docs/technical-notes.zh-CN.md)。
 
 端口,一句话(#1660):`bili start`(手工)拥有 `8787`;lane 替你拉起的一切(原生 hook、启动器 lane)住在独立的自管端口区,从 `18787` 起 —— 碰撞 +1 跳口、每个 lane 记住自己的漂移,零配置安装永不抢端口,刻意常驻的 `bili start` 守护进程则默认被附着。Attach 按泳道感知(#2905):hook 先骑自己 lane 的实例,绝不骑其他已声明 lane —— 除非在 `native.attachLanePriority` 里显式列出 —— 8787 用户区守护永远是最后兜底。升级重启时若旧版本还在该 lane 端口上排水,会最多等 5 秒让它释放并复用同一端口,而不是漂移(#1723);只有真正被占用的端口才 +1 跳口 —— 且这种跳口现在会大声打 warn。
 
@@ -191,16 +178,16 @@ pi / omp / kimi / claude 没有客户端侧通道 —— 它们的配置条目�
 
 - 原生模式与独立进程内扩展(`billion-context-pi`、`opencode-acp`)**互斥** —— 安装器负责换条目并把原配置快照(`.bili-bak`)。
 - **pi:** 原生安装默认自带子代理功能(`acp_delegate` / `acp_delegate_wait` / `acp_delegate_cancel`)—— 如何关闭它们并保留上下文压缩:[Pi 内置子代理](#pi-内置子代理)。
-- OpenCode 旧会话、V1/V2 插件形态与全部注意事项:[OpenCode](CLIENTS.zh-CN.md#opencode)。
+- OpenCode 旧会话、V1/V2 插件形态与全部注意事项:[OpenCode](docs/clients.zh-CN.md#opencode)。
 - `kimi` 仅在自举时上报 runtime-info(静态头无法承载逐请求窗口/模型值);子代理工具调用由代理的出站 tool_use 见证环路由(#1685)——模型看不到任何会话 id。
 - `hermes` 的原生插件是 Python:健康检查通过后用环境变量把 hermes 的 httpx 栈指向代理,并经 `llm_request` 中间件打逐请求头。
-- `claude` 有**原生姿态**(#964):受管 settings 块 + `SessionStart` hook + MCP shell;hook 骑自管端口区(#1660),每会话把受管 URL 重钉到存活 origin,端口漂移自愈。#1821 起 MCP shell 还在会话内守护代理(30s × 3 次失败),代理死亡时自行重生,lane 内模型请求 ~90s 内恢复而无需新开会话(与 zcode 车道同语义)。`BILI_NATIVE_CLAUDE=0` 退出(passthrough)。机制:[TECHNICAL-NOTES.zh-CN.md](TECHNICAL-NOTES.zh-CN.md)。**已知限制(#2290):** Claude Desktop 应用的 Code 标签页(`CLAUDE_CODE_ENTRYPOINT=claude-desktop`)会为其内嵌的 Claude Code 设置自己的 `ANTHROPIC_BASE_URL`,覆盖受管值——桌面会话完全绕过代理,而受管块的 `DISABLE_AUTO_COMPACT=1` 仍然生效,因此既没有 bili 压缩、也没有原生自动压缩。hook 会在会话开始时大声警告并记录下来供 `bili doctor` 展示(检测到本机装有 Claude Desktop 时,该 lane 也会显示 ⚠️ 提示);终端会话不受影响。**真机验证(2026-10-06,#2290):** 把 `HTTPS_PROXY` 写进 settings 的 `env` 块后,在 Claude Desktop 2.19675.1 / 内嵌 CC 2.1.288(Windows 11)上对一台开启 MITM 的存活代理**零 CONNECT 流量**——该变量没有到达应用内任何网络栈,与该时期的 CLI 行为一致——注意新版构建(CC 2.1.301 起)在 CLI 上会遵守 `HTTPS_PROXY`,这正是 `bili claude` 走 `/bili/` base-URL 改写的原因——launcher 不再为该 lane 设置代理、也不再设置 CA,而自带代理的子进程会把 loopback 主机合并进 `NO_PROXY`/`no_proxy`,确保无论子进程的代理行为如何,这一腿都保持直连(#3446)。截至该版本,桌面 Code 标签页不存在可用的路由缝隙;该 lane 继续在 [#2290](https://github.com/ranxianglei/billion-context/issues/2290) 跟踪,若上游行为变化再议。仅用桌面的用户可用 `bili plugin remove claude` 恢复原生自动压缩。#5095 起受管块还会安装一个 `SubagentStart` hook(`node <root>/dist/claude-subagent-hook.js`),给每次子代理派发铸一个随机 lane token 注入其上下文:骑着父会话 id 且无 agent-id 头的子代理(VS Code 扩展构建,#4352)按 `<id>|sub:…:t:<token>` 键控各自的压缩车道,并行同型派发不再合流(首条消息被折叠后 token 消失,后续请求回落到指纹车道)。卸载时随受管块一并移除。
-- `zcode` 有**原生姿态**(#1145):受管 `~/.zcode/cli/config.json` 块 + 每会话 provider `baseURL` 改写。完整机制:[CLIENTS.zh-CN.md](CLIENTS.zh-CN.md)。
-- `omp` 是自拉起原生插件;`codex` 性质不同 —— 它是 MCP shell 工具面配套:codex 的模型流量只能经 env 路由(默认 ChatGPT-登录 provider 没有可改写的配置缝 —— managed `model_providers` 块会强制 API-key 认证、废掉订阅登录),而 MCP 子进程无法向父进程注入 env,所以插件安装既不拉代理、也永远路由不了 codex 本体流量。`bili plugin install codex` 在 `~/.codex/config.toml` 写入 `[mcp_servers.bili]`(command = node,args = dist/mcp.js)注册四个 ACP 工具,会话启动时解析代理:env `BILI_MCP_PROXY` > 活实例登记(任一 lane 的代理或 `bili start` 守护)> 8787 用户区默认(#1660 去掉了安装时烘焙 origin,#403)—— 全不可达则 `tools/list` 报 -32003。结论:**先起 bili**(`bili start` 或任一客户端的 lane 代理),想要压缩再自行导出 HTTPS_PROXY;零配置全功能用 `bili codex`。机制:[CLIENTS.zh-CN.md](CLIENTS.zh-CN.md#codexopenai-codex-cli)。
+- `claude` 有**原生姿态**(#964):受管 settings 块 + `SessionStart` hook + MCP shell;hook 骑自管端口区(#1660),每会话把受管 URL 重钉到存活 origin,端口漂移自愈。#1821 起 MCP shell 还在会话内守护代理(30s × 3 次失败),代理死亡时自行重生,lane 内模型请求 ~90s 内恢复而无需新开会话(与 zcode 车道同语义)。`BILI_NATIVE_CLAUDE=0` 退出(passthrough)。机制:[docs/technical-notes.zh-CN.md](docs/technical-notes.zh-CN.md)。**已知限制(#2290):** Claude Desktop 应用的 Code 标签页(`CLAUDE_CODE_ENTRYPOINT=claude-desktop`)会为其内嵌的 Claude Code 设置自己的 `ANTHROPIC_BASE_URL`,覆盖受管值——桌面会话完全绕过代理,而受管块的 `DISABLE_AUTO_COMPACT=1` 仍然生效,因此既没有 bili 压缩、也没有原生自动压缩。hook 会在会话开始时大声警告并记录下来供 `bili doctor` 展示(检测到本机装有 Claude Desktop 时,该 lane 也会显示 ⚠️ 提示);终端会话不受影响。**真机验证(2026-10-06,#2290):** 把 `HTTPS_PROXY` 写进 settings 的 `env` 块后,在 Claude Desktop 2.19675.1 / 内嵌 CC 2.1.288(Windows 11)上对一台开启 MITM 的存活代理**零 CONNECT 流量**——该变量没有到达应用内任何网络栈,与该时期的 CLI 行为一致——注意新版构建(CC 2.1.301 起)在 CLI 上会遵守 `HTTPS_PROXY`,这正是 `bili claude` 走 `/bili/` base-URL 改写的原因——launcher 不再为该 lane 设置代理、也不再设置 CA,而自带代理的子进程会把 loopback 主机合并进 `NO_PROXY`/`no_proxy`,确保无论子进程的代理行为如何,这一腿都保持直连(#3446)。截至该版本,桌面 Code 标签页不存在可用的路由缝隙;该 lane 继续在 [#2290](https://github.com/ranxianglei/billion-context/issues/2290) 跟踪,若上游行为变化再议。**账号绑定功能(#4693):** 由于该车道经自定义 `ANTHROPIC_BASE_URL` 路由,Claude Code 会把会话当作第三方/API-key 模式,从而关闭绑定你 Anthropic 账号/云端的功能——**Remote Control**(`/remote-control`,从手机/桌面/网页接管本机会话)会在 bili 路由期间从命令列表消失。压缩本身不受影响;需要这些功能的会话请直接用不带 bili 的原生 `claude`(或 `bili plugin remove claude`)。这是 base-URL 路由缝隙的固有取舍——没有别的拦截点能绕过 CC 的 undici 栈(#2290)——而非配置被删。仅用桌面的用户可用 `bili plugin remove claude` 恢复原生自动压缩。#5095 起受管块还会安装一个 `SubagentStart` hook(`node <root>/dist/claude-subagent-hook.js`),给每次子代理派发铸一个随机 lane token 注入其上下文:骑着父会话 id 且无 agent-id 头的子代理(VS Code 扩展构建,#4352)按 `<id>|sub:…:t:<token>` 键控各自的压缩车道,并行同型派发不再合流(首条消息被折叠后 token 消失,后续请求回落到指纹车道)。卸载时随受管块一并移除。
+- `zcode` 有**原生姿态**(#1145):受管 `~/.zcode/cli/config.json` 块 + 每会话 provider `baseURL` 改写。完整机制:[docs/clients.zh-CN.md](docs/clients.zh-CN.md)。
+- `omp` 是自拉起原生插件;`codex` 性质不同 —— 它是 MCP shell 工具面配套:codex 的模型流量只能经 env 路由(默认 ChatGPT-登录 provider 没有可改写的配置缝 —— managed `model_providers` 块会强制 API-key 认证、废掉订阅登录),而 MCP 子进程无法向父进程注入 env,所以插件安装既不拉代理、也永远路由不了 codex 本体流量。`bili plugin install codex` 在 `~/.codex/config.toml` 写入 `[mcp_servers.bili]`(command = node,args = dist/mcp.js)注册四个 ACP 工具,会话启动时解析代理:env `BILI_MCP_PROXY` > 活实例登记(任一 lane 的代理或 `bili start` 守护)> 8787 用户区默认(#1660 去掉了安装时烘焙 origin,#403)—— 全不可达则 `tools/list` 报 -32003。结论:**先起 bili**(`bili start` 或任一客户端的 lane 代理),想要压缩再自行导出 HTTPS_PROXY;零配置全功能用 `bili codex`。机制:[docs/clients.zh-CN.md](docs/clients.zh-CN.md#codexopenai-codex-cli)。
 - `jcode`、`aider` 无原生模式(无插件/MCP/工具注入接缝:#962、#1048)—— 用 `bili jcode` / `bili aider`。
 - `copilot`、`amp`、`crush`、`zed`、`goose` 仅启动器模式(#1049/#2340);goose 无法 cert-MITM(rustls 不信任任何 CA 文件),改走纯 HTTP base-URL 重定向。
 
-### 方式 2 —— 启动器(`bili pi` / `bili codex` / `bili claude` / `bili omp` / `bili opencode` / `bili hermes` / `bili dsh` / `bili codebuddy` / `bili qoder` / `bili trae` / `bili jcode` / `bili kimi` / `bili gemini` / `bili iflow` / `bili qwen` / `bili antigravity` / `bili mcode` / `bili aider` / `bili copilot` / `bili amp` / `bili crush` / `bili zed` / `bili goose`)
+### 方式 2 —— 启动器(`bili pi` / `bili codex` / `bili claude` / `bili omp` / `bili opencode` / `bili hermes` / `bili dsh` / `bili codebuddy` / `bili qoder` / `bili trae` / `bili jcode` / `bili kimi` / `bili gemini` / `bili iflow` / `bili qwen` / `bili antigravity` / `bili mcode` / `bili aider` / `bili copilot` / `bili amp` / `bili crush` / `bili zed` / `bili goose` / `bili kiro`)
 
 启动器把客户端包进一条命令:在独立端口拉起一个代理(总是全新实例,绝不复用端口),再按客户端支持的机制把它指向代理 —— 能吃代理/CA 环境变量的走**证书 MITM**,不吃的走隔离的**`/bili/` 配置重写**。真实配置文件从不被修改;客户端自己的配置只被**读取**,用来发现它实际连接的 HTTPS 上游主机,把这些主机加入 MITM 白名单 —— 代理只 TLS 终结它们,其余流量盲透传。
 
@@ -209,11 +196,11 @@ bili pi                               # 拉起 pi,走代理 —— file-free(#53
 bili codex                            # 拉起 codex
 bili claude                           # 拉起 claude
 bili omp                              # pi 同款,file-free(#535):环境变量 + 扩展 registerProvider + 压缩取消,真实 ~/.omp 不动
-bili opencode                         # OpenCode(1.x 与 2.x):完整指南见下文 [OpenCode](CLIENTS.zh-CN.md#opencode) 一节
+bili opencode                         # OpenCode(1.x 与 2.x):完整指南见下文 [OpenCode](docs/clients.zh-CN.md#opencode) 一节
 bili hermes                           # file-free(#535):hermes 代理环境变量(HTTPS_PROXY + SSL_CERT_FILE 组合 CA bundle)—— https 走 CONNECT MITM,http 走绝对形式转发;真实 ~/.hermes 不动
 bili dsh                              # deepseek-harness:经 --patch 注入完整原生插件(#941) —— 真实 dsh 工具、会话绑定 /acp(plugin 模式);非回环上游走代理 env,回环保留 overlay DSH_HOME 改写(#535);dsh 自动压缩处处关闭(宿主平面经 bundle patch,web profile 的 preset 经 #3354 加载期 overlay,#1772/#2474/#3354)
 bili codebuddy                        # Tencent CodeBuddy Code CLI:CODEBUDDY_BASE_URL /bili/ 重写(OpenAI chat completions wire),预算对齐走 CODEBUDDY_AUTO_COMPACT_WINDOW;真实 ~/.codebuddy 不动
-bili qoder                            # qoder:模型端点硬编码 https(无法 /bili/ 改写)—— 证书 MITM(HTTPS_PROXY + NODE_EXTRA_CA_CERTS),默认模型主机已加白名单(#653)
+bili qoder                            # qoder CLI(`qoder`/`qodercli`):模型端点硬编码 https(无法 /bili/ 改写)—— 证书 MITM(HTTPS_PROXY + NODE_EXTRA_CA_CERTS),默认模型主机已加白名单(#653)。Qoder Desktop 是另一条 BYOK/自定义渠道,走 `/bili/` 前缀的明文 OpenAI wire —— 当作普通自定义 provider 指向 bili 即可(不走这条 MITM 车道);其官方订阅流量是加密的,不在范围内(#764)
 bili trae                             # Trae CLI(字节跳动,闭源 Go 二进制,无 base-URL 覆盖)—— 证书 MITM(HTTPS_PROXY + SSL_CERT_FILE),模型主机取 TRAE_CLI_API_HOST 或默认企业网关(#655)
 bili jcode                            # jcode(Rust 终端编码 agent)—— 环境变量式证书 MITM 启动:HTTPS_PROXY + SSL_CERT_FILE,模型主机 api.z.ai 默认加白,本地回环 provider 走 NO_PROXY 直连
 bili kimi                             # Kimi Code CLI(Moonshot):除无条件回环绕过外遵循标准代理环境变量 —— https 证书 MITM、http 绝对形式转发;回环端点编目并附手动 /bili/ 提示(#757)
@@ -228,6 +215,7 @@ bili amp                              # Amp CLI(Sourcegraph,闭源 Go 二进制)
 bili crush                            # Crush(Charm,开源 Go 二进制)—— 证书 MITM(HTTPS_PROXY + SSL_CERT_FILE),api.anthropic.com/api.openai.com/openrouter.ai + crush.json 自定义 base_url 加白(#2340)
 bili zed                              # Zed 编辑器(开源 Rust)—— 证书 MITM(HTTPS_PROXY + SSL_CERT_FILE,Linux TLS env 探测),内置 provider 域 + settings.json 自定义 api_url 加白,环回 provider 保持直连(#2340)
 bili goose                            # Goose(Block,Rust/reqwest):rustls 发布构建不信任任何 CA 文件 —— openai/anthropic 腿经 OPENAI_HOST/ANTHROPIC_HOST,自定义 provider 经重新生成的 GOOSE_PATH_ROOT overlay(/bili/ 改写,真实配置不动)(#1049)
+bili kiro                             # Kiro CLI(AWS):经 HTTPS_PROXY + SSL_CERT_FILE 与 NODE_EXTRA_CA_CERTS 上的合并 CA 做 cert-MITM;只解密 runtime.<region>.kiro.dev;developer/system 项为网关改写为 user;会话 = Kiro 的 conversation id(--resume 后保持)
 bili pi --mitm-domain api.foo.com     # 向 MITM 白名单追加域名
 ```
 
@@ -264,7 +252,7 @@ curl -s http://localhost:8787/__bili/stats
 
 ### 客户端深入
 
-一行带不过来的细节 —— 各模式(启动器 / `/bili/` URL 前缀 / 原生插件)如何把流量接进代理、往哪儿写了什么、已知局限有哪些 —— 都在 **[CLIENTS.zh-CN.md](CLIENTS.zh-CN.md)**:dsh · Kimi Code · Hermes · ZCode · Gemini 系(Gemini CLI / iFlow CLI / Qwen Code / Antigravity)· CONNECT 盲隧道接入但从不压缩的客户端(#897)· 未识别端点直连(#1290)· OpenCode(启动器 / 原生 / 纯代理、`/acp` 状态与规则、旧 opencode-acp 会话 #920)。
+一行带不过来的细节 —— 各模式(启动器 / `/bili/` URL 前缀 / 原生插件)如何把流量接进代理、往哪儿写了什么、已知局限有哪些 —— 都在 **[docs/clients.zh-CN.md](docs/clients.zh-CN.md)**:dsh · Kimi Code · Hermes · ZCode · Gemini 系(Gemini CLI / iFlow CLI / Qwen Code / Antigravity)· CONNECT 盲隧道接入但从不压缩的客户端(#897)· 未识别端点直连(#1290)· OpenCode(启动器 / 原生 / 纯代理、`/acp` 状态与规则、旧 opencode-acp 会话 #920)。
 
 ## 从源码安装(开发)
 
@@ -294,13 +282,17 @@ bili --version
 
 **压缩什么时候发生?** 由模型驱动:注入的上下文工具由模型在上下文增长时自行调用,温和的增长 nudge(按设计固定约 50K token 步长,可用 `compress.nudgeGrowthTokens` 调整)沿途提醒它,仅输入就超窗时预检作为硬兜底触发(#470)。用 `/acp` 或网页界面实时观察。
 
-**为什么第一次压缩要到 ~200k 才触发?** 压缩触发不是按绝对窗口位置、而是按增长区间:默认在开机内容之上增长 50k token 才触发第一次软压缩(`compress.nudgeGrowthTokens` 恒定步长、与窗口无关)。开机 100k 左右、或把 `compress.nudgeGrowthTokens` 设到 100k 左右时,可能都要到 ~200k 才发生第一次压缩。想更早压缩省 token:1.删减系统提示词、关闭不需要的工具、精简 skill;2.把 nudge 调小到 50k 左右;3.开启 lean 功能。完整算例见 [CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md#为什么第一次压缩要到-200k-才触发)。
+**压缩会缩小客户端自己的对话文件吗?** 不会 —— 这是超长会话里最常见的意外(#5796)。压缩缩的是**发给模型的内容**:每个出站请求都由存活块加摘要重建,所以对话再长、线上体积也保持小。客户端自己存的对话历史是用户数据 —— bili 从不改写它。dsh 上宿主自带的自动压缩在 bili 激活时还会被一并关闭(两个压缩器不能抢同一份历史,#1772/#2474/#3354),因此宿主侧文件随每一轮增长:文件越大每轮越慢(实测约 3 万条消息时每轮几十秒,#5796),实际可行的收敛路径就是**重开一个新会话**。网页会话列表会对请求数达到 5000+ 的会话打上「长会话/slow」徽标作为提醒。
 
-**bili 是透明的吗?怎么关掉?** 未识别端点原样转发([CLIENTS.zh-CN.md](CLIENTS.zh-CN.md)),且每种模式都能干净退出:原生安装用 `bili plugin remove <client>`,另两种模式停掉启动器命令 / 环境变量 / `/bili/` 前缀即可 —— 流量立刻恢复直连。
+**为什么第一次压缩要到 ~200k 才触发?** 压缩触发不是按绝对窗口位置、而是按增长区间:默认在开机内容之上增长 50k token 才触发第一次软压缩(`compress.nudgeGrowthTokens` 恒定步长、与窗口无关)。开机 100k 左右、或把 `compress.nudgeGrowthTokens` 设到 100k 左右时,可能都要到 ~200k 才发生第一次压缩。想更早压缩省 token:1.删减系统提示词、关闭不需要的工具、精简 skill;2.把 nudge 调小到 50k 左右;3.开启 lean 功能。完整算例见 [docs/configuration.zh-CN.md](docs/configuration.zh-CN.md#为什么第一次压缩要到-200k-才触发)。
 
-**能配合模型路由网关(如 [magpie](https://github.com/yetone/magpie))用吗?** 能 —— 客户端指向 bili、bili 经 `/bili/` 前缀指向网关(前缀内嵌网关的绝对 URL):`http://localhost:8787/bili/http://127.0.0.1:3425…`。例:Claude Code → `ANTHROPIC_BASE_URL=http://localhost:8787/bili/http://127.0.0.1:3425` + `ANTHROPIC_API_KEY=magpie`;OpenAI 系客户端 → `OPENAI_BASE_URL=http://localhost:8787/bili/http://127.0.0.1:3425/v1`(+ `OPENAI_API_KEY=magpie`)。压缩发生在路由*之前*——到达网关节点里任何账号的请求都已是压缩后的。凭据留在网关内:客户端的假 key 原样穿过,真实 key 不接触 bili。注意:① 会话中途切换账号会使 provider 前缀缓存失效——多账号路由的固有代价,与 bili 无关(见 `/acp-cache` 的 KEY SWITCHES 段);② 路由后的模型名对 bili 的窗口查询不透明——需在 providers 键 `http://127.0.0.1:3425` 下用 `models.<name>.context` 声明其上下文窗口,否则按兜底窗口运行(route-miss 警告,#2317);③ 中继若拒绝 bili Anthropic 车道的 `cache_control` 标记,设 `compat.noCacheControl`;④ 回环网关开箱即用;网关在非回环私网地址时可能还需 `network.allowPrivateHttpProviders`(#2984)。三条线(OpenAI Chat / Responses / Anthropic Messages,含跨协议转换)已端到端实测,#4433。
+**bili 是透明的吗?怎么关掉?** 未识别端点原样转发([docs/clients.zh-CN.md](docs/clients.zh-CN.md)),且每种模式都能干净退出:原生安装用 `bili plugin remove <client>`,另两种模式停掉启动器命令 / 环境变量 / `/bili/` 前缀即可 —— 流量立刻恢复直连。
 
-**日志和会话数据存在哪?** 日志:`~/.local/state/billion-context/bili.log`(同时镜像到 stderr);会话状态:`~/.local/share/billion-context/`(XDG 可覆盖;Windows 杀软排除 #362、可选清理 #1082)—— 完整路径见 [CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md)。
+**能配合模型路由网关(如 [magpie](https://github.com/yetone/magpie))用吗?** 能 —— 客户端指向 bili、bili 经 `/bili/` 前缀指向网关(前缀内嵌网关的绝对 URL):`http://localhost:8787/bili/http://127.0.0.1:3425…`。例:Claude Code → `ANTHROPIC_BASE_URL=http://localhost:8787/bili/http://127.0.0.1:3425` + `ANTHROPIC_API_KEY=magpie`;OpenAI 系客户端 → `OPENAI_BASE_URL=http://localhost:8787/bili/http://127.0.0.1:3425/v1`(+ `OPENAI_API_KEY=magpie`)。压缩发生在路由*之前*——到达网关节点里任何账号的请求都已是压缩后的。凭据留在网关内:客户端的假 key 原样穿过,真实 key 不接触 bili。注意:① 会话中途切换账号会使 provider 前缀缓存失效——多账号路由的固有代价,与 bili 无关(见 `/acp-cache` 的 KEY SWITCHES 段);② 路由后的模型名对 bili 的窗口查询不透明——需在 providers 键 `http://127.0.0.1:3425` 下用 `models.<name>.context` 声明其上下文窗口,否则按兜底窗口运行(route-miss 警告,#2317);③ 中继若拒绝 bili Anthropic 车道的 `cache_control` 标记,设 `compat.noCacheControl`;④ 回环网关开箱即用;网关在非回环私网地址时可能还需 `network.allowPrivateHttpProviders`(#2984);⑤ Claude Code 原生插件模式(`bili plugin install claude`)下,可在安装前设 `BILI_CLAUDE_UPSTREAM=http://127.0.0.1:3425`,受管配置块会自动将其包裹为代理 URL(或直接配置 `ANTHROPIC_BASE_URL=http://127.0.0.1:8787/bili/http://127.0.0.1:3425`;`localhost` 与 `127.0.0.1` 均被正确识别,#5369)。三条线(OpenAI Chat / Responses / Anthropic Messages,含跨协议转换)已端到端实测,#4433。
+
+**能配合 [opencodex](https://github.com/lidge-jun/opencodex)(`ocx`)用吗?——它是带 ChatGPT 账号池的本地 Codex/Claude Code 网关。** 同样的模式:客户端指向 bili、bili 经 `/bili/` 前缀指向 ocx —— OpenAI 系客户端(chat completions 与 Responses,如 Codex)→ `OPENAI_BASE_URL=http://localhost:8787/bili/http://127.0.0.1:10100/v1`;Anthropic 系客户端 → `ANTHROPIC_BASE_URL=http://localhost:8787/bili/http://127.0.0.1:10100`。要求 key 的客户端填个假值即可,原样穿过。bili 要放在 ocx *前面*而不是后面:provider 凭据与账号池都在 ocx 这一最终跳上,只有这个顺序才能让压缩与账号池同时生效。回环下两者之间不需要 key(ocx 默认回环绑定不读 token);非回环绑定按其文档设 `OPENCODEX_API_AUTH_TOKEN` + `x-opencodex-api-key` 头。请求模型时用 ocx 的 `provider/model` id 保证路由确定;和任何网关一样,路由后的 id 对 bili 的窗口查询不透明(用 `models.<name>.context` 声明),会话中途换账号会使前缀缓存失效(见 `/acp-cache` 的 KEY SWITCHES)。三条线(OpenAI Chat / Responses / Anthropic Messages)已端到端实测:bili 0.1.212 × ocx 2.97.0。
+
+**日志和会话数据存在哪?** 日志:`~/.local/state/billion-context/bili.log`(同时镜像到 stderr);会话状态:`~/.local/share/billion-context/`(XDG 可覆盖;Windows 杀软排除 #362、可选清理 #1082)—— 完整路径见 [docs/configuration.zh-CN.md](docs/configuration.zh-CN.md)。
 
 ## 运行代理
 
@@ -360,13 +352,13 @@ bili --no-auto-update        # 本次启动禁用自动更新
 
 ### 连接生命周期调优（#1982）
 
-客户端侧连接在最终响应结束后优雅关闭:代理主动发起关闭(`Connection: close`)时,最多等待 `BILI_POST_RESPONSE_LINGER_MS`(默认 `5000`)毫秒的对端关闭信号才释放套接字,池化客户端因此看到的是干净的 EOF,而非字节竞态可能产生的 RST。相关旋钮:`BILI_KEEP_ALIVE_TIMEOUT_MS`(空闲回收预算,默认 `5000`)与 `BILI_CLIENT_ERROR_BACKSTOP_MS`(错误排空路径终局兜底,默认 `30000`)——完整语义见 [CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md)。
+客户端侧连接在最终响应结束后优雅关闭:代理主动发起关闭(`Connection: close`)时,最多等待 `BILI_POST_RESPONSE_LINGER_MS`(默认 `5000`)毫秒的对端关闭信号才释放套接字,池化客户端因此看到的是干净的 EOF,而非字节竞态可能产生的 RST。相关旋钮:`BILI_KEEP_ALIVE_TIMEOUT_MS`(空闲回收预算,默认 `5000`)与 `BILI_CLIENT_ERROR_BACKSTOP_MS`(错误排空路径终局兜底,默认 `30000`)——完整语义见 [docs/configuration.zh-CN.md](docs/configuration.zh-CN.md)。
 
 ### 自动更新
 
 代理启动时和每 3 分钟检查 npm 是否有新版本。发现新版本就原位安装并打印通知 —— **重启 `bili` 才能生效**,除非启用可选自重启(`--auto-restart-on-update` 参数 / `ACP_AUTO_RESTART_ON_UPDATE=1` 环境变量 / 配置 `"autoRestartOnUpdate": true`,默认关闭):零在途请求时校验新安装、停止接收连接、排空、在同一端口拉起替代进程并在其开始接受连接后退出(客户端自动重连;会话状态在磁盘上保留)。安全门:排空窗口全程零在途、re-exec 前安装完整性检查、10 分钟冷却标记防止版本抖动循环重启;任何失败恢复原监听器并回落到普通提醒。运行进程落后于磁盘安装("stale")时,Web UI 显示横幅,`GET /__bili/status` 返回 `{version, diskVersion, stale, autoRestartOnUpdate, advisory, updatePolicy, inFlight}` 供脚本使用(`advisory` 为生效中的严重缺陷公告或 `null`,见下节;`updatePolicy` 上报 #3619 撒点状态——策略来源、`hold`/`pinned`/`blocked`、以及待执行的撒点升级及其到点时刻)。永久禁用:配置(`"autoUpdate": false`)或环境变量(`ACP_AUTO_UPDATE=0`)。
 
-**升级撒点(#3619):** 发现新版本后,自动更新不再立即应用。每台实例在延迟窗口内随机抽取**一个**时刻(内置默认 **15 分钟 – 48 小时**),到点再升;抽中的时刻落盘持久化,重启不重摇。全量升级因此摊开在整个窗口内,而不是发版后十几分钟内全体升完,给坏发版留出中途拦截的响应窗(#3401/#3600/#3394)。窗口与紧急控制放在一个公开的策略文件里(本仓库的 `auto-update-policy.json`,匿名 GET + ETag 缓存):`hold` 全局冻结自动升级、`blocked` 跳过指定版本、`pinned` 设置升级天花板。按设计 fail-open——文件不可达或格式非法时直接回退本地默认;而且它只能调节奏/跳过/钉住,**永远控制不了装什么**。本机退出方式:手动 `bili update` 绕过 `hold`/撒点(但仍遵守 `blocked`/`pinned`)、`"staggerMinDelayMs": 0` + `"staggerMaxDelayMs": 0`(或 `BILI_UPDATE_STAGGER_MIN_MS`/`BILI_UPDATE_STAGGER_MAX_MS`)恢复旧版立即升级、`ACP_AUTO_UPDATE=0` 完全停用自动更新。完整格式与语义见 [CONFIGURATION.zh-CN.md → `update`](CONFIGURATION.zh-CN.md#update)。
+**升级撒点(#3619):** 发现新版本后,自动更新不再立即应用。每台实例在延迟窗口内随机抽取**一个**时刻(内置默认 **15 分钟 – 48 小时**),到点再升;抽中的时刻落盘持久化,重启不重摇。全量升级因此摊开在整个窗口内,而不是发版后十几分钟内全体升完,给坏发版留出中途拦截的响应窗(#3401/#3600/#3394)。窗口与紧急控制放在一个公开的策略文件里(本仓库的 `auto-update-policy.json`,匿名 GET + ETag 缓存):`hold` 全局冻结自动升级、`blocked` 跳过指定版本、`pinned` 设置升级天花板。按设计 fail-open——文件不可达或格式非法时直接回退本地默认;而且它只能调节奏/跳过/钉住,**永远控制不了装什么**。本机退出方式:手动 `bili update` 绕过 `hold`/撒点(但仍遵守 `blocked`/`pinned`)、`"staggerMinDelayMs": 0` + `"staggerMaxDelayMs": 0`(或 `BILI_UPDATE_STAGGER_MIN_MS`/`BILI_UPDATE_STAGGER_MAX_MS`)恢复旧版立即升级、`ACP_AUTO_UPDATE=0` 完全停用自动更新。完整格式与语义见 [docs/configuration.zh-CN.md → `update`](docs/configuration.zh-CN.md#update)。
 
 **插件模式**(`bili opencode` / `bili pi` / `bili dsh` —— 代理内嵌在长驻宿主里运行时),"重启 bili"指的是重启**宿主**:内嵌进程无法自行退出,所以一直开着的宿主会持续运行它启动时的那份代码,默默地错过自动更新报告为"已安装"的每一处修复(#1603)。启用 `--auto-restart-on-update` 可让它在安全点自重启;或运行 `/acp`(当前仅 OpenCode 宿主,pi/dsh 覆盖见 #2084)—— 当磁盘安装领先于运行进程时,状态面板会追加一行过期警告(运行版本 vs 已安装版本)。若注入代码在运行期损坏(如 agent scope 被销毁),模型流量会静默直连(不压缩),直到宿主重启;自 #3581 起该状态可见:无会话运行时插件上报归属闸门降级,Web UI 显示「接管已失效」横幅,`GET /__bili/status` / `/__bili/overview` 暴露每代理的 `attribution` 状态。**按设计无归属**的后台车道(如 dsh 标题生成 sidecar)本身不携带 initiator,其小体量一次性请求按定义直连——按 #3651 契约这类正常拦截**永不报告**,因此永远不会触发横幅。横幅只在归属查询本身抛错(宿主内部错误,如 agent scope 被销毁)时出现,并给出可诊断信息:抛出的错误文本、脱敏后的端点、起始时间、已直连的请求数、解决方法(重启宿主进程),以及复制/提交诊断按钮(预填 GitHub issue)。
 
@@ -390,12 +382,14 @@ bili --no-auto-update        # 本次启动禁用自动更新
 - Web UI 概览页横幅,显示原因与手动升级命令;
 - `GET /__bili/status` 在 `advisory` 字段返回生效中的公告。
 
-该检查默认 fail-open:公告源不可达或格式错误只产生警告,绝不阻断模型流量。禁用方式:配置(`"advisoryCheck": false`)或环境变量(`BILI_ADVISORY_CHECK=0`);可用 `"advisoryUrl"` / `BILI_ADVISORY_URL` 指向自定义文档。
+该检查默认 fail-open:公告源不可达或格式错误只产生警告,绝不阻断模型流量。禁用方式:配置(`"advisoryCheck": false`)或环境变量(`BILI_ADVISORY_CHECK=0`);可用 `"advisoryUrl"` / `BILI_ADVISORY_URL` 指向自定义文档。**公告（Announcements）**（#5548）——与上面的关键缺陷公告是两回事：三个来源给 Web UI 提供横幅，相同 id 的覆盖顺序为**本地文件 > 远程源 > 内置**：(1)*内置*——一次性提示，直接走界面内置文案；(2)*本地*——把 JSON 文件放进配置目录的 `announcements/*.json`（默认 `~/.config/billion-context/announcements/`）即自动渲染：双语记录、按 kind 定色、npm 风格 `versions` 版本定向（`>=a.b.c`、`^`、`~`、`[lo hi]`、`||` 列表）、`percent` 灰度、时间窗、按类型排优先级——一个坏文件只废掉它自己；(3)*远程*——本仓库 master 分支的 [`announcements/remote.json`](announcements/remote.json)（每个 PR 都过 CI 校验），约每 3 分钟拉取一次，上一份有效公告的快照可跨重启/断网存活，坏推送会被拒绝；无法直连的环境用 `"remoteAnnouncementsUrl"` / `BILI_ANNOUNCEMENTS_URL` 指向同一文档的中继镜像。关闭行为按每条记录声明的模式：`persistent`（默认，按内容寻址——公告内容改动后会再提示一次）、`instance`（仅本进程）或 `always`（不显示关闭按钮）。关闭内置提示的记录按安装持久化在统一存储里（默认 SQLite，MySQL 后端同样可用），重启后不复发；旧的 `upgrade-notices.json` 状态文件只作为无统一存储边车（如显式加密 opt-out）的旧式安装的回退。官方源当前发布的是空条目列表。
+
+
 
 ## 配置
 
 完整的配置参考 —— 配置文件位置、顶层键、providers、压缩调参、环境变量 ——
-见 **[CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md)**。
+见 **[docs/configuration.zh-CN.md](docs/configuration.zh-CN.md)**。
 
 ### 配置文件
 
@@ -403,7 +397,7 @@ bili --no-auto-update        # 本次启动禁用自动更新
 (`$XDG_CONFIG_HOME/billion-context/`;用 `BILI_CONFIG_FILE` 可改路径)。
 同一开关有多个来源时的优先级:**CLI 参数(如有)> 环境变量 > 配置文件 > 内置默认值** —— 每个环境变量都继续作为覆盖层可用。
 
-里面有什么(细节见 CONFIGURATION.zh-CN.md):
+里面有什么(细节见 docs/configuration.zh-CN.md):
 
 - `providers` —— 按 provider 的路由表:上游覆盖、模型上下文窗口、按 provider/模型的压缩调参、wire 协议声明、compaction opt-in。
 - `compress` —— 三级压缩调参(全局 → provider → 模型):阈值、nudge 节奏、保留规则、prompts、tiers。
@@ -421,15 +415,15 @@ bili --no-auto-update        # 本次启动禁用自动更新
 
 最常找的开关:
 
-- **上游代理(防火墙/GFW)**—— 让代理自身出站流量走 v2rayA/clash:完整解析顺序、空字符串 = 显式直连、SOCKS5 拒绝、两条出站路径都覆盖,以及 `mitm://` vs `https://` 键 scheme 区分,都在 [CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md)(服务端设置 → `proxy`;Providers → key schemes)。
-- **线上兼容角色改写(`compat.roles`)**—— 上游拒绝 `developer` 角色?[CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md)(服务端设置 → `compat`)已覆盖 —— 包括零配置即用的失败自学习修复。
-- **签名上游(body 级签名)**—— 请求携带 body 级签名的网关(CodeArts APIG 的 `SDK-HMAC-SHA256`,或 `x-ofm-signature` 一类网关自造头):内置方案在 dsh 上透明重签;其他被形状检测识别出的方案**一律本地拒收** —— 签名请求要么重签+压缩、要么拒绝,绝不无签名放行 —— bili 在补上对应重签器前每次启动与 web UI 持续提醒(#1884/#2090)。检测规则、按方案覆盖、`BILI_RESIGN` / `BILI_RESIGN_PASSTHROUGH` / `BILI_CODEARTS_REF` 见 [CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md)(服务端设置 → `resign`)。
+- **上游代理(防火墙/GFW)**—— 让代理自身出站流量走 v2rayA/clash:完整解析顺序、空字符串 = 显式直连、SOCKS5 拒绝、两条出站路径都覆盖,以及 `mitm://` vs `https://` 键 scheme 区分,都在 [docs/configuration.zh-CN.md](docs/configuration.zh-CN.md)(服务端设置 → `proxy`;Providers → key schemes)。
+- **线上兼容角色改写(`compat.roles`)**—— 上游拒绝 `developer` 角色?[docs/configuration.zh-CN.md](docs/configuration.zh-CN.md)(服务端设置 → `compat`)已覆盖 —— 包括零配置即用的失败自学习修复。
+- **签名上游(body 级签名)**—— 请求携带 body 级签名的网关(CodeArts APIG 的 `SDK-HMAC-SHA256`,或 `x-ofm-signature` 一类网关自造头):内置方案在 dsh 上透明重签;其他被形状检测识别出的方案**一律本地拒收** —— 签名请求要么重签+压缩、要么拒绝,绝不无签名放行 —— bili 在补上对应重签器前每次启动与 web UI 持续提醒(#1884/#2090)。检测规则、按方案覆盖、`BILI_RESIGN` / `BILI_RESIGN_PASSTHROUGH` / `BILI_CODEARTS_REF` 见 [docs/configuration.zh-CN.md](docs/configuration.zh-CN.md)(服务端设置 → `resign`)。
 
 ### Pi 内置子代理
 
 使用 `bili pi` 或 pi 原生插件（`bili plugin install pi`）时，会自带默认启用的子代理功能：`acp_delegate`、`acp_delegate_wait` 和 `acp_delegate_cancel`。这组额外工具仅在 pi 上提供。
 
-**建议只启用一套子代理实现。** 如果使用内置功能，建议在用户级和项目级配置中移除或禁用其他 pi 子代理插件（例如 `pi-subagents` 或单独安装的 `billion-context-pi-subagents`），避免工具、提示词或行为重叠。如果更喜欢其他子代理插件，可以关闭内置功能。项目级 `pi-subagents` 安装默认会让内置 delegate 自动让位，但仅有用户级安装时不会，因此不能把这项保护当作所有安装方式都适用的保障。
+**建议只启用一套子代理实现。** 如果使用内置功能，建议在用户级和项目级配置中移除或禁用其他 pi 子代理插件（例如 `pi-subagents` 或单独安装的 `billion-context-pi-subagents`），避免工具、提示词或行为重叠。如果更喜欢其他子代理插件，可以关闭内置功能。`pi-subagents` 在任一作用域（项目级或用户级）的安装都会让内置 delegate 自动让位（#5637）——用户级安装在每个项目中都会加载，因此该保护同样适用；如需与其并存保留 `acp_delegate`，设置 `delegate.forceEnable`。
 
 要关闭内置子代理并保留上下文压缩，请将以下配置合并到 `~/.config/billion-context/billion-context.json`（或 `BILI_CONFIG_FILE` 指定的文件），保留已有的其他设置：
 
@@ -441,7 +435,7 @@ bili --no-auto-update        # 本次启动禁用自动更新
 }
 ```
 
-重启 pi 并开启新会话后生效。该配置关闭三个 delegate 工具、配套的系统提示词和子代理管理界面的快捷键，上下文压缩仍然启用；单独安装的其他子代理插件不受此开关控制。更多选项见[子代理配置](CONFIGURATION.zh-CN.md#pi)。
+重启 pi 并开启新会话后生效。该配置关闭三个 delegate 工具、配套的系统提示词和子代理管理界面的快捷键，上下文压缩仍然启用；单独安装的其他子代理插件不受此开关控制。更多选项见[子代理配置](docs/configuration.zh-CN.md#pi)。
 
 ## 会话机制
 
@@ -457,11 +451,13 @@ bili --no-auto-update        # 本次启动禁用自动更新
 | **omp**(经插件)| ✅ 发 | `prompt_cache_key` 提升为稳定身份(#268)|
 | **pi**(裸跑)| ❌ 不发 | 无 → 见下方匿名前缀亲和 |
 
-**omp 注意(#2583/#3556):** 较新的 OMP 构建中,默认 Anthropic(`anthropic-messages`)请求经 OMP 的 Cowork 传输以 node:https **直发** —— 到不了 bili 的 fetch 层,因此那条路径上 `prompt_cache_key` 打戳被*主动放弃*(打了戳反而会把字段泄漏进 Anthropic 严格 schema → HTTP 400)。自 #3556 起,`bili omp` launcher lane 默认不再留这个洞:除非你自己设置了 `PI_PROXY` / `PI_PROXY_ANTHROPIC`,launcher 会导出 `PI_PROXY_ANTHROPIC=<proxy>`,把 Cowork 推回 Bun 的 fetch、像其余 lane 一样经代理路由(可压缩、会话可见;打上的 key 由代理消费并剥离)。直连且匿名的行为只保留在 native omp 模式、以及你自己钉死代理姿态的 launcher lane;其余 omp 流量保持打戳身份。详见 [TECHNICAL-NOTES.zh-CN.md](TECHNICAL-NOTES.zh-CN.md)。
+**omp 注意(#2583/#3556):** 较新的 OMP 构建中,默认 Anthropic(`anthropic-messages`)请求经 OMP 的 Cowork 传输以 node:https **直发** —— 到不了 bili 的 fetch 层,因此那条路径上 `prompt_cache_key` 打戳被*主动放弃*(打了戳反而会把字段泄漏进 Anthropic 严格 schema → HTTP 400)。自 #3556 起,`bili omp` launcher lane 默认不再留这个洞:除非你自己设置了 `PI_PROXY` / `PI_PROXY_ANTHROPIC`,launcher 会导出 `PI_PROXY_ANTHROPIC=<proxy>`,把 Cowork 推回 Bun 的 fetch、像其余 lane 一样经代理路由(可压缩、会话可见;打上的 key 由代理消费并剥离)。直连且匿名的行为只保留在 native omp 模式、以及你自己钉死代理姿态的 launcher lane;其余 omp 流量保持打戳身份。详见 [docs/technical-notes.zh-CN.md](docs/technical-notes.zh-CN.md)。
+
+**omp advisor 隔离(#5567):** omp 的持续后台流(例如跑在第二个模型上的 turn-reviewer *advisor*)是独立的模型对话,但它的 Chat Completions 请求不带自己的会话信号——插件会把主会话 id 盖进 `prompt_cache_key`,于是两条流落在**同一个** bili 会话里。两个模型/协议交错写入同一账本会把它弄坏:refs 变 DEAD(`cannot be anchored` / `content-changed`)、fold coverage 漂移、usage/window/nudge 计量在两条流之间串用(日志行 `foreign payload under a shared session id (#4805)` 标记了代理发现异常的位置)。在宿主侧身份修复落地之前(跟踪于 [#5567](https://github.com/ranxianglei/billion-context/issues/5567)),可以让 advisor 带上自己的身份出线来隔离它:在 omp 的模型注册配置(`models.yml` 的 `providers:` 段)里,给 advisor 所用 provider 条目设置 `compat.supportsPromptCacheKey: true` —— pi-ai 就会把 advisor 自己的会话 UUID 序列化为 `prompt_cache_key`,bili 据此把它绑到独立会话。边界:若 omp 显式为 advisor 传了共享缓存键则此法无效;隔离后 advisor 作为独立会话运行(有自己的压缩状态);可在 web 面板确认 advisor 流量出现在独立会话 id 下。
 
 **无 header 客户端(pi 类):匿名前缀亲和。** 当客户端完全不发任何会话信号时,代理从重放的历史本身解析会话(`src/prefix-affinity.ts`,#309):只有当请求历史从第 0 条开始逐字节复现某已存会话的消息链时,才重新挂回该会话;否则获得一个确定性的新 `pfa-…` 会话。后果(#1262):**恢复(resume)** 的对话重新挂回自己的会话(包括代理重启后,#499);**开头相同的新任务不会继承**另一个会话的 block —— 它拿到全新会话,历史一旦分叉就彻底独立;完全没有任何可用信号时,请求会被显式 400 拒绝,而不是静默与他人状态碰撞。
 
-设计记录与威胁模型:[SESSION-IDENTITY.md](SESSION-IDENTITY.md)。消息粒度的对偶文档(为什么身份由内容派生、而非指派 id)是 [MESSAGE-IDENTITY.zh-CN.md](MESSAGE-IDENTITY.zh-CN.md)。
+设计记录与威胁模型:[docs/session-identity.md](docs/session-identity.md)。消息粒度的对偶文档(为什么身份由内容派生、而非指派 id)是 [docs/message-identity.zh-CN.md](docs/message-identity.zh-CN.md)。
 
 上游粘性路由方面,代理只转发客户端本来就提供的身份值(例如 body 里的 `session_id` 会以 `x-session-id` 上送),绝不自行合成一个。
 
@@ -469,11 +465,11 @@ bili --no-auto-update        # 本次启动禁用自动更新
 
 ### 派生(子)会话继承父会话的压缩上下文(#1333、#1362)
 
-当 agent 派生子会话(subagent 或 fork,从空历史起步、不重发父会话内容)时,它会在出生时上报这条血缘:身份注册携带父会话 id(`parentConversationId`),代理在子会话上记录一条只读链接(`derivedFrom`)。此后 `decompress` / `search_context` 对子会话自己从未见过的内容沿父链回退(带环检测、深度上限 8);任何东西都不复制进子会话,父会话也绝不被修改;父会话未知时子会话就按全新起步。各 lane 的父信号(pi/omp `parentSession` header、OpenCode V1/V2 `parentID`):[SESSION-IDENTITY.zh-CN.md](SESSION-IDENTITY.zh-CN.md#派生子会话出生时携带血统1333-1362)。claude/codex/dsh 在这里不需要任何信号:它们的子 agent 共享同一个会话 id,或根本没有子会话概念。
+当 agent 派生子会话(subagent 或 fork,从空历史起步、不重发父会话内容)时,它会在出生时上报这条血缘:身份注册携带父会话 id(`parentConversationId`),代理在子会话上记录一条只读链接(`derivedFrom`)。此后 `decompress` / `search_context` 对子会话自己从未见过的内容沿父链回退(带环检测、深度上限 8);任何东西都不复制进子会话,父会话也绝不被修改;父会话未知时子会话就按全新起步。各 lane 的父信号(pi/omp `parentSession` header、OpenCode V1/V2 `parentID`):[docs/session-identity.zh-CN.md](docs/session-identity.zh-CN.md#派生子会话出生时携带血统1333-1362)。claude/codex/dsh 在这里不需要任何信号:它们的子 agent 共享同一个会话 id,或根本没有子会话概念。
 
 ### Windows：把会话目录加入杀软排除项（#362）
 
-代理把每个会话的压缩状态持久化到会话目录(默认 `%USERPROFILE%\.local\share\billion-context\`),长会话每一轮都会重写该文件。在 Windows 上,实时杀毒(Defender)、搜索索引器或同步工具(OneDrive)可能在写入中途锁住该目录,导致 rename 以 `EPERM` 失败。同一会话连续 N 次写失败(默认 `5`)时,代理打一条一次性可操作告警,指明要排除的目录。根上修复:把 `%USERPROFILE%\.local\share\billion-context\` 加入杀软**排除项**,并确认没有同步工具在同步该路径 —— 完整步骤见 [CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md) 的「Windows：把会话目录加入杀软排除项」章节。同一排除项也覆盖统一存储 `index.db` 打不开(`unable to open database file`,#3823)——存储降级告警会把它列为第一嫌疑。
+代理把每个会话的压缩状态持久化到会话目录(默认 `%USERPROFILE%\.local\share\billion-context\`),长会话每一轮都会重写该文件。在 Windows 上,实时杀毒(Defender)、搜索索引器或同步工具(OneDrive)可能在写入中途锁住该目录,导致 rename 以 `EPERM` 失败。同一会话连续 N 次写失败(默认 `5`)时,代理打一条一次性可操作告警,指明要排除的目录。根上修复:把 `%USERPROFILE%\.local\share\billion-context\` 加入杀软**排除项**,并确认没有同步工具在同步该路径 —— 完整步骤见 [docs/configuration.zh-CN.md](docs/configuration.zh-CN.md) 的「Windows：把会话目录加入杀软排除项」章节。同一排除项也覆盖统一存储 `index.db` 打不开(`unable to open database file`,#3823)——存储降级告警会把它列为第一嫌疑。
 
 ### 单机多安装共存（#5046）
 
@@ -481,7 +477,7 @@ bili --no-auto-update        # 本次启动禁用自动更新
 
 ### 会话文件清理（#1082）
 
-短命会话会留下永远不会再被恢复的小状态文件。清理是**可选开启(opt-in)**的:设 `BILI_SESSION_GC=1` 才启用(默认关闭 —— 会话文件属于用户数据,不应有静默删除策略)。启用且持久化开启时,bili 在启动时和每小时扫描会话目录,只有**两个条件同时满足**才删除一个文件:年龄超过 `BILI_SESSION_GC_MAX_AGE_DAYS`(默认 7 天),并且该会话**从未被压缩过**(没有折叠块)、最近一次请求体 ≤ `BILI_SESSION_GC_MAX_TOKENS` token(默认 1M)—— 删除只丢字节不丢内容。CCR 内容存储遵循其会话文件的生命周期;被压缩过的会话永不删除;每次删除都写审计日志。详见 [CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md)。
+短命会话会留下永远不会再被恢复的小状态文件。清理是**可选开启(opt-in)**的:设 `BILI_SESSION_GC=1` 才启用(默认关闭 —— 会话文件属于用户数据,不应有静默删除策略)。启用且持久化开启时,bili 在启动时和每小时扫描会话目录,只有**两个条件同时满足**才删除一个文件:年龄超过 `BILI_SESSION_GC_MAX_AGE_DAYS`(默认 7 天),并且该会话**从未被压缩过**(没有折叠块)、最近一次请求体 ≤ `BILI_SESSION_GC_MAX_TOKENS` token(默认 1M)—— 删除只丢字节不丢内容。CCR 内容存储遵循其会话文件的生命周期;被压缩过的会话永不删除;每次删除都写审计日志。详见 [docs/configuration.zh-CN.md](docs/configuration.zh-CN.md)。
 
 ### 存储维护 CLI（#3928）
 

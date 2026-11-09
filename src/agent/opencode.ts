@@ -119,12 +119,13 @@ async function respawnOwnProxy(): Promise<string | undefined> {
 
 const server = async (ctx: OpencodePluginContext): Promise<OpencodeHooks> => {
     if (!proxyBase) return {};
-    console.log("[bili-opencode] plugin active (proxy " + proxyBase + ")");
+    // #5706: host-safe channel — raw console.* lands on the opencode TUI terminal.
+    logHostEvent("info", "[native-client]", "[bili-opencode] plugin active (proxy " + proxyBase + ")");
     // V1 host: same SDK-default-baseURL gap as the native entry — the
     // launcher's config-file rewrite only catches explicit baseURLs. Global
     // fetch patch catches the rest; runtime recovery rides the shared state.
     if (intercept !== undefined && installNativeFetchIntercept(intercept)) {
-        console.log("[bili-opencode] v1: fetch patch installed (catches providers without an explicit baseURL)");
+        logHostEvent("info", "[native-client]", "[bili-opencode] v1: fetch patch installed (catches providers without an explicit baseURL)");
     }
     return {
         ...createAcpCommandHooks(() => intercept?.origin ?? proxyBase, ctx),

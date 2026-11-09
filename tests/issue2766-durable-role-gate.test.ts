@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+    dshImageHandlePath,
     dshMcpCatalogPath,
     dshRuntimeContextPath,
     dshSkillCatalogPath,
@@ -28,6 +29,7 @@ const CARRIERS: Array<[name: string, marker: string, path: string, cls: (m: Core
     ["workspace instructions", "Instructions from: ~/.dsh/AGENTS.md", "durable/agents-md", dshWorkspaceInstructionsPath],
     ["mcp catalog", "<mcp_catalog>\n- server: fs\n</mcp_catalog>", "durable/mcp-catalog", dshMcpCatalogPath],
     ["runtime context", "Current runtime context. This snapshot supersedes earlier runtime-context snapshots.", "durable/runtime-context", dshRuntimeContextPath],
+    ["request-image handle", 'Image "x.png" (sha256:2e896b95dec003df); request preview 1600x900px.', "oneshot/image-handle", dshImageHandlePath],
 ];
 
 for (const [name, marker, path, cls] of CARRIERS) {

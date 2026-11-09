@@ -149,12 +149,20 @@ const { parentPort, workerData } = require("node:worker_threads");
 // (node:sqlite is NOT in module.builtinModules, so it is not skipped as a
 // builtin); variable indirection is that gate's sanctioned invisible path.
 // Do NOT inline the specifier back into the call — it re-trips the gate
-// (same class as #3511/#3516/#4008; see 8b70e913 for the same fix in
-// src/storage/quick-check-worker.ts).
+// (same class as #3511/#3516/#4008; driver.ts uses the same indirection for
+// bun:sqlite).
+// bun is not Node: it has no node:sqlite, and its own builtin speaks the
+// better-sqlite3-shaped API (Database, the "readonly" option instead of node's
+// "readOnly"), so the worker picks the engine by the runtime it actually runs
+// on — the same process.versions.bun test driver.ts uses.
 const SQLITE_SPEC = "node:sqlite";
+const BUN_SQLITE_SPEC = "bun:sqlite";
+const isBunRuntime = typeof process !== "undefined" && process.versions != null && process.versions.bun != null;
+const openReadOnly = isBunRuntime
+    ? (p) => new (require(BUN_SQLITE_SPEC).Database)(p, { readonly: true })
+    : (p) => new (require(SQLITE_SPEC).DatabaseSync)(p, { readOnly: true });
 try {
-    const { DatabaseSync } = require(SQLITE_SPEC);
-    const db = new DatabaseSync(workerData.path, { readOnly: true });
+    const db = openReadOnly(workerData.path);
     const rows = db.prepare("PRAGMA quick_check").all();
     db.close();
     const verdict = rows.map((row) => String(row.quick_check ?? "")).join(" ").trim();
