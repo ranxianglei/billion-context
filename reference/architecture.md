@@ -28,6 +28,8 @@ billion-context/
 │   │   ├── prepare-openai.ts     #   OpenAI chat request preparation (#1440)
 │   │   ├── prepare-responses.ts  #   Responses request preparation + codex compact/prompt-cache helpers (#1440)
 │   │   ├── relay.ts             #   Upstream relay zone: forward() + fake-completion recovery (#1440 P2 cut 4)
+│   │   ├── responses-ordering.ts #   #564 Responses assistant-run ordering repair + producer-owned turn-separator provenance (#2627)
+│   │   ├── responses-separator.ts #   Canonical Responses turn-separator literal and carrier predicates (#2627)
 │   │   ├── side-request.ts       #   Tool-surface check for auxiliary side requests
 │   │   ├── attribution-status.ts #   Takeover-failure visibility from host attribution reports (#3581)
 │   │   ├── dsh-authored-compaction.ts #   Bili-authored dsh compaction: answers the summarize call locally (#3733)
@@ -49,6 +51,9 @@ billion-context/
 │   ├── event-loop-watchdog.ts    # Worker-thread event-loop wedge detector: self-exit after 5 min of continuous main-loop silence (#4762)
 │   ├── paths.ts                  # XDG paths (config/cache/state) + relocation env vars
 │   ├── logger.ts                 # Tee logger: state-dir file + stderr
+│   ├── log-retention.ts          # Private-log generations: 48h target under a hard byte budget, 0600, honest coverage
+│   ├── log-retention-coverage.ts # Retention coverage reader: measured span from the oldest retained line, continuity always unknown
+│   ├── log-file-lines.ts         # Streaming line reader over the retained generations (bounded memory, per-file error reporting)
 │   ├── log-mask.ts               # Log safety: masks credentials/endpoints (#255)
 │   ├── version.ts                # Own version identity from package.json at runtime
 │   ├── doctor.ts                 # Read-only advisory evaluation against on-disk version (#1577)

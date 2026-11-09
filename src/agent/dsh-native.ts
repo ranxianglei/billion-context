@@ -2311,12 +2311,21 @@ export async function apply(ctx: PluginContext): Promise<void> {
         // floor sits under it; the bare floor marks the stronger "provably
         // over" tier in the line below. #4111 keeps the media exclusion
         // (base64 mass bills through the upstream's image lane, not as text).
-        // Unknown window or unsized body keeps #1117 semantics.
+        // An unsized body keeps #1117 semantics; an UNKNOWN window falls back
+        // to the 1M floor (#5907).
         // #4079: the declared window can be wrong SMALL (stale host config,
         // model-catalog fallback) — the bar never assumes below max(declared, 1M).
-        const doom = bodyOverWindowDetail(body, init, effectiveContextWindow(ctx));
+        // #5907: NO declaration at all (a custom provider whose model info the
+        // host never resolved) must not disarm the arm either — fall back to
+        // the same floor instead of forwarding an oversized body into a
+        // guaranteed upstream rejection.
+        const declared = effectiveContextWindow(ctx);
+        const doom = bodyOverWindowDetail(body, init, declared ?? MIN_ASSUMED_WINDOW_TOKENS);
         if (doom !== undefined) {
-            persistClientEvent(`bili-native-dsh: takeover gate refused ${gateKeyOf(url)} LOCALLY (422) — attribution threw and body est ~${doom.estTokens.toLocaleString("en-US")} tok ${doom.provablyOver ? "(the optimistic floor alone already exceeds the window)" : `(calibrated estimate over; the optimistic floor ${doom.floorTokens.toLocaleString("en-US")} tok still sits under it)`} vs window ${doom.window.toLocaleString("en-US")} (declared ${doom.declaredWindow.toLocaleString("en-US")}; never assumes below ${MIN_ASSUMED_WINDOW_TOKENS.toLocaleString("en-US")}) — core ${doom.coreBytes.toLocaleString("en-US")}B${doom.mediaBytes > 0 ? `, ${doom.mediaBytes.toLocaleString("en-US")}B media excluded` : ""} (#2924/#4111/#5613); a direct send would 400 upstream`);
+            const windowNote = declared === undefined
+                ? `no window declared; assuming the ${MIN_ASSUMED_WINDOW_TOKENS.toLocaleString("en-US")} floor`
+                : `declared ${doom.declaredWindow.toLocaleString("en-US")}; never assumes below ${MIN_ASSUMED_WINDOW_TOKENS.toLocaleString("en-US")}`;
+            persistClientEvent(`bili-native-dsh: takeover gate refused ${gateKeyOf(url)} LOCALLY (422) — attribution threw and body est ~${doom.estTokens.toLocaleString("en-US")} tok ${doom.provablyOver ? "(the optimistic floor alone already exceeds the window)" : `(calibrated estimate over; the optimistic floor ${doom.floorTokens.toLocaleString("en-US")} tok still sits under it)`} vs window ${doom.window.toLocaleString("en-US")} (${windowNote}) — core ${doom.coreBytes.toLocaleString("en-US")}B${doom.mediaBytes > 0 ? `, ${doom.mediaBytes.toLocaleString("en-US")}B media excluded` : ""} (#2924/#4111/#5613/#5907); a direct send would 400 upstream`);
             noteAttrRefusal("threw", { message, endpoint: maskUrlForDiagnostics(gateKeyOf(url)) });
             return "refuse-oversized";
         }
@@ -2332,16 +2341,22 @@ export async function apply(ctx: PluginContext): Promise<void> {
     // gateway send that passed every floor-only check, then bricked the
     // whole session when upstream rejected it). Same dual-tier pricing as
     // the threw arm — calibrated estimate first, the bare floor marking the
-    // "provably over" tier, #4111's media exclusion intact. Unknown window
-    // or unsized/streamed body keeps #1117, now named in the durable line
-    // via refuse()'s size note.
+    // "provably over" tier, #4111's media exclusion intact. An unsized/streamed
+    // body keeps #1117, now named in the durable line via refuse()'s size
+    // note; an unknown window falls back to the 1M floor (#5907).
     const refuseUnattributed = (url: string, attr: Exclude<GateAttribution, { state: "ok" }>, body: { bytes: number } | undefined, init: RequestInit | undefined): GateVerdict => {
         // #4079: same undersized-declaration guard as the threw arm — the
         // bar never assumes below the 1M common window floor. #4111: same
         // media-aware core-text caliber too (see bodyOverWindowDetail).
-        const unattributedDoom = bodyOverWindowDetail(body, init, effectiveContextWindow(ctx));
+        // #5907: an unknown window falls back to the same floor instead of
+        // disarming the whole arm.
+        const declared = effectiveContextWindow(ctx);
+        const unattributedDoom = bodyOverWindowDetail(body, init, declared ?? MIN_ASSUMED_WINDOW_TOKENS);
         if (unattributedDoom !== undefined) {
-            persistClientEvent(`bili-native-dsh: takeover gate refused ${gateKeyOf(url)} LOCALLY (422) — unattributed body est ~${unattributedDoom.estTokens.toLocaleString("en-US")} tok ${unattributedDoom.provablyOver ? "(the optimistic floor alone already exceeds the window)" : `(calibrated estimate over; the optimistic floor ${unattributedDoom.floorTokens.toLocaleString("en-US")} tok still sits under it)`} vs window ${unattributedDoom.window.toLocaleString("en-US")} (declared ${unattributedDoom.declaredWindow.toLocaleString("en-US")}; never assumes below ${MIN_ASSUMED_WINDOW_TOKENS.toLocaleString("en-US")}) — core ${unattributedDoom.coreBytes.toLocaleString("en-US")}B${unattributedDoom.mediaBytes > 0 ? `, ${unattributedDoom.mediaBytes.toLocaleString("en-US")}B media excluded` : ""} (#4068/#4079/#4111/#5613); a direct send would be a guaranteed upstream rejection`);
+            const windowNote = declared === undefined
+                ? `no window declared; assuming the ${MIN_ASSUMED_WINDOW_TOKENS.toLocaleString("en-US")} floor`
+                : `declared ${unattributedDoom.declaredWindow.toLocaleString("en-US")}; never assumes below ${MIN_ASSUMED_WINDOW_TOKENS.toLocaleString("en-US")}`;
+            persistClientEvent(`bili-native-dsh: takeover gate refused ${gateKeyOf(url)} LOCALLY (422) — unattributed body est ~${unattributedDoom.estTokens.toLocaleString("en-US")} tok ${unattributedDoom.provablyOver ? "(the optimistic floor alone already exceeds the window)" : `(calibrated estimate over; the optimistic floor ${unattributedDoom.floorTokens.toLocaleString("en-US")} tok still sits under it)`} vs window ${unattributedDoom.window.toLocaleString("en-US")} (${windowNote}) — core ${unattributedDoom.coreBytes.toLocaleString("en-US")}B${unattributedDoom.mediaBytes > 0 ? `, ${unattributedDoom.mediaBytes.toLocaleString("en-US")}B media excluded` : ""} (#4068/#4079/#4111/#5613/#5907); a direct send would be a guaranteed upstream rejection`);
             noteAttrRefusal(attr.state, { endpoint: maskUrlForDiagnostics(gateKeyOf(url)) });
             return "refuse-oversized-unattributed";
         }
