@@ -29,6 +29,7 @@ billion-context/
 │   │   ├── prepare-responses.ts  #   Responses request preparation + codex compact/prompt-cache helpers (#1440)
 │   │   ├── relay.ts             #   Upstream relay zone: forward() + fake-completion recovery (#1440 P2 cut 4)
 │   │   ├── responses-ordering.ts #   #564 Responses assistant-run ordering repair + producer-owned turn-separator provenance (#2627)
+│   │   ├── responses-separator.ts #   Canonical Responses turn-separator literal and carrier predicates (#2627)
 │   │   ├── side-request.ts       #   Tool-surface check for auxiliary side requests
 │   │   ├── attribution-status.ts #   Takeover-failure visibility from host attribution reports (#3581)
 │   │   ├── dsh-authored-compaction.ts #   Bili-authored dsh compaction: answers the summarize call locally (#3733)
