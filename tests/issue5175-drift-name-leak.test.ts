@@ -272,6 +272,9 @@ const PARITY_SHAPES: Array<[string, string]> = [
     // count-only turn that survived streaming would be visible text and would
     // defeat the degenerate-turn retry that replaces it with a real answer.
     ["live report count unit", "\x3cacp_tokens\x3e910\x3c/acp_tokens\x3e"],
+    // Sibling without underscore: the rule is deliberately acp-prefix-wide
+    // (see DRIFT_COUNT), so this must die whole at every wire cut too.
+    ["count unit, underscore-free sibling", "\x3cacp_tool\x3e5\x3c/acp_tool\x3e"],
 ];
 
 // Two shapes cannot be fixed from the streaming lane and are pinned here as a
@@ -1388,8 +1391,21 @@ test("#5179 A negatives: non-acp names, non-digit bodies, mismatched closes surv
 test("#5179 A: the gate engages on the count shape, stays off for prose pairs", () => {
     assert.equal(containsRenderTagText("\x3cacp_tokens\x3e910\x3c/acp_tokens\x3e"), true);
     assert.equal(containsRenderTagText("\x3cfoo\x3e5\x3c/foo\x3e"), false);
+    // Deliberate width (#5179 review): any acp-prefixed name engages the gate.
+    assert.equal(containsRenderTagText("\x3cacp_tool\x3e5\x3c/acp_tool\x3e"), true);
 });
 
 test("#5179 A: the released-span seam strips the count unit too", () => {
     assert.equal(stripDriftResidue("\x3cacp_tokens\x3e910\x3c/acp_tokens\x3e"), "");
+});
+
+// Width ruling (#5179 review, 2026-11-09): the count shape fires on ANY
+// acp-prefixed name with a digits-only body - not just the attested
+// acp_tokens. Kept deliberately wide: the acp prefix excludes English prose
+// and real tool-call XML on its own, while an underscore requirement would
+// overfit one instance and leave siblings (acp_count/acp_usage or a future
+// underscore-less form) leaking. Both directions pinned here.
+test("#5179 A width: underscore-free acp-prefixed count units are stripped too", () => {
+    assert.equal(stripAcpTags("\x3cacp_tool\x3e5\x3c/acp_tool\x3e"), "");
+    assert.equal(stripAcpTags("\x3cacpx\x3e910\x3c/acpx\x3e"), "");
 });

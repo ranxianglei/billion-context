@@ -285,6 +285,12 @@ const DRIFT_ATTR = new RegExp("\\x3c" + DRIFT_NAME_SRC + "\\s[^<>]*\\btokens\\s*
 // `acp`-prefixed name (no English word starts with "acp") wrapping a
 // digits-only body, closed by its OWN name (\1). Structurally impossible as
 // prose; a tool call's argument slot is key="value" pairs, never this (#1039).
+// Width is deliberate (#5179 review, 2026-11-09): ANY acp-prefixed name, not
+// just underscore-joined ones. The prefix alone excludes English prose and
+// real tool-call XML (independent A/B sweep: function_calls/invoke/parameter/
+// td/title byte-exact survivors); requiring an underscore would overfit the
+// single attested form (acp_tokens) and leave siblings from the same emitter
+// degradation uncovered. Pinned both directions in the #5179 suite.
 const DRIFT_COUNT = new RegExp("\\x3c(acp[A-Za-z0-9_]{0,28})>\\s*(\\d{1,7})\\s*\\x3c\\/\\1>", "gi");
 
 // #5175: the render tag emitted with NO attributes and an empty body —
