@@ -116,6 +116,33 @@ test("INJECT is recorded and returns a digest line; commit pairs into a harvest 
     if (!lines.some((l) => l.startsWith("harvest:"))) throw new Error(lines.join(" | "));
 });
 
+test("harvest denominator follows the injected tier (T2 offer vs T2 mass)", () => {
+    resetContextAnalysisForTest();
+    recordNudgeObservation("s-t2", { nudge: null, messages: [msg("1", 1000)] }, 400_000, 750_000, false);
+    recordNudgeObservation(
+        "s-t2",
+        {
+            nudge: {
+                shouldInject: true,
+                reason: "ready",
+                contextUsage: 0.53,
+                tier: 2,
+                breakdown: { nudgeGrowthTokens: 50000, pendingT1: 0, pendingT2: 80_000, pendingT3: 0, growth: 30_000, growthFloor: 22500 },
+            },
+            messages: [msg("1", 1000)],
+        },
+        400_000,
+        750_000,
+        true,
+    );
+    recordCompressCommit("s-t2", 80_000, 1); // model folded exactly the offered T2 mass
+    const v = contextAnalysisView("s-t2")!;
+    if (v.harvests.length !== 1) throw new Error(`harvests: ${JSON.stringify(v.harvests)}`);
+    const h = v.harvests[0]!;
+    if (h.offered !== 80_000) throw new Error(`offered must be the T2 mass, got ${h.offered}`);
+    if (Math.abs(h.ratio - 1) > 1e-9) throw new Error(`full execution must read ratio 1, got ${h.ratio}`);
+});
+
 test("under-harvest verdict: 2 of 4 offers answered at <50%", () => {
     resetContextAnalysisForTest();
     withClock((now, set) => {

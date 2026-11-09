@@ -391,7 +391,12 @@ export function recordCompressCommit(sessionId: string, tokensCompressed: number
         if (ev.matched) continue;
         const age = now - ev.ts;
         if (age > HARVEST_WINDOW_MS) break; // injects are chronological — older ones are further out
-        const offered = ev.pendingT1 > 0 ? ev.pendingT1 : ev.tokenCount;
+        // Offered mass = what the injected tier asked the model to fold. A T2/T3
+        // offer measured against the whole-session count read as under-harvested
+        // even on full execution (#5963 review); fall back to it only when the
+        // injected tier's own mass is absent.
+        const tierMass = ev.tier === 2 ? ev.pendingT2 : ev.tier === 3 ? ev.pendingT3 : ev.pendingT1;
+        const offered = tierMass > 0 ? tierMass : ev.tokenCount;
         ev.matched = true;
         a.harvests.push({ ts: now, offered, got: tokensCompressed, ratio: offered > 0 ? Math.min(2, tokensCompressed / offered) : 1 });
         if (a.harvests.length > HARVESTS_CAP) a.harvests.splice(0, a.harvests.length - HARVESTS_CAP);
