@@ -91,6 +91,13 @@ function text(value: unknown, limit: number): string {
 export const AUTO_FOLD_TARGET_MIN = 8_192;
 const AUTO_FOLD_TARGET_MAX = 10_000_000;
 
+/** [#3444] A growth fold must be EXPECTED to save at least this much to run,
+ *  and a fold that actually saved less arms the backoff instead of re-firing
+ *  next request: below this, the fixed cost of an external-summary round trip
+ *  (latency + quota + cache invalidation) outweighs the saving — a sub-floor
+ *  target used to burn such marginal folds on EVERY request (fold storm). */
+export const AUTO_FOLD_MIN_BENEFIT_TOKENS = 4_096;
+
 /** [#autoFold] Both parsers share the exact switch/target semantics: the
  *  target is only meaningful with the switch on; the switch defaults to
  *  half the model window at trigger time. */

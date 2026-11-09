@@ -125,12 +125,22 @@ export function adminRelayActiveInDraft(text: string): boolean {
     return (sec as Record<string, unknown>).adminRelay === true;
 }
 
+// #4906 P3: i18n bl.sub promises the feed turns over "约 1 小时一次", but the
+// panel kept its ONE fetch for the whole tab lifetime — pure staleness gate
+// for loadBlog's cache, inlined into the browser IIFE below via toString()
+// (same single-implementation discipline as the JSONC helpers above). The 1h
+// matches the server's hourly pull cadence (web/blog-refresh.ts ROUND_TTL_MS).
+export function blogCacheStale(cachedAt: number, now: number): boolean {
+    return now - cachedAt >= 60 * 60 * 1000;
+}
+
 export const WEB_CLIENT = `(function () {
     "use strict";
     const stripJsoncComments = ${stripJsoncComments.toString()};
     const stripJsoncTrailingCommas = ${stripJsoncTrailingCommas.toString()};
     const parseConfigDraft = ${parseConfigDraft.toString()};
     const adminRelayActiveInDraft = ${adminRelayActiveInDraft.toString()};
+    const blogCacheStale = ${blogCacheStale.toString()};
     const MESSAGES=${JSON.stringify(MESSAGES)};
     let locale = "zh-CN";
     try {
@@ -162,6 +172,33 @@ export const WEB_CLIENT = `(function () {
             if (m && m[1] !== undefined) API_ROOT = m[1] + "__bili";
         }
     } catch (e) {}
+    // #5319 (web half): resolved pack names from GET /__bili/packs — filled by
+    // loadConfig(); empty until then and the picker falls back to default+lean.
+    // #5328: per-name provenance + the user-pack dir (server authority) so the
+    // panel knows which entries 新建/编辑/删除 may touch.
+    let packNames = [];
+    let packSources = {};
+    let packUserDir = "";
+    // #5328: indirections so the inventory refresher lives at panel scope
+    // (loadConfig can call it before/after the quick-config block is built)
+    // while DOM and selection handling stay where the elements exist.
+    let packSelEl = null;
+    let rerenderQuick = null;
+    async function refreshPackInventory() {
+        try {
+            const p = await json(API_ROOT + "/packs");
+            if (!p || !Array.isArray(p.packs)) return;
+            packNames = p.packs.map((x) => String(x.name));
+            packSources = {};
+            for (const x of p.packs) packSources[String(x.name)] = String(x.source || "");
+            if (p.userDir) packUserDir = String(p.userDir) + "/";
+        } catch (e) { }
+        const prev = packSelEl ? packSelEl.value : "";
+        // Option reconstruction never fires the change listener — restore a
+        // still-present custom selection manually.
+        if (packSelEl && prev && packNames.includes(prev)) packSelEl.value = prev;
+        if (rerenderQuick) rerenderQuick();
+    }
     function t(key, vars) {
         let text = MESSAGES[locale][key];
         if (text === undefined) text = MESSAGES["zh-CN"][key];
@@ -382,6 +419,33 @@ export const WEB_CLIENT = `(function () {
         return html;
     }
     window.bili_hostPluginBanner = bili_hostPluginBanner;
+    // #5548: single renderer for every built-in notice — tone carries the
+    // color (banner ok|warn); adding a notice never adds a builder again.
+    // #5548 P2: local announcements ship their own localized copy on the wire
+    // ({"zh-CN": …, "en": …} or a plain string) — pick the UI locale with the
+    // same fallback chain t() uses.
+    function bili_pickLoc(v) {
+        if (typeof v === "string") return v;
+        if (v && typeof v === "object") {
+            if (v[locale] !== undefined && typeof v[locale] === "string") return v[locale];
+            if (v["zh-CN"] !== undefined && typeof v["zh-CN"] === "string") return v["zh-CN"];
+            if (v.en !== undefined && typeof v.en === "string") return v.en;
+            const vals = Object.values(v);
+            const first = vals.find((x) => typeof x === "string");
+            if (first !== undefined) return first;
+        }
+        return "";
+    }
+    function bili_noticeBanner(s) {
+        let html = '<div class="banner-title">' + escapeHtml(s.on) + "</div>";
+        let row = '<div class="alert-row"><span>' + escapeHtml(s.desc) + "</span>";
+        if (s.cta && s.cta.url) row += '<a class="btn sm notice-cta" href="' + escapeHtml(s.cta.url) + '" target="_blank" rel="noopener noreferrer">' + escapeHtml(s.cta.label) + "</a>";
+        if (!s.hideDismiss) row += '<button class="btn sm notice-dismiss">' + escapeHtml(s.dismiss) + "</button>";
+        html += row + "</div>";
+        html += '<div class="dim small" style="margin-top:6px">' + escapeHtml(s.hint) + "</div>";
+        return html;
+    }
+    window.bili_noticeBanner = bili_noticeBanner;
     function $(id) { return document.getElementById(id); }
     function toast(message, kind) {
         const host = $("toast-host");
@@ -419,8 +483,10 @@ export const WEB_CLIENT = `(function () {
             await json(API_ROOT + "/config", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) });
             toast(t("cfg.saved"), "ok");
             loadConfig();
+            return true;
         } catch (e) {
             toast(e.message, "err");
+            return false;
         } finally {
             busy(btn, false);
         }
@@ -443,6 +509,13 @@ export const WEB_CLIENT = `(function () {
         let i = 0;
         while (Math.abs(n) >= 1024 && i < units.length - 1) { n /= 1024; i++; }
         return (i > 0 ? n.toFixed(1) : String(Math.round(n))) + " " + units[i];
+    }
+    // #4899: USD display — 4 decimals under $1 (per-turn pennies stay visible),
+    // 2 above; negatives keep the sign (unpaid-back folds are honest).
+    function fmtUsd(n) {
+        if (n === null || n === undefined || isNaN(n)) return "—";
+        const abs = Math.abs(Number(n));
+        return (n < 0 ? "−" : "") + "$" + (abs >= 1 ? abs.toFixed(2) : abs.toFixed(4));
     }
     function timeAgo(iso) {
         if (!iso) return t("common.none");
@@ -470,6 +543,80 @@ export const WEB_CLIENT = `(function () {
         if (!p || p === "unknown") return '<span class="dim small">' + escapeHtml(t("protocol.unmarked")) + "</span>";
         return '<span class="badge proto">' + escapeHtml(p) + "</span>";
     }
+    function bindSessionColumns() {
+        document.querySelectorAll(".twide table.data").forEach((table) => {
+            const cols = Array.from(table.querySelectorAll("col"));
+            const headers = Array.from(table.querySelectorAll("thead th"));
+            headers.forEach((header, index) => {
+                if (index === headers.length - 1) return;
+                const label = () => t("ses.resize_column") + ": " + header.textContent;
+                const existing = header.querySelector(".col-resize");
+                if (existing) {
+                    existing.title = t("ses.resize_column");
+                    existing.setAttribute("aria-label", label());
+                    return;
+                }
+                const handle = document.createElement("button");
+                handle.type = "button";
+                handle.className = "col-resize";
+                handle.title = t("ses.resize_column");
+                handle.setAttribute("aria-label", label());
+                const start = () => {
+                    const widths = headers.map((cell) => cell.getBoundingClientRect().width);
+                    const total = table.getBoundingClientRect().width;
+                    table.style.width = total + "px";
+                    table.style.minWidth = "100%";
+                    widths.forEach((width, i) => { if (width > 0) cols[i].style.width = width + "px"; });
+                    table.classList.add("columns-resized");
+                    return widths;
+                };
+                const resize = (initial, delta) => {
+                    const widths = initial.slice();
+                    const direction = delta >= 0 ? 1 : -1;
+                    const receiver = direction > 0 ? index : initial.findIndex((width, i) => i > index && width > 0);
+                    if (receiver < 0 || initial[receiver] <= 0) return;
+                    let remaining = Math.abs(delta);
+                    let transferred = 0;
+                    for (let i = direction > 0 ? index + 1 : index; i >= 0 && i < widths.length; i += direction) {
+                        const available = Math.max(0, initial[i] - (i === 0 ? 120 : 48));
+                        const amount = Math.min(remaining, available);
+                        widths[i] -= amount;
+                        transferred += amount;
+                        remaining -= amount;
+                        if (remaining === 0) break;
+                    }
+                    widths[receiver] += transferred;
+                    widths.forEach((width, i) => { if (initial[i] > 0) cols[i].style.width = width + "px"; });
+                };
+                handle.addEventListener("pointerdown", (ev) => {
+                    if (ev.button !== 0) return;
+                    ev.preventDefault();
+                    try { handle.setPointerCapture(ev.pointerId); } catch (err) {}
+                    let initial = null;
+                    const move = (e) => {
+                        if (!initial) initial = start();
+                        resize(initial, e.clientX - ev.clientX);
+                    };
+                    const stop = () => {
+                        handle.removeEventListener("pointermove", move);
+                        handle.removeEventListener("pointerup", stop);
+                        handle.removeEventListener("pointercancel", stop);
+                        handle.removeEventListener("lostpointercapture", stop);
+                    };
+                    handle.addEventListener("pointermove", move);
+                    handle.addEventListener("pointerup", stop);
+                    handle.addEventListener("pointercancel", stop);
+                    handle.addEventListener("lostpointercapture", stop);
+                });
+                handle.addEventListener("keydown", (ev) => {
+                    if (ev.key !== "ArrowLeft" && ev.key !== "ArrowRight") return;
+                    ev.preventDefault();
+                    resize(start(), ev.key === "ArrowRight" ? 20 : -20);
+                });
+                header.appendChild(handle);
+            });
+        });
+    }
     function hydrate() {
         document.documentElement.lang = locale;
         document.querySelectorAll("[data-i18n]").forEach((el) => { el.textContent = t(el.getAttribute("data-i18n")); });
@@ -477,9 +624,10 @@ export const WEB_CLIENT = `(function () {
         document.querySelectorAll("[data-i18n-title]").forEach((el) => { el.setAttribute("title", t(el.getAttribute("data-i18n-title"))); });
         const tog = $("language-toggle");
         if (tog) tog.textContent = locale === "zh-CN" ? "English" : "中文";
+        bindSessionColumns();
     }
 
-    const PAGES = ["overview", "sessions", "config", "updates", "connect", "logs"];
+    const PAGES = ["overview", "sessions", "config", "updates", "connect", "logs", "blog"];
     let current = "overview";
     let sessionsCache = [];
     // #1682: last overview alert payload — lets a dismiss re-render without refetching.
@@ -572,6 +720,8 @@ export const WEB_CLIENT = `(function () {
             + (s.selfHeal ? ' <span class="badge live" style="background:#8a6d3b" title="' + escapeHtml(t("det.self_heal_tip")) + '">' + t("det.self_heal_short") + "</span>" : "")
             + (s.autoModeForge ? ' <span class="badge live" style="background:#6d3b8a" title="' + escapeHtml(t("det.auto_mode_forge_tip")) + '">' + t("det.auto_mode_forge_short") + "</span>" : "")
 + (s.keepalive ? ' <span class="badge live" style="background:#3b6d8a" title="' + escapeHtml(t("det.keepalive_tip") + " · " + s.keepalive.tierLabel + " · " + (s.keepalive.cadenceMs >= 60_000 ? Math.round(s.keepalive.cadenceMs / 60_000) + "min" : Math.round(s.keepalive.cadenceMs / 1000) + "s") + (s.keepalive.lastHitAt ? " · " + t("det.keepalive_last_hit") + " " + timeAgo(new Date(s.keepalive.lastHitAt).toISOString()) : "")) + '">' + t("det.keepalive_short") + "×" + s.keepalive.pingCount + "</span>" : "")
+            // #5796: long-running session — host-side history only grows, per-step cost climbs; badge points at the actionable exit.
+            + (s.slowSession ? ' <span class="badge live" style="background:#8a3b3b" title="' + escapeHtml(t("ses.slow_tip", { n: fmtW(s.slowSession.requests) })) + '">' + t("ses.slow_short") + "</span>" : "")
             + '<span class="row-id">' + escapeHtml(s.id) + "</span></a>";
     }
     // SAVED column prefers ledger-derived net savings; pre-tagging sessions fall back
@@ -583,9 +733,15 @@ export const WEB_CLIENT = `(function () {
         const clTip = x.coverageLostFolds
             ? ' title="' + escapeHtml(t("ses.covlost_tip", { n: x.coverageLostFolds, x: fmtW(x.coverageLostFrozenTokens || 0) })) + '"'
             : "";
-        if (v > 0) return '<td class="num good-num"' + clTip + ">" + fmtW(v) + "</td>";
-        if (v) return '<td class="num"' + (clTip || ' title="' + escapeHtml(t("ov.saved_neg_tip")) + '"') + ">" + fmtW(v) + "</td>";
+        if (v > 0) return '<td class="num good-num"' + clTip + ">" + fmtW(v) + moneySub(x) + "</td>";
+        if (v) return '<td class="num"' + (clTip || ' title="' + escapeHtml(t("ov.saved_neg_tip")) + '"') + ">" + fmtW(v) + moneySub(x) + "</td>";
         return '<td class="num dim">' + t("common.none") + "</td>";
+    }
+    // #4899: small $ line under the saved-tokens number — priced folds only
+    // (undefined when the session has no price profile: tokens only, no fake $).
+    function moneySub(x) {
+        if (x.savedUsd == null) return "";
+        return '<div class="dim small">' + (x.savedUsd >= 0 ? "≈ " : "") + "" + escapeHtml(fmtUsd(x.savedUsd)) + "</div>";
     }
     // Compact single-line hit cell: (97.0%/−1.3%/−0.9%/−1.1%) = hit/new/compress/TTL.
     function hitTd(s) {
@@ -629,9 +785,14 @@ export const WEB_CLIENT = `(function () {
             tr.innerHTML = "<td>" + sessionTitleCell(s) + '</td><td>' + protoBadge(s.protocol) + '</span></td><td class="num">' + fmtW(s.contextBest ? s.contextBest.tokens : s.contextTokens) + '</td>' + savedTd(s) + '<td class="dim">' + timeAgo(s.lastSeen) + "</td>";
         } else {
             const clientHint = s.clientHint ? String(s.clientHint) : "";
+            // #4571: inline sessions carry a lane chip beside the client hint so
+            // "did this run in-process?" is visible in the list, not just detail.
+            const laneChip = s.engineLane === "inline"
+                ? ' <span class="badge proto" title="' + escapeHtml(t("det.engine_lane_inline")) + '">inline</span>'
+                : s.engineLane === "server" ? ' <span class="badge proto dim" title="' + escapeHtml(t("det.engine_lane_server")) + '">srv</span>' : "";
             const clientCell = clientHint
-                ? '<span class="mono small clip w-client" title="' + escapeHtml(clientHint) + '">' + escapeHtml(clientHint) + "</span>"
-                : '<span class="dim">' + t("common.none") + "</span>";
+                ? '<span class="mono small clip w-client" title="' + escapeHtml(clientHint) + '">' + escapeHtml(clientHint) + "</span>" + laneChip
+                : '<span class="dim">' + t("common.none") + "</span>" + laneChip;
             tr.innerHTML = "<td>" + sessionTitleCell(s) + '</td><td class="client-cell">' + clientCell + '</td><td>' + protoBadge(s.protocol) + '</td><td><span class="mono dim small clip w-up">' + escapeHtml(hostOf(s.upstreamOrigin)) + '</td><td class="num">' + (s.requests ? s.requests : t("common.none")) + '</td><td class="num">' + fmtW(s.contextBest ? s.contextBest.tokens : s.contextTokens) + '</td><td class="num">' + (s.inputTokens ? fmtW(s.inputTokens) : '<span class="dim">' + t("common.none") + "</span>") + "</td>" + savedTd(s) + hitTd(s) + switchTd(s) + '<td class="num">' + (s.foldCount || 0) + '</td><td class="num">' + (s.blocks || 0) + '</td><td class="dim">' + timeAgo(s.lastSeen) + "</td>";
         }
         let navTimer = null;
@@ -865,6 +1026,102 @@ function changelogCatOf(rawLine) {
         // the snapshot — keep the buttons held down until it settles.
         if (st.checking || st.installing) upSetButtons(true);
     }
+    // #4587: panel-embedded blog & articles — the server renders the bundled
+    // markdown with web/markdown.ts (escaped by construction), so this side only
+    // lays out cards and expands bodies. Language rides the page-level locale;
+    // switching languages reloads the page, so no incremental re-render hook.
+    // #4906 P3: the cache carries a timestamp and goes stale after ~1h (the
+    // cadence bl.sub promises), so a long-lived tab re-pulls instead of pinning
+    // one fetch forever. A stale hit still paints instantly from cache; the
+    // re-pull runs silently in the background and re-renders only if the blog
+    // view is still on screen — the overview poll's discipline (no blocked
+    // first paint, no toasts from background refreshes).
+    let blogCache = null; // { data, at }
+    let blogSub = null;
+    let blogRefreshBusy = false;
+    function refreshBlogInBackground() {
+        if (blogRefreshBusy) return;
+        blogRefreshBusy = true;
+        json(API_ROOT + "/blog").then(function (feed) {
+            blogCache = { data: feed, at: Date.now() };
+            if (current === "blog") loadBlog(blogSub); // cache is fresh now — no refresh loop
+        }, function () {
+            // keep the stale paint; the cache keeps its old timestamp, so the next visit retries
+        }).then(function () { blogRefreshBusy = false; });
+    }
+    // Per-post discussion thread: the thread number is data, not inference — it reaches
+    // the client as item.discussion once the server-side passthrough lands (separate PR,
+    // see PR body) and the pipeline records a number for the post. Exact direct link only;
+    // a post without a recorded number simply shows no button (no guessed search URL).
+    function blogDiscussionUrl(item) {
+        return (typeof item.discussion === "number" && item.discussion > 0)
+            ? "https://github.com/ranxianglei/billion-context/discussions/" + item.discussion
+            : null;
+    }
+    async function loadBlog(sub) {
+        const host = $("bl-list");
+        if (!host) return;
+        blogSub = sub || null;
+        let data = blogCache ? blogCache.data : null;
+        if (!data) {
+            try {
+                data = await json(API_ROOT + "/blog");
+                blogCache = { data: data, at: Date.now() };
+            } catch (e) {
+                host.innerHTML = "";
+                toast(t("toast.failed", { msg: e.message }), "err");
+                return;
+            }
+        } else if (blogCacheStale(blogCache.at, Date.now())) {
+            refreshBlogInBackground();
+        }
+        const items = (data && Array.isArray(data.items)) ? data.items : [];
+        const zhOn = locale === "zh-CN";
+        const offlineNote = data && data.error ? '<div class="card"><div class="card-b">' + escapeHtml(t("bl.offline")) + '</div></div>' : "";
+        if (sub) {
+            const item = items.find((x) => String(x.id) === String(sub)) || null;
+            if (!item) {
+                host.innerHTML = '<div class="card"><div class="card-b"><a href="#/blog" class="bl-back">' + escapeHtml(t("bl.back")) + "</a> " + escapeHtml(t("bl.nf")) + "</div></div>";
+                return;
+            }
+            const kindLabel = item.kind === "post" ? t("bl.kind_post") : t("bl.kind_article");
+            const title = zhOn && item.titleZh ? item.titleZh : (item.title || "");
+            const html = zhOn ? (item.htmlZh || item.html || "") : (item.html || "");
+            const dUrl = blogDiscussionUrl(item);
+            const commentLink = dUrl ? '<a class="bl-back" href="' + dUrl + '" target="_blank" rel="noopener">' + escapeHtml(t("bl.comment")) + "</a>" : "";
+            // Per-article language pin: ?lang= outranks the saved UI language (#2321), so plain
+            // links double as an in-page EN|中文 toggle. Labels stay self-describing on purpose.
+            const subHref = "#/blog/" + encodeURIComponent(String(item.id));
+            const langToggle = '<a class="bl-back" href="?lang=en' + subHref + '">EN</a> <a class="bl-back" href="?lang=zh' + subHref + '">\u4e2d\u6587</a>';
+            host.innerHTML = offlineNote + '<div class="card"><div class="card-b"><span class="mono bl-date">' + escapeHtml(item.date || "\u2014") + '</span><span class="badge">' + escapeHtml(kindLabel) + '</span><a href="#/blog" class="bl-back">' + escapeHtml(t("bl.back")) + "</a> " + langToggle + " " + commentLink + "</div>"
+                + '<h3 class="bl-h">' + escapeHtml(title) + "</h3>"
+                + '<div class="card-b post-body">' + html + "</div></div>";
+            return;
+        }
+        if (!items.length) {
+            const wrap = document.createElement("div");
+            wrap.className = "card";
+            const box = document.createElement("div");
+            box.className = "card-b";
+            box.textContent = t("bl.empty");
+            wrap.appendChild(box);
+            host.innerHTML = offlineNote;
+            host.appendChild(wrap);
+            return;
+        }
+        host.innerHTML = offlineNote + '<div class="card">' + items.map((it) => {
+            const title = zhOn && it.titleZh ? it.titleZh : (it.title || "");
+            const alt = zhOn ? (it.title || "") : (it.titleZh || "");
+            let kindLabel;
+            if (it.kind === "post") kindLabel = t("bl.kind_post");
+            else kindLabel = t("bl.kind_article");
+            return '<a class="bl-row" href="#/blog/' + encodeURIComponent(String(it.id)) + '">'
+                + '<span class="mono bl-date">' + escapeHtml(it.date || "\u2014") + '</span>'
+                + '<span class="badge">' + escapeHtml(kindLabel) + '</span>'
+                + '<span class="bl-title">' + escapeHtml(title) + (alt ? ' <span class="bl-title-alt">' + escapeHtml(alt) + "</span>" : "") + "</span>"
+                + '<span class="bl-arrow">&#8594;</span></a>';
+        }).join("") + "</div>";
+    }
     async function loadUpdates() {
         try {
             const [st, cl] = await Promise.all([json(API_ROOT + "/update/state"), json(API_ROOT + "/changelog")]);
@@ -904,8 +1161,13 @@ function changelogCatOf(rawLine) {
         try {
             const r = await json(API_ROOT + "/update/check", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
             if (r.already) showUpdateResult(t("up.already_in_flight"), true);
-            else if (r.ok) showUpdateResult(t("up.check_ok"), true);
-            else showUpdateResult(String(r.error || t("toast.failed", { msg: "check failed" })), false);
+            else if (!r.ok) showUpdateResult(String(r.error || t("toast.failed", { msg: "check failed" })), false);
+            else if (r.status === "update-available") showUpdateResult(t("up.check_available", { v: String(r.candidate || r.latest || "") }), true);
+            else if (r.status === "up-to-date") showUpdateResult(t("up.check_up_to_date"), true);
+            else if (r.status === "blocked-advisory") showUpdateResult(t("up.check_blocked", { v: String(r.latest || "") }), true);
+            else if (r.status === "deferred-advisory") showUpdateResult(t("up.check_deferred"), true);
+            else if (r.note) showUpdateResult(String(r.note), true);
+            else showUpdateResult(t("up.check_ok"), true);
         } catch (e) {
             showUpdateResult(e.message, false);
         } finally {
@@ -930,32 +1192,87 @@ function changelogCatOf(rawLine) {
             const grossEl = $("st-gross");
             grossEl.textContent = o.grossSavedTotal ? fmtW(o.grossSavedTotal) : t("common.none");
             grossEl.title = o.grossSavedTotal ? String(Math.round(Number(o.grossSavedTotal))) : "";
-            $("st-gross-sub").textContent = t("ov.gross_note") + ((o.savedEstimated || 0) > 0 ? " · " + t("ov.saved_from_legacy", { n: fmtW(o.savedEstimated) }) : "");
+            // #4899 v5: print THE prices inside the formula lines — only when
+            // every priced session resolves identical rates; mixed fleets keep
+            // plain ≈$ amounts (never a misleading single rate).
+            const r6 = (x) => String(Math.round(x * 1e6) / 1e6);
+            const mra = o.moneyRates ? { w: r6(o.moneyRates.w), r: r6(o.moneyRates.r), q: r6(o.moneyRates.q) } : null;
+            $("st-gross-sub").textContent = t("ov.gross_note") + ((o.savedEstimated || 0) > 0 ? " · " + t("ov.saved_from_legacy", { n: fmtW(o.savedEstimated) }) : "")
+                + (o.savedUsdGrossTotal
+                    ? " · " + (mra ? t("ov.gross_formula", { f: o.foldsTotal, g: fmtW(o.grossSavedTotal), r: mra.r, n: fmtUsd(o.savedUsdGrossTotal) }) : t("ov.money_eq", { n: fmtUsd(o.savedUsdGrossTotal) }))
+                    : "");
             const netEl = $("st-netsaved");
             netEl.textContent = o.hasFoldData ? ((o.netSavedTotal || 0) < 0 ? "-" : "") + fmtW(Math.abs(o.netSavedTotal || 0)) : t("common.none");
             netEl.title = o.hasFoldData && o.netSavedTotal ? String(Math.round(Number(o.netSavedTotal))) : "";
             $("st-net-sub").textContent = o.hasFoldData ? t("ov.sub_repay", { r: fmtW(o.repayTotal || 0), s: fmtW(o.summaryCostTotal || 0) }) + ((o.savedEstimated || 0) > 0 ? " · " + t("ov.net_excl") : "") + ((o.coverageLostFrozenTotal || 0) > 0 ? " · " + t("ov.covlost_note", { n: o.coverageLostFoldTotal || 0, x: fmtW(o.coverageLostFrozenTotal) }) : "") : "";
+            if (o.hasFoldData && o.savedUsdTotal) $("st-net-sub").textContent += " · " + t("ov.money_eq", { n: fmtUsd(o.savedUsdTotal) }) + (mra ? " " + t("ov.net_rates", mra) : "");
             $("st-hitpct").textContent = o.hitPct == null ? t("common.none") : o.hitPct.toFixed(1) + "%";
+            // #4899: fleet money totals — only priced sessions contribute; no
+            // price data anywhere => dash, never $0.00 (honest-output rule).
+            const spendEl = $("st-spend");
+            if (spendEl) {
+                spendEl.textContent = o.hasMoneyData ? fmtUsd(o.costUsdTotal || 0) : t("common.none");
+                $("st-spend-sub").textContent = o.hasMoneyData && (o.savedUsdTotal || 0) !== 0
+                    ? t("ov.money_saved", { n: fmtUsd(o.savedUsdTotal) })
+                    : (o.hasMoneyData ? t("ov.money_none") : "");
+            }
             const hs = $("st-hit-split");
+            // #4899 v3: compression payback — colored net plus a break-even
+            // line (green when avoided turns outrun the fold cost, red while
+            // they haven't; turns here are the fleet Σ post-fold requests).
+            const pbEl = $("st-payback");
+            if (pbEl) {
+                const pbCard = $("st-payback-card");
+                if (o.paybackUsdTotal) {
+                    const pbNet = (o.paybackUsdTotal.saved || 0) - (o.paybackUsdTotal.spent || 0);
+                    pbEl.textContent = "\u2248 " + fmtUsd(pbNet);
+                    pbEl.title = String(Math.round(pbNet * 1e4) / 1e4);
+                    pbCard.classList.remove("good", "bad");
+                    if (pbNet !== 0) pbCard.classList.add(pbNet >= 0 ? "good" : "bad");
+                    const turns = o.paybackUsdTotal.turns || 0;
+                    const avgPerTurn = turns > 0 ? (o.paybackUsdTotal.saved || 0) / turns : 0;
+                    let sub = t("ov.payback_sub", { v: fmtUsd(o.paybackUsdTotal.saved || 0), s: fmtUsd(o.paybackUsdTotal.spent || 0) });
+                    if (avgPerTurn > 0 && (o.paybackUsdTotal.spent || 0) > 0) {
+                        const be = o.paybackUsdTotal.spent / avgPerTurn;
+                        sub += " · " + (turns >= be ? t("ov.payback_ok") : t("ov.payback_wait", { k: Math.max(1, Math.ceil(be - turns)) }));
+                    } else if (pbNet >= 0) sub += " · " + t("ov.payback_ok");
+                    if (mra) sub += " · " + t("ov.payback_rates", mra);
+                    $("st-payback-sub").textContent = sub;
+                } else {
+                    pbEl.textContent = t("common.none");
+                    pbCard.classList.remove("good", "bad");
+                    $("st-payback-sub").textContent = "";
+                }
+            }
             if (hs) {
                 const missSum = (o.missNewTotal || 0) + (o.missCompTotal || 0) + (o.missTtlTotal || 0);
                 const mi = o.missInputTotal || 0;
                 const f = (v) => fmtW(v) + (mi > 0 ? " (−" + ((v / mi) * 100).toFixed(1) + "%)" : "");
                 hs.textContent = missSum > 0 ? t("ov.miss_split", { n: f(o.missNewTotal || 0), c: f(o.missCompTotal || 0), x: f(o.missTtlTotal || 0) }) : t("common.none");
+                if (o.missSplitUsdTotal)
+                    hs.textContent += " · " + t("ov.miss_split_usd", { n: fmtUsd(o.missSplitUsdTotal.n), c: fmtUsd(o.missSplitUsdTotal.c), x: fmtUsd(o.missSplitUsdTotal.x) }) + (mra ? " " + t("ov.miss_rates", mra) : "");
             }
             $("st-input").textContent = o.inputTokens ? fmtW(o.inputTokens) : t("common.none");
             $("st-cached").textContent = o.cachedTokens ? fmtW(o.cachedTokens) : t("common.none");
             $("st-output").textContent = o.outputTokens ? fmtW(o.outputTokens) : t("common.none");
+            // #4899 v3: each token card carries its own ≈$ tier — together they
+            // reconcile with the 花费 card (i + r + w + o == costUsdTotal), so
+            // every displayed token figure has a money face next to it.
+            const cu = o.costUsdSplitTotal;
+            $("st-input-sub").textContent = cu ? t("ov.tier_unhit", { n: fmtUsd(cu.i) }) + (mra ? " · " + t("ov.at_input", { v: mra.w }) : "") : "";
+            $("st-cached-sub").textContent = cu ? t("ov.money_eq", { n: fmtUsd(cu.r) }) + (mra ? " · " + t("ov.at_read", { v: mra.r }) : "") : "";
+            $("st-output-sub").textContent = cu ? t("ov.money_eq", { n: fmtUsd(cu.o) }) + (mra ? " · " + t("ov.at_output", { v: mra.q }) : "") : "";
             const pb = $("protocol-body");
             pb.innerHTML = "";
             const rows = (o.byProtocol || []).slice().sort((a, b) => b.sessions - a.sessions || b.requests - a.requests);
             if (!rows.length) pb.innerHTML = '<tr><td colspan="8" class="dim">' + t("common.empty") + "</td></tr>";
             rows.forEach((r) => {
                 const tr = document.createElement("tr");
-                tr.innerHTML = '<td>' + protoBadge(r.protocol) + '</td><td class="num">' + r.sessions + '</td><td class="num">' + (r.requests ? fmtW(r.requests) : t("common.none")) + '</td><td class="num">' + (r.inputTokens ? fmtW(r.inputTokens) : t("common.none")) + '</td><td class="num">' + (r.cachedTokens ? fmtW(r.cachedTokens) : t("common.none")) + '</td>' + hitTd({ cacheHitPct: r.hitPct, missDropNew: r.missDropNew, missDropComp: r.missDropComp, missDropTtl: r.missDropTtl }) + '<td class="' + (r.savedNet > 0 ? "num good-num" : "num") + '"' + (r.savedNet < 0 ? ' title="' + escapeHtml(t("ov.saved_neg_tip")) + '"' : "") + '">' + (r.savedNet ? fmtW(r.savedNet) : t("common.none")) + '</td><td class="num">' + (r.folds ? fmtW(r.folds) : t("common.none")) + "</td>";
+                tr.innerHTML = '<td>' + protoBadge(r.protocol) + '</td><td class="num">' + r.sessions + '</td><td class="num">' + (r.requests ? fmtW(r.requests) : t("common.none")) + '</td><td class="num">' + (r.inputTokens ? fmtW(r.inputTokens) : t("common.none")) + '</td><td class="num">' + (r.cachedTokens ? fmtW(r.cachedTokens) : t("common.none")) + '</td>' + hitTd({ cacheHitPct: r.hitPct, missDropNew: r.missDropNew, missDropComp: r.missDropComp, missDropTtl: r.missDropTtl }) + '<td class="' + (r.savedNet > 0 ? "num good-num" : "num") + '"' + (r.savedNet < 0 ? ' title="' + escapeHtml(t("ov.saved_neg_tip")) + '"' : "") + '">' + (r.savedNet ? fmtW(r.savedNet) : t("common.none")) + moneySub({ savedUsd: r.savedUsd }) + '</td><td class="num">' + (r.folds ? fmtW(r.folds) : t("common.none")) + "</td>";
                 pb.appendChild(tr);
             });
             $("sys-version").textContent = d.version ? (d.commit ? d.version + " (" + d.commit + ")" : d.version) : "?";
+            $("sys-lane").textContent = d.origin || t("common.none");
             $("sys-disk-version").textContent = d.diskVersion || t("common.none");
             $("sys-inflight").textContent = String(d.inFlight || 0);
             const bt = d.blindTunnels || {};
@@ -1132,18 +1449,14 @@ function changelogCatOf(rawLine) {
             if (sp && typeof sp.pid === "number") {
                 spb.hidden = false;
                 spb.classList.add("show");
-                // #3923/#3959: a known bili instance of a DIFFERENT lane sharing
-                // the machine-global sessions dir is the supported topology —
-                // informational styling, not a corruption alarm.
-                if (sp.benign === true) {
-                    spb.classList.remove("warn");
-                    spb.classList.add("info");
-                    spb.innerHTML = "<strong>" + escapeHtml(t("sys.storage_second_process_cross_lane_title")) + "</strong> " + escapeHtml(t("sys.storage_second_process_cross_lane", { pid: String(sp.pid), lane: typeof sp.lane === "string" && sp.lane ? sp.lane : t("sys.split_brain_lane_undeclared") }));
-                } else {
-                    spb.classList.remove("info");
-                    spb.classList.add("warn");
-                    spb.innerHTML = "<strong>" + escapeHtml(t("sys.storage_second_process_title")) + "</strong> " + escapeHtml(t("sys.storage_second_process", { pid: String(sp.pid) }));
-                }
+                // #5082: several instances opening one index.db is the
+                // supported topology — informational styling, never a
+                // corruption alarm. The real hazard (two instances writing
+                // the SAME session) has its own banner via the #3923
+                // split-brain contest.
+                spb.classList.remove("warn");
+                spb.classList.add("info");
+                spb.innerHTML = "<strong>" + escapeHtml(t("sys.storage_second_process_shared_title")) + "</strong> " + escapeHtml(t("sys.storage_second_process_shared", { pid: String(sp.pid), lane: typeof sp.lane === "string" && sp.lane ? sp.lane : t("sys.split_brain_lane_undeclared") }));
             } else {
                 spb.hidden = true;
                 spb.classList.remove("show");
@@ -1159,10 +1472,12 @@ function changelogCatOf(rawLine) {
                 sbb.hidden = false;
                 sbb.classList.add("show");
                 const laneOf = (x) => (x && typeof x.lane === "string" && x.lane ? x.lane : t("sys.split_brain_lane_undeclared"));
+                // #4626: .slice(0, 8) of "session-…" is literally "session-" — show enough to tell sessions apart
+                const shortSid = sb.sessionId.length > 24 ? sb.sessionId.slice(0, 24) + "…" : sb.sessionId;
                 sbb.innerHTML = "<strong>" + escapeHtml(t("sys.split_brain_title")) + "</strong> "
                     + escapeHtml(t("sys.split_brain", {
-                        title: typeof sb.title === "string" && sb.title ? sb.title : sb.sessionId.slice(0, 8),
-                        sid: sb.sessionId.slice(0, 8),
+                        title: typeof sb.title === "string" && sb.title ? sb.title : shortSid,
+                        sid: shortSid,
                         selfPid: String(sb.self.pid),
                         selfLane: laneOf(sb.self),
                         peerPid: String(sb.peer.pid),
@@ -1279,6 +1594,21 @@ function changelogCatOf(rawLine) {
                 ab.innerHTML = "";
             }
         }
+        // #5221 phase 2 (owner ruling 2026-10-31): persistent local-resolver
+        // wedge — detection-only alarm banner beside the defect advisory.
+        const wb = $("resolver-wedge-banner");
+        if (wb) {
+            const w = d.resolverWedge;
+            if (w && w.tripped) {
+                wb.hidden = false;
+                wb.classList.add("show");
+                wb.innerHTML = '<strong>' + t("wedge.on") + '</strong> <span class="mono">' + w.hosts.join(", ") + '</span>' + t("wedge.desc") + t("wedge.hint");
+            } else {
+                wb.hidden = true;
+                wb.classList.remove("show");
+                wb.innerHTML = "";
+            }
+        }
         const pb = $("plugin-advisory-banner");
         if (pb) {
             const advs = Array.isArray(d.pluginAdvisories) ? d.pluginAdvisories : [];
@@ -1340,6 +1670,46 @@ function changelogCatOf(rawLine) {
                 hb.innerHTML = "";
             }
         }
+        // #5548: built-in notices — one region, one loop; per-notice activity
+        // is decided server-side (src/notices.ts registry), dismissal stays
+        // server-side (POST /__bili/notices/dismiss) so one close silences
+        // every browser. Tone + i18n keys come from the payload.
+        const nr = $("notices-banner-region");
+        if (nr) {
+            const list = Array.isArray(d.notices) ? d.notices : [];
+            nr.innerHTML = "";
+            for (const n of list) {
+                if (!n || typeof n !== "object" || typeof n.id !== "string") continue;
+                const el = document.createElement("div");
+                el.className = "banner " + (n.tone === "ok" ? "ok" : n.tone === "warn" ? "warn" : "");
+                // .banner is display:none until .show — #5548's loop never added it,
+                // so every merged notice (builtin + file + feed) rendered invisibly.
+                el.classList.add("show");
+                el.dataset.id = n.id;
+                nr.appendChild(el);
+                if (n.source !== "builtin") {
+                    el.innerHTML = bili_noticeBanner({ on: bili_pickLoc(n.title), desc: bili_pickLoc(n.desc), hint: bili_pickLoc(n.hint), dismiss: t("notices.dismiss_btn"), cta: n.ctaUrl ? { label: n.ctaLabel ?? "", url: n.ctaUrl } : null, hideDismiss: !!n.suppressDismiss });
+                } else {
+                    const k = n.keys && typeof n.keys === "object" ? n.keys : {};
+                    el.innerHTML = bili_noticeBanner({ on: t(String(k.on)), desc: t(String(k.desc)), hint: t(String(k.hint)), dismiss: k.dismiss ? t(String(k.dismiss)) : t("notices.dismiss_btn"), cta: null, hideDismiss: false });
+                }
+            }
+            for (const btn of Array.from(nr.querySelectorAll(".notice-dismiss"))) {
+                btn.addEventListener("click", async () => {
+                    busy(btn, true);
+                    const holder = btn.closest(".banner");
+                    try {
+                        await json(API_ROOT + "/notices/dismiss", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id: holder ? holder.dataset.id : "" }) });
+                        toast(t("notices.dismissed"), "ok");
+                        await loadOverview(true);
+                    } catch (e) {
+                        toast(e.message, "err");
+                    } finally {
+                        busy(btn, false);
+                    }
+                });
+            }
+        }
         // #1682: global upstream-connection alert banner — visible on every view,
         // one row per active alert (no stacking), dismiss per alert instance.
         latestAlerts = Array.isArray(d.alerts) ? d.alerts : [];
@@ -1356,6 +1726,7 @@ function changelogCatOf(rawLine) {
     function alertHint(kind) {
         switch (kind) {
             case "connect-timeout": return t("alert.hint.connect_timeout");
+            case "upstream-unreachable": return t("alert.hint.upstream_unreachable");
             case "connect-refused": return t("alert.hint.connect_refused");
             case "proxy-reset": return t("alert.hint.proxy_reset");
             case "upstream-reset": return t("alert.hint.upstream_reset");
@@ -2043,20 +2414,33 @@ function changelogCatOf(rawLine) {
         if (lp < 0) return null;
         return { kind: kind, name: nameId.slice(0, lp), cid: nameId.slice(lp + 1), text: line.slice(mark + tailLen) };
     }
+    // Terminates the reasoning cell of a reply: _reasoning_: has no end
+    // marker, so the handoff renderer would otherwise fold the answer that
+    // follows into the collapsed thinking box. Mirrored in HANDOFF_THINK_END.
+    const HANDOFF_THINK_END = "<!-- /reasoning -->";
     function splitHandoffBody(bodyLines) {
         const segs = [];
-        for (const raw of bodyLines) {
+        let thinkClosed = false;
+        for (let i = 0; i < bodyLines.length; i++) {
+            const raw = bodyLines[i];
             if (raw.trim() === "" && !(segs.length && segs[segs.length - 1].type === "out")) continue;
+            const activeThink = segs[segs.length - 1];
+            if (raw.trim() === HANDOFF_THINK_END && activeThink && activeThink.type === "think" && !thinkClosed) {
+                if (bodyLines[i + 1] === raw) { activeThink.lines.push(raw); i++; }
+                else thinkClosed = true;
+                continue;
+            }
             const tool = parseToolLine(raw);
             if (tool) { segs.push({ type: "tool", kind: tool.kind, name: tool.name, cid: tool.cid, lines: [tool.text] }); continue; }
             if (raw.indexOf("_reasoning_: ") === 0) {
                 const lastT = segs[segs.length - 1];
-                if (!lastT || lastT.type !== "think") segs.push({ type: "think", lines: [] });
+                if (!lastT || lastT.type !== "think" || thinkClosed) segs.push({ type: "think", lines: [] });
                 segs[segs.length - 1].lines.push(raw.slice("_reasoning_: ".length));
+                thinkClosed = false;
                 continue;
             }
             const last = segs[segs.length - 1];
-            if (last && (last.type === "out" || last.type === "think")) last.lines.push(raw);
+            if (last && (last.type === "out" || (last.type === "think" && !thinkClosed))) last.lines.push(raw);
             else segs.push({ type: "out", lines: [raw] });
         }
         return segs;
@@ -2192,206 +2576,162 @@ function changelogCatOf(rawLine) {
         });
         return { children: children, roots: roots };
     }
-    // #3917: at-a-glance view of the same folds. Layered (roots first, each fold
-    // one level beyond the block that absorbed it), edges drawn as beziers — a
-    // knowledge-graph-ish shape for reading structure, while the list view stays
-    // the place to read concrete messages. Modest trees are scaled down to fit
-    // the card; pathologically WIDE ones used to be scaled the same way and
-    // became sub-pixel smears (a 161-leaf session fits ≈ 0.05 ⇒ 6px boxes), so
-    // those rotate: depth runs along x, sibling stacks pile along y at full node
-    // size (#4173).
-    const GRAPH_NODE_W = 118;
-    const GRAPH_NODE_H = 36;
-    const GRAPH_GAP_X = 16;
-    const GRAPH_LEVEL_H = 84;
-    const GRAPH_FIT_W = 1120;
-    // #4173 review: the in-page live map draws with tighter nodes so long
-    // sessions stay one readable drawing; every other call site keeps the
-    // original full-size metrics byte-for-byte.
-    const MAP_NODE_W = 92;
-    const MAP_NODE_H = 30;
-    const MAP_GAP_X = 8;
-    const MAP_LEVEL_H = 46;
-    const FULL_METRICS = { w: GRAPH_NODE_W, h: GRAPH_NODE_H, gx: GRAPH_GAP_X, lh: GRAPH_LEVEL_H };
-    const MAP_METRICS = { w: MAP_NODE_W, h: MAP_NODE_H, gx: MAP_GAP_X, lh: MAP_LEVEL_H };
-    function blockGraphLayout(blocks, m) {
-        m = m || FULL_METRICS;
-        const shape = blockTreeShape(blocks);
-        const nodes = [];
-        const links = [];
-        let cursor = 0;
-        let maxDepth = 0;
-        const place = function (b, depth) {
-            if (depth > 40) return null;
-            const kids = shape.children[b.blockId] || [];
-            const childNodes = [];
-            kids.forEach(function (k) {
-                const kid = place(k, depth + 1);
-                if (kid) childNodes.push(kid);
-            });
-            let x;
-            if (!childNodes.length) {
-                x = cursor;
-                cursor += m.w + m.gx;
-            } else {
-                x = (childNodes[0].x + childNodes[childNodes.length - 1].x) / 2;
-            }
-            const node = { b: b, x: x, y: depth * m.lh };
-            nodes.push(node);
-            if (depth > maxDepth) maxDepth = depth;
-            childNodes.forEach(function (c) { links.push([node, c]); });
-            return node;
-        };
-        const roots = shape.roots.length ? shape.roots : blocks;
-        roots.forEach(function (r) { place(r, 0); });
-        if (!nodes.length) return { nodes: [], links: [], width: 0, height: 0 };
-        return { nodes: nodes, links: links, width: cursor - m.gx, height: maxDepth * m.lh + m.h };
-    }
-    // #4173: vertical mirror of blockGraphLayout — depth is the x-axis and the
-    // shared cursor packs sibling stacks along y. Chosen when a tree is far
-    // wider than it is tall: rotating puts the long dimension on the one axis
-    // the page scrolls, keeping every box at natural size (the in-page map's
-    // tighter metrics arrive from the caller).
-    function blockGraphLayoutVertical(blocks, m) {
-        m = m || FULL_METRICS;
-        const shape = blockTreeShape(blocks);
-        const nodes = [];
-        const links = [];
-        let cursor = 0;
-        let maxDepth = 0;
-        const place = function (b, depth) {
-            if (depth > 40) return null;
-            const kids = shape.children[b.blockId] || [];
-            const childNodes = [];
-            kids.forEach(function (k) {
-                const kid = place(k, depth + 1);
-                if (kid) childNodes.push(kid);
-            });
-            let y;
-            if (!childNodes.length) {
-                y = cursor;
-                cursor += m.h + m.gx;
-            } else {
-                y = (childNodes[0].y + childNodes[childNodes.length - 1].y) / 2;
-            }
-            const node = { b: b, x: depth * (m.w + m.gx), y: y };
-            nodes.push(node);
-            if (depth > maxDepth) maxDepth = depth;
-            childNodes.forEach(function (c) { links.push([node, c]); });
-            return node;
-        };
-        const roots = shape.roots.length ? shape.roots : blocks;
-        roots.forEach(function (r) { place(r, 0); });
-        if (!nodes.length) return { nodes: [], links: [], width: 0, height: 0 };
-        return { nodes: nodes, links: links, width: maxDepth * (m.w + m.gx) + m.w, height: cursor - m.gx };
-    }
-    // #4173: orientation shared by the full graph and the in-pane tree map —
-    // flat unless the tree overflows the card AND rotation shortens the long
-    // dimension; small trees stay byte-identical to the original rendering.
-    function graphLayouts(blocks, m) {
-        const lh = blockGraphLayout(blocks, m);
-        const lv = lh.width > GRAPH_FIT_W ? blockGraphLayoutVertical(blocks, m) : null;
-        const vertical = !!lv && lv.height < lh.width;
-        return { layout: vertical ? lv : lh, vertical: vertical };
-    }
-    // Bezier for one parent→child edge in either orientation — shared by every
-    // #4173 drawing (static graph and live in-pane map) so they always agree.
-    function graphEdgePath(l, pad, vertical, m) {
-        m = m || FULL_METRICS;
-        if (vertical) {
-            const x1 = l[0].x + pad + m.w;
-            const y1 = l[0].y + pad + m.h / 2;
-            const x2 = l[1].x + pad;
-            const y2 = l[1].y + pad + m.h / 2;
-            const mx = (x1 + x2) / 2;
-            return "M" + x1 + " " + y1 + " C" + mx + " " + y1 + " " + mx + " " + y2 + " " + x2 + " " + y2;
-        }
-        const x1 = l[0].x + pad + m.w / 2;
-        const y1 = l[0].y + pad + m.h;
-        const x2 = l[1].x + pad + m.w / 2;
-        const y2 = l[1].y + pad;
-        const my = (y1 + y2) / 2;
-        return "M" + x1 + " " + y1 + " C" + x1 + " " + my + " " + x2 + " " + my + " " + x2 + " " + y2;
-    }
-    // #4173: "wrapped" switches this same labeled drawing into in-pane map mode:
-    // it carries its NATURAL pixel size (width/height attrs) so the pane can
-    // show it 1:1 inside a scrollable viewport; zoom resizes the wrapping
-    // .tm-inner box (the svg fills it via CSS), which keeps scroll ranges
-    // honest while the browser scales the drawing uniformly.
-    function buildGraphSvg(blocks, wrapped, m) {
-        m = m || FULL_METRICS;
-        const g = graphLayouts(blocks, m);
-        const layout = g.layout;
-        const vertical = g.vertical;
-        if (!layout.nodes.length) return { html: "", vertical: false, width: 0, height: 0 };
-        const pad = 14;
-        const W = Math.ceil(layout.width + pad * 2);
-        const H = Math.ceil(layout.height + pad * 2);
-        const fit = W > GRAPH_FIT_W ? GRAPH_FIT_W / W : 1;
-        const parts = [];
-        parts.push('<svg class="g-svg' + (vertical ? " g-svg-v" : "") + (wrapped ? " tm-svg" : "") + '" viewBox="0 0 ' + W + " " + H + '" width="' + (wrapped ? W : Math.round(W * fit)) + '" height="' + (wrapped ? H : Math.round(H * fit)) + '" preserveAspectRatio="xMidYMid meet" role="img">');
-        if (wrapped) parts.push('<g class="tm-g">');
-        // compact rows carry the two text lines closer together
-        const idY = m.h >= 36 ? 15 : 12;
-        const metaY = m.h >= 36 ? 28 : 22;
-        layout.links.forEach(function (l) {
-            parts.push('<path class="g-edge" d="' + graphEdgePath(l, pad, vertical, m) + '" fill="none"/>');
+    // #4608: geometry for the collapsible-tree reading of the blocks pane.
+    // (The flame-chart reading was cut at owner request — the pane keeps
+    // the tree plus the classic folded-block list instead.)
+    const TREE_W = 200;          // collapsible-tree node box
+    const TREE_H = 44;
+    const TREE_GAP_X = 22;       // column spacing (depth axis)
+    const TREE_GAP_Y = 10;
+    // Collapsible depth-column tree: roots always show, a branch appears only
+    // while its parent carries the expand mark; the "+N" chip counts the whole
+    // hidden subtree so a deep collapse still says how much hides behind it.
+    function collapSubtreeSize(blocks) {
+        const byId = {};
+        blocks.forEach(function (b) { byId[b.blockId] = true; });
+        const childIds = {};
+        blocks.forEach(function (b) {
+            const pid = b.parentBlockId;
+            if (pid && pid !== b.blockId && byId[pid]) (childIds[pid] = childIds[pid] || []).push(b.blockId);
         });
-        layout.nodes.forEach(function (n) {
+        const memo = {};
+        const size = function (id, trail) {
+            if (memo[id] != null) return memo[id];
+            if (trail.indexOf(id) >= 0) return 1;
+            trail.push(id);
+            const total = 1 + (childIds[id] || []).reduce(function (acc, k) { return acc + size(k, trail); }, 0);
+            trail.pop();
+            memo[id] = total;
+            return total;
+        };
+        blocks.forEach(function (b) { size(b.blockId, []); });
+        return memo;
+    }
+    function collapTreeLayout(blocks, expanded) {
+        const shape = blockTreeShape(blocks);
+        const sizes = collapSubtreeSize(blocks);
+        const nodes = [], links = [];
+        let cursor = 0, maxDepth = 0;
+        const place = function (b, depth) {
+            if (depth > 40) return null;
+            const node = { b: b, x: depth, y: 0 };
+            const ys = [];
+            if (expanded && expanded[b.blockId])
+                (shape.children[b.blockId] || []).forEach(function (k) {
+                    const kn = place(k, depth + 1);
+                    if (kn) { ys.push(kn.y); links.push([node, kn]); }
+                });
+            if (ys.length) node.y = (ys[0] + ys[ys.length - 1]) / 2;
+            else { node.y = cursor; cursor += TREE_H + TREE_GAP_Y; }
+            nodes.push(node);
+            if (depth > maxDepth) maxDepth = depth;
+            return node;
+        };
+        (shape.roots.length ? shape.roots : blocks).forEach(function (r) { place(r, 0); });
+        if (!nodes.length) return { nodes: nodes, links: links, cols: 1, height: 0, sizes: sizes };
+        return { nodes: nodes, links: links, cols: maxDepth + 1, height: cursor - TREE_GAP_Y + TREE_H, sizes: sizes };
+    }
+    function renderCollapSvg(blocks, expanded, selectedBid) {
+        const lay = collapTreeLayout(blocks, expanded || {});
+        if (!lay.nodes.length) return { html: "" };
+        const colW = TREE_W + TREE_GAP_X;
+        const W = 12 + lay.cols * colW + 4;
+        const H = lay.height + 12;
+        const sel = selectedBid || "";
+        const p = [];
+        p.push('<svg class="g-svg g-svg-v" viewBox="0 0 ' + W + " " + H + '" width="' + W + '" height="' + H + '" preserveAspectRatio="xMinYMin meet" role="img">');
+        lay.links.forEach(function (l) {
+            const x1 = l[0].x * colW + 12 + TREE_W, y1 = l[0].y + 6 + TREE_H / 2;
+            const x2 = l[1].x * colW + 12, y2 = l[1].y + 6 + TREE_H / 2;
+            const mx = (x1 + x2) / 2;
+            p.push('<path class="g-edge" fill="none" d="M' + x1.toFixed(1) + " " + y1.toFixed(1) + " C" + mx.toFixed(1) + " " + y1.toFixed(1) + " " + mx.toFixed(1) + " " + y2.toFixed(1) + " " + x2.toFixed(1) + " " + y2.toFixed(1) + '"></path>');
+        });
+        lay.nodes.forEach(function (n) {
             const b = n.b;
             const tierNum = Number(b.tier) || 1;
-            const cls = "g-node tier-" + (tierNum > 3 ? "n" : String(tierNum)) + (b.active ? "" : " inactive");
-            const ratio = b.compressedTokens > 0 && b.summaryTokens > 0 ? (100 * b.summaryTokens / b.compressedTokens).toFixed(1) + "%" : "";
-            const meta = fmtW(b.compressedTokens) + " \u2192 " + fmtW(b.summaryTokens) + (ratio ? " " + ratio : "");
-            // #4173 review: the message span (mXXXX-mYYYY) belongs on the node,
-            // not only in the list row; tokens stay in the hover tooltip.
+            const hidden = (lay.sizes[b.blockId] || 1) - 1;
+            const isOpen = !!(expanded && expanded[b.blockId]);
+            const cls = "g-node tier-" + (tierNum > 3 ? "n" : String(tierNum)) + (b.active ? "" : " inactive") + (sel === b.blockId ? " fsel" : "");
+            let topic = blockTopic(b);
+            const maxCh = Math.floor((TREE_W - 52) / 7);
+            if (topic.length > maxCh) topic = topic.slice(0, Math.max(1, maxCh - 1)) + "...";
             const rr = refRangeOf(b);
-            parts.push('<g class="' + cls + '" data-bid="' + escapeHtml(b.blockId) + '" transform="translate(' + (n.x + pad) + "," + (n.y + pad) + ')">'
-                + "<title>" + escapeHtml(b.blockId + " \u00b7 T" + tierNum + (rr ? " \u00b7 " + rr : "") + " \u00b7 " + meta + " \u00b7 " + blockTopic(b)) + "</title>"
-                + '<rect width="' + m.w + '" height="' + m.h + '" rx="9"></rect>'
-                + '<text class="g-id" x="10" y="' + idY + '">' + escapeHtml(b.blockId + " \u00b7 T" + tierNum) + "</text>"
-                + '<text class="g-meta" x="10" y="' + metaY + '">' + escapeHtml(rr || meta) + "</text>"
-                + "</g>");
+            p.push('<g class="' + cls + '" data-bid="' + escapeHtml(b.blockId) + '" transform="translate(' + (n.x * colW + 12).toFixed(1) + "," + (n.y + 6).toFixed(1) + ')">');
+            p.push('<rect width="' + TREE_W + '" height="' + TREE_H + '" rx="9"><title>' + escapeHtml(b.blockId + " \u00b7 T" + tierNum + (rr ? " \u00b7 " + rr : "") + " \u00b7 " + blockTopic(b)) + "</title></rect>");
+            p.push('<text class="g-id" x="10" y="17">' + escapeHtml(b.blockId + " \u00b7 T" + tierNum + (rr ? " \u00b7 " + rr : "")) + "</text>");
+            p.push('<text class="g-topic" x="10" y="34">' + escapeHtml(topic) + "</text>");
+            if (hidden > 0)
+                p.push('<g class="tchip" data-toggle="' + escapeHtml(b.blockId) + '" transform="translate(' + (TREE_W - 34) + ',13)">' + '<rect width="28" height="18" rx="9"></rect><text x="14" y="13">' + (isOpen ? "−" : "+" + hidden) + '</text></g>');
+            p.push("</g>");
         });
-        if (wrapped) parts.push("</g>");
-        parts.push("</svg>");
-        return { html: parts.join(""), vertical: vertical, width: W, height: H };
-    }
-    // #4173: the scrollable inner frame of the in-pane tree map — sized at the
-    // drawing's natural pixels; treeMapApply() resizes it when zooming.
-    function treeMapInnerHtml(graph) {
-        if (!graph.html) return "";
-        return '<div class="tm-inner" data-nw="' + graph.width + '" data-nh="' + graph.height + '" style="width:' + graph.width + 'px;height:' + graph.height + 'px;">' + graph.html + "</div>";
-    }
-    function treeMapApply(view) {
-        const inner = view.querySelector(".tm-inner");
-        if (!inner) return;
-        const k = view.__vm ? view.__vm.k : 1;
-        const nw = parseFloat(inner.getAttribute("data-nw")) || 0;
-        const nh = parseFloat(inner.getAttribute("data-nh")) || 0;
-        inner.style.width = (nw * k) + "px";
-        inner.style.height = (nh * k) + "px";
-    }
-    function treeMapFit(view) {
-        const inner = view.querySelector(".tm-inner");
-        if (!inner) return;
-        const nw = parseFloat(inner.getAttribute("data-nw")) || 0;
-        const nh = parseFloat(inner.getAttribute("data-nh")) || 0;
-        if (!nw || !nh) return;
-        // #4173 review: the map flows with the page, so Fit shrinks the whole
-        // tree into roughly the current viewport and centers it there.
-        const w = Math.max(320, document.documentElement.clientWidth - 120);
-        const h = Math.max(320, window.innerHeight - 180);
-        view.__vm = { k: Math.min(1, Math.min(w / nw, h / nh) * 0.98) };
-        treeMapApply(view);
-        const r = inner.getBoundingClientRect();
-        window.scrollBy(0, (r.top + (nh * view.__vm.k) / 2) - window.innerHeight / 2);
+        p.push("</svg>");
+        return { html: p.join("") };
     }
     function refRangeOf(b) {
         if (!b.startRef) return "";
         return b.endRef && b.endRef !== b.startRef ? b.startRef + "–" + b.endRef : String(b.startRef);
     }
-    function blockNodeHtml(b, shape, idx, depth) {
+    // #4608: one pre-rendered detail panel per fold block — hidden until its
+    // bar/node is selected, so the drawings stay light while the summary, the
+    // kernel's own accounting and the lazy raw-content endpoints all live next
+    // to the thing you clicked.
+    function sidePanelHtml(b, idx) {
+        const tierNum = Number(b.tier) || 1;
+        const badge = b.active
+            ? '<span class="badge ok">' + t("det.block_active") + "</span>"
+            : '<span class="badge disk">' + t("det.block_inactive") + "</span>";
+        const extBadge = b.external ? '<span class="badge ext">' + t("det.block_external") + "</span>" : "";
+        const meta = ["T" + tierNum, fmtW(b.compressedTokens) + " \u2192 " + fmtW(b.summaryTokens)];
+        if (b.compressedTokens > 0 && b.summaryTokens > 0) meta.push((100 * b.summaryTokens / b.compressedTokens).toFixed(1) + "%");
+        meta.push(fmtB(b.summaryBytes));
+        if (b.effectiveMessageCount) meta.push(t("det.tree_msgs", { n: b.effectiveMessageCount }));
+        const rr = refRangeOf(b);
+        if (rr) meta.push(rr);
+        meta.push(timeAgo(b.createdAt));
+        // Same contract as the old list row: long summaries open as five
+        // clamped lines behind a show-all button; the clamp only survives
+        // measurement if it actually cut anything.
+        const sumLong = String(b.summary || "").trim().length > 64;
+        let bodyInner = renderBlockMd(b.summary || "");
+        if (sumLong) {
+            bodyInner = '<div class="blk-sum clamp">' + bodyInner + "</div>"
+                + '<button type="button" class="btn sm blk-sum-toggle">' + t("det.tree_sum_more") + "</button>";
+        }
+        const bid = escapeHtml(b.blockId);
+        let html = '<div class="bd-panel" data-bid="' + bid + '" hidden><div class="bd-head"><span class="mono">' + bid + "</span>" + badge + extBadge
+            + '<button class="btn sm blk-copy" data-bi="' + idx + '">' + t("common.copy") + "</button></div>"
+            + '<div class="topic">' + escapeHtml(blockTopic(b)) + "</div>"
+            + '<div class="meta mono">' + escapeHtml(meta.join(" \u00b7 ")) + "</div>"
+            + '<div class="body md">' + bodyInner + "</div>"
+            + '<div class="blk-content-bar">'
+            + '<button class="btn sm blk-content-btn" data-bid="' + bid + '" data-view="one">' + t("det.tree_orig_one") + "</button>"
+            + '<button class="btn sm blk-content-btn" data-bid="' + bid + '" data-view="full">' + t("det.tree_orig_full") + "</button>"
+            + '<span class="dim small">' + escapeHtml(t("det.tree_direct", { n: Number(b.directMessageCount) || 0 })) + "</span>"
+            + "</div>"
+            + '<div class="blk-content" data-blkbox hidden></div>';
+        // The messages this block folded — preview only, bytes arrive lazily
+        // (#3917) through the very same endpoint the old list rows used.
+        const msgs = b.directMessages || [];
+        if (msgs.length) {
+            html += '<ul class="blk-msgs">';
+            msgs.forEach(function (m) {
+                if (m.missing) {
+                    html += '<li><div class="msg-row missing"><span class="mref mono">' + escapeHtml(m.ref) + '</span><span class="mprev">' + t("det.tree_msg_gone") + "</span></div></li>";
+                    return;
+                }
+                const tags = m.toolName ? '<span class="badge">' + escapeHtml(m.toolName) + "</span>" : "";
+                html += '<li><button class="msg-row" data-ref="' + escapeHtml(m.ref) + '">'
+                    + '<span class="mref mono">' + escapeHtml(m.ref) + "</span>"
+                    + '<span class="badge">' + escapeHtml(m.role || "") + "</span>" + tags
+                    + '<span class="mprev">' + escapeHtml(m.preview || "") + "</span></button>"
+                    + '<div class="msg-body" hidden></div></li>';
+            });
+            html += "</ul>";
+        } else if (Number(b.directMessageCount) > 0) {
+            html += '<div class="dim small" style="margin:2px 0 8px">' + t("det.tree_msgs_unavailable") + "</div>";
+        }
+        return html + "</div>";
+    }    function blockNodeHtml(b, shape, idx, depth) {
         const kids = shape.children[b.blockId] || [];
         const tierNum = Number(b.tier) || 1;
         // #4173 review: rows start COLLAPSED — a 200-block session must not
@@ -2431,7 +2771,7 @@ function changelogCatOf(rawLine) {
             + '<button class="btn sm blk-content-btn" data-bid="' + bid + '" data-view="full">' + t("det.tree_orig_full") + "</button>"
             + '<span class="dim small">' + escapeHtml(t("det.tree_direct", { n: Number(b.directMessageCount) || 0 })) + "</span>"
             + "</div>"
-            + '<div class="blk-content" id="blk-content-' + bid + '" hidden></div>';
+            + '<div class="blk-content" data-blkbox hidden></div>';
         // #3917: the messages this block folded, one leaf per mNNNNN ref. The
         // preview is all the tree needs; the bytes arrive on the first click
         // (the lazy endpoint), so a wide session never ships its transcript.
@@ -2457,6 +2797,8 @@ function changelogCatOf(rawLine) {
         if (depth < 32) kids.forEach(function (k) { html += blockNodeHtml(k, shape, idx, depth + 1); });
         return html + "</details>";
     }
+
+
     function buildTreePane(blocks) {
         const parts = [];
         parts.push('<div class="card"><div class="card-h"><span>' + t("det.blocks_title") + '</span><span class="hint">' + t("det.blocks_count", { total: blocks.length, active: blocks.filter(function (b) { return b.active; }).length }) + '</span></div><div class="card-b">');
@@ -2464,32 +2806,40 @@ function changelogCatOf(rawLine) {
             parts.push('<div class="dim small" style="padding:8px 0">' + t("det.blocks_empty") + "</div></div></div>");
             return parts.join("");
         }
+        window.__biliDetailBlocks = blocks; // consumed by bindTreeModeActions() after insertion
         const stats = blockTreeStats(blocks);
         const tierBits = Object.keys(stats.tiers).sort(function (a, b) { return Number(a) - Number(b); }).map(function (k) { return "T" + k + " ×" + stats.tiers[k]; });
-    parts.push('<div class="tree-stats mono small">'
+        parts.push('<div class="tree-stats mono small">'
             + "<span>" + escapeHtml(t("det.tree_total", { n: blocks.length })) + "</span>"
             + "<span>" + escapeHtml(t("det.tree_active", { n: stats.active })) + "</span>"
             + "<span>" + escapeHtml(t("det.tree_split", { x: fmtW(stats.coverTokens), y: fmtW(stats.summaryTokens), p: stats.coverTokens > 0 ? (100 * stats.summaryTokens / stats.coverTokens).toFixed(1) + "%" : t("common.none") })) + "</span>"
             + (tierBits.length ? "<span>" + escapeHtml(tierBits.join(" · ")) + "</span>" : "")
             + "</div>");
         parts.push('<div class="tree-actions"><button id="blocks-copy" class="btn sm">' + t("det.blocks_copy_md") + '</button><button id="blocks-dl" class="btn sm">' + t("det.blocks_download") + "</button></div>");
+        parts.push('<div class="tree-modes">'
+            + '<button class="btn sm tree-mode active" data-mode="tree">' + t("det.tree_view_graph") + "</button>"
+            + '<button class="btn sm tree-mode" data-mode="list">' + t("det.tree_view_list") + "</button>"
+            + '<button id="tm-expand-all" class="btn sm" hidden>' + t("det.tree_expand_all") + "</button>"
+            + '<button id="tm-collapse-all" class="btn sm" hidden>' + t("det.tree_collapse_all") + "</button>"
+            + '<span class="hint" id="tree-hint">' + t("det.tree_interact") + "</span>"
+            + "</div>");
+        // Left: the two interchangeable readings inside one scrollable frame
+        // (the collapsible tree by default, the classic folded-block list on
+        // demand); right: the selected block, sticky beside the tree.
         const shape = blockTreeShape(blocks);
         const idxOf = {};
         blocks.forEach(function (b, i) { if (idxOf[b.blockId] === undefined) idxOf[b.blockId] = i; });
-        parts.push('<div class="tree-modes"><button class="btn sm tree-mode active" data-mode="list">' + t("det.tree_view_list") + '</button><button class="btn sm tree-mode" data-mode="graph">' + t("det.tree_view_graph") + '</button><span class="hint">' + t("det.tree_map_hint") + '</span><button id="tm-fit" class="btn sm" hidden>' + t("det.tree_map_fit") + "</button></div>");
-        const mapGraph = buildGraphSvg(blocks, true, MAP_METRICS);
-        // #4173 review: the live map comes FIRST (总揽全局), the full block
-        // list stacks below it — with the old order the map ended up under a
-        // screen of detail rows.
-        parts.push('<div class="tm-view" id="tree-graph" hidden>' + treeMapInnerHtml(mapGraph)
-            + '<div class="dim small" style="margin-top:8px">' + t("det.tree_graph_legend") + '</div></div>');
-        parts.push('<div class="tree-list" id="tree-list">');
-        parts.push('<div class="block-tree">');
+        parts.push('<div class="fd-grid"><div class="fd-left">');
+        parts.push('<div class="tm-view" id="tree-graph"><div class="tm-inner"></div></div>');
+        parts.push('<div class="tree-list" id="tree-list" hidden><div class="block-tree">');
         const rootBlocks = shape.roots.length ? shape.roots : blocks;
         rootBlocks.forEach(function (b) { parts.push(blockNodeHtml(b, shape, idxOf[b.blockId] || 0, 0)); });
-        parts.push("</div>");
-        parts.push('<div class="dim small" style="margin-top:10px">' + t("det.tree_hint") + "</div>");
-        parts.push("</div>");
+        parts.push("</div></div>");
+        parts.push('</div><aside class="fd-side"><div class="card bd-card"><div class="card-h"><span>' + t("det.block_detail_title") + '</span></div><div class="card-b">');
+        parts.push('<div class="dim small" id="bd-empty">' + t("det.block_side_hint") + "</div>");
+        parts.push('<div id="bd-panels">');
+        blocks.forEach(function (b) { parts.push(sidePanelHtml(b, idxOf[b.blockId])); });
+        parts.push("</div></div></div></aside></div>");
         parts.push("</div></div>");
         return parts.join("");
     }
@@ -2516,6 +2866,8 @@ function changelogCatOf(rawLine) {
         if (d.label && d.label !== d.id) kv(parts, t("common.label"), d.label);
         kv(parts, t("common.protocol"), d.protocol || null, true);
         kv(parts, t("det.client_hint"), d.clientHint || null, true);
+        // #4571: engine lane — in-process (inline) vs standalone proxy process.
+        kv(parts, t("det.engine_lane"), d.engineLane === "inline" ? t("det.engine_lane_inline") : d.engineLane === "server" ? t("det.engine_lane_server") : null, true);
         if (d.selfHeal) kv(parts, t("det.self_heal"), (d.selfHeal.action === "degrade-to-proxy" ? t("det.self_heal_degrade_to_proxy") : t("det.self_heal_suppress_nudge")) + " · " + d.selfHeal.detected + " · " + timeAgo(d.selfHeal.since), true);
         // #2740: session-level notice — auto-mode verdicts here are bili-local, not model judgments.
         if (d.autoModeForge) kv(parts, t("det.auto_mode_forge"), t("det.auto_mode_forge_local") + " · " + d.autoModeForge.count + "×" + (d.autoModeForge.lastVariant || "?") + " · " + timeAgo(d.autoModeForge.lastAt), true);
@@ -2534,8 +2886,19 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         parts.push('<div class="card" style="margin-top:16px"><div class="card-h"><span>' + t("det.usage") + '</span></div><div class="card-b">');
         parts.push('<div class="grid cols-4">');
         mini(parts, t("common.requests"), d.requests ? fmtW(d.requests) : null);
-        mini(parts, t("ov.input_tokens"), d.inputTokens ? fmtW(d.inputTokens) : null);
-        mini(parts, t("ov.cached_tokens"), d.cachedTokens ? fmtW(d.cachedTokens) : null);
+        // #4899 v4: every token figure gets its own ≈$ face even without folds
+        // (priced sessions carry a live-estimated costUsd) — same tiers as the
+        // overview cards; unpriced sessions stay bare.
+        // #4899 v5: per-session rate args — show THE price inside each formula,
+        // same rule as the overview (only when one price actually applies).
+        const d6 = (x) => String(Math.round(x * 1e6) / 1e6);
+        const drates = d.rates ? { w: d6(d.rates.w), r: d6(d.rates.r), q: d6(d.rates.q) } : null;
+        const inSub = (d.costUsd ? t("ov.tier_unhit", { n: fmtUsd(d.costUsd.input) }) : "")
+            + (drates ? " · " + t("ov.at_input", { v: drates.w }) : "")
+            + (d.payback != null && d.savedUsdGross != null ? " · " + t("det.in_counterfactual", { n: fmtUsd(d.savedUsdGross) }) : "");
+        mini(parts, t("ov.input_tokens"), d.inputTokens ? fmtW(d.inputTokens) : null, false, inSub);
+        mini(parts, t("ov.cached_tokens"), d.cachedTokens ? fmtW(d.cachedTokens) : null, false,
+            d.costUsd && d.cachedTokens > 0 ? t("ov.money_eq", { n: fmtUsd(d.costUsd.cacheRead) }) + (drates ? " · " + t("ov.at_read", { v: drates.r }) : "") : "");
         const mt = d.ledger && d.ledger.totals;
         const missArgs = mt && mt.input > 0 ? { n: fmtW(mt.newContent || 0), c: fmtW(mt.compRepay || 0), x: fmtW(mt.ttlRepay || 0), pn: (((mt.newContent || 0) / mt.input) * 100).toFixed(1), pc: (((mt.compRepay || 0) / mt.input) * 100).toFixed(1), px: (((mt.ttlRepay || 0) / mt.input) * 100).toFixed(1) } : null;
         // #2929: the headline hit-rate subline stays the three-bucket split only —
@@ -2556,12 +2919,51 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         if (rdRaw && (Number(rdRaw.count) > 0)) {
             hitSub += " · " + '<span style="color:#8250df" title="' + escapeHtml(t("det.attr_restart_tip")) + '">' + escapeHtml(t("det.attr_restart")) + " ×" + Number(rdRaw.count) + "</span>";
         }
-        mini(parts, t("det.hit_pct"), d.cacheHitPct == null ? null : d.cacheHitPct.toFixed(1) + "%", false, hitSub, missArgs ? t("det.miss_split_line", missArgs) : "");
-        mini(parts, t("ov.output_tokens"), d.outputTokens ? fmtW(d.outputTokens) : null);
+        // #4899: $ face under the missed-tokens split (current price table); tokens
+        // only when no price resolves.
+        const missLine = missArgs
+            ? t("det.miss_split_line", missArgs) + (d.missSplitUsd ? "<br>≈ " + escapeHtml(t("ov.miss_split_usd", { n: fmtUsd(d.missSplitUsd.n), c: fmtUsd(d.missSplitUsd.c), x: fmtUsd(d.missSplitUsd.x) })) + (drates ? " " + escapeHtml(t("ov.miss_rates", drates)) : "") : "")
+            : "";
+        mini(parts, t("det.hit_pct"), d.cacheHitPct == null ? null : d.cacheHitPct.toFixed(1) + "%", false, hitSub, missLine);
+        mini(parts, t("ov.output_tokens"), d.outputTokens ? fmtW(d.outputTokens) : null, false,
+            (d.costUsd ? t("ov.money_eq", { n: fmtUsd(d.costUsd.output) }) : "")
+            + (drates ? " · " + t("ov.at_output", { v: drates.q }) : "")
+            + (d.payback != null && d.summaryCost ? " · " + t("det.out_split", { n: fmtW(Math.max(0, d.outputTokens - d.summaryCost)), nn: fmtUsd(d.payback.normalOutputUsd), s: fmtW(d.summaryCost), ss: fmtUsd(d.payback.sigmaUsd) }) : ""));
         const dSavedV = d.netSaved != null ? d.netSaved : d.tokensSaved;
+        // #4899: money faces — saved-$ rides the saved-tokens card as the sub
+        // line; spend gets its own card with the input/cache/output breakdown.
+        const savedUsdSub = d.savedUsd != null ? t("ov.money_saved", { n: fmtUsd(d.savedUsd) }) : "";
         mini(parts, t("ov.tokens_saved"), dSavedV ? fmtW(dSavedV) : null, dSavedV > 0,
-            d.coverageLostFolds ? t("det.covlost_sub", { n: d.coverageLostFolds, x: fmtW(d.coverageLostFrozenTokens || 0) }) : "");
+            d.coverageLostFolds ? t("det.covlost_sub", { n: d.coverageLostFolds, x: fmtW(d.coverageLostFrozenTokens || 0) }) : savedUsdSub);
+        // #4899 v3: the honest question — did this session's folding pay back?
+        // The net reuses the same rounded faces rendered next door
+        // (gross − spent, exactly the canonical savedUsd arithmetic), so the
+        // numbers on screen reconcile by construction.
+        if (d.payback != null && d.savedUsdGross != null) {
+            const pnet = d.savedUsdGross - d.payback.spentUsd;
+            let brk = t("det.payback_brk_base", { r: fmtUsd(d.payback.replayUsd), g: fmtUsd(d.payback.sigmaUsd) });
+            if ((d.payback.creditUsd || 0) > 0) brk += " · " + t("det.payback_brk_credit", { c: fmtUsd(d.payback.creditUsd) });
+            if (d.rates) brk += " · " + escapeHtml(t("ov.payback_rates", { w: d6(d.rates.w), r: d6(d.rates.r), q: d6(d.rates.q) }));
+            let badge = "";
+            if (d.payback.breakevenTurns != null) {
+                const done = d.payback.actualTurns >= d.payback.breakevenTurns;
+                badge = ' <span style="color:' + (done ? "#1a7f37" : "#cf222e") + '">' + (done ? t("ov.payback_ok") : t("ov.payback_wait", { k: Math.max(1, Math.ceil(d.payback.breakevenTurns - d.payback.actualTurns)) })) + "</span>";
+            } else if (pnet >= 0) {
+                badge = ' <span style="color:#1a7f37">' + t("ov.payback_ok") + "</span>";
+            }
+            mini(parts, t("det.payback"), "\u2248 " + fmtUsd(pnet), pnet >= 0,
+                t("det.payback_split", { s: fmtUsd(d.payback.spentUsd), brk, v: fmtUsd(d.savedUsdGross) }) + badge);
+        }
+        if (d.costUsd != null) {
+            // #4899: derived-from-price-table spend carries the same ≈ mark
+            // every other money face uses; a persisted ledger reads exact.
+            mini(parts, t("ov.spend"), (d.costUsd.estimated ? "\u2248 " : "") + fmtUsd(d.costUsd.total), false,
+                t("det.spend_sub", { i: fmtUsd(d.costUsd.input), r: fmtUsd(d.costUsd.cacheRead), w: fmtUsd(d.costUsd.cacheWrite), o: fmtUsd(d.costUsd.output) }));
+        }
         mini(parts, t("det.last_input"), (d.lastInputTokens || 0) > 0 ? fmtW(d.lastInputTokens) : null);
+        // #4899 v3: money faces are live estimates at current list prices — say so where they appear.
+        if (d.costUsd != null || d.savedUsd != null)
+            parts.push('<div class="dim small" style="margin-top:8px">' + escapeHtml(t("common.price_est_note")) + "</div>");
         parts.push("</div>");
         // #1839: mark estimate-grade context numbers so a bounded local estimate
         // is never read as a measured value (the ghost-denominator incident).
@@ -2673,7 +3075,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         if (seamActive && seam.events.length > 0) {
             const evHead = '<tr><th class="num">#</th><th>' + t("det.fold_time") + '</th><th class="num">' + t("det.seam_col_hit") + '</th><th class="num">' + t("det.seam_col_input") + '</th><th>' + t("det.seam_col_div") + "</th></tr>";
             parts.push('<details open class="seam-ev"><summary title="' + escapeHtml(t("det.seam_events_tip")) + '"><b>' + t("det.seam_events", { n: seam.events.length }) + "</b></summary>"
-                + '<div class="fold-scroll" style="max-height:320px;border:none;border-radius:0;padding:2px 8px 8px"><table class="data"><thead>' + evHead + "</thead><tbody>");
+                + '<div class="fold-scroll" style="max-height:320px;border:none;border-radius:0;padding:2px 8px 8px"><table class="data event-table"><thead>' + evHead + "</thead><tbody>");
             seam.events.forEach((ev) => {
                 const cli = ev.client ? ' · <span style="color:#0969da">' + t("det.attr_client") + " @" + ev.client.idx + " (" + ev.client.role + "/" + ev.client.cls + ", " + fmtB(ev.client.len || 0) + ")</span>" : "";
                 parts.push('<tr><td class="num">' + ev.seq + '</td><td class="num">' + (ev.at ? fmtDT(ev.at) : t("common.none")) + '</td><td class="num">' + (typeof ev.hitPct === "number" ? ev.hitPct.toFixed(1) + "%" : t("common.none")) + '</td><td class="num">' + fmtW(ev.input || 0) + '</td><td class="mono small">' + fmtB(ev.lcpBytes || 0) + " @ " + t("det.seam_msg", { i: ev.msgIndex != null ? ev.msgIndex : "?", prev: ev.prevMsgs != null ? ev.prevMsgs : "?", cur: ev.curMsgs != null ? ev.curMsgs : "?" }) + cli + "</td></tr>");
@@ -2686,7 +3088,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         if (keySw && keySw.count > 0 && keySw.events && keySw.events.length > 0) {
             const kHead = '<tr><th class="num">#</th><th>' + t("det.fold_time") + '</th><th class="num">' + t("det.seam_col_hit") + '</th><th class="num">' + t("det.seam_col_input") + "</th><th>" + t("det.key_fp") + "</th></tr>";
             parts.push('<details open class="seam-ev"><summary title="' + escapeHtml(t("det.key_events_tip")) + '"><b>' + t("det.key_events", { n: keySw.count }) + "</b></summary>"
-                + '<div class="fold-scroll" style="max-height:320px;border:none;border-radius:0;padding:2px 8px 8px"><table class="data"><thead>' + kHead + "</thead><tbody>");
+                + '<div class="fold-scroll" style="max-height:320px;border:none;border-radius:0;padding:2px 8px 8px"><table class="data event-table"><thead>' + kHead + "</thead><tbody>");
             keySw.events.forEach((ev) => {
                 parts.push('<tr><td class="num">' + ev.seq + '</td><td class="num">' + (ev.at ? fmtDT(ev.at) : t("common.none")) + '</td><td class="num">' + (typeof ev.hitPct === "number" ? ev.hitPct.toFixed(1) + "%" : t("common.none")) + '</td><td class="num">' + fmtW(ev.input || 0) + '</td><td class="mono small">' + (ev.from || "?") + " → " + (ev.to || "?") + "</td></tr>");
             });
@@ -2698,7 +3100,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         if (promptSw && promptSw.count > 0 && promptSw.events && promptSw.events.length > 0) {
             const pHead = '<tr><th class="num">#</th><th>' + t("det.fold_time") + '</th><th class="num">' + t("det.seam_col_hit") + '</th><th class="num">' + t("det.seam_col_input") + "</th><th>" + t("det.prompt_fp") + "</th></tr>";
             parts.push('<details open class="seam-ev"><summary title="' + escapeHtml(t("det.prompt_events_tip")) + '"><b>' + t("det.prompt_events", { n: promptSw.count }) + "</b></summary>"
-                + '<div class="fold-scroll" style="max-height:320px;border:none;border-radius:0;padding:2px 8px 8px"><table class="data"><thead>' + pHead + "</thead><tbody>");
+                + '<div class="fold-scroll" style="max-height:320px;border:none;border-radius:0;padding:2px 8px 8px"><table class="data event-table"><thead>' + pHead + "</thead><tbody>");
             promptSw.events.forEach((ev) => {
                 parts.push('<tr><td class="num">' + ev.seq + '</td><td class="num">' + (ev.at ? fmtDT(ev.at) : t("common.none")) + '</td><td class="num">' + (typeof ev.hitPct === "number" ? ev.hitPct.toFixed(1) + "%" : t("common.none")) + '</td><td class="num">' + fmtW(ev.input || 0) + '</td><td class="mono small">' + (ev.from || "?") + " → " + (ev.to || "?") + "</td></tr>");
             });
@@ -2709,7 +3111,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         if (projSw && projSw.count > 0 && projSw.events && projSw.events.length > 0) {
             const jHead = '<tr><th class="num">#</th><th>' + t("det.fold_time") + '</th><th class="num">' + t("det.seam_col_hit") + '</th><th class="num">' + t("det.seam_col_input") + "</th><th>" + t("det.proj_fp") + "</th></tr>";
             parts.push('<details open class="seam-ev"><summary title="' + escapeHtml(t("det.proj_events_tip")) + '"><b>' + t("det.proj_events", { n: projSw.count }) + "</b></summary>"
-                + '<div class="fold-scroll" style="max-height:320px;border:none;border-radius:0;padding:2px 8px 8px"><table class="data"><thead>' + jHead + "</thead><tbody>");
+                + '<div class="fold-scroll" style="max-height:320px;border:none;border-radius:0;padding:2px 8px 8px"><table class="data event-table"><thead>' + jHead + "</thead><tbody>");
             projSw.events.forEach((ev) => {
                 parts.push('<tr><td class="num">' + ev.seq + '</td><td class="num">' + (ev.at ? fmtDT(ev.at) : t("common.none")) + '</td><td class="num">' + (typeof ev.hitPct === "number" ? ev.hitPct.toFixed(1) + "%" : t("common.none")) + '</td><td class="num">' + fmtW(ev.input || 0) + '</td><td class="mono small">' + (ev.from || "?") + " → " + (ev.to || "?") + "</td></tr>");
             });
@@ -2797,9 +3199,15 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         else {
             // All folds in one scrollable panel (same pattern as the compression blocks):
             // numeric headers align with their columns; long lists just scroll.
-            const foldHead = '<tr><th class="num">#</th><th>' + t("det.fold_time") + '</th><th class="num">' + t("det.fold_s") + '</th><th class="num">' + t("det.fold_sigma") + '</th><th class="num">' + t("det.fold_h") + '</th><th class="num">' + t("det.fold_t") + "</th></tr>";
-            const foldRow = (f, i) => '<tr><td class="num">' + (f.seq != null ? f.seq : i + 1) + '</td><td class="num">' + (f.at ? fmtDT(f.at) : t("common.none")) + '</td><td class="num">' + fmtW(f.S) + '</td><td class="num">' + fmtW(f.sigma) + '</td><td class="num">' + (f.hPct == null ? t("common.none") : f.hPct.toFixed(1) + "%") + '</td><td class="num">' + fmtW(f.T) + "</td></tr>";
-            parts.push('<div class="fold-scroll"><table class="data"><thead>' + foldHead + '</thead><tbody>');
+            const foldHead = '<tr><th class="num">#</th><th>' + t("det.fold_time") + '</th><th class="num">' + t("det.fold_s") + '</th><th class="num">' + t("det.fold_sigma") + '</th><th class="num">' + t("det.fold_h") + '</th><th class="num">' + t("det.fold_t") + '</th><th class="num">' + t("det.fold_ra") + '</th><th class="num">' + t("det.fold_saved") + "</th>" + (d.rates ? '<th class="num">' + t("det.fold_usd") + "</th>" : "") + "</tr>";
+            const foldRow = (f, i) => {
+                // #4899 v5: make "how much × how much" concrete per fold — the
+                // later-request multiplier, its token credit, and the ≈$ when a
+                // read rate resolves.
+                const credit = ((f.S ?? 0) - (f.sigma ?? 0)) * (f.requestsAfter ?? 0);
+                return '<tr><td class="num">' + (f.seq != null ? f.seq : i + 1) + '</td><td class="num">' + (f.at ? fmtDT(f.at) : t("common.none")) + '</td><td class="num">' + fmtW(f.S) + '</td><td class="num">' + fmtW(f.sigma) + '</td><td class="num">' + (f.hPct == null ? t("common.none") : f.hPct.toFixed(1) + "%") + '</td><td class="num">' + fmtW(f.T) + '</td><td class="num">' + fmtW(f.requestsAfter ?? 0) + '</td><td class="num">' + fmtW(credit) + "</td>" + (d.rates ? '<td class="num">' + fmtUsd((credit * d.rates.r) / 1e6) + "</td>" : "") + "</tr>";
+};
+            parts.push('<div class="fold-scroll"><table class="data fold-table"><thead>' + foldHead + '</thead><tbody>');
             folds.forEach((f, i) => parts.push(foldRow(f, i)));
             parts.push("</tbody></table></div>");
         }
@@ -2807,6 +3215,14 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         // #2904: no-ceiling output-budget pin — surface at the top of the detail
         // so GUI users see WHY long turns truncate (the /acp twin).
         if (d.outputBudgetDegraded) parts.push('<div class="banner warn show" style="margin-bottom:12px">' + escapeHtml(t("det.obudget_degraded", { model: d.outputBudgetDegraded.model, value: d.outputBudgetDegraded.value })) + "</div>");
+        if (d.contextAnalysis && d.contextAnalysis.text) {
+            // Context analysis: init size / nudge cadence / harvest acceptance /
+            // plain-language verdict — the question that used to take hours of
+            // manual log forensics (session-aedc188c investigation, 2026-11-08).
+            const ca = d.contextAnalysis;
+            const lines = ca.text.split("\\n").map((l) => "<div>" + escapeHtml(l) + "</div>");
+            parts.push('<div class="card" style="margin-top:16px"><div class="card-h"><span>' + t("det.context_analysis") + '</span><span class="hint">' + t("det.context_analysis_hint") + '</span></div><div class="card-b"><div class="mono small" style="line-height:1.8">' + lines.join("") + '</div></div></div>');
+        }
         if (Array.isArray(d.conflicts) && d.conflicts.length > 0) {
             // #2102: per-session evidence rows — the banner aggregates across sessions,
             // so this page is where its detail pointer lands.
@@ -2854,7 +3270,6 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             bindBlockContentActions(d);
             bindTreeModeActions();
             bindDetTabs();
-            bindTreeMap();
             bindCacheReportActions(d);
             bindSessionReportActions(d);
             bindTrajectoryBrush(d);
@@ -3067,6 +3482,26 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
     // #3917: lazy raw-content loader per block — the tree ships summary + numbers
     // only; the conversation bytes behind a block come on demand. "one" is what
     // decompress(block) hands back, "full" is the whole covered span.
+    // A summary clamp can only be measured once its card has layout —
+    // side panels get checked on selection, classic list rows on first
+    // expand. If the five-line clamp cut nothing, it is removed outright.
+    function fixSumClamp(pn) {
+        const body = pn.querySelector(":scope > .body.md");
+        if (!body || body.__sumChk) return;
+        body.__sumChk = 1;
+        let sum = null, btn = null;
+        for (let i = 0; i < body.children.length; i++) {
+            const c = body.children[i];
+            if (c.classList.contains("blk-sum")) sum = c;
+            if (c.classList.contains("blk-sum-toggle")) btn = c;
+        }
+        if (!sum || !btn) return;
+        if (sum.scrollHeight <= sum.clientHeight + 2) { sum.classList.remove("clamp"); btn.remove(); return; }
+        btn.addEventListener("click", function () {
+            const clamped = sum.classList.toggle("clamp");
+            btn.textContent = clamped ? t("det.tree_sum_more") : t("det.tree_sum_less");
+        });
+    }
     function bindBlockContentActions(d) {
         document.querySelectorAll(".blk-content-btn").forEach((btn) => {
             btn.addEventListener("click", async (ev) => {
@@ -3074,7 +3509,12 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
                 ev.stopPropagation();
                 const bid = btn.getAttribute("data-bid") || "";
                 const view = btn.getAttribute("data-view") === "full" ? "full" : "one";
-                const box = $("blk-content-" + bid);
+                // #4608: classic list rows and the side panels share the
+                // .blk-content class, so resolve the target box inside the
+                // button's own card — getElementById would grab whichever
+                // card happens to come first.
+                const hostEl = btn.closest(".bd-panel") || btn.closest(".block-item");
+                const box = hostEl ? hostEl.querySelector(":scope > .blk-content") : null;
                 if (!box) return;
                 // #4173 review: pressing the same button again collapses the
                 // raw view (it used to be one-way, so users were stuck).
@@ -3125,123 +3565,127 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
                 }
             });
         });
-        // #4173 review: measure each clamped summary when its row first opens —
-        // a closed <details> has no layout, so the cut-or-not verdict can only
-        // happen here; rows the clamp never shortened lose their button.
-        document.querySelectorAll(".block-node").forEach(function (det) {
-            det.addEventListener("toggle", function () {
-                if (!det.open) return;
-                const body = det.querySelector(":scope > .body.md");
-                if (!body || body.__sumChk) return;
-                body.__sumChk = 1;
-                let sum = null, btn = null;
-                for (let i = 0; i < body.children.length; i++) {
-                    const c = body.children[i];
-                    if (c.classList.contains("blk-sum")) sum = c;
-                    if (c.classList.contains("blk-sum-toggle")) btn = c;
-                }
-                if (!sum || !btn) return;
-                if (sum.scrollHeight <= sum.clientHeight + 2) { sum.classList.remove("clamp"); btn.remove(); return; }
-                btn.addEventListener("click", function () {
-                    const clamped = sum.classList.toggle("clamp");
-                    btn.textContent = clamped ? t("det.tree_sum_more") : t("det.tree_sum_less");
-                });
-            });
+        // #4173 review: classic list rows start collapsed — measure each
+        // row's clamp once on first expand (panels get the same treatment
+        // on selection).
+        document.querySelectorAll("#tree-list .block-node").forEach((row) => {
+            row.addEventListener("toggle", () => { if (row.open) fixSumClamp(row); });
         });
     }
-    // #3917: the compression pane carries two readings of the same data — the
-    // list (read concrete messages) and the graph (read the overall shape).
-    // Clicking a graph node jumps back to that block's expanded row in the list.
+    // #4608: master-detail pane binder — the left frame shows the
+    // collapsible tree (default) or the classic folded-block list; in tree
+    // mode the right side is the selected block's panel. Click selects;
+    // chips (+N/−) expand or collapse a branch; Esc collapses back to the
+    // roots. All hits are point-tested because the poller may have swapped
+    // innerHTML under a pressed finger (same trick as the #4173 live map).
+    let treeViewState = null;
+    let treeViewRender = null;
     function bindTreeModeActions() {
-        const list = $("tree-list");
-        const graph = $("tree-graph");
-        if (!list || !graph) return;
+        const graphView = $("tree-graph");
+        const listView = $("tree-list");
+        if (!graphView || !listView) return;
+        const blocks = window.__biliDetailBlocks || [];
         const btns = Array.prototype.slice.call(document.querySelectorAll(".tree-mode"));
-        const setMode = function (mode) {
-            const g = mode === "graph";
-            // #4173 review: graph mode STACKS the live map above the full
-            // block list (总揽全局 + 看细节 in one screen); list mode just
-            // hides the drawing. The list is never hidden anymore — it used
-            // to be, which read as "all the per-block details were lost".
-            list.hidden = false;
-            graph.hidden = !g;
-            // #4173 review: Fit only makes sense while the tree drawing is visible.
-            const fit = $("tm-fit");
-            if (fit) fit.hidden = !g;
-            btns.forEach(function (b) { b.classList.toggle("active", b.getAttribute("data-mode") === mode); });
-        };
-        btns.forEach(function (b) {
-            b.addEventListener("click", function (ev) {
-                ev.preventDefault();
-                setMode(b.getAttribute("data-mode") === "graph" ? "graph" : "list");
+        const expBtn = $("tm-expand-all");
+        const colBtn = $("tm-collapse-all");
+        const gridEl = graphView.closest(".fd-grid");
+        const sideEl = gridEl ? gridEl.querySelector(".fd-side") : null;
+        const hintEl = $("tree-hint");
+        let mode = "tree";
+        try { mode = sessionStorage.getItem("bili-tree-mode") === "list" ? "list" : "tree"; } catch (e) {}
+        const st = { mode: mode, selected: "", expanded: {} };
+        treeViewState = st;
+        function renderTree() {
+            const inner = graphView.querySelector(".tm-inner");
+            if (inner) inner.innerHTML = renderCollapSvg(blocks, st.expanded, st.selected).html;
+        }
+        treeViewRender = renderTree;
+        function select(bid) {
+            st.selected = bid;
+            document.querySelectorAll("#tree-graph [data-bid]").forEach(function (el) {
+                el.classList.toggle("fsel", el.getAttribute("data-bid") === bid);
             });
-        });
-        // #4173 review: default to the live map stacked over the list.
-        setMode("graph");
-    }
-    // #4173: the in-pane live tree panorama. The drawing renders at NATURAL
-    // size (a block box is always 118x36 px, labels readable) inside a
-    // natively scrollable viewport — pathological trees (very wide OR very
-    // tall) stay legible instead of meeting into smears. All interaction
-    // binds on the stable #tree-graph container (event delegation) because the
-    // 5s poller swaps its innerHTML. The map flows WITH the page (a plain
-    // wheel scrolls the document over it); Ctrl/⌘-wheel or trackpad pinch
-    // zooms around the cursor by resizing .tm-inner, #tm-fit shrinks the whole
-    // tree into the current viewport, double-click restores natural size, and
-    // a plain click on a node jumps to that block's row in the list below.
-    // Zoom state (view.__vm) survives re-renders.
-    function bindTreeMap() {
-        const view = $("tree-graph");
-        if (!view) return;
-        const fb = $("tm-fit");
-        if (fb) fb.addEventListener("click", function () { treeMapFit(view); });
-        view.addEventListener("dblclick", function () { view.__vm = null; treeMapApply(view); });
-        view.addEventListener("wheel", function (e) {
-            if (!e.ctrlKey) return; // a plain wheel keeps scrolling the page
-            e.preventDefault();
-            const inner = view.querySelector(".tm-inner");
-            if (!inner) return;
-            const old = view.__vm ? view.__vm.k : 1;
-            const k2 = Math.max(0.02, Math.min(8, old * Math.exp(-e.deltaY * 0.0015)));
-            if (k2 === old) return;
-            const r0 = inner.getBoundingClientRect();
-            const px = (e.clientX - r0.left) / old;
-            const py = (e.clientY - r0.top) / old;
-            view.__vm = { k: k2 };
-            treeMapApply(view);
-            const r1 = inner.getBoundingClientRect();
-            // hold the world point under the cursor still while the page reflows
-            window.scrollBy((r1.left + px * k2) - (r0.left + px * old), (r1.top + py * k2) - (r0.top + py * old));
-        }, { passive: false });
-        let downAt = null;
-        view.addEventListener("pointerdown", function (e) {
-            if (e.button !== 0) return;
-            downAt = { x: e.clientX, y: e.clientY };
-        });
-        view.addEventListener("pointerup", function (e) {
-            if (!downAt) return;
-            const moved = Math.abs(e.clientX - downAt.x) > 3 || Math.abs(e.clientY - downAt.y) > 3;
-            downAt = null;
-            if (moved) return;
-            // The page can scroll under a pressed finger, so the node under
-            // the pointer has to be hit-tested by point rather than target.
+            let found = null;
+            document.querySelectorAll("#bd-panels .bd-panel").forEach(function (pn) {
+                const on = pn.getAttribute("data-bid") === bid;
+                pn.hidden = !on;
+                if (on) found = pn;
+            });
+            const empty = $("bd-empty");
+            if (empty) {
+                empty.style.display = found ? "none" : "";
+                if (!found) empty.textContent = bid ? t("det.block_side_live") : t("det.block_side_hint");
+            }
+            if (found) fixSumClamp(found);
+        }
+        function hitEl(e) {
             let el = e.target;
-            try { el = document.elementFromPoint(e.clientX, e.clientY) || e.target; } catch (err) {}
-            const n = el && el.closest ? el.closest("[data-bid]") : null;
-            if (!n) return;
-            const bid = n.getAttribute("data-bid");
-            const row = document.querySelector('.block-node[data-bid="' + bid + '"]');
-            if (!row) return;
-            row.open = true;
-            row.classList.add("flash");
-            // #4173 review: land at the TOP of the block — long rows used to
-            // scroll to their middle and looked lost.
-            row.scrollIntoView({ block: "start", behavior: "smooth" });
-            setTimeout(function () { row.classList.remove("flash"); }, 1600);
+            try { el = document.elementFromPoint(e.clientX, e.clientY) || el; } catch (err) {}
+            return el;
+        }
+        function setMode(m) {
+            st.mode = m;
+            try { sessionStorage.setItem("bili-tree-mode", m); } catch (e) {}
+            graphView.hidden = m !== "tree";
+            listView.hidden = m !== "list";
+            if (expBtn) expBtn.hidden = m !== "tree";
+            if (colBtn) colBtn.hidden = m !== "tree";
+            if (gridEl) gridEl.classList.toggle("list-mode", m === "list");
+            if (sideEl) sideEl.hidden = m !== "tree";
+            if (hintEl) hintEl.textContent = m === "tree" ? t("det.tree_interact") : t("det.tree_list_hint");
+            btns.forEach(function (b) { b.classList.toggle("active", b.getAttribute("data-mode") === m); });
+        }
+        btns.forEach(function (b) {
+            b.addEventListener("click", function (ev) { ev.preventDefault(); setMode(b.getAttribute("data-mode") === "list" ? "list" : "tree"); });
         });
-        view.addEventListener("pointercancel", function () { downAt = null; });
+        if (expBtn) expBtn.addEventListener("click", function () {
+            blocks.forEach(function (b) { st.expanded[b.blockId] = true; });
+            renderTree();
+        });
+        if (colBtn) colBtn.addEventListener("click", function () { st.expanded = {}; renderTree(); });
+        const pressAt = { on: false, x: 0, y: 0 };
+        function down(e) { if (e.button !== 0) return; pressAt.on = true; pressAt.x = e.clientX; pressAt.y = e.clientY; }
+        function up(e) {
+            if (!pressAt.on) return null;
+            const moved = Math.abs(e.clientX - pressAt.x) > 3 || Math.abs(e.clientY - pressAt.y) > 3;
+            pressAt.on = false;
+            if (moved || e.button !== 0) return null;
+            return hitEl(e);
+        }
+        graphView.addEventListener("pointerdown", down);
+        graphView.addEventListener("pointercancel", function () { pressAt.on = false; });
+        graphView.addEventListener("pointerup", function (e) {
+            const el = up(e);
+            if (!el) return;
+            const chip = el.closest ? el.closest("[data-toggle]") : null;
+            if (chip) {
+                const bid = chip.getAttribute("data-toggle");
+                if (st.expanded[bid]) delete st.expanded[bid]; else st.expanded[bid] = true;
+                renderTree();
+                return;
+            }
+            const n = el.closest ? el.closest("[data-bid]") : null;
+            if (n) select(n.getAttribute("data-bid"));
+        });
+        // One global Esc listener per page life: collapse the tree back to
+        // its roots (only while the tree is the visible reading). The view
+        // and renderer resolve at keypress time, so a re-rendered detail
+        // pane (hash navigation) stays reachable instead of closing over
+        // the first pane's detached nodes.
+        if (!window.__biliTreeEscBound) {
+            window.__biliTreeEscBound = true;
+            window.addEventListener("keydown", function (e) {
+                const gv = $("tree-graph");
+                if (e.key !== "Escape" || !treeViewState || !gv || gv.hidden) return;
+                treeViewState.expanded = {};
+                if (treeViewRender) treeViewRender();
+            });
+        }
+        renderTree();
+        setMode(mode);
     }
-    function bindCacheReportActions(d) {
+
+        function bindCacheReportActions(d) {
         const copyB = $("cacherpt-copy");
         const dlB = $("cacherpt-dl");
         if (!copyB || !dlB) return;
@@ -3349,7 +3793,11 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
 
     async function loadConfig() {
         try {
-            const cfg = await json(API_ROOT + "/config");
+                        const cfg = await json(API_ROOT + "/config");
+            // #5319/#5328: refresh the resolved pack inventory (+ per-name
+            // source + user-pack dir) so the picker and the editor stay in
+            // sync with what is actually on disk.
+            refreshPackInventory();
             const cfgPathEl = $("cfg-path");
             if (cfgPathEl) cfgPathEl.textContent = cfg.path || t("common.empty");
             const fileBtn = $("copy-cfg-file");
@@ -3382,7 +3830,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             hydrateSummaryConfig(cfg);
             refreshDirtyFlag();
             const broken = Boolean(cfg.parseError);
-            ["cfg-file-edit", "save-file", "save-upstream", "save-quick", "save-summary"].forEach((id) => { const el = $(id); if (el) el.disabled = broken; });
+            ["cfg-file-edit", "save-file", "save-upstream", "save-quick", "save-summary", "save-pricing"].forEach((id) => { const el = $(id); if (el) el.disabled = broken; });
             const ptState = $("pt-state");
             const ptSource = $("pt-source");
             const clearPt = $("clear-passthrough");
@@ -3401,8 +3849,54 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             }
             loadUpstream(cfg);
             void loadResign();
+            void loadPricing();
         } catch (e) {
             toast(t("toast.failed", { msg: e.message }), "err");
+        }
+    }
+    // #4899: per-model billing price editor — GET /__bili/pricing renders one
+    // row per model the panel has seen (plus existing override keys); the
+    // models.dev registry defaults prefill the placeholders; Save PUTs
+    // {billing:{prices}} through the structured config section (hot-applied).
+    let pricingModels = [];
+    function priceBadge(m) {
+        if (m.override) return '<span class="badge ok">' + t("cfg.pricing_src_config") + "</span>";
+        if (m.price) return '<span class="badge disk">' + t("cfg.pricing_src_registry") + "</span>";
+        return '<span class="badge warn">' + t("cfg.pricing_src_none") + "</span>";
+    }
+    function priceInput(m, f, label) {
+        const ov = m.override && m.override[f] != null ? m.override[f] : "";
+        const def = m.price && m.price[f] != null ? m.price[f] : "";
+        return '<label style="flex:1;min-width:110px"><span class="dim small">' + label + '</span>'
+            + '<input class="field-input mono" data-f="' + f + '" value="' + ov + '" placeholder="' + (def !== "" ? def : "—")
+            + '" inputmode="decimal" spellcheck="false"></label>';
+    }
+    function renderPricing() {
+        const host = $("pricing-fields");
+        if (!host) return;
+        if (!pricingModels.length) { host.innerHTML = '<span class="dim small">' + t("cfg.pricing_empty") + "</span>"; return; }
+        host.innerHTML = pricingModels.map((m) =>
+            '<div class="price-row" data-model="' + escapeHtml(m.model) + '" style="display:flex;flex-direction:column;gap:6px;padding:10px 0;border-bottom:1px solid var(--border,#e1e4e8)">'
+            + '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><span class="mono small">' + escapeHtml(m.model) + "</span>" + priceBadge(m)
+            + '<button class="btn sm" data-del="1" title="' + escapeHtml(t("cfg.pricing_del")) + '">✕</button></div>'
+            + '<div style="display:flex;gap:8px;flex-wrap:wrap">'
+            + priceInput(m, "input", t("cfg.pricing_input"))
+            + priceInput(m, "output", t("cfg.pricing_output"))
+            + priceInput(m, "cacheRead", t("cfg.pricing_cacheread"))
+            + priceInput(m, "cacheWrite", t("cfg.pricing_cachewrite"))
+            + "</div></div>").join("");
+        const note = host.parentElement ? host.parentElement.querySelector(".cfg-dirty-note") : null;
+        if (note) note.hidden = true;
+    }
+    async function loadPricing() {
+        const host = $("pricing-fields");
+        if (!host) return;
+        try {
+            const data = await json(API_ROOT + "/pricing");
+            pricingModels = Array.isArray(data.models) ? data.models : [];
+            renderPricing();
+        } catch (e) {
+            host.innerHTML = '<span class="dim small">' + escapeHtml(t("toast.failed", { msg: e.message })) + "</span>";
         }
     }
     // #2090 plan A: read-only "Signed upstreams" card — every known/observed
@@ -3506,11 +4000,15 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             dbg.inp.checked = draft.debug === true;
             ptRow.inp.checked = draft.passthrough === true;
             imgRow.inp.checked = draft.imageRescale !== false;
+            tsRow.inp.checked = cp ? cp.messageTimestamps !== false : true;
             const ab = (cp && cp.absorb && typeof cp.absorb === "object" && !Array.isArray(cp.absorb)) ? cp.absorb : null;
             abRow.inp.checked = ab ? ab.enabled === true : false;
+            cafRow.inp.checked = cp ? cp.compressAtFoldPoint === true : false;
+            rnRow.inp.checked = cp ? cp.requireNudge === true : false;
+            rrRow.inp.checked = cp ? cp.requireRecommendation === true : false;
             const pv = (cp && typeof cp.promptPack === "string") ? cp.promptPack : "default";
             while (packSel.options.length > 0) packSel.removeChild(packSel.lastChild);
-            ["default", "lean"].forEach((name) => {
+            (packNames.length ? packNames : ["default", "lean"]).forEach((name) => {
                 const o = document.createElement("option");
                 o.value = name;
                 o.textContent = name;
@@ -3524,6 +4022,41 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             }
             packSel.value = pv;
             updatePackNote();
+            const pcv = (draft.promptCache && typeof draft.promptCache === "object" && !Array.isArray(draft.promptCache) && typeof draft.promptCache.routing === "string") ? draft.promptCache.routing : "disabled";
+            while (pckSel.options.length > 0) pckSel.removeChild(pckSel.lastChild);
+            PCK_VALUES.forEach((name) => {
+                const o = document.createElement("option");
+                o.value = name;
+                o.textContent = name;
+                pckSel.appendChild(o);
+            });
+            if (!PCK_VALUES.includes(pcv)) {
+                const o = document.createElement("option");
+                o.value = pcv;
+                o.textContent = pcv + " *";
+                pckSel.appendChild(o);
+            }
+            pckSel.value = pcv;
+            updatePckNote();
+            const wf = draft.rollout && typeof draft.rollout === "object" && !Array.isArray(draft.rollout) && draft.rollout.features && typeof draft.rollout.features === "object" && !Array.isArray(draft.rollout.features) ? draft.rollout.features.pluginFullResendWatermark : undefined;
+            let wmv = "default";
+            if (wf === true) wmv = "on"; else if (wf === false) wmv = "off";
+            while (wmSel.options.length > 0) wmSel.removeChild(wmSel.lastChild);
+            WM_VALUES.forEach((name) => {
+                const o = document.createElement("option");
+                o.value = name;
+                o.textContent = name;
+                wmSel.appendChild(o);
+            });
+            if (wf !== undefined && !WM_VALUES.includes(wmv)) {
+                const o = document.createElement("option");
+                o.value = String(wf);
+                o.textContent = String(wf) + " *";
+                wmSel.appendChild(o);
+                wmv = String(wf);
+            }
+            wmSel.value = wmv;
+            updateWmNote();
             nudge.value = String(cp && typeof cp.nudgeGrowthTokens === "number" ? cp.nudgeGrowthTokens : NUDGE_DEFAULT);
             updateNudgeNote();
             refreshTierInputs();
@@ -3636,9 +4169,86 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         abHint.className = "dim small";
         abHint.textContent = t("cfg.q_absorb_hint");
         abRow.ctl.appendChild(abHint);
+        // #5683: unprompted/out-of-bounds compression gates (compress.* booleans).
+        const rnRow = row("quick-require-nudge", t("cfg.q_require_nudge"));
+        qCtrls.push(rnRow.inp);
+        rnRow.inp.addEventListener("change", () => commit((d) => {
+            if (rnRow.inp.checked) {
+                if (!compressOf(d)) d.compress = {};
+                d.compress.requireNudge = true;
+            } else {
+                const c = compressOf(d);
+                if (c) {
+                    delete c.requireNudge;
+                    if (Object.keys(c).length === 0) delete d.compress;
+                }
+            }
+        }));
+        const rnHint = document.createElement("span");
+        rnHint.className = "dim small";
+        rnHint.textContent = t("cfg.q_require_nudge_hint");
+        rnRow.ctl.appendChild(rnHint);
+        const rrRow = row("quick-require-rec", t("cfg.q_require_rec"));
+        qCtrls.push(rrRow.inp);
+        rrRow.inp.addEventListener("change", () => commit((d) => {
+            if (rrRow.inp.checked) {
+                if (!compressOf(d)) d.compress = {};
+                d.compress.requireRecommendation = true;
+            } else {
+                const c = compressOf(d);
+                if (c) {
+                    delete c.requireRecommendation;
+                    if (Object.keys(c).length === 0) delete d.compress;
+                }
+            }
+        }));
+        const rrHint = document.createElement("span");
+        rrHint.className = "dim small";
+        rrHint.textContent = t("cfg.q_require_rec_hint");
+        rrRow.ctl.appendChild(rrHint);
         const packSel = document.createElement("select");
         packSel.className = "field-input mono";
         qCtrls.push(packSel);
+        // #4313 display gate — default ON since the leak-audit follow-up;
+        // unchecking writes an EXPLICIT false (deleting the key would
+        // silently resolve back to on). Sits ABOVE the prompt-pack row.
+        const tsRow = row("quick-message-ts", t("cfg.q_message_ts"));
+        qCtrls.push(tsRow.inp);
+        tsRow.inp.addEventListener("change", () => commit((d) => {
+            const c = compressOf(d);
+            if (tsRow.inp.checked) {
+                if (!c) return;
+                delete c.messageTimestamps;
+                // never leave a phantom empty container: an uncheck→recheck
+                // cycle must round-trip byte-identical to the saved config,
+                // or the dirty flag lints forever on a no-op
+                if (Object.keys(c).length === 0) delete d.compress;
+            } else {
+                if (typeof c !== "object" || c === null || Array.isArray(c)) d.compress = {};
+                d.compress.messageTimestamps = false;
+            }
+        }));
+        void tsRow.ctl;
+        // #5470 fold-point carrier relocation — default OFF (opt-in); uncheck
+        // deletes the key so the file stays clean (mirrors the absorb row).
+        const cafRow = row("quick-compress-at-fold-point", t("cfg.q_cafp"));
+        qCtrls.push(cafRow.inp);
+        cafRow.inp.addEventListener("change", () => commit((d) => {
+            if (cafRow.inp.checked) {
+                if (!compressOf(d)) d.compress = {};
+                d.compress.compressAtFoldPoint = true;
+            } else {
+                const c = compressOf(d);
+                if (c) {
+                    delete c.compressAtFoldPoint;
+                    if (Object.keys(c).length === 0) delete d.compress;
+                }
+            }
+        }));
+        const cafHint = document.createElement("span");
+        cafHint.className = "dim small";
+        cafHint.textContent = t("cfg.q_cafp_hint");
+        cafRow.ctl.appendChild(cafHint);
         const pw = document.createElement("div");
         pw.style.cssText = "display:flex;gap:12px;align-items:center;flex-wrap:wrap";
         const plab = document.createElement("label");
@@ -3647,18 +4257,441 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         plab.textContent = t("cfg.q_pack");
         pw.appendChild(plab);
         pw.appendChild(packSel);
+        packSelEl = packSel;
+        rerenderQuick = () => syncAll();
         box.appendChild(pw);
         const packNote = document.createElement("div");
         packNote.style.cssText = "margin:-6px 0 4px;font-size:12px;color:#57606a";
         function updatePackNote() {
             if (packSel.value === "lean") packNote.textContent = t("cfg.q_pack_lean_desc");
             else if (packSel.value === "default") packNote.textContent = t("cfg.q_pack_default_desc");
+            else if (packSel.value === "chat") packNote.textContent = t("cfg.q_pack_chat_desc");
             else packNote.textContent = t("cfg.q_pack_custom");
         }
         box.appendChild(packNote);
+        // #5328: user-dir pack management — 新建/编辑/删除 under the dir the
+        // server reported via GET /__bili/packs (userDir). Builtin/shipped
+        // packs are read-only here; guidance says "override with a same-named
+        // file" instead of pretending they can be edited in place.
+        const pmRow = document.createElement("div");
+        pmRow.style.cssText = "margin:4px 0 2px;display:flex;gap:8px;align-items:center;flex-wrap:wrap";
+        const pmName = document.createElement("input");
+        pmName.type = "text";
+        pmName.className = "field-input mono";
+        pmName.placeholder = t("cfg.q_pack_name_ph");
+        pmName.style.cssText = "width:200px";
+        const pmNew = document.createElement("button");
+        pmNew.className = "btn sm";
+        pmNew.textContent = t("cfg.q_pack_new");
+        const pmEdit = document.createElement("button");
+        pmEdit.className = "btn sm";
+        pmEdit.textContent = t("cfg.q_pack_edit");
+        const pmDel = document.createElement("button");
+        pmDel.className = "btn sm";
+        pmDel.textContent = t("cfg.q_pack_del");
+        const pmStatus = document.createElement("span");
+        pmStatus.style.cssText = "flex-basis:100%;font-size:12px;color:#57606a";
+        pmRow.append(pmName, pmNew, pmEdit, pmDel, pmStatus);
+        const peBox = document.createElement("div");
+        peBox.hidden = true;
+        peBox.style.cssText = "margin:4px 0";
+        // #5344: the editor is a three-tab panel (guided form / AI assist /
+        // raw JSON); the bare-JSON box below becomes the third tab.
+        // WEB_CLIENT embedding rules: no backtick literals; runtime \n
+        // escapes are written \\n in this source file.
+        const peTabs = document.createElement("div");
+        peTabs.style.cssText = "display:flex;gap:8px;margin-bottom:6px";
+        const PE_TAB_DEFS = [
+            { key: "form", label: t("cfg.q_pack_tab_form") },
+            { key: "ai", label: t("cfg.q_pack_tab_ai") },
+            { key: "json", label: t("cfg.q_pack_tab_json") },
+        ];
+        const peTabBtns = {};
+        for (const def of PE_TAB_DEFS) {
+            const btn = document.createElement("button");
+            btn.type = "button";
+            btn.className = "btn sm";
+            btn.textContent = def.label;
+            btn.style.borderBottom = "2px solid transparent";
+            (function (key) { btn.addEventListener("click", () => showPeTab(key)); })(def.key);
+            peTabBtns[def.key] = btn;
+            peTabs.appendChild(btn);
+        }
+        function showPeTab(key) {
+            for (const def of PE_TAB_DEFS) {
+                const btn = peTabBtns[def.key];
+                btn.style.fontWeight = def.key === key ? "700" : "400";
+                btn.style.borderBottom = def.key === key ? "2px solid #0969da" : "2px solid transparent";
+            }
+            peFormPane.hidden = key !== "form";
+            peAiPane.hidden = key !== "ai";
+            peJsonPane.hidden = key !== "json";
+        }
+        const peTa = document.createElement("textarea");
+        peTa.className = "editor mono codebox";
+        peTa.spellcheck = false;
+        peTa.rows = 10;
+        peTa.placeholder = '{\\n  "promptSections": {\\n    "philosophy": "…"\\n  }\\n}';
+        const peBtns = document.createElement("div");
+        peBtns.style.cssText = "margin-top:6px;display:flex;gap:8px";
+        const peSave = document.createElement("button");
+        peSave.className = "btn sm";
+        peSave.textContent = t("cfg.q_pack_save");
+        const peCancel = document.createElement("button");
+        peCancel.className = "btn sm";
+        peCancel.textContent = t("cfg.q_pack_cancel");
+        peBtns.append(peSave, peCancel);
+        // #5344 tab 1: guided form — start from a base text, tweak, save.
+        const peFormPane = document.createElement("div");
+        const peAiPane = document.createElement("div");
+        const peJsonPane = document.createElement("div");
+        peFormPane.hidden = false;
+        peAiPane.hidden = true;
+        peJsonPane.hidden = true;
+        peJsonPane.append(peTa, peBtns);
+        const baseRow = document.createElement("div");
+        baseRow.style.cssText = "display:flex;gap:8px;align-items:center;margin:2px 0 8px;flex-wrap:wrap";
+        const baseLab = document.createElement("label");
+        baseLab.htmlFor = "pack-base-sel";
+        baseLab.textContent = t("cfg.q_pack_base_label");
+        baseLab.style.cssText = "font-size:12px;color:#57606a";
+        const baseSel = document.createElement("select");
+        baseSel.id = "pack-base-sel";
+        baseSel.className = "field-input";
+        // #5345 follow-up: keep labels as literal t("…") calls — the #1024
+        // dead-key guard only counts string-literal arguments, so the old
+        // array + variable-lookup shape hid all four keys (CI red on master).
+        [["", t("cfg.q_pack_base_blank")], ["default", t("cfg.q_pack_base_default")], ["chat", t("cfg.q_pack_base_chat")], ["lean", t("cfg.q_pack_base_lean")]].forEach(([value, label]) => {
+            const opt = document.createElement("option");
+            opt.value = value;
+            opt.textContent = label;
+            baseSel.appendChild(opt);
+        });
+        const btnBaseLoad = document.createElement("button");
+        btnBaseLoad.type = "button";
+        btnBaseLoad.className = "btn sm";
+        btnBaseLoad.textContent = t("cfg.q_pack_base_load");
+        baseRow.append(baseLab, baseSel, btnBaseLoad);
+        const descWrap = document.createElement("div");
+        descWrap.style.cssText = "margin:8px 0";
+        const descLab = document.createElement("div");
+        descLab.textContent = t("cfg.q_pack_desc");
+        descLab.style.cssText = "font-size:13px;font-weight:600;margin-bottom:2px";
+        const descIn = document.createElement("input");
+        descIn.type = "text";
+        descIn.className = "field-input";
+        descIn.placeholder = t("cfg.q_pack_desc_ph");
+        descIn.style.cssText = "width:100%;box-sizing:border-box";
+        descWrap.append(descLab, descIn);
+        function packSectionField(label, helpText, rows) {
+            const wrap = document.createElement("div");
+            wrap.style.cssText = "margin:8px 0";
+            const lab = document.createElement("div");
+            lab.textContent = label;
+            lab.style.cssText = "font-size:13px;font-weight:600;margin-bottom:2px";
+            const help = document.createElement("div");
+            help.textContent = helpText;
+            help.style.cssText = "font-size:12px;color:#57606a;margin-bottom:4px";
+            const ta = document.createElement("textarea");
+            ta.className = "field-input mono";
+            ta.spellcheck = false;
+            ta.rows = rows;
+            ta.style.cssText = "width:100%;box-sizing:border-box";
+            wrap.append(lab, help, ta);
+            return { wrap, ta };
+        }
+        const phF = packSectionField(t("cfg.q_pack_phil"), t("cfg.q_pack_phil_help"), 5);
+        const hcF = packSectionField(t("cfg.q_pack_hc"), t("cfg.q_pack_hc_help"), 8);
+        const taPh = phF.ta;
+        const taHc = hcF.ta;
+        const formHint = document.createElement("div");
+        formHint.textContent = t("cfg.q_pack_form_hint");
+        formHint.style.cssText = "font-size:12px;color:#57606a;margin:8px 0";
+        const btnFormSave = document.createElement("button");
+        btnFormSave.type = "button";
+        btnFormSave.className = "btn sm";
+        btnFormSave.textContent = t("cfg.q_pack_form_save");
+        peFormPane.append(baseRow, descWrap, phF.wrap, hcF.wrap, formHint, btnFormSave);
+        // #5344 tab 2: AI assist — plain-language need -> self-contained
+        // prompt -> copy to any LLM -> paste its JSON back -> fills the form.
+        const aiNeedLab = document.createElement("div");
+        aiNeedLab.textContent = t("cfg.q_pack_ai_need");
+        aiNeedLab.style.cssText = "font-size:13px;font-weight:600;margin:2px 0";
+        const aiNeed = document.createElement("textarea");
+        aiNeed.className = "field-input";
+        aiNeed.rows = 3;
+        aiNeed.placeholder = t("cfg.q_pack_ai_need_ph");
+        aiNeed.style.cssText = "width:100%;box-sizing:border-box";
+        const aiBtnRow = document.createElement("div");
+        aiBtnRow.style.cssText = "display:flex;gap:8px;margin:6px 0";
+        const btnAiGen = document.createElement("button");
+        btnAiGen.type = "button";
+        btnAiGen.className = "btn sm";
+        btnAiGen.textContent = t("cfg.q_pack_ai_gen");
+        const btnAiCopy = document.createElement("button");
+        btnAiCopy.type = "button";
+        btnAiCopy.className = "btn sm";
+        btnAiCopy.textContent = t("cfg.q_pack_ai_copy");
+        aiBtnRow.append(btnAiGen, btnAiCopy);
+        const aiOut = document.createElement("textarea");
+        aiOut.className = "editor mono codebox";
+        aiOut.readOnly = true;
+        aiOut.rows = 8;
+        aiOut.spellcheck = false;
+        aiOut.style.cssText = "width:100%;box-sizing:border-box";
+        const aiHint = document.createElement("div");
+        aiHint.textContent = t("cfg.q_pack_ai_hint");
+        aiHint.style.cssText = "font-size:12px;color:#57606a;margin:8px 0 2px";
+        const aiIn = document.createElement("textarea");
+        aiIn.className = "editor mono codebox";
+        aiIn.rows = 8;
+        aiIn.spellcheck = false;
+        aiIn.placeholder = '{"promptSections": {"philosophy": "..."}}';
+        aiIn.style.cssText = "width:100%;box-sizing:border-box";
+        const btnAiApply = document.createElement("button");
+        btnAiApply.type = "button";
+        btnAiApply.className = "btn sm";
+        btnAiApply.textContent = t("cfg.q_pack_ai_apply");
+        const aiApplyRow = document.createElement("div");
+        aiApplyRow.style.cssText = "display:flex;gap:8px;margin-top:6px";
+        aiApplyRow.append(btnAiApply);
+        peAiPane.append(aiNeedLab, aiNeed, aiBtnRow, aiOut, aiHint, aiIn, aiApplyRow);
+        async function loadBaseText() {
+            const baseName = baseSel.value;
+            if (!baseName) { descIn.value = ""; taPh.value = ""; taHc.value = ""; return; }
+            try {
+                const r = await json(API_ROOT + "/packs/templates");
+                const pk = r && r.packs ? r.packs[baseName] : null;
+                if (!pk) { pmSet(t("cfg.q_pack_json_obj"), true); return; }
+                descIn.value = typeof pk.description === "string" ? pk.description : "";
+                taPh.value = typeof pk.philosophy === "string" ? pk.philosophy : "";
+                taHc.value = typeof pk.howToCompress === "string" ? pk.howToCompress : "";
+                pmSet("");
+            } catch (e) { pmSet(String(e), true); }
+        }
+        btnBaseLoad.addEventListener("click", () => loadBaseText());
+        // Shared pack-name normalizer (WEB_CLIENT rule: charCode, no regex
+        // with backslashes) for both save paths.
+        function packNameForSave() {
+            const rawName = (editingNew ? pmName.value.trim() : editingPack);
+            const first = rawName.charCodeAt(0);
+            return (first === 47 || first === 92 ? rawName.slice(1) : rawName).trim();
+        }
+        btnFormSave.addEventListener("click", async () => {
+            const name = packNameForSave();
+            if (!name || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name) || name.indexOf("..") !== -1) { pmSet(t("cfg.q_pack_bad_name"), true); return; }
+            const phil = taPh.value.trim();
+            const hc = taHc.value.trim();
+            if (!phil && !hc) { pmSet(t("cfg.q_pack_form_empty"), true); return; }
+            const obj = { promptSections: {} };
+            if (phil) obj.promptSections.philosophy = phil;
+            if (hc) obj.promptSections.howToCompress = hc;
+            const desc = descIn.value.trim();
+            if (desc) obj.description = desc;
+            try {
+                await json(API_ROOT + "/packs/user/" + encodeURIComponent(name), {
+                    method: "PUT",
+                    headers: { "content-type": "application/json" },
+                    body: JSON.stringify({ json: JSON.stringify(obj, null, 2) }),
+                });
+                pmSet(t("cfg.q_pack_saved", { name }));
+                peBox.hidden = true;
+                editingPack = "";
+                editingNew = false;
+                refreshPackInventory();
+                commit((d) => { if (!compressOf(d)) d.compress = {}; d.compress.promptPack = name; });
+            } catch (e) { pmSet(String(e), true); }
+        });
+        btnAiGen.addEventListener("click", () => {
+            const need = aiNeed.value.trim();
+            if (!need) { pmSet(t("cfg.q_pack_ai_need_empty"), true); return; }
+            aiOut.value = [t("cfg.q_pack_ai_p1", { need }), t("cfg.q_pack_ai_p2"), t("cfg.q_pack_ai_p3")].join("\\n\\n");
+            pmSet(t("cfg.q_pack_ai_gen_ok"));
+        });
+        btnAiCopy.addEventListener("click", async () => {
+            try { await navigator.clipboard.writeText(aiOut.value); pmSet(t("cfg.q_pack_ai_copied")); }
+            catch (e) { pmSet(String(e), true); }
+        });
+        btnAiApply.addEventListener("click", () => {
+            // Tolerate markdown fences around the model's reply (build the
+            // fence from charCodes — no backtick literals here).
+            const FENCE = String.fromCharCode(96) + String.fromCharCode(96) + String.fromCharCode(96);
+            let text = (aiIn.value || "").trim();
+            const lines = text.split("\\n");
+            if (lines.length > 0 && lines[0].trim().indexOf(FENCE) === 0) lines.shift();
+            if (lines.length > 0 && lines[lines.length - 1].trim() === FENCE) lines.pop();
+            text = lines.join("\\n").trim();
+            let obj = null;
+            try { obj = JSON.parse(text); } catch (e) { pmSet(t("cfg.q_pack_bad_json", { err: String(e) }), true); return; }
+            if (!obj || typeof obj !== "object" || Array.isArray(obj)) { pmSet(t("cfg.q_pack_json_obj"), true); return; }
+            const ps = (obj.promptSections && typeof obj.promptSections === "object") ? obj.promptSections : {};
+            descIn.value = typeof obj.description === "string" ? obj.description : "";
+            taPh.value = typeof ps.philosophy === "string" ? ps.philosophy : "";
+            taHc.value = typeof ps.howToCompress === "string" ? ps.howToCompress : "";
+            const extra = Object.keys(obj).filter((k) => k !== "name" && k !== "version" && k !== "description" && k !== "promptSections");
+            Object.keys(ps).forEach((k) => { if (k !== "philosophy" && k !== "howToCompress") extra.push("promptSections." + k); });
+            peTa.value = JSON.stringify(obj, null, 2);
+            showPeTab("form");
+            pmSet(extra.length ? t("cfg.q_pack_ai_extra", { names: extra.join(", ") }) : t("cfg.q_pack_ai_apply_ok"));
+        });
+        peBox.append(peTabs, peFormPane, peAiPane, peJsonPane);
+        box.append(pmRow, peBox);
+        showPeTab("form");
+        let editingPack = "";   // "" = closed; otherwise the name being edited
+        let editingNew = false;
+        function pmSet(text, isError) {
+            pmStatus.textContent = text || "";
+            pmStatus.style.color = isError ? "#cf222e" : "#57606a";
+        }
+        function selectedIsUserPack(name) {
+            return packUserDir !== "" && String(packSources[name] || "").startsWith(packUserDir);
+        }
+        pmNew.addEventListener("click", () => {
+            editingPack = "";
+            editingNew = true;
+            pmName.value = "";
+            peTa.value = '{\\n  "promptSections": {\\n    "philosophy": ""\\n  }\\n}\\n';
+            baseSel.value = "";
+            descIn.value = "";
+            taPh.value = "";
+            taHc.value = "";
+            aiNeed.value = "";
+            aiOut.value = "";
+            aiIn.value = "";
+            peBox.hidden = false;
+            pmSet("");
+            showPeTab("form");
+        });
+        pmEdit.addEventListener("click", async () => {
+            const name = packSel.value;
+            if (!name || name === "default") { pmSet(t("cfg.q_pack_ro_default"), true); return; }
+            if (!selectedIsUserPack(name)) {
+                const src = String(packSources[name] || "");
+                pmSet(src.startsWith("file:") ? t("cfg.q_pack_ro_project") : t("cfg.q_pack_ro_builtin"), true);
+                return;
+            }
+            try {
+                const r = await json(API_ROOT + "/packs/user/" + encodeURIComponent(name));
+                peTa.value = r && typeof r.json === "string" && r.json ? r.json : "{}\\n";
+                let loadedObj = null;
+                try { loadedObj = peTa.value ? JSON.parse(peTa.value) : null; } catch (e) { loadedObj = null; }
+                const loadedPs = (loadedObj && loadedObj.promptSections && typeof loadedObj.promptSections === "object") ? loadedObj.promptSections : {};
+                descIn.value = (loadedObj && typeof loadedObj.description === "string") ? loadedObj.description : "";
+                taPh.value = (typeof loadedPs.philosophy === "string") ? loadedPs.philosophy : "";
+                taHc.value = (typeof loadedPs.howToCompress === "string") ? loadedPs.howToCompress : "";
+                editingPack = name;
+                editingNew = false;
+                pmName.value = name;
+                peBox.hidden = false;
+                pmSet("");
+                showPeTab("form");
+            } catch (e) { pmSet(String(e), true); }
+        });
+        pmDel.addEventListener("click", async () => {
+            const name = packSel.value;
+            if (!selectedIsUserPack(name)) { pmSet(t("cfg.q_pack_ro_del"), true); return; }
+            if (typeof confirm === "function" && !confirm(t("cfg.q_pack_confirm_del", { name }))) return;
+            try {
+                await json(API_ROOT + "/packs/user/" + encodeURIComponent(name), { method: "DELETE" });
+                pmSet(t("cfg.q_pack_deleted"));
+                refreshPackInventory();
+            } catch (e) { pmSet(String(e), true); }
+        });
+        peCancel.addEventListener("click", () => {
+            peBox.hidden = true;
+            editingPack = "";
+            editingNew = false;
+            pmSet("");
+        });
+        peSave.addEventListener("click", async () => {
+            const name = packNameForSave();
+            if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name) || name.includes("..")) { pmSet(t("cfg.q_pack_bad_name"), true); return; }
+            let parsed;
+            try { parsed = JSON.parse(peTa.value); } catch (e) { pmSet(t("cfg.q_pack_bad_json", { err: String(e) }), true); return; }
+            try {
+                await json(API_ROOT + "/packs/user/" + encodeURIComponent(name), {
+                    method: "PUT",
+                    headers: { "content-type": "application/json" },
+                    body: JSON.stringify({ json: JSON.stringify(parsed, null, 2) }),
+                });
+                pmSet(t("cfg.q_pack_saved", { name }));
+                peBox.hidden = true;
+                editingPack = "";
+                editingNew = false;
+                refreshPackInventory();
+                commit((d) => { if (!compressOf(d)) d.compress = {}; d.compress.promptPack = name; });
+            } catch (e) { pmSet(String(e), true); }
+        });
         packSel.addEventListener("change", () => commit((d) => {
             if (!compressOf(d)) d.compress = {};
             if (packSel.value === "default") delete d.compress.promptPack; else d.compress.promptPack = packSel.value;
+        }));
+        // #5079: prompt_cache_key self-stamping switch — the single knob that
+        // decides whether bili writes its own prompt_cache_key on egress.
+        // Values map 1:1 onto the config file (promptCache.routing), so this
+        // control and the raw JSON editor below stay in sync through commit().
+        const PCK_VALUES = ["disabled", "auto", "enabled"];
+        const pckSel = document.createElement("select");
+        pckSel.className = "field-input mono";
+        qCtrls.push(pckSel);
+        const pkw = document.createElement("div");
+        pkw.style.cssText = "display:flex;gap:12px;align-items:center;flex-wrap:wrap";
+        const pklab = document.createElement("label");
+        pklab.htmlFor = "quick-pck";
+        pklab.style.cssText = "flex:0 1 auto;max-width:520px";
+        pklab.textContent = t("cfg.q_pck");
+        pckSel.id = "quick-pck";
+        pkw.appendChild(pklab);
+        pkw.appendChild(pckSel);
+        box.appendChild(pkw);
+        const pckNote = document.createElement("div");
+        pckNote.style.cssText = "margin:-6px 0 4px;font-size:12px;color:#57606a";
+        function updatePckNote() {
+            if (pckSel.value === "disabled") pckNote.textContent = t("cfg.q_pck_disabled_desc");
+            else if (pckSel.value === "auto") pckNote.textContent = t("cfg.q_pck_auto_desc");
+            else if (pckSel.value === "enabled") pckNote.textContent = t("cfg.q_pck_enabled_desc");
+            else pckNote.textContent = t("cfg.q_pck_custom");
+        }
+        box.appendChild(pckNote);
+        pckSel.addEventListener("change", () => commit((d) => {
+            const pc = (d.promptCache && typeof d.promptCache === "object" && !Array.isArray(d.promptCache)) ? d.promptCache : {};
+            if (PCK_VALUES.includes(pckSel.value)) pc.routing = pckSel.value; else delete pc.routing;
+            if (Object.keys(pc).length === 0) delete d.promptCache; else d.promptCache = pc;
+        }));
+        // #5403: watermark fastpath grey-rollout switch — maps 1:1 onto
+        // rollout.features.pluginFullResendWatermark (default follows the
+        // baked percent; on/off pin it per install). salt/base untouched.
+        const WM_VALUES = ["default", "on", "off"];
+        const wmSel = document.createElement("select");
+        wmSel.className = "field-input mono";
+        qCtrls.push(wmSel);
+        const ww = document.createElement("div");
+        ww.style.cssText = "display:flex;gap:12px;align-items:center;flex-wrap:wrap";
+        const wlab = document.createElement("label");
+        wlab.htmlFor = "quick-wm";
+        wlab.style.cssText = "flex:0 1 auto;max-width:520px";
+        wlab.textContent = t("cfg.q_wm");
+        wmSel.id = "quick-wm";
+        ww.appendChild(wlab);
+        ww.appendChild(wmSel);
+        box.appendChild(ww);
+        const wmNote = document.createElement("div");
+        wmNote.style.cssText = "margin:-6px 0 4px;font-size:12px;color:#57606a";
+        function updateWmNote() {
+            if (wmSel.value === "on") wmNote.textContent = t("cfg.q_wm_on_desc");
+            else if (wmSel.value === "off") wmNote.textContent = t("cfg.q_wm_off_desc");
+            else if (wmSel.value !== "default") wmNote.textContent = t("cfg.q_wm_custom");
+            else wmNote.textContent = t("cfg.q_wm_default_desc");
+        }
+        box.appendChild(wmNote);
+        wmSel.addEventListener("change", () => commit((d) => {
+            let roll = (d.rollout && typeof d.rollout === "object" && !Array.isArray(d.rollout)) ? d.rollout : {};
+            const feats = (roll.features && typeof roll.features === "object" && !Array.isArray(roll.features)) ? roll.features : {};
+            if (wmSel.value === "on") feats.pluginFullResendWatermark = true;
+            else if (wmSel.value === "off") feats.pluginFullResendWatermark = false;
+            else delete feats.pluginFullResendWatermark;
+            if (Object.keys(feats).length === 0) delete roll.features; else roll.features = feats;
+            if (Object.keys(roll).length === 0) delete d.rollout; else d.rollout = roll;
         }));
         const nudge = document.createElement("input");
         nudge.type = "number";
@@ -4069,15 +5102,19 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         const hq = qi < 0 ? "" : hash.slice(qi + 1);
         let name = "overview";
         let detailId = null;
-        const top = hbase.match(new RegExp("^#/(overview|config|updates|connect|logs)$"));
+        const top = hbase.match(new RegExp("^#/(overview|config|updates|connect|logs|blog)$"));
         if (top) {
             name = top[1];
             if (name === "logs" && hq) applyLogFilter(hq);
         } else {
             const ses = hash.match(new RegExp("^#/sessions(?:/(.+))?$")) || hash.match(new RegExp("^#/session/(.+)$"));
+            const blg = hash.match(new RegExp("^#/blog/(.+)$"));
             if (ses) {
                 name = "sessions";
                 if (ses[1]) detailId = decodeURIComponent(ses[1]);
+            } else if (blg) {
+                name = "blog";
+                detailId = decodeURIComponent(blg[1]);
             }
         }
         PAGES.forEach((p) => {
@@ -4090,6 +5127,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         else if (name === "sessions") loadSessions(detailId);
         else if (name === "config") loadConfig();
         else if (name === "updates") loadUpdates();
+        else if (name === "blog") loadBlog(detailId);
         else if (name === "logs") loadLogs();
     }
     window.addEventListener("hashchange", route);
@@ -4228,6 +5266,66 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         const sf = $("save-file");
         const ss = $("save-summary");
         if (ss) ss.addEventListener("click", () => putCfg(ss, { file: $("cfg-file-edit").value }));
+        // #4899: billing price editor events — add-model, per-row delete, and
+        // Save (validates every filled field, PUTs {billing:{prices}}).
+        const addBtn = $("pricing-add-btn");
+        if (addBtn) addBtn.addEventListener("click", () => {
+            const inp = $("pricing-add-model");
+            const model = inp ? inp.value.trim() : "";
+            if (!model) { toast(t("cfg.pricing_add_ph"), "err"); return; }
+            if (pricingModels.some((m) => m.model === model)) { toast(t("cfg.pricing_dup"), "err"); return; }
+            pricingModels.push({ model, price: null, override: null });
+            inp.value = "";
+            renderPricing();
+            const note = $("pricing-fields").parentElement.querySelector(".cfg-dirty-note");
+            if (note) note.hidden = false;
+        });
+        const pf = $("pricing-fields");
+        if (pf) pf.addEventListener("click", (ev) => {
+            const del = ev.target && ev.target.closest ? ev.target.closest("[data-del]") : null;
+            if (!del) return;
+            const row = del.closest(".price-row");
+            if (!row) return;
+            const model = row.getAttribute("data-model") || "";
+            pricingModels = pricingModels.filter((m) => m.model !== model);
+            renderPricing();
+        });
+        if (pf) pf.addEventListener("input", () => {
+            const note = pf.parentElement.querySelector(".cfg-dirty-note");
+            if (note) note.hidden = false;
+        });
+        const spr = $("save-pricing");
+        if (spr) spr.addEventListener("click", async () => {
+            const prices = {};
+            try {
+                pf.querySelectorAll(".price-row").forEach((row) => {
+                    const model = row.getAttribute("data-model") || "";
+                    if (!model) return;
+                    const read = (f) => {
+                        const el = row.querySelector('[data-f="' + f + '"]');
+                        const v = el ? String(el.value || "").trim() : "";
+                        if (v === "") return undefined;
+                        const n = Number(v);
+                        if (!isFinite(n) || n < 0) throw new Error(model + ": " + f);
+                        return n;
+                    };
+                    const input = read("input");
+                    if (input == null) return;
+                    const entry = { input };
+                    const output = read("output");
+                    if (output != null) entry.output = output;
+                    const cacheRead = read("cacheRead");
+                    if (cacheRead != null) entry.cacheRead = cacheRead;
+                    const cacheWrite = read("cacheWrite");
+                    if (cacheWrite != null) entry.cacheWrite = cacheWrite;
+                    prices[model] = entry;
+                });
+            } catch (e) {
+                toast(t("cfg.pricing_invalid", { msg: e.message }), "err");
+                return;
+            }
+            if (await putCfg(spr, { billing: { prices } })) loadPricing();
+        });
         if (sf) sf.addEventListener("click", async () => {
             const el = $("cfg-file-edit");
             const raw = el ? el.value : "";
@@ -4287,7 +5385,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
     async function refreshTreeMap() {
         if (mapBusy) return true;
         const view = $("tree-graph");
-        if (!view) return true;
+        if (!view || view.hidden) return true; // list mode: nothing live to repaint
         const m = location.hash.match(new RegExp("^#/session/(.+)$"));
         if (!m) return true;
         mapBusy = true;
@@ -4297,11 +5395,11 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
                 const sig = r.blocks.map(function (b) { return b.blockId + String(b.tier) + (b.active ? "a" : "") + ":" + (b.directBlockIds || []).join(","); }).join("|");
                 if (sig !== lastMapSig) {
                     lastMapSig = sig;
-                    // #4173 review: swap only the drawing frame so the pane's other
-                    // children (the legend row) survive live refreshes.
-                    view.querySelectorAll(".tm-inner").forEach(function (el) { el.remove(); });
-                    view.insertAdjacentHTML("afterbegin", treeMapInnerHtml(buildGraphSvg(r.blocks, true, MAP_METRICS)));
-                    treeMapApply(view);
+                    // #4608: repaint only the tree drawing — expansion and
+                    // selection survive the tick (the list is static DOM).
+                    const inner = view.querySelector(".tm-inner");
+                    const stv = treeViewState || { expanded: {}, selected: "" };
+                    if (inner) inner.innerHTML = renderCollapSvg(r.blocks, stv.expanded, stv.selected).html;
                 }
             }
         } catch (e) {

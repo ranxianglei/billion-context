@@ -95,7 +95,7 @@ test("#1590: webserver/index-inject publishes __BILI__ while an origin is known 
     }
 });
 
-test("#1590: index-inject stays silent when no origin is known yet (spawn mode)", async () => {
+test("#1590/#4846: index-inject still publishes __BILI__ when no origin is known yet (spawn mode)", async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-ui-"));
     try {
         await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: undefined, BILI_CONFIG_FILE: emptyConfigFile(home) }, async () => {
@@ -105,7 +105,38 @@ test("#1590: index-inject stays silent when no origin is known yet (spawn mode)"
             assert.equal(listeners.length, 1);
             const table: InjectRow[] = [];
             listeners[0](table);
-            assert.deepEqual(table, []);
+            // #4846: DSH Desktop captures this table once per app launch; dropping
+            // the whole row when the origin is not yet bound made dsh.contextTab
+            // fail open forever on desktop. The row now always lands — origin as a
+            // null placeholder, face flags intact (default keeps the tab on).
+            assert.deepEqual(table, [{ kind: "global", name: "__BILI__", value: { origin: null, contextTab: true } }]);
+        });
+    } finally {
+        rmrf(home);
+    }
+});
+
+test("#4846: index-inject carries contextTab=false even before the origin is bound (desktop boot snapshot)", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-ui-"));
+    try {
+        const cfgFile = path.join(home, "bili-config.json");
+        fs.writeFileSync(cfgFile, JSON.stringify({ dsh: { contextTab: false } }));
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: undefined, BILI_CONFIG_FILE: cfgFile }, async () => {
+            _resetRegisterForTest(undefined);
+            const listeners: InjectListener[] = [];
+            apply(uiCtx(listeners) as Parameters<typeof apply>[0]);
+            const table: InjectRow[] = [];
+            listeners[0](table);
+            // The exact repro: config says hide, spawn mode has not bound an
+            // origin yet at snapshot time — the face flag must still ride the row
+            // so readCtxTabFace() hides the tab instead of failing open.
+            assert.deepEqual(table, [{ kind: "global", name: "__BILI__", value: { origin: null, contextTab: false } }]);
+            // And the live /bili/origin route agrees once polled (snapshot ≡ route).
+            const routes: RouteRow[] = [];
+            apply(routeCtx(routes, []) as Parameters<typeof apply>[0]);
+            const res = new FakeRes();
+            await routes.find((r) => r.path === "/bili/origin")!.handler({}, res);
+            assert.deepEqual(JSON.parse(res.body), { origin: null, contextTab: false });
         });
     } finally {
         rmrf(home);
@@ -285,7 +316,7 @@ test("#1809: route registration rides the injected context's effect lifecycle", 
     }
 });
 
-type ElementNode = { type: string; props: Record<string, unknown> | null; children: unknown[] };
+type ElementNode = { type: string; props: Record<string, unknown> | null; children: unknown[]; closest?: (selector: string) => unknown };
 
 function collectText(node: unknown, out: string[]): void {
     if (typeof node === "string") {
@@ -498,8 +529,32 @@ async function mountClient(extra: Record<string, unknown>, slotName = "settings.
     let hookStates: unknown[] = [];
     let hookIndex = 0;
     let effectSlots: EffectSlot[] = [];
+    // React runs effects AFTER the commit, so a layout effect already sees the
+    // refs its render attached. Defer to the end of the render pass instead of
+    // running inline, or ref-based effects would always observe null.
+    let pendingEffects: Array<() => void> = [];
+    const runEffect = (fn: () => unknown | (() => void), deps?: readonly unknown[]): void => {
+        const i = hookIndex++;
+        const prev = effectSlots[i];
+        const prevDeps = prev?.deps;
+        const unchanged = prevDeps !== undefined && deps !== undefined &&
+            deps.length === prevDeps.length && deps.every((d, j) => Object.is(d, prevDeps[j]));
+        if (unchanged) return;
+        pendingEffects.push(() => {
+            prev?.cleanup?.();
+            const r = fn();
+            effectSlots[i] = { deps, cleanup: typeof r === "function" ? (r as () => void) : undefined };
+        });
+    };
     const reactStub = {
-        createElement: (type: string, props: Record<string, unknown> | null, ...children: unknown[]): ElementNode => ({ type, props, children }),
+        createElement: (type: string, props: Record<string, unknown> | null, ...children: unknown[]): ElementNode => {
+            const node: ElementNode = { type, props, children };
+            node.closest = (selector: string): unknown =>
+                typeof extra.__closest === "function" ? (extra.__closest as (s: string) => unknown)(selector) : null;
+            const ref = props?.ref;
+            if (typeof ref === "object" && ref !== null) (ref as { current: unknown }).current = node;
+            return node;
+        },
         useState: (init: unknown): [unknown, (v: unknown) => void] => {
             const i = hookIndex++;
             if (!(i in hookStates)) hookStates[i] = typeof init === "function" ? (init as () => unknown)() : init;
@@ -507,16 +562,12 @@ async function mountClient(extra: Record<string, unknown>, slotName = "settings.
             // components using setX(x => x+1) would store the closure itself.
             return [hookStates[i], (v: unknown) => { hookStates[i] = typeof v === "function" ? (v as (prev: unknown) => unknown)(hookStates[i]) : v; }];
         },
-        useEffect: (fn: () => unknown | (() => void), deps?: readonly unknown[]): void => {
+        useEffect: runEffect,
+        useLayoutEffect: runEffect,
+        useRef: (init: unknown): { current: unknown } => {
             const i = hookIndex++;
-            const prev = effectSlots[i];
-            const prevDeps = prev?.deps;
-            const unchanged = prevDeps !== undefined && deps !== undefined &&
-                deps.length === prevDeps.length && deps.every((d, j) => Object.is(d, prevDeps[j]));
-            if (unchanged) return;
-            prev?.cleanup?.();
-            const r = fn();
-            effectSlots[i] = { deps, cleanup: typeof r === "function" ? (r as () => void) : undefined };
+            if (!(i in hookStates)) hookStates[i] = { current: init ?? null };
+            return hookStates[i] as { current: unknown };
         },
     };
     const requireStub = (spec: string): unknown => {
@@ -561,14 +612,19 @@ async function mountClient(extra: Record<string, unknown>, slotName = "settings.
         // identity as the entry's props; the test may mirror that explicitly.
         component: (): unknown => {
             hookIndex = 0;
-            return renderProps === undefined
+            const tree = renderProps === undefined
                 ? bound()
                 : (bound as unknown as (props: unknown) => unknown)(renderProps);
+            const queued = pendingEffects;
+            pendingEffects = [];
+            for (const run of queued) run();
+            return tree;
         },
         resetHooks: () => {
             hookStates = [];
             hookIndex = 0;
             effectSlots = [];
+            pendingEffects = [];
         },
         runCleanups: () => {
             // #4432: release the sandbox clock first — the poll chains the
@@ -655,21 +711,21 @@ test("#1590/#2125: client bundle registers the settings.section entry bili AND t
         "#2448: frame height follows the host viewport instead of a flat 640px",
     );
     const buttons = collectButtons(tree);
-    assert.equal(buttons.length, 6, "five tabs (versions included, #3719) plus the backup open-in-browser button");
+    assert.equal(buttons.length, 7, "six tabs (blog after versions, #4906 follow-up) plus the backup open-in-browser button");
     // #2448: the backup button drops the origin URL from the label (a narrow
     // host panel squeezed the hint row into a sliver) and keeps it in the
     // tooltip instead.
     const openLabel: string[] = [];
-    collectText(buttons[5], openLabel);
+    collectText(buttons[6], openLabel);
     assert.deepEqual(openLabel, ["打开 Web UI"], "#2448: backup button label carries no origin URL");
-    assert.equal(buttons[5].props?.title, "http://127.0.0.1:8787", "#2448: the origin moves to the tooltip");
+    assert.equal(buttons[6].props?.title, "http://127.0.0.1:8787", "#2448: the origin moves to the tooltip");
     const tabLabels: string[] = [];
-    for (const b of buttons.slice(0, 5)) {
+    for (const b of buttons.slice(0, 6)) {
         const bt: string[] = [];
         collectText(b, bt);
         tabLabels.push(bt.join(""));
     }
-    assert.deepEqual(tabLabels, ["总览", "会话", "配置", "日志", "版本"], "tabs mirror the web UI nav terminology");
+    assert.deepEqual(tabLabels, ["总览", "会话", "配置", "日志", "版本", "博客"], "tabs mirror the web UI nav terminology");
     // The open-in-browser action rides the TAB row (right after the logs
     // tab), not the footer below the iframe: the row div that parents the
     // logs tab also parents the action button, and the root's footer row
@@ -681,8 +737,8 @@ test("#1590/#2125: client bundle registers the settings.section entry bili AND t
     });
     assert.ok(tabRow !== undefined, "logs tab has a parent row");
     const rowButtons = collectButtons(tabRow);
-    assert.equal(rowButtons.length, 6, "tab row = five tabs + the open-WebUI action");
-    assert.equal(rowButtons[5], buttons[5], "the action is the row's last child, right after the last tab");
+    assert.equal(rowButtons.length, 7, "tab row = six tabs + the open-WebUI action");
+    assert.equal(rowButtons[6], buttons[6], "the action is the row's last child, right after the last tab");
     const footerRow = (tree.children ?? []).filter((c) => c !== null && typeof c === "object").at(-1) as ElementNode;
     assert.equal(collectButtons(footerRow).length, 0, "embedded footer carries no button — the action moved up");
     // Tab click moves only the hash — the frame navigates same-document.
@@ -692,7 +748,7 @@ test("#1590/#2125: client bundle registers the settings.section entry bili AND t
     assert.ok(frameAfterTab !== undefined);
     assert.equal(frameAfterTab.props?.src, "http://127.0.0.1:8787/__bili/?embed=1&lang=zh#/sessions");
     // The backup button keeps the original jump target.
-    (buttons[5].props!.onClick as () => void)();
+    (buttons[6].props!.onClick as () => void)();
     assert.deepEqual(opened, ["http://127.0.0.1:8787/__bili/"]);
     m.runCleanups();
 
@@ -710,7 +766,7 @@ test("#1590/#2125: client bundle registers the settings.section entry bili AND t
     assert.ok(bframe !== undefined, "origin present renders the embedded iframe in the bundle panel");
     assert.equal(bframe.props?.src, "http://127.0.0.1:8787/__bili/?embed=1&lang=zh#/overview");
     const bButtons = collectButtons(btree);
-    assert.equal(bButtons.length, 6, "the bundle panel offers the same tabs plus backup button");
+    assert.equal(bButtons.length, 7, "the bundle panel offers the same tabs plus backup button");
     assert.equal(
         bButtons[bButtons.length - 1].props?.title,
         "http://127.0.0.1:8787",
@@ -851,7 +907,7 @@ test("#1809/#2125/#2187: client polls /bili/origin while unresolved — upgrades
         assert.ok(frame !== undefined, "resolved origin upgrades the entry without a reload");
         assert.equal(frame.props?.src, "http://127.0.0.1:9999/__bili/?embed=1&lang=zh#/overview");
         const upButtons = collectButtons(second);
-        assert.equal(upButtons.length, 6, "the upgraded entry shows tabs plus the backup button");
+        assert.equal(upButtons.length, 7, "the upgraded entry shows tabs plus the backup button");
         (upButtons[upButtons.length - 1].props!.onClick as () => void)();
         assert.deepEqual(opened, ["http://127.0.0.1:9999/__bili/"]);
         // #2288: resolution no longer STOPs the probe — exactly one fast probe
@@ -896,7 +952,7 @@ test("#1809/#2125/#2187: client polls /bili/origin while unresolved — upgrades
         assert.ok(sframe !== undefined, "the upgraded entry keeps its frame");
         assert.equal(sframe.props?.src, "http://127.0.0.1:18798/__bili/?embed=1&lang=zh#/overview", "the embedded frame follows the corrected live origin");
         const sButtons = collectButtons(second);
-        assert.equal(sButtons.length, 6, "the upgraded entry shows tabs plus the backup button");
+        assert.equal(sButtons.length, 7, "the upgraded entry shows tabs plus the backup button");
         (sButtons[sButtons.length - 1].props!.onClick as () => void)();
         assert.deepEqual(opened, ["http://127.0.0.1:18798/__bili/"]);
         m.runCleanups();
@@ -1001,7 +1057,7 @@ test("#1809/#2125/#2187: client polls /bili/origin while unresolved — upgrades
         assert.ok(bframe !== undefined, "the bundle panel upgrades on a resolved origin");
         assert.equal(bframe.props?.src, "http://127.0.0.1:9999/__bili/?embed=1&lang=zh#/overview");
         const bUpButtons = collectButtons(second);
-        assert.equal(bUpButtons.length, 6, "the bundle panel offers tabs plus the backup button");
+        assert.equal(bUpButtons.length, 7, "the bundle panel offers tabs plus the backup button");
         (bUpButtons[bUpButtons.length - 1].props!.onClick as () => void)();
         assert.deepEqual(opened, ["http://127.0.0.1:9999/__bili/"]);
         m.runCleanups();
@@ -2114,4 +2170,80 @@ test("#4254: shell.overlay upstream-unavailable pill polls /__bili/upstreams, re
     assert.ok(!gt.includes("no-host-entry") && !gt.includes("not-an-object"), "malformed entries are dropped");
     assert.ok(gt.includes("1 个上游不可用"), "header counts only surviving rows");
     g.runCleanups();
+});
+
+
+// #4406: the Context tab is a read-only report face, yet the host renders its
+// whole composer stack (input bar + todo/goal/queue docks) under EVERY
+// conversation view. The tab marks the conversation scroll container and
+// carries the scoped CSS that hides the seat, while approval / question /
+// plan-review takeovers — the only interactions this face still needs — stay
+// visible through the :not(:has(...)) carve-out.
+test("#4406: the Context tab marks the conversation scroll container and hides the host composer seat", async () => {
+    const ORIGIN = "http://127.0.0.1:8787";
+    const scrollAttrs = new Map<string, string>();
+    const scrollEl = {
+        setAttribute: (name: string, value: string): void => {
+            scrollAttrs.set(name, value);
+        },
+        removeAttribute: (name: string): void => {
+            scrollAttrs.delete(name);
+        },
+    };
+    const styles: Array<{ attrs: Record<string, string>; textContent: string }> = [];
+    const documentStub = {
+        querySelector: (selector: string): unknown =>
+            selector === "style[data-bili-surface]" && styles.length > 0 ? styles[0] : null,
+        createElement: (_tag: string): { attrs: Record<string, string>; textContent: string; setAttribute: (k: string, v: string) => void } => {
+            const el = {
+                attrs: {} as Record<string, string>,
+                textContent: "",
+                setAttribute: (k: string, v: string): void => {
+                    el.attrs[k] = v;
+                },
+            };
+            return el;
+        },
+        head: {
+            appendChild: (el: { attrs: Record<string, string>; textContent: string }): void => {
+                styles.push(el);
+            },
+        },
+    };
+
+    const m = await mountClient({
+        __BILI__: { origin: ORIGIN },
+        document: documentStub,
+        __closest: (selector: string): unknown => (selector === "[data-conversation-scroll]" ? scrollEl : null),
+        fetch: async (url: string) => {
+            const u = String(url);
+            if (u.endsWith("/bili/origin")) return { ok: true, json: async () => ({ origin: ORIGIN }) };
+            if (u.endsWith("/__bili/?embed=1")) return htmlOk();
+            return { ok: true, json: async () => ({ ok: false }) };
+        },
+        setTimeout,
+        clearTimeout,
+        setInterval: (() => 0) as unknown as typeof setInterval,
+        clearInterval: (() => {}) as unknown as typeof clearInterval,
+    }, "conversation.view", { sessionId: "conv-dsh-main" });
+
+    m.resetHooks();
+    m.component();
+    assert.equal(styles.length, 1, "one scoped style tag carries the rule");
+    assert.equal(styles[0].attrs["data-bili-surface"], "");
+    assert.ok(
+        styles[0].textContent.includes("[data-conversation-scroll][data-bili-surface]>[data-composer-seat]"),
+        "the rule targets the host composer seat under the marked scroll container",
+    );
+    assert.ok(
+        styles[0].textContent.includes(":not(:has([data-approval-key],[data-question-key],[data-plan-review-key]))"),
+        "approval / question / plan-review takeovers stay visible",
+    );
+    assert.equal(scrollAttrs.get("data-bili-surface"), "", "the conversation scroll container carries the marker");
+
+    m.component();
+    assert.equal(styles.length, 1, "the style is injected once per page, not once per render");
+
+    m.runCleanups();
+    assert.equal(scrollAttrs.has("data-bili-surface"), false, "leaving the tab drops the marker");
 });

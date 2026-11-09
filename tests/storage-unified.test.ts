@@ -9,10 +9,11 @@ import type { Session } from "../src/session.ts";
 import type { CoreMessage, CompressionBlock } from "acp-kernel";
 import { canonicalize, sha256 } from "./golden-canonical.ts";
 import { planIngest, loadLegacyView, toLegacyLike, type LegacySessionLike } from "../src/storage/ingest.ts";
+import { restampRefsToLedger } from "acp-kernel";
 import { UnifiedStore } from "../src/storage/store.ts";
 import { resolveStorageMode } from "../src/storage/shadow.ts";
 import { resolveStorageWalJournalSizeLimit } from "../src/knobs.ts";
-import { setPreferredSqliteEngineForTests, type SqliteEngineName } from "../src/storage/driver.ts";
+import { probeBuiltinSqlite, setPreferredSqliteEngineForTests, type SqliteEngineName } from "../src/storage/driver.ts";
 
 /**
  * Unified-storage acceptance (Phase 1, #2671).
@@ -82,12 +83,20 @@ function loadCase(name: string): Session {
 
 /** Same digest shape as the corpus manifest (see scripts/update-storage-corpus.ts). */
 function sessionDigest(view: ReturnType<typeof loadLegacyView>): string {
+    // #4316 PR3/3: cold-load alignment sets refLedgerAligned on the served
+    // state — a marker, not view content. The parity digest strips it (the
+    // manifest predates the flag); any REAL renumbering still moves byRaw and
+    // stays pinned (the corpus cases keep their counter refs — only a state
+    // whose rows exist gets aligned, and the corpus regen writes files without
+    // a live store session).
+    const state = { ...(view.state as Record<string, unknown>) };
+    delete state.refLedgerAligned;
     return sha256(JSON.stringify(canonicalize({
         id: view.id,
         meta: view.meta,
         stats: view.stats,
         metadata: view.metadata,
-        state: view.state,
+        state,
         blockContents: [...view.blockContents.entries()],
         lastMessages: view.lastMessages,
         lastMessagesFolded: view.lastMessagesFolded,
@@ -191,11 +200,18 @@ function betterSqliteAvailable(): boolean {
     }
 }
 
+/** node:sqlite is a NODE builtin; bun ships `bun:sqlite` instead and cannot load
+ *  it, so the legs that drive that engine explicitly skip on a bun runtime (the
+ *  driver probe is the same test the production ladder runs). */
+function nodeSqliteAvailable(): boolean {
+    return probeBuiltinSqlite();
+}
+
 test("storage unified: corpus round-trip digests equal the legacy manifest (better-sqlite3)", { skip: !betterSqliteAvailable() && "better-sqlite3 not installed (optional native dependency)" }, () => {
     for (const name of Object.keys(CASE_META)) runCase("better-sqlite3", name);
 });
 
-test("storage unified: corpus round-trip digests equal the legacy manifest (node:sqlite)", () => {
+test("storage unified: corpus round-trip digests equal the legacy manifest (node:sqlite)", { skip: !nodeSqliteAvailable() && "node:sqlite not available on this runtime (bun ships bun:sqlite)" }, () => {
     for (const name of Object.keys(CASE_META)) runCase("node:sqlite", name);
 });
 
@@ -397,6 +413,41 @@ test("resolveStorageWalJournalSizeLimit: env wins, garbage falls through, file t
     assert.equal(resolveStorageWalJournalSizeLimit({}, 2097152), 2097152, "file tier applies when the env is absent");
 });
 
+/** #4316 PR3/3 parity oracle: the expected digest for a FULL-mode load is
+ *  the LEGACY-mode view of the same files plus the deterministic one-time
+ *  ledger alignment (same seqByRaw the full-mode load aligned against). The
+ *  corpus manifest keeps pinning the PURE view (storage-corpus suite); this
+ *  oracle pins the equivalence "full serve = legacy serve + alignment". */
+function alignedLegacyDigest(caseDir: string, meta: { protocol: string; id: string }, seqByRawId: Map<string, number>): string {
+    const legacyDir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-legacy-oracle-"));
+    try {
+        fs.cpSync(caseDir, path.join(legacyDir, "case"), { recursive: true });
+        // Remove any unified sidecar so the legacy store serves the files.
+        for (const f of fs.readdirSync(path.join(legacyDir, "case"))) {
+            if (f.startsWith("index.db") || f.endsWith(".lock")) fs.rmSync(path.join(path.join(legacyDir, "case"), f), { force: true });
+        }
+        const prev = process.env.BILI_STORAGE_UNIFIED;
+        process.env.BILI_STORAGE_UNIFIED = "legacy";
+        let store: InstanceType<typeof SessionStore> | null = null;
+        try {
+            store = new SessionStore({ dir: path.join(legacyDir, "case"), debounceMs: 1, enabled: true });
+            const pure = store.loadSync(meta.id, { protocol: meta.protocol, upstreamOrigin: "http://127.0.0.1:8199" });
+            assert.ok(pure, "legacy oracle load returned null");
+            const view = toLegacyLike(pure);
+            const state = structuredClone(view.state as Record<string, unknown>);
+            restampRefsToLedger(state as never, seqByRawId);
+            delete state.refLedgerAligned;
+            return sessionDigest({ ...view, state: state as never });
+        } finally {
+            store?.closeQuietly();
+            if (prev === undefined) delete process.env.BILI_STORAGE_UNIFIED;
+            else process.env.BILI_STORAGE_UNIFIED = prev;
+        }
+    } finally {
+        try { fs.rmSync(legacyDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); } catch { /* Windows stray handle */ }
+    }
+}
+
 test("storage unified FULL mode: read path serves from the index with organic import + GC parity", async () => {
     const meta = CASE_META["folded"]!;
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-full-"));
@@ -410,21 +461,25 @@ test("storage unified FULL mode: read path serves from the index with organic im
         const store = new SessionStore({ dir: caseDir, debounceMs: 1, enabled: true });
         const session = store.loadSync(meta.id, { protocol: meta.protocol, upstreamOrigin: "http://127.0.0.1:8199" });
         assert.ok(session, "full-mode loadSync returned null");
-        assert.equal(sessionDigest(toLegacyLike(session)), manifest["folded"]!.digest, "full-mode read digest drift (organic import)");
         store.closeQuietly();
         // The import must have populated the index even though writeNow never ran.
         const probe = UnifiedStore.open(path.join(caseDir, "index.db"));
+        let expectedDigest = "";
         try {
             assert.ok(probe.getSessionRow(meta.id), "organic import did not populate index.db");
+            // #4316 PR3/3: expected = legacy view of the same files + the
+            // deterministic alignment against these very rows.
+            expectedDigest = alignedLegacyDigest(caseDir, meta, probe.seqByRaw(meta.id));
         } finally {
             probe.close();
         }
+        assert.equal(sessionDigest(toLegacyLike(session)), expectedDigest, "full-mode read digest drift (organic import)");
         // Second store, same dir: load again — serves from the index, no
         // import churn, digest still exact.
         const store2 = new SessionStore({ dir: caseDir, debounceMs: 1, enabled: true });
         const again = store2.loadSync(meta.id, { protocol: meta.protocol, upstreamOrigin: "http://127.0.0.1:8199" });
         assert.ok(again, "second full-mode loadSync returned null");
-        assert.equal(sessionDigest(toLegacyLike(again)), manifest["folded"]!.digest, "second full-mode read digest drift");
+        assert.equal(sessionDigest(toLegacyLike(again)), expectedDigest, "second full-mode read digest drift");
         store2.cancelAll();
     } finally {
         if (prev === undefined) delete process.env.BILI_STORAGE_UNIFIED;
@@ -508,8 +563,15 @@ test("storage unified: file-config storage.unified selects the mode; env tier st
         let store = new SessionStore({ dir: caseDir, debounceMs: 1, enabled: true });
         let session = store.loadSync(meta.id, { protocol: meta.protocol, upstreamOrigin: "http://127.0.0.1:8199" });
         assert.ok(session, "file-tier full loadSync returned null");
-        assert.equal(sessionDigest(toLegacyLike(session)), manifest["folded"]!.digest, "file-tier full read digest drift");
         store.closeQuietly();
+        const probeStore = UnifiedStore.open(path.join(caseDir, "index.db"));
+        let fileTierDigest = "";
+        try {
+            fileTierDigest = alignedLegacyDigest(caseDir, meta, probeStore.seqByRaw(meta.id));
+        } finally {
+            probeStore.close();
+        }
+        assert.equal(sessionDigest(toLegacyLike(session)), fileTierDigest, "file-tier full read digest drift");
         assert.ok(fs.existsSync(path.join(caseDir, "index.db")), "file-tier full did not create index.db");
         // Env tier wins: explicit env legacy overrides file full on a fresh
         // dir — a file-tier full would have opened the sidecar and imported,
@@ -717,7 +779,7 @@ test("storage: BLOCKED ref replays via byRaw only, never into byRef", () => {
 // binding per sessions row — and a dev build that already carried the
 // columns in its V1 DDL must migrate without a duplicate-column error.
 // ---------------------------------------------------------------------------
-test("schema v2: dev-window v1 database upgrades in place (identity columns added, rows survive)", async () => {
+test("schema v2: dev-window v1 database upgrades in place (identity columns added, rows survive)", { skip: !nodeSqliteAvailable() && "node:sqlite not available on this runtime (bun ships bun:sqlite)" }, async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-schema-v2-"));
     try {
         const dbPath = path.join(dir, "index.db");
@@ -739,7 +801,7 @@ test("schema v2: dev-window v1 database upgrades in place (identity columns adde
             assert.equal(row!.namespace, "proxy", "namespace backfills with its constant default");
             assert.equal(row!.origin, null, "origin backfills NULL");
             const ver = (store as unknown as { db: { prepare(q: string): { get(): unknown } } }).db.prepare("PRAGMA user_version").get() as { user_version: number };
-            assert.equal(ver.user_version, 8, "schema version stamped to 8 (v2 columns + v3 identity index + v4 extension namespaces + v5 watermark column + v6 orphans journal + v7 media map + v8 identity/tombstones)");
+            assert.equal(ver.user_version, 11, "schema version stamped to 11 (v2 columns + v3 identity index + v4 extension namespaces + v5 watermark column + v6 orphans journal + v7 media map + v8 identity/tombstones + v9 zero-ref collection index + v10 immutable message ts column + v11 FK child indexes)");
             // v3 backfill: every pre-existing sessions row claims its
             // (namespace, conversation_id) identity binding.
             const binding = (store as unknown as { lookupConversation(ns: string, id: string): string | null }).lookupConversation("proxy", "dev-window-1");
@@ -770,6 +832,117 @@ test("schema v2: dev-window v1 database upgrades in place (identity columns adde
             store2.close();
         }
     } finally {
+        fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    }
+});
+
+// ---------------------------------------------------------------------------
+// #4313: v10 immutable first-seen time column (messages.ts)
+// ---------------------------------------------------------------------------
+
+test("schema v10: v9→v10 migration adds messages.ts without backfill; idempotent", { skip: !nodeSqliteAvailable() && "node:sqlite not available on this runtime (bun ships bun:sqlite)" }, async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-unified-v10-"));
+    const dbPath = path.join(dir, "index.db");
+    try {
+        const { DatabaseSync } = await import("node:sqlite");
+        // Fresh install (v11 DDL), one row with a known ts, then knock the
+        // library back to a v9 shape: drop the column (SQLite ≥3.35), stamp
+        // user_version=9.
+        const store = UnifiedStore.open(dbPath);
+        store.close();
+        const raw = new DatabaseSync(dbPath);
+        raw.prepare("INSERT INTO content (hash, byte_len, refcount, bytes) VALUES (?, ?, 1, ?)").run(sha256("hello"), 5, "hello");
+        raw.prepare(
+            "INSERT INTO messages (session_id, seq, msg_id, role, kind, content_hash, identity, ts) VALUES (?, ?, ?, ?, 'message', ?, '', ?)",
+        ).run("v10-mig-1", 1, "x1", "user", sha256("hello"), 1700000000000);
+        raw.exec("ALTER TABLE messages DROP COLUMN ts");
+        raw.exec("PRAGMA user_version = 9");
+        raw.close();
+
+        const reopened = UnifiedStore.open(dbPath);
+        try {
+            const ver = (reopened as unknown as { db: { prepare(q: string): { get(): unknown } } }).db
+                .prepare("PRAGMA user_version").get() as { user_version: number };
+            assert.equal(ver.user_version, 11, "v9 library migrates to v11");
+            const rows = reopened.getMessages("v10-mig-1") as { seq: number; ts?: number | null }[];
+            assert.equal(rows.length, 1, "row survives the migration");
+            assert.ok(rows[0].ts === null || rows[0].ts === undefined, "pre-existing row keeps NULL (never backfilled)");
+        } finally {
+            reopened.close();
+        }
+        // Idempotence arm: reopen a stamped v11 — no ALTER may run twice.
+        const again = UnifiedStore.open(dbPath);
+        again.close();
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    }
+});
+
+test("#4313: ingest stamps ts from CoreMessage.ts; re-ingest never overwrites it", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-unified-v10b-"));
+    const store = UnifiedStore.open(path.join(dir, "index.db"));
+    try {
+        const stub = (id: string, msgs: (CoreMessage & { ts?: number })[]): LegacySessionLike => ({
+            id,
+            createdAt: 1700000000000,
+            lastSeen: 1700000001000,
+            meta: {},
+            stats: { requests: 0 },
+            metadata: {},
+            state: { blocks: [], messageRefs: { byRaw: {}, byRef: {} }, nextBlockId: 1, nextRunId: 1 },
+            blockContents: new Map(),
+            lastMessages: msgs,
+        }) as unknown as LegacySessionLike;
+        const T0 = 1700000000000;
+        const T1 = 1800000000000;
+        assert.ok(store.ingestSession(planIngest(stub("ts-s1", [{ id: "x1", role: "user", contentType: "text", text: "hello", ts: T0 }]))));
+        // Same content, later ts: INSERT OR IGNORE keeps the FIRST stamp.
+        assert.ok(store.ingestSession(planIngest(stub("ts-s1", [{ id: "x1", role: "user", contentType: "text", text: "hello", ts: T1 }]))));
+        const rows = store.getMessages("ts-s1") as { seq: number; msgId: string; ts?: number | null }[];
+        assert.equal(rows.length, 1);
+        assert.equal(rows[0].msgId, "x1");
+        assert.equal(rows[0].ts, T0, "upsert must not overwrite an existing ts (immutable stamp)");
+        // A later message stamps independently; the first row is untouched.
+        assert.ok(store.ingestSession(planIngest(stub("ts-s1", [{ id: "x1", role: "user", contentType: "text", text: "hello", ts: T0 }, { id: "y", role: "assistant", contentType: "text", text: "world", ts: T1 }]))));
+        const rows2 = store.getMessages("ts-s1") as { seq: number; msgId: string; ts?: number | null }[];
+        assert.deepEqual(rows2.sort((a, b) => a.seq - b.seq).map((r) => [r.msgId, r.ts]), [
+            ["x1", T0],
+            ["y", T1],
+        ]);
+    } finally {
+        store.close();
+        fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    }
+});
+
+test("#4313: fork clone copies ts verbatim (inherited ledger rows keep their stamps)", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-unified-v10c-"));
+    const store = UnifiedStore.open(path.join(dir, "index.db"));
+    try {
+        const stub = (id: string, msgs: (CoreMessage & { ts?: number })[]): LegacySessionLike => ({
+            id,
+            createdAt: 1700000000000,
+            lastSeen: 1700000001000,
+            meta: {},
+            stats: { requests: 0 },
+            metadata: {},
+            state: { blocks: [], messageRefs: { byRaw: {}, byRef: {} }, nextBlockId: 1, nextRunId: 1 },
+            blockContents: new Map(),
+            lastMessages: msgs,
+        }) as unknown as LegacySessionLike;
+        const A = 1700000000000;
+        const B = 1750000000000;
+        assert.ok(store.ingestSession(planIngest(stub("fork-parent", [
+            { id: "f1", role: "user", contentType: "text", text: "one", ts: A },
+            { id: "f2", role: "assistant", contentType: "text", text: "two", ts: B },
+        ]))));
+        const parentRows = store.getMessages("fork-parent") as { seq: number }[];
+        const throughSeq = Math.max(...parentRows.map((r) => r.seq));
+        assert.ok(store.cloneSessionRows("fork-parent", "fork-child", throughSeq), "clone lands");
+        const childRows = store.getMessages("fork-child") as { seq: number; msgId: string; ts?: number | null }[];
+        assert.deepEqual(childRows.map((r) => [r.msgId, r.ts]).sort(), [["f1", A], ["f2", B]], "child rows carry the parent's stamps");
+    } finally {
+        store.close();
         fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     }
 });

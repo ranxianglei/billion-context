@@ -23,7 +23,8 @@ import type { WireProtocol } from "./util.js";
  * Adoptability is judged in raw-id SET semantics, not position math: a raw id
  * is a SHA-256 of the message identity (role+contentType+text+toolCallId+
  * toolName, wire/message-id.ts), so the same bytes produce the same id in
- * parent and child. A block is adoptable iff every id in its
+ * parent and child. A retained block that is neither explicitly expanded nor
+ * consumed by another block is adoptable iff every id in its
  * effectiveMessageIds appears among the incoming request's core ids —
  * position-free, immune to subagent interleaving and reordering, and it
  * naturally rejects blocks that straddle the fork point (some source messages
@@ -83,7 +84,7 @@ interface ForkAdoptionPlan {
     adoptedActive: number;
     /** Sum of compressedTokens over the adopted ACTIVE blocks. */
     adoptedTokens: number;
-    /** Active blocks rejected because part of their source is absent. */
+    /** Eligible blocks rejected because part of their source is absent. */
     straddled: number;
     /** Highest ref string seeded, for logs. */
     maxRef: string;
@@ -166,11 +167,15 @@ export function planForkAdoption(
     const byId = new Map<string, CompressionBlock>();
     for (const b of parent.state.blocks) byId.set(b.blockId, b);
 
+    const consumed = new Set(parent.state.blocks.flatMap(b => b.directBlockIds));
     const active: CompressionBlock[] = [];
     let straddled = 0;
     if (includeBlocks) {
         for (const b of parent.state.blocks) {
-            if (!b.active) continue;
+            // Activity belongs to the source's last view; the fork may replay
+            // a retained span that view omitted. Intentional expansion and
+            // tier consumption remain inactive, as in kernel syncBlocks.
+            if (b.expanded || consumed.has(b.blockId)) continue;
             if (b.effectiveMessageIds.length === 0) continue;
             if (b.effectiveMessageIds.every((id) => incomingIds.has(id))) active.push(b);
             else straddled++;
@@ -189,12 +194,13 @@ export function planForkAdoption(
         for (const child of byId.get(id)?.directBlockIds ?? []) queue.push(child);
     }
 
+    const activeIds = new Set(active.map(b => b.blockId));
     const blocks: CompressionBlock[] = [];
     const rawIds = new Set<string>();
     for (const id of closure) {
         const b = byId.get(id);
         if (!b) continue;
-        blocks.push(structuredClone(b));
+        blocks.push({ ...structuredClone(b), active: activeIds.has(id) });
         for (const mid of b.effectiveMessageIds) rawIds.add(mid);
     }
     if (opts?.seedAllRefs) {
@@ -296,12 +302,55 @@ export function applyForkAdoption(session: Session, plan: ForkAdoptionPlan, pare
     markDirty(session);
 }
 
+/** #3925 → #3011 C9: what acp_status renders while a fork runs with zero
+ *  inherited blocks — the "starting fresh despite an adoptable parent" gap. */
+interface ForkAdoptionSkipped {
+    parentId: string;
+    blocks: number;
+    tokens: number;
+}
+
+/** Typed read of the forkAdoptionSkipped metadata field (session.metadata is
+ *  a free Record<string, unknown>; validate the shape on the way out). */
+export function forkAdoptionSkippedOf(session: Session): ForkAdoptionSkipped | undefined {
+    const raw = session.metadata.forkAdoptionSkipped;
+    if (typeof raw !== "object" || raw === null) return undefined;
+    const r = raw as Record<string, unknown>;
+    if (typeof r.parentId !== "string" || typeof r.blocks !== "number" || typeof r.tokens !== "number") return undefined;
+    return { parentId: r.parentId, blocks: r.blocks, tokens: r.tokens };
+}
+
+/** #2986/#3925: the lineage link must be durable BEFORE the next request —
+ *  markDirty alone persists on the debounce cadence, and a non-graceful exit
+ *  inside that window strands the child unlinked forever (the boot sweep and
+ *  the read-time decompress/search fallback both key off this link). Fire-
+ *  and-forget on purpose: this runs on the model-request hot path, so we must
+ *  not stall the response (mirrors persistLineageLinkNow in server/handle.ts). */
+function persistForkLineageNow(session: Session, log: (level: string, msg: string) => void): void {
+    void getStore().writeNow(session).catch((err) => {
+        log("warn", `[fork-adoption] lineage durable write failed for ${session.id}: ${String(err)} (#2986)`);
+    });
+}
+
 /** Server hook: on a fresh anonymous fork (via "new" + lineage "forked"),
  *  find the parent (memory first, then disk), measure what is adoptable, and
  *  seed the fresh session when enabled. Always logs the adoptable inventory —
  *  the measurement ework asked for in #629 — so operators can size the win
- *  before turning adoption on. */
-export function maybeAdoptForkBlocks(args: {
+ *  before turning adoption on.
+ *
+ *  #3925 → #3011 C9: records the persistent derivedFromSessionId link at
+ *  detection time whatever the adoption outcome — the same unconditional link
+ *  #1333 writes for explicitly derived conversations. Without it a bail left
+ *  NO trace: the boot sweep (reconcileDerivedLineage) only iterates sessions
+ *  carrying derivedFromSessionId, and decompress/search_context's read-time
+ *  parent fallback (derivedAncestorSessions) walks that same link — so an
+ *  unlinked child is never healed across a restart and its search stays blind
+ *  for life. The link copies nothing at link time; adoption still judges per
+ *  block in raw-id set semantics, so a mis-guessed parent can at most be
+ *  searched read-only, never adopted from. */
+// #4942: async — the parent load below must reach the DB on network storage
+// backends, or an anonymous fork of a DB-only parent starts fresh.
+export async function maybeAdoptForkBlocks(args: {
     session: Session;
     parentId: string;
     protocol: WireProtocol;
@@ -309,7 +358,7 @@ export function maybeAdoptForkBlocks(args: {
     upstreamOrigin: string;
     enabled: boolean;
     log: (level: string, msg: string) => void;
-}): void {
+}): Promise<void> {
     const { session, parentId, protocol, parsed, upstreamOrigin, enabled, log } = args;
     const incomingMsgs = incomingCoreMessages(protocol, parsed);
     if (!incomingMsgs) {
@@ -317,21 +366,35 @@ export function maybeAdoptForkBlocks(args: {
         return;
     }
     let parent = peekSession(parentId);
-    if (!parent) parent = getStore().loadSync(parentId, { protocol, upstreamOrigin }) ?? undefined;
+    if (!parent) parent = (await getStore().loadAsync(parentId, { protocol, upstreamOrigin })) ?? undefined;
     if (!parent) {
         log("info", `[fork-adoption] fork parent ${parentId} not found (evicted and not persisted); starting fresh (#629)`);
         return;
     }
     const plan = planForkAdoption(parent, new Set(incomingMsgs.map((m) => m.id)));
+    // Link once the parent is confirmed loadable (a dangling link to a
+    // vanished id would only churn the read-time walk for nothing).
+    const linked = session.metadata.derivedFromSessionId === undefined;
+    if (linked) {
+        session.metadata.derivedFrom = parentId;
+        session.metadata.derivedFromSessionId = parentId;
+    }
     if (plan.adoptedActive === 0) {
-        log("info", `[fork-adoption] fork of ${parentId}: no fully-present blocks to adopt (${plan.straddled} straddle the fork point); starting fresh (#629)`);
+        if (linked) persistForkLineageNow(session, log);
+        log("info", `[fork-adoption] fork of ${parentId}: no fully-present blocks to adopt (${plan.straddled} straddle the fork point); starting fresh; lineage linked so the startup sweep can inherit later folds (#629/#3925)`);
         return;
     }
     if (!enabled) {
-        log("info", `[fork-adoption] fork of ${parentId}: parent has ${plan.adoptedActive} adoptable block(s) covering ~${plan.adoptedTokens} tokens; forkAdoption disabled, starting fresh (set forkAdoption: true or BILI_FORK_ADOPTION=1)`);
+        session.metadata.forkAdoptionSkipped = { parentId, blocks: plan.adoptedActive, tokens: plan.adoptedTokens };
+        persistForkLineageNow(session, log);
+        log("warn", `[fork-adoption] fork of ${parentId}: parent has ${plan.adoptedActive} adoptable block(s) covering ~${plan.adoptedTokens} tokens; forkAdoption disabled, starting fresh (set forkAdoption: true or BILI_FORK_ADOPTION=1). Lineage linked — a bili restart lets the startup sweep inherit those blocks, and acp_status shows the gap (#3925)`);
         return;
     }
     applyForkAdoption(session, plan, parent);
+    // #3351 discipline: close the derived-blocks gate ONLY on real block
+    // adoption — the boot-sweep retry door stays open otherwise.
+    session.metadata.derivedBlocksAdopted = true;
+    persistForkLineageNow(session, log);
     log("info", `[fork-adoption] session ${session.id} adopted ${plan.adoptedActive} block(s) (~${plan.adoptedTokens} tokens, refs up to ${plan.maxRef || "n/a"}) from parent ${parentId} across fork (#629)`);
     // #1341: carry the originals behind the refs the fork now advertises as
     // retrievable — covered messages of the adopted blocks ∪ refs cited by
@@ -461,10 +524,12 @@ export function maybeAdoptDerivedFork(args: {
  * (the parent id came from the plugin register) and belongs with the
  * byte-prefix strong path, which is on by default.
  */
-export function reconcileDerivedLineage(
+// #4942: async — parent loads below must reach the DB on network storage
+// backends, or lineage of DB-only parents is never restored at boot.
+export async function reconcileDerivedLineage(
     sessions: Session[],
     opts: { log: (level: string, msg: string) => void; adoptionEnabled: boolean },
-): number {
+): Promise<number> {
     const { log, adoptionEnabled } = opts;
     if (!adoptionEnabled) return 0;
     let adopted = 0;
@@ -479,10 +544,10 @@ export function reconcileDerivedLineage(
 
         let parent = peekSession(parentId);
         if (!parent) {
-            parent = getStore().loadSync(parentId, {
+            parent = (await getStore().loadAsync(parentId, {
                 protocol: s.meta.protocol,
                 upstreamOrigin: s.meta.upstreamOrigin,
-            }) ?? undefined;
+            })) ?? undefined;
         }
         if (!parent) {
             // Evicted before it was persisted — or restored later. Leave the

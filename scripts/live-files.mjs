@@ -24,6 +24,7 @@ export const LIVE_FILES = [
     "tests/index-entry-guard.test.ts",
     "tests/issue1958-routed-warn.test.ts",
     "tests/issue2752-forward-partial-outcome.test.ts",
+    "tests/issue3472-mcp-structured-text.test.ts",
     "tests/issue4341-early-twin-adoption.test.ts",
     "tests/issue760-percall-conversation.test.ts",
     "tests/issue927-opencode-install.test.ts",
@@ -60,6 +61,69 @@ export const LIVE_FILES = [
     // #4434 (split-brain surface): spawns bili CLI children against a throwaway
     // origin; own probe server is listen(0) so only the zone band matters
     "tests/issue-split-brain-surface.test.ts",
+    // #3890: spawns the drain fixture; that fixture is listen(0) and reports
+    // READY <port>, so no zone band is needed — the entry is for the tripwire
+    "tests/issue3890-parent-gone-confirm-drain.test.ts",
+    // #4811: ensureProxyRunning rows drive real instance records + probe
+    // servers; every socket is listen(0), spawns are mocked, so the zone band
+    // is belt-and-braces like #3890's — the entry is for the tripwire
+    "tests/issue4811-dsh-busy-drop-selfheal.test.ts",
+    // #4977: spawns real CLI children against listen(0) ports (zombie holds
+    // the port; the ghost row binds it); zone band is belt-and-braces like
+    // #4341's — the entry is for the SPAWN_RE tripwire
+    "tests/issue4977-present-twin-persist-gate.test.ts",
+    // #4982: integration rows spawn bili children against freePort() picks and
+    // follow each child's REGISTERED port (ladder-tolerant); BASE is an
+    // in-memory-only value, so no zone band is needed — the entry is for the
+    // tripwire
+    "tests/issue4982-draining-twin-ladder.test.ts",
+    // #4994: ensureProxyRunning timeout-adoption rows drive fully mocked
+    // children + a fake clock; nothing is spawned and no socket is bound
+    // (the 1899x ports appear only in tmpdir log-file names) — like #3890's
+    // the entry is for the tripwire (its SPAWN_RE hit is the identifier
+    // "spawnLogOffset" in a code comment)
+    "tests/issue4994-spawn-timeout-adopt.test.ts",
+    // #5114: contract test for the storage-baseline preload's XDG dir sandbox;
+    // spawns a bare `node -e` child that only prints env — no ports, no
+    // servers, so the zone band is irrelevant; the entry is for the tripwire
+    "tests/preload-sandbox-dirs.test.ts",
+    // #5046/B: spawns one bare `node -e` dummy child purely as a live PID
+    // holder for the lock-file fixtures — no ports, no servers, so the zone
+    // band is irrelevant; the entry is for the tripwire
+    "tests/issue5046-second-writer-degrade.test.ts",
+    // #4762: in-process eval workers only (wedge probes), never bind a port -
+    // the entry exists for the spawn tripwire alone, like #3890
+    "tests/event-loop-watchdog.test.ts",
+    // #5012: logger-seam children only (stdio pipes, never bind a port) - the
+    // entry exists for the spawn tripwire alone, like #3890
+    "tests/issue5012-stdout-leg-mute.test.ts",
+    // #5152: spawns the beat-receiver fixture, which is listen(0) and publishes
+    // its port through a file; the sender under test is a worker_threads worker
+    // POSTing to that ephemeral port. No zone band is needed — the entry is for
+    // the tripwire. Concurrency reviewed: the fixture owns no shared port, its
+    // state lives under a per-run tmpdir, and each test uses its own receiver +
+    // origin, so the refcounted-worker table never sees cross-test collisions.
+    "tests/issue5152-owner-beat-survives-host-stall.test.ts",
+    // #4612: spawns an idle node child as the "other live process" fixture;
+    // binds no ports, mkdtemp-isolated per test
+    "tests/issue4612-gc-online-guard.test.ts",
+    // #5631 restart survival: real bili proxy children under OS signals
+    // (SIGTERM/SIGKILL/clean shutdown). Private mkdtemp homes per lane-arm,
+    // probed-free ports re-probed on every restart — no band reuse.
+    "tests/issue5631-restart-survival.test.ts",
+    // #5666: process-liveness regression — spawns ONE bare node child (--import
+    // tsx) that arms a keepalive through the real scheduler and asserts it exits
+    // on its own; the child runs under a per-run mkdtemp XDG sandbox, does no
+    // network I/O and binds no port, so no zone band is needed — the entry is for
+    // the tripwire alone, like #3890/#5114
+    "tests/cache-keepalive.test.ts",
+    // #5955: the only real child is ONE bare `node -e ""` spawned purely to
+    // hand back an already-reaped pid (win32 taskkill-then-SIGKILL silence);
+    // the takeover ladder itself runs on INJECTED deps — no proxy is started,
+    // no port is bound, no shutdown/kill signal ever reaches the OS. Fixed
+    // fake origins only, so no zone band is needed — the entry is for the
+    // tripwire alone, like #3890/#5114/#5666
+    "tests/issue5955-wedged-same-lane-takeover.test.ts",
 ];
 
 /** Band width per live file: the zone ladder drifts +1 per EADDRINUSE retry;

@@ -11,24 +11,38 @@
  *                      render goldens, both with a mid-conversation restart
  *                      and with the legacy file DELETED at the restart (the
  *                      index alone carries the session — the migration's
- *                      end-state promise).
+ *                      end-state promise). #4316 PR3/3 (380ef4dac): a
+ *                      full-mode cold load additionally re-homes citation
+ *                      numbers once (one-time ledger alignment) — comparisons
+ *                      run modulo that renumbering (citation-normalized
+ *                      digests), which is the ONLY permitted delta.
  *   STALE REJECT     — a multi-instance stale write that the guarded build
  *                      rejects must never reach index.db; the converged disk
  *                      record is what gets ingested.
  *   IMPORT GUARD     — a hand-aged legacy file (older savedAt than the
  *                      index watermark) must not re-import over newer index
  *                      state on load.
- *   ROLLBACK         — unset the env after running full → the legacy file
- *                      loads with the exact digest.
- *   SELF-DISABLE     — 3 consecutive sidecar failures disable it; reads flip
- *                      back to legacy; the legacy file stays readable.
- *   CORRUPT INDEX    — a corrupt index.db degrades the store to legacy-only
- *                      instead of bricking construction (#2771).
+ *   ROLLBACK         — explicitly select legacy after persisting the full
+ *                      load's migration → the file loads the exact digest.
+ *   NO SELF-DISABLE  — a failing sidecar NEVER self-disables: every save
+ *                      keeps retrying the real index write (reads stay
+ *                      unified) — the old 3-strike breaker is gone.
+ *   CORRUPT INDEX    — a provably-corrupt index.db does NOT block startup:
+ *                      construction proceeds WITHOUT the index (envelope-
+ *                      served), loud wire alarm, file set left in place
+ *                      byte-identical, no automatic rename/copy/rebuild and
+ *                      no legacy fallback (#4626 → final owner chain
+ *                      2026-10-30; supersedes both #2771's survive-degraded
+ *                      and the interim refuse-to-start pin for corruption).
  *   CAS REFCOUNT     — shared content blobs survive deleteSession of one
  *                      session and are collected only at refcount 0.
  *
- * The corrupt-index test is the regression for #2771; the rest are contract
- * pins (proof-only, no product change).
+ * The corrupt-index test was the regression for #2771 (construction
+ * survival) — re-pinned for the FINAL #4626-era policy chain: nothing moved/
+ * copied/rebuilt, boot proceeds envelope-served under a loud alarm; the rest
+ * are
+ * contract pins
+ * (proof-only, no product change).
  */
 
 import { test } from "node:test";
@@ -45,7 +59,7 @@ import { planIngest, loadLegacyView, toLegacyLike, type LegacySessionLike } from
 import { canonicalize, sha256 } from "./golden-canonical.ts";
 import { driveWire, WIRES, type Wire } from "./golden-storage-drive.ts";
 import { rmrf } from "./tmp-rm.ts";
-import { ENGPROOF_CHECKS, spawnCorruptIndexChild, viewDigest, viewStateDigest } from "./corrupt-index-child.ts";
+import { ENGPROOF_CHECKS, spawnCorruptIndexChild, stripOneTimeAlignment, viewDigest, viewStateDigest } from "./corrupt-index-child.ts";
 
 process.env.BILI_PERSIST_ZSTD = "0";
 // #3400: pin the legacy wire shape. This suite proves STORAGE restart
@@ -58,6 +72,11 @@ process.env.BILI_IMAGE_RESCALE = "0";
 // RENDER/STORAGE shape, not observability — keep them free of the new field
 // (the shadow lane has its own suite, tests/snapshot-shadow.test.ts).
 process.env.BILI_SNAPSHOT_SHADOW = "0";
+// #4313 follow-up: message timestamps are ON by default now; the committed
+// render goldens this suite compares against were produced with the display
+// gate OFF (CI preload chain) — pin it here too so bare local runs stay
+// hermetic (#5402).
+process.env.BILI_MESSAGE_TIMESTAMPS = "0";
 
 
 // Same hermeticity contract as the corpus suites: a developer machine with
@@ -145,11 +164,12 @@ function unifiedRows(store: UnifiedStore, id: string): ReturnType<typeof loadLeg
 // ---------------------------------------------------------------------------
 
 for (const wire of WIRES) {
-    test(`storage engine: full-mode restart is invisible on the ${wire} wire (== legacy restart, wire == committed goldens)`, { timeout: 240_000 }, async () => {
+    test(`storage engine: full-mode restart is invisible on the ${wire} wire (== legacy restart / committed goldens, modulo the #4316 one-time citation renumbering)`, { timeout: 240_000 }, async () => {
         const golden = JSON.parse(fs.readFileSync(path.join(RENDER_ROOT, `${wire}.json`), "utf8")) as {
-            turns: Array<{ i: number; sha: string }>;
+            turns: Array<{ i: number; sha: string; shaCiteNorm: string }>;
             foldAt: number; editedAt: number; summaryFrom: number;
             stateDigest: string;
+            stateDigestAligned: string;
             stateShape: Record<string, unknown>;
         };
         // The restart oracle: a legacy-only process restart. One caveat is
@@ -162,16 +182,19 @@ for (const wire of WIRES) {
             const record = await driveWire(wire as Wire, `golden-${wire}`, { storageUnified: "full", reloadAfterEdit: leg });
             assert.equal(record.turns.length, legacy.turns.length, `${wire}/${leg}: body count drifted vs legacy restart`);
             for (let i = 0; i < legacy.turns.length; i++) {
-                assert.equal(record.turns[i]!.sha, legacy.turns[i]!.sha, `${wire}/${leg}: outbound body #${i} digest drift vs legacy restart`);
-                assert.equal(record.turns[i]!.sha, golden.turns[i]!.sha, `${wire}/${leg}: outbound body #${i} digest drift vs committed goldens (restart must not change the wire)`);
+                if (i <= record.editedAt) assert.equal(record.turns[i]!.sha, golden.turns[i]!.sha, `${wire}/${leg}: pre-migration body #${i} digest drift vs committed goldens`);
+                // #4316 PR3/3 (380ef4dac): a full-mode cold load re-homes citation
+                // numbers once (one-time ledger alignment) — the ONLY permitted
+                // wire delta. Citation-normalized digests must match turn-for-turn.
+                assert.equal(record.turns[i]!.shaCiteNorm, legacy.turns[i]!.shaCiteNorm, `${wire}/${leg}: outbound body #${i} drifts beyond citation renumbering vs legacy restart`);
+                assert.equal(record.turns[i]!.shaCiteNorm, golden.turns[i]!.shaCiteNorm, `${wire}/${leg}: outbound body #${i} drifts beyond citation renumbering vs committed goldens (restart-inherent bs-field loss aside)`);
             }
             assert.equal(record.foldAt, legacy.foldAt, `${wire}/${leg}: fold landmark drifted`);
             assert.equal(record.editedAt, legacy.editedAt, `${wire}/${leg}: edit landmark drifted`);
             assert.equal(record.summaryFrom, legacy.summaryFrom, `${wire}/${leg}: summary carrier landmark drifted`);
-            assert.equal(record.stateDigest, legacy.stateDigest, `${wire}/${leg}: persisted state digest drift vs legacy restart`);
+            assert.equal(record.stateDigestAligned, legacy.stateDigestAligned, `${wire}/${leg}: persisted state drifts beyond the one-time ledger alignment vs legacy restart`);
+            assert.equal(record.stateDigestAligned, golden.stateDigestAligned, `${wire}/${leg}: persisted state drifts beyond the one-time ledger alignment vs committed goldens`);
             assert.deepEqual(record.stateShape, legacy.stateShape, `${wire}/${leg}: state shape drift`);
-            assert.deepEqual(record.sectionDigests, legacy.sectionDigests, `${wire}/${leg}: state section digests drift`);
-            assert.deepEqual(record.stateKeyDigests, legacy.stateKeyDigests, `${wire}/${leg}: state key digests drift`);
         }
     });
 }
@@ -274,10 +297,10 @@ test("storage engine: load-side import guard skips a hand-aged legacy file (inde
 });
 
 // ---------------------------------------------------------------------------
-// ROLLBACK: full → unset env → legacy file authoritative, digest exact.
+// ROLLBACK: full → explicit legacy → legacy file authoritative, digest exact.
 // ---------------------------------------------------------------------------
 
-test("storage engine: rollback contract — unset the env and the legacy read path serves the identical state", async () => {
+test("storage engine: rollback contract — explicit legacy mode serves the identical persisted state", async () => {
     const dir = tmpdir("bili-engproof-rollback-");
     const prev = process.env.BILI_STORAGE_UNIFIED;
     try {
@@ -293,20 +316,27 @@ test("storage engine: rollback contract — unset the env and the legacy read pa
         // (The load-path digest is the stable oracle: an in-memory session vs
         // a loaded one differs benignly by the storageMode stamp + one-time
         // tail normalization, identically under both paths.)
+        // #3818 flip: absent now resolves to FULL, so the legacy read path has
+        // to be spelled out explicitly (the knob's one-line escape hatch) —
+        // merely deleting the env would read unified and vacate this leg.
         const storeFull = new SessionStore({ dir, debounceMs: 1, enabled: true });
         const viaFull = storeFull.loadSync("corpus-folded", { protocol: "anthropic", upstreamOrigin: "http://127.0.0.1:8199" });
-        storeFull.closeQuietly();
         assert.ok(viaFull, "full-mode reload returned null");
+        // Persist the one-time cold-load alignment before exercising rollback.
+        await storeFull.writeNow(viaFull);
+        storeFull.closeQuietly();
         const digestFull = viewDigest(toLegacyLike(viaFull));
 
-        delete process.env.BILI_STORAGE_UNIFIED;
+        process.env.BILI_STORAGE_UNIFIED = "legacy";
         const store2 = new SessionStore({ dir, debounceMs: 1, enabled: true });
         const legacy = store2.loadSync("corpus-folded", { protocol: "anthropic", upstreamOrigin: "http://127.0.0.1:8199" });
         store2.closeQuietly();
         assert.ok(legacy, "legacy-only reload returned null after rollback");
         // #2960 ⑤: cross-mode equality is on the STATE proper — full mode
         // serves the raw table tail, legacy the envelope's folded view.
-        assert.equal(viewStateDigest(toLegacyLike(legacy)), viewStateDigest(toLegacyLike(viaFull)), "rollback: legacy-only load state digest drift vs full-mode load");
+        // #4316 PR3/3: modulo the one-time ledger alignment (full-side cold
+        // load re-homes citation numbers; legacy keeps counter numbers).
+        assert.equal(viewStateDigest(stripOneTimeAlignment(toLegacyLike(legacy))), viewStateDigest(stripOneTimeAlignment(toLegacyLike(viaFull))), "rollback: legacy-only load state digest drift vs full-mode load");
         assert.ok(viaFull.lastMessages && viaFull.lastMessages.length > 0, "⑤: full-mode load serves the table tail");
         assert.ok(legacy.lastMessages && legacy.lastMessages.length > 0, "⑤: rollback keeps the envelope tail");
         const disk = findWrittenRecord(dir, "corpus-folded");
@@ -320,11 +350,12 @@ test("storage engine: rollback contract — unset the env and the legacy read pa
 });
 
 // ---------------------------------------------------------------------------
-// SELF-DISABLE: 3 consecutive failures flip reads back to legacy-only.
+// NO SELF-DISABLE (2026-10-30 owner policy): a failing sidecar never
+// self-disables — every save keeps retrying the real index write.
 // ---------------------------------------------------------------------------
 
-test("storage engine: sidecar self-disables after 3 consecutive failures (reads flip legacy)", () => {
-    const dir = tmpdir("bili-engproof-disable-");
+test("storage engine: a failing sidecar NEVER self-disables — writes keep retrying, reads stay unified", () => {
+    const dir = tmpdir("bili-engproof-nodisable-");
     try {
         const shadow = UnifiedShadow.maybeOpen(dir, { BILI_STORAGE_UNIFIED: "full" }, () => {
             throw new Error("synthetic legacy-load failure");
@@ -333,26 +364,33 @@ test("storage engine: sidecar self-disables after 3 consecutive failures (reads 
         assert.equal(shadow.readsUnified, true, "fresh full sidecar must read unified");
         shadow.record({ some: "record" });
         shadow.record({ some: "record" });
-        assert.equal(shadow.readsUnified, true, "2 failures must not disable yet");
         shadow.record({ some: "record" });
-        assert.equal(shadow.stats.disabled, true, "3 consecutive failures must disable the sidecar");
-        assert.equal(shadow.readsUnified, false, "disabled sidecar must not read unified");
-        assert.equal(shadow.viewFor("anything"), null, "disabled sidecar must miss reads");
+        assert.equal(shadow.stats.disabled, false, "no breaker any more — repeated failures must not disable the sidecar (2026-10-30 owner policy)");
+        assert.equal(shadow.readsUnified, true, "a failing sidecar keeps reading unified — it never falls back on its own");
+        assert.match(shadow.stats.lastError ?? "", /synthetic legacy-load failure/, "the failure stays VISIBLE (loud warn), just non-fatal");
+        assert.equal(shadow.viewFor("anything"), null, "reads of a never-ingested id still miss — visibility, not mode");
         shadow.close();
+
+        // The breaker machinery itself must be gone from the source.
+        const src = fs.readFileSync(path.join(import.meta.dirname ?? ".", "..", "src", "storage", "shadow.ts"), "utf8");
+        assert.doesNotMatch(src, /MAX_CONSECUTIVE_FAILURES/);
+        assert.doesNotMatch(src, /REENABLE_PROBE_COOLDOWN_MS/);
 
         // The legacy file is unaffected through a plain SessionStore.
         const legacy = loadFolded(path.join(dir, "seed"));
-        assert.ok(legacy, "legacy load broken while the sidecar is disabled");
+        assert.ok(legacy, "legacy load broken while the sidecar is failing");
     } finally {
         rmrf(dir);
     }
 });
 
 // ---------------------------------------------------------------------------
-// CORRUPT INDEX (#2771): construction degrades to legacy-only.
+// CORRUPT INDEX (#2771 → #4626 → final form): a provably-corrupt index does
+// NOT block startup — the boot proceeds envelope-served; files untouched, no
+// move/copy/rebuild, the loud alarm names the manual fix.
 // ---------------------------------------------------------------------------
 
-test("storage engine: corrupt index.db degrades to legacy-only instead of bricking construction (#2771)", { timeout: 180_000 }, async () => {
+test("storage engine: corrupt index.db makes the boot PROCEED envelope-served — loud alarm, files untouched (#4626/#4816)", { timeout: 180_000 }, async () => {
     const dir = tmpdir("bili-engproof-corrupt-");
     const prev = process.env.BILI_STORAGE_UNIFIED;
     try {
@@ -362,32 +400,29 @@ test("storage engine: corrupt index.db degrades to legacy-only instead of bricki
         await store.writeNow(session);
         store.closeQuietly();
 
-        // The clean read through full mode — the digest the corrupt-index
-        // fallback must reproduce exactly from the legacy file.
+        // Both replicas must contain the migration before corrupting the index.
         const clean = new SessionStore({ dir, debounceMs: 1, enabled: true });
         const viaFull = clean.loadSync("corpus-folded", { protocol: "anthropic", upstreamOrigin: "http://127.0.0.1:8199" });
-        clean.closeQuietly();
         assert.ok(viaFull, "full-mode read returned null");
+        await clean.writeNow(viaFull);
+        clean.closeQuietly();
 
-        // #4338: everything past this point (corrupt the header → degrade
-        // construction → fallback read → rename guards → write → close) runs
-        // in a spawned child. On Windows the FAILED open of the corrupt index
-        // can leave an OS handle with no JS reference to release, and the
-        // resulting persistent EBUSY at rmrf outlives the whole tmp-rm retry
-        // ladder; the child exiting RELEASES all its handles by OS guarantee,
-        // so this parent's rmrf below cannot be blocked. The child prints a
-        // JSON verdict of named checks; every one is re-asserted here, so
-        // assertion coverage is 1:1 with the in-process era (same asserts,
-        // executed in the child, verified in the parent). The child also runs
-        // the #2781 mid-flow rename guard plus a post-close guard, so future
-        // handle-leak drift trips there by name instead of at teardown.
-        const stateDigestClean = viewStateDigest(toLegacyLike(viaFull));
+        // #4338: everything past this point (corrupt the header → alarm-boot
+        // → leak guards) runs in a spawned child. On Windows any
+        // sqlite file the scenario touches can leave an OS handle with no JS
+        // reference to release, and the resulting persistent EBUSY at rmrf
+        // would outlive the whole tmp-rm retry ladder; the child exiting
+        // RELEASES all its handles by OS guarantee, so this parent's rmrf
+        // below cannot be blocked. The child prints a JSON verdict of named
+        // checks; every one is re-asserted here, so assertion coverage is 1:1
+        // with in-process execution (same asserts, run in the child, verified
+        // in the parent).
         const childEnv: NodeJS.ProcessEnv = {
             ...process.env,
             BILI_STORAGE_UNIFIED: "full",
             BILI_PERSIST_ZSTD: "0",
         };
-        const verdict = spawnCorruptIndexChild("engproof", [dir, stateDigestClean], childEnv);
+        const verdict = spawnCorruptIndexChild("engproof", [dir], childEnv);
         assert.equal(verdict.ok, true, verdict.failure ?? "corrupt-index child reported a failed check");
         for (const name of ENGPROOF_CHECKS) {
             const check = verdict.checks.find((c) => c.name === name);
@@ -470,35 +505,39 @@ test("storage engine: CAS refcounts conserve shared content across deleteSession
 // the contract that lets us ship without a native SQLite dependency at all.
 // ---------------------------------------------------------------------------
 
-test("storage engine: no SQLite engine -> maybeOpen degrades to null (sidecar absent), never throws (#2823)", () => {
+test("storage engine: no SQLite engine -> maybeOpen REFUSES (throw), never silently degrades (#2823 re-pinned 2026-10-30)", () => {
     const dir = tmpdir("bili-engproof-noengine-open-");
     try {
         setSqliteEnginesUnavailableForTests(true);
-        const shadow = UnifiedShadow.maybeOpen(dir, { BILI_STORAGE_UNIFIED: "full" }, () => null);
-        assert.equal(shadow, null, "maybeOpen must return null (legacy-only) when no SQLite engine is available");
+        // No-degradation policy: the unified ask cannot be satisfied -> the
+        // open must throw (proxy boot then refuses loudly), not return null.
+        assert.throws(
+            () => UnifiedShadow.maybeOpen(dir, { BILI_STORAGE_UNIFIED: "full" }, () => null),
+            /no SQLite engine available/i,
+            "maybeOpen must REFUSE when no SQLite engine is available",
+        );
     } finally {
         setSqliteEnginesUnavailableForTests(false);
         rmrf(dir);
     }
 });
 
-test("storage engine: no SQLite engine -> SessionStore runs legacy-only, writes survive, no index.db (#2823)", async () => {
+test("storage engine: no SQLite engine -> construction REFUSES (no degradation in any case, 2026-10-30)", async () => {
     const dir = tmpdir("bili-engproof-noengine-e2e-");
     const prev = process.env.BILI_STORAGE_UNIFIED;
     try {
-        process.env.BILI_STORAGE_UNIFIED = "full"; // ask for the unified store...
-        setSqliteEnginesUnavailableForTests(true); // ...but pretend none exists
-        const session = loadFolded(path.join(dir, "seed"));
-        // THE #2823 regression: construction must survive with no engine at all.
-        const store = new SessionStore({ dir, debounceMs: 1, enabled: true });
-        await store.writeNow(session);
-        assert.ok(!fs.existsSync(path.join(dir, "index.db")), "no-engine mode must not create index.db");
-        const reloaded = store.loadSync("corpus-folded", { protocol: "anthropic", upstreamOrigin: "http://127.0.0.1:8199" });
-        store.closeQuietly();
-        assert.ok(reloaded, "legacy load returned null with no SQLite engine available");
-        const disk = findWrittenRecord(dir, "corpus-folded");
-        assert.ok(disk, "disk record not found");
-        assert.equal(viewDigest(toLegacyLike(reloaded)), recordDigest(disk), "no-engine: legacy load digest != disk record");
+        process.env.BILI_STORAGE_UNIFIED = "full"; // ask for the unified store
+        const session = loadFolded(path.join(dir, "seed")); // seed first (it constructs its own store)
+        setSqliteEnginesUnavailableForTests(true); // ...now pretend no engine exists
+        // #2823 re-pinned (2026-10-30 no-degradation policy): construction
+        // must REFUSE loudly — no engine at all means the unified ask cannot
+        // be served, and a silent legacy fallback was withdrawn.
+        assert.throws(
+            () => new SessionStore({ dir, debounceMs: 1, enabled: true }),
+            /no SQLite engine available/i,
+            "a unified/full ask with no engine must make construction refuse",
+        );
+        assert.ok(!fs.existsSync(path.join(dir, "index.db")), "refused construction must not leave an index.db behind");
     } finally {
         setSqliteEnginesUnavailableForTests(false);
         if (prev === undefined) delete process.env.BILI_STORAGE_UNIFIED;
@@ -509,5 +548,5 @@ test("storage engine: no SQLite engine -> SessionStore runs legacy-only, writes 
 
 // Engine note: these legs run on the process-default engine; the corpus
 // suites (storage-unified.test.ts) cover BOTH engines at the state level,
-// and the wire legs here assert against the same committed goldens the
-// legacy baseline produced.
+// and the wire legs here assert citation-normalized equality against the same
+// committed goldens the legacy baseline produced.

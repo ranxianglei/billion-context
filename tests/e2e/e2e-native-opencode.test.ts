@@ -344,7 +344,11 @@ async function stopProxiesGracefully(ctx: Ctx): Promise<void> {
       }
     }
   }
-  await new Promise((r) => setTimeout(r, 500));
+  // Wait for actual EXIT, not a blind sleep: the product drains keep-alives
+  // BEFORE flushing sessions on SIGTERM (SHUTDOWN_DRAIN_GRACE_MS = 10s
+  // backstop), so a fixed short read can land pre-flush and flake
+  // ("proxy must persist the session", #4599). Exit ⇒ flush completed.
+  await awaitProxyExit(ctx, 20_000);
 }
 
 /** Wait (bounded) for the parent-watched proxy to exit so the next run starts

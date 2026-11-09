@@ -36,10 +36,11 @@ interface Harness {
     markerRaw: (reqPath: string, anthropicBody: Record<string, unknown>) => Promise<{ status: number; body: unknown }>;
     forwarded: Record<string, unknown>[];
     dir: string;
+    settle: () => Promise<void>;
     close: () => Promise<void>;
 }
 
-async function harness(storageMode: "full" | "legacy", opts: { upstreamDelayMs?: number; upstreamStatus?: number } = {}): Promise<Harness> {
+async function harness(storageMode: "full" | "legacy", opts: { upstreamDelayMs?: number; upstreamStatus?: number; debounceMs?: number } = {}): Promise<Harness> {
     const dir = mkdtempSync(join(testRoot, "run-"));
     for (const key of ["XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME"]) process.env[key] = dir;
     process.env.BILI_STORAGE_UNIFIED = storageMode === "full" ? "full" : "legacy";
@@ -47,7 +48,7 @@ async function harness(storageMode: "full" | "legacy", opts: { upstreamDelayMs?:
     _resetPluginStateForTest();
     resetToolRingForTest();
     __resetIncrementalLaneForTests();
-    const store = new SessionStore({ dir: dir + "/sessions", enabled: true, debounceMs: 60000 });
+    const store = new SessionStore({ dir: dir + "/sessions", enabled: true, debounceMs: opts.debounceMs ?? 60000 });
     _setStoreForTest(store);
     _setForTest({});
     const forwarded: Record<string, unknown>[] = [];
@@ -106,7 +107,7 @@ async function harness(storageMode: "full" | "legacy", opts: { upstreamDelayMs?:
         const body: unknown = await response.json().catch(() => null);
         return { status: response.status, body };
     };
-    return { proxyUrl, path, turn, probe, markerTurn, markerRaw, forwarded, dir, close: async () => { await new Promise<void>((resolve) => proxy.close(() => resolve())); store.closeQuietly(); await new Promise<void>((resolve) => upstream.close(() => resolve())); } };
+    return { proxyUrl, path, turn, probe, markerTurn, markerRaw, forwarded, dir, settle: async () => { await new Promise<void>((resolve) => setTimeout(resolve, (opts.debounceMs ?? 60000) + 40)); }, close: async () => { await new Promise<void>((resolve) => proxy.close(() => resolve())); store.closeQuietly(); await new Promise<void>((resolve) => upstream.close(() => resolve())); } };
 }
 
 const userTurn = (n: number, text = "hello") => ({ id: `u${n}`, role: "user", contentType: "text", content: text.repeat(400) });
@@ -169,10 +170,14 @@ test("incremental lane: seq mismatch answers 409 with the server's seq; resync r
 });
 
 test("incremental lane: cold rebuild after restart serves the next delta from the unified table", async () => {
-    const h = await harness("full");
+    const h = await harness("full", { debounceMs: 20 });
     try {
         const seed = await h.turn({ sinceSeq: 0, messages: [userTurn(1)] });
         assert.equal(seed.status, 200);
+        // #5155: the wrap-up schedules a DEBOUNCED save, so the rows settle
+        // a moment later — let the flush land before simulating the restart.
+        await h.settle();
+        _resetSessionsForTest();
         // Simulate a process restart: session pool + warm caches dropped. The
         // canonical prefix must rebuild from the unified messages table.
         _resetSessionsForTest();
@@ -187,7 +192,7 @@ test("incremental lane: cold rebuild after restart serves the next delta from th
 });
 
 test("incremental lane: divergent resync survives a cold restart without a 409 loop", async () => {
-    const h = await harness("full");
+    const h = await harness("full", { debounceMs: 20 });
     try {
         const seed = await h.turn({ sinceSeq: 0, messages: [userTurn(1, "old branch one"), assistantTurn(1), userTurn(2, "old branch two")] });
         assert.equal(seed.status, 200);
@@ -195,6 +200,8 @@ test("incremental lane: divergent resync survives a cold restart without a 409 l
         const resync = await h.turn({ sinceSeq: 0, resync: true, messages: [userTurn(1, "edited branch")] });
         assert.equal(resync.status, 200);
         assert.equal(resync.headers.get("x-bili-applied-seq"), "1");
+        // #5155: debounced save — let the new branch's rows settle first.
+        await h.settle();
         // Cold restart: the canonical must rebuild from the CURRENT branch
         // only — the rejected branch's rows stay in the table (append-only)
         // but the served history slices past them (baseSeq epoch).
@@ -553,4 +560,34 @@ test("incrementalTurnBodyShape accepts the incremental payload and rejects anthr
     assert.equal(incrementalTurnBodyShape(garbage), false);
     const badSeq = Buffer.from(JSON.stringify({ conversationId: "c1", sinceSeq: "3", messages: [] }));
     assert.equal(incrementalTurnBodyShape(badSeq), false, "sinceSeq must be an integer");
+});
+
+// #3433: the lane ingests with anthropicToCore and re-emits with coreToAnthropic,
+// so non-anthropic message shapes must be rejected LOUDLY at the boundary —
+// converting them would silently drop assistant.tool_calls or mis-map
+// role:"tool" into user text. The client-side mirror is
+// wireMessagesLookAnthropic; this is the trust-boundary enforcement.
+test("#3433: lane rejects non-anthropic message shapes with 400, never half-converts them", async () => {
+    const h = await harness("full");
+    try {
+        const toolRole = await h.turn({ sinceSeq: 0, resync: true, messages: [
+            { role: "user", content: "hi" },
+            { role: "tool", tool_call_id: "c1", content: "out" },
+        ] });
+        assert.equal(toolRole.status, 400);
+        assert.match((toolRole.body as { error?: string }).error ?? "", /anthropic wire shape/);
+
+        const toolCalls = await h.turn({ sinceSeq: 0, resync: true, messages: [
+            { role: "assistant", content: null, tool_calls: [{ id: "c1", type: "function", function: { name: "f", arguments: "{}" } }] },
+        ] });
+        assert.equal(toolCalls.status, 400);
+        assert.match((toolCalls.body as { error?: string }).error ?? "", /anthropic wire shape/);
+
+        // the rejections applied nothing — a valid anthropic seed still lands
+        const seed = await h.turn({ sinceSeq: 0, resync: true, messages: [{ role: "user", content: "hello" }] });
+        assert.equal(seed.status, 200);
+        assert.equal(seed.headers.get("x-bili-applied-seq"), "1");
+    } finally {
+        await h.close();
+    }
 });

@@ -52,6 +52,14 @@ export function isCovered(id: string, coveredBases: Set<string>): boolean {
  * Blocks without bounds contribute nothing; messages without stamps are
  * decided by the id path alone. Both paths run in parallel (union): the id
  * path stays byte-identical for unstamped traffic.
+ *
+ * The -1/-1 "no claim" sentinel (PR #4725 N1: storage writes it when a
+ * block's covered ids cannot be resolved to transcript rows, e.g. migrated
+ * pre-unified-storage folds) contributes nothing — with the historical
+ * endSeq >= startSeq guard alone it would pass as a REAL interval and, for
+ * the [0,0] placeholder it replaces, suppress the seq-0 message as already
+ * folded. [0,0] itself stays a legitimate claim: a block can genuinely
+ * cover just seq 0.
  */
 export function coveredSeqIntervals(
   state: CompressionState,
@@ -62,6 +70,7 @@ export function coveredSeqIntervals(
     if (
       typeof block.startSeq === "number" &&
       typeof block.endSeq === "number" &&
+      block.startSeq >= 0 &&
       block.endSeq >= block.startSeq
     ) {
       intervals.push({ start: block.startSeq, end: block.endSeq });

@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { SessionStore } from "../src/persist.ts";
 import { Session, cacheBlockContent } from "../src/session.ts";
-import { exportSession, listSessions } from "../src/export.ts";
+import { exportSession, listSessions, renderHandoff } from "../src/export.ts";
 import { parseArgs } from "../src/cli.ts";
 import { createInitialState } from "acp-kernel";
 import { rmrf } from "./tmp-rm.ts";
@@ -71,7 +71,59 @@ test("bili export lists sessions and renders a handoff doc with summaries and or
 
         await assert.rejects(() => exportSession("nope", { dir }), /no session matches/);
     } finally {
+        store.closeQuietly();
         rmrf(dir);
+    }
+});
+
+test("handoff preserves the latest tool call outside request pruning and across storage reloads", async () => {
+    const previous = process.env.BILI_STORAGE_UNIFIED;
+    try {
+        for (const mode of ["legacy", "full"]) {
+            process.env.BILI_STORAGE_UNIFIED = mode;
+            const dir = mkdtempSync(path.join(tmpdir(), "bili-handoff-reply-"));
+            const store = new SessionStore({ dir, enabled: true, debounceMs: 0 });
+            try {
+                const s = makeSession("latest-tool", "Latest reply", undefined);
+                s.lastMessages = [{ id: "request", role: "user", contentType: "text", text: "read config" }];
+                s.metadata.handoffResponse = {
+                    request: s.stats.requests,
+                    messages: [{ id: "reply", role: "assistant", contentType: "tool-call", toolName: "read", toolCallId: "call1", text: '{"path":"config.ts"}' }],
+                };
+                const before = JSON.stringify(s.lastMessages);
+                for (const full of [false, true]) {
+                    const md = renderHandoff(s, full);
+                    assert.match(md, /### assistant\n/);
+                    assert.match(md, /read\(call1\)/);
+                    assert.match(md, /config\.ts/);
+                    assert.match(md, /1 (?:client )?messages/);
+                }
+                assert.equal(JSON.stringify(s.lastMessages), before, "export does not alter the request snapshot");
+                await store.writeNow(s);
+                const restored = store.loadSync(s.id);
+                assert.ok(restored);
+                assert.match(renderHandoff(restored, false), /read\(call1\)/);
+                restored.stats.requests++;
+                assert.doesNotMatch(renderHandoff(restored, false), /read\(call1\)/);
+            } finally {
+                store.closeQuietly();
+                rmrf(dir);
+            }
+        }
+    } finally {
+        if (previous === undefined) delete process.env.BILI_STORAGE_UNIFIED;
+        else process.env.BILI_STORAGE_UNIFIED = previous;
+    }
+});
+
+test("handoff ignores malformed reply metadata and exports a reply without a request snapshot", () => {
+    const s = makeSession("reply-only", "Reply only", undefined);
+    s.metadata.handoffResponse = { request: s.stats.requests, messages: [{ id: "reply", role: "assistant", contentType: "text", text: "latest answer" }] };
+    assert.match(renderHandoff(s, false), /latest answer/);
+    for (const messages of [[null], [{ role: "assistant", contentType: "text", text: {} }]]) {
+        s.metadata.handoffResponse = { request: s.stats.requests, messages };
+        assert.doesNotThrow(() => renderHandoff(s, false));
+        assert.doesNotMatch(renderHandoff(s, false), /latest answer|### assistant/);
     }
 });
 

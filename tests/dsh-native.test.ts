@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import http from "node:http";
 import { pathToFileURL } from "node:url";
-import { apply, planNativeDsh, shouldBootstrapNativeDsh, persistClientEvent, mediaBytesOfWireBody, bodyProvablyOverWindow, _attributionHealthForTest, _resetAttributionHealthForTest, _registerStateForTest, _resetRegisterForTest, _setModelInfoForTest, _setSpawnForTest, _setThrewRetryForTest, _settleNativeForTest, _stateHeadersForTest, _stateRespawnForTest, _stateTakeoverGateForTest, _stateToolsReadyForTest, _stateBeforeSendForTest, _stateOnResponseForTest, _noteRoutedForTest, _resetRoutedForTest, _resetWebProfileWarningForTest, _resetNonWebTraceForTest, _resetTitlesForTest, type PluginContext } from "../src/agent/dsh-native.ts";
+import { apply, planNativeDsh, shouldBootstrapNativeDsh, persistClientEvent, mediaBytesOfWireBody, bodyOverWindowDetail, _attributionHealthForTest, _resetAttributionHealthForTest, _registerStateForTest, _resetRegisterForTest, _setModelInfoForTest, _nativeStateForTest, _setSpawnForTest, _setThrewRetryForTest, _settleNativeForTest, _stateHeadersForTest, _stateRespawnForTest, _stateTakeoverGateForTest, _stateToolsReadyForTest, _stateBeforeSendForTest, _stateOnResponseForTest, _noteRoutedForTest, _resetRoutedForTest, _resetWebProfileWarningForTest, _resetNonWebTraceForTest, _resetTitlesForTest, _resetBodyParseStatsForTest, _bodyParseStatsForTest, _parsedBodyOnceForTest, type PluginContext } from "../src/agent/dsh-native.ts";
 import { __resetIncrementalClientForTests } from "../src/agent/incremental-client.ts";
 import { isDshCompactionActive, _resetDshCompactionVerdictForTest } from "../src/agent/dsh-compaction-disable.ts";
 import { once } from "node:events";
@@ -84,6 +84,54 @@ test("#3370: dsh incremental conversion is atomic (marker + body on the same ini
         });
     } finally {
         proxy.close();
+    }
+});
+
+// #3433: OpenAI wire shapes (assistant.tool_calls / role:"tool") must NOT be
+// converted onto the incremental lane — the lane ingests with anthropicToCore
+// and would silently drop the tool calls. They stay on full resend, exactly
+// like omp/opencode do behind wireMessagesLookAnthropic.
+test("#3433: dsh OpenAI tool shapes ride full resend; anthropic shapes still convert", async () => {
+    const proxy = await startMockProxy([], undefined, undefined, undefined, true);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-inc3433-"));
+    const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-inc3433-state-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin, XDG_STATE_HOME: stateHome, BILI_PROVIDER_REWRITES: undefined, BILI_NATIVE_DSH: undefined, BILLION_CONTEXT_PLUGIN: undefined }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            __resetIncrementalClientForTests();
+            const ctx = mockCtx();
+            ctx.setInitiator({ session: { id: "dsh-inc-3433" } });
+            apply(ctx);
+            await waitFor(() => ctx.registeredTools.length === 1, "manifest tool registration");
+            await _stateToolsReadyForTest();
+            const beforeSend = _stateBeforeSendForTest();
+            assert.ok(beforeSend, "conversion seam armed");
+            const url = `${proxy.origin}/v1/chat/completions`;
+
+            // OpenAI chat-completions shape: assistant.tool_calls + role:"tool"
+            const openaiMsgs = [
+                { role: "user", content: "list the files" },
+                { role: "assistant", content: null, tool_calls: [{ id: "call_1", type: "function", function: { name: "ls", arguments: "{}" } }] },
+                { role: "tool", tool_call_id: "call_1", content: "a.txt b.txt" },
+                { role: "user", content: "now read a.txt" },
+            ];
+            const original = JSON.stringify({ model: "gpt-test", max_tokens: 64, messages: openaiMsgs });
+            const init: RequestInit = { method: "POST", body: original };
+            await beforeSend(url, init);
+            assert.equal(init.body, original, "OpenAI tool shape rides full resend (body untouched)");
+            assert.equal(new Headers(init.headers ?? {}).get("x-bili-plugin-turn"), null, "no marker on the untouched body");
+
+            // control: the anthropic wire shape still converts (guard does not over-block)
+            const init2: RequestInit = { method: "POST", body: JSON.stringify({ model: "claude-test", max_tokens: 64, messages: [{ role: "user", content: [{ type: "text", text: "hello" }] }] }) };
+            await beforeSend(url, init2);
+            const body2 = JSON.parse(init2.body as string) as { conversationId?: string };
+            assert.equal(body2.conversationId, "dsh-inc-3433", "anthropic shape still converts to a lane turn");
+            assert.equal(new Headers(init2.headers).get("x-bili-plugin-turn"), "1", "marker stamped on the anthropic turn");
+        });
+    } finally {
+        proxy.close();
+        rmrf(home);
+        rmrf(stateHome);
     }
 });
 
@@ -1230,6 +1278,48 @@ test("#3806 apply(): a degraded web profile alarms loudly instead of the silent 
     }
 });
 
+test("#5686 P0-2 apply(): a degraded NON-WEB profile alarms loudly too (no silent arming)", async () => {
+    const proxy = await startMockProxy([]);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-5686-"));
+    const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-5686-state-"));
+    const logFile = path.join(stateHome, "billion-context", "bili.log");
+    const clientLines = (): string[] => fs.existsSync(logFile)
+        ? fs.readFileSync(logFile, "utf8").split("\n").filter((l) => l.includes("[dsh-client]"))
+        : [];
+    _setSpawnForTest(async () => undefined);
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin, XDG_STATE_HOME: stateHome, BILI_PROVIDER_REWRITES: undefined, BILI_NATIVE_DSH: undefined, BILLION_CONTEXT_PLUGIN: undefined }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            _resetWebProfileWarningForTest();
+            // headless profile (desktop app-in-bundle shape: no @deepseek-ai/*
+            // package under the profile) + a host without the internal/config
+            // hook — pre-#5686 this booted SILENTLY (info trace only).
+            const bare: Parameters<typeof apply>[0] = {
+                tools: { register: () => undefined },
+                commands: { register: () => undefined },
+                agents: {},
+                profileContext: { startedBundles: ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-headless", "billion-context"] },
+            };
+            apply(bare);
+            const lines = clientLines();
+            assert.equal(lines.length, 1);
+            assert.match(lines[0], /non-web-app bundle list/);
+            assert.match(lines[0], /could not latch/i);
+            assert.match(lines[0], /no-config-hook/);
+            assert.match(lines[0], /ARMED/i);
+            assert.match(lines[0], /#2474/);
+            await _stateToolsReadyForTest();
+        });
+    } finally {
+        _setSpawnForTest(undefined);
+        proxy.close();
+        rmrf(home);
+        rmrf(stateHome);
+        _resetRegisterForTest(undefined);
+        _resetWebProfileWarningForTest();
+    }
+});
+
 test("#3354/#3662 apply(): declares lane ownership instead of registering the overlay", async () => {
     const proxy = await startMockProxy([]);
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-cd-"));
@@ -1831,7 +1921,11 @@ test("#1117 apply() installs takeoverGate keyed on currentInitiator attribution"
             const gate = _stateTakeoverGateForTest();
             assert.ok(gate !== undefined, "takeoverGate installed");
             // unattributed (background chain, third-party in-process plugin) → NOT claimed
-            assert.equal(gate("https://api.anthropic.com/v1/messages"), false);
+            const rawNoneGate = gate("https://api.anthropic.com/v1/messages");
+            // #4829 review: the no-init (WS-lane-shaped) call must keep its SYNCHRONOUS
+            // verdict class — native-ws-intercept.ts compares with === false, no await.
+            assert.equal(rawNoneGate, false);
+            assert.equal(await rawNoneGate, false);
             // attributed (the host's own agent chain) → claimed
             ctx.setInitiator({ session: { id: "s1117" } });
             assert.equal(gate("https://api.anthropic.com/v1/messages"), true);
@@ -1866,8 +1960,9 @@ test("#1158 apply() gate refusal logs each endpoint once per process with attrib
             const refusedLines = (): string[] => (fs.existsSync(logFile) ? fs.readFileSync(logFile, "utf8") : "").split("\n").filter((l) => l.length > 0 && l.includes("takeover gate refused"));
             try {
                 const url = "https://api.gate-probe.test/v1/chat/completions";
-                assert.equal(gate(url), false, "unattributed → refused");
-                assert.equal(gate(url), false, "second refusal of the same endpoint");
+                // #4829: the none arm settles async — the recall claim may decode bodies
+                assert.equal(await gate(url), false, "unattributed → refused");
+                assert.equal(await gate(url), false, "second refusal of the same endpoint");
                 let lines = refusedLines();
                 assert.equal(lines.length, 1, `expected one refusal line per endpoint, got: ${lines.join(" | ")}`);
                 // #3651 paste-safe sink: non-public hosts are masked in the line; the dedup key
@@ -1875,11 +1970,11 @@ test("#1158 apply() gate refusal logs each endpoint once per process with attrib
                 assert.match(lines[0]!, /https:\/\/<private-host>\/v1\/chat\/completions/);
                 assert.match(lines[0]!, /no active initiator attribution/);
                 // A query string neither spawns a new line nor leaks into it.
-                assert.equal(gate(`${url}?key=sk-do-not-log`), false);
+                assert.equal(await gate(`${url}?key=sk-do-not-log`), false);
                 assert.equal(refusedLines().length, 1);
                 assert.ok(!fs.readFileSync(logFile, "utf8").includes("do-not-log"), "query string must not reach the log");
                 // A different endpoint earns its own line.
-                assert.equal(gate("https://api.other-probe.test/v1/messages"), false);
+                assert.equal(await gate("https://api.other-probe.test/v1/messages"), false);
                 assert.equal(refusedLines().length, 2);
                 // Attributed traffic claims silently.
                 ctx.setInitiator({ session: { id: "s1158" } });
@@ -1921,15 +2016,16 @@ test("#1158 L2 gate three-state: thrown attribution is a distinct state; counts 
             const refusedLines = (): string[] => (fs.existsSync(logFile) ? fs.readFileSync(logFile, "utf8") : "").split("\n").filter((l) => l.length > 0 && l.includes("takeover gate refused"));
             try {
                 const url = "https://api.gate-l2.test/v1/chat/completions";
-                // four same-state (none) refusals → exactly one line; counting continues silently
-                assert.equal(gate(url), false);
-                assert.equal(gate(url), false);
-                assert.equal(gate(url), false);
-                assert.equal(gate(url), false);
+                // four same-state (none) refusals → exactly one line; counting continues
+                // silently (#4829: the none arm settles async — the recall claim may decode bodies)
+                assert.equal(await gate(url), false);
+                assert.equal(await gate(url), false);
+                assert.equal(await gate(url), false);
+                assert.equal(await gate(url), false);
                 let lines = refusedLines();
                 assert.equal(lines.length, 1, `expected one line for repeated same-state refusals, got: ${lines.join(" | ")}`);
                 assert.match(lines[0]!, /no active initiator attribution/);
-                assert.match(lines[0]!, /refusals so far: 1$/);
+                assert.match(lines[0]!, /refusals so far: 1 \(body size unknown — streamed\/unreadable; the over-window fuse could not run\)$/);
                 // the ALS boundary starts throwing (disposed/closing agent scope) →
                 // new category → re-print carrying the accumulated count.
                 // #2924: `threw` now goes through the bounded settle-retry
@@ -1943,16 +2039,16 @@ test("#1158 L2 gate three-state: thrown attribution is a distinct state; counts 
                 lines = refusedLines();
                 assert.equal(lines.length, 2, `expected a state-transition re-print, got: ${lines.join(" | ")}`);
                 assert.match(lines[1]!, /currentInitiator\(\) threw \(agent initiator scope is disposed\)/);
-                assert.match(lines[1]!, /refusals so far: 5 \(state none→threw\)$/);
+                assert.match(lines[1]!, /refusals so far: 5 \(state none→threw\) \(body size unknown — streamed\/unreadable; the over-window fuse could not run\)$/);
                 // further thrown refusals stay silent again
                 assert.equal(await gate(url), false);
                 assert.equal(refusedLines().length, 2);
                 // back to plain none → transition the other way, count keeps running
                 ctx.agents.currentInitiator = () => undefined;
-                assert.equal(gate(url), false);
+                assert.equal(await gate(url), false);
                 lines = refusedLines();
                 assert.equal(lines.length, 3);
-                assert.match(lines[2]!, /refusals so far: 7 \(state threw→none\)$/);
+                assert.match(lines[2]!, /refusals so far: 7 \(state threw→none\) \(body size unknown — streamed\/unreadable; the over-window fuse could not run\)$/);
                 // attributed traffic claims silently — no line
                 ctx.agents.currentInitiator = origCI;
                 ctx.setInitiator({ session: { id: "s1158l2" } });
@@ -1961,7 +2057,7 @@ test("#1158 L2 gate three-state: thrown attribution is a distinct state; counts 
                 // the durable copy carries the same lines into bili.log, [dsh-client]-marked
                 const content = fs.readFileSync(logFile, "utf8");
                 // #3651: the durable line masks non-public upstream hosts (paste-safe sink), loopback stays verbatim.
-                assert.match(content, /\[warn\] \[v=[^\]]+\] \[dsh-client\] bili-native-dsh: model request sent DIRECT \(uncompressed\) — takeover gate refused https:\/\/<private-host>\/v1\/chat\/completions: currentInitiator\(\) threw \(agent initiator scope is disposed\) — agent scope disposed\/closing mid-request\? — refusals so far: 5 \(state none→threw\)$/m);
+                assert.match(content, /\[warn\] \[v=[^\]]+\] \[dsh-client\] bili-native-dsh: model request sent DIRECT \(uncompressed\) — takeover gate refused https:\/\/<private-host>\/v1\/chat\/completions: currentInitiator\(\) threw \(agent initiator scope is disposed\) — agent scope disposed\/closing mid-request\? — refusals so far: 5 \(state none→threw\) \(body size unknown — streamed\/unreadable; the over-window fuse could not run\)$/m);
                 assert.equal(errs.filter((e) => e.includes("takeover gate refused")).length, 0, "#2831: must not reach the terminal surface");
             } finally {
                 console.error = origErr;
@@ -2046,14 +2142,26 @@ test("#2924 gate `threw` persists: provably-oversized body refuses LOCALLY, ever
             const url = "https://api.gate-2924b.test/v1/chat/completions";
             const logFile = path.join(stateHome, "billion-context", "bili.log");
             const localLines = (): string[] => (fs.existsSync(logFile) ? fs.readFileSync(logFile, "utf8") : "").split("\n").filter((l) => l.length > 0 && l.includes("refused") && l.includes("LOCALLY"));
-            // 4,000,004 B / 4 = 1,000,001 tok > the floored bar max(1000
-            // declared, 1M assumed, #4079) = 1M → the OPTIMISTIC estimate
-            // already overflows: forwarding direct can only 400 upstream.
+            // 4,000,004 B / 4 = 1,000,001 tok FLOOR > the floored bar
+            // max(1000 declared, 1M assumed, #4079) = 1M → PROVABLY over:
+            // even the optimistic estimate overflows; forwarding direct can
+            // only 400 upstream.
             assert.equal(await gate(url, { bytes: 4_000_004 }), "refuse-oversized");
             assert.equal(localLines().length, 1, "one durable LOCAL-refusal line");
-            assert.match(localLines()[0]!, /≥1000001 tok \(core est 4000004B\/4\) exceeds window 1000000 \(declared 1000; never assumes below 1000000\)/);
-            // 4,000,000 B / 4 = 1M tok == floored bar: NOT provably over → direct.
-            assert.equal(await gate(url, { bytes: 4_000_000 }), false);
+            assert.match(localLines()[0]!, /attribution threw and body est ~1,140,002 tok \(the optimistic floor alone already exceeds the window\) vs window 1,000,000 \(declared 1,000; never assumes below 1,000,000\)/);
+            // #5613 calibrated tier: 4,000,000 B / 4 = 1M tok sits exactly ON
+            // the bar in floor terms (not provably over), but ×1.14 →
+            // 1,140,000 est > 1M — the measured billing bias says upstream
+            // will reject it: refuse locally instead of riding #1117 into a
+            // guaranteed 400.
+            assert.equal(await gate(url, { bytes: 4_000_000 }), "refuse-oversized");
+            assert.match(localLines()[1]!, /est ~1,140,000 tok \(calibrated estimate over; the optimistic floor 1,000,000 tok still sits under it\)/);
+            // Calibrated boundary pins (bytes/4 floor × 1.14 against the 1M
+            // bar): 3,508,768 B → floor 877,192 → est 999,999 ≤ 1M → still
+            // DIRECT; 3,508,772 B → floor 877,193 → est 1,000,001 > 1M →
+            // refused. One byte decides.
+            assert.equal(await gate(url, { bytes: 3_508_768 }), false, "under the calibrated bar stays DIRECT (#1117)");
+            assert.equal(await gate(url, { bytes: 3_508_772 }), "refuse-oversized", "one more byte trips the calibrated bar");
             // #4079 floor both-ways: a body over the DECLARED window (4004B/4
             // = 1001 tok > 1000) but under the assumed minimum must NOT be
             // refused — a mis-sized small window can never false-refuse.
@@ -2100,15 +2208,22 @@ test("#4068 gate `none` oversize arm: an unattributed body that provably cannot 
             const url = "https://api.gate-4068.test/v1/chat/completions";
             const logFile = path.join(stateHome, "billion-context", "bili.log");
             const localLines = (): string[] => (fs.existsSync(logFile) ? fs.readFileSync(logFile, "utf8") : "").split("\n").filter((l) => l.length > 0 && l.includes("refused") && l.includes("LOCALLY"));
-            // 4,000,004 B / 4 = 1,000,001 tok > the floored bar max(1000
-            // declared, 1M assumed, #4079) = 1M → provably over: a DIRECT send
-            // is a guaranteed upstream 400/413 and the host retries the SAME
-            // oversized history every turn (#4068's 6.16M-token send).
+            // 4,000,004 B / 4 = 1,000,001 tok floor > the floored bar = 1M →
+            // provably over: a DIRECT send is a guaranteed upstream 400/413
+            // and the host retries the SAME oversized history every turn
+            // (#4068's 6.16M-token send).
             assert.equal(await gate(url, { bytes: 4_000_004 }), "refuse-oversized-unattributed");
             assert.equal(localLines().length, 1, "one durable LOCAL-refusal line");
-            assert.match(localLines()[0]!, /unattributed body ≥1000001 tok \(core est 4000004B\/4\) exceeds window 1000000 \(declared 1000; never assumes below 1000000\)/);
-            // 4,000,000 B / 4 = 1M tok == floored bar: NOT provably over → direct.
-            assert.equal(await gate(url, { bytes: 4_000_000 }), false);
+            assert.match(localLines()[0]!, /unattributed body est ~1,140,002 tok \(the optimistic floor alone already exceeds the window\) vs window 1,000,000 \(declared 1,000; never assumes below 1,000,000\)/);
+            // #5613 calibrated tier, unattributed arm: floor exactly on the
+            // bar, ×1.14 → 1,140,000 est over it → refused locally (this is
+            // the exact class of send that bricked sessions in the field
+            // while passing every old floor-only check).
+            assert.equal(await gate(url, { bytes: 4_000_000 }), "refuse-oversized-unattributed");
+            assert.match(localLines()[1]!, /est ~1,140,000 tok \(calibrated estimate over; the optimistic floor 1,000,000 tok still sits under it\)/);
+            // Calibrated boundary pins (see the threw-arm twin above).
+            assert.equal(await gate(url, { bytes: 3_508_768 }), false, "under the calibrated bar keeps #1117 direct semantics");
+            assert.equal(await gate(url, { bytes: 3_508_772 }), "refuse-oversized-unattributed", "one more byte trips the calibrated bar");
             // #4079 floor both-ways: over the DECLARED window (1001 tok >
             // 1000) but under the assumed minimum → #1117 direct, not a
             // false refusal on a mis-sized declaration.
@@ -2126,6 +2241,55 @@ test("#4068 gate `none` oversize arm: an unattributed body that provably cannot 
         });
     } finally {
         _setModelInfoForTest();
+        proxy.close();
+        rmrf(stateHome);
+        rmrf(home);
+        _resetRegisterForTest(undefined);
+    }
+});
+
+test("#5613 gate DIRECT-send visibility: a continuous leak loop is logged on a bounded cadence with its body size; unknown sizes name the blind spot", async () => {
+    const proxy = await startMockProxy([]);
+    const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-5613-state-"));
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-5613-home-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin, XDG_STATE_HOME: stateHome }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            const ctx = mockCtx();
+            // No initiator wired → every request is an agentless `none`
+            // lane that the gate lets ride direct — the leak shape this
+            // visibility exists for (#5613: the ds-harness-remote loop that
+            // retried every turn with zero durable signal after line one).
+            apply(ctx);
+            await waitFor(() => ctx.registeredTools.length === 1, "initial attach tool registration");
+            const gate = _stateTakeoverGateForTest();
+            assert.ok(gate !== undefined, "takeoverGate installed");
+            const url = "https://api.gate-5613.test/v1/chat/completions";
+            const logFile = path.join(stateHome, "billion-context", "bili.log");
+            const directLines = (): string[] => (fs.existsSync(logFile) ? fs.readFileSync(logFile, "utf8") : "")
+                .split("\n")
+                .filter((l) => l.includes("sent DIRECT (uncompressed)") && l.includes("/v1/chat/completions")); // #3651: the durable copy masks the non-public host
+                // (<private-host>) — pin on the path instead.
+            // 20 small DIRECT sends (2,048 B ≪ the 1M-token bar) → exactly
+            // three durable lines: the first occurrence plus the every-10th
+            // cadence at counts 10 and 20.
+            for (let i = 0; i < 20; i += 1) {
+                assert.equal(await gate(url, { bytes: 2048 }), false, `send ${i + 1} rides #1117 direct (small body)`);
+            }
+            assert.equal(directLines().length, 3, "first + every-10th cadence, nothing else");
+            assert.match(directLines()[0]!, /refusals so far: 1 \(this body 2,048 B\)/);
+            assert.match(directLines()[1]!, /refusals so far: 10 \(state none→none\) \(this body 2,048 B\)/);
+            assert.match(directLines()[2]!, /refusals so far: 20 \(state none→none\) \(this body 2,048 B\)/);
+            // 10 more sends whose size CANNOT be known (streamed/unreadable
+            // bodies): they ride direct too, and the cadence line at count 30
+            // names the blind spot instead of staying silent.
+            for (let i = 0; i < 10; i += 1) {
+                assert.equal(await gate(url), false, `send ${21 + i} rides #1117 direct (size unknown)`);
+            }
+            assert.equal(directLines().length, 4, "cadence line at count 30");
+            assert.match(directLines()[3]!, /refusals so far: 30 \(state none→none\) \(body size unknown — streamed\/unreadable; the over-window fuse could not run\)/);
+        });
+    } finally {
         proxy.close();
         rmrf(stateHome);
         rmrf(home);
@@ -2201,7 +2365,7 @@ test("#4111 gate oversize arms are media-aware: a base64-heavy body the raw byte
     }
 });
 
-test("#4111 mediaBytesOfWireBody/bodyProvablyOverWindow: prices the inline-media shapes of every wire family, never treats pasted-text base64 as media, and re-prices the doom math only when media is the mass", () => {
+test("#4111 mediaBytesOfWireBody/bodyOverWindowDetail: prices the inline-media shapes of every wire family, never treats pasted-text base64 as media, and re-prices the doom math only when media is the mass", () => {
     const b64 = "QUJDREVGR0g=".repeat(32); // 384 chars of pure base64
     // anthropic base64 source blocks (image/document/audio share the shape)
     assert.equal(mediaBytesOfWireBody(JSON.stringify({ messages: [{ role: "user", content: [{ type: "image", source: { type: "base64", media_type: "image/png", data: b64 } }] }] })), Buffer.byteLength(b64));
@@ -2233,20 +2397,53 @@ test("#4111 mediaBytesOfWireBody/bodyProvablyOverWindow: prices the inline-media
     const bigB64 = "A".repeat(4_200_000);
     const bigUrl = `data:image/png;base64,${bigB64}`;
     const mediaOnlyInit: RequestInit = { method: "POST", body: JSON.stringify({ messages: [{ role: "user", content: [{ type: "image_url", image_url: { url: bigUrl } }] }] }) };
-    assert.equal(bodyProvablyOverWindow({ bytes: Buffer.byteLength(String(mediaOnlyInit.body)) }, mediaOnlyInit, 1000), undefined, "media-heavy body (raw mass over the old bar) is NOT provably over once media is excluded");
+    assert.equal(bodyOverWindowDetail({ bytes: Buffer.byteLength(String(mediaOnlyInit.body)) }, mediaOnlyInit, 1000), undefined, "media-heavy body (raw mass over the old bar) is NOT over once media is excluded");
     const mixedInit: RequestInit = { method: "POST", body: JSON.stringify({ messages: [{ role: "user", content: [{ type: "text", text: "y".repeat(4_000_004) }, { type: "image_url", image_url: { url: bigUrl } }] }] }) };
     const mixedBytes = Buffer.byteLength(String(mixedInit.body));
-    const mixedDoom = bodyProvablyOverWindow({ bytes: mixedBytes }, mixedInit, 1000);
-    assert.ok(mixedDoom !== undefined, "same media PLUS >4MB of text stays provably over");
+    const mixedDoom = bodyOverWindowDetail({ bytes: mixedBytes }, mixedInit, 1000);
+    assert.ok(mixedDoom !== undefined, "same media PLUS >4MB of text stays over");
+    assert.equal(mixedDoom?.provablyOver, true, ">4MB of text: even the optimistic floor alone exceeds the window");
+    assert.equal(mixedDoom?.estTokens, Math.ceil((mixedDoom?.floorTokens ?? 0) * 1.14), "calibrated tier = floor × CALIBRATED_TEXT_TOKEN_RATIO (src/util.ts)");
     assert.equal(mixedDoom?.mediaBytes, Buffer.byteLength(bigUrl), "doom numbers carry the excluded media mass");
     assert.equal(mixedDoom?.coreBytes, mixedBytes - Buffer.byteLength(bigUrl), "doom numbers carry media-excluded core bytes");
     assert.equal(mixedDoom?.window, 1_000_000, "#4079 floor never assumes below the 1M common window");
-    assert.equal(bodyProvablyOverWindow({ bytes: Buffer.byteLength(String(mediaOnlyInit.body)) }, mediaOnlyInit, 10_000_000), undefined, "media-heavy body under a big declared window never even trips stage 1");
+    assert.equal(bodyOverWindowDetail({ bytes: Buffer.byteLength(String(mediaOnlyInit.body)) }, mediaOnlyInit, 10_000_000), undefined, "media-heavy body under a big declared window never trips the raw-mass short-circuit");
     const textInit: RequestInit = { method: "POST", body: "x".repeat(4_000_004) };
-    assert.notEqual(bodyProvablyOverWindow({ bytes: Buffer.byteLength(String(textInit.body)) }, textInit, 1000), undefined, "text-only body stays provably over");
-    assert.equal(bodyProvablyOverWindow(undefined, mediaOnlyInit, 1000), undefined, "no body → no size arm");
-    assert.equal(bodyProvablyOverWindow({ bytes: mixedBytes }, mixedInit, undefined), undefined, "no window → no size arm");
-    assert.notEqual(bodyProvablyOverWindow({ bytes: mixedBytes }, undefined, 1000), undefined, "no init to re-price → media cannot be proven → the raw floor keeps the old (conservative) verdict");
+    assert.notEqual(bodyOverWindowDetail({ bytes: Buffer.byteLength(String(textInit.body)) }, textInit, 1000), undefined, "text-only body stays over");
+    assert.equal(bodyOverWindowDetail(undefined, mediaOnlyInit, 1000), undefined, "no body → no size arm");
+    assert.equal(bodyOverWindowDetail({ bytes: mixedBytes }, mixedInit, undefined), undefined, "no window → no size arm");
+    assert.notEqual(bodyOverWindowDetail({ bytes: mixedBytes }, undefined, 1000), undefined, "no init to re-price → media cannot be proven → all-core billing keeps the conservative verdict");
+});
+
+test("#4912 typed-array init.body: an undecodable buffer degrades to the conservative verdict instead of throwing out of the gate face", () => {
+    // Models V8's real limit: only buffers whose decoded form exceeds the
+    // max string length throw RangeError; small decodes keep working.
+    const savedDecoder = globalThis.TextDecoder;
+    const Real = globalThis.TextDecoder;
+    const passthrough = new Real();
+    const bigUrl = `data:image/png;base64,${"A".repeat(4_200_000)}`;
+    const raw = JSON.stringify({ messages: [{ role: "user", content: [{ type: "image_url", image_url: { url: bigUrl } }] }] });
+    const init: RequestInit = { method: "POST", body: new TextEncoder().encode(raw) };
+    const bytes = Buffer.byteLength(raw);
+    try {
+        globalThis.TextDecoder = class {
+            constructor(_label?: string, _options?: unknown) {}
+            decode(buf?: Uint8Array | ArrayBuffer): string {
+                if (buf !== undefined && buf.byteLength > 1_000_000) throw new RangeError("Invalid string length");
+                return passthrough.decode(buf);
+            }
+        } as unknown as typeof TextDecoder;
+        // Pre-fix this call threw RangeError out of the gate face. Now the
+        // undecodable buffer bills ALL bytes as core text (media unprovable).
+        const doom = bodyOverWindowDetail({ bytes }, init, 1000);
+        assert.ok(doom !== undefined, "undecodable over-bar body keeps the conservative (all-core-text) verdict");
+        assert.equal(doom?.mediaBytes, 0);
+        assert.equal(doom?.coreBytes, bytes);
+    } finally {
+        globalThis.TextDecoder = savedDecoder;
+    }
+    // Decodable twin of the SAME body: media credited exactly → not provably over.
+    assert.equal(bodyOverWindowDetail({ bytes }, init, 1000), undefined, "the guard must not zero media credits on the normal path");
 });
 
 test("#3581 gate degradation reports event-driven; give-up latch stops pointless settle-retries on a dead scope", async () => {
@@ -2548,7 +2745,7 @@ test("#1158 apply() persists bootstrap failures to bili.log (GUI stderr is invis
             // proxy's own line shape, origin-marked — stderr alone is invisible
             // to GUI hosts, which is exactly how #1158 stayed silent.
             const content = fs.readFileSync(logFile, "utf8");
-            assert.match(content, /^\d{4}-\d{2}-\d{2}T[\d:.]+Z \[warn\] \[v=[^\]]+\] \[dsh-client\] attach target http:\/\/127\.0\.0\.1:1 is not healthy — falling back to a spawned proxy$/m);
+            assert.match(content, /^\d{4}-\d{2}-\d{2}T[\d:.]+ \[warn\] \[v=[^\]]+\] \[dsh-client\] attach target http:\/\/127\.0\.0\.1:1 is not healthy — falling back to a spawned proxy$/m);
             assert.equal(errs.filter((e) => e.includes("not healthy")).length, 0, "#2831: must not reach the terminal surface");
         });
     } finally {
@@ -2570,7 +2767,7 @@ test("#1158 persistClientEvent: standard line shape into bili.log; broken fs nev
             persistClientEvent("probe https://relay.internal.example/v1/chat/completions?k=secret http://127.0.0.1:18788/bili/x https://api.deepseek.com/v1/messages");
             const logFile = path.join(stateHome, "billion-context", "bili.log");
             const content = fs.readFileSync(logFile, "utf8");
-            assert.match(content, /^\d{4}-\d{2}-\d{2}T[\d:.]+Z \[warn\] \[v=[^\]]+\] \[dsh-client\] boom-marker-xyz$/m);
+            assert.match(content, /^\d{4}-\d{2}-\d{2}T[\d:.]+ \[warn\] \[v=[^\]]+\] \[dsh-client\] boom-marker-xyz$/m);
             assert.match(content, /probe https:\/\/<private-host>\/v1\/chat\/completions http:\/\/127\.0\.0\.1:18788\/bili\/x https:\/\/api\.deepseek\.com\/v1\/messages$/m);
         });
         // Broken target (state root under a regular file): must swallow, never throw.
@@ -2800,6 +2997,67 @@ test("#1365 explicit BILLION_CONTEXT_ATTACH remains the tool endpoint when the r
         _setSpawnForTest(undefined);
         rmrf(home);
         _resetRoutedForTest();
+        _resetRegisterForTest(undefined);
+    }
+});
+
+test("#4894 declaredWindowForDirect: session model beats global default; unknown window fails open", async () => {
+    const proxy = await startMockProxy([]);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-4894-home-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            const ctx = mockCtx();
+            class Llm4894 {
+                async resolveModelInfo(): Promise<undefined> { return undefined; }
+            }
+            ctx.setModelServices(new Llm4894(), { currentSelection: () => ({ provider: "pG4894", model: "mG4894" }) });
+            apply(ctx);
+            await waitFor(() => ctx.registeredTools.length === 1, "initial attach tool registration");
+            // Seed AFTER registration settles: apply()'s inject already fired
+            // one refreshModelInfo for the global target, and its failure-
+            // shaped settle would otherwise clobber the seeded entry.
+            _setModelInfoForTest({ provider: "pS4894", model: "mS4894", contextWindow: 111 });
+            _setModelInfoForTest({ provider: "pG4894", model: "mG4894", contextWindow: 222 });
+            const hook = _nativeStateForTest().declaredWindowForDirect;
+            assert.ok(hook !== undefined, "apply() arms the direct-path window source");
+            // #2381 resolution, minus the plugin-mode gates: the session's own
+            // live header first...
+            ctx.setInitiator({ session: { id: "s4894", requestHeader: () => ({ config: { provider: "pS4894", model: "mS4894" } }) } });
+            assert.equal(hook(), 111, "session model wins over the global default");
+            // ...the host's global default as fallback...
+            ctx.setInitiator({ session: { id: "s4894" } });
+            assert.equal(hook(), 222, "global default when the session carries no header");
+            // ...and a resolvable model without cached window info → undefined
+            // (a wrong model's window is worse than none — fail open).
+            ctx.setInitiator({ session: { id: "s4894", requestHeader: () => ({ config: { provider: "pX4894", model: "mX4894" } }) } });
+            assert.equal(hook(), undefined, "unknown window fails open");
+        });
+    } finally {
+        _setModelInfoForTest();
+        proxy.close();
+        rmrf(home);
+        _resetRegisterForTest(undefined);
+    }
+});
+
+test("#4894 declaredWindowForDirect: no model services at all → undefined (fail-open)", async () => {
+    const proxy = await startMockProxy([]);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-4894b-home-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            const ctx = mockCtx();
+            apply(ctx);
+            await waitFor(() => ctx.registeredTools.length === 1, "initial attach tool registration");
+            const hook = _nativeStateForTest().declaredWindowForDirect;
+            assert.ok(hook !== undefined, "apply() arms the hook regardless of services");
+            assert.equal(hook(), undefined, "no services → no window source → fail-open direct sends");
+        });
+    } finally {
+        _setModelInfoForTest();
+        proxy.close();
+        rmrf(home);
         _resetRegisterForTest(undefined);
     }
 });
@@ -3102,5 +3360,71 @@ test("#1365 apply() attach mode: runtime death with routed evidence — waits th
         rmrf(home);
         _resetRoutedForTest();
         _resetRegisterForTest(undefined);
+    }
+});
+
+// #5792: the shared body-parse memo must dedupe N consumers onto ONE genuine
+// decode+parse per init, hand them the identical parsed value, and re-parse only
+// when a consumer swaps init.body (fork-adopt / the incremental delta form) —
+// serving a stale parse across a body swap would corrupt the downstream shape
+// checks. A failed parse caches as undefined without poisoning later lookups.
+test("#5792: shared body-parse memo dedupes consumers and invalidates on body swap", async () => {
+    _resetBodyParseStatsForTest();
+    const init: RequestInit = { method: "POST", body: JSON.stringify({ n: [1, 2, 3] }) };
+    const v1 = await _parsedBodyOnceForTest(init);
+    const v2 = await _parsedBodyOnceForTest(init);
+    const v3 = await _parsedBodyOnceForTest(init);
+    assert.equal(_bodyParseStatsForTest(), 1, "three consumers, one genuine parse");
+    assert.equal(v1, v2, "consumers share the identical parsed result");
+    assert.equal(v2, v3, "consumers share the identical parsed result");
+
+    init.body = JSON.stringify({ n: [4, 5] });
+    const v4 = await _parsedBodyOnceForTest(init);
+    assert.equal(_bodyParseStatsForTest(), 2, "swapped body forces a fresh parse (no stale reuse)");
+    assert.notEqual(v4, v1, "new body yields a distinct parsed value");
+
+    const bad: RequestInit = { method: "POST", body: "{not json" };
+    assert.equal(await _parsedBodyOnceForTest(bad), undefined, "unparseable body -> undefined");
+    assert.equal(await _parsedBodyOnceForTest(bad), undefined, "failure cached, still undefined");
+    assert.equal(_bodyParseStatsForTest(), 3, "each distinct init parses once");
+});
+
+// #5792: end-to-end through the real pre-send chain. An OpenAI-wire session used
+// to pay TWO full JSON.parse of the whole history inside the host process before
+// egress (recall parsed once, then incremental parsed again and bailed at the
+// anthropic-shape check). The chain must now collapse to exactly one genuine
+// parse while leaving the OpenAI body untouched (full resend).
+test("#5792: dsh pre-send chain parses the request body once per request", async () => {
+    const proxy = await startMockProxy([], undefined, undefined, undefined, true);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-5792-"));
+    const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-5792-state-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin, XDG_STATE_HOME: stateHome, BILI_PROVIDER_REWRITES: undefined, BILI_NATIVE_DSH: undefined, BILLION_CONTEXT_PLUGIN: undefined }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            __resetIncrementalClientForTests();
+            const ctx = mockCtx();
+            ctx.setInitiator({ session: { id: "dsh-5792" } });
+            apply(ctx);
+            await waitFor(() => ctx.registeredTools.length === 1, "manifest tool registration");
+            await _stateToolsReadyForTest();
+            const beforeSend = _stateBeforeSendForTest();
+            assert.ok(beforeSend, "pre-send seam armed");
+            const url = `${proxy.origin}/v1/chat/completions`;
+
+            const original = JSON.stringify({ model: "gpt-test", max_tokens: 64, messages: [
+                { role: "user", content: "list the files" },
+                { role: "assistant", content: null, tool_calls: [{ id: "call_1", type: "function", function: { name: "ls", arguments: "{}" } }] },
+                { role: "tool", tool_call_id: "call_1", content: "a.txt b.txt" },
+            ] });
+            const init: RequestInit = { method: "POST", body: original };
+            _resetBodyParseStatsForTest();
+            await beforeSend(url, init);
+            assert.equal(_bodyParseStatsForTest(), 1, "exactly one decode+parse across the whole pre-send chain (#5792)");
+            assert.equal(init.body, original, "OpenAI shape rides full resend (body untouched)");
+        });
+    } finally {
+        proxy.close();
+        rmrf(home);
+        rmrf(stateHome);
     }
 });

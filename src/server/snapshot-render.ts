@@ -1,3 +1,4 @@
+import type * as http from "node:http";
 import type { BiliMessage } from "acp-kernel/wire";
 import { getStore } from "../persist.js";
 import { featureEnabled } from "../rollout.js";
@@ -69,7 +70,7 @@ const MIN_SEAM_RUN = 2;
  *  when the id bytes were re-minted by an upgrade. Image cores share the
  *  "[image]" text, so the sidecar length rides the signature (same image ⇒
  *  same bytes ⇒ same length; different images practically always differ). */
-function identitySig(m: BiliMessage): string {
+export function identitySig(m: BiliMessage): string {
     const text = typeof m.text === "string" ? m.text : "";
     // #4390: hash the image BYTES, never the length — same-size screenshots
     // used to collide and chain a false seam (silent truncation). The walk
@@ -86,7 +87,11 @@ export function identitySigForTest(m: BiliMessage): string {
 
 interface ViewRow {
     seq: number;
-    msg: BiliMessage;
+    msgId: string;
+    /** Present only for UNCOVERED rows — covered rows' bytes never ride the
+     *  outbound (suppressed behind anchors), so the windowed loader (#D5-5)
+     * never reads them. */
+    msg?: BiliMessage;
 }
 
 interface SnapshotRenderDeps {
@@ -116,7 +121,7 @@ function legacyFor(session: Session, deps: SnapshotRenderDeps, clientMsgs: BiliM
     return clientMsgs;
 }
 
-function parseRow(content: string, seq: number): BiliMessage | null {
+function parseRow(content: string, seq: number, ts?: number | null): BiliMessage | null {
     try {
         const parsed = JSON.parse(content) as { id?: unknown; role?: unknown };
         if (typeof parsed.id !== "string" || typeof parsed.role !== "string") return null;
@@ -129,6 +134,9 @@ function parseRow(content: string, seq: number): BiliMessage | null {
         // DISPLAY index. Rows written before this change simply lack the
         // field; the kernel counter path keeps serving them unchanged.
         msg.ledgerSeq = seq + 1;
+        // #4313: the wall-clock stamp rides the column, never the stored
+        // bytes — hydrate it back onto the object (NULL = pre-feature).
+        if (typeof ts === "number") msg.ts = ts;
         return msg;
     } catch {
         return null;
@@ -147,31 +155,40 @@ function parseRow(content: string, seq: number): BiliMessage | null {
 // exempt the rendered prefix and validate only the tail it promises byte-intact.
 type ViewResult = { ok: true; view: BiliMessage[]; tailStart: number } | { ok: false; reason: string };
 
-function buildView(session: Session, clientMsgs: BiliMessage[]): ViewResult {
-    const activeBlocks = session.state.blocks.filter((b) => b.active);
-    if (activeBlocks.length === 0) return { ok: false, reason: "no-active-blocks" };
+interface TranscriptBase {
+    rows: ViewRow[];
+    blockSeeds: { blockId: string; seqs: Set<number> }[];
+    coveredSeqUnion: Set<number>;
+}
+
+/** Transcript stages shared by buildView and buildAnchoredView (#4804);
+ *  returns a degrade reason on any miss, never throws. */
+function loadTranscriptBase(session: Session): TranscriptBase | { reason: string } {
     const store = getStore();
-    if (!store) return { ok: false, reason: "store-unavailable" };
+    if (!store) return { reason: "store-unavailable" };
+    // #D5-5 windowed load — two tiers:
+    //   (a) identity rows (seq + msg_id, no bytes) for EVERY live row —
+    //       positions and ids drive block anchoring and the byId seam chain;
+    //   (b) content rows (bytes + media) ONLY for seqs OUTSIDE the covered
+    //       intervals — covered rows are suppressed behind anchors, so their
+    //       bytes never ride the outbound and are never read. A covered row
+    //       with corrupt bytes therefore cannot degrade the render.
     let rows: ViewRow[] = [];
     try {
-        const rawRows = store.unifiedTailViewRows(session.id);
+        const light = store.unifiedMessageIdRows(session.id);
         const seqs = store.unifiedTailSeqs(session.id);
-        if (!rawRows || rawRows.length === 0 || !seqs || seqs.length === 0) return { ok: false, reason: "transcript-empty" };
+        if (!light || light.length === 0 || !seqs || seqs.length === 0) return { reason: "transcript-empty" };
         const bySeq = new Map<number, ViewRow>();
-        for (const row of rawRows) {
-            const msg = parseRow(row.content, row.seq);
-            if (!msg) return { ok: false, reason: "row-unparsable" }; // untrustworthy transcript: degrade, never guess
-            bySeq.set(row.seq, { seq: row.seq, msg });
-        }
+        for (const row of light) bySeq.set(row.seq, { seq: row.seq, msgId: row.msgId });
         for (const seq of seqs) {
             const v = bySeq.get(seq);
-            if (!v) return { ok: false, reason: "view-pointer-missing-row" }; // view pointer to a missing row: degrade
+            if (!v) return { reason: "view-pointer-missing-row" }; // view pointer to a missing row: degrade
             rows.push(v);
         }
     } catch {
-        return { ok: false, reason: "transcript-error" };
+        return { reason: "transcript-error" };
     }
-    if (rows.length === 0) return { ok: false, reason: "transcript-empty" };
+    if (rows.length === 0) return { reason: "transcript-empty" };
 
     // #4052: the covered-region map must exist BEFORE the chain — the signature
     // fallback must not offer covered rows as bind targets (see the bySig filter
@@ -180,24 +197,127 @@ function buildView(session: Session, clientMsgs: BiliMessage[]): ViewResult {
     // signature here — #3812: the old sig sweep could not distinguish an upgrade
     // twin from a genuine later duplicate of the same text and silently swallowed
     // real messages).
+    const activeBlocks = session.state.blocks.filter((b) => b.active);
     const blockSeeds: { blockId: string; seqs: Set<number> }[] = [];
     const coveredSeqUnion = new Set<number>();
     for (const block of activeBlocks) {
         const blockSeqs = new Set<number>();
-        for (const id of block.effectiveMessageIds) {
-            for (let i = 0; i < rows.length; i++) {
-                if (rows[i].msg.id === id) blockSeqs.add(rows[i].seq);
-            }
+        const wanted = new Set(block.effectiveMessageIds);
+        for (let i = 0; i < rows.length; i++) {
+            if (wanted.has(rows[i].msgId)) blockSeqs.add(rows[i].seq);
         }
         // #3812: no fold-time id resolves against the view — the block cannot
         // be positioned (and its covered region cannot be bounded). Anchoring
         // it at the top (the old behavior) renders the summary above raw
         // history the engine can no longer suppress. Degrade to the legacy
         // path, which renders the client view untouched.
-        if (blockSeqs.size === 0) return { ok: false, reason: "block-unanchored" };
+        if (blockSeqs.size === 0) return { reason: "block-unanchored" };
         for (const seq of blockSeqs) coveredSeqUnion.add(seq);
         blockSeeds.push({ blockId: block.blockId, seqs: blockSeqs });
     }
+
+    // #D5-5: merge the covered seqs into disjoint intervals and load bytes
+    // only for the uncovered window. Row-unparsable now guards UNCOVERED
+    // bytes only — covered corruption cannot degrade the render.
+    try {
+        const intervals: [number, number][] = [];
+        {
+            const sorted = [...coveredSeqUnion].sort((a, b) => a - b);
+            for (const seq of sorted) {
+                const last = intervals[intervals.length - 1];
+                if (last && seq <= last[1] + 1) last[1] = Math.max(last[1], seq);
+                else intervals.push([seq, seq]);
+            }
+        }
+        const contentRows = store.unifiedUncoveredRows(session.id, intervals);
+        if (contentRows !== null) {
+            const bySeq = new Map<number, ViewRow>();
+            for (const row of contentRows) {
+                const msg = parseRow(row.content, row.seq, row.ts);
+                if (!msg) return { reason: "row-unparsable" }; // uncovered bytes are untrustworthy: degrade, never guess
+                bySeq.set(row.seq, { seq: row.seq, msgId: row.msgId, msg });
+            }
+            let coveredSeen = 0;
+            for (const r of rows) {
+                const v = bySeq.get(r.seq);
+                if (v) r.msg = v.msg;
+                else if (coveredSeqUnion.has(r.seq)) coveredSeen++;
+            }
+            // Every row must be accounted for: uncovered-with-bytes or
+            // covered. A gap (a row neither loaded nor covered — e.g. a
+            // concurrent ingest raced the two queries) falls back to one full
+            // load rather than rendering a hole.
+            if (coveredSeen !== [...coveredSeqUnion].filter((seq) => rows.some((r) => r.seq === seq)).length || rows.some((r) => !r.msg && !coveredSeqUnion.has(r.seq))) {
+                const full = store.unifiedTailViewRows(session.id);
+                if (full !== null) {
+                    const fullBySeq = new Map<number, BiliMessage>();
+                    for (const row of full) {
+                        const msg = parseRow(row.content, row.seq, row.ts);
+                        if (msg) fullBySeq.set(row.seq, msg);
+                    }
+                    for (const r of rows) {
+                        if (!r.msg) {
+                            const m = fullBySeq.get(r.seq);
+                            if (!m && !coveredSeqUnion.has(r.seq)) return { reason: "row-unparsable" };
+                            if (m) r.msg = m;
+                        }
+                    }
+                }
+            }
+        }
+    } catch {
+        return { reason: "transcript-error" };
+    }
+    return { rows, blockSeeds, coveredSeqUnion };
+}
+
+/** Anchor synthesis + covered-suppression merge shared by both renderers;
+ *  d = number of prefix rows rendered, tailMsgs ride verbatim after them.
+ *  null = an uncovered row has no bytes (never render a hole). */
+function assembleView(rows: ViewRow[], blockSeeds: { blockId: string; seqs: Set<number> }[], coveredSeqUnion: Set<number>, d: number, tailMsgs: BiliMessage[]): BiliMessage[] | null {
+    const anchors: { at: number; msg: BiliMessage }[] = [];
+    for (const { blockId, seqs: blockSeqs } of blockSeeds) {
+        let maxCover = -1;
+        for (const seq of blockSeqs) maxCover = Math.max(maxCover, seq);
+        let at = d;
+        for (let i = 0; i < d; i++) {
+            if (rows[i].seq > maxCover) {
+                at = i;
+                break;
+            }
+        }
+        anchors.push({
+            at,
+            msg: { id: `acp_summary_${blockId}`, role: "system", contentType: "text", text: "" } as BiliMessage,
+        });
+    }
+    anchors.sort((a, b) => a.at - b.at);
+
+    // The ENGINE owns coverage on this lane: covered rows never render —
+    // prune's effectiveMessageIds strip cannot be trusted here because
+    // reconcile may have re-keyed the block to the client's re-minted ids
+    // (#3752 upgrade turns), while the transcript rows keep fold-time ids.
+    // The synthesized anchor above carries each block's summary instead.
+    const merged: BiliMessage[] = [];
+    let ai = 0;
+    for (let i = 0; i < d; i++) {
+        while (ai < anchors.length && anchors[ai].at === i) merged.push(anchors[ai++].msg);
+        if (coveredSeqUnion.has(rows[i].seq)) continue;
+        const m = rows[i].msg;
+        if (!m) return null;
+        merged.push(m);
+    }
+    while (ai < anchors.length) merged.push(anchors[ai++].msg);
+    for (const m of tailMsgs) merged.push(m);
+    return merged;
+}
+
+function buildView(session: Session, clientMsgs: BiliMessage[]): ViewResult {
+    const activeBlocks = session.state.blocks.filter((b) => b.active);
+    if (activeBlocks.length === 0) return { ok: false, reason: "no-active-blocks" };
+    const base = loadTranscriptBase(session);
+    if ("reason" in base) return { ok: false, reason: base.reason };
+    const { rows, blockSeeds, coveredSeqUnion } = base;
 
     // Backward chain: from the client's end, match view rows (id fast path,
     // then identity signature). The chain must be contiguous; the first
@@ -206,7 +326,7 @@ function buildView(session: Session, clientMsgs: BiliMessage[]): ViewResult {
     let clientJoin = clientMsgs.length; // first client index of the tail
     {
         const byId = new Map<string, number>(); // msgId -> view index (last occurrence)
-        for (let i = 0; i < rows.length; i++) byId.set(rows[i].msg.id, i);
+        for (let i = 0; i < rows.length; i++) byId.set(rows[i].msgId, i);
         const bySig = new Map<string, number[]>(); // sig -> descending view indices
         for (let i = rows.length - 1; i >= 0; i--) {
             // #4052: covered rows take no signature binds. They never render
@@ -222,7 +342,9 @@ function buildView(session: Session, clientMsgs: BiliMessage[]): ViewResult {
             // an exact id is unambiguous (kernel contract: ids never reused)
             // and steady-state seams need it.
             if (coveredSeqUnion.has(rows[i].seq)) continue;
-            const sig = identitySig(rows[i].msg);
+            const m = rows[i].msg;
+            if (!m) continue;
+            const sig = identitySig(m);
             const list = bySig.get(sig);
             if (list) list.push(i);
             else bySig.set(sig, [i]);
@@ -283,48 +405,91 @@ function buildView(session: Session, clientMsgs: BiliMessage[]): ViewResult {
         if (run < MIN_SEAM_RUN) return { ok: false, reason: "seam-too-short" };
     }
     const d = joinRow + 1; // prefix = rows[0..d) — everything up to the join; rows beyond (rewound-away tails) never render
+    const merged = assembleView(rows, blockSeeds, coveredSeqUnion, d, clientMsgs.slice(clientJoin));
+    if (merged === null) return { ok: false, reason: "row-unparsable" };
 
-    // Anchor synthesis: one anchor per active block, positioned past the
-    // block's covered region in the transcript (first view row whose seq
-    // exceeds this block's deepest covered row; end-of-prefix when none).
-    // Per-block covered seqs come from the seeds computed before the chain
-    // (#4052). A partially re-keyed block may leave a few twin rows rendering
-    // alongside the summary (bounded duplicate content, visible, never loss);
-    // that residual is the price of never guessing.
-    const anchors: { at: number; msg: BiliMessage }[] = [];
-    for (const { blockId, seqs: blockSeqs } of blockSeeds) {
-        let maxCover = -1;
-        for (const seq of blockSeqs) maxCover = Math.max(maxCover, seq);
-        let at = d;
-        for (let i = 0; i < d; i++) {
-            if (rows[i].seq > maxCover) {
-                at = i;
-                break;
-            }
-        }
-        anchors.push({
-            at,
-            msg: { id: `acp_summary_${blockId}`, role: "system", contentType: "text", text: "" } as BiliMessage,
-        });
+    // #4241 tailStart is recorded in VIEW domain: the judge indexes its
+    // baseline (judgeBaseline === this rendered view) with it, so it must
+    // count the view rows that precede the first tail row. The client-domain
+    // join (clientJoin) is NOT a valid index into the view — the view prefix
+    // suppressed covered rows, so clientJoin can point past the view's end and
+    // the judge would validate nothing (vacuous clean — the regression that
+    // blinded the #4241 teeth on the T1-consolidation train).
+    const tailCount = clientMsgs.length - clientJoin;
+    return { ok: true, view: merged, tailStart: merged.length - tailCount };
+}
+
+// ---------------------------------------------------------------------------
+// #4804 anchored render — WS delta continuation lane (codex/opencode clients
+// that keep a previous_response_id checkpoint and send small input tails)
+// ---------------------------------------------------------------------------
+
+/** Thrown by prepare-responses when an anchored render cannot verify the
+ *  transcript seam. The WS session layer catches it and answers with the
+ *  client's standard previous_response_not_found recovery (a full replay),
+ *  which re-anchors everything losslessly. Never swallowed silently. */
+export class SnapshotAnchorFallbackError extends Error {
+    constructor(public readonly reason: string) {
+        super(`snapshot anchor fallback (${reason})`);
+        this.name = "SnapshotAnchorFallbackError";
     }
-    anchors.sort((a, b) => a.at - b.at);
+}
 
-    // The ENGINE owns coverage on this lane: covered rows never render —
-    // prune's effectiveMessageIds strip cannot be trusted here because
-    // reconcile may have re-keyed the block to the client's re-minted ids
-    // (#3752 upgrade turns), while the transcript rows keep fold-time ids.
-    // The synthesized anchor above carries each block's summary instead.
-    const merged: BiliMessage[] = [];
-    let ai = 0;
-    for (let i = 0; i < d; i++) {
-        while (ai < anchors.length && anchors[ai].at === i) merged.push(anchors[ai++].msg);
-        if (coveredSeqUnion.has(rows[i].seq)) continue;
-        merged.push(rows[i].msg);
-    }
-    while (ai < anchors.length) merged.push(anchors[ai++].msg);
-    for (let k = clientJoin; k < clientMsgs.length; k++) merged.push(clientMsgs[k]);
+/** Non-enumerable envelope property the WS session layer stamps onto the
+ *  request BEFORE dispatch when it short-circuited a delta continuation:
+ *  the identitySig of the LAST core message of the exact body dispatched.
+ *  Same-process handoff only — never serialized, never seen by other lanes. */
+export const WS_ANCHORED_REQ_PROP = Symbol.for("bili.wsAnchored");
 
-    return { ok: true, view: merged, tailStart: clientJoin };
+interface WsAnchoredPayload {
+    /** identitySig of the last converted message of the dispatched body —
+     *  must equal the sig of the transcript's last row (buildAnchoredView). */
+    tailSig: string;
+}
+
+export function wsAnchoredPayload(req: http.IncomingMessage): WsAnchoredPayload | undefined {
+    const v = (req as unknown as Record<symbol, unknown>)[WS_ANCHORED_REQ_PROP];
+    if (!v || typeof v !== "object") return undefined;
+    const p = v as WsAnchoredPayload;
+    return typeof p.tailSig === "string" && p.tailSig.length > 0 ? p : undefined;
+}
+
+/** #4804 observability latch: counts anchored renders per session; logs once. */
+export function noteAnchoredRender(session: Session, log?: (level: string, msg: string) => void): void {
+    const prior = typeof session.metadata["wsDeltaTurns"] === "number" ? (session.metadata["wsDeltaTurns"] as number) : 0;
+    session.metadata["wsDeltaTurns"] = prior + 1;
+    if (prior === 0) log?.("info", "[ws-delta] active: outbound prefix rendered from the unified transcript, delta continuations verified against it (issue #4804)");
+}
+
+/**
+ * #4804 anchored snapshot render. The client vouched the transcript up to its
+ * LAST row by protocol assertion: the checkpoint recorded the identitySig of
+ * the last core message of the EXACT body whose conversion produced those rows
+ * (commit-time, same converter), so no chain walk runs — the join is the
+ * transcript end and the whole converted body rides verbatim as the tail. Any
+ * verification miss is a degrade reason the caller turns into the typed
+ * fallback error (never a guess). Unlike buildView there is NO active-block
+ * requirement: with nothing folded yet the view is simply all rows + tail.
+ */
+export function buildAnchoredView(session: Session, tailMsgs: BiliMessage[], probeSig: string | null): ViewResult {
+    if (probeSig === null) return { ok: false, reason: "anchor-probe-unavailable" };
+    const base = loadTranscriptBase(session);
+    if ("reason" in base) return { ok: false, reason: base.reason };
+    const { rows, blockSeeds, coveredSeqUnion } = base;
+    const store = getStore();
+    if (!store) return { ok: false, reason: "store-unavailable" };
+    const last = rows[rows.length - 1];
+    // Targeted single-row read: pin the transcript's last row to the turn body
+    // that produced it. identitySig parity — the same converter ran on both
+    // sides (inbound body vs stored row bytes), so equality is byte-exact.
+    const line = store.unifiedMessageRows(session.id, [last.msgId])?.find((r) => r.msgId === last.msgId && r.seq === last.seq);
+    const probeMsg = line ? parseRow(line.content, line.seq) : null;
+    if (!probeMsg) return { ok: false, reason: "row-unparsable" };
+    if (identitySig(probeMsg) !== probeSig) return { ok: false, reason: "anchor-mismatch" };
+    const d = rows.length;
+    const merged = assembleView(rows, blockSeeds, coveredSeqUnion, d, tailMsgs);
+    if (merged === null) return { ok: false, reason: "row-unparsable" };
+    return { ok: true, view: merged, tailStart: merged.length - tailMsgs.length };
 }
 
 export function maybeSnapshotView(session: Session, clientMsgs: BiliMessage[], deps: SnapshotRenderDeps): BiliMessage[] {

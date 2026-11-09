@@ -10,7 +10,10 @@
 // with NO resolvable row in the window skips its coverage (its rows stay
 // live-visible — the safe direction) instead of failing the whole render.
 import http from "node:http";
+import { relocateCompressCarriers } from "acp-kernel";
 import { coreToAnthropic, type BiliMessage } from "acp-kernel/wire";
+import { loadConfigFile, isMcpBiliCompress } from "./config.js";
+import { resolveCompressAtFoldPoint } from "./knobs.js";
 import { getStore } from "./persist.js";
 import { peekSession } from "./session.js";
 import { pluginAgentHeader } from "./plugin.js";
@@ -84,6 +87,8 @@ export async function handlePluginRender(req: http.IncomingMessage, res: http.Se
         const m = parsed as BiliMessage & { ledgerSeq?: number };
         // store seqs are 0-based; ref display numbers are 1-based (#4346)
         m.ledgerSeq = row.seq + 1;
+        // #4313: hydrate the stored wall-clock stamp onto the message object.
+        if (typeof row.ts === "number") m.ts = row.ts;
         prefix.push(m);
         idToSeq.set(m.id, row.seq);
     }
@@ -106,11 +111,14 @@ export async function handlePluginRender(req: http.IncomingMessage, res: http.Se
         for (const s of blockSeqs) coveredSeqs.add(s);
         const maxCover = Math.max(...blockSeqs);
         const pos = viewRows.findIndex((r) => r.seq > maxCover);
-        if (pos === -1) continue; // the fold extends past the requested window
-        anchors.push({ pos, msg: { id: `acp_summary_${block.blockId}`, role: "system", contentType: "text", text: "" } as BiliMessage });
+        // #4732: pos === -1 means the fold reaches the END of the window — the
+        // covered rows are suppressed below, so the anchor MUST still land
+        // (at the tail) or the rendered prefix silently drops the whole fold
+        // with no summary in its place.
+        anchors.push({ pos: pos === -1 ? viewRows.length : pos, msg: { id: `acp_summary_${block.blockId}`, role: "system", contentType: "text", text: "" } as BiliMessage });
     }
     anchors.sort((a, b) => a.pos - b.pos);
-    const merged: BiliMessage[] = [];
+    let merged: BiliMessage[] = [];
     let ai = 0;
     for (let i = 0; i < viewRows.length; i++) {
         while (ai < anchors.length && anchors[ai].pos === i) {
@@ -118,6 +126,27 @@ export async function handlePluginRender(req: http.IncomingMessage, res: http.Se
             ai++;
         }
         if (!coveredSeqs.has(viewRows[i].seq)) merged.push(prefix[i]);
+    }
+    // #4732: tail anchors (fold covers the window's last rows) flush after
+    // the loop — they never satisfy anchors[ai].pos === i inside it.
+    while (ai < anchors.length) {
+        merged.push(anchors[ai].msg);
+        ai++;
+    }
+    // Fold-point carrier relocation mirror (switch A): with the knob on, move
+    // still-visible compress pairs from their original slot to their fold point
+    // — the same view-only transform the kernel node applies on processTurn,
+    // so the rendered prefix and steady turns agree (v2: summary text relocated
+    // to the fold point, pair kept in slot with pointer args). S4 has no
+    // per-request strictness context, so no thinking clear here.
+    // KNOWN ASYMMETRY (v1, #5470 review): the knob is read from env + the
+    // global `compress` file section only, while steady turns resolve through
+    // the full cascade — a key set at a provider/model tier moves pairs on
+    // steady turns but not here. Deliberate for now (the feature ships off by
+    // default and global-tier is the common case); wire the resolved value
+    // through in a follow-up.
+    if (resolveCompressAtFoldPoint(process.env, loadConfigFile().compress?.compressAtFoldPoint)) {
+        merged = relocateCompressCarriers(merged as unknown as Parameters<typeof relocateCompressCarriers>[0], session.state, { isCompressTool: isMcpBiliCompress }) as unknown as BiliMessage[];
     }
 
     const system = loadSystem(sessionId);

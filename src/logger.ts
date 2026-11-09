@@ -21,9 +21,11 @@
  *     logs it through this very writer, and the feedback loop spams the log
  *     file until rotation wipes the forensic window (#1233).
  *
- * Line format: `<iso-ts> [level][ [sess=<session-id>]] [v=<version>] <msg>`
- * — one prefix per PHYSICAL line (multi-line payloads repeat ts+level+tags on
- * every row, which is what makes line-wise grep / time-window queries honest).
+ * Line format: `<ts> [level][ [sess=<session-id>]] [v=<version>] <msg>` — ts is
+ * local wall clock without a zone suffix (#4535); legacy UTC "Z" heads from
+ * older builds stay parseable by the readers. One prefix per PHYSICAL line
+ * (multi-line payloads repeat ts+level+tags on every row, which is what makes
+ * line-wise grep / time-window queries honest).
  * The [sess=...] token is request-scoped via AsyncLocalStorage — see
  * enterSessionContext() below; the [v=...] token is process-wide (the running
  * build's version), so any single line from a multi-instance shared log file
@@ -100,6 +102,25 @@ let stderrDead = false;
 // raw fd, before any of our code runs). If the file leg later degrades,
 // warnReopenFailed() un-mutes so the stderr fallback still works.
 let stderrMuted = false;
+
+/** #5012: decide whether the stderr tee must be dropped once the file leg is
+ *  PROVEN live (the caller keys this to onFileLegLive; a dead file leg keeps
+ *  the stderr fallback by never firing the hook). Kept ONLY for real terminals
+ *  (isTty === true): a human terminal drains by design, while a pipe's consumer
+ *  may simply stop reading — and Node writes into a pipe are blocking with NO
+ *  error event on a full pipe (#5012: a Windows host that spawned bili,
+ *  captured stderr to a buffer, and stopped draining wedged the proxy's event
+ *  loop forever after ~64KB — no crash, no error line, just silence in the
+ *  file leg until the file died). Launcher children (launch token) keep their
+ *  unconditional mute (#2864): their stderr is a file fd anyway. */
+export function shouldMuteStderrLegAfterFileLive(hasLaunchToken: boolean, stderrIsTty: boolean | undefined): boolean {
+    return hasLaunchToken || stderrIsTty !== true;
+}
+
+/** Test seam (#5012): read the stderr-leg mute state without mutating it. */
+export function isStderrMuted(): boolean {
+    return stderrMuted;
+}
 
 /** #2864: stop writing to stderr (file-only mode). See the state comment. */
 export function muteStderrLeg(): void {
@@ -261,7 +282,7 @@ function warnReopenFailed(err: unknown): void {
     }
     if (!stderrDead) {
         try {
-            process.stderr.write(`${new Date().toISOString()} [warn] ${msg}\n`);
+            process.stderr.write(`${logTimestamp()} [warn] ${msg}\n`);
         } catch { /* stderr gone */ }
     }
 }
@@ -306,6 +327,14 @@ export function configureLogger(file?: string): string | undefined {
     return file;
 }
 
+/** Line timestamp: the system's LOCAL wall-clock time, no zone suffix
+ *  (`2026-10-24T19:19:02.681`) — same shape as the old UTC stamp minus the `Z`,
+ *  so log lines read exactly like `date` on this machine. */
+export function logTimestamp(d: Date = new Date()): string {
+    const p = (n: number, w = 2): string => String(n).padStart(w, "0");
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}.${p(d.getMilliseconds(), 3)}`;
+}
+
 /** Log a line to file + stderr. */
 export const log: Logger = (level, msg) => {
     if (capture) {
@@ -316,7 +345,7 @@ export const log: Logger = (level, msg) => {
         }
     }
     const safe = maskIpsInText(redactSecretsInText(msg));
-    const ts = new Date().toISOString();
+    const ts = logTimestamp();
     const sess = sessionCtx.getStore();
     const head = `${ts} [${level}]${sess ? ` [sess=${sess}]` : ""} [v=${VERSION}]`;
     // One prefix per PHYSICAL line (see header doc): multi-line payloads keep

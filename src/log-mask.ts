@@ -156,17 +156,32 @@ function escapeRegExp(s: string): string {
  *  publish-boundary text, rewriting it to `~` (the shell universal for $HOME).
  *  This is the identity leak #3959 proved in the wild — a public diagnostics
  *  report naming /home/<user>/... hands a stranger the reporter's username and
- *  home layout. Only THIS machine's os.homedir() is rewritten, as an ANCHORED
- *  match on BOTH flanks: preceded by start-of-string or a non-token boundary
- *  (whitespace / quote / bracket / colon / equals) AND followed by a path
- *  separator (/ or \), a quote, whitespace or end-of-string — so sibling homes
- *  (/home/<other>), URL hosts and URL pathnames are all left alone. The result
- *  stays actionable: ~/.cache/billion-context/... is exactly where the user
- *  looks to recover. Idempotent (~ has no homedir in it). */
+ *  home layout. Every spelling of THIS machine's home root is rewritten —
+ *  os.homedir() plus the $HOME and %USERPROFILE% env values (on Windows they
+ *  diverge: os.homedir() reads USERPROFILE while git-bash-style tool output
+ *  carries $HOME paths, so masking only one leaks the other; POSIX values
+ *  dedupe to one root) — each as an ANCHORED match on BOTH flanks: preceded by
+ *  start-of-string or a non-token boundary (whitespace / quote / bracket /
+ *  colon / equals) AND followed by a path separator (/ or \), a quote,
+ *  whitespace or end-of-string — so sibling homes (/home/<other>), URL hosts
+ *  and URL pathnames are all left alone. The result stays actionable:
+ *  ~/.cache/billion-context/... is exactly where the user looks to recover.
+ *  Idempotent (~ has no homedir in it). */
+function publishHomeRoots(): string[] {
+    const roots = new Set<string>();
+    for (const raw of [os.homedir(), process.env.HOME, process.env.USERPROFILE]) {
+        if (typeof raw !== "string") continue;
+        const r = raw.replace(/[/\\]+$/, "");
+        if (r) roots.add(r);
+    }
+    return [...roots].sort((a, b) => b.length - a.length);
+}
+
 export function maskPathsForPublish(text: string): string {
-    const home = os.homedir();
-    if (!text || !home) return text;
-    const re = new RegExp("(?<![/\\w.\\-])" + escapeRegExp(home) + "(?=[/\\\\\"'\\s]|$)", "g");
+    if (!text) return text;
+    const roots = publishHomeRoots();
+    if (roots.length === 0) return text;
+    const re = new RegExp("(?<![/\\w.\\-])(" + roots.map(escapeRegExp).join("|") + ")(?=[/\\\\\"'\\s]|$)", "g");
     return text.replace(re, "~");
 }
 
@@ -339,7 +354,11 @@ export function redactSecretsInText(text: string): string {
     return text
         .replace(/\b(bearer|basic)\s+([A-Za-z0-9._~+\/=-]{8,})/gi, (_m, scheme: string, tok: string) => `${scheme} <masked ${tok.length} chars>`)
         .replace(/(?<![A-Za-z0-9])(?:sk|xai)-[A-Za-z0-9_-]{8,}/g, "<masked key>")
+        // Groq (gsk_…) and Hugging Face (hf_…) keys, both on PUBLIC_HOST_SUFFIXES.
+        .replace(/(?<![A-Za-z0-9])(?:gsk|hf)_[A-Za-z0-9]{20,}/g, "<masked key>")
         .replace(/(?<![A-Za-z0-9])AIza[A-Za-z0-9_-]{20,}/g, "<masked key>")
         .replace(/eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}/g, "<masked jwt>")
-        .replace(/(\b(?:api[_-]?key|access[_-]?token|auth(?:orization)?|secret|passwd|password|token)\b\s*[:=]\s*)(["']?)([A-Za-z0-9._~+\/=-]{8,})\2/gi, (_m, pre: string, q: string, val: string) => `${pre}${q}<masked ${val.length} chars>${q}`);
+        // The optional quote after the name covers JSON/dict keys ("api_key": "…"), the shape
+        // upstream error bodies and config dumps use; without it only key=value / key: value matched.
+        .replace(/(\b(?:api[_-]?key|access[_-]?token|auth(?:orization)?|secret|passwd|password|token)\b["']?\s*[:=]\s*)(["']?)([A-Za-z0-9._~+\/=-]{8,})\2/gi, (_m, pre: string, q: string, val: string) => `${pre}${q}<masked ${val.length} chars>${q}`);
 }

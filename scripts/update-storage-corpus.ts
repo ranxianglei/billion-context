@@ -138,12 +138,16 @@ async function writeSessionAwaited(dir: string, session: Session): Promise<strin
 
 /** Digest over an in-memory session (pre-write reference — NOT the pin). */
 function sessionDigest(loaded: Session): string {
+    // #4316 PR3/3: strip the cold-load alignment marker (a flag, not view
+    // content) — mirrors the parity digest in tests/storage-unified.test.ts.
+    const state = { ...(loaded.state as unknown as Record<string, unknown>) };
+    delete state.refLedgerAligned;
     const view = {
         id: loaded.id,
         meta: loaded.meta,
         stats: loaded.stats,
         metadata: loaded.metadata,
-        state: loaded.state,
+        state,
         blockContents: [...loaded.blockContents.entries()],
         lastMessages: loaded.lastMessages,
         lastMessagesFolded: loaded.lastMessagesFolded,

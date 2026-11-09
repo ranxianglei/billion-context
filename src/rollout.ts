@@ -53,6 +53,27 @@ export const ROLLOUT_FEATURES: Record<string, RolloutPlan> = {
     // `rollout.features.pluginIncrementalTurns: true` (or a percent), or
     // `BILI_ROLLOUT_PLUGIN_INCREMENTAL_TURNS=1`.
     pluginIncrementalTurns: { percent: 0 },
+    // #5403/#5418 full-resend watermark fastpath: plugin-lane turns re-send
+    // the ENTIRE history each turn; on a verified hit (count watermark
+    // stamped by the previous response) the server stops re-parsing and
+    // re-materializing the identical prefix and decodes only head + new tail.
+    // Every verification miss degrades to the legacy full-parse path
+    // byte-identically. EXPERIMENTAL grey rollout at 5% (owner ruling
+    // 2026-11-02: default off, small cohort first, web switch + one-time
+    // intro notice ship alongside); force it per install with
+    // `rollout.features.pluginFullResendWatermark: true|false` (or a percent)
+    // / `BILI_ROLLOUT_PLUGIN_FULL_RESEND_WATERMARK=1|0`.
+    pluginFullResendWatermark: { percent: 5 },
+    // #4804 WS delta continuation: codex/opencode WebSocket clients that keep a
+    // previous_response_id checkpoint stop reconstructing full history on every
+    // turn — the session augments the delta with the server-committed previous
+    // output and the outbound prefix renders from the unified transcript
+    // (anchored snapshot render). Every verification miss degrades to the
+    // legacy full-reconstruction path or the 400 the client answers with a
+    // full replay (lossless). Requires storage.unified=full (reads); default
+    // 0% — force on with `rollout.features.wsDeltaContinuation: true` or
+    // `BILI_ROLLOUT_WS_DELTA_CONTINUATION=1`.
+    wsDeltaContinuation: { percent: 0 },
     // #2926 anthropic Threads reforge: when the mirrored thread history
     // crosses the window on a `continue`, swap it for a fresh `create`
     // carrying [summary, tail ring, delta]. Default 0% — threads traffic
@@ -76,6 +97,17 @@ export const ROLLOUT_FEATURES: Record<string, RolloutPlan> = {
     // cohorts (compressed vs deleted) and detects generation switches.
     // Default 0% — force on with `BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY=1`.
     pluginLaneServerHistory: { percent: 0 },
+    // #5825 identity-channel harvest seam (registry in identity-harvest.ts):
+    // loopback clients without an explicit body channel get stable session+
+    // message identity aligned from their OWN local transcript/sqlite
+    // (claude-code / codebuddy / mcode adapters). The per-install env switch
+    // BILI_IDENTITY_HARVEST alone already enables it; this key exists for a
+    // COHORT-WIDE ramp that never touches anyone's env. Decoupled from
+    // pluginLaneServerHistory on purpose (owner ruling 2026-11-07): that flag
+    // governs whether stamped ids get PINNED to rows, this one governs where
+    // the seam may even read local files — coupling them made opting one's
+    // own install in require bumping an unrelated rollout. Default 0%.
+    identityChannelHarvest: { percent: 0 },
 };
 
 export const BP_MAX = 10_000;
@@ -138,6 +170,14 @@ function overrideFor(feature: string, file: RolloutFileConfig | undefined): Roll
     if (o === false) return { enabled: false };
     if (typeof o === "number" && Number.isFinite(o)) return { percent: o };
     return o && typeof o === "object" && !Array.isArray(o) ? o : {};
+}
+
+/** #5403 watermark intro notice: true when the user's file carries NO
+ *  explicit override for the feature (neither shorthand nor object field —
+ *  a salt/base-only entry still counts as having touched the knob), so a
+ *  user who already made the call is never nagged. */
+export function featureOverrideAbsent(feature: string, file: RolloutFileConfig | undefined): boolean {
+    return Object.keys(overrideFor(feature, file)).length === 0;
 }
 
 function resolveInternal(feature: string, ctx: RolloutCtx, visited: Set<string>): RolloutDecision {

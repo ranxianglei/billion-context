@@ -58,7 +58,14 @@ for (const shape of ["one-interior-survivor", "all-missing", "small-zombie"] as 
                 if (shape === "all-missing") {
                     assert.equal(session.state.blocks.length, 1);
                     assert.equal(session.state.blocks[0].active, false);
-                    assert.equal(session.metadata.foldEpochConfirmPending === true, false);
+                    // #3641 doctrine: zero survivors latches the pause too — the
+                    // substrate is maximally unprovable and the ask is which
+                    // history owns the session going forward; folding must not
+                    // silently start a new epoch on foreign bytes. The original
+                    // `false` here contradicted the #3641 doctrine suites
+                    // (fold-anchor-doctrine) and was born-red at #4260; aligned
+                    // to the doctrine instead of carving the implementation out.
+                    assert.equal(session.metadata.foldEpochConfirmPending === true, pass >= 3);
                 }
             }
             assert.equal(session.blockContents.get(blockId)?.full.text, original);

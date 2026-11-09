@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as cache from "../scripts/ci-pretest-cache.mjs";
@@ -87,6 +87,47 @@ test("cold → warm → tamper lifecycle (the #4360 CI sequence)", () => {
     // The exact log lines CI greps for (#4360).
     assert.ok(lines.some((l) => l.startsWith("pretest-cache: HIT (kernel)")));
     assert.ok(lines.some((l) => l.startsWith("pretest-cache: MISS (kernel) → rebuilding")));
+});
+
+// #4599 sentinel (diagnosed on run 40161560956): actions/cache restores a
+// verified-fresh dist with SAVE-TIME mtimes while the fresh checkout leaves
+// the sources newer — content byte-identical, clock says stale. The #3325
+// guard in tests/golden-storage-drive.ts is a pure mtime oracle and reds
+// every cache-hit leg's golden drive ~4ms in. A verified HIT must reconcile
+// the two oracles by restamping dist mtimes, never by rebuilding or by
+// touching bytes.
+test("verified HIT restamps dist mtimes ahead of the checked-out sources (#4360×#3325)", () => {
+    const { root } = makeMiniRepo();
+    const log = (): void => {};
+    // COLD: real build materializes dist + marker.
+    cache.runPretestCache({ root, build: fakeBuild([]), log });
+
+    // Simulate the CI sequence: restore hands the dist back 24h old, the
+    // checkout leaves every source at now.
+    const old = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    utimesSync(join(root, "kernel/dist/index.js"), old, old);
+    for (const rel of ["kernel/src/index.ts", "kernel/src/deep/util.ts", "kernel/tsup.config.ts"]) {
+        utimesSync(join(root, rel), new Date(), new Date());
+    }
+    const srcAt = Math.max(
+        statSync(join(root, "kernel/src/index.ts")).mtimeMs,
+        statSync(join(root, "kernel/src/deep/util.ts")).mtimeMs,
+        statSync(join(root, "kernel/tsup.config.ts")).mtimeMs,
+    );
+    const distBefore = statSync(join(root, "kernel/dist/index.js")).mtimeMs;
+    assert.ok(srcAt > distBefore, "precondition: restored dist sits behind the checked-out sources");
+
+    // WARM: marker still byte-exact → HIT, zero builds…
+    const seen: string[] = [];
+    const r = cache.runPretestCache({ root, build: fakeBuild(seen), log });
+    assert.deepEqual(r.map((x) => x.hit), [true, true]);
+    assert.equal(seen.length, 0);
+
+    // …and afterwards the #3325 mtime condition can no longer fire, with
+    // the dist bytes untouched.
+    const distAfter = statSync(join(root, "kernel/dist/index.js")).mtimeMs;
+    assert.ok(distAfter >= srcAt, "HIT must restamp the dist ahead of the checked-out sources");
+    assert.equal(readFileSync(join(root, "kernel/dist/index.js"), "utf-8"), "built-bytes");
 });
 
 test("marker must match byte-exactly — absent, stale, tampered, CRLF are decided by content", () => {

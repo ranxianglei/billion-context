@@ -89,7 +89,7 @@ test("/acp on an armed-but-idle proxy renders the idle notice", async () => {
         },
     );
     assert.equal(outcome.kind, "success");
-    assert.match(outcome.text, /billion-context@9\.9\.9 — proxy connected, compression armed/);
+    assert.match(outcome.text, /billion-context@9\.9\.9 — proxy connected via .+, compression armed/);
 });
 
 test("/acp when the proxy is unreachable reports an error", async () => {

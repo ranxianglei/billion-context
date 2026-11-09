@@ -576,18 +576,24 @@ test("retrying a consumed range reports already-compressed guidance, not too-sma
   });
 
   assert.equal(retry.result.blocksCreated, 0);
-  assert.equal(retry.result.errors.length, 1);
-  assert.match(retry.result.errors[0]!, /already compressed/);
+  // #4521: a pure resubmit of an already-consumed range is an idempotent
+  // no-op success — guidance moved from errors[] to warnings[] and the
+  // result is flagged noop so hosts render a success-shaped receipt.
+  assert.equal(retry.result.errors.length, 0);
+  assert.equal(retry.result.noop, true);
+  assert.ok(retry.result.warnings.length > 0);
+  assert.match(retry.result.warnings[0]!, /already compressed/);
   assert.match(
-    retry.result.errors[0]!,
+    retry.result.warnings[0]!,
     /already summarized in active block\(s\) b1/,
   );
+  assert.match(retry.result.warnings[0]!, /do not resend these ranges/);
   assert.doesNotMatch(
-    retry.result.errors[0]!,
+    retry.result.warnings[0]!,
     /retry with startId\/endId set to active block IDs/,
   );
   assert.doesNotMatch(
-    retry.result.errors[0]!,
+    retry.result.warnings[0]!,
     /Total compressible content too small/,
   );
 });
@@ -1426,17 +1432,22 @@ test("gate error names the covering block when anchors stay consumed", () => {
   });
 
   assert.equal(result.result.blocksCreated, 0);
-  assert.equal(result.result.errors.length, 1);
+  // #4521: consumed-anchors-only resubmit is the idempotent no-op class —
+  // guidance lives in warnings[], errors[] stays empty, noop is flagged.
+  assert.equal(result.result.errors.length, 0);
+  assert.equal(result.result.noop, true);
+  assert.ok(result.result.warnings.length > 0);
   assert.match(
-    result.result.errors[0]!,
+    result.result.warnings[0]!,
     /Requested range\(s\) already compressed \(e\.g\. b2\.\.b110\)/,
   );
   assert.match(
-    result.result.errors[0]!,
+    result.result.warnings[0]!,
     /its content is already summarized in active block\(s\) b110 — use search_context or decompress b110 if you need details from it/,
   );
+  assert.match(result.result.warnings[0]!, /do not resend these ranges/);
   assert.doesNotMatch(
-    result.result.errors[0]!,
+    result.result.warnings[0]!,
     /retry with startId\/endId set to active block IDs/,
   );
 });

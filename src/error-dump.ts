@@ -18,6 +18,14 @@ import { safePrefix } from "./text-safe.js";
 let failCount = 0;
 let lastFailLog = 0;
 
+// #4482 follow-up (#4297): the banner line is part of the file on disk, so it
+// must count against the operator's byte cap — otherwise every dump exceeds
+// the knob by exactly the banner and the "final UTF-8 bytes" contract breaks.
+function cappedBudget(): number {
+    const bannerOverhead = Buffer.byteLength(DUMP_PLAINTEXT_BANNER) + 1; // banner + "\n"
+    return Math.max(knobDump4xxMaxBytes() - bannerOverhead, 0);
+}
+
 function warnDumpFailure(err: unknown): void {
     failCount++;
     const now = Date.now();
@@ -56,7 +64,7 @@ export function dumpRejectedBody(status: number, sessionId: string, body: string
     const raw = typeof body === "string" ? body : body.toString("utf8");
     if (!raw) return null;
     try {
-        const cap = knobDump4xxMaxBytes();
+        const cap = cappedBudget();
         let text = raw;
         if (Buffer.byteLength(raw) <= cap) {
             try { text = JSON.stringify(JSON.parse(raw), null, 2); } catch { /* keep non-JSON bodies raw */ }
@@ -89,7 +97,7 @@ export function dumpSummaryRejection(status: number, sessionId: string, request:
     if (!knobDump4xxEnabled()) return null;
     if (!request && !response) return null;
     try {
-        const cap = knobDump4xxMaxBytes();
+        const cap = cappedBudget();
         const side = (raw: string): string => {
             if (Buffer.byteLength(raw) > cap) return raw;
             try { return JSON.stringify(JSON.parse(raw)); } catch { return raw; }

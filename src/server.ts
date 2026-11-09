@@ -12,13 +12,12 @@ import type { ProxyOptions, ResignSettings } from "./config.js";
 export type { ProxyOptions } from "./config.js";
 import { loadNamedProviders, loadOptions, loadRoutes } from "./config.js";
 import { resetProxyCache } from "./upstream-proxy.js";
-import { FALLBACK_EFFECTIVE_WINDOW_FLOOR, findRoute, findRouteKey, lookupContextLimit, resolveConfiguredContextLimit, resolveConfiguredOutputLimit, resolveCompressProtocol, resolveResignSettings } from "./config.js";
+import { effectivePromptCacheRouting, FALLBACK_EFFECTIVE_WINDOW_FLOOR, findRoute, findRouteKey, lookupContextLimit, resolveConfiguredContextLimit, resolveConfiguredOutputLimit, resolveCompressProtocol, resolveMessageTimestamps, resolveResignSettings } from "./config.js";
 import { contextFromRegistry, loadRegistry, peekRegistryContext, peekRegistryOutputLimit, peekRegistryPriceProfile } from "./registry.js";
 import { codexAlignedWindow } from "./codex-models.js";
 import { fetchWithTimeout, upstreamTimeoutMs } from "./fetch-util.js";
 import { getUpstreamConnectionStatus, resolveProxy, resolveProxyDecision, proxyDispatcher, type UpstreamProxyDecision } from "./upstream-proxy.js";
 import { buildProxyFailureResponse, isExpectedFailFast, type SkippedProxyInfo } from "./upstream-fail.js";
-import { getUpstreamAlerts } from "./upstream-alerts.js";
 import { hostIdForLog, maskHostPortForLog, setMaskHostsEnabled, maskUrlForLog, maskUrlsInText } from "./log-mask.js";
 // Protocol codecs + the historical-image strip primitive live in the kernel now
 // (single source of truth shared with the omp/pi adapters): import from
@@ -54,12 +53,12 @@ import { prepareGoogle, prepareGoogleCountTokens } from "./server/prepare-google
 import { prepareResponses, prepareResponsesCompact } from "./server/prepare-responses.js";
 import { FORCE_TEXT_PROTOCOL } from "./server/inject.js";
 export { isChatGptCodexUpstream, isCodexResponsesLite, resolvePromptCacheKey, shouldInjectPromptCacheKey } from "./server/prepare-responses.js";
-import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "./fold-reconcile.js";
 import { biliToolsDeclaredOnWire, countBiliToolUses, evaluateSelfHealRound, nudgeSuppressed, pluginLaneDegraded, pluginLaneRestore } from "./session-self-heal.js";
 import { getSession, hasProcessedState, listSessions, peekSession, type PendingRetrieval, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, totalInFlight, snapshotMessages, ensureCanonicalId, storeEffectiveConfig, foldCoverage, postRebuildAnchorTokens, setPostRebuildAnchor, tickPostRebuildAnchor, splitSessionWarnings, usageAnchorCycleStale, staleSmallAnchorFallback, RESPONSES_TURN_SEPARATOR_ID_PREFIX } from "./session.js";
-import { detectStaleInstall } from "./update.js";
+import { detectStaleInstall, isVersionNewer } from "./update.js";
 import { decideEaddrinuse, eaddrinuseExitCode, isPortBusyError, postBindCanLadder, UPGRADE_REPLACEMENT_ENV, type FailFastReason } from "./listen-policy.js";
 import { getAdvisoryState, cannotResolveTarget } from "./advisory.js";
+import { pckNoticeActive } from "./pck-notice.js";
 import { PACKAGE_NAME, VERSION } from "./version.js";
 import {
     coreToGoogle,
@@ -79,13 +78,13 @@ import { ccrEnabled, ccrLoopConfig, ccrPluginWireOk, contentStoreOf, executeRetr
 import { buildIncomingImageIndex, pruneRetrieveImgExports } from "./image-restore.js";
 import { rulesEnabled, storeEffectiveRules } from "./rules-feature.js";
 import { storeEffectiveSearchPlanAware } from "./decompress-shared.js";
-import { armAutoFoldBackoff, autoFoldEngaged, AUTO_FOLD_BACKOFF_MS, externalQueueDroppedAll, withExternalSummaryTools } from "./external-summary-surface.js";
-import { AUTO_FOLD_TARGET_MIN } from "./external-summary-settings.js";
+import { armAutoFoldBackoff, autoFoldEngaged, autoFoldFloor, AUTO_FOLD_BACKOFF_MS, externalQueueDroppedAll, withExternalSummaryTools } from "./external-summary-surface.js";
+import { AUTO_FOLD_TARGET_MIN, AUTO_FOLD_MIN_BENEFIT_TOKENS } from "./external-summary-settings.js";
 import { auditStartupSummaryCredentials } from "./external-summary-credentials.js";
 import { applyRanges } from "./stream.js";
 import { attachSubagentSessions } from "./subagent-sessions.js";
 import { buildSessionCacheReport, handleAcpCache, learnedImageReserve, noteClientAbort, readKeySwitchStats, readModelSwitchStats, settleUsageReport } from "./cache-ledger.js";
-import { extractBillingAttributionBlock, extractSummaryFromSse, preflightCompress, estimateCoreMessages, estimateCoreMessagesUpper, estimateCoreMessagesUpperBytes, describeCoreTextDuplication, estimateRawBodyTokens, type PreflightResult } from "./preflight.js";
+import { extractBillingAttributionBlock, extractSummaryFromSse, preflightCompress, estimateCoreMessages, estimateCoreMessagesUpper, estimateCoreMessagesUpperBytes, describeCoreTextDuplication, estimateRawBodyTokens, estimateRawBodyBreakdown, type PreflightResult, type RawBodyBreakdown } from "./preflight.js";
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, DEFAULT_DECIDE_MAX_TOKENS, DECIDE_TIMEOUT_MS, extractDecisionText, ladderMode, parseDecision, recordDecision, resolveDecisionRange, type DecideConfig, type DecisionOutcome } from "./nudge-decide.js";
 import { gcConfigFromEnv, gcSessionFiles } from "./session-gc.js";
 import { countImagesInParsedBody, countImagesInRawBody, imageTokensInRawBody, imageTokensInParsedBody, resolveImageBilling, upstreamHost, type ResolvedImageBilling } from "./image-tokens.js";
@@ -95,13 +94,16 @@ import { reapOrphanBlocks } from "./orphan-gc.js";
 import { conflictScanEnabled, isDesignBenign, scanClientPlugins, sniffScanClient } from "./thirdparty-scan.js";
 import { clearConflictEvents, recordConflict, summarizeConflicts } from "./conflict-watch.js";
 import { getStore, setGlobalSessionCommitListener } from "./persist.js";
-import { log as loggerLog, configureLogger, getLogPath, closeLogger, isStreamWriteError, isBenignSocketRaceError, enterSessionContext, muteStderrLeg, onFileLegLive } from "./logger.js";
+import { log as loggerLog, configureLogger, getLogPath, closeLogger, isStreamWriteError, isBenignSocketRaceError, enterSessionContext, muteStderrLeg, onFileLegLive, shouldMuteStderrLegAfterFileLive, logTimestamp } from "./logger.js";
+import { noteRequest } from "./attach-heartbeat.js";
 import { queryLogLines } from "./web/logs-query.js";
-import { configFile, defaultLogFile, stateDir } from "./paths.js";
-import { atomicWriteInstanceFile, clearProxyInstanceFile, classifySameLanePeer, entryScriptFingerprint, entryShape, findSameLanePredecessor, findVerifiedSameLaneTwin, isPidAlive, listInstances, readProxyInstanceFile, registerInstanceAndWarn, sameInstanceShape, unregisterInstance, warnOnNewPeers, writeSpawnPortLog, type InstanceShape, type ProxyInstanceFile, type SameLanePeer } from "./instance.js";
-import { createServedMarkerWriter, reapStaleWriterMarkers, writerMarkerDir, type ServedMarkerWriter } from "./served-markers.js";
-import { recordSplitBrainContest } from "./storage/runtime-status.js";
-import { mayClobberPointer, probeOwnerInfo, resolvePortClaim } from "./port-owner.js";
+import { configFile, defaultLogFile, sessionsDir, stateDir } from "./paths.js";
+import { atomicWriteInstanceFile, clearProxyInstanceFile, classifySameLanePeer, entryShape, findPresentUnverifiedSameLaneTwin, findSameLanePredecessor, findVerifiedSameLaneTwin, isPidAlive, listInstances, markPortReleased, probePid, readProxyInstanceFile, registerInstanceAndWarn, resolveOwnFingerprint, sameInstanceShape, SPAWN_FINGERPRINT_ENV, unregisterInstance, warnOnNewPeers, writeSpawnPortLog, type InstanceShape, type PidProbe, type ProxyInstanceFile, type RegistryEntry, type SameLanePeer } from "./instance.js";
+import { createServedMarkerWriter, peerStillContests, processStartMs, reapStaleWriterMarkers, writerMarkerDir, type ServedMarkerWriter } from "./served-markers.js";
+import { recordSplitBrainContest, registerSplitBrainEvidenceCheck } from "./storage/runtime-status.js";
+import { holderProbeOrigin, mayClobberPointer, probeHolderForHint, probeOwnerInfo, resolvePortClaim, verifyEntryOwnsPort } from "./port-owner.js";
+import { armEventLoopWatchdog } from "./event-loop-watchdog.js";
+import { tcpConnectable } from "./liveness.js";
 import { hoistTrappedToolItems } from "./tool-pair-order.js";
 import { computeAnthropicMessageMarks, stampAnthropicSystemCacheControl, anthropicToolsCarryCacheControl } from "./loop/cache-control.js";
 import { reconcileSystemAnchor } from "./system-anchor.js";
@@ -112,7 +114,7 @@ import type { CommandcodeEnvelopeMeta } from "./commandcode-wire.js";
 import { CODEX_COMPACT_HEALTH_RATIO, codexCompactMode, codexHealthBarApplies, hasCompactionTrigger, stripBiliCompactionItems, replaceBiliCompactionItems, codexCompactGate, codexCompactGatePre, buildTriggerForgeBody, mergeForgedSummaries } from "./codex-compact.js";
 import { emitPreflightError } from "./stream-error.js";
 import { agentProviderRecipes } from "./agent-providers.js";
-import { affinityToken, claudeSubagentAgentId, claudeSubagentSplit, clientConversationHeader, codexTurnIdentity, conversationHeaderSource, dshPersonaFingerprintApplies, instructionsFingerprintApplies, openaiSystemTextForPersona, preferPromptCacheKeyIdentity, type ConversationIdentity } from "./session-id.js";
+import { affinityToken, claudeSubagentAgentId, claudeSubagentSplit, clientConversationHeader, codexTurnIdentity, conversationHeaderSource, dshPersonaFingerprintApplies, openaiSystemTextForPersona, preferPromptCacheKeyIdentity, type ConversationIdentity } from "./session-id.js";
 import { prefixAffinity, type AnonymousAffinity } from "./prefix-affinity.js";
 import { maybeAdoptForkBlocks, maybeAdoptResume, reconcileDerivedLineage } from "./fork-adoption.js";
 import { flushPrefixAffinity, hydratePrefixAffinity, scheduleAffinityPersist } from "./affinity-persist.js";
@@ -139,6 +141,8 @@ import {
     keepAliveTimeoutMs as knobKeepAliveTimeoutMs,
     keepResponseId as knobKeepResponseId,
     limitsReceiveBytes as knobLimitsReceiveBytes,
+    limitsMaxMessages,
+    limitsIngestBytes as knobLimitsIngestBytes,
     noCompressPrompt as knobNoCompressPrompt,
     noInjectTool as knobNoInjectTool,
     postResponseLingerMs as knobPostResponseLingerMs,
@@ -159,6 +163,7 @@ import { pipeThrough } from "./server/stream-io.js";
 import { artifactSeedHit, detectAcpArtifacts } from "./server/chain-artifacts.js";
 import { droppedOpenaiParts } from "./wire-drop-warn.js";
 import { BP_MAX, ROLLOUT_FEATURES, rolloutDecisions, rolloutInstallId, warnRolloutConfigProblems } from "./rollout.js";
+import { SnapshotAnchorFallbackError, WS_ANCHORED_REQ_PROP } from "./server/snapshot-render.js";
 export { forward } from "./server/relay.js";
 
 // #1086/#1218: the per-session chain-verdict memory moved to plugin.ts
@@ -423,7 +428,7 @@ export function googlePathKind(urlPath: string): GooglePathKind | null {
  *  `parsed.model`. Returns undefined when the path carries no model or an
  *  undecodable one. */
 export function googleModelFromPath(urlPath: string): string | undefined {
-    const m = /\/models\/([^/:?]+):(?:streamGenerateContent|generateContent|countTokens)\b/.exec(urlPath);
+    const m = /\/models\/([^:?]+):(?:streamGenerateContent|generateContent|countTokens)\b/.exec(urlPath);
     if (!m || !m[1]) return undefined;
     try {
         return decodeURIComponent(m[1]);
@@ -506,18 +511,26 @@ export async function createEngineContext(opts: ProxyOptions): Promise<EngineCon
     // %TEMP%/bili-proxy-<port>.log (raw append fd, no rotation) — with the
     // file leg live that pipe is a pure unbounded duplicate of bili.log
     // (31.7MB/5 days observed, other sessions' traces included). Mute it:
-    // the port log degrades to a pre-logger crash sink only. Manual starts
-    // (no launch token) keep the terminal tee; a dead file leg keeps the
-    // stderr fallback. #3857: the decision waits for the file leg to be
-    // PROVEN live (onFileLegLive) — liveness means the first byte was
-    // DELIVERED, not merely opened: on win32 (observed node 22) some paths
-    // hand out an fd whose writes then always fail, and at startup the stream
-    // is only pending anyway; deciding on either muted stderr over a dead leg
-    // and every line vanished with zero trace.
-    if (process.env.BILI_LAUNCH_TOKEN?.trim()) {
+    // the port log degrades to a pre-logger crash sink only. #3857: the
+    // decision waits for the file leg to be PROVEN live (onFileLegLive) —
+    // liveness means the first byte was DELIVERED, not merely opened: on win32
+    // (observed node 22) some paths hand out an fd whose writes then always
+    // fail, and at startup the stream is only pending anyway; deciding on
+    // either muted stderr over a dead leg and every line vanished with zero
+    // trace. #5012: the same reasoning extends beyond launcher children to ANY
+    // non-terminal stderr — a host that spawns bili and captures stderr into a
+    // buffer without draining it fills the ~64KB pipe; Node pipe writes are
+    // blocking and a full pipe NEVER emits an error event, so the proxy's
+    // event loop wedged mid-write: no crash, no error line, silent file leg,
+    // the "App frozen" symptom class. A terminal (isTTY) drains by design and
+    // keeps the tee; everything else gets the durable bili.log only (a dead
+    // file leg still restores the stderr fallback, warnReopenFailed).
+    if (shouldMuteStderrLegAfterFileLive(Boolean(process.env.BILI_LAUNCH_TOKEN?.trim()), process.stderr.isTTY)) {
         onFileLegLive(() => muteStderrLeg());
     }
-    const core = createCore();
+    // #4313 toggle (PR #5236): resolved ONCE per instance — stamping/rendering
+    // are baked into the pipeline nodes, so changing the flag needs a restart.
+    const core = createCore(resolveMessageTimestamps(opts.compress) ? { timestamps: true } : undefined);
     const config: Config = opts.kernelConfig;
     const log = (level: string, msg: string) => logMsg(opts, level, msg);
     // #300: per-server identity stamped into the x-bili-hop marker on outbound
@@ -558,6 +571,16 @@ export async function createEngineContext(opts: ProxyOptions): Promise<EngineCon
     // that survived a restart keep their folded view (otherwise long sessions
     // re-send oversized raw history and hang).
     await initSessions();
+    // No-degradation policy (2026-10-30): an ASYNC storage backend (mysql)
+    // attaches after construction; awaiting here makes "backend never came up"
+    // refuse at boot BEFORE listen() instead of surfacing on the first request
+    // (the old contract was openAsync degrades-to-null + first-request failure).
+    try {
+        await getStore().ready();
+    } catch (e) {
+        log("error", `[storage] refusing to start: ${String(e)}`);
+        process.exit(1);
+    }
     loadConversations();
     log("info", `[persist] ${getStore().enabled ? "enabled" : "disabled"}`);
     // #2807: restore fork lineage that a restart orphaned. Every fork writes
@@ -570,7 +593,7 @@ export async function createEngineContext(opts: ProxyOptions): Promise<EngineCon
     // (peekSession, then the on-disk store), so it has to be resident first.
     // The plugin conversation routing table is irrelevant to this sweep.
     try {
-        const adopted = reconcileDerivedLineage(listSessions(), {
+        const adopted = await reconcileDerivedLineage(listSessions(), {
             log,
             adoptionEnabled: opts.resumeInheritance !== false,
         });
@@ -638,9 +661,12 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // #1225: lane identity + code fingerprint recorded into the instance file
     // so later launches can decide reuse by WHO started us and WHICH code we
     // run — not just config shape (same-version stale dist kept serving after
-    // a rebuild; different clients cross-wrote one shared proxy).
+    // a rebuild; different clients cross-wrote one shared proxy). The digest
+    // itself comes from our spawner when we have one (#4125): re-hashing under
+    // our own feet diverges from every attach/rotate gate the spawner already
+    // ran on the script it exec'd.
     const launcherLane = process.env.BILI_LAUNCHER_LANE?.trim() || undefined;
-    const ownFingerprint = entryScriptFingerprint(process.argv[1]);
+    const ownFingerprint = resolveOwnFingerprint(process.env[SPAWN_FINGERPRINT_ENV], process.argv[1]);
     // #3801: our config shape EXACTLY as the registration below will record
     // it — the byte-stable pair for judging whether a contended-port holder
     // is a true duplicate or a config-drifted predecessor.
@@ -651,8 +677,38 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         modelWindows: { ...LAUNCHER_MODEL_WINDOWS },
         modelMaxOutputs: { ...LAUNCHER_MODEL_MAX_OUTPUTS },
     };
+    // #4762: arm the event-loop wedge detector as EARLY as startServer runs —
+    // startup phases (twin probes, engine/storage init, hydrate) carry their
+    // own sync-I/O hotspots and a stderr-pipe wedge (#5012 class) can arrive
+    // any time logging flows, so arming only after markBootReady left those
+    // windows unwatched. configureLogger here mirrors the early-twin path
+    // below (idempotent — createEngineContext re-configures the same path);
+    // plugin-injection mode never calls startServer, so the host process can
+    // still never trip the self-exit.
+    const watchLogFile = configureLogger(opts.logFile ?? defaultLogFile());
+    armEventLoopWatchdog({
+        logFile: watchLogFile,
+        version: VERSION,
+        onSpawnFailure: (err) => logMsg(opts, "warn", `[event-loop-watchdog] could not arm (${String(err)}) — continuing unwatched (#4762)`),
+    });
+
+    const instances = listInstances();
+    /** Both pre-persistence twin exits below share this tail: createEngineContext
+     *  has not run yet, so its configureLogger call has not happened either —
+     *  open the file leg here (mirroring it) so the twin line lands in bili.log
+     *  like the late-path twin line, gate on opts.log like every other
+     *  startServer line, and drain the stream before exiting or the buffered
+     *  line can be lost with the process. */
+    const exitBeforePersistence = async (hint: string): Promise<never> => {
+        const listenLine = `listen failed: EADDRINUSE listen EADDRINUSE: address already in use ${opts.host}:${opts.port}${hint}`;
+        configureLogger(opts.logFile ?? defaultLogFile());
+        logMsg(opts, "error", listenLine);
+        if (launchToken !== undefined) writeSpawnPortLog(opts.port, `${logTimestamp()} [error] [v=${VERSION}] ${listenLine}`);
+        await closeLogger();
+        process.exit(eaddrinuseExitCode("twin-collision"));
+    };
     const earlyTwin = await findVerifiedSameLaneTwin(
-        listInstances(),
+        instances,
         opts.port,
         launcherLane,
         ownFingerprint,
@@ -660,18 +716,34 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         (origin) => probeOwnerInfo(origin),
     );
     if (earlyTwin !== undefined) {
-        const hint = ` — port ${opts.port} is already served by a same-build bili instance (pid ${earlyTwin.pid}, lane ${launcherLane}) — exiting before persistence initialization instead of hopping: the duplicate loses and the serving instance keeps serving; the next launch will attach to it (#4341/#3044). A spawner reads this exit as an adopt signal and attaches to the serving instance itself (#3654).`;
-        const listenLine = `listen failed: EADDRINUSE listen EADDRINUSE: address already in use ${opts.host}:${opts.port}${hint}`;
-        // createEngineContext has not run yet, so its configureLogger call
-        // has not happened either — open the file leg here (mirroring it) so
-        // the adopt line lands in bili.log like the late-path twin line, gate
-        // on opts.log like every other startServer line, and drain the stream
-        // before exiting or the buffered line can be lost with the process.
-        configureLogger(opts.logFile ?? defaultLogFile());
-        logMsg(opts, "error", listenLine);
-        if (launchToken !== undefined) writeSpawnPortLog(opts.port, `${new Date().toISOString()} [error] [v=${VERSION}] ${listenLine}`);
-        await closeLogger();
-        process.exit(eaddrinuseExitCode("twin-collision"));
+        // #4762: the twin verdict above rested on ONE health probe during
+        // classification — a wedged zombie drains probes intermittently, so
+        // re-probe at the moment of death and say which case we actually hit.
+        const holderFragment = await probeHolderForHint({ origin: holderProbeOrigin(opts.host, opts.port), knownPid: earlyTwin.pid });
+        await exitBeforePersistence(` — port ${opts.port} is already served by a same-build bili instance (pid ${earlyTwin.pid}, lane ${launcherLane}) — exiting before persistence initialization instead of hopping: the duplicate loses and the serving instance keeps serving; the next launch will attach to it (#4341/#3044). A spawner reads this exit as an adopt signal and attaches to the serving instance itself (#3654). ${holderFragment}.`);
+    }
+    // #4977: the verified path above only adopts an occupant that PROVES itself
+    // healthy. The complement case — same-build twin marker whose socket still
+    // accepts connections but whose health probe is silent (dying or
+    // event-loop-wedged, #3654) — used to fall through into persistence init
+    // and open index.db under the zombie before the listen failed EADDRINUSE
+    // (two-writer window #3923/#3959). Same outcome, decided earlier: once the
+    // bind proved the port busy, the late policy classified this exact registry
+    // evidence and fail-fast-exited with the identical code.
+    // #5018 decision (owner, 2026-10-31): option A — the early adopt-exit wins
+    // over #5016's late ladder for this unstamped same-lane corner; the
+    // cross-lane squatter form stays ladder-off (lane matching excludes it).
+    const presentTwin = await findPresentUnverifiedSameLaneTwin(
+        instances,
+        opts.port,
+        launcherLane,
+        ownFingerprint,
+        (entry) => sameInstanceShape(entryShape(entry), ownShape),
+        (origin) => probeOwnerInfo(origin),
+        (origin) => tcpConnectable(origin),
+    );
+    if (presentTwin !== undefined) {
+        await exitBeforePersistence(` — port ${opts.port} is still held by a same-build bili instance (pid ${presentTwin.pid}, lane ${launcherLane}) whose health probe is silent while its socket accepts connections: it is dying or event-loop-wedged (#3654), not serving — exiting before persistence initialization instead of opening index.db under it (#3923/#3959 two-writer window); the spawner reads this exit as an adopt signal and retries once the port frees (#4811/#4977).`);
     }
 
     const engine = await createEngineContext(opts);
@@ -687,6 +759,15 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         try {
             await handle(req, res, opts, core, config, log, instanceId, instanceStartedAt, proxyWatchers, initialWatcherPid, adminCtx);
         } catch (err) {
+            // #4817/#4804: an anchored WS delta continuation whose seam check
+            // failed is OWNED by the WS session above — it answers with the
+            // client's standard 400 previous_response_not_found frame, clears
+            // the checkpoint chain, and the client's full replay re-anchors.
+            // Swallowing it into the generic 503 here would retain the
+            // checkpoint and loop the client on the same deterministic miss.
+            // The rethrow rides ONLY the request the WS session stamped
+            // (WS_ANCHORED_REQ_PROP); plain-HTTP lanes keep the 503 shape.
+            if (err instanceof SnapshotAnchorFallbackError && (req as unknown as Record<symbol, unknown>)[WS_ANCHORED_REQ_PROP] !== undefined) throw err;
             const msg = String(err);
             const e = err as { name?: string; message?: string };
             // #411: a client cancel aborts the upstream fetch via
@@ -695,6 +776,10 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
             // feeding the context-free [error] AbortError storm.
             const clientAbort = (e?.name === "AbortError" || /abort/i.test(String(e?.message ?? ""))) && (res.destroyed || res.writableEnded);
             if (clientAbort) log("info", `client aborted mid-stream: ${msg}`);
+            // #2465/#5663: classified transport deaths are already fully described on
+            // one line (kind/code/errno/syscall/address/hint) — stack frames were pure
+            // noise in field EHOSTUNREACH storms (305 failures × 7).
+            else if (err instanceof Error && (err as Error & { biliTransportFailure?: boolean }).biliTransportFailure === true) log("error", msg);
             // #4254: a deliberate circuit-breaker fail-fast logs nothing here — the
             // throttled [warn] at the throw site is the canonical record, so one dead
             // upstream stops re-emitting a per-request [error]+stack on every round.
@@ -1124,6 +1209,43 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     const PREDECESSOR_WAIT_MS = 500;
     let predecessorTicksLeft = PREDECESSOR_WAIT_TICKS;
     let predecessorWaitAnnounced = false;
+    // #4125: a strictly NEWER same-lane build holding our target port is not
+    // a "predecessor being replaced by an upgrade" — nothing is draining there,
+    // and laddering would fork the lane into a dual instance behind a port
+    // nobody routes to anymore (the two-install deadlock: the spawner's attach
+    // gate rejects the holder's foreign bytes, #3544 rotation only reaches
+    // strictly OLDER residents, and every new spawn loses the bind race). On
+    // confirmation the child exits with the #3654 adoption signal so the
+    // spawner rides the newer build. Probed once PER PORT and then cached
+    // (confirmed = {pid, version}, denied = null): a denial on port N says
+    // nothing about port N+1. Manual starts (no launch token) keep their legacy
+    // ladder semantics — only a spawner honors the adoption exit code — and so
+    // does an upgrade-replacement (its spawner owns the drain wait, never an
+    // adoption).
+    const newerHolderByPort = new Map<number, { pid: number; version: string } | null>();
+    const findNewerSameLaneHolder = async (port: number): Promise<{ pid: number; version: string } | null> => {
+        const cached = newerHolderByPort.get(port);
+        if (cached !== undefined) return cached;
+        let found: { pid: number; version: string } | null = null;
+        if (launchToken !== undefined && !upgradeReplacement && launcherLane !== undefined && ownFingerprint !== undefined) {
+            for (const entry of listInstances()) {
+                if (entry.port !== port || entry.lane !== launcherLane) continue;
+                if (entry.portReleasedAt !== undefined || !isPidAlive(entry.pid)) continue;
+                if (entry.codeFingerprint === ownFingerprint) continue; // twin/drifted paths own those
+                if (!sameInstanceShape(entryShape(entry), ownShape)) continue;
+                // Positive proof only: the live listener must answer health as
+                // EXACTLY the registry entry's claimed pid AND report a build
+                // strictly newer than ours (#4982 discipline).
+                const info = await probeOwnerInfo(entry.origin);
+                if (info?.pid === entry.pid && info.version !== undefined && isVersionNewer(info.version, VERSION)) {
+                    found = { pid: entry.pid, version: info.version };
+                    break;
+                }
+            }
+        }
+        newerHolderByPort.set(port, found);
+        return found;
+    };
     // #3923: per-session writer marker (session-level split-brain visibility) —
     // wired in announceListening, disposed on graceful shutdown.
     let servedWriter: ServedMarkerWriter | undefined;
@@ -1200,9 +1322,17 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         // launcher-private launchToken) so lane-aware attach discovery and
         // the #394 warning can reason about EVERY live instance — the single
         // proxy-origin file only reflects the last writer.
-        const registryRecord = { ...instanceRecord };
+        // #5046: carry the resolved sessions dir on the REGISTRY marker only
+        // (not the proxy-origin file) so the #394 warning can judge by
+        // directory — a lane-overlapping peer with a different dir shares no
+        // state and must not get the "stop one" advice.
+        const registryRecord = { ...instanceRecord, sessionsDir: sessionsDir() };
         delete registryRecord.launchToken;
-        const warnedAtRegistration = registerInstanceAndWarn(registryRecord, (msg) => log("warn", `[instances] ${msg}`));
+        const warnedAtRegistration = registerInstanceAndWarn(
+            registryRecord,
+            (msg) => log("warn", `[instances] ${msg}`),
+            (msg) => log("info", `[instances] ${msg}`),
+        );
         // #2401: registration warns the late starter only — a resident that is
         // ALREADY serving stays blind to a peer appearing later (the exact
         // dual-generation shape behind the stale-serving report). Rescan the
@@ -1211,7 +1341,12 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
             const warnedPeers = new Set<string>(warnedAtRegistration);
             const peerRescanMs = 60_000;
             const peerTimer = setInterval(() => {
-                for (const id of warnOnNewPeers({ instanceId, lane: launcherLane }, warnedPeers, (msg) => log("warn", `[instances] ${msg}`))) {
+                for (const id of warnOnNewPeers(
+                    { instanceId, lane: launcherLane, sessionsDir: sessionsDir() },
+                    warnedPeers,
+                    (msg) => log("warn", `[instances] ${msg}`),
+                    (msg) => log("info", `[instances] ${msg}`),
+                )) {
                     warnedPeers.add(id);
                 }
             }, peerRescanMs);
@@ -1225,7 +1360,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         {
             const markerDir = writerMarkerDir(stateDir());
             servedWriter = createServedMarkerWriter(
-                { instanceId, pid: process.pid, origin, version: VERSION, lane: launcherLane },
+                { instanceId, pid: process.pid, origin, version: VERSION, lane: launcherLane, startedAt: processStartMs(Date.now()) },
                 markerDir,
                 (level, msg) => log(level, msg),
                 {
@@ -1242,6 +1377,13 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
                 },
             );
             reapStaleWriterMarkers(markerDir, Date.now());
+            // #4626: a surfaced verdict re-evaluates against CURRENT marker
+            // evidence at every status read — the accused peer's own marker,
+            // judged by the same "still contests" definition as detection, so
+            // the restart-handover notice clears itself once the peer
+            // PROVABLY stops; an unreadable marker fails closed (keeps it).
+            registerSplitBrainEvidenceCheck((contest) =>
+                peerStillContests(markerDir, instanceId, contest.peer.instanceId, contest.sessionId, Date.now()));
             setGlobalSessionCommitListener((id) => servedWriter?.noteServed(id));
         }
         const nOverrides = Object.keys(opts.routes).length;
@@ -1258,6 +1400,18 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
                 + (opts.mitm.enabled ? ` — MITM proxy on (whitelist)${opts.mitm.domains.length ? ` +${opts.mitm.domains.join(",")}` : ""}` : "")
                 + (opts.passthrough ? " — PASSTHROUGH (compression OFF)" : ""),
         );
+        // #4994 rung 2: the spawner's timeout adoption parses THIS child's
+        // pid-tagged listen line out of the per-port log when it laddered off
+        // the preferred port — but post-#2864 the muted stderr leg means the
+        // banner above never reaches that file (same explicit-write pattern
+        // as the listen-failed paths below; the line names the actual bound
+        // origin while the file stays keyed on the preferred port).
+        if (launchToken !== undefined) {
+            writeSpawnPortLog(
+                opts.port,
+                `${logTimestamp()} [info] acp-proxy v${VERSION} (pid ${process.pid}, id ${instanceId.slice(0, 8)}) listening on http://${displayHost}:${actualPort}`,
+            );
+        }
         if (opts.passthrough) {
             log(
                 "warn",
@@ -1266,6 +1420,15 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
                     (opts.passthroughSource === "env"
                         ? "Unset ACP_PASSTHROUGH (or drop --passthrough) and restart to re-enable compression."
                         : "Clear it in the web UI (概览 page) or remove \"passthrough\": true from the config file to re-enable compression."),
+            );
+        }
+        // #5079: first upgrade onto the default-off pck switch — tell relay /
+        // account-pool users their affinity signal is off until they opt back in.
+        if (pckNoticeActive(effectivePromptCacheRouting(opts.promptCache))) {
+            log(
+                "info",
+                `[pck] prompt_cache_key self-stamping is OFF by default now (#5079). ` +
+                    "Upstreams that route prefix cache by this key (relays like workbuddy panel/hub, account pools) need it ON — set promptCache.routing=auto (or ACP_PROMPT_CACHE_ROUTING=auto) or use the web UI switch; direct official-API users can ignore this.",
             );
         }
         // #2090 plan A: signed requests refused earlier that the user has not
@@ -1335,6 +1498,8 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         }
         // #2941: LAST statement — registration above is done; degraded boots
         // (best-effort write failed) still flip ready, serving as before.
+        // The event-loop watchdog was armed at startServer entry (#4762):
+        // arming only here would leave startup-phase wedges unwatched.
         engine.markBootReady();
     };
     // #2941: after a successful bind, verify we are the SOLE owner of the
@@ -1394,72 +1559,135 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // Node treats it as an unhandled 'error' and throws, aborting before the
     // graceful-shutdown flush can run. Catch, log a human-readable message,
     // flush sessions, and exit cleanly (exit code 1 so callers/scripts notice).
+    // #4982: the twin verdict needs an async health probe (verifyEntryOwnsPort),
+    // so the handler body runs through a promise. At most one listen attempt is
+    // ever in flight (each retry is scheduled FROM this handler), so two error
+    // handlers can never interleave.
     server.on("error", (err: NodeJS.ErrnoException) => {
-        let busyReason: FailFastReason | undefined;
-        let peer: SameLanePeer | undefined;
-        if (isPortBusyError(err.code, lastTriedPort)) {
-            // #3493: win32 reports a cross-family bind collision (IPv6 wildcard
-            // holder squats the IPv4 bind) as EACCES on an unprivileged port —
-            // classify it like a true EADDRINUSE so it ladders instead of dying
-            // with the misleading privileged-port hint.
-            peer = classifySameLanePeer(listInstances(), lastTriedPort, launcherLane, ownFingerprint, (e) => sameInstanceShape(entryShape(e), ownShape));
-            const action = decideEaddrinuse({
-                upgradeReplacement,
-                twinHolds: peer?.kind === "twin",
-                launchToken: launchToken !== undefined,
-                strictPort,
-                attempts: listenAttempts,
-                maxAttempts: MAX_LISTEN_ATTEMPTS,
-                predecessorTicksLeft,
-                predecessorHolds: sameLanePredecessorHolds(lastTriedPort),
-                lastTriedPort,
-            });
-            if (action.kind === "wait-predecessor") {
-                predecessorTicksLeft -= 1;
-                setTimeout(() => attemptListen(action.port), PREDECESSOR_WAIT_MS);
-                return;
-            }
-            if (action.kind === "ladder") {
-                listenAttempts += 1;
-                // #3801: laddering OFF a same-build same-lane holder means it
-                // drifted (a true twin would have failed fast above) — name
-                // the coexistence so the dual-instance state in the logs is
-                // explainable: both run, each serves its own sessions.
-                const driftNote = peer?.kind === "drifted"
-                    ? ` — held by a same-lane bili instance (pid ${peer.entry.pid}) whose config drifted since it spawned; it keeps serving its own sessions while this one takes the next free port`
-                    : "";
-                log("warn", `port ${lastTriedPort} busy${err.code === "EADDRINUSE" ? "" : ` (${err.code})`} — ${action.nextPort === 0 ? "retrying on an ephemeral port" : `retrying on port ${action.nextPort}`}${driftNote} (#3801)`);
-                attemptListen(action.nextPort);
-                return;
-            }
-            busyReason = action.reason;
-        }
-        const hint =
-            isPortBusyError(err.code, lastTriedPort)
-                ? busyReason === "twin-collision"
-                  ? ` — port ${lastTriedPort} is already served by a same-build bili instance (pid ${peer?.entry.pid}, lane ${launcherLane}) — exiting instead of hopping: the duplicate loses and the serving instance keeps serving; the next launch will attach to it (#3044). A spawner reads this exit as an adopt signal and attaches to the serving instance itself (#3654).`
-                  : busyReason === "upgrade-replacement"
-                    ? ` — this process is an upgrade-restart replacement (#3044): it must own port ${lastTriedPort} exactly, but the prior instance still holds it. Exiting instead of hopping to ${lastTriedPort + 1} — a drifted replacement serves no client and leaks while the prior instance keeps serving; the upgrade retries on the next cooldown cycle.`
-                    : busyReason === "strict-port"
-                      ? ` — port ${lastTriedPort} is pinned (strict-port mode) but already in use. Free it or point the client at another port (e.g. BILI_CLAUDE_NATIVE_PORT for the claude native posture).`
-                      : ` — port ${lastTriedPort} is already in use. Stop the other process or use --port <N>.`
-                : err.code === "EACCES"
-                  ? ` — port ${lastTriedPort} requires privileges. Use a port >= 1024.`
-                  : "";
-        const listenLine = `listen failed: ${err.code ?? ""} ${err.message}${hint}`;
-        log("error", listenLine);
-        // #3654/#3116: a spawner's failure message points users at the per-port
-        // log, but post-#2864 this child mutes its stderr leg into bili.log —
-        // without this line that file stays 0 bytes and the diagnosis dies there.
-        if (launchToken !== undefined) writeSpawnPortLog(opts.port, `${new Date().toISOString()} [error] [v=${VERSION}] ${listenLine}`);
-        shuttingDown = true;
-        server.close();
-        flushConversations();
-        void flushAllSessions().finally(() => {
-            closeLogger();
-            process.exit(eaddrinuseExitCode(busyReason));
-        });
+        void handleListenError(err);
     });
+    const handleListenError = async (err: NodeJS.ErrnoException): Promise<void> => {
+        try {
+            let busyReason: FailFastReason | undefined;
+            let peer: SameLanePeer | undefined;
+            // #4125: set on the first contended-port check when that port was
+            // proven held by a strictly newer same-lane build (see hint below).
+            let newerHolds: { pid: number; version: string } | null | undefined;
+            if (isPortBusyError(err.code, lastTriedPort)) {
+                // #3493: win32 reports a cross-family bind collision (IPv6 wildcard
+                // holder squats the IPv4 bind) as EACCES on an unprivileged port —
+                // classify it like a true EADDRINUSE so it ladders instead of dying
+                // with the misleading privileged-port hint.
+                peer = classifySameLanePeer(listInstances(), lastTriedPort, launcherLane, ownFingerprint, (e) => sameInstanceShape(entryShape(e), ownShape));
+                // #4982: a registry twin is only a twin while it still OWNS the
+                // contended socket. The marker is a claim written at announce time;
+                // by now the claimed owner may have entered graceful shutdown
+                // (listener closed, process still draining) and a DIFFERENT
+                // instance may hold the freed port — dying with the adopt signal
+                // there strands the launch behind a cross-lane stranger we are
+                // forbidden to attach to (#1225). Verify the claim against the live
+                // listener first; an unverified claim falls through to the plain
+                // foreign-holder policy below (ladder or fail-fast).
+                let twinHolds = false;
+                if (peer?.kind === "twin") {
+                    const claimed = peer.entry;
+                    twinHolds = await verifyEntryOwnsPort(claimed.origin, { pid: claimed.pid, instanceId: claimed.instanceId });
+                    if (!twinHolds) {
+                        peer = undefined;
+                        log("warn", `port ${lastTriedPort}: registry twin ${claimed.instanceId.slice(0, 8)} (pid ${claimed.pid}) no longer answers as itself — the socket moved on while it drained; treating the port as foreign-held instead of dying twin-collision (#4982)`);
+                    }
+                }
+                // shutdown() may have raced the probe — its own exit path owns
+                // the outcome from here on.
+                if (shuttingDown) return;
+                // #4125: before judging the EADDRINUSE, check whether the
+                // contended port holds a STRICTLY NEWER same-lane build — the
+                // upward-adoption verdict (registry claim + answered health
+                // agreeing on pid, version strictly above ours).
+                newerHolds = await findNewerSameLaneHolder(lastTriedPort);
+                if (shuttingDown) return;
+                const action = decideEaddrinuse({
+                    upgradeReplacement,
+                    twinHolds,
+                    newerHolderHolds: newerHolds !== null,
+                    launchToken: launchToken !== undefined,
+                    strictPort,
+                    attempts: listenAttempts,
+                    maxAttempts: MAX_LISTEN_ATTEMPTS,
+                    predecessorTicksLeft,
+                    predecessorHolds: sameLanePredecessorHolds(lastTriedPort),
+                    lastTriedPort,
+                });
+                if (action.kind === "wait-predecessor") {
+                    predecessorTicksLeft -= 1;
+                    setTimeout(() => attemptListen(action.port), PREDECESSOR_WAIT_MS);
+                    return;
+                }
+                if (action.kind === "ladder") {
+                    listenAttempts += 1;
+                    // #3801: laddering OFF a same-build same-lane holder means it
+                    // drifted (a true twin would have failed fast above) — name
+                    // the coexistence so the dual-instance state in the logs is
+                    // explainable: both run, each serves its own sessions.
+                    const driftNote = peer?.kind === "drifted"
+                        ? ` — held by a same-lane bili instance (pid ${peer.entry.pid}) whose config drifted since it spawned; it keeps serving its own sessions while this one takes the next free port`
+                        : "";
+                    log("warn", `port ${lastTriedPort} busy${err.code === "EADDRINUSE" ? "" : ` (${err.code})`} — ${action.nextPort === 0 ? "retrying on an ephemeral port" : `retrying on port ${action.nextPort}`}${driftNote} (#3801)`);
+                    attemptListen(action.nextPort);
+                    return;
+                }
+                busyReason = action.reason;
+            }
+            const hint =
+                isPortBusyError(err.code, lastTriedPort)
+                    ? busyReason === "twin-collision"
+                      ? newerHolds !== undefined && newerHolds !== null
+                        ? ` — port ${lastTriedPort} holds a STRICTLY NEWER bili build v${newerHolds.version} (pid ${newerHolds.pid}, lane ${launcherLane}) than this v${VERSION} — exiting instead of hopping: nothing over there is draining, the older generation yields when the resident proves itself newer, and our spawner reads this exit as an adopt signal and rides the newer build instead of deadlocking behind it (#4125/#3544/#3654).`
+                        : ` — port ${lastTriedPort} is already served by a same-build bili instance (pid ${peer?.entry.pid}, lane ${launcherLane}) — exiting instead of hopping: the duplicate loses and the serving instance keeps serving; the next launch will attach to it (#3044). A spawner reads this exit as an adopt signal and attaches to the serving instance itself (#3654).`
+                      : busyReason === "upgrade-replacement"
+                        ? ` — this process is an upgrade-restart replacement (#3044): it must own port ${lastTriedPort} exactly, but the prior instance still holds it. Exiting instead of hopping to ${lastTriedPort + 1} — a drifted replacement serves no client and leaks while the prior instance keeps serving; the upgrade retries on the next cooldown cycle.`
+                        : busyReason === "strict-port"
+                          ? ` — port ${lastTriedPort} is pinned (strict-port mode) but already in use. Free it or point the client at another port (e.g. BILI_CLAUDE_NATIVE_PORT for the claude native posture).`
+                          : ` — port ${lastTriedPort} is already in use. Stop the other process or use --port <N>.`
+                    : err.code === "EACCES"
+                      ? ` — port ${lastTriedPort} requires privileges. Use a port >= 1024.`
+                      : "";
+            const listenLine = `listen failed: ${err.code ?? ""} ${err.message}${hint}`;
+            log("error", listenLine);
+            // #3654/#3116: a spawner's failure message points users at the per-port
+            // log, but post-#2864 this child mutes its stderr leg into bili.log —
+            // without this line that file stays 0 bytes and the diagnosis dies there.
+            if (launchToken !== undefined) writeSpawnPortLog(opts.port, `${logTimestamp()} [error] [v=${VERSION}] ${listenLine}`);
+            // #4762: terminal port-busy decisions die with a hint written from
+            // REGISTRY evidence alone (pid alive => "serving"). Re-probe the
+            // holder once before exiting so a wedged zombie is named as such -
+            // bounded by HOLDER_PROBE_TIMEOUT_MS on a process that is dying anyway.
+            if (busyReason !== undefined) {
+                const holderFragment = await probeHolderForHint({ origin: holderProbeOrigin(opts.host, lastTriedPort), knownPid: peer?.entry.pid });
+                const diagLine = `[eaddrinuse-diag] ${holderFragment}`;
+                log("error", diagLine);
+                if (launchToken !== undefined) writeSpawnPortLog(opts.port, `${logTimestamp()} [error] [v=${VERSION}] ${diagLine}`);
+            }
+            shuttingDown = true;
+            server.close();
+            flushConversations();
+            void flushAllSessions().finally(() => {
+                closeLogger();
+                process.exit(eaddrinuseExitCode(busyReason));
+            });
+        } catch (e) {
+            // The listen already failed; a crash here must still end the process
+            // cleanly instead of leaving a dead listener running.
+            log("error", `listen-error handling crashed: ${String(e)}`);
+            shuttingDown = true;
+            server.close();
+            flushConversations();
+            void flushAllSessions().finally(() => {
+                closeLogger();
+                process.exit(1);
+            });
+        }
+    };
     // Catch stray rejections/throws from background work (compress loops,
     // auto-update, initSessions) that escape the per-request try/catch —
     // Node 20+ aborts the process on these by default. Log loudly and flush.
@@ -1507,6 +1735,10 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         closeLogger();
         process.exit(0);
     };
+    const finishDrain = (): void => {
+        flushConversations();
+        void flushAllSessions().finally(finishShutdown);
+    };
     const shutdown = (sig: string) => {
         if (shuttingDown) return;
         shuttingDown = true;
@@ -1517,16 +1749,34 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         // before invoking cb, so in-flight SSE streams get a chance to finish
         // rather than being yanked mid-chunk.
         server.close(() => {
-            flushConversations();
-            void flushAllSessions().finally(finishShutdown);
+            finishDrain();
         });
+        // #4982: the listener just stopped accepting — withdraw the port
+        // ownership claim NOW instead of at process exit. The drain can outlive
+        // the release by minutes (keep-alive pins), and a stale claim let a
+        // same-lane newcomer misclassify us as its twin and die (#4982).
+        markPortReleased(instanceId);
         // Hard fallback: if connections hang (client never closes), don't
-        // block shutdown forever — force-exit after a grace window.
-        setTimeout(() => {
-            log("warn", `shutdown grace window elapsed; forcing exit (liveConns=${connRecords.size})`);
-            flushConversations();
-            void flushAllSessions().finally(finishShutdown);
-        }, 10_000).unref?.();
+        // block shutdown forever — force-exit after a grace window. #3890:
+        // while connections are still ALIVE the window re-arms (bounded by
+        // SHUTDOWN_DRAIN_MAX_PASSES) instead of cutting in-flight upstream
+        // streams mid-response — idle keep-alives don't hold the proxy, the
+        // keep-alive reaper clears them within one window, so a healthy drain
+        // still exits promptly and a stuck socket can pin at most the cap.
+        let drainPasses = 0;
+        const armDrainBackstop = (): void => {
+            setTimeout(() => {
+                if (connRecords.size > 0 && drainPasses < SHUTDOWN_DRAIN_MAX_PASSES) {
+                    drainPasses += 1;
+                    log("warn", `shutdown grace window elapsed but liveConns=${connRecords.size} — extending drain ${drainPasses}/${SHUTDOWN_DRAIN_MAX_PASSES} (#3890)`);
+                    armDrainBackstop();
+                    return;
+                }
+                log("warn", `shutdown grace window elapsed; forcing exit (liveConns=${connRecords.size})`);
+                finishDrain();
+            }, SHUTDOWN_DRAIN_GRACE_MS).unref?.();
+        };
+        armDrainBackstop();
     };
     // #3544: POST /__bili/shutdown (stale-proxy rotation from a newer
     // generation's bring-up) takes this exact graceful path.
@@ -1554,21 +1804,93 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         let idleSince: number | null = null;
         let lastDead: number[] = [];
         let lastStaleHb: number[] = [];
+        // #3890: consecutive failed kill-0 probes per pid (see WATCHER_DEAD_CONFIRM_TICKS).
+        const deadStreak = new Map<number, number>();
+        // #5152: the stale-heartbeat reading is taken on THIS event loop, so it
+        // is only trustworthy while this loop can run at all. A long synchronous
+        // turn starves the /__bili/watcher handler AND this ticker equally, so
+        // the pause is blindness that must not be charged to the owner. Measured
+        // from the ticker's OWN scheduling drift (the timer is armed for
+        // WATCHER_TICK_MS; any excess is the loop being unable to run) — a
+        // parallel sampling timer would be starved by the very stall it is
+        // supposed to report, and reads 0.
+        let prevTickAt: number | null = null;
+        const observedLoopLagMs = (tickAt: number): number => {
+            const lag = prevTickAt === null ? 0 : tickAt - prevTickAt - WATCHER_TICK_MS;
+            prevTickAt = tickAt;
+            return lag;
+        };
+        // #4994: consecutive stale-while-alive readings per pid (see WATCHER_HEARTBEAT_CONFIRM_TICKS).
+        const hbStreaks = new Map<number, number>();
         const watcher = setInterval(() => {
             const dead: number[] = [];
             const staleByHeartbeat: number[] = [];
             const tickNow = Date.now();
+            const heartbeatGraceMs = effectiveHeartbeatGrace(WATCHER_HEARTBEAT_GRACE_MS, observedLoopLagMs(tickNow));
             for (const pid of proxyWatchers) {
-                const alive = isPidAlive(pid);
+                const probe = probePid(pid);
+                const lastSeenAt = watcherLastSeen.get(pid);
                 // #3544: heartbeat-opted owners ALSO die by liveness-proof
                 // expiry — kill(pid,0) is an existence check, identity-blind
                 // under Windows pid reuse. Legacy pids (no heartbeat on record)
-                // keep kill-0-only semantics.
-                if (watcherIsDead(alive, watcherLastSeen.get(pid), tickNow, WATCHER_HEARTBEAT_GRACE_MS)) {
+                // keep kill-0-only semantics. #3890: a failed kill-0 must be
+                // CONFIRMED over consecutive ticks before it removes the pid —
+                // one transient OpenProcess failure used to be enough to kill
+                // the whole proxy while its parent lived on. #4994: the same
+                // confirmation now guards the heartbeat branch — that reading
+                // is taken across the proxy's OWN event loop, so one stale
+                // snapshot from a busy turn used to commit suicide mid-turn
+                // while the parent lived on.
+                const decision = tickWatchedPid(probe, lastSeenAt, tickNow, deadStreak.get(pid), hbStreaks.get(pid), { heartbeatGraceMs, confirmTicks: WATCHER_DEAD_CONFIRM_TICKS, heartbeatConfirmTicks: WATCHER_HEARTBEAT_CONFIRM_TICKS });
+                if (decision.removed) {
                     proxyWatchers.delete(pid);
                     watcherLastSeen.delete(pid);
+                    deadStreak.delete(pid);
+                    hbStreaks.delete(pid);
                     dead.push(pid);
-                    if (alive) staleByHeartbeat.push(pid);
+                    if (decision.staleHeartbeat) {
+                        staleByHeartbeat.push(pid);
+                        // #4994: attribute the killing branch here — the [stale-heartbeat]
+                        // suffix below survives to shutdown only when this very tick also
+                        // empties the set, so most heart-death episodes were invisible.
+                        log("warn", `[watchdog] pid ${pid} stale-heartbeat confirmed after ${WATCHER_HEARTBEAT_CONFIRM_TICKS} consecutive ticks (last beat ${Math.max(0, tickNow - (lastSeenAt ?? tickNow))}ms ago, pid still reads alive) — removing (#3544/#4994)`);
+                    } else {
+                        log("warn", `[watchdog] pid ${pid} dead confirmed after ${WATCHER_DEAD_CONFIRM_TICKS} consecutive failed kill-0 probes (last code=${probe.errCode ?? "?"}) — removing (#3890)`);
+                    }
+                    continue;
+                }
+                if (probe.alive) {
+                    if ((deadStreak.get(pid) ?? 0) > 0) {
+                        deadStreak.delete(pid);
+                        log("info", `[watchdog] pid ${pid} alive again after failed kill-0 probe(s) — clearing death streak (#3890)`);
+                    }
+                    if (decision.staleHeartbeat) {
+                        if ((hbStreaks.get(pid) ?? 0) === 0) {
+                            log("info", `[watchdog] heartbeat stale for pid ${pid} (${Math.max(0, tickNow - (lastSeenAt ?? tickNow))}ms since last beat, pid still reads alive) — requiring ${WATCHER_HEARTBEAT_CONFIRM_TICKS} consecutive stale ticks before believing it (#4994)`);
+                        }
+                        hbStreaks.set(pid, decision.hbStreak);
+                    } else if ((hbStreaks.get(pid) ?? 0) > 0) {
+                        hbStreaks.delete(pid);
+                        log("info", `[watchdog] pid ${pid} heartbeating again — clearing stale-heartbeat streak (#4994)`);
+                    }
+                } else {
+                    if (decision.streak === 1) {
+                        // Field instrumentation (#3890): Windows collapses every
+                        // non-ACCESS_DENIED OpenProcess failure into ESRCH, so
+                        // the errno is the only clue left to attribute false-dead
+                        // episodes — log it once per episode.
+                        log("info", `[watchdog] kill-0 probe failed for pid ${pid} (code=${probe.errCode ?? "?"}) — requiring ${WATCHER_DEAD_CONFIRM_TICKS} consecutive failures before believing it (#3890)`);
+                    }
+                    deadStreak.set(pid, decision.streak);
+                    // #4994: a kill-0-failing tick DISAGREES with the heartbeat axis and must
+                    // break its run — otherwise a flapping probe (Windows OpenProcess) lets
+                    // stale ticks accumulate across the gap and confirm without N CONSECUTIVE
+                    // alive-stale readings. The pure function already reports hbStreak 0 here;
+                    // persist it (mirrors the alive branch clearing deadStreak).
+                    if ((hbStreaks.get(pid) ?? 0) > 0) {
+                        hbStreaks.delete(pid);
+                        log("info", `[watchdog] pid ${pid} kill-0 probe failing — clearing stale-heartbeat streak (#4994)`);
+                    }
                 }
             }
             if (dead.length > 0) lastDead = dead;
@@ -1586,7 +1908,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
                 if (lastStaleHb.length > 0) reason += ` [stale-heartbeat pids: ${lastStaleHb.join(", ")}]`;
                 shutdown(reason);
             }
-        }, 2_000);
+        }, WATCHER_TICK_MS);
         watcher.unref?.();
     }
     return server;
@@ -1594,6 +1916,13 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
 
 export type Prepared = {
     body: string | Buffer;
+    /** The pre-serialization form of `body` when the lane built it as an
+     *  object (every prepare-* does: `body` is JSON.stringify(rebuilt)).
+     *  Consumers that would re-parse the string (image walk, overhead
+     *  estimate) read this instead — JSON round-trips are structurally
+     *  equal, and one full-body parse per consumer per turn is pure CPU
+     *  (#2078 seam rationale applied to the prepared body). */
+    parsedBody?: unknown;
     session: Session;
     processedMessages: CoreMessage[];
     /** Original CoreMessages from the protocol conversion, BEFORE processTurn
@@ -1623,6 +1952,11 @@ export type Prepared = {
      *  prompt carries the MCP name-mapping note (withMcpDialectNote). Threads
      *  to the round-2 system rebuild for byte-parity. */
     mcpDialectNote?: boolean;
+    /** #5418 watermark fastpath: extra SUCCESS-response headers built by the
+     *  prepare lane (x-bili-pf-seq = this turn's server-measured element
+     *  count, for client-side watermark convergence). The relay's 2xx path
+     *  merges them onto the upstream response headers. */
+    responseExtraHeaders?: Record<string, string>;
     responsesTextProtocol?: boolean;
     resetAfterSuccess?: boolean;
     responsesProjection?: ResponsesProjection;
@@ -1824,6 +2158,10 @@ export const headroomFallbackLogged = new Set<string>();
 // #2096: dedupe the post-reservation effective-window line per model|value —
 // the reserved window varies per request (max_tokens), so key on both.
 export const headroomEffectiveLogged = new Set<string>();
+/** #5191: per session|model|value dedup for the [arm-judge] line — the
+ * session overflow arm's judging wall is session-scoped evidence, unlike the
+ * config-derived [headroom] value, so the dedup key carries the session id. */
+export const armJudgingWallLogged = new Set<string>();
 
 // #1840: best-known OUTPUT ceiling for the request's model, resolved through
 // the SAME source chain (and rank order) the output-headroom fallback uses
@@ -1870,6 +2208,13 @@ export function resolveKnownOutputCeiling(
 // proxy still disappears promptly.
 const WATCHER_IDLE_GRACE_MS = 5_000;
 
+// How often the watchdog re-probes every watched pid. Named because the tick
+// interval is also the BASELINE for #5152's lag measurement: a tick that
+// arrives WATCHER_TICK_MS later than its predecessor was a tick the event loop
+// could not run — that excess is the proxy's own blindness, not evidence about
+// the owner.
+const WATCHER_TICK_MS = 2_000;
+
 // #3544: how long a heartbeat-opted owner may go silent before the watchdog
 // counts it dead even though its pid still exists (recycled). 3 missed beats
 // at the 5s client interval, tolerant of scheduler skew on a busy host.
@@ -1886,6 +2231,95 @@ export function watcherIsDead(alive: boolean, lastSeen: number | undefined, nowM
     return lastSeen !== undefined && nowMs - lastSeen > heartbeatGraceMs;
 }
 
+/** #5152: widen the heartbeat grace by the event-loop lag the watchdog itself
+ *  observed. The stale-heartbeat reading is taken on the proxy's OWN loop, so
+ *  when the loop could not run for N ms, an age that grew by N ms carries no
+ *  information about the owner: the honest window is `grace + N`.
+ *
+ *  Deliberately UNCAPPED. A 2-minute cap was the obvious first instinct, but it
+ *  is wrong for the failure it targets — #5138 records a ~19 MINUTE full-loop
+ *  block, and any cap below the real stall reintroduces exactly the false death
+ *  the change exists to stop. No cap is needed for safety: the extension is not
+ *  sticky. Every tick takes a FRESH measurement, so once the loop recovers the
+ *  window snaps back to the constant and a genuinely recycled pid (#3544) is
+ *  removed normally — the guarantee is delayed only by the duration of a stall
+ *  the proxy itself suffered, which is precisely the time it could not have
+ *  observed anything.
+ *
+ *  Unknown, zero or nonsensical lag falls through to the historical constant,
+ *  preserving pre-fix behavior bit-for-bit whenever no measurement exists. */
+export function effectiveHeartbeatGrace(heartbeatGraceMs: number, loopLagMs: number | undefined): number {
+    if (loopLagMs === undefined || !Number.isFinite(loopLagMs) || loopLagMs <= 0) return heartbeatGraceMs;
+    return heartbeatGraceMs + loopLagMs;
+}
+
+// #3890: the shutdown backstop window, and how many times it may RE-ARM while
+// connections are still alive. One window is the historical hard fallback;
+// extra passes exist so an in-flight upstream stream finishes instead of being
+// cut mid-response when its owner's death triggers the exit. Worst-case total
+// drain ≈ (1 + SHUTDOWN_DRAIN_MAX_PASSES) windows.
+const SHUTDOWN_DRAIN_GRACE_MS = 10_000;
+const SHUTDOWN_DRAIN_MAX_PASSES = 10;
+
+// #3890: how many CONSECUTIVE failed kill-0 probes must agree before the
+// watchdog believes a watched pid has died. Pre-fix, ONE failed probe removed
+// the pid from the watcher set and the empty-set grace window that followed
+// never re-probed it — a single transient OpenProcess failure on Windows was
+// enough to force-exit the proxy ~6s later while its parent lived on (12 such
+// events in 2.5h against one live pid). At the 2s tick, three confirmations
+// span ~4–6s: long enough to ride out transient failures, short enough that a
+// genuinely dead parent still exits promptly.
+const WATCHER_DEAD_CONFIRM_TICKS = 3;
+
+// #4994: how many CONSECUTIVE stale-while-alive ticks must agree before the
+// watchdog believes a heartbeat-opted owner has died. Pre-fix, ONE stale
+// reading removed the pid immediately — but that reading is taken on the
+// proxy's OWN event loop: a long synchronous turn (big compression, big
+// forward) starves the /__bili/watcher handler while the parent lives on, so
+// a busy-but-alive owner read dead ~grace into the stall and the proxy
+// committed suicide mid-turn (16 parent-gone events in 24h on Linux, where
+// kill-0 never lies — #4994 floor 6). Five ticks (~8s) rather than the
+// kill-0 shape's three: the window must span one full 5s beat interval plus
+// tick alignment, else the worst case (first stale tick at t0, next live beat
+// lands t0+5s and is processed t0+6s) is still a false death at t0+4s. A
+// truly recycled pid (#3544's reason for the branch) now exits ~8s later
+// than before — the anti-reuse guarantee holds, only slower.
+const WATCHER_HEARTBEAT_CONFIRM_TICKS = 5;
+
+interface WatcherTickDecision {
+    /** Remove this pid from the watcher set on this tick. */
+    removed: boolean;
+    /** Removed because the heartbeat expired while the pid still reads alive (#3544). */
+    staleHeartbeat: boolean;
+    /** Failed-probe streak after this tick (0 when alive or removed). */
+    streak: number;
+    /** Stale-while-alive streak after this tick (0 when the beat is fresh or removed). #4994. */
+    hbStreak: number;
+}
+
+/** #3890/#4994: pure per-pid death-streak step. Each axis confirms
+ *  independently over CONSECUTIVE agreeing ticks: a failed kill-0 probe
+ *  increments its streak and only removes at confirmTicks; a stale-while-alive
+ *  reading increments the heartbeat streak and only removes at
+ *  heartbeatConfirmTicks. A live probe resets the kill-0 axis, a fresh beat
+ *  resets the heartbeat axis, and a tick that disagrees with an axis breaks
+ *  THAT axis's run (episodes never accumulate across interruptions). Legacy
+ *  pids (no heartbeat record) keep kill-0-only semantics (#3544). */
+export function tickWatchedPid(probe: PidProbe, lastSeen: number | undefined, nowMs: number, prevStreak: number | undefined, prevHbStreak: number | undefined, opts: { heartbeatGraceMs: number; confirmTicks: number; heartbeatConfirmTicks: number }): WatcherTickDecision {
+    if (probe.alive) {
+        const staleHeartbeat = watcherIsDead(true, lastSeen, nowMs, opts.heartbeatGraceMs);
+        if (!staleHeartbeat) return { removed: false, staleHeartbeat: false, streak: 0, hbStreak: 0 };
+        const hbStreak = (prevHbStreak ?? 0) + 1;
+        return hbStreak >= opts.heartbeatConfirmTicks
+            ? { removed: true, staleHeartbeat: true, streak: 0, hbStreak: 0 }
+            : { removed: false, staleHeartbeat: true, streak: 0, hbStreak };
+    }
+    const streak = (prevStreak ?? 0) + 1;
+    return streak >= opts.confirmTicks
+        ? { removed: true, staleHeartbeat: false, streak: 0, hbStreak: 0 }
+        : { removed: false, staleHeartbeat: false, streak, hbStreak: 0 };
+}
+
 
 const ACP_TAG_MARK = "\x3cacp ";
 
@@ -1897,7 +2331,7 @@ const ACP_TAG_MARK = "\x3cacp ";
 // compression, src/preflight.ts — #247) have NO other carrier: their anchor is
 // the only place the summary reaches the model, so it must survive.
 //
-// Per mode (see TECHNICAL-NOTES.md "Two compression modes"): in plugin/launcher mode the
+// Per mode (see docs/technical-notes.md "Two compression modes"): in plugin/launcher mode the
 // tool call is ALWAYS in the re-sent history (the agent owns compression), so
 // this strips every acp_summary and the carrier is the tool call — recognized
 // by the plugin_<ts> callId minted at the tool API (#1567: an id-match alone
@@ -1963,6 +2397,32 @@ export function applyReasoningDrop(
         log("info", `[${sessionId}] compress-reasoning: dropped ${msgs.length - out.length} reasoning message(s) from closed compress turns (#651)`);
     }
     return out;
+}
+
+/** Predicate factory for the experimental fold-point carrier relocation
+ *  "thinking clear" (kernel Config.reasoningDroppable): a reasoning core may
+ *  be dropped at the moment its compress pair is repositioned ONLY when it
+ *  carries no wire signature. Signed Anthropic thinking/redacted_thinking
+ *  bytes are NEVER rewritten or deleted (#1658 doctrine). Returns undefined
+ *  for sessions where the kernel must not drop anything at all: strict-echo
+ *  upstreams (#684 — reasoning must round-trip with tool_calls) and views
+ *  holding ANY signed thinking block (presence-based gate, same posture as
+ *  planReasoningDrop), so a conservative misclassification can never break a
+ *  signed session. Pure + cheap; install per request. */
+export function makeFoldPointReasoningDroppable(
+    msgs: BiliMessage[],
+    strictEcho: boolean,
+): ((m: import("acp-kernel").CoreMessage) => boolean) | undefined {
+    if (strictEcho) return undefined;
+    if (msgs.some(hasSignedThinkingBlock)) return undefined;
+    return (m: import("acp-kernel").CoreMessage): boolean => {
+        const core = m as BiliMessage;
+        if (core.contentType === "reasoning") {
+            return !(typeof core.thinkingSignature === "string" && core.thinkingSignature.length > 0);
+        }
+        const raw = core.rawAnthropicBlock as { type?: unknown } | undefined;
+        return raw?.type !== "redacted_thinking";
+    };
 }
 
 /** [#651] Strip oversized reasoning from closed compress turns (see
@@ -2112,6 +2572,11 @@ export function warnReasoningPairs(
     log("warn", `[${sessionId}] reasoning-pair-violated: ${violators.length} assistant tool-call message(s) lack reasoning_content while ${withRc} carry it — strict-echo upstreams (DeepSeek thinking mode) will reject the request; first seen: ${violationNamed(tracked.fresh, tracked.ongoing, tracked.maxRepeat)} (#684/#762/#2864)`);
 }
 
+// [#5688] shared egress repair for adjacent per-turn effort directives —
+// implementation moved to its own leaf module so loop/ can import it without
+// a server.ts import cycle; re-exported here for existing consumers.
+export { dedupeAdjacentOutputConfig } from "./dedupe-adjacent-output-config.js";
+
 /** [#684] Anthropic-wire twin of the openai sentinel, narrowed by [#1327]:
  *  warn only when bili itself lost thinking — a tool_use block that rode an
  *  inbound assistant message WITH a thinking block now rides an outbound
@@ -2124,18 +2589,26 @@ export function warnReasoningPairs(
  *  silent. Any remaining fire means another path lost thinking (e.g. a fold
  *  pruned the block while preserving the tool_use) — investigate. [#2864]
  *  identity dedup like the openai twin: each lost tool_use reports once per
- *  episode, not once per request of a persistent violation. */
+ *  episode, not once per request of a persistent violation. [#5998] the
+ *  inbound scan counts SIGNED thinking only: an unsigned thinking block is
+ *  never a replayable asset on any upstream — signature-verifying peers
+ *  reject it ("thinking.signature: Field required") and never-signing relays
+ *  require exactly the bytes they produced verbatim — so its absence from the
+ *  outbound rebuild is by design, not a violation; only a lost SIGNED pair is
+ *  reportable. */
 export function warnAnthropicThinkingPairs(
     inboundMessages: unknown[],
     outboundMessages: unknown[],
     log: (level: string, msg: string) => void,
     sessionId: string,
 ): void {
+    const signedThinking = (b: { type?: string; signature?: unknown }) =>
+        b?.type === "thinking" && typeof b.signature === "string" && b.signature.length > 0;
     const thinkingIds = new Set<string>();
     for (const m of inboundMessages) {
-        const msg = m as { role?: string; content?: Array<{ type?: string; id?: string }> };
+        const msg = m as { role?: string; content?: Array<{ type?: string; id?: string; signature?: unknown }> };
         if (msg?.role !== "assistant" || !Array.isArray(msg.content)) continue;
-        if (!msg.content.some((b) => b?.type === "thinking")) continue;
+        if (!msg.content.some(signedThinking)) continue;
         for (const b of msg.content) {
             if (b?.type === "tool_use" && typeof b.id === "string") thinkingIds.add(b.id);
         }
@@ -2413,6 +2886,20 @@ export function diagNudge(turn: { nudge?: { shouldInject: boolean; reason: strin
 // all require usage >= their pct lines). #728 fix: such sessions fall back to
 // the PREVIOUS turn's locally-measured outbound payload upper bound
 // (session.stats.localInputEstimate, recorded in prepare* each turn). The
+// #4805: the meter-side size guard (anchorImpossible below) also requires an ABSOLUTE gap,
+// not just the ratio: on early/small sessions the char-count upper bound is already an order
+// of magnitude above the real token count, so a pure-ratio test would demote healthy small
+// anchors to estimates and lose usage-grade sizing exactly where it is cheapest to keep.
+const SIDE_LANE_ANCHOR_MIN_ABS_DELTA = 25_000;
+// The anchor's OWN request snapshot (lastUsagePayloadUpper, taken at settle)
+// carries the honesty margin: a usage report can legitimately under-report a
+// text-heavy payload by ~8x (#1820 B — char-bound 220k over a 5k report), so the
+// anchor size alone cannot prove pollution; requiring the payload to ALSO tower
+// 8x over the payload of the request that produced the anchor keeps #1820 B's
+// honest anchors on the fast path while #4805's side-lane sample (anchor request
+// ~3k upper, main payload ~680k upper) is refused with 2-20x margin.
+const SIDE_LANE_ANCHOR_IMPOSSIBLE_RATIO = 8;
+
 // estimator only errs EARLY (char-count upper bound → compress earlier, never
 // later), is active only while lastInputTokens == 0 (a real usage report takes
 // precedence immediately — same invariant as #604's armFailureShrink
@@ -2443,7 +2930,45 @@ export function effectiveTokenCount(session: Session, msgs: CoreMessage[], inbou
     // #4383 (both guards): stale-small — a sidecar/side-request sample under
     // the same session id, superseded by later main sends — must not freeze the
     // meter either; fall through to the fresher measurement.
-    if (!anchorStale && session.stats.lastInputTokens > 0 && (session.stats.lastInputTokensSource === "usage" || session.stats.lastInputTokensSource === "overflow-arm") && staleSmallAnchorFallback(session.stats, session.stats.lastInputTokens) === null) return { tokens: session.stats.lastInputTokens, source: "usage" };
+    // #4805 (size guard): a FRESH tiny anchor can still be lane pollution — a
+    // 2-message side request's usage (5100 tok) overwrote a 1700-message
+    // conversation's anchor and froze compression until the context blew the
+    // window. Time-based staleness cannot catch it (it is seconds old), but the
+    // size dimension can: a usage sample cannot describe a resent history whose
+    // own upper bound is ~an order of magnitude larger. Fall through to the
+    // local estimate then — the nudge sizes the payload it actually sees.
+    const payloadUpperNow = estimateCoreMessagesUpper(msgs) + inboundImageTokens;
+    const anchorImpossible = session.stats.lastInputTokens > 0
+        && (session.stats.lastUsagePayloadUpper ?? 0) > 0
+        && payloadUpperNow >= session.stats.lastInputTokens * SIDE_LANE_ANCHOR_IMPOSSIBLE_RATIO
+        && payloadUpperNow >= session.stats.lastUsagePayloadUpper! * SIDE_LANE_ANCHOR_IMPOSSIBLE_RATIO
+        && payloadUpperNow - session.stats.lastInputTokens > SIDE_LANE_ANCHOR_MIN_ABS_DELTA;
+    // #5135: pending compress credit proves THIS session executed its own fold
+    // since the last settle — applyRanges (stream.ts) already netted the
+    // savings out of lastInputTokens while lastUsageGradeTokens still carries
+    // the pre-fold report. Until processTurn materializes the fold and clears
+    // the credit, the resent history still contains the covered originals, so
+    // the raw inbound upper bound legitimately towers over the last OUTBOUND
+    // snapshot on long sessions — letting anchorImpossible stand would refuse
+    // this session's own honest anchor and hand the meter the stale pre-fold
+    // grade (false pressure-T2 right after a successful T1). Credit can only
+    // be minted by this conversation's own folds (foreign usage samples write
+    // none), so it exempts exactly this window; the #4805/#4849 anchor-
+    // pollution refusal stays fully armed when credit == 0.
+    // #5135+#4383 field fix: this branch deliberately overrides cycle-staleness
+    // too. A compress BURST (turns whose only output is compress calls) never
+    // reaches an upstream settle, so prepare stamps contextTokensSource=
+    // "estimate" every turn and usageAnchorCycleStale() stays true for the
+    // whole burst — pre-fix the credit exemption was dead exactly when it was
+    // needed, the meter fell through to the raw INBOUND upper bound (the full
+    // resent history), and a just-folded session read 238112/212992 = 112%
+    // "pressure" while its actual outbound was 83K — the phantom that kept
+    // re-nudging the model into the very compress loop the folds were supposed
+    // to end. The credit window is still bounded: the next real settle clears
+    // it (loop/core.ts), so this cannot freeze the meter; zero is a valid
+    // drained reading (kernel treats 0 as unknown).
+    if (session.stats.lastInputTokensSource === "usage" && (session.stats.compressCreditTokens ?? 0) > 0 && session.stats.lastInputTokens >= 0) return { tokens: session.stats.lastInputTokens, source: "usage" };
+    if (!anchorStale && !anchorImpossible && session.stats.lastInputTokens > 0 && (session.stats.lastInputTokensSource === "usage" || session.stats.lastInputTokensSource === "overflow-arm") && staleSmallAnchorFallback(session.stats, session.stats.lastInputTokens) === null) return { tokens: session.stats.lastInputTokens, source: "usage" };
     // #1820: right after a preflight rebuild the usage-grade baseline above is
     // momentarily absent (the rebuild request's own report hasn't landed yet,
     // or the upstream never reports), and every branch below sizes on the
@@ -2455,7 +2980,7 @@ export function effectiveTokenCount(session: Session, msgs: CoreMessage[], inbou
     // reporting upstreams fall back to legacy sizing rather than a frozen meter.
     const anchored = postRebuildAnchorTokens(session);
     if (anchored > 0) return { tokens: anchored, source: "estimate" };
-    const raw = estimateCoreMessagesUpper(msgs) + inboundImageTokens;
+    const raw = payloadUpperNow;
     // #1569/#1839: while the latest baseline is not usage-grade (the transient
     // window right after a failed turn), sizing on ANY re-derived view is how
     // ghosts enter: #1569 first tried min(est, raw) — the char-count upper
@@ -3048,13 +3573,13 @@ export function outboundPayloadBreakdown(
     reqUrl: string,
 ): { textEstimate: number; overheadEstimate: number; imageTokens: number; payloadEstimate: number; armEstimate: number } {
     const billingUpstream = route?.rewrittenUrl ?? (/^https?:\/\//i.test(reqUrl) ? reqUrl : opts.upstream);
-    const imageTokens = imageReserveFor(prepared.session, prepared.protocol, prepared.body, opts, billingUpstream);
+    const imageTokens = imageReserveFor(prepared.session, prepared.protocol, prepared.parsedBody ?? prepared.body, opts, billingUpstream);
     // #1498-F2: a kernel-transform failure leaves processedMessages empty while
     // the outbound IS the raw client body — measure that view instead of arming
     // at wire overhead only (the mirror of localInputEstimate's fallback).
     const msgs = prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages;
     const textEstimate = estimateCoreMessages(msgs);
-    const overheadEstimate = estimateWireOverhead(prepared.protocol, prepared.body);
+    const overheadEstimate = estimateWireOverhead(prepared.protocol, (prepared.parsedBody as Record<string, unknown> | undefined) ?? prepared.body);
     // #1498-F1: the arm value is not only a preflight floor — the kernel's
     // tool-result truncation loop consumes it as its remaining-depth input, so
     // an optimistic text estimate (chars/4 undercounts dense JSON/code by up to
@@ -3195,6 +3720,31 @@ export function warnRouteMissIfNew(
     return true;
 }
 
+// #5612: complement to warnRouteMissIfNew — a providers key DID match but the
+// model id is absent from that route's per-model table (e.g. client renamed ids
+// /,.→-), so overrides silently drop. Once per upstream+model, hints the rename.
+const modelNameMissWarned = new Set<string>();
+
+export function _resetModelNameMissWarnedForTest(): void {
+    modelNameMissWarned.clear();
+}
+
+export function warnModelNameMissIfNew(
+    origin: string | undefined,
+    model: string | undefined,
+    declaredNames: string[],
+    log: (level: string, msg: string) => void,
+): boolean {
+    if (!origin || !model || declaredNames.length === 0) return false;
+    const key = `${origin}\u0000${model}`;
+    if (modelNameMissWarned.has(key)) return false;
+    modelNameMissWarned.add(key);
+    const shown = declaredNames.slice(0, 8).join(", ");
+    const more = declaredNames.length > 8 ? `, … (+${declaredNames.length - 8})` : "";
+    log("warn", `[route] providers key ${hostIdForLog(origin)} matched but model=${model} is not among its declared per-model entries [${shown}${more}] — its context/output/compress overrides are IGNORED. If the client renames model ids (/ . → -), declare that spelling too; otherwise add "${model}" under the providers key.`);
+    return true;
+}
+
 /** #736 / #2317: the preflight fail-fast "effective window below native" note. The
  *  operator and codex-route-hit texts are preserved byte-for-byte; the new
  *  codex-route-miss branch fires when the shrink is codex-driven AND the request's
@@ -3219,6 +3769,46 @@ export function buildWindowShrinkNote(args: {
         return head + `it was aligned down to codex's own window perception, and your upstream (${up}) matched NO configured providers key${keys ? ` — your pinned context/modelContextLimit sit under: ${keys}` : ""}. Add a providers entry for this upstream so the pinned window applies here.`;
     }
     return head + `it was aligned down to codex's own window perception; set compress.modelContextLimit explicitly if your upstream serves the larger window.`;
+}
+
+// #5000/#4543: the core-text byte floor (estimateCoreMessagesUpperBytes) prices
+// only m.text — tools[], tool_calls[].function.arguments, the system prompt and
+// the JSON envelope are invisible to it, so a body can ride multi-MB over the
+// window on the wire while every projection-based doom gate stays silent
+// (incident #5000: 55.2 MiB wire body whose core text cleared the floor;
+// #4543: a 4.1 MiB CJK body the 7.5 B/tok floor can only see past ~7.5 MB on a
+// 1M window). Price the ACTUAL outbound body instead: the same CJK-aware leaf
+// walk the #554 side-request guard uses (estimateRawBodyTokens) counts every
+// string field of the serialized request — the conservative overcount (ids,
+// roles, structural strings) is the right bias for a fail-closed gate. Image
+// tokens are charged separately by the caller (they sit in binary-carrying
+// keys the walk excludes by design). Unparseable bodies return undefined —
+// callers keep the byte-floor fallback for them.
+interface MeasuredOutbound {
+    tokens: number;
+    breakdown: RawBodyBreakdown;
+}
+
+// #5000 item 3: dimension clause for the measured-doom messages — which part
+// of the body carries the mass, so "trim the oversized content" tells the
+// operator WHERE (a 55.2 MiB #5000 body with 1.44 MiB of messages[] means the
+// mass is tools[], not a giant paste).
+export function measuredBreakdownClause(b: RawBodyBreakdown): string {
+    return `messages ~${b.messages.toLocaleString("en-US")} · tools[] ~${b.tools.toLocaleString("en-US")} · system ~${b.system.toLocaleString("en-US")} · other ~${b.other.toLocaleString("en-US")}`;
+}
+
+export function measuredOutbound(prepared: { body: string | Buffer; parsedBody?: unknown }): MeasuredOutbound | undefined {
+    let parsed: unknown = prepared.parsedBody;
+    if (parsed === undefined) {
+        const raw = typeof prepared.body === "string" ? prepared.body : prepared.body.toString("utf8");
+        try {
+            parsed = JSON.parse(raw);
+        } catch {
+            return undefined;
+        }
+    }
+    const breakdown = estimateRawBodyBreakdown(parsed);
+    return { tokens: breakdown.total, breakdown };
 }
 
 export async function preflightCompressIfNeeded(
@@ -3260,6 +3850,30 @@ export async function preflightCompressIfNeeded(
     const limit = completionReserve > 0 && statedWall > 0
         ? Math.max(0, Math.min(config.modelContextLimit, statedWall - completionReserve))
         : config.modelContextLimit;
+    // #5191: handle.ts already announced "nudge/preflight judge input against
+    // ${reserved}" ([headroom]) — but when THIS session's overflow arm proved the
+    // upstream bills the completion share against the same wall (#3450), the
+    // judgments below run on min(reserved, statedWall - completionReserve),
+    // which can sit BELOW the announced window. An incident log showing two
+    // windows with no explanation sent the #5191 reporter chasing config that
+    // was never read. State the wall that actually judges, once per
+    // session|model|arm-value|headroom-value (the [headroom] number itself
+    // moves — the #3450 provider-lifetime proof clamps it later, e.g.
+    // 1,086,000 → 894,000 — and each new announcement deserves its own arm
+    // note). Reference the #4205 reserved twin, NOT config.modelContextLimit:
+    // the post-400 recovery pass reaches this code with modelContextLimit
+    // already rewritten to the armed ceiling, which would mislabel the
+    // comparison number as the [headroom] window.
+    const headroomWindow = typeof session.metadata.reservedContextLimit === "number" && session.metadata.reservedContextLimit > 0
+        ? session.metadata.reservedContextLimit
+        : config.modelContextLimit;
+    if (limit < headroomWindow) {
+        const armKey = `${session.id}|${String(model ?? "?")}|${limit}|${headroomWindow}`;
+        if (!armJudgingWallLogged.has(armKey)) {
+            armJudgingWallLogged.add(armKey);
+            log("info", `[arm-judge] upstream overflow proof (stated wall ${statedWall}, ${completionReserve} billed to completion): nudge/preflight judge input against ${limit} — BELOW the [headroom] window ${headroomWindow}; that line does not apply while this arm is live (#3450, #5191)`);
+        }
+    }
     // #321: codex's local auto-compaction runs at ~90% of its OWN context window,
     // so bili's preflight must stay ahead of that bar to win the race — a 100%
     // trigger lets codex compact first and the ACP lane becomes a backstop.
@@ -3286,10 +3900,20 @@ export async function preflightCompressIfNeeded(
     // floor under the documented minimum. Clamping to the minimum disarms
     // auto-fold on sub-8K windows outright (target >= overflow ⇒ growthArmed
     // false), which matches the documented feature scope.
+    // [#3444] A configured target below what this session can physically reach
+    // (system prompt + tool schemas + live tail) is UNREACHABLE: every fold
+    // lands above it and the trigger re-fires on every request (fold storm).
+    // An exhausted growth pass measures the irreducible floor into session
+    // metadata — raise the effective target to it so the trigger arms on real
+    // GROWTH past the floor instead of the permanent gap. Latest measurement
+    // wins (tracks baseline drift); a floor at/above the window collapses the
+    // arming entirely (growthArmed false ⇒ classic mode, nudge suppression
+    // releases via growthFoldingArmed's measuredFloor arg).
+    const measuredFloor = autoFoldOn ? autoFoldFloor(session) : undefined;
     const autoFoldTarget = autoFoldOn
-        ? Math.max(AUTO_FOLD_TARGET_MIN, Math.min((config as ResolvedKernelConfig).externalSummary?.autoFoldTargetTokens ?? (overflowTarget > 0 ? Math.round(overflowTarget / 2) : 0), overflowTarget))
+        ? Math.min(Math.max(Math.max(AUTO_FOLD_TARGET_MIN, Math.min((config as ResolvedKernelConfig).externalSummary?.autoFoldTargetTokens ?? (overflowTarget > 0 ? Math.round(overflowTarget / 2) : 0), overflowTarget)), measuredFloor ?? 0), overflowTarget)
         : undefined;
-    const growthArmed = autoFoldOn && autoFoldTarget !== undefined && autoFoldTarget > 0 && autoFoldTarget < overflowTarget; // narrowing form of growthFoldingArmed(config, overflowTarget) — keep in sync (PR #2581 review)
+    const growthArmed = autoFoldOn && autoFoldTarget !== undefined && autoFoldTarget > 0 && autoFoldTarget < overflowTarget; // narrowing form of growthFoldingArmed(config, overflowTarget, measuredFloor) — keep in sync (PR #2581 review)
     const compressionTarget = growthArmed ? autoFoldTarget : overflowTarget;
     // A fresh session (id rotated, e.g. after a model switch) has
     // lastInputTokens = 0 while still carrying a full raw history; size the
@@ -3369,13 +3993,48 @@ export async function preflightCompressIfNeeded(
         : calibratedText;
     const textBudget = Math.max(0, compressionTarget - imageTokens);
     const decisionTrigger = Math.max(Math.max(0, baselineFloor - imageTokens), textChannel);
-    const triggerFires = imageTokens >= compressionTarget || decisionTrigger >= textBudget;
+    // [#3444] expected-benefit gate for growth folds: once the payload sits at
+    // the (possibly floor-raised) target, every further request re-crosses it
+    // with only marginal new content — folding that burns a full external-
+    // summary round trip to save less than its fixed cost. Require the text
+    // channel to exceed the budget by at least AUTO_FOLD_MIN_BENEFIT_TOKENS
+    // before arming; below that the payload fits the window by definition and
+    // forwards as-is until enough material accrues. Classic overflow preflight
+    // is untouched (its bar is the window itself — there, firing is mandatory).
+    // Image-dominant payloads keep the original unconditional arm: images are
+    // not foldable, so their overage is not "expected benefit" at all.
+    const growthWorthIt = !growthArmed || imageTokens >= compressionTarget || decisionTrigger - textBudget >= AUTO_FOLD_MIN_BENEFIT_TOKENS;
+    const triggerFires = growthWorthIt && (imageTokens >= compressionTarget || decisionTrigger >= textBudget);
     // #2283 sub-defect 2: pair upstream billing with the same-payload local estimate on
     // EVERY request (not only when preflight triggers) — the offline data source for the
     // chars/4 deviation distribution behind the #2273 RC2 calibration decision.
     if (opts.debug) {
         const billed = session.stats.lastInputTokens > 0 && session.stats.lastInputTokensSource === "usage" ? session.stats.lastInputTokens : "none";
         log("debug", `[${session.id}] [usage-vs-est] upstream-billed=${billed} est=${Math.round(textEstimate)} k̂=${kFactor !== undefined ? kFactor.toFixed(2) : "n/a"} route=${currentOrigin === undefined ? "?" : maskUrlForLog(currentOrigin)} model=${model ?? "?"} baseline-grade=${session.stats.lastInputTokensSource ?? "none"} (#2283)`);
+    }
+    // #5000 item 2: the COUNT dimension — a hard upstream wire constraint on
+    // the messages[] array length that no byte/token estimate can express.
+    // #5000's 55.2 MiB / 26,903-message session cleared EVERY size gate (core
+    // text 1.44 MiB, 2 MiB absolute floor, egress byte floor) and died at the
+    // upstream with the count error. The limit is per-upstream: operators opt
+    // in with BILI_MAX_MESSAGES (or network.maxMessages); 0 = disabled (no
+    // global default — a wrong value must not false-block lanes whose
+    // upstream has no count limit). Doom-only: folding cannot close a
+    // 21,903-message gap inside one preflight round budget (the planner is
+    // token-benefit-driven, #3444), and the actionable remedy is client-side
+    // (restart / rewind). Runs BEFORE the trigger guard: a token-fit
+    // 6,000-message body never triggers preflight yet still 400s upstream —
+    // that IS the #5000 case.
+    const maxMessages = limitsMaxMessages();
+    if (maxMessages > 0) {
+        const msgCount = prepared.processedMessages.length > 0 ? prepared.processedMessages.length : prepared.originalMessages.length;
+        if (msgCount > maxMessages) {
+            const gap = msgCount - maxMessages;
+            const countMessage = `message count ${msgCount.toLocaleString("en-US")} exceeds the upstream wire limit ${maxMessages.toLocaleString("en-US")} (COUNT dimension — the messages[] array length is a hard upstream constraint that no byte/token estimate expresses, #5000: a 26,903-message session cleared every size gate and died at the upstream). Folding cannot close ~${gap.toLocaleString("en-US")} messages inside one preflight; reduce the session history — restart the session or rewind to an earlier point — and retry.`;
+            log("error", `[${session.id}] preflight fail-fast 413 (retryable=false, count gate): ${countMessage}`);
+            noteLocalRefusal(session, currentOrigin, model, limit);
+            return { failFast: true, status: 413, message: countMessage, retryable: false, respond: !res.writableEnded };
+        }
     }
     if (limit <= 0 || !model || !triggerFires) return prepared;
     // #3846: an earlier local 413 for THIS origin+model at an equal or wider
@@ -3429,6 +4088,17 @@ export async function preflightCompressIfNeeded(
         // the operator can verify it by hand. Bytes, not chars: CJK monsters
         // are char-cheap (1 char ≈ 1 token already) but byte-doomed; every legit
         // fitting English payload sits ~4× under the ratio bar.
+        // #5000/#4543: this probe gate keeps the #2490 byte-floor contract
+        // (7.5 B/tok = the densest REAL billing observed, the most conservative
+        // density; the 2MB absolute keeps experiment-sized payloads probing —
+        // the #1001 shape, where real tokenizers compress past any byte-ratio
+        // bar, must stay able to bet one request and settle a usage baseline).
+        // A measured-token tier lives at the gates where a forward is
+        // arbitration of a body preflight already tried to shrink: the #1839
+        // forward-once arm below, the #3146/#4185 post-fold block further down,
+        // and the egress fuse in relay.ts — not here, where the 400 of a probe
+        // is the designed #2313 evidence (refusal record, model/origin-scoped,
+        // TTL) rather than a guaranteed waste.
         const coreTextBytes = estimateCoreMessagesUpperBytes(prepared.processedMessages);
         if (coreTextBytes > Math.max(DOOMED_PROBE_ABSOLUTE_BYTES, limit * DOOMED_PROBE_BYTES_PER_TOKEN)) {
             const byteFloorTokens = Math.ceil(coreTextBytes / DOOMED_PROBE_BYTES_PER_TOKEN);
@@ -3719,6 +4389,16 @@ export async function preflightCompressIfNeeded(
         // deflation) mirrors the fit-gate quantity; lifetime is bounded (see
         // session.ts) so never-reporting upstreams fall back to legacy sizing.
         setPostRebuildAnchor(session, rebuiltTextSize + imageTokens);
+        // [#3444] exhausted honest pass: the chain folded everything it could
+        // (no failure) yet the rebuilt payload still sits at/above the growth
+        // target — the target is physically unreachable for this session.
+        // Record the measured floor so the next trigger arms on real growth
+        // past it instead of re-firing every request; latest measurement wins.
+        if (growthArmed && result.failure === undefined && rebuiltTextSize + imageTokens >= compressionTarget) {
+            session.metadata.autoFoldFloorTokens = rebuiltTextSize + imageTokens;
+            markDirty(session);
+            log("warn", `[${session.id}] auto-fold target ${compressionTarget} unreachable — the session's irreducible baseline measures ~${rebuiltTextSize + imageTokens} tokens (system prompt + tools + live tail); effective target raised to the floor until the gap closes (#3444). Raise compress.externalSummary.autoFoldTargetTokens above ${rebuiltTextSize + imageTokens} for headroom`);
+        }
     } else {
         fits = unknownBaseline
             ? result.fitsWindow
@@ -3767,8 +4447,39 @@ export async function preflightCompressIfNeeded(
             } else {
                 log("warn", `[${session.id}] preflight made no progress but the payload fits; forwarding as-is`);
             }
+        } else if (growthArmed && !queueDroppedAll && result.savedTokens < AUTO_FOLD_MIN_BENEFIT_TOKENS) {
+            // [#3444] sub-benefit fold: a full external-summary round trip saved
+            // less than its fixed cost — same economics as a zero-progress pass,
+            // so arm the same cooldown instead of paying per-request for
+            // marginal folds. Estimation error is the usual cause (the trigger
+            // believed more was over budget than the fold could actually save);
+            // #2662's congestion exemption applies unchanged.
+            log("warn", `[${session.id}] auto-fold saved only ~${result.savedTokens} tokens (< ${AUTO_FOLD_MIN_BENEFIT_TOKENS} worth) — forwarding as-is (estimate fits the model window ${limit}); backing off auto-fold for ${Math.round(AUTO_FOLD_BACKOFF_MS / 60_000)}m so classic nudges resume (#3444)`);
+            armAutoFoldBackoff(session);
+            markDirty(session);
         }
         return outbound;
+    }
+    // #5000/#4543/#5885: parse the rebuilt outbound ONCE, up front, for the
+    // measured-body doom tiers below (the #1839 arm and the #3146/#4185 gate)
+    // AND for the output-budget read nativeFitAfterClamp needs. The meter is
+    // the #554 side-request guard's own: it walks every string field of the
+    // serialized body (system + tools + arguments + messages, CJK-aware), so
+    // unlike the m.text byte floor it sees the mass that actually rides the
+    // wire. Parse failure leaves both readings undefined — the byte-floor
+    // fallbacks stay binding for those bodies.
+    let outboundBudgetTokens: number | undefined;
+    let outboundRawTokens: number | undefined;
+    let outboundBreakdown: RawBodyBreakdown | undefined;
+    try {
+        const outBody: unknown = JSON.parse(typeof outbound.body === "string" ? outbound.body : outbound.body.toString("utf8"));
+        outboundBreakdown = estimateRawBodyBreakdown(outBody);
+        outboundRawTokens = outboundBreakdown.total;
+        const outField = outputBudgetField(outBody);
+        const rawBudget = outField !== null ? readOutputBudget(outBody as Record<string, unknown>, outField) : undefined;
+        if (typeof rawBudget === "number" && rawBudget > 0) outboundBudgetTokens = rawBudget;
+    } catch {
+        outboundBudgetTokens = undefined;
     }
     // #1839: the two measurements disagree — preflight's own final view
     // (post-fold content + images + wire overhead) fits, but the fresh
@@ -3780,6 +4491,30 @@ export async function preflightCompressIfNeeded(
     // payload is no longer refused on a stale measurement. One forward
     // only — the #330 relaxed-zone caveat still bounds the risk.
     if (result.compressedRanges > 0 && !unknownBaseline && result.payloadEstimate < limit && !localRefusalHere) {
+        // #5000/#4543/#5885: the disagreement above is between two ESTIMATES — a
+        // MEASURED body is authoritative. If the rebuilt body itself exceeds the
+        // window on the #554 meter, "forwarding once for arbitration" is a
+        // guaranteed 400 (#4543: a 4.1 MiB CJK body measuring 1,121,674 tokens
+        // against a 1M window) and the log's "NOT forwarded" claim would be a
+        // lie (#5885 defect 3) — answer it 413 instead of burning the send.
+        // Bar: the NATIVE window when bili knows it (a body over the upstream's
+        // real window can never fit, on any tokenizer), the headroom limit as
+        // fallback — a meter over-count against the POLICY headroom must not
+        // swallow the #1839/#4185 "fits the native window" forwards.
+        // Images are NOT part of this comparison: an image-dominated overage is
+        // the #496/#1800 billing-arbitration domain (forward, let upstream bill
+        // or 400 for real evidence), not a doom — #857's screenshot turn pins
+        // that. The #554 meter excludes image payloads (image_url/data/url/...),
+        // so `outboundRawTokens` is text-only by construction.
+        const armMeasuredBar = typeof resolvedNativeWindow === "number" && resolvedNativeWindow > 0 ? resolvedNativeWindow : limit;
+        if (outboundRawTokens !== undefined && outboundRawTokens > armMeasuredBar) {
+            const outMsgs = outbound.processedMessages.length > 0 ? outbound.processedMessages : outbound.originalMessages;
+            log("error", `[${session.id}] preflight 413 measured-body profile (post-fold): ${describeCoreTextDuplication(outMsgs)}`);
+            const measuredDoomMessage = `rebuilt outbound body measures ~${outboundRawTokens.toLocaleString("en-US")} TEXT tokens (${outboundBreakdown ? measuredBreakdownClause(outboundBreakdown) : "by field: n/a"}; CJK-aware count, the #554 guard meter; images billed separately, never doom here — #496/#1800/#857) vs the model window ${armMeasuredBar.toLocaleString("en-US")} (model=${model}); the body ITSELF exceeds the window, so it was NOT forwarded for upstream arbitration. Remove or trim the oversized dimension named above (e.g. a giant paste or tool result in messages[], or tools[] schemas) and retry.`;
+            log("error", `[${session.id}] preflight fail-fast 413 (retryable=false): ${measuredDoomMessage}`);
+            noteLocalRefusal(session, currentOrigin, model, limit);
+            return { failFast: true, status: 413, message: measuredDoomMessage, retryable: false, respond: !res.writableEnded };
+        }
         log("warn", `[${session.id}] preflight view fits (~${result.payloadEstimate}/${limit}) but the rebuilt payload measures over — forwarding once for upstream arbitration (#1839)`);
         return outbound;
     }
@@ -3856,20 +4591,29 @@ export async function preflightCompressIfNeeded(
     // native-fit arm closed; doom bytes (#2490) and #3846 guard every arm.
     const deterministicExhaustion = f?.kind === "exhausted" && f.deterministic;
     const noUpstreamEvidence = session.stats.lastInputTokens <= 0 && statedWall <= 0 && deterministicExhaustion;
-    let outboundBudgetTokens: number | undefined;
-    try {
-        const outBody: unknown = JSON.parse(typeof outbound.body === "string" ? outbound.body : outbound.body.toString("utf8"));
-        const outField = outputBudgetField(outBody);
-        const rawBudget = outField !== null ? readOutputBudget(outBody as Record<string, unknown>, outField) : undefined;
-        if (typeof rawBudget === "number" && rawBudget > 0) outboundBudgetTokens = rawBudget;
-    } catch {
-        outboundBudgetTokens = undefined;
-    }
     const outboundCalibrated = foldedCalibratedSize ?? calibratedPayload;
     const nativeFitAfterClamp = statedWall <= 0 && outboundBudgetTokens !== undefined && typeof resolvedNativeWindow === "number" && resolvedNativeWindow > 0
         && outboundCalibrated + outboundBudgetTokens <= resolvedNativeWindow;
     if ((unknownBaseline || noUpstreamEvidence || nativeFitAfterClamp) && !growthArmed) {
         const outMsgs = outbound.processedMessages.length > 0 ? outbound.processedMessages : outbound.originalMessages;
+        // #5000/#4543: the measured body is the stronger reading — if it exceeds
+        // the window no upstream can accept it, whatever the byte floor says
+        // (the floor only sees m.text; #5000's 55.2 MiB wire body and #4543's
+        // 4.1 MiB CJK body both cleared it). Same bar as the #1839 arm above:
+        // the native window when known (a #4185 headroom over-count must not
+        // false-refuse a natively-fitting body), the headroom limit as
+        // fallback. Measured tier first, byte floor below stays as the
+        // fallback for unparseable bodies.
+        // Same text-only rule as the #1839 arm above: image-dominated overage
+        // belongs to the #496/#1800 billing arbitration, never to a local doom.
+        const gateMeasuredBar = typeof resolvedNativeWindow === "number" && resolvedNativeWindow > 0 ? resolvedNativeWindow : limit;
+        if (outboundRawTokens !== undefined && outboundRawTokens > gateMeasuredBar) {
+            log("error", `[${session.id}] preflight 413 measured-body profile: ${describeCoreTextDuplication(outMsgs)}`);
+            const measuredDoomMessage = `outbound body measures ~${outboundRawTokens.toLocaleString("en-US")} TEXT tokens even after preflight compression (${outboundBreakdown ? measuredBreakdownClause(outboundBreakdown) : "by field: n/a"}; CJK-aware count, the #554 guard meter; images billed separately, never doom here — #496/#1800/#857) vs the model window ${gateMeasuredBar.toLocaleString("en-US")} (model=${model}); the body ITSELF exceeds the window, so it was NOT forwarded. Remove or trim the oversized dimension named above (e.g. a giant paste or tool result in messages[], or tools[] schemas) and retry.`;
+            log("error", `[${session.id}] preflight fail-fast 413 (retryable=false): ${measuredDoomMessage}`);
+            noteLocalRefusal(session, currentOrigin, model, limit);
+            return { failFast: true, status: 413, message: measuredDoomMessage, retryable: false, respond: !res.writableEnded };
+        }
         const doomBytes = estimateCoreMessagesUpperBytes(outMsgs);
         if (doomBytes > Math.max(DOOMED_PROBE_ABSOLUTE_BYTES, limit * DOOMED_PROBE_BYTES_PER_TOKEN)) {
             const byteFloorTokens = Math.ceil(doomBytes / DOOMED_PROBE_BYTES_PER_TOKEN);
@@ -4045,11 +4789,26 @@ function formatBytes(n: number): string {
 // bytes are counted with Buffer.byteLength since undici sends UTF-8 bytes even
 // for string bodies (.length would count UTF-16 chars and undercount any
 // non-ASCII injection). Omitted on paths that fail fast without forwarding.
+// #4528: bili's own per-request processing past this WALL-CLOCK budget means
+// synchronous main-thread work large enough to starve the event loop and
+// freeze every endpoint on the same listener — warn so a pathological session
+// shows up in the log instead of being found through a frozen UI.
+// #5744: the trigger used to be message COUNT (>1000), which cannot separate
+// cost from size — one reporter session saved at 0.8s AND 14.5s at the same
+// ~3k msgs. Wall clock IS the cost; the info line above keeps reporting the
+// count for correlation.
+const SLOW_SESSION_MS_WARN = 1000;
 export function logRequestCost(log: (level: string, msg: string) => void, sessionId: string, msgs: number | null, inboundBytes: number, t0: number, outbound?: string | Buffer): void {
     const ms = Math.max(0, Math.round(performance.now() - t0));
     const outboundField = outbound !== undefined ? `, outbound=${formatBytes(Buffer.byteLength(outbound))}` : "";
     const view = currentFetchTransport() ? ", view=ws-expanded" : "";
     log("info", `[${sessionId}] request: ${msgs ?? "?"} msgs, inbound=${formatBytes(inboundBytes)}${outboundField}, local=${ms}ms${view}`);
+    // #5408: this line is THE observation point — a hot-at-attach session that
+    // never produces one is silent compression loss (the incident signature).
+    noteRequest(sessionId);
+    if (ms > SLOW_SESSION_MS_WARN) {
+        log("warn", `[${sessionId}] slow-session: ${msgs ?? "?"} msgs / inbound=${formatBytes(inboundBytes)} took local=${ms}ms — synchronous per-turn work is starving the event loop (#4528/#5744); consider closing/restarting the session or enabling compression`);
+    }
 }
 
 /** Thrown by readBody when the request body exceeds the configured receive-body

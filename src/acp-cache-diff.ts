@@ -396,7 +396,7 @@ export function compareWires(aBody: Buffer, bBody: Buffer): WireRel {
 
 export interface UsageSample { ts: number; input: number; cached: number; }
 
-const USAGE_LINE_RE = /^(\d{4}-\d{2}-\d{2}T[\d:.]+Z?) \[[a-z]+\] \[([^\]]+)\] (?:\[plugin\] )?\[acp-usage\](?: round \d+)? input=(\d+) cached=(\d+)/;
+const USAGE_LINE_RE = /^(\d{4}-\d{2}-\d{2}T[\d:.]+(?:Z|[+-]\d{2}:\d{2})?) \[[a-z]+\] \[([^\]]+)\] (?:\[plugin\] )?\[acp-usage\](?: round \d+)? input=(\d+) cached=(\d+)/;
 
 export function parseUsageLog(file: string): Map<string, UsageSample[]> {
     const bySession = new Map<string, UsageSample[]>();
