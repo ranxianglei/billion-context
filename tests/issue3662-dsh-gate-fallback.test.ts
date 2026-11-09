@@ -46,6 +46,9 @@ function mockGateHost() {
     };
 }
 const PRESET_SELF = { entry: { options: { name: "@deepseek-ai/dsh-agent-preset" } } };
+// #5248: the host-plane compaction-basic entry — its resolved config is the
+// plugin's own config, which the bundle patch replaces wholesale with {auto:false}
+const BASIC_SELF = { entry: { options: { name: "@deepseek-ai/dsh-compaction-basic" } } };
 function presetPlugins(): Array<Record<string, unknown>> {
     return [
         { name: "@deepseek-ai/dsh-compaction-basic", config: { auto: true } },
@@ -97,6 +100,47 @@ test("#3662: bili-native absent (disabled / kill-switched) — service still pro
         const out = mw.call(PRESET_SELF, null, () => cfg) as Record<string, unknown>;
         assert.equal(out, cfg, "absent verdict must pass the resolved config through verbatim");
         for (const row of plugins) assert.equal(row.disabled, undefined);
+    } finally {
+        _resetDshCompactionVerdictForTest();
+    }
+});
+
+test("#5248: bili-native absent — the static bundle-patch auto:false line is undone, host plane back to stock", () => {
+    try {
+        _resetDshCompactionVerdictForTest();
+        assert.ok(!isDshCompactionActive());
+        const m = mockGateHost();
+        gate.apply(m.host);
+        const mw = m.middleware() as (raw: unknown, next: () => unknown) => unknown;
+        // the bundle patch replaced the host-plane row's config wholesale with {auto:false}
+        const patched: Record<string, unknown> = { auto: false };
+        const out = mw.call(BASIC_SELF, null, () => patched) as Record<string, unknown>;
+        assert.notEqual(out, patched, "the patched row must be rewritten, not passed through");
+        assert.deepEqual(out, { auto: true }, "host-plane auto compaction restored to stock");
+        assert.equal(patched.auto, false, "the input config must not be mutated");
+        const multi: Record<string, unknown> = { auto: false, foo: "bar" };
+        assert.deepEqual(mw.call(BASIC_SELF, null, () => multi), { auto: true, foo: "bar" }, "other keys survive the restore");
+        // negatives: nothing to restore ⇒ identity passthrough
+        const stock: Record<string, unknown> = { auto: true };
+        assert.equal(mw.call(BASIC_SELF, null, () => stock), stock, "already-stock row passes through verbatim");
+        const otherEntry: Record<string, unknown> = { auto: false };
+        assert.equal(mw.call({ entry: { options: { name: "@deepseek-ai/dsh-other" } } }, null, () => otherEntry), otherEntry, "only the compaction-basic entry is targeted");
+        const arr = [{ auto: false }];
+        assert.equal(mw.call(BASIC_SELF, null, () => arr), arr, "array configs are not a compaction-basic shape");
+    } finally {
+        _resetDshCompactionVerdictForTest();
+    }
+});
+
+test("#5248: verdict active — the static line stays authoritative, host plane NOT restored", () => {
+    try {
+        _resetDshCompactionVerdictForTest();
+        declareDshCompactionActive();
+        const m = mockGateHost();
+        gate.apply(m.host);
+        const mw = m.middleware() as (raw: unknown, next: () => unknown) => unknown;
+        const patched: Record<string, unknown> = { auto: false };
+        assert.equal(mw.call(BASIC_SELF, null, () => patched), patched, "active verdict leaves the host-plane row exactly as the patch wrote it");
     } finally {
         _resetDshCompactionVerdictForTest();
     }

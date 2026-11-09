@@ -11,6 +11,10 @@
 # #3354; see src/agent/dsh-compaction-disable.ts). A profile-level full-snapshot
 # override of preset-standard (#2474) remains the fallback for dsh builds
 # whose internal 'internal/config' hook moved.
+# #5248: this line stays declarative ON PURPOSE — fail-safe: if the gate entry
+# fails to load while bili-native loads, the host plane must stay stood down.
+# When bili-native is absent/disabled (no process verdict), the gate transform
+# undoes exactly this line: host-plane auto returns to stock (dsh fully back).
 # #3662: the gate lives in its OWN always-on entry, not in bili-native —
 # disabling or kill-switching bili-native must leave the gate service alive so
 # the presets fall back to STOCK dsh compaction instead of pending forever
