@@ -92,7 +92,7 @@ test("A1: refusal bodies carry the bili_final terminal marker on both protocol s
     assert.equal(err.code, "dsh_compaction_refused");
 
     // the message must state the terminal semantics + the levers (#3013)
-    assert.match(String(err.message), /terminal for the session/);
+    assert.match(String(err.message), /unconditional and terminal \(bili_final\)/);
     assert.match(String(err.message), /stop retrying/);
     assert.match(String(err.message), /#2474/);
     assert.match(String(err.message), /allowDshCompaction/);
@@ -131,7 +131,7 @@ test("A3: pipeline storm — first refusal warns once, then every DSH_REFUSAL_ST
         assert.match(storm[0].msg, new RegExp(`refusal #${DSH_REFUSAL_STORM_LOG_EVERY}\\b`));
         assert.match(storm[0].msg, /never shrinks \(#2490\)/);
         assert.match(storm[0].msg, /#2474/);
-        assert.match(storm[0].msg, /allowDshCompaction/);
+        assert.match(storm[0].msg, /Disable dsh auto-compaction/);
         assert.match(storm[0].msg, /#3013/);
     } finally {
         setLogCapture(null);
@@ -172,7 +172,7 @@ test("A3: passthrough storm — first-in-process warns, then the same cadence (n
         if (firstInLoop) {
             assert.equal(warns.length, 1, "process-first refusal warns");
             assert.equal(infos.length, 1, "and the 100th logs one cadence info");
-            assert.match(infos[0].msg, /terminal; #3013/);
+            assert.match(infos[0].msg, /terminal, bili_final; #3013/);
         } else {
             assert.equal(infos.length, 1, "exactly one cadence info per 100 consecutive refusals");
         }

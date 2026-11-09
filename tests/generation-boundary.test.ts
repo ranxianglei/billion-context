@@ -126,9 +126,43 @@ test("#4305: injectSystem appends the note only when the boundary is active", ()
     const parsed = { system: "You are a helpful assistant.", messages: [] };
     const off = injectSystem({ ...parsed }, OPTS, undefined, defaultConfig(400_000), undefined, true, false, false) as string;
     assert.ok(!off.includes(GENERATION_BOUNDARY_NOTE), "inactive: system block unchanged by this feature");
-    const on = injectSystem({ ...parsed }, OPTS, undefined, defaultConfig(400_000), undefined, true, false, true) as string;
+    const on = injectSystem({ ...parsed }, OPTS, undefined, defaultConfig(400_000), undefined, true, false, false, true) as string;
     assert.ok(on.includes(GENERATION_BOUNDARY_NOTE), "active: note rides the ACP standing block");
     assert.ok(on.startsWith("You are a helpful assistant."), "client system block stays byte-exact (appended, never merged)");
     // sysParts order contract: client head, standing prompt (attribution outermost), THEN the note.
     assert.ok(on.indexOf(GENERATION_BOUNDARY_NOTE) > on.indexOf(PROJECT_ATTRIBUTION_LINE), "note sits AFTER the standing prompt, matching every steady prepare* path");
+});
+
+test("#4305: in-band system messages (e.g. codemode_catalog with m00150–m00220 example) never trigger", () => {
+    const s = sessionWithFrontier(10);
+    const messages: CoreMessage[] = [
+        {
+            id: "sys-patch",
+            role: "system",
+            contentType: "text",
+            text: "Updated system prompt section \"codemode_catalog\"\n- compress: each block starts with its 'm00150–m00220 optional topic' header line",
+        },
+    ];
+    assert.equal(detectGenerationBoundary(s, messages), false, "system catalog example refs are not previous-generation residue");
+    assert.equal(readGenerationBoundary(s), undefined);
+});
+
+test("#4305: mid-session turns (stats.requests > 1) never newly latch a generation boundary and break prefix cache", () => {
+    const s = sessionWithFrontier(17);
+    s.stats.requests = 1;
+    // Turn 1 had no stale refs -> no boundary latched on the first request.
+    assert.equal(detectGenerationBoundary(s, [msg("u1", "hello")]), false);
+    // Turn 2+ (requests > 1): a tool result or user message quotes m00047/m00048 or m00150/m00220.
+    s.stats.requests = 6;
+    const midSessionMessages: CoreMessage[] = [
+        msg("u1", "hello"),
+        {
+            id: "tool-1",
+            role: "tool",
+            contentType: "tool-result",
+            text: "inspected session file: m00047, m00048, and m00150–m00220",
+        },
+    ];
+    assert.equal(detectGenerationBoundary(s, midSessionMessages), false, "must not flip mid-session and mutate the standing system prompt");
+    assert.equal(readGenerationBoundary(s), undefined);
 });

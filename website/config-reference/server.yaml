@@ -153,10 +153,10 @@ entries:
     group: upstream
     id: tt.mcl2
     site_group: up
-    desc_en: "Legacy global window ceiling (highest-priority window source and usage denominator); prefer compress.modelContextLimit."
-    desc_zh: "旧版全局窗口上限（窗口来源中优先级最高，兼作使用率分母）；建议改用 compress.modelContextLimit。"
-    site_en: "<code>modelContextLimit</code> — legacy global window ceiling (default 200000); prefer compress.modelContextLimit."
-    site_zh: "<code>modelContextLimit</code> —— 旧版全局窗口上限（默认 200000）；建议改用 compress.modelContextLimit。"
+    desc_en: "Legacy global DEFAULT window (last-resort fallback in the window ladder: consulted only when no tier evidence, plugin/launcher report, per-route declaration, registry lookup, or built-in table resolves a limit for the model; also the usage-ratio denominator wherever it wins); prefer compress.modelContextLimit."
+    desc_zh: "旧版全局默认窗口（窗口解析阶梯的最后一层兜底：仅当 tier 证据、plugin/launcher 报告、路由声明、注册表查询、内置表都未解析出该模型的上限时才使用；在其生效的会话里兼作使用率分母）；建议改用 compress.modelContextLimit。"
+    site_en: "<code>modelContextLimit</code> — legacy global DEFAULT window (default 200000): last-resort fallback when no other source resolves a limit for the model; does NOT cap a natively-resolved window (#5908); prefer compress.modelContextLimit."
+    site_zh: "<code>modelContextLimit</code> —— 旧版全局默认窗口（默认 200000）：窗口解析的最后一层兜底，其他来源都未解析出该模型上限时才生效；不会封顶已按原生解析出的窗口（#5908）；建议改用 compress.modelContextLimit。"
   - key: imageBilling
     type: "\"auto\" | \"pixels\" | \"bytes\""
     default: "auto (resolves to pixels)"
@@ -190,6 +190,17 @@ entries:
     desc_zh: "出站图片降采样总开关（#3295/#3400）：大图以缩小形态发给模型，原图在会话存储中保持字节级原样。逐请求实时读取。"
     site_en: "<code>imageRescale</code> — egress downscale switch; large outbound images sent shrunken, originals kept byte-exact in session storage."
     site_zh: "<code>imageRescale</code> —— 出站图片降采样总开关；大图以缩小形态出站，原图在会话存储中保持字节级原样。"
+  - key: billing
+    type: object
+    default: "{}"
+    env: []
+    group: upstream
+    id: tt.billing
+    site_group: up
+    desc_en: "Per-model billing prices (#4899): billing.prices[model] = { input, output?, cacheRead?, cacheWrite? } in USD per million tokens; overrides the models.dev snapshot for the panel's USD spend ledger and saved-dollar estimate. Unpriced models show tokens only."
+    desc_zh: "按模型计费单价（#4899）：billing.prices[模型] = { input, output?, cacheRead?, cacheWrite? }，美元/百万 token；覆盖 models.dev 快照价，驱动面板美元花费台账与省钱折算。无价模型只显示 token。"
+    site_en: "<code>billing.prices</code> — per-model USD/Mtok prices feeding the panel's spend + savings views."
+    site_zh: "<code>billing.prices</code> —— 按模型美元/百万 token 单价，驱动面板花费与省钱视图。"
   - key: maskHosts
     type: boolean
     default: "true"
@@ -218,10 +229,21 @@ entries:
     group: behavior
     id: tt.subagent
     site_group: beh
-    desc_en: "Claude Code subagents get their own session namespace (<session>|sub:<agent-id>) instead of queueing behind the main session."
-    desc_zh: "Claude 子代理拥有独立会话命名空间（<session>|sub:<agent-id>），不再排队在主会话锁后。"
+    desc_en: "Claude Code subagents get their own session namespace (<session>|sub:<agent-id>) instead of queueing behind the main session. Anthropic-wire only — on the Responses wire this switch is a no-op (see the `subagentSplit` / BOTH-mechanisms scope note)."
+    desc_zh: "Claude 子代理拥有独立会话命名空间（<session>|sub:<agent-id>），不再排队在主会话锁后。仅 anthropic 线路 —— Responses 线路上本开关无效（见 `subagentSplit` / BOTH-mechanisms 作用域说明）。"
     site_en: "<code>subagentSplit</code> — Claude subagents get their own session namespace (on by default)."
     site_zh: "<code>subagentSplit</code> —— Claude 子代理拥有独立会话命名空间（默认开）。"
+  - key: personaSplit
+    type: boolean
+    default: "true"
+    env: BILI_PERSONA_SPLIT
+    group: behavior
+    id: tt.persona
+    site_group: beh
+    desc_en: "Split the Responses-wire lane keyed by the instructions fingerprint (Claude Code over /v1/responses; Codex root threads / older builds) when the instructions text changes AND the incoming history does not continue the tracked chain (default on). Opt out with env BILI_PERSONA_SPLIT=0 or personaSplit: false (env wins)."
+    desc_zh: "当 instructions 文本变化且入站历史不连续时，把按 instructions 指纹分键的 Responses 车道（Claude Code over /v1/responses；Codex 根线程 / 旧版本构建）分叉出去（默认开）。用环境变量 BILI_PERSONA_SPLIT=0 或配置 personaSplit: false 关闭（环境变量优先）。"
+    site_en: "<code>personaSplit</code> — Responses-wire instructions-fingerprint split (on by default; set false / BILI_PERSONA_SPLIT=0 to opt out)."
+    site_zh: "<code>personaSplit</code> —— Responses 线路 instructions 指纹分叉（默认开；false / BILI_PERSONA_SPLIT=0 关闭）。"
   - key: forkAdoption
     type: boolean
     default: "false"
@@ -378,11 +400,11 @@ entries:
     desc_zh: "按 Authorization 方案键控的重签名臂：可重签名的模型请求全程重签转发；无法重签的请求本地 403 拒绝，除非该方案经 passthrough 选择原文透传。"
   - key: promptCache.routing
     type: "\"auto\" | \"enabled\" | \"disabled\""
-    default: "auto"
+    default: "disabled"
     env: ACP_PROMPT_CACHE_ROUTING
     group: behavior
-    desc_en: "Prompt-cache routing posture for cache-aware lane selection."
-    desc_zh: "面向缓存感知路由选择的提示词缓存路由姿态。"
+    desc_en: "Posture of bili's own `prompt_cache_key` emission (both wires); client-supplied keys always forward verbatim."
+    desc_zh: "bili 自注入 `prompt_cache_key` 的姿态（两条 wire 同时生效）；客户端自带的 key 永远原样转发。"
   - key: cacheKeepalive.enabled
     type: boolean
     default: "false"
@@ -476,15 +498,29 @@ entries:
     default: "{} (acp_delegate enabled with package defaults)"
     env: [PI_ACP_DELEGATE_FORCE_ENABLE, PI_ACP_DELEGATE_MAX_DEPTH, PI_ACP_DELEGATE_SYNC_TIMEOUT_MINUTES, PI_ACP_DELEGATE_IDLE_TIMEOUT_MINUTES, PI_ACP_DELEGATE_ASYNC_TIMEOUT_MINUTES, PI_ACP_DELEGATE_MAX_CONCURRENT]
     group: behavior
-    desc_en: "Built-in pi-lane sub-agents (acp_delegate) surface, #2230 config-home. The pi.subagents section of billion-context.json owns the delegate config; the four acp.json keys (delegate/delegatePrompt/displayUsage/debug) are a deprecated fallback read only while the section is absent. prompt replaces delegatePrompt; debug is scoped to the sub-agent subsystem. Boolean shorthand subagents: false disables the whole surface. Full field table: the pi section in CONFIGURATION.md."
-    desc_zh: "内置 pi lane 子代理（acp_delegate）面（#2230 配置搬家）。billion-context.json 的 pi.subagents 段拥有 delegate 配置；acp.json 四键（delegate/delegatePrompt/displayUsage/debug）为已废弃回退源，仅段缺失时读取。prompt 取代 delegatePrompt；debug 限定子代理子系统。布尔简写 subagents: false 整体关闭。完整字段表见 CONFIGURATION.md 的 pi 段。"
+    desc_en: "Built-in pi-lane sub-agents (acp_delegate) surface, #2230 config-home. The pi.subagents section of billion-context.json owns the delegate config; the four acp.json keys (delegate/delegatePrompt/displayUsage/debug) are a deprecated fallback read only while the section is absent. prompt replaces delegatePrompt; debug is scoped to the sub-agent subsystem. Boolean shorthand subagents: false disables the whole surface. Full field table: the pi section in configuration.md."
+    desc_zh: "内置 pi lane 子代理（acp_delegate）面（#2230 配置搬家）。billion-context.json 的 pi.subagents 段拥有 delegate 配置；acp.json 四键（delegate/delegatePrompt/displayUsage/debug）为已废弃回退源，仅段缺失时读取。prompt 取代 delegatePrompt；debug 限定子代理子系统。布尔简写 subagents: false 整体关闭。完整字段表见 configuration.md 的 pi 段。"
   - key: pi.inline
     type: boolean
-    default: "false"
+    default: "true (unset env+file runs inline)"
     env: BILI_PI_INLINE
     group: behavior
-    desc_en: "Pi inline lane (#3278): run the pi extension's compression IN-PROCESS — no spawned proxy, no ephemeral port; model traffic and the /__bili//__acp tool surface are served by an in-process engine through a pseudo-origin. Resolved env > file > default(off): BILI_PI_INLINE=1/true enables, BILI_PI_INLINE=0/false explicitly disables over this file value."
-    desc_zh: "pi 内联压缩通道（#3278）：pi 扩展在进程内直接压缩——不派生代理进程、无临时端口；模型流量与 /__bili//__acp 工具面由进程内引擎经伪源站服务。解析顺序 env > 文件 > 默认(off)：BILI_PI_INLINE=1/true 开启，BILI_PI_INLINE=0/false 显式关闭且优先于本文件值。"
+    desc_en: "Pi inline lane (#3278; DEFAULT-ON since #5428, superseding the #4687 opt-in rule): the pi extension's compression runs IN-PROCESS — no spawned proxy, no ephemeral port; model traffic and the /__bili//__acp tool surface are served by an in-process engine through a pseudo-origin, the codex Responses WebSocket lane by a loopback-only WS bridge, and the Web UI by a loopback-only web listener booted with the engine. Unset env+file now runs INLINE; an ANNOUNCED attach target (launcher-set BILLION_CONTEXT_PROXY/ATTACH) still beats the default, so `bili pi` keeps its launcher proxy. Opt OUT with BILI_PI_INLINE=0/false/no/off or this key set false — restores the old attach/spawn posture. Resolved env > file > default; an explicit inline choice always beats an announced attach target. Human surface: `bili -i/--inline pi` (≡ the one-command lane) and `bili -s/--server pi` (pin the proxy posture, beats an inherited inline env)."
+    desc_zh: "pi 内联压缩通道（#3278；自 #5428 起默认开启，取代 #4687 的手动开启规则）：pi 扩展的压缩在进程内完成——不派生代理进程、无临时端口；模型流量与 /__bili//__acp 工具面由进程内引擎经伪源站服务，codex 的 Responses WebSocket 通道走随引擎启动的仅回环 WS 桥，Web UI 走随引擎启动的仅回环监听。未设置 env+文件时默认内联；显式宣告的附着目标（launcher 预置的 BILLION_CONTEXT_PROXY/ATTACH）仍压过默认，`bili pi` 照旧用 launcher 代理。不想用就 BILI_PI_INLINE=0/false/no/off 或本键设 false——恢复旧的 attach/spawn 姿态。解析顺序 env > 文件 > 默认；显式开启永远压过附着目标。人类入口:`bili -i/--inline pi`(≡ 一键车道)与 `bili -s/--server pi`(钉死代理姿态,压过继承的内联变量)。"
+  - key: pi.commands
+    type: "string[] | boolean"
+    default: "[\"acp\", \"acp-cache\"]"
+    env: ""
+    group: behavior
+    desc_en: "Which bili pi-plugin slash commands register: \"acp\", \"acp-cache\", \"acp-rule\", \"acp-fleet\". The default keeps the status (/acp) and cache-reconciliation (/acp-cache) entry points while leaving the rarer /acp-rule and /acp-fleet off the slash-completion list; true registers all four, [] or false registers none. Unknown names warn once and are ignored. Read at session start, so a config edit applies to the next session (no proxy restart needed). Pure UI surface: disabling a command never removes the underlying tool (acp_cache / acp_rule stay available to the model) or affects the proxy."
+    desc_zh: "bili pi 插件注册哪些斜杠命令：\"acp\"、\"acp-cache\"、\"acp-rule\"、\"acp-fleet\"。默认保留状态面板（/acp）与缓存对账（/acp-cache）两个入口，较冷门的 /acp-rule 与 /acp-fleet 不进入补全列表；true 注册全部四个，[] 或 false 一个都不注册。未知命令名告警一次后忽略。会话启动时读取，改配置下一个会话即生效（无需重启代理）。纯 UI 面：关闭命令不影响底层工具（acp_cache / acp_rule 对模型仍可用）与代理。"
+  - key: opencode.inline
+    type: boolean
+    default: "false"
+    env: BILI_OPENCODE_INLINE
+    group: behavior
+    desc_en: "OpenCode inline lane (#3278 port; OPT-IN — the default stays the spawned proxy, per owner decision on #4687): the opencode plugin's compression runs IN-PROCESS — no spawned proxy, no ephemeral port, no MITM certs; model traffic and the /__bili/ tool surface are served by an in-process engine through a pseudo-origin (verified on the Bun host). Set true (or BILI_OPENCODE_INLINE=1) to enable. Resolved env > file; an explicit inline choice always beats an announced attach target, an absent choice falls back to attach/spawn as before. `bili opencode-inline` is the one-command lane."
+    desc_zh: "opencode 内联压缩通道（#3278 移植；需手动开启——按 #4687 决定，默认仍是派生代理）：opencode 插件的压缩在进程内完成——不派生代理进程、无临时端口、无 MITM 证书；模型流量与 /__bili/ 工具面由进程内引擎经伪源站服务（已在 Bun 宿主验证）。设 true（或 BILI_OPENCODE_INLINE=1）开启。解析顺序 env > 文件；显式开启永远压过附着目标，未设置时行为与旧版一致（attach/spawn）。`bili opencode-inline` 一键车道。"
   - key: mitm.enabled
     type: boolean
     default: "true"

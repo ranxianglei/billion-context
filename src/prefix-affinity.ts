@@ -45,7 +45,7 @@ import { USER_IMAGE_PLACEHOLDER, normalizeMessageText } from "./fold-reconcile.j
  * conversation, truncated replay" from "a different conversation quoting
  * shared content" (templated tool outputs, standard files, stock errors —
  * parallel agents on one codebase produce these naturally). Removed in
- * #1115; rejected alternatives are documented in SESSION-IDENTITY.md.
+ * #1115; rejected alternatives are documented in docs/session-identity.md.
  *
  * Safety: matching a stored chain requires holding a byte-identical HEAD, so
  * the folded state reveals nothing the requester does not already hold.

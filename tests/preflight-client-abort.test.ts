@@ -175,14 +175,17 @@ for (const pluginMode of [false, true]) {
 test("cancelled growth auto-fold stops before fail-open forwarding and backoff", async () => {
     await withUpstream(async (url, mainCalls) => {
         const f = fixture(url, 50_000);
-        f.session.stats.lastInputTokens = 10_000;
+        // #3444 benefit gate: the growth arm needs decisionTrigger − target ≥
+        // AUTO_FOLD_MIN_BENEFIT_TOKENS (4096) — 10_000 vs 8192 left only 1808,
+        // so the trigger silently disarmed after 30ae2188a. 20_000 re-arms it.
+        f.session.stats.lastInputTokens = 20_000;
         f.session.stats.lastInputTokensSource = "usage";
         Object.assign(f.config, { externalSummary: parseExternalSummarySettings({
             enabled: true, autoFold: true, autoFoldTargetTokens: 8192,
             targets: [{ name: "sum", protocol: "responses", url, model: "test-model", apiKey: "fixture-key" }],
         }, { inlineKeys: true }) });
         f.prepared.nudge = f.core.processTurn({ messages: f.messages, state: f.session.state,
-            config: f.config, tokenCount: 10_000, renderTags: "text-only" }).nudge;
+            config: f.config, tokenCount: 20_000, renderTags: "text-only" }).nudge;
         assert.ok(f.prepared.nudge?.compressibleRanges.length);
         const processTurn = f.core.processTurn.bind(f.core);
         f.core.processTurn = params => {

@@ -37,7 +37,9 @@ interface LogQueryResult {
     isMatch?: boolean[];
 }
 
-const TS_RE = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z)/;
+// Bare local-time stamps (current format) and the older `Z` / offset forms all
+// must parse: one log file outlives a format change.
+const TS_RE = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?)/;
 
 function parseTs(line: string): number {
     const m = TS_RE.exec(line);

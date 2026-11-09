@@ -29,6 +29,19 @@ export const BILI_PASSTHROUGH_HEADER = "x-bili-passthrough";
 // 1M-token window could hold are stopped.
 export const MIN_ASSUMED_WINDOW_TOKENS = 1_000_000;
 
+// Session-ledger measurement (#5613): the wire bodies this host family sends
+// are billed upstream ~14% ABOVE the optimistic bytes/4 token FLOOR — the
+// floor is a strict lower bound, so a body that sits just under the window in
+// floor terms can already be OVER it in reality (the #5613 shape: a send that
+// passed every old "never false-refuse" check, then bricked the session
+// upstream). The over-window fuses therefore price media-excluded core text
+// at the CALIBRATED estimate (floor × this ratio) and only fail open when
+// even that fits; the bare floor remains the stronger "provably over" tier,
+// kept in the result shape for message wording. Owner-approved 2026-11-07:
+// large histories fail CLOSED locally instead of riding into a guaranteed
+// upstream 400.
+export const CALIBRATED_TEXT_TOKEN_RATIO = 1.14;
+
 /**
  * Cryptographic hash of a string, truncated to a 64-bit id (16 hex chars).
  *
@@ -156,7 +169,7 @@ export type WireProtocol = "anthropic" | "openai" | "responses" | "google";
 export function usageTotals(
     protocol: WireProtocol,
     usage: Record<string, unknown>,
-): { total: number | undefined; cached: number | undefined } {
+): { total: number | undefined; cached: number | undefined; creation?: number | undefined } {
     const num = (v: unknown): number | undefined =>
         typeof v === "number" && Number.isFinite(v) ? v : undefined;
     if (protocol === "anthropic") {
@@ -169,6 +182,9 @@ export function usageTotals(
         return {
             total: any ? promptInputTotal("anthropic", fresh ?? 0, read, creation, declaredInclusiveFromUsage(usage)) : undefined,
             cached: read,
+            // #4899: anthropic is the only wire with a cache-WRITE premium —
+            // surface creation tokens for the USD ledger (billing.ts).
+            creation,
         };
     }
     if (protocol === "openai") {
@@ -251,7 +267,19 @@ export function promptInputTotal(
     const baseSplit = !wireInclusive || (typeof cached === "number" && input < cached);
     // #4128: the ONLY lane whose default can flip to inclusive here, and ONLY on an
     // explicit upstream declaration — never inferred from the numbers (see above).
-    const anthropicInclusive = protocol === "anthropic" && declaredInclusive === true;
+    // #5513: trust that declaration only while it is SELF-CONSISTENT. An inclusive
+    // input contains its cache-read subset by definition, so it can never be smaller
+    // than it. A stamp claiming inclusive while reporting input < cached is
+    // self-refuting — it can only be a relay that reports Anthropic-split numbers
+    // (fresh-only input_tokens + separate cache_read) yet stamps semantic="openai"
+    // (e.g. a DeepSeek-backed gateway, whose native prompt_tokens is fresh-only).
+    // Reverting to split there adds the cached segment back instead of dividing it
+    // out of an under-counted total (which produced 1796–6991% "hit rates"). A
+    // genuine inclusive relay always has input >= cached, so this never touches
+    // correct traffic.
+    const anthropicInclusive =
+        protocol === "anthropic" && declaredInclusive === true &&
+        !(typeof cached === "number" && input < cached);
     const splitSemantics = baseSplit && !anthropicInclusive;
     const additive =
         (splitSemantics && typeof cached === "number" ? cached : 0) +

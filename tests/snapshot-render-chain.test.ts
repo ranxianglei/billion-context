@@ -47,10 +47,13 @@ let nextSessionId = 0;
 
 /** Install a fabricated unified-store tail view and render `client` through it. */
 function render(blocks: BlockLike[], client: BiliMessage[], rows: BiliMessage[]): { session: Session; view: BiliMessage[] } {
-    const rawRows = rows.map((m, i) => ({ seq: i + 1, content: JSON.stringify(m) }));
+    const rawRows = rows.map((m, i) => ({ seq: i + 1, msgId: m.id, content: JSON.stringify(m) }));
+    const inWindow = (seq: number, intervals: readonly [number, number][]) => intervals.some(([a, b]) => seq >= a && seq <= b);
     const fake = {
         unifiedTailSeqs: () => rawRows.map((r) => r.seq),
         unifiedTailViewRows: () => rawRows,
+        unifiedMessageIdRows: () => rawRows.map(({ seq, msgId }) => ({ seq, msgId })),
+        unifiedUncoveredRows: (_id: string, intervals: readonly [number, number][]) => rawRows.filter((r) => !inWindow(r.seq, intervals)),
     };
     _setStoreForTest(fake as unknown as SessionStore);
     nextSessionId++;

@@ -110,6 +110,25 @@ export function codexResponsesWsTarget(url: string | URL): string | undefined {
     return httpUrl;
 }
 
+/** Bound a pending inline wsOrigin like readyOrigin bounds a bootstrap: a
+ *  wedged bridge boot settles undefined (→ DIRECT degrade) instead of
+ *  pinning a DeferredWebSocket in CONNECTING forever. */
+function raceWsOriginBound(pending: Promise<string | undefined>): Promise<string | undefined> {
+    return new Promise(resolve => {
+        const timer = setTimeout(() => resolve(undefined), 20_000);
+        pending.then(
+            value => {
+                clearTimeout(timer);
+                resolve(value);
+            },
+            () => {
+                clearTimeout(timer);
+                resolve(undefined);
+            },
+        );
+    });
+}
+
 /** `<origin>` + `/bili/` + the normalized http(s) upstream — the proxy-connect
  *  side uses ws(s):, the embedded upstream keeps http(s): (codec contract). */
 export function rewriteCodexResponsesWsUrl(target: string, origin: string): string {
@@ -403,15 +422,21 @@ export function installNativeWebSocketIntercept(initialState: NativeInterceptSta
                 state.onDispatch?.(rewritten, "rewrite");
                 return new RoutedWebSocket(rewritten, ...rest);
             };
-            const origin = state.origin;
-            if (origin !== undefined) return rewrite(origin);
+            const origin = state.wsOrigin ?? state.origin;
+            if (typeof origin === "string") return rewrite(origin);
             // Origin still settling → defer the real connection (bounded by
-            // readyOrigin's timeout, same hold the fetch lane applies).
+            // readyOrigin's timeout, same hold the fetch lane applies). A
+            // pending wsOrigin (inline bridge booting) rides the same shell:
+            // settle undefined → DIRECT degrade below.
             return new DeferredWebSocket(
                 urlStr,
                 rest,
                 async () => {
-                    const settled = await readyOrigin(state);
+                    // A pending wsOrigin is the inline bridge booting; bound it
+                    // like readyOrigin bounds a bootstrap (20s) so a wedged
+                    // cold start cannot hold the construction in CONNECTING
+                    // forever — it degrades DIRECT below instead.
+                    const settled = state.wsOrigin instanceof Promise ? await raceWsOriginBound(state.wsOrigin) : await readyOrigin(state);
                     if (settled === undefined) {
                         if (!warnedDirect) {
                             warnedDirect = true;

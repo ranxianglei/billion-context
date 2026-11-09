@@ -208,11 +208,13 @@ test("#4297 main dump enforces final UTF-8 bytes including markers and pretty pr
 test("#4297 main dump preserves bodies that fit exactly at the byte limit", () => {
     process.env.BILI_DUMP_4XX = "1";
     process.env.BILI_DUMP_4XX_MAX_BYTES = "1024";
+    // #4482: the banner line rides along, so the body budget is the knob minus it.
+    const budget = 1024 - Buffer.byteLength(DUMP_PLAINTEXT_BANNER) - 1;
     try {
-        for (const raw of ["x".repeat(1024), "汉".repeat(340) + "😀", "small raw body"]) {
+        for (const raw of ["x".repeat(budget), "汉".repeat(Math.floor((budget - 4) / 3)) + "😀", "small raw body"]) {
             const out = dumpRejectedBody(400, "boundary", raw);
             assert.ok(out);
-            assert.equal(fs.readFileSync(out, "utf8"), raw);
+            assert.equal(stripDumpBanner(fs.readFileSync(out, "utf8")), raw);
         }
     } finally { restoreDumpEnv(); }
 });
@@ -232,7 +234,7 @@ test("#4297 summary cap covers both sides, JSON escaping and envelope bytes", ()
             const out = dumpSummaryRejection(413, `summary-bytes-${i}`, request, response);
             assert.ok(out);
             assert.ok(fs.statSync(out).size <= 1024, `${i}: ${fs.statSync(out).size} bytes`);
-            const parsed = JSON.parse(fs.readFileSync(out, "utf8")) as { status: number; request: string; response: string };
+            const parsed = JSON.parse(stripDumpBanner(fs.readFileSync(out, "utf8"))) as { status: number; request: string; response: string };
             assert.equal(parsed.status, 413);
             assert.equal(typeof parsed.request, "string");
             assert.equal(typeof parsed.response, "string");
@@ -247,13 +249,14 @@ test("#4297 summary cap covers both sides, JSON escaping and envelope bytes", ()
 test("#4297 summary exact byte boundary stays complete; one more byte truncates valid JSON", () => {
     process.env.BILI_DUMP_4XX = "1";
     process.env.BILI_DUMP_4XX_MAX_BYTES = "1024";
-    const overhead = Buffer.byteLength(JSON.stringify({ status: 400, request: "", response: "" }, null, 2));
+    const overhead = Buffer.byteLength(JSON.stringify({ status: 400, request: "", response: "" }, null, 2))
+        + Buffer.byteLength(DUMP_PLAINTEXT_BANNER) + 1; // #4482 banner shares the cap
     const exact = "x".repeat(1024 - overhead);
     try {
         for (const request of [exact, exact + "x"]) {
             const out = dumpSummaryRejection(400, "summary-boundary", request, "");
             assert.ok(out);
-            const parsed = JSON.parse(fs.readFileSync(out, "utf8")) as { request: string; response: string };
+            const parsed = JSON.parse(stripDumpBanner(fs.readFileSync(out, "utf8"))) as { request: string; response: string };
             assert.ok(fs.statSync(out).size <= 1024);
             assert.equal(parsed.response, "");
             if (request === exact) assert.equal(parsed.request, exact);

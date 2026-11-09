@@ -60,7 +60,31 @@ let warnedReanchor = false;
 // further re-entry falls back to the plain walk (degenerate multi-plugin
 // nesting) so the termination itself can never loop.
 const dispatchDepth = new AsyncLocalStorage<number>();
+// #4527: one-hop descent marker. Each link's `send` stamps the EXACT
+// downstream function it is about to call; a bili link whose `patched`
+// wrapper is entered with this marker pointing at ITSELF is being called by
+// the bili link directly above it (e.g. the native intercept handing its
+// INLINE_ORIGIN rewrite down to the inline transport) — a legitimate hop
+// through our own stack that must still run this link's dispatch. A foreign
+// wrapper in between re-issues the call as ITS own hop, so the identity
+// match fails and #1662's truncation below keeps protecting the descent.
+const chainHop = new AsyncLocalStorage<unknown>();
 let warnedReentry = false;
+
+/** #5614: run `operation` with BOTH re-entry stores cleared, regardless of the
+ *  surrounding async context. AsyncLocalStorage values persist in ANY callback
+ *  minted inside a `.run()` scope even after that fetch has settled — so a NEW
+ *  model operation whose transport callbacks were created during an earlier
+ *  fetch inherits a stale `dispatchDepth` (plus a non-matching `chainHop`) and
+ *  its first request lands in the depth-1 / depth->=2 branches above, skipping
+ *  `dispatchBody` (the compression entry) and going direct/uncompressed.
+ *  `.exit()` restores "outside any dispatch" for the operation's OWN subtree
+ *  only: the enclosing context (a parent re-entry, a concurrent sibling) is
+ *  untouched, so #1662's foreign-wrapper cutoff still fires INSIDE each
+ *  single-fetch descent and resumes on return. */
+export function runOutsideFetchChain<R>(operation: () => R): R {
+    return dispatchDepth.exit(() => chainHop.exit(operation));
+}
 
 /** #1410: the dead-closure signature. A wrapper whose owner nulled its
  *  closure locals dies exactly like this ("baseFetch is not a function").
@@ -95,7 +119,10 @@ export function installFetchChain(makeDispatch: (send: typeof globalThis.fetch) 
             let cur = ds;
             for (;;) {
                 try {
-                    return await cur(input, init);
+                    // #4527: stamp the hop so the downstream link (when it is
+                    // one of ours) can tell a legitimate descent from a
+                    // foreign wrapper's re-entry (#1662).
+                    return await chainHop.run(cur, () => cur(input, init));
                 } catch (err) {
                     const next = isDeadClosureError(err) ? nextLiveAnchor(cur) : undefined;
                     if (next === undefined) throw err;
@@ -126,6 +153,14 @@ export function installFetchChain(makeDispatch: (send: typeof globalThis.fetch) 
         // ponytail: unknown wrappers retain the #1662 cutoff; preserving their
         // deeper hooks requires a shared chain protocol.
         const patched = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+            // #4527: legitimate descent through our own link stack — the link
+            // directly above called THIS wrapper by identity (see chainHop).
+            // The #1662 depth logic below exists to terminate FOREIGN
+            // re-wraps, whose hop identity can never match; run our dispatch
+            // at one deeper level instead of skipping or truncating it.
+            if (chainHop.getStore() === patched) {
+                return dispatchDepth.run((dispatchDepth.getStore() ?? 0) + 1, () => dispatchBody(input, init));
+            }
             const depth = dispatchDepth.getStore();
             if (depth === 1) {
                 if (Reflect.get(ds, "__piWebAccessProxyFetch") === true) return send(input, init);

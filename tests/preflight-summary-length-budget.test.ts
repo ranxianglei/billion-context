@@ -26,7 +26,7 @@ const MAX_SUMMARY = 20000; // kernel default for compress.maxSummaryLength
 const OVER = Array.from({ length: 300 }, (_, i) => `Line ${i}: decision D${i} kept; error E${i} noted; path /src/file${i}.ts`).join("\n");
 assert.ok(OVER.length > MAX_SUMMARY && OVER.length < 400_000, "fixture summary must sit between the cap and the folded content size");
 
-async function runLengthBudget(opts: { fillerRepeats: number; summaryText: string; maxSummaryLength?: number }) {
+async function runLengthBudget(opts: { fillerRepeats: number; summaryText: string; maxSummaryLength?: number; compressionTarget?: number }) {
     const bodies: Record<string, unknown>[] = [];
     const logs: string[] = [];
     const server = http.createServer((req, res) => {
@@ -61,6 +61,7 @@ async function runLengthBudget(opts: { fillerRepeats: number; summaryText: strin
     const deps: PreflightDeps = {
         core: createCore(), session, config, prompts: defaultPrompts, protocol: "openai",
         url: `http://127.0.0.1:${port}/v1/messages`, headers: {}, model: "test-model",
+        compressionTarget: opts.compressionTarget,
         log: (_level, message) => logs.push(message),
     };
     try {
@@ -89,9 +90,12 @@ test("#1775 summarizeRange prompt carries a per-chunk length budget spread acros
     for (const b of two.bodies) {
         assert.ok(systemOf(b).includes(`AT MOST ${expectedTwo} characters`), "every chunk call carries the spread per-chunk budget");
     }
-    // 105K chars ≈ 26K tokens < 60K-token budget → single chunk → full cap.
-    const one = await runLengthBudget({ fillerRepeats: 15000, summaryText: "A dense tier-1 summary line that stays comfortably inside any per-chunk character budget." });
-    assert.equal(one.bodies.length, 1, "small filler stays one chunk");
+    // #4288 narrowed the fold trigger to payloads above the fold TARGET, so
+    // the single-chunk case rides an explicit compressionTarget below the
+    // window: 140K chars ≈ 35K tokens > 30K target (folds) but < 60K-token
+    // chunk budget → single chunk → full cap.
+    const one = await runLengthBudget({ fillerRepeats: 20000, compressionTarget: 30_000, summaryText: "A dense tier-1 summary line that stays comfortably inside any per-chunk character budget." });
+    assert.equal(one.bodies.length, 1, "target-pressure filler stays one chunk");
     assert.ok(systemOf(one.bodies[0]).includes(`AT MOST ${MAX_SUMMARY} characters`), "single chunk gets the full cap");
 });
 

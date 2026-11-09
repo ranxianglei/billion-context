@@ -23,7 +23,14 @@
 //
 // The workflow side (actions/cache keyed on hashFiles over the SAME inputs,
 // per runner.os) only accelerates the MISS path across legs; the marker
-// check stands on its own, so local `npm test` warm runs benefit too.
+// check stands on its own, so local `npm test` warm runs benefit too. One
+// side effect it must undo: a restore hands the dist back with SAVE-TIME
+// mtimes, older than the just-checked-out sources. tests/golden-storage-drive.ts'
+// #3325 staleness guard is a pure MTIME oracle (newest kernel/src vs
+// node_modules/acp-kernel/dist/index.js), so the HIT path restamps the
+// verified dist tree's mtimes to now — content untouched, the two oracles
+// agree again (#4599 sentinel: without this, every cache-hit leg reds the
+// storage-render golden chat wire ~4ms into the drive).
 //
 // Parity note: pretest previously ran `npm --prefix kernel run build && npm
 // --prefix pi-subagents run build`; this script runs exactly those commands
@@ -32,7 +39,7 @@
 
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -129,6 +136,25 @@ export function markerIsFresh(distDir, hash) {
 }
 
 /**
+ * Mtime reconciliation after a VERIFIED hit (#4360×#3325): the marker proved
+ * the bytes are current, but a cache restore left save-time mtimes behind
+ * the checked-out sources. Restamp every file's mtime to now so any
+ * mtime-based freshness oracle over the dist agrees with the content oracle.
+ * Content is never touched.
+ */
+function restampMtimes(distDir) {
+    const now = new Date();
+    const walk = (dir) => {
+        for (const e of readdirSync(dir, { withFileTypes: true })) {
+            const p = join(dir, e.name);
+            if (e.isDirectory()) walk(p);
+            else if (e.isFile()) utimesSync(p, now, now);
+        }
+    };
+    walk(distDir);
+}
+
+/**
  * The pretest loop. For each component: hash → fresh marker? HIT, skip :
  * MISS → run the real build → stamp the marker. `build`/`log` are test seams
  * (the CLI passes defaults); build failures propagate so the CLI exits 1 —
@@ -144,6 +170,7 @@ export function runPretestCache(opts = {}) {
         const hash = hashComponent(root, comp);
         const distDir = join(root, comp.dir, "dist");
         if (markerIsFresh(distDir, hash)) {
+            restampMtimes(distDir);
             log(`pretest-cache: HIT (${comp.name}) — dist fresh for hash ${hash.slice(0, 12)}`);
             results.push({ name: comp.name, hit: true, ms: 0 });
             continue;
