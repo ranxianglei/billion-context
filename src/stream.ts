@@ -6,6 +6,7 @@ import { handleAcpCache, prefixTokensBeforeRef, recordCacheFoldsFromBlocks } fro
 import { type Session, cacheBlockContent, markDirty, residentPressure, scrubTurnSeparatorIds, statusInputBaseline, withoutTurnSeparators } from "./session.js";
 import { COMPRESS_TOOL_NAME, parseCompressInput, ABSORB_TOOL_NAME, type ParsedRange } from "./compress-tool.js";
 import { effectiveAbsorbConfig, executeAbsorb, isProxyToolFor } from "./absorb.js";
+import { recordCompressCommit } from "./context-analysis.js";
 import { executeSearchContextTarget, resolveDecompress } from "./decompress-shared.js";
 import { ONE_CALL_HINT } from "acp-kernel";
 import { adoptContentStore, contentStoreOf, ccrEnabled, drainPendingRetrievals, executeRetrieve, retrieveToolName } from "./store.js";
@@ -1517,6 +1518,9 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         const foldPoint = [...ranges].sort((a, b) => refNum(a.startRef) - refNum(b.startRef))[0]?.startRef ?? "unknown";
         ctx.session.lastCompress = { at: Date.now(), shrinkRatio, foldPoint, blocks: r.blocksCreated, tokensCompressed: r.tokensCompressed };
         ctx.session.stats.pendingFoldUsage = true;
+        // Context analysis: pair this commit with the recent nudge offer so the
+        // acceptance rate (offered vs folded) is measurable (#session-aedc188c).
+        recordCompressCommit(ctx.session.id, r.tokensCompressed, r.blocksCreated);
         // #695: the next request materializes this fold — its prefix-cache hit
         // ceiling ≈ anchor / postFoldContext. sys length is unknown here, so
         // anchor (active block summaries) is a LOWER bound; the fold=new
