@@ -798,17 +798,6 @@ export async function* runCompressLoop(
             // round-2 truncation out of this retry path.
             let forwardedFraming = false;
             let forwardedVisible = false;
-            // #732 follow-up: whitespace-only text ("\n\n") is not visible
-            // output in any host-turn sense — a thinking model ends the turn with
-            // reasoning + 2 newlines and the client still stalls, but the length-2
-            // text made the #732 gate read "visible output reached" and skip the
-            // retry. Track NON-whitespace visible text separately for that gate.
-            // NOTE (post-review): set at PARSE time, not forward time — Responses
-            // textProtocol rounds parse text that is never forwarded, and this flag
-            // is still set. It is only ever safe in the degenerate gate, where it is
-            // equivalent to `assistantText.trim().length > 0`; NEVER reuse it in the
-            // truncation gates, which need forwarded (not parsed) semantics.
-            let forwardedVisibleText = false;
             // #2501: a thinking block reached the client without its signature —
             // unrecoverable by re-fetch on a signing upstream (see the gates).
             // Set when the held start is released (adapter's thinkingStart meta),
@@ -857,7 +846,6 @@ export async function* runCompressLoop(
                 sawThinking = false;
                 forwardedFraming = false;
                 forwardedVisible = false;
-                forwardedVisibleText = false;
                 unsignedThinkingOnWire = false;
                 sawSignedThinkingThisAttempt = false;
                 fwdBytes = 0;
@@ -866,7 +854,6 @@ export async function* runCompressLoop(
                     if (signal?.aborted) break;
                     if (ev.kind === "text") {
                         assistantText += ev.delta;
-                        if (ev.delta.trim().length > 0) forwardedVisibleText = true;
                         let tp = roundParts[roundParts.length - 1];
                         if (!tp || tp.kind !== "text") {
                             tp = { kind: "text", text: "" };
@@ -1139,12 +1126,12 @@ export async function* runCompressLoop(
                     finishReason !== "failed" &&
                     finishReason !== "incomplete" &&
                     finishReason !== "error" &&
+                    // #732 follow-up: trim, so whitespace-only text ("\n\n") must not bar
+                    // the retry — it is invisible to host turn semantics, same class as
+                    // the reasoning prefix. (The truncation gates keep the raw
+                    // forwardedVisible: they need forwarded-not-parsed semantics.)
                     assistantText.trim().length === 0 &&
                     calls.length === 0 &&
-                    // #732 follow-up: whitespace-only text ("\n\n") must not bar the retry —
-                    // it reached the client (forwardedVisible) but is invisible to
-                    // host turn semantics, same class as the reasoning prefix.
-                    !forwardedVisibleText &&
                     !signal?.aborted
                 ) {
                     degenerateRetried = true;
