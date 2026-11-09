@@ -65,6 +65,7 @@ billion-context/
 │   ├── fetch-transport.ts        # AsyncLocalStorage fetch-transport override (withFetchTransport)
 │   ├── content-encoding.ts       # gzip/deflate decode + decompression-bomb guard (413)
 │   ├── wire-body.ts              # Trailing-user-turn append on assembled wire bodies
+│   ├── egress-transforms.ts      # User-registerable egress request-body rewrite pipeline (#6003)
 │   ├── wire-drop-warn.ts         # Warn when a wire codec drops non-text parts (#1205)
 │   ├── text-safe.ts              # Surrogate-safe string prefix helper
 │   ├── sse-util.ts               # SSE parsing / line-ending normalization
