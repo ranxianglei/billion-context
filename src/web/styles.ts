@@ -48,6 +48,12 @@ export const WEB_STYLES = String.raw`
     --tm-t2-fill: #f6f3ff;
     --tm-t3-fill: #fffaf0;
     --tm-tn-fill: #f7f8fa;
+    /* #5941: per-tier node STROKES. Light hues are the pre-existing hardcoded
+       values verbatim (zero light-mode drift); the dark counterparts below
+       brighten them so borders stay legible on the low-luminance fills. */
+    --tm-t2-stroke: #7a5af8;
+    --tm-t3-stroke: #bf8700;
+    --tm-tn-stroke: #8a8f99;
     --shadow: 0 1px 3px rgba(31, 35, 40, 0.06), 0 1px 2px rgba(31, 35, 40, 0.04);
     --radius: 10px;
     --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
@@ -82,6 +88,9 @@ export const WEB_STYLES = String.raw`
         --tm-t2-fill: #241a38;
         --tm-t3-fill: #2c2416;
         --tm-tn-fill: #1c2129;
+        --tm-t2-stroke: #a371f7;
+        --tm-t3-stroke: #d29922;
+        --tm-tn-stroke: #8b949e;
         --shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
     /* keep in sync: the two dark palettes must stay verbatim-equal (#2559) */
     --hl-key: #79c0ff;
@@ -127,6 +136,9 @@ export const WEB_STYLES = String.raw`
     --tm-t2-fill: #241a38;
     --tm-t3-fill: #2c2416;
     --tm-tn-fill: #1c2129;
+    --tm-t2-stroke: #a371f7;
+    --tm-t3-stroke: #d29922;
+    --tm-tn-stroke: #8b949e;
     --shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
     /* keep in sync: the two dark palettes must stay verbatim-equal (#2559) */
     --hl-key: #79c0ff;
@@ -372,9 +384,9 @@ details.cl-item.cl-flash { outline: 2px solid var(--accent); outline-offset: -2p
 .g-node { cursor: pointer; }
 .g-node rect { fill: var(--tm-base-fill); stroke: var(--border-soft); stroke-width: 1.4; }
 .g-node.tier-1 rect { stroke: var(--accent); fill: var(--tm-t1-fill); }
-.g-node.tier-2 rect { stroke: #7a5af8; fill: var(--tm-t2-fill); }
-.g-node.tier-3 rect { stroke: #bf8700; fill: var(--tm-t3-fill); }
-.g-node.tier-n rect { stroke: #8a8f99; fill: var(--tm-tn-fill); }
+.g-node.tier-2 rect { stroke: var(--tm-t2-stroke); fill: var(--tm-t2-fill); }
+.g-node.tier-3 rect { stroke: var(--tm-t3-stroke); fill: var(--tm-t3-fill); }
+.g-node.tier-n rect { stroke: var(--tm-tn-stroke); fill: var(--tm-tn-fill); }
 .g-node.inactive rect { stroke: var(--border-soft); fill: var(--bg-muted); stroke-dasharray: 4 3; }
 .g-node.inactive text { opacity: .5; }
 .g-node:hover rect { stroke-width: 2.4; }
