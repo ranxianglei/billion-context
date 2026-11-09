@@ -88,6 +88,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `imageBilling` | "auto" \| "pixels" \| "bytes" | auto (resolves to pixels) | BILI_IMAGE_BILLING | Global image-token estimation basis; live-read per request, beats every per-provider setting. |
 | `imageTokenCap` | number | unset (uncapped) | BILI_IMAGE_TOKEN_CAP | Global per-image token ceiling applied on top of the resolved billing mode; live-read per request. |
 | `imageRescale` | boolean | true | BILI_IMAGE_RESCALE | Egress image downscale master switch (#3295/#3400): large outbound images are sent shrunken while originals stay untouched in session storage. Live-read per request. |
+| `egressTransforms` | array | unset (none) | — | User-registerable egress request-body rewrite pipeline (#6003): ESM plugins that rewrite every outbound model-request body after all session processing and before transport (re-sign / v1Wrap / fetch). Fail-open, hot-reloadable via POST /__bili/config/reload. |
 | `billing` | object | {} | — | Per-model billing prices (#4899): billing.prices[model] = { input, output?, cacheRead?, cacheWrite? } in USD per million tokens; overrides the models.dev snapshot for the panel's USD spend ledger and saved-dollar estimate. Unpriced models show tokens only. |
 
 **Behavior toggles**
@@ -610,6 +611,28 @@ Top-level keys that control how the proxy listens and behaves globally.
 - **Default:** `true`
 - **Status:** ACTIVE
 - **Description:** Master switch for the egress image downscale pass (#3295 removed the old arrival-time pass; #3400 re-adds it in simplified form). On every outbound request, after kernel folding and before protocol encoding, images whose longest edge exceeds `BILI_IMAGE_RESCALE_MAX_DIM` (default 1600) OR whose base64 body exceeds 100 KB are re-encoded fit-inside (never upscaled, original format kept) on an OUTBOUND COPY only — session storage keeps the original bytes byte-exact. A re-encode that saves less than 20% of the bytes is discarded (keep-smaller), so small/low-benefit images pass through untouched. Only PNG/JPEG/BMP are handled (pure-JS encoder, zero native dependencies); other formats pass through. Each shrunken image gets a stable annotation beside it reporting current vs original size; on lanes that register bili tools (proxy-injection lanes and plugin lanes via the plugin manifest) it also names `acp_read_original_image("<ref>")`, which returns the original bytes from local session storage — codex-style lanes that reject injected tools get the size-only annotation and no tool. Results of `acp_read_original_image` are structurally exempt from re-shrinking (the loop guard against the #3266 guess-reject-resend disease). Output is deterministic: the same input bytes always produce the same shrunken bytes and the same annotation text, so repeated resends of one history stay byte-stable and upstream prefix caching is undisturbed. One log line per unique image (content-hash cached; cache hits stay silent). Precedence: `BILI_IMAGE_RESCALE` env var (`"0"`/`"false"` disables; live-read, no restart) > this key > default on.
+
+### `egressTransforms`
+
+- **Type:** `array` — list of `{ id?, module, enabled?, priority?, match? }` entries (#6003)
+- **Default:** unset (no transforms registered; the pipeline is an exact no-op)
+- **Status:** ACTIVE
+- **Description:** User-registerable egress request-body rewrite pipeline. Each entry loads an ESM plugin module (default export `{ transform(ctx) }`) whose rewrite runs on every outbound model-request body — on the relay lane (the main send AND all recovery re-sends) and the compress-loop lane — AFTER all session processing (shed / compress-loop rewrites) and BEFORE transport (re-sign / v1Wrap / fetch), so the re-sign invariant always holds: the signature covers the final shipped bytes. File-only (no env var); relative `module` paths resolve against the directory holding the config file.
+  - **Entry fields:** `id` — log label; falls back to the module's own `id`, then its filename. `module` — required; absolute path or relative to the config dir. `enabled` — default `true`; `false` skips the entry. `priority` — number, smaller runs first; unset runs after all set ones, ties by registration order. `match` — `{ urlPrefix?, provider? }`, AND-ed scope filter; absent = every upstream. The module may also declare `id`/`priority`/`match`/`timeoutMs` on its default export; per field the config value wins.
+  - **Plugin contract:** `transform(ctx)` is async; `ctx = { sessionId, upstreamUrl, method, url, headers (mutable copy), body, protocol, model, stage }`, where `stage` is `"initial"` (main send), `"retry"` (a recovery re-send), or `"loop"` (compress loop). Return `undefined` to leave the body unchanged, or `{ body?, headers?, reason? }`; `body` must be a `string` or `Buffer`. Returned `headers` merge into the live header set on success only; a now-stale `content-length` is dropped whenever the body bytes change.
+  - **Fail-open:** a plugin that throws, exceeds its timeout (module `timeoutMs`, default 1000 ms), or returns an illegal body type is logged and skipped, and the pipeline continues with the PREVIOUS body — one bad plugin can never break the request. An unloadable or badly-shaped module is skipped the same way.
+  - **Hot reload:** `POST /__bili/config/reload` re-reads the entries and resets the module cache, so added/removed/reordered entries and edited plugin code take effect on the next request without a restart. Within one generation the loaded modules are pinned (a running session never swaps transform behavior mid-flight); modules are mtime-busted so an edited file re-evaluates on reload.
+  - **Observability:** each plugin that actually runs emits one debug line `[<sid>] [egress:<id>] stage=<stage> in=<N>B out=<M>B (<reason>)`.
+  - **Known boundary:** recovery re-sends derive their variant from the already-transformed outbound body and re-run the pipeline, so a non-idempotent string transform can apply twice; structural ladders that parse the JSON body (image shedding, thinking-strip) degrade gracefully when a plugin has made the body opaque (they bail rather than crash). The fake-completion hint retry uses a bespoke wrap→re-sign order and is deliberately not routed through this pipeline.
+
+  ```jsonc
+  {
+    "egressTransforms": [
+      { "id": "tunnel", "module": "./plugins/tunnel.mjs", "priority": 10 },
+      { "id": "audit", "module": "/abs/path/audit.mjs", "match": { "provider": "https://api.anthropic.com" } }
+    ]
+  }
+  ```
 
 ### `resign`
 
