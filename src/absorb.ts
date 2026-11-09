@@ -106,7 +106,10 @@ export function executeAbsorb(args: unknown, callId: string | undefined, absorb:
     ctx.session.state = outcome.state;
     if (!outcome.ok) {
         log(`[acp-absorb] ${outcome.resultText}`);
-        return toolFail(`[absorb FAILED: ${outcome.resultText}]`);
+        // #false-ad-audit: resultText already opens with its own verb
+        // ("absorb failed: …") — the old `[absorb FAILED: absorb failed: …]`
+        // double prefix made models read the surface twice.
+        return toolFail(outcome.resultText.toLowerCase().startsWith("absorb failed") ? outcome.resultText : `[absorb FAILED: ${outcome.resultText}]`);
     }
     // ok=true also covers the no-op re-absorb ("already absorbed"); detect a
     // real absorption by the appended record so credits net exactly once.
