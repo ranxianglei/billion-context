@@ -62,6 +62,8 @@ describe("#5173 new dsh injection classifiers", () => {
         const placeholder = "[image omitted to fit request image limits; \"image.png\" (sha256:0e596a186ab8). Normalized copy (read-only; may be resized or re-encoded): \"normalized/image.png\" (1584x892px, image/png).] these unknown keys are controller keys, not counted";
         assert.equal(dshImageOffloadPlaceholderPath(mk("u1", "user", placeholder)), "oneshot/image-offload-placeholder");
         assert.equal(dshImageOffloadPlaceholderPath(mk("u1", "user", "[image omitted because this model accepts text only; attachment sha256:2e896b95dec003df (1600x900px, image/png).]")), "oneshot/image-offload-placeholder");
+        // A [text, image] original keeps its prose BEFORE the "[" bracket, so the marker can sit mid-text: substring match, not prefix.
+        assert.equal(dshImageOffloadPlaceholderPath(mk("u1", "user", `please look again ${placeholder}`)), "oneshot/image-offload-placeholder");
         assert.equal(dshImageOffloadPlaceholderPath(mk("u1", "assistant", placeholder)), undefined, "assistant echo must never classify (#2766)");
         assert.equal(dshImageOffloadPlaceholderPath(mk("u1", "user", "Image \"x.png\" (sha256:2e896b95dec003df); request preview 1600x900px.")), undefined, "the live handle is not a placeholder");
         assert.equal(dshImageOffloadPlaceholderPath(mk("u1", "user", "")), undefined);

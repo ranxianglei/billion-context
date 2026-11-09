@@ -451,6 +451,8 @@ describe("#5142 carrier classifier units", () => {
         const placeholder = "[image omitted to fit request image limits; \"image.png\" (sha256:0e596a186ab8). Normalized copy (read-only; may be resized or re-encoded): \"normalized/image.png\" (1584x892px, image/png).] these unknown keys are controller keys, not counted";
         assert.equal(dshImageOffloadPlaceholderPath(mk("user", placeholder)), "oneshot/image-offload-placeholder");
         assert.equal(dshImageOffloadPlaceholderPath(mk("user", "[image omitted to fit request image limits; \"spawn_preview.png\" (sha256:2e896b95dec003df). Normalized copy (read-only; may be resized or re-encoded): \"normalized/spawn_preview.png\" (1600x900px, image/png).]")), "oneshot/image-offload-placeholder");
+        // A [text, image] original keeps its prose BEFORE the "[" bracket, so the marker can sit mid-text: substring match, not prefix.
+        assert.equal(dshImageOffloadPlaceholderPath(mk("user", `please look again ${placeholder}`)), "oneshot/image-offload-placeholder");
         // Text-only-route sibling of the same emitter (#6021): the same family.
         assert.equal(dshImageOffloadPlaceholderPath(mk("user", "[image omitted because this model accepts text only; attachment sha256:2e896b95dec003df (1600x900px, image/png).]")), "oneshot/image-offload-placeholder");
         assert.equal(dshImageOffloadPlaceholderPath(mk("assistant", placeholder)), undefined, "assistant echo must never classify (#2766)");
