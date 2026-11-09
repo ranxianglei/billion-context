@@ -6,7 +6,7 @@ import { defaultConfig, createInitialState, defaultCountTokens } from "acp-kerne
 import { startServer, isSideRequest, outputBudgetField, restoreOutputBudget, sideRequestGuard, resolveKnownOutputCeiling, _resetNoOutputCeilingWarningsForTest, _resetDshMidBandWarningsForTest, OUTPUT_RESTORE_ABSOLUTE_FLOOR } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { recordPluginRuntimeInfo, _resetPluginStateForTest } from "../src/plugin.ts";
-import { estimateRawBodyTokens } from "../src/preflight.ts";
+import { estimateRawBodyTokens, estimateRawBodyBreakdown } from "../src/preflight.ts";
 import { inspectContextOverflow } from "../src/util.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { mkdtempSync } from "node:fs";
@@ -552,6 +552,30 @@ test("estimateRawBodyTokens: counts string leaves, skips binary-carrying keys (#
     assert.equal(estimateRawBodyTokens(42), 0, "non-object body");
     // CJK must not be undercounted by the chars/4 fast path.
     assert.ok(estimateRawBodyTokens({ content: "汉".repeat(100) }) >= 100, "CJK counted per-char");
+});
+
+test("estimateRawBodyBreakdown: splits the same total on the top-level field (#5000 item 3)", () => {
+    const toolsMass = 120 * defaultCountTokens("d".repeat(40_000));
+    const body = {
+        system: "s".repeat(1_000),
+        tools: Array.from({ length: 120 }, () => ({ type: "function", function: { name: "t", description: "d".repeat(40_000) } })),
+        messages: [{ role: "user", content: "m".repeat(1_000) }],
+    };
+    const b = estimateRawBodyBreakdown(body);
+    assert.equal(b.total, estimateRawBodyTokens(body), "total equals the plain meter exactly (same walk, same exclusions)");
+    assert.ok(b.tools >= toolsMass, "tools[] mass lands in the tools bucket");
+    assert.ok(b.messages >= defaultCountTokens("m".repeat(1_000)), "message text lands in the messages bucket");
+    assert.ok(b.system >= defaultCountTokens("s".repeat(1_000)), "system text lands in the system bucket");
+    assert.equal(b.total, b.messages + b.tools + b.system + b.other, "buckets are exhaustive");
+    // the #5000 shape: a body whose mass rides tools[] — the doom message must
+    // be able to name THAT dimension, not "trim the oversized content".
+    assert.ok(b.tools > b.messages + b.system + b.other, "tools-dominant body reports tools-dominant");
+    // image payloads still excluded from every bucket (#5932).
+    const img = estimateRawBodyBreakdown({ image_url: `data:image/png;base64,${"A".repeat(50_000)}` });
+    assert.equal(img.total, 0, "image_url stays excluded in every bucket");
+    // non-object bodies bucket into other (or nothing) without throwing.
+    assert.equal(estimateRawBodyBreakdown(null).total, 0, "null body");
+    assert.equal(estimateRawBodyBreakdown("plain string").total, defaultCountTokens("plain string"), "bare string counts as other");
 });
 
 test("inspectContextOverflow: exceed_context_size_error pattern + (A / B > W) window parse (#554)", () => {

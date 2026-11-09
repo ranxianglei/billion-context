@@ -114,3 +114,35 @@ test("line-form string content with refs headers is not redirected to flat salva
     assert.equal(parsed.diagnostics.flatSummarySalvage, undefined);
     assert.equal(parsed.ranges[0]?.startRef, "m00010");
 });
+
+// ---------------------------------------------------------------------------
+// #5949 field: v2 pointer echo ack + repeat-parse-failure receipt collapse
+// ---------------------------------------------------------------------------
+
+test("compress call echoing the v2 relocation pointer is acked as a no-op, not lectured", () => {
+    const echo = { content: '{"content": "[bili] compression succeeded — summary relocated to its fold point above (block(s) b49); these ranges are already folded — do not re-compress them."}' };
+    const ctx = makeCtx();
+    const first = applyRanges(parseCompressInput(echo), ctx).text;
+    assert.ok(first.startsWith("[bili: nothing was compressed"), `echo acked, got: ${first}`);
+    assert.ok(!first.includes("Compression FAILED"), "echo is not a format failure");
+    // No repeat-guard counter: the counter text was misread by the model as
+    // "the user asked the same thing N times".
+    assert.ok(!first.includes("Repeat-failure guard"), "no repeat-failure guard on echo");
+    // Repeats stay counter-free acks (no failure streak accumulates).
+    const second = applyRanges(parseCompressInput(echo), ctx).text;
+    assert.ok(second.startsWith("[bili: nothing was compressed"), `repeat echo acked, got: ${second}`);
+    assert.ok(!second.includes("Repeat-failure guard"), "no counter on repeat echo");
+});
+
+test("identical parse failures collapse to a one-line receipt from the 2nd on", () => {
+    const bad = { content: "just prose with no refs at all" };
+    const ctx = makeCtx();
+    const first = applyRanges(parseCompressInput(bad), ctx).text;
+    assert.ok(first.includes("compress takes ONE 'content' STRING"), `first failure keeps the full guide, got: ${first}`);
+    const second = applyRanges(parseCompressInput(bad), ctx).text;
+    assert.ok(second.includes("failed 2 time(s) the same way"), `second failure is a one-liner with the count, got: ${second}`);
+    assert.ok(!second.includes("compress takes ONE 'content' STRING"), "format guide not repeated");
+    assert.ok(!second.includes("Repeat-failure guard"), "single counter statement only");
+    const third = applyRanges(parseCompressInput(bad), ctx).text;
+    assert.ok(third.includes("failed 3 time(s) the same way"), `third failure keeps counting, got: ${third}`);
+});

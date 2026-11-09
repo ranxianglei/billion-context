@@ -16,6 +16,7 @@ type LivePrice = NonNullable<ReturnType<typeof resolveBillingPrice>>;
 import { keepaliveStatusFor, type KeepaliveStatus } from "../cache-keepalive.js";
 import { METADATA_FOLD_COVERAGE } from "../fold-reconcile.js";
 import { markdownToHtml } from "./markdown.js";
+import { contextAnalysisView, type ContextAnalysisView } from "../context-analysis.js";
 import { log } from "../logger.js";
 import { dataDir } from "../paths.js";
 import { isExternalSummaryBlock } from "../external-summary-marker.js";
@@ -302,6 +303,11 @@ interface WebSessionDetail extends WebSessionSummary {
      *  resolution as the banner's clients[]); absent when unresolvable or when
      *  there are no conflicts. */
     conflictClient?: string;
+    /** Context analysis: init size, nudge cadence, compression acceptance
+     *  (harvest) rate, and the plain-language verdict — this process's live
+     *  view (in-memory only; absent for sessions this bili process has not
+     *  observed at least twice yet). */
+    contextAnalysis?: ContextAnalysisView;
     /** #2904: no-ceiling output-budget degraded state for this session's last
      *  starved model ({model,value,ts}); absent when none holds. */
     outputBudgetDegraded?: { model: string; value: number; ts: number };
@@ -1534,6 +1540,10 @@ function renderDetail(session: Session, live: boolean): WebSessionDetail {
         handoffTruncated,
         ...(conflicts.length > 0 ? { conflicts } : {}),
         ...(conflictClient ? { conflictClient } : {}),
+        ...(() => {
+            const ca = contextAnalysisView(session.id);
+            return ca ? { contextAnalysis: ca } : {};
+        })(),
         blockDetails: session.state.blocks.map((b) => {
             // Display data: canonicalize to ascending labels so non-monotonic-
             // ref spans don't render reversed in the UI (#2168).
