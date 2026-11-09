@@ -112,6 +112,10 @@ export const LIVE_FILES = [
     // the only real spawn is spawnSync(node -e "") for a pid probe, so no
     // zone band is needed — the entry is for the tripwire
     "tests/issue4566-lane-port-sticky.test.ts",
+    // #5487: spawns a one-shot sealer child (process.execPath) against its own
+    // mkdtemp dir to exercise concurrent sealing; no sockets are bound, so no
+    // zone port band is needed — the entry is for the SPAWN_RE tripwire alone
+    "tests/log-retention.test.ts",
     // #5631 restart survival: real bili proxy children under OS signals
     // (SIGTERM/SIGKILL/clean shutdown). Private mkdtemp homes per lane-arm,
     // probed-free ports re-probed on every restart — no band reuse.

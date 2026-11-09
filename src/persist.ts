@@ -844,6 +844,23 @@ export class SessionStore {
                 session.contentStoreDirty = false;
                 return true;
             }
+            if (this.writerOffActive()) {
+                // #2960 Phase 3 extension: the off switch covers the CCR
+                // content-store sidecar as well — in effective-full mode
+                // the unified ccr mirror (ingested by this same save's
+                // builder, which runs right after this gate returns) is the
+                // durable copy, and contentStoreOf() reads it first, so the
+                // file is never consulted. contentStoreDirty is cleared for
+                // the same reason: this save drops the resident store right
+                // after the ingest (dropResidentContentStore), and a stale
+                // dirty=true with contentStore=null would make a later
+                // writer-resume save hit the emptied-store branch and
+                // DELETE the sidecar file while the table may be dead.
+                // Convergence after a writer-resume comes from the kernel
+                // re-adopting its in-memory store on the next turn.
+                session.contentStoreDirty = false;
+                return true;
+            }
             mkdirSync(path.dirname(abs), { recursive: true });
             const text = JSON.stringify(session.contentStore);
             durableWriteFile(tmp, this.codec ? this.codec.encode(text) : text, 0o600);
