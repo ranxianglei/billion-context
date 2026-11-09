@@ -2,6 +2,7 @@ import { fetchWithCodexCatalogCache, isCodexCatalogRequest } from "./codex-catal
 import { createHandoffReply, captureHandoffJson } from "./handoff-response.js";
 import { checkOutboundBody, OutboundBodyTooLargeError } from "../request-body-budget.js";
 import { maybeRunInvariantJudge } from "../invariant-judge.js";
+import { repairResponsesAssistantOrdering, reanchorSeparatorManifest, separatorManifestAnchored, type SeparatorSlot } from "./responses-ordering.js";
 // #1440 P2 cut 4: upstream relay zone (forward) extracted verbatim from src/server.ts — pure move, zero behavior change.
 
 import http from "node:http";
@@ -12,7 +13,7 @@ import { type BiliMessage } from "acp-kernel/wire";
 import { absorbToolName, applyAbsorbView } from "../absorb.js";
 import { APIG_RESIGN_SCHEME, resignApig } from "../apig-resign.js";
 import { noteSuccessfulForward } from "../cache-keepalive.js";
-import { credentialFingerprint, generationParamFp, noteClientAbort, noteForwardedBody, noteForwardedImageFacts, noteInboundMessages, noteOutboundContextEstimates, settleOverflowCalibration, settleUsageReport, withCacheCapture } from "../cache-ledger.js";
+import { credentialFingerprint, generationParamFp, lastForwardedBody, noteClientAbort, noteForwardedBody, noteForwardedImageFacts, noteInboundMessages, noteOutboundContextEstimates, settleOverflowCalibration, settleUsageReport, withCacheCapture } from "../cache-ledger.js";
 import { warnCacheCollapse } from "../cache-warn.js";
 import { stampOutbound } from "../chain-checkpoint.js";
 import { applyCompatDropFields, dropCompatFieldsJson, resolveCompatDropFields } from "../compat-drop.js";
@@ -71,7 +72,7 @@ import { buildForwardHeaders, connectionNamedHeaders, RESPONSE_ONLY_STRIP_HEADER
 import { bodyDumpEnabled, logDumpFailure } from "./observability.js";
 import { effectiveAbsorbBlock } from "./prepare-responses.js";
 import { awaitDrain, bufferToStream, dumpStreamToFile, pipeThrough, readStreamToBuffer } from "./stream-io.js";
-import { buildForwardTarget, makeFoldPointReasoningDroppable, measuredBreakdownClause, measuredOutbound, outboundPayloadBreakdown, registerRequestAbort, beginStreamKeepalive, effectiveTokenCount, googlePathKind, imageBillingFor, imageTokenCapFor, inboundResignCredential, outboundContextEstimates, repairResponsesAssistantOrdering, resolveUpstream, stripKernelSummaries, usageGradeInputBaseline, DOOMED_PROBE_ABSOLUTE_BYTES, DOOMED_PROBE_BYTES_PER_TOKEN, type Prepared } from "../server.js";
+import { buildForwardTarget, makeFoldPointReasoningDroppable, measuredBreakdownClause, measuredOutbound, outboundPayloadBreakdown, registerRequestAbort, beginStreamKeepalive, effectiveTokenCount, googlePathKind, imageBillingFor, imageTokenCapFor, inboundResignCredential, outboundContextEstimates, resolveUpstream, stripKernelSummaries, usageGradeInputBaseline, DOOMED_PROBE_ABSOLUTE_BYTES, DOOMED_PROBE_BYTES_PER_TOKEN, type Prepared } from "../server.js";
 import { isStrictReasoningEcho, modelIdOf } from "../strict-echo.js";
 
 /** Infer the wire protocol from the request path for compat-role rewrites on
@@ -455,6 +456,87 @@ async function forwardCaptured(
     const steerCfg = steerResolved?.config ?? null;
     for (const w of steerResolved?.warnings ?? []) log("warn", `[${prepared?.session.id ?? "passthrough"}] [output-steering] ${w}`);
     let steerProtocol: WireProtocol | null = null;
+    // #564/#2627 final-wire provenance: the transformed object graph the bytes
+    // are (re)serialized from, and this turn's manifest re-anchored onto it.
+    // Everything below mutates ONE graph in place, so a marker carrier keeps its
+    // object identity across compat roles / steering / drops / the checkpoint —
+    // that identity is the only thing the manifest may re-index by.
+    let wireObj: Record<string, unknown> | null = null;
+    let separatorManifest = prepared?.separatorManifest;
+    // #564/#2627: IMPORTANT distinction. `separatorManifest === undefined` means
+    // "no producer claims were ever minted" (or they were proven dead) — the judge
+    // must still judge separators normally. This flag records a DIFFERENT state:
+    // a producer DID mint claims, then an opaque host rewrite invalidated the
+    // proof, so ownership of this send's separators is UNKNOWN. The judge then
+    // skips only its separator-ownership checks (I1/I2 for separators) for this
+    // send — it grants no exemption and every other integrity check still runs.
+    let separatorOwnershipUnknown = false;
+    // Opaque host rewrite: the producer DID mint claims, their proof is gone, and
+    // the bytes still contain separators we can no longer attribute. Dropping the
+    // manifest alone would tell the judge "no producer claims exist" and it would
+    // then report a genuine host separator as a client insertion; the flag keeps
+    // the distinction alive through to the judge.
+    const invalidateSeparatorOwnership = (): void => {
+        if (separatorManifest !== undefined) {
+            separatorOwnershipUnknown = true;
+            separatorManifest = undefined;
+        }
+    };
+    // The graph is parsed lazily, only when a step needs object access, and it is
+    // serialized lazily too: an unchanged fast path keeps the original string.
+    const wireGraph = (): Record<string, unknown> | null => {
+        if (wireObj !== null) return wireObj;
+        // Seed from prepare's own parsed graph whenever the bytes still match what
+        // it serialized: that object IS the graph the manifest's carriers live in
+        // (collectSeparatorManifest walked it), so identity survives. A fresh
+        // JSON.parse would mint new objects and no claim could ever re-anchor.
+        let parsed: unknown = null;
+        // Seed from prepare's OWN parsed graph only when the bytes are the ones it
+        // serialized AND the manifest still proves each carrier sits at its claimed
+        // index — identity without that proof would re-anchor a claim the producer
+        // never actually made.
+        const seedable = separatorManifest !== undefined
+            && typeof wireBody === "string"
+            && wireBody === prepared?.body
+            && separatorManifestAnchored(
+                separatorManifest,
+                (prepared?.parsedBody as { input?: unknown } | undefined)?.input as readonly unknown[] | undefined,
+                wireBody,
+            );
+        if (typeof wireBody === "string") {
+            if (seedable) {
+                parsed = prepared?.parsedBody;
+            } else {
+                try { parsed = JSON.parse(wireBody); } catch { parsed = null; }
+            }
+        }
+        wireObj = parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : null;
+        // A body that no longer matches the prepared bytes (or an unparseable one,
+        // or a manifest whose anchor proof failed) cannot carry proven lineage
+        // forward — ownership becomes UNKNOWN, not "nobody owns this", so the judge
+        // stops asserting separator findings.
+        if (!seedable) invalidateSeparatorOwnership();
+        return wireObj;
+    };
+    // Publish an in-place mutation of `wireGraph()` as the new body: exactly one
+    // serialization per rewrite, and the manifest is re-anchored against THAT
+    // string so the judge's byte-equality binding stays honest.
+    const commitGraph = (): void => {
+        if (wireObj === null) return;
+        const serialized = JSON.stringify(wireObj);
+        wireBody = serialized;
+        if (separatorManifest !== undefined) {
+            const input = wireObj.input;
+            if (!Array.isArray(input)) {
+                // The container the carriers lived in is gone entirely — we cannot
+                // say whether they were deleted deliberately or the graph was
+                // replaced under us, so ownership is UNKNOWN.
+                invalidateSeparatorOwnership();
+                return;
+            }
+            separatorManifest = reanchorSeparatorManifest(separatorManifest, input, serialized);
+        }
+    };
     if (typeof body === "string") {
         // upstreamUrl (the real destination) — not route?.rewrittenUrl, which
         // is undefined for zero-config requests and would skip provider compat.
@@ -476,14 +558,36 @@ async function forwardCaptured(
             compatProtocol = protocol;
             if (Object.keys(roles).length > 0) {
                 compatRoles = roles;
-                const applied = applyCompatRoles(body, protocol, roles);
-                if (applied.rewritten > 0) {
-                    wireBody = applied.body;
-                    log("info", `[${prepared?.session.id ?? "passthrough"}] [compat] rewrote ${applied.rewritten} message role(s) per compat.roles (${Object.entries(roles).map(([f, t]) => `${f}→${t}`).join(",")})`);
-                    // Kiro: remember which items the BUILT-IN map re-voiced, so the
-                    // invariant judge can see bili's own injected prompt as what it is
-                    // (a developer item) instead of an unexplained user insertion.
-                    if (Object.keys(builtin).length > 0) judgeRoleRestore = builtinRoleRestorePoints(body, protocol, builtin, roles);
+                // #564/#2627: when a separator manifest rides this turn, the role
+                // rewrite MUST land on the carriers' own object graph — the string
+                // wrapper re-serializes from an independent parse, which invalidates
+                // the claim binding with no way to re-prove it. Rewrite in place
+                // (identity-preserving) and re-anchor; anything opaque fails closed.
+                const graph = separatorManifest !== undefined && protocol === "responses" ? wireGraph() : null;
+                if (graph !== null) {
+                    const rewritten = applyCompatRolesJson(graph, protocol, roles);
+                    if (rewritten > 0) {
+                        commitGraph();
+                        log("info", `[${prepared?.session.id ?? "passthrough"}] [compat] rewrote ${rewritten} message role(s) per compat.roles (${Object.entries(roles).map(([f, t]) => `${f}→${t}`).join(",")})`);
+                        // Kiro: remember which items the BUILT-IN map re-voiced, so the
+                        // invariant judge can see bili's own injected prompt as what it is
+                        // (a developer item) instead of an unexplained user insertion.
+                        if (Object.keys(builtin).length > 0) judgeRoleRestore = builtinRoleRestorePoints(body, protocol, builtin, roles);
+                    }
+                } else {
+                    const applied = applyCompatRoles(body, protocol, roles);
+                    if (applied.rewritten > 0) {
+                        wireBody = applied.body;
+                        log("info", `[${prepared?.session.id ?? "passthrough"}] [compat] rewrote ${applied.rewritten} message role(s) per compat.roles (${Object.entries(roles).map(([f, t]) => `${f}→${t}`).join(",")})`);
+                        // Kiro: remember which items the BUILT-IN map re-voiced, so the
+                        // invariant judge can see bili's own injected prompt as what it is
+                        // (a developer item) instead of an unexplained user insertion.
+                        if (Object.keys(builtin).length > 0) judgeRoleRestore = builtinRoleRestorePoints(body, protocol, builtin, roles);
+                    }
+                    // Unchanged bytes keep the prepare-time binding honest; a rewrite
+                    // here came from an independent parse, so no carrier lineage can
+                    // be proven against it — ownership is UNKNOWN from here on.
+                    if (applied.rewritten > 0) invalidateSeparatorOwnership();
                 }
             }
         }
@@ -492,10 +596,23 @@ async function forwardCaptured(
         // just the compat pair; idempotent, byte-identical when nothing changes.
         steerProtocol = protocol;
         if (steerCfg && steerCfg.enabled && typeof wireBody === "string") {
-            const applied = applyOutputSteering(wireBody, protocol, steerCfg);
-            if (applied.changed) {
-                wireBody = applied.body;
-                log("info", `[${prepared?.session.id ?? "passthrough"}] [output-steering] applied (${applied.labels.join(", ")})`);
+            // #564/#2627: same object-graph rule as the role rewrite above — when a
+            // manifest rides this turn, the steering must land on the carriers' own
+            // graph so the claims can be re-anchored instead of dropped.
+            const graph = separatorManifest !== undefined ? wireGraph() : null;
+            if (graph !== null) {
+                const labels = applyOutputSteeringJson(graph, protocol, steerCfg);
+                if (labels.length > 0) {
+                    commitGraph();
+                    log("info", `[${prepared?.session.id ?? "passthrough"}] [output-steering] applied (${labels.join(", ")})`);
+                }
+            } else {
+                const applied = applyOutputSteering(wireBody, protocol, steerCfg);
+                if (applied.changed) {
+                    wireBody = applied.body;
+                    invalidateSeparatorOwnership();
+                    log("info", `[${prepared?.session.id ?? "passthrough"}] [output-steering] applied (${applied.labels.join(", ")})`);
+                }
             }
         }
         // #1757: compat.dropFields — AFTER every other body mutation (roles,
@@ -505,10 +622,25 @@ async function forwardCaptured(
         // rewrite above which is openai/responses-only.
         compatDropPaths = resolveCompatDropFields(opts.routes, upstreamUrl, opts.compat?.dropFields);
         if (compatDropPaths.length > 0 && typeof wireBody === "string") {
-            const applied = applyCompatDropFields(wireBody, compatDropPaths);
-            if (applied.dropped > 0) {
-                wireBody = applied.body;
-                log("info", `[${prepared?.session.id ?? "passthrough"}] [compat] dropped ${applied.dropped} field(s) per compat.dropFields (${compatDropPaths.join(", ")}) (#1757)`);
+            // #564/#2627: drops run on the SAME graph as every other transform, so
+            // identity decides — not the drop path's shape. A drop that deletes or
+            // rewrites a carrier simply removes it from the identity Map (or fails
+            // isSeparatorCarrier), while carriers it never touches keep their object
+            // identity and re-anchor. No path pattern is pre-judged.
+            const graph = separatorManifest !== undefined ? wireGraph() : null;
+            if (graph !== null) {
+                const dropped = dropCompatFieldsJson(graph, compatDropPaths);
+                if (dropped > 0) {
+                    commitGraph();
+                    log("info", `[${prepared?.session.id ?? "passthrough"}] [compat] dropped ${dropped} field(s) per compat.dropFields (${compatDropPaths.join(", ")}) (#1757)`);
+                }
+            } else {
+                const applied = applyCompatDropFields(wireBody, compatDropPaths);
+                if (applied.dropped > 0) {
+                    wireBody = applied.body;
+                    invalidateSeparatorOwnership();
+                    log("info", `[${prepared?.session.id ?? "passthrough"}] [compat] dropped ${applied.dropped} field(s) per compat.dropFields (${compatDropPaths.join(", ")}) (#1757)`);
+                }
             }
         }
     }
@@ -526,13 +658,40 @@ async function forwardCaptured(
     // recognition + hop passthrough are unaffected by this switch.
     if (prepared && !prepared.sidePassthrough && prepared.processedMessages.length > 0 && typeof wireBody === "string" && opts.chainEgressStamp === true) {
         try {
-            const stamped = stampOutbound(JSON.parse(wireBody), prepared.protocol, instanceId, Date.now(), prepared.model ?? prepared.google?.model);
+            // #564/#2627: stamp the SAME graph the manifest's carriers live in when
+            // one is riding this turn — `insertCheckpointCarrier` allocates a new
+            // input array but copies every other item by reference, so the carriers
+            // survive and are re-indexed at their shifted positions. The digest is
+            // computed over the graph, whose only difference from the parse is the
+            // dropped `undefined`-valued keys a raw parse would render back as null.
+            // When a manifest is riding this turn but the trusted graph is gone,
+            // the carriers' lineage is unprovable: stamp the plain parse for the
+            // upstream's sake, but record ownership as UNKNOWN rather than
+            // republishing bytes whose separator claims silently vanished.
+            const graphSeed = separatorManifest !== undefined ? wireGraph() : undefined;
+            const target: unknown = separatorManifest !== undefined
+                ? (graphSeed ?? JSON.parse(wireBody))
+                : (wireObj ?? JSON.parse(wireBody));
+            const stamped = stampOutbound(target, prepared.protocol, instanceId, Date.now(), prepared.model ?? prepared.google?.model);
             if (stamped !== null) {
-                wireBody = JSON.stringify(stamped);
+                // Whatever graph `target` was, the stamp's result replaces it: keep
+                // the identity (and re-anchor) only when `target` IS the graph this
+                // turn's carriers live in, otherwise publish plain bytes.
+                const targetWasGraph = target === wireObj && wireObj !== null;
+                const nextObj = stamped && typeof stamped === "object" && !Array.isArray(stamped) ? (stamped as Record<string, unknown>) : null;
+                if (targetWasGraph && nextObj !== null) {
+                    wireObj = nextObj;
+                    commitGraph();
+                } else {
+                    wireBody = JSON.stringify(stamped);
+                    wireObj = null;
+                    invalidateSeparatorOwnership();
+                }
                 log("debug", `[${prepared.session.id}] [stamp] outbound ${prepared.protocol} request carries checkpoint carrier`);
             }
         } catch (err) {
             log("debug", `[${prepared.session.id}] [chain] outbound stamping failed (${String(err)}); forwarding unstamped`);
+            invalidateSeparatorOwnership();
         }
     }
     if (res.destroyed || res.writableEnded) return;
@@ -661,7 +820,12 @@ async function forwardCaptured(
     let outboundCopyRewritten = false;
     if (prepared && !prepared.sidePassthrough && prepared.protocol && req.method !== "GET" && req.method !== "HEAD" && typeof wireBody === "string") {
         const shed = await shedEgressIfOverBudget(wireBody, prepared.protocol, { sessionId: prepared.session.id, session: prepared.session, log, phase: "pre-send" });
-        if (shed.body !== wireBody) outboundCopyRewritten = true;
+        if (shed.body !== wireBody) {
+            outboundCopyRewritten = true;
+            // #564/#2627: an opaque egress shed can delete or synthesize items —
+            // provenance cannot survive rewritten bytes it did not observe.
+            invalidateSeparatorOwnership();
+        }
         wireBody = shed.body;
         // #4124: proactive per-prompt image-count cap — once this route PROVED a
         // count wall via an upstream rejection (learned into stats.imageCountCaps),
@@ -677,6 +841,9 @@ async function forwardCaptured(
             });
             if (countShed.stats.changed) {
                 outboundCopyRewritten = true;
+                // #564/#2627: image shed rewrites item content (and can drop whole
+                // items) outside the carrier graph — fail closed on provenance.
+                invalidateSeparatorOwnership();
                 sess.metadata.imageCountShed = { at: Date.now(), phase: "pre-send", cap: imgCap, archived: countShed.stats.archived };
                 log("info", `[${sess.id}] [image-count-shed] pre-send: archived ${countShed.stats.archived} oldest images to stay under the learned per-prompt cap ${imgCap} on this route (#4124) — originals stay in session storage`);
                 wireBody = countShed.body;
@@ -693,7 +860,13 @@ async function forwardCaptured(
         // (non-retryable 400) — scrub before signing so the signature covers
         // the bytes actually sent. Buffer bodies are raw passthrough bytes
         // and are forwarded byte-faithfully, untouched.
-        if (typeof wireBody === "string") wireBody = scrubLoneSurrogatesOnWire(wireBody);
+        if (typeof wireBody === "string") {
+            const scrubbed = scrubLoneSurrogatesOnWire(wireBody);
+            // #564/#2627: the scrub rewrites escape sequences inside string leaves,
+            // including separator text — the manifest's byte binding dies with it.
+            if (scrubbed !== wireBody) invalidateSeparatorOwnership();
+            wireBody = scrubbed;
+        }
         applyResign(headers, wireBody);
     }
     try {
@@ -940,7 +1113,9 @@ async function forwardCaptured(
         const renderTailStart = typeof prepared.session.metadata["snapshotRenderTailStart"] === "number"
             ? (prepared.session.metadata["snapshotRenderTailStart"] as number)
             : undefined;
-        maybeRunInvariantJudge({
+        // #564/#2627: keep the proven marker indexes with the body just noted, so a
+        // compress-loop round re-sending these markers judges them as bili's own.
+        const ownedSeparatorCores = maybeRunInvariantJudge({
             // #2078: reuse the seam block's single parse of sentBody instead of
             // paying another full JSON.parse of the largest payload per turn.
             // Kiro: judge with the built-in role re-voicing undone (see judgeRoleRestore).
@@ -956,8 +1131,22 @@ async function forwardCaptured(
             body: sentBody,
             protocol: prepared.protocol,
             sessionId: prepared.session.id,
+            // The judge validates this body-bound manifest while reusing its
+            // one actual-wire projection; relay does not decode the history again.
+            // #564/#2627: this is the manifest RE-ANCHORED onto the final graph by
+            // carrier identity (or dropped outright when a rewrite could not prove
+            // lineage), never prepare's stale index list.
+            ...(separatorManifest !== undefined ? { separatorManifest } : {}),
+            // #564/#2627: an opaque host rewrite may have destroyed the proof
+            // while the bytes still hold genuine host separators. Tell the judge
+            // ownership is UNKNOWN so it stops asserting separator findings for
+            // this send — rather than telling it "no producer claims exist",
+            // which would accuse the client of an insertion bili itself made.
+            ...(separatorOwnershipUnknown ? { separatorOwnershipUnknown: true } : {}),
             ...(renderTailStart !== undefined ? { renderTailStart } : {}),
         });
+        const sentSlot = lastForwardedBody(prepared.session);
+        if (sentSlot !== undefined && ownedSeparatorCores !== undefined) sentSlot.ownedSeparatorCores = ownedSeparatorCores;
     }
     // #3148: round-level breaker — while the endpoint is provably dead, fail
     // fast WITHOUT contacting it instead of burning another full cold send +
@@ -2367,6 +2556,10 @@ async function forwardCaptured(
             const genBoundaryNote = detectGenerationBoundary(prepared.session, prepared.originalMessages, log) ? `\n\n${GENERATION_BOUNDARY_NOTE}` : "";
             const systemPrompt = withProjectAttribution(withMcpDialectNote(withMarkerIntegrityNote(withSummaryBudgetNote(textProtocol ? buildCompressHybridSystemPrompt(prepared.prompts ?? defaultPrompts, messageTimestampSections(conversationPromptSections(prepared.surface?.promptSections, externalSummaryEnabled(config)), "hybrid")) : buildCompressSystemPrompt(prepared.prompts ?? defaultPrompts, messageTimestampSections(conversationPromptSections(prepared.surface?.promptSections, externalSummaryEnabled(config)))), externalSummaryEnabled(config)), visibilityMarkers), prepared.mcpDialectNote === true)) + genBoundaryNote + absorbSection;
             const adapter = pickAdapter(prepared.protocol, parsedReq, textProtocol, prepared.responsesProjection, prepared.anthropicSystem, prepared.openaiSystemText, absorbActive ? absorbToolName(loopConfig) : undefined, prepared.google, prepared.systemNotes, opts.streamErrorShape, prepared.anthropicCacheMarks, prepared.anthropicClientCacheControls, absorbActive);
+            // #564/#2627: separator slots for the CURRENT round's body, refreshed
+            // by each fold. The loop reads this through `ctx.separatorSlots` so the
+            // continuity judge sees the same producer record prepare sees.
+            let loopSeparatorSlots: readonly SeparatorSlot[] = [];
             const refreshFolded = async (current: CoreMessage[]): Promise<CoreMessage[]> => {
                 return withSessionLock(prepared.session, async () => {
                     // #422: mirror the prepare's fold with the post-compress state so
@@ -2431,8 +2624,16 @@ async function forwardCaptured(
                     // turn rendered one history with two different shapes and the
                     // byte prefix broke mid-history on every fold.
                     const dropped = prepared.dropReasoning ? prepared.dropReasoning(out) : out;
-                    const ordered = prepared.protocol === "responses" ? repairResponsesAssistantOrdering(dropped, prepared.originalMessages) : dropped;
-                    return ordered;
+                    if (prepared.protocol === "responses") {
+                        const ordered = repairResponsesAssistantOrdering(dropped, prepared.originalMessages);
+                        // #564/#2627: the round-2+ body is built from THIS array, so
+                        // re-minted separator positions must travel with it or the
+                        // continuity judge reads a newly added marker as a mid-insertion.
+                        loopSeparatorSlots = ordered.slots;
+                        return ordered.messages;
+                    }
+                    loopSeparatorSlots = [];
+                    return dropped;
                 });
             };
             // #1455: loop-originated upstream responses (re-request/retries) are NOT covered by the outer tee above — they were invisible to ACP_DUMP_SSE until now.
@@ -2443,7 +2644,7 @@ async function forwardCaptured(
             const loopBillingUpstream = route?.rewrittenUrl ?? (/^https?:\/\//i.test(req.url ?? "") ? req.url ?? undefined : opts.upstream);
             const loop = runCompressLoop(
                 responseBody,
-                { core, config, messages: prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages, compressMessages: prepared.originalMessages, session: prepared.session, reply, log: ctx.log, proxyUrl, skippedProxy, upstreamOrigin: targetOrigin, protocol: prepared.protocol, textProtocol, debug: opts.debug, refreshFolded, visibilityMarkers, dumpSse: loopDumpDir ? (name, stream) => dumpStreamToFile(stream, loopDumpDir, name) : undefined, imageLearn: { host: upstreamHost(loopBillingUpstream), fp: `${imageBillingFor(opts, loopBillingUpstream)}:${imageTokenCapFor(opts, loopBillingUpstream)}` } },
+                { core, config, messages: prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages, compressMessages: prepared.originalMessages, session: prepared.session, reply, log: ctx.log, proxyUrl, skippedProxy, upstreamOrigin: targetOrigin, protocol: prepared.protocol, textProtocol, debug: opts.debug, refreshFolded, separatorSlots: () => loopSeparatorSlots, visibilityMarkers, dumpSse: loopDumpDir ? (name, stream) => dumpStreamToFile(stream, loopDumpDir, name) : undefined, imageLearn: { host: upstreamHost(loopBillingUpstream), fp: `${imageBillingFor(opts, loopBillingUpstream)}:${imageTokenCapFor(opts, loopBillingUpstream)}` } },
                 parsedReq,
                 // #3280: egress goes out enveloped via wireTransform, so every
                 // round-2+ response comes back enveloped too — unwrap at the loop's
