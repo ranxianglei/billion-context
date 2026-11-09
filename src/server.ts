@@ -2571,18 +2571,26 @@ export { dedupeAdjacentOutputConfig } from "./dedupe-adjacent-output-config.js";
  *  silent. Any remaining fire means another path lost thinking (e.g. a fold
  *  pruned the block while preserving the tool_use) — investigate. [#2864]
  *  identity dedup like the openai twin: each lost tool_use reports once per
- *  episode, not once per request of a persistent violation. */
+ *  episode, not once per request of a persistent violation. [#5998] the
+ *  inbound scan counts SIGNED thinking only: an unsigned thinking block is
+ *  never a replayable asset on any upstream — signature-verifying peers
+ *  reject it ("thinking.signature: Field required") and never-signing relays
+ *  require exactly the bytes they produced verbatim — so its absence from the
+ *  outbound rebuild is by design, not a violation; only a lost SIGNED pair is
+ *  reportable. */
 export function warnAnthropicThinkingPairs(
     inboundMessages: unknown[],
     outboundMessages: unknown[],
     log: (level: string, msg: string) => void,
     sessionId: string,
 ): void {
+    const signedThinking = (b: { type?: string; signature?: unknown }) =>
+        b?.type === "thinking" && typeof b.signature === "string" && b.signature.length > 0;
     const thinkingIds = new Set<string>();
     for (const m of inboundMessages) {
-        const msg = m as { role?: string; content?: Array<{ type?: string; id?: string }> };
+        const msg = m as { role?: string; content?: Array<{ type?: string; id?: string; signature?: unknown }> };
         if (msg?.role !== "assistant" || !Array.isArray(msg.content)) continue;
-        if (!msg.content.some((b) => b?.type === "thinking")) continue;
+        if (!msg.content.some(signedThinking)) continue;
         for (const b of msg.content) {
             if (b?.type === "tool_use" && typeof b.id === "string") thinkingIds.add(b.id);
         }

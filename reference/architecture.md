@@ -38,6 +38,7 @@ billion-context/
 │   │   ├── snapshot-render.ts    #   Snapshot render: outbound prefix from server transcript (#3756)
 │   │   ├── thread-tracking.ts    #   Anthropic Threads previous_message_id repair (#2701)
 │   │   ├── threads-lane.ts       #   Anthropic Threads lane: mirror, budget, reforge (#2926)
+│   │   ├── thinking-posture.ts   #   Signature-less thinking posture: 400-wording detector + wire strip + session memory (#5998)
 │   │   ├── update-actions.ts     #   Web Updates tab actions over the self-updater (#3719)
 │   │   └── stream-io.ts          #   Small response-body reader for non-2xx inspection
 │   ├── knobs.ts                  # Single knob resolver: env > config file > default (#2030)
