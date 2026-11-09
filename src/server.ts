@@ -99,7 +99,7 @@ import { noteRequest } from "./attach-heartbeat.js";
 import { queryLogLines } from "./web/logs-query.js";
 import { configFile, defaultLogFile, sessionsDir, stateDir } from "./paths.js";
 import { atomicWriteInstanceFile, clearProxyInstanceFile, classifySameLanePeer, entryShape, findPresentUnverifiedSameLaneTwin, findSameLanePredecessor, findVerifiedSameLaneTwin, isPidAlive, listInstances, markPortReleased, probePid, readProxyInstanceFile, registerInstanceAndWarn, resolveOwnFingerprint, sameInstanceShape, SPAWN_FINGERPRINT_ENV, unregisterInstance, warnOnNewPeers, writeSpawnPortLog, type InstanceShape, type PidProbe, type ProxyInstanceFile, type RegistryEntry, type SameLanePeer } from "./instance.js";
-import { createServedMarkerWriter, peerStillContests, reapStaleWriterMarkers, writerMarkerDir, type ServedMarkerWriter } from "./served-markers.js";
+import { createServedMarkerWriter, peerStillContests, processStartMs, reapStaleWriterMarkers, writerMarkerDir, type ServedMarkerWriter } from "./served-markers.js";
 import { recordSplitBrainContest, registerSplitBrainEvidenceCheck } from "./storage/runtime-status.js";
 import { holderProbeOrigin, mayClobberPointer, probeHolderForHint, probeOwnerInfo, resolvePortClaim, verifyEntryOwnsPort } from "./port-owner.js";
 import { armEventLoopWatchdog } from "./event-loop-watchdog.js";
@@ -1347,7 +1347,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         {
             const markerDir = writerMarkerDir(stateDir());
             servedWriter = createServedMarkerWriter(
-                { instanceId, pid: process.pid, origin, version: VERSION, lane: launcherLane },
+                { instanceId, pid: process.pid, origin, version: VERSION, lane: launcherLane, startedAt: processStartMs(Date.now()) },
                 markerDir,
                 (level, msg) => log(level, msg),
                 {
@@ -2311,7 +2311,7 @@ const ACP_TAG_MARK = "\x3cacp ";
 // compression, src/preflight.ts — #247) have NO other carrier: their anchor is
 // the only place the summary reaches the model, so it must survive.
 //
-// Per mode (see TECHNICAL-NOTES.md "Two compression modes"): in plugin/launcher mode the
+// Per mode (see docs/technical-notes.md "Two compression modes"): in plugin/launcher mode the
 // tool call is ALWAYS in the re-sent history (the agent owns compression), so
 // this strips every acp_summary and the carrier is the tool call — recognized
 // by the plugin_<ts> callId minted at the tool API (#1567: an id-match alone
@@ -2551,6 +2551,11 @@ export function warnReasoningPairs(
     if (tracked.fresh.length === 0) return;
     log("warn", `[${sessionId}] reasoning-pair-violated: ${violators.length} assistant tool-call message(s) lack reasoning_content while ${withRc} carry it — strict-echo upstreams (DeepSeek thinking mode) will reject the request; first seen: ${violationNamed(tracked.fresh, tracked.ongoing, tracked.maxRepeat)} (#684/#762/#2864)`);
 }
+
+// [#5688] shared egress repair for adjacent per-turn effort directives —
+// implementation moved to its own leaf module so loop/ can import it without
+// a server.ts import cycle; re-exported here for existing consumers.
+export { dedupeAdjacentOutputConfig } from "./dedupe-adjacent-output-config.js";
 
 /** [#684] Anthropic-wire twin of the openai sentinel, narrowed by [#1327]:
  *  warn only when bili itself lost thinking — a tool_use block that rode an
@@ -2921,10 +2926,20 @@ export function effectiveTokenCount(session: Session, msgs: CoreMessage[], inbou
     // grade (false pressure-T2 right after a successful T1). Credit can only
     // be minted by this conversation's own folds (foreign usage samples write
     // none), so it exempts exactly this window; the #4805/#4849 anchor-
-    // pollution refusal stays fully armed when credit == 0. #4383's cycle-stale guard
-    // still wins (#4383: newer unreported sends ride their own measurements);
-    // zero is a valid drained reading (kernel treats 0 as unknown).
-    if (!anchorStale && session.stats.lastInputTokensSource === "usage" && (session.stats.compressCreditTokens ?? 0) > 0 && session.stats.lastInputTokens >= 0) return { tokens: session.stats.lastInputTokens, source: "usage" };
+    // pollution refusal stays fully armed when credit == 0.
+    // #5135+#4383 field fix: this branch deliberately overrides cycle-staleness
+    // too. A compress BURST (turns whose only output is compress calls) never
+    // reaches an upstream settle, so prepare stamps contextTokensSource=
+    // "estimate" every turn and usageAnchorCycleStale() stays true for the
+    // whole burst — pre-fix the credit exemption was dead exactly when it was
+    // needed, the meter fell through to the raw INBOUND upper bound (the full
+    // resent history), and a just-folded session read 238112/212992 = 112%
+    // "pressure" while its actual outbound was 83K — the phantom that kept
+    // re-nudging the model into the very compress loop the folds were supposed
+    // to end. The credit window is still bounded: the next real settle clears
+    // it (loop/core.ts), so this cannot freeze the meter; zero is a valid
+    // drained reading (kernel treats 0 as unknown).
+    if (session.stats.lastInputTokensSource === "usage" && (session.stats.compressCreditTokens ?? 0) > 0 && session.stats.lastInputTokens >= 0) return { tokens: session.stats.lastInputTokens, source: "usage" };
     if (!anchorStale && !anchorImpossible && session.stats.lastInputTokens > 0 && (session.stats.lastInputTokensSource === "usage" || session.stats.lastInputTokensSource === "overflow-arm") && staleSmallAnchorFallback(session.stats, session.stats.lastInputTokens) === null) return { tokens: session.stats.lastInputTokens, source: "usage" };
     // #1820: right after a preflight rebuild the usage-grade baseline above is
     // momentarily absent (the rebuild request's own report hasn't landed yet,
@@ -3728,6 +3743,32 @@ export function buildWindowShrinkNote(args: {
     return head + `it was aligned down to codex's own window perception; set compress.modelContextLimit explicitly if your upstream serves the larger window.`;
 }
 
+// #5000/#4543: the core-text byte floor (estimateCoreMessagesUpperBytes) prices
+// only m.text — tools[], tool_calls[].function.arguments, the system prompt and
+// the JSON envelope are invisible to it, so a body can ride multi-MB over the
+// window on the wire while every projection-based doom gate stays silent
+// (incident #5000: 55.2 MiB wire body whose core text cleared the floor;
+// #4543: a 4.1 MiB CJK body the 7.5 B/tok floor can only see past ~7.5 MB on a
+// 1M window). Price the ACTUAL outbound body instead: the same CJK-aware leaf
+// walk the #554 side-request guard uses (estimateRawBodyTokens) counts every
+// string field of the serialized request — the conservative overcount (ids,
+// roles, structural strings) is the right bias for a fail-closed gate. Image
+// tokens are charged separately by the caller (they sit in binary-carrying
+// keys the walk excludes by design). Unparseable bodies return undefined —
+// callers keep the byte-floor fallback for them.
+export function measuredOutboundTokens(prepared: { body: string | Buffer; parsedBody?: unknown }): number | undefined {
+    let parsed: unknown = prepared.parsedBody;
+    if (parsed === undefined) {
+        const raw = typeof prepared.body === "string" ? prepared.body : prepared.body.toString("utf8");
+        try {
+            parsed = JSON.parse(raw);
+        } catch {
+            return undefined;
+        }
+    }
+    return estimateRawBodyTokens(parsed);
+}
+
 export async function preflightCompressIfNeeded(
     prepared: Prepared,
     runPrepare: () => Promise<Prepared>,
@@ -3981,6 +4022,17 @@ export async function preflightCompressIfNeeded(
         // the operator can verify it by hand. Bytes, not chars: CJK monsters
         // are char-cheap (1 char ≈ 1 token already) but byte-doomed; every legit
         // fitting English payload sits ~4× under the ratio bar.
+        // #5000/#4543: this probe gate keeps the #2490 byte-floor contract
+        // (7.5 B/tok = the densest REAL billing observed, the most conservative
+        // density; the 2MB absolute keeps experiment-sized payloads probing —
+        // the #1001 shape, where real tokenizers compress past any byte-ratio
+        // bar, must stay able to bet one request and settle a usage baseline).
+        // A measured-token tier lives at the gates where a forward is
+        // arbitration of a body preflight already tried to shrink: the #1839
+        // forward-once arm below, the #3146/#4185 post-fold block further down,
+        // and the egress fuse in relay.ts — not here, where the 400 of a probe
+        // is the designed #2313 evidence (refusal record, model/origin-scoped,
+        // TTL) rather than a guaranteed waste.
         const coreTextBytes = estimateCoreMessagesUpperBytes(prepared.processedMessages);
         if (coreTextBytes > Math.max(DOOMED_PROBE_ABSOLUTE_BYTES, limit * DOOMED_PROBE_BYTES_PER_TOKEN)) {
             const byteFloorTokens = Math.ceil(coreTextBytes / DOOMED_PROBE_BYTES_PER_TOKEN);
@@ -4342,6 +4394,25 @@ export async function preflightCompressIfNeeded(
         }
         return outbound;
     }
+    // #5000/#4543/#5885: parse the rebuilt outbound ONCE, up front, for the
+    // measured-body doom tiers below (the #1839 arm and the #3146/#4185 gate)
+    // AND for the output-budget read nativeFitAfterClamp needs. The meter is
+    // the #554 side-request guard's own: it walks every string field of the
+    // serialized body (system + tools + arguments + messages, CJK-aware), so
+    // unlike the m.text byte floor it sees the mass that actually rides the
+    // wire. Parse failure leaves both readings undefined — the byte-floor
+    // fallbacks stay binding for those bodies.
+    let outboundBudgetTokens: number | undefined;
+    let outboundRawTokens: number | undefined;
+    try {
+        const outBody: unknown = JSON.parse(typeof outbound.body === "string" ? outbound.body : outbound.body.toString("utf8"));
+        outboundRawTokens = estimateRawBodyTokens(outBody);
+        const outField = outputBudgetField(outBody);
+        const rawBudget = outField !== null ? readOutputBudget(outBody as Record<string, unknown>, outField) : undefined;
+        if (typeof rawBudget === "number" && rawBudget > 0) outboundBudgetTokens = rawBudget;
+    } catch {
+        outboundBudgetTokens = undefined;
+    }
     // #1839: the two measurements disagree — preflight's own final view
     // (post-fold content + images + wire overhead) fits, but the fresh
     // normal-config rebuild measures over. That divergence produced the
@@ -4352,6 +4423,30 @@ export async function preflightCompressIfNeeded(
     // payload is no longer refused on a stale measurement. One forward
     // only — the #330 relaxed-zone caveat still bounds the risk.
     if (result.compressedRanges > 0 && !unknownBaseline && result.payloadEstimate < limit && !localRefusalHere) {
+        // #5000/#4543/#5885: the disagreement above is between two ESTIMATES — a
+        // MEASURED body is authoritative. If the rebuilt body itself exceeds the
+        // window on the #554 meter, "forwarding once for arbitration" is a
+        // guaranteed 400 (#4543: a 4.1 MiB CJK body measuring 1,121,674 tokens
+        // against a 1M window) and the log's "NOT forwarded" claim would be a
+        // lie (#5885 defect 3) — answer it 413 instead of burning the send.
+        // Bar: the NATIVE window when bili knows it (a body over the upstream's
+        // real window can never fit, on any tokenizer), the headroom limit as
+        // fallback — a meter over-count against the POLICY headroom must not
+        // swallow the #1839/#4185 "fits the native window" forwards.
+        // Images are NOT part of this comparison: an image-dominated overage is
+        // the #496/#1800 billing-arbitration domain (forward, let upstream bill
+        // or 400 for real evidence), not a doom — #857's screenshot turn pins
+        // that. The #554 meter excludes image payloads (image_url/data/url/...),
+        // so `outboundRawTokens` is text-only by construction.
+        const armMeasuredBar = typeof resolvedNativeWindow === "number" && resolvedNativeWindow > 0 ? resolvedNativeWindow : limit;
+        if (outboundRawTokens !== undefined && outboundRawTokens > armMeasuredBar) {
+            const outMsgs = outbound.processedMessages.length > 0 ? outbound.processedMessages : outbound.originalMessages;
+            log("error", `[${session.id}] preflight 413 measured-body profile (post-fold): ${describeCoreTextDuplication(outMsgs)}`);
+            const measuredDoomMessage = `rebuilt outbound body measures ~${outboundRawTokens.toLocaleString("en-US")} TEXT tokens (system + tools + arguments + messages; CJK-aware count, the #554 guard meter; images billed separately, never doom here — #496/#1800/#857) vs the model window ${armMeasuredBar.toLocaleString("en-US")} (model=${model}); the body ITSELF exceeds the window, so it was NOT forwarded for upstream arbitration. Remove or trim the oversized content (e.g. a giant paste or tool result) and retry.`;
+            log("error", `[${session.id}] preflight fail-fast 413 (retryable=false): ${measuredDoomMessage}`);
+            noteLocalRefusal(session, currentOrigin, model, limit);
+            return { failFast: true, status: 413, message: measuredDoomMessage, retryable: false, respond: !res.writableEnded };
+        }
         log("warn", `[${session.id}] preflight view fits (~${result.payloadEstimate}/${limit}) but the rebuilt payload measures over — forwarding once for upstream arbitration (#1839)`);
         return outbound;
     }
@@ -4428,20 +4523,29 @@ export async function preflightCompressIfNeeded(
     // native-fit arm closed; doom bytes (#2490) and #3846 guard every arm.
     const deterministicExhaustion = f?.kind === "exhausted" && f.deterministic;
     const noUpstreamEvidence = session.stats.lastInputTokens <= 0 && statedWall <= 0 && deterministicExhaustion;
-    let outboundBudgetTokens: number | undefined;
-    try {
-        const outBody: unknown = JSON.parse(typeof outbound.body === "string" ? outbound.body : outbound.body.toString("utf8"));
-        const outField = outputBudgetField(outBody);
-        const rawBudget = outField !== null ? readOutputBudget(outBody as Record<string, unknown>, outField) : undefined;
-        if (typeof rawBudget === "number" && rawBudget > 0) outboundBudgetTokens = rawBudget;
-    } catch {
-        outboundBudgetTokens = undefined;
-    }
     const outboundCalibrated = foldedCalibratedSize ?? calibratedPayload;
     const nativeFitAfterClamp = statedWall <= 0 && outboundBudgetTokens !== undefined && typeof resolvedNativeWindow === "number" && resolvedNativeWindow > 0
         && outboundCalibrated + outboundBudgetTokens <= resolvedNativeWindow;
     if ((unknownBaseline || noUpstreamEvidence || nativeFitAfterClamp) && !growthArmed) {
         const outMsgs = outbound.processedMessages.length > 0 ? outbound.processedMessages : outbound.originalMessages;
+        // #5000/#4543: the measured body is the stronger reading — if it exceeds
+        // the window no upstream can accept it, whatever the byte floor says
+        // (the floor only sees m.text; #5000's 55.2 MiB wire body and #4543's
+        // 4.1 MiB CJK body both cleared it). Same bar as the #1839 arm above:
+        // the native window when known (a #4185 headroom over-count must not
+        // false-refuse a natively-fitting body), the headroom limit as
+        // fallback. Measured tier first, byte floor below stays as the
+        // fallback for unparseable bodies.
+        // Same text-only rule as the #1839 arm above: image-dominated overage
+        // belongs to the #496/#1800 billing arbitration, never to a local doom.
+        const gateMeasuredBar = typeof resolvedNativeWindow === "number" && resolvedNativeWindow > 0 ? resolvedNativeWindow : limit;
+        if (outboundRawTokens !== undefined && outboundRawTokens > gateMeasuredBar) {
+            log("error", `[${session.id}] preflight 413 measured-body profile: ${describeCoreTextDuplication(outMsgs)}`);
+            const measuredDoomMessage = `outbound body measures ~${outboundRawTokens.toLocaleString("en-US")} TEXT tokens even after preflight compression (system + tools + arguments + messages; CJK-aware count, the #554 guard meter; images billed separately, never doom here — #496/#1800/#857) vs the model window ${gateMeasuredBar.toLocaleString("en-US")} (model=${model}); the body ITSELF exceeds the window, so it was NOT forwarded. Remove or trim the oversized content (e.g. a giant paste or tool result) and retry.`;
+            log("error", `[${session.id}] preflight fail-fast 413 (retryable=false): ${measuredDoomMessage}`);
+            noteLocalRefusal(session, currentOrigin, model, limit);
+            return { failFast: true, status: 413, message: measuredDoomMessage, retryable: false, respond: !res.writableEnded };
+        }
         const doomBytes = estimateCoreMessagesUpperBytes(outMsgs);
         if (doomBytes > Math.max(DOOMED_PROBE_ABSOLUTE_BYTES, limit * DOOMED_PROBE_BYTES_PER_TOKEN)) {
             const byteFloorTokens = Math.ceil(doomBytes / DOOMED_PROBE_BYTES_PER_TOKEN);
@@ -4617,11 +4721,15 @@ function formatBytes(n: number): string {
 // bytes are counted with Buffer.byteLength since undici sends UTF-8 bytes even
 // for string bodies (.length would count UTF-16 chars and undercount any
 // non-ASCII injection). Omitted on paths that fail fast without forwarding.
-// #4528: inbound histories past this size pay an O(messages) synchronous scan
-// pass per turn on the main thread, large enough to starve the event loop and
+// #4528: bili's own per-request processing past this WALL-CLOCK budget means
+// synchronous main-thread work large enough to starve the event loop and
 // freeze every endpoint on the same listener — warn so a pathological session
 // shows up in the log instead of being found through a frozen UI.
-const SLOW_SESSION_MSG_WARN = 1000;
+// #5744: the trigger used to be message COUNT (>1000), which cannot separate
+// cost from size — one reporter session saved at 0.8s AND 14.5s at the same
+// ~3k msgs. Wall clock IS the cost; the info line above keeps reporting the
+// count for correlation.
+const SLOW_SESSION_MS_WARN = 1000;
 export function logRequestCost(log: (level: string, msg: string) => void, sessionId: string, msgs: number | null, inboundBytes: number, t0: number, outbound?: string | Buffer): void {
     const ms = Math.max(0, Math.round(performance.now() - t0));
     const outboundField = outbound !== undefined ? `, outbound=${formatBytes(Buffer.byteLength(outbound))}` : "";
@@ -4630,8 +4738,8 @@ export function logRequestCost(log: (level: string, msg: string) => void, sessio
     // #5408: this line is THE observation point — a hot-at-attach session that
     // never produces one is silent compression loss (the incident signature).
     noteRequest(sessionId);
-    if (msgs !== null && msgs > SLOW_SESSION_MSG_WARN) {
-        log("warn", `[${sessionId}] slow-session: ${msgs} msgs / inbound=${formatBytes(inboundBytes)} took local=${ms}ms — per-turn O(messages) synchronous scans are starving the event loop (#4528); consider closing/restarting the session or enabling compression`);
+    if (ms > SLOW_SESSION_MS_WARN) {
+        log("warn", `[${sessionId}] slow-session: ${msgs ?? "?"} msgs / inbound=${formatBytes(inboundBytes)} took local=${ms}ms — synchronous per-turn work is starving the event loop (#4528/#5744); consider closing/restarting the session or enabling compression`);
     }
 }
 

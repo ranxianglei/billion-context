@@ -58,7 +58,7 @@ import { safePrefix, safeSuffix, scrubLoneSurrogatesOnWire } from "../text-safe.
 import { clearUpstreamAlertsForHost, noteCircuitFailFastLog, recordUpstreamAlert, recordUpstreamCircuitFailure, recordUpstreamCircuitSuccess, upstreamCircuitBlockReason, upstreamCircuitLastFailureKind, upstreamCircuitRetryAfterSeconds } from "../upstream-alerts.js";
 import { describeUpstreamFailure, formatUpstreamError, proxyDispatcher, recordUpstreamConnection } from "../upstream-proxy.js";
 import { markExpectedFailFast, withUpstreamFailure, type UpstreamFailureKind } from "../upstream-fail.js";
-import { keyringModel429Scope, noteUpstreamThrottle429, noteUpstreamThrottleResolved, releaseUpstreamThrottleProbe, requestModelFromBody, upstreamThrottleGate } from "../upstream-throttle.js";
+import { noteUpstreamThrottle429, noteUpstreamThrottleResolved, releaseUpstreamThrottleProbe, requestModelFromBody, throttle429ModelScope, type ThrottleLocalReject, upstreamThrottleGate, upstreamThrottlePeekReject } from "../upstream-throttle.js";
 import { applyEstimateCalibration, currentCalibrationFactor, inspectContextOverflow, isMarkerlessOverflowReject, MIN_ASSUMED_WINDOW_TOKENS, normalizeUpstreamOrigin, usageOutputTotal, usageTotals, type ContextOverflowInfo, type WireProtocol } from "../util.js";
 import { billOutputUsage } from "../billing.js";
 import { DUMP_PLAINTEXT_BANNER } from "../dump-banner.js";
@@ -69,7 +69,7 @@ import { buildForwardHeaders, connectionNamedHeaders, RESPONSE_ONLY_STRIP_HEADER
 import { bodyDumpEnabled, logDumpFailure } from "./observability.js";
 import { effectiveAbsorbBlock } from "./prepare-responses.js";
 import { awaitDrain, bufferToStream, dumpStreamToFile, pipeThrough, readStreamToBuffer } from "./stream-io.js";
-import { buildForwardTarget, makeFoldPointReasoningDroppable, outboundPayloadBreakdown, registerRequestAbort, beginStreamKeepalive, effectiveTokenCount, googlePathKind, imageBillingFor, imageTokenCapFor, inboundResignCredential, outboundContextEstimates, repairResponsesAssistantOrdering, resolveUpstream, stripKernelSummaries, usageGradeInputBaseline, DOOMED_PROBE_ABSOLUTE_BYTES, DOOMED_PROBE_BYTES_PER_TOKEN, type Prepared } from "../server.js";
+import { buildForwardTarget, makeFoldPointReasoningDroppable, measuredOutboundTokens, outboundPayloadBreakdown, registerRequestAbort, beginStreamKeepalive, effectiveTokenCount, googlePathKind, imageBillingFor, imageTokenCapFor, inboundResignCredential, outboundContextEstimates, repairResponsesAssistantOrdering, resolveUpstream, stripKernelSummaries, usageGradeInputBaseline, DOOMED_PROBE_ABSOLUTE_BYTES, DOOMED_PROBE_BYTES_PER_TOKEN, type Prepared } from "../server.js";
 import { isStrictReasoningEcho, modelIdOf } from "../strict-echo.js";
 
 /** Infer the wire protocol from the request path for compat-role rewrites on
@@ -186,11 +186,14 @@ function armFailureShrink(prepared: Prepared, log: (level: string, msg: string) 
 /** #3701: user-visible diagnosis for an unrecoverable WS size rejection — names the
  *  exact bytes, why shedding could not fit, and the current budget for context.
  *  Deliberately does NOT suggest raising the budget: the gateway just proved it
- *  rejects this size, so a bigger budget would only send the fat frame again. */
-function wsOversizeDiagnosis(sentBytes: number, stats: ShedStats | undefined, budget: number): string {
-    const why = !stats || (!stats.archived && !stats.downscaled)
+ *  rejects this size, so a bigger budget would only send the fat frame again.
+ *  #4601: `why` overrides the derived reason when shedding was never ATTEMPTED
+ *  (e.g. a verbatim-passthrough body that shedWireImages cannot parse) — claiming
+ *  "no sheddable images" there was a lie about work that was not done. */
+function wsOversizeDiagnosis(sentBytes: number, stats: ShedStats | undefined, budget: number, why?: string): string {
+    const realWhy = why ?? (!stats || (!stats.archived && !stats.downscaled)
         ? "no sheddable images outside the protected recent messages"
-        : `shedding removed ${formatMiB(Math.max(0, sentBytes - stats.finalBytes))} MiB but the remainder is protected recent content`;
+        : `shedding removed ${formatMiB(Math.max(0, sentBytes - stats.finalBytes))} MiB but the remainder is protected recent content`);
     return `WS upstream rejected the ${formatMiB(sentBytes)} MiB request with close 1009 (zero events received) and the payload cannot be reduced further (${why}). Trim older images/history so the frame fits under the wire limit (current pre-send budget: ${budget > 0 ? `${formatMiB(budget)} MiB` : "disabled"} — network.wsOutboundBytes / BILI_WS_OUTBOUND_BYTES).`;
 }
 
@@ -249,6 +252,73 @@ export function armFirstByteWatchdog(o: {
     timer.unref();
     o.signal.addEventListener("abort", () => clearTimeout(timer), { once: true });
     return timer;
+}
+
+// #5795: single source of truth for the local 429/424 hold response — shared by
+// the post-ingest gate below and the pre-ingest fast path in handle.ts so the
+// two sites cannot drift on status/headers/body shape.
+function answerLocalThrottleReject(
+    res: http.ServerResponse,
+    reject: ThrottleLocalReject,
+    protocol: WireProtocol | null | undefined,
+    streamErrorShape: "protocol" | "completion" | undefined,
+    log: (level: string, msg: string) => void,
+    label?: string,
+): void {
+    log(reject.status === 424 ? "warn" : "debug", `[${label ?? "passthrough"}] [acp-proxy] 429-hold: answered locally with ${reject.status} without egress (#4204)`);
+    if (res.headersSent) {
+        emitStreamError(res, protocol ?? "openai", reject.message, undefined, streamErrorShape);
+        return;
+    }
+    res.writeHead(reject.status, reject.retryAfterSec !== null
+        ? { "content-type": "application/json", "retry-after": String(reject.retryAfterSec) }
+        : { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: { type: "rate_limit_error", code: reject.code, stage: "forward", message: reject.message, retryable: reject.status === 429, ...(reject.model === undefined ? {} : { scope: "model", model: reject.model }) } }));
+}
+
+// #5795: pre-ingest 429-hold fast path. While a hold is active for this
+// origin+credential the send will be answered locally anyway — answering
+// BEFORE prepare skips the O(history) parse/convert/pin cost of a request that
+// will not egress regardless (the held retry storms in the field report cost
+// ~6s of ingest per refused turn on multi-MiB histories). Completes #4204's
+// contract: zero egress while held → also zero ingest while held.
+// Read-only peek: never mints probe tokens or mutates governor state, so the
+// real gate in forwardCaptured keeps owning admission/probe accounting. The
+// conservative edges are deliberate: sub-threshold bodies keep their exact
+// pre-#5795 path (forge/classifier/compact-trigger shapes intercept locally
+// during prepare and must not be pre-empted), and lanes whose credential bili
+// itself overrides (#2336) key holds under the overridden fingerprint which
+// this raw-header peek cannot see — those fall through to the post-ingest gate
+// and are refused there exactly as before.
+export const EARLY_HOLD_GATE_MIN_BYTES = 1024 * 1024;
+
+export function tryAnswerEarlyHold(o: {
+    method?: string;
+    upstreamUrl: string;
+    credHeaders: Record<string, string>;
+    protocol: WireProtocol | null;
+    bodyBytes: number;
+    /** The request model — or a lazy supplier for it. The supplier form exists
+     *  because the only model source that is not a header read is a full-document
+     *  body scan: callers that pass a supplier pay that O(body) walk ONLY when
+     *  this function actually consults the model (i.e. the body cleared the
+     *  threshold and the wire is known). A sub-threshold or unknown-wire request
+     *  bails out above and never touches the payload (#5898 review: the eager
+     *  scan taxed every proxied POST with a result it could not use). */
+    requestModel?: string | (() => string | undefined);
+    res: http.ServerResponse;
+    streamErrorShape?: "protocol" | "completion";
+    log: (level: string, msg: string) => void;
+    /** Test seam: mirrors the governor's own explicit-now convention. */
+    now?: number;
+}): boolean {
+    if (o.method === "GET" || o.method === "HEAD") return false;
+    if (o.protocol === null || o.bodyBytes < EARLY_HOLD_GATE_MIN_BYTES) return false;
+    const requestModel = typeof o.requestModel === "function" ? o.requestModel() : o.requestModel;
+    const reject = upstreamThrottlePeekReject(o.upstreamUrl, o.credHeaders, o.now ?? Date.now(), requestModel);
+    if (reject === undefined) return false;
+    answerLocalThrottleReject(o.res, reject, o.protocol, o.streamErrorShape, o.log, "pre-ingest");
+    return true;
 }
 
 export function forward(...args: Parameters<typeof forwardCaptured>): Promise<void> {
@@ -446,7 +516,7 @@ async function forwardCaptured(
     // recognition + hop passthrough are unaffected by this switch.
     if (prepared && !prepared.sidePassthrough && prepared.processedMessages.length > 0 && typeof wireBody === "string" && opts.chainEgressStamp === true) {
         try {
-            const stamped = stampOutbound(JSON.parse(wireBody), prepared.protocol, instanceId);
+            const stamped = stampOutbound(JSON.parse(wireBody), prepared.protocol, instanceId, Date.now(), prepared.model ?? prepared.google?.model);
             if (stamped !== null) {
                 wireBody = JSON.stringify(stamped);
                 log("debug", `[${prepared.session.id}] [stamp] outbound ${prepared.protocol} request carries checkpoint carrier`);
@@ -658,6 +728,33 @@ async function forwardCaptured(
         const fuseWindow = Math.max(declaredWindow, MIN_ASSUMED_WINDOW_TOKENS);
         if (declaredWindow > 0) {
             const fuseMsgs = prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages;
+            // #5000/#4543: the byte floor below prices only m.text — a body whose
+            // mass sits in tools[] / tool arguments / the system prompt clears it
+            // (incident #5000: a 55.2 MiB wire body whose core text cleared the
+            // floor; #4543: a 4.1 MiB CJK body measuring ~1.12M tokens that the
+            // 7.5 B/tok floor cannot see below ~8.4 MB). Price the ACTUAL
+            // outbound body first with the #554 side-request meter (every string
+            // field, CJK-aware) and judge it against the SAME floored bar the
+            // byte floor uses (fuseWindow): the fuse's #4079 contract is
+            // "never block what a largest-common-window upstream might accept",
+            // and that contract binds a measurement just as much as a density
+            // guess — a wrong-small declaration must not false-block a body a
+            // 1M window would take. #4543 still lands: its declared 1,048,580
+            // window sits ABOVE the 1M floor, so floored or not the 1.12M-token
+            // body exceeds it. The byte floor stays as the fallback for
+            // unparseable bodies. No refusal record either way (#3974).
+            const fuseRawTokens = measuredOutboundTokens(prepared);
+            if (fuseRawTokens !== undefined && fuseRawTokens > fuseWindow) {
+                log("warn", `413: [${prepared.session.id}] egress window fuse measured-body profile: ${describeCoreTextDuplication(fuseMsgs)}`);
+                const fuseMessage = `outbound body measures ~${fuseRawTokens.toLocaleString("en-US")} tokens (system + tools + arguments + messages; CJK-aware count, the #554 guard meter) vs the effective model window ${declaredWindow.toLocaleString("en-US")} (bars never assume below ${MIN_ASSUMED_WINDOW_TOKENS} tokens, #4079) (model=${prepared.model ?? "unknown"}); the body ITSELF exceeds the window, so the send was stopped at the egress fuse instead of being forwarded (#5000/#4543/#4068). Remove or trim the oversized content (e.g. a giant paste or tool result) and retry.`;
+                log("warn", `413: [${prepared.session.id}] egress window fuse: ${fuseMessage}`);
+                if (res.headersSent) emitStreamError(res, prepared.protocol, fuseMessage, undefined, opts.streamErrorShape);
+                else {
+                    res.writeHead(413, { "content-type": "application/json" });
+                    res.end(JSON.stringify({ error: { type: "request_too_large", code: "egress_window_fuse", stage: "forward", message: fuseMessage, retryable: false } }));
+                }
+                return;
+            }
             const fuseBytes = estimateCoreMessagesUpperBytes(fuseMsgs);
             if (fuseBytes > Math.max(DOOMED_PROBE_ABSOLUTE_BYTES, fuseWindow * DOOMED_PROBE_BYTES_PER_TOKEN)) {
                 const fuseFloorTokens = Math.ceil(fuseBytes / DOOMED_PROBE_BYTES_PER_TOKEN);
@@ -850,21 +947,14 @@ async function forwardCaptured(
     // #4204: account-wide holds stay origin+credential scoped. KeyRing's
     // request-matched model-temporarily-unavailable error gets a separate
     // origin+credential+model hold so unrelated models remain eligible.
-    const throttleModel = throttleModelHint ?? (typeof prepared?.model === "string" ? prepared.model : requestModelFromBody(wireBody));
+    const throttleModel = throttleModelHint ?? (typeof prepared?.model === "string" ? prepared.model : requestModelFromBody(wireBody, req));
     let throttleProbeToken: symbol | undefined;
     if (req.method !== "GET" && req.method !== "HEAD") {
         const throttleGate = upstreamThrottleGate(upstreamUrl, headers, Date.now(), throttleModel);
         throttleProbeToken = throttleGate.probeToken;
         const throttleReject = throttleGate.reject;
         if (throttleReject !== undefined) {
-            log(throttleReject.status === 424 ? "warn" : "debug", `[${prepared?.session.id ?? "passthrough"}] [acp-proxy] 429-hold: answered locally with ${throttleReject.status} without egress (#4204)`);
-            if (res.headersSent) emitStreamError(res, prepared?.protocol ?? "openai", throttleReject.message, undefined, opts.streamErrorShape);
-            else {
-                res.writeHead(throttleReject.status, throttleReject.retryAfterSec !== null
-                    ? { "content-type": "application/json", "retry-after": String(throttleReject.retryAfterSec) }
-                    : { "content-type": "application/json" });
-                res.end(JSON.stringify({ error: { type: "rate_limit_error", code: throttleReject.code, stage: "forward", message: throttleReject.message, retryable: throttleReject.status === 429, ...(throttleReject.model === undefined ? {} : { scope: "model", model: throttleReject.model }) } }));
-            }
+            answerLocalThrottleReject(res, throttleReject, prepared?.protocol, opts.streamErrorShape, log, prepared?.session.id);
             return;
         }
     }
@@ -920,12 +1010,13 @@ async function forwardCaptured(
 
         if (prepared && req.method !== "GET" && req.method !== "HEAD") armFailureShrink(prepared, log, "network failure", outboundPayloadBreakdown(prepared, opts, route, req.url ?? "").armEstimate);
         if (prepared && prepared.attachedRetrievals && prepared.attachedRetrievals.length > 0) dropRetrievals(prepared.session, prepared.attachedRetrievals.map((i) => i.ref), "upstream network failure");
-        const sentBytes = typeof wireBody === "string" ? Buffer.byteLength(wireBody) : 0;
+        // #4601: a non-string (verbatim passthrough) body was reported as 0.0 MiB — measure it.
+        const sentBytes = typeof wireBody === "string" ? Buffer.byteLength(wireBody) : wireBody.byteLength;
         const budget = limitsWsOutboundBytes();
         const target = Math.min(sentBytes * 0.85, budget > 0 ? budget : Number.MAX_SAFE_INTEGER);
         if (prepared === null || prepared === undefined || prepared.sidePassthrough || prepared.protocol === undefined || typeof wireBody !== "string" || sentBytes <= 0 || !res.writable || res.writableEnded || res.destroyed) {
             releaseUpstreamThrottleProbe(throttleProbeToken);
-            throw new Error(wsOversizeDiagnosis(sentBytes, undefined, budget));
+            throw new Error(wsOversizeDiagnosis(sentBytes, undefined, budget, typeof wireBody !== "string" ? "the body is not a JSON wire body (verbatim passthrough) — image shedding cannot apply" : undefined));
         }
         const shedSession = prepared.session;
         let shedResult: ShedWireImagesResult;
@@ -1639,7 +1730,7 @@ async function forwardCaptured(
         // keyring_all_limited and every ambiguous response remain account-wide.
         if (req.method !== "GET" && req.method !== "HEAD") {
             if (upstream.status === 429) {
-                const modelScope = keyringModel429Scope(upstream.status, throttleModel, errBody);
+                const modelScope = throttle429ModelScope(upstream.status, throttleModel, errBody);
                 noteUpstreamThrottle429(upstreamUrl, headers, upstream.headers.get("retry-after"), Date.now(), modelScope, throttleProbeToken);
             } else {
                 noteUpstreamThrottleResolved(upstreamUrl, headers, upstream.status, Date.now(), throttleModel, throttleProbeToken);
@@ -1785,6 +1876,7 @@ async function forwardCaptured(
                     signal: clientAbort.signal,
                     session: prepared.session,
                     log,
+                    model: prepared.model ?? prepared.google?.model,
                 });
                 pluginBody = bufferToStream(resolvedBuf);
             }
@@ -1822,7 +1914,7 @@ async function forwardCaptured(
                         makeContinuationRefetch({
                             protocol: "responses",
                             body,
-                            model: throttleModel,
+                            model: throttleModel ?? prepared.google?.model,
                             upstreamUrl,
                             reqHeaders: buildForwardHeaders(headers), resign: applyResign,
                             proxyUrl,
@@ -1851,7 +1943,7 @@ async function forwardCaptured(
                         makeContinuationRefetch({
                             protocol: prepared.protocol,
                             body,
-                            model: throttleModel,
+                            model: throttleModel ?? prepared.google?.model,
                             upstreamUrl,
                             reqHeaders: buildForwardHeaders(headers), resign: applyResign,
                             proxyUrl,
@@ -1931,6 +2023,7 @@ async function forwardCaptured(
                 signal: clientAbort.signal,
                 session: prepared.session,
                 log,
+                model: prepared.model ?? prepared.google?.model,
             });
             responseBody = bufferToStream(resolvedBuf);
         }
@@ -1985,7 +2078,7 @@ async function forwardCaptured(
                     makeContinuationRefetch({
                         protocol: "responses",
                         body,
-                        model: throttleModel,
+                        model: throttleModel ?? prepared.google?.model,
                         upstreamUrl,
                         reqHeaders: buildForwardHeaders(headers), resign: applyResign,
                         proxyUrl,
@@ -2031,7 +2124,7 @@ async function forwardCaptured(
                     makeContinuationRefetch({
                         protocol: "responses",
                         body,
-                        model: throttleModel,
+                        model: throttleModel ?? p.google?.model,
                         upstreamUrl,
                         reqHeaders: buildForwardHeaders(headers), resign: applyResign,
                         proxyUrl,
@@ -2056,7 +2149,7 @@ async function forwardCaptured(
                     makeContinuationRefetch({
                         protocol: p.protocol,
                         body,
-                        model: throttleModel,
+                        model: throttleModel ?? p.google?.model,
                         wrapBody: v1Active ? v1Wrap : undefined,
                         upstreamUrl,
                         reqHeaders: buildForwardHeaders(headers), resign: applyResign,
@@ -2202,10 +2295,12 @@ async function forwardCaptured(
                     // against them drops the only cross-turn summary carrier and breaks the byte-prefix
                     // at the fold anchor (post-fold cache floor reset to the stable head).
                     const outBase = [...stripKernelSummaries(viewed as BiliMessage[], turn.state), ...(records as BiliMessage[])] as BiliMessage[];
-                    // Fold-point carrier relocation round-2 mirror (switch A): with the
-                    // switch on, pairs sit at their fold point instead of being
-                    // tail-appended onto the re-request. Idempotent when processTurn's
-                    // node already moved them (view-only + deterministic transform).
+                    // Fold-point summary relocation round-2 mirror (switch A): with
+                    // the switch on, each still-visible compress pair keeps its
+                    // chronological slot but its SUMMARY TEXT is re-emitted at its
+                    // fold point (call args become a pointer — v2 semantics).
+                    // Idempotent when processTurn's node already relocated them
+                    // (view-only + deterministic transform).
                     const out = loopConfig.compressAtFoldPoint
                         ? relocateCompressCarriers(outBase as unknown as CoreMessage[], turn.state, {
                             isCompressTool: loopConfig.isCompressTool,
@@ -2406,6 +2501,9 @@ async function resolveFakeCompletion(
         signal: AbortSignal;
         session: Session;
         log: (level: string, msg: string) => void;
+        /** #5390: target model name — lets the google-wire part-order normalize
+         *  skip the WC-018 text-first reorder for Claude models. */
+        model?: string;
         /** #1884: re-sign the retry body before it hits the wire (armed
          *  re-sign lane only; undefined on unsigned traffic). */
         resign?: (headers: Record<string, string>, body: string | Buffer) => void;
@@ -2421,7 +2519,7 @@ async function resolveFakeCompletion(
     const priorStreak = (opts.session.metadata.fakeCompletionStreak as number | undefined) ?? 0;
     if (max > 0 && priorStreak < max && isFakeCompletion(opts.protocol, buffer.toString("utf8"))) {
         for (let attempt = 1; attempt <= max && !opts.signal.aborted; attempt++) {
-            const hinted = injectFakeCompletionHint(opts.protocol, opts.wireBody);
+            const hinted = injectFakeCompletionHint(opts.protocol, opts.wireBody, opts.model);
             if (hinted === null) break;
             const wireHinted = opts.wrapBody ? opts.wrapBody(hinted) : hinted;
             opts.log("warn", `[${sid}] fake completion (tool-call XML, no tool block); retry ${attempt}/${max} with corrective hint`);

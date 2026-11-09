@@ -240,6 +240,62 @@ test("project-scope pi-subagents install stands acp_delegate down (#415)", async
     assert.equal(ctx.ui.notifications[0][1], "warning");
 });
 
+// The user scope resolves through PI_CODING_AGENT_DIR, not HOME (os.homedir()
+// ignores HOME on Windows), so the fixture pins the env var instead of the
+// temp HOME the rest of this file uses.
+function userScopeInstall(): { install: string; restore: () => void } {
+    const agentDir = fs.mkdtempSync(path.join(HOME, "agent-dir-"));
+    const install = path.join(agentDir, "npm", "node_modules", "pi-subagents");
+    fs.mkdirSync(install, { recursive: true });
+    fs.writeFileSync(path.join(install, "package.json"), JSON.stringify({ name: "pi-subagents", version: "1.0.0" }));
+    const saved = process.env.PI_CODING_AGENT_DIR;
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    return {
+        install,
+        restore: () => {
+            if (saved === undefined) delete process.env.PI_CODING_AGENT_DIR;
+            else process.env.PI_CODING_AGENT_DIR = saved;
+            fs.rmSync(agentDir, { recursive: true, force: true });
+        },
+    };
+}
+
+test("user-scope pi-subagents install stands acp_delegate down (#5637)", async () => {
+    const { pi, handlers, tools, commands, shortcuts } = fakePi();
+    (globalThis as Record<symbol, unknown>)[Symbol.for("acp-delegate.embedded")] = false;
+    wirePiSubagents(pi, "pi");
+    (globalThis as Record<symbol, unknown>)[Symbol.for("acp-delegate.embedded")] = true;
+    const ctx = sessionCtx();
+    const { install, restore } = userScopeInstall();
+    try {
+        await handlers.get("session_start")!(undefined, ctx);
+    } finally {
+        restore();
+    }
+    assert.ok(install, "user-scope install materialized");
+    assert.deepEqual(tools, []);
+    assert.deepEqual(commands, ["acp-fleet"]);
+    assert.equal(shortcuts.length, 0);
+});
+
+test("forceEnable keeps acp_delegate registered despite a user-scope install (#5637)", async () => {
+    clearBiliConfig();
+    writeBiliConfig({ pi: { subagents: { forceEnable: true } } });
+    const { pi, handlers, tools } = fakePi();
+    (globalThis as Record<symbol, unknown>)[Symbol.for("acp-delegate.embedded")] = false;
+    wirePiSubagents(pi, "pi");
+    (globalThis as Record<symbol, unknown>)[Symbol.for("acp-delegate.embedded")] = true;
+    const ctx = sessionCtx();
+    const { restore } = userScopeInstall();
+    try {
+        await handlers.get("session_start")!(undefined, ctx);
+    } finally {
+        restore();
+        clearBiliConfig();
+    }
+    assert.deepEqual(tools.sort(), ["acp_delegate", "acp_delegate_cancel", "acp_delegate_wait"]);
+});
+
 // --- #2230 config-home: pi.subagents in billion-context.json ---
 
 function writeBiliConfig(value: unknown): void {
@@ -325,7 +381,7 @@ test("piSubagentsAdapter maps the pi.subagents section onto the package adapter 
 });
 
 // #2260(F): pins the documented precedence PI_ACP_DELEGATE_* > pi.subagents >
-// acp.json > default (CONFIGURATION.md). The env readers live INSIDE the
+// acp.json > default (docs/configuration.md). The env readers live INSIDE the
 // bundled package's resolveDelegate, so this drives that real function through
 // bili's loader chain — a future package or adapter change that silently drops
 // env must fail here.
