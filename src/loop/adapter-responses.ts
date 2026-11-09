@@ -338,7 +338,7 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
             const devParts = projection && projection.systemParts.length > 0
                 ? [...projection.systemParts, systemPrompt]
                 : [systemPrompt];
-            const withDev = injectResponsesDeveloperMessage(inputItems, devParts.join("\n\n---\n\n"));
+            const withDev = injectResponsesDeveloperMessage(inputItems, devParts.join("\n\n---\n\n"), projection?.headRole ?? "developer");
             const finalInput = notes && notes.length > 0
                 ? [...withDev, ...notes.map((text) => ({ type: "message" as const, role: "user" as const, content: text }))]
                 : withDev;
