@@ -75,7 +75,7 @@ test("round-trip: unwrap→rewrap is deep-equal for a rich conversation", () => 
         { type: "function", function: { name: "get_weather", description: "d", parameters: { type: "object", properties: { city: { type: "string" } } } } },
     ]);
     const back = rewrapCommandcodeBody(flat, unwrapped.meta);
-    // Normalizations (WIRE-CONTRACTS.md): inline system hoists into the
+    // Normalizations (docs/wire-contracts.md): inline system hoists into the
     // params.system slot; multi-part user text blocks join into one block;
     // assistant content is always re-emitted as a block array.
     const expected = structuredClone(src) as any;

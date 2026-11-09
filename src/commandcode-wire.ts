@@ -8,7 +8,7 @@
 //
 // Strict fidelity (#1284 precedent): ANY shape this codec cannot convert is
 // rejected (undefined) and the caller relays the original bytes verbatim —
-// never a partial conversion. See WIRE-CONTRACTS.md (WC-* entries).
+// never a partial conversion. See docs/wire-contracts.md (WC-* entries).
 
 export interface CommandcodeEnvelopeMeta {
     /** Every original top-level envelope key except `params`, verbatim. */

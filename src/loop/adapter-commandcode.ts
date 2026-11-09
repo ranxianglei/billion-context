@@ -153,7 +153,7 @@ export function createCommandcodeAdapter(
                 try {
                     ev = JSON.parse(line) as Record<string, unknown>;
                 } catch {
-                    // WC-3 (WIRE-CONTRACTS.md): undecodable line — forward
+                    // WC-3 (docs/wire-contracts.md): undecodable line — forward
                     // verbatim in round 1 only, never fabricate meaning.
                     if (round === 1) yield { kind: "meta", chunk: lineBuf(line), firstRoundOnly: true } as ParsedStreamEvent;
                     continue;
@@ -217,7 +217,7 @@ export function createCommandcodeAdapter(
                     yield { kind: "error", message } as ParsedStreamEvent;
                     return;
                 } else {
-                    // WC-3 (WIRE-CONTRACTS.md): reasoning-start/end and any
+                    // WC-3 (docs/wire-contracts.md): reasoning-start/end and any
                     // future event types — forward verbatim in round 1 only
                     // so synthetic rounds do not replay upstream frames.
                     yield { kind: "meta", chunk: lineBuf(line), firstRoundOnly: true } as ParsedStreamEvent;

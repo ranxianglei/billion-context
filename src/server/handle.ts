@@ -675,7 +675,7 @@ async function handleRequest(
     // rewrapCommandcodeBody restores the envelope at the final forward boundary.
     // Strict fidelity (#1284 precedent): a body that is not a convertible
     // STREAMING CLI conversation relays verbatim with a one-time loud warning —
-    // never a partial conversion (WIRE-CONTRACTS.md).
+    // never a partial conversion (docs/wire-contracts.md).
     let ccMeta: CommandcodeEnvelopeMeta | undefined;
     if (wireFamily === "commandcode" && protocol !== null) {
         const unwrapped = typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
