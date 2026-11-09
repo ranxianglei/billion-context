@@ -16,7 +16,8 @@ process.env.DSH_HOME = home;
 process.env.XDG_STATE_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "iot-incompat-state-"));
 process.env.BILI_CONFIG_FILE = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "iot-incompat-cfg-")), "absent.json");
 
-const { NOTICES, probeDshIotThinking, dshIotThinkingActive } = await import("../src/notices.ts");
+const { NOTICES } = await import("../src/notices.ts");
+const { probeDshIotThinking, dshIotThinkingActive } = await import("../src/dsh-channel.ts");
 const { IOT_INCOMPAT_NOTICE_ID, dismissUpgradeNotice } = await import("../src/pck-notice.ts");
 
 const entry = () => {

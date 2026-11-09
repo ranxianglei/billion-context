@@ -43,6 +43,40 @@ export function dshProfileDirs(env: NodeJS.ProcessEnv = process.env): string[] {
     return entries.filter((e) => e.isDirectory() && e.name !== "node_modules").map((e) => path.join(profiles, e.name));
 }
 
+/** Uncached: does ANY dsh profile carry the iot-thinking plugin? Never throws
+ *  (no profiles / unreadable home ⇒ false — an advisory must not fail a page). */
+export function probeDshIotThinking(env: NodeJS.ProcessEnv = process.env): boolean {
+    let dirs: string[];
+    try {
+        dirs = dshProfileDirs(env);
+    } catch {
+        return false;
+    }
+    for (const dir of dirs) {
+        try {
+            if (fs.existsSync(path.join(dir, "node_modules", "dsh-plugin-iot-thinking", "package.json"))) return true;
+        } catch {
+            // unreadable profile: keep scanning the rest
+        }
+    }
+    return false;
+}
+
+/** Installed AND effective-enabled. The plugin's own default is enabled
+ *  (its config-store seeds enabled: true), so a missing/unreadable config
+ *  keeps the warning; only an explicit enabled: false silences it. */
+export function dshIotThinkingActive(env: NodeJS.ProcessEnv = process.env): boolean {
+    if (!probeDshIotThinking(env)) return false;
+    try {
+        const raw = fs.readFileSync(path.join(resolveDshHome(env), "plugin-data", "iot-thinking", "config.json"), "utf8");
+        const doc: unknown = JSON.parse(raw);
+        if (doc !== null && typeof doc === "object" && (doc as { enabled?: unknown }).enabled === false) return false;
+    } catch {
+        // absent/broken config ⇒ plugin runs on its default (enabled)
+    }
+    return true;
+}
+
 // — cordis.patch.yml entry parsing (#3838) ————————————————————————————————
 
 interface DshPatchEntry {
