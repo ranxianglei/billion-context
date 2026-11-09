@@ -47,7 +47,7 @@ export function detectThinkingSignatureRejection(status: number, bodyText: strin
     return true;
 }
 
-export interface UnsignedThinkingStrip {
+interface UnsignedThinkingStrip {
     body: string;
     removed: number;
 }
