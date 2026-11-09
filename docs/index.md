@@ -25,6 +25,7 @@
 | [msgid-infrastructure](msgid-infrastructure.md) / [中文](msgid-infrastructure.zh-CN.md) | Where sessionid+msgid is produced, validated (six copies), pinned, and consumed |
 | [opencode-responses-websocket](opencode-responses-websocket.md) / [中文](opencode-responses-websocket.zh-CN.md) | OpenCode V2 Responses-over-WebSocket integration (#1844) |
 | [plugin-protocol](plugin-protocol.md) | Cooperative plugin protocol v2 (experimental) |
+| [wire-contracts](wire-contracts.md) / [中文](wire-contracts.zh-CN.md) | Upstream wire-constraint ledger (WC entries): strict-fidelity codec rules + per-wire constraints (#1295) |
 
 ## Engineering & operations
 

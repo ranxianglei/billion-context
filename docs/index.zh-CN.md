@@ -25,6 +25,7 @@
 | [msgid-infrastructure](msgid-infrastructure.zh-CN.md) / [English](msgid-infrastructure.md) | sessionid+msgid 的生产、校验（六份副本）、钉住与消费 |
 | [opencode-responses-websocket](opencode-responses-websocket.zh-CN.md) / [English](opencode-responses-websocket.md) | OpenCode V2 Responses-over-WebSocket 集成（#1844） |
 | [plugin-protocol](plugin-protocol.md) | 协作插件协议 v2（实验性，无中文版） |
+| [wire-contracts](wire-contracts.zh-CN.md) / [English](wire-contracts.md) | 上游 wire 约束台账（WC 条目）：严格保真 codec 规则 + 各 wire 约束（#1295） |
 
 ## 工程与运维
 
