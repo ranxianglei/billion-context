@@ -1974,6 +1974,7 @@ async function forwardCaptured(
                         wireBodyText,
                         upstreamMeta,
                         reply,
+                        opts.streamErrorShape,
                     );
                 }
             } else {
@@ -2181,6 +2182,7 @@ async function forwardCaptured(
                     undefined,
                     upstreamMeta,
                     reply,
+                    opts.streamErrorShape,
                 );
             }
         } else if (
