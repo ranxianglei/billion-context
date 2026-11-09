@@ -26,7 +26,7 @@ import { storeEffectiveSearchPlanAware } from "../decompress-shared.js";
 import { externalSummaryEnabled, messageTimestampSections } from "../external-summary-surface.js";
 import { estimateRawBodyTokens } from "../preflight.js";
 import { gcDumpDirIfConfigured } from "../state-gc.js";
-import { imageTokensInParsedBody } from "../image-tokens.js";
+import { countImagesInRawBody, imageTokensInParsedBody } from "../image-tokens.js";
 import { APIG_RESIGN_CREDENTIAL_HEADER, APIG_RESIGN_HEADER, APIG_RESIGN_SCHEME, clearSignedRefusal, decodeApigCredential, inboundSignedScheme, recordSignedRefusal, signedRefusal } from "../apig-resign.js";
 import { conflictScanEnabled, isDesignBenign, scanClientPlugins, sniffScanClient } from "../thirdparty-scan.js";
 import { recordConflict } from "../conflict-watch.js";
@@ -62,8 +62,8 @@ import { evaluateChain, extractChainCarriers } from "../chain-checkpoint.js";
 import { BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, isLoopbackAddress, normalizeUpstreamOrigin, provenCompletionReserve, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, type WireProtocol } from "../util.js";
 import { checkTunnelDestination, tunnelAllowlistFromEnv } from "../tunnel-guard.js";
 import { resolveCompatDropFields } from "../compat-drop.js";
-import { DecompressedTooLargeError, decodeRequestBody } from "../content-encoding.js";
-import { autoModeForgeEnabled, dshAuthoredCompactionEnabled, imageRescaleEnabled, limitsDecodedBytes as knobLimitsDecodedBytes, noInjectTool as knobNoInjectTool, rawDumpDir as knobRawDumpDir } from "../knobs.js";
+import { DecompressedTooLargeError, decodeRequestBody, IngestBodyTooLargeError } from "../content-encoding.js";
+import { autoModeForgeEnabled, dshAuthoredCompactionEnabled, imageRescaleEnabled, limitsDecodedBytes as knobLimitsDecodedBytes, limitsIngestBytes as knobLimitsIngestBytes, noInjectTool as knobNoInjectTool, rawDumpDir as knobRawDumpDir } from "../knobs.js";
 import { buildForgeResponse, classifierForgeVariant, estimateCjkTokens, isAutoModeClassifier, requestText, summarizeAction } from "../auto-mode-forge.js";
 import { extractConversationId, isV1BackgroundSideRequest, isV1InternalRequest, unwrapV1Internal } from "../v1internal.js";
 import { anthropicBetaContextWindow, BILI_HOP_HEADER, capRegistryWindowByStandard, expandedContextSuffixWindow, launcherContextWindow, launcherMaxOutput, noteUnresolvedModelSession, UNRESOLVED_MODEL_SESSION_THRESHOLD, windowSourceLogged } from "./context-window.js";
@@ -429,10 +429,42 @@ async function handleRequest(
         if (!passthroughMark && protocol !== null && bodyBuffer.length > 0) {
             try {
                 const decoded = await decodeRequestBody(headerValue(req, "content-encoding"), bodyBuffer, knobLimitsDecodedBytes(), { signal: decodingSignal, onBytes: (bytes) => admission.observe(bytes) });
+                // #5794: identity (uncompressed) bodies never fire the onBytes
+                // hook above — it only runs inside the decompression path — so
+                // they were invisible to the large-body slot budget (a 51.2 MiB
+                // plain-JSON body consumed no slot at all). Observe the decoded
+                // size here; idempotent — a compressed body already observed
+                // via onBytes is admitted and this no-ops.
+                admission.observe(decoded.body.byteLength);
+                // #5794 item 2: the slot budget above caps CONCURRENCY of large
+                // decodes; a SINGLE oversized body still burns the event loop
+                // for seconds in the JSON.parse + normalization sweep (the
+                // 51.2 MiB / 29,619-message incident: 5.5–7.2 s per round,
+                // 54.6% of local CPU, 747 s FATAL → cold caches for every
+                // session). Any TEXT-dominated parseable body above the ingest
+                // cost band is already ≥ ~8M tokens — beyond every real model
+                // window — so refuse it HERE, after decode (which can balloon
+                // 10:1) but before the sweep that costs the seconds. 0 disables
+                // the cap (legacy parse-everything).
+                //
+                // Image-bearing bodies are exempt on EVERY lane: base64 pixels
+                // are excluded from the token meter by design ("images billed
+                // separately, never doom on raw bytes" — #496/#1800/#857), so
+                // "over-band = over-window" does not hold for them. #3909's
+                // ~48 MiB image-dense chat requests and #3701's ~38.5 MiB
+                // WS-screenshot bodies are supported workloads governed by the
+                // slot budget, the receive cap and each lane's own shed /
+                // pre-send byte budget. The probe is a cheap substring gate,
+                // so the text-dump rejection (#5794's shape) stays parse-free.
+                const ingestCap = protocol === "responses" ? 0 : knobLimitsIngestBytes();
+                if (ingestCap > 0 && decoded.body.byteLength > ingestCap
+                    && countImagesInRawBody(protocol, decoded.body) === 0) {
+                    throw new IngestBodyTooLargeError(ingestCap, decoded.body.byteLength);
+                }
                 bodyBuffer = decoded.body;
                 if (decoded.decoded) delete req.headers["content-encoding"];
             } catch (decErr) {
-                if (decErr instanceof DecompressedTooLargeError || decErr instanceof DecodedRequestBusyError || decodingSignal.aborted) throw decErr;
+                if (decErr instanceof DecompressedTooLargeError || decErr instanceof IngestBodyTooLargeError || decErr instanceof DecodedRequestBusyError || decodingSignal.aborted) throw decErr;
                 // #619: bili can't decode this content-encoding -> don't 400. Drop
                 // protocol so the request falls to the verbatim passthrough below,
                 // relaying the ORIGINAL still-encoded bytes (the reassignment never
@@ -450,10 +482,10 @@ async function handleRequest(
             res.end(JSON.stringify({ error: { type: "request_body_busy", stage: "decode", message: err.message } }));
             return;
         }
-        if (err instanceof BodyTooLargeError || err instanceof DecompressedTooLargeError) {
+        if (err instanceof BodyTooLargeError || err instanceof DecompressedTooLargeError || err instanceof IngestBodyTooLargeError) {
             log("warn", `413: request body exceeds ${err.limit} bytes`);
             res.writeHead(413, { "content-type": "application/json" });
-            res.end(JSON.stringify({ error: { type: "request_too_large", stage: err instanceof BodyTooLargeError ? "receive" : "decode", message: err.message } }));
+            res.end(JSON.stringify({ error: { type: "request_too_large", stage: err instanceof IngestBodyTooLargeError ? "ingest" : err instanceof BodyTooLargeError ? "receive" : "decode", message: err.message } }));
             return;
         }
         log("warn", `failed to prepare inbound request (${String(err)}) - 400`);
@@ -2767,7 +2799,7 @@ async function handleRequest(
                     }
                     if (countTokens) {
                         return protocol === "google"
-                            ? prepareGoogleCountTokens(work as GoogleRequestBody, core, reqConfig, log, session)
+                            ? prepareGoogleCountTokens(work as GoogleRequestBody, core, reqConfig, log, session, googleModel ?? v1Model)
                             : prepareCountTokens(work as AnthropicRequestBody, core, reqConfig, log, session);
                     }
                     if (protocol === "google") {

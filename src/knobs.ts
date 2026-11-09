@@ -283,6 +283,12 @@ const DEFAULT_LIMITS_DECODED_BYTES = 10 * 1024 * 1024 * 1024;
 const DEFAULT_LIMITS_OUTBOUND_BYTES = 5 * 1024 * 1024 * 1024;
 const DEFAULT_WS_OUTBOUND_BYTES = 10 * 1024 * 1024;
 const DEFAULT_HTTP_OUTBOUND_BYTES = 10 * 1024 * 1024;
+// #5794: the ingest cost band (decoded bytes) that may run the JSON.parse /
+// normalization sweep. 32 MiB ≈ the observed 51.2 MiB/29,619-msg incident
+// (5.5–7.2 s per round, 54.6% of local CPU, 747 s event-loop FATAL); any
+// parseable body ABOVE it is already ≥ ~8M tokens = 5–10× the largest model
+// window, so it can never succeed. 0 = no ingest cap (legacy).
+const DEFAULT_INGEST_BODY_BYTES = 32 * 1024 * 1024;
 
 /** BILI_RECEIVE_BODY_BYTES > network.receiveBodyBytes > 5 GiB. Max inbound wire bytes
  *  read into memory per request. #3128: these were hardcoded 100 MiB constants; the
@@ -334,6 +340,29 @@ export function limitsWsOutboundBytes(): number {
 export function limitsHttpOutboundBytes(): number {
     const v = tInt("BILI_HTTP_OUTBOUND_BYTES", loadConfigFile().network?.httpOutboundBytes);
     return Number.isFinite(v) && v >= 0 ? Math.floor(v) : DEFAULT_HTTP_OUTBOUND_BYTES;
+}
+
+/** BILI_INGEST_BODY_BYTES > network.ingestBodyBytes > 32 MiB. Cost band for the
+ *  JSON.parse + normalization sweep AFTER decode (the 51.2 MiB #5794 body spent
+ *  seconds there per round). Bodies above it are refused before the sweep with
+ *  an actionable 413; any parseable body over 32 MiB is ≥ ~8M tokens, i.e.
+ *  beyond every real model window, so nothing valid is blocked. 0 disables the
+ *  ingest cap (legacy parse-everything). */
+export function limitsIngestBytes(): number {
+    const v = tInt("BILI_INGEST_BODY_BYTES", loadConfigFile().network?.ingestBodyBytes);
+    return Number.isFinite(v) && v >= 0 ? Math.floor(v) : DEFAULT_INGEST_BODY_BYTES;
+}
+
+// #5000 item 2: per-upstream hard cap on the messages[] array length — a wire
+// constraint no byte/token estimate expresses (the 26,903-message #5000 session
+// cleared every size gate and died at the upstream). Per-UPSTREAM on purpose:
+// there is no universal value, so the default is 0 = disabled; operators set
+// BILI_MAX_MESSAGES / network.maxMessages to their upstream's known limit and
+// over-limit bodies get an actionable 413 (restart / rewind) instead of a
+// guaranteed upstream 400. Count only — it never folds.
+export function limitsMaxMessages(): number {
+    const v = tInt("BILI_MAX_MESSAGES", loadConfigFile().network?.maxMessages);
+    return Number.isFinite(v) && v > 0 ? Math.floor(v) : 0;
 }
 
 // --- session persistence (was BILI_PERSIST_* env-only) ---

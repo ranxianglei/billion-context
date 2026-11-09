@@ -316,7 +316,7 @@ test("#1809: route registration rides the injected context's effect lifecycle", 
     }
 });
 
-type ElementNode = { type: string; props: Record<string, unknown> | null; children: unknown[] };
+type ElementNode = { type: string; props: Record<string, unknown> | null; children: unknown[]; closest?: (selector: string) => unknown };
 
 function collectText(node: unknown, out: string[]): void {
     if (typeof node === "string") {
@@ -529,8 +529,32 @@ async function mountClient(extra: Record<string, unknown>, slotName = "settings.
     let hookStates: unknown[] = [];
     let hookIndex = 0;
     let effectSlots: EffectSlot[] = [];
+    // React runs effects AFTER the commit, so a layout effect already sees the
+    // refs its render attached. Defer to the end of the render pass instead of
+    // running inline, or ref-based effects would always observe null.
+    let pendingEffects: Array<() => void> = [];
+    const runEffect = (fn: () => unknown | (() => void), deps?: readonly unknown[]): void => {
+        const i = hookIndex++;
+        const prev = effectSlots[i];
+        const prevDeps = prev?.deps;
+        const unchanged = prevDeps !== undefined && deps !== undefined &&
+            deps.length === prevDeps.length && deps.every((d, j) => Object.is(d, prevDeps[j]));
+        if (unchanged) return;
+        pendingEffects.push(() => {
+            prev?.cleanup?.();
+            const r = fn();
+            effectSlots[i] = { deps, cleanup: typeof r === "function" ? (r as () => void) : undefined };
+        });
+    };
     const reactStub = {
-        createElement: (type: string, props: Record<string, unknown> | null, ...children: unknown[]): ElementNode => ({ type, props, children }),
+        createElement: (type: string, props: Record<string, unknown> | null, ...children: unknown[]): ElementNode => {
+            const node: ElementNode = { type, props, children };
+            node.closest = (selector: string): unknown =>
+                typeof extra.__closest === "function" ? (extra.__closest as (s: string) => unknown)(selector) : null;
+            const ref = props?.ref;
+            if (typeof ref === "object" && ref !== null) (ref as { current: unknown }).current = node;
+            return node;
+        },
         useState: (init: unknown): [unknown, (v: unknown) => void] => {
             const i = hookIndex++;
             if (!(i in hookStates)) hookStates[i] = typeof init === "function" ? (init as () => unknown)() : init;
@@ -538,16 +562,12 @@ async function mountClient(extra: Record<string, unknown>, slotName = "settings.
             // components using setX(x => x+1) would store the closure itself.
             return [hookStates[i], (v: unknown) => { hookStates[i] = typeof v === "function" ? (v as (prev: unknown) => unknown)(hookStates[i]) : v; }];
         },
-        useEffect: (fn: () => unknown | (() => void), deps?: readonly unknown[]): void => {
+        useEffect: runEffect,
+        useLayoutEffect: runEffect,
+        useRef: (init: unknown): { current: unknown } => {
             const i = hookIndex++;
-            const prev = effectSlots[i];
-            const prevDeps = prev?.deps;
-            const unchanged = prevDeps !== undefined && deps !== undefined &&
-                deps.length === prevDeps.length && deps.every((d, j) => Object.is(d, prevDeps[j]));
-            if (unchanged) return;
-            prev?.cleanup?.();
-            const r = fn();
-            effectSlots[i] = { deps, cleanup: typeof r === "function" ? (r as () => void) : undefined };
+            if (!(i in hookStates)) hookStates[i] = { current: init ?? null };
+            return hookStates[i] as { current: unknown };
         },
     };
     const requireStub = (spec: string): unknown => {
@@ -592,14 +612,19 @@ async function mountClient(extra: Record<string, unknown>, slotName = "settings.
         // identity as the entry's props; the test may mirror that explicitly.
         component: (): unknown => {
             hookIndex = 0;
-            return renderProps === undefined
+            const tree = renderProps === undefined
                 ? bound()
                 : (bound as unknown as (props: unknown) => unknown)(renderProps);
+            const queued = pendingEffects;
+            pendingEffects = [];
+            for (const run of queued) run();
+            return tree;
         },
         resetHooks: () => {
             hookStates = [];
             hookIndex = 0;
             effectSlots = [];
+            pendingEffects = [];
         },
         runCleanups: () => {
             // #4432: release the sandbox clock first — the poll chains the
@@ -2145,4 +2170,80 @@ test("#4254: shell.overlay upstream-unavailable pill polls /__bili/upstreams, re
     assert.ok(!gt.includes("no-host-entry") && !gt.includes("not-an-object"), "malformed entries are dropped");
     assert.ok(gt.includes("1 个上游不可用"), "header counts only surviving rows");
     g.runCleanups();
+});
+
+
+// #4406: the Context tab is a read-only report face, yet the host renders its
+// whole composer stack (input bar + todo/goal/queue docks) under EVERY
+// conversation view. The tab marks the conversation scroll container and
+// carries the scoped CSS that hides the seat, while approval / question /
+// plan-review takeovers — the only interactions this face still needs — stay
+// visible through the :not(:has(...)) carve-out.
+test("#4406: the Context tab marks the conversation scroll container and hides the host composer seat", async () => {
+    const ORIGIN = "http://127.0.0.1:8787";
+    const scrollAttrs = new Map<string, string>();
+    const scrollEl = {
+        setAttribute: (name: string, value: string): void => {
+            scrollAttrs.set(name, value);
+        },
+        removeAttribute: (name: string): void => {
+            scrollAttrs.delete(name);
+        },
+    };
+    const styles: Array<{ attrs: Record<string, string>; textContent: string }> = [];
+    const documentStub = {
+        querySelector: (selector: string): unknown =>
+            selector === "style[data-bili-surface]" && styles.length > 0 ? styles[0] : null,
+        createElement: (_tag: string): { attrs: Record<string, string>; textContent: string; setAttribute: (k: string, v: string) => void } => {
+            const el = {
+                attrs: {} as Record<string, string>,
+                textContent: "",
+                setAttribute: (k: string, v: string): void => {
+                    el.attrs[k] = v;
+                },
+            };
+            return el;
+        },
+        head: {
+            appendChild: (el: { attrs: Record<string, string>; textContent: string }): void => {
+                styles.push(el);
+            },
+        },
+    };
+
+    const m = await mountClient({
+        __BILI__: { origin: ORIGIN },
+        document: documentStub,
+        __closest: (selector: string): unknown => (selector === "[data-conversation-scroll]" ? scrollEl : null),
+        fetch: async (url: string) => {
+            const u = String(url);
+            if (u.endsWith("/bili/origin")) return { ok: true, json: async () => ({ origin: ORIGIN }) };
+            if (u.endsWith("/__bili/?embed=1")) return htmlOk();
+            return { ok: true, json: async () => ({ ok: false }) };
+        },
+        setTimeout,
+        clearTimeout,
+        setInterval: (() => 0) as unknown as typeof setInterval,
+        clearInterval: (() => {}) as unknown as typeof clearInterval,
+    }, "conversation.view", { sessionId: "conv-dsh-main" });
+
+    m.resetHooks();
+    m.component();
+    assert.equal(styles.length, 1, "one scoped style tag carries the rule");
+    assert.equal(styles[0].attrs["data-bili-surface"], "");
+    assert.ok(
+        styles[0].textContent.includes("[data-conversation-scroll][data-bili-surface]>[data-composer-seat]"),
+        "the rule targets the host composer seat under the marked scroll container",
+    );
+    assert.ok(
+        styles[0].textContent.includes(":not(:has([data-approval-key],[data-question-key],[data-plan-review-key]))"),
+        "approval / question / plan-review takeovers stay visible",
+    );
+    assert.equal(scrollAttrs.get("data-bili-surface"), "", "the conversation scroll container carries the marker");
+
+    m.component();
+    assert.equal(styles.length, 1, "the style is injected once per page, not once per render");
+
+    m.runCleanups();
+    assert.equal(scrollAttrs.has("data-bili-surface"), false, "leaving the tab drops the marker");
 });

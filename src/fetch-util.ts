@@ -1,6 +1,6 @@
 import { Agent } from "undici";
 import { currentFetchTransport } from "./fetch-transport.js";
-import { classifyUpstreamFailure, isFailFastUpstreamKind } from "./upstream-fail.js";
+import { classifyUpstreamFailure, isFailFastUpstreamKind, UPSTREAM_FIRST_BYTE_TIMEOUT_CODE } from "./upstream-fail.js";
 import { _resetUpstreamCaForTest, upstreamCaIdentity, upstreamExtraCa } from "./upstream-ca.js";
 import {
     upstreamTimeoutMs as knobUpstreamTimeoutMs,
@@ -199,6 +199,17 @@ export async function fetchWithTimeout(
     // streaming) re-arms to the full idle budget, preserving the #1706/#1714
     // guarantee that long silent prefills/streams are never truncated.
     const firstByteBudget = Math.min(timeoutMs ?? Number.POSITIVE_INFINITY, knobUpstreamFirstByteMs());
+    // #5807/#5831: a first-byte timeout is only REPLAYABLE when the operator
+    // explicitly tightened the first-byte budget below the idle budget — that
+    // is the only case where "silence before the first byte" is bounded by a
+    // small, deliberate number rather than the 12-min default (whose unset
+    // value must stay byte-identical to the legacy single-phase watchdog, and
+    // whose 3× stacking across retries is exactly what the #5831 decision ruled
+    // out). firstByteBudget < effective ⇔ the first-byte source (the knob when
+    // set, else the resolved idle) is strictly tighter than the effective full
+    // budget — e.g. a tightened knob, or a caller timeout LONGER than it.
+    const firstByteIsSplit = firstByteBudget < effective;
+    let firstByteTripped = false;
     const controller = new AbortController();
     let cleared = false;
     let phase: "first-byte" | "body" = "first-byte";
@@ -213,6 +224,7 @@ export async function fetchWithTimeout(
             // explained it (#5904 forensics: 300s of total silence). Name the
             // phase and budget every time it trips.
             log("warn", `upstream watchdog fired (${phase} phase, ${delayMs}ms budget) — ${String(opts.method ?? "GET")} ${safeUrl()} aborted: ${phase === "first-byte" ? "no response headers" : "no body chunk"} in budget`);
+            if (phase === "first-byte" && firstByteIsSplit) firstByteTripped = true;
             controller.abort();
         }, idleTimerDelayOverrideMs ?? delayMs);
         liveUpstreamTimers.add(t);
@@ -306,6 +318,17 @@ export async function fetchWithTimeout(
         return { response: raw, clearTimer: cleanup, stopIdleTimer };
     } catch (e) {
         cleanup();
+        // #5807/#5831: carry the phase-1 cause so the classifier can give it its
+        // own, replayable kind. Preserve name/message (downstream code keys off
+        // name === "AbortError", e.g. preflight's abort/timeout sniff) and keep
+        // the original as `cause` so chainOf() still sees the real AbortError
+        // beneath the marker.
+        if (firstByteTripped && e instanceof Error) {
+            const marked = new Error(e.message, { cause: e }) as Error & { code: string };
+            marked.name = e.name;
+            marked.code = UPSTREAM_FIRST_BYTE_TIMEOUT_CODE;
+            throw marked;
+        }
         throw e;
     }
 }

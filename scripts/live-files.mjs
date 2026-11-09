@@ -117,6 +117,13 @@ export const LIVE_FILES = [
     // network I/O and binds no port, so no zone band is needed — the entry is for
     // the tripwire alone, like #3890/#5114
     "tests/cache-keepalive.test.ts",
+    // #5955: the only real child is ONE bare `node -e ""` spawned purely to
+    // hand back an already-reaped pid (win32 taskkill-then-SIGKILL silence);
+    // the takeover ladder itself runs on INJECTED deps — no proxy is started,
+    // no port is bound, no shutdown/kill signal ever reaches the OS. Fixed
+    // fake origins only, so no zone band is needed — the entry is for the
+    // tripwire alone, like #3890/#5114/#5666
+    "tests/issue5955-wedged-same-lane-takeover.test.ts",
     // #5940: the wiring facet spawnSyncs one bare node child (--import tsx) that
     // drives the real background quick_check worker on a per-run mkdtemp fixture
     // DB; the spawn is synchronous (blocks the shard runner while it runs), the

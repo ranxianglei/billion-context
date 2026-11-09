@@ -190,6 +190,7 @@ function isReasoningRequiredError(e: unknown): boolean {
 const TRANSPORT_FAILURE_LABELS: Record<UpstreamFailureKind, string> = {
     "client-abort": "aborted",
     "upstream-timeout": "upstream timeout",
+    "upstream-headers-timeout": "upstream sent no first byte in time",
     "proxy-reset": "connection reset by an intermediate proxy",
     "upstream-reset": "connection reset by the upstream",
     "connect-refused": "connection refused",
@@ -1125,9 +1126,12 @@ export async function* runCompressLoop(
                     finishReason !== "failed" &&
                     finishReason !== "incomplete" &&
                     finishReason !== "error" &&
-                    assistantText.length === 0 &&
+                    // #732 follow-up: trim, so whitespace-only text ("\n\n") must not bar
+                    // the retry — it is invisible to host turn semantics, same class as
+                    // the reasoning prefix. (The truncation gates keep the raw
+                    // forwardedVisible: they need forwarded-not-parsed semantics.)
+                    assistantText.trim().length === 0 &&
                     calls.length === 0 &&
-                    !forwardedVisible &&
                     !signal?.aborted
                 ) {
                     degenerateRetried = true;
@@ -1224,6 +1228,28 @@ export async function* runCompressLoop(
                     }
                 }
                 break;
+            }
+
+            // #732 follow-up (observability only): the one-shot PER-REQUEST retry budget
+            // (degenerateRetried — shared with the #2303 draft-tail path, never reset per
+            // round) was already spent earlier in this request, and THIS round still ended
+            // degenerate — zero visible output, no tool call — so nothing will retry it.
+            // The host nudge is the only remaining safety net; make the fleet able to
+            // count these pass-throughs.
+            if (
+                degenerateRetried &&
+                sawDone &&
+                !truncatedDone &&
+                !suppressCompletion &&
+                typeof finishReason === "string" &&
+                finishReason !== "failed" &&
+                finishReason !== "incomplete" &&
+                finishReason !== "error" &&
+                assistantText.trim().length === 0 &&
+                calls.length === 0 &&
+                !signal?.aborted
+            ) {
+                loggerLog("warn", `[acp-loop] degenerate-turn DOUBLE-degenerate: degenerate terminal turn after the per-request retry budget was already spent, round ${round} (session ${ctx.session.id}) — passing through; host nudge is the remaining safety net (#732 follow-up)`);
             }
 
             if (

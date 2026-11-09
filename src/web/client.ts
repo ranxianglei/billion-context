@@ -3212,6 +3212,14 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         // #2904: no-ceiling output-budget pin — surface at the top of the detail
         // so GUI users see WHY long turns truncate (the /acp twin).
         if (d.outputBudgetDegraded) parts.push('<div class="banner warn show" style="margin-bottom:12px">' + escapeHtml(t("det.obudget_degraded", { model: d.outputBudgetDegraded.model, value: d.outputBudgetDegraded.value })) + "</div>");
+        if (d.contextAnalysis && d.contextAnalysis.text) {
+            // Context analysis: init size / nudge cadence / harvest acceptance /
+            // plain-language verdict — the question that used to take hours of
+            // manual log forensics (session-aedc188c investigation, 2026-11-08).
+            const ca = d.contextAnalysis;
+            const lines = ca.text.split("\\n").map((l) => "<div>" + escapeHtml(l) + "</div>");
+            parts.push('<div class="card" style="margin-top:16px"><div class="card-h"><span>' + t("det.context_analysis") + '</span><span class="hint">' + t("det.context_analysis_hint") + '</span></div><div class="card-b"><div class="mono small" style="line-height:1.8">' + lines.join("") + '</div></div></div>');
+        }
         if (Array.isArray(d.conflicts) && d.conflicts.length > 0) {
             // #2102: per-session evidence rows — the banner aggregates across sessions,
             // so this page is where its detail pointer lands.
