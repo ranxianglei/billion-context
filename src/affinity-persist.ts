@@ -3,6 +3,7 @@ import path from "node:path";
 import { prefixAffinity, type AffinitySnapshotEntry, MAX_TRACKED_SESSIONS } from "./prefix-affinity.js";
 import { stateDir } from "./paths.js";
 import { log } from "./logger.js";
+import { persistDebounceMs, persistMaxDelayMs } from "./knobs.js";
 
 /**
  * #499 P1a: prefix-affinity persistence. The anonymous affinity chains were
@@ -18,9 +19,10 @@ import { log } from "./logger.js";
  *  lost EVERYTHING since the last flush, not just 5s worth), and the
  *  max-delay budget caps how long a pending write can be starved: the file
  *  is on disk within ~500ms of the last mutation, or within 5s under
- *  sustained traffic — previously a flat 5s trailing window. */
-const PERSIST_DEBOUNCE_MS = 500;
-const PERSIST_MAX_DELAY_MS = 5_000;
+ *  sustained traffic — previously a flat 5s trailing window. Both windows
+ *  resolve through the shared persist.* knobs (#6062: under sustained
+ *  traffic the max-delay cap, not the debounce, sets the steady-state
+ *  rewrite rate); defaults keep the historical 500ms / 5s. */
 
 function affinityFile(): string {
     return path.join(stateDir(), "prefix-affinity.json");
@@ -131,13 +133,13 @@ export function scheduleAffinityPersist(): void {
     const now = Date.now();
     if (pendingSince === null) pendingSince = now;
     if (timer) clearTimeout(timer);
-    const budget = PERSIST_MAX_DELAY_MS - (now - pendingSince);
+    const budget = persistMaxDelayMs() - (now - pendingSince);
     timer = setTimeout(
         () => {
             timer = null;
             writeSnapshot();
         },
-        Math.max(0, Math.min(PERSIST_DEBOUNCE_MS, budget)),
+        Math.max(0, Math.min(persistDebounceMs(), budget)),
     );
     timer.unref?.();
 }

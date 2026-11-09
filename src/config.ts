@@ -2369,6 +2369,7 @@ type FileConfig = {
         enabled?: boolean;
         zstd?: boolean;
         debounceMs?: number;
+        maxDelayMs?: number;
         tailTokens?: number;
         epermAlertThreshold?: number;
         epermAlertRepeatMs?: number;
