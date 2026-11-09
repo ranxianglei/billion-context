@@ -147,14 +147,13 @@ export function resetEgressModuleCache(): void {
     moduleCache.clear();
 }
 
-function coerceModule(def: unknown, absPath: string): EgressTransformModule | null {
+function coerceModule(def: unknown): EgressTransformModule | null {
     if (!isRecord(def) || typeof def.transform !== "function") return null;
     const mod: EgressTransformModule = { transform: def.transform as EgressTransformModule["transform"] };
     if (typeof def.id === "string") mod.id = def.id;
     if (typeof def.priority === "number" && Number.isFinite(def.priority)) mod.priority = def.priority;
     mod.match = coerceMatch(def.match);
     if (typeof def.timeoutMs === "number" && Number.isFinite(def.timeoutMs) && def.timeoutMs > 0) mod.timeoutMs = def.timeoutMs;
-    void absPath;
     return mod;
 }
 
@@ -170,7 +169,7 @@ async function loadModule(absPath: string): Promise<LoadedModule> {
         // stable, so the same URL is reused (consistent mid-session behavior).
         const v = statSync(absPath).mtimeMs;
         const ns = await import(`${pathToFileURL(absPath).href}?v=${v}`);
-        const coerced = coerceModule(ns.default, absPath);
+        const coerced = coerceModule(ns.default);
         if (coerced === null) throw new Error("default export must be an object with a transform(ctx) function");
         result = { ok: true, mod: coerced };
     } catch (e) {
