@@ -280,6 +280,13 @@ function armedRefusalReceipt(n: number, decayMinutes: number): string {
     return `[Compression refused: this call carried no usable ranges and the compress circuit breaker is still armed (${n} consecutive failures) — while it stays armed, repeat parse-failure lectures are withheld. Format reminder: 'content' must be a non-empty array whose elements are {startId, endId, summary} objects with mNNNNN refs from your visible history. The breaker disarms on one successful fold or ${decayMinutes} minutes without a failing call. Continue your task without compressing.]`;
 }
 
+// #5986 review fix: the observed failure mode after a compress rejection is the
+// model getting entangled in compression bookkeeping and then stopping out —
+// every parse-failure receipt ends with this explicit return-to-task instruction
+// (the armed-breaker one-liner above already carries its own "Continue your task
+// without compressing.", so it is left untouched).
+const RETURN_TO_TASK_SUFFIX = " This failure only concerns the compress call. Return to the original task now and continue it (visible output or a tool call).";
+
 /** #2146: record one total compress failure (any spec) and return "" while
  *  healthy, or the pause paragraph to embed in the receipt once the
  *  consecutive-failure threshold is reached. Only failed-call receipts carry
@@ -1103,11 +1110,11 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
             return compressResult(armedRefusalReceipt(armedDetail.n, armedDetail.decayMinutes), "refused", 0, `parse:${diagnostics.kind}`);
         }
         if (isEmptyCall) {
-            return compressResult(`[Compression FAILED: the call carried no content at all (kind=${diagnostics.kind}) — an empty compress() compresses nothing and can never succeed. Do NOT re-issue an empty call; if you meant to compress, put content as ONE non-empty string in that SAME single call — each block headed by a 'mNNNNN–mNNNNN optional topic' line followed by its summary markdown (a JSON-encoded array of {startId, endId, summary} objects is also accepted INSIDE that same string).${guard}${loopGuard}]`, "refused", 0, `parse:${diagnostics.kind}`);
+            return compressResult(`[Compression FAILED: the call carried no content at all (kind=${diagnostics.kind}) — an empty compress() compresses nothing and can never succeed. Do NOT re-issue an empty call; if you meant to compress, put content as ONE non-empty string in that SAME single call — each block headed by a 'mNNNNN–mNNNNN optional topic' line followed by its summary markdown (a JSON-encoded array of {startId, endId, summary} objects is also accepted INSIDE that same string).${guard}${loopGuard}${RETURN_TO_TASK_SUFFIX}]`, "refused", 0, `parse:${diagnostics.kind}`);
         }
         if (argCorruption) {
             const truncNote = diagnostics.kind === "truncated" ? " (looks truncated)" : "";
-            return compressResult(`[Compression FAILED: the call's arguments (${argLen} chars) were not parseable JSON${truncNote} — the intended content was lost and nothing was compressed. Re-issue ONE compress call whose arguments parse as a single object with a STRING 'content' field: {"content": "<each block headed 'mNNNNN–mNNNNN optional topic', its summary on the following lines>"}. Never send 'content' as an actual JSON array or nested object — it is one plain string.${guard}${loopGuard}]`, "refused", 0, `parse:${diagnostics.kind}`);
+            return compressResult(`[Compression FAILED: the call's arguments (${argLen} chars) were not parseable JSON${truncNote} — the intended content was lost and nothing was compressed. Re-issue ONE compress call whose arguments parse as a single object with a STRING 'content' field: {"content": "<each block headed 'mNNNNN–mNNNNN optional topic', its summary on the following lines>"}. Never send 'content' as an actual JSON array or nested object — it is one plain string.${guard}${loopGuard}${RETURN_TO_TASK_SUFFIX}]`, "refused", 0, `parse:${diagnostics.kind}`);
         }
         const recovery = loopGuard === "" ? compressionRecovery(ctx) : { hint: "", canRetry: false };
         const retry = recovery.canRetry ? " Re-issue the compress call using those eligible refs." : "";
@@ -1119,7 +1126,7 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         const notArrayHint = diagnostics.kind === "content-not-array"
             ? " If your 'content' string encoded a single JSON object, wrap it in square brackets so it encodes an ARRAY of entries (\"[...]\"), or use the line-form headers below."
             : "";
-        return compressResult(`[Compression FAILED: no valid ranges parsed (kind=${diagnostics.kind}, dropped=${diagnostics.invalidItems}).${why}${notArrayHint} compress takes ONE 'content' STRING holding every range: each block starts with its header line 'mNNNNN–mNNNNN optional topic' followed by that block's summary markdown; a JSON-encoded array of {startId, endId, summary} objects is also accepted INSIDE that same string. startId/endId are mNNNNN message refs from the conversation (call acp_status to see current refs).${recovery.hint}${retry}${guard}${loopGuard} This failure only concerns the compress call. Return to the original task now and continue it (visible output or a tool call).]`, "refused", 0, `parse:${diagnostics.kind}`);
+        return compressResult(`[Compression FAILED: no valid ranges parsed (kind=${diagnostics.kind}, dropped=${diagnostics.invalidItems}).${why}${notArrayHint} compress takes ONE 'content' STRING holding every range: each block starts with its header line 'mNNNNN–mNNNNN optional topic' followed by that block's summary markdown; a JSON-encoded array of {startId, endId, summary} objects is also accepted INSIDE that same string. startId/endId are mNNNNN message refs from the conversation (call acp_status to see current refs).${recovery.hint}${retry}${guard}${loopGuard}${RETURN_TO_TASK_SUFFIX}]`, "refused", 0, `parse:${diagnostics.kind}`);
     }
     // #847: detect reversed refs as SUBMITTED, before #1001 normalization
     // rewrites them (order matters — normalizeRangeOrder mutates in place).
