@@ -430,8 +430,9 @@ test("#5955 full path: kill fails → fall through to normal spawn, ledger kept,
     const entries = readLedger();
     assert.equal(Object.keys(entries).length, 1, "surviving occupant keeps its ledger entry for the retry");
     // Five bring-ups, five observations — but the ledger's documented worst case
-    // is a lost read-modify-write (readWedgedLedger contract: "the worst case
-    // loses one observation ... which is safe"), so tolerate exactly that one
+    // is a lost read-modify-write (wedged-takeover ledger contract in
+    // src/launcher.ts: "the worst case loses one observation ... which is
+    // safe"), so tolerate exactly that one
     // loss instead of turning an fs-timing hiccup into a CI flake. Anything
     // below 4 means observations are NOT bridging the gap (the patience window
     // would restart every cycle and the takeover could never fire).
