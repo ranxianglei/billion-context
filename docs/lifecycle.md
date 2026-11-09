@@ -113,6 +113,8 @@
 | `BILI_OUTBOUND_BODY_BYTES` | network.outboundBodyBytes，5 GiB——重建后转发上游的硬上限（#3128） |
 | `BILI_WS_OUTBOUND_BYTES` | network.wsOutboundBytes，10 MiB——WS 车道出站软预算：超限先把旧的非保护图归档/降采样再发送（#3701：网关对大帧 close 1009；0 关闭预发送削减；HTTP 车道不受影响） |
 | `BILI_HTTP_OUTBOUND_BYTES` | network.httpOutboundBytes，10 MiB——普通/代理/pi 原生 HTTP 中继车道出站软预算：超限先把旧的非保护图归档/降采样再发送（#3909：图片密集会话按字节/像素解码 CPU 被上游拒收、token 折叠不触发；仅在无受管传输时生效，受管 HTTP/dsh-inline 从不裁减 #3701 Finding 1；0 关闭） |
+| `BILI_INGEST_BODY_BYTES` | network.ingestBodyBytes，32 MiB——解码后进入 JSON.parse+归一化清扫的成本带（#5794：51.2 MiB 体每轮吞 5.5–7.2s 事件循环 → 747s FATAL；超带的**文本为主**体即 413，因为任何可解析的 32 MiB+ 文本体 ≥ ~8M token、超过一切真实窗口；带图片的体豁免——像素按设计不进 token 计量，由槽位预算/收件上限/车道 shed 治理（#496/#3909/#3701）；0 关闭） |
+| `BILI_MAX_MESSAGES` | network.maxMessages，默认 0（关闭）——单上游 messages[] 数组长度硬限（COUNT 维度，任何字节/token 估算都表达不了；#5000：26,903 条消息体清掉所有尺寸闸仍在上游死掉；超限 413 提示 restart/rewind，不做折叠；按上游各自设置） |
 | `BILI_CACHE_KEEPALIVE`（#3376） | unset（false；同 `cacheKeepalive.enabled` 层级 env 覆盖） |
 | `BILI_CACHE_KEEPALIVE_ASSUME_TTL` | unset（从 body cache_control 断点探测） |
 | `BILI_CACHE_KEEPALIVE_TTL_FACTOR` | 0.9 |

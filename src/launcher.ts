@@ -36,11 +36,12 @@ import path from "node:path";
 import { createRequire } from "node:module";
 import { Worker } from "node:worker_threads";
 import { pathToFileURL } from "node:url";
-import { execFileSync, spawn, spawnSync, type StdioOptions } from "node:child_process";
+import { execFile, execFileSync, spawn, spawnSync, type StdioOptions } from "node:child_process";
 import { DEFAULT_MITM_DOMAINS } from "./mitm.js";
 import { isPrivateUpstreamHost } from "./private-host.js";
 import { redactProxyUrl } from "./upstream-fail.js";
 import {
+    atomicWriteJson,
     claimStartingMarker,
     clearStartingMarker,
     discoverLiveInstances,
@@ -56,6 +57,7 @@ import {
     type ProxyInstanceFile,
     type ProxyStartingMarker,
 } from "./instance.js";
+import { stateDir } from "./paths.js";
 import { TWIN_ADOPT_EXIT_CODE } from "./listen-policy.js";
 import { tcpConnectable } from "./liveness.js";
 import { selfPackageRoot, isBiliPiEntry, ompPluginLoadedFrom, dshNativeInstalled, claudeNativeInstalled, piPackageStrings } from "./plugin-install.js";
@@ -327,8 +329,10 @@ export interface LauncherDeps {
      *  Default hits the real endpoint; tests stub it. */
     fetchHealthInfoNoReuse?: (origin: string) => Promise<HealthInfo | undefined>;
     /** #3544: ask a stale resident to drain+exit (POST /__bili/shutdown).
+     *  The optional budget lets a caller shorten the request timeout for a
+     *  holder that is already known-unresponsive (#5955 wedged takeover).
      *  Default hits the real endpoint; tests stub it. */
-    requestInstanceShutdown?: (origin: string) => Promise<boolean>;
+    requestInstanceShutdown?: (origin: string, timeoutMs?: number) => Promise<boolean>;
     /** #1292: simulated OS for spawn planning and platform-gated arg
      *  construction — tests drive win32 paths from a POSIX host. Defaults
      *  to process.platform. */
@@ -351,6 +355,21 @@ export interface LauncherDeps {
     /** #3654: registry view behind serving-twin adoption after exit code 3
      *  (default: discoverLiveInstances, instance.ts). */
     listAdoptCandidates?: () => ProxyInstanceFile[];
+    /** #5955: graceful termination REQUEST for an escalated wedged holder —
+     *  POSIX SIGTERM (a saturated-but-yielding loop can still drain); win32
+     *  has no graceful node signal, so the default no-ops and the caller goes
+     *  straight to the hard kill. Tests inject a recorder. */
+    signalWedgedHolder?: (pid: number) => void;
+    /** #5955: unconditional hard-kill of an escalated wedged holder (POSIX
+     *  SIGKILL / win32 taskkill /F /T tree-kill, mirroring killAbandonedChild).
+     *  Tests inject a recorder so no real pid is ever touched. */
+    killWedgedHolder?: (pid: number) => void;
+    /** #5955: where the wedged-holder observation ledger persists (state dir by
+     *  default via wedgedLedgerFilePath(); tests point it at a scratch file). */
+    wedgedLedgerPath?: () => string;
+    /** #5955: process birth-stamp lookup for PID-reuse detection in the ledger
+     *  key (default: processBirthStamp — /proc on linux, ps/powershell elsewhere). */
+    processBirthStamp?: (pid: number) => Promise<string | undefined>;
 }
 
 export function isLaunchClient(value: string): value is ClientName {
@@ -2358,9 +2377,14 @@ export function refreshOverlayHome(
     realHome: string,
     overlay: string,
     generatedFile: string | string[],
-    opts?: { sharedSqlite?: boolean },
+    opts?: { sharedSqlite?: boolean; localOnlyEntries?: ReadonlySet<string> },
 ): boolean {
     const sharedSqlite = opts?.sharedSqlite === true;
+    // #5584: entries the client owns INSIDE the overlay (codex's .tmp staging).
+    // Never linked in from the real home, never merged back into it, and a stale
+    // escaping symlink left by a pre-fix launch is dropped so the client recreates
+    // them as genuine per-overlay paths (their git repos then stay inside home).
+    const localOnlyEntries = opts?.localOnlyEntries;
     const generatedFiles = new Set(Array.isArray(generatedFile) ? generatedFile : [generatedFile]);
     const isGeneratedDraft = (name: string): boolean =>
         [...generatedFiles].some((g) => name.startsWith(`.${g}.`) && name.endsWith(".tmp"));
@@ -2428,6 +2452,16 @@ export function refreshOverlayHome(
             try {
                 st = fs.lstatSync(overlayPath);
             } catch {
+                continue;
+            }
+            // #5584: local-only entries are owned by the client running under this
+            // overlay. A real dir/file is left untouched (never merged back); a
+            // stale escaping symlink from a pre-fix launch is dropped so the client
+            // recreates it as a genuine per-overlay path.
+            if (localOnlyEntries?.has(entry)) {
+                if (st.isSymbolicLink()) {
+                    try { fs.unlinkSync(overlayPath); } catch {}
+                }
                 continue;
             }
             if (st.isSymbolicLink()) {
@@ -2519,6 +2553,7 @@ export function refreshOverlayHome(
         for (const entry of copyPhaseEntries) {
             if (generatedFiles.has(entry)) continue;
             if (sharedSqlite && realDbMembers.has(entry)) continue;
+            if (localOnlyEntries?.has(entry)) continue;
             total += 1;
             const overlayPath = path.join(overlay, entry);
             let present = false;
@@ -3135,13 +3170,14 @@ export function renderCodexDotEnv(userText: string | undefined, values: { origin
  *  (both generations survive, loser as .bili-conflict).
  *
  *  Returns true when nothing remains pending in the overlay. */
-export function finalizeCodexHome(realHome: string, overlay: string, generatedFiles?: readonly string[]): boolean {
+export function finalizeCodexHome(realHome: string, overlay: string, generatedFiles?: readonly string[], localOnlyEntries?: ReadonlySet<string>): boolean {
     const generatedSet = new Set<string>(generatedFiles ?? []);
     const isExcluded = (name: string): boolean =>
         name === SQLITE_ORIGIN_FILE ||
         name === `${SQLITE_ORIGIN_FILE}.tmp` ||
         name === path.basename(overlayLockPath(overlay)) ||
         name === path.basename(overlayLeaseDir(overlay)) || // release-failure residue must never merge into the real home
+        localOnlyEntries?.has(name) === true || // #5584: codex's .tmp stays overlay-owned; never merged back nor relinked
         generatedSet.has(name) ||
         [...generatedSet].some((g) => name.startsWith(`.${g}.`) && name.endsWith(".tmp"));
     let overlayEntries: string[];
@@ -3215,6 +3251,14 @@ export function finalizeCodexHome(realHome: string, overlay: string, generatedFi
  *  directory per session. */
 const CODEX_SESSION_SLOT_MAX = 16;
 
+/** #5584: codex keeps its marketplace/plugin git checkouts under $CODEX_HOME/.tmp.
+ *  Sharing that directory into the overlay via a symlink makes every repo's canonical
+ *  path resolve back into the REAL home, so codex's "trusted Git repository root escapes
+ *  Codex home" containment check rejects each git-backed marketplace update under bili.
+ *  The overlay must own .tmp itself — never link it in from the real home, never merge
+ *  it back out — so those repos stay inside the active home. */
+const CODEX_LOCAL_ONLY_HOME_ENTRIES: ReadonlySet<string> = new Set([".tmp"]);
+
 /** #3203: claim a free per-session slot for this launch. Each slot is an
  *  ordinary overlay with its own lease — concurrent claims serialize on the
  *  atomic lock mkdir, so two launches never share a slot; a slot held by a
@@ -3262,7 +3306,7 @@ function migrateLegacyCodexOverlay(codexHome: string): void {
     if (!st.isDirectory()) return;
     acquireOverlayLease(legacy);
     try {
-        finalizeCodexHome(codexHome, legacy, [".env", "config.toml"]);
+        finalizeCodexHome(codexHome, legacy, [".env", "config.toml"], CODEX_LOCAL_ONLY_HOME_ENTRIES);
     } finally {
         releaseOverlayLease();
     }
@@ -3391,7 +3435,7 @@ export function prepareCodexHome(opts: {
     } else {
         overlay = `${codexHome}-bili`;
     }
-    if (!refreshOverlayHome(codexHome, overlay, generatedFiles, { sharedSqlite: opts.sharedSqlite })) return undefined;
+    if (!refreshOverlayHome(codexHome, overlay, generatedFiles, { sharedSqlite: opts.sharedSqlite, localOnlyEntries: CODEX_LOCAL_ONLY_HOME_ENTRIES })) return undefined;
     if (manageDotEnv) {
         try {
             const st = fs.lstatSync(path.join(overlay, ".env"));
@@ -4873,7 +4917,7 @@ const OWNER_HEARTBEAT_POST_TIMEOUT_MS = 2_000;
 const WATCHER_REG_ATTEMPTS = 3;
 const WATCHER_REG_RETRY_BACKOFF_MS = 500;
 
-export async function requestInstanceShutdown(origin: string): Promise<boolean> {
+export async function requestInstanceShutdown(origin: string, timeoutMs: number = SHUTDOWN_REQUEST_TIMEOUT_MS): Promise<boolean> {
     try {
         const res = await fetch(`${origin}/__bili/shutdown`, {
             method: "POST",
@@ -4882,7 +4926,7 @@ export async function requestInstanceShutdown(origin: string): Promise<boolean> 
             // would only extend the drain it is about to run.
             headers: { "content-type": "application/json", connection: "close" },
             body: "{}",
-            signal: AbortSignal.timeout(SHUTDOWN_REQUEST_TIMEOUT_MS),
+            signal: AbortSignal.timeout(timeoutMs),
         });
         return res.ok;
     } catch {
@@ -4956,6 +5000,326 @@ async function rotateStalePredecessor(
         }
         await sleep(HEALTH_POLL_INTERVAL_MS);
     }
+}
+
+// #5955: the decision table had one uncovered cell — a SAME-LANE resident on
+// our canonical port running DIFFERENT bytes whose health probe never answers
+// (BUSY: TCP connect succeeds while the event loop stays inside long sync
+// slices, e.g. a multi-minute fold on an oversized session). Every existing
+// surface skips such a holder: attach vetoes foreign bytes (#1225), #4125's
+// upward-adoption veto-lift needs an ANSWERED version a BUSY holder cannot
+// give, #3544 rotation excludes version-unverifiable residents by design
+// (#4811), and the spawned child waits 5s behind a same-lane predecessor then
+// ladders away (+1 sticky drift, #4568 family) or dies. No actor ever
+// resolved the holder, so the port stayed wedged until the process died on its
+// own — which the event-loop watchdog only guarantees for ≥5min CONTINUOUS
+// blocks; the saturation class never trips it, so the lane lost its proxy
+// indefinitely. Resolution = bounded patience across bring-up cycles, then a
+// supervised forced takeover: ask for a graceful shutdown (a loop that
+// briefly unblocks can still answer and close its listener cleanly), terminate
+// if the listener survives, verify the port released, continue to the normal
+// spawn. The stage budgets are deliberately SHORT (field-tuned #5955): after
+// 10 minutes of health silence the graceful path is insurance, not
+// expectation — the whole ladder must not add more than a few seconds on top
+// of the window. The victim loses at most its in-flight turn (sessions persist
+// per-turn); the window bounds worst-case unavailability from ∞ to
+// WEDGED_TAKEOVER_WINDOW_MS instead of risking an immediate kill of a
+// slow-but-alive fold.
+export const WEDGED_TAKEOVER_WINDOW_MS = 600_000; // 10 min = 2× WATCHDOG_HARD_TIMEOUT_MS (event-loop-watchdog.ts)
+export const WEDGED_MIN_OBSERVATIONS = 3;         // distinct bring-up cycles, not milliseconds — retry cadence varies per host
+export const WEDGED_OBSERVATION_STALE_MS = 300_000; // gap > this ⇒ the consecutive run was interrupted ⇒ the window restarts
+// Escalation-stage budgets, field-tuned (#5955 acceptance run on Windows: the
+// original 3+5+2+5s ladder spent ~12.4s of PURE SPIN against a structurally
+// unresponsive holder before the hard kill released the port in ~250ms). A
+// holder silent on health for 10 minutes will not complete an HTTP round-trip
+// in 3s — if it can answer at all it answers promptly, so every stage is a
+// tight multiple of the 200ms poll interval. Worst case is now ~6s to the
+// release verdict (+settle), not ~15s (+settle).
+const WEDGED_SHUTDOWN_BUDGET_MS = 1_000;          // request timeout for the graceful-shutdown POST
+const WEDGED_POST_SHUTDOWN_WAIT_MS = 2_000;       // budget to observe the listener close after the graceful request
+const WEDGED_TERM_GRACE_MS = 1_000;               // SIGTERM drain budget before the hard kill (POSIX only)
+const WEDGED_POST_KILL_WAIT_MS = 2_000;           // budget to observe the listener close after a hard kill (measured release ≤252ms)
+const WEDGED_POST_KILL_SETTLE_MS = 2_000;         // grace for kernel socket release after an ABRUPT kill before we bind (#5955)
+
+interface WedgedLedgerEntry {
+    pid: number;
+    firstBusyAt: number;
+    lastObservedAt: number;
+    observations: number;
+}
+
+/** #5955: the observation ledger is PERSISTED in the state dir — during a
+ *  wedge the client process restarts on every bring-up attempt, so an
+ *  in-process counter would reset every cycle and the patience window could
+ *  never fill (reporter evidence: `bootstrap failed` repeating each round).
+ *  Keyed by origin#pid#birth-stamp, so a new occupant — including a REUSED pid
+ *  on Windows, where dense kill/restart recycles pids fast — starts its own
+ *  window instead of inheriting the dead occupant's history. Concurrent hosts
+ *  sharing one file can race on read-modify-write; the worst case loses one
+ *  observation (the window lengthens by one cycle), which is safe. */
+function wedgedLedgerFilePath(): string {
+    return path.join(stateDir(), "wedged-takeover.json");
+}
+
+function isWedgedLedgerEntry(value: unknown): value is WedgedLedgerEntry {
+    if (typeof value !== "object" || value === null) return false;
+    const e = value as Record<string, unknown>;
+    return typeof e.pid === "number" && Number.isInteger(e.pid) && e.pid > 0
+        && typeof e.firstBusyAt === "number" && Number.isFinite(e.firstBusyAt)
+        && typeof e.lastObservedAt === "number" && Number.isFinite(e.lastObservedAt)
+        && typeof e.observations === "number" && Number.isInteger(e.observations) && e.observations >= 1;
+}
+
+/** Load the persisted ledger. Missing file = empty; a corrupt file or
+ *  malformed entry is dropped LOUDLY — a broken state file must never block
+ *  bring-up (the patience window simply restarts from zero). */
+function readWedgedLedger(file: string): Record<string, WedgedLedgerEntry> {
+    let raw: string;
+    try {
+        raw = fs.readFileSync(file, "utf8");
+    } catch (error) {
+        if ((error as NodeJS.ErrnoException)?.code !== "ENOENT") {
+            teeLog("warn", `bili: cannot read wedged-takeover ledger at ${file}: ${String(error)} — starting fresh, patience window restarts (#5955)`);
+        }
+        return {};
+    }
+    const entries: Record<string, WedgedLedgerEntry> = {};
+    let unparseable = false;
+    let dropped = 0;
+    try {
+        const parsed: unknown = JSON.parse(raw);
+        if (typeof parsed !== "object" || parsed === null || !("entries" in parsed)) throw new Error("missing entries");
+        for (const [key, value] of Object.entries((parsed as { entries: Record<string, unknown> }).entries)) {
+            if (isWedgedLedgerEntry(value)) entries[key] = value;
+            else dropped += 1;
+        }
+    } catch {
+        unparseable = true;
+    }
+    if (unparseable || dropped > 0) {
+        teeLog("warn", `bili: wedged-takeover ledger at ${file} is ${unparseable ? "unparseable" : `malformed (${dropped} bad entr${dropped === 1 ? "y" : "ies"})`} — starting fresh, patience window restarts (#5955)`);
+    }
+    return entries;
+}
+
+/** Persist the ledger. A failure here must NOT block bring-up: this cycle's
+ *  observation is lost and the window may take one more cycle. */
+function writeWedgedLedger(file: string, entries: Record<string, WedgedLedgerEntry>): void {
+    try {
+        atomicWriteJson({ entries }, file);
+    } catch (error) {
+        teeLog("warn", `bili: failed to persist wedged-takeover ledger at ${file}: ${String(error)} — observation not saved, patience window may extend by one cycle (#5955)`);
+    }
+}
+
+function runCommandCapture(command: string, args: readonly string[], timeoutMs: number): Promise<string> {
+    return new Promise((resolve, reject) => {
+        execFile(command, [...args], { timeout: timeoutMs, windowsHide: true }, (error, stdout) => {
+            if (error !== null) reject(error instanceof Error ? error : new Error(String(error)));
+            else resolve(String(stdout));
+        });
+    });
+}
+
+/** #5955: process birth stamp for the ledger key — PID REUSE guard. Windows
+ *  recycles pids quickly after dense kill/restart; without a birth stamp a
+ *  reused pid would inherit the dead occupant's observation history and get
+ *  force-taken-over on first sight. Sources (all best-effort, zero new deps):
+ *   linux: /proc/<pid>/stat field 22 (starttime, ticks since boot)
+ *   win32: powershell Get-Process StartTime (~1-3s cold start, rare path only)
+ *   other POSIX: `ps -o lstart=`
+ *  Failure → undefined → the key degrades to origin#pid (previous behavior); a
+ *  stamp that appears or disappears across observations restarts the window
+ *  once — conservative (longer patience, never a premature kill). */
+export async function processBirthStamp(pid: number): Promise<string | undefined> {
+    if (!Number.isInteger(pid) || pid <= 0) return undefined;
+    try {
+        if (process.platform === "linux") {
+            const raw = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+            const closeParen = raw.lastIndexOf(")");
+            if (closeParen < 0) return undefined;
+            // Fields after comm start at field 3 (state); starttime is field 22 → index 19.
+            const fields = raw.slice(closeParen + 1).trim().split(/\s+/);
+            const starttime = fields[19];
+            if (starttime !== undefined && /^\d+$/.test(starttime)) return `boot-${starttime}`;
+            return undefined;
+        }
+        if (process.platform === "win32") {
+            const out = await runCommandCapture("powershell", ["-NoProfile", "-NonInteractive", "-Command", `(Get-Process -Id ${pid} -ErrorAction Stop).StartTime.ToString('o')`], 10_000);
+            const trimmed = out.trim();
+            return trimmed === "" ? undefined : `ps-${trimmed}`;
+        }
+        const out = await runCommandCapture("ps", ["-o", "lstart=", "-p", String(pid)], 2_000);
+        const trimmed = out.trim();
+        return trimmed === "" ? undefined : `ps-${trimmed}`;
+    } catch {
+        return undefined;
+    }
+}
+
+/** #5955: pure cell check — is this probed candidate exactly the unresolved
+ *  deadlock cell? Same declared lane, our target port, foreign bytes
+ *  (fingerprint mismatch BEFORE any shape verdict), and BUSY (health silent,
+ *  TCP alive — probeLiveInstances kept it only because the connect succeeded).
+ *  A holder that ANSWERS health is someone else's cell (#4125 adoption /
+ *  #3544 rotation); matching bytes are attachable per #4811 same-lane
+ *  discipline. */
+export function isWedgedSameLaneCandidate(
+    c: { inst: ProxyInstanceFile; health: HealthInfo | undefined },
+    opts: LaunchOptions,
+    targetPort: number,
+    codeFingerprint: string | undefined,
+    foreignLanes: readonly string[],
+): boolean {
+    if (c.inst.port !== targetPort) return false;
+    if (opts.lane === undefined || c.inst.lane !== opts.lane) return false;
+    if (isUserZoneInstance(c.inst)) return false;
+    if (c.health !== undefined) return false;
+    return instanceCompatible(c.inst, opts, codeFingerprint, foreignLanes) === "code-fingerprint-mismatch";
+}
+
+/** #5955: pure ledger step — record one observation of a wedged candidate and
+ *  decide whether the patience window elapsed. A gap longer than the stale
+ *  threshold means the consecutive run was interrupted (the holder answered or
+ *  left between bring-ups) and the window restarts; short gaps bridge, so the
+ *  window measures cumulative wedging within one continuous episode. */
+export function stepWedgedLedger(
+    existing: WedgedLedgerEntry | undefined,
+    pid: number,
+    nowMs: number,
+): { entry: WedgedLedgerEntry; escalate: boolean; fresh: boolean } {
+    const fresh = existing === undefined || nowMs - existing.lastObservedAt > WEDGED_OBSERVATION_STALE_MS;
+    const entry = fresh
+        ? { pid, firstBusyAt: nowMs, lastObservedAt: nowMs, observations: 1 }
+        : { pid, firstBusyAt: existing.firstBusyAt, lastObservedAt: nowMs, observations: existing.observations + 1 };
+    const escalate = nowMs - entry.firstBusyAt >= WEDGED_TAKEOVER_WINDOW_MS && entry.observations >= WEDGED_MIN_OBSERVATIONS;
+    return { entry, escalate, fresh };
+}
+
+async function waitForListenerClose(
+    origin: string,
+    isConnectable: (origin: string) => Promise<boolean>,
+    now: () => number,
+    sleep: (ms: number) => Promise<void>,
+    budgetMs: number,
+): Promise<boolean> {
+    const deadline = now() + budgetMs;
+    for (;;) {
+        if (!(await isConnectable(origin))) return true;
+        if (now() >= deadline) return false;
+        await sleep(HEALTH_POLL_INTERVAL_MS);
+    }
+}
+
+/** #5955: bounded-patience forced takeover of the one decision-table cell
+ *  every other surface skips (see the block comment above). No-op unless a
+ *  candidate exists AND its ledger says the patience window elapsed; on any
+ *  doubt the caller's normal spawn ladder runs untouched. */
+async function resolveWedgedSameLaneHolder(
+    probed: Array<{ inst: ProxyInstanceFile; health: HealthInfo | undefined }>,
+    resolveTargetPort: () => number | undefined,
+    opts: LaunchOptions,
+    attachUrl: string | undefined,
+    foreignLanes: readonly string[],
+    codeFingerprint: string | undefined,
+    ledgerPath: string,
+    birthStamp: (pid: number) => Promise<string | undefined>,
+    now: () => number,
+    sleep: (ms: number) => Promise<void>,
+    requestShutdown: (origin: string, timeoutMs?: number) => Promise<boolean>,
+    isConnectable: (origin: string) => Promise<boolean>,
+    signalHolder: (pid: number) => void,
+    hardKillHolder: (pid: number) => void,
+    diag: (msg: string) => void,
+): Promise<void> {
+    if (attachUrl !== undefined) return;
+    // #1660: touching the sticky zone resolver has side effects; only do it when a
+    // wedged-cell holder actually exists.
+    const maybeWedged = probed.some((c) =>
+        c.health === undefined && opts.lane !== undefined && c.inst.lane === opts.lane
+        && !isUserZoneInstance(c.inst)
+        && instanceCompatible(c.inst, opts, codeFingerprint, foreignLanes) === "code-fingerprint-mismatch");
+    if (!maybeWedged) return;
+    const targetPort = resolveTargetPort();
+    if (targetPort === undefined) return;
+    const entries = readWedgedLedger(ledgerPath);
+    for (const [key, entry] of Object.entries(entries)) {
+        if (!isPidAlive(entry.pid)) delete entries[key];
+    }
+    let dirty = false;
+    const persist = (): void => {
+        if (!dirty) return;
+        dirty = false;
+        if (Object.keys(entries).length === 0) {
+            try { fs.unlinkSync(ledgerPath); } catch { /* already gone */ }
+            return;
+        }
+        writeWedgedLedger(ledgerPath, entries);
+    };
+    for (const c of probed) {
+        if (!isWedgedSameLaneCandidate(c, opts, targetPort, codeFingerprint, foreignLanes)) continue;
+        // PID-REUSE guard (#5955): Windows recycles pids quickly after dense
+        // kill/restart. The key carries the occupant's birth stamp so a REUSED
+        // pid starts a fresh window instead of inheriting the dead occupant's
+        // observation history and getting force-taken-over on first sight.
+        const stamp = await birthStamp(c.inst.pid);
+        const key = stamp !== undefined ? `${c.inst.origin}#${c.inst.pid}#${stamp}` : `${c.inst.origin}#${c.inst.pid}`;
+        const { entry, escalate, fresh } = stepWedgedLedger(entries[key], c.inst.pid, now());
+        entries[key] = entry;
+        dirty = true;
+        if (fresh) {
+            // User-visible announcement at patience-window start: without it the
+            // user sees only 422 refusals during the whole window (#5955).
+            const startMsg = `native-attach: ${c.inst.origin} (pid ${c.inst.pid}) unresponsive — TCP alive but health silent on port ${targetPort}; patience window started, forced takeover after ${WEDGED_TAKEOVER_WINDOW_MS / 1000}s of continuous observations (#5955)`;
+            console.error(startMsg);
+            teeLog("warn", startMsg);
+            diag(startMsg);
+        } else if (!escalate) {
+            diag(`native-attach: watching ${c.inst.origin} (pid ${c.inst.pid}): BUSY same-lane holder with foreign bytes holds port ${targetPort} — observation ${entry.observations}, ${Math.round((now() - entry.firstBusyAt) / 1000)}s of ${WEDGED_TAKEOVER_WINDOW_MS / 1000}s patience before forced takeover (#5955)`);
+        }
+        if (!escalate) {
+            persist();
+            continue;
+        }
+        const msg = `native-attach: forcing takeover of wedged same-lane proxy ${c.inst.origin} (pid ${c.inst.pid}): BUSY (TCP alive, health silent) for ${Math.round((now() - entry.firstBusyAt) / 1000)}s across ${entry.observations} bring-up cycles while holding port ${targetPort} with foreign bytes — requesting graceful shutdown, then terminating (#5955)`;
+        console.error(msg);
+        teeLog("warn", msg);
+        const t0 = now();
+        await requestShutdown(c.inst.origin, WEDGED_SHUTDOWN_BUDGET_MS);
+        let released = await waitForListenerClose(c.inst.origin, isConnectable, now, sleep, WEDGED_POST_SHUTDOWN_WAIT_MS);
+        let killedHard = false;
+        if (!released) {
+            signalHolder(c.inst.pid);
+            released = await waitForListenerClose(c.inst.origin, isConnectable, now, sleep, WEDGED_TERM_GRACE_MS);
+        }
+        if (!released) {
+            hardKillHolder(c.inst.pid);
+            killedHard = true;
+            released = await waitForListenerClose(c.inst.origin, isConnectable, now, sleep, WEDGED_POST_KILL_WAIT_MS);
+        }
+        if (released) {
+            if (killedHard) {
+                // An abrupt kill (SIGKILL / taskkill /F) leaves kernel socket state
+                // behind; give it a moment before the child tries to bind so the
+                // takeover does not ladder to +1 over residual TIME_WAIT (#5955).
+                await sleep(WEDGED_POST_KILL_SETTLE_MS);
+            }
+            delete entries[key];
+            dirty = true;
+            const done = `native-attach: wedged holder pid ${c.inst.pid} released port ${targetPort} after ${now() - t0}ms — continuing to spawn`;
+            console.error(done);
+            teeLog("info", done);
+        } else {
+            // Keep the ledger entry: the occupant survived every stage; the next
+            // bring-up cycle retries the escalation instead of starting over.
+            const failed = `native-attach: FAILED to release port ${targetPort} from wedged holder pid ${c.inst.pid} — falling back to the normal spawn ladder (may ladder to the next free port); takeover retries on the next bring-up (#5955)`;
+            console.error(failed);
+            teeLog("warn", failed);
+        }
+        persist();
+        return;
+    }
+    persist();
 }
 
 /** #3544: owner heartbeat — re-asserts our liveness every beat so the proxy's
@@ -5322,6 +5686,18 @@ export async function ensureProxyRunning(
         console.error(msg);
         attachDiag(msg);
     }
+    // #3544/#5955: the canonical port a replacement would bind — resolved
+    // LAZILY (only once a takeover candidate exists) because the lane
+    // preference resolver is stateful/sticky (#1660) and must not be touched
+    // on bring-ups where nothing rotates or takes over.
+    const resolveTargetPort = (): number | undefined => {
+        const rotLane = opts.lane !== undefined && opts.port <= 0 ? opts.lane : undefined;
+        return opts.port > 0
+            ? opts.port
+            : rotLane !== undefined
+                ? (deps?.zonePreferredPort ?? lanePreferredPort)(rotLane)
+                : undefined;
+    };
     // #3544: nothing attachable above — but a strictly-older generation may
     // still hold our canonical port (its fingerprint differs by definition, so
     // it was never attachable). Rotate it instead of letting the update sit
@@ -5329,14 +5705,7 @@ export async function ensureProxyRunning(
     {
         await rotateStalePredecessor(
             probed,
-            () => {
-                const rotLane = opts.lane !== undefined && opts.port <= 0 ? opts.lane : undefined;
-                return opts.port > 0
-                    ? opts.port
-                    : rotLane !== undefined
-                        ? (deps?.zonePreferredPort ?? lanePreferredPort)(rotLane)
-                        : undefined;
-            },
+            resolveTargetPort,
             opts,
             attachUrl,
             foreignLanes,
@@ -5344,6 +5713,29 @@ export async function ensureProxyRunning(
             now,
             sleepImpl,
             deps?.requestInstanceShutdown ?? requestInstanceShutdown,
+        );
+    }
+    // #5955: the cell neither attach nor rotation covers — a BUSY same-lane
+    // holder with foreign bytes on our canonical port. Bounded patience across
+    // bring-up cycles, then a supervised forced takeover; on any doubt the
+    // spawn ladder below runs untouched.
+    {
+        await resolveWedgedSameLaneHolder(
+            probed,
+            resolveTargetPort,
+            opts,
+            attachUrl,
+            foreignLanes,
+            codeFingerprint,
+            deps?.wedgedLedgerPath?.() ?? wedgedLedgerFilePath(),
+            deps?.processBirthStamp ?? ((pid: number) => processBirthStamp(pid)),
+            now,
+            sleepImpl,
+            deps?.requestInstanceShutdown ?? requestInstanceShutdown,
+            deps?.isConnectable ?? tcpConnectable,
+            deps?.signalWedgedHolder ?? signalWedgedHolderDefault,
+            deps?.killWedgedHolder ?? killWedgedHolderDefault,
+            attachDiag,
         );
     }
     if (!attachExternal && opts.strictPort) {
@@ -5940,6 +6332,68 @@ export async function ensureProxyRunning(
     }
 }
 
+/** #2260(A)/#5955: unconditional platform-native hard-kill of a proxy process
+ *  BY PID, all platforms. Win32 uses taskkill /F /T because TerminateProcess
+ *  on the direct pid alone leaks descendants (a detached child that spawned
+ *  its own helpers, e.g. self-update npm runs, survives); the direct SIGKILL
+ *  stays as the fallback if taskkill itself fails. Failures are surfaced,
+ *  never swallowed (#4125): a "killed" holder that survives keeps holding its
+ *  listener, and the caller's release verification is what catches that. */
+export function hardKillProxyTree(pid: number, label: string): void {
+    if (process.platform !== "win32") {
+        try {
+            process.kill(pid, "SIGKILL");
+        } catch (err) {
+            // ESRCH = the pid is already gone — the goal is met, not a failure.
+            if ((err as NodeJS.ErrnoException)?.code !== "ESRCH") {
+                teeLog("warn", `bili: SIGKILL of ${label} ${pid} failed (${err instanceof Error ? err.message : String(err)}) — its listener may survive the cleanup (#4125)`);
+            }
+        }
+        return;
+    }
+    let tkError: string | undefined;
+    try {
+        const tk = spawnSync("taskkill", ["/F", "/T", "/PID", String(pid)], { windowsHide: true, stdio: "ignore" });
+        if (tk.error !== undefined) tkError = tk.error.message;
+        else if (tk.status !== 0) tkError = `exit ${tk.status}`;
+    } catch (err) {
+        tkError = err instanceof Error ? err.message : String(err);
+    }
+    // #4125: a failed taskkill must not vanish silently — surface it; a non-
+    // zero exit can also mean the pid already left (harmless — the direct
+    // kill below still runs).
+    if (tkError !== undefined) {
+        teeLog("warn", `bili: taskkill of ${label} ${pid} reported failure (${tkError}) — its listener may survive the cleanup (#4125)`);
+    }
+    try {
+        process.kill(pid, "SIGKILL");
+    } catch (err) {
+        // ESRCH = the tree is already gone (taskkill reaped it) — the goal is
+        // met; warning there would log a false alarm on EVERY successful win32
+        // takeover (#5955 field report).
+        if ((err as NodeJS.ErrnoException)?.code !== "ESRCH") {
+            teeLog("warn", `bili: direct SIGKILL of ${label} ${pid} failed (${err instanceof Error ? err.message : String(err)}) — its listener may survive the cleanup (#4125)`);
+        }
+    }
+}
+
+/** #5955 defaults for the LauncherDeps takeover seams. POSIX sends SIGTERM
+ *  first (a saturated-but-yielding loop can still drain); win32 has no
+ *  graceful node signal, so it no-ops and the caller goes straight to the
+ *  hard kill. */
+function signalWedgedHolderDefault(pid: number): void {
+    if (process.platform === "win32") return;
+    try {
+        process.kill(pid, "SIGTERM");
+    } catch {
+        /* already gone */
+    }
+}
+
+function killWedgedHolderDefault(pid: number): void {
+    hardKillProxyTree(pid, "wedged holder");
+}
+
 /** #2260(A)/#2187: unconditional hard-kill of a spawned-but-abandoned proxy
  *  child, all platforms. Deliberately NOT stopProxy(): its win32 path returns
  *  without killing because the #414 design assumes THIS process exits ≤2s
@@ -5958,32 +6412,14 @@ function killAbandonedChild(child: SpawnChild | undefined): void {
         } catch {
             /* group already gone */
         }
-    } else {
-        // #3116: win32 has no process-group kill — TerminateProcess on the direct
-        // child alone leaks its descendants (a detached:true child that spawned
-        // its own helpers, e.g. self-update npm runs, survives the "abandoned"
-        // kill). taskkill /T walks the whole tree; the direct kill below stays
-        // as the fallback if taskkill itself fails.
-        let tkError: string | undefined;
-        try {
-            const tk = spawnSync("taskkill", ["/F", "/T", "/PID", String(child.pid)], { windowsHide: true, stdio: "ignore" });
-            if (tk.error !== undefined) tkError = tk.error.message;
-            else if (tk.status !== 0) tkError = `exit ${tk.status}`;
-        } catch (err) {
-            tkError = err instanceof Error ? err.message : String(err);
-        }
-        // #4125: a failed taskkill used to vanish silently here — exactly how a
-        // "killed" abandoned child could keep holding its listener. Surface it;
-        // a non-zero exit can also mean the pid already left (harmless — the
-        // direct kill below still runs).
-        if (tkError !== undefined) {
-            teeLog("warn", `bili: taskkill of abandoned proxy ${child.pid} reported failure (${tkError}) — its listener may survive the cleanup (#4125)`);
-        }
     }
+    hardKillProxyTree(child.pid, "abandoned proxy");
+    // The ChildProcess handle needs its own SIGKILL to close stdio and mark the
+    // handle dead — the pid-level kills above do not do that (#2260/#2187).
     try {
         child.kill?.("SIGKILL");
-    } catch (err) {
-        teeLog("warn", `bili: direct SIGKILL of abandoned proxy ${child.pid} failed (${err instanceof Error ? err.message : String(err)}) — its listener may survive the cleanup (#4125)`);
+    } catch {
+        teeLog("warn", `bili: SIGKILL of abandoned proxy ${child.pid} via its own handle failed — it may survive the cleanup (#4125)`);
     }
 }
 
@@ -6630,7 +7066,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
     let opencodeTmpFile: string | undefined;
     let dshOverlayHome: string | undefined;
     let gooseOverlay: GooseOverlay | undefined;
-    let codexOverlay: { realHome: string; overlay: string; generated: readonly string[] } | undefined;
+    let codexOverlay: { realHome: string; overlay: string; generated: readonly string[]; localOnly: ReadonlySet<string> } | undefined;
     const tmpFiles: string[] = [];
     const directUrl = launcherDirectUrl(process.env);
     if (directUrl) {
@@ -7153,7 +7589,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
             if (activeOverlay !== undefined) {
                 const generated: string[] = [".env"];
                 if (codexConversationId !== undefined) generated.push("config.toml");
-                codexOverlay = { realHome: codexRealHome, overlay: activeOverlay, generated };
+                codexOverlay = { realHome: codexRealHome, overlay: activeOverlay, generated, localOnly: CODEX_LOCAL_ONLY_HOME_ENTRIES };
             }
         }
     } else if (base === "codebuddy") {
@@ -7276,7 +7712,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         }
         if (codexOverlay) {
             try {
-                finalizeCodexHome(codexOverlay.realHome, codexOverlay.overlay, codexOverlay.generated);
+                finalizeCodexHome(codexOverlay.realHome, codexOverlay.overlay, codexOverlay.generated, codexOverlay.localOnly);
             } catch {}
         }
         releaseOverlayLease();

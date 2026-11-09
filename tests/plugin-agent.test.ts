@@ -21,12 +21,19 @@ process.env.NODE_ENV = "test";
 // are exercised against the file's own fake servers, exactly like CI.
 const realHome = process.env.HOME;
 const realProxyEnv = process.env.BILLION_CONTEXT_PROXY;
+const realConfigFileEnv = process.env.BILI_CONFIG_FILE;
 process.env.HOME = fs.mkdtempSync(path.join(os.tmpdir(), "bc-plugin-agent-"));
 delete process.env.BILLION_CONTEXT_PROXY;
+// #5659: the pi.commands default surface is ["acp", "acp-cache"] — this file also drives
+// /acp-rule registration, so opt the full surface in explicitly.
+process.env.BILI_CONFIG_FILE = path.join(process.env.HOME!, "billion-context.json");
+fs.writeFileSync(process.env.BILI_CONFIG_FILE, JSON.stringify({ pi: { commands: true } }));
 process.on("exit", () => {
     try { fs.rmSync(process.env.HOME!, { recursive: true, force: true }); } catch { /* best effort */ }
     process.env.HOME = realHome;
     if (realProxyEnv !== undefined) process.env.BILLION_CONTEXT_PROXY = realProxyEnv;
+    if (realConfigFileEnv !== undefined) process.env.BILI_CONFIG_FILE = realConfigFileEnv;
+    else delete process.env.BILI_CONFIG_FILE;
 });
 
 import { proxyBaseFromUrl, proxyBaseFromEnv, detectProxyBase, fetchManifest, forwardTool, fetchStatus, destinationRoutedThroughProxy } from "../src/agent/shared.ts";
