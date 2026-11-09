@@ -5878,11 +5878,6 @@ export async function ensureProxyRunning(
         const preferredOrigin = proxyOrigin(opts.host, port);
         const marker = listRegistry().find((e) => e.port === port && e.lane === zoneLane && e.instanceId !== "" && isPidAlive(e.pid));
         if (marker === undefined) return false;
-        // The hold protects a COMPATIBLE holder only: a same-lane instance that
-        // runs different bytes (#1723) or a drifted model shape (#3801) is
-        // exactly what this launch laddered away from, so its presence must not
-        // veto recording the port the new child actually took.
-        if (instanceCompatible(marker, opts, codeFingerprint, foreignLanes) !== undefined) return false;
         const info = await fetchHealthInfo(preferredOrigin);
         if (info?.ok && (info.pid === undefined || info.pid === marker.pid)) {
             attachDiag(`[zone] lane "${zoneLane}" keeps sticky port ${port} — same-lane instance ${marker.instanceId.slice(0, 8)} (pid ${marker.pid}) still serves it; laddered port ${settled} is NOT recorded, the pointer converges when the holder exits (#4566)`);
