@@ -49,6 +49,14 @@ entries:
     group: behavior
     desc_en: "Nested rollout: evaluate this feature only inside the named feature's enabled cohort, so the percent is relative to that population (roll B out to A's users; chains allowed, cycles fail closed)."
     desc_zh: "嵌套灰度:仅在所指特性的已入组人群内评估本特性,percent 相对该人群(B 只放量给 A 的用户;允许链式,环路判为关)。"
+  - key: rollout.features.identityChannelHarvest
+    type: "boolean | number"
+    default: "0 (off)"
+    default_zh: "0(关)"
+    env: BILI_ROLLOUT_IDENTITY_CHANNEL_HARVEST
+    group: behavior
+    desc_en: "Identity-channel harvest cohort gate (#5825): allows the loopback-only transcript/sqlite harvest (src/identity-harvest.ts: claude-code / codebuddy / mcode / goose / qwen lanes) without any per-install env switch, when neither the per-install switch (BILI_IDENTITY_HARVEST) nor this key is set nothing ever reads client storage. Owner ruling 2026-11-07: this cohort key is deliberately separate from rollout.features.pluginLaneServerHistory (which governs row PINNING of admitted ids) — either enabler may activate harvesting. Default 0%; raise after small-cohort observation of the degrade warn-once rate. See identity-channels.md."
+    desc_zh: "身份信道采集的灰度门(#5825):当安装级开关(BILI_IDENTITY_HARVEST)未设置时,允许仅由本灰度键激活回环专属的转录/SQLite 采集(claude-code / codebuddy / mcode / goose / qwen 车道);两者都不设则永不读客户端存储。owner 裁定 2026-11-07:本灰度键与 rollout.features.pluginLaneServerHistory(它管已接纳 id 的行钉住)刻意分离——任一使能方可激活采集。默认 0%,小流量观察退化率后再抬。见 identity-channels.zh-CN.md。"
   - key: rollout.features.pluginLaneServerHistory
     type: "boolean | number"
     default: "0 (off)"
@@ -63,5 +71,5 @@ entries:
     default_zh: "5(实验性灰度)"
     env: BILI_ROLLOUT_PLUGIN_FULL_RESEND_WATERMARK
     group: behavior
-    desc_en: "Full-resend watermark fastpath (#5403/#5418): plugin-lane chat-completions turns whose previous response carried an x-bili-pf-seq stamp assert the resent prefix via the echoed count (structural scan, no full parse); on a hit the pipeline consumes stashed canonical prefix cores plus only the new tail window (byte-identical outbound provenance; ANY doubt falls back to the untouched full-parse path per turn and re-stamps, five credited misses hold the lane for one hour). Requires the client to echo the stamp back as x-bili-pf-count (dsh/pi/opencode/omp do; unadapted lanes never hit). EXPERIMENTAL grey rollout — ON by default for roughly 5% of installs (owner ruling 2026-11-02: small cohort before GA; one-time intro notice in the web UI for every install, tri-state switch in quick config). Force it with `true`, turn off with `false` (or a percent) / env = 0. See TECHNICAL-NOTES.md “Full-resend watermark fastpath”."
-    desc_zh: "全量重发水位快路径(#5403/#5418):插件车道 chat-completions 回合若上一轮响应盖有 x-bili-pf-seq,则用回声计数声明重发前缀(结构扫描,不做全量解析);命中时管线只消费钉存的前缀核 + 新增尾巴窗口(出站字节同源可证;任何疑点当轮回退未动过的全量解析路径并重新盖戳,连续五次计名失配将车道按住一小时)。需客户端把戳回声为 x-bili-pf-count(适配的车道回带;其余车道不会命中)。**实验性灰度**——默认仅约 5% 的安装开启(owner 裁定 2026-11-02:先小流量再 GA;web 面板对全部安装显示一次性公告、快速配置提供三态开关);`true` 强制开、`false`(或百分比)/ env = 0 关。见 TECHNICAL-NOTES.zh-CN.md「全量重发水位快路径」。"
+    desc_en: "Full-resend watermark fastpath (#5403/#5418): plugin-lane chat-completions turns whose previous response carried an x-bili-pf-seq stamp assert the resent prefix via the echoed count (structural scan, no full parse); on a hit the pipeline consumes stashed canonical prefix cores plus only the new tail window (byte-identical outbound provenance; ANY doubt falls back to the untouched full-parse path per turn and re-stamps, five credited misses hold the lane for one hour). Requires the client to echo the stamp back as x-bili-pf-count (dsh/pi/opencode/omp do; unadapted lanes never hit). EXPERIMENTAL grey rollout — ON by default for roughly 5% of installs (owner ruling 2026-11-02: small cohort before GA; one-time intro notice in the web UI for every install, tri-state switch in quick config). Force it with `true`, turn off with `false` (or a percent) / env = 0. See technical-notes.md “Full-resend watermark fastpath”."
+    desc_zh: "全量重发水位快路径(#5403/#5418):插件车道 chat-completions 回合若上一轮响应盖有 x-bili-pf-seq,则用回声计数声明重发前缀(结构扫描,不做全量解析);命中时管线只消费钉存的前缀核 + 新增尾巴窗口(出站字节同源可证;任何疑点当轮回退未动过的全量解析路径并重新盖戳,连续五次计名失配将车道按住一小时)。需客户端把戳回声为 x-bili-pf-count(适配的车道回带;其余车道不会命中)。**实验性灰度**——默认仅约 5% 的安装开启(owner 裁定 2026-11-02:先小流量再 GA;web 面板对全部安装显示一次性公告、快速配置提供三态开关);`true` 强制开、`false`(或百分比)/ env = 0 关。见 technical-notes.zh-CN.md「全量重发水位快路径」。"
