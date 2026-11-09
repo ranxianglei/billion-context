@@ -1884,6 +1884,8 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 
 环境变量优先于配置文件。在不修改文件的情况下，它们适用于环境特定的覆盖（CI、容器）。
 
+**子进程部署。** 进程看不到自己启动之后才发生的环境变量变更——环境块在 spawn 时从父进程继承。bili 作为其他宿主的子进程运行时，宿主启动后再设置的环境变量（如 Windows 的 `setx`）要等宿主自身重启后才能到达新子进程；配置文件层不受父进程环境块影响、从下一次 bili 进程启动生效，是这类部署下更可靠的覆盖通道。
+
 **优先级模型（#2030）。** 每个行为开关的解析顺序为 **环境变量 > 配置文件 > 内置默认值**。自 #2030 起，每个纯行为开关同时拥有配置文件键，部署可以完全放在 `billion-context.json` 里；环境变量保留为覆盖层。**已设置**的环境变量独占其开关——即使值是垃圾值，也按 #2030 之前的原样解析（回落到默认值），既不会泄漏到文件层、也不会被文件层遮蔽。纯环境变量仅保留给无法放进文件的东西：密钥（`BILI_LAUNCH_TOKEN`、`BILI_ENCRYPTION_KEY`）、由另一个 bili 组件在 spawn 时写入的进程间通道（`BILI_MCP_PROXY`、`BILI_PARENT_PID`、`BILI_STRICT_PORT`、`BILI_OPENCODE_ACP_SPEC`、`BILI_LAUNCHER_MODEL_*`）、在第三方宿主进程内读取的宿主侧姿态（`BILLION_CONTEXT_PLUGIN*`、`BILI_NATIVE_*`、`BILI_RECLAIM_FETCH_PATCH`）、路径重定位（`BILI_CONFIG_FILE`、`BILI_SESSIONS_DIR`、`ACP_DUMP_DIR`、`XDG_*`）以及第三方约定（`CLAUDE_CODE_SESSION_ID`、`CODEX_HOME`、`https_proxy`）。新开关的准入规则见 AGENTS.md「Environment Variable Discipline」。
 
 ### 环境变量的配置键对照（#2030）
