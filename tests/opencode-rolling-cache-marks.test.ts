@@ -154,6 +154,50 @@ function messageBreakpoints(body: Record<string, unknown>): number {
 const CONV = "ses_rolling_marks";
 const laneHeaders = { "x-bili-plugin": "opencode", "x-bili-plugin-conversation": CONV, "x-acp-session": CONV };
 
+for (const landed of [true, false]) test(`successful Anthropic save settles journal after canonical cache eviction (flush=${landed})`, { timeout: 20000 }, async () => {
+    const before = process.env.BILI_MESSAGE_TIMESTAMPS;
+    process.env.BILI_MESSAGE_TIMESTAMPS = '1';
+    const h = await harness();
+    const originalAfterNextFlush = h.store.afterNextFlush.bind(h.store);
+    let release!: (landed: boolean) => void;
+    const held = new Promise<boolean>(resolve => { release = resolve; });
+    h.store.afterNextFlush = id => id === CONV ? held : originalAfterNextFlush(id);
+    const seed = (id: string) => ({ conversationId: id, path: '/v1/messages', sinceSeq: 0, resync: true,
+        request: { model: 'claude-test', max_tokens: 1024 },
+        messages: [{ role: 'user', content: 'Main turn for canonical eviction journal control. '.repeat(100) }] });
+    const post = (id: string) => h.post('/__bili/plugin/turn', JSON.stringify(seed(id)),
+        { ...laneHeaders, 'x-bili-plugin-conversation': id, 'x-acp-session': id });
+    try {
+        const response = await post(CONV);
+        assert.equal(response.status, 200);
+        assert.equal(response.appliedSeq, 1);
+        const session = listSessions().find(s => s.id === CONV);
+        assert.ok(session);
+        assert.ok(Object.keys(recoveredFirstSeen(h.store, CONV, undefined)).length > 0,
+            'the acknowledged main turn must have unsettled first-seen resources');
+        await h.store.writeNow(session);
+        assert.ok(h.store.unifiedRawMessages(CONV)?.some(row => typeof row.ts === 'number'),
+            'canonical timestamps must actually be committed before releasing completion');
+        // Actual lane requests fill the bounded 16-entry canonical cache. The
+        // original conversation receives no further request or cache touch.
+        for (let i = 0; i < 16; i++) assert.equal((await post(`ses_evict_other_${i}`)).status, 200);
+        assert.ok(Object.keys(recoveredFirstSeen(h.store, CONV, undefined)).length > 0);
+        const pending = recoveredFirstSeen(h.store, CONV, undefined);
+        release(landed);
+        await new Promise<void>(resolve => setImmediate(resolve));
+        assert.deepEqual(recoveredFirstSeen(h.store, CONV, undefined), landed ? {} : pending,
+            landed ? 'successful SQL save must settle journal even after canonical cache eviction'
+                : 'a negative flush verdict must retain the journal after eviction');
+        if (landed) assert.equal(h.store.listSessionExt(CONV).filter(row => row.key.startsWith('inc:first-seen:')).length, 0,
+            'settled timestamp chunk rows must be collected without another turn');
+    } finally {
+        release(false);
+        h.store.afterNextFlush = originalAfterNextFlush;
+        await h.close();
+        if (before === undefined) delete process.env.BILI_MESSAGE_TIMESTAMPS; else process.env.BILI_MESSAGE_TIMESTAMPS = before;
+    }
+});
+
 test('timestamp-free side requests may acknowledge without journal publication', async () => {
     const before = process.env.BILI_MESSAGE_TIMESTAMPS;
     process.env.BILI_MESSAGE_TIMESTAMPS = '1';
