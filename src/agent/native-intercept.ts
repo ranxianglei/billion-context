@@ -707,9 +707,18 @@ function emptySlotOversizeRefusal(
     url: string,
     doom?: NonNullable<ReturnType<typeof bodyOverWindowDetail>>,
 ): Response {
+    // Same declared-vs-bar distinction as fallbackOversizeRefusal (#4079): the
+    // doom prices against max(resolved, 1M floor), so when the resolved window
+    // is below the floor, naming the BAR as if the lane had resolved it would
+    // misstate the model's real window.
+    const barNote = doom === undefined
+        ? ""
+        : doom.declaredWindow === doom.window
+          ? `against the ${doom.window.toLocaleString("en-US")} token window the active lane resolved`
+          : `against the ${doom.window.toLocaleString("en-US")} token local bar (${doom.declaredWindow.toLocaleString("en-US")} resolved by the active lane; the bar never assumes below ${MIN_ASSUMED_WINDOW_TOKENS.toLocaleString("en-US")}, #4079)`;
     const basis = doom === undefined
         ? "this model request is larger than the silent-direct byte ceiling"
-        : `this model request's core text prices at ~${doom.estTokens.toLocaleString("en-US")} tokens (optimistic floor ${doom.floorTokens.toLocaleString("en-US")}) against the ${doom.window.toLocaleString("en-US")} token window the active lane resolved`;
+        : `this model request's core text prices at ~${doom.estTokens.toLocaleString("en-US")} tokens (optimistic floor ${doom.floorTokens.toLocaleString("en-US")}) ${barNote}`;
     const message =
         "billion-context refused this request locally: the native interceptor's live-state slot is empty (the plugin is between activations or was deactivated), and " + basis + " — forwarding it would send the prompt to the provider uncompressed (#5405/#5996). " +
         "The slot normally rebinds on the next plugin activation; retry shortly. If it persists, restart the host so the interceptor can rebind.";

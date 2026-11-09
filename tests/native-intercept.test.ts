@@ -656,6 +656,36 @@ test("install: an empty-slot body over the window fails OPEN until a lane has st
     }
 });
 
+test("install: an empty-slot refusal names a >=1M resolved window verbatim (#5996)", async () => {
+    const saved = globalThis.fetch;
+    _resetForTest();
+    const sink: string[] = [];
+    globalThis.fetch = fakeFetch(sink);
+    try {
+        // Resolved window at/above the 1M floor: declaredWindow === window, so
+        // the refusal must name it as THE window (the short form), not as a
+        // floored local bar — the sibling fallbackOversizeRefusal distinction.
+        const state: NativeInterceptState = {
+            origin: "http://127.0.0.1:40923",
+            ready: Promise.resolve("http://127.0.0.1:40923"),
+            headersFor: () => ({ "x-bili-plugin-context-window": "2000000" }),
+        };
+        assert.equal(installNativeFetchIntercept(state), true);
+        assert.equal((await globalThis.fetch("http://127.0.0.1:8199/v1/messages", { method: "POST", body: "{}" })).status, 200);
+        liveStateSlotEffect(state)()();
+        // 7.5 MiB < 8 MiB cap, ~2.24M est tokens > the 2M resolved window.
+        const res = await globalThis.fetch("http://127.0.0.1:8199/v1/messages", { method: "POST", body: "x".repeat(7.5 * 1024 * 1024) });
+        assert.equal(res.status, 422);
+        assert.equal(res.headers.get("x-bili-gate"), "oversize-refusal-no-live-state");
+        const j = (await res.json()) as { error?: { message: string } };
+        assert.match(j.error?.message ?? "", /2,000,000/, "names the resolved window");
+        assert.doesNotMatch(j.error?.message ?? "", /local bar/, "a >=1M resolved window is named as the window, not the floored bar");
+    } finally {
+        globalThis.fetch = saved;
+        _resetForTest();
+    }
+});
+
 test("the silent-direct ceiling defaults to 8 MiB and honors BILI_SILENT_DIRECT_MAX_MB (#5405 follow-up, #5826 review)", async () => {
     const savedEnv = process.env.BILI_SILENT_DIRECT_MAX_MB;
     const saved = globalThis.fetch;
