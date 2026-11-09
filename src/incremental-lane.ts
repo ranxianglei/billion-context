@@ -1118,7 +1118,9 @@ export async function handleIncrementalTurn(
             .then((landed) => {
                 if (!landed) return;
                 const live = canonicalCache.get(conversationId);
-                if (live && live.sessionId === sessionId) recordCanonicalPointers(sessionId, live.msgs, log);
+                // Settled SQL timestamps release the journal even after the
+                // warm canonical was evicted; pointer publication stays gated.
+                recordCanonicalPointers(sessionId, live?.sessionId === sessionId ? live.msgs : [], log);
             })
             .catch(() => undefined);
         releaseChain?.();
