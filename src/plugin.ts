@@ -6,9 +6,9 @@ import type { ServerResponse } from "node:http";
 import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
-import { getStore, storageStatusLabel } from "./persist.js";
+import { CORRUPT_SIBLING_CAP, getStore, pruneCorruptSiblings, storageStatusLabel } from "./persist.js";
 import { cloneStoreForRefs } from "./store.js";
-import { acquireInFlight, createSession, getSession, publishForkSession, diagnoseSuccessWithoutUsage, effectiveConfig, findSessionByCanonicalId, listSessions, markCompactionBoundary, markDirty, peekSession, releaseInFlight, statusInputBaseline, withSessionLock, type Session } from "./session.js";
+import { acquireInFlight, createSession, getSessionAsync, publishForkSession, diagnoseSuccessWithoutUsage, effectiveConfig, findSessionByCanonicalId, listSessions, markCompactionBoundary, markDirty, noteAbortedTurn, noteTruncatedUpstream, peekSession, releaseInFlight, statusInputBaseline, withSessionLock, type Session } from "./session.js";
 import { clientConversationHeader } from "./session-id.js";
 import { buildContextView } from "./context-view.js";
 import { ABSORB_TOOL_NAME, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_OPENAI_NO_RANGE, BILI_ACP_TOOLS_RESPONSES_NO_RANGE, PROXY_TOOL_NAMES, READ_ORIGINAL_IMAGE_TOOL, READ_ORIGINAL_IMAGE_TOOL_NAME, READ_ORIGINAL_IMAGE_TOOL_OPENAI, READ_ORIGINAL_IMAGE_TOOL_RESPONSES, RETRIEVE_TOOL_NAME, RULE_TOOL, RULE_TOOL_NAME, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES, SEARCH_CONTEXT_TOOL_NAME, absorbToolsFor, retrieveToolsFor, withAcpNotes, withAcpNotesOpenAI } from "./compress-tool.js";
@@ -379,10 +379,15 @@ export function loadConversations(): void {
     } catch {
         // #406: preserve the corrupt bytes for forensics instead of
         // silently zeroing every route on the next debounced write.
+        // #5779: bound the forensic retention like the session store does.
+        let removedCopies = 0;
         try {
-            fs.renameSync(conversationsFile(), `${conversationsFile()}.corrupt-${Date.now()}`);
+            const backup = `${conversationsFile()}.corrupt-${Date.now()}`;
+            fs.renameSync(conversationsFile(), backup);
+            removedCopies = pruneCorruptSiblings(conversationsFile(), backup).removed;
         } catch {}
-        loggerLog("warn", "[plugin] plugin-conversations.json is corrupt — backed up beside the original, starting an empty routing table");
+        const capNote = removedCopies > 0 ? `; removed ${removedCopies} older forensic cop${removedCopies === 1 ? "y" : "ies"} (cap ${CORRUPT_SIBLING_CAP})` : "";
+        loggerLog("warn", `[plugin] plugin-conversations.json is corrupt — backed up beside the original, starting an empty routing table${capNote}`);
     }
     conversationsDirty = false;
 }
@@ -1046,8 +1051,19 @@ function comparableHistory(value: unknown): boolean {
     if (Array.isArray(value)) return value.every(comparableHistory);
     if (!value || typeof value !== "object") return false;
     const part = value as Record<string, unknown>;
-    if (part.type !== undefined && !["message", "text", "input_text", "output_text", "tool_use", "tool_result", "function_call", "function_call_output"].includes(String(part.type))) return false;
+    if (part.type !== undefined && !["message", "text", "input_text", "output_text", "thinking", "redacted_thinking", "reasoning", "tool_use", "tool_result", "function_call", "function_call_output"].includes(String(part.type))) return false;
     if (part.type === "tool_use" || part.type === "function_call") return true;
+    // #4266: thinking-family blocks project to a named reasoning message and
+    // every wire hashes their bytes into that message's text — anthropicToCore
+    // reads b.thinking, openaiToCore carries reasoning_content, responsesToCore
+    // takes reasoning-item content (or a canonical opaque seed when only
+    // encrypted content is present) — so they are comparable by view. A
+    // payload-less thinking block carries nothing to compare, so it stays
+    // non-comparable (fail-closed: such a session refuses the fork instead of
+    // hashing a view with an unknowable content surface).
+    if (part.type === "thinking") return typeof part.thinking === "string" || typeof part.signature === "string";
+    if (part.type === "redacted_thinking") return typeof part.data === "string";
+    if (part.type === "reasoning") return true;
     if (part.audio !== undefined && part.audio !== null) return false;
     if (part.content !== undefined) return comparableHistory(part.content);
     if (part.output !== undefined) return comparableHistory(part.output);
@@ -1085,8 +1101,28 @@ function forkToolIsError(message: CoreMessage): boolean {
     return (message as CoreMessage & { toolIsError?: boolean }).toolIsError === true;
 }
 
+// Fork identity digests ONLY fields present on BOTH sides of the comparison:
+// the parent snapshot cells AND the child's replayed bytes re-projected at
+// ingress. thinkingTokens is deliberately EXCLUDED — the host projects it onto
+// prepared arrays (projectThinkingMass) and it never exists in the client's
+// bytes, so digesting it flags every stamped cell as spurious drift (the
+// GENERATED_METERING_FIELDS doctrine). Signed thinking content IS identity:
+// its carrier rides thinkingSignature / googleThoughtSignature, so a rotated
+// signature reads as drift (advisory adoption, one unfolded request) instead
+// of silently inheriting stale signature bytes (#1960 territory). The opaque
+// redacted_thinking payload is payload-addressed like images (#3751): its
+// projected text is a constant label carrying no bytes, so without this slot
+// a rotated payload under an unchanged id would pass the gate and inherit
+// stale bytes silently — the raw block's data digests into the tuple instead.
+function redactedPayloadDigest(message: CoreMessage): string | null {
+    const block = (message as CoreMessage & { rawAnthropicBlock?: { type?: unknown; data?: unknown } }).rawAnthropicBlock;
+    if (!block || block.type !== "redacted_thinking" || typeof block.data !== "string") return null;
+    return createHash("sha256").update(block.data, "utf8").digest("hex").slice(0, 16);
+}
+
 export function forkMessageIdentityHash(message: CoreMessage): string {
-    return forkHash([message.role, message.contentType, message.text ?? null, message.toolName ?? null, message.toolCallId ?? null, message.thinkingTokens ?? null, message.summaryOfBlockId ?? null, forkToolIsError(message)]);
+    const m = message as CoreMessage & { thinkingSignature?: string; googleThoughtSignature?: string };
+    return forkHash([m.role, m.contentType, m.text ?? null, m.toolName ?? null, m.toolCallId ?? null, m.thinkingSignature ?? null, m.googleThoughtSignature ?? null, m.summaryOfBlockId ?? null, forkToolIsError(m), redactedPayloadDigest(m)]);
 }
 
 /** #2077 CoW view equality for rememberPluginMessages' prefix walk: compares
@@ -1096,10 +1132,21 @@ export function forkMessageIdentityHash(message: CoreMessage): string {
  *  must track every byte fork matching can see. If an adapter ever attaches a
  *  new runtime field, it MUST be added here and to forkMessageIdentityHash
  *  together. */
+// thinkingTokens compares PRESENCE only (see forkMessageIdentityHash: the
+// value itself is one-sided metering noise, re-derived every turn — comparing
+// it would stop the CoW walk at every stamped cell and replace the whole
+// snapshot view on each turn). Presence is view-relevant: a freshly stamped
+// cell must displace an unstamped stored copy (or vice versa when attribution
+// ends), otherwise the stored snapshot silently loses — or keeps — the hidden
+// mass marker.
 function sameSnapshotView(a: CoreMessage, b: CoreMessage): boolean {
+    const am = a as CoreMessage & { thinkingSignature?: string; googleThoughtSignature?: string };
+    const bm = b as CoreMessage & { thinkingSignature?: string; googleThoughtSignature?: string };
     return a.id === b.id && a.role === b.role && a.contentType === b.contentType
         && a.text === b.text && a.toolName === b.toolName && a.toolCallId === b.toolCallId
-        && a.thinkingTokens === b.thinkingTokens && a.summaryOfBlockId === b.summaryOfBlockId
+        && am.thinkingSignature === bm.thinkingSignature && am.googleThoughtSignature === bm.googleThoughtSignature
+        && (typeof a.thinkingTokens === "number") === (typeof b.thinkingTokens === "number")
+        && a.summaryOfBlockId === b.summaryOfBlockId
         && forkToolIsError(a) === forkToolIsError(b);
 }
 
@@ -1261,7 +1308,17 @@ function forkSnapshot(session: Session, source?: CoreMessage[] | null) {
         const why = capped ? undefined : reconMissReason(session.id);
         throw new Error(why ? `${base} [reconstruction: ${why}]` : base);
     }
-    if (session.metadata.publicSnapshotTextComparable === false || messages.some((m) => (m.thinkingTokens ?? 0) > 0)) throw new Error("multimodal or opaque content cannot be compared by text");
+    // #4266 mechanism 1: signed thinking is no longer an opaque refusal. Wire
+    // thinking/redacted_thinking blocks project to a named reasoning message
+    // (anthropicToCore), so they are comparable by view. The host-projected
+    // metering mass (thinkingTokens, cache-ledger GENERATED_METERING_FIELDS)
+    // stays OUT of fork identity: it exists only on prepared arrays, never in
+    // the client's bytes, and is re-derived every turn — digesting it would
+    // flag every stamped cell as spurious drift on the child's first request.
+    // Signed content rides thinkingSignature/googleThoughtSignature inside the
+    // identity hash, so only genuinely uncomparable content (images, audio,
+    // publicSnapshotTextComparable === false) still refuses.
+    if (session.metadata.publicSnapshotTextComparable === false) throw new Error("multimodal or opaque content cannot be compared by text");
     const store = contentStoreOf(session);
     const expectedStoredRefs = session.metadata.publicSnapshotStoredRefs;
     if (Array.isArray(expectedStoredRefs) && expectedStoredRefs.some((ref) => typeof ref !== "string" || !store.byRef[ref])) throw new Error("CCR original index unavailable");
@@ -1310,14 +1367,19 @@ export function forkParentRevisionLegacy(session: Session): string {
     return forkHash({ sessionId: session.id, messages, state, blockContents: Object.fromEntries(session.blockContents), contentStore: store });
 }
 
-function resolveForkConversation(id: string): Session | undefined {
+// #4942: async — on network storage backends the existence probes must be
+// able to reach the DB (the sync facade misses by design there). Materialization
+// must ride the SAME async seam: a sync getSession after an async probe would
+// mint an EMPTY resident ghost for a DB-only id, and that ghost then poisons
+// every later getSessionAsync of the id for the process lifetime.
+async function resolveForkConversation(id: string): Promise<Session | undefined> {
     if (peekSession(id)) return peekSession(id);
-    if (getStore().loadSync(id)) return getSession(id);
+    if (await getStore().loadAsync(id)) return getSessionAsync(id);
     const { session, entry } = resolveConversation(id);
     if (session) return session;
     const persistedId = entry?.sessionId ?? id;
-    if (!getStore().loadSync(persistedId)) return undefined;
-    return getSession(persistedId);
+    if (!(await getStore().loadAsync(persistedId))) return undefined;
+    return getSessionAsync(persistedId);
 }
 
 /** #2601 freshness window for persona-lineage following — same family as
@@ -1448,7 +1510,7 @@ function forkReply(res: ServerResponse, status: number, body: unknown): void {
 
 export async function handlePluginSnapshot(conversationId: string, res: ServerResponse): Promise<void> {
     if (!conversationId) return forkReply(res, 400, { ok: false, code: "INVALID_REQUEST", error: "conversationId is required" });
-    const session = resolveForkConversation(conversationId);
+    const session = await resolveForkConversation(conversationId);
     if (!session) return forkReply(res, 404, { ok: false, code: "PARENT_NOT_FOUND", error: "unknown plugin conversation" });
     acquireInFlight(session);
     try {
@@ -1502,7 +1564,7 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
     const requestHash = forkHash(request);
     const replay = async (): Promise<boolean> => {
         await getStore().recoverCompletedFork(request.childConversationId);
-        const existing = resolveForkConversation(request.childConversationId);
+        const existing = await resolveForkConversation(request.childConversationId);
         if (!existing) return false;
         const receipt = existing.metadata.publicForkReceipt as { requestHash?: unknown; response?: unknown } | undefined;
         if (receipt?.requestHash === requestHash) forkReply(res, 200, { ...(receipt.response as Record<string, unknown>), replayed: true });
@@ -1512,7 +1574,7 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
     try { if (await replay()) return; }
     catch (err) { return forkReply(res, 503, { ok: false, status: "unavailable", code: "FORK_FAILED", error: String(err) }); }
     if (conversations.has(request.childConversationId) || pendingRegisters.some((r) => r.conversationId === request.childConversationId) || (registeredIds.has(request.childConversationId) && !forkChildHeldBySameParent(request.childConversationId, request.parentConversationId))) return forkReply(res, 409, { ok: false, code: "CHILD_CONFLICT", error: "child conversation already registered" });
-    const parent = resolveForkConversation(request.parentConversationId);
+    const parent = await resolveForkConversation(request.parentConversationId);
     if (!parent) return forkReply(res, 404, { ok: false, code: "PARENT_NOT_FOUND", error: "parent conversation not found" });
     acquireInFlight(parent);
     try {
@@ -1747,7 +1809,9 @@ function webSessionUrl(origin: string | undefined, sessionId: string): string | 
     return `${o}/__bili/#/session/${encodeURIComponent(sessionId)}`;
 }
 
-export function handlePluginStatus(conversationId: string, res: import("node:http").ServerResponse, deps: PluginToolDeps, fallbackLatest = false, trustedOrigin?: string): void {
+// #4942: async — the session resolution below must reach the DB on network
+// storage backends (the caller, handleAdminRoute, is already async).
+export async function handlePluginStatus(conversationId: string, res: import("node:http").ServerResponse, deps: PluginToolDeps, fallbackLatest = false, trustedOrigin?: string): Promise<void> {
     // #3862: the dsh client's Context tab reads this route CROSS-ORIGIN from
     // the dsh web app (its own loopback port / the dsh-app://app scheme). The
     // trusted-origin gate upstream of dispatch already admitted the request;
@@ -1758,7 +1822,7 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
         if (trustedOrigin !== undefined && trustedOrigin.length > 0) h["access-control-allow-origin"] = trustedOrigin;
         return h;
     };
-    let session = resolveForkConversation(conversationId);
+    let session = await resolveForkConversation(conversationId);
     const entry = conversations.get(conversationId);
     let viaFallback = false;
     let resolvedConversationId = conversationId;
@@ -2034,7 +2098,7 @@ export async function handlePluginTool(
         routedBy = "native";
         deps.log("info", `[plugin] tool "${tool}": routed by host call id (#4580) to "${session.id}"`);
     } else if (conversationId) {
-        session = resolveForkConversation(conversationId);
+        session = await resolveForkConversation(conversationId);
         entry = conversations.get(conversationId);
         if (session && witnessIds.size > 0 && !witnessIds.has(session.id)) {
             // #2601: a persona-lineage witness is not a spoof — the host stamps
@@ -2135,7 +2199,7 @@ export async function handlePluginTool(
         }
     }
     if (!session) {
-        session = resolveForkConversation(conversationId);
+        session = await resolveForkConversation(conversationId);
         entry = conversations.get(conversationId);
     }
     // #760: the verbatim-id fallback above can resolve a session with NO map
@@ -3035,7 +3099,14 @@ export async function pipePluginChatWithStrip(
             const d = ch?.["delta"];
             if (!d || typeof d !== "object") continue;
             const dd = d as Record<string, unknown>;
-            if (dd["tool_calls"] !== undefined) {
+            // Some OpenAI-compatible upstreams (sglang) emit explicit nulls for
+            // every delta field ("tool_calls": null on plain text deltas). A null
+            // is not a tool call: treating it as one poisoned sawToolUse and made
+            // retryEmptyTurn (#732/#821) silently skip degenerate empty stops
+            // (thinking + stripped render tag + EOS) — the host saw the turn end
+            // cleanly with no visible output. Compare with != null so only real
+            // tool_calls presence counts.
+            if (dd["tool_calls"] != null) {
                 sawToolUse = true;
                 // #1501 observe-only: accumulate fragments per tool-call index;
                 // the stream-end settle warns when a name never arrives (#1484).
@@ -3166,7 +3237,11 @@ export async function pipePluginChatWithStrip(
         // managed fields — audit them (argument frames excluded: #1039).
         if (!openaiFrameHasToolCalls(choices)) auditRawForward(rawEvent);
         if (drain.length > 0) return drain + rawEvent + "\n\n";
-        if (!hadText && anyPending()) return flushTails() + rawEvent + "\n\n";
+        // A non-terminal frame with no text, no tool call and no other delta key
+        // (MTPLX interleaves `delta:{}` progress frames mid-stream) carries nothing
+        // a held tail must precede. Draining on it split a render tag at the frame
+        // and leaked the tail as prose (#5192 shape) — same disease as #2405.
+        if (!hadText && anyPending() && hadTextOtherThanTextFields(choices)) return flushTails() + rawEvent + "\n\n";
         return rawEvent + "\n\n";
     };
     const processAnthropic = (ev: Record<string, unknown>, rawEvent: string): string => {
@@ -3626,6 +3701,7 @@ export async function pipePluginChatWithStrip(
             // Permitlist hosts (pi) get the raw cut — their native layer
             // classifies it as transient and retries; everyone else gets the
             // in-band truncation signal.
+            if (session) noteTruncatedUpstream(session, protocol, "eof");
             emitUpstreamTruncation(res, protocol, finalFinishReason !== undefined, log, buildTruncationDiag("eof"), transparentTruncationApplies(session));
             return;
         }
@@ -3636,6 +3712,8 @@ export async function pipePluginChatWithStrip(
         settleWitnesses();
         if (res.destroyed || res.writableEnded) {
             log?.("client aborted mid-stream");
+            // #5293: the partial output of an aborted turn never reports usage — record the pre-abort anchor so the first nudge decision after resume can absorb that debt.
+            if (session) noteAbortedTurn(session);
             return;
         }
         // #721: upstream read failed while the client is still connected —
@@ -3651,6 +3729,7 @@ export async function pipePluginChatWithStrip(
             /* client half-gone; the emission below is best-effort too */
         }
         loggerLog("warn", `[plugin] upstream stream read failed (${protocol}): ${String(e instanceof Error ? e.message : e)} — truncation signal path`);
+        if (session) noteTruncatedUpstream(session, protocol, "read-error");
         emitUpstreamTruncation(res, protocol, finalFinishReason !== undefined, log, buildTruncationDiag("read-error"), transparentTruncationApplies(session));
         return;
     } finally {
@@ -3693,7 +3772,10 @@ function openaiFrameHasToolCalls(choices: unknown): boolean {
     if (!Array.isArray(choices)) return false;
     for (const c of choices) {
         const d = c && typeof c === "object" ? (c as Record<string, unknown>)["delta"] : undefined;
-        if (d && typeof d === "object" && (d as Record<string, unknown>)["tool_calls"] !== undefined) return true;
+        // != null: sglang-style explicit "tool_calls": null deltas are not tool
+        // calls (see the sawToolUse fix above); they must not suppress the
+        // echo-residue audit either.
+        if (d && typeof d === "object" && (d as Record<string, unknown>)["tool_calls"] != null) return true;
     }
     return false;
 }
@@ -4490,6 +4572,7 @@ export async function pipePluginResponsesWithStrip(
         // event. Permitlist hosts (pi) get the raw cut for their native
         // classifier; everyone else gets the in-band error frame.
         if (!sawTerminal && !res.destroyed && !res.writableEnded) {
+            if (session) noteTruncatedUpstream(session, "responses", "eof");
             emitUpstreamTruncation(res, "responses", false, log, buildTruncationDiag("eof"), transparentTruncationApplies(session));
             return;
         }
@@ -4499,6 +4582,8 @@ export async function pipePluginResponsesWithStrip(
         settleWitnesses();
         if (res.destroyed || res.writableEnded) {
             log?.("client aborted mid-stream");
+            // #5293: same as the chat lane — record the pre-abort anchor for the post-resume re-anchor.
+            if (session) noteAbortedTurn(session);
             return;
         }
         // #721: upstream read failed while the client is still connected —
@@ -4512,6 +4597,7 @@ export async function pipePluginResponsesWithStrip(
             /* client half-gone; the emission below is best-effort too */
         }
         loggerLog("warn", `[plugin] upstream stream read failed (responses): ${String(e instanceof Error ? e.message : e)} — truncation signal path`);
+        if (session) noteTruncatedUpstream(session, "responses", "read-error");
         emitUpstreamTruncation(res, "responses", false, log, buildTruncationDiag("read-error"), transparentTruncationApplies(session));
         return;
     } finally {

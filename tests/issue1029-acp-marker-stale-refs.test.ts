@@ -66,15 +66,18 @@ test("#1029-②: no-valid-ranges failure is self-contained on line 1 (no danglin
     assert.match(marker, /❌ \[ACP\] Compression FAILED.*Rejected entries: entry 0:/, "marker carries the complete failure");
 });
 
-test("#1029-②: repeated identical malformed calls escalate via the repeat-failure guard", () => {
+test("#1029-②: repeated identical malformed calls escalate (2nd+ collapse to a one-liner that still counts)", () => {
     const ctx = makeCtx([textMsg("raw_1", "assistant", "a".repeat(800))]);
     const bad = () => applyRanges(parseCompressInput({ content: [{ startId: "m00001", endId: "m00002" }] }), ctx).text;
     const first = bad();
     assert.ok(first.startsWith("[Compression FAILED"), first);
     assert.ok(!first.includes("Repeat-failure guard"), "first attempt has no escalation");
+    assert.ok(!first.includes("FAILED again"), "first attempt is the full receipt, not the one-liner");
     const second = bad();
-    assert.match(second, /Repeat-failure guard/);
+    assert.ok(second.startsWith("[Compression FAILED again"), `second attempt collapses to the one-liner, got: ${second.slice(0, 120)}`);
     assert.match(second, /2 time\(s\)/);
+    assert.doesNotMatch(second, /compress takes ONE 'content' STRING/, "one-liner must not repeat the format lecture");
+    assert.match(second, /FIRST failed receipt above/, "one-liner points back at the full receipt");
 });
 
 test("#1029-③: zero-block rejection inlines the current ref span (stale refs from another generation)", () => {
