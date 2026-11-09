@@ -2926,10 +2926,20 @@ export function effectiveTokenCount(session: Session, msgs: CoreMessage[], inbou
     // grade (false pressure-T2 right after a successful T1). Credit can only
     // be minted by this conversation's own folds (foreign usage samples write
     // none), so it exempts exactly this window; the #4805/#4849 anchor-
-    // pollution refusal stays fully armed when credit == 0. #4383's cycle-stale guard
-    // still wins (#4383: newer unreported sends ride their own measurements);
-    // zero is a valid drained reading (kernel treats 0 as unknown).
-    if (!anchorStale && session.stats.lastInputTokensSource === "usage" && (session.stats.compressCreditTokens ?? 0) > 0 && session.stats.lastInputTokens >= 0) return { tokens: session.stats.lastInputTokens, source: "usage" };
+    // pollution refusal stays fully armed when credit == 0.
+    // #5135+#4383 field fix: this branch deliberately overrides cycle-staleness
+    // too. A compress BURST (turns whose only output is compress calls) never
+    // reaches an upstream settle, so prepare stamps contextTokensSource=
+    // "estimate" every turn and usageAnchorCycleStale() stays true for the
+    // whole burst — pre-fix the credit exemption was dead exactly when it was
+    // needed, the meter fell through to the raw INBOUND upper bound (the full
+    // resent history), and a just-folded session read 238112/212992 = 112%
+    // "pressure" while its actual outbound was 83K — the phantom that kept
+    // re-nudging the model into the very compress loop the folds were supposed
+    // to end. The credit window is still bounded: the next real settle clears
+    // it (loop/core.ts), so this cannot freeze the meter; zero is a valid
+    // drained reading (kernel treats 0 as unknown).
+    if (session.stats.lastInputTokensSource === "usage" && (session.stats.compressCreditTokens ?? 0) > 0 && session.stats.lastInputTokens >= 0) return { tokens: session.stats.lastInputTokens, source: "usage" };
     if (!anchorStale && !anchorImpossible && session.stats.lastInputTokens > 0 && (session.stats.lastInputTokensSource === "usage" || session.stats.lastInputTokensSource === "overflow-arm") && staleSmallAnchorFallback(session.stats, session.stats.lastInputTokens) === null) return { tokens: session.stats.lastInputTokens, source: "usage" };
     // #1820: right after a preflight rebuild the usage-grade baseline above is
     // momentarily absent (the rebuild request's own report hasn't landed yet,

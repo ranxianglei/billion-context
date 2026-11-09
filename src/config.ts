@@ -663,7 +663,9 @@ export type CompressSettings = {
      *  and state are untouched; identical layout is recomputed every turn.
      *  Env BILI_COMPRESS_AT_FOLD_POINT wins over every level;
      *  applyCompressSettings resolves it per request. Maps to kernel
-     *  Config.compressAtFoldPoint (acp-kernel >= 0.0.177). */
+     *  Config.compressAtFoldPoint (acp-kernel >= 0.0.177; v2 semantics since
+     *  0.0.188 — summary text relocated to the fold point, pair kept in slot
+     *  with pointer args). */
     compressAtFoldPoint?: boolean;
     /** Second opt-in riding on compressAtFoldPoint (default OFF): also drop
      *  the contiguous run of UNSIGNED reasoning cores immediately preceding a
