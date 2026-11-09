@@ -1702,8 +1702,11 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     const blocks = (session.state?.blocks ?? []) as BlockLike[];
     // Active coverage first (the anchor cap's survivor order, #2334), then the
     // retained view-deactivated lineage re-fed into the claim ladder (#4050);
-    // see recoveryCandidateIds for what is excluded and why.
-    const covered = coveredIdsOf(blocks);
+    // see recoveryCandidateIds for what is excluded and why. activeCovered keeps
+    // the active-only caliber intact (a separate object, never mutated) so the
+    // #5715 surviving-majority test below can run on live substrate alone.
+    const activeCovered = coveredIdsOf(blocks);
+    const covered = new Set(activeCovered);
     for (const id of recoveryCandidateIds(blocks)) covered.add(id);
     if (covered.size === 0) {
         resetFoldDriftState(session);
@@ -2181,13 +2184,18 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     // totalDrift itself: the #3641 drift streak + frozen witness are what keep
     // a genuine mid-history edit reading as honest loss (zombie accrual)
     // rather than sanctioned truncation (#4050/#2695). The surviving majority
-    // only voids the TERMINAL verdict (below). Denominators match the per-block
-    // coverage (separators / expected rebases / reasoning cores excluded); the
-    // bar is >= MIN_RESYNC_RUN and > half. Genuine wholesale replacement has ~0
-    // directly-present covered ids, so this can never mask a real collapse.
+    // only voids the TERMINAL verdict (below). The base is ACTIVE coverage only
+    // (the coveredIdsOf caliber), NOT the full `covered`: the #4050 view-
+    // deactivated lineage re-fed via recoveryCandidateIds is recoverable-but-
+    // gone, and its legitimate post-rewind/post-drift absence must never be able
+    // to dilute a healthy active majority below the bar (#5715 field report).
+    // Denominators match the per-block coverage (separators / expected rebases /
+    // reasoning cores excluded); the bar is >= MIN_RESYNC_RUN and > half.
+    // Genuine wholesale replacement has ~0 directly-present ACTIVE covered ids,
+    // so this can never mask a real collapse.
     let coveredHard = 0;
     let presentHard = 0;
-    for (const id of covered) {
+    for (const id of activeCovered) {
         if (isResponsesTurnSeparatorId(id) || expected[id] !== undefined || anchors[id]?.c === "reasoning") continue;
         coveredHard++;
         if (byId.has(id)) presentHard++;
