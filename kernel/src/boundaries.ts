@@ -62,11 +62,27 @@ export class BoundaryNotFoundError extends Error {
   }
 }
 
+/** #5337 option A: one O(n) raw-id -> index map over a message array. Built
+ *  once per screening pass (many units share it) instead of once per unit,
+ *  which was one of the O(n) terms multiplied by the unit count. Duplicate
+ *  ids resolve to their LAST position — same as the per-call maps replaced. */
+export function buildIndexByMessageId(
+  messages: readonly CoreMessage[],
+): Map<string, number> {
+  const byId = new Map<string, number>();
+  messages.forEach((message, index) => byId.set(message.id, index));
+  return byId;
+}
+
 export interface ResolveBoundariesInput {
   startRef: string;
   endRef: string;
   messages: CoreMessage[];
   state: CompressionState;
+  /** #5337 option A: prebuilt raw-id -> index map over EXACTLY `messages`
+   *  (screening screens many units against one array — build once per pass).
+   *  Omitted callers build one here as before. */
+  indexByMessageId?: Map<string, number>;
 }
 
 export interface ResolvedRange {
@@ -91,10 +107,8 @@ export function resolveBoundaries(
     );
   }
 
-  const indexByMessageId = new Map<string, number>();
-  input.messages.forEach((message, index) =>
-    indexByMessageId.set(message.id, index),
-  );
+  const indexByMessageId =
+    input.indexByMessageId ?? buildIndexByMessageId(input.messages);
 
   let snappedBoundaries: string[] = [];
   const startAnchor = resolveAnchorIndex(

@@ -7,7 +7,7 @@ import { flatFileNameFor } from "acp-kernel/persist";
 import type { WebSummaryRow } from "../storage/store.js";
 import { renderHandoff } from "../export.js";
 import { buildSessionCacheReport } from "../cache-ledger.js";
-import { resolveBillingPrice, savedUsdFromFolds } from "../billing.js";
+import { resolveBillingPrice, savedUsdFromFolds, validCostUsd } from "../billing.js";
 
 /** Shape of a resolved price row — taken via ReturnType so this module never
  *  couples to billing.ts's internal export surface (see #4916 unused-export
@@ -16,6 +16,7 @@ type LivePrice = NonNullable<ReturnType<typeof resolveBillingPrice>>;
 import { keepaliveStatusFor, type KeepaliveStatus } from "../cache-keepalive.js";
 import { METADATA_FOLD_COVERAGE } from "../fold-reconcile.js";
 import { markdownToHtml } from "./markdown.js";
+import { contextAnalysisView, type ContextAnalysisView } from "../context-analysis.js";
 import { log } from "../logger.js";
 import { dataDir } from "../paths.js";
 import { isExternalSummaryBlock } from "../external-summary-marker.js";
@@ -32,6 +33,16 @@ import * as path from "node:path";
  *  Session objects, so resident memory stays O(#sessions × ~1KB) regardless of
  *  total corpus bytes; a single admin request's peak is one decoded file. */
 
+// #5796: the host-side conversation surface (dsh session file, agent
+// transcripts) grows without bound — bili compression shrinks what is SENT to
+// the model, not the host's own history — so per-step cost climbs with it. On
+// plugin lanes (~2 host messages per request, dsh-measured) that becomes
+// visible around 10k messages ≈ 5k requests. The server log warns much earlier
+// (SLOW_SESSION_MSG_WARN = 1000 messages, src/server.ts); this display gate is
+// deliberately higher — the badge should mean "worth starting a new session",
+// not "notable".
+const SLOW_SESSION_REQUESTS_WARN = 5000;
+
 interface WebSessionSummary {
     id: string;
     title?: string;
@@ -42,6 +53,10 @@ interface WebSessionSummary {
      *  false = disk-only (evicted or from before this process started). */
     live: boolean;
     requests: number;
+    /** #5796: set once requests reach SLOW_SESSION_REQUESTS_WARN — the host-side
+     *  history only grows and per-step cost is climbing; the panel badges the row
+     *  so starting a fresh session reads as the actionable exit. */
+    slowSession?: { requests: number };
     contextTokens: number;
     /** #1839: provenance of contextTokens — "usage" = last real usage report,
      *  "estimate" = bounded local estimate (display should mark it as such). */
@@ -288,6 +303,11 @@ interface WebSessionDetail extends WebSessionSummary {
      *  resolution as the banner's clients[]); absent when unresolvable or when
      *  there are no conflicts. */
     conflictClient?: string;
+    /** Context analysis: init size, nudge cadence, compression acceptance
+     *  (harvest) rate, and the plain-language verdict — this process's live
+     *  view (in-memory only; absent for sessions this bili process has not
+     *  observed at least twice yet). */
+    contextAnalysis?: ContextAnalysisView;
     /** #2904: no-ceiling output-budget degraded state for this session's last
      *  starved model ({model,value,ts}); absent when none holds. */
     outputBudgetDegraded?: { model: string; value: number; ts: number };
@@ -633,18 +653,6 @@ function str(v: unknown): string | undefined {
     return typeof v === "string" && v.length > 0 ? v : undefined;
 }
 
-/** #4899: validate the persisted USD ledger blob — metadata/stats are
- *  user-editable JSON, so only finite non-negative fields survive; anything
- *  else reads as "no ledger" instead of poisoning the display. */
-function validCostUsd(v: unknown): { input: number; cacheRead: number; cacheWrite: number; output: number } | undefined {
-    if (!v || typeof v !== "object" || Array.isArray(v)) return undefined;
-    const o = v as Record<string, unknown>;
-    const f = (x: unknown): number | undefined => (typeof x === "number" && Number.isFinite(x) && x >= 0 ? x : undefined);
-    const input = f(o.input), cacheRead = f(o.cacheRead), cacheWrite = f(o.cacheWrite), output = f(o.output);
-    if (input === undefined && cacheRead === undefined && cacheWrite === undefined && output === undefined) return undefined;
-    return { input: input ?? 0, cacheRead: cacheRead ?? 0, cacheWrite: cacheWrite ?? 0, output: output ?? 0 };
-}
-
 /** #4899 v2 (owner design): the dollar faces of the panel are a DERIVED VIEW.
  *  They recompute on every fetch from the CURRENTLY resolved price table
  *  (`billing.prices` overrides > models.dev snapshot) — never gated on
@@ -971,6 +979,7 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
             : {}),
         live,
         requests,
+        ...(requests >= SLOW_SESSION_REQUESTS_WARN ? { slowSession: { requests } } : {}),
         contextTokens: s.stats.contextTokens,
         ...(s.stats.contextTokensSource ? { contextTokensSource: s.stats.contextTokensSource } : {}),
         tokensSaved,
@@ -1531,6 +1540,10 @@ function renderDetail(session: Session, live: boolean): WebSessionDetail {
         handoffTruncated,
         ...(conflicts.length > 0 ? { conflicts } : {}),
         ...(conflictClient ? { conflictClient } : {}),
+        ...(() => {
+            const ca = contextAnalysisView(session.id);
+            return ca ? { contextAnalysis: ca } : {};
+        })(),
         blockDetails: session.state.blocks.map((b) => {
             // Display data: canonicalize to ascending labels so non-monotonic-
             // ref spans don't render reversed in the UI (#2168).

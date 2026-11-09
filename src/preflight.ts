@@ -135,6 +135,16 @@ const DETERMINISTIC_EMPTY_STICKY_LIMIT = 3;
 // skip a doomed round only when the shortfall survives this slack — when
 // unsure, walk exactly as before.
 const FUTILITY_SLACK = 1.2;
+
+// #5408: when the #4288 fit-forward exit judges on ESTIMATE ONLY (no usage
+// baseline backing it) and the payload estimate reaches this fraction of the
+// HARD window limit, warn: the local estimate excludes the system prompt +
+// tool definitions and provider-side counting, so "fits by our scale" can
+// still overflow upstream (the incident forwarded ~542K actual against a
+// 500K window with zero bili warnings). Observability only — the forward
+// still happens (blocking would defeat #4288); the overflow-arm rescue folds
+// next turn if upstream rejects (#1195).
+const FIT_FORWARD_ESTIMATE_ONLY_MARGIN = 0.85;
 // #2383: entry overshoot (entryTokens / window) above which the LLM fold path
 // is PROVABLY unable to converge in this invocation — it exceeds the raised
 // budget's maximum coverage (MAX_PREFLIGHT_ROUNDS * 2 rounds x CHUNK_FRACTION
@@ -376,10 +386,53 @@ function refNum(ref: string): number {
 // clamp, the image-cost textSide) carries billed-caliber mass. Without it the
 // k̂ sample divides a bill that includes thinking by an estimate that
 // excludes it, and thinking-heavy routes learn an inflated factor.
+// #5116: the estimator runs on EVERY outbound turn over the RESENT full
+// history, so the CJK-aware scan is O(total conversation bytes) per request
+// and O(turns × bytes) per session — the single largest per-turn CPU item on
+// big-context lanes. A message's estimate is a pure function of its identity
+// (text + thinkingTokens), and kernel-minted ids are content digests, so an
+// id-keyed memo makes every call after the first a Map lookup: steady state
+// pays O(new messages) instead of O(full history) and repeated calls within
+// one turn (preflight arming, window gates, output clamp, relay) all hit.
+// Only `h_` digest ids are cached — test fixtures and reserved ids
+// (`acp_summary_*`) may reuse an id across differing texts and bypass it.
+// Kernel ids are *logical* identity, not a digest of the counted text, so two
+// same-id messages can still differ in counted text: (a) converters seed
+// tool-call ids with canonicalToolArgs(args) (whitespace/key-order only — the
+// character multiset, and therefore the CJK-aware count, is unchanged) while
+// CoreMessage.text keeps the verbatim args; (b) view renders (renderTags,
+// snapshot render) rewrite text in place and keep ids. The key therefore also
+// carries text length: every length-changing rewrite misses (a safe recount),
+// and the canonicalization deltas from (a) are count-invariant by construction.
+const messageTokenMemo = new Map<string, number>();
+const MESSAGE_TOKEN_MEMO_CAP = 200_000;
+const KERNEL_MINTED_ID = /^h_[0-9a-f]{16}(?:_\d+)?$/;
+
 export function estimateCoreMessages(messages: CoreMessage[]): number {
     let tokens = 0;
-    for (const m of messages) tokens += countMessageTokens(m, defaultCountTokens);
+    for (const m of messages) {
+        const id = m.id;
+        if (KERNEL_MINTED_ID.test(id)) {
+            const textLength = m.text === undefined ? -1 : m.text.length;
+            const key = `${id}|${textLength}|${m.thinkingTokens ?? ""}`;
+            const cached = messageTokenMemo.get(key);
+            if (cached !== undefined) {
+                tokens += cached;
+                continue;
+            }
+            const counted = countMessageTokens(m, defaultCountTokens);
+            if (messageTokenMemo.size >= MESSAGE_TOKEN_MEMO_CAP) messageTokenMemo.clear();
+            messageTokenMemo.set(key, counted);
+            tokens += counted;
+        } else {
+            tokens += countMessageTokens(m, defaultCountTokens);
+        }
+    }
     return tokens;
+}
+
+export function clearEstimateCoreMessagesMemoForTests(): void {
+    messageTokenMemo.clear();
 }
 
 // #554: side requests bypass the pipeline (#388) and are forwarded VERBATIM,
@@ -390,7 +443,12 @@ export function estimateCoreMessages(messages: CoreMessage[]): number {
 // imageTokensInParsedBody charges those separately. Slightly overcounts (ids,
 // roles, structural strings) — a conservative bias is right for a guard that
 // fails closed.
-const NON_TEXT_BODY_KEYS = new Set(["data", "url", "b64_json", "file_data"]);
+// #5932: `image_url` is the responses-lane/OpenAI data-URL shape (the blob sits
+// DIRECTLY under that key) — counting it as text once made a 40 MB screenshot
+// body "measure" ~10M tokens and doom-gates 413'd image turns that belong in
+// the #496/#1800 billing arbitration. OpenAI chat `image_url.url`, Anthropic
+// `source.data` and Gemini `inline_data.data` were already excluded.
+const NON_TEXT_BODY_KEYS = new Set(["data", "url", "b64_json", "file_data", "image_url"]);
 
 export function estimateRawBodyTokens(parsed: unknown): number {
     let tokens = 0;
@@ -409,6 +467,53 @@ export function estimateRawBodyTokens(parsed: unknown): number {
     };
     walk(parsed);
     return tokens;
+}
+
+/** #5000 item 3: which DIMENSION carries the outbound mass. The doom messages
+ *  must say whether it is messages[] (a giant paste / tool result), tools[]
+ *  (84 schemas in #5000), the system prompt, or structural other — "trim the
+ *  oversized content" is actively misleading for a 55.2 MiB body whose
+ *  messages[] is only 1.44 MiB. Same walk + same exclusions as
+ *  estimateRawBodyTokens, split on the TOP-LEVEL field, so `total` always
+ *  equals estimateRawBodyTokens(parsed) exactly. */
+export interface RawBodyBreakdown {
+    total: number;
+    messages: number;
+    tools: number;
+    system: number;
+    other: number;
+}
+
+export function estimateRawBodyBreakdown(parsed: unknown): RawBodyBreakdown {
+    const buckets: [number, number, number, number] = [0, 0, 0, 0]; // messages, tools, system, other
+    const walk = (value: unknown, key: string | undefined, bucket: number): void => {
+        if (typeof value === "string") {
+            if (!key || !NON_TEXT_BODY_KEYS.has(key)) buckets[bucket] += defaultCountTokens(value);
+            return;
+        }
+        if (Array.isArray(value)) {
+            for (const item of value) walk(item, key, bucket);
+            return;
+        }
+        if (value && typeof value === "object") {
+            for (const [k, v] of Object.entries(value as Record<string, unknown>)) walk(v, k, bucket);
+        }
+    };
+    if (parsed && typeof parsed === "object") {
+        for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+            const bucket = k === "messages" ? 0 : k === "tools" ? 1 : k === "system" ? 2 : 3;
+            walk(v, k, bucket);
+        }
+    } else {
+        walk(parsed, undefined, 3);
+    }
+    return {
+        total: buckets[0] + buckets[1] + buckets[2] + buckets[3],
+        messages: buckets[0],
+        tools: buckets[1],
+        system: buckets[2],
+        other: buckets[3],
+    };
 }
 
 // #553: upper-bound variant of estimateCoreMessages — every character counts
@@ -1348,12 +1453,23 @@ class SummaryTransportError extends Error {
 }
 
 async function requestSummaryBody(deps: PreflightDeps, body: string, stream: boolean): Promise<string> {
+    // #5904: log the upstream's origin+path (never the query — it can carry
+    // signed credentials) so progress lines stay greppable per-endpoint.
+    const safeUpstreamLabel = (raw: string): string => {
+        try { const u = new URL(raw); return u.origin + u.pathname; } catch { return "upstream"; }
+    };
     const maxAttempts = replayMaxAttempts();
     for (let attempt = 1; ; attempt++) {
         deps.signal?.throwIfAborted();
         let clearTimer: (() => void) | undefined;
         let stage: "request" | "response body" = "request";
         let retryDetail: string;
+        const sentAt = Date.now();
+        // #5904: a summary attempt could previously wedge between "sent" and
+        // "answered" with NO log line at all — a 5-minute silent hang was
+        // indistinguishable from a slow prefill. Emit send/receive progress so
+        // log timelines show exactly which attempt is in flight and for how long.
+        deps.log("info", `[preflight] summary attempt ${attempt}/${maxAttempts} sent (${body.length}b, stream=${stream}) → ${safeUpstreamLabel(deps.url)}`);
         try {
             // #3226: build the header set first so a signed lane can re-sign over
             // the summary's OWN bytes — forwarding the inbound signature verbatim
@@ -1369,6 +1485,7 @@ async function requestSummaryBody(deps: PreflightDeps, body: string, stream: boo
             }, undefined, deps.signal);
             clearTimer = result.clearTimer;
             stage = "response body";
+            deps.log("info", `[preflight] summary attempt ${attempt} headers received (${result.response.status}) after ${Date.now() - sentAt}ms`);
             const text = await result.response.text();
             deps.signal?.throwIfAborted();
             if (!result.response.ok) throw new UpstreamHttpError(result.response.status, text, attempt);
@@ -1401,6 +1518,7 @@ async function requestSummaryBody(deps: PreflightDeps, body: string, stream: boo
                 if (failure instanceof UpstreamHttpError && failure.status >= 400 && failure.status < 500) {
                     dumpSummaryRejection(failure.status, deps.session.id, body, failure.body);
                 }
+                deps.log("error", `[preflight] summary failed permanently after ${attempt} attempt${attempt === 1 ? "" : "s"} (${Date.now() - sentAt}ms): ${failure.message}`);
                 throw failure;
             }
             retryDetail = failure instanceof UpstreamHttpError ? `HTTP ${failure.status}` : failure.message;
@@ -2150,6 +2268,9 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             fitExitForward = true;
             if (baselineFloor >= textTarget && !armedBaseline) {
                 deps.log("info", `[preflight] payload fits by its own estimate (~${Math.round(result.payloadEstimate)}/${textTarget} target, window ${limit}); stopping instead of folding further despite a higher usage baseline (~${Math.round(baselineFloor)} tok measured under a prior model/route) — forwarding (#4288)`);
+            }
+            if (!armedBaseline && baselineFloor < textTarget && result.payloadEstimate >= FIT_FORWARD_ESTIMATE_ONLY_MARGIN * limit) {
+                deps.log("warn", `[preflight] fit-forward on estimate only: ~${Math.round(result.payloadEstimate)} tok vs window ${limit} with no usage measurement backing the fit (baseline ~${Math.round(baselineFloor)}) — the local estimate excludes the system prompt + tool definitions, so upstream may still reject with context overflow; if it does, the overflow-arm rescue folds next turn (#5408/#4288)`);
             }
             break;
         }
