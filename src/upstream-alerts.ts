@@ -194,8 +194,11 @@ const MAX_CIRCUITS = 32;
 interface CircuitEntry {
     state: UpstreamCircuit;
     /** True while the single half-open probe is in flight — concurrent
-     *  requests fail fast instead of stacking parallel probes. */
+     *  requests fail fast instead of stacking parallel probes. The slot is a
+     *  lease that lapses one cooldown after probeAt: a claimant can be answered
+     *  locally (e.g. by the #4204 429 hold) and never settle it. */
     probeInFlight: boolean;
+    probeAt: number;
     /** #4254: timestamp of the last emitted per-request fail-fast [warn], used by
      *  noteCircuitFailFastLog to bound the OPEN-state log storm to one line/window. */
     lastFailFastLogAt: number;
@@ -223,8 +226,10 @@ export function upstreamCircuitBlockReason(url: string, now: number = Date.now()
     if (!entry || entry.state.openedAt === null) return undefined;
     const c = entry.state;
     if (now < (c.nextProbeAt ?? 0)) return blockReasonText(c, now);
-    if (entry.probeInFlight) return blockReasonText(c, now);
+    // Lease, not lock (see CircuitEntry.probeInFlight).
+    if (entry.probeInFlight && now - entry.probeAt < circuitProbeCooldownMs) return blockReasonText(c, now);
     entry.probeInFlight = true;
+    entry.probeAt = now;
     return undefined;
 }
 
@@ -307,7 +312,7 @@ export function recordUpstreamCircuitFailure(url: string, error: unknown, viaPro
             }
             if (oldestKey !== undefined) circuits.delete(oldestKey);
         }
-        entry = { state: { host, consecutiveFailures: 0, openedAt: null, nextProbeAt: null, lastFailure: null }, probeInFlight: false, lastFailFastLogAt: 0 };
+        entry = { state: { host, consecutiveFailures: 0, openedAt: null, nextProbeAt: null, lastFailure: null }, probeInFlight: false, probeAt: 0, lastFailFastLogAt: 0 };
         circuits.set(host, entry);
     }
     const c = entry.state;

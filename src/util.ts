@@ -495,6 +495,10 @@ function parseOverflowCounts(text: string): { total?: number; messages?: number;
     // messages, 256000 in the completion)."
     let m = text.match(/requested\s+(\d[\d,]*)\s*tokens?\s*\(\s*(\d[\d,]*)\s*in the messages,\s*(\d[\d,]*)\s*in the completion\s*\)/i);
     if (m) return { total: toTokenNumber(m[1]), messages: toTokenNumber(m[2]), completion: toTokenNumber(m[3]) };
+    // SGLang/LiteLLM: "requested a total of N tokens: M tokens from the
+    // input messages and C tokens for the completion".
+    m = text.match(/requested\s+a\s+total\s+of\s+(\d[\d,]*)\s*tokens?\s*:\s*(\d[\d,]*)\s*tokens?\s+from the input messages\s+and\s+(\d[\d,]*)\s*tokens?\s+for the completion\b/i);
+    if (m) return { total: toTokenNumber(m[1]), messages: toTokenNumber(m[2]), completion: toTokenNumber(m[3]) };
     // Anthropic: "prompt is too long: 130000 tokens > 128000 maximum" — the
     // first number IS the prompt (messages) size; no completion split stated.
     m = text.match(/prompt is too long:\s*(\d[\d,]*)\s*tokens?\s*>/i);
