@@ -436,6 +436,14 @@ async function forwardCaptured(
             log("warn", `[${prepared?.session.id ?? "passthrough"}] [resign] re-sign failed; sending the previous signature: ${String(err)}`);
         }
     };
+    // Single egress chokepoint for every recovery re-send (#6003 groundwork): the
+    // re-sign (#1884) then v1internal re-wrap (#3129) each retry rung used to
+    // re-inline now lives here once. A future user egress-transform pipeline hooks
+    // in before the re-sign so the signature always covers the shipped bytes.
+    const finalizeEgress = (variant: string | Buffer): string | Buffer => {
+        applyResign(headers, variant);
+        return v1Wrap(variant);
+    };
     // #1093 output-side compression: resolve through the standard three-level
     // compress cascade (global → provider); default off = byte-for-byte passthrough.
     // The kernel decides (turn kind / verbosity / lower-effort); bili only lands it.
@@ -1052,8 +1060,7 @@ async function forwardCaptured(
         log("info", `[${prepared.session.id}] [ws-byte-shed] upstream closed 1009 with zero events at ${formatMiB(sentBytes)} MiB — shed to ${formatMiB(stats.finalBytes)} MiB (archived=${stats.archived} downscaled=${stats.downscaled}), resending once within this request`);
         try {
             const shrunkWire = scrubLoneSurrogatesOnWire(shrunk);
-            applyResign(headers, shrunkWire);
-            const retried = await fetchWithTimeout(upstreamUrl, { ...init, body: v1Wrap(shrunkWire) }, undefined, clientAbort.signal);
+            const retried = await fetchWithTimeout(upstreamUrl, { ...init, body: finalizeEgress(shrunkWire) }, undefined, clientAbort.signal);
             if (retried.response.ok) {
                 firstAttemptClear?.();
                 wireBody = shrunkWire;
@@ -1167,8 +1174,7 @@ async function forwardCaptured(
                     if (fixed.rewritten === 0) return "other";
                     let r: Awaited<ReturnType<typeof fetchWithTimeout>>;
                     try {
-                        applyResign(headers, fixed.body);
-                        r = await fetchWithTimeout(upstreamUrl, { ...init, body: v1Wrap(fixed.body) }, undefined, clientAbort.signal);
+                        r = await fetchWithTimeout(upstreamUrl, { ...init, body: finalizeEgress(fixed.body) }, undefined, clientAbort.signal);
                     } catch {
                         return "other"; // transport failure — keep the original 400
                     }
@@ -1266,8 +1272,7 @@ async function forwardCaptured(
             if (strippedPckBody !== null && !contentWall) {
                 let retried: Awaited<ReturnType<typeof fetchWithTimeout>> | null = null;
                 try {
-                    applyResign(headers, strippedPckBody);
-                    retried = await fetchWithTimeout(upstreamUrl, { ...init, body: v1Wrap(strippedPckBody) }, undefined, clientAbort.signal);
+                    retried = await fetchWithTimeout(upstreamUrl, { ...init, body: finalizeEgress(strippedPckBody) }, undefined, clientAbort.signal);
                 } catch {
                     retried = null; // transport failure — inconclusive, original 400 stands
                 }
@@ -1518,8 +1523,7 @@ async function forwardCaptured(
                 } else {
                     try {
                         s.metadata.imageCountShed = { at: Date.now(), phase: "same-request-retry", cap: overflowInfo.imageCountCap, archived: countShed.stats.archived };
-                        applyResign(headers, countShed.body);
-                        const retried = await fetchWithTimeout(upstreamUrl, { ...init, body: v1Wrap(countShed.body) }, undefined, clientAbort.signal);
+                        const retried = await fetchWithTimeout(upstreamUrl, { ...init, body: finalizeEgress(countShed.body) }, undefined, clientAbort.signal);
                         if (retried.response.ok) {
                             upstreamResult.clearTimer();
                             wireBody = countShed.body; // track the accepted re-send as the wire base
@@ -1574,8 +1578,7 @@ async function forwardCaptured(
                         // summaries — scrub string bodies again so a lone
                         // surrogate can't poison the retry (see the #1884 seam).
                         const wireRefolded = typeof refolded.body === "string" ? scrubLoneSurrogatesOnWire(refolded.body) : refolded.body;
-                        applyResign(headers, wireRefolded);
-                        const retried = await fetchWithTimeout(upstreamUrl, { ...init, body: v1Wrap(wireRefolded) }, undefined, clientAbort.signal);
+                        const retried = await fetchWithTimeout(upstreamUrl, { ...init, body: finalizeEgress(wireRefolded) }, undefined, clientAbort.signal);
                         if (retried.response.ok) {
                             upstreamResult.clearTimer();
                             wireBody = wireRefolded; // #1900: track the accepted re-send as the wire base
