@@ -23,7 +23,8 @@ import type { WireProtocol } from "./util.js";
  * Adoptability is judged in raw-id SET semantics, not position math: a raw id
  * is a SHA-256 of the message identity (role+contentType+text+toolCallId+
  * toolName, wire/message-id.ts), so the same bytes produce the same id in
- * parent and child. A block is adoptable iff every id in its
+ * parent and child. A retained block that is neither explicitly expanded nor
+ * consumed by another block is adoptable iff every id in its
  * effectiveMessageIds appears among the incoming request's core ids —
  * position-free, immune to subagent interleaving and reordering, and it
  * naturally rejects blocks that straddle the fork point (some source messages
@@ -83,7 +84,7 @@ interface ForkAdoptionPlan {
     adoptedActive: number;
     /** Sum of compressedTokens over the adopted ACTIVE blocks. */
     adoptedTokens: number;
-    /** Active blocks rejected because part of their source is absent. */
+    /** Eligible blocks rejected because part of their source is absent. */
     straddled: number;
     /** Highest ref string seeded, for logs. */
     maxRef: string;
@@ -166,11 +167,15 @@ export function planForkAdoption(
     const byId = new Map<string, CompressionBlock>();
     for (const b of parent.state.blocks) byId.set(b.blockId, b);
 
+    const consumed = new Set(parent.state.blocks.flatMap(b => b.directBlockIds));
     const active: CompressionBlock[] = [];
     let straddled = 0;
     if (includeBlocks) {
         for (const b of parent.state.blocks) {
-            if (!b.active) continue;
+            // Activity belongs to the source's last view; the fork may replay
+            // a retained span that view omitted. Intentional expansion and
+            // tier consumption remain inactive, as in kernel syncBlocks.
+            if (b.expanded || consumed.has(b.blockId)) continue;
             if (b.effectiveMessageIds.length === 0) continue;
             if (b.effectiveMessageIds.every((id) => incomingIds.has(id))) active.push(b);
             else straddled++;
@@ -189,12 +194,13 @@ export function planForkAdoption(
         for (const child of byId.get(id)?.directBlockIds ?? []) queue.push(child);
     }
 
+    const activeIds = new Set(active.map(b => b.blockId));
     const blocks: CompressionBlock[] = [];
     const rawIds = new Set<string>();
     for (const id of closure) {
         const b = byId.get(id);
         if (!b) continue;
-        blocks.push(structuredClone(b));
+        blocks.push({ ...structuredClone(b), active: activeIds.has(id) });
         for (const mid of b.effectiveMessageIds) rawIds.add(mid);
     }
     if (opts?.seedAllRefs) {
@@ -342,7 +348,9 @@ function persistForkLineageNow(session: Session, log: (level: string, msg: strin
  *  for life. The link copies nothing at link time; adoption still judges per
  *  block in raw-id set semantics, so a mis-guessed parent can at most be
  *  searched read-only, never adopted from. */
-export function maybeAdoptForkBlocks(args: {
+// #4942: async — the parent load below must reach the DB on network storage
+// backends, or an anonymous fork of a DB-only parent starts fresh.
+export async function maybeAdoptForkBlocks(args: {
     session: Session;
     parentId: string;
     protocol: WireProtocol;
@@ -350,7 +358,7 @@ export function maybeAdoptForkBlocks(args: {
     upstreamOrigin: string;
     enabled: boolean;
     log: (level: string, msg: string) => void;
-}): void {
+}): Promise<void> {
     const { session, parentId, protocol, parsed, upstreamOrigin, enabled, log } = args;
     const incomingMsgs = incomingCoreMessages(protocol, parsed);
     if (!incomingMsgs) {
@@ -358,7 +366,7 @@ export function maybeAdoptForkBlocks(args: {
         return;
     }
     let parent = peekSession(parentId);
-    if (!parent) parent = getStore().loadSync(parentId, { protocol, upstreamOrigin }) ?? undefined;
+    if (!parent) parent = (await getStore().loadAsync(parentId, { protocol, upstreamOrigin })) ?? undefined;
     if (!parent) {
         log("info", `[fork-adoption] fork parent ${parentId} not found (evicted and not persisted); starting fresh (#629)`);
         return;
@@ -516,10 +524,12 @@ export function maybeAdoptDerivedFork(args: {
  * (the parent id came from the plugin register) and belongs with the
  * byte-prefix strong path, which is on by default.
  */
-export function reconcileDerivedLineage(
+// #4942: async — parent loads below must reach the DB on network storage
+// backends, or lineage of DB-only parents is never restored at boot.
+export async function reconcileDerivedLineage(
     sessions: Session[],
     opts: { log: (level: string, msg: string) => void; adoptionEnabled: boolean },
-): number {
+): Promise<number> {
     const { log, adoptionEnabled } = opts;
     if (!adoptionEnabled) return 0;
     let adopted = 0;
@@ -534,10 +544,10 @@ export function reconcileDerivedLineage(
 
         let parent = peekSession(parentId);
         if (!parent) {
-            parent = getStore().loadSync(parentId, {
+            parent = (await getStore().loadAsync(parentId, {
                 protocol: s.meta.protocol,
                 upstreamOrigin: s.meta.upstreamOrigin,
-            }) ?? undefined;
+            })) ?? undefined;
         }
         if (!parent) {
             // Evicted before it was persisted — or restored later. Leave the

@@ -22,7 +22,7 @@
  * Kernel purity: host-side only, imports nothing from kernel internals.
  */
 
-import { biliToolsDeclaredOnWire } from "../session-self-heal.js";
+import { biliToolsDeclaredOnWire, declaredToolEntries } from "../session-self-heal.js";
 import { extractBillingAttributionBlock } from "../preflight.js";
 import { ANONYMOUS, hostProfileFor, type HostProfile } from "../host-profiles.js";
 import { CODE_MODE_OMNIBUS_TOOL_NAMES, mcpBiliToolName } from "../compress-tool.js";
@@ -52,10 +52,9 @@ interface WireObservation {
 
 function observeDeclaredTools(parsed: unknown, protocol: LaneProtocol): ReadonlySet<string> {
     const out = new Set<string>();
-    if (parsed === null || typeof parsed !== "object") return out;
-    const tools = (parsed as Record<string, unknown>)["tools"];
-    if (!Array.isArray(tools)) return out;
-    for (const t of tools) {
+    // #5527: every wire declaration location (top-level tools + Responses
+    // input[].additional_tools), not only the top-level array.
+    for (const t of declaredToolEntries(parsed, protocol)) {
         if (t === null || typeof t !== "object") continue;
         const rec = t as Record<string, unknown>;
         if (typeof rec["name"] === "string" && biliToolsDeclaredOnWire({ tools: [t] }, protocol, rec["name"])) out.add(rec["name"]);
@@ -92,6 +91,12 @@ interface WireClientSignals {
     readonly conversationSourceName: string | undefined;
     /** The shared codex UA/header detection (isCodexClient). */
     readonly codexUserAgent: boolean;
+    /** #5456: host-level opt-out for the instructions-fingerprint split
+     *  (config `personaSplit:false` / env BILI_PERSONA_SPLIT=0). The
+     *  fingerprint exists to keep DISJOINT subagent blobs off the main
+     *  lane; on a plain-proxy lane whose system prompt legitimately
+     *  changes every turn it forks the MAIN conversation instead. */
+    readonly personaSplitOff?: boolean;
 }
 
 interface WireClientEntry {
@@ -128,7 +133,15 @@ const WIRE_CLIENTS: readonly WireClientEntry[] = [
  * unknown clients resolve ANONYMOUS — instructions key VERBATIM for them,
  * #1106). */
 export function resolveWireClientProfile(signals: WireClientSignals): HostProfile {
-    for (const entry of WIRE_CLIENTS) if (entry.matches(signals)) return entry.profile;
+    for (const entry of WIRE_CLIENTS) {
+        if (!entry.matches(signals)) continue;
+        // #5456: the switch only disables the FINGERPRINT split; every other
+        // profile field (identity, caching rules, tool surface) stays.
+        if (signals.personaSplitOff && entry.profile.instructionsFingerprintKeyed) {
+            return { ...entry.profile, instructionsFingerprintKeyed: false };
+        }
+        return entry.profile;
+    }
     return ANONYMOUS;
 }
 // ③ LaneDecisions — the frozen decision object every gate reads.
@@ -294,7 +307,8 @@ export function resolveLaneDecisions(input: LaneDecisionInput): LaneDecisions {
 /** #3884 owner follow-up: make a reachability miss LOUD instead of silent.
  * When an armed nudge stays suppressed because the lane surface is OFF for
  * reachability (not the user's own injectTool=false choice), name what was
- * actually observed on the top-level tool table: the next host omnibus rename
+ * actually observed on the request's declared tool table (every wire
+ * declaration location, #5527): the next host omnibus rename
  * then shows up in bili.log next to the ARMED-SUPPRESSED label as
  * `surface=off(top-level=[new_name])` instead of requiring user archaeology
  * (#3600 and #3884 were both diagnosed from user-reported log dumps). Returns
@@ -311,4 +325,22 @@ function systemOf(parsed: unknown): string | Array<Record<string, unknown>> | un
     const system = (parsed as Record<string, unknown>)["system"];
     if (typeof system === "string" || Array.isArray(system)) return system;
     return undefined;
+}
+
+/** #5418 gate — is the full-resend-watermark fastpath allowed to engage for
+ * this request? The fastpath (src/server/fastpath.ts) lets plugin-lane turns
+ * assert the re-sent prefix is unchanged via a server-measured count
+ * watermark; any miss degrades byte-identically to the legacy full-parse
+ * path. Title-gen sidecars are never stamped (fresh conversations),
+ * incremental-turn requests already send deltas, and the breaker holds the
+ * lane after repeated verified misses. Row-driven truth table:
+ * tests/lane-decisions-matrix.test.ts (watermarkGateAllowed rows). */
+export function watermarkGateAllowed(input: {
+    featureOn: boolean;
+    pluginMode: boolean;
+    titleGen: boolean;
+    incrementalTurn: boolean;
+    breakerArmed: boolean;
+}): boolean {
+    return input.featureOn && input.pluginMode && !input.titleGen && !input.incrementalTurn && !input.breakerArmed;
 }

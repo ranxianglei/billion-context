@@ -1,5 +1,6 @@
 import type { CoreMessage } from "acp-kernel";
 import { coreToAnthropic, type AnthropicRequestBody } from "acp-kernel/wire";
+import { dedupeAdjacentOutputConfig } from "../dedupe-adjacent-output-config.js";
 import { appendSystemText, declaredInclusiveFromUsage } from "../util.js";
 import { stampAnthropicSystemCacheControl } from "./cache-control.js";
 import { buildVisibilityMarker } from "./core.js";
@@ -152,6 +153,14 @@ function rewriteTextDeltaEvent(eventStr: string, newIndex: number, newText: stri
     return Buffer.from(rebuilt.join("\n") + "\n\n", "utf8");
 }
 
+// The loop's own early ends say "length", OpenAI's word; Anthropic has no
+// such stop reason, and Claude Code stops mid-task on one it does not know.
+// "max_tokens" makes it resume the turn instead (#5179).
+function anthropicStopReason(reason: string | undefined): string {
+    if (!reason) return "end_turn";
+    return reason === "length" ? "max_tokens" : reason;
+}
+
 function buildTextDeltaEvent(index: number, text: string): Buffer {
     return Buffer.from(
         `event: content_block_delta\n` +
@@ -299,7 +308,10 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
             // steady path does (`anthropicCacheMarks ?? cacheControls`) — a
             // client-managed session has no bili marks, and dropping its
             // breakpoint leaves the post-fold prefix unwritten to cache.
-            const messages = coreToAnthropic(coreMessages, cacheMarks ?? clientCacheControls);
+            // [#5688] round-2 re-renders from the core view fold reconstruction
+            // can leave adjacent effort directives in — collapse like the
+            // steady egress or the rebuild 400s where the main request passed.
+            const messages = dedupeAdjacentOutputConfig(coreToAnthropic(coreMessages, cacheMarks ?? clientCacheControls));
             // #1876: same append-not-merge rebuild as the steady path's
             // injectSystem — both must emit byte-identical system (F2 seam).
             const system = originalSystem !== undefined ? appendSystemText(systemPrompt, originalSystem) : systemPrompt;
@@ -738,9 +750,8 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
         },
 
         emitCompletion(opts?: EmitCompletionOpts) {
-            const stopReason = opts?.finishReason ?? "end_turn";
             return buildTerminal(
-                stopReason,
+                anthropicStopReason(opts?.finishReason),
                 opts?.usage?.outputTokens ?? 0,
                 opts?.usage?.inputTokens ?? 0,
                 opts?.usage?.cachedTokens ?? 0,

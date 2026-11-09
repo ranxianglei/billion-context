@@ -12,6 +12,7 @@ import type { WireProtocol } from "./util.js";
 import type { InboundSlot, SeamSlot } from "./cache-ledger.js";
 import { isResponsesTurnSeparatorId } from "./turn-separator.js";
 import type { FoldReconcileResult } from "./fold-reconcile.js";
+import type { UnpromptedGate } from "./unprompted-gate.js";
 
 export type BlockView = { text: string; count: number };
 
@@ -198,6 +199,73 @@ export function lazyMetadata(
     return proxy;
 }
 
+/** #4788 phase 2: proxies for CCR content stores currently folded away. */
+const droppedContentStoreProxies = new WeakSet<object>();
+
+/** True when the record is a lazy content-store proxy currently folded away. */
+export function isDroppedContentStore(value: unknown): boolean {
+    return typeof value === "object" && value !== null && droppedContentStoreProxies.has(value);
+}
+
+/** #4788 phase 2 (owner decision 2026-10-31, discussion #3916-E): a session's
+ *  MessageContentStore that folded away after its save landed and re-materializes
+ *  on first touch — the exact shape contentStoreOf restores on a cold load.
+ *  Transparent Proxy over the plain-store shape ({version, byHash, byRef}): no
+ *  call-site changes; saveContentStore / ingest ccr_json+ccr_entries / fork /
+ *  publicSnapshotStoredRefs all walk it like any store and pay ONE narrow read
+ *  per burst. An unrecoverable drop throws on access instead of ever letting a
+ *  save write an EMPTY record where a non-empty one was proven durable (#2674
+ *  payload-first discipline, applied to discharge). */
+export function lazyContentStore(
+    sessionId: string,
+    loader: (id: string) => MessageContentStore | null,
+): MessageContentStore {
+    const target: Record<string, unknown> = {};
+    let dropped = true;
+    const ensure = (): void => {
+        if (!dropped) return;
+        const record = loader(sessionId);
+        if (!record || typeof record !== "object" || !("byRef" in record) || Object.keys(record.byRef as Record<string, unknown>).length === 0) {
+            throw new Error(`[persist] resident content store for ${sessionId} could not be re-materialized from the store — refusing the thinned view`);
+        }
+        Object.assign(target, record);
+        dropped = false;
+        droppedContentStoreProxies.delete(proxy);
+    };
+    const proxy = new Proxy(target, {
+        get(t, prop, receiver) {
+            ensure();
+            return Reflect.get(t, prop, receiver);
+        },
+        has(t, prop) {
+            ensure();
+            return Reflect.has(t, prop);
+        },
+        ownKeys(t) {
+            ensure();
+            return Reflect.ownKeys(t);
+        },
+        getOwnPropertyDescriptor(t, prop) {
+            ensure();
+            return Reflect.getOwnPropertyDescriptor(t, prop);
+        },
+        set(t, prop, value, receiver) {
+            ensure();
+            return Reflect.set(t, prop, value, receiver);
+        },
+        deleteProperty(t, prop) {
+            ensure();
+            return Reflect.deleteProperty(t, prop);
+        },
+        defineProperty(t, prop, desc) {
+            ensure();
+            return Reflect.defineProperty(t, prop, desc);
+        },
+    });
+    droppedContentStoreProxies.add(proxy);
+    return proxy as unknown as MessageContentStore;
+}
+
 /** One successful compress, recorded for #189 observability: correlating a
  *  downstream transient upstream rejection (e.g. GLM 3007 captcha) with the
  *  context rewrite that preceded it. `shrinkRatio` (#1911) is the fraction of
@@ -259,6 +327,38 @@ export type Session = {
         /** #4805: the in-flight request's probe verdict ({member, needle}),
          *  recorded at prepare and consumed by settleUsageReport. */
         requestMembership?: { member: boolean; needle: string | null };
+        /** #5293: the user aborted (Esc'd) the model stream mid-turn. The
+         *  interrupted turn's partial output never reports usage, so the next
+         *  usage-grade reading jumps by exactly that unreported mass — counted
+         *  as organic growth, the cadence nudge fires on the user's redirect
+         *  turn (pi: esc → continue → immediate compress injection). `anchor`
+         *  is the meter value at abort time; consumed by the first nudge
+         *  decision whose meter moved past it (absorbAbortedTurnGrowth).
+         *  In-memory only: the abort→resume causality spans one process
+         *  lifetime, and a restart replants nothing. */
+        abortReanchor?: { anchor: number; at: number };
+        /** #5683: the conversation's latest model-round compression-prompt facts
+         *  for the unprompted/out-of-bounds gates (src/unprompted-gate.ts).
+         *  Re-stamped on every prepare; in-memory only — a restart reads the
+         *  all-off default until the first round re-stamps, which is safe: no
+         *  tool call can reach applyRanges before its own round's prepare. */
+        unpromptedGate?: UnpromptedGate;
+        /** #5981: the last model stream on this conversation was CUT before its
+         *  terminal event (src/plugin.ts emitUpstreamTruncation sites). A tool
+         *  call dispatched out of such a stream can carry EMPTY arguments —
+         *  the argument deltas never arrived — and an empty `compress` call is
+         *  otherwise indistinguishable from the model's own "empty companion"
+         *  call (#1366). Without this stamp the parser-side receipt tells the
+         *  model not to re-issue, converting a recoverable transport failure
+         *  into an abandoned compression.
+         *
+         *  Read is non-consuming and TTL-bounded (TRUNCATED_UPSTREAM_MAX_AGE_MS):
+         *  one truncated turn may dispatch several tool calls whose arguments
+         *  were cut, so the first consumer must not clear the fact for the
+         *  rest; a later stream that completes simply stops consulting it once
+         *  the TTL lapses. In-memory only — a restart replants nothing, and a
+         *  restart also drops the truncated stream it described. */
+        truncatedUpstream?: { at: number; protocol: string; cause: "eof" | "read-error" };
     };
     id: string;
     /** Identity / descriptive metadata. Populated on first request. */
@@ -644,6 +744,16 @@ export type Session = {
      *  keys off this flag, which survives until the reconcile (or a full
      *  reset) has actually run. */
     ccrReconcilePending?: boolean;
+    /** In-memory only (NOT persisted — buildRecord omits it): timestamp of the
+     *  last full re-materialization from disk in THIS process (#5782), stamped
+     *  by adoptOrCreate's memory-miss reload branch — the path that pays the
+     *  expensive rebuild. While COLD_LOAD_EVICT_GRACE_MS is young, byte-budget
+     *  eviction skips this session: shedding it again would just re-pay the
+     *  materialization on the next touch (the evict↔cold-load thrash that
+     *  minted giant temporaries faster than GC could reclaim them). Boot-warm
+     *  sessions are deliberately NOT stamped — their staleness is real and they
+     *  must stay first in line to go. */
+    coldLoadedAt?: number;
     /** In-memory only (NOT persisted — buildRecord omits it): the most recent
      *  successful compress, set by applyRanges and read by the replay/preflight
      *  retry callbacks to correlate a transient upstream rejection with the
@@ -902,6 +1012,112 @@ export function diagnoseSuccessWithoutUsage(session: Session, wire: string): voi
     loggerLog("warn", `[${session.id}] [${wire}] upstream success without usage report — keeping lastInputTokens=${session.stats.lastInputTokens} (source=${session.stats.lastInputTokensSource ?? "none"}); nudge decisions ride local estimates until a usage-grade sample lands (#1595)`);
 }
 
+/** #5293: growth debt from a user-interrupted turn. When the user aborts a
+ *  model stream mid-turn (pi's Esc), the host persists the partial assistant
+ *  message and resends it on the next turn, but the interrupted turn never
+ *  reports usage for that output — the next usage-grade reading jumps by
+ *  exactly the unreported partial. The flat-growth cadence (KDD #8) counts
+ *  that jump as organic growth, so the nudge fires within one or two requests
+ *  of the user's redirect — summarizing output they just rejected.
+ *
+ *  Fix: an event-driven re-anchor in the same category as applyCompression
+ *  resetting lastNudgeShownTokens (kernel compress.ts). The abort site stamps
+ *  transient.abortReanchor (noteAbortedTurn); the FIRST nudge decision whose
+ *  meter moved past the pre-abort anchor re-anchors the low-water reference
+ *  to the current reading (absorbAbortedTurnGrowth). Deliberate exception to
+ *  #3674's low-water rule: #3674 deleted the event-gated re-anchor because it
+ *  dead-zoned small DROPS; here the reference moves UP because a known
+ *  unmeasured mass just landed, gated on a witnessed client action rather than
+ *  drift heuristics. Sessions without a pending stamp see byte-identical
+ *  decisions. Preflight / pressure bands are untouched — only the growth
+ *  cadence reference moves. */
+export const ABORT_REANCHOR_MAX_AGE_MS = 30 * 60 * 1000;
+
+/** #5981: how long a truncated-upstream stamp stays consultable. One cut
+ *  stream dispatches its tool calls within milliseconds (observed 37–115 ms),
+ *  so five minutes is already generous; the bound exists so a stale stamp can
+ *  never re-label a genuinely empty call the model makes much later in the
+ *  conversation. */
+export const TRUNCATED_UPSTREAM_MAX_AGE_MS = 5 * 60 * 1000;
+
+/** #5981: record that the model stream just served on this conversation was
+ *  CUT before its terminal event. Called from the four emitUpstreamTruncation
+ *  sites in src/plugin.ts (chat eof/read-error, responses eof/read-error).
+ *  The fact is what lets the compress receipt distinguish "the argument bytes
+ *  never arrived" from "the model sent an empty call" — the two are bytewise
+ *  identical by the time the parser sees them (#1366). */
+export function noteTruncatedUpstream(session: Session, protocol: string, cause: "eof" | "read-error"): void {
+    session.transient ??= {};
+    session.transient.truncatedUpstream = { at: Date.now(), protocol, cause };
+}
+
+/** #5981: read the truncated-upstream stamp WITHOUT consuming it — one cut
+ *  stream may dispatch several tool calls whose arguments were cut, so the
+ *  first consumer must not clear the fact for the rest. An expired stamp is
+ *  dropped on read so it can never re-label a later genuine empty call. */
+export function truncatedUpstreamOf(session: Session): { at: number; protocol: string; cause: "eof" | "read-error" } | undefined {
+    const t = session.transient;
+    const flag = t?.truncatedUpstream;
+    if (!t || !flag) return undefined;
+    if (Date.now() - flag.at > TRUNCATED_UPSTREAM_MAX_AGE_MS) {
+        delete t.truncatedUpstream;
+        return undefined;
+    }
+    return flag;
+}
+
+/** Stamp a pending aborted-turn re-anchor; call from the plugin pipe's
+ *  client-abort path AFTER settleUsage has landed whatever the interrupted
+ *  stream reported (the request's input size — the partial output itself
+ *  never reports). A zero/unknown meter carries no information: skip. */
+export function noteAbortedTurn(session: Session): void {
+    if (!Number.isFinite(session.stats.lastInputTokens) || session.stats.lastInputTokens <= 0) return;
+    session.transient ??= {};
+    session.transient.abortReanchor = { anchor: session.stats.lastInputTokens, at: Date.now() };
+}
+
+/** Consume a pending aborted-turn re-anchor if — and only if — the meter has
+ *  actually moved past the pre-abort anchor, i.e. the persisted partial now
+ *  shows up in the measurement. Until then the flag waits (the resume turn
+ *  still reads the stale anchor); a flag older than ABORT_REANCHOR_MAX_AGE_MS
+ *  is dropped without touching state. */
+export function absorbAbortedTurnGrowth(session: Session, tokenCount: number): void {
+    const t = session.transient;
+    const flag = t?.abortReanchor;
+    if (!t || !flag) return;
+    if (Date.now() - flag.at > ABORT_REANCHOR_MAX_AGE_MS) {
+        delete t.abortReanchor;
+        return;
+    }
+    if (!(tokenCount > flag.anchor)) return;
+    const nudge = session.state.nudge;
+    const oldRef = nudge.lastPerMessageNudgeTokens;
+    // #5415: the full-meter re-anchor below skips not only the aborted
+    // turn's unreported partial (intended, #5293) but also the MEASURED
+    // growth from the old reference up to the pre-abort anchor — growth the
+    // flat cadence legitimately counts. Abort-heavy clients (85 absorbs in
+    // one reported 4.5h log) get that growth zeroed every few minutes, so
+    // the nudge cadence starves and a huge ready mass sits idle for hours.
+    // Bank the skipped measured growth as debt and count the absorbs: the
+    // kernel pays both only from the SECOND absorb on (#5415) — a single
+    // abort stays exactly as quiet as #5293 pinned, while repeated aborts
+    // prove the session is abort-heavy (not redirect-polite) and the 209-era
+    // cadence recovers. applyCompression resets the bank and the count.
+    const recovered = Math.max(0, flag.anchor - oldRef);
+    nudge.absorbCount = (nudge.absorbCount ?? 0) + 1;
+    if (recovered > 0)
+        nudge.absorbedDebt = (nudge.absorbedDebt ?? 0) + recovered;
+    nudge.lastPerMessageNudgeTokens = Math.max(oldRef, tokenCount);
+    // The pending nudge (if any) died with its turn: clear the shown stamp and
+    // the per-tier cadence stamps together — the same full-reset shape as
+    // applyCompression (kernel compress.ts), so no stale half-threshold or
+    // tier-cadence residue survives the interrupt.
+    nudge.lastNudgeShownTokens = 0;
+    nudge.lastShownByTier = {};
+    delete t.abortReanchor;
+    loggerLog("info", `[${session.id}] aborted-turn growth absorbed: nudge reference ${oldRef}→${nudge.lastPerMessageNudgeTokens} (meter ${tokenCount}, pre-abort anchor ${flag.anchor}, growth debt +${recovered} → ${nudge.absorbedDebt ?? 0} over ${nudge.absorbCount} absorb(s)) (#5293/#5415)`);
+}
+
 // #1820: post-rebuild meter anchor. Right after a big preflight rebuild the
 // usage-grade baseline is momentarily absent (the rebuild request's own report
 // hasn't landed yet, or the upstream never reports one), so effectiveTokenCount
@@ -953,6 +1169,18 @@ const sessions = new Map<string, Session>();
 let MAX_SESSIONS = knobMaxSessions();
 let MAX_RESIDENT_BYTES = sessionResidentMaxBytes();
 const residentWeights = new WeakMap<Session, { revision: number; bytes: number }>();
+
+// #5782: how long a freshly re-materialized session is exempt from BYTE-budget
+// eviction (see Session.coldLoadedAt). Long enough to ride out an agent work
+// burst (tool calls run for minutes between model requests), short enough that
+// a genuinely abandoned session frees its slot promptly. Count-cap admission
+// ignores this window (availability floor, logged loudly) — a full pool must
+// still be able to admit.
+const COLD_LOAD_EVICT_GRACE_MS = 10 * 60_000;
+
+function isColdLoadGraced(session: Session): boolean {
+    return session.coldLoadedAt !== undefined && Date.now() - session.coldLoadedAt < COLD_LOAD_EVICT_GRACE_MS;
+}
 
 // #3918: last-known LIVE weight of evicted sessions, stamped at eviction time.
 // The live weight (transient message caches included) is only measurable while
@@ -1046,7 +1274,7 @@ export function residentBreakdown(session: Session): ResidentFieldBreakdown {
 export interface MemoryReport {
     pool: { sessions: number; maxSessions: number; residentBytes: number; budgetBytes: number };
     breakdown: ResidentFieldBreakdown;
-    sessions: Array<{ id: string; inFlight: number; lastSeen: number; revision: number; fields: ResidentFieldBreakdown }>;
+    sessions: Array<{ id: string; inFlight: number; lastSeen: number; revision: number; coldLoadedAt?: number; fields: ResidentFieldBreakdown }>;
 }
 
 export function memoryReport(): MemoryReport {
@@ -1062,7 +1290,7 @@ export function memoryReport(): MemoryReport {
         sums.state += fields.state;
         sums.other += fields.other;
         sums.total += fields.total;
-        rows.push({ id: session.id, inFlight: session.inFlight, lastSeen: session.lastSeen, revision: session.revisionEpoch ?? 0, fields });
+        rows.push({ id: session.id, inFlight: session.inFlight, lastSeen: session.lastSeen, revision: session.revisionEpoch ?? 0, coldLoadedAt: session.coldLoadedAt, fields });
     }
     rows.sort((a, b) => b.fields.total - a.fields.total);
     return {
@@ -1086,7 +1314,9 @@ function residentBytes(): number {
  * and the refusal repeats identically forever — the incident's 444 MiB image
  * session ping-ponged against an 87.5 MiB peer under the 512 MiB default.
  * Returns the measured pressure so the refusal receipt says so plainly instead
- * of promising a heal that will not come. */
+ * of promising a heal that will not come. #5782: a RESIDENT session inside its
+ * cold-load grace window is protected from that discharge, so the same shape is
+ * transient again while graced — the claim must say so or the receipt lies. */
 interface ResidentPressure {
     /** True when retrying cannot restore a usable view under the CURRENT pool state. */
     permanent: boolean;
@@ -1105,8 +1335,9 @@ export function residentPressure(id: string): ResidentPressure {
     const total = residentBytes();
     const known = evictedWeights.get(id);
     const weightBytes = known !== undefined ? Math.max(known, self) : resident ? self : undefined;
+    const graced = resident !== undefined && isColdLoadGraced(resident);
     return {
-        permanent: weightBytes !== undefined && weightBytes + (total - self) > MAX_RESIDENT_BYTES,
+        permanent: weightBytes !== undefined && !graced && weightBytes + (total - self) > MAX_RESIDENT_BYTES,
         weightBytes,
         otherBytes: total - self,
         residentBytes: total,
@@ -1115,17 +1346,25 @@ export function residentPressure(id: string): ResidentPressure {
 }
 
 function makeResidentRoom(incoming = 0): void {
-    while (sessions.size >= MAX_SESSIONS || (sessions.size > 0 && residentBytes() + incoming > MAX_RESIDENT_BYTES)) {
-        if (!evictOldest()) {
-            // The byte budget limits the idle cache, not active workload.
-            // Refusing every new conversation while a large request is pinned
-            // turns ordinary concurrent use into a proxy outage. The count
-            // limit remains a hard admission bound.
-            if (sessions.size < MAX_SESSIONS) break;
+    // The count limit is the HARD admission bound: a full pool must free a slot
+    // even when every idle candidate is inside its cold-load grace window
+    // (#5782) — refusing a new conversation would be a proxy outage.
+    while (sessions.size >= MAX_SESSIONS) {
+        if (!evictOldest({ overrideGrace: true })) {
             const reason = [...sessions.values()].every(session => session.inFlight > 0)
                 ? "all in-flight" : "active requests or failed saves prevent safe eviction";
             throw new Error(`session pool exhausted (MAX_SESSIONS=${MAX_SESSIONS}; ${reason})`);
         }
+    }
+    // The byte budget limits the IDLE cache, not active workload (#5782):
+    // shedding a freshly re-materialized session just re-pays its
+    // materialization on the next touch — the evict↔cold-load thrash that
+    // minted giant temporaries faster than GC could reclaim them (#5782's OOM).
+    // When only graced or in-flight sessions remain, the pool sits over budget;
+    // the hot working set stays bounded per-session by sessions.hardMaxBytes and
+    // sheds normally once grace expires.
+    while (sessions.size > 0 && residentBytes() + incoming > MAX_RESIDENT_BYTES) {
+        if (!evictOldest()) break;
     }
 }
 
@@ -1148,38 +1387,47 @@ export function zeroStats(): Session["stats"] {
     return { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, compressCreditTokens: 0, contextTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, retrieveDropped: 0, retrieveDelivered: 0, storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0 };
 }
 
-export function getSession(id: string, meta?: { protocol?: Session["meta"]["protocol"]; upstreamOrigin?: string; label?: string }): Session {
-    if (publishingForks.has(id)) throw new Error("child fork publication in progress");
-    const existing = sessions.get(id);
-    if (existing) {
-        existing.lastSeen = Date.now();
-        existing.restored = false;
-        // Fill in protocol/upstream/label meta on an existing session if the caller
-        // now knows it (e.g. a session was created by loadAll without meta).
-        if (meta?.protocol && !existing.meta.protocol) existing.meta.protocol = meta.protocol;
-        if (meta?.upstreamOrigin && !existing.meta.upstreamOrigin) existing.meta.upstreamOrigin = meta.upstreamOrigin;
-        if (meta?.label && !existing.meta.label) existing.meta.label = meta.label;
-        return existing;
-    }
-    // Memory miss: try reload from disk (e.g. after LRU eviction).
-    const store = getStore();
-    makeResidentRoom();
-    const reloaded = store.loadSync(id, meta);
+type SessionMeta = { protocol?: Session["meta"]["protocol"]; upstreamOrigin?: string; label?: string };
+
+/** #4942 single-flight dedupe: the async reload seam opens a race window the
+ *  sync getSession never had — two concurrent first-touches of the same
+ *  evicted/DB-only session must build ONE resident entry, not two. */
+const pendingSessionLoads = new Map<string, Promise<Session>>();
+
+function stampExisting(existing: Session, meta?: SessionMeta): void {
+    existing.lastSeen = Date.now();
+    existing.restored = false;
+    // Fill in protocol/upstream/label meta on an existing session if the caller
+    // now knows it (e.g. a session was created by loadAll without meta).
+    if (meta?.protocol && !existing.meta.protocol) existing.meta.protocol = meta.protocol;
+    if (meta?.upstreamOrigin && !existing.meta.upstreamOrigin) existing.meta.upstreamOrigin = meta.upstreamOrigin;
+    if (meta?.label && !existing.meta.label) existing.meta.label = meta.label;
+}
+
+/** Shared tail of getSession / getSessionAsync: adopt the reloaded session
+ *  into the resident pool, or create a fresh one under the cap guard. */
+function adoptOrCreate(id: string, meta: SessionMeta | undefined, reloaded: Session | null): Session {
     if (reloaded) {
         // A memory-miss reload is triggered by a real request: stamp fresh
         // activity, not the restored-from-disk state (#404).
         reloaded.lastSeen = Date.now();
         reloaded.restored = false;
         reloaded.persisted = true;
+        reloaded.coldLoadedAt = Date.now(); // #5782: this rebuild just paid the full re-materialization cost
         // A memory-miss reload puts a NEW resident entry back into the pool; the
         // new-session cap guard below is unreachable on this path, so enforce it
         // here or evict-then-revisit grows the pool past MAX_SESSIONS (#1064).
         makeResidentRoom(sessionWeight(reloaded));
+        if (sessionWeight(reloaded) > MAX_RESIDENT_BYTES) {
+            loggerLog("warn", `[session] ${id} live weight ${sessionWeight(reloaded)} bytes exceeds the WHOLE resident pool budget (${MAX_RESIDENT_BYTES} bytes) — the pool cannot hold it alongside peers; raise sessions.residentMaxBytes (env BILI_SESSION_RESIDENT_MAX_BYTES) toward your working-set total or close large sessions (#5782)`);
+        }
         sessions.set(id, reloaded);
         return reloaded;
     }
     if (sessions.size >= MAX_SESSIONS) {
-        const evicted = evictOldest();
+        // Count-cap admission: may override a cold-load grace window (#5782) —
+        // a full pool must still admit.
+        const evicted = evictOldest({ overrideGrace: true });
         if (!evicted) {
             throw new Error(`session pool exhausted (MAX_SESSIONS=${MAX_SESSIONS}; all in-flight)`);
         }
@@ -1188,6 +1436,46 @@ export function getSession(id: string, meta?: { protocol?: Session["meta"]["prot
     makeResidentRoom(sessionWeight(session));
     sessions.set(id, session);
     return session;
+}
+
+export function getSession(id: string, meta?: SessionMeta): Session {
+    if (publishingForks.has(id)) throw new Error("child fork publication in progress");
+    const existing = sessions.get(id);
+    if (existing) {
+        stampExisting(existing, meta);
+        return existing;
+    }
+    // Memory miss: try reload from disk (e.g. after LRU eviction).
+    const store = getStore();
+    makeResidentRoom();
+    return adoptOrCreate(id, meta, store.loadSync(id, meta));
+}
+
+/** #4942: async twin of getSession for the request path — on network storage
+ *  backends (mysql) the sync facade cannot read session state back, so a
+ *  memory miss must be able to fall to the DB row (store.loadAsync) instead
+ *  of silently starting a fresh session and losing every folded block at each
+ *  restart. On sqlite this is loadSync plus a microtask: identical behavior.
+ *  Concurrent first-touches of the same id share ONE load (single-flight). */
+export async function getSessionAsync(id: string, meta?: SessionMeta): Promise<Session> {
+    // #5044 publication race ported to the async seam: a request landing on a
+    // child id while its fork is mid-publication must fail loudly instead of
+    // adopting a fresh empty session that would wedge the publication.
+    if (publishingForks.has(id)) throw new Error("child fork publication in progress");
+    const existing = sessions.get(id);
+    if (existing) {
+        stampExisting(existing, meta);
+        return existing;
+    }
+    const store = getStore();
+    makeResidentRoom();
+    let pending = pendingSessionLoads.get(id);
+    if (!pending) {
+        pending = (async () => adoptOrCreate(id, meta, await store.loadAsync(id, meta)))()
+            .finally(() => { pendingSessionLoads.delete(id); });
+        pendingSessionLoads.set(id, pending);
+    }
+    return pending;
 }
 
 export function createSession(id: string, meta?: Session["meta"]): Session {
@@ -1210,9 +1498,11 @@ export function createSession(id: string, meta?: Session["meta"]): Session {
 
 const publishingForks = new Set<string>();
 
+// #4942: async — the existence probe must reach the DB on network storage
+// backends, or a fork could silently clobber a DB-only child row.
 export async function publishForkSession(session: Session, parentId: string): Promise<void> {
     if (publishingForks.has(session.id)) throw new Error("child fork publication in progress");
-    if (sessions.has(session.id) || getStore().loadSync(session.id)) throw new Error("child session already exists");
+    if (sessions.has(session.id) || (await getStore().loadAsync(session.id))) throw new Error("child session already exists");
     publishingForks.add(session.id);
     try {
         makeResidentRoom(sessionWeight(session));
@@ -1803,8 +2093,14 @@ export function coveredRealHistoryIds(blocks: ReadonlyArray<{ readonly active?: 
 
 /** Flush a session to disk and drop it from memory (LRU eviction). Refuses to
  *  evict sessions that are in-flight or whose flush failed (would lose a
- *  never-persisted session permanently). Returns true if a slot was freed. */
-function evictOldest(): boolean {
+ *  never-persisted session permanently). Returns true if a slot was freed.
+ *  #5782: byte-budget callers pass no options — sessions inside their cold-load
+ *  grace window are skipped, so the hot working set may sit over budget instead
+ *  of thrashing (evict↔cold-load re-mints the giant temporaries that OOM'd the
+ *  process). Count-cap callers pass { overrideGrace: true }: when EVERY idle
+ *  candidate is graced they still evict the oldest one, because a full pool
+ *  must admit (availability over cache quality, logged loudly). */
+function evictOldest(opts?: { overrideGrace?: boolean }): boolean {
     let oldestId: string | undefined;
     let oldestSeen = Infinity;
     for (const [id, s] of sessions) {
@@ -1812,6 +2108,7 @@ function evictOldest(): boolean {
         // its half-mutated state then reloading a second object causes
         // split-brain writes to the same file.
         if (s.inFlight > 0) continue;
+        if (!opts?.overrideGrace && isColdLoadGraced(s)) continue;
         if (s.lastSeen < oldestSeen) {
             oldestSeen = s.lastSeen;
             oldestId = id;
@@ -1819,6 +2116,7 @@ function evictOldest(): boolean {
     }
     if (!oldestId) return false;
     const s = sessions.get(oldestId)!;
+    const graceOverride = isColdLoadGraced(s);
     const ok = getStore().flushSync(s);
     if (!ok) {
         // A prior save does not contain the latest mutations. Keep newer
@@ -1831,7 +2129,7 @@ function evictOldest(): boolean {
     // session's message bytes live only here; state reloads from disk but the
     // view self-heals only on the next model request). Log it so operators can
     // correlate ctx=0 receipts with the exact moment a session left memory.
-    loggerLog("info", `[session] evicted ${oldestId} from resident pool (weight ${sessionWeight(s)} bytes, ${sessions.size} session(s) remain, budget ${MAX_RESIDENT_BYTES} bytes)`);
+    loggerLog("info", `[session] evicted ${oldestId} from resident pool (weight ${sessionWeight(s)} bytes, ${sessions.size} session(s) remain, budget ${MAX_RESIDENT_BYTES} bytes${graceOverride ? ", cold-load grace overridden for count-cap admission" : ""})`);
     return true;
 }
 
