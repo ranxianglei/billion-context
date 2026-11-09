@@ -26,15 +26,15 @@ function shouldReclaimFetchPatch(): boolean {
     return !/^(0|false|off|no)$/i.test(raw.trim());
 }
 
-/** #1158 self-heal: the property descriptor captured before we installed the
- *  guarded accessor, so _resetForTest can restore a plain writable data
+/** #1158 self-heal: the property descriptor captured before we installed our
+ *  chain top, so resetFetchChainForTest can restore the host's original
  *  property. Undefined before the first install in a process. */
 let preInstallDesc: PropertyDescriptor | undefined;
 
-/** The accessor descriptor we defined on globalThis.fetch — identity-compared
- *  by _resetForTest before restoring preInstallDesc, so a third party's legal
- *  delete/redefine in between (#1410) is never clobbered. */
-let installedDesc: PropertyDescriptor | undefined;
+/** The chain-top function we installed on globalThis.fetch — identity-compared
+ *  by resetFetchChainForTest before restoring preInstallDesc, so a third
+ *  party's legal replace/delete/redefine in between (#1410) is never clobbered. */
+let installedTop: typeof globalThis.fetch | undefined;
 
 /** #1410 re-anchor ledger: every fetch this process has ever observed at the
  *  top slot, ordered oldest→newest. The oldest entry is the module-load
@@ -107,7 +107,40 @@ function nextLiveAnchor(dead: typeof globalThis.fetch): typeof globalThis.fetch 
     return observedFetches.find((f) => !knownDeadFetches.has(f));
 }
 
-export function installFetchChain(makeDispatch: (send: typeof globalThis.fetch) => typeof globalThis.fetch): void {
+// #5959/#2804: integrity-watchdog state. A plain data property (the
+// inspector-compatible form, #3528) has no setter to observe assignments, so
+// every eviction shape — third-party ASSIGNMENT (#1158), DELETE or REDEFINE
+// (#2791), or a hostile ACCESSOR — is detected by periodically re-reading the
+// descriptor and healing with the same adopt-as-downstream policy. One check
+// closure per install cycle; resetFetchChainForTest stops it so tests never
+// leak timers or stale checks.
+let watchdogTimer: ReturnType<typeof setInterval> | undefined;
+let watchdogCheck: (() => void) | undefined;
+const WATCHDOG_INTERVAL_MS = 1_000;
+const WATCHDOG_MAX_FAILURES = 3;
+
+function stopWatchdog(): void {
+    if (watchdogTimer !== undefined) {
+        clearInterval(watchdogTimer);
+        watchdogTimer = undefined;
+    }
+    watchdogCheck = undefined;
+}
+
+/** Test seam: run one integrity check synchronously. Returns false when no
+ *  watchdog is armed (classic install / reclaim disabled / already reset). */
+export function runFetchIntegrityCheckForTest(): boolean {
+    if (watchdogCheck === undefined) return false;
+    watchdogCheck();
+    return true;
+}
+
+interface FetchChainOptions {
+    /** Integrity-watchdog tick period in ms (default 1 s). Tests use small values. */
+    watchdogIntervalMs?: number;
+}
+
+export function installFetchChain(makeDispatch: (send: typeof globalThis.fetch) => typeof globalThis.fetch, opts?: FetchChainOptions): void {
     const orig = globalThis.fetch;
     noteFetch(orig);
     const makeChain = (downstream: typeof globalThis.fetch) => {
@@ -187,14 +220,17 @@ export function installFetchChain(makeDispatch: (send: typeof globalThis.fetch) 
         return chain;
     };
 
-    // #1158 self-heal re-arm: dsh-http-proxy (0.1.3) re-applies by writing its
+    // #1158 self-heal: dsh-http-proxy (0.1.3) re-applies by writing its
     // module-load-time frozen originalFetch over globalThis.fetch, silently
     // un-routing every model request away from bili while the session keeps
-    // working (observed live on Windows). Guard the property instead of
-    // trusting the assignment to survive: any third-party install becomes
-    // our downstream and model traffic keeps routing through bili.
+    // working (observed live on Windows). Install the chain top as a plain
+    // writable DATA property (#5959/#3528: the old guarded accessor broke
+    // third-party fetch observers that require "value" in the descriptor —
+    // DSH's experimental-inspector refused to start) and watch the slot: any
+    // eviction — assignment (#1158), delete/redefine (#2791), hostile accessor
+    // — is healed within one tick by adopting whatever the evictor left behind
+    // as downstream, so model traffic keeps routing through bili.
     const desc = Object.getOwnPropertyDescriptor(globalThis, "fetch");
-    let rearmCount = 0;
     // #2685: true once this install cycle adopted a recognized pi-web-access
     // wrapper. Its own guard (marker passthrough, #2435) makes the first adopt
     // the only one, so the FIRST marked install is a supported coexistence
@@ -206,74 +242,137 @@ export function installFetchChain(makeDispatch: (send: typeof globalThis.fetch) 
     let top = makeChain(orig);
     if (guard && shouldReclaimFetchPatch()) {
         preInstallDesc = desc;
-        const accessor: PropertyDescriptor = {
-            configurable: true,
-            enumerable: desc?.enumerable ?? true,
-            get: () => top,
-            set: (v: unknown) => {
-                if (typeof v !== "function" || v === top) return;
-                // #1410: our own (possibly stale) chain link written back —
-                // recognize it by marker and ignore, never spend re-arm
-                // budget on ourselves.
-                if (isOwnChain(v)) return;
-                // #2685: a recognized pi-web-access wrapper is a SUPPORTED
-                // coexistence install, not an evict — its first adopt is a quiet
-                // handshake (neutral note, no alarm). Post-#1158-self-heal the
-                // guard ALWAYS re-adopts, so routing authority never actually
-                // leaves; "evict" was the pre-self-heal framing and is dropped
-                // from the wording. Unknown wrappers and any LATER (repeat /
-                // abnormal) marked install keep the full diagnostic below.
-                const webAccess = Reflect.get(v, "__piWebAccessProxyFetch") === true;
+        globalThis.fetch = top;
+        installedTop = top;
+        // Give-up counts CONSECUTIVE UNPRODUCTIVE repairs only (readback
+        // mismatch / non-writable throw): a lifetime-install counter would
+        // permanently disable the intercept after sustained coexisting-plugin
+        // churn (#1662 shape), violating #1158's "routing authority never
+        // leaves" policy. Healthy ticks and productive heals both reset it.
+        let failures = 0;
+        let adoptions = 0;
+        let givenUp = false;
+        const giveUpIfExhausted = (): void => {
+            if (failures >= WATCHDOG_MAX_FAILURES) {
+                givenUp = true;
+                logHostEvent("error", "[native-client]", `[bili-native] cannot take back globalThis.fetch after ${failures} consecutive failed repairs (#2791) — the property rejects the re-install (non-writable, or a hostile accessor swallows writes) — intercept offline until the slot is healthy again`);
+            }
+        };
+        const check = (): void => {
+            const cur = Object.getOwnPropertyDescriptor(globalThis, "fetch");
+            const slotValue: unknown = cur !== undefined && "value" in cur ? cur.value : undefined;
+            if (slotValue === top || (typeof slotValue === "function" && isOwnChain(slotValue))) {
+                // Healthy — including #1410's own (possibly stale) chain link
+                // written back: the data property exposes the physical slot
+                // (the old getter masked it), so follow the written-back link
+                // instead of wrapping it; that keeps slot===top without
+                // spending budget or logging. A healthy slot also RE-ARMS
+                // after a give-up: the intercept must not stay offline until
+                // restart when the host later makes the slot usable again.
+                if (slotValue !== top) {
+                    top = slotValue as typeof globalThis.fetch;
+                    installedTop = top;
+                }
+                failures = 0;
+                if (givenUp) {
+                    givenUp = false;
+                    logHostEvent("info", "[native-client]", "[bili-native] globalThis.fetch is healthy again (#2791) — intercept re-armed after the give-up");
+                }
+                return;
+            }
+            // Eviction: foreign value, non-function value, deleted, or accessorized.
+            const current = typeof globalThis.fetch === "function" ? globalThis.fetch : undefined;
+            if (givenUp) {
+                if (current === undefined) return; // still nothing usable — stay quiet
+                givenUp = false; // a live fetch reappeared — resume normal repair
+            }
+            if (current === top) {
+                // An accessor masks our own top (get: () => top): convert the
+                // slot back to a data property WITHOUT re-wrapping — wrapping
+                // our own top would nest dispatch twice.
+                try {
+                    globalThis.fetch = top;
+                } catch {
+                    Object.defineProperty(globalThis, "fetch", { value: top, writable: true, configurable: true, enumerable: true });
+                }
+                failures = globalThis.fetch === top ? 0 : failures + 1;
+                giveUpIfExhausted();
+                return;
+            }
+            const downstream = current ?? moduleAnchor;
+            if (downstream === undefined) {
+                givenUp = true;
+                logHostEvent("error", "[native-client]", "[bili-native] globalThis.fetch lost the bili install (#2791) and no live fetch remains to re-anchor onto — intercept offline until a usable fetch reappears");
+                return;
+            }
+            try {
                 // Visibility (#1158): a third-party install used to be silent —
                 // log it so "un-routed by a third party" is diagnosable. Past
                 // REARM_LIMIT the WARNING stops (log spam), but the adoption
                 // continues: #1662 showed that surrendering the top slot past
-                // the limit (`top = v`) left every later foreign install stacking
-                // on the orphaned chain with ZERO visibility — unbounded growth,
-                // silent, until the host process died. With the re-entry
-                // termination in makeChain each further adopt costs O(1) per
-                // request regardless of history length, so the cap now bounds
-                // LOGGING only, and routing authority never leaves the guard.
+                // the limit left every later foreign install stacking on the
+                // orphaned chain with ZERO visibility — unbounded growth, silent,
+                // until the host process died. With the re-entry termination in
+                // makeChain each further adopt costs O(1) per request regardless
+                // of history length, so the cap bounds LOGGING only, and routing
+                // authority always returns within one tick.
+                const webAccess = Reflect.get(downstream, "__piWebAccessProxyFetch") === true;
                 if (webAccess && !webAccessAdopted) {
                     webAccessAdopted = true;
                     logHostEvent("info", "[native-client]", "[bili-native] adopted pi-web-access proxy fetch as downstream (supported coexistence, #2435)");
-                } else if (rearmCount < REARM_LIMIT) {
-                    logHostEvent("warn", "[native-client]", `[bili-native] third-party globalThis.fetch install detected (#1158) — re-chaining as downstream (install ${rearmCount + 1})`);
+                } else if (adoptions < REARM_LIMIT) {
+                    const evictedShape = !(typeof slotValue === "function");
+                    if (evictedShape) logHostEvent("warn", "[native-client]", `[bili-native] globalThis.fetch lost the bili install (#2791) — re-anchored over the remaining fetch as downstream (repair ${failures + 1})`);
+                    else logHostEvent("warn", "[native-client]", `[bili-native] third-party globalThis.fetch install detected (#1158) — re-chaining as downstream (install ${adoptions + 1})`);
                 }
-                rearmCount += 1;
-                noteFetch(v);
-                top = makeChain(v as typeof globalThis.fetch);
-            },
+                noteFetch(downstream);
+                top = makeChain(downstream);
+                try {
+                    globalThis.fetch = top;
+                } catch {
+                    // Getter-only accessor: strict-mode assignment throws; the
+                    // property is still configurable, so redefine it as a data
+                    // property.
+                    Object.defineProperty(globalThis, "fetch", { value: top, writable: true, configurable: true, enumerable: true });
+                }
+                installedTop = top;
+                adoptions += 1;
+                failures = globalThis.fetch === top ? 0 : failures + 1;
+            } catch {
+                failures += 1;
+            }
+            giveUpIfExhausted();
         };
-        installedDesc = accessor;
-        Object.defineProperty(globalThis, "fetch", accessor);
+        stopWatchdog();
+        watchdogCheck = check;
+        watchdogTimer = setInterval(check, opts?.watchdogIntervalMs ?? WATCHDOG_INTERVAL_MS);
+        watchdogTimer.unref?.();
     } else {
         // Non-configurable host property or reclaim disabled
         // (BILI_RECLAIM_FETCH_PATCH=0): keep the classic direct install
-        // (no guard, the old behavior).
+        // (no guard, no watchdog — the escape-hatch trade-off stands).
         globalThis.fetch = top;
     }
 }
 
 export function resetFetchChainForTest(opts: { anchor?: typeof globalThis.fetch } = {}): void {
+    stopWatchdog();
     if (opts.anchor !== undefined) moduleAnchor = opts.anchor;
     observedFetches = moduleAnchor !== undefined ? [moduleAnchor] : [];
     knownDeadFetches.clear();
     warnedReanchor = false;
     warnedReentry = false;
-    if (preInstallDesc !== undefined) {
-        const d = preInstallDesc;
-        preInstallDesc = undefined;
-        // #1410: restore ONLY while the property is still ours — it is
-        // configurable, so a third party may legally have deleted/redefined
-        // it meanwhile; restoring blindly would clobber their install. The
-        // comparison must be on the accessor FUNCTIONS, not the descriptor
-        // object: on the global object V8 rebuilds the descriptor wrapper
-        // around every set, so object identity is never stable.
+    const d = preInstallDesc;
+    const held = installedTop;
+    preInstallDesc = undefined;
+    installedTop = undefined;
+    if (d !== undefined) {
+        // #1410: restore ONLY while the slot still holds our own top — the
+        // property is configurable, so a third party may legally have
+        // replaced/deleted/redefined it meanwhile; restoring blindly would
+        // clobber their install.
         const cur = Object.getOwnPropertyDescriptor(globalThis, "fetch");
-        if (cur !== undefined && installedDesc !== undefined && cur.get === installedDesc.get && cur.set === installedDesc.set) {
-            Object.defineProperty(globalThis, "fetch", { ...d, configurable: true });
-        }
-        installedDesc = undefined;
+        const v: unknown = cur !== undefined && "value" in cur ? cur.value : undefined;
+        if (v === held) Object.defineProperty(globalThis, "fetch", { ...d, configurable: true });
     }
 }
