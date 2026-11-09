@@ -230,8 +230,26 @@ function record(rawId: string, turns: NeutralTurn[], tagHash: string, model?: st
  *  byte-for-byte, so (id, persona) alone is not injective over RUNS. A
  *  non-empty discriminator widens the fork key to
  *  `<rawId>|sub:<fp16(tag)>:<fp16(disc)>`; every other caller omits both
- *  optional args and keeps the byte-identical old ladder. */
-export function resolveSessionOrder(rawId: string, history: unknown, personaTag?: string, declaredModel?: string, laneToken?: string, laneDiscriminator?: string): SessionOrderResolution {
+ *  optional args and keeps the byte-identical old ladder.
+ *
+ *  `laneWideDiscriminator` (#6011, LAST param for source compatibility):
+ *  the companion of `laneDiscriminator`, consumed ONLY by the collision
+ *  widening inside the derived-persona fork branch below. The D1-B frag is
+ *  not injective over concurrent SAME-TYPE runs whose first user message is
+ *  byte-identical shared boilerplate (#6011 field evidence: three CC SDK
+ *  subagent runs, identical 894-char msg#1, diverging from msg#4+ — all
+ *  three collided onto ONE lane and each pass clobbered its skeleton). When
+ *  a non-empty wide discriminator rides the request AND an occupant skeleton
+ *  already sits under the base fork key that the incoming does NOT continue
+ *  (neither a strict prefix EXTENSION nor a fragment-verified TAIL
+ *  continuation — both judged against the OCCUPANT, mirroring this file's
+ *  own growth/re-anchor idioms), the key widens to a fourth segment
+ *  `<base>:<fp16(wide)>`: the incoming records under its OWN widened key and
+ *  the occupant's skeleton survives untouched. Healthy runs (distinct
+ *  first-user frags) never contest a base key — they keep extending their
+ *  own skeleton and take exactly the pre-change path; every other caller
+ *  omits this arg. */
+export function resolveSessionOrder(rawId: string, history: unknown, personaTag?: string, declaredModel?: string, laneToken?: string, laneDiscriminator?: string, laneWideDiscriminator?: string): SessionOrderResolution {
     const list = Array.isArray(history) ? (history as unknown[]) : [];
     const turns = neutralTurns(list);
     const kinds = turns.map((t) => t.kind);
@@ -253,6 +271,9 @@ export function resolveSessionOrder(rawId: string, history: unknown, personaTag?
     // #5095 D1-B fallback (no valid token on the wire): per-run fragment,
     // consumed below by the derived-persona fork branch only.
     const disc = laneDiscriminator !== undefined && laneDiscriminator.trim().length > 0 ? laneDiscriminator.trim() : "";
+    // #6011: wide fragment for the collision widening — same consume-once
+    // contract, consumed by the SAME fork branch only.
+    const wideDisc = laneWideDiscriminator !== undefined && laneWideDiscriminator.trim().length > 0 ? laneWideDiscriminator.trim() : "";
     const recorded = skeletons.get(rawId);
     if (recorded === undefined) {
         // First sight under the id. A main-shaped history claims the raw
@@ -370,7 +391,36 @@ export function resolveSessionOrder(rawId: string, history: unknown, personaTag?
         // headless-subagent call site passes one) widens the key into a
         // three-segment form so distinct same-type runs never share a
         // compression session; empty degrades to the two-segment key.
-        const laneKey = disc !== "" ? `${rawId}|sub:${fp16(tag)}:${fp16(disc)}` : `${rawId}|sub:${fp16(tag)}`;
+        let laneKey = disc !== "" ? `${rawId}|sub:${fp16(tag)}:${fp16(disc)}` : `${rawId}|sub:${fp16(tag)}`;
+        // #6011: the D1-B frag collides when concurrent same-type runs share
+        // a byte-identical first user message (shared boilerplate — the
+        // field shape above), so every pass clobbered the lane's skeleton
+        // and three live runs compressed into ONE session. When a wide
+        // discriminator rides the request and an occupant already sits under
+        // the base key that the incoming does NOT continue, widen to a fourth
+        // segment: the incoming records under its OWN widened key and the
+        // occupant's skeleton survives untouched. "Continue" means strictly
+        // what the rest of this file means by it, judged against the OCCUPANT
+        // — a strict prefix extension (growth / equal retry) or a
+        // fragment-verified tail continuation (native compaction / head
+        // truncation keep the living tail verbatim — the exact mirror of the
+        // tag-less re-anchor rung below, same window, same tests). A shared
+        // head with a divergent tail (distinct run, however early) is NOT a
+        // continuation; a stale shorter replay of the occupant is not one
+        // either and takes the widened key until the client catches up
+        // (self-heals — strictly better than today's clobber-and-rewind).
+        if (wideDisc !== "") {
+            const occupant = skeletons.get(laneKey);
+            if (occupant !== undefined) {
+                const extendsOccupant = occupant.kinds.every((k, i) => k === kinds[i])
+                    && occupant.frags.every((f, i) => f === incomingFrags[i]);
+                const w = Math.min(TAIL_WINDOW, kinds.length, occupant.kinds.length);
+                const keepsTail = w > 0
+                    && tailAligns(kinds, occupant.kinds)
+                    && incomingFrags.slice(-w).every((f, i) => f === occupant.frags[occupant.frags.length - w + i]);
+                if (!extendsOccupant && !keepsTail) laneKey = `${laneKey}:${fp16(wideDisc)}`;
+            }
+        }
         record(laneKey, turns, tagHash, model);
         return { key: laneKey, action: "derived-persona", reason: "persona text changed without continuing history — persona lane" };
     }
@@ -477,11 +527,13 @@ export function applyOrderSnapshot(entries: OrderSkeletonEntry[]): number {
  *  drift cluster had to be reverse-engineered from field screenshots. Claim
  *  and continue stay silent (steady-state volume); the caller decides what
  *  to log. The callback is best-effort: a throwing observer must never break
- *  resolution. */
+ *  resolution. `laneWideDiscriminator` (#6011) rides LAST as well — the
+ *  collision-widening companion of `laneDiscriminator` (see
+ *  resolveSessionOrder). */
 type SessionResolveObserver = (rawId: string, r: SessionOrderResolution) => void;
 
-export function personaConversationOrder(rawId: string, history: unknown, personaTag?: string, declaredModel?: string, laneToken?: string, laneDiscriminator?: string, onResolve?: SessionResolveObserver): string {
-    const res = resolveSessionOrder(rawId, history, personaTag ?? "", declaredModel, laneToken, laneDiscriminator);
+export function personaConversationOrder(rawId: string, history: unknown, personaTag?: string, declaredModel?: string, laneToken?: string, laneDiscriminator?: string, onResolve?: SessionResolveObserver, laneWideDiscriminator?: string): string {
+    const res = resolveSessionOrder(rawId, history, personaTag ?? "", declaredModel, laneToken, laneDiscriminator, laneWideDiscriminator);
     if (onResolve !== undefined) {
         try {
             onResolve(rawId, res);
