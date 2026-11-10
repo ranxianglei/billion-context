@@ -103,7 +103,9 @@ async function observeJsonTerminalState(stream: ReadableStream<Uint8Array>): Pro
     }
     if (typeof body !== "object" || body === null) return "unknown";
     const rec = body as Record<string, unknown>;
-    if (rec.error !== undefined) return "failed";
+    if (rec.error !== undefined && rec.error !== null) return "failed";
+    if (rec.status === "failed" || rec.status === "incomplete" || rec.status === "cancelled") return "failed";
+    if (rec.status !== undefined && rec.status !== "completed") return "unknown";
     if (Array.isArray(rec.output)) return "completed";
     return "unknown";
 }
