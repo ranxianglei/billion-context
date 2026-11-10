@@ -32,6 +32,7 @@ import { extractWsOversizeError, formatMiB, shedEgressIfOverBudget, shedWireImag
 import { conversationPromptSections, externalSummaryEnabled, messageTimestampSections } from "../external-summary-surface.js";
 import { fakeBufCap, injectFakeCompletionHint, isFakeCompletion, maxFakeCompletionRetries } from "../fake-completion.js";
 import { fetchWithTimeout, fetchWithTransportRetry } from "../fetch-util.js";
+import { applyEgressTransforms, type EgressTransformBase } from "../egress-transforms.js";
 import { currentFetchTransport } from "../fetch-transport.js";
 import { refForItemBytes } from "../image-rescale.js";
 import { countImagesInParsedBody, countImagesInRawBody, upstreamHost } from "../image-tokens.js";
@@ -345,12 +346,14 @@ async function forwardCaptured(
     overflowRefold?: (realWindow: number | undefined) => Promise<{ body: string | Buffer; prepared: Prepared | null } | null>,
     v1Meta?: Record<string, unknown>,
     throttleModelHint?: string,
+    onWireBody?: (body?: Buffer | string) => void,
 ): Promise<void> {
     const forwardStartedAt = Date.now();
     const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepared.session, () => !res.destroyed) : undefined;
     // E2: a codex native-compaction request intercepted in prepare() carries a
     // forged success response — serve it without contacting upstream.
     if (prepared?.codexForge) {
+        onWireBody?.();
         log("info", `[${prepared.session.id}] codex compact served locally (${prepared.codexForge.kind}); upstream not contacted`);
         if (!res.headersSent) res.writeHead(200, { "content-type": prepared.codexForge.contentType });
         res.end(prepared.codexForge.body);
@@ -440,13 +443,45 @@ async function forwardCaptured(
             log("warn", `[${prepared?.session.id ?? "passthrough"}] [resign] re-sign failed; sending the previous signature: ${String(err)}`);
         }
     };
+    // #6003 phase 2: user-registerable egress body-rewrite pipeline. Runs AFTER
+    // session processing (shed above) and BEFORE the re-sign, so the signature
+    // always covers the final shipped bytes (the #1884 invariant). Unconfigured
+    // (absent/empty) → runEgress returns its input untouched (zero regression),
+    // so every call site below is a no-op unless a plugin is registered.
+    const egressEntries = opts.egressTransforms;
+    // Invariant context fields for the user egress-transform pipeline (#6003
+    // phase 2). `headers` is passed per call site rather than captured here
+    // because the compress-loop lane re-signs against its OWN header copy
+    // (reqHeaders / buildForwardHeaders), not the base forward-target headers —
+    // a plugin-set header must land on the exact object the signature will
+    // cover, or the shipped bytes and the signed bytes diverge.
+    const egressBaseFields =
+        egressEntries && egressEntries.length > 0
+            ? {
+                sessionId: prepared?.session.id,
+                upstreamUrl,
+                method: req.method ?? "GET",
+                url: upstreamUrl,
+                protocol: prepared?.protocol ?? "",
+                model: prepared?.model,
+            }
+            : undefined;
+    const runEgress = async (
+        body: string | Buffer,
+        stage: EgressTransformBase["stage"],
+        headers: Record<string, string>,
+    ): Promise<string | Buffer> => {
+        if (!egressBaseFields || !egressEntries || egressEntries.length === 0) return body;
+        return await applyEgressTransforms(body, { ...egressBaseFields, headers, stage }, egressEntries, log);
+    };
     // Single egress chokepoint for every recovery re-send (#6003 groundwork): the
     // re-sign (#1884) then v1internal re-wrap (#3129) each retry rung used to
-    // re-inline now lives here once. A future user egress-transform pipeline hooks
-    // in before the re-sign so the signature always covers the shipped bytes.
-    const finalizeEgress = (variant: string | Buffer): string | Buffer => {
-        applyResign(headers, variant);
-        return v1Wrap(variant);
+    // re-inline now lives here once. The egress pipeline (runEgress above) hooks in
+    // before the re-sign so the signature always covers the shipped bytes.
+    const finalizeEgress = async (variant: string | Buffer): Promise<string | Buffer> => {
+        const transformed = await runEgress(variant, "retry", headers);
+        applyResign(headers, transformed);
+        return v1Wrap(transformed);
     };
     // #1093 output-side compression: resolve through the standard three-level
     // compress cascade (global → provider); default off = byte-for-byte passthrough.
@@ -884,6 +919,19 @@ async function forwardCaptured(
             if (scrubbed !== wireBody) invalidateSeparatorOwnership();
             wireBody = scrubbed;
         }
+        // #6003 phase 2: run the user egress-transform pipeline on the final
+        // session-processed body, BEFORE the re-sign so the signature covers the
+        // shipped bytes. A plugin that rewrites the body makes it opaque to both
+        // provenance (#564/#2627) and the image-fact parser, so mark the copy
+        // rewritten (raw-count fallback) and invalidate the byte-bound manifest.
+        if (egressBaseFields) {
+            const beforeEgress = wireBody;
+            wireBody = await runEgress(wireBody, "initial", headers);
+            if (wireBody !== beforeEgress) {
+                outboundCopyRewritten = true;
+                invalidateSeparatorOwnership();
+            }
+        }
         applyResign(headers, wireBody);
     }
     try {
@@ -1006,11 +1054,13 @@ async function forwardCaptured(
             log("debug", `[${prepared.session.id}] [thinking-posture] dropped ${dropped.removed} signature-less thinking block(s) before send (strict upstream learned for this session, #5998)`);
         }
     }
+    const requestBody = req.method === "GET" || req.method === "HEAD" ? undefined : v1Wrap(wireBody);
     const init: Omit<RequestInit, "dispatcher"> & { dispatcher?: object } = {
         method: req.method ?? "GET",
         headers,
-        body: req.method === "GET" || req.method === "HEAD" ? undefined : v1Wrap(wireBody),
+        body: requestBody,
     };
+    onWireBody?.(requestBody);
     if (dispatcher) init.dispatcher = dispatcher;
     // #1843 L1: capture this round's image facts at the SEND chokepoint so the
     // turn's usage settle pairs with the bytes actually sent — streamed turns
@@ -1072,7 +1122,8 @@ async function forwardCaptured(
     // previous request's body. Loop re-fetches re-note their own rebuilt bodies
     // (loop/core.ts fetchUpstream); side requests never settle usage and must
     // not clobber the slot.
-    if (prepared?.session && !prepared.sidePassthrough && req.method !== "GET" && req.method !== "HEAD") {
+    const mainSend = prepared !== null && prepared.session !== undefined && !prepared.sidePassthrough && req.method !== "GET" && req.method !== "HEAD";
+    if (mainSend && prepared?.session) {
         const sentBody = typeof wireBody === "string" ? wireBody : wireBody.toString("utf8");
         // #2078: ONE parse of the outbound body for the whole seam block — the
         // estimate's projection, its wire-overhead term, and the image reserve
@@ -1286,7 +1337,7 @@ async function forwardCaptured(
         log("info", `[${prepared.session.id}] [ws-byte-shed] upstream closed 1009 with zero events at ${formatMiB(sentBytes)} MiB — shed to ${formatMiB(stats.finalBytes)} MiB (archived=${stats.archived} downscaled=${stats.downscaled}), resending once within this request`);
         try {
             const shrunkWire = scrubLoneSurrogatesOnWire(shrunk);
-            const retried = await fetchWithTimeout(upstreamUrl, { ...init, body: finalizeEgress(shrunkWire) }, undefined, clientAbort.signal);
+            const retried = await fetchWithTimeout(upstreamUrl, { ...init, body: await finalizeEgress(shrunkWire) }, undefined, clientAbort.signal);
             if (retried.response.ok) {
                 firstAttemptClear?.();
                 wireBody = shrunkWire;
@@ -1324,15 +1375,17 @@ async function forwardCaptured(
     }
     // #552 learn-on-failure: a converting upstream that rejects a role (codex
     // ≥0.153 sends "developer"; vLLM/SGLang-style backends answer 400
-    // "Invalid role: developer") gets ONE auto-retry with the offending role
-    // rewritten to "system". On success the mapping is remembered on the
-    // session (never written to config — the log carries the permanent
-    // per-provider snippet instead). On failure the original response
-    // continues downstream verbatim. 400 bodies are small (buffered below).
+    // "Invalid role: developer", serde-based ones such as DeepSeek answer 422
+    // "messages[0].role: unknown variant `developer`", #6063) gets ONE
+    // auto-retry with the offending role rewritten to "system". On success the
+    // mapping is remembered on the session (never written to config — the log
+    // carries the permanent per-provider snippet instead). On failure the
+    // original response continues downstream verbatim. Error bodies for these
+    // request-validation statuses are small (buffered below).
     if (
         compatProtocol &&
         typeof wireBody === "string" &&
-        upstreamResult.response.status === 400 &&
+        (upstreamResult.response.status === 400 || upstreamResult.response.status === 422) &&
         upstreamResult.response.body
     ) {
         let roleErrText: string | null = null;
@@ -1400,7 +1453,7 @@ async function forwardCaptured(
                     if (fixed.rewritten === 0) return "other";
                     let r: Awaited<ReturnType<typeof fetchWithTimeout>>;
                     try {
-                        r = await fetchWithTimeout(upstreamUrl, { ...init, body: finalizeEgress(fixed.body) }, undefined, clientAbort.signal);
+                        r = await fetchWithTimeout(upstreamUrl, { ...init, body: await finalizeEgress(fixed.body) }, undefined, clientAbort.signal);
                     } catch {
                         return "other"; // transport failure — keep the original 400
                     }
@@ -1498,7 +1551,7 @@ async function forwardCaptured(
             if (strippedPckBody !== null && !contentWall) {
                 let retried: Awaited<ReturnType<typeof fetchWithTimeout>> | null = null;
                 try {
-                    retried = await fetchWithTimeout(upstreamUrl, { ...init, body: finalizeEgress(strippedPckBody) }, undefined, clientAbort.signal);
+                    retried = await fetchWithTimeout(upstreamUrl, { ...init, body: await finalizeEgress(strippedPckBody) }, undefined, clientAbort.signal);
                 } catch {
                     retried = null; // transport failure — inconclusive, original 400 stands
                 }
@@ -1574,8 +1627,11 @@ async function forwardCaptured(
                 if (dropped.removed > 0) {
                     let retried: Awaited<ReturnType<typeof fetchWithTimeout>> | null = null;
                     try {
-                        applyResign(headers, dropped.body);
-                        retried = await fetchWithTimeout(upstreamUrl, { ...init, body: v1Wrap(dropped.body) }, undefined, clientAbort.signal);
+                        // #6003 phase 2: route through the unified egress chokepoint
+                        // like the other five recovery re-sends (was an inline
+                        // applyResign+v1Wrap that bypassed both the Phase-1 chokepoint
+                        // and the user transform pipeline). Unconfigured = byte-identical.
+                        retried = await fetchWithTimeout(upstreamUrl, { ...init, body: await finalizeEgress(dropped.body) }, undefined, clientAbort.signal);
                     } catch {
                         retried = null; // transport failure — inconclusive, original 400 stands
                     }
@@ -1819,7 +1875,7 @@ async function forwardCaptured(
                 } else {
                     try {
                         s.metadata.imageCountShed = { at: Date.now(), phase: "same-request-retry", cap: overflowInfo.imageCountCap, archived: countShed.stats.archived };
-                        const retried = await fetchWithTimeout(upstreamUrl, { ...init, body: finalizeEgress(countShed.body) }, undefined, clientAbort.signal);
+                        const retried = await fetchWithTimeout(upstreamUrl, { ...init, body: await finalizeEgress(countShed.body) }, undefined, clientAbort.signal);
                         if (retried.response.ok) {
                             upstreamResult.clearTimer();
                             wireBody = countShed.body; // track the accepted re-send as the wire base
@@ -1874,7 +1930,7 @@ async function forwardCaptured(
                         // summaries — scrub string bodies again so a lone
                         // surrogate can't poison the retry (see the #1884 seam).
                         const wireRefolded = typeof refolded.body === "string" ? scrubLoneSurrogatesOnWire(refolded.body) : refolded.body;
-                        const retried = await fetchWithTimeout(upstreamUrl, { ...init, body: finalizeEgress(wireRefolded) }, undefined, clientAbort.signal);
+                        const retried = await fetchWithTimeout(upstreamUrl, { ...init, body: await finalizeEgress(wireRefolded) }, undefined, clientAbort.signal);
                         if (retried.response.ok) {
                             upstreamResult.clearTimer();
                             wireBody = wireRefolded; // #1900: track the accepted re-send as the wire base
@@ -2689,7 +2745,7 @@ async function forwardCaptured(
                 // #3280: egress goes out enveloped via wireTransform, so every
                 // round-2+ response comes back enveloped too — unwrap at the loop's
                 // single adoption point or parseStream sees no candidates.
-                { url: upstreamUrl, headers: reqHeaders, model: throttleModel, wireTransform, resign: applyResign, responseStreamTransform: v1Active ? v1UnwrapStream : undefined },
+                { url: upstreamUrl, headers: reqHeaders, model: throttleModel, wireTransform, resign: applyResign, egress: (b) => runEgress(b, "loop", reqHeaders), responseStreamTransform: v1Active ? v1UnwrapStream : undefined },
                 adapter,
                 systemPrompt,
                 clientAbort.signal,
@@ -2752,7 +2808,7 @@ async function forwardCaptured(
                         json,
                         { core, config, messages: prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, textProtocol: true, visibilityMarkers, signal: clientAbort.signal },
                         requestBody,
-                        { url: upstreamUrl, headers: requestHeaders, wireTransform, resign: applyResign },
+                        { url: upstreamUrl, headers: requestHeaders, wireTransform, resign: applyResign, egress: (b) => runEgress(b, "loop", requestHeaders) },
                     );
                 }
                 // #5957: non-stream Anthropic runs the same proxy-tool loop as
@@ -2762,12 +2818,16 @@ async function forwardCaptured(
                 // through to the one-shot rewriter below.
                 if (prepared.protocol === "anthropic") {
                     const requestBody = JSON.parse(typeof body === "string" ? body : body.toString("utf8")) as Record<string, unknown>;
+                    // #6003 phase 2: one header object shared by both the re-sign
+                    // and the egress pipeline — a plugin-set header must land on
+                    // the exact object the signature will cover.
+                    const anthropicReqHeaders = buildForwardHeaders(headers);
                     json = await compressLoopAnthropicJson(
                         json,
                         ctx,
                         { proxyUrl, signal: clientAbort.signal },
                         requestBody,
-                        { url: upstreamUrl, headers: buildForwardHeaders(headers), wireTransform, resign: applyResign },
+                        { url: upstreamUrl, headers: anthropicReqHeaders, wireTransform, resign: applyResign, egress: (b) => runEgress(b, "loop", anthropicReqHeaders) },
                     );
                 }
                 // Capture upstream usage so tokenCount (which drives nudge +

@@ -6,7 +6,7 @@ import type { ServerResponse } from "node:http";
 import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
-import { CORRUPT_SIBLING_CAP, getStore, pruneCorruptSiblings, storageStatusLabel } from "./persist.js";
+import { CORRUPT_SIBLING_CAP, getStore, pruneCorruptSiblings, storageStatusLabel, kvStore } from "./persist.js";
 import { cloneStoreForRefs } from "./store.js";
 import { acquireInFlight, createSession, getSessionAsync, publishForkSession, diagnoseSuccessWithoutUsage, effectiveConfig, findSessionByCanonicalId, listSessions, markCompactionBoundary, markDirty, noteAbortedTurn, noteTruncatedUpstream, peekSession, releaseInFlight, statusInputBaseline, withSessionLock, type Session } from "./session.js";
 import { clientConversationHeader } from "./session-id.js";
@@ -289,6 +289,39 @@ type ConversationEntry = { sessionId: string; lastSeen: number };
 
 const MAX_PLUGIN_CONVERSATIONS = 1024;
 
+// #5753: the routing table rides the UNIFIED storage (kv_store namespace
+// "plugin-conversations", single row "table" holding id→{sessionId,lastSeen})
+// under the #5548 carrier rules: kv primary once hydrated, the legacy file
+// kept as pre-hydration fallback + sole carrier on legacy-only instances,
+// one-time migration on first hydration. Side benefit vs the file: sqlite
+// atomicity removes the torn-write class that spawned the .corrupt backups.
+const CONV_NS = "plugin-conversations";
+const CONV_KEY = "table";
+let convKvReady = false;
+let convChain: Promise<void> = Promise.resolve();
+let convWarned = false;
+
+function convWarnOnce(tag: string, err: unknown): void {
+    if (convWarned) return;
+    convWarned = true;
+    loggerLog("warn", `[plugin] ${tag} failed — the conversation table stays on the legacy file for this process (${err instanceof Error ? err.message : String(err)})`);
+}
+
+/** Validate a persisted table map; null unusable. Entries must carry a
+ *  non-empty sessionId and a numeric lastSeen (the LRU clock depends on it). */
+function parseConvTable(value: unknown): Record<string, ConversationEntry> | null {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+    const out: Record<string, ConversationEntry> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+        if (!v || typeof v !== "object") continue;
+        const e = v as ConversationEntry;
+        if (typeof e.sessionId !== "string" || e.sessionId.length === 0) continue;
+        if (typeof e.lastSeen !== "number") continue;
+        out[k] = { sessionId: e.sessionId, lastSeen: e.lastSeen };
+    }
+    return out;
+}
+
 const conversations = new Map<string, ConversationEntry>();
 // #2077: which content-store object each session's stored-refs list was last
 // evaluated against. Store updates are immutable (storeOriginal returns a new
@@ -322,6 +355,24 @@ function writeConversationsFile(): void {
     try {
         const obj: Record<string, ConversationEntry> = {};
         for (const [k, v] of conversations) obj[k] = v;
+        // #5753: unified instances persist to kv_store — SQLite's atomic commit
+        // replaces the pid-tmp + fsync + rename dance below.
+        const store = kvStore();
+        if (convKvReady && store !== null) {
+            convChain = convChain.then(
+                () => store.setKvAsync(CONV_NS, CONV_KEY, obj),
+            ).catch((err) => {
+                convWarnOnce("persist", err);
+                // #5757 review fix: a failed write DEMOTES this process back
+                // onto the legacy file path (the rescheduled save below takes
+                // it), instead of retrying a dead store on every 300ms save.
+                convKvReady = false;
+                conversationsDirty = true;
+                scheduleSaveConversations();
+            });
+            conversationsDirty = false;
+            return;
+        }
         fs.mkdirSync(stateDir(), { recursive: true });
         // #406: the only state file that used to be written in place — a
         // torn write or a dying dual instance must not zero every route.
@@ -351,13 +402,19 @@ function scheduleSaveConversations(): void {
     }, 300);
 }
 
-/** Flush the conversation map to disk immediately (called on shutdown). */
-export function flushConversations(): void {
+/** Flush the conversation map immediately (called on shutdown). Awaits queued
+ *  unified-store writes so a graceful exit loses nothing. */
+export async function flushConversations(): Promise<void> {
     if (conversationsSaveTimer) {
         clearTimeout(conversationsSaveTimer);
         conversationsSaveTimer = undefined;
     }
-    writeConversationsFile();
+    if (convKvReady && kvStore() !== null) {
+        if (conversationsDirty) writeConversationsFile(); // enqueue the queued table
+        await convChain;
+    } else {
+        writeConversationsFile();
+    }
 }
 
 /** Restore the persisted conversationId → session map. Called at startup,
@@ -390,6 +447,60 @@ export function loadConversations(): void {
         loggerLog("warn", `[plugin] plugin-conversations.json is corrupt — backed up beside the original, starting an empty routing table${capNote}`);
     }
     conversationsDirty = false;
+}
+
+/** Once per process (wired right after loadConversations at server start):
+ *  layer the kv table over what loadConversations loaded (fresher lastSeen
+ *  wins per id; oldest-first re-insertion restores the LRU clock), then
+ *  migrate file-only rows into the store exactly once. Never throws. */
+export async function hydratePluginConversationsUnified(): Promise<void> {
+    const store = kvStore();
+    if (convKvReady || !store) return;
+    try {
+        let raw: unknown;
+        try {
+            raw = await store.getKvAsync(CONV_NS, CONV_KEY);
+        } catch {
+            raw = undefined;
+        }
+        const hadRow = raw !== undefined && raw !== null;
+        const kvTable = hadRow ? (parseConvTable(raw) ?? {}) : {};
+        // kv ∪ file-loaded memory rows, fresher lastSeen wins per id…
+        const byKey = new Map<string, ConversationEntry>([...conversations]);
+        for (const [k, v] of Object.entries(kvTable)) {
+            const cur = byKey.get(k);
+            byKey.set(k, !cur || v.lastSeen >= cur.lastSeen ? v : cur);
+        }
+        // …re-insert oldest-first so the Map tail is most-recently-used again,
+        // then re-apply the cap from the front (oldest) like recordPluginSession.
+        const merged = [...byKey.entries()].sort((a, b) => a[1].lastSeen - b[1].lastSeen);
+        conversations.clear();
+        for (const [k, v] of merged) conversations.set(k, v);
+        while (conversations.size > MAX_PLUGIN_CONVERSATIONS) {
+            const oldest = conversations.keys().next().value;
+            if (oldest === undefined) break;
+            conversations.delete(oldest);
+        }
+        // One-time migration: rows loaded from the legacy file travel up once.
+        const missing = [...conversations.keys()].filter((k) => !(k in kvTable));
+        if (!hadRow || missing.length > 0) {
+            const payload: Record<string, ConversationEntry> = {};
+            for (const [k, v] of conversations) payload[k] = v;
+            await store.setKvAsync(CONV_NS, CONV_KEY, payload);
+            if (missing.length > 0) loggerLog("info", `[plugin] migrated ${missing.length} conversation route(s) from the legacy JSON file into unified storage (#5753)`);
+        }
+        convKvReady = true;
+        conversationsDirty = false;
+    } catch (err) {
+        convWarnOnce("hydrate", err);
+    }
+}
+
+/** Test seam: drop the unified caches; the next hydrate re-reads the volume. */
+export function _resetPluginConversationsUnifiedForTest(): void {
+    convKvReady = false;
+    convChain = Promise.resolve();
+    convWarned = false;
 }
 
 /** Index a plugin session by its conversation id (the key the plugin uses on
