@@ -292,3 +292,188 @@ describe("honesty gates survive the doctrine (no wholesale silencing)", () => {
         assert.notEqual(session.metadata[METADATA_DRIFT_ESCALATED], true, "single-cell churn never mass-escalates");
     });
 });
+
+describe("#5715 partial interior loss with a surviving direct-ID majority is NOT total drift", () => {
+    // 30-turn history, every turn folded in. The host drops TEN INTERIOR turns
+    // (neither a head cut nor a tail rewind) while the other TWENTY ride
+    // verbatim on the wire. The #3641 verdict classifier only saw
+    // claims==0 + unmatched>0 and never counted the twenty surviving DIRECT
+    // matches, so three such passes latched epoch-confirm and paused
+    // compression on a healthy session (#5715 field: 1162/1171 direct-present,
+    // ten interior missing). A strict direct-ID majority is the opposite of
+    // wholesale replacement and must not read as substrate destruction.
+    function interiorLossFixture(): { old: CoreMessage[]; covered: string[]; wire: CoreMessage[] } {
+        const old: CoreMessage[] = [];
+        for (let i = 0; i < 30; i++) {
+            old.push(msg(`t${i}`, i % 2 ? "user" : "assistant",
+                `history turn ${i} with distinctive vocabulary marker word ${i} for shingle coverage`));
+        }
+        const covered = old.map((m) => m.id as string);
+        const removed = new Set([4, 6, 8, 10, 12, 14, 16, 18, 20, 22]); // ten INTERIOR turns
+        const wire = old.filter((_, i) => !removed.has(i));
+        return { old, covered, wire };
+    }
+
+    test("ten interior turns dropped, twenty verbatim: no escalation, no epoch-confirm latch", () => {
+        const { old, covered, wire } = interiorLossFixture();
+        const session = fakeSession(covered, old, "dsh");
+        for (let pass = 0; pass < 4; pass++) reconcileFoldCoverage(session, wire, repair());
+        assert.notEqual(session.metadata[METADATA_DRIFT_ESCALATED], true,
+            "a surviving strict direct-ID majority is not substrate destruction");
+        assert.equal(epochConfirmPending(session), false,
+            "partial interior loss must not ask for an epoch confirmation");
+        const blocks = (session.state as { blocks: Array<{ blockId?: string }> }).blocks;
+        assert.ok(blocks.some((b) => b.blockId === "blk-1"), "the snapshot block is retained, not reaped");
+    });
+
+    test("the same interior-loss shape is tolerated in proxy mode too (lane-agnostic)", () => {
+        const { old, covered, wire } = interiorLossFixture();
+        const session = fakeSession(covered, old); // no pluginAgent -> proxy mode
+        for (let pass = 0; pass < 4; pass++) reconcileFoldCoverage(session, wire, repair());
+        assert.equal(epochConfirmPending(session), false,
+            "direct-ID majority continuity is identity evidence on every lane, not just DSH");
+    });
+
+    test("an already-pending stale latch clears once the healthy majority is back", () => {
+        const { old, covered } = interiorLossFixture();
+        const session = fakeSession(covered, old, "dsh");
+        // A persisted pending latch whose drift streak was already cleared
+        // (#5715 second site: prevStreak===0 must not strand the pause).
+        session.metadata["foldEpochConfirmPending"] = true;
+        assert.equal(epochConfirmPending(session), true, "precondition: the latch is pending");
+        // the original history is back on the wire wholesale -> a clean realigned pass
+        reconcileFoldCoverage(session, old, repair());
+        assert.equal(epochConfirmPending(session), false,
+            "strong direct continuity on an already-pending session recovers compression");
+    });
+
+    test("an explained head cut keeps its own note — the majority note stays silent", () => {
+        // 30 fully-covered turns; the host drops the OLDEST ten (a head cut —
+        // truncationExplained territory, #2695) while twenty ride verbatim,
+        // which is ALSO a strict direct-ID majority. The #2695 note owns this
+        // episode: the #5715 majority note must not fire a second line
+        // mislabeling the head cut as "interior" loss.
+        const old: CoreMessage[] = [];
+        for (let i = 0; i < 30; i++) {
+            old.push(msg(`t${i}`, i % 2 ? "user" : "assistant",
+                `history turn ${i} with distinctive vocabulary marker word ${i} for shingle coverage`));
+        }
+        const session = fakeSession(old.map((m) => m.id as string), old);
+        reconcileFoldCoverage(session, old, repair()); // warm pass: coverage established
+        const logs: string[] = [];
+        for (let pass = 0; pass < 4; pass++) reconcileFoldCoverage(session, old.slice(10), repair((l, m) => logs.push(`${l}: ${m}`)));
+        assert.ok(logs.some((line) => line.startsWith("info") && /truncat/i.test(line)),
+            "the #2695 truncation note still names the head cut");
+        assert.ok(!logs.some((line) => line.includes("partial interior loss")),
+            "an already-explained episode is not double-reported as interior loss");
+    });
+
+    test("genuine wholesale replacement STILL escalates (the gate did not weaken detection)", () => {
+        const { old, covered } = interiorLossFixture();
+        const session = fakeSession(covered, old, "dsh");
+        const foreign: CoreMessage[] = [];
+        for (let i = 0; i < 14; i++) foreign.push(msg(`x${i}`, i % 2 ? "user" : "assistant",
+            `unrelated fresh content ${i} about a brand new topic entirely`));
+        for (let pass = 0; pass < 4; pass++) reconcileFoldCoverage(session, foreign, repair());
+        assert.equal(session.metadata[METADATA_DRIFT_ESCALATED], true, "detection intact: the collapse is still flagged");
+        assert.equal(epochConfirmPending(session), true, "wholesale replacement still asks for an epoch confirmation");
+    });
+
+    // #5715 field report (independent 0.1.213/Linux-DSH confirmation): the
+    // surviving-majority base must be ACTIVE coverage alone. A successful
+    // rewind deactivates an old fold (#4050 lineage) whose ids legitimately
+    // leave the wire; counting those absent inactive recovery candidates in
+    // the denominator dilutes a healthy active direct-ID majority below the
+    // bar and re-latches epoch-confirm on a live session.
+    test("absent inactive recovery candidates cannot dilute a healthy active majority", () => {
+        const active: CoreMessage[] = [];
+        for (let i = 0; i < 20; i++) {
+            active.push(msg(`a${i}`, i % 2 ? "user" : "assistant",
+                `live turn ${i} alpha distinctive vocabulary ${i} shingle coverage body`));
+        }
+        const rewound: CoreMessage[] = [];
+        for (let i = 0; i < 30; i++) {
+            rewound.push(msg(`r${i}`, i % 2 ? "user" : "assistant",
+                `retired rewound turn ${i} beta distinctive vocabulary ${i} long deactivated`));
+        }
+        const anchors: Record<string, FoldAnchor> = {};
+        for (const m of [...active, ...rewound]) anchors[m.id as string] = anchorOf(m);
+        const droppedActive = new Set([3, 14]); // two INTERIOR live turns lost
+        const wire = [...active.filter((_, i) => !droppedActive.has(i)),
+            ...Array.from({ length: 6 }, (_, i) => msg(`n${i}`, i % 2 ? "user" : "assistant", `fresh turn ${i} gamma vocabulary ${i}`))];
+        // Order backbone sandwiches the deactivated block between two LIVE halves
+        // so its absence is interior, not a head/tail truncation run.
+        const order = [...active.slice(0, 10).map((m) => m.id as string),
+            ...rewound.map((m) => m.id as string),
+            ...active.slice(10).map((m) => m.id as string)];
+        const session = {
+            id: "s-doctrine",
+            metadata: { foldAnchors: anchors, foldAnchorOrder: order, pluginAgent: "dsh" },
+            state: {
+                blocks: [
+                    { active: true, blockId: "blk-live", effectiveMessageIds: active.map((m) => m.id as string), directMessageIds: active.map((m) => m.id as string) },
+                    { active: false, blockId: "blk-rewound", effectiveMessageIds: rewound.map((m) => m.id as string), directMessageIds: rewound.map((m) => m.id as string) },
+                ],
+                messageRefs: { byRaw: {}, byRef: {} },
+            },
+        } as unknown as Session;
+        for (let pass = 0; pass < 4; pass++) reconcileFoldCoverage(session, wire, repair());
+        assert.ok((session.metadata["foldDriftStreak"] as number ?? 0) >= 3,
+            "precondition: drift WAS detected (total-loss verdict held, no explainer) — the gate, not an explainer, decides");
+        assert.equal(epochConfirmPending(session), false,
+            "absent inactive recovery candidates must not mask a healthy active direct-ID majority");
+        assert.notEqual(session.metadata[METADATA_DRIFT_ESCALATED], true,
+            "partial active loss plus legitimate rewind residuals is not substrate destruction");
+    });
+
+    // #5715 field report negative control: a "surviving majority" made ONLY of
+    // reasoning cores must never satisfy the bar — reasoning is excluded from
+    // both numerator and denominator, so a genuine HARD (text/tool) loss still
+    // escalates even when many thinking cores ride verbatim on the wire.
+    test("reasoning-only survivors do not mask a hard (text) loss", () => {
+        const text: CoreMessage[] = [];
+        for (let i = 0; i < 20; i++) {
+            text.push(msg(`t${i}`, i % 2 ? "user" : "assistant",
+                `hard turn ${i} delta distinctive vocabulary ${i} shingle body here`));
+        }
+        const reasoning: CoreMessage[] = [];
+        for (let i = 0; i < 20; i++) {
+            reasoning.push(msg(`q${i}`, "assistant", `thinking core ${i} epsilon vocabulary ${i}`, { contentType: "reasoning" }));
+        }
+        const anchors: Record<string, FoldAnchor> = {};
+        for (const m of [...text, ...reasoning]) anchors[m.id as string] = anchorOf(m);
+        const droppedText = new Set([1, 3, 5, 7, 9, 11, 13, 15, 17, 19]); // ten INTERIOR hard turns lost
+        const wire = [...text.filter((_, i) => !droppedText.has(i)), ...reasoning];
+        const session = {
+            id: "s-doctrine",
+            metadata: { foldAnchors: anchors, foldAnchorOrder: [...text, ...reasoning].map((m) => m.id as string), pluginAgent: "dsh" },
+            state: {
+                blocks: [{ active: true, blockId: "blk-1", effectiveMessageIds: [...text, ...reasoning].map((m) => m.id as string), directMessageIds: [...text, ...reasoning].map((m) => m.id as string) }],
+                messageRefs: { byRaw: {}, byRef: {} },
+            },
+        } as unknown as Session;
+        for (let pass = 0; pass < 4; pass++) reconcileFoldCoverage(session, wire, repair());
+        assert.equal(epochConfirmPending(session), true,
+            "twenty surviving reasoning cores are not a surviving HARD majority — the text loss still escalates");
+        assert.equal(session.metadata[METADATA_DRIFT_ESCALATED], true,
+            "excluding reasoning from the majority base keeps detection honest");
+    });
+
+    // #5715 tie-breaker: exactly HALF the active hard ids present is NOT a clear
+    // surviving majority (strict > half required). A repeated exactly-half loss
+    // is itself a strong anomaly — under-detecting a real 50% collapse is worse
+    // than one confirmable epoch prompt, so the bar stays strict at the boundary.
+    test("exactly half present is not a clear majority (strict boundary)", () => {
+        const old: CoreMessage[] = [];
+        for (let i = 0; i < 20; i++) {
+            old.push(msg(`t${i}`, i % 2 ? "user" : "assistant",
+                `half turn ${i} zeta distinctive vocabulary ${i} shingle coverage`));
+        }
+        const session = fakeSession(old.map((m) => m.id as string), old, "dsh");
+        const removed = new Set([1, 3, 5, 7, 9, 11, 13, 15, 17, 19]); // exactly ten of twenty
+        const wire = old.filter((_, i) => !removed.has(i));
+        for (let pass = 0; pass < 4; pass++) reconcileFoldCoverage(session, wire, repair());
+        assert.equal(epochConfirmPending(session), true,
+            "ten-of-twenty present is not a strict majority — the terminal verdict may still fire");
+    });
+});

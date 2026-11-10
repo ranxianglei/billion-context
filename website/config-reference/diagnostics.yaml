@@ -61,6 +61,28 @@ entries:
     group: diagnostics
     desc_en: "Age cap in days for debug dump dirs; files older than this are deleted (floor 1 h). Off by default."
     desc_zh: "调试转储目录的保留天数上限；超过该天数的文件被删除（下限 1 小时）。默认关闭。"
+  - key: diagnostics.logRetentionHours
+    type: number
+    default: "48 (floor 1)"
+    plain_default: "48"
+    default_zh: "48（下限 1）"
+    env: BILI_LOG_RETENTION_HOURS
+    group: diagnostics
+    desc_en: "History the PRIVATE run log (`bili.log`) is retained to cover, in hours. The logger seals the active file at 10 MiB into an immutable, uniquely named generation instead of one `bili.log.old`, so every retained generation is enumerable and the window is real rather than accidental. This is a TARGET, not a promise: `diagnostics.logBudgetBytes` is the hard bound and always wins — a shorter window is reported, never silently claimed as complete. Reported coverage is the MEASURED span from the oldest retained line to now; generation files carry no lineage evidence, so `continuity` is always `unknown` and no status claims an unbroken window (out-of-order stamps are not treated as missing history either). Floor 1 h; a non-positive or non-numeric value falls back to the 48 h default, and because a SET env var owns the switch, an illegal `BILI_LOG_RETENTION_HOURS` falls back to that default rather than to this key."
+    desc_zh: "**私有**运行日志（`bili.log`）目标覆盖的历史小时数。日志器在 10 MiB 处把活动文件封存为**不可变、名字唯一**的一代，取代单个 `bili.log.old`，于是每一代都可枚举、窗口是真实的而不是碰巧的。这是**目标**而非承诺：`diagnostics.logBudgetBytes` 是硬上限且永远优先——更短的窗口会被如实报告，绝不悄悄宣称完整。报告的覆盖是**实测跨度**（最旧保留行 → 现在）：分代文件里没有谱系证据，所以 `continuity` 恒为 `unknown`，任何状态都不宣称窗口未中断（时间戳错序同样不被当作历史缺失）。下限 1 小时；非正数或非数值回落到默认 48 小时；按「env 一旦设置即拥有该开关」的约定，非法的 `BILI_LOG_RETENTION_HOURS` 回落到该默认值而不是本键。"
+    site_en: "<code>diagnostics.logRetentionHours</code> — target hours of PRIVATE <code>bili.log</code> history (default 48, floor 1); the byte budget always wins, and reported coverage is a MEASURED span whose continuity is <code>unknown</code>."
+    site_zh: "<code>diagnostics.logRetentionHours</code> —— 私有 <code>bili.log</code> 的目标历史小时数（默认 48，下限 1）；字节预算永远优先，报告的覆盖是实测跨度且 continuity 恒为 <code>unknown</code>。"
+  - key: diagnostics.logBudgetBytes
+    type: number
+    default: "268435456 (256 MiB, floor 1 MiB)"
+    plain_default: "268435456"
+    default_zh: "268435456（256 MiB，下限 1 MiB）"
+    env: BILI_LOG_BUDGET_BYTES
+    group: diagnostics
+    desc_en: "Hard total-byte budget across the active log plus every sealed generation; oldest generations are deleted first when it is exceeded — oldest first by sealed stamp (legacy `.old` takes its own mtime), so a migrated legacy artifact is reclaimed in its real chronological place instead of being skipped in favour of newer stamped generations. Bounds disk cost and privacy exposure on a busy machine where the default window would otherwise run to many times this. When the bytes needed for `logRetentionHours` exceed the budget, the BUDGET WINS and the shortfall is surfaced (a start-time `[warn]`, and the `retention` object in `GET /__bili/logs`). The ACTIVE file is never deleted, so a single active file that alone exceeds the budget is reported as over budget rather than truncated. Floor 1 MiB; a non-positive or non-numeric value falls back to the 256 MiB default, and a set `BILI_LOG_BUDGET_BYTES` owns the switch the same way as the hours key. Files are owner-only: 0600 from the first byte, archive directories 0700 (win32 has no POSIX mode bits and the state-dir ACL governs)."
+    desc_zh: "活动日志 + 全部封存分代的总字节硬预算；超出时按**最旧优先**整代删除——排序按封存时间戳（遗留 `.old` 用自己的 mtime），所以迁移来的历史按其真实年代被回收，而不会被跳过、先去删更新的分代。它约束繁忙机器上的磁盘占用与隐私暴露面。当 `logRetentionHours` 所需的字节超出预算时**预算赢**，且不足会被上报（启动时一行 `[warn]`，以及 `GET /__bili/logs` 里的 `retention` 对象）。活动文件永不删除，所以单个活动文件本身就超过预算时会被报告为超预算，而不是被截断。下限 1 MiB；非正数或非数值回落到默认 256 MiB，且与小时键同理：设置了的 `BILI_LOG_BUDGET_BYTES` 拥有该开关。日志文件仅属主可读：首字节起 0600，归档目录 0700（win32 无 POSIX 权限位，由状态目录 ACL 决定）。"
+    site_en: "<code>diagnostics.logBudgetBytes</code> — hard total-byte budget across the active log + all sealed generations (default 256 MiB, floor 1 MiB); oldest-first eviction, the active file is never deleted, and this budget beats <code>logRetentionHours</code>."
+    site_zh: "<code>diagnostics.logBudgetBytes</code> —— 活动日志 + 全部封存分代的总字节硬预算（默认 256 MiB，下限 1 MiB）；最旧优先回收、活动文件永不删除，且该预算优先于 <code>logRetentionHours</code>。"
   - key: diagnostics.renderNone
     type: boolean
     default: "false"
