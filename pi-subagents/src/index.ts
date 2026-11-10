@@ -133,16 +133,10 @@ export function createSubagentsExtension(inline?: SubagentsAdapterConfig): Exten
         setDelegatePolicy(state.policy);
         setDelegateDefaults({ thinkingLevel: state.policy.thinkingLevel, agents: state.policy.agents });
         setDelegateNotifyIfRead(state.policy.notifyIfRead);
-        // Third-party subagent overlap guard (#415/#5637): ANY pi-subagents
-        // install — project OR user scope — stands acp_delegate down unless
-        // delegate.forceEnable opts back in. The original scope split kept
-        // user-scope installs warn-only so a global install couldn't SILENTLY
-        // disable acp_delegate everywhere; the stand-down is loud (UI notify /
-        // console.error) and forceEnable is the documented escape hatch, neither
-        // scope-dependent, so the most common install path (`pi install
-        // npm:pi-subagents`, which writes user-scope) now also stands down
-        // instead of leaving two competing sub-agent systems live in every
-        // project.
+        // Third-party subagent overlap guard (#415, scope widened in #5637): a
+        // pi-subagents install at EITHER scope stands acp_delegate down unless
+        // delegate.forceEnable opts back in — a user-scope install is loaded in
+        // every project too, so warn-only would duplicate the surface everywhere.
         if (state.policy.enabled && !state.policy.forceEnable) {
           const scopes = findPiSubagentsInstalls(resolveAgentDir(), cwd);
           const install = scopes.project[0] ?? scopes.user[0];

@@ -42,6 +42,53 @@ import type { ExtensionAPI, ToolDefinition } from "./pi.js";
 import { loadConfigFile, type PiSubagentsFileConfig } from "../config.js";
 import { logHostEvent } from "./host-log.js";
 
+/** The four bili pi-plugin slash commands ownable via `pi.commands`. */
+export const PI_COMMAND_NAMES = ["acp", "acp-cache", "acp-rule", "acp-fleet"] as const;
+type PiCommandName = (typeof PI_COMMAND_NAMES)[number];
+/** Default surface: status + cache reconciliation stay on, the rarer
+ *  acp-rule / acp-fleet register only when named explicitly. */
+export const DEFAULT_PI_COMMANDS: readonly PiCommandName[] = ["acp", "acp-cache"];
+
+let warnedUnknownPiCommands = false;
+let warnedWrongTypePiCommands = false;
+
+/** Resolve `pi.commands` from billion-context.json into the set of slash
+ *  commands to register. `undefined` → DEFAULT_PI_COMMANDS; `[]` or `false`
+ *  → none; `true` → all four; arrays keep only known names (unknown ones warn
+ *  once, honoring the never-silently-drop-user-config rule §7.3). Each
+ *  warning class is one-shot per process so stderr stays quiet across
+ *  session starts. */
+export function resolvePiCommands(raw: unknown): readonly PiCommandName[] {
+    if (raw === undefined) return DEFAULT_PI_COMMANDS;
+    if (raw === false || (Array.isArray(raw) && raw.length === 0)) return [];
+    if (raw === true) return PI_COMMAND_NAMES;
+    if (Array.isArray(raw)) {
+        const known = new Set<string>(PI_COMMAND_NAMES);
+        const picked: PiCommandName[] = [];
+        for (const item of raw) {
+            if (typeof item === "string" && known.has(item)) {
+                if (!picked.includes(item as PiCommandName)) picked.push(item as PiCommandName);
+            } else if (!warnedUnknownPiCommands) {
+                warnedUnknownPiCommands = true;
+                console.error(`bili-plugin(pi): pi.commands has unknown entry ${JSON.stringify(item)} — known: ${PI_COMMAND_NAMES.join(", ")}`);
+            }
+        }
+        return picked;
+    }
+    // Wrong-typed value: warn and fall back to the default surface.
+    if (!warnedWrongTypePiCommands) {
+        warnedWrongTypePiCommands = true;
+        console.error(`bili-plugin(pi): pi.commands must be an array of command names or a boolean — got ${typeof raw}; using default ${JSON.stringify(DEFAULT_PI_COMMANDS)}`);
+    }
+    return DEFAULT_PI_COMMANDS;
+}
+
+/** Which slash commands should this runtime register? Read per session_start
+ *  so a config edit applies on the next session without a proxy restart. */
+export function piCommandsEnabled(): ReadonlySet<string> {
+    return new Set(resolvePiCommands(loadConfigFile().pi?.commands));
+}
+
 const EMBEDDED_GLOBAL_KEY = Symbol.for("acp-delegate.embedded");
 
 function embeddedClaimed(): boolean {
@@ -71,7 +118,7 @@ function hasBuildContextEntries(ctx: unknown): boolean {
 // #2230 config-home: map the `pi.subagents` section of billion-context.json
 // onto the package's adapter shape. Mirrors the package's
 // piSubagentsToAdapter deliberately — no shared code across the two loaders;
-// the FILE FORMAT (documented in CONFIGURATION.md) is the contract. Renames:
+// the FILE FORMAT (documented in docs/configuration.md) is the contract. Renames:
 // `prompt` replaces acp.json's delegatePrompt; `debug` is scoped to the
 // sub-agent subsystem (the top-level proxy `debug` is untouched).
 export function piSubagentsAdapter(section: PiSubagentsFileConfig | boolean): SubagentsAdapterConfig {
@@ -123,7 +170,7 @@ export function wirePiSubagents(pi: ExtensionAPI, agent: string): void {
         // rebuilt runtime gets fresh extension objects (#2875 re-wires after
         // /new/reload), and pi serves commands from the active runner only —
         // re-registering is required across rebuilds and cannot duplicate.
-        if (fleetCommandRegistered === false) {
+        if (fleetCommandRegistered === false && piCommandsEnabled().has("acp-fleet")) {
             fleetCommandRegistered = true;
             pi.registerCommand?.("acp-fleet", {
                 description: "Inspect acp_delegate sub-agent runs: live list + transcript overlay (TUI), text snapshot elsewhere.",
@@ -166,13 +213,13 @@ export function wirePiSubagents(pi: ExtensionAPI, agent: string): void {
             setDelegatePolicy(state.policy);
             setDelegateDefaults({ thinkingLevel: state.policy.thinkingLevel, agents: state.policy.agents });
             setDelegateNotifyIfRead(state.policy.notifyIfRead);
-            // Third-party pi-subagents overlap guard (#415/#5637, same contract
-            // as the standalone package): ANY install — project OR user scope —
-            // stands acp_delegate down unless delegate.forceEnable opts back in.
+            // Third-party pi-subagents overlap guard (#415, same contract as
+            // the standalone package, scope widened in #5637): an install at
+            // EITHER scope stands acp_delegate down unless delegate.forceEnable
+            // opts back in — a user-scope install is loaded in every project.
             if (state.policy.enabled && !state.policy.forceEnable) {
                 const scopes = findPiSubagentsInstalls(resolveAgentDir(), cwd);
-                const install = scopes.project[0] ?? scopes.user[0];
-                if (install !== undefined) {
+                if (scopes.project[0] !== undefined || scopes.user[0] !== undefined) {
                     state.stoodDown = true;
                     if (!standDownWarned) {
                         standDownWarned = true;
