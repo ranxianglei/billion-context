@@ -15,7 +15,7 @@ import {
 const KIND = "compressed history";
 const HEAD_CHARS = 96;
 
-export interface FoldSummaryCcrResult {
+interface FoldSummaryCcrResult {
     messages: CoreMessage[];
     store: MessageContentStore;
     changed: boolean;
