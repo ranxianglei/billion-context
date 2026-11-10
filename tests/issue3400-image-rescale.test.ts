@@ -21,7 +21,7 @@ process.env.BILI_CONFIG_FILE = "/nonexistent/bili-issue3400-config.json";
 const { createSession, peekSession } = await import("../src/session.js");
 const {
     applyImageRescalePass, applyImageRescaleItems, executeReadOriginalImage,
-    buildRescaleNote, clearRescaleEncodeCache,
+    buildRescaleNote, clearRescaleEncodeCache, shedDownscaleImage,
 } = await import("../src/image-rescale.js");
 const { storeEffectiveImageRescale, imageRescaleToolArmed } = await import("../src/store.js");
 const { defaultConfig } = await import("acp-kernel");
@@ -123,6 +123,13 @@ test("hash cache: same content encodes once, cache hits log nothing", async () =
     const d1 = (h1[0].rawAnthropicBlock as { source: { data: string } }).source.data;
     const d2 = (h2[0].rawAnthropicBlock as { source: { data: string } }).source.data;
     assert.equal(d2, d1);
+});
+
+test("shed encode cache respects the declared mime (same bytes under two mimes)", async () => {
+    const png = await shedDownscaleImage("image/png", BIG.b64, 800);
+    const jpeg = await shedDownscaleImage("image/jpeg", BIG.b64, 800);
+    assert.ok(png && jpeg, "both mimes must produce an encode");
+    assert.notEqual(png, jpeg, "a key missing the mime would serve the first mime's bytes under the second");
 });
 
 test("byte-stable: same history → identical outbound bytes across cache states", async () => {
