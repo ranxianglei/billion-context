@@ -23,7 +23,8 @@ import type { WireProtocol } from "./util.js";
  * Adoptability is judged in raw-id SET semantics, not position math: a raw id
  * is a SHA-256 of the message identity (role+contentType+text+toolCallId+
  * toolName, wire/message-id.ts), so the same bytes produce the same id in
- * parent and child. A block is adoptable iff every id in its
+ * parent and child. A retained block that is neither explicitly expanded nor
+ * consumed by another block is adoptable iff every id in its
  * effectiveMessageIds appears among the incoming request's core ids —
  * position-free, immune to subagent interleaving and reordering, and it
  * naturally rejects blocks that straddle the fork point (some source messages
@@ -83,7 +84,7 @@ interface ForkAdoptionPlan {
     adoptedActive: number;
     /** Sum of compressedTokens over the adopted ACTIVE blocks. */
     adoptedTokens: number;
-    /** Active blocks rejected because part of their source is absent. */
+    /** Eligible blocks rejected because part of their source is absent. */
     straddled: number;
     /** Highest ref string seeded, for logs. */
     maxRef: string;
@@ -166,11 +167,15 @@ export function planForkAdoption(
     const byId = new Map<string, CompressionBlock>();
     for (const b of parent.state.blocks) byId.set(b.blockId, b);
 
+    const consumed = new Set(parent.state.blocks.flatMap(b => b.directBlockIds));
     const active: CompressionBlock[] = [];
     let straddled = 0;
     if (includeBlocks) {
         for (const b of parent.state.blocks) {
-            if (!b.active) continue;
+            // Activity belongs to the source's last view; the fork may replay
+            // a retained span that view omitted. Intentional expansion and
+            // tier consumption remain inactive, as in kernel syncBlocks.
+            if (b.expanded || consumed.has(b.blockId)) continue;
             if (b.effectiveMessageIds.length === 0) continue;
             if (b.effectiveMessageIds.every((id) => incomingIds.has(id))) active.push(b);
             else straddled++;
@@ -189,12 +194,13 @@ export function planForkAdoption(
         for (const child of byId.get(id)?.directBlockIds ?? []) queue.push(child);
     }
 
+    const activeIds = new Set(active.map(b => b.blockId));
     const blocks: CompressionBlock[] = [];
     const rawIds = new Set<string>();
     for (const id of closure) {
         const b = byId.get(id);
         if (!b) continue;
-        blocks.push(structuredClone(b));
+        blocks.push({ ...structuredClone(b), active: activeIds.has(id) });
         for (const mid of b.effectiveMessageIds) rawIds.add(mid);
     }
     if (opts?.seedAllRefs) {

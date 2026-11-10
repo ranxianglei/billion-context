@@ -80,16 +80,22 @@ const ROLE_CAPTURE_STOPWORDS = new Set([
 const ROLE_REJECTION_PATTERNS = [
     /(?:invalid|unknown|unsupported|unrecognized|unexpected)[a-z ]{0,24}?role\s*[:=]?\s*["'`]?([a-z][a-z0-9_-]{1,31})["'`]?/i,
     /role\s*[:=]?\s*["'`]?([a-z][a-z0-9_-]{1,31})["'`]?\s+(?:is\s+)?not\s+(?:supported|allowed|recognized|valid|accepted)/i,
+    // Rust serde deserialization shape (DeepSeek official API, #6063): the
+    // field path comes FIRST and "unknown variant" after — the reverse word
+    // order of pattern 1, so it needs its own rule:
+    //   messages[0].role: unknown variant `developer`, expected one of ...
+    /role\s*:\s*(?:unknown|invalid|unsupported)\s+variant\s*["'`]?([a-z][a-z0-9_-]{1,31})["'`]?/i,
 ];
 
-/** Detect an upstream 400 that exists only because of a message role the
- *  provider does not support (e.g. codex ≥0.153 sends "developer";
- *  converting backends answer 400 "Invalid role: developer"). Conservative by
- *  design: status must be 400, the body must blame a role, and the captured
- *  token must look like a role name. Returns the offending role so the
- *  caller can auto-rewrite it to a supported one. */
+/** Detect an upstream 400/422 that exists only because of a message role the
+ *  provider does not support (e.g. codex ≥0.153 sends "developer"; converting
+ *  backends answer 400 "Invalid role: developer", serde-based ones such as
+ *  DeepSeek answer 422 "messages[0].role: unknown variant `developer`", #6063).
+ *  Conservative by design: status must be 400 or 422, the body must blame a
+ *  role, and the captured token must look like a role name. Returns the
+ *  offending role so the caller can auto-rewrite it to a supported one. */
 export function detectRoleRejection(status: number, bodyText: string): { role: string } | null {
-    if (status !== 400) return null;
+    if (status !== 400 && status !== 422) return null;
     const head = bodyText.slice(0, 4096);
     for (const re of ROLE_REJECTION_PATTERNS) {
         const m = re.exec(head);
@@ -107,12 +113,13 @@ export function detectRoleRejection(status: number, bodyText: string): { role: s
  *  #377. Distinct from detectRoleRejection, which names an unsupported ROLE;
  *  here the role is fine and the POSITION/count is the problem, so there is no
  *  role to capture — just a boolean gate for the second-chance developer→user
- *  hop. Conservative: requires a 400 plus the literal word "system" plus one
- *  strong placement/multiplicity marker, so unrelated 400s (quota, overflow,
- *  missing-system, auth) never trip it. Quotes/brackets are normalized away so
- *  phrasings like "Only one 'system' message…" still match. */
+ *  hop. Conservative: requires a 400/422 (#552 ladder gate) plus the literal
+ *  word "system" plus one strong placement/multiplicity marker, so unrelated
+ *  errors (quota, overflow, missing-system, auth) never trip it.
+ *  Quotes/brackets are normalized away so phrasings like "Only one 'system'
+ *  message…" still match. */
 export function detectSystemPlacementError(status: number, bodyText: string): boolean {
-    if (status !== 400) return false;
+    if (status !== 400 && status !== 422) return false;
     const head = bodyText.slice(0, 4096);
     if (!/system/i.test(head)) return false;
     const norm = head.replace(/['"`[\](){}]/g, " ");
