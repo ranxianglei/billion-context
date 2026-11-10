@@ -20,7 +20,7 @@
 WebSocket インターセプトはプロトコル非依存シェルとプロトコル毎のコーデックに分割される：
 
 - `src/ws-bridge.ts`（シェル）は許可（ループバックソース、`x-bili-plugin` レーンマーカ、`x-bili-plugin-conversation` セッションヘッダー、トンネル宛先ガード）、アップグレードハンドシェイク、接続毎の簿記、シャットダウン時のティアダウンを所有する。どんなワイルプロトコルも知らない。
-- `src/responses-ws.ts`（コーデック）は Responses 固有のすべてを所有する：フレーム検証、`previous_response_id` クライアント履歴契約、継続チェックポイントを持つアップストリーム WebSocket トランスポート、SSE レスポンスシンク。単一の配線箇所のコーデックテーブルに登録される（`src/server.ts` の `installWebSocketBridge(server, dispatch, log, [responsesCodec, codexResponsesCodec])`）。
+- `src/responses-ws.ts`（コーデック）は Responses 固有のすべてを所有する：フレーム検証、`previous_response_id` クライアント履歴契約、継続チェックポイントを持つアップストリーム WebSocket トランスポート、SSE レスポンスシンク。単一の配線箇所のコーデックテーブルに `responsesCodec` として登録される（`src/server.ts` の `installWebSocketBridge(server, dispatch, log, [responsesCodec, codexResponsesCodec])`）。
 
 第 2 のワイルプロトコルは新しいコーデックファイル + テーブルエントリ 1 つ——シェルは変更しない。シェル契約は `WsBridgeCodec`（名前、プラグインマーカ、URL クレーム、セッションファクトリ）と `WsBridgeSession`（message/close/shutdown）。セッションはラベル付きロガー、アップグレードされたピア、アップグレードリクエスト、クレームされたアップストリーム URL、ACP パイプライン入口（`dispatch`）を受け取り、プロセス内でワイルプロトコル形状のエンベロープを再構築することが期待される。`tests/ws-bridge.test.ts` は合成の第 2 コーデックでシェルを駆動し、コーデックテーブルを誠実な状態に保つ。
 
