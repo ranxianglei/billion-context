@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { tmpdir } from "node:os";
 import { appendFileSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { join, relative, sep } from "node:path";
+import { basename, join, relative, sep } from "node:path";
 import { createInitialState } from "acp-kernel";
 import { SessionStore } from "../src/persist.ts";
 import type { Session } from "../src/session.ts";
@@ -69,6 +69,7 @@ interface MigrateResultEntry {
     reason?: string;
     alternates?: number;
     decodedBytes?: number;
+    ccrSidecar?: boolean;
 }
 
 interface MigrateJson {
@@ -76,6 +77,8 @@ interface MigrateJson {
     scannedFiles: number;
     counts: { imported: number; indexed: number; drifted: number; failed: number; planned: number };
     results: MigrateResultEntry[];
+    ccrSidecarSessions: number;
+    unpairedCcrSidecars: string[];
     indexDbBefore?: number;
     indexDbAfter?: number;
 }
@@ -90,6 +93,21 @@ const byId = (out: MigrateJson, id: string): MigrateResultEntry => {
     assert.ok(hit, `result entry for ${id}`);
     return hit!;
 };
+
+/** Absolute path of the legacy envelope file carrying record `id` (plain ids
+ *  land under _unknown/). Throws when absent. */
+function findEnvelope(dir: string, id: string): string {
+    const protoDir = join(dir, "_unknown");
+    const name = readdirSync(protoDir).find((n) => {
+        try {
+            return JSON.parse(readFileSync(join(protoDir, n), "utf8")).payload.id === id;
+        } catch {
+            return false;
+        }
+    });
+    assert.ok(name, `envelope file for ${id}`);
+    return join(protoDir, name);
+}
 
 test("bulk-imports legacy JSON sessions into a fresh index and reconciles clean", async () => {
     const dir = mkdtempSync(join(tmpdir(), "bili-migrate-"));
@@ -253,6 +271,83 @@ test("already-indexed session whose file diverged reports drifted without re-wri
         const d = byId(second.out, "drift-1");
         assert.equal(d.status, "drifted", `expected drifted, got ${d.status}: ${d.reason}`);
         assert.equal(second.out.counts.imported, 0, "diverged-but-not-ahead session is not re-imported");
+    } finally {
+        rmrf(dir);
+    }
+});
+
+test("reports CCR sidecars without importing them; the closing note withholds the delete invitation", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "bili-migrate-"));
+    try {
+        await writeSessions(dir, [{ id: "ccr-1" }]);
+        const envFile = findEnvelope(dir, "ccr-1");
+        const sidecarAbs = `${envFile.slice(0, -".json".length)}.content-store.json`;
+        const sidecarBody = JSON.stringify({ version: 1, byHash: {}, byRef: {} });
+        writeFileSync(sidecarAbs, sidecarBody);
+        dropIndex(dir);
+
+        const plan = await runMigrate(dir, true);
+        assert.equal(plan.code, 0, "a sidecar alone never fails the run");
+        assert.equal(plan.out.counts.planned, 1);
+        assert.equal(plan.out.ccrSidecarSessions, 1, "dry-run reports the sidecar too");
+        assert.deepEqual(plan.out.unpairedCcrSidecars, []);
+        assert.equal(byId(plan.out, "ccr-1").ccrSidecar, true);
+
+        const real = await runMigrate(dir);
+        assert.equal(real.code, 0);
+        assert.equal(real.out.counts.imported, 1);
+        assert.equal(real.out.scannedFiles, 1, "sidecars are never counted as scanned envelopes");
+        assert.equal(real.out.ccrSidecarSessions, 1);
+        assert.deepEqual(real.out.unpairedCcrSidecars, []);
+        assert.equal(byId(real.out, "ccr-1").ccrSidecar, true);
+        assert.equal(readFileSync(sidecarAbs, "utf8"), sidecarBody, "the sidecar is never touched");
+
+        const again = await runMigrate(dir);
+        assert.equal(again.code, 0);
+        assert.equal(again.out.counts.indexed, 1);
+        assert.equal(byId(again.out, "ccr-1").ccrSidecar, true, "the warning persists until the sidecar is absorbed or removed");
+
+        const human = await runStorageMigrateCommand({ dir, dryRun: false, json: false });
+        assert.ok(human.text.includes("KEEP"), `human output warns to keep the sidecar:\n${human.text}`);
+        assert.ok(human.text.includes(basename(sidecarAbs)), `human output names the sidecar file:\n${human.text}`);
+        assert.ok(!human.text.includes("archive or delete them yourself"), "delete invitation withdrawn while sidecars exist");
+    } finally {
+        rmrf(dir);
+    }
+});
+
+test("without CCR sidecars the report stays zero and the original closing note survives", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "bili-migrate-"));
+    try {
+        await writeSessions(dir, [{ id: "plain-1" }, { id: "plain-2" }]);
+        dropIndex(dir);
+        const out = await runMigrate(dir);
+        assert.equal(out.code, 0);
+        assert.equal(out.out.ccrSidecarSessions, 0);
+        assert.deepEqual(out.out.unpairedCcrSidecars, []);
+        for (const id of ["plain-1", "plain-2"]) assert.equal(byId(out.out, id).ccrSidecar, undefined);
+        const human = await runStorageMigrateCommand({ dir, dryRun: false, json: false });
+        assert.ok(human.text.includes("archive or delete them yourself once this report is clean."), `original closing note preserved:\n${human.text}`);
+        assert.ok(!human.text.includes("CCR sidecars"), `no sidecar section without sidecars:\n${human.text}`);
+    } finally {
+        rmrf(dir);
+    }
+});
+
+test("an orphan CCR sidecar (no matching envelope) is listed, uncounted, non-failing", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "bili-migrate-"));
+    try {
+        await writeSessions(dir, [{ id: "ok-1" }]);
+        writeFileSync(join(dir, "_unknown", "ghost.content-store.json"), JSON.stringify({ version: 1, byHash: {}, byRef: {} }));
+        dropIndex(dir);
+        const out = await runMigrate(dir);
+        assert.equal(out.code, 0, "an orphan sidecar never fails the run");
+        assert.equal(out.out.scannedFiles, 1, "orphan sidecars are not counted as envelopes");
+        assert.equal(out.out.ccrSidecarSessions, 0);
+        assert.deepEqual(out.out.unpairedCcrSidecars, [`_unknown${sep}ghost.content-store.json`]);
+        const human = await runStorageMigrateCommand({ dir, dryRun: false, json: false });
+        assert.ok(human.text.includes("ghost.content-store.json"), `orphan named in human output:\n${human.text}`);
+        assert.ok(!human.text.includes("archive or delete them yourself"), "delete invitation withdrawn while an orphan exists");
     } finally {
         rmrf(dir);
     }
