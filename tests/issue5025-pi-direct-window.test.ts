@@ -17,11 +17,10 @@ import os from "node:os";
 import path from "node:path";
 import { after, beforeEach, test } from "node:test";
 import { createBiliPlugin, piDeclaredWindowForDirect, _resetPiDeclaredWindowForTest } from "../src/agent/pi.ts";
-import { _declaredWindowHookForTest } from "../src/agent/pi-native.ts";
 
 const STATE_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "bili-5025-state-"));
 const PREV_ENV: Record<string, string | undefined> = {};
-for (const key of ["XDG_STATE_HOME", "BILLION_CONTEXT_PROXY", "BILLION_CONTEXT_ATTACH", "BILLION_CONTEXT_PLUGIN", "BILI_NATIVE_PI"]) {
+for (const key of ["XDG_STATE_HOME", "BILLION_CONTEXT_PROXY", "BILLION_CONTEXT_ATTACH", "BILLION_CONTEXT_PLUGIN", "BILI_NATIVE_PI", "BILI_PI_INLINE"]) {
     PREV_ENV[key] = process.env[key];
 }
 // The native entry arms at import time; a dev shell's live proxy must not be
@@ -29,6 +28,16 @@ for (const key of ["XDG_STATE_HOME", "BILLION_CONTEXT_PROXY", "BILLION_CONTEXT_A
 delete process.env.BILLION_CONTEXT_PROXY;
 delete process.env.BILLION_CONTEXT_ATTACH;
 process.env.XDG_STATE_HOME = STATE_ROOT;
+// #5428 flipped the pi lane's DEFAULT posture to INLINE: with a clean env an
+// import-time arm registers an origin waiter resolving to the inline
+// pseudo-origin, so awaitNativeProxyOrigin() would no longer stay undefined
+// and before_provider_headers would ride the proxy branch (manifest fetch)
+// instead of the direct-send early return this suite pins. Pin the pre-#5428
+// spawn posture (same pin family as e2e-native-pi, #4599). Static imports
+// hoist above any assignment, so set the marker first and import dynamically
+// (issue1958-routed-warn.test.ts).
+process.env.BILI_PI_INLINE = "0";
+const { _declaredWindowHookForTest } = await import("../src/agent/pi-native.ts");
 after(() => {
     for (const [key, value] of Object.entries(PREV_ENV)) {
         if (value === undefined) delete process.env[key];
