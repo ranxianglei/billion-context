@@ -1007,6 +1007,145 @@ test("#2708: a same-id session_start after a drop re-asserts during registration
     }
 });
 
+// #6080: model a host whose registry no longer reads our instance's tool map (pi's
+// runner/instance generation drift): every registerTool lands and is immediately
+// invisible to getAllTools. `stuckRef.stuck` lets a test flip the host back to health.
+function makeDroppingRegister(pi: FakePi, stuckRef: { stuck: boolean }): void {
+    const original = pi.registerTool.bind(pi);
+    pi.registerTool = (tool: RecordedTool) => {
+        original(tool);
+        if (stuckRef.stuck) pi.tools.length = 0;
+    };
+}
+
+test("#6080: an ineffective re-registration backs off instead of churning every turn", async () => {
+    const proxy = await startFakeProxy();
+    const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bc-plugin-agent-log-"));
+    try {
+        const pi = makeFakePi();
+        // Long backoff so the window cannot expire inside this test.
+        createBiliPlugin("pi", { retryIntervalMs: 10, reassertBackoffMs: 60_000 })(pi as never);
+        await pi.events.get("session_start")!({}, fakeCtx(proxy));
+        await waitForTools(pi, 2);
+        const before = pi.registerCalls;
+        makeDroppingRegister(pi, { stuck: true });
+        // The host rebuilt its registry while our instance map was unreadable —
+        // the ACP tools vanished from the executable list.
+        pi.tools.length = 0;
+
+        const termLines: string[] = [];
+        const origWarn = console.warn;
+        console.warn = (...args: unknown[]) => { termLines.push(args.map(String).join(" ")); };
+        try {
+            await withEnv({ XDG_STATE_HOME: stateHome }, async () => {
+                // Turn 1: detected → one re-registration burst → still absent → backoff.
+                await pi.events.get("before_agent_start")!({}, fakeCtx(proxy));
+                assert.equal(pi.registerCalls, before + 2, "turn 1: exactly one re-registration burst");
+                // Turn 2: BOTH per-turn hooks fire (real pi fires both) — the backoff
+                // must suppress every further burst, not just one hook's.
+                await pi.events.get("before_agent_start")!({}, fakeCtx(proxy));
+                await pi.events.get("before_provider_headers")!({ headers: {} }, fakeCtx(proxy));
+                assert.equal(pi.registerCalls, before + 2, "turn 2: no further churn while in backoff");
+                // Turn 3: still quiet.
+                await pi.events.get("before_provider_headers")!({ headers: {} }, fakeCtx(proxy));
+                assert.equal(pi.registerCalls, before + 2, "turn 3: still quiet");
+            });
+        } finally {
+            console.warn = origWarn;
+        }
+
+        const logText = fs.readFileSync(path.join(stateHome, "billion-context", "bili.log"), "utf8");
+        const dropLines = logText.split("\n").filter((l) => l.includes("dropped from the host registry"));
+        assert.equal(dropLines.length, 1, `the drop warn fires once for the episode, got ${dropLines.length}`);
+        const backoffLines = logText.split("\n").filter((l) => l.includes("re-registration did not take effect"));
+        assert.equal(backoffLines.length, 1, `the ineffective-attempt diagnostic fires once, got ${backoffLines.length}`);
+        assert.ok(backoffLines[0].includes("backing off"), "the diagnostic names the backoff");
+        assert.equal(termLines.filter((w) => w.includes("re-registration did not take effect")).length, 0, "#2831: diagnostics stay out of the terminal surface");
+    } finally {
+        await proxy.close();
+        fs.rmSync(stateHome, { recursive: true, force: true });
+    }
+});
+
+test("#6080: after the backoff window expires, exactly one more attempt is made", async () => {
+    const proxy = await startFakeProxy();
+    const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bc-plugin-agent-log-"));
+    try {
+        const pi = makeFakePi();
+        createBiliPlugin("pi", { retryIntervalMs: 10, reassertBackoffMs: 40 })(pi as never);
+        await pi.events.get("session_start")!({}, fakeCtx(proxy));
+        await waitForTools(pi, 2);
+        const before = pi.registerCalls;
+        makeDroppingRegister(pi, { stuck: true });
+        pi.tools.length = 0; // host rebuilt its registry while our map was unreadable
+
+        await withEnv({ XDG_STATE_HOME: stateHome }, async () => {
+            await pi.events.get("before_provider_headers")!({ headers: {} }, fakeCtx(proxy));
+            assert.equal(pi.registerCalls, before + 2, "attempt 1 fired");
+            // Inside the window: suppressed.
+            await pi.events.get("before_provider_headers")!({ headers: {} }, fakeCtx(proxy));
+            assert.equal(pi.registerCalls, before + 2, "suppressed inside the backoff window");
+            // After expiry: exactly ONE more attempt — then a fresh window opens.
+            await sleep(80);
+            await pi.events.get("before_provider_headers")!({ headers: {} }, fakeCtx(proxy));
+            assert.equal(pi.registerCalls, before + 4, "exactly one more attempt after expiry");
+            await pi.events.get("before_provider_headers")!({ headers: {} }, fakeCtx(proxy));
+            assert.equal(pi.registerCalls, before + 4, "suppressed again after the second failed attempt");
+        });
+
+        const logText = fs.readFileSync(path.join(stateHome, "billion-context", "bili.log"), "utf8");
+        const backoffLines = logText.split("\n").filter((l) => l.includes("re-registration did not take effect"));
+        assert.equal(backoffLines.length, 2, "one diagnostic per failed attempt");
+    } finally {
+        await proxy.close();
+        fs.rmSync(stateHome, { recursive: true, force: true });
+    }
+});
+
+test("#6080: a host that starts accepting registrations converges and goes quiet", async () => {
+    const proxy = await startFakeProxy();
+    const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bc-plugin-agent-log-"));
+    try {
+        const pi = makeFakePi();
+        createBiliPlugin("pi", { retryIntervalMs: 10, reassertBackoffMs: 40 })(pi as never);
+        await pi.events.get("session_start")!({}, fakeCtx(proxy));
+        await waitForTools(pi, 2);
+        const before = pi.registerCalls;
+        const stuckRef = { stuck: true };
+        makeDroppingRegister(pi, stuckRef);
+        pi.tools.length = 0; // host rebuilt its registry while our map was unreadable
+
+        await withEnv({ XDG_STATE_HOME: stateHome }, async () => {
+            // Episode start: burst fails, backoff engaged.
+            await pi.events.get("before_provider_headers")!({ headers: {} }, fakeCtx(proxy));
+            assert.equal(pi.registerCalls, before + 2, "first attempt fired");
+            // The host heals (e.g. pi finishes its reload and our instance map is read
+            // again). The next attempt lands after the short window expires…
+            stuckRef.stuck = false;
+            await sleep(80);
+            await pi.events.get("before_provider_headers")!({ headers: {} }, fakeCtx(proxy));
+            assert.equal(pi.tools.length, 2, "the re-registration now sticks");
+            assert.equal(pi.registerCalls, before + 4, "converged with one extra attempt");
+            // …and the session is quiet from then on.
+            await pi.events.get("before_provider_headers")!({ headers: {} }, fakeCtx(proxy));
+            assert.equal(pi.registerCalls, before + 4, "no churn after convergence");
+            // A LATER transient drop (a new episode) must still heal immediately —
+            // the earlier backoff episode must not suppress it.
+            pi.tools.length = 0;
+            await pi.events.get("before_provider_headers")!({ headers: {} }, fakeCtx(proxy));
+            assert.equal(pi.tools.length, 2, "a later drop heals on the very next turn");
+            assert.equal(pi.registerCalls, before + 6, "immediate heal — no stale backoff suppression");
+        });
+
+        const logText = fs.readFileSync(path.join(stateHome, "billion-context", "bili.log"), "utf8");
+        const backoffLines = logText.split("\n").filter((l) => l.includes("re-registration did not take effect"));
+        assert.equal(backoffLines.length, 1, "only the truly ineffective attempt was diagnosed");
+    } finally {
+        await proxy.close();
+        fs.rmSync(stateHome, { recursive: true, force: true });
+    }
+});
+
 test("#3542: a /tree rewind that resets the active loadout self-heals on session_tree", async () => {
     const proxy = await startFakeProxy();
     const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bc-plugin-agent-log-"));
