@@ -379,6 +379,7 @@ async function firePing(entry: KeepaliveEntry): Promise<void> {
     entry.pingInFlight = false;
     if (registry.get(entry.sessionId) !== entry) return;
     const text = await resp.text().catch(() => "");
+    if (registry.get(entry.sessionId) !== entry) return;
     if (!resp.ok) {
         if (resp.status === 429) {
             disarm(entry.sessionId, "rate-limited(429)");
