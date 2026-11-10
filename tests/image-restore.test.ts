@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, statSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { anthropicToCore, googleToCore, openaiToCore, responsesToCore } from "acp-kernel/wire";
@@ -190,6 +190,22 @@ test("writeRestoredImage: a rebase that restarts refs never restores the previou
     assert.equal(writeRestoredImage("m00001", 0, png2, "sess-rebase"), gen2);
     assert.equal(writeRestoredImage("m00001", 0, pngImg, "sess-rebase"), gen1);
 });
+
+for (const length of [0, 8]) {
+    test(`image index repairs an incomplete ${length}-byte spill when the original is resent`, () => {
+        const body = { model: "gpt", messages: [{ role: "user", content: [{ type: "image_url", image_url: { url: dataUrl } }] }] };
+        const sessionId = `sess-incomplete-${length}`;
+        const original = buildIndex("openai", body, false, sessionId);
+        const file = [...original.values()][0][0].path;
+        writeFileSync(file, Buffer.from(PNG, "base64").subarray(0, length));
+        const repaired = buildIndex("openai", body, false, sessionId);
+        assert.equal([...repaired.values()][0][0].path, file, "stable refs retain the same spill path");
+        assert.deepEqual(readFileSync(file), Buffer.from(PNG, "base64"), "resending the original must recover a partial write");
+        const mtime = statSync(file).mtimeMs;
+        buildIndex("openai", body, false, sessionId);
+        assert.equal(statSync(file).mtimeMs, mtime, "complete files retain the skip-write fast path");
+    });
+}
 
 test("resolveDecompress({ imageRef }): lists, restores to file, and reports misses", () => {
     const p = writeRestoredImage("m00042", 0, pngImg, "sess-A")!;
