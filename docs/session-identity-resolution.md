@@ -116,7 +116,7 @@ keep as-is):
    (populated by the previous request); the stored message-id set lives in the
    database. Putting the cheaper-to-compare but disk-backed check ahead of the
    memory-resident one adds a per-turn store read to the hot path.
-   3. **Availability.** Most lanes carry no message ids at all (un-stamped,
+3. **Availability.** Most lanes carry no message ids at all (un-stamped,
    un-wired); the rung simply does not exist for those requests.
 
     Lane attribution (#6011) joined later because it needed one ingredient the
