@@ -205,9 +205,13 @@ function attachEngine(ctx: Host): void {
         const info = await ctx.llm.resolveModelInfo(provider, model, signal);
         const window = info.context?.contextWindow;
         if (!window) throw new Error("native summary model has no context window");
-        // Reserve output, instruction and tool-schema overhead. The meter uses
-        // the host's tokenizer; the schema fallback deliberately overestimates.
-        const budget = Math.floor(window * 0.9) - config.maxTokens - 4096 - Buffer.byteLength(JSON.stringify(input.tools ?? []));
+        // Price schema text with the same host heuristic as messages, never UTF-8 bytes.
+        // The synthetic message is only metered, not sent; its framing adds a small reserve.
+        const toolsTokens = input.tools?.length ? ctx.tokenMeter.estimateMessage({
+            role: "user", content: [{ type: "text", text: JSON.stringify(input.tools) }],
+        }) : 0;
+        if (!Number.isFinite(toolsTokens) || toolsTokens < 0) throw new Error("native summary tool token estimate is invalid");
+        const budget = Math.floor(window * 0.9) - config.maxTokens - 4096 - toolsTokens;
         if (budget <= 0) throw new Error("native summary model has insufficient input budget");
         return state().summary.run(true, () => boundedNativeSummary(input, budget, m => ctx.tokenMeter.estimateMessage(m),
             part => originals.summarize.call(engine, part, agent, signal), signal));

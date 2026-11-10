@@ -108,3 +108,39 @@ test("adapter gates native methods and scopes summary bypass without leaking to 
     assert.equal(await ctx.compaction.compactPressure(agent, { config: { model } }), null);
     assert.deepEqual(calls, ["auto"]);
 });
+
+test("native summary budgets large multilingual tool catalogs in host tokens, preserving schemas on every batch", async () => {
+    configureNativeCompaction([{ model: "gpt-*" }]);
+    const agent = { session: { id: "large-tools", requestHeader: () => ({ config: { provider: "test", model: "gpt-luna" } }) } };
+    const meter = (m: Parameters<Parameters<typeof apply>[0]["tokenMeter"]["estimateMessage"]>[0]) =>
+        m.content.reduce((n, b) => n + Math.ceil((b.text?.length ?? 0) / 4) + 4, 4);
+    const tools = Array.from({ length: 327 }, (_, i) => ({ name: `tool_${i}`, description: "Synthetic 工具目录 description. ".repeat(40), parameters: { type: "object", properties: {} } }));
+    assert.ok(Buffer.byteLength(JSON.stringify(tools)) > 272000);
+    const input = { tools, messages: [{ ...message("System rules."), role: "system" }, ...Array.from({ length: 6 }, (_, i) => message(`fact-${i} `.repeat(15000)))] };
+    const before = structuredClone(input);
+    let calls = 0;
+    const seen = new Set<string>();
+    const engine: Parameters<typeof apply>[0]["compaction"] = {
+        config: { summarizationProvider: "", summarizationModel: "", maxTokens: 65536 },
+        compactIfNeeded: async () => null, compactPressure: async () => null,
+        compactRegion: async () => null, compactNow: async () => null,
+        summarize: async part => {
+            calls++;
+            assert.equal(nativeSummaryActive(), true);
+            assert.deepEqual(part.tools, tools);
+            const schemaTokens = meter(message(JSON.stringify(part.tools)));
+            assert.ok(part.messages.reduce((n, m) => n + meter(m), 0) + schemaTokens + 65536 + 4096 <= Math.floor(272000 * 0.9));
+            for (const m of part.messages) for (const b of m.content) for (const fact of b.text?.match(/fact-\d/g) ?? []) seen.add(fact);
+            return { summary: [{ type: "text", text: "Short retained facts." }] };
+        },
+    };
+    const ctx: Parameters<typeof apply>[0] = { compaction: engine, tokenMeter: { estimateMessage: meter }, llm: { resolveModelInfo: async () => ({ context: { contextWindow: 272000 } }) }, on: () => undefined };
+    apply(ctx);
+    await engine.summarize(input, agent);
+    assert.ok(calls > 1, "the tool reservation must force bounded batches");
+    assert.equal(seen.size, 6);
+    assert.deepEqual(input, before);
+    const previousCalls = calls;
+    await assert.rejects(engine.summarize({ messages: [message("fact")], tools: [{ description: "x".repeat(800000) }] }, agent), /insufficient input budget/);
+    assert.equal(calls, previousCalls, "genuinely oversized schemas fail before egress");
+});

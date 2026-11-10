@@ -18,11 +18,13 @@ const calls = [];
 let fail = false;
 await ctx.plugin(c => c.reflect.provide('llm', {
     imageRequestPricing: () => undefined,
-    resolveModelInfo: async () => ({ context: { contextWindow: 18000 }, defaultMaxTokens: 100 }),
+    resolveModelInfo: async (_provider, model) => ({ context: { contextWindow: model === 'gpt-luna' ? 272000 : 18000 }, defaultMaxTokens: 100 }),
     async *stream(options) {
         assert.equal(policy.nativeSummaryActive(), true);
         const cost = options.messages.reduce((n, m) => n + ctx.tokenMeter.estimateMessage(m), 0);
-        assert.ok(cost + options.maxTokens < 18000, `summary overflow: ${cost}`);
+        const toolsTokens = options.tools?.length ? Math.ceil(JSON.stringify(options.tools).length / 4) + 4 : 0;
+        const window = options.model === 'gpt-luna' ? 272000 : 18000;
+        assert.ok(cost + toolsTokens + options.maxTokens < window, `summary overflow: ${cost} + ${toolsTokens}`);
         calls.push(options);
         if (fail) throw new Error('synthetic provider failure');
         yield { type: 'text-delta', index: 0, text: 'Facts retained: checkpoint integration verified.' };
@@ -35,18 +37,18 @@ await ctx.plugin(TokenMeter);
 await ctx.plugin(Loader, { baseUrl: root.href });
 ctx.loader.builtins.group = await load('cordis-plugin-group');
 await ctx.loader.create({ id: 'compaction', name: 'cordis:group', group: true, isolate: { compaction: true }, config: [
-    { name: new URL('dsh-compaction-basic/lib/index.js', root).href, config: { auto: true, thresholdRatio: 0.8, headroomTokens: 1000, maxTokens: 200, retainTokens: 1000 } },
+    { name: new URL('dsh-compaction-basic/lib/index.js', root).href, config: { auto: true, thresholdRatio: 0.8, headroomTokens: 1000, maxTokens: 200, retainTokens: 1000, modelPolicies: [{ provider: 'fake', model: 'gpt-luna', headroomTokens: 65536, maxTokens: 65536, retainTokens: 32245 }] } },
     { name: new URL('../dist/agent/dsh-native-compaction.js', import.meta.url).href },
 ] });
 await ctx.loader.await();
 const engine = ctx.loader.resolveGroup('compaction').ctx.get('compaction');
 assert.ok(engine, 'isolated preset group provides its compaction engine');
 assert.equal(ctx.get('compaction'), undefined, 'preset engine does not leak to the host plane');
-function fixture(id, model, count = 16) {
+function fixture(id, model, count = 16, tools = [], repeats = 2600) {
     const session = ctx.sessions.create(id);
     session.append('system/message', { message: createSystemMessage('Keep the facts.') }, { surfaceOp: 'append' });
-    session.append('request/header', { header: { config: { provider: 'fake', model, maxTokens: 200 } }, reason: 'initial' });
-    for (let i = 0; i < count; i++) session.append('user/message', createUserMessage({ content: [{ type: 'text', text: `fact-${i}: `.repeat(2600) }], source: { kind: 'user' } }), { surfaceOp: 'append' });
+    session.append('request/header', { header: { config: { provider: 'fake', model, maxTokens: model === 'gpt-luna' ? 70464 : 200 }, ...(tools.length ? { tools } : {}) }, reason: 'initial' });
+    for (let i = 0; i < count; i++) session.append('user/message', createUserMessage({ content: [{ type: 'text', text: `fact-${i}: `.repeat(repeats) }], source: { kind: 'user' } }), { surfaceOp: 'append' });
     session.append('turn/start', { turn: 'test-turn' });
     return { session, options: { provider: 'fake', model }, model: { current: () => ({ provider: 'fake', model }), select: next => { model = next; } } };
 }
@@ -71,11 +73,31 @@ try {
     const generation = agent.session.surface.replaceGeneration;
     assert.equal(await engine.compactIfNeeded(agent, 'pressure'), null);
     assert.equal(agent.session.surface.replaceGeneration, generation);
+    const tools = Array.from({ length: 327 }, (_, i) => ({ name: `tool_${i}`, description: 'Synthetic 工具目录 description. '.repeat(40), parameters: { type: 'object', properties: {} } }));
+    assert.ok(Buffer.byteLength(JSON.stringify(tools)) > 272000);
+    const large = fixture('large-tool-test', 'gpt-luna', 12, tools, 7500);
+    const largeHistory = large.session.snapshotEvents();
+    const largeBefore = ctx.tokenMeter.measure(large.session).totalTokens;
+    const beforeCalls = calls.length;
+    assert.ok(await engine.compactIfNeeded(large, 'pressure'));
+    const largeCalls = calls.slice(beforeCalls);
+    assert.ok(largeCalls.length > 1, 'large catalog still allows bounded multi-batch summary');
+    for (const call of largeCalls) assert.deepEqual(call.tools, tools);
+    assert.deepEqual(large.session.snapshotEvents().slice(0, largeHistory.length), largeHistory);
+    assert.equal(large.session.surface.replaceGeneration, 1);
+    assert.ok(ctx.tokenMeter.measure(large.session).totalTokens < 136000, 'native pressure drops below the Luna threshold');
+    const oversized = fixture('oversized-tools-test', 'gpt-luna', 16, [{ name: 'too_large', description: 'x'.repeat(800000), parameters: { type: 'object' } }]);
+    const oversizedSurface = [...oversized.session.surface.nodes];
+    const beforeOversize = calls.length;
+    await assert.rejects(engine.compactIfNeeded(oversized, 'pressure'), /insufficient input budget/);
+    assert.equal(calls.length, beforeOversize);
+    assert.deepEqual(oversized.session.surface.nodes, oversizedSurface);
+    assert.equal(oversized.session.surface.replaceGeneration, 0);
     const broken = fixture('failed-test', 'gpt-5');
     const nodes = [...broken.session.surface.nodes];
     fail = true;
     await assert.rejects(engine.compactIfNeeded(broken, 'pressure'), /synthetic provider failure/);
     assert.deepEqual(broken.session.surface.nodes, nodes);
     assert.equal(broken.session.surface.replaceGeneration, 0);
-    console.log(JSON.stringify({ result: 'passed', realDSH: '0.2.2-rc.1', summaryCalls: calls.length, originalSurfaceNodes: originalCount, finalSurfaceNodes: agent.session.surface.nodes.length, generation: agent.session.surface.replaceGeneration }));
+    console.log(JSON.stringify({ result: 'passed', realDSH: '0.2.2-rc.1', summaryCalls: calls.length, originalSurfaceNodes: originalCount, finalSurfaceNodes: agent.session.surface.nodes.length, generation: agent.session.surface.replaceGeneration, largeCatalog: { tools: tools.length, summaryCalls: largeCalls.length, beforeTokens: largeBefore, afterTokens: ctx.tokenMeter.measure(large.session).totalTokens } }));
 } finally { await ctx.fiber.dispose(); }
