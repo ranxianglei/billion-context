@@ -1386,3 +1386,44 @@ test("parseCompressArgs refuses to narrow a ref pair with an unrecognized separa
   assert.equal(single.ranges[0]?.startRef, "m00150");
   assert.equal(single.ranges[0]?.endRef, "m00150");
 });
+
+// ---------------------------------------------------------------------------
+// compressAtFoldPoint v2 pointer echo + stringified single entry (#5949 field)
+// ---------------------------------------------------------------------------
+
+test("content echoing the v2 relocation pointer classifies as already-folded-echo", () => {
+  // Field shape (billion-context session 01a1b6b3): the model copied the most
+  // recent compress call's rewritten args — the v2 ack pointer — as the
+  // content of a NEW call, wrapped in one more JSON layer.
+  const parsed = parseCompressArgs({
+    content: '{"content": "[bili] compression succeeded — summary relocated to its fold point above (block(s) b49); these ranges are already folded — do not re-compress them."}',
+  });
+  assert.equal(parsed.diagnostics.ok, false);
+  assert.equal(parsed.diagnostics.kind, "already-folded-echo");
+  assert.equal(parsed.ranges.length, 0);
+});
+
+test("bare pointer text in content is already-folded-echo too", () => {
+  const parsed = parseCompressArgs({
+    content: "[bili] compression succeeded — summary relocated to its fold point above (block(s) b50); these ranges are already folded — do not re-compress them.",
+  });
+  assert.equal(parsed.diagnostics.kind, "already-folded-echo");
+});
+
+test("content string encoding ONE entry object is salvaged (refs inside the JSON)", () => {
+  const parsed = parseCompressArgs({
+    content: JSON.stringify({ startId: "m00150", endId: "m00220", summary: "investigated the loop; fixed the gate" }),
+  });
+  assert.equal(parsed.diagnostics.ok, true);
+  assert.equal(parsed.diagnostics.contentSalvage, true);
+  assert.equal(parsed.ranges.length, 1);
+  assert.equal(parsed.ranges[0]?.startRef, "m00150");
+  assert.equal(parsed.ranges[0]?.endRef, "m00220");
+  assert.equal(parsed.ranges[0]?.summary, "investigated the loop; fixed the gate");
+});
+
+test("stringified object without range bounds still rejects (content-not-array)", () => {
+  const parsed = parseCompressArgs({ content: JSON.stringify({ note: "not a range" }) });
+  assert.equal(parsed.diagnostics.ok, false);
+  assert.equal(parsed.diagnostics.kind, "content-not-array");
+});

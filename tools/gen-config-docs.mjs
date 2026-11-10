@@ -10,8 +10,8 @@ import { fileURLToPath } from "node:url";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const SEED_DIR = join(ROOT, "website", "config-reference");
-const MD_EN = join(ROOT, "CONFIGURATION.md");
-const MD_ZH = join(ROOT, "CONFIGURATION.zh-CN.md");
+const MD_EN = join(ROOT, "docs/configuration.md");
+const MD_ZH = join(ROOT, "docs/configuration.zh-CN.md");
 const MAIN_JS = join(ROOT, "website", "main.js");
 const DOCS_HTML = join(ROOT, "website", "docs", "index.html");
 const HOME_HTML = join(ROOT, "website", "index.html");

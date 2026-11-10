@@ -82,6 +82,7 @@ import { createHash } from "node:crypto";
 import { prefixAffinity } from "./prefix-affinity.js";
 import { isClaudeLaneToken } from "./claude-lane-token.js";
 import { neutralTurns, type NeutralTurn } from "./affinity-neutral.js";
+import { log as loggerLog } from "./logger.js";
 // #3397: skeleton persistence hook (deferred-use ESM cycle with
 // src/order-persist.ts — each side calls the other only inside function
 // bodies, never at module evaluation; see the note on its import).
@@ -161,6 +162,47 @@ function maxAlignedFragRun(kindsA: string[], fragsA: string[], kindsB: string[],
  *  history is the SAME conversation with host-side edits, not a stranger. */
 const CONTINUATION_MIN_RUN = 8;
 
+// #5719 E5: the #3733 authored-checkpoint identity header, as FORGED by
+// src/server/dsh-authored-compaction.ts (BILI_SNAPSHOT_TAG_PREFIX). Pinned
+// locally instead of imported: this module must stay server-free (the wiring
+// direction is handle.ts → here), and the version-pin doctrine
+// (src/server/dsh-compaction-guard.ts header) wants detector constants local.
+// If the producer's bytes drift the scan degrades to a MISS — the pre-#5719
+// fork behavior — never to a false claim.
+const BILI_SNAPSHOT_CONV_RE = /\x3cbili-snapshot v1 [^\x3e]*\bconv="([^"]+)"/;
+
+/** #5719 E5: does the FIRST user message carry our own authored-checkpoint
+ *  identity header declaring exactly `rawId`? A full compaction erases every
+ *  continuation proof the tag-changed rungs demand by definition (recorded
+ *  tail gone, depth collapsed, zero assistant in the first post-compaction
+ *  step) — the self-declaration is the one survivor. Content-blind text
+ *  extraction over all four wire shapes (string content; parts/blocks arrays
+ *  with .text items — openai/anthropic/responses/google alike). Only the
+ *  first user message counts: a LATER quote of a checkpoint (the #4438
+ *  class) must never re-anchor someone else's lane. */
+function selfCheckpointDeclares(history: unknown, rawId: string): boolean {
+    if (!Array.isArray(history)) return false;
+    for (const m of history as unknown[]) {
+        if (m === null || typeof m !== "object") continue;
+        const msg = m as { role?: unknown; content?: unknown; parts?: unknown };
+        if (msg.role !== "user") continue;
+        const c = msg.content !== undefined ? msg.content : msg.parts;
+        let text = "";
+        if (typeof c === "string") {
+            text = c;
+        } else if (Array.isArray(c)) {
+            for (const p of c) {
+                if (p !== null && typeof p === "object" && typeof (p as { text?: unknown }).text === "string") {
+                    text += (p as { text: string }).text;
+                }
+            }
+        }
+        const hit = BILI_SNAPSHOT_CONV_RE.exec(text);
+        return hit !== null && hit[1] === rawId;
+    }
+    return false;
+}
+
 export type SessionOrderResolution = {
     key: string;
     action: "claim" | "continue" | "reanchor" | "derived-aux" | "derived-task" | "derived-persona";
@@ -208,7 +250,10 @@ function record(rawId: string, turns: NeutralTurn[], tagHash: string, model?: st
  *  kinds prefix-align AND head fragments match) migrates the raw key
  *  (#2241/#2250); a tag change whose recorded body still sits verbatim at
  *  its own indices inside the incoming (host-side rewrite of its own log —
- *  #4778) migrates too; only a tag change with NO positional continuation
+ *  #4778) migrates too; a tag change whose first user message carries our
+ *  own authored checkpoint declaring exactly the raw id migrates outright
+ *  (#5719 — full compaction erases every positional proof by definition,
+ *  the self-declaration is the survivor); only a tag change with NO such
  *  evidence forks onto `<rawId>|sub:<fp16(tag)>` — byte-identical to the
  *  old ladder's fork keys, so persisted fork lanes keep their sessions
  *  across the upgrade.
@@ -321,7 +366,7 @@ export function resolveSessionOrder(rawId: string, history: unknown, personaTag?
      *  instead of forking a zero-state sub lane (#5719). The store lookup is
      *  LAZY (fires only here, with stamped ids present) and null-safe: a
      *  latched-off / legacy store degrades to the byte-evidence path. */
-    const tryMsgIdRescue = (): SessionOrderResolution | null => {
+    const tryMsgIdRescue = (exit: string): SessionOrderResolution | null => {
         if (inboundIds === undefined || readStoredMsgIds === undefined) return null;
         const stored = readStoredMsgIds(rawId);
         if (stored === null || stored.length === 0) return null;
@@ -335,6 +380,13 @@ export function resolveSessionOrder(rawId: string, history: unknown, personaTag?
             }
         }
         if (hits === 0) return null;
+        // #5865-P2 (identity F1 / #5826-P1 follow-up): the promised one-line
+        // trace. The ≥1-overlap rescue re-anchors the WHOLE request on the
+        // raw lane BEFORE the role-fork rungs — whether aux/review dispatches
+        // ever ride stamped ids overlapping the parent's rows is exactly the
+        // evidence the ≥2-vs-≥1 threshold decision needs, so every firing is
+        // logged (hits, exit context, ids) before the threshold is touched.
+        loggerLog("warn", `[session-resolve][msgid-rescue] ${rawId} hits=${hits}/${inboundIds.length} exit=${exit} firstHit=${firstHit} (#5719 overlap-rung reachability evidence)`);
         record(rawId, turns, effectiveTagHash, effectiveModel);
         return {
             key: rawId,
@@ -351,6 +403,18 @@ export function resolveSessionOrder(rawId: string, history: unknown, personaTag?
         // else is a different persona under the shared id (#150 fresh
         // task, #1916 auto-review): its own `|sub:<fp16(tag)>` lane,
         // stable across successive calls of the same persona.
+        if (selfCheckpointDeclares(history, rawId)) {
+            // #5719 E5 (first rung — strongest evidence, cheapest check): the
+            // incoming carries bili's OWN authored checkpoint (#3733) whose
+            // identity header declares this exact raw id. Full compaction
+            // erases every continuation proof the rungs below demand by
+            // definition, so no other evidence is demanded here — the marker
+            // IS the proof. record() moves the recorded tagHash to the new
+            // tag, so the next request is tag-unchanged and simply continues;
+            // the `|sub:` fork never happens and the parent lane unfreezes.
+            record(rawId, turns, tagHash, effectiveModel);
+            return { key: rawId, action: "reanchor", reason: "self-authored checkpoint declares this raw id — continuation across full-compaction rewrite (#5719)" };
+        }
         const headN = Math.min(kinds.length, recorded.kinds.length);
         const headAligns = headN > 0 && recorded.kinds.every((k, i) => kinds[i] === k);
         const headFragsEqual = headN > 0 && incomingFrags.slice(0, headN).every((f, i) => f === recorded.frags[i]);
@@ -429,7 +493,7 @@ export function resolveSessionOrder(rawId: string, history: unknown, personaTag?
         // #5719: every byte-level escape needs EVIDENCE (fragments/cells/
         // chain continuity) that the composite field failure destroys in the
         // same turn — fall back to the only surviving identity carrier.
-        const msgRescue = tryMsgIdRescue();
+        const msgRescue = tryMsgIdRescue("tag-changed");
         if (msgRescue !== null) return msgRescue;
         // #5095 D1-B: a non-empty discriminator (only the claude-anthropic
         // headless-subagent call site passes one) widens the key into a
@@ -478,7 +542,7 @@ export function resolveSessionOrder(rawId: string, history: unknown, personaTag?
         // derived, never the raw key, until the skeleton is re-established.
         // The skeleton-hash discriminator keeps distinct strangers (two
         // subagents under one main id) on distinct compression sessions.
-        const taskRescue = tryMsgIdRescue();
+        const taskRescue = tryMsgIdRescue("diverged-order");
         if (taskRescue !== null) return taskRescue;
         return { key: `${rawId}|sub:task:${skel8(kinds)}`, action: "derived-task", reason: "no order+fragment alignment with the recorded skeleton" };
     }
@@ -498,7 +562,7 @@ export function resolveSessionOrder(rawId: string, history: unknown, personaTag?
         record(rawId, turns, effectiveTagHash, effectiveModel);
         return { key: rawId, action: "reanchor", reason: "same persona id, shorter replay — skeleton follows the living end" };
     }
-    const shortRescue = tryMsgIdRescue();
+    const shortRescue = tryMsgIdRescue("shorter-divergent");
     if (shortRescue !== null) return shortRescue;
     return {
         key: `${rawId}|sub:task:${skel8(kinds)}`,
