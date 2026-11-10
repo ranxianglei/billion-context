@@ -314,8 +314,14 @@ function applyRefolds(input: {
   runId: string;
   config: Config;
   blockIds: string[];
+  /** #5894: the caller's batch-level FLOOR check already covered this summary
+   *  (multi-candidate batch met minSummaryLength in TOTAL) — waive the
+   *  per-range min here too; EMPTY + MAX stay enforced. */
+  minFloorCovered?: boolean;
 }): void {
-  validateSummaryLength(input.spec, input.config.compress);
+  validateSummaryLength(input.spec, input.config.compress, {
+    skipMin: input.minFloorCovered === true,
+  });
   const targets = new Set(input.blockIds);
   input.state.blocks = input.state.blocks.map((block) => {
     if (!targets.has(block.blockId)) return block;
@@ -698,8 +704,15 @@ export function createCore(ports: Ports = {}): CompressionCore {
     // Scope is EXACTLY the fold-candidate set that mutates state in the loop —
     // never every requested range, else a consumed range whose summary happens to
     // be long would wrongly kill a batch whose real candidates all validate.
+    // #5894: the FLOOR judges the BATCH, not each paragraph. A multi-candidate
+    // batch passes when its COMBINED summaries reach minSummaryLength — one
+    // trivial span may honestly earn a few words without atomically killing its
+    // siblings (#3003's own advice was "drop the offending range(s)", which then
+    // failed ALONE against the same floor and spun). A single folding candidate
+    // keeps guarding its own summary; EMPTY and MAX stay per-range in both shapes.
+    let batchFloorByTotal = false;
     {
-      const lengthFailures: string[] = [];
+      const foldCandidates: ApplyCompressionInput["ranges"][number][] = [];
       for (const spec of input.ranges) {
         if (skipSpecs.has(spec)) continue;
         const resolution = classifications.get(spec);
@@ -709,17 +722,48 @@ export function createCore(ports: Ports = {}): CompressionCore {
           resolution.status === "consumed" &&
           refoldDecisions.get(spec)?.kind === "refold";
         if (!foldsFresh && !foldsRefold) continue;
+        foldCandidates.push(spec);
+      }
+      const lengthFailures: string[] = [];
+      const minLen = input.config.compress.minSummaryLength;
+      if (foldCandidates.length === 1) {
+        const solo = foldCandidates[0]!;
         try {
-          validateSummaryLength(spec, input.config.compress);
+          validateSummaryLength(solo, input.config.compress);
         } catch (error) {
           lengthFailures.push(
             rangeError(
-              spec,
+              solo,
               error instanceof Error ? error.message : String(error),
             ),
           );
         }
+      } else {
+        for (const spec of foldCandidates) {
+          try {
+            validateSummaryLength(spec, input.config.compress, { skipMin: true });
+          } catch (error) {
+            lengthFailures.push(
+              rangeError(
+                spec,
+                error instanceof Error ? error.message : String(error),
+              ),
+            );
+          }
+        }
+        if (minLen > 0 && foldCandidates.length > 1) {
+          const total = foldCandidates.reduce(
+            (sum, spec) => sum + (spec.summary?.trim() ?? "").length,
+            0,
+          );
+          if (total < minLen) {
+            lengthFailures.push(
+              `Batch summary too short (${total} chars across ${foldCandidates.length} ranges, min ${minLen}). The combined summaries must capture the compressed content's key information.`,
+            );
+          }
+        }
       }
+      batchFloorByTotal = foldCandidates.length > 1;
       if (lengthFailures.length > 0) {
         // Rejected batches carry their dead-ref tombstone side effect (#2362):
         // the clone differs from input.state only in deadRefs before this point,
@@ -771,6 +815,7 @@ export function createCore(ports: Ports = {}): CompressionCore {
               runId: runIdOf(),
               config: input.config,
               blockIds: decision.blocks.map((block) => block.blockId),
+              minFloorCovered: batchFloorByTotal,
             });
             blocksCreated += decision.blocks.length;
           } catch (error) {
@@ -809,6 +854,7 @@ export function createCore(ports: Ports = {}): CompressionCore {
           protectedMessageIds,
           countTokens,
           preExistingCoverage,
+          minFloorCovered: batchFloorByTotal,
         });
         blocksCreated += outcome.noop
           ? 0
@@ -1703,6 +1749,10 @@ interface SingleRangeInput {
   protectedMessageIds?: Set<string>;
   countTokens: (text: string) => number;
   preExistingCoverage: Set<string>;
+  /** #5894: the caller's batch-level FLOOR check already covered this summary
+   *  (multi-candidate batch met minSummaryLength in TOTAL) — waive the
+   *  per-range min; EMPTY + MAX stay enforced. */
+  minFloorCovered?: boolean;
 }
 
 interface SingleRangeOutcome {
@@ -1788,6 +1838,7 @@ function applySingleRange(input: SingleRangeInput): SingleRangeOutcome {
         runId: input.runId,
         config: input.config,
         blockIds: decision.blocks.map((block) => block.blockId),
+        minFloorCovered: input.minFloorCovered,
       });
       return {
         tokens: 0,
@@ -1954,7 +2005,9 @@ function resolveCoverageInterval(
 
 function validateCompressionRange(input: SingleRangeInput): void {
   const cfg = input.config.compress;
-  validateSummaryLength(input.spec, cfg);
+  validateSummaryLength(input.spec, cfg, {
+    skipMin: input.minFloorCovered === true,
+  });
 
   // #4521: the empty-range case (no direct messages, no consumed blocks)
   // moved to the caller as an idempotent NO-OP outcome — see applySingleRange.
@@ -1965,6 +2018,7 @@ function validateCompressionRange(input: SingleRangeInput): void {
 function validateSummaryLength(
   spec: { summary: string; summaryMaxChars?: number },
   cfg: Config["compress"],
+  opts: { skipMin?: boolean } = {},
 ): void {
   const summary = spec.summary?.trim() ?? "";
 
@@ -1974,7 +2028,13 @@ function validateSummaryLength(
     );
   }
 
-  if (cfg.minSummaryLength > 0 && summary.length < cfg.minSummaryLength) {
+  // #5894: skipMin — the caller judged the FLOOR at batch level (multi-candidate
+  // total); EMPTY + MAX below stay enforced, only the per-range min is waived.
+  if (
+    !opts.skipMin &&
+    cfg.minSummaryLength > 0 &&
+    summary.length < cfg.minSummaryLength
+  ) {
     throw new Error(
       `Summary too short (${summary.length} chars, min ${cfg.minSummaryLength}). The summary must capture the compressed range's key information.`,
     );
