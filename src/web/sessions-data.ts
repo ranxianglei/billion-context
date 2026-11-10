@@ -38,7 +38,7 @@ import * as path from "node:path";
 // the model, not the host's own history — so per-step cost climbs with it. On
 // plugin lanes (~2 host messages per request, dsh-measured) that becomes
 // visible around 10k messages ≈ 5k requests. The server log warns much earlier
-// (SLOW_SESSION_MSG_WARN = 1000 messages, src/server.ts); this display gate is
+// (SLOW_SESSION_MS_WARN = 1000ms local-processing budget, src/server/request-cost.ts); this display gate is
 // deliberately higher — the badge should mean "worth starting a new session",
 // not "notable".
 const SLOW_SESSION_REQUESTS_WARN = 5000;

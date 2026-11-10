@@ -1213,18 +1213,18 @@ export class PrefixAffinityResolver {
             //  malformed list degrades the entry to exact-hash resolution.
             let sketches: string[] | undefined;
             if (hv === 2 && Array.isArray(e.sketches)) {
-                const valid = (e.sketches as unknown[]).filter(
-                    (s): s is string => typeof s === "string" && /^[0-9a-f]{16}$/.test(s),
-                );
-                if (valid.length >= ALIGN_MIN_DEPTH) sketches = valid.slice(0, SKETCH_MAX_DEPTH);
+                const slots: unknown[] = Array.from(e.sketches);
+                if (slots.every((s): s is string => typeof s === "string" && /^[0-9a-f]{16}$/.test(s)) &&
+                    slots.length >= ALIGN_MIN_DEPTH) sketches = slots.slice(0, SKETCH_MAX_DEPTH);
             }
             // #2265: user-role flags for the ownership-anchor gate — optional,
             //  malformed lists simply degrade the entry (no user anchor → the
             //  simhash rung skips it, exact-hash resolution still works).
             let userFlags: boolean[] | undefined;
             if (sketches !== undefined && Array.isArray(e.userFlags)) {
-                const validU = (e.userFlags as unknown[]).filter((u): u is boolean => typeof u === "boolean");
-                if (validU.length > 0) userFlags = validU.slice(-MAX_STORED_ITEMS);
+                const flags: unknown[] = Array.from(e.userFlags);
+                if (flags.every((u): u is boolean => typeof u === "boolean") &&
+                    flags.length > 0) userFlags = flags.slice(-MAX_STORED_ITEMS);
             }
             const entry: ChainEntry = {
                 sessionId: e.sessionId,
@@ -1241,9 +1241,13 @@ export class PrefixAffinityResolver {
             // #2807: optional tail-turn fragments for the append-continuation
             //  rung — hv2 only (a v1 entry's fragments were never noted),
             //  malformed lists degrade the entry to exact-ladder behavior.
+            //  Whole-carrier validation like sketches/userFlags above: a
+            //  filtered middle slot would shift later fragments onto the
+            //  wrong source message.
             if (hv === 2 && Array.isArray(e.tailFrags)) {
-                const validF = (e.tailFrags as unknown[]).filter((f): f is string => typeof f === "string" && /^[0-9a-f]{64}$/.test(f));
-                if (validF.length > 0) entry.tailFrags = validF.slice(0, MAX_TURN_FRAGS);
+                const frags: unknown[] = Array.from(e.tailFrags);
+                if (frags.every((f): f is string => typeof f === "string" && /^[0-9a-f]{64}$/.test(f)) &&
+                    frags.length > 0) entry.tailFrags = frags.slice(0, MAX_TURN_FRAGS);
             }
             this.trackedChains.delete(entry.sessionId);
             this.trackedChains.set(entry.sessionId, entry);
