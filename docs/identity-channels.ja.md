@@ -8,10 +8,10 @@
 
 ```
 stamped inbound ids (body fields / turn envelope)   ──▶  same consumer path ◀── harvested ids
-                                                             (msgid-pin validation →
-                                                              #5719 attribution rung →
-                                                              pin/row pipeline on
-                                                              anthropic wire)
+                                                            (msgid-pin validation →
+                                                             #5719 attribution rung →
+                                                             pin/row pipeline on
+                                                             anthropic wire)
 ```
 
 - **スタンプレーン**（dsh など）：ホストが正規 ID（`acp_summary_*`）を発行し、ボディフィールドや `/__bili/plugin/turn` エンベロープにスタンプ；送出前にプロトコル剥離。
