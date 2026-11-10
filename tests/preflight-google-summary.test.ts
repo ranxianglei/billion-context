@@ -195,7 +195,6 @@ test("e2e preflight (#829): the JSON summary of a non-streaming Gemini call is r
     }
 });
 
-
 test("Gemini tool screenshots reach the real preflight summary as recovery notes", async () => {
     const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
     const calls: Call[] = [];
