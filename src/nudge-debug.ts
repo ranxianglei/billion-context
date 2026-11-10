@@ -23,9 +23,9 @@
 // inline-engine.ts AND these prepare modules — tsup splitting:false). In
 // spawn/attach mode the proxy is a separate process holding its own bundle
 // copy: no listener ever fires there and the feature is inert (documented in
-// docs/configuration.md).
+// docs/clients.md en+zh, Pi section).
 
-export type NudgeDebugKind = "advisory" | "directive" | "fallback";
+type NudgeDebugKind = "advisory" | "directive" | "fallback";
 
 export type NudgeDebugEvent = {
     /** bili session id the nudge armed under (not the host session id). */
