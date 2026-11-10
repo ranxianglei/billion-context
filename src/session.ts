@@ -23,6 +23,7 @@ import {
     type HistoryGeneration,
     type HistoryGenerationMeta,
 } from "./history-generations.js";
+import { CODEX_CHECKPOINT_METADATA_KEY, readCodexCheckpoint } from "./codex-checkpoint.js";
 import type { FoldReconcileResult } from "./fold-reconcile.js";
 import type { UnpromptedGateState } from "./unprompted-gate.js";
 
@@ -1922,6 +1923,36 @@ export function historyGenerationsOf(session: Session): HistoryGeneration[] {
         if (gen) out.push(gen);
     }
     return out;
+}
+
+/** A cloud compaction item arrived in the RESPONSE we are streaming. The
+ *  client opted into server-side compaction on that very request, so the
+ *  history it replaced is closed now instead of at the next request: the
+ *  boundary lands on the turn that caused it and survives a client that never
+ *  comes back. The ordinal advances by one and is recorded, so the replay
+ *  (header or input item) on the following request is recognized as the same
+ *  event and never rebases twice. */
+export function closeCodexResponseCompaction(session: Session, opts: { itemIds: readonly string[]; messages?: readonly CoreMessage[] | null }): boolean {
+    const record = readCodexCheckpoint(session);
+    const seq = (record?.seq ?? 0) + 1;
+    const checkpointId = opts.itemIds.at(-1) ?? `response-compaction-${seq}`;
+    markNativeCompactionBoundary(session);
+    const rebased = reconcileNativeCompactionBoundary(session, {
+        messages: opts.messages && opts.messages.length > 0 ? [...opts.messages] : undefined,
+        cause: "codex-cloud-compaction",
+        source: "codex-response-item",
+        checkpointId,
+    });
+    if (!rebased) return false;
+    session.metadata[CODEX_CHECKPOINT_METADATA_KEY] = {
+        id: checkpointId,
+        seq,
+        at: Date.now(),
+        covered: record?.covered ?? 0,
+        digest: record?.digest,
+    };
+    markDirty(session);
+    return true;
 }
 
 export function markNativeCompactionBoundary(session: Session): void {

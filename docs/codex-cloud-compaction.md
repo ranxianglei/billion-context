@@ -29,6 +29,42 @@ clients that cannot announce.
 The headers are proxy-internal: they are listed in `UPSTREAM_HOP_HEADERS`, so
 they are stripped from both HTTP and WebSocket upstream egress.
 
+## Three wire-truth channels, one ordinal
+
+The boundary can be named at three points, all of which carry the same
+identity, so no channel can rebase twice and no channel is required for the
+others to work:
+
+| Channel | When it is seen | Who it serves |
+| --- | --- | --- |
+| `x-bili-codex-checkpoint*` header | on the request that replays the checkpoint | dsh-codex-subscription |
+| replayed `compaction` input items | on any request after a server compaction | real Codex CLI, headerless clients |
+| `compaction` output item in the response | on the turn that caused the compaction | every client, earliest possible point |
+
+The response-side channel closes the generation on the turn that compacted
+instead of one round later; the later channels are deduplicated against the
+recorded ordinal (`metadata.codexCloudCheckpoint.seq`), so the replay, a retry,
+or a process restart can never close a second generation for the same
+checkpoint.
+
+## Aggregation across generations
+
+Consecutive compactions would otherwise leave the model with several disjoint
+generations. The navigation note therefore merges the block summaries of every
+closed generation into **one** consolidated summary (newest summary wins per
+topic, bounded to ~1.2k chars) so the model keeps a single coherent picture of
+the closed past and still has to call `search_context` / `decompress` for
+detail.
+
+## Not compacting the same tokens twice
+
+The proxy folds history on the wire, while the model client still measures its
+own (unfolded) history. Without coordination right after a successful ACP fold
+the client keeps asking the server to compact a body that is already smaller.
+bili therefore announces the tokens it just folded on the response
+(`x-bili-plugin-compressed`) and dsh-codex-subscription credits exactly that
+much to the next request's compaction threshold — once, never permanently.
+
 ## What happens at the boundary
 
 1. `closeHistoryGeneration()` snapshots the live compression state — blocks,

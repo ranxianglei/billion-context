@@ -312,7 +312,50 @@ const NAV_LIMIT = 4;
 
 /** Compact navigation index injected at compaction boundaries only: names the
  *  read-only generations and how to search them. Never carries payload. */
-export function historyNavNote(session: Session): string | null {
+const NAV_TOPIC_CHARS = 120;
+const NAV_POINT_CHARS = 240;
+const NAV_SUMMARY_CHARS = 1_200;
+
+function oneLine(text: string): string {
+    return text.replace(/\s+/g, " ").trim();
+}
+
+function clampText(text: string, max: number): string {
+    const flat = oneLine(text);
+    return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat;
+}
+
+/**
+ * Merge the summaries of every closed generation into ONE consolidated summary.
+ * Consecutive cloud compactions would otherwise leave the model with N disjoint
+ * generations, each only reachable through its own lookup; the newest summary
+ * per topic wins, so re-folded material never appears twice. Bounded so the
+ * navigation index stays a note, not a payload.
+ */
+export function mergeGenerationSummaries(generations: readonly HistoryGeneration[], limit: number = NAV_SUMMARY_CHARS): string | null {
+    const seen = new Set<string>();
+    const lines: string[] = [];
+    let used = 0;
+    for (const generation of [...generations].reverse()) {
+        for (const block of generation.blocks) {
+            const topic = clampText(block.topic ?? block.blockId, NAV_TOPIC_CHARS);
+            const key = topic.toLowerCase();
+            if (seen.has(key)) continue;
+            seen.add(key);
+            const point = clampText(block.summary, NAV_POINT_CHARS);
+            const line = `- ${topic}: ${point}`;
+            if (used + line.length > limit) {
+                if (lines.length === 0) lines.push(`${line.slice(0, limit)}…`);
+                return lines.join("\n");
+            }
+            used += line.length + 1;
+            lines.push(line);
+        }
+    }
+    return lines.length > 0 ? lines.join("\n") : null;
+}
+
+export function historyNavNote(session: Session, generations?: readonly HistoryGeneration[]): string | null {
     const index = historyIndex(session);
     if (index.length === 0) return null;
     const tail = index.slice(-NAV_LIMIT);
@@ -326,6 +369,12 @@ export function historyNavNote(session: Session): string | null {
         `[bili] ${index.length} closed history generation(s) are preserved read-only and stay searchable.`,
         ...(omitted > 0 ? [`- ${omitted} older generation(s) omitted from this index (still searchable)`] : []),
         ...lines,
+        ...(index.length > 1 && generations !== undefined
+            ? (() => {
+                const merged = mergeGenerationSummaries(generations);
+                return merged === null ? [] : ["Consolidated summary of the closed history (newest first):", merged];
+            })()
+            : []),
         "Use search_context to locate folded or archived detail; decompress(blockId) and the retrieve tool resolve blocks and refs from these generations as well. Archived content is read-only and never re-sent to the model.",
     ].join("\n");
 }

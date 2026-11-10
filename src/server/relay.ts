@@ -50,9 +50,10 @@ import { pipePluginChatWithStrip, pipePluginJson, pipePluginJsonlWithStrip, pipe
 import { describeCoreTextDuplication, estimateCoreMessages, estimateCoreMessagesUpperBytes } from "../preflight.js";
 import { reasoningGuardEngages, runReasoningGuard } from "../reasoning-guard.js";
 import { wrapStreamWithRunawayGuard } from "../runaway-guard.js";
-import { diagnoseSuccessWithoutUsage, markDirty, markNativeCompactionBoundary, withSessionLock, type Session } from "../session.js";
+import { closeCodexResponseCompaction, diagnoseSuccessWithoutUsage, markDirty, markNativeCompactionBoundary, withSessionLock, type Session } from "../session.js";
 import { adoptContentStore, ccrLoopConfig, commitRetrievalNotes, commitRetrievals, contentStoreOf, dropRetrievals } from "../store.js";
 import { emitStreamError } from "../stream-error.js";
+import { observeCodexCompactionItems } from "../codex-checkpoint.js";
 import { rewriteGoogleJsonResponseAsync } from "../stream-google.js";
 import { v1UnwrapStream, wrapV1Internal, wrapV1ResponseJson, wrapV1SseFrame } from "../v1internal.js";
 import { rewriteOpenaiJsonResponseAsync } from "../stream-openai.js";
@@ -2286,6 +2287,18 @@ async function forwardCaptured(
                         (msg) => log("info", `[${prepared.session.id}] ${msg}`),
                     );
                 } else if (prepared.protocol === "responses") {
+                    // Codex cloud compaction: the client asked the server to
+                    // compact this very request, so a compaction item in the
+                    // response is the boundary — close it now instead of one
+                    // turn late. The tee only exists on opted-in turns; the
+                    // observer never rejects and the close is deduped against
+                    // the ordinal the next request will replay.
+                    let compactionObserver: Promise<string[]> | null = null;
+                    if (prepared.codexBoundary?.requested) {
+                        const [toPipe, toObserve] = pluginBody.tee();
+                        pluginBody = toPipe;
+                        compactionObserver = observeCodexCompactionItems(toObserve);
+                    }
                     // #732/#821 applies to this pipe too (#871): the agent's own
                     // body, held here with its URL and headers, is re-issued once
                     // when the turn completes with nothing visible.
@@ -2312,6 +2325,24 @@ async function forwardCaptured(
                         upstreamMeta,
                         reply,
                     );
+                    if (compactionObserver) {
+                        const ids = await Promise.race([
+                            compactionObserver,
+                            new Promise<string[]>((resolve) => {
+                                const timer = setTimeout(() => resolve([]), 3000);
+                                timer.unref();
+                            }),
+                        ]);
+                        if (ids.length > 0) {
+                            await withSessionLock(prepared.session, () => {
+                                const closed = closeCodexResponseCompaction(prepared.session, {
+                                    itemIds: ids,
+                                    messages: prepared.codexBoundary?.messages,
+                                });
+                                log("info", `[${prepared.session.id}] codex cloud compaction item in response (${ids[0]}): ${closed ? "generation closed at response time" : "boundary kept for next request (nothing archived)"}`);
+                            });
+                        }
+                    }
                 } else {
                     // #732/#821: the plugin pipe re-issues the agent's own body
                     // once when a turn ends with nothing visible (the render-tag

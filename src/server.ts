@@ -2000,6 +2000,12 @@ export type Prepared = {
     responseExtraHeaders?: Record<string, string>;
     responsesTextProtocol?: boolean;
     resetAfterSuccess?: boolean;
+    /** Codex cloud compaction: this request opted into server-side compaction,
+     *  plus the pre-compaction view the generation must archive. The relay
+     *  closes the boundary at response time when the stream carries the
+     *  compaction item, instead of waiting for the next request to announce
+     *  it. */
+    codexBoundary?: { requested: boolean; messages: CoreMessage[] };
     responsesProjection?: ResponsesProjection;
     anthropicSystem?: AnthropicRequestBody["system"];
     /** #2189: the client's billing-attribution block captured from the INBOUND

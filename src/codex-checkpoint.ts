@@ -103,3 +103,102 @@ export function readCodexCheckpoint(session: { metadata: Record<string, unknown>
 export function codexCheckpointRecord(signal: CodexCheckpointSignal, at: number): CodexCheckpointRecord {
     return { id: signal.checkpointId, seq: signal.seq, at, covered: signal.covered, digest: signal.digest };
 }
+
+/** Compaction items a client replayed in this request's input. Each one is a
+ *  checkpoint the server already produced, so the count is a monotonic
+ *  generation ordinal that both sides can recompute: the plugin from the
+ *  history it sends, the proxy from the wire. Bili's own forged carrier is
+ *  excluded — it is a summary handoff, not a remote checkpoint. */
+export function codexCompactionItems(input: unknown): { count: number; ids: string[] } {
+    if (!Array.isArray(input)) return { count: 0, ids: [] };
+    const ids: string[] = [];
+    for (const raw of input) {
+        if (!raw || typeof raw !== "object") continue;
+        const item = raw as Record<string, unknown>;
+        if (item.type !== "compaction") continue;
+        const encrypted = item.encrypted_content;
+        if (typeof encrypted !== "string" || encrypted.length === 0) continue;
+        if (typeof item.id === "string" && item.id.startsWith("fc_bili_")) continue;
+        if (encrypted.startsWith("bili:acp:")) continue;
+        ids.push(typeof item.id === "string" && item.id.length > 0 ? item.id : `compaction-${ids.length + 1}`);
+    }
+    return { count: ids.length, ids };
+}
+
+/** The client asked the server to compact this very request. Together with a
+ *  compaction item in the response, that is an explicit opt-in to server-side
+ *  compaction — the condition under which the response item may be treated as
+ *  a history boundary instead of waiting for the next request to announce it. */
+export function codexCompactionRequested(body: unknown): boolean {
+    if (!body || typeof body !== "object") return false;
+    const management = (body as Record<string, unknown>).context_management;
+    if (!Array.isArray(management)) return false;
+    return management.some((entry) => entry && typeof entry === "object"
+        && (entry as Record<string, unknown>).type === "compaction");
+}
+
+const OBSERVE_MAX_BYTES = 2 * 1024 * 1024;
+
+/** Watch a Responses SSE stream for the compaction item the server produced.
+ *  Last one wins, mirroring how the codex client replays the checkpoint: the
+ *  stream emits an in-progress item and then the final one. Resolves on the
+ *  terminal frame, EOF, or error — never rejects, because it runs beside the
+ *  client-facing pipe. */
+export async function observeCodexCompactionItems(stream: ReadableStream<Uint8Array>): Promise<string[]> {
+    const ids: string[] = [];
+    let buffer = "";
+    let bytes = 0;
+    const decoder = new TextDecoder();
+    const readLine = (line: string): boolean => {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith("data:")) return false;
+        const data = trimmed.slice(5).trim();
+        if (data === "[DONE]") return true;
+        let event: Record<string, unknown>;
+        try {
+            event = JSON.parse(data) as Record<string, unknown>;
+        } catch {
+            return false;
+        }
+        if (event.type === "response.output_item.done") {
+            const item = event.item;
+            if (item && typeof item === "object") {
+                const value = item as Record<string, unknown>;
+                if (value.type === "compaction" && typeof value.encrypted_content === "string") {
+                    if (!(typeof value.id === "string" && value.id.startsWith("fc_bili_"))) {
+                        ids.length = 0;
+                        ids.push(typeof value.id === "string" && value.id.length > 0 ? value.id : "compaction-response");
+                    }
+                }
+            }
+        }
+        return event.type === "response.completed" || event.type === "response.failed" || event.type === "response.incomplete";
+    };
+    try {
+        const reader = stream.getReader();
+        for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            bytes += value.byteLength;
+            if (bytes > OBSERVE_MAX_BYTES) {
+                await reader.cancel().catch(() => undefined);
+                break;
+            }
+            buffer += decoder.decode(value, { stream: true });
+            let index = buffer.indexOf("\n");
+            while (index >= 0) {
+                const line = buffer.slice(0, index);
+                buffer = buffer.slice(index + 1);
+                if (readLine(line)) {
+                    await reader.cancel().catch(() => undefined);
+                    return ids;
+                }
+                index = buffer.indexOf("\n");
+            }
+        }
+        if (buffer) readLine(buffer);
+    } catch {
+        // The client pipe owns this response; a cancelled tee is not an error.
+    }
+    return ids;
+}

@@ -3,10 +3,23 @@
 > 一段会话上有两种压缩：Codex 后端用加密 checkpoint 替换历史，bili 用 ACP
 > 压缩同一段历史。本文记录两者如何保持一致，以及越过边界后什么还活着。
 
-## 边界靠通知，不靠猜测
+## 三条线上通道，一个序号
 
-`dsh-codex-subscription` 校验回放的 OpenAI `compaction` 项后，给下一次模型请求
-打上 checkpoint 身份：
+边界可以在三个位置被确认，三者携带同一身份，因此任何一条通道都不会重复 reset，
+也不存在“必须依赖某一条”的情况：
+
+| 通道 | 何时可见 | 服务对象 |
+|---|---|---|
+| `x-bili-codex-checkpoint*` header | 回放 checkpoint 的那次请求 | dsh-codex-subscription |
+| 回放的 `compaction` 输入项 | 服务端压缩之后的任意请求 | 真实 Codex CLI、无 header 的客户端 |
+| 响应里的 `compaction` 输出项 | 造成压缩的那一轮响应 | 所有客户端，最早的时间点 |
+
+响应侧通道在“造成压缩的那一轮”就关闭历史代，而不是晚一轮；后续通道会按已记录的
+序号（`metadata.codexCloudCheckpoint.seq`）去重，所以回放、重试或进程重启都不会
+为同一个 checkpoint 关闭第二代。
+
+`dsh-codex-subscription` 校验回放的 OpenAI `compaction` 项后，可以给下一次模型请求
+打上 checkpoint 身份（这是三条通道中的显式一条；插件未打时另外两条仍然工作）：
 
 | Header | 含义 |
 |---|---|
@@ -24,6 +37,19 @@ bili（`src/codex-checkpoint.ts`）把**新身份**——新 id 或更大的 `se
 
 这些 header 属于代理内部：已列入 `UPSTREAM_HOP_HEADERS`，HTTP 与 WebSocket
 出站都会被剥掉。
+
+## 跨代聚合
+
+连续压缩会让模型看到多个互不相干的代。导航注记因此把所有已关闭代的块摘要合并成
+**一条**统一摘要（同一 topic 以最新一条为准，整体约 1.2k 字符封顶），模型保留对
+“已关闭的过去”的单一连贯印象，细节仍然要调用 `search_context` / `decompress`。
+
+## 不重复压缩同一段 token
+
+代理在线上折叠了历史，但模型客户端仍按自己（未折叠）的历史计算体积。折叠成功后
+不做协调，客户端会继续请求服务端压缩一个已经变小的 body。因此 bili 在响应里通告
+本轮折叠掉的 token 数（`x-bili-plugin-compressed`），`dsh-codex-subscription` 把
+同样的额度**一次性**抵扣进下一次请求的压缩阈值，而不是永久下调。
 
 ## 边界上发生什么
 

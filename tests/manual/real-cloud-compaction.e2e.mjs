@@ -1,8 +1,10 @@
 // Real-credential end-to-end: Codex cloud compaction (GPT-6 Luna) through a
-// live bili proxy. Proves: real encrypted_content checkpoint is captured and
-// reused, the checkpoint header closes a read-only history generation, old
-// refs/blocks restore after compaction, a second compaction never rebases
-// twice, and the model keeps working from the compacted context.
+// live bili proxy. Proves, against the real backend: the encrypted checkpoint
+// is captured and reused, the response-side compaction item closes a read-only
+// history generation on the turn that caused it, the replay later in the
+// conversation never rebases twice, old refs/blocks restore and stay
+// searchable across generations, and the model keeps working from the
+// compacted context with its tool surface intact.
 //
 //   node --import ./tests/preload-test-env.mjs --import tsx tests/manual/real-cloud-compaction.e2e.mjs
 import assert from 'node:assert/strict'
@@ -72,7 +74,10 @@ const toolUrl = `${proxyOrigin}/__bili/plugin/tool`
 const provider = openaiCodexProvider()
 const baseModel = (await provider.getModels()).find(m => m.id === 'gpt-5.6-luna')
 const model = { ...baseModel, id: MODEL, name: 'GPT-6 Luna', contextWindow: WINDOW, maxTokens: 32000 }
-const bridge = createCompactionBridge({ enabled: () => true, accountScope: async () => accountId, threshold: () => 5000 })
+// Threshold is per-request: the seed turn must NOT compact (so the agent can
+// fold first, exactly like a real ACP turn), the following turn must.
+let compactThreshold = 10_000_000
+const bridge = createCompactionBridge({ enabled: () => true, accountScope: async () => accountId, threshold: () => compactThreshold })
 const adapter = bridge.wrapAdapter({
   async prepareCall() {
     return { model, stream: options => piStream(options) }
@@ -87,12 +92,11 @@ function piStream(options) {
       onPayload: payload => {
         const prepared = bridge.preparePayload(payload, WINDOW, undefined)
         const sig = bridge.checkpointSignal()
-        log('  payload', JSON.stringify({ reuse: !!sig, sig: sig && { seq: sig.seq, covered: sig.covered }, fullHistory: JSON.stringify(prepared.input).includes('history 0 lorem'), inputItems: prepared.input.length, compactionItems: prepared.input.filter(i => i.type === 'compaction').length }))
+        log('  payload', JSON.stringify({ reuse: !!sig, sig: sig && { seq: sig.seq, covered: sig.covered }, compactionItems: prepared.input.filter(i => i.type === 'compaction').length }))
         Object.assign(headers, Object.fromEntries(bridge.stampHeaders(new Headers({})).entries()))
         return prepared
       },
       fetch: async (url, init) => {
-        log('  upstream fetch', new URL(url).pathname)
         const target = new URL(url)
         const routed = `${proxyOrigin}/bili/https://${target.host}${target.pathname}${target.search}`
         const h = new Headers(init.headers)
@@ -100,11 +104,9 @@ function piStream(options) {
         h.set('x-bili-plugin', 'dsh')
         h.set('x-bili-plugin-conversation', CONV)
         const res = await realFetch(routed, { ...init, headers: h, signal: AbortSignal.timeout(150000) })
-        log('  proxy response', res.status)
         return bridge.networkOptions({}).transformResponse(res, new URL(url))
       },
     })
-    log('  pi stream started')
     const blocks = []
     let done
     for await (const ev of events) {
@@ -113,7 +115,6 @@ function piStream(options) {
       if (ev.type === 'done') done = ev
     }
     const kept = blocks.filter(Boolean)
-    kept.forEach((block, index) => { blocks[index] = block })
     for (let i = 0; i < kept.length; i++) yield { type: 'block-end', index: i, block: kept[i] }
     yield {
       type: 'finish',
@@ -130,8 +131,7 @@ async function turn(messages, label) {
   const finish = events.find(e => e.type === 'finish')
   const blocks = events.filter(e => e.type === 'block-end').map(e => e.block)
   const assistant = { role: 'assistant', content: blocks, source: { kind: 'pi-ai', provider: 'openai-codex', model: MODEL, replayState: finish.replayState } }
-  const usage = messages.length
-  log(`${label}: cp=${(finish.replayState?.response?.codexCompactionV1?.digest ?? 'none').slice(0, 12)} blocks=${blocks.length} text=${JSON.stringify((finish.text ?? '').slice(0, 160))} upstreamBodies=${upstreamBodies.length}`)
+  log(`${label}: cp=${(finish.replayState?.response?.codexCompactionV1?.digest ?? 'none').slice(0, 12)} text=${JSON.stringify((finish.text ?? '').slice(0, 160))}`)
   return { assistant, finish, text: finish.text ?? '' }
 }
 
@@ -140,110 +140,98 @@ function theSession() {
   return all.find(s => (s.lastMessages?.length ?? 0) > 0) ?? all.at(-1)
 }
 
-// ── turn 1: large real request, server-side compaction ───────────────────
+async function waitForGenerations(count, label) {
+  const deadline = Date.now() + 8000
+  while (Date.now() < deadline) {
+    if (historyIndex(theSession()).length >= count) return
+    await new Promise(r => setTimeout(r, 50))
+  }
+  assert.fail(`timed out waiting for ${label}`)
+}
+
+const toolCall = (tool, args) => realFetch(toolUrl, {
+  method: 'POST', headers: { 'content-type': 'application/json', 'x-bili-plugin': 'dsh' },
+  body: JSON.stringify({ conversationId: theSession().id, tool, args }),
+  signal: AbortSignal.timeout(30000),
+}).then(r => r.text()).then(t => JSON.parse(t).result)
+
+const restored = (result) => { const m = /written to: (\S+)/.exec(result ?? ''); return m ? fs.readFileSync(m[1], 'utf8') : result ?? '' }
+
+// ── turn 0: seed a real conversation, then fold its head (no compaction) ──
 const history = Array.from({ length: 12 }, (_, i) => ({
   role: i % 2 === 0 ? 'user' : 'assistant',
   content: [{ type: 'text', text: `history ${i} ` + ('lorem ipsum dolor sit amet ' + i + ' ').repeat(333) }],
 }))
 const messages1 = [...history, { role: 'user', content: [{ type: 'text', text: 'Remember this token: REAL-COMPACT-TOKEN-9. Reply with exactly: SEEDED' }] }]
-const t1 = await turn(messages1, 'turn1 (compaction)')
-const s1 = theSession()
-const blocksBefore = s1.state.blocks.filter(b => b.active).map(b => b.blockId)
-log('session', s1.id, 'refs', Object.keys(s1.state.messageRefs.byRaw).length, 'blocks', JSON.stringify(blocksBefore), 'generations', historyIndex(s1).length)
-assert.ok(t1.finish.replayState?.response?.codexCompactionV1?.items?.[0]?.encrypted_content, 'turn1 must persist a real encrypted checkpoint')
-
-// fold the head through the plugin tool endpoint (the agent's ACP compression)
-const fold = await realFetch(toolUrl, {
-  method: 'POST',
-  headers: { 'content-type': 'application/json', 'x-bili-plugin': 'dsh' },
-  body: JSON.stringify({ conversationId: s1.id, tool: 'compress', args: { content: [{ startId: 'm00001', endId: 'm00007', topic: 'folded head', summary: 'FOLDED-SUMMARY real e2e head: twelve seeded turns; the user assigned token REAL-COMPACT-TOKEN-9 and asked for a SEEDED reply.' }] } }),
-})
-const foldText = await fold.text()
-log('fold', fold.status, foldText.slice(0, 160))
-assert.ok(fold.status === 200 && !foldText.includes('no-op'), `fold must fold: ${foldText.slice(0, 300)}`)
+const t0 = await turn(messages1, 'turn0 (seed)')
+assert.equal(historyIndex(theSession()).length, 0, 'the seed turn must not compact')
+const foldText = await toolCall('compress', { content: [{ startId: 'm00001', endId: 'm00007', topic: 'folded head', summary: 'FOLDED-SUMMARY real e2e head: twelve seeded turns; the user assigned token REAL-COMPACT-TOKEN-9 and asked for a SEEDED reply.' }] })
+log('fold', foldText.slice(0, 160))
+assert.ok(!foldText.includes('no-op'), `fold must fold: ${foldText.slice(0, 300)}`)
 const folded = theSession().state.blocks.filter(b => b.active).map(b => b.blockId)
-log('folded blocks', JSON.stringify(folded))
+assert.ok(folded.length > 0, 'a folded block exists before the cloud compaction')
 
-// ── turn 2: checkpoint reuse -> authoritative boundary ───────────────────
-const messages2 = [...messages1, t1.assistant, { role: 'user', content: [{ type: 'text', text: 'What token did I ask you to remember? Reply with the token only.' }] }]
+// ── turn 1: the server really compacts; the response item closes the generation ──
+compactThreshold = 5000
+const messages1c = [...messages1, t0.assistant, { role: 'user', content: [{ type: 'text', text: 'Reply with exactly: SEEDED' }] }]
+const t1 = await turn(messages1c, 'turn1 (server compaction)')
+const checkpoint = t1.finish.replayState?.response?.codexCompactionV1
+assert.ok(checkpoint?.items?.[0]?.encrypted_content, 'turn1 must persist the real encrypted checkpoint')
+await waitForGenerations(1, 'response-time generation close')
+const g1 = historyIndex(theSession())[0]
+log('generation 1', JSON.stringify({ n: g1.generation, cause: g1.cause, cp: g1.checkpointId?.slice(0, 12), blocks: g1.blockIds, refs: [g1.firstRef, g1.lastRef] }))
+assert.equal(g1.cause, 'codex-cloud-compaction', 'the generation records the cloud cause')
+assert.deepEqual(g1.blockIds, folded, 'the folded block is archived at response time')
+assert.equal(g1.checkpointId, checkpoint.items[0].id, 'the archived identity is the response item the client will replay')
+const record1 = theSession().metadata.codexCloudCheckpoint
+assert.equal(record1.seq, 1, 'the ordinal is recorded so the replay cannot double-rebase')
+assert.ok(theSession().state.nextBlockId > Number(folded[0].slice(1)), 'block ids are pinned above the archive')
+
+// ── turn 2: the client replays the checkpoint; identity must not rebase twice ──
+const messages2 = [...messages1c, t1.assistant, { role: 'user', content: [{ type: 'text', text: 'What token did I ask you to remember? Reply with the token only.' }] }]
 const beforeBodyCount = upstreamBodies.length
-const t2 = await turn(messages2, 'turn2 (reuse)')
-const s2 = theSession()
-const gens = historyIndex(s2)
-log('generations', gens.length, JSON.stringify(gens.map(g => ({ n: g.generation, cause: g.cause, cp: g.checkpointId?.slice(0, 12), blocks: g.blockIds, refs: [g.firstRef, g.lastRef] }))))
-log('nextBlockId', s2.state.nextBlockId, 'checkpoint record', JSON.stringify(s2.metadata.codexCloudCheckpoint ?? null))
-
+const t2 = await turn(messages2, 'turn2 (replay)')
+const gens2 = historyIndex(theSession())
+assert.equal(gens2.length, 1, `the replay must not close a second generation (got ${gens2.length})`)
 const sent2 = upstreamBodies[beforeBodyCount] ?? ''
-assert.ok(gens.length === 1, `reuse must close exactly one generation (got ${gens.length})`)
-assert.ok(gens[0].blockIds.includes(folded[0]), 'the folded block must be archived in generation 1')
-assert.ok(!sent2.includes('history 0 lorem'), 'the reused request must NOT resend the summarized history')
-assert.ok(sent2.includes('encrypted_content'), 'the reused request must carry the real encrypted checkpoint')
-assert.ok(/REAL-COMPACT-TOKEN-9/.test(t2.text), `model must answer from the compacted context, got ${JSON.stringify(t2.text.slice(0, 200))}`)
+assert.ok(!sent2.includes('history 0 lorem'), 'the replay must NOT resend the summarized history')
+assert.ok(sent2.includes('encrypted_content'), 'the replay must carry the real encrypted checkpoint')
+assert.ok(/REAL-COMPACT-TOKEN-9/.test(t2.text), `the model must answer from the compacted context, got ${JSON.stringify(t2.text.slice(0, 200))}`)
+assert.ok(sent2.includes('closed history generation(s) are preserved read-only'), 'the model gets the compact navigation index')
 
-// old refs and blocks restore read-only from the generation
-const oldRef = gens[0].firstRef
-const dec = await realFetch(toolUrl, {
-  method: 'POST',
-  headers: { 'content-type': 'application/json', 'x-bili-plugin': 'dsh' },
-  body: JSON.stringify({ conversationId: s2.id, tool: 'decompress', args: { blockId: gens[0].blockIds[0], full: true } }),
-  signal: AbortSignal.timeout(30000),
-})
-const decText = await dec.text()
-log('decompress', dec.status, decText.slice(0, 200))
-const decResult = JSON.parse(decText).result
-const decBody = (() => { const m = /written to: (\S+)/.exec(decResult); return m ? fs.readFileSync(m[1], 'utf8') : decResult })()
-log('decompressed chars', decBody.length)
-assert.ok(decResult.includes('history generation 1'), 'decompress must restore from generation 1')
-assert.ok(decBody.includes('history 0 '), 'decompress must restore the original verbatim text')
-log('calling search_context')
-const search = await realFetch(toolUrl, {
-  method: 'POST',
-  headers: { 'content-type': 'application/json', 'x-bili-plugin': 'dsh' },
-  body: JSON.stringify({ conversationId: s2.id, tool: 'search_context', args: { query: 'REAL-COMPACT-TOKEN-9' } }),
-  signal: AbortSignal.timeout(30000),
-})
-const searchText = await search.text()
-log('search raws', searchText.length)
-log('search', search.status, searchText.slice(0, 300))
-assert.ok(/generation 1|REAL-COMPACT-TOKEN-9/i.test(searchText), 'search_context must reach the closed generation')
+// ── old refs and blocks restore / stay searchable across the generation ──
+const dec = await toolCall('decompress', { blockId: g1.blockIds[0], full: true })
+assert.ok(String(dec).includes('history generation 1'), `decompress must restore from generation 1: ${String(dec).slice(0, 200)}`)
+assert.ok(restored(String(dec)).includes('history 0 '), 'decompress must restore the original verbatim text')
+const search = String(await toolCall('search_context', { query: 'REAL-COMPACT-TOKEN-9' }))
+log('search', search.slice(0, 240))
+assert.ok(/generation 1|REAL-COMPACT-TOKEN-9/i.test(search), 'search_context must reach the closed generation')
 
-// ── turn 3: a second real server compaction is announced at this boundary ──
+// ── turn 3: continue the SAME task; tools must survive, the second boundary must dedupe ──
 const messages3 = [...messages2, t2.assistant, { role: 'user', content: [{ type: 'text', text: 'Now reply with exactly: STILL-ALIVE' }] }]
 const beforeBody3 = upstreamBodies.length
 const t3 = await turn(messages3, 'turn3 (continue)')
-const s3 = theSession()
-const gens3 = historyIndex(s3)
-log('generations after turn3', gens3.length, JSON.stringify(gens3.map(g => ({ n: g.generation, cp: g.checkpointId?.slice(0, 12), blocks: g.blockIds, refs: [g.firstRef, g.lastRef] }))))
-log('checkpoint after turn3', JSON.stringify(s3.metadata.codexCloudCheckpoint ?? null))
 assert.ok(/STILL-ALIVE/i.test(t3.text), `turn3 must complete a real request, got ${JSON.stringify(t3.text.slice(0, 200))}`)
-assert.ok(gens3.length >= 1, 'turn3 must keep the closed generation')
-assert.equal(new Set(gens3.map(g => g.checkpointId)).size, gens3.length, 'each closed generation must carry a distinct checkpoint id')
-assert.equal(gens3.at(-1).checkpointId, s3.metadata.codexCloudCheckpoint.id, 'the newest generation must match the announced checkpoint')
+await waitForGenerations(1, 'turn3 generation bookkeeping')
+const gens3 = historyIndex(theSession())
+log('generations after turn3', JSON.stringify(gens3.map(g => ({ n: g.generation, cp: g.checkpointId?.slice(0, 12), blocks: g.blockIds }))))
+assert.ok(gens3.length >= 1, 'turn3 keeps the closed generation')
+assert.equal(new Set(gens3.map(g => g.checkpointId)).size, gens3.length, 'every closed generation carries a distinct identity')
+assert.equal(gens3.at(-1).checkpointId, theSession().metadata.codexCloudCheckpoint.id, 'the newest generation matches the recorded checkpoint')
 assert.ok(!(upstreamBodies[beforeBody3] ?? '').includes('history 0 lorem'), 'turn3 must not resend the summarized history')
-assert.deepEqual(gens3[0].blockIds, gens3[0].blockIds.filter(id => folded.includes(id)), 'generation 1 must stay the block archive')
 
-// a duplicate delivery of the same request re-announces the same checkpoint and must not rebase again
 const t3b = await turn(messages3, 'turn3 retry (same checkpoint)')
 const gens3b = historyIndex(theSession())
-log('generations after identical retry', gens3b.length)
 assert.equal(gens3b.length, gens3.length, 'a duplicate delivery of the same checkpoint must not close another generation')
 assert.ok(/STILL-ALIVE/i.test(t3b.text), `duplicate delivery must still complete, got ${JSON.stringify(t3b.text.slice(0, 200))}`)
 
-// the closed generations remain searchable and the archived block restorable after the second boundary
-const dec2 = JSON.parse(await (await realFetch(toolUrl, {
-  method: 'POST', headers: { 'content-type': 'application/json', 'x-bili-plugin': 'dsh' },
-  body: JSON.stringify({ conversationId: s3.id, tool: 'decompress', args: { blockId: gens3[0].blockIds[0], full: true } }),
-  signal: AbortSignal.timeout(30000),
-})).text()).result
-const dec2Body = (() => { const m = /written to: (\S+)/.exec(dec2); return m ? fs.readFileSync(m[1], 'utf8') : dec2 })()
-assert.ok(dec2Body.includes('history 0 '), 'generation 1 must stay restorable after a second boundary')
-const search2 = JSON.parse(await (await realFetch(toolUrl, {
-  method: 'POST', headers: { 'content-type': 'application/json', 'x-bili-plugin': 'dsh' },
-  body: JSON.stringify({ conversationId: s3.id, tool: 'search_context', args: { query: 'STILL-ALIVE' } }),
-  signal: AbortSignal.timeout(30000),
-})).text()).result
-log('search after second boundary', JSON.stringify(search2.slice(0, 200)))
+// ── the first generation is still restorable and searchable afterwards ──
+const dec2 = String(await toolCall('decompress', { blockId: g1.blockIds[0], full: true }))
+assert.ok(restored(dec2).includes('history 0 '), 'generation 1 must stay restorable after a second boundary')
+const search2 = String(await toolCall('search_context', { query: 'STILL-ALIVE' }))
 assert.ok(/closed-generation|generation/i.test(search2), 'search_context must reach the closed generations')
 
-log('OK: real cloud compaction reuse + generation restore + consecutive boundaries + continuation verified')
+log('OK: real cloud compaction closed at response time + reuse dedupe + generation restore + continuation verified')
+log('generations', JSON.stringify(historyIndex(theSession()).map(g => ({ n: g.generation, cp: g.checkpointId?.slice(0, 12), refs: [g.firstRef, g.lastRef] }))))
 proxy.close()
+process.exit(0)

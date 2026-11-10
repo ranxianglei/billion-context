@@ -6,6 +6,7 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Session } from "../src/session.ts";
+import type { CompressionBlock } from "acp-kernel";
 import {
     applyCompactionArchive,
     historyGenerationsOf,
@@ -17,7 +18,7 @@ import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { executeRetrieve, adoptContentStore, storeEffectiveCcr } from "../src/store.ts";
 import { resolveDecompress, executeSearchContext } from "../src/decompress-shared.ts";
 import { codexCheckpointRecord, isNewCodexBoundary, parseCodexCheckpointSignal } from "../src/codex-checkpoint.ts";
-import { historyNavNote } from "../src/history-generations.ts";
+import { historyNavNote, mergeGenerationSummaries, metaOf, type HistoryGeneration } from "../src/history-generations.ts";
 
 const noLog = (_level: string, _msg: string): void => {};
 
@@ -292,4 +293,39 @@ test("a generation that cannot be persisted aborts the rebase, stays pending, an
         _setStoreForTest(new SessionStore({ dir: process.env.BILI_SESSIONS_DIR, enabled: true, debounceMs: 0 }));
         rmSync(dir, { recursive: true, force: true });
     }
+});
+
+function syntheticBlock(blockId: string, topic: string, summary: string): CompressionBlock {
+    return {
+        blockId, runId: "r1", tier: 1, topic, summary, directMessageIds: [], effectiveMessageIds: [],
+        directBlockIds: [], compressedTokens: 10, createdAt: 1, survivedCount: 0, generation: "young", active: false,
+    };
+}
+
+function syntheticGeneration(generation: number, blocks: CompressionBlock[]): HistoryGeneration {
+    return {
+        generation, id: `synthetic#g${generation}`, at: 1_700_000_000_000 + generation, cause: "codex-cloud-compaction",
+        maxRefIndex: 4, firstRef: "m00001", lastRef: "m00004", messageCount: 4, blockCount: blocks.length,
+        blockIds: blocks.map(b => b.blockId), tokensCompressed: 100,
+        blocks, blockContents: {}, messageRefs: { byRaw: {}, byRef: {} }, messages: [],
+    };
+}
+
+test("consecutive generations publish ONE consolidated summary, deduped by topic", () => {
+    const session = makeSession();
+    const generations = [
+        syntheticGeneration(1, [syntheticBlock("b1", "alpha", "ALPHA-POINT-OLD"), syntheticBlock("b2", "gamma", "GAMMA-POINT")]),
+        syntheticGeneration(2, [syntheticBlock("b3", "beta", "BETA-POINT-NEW"), syntheticBlock("b4", "alpha", "ALPHA-POINT-NEW")]),
+    ];
+    session.metadata.historyGenerations = generations.map(metaOf);
+    const merged = mergeGenerationSummaries(generations);
+    assert.ok(merged !== null, "two generations must merge into one summary");
+    assert.ok(merged.includes("BETA-POINT-NEW"), "the newest generation's content is present");
+    assert.ok(merged.includes("ALPHA-POINT-NEW"), "the newest summary wins for a repeated topic");
+    assert.ok(!merged.includes("ALPHA-POINT-OLD"), "an older summary for the same topic is not repeated");
+    assert.ok(merged.includes("GAMMA-POINT"), "topics only present in the older generation survive");
+    const note = historyNavNote(session, generations);
+    assert.ok(note !== null);
+    assert.ok(note.includes("Consolidated summary of the closed history"), "the note carries the merged summary");
+    assert.ok(note.indexOf("ALPHA-POINT-NEW") > note.indexOf("generation 1"), "the merged summary follows the generation index");
 });
