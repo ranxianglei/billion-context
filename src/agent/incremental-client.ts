@@ -12,7 +12,7 @@
 //      full-resend request with the marker removed — behavior equals the
 //      pre-incremental world for that turn.
 //
-// Wire contract: see PLUGIN.md "Incremental turns". Messages are raw wire
+// Wire contract: see docs/plugin-protocol.md "Incremental turns". Messages are raw wire
 // messages ({role, content: string | blocks[]}) — the lane derives stable
 // content ids server-side, so hosts without their own message ids work.
 
@@ -208,6 +208,8 @@ interface ConvState {
     sinceSeq: number;
     /** Wire hashes of everything the server has acknowledged, in order. */
     sent: string[];
+    /** Raw (cache_control-inclusive) wire hashes parallel to `sent` — detects decoration-only changes that must ride as retouch. */
+    sentRaw?: string[];
     /** Sticky system (JSON) we told the lane; resend only on change. */
     systemJson: string | undefined;
     /** Per-conversation kill switch after unrecoverable failures. */
@@ -249,6 +251,10 @@ function screenMsgIds(ids: unknown): ids is string[] {
     return true;
 }
 
+/** Test-only accessor (#5826 review): pins tests/msgid-rule-parity.test.ts.
+ *  Production callers use screenMsgIds directly. */
+export const _screenMsgIdsForTest = screenMsgIds;
+
 /** Delta-turn claim gate: undefined when any candidate id was already sent
  *  on an earlier envelope of this conversation (the lane would 400 — see
  *  msgidClaims); otherwise the ids are claimed and returned. */
@@ -264,7 +270,14 @@ function claimableDeltaMsgIds(conversationId: string, ids: string[]): string[] |
 }
 
 const PROBE_TTL_MS = 30_000;
-const probeCache = new Map<string, { ok: boolean; at: number }>();
+const probeCache = new Map<string, { ok: boolean; cacheControlRetouch: boolean; at: number }>();
+
+/** The optional envelope extension must be positively advertised by the server.
+ * Older servers ignore unknown fields, so sending retouches to them is unsafe. */
+export function incrementalCacheRetouchEnabled(proxyBase: string): boolean {
+    const cached = probeCache.get(proxyBase);
+    return cached !== undefined && cached.ok && cached.cacheControlRetouch && Date.now() - cached.at < PROBE_TTL_MS;
+}
 
 /** Probe the lane's incremental support. Cached per proxy base for 30s; any
  * error or non-200 → not enabled (older servers 404 the GET). */
@@ -273,16 +286,18 @@ export async function probeIncrementalTurns(proxyBase: string, fetchImpl: typeof
     const cached = probeCache.get(proxyBase);
     if (cached && now - cached.at < PROBE_TTL_MS) return cached.ok;
     let ok = false;
+    let cacheControlRetouch = false;
     try {
         const res = await fetchImpl(`${proxyBase}/__bili/plugin/turn`, { method: "GET", signal: AbortSignal.timeout(3000) });
         if (res.ok) {
-            const body = await res.json() as { enabled?: unknown };
+            const body = await res.json() as { enabled?: unknown; cacheControlRetouch?: unknown };
             ok = body.enabled === true;
+            cacheControlRetouch = body.cacheControlRetouch === true;
         }
     } catch {
         ok = false;
     }
-    probeCache.set(proxyBase, { ok, at: now });
+    probeCache.set(proxyBase, { ok, cacheControlRetouch, at: now });
     return ok;
 }
 
@@ -305,6 +320,28 @@ export function wireMessagesLookAnthropic(messages: unknown): messages is Increm
 
 function wireHash(m: IncrementalWireMessage): string {
     return createHash("sha256").update(`${m.role}\u0000${JSON.stringify(m.content)}`).digest("hex").slice(0, 16);
+}
+
+/** Content with block-level cache_control removed. Hosts that keep a rolling
+ *  breakpoint on the newest messages (OpenCode moves its ephemeral marks to
+ *  the last messages every request) change the bytes of already-acked
+ *  messages only by that decoration; alignment must ignore it or every turn
+ *  degrades into a full resync. */
+function contentWithoutCacheControl(content: unknown): unknown {
+    if (!Array.isArray(content)) return content;
+    let changed = false;
+    const out = content.map((b: unknown) => {
+        if (b === null || typeof b !== "object" || !("cache_control" in b)) return b;
+        changed = true;
+        const { cache_control: _drop, ...rest } = b as Record<string, unknown>;
+        return rest;
+    });
+    return changed ? out : content;
+}
+
+/** Alignment hash: the wire hash with cache_control decorations stripped. */
+function alignHash(m: IncrementalWireMessage): string {
+    return createHash("sha256").update(`${m.role}\u0000${JSON.stringify(contentWithoutCacheControl(m.content))}`).digest("hex").slice(0, 16);
 }
 
 /** Public twin of the internal wire hash for boundary comparisons. The
@@ -355,6 +392,8 @@ type IncrementalPlan =
     | { mode: "skip" };                         // nothing to gain / state dead → full resend
 
 interface PlanArgs {
+    /** Only true after the server's capability probe advertised support. */
+    cacheControlRetouch?: boolean;
     conversationId: string;
     /** Forward path of the ORIGINAL request (the marker divert uses it);
      * optional — the lane defaults a bare `path` to /v1/messages. */
@@ -376,7 +415,7 @@ interface PlanArgs {
     msgIds?: string[];
 }
 
-function buildBody(args: PlanArgs, sinceSeq: number, messages: IncrementalWireMessage[], resync: boolean, includeSystem: boolean, msgIds?: string[]): string {
+function buildBody(args: PlanArgs, sinceSeq: number, messages: IncrementalWireMessage[], resync: boolean, includeSystem: boolean, msgIds?: string[], retouch?: { index: number; message: IncrementalWireMessage }[]): string {
     // `request` is optional at the call sites (a host may plan with only
     // messages+system); missing params simply ride their lane defaults.
     const src = args.request ?? {};
@@ -395,6 +434,7 @@ function buildBody(args: PlanArgs, sinceSeq: number, messages: IncrementalWireMe
     // #4491: only a provably-parallel, non-empty array rides the envelope —
     // an empty delta (pure sticky-system update) pins nothing and stays off.
     if (msgIds !== undefined && msgIds.length === messages.length && msgIds.length > 0) body.msgIds = msgIds;
+    if (retouch !== undefined && retouch.length > 0) body.retouch = retouch;
     return JSON.stringify(body);
 }
 
@@ -418,8 +458,9 @@ export function planIncrementalTurn(args: PlanArgs, forceResync = false): Increm
         if (fullIds !== undefined) msgidClaims.set(args.conversationId, new Set(fullIds));
         return { mode: forceResync ? "resync" : "seed", body: buildBody(args, 0, args.messages, true, includeSystem, fullIds) };
     }
-    const hashes = args.messages.map(wireHash);
-    // Prefix alignment: everything previously acked must still lead the list.
+    const hashes = args.messages.map(alignHash);
+    // Prefix alignment: everything previously acked must still lead the list
+    // (cache_control decorations ignored — they ride as retouch below).
     const n = Math.min(state.sent.length, hashes.length);
     let aligned = true;
     for (let i = 0; i < n; i++) {
@@ -429,20 +470,34 @@ export function planIncrementalTurn(args: PlanArgs, forceResync = false): Increm
         if (fullIds !== undefined) msgidClaims.set(args.conversationId, new Set(fullIds));
         return { mode: "resync", body: buildBody(args, 0, args.messages, true, systemJson !== state.systemJson, fullIds) };
     }
+    const retouch: { index: number; message: IncrementalWireMessage }[] = [];
+    if (state.sentRaw !== undefined && state.sentRaw.length === state.sent.length) {
+        for (let i = 0; i < state.sent.length; i++) {
+            if (state.sentRaw[i] !== wireHash(args.messages[i])) retouch.push({ index: i, message: args.messages[i] });
+        }
+    } else {
+        for (let i = 0; i < state.sent.length; i++) retouch.push({ index: i, message: args.messages[i] });
+    }
+    // An older server would accept but ignore retouch. Keep the original
+    // request on the normal path instead of forwarding stale cache marks.
+    if (retouch.length > 0 && args.cacheControlRetouch !== true) return { mode: "skip" };
     if (hashes.length === state.sent.length) {
         // Equal message set: normally a retry of the same turn → normal path.
         // But a SYSTEM change is still a real outgoing turn — send an empty
         // delta so the lane forwards the assembled request with the new
         // sticky system (the canonical itself is unchanged).
         if (systemJson !== state.systemJson) {
-            return { mode: "delta", body: buildBody(args, state.sinceSeq, [], false, true) };
+            return { mode: "delta", body: buildBody(args, state.sinceSeq, [], false, true, undefined, retouch) };
         }
         return { mode: "skip" }; // retry of the same turn → normal path
     }
     const deltaIds = fullIds !== undefined ? claimableDeltaMsgIds(args.conversationId, fullIds.slice(state.sent.length)) : undefined;
+    // Acked messages whose bytes changed only by cache_control: send them
+    // whole so the server re-derives their breakpoints and the assembled
+    // request stays byte-identical to the host's full body.
     return {
         mode: "delta",
-        body: buildBody(args, state.sinceSeq, args.messages.slice(state.sent.length), false, systemJson !== state.systemJson, deltaIds),
+        body: buildBody(args, state.sinceSeq, args.messages.slice(state.sent.length), false, systemJson !== state.systemJson, deltaIds, retouch),
     };
 }
 
@@ -453,7 +508,8 @@ export function noteIncrementalAck(conversationId: string, appliedSeq: number, m
     rejectionCircuit.delete(conversationId);
     convs.set(conversationId, {
         sinceSeq: appliedSeq,
-        sent: messages.map(wireHash),
+        sent: messages.map(alignHash),
+        sentRaw: messages.map(wireHash),
         systemJson: system === undefined ? undefined : JSON.stringify(system),
         dead: false,
     });
