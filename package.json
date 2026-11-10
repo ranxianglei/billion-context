@@ -1,6 +1,6 @@
 {
   "name": "billion-context",
-  "version": "0.1.212",
+  "version": "0.1.213",
   "description": "A context-compression plugin \u2014 small context windows (a 100K context is enough), 5x fewer tokens, month-long single sessions (billions of tokens), and compression quality \u2014 for all agents: pi, OpenCode, Codex, Claude Code, and more. billion-context is all you need.",
   "type": "module",
   "main": "dist/index.js",
@@ -98,8 +98,8 @@
   "files": [
     "LICENSE",
     "README.md",
-    "CONFIGURATION.md",
-    "CONFIGURATION.zh-CN.md",
+    "docs/configuration.md",
+    "docs/configuration.zh-CN.md",
     "dist",
     "dsh.bundle.patch.yml",
     "hermes-plugin",

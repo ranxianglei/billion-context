@@ -233,7 +233,13 @@ export function holderProbeOrigin(host: string, port: number): string {
  *  result is already resolved, so tests need no live socket. */
 export function holderHintFragment(serving: boolean, holderPid?: number): string {
     if (serving) {
-        return `existing listener answered /__bili/health${holderPid !== undefined ? ` (pid ${holderPid})` : ""} — it IS serving; this process exits as the duplicate and the spawner should attach to it`;
+        // #5907: a host relaunch racing the still-up previous instance lands
+        // this line ~40ms beside the loser's EADDRINUSE (and often a
+        // [split-brain] notice from the startup-overlap writes), which reads
+        // like a fatal error although the loser exits cleanly. Name the
+        // expectedness + the split-brain cross-reference so the pair reads as
+        // routine churn, without softening the wedged/dead branch below.
+        return `existing listener answered /__bili/health${holderPid !== undefined ? ` (pid ${holderPid})` : ""} — it IS serving; this process exits as the duplicate and the spawner should attach to it. This is the expected duplicate-instance outcome when a host relaunches while the previous instance is still up: the serving instance keeps its sessions and no action is needed; if a [split-brain] notice near these timestamps names this exiting pid, it is the same duplicate start settling, not data corruption in progress (#4762/#5907)`;
     }
     const remedy = holderPid !== undefined
         ? `kill it to free the port (Windows: taskkill /PID ${holderPid}; Linux/macOS: kill ${holderPid})`

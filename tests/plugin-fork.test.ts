@@ -295,6 +295,27 @@ test("HTTP exposes a versioned snapshot and forks an exact ordered prefix", { ti
     } finally { await h.close(); }
 });
 
+test("HTTP fork carries the timestamp ledger so the first child replay re-renders cached tag bytes (#5608)", { timeout: 60_000 }, async () => {
+    // the carry only has teeth when stamps exist: defeat the suite's ambient
+    // BILI_MESSAGE_TIMESTAMPS=0 pin so this instance resolves the #4313 default ON
+    const prevStampEnv = process.env.BILI_MESSAGE_TIMESTAMPS;
+    delete process.env.BILI_MESSAGE_TIMESTAMPS;
+    const h = await harness();
+    try {
+        const parent = resolveConversation("parent").session!;
+        assert.ok(parent.state.tsStamps && Object.keys(parent.state.tsStamps).length >= 3, "the seeded turn minted stamps for the tagged messages");
+        const snapshot = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;
+        const fork = await h.request("/__bili/plugin/fork", forkRequest(snapshot, "child"));
+        assert.equal(fork.status, 201, JSON.stringify(fork.body));
+        const child = resolveConversation("child").session!;
+        assert.deepEqual(child.state.tsStamps, parent.state.tsStamps, "stamps are raw-id (content-hash) keyed — the whole ledger denotes exact cached bytes and rides the fork verbatim");
+    } finally {
+        await h.close();
+        if (prevStampEnv === undefined) delete process.env.BILI_MESSAGE_TIMESTAMPS;
+        else process.env.BILI_MESSAGE_TIMESTAMPS = prevStampEnv;
+    }
+});
+
 async function sendIntentModel(h: Awaited<ReturnType<typeof harness>>, conversationId: string, messages: unknown[], tools: unknown[], requestAgent?: string, maxTokens = 256, announcePlugin = true, pluginName = "ekko-agent") {
     const headers: Record<string, string> = { "content-type": "application/json", "x-acp-session": conversationId };
     if (announcePlugin) {
@@ -737,8 +758,18 @@ test("publicForkInputCheck keeps the #3743 taxonomy pinned per class (hash-drift
         const cell = child.pluginSnapshot![0];
         const body = { model: "claude-test", max_tokens: 1024, stream: false, messages: [...h.messages.slice(0, 2), { role: "user", content: "continue child" }] };
         assert.deepEqual(publicForkInputCheck(child, "anthropic", body), { ok: true }, "intact snapshot verifies clean before any mutation");
+        // #4266: thinkingTokens is one-sided metering mass (server view only, re-derived per turn)
+        // and is excluded from fork identity — a metering-only divergence must NOT read as drift.
         const savedThinkingTokens = cell.thinkingTokens;
         cell.thinkingTokens = 7;
+        try {
+            assert.deepEqual(publicForkInputCheck(child, "anthropic", body), { ok: true }, "metering-mass divergence alone stays clean");
+        } finally {
+            cell.thinkingTokens = savedThinkingTokens;
+        }
+        // A genuine identity-field divergence under the same id still reads hash-drift-under-same-id.
+        const savedText = cell.text;
+        cell.text = "mutated identity field";
         try {
             const verdict = publicForkInputCheck(child, "anthropic", body);
             assert.equal(verdict.ok, false);
@@ -747,7 +778,7 @@ test("publicForkInputCheck keeps the #3743 taxonomy pinned per class (hash-drift
                 assert.doesNotMatch(verdict.reason, /id-drift|ref-broken/);
             }
         } finally {
-            cell.thinkingTokens = savedThinkingTokens;
+            cell.text = savedText;
         }
         const savedRef = child.state.messageRefs.byRaw[cell.id];
         assert.notEqual(savedRef, undefined);
@@ -960,10 +991,11 @@ for (const storageMode of ["legacy", "full"] as const) {
             parent.contentStore = storeOriginal(createContentStore(), { ref: "m00001", rawId: parent.pluginSnapshot![0].id, text: "CCR original retained independently after restart", kind: "original", tokens: 10, head: "CCR original" });
             parent.contentStoreDirty = true;
             assert(h.store.flushSync(parent));
-            // #4316 PR3/3: only a unified cold load runs the one-time ledger
-            // alignment; the CI legacy baseline retains the original state.
+            // #4316 PR3/3 + #5608-D: cold load NO LONGER runs the one-time
+            // ledger alignment — it must preserve the persisted state
+            // byte-for-byte so the provider prefix survives the restart;
+            // the alignment rides the session's next post-restart fold save.
             const persistedState = JSON.parse(JSON.stringify(parent.state));
-            if (h.store.replicasAvailable()) persistedState.refLedgerAligned = true;
             assert.deepEqual(JSON.parse(JSON.stringify(h.store.loadSync("parent")!.state)), persistedState);
             const snapshot = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;
             const req = forkRequest(snapshot);
