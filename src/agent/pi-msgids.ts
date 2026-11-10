@@ -249,16 +249,13 @@ function partsLowerThrough(eParts: FpPart[], wParts: FpPart[]): boolean {
     return wi === wParts.length;
 }
 
-/** Walk the outgoing wire messages and the branch entries in lockstep; return
- *  the entry id for every wire message (aligned by index), or undefined when
- *  the alignment cannot be proven end-to-end (all-or-nothing). */
-export function laneMsgIdsForWire(wire: unknown, branch: unknown): string[] | undefined {
-    if (!Array.isArray(wire) || !Array.isArray(branch)) return undefined;
+/** Shared lockstep iterator over the branch's VISIBLE entries (next
+ *  wire-producing entry past every provably silent one; "bail" = unprovable
+ *  shape, "exhausted" = no entries left). */
+function makeEntryTake(branch: unknown[]): () => { id: string; parts: FpPart[] } | "bail" | "exhausted" {
     const entries = branch as unknown[];
     let ei = 0;
-    // Next visible (wire-producing) entry past every provably silent one.
-    // "bail" = unprovable shape; "exhausted" = no entries left.
-    const take = (): { id: string; parts: FpPart[] } | "bail" | "exhausted" => {
+    return (): { id: string; parts: FpPart[] } | "bail" | "exhausted" => {
         while (ei < entries.length) {
             const raw = entries[ei];
             ei += 1;
@@ -279,6 +276,14 @@ export function laneMsgIdsForWire(wire: unknown, branch: unknown): string[] | un
         }
         return "exhausted";
     };
+}
+
+/** Walk the outgoing wire messages and the branch entries in lockstep; return
+ *  the entry id for every wire message (aligned by index), or undefined when
+ *  the alignment cannot be proven end-to-end (all-or-nothing). */
+export function laneMsgIdsForWire(wire: unknown, branch: unknown): string[] | undefined {
+    if (!Array.isArray(wire) || !Array.isArray(branch)) return undefined;
+    const take = makeEntryTake(branch);
     const ids: string[] = [];
     for (const w of wire) {
         const wParts = wireFingerprint(w);
@@ -312,4 +317,151 @@ export function laneMsgIdsForWire(wire: unknown, branch: unknown): string[] | un
  *  to exactly one core message: a string, or a single-block content array. */
 export function lanePinnableContent(content: unknown): boolean {
     return typeof content === "string" || (Array.isArray(content) && content.length === 1);
+}
+
+/* ------------------------------------------------------------------ */
+/* #5403/#5418 unified watermark channel — OpenAI CHAT-family resolver.  */
+/* ------------------------------------------------------------------ */
+
+/** Fingerprint of one OUTGOING openai-chat wire element. undefined =
+ *  unprovable (alien role/segment/shape) — the caller bails. */
+function oaiWireFingerprint(role: string, content: unknown, toolCalls: unknown, toolCallId: unknown): FpPart[] | undefined {
+    if (role === "tool") {
+        if (typeof toolCallId !== "string" || toolCallId.length === 0) return undefined;
+        return [{ t: "toolres", v: toolCallId }];
+    }
+    if (role !== "user" && role !== "assistant") return undefined;
+    const parts: FpPart[] = [];
+    if (typeof content === "string") {
+        const p = textPart(content);
+        if (p !== undefined) parts.push(p);
+    } else if (content !== null && content !== undefined) {
+        if (!Array.isArray(content)) return undefined;
+        for (const raw of content) {
+            if (raw === null || typeof raw !== "object") return undefined;
+            const seg = raw as Record<string, unknown>;
+            if (seg.type === "text") {
+                const p = textPart(seg.text);
+                if (p !== undefined) parts.push(p);
+            } else if (seg.type === "image_url") {
+                const u = seg.image_url;
+                const url = (u !== null && typeof u === "object" ? (u as Record<string, unknown>).url : u);
+                if (typeof url !== "string") return undefined;
+                parts.push({ t: "img", v: url });
+            } else {
+                return undefined;
+            }
+        }
+    }
+    if (toolCalls !== undefined) {
+        if (!Array.isArray(toolCalls)) return undefined;
+        for (const raw of toolCalls) {
+            const tc = raw === null || typeof raw !== "object" ? undefined : (raw as Record<string, unknown>);
+            if (tc === undefined || typeof tc.id !== "string" || tc.id.length === 0) return undefined;
+            parts.push({ t: "tooluse", v: tc.id });
+        }
+    }
+    // An empty result means the conversion provably drops the message — that
+    // cannot happen for a message that IS on the wire; refuse instead of
+    // silently misaligning the rest of the list.
+    return parts.length > 0 ? parts : undefined;
+}
+
+/** Can `eParts` (branch-entry fingerprint) lower onto `wParts` (openai-chat
+ *  wire fingerprint)? Same documented transform set as partsLowerThrough,
+ *  MINUS the thinking tolerances: this family bails up-front on any
+ *  reasoning-family field, so a thinking entry part here is unprovable. */
+function oaiPartsAlign(eParts: FpPart[], wParts: FpPart[]): boolean {
+    let wi = 0;
+    let placeholderOpen = false;
+    for (const ep of eParts) {
+        if (ep.t === "think" || ep.t === "redact") return false;
+        if (wi < wParts.length) {
+            const wp = wParts[wi];
+            if (ep.t === wp.t && ep.v === wp.v) {
+                wi++;
+                placeholderOpen = false;
+                continue;
+            }
+            if (ep.t === "img" && wp.t === "text" && wp.v === NON_VISION_USER_IMAGE_PLACEHOLDER) {
+                if (!placeholderOpen) {
+                    wi++;
+                    placeholderOpen = true;
+                }
+                continue;
+            }
+            if (ep.t === "tooluse" && wp.t === "tooluse") {
+                wi++;
+                placeholderOpen = false;
+                continue;
+            }
+            if (ep.t === "toolres" && wp.t === "toolres") {
+                wi++;
+                placeholderOpen = false;
+                continue;
+            }
+        }
+        if (ep.t === "img" && placeholderOpen) continue;
+        return false;
+    }
+    return wi === wParts.length;
+}
+
+/** Resolve the pi branch-entry id for EVERY element of an openai-chat
+ *  (chat-completions) outgoing request — 1:1 with the ELEMENT COUNT, which
+ *  is exactly what the watermark tail-ids contract slices on. Differences
+ *  from the anthropic resolver:
+ *   - the LEADING run of system|developer elements is assembled from
+ *     config/state and has no branch entry; it is covered by POSITION-PINNED
+ *     synthetic tokens (`bili-ps-<i>`, stable per slot, charset-safe, never
+ *     confused with uuid entry ids) — the chain stays alive instead of dying
+ *     on its first system element, and a moved slot still breaks the anchor
+ *     honestly (uncredited reseed, same as a real edit);
+ *   - ANY non-leading system|developer element, or any reasoning-family
+ *     field (`reasoning_content`/`thinking`/`redacted_thinking`/`function_call`)
+ *     anywhere, bails the whole list — the conversion rules there are not
+ *     statically provable, and an absent list costs one count-mode turn;
+ *   - everything else walks the SHARED entry iterator with the same
+ *     order-preserving proof (never similarity, never position alone).
+ * All-or-nothing: undefined ⇒ the caller sends nothing (cleared, never stale). */
+export function laneMsgIdsForOpenAiWire(wire: unknown, branch: unknown): string[] | undefined {
+    if (!Array.isArray(wire) || !Array.isArray(branch)) return undefined;
+    const els = wire as Array<Record<string, unknown> | null>;
+    let lead = 0;
+    while (lead < els.length) {
+        const r = els[lead] === null || typeof els[lead] !== "object" ? undefined : (els[lead] as Record<string, unknown>).role;
+        if (r !== "system" && r !== "developer") break;
+        lead += 1;
+    }
+    const take = makeEntryTake(branch);
+    const ids: string[] = [];
+    for (let i = 0; i < lead; i++) ids.push(`bili-ps-${i}`);
+    for (let i = lead; i < els.length; i++) {
+        const el = els[i];
+        if (el === null || typeof el !== "object") return undefined;
+        if (
+            el.reasoning_content !== undefined ||
+            el.thinking !== undefined ||
+            el.redacted_thinking !== undefined ||
+            el.function_call !== undefined
+        ) return undefined;
+        const role = typeof el.role === "string" ? el.role : "";
+        if (role === "system" || role === "developer") return undefined; // non-leading: ambiguous placement
+        const wParts = oaiWireFingerprint(role, el.content, el.tool_calls, el.tool_call_id);
+        if (wParts === undefined) return undefined;
+        if (wParts.every((p) => p.t === "toolres")) {
+            for (let j = 0; j < wParts.length; j++) {
+                const n = take();
+                if (typeof n === "string" || n.parts.length !== 1 || n.parts[0].t !== "toolres") return undefined;
+                ids.push(n.id);
+            }
+            continue;
+        }
+        const n = take();
+        if (typeof n === "string") return undefined;
+        if (!oaiPartsAlign(n.parts, wParts)) return undefined;
+        ids.push(n.id);
+    }
+    const leftover = take();
+    return leftover === "exhausted" ? ids : undefined;
 }
