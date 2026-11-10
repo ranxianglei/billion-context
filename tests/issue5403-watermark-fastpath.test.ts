@@ -11,7 +11,8 @@
 //   1. OUTBOUND byte equality: every upstream body is byte-identical modulo
 //      kernel time="…" attributes (the sanctioned normalization clause).
 //   2. Watermark headers never leak past the proxy to the model endpoint.
-//   3. Phase B stamps accumulate per measured wire length; Phase A emits none.
+//   3. Phase B stamps accumulate per measured wire length (turn 0 rides the
+//      #5656 verbatim side lane, unstamped in both phases); Phase A emits none.
 //   4. RESIDENCY BAND: after steady state the fastpath proxy pins only the
 //      tail window while the legacy proxy pins the full working copy
 //      (/__bili/memory breakdown.lastMessages < 0.8× legacy).
@@ -204,6 +205,14 @@ test("#5418 A/B byte-equality + residency band (hermetic dual-proxy)", async () 
         ra.forEach((s, i) => assert.equal(s, null, `A stamp ${i}: legacy path must not stamp`));
         const corpus = scriptTurns();
         for (let i = 0; i < 8; i++) {
+            if (i === 0) {
+                // #5656 residual: turn 0 is a tool-less single-shot shape, so it
+                // rides the verbatim side lane (kernel no-touch) in BOTH phases
+                // — the gate predates this feature and ignores the rollout env —
+                // and the side lane neither scans nor stamps.
+                assert.equal(rb[i], null, `B stamp ${i}: side lane must not stamp`);
+                continue;
+            }
             // The stamp is THIS TURN'S measured wire total (full resends grow
             // monotonically by one appended element).
             assert.equal(rb[i], corpus[i].messages.length, `B stamp ${i}: measured wire total`);

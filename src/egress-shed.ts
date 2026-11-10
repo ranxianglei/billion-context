@@ -46,6 +46,11 @@ export interface ShedStats {
     changed: boolean;
 }
 
+export interface ShedWireImagesResult {
+    body: string;
+    stats: ShedStats;
+}
+
 interface ShedOptions {
     /** Best-effort mNNNNN resolver (session incoming-image index); placeholders quote it. */
     resolveRef?: (mediaType: string, b64: string) => Promise<string | undefined>;
@@ -251,7 +256,7 @@ export async function shedWireImages(
     protocol: WireProtocol,
     targetBytes: number,
     opts: ShedOptions = {},
-): Promise<{ body: string; stats: ShedStats }> {
+): Promise<ShedWireImagesResult> {
     const originalBytes = byteLen(body);
     const noop: ShedStats = { originalBytes, finalBytes: originalBytes, archived: 0, downscaled: 0, changed: false };
     if (targetBytes <= 0 || originalBytes <= targetBytes) return { body, stats: noop };
@@ -274,10 +279,17 @@ export async function shedWireImages(
     let est = originalBytes;
     let archived = 0;
     let downscaled = 0;
+    // Rung B's downscale pass decodes + re-encodes through jimp, so it stays capped at
+    // MAX_SHED_IMAGES to bound per-request CPU. Rung A (archiving, below) is a cheap string
+    // swap and must walk EVERY occurrence — see #5745.
     const work = occurrences.slice(0, MAX_SHED_IMAGES);
 
     // Rung A: archive oldest non-protected images to placeholder notes until under target.
-    for (const o of work) {
+    // Walks every occurrence (not just the first MAX_SHED_IMAGES): archiving is a string swap,
+    // so the jimp CPU bound does not apply here — capping it left any session with more than
+    // 64 images permanently over budget (#5745: 582 images shed only 64, the body stayed over
+    // the 10 MiB cap and upstream 400'd every round).
+    for (const o of occurrences) {
         if (est <= targetBytes) break;
         if (o.protectedTail) continue;
         const note = await shedNote(o.mediaType, o.b64, opts.resolveRef);
