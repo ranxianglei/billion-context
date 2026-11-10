@@ -206,8 +206,20 @@ test("rolloutDecisions: sorted, one per registered feature, real install id", ()
         assert.equal(alpha.enabled, true);
         assert.equal(zeta.enabled, false);
         // percent-0 still flows through the bucketing tier (bucket < 0bp is
-        // never true) — "off" is reserved for features with no percent at all.
-        for (const d of ds) assert.equal(d.source, "bucket", d.feature);
+        // never true) — "off" is otherwise reserved for features with no
+        // percent at all. ONE documented exception: a base-nested feature
+        // (#5874 snapshotLane nests on snapshotFoundation) whose base is off
+        // resolves to source "off" — it is evaluated only inside the base's
+        // enabled cohort, and an empty-config base (percent 0) has none.
+        const baseNested = new Set(
+            Object.entries(rollout.ROLLOUT_FEATURES)
+                .filter(([, p]) => typeof p.base === "string" && p.base.length > 0)
+                .map(([k]) => k),
+        );
+        for (const d of ds) {
+            if (baseNested.has(d.feature)) assert.equal(d.source, "off", d.feature);
+            else assert.equal(d.source, "bucket", d.feature);
+        }
     });
 });
 
