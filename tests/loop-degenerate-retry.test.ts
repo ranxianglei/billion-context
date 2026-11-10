@@ -217,7 +217,7 @@ test("#732-follow-up W1: reasoning + whitespace-only text + stop → the #732 re
     const { out, fetchCalls, bodies } = await drainOpenai(OPENAI_THINKING_WSPRIBE, [OPENAI_GOOD], "deg-w1");
     assert.equal(fetchCalls, 1, "exactly one degenerate auto-retry fired despite the forwarded \"\\n\\n\"");
     assert.ok(
-        bodies[0].includes("ended without a tool call"),
+        bodies[0].includes("produced no visible output"),
         "the retry body carries the ephemeral continuation nudge",
     );
     assert.ok(out.includes("let me check the logs"), "the thinking prefix was streamed to the client");
