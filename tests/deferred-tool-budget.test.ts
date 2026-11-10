@@ -99,11 +99,22 @@ test("#2391: output headroom includes loaded schemas without adding them again t
     const loaded = { ...deferred, description: "l".repeat(780_000) };
     const body = { tools, input: [{ type: "additional_tools", tools: [loaded] }], max_output_tokens: 100_000 };
     const context = { processedMessages: [], systemText: "", tools, lastInputTokens: 0, imageTokens: 0, nativeWindow: 272_000 };
+    // #5278: the cap sizes off the x1.12-safety-inflated estimate; derive both
+    // expectations from the same documented formula instead of re-pinning magic
+    // numbers (tightened vs the pre-#5278 pins by design).
+    const capOf = (est: number): number => {
+        const safeEst = Math.ceil(est * 1.12);
+        const margin = Math.max(2048, Math.ceil(safeEst * 0.05));
+        return Math.max(Math.floor(272_000 - safeEst - margin), Math.min(4_096, Math.floor(272_000 - safeEst)));
+    };
+    const estOnly = estimateInputTokens([], "", tools, 0, undefined, undefined, undefined, undefined, countLoadedToolTokens(body));
     clampOutgoingOutput(body, "max_output_tokens", context, "fixture", () => {});
-    assert.ok(body.max_output_tokens < 100_000 && body.max_output_tokens > 60_000);
+    assert.equal(body.max_output_tokens, capOf(estOnly), "loaded schemas price into the headroom");
+    assert.ok(typeof body.max_output_tokens === "number" && (body.max_output_tokens as number) < 100_000, "the oversized request is reduced");
     const usageBody = { ...body, max_output_tokens: 100_000 };
     clampOutgoingOutput(usageBody, "max_output_tokens", { ...context, lastInputTokens: 200_000, lastInputTokensSource: "usage" }, "fixture", () => {});
-    assert.equal(usageBody.max_output_tokens, 62_000);
+    assert.ok(estOnly <= 200_000, "usage baseline wins the max() in this fixture");
+    assert.equal(usageBody.max_output_tokens, capOf(200_000), "usage-grade baseline still bounds the headroom (no double-counted reserve, #2558)");
 });
 
 test("#2391: a 272k Responses proxy forwards the full deferred catalog and rejects eager/loaded overflow", async () => {

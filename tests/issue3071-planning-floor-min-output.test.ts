@@ -49,8 +49,10 @@ test("#3071: when raw headroom < 4096 the floor is bounded by headroom, not forc
 });
 
 test("#3071: a healthy cap well above the floor is unchanged", () => {
-    // cap 136144 >> 4096 -> the capability floor does not interfere.
-    assert.equal(clampOutputBudget(200_000, 120_000, WINDOW), 136_144);
+    // #5278: the cap is now sized on the x1.12-safety-inflated estimate (134400):
+    // floor(262144 - 134400 - ceil(134400*0.05)) = 121024 >> 4096, so the
+    // capability floor still does not interfere.
+    assert.equal(clampOutputBudget(200_000, 120_000, WINDOW), 121_024);
 });
 
 test("#3071 (integration): clampOutgoingOutput plans against the refused ledger and floors to 4096", () => {
