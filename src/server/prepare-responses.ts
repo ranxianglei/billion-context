@@ -411,10 +411,10 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         });
         const caLine = recordNudgeObservation(sessionId, turn, tokenCount, config.modelContextLimit, willInjectNudge, decideTier1Arm && !decideFallbackOverride, surfaceOffDetail(laneDecisions, opts.compress.injectTool));
         if (caLine) log("info", caLine);
+        log(nudgeDiagLogLevel(tokenCount, turn.nudge), diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model, willInjectNudge, decideTier1Arm && !decideFallbackOverride, surfaceOffDetail(laneDecisions, opts.compress.injectTool)));
         const ordered = repairResponsesAssistantOrdering(applyReasoningDrop(stripKernelSummaries(turn.messages, turn.state), reasoningPlan, log, sessionId), originalMessages);
         processedMessages = ordered.messages;
         separatorSlots = ordered.slots;
-        log(nudgeDiagLogLevel(tokenCount, turn.nudge), diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model, willInjectNudge, decideTier1Arm && !decideFallbackOverride, surfaceOffDetail(laneDecisions, opts.compress.injectTool)));
         // #3477: consume the announced native-compaction boundary (pi session_compact
         // → /__bili/plugin/compact → markCompactionBoundary) exactly once, after the
         // post-compaction history was processed: archives the deactivated blocks,
