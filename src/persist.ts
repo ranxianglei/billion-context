@@ -40,7 +40,7 @@ import { orphanContents, resolveStorageMode, UnifiedShadow, hadIntegrityQuickChe
 import { noteColdLoad } from "./attach-heartbeat.js";
 import { resolveBackendName } from "./storage/backend.js";
 import { toLegacyLike, type LegacySessionLike } from "./storage/ingest.js";
-import { sha256Hex, type CheckpointRow, type MessageRefContentRow } from "./storage/store.js";
+import { sha256Hex, type CheckpointRow, type MessageRefContentRow, type MessageIdContentRow } from "./storage/store.js";
 import { contentStoreOf } from "./store.js";
 import type { WireProtocol } from "./util.js";
 import { currentContextObservation, canonicalJson, CALIBRATION_CLAMP_MAX, CALIBRATION_CLAMP_MIN, CALIBRATION_SAMPLE_MAX, CALIBRATION_SAMPLE_MIN, CALIBRATION_SAMPLE_WINDOW } from "./cache-ledger.js";
@@ -2447,6 +2447,21 @@ export class SessionStore {
         }
     }
 
+    /** #6029: per-msg_id message bodies from the unified store — the restamp-proof
+     *  web fallback. restampRefsToLedger renumbers the live refs at cold load, so
+     *  a ref-number join (unifiedMessageContentByRefs) misses every row whose live
+     *  ref drifted off its index-time number; msg_id is invariant across restamps.
+     *  Null when the unified store is unavailable — callers keep their legacy
+     *  "missing" posture and never guess. */
+    unifiedMessageContentByIds(sessionId: string, msgIds: readonly string[]): MessageIdContentRow[] | null {
+        if (!this.shadow || this.shadow.stats.disabled) return null;
+        try {
+            return this.shadow.messageContentByMsgIds(sessionId, msgIds);
+        } catch {
+            return null; // sidecar degraded mid-call: treat as unavailable
+        }
+    }
+
     /** #D5-5 render windowing: identity-only rows (seq + msg_id). Null when
      *  the unified store is unavailable — the render lane degrades, never
      *  guesses. */
@@ -4397,5 +4412,26 @@ export function unifiedKvActive(): boolean {
         return _store.liveStorageStamp !== "legacy";
     } catch {
         return false;
+    }
+}
+
+/** #5753/#5757: same probe as unifiedKvActive(), but returns the store ONLY
+ *  when it actually exposes the KV methods the migration surfaces use.
+ *  Suites (and future adapters) may install a PARTIAL stub via
+ *  _setStoreForTest — e.g. snapshot-render-chain fakes only the unifiedTail*
+ *  view methods — and those must fall back to the legacy file paths silently
+ *  instead of crashing a hot path on a missing method. */
+export function kvStore(): SessionStore | null {
+    try {
+        const s = _store;
+        if (!s || s.liveStorageStamp === "legacy") return null;
+        if (
+            typeof s.getKvAsync !== "function"
+            || typeof s.setKvAsync !== "function"
+            || typeof s.listKvAsync !== "function"
+        ) return null;
+        return s;
+    } catch {
+        return null;
     }
 }

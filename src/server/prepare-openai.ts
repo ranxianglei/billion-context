@@ -152,7 +152,9 @@ export async function prepareOpenai(
     const reserveBody: OpenAIRequestBody | string = wpHit !== undefined && wpFullText !== undefined ? wpFullText : parsed;
     let wpSeedSystemText = "";
     let wpTurnStrip: RawStripCounts | undefined;
-    const markerCounts = wpHit !== undefined ? wpHit.markerCounts : stripRawStage(parsed, "openai");
+    // On a watermark hit no walk runs this turn — the cached counts describe
+    // the window's logical view, so report zero wall time for THIS turn (#6018).
+    const markerCounts = wpHit !== undefined ? { ...wpHit.markerCounts, strippedMs: 0 } : stripRawStage(parsed, "openai");
     logRawStripCounts(markerCounts, log, sessionId);
 
     try {

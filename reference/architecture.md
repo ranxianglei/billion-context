@@ -28,6 +28,7 @@ billion-context/
 │   │   ├── prepare-openai.ts     #   OpenAI chat request preparation (#1440)
 │   │   ├── prepare-responses.ts  #   Responses request preparation + codex compact/prompt-cache helpers (#1440)
 │   │   ├── relay.ts             #   Upstream relay zone: forward() + fake-completion recovery (#1440 P2 cut 4)
+│   │   ├── request-cost.ts       #   Per-request local-cost line (outbound measured at the real wire body) + #5408 heartbeat + wall-clock slow-session advisory, facts only (#903/#4528/#5744)
 │   │   ├── responses-ordering.ts #   #564 Responses assistant-run ordering repair + producer-owned turn-separator provenance (#2627)
 │   │   ├── responses-separator.ts #   Canonical Responses turn-separator literal and carrier predicates (#2627)
 │   │   ├── side-request.ts       #   Tool-surface check for auxiliary side requests
@@ -65,6 +66,7 @@ billion-context/
 │   ├── fetch-transport.ts        # AsyncLocalStorage fetch-transport override (withFetchTransport)
 │   ├── content-encoding.ts       # gzip/deflate decode + decompression-bomb guard (413)
 │   ├── wire-body.ts              # Trailing-user-turn append on assembled wire bodies
+│   ├── egress-transforms.ts      # User-registerable egress request-body rewrite pipeline (#6003)
 │   ├── wire-drop-warn.ts         # Warn when a wire codec drops non-text parts (#1205)
 │   ├── text-safe.ts              # Surrogate-safe string prefix helper
 │   ├── sse-util.ts               # SSE parsing / line-ending normalization
@@ -75,6 +77,7 @@ billion-context/
 │   ├── stream-error.ts           # Minimal SSE error+finish sequence for failed streams
 │   ├── stream-terminal.ts        # Terminal-state observer for native-compaction responses (#321)
 │   ├── exit-matrix.ts            # Wire-exit × cross-cutting-concern enumeration matrix (#588)
+│   ├── exit-deadline.ts          # 5s cap on the exit flush path (EXIT_FLUSH_DEADLINE_MS, #5753)
 │   ├── degenerate-retry.ts       # Continuation-nudge retry body builder
 │   ├── degenerate-turn.ts        # Degenerate turn (empty/truncated) detection
 │   ├── strict-echo.ts            # Strict-echo reasoning upstream handling (#684)

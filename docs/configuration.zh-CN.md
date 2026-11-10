@@ -88,6 +88,7 @@
 | `imageBilling` | "auto" \| "pixels" \| "bytes" | auto (resolves to pixels) | BILI_IMAGE_BILLING | 全局图片 token 估算口径；逐请求实时读取，优先于所有逐 provider 设置。 |
 | `imageTokenCap` | number | unset (uncapped) | BILI_IMAGE_TOKEN_CAP | 全局单图 token 上限，叠加在计费口径之上生效；逐请求实时读取。 |
 | `imageRescale` | boolean | true | BILI_IMAGE_RESCALE | 出站图片降采样总开关（#3295/#3400）：大图以缩小形态发给模型，原图在会话存储中保持字节级原样。逐请求实时读取。 |
+| `egressTransforms` | array | unset (none) | — | 用户可注册的出站请求体改写管线（#6003）：ESM 插件在所有会话处理之后、传输（重签 / v1Wrap / fetch）之前改写每个出站模型请求体。fail-open，可经 POST /__bili/config/reload 热重载。 |
 | `billing` | object | {} | — | 按模型计费单价（#4899）：billing.prices[模型] = { input, output?, cacheRead?, cacheWrite? }，美元/百万 token；覆盖 models.dev 快照价，驱动面板美元花费台账与省钱折算。无价模型只显示 token。 |
 
 **行为开关**
@@ -611,6 +612,28 @@
 - **默认值：** `true`
 - **状态：** ACTIVE
 - **说明：** 出站图片降采样 pass 的总开关（#3295 删除了旧的入站时降采样；#3400 以简化形态重新引入）。每个出站请求在 kernel 折叠之后、协议编码之前，对最长边超过 `BILI_IMAGE_RESCALE_MAX_DIM`（默认 1600）**或** base64 体积超过 100 KB 的图片做 fit-inside 重编码（不放大、保留原格式），且只作用于**出站副本**——会话存储中的原始字节保持逐字节原样。重编码节省不足 20% 字节的结果直接丢弃（keep-smaller），小图与低收益图原样通过。仅处理 PNG/JPEG/BMP（纯 JS 编码器，零原生依赖）；其他格式原样通过。每张被缩小的图片旁附一段稳定注释，报告当前与原图尺寸；在注册 bili 工具的车道（代理注入车道，以及经插件 manifest 注册的插件车道）中还会指明 `acp_read_original_image("<ref>")`——它从本地会话存储取回原始字节；拒绝注入工具的车道（如 codex）只拿到报尺寸的注释、没有工具。`acp_read_original_image` 的结果**结构性豁免**再次降采样（防 #3266「猜→拒→重发」循环复发的环锁）。输出确定性：同一输入字节永远产出同一缩小字节与同一注释文本，同一历史反复重发保持逐字节稳定，上游前缀缓存不受扰动。每张唯一图片记一条日志（内容 hash 缓存；缓存命中静默）。优先级：`BILI_IMAGE_RESCALE` 环境变量（`"0"`/`"false"` 关闭；实时读取，无需重启）> 本配置键 > 默认开启。
+
+### `egressTransforms`
+
+- **类型：** `array` —— `{ id?, module, enabled?, priority?, match? }` 条目列表（#6003）
+- **默认值：** 未设置（未注册任何改写；管线为精确的空操作 no-op）
+- **状态：** ACTIVE
+- **说明：** 用户可注册的出站请求体改写管线。每个条目加载一个 ESM 插件模块（default export 为 `{ transform(ctx) }`），其改写在每个出站模型请求体上运行——覆盖 relay 车道（主发送**以及**所有恢复重发）与压缩循环车道——在所有会话处理（shed / 压缩循环改写）之后、传输（重签 / v1Wrap / fetch）之前，因此重签不变量始终成立：签名覆盖最终出站的字节。仅配置文件（无 env 变量）；相对 `module` 路径相对配置文件所在目录解析。
+  - **条目字段：** `id` —— 日志标签；回退到模块自身 `id`，再回退到文件名。`module` —— 必填；绝对路径或相对配置目录。`enabled` —— 默认 `true`；`false` 跳过该条目。`priority` —— 数值，越小越先执行；未设置的排在所有已设置之后，同值按注册顺序。`match` —— `{ urlPrefix?, provider? }`，AND 式作用域过滤；缺省 = 所有上游。模块也可在其 default export 上声明 `id`/`priority`/`match`/`timeoutMs`；逐字段以配置值为准。
+  - **插件契约：** `transform(ctx)` 为 async；`ctx = { sessionId, upstreamUrl, method, url, headers(可修改副本), body, protocol, model, stage }`，其中 `stage` 取 `"initial"`（主发送）、`"retry"`（恢复重发）或 `"loop"`（压缩循环）。返回 `undefined` 表示不改写；或返回 `{ body?, headers?, reason? }`，其中 `body` 必须是 `string` 或 `Buffer`。返回的 `headers` 仅在成功时并入实时头部集合；当 body 字节变化时，过期的 `content-length` 会被删除。
+  - **fail-open：** 插件抛错、超时（模块 `timeoutMs`，默认 1000 ms）或返回非法 body 类型时，记日志并跳过，管线以**上一个** body 继续——单个坏插件绝不会弄坏请求。无法加载或形状不对的模块同样被跳过。
+  - **热重载：** `POST /__bili/config/reload` 重读条目并重置模块缓存，因此增删/重排条目与编辑后的插件代码在下一个请求即生效，无需重启。同一代内已加载的模块是钉住的（运行中的会话不会中途切换改写行为）；模块按 mtime 失效，编辑过的文件在重载时重新求值。
+  - **可观测性：** 每个实际运行的插件输出一行 debug：`[<sid>] [egress:<id>] stage=<stage> in=<N>B out=<M>B (<reason>)`。
+  - **已知边界：** 恢复重发从已改写的出站 body 派生变体并重跑管线，故非幂等的字符串改写可能应用两次；解析 JSON body 的结构化阶梯（图片 shed、thinking-strip）在插件把 body 变成不透明 Buffer 时会优雅降级（bail 而非崩溃）。fake-completion 提示重试采用特殊的 wrap→re-sign 顺序，刻意不经过本管线。
+
+  ```jsonc
+  {
+    "egressTransforms": [
+      { "id": "tunnel", "module": "./plugins/tunnel.mjs", "priority": 10 },
+      { "id": "audit", "module": "/abs/path/audit.mjs", "match": { "provider": "https://api.anthropic.com" } }
+    ]
+  }
+  ```
 
 ### `resign`
 

@@ -190,6 +190,17 @@ entries:
     desc_zh: "出站图片降采样总开关（#3295/#3400）：大图以缩小形态发给模型，原图在会话存储中保持字节级原样。逐请求实时读取。"
     site_en: "<code>imageRescale</code> — egress downscale switch; large outbound images sent shrunken, originals kept byte-exact in session storage."
     site_zh: "<code>imageRescale</code> —— 出站图片降采样总开关；大图以缩小形态出站，原图在会话存储中保持字节级原样。"
+  - key: egressTransforms
+    type: array
+    default: "unset (none)"
+    env: []
+    group: upstream
+    id: tt.etf2
+    site_group: up
+    desc_en: "User-registerable egress request-body rewrite pipeline (#6003): ESM plugins that rewrite every outbound model-request body after all session processing and before transport (re-sign / v1Wrap / fetch). Fail-open, hot-reloadable via POST /__bili/config/reload."
+    desc_zh: "用户可注册的出站请求体改写管线（#6003）：ESM 插件在所有会话处理之后、传输（重签 / v1Wrap / fetch）之前改写每个出站模型请求体。fail-open，可经 POST /__bili/config/reload 热重载。"
+    site_en: "<code>egressTransforms</code> — user-registerable egress body-rewrite pipeline (ESM plugins, fail-open, hot-reloadable)."
+    site_zh: "<code>egressTransforms</code> —— 用户可注册的出站请求体改写管线（ESM 插件，fail-open，可热重载）。"
   - key: billing
     type: object
     default: "{}"

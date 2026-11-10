@@ -296,6 +296,12 @@ export interface RequestOptions {
      *  re-sign lane only; undefined on unsigned traffic). Each round rebuilds
      *  the body, so a signature computed for an earlier round is stale. */
     resign?: (headers: Record<string, string>, body: string | Buffer) => void;
+    /** #6003 phase 2: user egress-transform pipeline hook for the compress-loop
+     *  lane's own re-requests / round-2+ rebuilds. Pre-bound by the host with the
+     *  session context (stage "loop"); returns the (possibly rewritten) outbound
+     *  body. Runs AFTER the budget shed and BEFORE resign so the signature covers
+     *  the shipped bytes. undefined when unconfigured — exact no-op. */
+    egress?: (body: string | Buffer) => Promise<string | Buffer>;
 }
 
 // #1960: one round's assistant message parts, in STREAM order. The rebuilt
@@ -554,7 +560,10 @@ export async function* runCompressLoop(
         // The stringify output cannot carry a real lone-half code unit
         // (well-formed JSON.stringify escapes each half), so the escape-only
         // JSON variant skips the dead character-level scan.
-        let wireBodyStr = scrubLoneSurrogateEscapesOnJson(JSON.stringify(wireObj));
+        // #6003 phase 2: widened to Buffer because a user egress-transform may
+        // replace the serialized body with an opaque envelope; every downstream
+        // consumer below accepts string|Buffer except noteForwardedBody (coerced).
+        let wireBodyStr: string | Buffer = scrubLoneSurrogateEscapesOnJson(JSON.stringify(wireObj));
         let wireShedRewrote = false;
         // #3701/#3909: internal re-requests ride the same transport as the outer turn
         // (AsyncLocalStorage) — WS or plain HTTP relay — so an oversized rebuild dies the
@@ -578,6 +587,16 @@ export async function* runCompressLoop(
                 wireBodyStr = scrubLoneSurrogateEscapesOnJson(shedBody);
             }
         }
+        // #6003 phase 2: user egress-transform pipeline on the loop lane's own
+        // re-request bodies — after the budget shed, before resign, so the
+        // signature covers the shipped bytes. A rewrite makes the body opaque to
+        // provenance / image-fact parsing, so mark it (raw-count fallback + skip
+        // the separator-index exemption), exactly as a budget shed does.
+        if (requestOptions.egress) {
+            const beforeEgress = wireBodyStr;
+            wireBodyStr = await requestOptions.egress(wireBodyStr);
+            if (wireBodyStr !== beforeEgress) wireShedRewrote = true;
+        }
         requestOptions.resign?.(requestOptions.headers, wireBodyStr);
         // #2131 follow-up: the message array lives under `messages` (chat),
         // `input` (Responses) or `contents` (Google) depending on wire shape.
@@ -591,7 +610,10 @@ export async function* runCompressLoop(
         const prevSentFull = prevSent?.full ?? null;
         // #3803: generation-parameter fingerprint from the full wire object (never the capped head) —
         // a host reasoning-effort / thinking-config flip re-partitions the provider cache namespace.
-        noteForwardedBody(ctx.session, wireBodyStr, wireArr !== undefined ? wireArr.length : null, credentialFingerprint(requestOptions.headers), generationParamFp(wireObj));
+        // noteForwardedBody is a string-only forensics sink; an opaque egress
+        // envelope (Buffer) is lossy-converted — advisory pairing only, and the
+        // provenance judge below already skips when the body was rewritten.
+        noteForwardedBody(ctx.session, typeof wireBodyStr === "string" ? wireBodyStr : wireBodyStr.toString("utf8"), wireArr !== undefined ? wireArr.length : null, credentialFingerprint(requestOptions.headers), generationParamFp(wireObj));
         // #564/#2627: provenance is resolved against the array that belongs to
         // `wireBodyStr`. Shedding rewrites the body wholesale, so the pre-shed
         // `wireArr` no longer describes it; rather than map stale indexes (which
