@@ -101,7 +101,10 @@ test("config epoch: a live externalSummary chain survives the stale window with 
         const session = makeSession();
         const stamped = defaultConfig(200_000) as Config & { externalSummary?: { enabled: boolean } };
         stamped.externalSummary = { enabled: true };
-        storeEffectiveConfig(session, stamped);
+        // #5930: pass the source generation explicitly — under the new contract a
+        // missing epoch stamps nothing (legacy stamp-wins), so the stale-window
+        // path this test pins needs a real generation to go stale against.
+        storeEffectiveConfig(session, stamped, configFileEpoch());
         assert.equal(externalSummaryEnabled(effectiveConfig(session, defaultConfig(200_000))), true, "precondition: chain on while the file still declares it");
         // Any other edit moves the epoch into the stale-overlay window; the
         // provider table and the chain itself are untouched.
