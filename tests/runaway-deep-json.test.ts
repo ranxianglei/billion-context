@@ -38,11 +38,23 @@ test("deep tool-argument objects are skipped without traversing their text leave
     assert.equal(result.output, result.input);
 });
 
-test("iterative traversal preserves text order across nested arrays and objects", async () => {
+test("iterative traversal visits every text leaf in mixed arrays and objects", async () => {
     const result = await inspect(JSON.stringify({
         choices: [{ delta: { content: ["=".repeat(100), { text: "reset" }, "=".repeat(100)] } }],
         text: "=".repeat(100),
     }));
+    assert.equal(result.verdicts.length, 1);
+    assert.equal(result.verdicts[0].reason, "text-run");
+});
+
+test("leaf feed follows wire order: separated runs stay below the threshold", async () => {
+    const result = await inspect(JSON.stringify({ content: "=".repeat(150), delta: `x${"=".repeat(150)}` }));
+    assert.deepEqual(result.verdicts, []);
+    assert.equal(result.output, result.input);
+});
+
+test("leaf feed follows wire order: contiguous runs reach the threshold", async () => {
+    const result = await inspect(JSON.stringify({ content: "=".repeat(150), delta: `${"=".repeat(150)}x` }));
     assert.equal(result.verdicts.length, 1);
     assert.equal(result.verdicts[0].reason, "text-run");
 });
