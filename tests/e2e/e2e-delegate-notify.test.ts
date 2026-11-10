@@ -264,6 +264,12 @@ async function runScenario(name: string, prompt: string, totalDirectives: number
       XDG_CACHE_HOME: ctx.xdg.cache,
       XDG_STATE_HOME: ctx.xdg.state,
       XDG_DATA_HOME: ctx.xdg.data,
+      // The scripted filler issues 9 identical fast `sleep 2` calls; the
+      // repetition guard's rapidity ladder (warn 3 / refuse 5 / abort 6) then
+      // trips on fast runners (no round reaches the 5s long-poll reset) and
+      // aborts the turn mid-scenario — a runner-speed coin flip. The guard is
+      // covered by its own unit suite and is orthogonal to #2320/#2546 here.
+      BILI_GUARDRAIL_REPETITION: "0",
       ...(cliEntry ? { PI_CLI_PATH: cliEntry } : {}),
     });
     pi = new RpcClient(ctx.piCwd, env);
