@@ -98,7 +98,6 @@ import { clearConflictEvents, recordConflict, summarizeConflicts } from "./confl
 import { getStore, setGlobalSessionCommitListener } from "./persist.js";
 import { log as loggerLog, configureLogger, getLogPath, closeLogger, isStreamWriteError, isBenignSocketRaceError, enterSessionContext, muteStderrLeg, onFileLegLive, shouldMuteStderrLegAfterFileLive, logTimestamp } from "./logger.js";
 import { configureLogRetention } from "./log-retention.js";
-import { noteRequest } from "./attach-heartbeat.js";
 import { configFile, defaultLogFile, sessionsDir, stateDir } from "./paths.js";
 import { atomicWriteInstanceFile, clearProxyInstanceFile, classifySameLanePeer, entryShape, findPresentUnverifiedSameLaneTwin, findSameLanePredecessor, findVerifiedSameLaneTwin, isPidAlive, listInstances, markPortReleased, probePid, readProxyInstanceFile, registerInstanceAndWarn, resolveOwnFingerprint, sameInstanceShape, SPAWN_FINGERPRINT_ENV, unregisterInstance, warnOnNewPeers, writeSpawnPortLog, type InstanceShape, type PidProbe, type ProxyInstanceFile, type RegistryEntry, type SameLanePeer } from "./instance.js";
 import { createServedMarkerWriter, peerStillContests, processStartMs, reapStaleWriterMarkers, writerMarkerDir, type ServedMarkerWriter } from "./served-markers.js";
@@ -157,7 +156,6 @@ import { BILI_HOP_HEADER, anthropicBetaContextWindow, capRegistryWindowByStandar
 import { connectionNamedHeaders, NO_IDENTITY_MESSAGE, stripRemoteCompactionBetaFeature, UPSTREAM_HOP_HEADERS } from "./server/headers.js";
 import { installWebSocketBridge } from "./ws-bridge.js";
 import { codexResponsesCodec, responsesCodec } from "./responses-ws.js";
-import { currentFetchTransport } from "./fetch-transport.js";
 import { demoteGate, hasLeakedBiliToolsOnly, isSideRequest, outputBudgetField, resolveSideLane, restoreOutputBudget, SIDE_REQUEST_MAX_TOKENS, sideRequestGuard, stripLeakedBiliTools } from "./server/side-request.js";
 import { DSH_COMPACTION_SHAPE_MSGS, dshCompactionRefusal, isDshCompactionCall } from "./server/dsh-compaction-guard.js";
 import { clampOutgoingOutput, countSystemAndToolsTokens, emergencyNudge, estimateInputTokens, estimateWireOverhead, projectThinkingMass, readOutputBudget } from "./server/budget.js";
@@ -4753,62 +4751,6 @@ export function headerValue(req: http.IncomingMessage, name: string): string | u
         if (k.toLowerCase() === lower) return Array.isArray(v) ? v[0] : v;
     }
     return undefined;
-}
-
-function formatBytes(n: number): string {
-    if (n < 1024) return `${n}B`;
-    if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)}KiB`;
-    if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)}MiB`;
-    return `${(n / (1024 * 1024 * 1024)).toFixed(1)}GiB`;
-}
-
-// #903: per-request local-cost line, logged at every point where bili finishes
-// its own processing and hands the request off (upstream forward, forged local
-// response, or fail-fast error) — see handle(). outbound is the exact body value
-// handed to forward() (string OR Buffer — Prepared.body is string|Buffer); wire
-// bytes are counted with Buffer.byteLength since undici sends UTF-8 bytes even
-// for string bodies (.length would count UTF-16 chars and undercount any
-// non-ASCII injection). Omitted on paths that fail fast without forwarding.
-// #4528: bili's own per-request processing past this WALL-CLOCK budget means
-// synchronous main-thread work large enough to starve the event loop and
-// freeze every endpoint on the same listener — warn so a pathological session
-// shows up in the log instead of being found through a frozen UI.
-// #5744: the trigger used to be message COUNT (>1000), which cannot separate
-// cost from size — one reporter session saved at 0.8s AND 14.5s at the same
-// ~3k msgs. Wall clock IS the cost; the info line above keeps reporting the
-// count for correlation.
-const SLOW_SESSION_MS_WARN = 1000;
-// #5907 follow-up: the warn fires ONCE per session per process — a 3k-msg
-// session exceeds the wall budget on EVERY turn, so re-logging each turn
-// floods the log while adding nothing; the first occurrence carries the full
-// size picture (msgs + inbound + est tokens) plus the cleanup command. The
-// map is bounded: past the cap the earliest-warned session is evicted so a
-// long-lived proxy with many sessions cannot grow it without bound.
-const SLOW_SESSION_WARNED = new Map<string, number>();
-const MAX_SLOW_SESSION_WARNED = 512;
-export function _resetSlowSessionWarnedForTest(): void {
-    SLOW_SESSION_WARNED.clear();
-}
-export function logRequestCost(log: (level: string, msg: string) => void, sessionId: string, msgs: number | null, inboundBytes: number, t0: number, outbound?: string | Buffer): void {
-    const ms = Math.max(0, Math.round(performance.now() - t0));
-    const outboundField = outbound !== undefined ? `, outbound=${formatBytes(Buffer.byteLength(outbound))}` : "";
-    const view = currentFetchTransport() ? ", view=ws-expanded" : "";
-    log("info", `[${sessionId}] request: ${msgs ?? "?"} msgs, inbound=${formatBytes(inboundBytes)}${outboundField}, local=${ms}ms${view}`);
-    // #5408: this line is THE observation point — a hot-at-attach session that
-    // never produces one is silent compression loss (the incident signature).
-    noteRequest(sessionId);
-    if (ms > SLOW_SESSION_MS_WARN && !SLOW_SESSION_WARNED.has(sessionId)) {
-        SLOW_SESSION_WARNED.set(sessionId, ms);
-        while (SLOW_SESSION_WARNED.size > MAX_SLOW_SESSION_WARNED) {
-            const oldest = SLOW_SESSION_WARNED.keys().next().value;
-            if (oldest === undefined) break;
-            SLOW_SESSION_WARNED.delete(oldest);
-        }
-        // bytes/4 is the repo-wide optimistic token floor (same caliber as the
-        // oversize gates) — labeled est because JSON overhead skews it high.
-        const estTok = Math.round(inboundBytes / 4);
-        log("warn", `[${sessionId}] slow-session: ${msgs ?? "?"} msgs / inbound=${formatBytes(inboundBytes)} (~${estTok} est tok) took local=${ms}ms — synchronous per-turn work is starving the event loop (#4528/#5744); the session has grown large — consider \`bili sessions rm ${sessionId}\` or enabling compression (#5907)`);
-    }
 }
 
 /** Thrown by readBody when the request body exceeds the configured receive-body
