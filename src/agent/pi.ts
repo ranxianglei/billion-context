@@ -669,8 +669,17 @@ function noProxyWarning(agent: string): string {
 }
 
 const RETRY_INTERVAL_MS = 10000;
+// #6080: cadence for re-attempting a re-registration that did NOT stick. If the writes
+// land in an instance map the host's current registry no longer reads (pi's
+// runner/instance generation drift after a mid-session mode switch/reload), retrying on
+// every per-turn hook call turns the self-heal into a permanent churn: up to
+// (tools × 2 hooks) synchronous full-registry rebuilds per turn, each re-running the
+// host's prepareLoadout hooks and recomputing its hidden-declaration projection — the
+// perturbation that leaves the host's loadout stale (#6080). Cap attempts to one per
+// window; probes keep running throughout so a natural heal is picked up immediately.
+const REASSERT_BACKOFF_MS = 10 * 60_000;
 
-type RegisterState = { sid?: string; toolsFor?: string; toolsReady?: boolean; pending?: Promise<void>; retryAt?: number; identityAt?: string; carriedSids?: Set<string>; retryIntervalMs: number; manifestPrime?: { base: string; tools: Promise<ManifestTool[] | undefined> }; registeredTools?: ManifestTool[] };
+type RegisterState = { sid?: string; toolsFor?: string; toolsReady?: boolean; pending?: Promise<void>; retryAt?: number; identityAt?: string; carriedSids?: Set<string>; retryIntervalMs: number; reassertBackoffMs: number; reassertBackoffUntil?: number; manifestPrime?: { base: string; tools: Promise<ManifestTool[] | undefined> }; registeredTools?: ManifestTool[] };
 
 // #2708: pi rebuilds its executable tool list per request — _refreshToolRegistry() walks
 // the live extension instances' tool maps into _toolRegistry, and setActiveToolsByName()
@@ -682,21 +691,44 @@ type RegisterState = { sid?: string; toolsFor?: string; toolsReady?: boolean; pe
 // host's real registry and re-asserting vanished tools: registerTool is idempotent (dedup by
 // name) and post-bind triggers a registry refresh, so a per-request re-assert is cheap and
 // safe. No registry query (older pi / omp) or a throwing query → no-op, never a blind re-register.
+// #6080: the re-assert verifies its own effect and converges. A transient drop heals in the
+// very turn it is detected (behavior unchanged since #2708). If the re-registration does NOT
+// stick — the writes land in an instance map the host no longer reads — retrying on every
+// per-turn hook call would churn forever (observed: paired warns + re-registers on EVERY
+// turn for 82 minutes), and each re-register synchronously rebuilds the host's whole
+// registry/loadout mid-turn-prep, which is what left the host's hiddenDeclarations stale.
+// So an ineffective attempt enters a backoff window: probes keep running (cheap, so a
+// natural heal is picked up on the next turn), but no further registerTool churn until the
+// window expires or the scenario changes (a fresh registration for a new sid, or a tree
+// navigation — both clear the backoff).
 function reassertDroppedTools(pi: ExtensionAPI, state: RegisterState, agent: string, proxyBase: string): void {
     const tools = state.registeredTools;
     if (tools === undefined || tools.length === 0) return;
     const probe = (pi as { getAllTools?: () => Array<{ name?: unknown }> }).getAllTools;
     if (typeof probe !== "function") return;
-    let present: Set<string>;
-    try {
-        present = new Set(probe.call(pi).map((t) => (typeof t?.name === "string" ? t.name : "")).filter((n): n is string => n.length > 0));
-    } catch {
-        return; // query rejected (e.g. stale ctx) — never re-register blindly
-    }
+    const readPresent = (): Set<string> | undefined => {
+        try {
+            return new Set(probe.call(pi).map((t) => (typeof t?.name === "string" ? t.name : "")).filter((n): n is string => n.length > 0));
+        } catch {
+            return undefined; // query rejected (e.g. stale ctx) — never re-register blindly
+        }
+    };
+    const present = readPresent();
+    if (present === undefined) return;
     const missing = tools.map((t) => t.name).filter((name) => !present.has(name));
     if (missing.length === 0) return;
+    const now = Date.now();
+    if (state.reassertBackoffUntil !== undefined && now < state.reassertBackoffUntil) return;
     logHostEvent("warn", "[native-client]", `bili-plugin(${agent}): ${missing.length} bili tool(s) dropped from the host registry (${missing.join(", ")}) — re-registering (#2708)`);
     for (const t of tools) pi.registerTool(manifestToTool(proxyBase, t, agent));
+    const after = readPresent();
+    const stillMissing = after === undefined ? missing : tools.map((t) => t.name).filter((name) => !after.has(name));
+    if (stillMissing.length === 0) {
+        state.reassertBackoffUntil = undefined;
+        return;
+    }
+    state.reassertBackoffUntil = now + state.reassertBackoffMs;
+    logHostEvent("warn", "[native-client]", `bili-plugin(${agent}): re-registration did not take effect (${stillMissing.length} tool(s) still absent: ${stillMissing.join(", ")}) — backing off ${Math.round(state.reassertBackoffMs / 60_000)} min before the next attempt; probing continues in between (#6080)`);
 }
 
 // #3542: a pi /tree rewind (navigateTree) resets the ACTIVE tool loadout to what
@@ -780,6 +812,9 @@ async function registerTools(pi: ExtensionAPI, ctx: Ctx, state: RegisterState, a
                 // #2708: remember what we put in the host registry so the
                 // per-request re-assert can detect a later drop.
                 state.registeredTools = tools;
+                // #6080: a fresh registration is a scenario change — allow an
+                // immediate re-assert even if an earlier episode is in backoff.
+                state.reassertBackoffUntil = undefined;
             }
             state.toolsReady = true;
             state.retryAt = undefined;
@@ -891,10 +926,10 @@ export function createPiDirectSendGuard(): (url: string, input: string | URL | R
     };
 }
 
-export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalMs?: number }): (pi: ExtensionAPI) => void {
+export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalMs?: number; reassertBackoffMs?: number }): (pi: ExtensionAPI) => void {
     return function biliPlugin(pi: ExtensionAPI): void {
         const agent = agentName(agentOverride);
-        const state: RegisterState = { retryIntervalMs: opts?.retryIntervalMs ?? RETRY_INTERVAL_MS };
+        const state: RegisterState = { retryIntervalMs: opts?.retryIntervalMs ?? RETRY_INTERVAL_MS, reassertBackoffMs: opts?.reassertBackoffMs ?? REASSERT_BACKOFF_MS };
         // #3066/#3516: tool-output guardrails (output cap / bash timeout /
         // repetition loop-break); knobs resolve env > file > default so the
         // documented BILI_GUARDRAIL_* / guardrails.* switches work end-to-end.
@@ -1706,7 +1741,12 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
         });
         // #3542: a /tree rewind resets the active loadout from the transcript —
         // re-assert ours right after the reset (see reassertLoadoutAfterTree).
-        pi.on("session_tree", () => reassertLoadoutAfterTree(pi, state, agent));
+        pi.on("session_tree", () => {
+            // #6080: the host rebuilt its view — an instance map that was dead may be
+            // live again; allow an immediate re-assert instead of waiting out backoff.
+            state.reassertBackoffUntil = undefined;
+            reassertLoadoutAfterTree(pi, state, agent);
+        });
         // omp fires session_compact on in-session native compaction (sid does
         // not rotate), so the proxy reuses stale state — notify it to archive
         // the now-unreachable blocks (#395). Fire-and-forget: a failed
