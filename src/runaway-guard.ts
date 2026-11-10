@@ -337,8 +337,14 @@ export function wrapStreamWithRunawayGuard<T extends Uint8Array>(
         // NDJSON fallback: some OpenAI-compatible servers separate events with bare
         // newlines and never emit a blank line. Engages only once the buffer is large
         // enough that standard SSE framing is clearly absent (a real SSE body separates
-        // every frame long before NDJSON_FALLBACK_MIN).
-        if (ndjson || (frameBuf.length >= NDJSON_FALLBACK_MIN && /^[{\[]/.test(frameBuf) && frameBuf.includes("\n") && !HAS_FRAME_SEP_RE.test(frameBuf))) {
+        // every frame long before NDJSON_FALLBACK_MIN) and its first non-blank content
+        // is a JSON token ({ / [): a single oversized SSE event split across chunks
+        // also reaches this size with no blank line yet, but opens with an SSE field
+        // ("data: …"), so the token gate keeps it in SSE mode until the real separator
+        // arrives. Once engaged the mode is sticky for the rest of the stream (re-arming
+        // per chunk would forget it on small chunks), and the unfinished last line stays
+        // in frameBuf for the chunk that completes it.
+        if (ndjson || (frameBuf.length >= NDJSON_FALLBACK_MIN && /^\s*[{\[]/.test(frameBuf) && frameBuf.includes("\n") && !HAS_FRAME_SEP_RE.test(frameBuf))) {
             ndjson = true;
             const lines = frameBuf.split("\n");
             frameBuf = lines.pop() ?? "";
@@ -366,6 +372,9 @@ export function wrapStreamWithRunawayGuard<T extends Uint8Array>(
         while ((m = FRAME_SEP_RE.exec(frameBuf)) !== null) {
             const frame = frameBuf.slice(0, m.index);
             frameBuf = frameBuf.slice(m.index + m[0].length);
+            // Re-anchor the shared global regex: the buffer shrank under it, so without
+            // this the next exec resumes at the stale offset (past the end of the new
+            // string) and silently skips every remaining frame in the chunk.
             FRAME_SEP_RE.lastIndex = 0;
             processSseFrame(frame);
             if (walkTripped) return;

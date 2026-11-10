@@ -47,7 +47,7 @@ test("NDJSON fallback preserves a partial last event until its next chunk", asyn
 
 test("NDJSON fallback does not swallow a large multi-line data SSE frame", async () => {
     // >=64KB single SSE frame whose payload spans many data: lines (pretty-printed
-    // JSON). Without the /^[{\[]/ opening-token gate the fallback engages on the
+    // JSON). Without the opening-token gate the fallback engages on the
     // first chunk, drops every unparseable "data:" line and never counts the run.
     const json = JSON.stringify({ choices: [{ delta: { content: "ab".repeat(33_000) + "=".repeat(200) } }] }, null, 2);
     const body = json.split("\n").map((l) => `data: ${l}`).join("\n") + "\n\n";
@@ -55,6 +55,15 @@ test("NDJSON fallback does not swallow a large multi-line data SSE frame", async
     assert.equal(result.verdicts.length, 1);
     assert.equal(result.verdicts[0].reason, "text-run");
     assert.equal(result.output, body.slice(0, -1));
+});
+
+test("NDJSON fallback tolerates leading blank lines before the first event", async () => {
+    const prefix = `\n${delta("ab".repeat(33_000))}\n`;
+    const run = `${delta("=".repeat(200))}\n`;
+    const result = await inspect([prefix + run.slice(0, 60), run.slice(60)]);
+    assert.equal(result.verdicts.length, 1);
+    assert.equal(result.verdicts[0].reason, "text-run");
+    assert.equal(result.output, prefix + run.slice(0, 60));
 });
 
 test("a large SSE event split before its final newline stays in SSE mode", async () => {
