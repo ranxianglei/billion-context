@@ -269,6 +269,7 @@ export function wrapStreamWithRunawayGuard<T extends Uint8Array>(
 
     // #3260 text-run lane state.
     let frameBuf = ""; // unprocessed tail: complete frames + at most one partial frame
+    let ndjson = false;
     let walkTripped = false;
     let tripVerdict: RunawayVerdict | null = null;
 
@@ -337,9 +338,11 @@ export function wrapStreamWithRunawayGuard<T extends Uint8Array>(
         // newlines and never emit a blank line. Engages only once the buffer is large
         // enough that standard SSE framing is clearly absent (a real SSE body separates
         // every frame long before NDJSON_FALLBACK_MIN).
-        if (frameBuf.length >= NDJSON_FALLBACK_MIN && frameBuf.includes("\n") && !HAS_FRAME_SEP_RE.test(frameBuf)) {
+        if (ndjson || (frameBuf.length >= NDJSON_FALLBACK_MIN && /^[{\[]/.test(frameBuf) && frameBuf.includes("\n") && !HAS_FRAME_SEP_RE.test(frameBuf))) {
+            ndjson = true;
             const lines = frameBuf.split("\n");
-            frameBuf = "";
+            frameBuf = lines.pop() ?? "";
+            if (frameBuf.length > FRAME_BUF_CAP) frameBuf = "";
             for (const lineRaw of lines) {
                 const line = lineRaw.endsWith("\r") ? lineRaw.slice(0, -1) : lineRaw;
                 if (line.length === 0 || (line.charAt(0) !== "{" && line.charAt(0) !== "[")) continue;
@@ -363,6 +366,7 @@ export function wrapStreamWithRunawayGuard<T extends Uint8Array>(
         while ((m = FRAME_SEP_RE.exec(frameBuf)) !== null) {
             const frame = frameBuf.slice(0, m.index);
             frameBuf = frameBuf.slice(m.index + m[0].length);
+            FRAME_SEP_RE.lastIndex = 0;
             processSseFrame(frame);
             if (walkTripped) return;
             if (frameBuf.length > FRAME_BUF_CAP) {
