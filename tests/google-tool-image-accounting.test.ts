@@ -49,3 +49,18 @@ test("Google tool images share top-level media billing without charging the resu
     assert.equal(countImagesInParsedBody("google", textOnly), 0);
     assert.deepEqual(imagePlaceholders(googleToCore(textOnly).msgs[0]), []);
 });
+
+test("Google nested non-image media is billed and counted but earns no recovery note", () => {
+    const data = "JVBERi0xLjQKJcOkw7zDtsOfCg==";
+    const body: GoogleRequestBody = { contents: [{ role: "user", parts: [{ functionResponse: {
+        name: "export_doc", response: { output: "written" }, parts: [{ inlineData: { mimeType: "application/pdf", data } }],
+    } }] }] };
+    assert.equal(countImagesInParsedBody("google", body), 1);
+    assert.equal(imageTokensInParsedBody("google", body, "bytes"), Math.ceil(data.length / 4));
+    // Negative direction of the image/* note gate (#3617): the note carries a
+    // decompress({ imageRef }) recovery ref, and the restore channel indexes
+    // NESTED google media only for image/* mimes (src/image-restore.ts) — an
+    // note here would promise a restore it cannot deliver. Billing stays
+    // mime-agnostic: every forwarded byte reaches upstream.
+    assert.deepEqual(imagePlaceholders(googleToCore(body).msgs[0]), []);
+});
