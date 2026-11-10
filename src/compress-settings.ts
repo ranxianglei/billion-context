@@ -1,6 +1,6 @@
 import { DEFAULT_ABSORB_CONFIG, DEFAULT_CCR_CONFIG, defaultPrompts, resolvePrompts, createPackResolver, builtinSource, createDirPackSource, isValidPackName, type AbsorbConfig, type Config, type CcrConfig, type Pack, type PackSurface, type Prompts } from "acp-kernel";
 import * as path from "node:path";
-import { findRoute, type CompressSettings, type NamedProviderRecipe, type ProviderRoutes } from "./config.js";
+import { findRoute, resolveModelEntryOnRoute, type CompressSettings, type NamedProviderRecipe, type ProviderRoutes } from "./config.js";
 import { configDir } from "./paths.js";
 import { log as loggerLog } from "./logger.js";
 import { expandExternalSummaryChainTolerant, type ExternalSummarySettings } from "./external-summary-settings.js";
@@ -74,9 +74,13 @@ export function mergeCompress(
         emergencyThresholdPercent: pick("emergencyThresholdPercent"),
         nudgeGrowthTokens: pick("nudgeGrowthTokens"),
         minPressureBenefitTokens: pick("minPressureBenefitTokens"),
+        requireUsageSampleForPressure: pick("requireUsageSampleForPressure"),
+        maxEstimateHoldRounds: pick("maxEstimateHoldRounds"),
         tierNudgeTokens: tierNudgeLevels.length > 0 ? Object.assign({}, ...tierNudgeLevels) : undefined,
         nudgeModelDecided: pick("nudgeModelDecided"),
         nudgeDecisionMaxTokens: pick("nudgeDecisionMaxTokens"),
+        requireNudge: pick("requireNudge"),
+        requireRecommendation: pick("requireRecommendation"),
         preserveRecentMessages: pick("preserveRecentMessages"),
         preserveRecentTokens: pick("preserveRecentTokens"),
         minCompressRangeChars: rangeOf(model) ?? rangeOf(provider) ?? rangeOf(global),
@@ -131,7 +135,7 @@ export function resolveCompress(
     global?: CompressSettings,
 ): CompressSettings {
     const route = findRoute(routes, upstreamUrl);
-    return mergeCompress(global, route?.compress, model ? route?.models?.[model]?.compress : undefined);
+    return mergeCompress(global, route?.compress, resolveModelEntryOnRoute(route, model).entry?.compress);
 }
 
 let warnedPromptsRisk = false;
@@ -334,6 +338,13 @@ export function applyCompressSettings(base: Config, limit: number, s: CompressSe
     // #3211: explicit 0 is meaningful (legacy any-pending pressure behavior),
     // so pass it through instead of skipping like the growth-token knobs.
     if (s.minPressureBenefitTokens !== undefined) nudge.minPressureBenefitTokens = s.minPressureBenefitTokens;
+    // Phantom-pressure guard: an explicit false is meaningful (legacy
+    // estimate-driven pressure injection), so pass it through instead of
+    // skipping like absent knobs.
+    if (s.requireUsageSampleForPressure !== undefined) nudge.requireUsageSampleForPressure = s.requireUsageSampleForPressure;
+    // #5865 estimate-hold backstop bound — pass through like every numeric
+    // knob (0 is meaningful: it disables the hold).
+    if (s.maxEstimateHoldRounds !== undefined && typeof s.maxEstimateHoldRounds === "number") nudge.maxEstimateHoldRounds = Math.floor(s.maxEstimateHoldRounds);
     if (s.tierNudgeTokens !== undefined) {
         const tg: NonNullable<Config["nudge"]["tierGrowthTokens"]> = {};
         if (typeof s.tierNudgeTokens.t1 === "number") tg.t1 = s.tierNudgeTokens.t1;
