@@ -23,7 +23,7 @@
 
 import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST } from "../launcher.js";
 import { createBiliPlugin } from "./pi.js";
-import { applyOmpFirstEventTimeout, markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, setNativeOriginWaiter, singleFlight } from "./native-bootstrap.js";
+import { applyOmpFirstEventTimeout, applyOmpMessageThreadsOff, markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, setNativeOriginWaiter, singleFlight } from "./native-bootstrap.js";
 import { installNativeFetchIntercept, noteRoutedOrigin, observeRoutedOrigin, readyOrigin, setDeclaredModelEndpoints, type NativeInterceptState } from "./native-intercept.js";
 import { loadDeclaredModelEndpoints } from "../model-endpoints.js";
 import { clearIncrementalProbe, createPrepareDirectSend, hostMsgIdHintFor, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalAck, noteIncrementalRejection, planIncrementalTurn, probeIncrementalTurns, rememberOriginalBody, sweepStale, wireMessagesLookAnthropic, type IncrementalWireMessage } from "./incremental-client.js";
@@ -411,8 +411,11 @@ if (plan.mode !== "off") armNativeOmp(plan);
 // preflight over a large context holds the response for minutes while OMP only
 // sees keep-alive comments, and its default 300s timer would abort mid-compression.
 // Sync at module eval so it lands before the first request; user-pinned values win.
+// #6088: same for OMP's message threads — OMP reads the switch per request, so
+// defaulting it off here makes every turn carry the full history bili compresses.
 if (process.env.NODE_TEST_CONTEXT === undefined && ompTrafficRidesBili(process.env)) {
     applyOmpFirstEventTimeout(process.env);
+    applyOmpMessageThreadsOff(process.env);
 }
 
 // node:test imports this module for shouldBootstrapNativeOmp — never

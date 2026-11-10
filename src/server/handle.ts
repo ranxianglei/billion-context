@@ -68,7 +68,7 @@ import { matchModelEndpoint } from "../model-endpoints.js";
 import { autoModeForgeEnabled, dshAuthoredCompactionEnabled, imageRescaleEnabled, limitsDecodedBytes as knobLimitsDecodedBytes, limitsIngestBytes as knobLimitsIngestBytes, noInjectTool as knobNoInjectTool, rawDumpDir as knobRawDumpDir } from "../knobs.js";
 import { buildForgeResponse, classifierForgeVariant, estimateCjkTokens, isAutoModeClassifier, requestText, summarizeAction } from "../auto-mode-forge.js";
 import { extractConversationId, isV1BackgroundSideRequest, isV1InternalRequest, unwrapV1Internal } from "../v1internal.js";
-import { anthropicBetaContextWindow, BILI_HOP_HEADER, capRegistryWindowByStandard, expandedContextSuffixWindow, launcherContextWindow, launcherMaxOutput, noteUnresolvedModelSession, UNRESOLVED_MODEL_SESSION_THRESHOLD, windowSourceLogged } from "./context-window.js";
+import { anthropicBetaContextWindow, anthropicBetaMessageThreads, BILI_HOP_HEADER, capRegistryWindowByStandard, expandedContextSuffixWindow, launcherContextWindow, launcherMaxOutput, noteUnresolvedModelSession, UNRESOLVED_MODEL_SESSION_THRESHOLD, windowSourceLogged } from "./context-window.js";
 import { NO_IDENTITY_MESSAGE, safeSessionId } from "./headers.js";
 import { demoteGate, hasLeakedBiliToolsOnly, hasSingleShotBudget, isClaudeCodeTitleRequest, isDshAutoReviewRequest, isDshSingleShotSidecar, isDshTitleRequest, isServerToolUtilityCall, isSideRequest, isStructuredOutputCall, resolveSideLane, restoreOutputBudget, sideRequestGuard, stripLeakedBiliTools } from "./side-request.js";
 import { DSH_COMPACTION_SHAPE_MSGS, DSH_REFUSAL_STORM_LOG_EVERY, detectPassthroughDshCompactionCall, dshCompactionRefusal, dshPassthroughGuardStats, isDshCompactionCall } from "./dsh-compaction-guard.js";
@@ -123,6 +123,12 @@ const codexConfigWindowWarned = new Set<string>();
 // deeper prefix-break kind is eligible; equal-depth replays (#1486) and
 // truncated subviews never adopt weakly regardless of ratio.
 const WEAK_ADOPT_MIN_PREFIX_RATIO = 0.8;
+
+// #6088: warn-once per (pre-fork) session when a request negotiates Anthropic
+// message threads — every turn then carries only the newest message(s), so the
+// session silently never compresses. Keyed by the base id so `|sub:` forks of
+// the same conversation do not repeat the line.
+const messageThreadsWarned = new Set<string>();
 
 // #2986: the derivedFromSessionId link is what keeps a kind child session
 // reachable along its parent chain after a restart — without it the shared
@@ -1636,6 +1642,13 @@ async function handleRequest(
         // embed the id manually. One statement, runs in this request's own
         // async context, so concurrent requests never cross-contaminate.
         enterSessionContext(sessionId);
+        if (protocol === "anthropic" && anthropicBetaMessageThreads(req.headers)) {
+            const baseId = sessionId.split("|sub:")[0];
+            if (!messageThreadsWarned.has(baseId)) {
+                messageThreadsWarned.add(baseId);
+                loggerLog("warn", `[${baseId}] Anthropic message threads are on (anthropic-beta message-threads-*): the upstream holds the history and each request carries only the newest message(s), so bili cannot compress this session; for OMP set PI_ANTHROPIC_MESSAGE_THREADS=0 (#6088)`);
+            }
+        }
         // #1086/#1357: content-fallback chain observation, now that identity is known.
         // Artifacts + processed local state ⇒ self-produced: process normally.
         // Artifacts + NO local state ⇒ ADVISORY observation (#1357 Phase 1): the

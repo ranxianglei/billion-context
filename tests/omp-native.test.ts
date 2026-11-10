@@ -7,7 +7,7 @@ import { pathToFileURL } from "node:url";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import factory, { ompTrafficRidesBili, shouldBootstrapNativeOmp, planNativeOmp, armNativeOmp, _resetNativeStateForTest, _setSpawnForTest, _stateRespawnForTest, _noteRoutedForTest } from "../src/agent/omp-native.ts";
-import { applyOmpFirstEventTimeout, nativeProxyScriptPath, ompFirstEventTimeoutValue, OMP_FIRST_EVENT_TIMEOUT_DEFAULT_MS, OMP_FIRST_EVENT_TIMEOUT_ENV } from "../src/agent/native-bootstrap.ts";
+import { applyOmpFirstEventTimeout, applyOmpMessageThreadsOff, OMP_MESSAGE_THREADS_ENV, nativeProxyScriptPath, ompFirstEventTimeoutValue, OMP_FIRST_EVENT_TIMEOUT_DEFAULT_MS, OMP_FIRST_EVENT_TIMEOUT_ENV } from "../src/agent/native-bootstrap.ts";
 import { pluginInstall, pluginRemove, pluginStatusAll, selfPackageRoot, ompPluginLoadedFrom } from "../src/plugin-install.ts";
 import { rmrf } from "./tmp-rm.ts";
 
@@ -70,6 +70,18 @@ test("#1774 applyOmpFirstEventTimeout: stamps only when unpinned, idempotent on 
     const pinned: NodeJS.ProcessEnv = { [OMP_FIRST_EVENT_TIMEOUT_ENV]: "45000" };
     applyOmpFirstEventTimeout(pinned);
     assert.equal(pinned[OMP_FIRST_EVENT_TIMEOUT_ENV], "45000");
+});
+
+test("#6088 applyOmpMessageThreadsOff: defaults to \"0\" only when unpinned, blank counts as unset", () => {
+    const clean: NodeJS.ProcessEnv = {};
+    applyOmpMessageThreadsOff(clean);
+    assert.equal(clean[OMP_MESSAGE_THREADS_ENV], "0");
+    const blank: NodeJS.ProcessEnv = { [OMP_MESSAGE_THREADS_ENV]: "  " };
+    applyOmpMessageThreadsOff(blank);
+    assert.equal(blank[OMP_MESSAGE_THREADS_ENV], "0");
+    const pinned: NodeJS.ProcessEnv = { [OMP_MESSAGE_THREADS_ENV]: "1" };
+    applyOmpMessageThreadsOff(pinned);
+    assert.equal(pinned[OMP_MESSAGE_THREADS_ENV], "1", "explicit user value wins");
 });
 
 test("nativeProxyScriptPath: dist/agent/omp-native.js resolves to the package bin", () => {
