@@ -28,6 +28,7 @@ import { ABSORB_TOOL_NAME, READ_ORIGINAL_IMAGE_TOOL_OPENAI, RULE_TOOL_OPENAI, ab
 import { absorbToolName, applyAbsorbView, storeEffectiveAbsorb } from "../absorb.js";
 import { storeEffectiveBlockOps } from "../acp-block-ops.js";
 import { buildBlockOpsSystemPrompt } from "acp-kernel";
+import { FoundationRejectError, foundationCommitTurn, foundationLaneActive, foundationPrepare, type FoundationTurn } from "../snapshot-plane.js";
 import { adoptContentStore, ccrEnabled, ccrLoopConfig, contentStoreOf, dropRetrievals, imageRescaleToolArmed, pruneExpiredRetrievals, reconcileReloadedRetrievals, renderRetrievalNotes, retrieveToolName, snapshotPendingRetrievals, snapshotRetrievalNotes } from "../store.js";
 import { rulesEnabled, storeEffectiveRules } from "../rules-feature.js";
 import { autoFoldEngaged, autoFoldFloor, conversationPromptSections, externalSummaryEnabled, growthFoldingArmed, messageTimestampSections } from "../external-summary-surface.js";
@@ -122,6 +123,17 @@ export async function prepareOpenai(
     // overrides the dsh default — #3401); alias kept for the remaining reads.
     const laneDecisions = resolveLaneDecisions({ protocol: "openai", pluginMode, pluginAgent: typeof session.metadata["pluginAgent"] === "string" ? session.metadata["pluginAgent"] as string : undefined, parsed, shouldInject, pluginHeaderPresent: pluginAgentHeader(req.headers) !== undefined });
 
+    // #5874 snapshot-table compression foundation (two-level cohort rollout):
+    // the outbound prefix renders from the SNAPSHOT TABLE (server-
+    // authoritative, append-only pos, event-sourced) instead of the client's
+    // re-sent bytes. It is a FLAG MUTEX with the watermark and the #3756
+    // snapshot-render lane (proposal §8 / ruling K): a foundation-gated turn
+    // suppresses both — one session, one prefix home. Decided BEFORE any
+    // store access, so a non-enrolled session never touches the tables.
+    const foundationGate = pluginMode && !isTitleGen && foundationLaneActive(session);
+    let foundation: FoundationTurn | null = null;
+    let foundationHeader: string | undefined;
+
     // #5403/#5418 watermark fastpath (rollout-gated; plugin lane only): a
     // verified hit ASSERTS the re-sent prefix is unchanged, so this turn skips
     // the full-body re-strip/re-convert below — the prefix view comes from the
@@ -132,7 +144,7 @@ export async function prepareOpenai(
     let wpOutcome: FastpathOutcome | null = null;
     let wpFullText: string | undefined;
     const wpModel = typeof parsed.model === "string" ? parsed.model : "";
-    if (bodyText !== undefined && pluginMode && !isTitleGen && featureEnabled("pluginFullResendWatermark")) {
+    if (bodyText !== undefined && pluginMode && !isTitleGen && !foundationGate && featureEnabled("pluginFullResendWatermark")) {
         wpFullText = bodyText;
         wpOutcome = evaluateWatermarkFastpath(bodyText, req, session, { pluginMode, titleGen: isTitleGen, model: wpModel }, log);
         log("debug", `[${session.id}] fastpath ${wpOutcome.hit ? "HIT" : wpOutcome.decision}${wpOutcome.creditedMiss ? "(credited)" : ""}${wpOutcome.measuredT !== undefined ? ` T=${wpOutcome.measuredT}` : ""}`);
@@ -189,11 +201,18 @@ export async function prepareOpenai(
         // stamped list, so count-parity there would fail by design — pinning
         // only adds noise.
         if (wpHit === undefined && pluginMode && incomingMsgIds !== undefined) {
-            if (featureEnabled("pluginLaneServerHistory")) {
+            // #5874: the foundation lane pins identity MANDATORILY — its
+            // evidence chain is the pinned host ids, so a failed validation
+            // is the R3 cohort fault (hard 400, zero kernel side effects)
+            // instead of the content-id fallback below.
+            const pinArmed = featureEnabled("pluginLaneServerHistory") || foundationGate;
+            if (pinArmed) {
                 const v = validateMsgIds(incomingMsgIds, msgs.length);
                 if (v.ok) {
                     msgs = applyMsgIdPin(msgs, v.ids);
                     originalMessages = msgs;
+                } else if (foundationGate) {
+                    throw new FoundationRejectError("SNAPSHOT_ENVELOPE_FAULT", `snapshot foundation: the inbound msgid envelope failed validation (${v.reason}) — hard-rejected per R3 (#5874)`);
                 } else {
                     log("warn", `[${sessionId}] [msgid] openai-wire pin rejected (${v.reason}) — falling back to content-derived ids (#4491/#5825)`);
                 }
@@ -201,12 +220,25 @@ export async function prepareOpenai(
                 log("info", `[${sessionId}] [msgid] openai-wire biliMsgIds present but pluginLaneServerHistory rollout is off for this install — field stripped, ids not pinned (#5825)`);
             }
         }
+        // #5874 stage 0: world match for enrolled sessions. Runs BEFORE
+        // processTurn, so a thrown FoundationRejectError carries zero kernel
+        // side effects (the R3 gate). Non-enrolled / degraded turns get a
+        // turn whose phase keeps the legacy path untouched below.
+        if (foundationGate) {
+            foundation = await foundationPrepare({
+                session,
+                // A non-array / non-string-element envelope is an envelope
+                // fault (R3) — never silently coerced.
+                incomingMsgIds: Array.isArray(incomingMsgIds) && incomingMsgIds.every((x) => typeof x === "string") ? (incomingMsgIds as string[]) : null,
+                log,
+            });
+        }
         // #3756 snapshot render: the outbound prefix renders from the unified
         // transcript (server-authoritative, fold-time ids — immune to identity
         // re-mints #3752); only the live tail keeps the client's bytes.
         // No-op returns `msgs` when the lane is inactive/degraded.
         // reconcileFoldCoverage below still observes the CLIENT view.
-        const renderMsgs = maybeSnapshotView(session, msgs, { sessionId, pluginMode, log });
+        const renderMsgs = foundationGate ? msgs : maybeSnapshotView(session, msgs, { sessionId, pluginMode, log });
         // #4241: the render lane replaced the view (reference-inequality is the
         // discriminator — maybeSnapshotView returns the SAME array when idle),
         // so the judged baseline is the rendered transcript, not the inbound.
@@ -399,6 +431,22 @@ export async function prepareOpenai(
         if (caLine) log("info", caLine);
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model, willInjectNudge, decideTier1Arm && !decideFallbackOverride, surfaceOffDetail(laneDecisions, opts.compress.injectTool)));
         processedMessages = applyReasoningDrop(stripKernelSummaries(turn.messages, turn.state), reasoningPlan, log, sessionId);
+        // #5874 stage 3+4: commit the turn to the snapshot tables (ONE tx)
+        // and render the egress from the TABLE (active rows, host envelope
+        // order) — the byte-stability property the foundation exists for.
+        // A R2 join failure / degrade / tripwire returns a null egress and
+        // the legacy view above stands (per-turn gate, self-healing).
+        if (foundation !== null && (foundation.phase === "arm" || foundation.phase === "hit")) {
+            const fRes = await foundationCommitTurn({ turn: foundation, msgs, modelView: processedMessages as BiliMessage[], blocks: turn.state.blocks, activeBefore, state: turn.state, log });
+            foundationHeader = fRes.token;
+            if (fRes.egress !== null) {
+                processedMessages = fRes.egress;
+            } else {
+                log("warn", `[${sessionId}] [snapshot] egress fell back to the legacy view (token=${fRes.token}, tripwire=${fRes.tripwire})`);
+            }
+        } else if (foundation !== null) {
+            foundationHeader = foundation.token; // diverge / red / off: legacy egress
+        }
         // #1001: a silent client history rewrite takes the same archive+prune path
         // as an announced /compact boundary — syncBlocks above has already
         // deactivated the blocks whose sources left the context. Skipped when
@@ -563,6 +611,7 @@ export async function prepareOpenai(
             attachedRetrievalNoteIds = retrNotes.map((n) => n.id);
         }
     } catch (err) {
+        if (err instanceof FoundationRejectError) throw err; // #5874 R3: the 400 control channel outranks the fallback
         log("warn", `[${sessionId}] kernel transform failed, forwarding unchanged: ${String(err)}`);
         if (attachedRetrievals.length > 0) dropRetrievals(session, attachedRetrievals.map((i) => i.ref), "prepare failed; forwarded unprocessed");
         processedMessages = [];
@@ -652,7 +701,7 @@ export async function prepareOpenai(
         });
         if (Object.keys(wpResponseHeaders).length === 0) wpResponseHeaders = undefined;
     }
-    return { body: JSON.stringify(rebuilt), parsedBody: rebuilt, session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, judgeBaseline, protocol: "openai", stream, compressInjected: injectTools, pluginMode, mcpDialectNote: laneDecisions.mcpDialect, nudge, nudgeOutcome, prompts, surface, openaiSystemText, systemNotes: sysNotes, renderTags: renderStrategy, responseExtraHeaders: wpResponseHeaders, dropReasoning: (msgs: BiliMessage[]) => applyReasoningDrop(msgs, reasoningPlan, log, sessionId) } as Prepared;
+    return { body: JSON.stringify(rebuilt), parsedBody: rebuilt, session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, judgeBaseline, protocol: "openai", stream, compressInjected: injectTools, pluginMode, mcpDialectNote: laneDecisions.mcpDialect, nudge, nudgeOutcome, prompts, surface, openaiSystemText, systemNotes: sysNotes, renderTags: renderStrategy, responseExtraHeaders: foundationHeader !== undefined ? { "x-bili-snapshot": foundationHeader, ...(wpResponseHeaders ?? {}) } : wpResponseHeaders, dropReasoning: (msgs: BiliMessage[]) => applyReasoningDrop(msgs, reasoningPlan, log, sessionId) } as Prepared;
 }
 
 /** Append the ephemeral nudge to a Gemini `contents` array. Gemini is

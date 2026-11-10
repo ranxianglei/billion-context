@@ -32,6 +32,9 @@ interface CompressLoopResponsesCtx {
     /** #862: when `false`, suppress 📦/❌ visibility markers (same contract as
      *  LoopCtx.visibilityMarkers). Default (undefined) keeps markers on. */
     visibilityMarkers?: boolean;
+    /** #5874: set by the applyRanges snapshot-fold hook when a fold commits on
+     *  a foundation-lane session — await it before continuing (flush discipline). */
+    pendingSnapshotFlush?: Promise<void>;
 }
 
 interface RequestOptions {
@@ -124,6 +127,7 @@ async function surfaceProxyJson(
             const toolResult = mutating
                 ? await withSessionLock(ctx.session, () => executeProxyToolAsync(call.name, args, ctx, call.callId, rawArgs, ctx.signal))
                 : await executeProxyToolAsync(call.name, args, ctx, call.callId, rawArgs, ctx.signal);
+            await ctx.pendingSnapshotFlush; // #5874: fold commits land in the snapshot tables before the loop continues
             result = toolResult.text;
             ctx.log(`[acp-proxy: responses JSON ${call.name}${mutating ? "" : " (read-only)"} → ${result.slice(0, 120).replace(/\n/g, " ")}]`);
         } catch (e) {
@@ -200,6 +204,7 @@ export async function compressLoopResponsesJson(
                 rawArgs = call.arguments;
             }
                 const toolResult = await withSessionLock(ctx.session, () => executeProxyToolAsync(call.name, args, ctx, call.callId, rawArgs, ctx.signal));
+            await ctx.pendingSnapshotFlush; // #5874: fold commits land in the snapshot tables before the re-request
             ctx.log(`[acp-proxy: responses JSON ${call.name} → ${toolResult.text.slice(0, 120).replace(/\n/g, " ")}]`);
             if (ctx.visibilityMarkers !== false) inputItems.push({ type: "message", role: "user", content: buildVisibilityMarker(call.name, toolResult.text) });
         }

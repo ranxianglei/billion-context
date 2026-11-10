@@ -106,6 +106,8 @@
 | `rollout.features.identityChannelHarvest` | boolean \| number | 0(关) | BILI_ROLLOUT_IDENTITY_CHANNEL_HARVEST | 身份信道采集的灰度门(#5825):当安装级开关(BILI_IDENTITY_HARVEST)未设置时,允许仅由本灰度键激活回环专属的转录/SQLite 采集(claude-code / codebuddy / mcode / goose / qwen 车道);两者都不设则永不读客户端存储。owner 裁定 2026-11-07:本灰度键与 rollout.features.pluginLaneServerHistory(它管已接纳 id 的行钉住)刻意分离——任一使能方可激活采集。默认 0%,小流量观察退化率后再抬。见 identity-channels.zh-CN.md。 |
 | `rollout.features.pluginLaneServerHistory` | boolean \| number | 0(关) | BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY | 插件车道服务端正史(#4491):对已放量的安装,(a) 插件车道请求可携带与 `messages` 平行的内部字段 `biliMsgIds`,把消息身份钉在客户端提供的 id 上(转发上游前一律剥掉;格式错误的数组告警后忽略,身份投毒形态在增量车道直接硬失败);(b) 仅回环可达的 `POST /__bili/plugin/render` 端点从统一存储渲染出站前缀(折叠区收敛为摘要锚点;任何失步都返回非 2xx,shim 退回本地历史);(c) 增量车道探测响应通告 `serverHistory`。默认 0%,放量前无行为变化。 |
 | `rollout.features.pluginFullResendWatermark` | boolean \| number | 5(实验性灰度) | BILI_ROLLOUT_PLUGIN_FULL_RESEND_WATERMARK | 全量重发水位快路径(#5403/#5418):插件车道 chat-completions 回合若上一轮响应盖有 x-bili-pf-seq,则用回声计数声明重发前缀(结构扫描,不做全量解析);命中时管线只消费钉存的前缀核 + 新增尾巴窗口(出站字节同源可证;任何疑点当轮回退未动过的全量解析路径并重新盖戳,连续五次计名失配将车道按住一小时)。需客户端把戳回声为 x-bili-pf-count(适配的车道回带;其余车道不会命中)。**实验性灰度**——默认仅约 5% 的安装开启(owner 裁定 2026-11-02:先小流量再 GA;web 面板对全部安装显示一次性公告、快速配置提供三态开关);`true` 强制开、`false`(或百分比)/ env = 0 关。见 technical-notes.zh-CN.md「全量重发水位快路径」。 |
+| `rollout.features.snapshotFoundation` | boolean \| number | 0(关——主门) | BILI_ROLLOUT_SNAPSHOT_FOUNDATION | 快照表压缩基础**主灰度门**(#5874):入组安装的插件车道车队会话(snapshot.cohortHosts)把压缩台账放在服务端快照表里,出站前缀从表渲染——跨客户端字节抖动保持稳定,含压缩折叠。要求客户端每轮回带消息 id 信封(biliMsgIds);入组请求缺信封时硬 400、零副作用(R3),十分钟内三次故障该会话锁回老路径。任何红色门槛(校验和/台账断裂 R1、无法解释的历史变化 R2、世界纪元失步 R3、未落盘的结构提交 R4)都会把该会话永久拉回老路径——绝不砖。默认 0%:放量前零行为变化。 |
+| `rollout.features.snapshotLane` | boolean \| number | 100(基座嵌套:主分组内恒开) | BILI_ROLLOUT_SNAPSHOT_LANE | 快照表基础**车道开关**(#5874):仅在 snapshotFoundation 分组内评估(基座嵌套),因此入组与否完全由主门决定;本键用于在已入组安装内单独关掉车道行为(或测试中不动主门而强开)。默认 100——改动它永不重排任何人;它是针对车道行为本身的手术刀级开关。 |
 | `maskHosts` | boolean | true | BILI_LOG_MASK_HOSTS | 日志中把非公开目标主机遮成 <private-host>；凭据头无论此开关如何总是遮盖。 |
 | `security.adminRelay` | boolean | false | — | 允许宿主（当前为 dsh web）把它自己入口域名下的整个 /__bili/ 管理面中继到本机代理，使远程浏览器能打开面板（#3373）。默认关闭、仅配置文件。中继跳到达代理时是本机非浏览器客户端（回环源地址 + 回环 Host、无 Origin 头），管理端门槛不变；开启后，凡能访问宿主 web 入口的人都能改配置、写凭据——请先给入口加鉴权/反代。 |
 | `subagentSplit` | boolean | true | BILI_SUBAGENT_SPLIT | Claude 子代理拥有独立会话命名空间（<session>\|sub:<agent-id>），不再排队在主会话锁后。仅 anthropic 线路 —— Responses 线路上本开关无效（见 `subagentSplit` / BOTH-mechanisms 作用域说明）。 |
@@ -352,6 +354,12 @@
 | `compress.reasoning.drop` | boolean | true | — | 丢弃超过阈值的已结束轮次推理块。 |
 | `compress.reasoning.threshold` | number | 2048 | — | 已结束推理块被丢弃的字符阈值。 |
 | `compress.minCompressRange` | number | same as minCompressRangeChars | — | minCompressRangeChars 的弃用别名（接受，映射到后者）。 _(已弃用)_ |
+| `snapshot` | object | {} | — | 快照表压缩基础配置块:把入组会话的折叠历史放在服务端快照表(l1_world / snap_rows / snap_log / snap_ckpt)里,出站前缀从表渲染,使模型看到的字节跨客户端抖动保持稳定。入组由灰度控制(rollout.features.snapshotFoundation,基座嵌套车道 snapshotLane);本块调节入组后的行为。灰度关闭时零行为变化。 |
+| `snapshot.shadow` | boolean | 开 | — | 快照渲染影子对账(#3756):每轮已折叠会话都用引擎现算一次出站快照视图但不使用,与 legacy 实际出站比对分类,逐会话计数进 web 面板与 snapshot-shadow 诊断主题。渲染车道仍受灰度控制(BILI_ROLLOUT_SNAPSHOT_RENDER);影子车道绝不改变出站字节。环境变量 BILI_SNAPSHOT_SHADOW(0/false/off 或 1/true/on)优先于本文件层级。 |
+| `snapshot.enabled` | boolean | 开 | — | 快照表基础的安装级总开关(#5874)。独立于灰度:即使本安装落在 snapshotFoundation 分组内,false 也让所有会话走老压缩路径。默认开——默认情况下由灰度百分比独自拦住安装。 |
+| `snapshot.cohortHosts` | string[] | ["pi"] | — | 基础车道的宿主车队(#5874,owner 裁定 D4):只有 pluginAgent 宿主 id 在列表内的插件车道会话入组——车道要求客户端每轮回带完整消息 id 信封(biliMsgIds),未适配宿主永不进入。初始名单:pi(稳定规范序列化)。某宿主须先证明端到端字节对齐(T4/T12)才可加入。 |
+| `snapshot.tripwireRate` | number | 0.05 | — | 每个入组绿面回合以该概率(0..1)额外计算一次 legacy 视图并逐字节比对两条出站核序列(#5874 §4.5 绊线)。不一致会永久把该会话拉回老路径并记告警——这是「表渲染字节恒等于 legacy 字节」的生产金丝雀。大车队可调低,0 关闭。 |
+| `snapshot.ckptEveryNTurns` | number | 16 | — | 快照 LSM 的检查点节奏(#5874):至少每 N 个已提交回合把事件日志折进检查点(吸收折叠前沿之前的日志行,物理清除无覆盖的失活行);每个压缩回合也强制折叠。N 越大稳态行数越少、崩溃后重建尾部越长;折叠本身幂等,两种取值都安全。 |
 
 **路由表字段**
 
@@ -2012,6 +2020,8 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_ROLLOUT_IDENTITY_CHANNEL_HARVEST` | `rollout.features.identityChannelHarvest` | 0 (off) |
 | `BILI_ROLLOUT_PLUGIN_FULL_RESEND_WATERMARK` | `rollout.features.pluginFullResendWatermark` | 5 (experimental grey) |
 | `BILI_ROLLOUT_PLUGIN_LANE_SERVER_HISTORY` | `rollout.features.pluginLaneServerHistory` | 0 (off) |
+| `BILI_ROLLOUT_SNAPSHOT_FOUNDATION` | `rollout.features.snapshotFoundation` | 0 (off — the master gate) |
+| `BILI_ROLLOUT_SNAPSHOT_LANE` | `rollout.features.snapshotLane` | 100 (base-nested: always on inside the master cohort) |
 | `BILI_SESSION_CONTENT_STORE_PIN` | `sessions.contentStorePin` | false |
 | `BILI_SESSION_GC` | `sessions.gc.enabled` | false |
 | `BILI_SESSION_GC_INTERVAL_MS` | `sessions.gc.intervalMs` | 3600000 |

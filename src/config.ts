@@ -2042,10 +2042,23 @@ type FileConfig = {
     cacheKeepalive?: CacheKeepaliveSettings;
     /** MITM block (#2030: + handshakeTimeoutMs, was env BILI_MITM_HANDSHAKE_TIMEOUT_MS only). */
     mitm?: { enabled?: boolean; domains?: string[]; handshakeTimeoutMs?: number };
-    /** Snapshot-render observability block. `shadow` (boolean, default true)
-     *  computes the snapshot view on armed turns without using it — counters
-     *  surface in the web panel; env BILI_SNAPSHOT_SHADOW wins (#3756). */
-    snapshot?: { shadow?: boolean };
+    /** Snapshot-render observability block (#3756) + the #5874 snapshot-table
+     *  compression foundation. `shadow` (boolean, default true) computes the
+     *  snapshot view on armed turns without using it — counters surface in
+     *  the web panel; env BILI_SNAPSHOT_SHADOW wins. Foundation keys (all
+     *  file-tier — the rollout switches are `rollout.features.snapshotFoundation`
+     *  / `snapshotLane` or BILI_ROLLOUT_SNAPSHOT_FOUNDATION / BILI_ROLLOUT_SNAPSHOT_LANE):
+     *  `enabled` (master kill-switch, default true), `cohortHosts` (plugin
+     *  agent ids enrolled in the foundation, default ["pi"]), `tripwireRate`
+     *  (0–1, the sampled egress-vs-legacy byte-parity check, default 0.05),
+     *  `ckptEveryNTurns` (checkpoint cadence in committed turns, default 16). */
+    snapshot?: {
+        shadow?: boolean;
+        enabled?: boolean;
+        cohortHosts?: string[];
+        tripwireRate?: number;
+        ckptEveryNTurns?: number;
+    };
     /** Re-sign block (#1884), scheme-keyed: the key is the lowercase
      *  Authorization scheme (built-in: "sdk-hmac-sha256" — CodeArts APIG).
      *  `enabled: false` unloads the arm for that scheme (pre-resign rewrite
@@ -2542,6 +2555,8 @@ const KNOWN_TOP_LEVEL_KEYS = new Set([
     "autoModeForge", "imageRescale", "guardrails",
     // #3376:
     "cacheKeepalive",
+    // #3756/#5874: snapshot-render shadow block + snapshot-table foundation keys.
+    "snapshot",
     // #6003 phase 2: user-registerable egress body-rewrite pipeline.
     "egressTransforms",
 ]);

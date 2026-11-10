@@ -2375,6 +2375,27 @@ export class SessionStore {
         }
     }
 
+    /** #5874 P3 (decompress green lane): sync snapshot row-ledger read. Null =
+     *  no snapshot substrate (sidecar unavailable or network backend) — the
+     *  caller then keeps the legacy receipts. */
+    unifiedSnapshotRows(sessionId: string): import("./storage/store.js").SnapRow[] | null {
+        if (!this.shadow || this.shadow.stats.disabled) return null;
+        try {
+            return this.shadow.unifiedSnapshotRows(sessionId);
+        } catch {
+            return null;
+        }
+    }
+
+    unifiedSnapshotCkpt(sessionId: string): import("./storage/store.js").SnapCkpt | null {
+        if (!this.shadow || this.shadow.stats.disabled) return null;
+        try {
+            return this.shadow.unifiedSnapshotCkpt(sessionId);
+        } catch {
+            return null;
+        }
+    }
+
     unifiedListSessionIds(): string[] | null {
         if (!this.shadow || this.shadow.stats.disabled) return null;
         try {
@@ -2631,6 +2652,17 @@ export class SessionStore {
     private liveShadow(): UnifiedShadow {
         if (!this.replicasAvailable()) throw new Error("[storage] replicas require the unified store (storage.unified=shadow|full or BILI_STORAGE_UNIFIED); this instance runs legacy-only");
         return this.shadow as UnifiedShadow;
+    }
+
+    /** #5874: the snapshot-table foundation's storage access (async
+     *  StorageBackend on the live unified sidecar; the sqlite path adapts the
+     *  sync store). Null when the sidecar is missing/disabled — the
+     *  foundation degrades to legacy on those installs. Unlike
+     *  liveShadow() this NEVER throws: the plane treats null as "no
+     *  substrate", not an error. */
+    foundationStore() {
+        if (!this.shadow || this.shadow.stats.disabled) return null;
+        return this.shadow.foundationStore();
     }
 
     /** Freezes the session's CURRENT persisted state as a checkpoint. Callers

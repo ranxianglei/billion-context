@@ -25,6 +25,7 @@ import { log as loggerLog } from "./logger.js";
 import { scanModelOutputForPhantomAttachments } from "./phantom-attachment.js";
 import { ccrEnabled, ccrLoopConfig, contentStoreOf, retrieveToolName } from "./store.js";
 import { emitStreamError, emitUpstreamTruncation } from "./stream-error.js";
+import type { RewriteCtx } from "./stream.js";
 import type { TruncationDiag } from "./stream-error.js";
 import { recordAttributionReport } from "./server/attribution-status.js";
 import type { HandoffReply } from "./server/handoff-response.js";
@@ -2429,7 +2430,7 @@ export async function handlePluginTool(
             const creditBefore = session.stats.compressCreditTokens ?? 0;
             const compressBefore = session.lastCompress;
             const pendingBefore = new Set(session.pendingRetrievals.map((p) => p.ref));
-            const toolResult = await executeProxyToolAsync(tool, args, {
+            const toolCtx: RewriteCtx = {
                 core: deps.core,
                 // #833: run proxy tools under the session's last resolved Config
                 // (same values the wire path used), not the base kernelConfig.
@@ -2443,8 +2444,15 @@ export async function handlePluginTool(
                 // (same split as the relay loop ctx).
                 compressMessages: mem && mem.original.length > 0 ? mem.original : undefined,
                 session,
-                log: (m) => deps.log("info", `[${session.id}] [plugin] ${m}`),
-            }, callId, undefined, deps.signal);
+                log: (m: string) => deps.log("info", `[${session.id}] [plugin] ${m}`),
+            };
+            const toolResult = await executeProxyToolAsync(tool, args, toolCtx, callId, undefined, deps.signal);
+            // #5874 first scene (proposal §4.2): a tool-driven fold must
+            // land in the snapshot tables BEFORE this response goes out —
+            // the awaited-flush discipline. The hook only sets the field
+            // when a fold committed on a foundation-lane session; otherwise
+            // it is undefined and this is a no-op.
+            await toolCtx.pendingSnapshotFlush;
             if (nativeCaller && tool === retrieveToolName(session) && typeof args.ref === "string") {
                 // Preserve the session's export before a same-ref concurrent lookup.
                 const retrieved = applyRetrieve({ store: contentStoreOf(session), ref: args.ref, exportDir: path.join(stateDir(), "retrieve") });

@@ -1,0 +1,52 @@
+# Config reference seed — snapshot block (#5874 snapshot-table compression
+# foundation + #3756 snapshot-render shadow).
+# Edit HERE, then run: node tools/gen-config-docs.mjs generate
+domain: snapshot
+entries:
+  - key: snapshot
+    type: object
+    default: "{}"
+    group: compress
+    desc_en: "Snapshot-table compression foundation block: the server-side ledger that keeps each enrolled session's folded history in snapshot tables (l1_world / snap_rows / snap_log / snap_ckpt) and renders the outbound prefix from it, so the bytes the model sees stay stable across client byte churn. Enrolment is rollout-gated (rollout.features.snapshotFoundation, base-nested lane snapshotLane); this block tunes the enrolled behavior. No behavior changes while the rollout is off."
+    desc_zh: "快照表压缩基础配置块:把入组会话的折叠历史放在服务端快照表(l1_world / snap_rows / snap_log / snap_ckpt)里,出站前缀从表渲染,使模型看到的字节跨客户端抖动保持稳定。入组由灰度控制(rollout.features.snapshotFoundation,基座嵌套车道 snapshotLane);本块调节入组后的行为。灰度关闭时零行为变化。"
+    desc_ja: "スナップショットテーブル圧縮基盤ブロック:エンロールされた各セッションの折り畳み済み履歴をスナップショットテーブル(l1_world / snap_rows / snap_log / snap_ckpt)に保持し、送信プレフィックスをそこからレンダリングするサーバー側の台帳 — クライアントのバイト変動に対してモデルが見るバイトを安定させる。エンロールはロールアウトゲート(`rollout.features.snapshotFoundation`、ベースネストレーン `snapshotLane`)で制御;本ブロックはエンロール後の動作を調整する。ロールアウト OFF 中は挙動は変わらない。"
+  - key: snapshot.shadow
+    type: boolean
+    default: "true"
+    default_zh: "开"
+    group: compress
+    desc_en: "Snapshot-render shadow observability (#3756): compute the outbound snapshot view on every armed turn WITHOUT using it, classify the diff against the legacy outbound, and surface per-session counters in the web panel + the snapshot-shadow diagnostics topic. The render lane stays rollout-gated (BILI_ROLLOUT_SNAPSHOT_RENDER); the shadow lane never changes outbound bytes — it is the dry-run evidence. Env tier BILI_SNAPSHOT_SHADOW (0/false/off or 1/true/on) wins over this file tier."
+    desc_zh: "快照渲染影子对账(#3756):每轮已折叠会话都用引擎现算一次出站快照视图但不使用,与 legacy 实际出站比对分类,逐会话计数进 web 面板与 snapshot-shadow 诊断主题。渲染车道仍受灰度控制(BILI_ROLLOUT_SNAPSHOT_RENDER);影子车道绝不改变出站字节。环境变量 BILI_SNAPSHOT_SHADOW(0/false/off 或 1/true/on)优先于本文件层级。"
+    desc_ja: "スナップショットレンダリングのシャドー観測 (#3756):アームされた各ターンで送信スナップショットビューを計算するが使用せず、legacy の実際の送信との差分を分類し、セッションごとのカウンターを Web パネル + snapshot-shadow 診断トピックに表示。レンダリングレーンはロールアウトゲート(`BILI_ROLLOUT_SNAPSHOT_RENDER`)のままで、シャドーレーンは送信バイトを一切変更しない — これはドライランの証拠。環境変数 `BILI_SNAPSHOT_SHADOW`(0/false/off または 1/true/on)がこのファイル層に優先。"
+  - key: snapshot.enabled
+    type: boolean
+    default: "true"
+    default_zh: "开"
+    group: compress
+    desc_en: "Install-level kill switch for the snapshot-table foundation (#5874). Independent of the rollout: even for installs inside the snapshotFoundation cohort, false keeps every session on the legacy compression paths. Default on — the rollout percent is the only thing holding back installs by default."
+    desc_zh: "快照表基础的安装级总开关(#5874)。独立于灰度:即使本安装落在 snapshotFoundation 分组内,false 也让所有会话走老压缩路径。默认开——默认情况下由灰度百分比独自拦住安装。"
+    desc_ja: "スナップショットテーブル基盤のインストールレベルのキルスイッチ (#5874)。ロールアウトと独立:`snapshotFoundation` コホート内のインストールであっても、false にすると全セッションが legacy 圧縮パスのまま。デフォルト ON — デフォルトではインストールを止めているのはロールアウト率のみ。"
+  - key: snapshot.cohortHosts
+    type: "string[]"
+    default: "[\"pi\"]"
+    default_zh: "[\"pi\"]"
+    group: compress
+    desc_en: "Host cohort for the foundation lane (#5874, owner ruling D4): only plugin-lane sessions whose host id (the pluginAgent metadata value) is in this list enroll — the lane requires the client to echo the full message-id envelope (biliMsgIds) every turn, so unadapted hosts can never enter. Initial roster: pi (stable canonical serialization). Add a host here only after its e2e parity (T4/T12) has been demonstrated."
+    desc_zh: "基础车道的宿主车队(#5874,owner 裁定 D4):只有 pluginAgent 宿主 id 在列表内的插件车道会话入组——车道要求客户端每轮回带完整消息 id 信封(biliMsgIds),未适配宿主永不进入。初始名单:pi(稳定规范序列化)。某宿主须先证明端到端字节对齐(T4/T12)才可加入。"
+    desc_ja: "基盤レーンのホストコホート (#5874、オーナー裁定 D4):プラグイン `pluginAgent` ホスト ID がこのリストにあるプラグインレーンのセッションのみがエンロール — レーンはクライアントが毎ターン完全なメッセージ ID エンベロープ(`biliMsgIds`)をエコーすることを要求するため、未対応ホストは決して入れない。初期名簿:pi(安定した正規シリアライゼーション)。ホストを追加するのは、その e2e パリティ(T4/T12)が実証された後のみ。"
+  - key: snapshot.tripwireRate
+    type: number
+    default: "0.05"
+    default_zh: "0.05"
+    group: compress
+    desc_en: "Per-turn probability (0..1) that an enrolled green-plane turn additionally computes the legacy view and byte-compares the two egress core sequences (#5874 §4.5 tripwire). A mismatch permanently yanks that session's plane to legacy and logs an alert — the production canary that the table-rendered bytes stay equal to the legacy bytes. Lower for large fleets, 0 disables."
+    desc_zh: "每个入组绿面回合以该概率(0..1)额外计算一次 legacy 视图并逐字节比对两条出站核序列(#5874 §4.5 绊线)。不一致会永久把该会话拉回老路径并记告警——这是「表渲染字节恒等于 legacy 字节」的生产金丝雀。大车队可调低,0 关闭。"
+    desc_ja: "エンロールされたグリーンプレーンのターンごとに、legacy ビューも追加計算して 2 つの送信コアシーケンスをバイト比較する確率(0..1)(#5874 §4.5 トリップワイヤー)。不一致はそのセッションのプレーンを legacy に永続的に引き戻し、アラートを記録 — テーブルレンダリングのバイトが legacy のバイトと等しいことを保証する本番カナリア。大規模 fleet では低く、0 で無効化。"
+  - key: snapshot.ckptEveryNTurns
+    type: number
+    default: "16"
+    default_zh: "16"
+    group: compress
+    desc_en: "Checkpoint cadence for the snapshot LSM (#5874): at least every N committed turns the plane folds its event log into a checkpoint (absorbing log rows up to the fold frontier and physically clearing no-cover inactive rows). Also forces a fold on every compression turn. Bigger N = smaller steady-state row count, longer rebuild tail after a crash; the fold is idempotent either way."
+    desc_zh: "快照 LSM 的检查点节奏(#5874):至少每 N 个已提交回合把事件日志折进检查点(吸收折叠前沿之前的日志行,物理清除无覆盖的失活行);每个压缩回合也强制折叠。N 越大稳态行数越少、崩溃后重建尾部越长;折叠本身幂等,两种取值都安全。"
+    desc_ja: "スナップショット LSM のチェックポイント頻度 (#5874):少なくとも N 回のコミット済みターンに 1 回、プレーンはイベントログをチェックポイントに折り込む(フォールドフロンティアまでのログ行を吸収し、カバーのない非アクティブ行を物理的にクリア)。圧縮ターンでも常にフォールドを強制。N が大きいほど定常時の行数は少なく、クラッシュ後の再ビルド尾部は長い;フォールド自体はどちらでも冪等。"

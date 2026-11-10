@@ -109,6 +109,24 @@ export const ROLLOUT_FEATURES: Record<string, RolloutPlan> = {
     // the seam may even read local files — coupling them made opting one's
     // own install in require bumping an unrelated rollout. Default 0%.
     identityChannelHarvest: { percent: 0 },
+    // #5874 snapshot-table compression foundation (proposal §9): the
+    // SERVER-AUTHORITATIVE compression ledger — raw bytes → protocol convert
+    // → rewrite/compress → event-sourced snapshot tables (append-only pos,
+    // ckpt-absorbed log) → egress rendered from the tables → outbound. The
+    // MASTER switch: the enrolled cohort's full-resend sessions stop
+    // re-deriving the outbound prefix from client bytes and read it from the
+    // foundation instead (byte-stable across client byte churn; red gates
+    // R1–R4 fail safe to the legacy path). Default 0% — force on with
+    // `BILI_ROLLOUT_SNAPSHOT_FOUNDATION=1` (or
+    // `rollout.features.snapshotFoundation: true`).
+    snapshotFoundation: { percent: 0, salt: "snapshot-foundation-v1" },
+    // #5874 foundation LANE: base-nested on snapshotFoundation (proposal §9
+    // two-level master⊃lane) — the per-lane behaviour toggle inside the
+    // enrolled cohort (100% = every enrolled session runs the lane; lower
+    // percents would grey the lane itself). The practical switch today is
+    // the master; this entry exists so a lane-level ramp needs no code
+    // change. Force with `BILI_ROLLOUT_SNAPSHOT_LANE=1`.
+    snapshotLane: { percent: 100, base: "snapshotFoundation" },
 };
 
 export const BP_MAX = 10_000;
