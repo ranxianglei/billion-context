@@ -14,6 +14,7 @@ import {
 import { PROXY_TOOL_NAMES, READ_ORIGINAL_IMAGE_TOOL_NAME, RULE_TOOL_NAME } from "./compress-tool.js";
 import { effectiveRulesEnabled } from "./rules-feature.js";
 import { ccrEnabled, retrieveToolName } from "./store.js";
+import { featureEnabled } from "./rollout.js";
 import { log as loggerLog } from "./logger.js";
 import type { Session } from "./session.js";
 import { toolFail, toolOk, type ProxyToolResult } from "./proxy-tool-result.js";
@@ -54,7 +55,7 @@ export function isProxyToolFor(name: string, session: Session | undefined, confi
     if (name === READ_ORIGINAL_IMAGE_TOOL_NAME) return true;
     const absorb = effectiveAbsorbConfig(session, config);
     if (absorb?.enabled === true && name === (absorb.toolName ?? ABSORB_TOOL_NAME)) return true;
-    if (ccrEnabled(session) && name === retrieveToolName(session)) return true;
+    if ((ccrEnabled(session) || featureEnabled("foldSummaryCcr")) && name === retrieveToolName(session)) return true;
     return effectiveRulesEnabled(session, config) && name === RULE_TOOL_NAME;
 }
 

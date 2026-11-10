@@ -10,6 +10,7 @@ import { recordCompressCommit } from "./context-analysis.js";
 import { executeSearchContextTarget, resolveDecompress } from "./decompress-shared.js";
 import { ONE_CALL_HINT } from "acp-kernel";
 import { adoptContentStore, contentStoreOf, ccrEnabled, drainPendingRetrievals, executeRetrieve, retrieveToolName } from "./store.js";
+import { featureEnabled } from "./rollout.js";
 import { recordThreadTail } from "./server/thread-tracking.js";
 import { peekStoredTailView } from "./persist.js";
 import { imagePlaceholdersForSummary } from "./image-note.js";
@@ -75,7 +76,7 @@ function executeAnthropicProxyTool(toolName: string, args: Record<string, unknow
     if (absorb?.enabled === true && toolName === (absorb.toolName ?? ABSORB_TOOL_NAME)) {
         return executeAbsorb(args, undefined, absorb, ctx);
     }
-    if (ccrEnabled(ctx.session) && toolName === retrieveToolName(ctx.session)) {
+    if ((ccrEnabled(ctx.session) || featureEnabled("foldSummaryCcr")) && toolName === retrieveToolName(ctx.session)) {
         // Non-stream rewrite has no re-request to ride, so the full text rides
         // inline right after the ack inside the converted text block.
         const ack = executeRetrieve(args, ctx.session);
