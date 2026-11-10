@@ -323,6 +323,85 @@ test("contract: fork clone copies rows, records lineage, replays idempotently (#
     }
 });
 
+// #5874: the snapshot-table foundation contract — the commit primitive, the
+// event frontier, the L1 world and the session cascade through the
+// INTERFACE ONLY (the mysql lane pins the same shape below).
+test("contract: snapshot-table foundation — commit, frontier, l1 world, cascade (#5874)", async () => {
+    const dir = scratch();
+    try {
+        const backend = await openBackend("sqlite", path.join(dir, "index.db"));
+        try {
+            const sid = "sess-snap-found";
+            // Commit 1: two rows + two log entries; a pre-form in the CAS.
+            const pre = "contract-pre-" + "p".repeat(40);
+            const r1 = await backend.commitSnapshot({
+                sessionId: sid,
+                preContents: [{ hash: "h" + "b".repeat(63), content: pre }],
+                rows: [
+                    { pos: 1, coreIds: '["h1"]', preJson: "h" + "b".repeat(63), postJson: '{"id":"h1"}', tokensEst: 3, active: true },
+                    { pos: 2, coreIds: '["h2"]', postJson: '{"id":"h2"}', tokensEst: 3, active: true },
+                ],
+                logEntries: [
+                    { kind: "cast", payload: "{}", createdAt: 10 },
+                    { kind: "append", payload: "{}", createdAt: 20 },
+                ],
+                now: 20,
+            });
+            assert.deepEqual(r1.logSeqs, [1, 2], "frontier starts at 1");
+            const rows = await backend.getSnapRows(sid);
+            assert.equal(rows.length, 2, "both rows readable through the interface");
+            assert.deepEqual(rows[0]!.coreIds, '["h1"]');
+            assert.equal(await backend.snapLogMaxSeq(sid), 2, "frontier = max log seq");
+
+            // Commit 2: right-side update at an existing pos (update event
+            // shape) + a ckpt fold that absorbs the log: the FRONTIER must
+            // survive the absorption (it is max(log, ckpt), invariant ii).
+            const r2 = await backend.commitSnapshot({
+                sessionId: sid,
+                rows: [
+                    { pos: 2, coreIds: '["h2"]', postJson: '{"id":"h2","v":2}', tokensEst: 5, active: true },
+                    { pos: 3, coreIds: '["h3"]', postJson: '{"id":"h3"}', tokensEst: 2, active: false, coverRef: "blk-9" },
+                ],
+                logEntries: [{ kind: "compact", payload: "{}", createdAt: 30 }],
+                ckpt: { ckptSeq: 3, metaJson: '{"v":1}', checksum: "s4", updatedAt: 30 },
+                now: 30,
+            });
+            assert.deepEqual(r2.logSeqs, [3], "seq continues after the previous commit");
+            assert.equal(await backend.snapLogMaxSeq(sid), 3, "frontier survives the log absorption (max over log AND ckpt)");
+            const after = await backend.getSnapRows(sid, { includeInactive: true });
+            assert.equal(after.length, 3, "pos 2 was updated in place, pos 3 added (deactivated with a cover)");
+            const pos2 = after.find((r) => r.pos === 2)!
+            assert.equal(pos2.postJson, '{"id":"h2","v":2}', "the update is a right-side rewrite, not a new row");
+            const pos3 = after.find((r) => r.pos === 3)!
+            assert.equal(pos3.coverRef, "blk-9", "deactivated rows keep their covering-block anchor (ruling B)");
+            assert.equal(await backend.contentRefCountOfBody(pre), 1, "pre-form CAS refcounted in-tx");
+
+            // The L1 world: the envelope is the server canon; the world
+            // origin never moves on a plain update (B1 trap).
+            await backend.upsertL1World({ sessRaw: "raw-1", sessionId: sid, ledgerId: "led-1", envelopeJson: '["h1","h2"]', envelopeChecksum: "e1", issuedAt: 100, armedAt: 150 });
+            await backend.upsertL1World({ sessRaw: "raw-1", sessionId: sid, ledgerId: "led-1", envelopeJson: '["h1","h2","h3"]', envelopeChecksum: "e2", issuedAt: 999999 });
+            const world = await backend.getL1World("raw-1");
+            assert.ok(world);
+            assert.equal(world!.envelopeJson, '["h1","h2","h3"]', "envelope re-acts");
+            assert.equal(world!.issuedAt, 100, "world origin never moves on a plain update");
+            assert.equal((await backend.listL1WorldByLedger("led-1")).length, 1);
+
+            // Sweep + cascade: no orphans on either path.
+            assert.equal(await backend.sweepSnapRowsByDeadCovers(sid, ["blk-9"]), 1, "dead-cover row swept");
+            assert.equal(await backend.contentRefCountOfBody(pre), 1, "the pre ref of a LIVE row is not touched by the sweep");
+            await backend.deleteSession(sid);
+            assert.equal((await backend.getSnapRows(sid, { includeInactive: true })).length, 0, "cascade: no snap_rows orphans");
+            assert.equal(await backend.snapLogMaxSeq(sid), 0, "cascade: no snap_log orphans");
+            assert.equal(await backend.getSnapCkpt(sid), null, "cascade: no snap_ckpt orphans");
+            assert.equal(await backend.getL1World("raw-1"), null, "cascade: l1_world follows the session (reverse pointer)");
+        } finally {
+            await backend.close();
+        }
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
 // ---------------------------------------------------------------------------
 // MySQL lane (#3388 step 2): the same contract surface against MySQL 8.0.
 // Runs only when BILI_MYSQL_TEST_DSN is exported (CI starts a mysql:8.0
@@ -457,6 +536,41 @@ test("mysql lane: contract surface against MySQL 8.0", { skip: MYSQL_DSN.length 
     await backend.deleteSession(chSid);
     await backend.deleteSession(cpSid);
     await backend.deleteSession(sid);
+
+    // #5874: the snapshot-table foundation on the mysql lane — the same
+    // contract the sqlite contract test pins (commit, frontier survival
+    // across the ckpt absorption, l1 world, cascade).
+    const sfSid = `sess-mysql-snap-${run}`;
+    const sfPre = "mysql-snap-pre-" + "m".repeat(30);
+    const sf1 = await backend.commitSnapshot({
+        sessionId: sfSid,
+        preContents: [{ hash: "h" + "c".repeat(63), content: sfPre }],
+        rows: [{ pos: 1, coreIds: '["m1"]', preJson: "h" + "c".repeat(63), postJson: '{"id":"m1"}', tokensEst: 3, active: true }],
+        logEntries: [{ kind: "cast", payload: "{}", createdAt: 10 }],
+        now: 10,
+    });
+    assert.deepEqual(sf1.logSeqs, [1], "mysql: frontier starts at 1");
+    const sf2 = await backend.commitSnapshot({
+        sessionId: sfSid,
+        rows: [{ pos: 1, coreIds: '["m1"]', preJson: "h" + "c".repeat(63), postJson: '{"id":"m1","v":2}', tokensEst: 4, active: false, coverRef: "blk-m" }],
+        logEntries: [{ kind: "compact", payload: "{}", createdAt: 20 }],
+        ckpt: { ckptSeq: 2, metaJson: '{"v":1}', checksum: "s", updatedAt: 20 },
+        now: 20,
+    });
+    assert.deepEqual(sf2.logSeqs, [2], "mysql: seq continues");
+    assert.equal(await backend.snapLogMaxSeq(sfSid), 2, "mysql: frontier survives the ckpt absorption");
+    const sfRows = await backend.getSnapRows(sfSid, { includeInactive: true });
+    assert.equal(sfRows.length, 1, "mysql: row updated in place");
+    assert.equal(sfRows[0]!.postJson, '{"id":"m1","v":2}', "mysql: right-side rewrite");
+    assert.equal(await backend.contentRefCountOfBody(sfPre), 1, "mysql: pre-form refcounted in-tx");
+    await backend.upsertL1World({ sessRaw: `raw-mysql-${run}`, sessionId: sfSid, ledgerId: `led-mysql-${run}`, envelopeJson: '["m1"]', envelopeChecksum: "e", issuedAt: 100 });
+    await backend.upsertL1World({ sessRaw: `raw-mysql-${run}`, sessionId: sfSid, ledgerId: `led-mysql-${run}`, envelopeJson: '["m1","m2"]', envelopeChecksum: "e2", issuedAt: 999999 });
+    assert.equal((await backend.getL1World(`raw-mysql-${run}`))!.issuedAt, 100, "mysql: world origin never moves (B1 trap)");
+    assert.equal(await backend.sweepSnapRowsByDeadCovers(sfSid, ["blk-m"]), 1, "mysql: dead-cover sweep");
+    assert.equal(await backend.contentRefCountOfBody(sfPre), 0, "mysql: swept row's pre ref released");
+    await backend.deleteSession(sfSid);
+    assert.equal((await backend.getSnapRows(sfSid, { includeInactive: true })).length, 0, "mysql: cascade clean");
+    assert.equal(await backend.getL1World(`raw-mysql-${run}`), null, "mysql: l1_world cascade");
 
     // verifyProjections on a fresh session
     const vSid = `sess-mysql-verify-${run}`;

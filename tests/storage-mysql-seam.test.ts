@@ -18,6 +18,11 @@ import type {
     SessionSummaryRow,
     SessionViewRows,
     StorageReadView,
+    L1WorldRow,
+    SnapRow,
+    SnapCkpt,
+    SnapshotCommitInput,
+    SnapshotCommitResult,
 } from "../src/storage/backend.ts";
 import { sha256 } from "../src/storage/canonical.ts";
 
@@ -275,6 +280,44 @@ class StubMysqlBackend implements StorageBackend {
     }
     contentDedupReport(): Promise<{ rows: number; bytesTotal: number; refcounted: number }> {
         return Promise.resolve({ rows: 0, bytesTotal: 0, refcounted: 0 });
+    }
+    // #5874: snapshot-table foundation stubs — this seam test round-trips
+    // ingestSession only; the foundation surface stays no-op on the stub.
+    commitSnapshot(_input: SnapshotCommitInput): Promise<SnapshotCommitResult> {
+        return Promise.resolve({ logSeqs: [] });
+    }
+    getSnapRows(): Promise<SnapRow[]> {
+        return Promise.resolve([]);
+    }
+    snapLogMaxSeq(): Promise<number> {
+        return Promise.resolve(0);
+    }
+    getSnapCkpt(): Promise<SnapCkpt | null> {
+        return Promise.resolve(null);
+    }
+    getL1World(): Promise<L1WorldRow | null> {
+        return Promise.resolve(null);
+    }
+    upsertL1World(_row: L1WorldRow): Promise<void> {
+        return Promise.resolve();
+    }
+    listL1WorldByLedger(): Promise<L1WorldRow[]> {
+        return Promise.resolve([]);
+    }
+    deleteSnapshotSession(): Promise<void> {
+        return Promise.resolve();
+    }
+    sweepSnapRowsByDeadCovers(): Promise<number> {
+        return Promise.resolve(0);
+    }
+    putContentRef(_content: string, _precomputedHash?: string): Promise<string> {
+        return Promise.resolve("stub");
+    }
+    getContentRef(_hash: string): Promise<string | null> {
+        return Promise.resolve(null);
+    }
+    releaseContentRef(_hash: string | null): Promise<void> {
+        return Promise.resolve();
     }
     close(): Promise<void> {
         return Promise.resolve();
