@@ -907,7 +907,7 @@ the V1 shape and 2.x hosts load the V2 `setup()`. The standalone
 [`opencode-acp`](https://github.com/ranxianglei/opencode-acp) extension is
 V1-only and does **not** load under 2.x — for OpenCode 2.x, billion-context
 is the recommended context manager. Everything below is verified end-to-end
-on `@opencode/cli` 2.0.3 (V1 lane: 1.14.46 and 1.18.31).
+on `@opencode/cli` 2.1.0 (V1 lane: 1.14.46 and 1.18.31).
 
 | Path | Command | When |
 |---|---|---|
@@ -960,13 +960,20 @@ Registers a self-spawning plugin in your real opencode config and sets
 face is added by default (the native plugin already provides the bili tools,
 session-bound); pass `--with-mcp` to add one — the entry then carries no
 origin pin, so it survives the plugin's ephemeral-port proxy restarts (#926).
-Entry form depends on how THIS bili was installed: an **npm install** writes
-the bare package name (`"plugin": ["billion-context"]`) — the package
-publishes `exports["./server"]` → `dist/agent/opencode-native.js`, so
-opencode loads it through its own Npm.add machinery; zero absolute paths, portable. (That exact bare-name entry doubles as a hand-install without bili — see README Quickstart Option 1.) A **git checkout / dev build** falls back to a local shim dir
-(`<configDir>/plugins/billion-context/index.js` → this checkout's
-`dist/agent/opencode-native.js`) — machine-local by construction; re-running
-install from an npm install migrates the entry back to the bare name.
+Entry form depends on the host generation AND how THIS bili was installed.
+An **OpenCode 1.x npm install** writes the bare package name
+(`"plugin": ["billion-context"]`) — the package publishes
+`exports["./server"]` → `dist/agent/opencode-native.js`, so opencode loads
+it through its own Npm.add machinery; zero absolute paths, portable. (That
+exact bare-name entry doubles as a hand-install without bili — see README
+Quickstart Option 1.) On an **OpenCode 2.x host** — and for any **git
+checkout / dev build** — the installer writes a local shim dir instead
+(`<configDir>/plugins/billion-context/index.js` → this install's
+`dist/agent/opencode-native.js`): 2.x resolves a bare package name through
+the package `main` field (`dist/index.js`, the CLI — no plugin definition),
+so the bare name never loads there (#3976); re-running install (or a reinstall
+to a new path) regenerates the shim to point at the current root, and a
+legacy bare-name entry in a 2.x config is migrated to the shim automatically.
 
 At load the plugin bootstraps its own proxy (attaches to a healthy instance
 instead of doubling; parent-pid watchdog kills it when opencode exits),
