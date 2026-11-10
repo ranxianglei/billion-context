@@ -30,24 +30,21 @@ import test from "node:test";
 process.env.NODE_ENV = "test";
 
 import { defaultConfig } from "acp-kernel";
-import { anthropicToCore } from "acp-kernel/wire";
+import { anthropicToCore, insertBeforeTrailingSystemRun, type AnthropicWireMessage } from "acp-kernel/wire";
 import { createAnthropicAdapter } from "../src/loop/index.ts";
 import { insertCheckpointCarrier } from "../src/chain-checkpoint.ts";
-import { insertBeforeTrailingSystemRun } from "../src/util.ts";
 import { appendTrailingUserText } from "../src/wire-body.ts";
 import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 
-type M = { role: string; content: unknown };
-
 type Msg = { role: string; content: string | Array<{ type?: string; text?: string }> };
 const textOf = (m: Msg): string =>
     typeof m.content === "string" ? m.content : m.content.map((b) => b.text ?? "").join("");
 
 test("#5432 helper: insertions land BEFORE a trailing system run, run stays verbatim at the end", () => {
-    const base: M[] = [
+    const base: AnthropicWireMessage[] = [
         { role: "user", content: "q" },
         { role: "assistant", content: "a" },
         { role: "system", content: "sys1" },
@@ -61,7 +58,7 @@ test("#5432 helper: insertions land BEFORE a trailing system run, run stays verb
 });
 
 test("#5432 helper: no trailing system → plain tail append (legacy behavior unchanged)", () => {
-    const base: M[] = [
+    const base: AnthropicWireMessage[] = [
         { role: "user", content: "q" },
         { role: "assistant", content: "a" },
     ];
@@ -73,7 +70,7 @@ test("#5432 helper: no trailing system → plain tail append (legacy behavior un
 });
 
 test("#5432 helper: empty additions → same array back; all-system input → additions lead", () => {
-    const base: M[] = [{ role: "system", content: "s" }];
+    const base: AnthropicWireMessage[] = [{ role: "system", content: "s" }];
     assert.equal(insertBeforeTrailingSystemRun(base, []), base);
     const out = insertBeforeTrailingSystemRun(base, [{ role: "user", content: "n" }]);
     assert.deepEqual(
@@ -83,7 +80,7 @@ test("#5432 helper: empty additions → same array back; all-system input → ad
 });
 
 test("#5432 helper: sequential batches keep their relative order before the run", () => {
-    let msgs: M[] = [
+    let msgs: AnthropicWireMessage[] = [
         { role: "user", content: "q" },
         { role: "system", content: "sys" },
     ];
