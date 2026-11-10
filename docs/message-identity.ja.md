@@ -406,7 +406,7 @@ join の content-hash base の代替としては決してならない。OUTBOUND
 バー スナップショット `seq` でキー化される（#3756、上記）し、content-hash
 ラダーは join 点を特定するチェーンフォールバックとして機能するのみ。総括：
 bytes がアンカー、hashes が ledger join、`seq` が render join（rollout
-gate)、mNNNNN が ledger、tags が view。
+gate）、mNNNNN が ledger、tags が view。
 
 関連：#1496（本文書の契機）、`session-identity.md`（セッション粒度）、#1476 +
 kernel #459/#463（echo 識別）、#242/#1475（Responses id 制約）、#206/#673
