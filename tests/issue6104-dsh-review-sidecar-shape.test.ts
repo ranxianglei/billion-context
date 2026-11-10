@@ -85,6 +85,17 @@ test("#6104: the banner tolerance is bounded to the system head, not the whole p
     // A policy quoted deep inside someone else's prompt must not identify a review call.
     const quoted = ["You are a coding agent.", "", "", "", "", "", `${DSH_AUTO_REVIEW_SYSTEM_PREFIX} in this conversation.`].join("\n");
     assert.equal(isDshAutoReviewRequest("anthropic", anthropic(quoted, reviewSnapshot(SECTIONS))), false);
+    // The window itself, line by line: DSH_AUTO_REVIEW_HEAD_LINES is the whole
+    // contract of the tolerance, so pin BOTH ends of it — a future "just raise
+    // the constant" edit has to face the case it stops catching.
+    const sentenceAt = (line: number): string => {
+        const lines = ["You are a coding agent.", "body", "body", "body", "body", "body", "body"];
+        lines[line - 1] = `${DSH_AUTO_REVIEW_SYSTEM_PREFIX} in this conversation.`;
+        return lines.join("\n");
+    };
+    assert.equal(isDshAutoReviewRequest("anthropic", anthropic(sentenceAt(1), reviewSnapshot(SECTIONS))), true, "line 1 (the legacy pin) still matches");
+    assert.equal(isDshAutoReviewRequest("anthropic", anthropic(sentenceAt(5), reviewSnapshot(SECTIONS))), true, "line 5 is the last line inside the window");
+    assert.equal(isDshAutoReviewRequest("anthropic", anthropic(sentenceAt(6), reviewSnapshot(SECTIONS))), false, "line 6 is outside the window");
     // CRLF carriers (the reporter's host is Windows) read the same.
     assert.equal(isDshAutoReviewRequest("anthropic", anthropic(POLICY_RC1.replace(/\n/g, "\r\n"), reviewSnapshot(SECTIONS))), true);
     // Block-array system: systemCarrierTexts hands each block over separately, so
