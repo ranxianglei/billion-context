@@ -1659,7 +1659,7 @@ export function isMcpBiliCompress(toolName: string): boolean {
 // to keep a preceding compress pair visible instead of hiding it. Structural
 // param (only the two wire fields it reads) so it stays assignable to the
 // kernel's (msg: CoreMessage) => boolean Config field.
-function isStrandedProtectedPredecessor(m: { contentType?: string; thinkingSignature?: string; rawAnthropicBlock?: unknown }): boolean {
+export function isStrandedProtectedPredecessor(m: { contentType?: string; thinkingSignature?: string; rawAnthropicBlock?: unknown }): boolean {
   if (m.contentType === "reasoning") return typeof m.thinkingSignature === "string" && m.thinkingSignature.length > 0;
   return (m.rawAnthropicBlock as { type?: unknown } | undefined)?.type === "redacted_thinking";
 }
