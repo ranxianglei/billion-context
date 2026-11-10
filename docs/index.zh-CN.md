@@ -1,6 +1,6 @@
 # 文档总目录
 
-> 全部系统文档集中在 `docs/`。仓库根目录只保留四个入口文件：`README.md`、`README.zh-CN.md`、`AGENTS.md`、`CHANGELOG.md`。原根路径保留单行重定向占位（计划 1–2 个版本后删除，记账见 [lifecycle §5](lifecycle.md#5-卫生记录)）。
+> 全部系统文档集中在 `docs/`。仓库根目录只保留四个核心入口文件——`README.md`、`README.zh-CN.md`、`AGENTS.md`、`CHANGELOG.md`——外加受认可的社区 README 译本（`README.<locale>.md`，如 `README.ja.md`，批准于 2026-11-09 / #6000）。原根路径保留单行重定向占位（计划 1–2 个版本后删除，记账见 [lifecycle §5](lifecycle.md#5-卫生记录)）。
 > 惰性加载的施工参考（架构 / 环境变量 / 测试 / 发版 / git-pr）：[reference/](../reference/README.md)。
 
 ## 从这里开始

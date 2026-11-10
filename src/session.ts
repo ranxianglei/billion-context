@@ -4,15 +4,16 @@ import { log as loggerLog } from "./logger.js";
 import { getStore, effectiveFileStorageMode } from "./persist.js";
 import { VERSION } from "./version.js";
 import { maxSessions as knobMaxSessions, sessionWarmMax, sessionWarmMaxBytes, sessionResidentMaxBytes } from "./knobs.js";
-import { configFileEpoch, loadConfigFile } from "./config.js";
+import { configFileEpoch, loadConfigFile, loadNamedProviders } from "./config.js";
 import { applyCompressSettings, hasCompressSettings, resolveContextLimitValue } from "./compress-settings.js";
+import { agentProviderRecipes } from "./agent-providers.js";
 import { durableMessageToolPaths, withDurableProtection } from "./durable-message-guards.js";
 import type { AnonymousProvenance } from "./anon-provenance.js";
 import type { WireProtocol } from "./util.js";
 import type { InboundSlot, SeamSlot } from "./cache-ledger.js";
 import { isResponsesTurnSeparatorId } from "./turn-separator.js";
 import type { FoldReconcileResult } from "./fold-reconcile.js";
-import type { UnpromptedGate } from "./unprompted-gate.js";
+import type { UnpromptedGateState } from "./unprompted-gate.js";
 
 export type BlockView = { text: string; count: number };
 
@@ -337,12 +338,14 @@ export type Session = {
          *  In-memory only: the abort→resume causality spans one process
          *  lifetime, and a restart replants nothing. */
         abortReanchor?: { anchor: number; at: number };
-        /** #5683: the conversation's latest model-round compression-prompt facts
-         *  for the unprompted/out-of-bounds gates (src/unprompted-gate.ts).
-         *  Re-stamped on every prepare; in-memory only — a restart reads the
-         *  all-off default until the first round re-stamps, which is safe: no
-         *  tool call can reach applyRanges before its own round's prepare. */
-        unpromptedGate?: UnpromptedGate;
+        /** #5683/#5943: the conversation's live nudge CREDIT plus the policy
+         *  flags, for the unprompted/out-of-bounds gates (src/unprompted-gate.ts).
+         *  Re-stamped on every prepare (injected rounds re-mint the window,
+         *  un-nudged model rounds decay it); in-memory only — a restart lapses
+         *  any live credit to the all-off default until the first round
+         *  re-stamps, which is safe: no tool call can reach applyRanges before
+         *  its own round's prepare. */
+        unpromptedGate?: UnpromptedGateState;
         /** #5981: the last model stream on this conversation was CUT before its
          *  terminal event (src/plugin.ts emitUpstreamTruncation sites). A tool
          *  call dispatched out of such a stream can carry EMPTY arguments —
@@ -820,12 +823,18 @@ function staleEffectiveStamp(session: Session | undefined): boolean {
  *  Config without file settings, so returning it naked would drop every file
  *  knob between the edit and the session's next wire request. Provider/model
  *  cascade levels need the request URL and are deliberately NOT re-resolved
- *  here — the next wire request re-stamps the full cascade. */
+ *  here — the next wire request re-stamps the full cascade. The named-provider
+ *  recipe table IS resolved from the same live sources the request path feeds
+ *  resolveRequestConfig (agent-registry layer under file recipes — see
+ *  server/handle.ts): applyCompressSettings expands global-level
+ *  externalSummary "provider/model" references against that table at resolve
+ *  time, so an empty table disables every valid chain for the whole stale
+ *  window (#5912). */
 function liveFileOverlayConfig(base: Config): Config {
     const compress = loadConfigFile().compress;
     if (!compress || !hasCompressSettings(compress)) return base;
     const limit = resolveContextLimitValue(compress.modelContextLimit, base.modelContextLimit);
-    return applyCompressSettings(base, limit, compress, {});
+    return applyCompressSettings(base, limit, compress, { ...agentProviderRecipes(), ...loadNamedProviders() });
 }
 
 export function effectiveConfig(session: Session | undefined, fallback: Config): Config {
