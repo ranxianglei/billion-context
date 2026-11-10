@@ -41,6 +41,11 @@ import { startAdvisoryWatcher, getAdvisoryState, advisoryDeferring, advisoryBloc
 import { startReleaseNotesWatcher } from "./update-notes.js";
 import { startRemoteNoticesWatcher } from "./remote-notices.js";
 import { hydrateNoticeReceipts } from "./notice-store.js";
+import { hydrateHostPluginDismissals } from "./host-plugin-notice.js";
+import { hydrateResignPending } from "./apig-resign.js";
+import { hydrateRolloutIdentity } from "./rollout.js";
+import { hydrateOrderUnified } from "./order-persist.js";
+import { hydrateAffinityUnified } from "./affinity-persist.js";
 import { resolveProxy } from "./upstream-proxy.js";
 import { runMcpStdio } from "./mcp.js";
 import { PLUGIN_AGENTS, isPluginAgent, pluginInstall, pluginRemove, pluginStatusAll, pluginUpdate, renderPluginList, warnActivePluginSessions, type PluginAgent } from "./plugin-install.js";
@@ -617,7 +622,7 @@ export async function main(): Promise<void> {
     }
     if (command === "acp-cache") {
         try {
-            const report = runDiff(acpCacheDir!, { logFile: acpCacheLog, noLog: acpCacheNoLog, session: acpCacheSession });
+            const report = await runDiff(acpCacheDir!, { logFile: acpCacheLog, noLog: acpCacheNoLog, session: acpCacheSession });
             process.stdout.write(jsonOutput ? renderJson(report) : renderText(report));
         } catch (error) {
             console.error(`bili acp-cache: ${error instanceof Error ? error.message : String(error)}`);
@@ -685,7 +690,7 @@ export async function main(): Promise<void> {
                     packageName: PACKAGE_NAME,
                     resolveProxy: updaterResolveProxy,
                     updateTag,
-                    globalCheck: () => checkForUpdate({ packageName: PACKAGE_NAME, currentVersion: VERSION, autoUpdate: true, resolveProxy: updaterResolveProxy, updateTag }, true),
+                    globalCheck: async () => { await checkForUpdate({ packageName: PACKAGE_NAME, currentVersion: VERSION, autoUpdate: true, resolveProxy: updaterResolveProxy, updateTag }, true); },
                     log: (_level, msg) => console.log(msg),
                 });
                 for (const line of lines) console.log(line);
@@ -963,4 +968,13 @@ export async function main(): Promise<void> {
     // #5548: notice dismissal receipts ride the unified storage — hydrate the
     // in-memory view once at boot (and migrate any legacy JSON file one time).
     void hydrateNoticeReceipts();
+    // #5753: the same carrier rules now cover host-plugin dismissals, the
+    // apig-resign pending queue, the rollout install id, and the session-order
+    // + prefix-affinity snapshots. All no-op on legacy-only instances and
+    // before anything created the storage singleton.
+    void hydrateHostPluginDismissals();
+    void hydrateResignPending();
+    void hydrateRolloutIdentity();
+    void hydrateOrderUnified();
+    void hydrateAffinityUnified();
 }

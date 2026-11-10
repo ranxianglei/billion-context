@@ -14,6 +14,7 @@ export interface SseSink {
     write(chunk: string | Uint8Array): unknown;
     end(): void;
     once(event: "drain" | "close" | "error", cb: () => void): unknown;
+    removeListener?(event: "close" | "error", cb: () => void): unknown;
 }
 
 /** Guard against OpenAI gpt-5.x/gpt-6.x "lattice" reasoning truncation (#739): these
@@ -450,17 +451,28 @@ function cloneUsage(u: Usage | null): Usage | null {
     return JSON.parse(JSON.stringify(u)) as Usage;
 }
 
-async function pipeThroughRaw(stream: ReadableStream<Uint8Array>, res: SseSink): Promise<void> {
+export async function pipeThroughRaw(stream: ReadableStream<Uint8Array>, res: SseSink): Promise<void> {
     const reader = stream.getReader();
+    let completed = false;
+    const cancel = (): void => { void reader.cancel().catch(() => {}); };
+    res.once("close", cancel);
+    res.once("error", cancel);
     try {
+        if (res.destroyed || res.writableEnded) return;
         for (;;) {
             const { done, value } = await reader.read();
-            if (done) break;
+            if (done) {
+                completed = true;
+                break;
+            }
             if (res.destroyed || res.writableEnded) break;
             res.write(value);
             if (res.writableNeedDrain) await awaitDrain(res);
         }
     } finally {
+        res.removeListener?.("close", cancel);
+        res.removeListener?.("error", cancel);
+        if (!completed) cancel();
         reader.releaseLock();
         if (!res.writableEnded) res.end();
     }
