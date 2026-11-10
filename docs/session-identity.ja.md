@@ -104,10 +104,10 @@ credentials、中継、プロトコル変換 — でセッションを分割す�
   優雅に非活性化し、フル再生はそれを復活させる（`tests/truncation-fork.test.ts`
   でピン留め）。
 
-切り捨てランのスキャンは帰属形態としてのみ生存する：先頭 `TRUNCATION_LINEAGE_
-WINDOW = 8` ランが追跡チェーンの内部（offset ≥ 1）に厳密に含まれる NEW
-セッションは `lineage: { reason: "truncated", parents }` を記録；共有先頭プレ
-フィックス（LCP ≥ `MIN_FORK_PREFIX = 3`）があれば代わりに
+切り捨てランのスキャンは帰属形態としてのみ生存する：先頭
+`TRUNCATION_LINEAGE_WINDOW = 8` ランが追跡チェーンの内部（offset ≥ 1）に厳密に
+含まれる NEW セッションは `lineage: { reason: "truncated", parents }` を記録；
+共有先頭プレフィックス（LCP ≥ `MIN_FORK_PREFIX = 3`）があれば代わりに
 `reason: "forked"` を記録し優先される。Lineage は UI/debug 用にログされて保存
 されるが**マッチングには決して影響しない**。
 
