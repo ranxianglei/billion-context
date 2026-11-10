@@ -1191,9 +1191,18 @@ async function driveHostCompact(wire: Wire, ctx: number): Promise<void> {
             state.suppressTrigger = false;
         };
         // 1) seed: 12 fat turns — at least one proxy-side fold lands
+        // (#5765: 6KB -> 5.5KB per seed turn. The always-on retire/restore/
+        // rewrite tool schemas add ~2.6KB to every forwarded body, which pushed
+        // the second-phase seed body past the 64KB demand threshold ONE body
+        // earlier (66.9KB vs 65.5KB at body #11) — the seed fold then landed
+        // one turn ahead of the #2695 geometry the zombie-settle bound and the
+        // rearm-shrink pins were measured against, cascading into a different
+        // ref allocation after decimation (rearm fold at body #22 then dropped
+        // 2 elements instead of 4). 5.5KB/turn restores the master-aligned
+        // fold turns with ~2.4KB of head-room under the threshold.)
         if (wire === "chat") hist.push({ role: "system", content: "You are a coding agent operating in a sandbox." });
         for (let t = 0; t < 12; t++) {
-            pushUser(`Turn ${t}: please analyze module ${t}. ` + FILLER(t, 6));
+            pushUser(`Turn ${t}: please analyze module ${t}. ` + FILLER(t, 5.5));
             await send(t, false);
         }
         assert.ok(trigger.calls() >= 1, `${wire}: seed must land >=1 fold (got ${trigger.calls()})`);

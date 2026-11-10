@@ -136,10 +136,13 @@ function startMockUpstream(): Promise<{ server: http.Server; port: number; stats
             }
             stats.streamingForwards += 1;
             stats.imagesSeen += (raw.match(/"input_image"/g) ?? []).length;
-            // A believable vision encoder: ~3k tokens per screenshot on top of
-            // whatever text rides along — NOT the 150k/image the bytes prior
-            // claims for these fixtures.
-            const inputTokens = raw.includes('"input_image"') ? 8000 : 6617;
+            // A believable vision encoder: bills whatever text rides along plus the
+            // screenshots — NOT the 150k/image the bytes prior claims for these fixtures.
+            // #5765: the forwarded body now carries ~657 more est-tokens of always-on tool
+            // schema than the pre-#5765 surface, and a real encoder bills what it receives —
+            // both constants shift by that delta so the learned per-image cost lands where
+            // the (1500, 5000) sanity bound below was calibrated (1813.5 on master).
+            const inputTokens = raw.includes('"input_image"') ? 8657 : 7274;
             res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
             res.write(`event: response.completed\ndata: ${JSON.stringify({ response: { id: "resp_done", status: "completed", output: [], usage: { input_tokens: inputTokens, output_tokens: 5, total_tokens: inputTokens + 5 } } })}\n\n`);
             res.end();

@@ -36,18 +36,30 @@ import { listSessions } from "../src/session.ts";
 //   idx 1..2   assistant foldable 2697 chars   \
 //   idx 3..4   assistant PROTECTED 2562 chars  | c1 = [0..7] by token packing
 //   idx 5..7   assistant foldable 2697 chars   /   (8 + 6x675 = 4733 <= 4800),
-//   idx 8      assistant PROTECTED 2562 chars    mid = 3 -> BOTH raw halves
+//   idx 8      assistant PROTECTED 207 chars     mid = 3 -> BOTH raw halves
 //   idx 9      assistant foldable 2697 chars     [4..7]/[0..3] touch the pair
-//   idx 10..14 assistant tail 358 chars          -> recent zone (M=1000 grows
+//   idx 10..14 assistant tail 294 chars          -> recent zone (M=1000 grows
 //   idx 15     latest user msg                    backward; endpoint drifts +-1)
-// est ~10.7k tok vs 8000: gap (< old-region mass) so the #1841/#330 strict
-// walk runs UNRELAXED; overshoot ~1.3x stays far below the emergency-digest
+// est ~10.9k tok vs 8000 (post-#5765 retune): gap (< old-region mass) so the #1841/#330
+// strict walk runs UNRELAXED; overshoot ~1.3x stays far below the emergency-digest
 // coverage bound (19.2x), so the LLM summary path is exercised. c1's body
 // (~13.6k chars, protected pair excluded) exceeds FAIL_ABOVE_CHARS; the
 // snapped halves ([0..2] ~5.4k chars, [5..7] ~8.1k chars) sit inside
 // [minCompressRange 5000, FAIL_ABOVE). idx 8 is protected so the residual
 // chunk after c1 carries < minCompressRange of effective mass no matter where
 // the recent-zone endpoint lands — nothing besides the snapped halves can fold.
+// Post-fix (master): both halves snap past the protected rim, fold, and the
+// post-fold payload lands ~7.6k tok — ~400 tok under the 8k window. #5765:
+// the always-on retire/restore/rewrite tool schemas add ~0.66k est-tokens to
+// every responses body, which ate that margin and left the post-fold payload
+// ~186 tok OVER the window (502 + a tier-distillation call that carried a
+// protected message). Retuned: idx 8 2562 -> 207 chars (it is BLOCKED — no
+// compressible slot — so its size never touches the walk geometry) and the
+// tail 358 -> 294 chars; 74 tok per tail keeps the 1000-tok zone walk
+// stopping at idx9 exactly as on master (5x74+5+675 = 1050 >= 1000, 50-tok
+// slack — below that idx7 would join the zone and c1 would shrink). The two
+// trims cut surviving, never-folded mass and restore the pre-#5765 post-fold
+// geometry without touching c1's packing (idx 0..7 unchanged).
 // Pre-fix: both halves carry a BLOCKED boundary -> preview rejects both ->
 // nothing folds -> payload stays over-window -> 502 (#4079: no marker is written anymore).
 // Post-fix: halves snap past the protected rim, fold, payload fits -> 200.
@@ -150,12 +162,15 @@ function foldText(i: number): string {
     return `Assistant analysis part ${i}. ` + `FOLD_${i}_payload_`.repeat(178);
 }
 
-function protectText(i: number): string {
-    return `Protected segment ${i} ${PROTECT_MARKER} stays visible. ` + `PROT_${i}_payload_`.repeat(167);
+function protectText(i: number, repeat: number = 167): string {
+    return `Protected segment ${i} ${PROTECT_MARKER} stays visible. ` + `PROT_${i}_payload_`.repeat(repeat);
 }
 
 function tailText(i: number): string {
-    return `Tail segment ${i} near the recent zone. ` + `TAIL_${i}_payload_`.repeat(20);
+    // #5765: 358 -> 294 chars (74 tok) — saves ~80 est-tokens of never-folded
+    // tail content in the post-fold payload while keeping the 1000-tok zone
+    // walk stopped at idx9 (5x74+5+675 = 1050 >= 1000 with 50-tok slack).
+    return `Tail segment ${i} near the recent zone. ` + `TAIL_${i}_payload_`.repeat(16);
 }
 
 function buildInput() {
@@ -172,7 +187,7 @@ function buildInput() {
         item("assistant", foldText(5)),
         item("assistant", foldText(6)),
         item("assistant", foldText(7)),
-        item("assistant", protectText(8)),
+        item("assistant", protectText(8, 10)),
         item("assistant", foldText(9)),
         item("assistant", tailText(10)),
         item("assistant", tailText(11)),

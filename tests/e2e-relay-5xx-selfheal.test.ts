@@ -37,7 +37,7 @@ import { listSessions, type Session } from "../src/session.ts";
 
 const WINDOW = 32_000;
 const RELAY_WINDOW = 29_500; // the relay's hidden tolerance (tokens, chars/4)
-const BIG = 12_000; // chars per tool_result (well over minOutputTokens 1000)
+const BIG = 11_700; // chars per tool_result (well over minOutputTokens 1000; #5765: the always-on retire/restore/rewrite tool schemas added ~0.7k tokens to every body — trims the body back to the intended ~97% of window)
 const STEPS = 9; // big tool steps (outside the protected recent zone)
 
 const RELAY_ERROR_BODY = JSON.stringify({

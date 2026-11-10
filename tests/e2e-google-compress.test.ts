@@ -180,9 +180,16 @@ function startMockGemini(state: RelayState, threshold: number = LIVE_BYTES_THRES
                                     content: [
                                         {
                                             startId: refIds[2]!,
-                                            endId: refIds[refIds.length - 10]!,
+                                            // #5765: the range was originally refIds[2]..refIds[len-10]. Two surface shifts broke it:
+                                            // (1) the always-on tool schemas add ~2.7KB/body, so the byte threshold is now crossed one
+                                            //     message earlier (len=12 instead of 14) — the old expression then selected a single
+                                            //     message, which the fold refuses (min 1000 chars). The max(…, 4) floor keeps >=3 messages.
+                                            // (2) compressing only 4 messages per cycle shrank the body less than one turn re-added it, so the
+                                            //     peak ratcheted +~240B/cycle until the final 2× client-history assertion flipped. Keeping a
+                                            //     ~5-ref tail (len-6) instead makes each fold out-earn the growth and the payload truly bounded.
+                                            endId: refIds[Math.max(refIds.length - 6, 4)]!,
                                             topic: "google grow compress e2e",
-                                            summary: `${SUMMARY_TEXT} — ${refIds[2]!}..${refIds[refIds.length - 10]!}`,
+                                            summary: `${SUMMARY_TEXT} — ${refIds[2]!}..${refIds[Math.max(refIds.length - 6, 4)]!}`,
                                         },
                                     ],
                                 },

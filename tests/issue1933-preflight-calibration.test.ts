@@ -340,7 +340,7 @@ test("e2e F1: a relay billing below the local estimator teaches k̂<1 — the ca
 test("e2e F2: a route switch demotes the stale usage-baseline — the small post-switch request is not folded", async () => {
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
-    const a = makeUpstream(1.4);
+    const a = makeUpstream(1.5);
     const b = makeUpstream(1.0);
     a.server.listen(0, "127.0.0.1");
     await once(a.server, "listening");
@@ -356,13 +356,17 @@ test("e2e F2: a route switch demotes the stale usage-baseline — the small post
     const proxyPort = (proxy.address() as { port: number }).port;
 
     try {
-        // Turn 1 on route A: the relay bills 1.4x the local estimate, so its
-        // usage report lands ABOVE the 20k window target even though the local
-        // estimate (~16k incl. overhead) stayed under it — no trigger, forward.
+        // Turn 1 on route A: the relay bills 1.5x the local estimate, so its
+        // usage report (~21k) lands ABOVE the 20k window target even though the
+        // local estimate (~18.5k incl. overhead) stayed under it — no trigger,
+        // forward. (#5765: the always-on retire/restore/rewrite tool schemas
+        // added ~0.7k tokens to every body — 15→14 messages keeps the estimate
+        // under the target with the original ~1.5k margin; 1.5x × 14×4000/4
+        // bills the same 21k the 1.4x × 15×4000/4 shape did.)
         const r1 = await fetch(`http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${portA}/chat/completions`, {
             method: "POST",
             headers: { "content-type": "application/json", "x-acp-session": "i1933-f2" },
-            body: JSON.stringify({ model: "gpt-test", stream: true, messages: longMessages(15, 4000) }),
+            body: JSON.stringify({ model: "gpt-test", stream: true, messages: longMessages(14, 4000) }),
         });
         assert.equal(r1.status, 200, `turn 1 must forward: HTTP ${r1.status}`);
         await r1.text();
