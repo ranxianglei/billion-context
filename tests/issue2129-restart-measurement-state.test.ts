@@ -332,7 +332,7 @@ test("e2e: restart restores k̂ + usage anchor — the over-raw resend forwards 
             assert.equal(env.payload.stats?.localInputEstimate, preRestart.est, "per-turn estimate must be on disk after restart");
             assert.ok(env.payload.metadata?.anonymousPrefixAffinity, "PFA stamp must be on disk after restart");
         } catch (err) {
-            // #5381: unreproducible locally — on failure dump what landed on disk vs. what
+            // #5379: unreproducible locally — on failure dump what landed on disk vs. what
             // was set so the next occurrence self-diagnoses; each read is guarded so a
             // lazy-metadata proxy trap can't mask the real assertion error.
             const diag = (label: string, get: () => unknown): void => {
