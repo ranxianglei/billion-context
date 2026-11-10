@@ -23,6 +23,10 @@ interface FunctionCallBuffer {
     callId: string;
     name: string;
     arguments: string;
+    // #6056: positional identity of the item within this response. Copilot
+    // rotates function_call item ids across lifecycle events (added vs done);
+    // output_index stays stable, so it is the fallback correlation key.
+    outputIndex?: number;
 }
 
 // Upstream rejects Responses input item ids longer than 64 chars. All
@@ -338,7 +342,7 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
             const devParts = projection && projection.systemParts.length > 0
                 ? [...projection.systemParts, systemPrompt]
                 : [systemPrompt];
-            const withDev = injectResponsesDeveloperMessage(inputItems, devParts.join("\n\n---\n\n"));
+            const withDev = injectResponsesDeveloperMessage(inputItems, devParts.join("\n\n---\n\n"), projection?.headRole ?? "developer");
             const finalInput = notes && notes.length > 0
                 ? [...withDev, ...notes.map((text) => ({ type: "message" as const, role: "user" as const, content: text }))]
                 : withDev;
@@ -356,6 +360,24 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
 
         async *parseStream(upstream, round) {
             const pending = new Map<string, FunctionCallBuffer>();
+            // #6056: resolve a buffered ACP function_call by its event identifiers.
+            // The primary key is the item id, but Copilot rotates function_call item
+            // ids across lifecycle events (added vs done) while call_id and
+            // output_index stay stable — a direct id lookup misses and the proxy-owned
+            // ACP call would leak into the client's native dispatcher. Fall back to
+            // those stable keys before giving up. `pending` holds only concurrent
+            // in-flight ACP calls, so a linear scan is cheap.
+            const resolvePending = (itemId: string, callId?: string, outputIndex?: number): FunctionCallBuffer | undefined => {
+                if (itemId) {
+                    const direct = pending.get(itemId);
+                    if (direct) return direct;
+                }
+                for (const buf of pending.values()) {
+                    if (outputIndex !== undefined && buf.outputIndex === outputIndex) return buf;
+                    if (callId && buf.callId && buf.callId === callId) return buf;
+                }
+                return undefined;
+            };
             // #1501 option C: nameless function_call items fall into raw replay
             // below — their bytes reach the client untouched (#1039). Track them
             // so the round-end settle can emit one diag warn (#1484 class); the
@@ -490,6 +512,7 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                                 callId: typeof item.call_id === "string" ? item.call_id : "",
                                 name: fcName,
                                 arguments: "",
+                                outputIndex: typeof obj.output_index === "number" ? obj.output_index : undefined,
                             });
                         } else {
                             if (fcName.length === 0) {
@@ -546,7 +569,10 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                 } else if (type === "response.function_call_arguments.delta") {
                     const itemId = typeof obj.item_id === "string" ? obj.item_id : "";
                     const delta = typeof obj.delta === "string" ? obj.delta : "";
-                    const fc = pending.get(itemId);
+                    // #6056: correlate by item id first, then the stable output_index —
+                    // Copilot rotates function_call item ids across lifecycle events, so a
+                    // direct lookup misses and the ACP argument bytes would leak to the client.
+                    const fc = resolvePending(itemId, undefined, typeof obj.output_index === "number" ? obj.output_index : undefined);
                     if (fc) fc.arguments += delta;
                     else {
                         const nf = namelessFc.get(itemId);
@@ -556,7 +582,7 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                 } else if (type === "response.function_call_arguments.done") {
                     const itemId = typeof obj.item_id === "string" ? obj.item_id : "";
                     const args = typeof obj.arguments === "string" ? obj.arguments : "";
-                    const fc = pending.get(itemId);
+                    const fc = resolvePending(itemId, undefined, typeof obj.output_index === "number" ? obj.output_index : undefined);
                     if (fc && args) fc.arguments = args;
                     else {
                         const nf = namelessFc.get(itemId);
@@ -570,10 +596,18 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                     const item = obj.item as Record<string, unknown> | undefined;
                     if (item?.type === "function_call") {
                         const itemId = typeof item.id === "string" ? item.id : "";
-                        const fc = pending.get(itemId);
+                        const doneName = typeof item.name === "string" ? item.name : "";
+                        const doneCallId = typeof item.call_id === "string" ? item.call_id : "";
+                        // #6056: resolve by item id first, then the stable call_id /
+                        // output_index — Copilot rotates function_call item ids across
+                        // lifecycle events, so a direct lookup misses and the proxy-owned
+                        // ACP call would leak into the client's native dispatcher (the
+                        // reported "Tool ... not found").
+                        const fc = resolvePending(itemId, doneCallId || undefined, typeof obj.output_index === "number" ? obj.output_index : undefined);
                         if (fc) {
                             if (typeof item.arguments === "string" && item.arguments) fc.arguments = item.arguments;
-                            pending.delete(itemId);
+                            // Delete by the BUFFERED id, not the done event's (possibly rotated) id.
+                            pending.delete(fc.itemId);
                             toolCallsEmitted++;
                             // #1039 invariant: arguments are user intent, verbatim — see tag-echo-filter.ts header.
                             yield {
@@ -582,10 +616,23 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                                 callId: fc.callId,
                                 arguments: fc.arguments,
                             } as ParsedStreamEvent;
+                        } else if (doneName.length > 0 && (PROXY_TOOL_NAMES.has(doneName) || doneName === absorbName)) {
+                            // #6056 safety net: an ACP-named call that was never buffered
+                            // (nameless or otherwise uncorrelatable added event). It is bili's
+                            // own surface — intercept it server-side and NEVER forward the raw
+                            // done to the client dispatcher. Consistent with the tracking
+                            // decision at added time, so no legitimate native tool is caught.
+                            toolCallsEmitted++;
+                            yield {
+                                kind: "tool_call",
+                                name: doneName,
+                                callId: doneCallId,
+                                arguments: typeof item.arguments === "string" ? item.arguments : "",
+                            } as ParsedStreamEvent;
                         } else {
-                            if (typeof item.name !== "string" || item.name.length === 0) {
+                            if (doneName.length === 0) {
                                 const nf = namelessFc.get(itemId) ?? { callId: "", argsLen: 0, frags: 0 };
-                                nf.callId = typeof item.call_id === "string" ? item.call_id : nf.callId;
+                                nf.callId = doneCallId || nf.callId;
                                 if (typeof item.arguments === "string") nf.argsLen = item.arguments.length;
                                 nf.frags++;
                                 namelessFc.set(itemId, nf);
@@ -594,8 +641,8 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                             toolCallsEmitted++;
                             yield {
                                 kind: "tool_call",
-                                name: typeof item.name === "string" ? item.name : "",
-                                callId: typeof item.call_id === "string" ? item.call_id : "",
+                                name: doneName,
+                                callId: doneCallId,
                                 arguments: typeof item.arguments === "string" ? item.arguments : "",
                                 passthrough: true,
                             } as ParsedStreamEvent;
