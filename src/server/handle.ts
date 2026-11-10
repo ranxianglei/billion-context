@@ -1206,16 +1206,18 @@ async function handleRequest(
             const openaiLike = protocol === "openai" || protocol === "anthropic" ? (parsed as { messages?: unknown }).messages : undefined;
             if (Array.isArray(openaiLike) && openaiLike.length > 0) {
                 const messageRoles = (openaiLike as Array<{ role?: unknown }>).map((m) => (typeof m?.role === "string" ? m.role : ""));
-                // #6011: per-message content fingerprints for sidechain attribution —
-                // the same text projection the JSONL side applies to its rows.
-                const messageFingerprints = fingerprintMessageTexts(openaiLike) ?? undefined;
                 const harvested = harvestIdentity({
                     sessionId: zcodeParentIdentity.value,
                     expectedLen: openaiLike.length,
                     remoteAddress: req.socket.remoteAddress,
                     headers: req.headers as Record<string, string | string[] | undefined>,
                     messageRoles,
-                    messageFingerprints,
+                    // #6011: LAZY — the registry invokes this only after every
+                    // gate passed and the claude adapter matched a file that
+                    // contains sidechain rows (same text projection the JSONL
+                    // side applies to its rows); unharvested requests pay no
+                    // sha256 at all.
+                    computeMessageFingerprints: () => fingerprintMessageTexts(openaiLike) ?? undefined,
                 });
                 if (harvested !== null) {
                     inboundMsgIds = [...harvested.ids];

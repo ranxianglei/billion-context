@@ -83,13 +83,16 @@ export interface IdentityHarvestCtx {
     /** Wire roles of the outbound messages, for cheap boundary verification
      *  when an adapter can map its stored rows onto wire roles. */
     messageRoles?: readonly string[] | undefined;
-    /** #6011: per-message content fingerprints (fingerprintText of the
+    /** #6011: LAZY per-message content fingerprints (fingerprintText of the
      *  extracted plain text, wire order) for adapters that must attribute a
      *  request to ONE of several same-shaped stored threads — role patterns
-     *  alone cannot tell parallel subagent runs apart. Optional: a source
-     *  that needs them degrades the turn when they are absent (whole-turn
-     *  contract); sources that don't need them ignore the field. */
-    messageFingerprints?: readonly string[] | undefined;
+     *  alone cannot tell parallel subagent runs apart. The provider is
+     *  invoked only after every registry gate has passed and this source's
+     *  matches() agreed, so requests that will not be harvested pay no
+     *  hashing at all (#6011 review). Optional: a source that needs them
+     *  degrades the turn when they are absent (whole-turn contract); sources
+     *  that don't need them never invoke it. */
+    computeMessageFingerprints?: (() => readonly string[] | undefined) | undefined;
 }
 
 /** #6011: the comparable plain text of one wire message's content, across
