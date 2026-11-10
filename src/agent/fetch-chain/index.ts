@@ -281,7 +281,16 @@ export function installFetchChain(makeDispatch: (send: typeof globalThis.fetch) 
                 return;
             }
             // Eviction: foreign value, non-function value, deleted, or accessorized.
-            const current = typeof globalThis.fetch === "function" ? globalThis.fetch : undefined;
+            // #5959 review: a hostile GETTER can throw on read — swallow it the
+            // same way the write side below does (an uncaughtException out of
+            // the timer callback kills the host process).
+            let current: typeof globalThis.fetch | undefined;
+            try {
+                const v: unknown = globalThis.fetch;
+                if (typeof v === "function") current = v as typeof globalThis.fetch;
+            } catch {
+                current = undefined;
+            }
             if (givenUp) {
                 if (current === undefined) return; // still nothing usable — stay quiet
                 givenUp = false; // a live fetch reappeared — resume normal repair

@@ -778,6 +778,41 @@ test("#5959: a hostile accessor that swallows every write gives up loudly — an
     }
 });
 
+test("#5959 review: a throwing getter eviction cannot escape the watchdog timer", async () => {
+    const saved = globalThis.fetch;
+    const preSink: string[] = [];
+    const preFake = fakeFetch(preSink);
+    const { _resetForTest } = await import("../src/agent/native-intercept.js");
+    Object.defineProperty(globalThis, "fetch", { value: preFake, writable: true, configurable: true, enumerable: true });
+    _resetForTest({ anchor: preFake }); // deterministic heal target below
+    try {
+        const { lines } = await withDiagnosticsCapture(async () => {
+            installNativeFetchIntercept({ origin: "http://127.0.0.1:40001", ready: Promise.resolve("http://127.0.0.1:40001") });
+            const installed = globalThis.fetch;
+            // Hostile shape beyond the swallowing setter: the GETTER itself throws.
+            Object.defineProperty(globalThis, "fetch", {
+                get: () => { throw new TypeError("fetch observer disabled"); },
+                configurable: true,
+                enumerable: true,
+            });
+            // Pre-fix the throw escaped the check into the setInterval callback
+            // (uncaughtException → host process death).
+            assert.doesNotThrow(() => tick());
+            const d = Object.getOwnPropertyDescriptor(globalThis, "fetch");
+            assert.ok(d !== undefined && "value" in d, "the heal converts the slot back to a data property");
+            assert.notEqual(globalThis.fetch, installed); // re-anchored over the surviving fetch
+            const res = await globalThis.fetch("http://127.0.0.1:8199/v1/messages", { method: "POST" });
+            assert.equal(res.status, 200); // the healed chain routes model traffic
+        });
+        assert.deepEqual(preSink, ["http://127.0.0.1:40001/bili/http://127.0.0.1:8199/v1/messages"]);
+        assert.ok(lines.some(l => l.includes("[warn]") && l.includes("lost the bili install (#2791)")),
+            `expected the eviction warn line, got: ${lines.join(" | ")}`);
+    } finally {
+        Object.defineProperty(globalThis, "fetch", { value: saved, writable: true, configurable: true, enumerable: true });
+        _resetForTest();
+    }
+});
+
 // #5907: the no-guard postures (env escape hatch / non-configurable host
 // property) are exactly where a third-party replacement silently un-routes
 // model traffic — pin that each one names the degraded posture in bili.log
