@@ -117,8 +117,9 @@ test("WS cache diagnostics: fingerprints describe exact egress, deltas and recon
             assert.equal(row.connection, i === 3 ? 2 : 1);
         }
         assert.deepEqual(sends.map(row => row.mode), ["full", "delta", "full", "full"]);
-        assert.equal(sends[0].request_sha256, sends[0].frame_sha256);
-        assert.equal(sends[1].request_sha256, hash(JSON.stringify({ ...settings, input: secondInput, ...transportFields, type: "response.create" })));
+        // The send record is an allowlist. A hash of the full effective request is deliberately
+        // absent: it costs a second full-body serialization on every send, including deltas.
+        for (const row of sends) assert.deepEqual(Object.keys(row).sort(), ["connection", "frame_sha256", "mode", "phase", "previous_response_id_sha256", "send", "settings_sha256"]);
         assert.equal(sends[0].settings_sha256, sends[1].settings_sha256);
         assert.notEqual(sends[1].settings_sha256, sends[2].settings_sha256);
         assert.deepEqual(sends.map(row => row.previous_response_id_sha256), [null, hash("resp_first"), null, null]);
