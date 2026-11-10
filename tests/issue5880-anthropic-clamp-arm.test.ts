@@ -66,7 +66,7 @@ function makeSession(lastInputTokens: number, source: Session["stats"]["lastInpu
         blockContents: new Map(),
         inFlight: 0,
         persisted: false,
-    } as unknown as Session & Record<never, never>;
+    } as unknown as Session;
 }
 
 test("#5880 unit: an active overflow-arm tag survives the post-rebuild anchor write", () => {
