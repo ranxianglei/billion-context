@@ -699,6 +699,19 @@ fallback — read only while the section is absent, ignored once it exists.
 Full field table and the `PI_ACP_DELEGATE_*` env overrides:
 configuration.md → [`pi`](configuration.md#pi).
 
+**Nudge debug (see the injected text verbatim).** With the global debug
+switch on (`ACP_DEBUG=1`, or `"debug": true` in the config file), every nudge
+the proxy injects mid-compression is mirrored into the pi transcript as a
+transcript-only entry: a `[bili-nudge] <protocol>/<kind> tier=… reason=…`
+label above the verbatim wire text — exactly the ephemeral trailing user
+message the model reads that turn. The entry is a pi `CustomEntry`, which
+never enters the LLM context (pi's session-context build ignores
+`type:"custom"`), so only the human sees it; nothing is added to any re-sent
+history. Pi inline mode only — in spawn/attach the proxy is a separate
+process and the view is unavailable. Covers the Anthropic and OpenAI wire
+lanes (the two pi reaches over HTTP); on hosts without
+`registerEntryRenderer`/`appendEntry` the feature degrades to absent.
+
 **How routing works.** The pi extension bootstraps (or attaches to) its own
 proxy and patches `globalThis.fetch` in-process: every model-API HTTP request
 is rewritten to `<proxy>/bili/<upstream-url>`, and the extension stamps the

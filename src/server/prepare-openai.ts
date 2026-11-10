@@ -13,6 +13,7 @@ import { applyReasoningDrop, diagNudge, diagTagSummary, deriveTitle, effectiveTo
 import { recordNudgeObservation } from "../context-analysis.js";
 import { yieldToEventLoop } from "../yield-loop.js";
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, resolveDecisionRange, stripDecisionReasoningFields, type DecideConfig } from "../nudge-decide.js";
+import { emitNudgeInjected } from "../nudge-debug.js";
 import { excludeDeadRefRanges } from "../acp-status.js";
 import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "../fold-reconcile.js";
 import { maybeSnapshotView } from "./snapshot-render.js";
@@ -491,8 +492,10 @@ export async function prepareOpenai(
                     const rendered = renderNudgeText(turn.nudge, prompts, surface?.nudgeSections, "openai");
                     const renderedWithPayload = rendered.text;
                     if (rendered.text) {
-                        rebuiltMessages = [...rebuiltMessages, { role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withFirstSightDrain(renderedWithPayload, turn.nudge.reason, externalSummaryEnabled(config)), externalSummaryEnabled(config)), visibilityMarkers) }];
+                        const wireText = withMarkerIntegrityNote(withSummaryBudgetNote(withFirstSightDrain(renderedWithPayload, turn.nudge.reason, externalSummaryEnabled(config)), externalSummaryEnabled(config)), visibilityMarkers);
+                        rebuiltMessages = [...rebuiltMessages, { role: "user", content: wireText }];
                         nudgeOutcome = "injected";
+                        emitNudgeInjected({ sessionId, protocol: "openai", kind: "fallback", tier: turn.nudge.tier, reason: turn.nudge.reason, text: wireText, ts: Date.now() });
                     } else {
                         nudgeOutcome = "skipped";
                     }
@@ -512,8 +515,10 @@ export async function prepareOpenai(
                 if (outcome.kind === "yes") {
                     const span = resolveDecisionRange(outcome, ranges);
                     if (span) {
-                        rebuiltMessages = [...rebuiltMessages, { role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withFirstSightDrain(buildDirectiveText(span.startRef, span.endRef, outcome.topic), turn.nudge.reason, externalSummaryEnabled(config)), externalSummaryEnabled(config)), visibilityMarkers) }];
+                        const wireText = withMarkerIntegrityNote(withSummaryBudgetNote(withFirstSightDrain(buildDirectiveText(span.startRef, span.endRef, outcome.topic), turn.nudge.reason, externalSummaryEnabled(config)), externalSummaryEnabled(config)), visibilityMarkers);
+                        rebuiltMessages = [...rebuiltMessages, { role: "user", content: wireText }];
                         nudgeOutcome = "injected";
+                        emitNudgeInjected({ sessionId, protocol: "openai", kind: "directive", tier: turn.nudge.tier, reason: turn.nudge.reason, text: wireText, ts: Date.now() });
                     } else {
                         nudgeOutcome = "skipped";
                         log("info", `[${sessionId}] [acp-decide] yes but no live range left to target — skipping injection`);
@@ -530,8 +535,10 @@ export async function prepareOpenai(
                     const rendered = renderNudgeText(turn.nudge, prompts, surface?.nudgeSections, "openai");
                     const renderedWithPayload = rendered.text;
                     if (rendered.text) {
-                        rebuiltMessages = [...rebuiltMessages, { role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withFirstSightDrain(renderedWithPayload, turn.nudge.reason, externalSummaryEnabled(config)), externalSummaryEnabled(config)), visibilityMarkers) }];
+                        const wireText = withMarkerIntegrityNote(withSummaryBudgetNote(withFirstSightDrain(renderedWithPayload, turn.nudge.reason, externalSummaryEnabled(config)), externalSummaryEnabled(config)), visibilityMarkers);
+                        rebuiltMessages = [...rebuiltMessages, { role: "user", content: wireText }];
                         nudgeOutcome = "injected";
+                        emitNudgeInjected({ sessionId, protocol: "openai", kind: "advisory", tier: turn.nudge.tier, reason: turn.nudge.reason, text: wireText, ts: Date.now() });
                     } else {
                         nudgeOutcome = "skipped";
                     }

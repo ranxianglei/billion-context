@@ -287,6 +287,7 @@ billion-context/
 │   ├── notice-store.ts           # Notice dismissal receipts in unified kv_store, legacy file fallback (#5548)
 │   ├── notices.ts                # Built-in notice registry: activity predicates + i18n key table (#5548)
 │   ├── nudge-decide.ts           # Model-decided nudge timing over the already-cached prefix (#2228)
+│   ├── nudge-debug.ts            # Nudge-injection debug bus: verbatim wire text → pi TUI CustomEntry (never in LLM context; gated on the debug switch)
 │   ├── order-persist.ts          # Persists session-order skeletons across restarts (#3397)
 │   ├── pack-install.ts           # bili pack install|remove|list: npm-distributable prompt packs (#5319)
 │   ├── pck-notice.ts             # One-time notice for the prompt_cache.routing default flip (#5079)

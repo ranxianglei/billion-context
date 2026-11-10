@@ -10,6 +10,7 @@ import { pluginAgentHeader } from "../plugin.js";
 import { applyReasoningDrop, dedupeAdjacentOutputConfig, diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, makeFoldPointReasoningDroppable, planReasoningDrop, reapOrphansLogged, runNudgeDecision, stripKernelSummaries, warnAnthropicThinkingPairs, type Prepared } from "../server.js";
 import { recordNudgeObservation } from "../context-analysis.js";
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, resolveDecisionRange, stripDecisionReasoningFields, type DecideConfig } from "../nudge-decide.js";
+import { emitNudgeInjected } from "../nudge-debug.js";
 import { excludeDeadRefRanges } from "../acp-status.js";
 import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "../fold-reconcile.js";
 import { maybeSnapshotView } from "./snapshot-render.js";
@@ -523,8 +524,10 @@ export async function prepareAnthropic(
                     const rendered = renderNudgeText(turn.nudge, prompts, surface?.nudgeSections, "anthropic");
                     const renderedWithPayload = rendered.text;
                     if (rendered.text) {
-                        rebuiltMessages = [...rebuiltMessages, { role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withFirstSightDrain(renderedWithPayload, turn.nudge.reason, externalSummaryEnabled(config)), externalSummaryEnabled(config)), visibilityMarkers) }];
+                        const wireText = withMarkerIntegrityNote(withSummaryBudgetNote(withFirstSightDrain(renderedWithPayload, turn.nudge.reason, externalSummaryEnabled(config)), externalSummaryEnabled(config)), visibilityMarkers);
+                        rebuiltMessages = [...rebuiltMessages, { role: "user", content: wireText }];
                         nudgeOutcome = "injected";
+                        emitNudgeInjected({ sessionId, protocol: "anthropic", kind: "fallback", tier: turn.nudge.tier, reason: turn.nudge.reason, text: wireText, ts: Date.now() });
                     } else {
                         nudgeOutcome = "skipped";
                     }
@@ -544,8 +547,10 @@ export async function prepareAnthropic(
                 if (outcome.kind === "yes") {
                     const span = resolveDecisionRange(outcome, ranges);
                     if (span) {
-                        rebuiltMessages = [...rebuiltMessages, { role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withFirstSightDrain(buildDirectiveText(span.startRef, span.endRef, outcome.topic), turn.nudge.reason, externalSummaryEnabled(config)), externalSummaryEnabled(config)), visibilityMarkers) }];
+                        const wireText = withMarkerIntegrityNote(withSummaryBudgetNote(withFirstSightDrain(buildDirectiveText(span.startRef, span.endRef, outcome.topic), turn.nudge.reason, externalSummaryEnabled(config)), externalSummaryEnabled(config)), visibilityMarkers);
+                        rebuiltMessages = [...rebuiltMessages, { role: "user", content: wireText }];
                         nudgeOutcome = "injected";
+                        emitNudgeInjected({ sessionId, protocol: "anthropic", kind: "directive", tier: turn.nudge.tier, reason: turn.nudge.reason, text: wireText, ts: Date.now() });
                     } else {
                         nudgeOutcome = "skipped";
                         log("info", `[${sessionId}] [acp-decide] yes but no live range left to target — skipping injection`);
@@ -560,8 +565,10 @@ export async function prepareAnthropic(
                     const rendered = renderNudgeText(turn.nudge, prompts, surface?.nudgeSections, "anthropic");
                     const renderedWithPayload = rendered.text;
                     if (rendered.text) {
-                        rebuiltMessages = [...rebuiltMessages, { role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withFirstSightDrain(renderedWithPayload, turn.nudge.reason, externalSummaryEnabled(config)), externalSummaryEnabled(config)), visibilityMarkers) }];
+                        const wireText = withMarkerIntegrityNote(withSummaryBudgetNote(withFirstSightDrain(renderedWithPayload, turn.nudge.reason, externalSummaryEnabled(config)), externalSummaryEnabled(config)), visibilityMarkers);
+                        rebuiltMessages = [...rebuiltMessages, { role: "user", content: wireText }];
                         nudgeOutcome = "injected";
+                        emitNudgeInjected({ sessionId, protocol: "anthropic", kind: "advisory", tier: turn.nudge.tier, reason: turn.nudge.reason, text: wireText, ts: Date.now() });
                     } else {
                         nudgeOutcome = "skipped";
                     }

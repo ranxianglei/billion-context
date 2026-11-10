@@ -5,12 +5,13 @@
 // minimal structural declarations — the bundled artifact imports NOTHING
 // from the host at runtime (the host duck-types us in).
 
-import type { MessageRenderer } from "@earendil-works/pi-coding-agent";
+import type { EntryRenderer, MessageRenderer } from "@earendil-works/pi-coding-agent";
 import { Box, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { wrapCacheReport, wrapRuleReport } from "../acp-panel.js";
+import { onNudgeInjected, type NudgeDebugEvent } from "../nudge-debug.js";
 import { awaitNativeProxyOrigin } from "./native-bootstrap.js";
 import { disposeSubagentSelfReg, selfRegisterForSession, type SubagentSelfRegState } from "./pi-subagent-registry.js";
 import { isModelApiUrl, nativeInterceptInstalled } from "./native-intercept.js";
@@ -25,7 +26,7 @@ import { asciiHeaderValue, detectProxyBase, destinationRoutedThroughProxy, fetch
 import { createForkAdopter } from "./fork-adopt.js";
 import { logHostEvent } from "./host-log.js";
 import { plainHttpTrusted } from "../private-host.js";
-import { allowPrivateHttpProviders, guardrailBashTimeout, guardrailMaxOutputBytes, guardrailRepetition } from "../knobs.js";
+import { allowPrivateHttpProviders, debugEnabled, guardrailBashTimeout, guardrailMaxOutputBytes, guardrailRepetition } from "../knobs.js";
 import { hostProfileFor } from "../host-profiles.js";
 
 export type Ctx = {
@@ -82,6 +83,13 @@ type ExtensionAPI = {
     registerTool: (tool: ToolDefinition) => void;
     registerCommand?: (name: string, options: { description?: string; handler: (args: string, ctx: CommandCtx) => void | Promise<void> }) => void;
     registerMessageRenderer?: (customType: string, renderer: MessageRenderer) => void;
+    // Nudge debug surface (debug switch, ACP_DEBUG/debug): mirror the exact
+    // injected nudge wire text into the transcript as a CustomEntry —
+    // human-visible, never in LLM context (the host's session-context build
+    // ignores type:"custom"). Optional because older hosts lack it; without
+    // it the debug view is simply unavailable.
+    registerEntryRenderer?: (customType: string, renderer: EntryRenderer) => void;
+    appendEntry?: (customType: string, data?: unknown) => void;
     // #2186: acp_delegate (inlined from billion-context-pi-subagents) injects
     // completion notifications through the host's persistent transcript
     // channel; optional because older hosts and non-pi hosts lack it.
@@ -891,6 +899,11 @@ export function createPiDirectSendGuard(): (url: string, input: string | URL | R
     };
 }
 
+// Nudge-debug wiring guard: the bus subscription is process-global (the
+// emitters live in this same bundle in inline mode), so wire it at most once
+// even if a host ever re-invokes the factory.
+let nudgeDebugWired = false;
+
 export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalMs?: number }): (pi: ExtensionAPI) => void {
     return function biliPlugin(pi: ExtensionAPI): void {
         const agent = agentName(agentOverride);
@@ -1101,6 +1114,36 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                 box.addChild(new Text(theme.fg("dim", "Ctrl+O to expand full ACP report"), 0, 0));
                 return box;
             });
+        }
+        // Nudge debug surface: with the debug switch on (ACP_DEBUG / config
+        // debug — rides the familiar global debug knob), each nudge the
+        // prepare stage injects (the ephemeral trailing user message — final
+        // wrapped wire text) is mirrored into the transcript as a
+        // CustomEntry so the operator sees the verbatim text inline.
+        // CustomEntry never reaches the model: pi's session-context build
+        // ignores type:"custom", and the engine-side emitter is this same
+        // bundle/process in the default INLINE pi mode (spawn/attach proxies
+        // are separate processes — no bus listener, feature inert there).
+        if (agent === "pi" && typeof pi.registerEntryRenderer === "function" && typeof pi.appendEntry === "function" && debugEnabled()) {
+            pi.registerEntryRenderer("bili-nudge", (entry, _options, theme) => {
+                const data = entry.data as NudgeDebugEvent | undefined;
+                if (data === undefined || typeof data !== "object" || typeof data.text !== "string" || data.text.length === 0) return undefined;
+                const box = new Box(1, 1, (line) => theme.bg("customMessageBg", line));
+                box.addChild(new Text(theme.fg("customMessageLabel", `\x1b[1m[bili-nudge] ${data.protocol}/${data.kind} tier=${data.tier ?? "-"} reason=${data.reason}\x1b[22m`), 0, 0));
+                box.addChild(new Spacer(1));
+                box.addChild(new Text(data.text, 0, 0));
+                return box;
+            });
+            if (!nudgeDebugWired) {
+                nudgeDebugWired = true;
+                onNudgeInjected((event) => {
+                    try {
+                        pi.appendEntry?.("bili-nudge", event);
+                    } catch {
+                        // debug surface only — a failed append must never break the request pipeline
+                    }
+                });
+            }
         }
         const piCommands = piCommandsEnabled();
         if (typeof pi.registerCommand === "function") {

@@ -164,6 +164,8 @@ Pi 有完整原生模式(`bili plugin install pi`,README 快速上手方案 1);�
 
 **子代理配置(#2230)。** 内置 `acp_delegate` 面(三个 delegate 工具、角色、fleet 检查器——由 `bili pi` 经内嵌扩展接线)配置在 bili 自己的配置文件:`~/.config/billion-context/billion-context.json` 的 `pi.subagents` 段(布尔简写 `"pi": {"subagents": false}` 可整体关闭)。`~/.pi/acp.json` 的四键(`delegate` / `delegatePrompt` / `displayUsage` / `debug`)是已废弃的回退源——仅当段缺失时读取,段存在后完全忽略。完整字段表与 `PI_ACP_DELEGATE_*` 环境变量见 configuration.zh-CN.md 的 [`pi`](configuration.zh-CN.md#pi) 段。
 
+**nudge 调试(逐字查看注入原文)。** 打开全局 debug 开关(`ACP_DEBUG=1`,或配置文件 `"debug": true`)后,压缩过程中代理每次注入 nudge 都会以「仅转录条目」的形式镜像进 pi 会话记录:`[bili-nudge] <协议>/<类型> tier=… reason=…` 标签 + 逐字 wire 原文——即模型当轮实际读到的那条临时尾随 user 消息,一字不差。该条目是 pi 的 `CustomEntry`,从不进入模型上下文(pi 的会话上下文构建会忽略 `type:"custom"`),所以只有人能看到,也不会被加进任何重发历史。仅 pi inline 模式有效——spawn/attach 下代理是独立进程,看不到;覆盖 Anthropic 与 OpenAI 两条 wire 车道(pi 走 HTTP 仅有的两条);宿主缺少 `registerEntryRenderer`/`appendEntry` 时此功能静默缺席。
+
 **路由机制。** pi 扩展自行拉起(或附着)代理并进程内 patch `globalThis.fetch`:所有模型 API 的 HTTP 请求被改写到 `<proxy>/bili/<upstream-url>`,扩展经 pi 的 `before_provider_headers` 事件盖 `x-bili-plugin*` 头。所有 HTTP 系 provider(Anthropic、OpenAI chat/completions/responses、Gemini、Mistral、OpenRouter、Azure、自定义中转……)走这条路,得到具名 plugin-mode 会话。
 
 **搭配 pi-claude-bridge:压缩状态不跨 reopen/resume(#3429)。** pi-claude-bridge 每次 pi 会话启动都会拉起一个**全新的 Claude Code 子进程**,该子进程在每个模型请求上盖自己的 `x-claude-code-session-id`——pi 的稳定会话 id 根本不上这条 HTTP。bili 按它看到的 id verbatim 键控会话(此处即 `x-claude-code-session-id`),所以 reopen/resume/fork 之后桥的新 CC id 映射到空会话:已折叠历史与压缩账本不延续,launcher/native `compress` 对 pi id 返回 404(未知 plugin 会话)——同一根机制,不是两个 bug。这是桥侧的身份缺口,不是 bili 缺陷:内容从不丢失或损坏,只是压缩的*状态*重置。根治属于 pi-claude-bridge(让 CC session id 从 pi 会话 id 稳定派生);在那之前,把 pi+claude-bridge 当纯代理模式看待上下文管理。
