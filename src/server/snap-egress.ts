@@ -582,21 +582,27 @@ export function applySnapEgress(
         return legacyProcessed; // plane not initialized for this sid yet — nothing to observe
     }
 
-    const built = buildSnapEgressView(view, clientMsgs, state);
-    if (!built.ok) {
-        noteDegrade(built.reason);
-        return legacyProcessed;
-    }
+    // #5874 P2 (never-fail contract): the plane path must degrade, never
+    // throw. A TypeError escaping here (found in CI: the media-offload object
+    // {"$media": hash} fed to sha256) reached the lane catch, which forwarded
+    // the UNPROCESSED client bytes — kernel render, watermark and tripwire all
+    // skipped — and corrupted the egress for the whole turn.
+    try {
+        const built = buildSnapEgressView(view, clientMsgs, state);
+        if (!built.ok) {
+            noteDegrade(built.reason);
+            return legacyProcessed;
+        }
 
-    // Kernel parity, step 1: the hide-compress-calls pipeline node strips
-    // consumed compress tool-call/result pairs (and swept orphans) INSIDE
-    // processTurn, so the legacy bytes never contain them — the plane view
-    // must pass the same exported filter over the same state or it serves
-    // messages the model is not supposed to see again (gate: length-red with
-    // plane LONGER). Idempotent: run against the post-turn state, already-
-    // hidden ids stay hidden.
-    const hidden = hideConsumedCompressCalls(state, built.msgs);
-    let planeMsgs: BiliMessage[] = hidden.messages as BiliMessage[];
+        // Kernel parity, step 1: the hide-compress-calls pipeline node strips
+        // consumed compress tool-call/result pairs (and swept orphans) INSIDE
+        // processTurn, so the legacy bytes never contain them — the plane view
+        // must pass the same exported filter over the same state or it serves
+        // messages the model is not supposed to see again (gate: length-red with
+        // plane LONGER). Idempotent: run against the post-turn state, already-
+        // hidden ids stay hidden.
+        const hidden = hideConsumedCompressCalls(state, built.msgs);
+        let planeMsgs: BiliMessage[] = hidden.messages as BiliMessage[];
 
     // Kernel render parity: hydrate the immutable first-sight timestamps
     // (plane rows are stored pre-render and carry no ts), then run the
@@ -679,4 +685,9 @@ export function applySnapEgress(
         deps.log("warn", `[snaplane] sid=${deps.sessionId} decision=red:egress:${verdict.reason} — legacy egress kept (${n}/${EGRESS_EXCLUDE_AFTER})${verdict.firstDiff ? ` — ${verdict.firstDiff}` : ""} — adopt paired=${built.adopt.paired} adopted=${built.adopt.adopted} trimMiss=${built.adopt.trimMiss} unpaired=${built.adopt.unpaired}`);
     }
     return legacyProcessed;
+    } catch (err) {
+        noteDegrade("egress-assembly-error");
+        deps.log("warn", `[snaplane] sid=${deps.sessionId} decision=degrade:egress:assembly-error (${err instanceof Error ? err.message : String(err)}) — legacy egress kept`);
+        return legacyProcessed;
+    }
 }
