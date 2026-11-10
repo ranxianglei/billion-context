@@ -98,6 +98,11 @@ const WAIVERS = new Map([
     // structurally through dshCompactionGateTelemetry()'s return type; keep
     // the export so the channel payload stays named at its definition site.
     ["src/agent/dsh-compaction-disable.ts", new Set(["DshCompactionGateTelemetry"])],
+    // #6003 egress-transform plugin contract: the four match/ctx/result/module
+    // type shapes are referenced only inside src/egress-transforms.ts (callers
+    // consume them through applyEgressTransforms' parameter types); keep the
+    // exports so the user-plugin contract stays named at its definition site.
+    ["src/egress-transforms.ts", new Set(["EgressTransformMatch", "EgressTransformCtx", "EgressTransformResult", "EgressTransformModule"])],
 ]);
 
 const findings = [];

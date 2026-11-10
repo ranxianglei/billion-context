@@ -6,6 +6,7 @@ import { APIG_RESIGN_SCHEME, KNOWN_SIGNATURE_SCHEMES, readPendingRefusals, unres
 import { handleAcpCache, readKeySwitchStats, readModelSwitchStats, readProjSwitchStats, readPromptSwitchStats } from "../cache-ledger.js";
 import type { ProxyOptions } from "../config.js";
 import { loadConfigFile, loadNamedProviders, loadOptions, loadRoutes, resolveResignSettings } from "../config.js";
+import { resetEgressModuleCache } from "../egress-transforms.js";
 import { applyCompressSettings, listResolvedPacks, resolveCompressSurfaceDetailed } from "../compress-settings.js";
 import { clearConflictEvents, summarizeConflicts } from "../conflict-watch.js";
 import { cannotResolveTarget, getAdvisoryState } from "../advisory.js";
@@ -931,6 +932,11 @@ function handleConfigReload(opts: ProxyOptions, res: http.ServerResponse, log: (
     opts.compat = reloaded.compat;
     opts.imageBilling = reloaded.imageBilling;
     opts.imageTokenCap = reloaded.imageTokenCap;
+    // #6003 phase 2: egress transforms are file-only, so pull them off the fresh
+    // loadOptions() result (already parsed/validated) and drop the loaded-module
+    // cache so a plugin's code + any added/removed entry take effect next request.
+    opts.egressTransforms = reloaded.egressTransforms;
+    resetEgressModuleCache();
     // Release cached ProxyAgents so agents for proxy URLs that were
     // removed/changed don't leak for the process lifetime. The next request
     // re-creates the needed agent lazily via proxyDispatcher().
