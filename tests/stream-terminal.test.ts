@@ -114,6 +114,11 @@ test("JSON: completed output with a null error is successful", async () => {
     assert.equal(await observeResponsesTerminalState(stream, false), "completed");
 });
 
+test("JSON: a completed claim carrying a real error still fails", async () => {
+    const stream = sseStream([JSON.stringify({ status: "completed", error: { message: "boom" }, output: [] })]);
+    assert.equal(await observeResponsesTerminalState(stream, false), "failed");
+});
+
 test("JSON: compact endpoint output without a status remains supported", async () => {
     const stream = sseStream([JSON.stringify({ object: "response.compaction", output: [] })]);
     assert.equal(await observeResponsesTerminalState(stream, false), "completed");
