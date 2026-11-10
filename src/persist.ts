@@ -342,6 +342,17 @@ export function contentStoreRelPathFor(id: string, protocol?: string, upstreamOr
     return base.slice(0, -".json".length) + ".content-store.json";
 }
 
+/** #5599 migrate guard: the CCR sidecar paired with a session ROUTE FILE (as
+ *  opposed to an id) — <base>.json → <base>.content-store.json, and a .fb.json
+ *  fallback source keeps its <base>.content-store.json name. Mirrors the
+ *  source-file rule of candidateContentStorePaths so detection agrees with
+ *  what loadContentStore would read for that exact file. */
+export function ccrSidecarForRouteFile(file: string): string {
+    return file.endsWith(".fb.json")
+        ? `${file.slice(0, -".fb.json".length)}.content-store.json`
+        : `${file.slice(0, -".json".length)}.content-store.json`;
+}
+
 /** #1937: true when a walked FILENAME is the canonical (or legacy flat /
  *  .fb fallback) name for record `id` — mirrors the kernel StateStore.loadAll
  *  owner check so independent directory walkers agree with loadSync about
@@ -433,12 +444,20 @@ interface LegacyMigrateSessionResult {
     /** Same-id route files that were NOT used as representative (left untouched). */
     alternates?: number;
     decodedBytes?: number;
+    /** A #1097 CCR sidecar co-resides with one of this id's route files — NOT
+     *  imported by migrate (the acp_retrieve originals stay file-backed); it
+     *  must be kept until those originals are absorbed into the index. */
+    ccrSidecar?: boolean;
 }
 
 export interface LegacyMigrateReport {
     scannedFiles: number;
     results: LegacyMigrateSessionResult[];
     counts: { imported: number; indexed: number; drifted: number; failed: number; planned: number };
+    /** Sessions carrying a paired CCR sidecar — reported, never imported. */
+    ccrSidecarSessions: number;
+    /** CCR sidecars with no matching scanned envelope — reported, never touched. */
+    unpairedCcrSidecars: string[];
 }
 
 export class SessionStore {
@@ -2011,10 +2030,21 @@ export class SessionStore {
         const byId = new Map<string, Array<{ file: string; savedAt: number }>>();
         const badFiles: Array<{ file: string; reason: string }> = [];
         let scannedFiles = 0;
+        const relOf = (file: string): string =>
+            file.startsWith(`${this.sessionsDir}-cold${path.sep}`)
+                ? `cold:${path.relative(`${this.sessionsDir}-cold`, file)}`
+                : path.relative(this.sessionsDir, file);
+        // #5599 guard: #1097 CCR sidecars are REPORTED, never counted or
+        // imported — deleting them after a "clean" migrate would lose the
+        // acp_retrieve originals this tool does not move into the index.
+        const ccrSidecars = new Map<string, string>(); // abs path -> rel path
         for (const root of [this.sessionsDir, `${this.sessionsDir}-cold`] as string[]) {
             if (!existsSync(root)) continue;
             for (const file of walkJsonFilesSync(root)) {
-                if (path.basename(file).endsWith(".content-store.json")) continue;
+                if (path.basename(file).endsWith(".content-store.json")) {
+                    ccrSidecars.set(file, relOf(file));
+                    continue;
+                }
                 scannedFiles++;
                 const parsed = await this.readRawFileWithBytes(file);
                 if (!parsed) {
@@ -2035,15 +2065,17 @@ export class SessionStore {
                 byId.set(rec.payload.id, list);
             }
         }
-        const relOf = (file: string): string =>
-            file.startsWith(`${this.sessionsDir}-cold${path.sep}`)
-                ? `cold:${path.relative(`${this.sessionsDir}-cold`, file)}`
-                : path.relative(this.sessionsDir, file);
         const indexedBefore = new Set(this.unifiedListSessionIds() ?? []);
+        let ccrSidecarSessions = 0;
+        const matchedCcr = new Set<string>();
         for (const id of [...byId.keys()].sort()) {
             const files = byId.get(id)!;
             // Boot's survivor rule: newest savedAt wins, lexicographic path breaks ties.
             const rep = [...files].sort((a, b) => b.savedAt - a.savedAt || a.file.localeCompare(b.file))[0];
+            // #5599 guard: which #1097 sidecars pair with this id's route files.
+            const pairedCcr = new Set(
+                files.map((f) => ccrSidecarForRouteFile(f.file)).filter((p) => ccrSidecars.has(p)),
+            );
             let status: LegacyMigrateSessionResult["status"] = "failed";
             let reason: string | undefined;
             let decodedBytes: number | undefined;
@@ -2091,6 +2123,11 @@ export class SessionStore {
             if (reason) entry.reason = reason;
             if (decodedBytes !== undefined) entry.decodedBytes = decodedBytes;
             if (files.length > 1) entry.alternates = files.length - 1;
+            if (pairedCcr.size > 0) {
+                entry.ccrSidecar = true;
+                ccrSidecarSessions++;
+                for (const p of pairedCcr) matchedCcr.add(p);
+            }
             results.push(entry);
             counts[status]++;
         }
@@ -2099,8 +2136,15 @@ export class SessionStore {
             results.push(entry);
             counts.failed++;
         }
-        this.log("info", `[persist] storage migrate${dryRun ? " (dry run)" : ""}: ${scannedFiles} files scanned, ${counts.imported} imported, ${counts.indexed} indexed, ${counts.drifted} drifted, ${counts.failed} failed`);
-        return { scannedFiles, results, counts };
+        const unpairedCcrSidecars = [...ccrSidecars.entries()]
+            .filter(([abs]) => !matchedCcr.has(abs))
+            .map(([, rel]) => rel)
+            .sort();
+        const ccrNote = ccrSidecarSessions > 0 || unpairedCcrSidecars.length > 0
+            ? `, ${ccrSidecarSessions} session(s) with CCR sidecar(s), ${unpairedCcrSidecars.length} unpaired CCR sidecar(s)`
+            : "";
+        this.log("info", `[persist] storage migrate${dryRun ? " (dry run)" : ""}: ${scannedFiles} files scanned, ${counts.imported} imported, ${counts.indexed} indexed, ${counts.drifted} drifted, ${counts.failed} failed${ccrNote}`);
+        return { scannedFiles, results, counts, ccrSidecarSessions, unpairedCcrSidecars };
     }
 
     /** Shared post-load fixups for the unified read path: rebuilds the

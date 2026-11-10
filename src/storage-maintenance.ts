@@ -6,7 +6,7 @@
  */
 import { existsSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { SessionStore, type LegacyMigrateReport } from "./persist.js";
+import { SessionStore, ccrSidecarForRouteFile, type LegacyMigrateReport } from "./persist.js";
 import type { GcPlan } from "./storage/store.js";
 import { fileStorageArchiveAfterDays, resolveArchiveAfterDays } from "./knobs.js";
 import { scanForeignBlocks, applyForeignBlockSweep, type ForeignBlockPlan } from "./foreign-block-sweep.js";
@@ -371,8 +371,21 @@ function renderMigrate(report: LegacyMigrateReport, dryRun: boolean): string {
     } else {
         lines.push("  no legacy JSON sessions found");
     }
+    // #5599 guard: sidecars hold acp_retrieve originals (#1097) that migrate
+    // does NOT import — a "clean" report must never invite deleting them.
+    const withCcr = report.results.filter((r) => r.ccrSidecar === true);
+    if (withCcr.length > 0 || report.unpairedCcrSidecars.length > 0) {
+        lines.push("");
+        lines.push("CCR sidecars NOT imported by this tool — KEEP them (they hold the acp_retrieve originals, #1097):");
+        for (const r of withCcr) lines.push(`  ${r.id}  ${ccrSidecarForRouteFile(r.file)}`);
+        for (const f of report.unpairedCcrSidecars) lines.push(`  (no matching envelope)  ${f}`);
+    }
     if (dryRun) lines.push("dry-run: nothing written");
-    else lines.push("note: JSON files were not modified — archive or delete them yourself once this report is clean.");
+    else if (withCcr.length === 0 && report.unpairedCcrSidecars.length === 0) {
+        lines.push("note: JSON files were not modified — archive or delete them yourself once this report is clean.");
+    } else {
+        lines.push("note: JSON files were not modified — but do NOT delete the listed .content-store.json sidecar(s): they hold acp_retrieve originals this tool did not import, and deleting them makes those originals unrecoverable.");
+    }
     return lines.join("\n");
 }
 
