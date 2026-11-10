@@ -1,4 +1,4 @@
-// #6155: the defect-advisory banner interpolates `id` and `reason` — strings
+// #6153: the defect-advisory banner interpolates `id` and `reason` — strings
 // parsed verbatim from the remote billion-context-advisories npm feed
 // (src/advisory.ts parseAdvisoryDoc checks non-emptiness only) — directly
 // into innerHTML. Every other dynamic string in the panel goes through
