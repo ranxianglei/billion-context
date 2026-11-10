@@ -340,6 +340,19 @@ export interface CompressionState {
    *  Carries the position so the sweep is cache-neutral: it only removes records
    *  the fold already invalidated. Optional: absent until the first post-fix fold. */
   pendingOrphanSweepMinRef?: number;
+  /** UPPER bound of the same pending orphan-sweep window (#6116): the highest
+   *  allocated m-ref at the moment the most recent pending fold committed
+   *  (highestUsedIndex of messageRefs in applyCompression). Every message that
+   *  was already in history then carries a ref <= this value; the successful
+   *  compress call itself and anything issued after it (mixed multi-tool turns)
+   *  only gets a ref on the NEXT assignRefs pass — strictly above it — so it
+   *  stays out of the sweep and its failure feedback remains visible for the
+   *  model to react to. Consumed together with pendingOrphanSweepMinRef (the
+   *  sweep condition becomes min <= refNum <= max). Across several folds that
+   *  commit before one consuming turn it keeps the running MAX, mirroring the
+   *  min side's running MIN. Optional: states written before #6116 lack it, and
+   *  a missing max degrades to the pre-fix unbounded sweep (upgrade compat). */
+  pendingOrphanSweepMaxRef?: number;
   /** Emergency-truncation latch (#3939 ③/#3691): the clipped texts (post-clip
    *  bytes, keyed by padded ref) of messages clipped by the emergency-truncate
    *  node. The watermark decision is made ONCE — replaying these clips on every
