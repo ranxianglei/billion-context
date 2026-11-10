@@ -106,6 +106,32 @@ for (const protocol of ["responses", "anthropic", "openai", "google"] as const) 
     }
 }
 
+for (const protocol of ["responses", "anthropic", "openai", "google"] as const) {
+    test(`external summary HTTP: ${protocol} accepts a JSON event split across multiple data fields`, async () => {
+        const multiline = streamCompletion(protocol).replace(/^data: (.+)$/gm, (line, data: string) => data === "[DONE]" ? line :
+            JSON.stringify(JSON.parse(data), null, 2).split("\n").map((part) => `data: ${part}`).join("\n: keepalive\n"));
+        await upstream((_req, res) => {
+            res.setHeader("content-type", "text/event-stream");
+            res.end(multiline.replace(/\n/g, "\r\n"));
+        }, async (url) => {
+            const candidate = createSummaryHttpCandidate(target(url, protocol, true), 8192);
+            const result = await new ExternalSummaryExecutor(1).execute(work, [candidate], budget);
+            assert.equal(result.status, "success");
+            if (result.status === "success") assert.equal(result.summary, summary);
+        });
+    });
+}
+
+test("external summary HTTP: malformed multiline JSON still rejects the entire summary", async () => {
+    await upstream((_req, res) => {
+        res.setHeader("content-type", "text/event-stream");
+        res.end(streamCompletion("responses") + 'data: {\ndata: invalid json\ndata: }\n\n');
+    }, async (url) => {
+        const candidate = createSummaryHttpCandidate(target(url, "responses", true), 8192);
+        await assert.rejects(candidate.summarize(work, AbortSignal.timeout(4000)), { message: "External summary response contains an invalid frame" });
+    });
+});
+
 for (const status of [400, 401, 403]) {
     test(`external summary HTTP: ${status} fails fast to the backup without leaking errors`, async () => {
         const paths: string[] = [];

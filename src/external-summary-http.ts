@@ -6,7 +6,7 @@ import { fetchWithTimeout, isTransientUpstreamError, sleep } from "./fetch-util.
 import { extractSummaryFromSse, extractSummaryText, summaryPayload, type PreflightProtocol } from "./preflight.js";
 import { log as loggerLog } from "./logger.js";
 import { maskUrlForLog, maskUrlsInText } from "./log-mask.js";
-import { finalizeSseLineEndings } from "./sse-util.js";
+import { bufferedSseEvents, finalizeSseLineEndings } from "./sse-util.js";
 import { proxyDispatcher } from "./upstream-proxy.js";
 import { PACKAGE_NAME, VERSION } from "./version.js";
 
@@ -172,9 +172,8 @@ function parseSummary(protocol: PreflightProtocol, text: string): string {
     } else {
         const normalized = finalizeSseLineEndings(text);
         const events: unknown[] = [];
-        for (const line of normalized.split("\n")) {
-            if (!line.startsWith("data:")) continue;
-            const data = line.slice(5).trim();
+        for (const event of bufferedSseEvents(normalized)) {
+            const data = event.data.trim();
             if (!data || data === "[DONE]") continue;
             try { events.push(JSON.parse(data)); } catch { throw new Error("External summary response contains an invalid frame"); }
         }
