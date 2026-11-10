@@ -18,8 +18,8 @@
 
 | Doc | What it is |
 |---|---|
-| [message-identity](message-identity.md) / [中文](message-identity.zh-CN.md) | Message identity doctrine: content hash as cross-turn join key, order > hash, msgid rung, snapshot render |
-| [session-identity](session-identity.md) / [中文](session-identity.zh-CN.md) | Which session an *anonymous* request belongs to |
+| [message-identity](message-identity.md) / [中文](message-identity.zh-CN.md) / [日本語](message-identity.ja.md) | Message identity doctrine: content hash as cross-turn join key, order > hash, msgid rung, snapshot render |
+| [session-identity](session-identity.md) / [中文](session-identity.zh-CN.md) / [日本語](session-identity.ja.md) | Which session an *anonymous* request belongs to |
 | [session-identity-resolution](session-identity-resolution.md) / [中文](session-identity-resolution.zh-CN.md) / [日本語](session-identity-resolution.ja.md) | Which *conversation* a known client session id belongs to (same id, different conversations) |
 | [identity-channels](identity-channels.md) / [中文](identity-channels.zh-CN.md) / [日本語](identity-channels.ja.md) | Cross-client stable conversation+message id wiring (#5825): who carries identity in, where it is consumed |
 | [msgid-infrastructure](msgid-infrastructure.md) / [中文](msgid-infrastructure.zh-CN.md) / [日本語](msgid-infrastructure.ja.md) | Where sessionid+msgid is produced, validated (six copies), pinned, and consumed |

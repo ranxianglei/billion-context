@@ -18,8 +18,8 @@
 
 | 文档 | 说明 |
 |---|---|
-| [message-identity](message-identity.zh-CN.md) / [English](message-identity.md) | 消息身份教义：内容哈希作跨轮 join 键、顺序 > hash、msgid 层、快照渲染 |
-| [session-identity](session-identity.zh-CN.md) / [English](session-identity.md) | 匿名请求归属哪个会话 |
+| [message-identity](message-identity.zh-CN.md) / [English](message-identity.md) / [日本語](message-identity.ja.md) | 消息身份教义：内容哈希作跨轮 join 键、顺序 > hash、msgid 层、快照渲染 |
+| [session-identity](session-identity.zh-CN.md) / [English](session-identity.md) / [日本語](session-identity.ja.md) | 匿名请求归属哪个会话 |
 | [session-identity-resolution](session-identity-resolution.zh-CN.md) / [English](session-identity-resolution.md) / [日本語](session-identity-resolution.ja.md) | 已知客户端 session id 归属哪个会话（同 id 不同会话的裁决） |
 | [identity-channels](identity-channels.zh-CN.md) / [English](identity-channels.md) / [日本語](identity-channels.ja.md) | 跨客户端稳定会话/消息 id 接线（#5825）：谁带身份进来、在哪里消费 |
 | [msgid-infrastructure](msgid-infrastructure.zh-CN.md) / [English](msgid-infrastructure.md) / [日本語](msgid-infrastructure.ja.md) | sessionid+msgid 的生产、校验（六份副本）、钉住与消费 |
