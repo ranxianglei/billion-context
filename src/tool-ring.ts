@@ -34,6 +34,7 @@ interface WitnessEntry {
 const rings = new Map<string, WitnessEntry[]>();
 /** witness hash → set of sessionIds holding it (populated on lookup sweep). */
 const hashIndex = new Map<string, Set<string>>();
+let lastRecordSweepAt: number | undefined;
 
 /** Fake-clock seam for TTL tests. Undefined = real wall clock. */
 let clockForTest: (() => number) | undefined;
@@ -119,6 +120,12 @@ export function recordToolWitness(sessionId: string, name: string, args: string 
     const hash = witnessHash(name, args);
     if (!hash) return;
     const now = nowMs();
+    // Native-id routing may never look up a hash witness. Reclaim other
+    // sessions on writes too, amortizing the full scan over the TTL window.
+    if (lastRecordSweepAt === undefined || now - lastRecordSweepAt > WITNESS_TTL_MS || now < lastRecordSweepAt) {
+        for (const id of rings.keys()) sweep(id, now);
+        lastRecordSweepAt = now;
+    }
     sweep(sessionId, now);
     const ring = rings.get(sessionId) ?? [];
     if (ring.length > 0 && ring[ring.length - 1].hash === hash) {
@@ -219,6 +226,7 @@ export function lookupToolUseIdSession(toolUseId: string): string | undefined {
 export function resetToolRingForTest(): void {
     rings.clear();
     hashIndex.clear();
+    lastRecordSweepAt = undefined;
     toolUseIds.clear();
     clockForTest = undefined;
 }
