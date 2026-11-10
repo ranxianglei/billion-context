@@ -34,7 +34,7 @@ import { resolveBackendName, backendSelectionNotice, selectedBackendRaw, openBac
 import { canonicalDigest, canonicalize, sha256 } from "./canonical.ts";
 import { recordSidecarInstance, recordSidecarOpenFailure } from "./runtime-status.ts";
 import type { SqliteEngineName, SqliteEngineSource } from "./driver.ts";
-import type { MessageRow, BlockRow, SessionRow, RefRow, MessageRefContentRow } from "./store.js";
+import type { MessageRow, BlockRow, SessionRow, RefRow, MessageRefContentRow, MessageIdContentRow } from "./store.js";
 import type { CoreMessage, MessageContentStore } from "acp-kernel";
 
 // True once quick_check proved this process's index corrupt. such a boot is
@@ -1004,6 +1004,13 @@ export class UnifiedShadow {
     messageContentByRefNums(sessionId: string, refNums: readonly number[]): MessageRefContentRow[] {
         if (this.sync === null || refNums.length === 0) return [];
         return this.sync.messageContentByRefNums(sessionId, refNums);
+    }
+
+    /** #6029: per-msg_id stored bodies — the restamp-proof twin of
+     *  messageContentByRefNums (sync store only, like its sibling). */
+    messageContentByMsgIds(sessionId: string, msgIds: readonly string[]): MessageIdContentRow[] {
+        if (this.sync === null || msgIds.length === 0) return [];
+        return this.sync.messageContentByMsgIds(sessionId, msgIds);
     }
 
     sessionSummaries(): SessionSummaryRow[] {
