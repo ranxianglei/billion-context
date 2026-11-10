@@ -163,7 +163,7 @@ test("#5460 P1: ring buffer serves in-process consumers (/stats, panel P4)", () 
 test("#5460 P1: logRequestCost wires structured rows through the single choke point", async () => {
     // Late import keeps the heavy server module out of the fast paths above;
     // importing ../src/server.js in tests is an established pattern.
-    const { logRequestCost } = await import("../src/server.js");
+    const { logRequestCost } = await import("../src/server/request-cost.js");
     resetModule();
     const dir = sandbox();
     try {
