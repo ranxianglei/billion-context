@@ -65,7 +65,9 @@ export function mergeState(parsed: CompressionState): CompressionState {
         sweptOrphanCallIds: parsed.sweptOrphanCallIds ?? fresh.sweptOrphanCallIds,
         pendingOrphanSweepMinRef: parsed.pendingOrphanSweepMinRef ?? fresh.pendingOrphanSweepMinRef,
         // #6116: the window's upper bound is transient like the min marker;
-        // losing it only degrades to the pre-fix unbounded sweep (safe side).
+        // states written before #6116 lack it and keep the pre-fix unbounded
+        // sweep for that one pending window (upgrade compat, pinned by
+        // kernel/tests/issue6116-sweep-window.test.ts).
         pendingOrphanSweepMaxRef: parsed.pendingOrphanSweepMaxRef ?? fresh.pendingOrphanSweepMaxRef,
         // #3939 ③/#3691: the emergency-truncate latch must survive hydration —
         // dropping it re-exposes clipped bytes mid-history after a restart,
