@@ -178,12 +178,13 @@ export function clearRescaleEncodeCache(): void {
  *  Unlike rescaleImage there is no trigger gate and no keep-ratio floor — any strict
  *  reduction is adopted; images already within maxDim are left alone. Returns the new
  *  base64 (same mime) or null when nothing was saved (unsupported format, jimp absent,
- *  or the re-encode did not shrink). Cached per hash+dim. */
+ *  or the re-encode did not shrink). Cached per (mime, dim, content) — the encode
+ *  format follows the declared mime, so the key must cover it too. */
 export async function shedDownscaleImage(mediaType: string, b64: string, maxDim: number): Promise<string | null> {
     const mime = normalizeMime(mediaType);
     if (!mime || typeof b64 !== "string" || b64.length === 0 || !Number.isFinite(maxDim) || maxDim <= 0) return null;
     const dim = Math.floor(maxDim);
-    const hash = createHash("sha256").update(`${dim}:${b64}`, "utf8").digest("hex");
+    const hash = createHash("sha256").update(`${mime}:${dim}:${b64}`, "utf8").digest("hex");
     let pending = encodeCache.get(hash);
     if (!pending) {
         pending = doRescale(mime, b64, b64Bytes(b64), dim, true);
