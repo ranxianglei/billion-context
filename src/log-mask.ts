@@ -207,13 +207,15 @@ export function maskUrlForDiagnostics(url: string): string {
     try {
         const u = new URL(url);
         // Node keeps the brackets in hostname for bracketed IPv6 ([::1]).
-        // Loopback is returned VERBATIM (not re-serialized): URL.pathname
-        // normalizes pathless URLs by appending "/", which would drift
-        // byte-pinned local-origin lines for no security benefit — loopback
-        // identifies bili's own proxy, and secrets are scrubbed separately
-        // by redactSecretsInText upstream of every call site.
+        // Keep clean loopback URLs verbatim: URL.pathname would add "/" to
+        // pathless local-origin lines. The exemption covers host visibility,
+        // never userinfo/query/hash; generic text redaction cannot recognize
+        // arbitrary passwords or every query parameter carrying a secret.
         const h = u.hostname.replace(/^\[|\]$/g, "").toLowerCase();
-        if (h === "localhost" || isLoopbackIp(h)) return url;
+        if (h === "localhost" || isLoopbackIp(h)) {
+            if (!u.username && !u.password && !u.search && !u.hash) return url;
+            return `${u.protocol}//${u.host}${u.pathname}`;
+        }
     } catch {
         // unparseable — fall through to the generic masker
     }
