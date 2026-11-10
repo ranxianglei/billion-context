@@ -157,6 +157,15 @@ export interface NudgeState {
    *  a mass-qualified T2/T3 fire ahead of T1 instead of starving forever.
    *  Cleared by a compliant harvest or any distillation. */
   t1HarvestStall?: boolean;
+  /** #5865 estimate-hold backstop: count of CONSECUTIVE processTurn events
+   *  whose meter reading was estimate-grade. Reset to 0 by any usage-grade
+   *  reading. Only consulted while nudge.requireUsageSampleForPressure is on:
+   *  the pressure band defers while this count <=
+   *  nudge.maxEstimateHoldRounds and falls back to estimate-driven injection once it exceeds the bound, so a
+   *  backend that never reports usage cannot starve its pressure nudges
+   *  forever. Persisted so the streak survives restarts like the rest of
+   *  NudgeState. */
+  estimateHoldStreak?: number;
 }
 
 export interface CompressionStats {
@@ -461,6 +470,33 @@ export interface NudgeConfig {
    *  (zero-yield loop, #198). Default: max(5000, round(modelContextLimit ×
    *  0.01)). Set 0 to restore the legacy any-pending behavior. */
   minPressureBenefitTokens?: number;
+  /** Phantom-pressure guard: require the meter reading behind the pressure
+   *  band (usage >= maxContextLimitPct / emergencyThresholdPct) to be
+   *  usage-grade (a billing-sample-backed token count, i.e. the host passed
+   *  processTurn({ tokenCountSource: "usage" })) before injecting an
+   *  EMERGENCY/OVER-LIMIT nudge. Estimate-grade readings (char-bound local
+   *  fallback — e.g. right after an aborted turn or a cache-TTL expiry that
+   *  left no usage report) structurally run high, and acting on them
+   *  rewrites content off a bad meter; deferring costs at most one round
+   *  because the very next request carries a fresh billing report.
+   *  Default true; set false to restore estimate-driven pressure injection.
+   *  Non-pressure tiers (growth/cadence arms) are unaffected either way. */
+  requireUsageSampleForPressure?: boolean;
+  /** #5865 ruling (estimate-hold backstop): while that guard is on, a run of
+   *  consecutive ESTIMATE-grade readings is only held for at most
+   *  `maxEstimateHoldRounds` rounds; from the following round onward the
+   *  pressure band acts on the estimate again (legacy behavior). Without the
+   *  bound, an upstream that NEVER reports usage (anonymous zero-baseline /
+   *  silent-backend sessions — see #728/#553, where the local estimate is
+   *  the only pressure signal) would be deferred forever: every round is
+   *  estimate-grade and the "next request carries a fresh billing report"
+   *  premise never materializes. Default 2: covers the observed double-ghost
+   *  windows (aborted turn + its follow-up before the aborted cycle's report
+   *  can land) while capping worst-case starvation at two missed
+   *  opportunities. 0 disables the hold entirely (the pressure band fires on
+   *  the very first estimate round — same practical effect as
+   *  requireUsageSampleForPressure=false for the pressure band). */
+  maxEstimateHoldRounds?: number;
 }
 
 export interface TruncateConfig {
@@ -723,6 +759,13 @@ export interface NudgeBreakdown {
   /** Max pending across all tiers — compared against minPressureBenefit by the
    *  emergency-truncate node to detect a terminal floor (#300). */
   maxPending: number;
+  /** Open numeric ledger for debug/reason fields. Documented special keys:
+   *   - pressureDeferredNoSample (1/0): the pressure-band injection was
+   *     deferred for lack of a usage-grade sample
+   *     (NudgeConfig.requireUsageSampleForPressure); the host early-
+   *     advertising arm (emergencyNudge) must mirror this bit. Absent on
+   *     hand-built decisions — pre-fix semantics apply there.
+   */
   [key: string]: number;
 }
 
