@@ -54,7 +54,7 @@ export function syntheticSummaryRef(blockId: string): string {
     return indexToRef(SYNTHETIC_SUMMARY_REF_BASE + (fnv1a(blockId) % SYNTHETIC_SUMMARY_REF_SPAN));
 }
 
-export interface FoldSummaryCcrOutcome {
+interface FoldSummaryCcrOutcome {
     /** Egress view with rendered summaries swapped for placeholders. */
     messages: CoreMessage[];
     /** Content store with every touched summary's prose stored (append-only). */
