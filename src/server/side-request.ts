@@ -153,9 +153,9 @@ export function isDshTitleRequest(parsed: unknown): boolean {
 
 // #4438: dsh's auto-review sidecar (@deepseek-ai/dsh-experimental-auto-review's
 // classifyRisk()) fires before every native tool call under the Auto permission
-// tier: a fixed REVIEW_POLICY system prompt + exactly ONE freshly-flattened user
-// blob (ENVIRONMENT / PROJECT_INSTRUCTIONS / FILTERED_HISTORY / PENDING_ACTION),
-// no tools, same conversation id as the main turn. On at least one deployment
+// tier: a fixed REVIEW_POLICY system prompt + a freshly-flattened user body
+// (ENVIRONMENT / PROJECT_INSTRUCTIONS / FILTERED_HISTORY / PENDING_ACTION), no
+// tools, same conversation id as the main turn. On at least one deployment
 // class (web profile behind a gateway) the extension's own model client reaches
 // bili UNSTAMPED — no x-bili-plugin — while the session's sticky plugin binding
 // keeps the #2432 rebase gate armed for it: every header-gated isolation gate
@@ -166,12 +166,37 @@ export function isDshTitleRequest(parsed: unknown): boolean {
 // skips the output clamp (#453) into permanent upstream 400s.
 // Shape-decisive WITHOUT a caller-side header gate — deliberately different from
 // isDshTitleRequest's discipline: the shape carries its own client evidence
-// (dsh's fixed REVIEW_POLICY first line, version-pinned like
+// (dsh's fixed REVIEW_POLICY sentence, version-pinned like
 // DSH_TITLE_SYSTEM_PREFIX / DSH_COMPACTION_INSTRUCTION_PREFIX), and the header
 // gate is precisely what failed here. A main turn can never match: it carries a
-// tools surface and multi-turn history; the single-blob bar rejects every
-// history-replaying request.
+// tools surface, and every entry-level loop below vetoes any assistant/tool
+// turn — which every real history resend has.
+// #6104: two bars were host-side FORMAT decisions that moved, not identity.
+// REVIEW_POLICY gained a `REVIEW_POLICY` banner line (the sentence is no longer
+// line 1 ⇒ line-scan, see DSH_AUTO_REVIEW_HEAD_LINES), and 0.2.2's
+// reviewMessages() replays the WHOLE conversation as role:"user" text blobs (so
+// the old `users === 1` bar rejected the very request it was written for, and
+// the review then ate the fold ledger it was supposed to leave alone: 107 DEAD
+// tombstones, 0 compressions across the reporter's 5 sessions). The replay veto
+// never needed the user count — the assistant/tool veto carries it.
 export const DSH_AUTO_REVIEW_SYSTEM_PREFIX = "You are the final authorization reviewer for exactly one pending tool call";
+
+// #6104: dsh versions its REVIEW_POLICY by PREFIXING it with a banner line
+// (`REVIEW_POLICY` on 0.2.2-rc.1), so a first-line pin silently misses the
+// whole review traffic on any host build that adds one more line above the
+// sentence. The pin stays version-pinned to the SENTENCE; only its position is
+// read tolerantly — the first few lines of the system carrier, never the whole
+// prompt (a policy QUOTED deep inside some other agent's prompt must not
+// identify a review call; the reporter's own #6104 body shows nothing else in
+// the request can rescue the match, so a miss here runs the review through the
+// full pipeline and tombstones its refs as DEAD).
+const DSH_AUTO_REVIEW_HEAD_LINES = 5;
+
+/** The pinned reviewer sentence on any line of the system carrier's head. */
+function isDshAutoReviewPolicy(text: string): boolean {
+    const lines = text.split("\n", DSH_AUTO_REVIEW_HEAD_LINES);
+    return lines.some((line) => line.trimStart().startsWith(DSH_AUTO_REVIEW_SYSTEM_PREFIX));
+}
 
 export function isDshAutoReviewRequest(protocol: string | null, parsed: unknown): boolean {
     if (protocol === null || !parsed || typeof parsed !== "object") return false;
@@ -182,7 +207,7 @@ export function isDshAutoReviewRequest(protocol: string | null, parsed: unknown)
     // The fixed reviewer policy on ANY wire's system carrier (top-level system,
     // instructions, systemInstruction.parts, or a role:system entry in
     // messages[]/input[]) — systemCarrierTexts reads them all (#3149 lesson).
-    if (!systemCarrierTexts(p).some((t) => t.trimStart().startsWith(DSH_AUTO_REVIEW_SYSTEM_PREFIX))) return false;
+    if (!systemCarrierTexts(p).some(isDshAutoReviewPolicy)) return false;
     const entries = protocol === "responses" ? p.input : protocol === "google" ? p.contents : p.messages;
     if (!Array.isArray(entries)) return false;
     let users = 0;
@@ -204,10 +229,11 @@ export function isDshAutoReviewRequest(protocol: string | null, parsed: unknown)
             userHasContent = true;
         }
     }
-    // Exactly ONE non-system message with content: the freshly-flattened review
-    // snapshot. A replayed history (any assistant/tool turn or a second user
-    // message) vetoes — see the comment above the constant.
-    return users === 1 && userHasContent;
+    // ONE or MORE non-system messages with content: the freshly-flattened
+    // review snapshot (#4438) or its history-replaying form (#6104). The replay
+    // veto is the loop above — any assistant/tool turn returns false — so a real
+    // history resend can never reach this line, whatever its user count.
+    return users >= 1 && userHasContent;
 }
 /** #5687 follow-up: a sidecar never carries a durable-state marker. dsh injects
  *  its durable payloads (skills, workspace instructions, MCP catalog, runtime
