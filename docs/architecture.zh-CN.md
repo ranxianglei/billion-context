@@ -25,7 +25,7 @@
 | `pipeline` | 请求管道（handle / prepare-* / relay / inject） | [pipeline.zh-CN.md](./architecture/pipeline.zh-CN.md) · [EN](./architecture/pipeline.md) | ✅ |
 | `lanes` | 宿主车道（dsh / pi / opencode / codex / 裸代理 + lane-decisions） | [lanes.zh-CN.md](./architecture/lanes.zh-CN.md) · [EN](./architecture/lanes.md) | ✅ |
 | `kernel` | 压缩内核（acp-kernel：折叠 / 摘要 / ref 账本） | [kernel.zh-CN.md](./architecture/kernel.zh-CN.md) · [EN](./architecture/kernel.md) | ✅ |
-| `identity` | 会话与消息身份（session id / persona fork / msgid 通道） | [identity.zh-CN.md](./architecture/identity.zh-CN.md) · [EN](./architecture/identity.md) | ✅ |
+| `identity` | 会话与消息身份、种子分叉继承验证及重放 | [identity.zh-CN.md](./architecture/identity.zh-CN.md) · [EN](./architecture/identity.md) | ✅ |
 | `fastpaths` | 快路径（增量车道 / v5 watermark / D-lane 快照渲染） | [fastpaths.zh-CN.md](./architecture/fastpaths.zh-CN.md) · [EN](./architecture/fastpaths.md) | ✅ |
 | `webui` | Web 面板与 admin 面 | [webui.zh-CN.md](./architecture/webui.zh-CN.md) · [EN](./architecture/webui.md) | ✅ |
 | `update` | 自更新、advisory、插件安装 | [update.zh-CN.md](./architecture/update.zh-CN.md) · [EN](./architecture/update.md) | ✅ |

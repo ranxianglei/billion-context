@@ -12,7 +12,7 @@ import { once } from "node:events";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { forkChildVerdict, _maybeForkAdoptBeforeSendForTest, _resetForkGateDiagnosticsForTest, _resetRegisterForTest, type ForkChildVerdict, type PluginContext } from "../src/agent/dsh-native.ts";
-import { forkIdentityHashOf, forkOrderHashOf, openaiBodyToCore, resetForkCapabilityCacheForTest } from "../src/agent/fork-adopt.ts";
+import { forkDurableIdentitiesOf, forkIdentityHashOf, forkOrderHashOf, openaiBodyToCore, resetForkCapabilityCacheForTest } from "../src/agent/fork-adopt.ts";
 
 process.env.NODE_ENV = "test";
 const testRoot = mkdtempSync(join(tmpdir(), "bili-issue4215-"));
@@ -212,6 +212,63 @@ test("forkSource parent reaches the adoption protocol before the first request",
     assert(forkRequest?.body, JSON.stringify(requests));
     assert.equal(forkRequest.body.parentConversationId, "parent-sid");
     assert.equal(forkRequest.body.childConversationId, "fork-source-child-sid");
+});
+
+test("ordinary fork sidechat and seeded subagent share durable adoption while fresh children do not", async () => {
+    resetForkCapabilityCacheForTest();
+    const core = openaiBodyToCore(JSON.parse(validInit.body as string))!;
+    const orderedMessages = core.map((message) => ({ rawId: message.id, ref: null, identityHash: forkIdentityHashOf(message) }));
+    const posted: Record<string, unknown>[] = [];
+    const server = http.createServer(async (req, res) => {
+        const chunks: Buffer[] = [];
+        for await (const chunk of req) chunks.push(Buffer.from(chunk));
+        res.setHeader("content-type", "application/json");
+        if (req.url === "/__bili/plugin/manifest") return void res.end(JSON.stringify({ capabilities: { fork: { protocolVersion: 2 } } }));
+        if (req.url?.startsWith("/__bili/plugin/snapshot?")) {
+            if (!req.url.includes("mode=raw")) {
+                res.writeHead(409);
+                return void res.end(JSON.stringify({ code: "SNAPSHOT_UNAVAILABLE" }));
+            }
+            return void res.end(JSON.stringify({ parentRevision: "rev-unified", comparison: "raw", durableFork: true, orderHash: forkOrderHashOf(orderedMessages), orderedMessages }));
+        }
+        if (req.url === "/__bili/plugin/fork") {
+            posted.push(JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>);
+            res.writeHead(201);
+            return void res.end(JSON.stringify({ replayed: false }));
+        }
+        res.writeHead(404);
+        res.end();
+    });
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const address = server.address();
+    assert(address && typeof address === "object");
+    try {
+        _resetRegisterForTest(`http://127.0.0.1:${address.port}`, true);
+        const scenarios: Array<{ id: string; header: NonNullable<SessionShape["header"]>; seeded: boolean }> = [
+            { id: "unified-ordinary", header: { isSeeded: true, forkSource: { sessionId: "parent-sid", boundary: 42 } }, seeded: true },
+            { id: "unified-sidechat", header: { isSeeded: true, parentSession: "parent-sid", forkSource: { sessionId: "parent-sid", boundary: 42 } }, seeded: true },
+            { id: "unified-subagent", header: { isSeeded: true, parentSession: "parent-sid", forkSource: { sessionId: "parent-sid", boundary: 40 } }, seeded: true },
+            { id: "unified-legacy-seeded", header: { isSeeded: true, parentSession: "parent-sid" }, seeded: true },
+            { id: "unified-fresh-child", header: { isSeeded: false, parentSession: "parent-sid" }, seeded: false },
+        ];
+        for (const scenario of scenarios) {
+            const before = posted.length;
+            await _maybeForkAdoptBeforeSendForTest(ctxWithInitiator(() => ({ session: { id: scenario.id, header: scenario.header } })), validInit);
+            assert.equal(posted.length, before + Number(scenario.seeded), scenario.id);
+            if (!scenario.seeded) continue;
+            const payload = posted.at(-1)!;
+            assert.equal(payload.childConversationId, scenario.id);
+            assert.equal(payload.parentConversationId, "parent-sid");
+            assert.equal(payload.protocolVersion, 2);
+            assert.equal(payload.comparison, "raw");
+            assert.deepEqual(payload.durableFork, { messages: forkDurableIdentitiesOf(core) });
+        }
+    } finally {
+        server.close();
+        server.closeAllConnections?.();
+        await once(server, "close").catch(() => undefined);
+    }
 });
 
 test("malformed seeded lineage: one warn per anomaly naming what is missing (#4215)", async () => {
