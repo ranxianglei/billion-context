@@ -32,7 +32,7 @@ interface WitnessEntry {
 
 /** sessionId → ring of recent witness hashes (oldest first, capped). */
 const rings = new Map<string, WitnessEntry[]>();
-/** witness hash → set of sessionIds holding it (populated on lookup sweep). */
+/** witness hash → set of sessionIds holding it (added on record, pruned on sweep). */
 const hashIndex = new Map<string, Set<string>>();
 let lastRecordSweepAt: number | undefined;
 
