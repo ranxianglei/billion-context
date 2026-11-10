@@ -204,7 +204,12 @@ describe("#4484 merge preserves existing block coverage", () => {
     assert.ok(res.result.warnings.some((w) => w.includes("b2")), JSON.stringify(res.result.warnings));
   });
 
-  it("impossible merge: a range whose only content is the defective block refuses actionably", () => {
+  it("defective-block-only span: #5919 recovers by extending the fold to the stranded result", () => {
+    // Pre-#5919 this span refused with an actionable error and the block's
+    // stranded result could never fold (its pair partner sat inside the
+    // block's coverage): the merge dead-ended and every retry re-failed the
+    // same way. The recovery rung now folds the stranded result INTO the
+    // merge so the turn closes — coverage is preserved, nothing lost.
     const { core, messages, state } = buildMidPairFixture();
     const before = coveredMessageIds(state);
     const res = core.applyCompression({
@@ -213,10 +218,25 @@ describe("#4484 merge preserves existing block coverage", () => {
       config,
       ranges: [{ startRef: "b2", endRef: "b2", summary: SUMMARY }],
     });
-    assert.equal(res.result.errors.length, 1, JSON.stringify(res.result));
-    assert.equal(res.result.blocksCreated, 0);
-    assert.match(res.result.errors[0]!, /cannot satisfy turn integrity/);
-    assert.deepEqual(lostCoverage(before, res.state), [], "state must stay untouched");
+    assert.equal(res.result.errors.length, 0, JSON.stringify(res.result));
+    assert.equal(res.result.blocksCreated, 1);
+    assert.ok(
+      res.result.warnings.some((w) =>
+        w.startsWith("Extended this merge to fold stranded partner(s)"),
+      ),
+      JSON.stringify(res.result.warnings),
+    );
+    const merged = res.state.blocks.find(
+      (b) => b.active && b.effectiveMessageIds.includes("read-result"),
+    );
+    assert.ok(merged, "the recovered merge must create a block");
+    for (const id of ["read-call", "read-result"])
+      assert.ok(merged!.effectiveMessageIds.includes(id), id);
+    assert.ok(
+      !res.state.blocks.find((b) => b.blockId === "b2")!.active,
+      "the defective block is consumed by the recovery",
+    );
+    assert.deepEqual(lostCoverage(before, res.state), [], "no pre-existing coverage lost");
   });
 
   it("control: a clean merge (no split, no protected tool) loses nothing", () => {

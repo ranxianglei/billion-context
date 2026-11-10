@@ -20,8 +20,18 @@
 //      source, #4491) and the whole-turn-degrade contract: an adapter returns
 //      exactly `expectedLen` ids in wire order or null — a partial or shifted
 //      array degrades the ENTIRE turn to the pre-wiring path. Ids are never
-//      reused by any harvested client, so misbinding is impossible; a failed
-//      alignment at worst misses pinning, it cannot attach a wrong identity.
+//      reused by any harvested client, so a harvested id can never belong to
+//      ANOTHER session; the residual risk is an intra-session positional
+//      misbinding — an EVEN transcript/wire shift keeps the user/assistant
+//      role pattern intact and defeats role checks — which the per-session
+//      id-continuity check in alignTailIds exists to reject: any store
+//      rewrite/compaction/late-appended row that moves an already-pinned row
+//      degrades the turn instead of re-stamping shifted ids. A failed
+//      alignment at worst misses pinning (consequence: cache-pin drift);
+//      identity leakage across sessions is structurally impossible. A pure
+//      EVEN late append that leaves every already-pinned row untouched is
+//      undecidable from roles alone (the store rows really are at those
+//      indices) and stays a bounded pin-drift residual.
 //
 // Consumption after a hit is exactly today's stamped-body path: handle.ts
 // re-stamps the validated ids onto `parsed` under MSG_IDS_BODY_FIELD before
@@ -42,8 +52,20 @@ const ENV = "BILI_IDENTITY_HARVEST";
  *  tail (dropping a possibly-partial first line) is exact for its purpose. */
 export const HARVEST_TAIL_BYTES = 16 * 1024 * 1024;
 export const MAX_PROJECT_DIRS = 2000;
-/** Boundary positions compared when both sides expose roles at them. */
-const MAX_ROLE_SPOT_CHECK = 4;
+
+/** #5898 review: per-session id-continuity guard. The role check cannot see
+ *  an EVEN transcript/wire shift (user/assistant alternation keeps the role
+ *  pattern intact — e.g. the client appended a row after the request was
+ *  built, or its store was compacted/rewritten), so the registry remembers
+ *  the last stamped tail per session and rejects any alignment whose overlap
+ *  with that tail disagrees on an id — the signature of a moved row. Append-
+ *  only stores pass trivially: shared rows keep their ids. Bounded: the
+ *  oldest session is evicted at the cap; a missing entry merely skips the
+ *  check for that one turn and re-arms on the next successful alignment
+ *  (cost bounded to the pre-check behavior — a role-pattern-consistent even
+ *  shift on a FRESH session degrades to pin drift, never cross-session
+ *  leakage, since ids are never reused by harvested clients). */
+const LAST_ALIGNED_MAX = 512;
 
 export interface IdentityHarvestCtx {
     /** The recognized conversation-identity value for this request (the raw
@@ -91,6 +113,7 @@ function enabledSources(): Set<string> | null {
 }
 
 const warned = new Set<string>();
+const lastAligned = new Map<string, { ids: string[]; rowsLen: number }>();
 function warnOnce(key: string, message: string): void {
     if (warned.has(key)) return;
     warned.add(key);
@@ -107,27 +130,49 @@ export function headerFirst(ctx: IdentityHarvestCtx, name: string): string | und
 export function resetIdentityHarvestForTest(): void {
     sources = [];
     warned.clear();
+    lastAligned.clear();
 }
 
 /** Tail alignment shared by every harvest source: exact count parity on the
- *  last `expectedLen` rows + a role spot-check over up to MAX_ROLE_SPOT_CHECK
- *  boundary positions WHERE BOTH SIDES EXPOSE A ROLE (either side lacking one
- *  at a position skips it — schemas differ per client). Any agreement
- *  disagreement degrades the whole turn. ids in wire order. */
+ *  last `expectedLen` rows + a FULL role-sequence check over every position
+ *  where both sides expose a role (was a 4-position spot check; a shift that
+ *  flips the role pattern anywhere in the tail degrades the turn) + the
+ *  per-session id-continuity check (see lastAligned). Either side lacking a
+ *  role at a position skips that position — schemas differ per client. ids
+ *  in wire order. */
 export function alignTailIds(ctx: IdentityHarvestCtx, rows: Array<{ id: string; role?: string }>): string[] | null {
     if (rows.length < ctx.expectedLen) return null;
     const tail = rows.slice(-ctx.expectedLen);
     if (ctx.messageRoles && ctx.messageRoles.length === ctx.expectedLen) {
-        let checked = 0;
-        for (let i = tail.length - 1; i >= 0 && checked < MAX_ROLE_SPOT_CHECK; i--) {
+        for (let i = 0; i < tail.length; i++) {
             const want = String(ctx.messageRoles[i] ?? "").toLowerCase();
             const have = tail[i].role?.toLowerCase();
             if (!want || !have) continue;
             if (want !== have) return null;
-            checked++;
         }
     }
-    return tail.map((r) => r.id);
+    const ids = tail.map((r) => r.id);
+    const prev = lastAligned.get(ctx.sessionId);
+    if (prev !== undefined) {
+        // Overlap of the two tails on shared STORE-ROW indices: [max(starts),
+        // min(end)). Append-only stores agree there by construction; a
+        // rewrite/shift/compaction moves a row's id into a different index
+        // and the mismatch degrades the turn instead of re-stamping it.
+        const prevStart = prev.rowsLen - prev.ids.length;
+        const curStart = rows.length - ids.length;
+        const overlapStart = Math.max(prevStart, curStart);
+        const overlapEnd = Math.min(prev.rowsLen, rows.length);
+        for (let r = overlapStart; r < overlapEnd; r++) {
+            if (prev.ids[r - prevStart] !== ids[r - curStart]) return null;
+        }
+    }
+    lastAligned.set(ctx.sessionId, { ids, rowsLen: rows.length });
+    while (lastAligned.size > LAST_ALIGNED_MAX) {
+        const oldest = lastAligned.keys().next().value;
+        if (oldest === undefined) break;
+        lastAligned.delete(oldest);
+    }
+    return ids;
 }
 
 type HarvestResult = { ids: readonly string[]; sourceId: string } | null;

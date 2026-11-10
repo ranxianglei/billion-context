@@ -213,7 +213,10 @@ const LEGACY_STATUS_SECTION_STARTS = [
     "Every event above is an UNCONFIRMED signal",
     "Fix (",
     "Fix: ",
+    // Both spellings: reports persisted before #5920's doc centralization carry
+    // the old pointer and must keep stripping on upgraded instances.
     "CONFIGURATION.md →",
+    "docs/configuration.md →",
     "CRITICAL ADVISORY (instance-level): ",
     "CRITICAL UPDATE READY (instance-level): ",
     "CRITICAL UPDATE AVAILABLE (instance-level): ",
