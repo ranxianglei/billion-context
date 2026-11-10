@@ -438,8 +438,9 @@ export function clearEstimateCoreMessagesMemoForTests(): void {
 // #554: side requests bypass the pipeline (#388) and are forwarded VERBATIM,
 // so their fit decision must be made on the RAW client body — the kernel view
 // is empty on that path (processedMessages: []). Walks every string leaf of
-// the parsed body through the same CJK-aware defaultCountTokens; binary-
-// carrying fields (base64 image data, data-URLs) are excluded because
+// the parsed body (iterative explicit stack — client bodies may nest beyond
+// recursion depth, #6038) through the same CJK-aware defaultCountTokens;
+// binary-carrying fields (base64 image data, data-URLs) are excluded because
 // imageTokensInParsedBody charges those separately. Slightly overcounts (ids,
 // roles, structural strings) — a conservative bias is right for a guard that
 // fails closed.
@@ -452,20 +453,21 @@ const NON_TEXT_BODY_KEYS = new Set(["data", "url", "b64_json", "file_data", "ima
 
 export function estimateRawBodyTokens(parsed: unknown): number {
     let tokens = 0;
-    const walk = (value: unknown, key?: string): void => {
+    const pending: [unknown, string | undefined][] = [[parsed, undefined]];
+    while (pending.length > 0) {
+        const [value, key] = pending.pop()!;
         if (typeof value === "string") {
             if (!key || !NON_TEXT_BODY_KEYS.has(key)) tokens += defaultCountTokens(value);
-            return;
+            continue;
         }
         if (Array.isArray(value)) {
-            for (const item of value) walk(item, key);
-            return;
+            for (const item of value) pending.push([item, key]);
+            continue;
         }
         if (value && typeof value === "object") {
-            for (const [k, v] of Object.entries(value as Record<string, unknown>)) walk(v, k);
+            for (const [k, v] of Object.entries(value as Record<string, unknown>)) pending.push([v, k]);
         }
-    };
-    walk(parsed);
+    }
     return tokens;
 }
 
@@ -486,26 +488,28 @@ export interface RawBodyBreakdown {
 
 export function estimateRawBodyBreakdown(parsed: unknown): RawBodyBreakdown {
     const buckets: [number, number, number, number] = [0, 0, 0, 0]; // messages, tools, system, other
-    const walk = (value: unknown, key: string | undefined, bucket: number): void => {
-        if (typeof value === "string") {
-            if (!key || !NON_TEXT_BODY_KEYS.has(key)) buckets[bucket] += defaultCountTokens(value);
-            return;
-        }
-        if (Array.isArray(value)) {
-            for (const item of value) walk(item, key, bucket);
-            return;
-        }
-        if (value && typeof value === "object") {
-            for (const [k, v] of Object.entries(value as Record<string, unknown>)) walk(v, k, bucket);
-        }
-    };
+    const pending: [unknown, string | undefined, number][] = [];
     if (parsed && typeof parsed === "object") {
         for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
             const bucket = k === "messages" ? 0 : k === "tools" ? 1 : k === "system" ? 2 : 3;
-            walk(v, k, bucket);
+            pending.push([v, k, bucket]);
         }
     } else {
-        walk(parsed, undefined, 3);
+        pending.push([parsed, undefined, 3]);
+    }
+    while (pending.length > 0) {
+        const [value, key, bucket] = pending.pop()!;
+        if (typeof value === "string") {
+            if (!key || !NON_TEXT_BODY_KEYS.has(key)) buckets[bucket] += defaultCountTokens(value);
+            continue;
+        }
+        if (Array.isArray(value)) {
+            for (const item of value) pending.push([item, key, bucket]);
+            continue;
+        }
+        if (value && typeof value === "object") {
+            for (const [k, v] of Object.entries(value as Record<string, unknown>)) pending.push([v, k, bucket]);
+        }
     }
     return {
         total: buckets[0] + buckets[1] + buckets[2] + buckets[3],

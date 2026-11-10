@@ -74,6 +74,10 @@ interface CompressLoopAnthropicRequestOptions {
     /** #1884: re-sign hook for the armed tunnel — same contract as the unified
      *  loop's RequestOptions.resign (loop/core.ts). */
     resign?: (headers: Record<string, string>, body: string | Buffer) => void;
+    /** #6003 phase 2: user egress-transform pipeline hook — runs after the round
+     *  body is built and before resign so the signature covers shipped bytes.
+     *  undefined when unconfigured (exact no-op). */
+    egress?: (body: string | Buffer) => Promise<string | Buffer>;
 }
 
 export async function compressLoopAnthropicJson(
@@ -137,7 +141,10 @@ export async function compressLoopAnthropicJson(
             { role: "assistant", content: original },
             { role: "user", content: userTurn },
         ];
-        const roundBody = JSON.stringify(requestOptions.wireTransform ? requestOptions.wireTransform(requestBody) : requestBody);
+        let roundBody: string | Buffer = JSON.stringify(requestOptions.wireTransform ? requestOptions.wireTransform(requestBody) : requestBody);
+        // #6003 phase 2: user egress-transform pipeline before the re-sign so the
+        // signature covers the shipped bytes.
+        if (requestOptions.egress) roundBody = await requestOptions.egress(roundBody);
         requestOptions.resign?.(requestOptions.headers, roundBody);
         log(`[acp-proxy: non-stream anthropic proxy-tool round ${round}; re-requesting so the model sees the result]`);
         const result = await fetchWithRetry(

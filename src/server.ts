@@ -12,6 +12,7 @@ import type { ProxyOptions, ResignSettings } from "./config.js";
 export type { ProxyOptions } from "./config.js";
 import { loadNamedProviders, loadOptions, loadRoutes } from "./config.js";
 import { resetProxyCache } from "./upstream-proxy.js";
+import { withExitDeadline } from "./exit-deadline.js";
 import { effectivePromptCacheRouting, FALLBACK_EFFECTIVE_WINDOW_FLOOR, findRoute, findRouteKey, lookupContextLimit, resolveConfiguredContextLimit, resolveConfiguredOutputLimit, resolveCompressProtocol, resolveMessageTimestamps, resolveResignSettings } from "./config.js";
 import { contextFromRegistry, loadRegistry, peekRegistryContext, peekRegistryOutputLimit, peekRegistryPriceProfile } from "./registry.js";
 import { codexAlignedWindow } from "./codex-models.js";
@@ -54,7 +55,8 @@ import { prepareResponses, prepareResponsesCompact } from "./server/prepare-resp
 import { FORCE_TEXT_PROTOCOL } from "./server/inject.js";
 export { isChatGptCodexUpstream, isCodexResponsesLite, resolvePromptCacheKey, shouldInjectPromptCacheKey } from "./server/prepare-responses.js";
 import { biliToolsDeclaredOnWire, countBiliToolUses, evaluateSelfHealRound, nudgeSuppressed, pluginLaneDegraded, pluginLaneRestore } from "./session-self-heal.js";
-import { getSession, hasProcessedState, listSessions, peekSession, type PendingRetrieval, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, totalInFlight, snapshotMessages, ensureCanonicalId, storeEffectiveConfig, foldCoverage, postRebuildAnchorTokens, setPostRebuildAnchor, tickPostRebuildAnchor, splitSessionWarnings, usageAnchorCycleStale, staleSmallAnchorFallback, RESPONSES_TURN_SEPARATOR_ID_PREFIX } from "./session.js";
+import { getSession, hasProcessedState, listSessions, peekSession, type PendingRetrieval, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, totalInFlight, snapshotMessages, ensureCanonicalId, storeEffectiveConfig, foldCoverage, postRebuildAnchorTokens, setPostRebuildAnchor, tickPostRebuildAnchor, splitSessionWarnings, usageAnchorCycleStale, staleSmallAnchorFallback } from "./session.js";
+import type { SeparatorManifest } from "./server/responses-ordering.js";
 import { detectStaleInstall, isVersionNewer } from "./update.js";
 import { decideEaddrinuse, eaddrinuseExitCode, isPortBusyError, postBindCanLadder, UPGRADE_REPLACEMENT_ENV, type FailFastReason } from "./listen-policy.js";
 import { getAdvisoryState, cannotResolveTarget } from "./advisory.js";
@@ -88,15 +90,14 @@ import { extractBillingAttributionBlock, extractSummaryFromSse, preflightCompres
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, DEFAULT_DECIDE_MAX_TOKENS, DECIDE_TIMEOUT_MS, extractDecisionText, ladderMode, parseDecision, recordDecision, resolveDecisionRange, type DecideConfig, type DecisionOutcome } from "./nudge-decide.js";
 import { gcConfigFromEnv, gcSessionFiles } from "./session-gc.js";
 import { countImagesInParsedBody, countImagesInRawBody, imageTokensInRawBody, imageTokensInParsedBody, resolveImageBilling, upstreamHost, type ResolvedImageBilling } from "./image-tokens.js";
-import { APIG_RESIGN_HEADER, APIG_RESIGN_CREDENTIAL_HEADER, APIG_RESIGN_SCHEME, KNOWN_SIGNATURE_SCHEMES, clearSignedRefusal, decodeApigCredential, inboundSignedScheme, readPendingRefusals, recordSignedRefusal, resignApig, signedRefusal, unresolvedRefusals, type ApigCredential } from "./apig-resign.js";
+import { APIG_RESIGN_HEADER, APIG_RESIGN_CREDENTIAL_HEADER, APIG_RESIGN_SCHEME, KNOWN_SIGNATURE_SCHEMES, clearSignedRefusal, decodeApigCredential, flushResignPending, inboundSignedScheme, readPendingRefusals, recordSignedRefusal, resignApig, signedRefusal, unresolvedRefusals, type ApigCredential } from "./apig-resign.js";
 import { renderUI, handleConfigGet, handleConfigPut, handleSummaryCredentialPut, buildOverview, buildSessionList, buildSessionPage, buildSessionDetail, hiddenEmptyCount } from "./web/index.js";
 import { reapOrphanBlocks } from "./orphan-gc.js";
 import { conflictScanEnabled, isDesignBenign, scanClientPlugins, sniffScanClient } from "./thirdparty-scan.js";
 import { clearConflictEvents, recordConflict, summarizeConflicts } from "./conflict-watch.js";
 import { getStore, setGlobalSessionCommitListener } from "./persist.js";
 import { log as loggerLog, configureLogger, getLogPath, closeLogger, isStreamWriteError, isBenignSocketRaceError, enterSessionContext, muteStderrLeg, onFileLegLive, shouldMuteStderrLegAfterFileLive, logTimestamp } from "./logger.js";
-import { noteRequest } from "./attach-heartbeat.js";
-import { queryLogLines } from "./web/logs-query.js";
+import { configureLogRetention } from "./log-retention.js";
 import { configFile, defaultLogFile, sessionsDir, stateDir } from "./paths.js";
 import { atomicWriteInstanceFile, clearProxyInstanceFile, classifySameLanePeer, entryShape, findPresentUnverifiedSameLaneTwin, findSameLanePredecessor, findVerifiedSameLaneTwin, isPidAlive, listInstances, markPortReleased, probePid, readProxyInstanceFile, registerInstanceAndWarn, resolveOwnFingerprint, sameInstanceShape, SPAWN_FINGERPRINT_ENV, unregisterInstance, warnOnNewPeers, writeSpawnPortLog, type InstanceShape, type PidProbe, type ProxyInstanceFile, type RegistryEntry, type SameLanePeer } from "./instance.js";
 import { createServedMarkerWriter, peerStillContests, processStartMs, reapStaleWriterMarkers, writerMarkerDir, type ServedMarkerWriter } from "./served-markers.js";
@@ -119,7 +120,7 @@ import { maybeAdoptForkBlocks, maybeAdoptResume, reconcileDerivedLineage } from 
 import { flushPrefixAffinity, hydratePrefixAffinity, scheduleAffinityPersist } from "./affinity-persist.js";
 import { flushOrderSkeletons, hydrateOrderSkeletons } from "./order-persist.js";
 import { setSimhashAdoptionEnabled } from "./prefix-affinity.js";
-import { consumePluginRegisterFor, flushConversations, handlePluginCompact, handlePluginManifest, handlePluginFork, handlePluginSnapshot, handlePluginRegister, handlePluginRuntimeInfo, handlePluginStatus, handlePluginTool, isPluginFoldCallId, loadConversations, pluginAgentHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginReportedContextWindow, pluginReportedMaxOutput, pluginRequestAgentHeader, pluginRuntimeInfoFor, pluginRuntimeInfoForConversation, recordChainVerdict, recordPluginSession, rememberPluginMessages, resolveConversation, runtimeConversationId, takePendingPluginRegister } from "./plugin.js";
+import { consumePluginRegisterFor, flushConversations, handlePluginCompact, handlePluginManifest, handlePluginFork, handlePluginSnapshot, handlePluginRegister, handlePluginRuntimeInfo, handlePluginStatus, handlePluginTool, isPluginFoldCallId, loadConversations, hydratePluginConversationsUnified, pluginAgentHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginReportedContextWindow, pluginReportedMaxOutput, pluginRequestAgentHeader, pluginRuntimeInfoFor, pluginRuntimeInfoForConversation, recordChainVerdict, recordPluginSession, rememberPluginMessages, resolveConversation, runtimeConversationId, takePendingPluginRegister } from "./plugin.js";
 import { setupMitm, readMitmUpstream, getBlindTunnelStats, liveBlindTunnels, MITM_RAW_SOCKET_KEY } from "./mitm.js";
 import { evaluateChain, extractChainCarriers, stripEmbeddedChainCarriers } from "./chain-checkpoint.js";
 import type { BiliMessage } from "acp-kernel/wire";
@@ -142,6 +143,7 @@ import {
     limitsReceiveBytes as knobLimitsReceiveBytes,
     limitsMaxMessages,
     limitsIngestBytes as knobLimitsIngestBytes,
+    logRetentionPolicy as knobLogRetentionPolicy,
     noCompressPrompt as knobNoCompressPrompt,
     noInjectTool as knobNoInjectTool,
     postResponseLingerMs as knobPostResponseLingerMs,
@@ -154,7 +156,6 @@ import { BILI_HOP_HEADER, anthropicBetaContextWindow, capRegistryWindowByStandar
 import { connectionNamedHeaders, NO_IDENTITY_MESSAGE, stripRemoteCompactionBetaFeature, UPSTREAM_HOP_HEADERS } from "./server/headers.js";
 import { installWebSocketBridge } from "./ws-bridge.js";
 import { codexResponsesCodec, responsesCodec } from "./responses-ws.js";
-import { currentFetchTransport } from "./fetch-transport.js";
 import { demoteGate, hasLeakedBiliToolsOnly, isSideRequest, outputBudgetField, resolveSideLane, restoreOutputBudget, SIDE_REQUEST_MAX_TOKENS, sideRequestGuard, stripLeakedBiliTools } from "./server/side-request.js";
 import { DSH_COMPACTION_SHAPE_MSGS, dshCompactionRefusal, isDshCompactionCall } from "./server/dsh-compaction-guard.js";
 import { clampOutgoingOutput, countSystemAndToolsTokens, emergencyNudge, estimateInputTokens, estimateWireOverhead, projectThinkingMass, readOutputBudget } from "./server/budget.js";
@@ -493,6 +494,10 @@ export interface EngineContext {
 }
 
 export async function createEngineContext(opts: ProxyOptions): Promise<EngineContext> {
+    // Resolve the private-log retention policy BEFORE the logger opens a file:
+    // this is the acyclic startup boundary (config.ts + knobs.ts import logger.ts,
+    // so the logger can never read them itself). Env > config file > default.
+    configureLogRetention(knobLogRetentionPolicy());
     // Configure the tee logger (file + stderr) BEFORE any logging so the very
     // first line (persist status) lands in the file too.
     const filePath = configureLogger(opts.logFile ?? defaultLogFile());
@@ -571,6 +576,9 @@ export async function createEngineContext(opts: ProxyOptions): Promise<EngineCon
         process.exit(1);
     }
     loadConversations();
+    // #5753: layer the sqlite routing-table row over the file view and migrate
+    // any file-only routes one time (needs initSessions' store to be live).
+    void hydratePluginConversationsUnified();
     log("info", `[persist] ${getStore().enabled ? "enabled" : "disabled"}`);
     // #2807: restore fork lineage that a restart orphaned. Every fork writes
     // metadata.derivedFromSessionId, but both adoption paths read process-local
@@ -646,6 +654,10 @@ export async function createEngineContext(opts: ProxyOptions): Promise<EngineCon
 }
 
 export async function startServer(opts: ProxyOptions): Promise<http.Server> {
+    // Same acyclic startup boundary as createEngineContext: startServer opens the
+    // file leg for the watchdog and the twin exits BEFORE the engine exists, so
+    // the retention policy must already be resolved here (idempotent).
+    configureLogRetention(knobLogRetentionPolicy());
     const launchToken = process.env.BILI_LAUNCH_TOKEN?.trim();
     // #1225: lane identity + code fingerprint recorded into the instance file
     // so later launches can decide reuse by WHO started us and WHICH code we
@@ -1521,11 +1533,14 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
                     log("error", `listen failed: ${outcome.message}`);
                     shuttingDown = true;
                     server.close();
-                    flushConversations();
-                    void flushAllSessions().finally(() => {
+                    void (async () => {
+                        await withExitDeadline("die-path storage flushes", (async () => {
+                            await flushConversations();
+                            await flushAllSessions();
+                        })());
                         closeLogger();
                         process.exit(1);
-                    });
+                    })();
                     return;
                 }
             }
@@ -1659,22 +1674,28 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
             }
             shuttingDown = true;
             server.close();
-            flushConversations();
-            void flushAllSessions().finally(() => {
+            void (async () => {
+                await withExitDeadline("busy-port storage flushes", (async () => {
+                    await flushConversations();
+                    await flushAllSessions();
+                })());
                 closeLogger();
                 process.exit(eaddrinuseExitCode(busyReason));
-            });
+            })();
         } catch (e) {
             // The listen already failed; a crash here must still end the process
             // cleanly instead of leaving a dead listener running.
             log("error", `listen-error handling crashed: ${String(e)}`);
             shuttingDown = true;
             server.close();
-            flushConversations();
-            void flushAllSessions().finally(() => {
+            void (async () => {
+                await withExitDeadline("crash-path storage flushes", (async () => {
+                    await flushConversations();
+                    await flushAllSessions();
+                })());
                 closeLogger();
                 process.exit(1);
-            });
+            })();
         }
     };
     // Catch stray rejections/throws from background work (compress loops,
@@ -1716,17 +1737,31 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // debounced writes keep disk within ~500ms of in-memory state.
     let shuttingDown = false;
     const finishShutdown = (): void => {
-        flushPrefixAffinity();
-        flushOrderSkeletons();
-        servedWriter?.dispose();
-        clearProxyInstanceFile(instanceId);
-        unregisterInstance(instanceId);
-        closeLogger();
-        process.exit(0);
+        void (async () => {
+            // #5753: affinity/order now settle into sqlite — await their queued
+            // writes so a graceful exit loses nothing recorded this run.
+            // #5757: the await is deadline-bounded — a wedged volume must not
+            // hold the exit hostage (see src/exit-deadline.ts).
+            await withExitDeadline("unified-store flushes (affinity/order/resign)", (async () => {
+                await flushPrefixAffinity();
+                await flushOrderSkeletons();
+                await flushResignPending();
+            })());
+            servedWriter?.dispose();
+            clearProxyInstanceFile(instanceId);
+            unregisterInstance(instanceId);
+            closeLogger();
+            process.exit(0);
+        })();
     };
     const finishDrain = (): void => {
-        flushConversations();
-        void flushAllSessions().finally(finishShutdown);
+        void (async () => {
+            await withExitDeadline("conversation/session flushes", (async () => {
+                await flushConversations();
+                await flushAllSessions();
+            })());
+            finishShutdown();
+        })();
     };
     const shutdown = (sig: string) => {
         if (shuttingDown) return;
@@ -1928,6 +1963,12 @@ export type Prepared = {
      *  from the frozen prefix). Undefined = client-authoritative turn, the
      *  judge keeps originalMessages (byte-identical behavior). */
     judgeBaseline?: readonly CoreMessage[];
+    /** #564/#2627: producer-owned Responses ordering separators resolved into
+     *  the exact indexes of `parsedBody.input`. Handed to the invariant judge
+     *  as an explicit argument so it can exempt ONLY bili's own outbound-only
+     *  markers — never client prose that happens to carry identical text. The
+     *  manifest is re-anchored against the final wire array at judge time. */
+    separatorManifest?: SeparatorManifest;
     protocol: WireProtocol;
     stream: boolean;
     compressInjected: boolean;
@@ -2571,18 +2612,26 @@ export { dedupeAdjacentOutputConfig } from "./dedupe-adjacent-output-config.js";
  *  silent. Any remaining fire means another path lost thinking (e.g. a fold
  *  pruned the block while preserving the tool_use) — investigate. [#2864]
  *  identity dedup like the openai twin: each lost tool_use reports once per
- *  episode, not once per request of a persistent violation. */
+ *  episode, not once per request of a persistent violation. [#5998] the
+ *  inbound scan counts SIGNED thinking only: an unsigned thinking block is
+ *  never a replayable asset on any upstream — signature-verifying peers
+ *  reject it ("thinking.signature: Field required") and never-signing relays
+ *  require exactly the bytes they produced verbatim — so its absence from the
+ *  outbound rebuild is by design, not a violation; only a lost SIGNED pair is
+ *  reportable. */
 export function warnAnthropicThinkingPairs(
     inboundMessages: unknown[],
     outboundMessages: unknown[],
     log: (level: string, msg: string) => void,
     sessionId: string,
 ): void {
+    const signedThinking = (b: { type?: string; signature?: unknown }) =>
+        b?.type === "thinking" && typeof b.signature === "string" && b.signature.length > 0;
     const thinkingIds = new Set<string>();
     for (const m of inboundMessages) {
-        const msg = m as { role?: string; content?: Array<{ type?: string; id?: string }> };
+        const msg = m as { role?: string; content?: Array<{ type?: string; id?: string; signature?: unknown }> };
         if (msg?.role !== "assistant" || !Array.isArray(msg.content)) continue;
-        if (!msg.content.some((b) => b?.type === "thinking")) continue;
+        if (!msg.content.some(signedThinking)) continue;
         for (const b of msg.content) {
             if (b?.type === "tool_use" && typeof b.id === "string") thinkingIds.add(b.id);
         }
@@ -2748,61 +2797,6 @@ export function stripKernelSummaries(messages: BiliMessage[], state: Compression
     return messages.filter((m) => !(m.id ?? "").startsWith("acp_summary_") || !carried.has(m.id));
 }
 
-// #564: folding + stripKernelSummaries can merge two assistant turns into one
-// run, which Responses rejects (run order reasoning* -> message* ->
-// function_call*, <=1 reasoning). Rebuild boundaries from the ORIGINAL history
-// AFTER dedup: drop a reasoning whose turn body was wholly folded away (keep
-// originally-reasoning-only turns), else separate the runs with a user marker.
-const RESPONSES_TURN_SEPARATOR = "[The exchange between these two assistant turns was compressed.]";
-
-export function repairResponsesAssistantOrdering(folded: CoreMessage[], original: CoreMessage[]): CoreMessage[] {
-    const runOf = new Map<string, number>();
-    const runHasBody = new Map<number, boolean>();
-    let run = 0;
-    let inRun = false;
-    for (const m of original) {
-        if (m.role === "assistant") {
-            if (!inRun) { run++; inRun = true; }
-            runOf.set(m.id, run);
-            if (m.contentType !== "reasoning") runHasBody.set(run, true);
-        } else {
-            inRun = false;
-        }
-    }
-    const survivorCount = new Map<number, number>();
-    for (const m of folded) {
-        const r = m.role === "assistant" ? runOf.get(m.id) : undefined;
-        if (r !== undefined) survivorCount.set(r, (survivorCount.get(r) ?? 0) + 1);
-    }
-
-    const out: CoreMessage[] = [];
-    let phase = -1;
-    let seenReasoning = false;
-    let sepSeq = 0;
-    const pushSeparator = (): void => {
-        sepSeq++;
-        out.push({ id: `${RESPONSES_TURN_SEPARATOR_ID_PREFIX}${sepSeq}`, role: "user", contentType: "text", text: RESPONSES_TURN_SEPARATOR });
-        phase = -1;
-        seenReasoning = false;
-    };
-    for (const m of folded) {
-        if (m.role !== "assistant") {
-            out.push(m);
-            phase = -1;
-            seenReasoning = false;
-            continue;
-        }
-        const kind = m.contentType === "reasoning" ? "reasoning" : m.contentType === "tool-call" ? "tool-call" : "message";
-        const r = runOf.get(m.id);
-        if (kind === "reasoning" && r !== undefined && runHasBody.get(r) && survivorCount.get(r) === 1) continue;
-        if ((kind === "reasoning" && (phase > 0 || seenReasoning)) || (kind === "message" && phase === 2)) pushSeparator();
-        out.push(m);
-        if (kind === "reasoning") { phase = Math.max(phase, 0); seenReasoning = true; }
-        else if (kind === "message") phase = Math.max(phase, 1);
-        else phase = Math.max(phase, 2);
-    }
-    return out;
-}
 
 export function diagTagSummary(messages: CoreMessage[], sessionId: string, strategy: string): string {
     let textTagged = 0;
@@ -4419,7 +4413,17 @@ export async function preflightCompressIfNeeded(
                     log("info", `[${session.id}] auto-fold steady state: payload fits and no foldable candidates remained — forwarding as-is without backoff (#2638)`);
                 }
             } else {
-                log("warn", `[${session.id}] preflight made no progress but the payload fits; forwarding as-is`);
+                // #5907 facet 3: this exact branch is where an UNATTRIBUTED chain burns
+                // its turn silently — the request carried no conversation identity, so
+                // bili minted a pfa-* chain whose window came from the static ladder
+                // (table / registry / configured / default), never a host report; the
+                // fit verdict rests on the optimistic estimate; and the forward then
+                // dies upstream (400 / stream silence) with nothing in the log naming
+                // the class. An on-site operator reading only bili.log could not tell
+                // "mis-sized anonymous window" from a healthy fit-forward without an
+                // external probe. Name it in the one line they already grep for —
+                // identified sessions keep the original wording verbatim.
+                log("warn", `[${session.id}] preflight made no progress but the payload fits; forwarding as-is${anonymous ? " — unattributed chain (no conversation identity in this request's headers): the effective window came from bili's static ladder, not a host report, and may be mis-sized for the model actually served; if this turn 400s or stalls upstream, make the sending path carry the identity headers so the turn attaches to the real session (#5907)" : ""}`);
             }
         } else if (growthArmed && !queueDroppedAll && result.savedTokens < AUTO_FOLD_MIN_BENEFIT_TOKENS) {
             // [#3444] sub-benefit fold: a full external-summary round trip saved
@@ -4747,42 +4751,6 @@ export function headerValue(req: http.IncomingMessage, name: string): string | u
         if (k.toLowerCase() === lower) return Array.isArray(v) ? v[0] : v;
     }
     return undefined;
-}
-
-function formatBytes(n: number): string {
-    if (n < 1024) return `${n}B`;
-    if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)}KiB`;
-    if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)}MiB`;
-    return `${(n / (1024 * 1024 * 1024)).toFixed(1)}GiB`;
-}
-
-// #903: per-request local-cost line, logged at every point where bili finishes
-// its own processing and hands the request off (upstream forward, forged local
-// response, or fail-fast error) — see handle(). outbound is the exact body value
-// handed to forward() (string OR Buffer — Prepared.body is string|Buffer); wire
-// bytes are counted with Buffer.byteLength since undici sends UTF-8 bytes even
-// for string bodies (.length would count UTF-16 chars and undercount any
-// non-ASCII injection). Omitted on paths that fail fast without forwarding.
-// #4528: bili's own per-request processing past this WALL-CLOCK budget means
-// synchronous main-thread work large enough to starve the event loop and
-// freeze every endpoint on the same listener — warn so a pathological session
-// shows up in the log instead of being found through a frozen UI.
-// #5744: the trigger used to be message COUNT (>1000), which cannot separate
-// cost from size — one reporter session saved at 0.8s AND 14.5s at the same
-// ~3k msgs. Wall clock IS the cost; the info line above keeps reporting the
-// count for correlation.
-const SLOW_SESSION_MS_WARN = 1000;
-export function logRequestCost(log: (level: string, msg: string) => void, sessionId: string, msgs: number | null, inboundBytes: number, t0: number, outbound?: string | Buffer): void {
-    const ms = Math.max(0, Math.round(performance.now() - t0));
-    const outboundField = outbound !== undefined ? `, outbound=${formatBytes(Buffer.byteLength(outbound))}` : "";
-    const view = currentFetchTransport() ? ", view=ws-expanded" : "";
-    log("info", `[${sessionId}] request: ${msgs ?? "?"} msgs, inbound=${formatBytes(inboundBytes)}${outboundField}, local=${ms}ms${view}`);
-    // #5408: this line is THE observation point — a hot-at-attach session that
-    // never produces one is silent compression loss (the incident signature).
-    noteRequest(sessionId);
-    if (ms > SLOW_SESSION_MS_WARN) {
-        log("warn", `[${sessionId}] slow-session: ${msgs ?? "?"} msgs / inbound=${formatBytes(inboundBytes)} took local=${ms}ms — synchronous per-turn work is starving the event loop (#4528/#5744); consider closing/restarting the session or enabling compression`);
-    }
 }
 
 /** Thrown by readBody when the request body exceeds the configured receive-body

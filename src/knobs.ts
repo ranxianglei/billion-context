@@ -28,6 +28,7 @@ import { parseDurationField } from "./duration.js";
 import { UPSTREAM_TIMEOUT_MS, REPLAY_MAX_ATTEMPTS, REPLAY_BASE_DELAY_MS } from "./fetch-util.js";
 import { PROXY_KEEPALIVE_MAX_MS } from "./upstream-proxy.js";
 import { WAL_JOURNAL_SIZE_LIMIT } from "./storage/schema.js";
+import { LOG_RETENTION_BUDGET_BYTES, LOG_RETENTION_TARGET_MS } from "./log-retention.js";
 
 /** Tiered raw number: the env var wins when SET (even empty/garbage — the
  *  caller applies the historical validation), else a finite number from the
@@ -456,6 +457,14 @@ export function persistDebounceMs(): number {
     return Number.isFinite(v) && v >= 0 ? v : 500;
 }
 
+/** BILI_PERSIST_MAX_DELAY_MS > persist.maxDelayMs > 5000 (#6058: under sustained
+ *  traffic the max-delay cap — not the debounce window — sets the session-order /
+ *  prefix-affinity snapshot rewrite rate; both writers had it hardcoded at 5s). */
+export function persistMaxDelayMs(): number {
+    const v = tInt("BILI_PERSIST_MAX_DELAY_MS", filePersist().maxDelayMs);
+    return Number.isFinite(v) && v >= 0 ? v : 5_000;
+}
+
 /** BILI_PERSIST_TAIL_TOKENS > persist.tailTokens > 16384 (0 disables message persistence). */
 export function persistTailTokens(): number {
     const v = tInt("BILI_PERSIST_TAIL_TOKENS", filePersist().tailTokens);
@@ -773,6 +782,40 @@ export function dump4xxMaxBytes(): number {
     const f = fileDiag().dump4xxMaxBytes;
     const n = typeof f === "number" && Number.isFinite(f) && f > 0 ? f : NaN;
     return Math.max(1024, n || 2 * 1024 * 1024);
+}
+
+/** BILI_LOG_RETENTION_HOURS > diagnostics.logRetentionHours > 48. How much
+ *  wall-clock history the private log keeps before the byte budget trims it.
+ *  Floor 1 h. A SET env var owns the switch even when its content is illegal
+ *  (process-level convention, #2030): an unparsable value falls back to the
+ *  DEFAULT, never to the file layer, so the file key cannot silently shadow it. */
+function logRetentionTargetMs(): number {
+    const envRaw = process.env.BILI_LOG_RETENTION_HOURS;
+    const f = fileDiag().logRetentionHours;
+    const fromFile = typeof f === "number" && Number.isFinite(f) && f > 0 ? f : LOG_RETENTION_TARGET_MS / 3_600_000;
+    const hours = envRaw !== undefined
+        ? (Number.isFinite(Number(envRaw)) && Number(envRaw) > 0 ? Number(envRaw) : LOG_RETENTION_TARGET_MS / 3_600_000)
+        : fromFile;
+    return Math.max(1, hours) * 3_600_000;
+}
+
+/** BILI_LOG_BUDGET_BYTES > diagnostics.logBudgetBytes > 256 MiB. HARD cap on
+ *  bytes across the active log + every sealed generation — the budget wins over
+ *  the target window. Floor 1 MiB so a typo cannot degenerate the log to nothing.
+ *  Same set-env-owns-the-switch rule as the target above. */
+function logRetentionBudgetBytes(): number {
+    const envRaw = process.env.BILI_LOG_BUDGET_BYTES;
+    const f = fileDiag().logBudgetBytes;
+    const fromFile = typeof f === "number" && Number.isFinite(f) && f > 0 ? f : LOG_RETENTION_BUDGET_BYTES;
+    const bytes = envRaw !== undefined
+        ? (Number.isFinite(Number(envRaw)) && Number(envRaw) > 0 ? Number(envRaw) : LOG_RETENTION_BUDGET_BYTES)
+        : fromFile;
+    return Math.max(1 << 20, bytes);
+}
+
+/** The resolved retention policy snapshot the logger installs at startup. */
+export function logRetentionPolicy(): { targetMs: number; budgetBytes: number } {
+    return { targetMs: logRetentionTargetMs(), budgetBytes: logRetentionBudgetBytes() };
 }
 
 /** BILI_DUMP_MAX_TOTAL_BYTES > diagnostics.maxTotalBytes > off (null). Total-size cap

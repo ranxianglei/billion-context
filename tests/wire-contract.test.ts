@@ -147,6 +147,25 @@ test("WC-023 mid-conversation system messages satisfy the two-sided positional c
     })[0], /WC-023.*precede/);
 });
 
+test("WC-024 thinking blocks must carry a signature (#5998)", () => {
+    // Legal: signed thinking replayed verbatim.
+    assert.deepEqual(VALIDATORS.anthropic({
+        messages: [
+            { role: "assistant", content: [{ type: "thinking", thinking: "t", signature: "sig_A" }, { type: "text", text: "a" }] },
+        ],
+    }), []);
+    // Illegal: unsigned thinking — the DSH transcript shape (reasoning stored as {type, text}).
+    assert.match(VALIDATORS.anthropic({
+        messages: [
+            { role: "assistant", content: [{ type: "thinking", thinking: "t" }, { type: "tool_use", id: "tu1", name: "n", input: {} }] },
+        ],
+    })[0], /WC-024/);
+    // Illegal: an empty-string signature counts as missing.
+    assert.match(VALIDATORS.anthropic({
+        messages: [{ role: "assistant", content: [{ type: "thinking", thinking: "t", signature: "" }] }],
+    })[0], /WC-024/);
+});
+
 test("WC-016 validates global-scope breakpoint ordering (render order: tools → system → messages)", () => {
     // #2648 shape: unmarked tools render ahead of a global system block.
     assert.match(VALIDATORS.anthropic({
@@ -248,6 +267,8 @@ test("wire-contract ledger: every rule has a live enforcement clause", () => {
                 { role: "assistant", content: [{ type: "text", text: "a" }] },
                 { role: "system", content: [{ type: "text", text: "s" }] },
             ] },
+            // WC-024: the DSH transcript shape (#5998) — assistant thinking without a signature.
+            { messages: [{ role: "assistant", content: [{ type: "thinking", thinking: "t" }] }] },
         ],
         "openai-chat": [
             { model: "gemini-synthetic", tools: [{ type: "function", function: { name: "compress", parameters: { type: "object", properties: { content: { type: ["array", "string"] } } } } }] },

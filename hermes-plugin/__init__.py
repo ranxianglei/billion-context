@@ -732,6 +732,13 @@ def mitm_domains_from_config() -> List[str]:
                         if entry.get(key):
                             add(entry[key])
                             break
+        # Top-level base_url/url/api sits next to `provider:` in Hermes' documented config (#6022) —
+        # the active provider's endpoint when there is no providers map. Additive, not fallback-only:
+        # a config may carry both shapes, and traffic can legally reach either host.
+        for key in ("base_url", "url", "api"):
+            if data.get(key):
+                add(data[key])
+                break
     return hosts
 
 
@@ -756,8 +763,6 @@ def _provider_base_url(provider: Any) -> Optional[str]:
     """The configured base URL of one hermes provider (best effort; same config keys as
     mitm_domains_from_config). None when absent/unreadable."""
     name = str(provider or "").strip()
-    if not name:
-        return None
     cfg = hermes_home() / "config.yaml"
     try:
         data = _yaml_loader()(cfg.read_text(encoding="utf-8"))
@@ -774,18 +779,28 @@ def _provider_base_url(provider: Any) -> Optional[str]:
                 return str(entry[key]).strip()
         return None
 
-    providers = data.get("providers")
-    if isinstance(providers, dict):
-        found = pick(providers.get(name))
-        if found:
-            return found
-    legacy = data.get("custom_providers")
-    if isinstance(legacy, list):
-        for entry in legacy:
-            if str((entry or {}).get("name") or "").strip() == name:
-                found = pick(entry)
-                if found:
-                    return found
+    if name:
+        providers = data.get("providers")
+        if isinstance(providers, dict):
+            found = pick(providers.get(name))
+            if found:
+                return found
+        legacy = data.get("custom_providers")
+        if isinstance(legacy, list):
+            for entry in legacy:
+                if str((entry or {}).get("name") or "").strip() == name:
+                    found = pick(entry)
+                    if found:
+                        return found
+    # Top-level base_url/url/api overrides the ACTIVE provider's endpoint (#6022). It answers the
+    # active provider's request — an unnamed one included, since the hook surface often carries no
+    # provider kwarg — and never some other named provider's.
+    active = str(data.get("provider") or "").strip()
+    if not name or name == active:
+        for key in ("base_url", "url", "api"):
+            value = data.get(key)
+            if value:
+                return str(value).strip()
     return None
 
 
