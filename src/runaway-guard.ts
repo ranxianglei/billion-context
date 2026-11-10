@@ -272,32 +272,28 @@ export function wrapStreamWithRunawayGuard<T extends Uint8Array>(
     let walkTripped = false;
     let tripVerdict: RunawayVerdict | null = null;
 
-    // Recursive walker over a parsed frame: feeds ONLY text-family leaves that sit
-    // outside excluded branches into the guard's run tracker.
-    const collectText = (node: unknown, key: string, excluded: boolean): void => {
-        if (walkTripped) return;
-        if (typeof node === "string") {
-            if (!excluded && TEXT_LEAF_KEYS.has(key)) {
-                const v = guard.feedText(node);
-                if (v.tripped) {
-                    walkTripped = true;
-                    tripVerdict = v;
+    // Walk parsed text leaves outside excluded branches without consuming the call stack.
+    const collectText = (root: unknown): void => {
+        const pending: Array<{ node: unknown; key: string }> = [{ node: root, key: "" }];
+        while (pending.length > 0 && !walkTripped) {
+            const { node, key } = pending.pop()!;
+            if (EXCLUDED_BRANCHES.has(key)) continue;
+            if (typeof node === "string") {
+                if (TEXT_LEAF_KEYS.has(key)) {
+                    const v = guard.feedText(node);
+                    if (v.tripped) {
+                        walkTripped = true;
+                        tripVerdict = v;
+                    }
                 }
-            }
-            return;
-        }
-        if (Array.isArray(node)) {
-            for (const item of node) {
-                collectText(item, key, excluded);
-                if (walkTripped) return;
-            }
-            return;
-        }
-        if (typeof node === "object" && node !== null) {
-            const ex = excluded || EXCLUDED_BRANCHES.has(key);
-            for (const [k, v] of Object.entries(node as Record<string, unknown>)) {
-                collectText(v, k, ex);
-                if (walkTripped) return;
+            } else if (Array.isArray(node)) {
+                for (let i = node.length - 1; i >= 0; i--) pending.push({ node: node[i], key });
+            } else if (typeof node === "object" && node !== null) {
+                const entries = Object.entries(node as Record<string, unknown>);
+                for (let i = entries.length - 1; i >= 0; i--) {
+                    const [childKey, child] = entries[i];
+                    pending.push({ node: child, key: childKey });
+                }
             }
         }
     };
@@ -311,7 +307,7 @@ export function wrapStreamWithRunawayGuard<T extends Uint8Array>(
         }
         walkTripped = false;
         tripVerdict = null;
-        collectText(obj, "", false);
+        collectText(obj);
     };
 
     const processSseFrame = (frame: string): void => {
