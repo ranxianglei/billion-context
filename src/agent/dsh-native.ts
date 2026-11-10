@@ -65,6 +65,7 @@ import { MIN_ASSUMED_WINDOW_TOKENS } from "../util.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, singleFlight } from "./native-bootstrap.js";
 import { bodyOverWindowDetail as sharedBodyOverWindowDetail, installNativeFetchIntercept, liveStateSlotEffect, noteRoutedOrigin, observeRoutedOrigin, routedBiliModelUrl, type GateVerdict, type NativeInterceptState } from "./native-intercept.js";
 import { runOutsideFetchChain } from "./fetch-chain/index.js";
+import { installNativeWebSocketIntercept } from "./native-ws-intercept.js";
 import { asciiHeaderValue, fetchManifest, fetchProxyVersion, fetchStatus, fetchStatusLatest, forwardTool, reportAttributionHealth, reportRuntimeInfo, waitForProxyVersion, type ManifestTool } from "./shared.js";
 import { createForkAdopter, sideShapedBody } from "./fork-adopt.js";
 import { clearIncrementalProbe, createPrepareDirectSend, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalRejection, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, rememberOriginalBody, sweepStale, wireMessagesLookAnthropic, type IncrementalWireMessage } from "./incremental-client.js";
@@ -2372,9 +2373,10 @@ export async function apply(ctx: PluginContext): Promise<void> {
         // gate contract already tolerates Promise verdicts (threw arm).
         if (attr.state === "none") {
             // #4829 review: without init there is no body to decode and the
-            // claim can never succeed — settle synchronously so this shape
-            // keeps the OLD verdict class: native-ws-intercept.ts compares
-            // its gate result with === false WITHOUT awaiting.
+            // claim can never succeed — settle synchronously. Both gate
+            // consumers await the verdict today (fetch lane since #4829, WS
+            // lane inside its deferred window since #5838), so this is a fast
+            // path, not a verdict-class contract.
             if (init === undefined) {
                 threwStreak = 0;
                 threwGiveUpNoticed = false;
@@ -2861,8 +2863,8 @@ export async function apply(ctx: PluginContext): Promise<void> {
     });
 
     // node:test drives apply() directly with a mock ctx — never patch
-    // globalThis.fetch from inside a test run.
-    if (process.env.NODE_TEST_CONTEXT === undefined) installNativeFetchIntercept(state);
+    // globalThis.fetch/WebSocket from inside a test run.
+    if (process.env.NODE_TEST_CONTEXT === undefined) installDshIntercepts(state);
 
     // #4134: hold activation until the ACP tool registration has landed (or
     // is provably not coming / 2s cap). The host composes each model round
@@ -2876,6 +2878,20 @@ export async function apply(ctx: PluginContext): Promise<void> {
     // under NODE_TEST_CONTEXT (a mock apply() with no spawn armed would
     // otherwise burn the full 2s cap on every call).
     if (process.env.NODE_TEST_CONTEXT === undefined) await registerArmed();
+}
+
+/** Both client-side egress legs of the dsh lane (#5838): model HTTP(S) through
+ *  the fetch intercept, and the Codex Responses WebSocket leg through the WS
+ *  wrapper. DSH embeds pi-ai whose openai-codex-responses provider defaults to
+ *  transport auto, so a successful WebSocket exchange NEVER calls fetch — with
+ *  only the fetch leg installed the whole conversation bypasses the proxy while
+ *  bili's own gate leaves native compaction off, i.e. nothing compresses until
+ *  the context limit. The state carries the per-dispatch hooks (async
+ *  takeoverGate, toolsReady, beforeSend fork adoption, headersFor stamps) that
+ *  the wrapper runs inside its deferred window before the upgrade goes out. */
+export function installDshIntercepts(state: NativeInterceptState): void {
+    installNativeFetchIntercept(state);
+    installNativeWebSocketIntercept(state);
 }
 
 /** Test hook: reset the module-level registration lifecycle so suites can

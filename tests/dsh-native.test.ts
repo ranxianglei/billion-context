@@ -5,7 +5,9 @@ import os from "node:os";
 import path from "node:path";
 import http from "node:http";
 import { pathToFileURL } from "node:url";
-import { apply, planNativeDsh, shouldBootstrapNativeDsh, persistClientEvent, mediaBytesOfWireBody, bodyOverWindowDetail, _attributionHealthForTest, _resetAttributionHealthForTest, _registerStateForTest, _resetRegisterForTest, _setModelInfoForTest, _nativeStateForTest, _setSpawnForTest, _setThrewRetryForTest, _settleNativeForTest, _stateHeadersForTest, _stateRespawnForTest, _stateTakeoverGateForTest, _stateToolsReadyForTest, _stateBeforeSendForTest, _stateOnResponseForTest, _noteRoutedForTest, _resetRoutedForTest, _resetWebProfileWarningForTest, _resetNonWebTraceForTest, _resetTitlesForTest, _resetBodyParseStatsForTest, _bodyParseStatsForTest, _parsedBodyOnceForTest, type PluginContext } from "../src/agent/dsh-native.ts";
+import { apply, installDshIntercepts, planNativeDsh, shouldBootstrapNativeDsh, persistClientEvent, mediaBytesOfWireBody, bodyOverWindowDetail, _attributionHealthForTest, _resetAttributionHealthForTest, _registerStateForTest, _resetRegisterForTest, _setModelInfoForTest, _nativeStateForTest, _setSpawnForTest, _setThrewRetryForTest, _settleNativeForTest, _stateHeadersForTest, _stateRespawnForTest, _stateTakeoverGateForTest, _stateToolsReadyForTest, _stateBeforeSendForTest, _stateOnResponseForTest, _noteRoutedForTest, _resetRoutedForTest, _resetWebProfileWarningForTest, _resetNonWebTraceForTest, _resetTitlesForTest, _resetBodyParseStatsForTest, _bodyParseStatsForTest, _parsedBodyOnceForTest, type PluginContext } from "../src/agent/dsh-native.ts";
+import { nativeInterceptInstalled, _resetForTest as _resetFetchInterceptForTest, type NativeInterceptState } from "../src/agent/native-intercept.ts";
+import { nativeWebSocketInterceptInstalled, _resetForTest as _resetWsInterceptForTest } from "../src/agent/native-ws-intercept.ts";
 import { __resetIncrementalClientForTests } from "../src/agent/incremental-client.ts";
 import { isDshCompactionActive, _resetDshCompactionVerdictForTest } from "../src/agent/dsh-compaction-disable.ts";
 import { once } from "node:events";
@@ -3438,5 +3440,34 @@ test("#5792: dsh pre-send chain parses the request body once per request", async
         proxy.close();
         rmrf(home);
         rmrf(stateHome);
+    }
+});
+
+// #5838: installDshIntercepts must arm BOTH egress legs — with only the fetch
+// leg installed, a successful codex-responses WebSocket exchange never calls
+// fetch and the whole conversation bypasses the proxy.
+test("#5838: installDshIntercepts arms both egress legs (fetch + codex-responses WebSocket)", () => {
+    const g = globalThis as Record<PropertyKey, unknown>;
+    const savedFetch = g.fetch;
+    const savedWsDesc = Object.getOwnPropertyDescriptor(globalThis, "WebSocket");
+    const FakeWs = class {};
+    const restore = (): void => {
+        _resetFetchInterceptForTest();
+        _resetWsInterceptForTest();
+        if (savedWsDesc !== undefined) Object.defineProperty(globalThis, "WebSocket", savedWsDesc);
+        else delete g.WebSocket;
+        g.fetch = savedFetch;
+    };
+    try {
+        restore();
+        g.WebSocket = FakeWs;
+        const state: NativeInterceptState = { origin: "http://127.0.0.1:8787", ready: Promise.resolve("http://127.0.0.1:8787") };
+        installDshIntercepts(state);
+        assert.equal(nativeInterceptInstalled(), true, "fetch leg installed");
+        assert.equal(nativeWebSocketInterceptInstalled(), true, "WebSocket leg installed");
+        assert.notEqual(g.fetch, savedFetch, "global fetch wrapped");
+        assert.notEqual(g.WebSocket, FakeWs, "global WebSocket wrapped");
+    } finally {
+        restore();
     }
 });
