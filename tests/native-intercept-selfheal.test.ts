@@ -759,7 +759,7 @@ test("#5959: a hostile accessor that swallows every write gives up loudly — an
                 enumerable: true,
             });
             for (let i = 0; i < 3; i++) tick(); // WATCHDOG_MAX_FAILURES consecutive unproductive repairs
-            tick(); // the slot still resolves to a function → givenUp clears and the repair retries (counter restarts)
+            tick(); // the slot still resolves to a function → givenUp clears; the retry fails again and re-triggers the give-up (failures keeps counting)
             assert.equal(globalThis.fetch, foreign); // the slot still resolves through the hostile getter
             // The hostile plugin stands down: the slot holds our link again → recovery.
             Object.defineProperty(globalThis, "fetch", { value: ours as typeof globalThis.fetch, writable: true, configurable: true, enumerable: true });
