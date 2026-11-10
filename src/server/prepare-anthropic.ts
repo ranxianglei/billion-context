@@ -37,6 +37,7 @@ import { reconcileSystemAnchor } from "../system-anchor.js";
 import { isStrictReasoningEcho, modelIdOf } from "../strict-echo.js";
 import { logRawStripCounts, markerArtifactCount, stripRawStage } from "../marker/engine.js";
 import { imageRescaleMaxDim, renderNone as knobRenderNone } from "../knobs.js";
+import { SessionStore } from "../persist.js";
 import { applyImageRescalePass } from "../image-rescale.js";
 import { isAutoModeClassifier } from "../auto-mode-forge.js";
 import { countSystemAndToolsTokens, emergencyNudge, emergencyNudgeArmed, projectThinkingMass } from "./budget.js";
@@ -219,6 +220,9 @@ export async function prepareAnthropic(
     const markerCounts = stripRawStage(parsed, "anthropic");
     logRawStripCounts(markerCounts, log, sessionId);
 
+    // #5874 P2-final: in-request snapshot flush verdict (set after processTurn,
+    // read at end-of-prepare to decide whether the debounce still needs a shot).
+    let snapFlush: { ok: boolean; epoch: number | undefined } | undefined;
     try {
         const converted = anthropicToCore(parsed);
         let msgs = converted.msgs;
@@ -379,6 +383,15 @@ export async function prepareAnthropic(
         const turn = core.processTurn({ messages: renderMsgs, state: session.state, config: loopConfig, tokenCount, tokenCountSource, renderTags: renderStrategy, contentStore: contentStoreOf(session) });
         session.state = turn.state;
         adoptContentStore(session, turn.contentStore);
+        // #5874 P2-final: snapshot application (in-request) — the canonical
+        // transcript up to THIS user message plus the kernel's post-fold state
+        // must be on the snapshot plane before the egress stage reads it
+        // (chain: raw → wire→core → kernel rewrite → snapshot write → egress
+        // rewrite → egress). snapshotMessages first: the persist build reads
+        // session.lastMessages. Never fatal — a failed flush leaves the round
+        // on the legacy egress path (the seam walk carries it).
+        snapshotMessages(session, originalMessages);
+        snapFlush = await SessionStore.flushOrSkip(session);
         // #4528: split the kernel pass from its post-processing scan passes so
         // each is a bounded synchronous stretch rather than one long block.
         await yieldToEventLoop();
@@ -626,7 +639,6 @@ export async function prepareAnthropic(
     // SysPrompt row — the kernel breakdown classifies messages only, and on
     // this wire the system rides the top-level `system` field outside the fold.
     session.metadata.systemPromptTokens = countSystemAndToolsTokens(extractSystem(systemOut), toolsOut);
-    snapshotMessages(session, originalMessages);
     // #3397 durability-before-render: make this turn's ledger rows durable NOW
     // (synchronous SQLite ingest, no JSON envelope) so the refs the model is
     // about to see are on disk BEFORE the response is sent. Without this, a
@@ -635,7 +647,10 @@ export async function prepareAnthropic(
     // gate rejects as "above the highest allocated ref". markDirty below keeps
     // the JSON envelope debounced; this only moves the small row ingest ahead.
     getStore().ingestRowsNow(session);
-    markDirty(session);
+    // #5874 P2-final: the in-request snapshot flush above already persisted
+    // this revision; re-arm the debounce only if the session mutated since
+    // (stats probes land at the next flush) or the flush never landed.
+    if (!snapFlush || !snapFlush.ok || (session.revisionEpoch ?? 0) !== snapFlush.epoch) markDirty(session);
 
     // [#5604] a preflight fold of the tail (soft protection relaxed to 0, or a
     // tail tool pair in neverPreserveRecentTools) can leave the outbound array

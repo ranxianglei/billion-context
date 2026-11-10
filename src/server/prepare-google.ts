@@ -34,6 +34,7 @@ import { attachSubagentSessions } from "../subagent-sessions.js";
 import { reconcileSystemAnchor } from "../system-anchor.js";
 import { logRawStripCounts, markerArtifactCount, stripRawStage } from "../marker/engine.js";
 import { imageRescaleMaxDim, renderNone as knobRenderNone } from "../knobs.js";
+import { SessionStore } from "../persist.js";
 import { applyImageRescalePass } from "../image-rescale.js";
 import { clampOutgoingOutput, countSystemAndToolsTokens, dshLedgerFloorTokens, emergencyNudge, emergencyNudgeArmed } from "./budget.js";
 import { estimateCoreMessages } from "../preflight.js";
@@ -123,6 +124,9 @@ export async function prepareGoogle(
     const markerCounts = stripRawStage(parsed, "google");
     logRawStripCounts(markerCounts, log, sessionId);
 
+    // #5874 P2-final: in-request snapshot flush verdict (set after processTurn,
+    // read at end-of-prepare to decide whether the debounce still needs a shot).
+    let snapFlush: { ok: boolean; epoch: number | undefined } | undefined;
     try {
         const { msgs, systemText } = googleToCore(parsed);
         googleClientSystem = systemText;
@@ -209,6 +213,15 @@ export async function prepareGoogle(
         const turn = core.processTurn({ messages: renderMsgs, state: session.state, config: loopConfig, tokenCount, tokenCountSource, renderTags: renderStrategy, contentStore: contentStoreOf(session) });
         session.state = turn.state;
         adoptContentStore(session, turn.contentStore);
+        // #5874 P2-final: snapshot application (in-request) — the canonical
+        // transcript up to THIS user message plus the kernel's post-fold state
+        // must be on the snapshot plane before the egress stage reads it
+        // (chain: raw → wire→core → kernel rewrite → snapshot write → egress
+        // rewrite → egress). snapshotMessages first: the persist build reads
+        // session.lastMessages. Never fatal — a failed flush leaves the round
+        // on the legacy egress path (the seam walk carries it).
+        snapshotMessages(session, originalMessages);
+        snapFlush = await SessionStore.flushOrSkip(session);
         // #4528: split the kernel pass from its post-processing scan passes so
         // each is a bounded synchronous stretch rather than one long block.
         await yieldToEventLoop();
@@ -426,10 +439,12 @@ export async function prepareGoogle(
             + imageReserveFor(session, "google", rebuilt, opts, upstreamOrigin);
         if (upstreamOrigin) session.stats.lastLocalTextEstimateOrigin = upstreamOrigin;
     }
-    snapshotMessages(session, originalMessages);
     // #3397 durability-before-render (see prepare-anthropic.ts): rows durable NOW, before the model call.
     getStore().ingestRowsNow(session);
-    markDirty(session);
+    // #5874 P2-final: the in-request snapshot flush above already persisted
+    // this revision; re-arm the debounce only if the session mutated since
+    // (stats probes land at the next flush) or the flush never landed.
+    if (!snapFlush || !snapFlush.ok || (session.revisionEpoch ?? 0) !== snapFlush.epoch) markDirty(session);
     return { body: JSON.stringify(rebuilt), parsedBody: rebuilt, session, processedMessages, originalMessages, judgeBaseline, protocol: "google", stream, compressInjected: injectTools, pluginMode, mcpDialectNote: laneDecisions.mcpDialect, nudge, nudgeOutcome, prompts, surface, google: { system: googleClientSystem, model }, systemNotes: sysNotes, renderTags: renderStrategy } as Prepared;
 }
 

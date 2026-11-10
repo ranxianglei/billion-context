@@ -1,6 +1,6 @@
 # 提案：快照表式压缩底座（六段固定链，单一存储真源）
 
-> **状态：P0 + P1 + P2 已在 [#5901](https://github.com/ranxianglei/billion-context/pull/5901) 实现**（schema v12；影子写 soak；P2 = mapEgress 带 tripwire 保护的出站切换，soak 期间随 `ci:full` + 本地 gate 以 100% 运行，发版前与其他 soak 旗一样改回先关后发）。
+> **状态：P0 + P1 + P2 已在 [#5901](https://github.com/ranxianglei/billion-context/pull/5901) 实现**（schema v12；影子写 soak；P2 = mapEgress 带 tripwire 保护的出站切换，soak 期间随 `ci:full` + 本地 gate 以 100% 运行，发版前与其他 soak 旗一样改回先关后发）。P2-final 按提案原序落地六段链：快照写入（事件→表）在**请求内**完成 —— 内核改写之后、出站改写之前，平面在响应发出前即可读，本轮自身重发的尾窗为空。
 > 2026-11-07 作为设计提案撰写；本文件是已落地实现的设计记录。
 > **基线：** origin/master（写于 2026-11-07；存储 schema v11，#5854 已把 v6 整线撤出 master）。
 > **来源讨论：** [#5643](https://github.com/ranxianglei/billion-context/issues/5643)（含定位纠正评论）。

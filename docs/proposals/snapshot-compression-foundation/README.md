@@ -1,6 +1,6 @@
 # Proposal: Snapshot-Table Compression Foundation (six-stage fixed chain, single storage truth)
 
-> **Status: P0 + P1 + P2 implemented in [#5901](https://github.com/ranxianglei/billion-context/pull/5901)** (schema v12; shadow-write soak; P2 = mapEgress tripwire-guarded egress cutover, soak at 100% for the `ci:full` + local-gate run, release flips it back to OFF-before-ship like every soak flag).
+> **Status: P0 + P1 + P2 implemented in [#5901](https://github.com/ranxianglei/billion-context/pull/5901)** (schema v12; shadow-write soak; P2 = mapEgress tripwire-guarded egress cutover, soak at 100% for the `ci:full` + local-gate run, release flips it back to OFF-before-ship like every soak flag). P2-final lands the six-stage chain in the proposal's own order: the snapshot write (events → tables) runs **in-request**, after the kernel rewrite and before the egress stage — the plane is readable before the response is sent, and this round's own resend carries an empty tail.
 > Written 2026-11-07 as a design proposal; this doc is the design record of the landed implementation.
 > **Baseline:** origin/master (written 2026-11-07; storage schema v11; #5854 has fully reverted the v6 line from master).
 > **Origin thread:** [#5643](https://github.com/ranxianglei/billion-context/issues/5643) (incl. the re-positioning comment).

@@ -44,6 +44,7 @@ import { pckKeyAbated } from "../pck-probe.js";
 import { reconcilePluginFoldCallIds } from "../plugin.js";
 import { logRawStripCounts, markerArtifactCount, stripRawStage } from "../marker/engine.js";
 import { imageRescaleMaxDim, keepResponseId as knobKeepResponseId, noCompressPrompt as knobNoCompressPrompt, noInjectTool as knobNoInjectTool, renderNone as knobRenderNone } from "../knobs.js";
+import { SessionStore } from "../persist.js";
 import { applyImageRescaleItems } from "../image-rescale.js";
 import { clampOutgoingOutput, countLoadedToolTokens, countSystemAndToolsTokens, dshLedgerFloorTokens, emergencyNudge, emergencyNudgeArmed, modelVisibleTools } from "./budget.js";
 import { FORCE_TEXT_PROTOCOL, injectResponsesTool, injectTool } from "./inject.js";
@@ -174,6 +175,9 @@ export async function prepareResponses(
         resolveCompressProtocol(opts.routes, upstreamOrigin) === "marker";
     const renderTags: "text-only" | "none" = knobRenderNone() || isCompactionTrigger ? "none" : "text-only";
 
+    // #5874 P2-final: in-request snapshot flush verdict (set after processTurn,
+    // read at end-of-prepare to decide whether the debounce still needs a shot).
+    let snapFlush: { ok: boolean; epoch: number | undefined } | undefined;
     try {
         // [#1638] Position-preserve mid-history system/developer items for
         // plugin agents and native Codex. Both append developer
@@ -375,6 +379,15 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         const turn = core.processTurn({ messages: renderMsgs, state: session.state, config: loopConfig, tokenCount, tokenCountSource, renderTags, contentStore: contentStoreOf(session) });
         session.state = turn.state;
         adoptContentStore(session, turn.contentStore);
+        // #5874 P2-final: snapshot application (in-request) — the canonical
+        // transcript up to THIS user message plus the kernel's post-fold state
+        // must be on the snapshot plane before the egress stage reads it
+        // (chain: raw → wire→core → kernel rewrite → snapshot write → egress
+        // rewrite → egress). snapshotMessages first: the persist build reads
+        // session.lastMessages. Never fatal — a failed flush leaves the round
+        // on the legacy egress path (the seam walk carries it).
+        snapshotMessages(session, originalMessages);
+        snapFlush = await SessionStore.flushOrSkip(session);
         // #4528: split the kernel pass from its post-processing scan passes so
         // each is a bounded synchronous stretch rather than one long block.
         await yieldToEventLoop();
@@ -745,10 +758,12 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         const responsesPairOrigin = billingUpstream ?? upstreamOrigin;
         if (responsesPairOrigin) session.stats.lastLocalTextEstimateOrigin = responsesPairOrigin;
     }
-    snapshotMessages(session, originalMessages);
     // #3397 durability-before-render (see prepare-anthropic.ts): rows durable NOW, before the model call.
     getStore().ingestRowsNow(session);
-    markDirty(session);
+    // #5874 P2-final: the in-request snapshot flush above already persisted
+    // this revision; re-arm the debounce only if the session mutated since
+    // (stats probes land at the next flush) or the flush never landed.
+    if (!snapFlush || !snapFlush.ok || (session.revisionEpoch ?? 0) !== snapFlush.epoch) markDirty(session);
     // #564/#2627: ONE serialization of the outbound body. The same string is
     // both what we send and what the separator manifest binds to, so the claims
     // can never be attributed to a body that differs by even one byte.

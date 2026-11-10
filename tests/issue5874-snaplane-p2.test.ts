@@ -21,6 +21,7 @@ import { planIngest, type LegacySessionLike } from "../src/storage/ingest.ts";
 import { _resetSnapPlaneDeadForTests, type SnapView } from "../src/storage/snap.ts";
 import { UnifiedStore } from "../src/storage/store.ts";
 import { SessionStore, _setStoreForTest, getStore } from "../src/persist.ts";
+import { createSession, markDirty, snapshotMessages } from "../src/session.ts";
 import {
     applySnapEgress,
     buildSnapEgressView,
@@ -777,4 +778,51 @@ test("T23 empty client text is not adoption-eligible", () => {
     withStore(view);
     const kept = applySnapEgress(resend, state, legacy, { ...deps(), sessionId: "t23" });
     assert.equal(kept, legacy, "empty body is not a trim — tripwire judges the divergence");
+});
+
+// T24 (P2-final): the in-request snapshot write — the lane flushes the store
+// BEFORE the egress stage, so the plane already holds THIS round's messages
+// and the seam walk for this round's own resend has an empty tail.
+test("T24 in-request flush: plane readable pre-egress, tail=0 for this round's resend", async () => {
+    const dir = tmpDir("bili-5874-p2-t24-");
+    const store = new SessionStore({ enabled: true, dir, debounceMs: 1000 });
+    _setStoreForTest(store);
+    try {
+        const session = createSession("t24-sid", { protocol: "openai" });
+        const resend = [
+            msg("u1", "first user message"),
+            msg("a1", "first reply", "assistant"),
+            msg("u2", "second user message"),
+        ];
+        // The lane's exact sequence: snapshotMessages → in-request flush.
+        snapshotMessages(session, resend);
+        const verdict = await SessionStore.flushOrSkip(session);
+        assert.equal(verdict.ok, true, "the in-request flush landed");
+        // The plane already holds the in-flight turn — pre-egress.
+        const view = store.snapEgressView("t24-sid");
+        assert.ok(view, "plane view present after the in-request flush");
+        const texts = view!.rows.map((r) => {
+            try { return (JSON.parse(r.postJson ?? "") as { text?: string }).text ?? null; } catch { return null; }
+        });
+        assert.deepEqual(texts, ["first user message", "first reply", "second user message"]);
+        // The seam walk for THIS round's resend sees a full prefix: no tail.
+        const state = session.state as CompressionState;
+        const built = buildSnapEgressView(view!, resend, state);
+        assert.ok(built.ok, built.ok ? "" : `view must assemble, got ${(built as { reason: string }).reason}`);
+        assert.equal(built.tailCount, 0, "this round's resend is fully on the plane — no tail");
+        assert.equal(built.msgs.length, 3, "the full transcript, no anchor (no folds yet)");
+        // Idempotent: re-flushing the same epoch persists nothing new.
+        const verdict2 = await SessionStore.flushOrSkip(session);
+        assert.equal(verdict2.ok, true);
+        assert.equal(store.snapEgressView("t24-sid")?.rows.length, 3);
+        // A mutation after the flush bumps the epoch — the lane's re-arm
+        // condition (!ok || epoch changed) is then true.
+        markDirty(session);
+        const verdict3 = await SessionStore.flushOrSkip(session);
+        assert.equal(verdict3.ok, true);
+        assert.notEqual(session.revisionEpoch, verdict.epoch, "epoch moved after the mutation");
+    } finally {
+        _setStoreForTest(null as unknown as SessionStore);
+        await store.closeQuietly();
+    }
 });
