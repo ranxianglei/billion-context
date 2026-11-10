@@ -3,9 +3,10 @@ import { collectBlockContent, countMessageTokens, defaultCountTokens, formatRang
 import { loadConfigFile, resolveMessageTimestamps } from "./config.js";
 import { excludeDeadRefRanges, handleAcpStatus, liveCompressionRanges } from "./acp-status.js";
 import { handleAcpCache, prefixTokensBeforeRef, recordCacheFoldsFromBlocks } from "./cache-ledger.js";
-import { type Session, cacheBlockContent, markDirty, residentPressure, scrubTurnSeparatorIds, statusInputBaseline, withoutTurnSeparators } from "./session.js";
+import { type Session, cacheBlockContent, markDirty, residentPressure, scrubTurnSeparatorIds, statusInputBaseline, truncatedUpstreamOf, withoutTurnSeparators } from "./session.js";
 import { COMPRESS_TOOL_NAME, parseCompressInput, ABSORB_TOOL_NAME, type ParsedRange } from "./compress-tool.js";
 import { effectiveAbsorbConfig, executeAbsorb, isProxyToolFor } from "./absorb.js";
+import { recordCompressCommit } from "./context-analysis.js";
 import { executeSearchContextTarget, resolveDecompress } from "./decompress-shared.js";
 import { ONE_CALL_HINT } from "acp-kernel";
 import { adoptContentStore, contentStoreOf, ccrEnabled, drainPendingRetrievals, executeRetrieve, retrieveToolName } from "./store.js";
@@ -19,7 +20,7 @@ import { attachSubagentSessions, subagentSessionNote, subagentSessionsOf, syncSu
 import { METADATA_DRIFT_ESCALATED } from "./fold-reconcile.js";
 import { safePrefix, safeSuffix, scrubLoneSurrogates } from "./text-safe.js";
 import { applyConfiguredCompression } from "./external-summary-compress.js";
-import { unpromptedGateOf } from "./unprompted-gate.js";
+import { NUDGE_CREDIT_ROUNDS, unpromptedGateOf } from "./unprompted-gate.js";
 import { describeUncoveredRuns, shortTokenCount, uncoveredHistoryRuns } from "./uncovered.js";
 
 export type RewriteCtx = {
@@ -47,7 +48,7 @@ export type RewriteCtx = {
 // path uses (loop/core.ts executeProxyTool). compress mutates context
 // (handled by applyRanges); the other three are read-only queries whose result
 // becomes a text block replacing the intercepted tool_use.
-function executeAnthropicProxyTool(toolName: string, args: Record<string, unknown>, ctx: RewriteCtx): ProxyToolResult {
+export function executeAnthropicProxyTool(toolName: string, args: Record<string, unknown>, ctx: RewriteCtx): ProxyToolResult {
     if (toolName === COMPRESS_TOOL_NAME) {
         return applyRanges(parseCompressInput(args), ctx);
     }
@@ -205,6 +206,15 @@ function clearCompressFailures(session: Session): void {
         markDirty(session);
     }
 }
+// Occurrences of a failure key currently held in the persisted streak ring
+// (read-only companion to recordCompressFailure — call it AFTER the record
+// call so the count includes the just-pushed attempt).
+function compressFailOccurrencesOf(session: Session, key: string): number {
+    if (!key) return 0;
+    const prev = session.metadata[FAIL_STREAK_KEY];
+    const keys = Array.isArray(prev) ? prev.filter((k): k is string => typeof k === "string") : [];
+    return keys.filter((k) => k === key).length;
+}
 
 // #2146: the exact-spec repeat guard above is defeated by a model that walks
 // spec space — one fresh (also failing) range per call. In the incident,
@@ -279,6 +289,13 @@ function substrateDestructionPauseParagraph(n: number): string {
 function armedRefusalReceipt(n: number, decayMinutes: number): string {
     return `[Compression refused: this call carried no usable ranges and the compress circuit breaker is still armed (${n} consecutive failures) — while it stays armed, repeat parse-failure lectures are withheld. Format reminder: 'content' must be a non-empty array whose elements are {startId, endId, summary} objects with mNNNNN refs from your visible history. The breaker disarms on one successful fold or ${decayMinutes} minutes without a failing call. Continue your task without compressing.]`;
 }
+
+// #5986 review fix: the observed failure mode after a compress rejection is the
+// model getting entangled in compression bookkeeping and then stopping out —
+// every parse-failure receipt ends with this explicit return-to-task instruction
+// (the armed-breaker one-liner above already carries its own "Continue your task
+// without compressing.", so it is left untouched).
+const RETURN_TO_TASK_SUFFIX = " This failure only concerns the compress call. Return to the original task now and continue it (visible output or a tool call).";
 
 /** #2146: record one total compress failure (any spec) and return "" while
  *  healthy, or the pause paragraph to embed in the receipt once the
@@ -1040,17 +1057,36 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
     // failures have separate reporting (noteSkip) and must not arm the
     // model-facing circuit breaker on attempts the model never made.
     const trackLoop = opts?.loopTracking !== false;
-    // #5683: unprompted-compression policy gate (timing). Model-initiated calls
-    // only — bili's own overflow backstop folds ride loopTracking:false above
-    // and never reach this check, so availability is unaffected even when the
-    // nudge channel itself is suppressed.
+    // #5683/#5943: unprompted-compression policy gate (timing). Model-initiated
+    // calls only — bili's own overflow backstop folds ride loopTracking:false
+    // above and never reach this check, so availability is unaffected even when
+    // the nudge channel itself is suppressed. "armed" here reads as LIVE NUDGE
+    // CREDIT (#5943): a window of NUDGE_CREDIT_ROUNDS model rounds minted by the
+    // last actually-injected nudge, refreshed by each new one and decayed by
+    // every un-nudged model round (see src/unprompted-gate.ts) — NOT this-round
+    // arm, which refused every multi-round cleanup continuation.
     const gate = trackLoop ? unpromptedGateOf(ctx.session) : undefined;
     if (gate?.requireNudge && !gate.armed) {
-        ctx.log("[acp-proxy: refused unprompted compress — no nudge was injected this turn (compress.requireNudge)]");
-        return compressResult("[Compression REFUSED: unprompted compression is disabled on this route (compress.requireNudge) — you may only call compress in a round where a compression nudge was actually injected, and no nudge accompanied this round. Continue the task without folding; when a nudge appears, follow its ranges.]", "refused", 0, "unprompted");
+        ctx.log("[acp-proxy: refused unprompted compress — no live nudge credit (window expired or never minted) (compress.requireNudge)]");
+        return compressResult(`[Compression REFUSED: unprompted compression is disabled on this route (compress.requireNudge) — you may only call compress while a nudge credit is live, i.e. within ${NUDGE_CREDIT_ROUNDS} model rounds of a compression nudge that was actually injected. No live credit right now: the last injected nudge's window has expired, or no nudge was ever injected. Continue the task without folding; when a nudge appears, follow its ranges.]`, "refused", 0, "unprompted");
     }
     let { ranges, diagnostics } = parsed;
     if (ranges.length === 0) {
+        // compressAtFoldPoint v2 pointer echo (kind=already-folded-echo): the
+        // call's content was the relocation ack text of an earlier fold — the
+        // model copied the most recent compress call's rewritten args as its
+        // template (field report on #5949's v2: four identical
+        // content-not-array receipts in 25 minutes, each receipt feeding the
+        // next retry). Nothing is wrong with the format and nothing is
+        // foldable: ack a no-op instead of lecturing. NOT routed through
+        // recordCompressFailure (no repeat-guard counter for the model to
+        // misread as "the user asked N times"), but loop-tracked so a runaway
+        // echo burst still collapses to the #2146 short refusal.
+        if (diagnostics.kind === "already-folded-echo") {
+            const loopGuard = trackLoop ? noteCompressLoopFailure(ctx, "already-folded-echo") : "";
+            ctx.log("[acp-proxy: compress call echoed a fold-point relocation pointer (compressAtFoldPoint v2) — acked as no-op]");
+            return compressResult(`[bili: nothing was compressed — the text you sent is the relocation pointer of an earlier, already-completed fold (its summary lives at its fold point in the history). Do not re-send it. To fold NEW consumed ranges, issue one compress call whose content holds fresh 'mNNNNN–mNNNNN optional topic' header lines with their summaries.]${loopGuard}`, "refused", 0, "already-folded-echo");
+        }
         ctx.log("[acp-proxy: compress call had no valid ranges; nothing compressed.]");
         const rawReasons = diagnostics.invalidReasons ?? [];
         for (const reason of rawReasons) ctx.log(`[acp-proxy: rejected entry: ${reason}]`);
@@ -1082,6 +1118,33 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
             !isEmptyCall &&
             argLen !== undefined &&
             (diagnostics.kind === "malformed-json" || diagnostics.kind === "truncated");
+        // #5981: an EMPTY call dispatched from a stream that was CUT before its
+        // terminal event is not the model's empty companion call — the argument
+        // deltas never arrived. The bytes are identical by the time the parser
+        // sees them, so only the truncation stamp can tell the two apart. This
+        // branch must run BEFORE the #847/#4812 failure ledgers: those counters
+        // exist to detect a model repeating a spec it authored, and charging a
+        // transport failure to them would (a) arm the model-facing breaker on
+        // failures the model never caused and (b) collapse this receipt into a
+        // do-not-retry refusal precisely when a retry is the correct action.
+        const cutStream = isEmptyCall ? truncatedUpstreamOf(ctx.session) : undefined;
+        if (cutStream !== undefined) {
+            // #5981: the spec-keyed #847 ledger is deliberately NOT charged —
+            // it tells the model "you have requested this exact spec N times",
+            // which is false (the model never sent a spec; the bytes were cut).
+            // The session-level #4812 streak IS charged: a transport that stays
+            // broken must still bound the re-issue advice, or the model retries
+            // a dead stream until the turn dies — the runaway #2146 exists to
+            // stop. At the threshold this collapses into the same armed refusal
+            // every other receipt gets.
+            const lostLoopGuard = trackLoop ? noteCompressLoopFailure(ctx, `lost-in-transit:${diagnostics.kind}`, undefined, "truncated-upstream") : "";
+            const lostArmed = trackLoop ? compressBreakerDetail(ctx.session) : undefined;
+            ctx.log(`[acp-proxy: compress arguments lost in transit — the ${cutStream.protocol} stream was cut before its terminal event (${cutStream.cause}); not counted against the model's spec repeat guard]`);
+            if (lostArmed !== undefined && lostArmed.n > COMPRESS_LOOP_THRESHOLD) {
+                return compressResult(armedRefusalReceipt(lostArmed.n, lostArmed.decayMinutes), "refused", 0, `parse:${diagnostics.kind}:lost-in-transit`);
+            }
+            return compressResult(`[Compression FAILED: ARGUMENTS LOST IN TRANSIT — the upstream ${cutStream.protocol} stream carrying this call was cut before its terminal event (${cutStream.cause}), so the compress arguments never arrived. The call reached the proxy EMPTY through no fault of yours; nothing was compressed and this is NOT an empty-intent call. RE-ISSUE the compress call with the content you intended: ONE 'content' STRING holding every range, each block starting with its header line 'mNNNNN–mNNNNN optional topic' followed by that block's summary markdown (a JSON-encoded array of {startId, endId, summary} objects is also accepted INSIDE that same string).${lostLoopGuard}]`, "refused", 0, `parse:${diagnostics.kind}:lost-in-transit`);
+        }
         const parseKey = `parse:${diagnostics.kind}:${diagnostics.invalidItems}:${rawReasons.slice(0, 3).join("|")}`;
         const guard = recordCompressFailure(
             ctx.session,
@@ -1102,12 +1165,28 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
             ctx.log(`[acp-proxy: parse-failure receipt collapsed to short refusal (breaker armed, n=${armedDetail.n}, kind=${diagnostics.kind})`);
             return compressResult(armedRefusalReceipt(armedDetail.n, armedDetail.decayMinutes), "refused", 0, `parse:${diagnostics.kind}`);
         }
+        // Repeat-parse-failure collapse: from the 2nd identical parse failure
+        // on, the full format lecture + eligibility list re-appends ~200 words
+        // per retry (the field loop stacked 8 receipts before stopping, and
+        // the per-retry counter fed the model's "the user keeps asking the
+        // same message" misread). The FIRST failure keeps the full teaching
+        // receipt; every repeat gets ONE line pointing back at it. The
+        // spec-repeat guard text is dropped here on purpose — one counter,
+        // stated once.
+        const occurrences = compressFailOccurrencesOf(ctx.session, parseKey);
+        // #4812: collapse to a one-liner only on the tracked lane — the
+        // preflight lane (loopTracking:false) must always return the full
+        // receipt (it never arms and never collapses).
+        if (trackLoop && occurrences >= 2) {
+            ctx.log(`[acp-proxy: parse-failure receipt collapsed to one-liner (attempt ${occurrences}, kind=${diagnostics.kind})]`);
+            return compressResult(`[Compression FAILED again — this exact call has now failed ${occurrences} time(s) the same way (kind=${diagnostics.kind}); nothing was compressed. The full format guide and eligible ranges are in the FIRST failed receipt above — do not re-send this call verbatim.${loopGuard}]`, "refused", 0, `parse:${diagnostics.kind}`);
+        }
         if (isEmptyCall) {
-            return compressResult(`[Compression FAILED: the call carried no content at all (kind=${diagnostics.kind}) — an empty compress() compresses nothing and can never succeed. Do NOT re-issue an empty call; if you meant to compress, put content as ONE non-empty string in that SAME single call — each block headed by a 'mNNNNN–mNNNNN optional topic' line followed by its summary markdown (a JSON-encoded array of {startId, endId, summary} objects is also accepted INSIDE that same string).${guard}${loopGuard}]`, "refused", 0, `parse:${diagnostics.kind}`);
+            return compressResult(`[Compression FAILED: the call carried no content at all (kind=${diagnostics.kind}) — an empty compress() compresses nothing and can never succeed. Do NOT re-issue an empty call; if you meant to compress, put content as ONE non-empty string in that SAME single call — each block headed by a 'mNNNNN–mNNNNN optional topic' line followed by its summary markdown (a JSON-encoded array of {startId, endId, summary} objects is also accepted INSIDE that same string).${guard}${loopGuard}${RETURN_TO_TASK_SUFFIX}]`, "refused", 0, `parse:${diagnostics.kind}`);
         }
         if (argCorruption) {
             const truncNote = diagnostics.kind === "truncated" ? " (looks truncated)" : "";
-            return compressResult(`[Compression FAILED: the call's arguments (${argLen} chars) were not parseable JSON${truncNote} — the intended content was lost and nothing was compressed. Re-issue ONE compress call whose arguments parse as a single object with a STRING 'content' field: {"content": "<each block headed 'mNNNNN–mNNNNN optional topic', its summary on the following lines>"}. Never send 'content' as an actual JSON array or nested object — it is one plain string.${guard}${loopGuard}]`, "refused", 0, `parse:${diagnostics.kind}`);
+            return compressResult(`[Compression FAILED: the call's arguments (${argLen} chars) were not parseable JSON${truncNote} — the intended content was lost and nothing was compressed. Re-issue ONE compress call whose arguments parse as a single object with a STRING 'content' field: {"content": "<each block headed 'mNNNNN–mNNNNN optional topic', its summary on the following lines>"}. Never send 'content' as an actual JSON array or nested object — it is one plain string.${guard}${loopGuard}${RETURN_TO_TASK_SUFFIX}]`, "refused", 0, `parse:${diagnostics.kind}`);
         }
         const recovery = loopGuard === "" ? compressionRecovery(ctx) : { hint: "", canRetry: false };
         const retry = recovery.canRetry ? " Re-issue the compress call using those eligible refs." : "";
@@ -1119,7 +1198,7 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         const notArrayHint = diagnostics.kind === "content-not-array"
             ? " If your 'content' string encoded a single JSON object, wrap it in square brackets so it encodes an ARRAY of entries (\"[...]\"), or use the line-form headers below."
             : "";
-        return compressResult(`[Compression FAILED: no valid ranges parsed (kind=${diagnostics.kind}, dropped=${diagnostics.invalidItems}).${why}${notArrayHint} compress takes ONE 'content' STRING holding every range: each block starts with its header line 'mNNNNN–mNNNNN optional topic' followed by that block's summary markdown; a JSON-encoded array of {startId, endId, summary} objects is also accepted INSIDE that same string. startId/endId are mNNNNN message refs from the conversation (call acp_status to see current refs).${recovery.hint}${retry}${guard}${loopGuard}]`, "refused", 0, `parse:${diagnostics.kind}`);
+        return compressResult(`[Compression FAILED: no valid ranges parsed (kind=${diagnostics.kind}, dropped=${diagnostics.invalidItems}).${why}${notArrayHint} compress takes ONE 'content' STRING holding every range: each block starts with its header line 'mNNNNN–mNNNNN optional topic' followed by that block's summary markdown; a JSON-encoded array of {startId, endId, summary} objects is also accepted INSIDE that same string. startId/endId are mNNNNN message refs from the conversation (call acp_status to see current refs).${recovery.hint}${retry}${guard}${loopGuard}${RETURN_TO_TASK_SUFFIX}]`, "refused", 0, `parse:${diagnostics.kind}`);
     }
     // #847: detect reversed refs as SUBMITTED, before #1001 normalization
     // rewrites them (order matters — normalizeRangeOrder mutates in place).
@@ -1477,6 +1556,9 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         const foldPoint = [...ranges].sort((a, b) => refNum(a.startRef) - refNum(b.startRef))[0]?.startRef ?? "unknown";
         ctx.session.lastCompress = { at: Date.now(), shrinkRatio, foldPoint, blocks: r.blocksCreated, tokensCompressed: r.tokensCompressed };
         ctx.session.stats.pendingFoldUsage = true;
+        // Context analysis: pair this commit with the recent nudge offer so the
+        // acceptance rate (offered vs folded) is measurable (#session-aedc188c).
+        recordCompressCommit(ctx.session.id, r.tokensCompressed, r.blocksCreated);
         // #695: the next request materializes this fold — its prefix-cache hit
         // ceiling ≈ anchor / postFoldContext. sys length is unknown here, so
         // anchor (active block summaries) is a LOWER bound; the fold=new

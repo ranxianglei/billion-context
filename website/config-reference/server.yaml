@@ -190,6 +190,17 @@ entries:
     desc_zh: "出站图片降采样总开关（#3295/#3400）：大图以缩小形态发给模型，原图在会话存储中保持字节级原样。逐请求实时读取。"
     site_en: "<code>imageRescale</code> — egress downscale switch; large outbound images sent shrunken, originals kept byte-exact in session storage."
     site_zh: "<code>imageRescale</code> —— 出站图片降采样总开关；大图以缩小形态出站，原图在会话存储中保持字节级原样。"
+  - key: egressTransforms
+    type: array
+    default: "unset (none)"
+    env: []
+    group: upstream
+    id: tt.etf2
+    site_group: up
+    desc_en: "User-registerable egress request-body rewrite pipeline (#6003): ESM plugins that rewrite every outbound model-request body after all session processing and before transport (re-sign / v1Wrap / fetch). Fail-open, hot-reloadable via POST /__bili/config/reload."
+    desc_zh: "用户可注册的出站请求体改写管线（#6003）：ESM 插件在所有会话处理之后、传输（重签 / v1Wrap / fetch）之前改写每个出站模型请求体。fail-open，可经 POST /__bili/config/reload 热重载。"
+    site_en: "<code>egressTransforms</code> — user-registerable egress body-rewrite pipeline (ESM plugins, fail-open, hot-reloadable)."
+    site_zh: "<code>egressTransforms</code> —— 用户可注册的出站请求体改写管线（ESM 插件，fail-open，可热重载）。"
   - key: billing
     type: object
     default: "{}"
@@ -507,6 +518,13 @@ entries:
     group: behavior
     desc_en: "Pi inline lane (#3278; DEFAULT-ON since #5428, superseding the #4687 opt-in rule): the pi extension's compression runs IN-PROCESS — no spawned proxy, no ephemeral port; model traffic and the /__bili//__acp tool surface are served by an in-process engine through a pseudo-origin, the codex Responses WebSocket lane by a loopback-only WS bridge, and the Web UI by a loopback-only web listener booted with the engine. Unset env+file now runs INLINE; an ANNOUNCED attach target (launcher-set BILLION_CONTEXT_PROXY/ATTACH) still beats the default, so `bili pi` keeps its launcher proxy. Opt OUT with BILI_PI_INLINE=0/false/no/off or this key set false — restores the old attach/spawn posture. Resolved env > file > default; an explicit inline choice always beats an announced attach target. Human surface: `bili -i/--inline pi` (≡ the one-command lane) and `bili -s/--server pi` (pin the proxy posture, beats an inherited inline env)."
     desc_zh: "pi 内联压缩通道（#3278；自 #5428 起默认开启，取代 #4687 的手动开启规则）：pi 扩展的压缩在进程内完成——不派生代理进程、无临时端口；模型流量与 /__bili//__acp 工具面由进程内引擎经伪源站服务，codex 的 Responses WebSocket 通道走随引擎启动的仅回环 WS 桥，Web UI 走随引擎启动的仅回环监听。未设置 env+文件时默认内联；显式宣告的附着目标（launcher 预置的 BILLION_CONTEXT_PROXY/ATTACH）仍压过默认，`bili pi` 照旧用 launcher 代理。不想用就 BILI_PI_INLINE=0/false/no/off 或本键设 false——恢复旧的 attach/spawn 姿态。解析顺序 env > 文件 > 默认；显式开启永远压过附着目标。人类入口:`bili -i/--inline pi`(≡ 一键车道)与 `bili -s/--server pi`(钉死代理姿态,压过继承的内联变量)。"
+  - key: pi.commands
+    type: "string[] | boolean"
+    default: "[\"acp\", \"acp-cache\"]"
+    env: ""
+    group: behavior
+    desc_en: "Which bili pi-plugin slash commands register: \"acp\", \"acp-cache\", \"acp-rule\", \"acp-fleet\". The default keeps the status (/acp) and cache-reconciliation (/acp-cache) entry points while leaving the rarer /acp-rule and /acp-fleet off the slash-completion list; true registers all four, [] or false registers none. Unknown names warn once and are ignored. Read at session start, so a config edit applies to the next session (no proxy restart needed). Pure UI surface: disabling a command never removes the underlying tool (acp_cache / acp_rule stay available to the model) or affects the proxy."
+    desc_zh: "bili pi 插件注册哪些斜杠命令：\"acp\"、\"acp-cache\"、\"acp-rule\"、\"acp-fleet\"。默认保留状态面板（/acp）与缓存对账（/acp-cache）两个入口，较冷门的 /acp-rule 与 /acp-fleet 不进入补全列表；true 注册全部四个，[] 或 false 一个都不注册。未知命令名告警一次后忽略。会话启动时读取，改配置下一个会话即生效（无需重启代理）。纯 UI 面：关闭命令不影响底层工具（acp_cache / acp_rule 对模型仍可用）与代理。"
   - key: opencode.inline
     type: boolean
     default: "false"

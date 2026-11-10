@@ -1,6 +1,6 @@
 # billion-context
 
-<p align="center"><a href="./README.md">English</a> | <a href="./README.zh-CN.md">中文</a></p>
+<p align="center"><a href="./README.md">English</a> | <a href="./README.zh-CN.md">中文</a> | <a href="./README.ja.md">日本語</a></p>
 
 <p align="center"><strong>上下文压缩插件</strong> — <em>billion-context is all you need。</em></p>
 
@@ -169,7 +169,20 @@ bili plugin remove <client>     # 卸载(dsh 经同一通道移除;配置快照�
 客户端有自己的插件通道时,也可以原生安装、完全不用 bili 命令:
 
 - **dsh:** `dsh plugin --profile <name> add billion-context` 正是 `bili plugin install dsh` 按 profile 驱动的那条命令(仅 npm 形态;git checkout 没有已发布入口 —— 直接填 GitHub 地址装到的是没有 `dist/` 的源码,bundle 永远加载不出来)—— 两种走法终态一致(pnpm 装进 profile、patch 层由 dsh 自己挂载);经同一通道卸载。见下文 dsh 段。
-- **opencode:** 把裸 npm 包名直接写进你真实配置的插件列表 —— `"plugin": ["billion-context"]`(仅 npm 形态;git checkout 没有已发布入口)。包通过 `exports["./server"]` → `dist/agent/opencode-native.js` 暴露插件入口,opencode 用自己的 Npm.add 机制加载,插件自拉起的行为与 bili 安装的形态完全一致。另外要做两件 bili 安装器会替你做的事:在同一份配置里设 `"compaction": { "auto": false }`(否则 OpenCode 的原生自动压缩会双重压缩),并先手工备份该配置文件。
+- **opencode:** 最省事是 `bili plugin install opencode`(它会按宿主版本选对入口形态)。不用 bili 手工安装(仅 npm 形态;git checkout 没有已发布入口):
+  - **OpenCode 1.x** —— 把裸 npm 包名直接写进你真实配置的插件列表:`"plugin": ["billion-context"]`。包通过 `exports["./server"]` → `dist/agent/opencode-native.js` 暴露插件入口,opencode 用自己的 Npm.add 机制加载,插件自拉起的行为与 bili 安装的形态完全一致。
+  - **OpenCode 2.x** —— 裸包名**不行**:2.x 走包的 `main` 字段(`dist/index.js`,是 CLI、没有插件定义)解析,模块加载失败(#3976)。正确写法是在一个目录里放一行重导出,再把配置的 `plugins` 列表指向这个目录:
+
+    ```js
+    // <shim 目录>/index.js
+    export { default } from "<全局安装的绝对路径>/dist/agent/opencode-native.js";
+    ```
+
+    ```json
+    { "plugins": ["<shim 目录>"] }
+    ```
+
+  两个版本都要做两件 bili 安装器会替你做的事:在同一份配置里设 `"compaction": { "auto": false }`(否则 OpenCode 的原生自动压缩会双重压缩),并先手工备份该配置文件。
 - **claude:** 本仓库同时是一个 Claude Code 插件市场 —— `/plugin marketplace add ranxianglei/billion-context`,再 `/plugin install billion-context@billion-context`,然后运行 `/billion-context:bili-setup`(它会替你驱动 `bili plugin install claude` 并提示重启)。终态与 bili 安装器一致;插件自身不携带 hooks 或 MCP 条目,不会双重注册。
 
 pi / omp / kimi / claude 没有客户端侧通道 —— 它们的配置条目由 `bili plugin install <client>` 代写(kimi 的声明式 `kimi.plugin.json` + 注册记录、claude 的受管 settings 块等)。

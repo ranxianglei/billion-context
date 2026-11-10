@@ -113,6 +113,8 @@
 | `BILI_OUTBOUND_BODY_BYTES` | network.outboundBodyBytes，5 GiB——重建后转发上游的硬上限（#3128） |
 | `BILI_WS_OUTBOUND_BYTES` | network.wsOutboundBytes，10 MiB——WS 车道出站软预算：超限先把旧的非保护图归档/降采样再发送（#3701：网关对大帧 close 1009；0 关闭预发送削减；HTTP 车道不受影响） |
 | `BILI_HTTP_OUTBOUND_BYTES` | network.httpOutboundBytes，10 MiB——普通/代理/pi 原生 HTTP 中继车道出站软预算：超限先把旧的非保护图归档/降采样再发送（#3909：图片密集会话按字节/像素解码 CPU 被上游拒收、token 折叠不触发；仅在无受管传输时生效，受管 HTTP/dsh-inline 从不裁减 #3701 Finding 1；0 关闭） |
+| `BILI_INGEST_BODY_BYTES` | network.ingestBodyBytes，32 MiB——解码后进入 JSON.parse+归一化清扫的成本带（#5794：51.2 MiB 体每轮吞 5.5–7.2s 事件循环 → 747s FATAL；超带的**文本为主**体即 413，因为任何可解析的 32 MiB+ 文本体 ≥ ~8M token、超过一切真实窗口；带图片的体豁免——像素按设计不进 token 计量，由槽位预算/收件上限/车道 shed 治理（#496/#3909/#3701）；0 关闭） |
+| `BILI_MAX_MESSAGES` | network.maxMessages，默认 0（关闭）——单上游 messages[] 数组长度硬限（COUNT 维度，任何字节/token 估算都表达不了；#5000：26,903 条消息体清掉所有尺寸闸仍在上游死掉；超限 413 提示 restart/rewind，不做折叠；按上游各自设置） |
 | `BILI_CACHE_KEEPALIVE`（#3376） | unset（false；同 `cacheKeepalive.enabled` 层级 env 覆盖） |
 | `BILI_CACHE_KEEPALIVE_ASSUME_TTL` | unset（从 body cache_control 断点探测） |
 | `BILI_CACHE_KEEPALIVE_TTL_FACTOR` | 0.9 |
@@ -134,6 +136,7 @@
 | `BILI_SESSION_WARM_MAX_BYTES` | warm 解码字节上限，64 MiB（#2803） |
 | `BILI_PERSIST` | `=0` 关闭持久化（ephemeral/test） |
 | `BILI_PERSIST_DEBOUNCE_MS` | persist.debounceMs，500 |
+| `BILI_PERSIST_MAX_DELAY_MS` | persist.maxDelayMs，5000——持续写入时待落盘写入的等待上限（#6058） |
 | `BILI_PERSIST_EPERM_ALERT_THRESHOLD` / `BILI_PERSIST_EPERM_ALERT_REPEAT_MS` | EPERM 告警阈值 5 / 重复间隔 0（不限次） |
 | `BILI_PERSIST_TAIL_TOKENS` | persist.tailTokens，16384（0 禁用消息持久化，#401） |
 | `BILI_PERSIST_ZSTD` | `=1/true` 启用 zstd 压缩持久化（owner 决定 #1080，默认 off） |
@@ -154,6 +157,8 @@
 | `BILI_FAKE_BUF_CAP` | fake-completion 缓冲上限，16 MiB |
 | `BILI_CONFLICT_SCAN` | thirdparty-scan 冲突扫描开关 |
 | `BILI_INVARIANT_JUDGE` | diagnostics.invariantJudge，默认 on——I1/I2 出站不变量法官（L1 顾问：violation 只 warn、流量永不拦；`=0` 解除武装，#3938 decision ②） |
+| `BILI_LOG_RETENTION_HOURS` | diagnostics.logRetentionHours，默认 48（下限 1h）——私有 `bili.log` 的目标覆盖窗口：活动文件 10 MiB 封存为不可变、名字唯一的一代；字节预算永远优先，报告的覆盖是**实测跨度**且 `continuity` 恒为 `unknown`（不宣称未中断）；非法值回落到默认而非文件层（env 一旦设置即拥有开关） |
+| `BILI_LOG_BUDGET_BYTES` | diagnostics.logBudgetBytes，默认 268435456（256 MiB，下限 1 MiB）——活动日志 + 全部封存分代的硬总字节预算，超限按封存时间戳**最旧优先**整代删除；活动文件永不删除（单文件超预算只报告、不截断）；与 `BILI_LOG_RETENTION_HOURS` 冲突时预算赢 |
 
 ### 2.6 安全 / 运维通道
 

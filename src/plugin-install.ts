@@ -1378,10 +1378,13 @@ function stripLegacyOpencodeAcp(data: Record<string, unknown>, notes: string[], 
 
 // #925: how THIS bili was installed decides which plugin entry install can
 // publish. An npm-form install (package root under node_modules — npm/pnpm/
-// yarn, both path-separator styles) ships its entry through package.json
-// exports["./server"], so opencode loads the bare package name via its own
-// Npm.add machinery (host-managed install + upgrade, portable config). Any
-// other form (git checkout / dev build) has no published entry — local shim dir.
+// yarn, both path-separator styles) CAN ship its entry through package.json
+// exports["./server"] as the bare package name (host-managed install +
+// upgrade, portable config) — but ONLY on OpenCode 1.x hosts. On 2.x hosts
+// the bare name resolves to the package MAIN field on some platforms
+// (Windows: dist/index.js — the CLI, no default export → LoadError, #3976),
+// so every 2.x install writes the local shim dir instead. Any non-npm form
+// (git checkout / dev build) has no published entry — local shim dir too.
 export function isNpmInstallForm(root: string): boolean {
     return /(^|[/\\])node_modules[/\\]/.test(root);
 }
@@ -1389,6 +1392,8 @@ export function isNpmInstallForm(root: string): boolean {
 export const OPENCODE_NPM_ENTRY = "billion-context";
 
 const DEV_FORM_NOTE = "dev form: machine-local shim, not portable across machines — an npm install writes the bare package name instead";
+
+const V2_NPM_SHIM_NOTE = "OpenCode 2.x host: machine-local shim dir instead of the bare package name — 2.x loads bare names via the package main field, which is not the plugin (#3976)";
 
 // #925: pick + apply the plugin entry for this install form. Replaces any
 // existing entry of either form (single owner), returns note(s). #927: the
@@ -1400,13 +1405,21 @@ const DEV_FORM_NOTE = "dev form: machine-local shim, not portable across machine
 // scalars) are preserved verbatim in form and position. A strings-only
 // projection must never be written back, and "plugin present" must mean
 // the key was left untouched (no rewrite of the surrounding file either).
+// #3976: the ENTRY FORM is decided by install form AND host major version —
+// the `plugins` key is written only for 2.x hosts (#927 pickPluginKey), so
+// key === "plugins" is the 2.x gate: every 2.x install (npm or dev form)
+// writes the shim dir, because a bare package name resolves to the package
+// main field (dist/index.js — the CLI, no default export) on 2.x hosts such
+// as Windows and loads no plugin at all. 1.x keeps the portable bare name
+// for npm-form installs; dev form always shims (no published entry).
 export function applyOpencodePluginEntry(args: { data: Record<string, unknown>; root: string; shimDir: string; agentJs: string; key?: "plugin" | "plugins"; touched?: Set<string> }): string[] {
     const { data, root, shimDir, agentJs } = args;
     const key = args.key ?? "plugin";
     const touched = args.touched ?? new Set<string>();
     const ours = [OPENCODE_NPM_ENTRY, shimDir];
     const npmForm = isNpmInstallForm(root);
-    const entry = npmForm ? OPENCODE_NPM_ENTRY : shimDir;
+    const useShim = !npmForm || key === "plugins";
+    const entry = useShim ? shimDir : OPENCODE_NPM_ENTRY;
     const isOurs = (x: unknown): boolean => typeof x === "string" && ours.includes(x);
     const raw = data[key];
     const oursIn = (): string[] => {
@@ -1415,10 +1428,15 @@ export function applyOpencodePluginEntry(args: { data: Record<string, unknown>; 
         return [];
     };
     const replaced = oursIn();
-    if (npmForm && replaced.includes(shimDir)) fs.rmSync(shimDir, { recursive: true, force: true });
-    if (!npmForm) {
+    if (!useShim && replaced.includes(shimDir)) fs.rmSync(shimDir, { recursive: true, force: true });
+    if (useShim) {
         fs.mkdirSync(shimDir, { recursive: true });
-        fs.writeFileSync(path.join(shimDir, "index.js"), `export { default } from ${JSON.stringify(agentJs)};\n`);
+        // Rewrite whenever the content drifts from THIS root (a reinstall to
+        // a new path must heal a stale shim even when the config entry is
+        // already present and left untouched below).
+        const idx = path.join(shimDir, "index.js");
+        const want = `export { default } from ${JSON.stringify(agentJs)};\n`;
+        if (!fs.existsSync(idx) || fs.readFileSync(idx, "utf8") !== want) fs.writeFileSync(idx, want);
     }
     // Exactly our one entry, already the right form — nothing to migrate:
     // leave the key (and the file) untouched.
@@ -1434,12 +1452,13 @@ export function applyOpencodePluginEntry(args: { data: Record<string, unknown>; 
         data[key] = [entry];
     }
     touched.add(key);
-    if (npmForm) {
-        if (replaced.length === 0) return [`plugin -> ${OPENCODE_NPM_ENTRY}`];
-        return [`plugin -> ${OPENCODE_NPM_ENTRY} (replaced ${replaced.join(", ")})`];
+    if (!useShim) {
+        if (replaced.length === 0) return [`${key} -> ${OPENCODE_NPM_ENTRY}`];
+        return [`${key} -> ${OPENCODE_NPM_ENTRY} (replaced ${replaced.join(", ")})`];
     }
-    if (replaced.length === 0) return [`plugin -> ${shimDir}`, DEV_FORM_NOTE];
-    return [`plugin -> ${shimDir} (replaced ${replaced.join(", ")})`, DEV_FORM_NOTE];
+    const note = npmForm ? V2_NPM_SHIM_NOTE : DEV_FORM_NOTE;
+    if (replaced.length === 0) return [`${key} -> ${shimDir}`, note];
+    return [`${key} -> ${shimDir} (replaced ${replaced.join(", ")})`, note];
 }
 
 function opencodeInstall(withMcp = false): string {
@@ -1501,9 +1520,10 @@ function opencodeInstall(withMcp = false): string {
         }
     }
 
-    // Native plugin (#820/#925): self-spawned proxy + http.request URL rewrite.
-    // Entry form depends on how THIS bili was installed — npm → bare package
-    // name (exports["./server"], host-managed), checkout/dev → local shim dir.
+    // Native plugin (#820/#925/#3976): self-spawned proxy + http.request URL
+    // rewrite. Entry form: OpenCode 1.x + npm install → bare package name
+    // (host-managed, portable); every 2.x install and any dev-form install →
+    // local shim dir (bare names do not load under 2.x hosts, #3976).
     const root = selfPackageRoot();
     const agentJs = path.join(root, "dist", "agent", "opencode-native.js");
     requireDistFile(agentJs);
@@ -2635,6 +2655,18 @@ async function updateLane(agent: PluginAgent, opts: PluginUpdateOpts, log: (leve
             return [`opencode: the cache copy is bili-owned and self-updates in place through its own proxy${where}${v} (#1234) — this command does NOT run opencode's upgrade; OpenCode v2 'plugin update' is an extra manual channel, and reload/restart OpenCode after a disk update to activate it`];
         }
         if (PLUGIN_KEYS.some((k) => pluginEntries(data, k).some((p) => p === dir))) {
+            // #3976: on 2.x hosts even npm installs use the shim — tell the
+            // user which root the shim re-exports before prescribing a fix.
+            let target: string | undefined;
+            try {
+                const m = /from\s+"([^"]+)"/.exec(fs.readFileSync(path.join(dir, "index.js"), "utf8"));
+                if (m) target = m[1];
+            } catch {}
+            if (target !== undefined && isNpmInstallForm(target)) {
+                const ver = pkgVersionAt(path.dirname(path.dirname(path.dirname(target))));
+                const v = ver !== undefined ? ` v${ver}` : "";
+                return [`opencode: the shim points at the npm install${v} (#3976) — it self-updates in place through its own proxy; reload/restart OpenCode after a disk update to activate it`];
+            }
             return ["opencode: plugin points at this checkout — rebuild the checkout (`npm run build`) to pick up changes"];
         }
         return ["opencode: not installed"];

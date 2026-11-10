@@ -243,6 +243,13 @@ interface Captured {
     msg: string;
 }
 
+/** Failure diagnostics for a capture seam: index, level and message, so a
+ *  missing/extra/mistimed emission is readable without rerunning the suite. */
+function describeCapture(captured: readonly Captured[]): string {
+    if (captured.length === 0) return "(capture empty)";
+    return captured.map((c, i) => `  [${i}] ${c.level}: ${c.msg}`).join("\n");
+}
+
 test("proxy debug logs: no credentials, no non-public host in ANY log line (#255)", async () => {
     const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "bili-log-mask-"));
     const prev = {
@@ -762,17 +769,35 @@ test("maskIpsInText: non-loopback IP literals scrubbed from free-form text (#171
 test("logger sink: file lines scrubbed, capture hook stays raw (#1718)", async () => {
     const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "bili-log-sink-"));
     const file = path.join(tmpRoot, "sink.log");
-    const captured: string[] = [];
-    setLogCapture((_level, msg) => captured.push(msg));
+    const captured: Captured[] = [];
+    setLogCapture((level, msg) => captured.push({ level, msg }));
     try {
         configureLogger(file);
+        // A fresh log's coverage is short of the 48h target, so startup emits a
+        // retention diagnostic through this very seam BEFORE the line under
+        // test. Positional capture[0] therefore asserts on that diagnostic, not
+        // on the warning — the CI red on both platforms. Assert exact membership
+        // and account for the diagnostic explicitly instead of dropping it.
+        const startupDiagnostic = captured.find((c) => c.msg.startsWith("log retention:"));
+        assert.ok(startupDiagnostic, `startup must keep the retention diagnostic:\n${describeCapture(captured)}`);
+        assert.match(startupDiagnostic.msg, /incomplete window|no dated log history retained yet|retained history unavailable/, startupDiagnostic.msg);
+
         const secret = "sk-test-leak-1234567890";
-        loggerLog("warn", `upstream 401 body: {"error":{"code":"invalid_api_key","api_key":"${secret}"}}`);
+        const rawMessage = `upstream 401 body: {"error":{"code":"invalid_api_key","api_key":"${secret}"}}`;
+        loggerLog("warn", rawMessage);
         await closeLogger();
+
         const onDisk = fs.readFileSync(file, "utf8");
         assert.ok(!onDisk.includes(secret), `secret leaked into log file:\n${onDisk}`);
         assert.ok(onDisk.includes("<masked"), onDisk);
-        assert.ok(captured[0]?.includes(secret), "capture hook must receive the raw message (in-process seam)");
+
+        // The in-process seam is not a log surface: it receives the message
+        // BEFORE redaction, verbatim. Exact membership (not "some capture") is
+        // the property: a partial or pre-masked delivery must fail here.
+        const raws = captured.filter((c) => c.msg === rawMessage);
+        assert.equal(raws.length, 1, `capture hook must receive the raw message exactly once, got ${raws.length}:\n${describeCapture(captured)}`);
+        assert.equal(raws[0]!.level, "warn", "the raw warning keeps its level through the seam");
+        assert.ok(!captured.some((c) => c.msg.includes("<masked")), `the seam must never see the redacted text:\n${describeCapture(captured)}`);
     } finally {
         configureLogger(undefined);
         setLogCapture(null);

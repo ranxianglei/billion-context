@@ -158,14 +158,15 @@ describe("#5789 tier-2 merge recovery ladder", () => {
     }
   });
 
-  it("block self-range b4..b4: idempotent no-op", () => {
-    // A poison block referenced against itself hard-failed on master with
-    // the same turn-integrity refusal as b1..b4 (its own coverage strands
-    // the live k2/l2/r2 conflict and nothing else is left to fold). With
-    // the recovery ladder the projection excludes b4 from consumption and
-    // folds nothing: an idempotent no-op success, never an error (a retry
-    // here must not arm the breaker or grow context). Pinned because #5789
-    // touches the adjacent projection paths.
+  it("block self-range b4..b4: #5919 extends to the live result and closes the turn", () => {
+    // A poison block referenced against itself pre-#5919 either hard-failed
+    // (turn-integrity refusal) or no-opped with nothing folded — while the
+    // live result l2 stayed stranded forever because its pair partner k2 sat
+    // inside b4's coverage (INV2: a lone result can never fold). The #5919
+    // recovery rung now folds the stranded result INTO the merge, consuming
+    // b4: the turn closes, the conflict clears, and a retry never errors
+    // (no breaker arming). Pinned because #5789 touches the adjacent
+    // projection paths.
     const { core, messages, state } = buildUserShapeFixture();
     const before = coveredMessageIds(state);
     const res = core.applyCompression({
@@ -175,12 +176,27 @@ describe("#5789 tier-2 merge recovery ladder", () => {
       ranges: [{ startRef: "b4", endRef: "b4", summary: SUMMARY }],
     });
     assert.equal(res.result.errors.length, 0, JSON.stringify(res.result));
-    assert.equal(res.result.blocksCreated, 0);
+    assert.equal(res.result.blocksCreated, 1);
     assert.ok(
-      res.result.warnings.some((w) => w.includes("folded nothing")),
+      res.result.warnings.some((w) =>
+        w.startsWith("Extended this merge to fold stranded partner(s)"),
+      ),
       JSON.stringify(res.result.warnings),
     );
-    assert.deepEqual(lostCoverage(before, res.state), [], "state must stay untouched");
+    const merged = res.state.blocks.find(
+      (b) => b.active && b.effectiveMessageIds.includes("l2"),
+    );
+    assert.ok(merged, "the recovered merge must cover the stranded result");
+    assert.equal(res.state.blocks.find((b) => b.blockId === "b4")!.active, false);
+    assert.deepEqual(lostCoverage(before, res.state), [], "no pre-existing coverage dropped");
+    // A retry of the same range must never error — the breaker stays disarmed.
+    const res2 = core.applyCompression({
+      messages,
+      state: res.state,
+      config,
+      ranges: [{ startRef: "b4", endRef: "b4", summary: SUMMARY }],
+    });
+    assert.equal(res2.result.errors.length, 0, JSON.stringify(res2.result));
   });
 
   it("conflict owned by a SURVIVING higher-tier block: inherited with warning, clean blocks still distill", () => {
