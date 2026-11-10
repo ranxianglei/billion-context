@@ -3485,6 +3485,61 @@ export class SessionStore {
         this.drainFlushWaiters(session.id, true);
     }
 
+    /** #5874 P2-final: the IN-REQUEST snapshot application — persist the
+     *  session's current canonical state right now (single store transaction
+     *  through writeNow: legacy tables AND the snapshot plane via
+     *  snapShadowSync), so the egress stage of the SAME request reads a plane
+     *  that already contains this turn (chain: raw → wire→core → kernel
+     *  rewrite → snapshot write → egress rewrite → egress). Before this the
+     *  plane write waited for the post-response debounce, so egress always
+     *  saw the plane one tick behind and re-stitched the live tail from the
+     *  client resend at the seam.
+     *
+     *  Never throws — a failed flush leaves the round on the legacy egress
+     *  path (the seam walk carries it) and the debounced retry is untouched.
+     *  On success the armed debounce is settled: our live build already
+     *  covers every mutation up to the epoch it captured, so the pending
+     *  timer is dropped (its build would be a byte-identical no-op); a
+     *  mutation that landed DURING the write's chain-run window re-arms via
+     *  the caller's end-of-prepare markDirty (the returned epoch lets it
+     *  distinguish "already saved" from "new state since").
+     *  @returns { ok: write landed, epoch: revisionEpoch captured BEFORE the
+     *  write (compare against session.revisionEpoch afterwards). */
+    async flushSessionNow(session: Session): Promise<{ ok: boolean; epoch: number | undefined }> {
+        const epoch = session.revisionEpoch;
+        try {
+            await this.writeNow(session);
+        } catch (err) {
+            this.log("warn", `[persist] ${session.id}: in-request snapshot flush failed (round stays on the legacy egress path): ${String(err).slice(0, 200)}`);
+            return { ok: false, epoch };
+        }
+        if ((session.revisionEpoch ?? 0) !== (epoch ?? 0)) {
+            // Newer mutation landed during the chain-run window — keep the
+            // debounce alive for it (re-arm; the pending timer already covers
+            // it when the timer still exists).
+            this.scheduleSave(session);
+        } else {
+            const t = this.saveTimers.get(session.id);
+            if (t) {
+                clearTimeout(t);
+                this.saveTimers.delete(session.id);
+            }
+            this.saveBuilders.delete(session.id);
+            this.writerOffPending.delete(session.id);
+            this.runIdleSpillIfIdle(session.id);
+        }
+        return { ok: true, epoch };
+    }
+
+    /** #5874 P2-final: lane-facing wrapper — a missing or PARTIAL store (test
+     *  stubs that answer only the accessors under test) degrades to "not
+     *  flushed" instead of throwing into the lane's kernel-fail catch. */
+    static async flushOrSkip(session: Session): Promise<{ ok: boolean; epoch: number | undefined }> {
+        const st = getStore();
+        if (!st || typeof st.flushSessionNow !== "function") return { ok: false, epoch: session.revisionEpoch };
+        return st.flushSessionNow(session);
+    }
+
     /** #4739: where this id's record lives RIGHT NOW — the one build-scoped
      *  source decision shared by both lazy-field restores after a save.
      *  Mirrors loadSync's routing exactly: no readable unified index (never

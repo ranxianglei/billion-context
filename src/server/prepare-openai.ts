@@ -40,6 +40,7 @@ import { isStrictReasoningEcho, modelIdOf, normalizeStrictEchoReasoning } from "
 import { reconcileSystemAnchor } from "../system-anchor.js";
 import { logRawStripCounts, markerArtifactCount, stripRawStage, type RawStripCounts } from "../marker/engine.js";
 import { imageRescaleMaxDim, renderNone as knobRenderNone } from "../knobs.js";
+import { SessionStore } from "../persist.js";
 import { applyImageRescalePass } from "../image-rescale.js";
 import { clampOutgoingOutput, countSystemAndToolsTokens, dshLedgerFloorTokens, emergencyNudge, emergencyNudgeArmed } from "./budget.js";
 import { effectiveAbsorbBlock, effectiveBlockOpsEnabled } from "./prepare-responses.js";
@@ -160,6 +161,9 @@ export async function prepareOpenai(
     const markerCounts = wpHit !== undefined ? { ...wpHit.markerCounts, strippedMs: 0 } : stripRawStage(parsed, "openai");
     logRawStripCounts(markerCounts, log, sessionId);
 
+    // #5874 P2-final: in-request snapshot flush verdict (set after processTurn,
+    // read at end-of-prepare to decide whether the debounce still needs a shot).
+    let snapFlush: { ok: boolean; epoch: number | undefined } | undefined;
     try {
         // Kernel 0.0.37 hoists the contiguous leading system/developer prefix
         // OUT of the fold space: system content is host runtime state and
@@ -327,6 +331,15 @@ export async function prepareOpenai(
         const turn = core.processTurn({ messages: renderMsgs, state: session.state, config: loopConfig, tokenCount, tokenCountSource, renderTags: renderStrategy, contentStore: contentStoreOf(session) });
         session.state = turn.state;
         adoptContentStore(session, turn.contentStore);
+        // #5874 P2-final: snapshot application (in-request) — the canonical
+        // transcript up to THIS user message plus the kernel's post-fold state
+        // must be on the snapshot plane before the egress stage reads it
+        // (chain: raw → wire→core → kernel rewrite → snapshot write → egress
+        // rewrite → egress). snapshotMessages first: the persist build reads
+        // session.lastMessages. Never fatal — a failed flush leaves the round
+        // on the legacy egress path (the seam walk carries it).
+        snapshotMessages(session, wpHit !== undefined ? wpHit.windowCores : originalMessages);
+        snapFlush = await SessionStore.flushOrSkip(session);
         // #4528: split the kernel pass from its post-processing scan passes so
         // each is a bounded synchronous stretch rather than one long block.
         await yieldToEventLoop();
@@ -648,8 +661,10 @@ export async function prepareOpenai(
     // #5403/#5418: on a watermark hit pin only this turn's window — the
     // stashed prefix lives OUTSIDE the Session by design; the fold machinery
     // applies to the pin exactly as it already does for folded sessions.
-    snapshotMessages(session, wpHit !== undefined ? wpHit.windowCores : originalMessages);
-    markDirty(session);
+    // #5874 P2-final: the in-request snapshot flush above already persisted
+    // this revision; re-arm the debounce only if the session mutated since
+    // (stats probes land at the next flush) or the flush never landed.
+    if (!snapFlush || !snapFlush.ok || (session.revisionEpoch ?? 0) !== snapFlush.epoch) markDirty(session);
     let wpResponseHeaders: Record<string, string> | undefined;
     if (wpFullText !== undefined && wpOutcome !== null && wpTurnStrip !== undefined) {
         wpResponseHeaders = finalizeWatermarkTurn(session, wpOutcome, {
