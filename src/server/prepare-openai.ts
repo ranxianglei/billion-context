@@ -64,6 +64,7 @@ export async function prepareOpenai(
     billingUpstream?: string,
     decide?: DecideConfig,
     bodyText?: string,
+    msgIdSource?: "body" | "header" | "harvest",
 ): Promise<Prepared> {
     const sessionId = session.id;
     const stream = parsed.stream === true;
@@ -180,13 +181,21 @@ export async function prepareOpenai(
         // #4491/#5825 parity: pin identity to client-supplied ids (plugin
         // lanes only — pure proxy traffic has no msgid channel and stays on
         // snapshot render D), the SAME gated contract as the anthropic twin.
+        // #6011: HARVEST-sourced ids are pinned without the pluginMode × cohort
+        // double gate — the harvest registry already enforced rollout-or-env +
+        // loopback + full content verification upstream, so a verified harvest
+        // id is as trustworthy as a stamped one. Without this, CC-standalone
+        // subagent lanes would never accumulate pinned rows and the #5719/#6011
+        // store-overlap rungs could never fire for them.
         // Skipped on watermark hits on purpose: fastpath turns reuse the
         // seed stash's prefix view whose rows were already pinned when it was
         // materialized, and the decoded tail window is SHORTER than the
         // stamped list, so count-parity there would fail by design — pinning
         // only adds noise.
-        if (wpHit === undefined && pluginMode && incomingMsgIds !== undefined) {
-            if (featureEnabled("pluginLaneServerHistory")) {
+        if (wpHit === undefined && (pluginMode || msgIdSource === "harvest") && incomingMsgIds !== undefined) {
+            if (pluginMode && !featureEnabled("pluginLaneServerHistory")) {
+                log("info", `[${sessionId}] [msgid] openai-wire biliMsgIds present but pluginLaneServerHistory rollout is off for this install — field stripped, ids not pinned (#5825)`);
+            } else {
                 const v = validateMsgIds(incomingMsgIds, msgs.length);
                 if (v.ok) {
                     msgs = applyMsgIdPin(msgs, v.ids);
@@ -194,8 +203,6 @@ export async function prepareOpenai(
                 } else {
                     log("warn", `[${sessionId}] [msgid] openai-wire pin rejected (${v.reason}) — falling back to content-derived ids (#4491/#5825)`);
                 }
-            } else {
-                log("info", `[${sessionId}] [msgid] openai-wire biliMsgIds present but pluginLaneServerHistory rollout is off for this install — field stripped, ids not pinned (#5825)`);
             }
         }
         // #3756 snapshot render: the outbound prefix renders from the unified

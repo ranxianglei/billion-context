@@ -239,6 +239,15 @@ function record(rawId: string, turns: NeutralTurn[], tagHash: string, model?: st
     scheduleOrderPersist();
 }
 
+/** #5719/#6011: normalize the incoming stamped ids (malformed/absent →
+ *  undefined — degrade over half-trust; callers then take exactly the
+ *  pre-change path). */
+function normalizeInboundIds(msgIds?: string[]): string[] | undefined {
+    return msgIds !== undefined && msgIds.length > 0 && msgIds.every((s) => typeof s === "string" && s.trim().length > 0)
+        ? msgIds
+        : undefined;
+}
+
 /** #2944 order-primary resolution. `rawId` MUST be a client-minted,
  *  unambiguous conversation id (caller's provenance contract — see the
  *  table above; ids that fail it stay on the anonymous ladder).
@@ -293,24 +302,59 @@ function record(rawId: string, turns: NeutralTurn[], tagHash: string, model?: st
  *  zero-state `|sub:` child. Requests without stamped ids — or with an
  *  unavailable store view — take exactly the pre-change path.
  *
- *  `readStoredMsgIds` (#5719, LAST param): `(key) => readonly string[] | null`
+ *  #6011 (sub-lane continuation by msgid STORE overlap): stamped ids ALSO
+ *  run ONE rung at every fork exit, after the raw-lane rescue above and
+ *  before the legacy fork mint — the SIBLING rung. The candidate sub-lanes
+ *  are the recorded skeleton keys under `<rawId>|sub:` UNIONED with the
+ *  unified store's session list filtered to the same prefix (`listStoredSessions`,
+ *  last param — covers lanes whose skeleton was evicted or pre-dates this
+ *  process). For each candidate the rung asks `readStoredMsgIds(candidate)`
+ *  for the rows PINNED under that lane key (the standard sessionId+msgid
+ *  matching query — the same #5719 semantics generalized from the raw key to
+ *  its derived children; NO parallel ledger exists, the unified store IS the
+ *  witness). Exactly ONE candidate with ANY overlap (host-minted UUIDs cannot
+ *  collide across distinct conversations) → the request CONTINUES that lane
+ *  instead of forking a fresh zero-state child; MULTIPLE overlapping
+ *  candidates (id reuse — a minting-contract violation) → warn + degrade to
+ *  the mint below, never guess; none → mint. Raw-lane rescue keeps its
+ *  precedence (an id overlapping the MAIN conversation's stored rows still
+ *  re-anchors raw first). Because the witness is the pinned ROWS — live AND
+ *  retired (#5312/#4390 retire-don't-delete) — client-side compaction cannot
+ *  erase an id out of the matchable set: a compacted-away message stays
+ *  queryable until physical archive, and every retained row keeps being
+ *  resent, so overlap survives normal growth indefinitely.
+ *
+ *  #6011 (stamped-id fork mint): when stamped ids are present but BOTH
+ *  rescues miss, the fork key is `<rawId>|sub:m:<first inbound id>` — the
+ *  FULL untruncated id, at all three fork exits instead of the legacy
+ *  content-derived key. The first inbound id is unique per run (host-minted
+ *  at thread birth), so parallel same-shape runs land on distinct lanes from
+ *  their very first fork; the sibling rung takes over continuity once the
+ *  run's rows are pinned under its key. With NO stamped ids the legacy mint
+ *  is byte-identical to before.
+ *
+ *  `readStoredMsgIds` (#5719, second-to-last param): `(key) => readonly string[] | null`
  *  — the recorded msg_ids for a conversation key (production:
  *  getStore().unifiedAllMessageIds — #5312's full historical id set, live AND
- *  retired rows, identity-only with no content hydration). Invoked AT MOST
- *  once, and only at a fork exit with non-empty inbound ids; never on the
- *  hot path. null = store unavailable (latch-off / legacy epoch) →
- *  byte-evidence only.
+ *  retired rows, identity-only with no content hydration). Invoked only at
+ *  fork exits with non-empty inbound ids — once for the raw key plus once
+ *  per candidate sub-lane; never on the hot path. null = store unavailable
+ *  (latch-off / legacy epoch) → byte-evidence only.
+ *
+ *  `listStoredSessions` (#6011, LAST param): `() => string[] | null` — the
+ *  unified store's session-key list (production:
+ *  getStore().unifiedListSessionIds), prefix-filtered to `<rawId>|sub:` to
+ *  form the sibling-rung candidate set alongside the skeleton table. null /
+ *  absent = skeleton-table candidates only. Same lazy contract as
+ *  readStoredMsgIds: invoked at most once, and only at a fork exit with
+ *  non-empty inbound ids.
  */
-export function resolveSessionOrder(rawId: string, history: unknown, personaTag?: string, declaredModel?: string, laneToken?: string, laneDiscriminator?: string, msgIds?: string[], readStoredMsgIds?: (rawKey: string) => readonly string[] | null): SessionOrderResolution {
+export function resolveSessionOrder(rawId: string, history: unknown, personaTag?: string, declaredModel?: string, laneToken?: string, laneDiscriminator?: string, msgIds?: string[], readStoredMsgIds?: (rawKey: string) => readonly string[] | null, listStoredSessions?: () => string[] | null): SessionOrderResolution {
     const list = Array.isArray(history) ? (history as unknown[]) : [];
     const turns = neutralTurns(list);
-    // #5719: normalize the incoming stamped ids ONCE (malformed/absent →
-    // undefined — degrade over half-trust, the fork-exit rung below then
-    // takes exactly the pre-change path).
-    const inboundIds: string[] | undefined =
-        msgIds !== undefined && msgIds.length > 0 && msgIds.every((s) => typeof s === "string" && s.trim().length > 0)
-            ? msgIds
-            : undefined;
+    // #5719: normalize the incoming stamped ids ONCE (see
+    // normalizeInboundIds — malformed/absent degrades to the pre-change path).
+    const inboundIds = normalizeInboundIds(msgIds);
     const kinds = turns.map((t) => t.kind);
     const incomingFrags = fragsOf(turns);
     const tag = personaTag !== undefined && personaTag.trim().length > 0 ? personaTag : "";
@@ -392,6 +436,63 @@ export function resolveSessionOrder(rawId: string, history: unknown, personaTag?
             key: rawId,
             action: "reanchor",
             reason: `byte-level continuation failed but ${hits} host message id(s) match rows recorded for this key in the unified store (${firstHit}) — same conversation by sessionid+msgid identity (#5719)`,
+        };
+    };
+    /** #6011 fork-exit rung (after raw-lane rescue, before the legacy mint):
+     *  a derived lane whose PINNED rows overlap the incoming ids is THIS
+     *  run's own lane — continue it instead of forking a zero-state sibling.
+     *  Standard sessionId+msgid store matching (the #5719 semantics
+     *  generalized from the raw key to its derived children — the unified
+     *  store is the witness, no parallel ledger): candidates are the
+     *  recorded skeleton keys under `<rawId>|sub:` unioned with the store's
+     *  session list on the same prefix (covers lanes whose skeleton entry
+     *  was evicted or pre-dates this process); each candidate is asked for
+     *  its pinned msg_ids. Exactly ONE overlapping lane continues
+     *  (host-minted UUIDs cannot collide across distinct conversations);
+     *  MULTIPLE overlaps mean id reuse (a minting-contract violation) →
+     *  warn + degrade to the mint below, never guess; none → mint. */
+    const trySiblingLane = (exit: string): SessionOrderResolution | null => {
+        if (inboundIds === undefined || readStoredMsgIds === undefined) return null;
+        const prefix = `${rawId}|sub:`;
+        const candidates = new Set<string>();
+        for (const key of skeletons.keys()) {
+            if (key.startsWith(prefix)) candidates.add(key);
+        }
+        for (const key of listStoredSessions?.() ?? []) {
+            if (key.startsWith(prefix)) candidates.add(key);
+        }
+        if (candidates.size === 0) return null;
+        let hitKey = "";
+        let hitHits = 0;
+        let hitFirst = "";
+        for (const key of candidates) {
+            const stored = readStoredMsgIds(key);
+            if (stored === null || stored.length === 0) continue;
+            const known = new Set(stored);
+            let hits = 0;
+            let firstHit = "";
+            for (const s of inboundIds) {
+                if (known.has(s)) {
+                    hits++;
+                    if (firstHit === "") firstHit = s;
+                }
+            }
+            if (hits === 0) continue;
+            if (hitKey !== "") {
+                loggerLog("warn", `[session-resolve][msgid-sibling] ambiguous: ${hitKey} and ${key} both overlap the incoming ids (firstHit=${firstHit}) exit=${exit} — degrading to fresh mint (#6011)`);
+                return null;
+            }
+            hitKey = key;
+            hitHits = hits;
+            hitFirst = firstHit;
+        }
+        if (hitKey === "") return null;
+        loggerLog("warn", `[session-resolve][msgid-sibling] ${hitKey} hits=${hitHits}/${inboundIds.length} exit=${exit} firstHit=${hitFirst} (#6011 sub-lane continuation by msgid store-overlap)`);
+        record(hitKey, turns, effectiveTagHash, effectiveModel);
+        return {
+            key: hitKey,
+            action: "continue",
+            reason: `${hitHits} host message id(s) match rows pinned under this sub lane (${hitFirst}) — same run continuing on its own lane (#6011)`,
         };
     };
     if (tagChanged) {
@@ -495,11 +596,21 @@ export function resolveSessionOrder(rawId: string, history: unknown, personaTag?
         // same turn — fall back to the only surviving identity carrier.
         const msgRescue = tryMsgIdRescue("tag-changed");
         if (msgRescue !== null) return msgRescue;
+        const sibRescue = trySiblingLane("tag-changed");
+        if (sibRescue !== null) return sibRescue;
         // #5095 D1-B: a non-empty discriminator (only the claude-anthropic
         // headless-subagent call site passes one) widens the key into a
         // three-segment form so distinct same-type runs never share a
         // compression session; empty degrades to the two-segment key.
-        const laneKey = disc !== "" ? `${rawId}|sub:${fp16(tag)}:${fp16(disc)}` : `${rawId}|sub:${fp16(tag)}`;
+        // #6011: with stamped ids present and both rescues missed, the fork
+        // keys off the run's FIRST inbound id in FULL (untruncated — host-
+        // minted uuids are unique per run by construction), so parallel
+        // same-shape runs land on distinct lanes from their first fork; the
+        // sibling rung takes over continuity once the run's rows are pinned
+        // under its key.
+        const laneKey = inboundIds !== undefined
+            ? `${rawId}|sub:m:${inboundIds[0]}`
+            : disc !== "" ? `${rawId}|sub:${fp16(tag)}:${fp16(disc)}` : `${rawId}|sub:${fp16(tag)}`;
         record(laneKey, turns, tagHash, model);
         return { key: laneKey, action: "derived-persona", reason: "persona text changed without continuing history — persona lane" };
     }
@@ -544,7 +655,15 @@ export function resolveSessionOrder(rawId: string, history: unknown, personaTag?
         // subagents under one main id) on distinct compression sessions.
         const taskRescue = tryMsgIdRescue("diverged-order");
         if (taskRescue !== null) return taskRescue;
-        return { key: `${rawId}|sub:task:${skel8(kinds)}`, action: "derived-task", reason: "no order+fragment alignment with the recorded skeleton" };
+        const sibRescue = trySiblingLane("diverged-order");
+        if (sibRescue !== null) return sibRescue;
+        // #6011: stamped-id forks key off the run's first inbound id (see the
+        // tag-changed exit); no ids keeps the legacy skeleton-hash key.
+        return {
+            key: inboundIds !== undefined ? `${rawId}|sub:m:${inboundIds[0]}` : `${rawId}|sub:task:${skel8(kinds)}`,
+            action: "derived-task",
+            reason: "no order+fragment alignment with the recorded skeleton",
+        };
     }
     // Shorter than recorded: either head truncation (dsh native compaction
     // keeps the old tail messages verbatim → fragments equal → raw +
@@ -564,8 +683,12 @@ export function resolveSessionOrder(rawId: string, history: unknown, personaTag?
     }
     const shortRescue = tryMsgIdRescue("shorter-divergent");
     if (shortRescue !== null) return shortRescue;
+    const sibRescue = trySiblingLane("shorter-divergent");
+    if (sibRescue !== null) return sibRescue;
+    // #6011: stamped-id forks key off the run's first inbound id (see the
+    // tag-changed exit); no ids keeps the legacy skeleton-hash key.
     return {
-        key: `${rawId}|sub:task:${skel8(kinds)}`,
+        key: inboundIds !== undefined ? `${rawId}|sub:m:${inboundIds[0]}` : `${rawId}|sub:task:${skel8(kinds)}`,
         action: "derived-task",
         reason: "shorter history with a divergent tail — id-reuse guard (subagent replay?)",
     };
@@ -610,7 +733,13 @@ export function applyOrderSnapshot(entries: OrderSkeletonEntry[]): number {
  *  validated `biliMsgIds` array (src/msgid-pin.ts `incomingMsgIdsOf`) plus
  *  the unified-store msg_id lookup so the fork-exit rung can prove identity
  *  by sessionid+msgid when the byte-level evidence was destroyed in the same
- *  turn (#5517 compound failure). The lookup is invoked lazily, at most once. */
+ *  turn (#5517 compound failure). The lookups are invoked lazily, only at
+ *  fork exits with non-empty inbound ids.
+ *  #6011 adds the sibling-lane continuation rung (the standard sessionId+
+ *  msgid store matching generalized from the raw key to its derived
+ *  children) and the stamped-id fork mint on top; the optional LAST param
+ *  `listStoredSessions` supplies the store's session-key list for sibling
+ *  candidate discovery alongside the skeleton table. */
 /** #5686 visibility seam (optional): observers of state-changing outcomes.
  *  Production used to discard everything but the key, so every fork
  *  (derived-*) and migration (reanchor) ran with zero durable trace — the
@@ -620,8 +749,8 @@ export function applyOrderSnapshot(entries: OrderSkeletonEntry[]): number {
  *  resolution. */
 type SessionResolveObserver = (rawId: string, r: SessionOrderResolution) => void;
 
-export function personaConversationOrder(rawId: string, history: unknown, personaTag?: string, declaredModel?: string, laneToken?: string, laneDiscriminator?: string, onResolve?: SessionResolveObserver, msgIds?: string[], readStoredMsgIds?: (rawKey: string) => readonly string[] | null): string {
-    const res = resolveSessionOrder(rawId, history, personaTag ?? "", declaredModel, laneToken, laneDiscriminator, msgIds, readStoredMsgIds);
+export function personaConversationOrder(rawId: string, history: unknown, personaTag?: string, declaredModel?: string, laneToken?: string, laneDiscriminator?: string, onResolve?: SessionResolveObserver, msgIds?: string[], readStoredMsgIds?: (rawKey: string) => readonly string[] | null, listStoredSessions?: () => string[] | null): string {
+    const res = resolveSessionOrder(rawId, history, personaTag ?? "", declaredModel, laneToken, laneDiscriminator, msgIds, readStoredMsgIds, listStoredSessions);
     if (onResolve !== undefined) {
         try {
             onResolve(rawId, res);

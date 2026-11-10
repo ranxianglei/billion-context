@@ -39,19 +39,24 @@ Harvest gates (all must hold per request): (env `BILI_IDENTITY_HARVEST`
 non-empty (`all` or comma source list) OR rollout
 `identityChannelHarvest` ON — either enabler suffices, both default OFF,
 overrider of the unrelated `pluginLaneServerHistory`) × request source
-address loopback-only × adapter join key matches. Row PINNING of admitted ids
-(additionally on both wires since the openai-parity step) stays gated by
-`pluginLaneServerHistory`; attribution-rung evidence does not need it.
-Admitted ids ride the FULL pipeline on BOTH wires: #5719 attribution rung,
-and — while `pluginLaneServerHistory` is on — pin/storage-row linking
-(`prepare-anthropic` + `prepare-openai`, watermark-fastpath turns excluded:
-a hit view is a shorter window and would mismatch by construction).
+address loopback-only × adapter join key matches. Row PINNING of admitted
+ids (on both wires) runs UNCONDITIONALLY once ids are admitted — #6011
+removed the extra `pluginLaneServerHistory` gate for harvest-sourced ids
+because the gates above already made them as trustworthy as stamped ones,
+and without pinned rows the #5719/#6011 store-overlap rungs could never
+fire for proxy-mode lanes (e.g. Claude Code standalone). Stamped
+(body/header) traffic keeps its own `pluginLaneServerHistory` gate
+unchanged. Admitted ids ride the FULL pipeline on BOTH wires: #5719
+attribution rung + #6011 sub-lane sibling rung, plus pin/storage-row
+linking (`prepare-anthropic` + `prepare-openai`, watermark-fastpath turns
+excluded: a hit view is a shorter window and would mismatch by
+construction).
 
 ## 2. Lane table (from the #5825 per-client investigation)
 
 | Client | Session key | Message ids | Adapter | Status |
 |---|---|---|---|---|
-| claude-code | `x-claude-code-session-id` (+transcript filename) | transcript `.jsonl` rows `uuid`; sidechain + summary rows excluded | `src/identity-claude.ts` | WIRED (anthropic wire: full path incl row pinning) |
+| claude-code | `x-claude-code-session-id` (+transcript filename) | transcript `.jsonl` rows `uuid`; summary rows excluded; main-thread rows content-verified (#6011); parallel sidechain threads attributed by `parentUuid` chain + full-tail content fingerprint, ambiguity ⇒ whole-turn degrade | `src/identity-claude.ts` | WIRED (anthropic wire: full path incl row pinning); parallel subagent lanes mint/continue via the #6011 store-overlap sibling rung + full-id `|sub:m:` mint |
 | codebuddy | `x-conversation-id` (= transcript filename, restart-stable, measured 2.181.0) | JSONL rows `id`+`parentId`; system/draft rows excluded | `src/identity-codebuddy.ts` | WIRED (openai wire: attribution rung); recognition merged into `conversationHeaderSource` low-trust tier |
 | mcode / mavis | `x-mavis-session-id` (`mvs_…`, already recognized #1050) | runtime-state.sqlite `local_runtime_message_rows.msg_id` | `src/identity-mcode.ts` | WIRED (sqlite exemplar; per-turn read probe, open→query→close) |
 | goose | `agent-session-id` (= sqlite sessions.id, restart-stable; BYOK/custom-provider paths included; user-overridden name degrades this lane only) | sessions.db `messages.message_id` (`msg_<uuidv4>`, never reused); ORDER BY created_timestamp,id; compaction re-parents ⇒ post-compaction turn degrades whole-turn, self-heals next turn | `src/identity-goose.ts` | WIRED |
@@ -79,6 +84,19 @@ a hit view is a shorter window and would mismatch by construction).
   shared discipline lives in the core (count parity vs `expectedLen`,
   boundary role spot-check up to 4 positions where both sides expose roles,
   canonical msgid validation, per-source warn-once degradation).
+- **Sidechain content verification (claude-code, #6011):** once a session file
+  contains sidechain rows, id admission demands a full-tail content fingerprint
+  match for BOTH request shapes — main-thread turns verify against the visible
+  main tail; subagent-shaped turns bind to the ONE sidechain thread whose
+  `parentUuid` chain ends at matching fingerprints (composite key
+  `<sessionId>|sc:<chain-head-uuid>`), and zero candidates + verified main tail
+  falls back to the raw-key pass. A false-positive bind is corruption-class
+  (wrong lane continued, wrong ids pinned) while a false negative costs one
+  turn of pinning and self-heals next round — hence strict bias: ambiguity
+  (two threads with identical text), content drift, or missing fingerprints
+  degrade the WHOLE turn to null instead of guessing. Rows without
+  `parentUuid` (older clients) have no chain structure: main requests still
+  verify, subagent-shaped ones admit nothing.
 - Consumers stay client-agnostic: nothing downstream of the seam mentions a
   client name.
 
