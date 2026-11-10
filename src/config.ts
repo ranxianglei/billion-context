@@ -17,6 +17,7 @@ import type { ReasoningGuardConfig } from "./reasoning-guard.js";
 import type { OutputSteeringConfig } from "./output-steering.js";
 import { parseExternalSummaryChain, type ExternalSummaryChain, validSummaryCredentialName } from "./external-summary-settings.js";
 import { parseBillingSettings, setBillingOverrides } from "./billing.js";
+import { parseEgressTransformEntries, type EgressTransformEntry } from "./egress-transforms.js";
 
 export function safeReadJson(path: string): unknown {
     try {
@@ -725,13 +726,33 @@ const CONTEXT_LIMIT_TABLE: Array<{ match: RegExp; limit: number }> = [
 // MODEL, and testing the full id first lets the provider segment hijack the
 // match ("Kimi/glm-5" → ^kimi 200K instead of ^glm-5 1M; "deepseek/
 // deepseek-r1" skips the specific ^deepseek-(r1|v3|ocr) rule because of the
-// "/" and falls to broad ^deepseek 1M — #2074). The full id remains the
-// FALLBACK for tails carrying no family signal whose provider segment does
-// ("qwen/qwq-32b").
+// "/" and falls to broad ^deepseek 1M — #2074). Custom-provider gateways go
+// one layer deeper still: "vendor/region:model" ids ("liuyue/cn:
+// deepseek-v4.1-flash" — #5907), where even the basename carries a namespace
+// prefix before the colon. Every root therefore ALSO yields its tail after
+// the LAST colon as a candidate, tested strictly AFTER the un-stripped root:
+// the tail is the last-resort model-part form, and a tag-shaped suffix
+// ("gpt-5:o3-preview" → "o3-preview") could false-match an unrelated family
+// rule if it were tested first. The full id remains the FALLBACK for tails
+// carrying no family signal whose provider segment does ("qwen/qwq-32b").
 function modelRoots(model: string): string[] {
+    const roots: string[] = [];
+    const push = (root: string): void => {
+        if (root.length > 0 && !roots.includes(root)) roots.push(root);
+    };
+    const colonTail = (root: string): string => {
+        const colon = root.lastIndexOf(":");
+        return colon >= 0 && colon < root.length - 1 ? root.slice(colon + 1) : "";
+    };
     const slash = model.lastIndexOf("/");
-    if (slash > 0 && slash < model.length - 1) return [model.slice(slash + 1), model];
-    return [model];
+    const basename = slash > 0 && slash < model.length - 1 ? model.slice(slash + 1) : model;
+    push(basename);
+    push(colonTail(basename));
+    if (basename !== model) {
+        push(model);
+        push(colonTail(model));
+    }
+    return roots;
 }
 
 export function lookupContextLimit(model: string | undefined): number | undefined {
@@ -964,6 +985,11 @@ export type ProxyOptions = {
      *  traffic (MCP/web) regains the user's shell proxy, while model egress
      *  keeps the clean-env direct semantics (e1c6c92). */
     auxProxyFallback?: ProxyFallbackOptions;
+    /** #6003 phase 2: user-registerable egress body-rewrite pipeline, parsed
+     *  from the top-level `egressTransforms` config array (file-only). Runs after
+     *  session processing and before v1Wrap/re-sign/fetch on every outbound path.
+     *  Empty/absent = no-op (zero regression). Refreshed on config reload. */
+    egressTransforms?: EgressTransformEntry[];
     modelContextLimit: number;
     kernelConfig: Config;
     /** Global-level compression settings (level 1) — the tuning fields from the
@@ -1807,6 +1833,10 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         chainContentDetection: (env.BILI_CHAIN_CONTENT ?? (fileConfig.chainContentDetection === true ? "1" : "0")) !== "0",
         chainEgressStamp: (env.BILI_CHAIN_STAMP ?? (fileConfig.chainEgressStamp === true ? "1" : "0")) !== "0",
         stableSystemAnchor: (env.BILI_STABLE_SYSTEM_ANCHOR ?? (fileConfig.stableSystemAnchor === true ? "1" : "0")) !== "0",
+        // #6003 phase 2: file-only (not one of the six env categories); parsed +
+        // validated here so a malformed entry warns once at boot instead of at
+        // first request. Absent → [] → every call site short-circuits (no-op).
+        egressTransforms: parseEgressTransformEntries(fileConfig.egressTransforms),
     };
 }
 
@@ -2226,10 +2256,11 @@ type FileConfig = {
          *  wins. The proxy hot path stays on sqlite until the step-3 async
          *  swap; the boot notice names that boundary. */
         mysql?: { dsn?: string };
-        /** Phase 3 (#2960): "off" stops writing the legacy JSON envelope while
-         *  storage.unified is "full" — the SQLite index becomes the only
-         *  persistent copy (reads were already unified-first; boot enumerates
-         *  the index union). Ignored with a one-time warning under
+        /** Phase 3 (#2960): "off" stops writing the legacy JSON envelope AND
+         *  the per-session CCR content-store sidecar while storage.unified is
+         *  "full" — the SQLite index (session row + ccr mirror) becomes the
+         *  only persistent copy (reads were already unified-first; boot
+         *  enumerates the index union). Ignored with a one-time warning under
          *  shadow/legacy, where the JSON file remains the sole source of
          *  truth. Env BILI_STORAGE_JSON_WRITER wins; default "on". Rollback =
          *  unset (JSON writing resumes; index-only sessions keep loading via
@@ -2408,6 +2439,11 @@ type FileConfig = {
          *  oldest-first deletion when exceeded. Unset/0 = off (default). */
         maxTotalBytes?: number;
         maxAgeDays?: number;
+        /** Private log retention (bili.log): target wall-clock hours kept before
+         *  the hard byte budget trims the oldest sealed generation. Defaults 48 h
+         *  and 256 MiB; env BILI_LOG_RETENTION_HOURS / BILI_LOG_BUDGET_BYTES win. */
+        logRetentionHours?: number;
+        logBudgetBytes?: number;
     };
     /** Fake-completion fallback tuning (#2030) — was BILI_FAKE_COMPLETION_RETRIES / BILI_FAKE_BUF_CAP. */
     fakeCompletion?: { retries?: number; bufCapBytes?: number };
@@ -2442,6 +2478,13 @@ type FileConfig = {
     decompressTmpCap?: number;
     /** Image rescale egress pass on/off (#3400) — env BILI_IMAGE_RESCALE (default: on). */
     imageRescale?: boolean;
+    /** #6003 phase 2: user-registerable egress body-rewrite plugins. Each entry:
+     *  `{ id?, module, enabled?, priority?, match? }` where `module` is an ESM file
+     *  (relative paths resolve against this config file's directory) whose default
+     *  export is `{ id?, priority?, match?, timeoutMs?, transform(ctx) }`. File-only
+     *  (no env tier); hot-reloaded via POST /__bili/config/reload. See
+     *  docs/configuration.md "Egress transforms". */
+    egressTransforms?: unknown;
 };
 
 function nonEmpty(value: string | undefined): string | undefined {
@@ -2496,6 +2539,8 @@ const KNOWN_TOP_LEVEL_KEYS = new Set([
     "autoModeForge", "imageRescale", "guardrails",
     // #3376:
     "cacheKeepalive",
+    // #6003 phase 2: user-registerable egress body-rewrite pipeline.
+    "egressTransforms",
 ]);
 
 // Every field parseCompressSettings accepts — hint source for misplaced keys:

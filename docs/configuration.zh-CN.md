@@ -88,6 +88,7 @@
 | `imageBilling` | "auto" \| "pixels" \| "bytes" | auto (resolves to pixels) | BILI_IMAGE_BILLING | 全局图片 token 估算口径；逐请求实时读取，优先于所有逐 provider 设置。 |
 | `imageTokenCap` | number | unset (uncapped) | BILI_IMAGE_TOKEN_CAP | 全局单图 token 上限，叠加在计费口径之上生效；逐请求实时读取。 |
 | `imageRescale` | boolean | true | BILI_IMAGE_RESCALE | 出站图片降采样总开关（#3295/#3400）：大图以缩小形态发给模型，原图在会话存储中保持字节级原样。逐请求实时读取。 |
+| `egressTransforms` | array | unset (none) | — | 用户可注册的出站请求体改写管线（#6003）：ESM 插件在所有会话处理之后、传输（重签 / v1Wrap / fetch）之前改写每个出站模型请求体。fail-open，可经 POST /__bili/config/reload 热重载。 |
 | `billing` | object | {} | — | 按模型计费单价（#4899）：billing.prices[模型] = { input, output?, cacheRead?, cacheWrite? }，美元/百万 token；覆盖 models.dev 快照价，驱动面板美元花费台账与省钱折算。无价模型只显示 token。 |
 
 **行为开关**
@@ -207,7 +208,7 @@
 | `storage.backend` | sqlite\|mysql | unset (sqlite) | BILI_STORAGE_BACKEND | 存储后端选择（#3388 / #3931）：统一存储消费操作级的异步 StorageBackend 契约。sqlite 为默认（现有 UnifiedStore 套一层 Promise 包装适配器）。mysql 已完整接线（第二+三步）：openBackend("mysql", dsn) 打开真正的 MysqlBackend,对接 MySQL 8.0 —— 完整契约面（带 CAS 引用计数的 ingest、读取、session_ext、收割台账、归档/恢复/GC、checkpoint、会话绑定）,mysql2 作为常规依赖打包并按需懒加载（从不选 mysql 的启动永不加载它）。代理热路径经异步影子 facade 接线：保存进串行后端队列（水位 delta、孤儿/收割台账、digest 采样 —— sqlite 保持零 await 同步快车道不变）,同步读走 JSON 信封（sidecar 经 ready() 异步挂载;viewFor/importRecord 同步面按设计 miss）,replicas/ext/GC/export/fork 走异步孪生（#4911：fork 车道经它们 await lastLiveSeq + 行克隆；fold-anchor 回填/快照渲染用的同步窗口读按设计仍走信封）。writerOff 仅 sqlite（信封就是 mysql 的同步读路径）。未知名字回退 sqlite 并提示。每个 lane 启动时解析一次。 |
 | `storage.mysql.dsn` | string | unset | BILI_MYSQL_DSN | storage.backend="mysql" 的 MySQL DSN（#3388 第二步，#3931）：mysql://user:pass@host:3306/db。由 StorageBackend 契约路径消费（含热路径 —— 异步影子队列）。环境变量 BILI_MYSQL_DSN 优先于文件键。空/未设置 = mysql 后端无法打开 —— 文档化错误会同时列出两个旋钮和可用的默认值。 |
 | `storage.sqliteAutoDownload` | boolean | true | BILI_SQLITE_AUTO_DOWNLOAD | SQLite 引擎一次性自下载的闸门（#2833）：进程内没有可用引擎（无内置 node:sqlite、宿主未装 better-sqlite3）且本平台希望启用统一边车时，bili 从 npm registry 一次性下载钉死的 better-sqlite3 预编译 tarball（约 11 MB，sha512 校验）到缓存目录，之后每次启动复用。引擎解析顺序：内置 node:sqlite（Node >= 22.5）-> 宿主机已装的 better-sqlite3 -> 缓存的自下载副本 -> 自下载（本开关控制）-> 无引擎（仅 legacy，即 #2825 降级契约）。开关只控制网络下载 —— 为 false 时缓存副本仍会使用；不支持的平台永不下载。 tarball 下载内置镜像列表兜底（#3338）：先试配置的 registry（BILI_UPDATE_REGISTRY / update.registry），再试 https://registry.npmjs.org、https://registry.npmmirror.com —— 第一个通过 sha512 校验的镜像生效；Node < 22.5 且无引擎时，降级原因会给出明确的 Node 升级提示（#3385）。引擎产物按运行时特性分别钉死，因为 binding 无法在包自身声明的范围之外加载：Node >= 22 且 N-API >= 10 用 better-sqlite3 v13（单个 tarball 自带 prebuilds），而 Node 20 与 Node 22.0–22.12（满足 v13 的大版本下限但只带 N-API 9）用 v12.9.0（纯 JS tarball 加与之 ABI 匹配的 prebuild，从二进制镜像获取并经 nativeBinding 注入）—— 低版本 Node 因此留在统一存储车道上，而不是降级到 legacy。任何钉死产物都不支持的运行时（低于所有下限，或 ABI 无对应 prebuild）会在加载之前被拒绝，下载与缓存副本注册都不进行 —— 在那里加载该 binding 会让进程崩溃，而不是优雅失败（#3341、#3894）。下载失败会置一个 6 小时的重试冷却，以标记文件形式持久化在缓存目录下（billion-context/sqlite/.bootstrap-failed.json）；storage 诊断块会显示该标记的绝对到期时间与路径 —— 删除该文件并重启 bili 即可强制立即重试，不必等完整个冷却窗口（#3788）。 |
-| `storage.jsonWriter` | on\|off | on | BILI_STORAGE_JSON_WRITER | Phase 3 信封开关（#2960）：off 时若 storage.unified 为 full 则不再写 legacy JSON 会话信封 —— SQLite 索引成为唯一持久化副本（读路径本就 unified-first；boot 枚举索引并集，纯索引会话可正常加载）。仅在有效 full 模式下生效：shadow/legacy（或加密激活）下请求会被忽略并警告一次，因为 JSON 文件仍是唯一事实源。环境变量层 0/false/off = off、1/true/on = on，优先于严格拼写的文件层。失败安全：若边车运行中自禁用，下次保存即恢复信封写入。回滚：去掉该开关 —— 写入恢复，纯索引会话经 boot 并集继续可加载，replicas/restore 可重新物化可移植的 JSON 信封。降级二进制（或丢失 SQLite 引擎）会让纯索引会话在 v0.1.196 及更早版本上不可见，直到重新运行 >=v0.1.197 —— 数据在 index.db 中完好无损，只是旧代码不读它。每会话的 content-store 边车无论开关如何都照写。jsonWriter=off 的 lane 必须是其会话目录的唯一写者：off lane 读路径 unified-first、永不回退到文件，因此同一目录上跑 legacy/shadow 的对等实例会静默分叉（它的 JSON 副本收不到更新，off lane 也看不到对等实例的写入）。 |
+| `storage.jsonWriter` | on\|off | on | BILI_STORAGE_JSON_WRITER | Phase 3 信封开关（#2960）：off 时若 storage.unified 为 full 则不再写 legacy JSON 会话信封 —— SQLite 索引成为唯一持久化副本（读路径本就 unified-first；boot 枚举索引并集，纯索引会话可正常加载）。仅在有效 full 模式下生效：shadow/legacy（或加密激活）下请求会被忽略并警告一次，因为 JSON 文件仍是唯一事实源。环境变量层 0/false/off = off、1/true/on = on，优先于严格拼写的文件层。失败安全：若边车运行中自禁用，下次保存即恢复信封写入。回滚：去掉该开关 —— 写入恢复，纯索引会话经 boot 并集继续可加载，replicas/restore 可重新物化可移植的 JSON 信封。降级二进制（或丢失 SQLite 引擎）会让纯索引会话在 v0.1.196 及更早版本上不可见，直到重新运行 >=v0.1.197 —— 数据在 index.db 中完好无损，只是旧代码不读它。每会话的 CCR content-store 边车也不再写 —— full 模式下读取时先查索引里的 ccr 镜像，镜像才是持久副本。jsonWriter=off 的 lane 必须是其会话目录的唯一写者：off lane 读路径 unified-first、永不回退到文件，因此同一目录上跑 legacy/shadow 的对等实例会静默分叉（它的 JSON 副本收不到更新，off lane 也看不到对等实例的写入）。 |
 | `storage.walJournalSizeLimitBytes` | number | 8388608 | BILI_STORAGE_WAL_JOURNAL_SIZE_LIMIT_BYTES | index.db-wal 的 WAL 回收上限（#3250），单位字节：每次完成的 checkpoint 把 WAL 文件截回该大小，约束长驻进程的磁盘占用与崩溃恢复重放。不是每会话数据配额 —— 数据写入时就已落进 index.db，WAL 只是两次 checkpoint 之间的帧暂存区，会话数量/大小不会放大它；大 burst 可能暂时超出，直到下一次完成的 checkpoint 截回。调大 = truncate IO 更稀疏，但稳态磁盘占用更多、崩溃恢复重放尾更长。环境变量层（正整数）优先于配置文件层；env 值非法或非正数时静默落到文件/默认层，boot 不崩。lane 启动、store open 时生效 —— 热改动需重启。实际取值会出现在 unified-enable 日志行与 storage 诊断块中。 |
 | `storage.archiveAfterDays` | integer | 365 | BILI_STORAGE_ARCHIVE_AFTER_DAYS | GC 年龄清扫窗口（天，#3463/#3901）：闲置超过该时长的会话被归档 —— 以单行 JSON 追加到单一归档日志（会话目录下的 archive/archive.jsonl——不撒每会话小文件），墓碑行保留标签与身份，释放内容/媒体引用，一条 POST 即可恢复。0 关闭年龄清扫；POST /__bili/storage/gc 始终可用并支持 ?vacuum=full 收缩存量 index.db（新写入始终 auto_vacuum=INCREMENTAL）。同一套操作另有 CLI 层（#3928）：bili storage gc [--days N] [--vacuum full\|incremental] [--dry-run]，以及 bili sessions ls/rm/archive/restore <id>（README「存储维护 CLI」一节）。环境变量优先于配置文件层。 |
 | `sessions` | object | {} (all defaults) | — | 会话表容量上限与可选垃圾回收。 |
@@ -255,6 +256,8 @@
 | `diagnostics.dump4xxMaxBytes` | number | 2097152 (floor 1024) | BILI_DUMP_4XX_MAX_BYTES | 单个 4xx 转储文件的大小上限。 |
 | `diagnostics.maxTotalBytes` | number | unset (off) | BILI_DUMP_MAX_TOTAL_BYTES | 调试转储目录（dumps/、raw/、SSE dump 目录）的总大小上限；超限时按最旧优先删除（下限 1 MiB）。转储默认无任何轮转，持续捕获下每天可增长数十 GB（#2412）。 |
 | `diagnostics.maxAgeDays` | number | unset (off) | BILI_DUMP_MAX_AGE_DAYS | 调试转储目录的保留天数上限；超过该天数的文件被删除（下限 1 小时）。默认关闭。 |
+| `diagnostics.logRetentionHours` | number | 48（下限 1） | BILI_LOG_RETENTION_HOURS | **私有**运行日志（`bili.log`）目标覆盖的历史小时数。日志器在 10 MiB 处把活动文件封存为**不可变、名字唯一**的一代，取代单个 `bili.log.old`，于是每一代都可枚举、窗口是真实的而不是碰巧的。这是**目标**而非承诺：`diagnostics.logBudgetBytes` 是硬上限且永远优先——更短的窗口会被如实报告，绝不悄悄宣称完整。报告的覆盖是**实测跨度**（最旧保留行 → 现在）：分代文件里没有谱系证据，所以 `continuity` 恒为 `unknown`，任何状态都不宣称窗口未中断（时间戳错序同样不被当作历史缺失）。下限 1 小时；非正数或非数值回落到默认 48 小时；按「env 一旦设置即拥有该开关」的约定，非法的 `BILI_LOG_RETENTION_HOURS` 回落到该默认值而不是本键。 |
+| `diagnostics.logBudgetBytes` | number | 268435456（256 MiB，下限 1 MiB） | BILI_LOG_BUDGET_BYTES | 活动日志 + 全部封存分代的总字节硬预算；超出时按**最旧优先**整代删除——排序按封存时间戳（遗留 `.old` 用自己的 mtime），所以迁移来的历史按其真实年代被回收，而不会被跳过、先去删更新的分代。它约束繁忙机器上的磁盘占用与隐私暴露面。当 `logRetentionHours` 所需的字节超出预算时**预算赢**，且不足会被上报（启动时一行 `[warn]`，以及 `GET /__bili/logs` 里的 `retention` 对象）。活动文件永不删除，所以单个活动文件本身就超过预算时会被报告为超预算，而不是被截断。下限 1 MiB；非正数或非数值回落到默认 256 MiB，且与小时键同理：设置了的 `BILI_LOG_BUDGET_BYTES` 拥有该开关。日志文件仅属主可读：首字节起 0600，归档目录 0700（win32 无 POSIX 权限位，由状态目录 ACL 决定）。 |
 | `diagnostics.renderNone` | boolean | false | ACP_RENDER_NONE | 禁用所有 ACP 标签渲染（原始线路研究模式）。 |
 | `diagnostics.invariantJudge` | boolean | true | BILI_INVARIANT_JUDGE | 保持 I1/I2 出站不变量判官以 L1 advisory 形态开启（#3938）：每笔请求的出站字节都与客户端入站历史对账，违规以 warn 记录、干净判定以 debug 记录，绝不阻塞流量。设为 false 或 BILI_INVARIANT_JUDGE=0 可静默。 |
 | `diagnostics.noInjectTool` | boolean | false | ACP_NO_INJECT_TOOL | 停止向请求注入 acp_compress 工具定义。 |
@@ -608,6 +611,28 @@
 - **默认值：** `true`
 - **状态：** ACTIVE
 - **说明：** 出站图片降采样 pass 的总开关（#3295 删除了旧的入站时降采样；#3400 以简化形态重新引入）。每个出站请求在 kernel 折叠之后、协议编码之前，对最长边超过 `BILI_IMAGE_RESCALE_MAX_DIM`（默认 1600）**或** base64 体积超过 100 KB 的图片做 fit-inside 重编码（不放大、保留原格式），且只作用于**出站副本**——会话存储中的原始字节保持逐字节原样。重编码节省不足 20% 字节的结果直接丢弃（keep-smaller），小图与低收益图原样通过。仅处理 PNG/JPEG/BMP（纯 JS 编码器，零原生依赖）；其他格式原样通过。每张被缩小的图片旁附一段稳定注释，报告当前与原图尺寸；在注册 bili 工具的车道（代理注入车道，以及经插件 manifest 注册的插件车道）中还会指明 `acp_read_original_image("<ref>")`——它从本地会话存储取回原始字节；拒绝注入工具的车道（如 codex）只拿到报尺寸的注释、没有工具。`acp_read_original_image` 的结果**结构性豁免**再次降采样（防 #3266「猜→拒→重发」循环复发的环锁）。输出确定性：同一输入字节永远产出同一缩小字节与同一注释文本，同一历史反复重发保持逐字节稳定，上游前缀缓存不受扰动。每张唯一图片记一条日志（内容 hash 缓存；缓存命中静默）。优先级：`BILI_IMAGE_RESCALE` 环境变量（`"0"`/`"false"` 关闭；实时读取，无需重启）> 本配置键 > 默认开启。
+
+### `egressTransforms`
+
+- **类型：** `array` —— `{ id?, module, enabled?, priority?, match? }` 条目列表（#6003）
+- **默认值：** 未设置（未注册任何改写；管线为精确的空操作 no-op）
+- **状态：** ACTIVE
+- **说明：** 用户可注册的出站请求体改写管线。每个条目加载一个 ESM 插件模块（default export 为 `{ transform(ctx) }`），其改写在每个出站模型请求体上运行——覆盖 relay 车道（主发送**以及**所有恢复重发）与压缩循环车道——在所有会话处理（shed / 压缩循环改写）之后、传输（重签 / v1Wrap / fetch）之前，因此重签不变量始终成立：签名覆盖最终出站的字节。仅配置文件（无 env 变量）；相对 `module` 路径相对配置文件所在目录解析。
+  - **条目字段：** `id` —— 日志标签；回退到模块自身 `id`，再回退到文件名。`module` —— 必填；绝对路径或相对配置目录。`enabled` —— 默认 `true`；`false` 跳过该条目。`priority` —— 数值，越小越先执行；未设置的排在所有已设置之后，同值按注册顺序。`match` —— `{ urlPrefix?, provider? }`，AND 式作用域过滤；缺省 = 所有上游。模块也可在其 default export 上声明 `id`/`priority`/`match`/`timeoutMs`；逐字段以配置值为准。
+  - **插件契约：** `transform(ctx)` 为 async；`ctx = { sessionId, upstreamUrl, method, url, headers(可修改副本), body, protocol, model, stage }`，其中 `stage` 取 `"initial"`（主发送）、`"retry"`（恢复重发）或 `"loop"`（压缩循环）。返回 `undefined` 表示不改写；或返回 `{ body?, headers?, reason? }`，其中 `body` 必须是 `string` 或 `Buffer`。返回的 `headers` 仅在成功时并入实时头部集合；当 body 字节变化时，过期的 `content-length` 会被删除。
+  - **fail-open：** 插件抛错、超时（模块 `timeoutMs`，默认 1000 ms）或返回非法 body 类型时，记日志并跳过，管线以**上一个** body 继续——单个坏插件绝不会弄坏请求。无法加载或形状不对的模块同样被跳过。
+  - **热重载：** `POST /__bili/config/reload` 重读条目并重置模块缓存，因此增删/重排条目与编辑后的插件代码在下一个请求即生效，无需重启。同一代内已加载的模块是钉住的（运行中的会话不会中途切换改写行为）；模块按 mtime 失效，编辑过的文件在重载时重新求值。
+  - **可观测性：** 每个实际运行的插件输出一行 debug：`[<sid>] [egress:<id>] stage=<stage> in=<N>B out=<M>B (<reason>)`。
+  - **已知边界：** 恢复重发从已改写的出站 body 派生变体并重跑管线，故非幂等的字符串改写可能应用两次；解析 JSON body 的结构化阶梯（图片 shed、thinking-strip）在插件把 body 变成不透明 Buffer 时会优雅降级（bail 而非崩溃）。fake-completion 提示重试采用特殊的 wrap→re-sign 顺序，刻意不经过本管线。
+
+  ```jsonc
+  {
+    "egressTransforms": [
+      { "id": "tunnel", "module": "./plugins/tunnel.mjs", "priority": 10 },
+      { "id": "audit", "module": "/abs/path/audit.mjs", "match": { "provider": "https://api.anthropic.com" } }
+    ]
+  }
+  ```
 
 ### `resign`
 
@@ -1900,7 +1925,9 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_INGEST_BODY_BYTES` | `network.ingestBodyBytes` | 33554432 |
 | `BILI_INVARIANT_JUDGE` | `diagnostics.invariantJudge` | true |
 | `BILI_KEEP_ALIVE_TIMEOUT_MS` | `network.keepAliveTimeoutMs` | 5000 |
+| `BILI_LOG_BUDGET_BYTES` | `diagnostics.logBudgetBytes` | 268435456 (256 MiB, floor 1 MiB) |
 | `BILI_LOG_MASK_HOSTS` | `maskHosts` | true |
+| `BILI_LOG_RETENTION_HOURS` | `diagnostics.logRetentionHours` | 48 (floor 1) |
 | `BILI_MAX_MESSAGES` | `network.maxMessages` | 0 |
 | `BILI_MAX_SESSIONS` | `sessions.max` | 256 |
 | `BILI_MAX_SHRINK_PER_COMPRESS` | `network.maxShrinkPerCompress` | unset |

@@ -68,7 +68,7 @@ test("compareWires: healthy array-append is still append(json-tail), unchanged b
     assert.equal(r.append?.kind, "json-tail");
 });
 
-test("runDiff: auto-review sidecar pair classifies pure-append (was mid-stream-rewrite)", () => {
+test("runDiff: auto-review sidecar pair classifies pure-append (was mid-stream-rewrite)", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "acp3476-"));
     try {
         const tA = Date.parse("2026-10-16T11:19:00.000Z");
@@ -79,7 +79,7 @@ test("runDiff: auto-review sidecar pair classifies pure-append (was mid-stream-r
         };
         write(tA, "REQ", reviewBody(["turn-1 transcript chunk"]));
         write(tB, "REQ", reviewBody(["turn-1 transcript chunk", "turn-2 transcript chunk"]));
-        const report = runDiff(dir, { noLog: true });
+        const report = await runDiff(dir, { noLog: true });
         assert.equal(report.totalPairs, 1);
         const p = report.sessions[0]!.pairs[0]!;
         assert.equal(p.category, "pure-append", "the sidecar's semantic append must not be charged as a rewrite");

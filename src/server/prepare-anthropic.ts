@@ -1,7 +1,7 @@
 import http from "node:http";
 import type { CompressionCore, Config, CoreMessage, NudgeDecision, PackSurface, Prompts } from "acp-kernel";
 import { renderNudgeText, viableRanges } from "acp-kernel";
-import { anthropicToCore, buildSystem, coreToAnthropic, extractSystem, insertBeforeTrailingSystemRun, type AnthropicRequestBody, type AnthropicWireMessage, type BiliMessage } from "acp-kernel/wire";
+import { anthropicToCore, buildSystem, coreToAnthropic, extractSystem, healAnthropicSystemPositions, insertBeforeTrailingSystemRun, type AnthropicRequestBody, type AnthropicWireMessage, type BiliMessage } from "acp-kernel/wire";
 import { rewriteInboundThreadContinue } from "./thread-tracking.js";
 import { captureThreadsTurn, estimateThreadsTokens, isThreadsBody, threadsReforgeEnabled } from "./threads-lane.js";
 import type { CompressReasoningConfig } from "../reasoning-drop.js";
@@ -535,7 +535,9 @@ export async function prepareAnthropic(
                 const ranges = turn.nudge.compressibleRanges ?? [];
                 // [#5688] the side call shares the main request's upstream —
                 // un-deduped rebuiltMessages would 400 the decision too.
-                const sideBody: Record<string, unknown> = { ...parsed, messages: [...dedupeAdjacentOutputConfig(rebuiltMessages), { role: "user", content: buildDecisionPrompt(ranges) }], system: systemOut, tools: toolsOut, stream: false, max_tokens: decide.maxTokens };
+                // [#4570] and the side array must obey the system-position rule
+                // on the array actually sent, which is exactly this one.
+                const sideBody: Record<string, unknown> = { ...parsed, messages: healAnthropicSystemPositions([...dedupeAdjacentOutputConfig(rebuiltMessages), { role: "user", content: buildDecisionPrompt(ranges) }]), system: systemOut, tools: toolsOut, stream: false, max_tokens: decide.maxTokens };
                 delete sideBody.prompt_cache_key;
                 stripDecisionReasoningFields("anthropic", sideBody);
                 const outcome = await runNudgeDecision({ req, opts, protocol: "anthropic", sideBody, session, log });
@@ -622,8 +624,16 @@ export async function prepareAnthropic(
     if (dedupedMessages !== rebuiltMessages) {
         log("warn", `[${sessionId}] adjacent-output-config: collapsed duplicate effort directive(s) after fold reconstruction (#5688)`);
     }
-    warnAnthropicThinkingPairs(parsed.messages, dedupedMessages, log, sessionId);
-    const rebuilt: AnthropicRequestBody = { ...parsed, messages: dedupedMessages, system: systemOut, tools: toolsOut };
+
+    // #4570: notes, nudges and the retrieval note append AFTER coreToAnthropic's
+    // heal, so the position rule is enforced again on the array actually sent.
+    // This is the LAST transform: the rule is judged on the exact array the
+    // upstream receives, with #5604's tail nudge and #5688's collapse in place.
+    // The pass only re-voices illegal systems in place (never reorders), so the
+    // trailing-user tail #5604 established stays last.
+    const healedMessages = healAnthropicSystemPositions(dedupedMessages);
+    warnAnthropicThinkingPairs(parsed.messages, healedMessages, log, sessionId);
+    const rebuilt: AnthropicRequestBody = { ...parsed, messages: healedMessages, system: systemOut, tools: toolsOut };
     // prompt_cache_key is the omp plugin's session id stamped for the proxy's
     // identity chain (#268), not part of the Anthropic Messages API — strip it
     // so the real upstream never sees a field it doesn't know.

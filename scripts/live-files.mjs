@@ -117,6 +117,10 @@ export const LIVE_FILES = [
     // IPC rather than sleeps, and nothing binds a port, so in-file tests are
     // parallel-safe and the suite needs no serialization.
     "tests/snapshot-journal.test.ts",
+    // #5487: spawns a one-shot sealer child (process.execPath) against its own
+    // mkdtemp dir to exercise concurrent sealing; no sockets are bound, so no
+    // zone port band is needed — the entry is for the SPAWN_RE tripwire alone
+    "tests/log-retention.test.ts",
     // #5631 restart survival: real bili proxy children under OS signals
     // (SIGTERM/SIGKILL/clean shutdown). Private mkdtemp homes per lane-arm,
     // probed-free ports re-probed on every restart — no band reuse.
@@ -134,6 +138,12 @@ export const LIVE_FILES = [
     // fake origins only, so no zone band is needed — the entry is for the
     // tripwire alone, like #3890/#5114/#5666
     "tests/issue5955-wedged-same-lane-takeover.test.ts",
+    // #5940: the wiring facet spawnSyncs one bare node child (--import tsx) that
+    // drives the real background quick_check worker on a per-run mkdtemp fixture
+    // DB; the spawn is synchronous (blocks the shard runner while it runs), the
+    // child binds no port and does no network I/O, so no zone band is needed —
+    // the entry is for the tripwire alone, like #3890/#5114
+    "tests/integrity-worker-stderr.test.ts",
 ];
 
 /** Band width per live file: the zone ladder drifts +1 per EADDRINUSE retry;
