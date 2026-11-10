@@ -34,7 +34,7 @@ import { resolveBackendName, backendSelectionNotice, selectedBackendRaw, openBac
 import { canonicalDigest, canonicalize, sha256 } from "./canonical.ts";
 import { recordSidecarInstance, recordSidecarOpenFailure } from "./runtime-status.ts";
 import type { SqliteEngineName, SqliteEngineSource } from "./driver.ts";
-import type { MessageRow, BlockRow, SessionRow, RefRow, MessageRefContentRow } from "./store.js";
+import type { MessageRow, BlockRow, SessionRow, RefRow, MessageRefContentRow, MessageIdContentRow } from "./store.js";
 import type { CoreMessage, MessageContentStore } from "acp-kernel";
 
 // True once quick_check proved this process's index corrupt. such a boot is
@@ -63,6 +63,11 @@ interface ResidentFields {
  *  migration-parity property, not a per-commit one. The FIRST ingest of a
  *  session always verifies (cold-path full check), then every N-th. */
 export const VERIFY_EVERY_INGESTS = 20;
+
+/** #5744: wall-clock threshold for the slow-ingest warn (ms). The old
+ *  request-level warn keyed on message count, which cannot separate a fast
+ *  big session from a slow small one. */
+const SLOW_INGEST_WARN_MS = 500;
 
 /** #4323: consecutive sampled drifts required before escalating. A one-off
  *  drift is transient external churn (the watermark clear below heals it);
@@ -482,6 +487,12 @@ export class UnifiedShadow {
             // full path below; the delta itself re-verifies the boundary
             // inside the ingest transaction, so a racing writer degrades to
             // a full ingest, never a corrupt one.
+            // #5744: wall-clock guard on the ingest itself — message count is
+            // a bad proxy (one reporter session: 0.8s and 14.5s saves at the
+            // SAME ~3k msgs). Names the path so a spike is attributable
+            // (delta fast path vs full fallback) without a profiler.
+            const tIngestStart = performance.now();
+            let ingestPath = "delta";
             phase = "ingest-delta";
             // #5677: while drift-latched the sampled digest has PROVEN the
             // stored view diverges from the live one — vouching for a trusted
@@ -498,6 +509,7 @@ export class UnifiedShadow {
             // divergent; healthy sessions never see it.
             const deltaApplied = !this.driftedSessions.has(legacy.id) && this.ingestDelta(legacy, hasRawTail);
             if (!deltaApplied) {
+                ingestPath = "full";
                 phase = "plan-ingest";
                 const plan = planIngest(legacy);
                 phase = "ingest-session";
@@ -515,6 +527,14 @@ export class UnifiedShadow {
                 this.sync.ingestSession(plan, undefined, { completeLog });
             }
             this.stats.ingests++;
+            const ingestMs = Math.round(performance.now() - tIngestStart);
+            if (ingestMs > SLOW_INGEST_WARN_MS) {
+                // #5744: attach WAL forensics so a stall spike can be attributed
+                // to a checkpoint burst (multi-second tick inside the window)
+                // instead of per-row statement cost — read-only, warn path only.
+                const walSuffix = this.sync.walDiagnosticsSuffix() ?? "";
+                loggerLog("warn", `[storage] slow-ingest: ${legacy.id} path=${ingestPath} took=${ingestMs}ms${walSuffix} — synchronous per-save storage work is starving the event loop (#5744); path=full means the delta fast path fell back (watermark missing/cleared or tail shape changed)`);
+            }
             // #3133 sampled verification: ingest integrity is already guarded
             // by the SQLite write path; the read-back digest is a migration
             // parity oracle, so it runs on the first ingest of a session and
@@ -998,6 +1018,13 @@ export class UnifiedShadow {
     messageContentByRefNums(sessionId: string, refNums: readonly number[]): MessageRefContentRow[] {
         if (this.sync === null || refNums.length === 0) return [];
         return this.sync.messageContentByRefNums(sessionId, refNums);
+    }
+
+    /** #6029: per-msg_id stored bodies — the restamp-proof twin of
+     *  messageContentByRefNums (sync store only, like its sibling). */
+    messageContentByMsgIds(sessionId: string, msgIds: readonly string[]): MessageIdContentRow[] {
+        if (this.sync === null || msgIds.length === 0) return [];
+        return this.sync.messageContentByMsgIds(sessionId, msgIds);
     }
 
     sessionSummaries(): SessionSummaryRow[] {
