@@ -1551,8 +1551,13 @@ export async function* runCompressLoop(
                         coreMessages.push(redactedMsg);
                     }
                 }
+                const roundProxySignature =
+                    ctx.protocol === "google"
+                        ? proxyResults.find((p) => typeof p.signature === "string" && p.signature.length > 0)?.signature
+                        : undefined;
                 for (const pr of proxyResults) {
                     if (functionCallIds.has(pr.callId)) {
+                        const sig = pr.signature || roundProxySignature;
                         coreMessages.push({
                             id: `acp_loop_r${round}_asst_tc_${pr.callId}`,
                             role: "assistant",
@@ -1561,7 +1566,7 @@ export async function* runCompressLoop(
                             toolCallId: pr.callId,
                             // #3661: guaranteed-valid-JSON replay (see wireArguments); raw model bytes stay in pr.arguments for #156 signatures.
                             text: pr.wireArguments,
-                            ...(ctx.protocol === "google" && pr.signature ? { googleThoughtSignature: pr.signature } : {}),
+                            ...(ctx.protocol === "google" && sig ? { googleThoughtSignature: sig } : {}),
                         });
                         const toolResultMsg: CoreMessage = {
                             id: `acp_loop_r${round}_tool_${pr.callId}`,
