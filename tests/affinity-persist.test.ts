@@ -132,8 +132,8 @@ test("sustained mutations cannot starve the write — max-delay budget (#1834)",
     }
 });
 
-test("persist.debounceMs knob is honored — a larger window defers the write (#6062)", async () => {
-    // #6062: this writer used its own hardcoded 500ms instead of the persist.*
+test("persist.debounceMs knob is honored — a larger window defers the write (#6058)", async () => {
+    // #6058: this writer used its own hardcoded 500ms instead of the persist.*
     // knobs the main session writer honors. With debounce=1500 the old code
     // wrote at ~500ms; the wired knob defers past the 700ms mark below.
     process.env.BILI_PERSIST_DEBOUNCE_MS = "1500";
@@ -153,7 +153,7 @@ test("persist.debounceMs knob is honored — a larger window defers the write (#
     }
 });
 
-test("persist.maxDelayMs knob is honored — a small cap beats a huge debounce under sustained traffic (#6062)", async () => {
+test("persist.maxDelayMs knob is honored — a small cap beats a huge debounce under sustained traffic (#6058)", async () => {
     // The reported field scenario: continuous mutations. With debounce=5000
     // the OLD code first wrote at ~5s (its hardcoded max-delay budget); with
     // maxDelay=400 the write must land within ~1.5s.

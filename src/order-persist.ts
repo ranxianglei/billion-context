@@ -25,7 +25,7 @@ import { kvStore } from "./persist.js";
 
 // Same quiesce/max-delay discipline as #1834's affinity persistence: a busy
 // proxy must not starve the write indefinitely. Both windows resolve through
-// the shared persist.* knobs (#6062 QLC field report: under sustained traffic
+// the shared persist.* knobs (#6058 QLC field report: under sustained traffic
 // the 5s max-delay cap set the steady-state rewrite rate, so tuning only the
 // debounce window changed nothing); defaults keep the historical 500ms / 5s.
 const MAX_ORDER_ENTRIES = 1024;

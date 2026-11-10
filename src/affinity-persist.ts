@@ -21,7 +21,7 @@ import { kvStore } from "./persist.js";
  *  max-delay budget caps how long a pending write can be starved: the file
  *  is on disk within ~500ms of the last mutation, or within 5s under
  *  sustained traffic — previously a flat 5s trailing window. Both windows
- *  resolve through the shared persist.* knobs (#6062: under sustained
+ *  resolve through the shared persist.* knobs (#6058: under sustained
  *  traffic the max-delay cap, not the debounce, sets the steady-state
  *  rewrite rate); defaults keep the historical 500ms / 5s. */
 

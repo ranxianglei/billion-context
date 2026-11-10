@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { flushOrderSkeletons, scheduleOrderPersist } from "../src/order-persist.ts";
 
-// #6062: the session-order snapshot writer had its quiesce/max-delay windows
+// #6058: the session-order snapshot writer had its quiesce/max-delay windows
 // hardcoded (500ms / 5s) and never read the persist.* knobs — while the main
 // session writer honored persist.debounceMs all along. These tests pin both
 // directions of the wiring: the defaults stay at the historical cadence, and
@@ -32,7 +32,7 @@ beforeEach(() => {
     process.env.XDG_STATE_HOME = tmp;
 });
 
-test("default cadence unchanged: single mutation lands within ~500ms (#6062)", async () => {
+test("default cadence unchanged: single mutation lands within ~500ms (#6058)", async () => {
     assert.ok(!fs.existsSync(orderFile()), "fresh state dir has no snapshot yet");
     scheduleOrderPersist();
     await new Promise((r) => setTimeout(r, 200));
@@ -42,7 +42,7 @@ test("default cadence unchanged: single mutation lands within ~500ms (#6062)", a
     flushOrderSkeletons();
 });
 
-test("persist.debounceMs knob is honored — a larger window defers the write (#6062)", async () => {
+test("persist.debounceMs knob is honored — a larger window defers the write (#6058)", async () => {
     process.env.BILI_PERSIST_DEBOUNCE_MS = "1500";
     try {
         scheduleOrderPersist();
@@ -56,7 +56,7 @@ test("persist.debounceMs knob is honored — a larger window defers the write (#
     }
 });
 
-test("persist.maxDelayMs knob is honored — a small cap beats a huge debounce under sustained traffic (#6062)", async () => {
+test("persist.maxDelayMs knob is honored — a small cap beats a huge debounce under sustained traffic (#6058)", async () => {
     // The reported field scenario: continuous mutations. With debounce=5000
     // the OLD code first wrote at ~5s (its hardcoded max-delay budget); with
     // maxDelay=400 the write must land within ~1.5s.

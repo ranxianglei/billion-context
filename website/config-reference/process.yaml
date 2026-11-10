@@ -311,8 +311,8 @@ entries:
     default: "5000"
     env: BILI_PERSIST_MAX_DELAY_MS
     group: process
-    desc_en: "Cap on how long a pending session-file write may wait under continuous activity — the debounce window restarts on every mutation, so this budget bounds the steady-state rewrite rate on wear-sensitive drives (#6062)."
-    desc_zh: "持续写入时一次待落盘写入最多可等待的时长上限——去抖窗口每次变更都会重置，这个预算决定磨损敏感盘上的稳态重写速率（#6062）。"
+    desc_en: "Cap on how long a pending session-file write may wait under continuous activity — the debounce window restarts on every mutation, so this budget bounds the steady-state rewrite rate on wear-sensitive drives (#6058)."
+    desc_zh: "持续写入时一次待落盘写入最多可等待的时长上限——去抖窗口每次变更都会重置，这个预算决定磨损敏感盘上的稳态重写速率（#6058）。"
   - key: persist.tailTokens
     type: number
     default: "16384 (0 disables message persistence)"
