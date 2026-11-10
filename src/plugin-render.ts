@@ -11,7 +11,6 @@
 // live-visible — the safe direction) instead of failing the whole render.
 import http from "node:http";
 import { coreToAnthropic, type BiliMessage } from "acp-kernel/wire";
-import { loadConfigFile, isMcpBiliCompress } from "./config.js";
 import { getStore } from "./persist.js";
 import { peekSession } from "./session.js";
 import { pluginAgentHeader } from "./plugin.js";
