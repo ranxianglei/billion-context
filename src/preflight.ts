@@ -12,6 +12,7 @@ import {
 } from "acp-kernel";
 import { createHash } from "node:crypto";
 import { yieldToEventLoop } from "./yield-loop.js";
+import { bufferedSseEvents } from "./sse-util.js";
 import { buildCompressSystemPrompt, parseCompressInput } from "./compress-tool.js";
 import { IMAGE_PLACEHOLDER, imagePlaceholdersForSummary } from "./image-note.js";
 import { applyAbsorbView } from "./absorb.js";
@@ -948,18 +949,8 @@ export function extractSummaryFromSse(protocol: PreflightProtocol, text: string)
     let completed = false;
     let invalid = false;
     let badFrame = false;
-    let eventType = "";
-    for (const line of text.split("\n")) {
-        if (line.trim() === "") {
-            eventType = "";
-            continue;
-        }
-        if (line.startsWith("event:")) {
-            eventType = line.slice(6).trim();
-            continue;
-        }
-        if (!line.startsWith("data:")) continue;
-        const payload = line.slice(5).trim();
+    for (const { event: eventType, data } of bufferedSseEvents(text)) {
+        const payload = data.trim();
         if (!payload || payload === "[DONE]") continue;
         let obj: unknown;
         try {
