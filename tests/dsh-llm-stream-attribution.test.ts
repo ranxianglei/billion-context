@@ -37,6 +37,71 @@ import {
 import { __resetConversationRecallForTests } from "../src/agent/conversation-recall.ts";
 import { installNativeWebSocketIntercept, _resetForTest as resetWsIntercept } from "../src/agent/native-ws-intercept.ts";
 import { WebSocket, WebSocketServer } from "ws";
+import { apply as applyNativePolicy, configureNativeCompaction } from "../src/agent/dsh-native-compaction.ts";
+import { installNativeFetchIntercept, _resetForTest as resetFetchIntercept } from "../src/agent/native-intercept.ts";
+
+test("DSH dispatch switches native/bili/native with unchanged native wire and a new bili generation", async () => {
+    await withSetup(async (handle, proxy) => {
+        const savedFetch = globalThis.fetch;
+        resetFetchIntercept();
+        installNativeFetchIntercept(_nativeStateForTest());
+        const { createServer } = await import("node:http");
+        const direct: Array<{ headers: import("node:http").IncomingHttpHeaders; body: string }> = [];
+        const routed: Array<{ url: string; conversation: string | string[] | undefined }> = [];
+        proxy.server.on("request", req => {
+            if (req.url?.startsWith("/bili/")) routed.push({ url: req.url, conversation: req.headers["x-bili-plugin-conversation"] });
+        });
+        const upstream = createServer(async (req, res) => {
+            const chunks: Buffer[] = [];
+            for await (const chunk of req) chunks.push(Buffer.from(chunk));
+            direct.push({ headers: req.headers, body: Buffer.concat(chunks).toString() });
+            res.end("native");
+        });
+        await new Promise<void>(resolve => upstream.listen(0, "127.0.0.1", resolve));
+        const address = upstream.address();
+        assert.ok(address && typeof address === "object");
+        const url = `http://127.0.0.1:${address.port}/v1/responses`;
+        let model = "codex/gpt-test";
+        const agent = { model: { current: () => ({ provider: "test", model }) }, session: { id: "native-switch-http", surface: { replaceGeneration: 0 } } };
+        handle.ctx.agents.get = sid => sid === agent.session.id ? agent : undefined;
+        configureNativeCompaction([{ model: "codex/gpt-*" }]);
+        applyNativePolicy({
+            on: (_event, callback) => callback({ agent }, () => undefined),
+        } as Parameters<typeof applyNativePolicy>[0], { noBackend: true });
+        const send = async (body: string) => {
+            const stream = runWaterfall(handle.events, { sessionId: agent.session.id, provider: "test", model }, async function* () {
+                await Promise.resolve();
+                await fetch(url, { method: "POST", headers: { "content-type": "application/json", "x-test-signed": "verbatim" }, body });
+                yield 1;
+            });
+            for await (const _ of stream) { /* Drain the adapter inside its dispatch scope. */ }
+        };
+        try {
+            await send('{"model":"codex/gpt-test","input":"native one"}');
+            assert.equal(direct.length, 1);
+            assert.equal(routed.length, 0);
+            assert.equal(direct[0].headers["x-bili-plugin"], undefined);
+            assert.equal(direct[0].headers["x-test-signed"], "verbatim");
+            assert.equal(direct[0].body, '{"model":"codex/gpt-test","input":"native one"}');
+            agent.session.surface.replaceGeneration = 2;
+            model = "kimi";
+            await send('{"model":"kimi","input":"checkpoint plus tail"}');
+            assert.equal(routed.length, 1);
+            assert.equal(routed[0].conversation, "native-switch-http|dsh-generation:2");
+            model = "codex/gpt-test";
+            await send('{"model":"codex/gpt-test","input":"native two"}');
+            assert.equal(direct.length, 2);
+            assert.equal(routed.length, 1);
+            assert.equal(direct[1].headers["x-bili-plugin"], undefined);
+        } finally {
+            configureNativeCompaction([]);
+            resetFetchIntercept({ anchor: savedFetch });
+            globalThis.fetch = savedFetch;
+            upstream.close();
+            upstream.closeAllConnections();
+        }
+    });
+});
 
 const MODEL_URL = "https://api.anthropic.com/v1/messages";
 

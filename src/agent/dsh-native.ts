@@ -1,3 +1,5 @@
+import { compactionConversationId, compactionGenerationIsolation, nativeAgent, nativeModel, nativeSummaryActive, requireNativeCompactionReady } from "./dsh-native-compaction.js";
+
 // Native dsh (deepseek-harness) cordis plugin (#941): full plugin-mode
 // compression for dsh WITHOUT a launcher — bare `dsh` with this plugin
 // installed via `bili plugin install dsh` (cordis.patch.yml entry) or
@@ -104,8 +106,10 @@ function regBackoffMs(failStreak: number): number {
 }
 
 type AgentLike = {
+    model?: { current: () => { provider?: unknown; model?: unknown } | undefined };
     session?: {
         id?: unknown;
+        surface?: { replaceGeneration: number };
         // #2381: dsh-session Session surface — the EpochHeader the NEXT request
         // is compared against ({config:{provider,model,...}}). dsh-agent-loop
         // writes each step's header into the session log BEFORE its fetch, so
@@ -148,7 +152,7 @@ type ToolDefinition = {
 type CommandOutcome = { kind: "success" | "error"; text: string };
 
 export type PluginContext = {
-    tools: { register: (definition: ToolDefinition) => unknown };
+    tools: { register: (definition: ToolDefinition, options?: { when: (context: { agent?: AgentLike; modelSelection?: { provider?: unknown; model?: unknown } }) => boolean }) => unknown };
     commands: { register: (command: { name: string; description: string; handler: (invocation?: CommandInvocation) => Promise<CommandOutcome> }) => unknown };
     agents: { currentInitiator?: () => AgentLike | undefined; get?: (id: string) => AgentLike | undefined };
     // Runtime-info sources (#955), resolved via dynamic ctx.inject when the
@@ -926,6 +930,7 @@ function toolDefinition(tool: ManifestTool): ToolDefinition {
             render: (_args, value) => [{ type: "text", text: typeof value === "string" ? value : String(value ?? "") }],
         },
         execute: async (args, exec) => {
+            if (nativeAgent(exec.agent)) throw new Error("bili compression tools are unavailable for a native-compaction model");
             // #983: read the LIVE base — a respawn after a proxy death moves
             // the origin, and a captured base would keep firing at a dead port.
             const base = register.base;
@@ -936,7 +941,7 @@ function toolDefinition(tool: ManifestTool): ToolDefinition {
             if (typeof sid !== "string" || sid.length === 0) {
                 throw new Error(`bili tool ${tool.name} requires an owning agent session`);
             }
-            const out = await forwardTool(base, sid, tool.name, args, exec.signal, true);
+            const out = await forwardTool(base, compactionConversationId(exec.agent, sid), tool.name, args, exec.signal, true);
             // #2204: dsh tool results are plain strings — a business failure
             // throws so the host renders an error, not success text.
             if (out.failed) throw new Error(out.text);
@@ -994,7 +999,7 @@ async function registerTools(ctx: PluginContext): Promise<void> {
         let adopted = 0;
         for (const tool of tools) {
             try {
-                target.tools.register(toolDefinition(tool));
+                target.tools.register(toolDefinition(tool), { when: ({ agent, modelSelection }) => !compactionGenerationIsolation() || !nativeModel(modelSelection ?? agent?.model?.current() ?? agent?.session?.requestHeader?.()?.config) });
             } catch (err) {
                 // #3380: idempotent adoption — a name this process ALREADY
                 // holds in the host tool layer throws "already registered";
@@ -1187,8 +1192,18 @@ type GateAttribution =
 interface LlmDispatchScope {
     sid: string;
     msgIds: string[] | undefined;
+    nativeCompaction?: boolean;
+    conversationId?: string;
+    titleRequest?: boolean;
 }
 const dispatchScope = new AsyncLocalStorage<LlmDispatchScope>();
+
+function compactionAgentOf(ctx: PluginContext, sid: string): AgentLike | undefined {
+    const direct = ctx.agents.get?.(sid);
+    if (direct?.session?.id === sid) return direct;
+    const ambient = ctx.agents.currentInitiator?.();
+    return ambient?.session?.id === sid ? ambient : undefined;
+}
 
 let noticedScopedAttribution = false;
 
@@ -1619,6 +1634,7 @@ function latestSessionNote(status: Record<string, unknown>, requestedSid: string
 }
 
 async function statusOutcome(ctx: PluginContext, invocation?: CommandInvocation): Promise<CommandOutcome> {
+    if (compactionGenerationIsolation() && nativeAgent(invocation?.agent ?? ctx.agents.currentInitiator?.())) return { kind: "success", text: "This model uses DSH native compaction. bili compression is inactive for this session's current model." };
     const base = register.base;
     if (!base) {
         // #3380 P3: toolsReady implies a proxy WAS serving this session — a
@@ -1646,7 +1662,8 @@ async function statusOutcome(ctx: PluginContext, invocation?: CommandInvocation)
     // agent session id; fall back to ALS attribution, then the latest-session fallback.
     const sid = invocationSidOf(invocation) ?? sessionIdOf(ctx);
     let fellBackToLatest = false;
-    let status: Record<string, unknown> | undefined = sid !== undefined ? await fetchStatus(base, sid) : undefined;
+    const cid = sid === undefined || !compactionGenerationIsolation() ? sid : compactionConversationId(invocation?.agent ?? ctx.agents.get?.(sid) ?? ctx.agents.currentInitiator?.(), sid);
+    let status: Record<string, unknown> | undefined = cid !== undefined ? await fetchStatus(base, cid) : undefined;
     if (status === undefined) {
         fellBackToLatest = true;
         status = await fetchStatusLatest(base);
@@ -1691,6 +1708,7 @@ async function statusOutcome(ctx: PluginContext, invocation?: CommandInvocation)
  *  API passes no arguments, so this lane always shows the default
  *  (summary-ledger) report — no `full`. */
 async function cacheOutcome(ctx: PluginContext, invocation?: CommandInvocation): Promise<CommandOutcome> {
+    if (compactionGenerationIsolation() && nativeAgent(invocation?.agent ?? ctx.agents.currentInitiator?.())) return { kind: "success", text: "This model uses DSH native compaction; bili has no cache statistics for its direct requests." };
     const base = register.base;
     if (!base) {
         return {
@@ -1702,7 +1720,7 @@ async function cacheOutcome(ctx: PluginContext, invocation?: CommandInvocation):
     // #1677: same session-resolution fix as /acp — the command path carries no ALS
     // attribution, so prefer the invocation's agent session id over currentInitiator().
     const sid = invocationSidOf(invocation) ?? sessionIdOf(ctx);
-    let target = sid;
+    let target = sid === undefined || !compactionGenerationIsolation() ? sid : compactionConversationId(invocation?.agent ?? ctx.agents.get?.(sid) ?? ctx.agents.currentInitiator?.(), sid);
     let fallbackNote: string | undefined;
     if (target === undefined) {
         try {
@@ -1961,6 +1979,7 @@ export async function apply(ctx: PluginContext): Promise<void> {
     // gate + optional custom label), read live on every call so a web-settings
     // edit lands on the next page load without a proxy restart.
     const withCtxTabFace = (base: Record<string, unknown>): Record<string, unknown> => {
+        if (compactionGenerationIsolation()) base.selectiveCompaction = true;
         base.contextTab = dshContextTabEnabled();
         const label = dshContextTabLabel();
         if (label !== undefined) base.contextTabLabel = label;
@@ -2008,13 +2027,25 @@ export async function apply(ctx: PluginContext): Promise<void> {
     const originRoute = {
         kind: "exact" as const,
         path: "/bili/origin",
-        handler: (_req: unknown, res: { writeHead: (status: number, headers?: Record<string, string>) => void; end: (body?: string) => void }): void => {
+        handler: (req: unknown, res: { writeHead: (status: number, headers?: Record<string, string>) => void; end: (body?: string) => void }): void => {
             const origin = currentOrigin();
             // #3373: relay mode ⇒ the client derives its base from the probe
             // response URL itself; the loopback origin is useless (and leaky)
             // to a remote browser. #4237: same Context-tab face flags as the
             // snapshot row.
-            const body = JSON.stringify(withCtxTabFace(origin !== undefined && adminRelayEnabled() ? { origin: null, relay: true } : { origin: origin ?? null }));
+            const face = withCtxTabFace(origin !== undefined && adminRelayEnabled() ? { origin: null, relay: true } : { origin: origin ?? null });
+            if (compactionGenerationIsolation()) {
+                const raw = (req as { url?: unknown })?.url;
+                const sid = typeof raw === "string" ? new URL(raw, "http://localhost").searchParams.get("sessionId") : null;
+                if (sid) {
+                    const agent = ctx.agents.get?.(sid);
+                    if (agent) {
+                        face.conversationId = compactionConversationId(agent, sid);
+                        face.nativeCompaction = nativeAgent(agent);
+                    }
+                }
+            }
+            const body = JSON.stringify(face);
             res.writeHead(200, { "content-type": "application/json" });
             res.end(body);
         },
@@ -2040,20 +2071,25 @@ export async function apply(ctx: PluginContext): Promise<void> {
     if (typeof ctx.inject === "function" && typeof ctx.on === "function") {
         const onEvent = ctx.on.bind(ctx);
         ctx.inject(["llm"], () => {
-            onEvent("llm/stream", (options: { sessionId?: unknown; messages?: unknown }, next: () => AsyncIterable<unknown>) => {
+            onEvent("llm/stream", (options: { sessionId?: unknown; messages?: unknown; provider?: unknown; model?: unknown; purpose?: unknown }, next: () => AsyncIterable<unknown>) => {
                 const sid = typeof options?.sessionId === "string" && options.sessionId.length > 0 ? options.sessionId : undefined;
                 if (sid === undefined) return next();
                 // #4491: capture the host message ids riding the same options
                 // — undefined (all-or-nothing) when any message lacks a usable
                 // id, so sidecar shapes degrade to id-less turns.
-                const scope: LlmDispatchScope = { sid, msgIds: hostMsgIdsOf(options?.messages) };
+                const agent = compactionGenerationIsolation() ? compactionAgentOf(ctx, sid) : undefined;
+                const native = nativeSummaryActive() || (options.purpose === "compaction" ? nativeAgent(agent) : nativeModel(options));
+                const titleRequest = options.purpose === "session-title";
+                if (native && !nativeSummaryActive() && !titleRequest) requireNativeCompactionReady(agent);
+                const conversationId = native || titleRequest ? sid : compactionConversationId(agent, sid);
+                const scope: LlmDispatchScope = { sid, msgIds: hostMsgIdsOf(options?.messages), nativeCompaction: native, conversationId, titleRequest };
                 // #5403/#5418 v3: feed the per-slot id sequence into the
                 // watermark channel (the fetch chokepoint emits count +
                 // tail-ids; core = pf-channel.ts) — "?" slots ride id-less
                 // elements without poisoning the rest. A failed resolution
                 // (no usable message list at all) CLEARS like every other
                 // adapter — never ride a stale one.
-                pfChannel.pfCaptureIds(sid, pfSlotIdsOf(options?.messages));
+                if (!native) pfChannel.pfCaptureIds(conversationId, pfSlotIdsOf(options?.messages));
                 // next() may start the adapter's fetch eagerly (inside this
                 // call), and lazy continuations resume on each advance —
                 // runLlmDispatch covers the former, wrapScopedIterable the
@@ -2356,6 +2392,7 @@ export async function apply(ctx: PluginContext): Promise<void> {
         }
         return refuse(url, attr, body);
     };
+    state.nativeCompactionBypass = () => dispatchScope.getStore()?.nativeCompaction === true || nativeSummaryActive();
     state.takeoverGate = (url, body, init) => {
         const attr = attributionOf(ctx);
         if (attr.state === "ok") {
@@ -2548,7 +2585,9 @@ export async function apply(ctx: PluginContext): Promise<void> {
         // sent (the proxy-side exact-match gate stays as defense in depth).
         const target = sessionModelTargetOf(ctx) ?? globalModelTarget(modelInfo.services);
         refreshModelInfo(register.base, target);
-        const headers: Record<string, string> = { "x-bili-plugin": "dsh", "x-bili-plugin-conversation": sid };
+        const scopedId = dispatchScope.getStore()?.conversationId;
+        const agent = compactionGenerationIsolation() && scopedId === undefined ? compactionAgentOf(ctx, sid) : undefined;
+        const headers: Record<string, string> = { "x-bili-plugin": "dsh", "x-bili-plugin-conversation": scopedId ?? compactionConversationId(agent, sid) };
         // #3370: the incremental-turn marker (and, since #3329, the turn id)
         // is no longer stamped here — a closure-level armed flag shared by
         // every session raced concurrent requests across the awaited
@@ -2590,6 +2629,15 @@ export async function apply(ctx: PluginContext): Promise<void> {
     // body to its incremental form when the lane advertises the feature —
     // init.body mutation propagates through withHeaders/send untouched.
     state.beforeSend = async (url, init) => {
+        // Each host replacement starts a fresh bili substrate. Do not carry a
+        // negotiated alias, fork adoption or incremental seed across that boundary.
+        if (compactionGenerationIsolation() && !dispatchScope.getStore()?.titleRequest) {
+            const attr = attributionOf(ctx);
+            if (attr.state === "ok") {
+                const id = dispatchScope.getStore()?.conversationId ?? compactionConversationId(compactionAgentOf(ctx, attr.sid), attr.sid);
+                if (id !== attr.sid) return;
+            }
+        }
         // #4082 review: learn + stamp run FIRST — the boundary fingerprint
         // must come from the ORIGINAL full history; fork-adopt and the
         // incremental swap both rewrite init.body afterwards (the delta form

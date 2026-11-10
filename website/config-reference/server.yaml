@@ -380,8 +380,26 @@ entries:
     default: "{}"
     env: BILI_ALLOW_DSH_COMPACTION
     group: behavior
-    desc_en: "Section recognized but its former escape hatch is gone (#3666, superseding #2028): the allowDshCompaction key and the BILI_ALLOW_DSH_COMPACTION env var no longer exist — dsh native compaction is refused unconditionally by the wire guard on every lane. Leftover dsh.allowDshCompaction values are ignored with a one-time deprecation warning; apply host-side suppression instead (#3354/#2474). The live keys — dsh.authoredCompaction, dsh.contextTab, dsh.contextTabLabel — are documented in the following entries."
-    desc_zh: "段仍被识别，但其原逃生门已移除（#3666，取代 #2028）：allowDshCompaction 键与 BILI_ALLOW_DSH_COMPACTION 环境变量已不存在——dsh 原生压缩现在在所有线路上被无条件拒绝。遗留的 dsh.allowDshCompaction 取值会被忽略（一次性弃用警告）；请改用宿主侧抑制（#3354/#2474）。存活的键——dsh.authoredCompaction、dsh.contextTab、dsh.contextTabLabel——见接下来的条目。"
+    desc_en: "Section recognized but its former escape hatch is gone (#3666, superseding #2028): the allowDshCompaction key and the BILI_ALLOW_DSH_COMPACTION env var no longer exist — the wire guard refuses unmanaged native compaction. Explicit dsh.nativeCompactionModels rules coordinate host ownership and bypass that wire lane. Leftover dsh.allowDshCompaction values are ignored with a one-time deprecation warning; apply host-side suppression instead (#3354/#2474). The live keys — dsh.authoredCompaction, dsh.contextTab, dsh.contextTabLabel — are documented in the following entries."
+    desc_zh: "段仍被识别，但其原逃生门已移除（#3666，取代 #2028）：allowDshCompaction 键与 BILI_ALLOW_DSH_COMPACTION 环境变量已不存在——线级守卫拒绝未受管理的原生压缩。显式 dsh.nativeCompactionModels 规则协调宿主压缩归属并绕过该线路。遗留的 dsh.allowDshCompaction 取值会被忽略（一次性弃用警告）；请改用宿主侧抑制（#3354/#2474）。存活的键——dsh.authoredCompaction、dsh.contextTab、dsh.contextTabLabel——见接下来的条目。"
+  - key: dsh.nativeCompactionModels
+    type: "{ provider?: string, model: string }[]"
+    default: "[]"
+    group: behavior
+    desc_en: "Opt selected DSH Web-preset models into native compaction (#6121). Exact provider ID is optional; model matches exactly or by a trailing * prefix, e.g. gpt-* or codex/gpt-*. Unmatched models keep bili. Requires a host restart. Native summaries bypass bili and host replacement generations isolate later bili state; see docs/dsh-native-compaction.md for supported profiles, handoff limits and update guidance."
+    desc_zh: "指定 DSH Web 预设中的模型使用原生压缩（#6121）。可选 provider 精确匹配；model 精确匹配或使用末尾 * 表示前缀，例如 gpt-*、codex/gpt-*。未匹配模型继续使用 bili，需重启宿主生效。原生摘要绕过 bili，宿主替换代数隔离后续 bili 状态；支持范围、切换边界和更新方式见 docs/dsh-native-compaction.zh-CN.md。"
+  - key: dsh.nativeCompactionModels.model
+    type: string
+    default: "required per rule"
+    group: behavior
+    desc_en: "Each native-compaction rule's exact model ID or prefix ending in *. Display names and other wildcard forms are not accepted."
+    desc_zh: "每条原生压缩规则的模型 ID，精确匹配或末尾 * 前缀匹配，不使用显示名或其他通配形式。"
+  - key: dsh.nativeCompactionModels.provider
+    type: string
+    default: "omitted (all providers)"
+    group: behavior
+    desc_en: "Optional exact DSH provider ID restricting one native-compaction model rule."
+    desc_zh: "可选的 DSH 供应商 ID，精确限定该条原生压缩模型规则。"
   - key: dsh.authoredCompaction
     type: boolean
     default: "true (on, #3901 flip)"

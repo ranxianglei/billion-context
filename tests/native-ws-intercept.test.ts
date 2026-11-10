@@ -686,6 +686,28 @@ test("#5838 e2e: stamped headers actually ride the real WebSocket upgrade reques
     }
 });
 
+test("native-compaction sockets stay direct and refuse reuse after ownership changes", async () => {
+    await withPatchedGlobal(async () => {
+        let native = true;
+        const no = () => { throw new Error("bili hooks must not run on a native socket"); };
+        const state: NativeInterceptState = { origin: ORIGIN, ready: Promise.resolve(ORIGIN), nativeCompactionBypass: () => native, beforeSend: no, headersFor: no, takeoverGate: no };
+        installNativeWebSocketIntercept(state);
+        const ws = new (WsCtor<FakeWs>())(UPSTREAM_WS, {});
+        await tick();
+        const [real] = FakeWs.instances;
+        real.readyState = FakeWs.OPEN;
+        const frame = JSON.stringify({ type: "response.create", model: "gpt-5", input: [] });
+        ws.send(frame);
+        await tick();
+        assert.deepEqual(real.sent, [frame]);
+        native = false;
+        ws.send(frame);
+        await tick();
+        assert.deepEqual(real.sent, [frame]);
+        assert.equal(real.closed, true);
+    });
+});
+
 test("DSH prepares every response.create in sender scope, preserves continuation, and refuses model changes", async () => {
     await withPatchedGlobal(async () => {
         const scope = new AsyncLocalStorage<string>();

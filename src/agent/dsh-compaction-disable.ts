@@ -33,6 +33,8 @@
 // bundle-patch gate rows may target ids a profile does not ship — their miss
 // is otherwise visible only in the host loader log).
 
+import { configureNativeCompaction, selectiveCompactionEnabled } from "./dsh-native-compaction.js";
+
 /** The two dsh packages whose backends must not instantiate while bili owns the lane. */
 const DSH_COMPACTION_BASIC_PACKAGE = "@deepseek-ai/dsh-compaction-basic";
 const DSH_COMMAND_COMPACT_PACKAGE = "@deepseek-ai/dsh-command-compact";
@@ -78,6 +80,7 @@ const DSH_COMPACTION_VERDICT_KEY = "__BILI_DSH_COMPACTION_VERDICT__";
 
 /** bili-native calls this from apply() when its plan keeps the lane owned. */
 export function declareDshCompactionActive(): void {
+    configureNativeCompaction();
     (globalThis as Record<string, unknown>)[DSH_COMPACTION_VERDICT_KEY] = "active";
 }
 
@@ -166,6 +169,19 @@ export function disableBasicCompaction(rows: readonly unknown[]): unknown[] {
     });
 }
 
+export function selectiveBasicCompaction(rows: readonly unknown[]): unknown[] {
+    const result = rows.map(row => {
+        if (row === null || typeof row !== "object") return row;
+        const r = row as PresetRow;
+        return r.group && Array.isArray(r.config) ? { ...r, config: selectiveBasicCompaction(r.config) } : row;
+    });
+    if (rows.some(row => row !== null && typeof row === "object" && (row as PresetRow).name === DSH_COMPACTION_BASIC_PACKAGE) &&
+        !rows.some(row => row !== null && typeof row === "object" && (row as PresetRow).name === "billion-context/dsh-native-compaction")) {
+        result.push({ name: "billion-context/dsh-native-compaction" });
+    }
+    return result;
+}
+
 export type CompactionDisableHost = {
     on?: (event: string, listener: (raw: unknown, next: () => unknown) => unknown, options?: { global?: boolean }) => void;
     reflect?: { provide?: (name: string, value: unknown) => void } | undefined;
@@ -195,12 +211,15 @@ export function registerCompactionDisable(ctx: CompactionDisableHost): void {
             // their resolved config object identity.
             const config = (resolved ?? {}) as { plugins?: unknown };
             if (!Array.isArray(config.plugins)) return resolved;
-            const compactionRows = countCompactionRows(config.plugins);
-            if (compactionRows === 0) return resolved;
             const rawName = this?.entry?.options?.name;
             const entryName = typeof rawName === "string" ? rawName : "unnamed-entry";
+            const compactionRows = countCompactionRows(config.plugins);
+            if (compactionRows === 0) {
+                if (!selectiveCompactionEnabled() || entryName !== DSH_AGENT_PRESET_PACKAGE) return resolved;
+                return { ...config, plugins: [...config.plugins, { name: "billion-context/dsh-native-compaction", config: { noBackend: true } }] };
+            }
             noteGateCoverage(entryName.slice(0, 120), compactionRows, entryName === DSH_AGENT_PRESET_PACKAGE);
-            return { ...config, plugins: disableBasicCompaction(config.plugins) };
+            return { ...config, plugins: selectiveCompactionEnabled() ? selectiveBasicCompaction(config.plugins) : disableBasicCompaction(config.plugins) };
         }, { global: true });
     }
     // Publish only after the middleware is registered; the host owns both lifetimes.
