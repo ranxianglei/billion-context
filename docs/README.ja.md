@@ -2,7 +2,7 @@
 
 **billion-context** のシステム文書はすべてこのディレクトリに集約されています。リポジトリのルートには 4 つの**コア**入口ファイル——`README.md`、`README.zh-CN.md`、`AGENTS.md`、`CHANGELOG.md`——と、承認済みのコミュニティ維持 README 訳本（`README.<locale>.md`、例 `README.ja.md`、2026-11-09 に承認、#6000）のみを保持します。旧ルート文書パスはルートに一行的なリダイレクト用プレースホルダを残します（追跡は [lifecycle §5](lifecycle.md#5-卫生记录)）。
 
-> **全カタログ:** [index.md](index.md) / [index.zh-CN.md](index.zh-CN.md) — 全文書を一行説明付きで一覧。このページはディレクトリの落地ページで、何がどこにあるか、そして何を live に保つかというルールを示します。
+> **全カタログ:** [index.md](index.md) / [index.zh-CN.md](index.zh-CN.md) — 全文書を一行説明付きで一覧。このページはディレクトリのランディングページで、何がどこにあるか、そして何を live に保つかというルールを示します。
 
 ## セクション
 
