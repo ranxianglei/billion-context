@@ -4,6 +4,8 @@ import path from "node:path";
 
 import { RESIGN_BUILTIN_SCHEME, resolveModelEntryOnRoute, resolveResignSettings, type ProviderRoute } from "./config.js";
 import { configFile, stateDir } from "./paths.js";
+import { log as loggerLog } from "./logger.js";
+import { kvStore } from "./persist.js";
 
 /**
  * #1884 (CodeArts APIG): requests signed with SDK-HMAC-SHA256 carry a
@@ -339,6 +341,94 @@ interface ResignPendingEntry {
 }
 
 const RESIGN_PENDING_MAX_ENTRIES = 32;
+// #5753: the pending map rides the UNIFIED storage (kv_store namespace
+// "resign-pending", single row "pending" holding the whole map) under the
+// #5548 carrier rules: kv primary once hydrated, legacy file kept as the
+// pre-hydration fallback + sole carrier on legacy-only instances, one-time
+// migration on first hydration, then a unified instance never writes the file
+// again. Advisory surface: best-effort only (warn-once), never a request path.
+const PENDING_NS = "resign-pending";
+const PENDING_KEY = "pending";
+
+let pendingCache: Record<string, ResignPendingEntry> | null = null;
+let pendingWarned = false;
+// RMW serialization: refusals are rare, but two back-to-back ones must not
+// lose an increment against each other (the sync file discipline serialized
+// them inside the process by construction).
+let pendingChain: Promise<void> = Promise.resolve();
+// Hydration gate: until cli-start hydrates the kv row, unified instances fall
+// back to the legacy file (which hydration imports on first run).
+let pendingHydrated = false;
+
+/** Queued carrier write: the kv row once hydrated on a unified instance,
+ *  else the legacy file. Best-effort — warn-once, never throw.
+ *  The FILE path stays synchronous (the old contract: a refusal recorded on
+ *  the hot path must already be on disk by the time any exit fires).
+ *  #5757 review fix: a persistent store failure DEMOTES this process back to
+ *  the file discipline (and lands the current map on disk now) instead of
+ *  quietly re-queueing forever into a dead store. */
+function persistPendingNow(map: Record<string, ResignPendingEntry>): void {
+    const store = pendingHydrated ? kvStore() : null;
+    if (!store) {
+        writePendingRefusals(map);
+        return;
+    }
+    pendingChain = pendingChain.then(() => store.setKvAsync(PENDING_NS, PENDING_KEY, map)).catch((err) => {
+        pendingWarnOnce("persist", err);
+        // demote: everything after this ride's the legacy file again
+        pendingHydrated = false;
+        try {
+            writePendingRefusals(map);
+        } catch { /* best effort; the next op re-persists */ }
+    });
+}
+
+/** Await in-flight kv carrier writes — called from shutdown paths so a
+ *  late refusal cannot be lost by a hard exit. */
+export async function flushResignPending(): Promise<void> {
+    await pendingChain;
+}
+
+function pendingWarnOnce(tag: string, err: unknown): void {
+    if (pendingWarned) return;
+    pendingWarned = true;
+    loggerLog("warn", `[resign] ${tag} failed — pending refusals stay in-memory for this process: ${err instanceof Error ? err.message : String(err)}`);
+}
+
+/** Validate a persisted doc (kv row or file body). null when unusable. */
+function parsePendingDoc(value: unknown): Record<string, ResignPendingEntry> | null {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+    const out: Record<string, ResignPendingEntry> = {};
+    for (const [scheme, raw] of Object.entries(value as Record<string, unknown>)) {
+        if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
+        const e = raw as Record<string, unknown>;
+        out[scheme] = {
+            origin: typeof e["origin"] === "string" ? e["origin"] : "",
+            firstSeen: typeof e["firstSeen"] === "string" ? e["firstSeen"] : new Date(0).toISOString(),
+            lastSeen: typeof e["lastSeen"] === "string" ? e["lastSeen"] : new Date(0).toISOString(),
+            count: typeof e["count"] === "number" && Number.isFinite(e["count"]) && e["count"] > 0 ? Math.floor(e["count"]) : 1,
+        };
+    }
+    return out;
+}
+
+async function fetchPendingFromStore(): Promise<Record<string, ResignPendingEntry> | null> {
+    const store = kvStore();
+    if (!store) return null;
+    try {
+        return parsePendingDoc(await store.getKvAsync(PENDING_NS, PENDING_KEY));
+    } catch {
+        return null;
+    }
+}
+
+/** #5757 review fix: the process is riding the kv carrier right now (hydrated
+ *  on an instance with real KV methods). Anything else — pure legacy-only
+ *  instances AND partial test stubs — keeps master's exact semantics: re-read
+ *  the FILE on every operation, no sticky cache. */
+function unifiedLive(): boolean {
+    return pendingHydrated && kvStore() !== null;
+}
 
 function resignPendingFile(): string {
     return path.join(stateDir(), "resign-pending.json");
@@ -385,25 +475,30 @@ function writePendingRefusals(map: Record<string, ResignPendingEntry>): void {
 }
 
 /** Remember that a signed request was refused (both lanes call this on the
- *  refusal path). Bounded: newest 32 schemes survive a restart. */
+ *  refusal path). Bounded: newest 32 schemes survive a restart.
+ *  Visibility stays SYNCHRONOUS (callers assert the pending map right away);
+ *  only the carrier write is queued. */
 export function recordSignedRefusal(scheme: string, url: string): void {
     const key = scheme.trim().toLowerCase();
     if (key.length === 0) return;
-    const map = readPendingRefusalsRaw();
     let origin = "";
     try { origin = new URL(url).origin; } catch { origin = url.slice(0, 120); }
     const now = new Date().toISOString();
-    const prev = map[key];
-    map[key] = prev
+    const live: Record<string, ResignPendingEntry> = {};
+    const ridingKv = unifiedLive();
+    for (const [k, v] of Object.entries(ridingKv ? pendingCache ?? readPendingRefusalsRaw() : readPendingRefusalsRaw())) live[k] = { ...v };
+    const prev = live[key];
+    live[key] = prev
         ? { origin: prev.origin || origin, firstSeen: prev.firstSeen, lastSeen: now, count: prev.count + 1 }
         : { origin, firstSeen: now, lastSeen: now, count: 1 };
-    const keys = Object.keys(map);
+    const keys = Object.keys(live);
     if (keys.length > RESIGN_PENDING_MAX_ENTRIES) {
         // Drop the oldest-seen overflow entries; keep the most recently active.
-        keys.sort((a, b) => map[a].firstSeen.localeCompare(map[b].firstSeen));
-        for (const drop of keys.slice(0, keys.length - RESIGN_PENDING_MAX_ENTRIES)) delete map[drop];
+        keys.sort((a, b) => live[a].firstSeen.localeCompare(live[b].firstSeen));
+        for (const drop of keys.slice(0, keys.length - RESIGN_PENDING_MAX_ENTRIES)) delete live[drop];
     }
-    writePendingRefusals(map);
+    if (ridingKv) pendingCache = live; // legacy path never caches (#5757)
+    persistPendingNow(live);
 }
 
 /** Forget a scheme's refusal memory — called when the scheme is configured
@@ -411,14 +506,63 @@ export function recordSignedRefusal(scheme: string, url: string): void {
  *  BILI_RESIGN=0), so startup reminders stop nagging about it. */
 export function clearSignedRefusal(scheme: string): void {
     const key = scheme.trim().toLowerCase();
-    const map = readPendingRefusalsRaw();
-    if (!(key in map)) return;
-    delete map[key];
-    writePendingRefusals(map);
+    if (key.length === 0) return;
+    const ridingKv = unifiedLive();
+    const src = ridingKv ? pendingCache ?? readPendingRefusalsRaw() : readPendingRefusalsRaw();
+    if (!(key in src)) return;
+    const live: Record<string, ResignPendingEntry> = {};
+    for (const [k, v] of Object.entries(src)) live[k] = { ...v };
+    delete live[key];
+    if (ridingKv) pendingCache = live; // legacy path never caches (#5757)
+    persistPendingNow(live);
 }
 
 export function readPendingRefusals(): Record<string, ResignPendingEntry> {
-    return readPendingRefusalsRaw();
+    const src = unifiedLive() ? pendingCache ?? readPendingRefusalsRaw() : readPendingRefusalsRaw();
+    const out: Record<string, ResignPendingEntry> = {};
+    for (const [k, v] of Object.entries(src)) out[k] = { ...v };
+    return out;
+}
+
+/** Once per process (wired at cli start): load the kv row + import the legacy
+ *  file one time. Legacy-only instances keep the pure-file path forever.
+ *  Never throws. */
+export async function hydrateResignPending(): Promise<void> {
+    const store = kvStore();
+    if (pendingHydrated || !store) return;
+    let merged: Record<string, ResignPendingEntry> | null = null;
+    try {
+        const kvRows = await fetchPendingFromStore();
+        const fileMap = readPendingRefusalsRaw();
+        merged = {};
+        for (const [k, v] of Object.entries(kvRows ?? {})) merged[k] = v;
+        for (const [k, f] of Object.entries(fileMap)) {
+            const c = merged[k];
+            // fresher lastSeen wins per scheme (tie → higher count); mirrors
+            // the whole-map merge discipline the file write used to enforce.
+            if (!c || f.lastSeen > c.lastSeen || (f.lastSeen === c.lastSeen && f.count >= c.count)) merged[k] = f;
+        }
+        // one-time migration, per-entry like the sibling modules: any file scheme
+        // missing from the kv row travels up — a late file row must not be
+        // stranded just because the row already holds other schemes (#5757 review).
+        const missingFile = Object.keys(fileMap).filter((k) => !(k in (kvRows ?? {})));
+        if (missingFile.length > 0) {
+            await store.setKvAsync(PENDING_NS, PENDING_KEY, merged);
+            loggerLog("info", `[resign] imported ${missingFile.length} pending-refusal entr(y/ies) from the legacy JSON file into unified storage (kv_store namespace "${PENDING_NS}")`);
+        }
+    } catch (err) {
+        pendingWarnOnce("hydrate", err);
+    }
+    pendingCache = merged ?? {};
+    pendingHydrated = true;
+}
+
+/** Test seam: drop caches so the next hydrate re-reads the volume. */
+export function _resetResignPendingForTest(): void {
+    pendingCache = null;
+    pendingHydrated = false;
+    pendingWarned = false;
+    pendingChain = Promise.resolve();
 }
 
 /** Schemes whose refusal is still UNRESOLVED under the current settings —
@@ -433,7 +577,7 @@ export function readPendingRefusals(): Record<string, ResignPendingEntry> {
 export function unresolvedRefusals(env: NodeJS.ProcessEnv = process.env): Record<string, ResignPendingEntry> {
     if (env.BILI_RESIGN === "0") return {};
     const out: Record<string, ResignPendingEntry> = {};
-    for (const [scheme, entry] of Object.entries(readPendingRefusalsRaw())) {
+    for (const [scheme, entry] of Object.entries(readPendingRefusals())) {
         const settings = resolveResignSettings(env, {}, scheme);
         if (!settings.enabled) continue;
         const builtinPassthrough = scheme === APIG_RESIGN_SCHEME && (settings.passthrough || env.BILI_RESIGN_PASSTHROUGH === "1" || env.BILI_RESIGN_PASSTHROUGH === "true");
