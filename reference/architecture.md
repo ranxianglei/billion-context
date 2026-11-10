@@ -99,6 +99,7 @@ billion-context/
 │   ├── compress-tool.ts          # ACP tool surface — thin re-export from acp-kernel
 │   ├── decompress-shared.ts      # Shared decompress logic + large-decompress tmp retention cap
 │   ├── fold-reconcile.ts         # Fold-anchor reconciliation for stable prefix cache
+│   ├── fold-summary-ccr.ts       # Proxy-mode fold summaries → CCR placeholder on the egress view (default-off POC, #6111)
 │   ├── generation-boundary.ts    # Standing generation-boundary note for post-switch stale-ref residue (#4305)
 │   ├── orphan-gc.ts              # Orphan block garbage collection
 │   ├── foreign-block-sweep.ts    # Legacy cross-session fold-block sweep: covered-ids with zero transcript intersection → reversible archive (#5312)
