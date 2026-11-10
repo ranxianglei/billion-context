@@ -12,7 +12,7 @@
 //      full-resend request with the marker removed — behavior equals the
 //      pre-incremental world for that turn.
 //
-// Wire contract: see PLUGIN.md "Incremental turns". Messages are raw wire
+// Wire contract: see docs/plugin-protocol.md "Incremental turns". Messages are raw wire
 // messages ({role, content: string | blocks[]}) — the lane derives stable
 // content ids server-side, so hosts without their own message ids work.
 
