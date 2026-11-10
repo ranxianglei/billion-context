@@ -24,7 +24,7 @@
  * backward seam walk D-lane uses — id fast path, identity-signature fallback,
  * one reply-lag gap tolerated, #3812/#4052 semantics preserved).
  */
-import { defaultCountTokens, hideConsumedCompressCalls, renderVisibleRefs, TRUNCATION_CLIP_RE, SUMMARY_HEADER, summaryMessageId, type CompressionState, type RenderStrategy } from "acp-kernel";
+import { defaultCountTokens, hideConsumedCompressCalls, highestUsedIndex, refToIndex, renderVisibleRefs, TRUNCATION_CLIP_RE, SUMMARY_HEADER, summaryMessageId, type CompressionState, type RenderStrategy } from "acp-kernel";
 import type { BiliMessage } from "acp-kernel/wire";
 import { createHash } from "node:crypto";
 import { loadConfigFile, resolveMessageTimestamps } from "../config.js";
@@ -609,12 +609,31 @@ export function applySnapEgress(
     // degrade — never unverified bytes.
     let rendered: BiliMessage[];
     try {
-        const tsStamps = (state as { tsStamps?: Record<string, number> }).tsStamps;
+        // Kernel render parity, step 2 (#5608-C): the time attribute is
+        // rendered only for refs strictly beyond the timestamp visibility
+        // high-water mark — the kernel's stamp-timestamps node attaches m.ts
+        // only when seq > hwm, and render-refs drops the attribute for any
+        // message without m.ts. A fold's ledger alignment raises the mark, so
+        // old refs intentionally lose the attribute in the legacy render;
+        // hydrating them unconditionally would diverge the plane bytes from
+        // the legacy render (tripwire red, sticky exclusion). Mirror the
+        // gate exactly: same stamps map, same byRaw ref lookup, same hwm.
+        const tsStamps = state.tsStamps;
+        const byRaw = state.messageRefs?.byRaw;
+        const hwm = typeof state.timestampsHighWaterRefSeq === "number"
+            ? state.timestampsHighWaterRefSeq
+            : highestUsedIndex(state.messageRefs ?? { byRaw: {}, byRef: {} });
         const hydrated = tsStamps === undefined
             ? planeMsgs
-            : planeMsgs.map((m) => m.ts === undefined && typeof m.id === "string" && tsStamps[m.id] !== undefined
-                ? ({ ...m, ts: tsStamps[m.id] } as BiliMessage)
-                : m);
+            : planeMsgs.map((m) => {
+                if (m.ts !== undefined || typeof m.id !== "string") return m;
+                const stamped = tsStamps[m.id];
+                if (stamped === undefined) return m;
+                const cur = byRaw?.[m.id];
+                const seq = cur === undefined ? null : refToIndex(cur);
+                if (seq === null || seq <= hwm) return m;
+                return { ...m, ts: stamped } as BiliMessage;
+            });
         rendered = renderVisibleRefs(hydrated, state, defaultCountTokens, deps.renderTags, flags.timestamps) as BiliMessage[];
     } catch (err) {
         noteDegrade("render-error");

@@ -398,6 +398,10 @@ test("#5874 T18a: kernel render parity — plane rows re-stamped by the kernel r
         byRef: Object.fromEntries([["m00005", anchorId], ...ids.map((id, i) => [`m0000${9 + i}`, id])]),
     };
     state.tsStamps = Object.fromEntries([[anchorId, TS - 60_000], ...ids.map((id) => [id, TS])]);
+    // A real post-fold state carries the #5608-C visibility mark: a fresh
+    // session armed it to 0 on its first stamped pass, so every ref minted
+    // afterwards renders its time attribute (seq > hwm).
+    state.timestampsHighWaterRefSeq = 0;
     // Plain untagged client resend (host transport never carries tags).
     const resend = [
         msg("m1", "message 1"),
@@ -439,6 +443,7 @@ test("#5874 T18b: immutable first-sight time — the plane render is stable acro
         byRef: Object.fromEntries([["m00009", "m9"], ["m00010", "m10"], ["m00011", "m11"], ["m00012", "m12"]]),
     };
     state.tsStamps = Object.fromEntries([["m9", TS], ["m10", TS], ["m11", TS], ["m12", TS]]);
+    state.timestampsHighWaterRefSeq = 0; // #5608-C: fresh-session mark, all refs visible
     const resend = [
         msg("m1", "message 1"),
         msg("m9", "message 9"),
@@ -462,6 +467,52 @@ test("#5874 T18b: immutable first-sight time — the plane render is stable acro
     assert.equal(snapEgressStatusWire().cutover, 2);
     assert.equal(out1[1].text, out2[1].text, "same tsStamps → identical bytes across turns");
     assert.ok((out1[1].text ?? "").includes(formatTagTime(TS)), "time is the immutable first-sight stamp, not the wall clock");
+    } finally {
+        if (prevTs === undefined) delete process.env.BILI_MESSAGE_TIMESTAMPS;
+        else process.env.BILI_MESSAGE_TIMESTAMPS = prevTs;
+    }
+});
+
+test("#5874 T18d: the #5608-C high-water mark gates the time attribute — plane and legacy both drop it for refs at/below the mark after a fold", () => {
+    const prevTs = process.env.BILI_MESSAGE_TIMESTAMPS;
+    process.env.BILI_MESSAGE_TIMESTAMPS = "1";
+    try {
+    _resetSnapEgressForTests();
+    setConfig({});
+    const { view, state } = planeFor("sess-p2-env-d");
+    withStore(view);
+    const TS = 1_600_000_000_000;
+    const anchorId = summaryMessageId("blk-c1");
+    state.messageRefs = {
+        byRaw: Object.fromEntries([[anchorId, "m00005"], ["m9", "m00009"], ["m10", "m00010"], ["m11", "m00011"], ["m12", "m00012"]]),
+        byRef: Object.fromEntries([["m00005", anchorId], ["m00009", "m9"], ["m00010", "m10"], ["m00011", "m11"], ["m00012", "m12"]]),
+    };
+    state.tsStamps = Object.fromEntries([[anchorId, TS - 60_000], ["m9", TS], ["m10", TS], ["m11", TS], ["m12", TS]]);
+    // The fold's ledger alignment raised the visibility mark to 11: m00005,
+    // m00009, m00010, m00011 sit at/below it and lose the attribute; only
+    // m00012 (minted after the mark) keeps it — in BOTH renders.
+    state.timestampsHighWaterRefSeq = 11;
+    const resend = [
+        msg("m1", "message 1"),
+        msg("m9", "message 9"),
+        msg("m10", "message 10", "assistant"),
+        msg("m11", "message 11"),
+        msg("m12", "message 12", "assistant"),
+    ];
+    const unt: BiliMessage[] = [
+        { ...msg(anchorId, `${SUMMARY_HEADER}\nfolded 1-8`, "system" as const) },
+        msg("m9", "message 9"),
+        msg("m10", "message 10", "assistant"),
+        msg("m11", "message 11"),
+        { ...msg("m12", "message 12", "assistant"), ts: TS },
+    ];
+    const legacy = renderVisibleRefs(unt, state, defaultCountTokens, "text-only", true) as BiliMessage[];
+    const out = applySnapEgress(resend, state, legacy, { ...deps(), renderTags: "text-only" as const });
+    assert.equal(snapEgressStatusWire().cutover, 1, "gated plane matches gated legacy — cutover, not red");
+    assert.deepEqual(out.map((m) => [m.id, m.role, m.text]), legacy.map((m) => [m.id, m.role, m.text]), "byte-identical after the mark change (ledgerSeq is plane metadata)");
+    assert.ok(!/(^|\s)time="/.test(out[1].text ?? ""), "m00009 (seq 9 <= 11) lost the attribute");
+    assert.ok(!/(^|\s)time="/.test(out[3].text ?? ""), "m00011 (seq 11 <= 11) lost the attribute");
+    assert.ok((out[4].text ?? "").includes(`time="${formatTagTime(TS)}"`), "m00012 (seq 12 > 11) keeps the attribute");
     } finally {
         if (prevTs === undefined) delete process.env.BILI_MESSAGE_TIMESTAMPS;
         else process.env.BILI_MESSAGE_TIMESTAMPS = prevTs;
@@ -785,6 +836,12 @@ test("T23 empty client text is not adoption-eligible", () => {
 // and the seam walk for this round's own resend has an empty tail.
 test("T24 in-request flush: plane readable pre-egress, tail=0 for this round's resend", async () => {
     const dir = tmpDir("bili-5874-p2-t24-");
+    // The suite-wide baseline preload pins BILI_STORAGE_UNIFIED=legacy for the
+    // legacy-corpus; this test asserts on the unified store's plane, so it
+    // pins its own mode (the preload's documented contract for mode-dependent
+    // suites) — unconditionally, because the baseline already set "legacy".
+    const prevMode = process.env.BILI_STORAGE_UNIFIED;
+    process.env.BILI_STORAGE_UNIFIED = "full";
     const store = new SessionStore({ enabled: true, dir, debounceMs: 1000 });
     _setStoreForTest(store);
     try {
@@ -822,6 +879,8 @@ test("T24 in-request flush: plane readable pre-egress, tail=0 for this round's r
         assert.equal(verdict3.ok, true);
         assert.notEqual(session.revisionEpoch, verdict.epoch, "epoch moved after the mutation");
     } finally {
+        if (prevMode === undefined) delete process.env.BILI_STORAGE_UNIFIED;
+        else process.env.BILI_STORAGE_UNIFIED = prevMode;
         _setStoreForTest(null as unknown as SessionStore);
         await store.closeQuietly();
     }
