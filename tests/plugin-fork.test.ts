@@ -20,6 +20,7 @@ import { recordToolWitness, resetToolRingForTest } from "../src/tool-ring.ts";
 import { contentStoreOf } from "../src/store.ts";
 import { closeServers } from "./server-close-guard.ts";
 import { openSqliteDatabase } from "../src/storage/driver.ts";
+import { chatBodyToCore, forkDurableIdentitiesOf, forkDurableIdentityHashOf, tryForkAdoption } from "../src/agent/fork-adopt.ts";
 
 process.env.NODE_ENV = "test";
 const testRoot = mkdtempSync(join(tmpdir(), "bili-fork-"));
@@ -277,7 +278,7 @@ test("HTTP exposes a versioned snapshot and forks an exact ordered prefix", { ti
     const h = await harness();
     try {
         const manifest = await h.request("/__bili/plugin/manifest");
-        assert.deepEqual(manifest.body.capabilities.fork, { protocolVersion: 2, acceptsProtocolVersions: [1, 2], endpoint: "/__bili/plugin/fork", snapshotEndpoint: "/__bili/plugin/snapshot" });
+        assert.deepEqual(manifest.body.capabilities.fork, { protocolVersion: 2, acceptsProtocolVersions: [1, 2], durableFork: true, endpoint: "/__bili/plugin/fork", snapshotEndpoint: "/__bili/plugin/snapshot" });
         const snapshot = await h.request("/__bili/plugin/snapshot?conversationId=parent");
         assert.equal(snapshot.status, 200, JSON.stringify({ response: snapshot.body, session: resolveConversation("parent").session }));
         assert.equal(snapshot.body.orderedMessages.length, 3);
@@ -633,6 +634,562 @@ async function compress(h: Awaited<ReturnType<typeof harness>>, conversationId =
     assert(!r.body.result.includes("FAILED"), r.body.result);
     return r;
 }
+
+function durableForkOf(messages: unknown[]) {
+    return { messages: forkDurableIdentitiesOf(chatBodyToCore({ messages })!).filter((m) => m.identityHash.length === 64) };
+}
+
+test("HTTP DSH seeded fork keeps prefix adoption when durable storage is unavailable", { timeout: 60_000 }, async () => {
+    const oldMode = process.env.BILI_STORAGE_UNIFIED;
+    process.env.BILI_STORAGE_UNIFIED = "legacy";
+    const h = await harness(true);
+    try {
+        await compress(h);
+        const snapshot = await h.request("/__bili/plugin/snapshot?conversationId=parent");
+        assert.equal(snapshot.status, 200, JSON.stringify(snapshot.body));
+        assert.equal(h.store.replicasAvailable(), false);
+        const result = await tryForkAdoption({ base: h.origin, parentConversationId: "parent", childConversationId: "legacy-seeded-child", body: { messages: h.messages }, allowOpaque: true, durableFork: true });
+        assert.equal(result.outcome, "adopted", JSON.stringify(result));
+        assert.equal((snapshot.body as SnapshotResponse & { durableFork?: boolean }).durableFork, false);
+        const child = resolveConversation("legacy-seeded-child").session!;
+        assert.equal(child.state.blocks.length, 1);
+        assert.equal((child.metadata.publicForkReceipt as { durableInput?: unknown }).durableInput, undefined);
+        await sendModel(h, child.id, [...h.messages, { role: "assistant", content: "legacy seeded continuation" }]);
+        const outbound = JSON.stringify(h.forwarded.at(-1)!.messages);
+        assert(outbound.includes(summary), outbound);
+        assert(!outbound.includes("second original"), outbound);
+    } finally {
+        h.store.cancelAll();
+        await h.close();
+        if (oldMode === undefined) delete process.env.BILI_STORAGE_UNIFIED;
+        else process.env.BILI_STORAGE_UNIFIED = oldMode;
+    }
+});
+
+test("HTTP DSH durable fork never inherits a block beyond a historical child boundary", { timeout: 60_000 }, async () => {
+    const oldMode = process.env.BILI_STORAGE_UNIFIED;
+    process.env.BILI_STORAGE_UNIFIED = "full";
+    const h = await harness(true);
+    try {
+        await compress(h);
+        const parent = resolveConversation("parent").session!;
+        parent.metadata.publicSnapshotRetained = true;
+        assert(h.store.flushSync(parent));
+        const snapshot = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;
+        const messages = [h.messages[0], { role: "user", content: "historical branch continuation" }];
+        const fork = await h.request("/__bili/plugin/fork", { ...forkRequest(snapshot, "historical-child", 1), protocolVersion: 2, durableFork: durableForkOf(messages) });
+        assert.equal(fork.status, 201, JSON.stringify(fork.body));
+        assert.deepEqual(fork.body.inheritedBlocks, [], "the other half of b1 is not in the child");
+        await sendModel(h, "historical-child", messages);
+        const outbound = JSON.stringify(h.forwarded.at(-1)!.messages);
+        assert(!outbound.includes(summary), outbound);
+        assert(!outbound.includes("second original"), outbound);
+    } finally {
+        h.store.cancelAll();
+        await h.close();
+        if (oldMode === undefined) delete process.env.BILI_STORAGE_UNIFIED;
+        else process.env.BILI_STORAGE_UNIFIED = oldMode;
+    }
+});
+
+test("HTTP DSH durable fork inherits compression blocks beyond a provider prefix", { timeout: 60_000 }, async () => {
+    const oldMode = process.env.BILI_STORAGE_UNIFIED;
+    process.env.BILI_STORAGE_UNIFIED = "full";
+    const h = await harness(true);
+    let reopened: SessionStore | undefined;
+    try {
+        await compress(h);
+        for (let i = 0; i < 100 && resolveConversation("parent").session!.state.blocks.length === 0; i++) await new Promise((r) => setTimeout(r, 20));
+        const parent = resolveConversation("parent").session!;
+        assert.equal(parent.state.blocks.length, 1);
+        parent.metadata.publicSnapshotRetained = true;
+        assert(h.store.flushSync(parent));
+        const snapshot = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;
+        const messages = [h.messages[0], { role: "user", content: "sidechat-only inserted message" }, ...h.messages.slice(1)];
+        const request = { ...forkRequest(snapshot, "durable-child", 1), protocolVersion: 2, durableFork: durableForkOf(messages) };
+        const fork = await h.request("/__bili/plugin/fork", request);
+        assert.equal(fork.status, 201, JSON.stringify(fork.body));
+        assert.equal(fork.body.inheritedBlocks.length, 1, JSON.stringify(fork.body));
+        const child = resolveConversation("durable-child").session!;
+        assert.equal(child.pluginSnapshot?.length, h.messages.length);
+        assert.equal(child.metadata.publicSnapshotTextComparable, false);
+        assert.deepEqual(child.state.blocks, parent.state.blocks);
+        assert.deepEqual(Object.keys(child.contentStore?.byRef ?? {}), Object.keys(parent.contentStore?.byRef ?? {}));
+        assert(h.store.flushSync(child));
+        const inheritedIds = new Set(parent.pluginSnapshot!.map((m) => m.id));
+        const childRows = h.store.unifiedMessageIdRows(child.id)!;
+        assert.deepEqual(childRows.filter((row) => inheritedIds.has(row.msgId)).map((row) => row.msgId), [...inheritedIds]);
+        assert(childRows.every((row) => inheritedIds.has(row.msgId) || row.msgId === "acp_summary_b1"));
+        const prepended = [{ role: "user", content: "sidechat instruction before inherited history" }, ...h.messages];
+        const zeroPrefix = await h.request("/__bili/plugin/fork", { ...forkRequest(snapshot, "zero-prefix-child", 0), protocolVersion: 2, durableFork: durableForkOf(prepended) });
+        assert.equal(zeroPrefix.status, 201, JSON.stringify(zeroPrefix.body));
+        assert.equal(zeroPrefix.body.inheritedBlocks.length, 1);
+        await sendModel(h, "zero-prefix-child", prepended);
+        const zeroOutbound = JSON.stringify(h.forwarded.at(-1)!.messages);
+        assert(zeroOutbound.includes(summary), zeroOutbound);
+        assert(zeroOutbound.includes("sidechat instruction before inherited history"), zeroOutbound);
+        assert(!zeroOutbound.includes("second original"), zeroOutbound);
+        h.store.cancelAll();
+        h.store.closeQuietly();
+        _resetSessionsForTest();
+        _resetPluginStateForTest();
+        reopened = new SessionStore({ dir: join(h.dir, "sessions"), enabled: true, debounceMs: 60_000 });
+        _setStoreForTest(reopened);
+        const restored = reopened.loadSync("durable-child")!;
+        assert(restored);
+        assert.equal(restored.state.blocks.length, 1);
+        const original = await h.request("/__bili/plugin/tool", { conversationId: "durable-child", tool: "decompress", args: { blockId: "b1", full: true } });
+        assert.match(original.body.result, /second original/);
+        await sendModel(h, "durable-child", [...messages, { role: "assistant", content: "durable child first continuation" }]);
+        const outbound = JSON.stringify(h.forwarded.at(-1)!.messages);
+        assert(outbound.includes(summary), outbound);
+        assert(outbound.includes("sidechat-only inserted message"), outbound);
+        assert(!outbound.includes("second original"), outbound);
+    } finally {
+        reopened?.cancelAll();
+        reopened?.closeQuietly();
+        h.store.cancelAll();
+        await h.close();
+        h.store.closeQuietly();
+        if (oldMode === undefined) delete process.env.BILI_STORAGE_UNIFIED;
+        else process.env.BILI_STORAGE_UNIFIED = oldMode;
+    }
+});
+
+test("HTTP DSH durable fork preserves a block when a model switch omits only reasoning", { timeout: 60_000 }, async () => {
+    const oldMode = process.env.BILI_STORAGE_UNIFIED;
+    process.env.BILI_STORAGE_UNIFIED = "full";
+    const h = await harness(true, false);
+    try {
+        const messages = [
+            h.messages[0],
+            { role: "assistant", content: [
+                { type: "thinking", thinking: "private reasoning ".repeat(200), signature: "signed-reasoning" },
+                { type: "text", text: "second original ".repeat(250) },
+            ] },
+            h.messages[2],
+        ];
+        await sendModel(h, "parent", messages);
+        await compress(h, "parent", "m00001", "m00003");
+        const parent = resolveConversation("parent").session!;
+        const reasoning = parent.pluginSnapshot!.find((m) => m.contentType === "reasoning")!;
+        assert(reasoning);
+        assert(parent.state.blocks[0]!.effectiveMessageIds.includes(reasoning.id));
+        parent.metadata.publicSnapshotRetained = true;
+        assert(h.store.flushSync(parent));
+        const snapshot = (await h.request("/__bili/plugin/snapshot?conversationId=parent&mode=raw")).body;
+        const replay = [messages[0], { role: "assistant", content: "second original ".repeat(250) }, messages[2]];
+        const fork = await h.request("/__bili/plugin/fork", { ...forkRequest(snapshot, "reasoning-child", 1), protocolVersion: 2, comparison: "raw", durableFork: durableForkOf(replay) });
+        assert.equal(fork.status, 201, JSON.stringify(fork.body));
+        assert.equal(fork.body.inheritedBlocks.length, 1, JSON.stringify(fork.body));
+        const child = resolveConversation("reasoning-child").session!;
+        assert(!child.pluginSnapshot!.some((m) => m.id === reasoning.id), "host-omitted reasoning must not be replayed");
+        assert.equal(child.state.messageRefs.byRaw[reasoning.id], parent.state.messageRefs.byRaw[reasoning.id]);
+        await sendModel(h, "reasoning-child", [...replay, { role: "assistant", content: "continue after model switch" }]);
+        const outbound = JSON.stringify(h.forwarded.at(-1)!.messages);
+        assert(outbound.includes(summary), outbound);
+        assert(!outbound.includes("second original"), outbound);
+        assert(!outbound.includes("private reasoning"), outbound);
+        const original = await h.request("/__bili/plugin/tool", { conversationId: "reasoning-child", tool: "decompress", args: { blockId: "b1", full: true } });
+        assert(!original.body.result.includes("FAILED"), original.body.result);
+        assert.match(child.blockContents.get("b1")!.full.text, /second original/);
+        assert.match(child.blockContents.get("b1")!.full.text, /private reasoning/);
+        const cut = [messages[0], { role: "user", content: "branch before the assistant response" }];
+        const historical = await h.request("/__bili/plugin/fork", { ...forkRequest(snapshot, "cut-reasoning-child", 1), protocolVersion: 2, comparison: "raw", durableFork: durableForkOf(cut) });
+        assert.equal(historical.status, 201, JSON.stringify(historical.body));
+        assert.deepEqual(historical.body.inheritedBlocks, [], "reasoning omission cannot authorize missing text beyond a historical boundary");
+        const broken = await h.request("/__bili/plugin/fork", { ...forkRequest(snapshot, "broken-reasoning-ref-child", 1), protocolVersion: 2, comparison: "raw", durableFork: durableForkOf(replay) });
+        assert.equal(broken.status, 201, JSON.stringify(broken.body));
+        assert.equal(broken.body.inheritedBlocks.length, 1);
+        const brokenChild = resolveConversation("broken-reasoning-ref-child").session!;
+        const reasoningRef = brokenChild.state.messageRefs.byRaw[reasoning.id]!;
+        delete brokenChild.state.messageRefs.byRef[reasoningRef];
+        assert(h.store.flushSync(brokenChild));
+        await sendModel(h, "broken-reasoning-ref-child", replay);
+        assert.equal(brokenChild.state.blocks.length, 0, "omitted reasoning still requires an intact bidirectional ref mapping");
+        assert(!JSON.stringify(h.forwarded.at(-1)!.messages).includes(summary));
+        assert(JSON.stringify(h.forwarded.at(-1)!.messages).includes("second original"));
+        assert.equal(h.store.loadSync(brokenChild.id)!.state.blocks.length, 0);
+    } finally {
+        h.store.cancelAll();
+        await h.close();
+        if (oldMode === undefined) delete process.env.BILI_STORAGE_UNIFIED;
+        else process.env.BILI_STORAGE_UNIFIED = oldMode;
+    }
+});
+
+test("HTTP DSH durable fork keeps reasoning omission and nested originals across later sends and cold reload", { timeout: 60_000 }, async () => {
+    const oldMode = process.env.BILI_STORAGE_UNIFIED;
+    process.env.BILI_STORAGE_UNIFIED = "full";
+    const h = await harness(true, false);
+    let reopened: SessionStore | undefined;
+    try {
+        const messages = [
+            h.messages[0],
+            { role: "assistant", content: [
+                { type: "thinking", thinking: "private nested reasoning ".repeat(150), signature: "original-signature" },
+                { type: "text", text: "second original ".repeat(250) },
+            ] },
+            { role: "user", content: "third original ".repeat(250) },
+            { role: "assistant", content: "fourth original ".repeat(250) },
+            h.messages[2],
+        ];
+        await sendModel(h, "parent", messages);
+        await compress(h, "parent", "m00001", "m00003");
+        await compress(h, "parent", "b1", "m00005");
+        const parent = resolveConversation("parent").session!;
+        const reasoning = parent.pluginSnapshot!.find((message) => message.contentType === "reasoning")!;
+        parent.metadata.publicSnapshotRetained = true;
+        assert(h.store.flushSync(parent));
+        const snapshot = (await h.request("/__bili/plugin/snapshot?conversationId=parent&mode=raw")).body;
+        const fork = await h.request("/__bili/plugin/fork", { ...forkRequest(snapshot, "later-reasoning-child", 1), protocolVersion: 2, comparison: "raw", durableFork: durableForkOf(messages) });
+        assert.equal(fork.status, 201, JSON.stringify(fork.body));
+        assert.deepEqual(fork.body.inheritedBlocks.map((block) => block.id), ["b1", "b2"]);
+        await sendModel(h, "later-reasoning-child", messages);
+        const replay = [messages[0], { role: "assistant", content: "second original ".repeat(250) }, ...messages.slice(2)];
+        await sendModel(h, "later-reasoning-child", [...replay, { role: "assistant", content: "later child continuation" }]);
+        const child = resolveConversation("later-reasoning-child").session!;
+        assert.equal(child.state.blocks.length, 2, "a model switch after the first request must keep both tiers");
+        assert(JSON.stringify(h.forwarded.at(-1)!.messages).includes(summary));
+        assert(!JSON.stringify(h.forwarded.at(-1)!.messages).includes("second original"));
+        assert(h.store.flushSync(child));
+        h.store.cancelAll();
+        h.store.closeQuietly();
+        _resetSessionsForTest();
+        _resetPluginStateForTest();
+        reopened = new SessionStore({ dir: join(h.dir, "sessions"), enabled: true, debounceMs: 60_000 });
+        _setStoreForTest(reopened);
+        const restored = reopened.loadSync(child.id)!;
+        assert.equal(restored.state.blocks.length, 2);
+        await sendModel(h, child.id, [...replay, { role: "assistant", content: "cold child continuation" }]);
+        const coldOutbound = JSON.stringify(h.forwarded.at(-1)!.messages);
+        assert(coldOutbound.includes(summary), coldOutbound);
+        assert(!coldOutbound.includes("second original"), coldOutbound);
+        const live = resolveConversation(child.id).session!;
+        assert.match(live.blockContents.get("b1")!.full.text, /private nested reasoning/);
+        const changed = structuredClone(messages);
+        changed[1] = { role: "assistant", content: [
+            { type: "thinking", thinking: "private nested reasoning ".repeat(150), signature: "changed-signature" },
+            { type: "text", text: "second original ".repeat(250) },
+        ] };
+        assert.equal(chatBodyToCore({ messages: changed })!.find((message) => message.contentType === "reasoning")!.id, reasoning.id);
+        await sendModel(h, child.id, changed);
+        assert.equal(live.state.blocks.length, 0, "changed reasoning invalidates its block and every consuming tier");
+        assert(!JSON.stringify(h.forwarded.at(-1)!.messages).includes(summary));
+        assert(JSON.stringify(h.forwarded.at(-1)!.messages).includes("second original"));
+        assert.equal(reopened.loadSync(child.id)!.state.blocks.length, 0);
+    } finally {
+        reopened?.cancelAll();
+        reopened?.closeQuietly();
+        h.store.cancelAll();
+        await h.close();
+        if (oldMode === undefined) delete process.env.BILI_STORAGE_UNIFIED;
+        else process.env.BILI_STORAGE_UNIFIED = oldMode;
+    }
+});
+
+test("HTTP DSH durable fork follows the parent snapshot order rather than first ingestion seq", { timeout: 60_000 }, async () => {
+    const oldMode = process.env.BILI_STORAGE_UNIFIED;
+    process.env.BILI_STORAGE_UNIFIED = "full";
+    const h = await harness(true);
+    try {
+        await compress(h);
+        const parent = resolveConversation("parent").session!;
+        parent.metadata.publicSnapshotRetained = true;
+        assert(h.store.flushSync(parent));
+        const ids = parent.pluginSnapshot!.map((m) => m.id);
+        const db = openSqliteDatabase(join(h.dir, "sessions", "index.db"));
+        try {
+            const rows = db.db.prepare("SELECT seq, msg_id FROM messages WHERE session_id = ? ORDER BY seq").all(parent.id) as { seq: number; msg_id: string }[];
+            const first = rows.find((row) => row.msg_id === ids[0])!.seq;
+            const second = rows.find((row) => row.msg_id === ids[1])!.seq;
+            const temporary = Math.max(...rows.map((row) => row.seq)) + 1;
+            const move = db.db.prepare("UPDATE messages SET seq = ? WHERE session_id = ? AND seq = ?");
+            move.run(temporary, parent.id, first);
+            move.run(first, parent.id, second);
+            move.run(second, parent.id, temporary);
+        } finally { db.db.close(); }
+        assert(h.store.flushSync(parent));
+        assert.notDeepEqual(h.store.unifiedMessageIdRows(parent.id)!.filter((row) => ids.includes(row.msgId)).map((row) => row.msgId), ids);
+        const snapshot = (await h.request("/__bili/plugin/snapshot?conversationId=parent&mode=raw")).body;
+        const good = await h.request("/__bili/plugin/fork", { ...forkRequest(snapshot, "snapshot-order-child", 1), protocolVersion: 2, comparison: "raw", durableFork: durableForkOf(h.messages) });
+        assert.equal(good.status, 201, JSON.stringify(good.body));
+        assert.deepEqual(good.body.inheritedBlocks.map((block) => block.id), ["b1"]);
+        await sendModel(h, "snapshot-order-child", h.messages);
+        assert(JSON.stringify(h.forwarded.at(-1)!.messages).includes(summary));
+        const reordered = [h.messages[1], h.messages[0], h.messages[2]];
+        const bad = await h.request("/__bili/plugin/fork", { ...forkRequest(snapshot, "reordered-durable-child", 0), protocolVersion: 2, comparison: "raw", durableFork: durableForkOf(reordered) });
+        assert.equal(bad.status, 201, JSON.stringify(bad.body));
+        assert.deepEqual(bad.body.inheritedBlocks, [], "real child reordering must not be accepted as an ingestion-order difference");
+        await sendModel(h, "reordered-durable-child", reordered);
+        const outbound = JSON.stringify(h.forwarded.at(-1)!.messages);
+        assert(!outbound.includes(summary), outbound);
+        assert(outbound.includes("second original"), outbound);
+    } finally {
+        h.store.cancelAll();
+        await h.close();
+        if (oldMode === undefined) delete process.env.BILI_STORAGE_UNIFIED;
+        else process.env.BILI_STORAGE_UNIFIED = oldMode;
+    }
+});
+
+test("HTTP DSH durable fork excludes changed opaque file payloads under the same raw id", { timeout: 60_000 }, async () => {
+    const oldMode = process.env.BILI_STORAGE_UNIFIED;
+    process.env.BILI_STORAGE_UNIFIED = "full";
+    const h = await harness(true, false);
+    try {
+        const messages = [
+            { role: "user", content: [{ type: "text", text: "inspect file ".repeat(250) }, { type: "file", file_id: "file-A" }] },
+            h.messages[1], h.messages[2],
+        ];
+        await sendChatModel(h, "parent", messages);
+        await compress(h);
+        const parent = resolveConversation("parent").session!;
+        parent.metadata.publicSnapshotRetained = true;
+        assert(h.store.flushSync(parent));
+        const snapshot = (await h.request("/__bili/plugin/snapshot?conversationId=parent&mode=raw")).body;
+        const changed = [{ role: "user", content: [{ type: "text", text: "inspect file ".repeat(250) }, { type: "file", file_id: "file-B" }] }, ...messages.slice(1)];
+        assert.equal(durableForkOf(messages).messages[0]!.rawId, durableForkOf(changed).messages[0]!.rawId);
+        const fork = await h.request("/__bili/plugin/fork", { ...forkRequest(snapshot, "file-child", 1), protocolVersion: 2, comparison: "raw", durableFork: durableForkOf(changed) });
+        assert.equal(fork.status, 201, JSON.stringify(fork.body));
+        assert.deepEqual(fork.body.inheritedBlocks, []);
+        assert(!JSON.stringify(resolveConversation("file-child").session!.pluginSnapshot).includes("file-A"));
+        await sendChatModel(h, "file-child", changed);
+        const outbound = JSON.stringify(h.forwarded.at(-1)!.messages);
+        assert(outbound.includes("file-B"), outbound);
+        assert(!outbound.includes("file-A"), outbound);
+        assert(!outbound.includes(summary), outbound);
+    } finally {
+        h.store.cancelAll();
+        await h.close();
+        if (oldMode === undefined) delete process.env.BILI_STORAGE_UNIFIED;
+        else process.env.BILI_STORAGE_UNIFIED = oldMode;
+    }
+});
+
+test("HTTP DSH durable fork rejects ambiguous success/error generations of one tool result", { timeout: 60_000 }, async () => {
+    const oldMode = process.env.BILI_STORAGE_UNIFIED;
+    process.env.BILI_STORAGE_UNIFIED = "full";
+    const h = await harness(true, false);
+    try {
+        const messages = [
+            h.messages[0],
+            { role: "assistant", content: [{ type: "tool_use", id: "build-call", name: "bash", input: { command: "npm test" } }] },
+            { role: "user", content: [{ type: "tool_result", tool_use_id: "build-call", content: "build output ".repeat(250), is_error: false }] },
+            { role: "assistant", content: "build checked" },
+        ];
+        await sendModel(h, "parent", messages);
+        await compress(h, "parent", "m00001", "m00003");
+        const parent = resolveConversation("parent").session!;
+        parent.metadata.publicSnapshotRetained = true;
+        assert(h.store.flushSync(parent));
+        const failed = structuredClone(messages);
+        failed[2] = { role: "user", content: [{ type: "tool_result", tool_use_id: "build-call", content: "build output ".repeat(250), is_error: true }] };
+        const failedCore = chatBodyToCore({ messages: failed })!;
+        const originalCore = chatBodyToCore({ messages })!;
+        assert.equal(failedCore[2]!.id, originalCore[2]!.id);
+        assert.notEqual(forkDurableIdentityHashOf(failedCore[2]!), forkDurableIdentityHashOf(originalCore[2]!));
+        parent.pluginSnapshot = structuredClone(failedCore);
+        parent.lastMessages = structuredClone(failedCore);
+        markDirty(parent);
+        assert(h.store.flushSync(parent));
+        const snapshot = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;
+        for (const [childId, body] of [["failed-child", failed], ["historical-success-child", messages]] as const) {
+            const fork = await h.request("/__bili/plugin/fork", { ...forkRequest(snapshot, childId, 1), protocolVersion: 2, durableFork: durableForkOf(body) });
+            assert.equal(fork.status, 201, JSON.stringify(fork.body));
+            assert.deepEqual(fork.body.inheritedBlocks, []);
+            assert(!resolveConversation(childId).session!.pluginSnapshot!.some((m) => m.id === failedCore[2]!.id));
+            await sendModel(h, childId, body);
+            const outbound = JSON.stringify(h.forwarded.at(-1)!.messages);
+            assert(!outbound.includes(summary), outbound);
+            assert(outbound.includes("build output"), outbound);
+        }
+    } finally {
+        h.store.cancelAll();
+        await h.close();
+        if (oldMode === undefined) delete process.env.BILI_STORAGE_UNIFIED;
+        else process.env.BILI_STORAGE_UNIFIED = oldMode;
+    }
+});
+
+test("HTTP DSH durable fork does not hide a file changed after fork publication", { timeout: 60_000 }, async () => {
+    const oldMode = process.env.BILI_STORAGE_UNIFIED;
+    process.env.BILI_STORAGE_UNIFIED = "full";
+    const h = await harness(true, false);
+    try {
+        const messages = [
+            h.messages[0],
+            { role: "user", content: [{ type: "text", text: "inspect file ".repeat(250) }, { type: "file", file_id: "file-A" }] },
+            h.messages[2],
+        ];
+        await sendChatModel(h, "parent", messages);
+        await compress(h);
+        const parent = resolveConversation("parent").session!;
+        parent.metadata.publicSnapshotRetained = true;
+        assert(h.store.flushSync(parent));
+        const snapshot = (await h.request("/__bili/plugin/snapshot?conversationId=parent&mode=raw")).body;
+        const fork = await h.request("/__bili/plugin/fork", { ...forkRequest(snapshot, "changed-file-child", 1), protocolVersion: 2, comparison: "raw", durableFork: durableForkOf(messages) });
+        assert.equal(fork.status, 201, JSON.stringify(fork.body));
+        assert.equal(fork.body.inheritedBlocks.length, 1);
+        const changed = [messages[0], { role: "user", content: [{ type: "text", text: "inspect file ".repeat(250) }, { type: "file", file_id: "file-B" }] }, messages[2]];
+        await sendChatModel(h, "changed-file-child", changed);
+        const outbound = JSON.stringify(h.forwarded.at(-1)!.messages);
+        assert(outbound.includes("file-B"), outbound);
+        assert(!outbound.includes("file-A"), outbound);
+        assert(!outbound.includes(summary), outbound);
+    } finally {
+        h.store.cancelAll();
+        await h.close();
+        if (oldMode === undefined) delete process.env.BILI_STORAGE_UNIFIED;
+        else process.env.BILI_STORAGE_UNIFIED = oldMode;
+    }
+});
+
+test("HTTP DSH durable fork accepts whole-pair renaming but not swapped parallel results", { timeout: 60_000 }, async () => {
+    const oldMode = process.env.BILI_STORAGE_UNIFIED;
+    process.env.BILI_STORAGE_UNIFIED = "full";
+    const h = await harness(true, false);
+    try {
+        const messages = [
+            h.messages[0],
+            { role: "assistant", tool_calls: [
+                { id: "call-A", type: "function", function: { name: "read", arguments: '{"path":"A"}' } },
+                { id: "call-B", type: "function", function: { name: "read", arguments: '{"path":"B"}' } },
+            ] },
+            { role: "tool", tool_call_id: "call-A", content: "result X ".repeat(250) },
+            { role: "tool", tool_call_id: "call-B", content: "result Y ".repeat(250) },
+            h.messages[2],
+        ];
+        await sendChatModel(h, "parent", messages);
+        await compress(h, "parent", "m00001", "m00005");
+        const parent = resolveConversation("parent").session!;
+        parent.metadata.publicSnapshotRetained = true;
+        assert(h.store.flushSync(parent));
+        const snapshot = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;
+        const renamed = structuredClone(messages);
+        renamed[1] = { role: "assistant", tool_calls: [
+            { id: "new-A", type: "function", function: { name: "read", arguments: '{"path":"A"}' } },
+            { id: "new-B", type: "function", function: { name: "read", arguments: '{"path":"B"}' } },
+        ] };
+        renamed[2] = { role: "tool", tool_call_id: "new-A", content: "result X ".repeat(250) };
+        renamed[3] = { role: "tool", tool_call_id: "new-B", content: "result Y ".repeat(250) };
+        const swapped = structuredClone(messages);
+        swapped[2] = { role: "tool", tool_call_id: "call-B", content: "result X ".repeat(250) };
+        swapped[3] = { role: "tool", tool_call_id: "call-A", content: "result Y ".repeat(250) };
+        assert.deepEqual(durableForkOf(messages).messages.map((m) => m.rawId), durableForkOf(swapped).messages.map((m) => m.rawId));
+        const good = await h.request("/__bili/plugin/fork", { ...forkRequest(snapshot, "renamed-child", 1), protocolVersion: 2, durableFork: durableForkOf(renamed) });
+        assert.equal(good.status, 201, JSON.stringify(good.body));
+        assert.equal(good.body.inheritedBlocks.length, 1);
+        await sendChatModel(h, "renamed-child", renamed);
+        assert(JSON.stringify(h.forwarded.at(-1)!.messages).includes(summary));
+        const bad = await h.request("/__bili/plugin/fork", { ...forkRequest(snapshot, "swapped-child", 1), protocolVersion: 2, durableFork: durableForkOf(swapped) });
+        assert.equal(bad.status, 201, JSON.stringify(bad.body));
+        assert.deepEqual(bad.body.inheritedBlocks, [], "result ownership changed despite unchanged raw ids");
+        await sendChatModel(h, "swapped-child", swapped);
+        assert(!JSON.stringify(h.forwarded.at(-1)!.messages).includes(summary));
+    } finally {
+        h.store.cancelAll();
+        await h.close();
+        if (oldMode === undefined) delete process.env.BILI_STORAGE_UNIFIED;
+        else process.env.BILI_STORAGE_UNIFIED = oldMode;
+    }
+});
+
+test("HTTP DSH durable fork preserves whole-pair wire ID reuse across archived generations", { timeout: 60_000 }, async () => {
+    const oldMode = process.env.BILI_STORAGE_UNIFIED;
+    process.env.BILI_STORAGE_UNIFIED = "full";
+    const h = await harness(true, false);
+    try {
+        const generation = (a: string, b: string) => [
+            h.messages[0],
+            { role: "assistant", tool_calls: [
+                { id: a, type: "function", function: { name: "read", arguments: '{"path":"A"}' } },
+                { id: b, type: "function", function: { name: "read", arguments: '{"path":"B"}' } },
+            ] },
+            { role: "tool", tool_call_id: a, content: "result X ".repeat(250) },
+            { role: "tool", tool_call_id: b, content: "result Y ".repeat(250) },
+            h.messages[2],
+        ];
+        const original = generation("call-A", "call-B");
+        await sendChatModel(h, "parent", original);
+        await compress(h, "parent", "m00001", "m00005");
+        const parent = resolveConversation("parent").session!;
+        parent.metadata.publicSnapshotRetained = true;
+        assert(h.store.flushSync(parent));
+        const renamed = generation("call-B", "call-A");
+        const renamedCore = chatBodyToCore({ messages: renamed })!;
+        assert.deepEqual(durableForkOf(renamed), durableForkOf(original), "wire ID reuse keeps each result attached to the same durable call");
+        parent.pluginSnapshot = structuredClone(renamedCore);
+        parent.lastMessages = structuredClone(renamedCore);
+        parent.lastMessagesFolded = false;
+        markDirty(parent);
+        assert(h.store.flushSync(parent));
+        const archived = (await h.store.forkMessageRowsAsync(parent.id))!.map((row) => JSON.parse(row.content) as { id: string; toolCallId?: string });
+        for (const tool of renamedCore.filter((m) => m.contentType === "tool-call" || m.contentType === "tool-result")) {
+            assert.deepEqual(new Set(archived.filter((m) => m.id === tool.id).map((m) => m.toolCallId)), new Set(["call-A", "call-B"]), "both complete wire generations must be archived");
+        }
+        const snapshot = (await h.request("/__bili/plugin/snapshot?conversationId=parent&mode=raw")).body;
+        const good = await h.request("/__bili/plugin/fork", { ...forkRequest(snapshot, "reused-generation-child", 1), protocolVersion: 2, comparison: "raw", durableFork: durableForkOf(renamed) });
+        assert.equal(good.status, 201, JSON.stringify(good.body));
+        assert.deepEqual(good.body.inheritedBlocks.map((b) => b.id), ["b1"]);
+        await sendChatModel(h, "reused-generation-child", renamed);
+        const folded = JSON.stringify(h.forwarded.at(-1)!.messages);
+        assert(folded.includes(summary), folded);
+        assert(!folded.includes("result X"), folded);
+        assert(!folded.includes("result Y"), folded);
+        const swapped = structuredClone(renamed);
+        swapped[2] = { role: "tool", tool_call_id: "call-A", content: "result X ".repeat(250) };
+        swapped[3] = { role: "tool", tool_call_id: "call-B", content: "result Y ".repeat(250) };
+        assert.deepEqual(durableForkOf(swapped).messages.map((m) => m.rawId), durableForkOf(renamed).messages.map((m) => m.rawId));
+        const bad = await h.request("/__bili/plugin/fork", { ...forkRequest(snapshot, "reused-swapped-child", 1), protocolVersion: 2, comparison: "raw", durableFork: durableForkOf(swapped) });
+        assert.equal(bad.status, 201, JSON.stringify(bad.body));
+        assert.deepEqual(bad.body.inheritedBlocks, [], "result ownership changes must remain rejected after wire ID reuse");
+        await sendChatModel(h, "reused-swapped-child", swapped);
+        const unfolded = JSON.stringify(h.forwarded.at(-1)!.messages);
+        assert(!unfolded.includes(summary), unfolded);
+        assert(unfolded.includes("result X"), unfolded);
+        assert(unfolded.includes("result Y"), unfolded);
+    } finally {
+        h.store.cancelAll();
+        await h.close();
+        if (oldMode === undefined) delete process.env.BILI_STORAGE_UNIFIED;
+        else process.env.BILI_STORAGE_UNIFIED = oldMode;
+    }
+});
+
+test("HTTP DSH durable fork fails closed on unresolved retired media", { timeout: 60_000 }, async (t) => {
+    const oldMode = process.env.BILI_STORAGE_UNIFIED;
+    process.env.BILI_STORAGE_UNIFIED = "full";
+    const h = await harness(true);
+    try {
+        const parent = resolveConversation("parent").session!;
+        parent.metadata.publicSnapshotRetained = true;
+        assert(h.store.flushSync(parent));
+        const target = parent.pluginSnapshot![1]!;
+        parent.pluginSnapshot = parent.pluginSnapshot!.filter((m) => m.id !== target.id);
+        markDirty(parent);
+        const rows = (await h.store.forkMessageRowsAsync(parent.id))!;
+        const snapshot = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;
+        for (const extra of [{ imageBase64: { $media: "a".repeat(64) } }, { rawResponsesItem: { type: "message", content: [{ type: "input_image", image_url: `data:image/png;base64,{$media:${"a".repeat(64)}}` }] } }]) {
+            const missing = JSON.parse(JSON.stringify({ ...target, ...extra })) as typeof target;
+            const mockedRows = rows.map((row) => row.msgId === target.id ? { ...row, content: JSON.stringify(missing) } : row);
+            const fault = t.mock.method(h.store, "forkMessageRowsAsync", async () => mockedRows);
+            try {
+                const evidence: { messages: { rawId: string; identityHash: string }[] } = { messages: [parent.pluginSnapshot![0]!, missing].map((m) => ({ rawId: m.id, identityHash: forkDurableIdentityHashOf(m) })) };
+                const fork: Awaited<ReturnType<typeof h.request>> = await h.request("/__bili/plugin/fork", { ...forkRequest(snapshot, "media-child", 1), protocolVersion: 2, durableFork: evidence });
+                assert.equal(fork.status, 409, JSON.stringify(fork.body));
+                assert.equal(fork.body.code, "DURABLE_FORK_UNAVAILABLE");
+                assert.equal(resolveConversation("media-child").session, undefined);
+                assert.equal(h.store.loadSync("media-child"), null);
+            } finally { fault.mock.restore(); }
+        }
+    } finally {
+        h.store.cancelAll();
+        await h.close();
+        if (oldMode === undefined) delete process.env.BILI_STORAGE_UNIFIED;
+        else process.env.BILI_STORAGE_UNIFIED = oldMode;
+    }
+});
 
 test("HTTP compressed originals are isolated across parent and siblings and straddlers are excluded", { timeout: 60_000 }, async () => {
     const h = await harness();
@@ -1180,6 +1737,11 @@ test("HTTP missing nested originals and CCR payloads fail closed without publish
         assert.equal((await h.request("/__bili/plugin/fork", forkRequest(snapshot))).body.status, "unavailable");
     } finally { await h.close(); }
 });
+
+async function sendChatModel(h: Awaited<ReturnType<typeof harness>>, conversationId: string, messages: unknown[]) {
+    const response = await fetch(`${h.origin}/bili/${h.upstreamUrl}/v1/chat/completions`, { method: "POST", headers: { "content-type": "application/json", "x-bili-plugin": "test", "x-bili-plugin-conversation": conversationId }, body: JSON.stringify({ model: "claude-test", max_tokens: 1024, stream: false, messages }) });
+    assert.equal(response.status, 200, await response.text());
+}
 
 async function sendModel(h: Awaited<ReturnType<typeof harness>>, conversationId: string, messages: unknown[]) {
     const response = await fetch(`${h.origin}/bili/${h.upstreamUrl}/v1/messages`, { method: "POST", headers: { "content-type": "application/json", "x-bili-plugin": "test", "x-bili-plugin-conversation": conversationId }, body: JSON.stringify({ model: "claude-test", max_tokens: 1024, stream: false, messages }) });

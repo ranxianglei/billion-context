@@ -1518,13 +1518,13 @@ const publishingForks = new Set<string>();
 
 // #4942: async — the existence probe must reach the DB on network storage
 // backends, or a fork could silently clobber a DB-only child row.
-export async function publishForkSession(session: Session, parentId: string): Promise<void> {
+export async function publishForkSession(session: Session, parentId: string, throughSeq?: number): Promise<void> {
     if (publishingForks.has(session.id)) throw new Error("child fork publication in progress");
     if (sessions.has(session.id) || (await getStore().loadAsync(session.id))) throw new Error("child session already exists");
     publishingForks.add(session.id);
     try {
         makeResidentRoom(sessionWeight(session));
-        await getStore().persistForkSession(parentId, session);
+        await getStore().persistForkSession(parentId, session, throughSeq);
         session.persisted = getStore().enabled;
         sessions.set(session.id, session);
     } finally {

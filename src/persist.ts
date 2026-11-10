@@ -3828,12 +3828,18 @@ export class SessionStore {
         return ok;
     }
 
-    async persistForkSession(parentId: string, session: Session): Promise<void> {
+    async forkMessageRowsAsync(sessionId: string): Promise<{ seq: number; msgId: string; content: string }[] | null> {
+        await this.ready();
+        if (!this.shadow || this.shadow.stats.disabled) return null;
+        return this.shadow.forkMessageRowsAsync(sessionId);
+    }
+
+    async persistForkSession(parentId: string, session: Session, throughSeq?: number): Promise<void> {
         await this.ready();
         const record = buildRecord(session, this.liveStorageStamp);
         // No child ingest may precede this transaction: its first identities
         // must inherit the parent's absolute ledger, including retired slots.
-        const cloned = await this.shadow?.createForkAsync(parentId, toLegacyLike(session)) ?? false;
+        const cloned = await this.shadow?.createForkAsync(parentId, toLegacyLike(session), throughSeq) ?? false;
         if (!cloned) {
             if (!this.flushSync(session)) throw new Error("fork persistence failed");
             return;

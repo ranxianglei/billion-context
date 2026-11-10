@@ -1356,10 +1356,8 @@ function forkSourceOf(header: NonNullable<AgentLike["session"]>["header"]): { se
 }
 
 function forkParentSessionOf(header: NonNullable<AgentLike["session"]>["header"]): string | undefined {
-    const source = header?.forkSource;
-    if (source !== null && typeof source === "object" && typeof source.sessionId === "string" && source.sessionId.length > 0) {
-        return source.sessionId;
-    }
+    const source = forkSourceOf(header);
+    if (source !== undefined) return source.sessionId;
     const parent = header?.parentSession;
     return typeof parent === "string" && parent.length > 0 ? parent : undefined;
 }
@@ -1630,7 +1628,7 @@ async function maybeForkAdoptBeforeSend(ctx: PluginContext, init: RequestInit | 
             `bili-native-dsh: fork adoption for ${child.sid} skipped at the proxy-base gate — the proxy origin is not known yet, so the fork protocol cannot be reached (#4215)`);
         return;
     }
-    await dshForkAdopter.maybeAdopt({ base, parent: child.parent, child: child.sid, body, allowOpaque: child.forkSource !== undefined });
+    await dshForkAdopter.maybeAdopt({ base, parent: child.parent, child: child.sid, body, allowOpaque: true, durableFork: true });
 }
 
 // #1677: session id of the command's invoking agent (host-passed invocation); malformed
