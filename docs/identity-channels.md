@@ -82,7 +82,7 @@ construction).
   request, on LOOPBACK only. Remote-sourced requests can never harvest.
 - Each adapter validates its own layout assumptions inside its snapshot;
   shared discipline lives in the core (count parity vs `expectedLen`,
-  boundary role spot-check up to 4 positions where both sides expose roles,
+  full role-sequence check over every position where both sides expose a role,
   canonical msgid validation, per-source warn-once degradation).
 - **Sidechain content verification (claude-code, #6011):** once a session file
   contains sidechain rows, id admission demands a full-tail content fingerprint
