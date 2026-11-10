@@ -17,7 +17,7 @@
 // sends no such bytes to the proxy, so those belong to the agent's in-process
 // recovery (cf. billion-context-pi#594), not here.
 
-import { existsSync, mkdirSync, readdirSync, rmdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, readdirSync, rmdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
 import {
@@ -438,7 +438,8 @@ export function writeRestoredImage(ref: string, idx: number, img: RestorableImag
     const digest = createHash("sha256").update(body).digest("hex").slice(0, 8);
     const path = join(dir, `${safeRef}${idx > 0 ? `-${idx}` : ""}-${digest}.${extFor(img.mediaType)}`);
     try {
-        if (existsSync(path)) return path;
+        const existing = statSync(path, { throwIfNoEntry: false });
+        if (existing?.isFile() && existing.size === body.length) return path;
         mkdirSync(dir, { recursive: true });
         writeFileSync(path, body, { mode: 0o600 });
         return path;
