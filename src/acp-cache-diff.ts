@@ -6,6 +6,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { DUMP_PLAINTEXT_BANNER } from "./dump-banner.js";
 import { defaultLogFile } from "./paths.js";
+import { logGenerations } from "./log-retention.js";
+import { readLogLines } from "./log-file-lines.js";
 import { safeSessionId } from "./server/headers.js";
 
 type PairCategory = "pure-append" | "mid-stream-rewrite" | "prefix-stable-miss";
@@ -398,11 +400,14 @@ export interface UsageSample { ts: number; input: number; cached: number; }
 
 const USAGE_LINE_RE = /^(\d{4}-\d{2}-\d{2}T[\d:.]+(?:Z|[+-]\d{2}:\d{2})?) \[[a-z]+\] \[([^\]]+)\] (?:\[plugin\] )?\[acp-usage\](?: round \d+)? input=(\d+) cached=(\d+)/;
 
-export function parseUsageLog(file: string): Map<string, UsageSample[]> {
+export async function parseUsageLog(file: string): Promise<Map<string, UsageSample[]>> {
     const bySession = new Map<string, UsageSample[]>();
-    let text: string;
-    try { text = fs.readFileSync(file, "utf8"); } catch { return bySession; }
-    for (const line of text.split("\n")) {
+    // Streamed: a retained generation is up to the byte budget, and the diff
+    // only needs the [acp-usage] lines out of it. Nothing per-line beyond the
+    // parsed samples survives the pass. An unreadable file THROWS: reporting
+    // zero samples for a log we could not open would be a false answer.
+    let readError: NodeJS.ErrnoException | undefined;
+    for await (const line of readLogLines([file], { onError: (_f, e) => { readError ??= e; } })) {
         const m = USAGE_LINE_RE.exec(line);
         if (!m) continue;
         const ts = Date.parse(m[1]!);
@@ -412,6 +417,7 @@ export function parseUsageLog(file: string): Map<string, UsageSample[]> {
         list.push({ ts, input: Number(m[3]), cached: Number(m[4]) });
         bySession.set(sid, list);
     }
+    if (readError) throw readError;
     for (const list of bySession.values()) list.sort((a, b) => a.ts - b.ts);
     return bySession;
 }
@@ -514,7 +520,7 @@ interface DiffOptions {
     session?: string;
 }
 
-export function runDiff(root: string, opts: DiffOptions = {}): DiffReport {
+export async function runDiff(root: string, opts: DiffOptions = {}): Promise<DiffReport> {
     const rootResolved = path.resolve(root);
     let st: fs.Stats;
     try { st = fs.statSync(rootResolved); } catch (error) { throw new Error(`cannot access ${root}: ${error instanceof Error ? error.message : String(error)}`); }
@@ -539,11 +545,35 @@ export function runDiff(root: string, opts: DiffOptions = {}): DiffReport {
     let logSource: string | null = null;
     let usageBySession = new Map<string, UsageSample[]>();
     if (!opts.noLog) {
-        const candidates = opts.logFile ? [path.resolve(opts.logFile)] : [path.join(rootResolved, "bili.log"), defaultLogFile()];
-        for (const c of candidates) {
-            try {
-                if (fs.statSync(c).isFile()) { logSource = c; usageBySession = parseUsageLog(c); break; }
-            } catch { /* try next candidate */ }
+        if (opts.logFile) {
+            // Explicit --log keeps its documented single-file semantics.
+            const c = path.resolve(opts.logFile);
+            try { if (fs.statSync(c).isFile()) { logSource = c; usageBySession = await parseUsageLog(c); } } catch { /* no log */ }
+        } else {
+            // Default: the shared generation enumeration — one root-level log
+            // (legacy layout) followed by the state-dir history, sealed
+            // generations oldest-first and the active file last, so the merged
+            // per-session sample lists stay in timestamp order.
+            const files: string[] = [];
+            const rootLog = path.join(rootResolved, "bili.log");
+            try { if (fs.statSync(rootLog).isFile()) files.push(rootLog); } catch { /* absent */ }
+            for (const g of logGenerations(defaultLogFile())) files.push(g.path);
+            // The reported source is the newest file that actually contributed
+            // samples, so a root-level-only layout still names its own bili.log.
+            let source: string | null = null;
+            for (const f of files) {
+                let parsed: Map<string, UsageSample[]>;
+                try { parsed = await parseUsageLog(f); } catch { continue; } // rotated away mid-run
+                if (parsed.size === 0) continue;
+                source = f;
+                for (const [sid, samples] of parsed) {
+                    const list = usageBySession.get(sid) ?? [];
+                    list.push(...samples);
+                    usageBySession.set(sid, list);
+                }
+            }
+            logSource = source;
+            for (const list of usageBySession.values()) list.sort((a, b) => a.ts - b.ts);
         }
     }
     const usageSamples = [...usageBySession.values()].reduce((n, l) => n + l.length, 0);

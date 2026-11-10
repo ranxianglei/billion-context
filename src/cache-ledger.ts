@@ -442,6 +442,11 @@ export interface SeamSlot {
      *  fingerprint of the parsed outbound body that carried this request out.
      *  Preserved across byte-identical re-notes like keyFp. */
     effFp?: string;
+    /** #564/#2627: exit-core indexes of THIS body that bili proved are its own
+     *  ordering separators, as the invariant judge returned them at send. The
+     *  next loop round's continuity verdict reads them as entry-side ownership.
+     *  Preserved across byte-identical re-notes like keyFp. */
+    ownedSeparatorCores?: ReadonlySet<number>;
 }
 
 // #3023: message-count ceiling for the inbound pair. The per-message
@@ -758,6 +763,7 @@ export function noteForwardedBody(session: Session, body: string, msgs?: number 
         full: buf.byteLength <= BODY_FULL_CAP ? buf : samePayload ? prior.full : null,
         keyFp: keyFp ?? (samePayload ? prior.keyFp : undefined),
         effFp: effFp ?? (samePayload ? prior.effFp : undefined),
+        ownedSeparatorCores: samePayload ? prior.ownedSeparatorCores : undefined,
     };
     if ("round" in transient && transient.round > 1) {
         delete transient.imageFacts;

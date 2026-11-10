@@ -820,8 +820,12 @@ export class MysqlBackend implements StorageBackend {
                 [s.sessionId],
             )) as unknown as StoredBlockRow[][];
             for (const row of storedBlockRows[0]) storedBlocks.set(str(row.block_id), row);
+            // #5898 review (P3, mirror of store.ts): O(1) membership set
+            // instead of a per-stored-block Array.some over the incoming
+            // blocks (O(stored×incoming) on the record() hot path).
+            const incomingBlockIds = new Set(input.blocks.map((b) => b.blockId));
             for (const [blockId, stale] of storedBlocks) {
-                if (input.blocks.some((b) => b.blockId === blockId)) continue;
+                if (incomingBlockIds.has(blockId)) continue;
                 // referencing row first, then release (#4242 delete-on-zero)
                 await c.query("DELETE FROM blocks WHERE session_id = ? AND block_id = ?", [s.sessionId, blockId]);
                 await this.releaseContent(c, str(stale.summary_hash));

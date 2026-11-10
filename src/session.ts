@@ -4,15 +4,16 @@ import { log as loggerLog } from "./logger.js";
 import { getStore, effectiveFileStorageMode } from "./persist.js";
 import { VERSION } from "./version.js";
 import { maxSessions as knobMaxSessions, sessionWarmMax, sessionWarmMaxBytes, sessionResidentMaxBytes } from "./knobs.js";
-import { configFileEpoch, loadConfigFile } from "./config.js";
+import { configFileEpoch, loadConfigFile, loadNamedProviders } from "./config.js";
 import { applyCompressSettings, hasCompressSettings, resolveContextLimitValue } from "./compress-settings.js";
+import { agentProviderRecipes } from "./agent-providers.js";
 import { durableMessageToolPaths, withDurableProtection } from "./durable-message-guards.js";
 import type { AnonymousProvenance } from "./anon-provenance.js";
 import type { WireProtocol } from "./util.js";
 import type { InboundSlot, SeamSlot } from "./cache-ledger.js";
 import { isResponsesTurnSeparatorId } from "./turn-separator.js";
 import type { FoldReconcileResult } from "./fold-reconcile.js";
-import type { UnpromptedGate } from "./unprompted-gate.js";
+import type { UnpromptedGateState } from "./unprompted-gate.js";
 
 export type BlockView = { text: string; count: number };
 
@@ -337,12 +338,30 @@ export type Session = {
          *  In-memory only: the abort→resume causality spans one process
          *  lifetime, and a restart replants nothing. */
         abortReanchor?: { anchor: number; at: number };
-        /** #5683: the conversation's latest model-round compression-prompt facts
-         *  for the unprompted/out-of-bounds gates (src/unprompted-gate.ts).
-         *  Re-stamped on every prepare; in-memory only — a restart reads the
-         *  all-off default until the first round re-stamps, which is safe: no
-         *  tool call can reach applyRanges before its own round's prepare. */
-        unpromptedGate?: UnpromptedGate;
+        /** #5683/#5943: the conversation's live nudge CREDIT plus the policy
+         *  flags, for the unprompted/out-of-bounds gates (src/unprompted-gate.ts).
+         *  Re-stamped on every prepare (injected rounds re-mint the window,
+         *  un-nudged model rounds decay it); in-memory only — a restart lapses
+         *  any live credit to the all-off default until the first round
+         *  re-stamps, which is safe: no tool call can reach applyRanges before
+         *  its own round's prepare. */
+        unpromptedGate?: UnpromptedGateState;
+        /** #5981: the last model stream on this conversation was CUT before its
+         *  terminal event (src/plugin.ts emitUpstreamTruncation sites). A tool
+         *  call dispatched out of such a stream can carry EMPTY arguments —
+         *  the argument deltas never arrived — and an empty `compress` call is
+         *  otherwise indistinguishable from the model's own "empty companion"
+         *  call (#1366). Without this stamp the parser-side receipt tells the
+         *  model not to re-issue, converting a recoverable transport failure
+         *  into an abandoned compression.
+         *
+         *  Read is non-consuming and TTL-bounded (TRUNCATED_UPSTREAM_MAX_AGE_MS):
+         *  one truncated turn may dispatch several tool calls whose arguments
+         *  were cut, so the first consumer must not clear the fact for the
+         *  rest; a later stream that completes simply stops consulting it once
+         *  the TTL lapses. In-memory only — a restart replants nothing, and a
+         *  restart also drops the truncated stream it described. */
+        truncatedUpstream?: { at: number; protocol: string; cause: "eof" | "read-error" };
     };
     id: string;
     /** Identity / descriptive metadata. Populated on first request. */
@@ -804,12 +823,18 @@ function staleEffectiveStamp(session: Session | undefined): boolean {
  *  Config without file settings, so returning it naked would drop every file
  *  knob between the edit and the session's next wire request. Provider/model
  *  cascade levels need the request URL and are deliberately NOT re-resolved
- *  here — the next wire request re-stamps the full cascade. */
+ *  here — the next wire request re-stamps the full cascade. The named-provider
+ *  recipe table IS resolved from the same live sources the request path feeds
+ *  resolveRequestConfig (agent-registry layer under file recipes — see
+ *  server/handle.ts): applyCompressSettings expands global-level
+ *  externalSummary "provider/model" references against that table at resolve
+ *  time, so an empty table disables every valid chain for the whole stale
+ *  window (#5912). */
 function liveFileOverlayConfig(base: Config): Config {
     const compress = loadConfigFile().compress;
     if (!compress || !hasCompressSettings(compress)) return base;
     const limit = resolveContextLimitValue(compress.modelContextLimit, base.modelContextLimit);
-    return applyCompressSettings(base, limit, compress, {});
+    return applyCompressSettings(base, limit, compress, { ...agentProviderRecipes(), ...loadNamedProviders() });
 }
 
 export function effectiveConfig(session: Session | undefined, fallback: Config): Config {
@@ -1016,6 +1041,39 @@ export function diagnoseSuccessWithoutUsage(session: Session, wire: string): voi
  *  decisions. Preflight / pressure bands are untouched — only the growth
  *  cadence reference moves. */
 export const ABORT_REANCHOR_MAX_AGE_MS = 30 * 60 * 1000;
+
+/** #5981: how long a truncated-upstream stamp stays consultable. One cut
+ *  stream dispatches its tool calls within milliseconds (observed 37–115 ms),
+ *  so five minutes is already generous; the bound exists so a stale stamp can
+ *  never re-label a genuinely empty call the model makes much later in the
+ *  conversation. */
+export const TRUNCATED_UPSTREAM_MAX_AGE_MS = 5 * 60 * 1000;
+
+/** #5981: record that the model stream just served on this conversation was
+ *  CUT before its terminal event. Called from the four emitUpstreamTruncation
+ *  sites in src/plugin.ts (chat eof/read-error, responses eof/read-error).
+ *  The fact is what lets the compress receipt distinguish "the argument bytes
+ *  never arrived" from "the model sent an empty call" — the two are bytewise
+ *  identical by the time the parser sees them (#1366). */
+export function noteTruncatedUpstream(session: Session, protocol: string, cause: "eof" | "read-error"): void {
+    session.transient ??= {};
+    session.transient.truncatedUpstream = { at: Date.now(), protocol, cause };
+}
+
+/** #5981: read the truncated-upstream stamp WITHOUT consuming it — one cut
+ *  stream may dispatch several tool calls whose arguments were cut, so the
+ *  first consumer must not clear the fact for the rest. An expired stamp is
+ *  dropped on read so it can never re-label a later genuine empty call. */
+export function truncatedUpstreamOf(session: Session): { at: number; protocol: string; cause: "eof" | "read-error" } | undefined {
+    const t = session.transient;
+    const flag = t?.truncatedUpstream;
+    if (!t || !flag) return undefined;
+    if (Date.now() - flag.at > TRUNCATED_UPSTREAM_MAX_AGE_MS) {
+        delete t.truncatedUpstream;
+        return undefined;
+    }
+    return flag;
+}
 
 /** Stamp a pending aborted-turn re-anchor; call from the plugin pipe's
  *  client-abort path AFTER settleUsage has landed whatever the interrupted

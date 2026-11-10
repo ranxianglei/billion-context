@@ -109,6 +109,41 @@ test("DeepSeek/OpenAI counts survive comma grouping (#3450)", () => {
     assert.equal(info.requestedCompletion, 256000);
 });
 
+test("LiteLLM/SGLang: colon-separated input and completion counts survive the wrapper", () => {
+    for (const counts of [
+        ["131072", "134000", "100000", "34000"],
+        ["131,072", "134,000", "100,000", "34,000"],
+    ]) {
+        const [window, total, messages, completion] = counts;
+        const message = `litellm.BadRequestError: OpenAIException - Requested token count exceeds the model's maximum context length of ${window} tokens. You requested a total of ${total} tokens: ${messages} tokens from the input messages and ${completion} tokens for the completion. Please reduce the number of tokens in the input messages or the completion to fit within the limit.\n\nLiteLLM: model group 'test-model' failed with the error above. No fallback was attempted.`;
+        const body = JSON.stringify({ error: { message, type: "BadRequestError", param: null, code: "400" } });
+        const info = inspectContextOverflow(400, body);
+        assert.equal(info.isOverflow, true);
+        assert.equal(info.window, 131072);
+        assert.equal(info.requestedTotal, 134000);
+        assert.equal(info.requestedMessages, 100000);
+        assert.equal(info.requestedCompletion, 34000);
+        assert.equal(inspectContextOverflow(429, body).isOverflow, false);
+    }
+});
+
+test("LiteLLM counts require the explicit input/completion split", () => {
+    for (const split of [
+        "100000 tokens from the input messages",
+        "100000 input messages and 34000 tokens for the completion",
+        "100000 tokens from the input messages and 34000 output tokens",
+    ]) {
+        const info = inspectContextOverflow(400, JSON.stringify({ error: {
+            message: `Requested token count exceeds the model's maximum context length of 131072 tokens. You requested a total of 134000 tokens: ${split}.`,
+        } }));
+        assert.equal(info.isOverflow, true);
+        assert.equal(info.window, 131072);
+        assert.equal(info.requestedTotal, undefined);
+        assert.equal(info.requestedMessages, undefined);
+        assert.equal(info.requestedCompletion, undefined);
+    }
+});
+
 test("Anthropic 'prompt is too long' states the prompt count — no completion split (#3450)", () => {
     const body = JSON.stringify({
         type: "error",

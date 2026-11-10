@@ -499,6 +499,18 @@ export function insertBeforeTrailingSystemRun(
   return [...messages.slice(0, i), ...additions, ...messages.slice(i)];
 }
 
+/** #4570: the position backstop as a standalone pass over a FINAL Anthropic
+ *  messages array — hosts that append messages after coreToAnthropic (notes,
+ *  nudges, side-call prompts) run it on the array they actually send. Same
+ *  heal as coreToAnthropic's internal pass (#5438); fresh objects only. */
+export function healAnthropicSystemPositions(
+  messages: readonly AnthropicWireMessage[],
+): AnthropicWireMessage[] {
+  const out = [...messages];
+  healIllegalSystemPositions(out);
+  return out;
+}
+
 export function coreToAnthropic(
   messages: BiliMessage[],
   cacheControls?: Map<string, unknown>,

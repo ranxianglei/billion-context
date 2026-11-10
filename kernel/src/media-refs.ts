@@ -61,7 +61,9 @@ function isInlineDataUrl(u: unknown): boolean {
  *  pre-signed/expiring handle — the enumerated families:
  *  - cloud-provider signing prefixes (S3 v4 `X-Amz-*`, GCS `X-Goog-*`,
  *    Azure Blob SAS `X-MS-*`, R2/Cloudflare `X-CF-*`/`X-R2-*`, Aliyun OSS
- *    `X-OSS-*`… via the generic provider-prefix pattern);
+ *    `X-OSS-*`… via the generic provider-prefix pattern — including the
+ *    Huawei OBS `X-OBS-*`, Tencent COS `X-COS-*` and Baidu BCE `X-BCE-*`
+ *    families);
  *  - explicit expiry keys (`Expires`/`expiry`/`exp`/`ttl` — covers S3 v1
  *    pre-signing and generic signed-CDN schemes);
  *  - credential/session keys (`Signature`/`sig`/`token`/`session-token`/
@@ -69,7 +71,7 @@ function isInlineDataUrl(u: unknown): boolean {
  *  Non-HTTP refs (DeepSeek `file_id`, `gs://` URIs, bare ids) never match —
  *  they are durable by definition of the #5620 split. */
 const EPHEMERAL_QUERY_PARAM =
-  /^(?:x-(?:amz|goog|ms|cf|r2|oss|azure)-.*|(?:expires?|expiry|exp|ttl|signature|sig|session-token|security-token|token|auth))$/i;
+  /^(?:x-(?:amz|goog|ms|cf|r2|oss|azure|obs|cos|bce)-.*|(?:expires?|expiry|exp|ttl|signature|sig|session-token|security-token|token|auth))$/i;
 
 /** #5865-P2: true when the ref is an HTTP(S) URL whose query carries a
  *  signed/expiring marker — its re-access is time-bounded, so it must not
@@ -235,7 +237,11 @@ export function collectFoldMediaRefs(
   };
   for (const m of directMessages)
     if (m) for (const r of extractMediaRefs(m)) add(r);
+  // #5865 review: block summaries written by OLDER builds can carry refs
+  // that looksEphemeralSignedUrl would reject today — the carry-forward must
+  // apply the same filter or a dead signed URL survives forever via the
+  // merged block's MEDIA REFS section even though no live message holds it.
   for (const b of consumedBlocks)
-    if (b) for (const r of parseMediaRefsSection(b.summary)) add(r);
+    if (b) for (const r of parseMediaRefsSection(b.summary)) if (!looksEphemeralSignedUrl(r)) add(r);
   return refs;
 }
