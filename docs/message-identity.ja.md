@@ -212,7 +212,7 @@ churn 領域を head-first と tail-first で整列し、**フィンガープリ
 い）、加えてこの churn クラスがレイヤーなしで再課金することを示す独自の
 reconcile-off 対照。
 
-## snapshot-as-session 教義：id 上の判定クラス（#3641)
+## snapshot-as-session 教義：id 上の判定クラス（#3641）
 
 #2480 は fold coverage を検証付き位置ベースにした。#3641 は**どの**チャネルも
 検証できなかった場合になにが起きるかを決着させた。反転：**(session id + fold
