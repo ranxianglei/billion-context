@@ -34,7 +34,7 @@ import { resolveBackendName, backendSelectionNotice, selectedBackendRaw, openBac
 import { canonicalDigest, canonicalize, sha256 } from "./canonical.ts";
 import { recordSidecarInstance, recordSidecarOpenFailure } from "./runtime-status.ts";
 import type { SqliteEngineName, SqliteEngineSource } from "./driver.ts";
-import type { MessageRow, BlockRow, SessionRow, RefRow, MessageRefContentRow } from "./store.js";
+import type { MessageRow, BlockRow, SessionRow, RefRow, MessageRefContentRow, MessageIdContentRow } from "./store.js";
 import type { CoreMessage, MessageContentStore } from "acp-kernel";
 
 // True once quick_check proved this process's index corrupt. such a boot is
@@ -63,6 +63,11 @@ interface ResidentFields {
  *  migration-parity property, not a per-commit one. The FIRST ingest of a
  *  session always verifies (cold-path full check), then every N-th. */
 export const VERIFY_EVERY_INGESTS = 20;
+
+/** #5744: wall-clock threshold for the slow-ingest warn (ms). The old
+ *  request-level warn keyed on message count, which cannot separate a fast
+ *  big session from a slow small one. */
+const SLOW_INGEST_WARN_MS = 500;
 
 /** #4323: consecutive sampled drifts required before escalating. A one-off
  *  drift is transient external churn (the watermark clear below heals it);
@@ -103,6 +108,32 @@ export function sqliteOpenFailureHint(err: string): string {
         return " (win32: 'attempt to write a readonly database' on an EXISTING index.db = the file opened read-only and the first write was refused by the OS — most often Windows integrity control (a process running at Low integrity cannot write Medium-labeled files, and a DSH-spawned node.exe can itself carry a Low label, e.g. after a stray 'icacls /setintegritylevel Low' — #5154), less often antivirus/Defender or another bili/dsh process holding the files; check the PROCESS side first — run icacls on your node.exe and if it reports a Low label restore it with 'icacls <path-to-node.exe> /setintegritylevel Medium' — do NOT relabel the sessions dir Low to match (that cements the mislabel and drags every file down with it); do NOT delete the file — in unified-full mode it may hold the only copy of recent session state)";
     }
     return "";
+}
+
+/** #5627: single-line forensic form of a record() failure — the error, the
+ *  failing PHASE, the session id, and the top stack frames. String(err)
+ *  alone is worthless for engine-level failures (a RangeError says "Maximum
+ *  call stack size exceeded" without saying WHERE); pre-fix both the warn
+ *  line and stats.lastError (the panel/status carrier) discarded everything
+ *  but the bare message, leaving such failures undiagnosable (#5627). Frames
+ *  are trimmed so the line stays grep-able; shortenError() on the status
+ *  side truncates the rest. */
+export function formatShadowFailure(err: unknown, phase: string, sessionId: string | undefined): string {
+    const detail = `${String(err)} | phase=${phase} | session=${sessionId ?? "-"}`;
+    const stack = err instanceof Error ? err.stack : undefined;
+    if (typeof stack !== "string") return cap(detail);
+    const frames = stack
+        .split("\n")
+        .slice(1, 7)
+        .map((l) => l.trim())
+        .filter((l) => l.length > 0)
+        .map((f) => (f.length > 96 ? `${f.slice(0, 96)}…` : f))
+        .join(" <- ");
+    return frames.length > 0 ? cap(`${detail} | ${frames}`) : cap(detail);
+}
+
+function cap(s: string): string {
+    return s.length > 700 ? `${s.slice(0, 697)}...` : s;
 }
 
 // Canonical home for StorageMode/resolveStorageMode is src/knobs.ts (env-var
@@ -163,6 +194,10 @@ export class UnifiedShadow {
      *  saves index-only) so a multi-writer ping-pong (#394) can no longer
      *  churn the file copy; the first clean sample re-admits. */
     readonly frozenEnvelopeIds = new Set<string>();
+    /** #5408: when (epoch ms) this process froze each session's envelope
+     *  writes — feeds the status wire and the skip-save logs so a frozen
+     *  session surfaces WITH an age and a reason instead of only a count. */
+    private readonly frozenEnvelopeSince = new Map<string, number>();
     /** #3931 step 3: the sqlite fast lane. Null when the selected backend
      *  is a network backend (mysql) — then every sync facade method below
      *  returns its miss value (null / [] / no-op) and callers fall back to
@@ -189,6 +224,11 @@ export class UnifiedShadow {
     /** #3133: per-session ingest counters (verify sampling). Per-process
      *  only — nothing persisted, no schema change. */
     private readonly ingestCounts = new Map<string, number>();
+    /** Warn-dedup key of the last logged failure — the error message itself
+     *  (#5140: one warn per distinct message, no per-turn spam). #5627 makes
+     *  the message victim-specific where possible, so distinct victims still
+     *  each warn once. */
+    private lastWarnKey: string | null = null;
 
     private constructor(mode: StorageMode, store: UnifiedStore | null, legacyLoad: (record: unknown) => LegacySessionLike | null, backend?: StorageBackend, dbPath?: string) {
         this.mode = mode;
@@ -199,17 +239,29 @@ export class UnifiedShadow {
     }
 
     /** #5103 / 2026-10-30 owner policy (never abandon index writes): record
-     *  every ingest failure with the file named — but a streak of the SAME
-     *  error message warns once (a permanently broken index must not add a log
-     *  line to every turn), while any NEW message warns immediately. Nothing is
-     *  ever disabled; the next save retries the write unconditionally. */
-    private noteIngestFailure(err: unknown): void {
-        const prev = this.stats.lastError ?? "";
-        const errStr = String(err);
+     *  every ingest failure with the file named — but the SAME error message
+     *  warns once (a permanently broken index must not add a log line to
+     *  every turn), while any NEW message warns immediately.
+     *  Nothing is ever disabled; the next save retries the write
+     *  unconditionally.
+     *  #5627: the recorded detail names the failing PHASE + SESSION + top
+     *  stack frames (formatShadowFailure) — an engine verdict like
+     *  "RangeError: Maximum call stack size exceeded" names nothing on its
+     *  own. The dedup key stays the MESSAGE (the #5140 pin: one warn per
+     *  distinct message), and the enrichment makes that key honest: the
+     *  serializer re-throw names the offending row (#5627), so distinct
+     *  victims carry distinct messages and each still gets its ONE warning,
+     *  while shared-root-cause failures (one SQLITE_BUSY across many
+     *  sessions) stay a single line. stats.lastError always carries the
+     *  LATEST failure's full detail regardless of dedup. */
+    private noteIngestFailure(err: unknown, phase: string, sessionId?: string): void {
+        const detail = formatShadowFailure(err, phase, sessionId);
         this.consecutiveFailures += 1;
-        this.stats.lastError = errStr;
-        if (errStr !== prev) {
-            loggerLog("warn", `[storage] unified sidecar ${this.dbPath ?? "backend"} failed to ingest (${this.consecutiveFailures} in a row; ${errStr})${sqliteOpenFailureHint(errStr)} — the index write will be RETRIED on every subsequent save until it succeeds again (no self-disable; the JSON envelope keeps serving meanwhile)`);
+        this.stats.lastError = detail;
+        const key = String(err);
+        if (key !== this.lastWarnKey) {
+            this.lastWarnKey = key;
+            loggerLog("warn", `[storage] unified sidecar ${this.dbPath ?? "backend"} failed to ingest (${this.consecutiveFailures} in a row; ${detail})${sqliteOpenFailureHint(String(err))} — the index write will be RETRIED on every subsequent save until it succeeds again (no self-disable; the JSON envelope keeps serving meanwhile)`);
         }
     }
 
@@ -400,9 +452,14 @@ export class UnifiedShadow {
             this.enqueueAsyncRecord(record, rawTail, liveCcr);
             return;
         }
+        // #5627: which stage is running — the failure forensics must name
+        // the operation that died, not just the engine's one-line verdict.
+        let phase = "legacy-load";
+        let sessionId: string | undefined;
         try {
             const loaded = this.legacyLoad(record);
             if (!loaded) return;
+            sessionId = loaded.id;
             // #4216/#4242: the reap shape (blockContents without their
             // state.blocks entries) is now REPRESENTABLE — planIngest
             // journals the orphan contents into sessions.orphans_json and
@@ -430,18 +487,46 @@ export class UnifiedShadow {
             // full path below; the delta itself re-verifies the boundary
             // inside the ingest transaction, so a racing writer degrades to
             // a full ingest, never a corrupt one.
+            // #5744: wall-clock guard on the ingest itself — message count is
+            // a bad proxy (one reporter session: 0.8s and 14.5s saves at the
+            // SAME ~3k msgs). Names the path so a spike is attributable
+            // (delta fast path vs full fallback) without a profiler.
+            const tIngestStart = performance.now();
+            let ingestPath = "delta";
+            phase = "ingest-delta";
             if (!this.ingestDelta(legacy, hasRawTail)) {
+                ingestPath = "full";
+                phase = "plan-ingest";
                 const plan = planIngest(legacy);
+                phase = "ingest-session";
                 // #3285: only a raw-tail plan is the complete log — that is
                 // what lets the full path sweep foreign rows as stale.
-                this.sync.ingestSession(plan, undefined, { completeLog: hasRawTail });
+                // #5408: while drift-latched the ENVELOPE is what loadSync
+                // serves (the latch exists because the index diverged from
+                // it), so the index must converge to THAT view — sweep on
+                // every latched full ingest even without a raw tail. Before
+                // this, a folded-resident save (no raw tail) never swept:
+                // foreign rows rode every replay and the drift could never
+                // clear on its own (the incident behind #5408 sat frozen for
+                // 8h on exactly this shape).
+                const completeLog = hasRawTail || this.driftedSessions.has(legacy.id);
+                this.sync.ingestSession(plan, undefined, { completeLog });
             }
             this.stats.ingests++;
+            const ingestMs = Math.round(performance.now() - tIngestStart);
+            if (ingestMs > SLOW_INGEST_WARN_MS) {
+                // #5744: attach WAL forensics so a stall spike can be attributed
+                // to a checkpoint burst (multi-second tick inside the window)
+                // instead of per-row statement cost — read-only, warn path only.
+                const walSuffix = this.sync.walDiagnosticsSuffix() ?? "";
+                loggerLog("warn", `[storage] slow-ingest: ${legacy.id} path=${ingestPath} took=${ingestMs}ms${walSuffix} — synchronous per-save storage work is starving the event loop (#5744); path=full means the delta fast path fell back (watermark missing/cleared or tail shape changed)`);
+            }
             // #3133 sampled verification: ingest integrity is already guarded
             // by the SQLite write path; the read-back digest is a migration
             // parity oracle, so it runs on the first ingest of a session and
             // then every VERIFY_EVERY_INGESTS-th (drift stays observable via
             // stats.verifyDrift on the sampled saves).
+            phase = "verify-sample";
             const count = (this.ingestCounts.get(legacy.id) ?? 0) + 1;
             this.ingestCounts.set(legacy.id, count);
             if ((count - 1) % VERIFY_EVERY_INGESTS === 0) {
@@ -481,8 +566,26 @@ export class UnifiedShadow {
                     // store keeps receiving every save either way).
                     const streak = (this.driftStreaks.get(legacy.id) ?? 0) + 1;
                     this.driftStreaks.set(legacy.id, streak);
+                    // #3919: the digest says WHICH bytes disagree but not WHERE —
+                    // append the field-level diagnosis (diverged dimensions +
+                    // first divergent tail slot, fingerprints only, never body
+                    // text) so one log line is enough to classify the trigger.
+                    // The line prefix stays byte-identical for existing greps.
+                    // #5408: computed BEFORE the escalation so the ESCALATED
+                    // warn carries it too — that line is the one operators see
+                    // when they grep for the freeze, and "diverged: state"
+                    // without the sub-key drill-down left #5408 undiagnosable.
+                    let diagnosis = "";
+                    try {
+                        diagnosis = formatDriftDiagnostics(verified.diagnostics);
+                    } catch {
+                        // diagnostics must never break the heal path
+                    }
                     if (streak === DRIFT_ESCALATE_STREAK) {
                         this.frozenEnvelopeIds.add(legacy.id);
+                        // #5408: stamp WHEN this process froze the writes — the
+                        // skip-save logs and the status wire surface the age.
+                        this.frozenEnvelopeSince.set(legacy.id, Date.now());
                         let sides = "";
                         try {
                             const envBlocks = legacy.state.blocks.filter((b) => b.active).length;
@@ -491,7 +594,7 @@ export class UnifiedShadow {
                         } catch {
                             // counts must never break the heal path
                         }
-                        loggerLog("warn", `[storage] DIGEST DRIFT ESCALATED for ${legacy.id}: ${streak} consecutive sampled drifts — the views have stopped converging${sides}. Both legs are built in THIS process, so a persistent gap is a digest-shape mismatch first (field only one leg builds, ordering — #4392) and only then a writer: known producers are a second bili instance sharing one sessions dir (#394 anti-pattern; second-instance detection: #4177), or ONE host re-writing history slots below the ingest watermark on every save (the delta fast path skips them by design, so the sampled backstop cannot converge against a repeating trigger — #4614). Freezing THIS process's JSON envelope writes for the session until a clean sample re-admits it — the unified store keeps receiving every save (#4323)`);
+                        loggerLog("warn", `[storage] DIGEST DRIFT ESCALATED for ${legacy.id}: ${streak} consecutive sampled drifts — the views have stopped converging${sides}${diagnosis}. Both legs are built in THIS process, so a persistent gap is a digest-shape mismatch first (field only one leg builds, ordering — #4392) and only then a writer: known producers are a second bili instance sharing one sessions dir (#394 anti-pattern; second-instance detection: #4177), or ONE host re-writing history slots below the ingest watermark on every save (the delta fast path skips them by design, so the sampled backstop cannot converge against a repeating trigger — #4614). Freezing THIS process's JSON envelope writes for the session until a clean sample re-admits it — the unified store keeps receiving every save (#4323)`);
                     }
                     // Panels consume {disabled, lastError} — make the sampled
                     // degradation visible there, not just in the counter/log.
@@ -505,17 +608,6 @@ export class UnifiedShadow {
                     // tail slot through the exact full path (divergence
                     // window bounded to ≤ VERIFY_EVERY_INGESTS saves).
                     this.sync.clearIngestWatermark(legacy.id);
-                    // #3919: the digest says WHICH bytes disagree but not WHERE —
-                    // append the field-level diagnosis (diverged dimensions +
-                    // first divergent tail slot, fingerprints only, never body
-                    // text) so one log line is enough to classify the trigger.
-                    // The line prefix stays byte-identical for existing greps.
-                    let diagnosis = "";
-                    try {
-                        diagnosis = formatDriftDiagnostics(verified.diagnostics);
-                    } catch {
-                        // diagnostics must never break the heal path
-                    }
                     loggerLog("error", `[storage] unified shadow DIGEST DRIFT for ${legacy.id}: unified replay != legacy load view${repeat ? " (repeat: consecutive sampled drift — the views are not converging)" : ""}${diagnosis} — dropped the ingest watermark, the next save re-ingests the full tail`);
                 } else {
                     this.stats.verifyOk++;
@@ -527,13 +619,14 @@ export class UnifiedShadow {
                     // this process's envelope writes for the session.
                     this.driftStreaks.delete(legacy.id);
                     if (this.frozenEnvelopeIds.delete(legacy.id)) {
+                        this.frozenEnvelopeSince.delete(legacy.id);
                         loggerLog("info", `[storage] drift resolved for ${legacy.id}: clean sample re-admits the session — envelope writes resume (#4323)`);
                     }
                 }
             }
             this.consecutiveFailures = 0;
         } catch (err) {
-            this.noteIngestFailure(err);
+            this.noteIngestFailure(err, phase, sessionId);
         }
     }
 
@@ -651,6 +744,21 @@ export class UnifiedShadow {
         return this.sync !== null && this.frozenEnvelopeIds.has(id);
     }
 
+    /** #5408: freeze metadata for status surfaces — null when not frozen. */
+    envelopeFrozenInfo(id: string): { sinceMs: number } | null {
+        if (!this.envelopeFrozen(id)) return null;
+        return { sinceMs: this.frozenEnvelopeSince.get(id) ?? Date.now() };
+    }
+
+    /** #5408: every frozen session with its freeze time, sorted by id — the
+     *  /__bili/status wire detail behind the frozenEnvelopeSessions count. */
+    frozenEnvelopeDetails(): { id: string; sinceMs: number }[] {
+        const out: { id: string; sinceMs: number }[] = [];
+        for (const id of this.frozenEnvelopeIds) out.push({ id, sinceMs: this.frozenEnvelopeSince.get(id) ?? Date.now() });
+        out.sort((a, b) => a.id.localeCompare(b.id));
+        return out;
+    }
+
     /** #4323: active block rows the unified store holds for `id` — null when
      *  the sqlite fast lane is unavailable; callers must not guess from null. */
     activeBlockCount(id: string): number | null {
@@ -690,6 +798,7 @@ export class UnifiedShadow {
         this.ingestCounts.delete(id);
         this.driftStreaks.delete(id);
         this.frozenEnvelopeIds.delete(id);
+        this.frozenEnvelopeSince.delete(id);
         try {
             this.sync.deleteSession(id);
         } catch (err) {
@@ -808,6 +917,29 @@ export class UnifiedShadow {
         return this.sync.archiveSession(sessionId, opts);
     }
 
+    /** #5312: full transcript id set + block rows for the foreign-block sweep
+     *  (reads degrade like the neighboring sync facades on network backends). */
+    allMessageIds(sessionId: string): string[] {
+        if (this.sync === null) return [];
+        return this.sync.allMessageIds(sessionId);
+    }
+
+    getBlocks(sessionId: string): ReturnType<import("./store.ts").UnifiedStore["getBlocks"]> {
+        if (this.sync === null) return [];
+        return this.sync.getBlocks(sessionId);
+    }
+
+    /** #5312: reversible single-block archive / restore (see UnifiedStore). */
+    archiveBlock(sessionId: string, blockId: string, opts: { archiveDir: string }): { ok: boolean; exportPath?: string; reason?: string; contentRowsDeleted?: number } {
+        if (this.sync === null) return { ok: false, reason: "async backend — single-block archive unavailable" };
+        return this.sync.archiveBlock(sessionId, blockId, opts);
+    }
+
+    restoreBlock(sessionId: string, blockId: string, opts: { archiveDir: string }): { ok: boolean; reason?: string } {
+        if (this.sync === null) return { ok: false, reason: "async backend — single-block restore unavailable" };
+        return this.sync.restoreBlock(sessionId, blockId, opts);
+    }
+
     sessionStorageStats(sessionId: string): import("./store.ts").SessionStorageStats | null {
         if (this.sync === null) return null;
         return this.sync.sessionStorageStats(sessionId);
@@ -872,6 +1004,13 @@ export class UnifiedShadow {
     messageContentByRefNums(sessionId: string, refNums: readonly number[]): MessageRefContentRow[] {
         if (this.sync === null || refNums.length === 0) return [];
         return this.sync.messageContentByRefNums(sessionId, refNums);
+    }
+
+    /** #6029: per-msg_id stored bodies — the restamp-proof twin of
+     *  messageContentByRefNums (sync store only, like its sibling). */
+    messageContentByMsgIds(sessionId: string, msgIds: readonly string[]): MessageIdContentRow[] {
+        if (this.sync === null || msgIds.length === 0) return [];
+        return this.sync.messageContentByMsgIds(sessionId, msgIds);
     }
 
     sessionSummaries(): SessionSummaryRow[] {
@@ -1017,10 +1156,14 @@ export class UnifiedShadow {
      *  shadow queue; failures feed the same per-message warn — nothing disables (#2432-era breaker removed 2026-10-30). */
     private enqueueAsyncRecord(record: unknown, rawTail?: { lastMessages: CoreMessage[]; lastMessagesFolded?: boolean }, liveCcr?: MessageContentStore): void {
         void this.enqueue(async () => {
+            // #5627: same failing-stage forensics as the sync record() above.
+            let phase = "legacy-load";
+            let sessionId: string | undefined;
             try {
                 const backend = this.backend!;
                 const loaded0 = this.legacyLoad(record);
                 if (!loaded0) return;
+                sessionId = loaded0.id;
                 let legacy = loaded0;
                 let hasRawTail = false;
                 if (rawTail && rawTail.lastMessages.length > 0) {
@@ -1032,6 +1175,7 @@ export class UnifiedShadow {
                 // #4216/#4242: orphan shape rides the plan journal — normal
                 // ingest (the async twin of the sync fix); no freeze.
                 // #3133 watermark delta.
+                phase = "ingest-delta";
                 let applied = false;
                 try {
                     const mark = await backend.ingestWatermark(legacy.id);
@@ -1048,8 +1192,23 @@ export class UnifiedShadow {
                 } catch {
                     applied = false;
                 }
-                if (!applied) await backend.ingestSession(planIngest(legacy), undefined, { completeLog: hasRawTail });
+                // #5412: mirror the sync path's latched-sweep promotion (#5408
+                // B1 / #4323). While the sampler has latched this session as
+                // drift-latched, the envelope is the view loadSync serves —
+                // the full re-ingest must claim authoritative-set authority
+                // even without a raw tail so its stale sweep retires foreign
+                // residue rows; otherwise every latched save re-takes the
+                // incomplete view, the next sample drifts again, and the
+                // frozen session never self-heals.
+                const completeLog = hasRawTail || this.driftedSessions.has(legacy.id);
+                if (!applied) {
+                    phase = "plan-ingest";
+                    const plan = planIngest(legacy);
+                    phase = "ingest-session";
+                    await backend.ingestSession(plan, undefined, { completeLog });
+                }
                 this.stats.ingests++;
+                phase = "verify-sample";
                 const count = (this.ingestCounts.get(legacy.id) ?? 0) + 1;
                 this.ingestCounts.set(legacy.id, count);
                 if ((count - 1) % VERIFY_EVERY_INGESTS === 0) {
@@ -1080,7 +1239,7 @@ export class UnifiedShadow {
                 }
                 this.consecutiveFailures = 0;
             } catch (err) {
-                this.noteIngestFailure(err);
+                this.noteIngestFailure(err, phase, sessionId);
             }
         });
     }
@@ -1344,6 +1503,10 @@ interface DriftSlotFingerprint {
 interface DriftDiagnostics {
     /** Top-level view keys whose canonicalized JSON differs, sorted. */
     keys: string[];
+    /** #5408: state sub-keys that disagree (when `state` itself diverged) —
+     *  "diverged: state" alone cannot be acted on because every full re-ingest
+     *  converges the tables it owns; the sub-key names the actual residue. */
+    stateKeys?: string[];
     /** First divergent lastMessages slot (or the length-mismatch index). */
     tailSlot?: { index: number; expect: DriftSlotFingerprint; got: DriftSlotFingerprint };
 }
@@ -1356,6 +1519,7 @@ class BatchedViewVerification {
     private readonly orphans: LegacySessionLike["blockContents"];
     private readonly messages = new Map<number, ReturnType<typeof messageSignature>>();
     private readonly keys = new Set<string>();
+    private headerDiag: DriftDiagnostics | null = null;
     private drift = false;
     private blockCount = 0;
     private activeBlocks = 0;
@@ -1380,7 +1544,11 @@ class BatchedViewVerification {
         if (shadowDigest(expect) !== shadowDigest(got)) {
             this.drift = true;
             try {
-                for (const key of describeViewDivergence(expect, got).keys) this.keys.add(key);
+                const diag = describeViewDivergence(expect, got);
+                // #5408: retain the header-level drill-down (state sub-keys) —
+                // the bulk phases below can only name "state" coarsely.
+                this.headerDiag = diag;
+                for (const key of diag.keys) this.keys.add(key);
             } catch {
                 // Diagnostic detail must not suppress a proven drift.
             }
@@ -1444,6 +1612,7 @@ class BatchedViewVerification {
         this.compareMessages("lastMessages", this.tail.tailSeqs);
         this.compareMessages("pluginSnapshot", this.tail.pluginSnapshotSeqs);
         const diagnostics: DriftDiagnostics = { keys: [...this.keys].sort() };
+        if (this.headerDiag?.stateKeys) diagnostics.stateKeys = this.headerDiag.stateKeys;
         if (this.tailSlot) diagnostics.tailSlot = this.tailSlot;
         return { matches: !this.drift, activeBlocks: this.activeBlocks, tailGaps: this.tailGaps, diagnostics };
     }
@@ -1486,6 +1655,22 @@ export function describeViewDivergence(expectView: unknown, gotView: unknown): D
         if (ser(e[k]) !== ser(g[k])) keys.push(k);
     }
     const diagnostics: DriftDiagnostics = { keys };
+    if (keys.includes("state")) {
+        // #5408: drill one level into the state object so the log names which
+        // sub-field disagrees (messageRefs / kstate residue / coverage), not
+        // just that "state" as a whole does.
+        const es = e["state"];
+        const gs = g["state"];
+        if (es !== null && typeof es === "object" && !Array.isArray(es) && gs !== null && typeof gs === "object" && !Array.isArray(gs)) {
+            const eo = es as Record<string, unknown>;
+            const go = gs as Record<string, unknown>;
+            const subKeys: string[] = [];
+            for (const k of [...new Set([...Object.keys(eo), ...Object.keys(go)])].sort()) {
+                if (ser(eo[k]) !== ser(go[k])) subKeys.push(k);
+            }
+            if (subKeys.length > 0) diagnostics.stateKeys = subKeys;
+        }
+    }
     if (keys.includes("lastMessages") && Array.isArray(e["lastMessages"]) && Array.isArray(g["lastMessages"])) {
         const et = e["lastMessages"] as unknown[];
         const gt = g["lastMessages"] as unknown[];
@@ -1510,6 +1695,7 @@ export function describeViewDivergence(expectView: unknown, gotView: unknown): D
 /** Compact log-suffix form of describeViewDivergence (""-free: always starts with a space). */
 export function formatDriftDiagnostics(d: DriftDiagnostics): string {
     const parts = [`diverged: ${d.keys.length > 0 ? d.keys.join(",") : "<unknown>"}`];
+    if (d.stateKeys) parts.push(`state: ${d.stateKeys.join(",")}`);
     if (d.tailSlot) {
         const { index, expect: ex, got: go } = d.tailSlot;
         parts.push(`tail slot ${index}: expect ${ex.id}/${ex.role} len=${ex.length} sha=${ex.sha8}, got ${go.id}/${go.role} len=${go.length} sha=${go.sha8}`);

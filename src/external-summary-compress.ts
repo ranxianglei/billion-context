@@ -3,7 +3,7 @@ import { buildCompressSystemPrompt, parseCompressInput, type ParsedRange } from 
 import { messageTimestampSections } from "./external-summary-surface.js";
 import { configuredSummaryPlan } from "./external-summary-runtime.js";
 import type { ResolvedKernelConfig } from "./compress-settings.js";
-import { applyRanges, noVisibleContextRefusal, normalizeRangeOrder, recoverEvictedView, type RewriteCtx } from "./stream.js";
+import { applyRanges, noVisibleContextRefusal, normalizeRangeOrder, recoverEvictedView, supersededRefRejection, type RewriteCtx } from "./stream.js";
 import { compressResult, type ProxyToolResult } from "./proxy-tool-result.js";
 import { imagePlaceholders } from "./image-note.js";
 import { describeExternalSummaryFailure, summaryLengthBudgetClause, type SummaryWork } from "./external-summary.js";
@@ -48,6 +48,14 @@ export async function applyConfiguredCompression(input: unknown, ctx: RewriteCtx
     recoverEvictedView(ctx);
     const noView = noVisibleContextRefusal(ctx, parsed.ranges);
     if (noView) return noView;
+    // #5558: resolve superseded refs BEFORE the probe preview — the preview
+    // judges foldability while applyRanges re-resolves refs on every entry, so
+    // judging on untranslated refs lets an unanchorable stale cite read as "no
+    // change" here yet translate and fold under a synthetic probe summary in
+    // there, committing content without the configured external summarizer.
+    // One projection for judgment AND execution (#3236 discipline).
+    const resolved = supersededRefRejection(parsed.ranges, ctx.session);
+    if (resolved.rejection !== null) return applyRanges({ ...parsed, ranges: resolved.translatedRanges }, ctx);
     const state = ctx.session.state;
     const revision = ctx.session.revisionEpoch;
     const messages = (ctx.compressMessages ?? ctx.messages).map((message) => {
@@ -56,8 +64,9 @@ export async function applyConfiguredCompression(input: unknown, ctx: RewriteCtx
     });
     const work: SummaryWork[] = [];
     const valid: ParsedRange[] = [];
+    let hasProbeChanges = false;
     // Kernel protection and aggregate size checks must see the complete batch.
-    const probes = parsed.ranges.map((range, index) => {
+    const probes = resolved.translatedRanges.map((range, index) => {
         const maximum = Math.min(ctx.config.compress.maxSummaryLength, range.summaryMaxChars ?? Infinity);
         const length = Math.min(maximum, Math.max(64, ctx.config.compress.minSummaryLength));
         return { ...range, summary: (`external-probe-${index}:`).padEnd(length, "x").slice(0, length) };
@@ -70,6 +79,7 @@ export async function applyConfiguredCompression(input: unknown, ctx: RewriteCtx
         const blocks = preview.state.blocks.filter((candidate) => candidate.summary === probes[index].summary
             && before.get(candidate.blockId)?.summary !== candidate.summary);
         if (blocks.length === 0) continue;
+        hasProbeChanges = true;
         const content = blocks.map((block) => {
             const collected = collectBlockContent(state, block, source, { full: false }).text;
             if (collected.trim()) return collected;
@@ -95,7 +105,14 @@ export async function applyConfiguredCompression(input: unknown, ctx: RewriteCtx
             instructions: `${ctx.session.meta.summaryInstructions ?? buildCompressSystemPrompt(undefined, messageTimestampSections(undefined))}\nWrite a faithful summary of the selected range ${range.startRef}-${range.endRef}. Preserve task status, constraints, decisions, exact code identifiers, paths and errors, and unfinished objectives with their source message refs. Submitted summary hints are non-authoritative. Never summarize or change the read-only reference.`
                 + summaryLengthBudgetClause(maxSummaryChars, ctx.config.compress.minSummaryLength) });
     }
-    if (work.length === 0) return compressResult("[Compression FAILED: no selected range passed the existing kernel protection checks. Nothing compressed.]", "refused", 0);
+    if (work.length === 0) {
+        // #5558: an unchanged preview can be an already-covered/protected no-op
+        // or a kernel refusal; the normal path supplies that truthful receipt.
+        // If a probe changed state but yielded no content, never fold a hint
+        // without the configured external summary.
+        if (!hasProbeChanges) return applyRanges({ ...parsed, ranges: probes }, ctx);
+        return compressResult("[Compression FAILED: no selected range passed the existing kernel protection checks. Nothing compressed.]", "refused", 0);
+    }
     const batch = await plan.summarize(work, signal);
     if (signal?.aborted || ctx.session.state !== state || ctx.session.revisionEpoch !== revision) return compressResult("[Compression FAILED: cancelled or session changed while generating external summaries. Nothing compressed.]", "refused", 0);
     const successful: ParsedRange[] = [];
