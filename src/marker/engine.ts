@@ -51,7 +51,7 @@ function countMarkerLines(text: string): number {
 }
 
 // Shared per-text-slot pipeline. Mirrors stripAcpStatusMarkers semantics:
-// status-body blocks, then marker LINES only. Render-tag spans () are
+// status-body blocks, then marker LINES only. Render-tag spans (\x3cacp …\x3e) are
 // deliberately NOT touched at this layer — a foreign literal tag is user
 // data (#1357 advisory processing keeps it byte-intact) and bili's own tag
 // echoes are handled at the projection layer (tag-echo-filter render walk).
