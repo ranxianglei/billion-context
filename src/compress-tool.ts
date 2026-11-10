@@ -443,7 +443,7 @@ export const READ_ORIGINAL_IMAGE_TOOL_GOOGLE = { name: READ_ORIGINAL_IMAGE_TOOL_
 // serves one definition. Takes a single `ref` (the mNNNNN id printed in the
 // [acp-stored] placeholder). Read-only with respect to context: the fetched content
 // rides the ephemeral tool-result channel and consumes no message ref.
-const RETRIEVE_TOOL_DESCRIPTION = "Retrieve the full original text of a stored message by its id. Large tool results are replaced on the wire with a placeholder shaped like \"📦 [acp-stored #m00423 · shell output · 4,213 tok] `npm run build`\n   → acp_retrieve(\"m00423\") returns the full text\". Call this with that ref to read the complete original back into context. Leaving the placeholder costs nothing; retrieving costs one call — fetch only when the detail matters to the current step.";
+const RETRIEVE_TOOL_DESCRIPTION = "Retrieve the full original text of a stored message by its id. Large tool results are replaced on the wire with a placeholder shaped like \"📦 [acp-stored #m00423 · shell output · 4,213 tok] `npm run build`\n   → acp_retrieve(\"m00423\") returns the full text\". Call this with that ref to read the complete original back into context. Very large originals are exported to a file instead of inline text — the result then carries the exported file's path; read that file with your file-read tool. Leaving the placeholder costs nothing; retrieving costs one call — fetch only when the detail matters to the current step.";
 const RETRIEVE_PARAM_SCHEMA = {
     type: "object" as const,
     properties: {
@@ -507,6 +507,8 @@ export function normalizeCompressInput(input: unknown): unknown {
     if (isPlainObject(input)) {
         const c = input["content"];
         if (isPlainObject(c)) return { ...input, content: [c] };
+        const salvaged = decodeContentStringEntries(c);
+        if (salvaged !== undefined) return { ...input, content: salvaged };
         return input;
     }
     if (typeof input === "string") {
@@ -514,10 +516,33 @@ export function normalizeCompressInput(input: unknown): unknown {
         if (!obj) return input;
         const c = obj["content"];
         if (isPlainObject(c)) return { ...obj, content: [c] };
+        const salvaged = decodeContentStringEntries(c);
+        if (salvaged !== undefined) return { ...obj, content: salvaged };
         if (looksLikeRangeEntry(obj)) return { content: [obj] };
         return input;
     }
     return input;
+}
+
+// #4252 hole-closure (false-advertising audit, incident shape
+// {"content":"{\"startId\":\"m04707\",…}"}): post-narrowing, models whose
+// muscle memory says “content is JSON” encode a range OBJECT or ARRAY AS THE
+// STRING — exactly what the parameter description’s “a valid JSON string… a
+// JSON-encoded array as that string is also accepted” invites. Neither layer
+// used to salvage it (object-typed content was wrapped; a STRING-typed content
+// only got line-form/flat treatment) ⇒ refused with kind=content-not-array.
+// Decode once and adopt only when the result is strictly ENTRIES-shaped:
+// a single range entry (start+end+summary) wrapped to one element, or an
+// array of such entries. A bounds-less JSON object (the flat-summary payload
+// {summary,…} + top-level refs) is deliberately NOT adopted here — it belongs
+// to the flat-single-range salvage path, not the entry decoder.
+function decodeContentStringEntries(c: unknown): unknown | undefined {
+    if (typeof c !== "string") return undefined;
+    let v: unknown;
+    try { v = JSON.parse(c); } catch { return undefined; }
+    if (isPlainObject(v)) return looksLikeRangeEntry(v) ? [v] : undefined;
+    if (Array.isArray(v) && v.length > 0 && v.every((e) => isPlainObject(e) && looksLikeRangeEntry(e))) return v;
+    return undefined;
 }
 
 // #3780: the documented line-form string can arrive DOUBLE-ESCAPED — a model
@@ -662,9 +687,9 @@ export function withStagedCompressGuidance(text: string): string {
 // injections, whose stock text pins ONE span. Byte-stable constants (like
 // the notes above) so the prefix-cache anchor stays intact.
 const FIRST_SIGHT_DRAIN_NOTE =
-    "\n\n[First-sight digestion: the compressible ranges above are a pre-existing backlog this session arrived with, not growth from your current task. Drain the backlog in ONE batched compress call — cover EVERY ready range, splitting oversized spans into multiple smaller ranges at logical boundaries (each summary within its cap), and submit them all together in the same call (content: [{startId,endId,summary}, {…}]). Do NOT fold piecemeal across turns: every small front fold re-bills the whole remaining tail to the prefix cache, while one batched call lands once. Keep draining while the nudge repeats — it stops when the backlog is gone. Where this conflicts with a single-span directive above, this takes precedence: the cited span is the starting point of the batch, not its limit.]";
+    "\n\n[First-sight digestion: the compressible ranges above are a pre-existing backlog this session arrived with, not growth from your current task. Drain the backlog in ONE batched compress call — cover EVERY ready range, splitting oversized spans into multiple smaller ranges at logical boundaries (each summary within its cap), and submit them all together in the same call — every range goes into ONE 'content' string (format in the compress tool description). Do NOT fold piecemeal across turns: every small front fold re-bills the whole remaining tail to the prefix cache, while one batched call lands once. Keep draining while the nudge repeats — it stops when the backlog is gone. Where this conflicts with a single-span directive above, this takes precedence: the cited span is the starting point of the batch, not its limit.]";
 const FIRST_SIGHT_DRAIN_NOTE_EXTERNAL =
-    "\n\n[First-sight digestion: the compressible ranges above are a pre-existing backlog this session arrived with, not growth from your current task. The independent summary service writes the summaries — you only select the ranges (plus optional topic hints), so your own response-length budget is not a limit here. Drain the backlog in ONE batched compress call — cover EVERY ready range, splitting oversized spans into multiple smaller ranges at logical boundaries, and submit them all together in the same call (content: [{startId,endId,summary}, {…}]). Do NOT fold piecemeal across turns: every small front fold re-bills the whole remaining tail to the prefix cache, while one batched call lands once. Keep draining while the nudge repeats — it stops when the backlog is gone. Where this conflicts with a single-span directive above, this takes precedence: the cited span is the starting point of the batch, not its limit.]";
+    "\n\n[First-sight digestion: the compressible ranges above are a pre-existing backlog this session arrived with, not growth from your current task. The independent summary service writes the summaries — you only select the ranges (plus optional topic hints), so your own response-length budget is not a limit here. Drain the backlog in ONE batched compress call — cover EVERY ready range, splitting oversized spans into multiple smaller ranges at logical boundaries, and submit them all together in the same call — every range goes into ONE 'content' string (format in the compress tool description). Do NOT fold piecemeal across turns: every small front fold re-bills the whole remaining tail to the prefix cache, while one batched call lands once. Keep draining while the nudge repeats — it stops when the backlog is gone. Where this conflicts with a single-span directive above, this takes precedence: the cited span is the starting point of the batch, not its limit.]";
 
 /** True when the kernel flagged the nudge reason with the first-sight mass
  *  marker (kernel/src/compress.ts appends " [first-sight mass]" while a
@@ -725,7 +750,7 @@ export function withMarkerIntegrityNote(text: string, visibilityMarkers = true):
 // a hard number so it stays correct regardless of the configured cap (the exact
 // limit is already reported verbatim in the kernel's failure message).
 const SUMMARY_BUDGET_NOTE =
-    "\n\n[Per-summary length budget: every compress summary has a hard character cap, and a single oversized summary fails the WHOLE compress call — nothing gets folded. Dense content (many subagent results, long tool outputs) tempts you into writing one giant summary for a big range; don't. When a range is large or dense, SPLIT it into several smaller ranges at logical boundaries and give EACH its own concise, scannable summary, then batch all the ranges in one compress call (content: [{startId,endId,summary}, {…}]). Prefer several tight blocks over one bloated block: each stays under the cap, and smaller blocks are cheaper to re-send and independently searchable/decompressible.]";
+    "\n\n[Per-summary length budget: every compress summary has a hard character cap, and a single oversized summary fails the WHOLE compress call — nothing gets folded. Dense content (many subagent results, long tool outputs) tempts you into writing one giant summary for a big range; don't. When a range is large or dense, SPLIT it into several smaller ranges at logical boundaries and give EACH its own concise, scannable summary, then batch all the ranges in one compress call — every range goes into the ONE 'content' string (format in the compress tool description). Prefer several tight blocks over one bloated block: each stays under the cap, and smaller blocks are cheaper to re-send and independently searchable/decompressible.]";
 
 /** Append the per-summary length-budget rule to a nudge or system-prompt text,
  *  whenever the model writes the committed summary. In external-summary mode
