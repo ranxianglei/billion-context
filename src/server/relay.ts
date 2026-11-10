@@ -1353,15 +1353,17 @@ async function forwardCaptured(
     }
     // #552 learn-on-failure: a converting upstream that rejects a role (codex
     // ≥0.153 sends "developer"; vLLM/SGLang-style backends answer 400
-    // "Invalid role: developer") gets ONE auto-retry with the offending role
-    // rewritten to "system". On success the mapping is remembered on the
-    // session (never written to config — the log carries the permanent
-    // per-provider snippet instead). On failure the original response
-    // continues downstream verbatim. 400 bodies are small (buffered below).
+    // "Invalid role: developer", serde-based ones such as DeepSeek answer 422
+    // "messages[0].role: unknown variant `developer`", #6063) gets ONE
+    // auto-retry with the offending role rewritten to "system". On success the
+    // mapping is remembered on the session (never written to config — the log
+    // carries the permanent per-provider snippet instead). On failure the
+    // original response continues downstream verbatim. Error bodies for these
+    // request-validation statuses are small (buffered below).
     if (
         compatProtocol &&
         typeof wireBody === "string" &&
-        upstreamResult.response.status === 400 &&
+        (upstreamResult.response.status === 400 || upstreamResult.response.status === 422) &&
         upstreamResult.response.body
     ) {
         let roleErrText: string | null = null;
