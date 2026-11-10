@@ -28,11 +28,21 @@ export interface RawStripCounts {
     markerLines: number;
     nudges: number;
     carriers: number;
+    // #6018: wall time of this pass (ms, one decimal). The O(history) inbound
+    // walk resends every turn; field reports must be able to attribute its
+    // share of per-turn latency from the log instead of subtracting phase
+    // residuals (the #5792 host-json-parse pattern).
+    strippedMs: number;
 }
 
 function emptyCounts(): RawStripCounts {
-    return { panels: 0, statusBodies: 0, statusBodyLines: 0, markerLines: 0, nudges: 0, carriers: 0 };
+    return { panels: 0, statusBodies: 0, statusBodyLines: 0, markerLines: 0, nudges: 0, carriers: 0, strippedMs: 0 };
 }
+
+// #6018: log threshold for the raw-strip wall-time line. A normal session
+// strips in <1ms; ≥10ms means this walk costs as much as a small network hop
+// and deserves an attributable line next to the request-cost line.
+const RAW_STRIP_SLOW_MS = 10;
 
 function countMarkerLines(text: string): number {
     let n = 0;
@@ -57,10 +67,17 @@ function stripTextSlot(text: string, counts: RawStripCounts, opts?: { noStatusBo
             counts.statusBodyLines += body.lines;
         }
     }
-    const out = stripMarkerLines(t);
-    if (out !== t) {
-        counts.markerLines += countMarkerLines(t);
-        t = out.trim().length > 0 ? out : " ";
+    // #6018: every MARKER_LINE match contains the literal "[ACP]" — clean
+    // history (the common case on long sessions) cannot match, so gate the
+    // global regex scan behind a SIMD literal check instead of rescanning all
+    // resent bytes with the regex every turn (measured: ~6.5ms → ~1.5ms over
+    // a 23MiB / 12,846-slot anthropic body).
+    if (t.includes("[ACP]")) {
+        const out = stripMarkerLines(t);
+        if (out !== t) {
+            counts.markerLines += countMarkerLines(t);
+            t = out.trim().length > 0 ? out : " ";
+        }
     }
     return t;
 }
@@ -204,6 +221,7 @@ function stripResponsesInput(input: unknown, counts: RawStripCounts): void {
 export function stripRawStage(parsed: unknown, wire: WireProtocol): RawStripCounts {
     const counts = emptyCounts();
     if (!isPlainRecord(parsed)) return counts;
+    const t0 = performance.now();
     counts.carriers = stripEmbeddedChainCarriers(parsed, wire);
     if (wire === "google") {
         stripGoogleContents(parsed, counts);
@@ -212,6 +230,7 @@ export function stripRawStage(parsed: unknown, wire: WireProtocol): RawStripCoun
     } else {
         stripMessagesArray(parsed.messages, counts);
     }
+    counts.strippedMs = Number((performance.now() - t0).toFixed(1));
     return counts;
 }
 
@@ -246,5 +265,11 @@ export function logRawStripCounts(
     }
     if (counts.carriers > 0) {
         log("info", `[${sessionId}] stripped ${counts.carriers} embedded chain checkpoint(s) from incoming history (leaked egress control data, issue #1542)`);
+    }
+    // Emitted independently of artifact counts: a pass over a huge CLEAN
+    // history strips nothing yet still costs wall time — that is exactly the
+    // slice a field report needs to attribute (#6018).
+    if (counts.strippedMs >= RAW_STRIP_SLOW_MS) {
+        log("info", `[${sessionId}] raw-strip: ${counts.strippedMs}ms — O(history) inbound marker walk over the resent body (issue #6018)`);
     }
 }

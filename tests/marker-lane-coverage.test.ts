@@ -8,7 +8,7 @@
 // BEFORE the field does.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { stripRawStage, type RawStripCounts } from "../src/marker/engine.ts";
+import { logRawStripCounts, stripRawStage, type RawStripCounts } from "../src/marker/engine.ts";
 import { MARKER_SPECS, type MarkerId, type MarkerScope, type MarkerSpec, type MarkerStage } from "../src/marker/spec.ts";
 import { MARKER_INTEGRITY_NOTE } from "../src/marker/anchors.ts";
 import { buildVisibilityMarker } from "../src/loop/core.ts";
@@ -175,7 +175,44 @@ test("engine: the declarative spec table and the engine agree on raw-stage class
     // stage must NEVER strip a foreign literal tag from user text.
     assert.ok(!rawIds.includes("render_tag"));
     const counted = ["panels", "statusBodies", "markerLines", "nudges", "carriers"] as const;
-    assert.equal(Object.keys(stripRawStage({ messages: [] }, "anthropic")).length, counted.length + 1, "counts shape unchanged: spec/engine drift check");
+    // statusBodyLines is a sub-count of statusBodies and strippedMs the pass
+    // wall time (#6018) — neither is an artifact class, so neither is a spec
+    // id. Both are enumerated here so a NEW silently-added class still fails
+    // this check.
+    assert.deepEqual(
+        Object.keys(stripRawStage({ messages: [] }, "anthropic")).sort(),
+        [...counted, "statusBodyLines", "strippedMs"].sort(),
+        "counts shape unchanged: spec/engine drift check",
+    );
+});
+
+test("engine: marker-line gate fires only on the literal [ACP] (#6018)", () => {
+    // negative row: near-miss text without the literal cannot match MARKER_LINE
+    // — it must ride byte-intact through the gated pass exactly as before.
+    {
+        const body = { messages: [{ role: "assistant", content: "📦 [AC P] Compressed m00001–m00010 → b5 and 📦[ACP ] x" }] };
+        const counts = stripRawStage(body, "anthropic");
+        assert.equal(counts.markerLines, 0);
+        assert.equal(body.messages[0].content, "📦 [AC P] Compressed m00001–m00010 → b5 and 📦[ACP ] x", "near-miss without literal [ACP] untouched");
+    }
+    // positive row: the literal line is still stripped when present.
+    {
+        const body = { messages: [{ role: "assistant", content: "before\n📦 [ACP] Compressed m00001–m00010 → b5\nafter" }] };
+        const counts = stripRawStage(body, "anthropic");
+        assert.equal(counts.markerLines, 1);
+        assert.ok(!String(body.messages[0].content).includes("[ACP]"), "literal marker line stripped");
+    }
+});
+
+test("engine: strippedMs measures the pass; the slow line logs only above threshold (#6018)", () => {
+    const small = stripRawStage({ messages: [{ role: "user", content: "hi" }] }, "anthropic");
+    assert.ok(Number.isFinite(small.strippedMs) && small.strippedMs >= 0, "strippedMs is a finite non-negative number");
+    const lines: string[] = [];
+    const log = (_level: "info" | "warn", msg: string): void => { lines.push(msg); };
+    logRawStripCounts({ panels: 0, statusBodies: 0, statusBodyLines: 0, markerLines: 0, nudges: 0, carriers: 0, strippedMs: 3.2 }, log, "s1");
+    assert.ok(!lines.some((m) => m.includes("raw-strip")), "below threshold: silent");
+    logRawStripCounts({ panels: 0, statusBodies: 0, statusBodyLines: 0, markerLines: 0, nudges: 0, carriers: 0, strippedMs: 12.4 }, log, "s1");
+    assert.ok(lines.some((m) => m.includes("raw-strip: 12.4ms")), "above threshold: attributable line");
 });
 
 test("engine: degraded slots become a space, never an empty string (#1542 zombie guard)", () => {
