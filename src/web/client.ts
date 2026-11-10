@@ -1584,9 +1584,9 @@ function changelogCatOf(rawLine) {
                 ab.hidden = false;
                 ab.classList.add("show");
                 if (a.pendingRestart) {
-                    ab.innerHTML = '<strong>' + t("advisory.on") + '</strong> <span class="mono">[' + a.id + "]</span> " + t("advisory.restartDesc") + "<span>" + (a.reason || "") + "</span>" + t("advisory.restartHint");
+                    ab.innerHTML = '<strong>' + t("advisory.on") + '</strong> <span class="mono">[' + escapeHtml(a.id) + "]</span> " + t("advisory.restartDesc") + "<span>" + escapeHtml(a.reason || "") + "</span>" + t("advisory.restartHint");
                 } else {
-                    ab.innerHTML = '<strong>' + t("advisory.on") + '</strong> <span class="mono">[' + a.id + "]</span> " + t("advisory.desc") + "<span>" + (a.reason || "") + "</span>" + t("advisory.hint") + '<span class="mono">npm install -g billion-context@' + (a.targetFailed ? "latest" : a.target || "latest") + "</span>";
+                    ab.innerHTML = '<strong>' + t("advisory.on") + '</strong> <span class="mono">[' + escapeHtml(a.id) + "]</span> " + t("advisory.desc") + "<span>" + escapeHtml(a.reason || "") + "</span>" + t("advisory.hint") + '<span class="mono">npm install -g billion-context@' + escapeHtml(a.targetFailed ? "latest" : a.target || "latest") + "</span>";
                 }
             } else {
                 ab.hidden = true;
