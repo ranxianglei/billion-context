@@ -23,8 +23,8 @@
 // versa), and the resolver's raw-lane rescue would then RE-ANCHOR one
 // conversation onto the other's lane. Once sidechain rows exist in the file,
 // BOTH directions therefore demand content verification: the request's
-// per-message fingerprints (ctx.messageFingerprints) must equal the candidate
-// thread's tail text fingerprints at EVERY position. Outcomes:
+// per-message fingerprints (ctx.computeMessageFingerprints()) must equal the
+// candidate thread's tail text fingerprints at EVERY position. Outcomes:
 //   - exactly one candidate verifies (a sidechain thread, or the main tail) → bind;
 //   - none verifies, several shape-match, or main+thread both verify → null
 //     (never guess — a miss costs pinning, a wrong bind corrupts a lane);
@@ -173,7 +173,9 @@ function tailFpsEqualVisible(tail: readonly ClaudeVisibleRow[], fps: readonly st
  *  the world where role-only alignment can misbind in either direction.
  *  See the module header for the outcome matrix. */
 function attributeSidechainWorld(ctx: IdentityHarvestCtx, visible: ClaudeVisibleRow[], scRows: ClaudeSidechainRow[]): string[] | null {
-    const fps = ctx.messageFingerprints;
+    // Invoked only from snapshot() after every registry gate passed AND this
+    // file contains sidechain rows — the only world where the hashing pays.
+    const fps = ctx.computeMessageFingerprints?.();
     if (fps === undefined || fps.length !== ctx.expectedLen) return null; // no content evidence → never guess
     const mainTailOk = visible.length >= ctx.expectedLen
         && (() => {
