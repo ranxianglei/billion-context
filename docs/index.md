@@ -10,7 +10,7 @@
 | [README](../README.md) / [中文](../README.zh-CN.md) / [日本語](../README.ja.md) | Project entry: what it is, quickstart, architecture overview |
 | [architecture](architecture.md) / [中文](architecture.zh-CN.md) | **System architecture hub** (LIVE doc, owner ruling 2026-11-08): overall diagram + per-module pages, each with its own diagram — see `docs/architecture/` |
 | [configuration](configuration.md) / [中文](configuration.zh-CN.md) | Full configuration reference (generated from `website/config-reference/*.yaml` by `tools/gen-config-docs.mjs`; hand-written sections are drift-guarded) |
-| [clients](clients.md) / [中文](clients.zh-CN.md) | Per-client integration deep dives: how each mode (launcher / `/bili/` / native plugin) wires traffic in |
+| [clients](clients.md) / [中文](clients.zh-CN.md) / [日本語](clients.ja.md) | Per-client integration deep dives: how each mode (launcher / `/bili/` / native plugin) wires traffic in |
 | [how-it-works](how-it-works.en.svg) / [中文](how-it-works.zh-CN.svg) | One diagram: request flow + the injected context tools |
 | [README](README.md) / [中文](README.zh-CN.md) / [日本語](README.ja.md) | Directory landing page: section map + the rules that keep this directory live |
 
