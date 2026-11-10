@@ -3927,6 +3927,157 @@ export async function pipePluginChatWithStrip(
     }
 }
 
+// #1295: plugin-mode passthrough for the commandcode CLI wire (bare JSONL).
+// The agent owns compression (its compress tool call rides its own re-sent
+// history), so the proxy only strips model-emitted render tags from the two
+// prose fields and sniffs usage; every other byte passes through untouched.
+export async function pipePluginJsonlWithStrip(
+    stream: ReadableStream<Uint8Array>,
+    res: ServerResponse,
+    session?: Session,
+    log?: (s: string) => void,
+): Promise<void> {
+    const reader = stream.getReader();
+    const decoder = new TextDecoder("utf-8");
+    let buf = "";
+    // One filter instance per prose field (the SSE pipe keeps per-field
+    // instances too — a shared state machine cross-contaminates text and
+    // reasoning when the fields interleave). The JSONL wire carries each
+    // delta as a whole line, so the filters' held tails are only resolved at
+    // the terminal frame / EOF / read failure — never per line (a per-line
+    // flush destroys the cross-delta tag/marker state this filter exists for).
+    const onStrip = (snippet: string) => {
+        loggerLog("warn", `[tag-echo] stripped model-emitted render tag (commandcode plugin mode): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+        log?.(`[tag-echo] stripped model-emitted render tag: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+    };
+    const textFilter = composeStreamFilters(createTagEchoFilter(onStrip), createMarkerLineFilter());
+    const reasonFilter = composeStreamFilters(createTagEchoFilter(onStrip), createMarkerLineFilter());
+    let sawTerminal = false;
+    let visibleTextChars = 0;
+    let finalFinishReason: string | undefined;
+    const acc: UsageSample = {};
+    const settleUsage = () => {
+        if (session && (acc.inputTokens !== undefined || acc.outputTokens !== undefined || acc.cachedTokens !== undefined || acc.creationTokens !== undefined)) {
+            applyUsageSample(session, acc, "openai");
+            markDirty(session);
+        }
+    };
+    const maybeWarnDegenerate = () => {
+        if (!sawTerminal || res.destroyed || res.writableEnded) return;
+        const st = { inputChars: 0, outputChars: 0, dropped: false, dropCount: 0 };
+        for (const f of [textFilter, reasonFilter]) {
+            const s = f.stats();
+            st.inputChars += s.inputChars;
+            st.outputChars += s.outputChars;
+            st.dropped = st.dropped || s.dropped;
+            st.dropCount += s.dropCount;
+        }
+        const msg = degenerateTurnWarning({
+            reason: finalFinishReason,
+            terminalReason: "stop",
+            toolCalls: 0,
+            text: { inputChars: st.inputChars, outputChars: visibleTextChars, dropped: st.dropped, dropCount: st.dropCount },
+            sawThinking: false,
+            wire: "plugin-passthrough-commandcode",
+        });
+        if (msg) {
+            loggerLog("warn", msg);
+            log?.(msg);
+        }
+    };
+    // Write back whatever prose the filters are still holding as synthetic
+    // lines of the ORIGINAL event type, so held tails land before the
+    // terminal frame instead of being silently dropped (mirrors the SSE
+    // pipe's flushTails-at-terminal pattern).
+    const flushFieldTails = async () => {
+        const textTail = textFilter.flush();
+        const reasonTail = reasonFilter.flush();
+        if (textTail.length > 0 && !res.destroyed && !res.writableEnded) {
+            visibleTextChars += textTail.length;
+            if (!res.write(Buffer.from(JSON.stringify({ type: "text-delta", text: textTail }) + "\n", "utf8"))) await awaitDrain(res);
+        }
+        if (reasonTail.length > 0 && !res.destroyed && !res.writableEnded) {
+            if (!res.write(Buffer.from(JSON.stringify({ type: "reasoning-delta", text: reasonTail }) + "\n", "utf8"))) await awaitDrain(res);
+        }
+    };
+    try {
+        while (true) {
+            let done: boolean;
+            let value: Uint8Array | undefined;
+            try {
+                ({ done, value } = await reader.read());
+            } catch (e) {
+                settleUsage();
+                if (res.destroyed || res.writableEnded) return;
+                try { await flushFieldTails(); } catch { /* client half-gone; the signal below is best-effort too */ }
+                loggerLog("warn", `[plugin] upstream stream read failed (commandcode): ${String(e instanceof Error ? e.message : e)} — emitting in-band truncation signal`);
+                emitUpstreamTruncation(res, "commandcode", finalFinishReason !== undefined, log);
+                return;
+            }
+            if (done) break;
+            buf += decoder.decode(value, { stream: true });
+            let idx: number;
+            while ((idx = buf.indexOf("\n")) >= 0) {
+                const line = buf.slice(0, idx);
+                buf = buf.slice(idx + 1);
+                if (line.trim().length === 0) continue;
+                let ev: Record<string, unknown>;
+                try {
+                    ev = JSON.parse(line) as Record<string, unknown>;
+                } catch {
+                    if (!res.write(Buffer.from(line + "\n", "utf8"))) await awaitDrain(res);
+                    continue;
+                }
+                const type = ev["type"];
+                let outLine = line;
+                if ((type === "text-delta" || type === "reasoning-delta") && typeof ev["text"] === "string") {
+                    const f = type === "text-delta" ? textFilter : reasonFilter;
+                    const clean = f.push(ev["text"] as string);
+                    if (type === "text-delta") visibleTextChars += clean.length;
+                    if (clean !== ev["text"]) outLine = JSON.stringify({ ...ev, text: clean });
+                } else if (type === "finish") {
+                    await flushFieldTails();
+                    sawTerminal = true;
+                    if (typeof ev["finishReason"] === "string") finalFinishReason = ev["finishReason"] as string;
+                    const tu = ev["totalUsage"];
+                    if (tu !== null && typeof tu === "object" && !Array.isArray(tu)) {
+                        const t = tu as Record<string, unknown>;
+                        if (typeof t["inputTokens"] === "number") acc.inputTokens = t["inputTokens"] as number;
+                        if (typeof t["outputTokens"] === "number") acc.outputTokens = t["outputTokens"] as number;
+                        const details = t["inputTokenDetails"];
+                        if (details !== null && typeof details === "object" && typeof (details as Record<string, unknown>)["cacheReadTokens"] === "number") {
+                            acc.cachedTokens = (details as Record<string, unknown>)["cacheReadTokens"] as number;
+                        }
+                    }
+                } else if (type === "error") {
+                    sawTerminal = true;
+                    await flushFieldTails();
+                }
+                if (!res.write(Buffer.from(outLine + "\n", "utf8"))) await awaitDrain(res);
+            }
+        }
+        await flushFieldTails();
+        if (buf.trim().length > 0 && !res.destroyed && !res.writableEnded) {
+            if (!res.write(Buffer.from(buf + "\n", "utf8"))) await awaitDrain(res);
+        }
+        settleUsage();
+        maybeWarnDegenerate();
+    } catch (e) {
+        settleUsage();
+        if (res.destroyed || res.writableEnded) {
+            log?.("client aborted mid-stream");
+            return;
+        }
+        try { await flushFieldTails(); } catch { /* client half-gone; the signal below is best-effort too */ }
+        loggerLog("warn", `[plugin] upstream stream read failed (commandcode): ${String(e instanceof Error ? e.message : e)} — emitting in-band truncation signal`);
+        emitUpstreamTruncation(res, "commandcode", finalFinishReason !== undefined, log);
+        return;
+    } finally {
+        reader.releaseLock();
+        res.end();
+    }
+}
+
 /** #5951: name a read failure in the truncation diag. The socket's own code
  *  (`ECONNRESET`, `UND_ERR_SOCKET`, ...) is what tells a provider disconnect
  *  apart from a local abort, and it is the only part of the cause that is not

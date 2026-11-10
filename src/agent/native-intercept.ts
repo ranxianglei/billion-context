@@ -10,6 +10,7 @@ import { installFetchChain, isDeadClosureError, resetFetchChainForTest } from ".
 import { logHostEvent } from "./host-log.js";
 
 import { envMillis } from "./native-bootstrap.js";
+import { matchModelEndpoint, type ModelEndpointPattern } from "../model-endpoints.js";
 import { mediaBytesOfWireBody } from "./media-bytes.js";
 import * as pfChannel from "./pf-channel.js";
 import { probeLiveness, type LivenessVerdict } from "../liveness.js";
@@ -273,6 +274,23 @@ function noteSignedDirect(url: string, scheme: string, why: string): void {
 // `acp_status` reporting "unknown plugin conversation") (#5593).
 const MODEL_API_SUFFIX = /(?:^|\/)(?:v\d+\/)?(?:messages|chat\/completions|completions|responses|conversations)\/?$|(?:^|\/)models\/[^:?]+:(?:streamGenerateContent|generateContent|countTokens)$|(?:^|\/)v1internal:(?:streamGenerateContent|generateContent|countTokens)$/;
 
+// #1295: declared custom-wire endpoints (src/model-endpoints.ts) — the SAME
+// config source the proxy classifier reads, so client claim and proxy
+// classification can no longer drift. Entries populate this at plugin load;
+// a config change takes effect on the next host start.
+let declaredPatterns: readonly ModelEndpointPattern[] = [];
+
+export function setDeclaredModelEndpoints(patterns: readonly ModelEndpointPattern[]): void {
+    declaredPatterns = patterns;
+}
+
+/** Current declared patterns (read-only view). Host gates consult this to let
+ *  explicitly declared endpoints through even when heuristic attribution is
+ *  unavailable (#1295). */
+export function getDeclaredModelEndpoints(): readonly ModelEndpointPattern[] {
+    return declaredPatterns;
+}
+
 /** True when the URL points at a model-API endpoint worth proxying. Never
  *  true for bili's own proxy paths (`/bili/…`, `/__bili/…`) or non-HTTP(S). */
 /** True when this process carries the native fetch intercept (#519) — every
@@ -291,6 +309,8 @@ export function isModelApiUrl(url: string): boolean {
         const u = new URL(url);
         const segments = u.pathname.split("/").filter((s) => s.length > 0);
         if (segments[0] === "bili") return false;
+        // #1295: an explicit declaration outranks the built-in suffix table.
+        if (matchModelEndpoint(declaredPatterns, url) !== undefined) return true;
         const pathname = u.pathname.replace(/\/+$/, "");
         return MODEL_API_SUFFIX.test(pathname);
     } catch {
@@ -2227,6 +2247,7 @@ export function _resetForTest(opts: { anchor?: typeof globalThis.fetch } = {}): 
     delete g[ACTIVE_STATE];
     delete g[ACTIVE_STATE_SEQ];
     signedDirectSeen.clear();
+    declaredPatterns = [];
     lastMissingStateLogSeq = Symbol("unset");
     lastKnownContextWindow = undefined;
     respawnCooldownOverrideMs = undefined;
