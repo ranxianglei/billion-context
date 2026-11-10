@@ -108,7 +108,7 @@ export function parseHttpProxy(proxy?: string, biliPort?: number): ParsedHttpPro
     }
     return {
         url: url.href,
-        host: url.hostname,
+        host: url.hostname.replace(/^\[|\]$/g, ""),
         port,
         protocol: url.protocol,
         ...(proxyAuthorization(url) ? { authorization: proxyAuthorization(url) } : {}),
@@ -457,7 +457,7 @@ export function _setConnectFactoryForTest(factory: ((port: number, host: string)
  *  branch's 10s handshake timeout (see #78). */
 export function connectDirect(host: string, port: number, timeoutMs: number = CONNECT_TIMEOUT_MS): Promise<net.Socket> {
     return new Promise((resolve, reject) => {
-        const socket = connectFactory(port, host);
+        const socket = connectFactory(port, host.replace(/^\[|\]$/g, ""));
         let settled = false;
         const finishError = (error: Error) => {
             if (settled) return;
@@ -497,9 +497,10 @@ export function connectThroughProxy(host: string, port: number, proxyUrl: string
         socket.once("error", finishError);
         const connectedEvent = proxy.protocol === "https:" ? "secureConnect" : "connect";
         socket.once(connectedEvent, () => {
+            const authority = `${net.isIP(host) === 6 ? `[${host}]` : host}:${port}`;
             const headers = [
-                `CONNECT ${host}:${port} HTTP/1.1`,
-                `Host: ${host}:${port}`,
+                `CONNECT ${authority} HTTP/1.1`,
+                `Host: ${authority}`,
                 "Proxy-Connection: Keep-Alive",
                 ...(proxy.authorization ? [`Proxy-Authorization: ${proxy.authorization}`] : []),
                 "",
