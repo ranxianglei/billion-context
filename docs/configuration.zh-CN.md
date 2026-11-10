@@ -84,6 +84,7 @@
 | `upstreamProxy` | string | unset | — | Web 面板手动设置的代理层级（由仪表盘代理编辑器写入）；解析顺序中位于 BILI_UPSTREAM_PROXY 之下。 |
 | `upstreamProxyMode` | "auto" \| "manual" \| "direct" | auto (unset behaves as direct) | BILI_UPSTREAM_PROXY_MODE | 全局代理来源策略：auto（环境变量/系统发现）、manual（仅 Web 面板值）、direct（从不使用代理）。 |
 | `providers` | record url-prefix → route entry | {} | — | 路由表：URL 前缀键到逐 provider 条目（models、compress、compat…）的映射。详见 Providers 章节。 |
+| `modelEndpointPatterns` | array of { match: string, wire: "anthropic" \| "openai" \| "responses" \| "google" \| "commandcode" } | [] | — | 可声明的自定义 wire 模型端点：绝对 URL 前缀到 wire 族的映射。同一配置源同时喂给代理协议分类器与客户端 fetch 认领，两个门不再漂移（#1295）。 |
 | `modelContextLimit` | number | 200000 | ACP_MODEL_CONTEXT_LIMIT | 旧版全局默认窗口（窗口解析阶梯的最后一层兜底：仅当 tier 证据、plugin/launcher 报告、路由声明、注册表查询、内置表都未解析出该模型的上限时才使用；在其生效的会话里兼作使用率分母）；建议改用 compress.modelContextLimit。 |
 | `imageBilling` | "auto" \| "pixels" \| "bytes" | auto (resolves to pixels) | BILI_IMAGE_BILLING | 全局图片 token 估算口径；逐请求实时读取，优先于所有逐 provider 设置。 |
 | `imageTokenCap` | number | unset (uncapped) | BILI_IMAGE_TOKEN_CAP | 全局单图 token 上限，叠加在计费口径之上生效；逐请求实时读取。 |
@@ -294,7 +295,7 @@
 | `compress.preserveRecentTokens` | number | kernel ≈5000 | — | 最近的 token 软保护、免于折叠。 |
 | `compress.minCompressRangeChars` | number (deprecated alias: minCompressRange) | kernel ≈5000 | — | 可折叠片段的最小字符数；更短的永不折叠。 |
 | `compress.maxSummaryLength` | number | kernel 20000 | — | 单条生成摘要的硬字符上限；超长的回复被整段拒绝（不截断、不重试）。外部摘要模型会被提前告知这个确切上限（#3635）。0 = 不限制。 |
-| `compress.minSummaryLength` | number | kernel 50 | — | 生成摘要的字符下限；过短的回复被整段拒绝。0 = 禁用。外部摘要模型受同一下限约束（#3635）。 |
+| `compress.minSummaryLength` | number | kernel 50 | — | 生成摘要的字符下限：单段压缩按自身判定；批量压缩按合计判定——一段偷懒不再拖垮整批（#5894）。0 = 禁用。外部摘要模型仍受逐段下限约束（#3635）。 |
 | `compress.reconcile` | "off" \| "warn" \| "repair" | "repair" | BILI_FOLD_RECONCILE | 客户端在轮次之间回退或改写历史时校准已折叠状态。 |
 | `compress.compressAtFoldPoint` | boolean | false | BILI_COMPRESS_AT_FOLD_POINT | 实验性，默认关闭：把仍可见的压缩调用/结果对从原位置（贴近尾部）移到它自己的折叠点，即 [已折叠区]–[调用对]–[保护消息]，避免弱注意力模型把历史末尾的工具交换当成新命令。纯视图变换：refs 与状态不变、每轮重算结果一致；关闭时布局字节级不变。 |
 | `compress.compressAtFoldPointClearThinking` | boolean | false | BILI_COMPRESS_AT_FOLD_POINT_CLEAR_THINKING | 依附于 compress.compressAtFoldPoint 的第二层开关：调用对被挪位的一瞬间，同时丢掉紧邻其前的未签名思考段（模型对本次折叠本身的思考），让挪位后的开头更干净。主开关关闭时无效；带签名的思考块与严格推理回显会话绝不受影响（#1658/#684）。 |
@@ -1326,6 +1327,25 @@ URL 键通道（或带 `bind` 的命名条目）可以向上游发送**自己的
 - **默认值：** *（全局 `imageTokenCap`，再回退未设置 —— 无上限）*
 - **状态：** ACTIVE
 - **说明：** 按路由的单图 token 估算天花板（#1843），叠加在该路由解析出的任何计费模式之上。优先于全局 `imageTokenCap`；`BILI_IMAGE_TOKEN_CAP` 环境变量优先于两者。非数字或非正值按宽松解析丢弃（与 `imageBilling` 一致）。
+
+---
+
+## 模型端点声明（Model Endpoint Patterns）
+
+`modelEndpointPatterns` 用于声明非标路径上的模型端点 —— 路径形状不属于任何内置 wire family 的 URL（例如 `https://api.commandcode.ai/alpha/generate`）。未声明时这类请求逐字节 relay、零压缩（#1290）；声明后两个 gate 对它们达成一致：客户端 fetch patch 认领该请求，代理将其分类到声明的 wire family。
+
+- **类型：** `{ "match": string, "wire": "anthropic" | "openai" | "responses" | "google" | "commandcode" }` 数组
+- **默认值：** `[]`（仅内置路径表）
+- **状态：** ACTIVE
+- **说明：** 每个条目是一个绝对 URL 前缀加要按哪种 wire family 处理。最长匹配前缀优先；匹配要求同 origin 且落在 path 段边界上（`…/alpha/generate` 匹配自身及子路径，不匹配 `…/alpha/generate2`，也绝不匹配其他 origin）。同一份配置同时喂给代理侧协议分类器和所有 native entry 的客户端 fetch 认领逻辑，原先两张硬编码表从此不可能再漂移（#1295）。注意两个 gate 在带路径重写的 provider 上匹配的 URL 不同：客户端认领匹配客户端调用的 URL，代理分类器匹配重写后的 URL —— **请声明请求实际落地的 URL**（配置了 `upstreamPath` 重写时即重写后的路径）。Userinfo（`https://user:pass@host/…`）与 `search`/`hash` 一样在启动时被大声拒绝。基于 body 的消歧仍然生效（#1284）：已声明端点若 body 看起来不是模型对话则原样 relay；不可转换的 `commandcode` body（非流式 CLI 对话等）同样原样 relay（见 [wire-contracts.zh-CN.md](wire-contracts.zh-CN.md)）。四个标准 family 只改变分类判定，管线本身不变。`commandcode` 是 commandcode CLI wire：嵌套 envelope 包着一个 openai-completions 形状的对话，响应为裸 JSONL 事件流；流式请求走 OpenAI 族循环压缩（proxy 与 plugin 两种模式都支持），非流式降级为原样 relay。声明在进程启动时读取 —— 修改后需重启 bili（以及需要由 fetch patch 认领该端点的 native client）才能生效。条目格式错误会在启动时大声报错，而不是被静默丢弃。
+
+  ```jsonc
+  {
+    "modelEndpointPatterns": [
+      { "match": "https://api.commandcode.ai/alpha/generate", "wire": "commandcode" }
+    ]
+  }
+  ```
 
 ---
 
@@ -2398,7 +2418,7 @@ MITM 只对一份**白名单**中的模型域名生效（`open.bigmodel.cn`、`a
 | hermes | `HTTPS_PROXY`（明文 http 走 absolute-form 正向代理请求） | `SSL_CERT_FILE` → `combined-ca.pem`（另设旧版 `HERMES_CA_BUNDLE` → `root-ca.pem`） |
 | dsh | `HTTPS_PROXY`（明文 http 另加 `HTTP_PROXY`）+ `DEEPSEEK_BASE_URL`；**仅回环**隔离 `DSH_HOME` | `SSL_CERT_FILE` → `combined-ca.pem` |
 
-`NODE_EXTRA_CA_CERTS` 是**追加**到内置信任库，所以只指向 MITM 根证书（`root-ca.pem`）即可。`SSL_CERT_FILE` 会**替换**默认 CA bundle，所以 codex/dsh/hermes 指向 `combined-ca.pem` —— 包含 MITM 根证书**加上**操作系统信任库与 Node 公共根。合并 OS 信任库很关键：部分被启动的客户端把这个文件当作**整个**信任池（codex 的 rustls HTTP 栈是替换而非追加，#1807），它们的直连（不经代理）连接只能靠这个文件校验，因此文件必须是 OS 自身信任集合的超集（Windows 经 PowerShell 读证书库、macOS 经 `security(1)` 读钥匙串；Linux 本就直读文件系统 bundle；最多每 24 小时重建一次）。最初引入该 bundle 是为了让子进程环境里 pip/git/curl 类 TLS（盲转发、真证书）不受影响（#152；hermes 自 #1375 起，因为当前 hermes 只经 `SSL_CERT_FILE` 解析环境信任；OS 信任库合并自 #1807 起）。
+`NODE_EXTRA_CA_CERTS` 是**追加**到内置信任库，所以只指向 MITM 根证书（`root-ca.pem`）即可。`SSL_CERT_FILE` 会**替换**默认 CA bundle，所以 codex/dsh/hermes 指向 `combined-ca.pem` —— 包含 MITM 根证书**加上**操作系统信任库与 Node 公共根，且只保留 CA 证书（#5802：darwin 的 `security(1)` 钥匙串导出会混入非 CA 叶子身份证书（如 `com.apple.kerberos.kdc`），codex 这类替换语义客户端只要有一个条目解析失败就拒绝整份文件）。合并 OS 信任库很关键：部分被启动的客户端把这个文件当作**整个**信任池（codex 的 rustls HTTP 栈是替换而非追加，#1807），它们的直连（不经代理）连接只能靠这个文件校验，因此文件必须是 OS 自身信任集合的超集（Windows 经 PowerShell 读证书库、macOS 经 `security(1)` 读钥匙串；Linux 本就直读文件系统 bundle；最多每 24 小时重建一次）。最初引入该 bundle 是为了让子进程环境里 pip/git/curl 类 TLS（盲转发、真证书）不受影响（#152；hermes 自 #1375 起，因为当前 hermes 只经 `SSL_CERT_FILE` 解析环境信任；OS 信任库合并自 #1807 起）。
 
 Claude Code 的 undici fetch 忽略 `HTTPS_PROXY`，所以证书 MITM 拦不到它。claude 的所有上游 —— 包括预先配置的 `ANTHROPIC_BASE_URL` relay，以及 `CLAUDE_CODE_USE_VERTEX=1` 下的 Vertex 端点 —— 一律改走 `/bili/` URL 形式，通过客户端自己的 base URL 变量下发；无需任何 CA 信任。
 

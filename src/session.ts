@@ -647,6 +647,15 @@ export type Session = {
      *  the message that now owns the number). A fresh process that never
      *  re-stamped has no map and every ref behaves normally. */
     restampSuperseded?: Map<string, string>;
+    /** #5608-D: set when a fold commits on a not-yet-aligned session. The
+     *  #4316 citation-space alignment used to run at cold load — every
+     *  restart renumbered ALL refs and burned ONE full-prefix provider
+     *  re-bill on the very first post-restart round. Now it defers to the
+     *  NEXT successful fold: that rewrite already invalidates history once,
+     *  so the renumbering rides its boundary free; sessions that never fold
+     *  keep their legacy refs forever (zero cost). Persist consumes the
+     *  marker exactly once on the save path. Process-lifetime only. */
+    pendingLedgerAlign?: boolean;
     createdAt: number;
     lastSeen: number;
     /** Original content of compressed blocks, captured at compress time when

@@ -1063,6 +1063,11 @@ test("e2e: oversized side request is blocked locally (413), never reaches the up
         const s = getSession(SESSION);
         assert.ok(s, "session row exists (created before the gate)");
         assert.equal(JSON.stringify(s.state), JSON.stringify(createInitialState()), "kernel state untouched by side requests (blocked or not)");
+        // Named poison-field pin (#5608-B fix for exactly this shape): a resume-miss
+        // under UNPROVEN identity (cross-lane boilerplate prefix match) must not arm
+        // honest-NULL on a side lane — a lane that never runs a kernel pass could
+        // never self-clear the flag, and it would ride into persisted state.
+        assert.equal(s.state.suppressMintingOnce, undefined, "unproven-identity miss must not arm honest-NULL on a side request (#554/#5608-B)");
         assert.equal(s.stats.requests, 0, "side requests do not count as main requests");
     } finally {
         await closeRig(rig);
