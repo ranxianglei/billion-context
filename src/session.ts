@@ -13,7 +13,7 @@ import type { WireProtocol } from "./util.js";
 import type { InboundSlot, SeamSlot } from "./cache-ledger.js";
 import { isResponsesTurnSeparatorId } from "./turn-separator.js";
 import type { FoldReconcileResult } from "./fold-reconcile.js";
-import type { UnpromptedGate } from "./unprompted-gate.js";
+import type { UnpromptedGateState } from "./unprompted-gate.js";
 
 export type BlockView = { text: string; count: number };
 
@@ -338,12 +338,14 @@ export type Session = {
          *  In-memory only: the abort→resume causality spans one process
          *  lifetime, and a restart replants nothing. */
         abortReanchor?: { anchor: number; at: number };
-        /** #5683: the conversation's latest model-round compression-prompt facts
-         *  for the unprompted/out-of-bounds gates (src/unprompted-gate.ts).
-         *  Re-stamped on every prepare; in-memory only — a restart reads the
-         *  all-off default until the first round re-stamps, which is safe: no
-         *  tool call can reach applyRanges before its own round's prepare. */
-        unpromptedGate?: UnpromptedGate;
+        /** #5683/#5943: the conversation's live nudge CREDIT plus the policy
+         *  flags, for the unprompted/out-of-bounds gates (src/unprompted-gate.ts).
+         *  Re-stamped on every prepare (injected rounds re-mint the window,
+         *  un-nudged model rounds decay it); in-memory only — a restart lapses
+         *  any live credit to the all-off default until the first round
+         *  re-stamps, which is safe: no tool call can reach applyRanges before
+         *  its own round's prepare. */
+        unpromptedGate?: UnpromptedGateState;
         /** #5981: the last model stream on this conversation was CUT before its
          *  terminal event (src/plugin.ts emitUpstreamTruncation sites). A tool
          *  call dispatched out of such a stream can carry EMPTY arguments —

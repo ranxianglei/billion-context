@@ -2946,19 +2946,28 @@ async function handleRequest(
                         degradeAvailable: opts.compress.injectTool && !knobNoInjectTool(),
                     }, log);
                 }
-                // #5683: stamp this round's compression-prompt facts for the
-                // unprompted/out-of-bounds gates (applyRanges). armed tracks the
-                // SAME post-gate delivery fact as the self-heal credit above —
-                // only an actually delivered nudge ("injected") arms; "gated"
-                // rounds held by the emergency backoff never did reach the model.
-                // Stamped on EVERY round (not just nudge-carrying ones) so an
-                // un-nudged round disarms a stale arm; loop re-requests within
-                // the same turn do not re-run prepare, so the arm persists across
-                // rounds of one turn and dies with the next un-nudged turn.
+                // #5683/#5943: stamp this round's compression-prompt facts for
+                // the unprompted/out-of-bounds gates (applyRanges). nudgeInjected
+                // tracks the SAME post-gate delivery fact as the self-heal credit
+                // above — only an actually delivered nudge ("injected") mints;
+                // "gated" rounds held by the emergency backoff never did reach
+                // the model. #5943: the gate consumes a CREDIT, not this-round
+                // arm — an injected round re-mints NUDGE_CREDIT_ROUNDS model
+                // rounds of eligibility and every un-nudged model round decays
+                // one, so a model that comes back one or several rounds later to
+                // finish a nudge's recommended cleanup is still inside its window
+                // instead of refused (the single-round arm refused all of them).
+                // Stamped on EVERY round (not just nudge-carrying ones) so
+                // un-nudged rounds keep decaying; loop re-requests within the
+                // same turn do not re-run prepare, so the window persists across
+                // them. Non-model shapes pass modelRound:false — they hold the
+                // window open without refreshing it, mirroring the preflight
+                // exclusion predicate below.
                 storeUnpromptedGate(session, {
-                    armed: prepared.nudgeOutcome === "injected",
+                    nudgeInjected: prepared.nudgeOutcome === "injected",
                     requireNudge: preparedCs?.requireNudge === true,
                     requireRecommendation: preparedCs?.requireRecommendation === true,
+                    modelRound: !countTokens && !responsesCompact && !prepared.codexForge && !prepared.threadsLane,
                 });
                 // A locally-served codex compaction forge never reaches an
                 // upstream: preflight would burn summarization rounds for a
