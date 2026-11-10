@@ -515,8 +515,12 @@ const SINGLE_REF_IN_LINE = /^([mb]\d{1,7})\b/i;
 // An unrecognized divider between two refs (punctuation run + a ref right
 // after) — the pair regex missed a separator variant. Folding as a single
 // ref would silently compress ONE message of a many-message range.
+// #6071: the run may mix punctuation with Han-script letters — CJK range
+// words (到/至) are \p{L}, so the original class let "m07890到m07950" through
+// as a single-ref header and narrowed a multi-message fold to one message,
+// exactly what this guard exists to prevent.
 const UNRECOGNIZED_REF_SEP_RE =
-  /^\s*[^\p{L}\p{N}\s]{1,3}\s*[mb]\d{1,7}\b/iu;
+  /^\s*(?:[^\p{L}\p{N}\s]|\p{Script=Han}){1,3}\s*[mb]\d{1,7}\b/iu;
 
 function normalizeLineRef(raw: string): string {
   const lower = raw.toLowerCase();
