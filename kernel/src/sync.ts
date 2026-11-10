@@ -108,6 +108,18 @@ export function syncBlocks(
     // the host's superseded map forever (the "one-time" restamp stops being
     // one-time; reference/ref-keyed-surfaces.md, flag-propagation contract).
     refLedgerAligned: state.refLedgerAligned,
+    // #5608-C: the visibility mark must survive the sync clone — dropping it
+    // re-arms the "first pass" write and could lower/refresh the mark (attr
+    // bytes would flap turn-to-turn = prefix churn). Conditional spread:
+    // legacy states carry no key and must stay key-free.
+    ...(state.timestampsHighWaterRefSeq !== undefined
+        ? { timestampsHighWaterRefSeq: state.timestampsHighWaterRefSeq }
+        : {}),
+    // #5608-B: the host arm rides the clone too; it self-clears on the first
+    // enabled stamp pass, and dropping it early would just re-open the mint.
+    ...(state.suppressMintingOnce !== undefined
+        ? { suppressMintingOnce: state.suppressMintingOnce }
+        : {}),
     // #4313: first-sight time stamps must survive the sync clone — dropping
     // them here would re-mint every stamped message a fresh wall-clock value
     // on the very next turn (timestamp drift = receipt range churn, and the
