@@ -1757,7 +1757,17 @@ export class UnifiedStore {
      *  sticky dead flag and returns null — the caller keeps legacy bytes. */
     snapEgressView(sessionId: string): SnapView | null {
         try {
-            return readSnapView(this.db as unknown as Parameters<typeof readSnapView>[0], sessionId);
+            const view = readSnapView(this.db as unknown as Parameters<typeof readSnapView>[0], sessionId);
+            if (!view) return null;
+            // #3762: rows persist the media-OFFLOADED form (imageBase64 =
+            // {"$media": hash}); every other row accessor hydrates on read —
+            // the egress view must too, or the seam walk and tripwire hash an
+            // offload object instead of the image bytes (identitySig TypeError
+            // took a whole turn down: the plane path must never fail a turn).
+            return {
+                ...view,
+                rows: view.rows.map((r) => r.postJson ? { ...r, postJson: this.hydrateMedia(r.postJson) } : r),
+            };
         } catch (err) {
             if (err instanceof SnapPlaneDeadError) {
                 loggerLog("warn", `[snaplane] sid=${sessionId} egress read hit a dead plane (R1) — legacy egress kept`);
