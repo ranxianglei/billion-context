@@ -200,6 +200,7 @@
 | `persist.enabled` | boolean | true | BILI_PERSIST | 会话记录落盘总开关（0/false 关闭）。 |
 | `persist.zstd` | boolean | false | BILI_PERSIST_ZSTD | zstd 压缩持久化会话文件（1/true 启用）。 |
 | `persist.debounceMs` | number | 500 | BILI_PERSIST_DEBOUNCE_MS | 会话文件写入的去抖窗口。 |
+| `persist.maxDelayMs` | number | 5000 | BILI_PERSIST_MAX_DELAY_MS | 持续写入时一次待落盘写入最多可等待的时长上限——去抖窗口每次变更都会重置，这个预算决定磨损敏感盘上的稳态重写速率（#6058）。 |
 | `persist.tailTokens` | number | 16384 (0 disables message persistence) | BILI_PERSIST_TAIL_TOKENS | 为导出保真保留的最近消息原文 token 尾部大小。 |
 | `persist.epermAlertThreshold` | number | 5 | BILI_PERSIST_EPERM_ALERT_THRESHOLD | 连续 EPERM 写失败达到该次数后在日志中告警。 |
 | `persist.epermAlertRepeatMs` | number | 0 (no repeats) | BILI_PERSIST_EPERM_ALERT_REPEAT_MS | EPERM 告警的重复间隔；0 只记录一次。 |
@@ -1016,10 +1017,20 @@
 
 ### `persist`
 
-- **类型：** `{ enabled?: boolean; zstd?: boolean; debounceMs?: number; tailTokens?: number; epermAlertThreshold?: number; epermAlertRepeatMs?: number }`
-- **默认：** `{ enabled: true, zstd: false, debounceMs: 500, tailTokens: 16384, epermAlertThreshold: 5, epermAlertRepeatMs: 0 }`
+- **类型：** `{ enabled?: boolean; zstd?: boolean; debounceMs?: number; maxDelayMs?: number; tailTokens?: number; epermAlertThreshold?: number; epermAlertRepeatMs?: number }`
+- **默认：** `{ enabled: true, zstd: false, debounceMs: 500, maxDelayMs: 5000, tailTokens: 16384, epermAlertThreshold: 5, epermAlertRepeatMs: 0 }`
 - **状态：** ACTIVE
-- **说明：** 会话持久化行为（对应 `BILI_PERSIST`、`BILI_PERSIST_ZSTD`、`BILI_PERSIST_DEBOUNCE_MS`、`BILI_PERSIST_TAIL_TOKENS`、`BILI_PERSIST_EPERM_ALERT_THRESHOLD`、`BILI_PERSIST_EPERM_ALERT_REPEAT_MS`）。`enabled: false` 会话语仅存内存；`zstd: true` 写 `BILIZSTD1` 文件（#1080 owner 决定：纯 JSON 仍是默认，可恢复性优先）；`tailTokens` 约束持久化折叠快照的预算（`0` 完全不持久化消息）；两个 `eperm*` 键调节 Windows 杀软排除项告警。详见[环境变量表](#环境变量的配置键对照-2030)。
+- **说明：** 会话持久化行为（对应 `BILI_PERSIST`、`BILI_PERSIST_ZSTD`、`BILI_PERSIST_DEBOUNCE_MS`、`BILI_PERSIST_MAX_DELAY_MS`、`BILI_PERSIST_TAIL_TOKENS`、`BILI_PERSIST_EPERM_ALERT_THRESHOLD`、`BILI_PERSIST_EPERM_ALERT_REPEAT_MS`）。`enabled: false` 会话语仅存内存；`zstd: true` 写 `BILIZSTD1` 文件（#1080 owner 决定：纯 JSON 仍是默认，可恢复性优先）；`tailTokens` 约束持久化折叠快照的预算（`0` 完全不持久化消息）；`debounceMs` / `maxDelayMs` 约束会话文件的写盘去抖——窗口每次变更都会重置，max-delay 上限保证持续流量下写入也一定在预算内落盘（该上限只存在于 session-order / prefix-affinity 两个快照写入器——它们的 5s 预算在 #6058 前硬编码、之后才接到这个旋钮，并决定了磨损敏感盘上的稳态重写速率；主会话语写入器用非重置式去抖、不会饿死，因此没有这个上限）；两个 `eperm*` 键调节 Windows 杀软排除项告警。详见[环境变量表](#环境变量的配置键对照-2030)。
+
+  **观测物理写入量（#6058）。** 要在磨损敏感（如 QLC）的盘上实测这些旋钮对真实磁盘损耗的影响，在一段代表性负载前后 diff NVMe SMART 计数器：
+
+  ```bash
+  smartctl -A -d nvme /dev/nvme0n1    # 记录 "Data Units Written"（及 "Percentage Used"）
+  # ... 跑 N 分钟负载 ...
+  smartctl -A -d nvme /dev/nvme0n1    # 差值 = 该窗口内的物理写入量
+  ```
+
+  随后在机器空闲 ~10 分钟后再读一次，把后台写入（WAL checkpoint、快照落盘）与前台流量分开看。计数器单位由固件定义（NVMe 标准为 512 字节单位——可用一次已知大小的拷贝校准），所以比较固定窗口内的差值，而不是绝对值。文件系统层记账（mtime/size 扫描）完全看不到 index.db 的页级重写与 WAL 翻动——只有 SMART 计数器能看到全量。
 
 ### `sessions`
 
@@ -1947,6 +1958,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_PERSIST_DEBOUNCE_MS` | `persist.debounceMs` | 500 |
 | `BILI_PERSIST_EPERM_ALERT_REPEAT_MS` | `persist.epermAlertRepeatMs` | 0 (no repeats) |
 | `BILI_PERSIST_EPERM_ALERT_THRESHOLD` | `persist.epermAlertThreshold` | 5 |
+| `BILI_PERSIST_MAX_DELAY_MS` | `persist.maxDelayMs` | 5000 |
 | `BILI_PERSIST_TAIL_TOKENS` | `persist.tailTokens` | 16384 (0 disables message persistence) |
 | `BILI_PERSIST_ZSTD` | `persist.zstd` | false |
 | `BILI_PERSONA_SPLIT` | `personaSplit` | true |
@@ -2099,6 +2111,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_ATTACH_EVIDENCE_GRACE_MS` | dsh/opencode attach 校验探测到目标已挂时，等待路由通道证据出现的宽限窗口（毫秒），超时才回退到旧的 spawn 路径（覆盖「判定早于首个请求」的竞态：t≈0 时探测失败、t≈1s 时首个模型请求才落地）（默认 `5000`）。见 #1365。 |
 | `BILI_PERSIST` | 设 `0` 关闭会话持久化（仅内存，重启即丢）。 |
 | `BILI_PERSIST_DEBOUNCE_MS` | 持久化写盘的防抖窗口（毫秒，默认 `500`）。 |
+| `BILI_PERSIST_MAX_DELAY_MS` | 变更不断到来时一次待落盘写入最多可等待的上限（毫秒）——去抖窗口每次变更都会重置，这个预算才保证持续流量下文件一定会落盘（默认 `5000`；此前在 session-order / prefix-affinity 写入器中硬编码，#6058）。 |
 | `BILI_PERSIST_TAIL_TOKENS` | 持久化会话快照的 token 预算（#401）。盘上记录的是**折叠视图**（压缩范围以块摘要替代）并截断到该预算内的最新消息 —— 不再存全量原始历史。默认 `16384`；设 `0` 彻底不持久化消息（块摘要与压缩原件仍会持久化，`bili export` 退回块级渲染）。活会话内存不受影响 —— 活会话的 `bili export` 始终完整。 |
 | `BILI_PERSIST_ZSTD` | 设为 `1`/`true` 启用会话文件的 zstd 压缩（#1080，owner 决定：**默认关闭**——纯 JSON 可恢复性最强：可用 jq/grep 调试，且无降级尾部风险）。启用后，每个确实能压缩变小的会话文件均以 `BILIZSTD1` 格式写入——即在 JSON 主体之上附加一个小头部（魔数 + 格式版本 + 模式字节），在 Node ≥ 22.15 上以 zstd 压缩存储，在旧版运行时上则原样存储；读取端兼容两种主体格式（优先使用原生 zstd，否则回退至内置的 WASM 实现），因此文件在不同运行时和版本间均可正常读取。压不小的小会话与无密钥的原始主体以裸 JSON 落盘。与 `BILI_ENCRYPTION_KEY` 相互独立——两者同时生效时，压缩方式会记录在 `BILIENC1` 内部的模式字节中。已有的纯 JSON 文件**永不在启动时改写**（降级安全——批量重编码会让回退到旧版 bili 时把自己的写入当成“损坏文件”）；它们在其下一次保存时自然转换。注意：一旦会话已保存为 `BILIZSTD1`，旧版 bili（< 0.1.135）无法读取——该限制仅对显式启用的部署生效；未设置或其他值均保持纯 JSON。 |
 | `BILI_STORAGE_UNIFIED` | 存储迁移分层开关（#2671）。配置文件层：`{"storage":{"unified":"legacy|shadow|full"}}` 选用相同模式（严格拼写），在环境变量未设时生效；`BILI_STORAGE_UNIFIED`（额外接受 `1`/`true`=shadow、`unified`=full）始终优先于文件。模式在每个 lane 启动时解析一次——文件热改动在下次重启生效。设 `1`/`true` 启用**统一 SQLite 存储干跑**（Phase 1）：每次会话写入都会双写到 `<sessions-dir>/index.db`（引擎解析顺序自 #2833 起：运行时提供内置 `node:sqlite` 时优先（Node >= 22.5）-> 宿主已装的 `better-sqlite3` 原生模块 -> 先前自下载的缓存副本 -> 一次性自下载钉死的 `better-sqlite3` 预编译 tarball（约 11 MB，sha512 校验，受 `storage.sqliteAutoDownload` 控制，不支持的平台永不下载；引擎产物按 Node 大版本分别钉死（Node >= 22 用 better-sqlite3 v13；Node 20 用 v12.9.0 及其 ABI 匹配的 prebuild），任何钉死产物都不支持的运行时会在加载之前被拒绝，下载与缓存副本注册都不进行，因为在那里加载该 binding 会让进程崩溃（#3341、#3894））-> 无引擎则按 #2825 降级契约保持仅 legacy；引擎获取永不依赖宿主安装期的构建脚本审批），并将统一层回放与旧格式加载视图做 digest 对账——不匹配时记录 `[storage] unified shadow DIGEST DRIFT …`，绝不阻塞或改写主写路径（旧格式文件仍是唯一事实源）。设 `full`/`unified` 启用**平替读路径**（Phase 1.5）：`loadSync`/`boot`/`loadAll`/`loadStateForSearch` 改为 unified-first——首次打开旧文件会话时有机导入索引（`[storage] unified import on first open: …`），后续加载直接由 `index.db` 提供，任意统一层失败自动回退旧文件；旧格式文件照常双写，**回滚 = 去掉开关（环境变量与/或文件值）**。加密硬互斥：`BILI_ENCRYPTION_KEY` 激活时整个 sidecar 拒绝开启（index.db 明文存 ingest 载荷，记录 `unified sidecar DISABLED` 警告后保持 legacy-only）。枚举/GC 与 web 列表仍以文件为基底；`removeLegacyFile` 同步删除索引行并释放 CAS 引用计数。digest 把末次写入者版本戳 `biliVersion` 与墙钟时间戳视为环境（`__VER__`/`__TS__`），其余字节必须逐一致。连续 3 次内部失败后自动停用（full 模式下停用即回退 legacy 读）。**副本/检查点 REST（Phase 2）**：任意统一层 lane（shadow 或 full）上，`POST /__bili/replicas {sessionId, label?, pinned?}` 把会话持久化状态冻结为一条内容寻址的 checkpoint blob+行（先强制刷新驻留会话），`GET /__bili/replicas[?sessionId=]` 列出副本，`GET /__bili/replicas/<cpId>` 返回详情+字节数，`POST /__bili/replicas/<cpId>/restore {sessionId?}` 把检查点物化为全新的一等会话（走正常双写路径：JSON+统一层 ingest；`meta.restoredFrom`/`restoredCheckpoint` 记录来源），`DELETE /__bili/replicas/<cpId>` 删除。pinned 副本持有 CAS 引用计数，可在 `deleteSession` GC 中存活（本功能的意义：破坏性实验前抓的副本活得过实验本身）；显式 DELETE 仍可删 pinned。legacy-only lane 返回 501 并附开关提示。路由与 `__bili` 其余部分一样仅限 loopback。未设置时默认 `full`（#3818）。 |

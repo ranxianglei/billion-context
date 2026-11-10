@@ -457,6 +457,14 @@ export function persistDebounceMs(): number {
     return Number.isFinite(v) && v >= 0 ? v : 500;
 }
 
+/** BILI_PERSIST_MAX_DELAY_MS > persist.maxDelayMs > 5000 (#6058: under sustained
+ *  traffic the max-delay cap — not the debounce window — sets the session-order /
+ *  prefix-affinity snapshot rewrite rate; both writers had it hardcoded at 5s). */
+export function persistMaxDelayMs(): number {
+    const v = tInt("BILI_PERSIST_MAX_DELAY_MS", filePersist().maxDelayMs);
+    return Number.isFinite(v) && v >= 0 ? v : 5_000;
+}
+
 /** BILI_PERSIST_TAIL_TOKENS > persist.tailTokens > 16384 (0 disables message persistence). */
 export function persistTailTokens(): number {
     const v = tInt("BILI_PERSIST_TAIL_TOKENS", filePersist().tailTokens);
