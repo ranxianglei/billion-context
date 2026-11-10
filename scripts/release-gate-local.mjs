@@ -25,7 +25,7 @@
 //
 // Usage:
 //   node scripts/release-gate-local.mjs [--tarball <path>] [--keep]
-//        [--skip a|b|u[,…]] [--with-update] [--base-dir <dir>]
+//        [--skip a|b|u[,…]] [--with-update] [--base-dir <dir>] [--reuse-base-dir]
 //
 //   --tarball      built package tarball (default: `npm pack` on the current
 //                  tree — run `npm run build` first, as the release
@@ -33,6 +33,10 @@
 //   --with-update  also run Lane U (needs verdaccio + GATE_VERDACCIO_NPMRC).
 //   --keep         keep the scratch dir (default: remove on success, keep on
 //                  failure for post-mortem).
+//   --reuse-base-dir  accept a NON-EMPTY --base-dir (default: refuse — a
+//                  rerun would overwrite the previous run's bili.log and
+//                  dsh-*.jsonl evidence; this foot-gun destroyed the 16:36
+//                  green run's artifacts during the #5904 forensics).
 //
 // Env knobs (all optional; defaults fit the dev host):
 //   GATE_DSH_BIN          default "dsh"            (dsh >= 0.2.0-rc.2 surface)
@@ -186,6 +190,35 @@ function record(lane, name, pass, evidence) {
   log(`  ${pass ? "✅" : "❌"} [${lane}] ${name}${evidence ? ` — ${evidence}"` : ""}`);
 }
 
+// One tiny REAL completion against the (first component of the) upstream
+// model pool — proves inference capability, not just liveness. Returns true
+// only when a completion comes back within budgetMs.
+async function inferenceProbe(baseUrl, model, budgetMs) {
+  const single = String(model).split(",")[0].trim();
+  const t = Date.now();
+  try {
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), budgetMs);
+    const res = await fetch(`${baseUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: single, messages: [{ role: "user", content: "Reply with the single word OK." }], max_tokens: 8, temperature: 0 }),
+      signal: ac.signal,
+    });
+    clearTimeout(timer);
+    const body = await res.text();
+    if (!res.ok) {
+      warn(`inference probe: HTTP ${res.status} after ${Date.now() - t}ms (body: ${body.slice(0, 200)})`);
+      return false;
+    }
+    log(`inference probe ok: model=${single} ${Date.now() - t}ms`);
+    return true;
+  } catch (e) {
+    warn(`inference probe FAILED after ${Date.now() - t}ms: ${e?.message ?? e}`);
+    return false;
+  }
+}
+
 async function killProxy() {
   if (!proxyChild) return;
   const pid = proxyChild.pid;
@@ -217,10 +250,20 @@ async function startProxy(ctx) {
 
 async function main() {
   const t0 = Date.now();
+  log("== local real-model release gate ==");
+
+  // --base-dir guard (#5904 forensics lesson): reusing a non-empty scratch
+  // dir silently overwrites the previous run's bili.log / dsh-*.jsonl — the
+  // 16:36 green run's evidence was destroyed exactly this way by the 19:39
+  // rerun. Default base-dir is unique per run; an explicit NON-EMPTY one now
+  // requires --reuse-base-dir.
+  const explicitBase = String(arg("base-dir", "")) !== "";
   const baseDir = path.resolve(String(arg("base-dir", "")) || path.join(os.tmpdir(), `bili-release-gate-${Date.now()}`));
+  if (explicitBase && fs.existsSync(baseDir) && fs.readdirSync(baseDir).length > 0 && !arg("reuse-base-dir")) {
+    throw new Error(`--base-dir ${baseDir} is non-empty — a rerun would OVERWRITE the previous run's evidence (bili.log, dsh-*.jsonl). Pass --reuse-base-dir to accept, or drop --base-dir for a fresh timestamped dir.`);
+  }
   fs.mkdirSync(baseDir, { recursive: true });
 
-  log("== local real-model release gate ==");
   log(`scratch: ${baseDir}`);
 
   // ---- 0. prerequisites ----------------------------------------------------
@@ -244,6 +287,17 @@ async function main() {
   log(`lanes available: dsh=${dshOk} sglang=${sglangOk} relay=${relayOk} verdaccio=${verdaccioOk}`);
   if (!dshOk || !sglangOk) throw new Error("Lane A prerequisites missing (dsh CLI / sglang). Fix GATE_* env or start the services.");
   if (!relayOk) warn(`relay ${G.relayUrl} not ok — Lane B (model switch) will be SKIPPED`);
+
+  // Liveness alone lies (#5904 forensics): /v1/models returns 200 while the
+  // scheduler is drowning in runaway generations or the GPU is degraded —
+  // the 19:39 red run's turn 1 showed a degraded upstream (tiny input, no
+  // cache report) yet every liveness probe stayed green, and separating
+  // "environment red" from "product red" cost a forensic afternoon. Prove
+  // INFERENCE capability with one tiny real completion before burning a
+  // 12-minute run; a probe miss is an ENVIRONMENT failure, not a product red.
+  const probeBudget = Number(env("GATE_PREFLIGHT_BUDGET_MS", 30000)) || 30000;
+  const probeOk = await inferenceProbe(G.sglangUrl, G.sglangModel, probeBudget);
+  if (!probeOk) throw new Error(`sglang is alive (/v1/models ok) but a trivial completion failed or exceeded ${probeBudget}ms — the environment is degraded. Fix the model service before gating; do NOT read this as a product regression.`);
 
   // ---- 1. hermetic environment --------------------------------------------
   for (const d of ["dsh-home/profiles", "work", "sessions", "xdg/state", "xdg/cache", "xdg/data"]) {
@@ -289,6 +343,15 @@ async function main() {
     PI_PROVIDER: "",
     BILI_GATE_KEY: "gate-local",
     ZHIPUAI_GATE_KEY: G.relayKey,
+    // #5904: bound phase-1 (request sent → first response byte) of the proxy's
+    // upstream summary calls. The incident wedge — sglang accepting the request
+    // then never answering — silently ate the client's 300s turn budget. 120s
+    // is 1.6× the slowest LEGITIMATE first byte observed in this environment
+    // (73s to first token for a ~100KB summary prefill on a GPU-restart-cold
+    // sglang), and two attempts fit the 300s turn (120 + backoff + 120 ≈ 245s)
+    // so the wedge surfaces as a real error before the client aborts. Product
+    // default stays the full 12-min idle budget (src/knobs.ts upstreamFirstByteMs).
+    BILI_UPSTREAM_FIRST_BYTE_MS: "120000",
   };
 
   const biliConfigFor = (window) =>
@@ -443,6 +506,13 @@ async function main() {
       const s1 = slice(m1);
       record("A", "no fold while corpus is fresh (protected)", !/acp-compress-obs\] shrink/.test(s1), "");
       record("A", "S40 marker answered from corpus", has(t1.final, CODEWORDS[39]), `final="${t1.final.trim().slice(0, 80)}"`);
+      // Environment-degradation tell (#5904 forensics): t1 does 13 rounds
+      // over a stable prefix, so a healthy upstream shows cache reports by
+      // round 2; a degraded one (GPU restarted / scheduler drowning) shows
+      // none while the turn still passes. WARN, not fail — a genuinely cold
+      // or non-reporting cache is legal; the warn tells the operator the
+      // rest of the run may be measuring the environment, not the product.
+      if (!/cache hit \d+%/.test(s1)) warn("turn 1 produced no cache report at all — upstream may be degraded; later lane results may reflect the environment, not the product");
 
       // Shrink the route window mid-session + restart (also proves session
       // persistence across a proxy restart). Next turn's input overshoots
@@ -587,6 +657,7 @@ async function main() {
   log(`elapsed: ${((Date.now() - t0) / 1000).toFixed(0)}s`);
   if (results.some((r) => !r.pass)) {
     log(`SCRATCH KEPT for post-mortem: ${baseDir}`);
+    log(`evidence: bili.log=${biliLog} ${fs.existsSync(biliLog) ? "(present)" : "(MISSING — logger died early)"} · proxy.log=${proxyLog} · turns=${path.join(baseDir, "dsh-t*.jsonl")} (+ .err) · config=${biliConfig}`);
     process.exitCode = 1;
   } else {
     log(G.keep ? `scratch kept (--keep): ${baseDir}` : `cleaning scratch ${baseDir}`);
