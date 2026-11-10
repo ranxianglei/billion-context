@@ -6,7 +6,9 @@ import type { CompressReasoningConfig } from "../reasoning-drop.js";
 import { resolveAbsorbSettings } from "../compress-settings.js";
 import { effectivePromptCacheRouting, resolveCompressProtocol, type CompressSettings, type ProxyOptions } from "../config.js";
 import { currentCalibrationFactor, strippedResponseIdWarning } from "../util.js";
-import { applyReasoningDrop, diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, makeFoldPointReasoningDroppable, planReasoningDrop, repairResponsesAssistantOrdering, reapOrphansLogged, resolveKnownOutputCeiling, runNudgeDecision, stripKernelSummaries, usageGradeInputBaseline, warnResponsesReasoningPairs, type Prepared } from "../server.js";
+import { applyReasoningDrop, diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, makeFoldPointReasoningDroppable, planReasoningDrop, reapOrphansLogged, resolveKnownOutputCeiling, runNudgeDecision, stripKernelSummaries, usageGradeInputBaseline, warnResponsesReasoningPairs, type Prepared } from "../server.js";
+import { collectSeparatorManifest, repairResponsesAssistantOrdering, type SeparatorSlot } from "./responses-ordering.js";
+import { recordNudgeObservation } from "../context-analysis.js";
 import { yieldToEventLoop } from "../yield-loop.js";
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, resolveDecisionRange, stripDecisionReasoningFields, type DecideConfig } from "../nudge-decide.js";
 import { excludeDeadRefRanges } from "../acp-status.js";
@@ -94,6 +96,10 @@ export async function prepareResponses(
     }
 
     let processedMessages: CoreMessage[] = [];
+    // #564/#2627: the ordering separators THIS turn's repair actually inserted,
+    // recorded by the producer so provenance never has to be inferred from item
+    // text later. Empty on the overwhelming majority of turns.
+    let separatorSlots: SeparatorSlot[] = [];
     let originalMessages: CoreMessage[] = [];
     let judgeBaseline: readonly CoreMessage[] | undefined;
     let nudge: NudgeDecision | undefined;
@@ -268,7 +274,7 @@ export async function prepareResponses(
         // drift without recovering (the #2193 escalation is observe-only).
         // TWO producers replay that shape on this wire: codex (rollout event
         // type:"compacted", #2372) and dsh desktop's compaction-basic
-        // checkpoint (#2432) — CONFIGURATION.md names responses "the lane dsh
+        // checkpoint (#2432) — docs/configuration.md names responses "the lane dsh
         // desktop's compaction actually rides" (#2360), yet before the #2451
         // review this slot covered codex only and the dsh desktop scenario
         // fell back into the pre-#2432 death spiral. Detect (client identity
@@ -407,8 +413,12 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
             growthFoldingArmed: growthFoldingArmed(loopConfig, codexLane && codexCompactMode() === "intercept" ? loopConfig.modelContextLimit * CODEX_COMPACT_HEALTH_RATIO : undefined, autoFoldFloor(session)),
             modelWantsIt: turn.nudge !== undefined && (turn.nudge.shouldInject || emergencyNudgeArmed(session, turn.nudge, loopConfig.compress.minCompressRange, tokenCount, loopConfig.nudge.growthFloor)),
         });
+        const caLine = recordNudgeObservation(sessionId, turn, tokenCount, config.modelContextLimit, willInjectNudge, decideTier1Arm && !decideFallbackOverride, surfaceOffDetail(laneDecisions, opts.compress.injectTool));
+        if (caLine) log("info", caLine);
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model, willInjectNudge, decideTier1Arm && !decideFallbackOverride, surfaceOffDetail(laneDecisions, opts.compress.injectTool)));
-        processedMessages = repairResponsesAssistantOrdering(applyReasoningDrop(stripKernelSummaries(turn.messages, turn.state), reasoningPlan, log, sessionId), originalMessages);
+        const ordered = repairResponsesAssistantOrdering(applyReasoningDrop(stripKernelSummaries(turn.messages, turn.state), reasoningPlan, log, sessionId), originalMessages);
+        processedMessages = ordered.messages;
+        separatorSlots = ordered.slots;
         // #3477: consume the announced native-compaction boundary (pi session_compact
         // → /__bili/plugin/compact → markCompactionBoundary) exactly once, after the
         // post-compaction history was processed: archives the deactivated blocks,
@@ -449,7 +459,7 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
             const devContent = devParts.join("\n\n---\n\n");
             responsesDevContent = devContent;
             if (forgedSummaries.length > 0) log("debug", `[${sessionId}] [inject] ${forgedSummaries.length} captured summary block(s) re-injected into developer message`);
-            rebuiltInput = injectResponsesDeveloperMessage(rebuiltInput, devContent);
+            rebuiltInput = injectResponsesDeveloperMessage(rebuiltInput, devContent, projection.headRole ?? "developer");
             if (!knobNoInjectTool() && injectTools) {
                 // #1712: decompress's startId/endId execute only on CCR-armed
                 // sessions (#1179) — serve the no-range schema otherwise.
@@ -463,7 +473,7 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
             const devContent = [...projection.systemParts, ...forgedSummaries, ...(tagsOnlyPrompt !== "" ? [tagsOnlyPrompt] : []), ...(genBoundaryActive && !isCompactionTrigger ? [GENERATION_BOUNDARY_NOTE] : [])].join("\n\n---\n\n");
             responsesDevContent = devContent;
             if (forgedSummaries.length > 0) log("debug", `[${sessionId}] [inject] ${forgedSummaries.length} captured summary block(s) re-injected into developer message`);
-            rebuiltInput = injectResponsesDeveloperMessage(rebuiltInput, devContent);
+            rebuiltInput = injectResponsesDeveloperMessage(rebuiltInput, devContent, projection.headRole ?? "developer");
         }
         if (sysNotes.length > 0) {
             const inputItems: ResponseInputItem[] = typeof rebuiltInput === "string"
@@ -702,13 +712,23 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
     }
     snapshotMessages(session, originalMessages);
     markDirty(session);
+    // #564/#2627: ONE serialization of the outbound body. The same string is
+    // both what we send and what the separator manifest binds to, so the claims
+    // can never be attributed to a body that differs by even one byte.
+    const sentBodyStr = JSON.stringify(rebuilt);
+    const separatorManifest = collectSeparatorManifest(
+        Array.isArray(rebuiltInput) ? rebuiltInput : undefined,
+        separatorSlots,
+        sentBodyStr,
+    );
     return {
-        body: JSON.stringify(rebuilt),
+        body: sentBodyStr,
         parsedBody: rebuilt,
         session,
         processedMessages,
         originalMessages,
         judgeBaseline,
+        ...(separatorManifest !== undefined ? { separatorManifest } : {}),
         responsesProjection,
         systemNotes: sysNotes,
         protocol: "responses",
@@ -792,7 +812,7 @@ export function prepareResponsesCompact(
             return base;
         }
         const viewed = applyAbsorbView(turn.messages, turn.state, compactConfig, usageGradeInputBaseline(session));
-        const processed = repairResponsesAssistantOrdering(stripKernelSummaries(viewed, turn.state), projection.msgs);
+        const processed = repairResponsesAssistantOrdering(stripKernelSummaries(viewed, turn.state), projection.msgs).messages;
         let output = patchResponsesInput(projection, processed);
         if (typeof output === "string") {
             session.state = prevState;

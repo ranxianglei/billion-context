@@ -2,8 +2,8 @@
 
 Design record for how billion-context decides **which conversation** a request
 belongs to once its session id (client-minted conversation identifier) is known.
-Companion pages: `SESSION-IDENTITY.md` (repo root — the *anonymous* lane: what to
-do when the request carries no id at all), `MESSAGE-IDENTITY.md` (message-level
+Companion pages: `session-identity.md` (sibling — the *anonymous* lane: what to
+do when the request carries no id at all), `message-identity.md` (message-level
 identity doctrine), and `docs/identity-channels.md` (who carries the ids into
 bili in the first place). Normative statements: AGENTS.md KDD #11 (identity
 hierarchy) and KDD #18 (channel wiring law).

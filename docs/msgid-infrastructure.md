@@ -1,6 +1,6 @@
 # Message-ID lane infrastructure: the sessionid+msgid production/consumption map
 
-> Status: companion doc for the gap fix mandated by the #5826 release review (owner ruling 2026-11-07). Identity-ladder doctrine lives in MESSAGE-IDENTITY.md (kernel) and SESSION-IDENTITY.md (session side); this file does ONE job — explain where sessionid+msgid, the cross-lane public substrate, is produced, how it travels, who validates it (six copies), where it is pinned, its five consumers, and its declared trust boundaries. Read this before touching any of it.
+> Status: companion doc for the gap fix mandated by the #5826 release review (owner ruling 2026-11-07). Identity-ladder doctrine lives in message-identity.md (kernel) and session-identity.md (session side); this file does ONE job — explain where sessionid+msgid, the cross-lane public substrate, is produced, how it travels, who validates it (six copies), where it is pinned, its five consumers, and its declared trust boundaries. Read this before touching any of it.
 
 ## 1. What it is
 
@@ -71,4 +71,4 @@ The unified-store `messages.msg_id` column is the ONLY id truth: ingestion pins 
 2. New consumers register a row in §6 before writing code.
 3. Host bundles must not import server modules (§4 structural constraint); new mirrors get their own row in the parity test.
 4. Ids never reach upstream-visible bodies/headers (strip discipline, §3); pf-* headers keep protocol-header status.
-5. Before discussing "id mismatch / destroyed misdiagnosis / cache broken" bugs, check the MESSAGE-IDENTITY.md ladder and §6 here to establish which consumer path the session takes.
+5. Before discussing "id mismatch / destroyed misdiagnosis / cache broken" bugs, check the message-identity.md ladder and §6 here to establish which consumer path the session takes.

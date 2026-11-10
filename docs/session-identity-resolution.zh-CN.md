@@ -2,8 +2,8 @@
 
 设计记录：当请求的**会话 ID**（客户端铸造的会话标识）已经认出之后，
 billion-context 如何判定它属于**哪一个对话**。姊妹页：仓库根目录
-`SESSION-IDENTITY.zh-CN.md`（**匿名车道**：请求什么 ID 都没有时怎么办）、
-`MESSAGE-IDENTITY.zh-CN.md`（消息级身份教义）、`docs/identity-channels.zh-CN.md`
+`session-identity.zh-CN.md`（**匿名车道**：请求什么 ID 都没有时怎么办）、
+`message-identity.zh-CN.md`（消息级身份教义）、`docs/identity-channels.zh-CN.md`
 （各客户端把 ID 带进 bili 的接线地图）。规范条文：AGENTS.md KDD #11（身份层级）
 与 KDD #18（信道接线的单一缝法则）。
 

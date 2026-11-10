@@ -1682,6 +1682,9 @@ function changelogCatOf(rawLine) {
                 if (!n || typeof n !== "object" || typeof n.id !== "string") continue;
                 const el = document.createElement("div");
                 el.className = "banner " + (n.tone === "ok" ? "ok" : n.tone === "warn" ? "warn" : "");
+                // .banner is display:none until .show — #5548's loop never added it,
+                // so every merged notice (builtin + file + feed) rendered invisibly.
+                el.classList.add("show");
                 el.dataset.id = n.id;
                 nr.appendChild(el);
                 if (n.source !== "builtin") {
@@ -3212,6 +3215,14 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         // #2904: no-ceiling output-budget pin — surface at the top of the detail
         // so GUI users see WHY long turns truncate (the /acp twin).
         if (d.outputBudgetDegraded) parts.push('<div class="banner warn show" style="margin-bottom:12px">' + escapeHtml(t("det.obudget_degraded", { model: d.outputBudgetDegraded.model, value: d.outputBudgetDegraded.value })) + "</div>");
+        if (d.contextAnalysis && d.contextAnalysis.text) {
+            // Context analysis: init size / nudge cadence / harvest acceptance /
+            // plain-language verdict — the question that used to take hours of
+            // manual log forensics (session-aedc188c investigation, 2026-11-08).
+            const ca = d.contextAnalysis;
+            const lines = ca.text.split("\\n").map((l) => "<div>" + escapeHtml(l) + "</div>");
+            parts.push('<div class="card" style="margin-top:16px"><div class="card-h"><span>' + t("det.context_analysis") + '</span><span class="hint">' + t("det.context_analysis_hint") + '</span></div><div class="card-b"><div class="mono small" style="line-height:1.8">' + lines.join("") + '</div></div></div>');
+        }
         if (Array.isArray(d.conflicts) && d.conflicts.length > 0) {
             // #2102: per-session evidence rows — the banner aggregates across sessions,
             // so this page is where its detail pointer lands.
@@ -5063,6 +5074,9 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             $("log-count").textContent = d.total > 0
                 ? t("logs.count", { n: (d.lines || []).length, total: d.total }) + ((typeof d.omitted === "number" && d.omitted > 0) ? t("logs.omitted", { o: d.omitted }) : "")
                 : "";
+            if (Array.isArray(d.unreadable) && d.unreadable.length > 0) {
+                $("log-count").textContent += " · " + t("logs.incomplete", { n: d.unreadable.length });
+            }
             const bodyEl = $("log-body");
             const rows = d.lines || [];
             if (!rows.length) {
@@ -5170,47 +5184,36 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         if (lsearch) lsearch.addEventListener("input", () => { clearTimeout(logTimer); logTimer = setTimeout(loadLogs, 400); });
         const llines = $("log-lines");
         if (llines) llines.addEventListener("change", loadLogs);
-        const ldl = $("log-dl");
-        if (ldl) ldl.addEventListener("click", async () => {
-            busy(ldl, true);
-            try {
-                const q = ($("log-search").value || "").trim();
-                const r = await fetch(API_ROOT + "/logs?raw=1&q=" + encodeURIComponent(q) + "&lines=2000" + logViewExtras());
-                const blob = await r.blob();
-                const a = document.createElement("a");
-                a.href = URL.createObjectURL(blob);
-                a.download = "billion-context-log.txt";
-                document.body.appendChild(a);
-                a.click();
-                a.remove();
-                setTimeout(() => URL.revokeObjectURL(a.href), 4000);
-            } catch (e) {
-                toast(t("toast.failed", { msg: e.message }), "err");
-            } finally {
-                busy(ldl, false);
-            }
-        });
-        const ldlAll = $("log-dl-all");
-        if (ldlAll) ldlAll.addEventListener("click", async () => {
-            busy(ldlAll, true);
-            try {
-                // Full unfiltered log (rotated .old + current) regardless of the
-                // search box — the honest "download everything" path.
-                const r = await fetch(API_ROOT + "/logs?raw=1&all=1");
-                const blob = await r.blob();
-                const a = document.createElement("a");
-                a.href = URL.createObjectURL(blob);
-                a.download = "billion-context-full-log.txt";
-                document.body.appendChild(a);
-                a.click();
-                a.remove();
-                setTimeout(() => URL.revokeObjectURL(a.href), 4000);
-            } catch (e) {
-                toast(t("toast.failed", { msg: e.message }), "err");
-            } finally {
-                busy(ldlAll, false);
-            }
-        });
+        for (const id of ["log-ctx", "log-win"]) {
+            const control = $(id);
+            if (control) control.addEventListener("change", loadLogs);
+        }
+        for (const [buttonId, all] of [["log-dl", false], ["log-dl-all", true]]) {
+            const button = $(buttonId);
+            if (button) button.addEventListener("click", async () => {
+                busy(button, true);
+                try {
+                    const q = ($("log-search").value || "").trim();
+                    const query = all ? "raw=1&all=1" : "raw=1&q=" + encodeURIComponent(q) + "&lines=2000" + logViewExtras();
+                    const response = await fetch(API_ROOT + "/logs?" + query);
+                    if (!response.ok) throw new Error("HTTP " + response.status);
+                    const unreadable = response.headers.get("x-bili-log-incomplete");
+                    if (unreadable) toast(t("logs.incomplete", { n: unreadable }), "err");
+                    const blob = await response.blob();
+                    const a = document.createElement("a");
+                    a.href = URL.createObjectURL(blob);
+                    a.download = all ? "billion-context-full-log.txt" : "billion-context-log.txt";
+                    document.body.appendChild(a);
+                    a.click();
+                    a.remove();
+                    setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+                } catch (e) {
+                    toast(t("toast.failed", { msg: e.message }), "err");
+                } finally {
+                    busy(button, false);
+                }
+            });
+        }
         const testBtn = $("test-upstream");
         if (testBtn) testBtn.addEventListener("click", async () => {
             busy(testBtn, true);

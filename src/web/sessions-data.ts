@@ -16,6 +16,7 @@ type LivePrice = NonNullable<ReturnType<typeof resolveBillingPrice>>;
 import { keepaliveStatusFor, type KeepaliveStatus } from "../cache-keepalive.js";
 import { METADATA_FOLD_COVERAGE } from "../fold-reconcile.js";
 import { markdownToHtml } from "./markdown.js";
+import { contextAnalysisView, type ContextAnalysisView } from "../context-analysis.js";
 import { log } from "../logger.js";
 import { dataDir } from "../paths.js";
 import { isExternalSummaryBlock } from "../external-summary-marker.js";
@@ -37,7 +38,7 @@ import * as path from "node:path";
 // the model, not the host's own history — so per-step cost climbs with it. On
 // plugin lanes (~2 host messages per request, dsh-measured) that becomes
 // visible around 10k messages ≈ 5k requests. The server log warns much earlier
-// (SLOW_SESSION_MSG_WARN = 1000 messages, src/server.ts); this display gate is
+// (SLOW_SESSION_MS_WARN = 1000ms local-processing budget, src/server/request-cost.ts); this display gate is
 // deliberately higher — the badge should mean "worth starting a new session",
 // not "notable".
 const SLOW_SESSION_REQUESTS_WARN = 5000;
@@ -302,6 +303,11 @@ interface WebSessionDetail extends WebSessionSummary {
      *  resolution as the banner's clients[]); absent when unresolvable or when
      *  there are no conflicts. */
     conflictClient?: string;
+    /** Context analysis: init size, nudge cadence, compression acceptance
+     *  (harvest) rate, and the plain-language verdict — this process's live
+     *  view (in-memory only; absent for sessions this bili process has not
+     *  observed at least twice yet). */
+    contextAnalysis?: ContextAnalysisView;
     /** #2904: no-ceiling output-budget degraded state for this session's last
      *  starved model ({model,value,ts}); absent when none holds. */
     outputBudgetDegraded?: { model: string; value: number; ts: number };
@@ -1433,23 +1439,30 @@ function renderDetail(session: Session, live: boolean): WebSessionDetail {
     // absent from BOTH keep the honest missing marker.
     // `directMessageCount` still tells the UI how many were folded either way.
     const messageById = new Map((session.lastMessages || []).map((m) => [m.id, m]));
-    const hydratedByRefNum = new Map<number, { role: string; content: string }>();
+    // #6029: hydrate pruned leaves by their STABLE msg_id (the content-derived
+    // identity), never by the live ref number. restampRefsToLedger renumbers the
+    // live refs at cold load — the #5196 parked band lands on fresh high numbers
+    // while messages.ref_num stays frozen at index time — so a ref-number join
+    // silently misses every renumbered row (~37% of a long session's block-detail
+    // leaves read as "gone"). msg_id never moves under a restamp, so it is the
+    // correct join key; the ref below stays display-only.
+    const hydratedByMsgId = new Map<string, { role: string; content: string }>();
     try {
-        const pending: number[] = [];
+        const pending: string[] = [];
         for (const b of session.state.blocks) {
             for (const raw of b.directMessageIds || []) {
                 if (!messageById.has(raw)) {
                     const r = byRaw[raw];
                     const num = typeof r === "string" ? /^m(\d+)$/.exec(r) : undefined;
-                    if (num) pending.push(Number(num[1]));
+                    if (num) pending.push(raw);
                 }
             }
         }
         if (pending.length > 0) {
-            const rows = getStore().unifiedMessageContentByRefs(session.id, pending);
+            const rows = getStore().unifiedMessageContentByIds(session.id, pending);
             for (const row of rows ?? []) {
                 const text = storedMessageText(row.content);
-                if (text !== null) hydratedByRefNum.set(row.refNum, { role: row.role, content: text });
+                if (text !== null) hydratedByMsgId.set(row.msgId, { role: row.role, content: text });
             }
         }
     } catch {
@@ -1464,10 +1477,11 @@ function renderDetail(session: Session, live: boolean): WebSessionDetail {
             // #3917: a folded message whose bytes are gone from the resident
             // window still gets a row — the ref is the identity the user asked
             // for. #4738: bytes gone from the window but stored are hydrated,
-            // never missed; nothing invented either way.
+            // never missed; nothing invented either way. #6029: the lookup keys
+            // off the stable msg_id (raw), not the possibly-restamped ref number.
             if (!msg) {
                 const num = /^m(\d+)$/.exec(ref);
-                const stored = num ? hydratedByRefNum.get(Number(num[1])) : undefined;
+                const stored = num ? hydratedByMsgId.get(raw) : undefined;
                 out.push(stored ? { ref, role: stored.role, preview: messagePreview(stored.content) } : { ref, missing: true });
                 continue;
             }
@@ -1534,6 +1548,10 @@ function renderDetail(session: Session, live: boolean): WebSessionDetail {
         handoffTruncated,
         ...(conflicts.length > 0 ? { conflicts } : {}),
         ...(conflictClient ? { conflictClient } : {}),
+        ...(() => {
+            const ca = contextAnalysisView(session.id);
+            return ca ? { contextAnalysis: ca } : {};
+        })(),
         blockDetails: session.state.blocks.map((b) => {
             // Display data: canonicalize to ascending labels so non-monotonic-
             // ref spans don't render reversed in the UI (#2168).
@@ -1725,7 +1743,10 @@ export async function buildMessageContent(id: string, ref: string): Promise<Mess
         const num = /^m(\d+)$/.exec(ref);
         if (typeof raw === "string" && num) {
             try {
-                const rows = getStore().unifiedMessageContentByRefs(id, [Number(num[1])]);
+                // #6029: query by the stable msg_id — the live ref may have been
+                // restamped onto a fresh high number while messages.ref_num stays
+                // frozen at index time, so a ref-number join misses the row.
+                const rows = getStore().unifiedMessageContentByIds(id, [raw]);
                 const row = rows && rows.length > 0 ? rows[0] : undefined;
                 const stored = row ? storedMessageText(row.content) : null;
                 if (row && stored !== null) {

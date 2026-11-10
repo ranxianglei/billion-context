@@ -1,7 +1,7 @@
 # 消息身份公用设施:sessionid+msgid 的生产与消费地图
 
 > 状态:#5826 release review(2026-11-07)owner 裁定落地的缺口修复配套文档。
-> 身份层级教义见根目录 MESSAGE-IDENTITY.md 与会话侧 SESSION-IDENTITY.md;本文只负责一件事——把 **sessionid+msgid 这套跨车道的公用设施**的生产端、传输形态、校验副本、持久化单一事实源、五个消费方、信任边界,一次说明白。改动任何一处之前先读这里。
+> 身份层级教义见根目录 message-identity.md 与会话侧 session-identity.md;本文只负责一件事——把 **sessionid+msgid 这套跨车道的公用设施**的生产端、传输形态、校验副本、持久化单一事实源、五个消费方、信任边界,一次说明白。改动任何一处之前先读这里。
 
 ## 1. 这是什么
 
@@ -72,4 +72,4 @@
 2. 新消费方先在 §6 登记一行再写代码。
 3. 宿主 bundle 不得 import server 模块(§4 结构约束);新增镜像必须在 parity 测试中立项。
 4. id 永远不进上游可见 body/header(剥除纪律,§3);pf-* 头维持协议头性质。
-5. 讨论「id 失配/destroyed 误诊/断缓存」类问题先查 MESSAGE-IDENTITY.md 层级与本文 §6,确认该会话走的哪条消费路径。
+5. 讨论「id 失配/destroyed 误诊/断缓存」类问题先查 message-identity.md 层级与本文 §6,确认该会话走的哪条消费路径。
