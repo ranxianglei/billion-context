@@ -242,11 +242,11 @@ test("plugin manifest serves the exact wire tool schemas, headers and version", 
         // #1192: every extra tool (absorb, acp_rule) is opt-in and only advertised
         // when enabled — hosts register manifest tools verbatim, so a disabled
         // tool must not be listed. acp_cache stays in the base toolset.
-        assert.deepEqual([...manifest.toolNames].sort(), ["acp_cache", "acp_read_original_image", "acp_status", "compress", "decompress", "search_context"]);
+        assert.deepEqual([...manifest.toolNames].sort(), ["acp_cache", "acp_read_original_image", "acp_restore", "acp_retire", "acp_rewrite", "acp_status", "compress", "decompress", "search_context"]);
         const names = manifest.tools.anthropic!.map((t) => String(t.name)).sort();
-        assert.deepEqual(names, ["acp_cache", "acp_read_original_image", "acp_status", "compress", "decompress", "search_context"]);
-        assert.equal(manifest.tools.openai!.length, 6);
-        assert.equal(manifest.tools.responses!.length, 6);
+        assert.deepEqual(names, ["acp_cache", "acp_read_original_image", "acp_restore", "acp_retire", "acp_rewrite", "acp_status", "compress", "decompress", "search_context"]);
+        assert.equal(manifest.tools.openai!.length, 9);
+        assert.equal(manifest.tools.responses!.length, 9);
         // #841: search_context's conversation_id doubles as a cross-session
         // read-only search target — its param description must carry the
         // historical-search wording in every wire shape.
@@ -278,14 +278,14 @@ test("plugin manifest: acp_rule advertised when rules enabled in config", async 
         const resp = await fetch(`http://127.0.0.1:${h.proxyPort}/__bili/plugin/manifest`);
         assert.equal(resp.status, 200);
         const manifest = (await resp.json()) as { toolNames: string[]; tools: Record<string, Array<Record<string, unknown>>> };
-        assert.deepEqual([...manifest.toolNames].sort(), ["acp_cache", "acp_read_original_image", "acp_rule", "acp_status", "compress", "decompress", "search_context"]);
+        assert.deepEqual([...manifest.toolNames].sort(), ["acp_cache", "acp_read_original_image", "acp_restore", "acp_retire", "acp_rewrite", "acp_rule", "acp_status", "compress", "decompress", "search_context"]);
         for (const shape of ["anthropic", "openai", "responses"] as const) {
             const listed = manifest.tools[shape]!.map((t) => {
                 const fn = t.function as { name?: unknown } | undefined;
                 return typeof t.name === "string" ? t.name : (typeof fn?.name === "string" ? fn.name : "");
             });
             assert.ok(listed.includes("acp_rule"), `${shape} has acp_rule`);
-            assert.equal(listed.length, 7);
+            assert.equal(listed.length, 10);
         }
     } finally {
         await h.close();
@@ -301,7 +301,7 @@ test("plugin manifest: absorb and acp_rule advertised when enabled in config", a
         const resp = await fetch(`http://127.0.0.1:${h.proxyPort}/__bili/plugin/manifest`);
         assert.equal(resp.status, 200);
         const manifest = (await resp.json()) as { toolNames: string[]; tools: Record<string, Array<Record<string, unknown>>> };
-        assert.deepEqual([...manifest.toolNames].sort(), ["absorb", "acp_cache", "acp_read_original_image", "acp_rule", "acp_status", "compress", "decompress", "search_context"]);
+        assert.deepEqual([...manifest.toolNames].sort(), ["absorb", "acp_cache", "acp_read_original_image", "acp_restore", "acp_retire", "acp_rewrite", "acp_rule", "acp_status", "compress", "decompress", "search_context"]);
         for (const shape of ["anthropic", "openai", "responses"] as const) {
             const listed = manifest.tools[shape]!.map((t) => {
                 const fn = t.function as { name?: unknown } | undefined;
@@ -309,7 +309,7 @@ test("plugin manifest: absorb and acp_rule advertised when enabled in config", a
             });
             assert.ok(listed.includes("absorb"), `${shape} has absorb`);
             assert.ok(listed.includes("acp_rule"), `${shape} has acp_rule`);
-            assert.equal(listed.length, 8);
+            assert.equal(listed.length, 11);
         }
     } finally {
         await h.close();
@@ -327,14 +327,14 @@ test("plugin manifest: absorb advertised when enabled in the global compress blo
         const resp = await fetch(`http://127.0.0.1:${h.proxyPort}/__bili/plugin/manifest`);
         assert.equal(resp.status, 200);
         const manifest = (await resp.json()) as { toolNames: string[]; tools: Record<string, Array<Record<string, unknown>>> };
-        assert.deepEqual([...manifest.toolNames].sort(), ["absorb", "acp_cache", "acp_read_original_image", "acp_status", "compress", "decompress", "search_context"]);
+        assert.deepEqual([...manifest.toolNames].sort(), ["absorb", "acp_cache", "acp_read_original_image", "acp_restore", "acp_retire", "acp_rewrite", "acp_status", "compress", "decompress", "search_context"]);
         for (const shape of ["anthropic", "openai", "responses"] as const) {
             const listed = manifest.tools[shape]!.map((t) => {
                 const fn = t.function as { name?: unknown } | undefined;
                 return typeof t.name === "string" ? t.name : (typeof fn?.name === "string" ? fn.name : "");
             });
             assert.ok(listed.includes("absorb"), `${shape} has absorb`);
-            assert.equal(listed.length, 7);
+            assert.equal(listed.length, 10);
         }
     } finally {
         await h.close();
@@ -349,7 +349,7 @@ test("plugin manifest: absorb omitted when the global compress block disables it
         const resp = await fetch(`http://127.0.0.1:${h.proxyPort}/__bili/plugin/manifest`);
         assert.equal(resp.status, 200);
         const manifest = (await resp.json()) as { toolNames: string[] };
-        assert.deepEqual([...manifest.toolNames].sort(), ["acp_cache", "acp_read_original_image", "acp_status", "compress", "decompress", "search_context"]);
+        assert.deepEqual([...manifest.toolNames].sort(), ["acp_cache", "acp_read_original_image", "acp_restore", "acp_retire", "acp_rewrite", "acp_status", "compress", "decompress", "search_context"]);
     } finally {
         await h.close();
     }
