@@ -69,6 +69,11 @@ export function conversationHeaderSource(headers: Record<string, string | string
     // x-mavis-session-id: MiniMax Code (mcode) stamps its per-conversation id
     // on every model request (#1050). Client-specific name — same trust class
     // as the claude/grok headers above.
+    // agent-session-id: goose stamps its sqlite sessions.id (default
+    // YYYYMMDD_<n>, stable across restarts) on every model request, BYOK and
+    // custom-provider paths included (#5825); a user-overridden header name
+    // simply degrades this lane. Client-specific name — same trust class as
+    // the headers above.
     // x-opencode-session-id: OpenCode 2.x stamps the request's OWN session id
     // here on every model request, while x-session-affinity / X-Session-Id /
     // x-opencode-session all carry the INHERITED cache-routing affinity
@@ -80,8 +85,15 @@ export function conversationHeaderSource(headers: Record<string, string | string
     // for 2.x traffic and is inert for 1.x (header absent); root sessions are
     // unchanged either way (affinity === own id). Client-specific name — same
     // trust class as the headers above.
+    // x-conversation-id: CodeBuddy (`bili n`) stamps its persisted
+    // conversation object id on every model request — measured 2.181.0 across
+    // fresh/-c/-r processes: stable across restarts, survives compaction
+    // (#5825, decision A: merge low-trust recognition; per-message identity
+    // rides the transcript.jsonl harvest in src/identity-codebuddy.ts).
+    // Client-specific name; placed AFTER every stricter client header and the
+    // affinity tier, before the bare generic `session-id` names.
     const pluginMarker = typeof headers["x-bili-plugin"] === "string";
-    const names = ["x-bili-plugin-conversation", "x-claude-code-session-id", "x-grok-session-id", "x-grok-conv-id", "x-mavis-session-id", "x-opencode-session-id", "x-session-affinity", "x-acp-session", "x-session-id", "x-opencode-session", "session-id", "session_id"];
+    const names = ["x-bili-plugin-conversation", "x-claude-code-session-id", "x-grok-session-id", "x-grok-conv-id", "x-mavis-session-id", "agent-session-id", "x-opencode-session-id", "x-session-affinity", "x-acp-session", "x-conversation-id", "x-session-id", "x-opencode-session", "session-id", "session_id"];
     for (const name of names) {
         if (name === "x-bili-plugin-conversation" && !pluginMarker) continue;
         const v = headers[name];
@@ -139,7 +151,7 @@ export function zcodeMemoryConversation(parent: string, headers: Record<string, 
  * (#3482): present header names, the resolved conversation-source header,
  * and the codex user-agent fact. Shared by every predicate below so the
  * signal extraction stays single-sourced. */
-function wireClientSignals(headers: Record<string, string | string[] | undefined>): { headerNames: Set<string>; conversationSourceName: string | undefined; codexUserAgent: boolean } {
+function wireClientSignals(headers: Record<string, string | string[] | undefined>, personaSplitOff?: boolean): { headerNames: Set<string>; conversationSourceName: string | undefined; codexUserAgent: boolean; personaSplitOff?: boolean } {
     const headerNames = new Set<string>();
     for (const [name, value] of Object.entries(headers ?? {})) {
         const first = Array.isArray(value) ? value[0] : value;
@@ -149,15 +161,19 @@ function wireClientSignals(headers: Record<string, string | string[] | undefined
         headerNames,
         conversationSourceName: conversationHeaderSource(headers)?.name,
         codexUserAgent: isCodexClient(headers),
+        personaSplitOff,
     };
 }
 
-export function instructionsFingerprintApplies(headers: Record<string, string | string[] | undefined>): boolean {
+export function instructionsFingerprintApplies(headers: Record<string, string | string[] | undefined>, personaSplitOff?: boolean): boolean {
     // Detection only — the client-identity DECISION (who keys by
     // instructions) lives in the lane-decisions wire-client registry
     // (#3482 site 4): the header-name literals are registry data, not
     // scattered comparisons. Signals are name-free observations here.
-    return resolveWireClientProfile(wireClientSignals(headers)).instructionsFingerprintKeyed;
+    // personaSplitOff (#5456): host-level opt-out threaded from ProxyOptions
+    // so resolveWireClientProfile can strip instructionsFingerprintKeyed
+    // without mutating WIRE_CLIENTS literals.
+    return resolveWireClientProfile(wireClientSignals(headers, personaSplitOff)).instructionsFingerprintKeyed;
 }
 
 /** #4352: whether THIS request's claude-code-over-Anthropic traffic should
