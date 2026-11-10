@@ -114,6 +114,16 @@ function earlyHoldCredHeaders(req: http.IncomingMessage): Record<string, string>
 // window sizing falls back to config.toml model_context_window.
 const codexConfigWindowWarned = new Set<string>();
 
+// #5608 v3: weakest VERIFIED common-prefix ratio (verifiedPrefix / chainDepth)
+// at which a byte-exact MISS may still weakly adopt the closest tracked chain.
+// Floor set just below the lowest production telemetry reading in #5608's
+// maintainer comments (dsh desktop restart LCP 632/760 ≈ 0.83; others 827/955
+// ≈ 0.87, 1395/1523 ≈ 0.92) and far above every measured CI misfire shape
+// (head breaks at cell 0–8 of short chains: 0.0–0.67). Only the strictly-
+// deeper prefix-break kind is eligible; equal-depth replays (#1486) and
+// truncated subviews never adopt weakly regardless of ratio.
+const WEAK_ADOPT_MIN_PREFIX_RATIO = 0.8;
+
 // #2986: the derivedFromSessionId link is what keeps a kind child session
 // reachable along its parent chain after a restart — without it the shared
 // prefix is re-sent whole and over-window requests 503 (the #2985 failure). It
@@ -1961,6 +1971,17 @@ async function handleRequest(
         // as before — no deferral, no timing change).
         if (clientProvided && !anonAffinity && session.stats.requests === 0 && session.metadata.derivedFromSessionId === undefined && session.metadata.publicForkReceipt === undefined && opts.resumeInheritance !== false) {
             const loadParent = (id: string): Session | undefined => peekSession(id) ?? getStore().loadSync(id, { protocol, upstreamOrigin }) ?? undefined;
+            // #5608-B: where the honest-NULL arm actually lives — the PROVEN
+            // identity paths only: weak/strong resume adoptions (maybeAdoptResume,
+            // armBoundaryNull) and derived-fork/manual-fork sites (fork-adoption.ts,
+            // plugin.ts). Deliberately NOT armed here on any "starting fresh"
+            // fallback: below-threshold or unloadable matches do not prove the
+            // incoming bytes are OLD history (the same false-positive zone v3's
+            // gate rejects adoption for — cross-lane boilerplate prefixes match
+            // at cell 0 for genuinely new conversations, #554 e2e), and a lane
+            // that never runs a kernel pass (side requests are pure passthrough,
+            // #388) could never self-clear the flag, poisoning its persisted
+            // kernel state. Unproven identity keeps brand-new semantics: mint.
             // Claude Code records its fork parent in the transcript
             // (forkedFrom) — authoritative where the byte-exact prefix match
             // below fails: equal-length resumes and re-decorated tails (a
@@ -1998,6 +2019,95 @@ async function handleRequest(
                         ? prefixAffinity.diagnoseResumeMiss(affinityList, sessionId, derivedParent)
                         : prefixAffinity.diagnoseResumeMiss(affinityList, sessionId);
                     log(miss.best !== undefined ? "info" : "debug", `[${sessionId}] [resume-inheritance] miss: ${describeResumeMiss(miss)} (#4264)`);
+                    // #5608: a miss starts FRESH state, so the first replay renders
+                    // tags with new ref numbers, minted "now" times (or no times),
+                    // and RAW ranges where the old process sent FOLDED carriers —
+                    // every tagged byte flips vs the provider-cached prefix and
+                    // the whole history re-bills for one generation (the 1–12%
+                    // hit events). Adopt from the CLOSEST tracked chain instead of
+                    // starting bare: refs/blocks/latches/timestamps are all raw-id
+                    // (content-hash) keyed, so every carried value denotes the
+                    // exact bytes the model saw, and set-semantics adoption
+                    // self-defends against the deep divergence that broke the
+                    // byte-exact gate — a block whose sources were mutated is
+                    // simply straddled and left out. Honest ceiling: the true
+                    // common prefix; 100% needs a byte-faithful reload.
+                    // #5608 v3: content similarity alone cannot PROVE same-conversation
+                    // identity, so a miss must not adopt the closest chain unconditionally.
+                    // The v2 unconditional adoption shipped and immediately misfired on
+                    // three measured shapes (local CI reproduction, all cross-session
+                    // false positives inside one proxy process):
+                    //   equal-depth   two unrelated sessions resending the SAME
+                    //                 conversation bytes under new ids (#3686: a pi
+                    //                 subtest replayed the codex control's 15K-token
+                    //                 fixture verbatim — the foreign lane's fold block
+                    //                 landed on the declared-pi session)
+                    //   truncated     one session resending a SHORTER subview of another
+                    //                 session's live chain
+                    //   head break    near-duplicate boilerplate conversations that
+                    //                 already diverge at cell 0/8 of the window
+                    // Adopting in those cases smuggles foreign blocks/latches across
+                    // lanes: host-policy pins broke (#3686 "no fold may land"), fail-
+                    // fast paths started seeing inherited token budgets (#3450/#3645),
+                    // ref numbering shifted (fix-1001). Equal-depth replays were also
+                    // ruled out by design since #1486 ("duplicate conversation or
+                    // tail-branch replay… linking would adopt foreign blocks") — v2
+                    // overrode that stance without proof; v3 restores it for the weak
+                    // path. The legitimate production shape (#5608 telemetry, maintainer
+                    // comments: dsh desktop restarts with a NEW id resending full
+                    // history) is CONTINUATION-shaped: strictly deeper than the tracked
+                    // chain, divergence only in the recent tail (observed LCP floor
+                    // ≈ 632/760 = 0.83; other readings 827/955 ≈ 0.87, 1395/1523 ≈ 0.92).
+                    const b = miss.best;
+                    if (b && b.kind === "prefix-break") {
+                        // Conservative verified common-prefix: per-item hashes cover the
+                        // stored trailing window, so firstDivergence (absolute index of
+                        // the first disagreeing cell) lower-bounds the true LCP, and a
+                        // null means every VERIFIED cell of the parent agrees — treat
+                        // that as the whole stored chain sharing.
+                        const verifiedPrefix = b.firstDivergence === null ? b.chainDepth : b.firstDivergence;
+                        const ratio = verifiedPrefix / Math.max(b.chainDepth, 1);
+                        if (ratio < WEAK_ADOPT_MIN_PREFIX_RATIO) {
+                                // #5608-B: no honest-NULL arm on this fallback (see the
+                            // decision note at armHonestNull removal above) — strangers
+                            // and boilerplate-only overlap start brand-new: their ids
+                            // mint normally.
+                            log("info", `[${sessionId}] [resume-inheritance] miss: starting fresh — closest chain ${b.sessionId} breaks at cell ${b.firstDivergence}/${b.chainDepth} (verified prefix ${(ratio * 100).toFixed(0)}% < ${(WEAK_ADOPT_MIN_PREFIX_RATIO * 100).toFixed(0)}%); not a verified continuation (#5608)`);
+                        } else {
+                            const best = b.sessionId;
+                            try {
+                                const bestParent = loadParent(best);
+                                if (bestParent && bestParent !== session) {
+                                    maybeAdoptResume({
+                                        session,
+                                        parent: bestParent,
+                                        sharedDepth: 0,
+                                        protocol,
+                                        parsed,
+                                        upstreamOrigin,
+                                        blocksEnabled: true,
+                                        via: "weakly resumed closest chain after byte-exact miss (#5608)",
+                                        // #5608-B: the miss path is exactly the
+                                        // re-rendered-drift shape — uncovered ids
+                                        // may be OLD content, so the boundary
+                                        // batch yields honest NULL.
+                                        armBoundaryNull: true,
+                                        log,
+                                    });
+                                } else {
+                                    log("info", `[${sessionId}] [resume-inheritance] miss: closest chain ${best} is not loadable — starting fresh (#5608)`);
+                                }
+                            } catch (err) {
+                                log("warn", `[${sessionId}] [resume-inheritance] miss: weak adoption from closest chain ${best} failed (${String(err)}); continuing fresh (#5608)`);
+                            }
+                        }
+                    } else if (b) {
+                        // truncated / equal-depth shapes: classification proves
+                        // overlap, but again no honest-NULL arm here — see the
+                        // decision note above (unproven identity = brand-new mint;
+                        // lanes without a kernel pass can never clear the flag).
+                        log("info", `[${sessionId}] [resume-inheritance] miss: starting fresh — closest chain ${b.sessionId} is a ${b.kind} shape (incoming ${b.incomingDepth} vs chain ${b.chainDepth}); only strictly-deeper verified continuations may be adopted weakly (#5608/#1486)`);
+                    }
                 }
             }
             if (resume) {
