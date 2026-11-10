@@ -3,7 +3,7 @@
  *
  * Coverage map (issue acceptance boxes):
  *  ① draw uniformity (fixed random source) + persistence no-re-roll  — §D, §H1
- *  ② default window 15min..48h, local config/env override            — §C
+ *  ② default window 15min..7d, local config/env override            — §C
  *  ③ remote policy fetch: ETag cache, 304, failure fallback          — §E
  *  ④ overrides by version/range; hold/blocked/pinned each tested     — §C, §G, §H
  *  ⑤ security: file cannot induce arbitrary version/URL installs     — §A5, §G, §H6
