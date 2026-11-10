@@ -68,7 +68,22 @@
 //        never updated). No backfill: pre-feature rows stay NULL and keep
 //        rendering without the tag's time attribute. Same both-directions
 //        compatibility as v5 (older build ignores, newer build ALTERs).
-export const STORAGE_SCHEMA_VERSION = 10;
+//      - v11: FK child indexes on content.hash (#5539) — every column that
+//        REFERENCES content(hash) gains its own index: messages(content_hash),
+//        blocks(one_hash), blocks(summary_hash), ccr_entries(content_hash),
+//        message_media(media_hash), checkpoints(state_hash). With
+//        foreign_keys=ON, deleting a parent content row must prove no child
+//        row still references it; without an index on the child column
+//        SQLite full-scans the whole child table once PER deleted parent row.
+//        releaseContent() removes one parent per released hash (~3K/turn on a
+//        busy session), so every turn paid ~3K × 6 full scans — field report
+//        #5539: 20–35 s/turn at ~18K messages, 4–5 s after adding the five
+//        child indexes he listed (checkpoints.state_hash is this fix's sixth,
+//        same mechanism, missed by the field audit). Same idempotent-CREATE
+//        discipline as v9 (#4796); building them once costs about what
+//        open-time quick_check pays on EVERY open (#4175). Additive-only: an
+//        older build opening a v11 file ignores the extra indexes.
+export const STORAGE_SCHEMA_VERSION = 11;
 
 /** #3250: cap for `journal_size_limit` (see STORAGE_PRAGMAS). Passive and
  *  auto checkpoints move frames into the main db and reset the write offset
@@ -277,6 +292,17 @@ CREATE INDEX IF NOT EXISTS idx_blocks_session ON blocks(session_id, ord);
 CREATE INDEX IF NOT EXISTS idx_dead_refs_session ON dead_refs(session_id, ord);
 CREATE INDEX IF NOT EXISTS idx_refs_session ON refs(session_id, ord);
 CREATE INDEX IF NOT EXISTS idx_checkpoints_session ON checkpoints(session_id, created_at);
+-- FK child indexes (#5539): with foreign_keys=ON, every DELETE from the
+-- content parent proves no child row still references it by scanning each
+-- child table UNLESS the child's ref column is indexed. releaseContent()
+-- removes one parent per released hash (~3K/turn), so unindexed = ~3K × 6
+-- full scans per turn (field: 20–35 s/turn at ~18K messages).
+CREATE INDEX IF NOT EXISTS idx_messages_content_hash ON messages(content_hash);
+CREATE INDEX IF NOT EXISTS idx_blocks_one_hash ON blocks(one_hash);
+CREATE INDEX IF NOT EXISTS idx_blocks_summary_hash ON blocks(summary_hash);
+CREATE INDEX IF NOT EXISTS idx_ccr_entries_content_hash ON ccr_entries(content_hash);
+CREATE INDEX IF NOT EXISTS idx_message_media_media_hash ON message_media(media_hash);
+CREATE INDEX IF NOT EXISTS idx_checkpoints_state_hash ON checkpoints(state_hash);
 `;
 
 /** Applied inside one transaction whenever user_version < STORAGE_SCHEMA_VERSION. */
@@ -397,6 +423,18 @@ export function migrateSchema(db: {
             if (!tsCols.includes("ts")) {
                 db.exec("ALTER TABLE messages ADD COLUMN ts INTEGER");
             }
+        }
+        if (from < 11) {
+            // v11 (#5539): FK child indexes on content.hash — see the header
+            // note and the DDL comment above for the mechanism and field
+            // evidence. Idempotent CREATEs, same discipline as v9; a
+            // dev-window lib that already carried them re-lands cleanly.
+            db.exec("CREATE INDEX IF NOT EXISTS idx_messages_content_hash ON messages(content_hash)");
+            db.exec("CREATE INDEX IF NOT EXISTS idx_blocks_one_hash ON blocks(one_hash)");
+            db.exec("CREATE INDEX IF NOT EXISTS idx_blocks_summary_hash ON blocks(summary_hash)");
+            db.exec("CREATE INDEX IF NOT EXISTS idx_ccr_entries_content_hash ON ccr_entries(content_hash)");
+            db.exec("CREATE INDEX IF NOT EXISTS idx_message_media_media_hash ON message_media(media_hash)");
+            db.exec("CREATE INDEX IF NOT EXISTS idx_checkpoints_state_hash ON checkpoints(state_hash)");
         }
     });
     if (needV8Backfill) migrateV8Identities(db);

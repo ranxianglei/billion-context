@@ -166,6 +166,14 @@ const BODY_NO_BP = JSON.stringify({
     system: "plain system",
     messages: [{ role: "user", content: "hi" }],
 });
+// #5665: a breakpoint with no explicit ttl — Anthropic's default ephemeral TTL is 5m.
+const BODY_NO_TTL = JSON.stringify({
+    model: "claude-opus-test",
+    max_tokens: 1024,
+    stream: true,
+    system: [{ type: "text", text: "sys", cache_control: { type: "ephemeral" } }],
+    messages: [{ role: "user", content: "hi" }],
+});
 
 let timers: FakeTimers;
 let sid: string;
@@ -218,6 +226,19 @@ test("detectKeepaliveTier: 5m / 1h / mixed / nested / none", () => {
         messages: [{ role: "user", content: [{ type: "text", text: "b", cache_control: { type: "ephemeral", ttl: "1h" } }] }],
     };
     assert.equal(detectKeepaliveTier(mixed), "1h");
+    // #5665: a breakpoint without an explicit ttl is Anthropic's default 5m tier,
+    // NOT "no breakpoint detected". Only bodies with zero cache_control are undefined.
+    assert.equal(detectKeepaliveTier(JSON.parse(BODY_NO_TTL)), "5m");
+    const mixedNoTtl = {
+        system: [{ text: "a", cache_control: { type: "ephemeral", ttl: "5m" } }],
+        messages: [{ role: "user", content: [{ type: "text", text: "b", cache_control: { type: "ephemeral" } }] }],
+    };
+    assert.equal(detectKeepaliveTier(mixedNoTtl), "5m");
+    const oneHourAmongNoTtl = {
+        system: [{ text: "a", cache_control: { type: "ephemeral" } }],
+        messages: [{ role: "user", content: [{ type: "text", text: "b", cache_control: { type: "ephemeral", ttl: "1h" } }] }],
+    };
+    assert.equal(detectKeepaliveTier(oneHourAmongNoTtl), "1h");
     assert.equal(detectKeepaliveTier(JSON.parse(BODY_NO_BP)), undefined);
     assert.equal(detectKeepaliveTier(null), undefined);
 });
@@ -300,6 +321,17 @@ test("arm: anthropic POST with 5m breakpoints arms at TTL×0.9", () => {
 test("arm: 1h breakpoints arm at 1h×0.9", () => {
     noteSuccessfulForward(armInput({ wireBody: BODY_1H }));
     assert.equal(_keepaliveEntryForTest(sid)?.cadenceMs, 3_240_000);
+});
+
+// #5665 regression: a breakpoint with no explicit ttl used to return tier
+// undefined and silently never arm; it must now arm at the 5m cadence.
+test("arm: no-ttl breakpoints arm at the default 5m tier", () => {
+    noteSuccessfulForward(armInput({ wireBody: BODY_NO_TTL }));
+    const e = _keepaliveEntryForTest(sid);
+    assert.ok(e, "session armed from a no-ttl breakpoint");
+    assert.equal(e!.cadenceMs, 270_000);
+    assert.equal(e!.tierLabel, "5m");
+    assert.deepEqual(_keepaliveArmedForTest(), [sid]);
 });
 
 for (const [name, over] of [
