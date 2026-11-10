@@ -2419,9 +2419,10 @@ export async function handlePluginTool(
     {
         const hot = hotWritersOf(session.id);
         if (hot.length > 0) {
-            deps.log("error", `[plugin] tool "${tool}" refused for session ${session.id}: another live instance is writing it (${hot.map(describeHotWriter).join(", ")}) — stop one instance or point this client at the writer (#394)`);
+            const peers = [...new Set(hot.map(describeHotWriter))].join(", ");
+            deps.log("error", `[plugin] tool "${tool}" refused for session ${session.id}: another live instance is writing it (${peers}) — stop one instance or point this client at the writer (#394)`);
             res.writeHead(409, { "content-type": "application/json" });
-            res.end(JSON.stringify({ ok: false, error: `this conversation is currently being served by another bili instance (${describeHotWriter(hot[0]!)}); stop that instance or route this client to it, then retry` }));
+            res.end(JSON.stringify({ ok: false, error: `this conversation is currently being served by another bili instance (${peers}); stop that instance or route this client to it, then retry` }));
             return;
         }
     }
