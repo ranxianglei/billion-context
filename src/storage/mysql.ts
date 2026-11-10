@@ -54,6 +54,11 @@ import type {
     WebSummaryRow,
     IngestSessionInput,
     SessionViewRows,
+    L1WorldRow,
+    SnapRow,
+    SnapCkpt,
+    SnapshotCommitInput,
+    SnapshotCommitResult,
 } from "./store.js";
 
 /** The mysql2/promise driver module, injected by openBackend() at open time.
@@ -73,8 +78,13 @@ export type Mysql2Module = typeof import("mysql2/promise");
  *  proofing there. Existing stamped-v10 libraries re-enter the probe-first
  *  DDL block below exactly once on first open (information_schema probe +
  *  ALTER ADD INDEX); fresh installs pick the keys up from the CREATE TABLE
- *  DDL. */
-const MYSQL_SCHEMA_VERSION = 11;
+ *  DDL.
+ *  v12 (#5874): snapshot-table compression foundation — four NEW tables
+ *  (l1_world, snap_rows, snap_log, snap_ckpt), pure additive, no ALTERs on
+ *  existing tables. The unconditional CREATE TABLE IF NOT EXISTS loop at the
+ *  top of init() lands them on every open (same idempotent-CREATE discipline
+ *  as v3/v4/v7 in the sqlite twin); nothing behind the stamp gate. */
+const MYSQL_SCHEMA_VERSION = 12;
 
 /** Parity constants with the sqlite v8 streaming backfill
  *  (src/storage/schema.ts, #4677): same page size, same printable absent
@@ -267,6 +277,59 @@ CREATE TABLE IF NOT EXISTS message_media (
     media_hash VARCHAR(64) NOT NULL,
     PRIMARY KEY (session_id, seq, media_hash),
     KEY idx_message_media_media_hash (media_hash)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4;
+
+-- #5874 snapshot-table compression foundation (v12): the single storage
+-- truth for the coherent-host compression base (sqlite twin in
+-- src/storage/schema.ts). post_json ALWAYS holds the canonical-core form
+-- (never wire bytes — invariant v); pre_json holds CAS digest references
+-- (ruling A). Rows are never physically deleted while their covering
+-- block lives (active=0 deactivation; physical cleanup with the covering
+-- block — ruling B / #3752 red line). l1_world.envelope_json holds the
+-- canonical host-msgid envelope as an ordered JSON array of {id, pos}
+-- (append-only pos, never reused); l1_world.session_id is the reverse
+-- pointer so deleteSession can cascade.
+CREATE TABLE IF NOT EXISTS l1_world (
+    sess_raw          VARCHAR(255) NOT NULL PRIMARY KEY,
+    session_id        VARCHAR(255) NOT NULL,
+    ledger_id         VARCHAR(255) NOT NULL,
+    envelope_json     LONGTEXT NOT NULL,
+    envelope_checksum VARCHAR(128) NOT NULL,
+    witness_probe     TEXT NULL,
+    issued_at         BIGINT NOT NULL,
+    armed_at          BIGINT NULL,
+    KEY idx_l1_ledger (ledger_id)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4;
+
+CREATE TABLE IF NOT EXISTS snap_rows (
+    sid        VARCHAR(255) NOT NULL,
+    pos        BIGINT NOT NULL,
+    core_ids   LONGTEXT NOT NULL,
+    pre_json   LONGTEXT NULL,
+    post_json  LONGTEXT NOT NULL,
+    tokens_est BIGINT NOT NULL DEFAULT 0,
+    active     TINYINT NOT NULL DEFAULT 1,
+    cover_ref  VARCHAR(255) NULL,
+    updated_at BIGINT NOT NULL,
+    PRIMARY KEY (sid, pos),
+    KEY idx_snap_rows_cover (sid, cover_ref)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4;
+
+CREATE TABLE IF NOT EXISTS snap_log (
+    sid        VARCHAR(255) NOT NULL,
+    seq        BIGINT NOT NULL,
+    kind       VARCHAR(32) NOT NULL,
+    payload    LONGTEXT NOT NULL,
+    created_at BIGINT NOT NULL,
+    PRIMARY KEY (sid, seq)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4;
+
+CREATE TABLE IF NOT EXISTS snap_ckpt (
+    sid        VARCHAR(255) NOT NULL PRIMARY KEY,
+    ckpt_seq   BIGINT NOT NULL,
+    meta_json  LONGTEXT NOT NULL,
+    checksum   VARCHAR(128) NOT NULL,
+    updated_at BIGINT NOT NULL
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4;
 
 CREATE TABLE IF NOT EXISTS bili_meta (
@@ -1308,8 +1371,15 @@ export class MysqlBackend implements StorageBackend {
             await c.query("DELETE FROM ccr_entries WHERE session_id = ?", [sessionId]);
             await c.query("DELETE FROM conversations WHERE session_id = ?", [sessionId]);
             await c.query("DELETE FROM session_ext WHERE session_id = ?", [sessionId]);
+            // #5874: snapshot-table foundation cascade (T6: no orphans).
+            const [snapPre] = (await c.query("SELECT pre_json FROM snap_rows WHERE sid = ?", [sessionId])) as unknown as Row[][];
+            await c.query("DELETE FROM snap_rows WHERE sid = ?", [sessionId]);
+            await c.query("DELETE FROM snap_log WHERE sid = ?", [sessionId]);
+            await c.query("DELETE FROM snap_ckpt WHERE sid = ?", [sessionId]);
+            await c.query("DELETE FROM l1_world WHERE session_id = ?", [sessionId]);
             await c.query("DELETE FROM sessions WHERE session_id = ?", [sessionId]);
             for (const hash of refs) await this.releaseContent(c, hash);
+            for (const r of snapPre) if (r.pre_json !== null && r.pre_json !== undefined) await this.releaseContent(c, str(r.pre_json));
             // #4796 follow-up: scoped collection over this session's own
             // released hashes (see collectZeroRefIn) — never the whole table.
             await this.collectZeroRefIn(c, refs);
@@ -2141,6 +2211,217 @@ export class MysqlBackend implements StorageBackend {
             await this.collectZeroRefIn(c, [str(rows[0].state_hash)]);
             return true;
         });
+    }
+
+    // --- snapshot-table foundation (#5874) --------------------------------
+
+    /** #5874 commit primitive (mysql twin): rows + log appends (+ optional
+     *  ckpt fold) in ONE transaction; seq assignment mirrors the sqlite
+     *  twin (max(existing log max, ckpt_seq) + n — strictly monotonic,
+     *  invariant ii). */
+    async commitSnapshot(input: SnapshotCommitInput): Promise<SnapshotCommitResult> {
+        return this.tx(async (c): Promise<SnapshotCommitResult> => {
+            const sid = input.sessionId;
+            for (const pc of input.preContents ?? []) await this.putContent(c, pc.content, pc.hash);
+            const [logRows] = (await c.query("SELECT COALESCE(MAX(seq), 0) AS m FROM snap_log WHERE sid = ?", [sid])) as unknown as Row[][];
+            const [ckptRows] = (await c.query("SELECT COALESCE(MAX(ckpt_seq), 0) AS m FROM snap_ckpt WHERE sid = ?", [sid])) as unknown as Row[][];
+            let nextSeq = Math.max(num(logRows[0]?.m), num(ckptRows[0]?.m));
+            for (const r of input.rows) {
+                await c.query(
+                    "INSERT INTO snap_rows (sid, pos, core_ids, pre_json, post_json, tokens_est, active, cover_ref, updated_at) " +
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) " +
+                        "ON DUPLICATE KEY UPDATE core_ids = VALUES(core_ids), pre_json = VALUES(pre_json), " +
+                        "post_json = VALUES(post_json), tokens_est = VALUES(tokens_est), active = VALUES(active), " +
+                        "cover_ref = VALUES(cover_ref), updated_at = VALUES(updated_at)",
+                    [sid, r.pos, r.coreIds, r.preJson ?? null, r.postJson, r.tokensEst, r.active ? 1 : 0, r.coverRef ?? null, input.now],
+                );
+            }
+            const logSeqs: number[] = [];
+            for (const e of input.logEntries) {
+                nextSeq += 1;
+                logSeqs.push(nextSeq);
+                await c.query("INSERT INTO snap_log (sid, seq, kind, payload, created_at) VALUES (?, ?, ?, ?, ?)", [
+                    sid,
+                    nextSeq,
+                    e.kind,
+                    e.payload,
+                    e.createdAt,
+                ]);
+            }
+            let ckptSeq: number | undefined;
+            if (input.ckpt !== undefined) {
+                ckptSeq = input.ckpt.ckptSeq;
+                await c.query(
+                    "INSERT INTO snap_ckpt (sid, ckpt_seq, meta_json, checksum, updated_at) VALUES (?, ?, ?, ?, ?) " +
+                        "ON DUPLICATE KEY UPDATE ckpt_seq = VALUES(ckpt_seq), meta_json = VALUES(meta_json), " +
+                        "checksum = VALUES(checksum), updated_at = VALUES(updated_at)",
+                    [sid, ckptSeq, input.ckpt.metaJson, input.ckpt.checksum, input.now],
+                );
+                // Ckpt fold = the LSM compaction boundary (mysql twin): absorb
+                // the log up to ckptSeq into the meta triple and physically
+                // clean inactive rows that have NO covering block (client-side
+                // drops; block-covered rows ride the block lifecycle — ruling
+                // B, no global TTL, #3752).
+                const [absorbed] = (await c.query(
+                    "SELECT pre_json FROM snap_rows WHERE sid = ? AND active = 0 AND cover_ref IS NULL",
+                    [sid],
+                )) as unknown as Row[][];
+                await c.query("DELETE FROM snap_rows WHERE sid = ? AND active = 0 AND cover_ref IS NULL", [sid]);
+                await c.query("DELETE FROM snap_log WHERE sid = ? AND seq <= ?", [sid, ckptSeq]);
+                for (const a of absorbed) if (a.pre_json !== null && a.pre_json !== undefined) await this.releaseContent(c, str(a.pre_json));
+            }
+            return { logSeqs, ckptSeq };
+        });
+    }
+
+    async getSnapRows(sessionId: string, opts?: { fromPos?: number; includeInactive?: boolean }): Promise<SnapRow[]> {
+        const where: string[] = ["sid = ?"];
+        const args: unknown[] = [sessionId];
+        if (opts?.fromPos !== undefined) {
+            where.push("pos > ?");
+            args.push(opts.fromPos);
+        }
+        if (opts?.includeInactive !== true) where.push("active = 1");
+        const [rows] = (await this.pool.query(
+            `SELECT pos, core_ids, pre_json, post_json, tokens_est, active, cover_ref, updated_at ` +
+                `FROM snap_rows WHERE ${where.join(" AND ")} ORDER BY pos`,
+            args,
+        )) as unknown as Row[][];
+        const out: SnapRow[] = [];
+        for (const r of rows) out.push({
+            sessionId,
+            pos: num(r.pos),
+            coreIds: str(r.core_ids),
+            preJson: nullableStr(r.pre_json),
+            postJson: str(r.post_json),
+            tokensEst: num(r.tokens_est),
+            active: num(r.active) === 1,
+            coverRef: nullableStr(r.cover_ref),
+            updatedAt: num(r.updated_at),
+        });
+        return out;
+    }
+
+    async snapLogMaxSeq(sessionId: string): Promise<number> {
+        // The committed EVENT FRONTIER: max over log AND checkpoint (the
+        // ckpt absorbs log payloads — the log's own MAX understates after a
+        // fold; invariant ii is enforced against this value).
+        const [rows] = (await this.pool.query(
+            "SELECT COALESCE(MAX(l.m), 0) AS m FROM (SELECT MAX(seq) AS m FROM snap_log WHERE sid = ?) l, " +
+                "(SELECT MAX(ckpt_seq) AS m FROM snap_ckpt WHERE sid = ?) c",
+            [sessionId, sessionId],
+        )) as unknown as Row[][];
+        return num(rows[0]?.m);
+    }
+
+    async getSnapCkpt(sessionId: string): Promise<SnapCkpt | null> {
+        const [rows] = (await this.pool.query(
+            "SELECT ckpt_seq, meta_json, checksum, updated_at FROM snap_ckpt WHERE sid = ?",
+            [sessionId],
+        )) as unknown as Row[][];
+        if (rows.length === 0) return null;
+        const r = rows[0];
+        return { sessionId, ckptSeq: num(r.ckpt_seq), metaJson: str(r.meta_json), checksum: str(r.checksum), updatedAt: num(r.updated_at) };
+    }
+
+    async getL1World(sessRaw: string): Promise<L1WorldRow | null> {
+        const [rows] = (await this.pool.query(
+            "SELECT session_id, ledger_id, envelope_json, envelope_checksum, witness_probe, issued_at, armed_at FROM l1_world WHERE sess_raw = ?",
+            [sessRaw],
+        )) as unknown as Row[][];
+        if (rows.length === 0) return null;
+        const r = rows[0];
+        return {
+            sessRaw,
+            sessionId: str(r.session_id),
+            ledgerId: str(r.ledger_id),
+            envelopeJson: str(r.envelope_json),
+            envelopeChecksum: str(r.envelope_checksum),
+            witnessProbe: nullableStr(r.witness_probe),
+            issuedAt: num(r.issued_at),
+            armedAt: nullableNum(r.armed_at),
+        };
+    }
+
+    async upsertL1World(row: L1WorldRow): Promise<void> {
+        await this.pool.query(
+            "INSERT INTO l1_world (sess_raw, session_id, ledger_id, envelope_json, envelope_checksum, witness_probe, issued_at, armed_at) " +
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?) " +
+                "ON DUPLICATE KEY UPDATE session_id = VALUES(session_id), ledger_id = VALUES(ledger_id), " +
+                "envelope_json = VALUES(envelope_json), envelope_checksum = VALUES(envelope_checksum), " +
+                "witness_probe = VALUES(witness_probe), armed_at = COALESCE(VALUES(armed_at), armed_at)",
+            [row.sessRaw, row.sessionId, row.ledgerId, row.envelopeJson, row.envelopeChecksum, row.witnessProbe ?? null, row.issuedAt, row.armedAt ?? null],
+        );
+    }
+
+    async listL1WorldByLedger(ledgerId: string): Promise<L1WorldRow[]> {
+        const [rows] = (await this.pool.query(
+            "SELECT sess_raw, session_id, ledger_id, envelope_json, envelope_checksum, witness_probe, issued_at, armed_at FROM l1_world WHERE ledger_id = ? ORDER BY sess_raw",
+            [ledgerId],
+        )) as unknown as Row[][];
+        return rows.map((r) => ({
+            sessRaw: str(r.sess_raw),
+            sessionId: str(r.session_id),
+            ledgerId: str(r.ledger_id),
+            envelopeJson: str(r.envelope_json),
+            envelopeChecksum: str(r.envelope_checksum),
+            witnessProbe: nullableStr(r.witness_probe),
+            issuedAt: num(r.issued_at),
+            armedAt: nullableNum(r.armed_at),
+        }));
+    }
+
+    /** #5874 ruling B physical cleanup (mysql twin): INACTIVE rows whose
+     *  covering block died; chunked under REF_STMT_MAX_PARAMS. */
+    async sweepSnapRowsByDeadCovers(sessionId: string, deadCoverRefs: string[]): Promise<number> {
+        if (deadCoverRefs.length === 0) return 0;
+        let swept = 0;
+        for (let i = 0; i < deadCoverRefs.length; i += REF_STMT_MAX_PARAMS) {
+            const chunk = deadCoverRefs.slice(i, i + REF_STMT_MAX_PARAMS);
+            const ph = chunk.map(() => "?").join(",");
+            const [doomed] = (await this.pool.query(
+                `SELECT pre_json FROM snap_rows WHERE sid = ? AND active = 0 AND cover_ref IN (${ph})`,
+                [sessionId, ...chunk],
+            )) as unknown as Row[][];
+            const [res] = (await this.pool.query(
+                `DELETE FROM snap_rows WHERE sid = ? AND active = 0 AND cover_ref IN (${ph})`,
+                [sessionId, ...chunk],
+            )) as unknown as [{ affectedRows?: number }, unknown];
+            swept += Number(res.affectedRows ?? 0);
+            for (const d of doomed) if (d.pre_json !== null && d.pre_json !== undefined) await this.releaseContent(this.pool, str(d.pre_json));
+        }
+        return swept;
+    }
+
+    // #5874: world-epoch resync (standalone, its own short transaction) —
+    // wipes one session's snapshot-table state and releases the pre-form
+    // content refs. The deleteSession cascade above reuses the same four
+    // deletes inside the session-delete transaction.
+    async deleteSnapshotSession(sessionId: string): Promise<void> {
+        await this.tx(async (c) => {
+            const [snapPre] = (await c.query("SELECT pre_json FROM snap_rows WHERE sid = ?", [sessionId])) as unknown as Row[][];
+            await c.query("DELETE FROM snap_rows WHERE sid = ?", [sessionId]);
+            await c.query("DELETE FROM snap_log WHERE sid = ?", [sessionId]);
+            await c.query("DELETE FROM snap_ckpt WHERE sid = ?", [sessionId]);
+            await c.query("DELETE FROM l1_world WHERE session_id = ?", [sessionId]);
+            for (const r of snapPre) if (r.pre_json !== null && r.pre_json !== undefined) await this.releaseContent(c, str(r.pre_json));
+        });
+    }
+
+    async putContentRef(content: string, precomputedHash?: string): Promise<string> {
+        return this.tx(async (c) => this.putContent(c, content, precomputedHash));
+    }
+
+    async getContentRef(hash: string): Promise<string | null> {
+        const [rows] = (await this.pool.query("SELECT bytes FROM content WHERE hash = ?", [hash])) as unknown as Row[][];
+        if (rows.length === 0) return null;
+        const b = rows[0].bytes;
+        return Buffer.from(b as Uint8Array).toString("utf8");
+    }
+
+    async releaseContentRef(hash: string | null): Promise<void> {
+        if (!hash) return;
+        await this.tx(async (c) => this.releaseContent(c, hash));
     }
 
     // --- session_ext / kv --------------------------------------------------

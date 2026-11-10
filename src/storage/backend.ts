@@ -34,6 +34,12 @@ export type {
     WebSummaryRow,
     IngestSessionInput,
     SessionViewRows,
+    L1WorldRow,
+    SnapRow,
+    SnapLogEntry,
+    SnapCkpt,
+    SnapshotCommitInput,
+    SnapshotCommitResult,
 } from "./store.js";
 import type {
     SessionRow,
@@ -46,6 +52,12 @@ import type {
     WebSummaryRow,
     IngestSessionInput,
     SessionViewRows,
+    L1WorldRow,
+    SnapRow,
+    SnapLogEntry,
+    SnapCkpt,
+    SnapshotCommitInput,
+    SnapshotCommitResult,
 } from "./store.js";
 
 /** Everything a storage backend must provide. Mirrors the operation surface
@@ -144,6 +156,27 @@ export interface StorageBackend {
     verifyProjections(sessionId: string): Promise<{ ok: true; checks: number } | { ok: false; error: string }>;
     counts(): Promise<Record<string, number>>;
     contentDedupReport(): Promise<{ rows: number; bytesTotal: number; refcounted: number }>;
+
+    // --- snapshot-table foundation (#5874) --------------------------------
+    /** The commit primitive: rows + log appends (+ optional ckpt fold) in
+     *  ONE transaction; seqs assigned by the store (strictly monotonic). */
+    commitSnapshot(input: SnapshotCommitInput): Promise<SnapshotCommitResult>;
+    getSnapRows(sessionId: string, opts?: { fromPos?: number; includeInactive?: boolean }): Promise<SnapRow[]>;
+    snapLogMaxSeq(sessionId: string): Promise<number>;
+    getSnapCkpt(sessionId: string): Promise<SnapCkpt | null>;
+    getL1World(sessRaw: string): Promise<L1WorldRow | null>;
+    upsertL1World(row: L1WorldRow): Promise<void>;
+    listL1WorldByLedger(ledgerId: string): Promise<L1WorldRow[]>;
+    /** Ruling B physical cleanup (inactive rows whose cover block died). */
+    sweepSnapRowsByDeadCovers(sessionId: string, deadCoverRefs: string[]): Promise<number>;
+    /** #5874: world-epoch resync — wipe one session's snapshot-table state
+     *  (rows + log + ckpt + world) and release the pre-form content refs. */
+    deleteSnapshotSession(sessionId: string): Promise<void>;
+    /** #5874 ruling A: CAS reference access (pre-form bodies). */
+    putContentRef(content: string, precomputedHash?: string): Promise<string>;
+    /** #5874: null = body missing (audit-diagnostic exit, T8). */
+    getContentRef(hash: string): Promise<string | null>;
+    releaseContentRef(hash: string | null): Promise<void>;
 
     close(): Promise<void>;
     /** One-time DDL + schema stamp for network backends (MySQL); a no-op
@@ -289,6 +322,42 @@ export class SqliteBackend implements StorageBackend {
     }
     deleteCheckpoint(cpId: string): Promise<boolean> {
         return Promise.resolve(this.store.deleteCheckpoint(cpId));
+    }
+    commitSnapshot(input: SnapshotCommitInput): Promise<SnapshotCommitResult> {
+        return Promise.resolve(this.store.commitSnapshot(input));
+    }
+    getSnapRows(sessionId: string, opts?: { fromPos?: number; includeInactive?: boolean }): Promise<SnapRow[]> {
+        return Promise.resolve(this.store.getSnapRows(sessionId, opts));
+    }
+    snapLogMaxSeq(sessionId: string): Promise<number> {
+        return Promise.resolve(this.store.snapLogMaxSeq(sessionId));
+    }
+    getSnapCkpt(sessionId: string): Promise<SnapCkpt | null> {
+        return Promise.resolve(this.store.getSnapCkpt(sessionId));
+    }
+    getL1World(sessRaw: string): Promise<L1WorldRow | null> {
+        return Promise.resolve(this.store.getL1World(sessRaw));
+    }
+    upsertL1World(row: L1WorldRow): Promise<void> {
+        return Promise.resolve(this.store.upsertL1World(row));
+    }
+    listL1WorldByLedger(ledgerId: string): Promise<L1WorldRow[]> {
+        return Promise.resolve(this.store.listL1WorldByLedger(ledgerId));
+    }
+    sweepSnapRowsByDeadCovers(sessionId: string, deadCoverRefs: string[]): Promise<number> {
+        return Promise.resolve(this.store.sweepSnapRowsByDeadCovers(sessionId, deadCoverRefs));
+    }
+    deleteSnapshotSession(sessionId: string): Promise<void> {
+        return Promise.resolve(this.store.deleteSnapshotSession(sessionId));
+    }
+    putContentRef(content: string, precomputedHash?: string): Promise<string> {
+        return Promise.resolve(this.store.putContentRef(content, precomputedHash));
+    }
+    getContentRef(hash: string): Promise<string | null> {
+        return Promise.resolve(this.store.getContentRef(hash));
+    }
+    releaseContentRef(hash: string | null): Promise<void> {
+        return Promise.resolve(this.store.releaseContentRef(hash));
     }
     setSessionExt(sessionId: string, key: string, value: unknown): Promise<void> {
         return Promise.resolve(this.store.setSessionExt(sessionId, key, value));

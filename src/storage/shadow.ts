@@ -31,7 +31,7 @@ import type { BlockView } from "../session.js";
 import { resolveStorageMode, resolveStorageWalJournalSizeLimit, type StorageMode } from "../knobs.ts";
 import { UnifiedStore, StorageIntegrityError, type CheckpointRow, type SessionSummaryRow, type WebSummaryRow } from "./store.ts";
 import path from "node:path";
-import { resolveBackendName, backendSelectionNotice, selectedBackendRaw, openBackend, type StorageBackend } from "./backend.ts";
+import { resolveBackendName, backendSelectionNotice, selectedBackendRaw, openBackend, SqliteBackend, type StorageBackend } from "./backend.ts";
 import { canonicalDigest, canonicalize, sha256 } from "./canonical.ts";
 import { recordSidecarInstance, recordSidecarOpenFailure } from "./runtime-status.ts";
 import type { SqliteEngineName, SqliteEngineSource } from "./driver.ts";
@@ -237,6 +237,47 @@ export class UnifiedShadow {
         if (store === null) this.backend = backend ?? null;
         this.legacyLoad = legacyLoad;
         this.dbPath = dbPath ?? null;
+    }
+
+    /** #5874: the snapshot-table foundation's storage access — the async
+     *  StorageBackend contract on whichever backend serves this instance
+     *  (sqlite: a thin adapter over the sync UnifiedStore, built once;
+     *  mysql: the MysqlBackend itself). Null when the sidecar is missing
+     *  (open failed) — the foundation degrades to legacy on those installs.
+     *  Every other method on this class keeps its own conventions. */
+    private foundationBk: StorageBackend | null | undefined;
+    foundationStore(): StorageBackend | null {
+        if (this.stats.disabled) return null;
+        if (this.sync !== null) {
+            if (this.foundationBk === undefined) this.foundationBk = new SqliteBackend(this.sync);
+            return this.foundationBk;
+        }
+        return this.backend;
+    }
+
+    /** #5874 P3 (decompress green lane): SYNC row-ledger read — the decompress
+     *  path is synchronous and sqlite-only (the sync UnifiedStore is the fast
+     *  lane; network backends have no sync surface, so mysql installs return
+     *  null = "unavailable" and the legacy receipts apply there unchanged).
+     *  includeInactive: covered (active=0) rows ARE the pre-fold content the
+     *  ledger keeps for a dead block. Null on any degradation — callers must
+     *  treat null as "no snapshot substrate", never as "no rows". */
+    unifiedSnapshotRows(sessionId: string): import("./store.ts").SnapRow[] | null {
+        if (this.stats.disabled || this.sync === null) return null;
+        try {
+            return this.sync.getSnapRows(sessionId, { includeInactive: true });
+        } catch {
+            return null; // sidecar degraded mid-call: legacy path applies
+        }
+    }
+
+    unifiedSnapshotCkpt(sessionId: string): import("./store.ts").SnapCkpt | null {
+        if (this.stats.disabled || this.sync === null) return null;
+        try {
+            return this.sync.getSnapCkpt(sessionId);
+        } catch {
+            return null;
+        }
     }
 
     /** #5103 / 2026-10-30 owner policy (never abandon index writes): record

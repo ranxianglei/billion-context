@@ -301,6 +301,10 @@ export interface SessionStorageStats {
         sessionExt: number;
         checkpoints: number;
         pinnedCheckpoints: number;
+        /** #5874: snapshot-table foundation rows for this session. */
+        snapRows: number;
+        snapLog: number;
+        snapCkpt: number;
     };
     /** Bytes held in inline JSON columns of this session's rows (sessions
      *  record + blocks payload_json + session_ext value_json) — everything
@@ -329,6 +333,101 @@ export interface GcPlan {
     zeroRefRows: number;
     zeroRefBytes: number;
     pageSize: number;
+}
+
+/** #5874: L1 identity thin-table row (ruling G). sessRaw is the raw,
+ *  un-truncated session identity (P9: never truncated — truncation would
+ *  split one world into two); sessionId is the reverse pointer into
+ *  sessions (deleteSession cascade); ledgerId binds the kernel ledger the
+ *  world was issued under. witnessProbe is diagnostic-only (never gates).
+ *  issuedAt/armedAt are the world's origin timestamps — the B1 trap
+ *  (frontier moves only via arm/reset) makes them move-only-forward. */
+export interface L1WorldRow {
+    sessRaw: string;
+    sessionId: string;
+    ledgerId: string;
+    /** The canonical host-msgid envelope (JSON array, per-element host ids in
+     *  host order) — the server's standing record the next turn's envelope
+     *  matches position-by-position against (§4.0.1 echo direct-hit).
+     *  Never truncated (P9). */
+    envelopeJson: string;
+    /** sha256 of envelopeJson (fast mismatch before the positional walk). */
+    envelopeChecksum: string;
+    witnessProbe?: string | null;
+    issuedAt: number;
+    armedAt?: number | null;
+}
+
+/** #5874: one snapshot-table fact row. pos is the session-local position
+ *  (strictly-increasing cast/append order); coreIds names the canonical
+ *  cores the row materializes (JSON array); postJson is the canonical-core
+ *  right side of the event (invariant v — NEVER wire bytes); preJson holds
+ *  CAS digest references to the event's left side (ruling A: the pre-form
+ *  lives in the content CAS and outlives the row); coverRef anchors the
+ *  row's physical lifecycle to its covering block (ruling B); active=false
+ *  is the deactivation tombstone (rows are never physically deleted while
+ *  the covering block lives — physical cleanup only with the block). */
+export interface SnapRow {
+    sessionId: string;
+    pos: number;
+    coreIds: string;
+    preJson?: string | null;
+    postJson: string;
+    tokensEst: number;
+    active: boolean;
+    coverRef?: string | null;
+    updatedAt: number;
+}
+
+/** #5874: one event-journal entry. kind is one of cast|append|update|
+ *  delete|compact; payload is the structured event (JSON). seq is assigned
+ *  by the commit primitive (strictly monotonic per session, invariant ii). */
+export interface SnapLogEntry {
+    sessionId: string;
+    seq: number;
+    kind: string;
+    payload: string;
+    createdAt: number;
+}
+
+/** #5874: per-session hydration triple (ruling F). metaJson carries the
+ *  serialized kernel CompressionState + its own checksum, the summary
+ *  coverage map (summary-pos → covered-pos ranges — the sole decompress/GC
+ *  basis after compaction), and the S4 aggregate checksum. */
+export interface SnapCkpt {
+    sessionId: string;
+    ckptSeq: number;
+    metaJson: string;
+    checksum: string;
+    updatedAt: number;
+}
+
+/** #5874: the commit primitive's input — ONE transaction applies
+ *  everything (event transactional unit; any throw = whole-turn abort, no
+ *  half-state). Row upserts: insert at a new pos or right-side update at an
+ *  existing pos (deactivation via active=false — never a physical delete).
+ *  Log entries are appended with primitive-assigned seqs. The optional
+ *  checkpoint fold absorbs the log up to its seq and rewrites the meta
+ *  triple. */
+export interface SnapshotCommitInput {
+    sessionId: string;
+    /** CAS bodies to put IN THIS SAME transaction before the rows that
+     *  reference them (ruling A: pre-form bytes live in the content CAS and
+     *  outlive the row; same-tx put keeps the reference dangling-free even
+     *  on crash). */
+    preContents?: Array<{ hash: string; content: string }>;
+    rows: Array<Omit<SnapRow, "sessionId" | "updatedAt">>;
+    logEntries: Array<Omit<SnapLogEntry, "sessionId" | "seq">>;
+    ckpt?: Omit<SnapCkpt, "sessionId">;
+    /** Wall-clock stamp for updated_at/created_at (injected: tests pin it).
+     */
+    now: number;
+}
+
+export interface SnapshotCommitResult {
+    /** The seqs assigned to the appended log entries, in input order. */
+    logSeqs: number[];
+    ckptSeq?: number;
 }
 
 export interface IngestSessionInput {
@@ -1898,6 +1997,11 @@ export class UnifiedStore {
             this.db.prepare("DELETE FROM ccr_entries WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM conversations WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM session_ext WHERE session_id = ?").run(sessionId);
+            // #5874: snapshot-table foundation cascade (T6: no orphans) —
+            // snap_rows/snap_log/snap_ckpt by sid, l1_world by the reverse
+            // session_id pointer (one identity can have issued this session
+            // more than once across re-issues).
+            this.deleteSnapshotSession(sessionId);
             this.db.prepare("DELETE FROM sessions WHERE session_id = ?").run(sessionId);
             for (const hash of refs) this.releaseContent(hash);
             // #4796 follow-up: scoped collection over this session's own
@@ -1922,11 +2026,15 @@ export class UnifiedStore {
                     "(SELECT COUNT(*) FROM ccr_entries WHERE session_id = ?) AS ccrEntries, " +
                     "(SELECT COUNT(*) FROM session_ext WHERE session_id = ?) AS ext, " +
                     "(SELECT COUNT(*) FROM checkpoints WHERE session_id = ?) AS cps, " +
-                    "(SELECT COUNT(*) FROM checkpoints WHERE session_id = ? AND pinned = 1) AS pinnedCps",
+                    "(SELECT COUNT(*) FROM checkpoints WHERE session_id = ? AND pinned = 1) AS pinnedCps, " +
+                    "(SELECT COUNT(*) FROM snap_rows WHERE sid = ?) AS snapRows, " +
+                    "(SELECT COUNT(*) FROM snap_log WHERE sid = ?) AS snapLog, " +
+                    "(SELECT COUNT(*) FROM snap_ckpt WHERE sid = ?) AS snapCkpt",
             )
-            .get(sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId) as {
+            .get(sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId) as {
             messages: number; media: number; blocks: number; deadRefs: number;
             refs: number; ccrEntries: number; ext: number; cps: number; pinnedCps: number;
+            snapRows: number; snapLog: number; snapCkpt: number;
         };
         const inlineBytes =
             ((this.db
@@ -1942,6 +2050,17 @@ export class UnifiedStore {
                 .get(sessionId) as { b: number }).b ?? 0) +
             ((this.db
                 .prepare("SELECT COALESCE(SUM(LENGTH(value_json)), 0) AS b FROM session_ext WHERE session_id = ?")
+                .get(sessionId) as { b: number }).b ?? 0) +
+            // #5874: snapshot-table inline bytes (post/pre/core_ids are the
+            // session's own fact bytes — they die with the session).
+            ((this.db
+                .prepare("SELECT COALESCE(SUM(LENGTH(post_json) + LENGTH(COALESCE(pre_json, '')) + LENGTH(core_ids)), 0) AS b FROM snap_rows WHERE sid = ?")
+                .get(sessionId) as { b: number }).b ?? 0) +
+            ((this.db
+                .prepare("SELECT COALESCE(SUM(LENGTH(payload)), 0) AS b FROM snap_log WHERE sid = ?")
+                .get(sessionId) as { b: number }).b ?? 0) +
+            ((this.db
+                .prepare("SELECT COALESCE(SUM(LENGTH(meta_json)), 0) AS b FROM snap_ckpt WHERE sid = ?")
                 .get(sessionId) as { b: number }).b ?? 0);
         const cas = this.db
             .prepare(
@@ -1967,11 +2086,254 @@ export class UnifiedStore {
                 sessionExt: counts.ext,
                 checkpoints: counts.cps,
                 pinnedCheckpoints: counts.pinnedCps,
+                snapRows: counts.snapRows,
+                snapLog: counts.snapLog,
+                snapCkpt: counts.snapCkpt,
             },
             inlineBytes,
             casExclusiveBytes: cas.exclusiveBytes,
             casSharedBlobs: cas.sharedBlobs,
         };
+    }
+
+    /** #5874 commit primitive: row upserts + log appends (+ optional
+     *  checkpoint fold) land in ONE transaction — the event transactional
+     *  unit. seq assignment is authoritative here: each appended entry gets
+     *  max(existing max log seq, ckpt_seq) + n, so seqs stay strictly
+     *  monotonic across compaction (invariant ii) even when a checkpoint
+     *  fold has absorbed older log. Any throw rolls the whole unit back
+     *  (no half-state — a failed commit leaves the store exactly as it
+     *  was). */
+    commitSnapshot(input: SnapshotCommitInput): SnapshotCommitResult {
+        const sid = input.sessionId;
+        return this.db.transaction(() => {
+            for (const pc of input.preContents ?? []) this.putContent(pc.content, pc.hash);
+            const logMax = (this.db.prepare("SELECT COALESCE(MAX(seq), 0) AS m FROM snap_log WHERE sid = ?").get(sid) as { m: number }).m;
+            const ckptMax = (this.db.prepare("SELECT COALESCE(MAX(ckpt_seq), 0) AS m FROM snap_ckpt WHERE sid = ?").get(sid) as { m: number }).m;
+            let nextSeq = Math.max(logMax ?? 0, ckptMax ?? 0);
+            const upsertRow = this.db.prepare(
+                "INSERT INTO snap_rows (sid, pos, core_ids, pre_json, post_json, tokens_est, active, cover_ref, updated_at) " +
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) " +
+                    "ON CONFLICT (sid, pos) DO UPDATE SET core_ids = excluded.core_ids, pre_json = excluded.pre_json, " +
+                    "post_json = excluded.post_json, tokens_est = excluded.tokens_est, active = excluded.active, " +
+                    "cover_ref = excluded.cover_ref, updated_at = excluded.updated_at",
+            );
+            for (const r of input.rows) {
+                upsertRow.run(
+                    sid,
+                    r.pos,
+                    r.coreIds,
+                    r.preJson ?? null,
+                    r.postJson,
+                    r.tokensEst,
+                    r.active ? 1 : 0,
+                    r.coverRef ?? null,
+                    input.now,
+                );
+            }
+            const insLog = this.db.prepare("INSERT INTO snap_log (sid, seq, kind, payload, created_at) VALUES (?, ?, ?, ?, ?)");
+            const logSeqs: number[] = [];
+            for (const e of input.logEntries) {
+                nextSeq += 1;
+                logSeqs.push(nextSeq);
+                insLog.run(sid, nextSeq, e.kind, e.payload, e.createdAt);
+            }
+            let ckptSeq: number | undefined;
+            if (input.ckpt !== undefined) {
+                ckptSeq = input.ckpt.ckptSeq;
+                this.db
+                    .prepare(
+                        "INSERT INTO snap_ckpt (sid, ckpt_seq, meta_json, checksum, updated_at) VALUES (?, ?, ?, ?, ?) " +
+                            "ON CONFLICT (sid) DO UPDATE SET ckpt_seq = excluded.ckpt_seq, meta_json = excluded.meta_json, " +
+                            "checksum = excluded.checksum, updated_at = excluded.updated_at",
+                    )
+                    .run(sid, ckptSeq, input.ckpt.metaJson, input.ckpt.checksum, input.now);
+                // Ckpt fold = the LSM compaction boundary: the log payloads up
+                // to ckptSeq are ABSORBED into the meta triple (the coverage
+                // map carries the delete/compact facts forward), so they leave
+                // the log. Inactive rows without a covering block (client-side
+                // drops — ruling B leaves block-covered rows to the block's
+                // lifecycle) are physically cleaned here: the ckpt cadence is
+                // the only bounded lifetime (no global TTL, #3752).
+                const absorbed = this.db
+                    .prepare("SELECT pre_json FROM snap_rows WHERE sid = ? AND active = 0 AND cover_ref IS NULL")
+                    .all(sid) as { pre_json: string | null }[];
+                this.db.prepare("DELETE FROM snap_rows WHERE sid = ? AND active = 0 AND cover_ref IS NULL").run(sid);
+                this.db.prepare("DELETE FROM snap_log WHERE sid = ? AND seq <= ?").run(sid, ckptSeq);
+                for (const a of absorbed) if (a.pre_json) this.releaseContent(a.pre_json);
+            }
+            return { logSeqs, ckptSeq };
+        });
+    }
+
+    /** #5874: hydrate read path — the session's fact rows in pos order
+     *  (green-lane rebuild basis). includeInactive=false (default) filters
+     *  the active=0 tombstones; fromPos starts the scan after a pos
+     *  (checkpoint-absorbed prefix). */
+    getSnapRows(sessionId: string, opts?: { fromPos?: number; includeInactive?: boolean }): SnapRow[] {
+        const where: string[] = ["sid = ?"];
+        const args: unknown[] = [sessionId];
+        if (opts?.fromPos !== undefined) {
+            where.push("pos > ?");
+            args.push(opts.fromPos);
+        }
+        if (opts?.includeInactive !== true) where.push("active = 1");
+        const rows = this.db
+            .prepare(
+                `SELECT pos, core_ids, pre_json, post_json, tokens_est, active, cover_ref, updated_at
+                  FROM snap_rows WHERE ${where.join(" AND ")} ORDER BY pos`,
+            )
+            .all(...args) as { pos: number; core_ids: string; pre_json: string | null; post_json: string;
+                tokens_est: number; active: number; cover_ref: string | null; updated_at: number }[];
+        return rows.map((r) => ({
+            sessionId,
+            pos: r.pos,
+            coreIds: r.core_ids,
+            preJson: r.pre_json,
+            postJson: r.post_json,
+            tokensEst: r.tokens_est,
+            active: r.active === 1,
+            coverRef: r.cover_ref,
+            updatedAt: r.updated_at,
+        }));
+    }
+
+    /** #5874: the committed EVENT FRONTIER — the max over the log AND the
+     *  checkpoint (the ckpt absorbs log payloads, so the log's own MAX would
+     *  understate the frontier after a fold; invariant ii is enforced
+     *  against this value). 0 = no events yet. */
+    snapLogMaxSeq(sessionId: string): number {
+        const log = this.db.prepare("SELECT COALESCE(MAX(seq), 0) AS m FROM snap_log WHERE sid = ?").get(sessionId) as { m: number };
+        const ckpt = this.db.prepare("SELECT COALESCE(MAX(ckpt_seq), 0) AS m FROM snap_ckpt WHERE sid = ?").get(sessionId) as { m: number };
+        return Math.max(log.m ?? 0, ckpt.m ?? 0);
+    }
+
+    /** #5874: public CAS accessors for the foundation's pre-form references
+     *  (ruling A). putContentRef runs its own transaction when called from
+     *  outside the commit primitive (which puts in-tx via preContents). */
+    putContentRef(content: string, precomputedHash?: string): string {
+        return this.db.transaction(() => this.putContent(content, precomputedHash));
+    }
+
+    /** #5874: null = body missing (the audit-diagnostic exit — decompress
+     *  must NEVER silently render an empty pre, T8). */
+    getContentRef(hash: string): string | null {
+        const r = this.db.prepare("SELECT bytes FROM content WHERE hash = ?").get(hash) as { bytes: Buffer } | undefined;
+        return r ? Buffer.from(r.bytes).toString("utf8") : null;
+    }
+
+    releaseContentRef(hash: string | null): void {
+        if (hash) this.releaseContent(hash);
+    }
+
+    /** #5874: the hydration triple, or null when the session has no
+     *  checkpoint fold yet (the red-lane kstate fallback then serves). */
+    getSnapCkpt(sessionId: string): SnapCkpt | null {
+        const r = this.db
+            .prepare("SELECT ckpt_seq, meta_json, checksum, updated_at FROM snap_ckpt WHERE sid = ?")
+            .get(sessionId) as { ckpt_seq: number; meta_json: string; checksum: string; updated_at: number } | undefined;
+        if (!r) return null;
+        return { sessionId, ckptSeq: r.ckpt_seq, metaJson: r.meta_json, checksum: r.checksum, updatedAt: r.updated_at };
+    }
+
+    /** #5874: L1 identity lookup by raw (stage-1 world match, the echo
+     *  hit). Null when the identity was never issued. */
+    getL1World(sessRaw: string): L1WorldRow | null {
+        const r = this.db
+            .prepare("SELECT session_id, ledger_id, envelope_json, envelope_checksum, witness_probe, issued_at, armed_at FROM l1_world WHERE sess_raw = ?")
+            .get(sessRaw) as { session_id: string; ledger_id: string; envelope_json: string; envelope_checksum: string;
+                witness_probe: string | null; issued_at: number; armed_at: number | null } | undefined;
+        if (!r) return null;
+        return {
+            sessRaw,
+            sessionId: r.session_id,
+            ledgerId: r.ledger_id,
+            envelopeJson: r.envelope_json,
+            envelopeChecksum: r.envelope_checksum,
+            witnessProbe: r.witness_probe,
+            issuedAt: r.issued_at,
+            armedAt: r.armed_at,
+        };
+    }
+
+    /** #5874: L1 identity issue / world move. INSERT on first sight;
+     *  UPDATE only when the session or ledger binding changes (the B1
+     *  trap: the world origin issued_at NEVER moves on a plain update —
+     *  only a fresh issue under a different identity resets it, and the
+     *  caller controls that by passing the same/new sessRaw). */
+    upsertL1World(row: L1WorldRow): void {
+        this.db.prepare(
+            "INSERT INTO l1_world (sess_raw, session_id, ledger_id, envelope_json, envelope_checksum, witness_probe, issued_at, armed_at) " +
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?) " +
+                "ON CONFLICT (sess_raw) DO UPDATE SET session_id = excluded.session_id, " +
+                "ledger_id = excluded.ledger_id, envelope_json = excluded.envelope_json, " +
+                "envelope_checksum = excluded.envelope_checksum, witness_probe = excluded.witness_probe, " +
+                "armed_at = COALESCE(excluded.armed_at, l1_world.armed_at)",
+        ).run(row.sessRaw, row.sessionId, row.ledgerId, row.envelopeJson, row.envelopeChecksum, row.witnessProbe ?? null, row.issuedAt, row.armedAt ?? null);
+    }
+
+    /** #5874: L1 rows bound to a ledger (world listing / audit). */
+    listL1WorldByLedger(ledgerId: string): L1WorldRow[] {
+        const rows = this.db
+            .prepare(
+                "SELECT sess_raw, session_id, ledger_id, envelope_json, envelope_checksum, witness_probe, issued_at, armed_at FROM l1_world WHERE ledger_id = ? ORDER BY sess_raw",
+            )
+            .all(ledgerId) as { sess_raw: string; session_id: string; ledger_id: string; envelope_json: string; envelope_checksum: string;
+                witness_probe: string | null; issued_at: number; armed_at: number | null }[];
+        return rows.map((r) => ({
+            sessRaw: r.sess_raw,
+            sessionId: r.session_id,
+            ledgerId: r.ledger_id,
+            envelopeJson: r.envelope_json,
+            envelopeChecksum: r.envelope_checksum,
+            witnessProbe: r.witness_probe,
+            issuedAt: r.issued_at,
+            armedAt: r.armed_at,
+        }));
+    }
+
+    /** #5874: ruling B physical cleanup — remove INACTIVE rows whose
+     *  covering block is gone (archived/deleted). Called with the dead
+     *  block ids at GC time; active rows are NEVER touched here (no global
+     *  TTL — #3752 red line). Returns the swept row count. */
+    sweepSnapRowsByDeadCovers(sessionId: string, deadCoverRefs: string[]): number {
+        if (deadCoverRefs.length === 0) return 0;
+        // Chunk under the bind-parameter limit (same discipline as the
+        // refs batching, REF_STMT_MAX_PARAMS).
+        let swept = 0;
+        for (let i = 0; i < deadCoverRefs.length; i += REF_STMT_MAX_PARAMS) {
+            const chunk = deadCoverRefs.slice(i, i + REF_STMT_MAX_PARAMS);
+            const ph = chunk.map(() => "?").join(",");
+            const doomed = this.db
+                .prepare(`SELECT pre_json FROM snap_rows WHERE sid = ? AND active = 0 AND cover_ref IN (${ph})`)
+                .all(sessionId, ...chunk) as { pre_json: string | null }[];
+            const r = this.db
+                .prepare(
+                    `DELETE FROM snap_rows WHERE sid = ? AND active = 0 AND cover_ref IN (${ph})`,
+                )
+                .run(sessionId, ...chunk);
+            swept += Number(r.changes ?? 0);
+            // The row dies with its covering block — hand its pre-form CAS
+            // reference back (ruling A: the pre bytes outlived the row, now
+            // the row is gone, the ref is too; the CAS body itself may be
+            // shared and is refcounted).
+            for (const d of doomed) if (d.pre_json) this.releaseContent(d.pre_json);
+        }
+        return swept;
+    }
+
+    /** #5874: cascade-delete the snapshot foundation for one session
+     *  (deleteSession calls this inside its own transaction; tests call it
+     *  directly for the T6 no-orphan pin). */
+    deleteSnapshotSession(sessionId: string): void {
+        const preRefs = this.db
+            .prepare("SELECT pre_json FROM snap_rows WHERE sid = ?")
+            .all(sessionId) as { pre_json: string | null }[];
+        this.db.prepare("DELETE FROM snap_rows WHERE sid = ?").run(sessionId);
+        this.db.prepare("DELETE FROM snap_log WHERE sid = ?").run(sessionId);
+        this.db.prepare("DELETE FROM snap_ckpt WHERE sid = ?").run(sessionId);
+        this.db.prepare("DELETE FROM l1_world WHERE session_id = ?").run(sessionId);
+        for (const r of preRefs) if (r.pre_json) this.releaseContent(r.pre_json);
     }
 
     /** #3928: zero-ref CAS garbage report — what `gc` / post-delete sweeps
@@ -2761,7 +3123,7 @@ export class UnifiedStore {
 
     counts(): Record<string, number> {
         const out: Record<string, number> = {};
-        for (const t of ["sessions", "messages", "refs", "blocks", "dead_refs", "ccr_entries", "content", "checkpoints"]) {
+        for (const t of ["sessions", "messages", "refs", "blocks", "dead_refs", "ccr_entries", "content", "checkpoints", "l1_world", "snap_rows", "snap_log", "snap_ckpt"]) {
             const row = this.db.prepare(`SELECT COUNT(*) AS n FROM ${t}`).get() as { n: number };
             out[t] = row.n;
         }
@@ -3146,11 +3508,11 @@ export class UnifiedStore {
             const hashes = this.db
                 .prepare("SELECT content_hash AS h FROM messages WHERE session_id = ?")
                 .all(childId) as Record<string, unknown>[];
-            for (const row of hashes) this.putContentRef(row.h as string);
+            for (const row of hashes) this.bumpContentRef(row.h as string);
             const media = this.db
                 .prepare("SELECT media_hash AS h FROM message_media WHERE session_id = ?")
                 .all(childId) as Record<string, unknown>[];
-            for (const row of media) this.putContentRef(row.h as string);
+            for (const row of media) this.bumpContentRef(row.h as string);
             this.db
                 .prepare(
                     `INSERT INTO sessions (session_id, created_at, updated_at, parent_session_id, fork_point_seq)
@@ -3171,7 +3533,7 @@ export class UnifiedStore {
         });
     }
 
-    private putContentRef(hash: string): void {
+    private bumpContentRef(hash: string): void {
         const res = this.db
             .prepare(
                 "UPDATE content SET refcount = refcount + 1 WHERE hash = ?",

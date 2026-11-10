@@ -83,7 +83,20 @@
 //        discipline as v9 (#4796); building them once costs about what
 //        open-time quick_check pays on EVERY open (#4175). Additive-only: an
 //        older build opening a v11 file ignores the extra indexes.
-export const STORAGE_SCHEMA_VERSION = 11;
+// v12: snapshot-table compression foundation (#5874) — four NEW tables,
+//      zero behavior change on existing tables: l1_world (L1 identity thin
+//        table: raw session identity → ledger binding, ruling G, reuse of
+//        the #5842 harvest), snap_rows (append-only fact rows: the
+//        canonical-core right side of every cast/append/update/delete event,
+//        pos-ordered, never physically deleted while their covering block
+//        lives — deactivation is active=0, physical cleanup only with the
+//        covering block, ruling B / #3752 red line), snap_log (per-session
+//        strictly-monotonic event journal — one transaction per commit
+//        primitive), snap_ckpt (per-session hydration triple: serialized
+//        kernel CompressionState + own checksum, summary coverage map, S4
+//        aggregate checksum — P7 hydrate O(1)). Additive-only: an older
+//        build opening a v12 file ignores the extra tables.
+export const STORAGE_SCHEMA_VERSION = 12;
 
 /** #3250: cap for `journal_size_limit` (see STORAGE_PRAGMAS). Passive and
  *  auto checkpoints move frames into the main db and reset the write offset
@@ -309,6 +322,74 @@ CREATE INDEX IF NOT EXISTS idx_blocks_summary_hash ON blocks(summary_hash);
 CREATE INDEX IF NOT EXISTS idx_ccr_entries_content_hash ON ccr_entries(content_hash);
 CREATE INDEX IF NOT EXISTS idx_message_media_media_hash ON message_media(media_hash);
 CREATE INDEX IF NOT EXISTS idx_checkpoints_state_hash ON checkpoints(state_hash);
+
+-- #5874 snapshot-table compression foundation (v12): the single storage
+-- truth for the coherent-host compression base. Rows are the append-only
+-- fact layer (cast/append/update/delete/compact events); snap_ckpt carries
+-- the kernel-state hydration triple (serialized CompressionState + own
+-- checksum, summary coverage map, S4 aggregate checksum). post_json ALWAYS
+-- holds the canonical-core form of the event's right side (never wire
+-- bytes — invariant v); pre_json holds CAS digest references (ruling A):
+-- the pre-form lives in the content CAS and outlives the row. l1_world is
+-- the L1 identity thin table (sess_raw → ledger binding, ruling G) and
+-- holder of the canonical host-msgid ENVELOPE (envelope_json): the server's
+-- standing record of the host's per-element ids, stored as an ordered JSON
+-- array of {id, pos} — each host msgid bound to its APPEND-ONLY ledger pos
+-- (never reused: a middle insertion issues a fresh pos and never shifts a
+-- stored row). The §4.0.1 "server-side canon" each turn matches against
+-- (echo), extends on tail appends (probe) or interleaved inserts (scatter),
+-- and is re-adopted only on an explicit resync. envelope_checksum = sha256
+-- of the id sequence (host order). P9: raw values never truncated.
+-- session_id is the reverse pointer so deleteSession can cascade.
+-- Rows are never physically deleted while their covering block lives
+-- (deactivation sets active=0); physical cleanup happens only when the
+-- covering block is archived/deleted (no global TTL — #3752 red line).
+CREATE TABLE IF NOT EXISTS l1_world (
+    sess_raw          TEXT PRIMARY KEY,
+    session_id        TEXT NOT NULL,
+    ledger_id         TEXT NOT NULL,
+    envelope_json     TEXT NOT NULL,
+    envelope_checksum TEXT NOT NULL,
+    witness_probe     TEXT,
+    issued_at         INTEGER NOT NULL,
+    armed_at          INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS snap_rows (
+    sid         TEXT NOT NULL,
+    pos         INTEGER NOT NULL,
+    core_ids    TEXT NOT NULL,
+    pre_json    TEXT,
+    post_json   TEXT NOT NULL,
+    tokens_est  INTEGER NOT NULL DEFAULT 0,
+    active      INTEGER NOT NULL DEFAULT 1,
+    cover_ref   TEXT,
+    updated_at  INTEGER NOT NULL,
+    PRIMARY KEY (sid, pos)
+);
+
+CREATE TABLE IF NOT EXISTS snap_log (
+    sid         TEXT NOT NULL,
+    seq         INTEGER NOT NULL,
+    kind        TEXT NOT NULL,
+    payload     TEXT NOT NULL,
+    created_at  INTEGER NOT NULL,
+    PRIMARY KEY (sid, seq)
+);
+
+CREATE TABLE IF NOT EXISTS snap_ckpt (
+    sid         TEXT NOT NULL,
+    ckpt_seq    INTEGER NOT NULL,
+    meta_json   TEXT NOT NULL,
+    checksum    TEXT NOT NULL,
+    updated_at  INTEGER NOT NULL,
+    PRIMARY KEY (sid)
+);
+
+CREATE INDEX IF NOT EXISTS idx_l1_ledger ON l1_world(ledger_id);
+-- Ruling B: inactive-row physical cleanup is anchored on the covering
+-- block — GC walks this index to find rows whose cover_ref block died.
+CREATE INDEX IF NOT EXISTS idx_snap_rows_cover ON snap_rows(sid, cover_ref);
 `;
 
 /** Applied inside one transaction whenever user_version < STORAGE_SCHEMA_VERSION. */
@@ -441,6 +522,20 @@ export function migrateSchema(db: {
             db.exec("CREATE INDEX IF NOT EXISTS idx_ccr_entries_content_hash ON ccr_entries(content_hash)");
             db.exec("CREATE INDEX IF NOT EXISTS idx_message_media_media_hash ON message_media(media_hash)");
             db.exec("CREATE INDEX IF NOT EXISTS idx_checkpoints_state_hash ON checkpoints(state_hash)");
+        }
+        if (from < 12) {
+            // v12 (#5874): snapshot-table compression foundation — four NEW
+            // tables + two indexes, pure additive (no backfill, no ALTER on
+            // existing tables). Idempotent CREATEs, same discipline as
+            // v3/v4/v7/v11; a dev-window lib that already carried them
+            // re-lands cleanly. Zero behavior change: every existing query
+            // is untouched (T1 upgrade pin + DROP rollback drill).
+            db.exec("CREATE TABLE IF NOT EXISTS l1_world (\n                sess_raw          TEXT PRIMARY KEY,\n                session_id        TEXT NOT NULL,\n                ledger_id         TEXT NOT NULL,\n                envelope_json     TEXT NOT NULL,\n                envelope_checksum TEXT NOT NULL,\n                witness_probe     TEXT,\n                issued_at         INTEGER NOT NULL,\n                armed_at          INTEGER\n            )");
+            db.exec("CREATE TABLE IF NOT EXISTS snap_rows (\n                sid         TEXT NOT NULL,\n                pos         INTEGER NOT NULL,\n                core_ids    TEXT NOT NULL,\n                pre_json    TEXT,\n                post_json   TEXT NOT NULL,\n                tokens_est  INTEGER NOT NULL DEFAULT 0,\n                active      INTEGER NOT NULL DEFAULT 1,\n                cover_ref   TEXT,\n                updated_at  INTEGER NOT NULL,\n                PRIMARY KEY (sid, pos)\n            )");
+            db.exec("CREATE TABLE IF NOT EXISTS snap_log (\n                sid         TEXT NOT NULL,\n                seq         INTEGER NOT NULL,\n                kind        TEXT NOT NULL,\n                payload     TEXT NOT NULL,\n                created_at  INTEGER NOT NULL,\n                PRIMARY KEY (sid, seq)\n            )");
+            db.exec("CREATE TABLE IF NOT EXISTS snap_ckpt (\n                sid         TEXT NOT NULL,\n                ckpt_seq    INTEGER NOT NULL,\n                meta_json   TEXT NOT NULL,\n                checksum    TEXT NOT NULL,\n                updated_at  INTEGER NOT NULL,\n                PRIMARY KEY (sid)\n            )");
+            db.exec("CREATE INDEX IF NOT EXISTS idx_l1_ledger ON l1_world(ledger_id)");
+            db.exec("CREATE INDEX IF NOT EXISTS idx_snap_rows_cover ON snap_rows(sid, cover_ref)");
         }
     });
     if (needV8Backfill) migrateV8Identities(db);
