@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
 import test from "node:test";
+import { Jimp } from "jimp";
 
 process.env.NODE_ENV = "test";
 
@@ -143,6 +144,32 @@ test("#767 unit: decodeImageDims parses container headers without full decode", 
     assert.deepEqual(decodeImageDims(jpegB64(512, 384)), { w: 512, h: 384 }, "JPEG dims found behind APP0+EXIF padding");
     assert.equal(decodeImageDims("A".repeat(64)), undefined, "unparsable garbage falls back to flat cost");
     assert.equal(decodeImageDims(Buffer.from([0x89, 0x50, 0x4e, 0x47]).toString("base64")), undefined, "truncated header → fallback");
+});
+
+for (const before of ["APP0", "SOF0"] as const) {
+    test(`JPEG marker fill before ${before} retains dimensions and pixel billing`, async () => {
+        const original = await new Jimp({ width: 40, height: 24, color: 0x123456ff }).getBuffer("image/jpeg");
+        const offset = before === "APP0" ? 2 : original.findIndex((byte, i) => byte === 0xff && original[i + 1] === 0xc0);
+        assert.ok(offset >= 2);
+        // T.81 B.1.1.2 allows FF fill bytes before any marker. Keep the
+        // encoded image intact, adding one or several bytes at that boundary.
+        const padded = Buffer.concat([original.subarray(0, offset), Buffer.alloc(before === "APP0" ? 1 : 3, 0xff), original.subarray(offset)]);
+        const decoded = await Jimp.read(padded);
+        assert.equal(decoded.bitmap.width, 40, "independent full decoder accepts the padded JPEG");
+        assert.equal(decoded.bitmap.height, 24);
+        const b64 = padded.toString("base64");
+        assert.deepEqual(decodeImageDims(b64), { w: 40, h: 24 });
+        const body = { input: [{ role: "user", content: [{ type: "input_image", image_url: `data:image/jpeg;base64,${b64}` }] }] };
+        assert.equal(imageTokensInParsedBody("responses", body, "pixels"), pixelTileEstimate(40, 24), "legal marker fill must not trigger the 16K fallback");
+        assert.deepEqual(decodeImageDims(original.toString("base64")), { w: 40, h: 24 }, "ordinary marker parsing is unchanged");
+    });
+}
+
+test("JPEG fill without a complete frame header still falls back within the scan budget", () => {
+    const onlyFill = Buffer.concat([Buffer.from([0xff, 0xd8]), Buffer.alloc(300_000, 0xff)]);
+    assert.equal(decodeImageDims(onlyFill.toString("base64")), undefined);
+    const truncatedSof = Buffer.from([0xff, 0xd8, 0xff, 0xff, 0xc0, 0x00, 0x11, 0x08, 0x00]);
+    assert.equal(decodeImageDims(truncatedSof.toString("base64")), undefined);
 });
 
 test("#767 unit: pixelTileEstimate matches the OpenAI high-detail tile model", () => {

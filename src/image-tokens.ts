@@ -119,6 +119,7 @@ function jpegDims(b: Buffer): Dims | undefined {
     while (off + 4 <= b.length) {
         if (b[off] !== 0xff) { off += 1; continue; }
         const marker = b[off + 1];
+        if (marker === 0xff) { off += 1; continue; } // T.81 B.1.1.2: marker fill, not a length-bearing segment
         if (marker === 0xd8 || marker === 0x01 || (marker >= 0xd0 && marker <= 0xd9)) { off += 2; continue; }
         if (marker === 0xda) break; // SOS with no SOF before it — malformed
         const segLen = b.readUInt16BE(off + 2);
