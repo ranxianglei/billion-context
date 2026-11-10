@@ -468,7 +468,6 @@ export class ResponsesWsUpstream {
         const request = this.history.continuation(body);
         const connection = this.connectionGeneration;
         const { input: _diagnosticInput, ...settings } = body;
-        const requestHash = cacheDiagnosticHash(JSON.stringify({ ...body, ...egressTransportFields, type: "response.create" }));
         const settingsHash = cacheDiagnosticHash(canonical({ ...settings, ...egressTransportFields }));
         this.log("debug", `upstream request mode=${request.previous_response_id === undefined ? "full" : "delta"}`);
         return new Promise<Response>((resolve, reject) => {
@@ -490,7 +489,7 @@ export class ResponsesWsUpstream {
                 this.log("debug", `upstream cache-diagnostic ${JSON.stringify({
                     phase: "send", connection, send,
                     mode: payload.previous_response_id === undefined ? "full" : "delta",
-                    frame_sha256: cacheDiagnosticHash(frameText), request_sha256: requestHash, settings_sha256: settingsHash,
+                    frame_sha256: cacheDiagnosticHash(frameText), settings_sha256: settingsHash,
                     previous_response_id_sha256: typeof payload.previous_response_id === "string" ? cacheDiagnosticHash(payload.previous_response_id) : null,
                 })}`);
                 socket.send(frameText);
