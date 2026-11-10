@@ -25,7 +25,7 @@
 //
 // Usage:
 //   node scripts/release-gate-local.mjs [--tarball <path>] [--keep]
-//        [--skip a|b|u[,…]] [--with-update] [--base-dir <dir>]
+//        [--skip a|b|u[,…]] [--with-update] [--base-dir <dir>] [--reuse-base-dir]
 //
 //   --tarball      built package tarball (default: `npm pack` on the current
 //                  tree — run `npm run build` first, as the release
@@ -33,6 +33,10 @@
 //   --with-update  also run Lane U (needs verdaccio + GATE_VERDACCIO_NPMRC).
 //   --keep         keep the scratch dir (default: remove on success, keep on
 //                  failure for post-mortem).
+//   --reuse-base-dir  accept a NON-EMPTY --base-dir (default: refuse — a
+//                  rerun would overwrite the previous run's bili.log and
+//                  dsh-*.jsonl evidence; this foot-gun destroyed the 16:36
+//                  green run's artifacts during the #5904 forensics).
 //
 // Env knobs (all optional; defaults fit the dev host):
 //   GATE_DSH_BIN          default "dsh"            (dsh >= 0.2.0-rc.2 surface)
@@ -58,8 +62,9 @@
 //                         corpus mass leaves the turn viable)
 //
 // Exit code 0 = every ran lane green. Non-zero = at least one red assertion.
-// Evidence (proxy.log, per-turn ndjson, config, corpus) stays in the scratch
-// dir on failure.
+// Evidence (bili.log — the logger's own file; proxy.log keeps only the
+// startup head since #5089 muted the stderr tee — plus per-turn ndjson,
+// config, corpus) stays in the scratch dir on failure.
 
 import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
@@ -185,6 +190,35 @@ function record(lane, name, pass, evidence) {
   log(`  ${pass ? "✅" : "❌"} [${lane}] ${name}${evidence ? ` — ${evidence}"` : ""}`);
 }
 
+// One tiny REAL completion against the (first component of the) upstream
+// model pool — proves inference capability, not just liveness. Returns true
+// only when a completion comes back within budgetMs.
+async function inferenceProbe(baseUrl, model, budgetMs) {
+  const single = String(model).split(",")[0].trim();
+  const t = Date.now();
+  try {
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), budgetMs);
+    const res = await fetch(`${baseUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: single, messages: [{ role: "user", content: "Reply with the single word OK." }], max_tokens: 8, temperature: 0 }),
+      signal: ac.signal,
+    });
+    clearTimeout(timer);
+    const body = await res.text();
+    if (!res.ok) {
+      warn(`inference probe: HTTP ${res.status} after ${Date.now() - t}ms (body: ${body.slice(0, 200)})`);
+      return false;
+    }
+    log(`inference probe ok: model=${single} ${Date.now() - t}ms`);
+    return true;
+  } catch (e) {
+    warn(`inference probe FAILED after ${Date.now() - t}ms: ${e?.message ?? e}`);
+    return false;
+  }
+}
+
 async function killProxy() {
   if (!proxyChild) return;
   const pid = proxyChild.pid;
@@ -216,10 +250,20 @@ async function startProxy(ctx) {
 
 async function main() {
   const t0 = Date.now();
+  log("== local real-model release gate ==");
+
+  // --base-dir guard (#5904 forensics lesson): reusing a non-empty scratch
+  // dir silently overwrites the previous run's bili.log / dsh-*.jsonl — the
+  // 16:36 green run's evidence was destroyed exactly this way by the 19:39
+  // rerun. Default base-dir is unique per run; an explicit NON-EMPTY one now
+  // requires --reuse-base-dir.
+  const explicitBase = String(arg("base-dir", "")) !== "";
   const baseDir = path.resolve(String(arg("base-dir", "")) || path.join(os.tmpdir(), `bili-release-gate-${Date.now()}`));
+  if (explicitBase && fs.existsSync(baseDir) && fs.readdirSync(baseDir).length > 0 && !arg("reuse-base-dir")) {
+    throw new Error(`--base-dir ${baseDir} is non-empty — a rerun would OVERWRITE the previous run's evidence (bili.log, dsh-*.jsonl). Pass --reuse-base-dir to accept, or drop --base-dir for a fresh timestamped dir.`);
+  }
   fs.mkdirSync(baseDir, { recursive: true });
 
-  log("== local real-model release gate ==");
   log(`scratch: ${baseDir}`);
 
   // ---- 0. prerequisites ----------------------------------------------------
@@ -244,6 +288,17 @@ async function main() {
   if (!dshOk || !sglangOk) throw new Error("Lane A prerequisites missing (dsh CLI / sglang). Fix GATE_* env or start the services.");
   if (!relayOk) warn(`relay ${G.relayUrl} not ok — Lane B (model switch) will be SKIPPED`);
 
+  // Liveness alone lies (#5904 forensics): /v1/models returns 200 while the
+  // scheduler is drowning in runaway generations or the GPU is degraded —
+  // the 19:39 red run's turn 1 showed a degraded upstream (tiny input, no
+  // cache report) yet every liveness probe stayed green, and separating
+  // "environment red" from "product red" cost a forensic afternoon. Prove
+  // INFERENCE capability with one tiny real completion before burning a
+  // 12-minute run; a probe miss is an ENVIRONMENT failure, not a product red.
+  const probeBudget = Number(env("GATE_PREFLIGHT_BUDGET_MS", 30000)) || 30000;
+  const probeOk = await inferenceProbe(G.sglangUrl, G.sglangModel, probeBudget);
+  if (!probeOk) throw new Error(`sglang is alive (/v1/models ok) but a trivial completion failed or exceeded ${probeBudget}ms — the environment is degraded. Fix the model service before gating; do NOT read this as a product regression.`);
+
   // ---- 1. hermetic environment --------------------------------------------
   for (const d of ["dsh-home/profiles", "work", "sessions", "xdg/state", "xdg/cache", "xdg/data"]) {
     fs.mkdirSync(path.join(baseDir, d), { recursive: true });
@@ -251,6 +306,18 @@ async function main() {
   const port = await freePort();
   const profileDir = path.join(baseDir, "dsh-home", "profiles", "gate");
   const proxyLog = path.join(baseDir, "proxy.log");
+  // Evidence channel: bili tees every log line to $XDG_STATE_HOME/billion-
+  // context/bili.log AND (historically) to the captured stderr stream above.
+  // Since master's #5012 the stderr leg mutes itself once the log file proves
+  // live on an undrained pipe — exactly this harness's spawn shape — so
+  // post-boot lines live ONLY in bili.log. Every assertion below greps the
+  // evidence file through mark()/slice(); the channel is decided ONCE on
+  // first use (sticky): bili.log is append-only and never legitimately
+  // disappears mid-run, so re-resolving per call could splice byte offsets
+  // across two different files if either file appeared or vanished late.
+  const biliLog = path.join(baseDir, "xdg", "state", "billion-context", "bili.log");
+  let evidenceChannel = null;
+  const evidenceFile = () => (evidenceChannel ??= fs.existsSync(biliLog) ? biliLog : proxyLog);
   const biliConfig = path.join(baseDir, "bili.json");
 
   const childEnv = {
@@ -266,10 +333,25 @@ async function main() {
     // (observed: latest=<old candidate> for >60s after this round's publish,
     // long enough to fail Lane U's up-to-date assertion inside the 240s poll).
     NPM_CONFIG_CACHE: path.join(baseDir, "npm-cache"),
+    // Pin the log-file channel: an operator-set ACP_LOG_FILE would steer
+    // bili.log out of this scratch tree while the stderr tee still mutes
+    // (the file leg proves live elsewhere) — post-boot assertions would then
+    // red off an empty proxy.log fallback. Empty string resolves to the
+    // default XDG path above (set-but-empty falls back to config/default).
+    ACP_LOG_FILE: "",
     BILI_PROVIDER_REWRITES: "",
     PI_PROVIDER: "",
     BILI_GATE_KEY: "gate-local",
     ZHIPUAI_GATE_KEY: G.relayKey,
+    // #5904: bound phase-1 (request sent → first response byte) of the proxy's
+    // upstream summary calls. The incident wedge — sglang accepting the request
+    // then never answering — silently ate the client's 300s turn budget. 120s
+    // is 1.6× the slowest LEGITIMATE first byte observed in this environment
+    // (73s to first token for a ~100KB summary prefill on a GPU-restart-cold
+    // sglang), and two attempts fit the 300s turn (120 + backoff + 120 ≈ 245s)
+    // so the wedge surfaces as a real error before the client aborts. Product
+    // default stays the full 12-min idle budget (src/knobs.ts upstreamFirstByteMs).
+    BILI_UPSTREAM_FIRST_BYTE_MS: "120000",
   };
 
   const biliConfigFor = (window) =>
@@ -370,8 +452,13 @@ async function main() {
   fs.writeFileSync(path.join(baseDir, "work", "corpus.md"), buildCorpus(G.corpusTokens));
 
   const ctx = { workDir: path.join(baseDir, "work"), childEnv, proxyLog, port, profileEntry, sessionId: null };
-  const mark = () => fs.statSync(proxyLog).size;
-  const slice = (from, to) => fs.readFileSync(proxyLog, "utf8").slice(from, to ?? undefined);
+  const mark = () => fs.statSync(evidenceFile()).size;
+  const slice = (from, to) => { const f = evidenceFile(); if (f !== proxyLog && !fs.existsSync(f)) throw new Error(`evidence log ${f} vanished`); return fs.readFileSync(f, "utf8").slice(from, to ?? undefined); };
+  // #5524 (folded in from the sibling PR): a startup failure must say WHICH
+  // file(s) hold the evidence — bili.log present means check both, absent
+  // means the logger died before opening its file.
+  const proxyFailHint = (what) =>
+    `${what} — see ${proxyLog}${fs.existsSync(biliLog) ? ` and ${biliLog}` : ` (${biliLog} never appeared — the logger failed before opening its file)`}`;
 
   async function turn(prompt, label) {
     const r = spawnSync(
@@ -399,7 +486,8 @@ async function main() {
 
   // ---- 3. proxy up ----------------------------------------------------------
   log(`starting profile proxy on 127.0.0.1:${port} …`);
-  if (!(await startProxy(ctx))) throw new Error(`proxy did not come up — see ${proxyLog}`);
+  if (!(await startProxy(ctx))) throw new Error(proxyFailHint("proxy did not come up"));
+  if (!fs.existsSync(biliLog)) warn("bili.log missing after proxy boot — evidence falls back to proxy.log; post-boot assertions may red because the stderr tee mutes itself (#5012)");
 
   try {
     // ================= Lane A: compression =================================
@@ -418,13 +506,20 @@ async function main() {
       const s1 = slice(m1);
       record("A", "no fold while corpus is fresh (protected)", !/acp-compress-obs\] shrink/.test(s1), "");
       record("A", "S40 marker answered from corpus", has(t1.final, CODEWORDS[39]), `final="${t1.final.trim().slice(0, 80)}"`);
+      // Environment-degradation tell (#5904 forensics): t1 does 13 rounds
+      // over a stable prefix, so a healthy upstream shows cache reports by
+      // round 2; a degraded one (GPU restarted / scheduler drowning) shows
+      // none while the turn still passes. WARN, not fail — a genuinely cold
+      // or non-reporting cache is legal; the warn tells the operator the
+      // rest of the run may be measuring the environment, not the product.
+      if (!/cache hit \d+%/.test(s1)) warn("turn 1 produced no cache report at all — upstream may be degraded; later lane results may reflect the environment, not the product");
 
       // Shrink the route window mid-session + restart (also proves session
       // persistence across a proxy restart). Next turn's input overshoots
       // the ~12.3k effective window with corpus now old enough to fold.
       biliConfigFor(G.smallWindow);
       await killProxy();
-      if (!(await startProxy(ctx))) throw new Error(`proxy restart failed — see ${proxyLog}`);
+      if (!(await startProxy(ctx))) throw new Error(proxyFailHint("proxy restart failed"));
 
       const m2 = mark();
       const t2 = await turn("Without reading any file again, and WITHOUT calling any tool (no search_context, no file reads, no commands — tool use invalidates the measurement): reply with ONLY the TITLE line of section S07.", "t2");
@@ -461,7 +556,7 @@ async function main() {
       // also proves folded state survives a proxy restart.
       fs.writeFileSync(path.join(profileDir, "cordis.patch.yml"), cordisFor("zhipuai", G.relayModel));
       await killProxy();
-      if (!(await startProxy(ctx))) throw new Error(`proxy restart failed — see ${proxyLog}`);
+      if (!(await startProxy(ctx))) throw new Error(proxyFailHint("proxy restart failed"));
 
       const m3 = mark();
       const t3 = await turn("Without reading any file again, and WITHOUT calling any tool (no search_context, no file reads, no commands — tool use invalidates the measurement): reply with the TITLE lines of section S07 and section S40, one per line, then the word DONE.", "t3");
@@ -562,6 +657,7 @@ async function main() {
   log(`elapsed: ${((Date.now() - t0) / 1000).toFixed(0)}s`);
   if (results.some((r) => !r.pass)) {
     log(`SCRATCH KEPT for post-mortem: ${baseDir}`);
+    log(`evidence: bili.log=${biliLog} ${fs.existsSync(biliLog) ? "(present)" : "(MISSING — logger died early)"} · proxy.log=${proxyLog} · turns=${path.join(baseDir, "dsh-t*.jsonl")} (+ .err) · config=${biliConfig}`);
     process.exitCode = 1;
   } else {
     log(G.keep ? `scratch kept (--keep): ${baseDir}` : `cleaning scratch ${baseDir}`);

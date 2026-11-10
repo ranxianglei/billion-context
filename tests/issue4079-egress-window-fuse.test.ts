@@ -148,6 +148,11 @@ test("e2e #4079: a body that provably cannot fit any window is stopped at the eg
     try {
         // No `model` in the body → preflight's `!model` early return skips its
         // doom math and folding entirely; forward() is the last line (#4079).
+        // The measured tier (the #554 meter on the ACTUAL body, #5000/#4543)
+        // fires first for this parseable body: ~2.17M measured tokens > the
+        // floored 1M bar. The byte floor below it stays as the fallback for
+        // unparseable bodies and is still covered by the both-ways test's
+        // 8.68MB-class arithmetic.
         // 2000 msgs × 4.4K chars ≈ 8.68MB core text — past the floored ratio bar
         // (max(20K declared, 1M assumed) × 7.5 B/token = 7.5MB; the 2MB absolute
         // bar is dominated).
@@ -159,8 +164,77 @@ test("e2e #4079: a body that provably cannot fit any window is stopped at the eg
         assert.equal(parsed.error?.type, "request_too_large", "same structured too-large family as the byte budget");
         assert.equal(parsed.error?.code, "egress_window_fuse", "the fuse names itself for log greppability");
         assert.equal(parsed.error?.retryable, false, "4xx non-retryable class — retrying re-sends the same oversized history (#2847 semantics)");
-        assert.match(parsed.error?.message ?? "", /outbound core text alone is ~\d{7} bytes/, "the byte math is in the operator-facing message");
+        assert.match(parsed.error?.message ?? "", /outbound body measures ~[\d,]+ tokens/, "the measured token math is in the operator-facing message");
         assert.match(parsed.error?.message ?? "", /bars never assume below 1000000 tokens/, "the assumed-window floor is stated for the operator (#4079)");
+        assert.match(parsed.error?.message ?? "", /stopped at the egress fuse instead of being forwarded/, "the remedy wording is present");
+        // THE behavior under test: the doomed payload NEVER reaches the upstream.
+        assert.equal(calls.length, 0, `upstream must see zero calls (got ${JSON.stringify(calls)})`);
+    } finally {
+        await close();
+        rmrf(root);
+    }
+});
+
+test("e2e #5000: a body whose mass rides tools[] — core text clearing the byte floor — is still stopped by the measured tier, not forwarded", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "bili-4079t-"));
+    const { ctx, calls, close } = await setup();
+    try {
+        // Incident #5000's shape: the wire body's mass sits in tool definitions,
+        // which the core-text byte floor never sees (it prices m.text only).
+        // 120 tools × 40KB descriptions ≈ 4.8MB of tool text ≈ ~1.2M measured
+        // tokens — over the floored 1M bar — while the core text is ~1.5KB,
+        // ~5000× under the 7.5MB byte floor. With `model` present the preflight
+        // measured gate fires before the relay fuse; same verdict either way.
+        const tools = Array.from({ length: 120 }, (_, i) => ({
+            type: "function",
+            function: { name: `tool_${i}`, description: "d".repeat(40_000) },
+        }));
+        const messages = bigMessages(3, 500);
+        const r = await fetch(ctx.url, {
+            method: "POST",
+            headers: { ...ctx.headers },
+            body: JSON.stringify({ model: "gpt-test", stream: true, tools, messages }),
+        });
+        const body = await r.text();
+        const parsed = JSON.parse(body) as { error?: { type?: string; code?: string; retryable?: boolean; message?: string } };
+
+        assert.equal(r.status, 413, `tools-mass body must fail fast (got ${r.status}): ${body.slice(0, 300)}`);
+        assert.equal(parsed.error?.code, "preflight_compress_failed", "the preflight fail-fast house shape (the measured gate answers before the relay)");
+        assert.equal(parsed.error?.retryable, false, "4xx non-retryable class — retrying re-sends the same oversized history (#2847 semantics)");
+        assert.match(parsed.error?.message ?? "", /outbound body measures ~[\d,]+ TEXT tokens/, "the measured tier names itself (text-only; image payloads are #496 arbitration, never doom)");
+        assert.match(parsed.error?.message ?? "", /NOT forwarded/, "the remedy wording is present");
+        // THE behavior under test: the doomed payload NEVER reaches the upstream
+        // (before the measured tier it cleared the byte floor and rode forward
+        // to a guaranteed 400 — incident #5000's 55.2 MiB send).
+        assert.equal(calls.length, 0, `upstream must see zero calls (got ${JSON.stringify(calls)})`);
+    } finally {
+        await close();
+        rmrf(root);
+    }
+});
+
+test("e2e #4543: a CJK body whose CORE TEXT alone measures over the floored fuse bar — while its BYTES clear the byte floor — is stopped at the fuse (the incident's 4.1 MiB sailed to a guaranteed 400)", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "bili-4079c-"));
+    const { ctx, calls, close } = await setup();
+    try {
+        // Incident #4543's shape: dense CJK history. 1.12M CJK chars ≈ 3.36MB —
+        // ~55% under the 7.5MB floored byte floor (which the meter-based floor
+        // at ~7.5 B/token cannot see at CJK's 3.4 B/tok) — but CJK bills ~1
+        // token per character, so the #554 meter prices ~1.12M tokens: over the
+        // 1M floored bar. No `model` in the body → preflight skipped → the
+        // relay fuse is the last line. On master this body forwarded to a
+        // guaranteed upstream 400 (incident logs: 4.1 MiB, 1,121,674 tokens,
+        // grep "egress window fuse" = 0).
+        const cjk = "数".repeat(1_120_000);
+        const messages = [{ role: "user", content: cjk + "\n" + "x".repeat(3_072) }] as Array<{ role: string; content: string }>;
+        const r = await post(ctx, messages, false);
+        const body = await r.text();
+        const parsed = JSON.parse(body) as { error?: { type?: string; code?: string; retryable?: boolean; message?: string } };
+
+        assert.equal(r.status, 413, `the CJK-measured body must stop at the fuse (got ${r.status}): ${body.slice(0, 300)}`);
+        assert.equal(parsed.error?.code, "egress_window_fuse", "the fuse names itself");
+        assert.equal(parsed.error?.retryable, false, "non-retryable — retrying re-sends the same oversized history (#2847 semantics)");
+        assert.match(parsed.error?.message ?? "", /outbound body measures ~[\d,]+ tokens/, "the measured token math is in the operator-facing message");
         assert.match(parsed.error?.message ?? "", /stopped at the egress fuse instead of being forwarded/, "the remedy wording is present");
         // THE behavior under test: the doomed payload NEVER reaches the upstream.
         assert.equal(calls.length, 0, `upstream must see zero calls (got ${JSON.stringify(calls)})`);

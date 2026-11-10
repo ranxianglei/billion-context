@@ -33,7 +33,8 @@ import { createBiliPlugin, createPiDirectSendGuard, piDeclaredWindowForDirect } 
 import { isLegacyBcpEntry, markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, setNativeOriginWaiter, singleFlight } from "./native-bootstrap.js";
 import { loadConfigFile } from "../config.js";
 import { getInlineEngine, INLINE_ORIGIN } from "../inline-engine.js";
-import { installNativeFetchIntercept, noteRoutedOrigin, observeRoutedOrigin, readyOrigin, type NativeInterceptState } from "./native-intercept.js";
+import { installNativeFetchIntercept, noteRoutedOrigin, observeRoutedOrigin, readyOrigin, setDeclaredModelEndpoints, type NativeInterceptState } from "./native-intercept.js";
+import { loadDeclaredModelEndpoints } from "../model-endpoints.js";
 import { installInlineTransport } from "./pi-inline.js";
 import { installNativeWebSocketIntercept } from "./native-ws-intercept.js";
 import { fetchProxyVersion, fetchStatus, waitForProxyVersion } from "./shared.js";
@@ -50,7 +51,7 @@ export function shouldBootstrapNative(env: NodeJS.ProcessEnv): boolean {
 
 /** Decide this process's native posture (#886/#983 mechanism, ported to the pi
  *  lane in #1795). Precedence kill-switch > /bili/ rewrite launch > explicit
- *  inline > attach > spawn (DEFAULT). A preset BILLION_CONTEXT_PROXY is an ATTACH target, not a
+ *  inline > attach > inline (DEFAULT since #5428) > spawn. A preset BILLION_CONTEXT_PROXY is an ATTACH target, not a
  *  stand-down: the pseudo-attach hole (preset env + bare pi) used to disarm
  *  routing entirely while tools still found the proxy through the env — model
  *  traffic went direct and uncompressed, the proxy never saw the session, and
@@ -59,12 +60,15 @@ export function shouldBootstrapNative(env: NodeJS.ProcessEnv): boolean {
  *  /bili/ launch (BILI_PROVIDER_REWRITES) still stands us down — its URLs are
  *  already proxy-shaped. BILI_PI_INLINE (#3278) outranks ambient attach envs:
  *  it is a deliberate choice about WHERE compression runs (in this process),
- *  not just which proxy to use. Resolved env > file > default(off): the
+ *  not just which proxy to use. Resolved env > file > default: the
  *  config-file home is `"pi": {"inline": true}`; an explicit BILI_PI_INLINE=0/
- *  false disables over the file. OPT-IN ONLY (owner decision on #4687:
- *  never flip defaults) — unset env/file behaves exactly as before the
- *  #4571 default flip (attach > spawned proxy); `bili pi-inline` presets
- *  BILI_PI_INLINE=1 for the one-command lane. */
+ *  false disables over the file. DEFAULT INLINE since #5428 (supersedes the
+ *  #4687 opt-in rule): unset env+file runs the in-process lane — opt out
+ *  with BILI_PI_INLINE=0/false/no/off or `"pi": {"inline": false}` to
+ *  restore the old attach/spawn posture. An ANNOUNCED attach target
+ *  (launcher-set BILLION_CONTEXT_PROXY/ATTACH) still beats the default —
+ *  `bili pi` keeps its launcher proxy; only explicit inline outranks attach.
+ *  `bili pi-inline` presets BILI_PI_INLINE=1 for the one-command lane. */
 export function planNativePi(env: NodeJS.ProcessEnv, fileInline: boolean | undefined = undefined): { mode: "off" | "attach" | "spawn" | "inline"; attachOrigin?: string } {
     if (env.BILLION_CONTEXT_PLUGIN === "0" || env.BILI_NATIVE_PI === "0") return { mode: "off" };
     if (env.BILI_PROVIDER_REWRITES !== undefined) return { mode: "off" };
@@ -78,10 +82,16 @@ export function planNativePi(env: NodeJS.ProcessEnv, fileInline: boolean | undef
     // still suppresses a file-true value (env > file, #3278 contract):
     if (!inlineEnvOff && (inlineEnvOn || fileInline === true)) return { mode: "inline" };
     const attachOrigin = nativeAttachOrigin(env) ?? proxyEnvOrigin(env);
+    // An ANNOUNCED attach target beats the #5428 inline default: `bili pi`
+    // sets BILLION_CONTEXT_PROXY before the child starts, and its launcher
+    // proxy must keep serving that child.
     if (attachOrigin !== undefined) return { mode: "attach", attachOrigin };
-    // …then spawn: the historical default (owner decision on #4687 — inline
-    // is opt-in only, the #4571 default flip is reverted; a proxy server is
-    // spawned unless BILI_PI_INLINE / pi.inline=true opted into in-process).
+    // #5428 default flip (supersedes #4687): with NO explicit choice anywhere
+    // (env unset/blank AND file unset) the lane runs INLINE in-process. Reach
+    // spawn only via explicit opt-out — BILI_PI_INLINE=0/false/no/off or
+    // "pi": {"inline": false} — which restores the pre-#5428 posture above
+    // (attach when announced, else a spawned proxy).
+    if ((inlineEnv === undefined || inlineEnv === "") && fileInline === undefined) return { mode: "inline" };
     return { mode: "spawn" };
 }
 
@@ -341,6 +351,9 @@ if (process.env.NODE_TEST_CONTEXT === undefined && plan.mode !== "off") {
     // this link instead of egressing toward a proxy port that does not exist.
     if (plan.mode === "inline") installInlineTransport();
     installNativeFetchIntercept(state);
+    // #1295: declared custom-wire endpoints — same config source as the proxy;
+    // takes effect on the next host start (config is read once at arm time).
+    void loadDeclaredModelEndpoints().then(setDeclaredModelEndpoints);
     // #2111: the Codex Responses WS leg shares the fetch intercept's enable
     // conditions and lifecycle — off mode patches nothing, repeated loads are
     // no-ops, and the wrapper installs before any model connection exists.
