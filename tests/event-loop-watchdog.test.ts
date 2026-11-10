@@ -55,7 +55,15 @@ test("wedged main loop trips the watchdog: warn + fatal forensic lines land in t
         assert.ok(handle, "handle expected");
         await sleep(50); // beats flowing — worker initialized
         blockMainLoop(400); // synchronous spin: zero heartbeats reach the worker
-        await sleep(80); // deliver the queued trip message
+        // Deliver the queued trip message. Poll to a bounded deadline instead
+        // of one fixed grace sleep: under runner load, worker init or the
+        // postMessage hop can land past any small fixed window without the
+        // mechanism breaking (#4762; same load-flake family as #4161 — the
+        // 2026-11-04 windows-latest/node-24 shard-4 red fired exactly this
+        // line on green code). A genuinely dead trip path still fails — after
+        // the full budget.
+        const tripDeadline = Date.now() + 3_000;
+        while (typeof trippedWith !== "number" && Date.now() < tripDeadline) await sleep(20);
         if (typeof trippedWith !== "number") throw new Error(`onTrip must fire after a continuous block past hardTimeoutMs (got ${String(trippedWith)})`);
         assert.ok(trippedWith >= 150, `gap ${trippedWith} must reach the hard threshold`);
         const content = fs.readFileSync(logFile, "utf8");

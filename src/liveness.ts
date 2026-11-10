@@ -112,7 +112,8 @@ export async function probeLiveness(origin: string, budgetMs: number): Promise<L
         try {
             const data = (await res.json()) as { ok?: unknown };
             if (data.ok !== true) return { state: "dead", detail: "health payload reports not-ok" };
-        } catch {
+        } catch (err) {
+            if (isTimeoutErr(err)) throw err;
             return { state: "dead", detail: "non-JSON health payload (foreign listener?)" };
         }
         return { state: "alive" };

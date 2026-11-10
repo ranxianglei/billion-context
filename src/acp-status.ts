@@ -26,6 +26,7 @@ import { forkAdoptionSkippedOf } from "./fork-adoption.js";
 import { preCompactionArchiveOf, statusInputBaseline, type Session } from "./session.js";
 import { compressBreakerDetail, compressLastFailureCause } from "./stream.js";
 import { describeAdvisory, getAdvisoryState } from "./advisory.js";
+import { getResolverWedgeState } from "./resolver-wedge.js";
 import { getUpdateVisibility, updateBannerPayload } from "./update-notes.js";
 import { loadOptions } from "./config.js";
 import { pckNoticeActive } from "./pck-notice.js";
@@ -34,6 +35,7 @@ import { isExternalSummaryBlock } from "./external-summary-marker.js";
 import { storageStatusLabel } from "./persist.js";
 import { storageStatusWire } from "./storage/runtime-status.js";
 import { toolOk, type ProxyToolResult } from "./proxy-tool-result.js";
+import { formatContextAnalysis } from "./context-analysis.js";
 
 interface AcpStatusCtx {
     core: CompressionCore;
@@ -264,6 +266,15 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
         extra.push("");
         extra.push(kaLine);
     }
+    // Context analysis: init size, nudge cadence, harvest (acceptance) rate and
+    // the plain-language verdict — the question that used to take hours of
+    // manual log forensics (session-aedc188c investigation, 2026-11-08).
+    const caLines = formatContextAnalysis(ctx.session.id);
+    if (caLines && caLines.length > 0) {
+        extra.push("");
+        extra.push("CONTEXT ANALYSIS (this process's lifetime):");
+        extra.push(...caLines);
+    }
     // #2432: while the compress circuit breaker is armed, advertising ranges
     // here contradicts the breaker receipt ("STOP calling compress now") and
     // feeds the exact retry loop the breaker exists to kill — every model that
@@ -315,6 +326,14 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
                 extra.push("");
                 extra.push(formatRanges(ranges, protectedRanges));
             }
+        } else {
+            // False-advertising fix: the tool advertises "compressible ranges"
+            // unconditionally, but the live table only exists while
+            // processTurn arms a nudge (growth >= floor). Say so instead of
+            // going silent — silence reads as "no refs exist at all" and
+            // sends first-call models into retry loops.
+            extra.push("");
+            extra.push("Compressible ranges: none offered right now — context growth has not reached the compression-nudge threshold, so nothing is worth folding yet. Continue the task; the live table appears once growth arms the nudge.");
         }
     } catch {
         // Base-only report; never fall back to a stale snapshot.
@@ -412,17 +431,16 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
         }
         if (openCircuits.length > 4) extra.push(`UPSTREAM CIRCUIT OPEN — (+${openCircuits.length - 4} more host(s))`);
     }
-    // #4204: display counterpart of the egress-side 429 governor — holds are
-    // per origin+credential and answer locally (zero egress) while armed, so
-    // hosts/models can see WHY sends are held back and when the next probe
-    // fires. Display-only; no wire decision lives here.
+    // #4204: display counterpart of the egress-side 429 governor. Account
+    // holds are per origin+credential; a verified KeyRing model refusal has
+    // its own origin+credential+model hold. Both answer locally (zero egress).
     const throttleHolds = activeThrottleHolds();
     if (throttleHolds.length > 0) {
         for (const h of throttleHolds.slice(0, 4)) {
             extra.push("");
-            extra.push(`UPSTREAM 429 HOLD — ${h.host}: ${h.streak} consecutive upstream 429(s); outbound sends answered locally until ${new Date(h.nextAttemptAt).toISOString()} (${h.terminal ? "TERMINAL — local 424 outside SDK retry sets until a probe succeeds" : "backoff window"}); zero egress while held, clears on the next non-429 response (#4204).`);
+            extra.push(`UPSTREAM 429 HOLD — ${h.host}${h.model === undefined ? "" : ` (model ${h.model})`}: ${h.streak} consecutive upstream 429(s); outbound sends answered locally until ${new Date(h.nextAttemptAt).toISOString()} (${h.terminal ? "TERMINAL — local 424 outside SDK retry sets until a probe succeeds" : "backoff window"}); zero egress while held, clears on a resolved non-429 response in the same scope (#4204).`);
         }
-        if (throttleHolds.length > 4) extra.push(`UPSTREAM 429 HOLD — (+${throttleHolds.length - 4} more origin+credential key(s))`);
+        if (throttleHolds.length > 4) extra.push(`UPSTREAM 429 HOLD — (+${throttleHolds.length - 4} more origin+credential[+model] key(s))`);
     }
     const shrinkAt = ctx.session.stats.emergencyShrinkAt;
     if (typeof shrinkAt === "number") {
@@ -512,6 +530,13 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
         // — surface the active advisory here (instance-level, like #897).
         extra.push("");
         extra.push(`CRITICAL ADVISORY (instance-level): bili is auto-updating through the self-updater's safety chain — ${describeAdvisory(adv.active, adv.lastError)}. Live state: the advisory field of GET /__bili/status.`);
+    }
+    // #5221 phase 2 (owner ruling 2026-10-31): suspected persistent local-resolver
+    // wedge — detection-only alarm surface, same lane as the advisory above.
+    const rw = getResolverWedgeState();
+    if (rw) {
+        extra.push("");
+        extra.push(`RESOLVER WEDGE SUSPECTED (instance-level): this process's OS name resolution keeps failing for ${rw.hosts.length} host(s) that resolved fine before (${rw.hosts.slice(0, 5).join(", ")}${rw.hosts.length > 5 ? ", …" : ""}) — model requests 502 until the proxy process restarts or egress routes through an upstream proxy (-F/--forward-proxy). Live state: the resolverWedge field of GET /__bili/status.`);
     }
     const upd = getUpdateVisibility(VERSION);
     const updateAction = updateBannerPayload(upd);

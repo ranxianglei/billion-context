@@ -5,7 +5,7 @@ import { type AnthropicRequestBody, type GoogleFunctionDeclaration, type GoogleT
 import { appendSystemText } from "../util.js";
 import { absorbEnabled, absorbToolName } from "../absorb.js";
 import { BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, BILI_ACP_TOOLS_GOOGLE, BILI_ACP_TOOLS_GOOGLE_NO_RANGE, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_OPENAI_NO_RANGE, BILI_ACP_TOOLS_RESPONSES, buildAbsorbSystemPrompt, buildAcpTagsOnlyPrompt, buildCompressSystemPrompt, packOwnsDescription, ptcNoteMode, withAcpNotes, withAcpNotesOpenAI, withMarkerIntegrityNote, withMcpDialectNote, withSummaryBudgetNote, withProjectAttribution } from "../compress-tool.js";
-import { conversationPromptSections, externalSummaryEnabled, withExternalSummaryTools } from "../external-summary-surface.js";
+import { conversationPromptSections, externalSummaryEnabled, messageTimestampSections, withExternalSummaryTools } from "../external-summary-surface.js";
 import { forceTextProtocol as knobForceTextProtocol, renderNone as knobRenderNone } from "../knobs.js";
 import { GENERATION_BOUNDARY_NOTE } from "../generation-boundary.js";
 
@@ -26,10 +26,10 @@ export function injectSystem(
     // the caller (prepareAnthropic), never merged into system.
     const parts: string[] = [];
     let acpStandingPushed = false;
-    if (opts.compress.injectTool && !suppressCompressPrompt) { parts.push(withProjectAttribution(withMcpDialectNote(withMarkerIntegrityNote(withSummaryBudgetNote(buildCompressSystemPrompt(prompts, conversationPromptSections(surface?.promptSections, externalSummaryEnabled(config))), externalSummaryEnabled(config)), visibilityMarkers), mcpDialectNote))); acpStandingPushed = true; }
+    if (opts.compress.injectTool && !suppressCompressPrompt) { parts.push(withProjectAttribution(withMcpDialectNote(withMarkerIntegrityNote(withSummaryBudgetNote(buildCompressSystemPrompt(prompts, messageTimestampSections(conversationPromptSections(surface?.promptSections, externalSummaryEnabled(config)))), externalSummaryEnabled(config)), visibilityMarkers), mcpDialectNote))); acpStandingPushed = true; }
     else if (!knobRenderNone()) {
         // #1881: the NEVER-echo prohibition follows the rendered tags, not the tool switch.
-        const tagsOnly = buildAcpTagsOnlyPrompt("function", prompts, surface?.promptSections);
+        const tagsOnly = buildAcpTagsOnlyPrompt("function", prompts, messageTimestampSections(surface?.promptSections));
         if (tagsOnly) { parts.push(tagsOnly); acpStandingPushed = true; }
     }
     // #4305: standing generation-boundary note — rides the ACP standing block,
