@@ -255,25 +255,30 @@ test("buildCompressibleRanges treats a live carrier as a boundary; stale carrier
 // exemption, enforced by filterProtectedToolMessages. Pin both directions so
 // neither regresses — this PR's original blanket carve was dropped on rebase
 // because it would have re-pinned archivable media against #2607.
-test("archivable media folds like text; unrecoverable payloads stay pinned (#2607)", () => {
+test("archivable and ref-based media fold like text; only refless payloads stay pinned (#2607/#5620)", () => {
   const core = createCore();
   const cfg = config();
   const state = createInitialState();
   const archivable = { ...msg("MA", "see image"), imageBase64: "aGVsbG8=" };
-  const unrecoverable = {
-    ...msg("MU", "remote shot"),
+  const refBased = {
+    ...msg("RB", "remote shot"),
     rawOpenaiContent: { type: "image_url", image_url: { url: "https://example.com/shot.png" } },
   };
-  const messages = [msg("x1", "text one", "assistant"), archivable, unrecoverable, msg("x2", "text two", "assistant")];
+  const refless = {
+    ...msg("MU", "opaque blob"),
+    rawOpenaiContentParts: [{ type: "mystery", blob: "zzz" }],
+  };
+  const messages = [msg("x1", "text one", "assistant"), archivable, refBased, refless, msg("x2", "text two", "assistant")];
   state.messageRefs = assignRefs(messages, {
     existing: state.messageRefs,
     nextIndex: 1,
     isProtected: (m) => hasUnrecoverableMediaPayload(m),
   }).map;
   assert.equal(state.messageRefs.byRaw["MA"], "m00002");
+  assert.equal(state.messageRefs.byRaw["RB"], "m00003", "#5620: ref-based media is citable");
   assert.equal(state.messageRefs.byRaw["MU"], "BLOCKED");
   const folded = core.applyCompression({
-    ranges: [{ startRef: "m00001", endRef: "m00003", summary: "with media" }],
+    ranges: [{ startRef: "m00001", endRef: "m00004", summary: "with media" }],
     messages,
     state,
     config: cfg,
@@ -284,8 +289,13 @@ test("archivable media folds like text; unrecoverable payloads stay pinned (#260
   const block = folded.state.blocks.find((b) => b.active)!;
   assert.ok(block.effectiveMessageIds.includes("x1"));
   assert.ok(block.effectiveMessageIds.includes("MA"), "archivable media folds like text");
+  assert.ok(block.effectiveMessageIds.includes("RB"), "#5620: ref-based media folds");
+  assert.ok(
+    block.summary.includes("- https://example.com/shot.png"),
+    "the re-access handle rides the stored summary (#5620)",
+  );
   assert.ok(block.effectiveMessageIds.includes("x2"));
-  assert.ok(!block.effectiveMessageIds.includes("MU"), "unrecoverable payload stays pinned");
+  assert.ok(!block.effectiveMessageIds.includes("MU"), "refless payload stays pinned");
 });
 
 // Partial-pair visibility (call visible, result covered) is UNREACHABLE

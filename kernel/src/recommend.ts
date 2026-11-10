@@ -352,10 +352,12 @@ export function buildCompressibleRanges(
       continue;
     }
 
-    // Unrecoverable media (no stored bytes — remote URL / file refs) is
-    // destroyed by folding with no restore behind it (#1188/#2609): never
-    // advertised as compressible, and a gap so no range spans it. Archivable
-    // inline images are compressible like text (#2607).
+    // Unrecoverable media (no stored bytes AND no re-access handle — since
+    // #5620 ref-based media like remote URLs / file ids is foldable, its
+    // handle riding the summary) is destroyed by folding with no restore
+    // behind it (#1188/#2609): never advertised as compressible, and a gap
+    // so no range spans it. Archivable inline images are compressible like
+    // text (#2607).
     if (hasUnrecoverableMediaPayload(msg)) {
       skipSinceCompressible = true;
       skipSinceProtected = true;
@@ -429,9 +431,17 @@ export function buildCompressibleRanges(
   // each removed message as a gap so no range spans it.
   // #2663: judge foldability on the same array class apply does (see the
   // `integritySource` parameter) — grouping/pairing are array-dependent.
+  // #5531: ids already covered by an active block are INVISIBLE, not kept —
+  // a covered call cannot strand its turn's reasoning. Without this, every
+  // #564 reverse split (call+result folded into a block, reasoning+text left
+  // visible) manufactures residue that no later fold may ever take: it is
+  // withdrawn here AND rejected at apply, so each growth fold reclaims only
+  // the non-residue and the session grows without bound (billion-context#5531).
   const unfoldedIds = computeIntegrityWithdrawals(
     integritySource ?? messages,
     new Set(compressibleMsgs.map((info) => info.id)),
+    undefined,
+    covered,
   ).withdrawn;
   if (unfoldedIds.size > 0) {
     let gapPending = false;

@@ -45,13 +45,13 @@ function twoRequestSession(dir: string, sid: string, tA: number, tB: number, bod
 const T_A = Date.parse("2026-09-24T14:32:04.500Z");
 const T_B = Date.parse("2026-09-24T14:32:11.000Z");
 
-test("compareWires: strict byte prefix is append(strict)", () => {
+test("compareWires: strict byte prefix is append(strict)", async () => {
     const r = compareWires(Buffer.from('{"a":1'), Buffer.from('{"a":12}'));
     assert.equal(r.rel, "append");
     assert.equal(r.append?.kind, "strict");
 });
 
-test("compareWires: healthy message-array append is append(json-tail), not a rewrite (#1266)", () => {
+test("compareWires: healthy message-array append is append(json-tail), not a rewrite (#1266)", async () => {
     const a = Buffer.from(chatBody("gpt-x", [M1, M2]));
     const b = Buffer.from(chatBody("gpt-x", [M1, M2, M3]));
     const r = compareWires(a, b);
@@ -61,7 +61,7 @@ test("compareWires: healthy message-array append is append(json-tail), not a rew
     assert.equal(r.append?.countB, 3);
 });
 
-test("compareWires: rewritten shared element is a mid-stream diverge", () => {
+test("compareWires: rewritten shared element is a mid-stream diverge", async () => {
     const a = Buffer.from(chatBody("gpt-x", [M1, M2, M3]));
     const b = Buffer.from(chatBody("gpt-x", [M1X, M2, M3]));
     const r = compareWires(a, b);
@@ -70,7 +70,7 @@ test("compareWires: rewritten shared element is a mid-stream diverge", () => {
     assert.ok(r.byteOffset > 0);
 });
 
-test("compareWires: field change before the message array is a preArray diverge", () => {
+test("compareWires: field change before the message array is a preArray diverge", async () => {
     const a = Buffer.from(chatBody("gpt-x", [M1]));
     const b = Buffer.from(chatBody("gpt-y", [M1]));
     const r = compareWires(a, b);
@@ -78,21 +78,21 @@ test("compareWires: field change before the message array is a preArray diverge"
     assert.equal(r.preArray, true);
 });
 
-test("compareWires: truncating the message list is a diverge, not an append", () => {
+test("compareWires: truncating the message list is a diverge, not an append", async () => {
     const a = Buffer.from(chatBody("gpt-x", [M1, M2, M3]));
     const b = Buffer.from(chatBody("gpt-x", [M1, M2]));
     const r = compareWires(a, b);
     assert.equal(r.rel, "diverge");
 });
 
-test("runDiff: healthy array-append pair classifies pure-append (json-tail), usage unavailable noted", () => {
+test("runDiff: healthy array-append pair classifies pure-append (json-tail), usage unavailable noted", async () => {
     const dir = tmpdir("acp-diff-pure-");
     try {
         twoRequestSession(dir, "ses_a", T_A, T_B, {
             aIn: chatBody("gpt-x", [M1]), bIn: chatBody("gpt-x", [M1, M2]),
             aOut: chatBody("gpt-x", [M1]), bOut: chatBody("gpt-x", [M1, M2]),
         });
-        const report = runDiff(dir, { noLog: true });
+        const report = await runDiff(dir, { noLog: true });
         assert.equal(report.totalPairs, 1);
         const p = report.sessions[0]!.pairs[0]!;
         assert.equal(p.category, "pure-append");
@@ -103,7 +103,7 @@ test("runDiff: healthy array-append pair classifies pure-append (json-tail), usa
     } finally { rmrf(dir); }
 });
 
-test("runDiff: #3331 CRLF dump files parse — header block terminated by \\r\\n\\r\\n still classifies pure-append", () => {
+test("runDiff: #3331 CRLF dump files parse — header block terminated by \\r\\n\\r\\n still classifies pure-append", async () => {
     const dir = tmpdir("acp-diff-crlf-");
     try {
         // same healthy pair as the LF test above, but every dump file uses
@@ -118,7 +118,7 @@ test("runDiff: #3331 CRLF dump files parse — header block terminated by \\r\\n
         crlfDump(tA + 1, "ses_crlf", "REQ", chatBody("gpt-x", [M1]));
         crlfDump(tB, "ses_crlf", "INCOMING", chatBody("gpt-x", [M1, M2]));
         crlfDump(tB + 1, "ses_crlf", "REQ", chatBody("gpt-x", [M1, M2]));
-        const report = runDiff(dir, { noLog: true });
+        const report = await runDiff(dir, { noLog: true });
         assert.equal(report.totalPairs, 1, "CRLF dumps found and paired");
         const p = report.sessions[0]!.pairs[0]!;
         assert.equal(p.category, "pure-append");
@@ -127,14 +127,14 @@ test("runDiff: #3331 CRLF dump files parse — header block terminated by \\r\\n
     } finally { rmrf(dir); }
 });
 
-test("runDiff: incoming append + outgoing mid-stream drift attributes proxy (#1249 shape)", () => {
+test("runDiff: incoming append + outgoing mid-stream drift attributes proxy (#1249 shape)", async () => {
     const dir = tmpdir("acp-diff-proxy-");
     try {
         twoRequestSession(dir, "ses_a", T_A, T_B, {
             aIn: chatBody("gpt-x", [M1, M2]), bIn: chatBody("gpt-x", [M1, M2, M3]),
             aOut: chatBody("gpt-x", [M1, M2]), bOut: chatBody("gpt-x", [M1X, M2, M3]),
         });
-        const report = runDiff(dir, { noLog: true });
+        const report = await runDiff(dir, { noLog: true });
         const p = report.sessions[0]!.pairs[0]!;
         assert.equal(p.category, "mid-stream-rewrite");
         assert.equal(p.attribution, "proxy");
@@ -147,14 +147,14 @@ test("runDiff: incoming append + outgoing mid-stream drift attributes proxy (#12
     } finally { rmrf(dir); }
 });
 
-test("runDiff: client-side rewrite forwarded verbatim attributes client", () => {
+test("runDiff: client-side rewrite forwarded verbatim attributes client", async () => {
     const dir = tmpdir("acp-diff-client-");
     try {
         twoRequestSession(dir, "ses_a", T_A, T_B, {
             aIn: chatBody("gpt-x", [M1, M2]), bIn: chatBody("gpt-x", [M1X, M2, M3]),
             aOut: chatBody("gpt-x", [M1, M2]), bOut: chatBody("gpt-x", [M1X, M2, M3]),
         });
-        const report = runDiff(dir, { noLog: true });
+        const report = await runDiff(dir, { noLog: true });
         const p = report.sessions[0]!.pairs[0]!;
         assert.equal(p.category, "mid-stream-rewrite");
         assert.equal(p.attribution, "client");
@@ -162,7 +162,7 @@ test("runDiff: client-side rewrite forwarded verbatim attributes client", () => 
     } finally { rmrf(dir); }
 });
 
-test("runDiff: stable outgoing prefix + collapsed cached tokens classifies prefix-stable-miss", () => {
+test("runDiff: stable outgoing prefix + collapsed cached tokens classifies prefix-stable-miss", async () => {
     const dir = tmpdir("acp-diff-miss-");
     try {
         twoRequestSession(dir, "ses_a", T_A, T_B, {
@@ -174,7 +174,7 @@ test("runDiff: stable outgoing prefix + collapsed cached tokens classifies prefi
             "2026-09-24T14:32:12.456Z [info] [ses_a] [acp-usage] round 1 input=104000 cached=1000 (cache hit 1%)",
             "2026-09-24T14:32:12.999Z [info] unrelated noise line",
         ].join("\n") + "\n");
-        const report = runDiff(dir);
+        const report = await runDiff(dir);
         assert.equal(report.logSource, path.join(dir, "bili.log"));
         assert.equal(report.usageSamples, 2);
         const p = report.sessions[0]!.pairs[0]!;
@@ -188,7 +188,7 @@ test("runDiff: stable outgoing prefix + collapsed cached tokens classifies prefi
     } finally { rmrf(dir); }
 });
 
-test("runDiff: dense request cadence (<2s apart, compress-loop regime) still aligns usage — a later request must not steal its predecessor's response line", () => {
+test("runDiff: dense request cadence (<2s apart, compress-loop regime) still aligns usage — a later request must not steal its predecessor's response line", async () => {
     // Regression: the old alignUsage window (+2000ms in the WRONG direction)
     // let request B's dump claim response A's usage line whenever B followed A
     // by < 2s. Request A then lost its usage data and the miss went
@@ -206,7 +206,7 @@ test("runDiff: dense request cadence (<2s apart, compress-loop regime) still ali
             "2026-09-24T14:32:05.000Z [info] [ses_dense] [acp-usage] round 1 input=100000 cached=95000 (cache hit 95%)",
             "2026-09-24T14:32:06.000Z [info] [ses_dense] [acp-usage] round 1 input=104000 cached=1000 (cache hit 1%)",
         ].join("\n") + "\n");
-        const report = runDiff(dir);
+        const report = await runDiff(dir);
         assert.equal(report.usageSamples, 2);
         const p = report.sessions[0]!.pairs[0]!;
         assert.equal(p.usageAvailable, true, "request A must keep its own response's usage line");
@@ -216,7 +216,7 @@ test("runDiff: dense request cadence (<2s apart, compress-loop regime) still ali
     } finally { rmrf(dir); }
 });
 
-test("runDiff: healthy usage (cached ≈ previous input) stays pure-append", () => {
+test("runDiff: healthy usage (cached ≈ previous input) stays pure-append", async () => {
     const dir = tmpdir("acp-diff-healthy-");
     try {
         twoRequestSession(dir, "ses_a", T_A, T_B, {
@@ -227,21 +227,21 @@ test("runDiff: healthy usage (cached ≈ previous input) stays pure-append", () 
             "2026-09-24T14:32:05.123Z [info] [ses_a] [acp-usage] round 1 input=100000 cached=95000 (cache hit 95%)",
             "2026-09-24T14:32:12.456Z [info] [ses_a] [acp-usage] round 1 input=104000 cached=99500 (cache hit 95%)",
         ].join("\n") + "\n");
-        const report = runDiff(dir);
+        const report = await runDiff(dir);
         const p = report.sessions[0]!.pairs[0]!;
         assert.equal(p.category, "pure-append");
         assert.equal(p.usage?.missedPrefix, 500);
     } finally { rmrf(dir); }
 });
 
-test("runDiff: legacy INCOMING filenames (no session id) attribute by timestamp proximity", () => {
+test("runDiff: legacy INCOMING filenames (no session id) attribute by timestamp proximity", async () => {
     const dir = tmpdir("acp-diff-legacy-");
     try {
         twoRequestSession(dir, "ses_c", T_A, T_B, {
             aIn: chatBody("gpt-x", [M1]), bIn: chatBody("gpt-x", [M1, M2]),
             aOut: chatBody("gpt-x", [M1]), bOut: chatBody("gpt-x", [M1, M2]),
         }, { legacy: true });
-        const report = runDiff(dir, { noLog: true });
+        const report = await runDiff(dir, { noLog: true });
         const s = report.sessions.find((x) => x.sid === "ses_c");
         assert.ok(s, "session should be found via REQ dumps");
         assert.equal(s!.legacyIncoming, 2);
@@ -251,21 +251,21 @@ test("runDiff: legacy INCOMING filenames (no session id) attribute by timestamp 
     } finally { rmrf(dir); }
 });
 
-test("runDiff: model change between requests is noted", () => {
+test("runDiff: model change between requests is noted", async () => {
     const dir = tmpdir("acp-diff-model-");
     try {
         twoRequestSession(dir, "ses_a", T_A, T_B, {
             aIn: chatBody("gpt-x", [M1]), bIn: chatBody("gpt-y", [M1, M2]),
             aOut: chatBody("gpt-x", [M1]), bOut: chatBody("gpt-y", [M1, M2]),
         });
-        const report = runDiff(dir, { noLog: true });
+        const report = await runDiff(dir, { noLog: true });
         const p = report.sessions[0]!.pairs[0]!;
         assert.equal(p.category, "mid-stream-rewrite");
         assert.ok(p.notes.some((n) => n.includes("model changed gpt-x→gpt-y")), p.notes.join(";"));
     } finally { rmrf(dir); }
 });
 
-test("runDiff: --session filters sessions; empty dir throws a guidance error", () => {
+test("runDiff: --session filters sessions; empty dir throws a guidance error", async () => {
     const dir = tmpdir("acp-diff-filter-");
     try {
         twoRequestSession(dir, "ses_a", T_A, T_B, {
@@ -276,19 +276,19 @@ test("runDiff: --session filters sessions; empty dir throws a guidance error", (
             aIn: chatBody("gpt-x", [M1]), bIn: chatBody("gpt-x", [M1, M2]),
             aOut: chatBody("gpt-x", [M1]), bOut: chatBody("gpt-x", [M1, M2]),
         });
-        const all = runDiff(dir, { noLog: true });
+        const all = await runDiff(dir, { noLog: true });
         assert.equal(all.sessions.length, 2);
-        const filtered = runDiff(dir, { noLog: true, session: "ses_b" });
+        const filtered = await runDiff(dir, { noLog: true, session: "ses_b" });
         assert.equal(filtered.sessions.length, 1);
         assert.equal(filtered.sessions[0]!.sid, "ses_b");
     } finally { rmrf(dir); }
     const empty = tmpdir("acp-diff-empty-");
     try {
-        assert.throws(() => runDiff(empty, { noLog: true }), /no ACP_DUMP_BODY dumps/);
+        await assert.rejects(() => runDiff(empty, { noLog: true }), /no ACP_DUMP_BODY dumps/);
     } finally { rmrf(empty); }
 });
 
-test("renderJson/renderText: machine output parses and text highlights worst offenders", () => {
+test("renderJson/renderText: machine output parses and text highlights worst offenders", async () => {
     const dir = tmpdir("acp-diff-render-");
     try {
         twoRequestSession(dir, "ses_ok", T_A, T_B, {
@@ -299,7 +299,7 @@ test("renderJson/renderText: machine output parses and text highlights worst off
             aIn: chatBody("gpt-x", [M1, M2]), bIn: chatBody("gpt-x", [M1, M2, M3]),
             aOut: chatBody("gpt-x", [M1, M2]), bOut: chatBody("gpt-x", [M1X, M2, M3]),
         });
-        const report = runDiff(dir, { noLog: true });
+        const report = await runDiff(dir, { noLog: true });
         const parsed = JSON.parse(renderJson(report)) as { totalPairs: number; byCategory: Record<string, number>; worst: unknown[] };
         assert.equal(parsed.totalPairs, 2);
         assert.equal(Object.values(parsed.byCategory).reduce((n, v) => n + v, 0), 2);
@@ -313,7 +313,7 @@ test("renderJson/renderText: machine output parses and text highlights worst off
     } finally { rmrf(dir); }
 });
 
-test("parseUsageLog: loop + plugin variants, sanitized sids, malformed lines skipped", () => {
+test("parseUsageLog: loop + plugin variants, sanitized sids, malformed lines skipped", async () => {
     const dir = tmpdir("acp-diff-log-");
     try {
         const file = path.join(dir, "bili.log");
@@ -323,12 +323,21 @@ test("parseUsageLog: loop + plugin variants, sanitized sids, malformed lines ski
             "2026-09-24T14:32:07.000Z [info] [other] [plugin] [acp-usage] input=300 cached=n/a",
             "2026-09-24T14:32:08.000Z [warn] [weird/id] something else entirely",
         ].join("\n") + "\n");
-        const map = parseUsageLog(file);
+        const map = await parseUsageLog(file);
         assert.deepEqual(map.get("weird_id"), [
             { ts: Date.parse("2026-09-24T14:32:05.123Z"), input: 100, cached: 50 },
             { ts: Date.parse("2026-09-24T14:32:06.000Z"), input: 200, cached: 180 },
         ]);
         assert.ok(!map.has("other"), "cached=n/a line must be skipped");
+    } finally { rmrf(dir); }
+});
+
+test("parseUsageLog: an unreadable log throws instead of answering 'no usage'", async () => {
+    const dir = tmpdir("acp-diff-log-missing-");
+    try {
+        // A vanished log must not read as "this run had zero usage": the diff
+        // would then present an empty ledger as the whole truth.
+        await assert.rejects(() => parseUsageLog(path.join(dir, "absent.log")), (e: NodeJS.ErrnoException) => e.code === "ENOENT");
     } finally { rmrf(dir); }
 });
 
