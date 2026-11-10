@@ -568,6 +568,9 @@ elif SCENARIO == "slow-boot-fail":
 elif SCENARIO == "slow-boot-unload":
     install_sidecar(False)
     os.environ["BILLION_CONTEXT_ATTACH"] = ORIGIN
+    # #5991 negative direction: the host's own proxy must survive an unload that lands BEFORE
+    # routing ever happened — the _shutdown env gate must stay a no-op, not wipe pre-existing keys.
+    os.environ["HTTPS_PROXY"] = "http://user-proxy.example:9999"
     mod.REGISTER_WAIT_S = 0.2
     mod.BOOTSTRAP_BUDGET_S = 5.0
     SLOW["enabled"] = True
@@ -1775,7 +1778,8 @@ describe("python plugin runtime (subprocess)", () => {
         assert.deepEqual(out!.tools_after_unload, [], "no register_tool after unload — the host would drop it anyway");
         assert.equal(out!.unload_thread_alive, false, "the bootstrap thread exits on the stop event");
         assert.equal(out!.state_after_unload, "stopped");
-        assert.equal(out!.env_after_unload, null);
+        assert.equal(out!.env_after_unload, "http://user-proxy.example:9999",
+            "the host's own proxy survives an unload that never routed (#5991)");
         assert.equal(out!.mw_after_unload_none, true);
         assert.match(out!.acp_after_unload!, /plugin unloaded/);
     });
