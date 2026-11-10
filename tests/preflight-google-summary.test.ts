@@ -6,6 +6,7 @@ import test from "node:test";
 process.env.NODE_ENV = "test";
 
 import { defaultConfig } from "acp-kernel";
+import type { GoogleRequestBody } from "acp-kernel/wire";
 import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
@@ -184,6 +185,51 @@ test("e2e preflight (#829): the JSON summary of a non-streaming Gemini call is r
         assert.equal(status, 200, `the JSON-summary shape must compress as well (got HTTP ${status}: ${body.slice(0, 300)})`);
         assert.ok(calls.filter((c) => c.summary).length >= 1, "a summary was requested");
         assert.ok(body.includes("forwarded to the model"), `the model reply reached the client, got: ${body.slice(0, 300)}`);
+    } finally {
+        proxy.close();
+        proxy.closeIdleConnections?.();
+        await once(proxy, "close");
+        upstream.close();
+        upstream.closeIdleConnections?.();
+        await once(upstream, "close");
+    }
+});
+
+
+test("Gemini tool screenshots reach the real preflight summary as recovery notes", async () => {
+    const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+    const calls: Call[] = [];
+    const upstream = makeGeminiUpstream(calls);
+    upstream.listen(0, "127.0.0.1");
+    await once(upstream, "listening");
+    const upstreamPort = (upstream.address() as { port: number }).port;
+    const proxy = await startProxy(upstreamPort);
+    await once(proxy, "listening");
+    const proxyPort = (proxy.address() as { port: number }).port;
+    try {
+        const contents: NonNullable<GoogleRequestBody["contents"]> = longGeminiContents();
+        contents[1].parts!.push({ functionCall: { name: "screenshot", args: {} } });
+        contents[2].parts!.unshift({ functionResponse: {
+            name: "screenshot", response: { output: "Captured two views" },
+            parts: [
+                { inlineData: { mimeType: "image/png", data: png } },
+                { inlineData: { mimeType: "image/png", data: png } },
+            ],
+        } });
+        const response = await fetch(`http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1beta/models/gemini-test:streamGenerateContent?alt=sse`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-acp-session": "google-tool-image-notes" },
+            body: JSON.stringify({ contents, systemInstruction: { parts: [{ text: "You are a test assistant." }] }, generationConfig: { maxOutputTokens: 4096 } }),
+        });
+        const body = await response.text();
+        assert.equal(response.status, 200, body.slice(0, 300));
+        const summaries = calls.filter((call) => call.summary).map((call) => call.raw).join("\n");
+        assert.ok(summaries.includes("Captured two views"), "the tool result belongs to the folded range");
+        assert.equal((summaries.match(/\[image: png 1x1 · m\d{5}\]/g) ?? []).length, 2);
+        assert.ok(!summaries.includes(png), "summary input carries notes instead of image bytes");
+        const forwards = calls.filter((call) => !call.summary).map((call) => call.raw);
+        assert.ok(forwards.some((raw) => raw.includes(SUMMARY_TEXT.slice(0, 40))), "the real proxy applied the fold");
+        assert.ok(forwards.every((raw) => !raw.includes(png)), "folded pixels leave the model request");
     } finally {
         proxy.close();
         proxy.closeIdleConnections?.();

@@ -224,6 +224,18 @@ function opaquePartCost(part: Record<string, unknown>, configuredCap?: number): 
     return applyCap(Math.ceil(JSON.stringify(part).length / 4), configuredCap);
 }
 
+/** Gemini tool responses carry media beside their JSON result, in parts. */
+export function* googleMediaParts(parts: unknown[]): Generator<Record<string, unknown>> {
+    for (const part of parts) {
+        if (!isObj(part)) continue;
+        yield part;
+        const response = part.functionResponse;
+        if (isObj(response) && Array.isArray(response.parts)) {
+            for (const nested of response.parts) if (isObj(nested)) yield nested;
+        }
+    }
+}
+
 export function imageTokensInParsedBody(protocol: "anthropic" | "openai" | "responses" | "google", body: unknown, billing: ResolvedImageBilling = "bytes", configuredCap?: number): number {
     if (!isObj(body)) return 0;
     let total = 0;
@@ -235,8 +247,7 @@ export function imageTokensInParsedBody(protocol: "anthropic" | "openai" | "resp
         if (!Array.isArray(contents)) return 0;
         for (const c of contents) {
             if (!isObj(c) || !Array.isArray(c.parts)) continue;
-            for (const part of c.parts) {
-                if (!isObj(part)) continue;
+            for (const part of googleMediaParts(c.parts)) {
                 const inline = part.inlineData;
                 if (isObj(inline) && typeof inline.data === "string") { total += base64ImageCost(inline.data, billing, configuredCap); continue; }
                 const file = part.fileData;
@@ -395,8 +406,7 @@ export function countImagesInParsedBody(protocol: "anthropic" | "openai" | "resp
         if (!Array.isArray(contents)) return 0;
         for (const c of contents) {
             if (!isObj(c) || !Array.isArray(c.parts)) continue;
-            for (const part of c.parts) {
-                if (!isObj(part)) continue;
+            for (const part of googleMediaParts(c.parts)) {
                 const inline = part.inlineData;
                 if (isObj(inline) && typeof inline.data === "string") { n += 1; continue; }
                 const file = part.fileData;
