@@ -3980,6 +3980,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         function compressOf(d) { return (d.compress && typeof d.compress === "object" && !Array.isArray(d.compress)) ? d.compress : null; }
         const NUDGE_DEFAULT = 50000, NUDGE_STEP = 5000, NUDGE_LOW = 20000, NUDGE_HIGH = 100000;
         const PRM_KERNEL_DEFAULT = 3;
+        const SUMFLOOR_DEFAULT = 50;
         const brokenNote = document.createElement("div");
         brokenNote.style.cssText = "min-height:16px;font-size:12px;color:#cf222e";
         box.appendChild(brokenNote);
@@ -4061,6 +4062,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             updateNudgeNote();
             refreshTierInputs();
             prm.value = String(cp && typeof cp.preserveRecentMessages === "number" ? cp.preserveRecentMessages : PRM_KERNEL_DEFAULT);
+            sumfloor.value = String(cp && typeof cp.minSummaryLength === "number" ? cp.minSummaryLength : SUMFLOOR_DEFAULT);
             ptInp.value = (cp && Array.isArray(cp.protectedTools)) ? cp.protectedTools.join(", ") : "";
             const nv = (cp && Array.isArray(cp.neverPreserveRecentTools)) ? cp.neverPreserveRecentTools : null;
             neInp.value = nv ? nv.filter((x) => typeof x === "string").join(", ") : "";
@@ -4850,6 +4852,17 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             const v = parseInt(prm.value, 10);
             if (!isNaN(v) && v > 0 && v !== PRM_KERNEL_DEFAULT) d.compress.preserveRecentMessages = v;
             else { delete d.compress.preserveRecentMessages; prm.value = String(PRM_KERNEL_DEFAULT); }
+        }));
+        const sumfloor = textRow("quick-sumfloor", t("cfg.q_sumfloor"), t("cfg.q_sumfloor_ph"));
+        sumfloor.type = "number";
+        sumfloor.min = "0";
+        sumfloor.style.flex = "0 0 140px";
+        qCtrls.push(sumfloor);
+        sumfloor.addEventListener("change", () => commit((d) => {
+            if (!compressOf(d)) d.compress = {};
+            const v = parseInt(sumfloor.value, 10);
+            if (!isNaN(v) && v >= 0 && v !== SUMFLOOR_DEFAULT) d.compress.minSummaryLength = v;
+            else { delete d.compress.minSummaryLength; sumfloor.value = String(SUMFLOOR_DEFAULT); }
         }));
         const NEVER_DEFAULT = ["decompress", "search_context", "read", "bash"];
         const neInp = textRow("quick-never", t("cfg.q_never"), t("cfg.q_never_ph"));
