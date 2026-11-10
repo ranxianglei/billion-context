@@ -134,6 +134,9 @@ export const LIVE_FILES = [
     // child binds no port and does no network I/O, so no zone band is needed —
     // the entry is for the tripwire alone, like #3890/#5114
     "tests/integrity-worker-stderr.test.ts",
+    // Real npm pack/install children use mkdtemp package fixtures and the
+    // preload's per-process XDG roots; they bind no listener ports.
+    "tests/pack-install.test.ts",
 ];
 
 /** Band width per live file: the zone ladder drifts +1 per EADDRINUSE retry;
