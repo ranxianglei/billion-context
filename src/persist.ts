@@ -36,6 +36,7 @@ import { mergeState } from "./state-hydration.js";
 import { restampRefsToLedger, restampContentStore } from "acp-kernel";
 import { LazyBlockContents, isDroppedContentStore, isDroppedMetadata, lazyContentStore, lazyMetadata, peekSession, sessionWeight } from "./session.js";
 import type { Session, BlockContent, BlockView } from "./session.js";
+import { HISTORY_GENERATIONS_VERSION, type HistoryArchive } from "./history-generations.js";
 import { orphanContents, resolveStorageMode, UnifiedShadow, hadIntegrityQuickCheckFailure, type StorageMode } from "./storage/shadow.js";
 import { noteColdLoad } from "./attach-heartbeat.js";
 import { resolveBackendName } from "./storage/backend.js";
@@ -323,6 +324,15 @@ function durableWriteFile(file: string, data: Buffer | string, mode?: number): v
 export function contentStoreRelPathFor(id: string, protocol?: string, upstreamOrigin?: string): string {
     const base = relPathFor(id, protocol, upstreamOrigin);
     return base.slice(0, -".json".length) + ".content-store.json";
+}
+
+/** Read-only history generations: closed ACP state + verbatim originals,
+ *  one envelope per session next to the live content store. Written only when
+ *  a compaction boundary closes a generation; never read on the hot path
+ *  (the metadata index gates it). */
+function historyGenerationsRelPathFor(id: string, protocol?: string, upstreamOrigin?: string): string {
+    const base = contentStoreRelPathFor(id, protocol, upstreamOrigin);
+    return base.slice(0, -".content-store.json".length) + ".history-generations.json";
 }
 
 /** #1937: true when a walked FILENAME is the canonical (or legacy flat /
@@ -717,7 +727,10 @@ export class SessionStore {
             // scan from parsing each one and warning "skipping invalid record"
             // per file (hundreds of warns per start at multi-relay scale). Same
             // suffix predicate the GC (#1180) and web walkers already use.
-            foreignFile: (file) => path.basename(file).endsWith(".content-store.json"),
+            foreignFile: (file) => {
+                const base = path.basename(file);
+                return base.endsWith(".content-store.json") || base.endsWith(".history-generations.json");
+            },
         });
     }
 
@@ -730,6 +743,75 @@ export class SessionStore {
             contentStoreRelPathFor(session.id, session.meta.protocol, session.meta.upstreamOrigin),
             contentStoreRelPathFor(session.id),
         ]);
+    }
+
+    /** Closed history generations for a live session (see
+     *  historyGenerationsRelPathFor). Malformed/unreadable envelopes degrade to
+     *  null: archive loss must never wedge the tool path. */
+    loadHistoryGenerations(session: Session): HistoryArchive | null {
+        for (const rel of [
+            historyGenerationsRelPathFor(session.id, session.meta.protocol, session.meta.upstreamOrigin),
+            historyGenerationsRelPathFor(session.id),
+        ]) {
+            const abs = path.join(this.sessionsDir, rel);
+            if (!existsSync(abs)) continue;
+            try {
+                const text = this.readCodec.decode(readFileSync(abs));
+                const parsed = JSON.parse(text) as HistoryArchive;
+                if (parsed && parsed.version === HISTORY_GENERATIONS_VERSION
+                    && typeof parsed.sessionId === "string"
+                    && Array.isArray(parsed.generations)) {
+                    return parsed;
+                }
+                throw new Error("malformed history-generations envelope");
+            } catch (err) {
+                this.log("warn", `[persist] history generations for ${session.id} unreadable (${rel}): ${err instanceof Error ? err.message : String(err)}`);
+                return null;
+            }
+        }
+        return null;
+    }
+
+    hasHistoryGenerations(session: Session): boolean {
+        return this.historyGenerationsStat(session) !== null;
+    }
+
+    /** Cheap identity of the on-disk sidecar. Consumers cache the decoded
+     *  archive; keying that cache on the file's size+mtime means a rewrite by
+     *  another process (or a partially visible rename) never serves stale
+     *  payload just because the metadata index looks unchanged. */
+    historyGenerationsStat(session: Session): { size: number; mtimeMs: number } | null {
+        for (const rel of [
+            historyGenerationsRelPathFor(session.id, session.meta.protocol, session.meta.upstreamOrigin),
+            historyGenerationsRelPathFor(session.id),
+        ]) {
+            try {
+                const stat = statSync(path.join(this.sessionsDir, rel));
+                return { size: stat.size, mtimeMs: stat.mtimeMs };
+            } catch { /* try the next candidate */ }
+        }
+        return null;
+    }
+
+    /** Atomic, fsynced append-store write. Payload-first: callers persist the
+     *  archive BEFORE the session record advertises it, so a crash can only
+     *  leave an unindexed (recoverable) generation, never a dangling index. */
+    saveHistoryGenerations(session: Session, archive: HistoryArchive): boolean {
+        if (!this.enabled) return false;
+        const rel = historyGenerationsRelPathFor(session.id, session.meta.protocol, session.meta.upstreamOrigin);
+        const abs = path.join(this.sessionsDir, rel);
+        const tmp = path.join(path.dirname(abs), `.tmp-${path.basename(abs, ".json")}-${process.pid}-${this.tmpSeq++}`);
+        try {
+            mkdirSync(path.dirname(abs), { recursive: true });
+            const text = JSON.stringify(archive);
+            durableWriteFile(tmp, this.codec ? this.codec.encode(text) : text, 0o600);
+            renameSync(tmp, abs);
+            return true;
+        } catch (err) {
+            try { rmSync(tmp, { force: true }); } catch { /* best-effort: swept at next boot */ }
+            this.log("warn", `[persist] history-generations write failed for ${session.id}: ${err instanceof Error ? err.message : String(err)}`);
+            return false;
+        }
     }
 
     /** Id+meta variant for replica freeze/restore (#2671 review 6): the
@@ -1558,7 +1640,9 @@ export class SessionStore {
         for (const rel of await this.findSessionFiles(id, meta)) {
             await rm(path.join(this.sessionsDir, rel), { force: true }).catch(() => {});
             if (rel.endsWith(".json") && !rel.endsWith(".fb.json")) {
-                await rm(path.join(this.sessionsDir, `${rel.slice(0, -".json".length)}.content-store.json`), { force: true }).catch(() => {});
+                const base = rel.slice(0, -".json".length);
+                await rm(path.join(this.sessionsDir, `${base}.content-store.json`), { force: true }).catch(() => {});
+                await rm(path.join(this.sessionsDir, `${base}.history-generations.json`), { force: true }).catch(() => {});
             }
         }
     }

@@ -969,7 +969,7 @@ export function handlePluginCompact(payload: string, res: import("node:http").Se
         }));
         return;
     }
-    markCompactionBoundary(session);
+    markCompactionBoundary(session, { cause: "client-announced-compaction", source: "plugin-compact-endpoint" });
     if (entry) entry.lastSeen = Date.now();
     res.end(JSON.stringify({ ok: true, conversationId }));
 }

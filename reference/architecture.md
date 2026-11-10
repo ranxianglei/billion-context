@@ -133,10 +133,12 @@ billion-context/
 │   ├── compat-roles.ts           # Wire-compat role rewrite resolution (learn-on-failure)
 │   ├── compat-drop.ts            # compat.dropFields validation
 │   ├── codex-compact.ts          # Codex compact mode intercept/pass (knob-resolved)
+│   ├── codex-checkpoint.ts       # dsh-codex-subscription cloud-checkpoint header truth (parse/dedupe/record)
 │   ├── codex-models.ts           # Codex bundled model-table snapshot
 │   ├── codex-models-snapshot.json # Bundled codex model table data (openai/codex main snapshot)
 │   ├── registry.ts               # models.dev context-window registry (live-first, snapshot floor)
 │   ├── registry-snapshot.json    # Bundled full models.dev snapshot (offline floor)
+│   ├── history-generations.ts    # Read-only history generations: closed ACP blocks/refs/messages + frozen CCR
 │   ├── session.ts                # Session model + in-memory store (bounded, MAX_SESSIONS)
 │   ├── session-id.ts             # Session identity: client value verbatim + persona fork fingerprint
 │   ├── claude-lane-token.ts      # SubagentStart lane-token grammar (mint/extract, #5095)

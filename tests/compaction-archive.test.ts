@@ -121,14 +121,38 @@ test("compaction archive: the boundary log reports the surviving raw-id count (#
     assert.ok(live > 0, "fixture keeps live refs so the count is meaningful");
 });
 
-test("compaction archive: decompress on an archived block gives an explicit reason, not silent/wrong content", () => {
+test("compaction archive: decompress on an archived block restores its captured original from the closed generation", () => {
+    const { session, blockId, tail } = sessionWithActiveBlock();
+    session.blockContents.set(blockId, {
+        one: { text: "one-line view of the folded head", count: 7 },
+        full: { text: "verbatim early history that the summary replaced", count: 7 },
+    });
+    runShortenedTurn(session, tail, true);
+    const ctx = { core: createCore(), config: defaultConfig(200000), messages: tail, session, log: (_msg: string) => {} };
+    const out = resolveDecompress({ blockId, full: true }, ctx).text;
+    assert.match(out, /read-only from history generation 1/);
+    assert.match(out, /verbatim early history that the summary replaced/);
+    assert.doesNotMatch(out, /decompress FAILED/);
+    assert.equal(session.state.blocks.find((b) => b.blockId === blockId)?.active, false, "restore never reactivates the archived block");
+});
+
+test("compaction archive: an archived block with no captured original stays an explicit failure", () => {
     const { session, blockId, tail } = sessionWithActiveBlock();
     runShortenedTurn(session, tail, true);
     const ctx = { core: createCore(), config: defaultConfig(200000), messages: tail, session, log: (_msg: string) => {} };
     const out = resolveDecompress({ blockId }, ctx).text;
     assert.match(out, /decompress FAILED/);
-    assert.match(out, /pre-compaction archive/);
-    assert.match(out, /no longer reachable/);
+    assert.match(out, /history generation 1/);
+    assert.match(out, /summary only/);
+});
+
+test("compaction archive: a pre-compaction record without a durable generation keeps the honest reason", () => {
+    const session = makeSession();
+    session.metadata.preCompactionArchive = { b9: { at: Date.now(), reason: "content replaced by client native compaction summary" } };
+    const ctx = { core: createCore(), config: defaultConfig(200000), messages: [], session, log: (_msg: string) => {} };
+    const out = resolveDecompress({ blockId: "b9" }, ctx).text;
+    assert.match(out, /decompress FAILED/);
+    assert.match(out, /before a durable history generation existed/);
 });
 
 test("compaction archive: acp_status surfaces the archive aggregated by default, per-block on demand (#3105)", () => {
@@ -137,7 +161,7 @@ test("compaction archive: acp_status surfaces the archive aggregated by default,
     const ctx: LoopCtx = { core: createCore(), config: defaultConfig(200000), messages: tail, session, log: (_msg: string) => {} };
     const out = executeProxyTool("acp_status", {}, ctx).text;
     assert.match(out, /PRE-COMPACTION ARCHIVE — 1 block\(s\)/);
-    assert.match(out, /decompress is unavailable/);
+    assert.match(out, /stay restorable read-only/);
     assert.doesNotMatch(out, /^\s{2}b\S+ — /m, "default view aggregates by reason — no per-block lines (#3105)");
     assert.match(out, /1: content replaced by client native compaction summary/);
     assert.match(out, /acp_status\(\{ archiveDetail: true \}\)/, "default view points at the on-demand detail call");

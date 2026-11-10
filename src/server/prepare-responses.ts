@@ -31,6 +31,8 @@ import { rulesEnabled, storeEffectiveRules } from "../rules-feature.js";
 import { autoFoldEngaged, autoFoldFloor, conversationPromptSections, externalSummaryEnabled, growthFoldingArmed, messageTimestampSections } from "../external-summary-surface.js";
 import { filterDeadRanges } from "../dead-ranges.js";
 import { detectGenerationBoundary, GENERATION_BOUNDARY_NOTE } from "../generation-boundary.js";
+import { CODEX_CHECKPOINT_METADATA_KEY, codexCheckpointLane, codexCheckpointRecord, isNewCodexBoundary, parseCodexCheckpointSignal, readCodexCheckpoint } from "../codex-checkpoint.js";
+import { historyNavNote } from "../history-generations.js";
 import { attachSubagentSessions } from "../subagent-sessions.js";
 import { estimateCoreMessages, estimateCoreMessagesUpper } from "../preflight.js";
 import { hoistTrappedToolItems } from "../tool-pair-order.js";
@@ -74,6 +76,40 @@ export async function prepareResponses(
     // #3222: #651's reasoning-drop plan, computed on the INBOUND history before
     // core.processTurn — see planReasoningDrop for why the post-turn view is too late.
     let reasoningPlan = new Set<string>();
+    // Codex cloud compaction: the DSH codex adapter names the checkpoint it
+    // installed, so the boundary is wire truth instead of a text guess. A
+    // `reuse` signal (or a repeated fresh id/seq after a crash) never rebases
+    // twice; a new id or a higher seq is a real consecutive compaction.
+    const checkpointSignal = parseCodexCheckpointSignal(req.headers);
+    const checkpointRecord = readCodexCheckpoint(session);
+    const checkpointHost = isCodexHost(req.headers) || codexCheckpointLane(req.headers);
+    const codexCheckpointBoundary = checkpointSignal !== null
+        && checkpointHost
+        && !hasCompactionTrigger(parsed.input)
+        && isNewCodexBoundary(checkpointRecord, checkpointSignal);
+    if (checkpointSignal !== null && checkpointHost) {
+        if (codexCheckpointBoundary) {
+            recordConflict(session, "native-compaction", `codex cloud checkpoint ${checkpointSignal.checkpointId} seq ${checkpointSignal.seq} covered=${checkpointSignal.covered}`);
+            markNativeCompactionBoundary(session);
+            const rebased = reconcileNativeCompactionBoundary(session, {
+                // The generation covers the history this checkpoint REPLACED, not
+                // the truncated tail the client now resends: keep the previous
+                // full turn view so every ref in it stays restorable.
+                messages: session.lastMessages && session.lastMessages.length > 0
+                    ? session.lastMessages
+                    : Array.isArray(parsed.input) ? parsed.input : [],
+                cause: "codex-cloud-compaction",
+                source: "dsh-codex-subscription",
+                checkpointId: checkpointSignal.checkpointId,
+            });
+            session.metadata[CODEX_CHECKPOINT_METADATA_KEY] = codexCheckpointRecord(checkpointSignal, checkpointRecord?.at ?? Date.now());
+            markDirty(session);
+            log("info", `[${sessionId}] codex cloud checkpoint ${checkpointSignal.checkpointId} seq ${checkpointSignal.seq} (${checkpointSignal.state}): rebased=${rebased}, ${checkpointSignal.covered} covered message(s)`);
+        } else if (!checkpointRecord || checkpointSignal.seq >= checkpointRecord.seq) {
+            session.metadata[CODEX_CHECKPOINT_METADATA_KEY] = codexCheckpointRecord(checkpointSignal, checkpointRecord?.at ?? Date.now());
+            markDirty(session);
+        }
+    }
     if (reconcileNativeCompactionBoundary(session)) {
         log("info", `[${sessionId}] reconciled ACP state after native Responses compact boundary`);
     }
@@ -431,6 +467,9 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
             applyCompactionArchive(session, activeBefore, new Set(msgs.map((m) => m.id)), log);
         }
         reapOrphansLogged(session, msgs, log, sessionId);
+        // Standing navigation index for closed generations: byte-stable
+        // between boundaries, names refs/blocks without carrying payload.
+        const historyNav = isCompactionTrigger ? null : historyNavNote(session);
         rebuiltInput = patchResponsesInput(projection, processedMessages);
         if (Array.isArray(rebuiltInput)) rebuiltInput = mergeAdjacentConfigurationUpdates(hoistTrappedToolItems(rebuiltInput));
         // #3400: the Responses steady path rebuilds items from the RAW parsed
@@ -455,7 +494,7 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         const genBoundaryActive = detectGenerationBoundary(session, processedMessages, log);
         if (compressSurfaceOn && !isCompactionTrigger && !knobNoCompressPrompt()) {
             const prompt = withProjectAttribution(withMcpDialectNote(withMarkerIntegrityNote(withSummaryBudgetNote(responsesTextProtocol ? buildCompressHybridSystemPrompt(prompts, messageTimestampSections(conversationPromptSections(surface?.promptSections, externalSummaryEnabled(config)), "hybrid")) : buildCompressSystemPrompt(prompts, messageTimestampSections(conversationPromptSections(surface?.promptSections, externalSummaryEnabled(config)))), externalSummaryEnabled(config)), visibilityMarkers), laneDecisions.mcpDialect, blockOpsActive));
-            const devParts = [...projection.systemParts, ...forgedSummaries, prompt];
+            const devParts = [...projection.systemParts, ...forgedSummaries, prompt, ...(historyNav ? [historyNav] : [])];
             if (genBoundaryActive) devParts.push(GENERATION_BOUNDARY_NOTE);
             if (absorbActive) devParts.push(buildAbsorbSystemPrompt(absorbToolName(loopConfig)));
             if (blockOpsActive) devParts.push(buildBlockOpsSystemPrompt(responsesTextProtocol ? "hybrid" : "function"));
@@ -472,8 +511,8 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
                     ? injectResponsesTool(parsed.tools, [...(ccrOn ? BILI_ACP_READONLY_TOOLS_RESPONSES : BILI_ACP_READONLY_TOOLS_RESPONSES_NO_RANGE), ...(blockOpsActive ? blockOps.responses : [])], surface?.toolPrompts, externalSummaryEnabled(config))
                     : injectResponsesTool(parsed.tools, respExtra.length > 0 ? [...(ccrOn ? BILI_ACP_TOOLS_RESPONSES : BILI_ACP_TOOLS_RESPONSES_NO_RANGE), ...respExtra] : (ccrOn ? BILI_ACP_TOOLS_RESPONSES : BILI_ACP_TOOLS_RESPONSES_NO_RANGE), surface?.toolPrompts, externalSummaryEnabled(config));
             }
-        } else if (tagsOnlyPrompt !== "" || projection.systemParts.length > 0 || forgedSummaries.length > 0) {
-            const devContent = [...projection.systemParts, ...forgedSummaries, ...(tagsOnlyPrompt !== "" ? [tagsOnlyPrompt] : []), ...(genBoundaryActive && !isCompactionTrigger ? [GENERATION_BOUNDARY_NOTE] : [])].join("\n\n---\n\n");
+        } else if (tagsOnlyPrompt !== "" || projection.systemParts.length > 0 || forgedSummaries.length > 0 || historyNav) {
+            const devContent = [...projection.systemParts, ...forgedSummaries, ...(tagsOnlyPrompt !== "" ? [tagsOnlyPrompt] : []), ...(genBoundaryActive && !isCompactionTrigger ? [GENERATION_BOUNDARY_NOTE] : []), ...(historyNav ? [historyNav] : [])].join("\n\n---\n\n");
             responsesDevContent = devContent;
             if (forgedSummaries.length > 0) log("debug", `[${sessionId}] [inject] ${forgedSummaries.length} captured summary block(s) re-injected into developer message`);
             rebuiltInput = injectResponsesDeveloperMessage(rebuiltInput, devContent, projection.headRole ?? "developer");

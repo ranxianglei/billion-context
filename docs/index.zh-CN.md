@@ -24,6 +24,7 @@
 | [identity-channels](identity-channels.zh-CN.md) / [English](identity-channels.md) | 跨客户端稳定会话/消息 id 接线（#5825）：谁带身份进来、在哪里消费 |
 | [msgid-infrastructure](msgid-infrastructure.zh-CN.md) / [English](msgid-infrastructure.md) | sessionid+msgid 的生产、校验（六份副本）、钉住与消费 |
 | [opencode-responses-websocket](opencode-responses-websocket.zh-CN.md) / [English](opencode-responses-websocket.md) | OpenCode V2 Responses-over-WebSocket 集成（#1844） |
+| [codex-cloud-compaction](codex-cloud-compaction.zh-CN.md) / [English](codex-cloud-compaction.md) | Codex 云端 checkpoint ↔ ACP 历史代：边界通知、只读归档、ref/块号连续性、跨代检索 |
 | [plugin-protocol](plugin-protocol.md) | 协作插件协议 v2（实验性，无中文版） |
 | [wire-contracts](wire-contracts.zh-CN.md) / [English](wire-contracts.md) | WC 台账：可声明自定义 wire 端点（#1295）背后的上游 wire 约束永久账本；条目只被取代（SUPERSEDED），不删除 |
 
