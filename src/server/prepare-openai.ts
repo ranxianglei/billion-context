@@ -7,8 +7,10 @@ import type { ProxyOptions } from "../config.js";
 import { effectivePromptCacheRouting } from "../config.js";
 import { currentCalibrationFactor, hardenOpenaiAssistantContent, systemToUser } from "../util.js";
 import { conversationHeaderSource, resolveRelayAffinityPck } from "../session-id.js";
+import { MSG_IDS_BODY_FIELD, applyMsgIdPin, validateMsgIds } from "../msgid-pin.js";
 import { pluginAgentHeader } from "../plugin.js";
-import { applyReasoningDrop, diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, planReasoningDrop, makeFoldPointReasoningDroppable, reapOrphansLogged, resolveKnownOutputCeiling, runNudgeDecision, stripKernelSummaries, warnDroppedOpenaiParts, warnReasoningPairs, type Prepared } from "../server.js";
+import { applyReasoningDrop, diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, planReasoningDrop, reapOrphansLogged, resolveKnownOutputCeiling, runNudgeDecision, stripKernelSummaries, warnDroppedOpenaiParts, warnReasoningPairs, type Prepared } from "../server.js";
+import { recordNudgeObservation } from "../context-analysis.js";
 import { yieldToEventLoop } from "../yield-loop.js";
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, resolveDecisionRange, stripDecisionReasoningFields, type DecideConfig } from "../nudge-decide.js";
 import { excludeDeadRefRanges } from "../acp-status.js";
@@ -65,6 +67,13 @@ export async function prepareOpenai(
 ): Promise<Prepared> {
     const sessionId = session.id;
     const stream = parsed.stream === true;
+    // #5825/#4491 parity: bili-namespaced msgid channel on the openai wire.
+    // Stripped UNCONDITIONALLY — same discipline as the anthropic twin:
+    // the real upstream must never see a field it does not know. Sources:
+    // host body stamps (pi incremental lane) or the #5825 handle-seam
+    // re-stamp of stamped-header/harvested ids.
+    const incomingMsgIds = (parsed as Record<string, unknown>)[MSG_IDS_BODY_FIELD];
+    delete (parsed as Record<string, unknown>)[MSG_IDS_BODY_FIELD];
     // Real wire element count; a watermark hit overrides it with the measured
     // total T (see the #5403/#5418 block below).
     let inboundMessageCount = Array.isArray(parsed.messages) ? parsed.messages.length : 1;
@@ -143,7 +152,9 @@ export async function prepareOpenai(
     const reserveBody: OpenAIRequestBody | string = wpHit !== undefined && wpFullText !== undefined ? wpFullText : parsed;
     let wpSeedSystemText = "";
     let wpTurnStrip: RawStripCounts | undefined;
-    const markerCounts = wpHit !== undefined ? wpHit.markerCounts : stripRawStage(parsed, "openai");
+    // On a watermark hit no walk runs this turn — the cached counts describe
+    // the window's logical view, so report zero wall time for THIS turn (#6018).
+    const markerCounts = wpHit !== undefined ? { ...wpHit.markerCounts, strippedMs: 0 } : stripRawStage(parsed, "openai");
     logRawStripCounts(markerCounts, log, sessionId);
 
     try {
@@ -152,7 +163,8 @@ export async function prepareOpenai(
         // must not feed ids/fingerprints. Capture it and re-inject below —
         // otherwise the proxy would forward payloads without any system.
         const converted = wpHit !== undefined ? { msgs: wpHit.view, systemText: wpHit.systemText } : openaiToCore(parsed);
-        const { msgs, systemText } = converted;
+        let msgs = converted.msgs;
+        let systemText = converted.systemText;
         openaiSystemText = systemText;
         wpSeedSystemText = systemText;
         wpTurnStrip = markerCounts;
@@ -165,6 +177,27 @@ export async function prepareOpenai(
             openaiSystemText = outcome.outbound;
         }
         originalMessages = msgs;
+        // #4491/#5825 parity: pin identity to client-supplied ids (plugin
+        // lanes only — pure proxy traffic has no msgid channel and stays on
+        // snapshot render D), the SAME gated contract as the anthropic twin.
+        // Skipped on watermark hits on purpose: fastpath turns reuse the
+        // seed stash's prefix view whose rows were already pinned when it was
+        // materialized, and the decoded tail window is SHORTER than the
+        // stamped list, so count-parity there would fail by design — pinning
+        // only adds noise.
+        if (wpHit === undefined && pluginMode && incomingMsgIds !== undefined) {
+            if (featureEnabled("pluginLaneServerHistory")) {
+                const v = validateMsgIds(incomingMsgIds, msgs.length);
+                if (v.ok) {
+                    msgs = applyMsgIdPin(msgs, v.ids);
+                    originalMessages = msgs;
+                } else {
+                    log("warn", `[${sessionId}] [msgid] openai-wire pin rejected (${v.reason}) — falling back to content-derived ids (#4491/#5825)`);
+                }
+            } else {
+                log("info", `[${sessionId}] [msgid] openai-wire biliMsgIds present but pluginLaneServerHistory rollout is off for this install — field stripped, ids not pinned (#5825)`);
+            }
+        }
         // #3756 snapshot render: the outbound prefix renders from the unified
         // transcript (server-authoritative, fold-time ids — immune to identity
         // re-mints #3752); only the live tail keeps the client's bytes.
@@ -192,10 +225,6 @@ export async function prepareOpenai(
         const absorbActive = absorbBlock?.enabled === true && shouldInject;
         const rulesActive = rulesEnabled(config) && shouldInject;
         const loopConfig = ccrLoopConfig(session, { ...config, absorb: absorbActive ? absorbBlock : undefined });
-        // Experimental fold-point "thinking clear" (default OFF): install the kernel drop predicate only when BOTH switches are set; strict-echo (#684) and signed-thinking views yield none at all (#1658).
-        if (loopConfig.compressAtFoldPointClearThinking) {
-            loopConfig.reasoningDroppable = makeFoldPointReasoningDroppable(renderMsgs, isStrictReasoningEcho(session, upstreamOrigin, modelIdOf(parsed)));
-        }
         // #2432: dsh desktop's native compaction can LAND without ever
         // transiting bili — its summarizer calls ctx.llm.stream() directly,
         // and manual /compact / idle-session paths have no ALS attribution so
@@ -289,7 +318,7 @@ export async function prepareOpenai(
         await yieldToEventLoop();
         // #5293: re-anchor the nudge growth reference after a user-aborted turn (no-op otherwise).
         absorbAbortedTurnGrowth(session, tokenCount);
-        const turn = core.processTurn({ messages: renderMsgs, state: session.state, config: loopConfig, tokenCount, renderTags: renderStrategy, contentStore: contentStoreOf(session) });
+        const turn = core.processTurn({ messages: renderMsgs, state: session.state, config: loopConfig, tokenCount, tokenCountSource, renderTags: renderStrategy, contentStore: contentStoreOf(session) });
         session.state = turn.state;
         adoptContentStore(session, turn.contentStore);
         // #4528: split the kernel pass from its post-processing scan passes so
@@ -359,6 +388,8 @@ export async function prepareOpenai(
             growthFoldingArmed: growthFoldingArmed(loopConfig, undefined, autoFoldFloor(session)),
             modelWantsIt: turn.nudge !== undefined && (turn.nudge.shouldInject || emergencyNudgeArmed(session, turn.nudge, loopConfig.compress.minCompressRange, tokenCount, loopConfig.nudge.growthFloor)),
         });
+        const caLine = recordNudgeObservation(sessionId, turn, tokenCount, config.modelContextLimit, willInjectNudge, decideTier1Arm && !decideFallbackOverride, surfaceOffDetail(laneDecisions, opts.compress.injectTool));
+        if (caLine) log("info", caLine);
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model, willInjectNudge, decideTier1Arm && !decideFallbackOverride, surfaceOffDetail(laneDecisions, opts.compress.injectTool)));
         processedMessages = applyReasoningDrop(stripKernelSummaries(turn.messages, turn.state), reasoningPlan, log, sessionId);
         // #1001: a silent client history rewrite takes the same archive+prune path
