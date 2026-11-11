@@ -452,7 +452,9 @@ function resolveDecompressRange(args: Record<string, unknown>, ctx: ProxyToolCtx
         injText = toFileOut.text;
     } else if (body.length > 10000) {
         const safeBlockId = block.blockId.replace(/[^a-zA-Z0-9_-]/g, "-");
-        // Each spill owns its path, even when sessions reuse block and span ids in the same millisecond.
+        // [#1207 review F4] Span in the filename; each spill owns its path even when sessions
+        // reuse block and span ids in the same millisecond (#6175). 0600: folded conversation
+        // content is not world-readable on multi-user hosts.
         const outPath = join(tmpdir(), `acp-decompress-${safeBlockId}-${startRaw}-${endRaw}-${randomUUID()}.txt`);
         try {
             mkdirSync(dirname(outPath), { recursive: true });
