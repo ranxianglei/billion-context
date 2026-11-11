@@ -74,7 +74,8 @@ export function observeOutboundPrefix(
             ? ` BREAK@${lcp} prev[${prev.length}]="${prev[lcp] ?? "<end>"}" -> cur[${cur.length}]="${cur[lcp] ?? "<end>"}"`
             : "";
         log(shrank ? "info" : "debug", `[${sessionId}] outbound-prefix: lcp=${lcp}/${cur.length} (prev ${prev.length}) cc@[${ccIdx.join(",")}]${detail} (#5385)`);
-    } catch {
+    } catch (err) {
         // observation-only: never disturb the request path
+        log("warn", `[${sessionId}] outbound-prefix: observation failed: ${String(err)} (#5385)`);
     }
 }
