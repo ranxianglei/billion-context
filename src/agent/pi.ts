@@ -5,13 +5,13 @@
 // minimal structural declarations — the bundled artifact imports NOTHING
 // from the host at runtime (the host duck-types us in).
 
-import type { EntryRenderer, MessageRenderer } from "@earendil-works/pi-coding-agent";
+import type { MessageRenderer } from "@earendil-works/pi-coding-agent";
 import { Box, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { wrapCacheReport, wrapRuleReport } from "../acp-panel.js";
-import { ACP_NUDGE_CUSTOM_TYPE, formatNudgeRecord, onNudgeInjected, type NudgeDebugEvent } from "../nudge-debug.js";
+import { onNudgeInjected, type NudgeDebugEvent } from "../nudge-debug.js";
 import { awaitNativeProxyOrigin } from "./native-bootstrap.js";
 import { disposeSubagentSelfReg, selfRegisterForSession, type SubagentSelfRegState } from "./pi-subagent-registry.js";
 import { isModelApiUrl, nativeInterceptInstalled } from "./native-intercept.js";
@@ -83,13 +83,6 @@ type ExtensionAPI = {
     registerTool: (tool: ToolDefinition) => void;
     registerCommand?: (name: string, options: { description?: string; handler: (args: string, ctx: CommandCtx) => void | Promise<void> }) => void;
     registerMessageRenderer?: (customType: string, renderer: MessageRenderer) => void;
-    // Nudge debug surface (debug switch, ACP_DEBUG/debug): mirror the exact
-    // injected nudge wire text into the transcript as a CustomEntry —
-    // human-visible, never in LLM context (the host's session-context build
-    // ignores type:"custom"). Optional because older hosts lack it; without
-    // it the debug view is simply unavailable.
-    registerEntryRenderer?: (customType: string, renderer: EntryRenderer) => void;
-    appendEntry?: (customType: string, data?: unknown) => void;
     // #2186: acp_delegate (inlined from billion-context-pi-subagents) injects
     // completion notifications through the host's persistent transcript
     // channel; optional because older hosts and non-pi hosts lack it.
@@ -902,16 +895,14 @@ export function createPiDirectSendGuard(): (url: string, input: string | URL | R
 // Nudge-debug wiring guard: the bus subscription is process-global (the
 // emitters live in this same bundle in inline mode), so wire it at most once
 // even if a host ever re-invokes the factory.
-// Nudge debug surface (billion-context-pi issue #326 parity) — module-level
-// because the bus subscription is process-singleton:
+// Nudge debug surface (transient terminal view only) — module-level because
+// the bus subscription is process-singleton:
 //   nudgeDebugWired: the onNudgeInjected listener registered exactly once.
-//   nudgeRecordedTurns: (sessionId → turnKey) one compact record line per user
-//       turn — emergency nudges re-inject on every LLM call and must not
-//       flood the session file.
-//   nudgeFullPending / nudgeNotifiedTurns: the verbatim wire text is shown as
-//       a transient terminal notification (debug switch on), deduped per turn.
+//   nudgeFullPending: the latest injected nudge, consumed (and cleared) by the
+//       after_provider_response hook once the model has answered.
+//   nudgeNotifiedTurns: (sessionId → turnKey) dedup — emergency nudges
+//       re-inject on every LLM call of a turn; notify at most once per turn.
 let nudgeDebugWired = false;
-const nudgeRecordedTurns = new Map<string, string>();
 const nudgeNotifiedTurns = new Map<string, string>();
 let nudgeFullPending: NudgeDebugEvent | null = null;
 
@@ -1126,51 +1117,24 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                 return box;
             });
         }
-        // Nudge display (aligned with billion-context-pi issue #326, custom
-        // type `acp-nudge`): the nudge ITSELF goes to the model — that is the
-        // pre-existing mechanism's job, this surface adds nothing to model
-        // context. What lands in the transcript: ONE compact record line per
-        // user turn (`[ACP nudge] …`), always, as a CustomEntry — pi-visible,
-        // model-invisible (pi's buildSessionContext ignores type:"custom"),
-        // persistent in the session file. With the debug switch on
-        // (ACP_DEBUG / config `debug`) the VERBATIM wire text is additionally
-        // shown as a transient terminal notification (see the
-        // after_provider_response hook) and is never persisted.
-        // Engine-side emitter: same bundle/process in the default INLINE pi
-        // mode (spawn/attach proxies are separate processes — no bus
-        // listener, feature inert there; docs/clients.md).
-        if (agent === "pi" && typeof pi.registerEntryRenderer === "function" && typeof pi.appendEntry === "function") {
+        // Nudge debug view (transient only, gated on the debug switch —
+        // ACP_DEBUG / config `debug`): when the proxy injects a nudge (the
+        // ephemeral trailing user message the model reads), the VERBATIM wire
+        // text is shown once per user turn as a terminal notification after
+        // the model has answered. Nothing is persisted and nothing is added
+        // to model context. Engine-side emitter: same bundle/process in the
+        // default INLINE pi mode (spawn/attach proxies are separate processes
+        // — no bus listener, feature inert there; docs/clients.md).
+        if (agent === "pi") {
             if (!nudgeDebugWired) {
                 nudgeDebugWired = true;
                 onNudgeInjected((event) => {
-                    try {
-                        if (nudgeRecordedTurns.get(event.sessionId) !== event.turnKey) {
-                            nudgeRecordedTurns.set(event.sessionId, event.turnKey);
-                            pi.appendEntry?.(ACP_NUDGE_CUSTOM_TYPE, { text: formatNudgeRecord(event) });
-                        }
-                    } catch {
-                        // debug surface only — a failed append must never break the request pipeline
-                    }
                     nudgeFullPending = event;
                 });
             }
-            pi.registerEntryRenderer(ACP_NUDGE_CUSTOM_TYPE, (entry, _options, theme) => {
-                const data = entry.data as { text?: unknown } | undefined;
-                const text = data !== undefined && typeof data === "object" ? data.text : undefined;
-                if (typeof text !== "string" || text.length === 0) return undefined;
-                const box = new Box(1, 1, (line) => theme.bg("customMessageBg", line));
-                box.addChild(new Text(theme.fg("dim", text), 0, 0));
-                return box;
-            });
-        }
-        // Nudge debug FULL text: once the model has answered a request that
-        // carried a nudge, show the verbatim wire text once per user turn —
-        // a transient terminal notification only, never written to the
-        // session file (billion-context-pi #326 parity: the file keeps the
-        // compact `[ACP nudge] …` line). Gated on the debug switch.
-        if (agent === "pi") {
             pi.on("after_provider_response", ((_event: unknown, ctx: Ctx) => {
                 const pending = nudgeFullPending;
+                nudgeFullPending = null;
                 if (pending === null || !debugEnabled()) return;
                 if (nudgeNotifiedTurns.get(pending.sessionId) === pending.turnKey) return;
                 nudgeNotifiedTurns.set(pending.sessionId, pending.turnKey);

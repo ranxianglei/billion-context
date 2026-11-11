@@ -4,23 +4,15 @@
 // withSummaryBudgetNote/withMarkerIntegrityNote — the exact string on the
 // wire, not the pre-wrapper template).
 //
-// Display contract (aligned with billion-context-pi issue #326, custom type
-// `acp-nudge`):
-//   1. The nudge itself goes to the MODEL — that is the pre-existing nudge
-//      mechanism's job (the model must read it to call compress); this module
-//      adds nothing to model context.
-//   2. ALWAYS: the pi lane mirrors ONE compact record line per user turn
-//      (`formatNudgeRecord`) into the host transcript as a CustomEntry via
-//      pi.appendEntry(ACP_NUDGE_CUSTOM_TYPE, { text }). CustomEntries do NOT
-//      participate in LLM context (pi's buildSessionContext ignores
-//      type:"custom"), so the record is HUMAN-ONLY: pi-visible, model-
-//      invisible, and persistent in the session file across restarts.
-//   3. DEBUG ONLY (debugEnabled() — ACP_DEBUG > config `debug` > false): the
-//      verbatim wire text is shown as a transient terminal notification by
-//      the pi lane; it is never written to the session file.
-// Per-turn dedup (turnKey) lives on the consumer side: emergency nudges
-// re-inject on every LLM call of a turn and must not flood the session file
-// with one record per call — one record per user turn.
+// Display contract: the nudge ITSELF goes to the model — that is the
+// pre-existing nudge mechanism's job (the model must read it to call
+// compress); this module adds nothing to model context. The pi lane mirrors
+// the injection to the TERMINAL ONLY, gated on the debug switch
+// (debugEnabled() — ACP_DEBUG > config `debug` > false): once the model has
+// answered a request that carried a nudge, the verbatim wire text is shown
+// as a transient terminal notification (pi.ui.notify), at most once per user
+// turn (per-turn dedup, turnKey: emergency nudges re-inject on every LLM
+// call of a turn). Nothing is written to the session file.
 //
 // Why a bus and not a log line: the nudge text IS the thing under debugging —
 // "what did the model actually read this round" — and grepping a log file
@@ -35,10 +27,6 @@
 // docs/clients.md en+zh, Pi section).
 
 type NudgeDebugKind = "advisory" | "directive" | "fallback";
-
-/** Same custom entry type the pi lane (billion-context-pi) persists for
- *  nudge records — one name across both pi clients. */
-export const ACP_NUDGE_CUSTOM_TYPE = "acp-nudge";
 
 export type NudgeDebugEvent = {
     /** bili session id the nudge armed under (not the host session id). */
@@ -64,8 +52,8 @@ export type NudgeDebugEvent = {
      *  message of the pre-nudge conversation). One record line per
      *  (session, turnKey) — emergency re-injections within a turn collapse. */
     turnKey: string;
-    /** The FINAL wrapped wire text, verbatim (debug display only — the pi
-     *  lane shows it transiently and never persists it). */
+    /** The FINAL wrapped wire text, verbatim (debug display only — shown
+     *  transiently in the terminal, never persisted). */
     text: string;
     ts: number;
 };
@@ -125,15 +113,6 @@ function djb2(s: string): number {
         h = ((h << 5) + h + s.charCodeAt(i)) >>> 0;
     }
     return h;
-}
-
-/** Compact one-line twin of the wire nudge (billion-context-pi issue #326
- *  formatNudgeRecord): auditability only — the full multi-line nudge
- *  deliberately stays out of the session file. */
-export function formatNudgeRecord(ev: Pick<NudgeDebugEvent, "tier" | "pct" | "emergency" | "topRange">): string {
-    const tier = `T${ev.tier ?? 1}`;
-    const range = ev.topRange !== null ? ` · top range ${ev.topRange.startRef}–${ev.topRange.endRef}` : "";
-    return `[ACP nudge]${ev.emergency ? " EMERGENCY" : ""} ${ev.pct}% · ${tier}${range}`;
 }
 
 type NudgeDebugListener = (event: NudgeDebugEvent) => void;

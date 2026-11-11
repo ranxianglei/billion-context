@@ -700,22 +700,17 @@ Full field table and the `PI_ACP_DELEGATE_*` env overrides:
 configuration.md → [`pi`](configuration.md#pi).
 
 **Nudge visibility (what the proxy injected, without model-context cost).**
-Every nudge the proxy injects mid-compression leaves a COMPACT RECORD LINE in
-the pi transcript — `[ACP nudge] 92% · T2 · top range m0120–m0145` (percent of
-context used, tier, optional top compressible range; `EMERGENCY` flag when the
-emergency arm fired) — one per user turn, always on, no config needed. The
-line is a pi `CustomEntry` of type `acp-nudge`, which never enters the LLM
-context (pi's session-context build ignores `type:"custom"`) and persists in
-the session file across restarts: pi-visible, model-invisible. With the
-global debug switch on (`ACP_DEBUG=1`, or `"debug": true` in the config
-file) the VERBATIM wire text — exactly the ephemeral trailing user message
-the model reads that turn — is additionally shown once per turn as a transient
-terminal notification; it is never written to the session file. Pi inline
-mode only — in spawn/attach the proxy is a separate process and the view is
-unavailable. Covers the Anthropic and OpenAI wire lanes (the two pi reaches
-over HTTP); on hosts without `registerEntryRenderer`/`appendEntry` the feature
-degrades to absent. (Custom type and line format aligned with the official
-pi client, billion-context-pi issue #326.)
+With the global debug switch on (`ACP_DEBUG=1`, or `"debug": true` in the
+config file), every nudge the proxy injects mid-compression is shown in the
+terminal — once per user turn, as a transient notification after the model
+has answered — with the VERBATIM wire text: exactly the ephemeral trailing
+user message the model reads that turn, byte for byte. The notification is
+terminal-only: it is never written to the session file and adds nothing to
+model context (the nudge reaching the model is the pre-existing mechanism's
+job; this view just lets a human see it happen). Pi inline mode only — in
+spawn/attach the proxy is a separate process and the view is unavailable.
+Covers the Anthropic and OpenAI wire lanes (the two pi reaches over HTTP); on
+hosts without `ui.notify` the feature degrades to absent.
 
 **How routing works.** The pi extension bootstraps (or attaches to) its own
 proxy and patches `globalThis.fetch` in-process: every model-API HTTP request

@@ -1,10 +1,9 @@
-// Nudge debug surface (billion-context-pi issue #326 parity): the prepare
-// stage must mirror the EXACT nudge wire text it injects into the in-process
-// bus (src/nudge-debug.ts); the pi lane turns each event into ONE compact
-// `[ACP nudge] …` CustomEntry record line per user turn (ALWAYS on —
-// CustomEntry never enters LLM context, pi-visible / model-invisible,
-// persistent in the session file) and, with the debug switch on
-// (ACP_DEBUG / config `debug`), a transient verbatim terminal notification.
+// Nudge debug surface: the prepare stage must mirror the EXACT nudge wire
+// text it injects into the in-process bus (src/nudge-debug.ts); the pi lane
+// shows it as a TRANSIENT terminal notification (debug switch on —
+// ACP_DEBUG / config `debug`), once per user turn, never persisted. The nudge
+// itself going to the model is the pre-existing mechanism's job; this module
+// adds nothing to model context.
 // Gold assertion: the bus event text is BYTE-IDENTICAL to the trailing user
 // message content the proxy actually sent upstream — the human in pi sees
 // exactly what the model read, and nothing more.
@@ -23,7 +22,7 @@ import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
-import { emitNudgeInjected, onNudgeInjected, _resetNudgeDebugForTest, formatNudgeRecord, nudgeDebugMeta, nudgeTurnKey, type NudgeDebugEvent } from "../src/nudge-debug.ts";
+import { emitNudgeInjected, onNudgeInjected, _resetNudgeDebugForTest, nudgeDebugMeta, nudgeTurnKey, type NudgeDebugEvent } from "../src/nudge-debug.ts";
 import { debugEnabled } from "../src/knobs.ts";
 import { createBiliPlugin } from "../src/agent/pi.ts";
 
@@ -83,14 +82,7 @@ test("debugEnabled: ACP_DEBUG env wins; file `debug` tier; default off; only the
     }
 });
 
-// ---------- record line + turn key (billion-context-pi #326 parity) ----------
-
-test("formatNudgeRecord: matches the pi-lane one-liner format", () => {
-    const base = { tier: 2, pct: 92, emergency: false, topRange: { startRef: "m00010", endRef: "m00030" } };
-    assert.equal(formatNudgeRecord(base), "[ACP nudge] 92% · T2 · top range m00010–m00030");
-    assert.equal(formatNudgeRecord({ ...base, emergency: true }), "[ACP nudge] EMERGENCY 92% · T2 · top range m00010–m00030");
-    assert.equal(formatNudgeRecord({ ...base, tier: null, topRange: null }), "[ACP nudge] 92% · T1");
-});
+// ---------- turn key (per-turn dedup for the terminal notify) ----------
 
 test("nudgeTurnKey: identity of the last TEXT user message; tool-only tails do not move it", () => {
     const u = { role: "user", content: "please fix the ledger bug" };
@@ -119,42 +111,38 @@ test("nudgeDebugMeta: pct rounds, emergency flags, top range by tokens", () => {
     assert.equal(emergency.topRange, null, "no ranges → null");
 });
 
-// ---------- pi wiring gate (both directions, #3617 discipline) ----------
+// ---------- pi wiring (both directions, #3617 discipline) ----------
 
-test("pi wiring: the acp-nudge entry renderer registers on every pi host (record lines are always on)", () => {
+test("pi wiring: the nudge terminal-notify hook subscribes on the pi host only", () => {
     const savedEnv = process.env.ACP_DEBUG;
     try {
         if (savedEnv !== undefined) process.env.ACP_DEBUG = savedEnv;
         else delete process.env.ACP_DEBUG;
         const makeStub = () => {
-            const entryTypes: string[] = [];
+            const events: string[] = [];
             return {
-                entryTypes,
-                on: () => {},
+                events,
+                on: (name: string) => { events.push(name); },
                 fire: () => undefined,
                 fireAsync: async () => undefined,
                 registerTool: () => {},
                 registerCommand: () => {},
                 registerProvider: () => {},
                 registerMessageRenderer: () => {},
-                registerEntryRenderer: (t: string) => { entryTypes.push(t); },
-                appendEntry: () => {},
                 getSessionName: () => "test",
             };
         };
-        // Always on now — the compact record line no longer rides the debug
-        // switch (billion-context-pi #326: one line per turn, persistent);
-        // the switch gates only the transient full-text terminal notify.
         const on = makeStub();
         createBiliPlugin("pi")(on as never);
-        assert.ok(on.entryTypes.includes("acp-nudge"), "registers on the pi host without any debug config");
-        process.env.ACP_DEBUG = "0";
-        const off = makeStub();
-        createBiliPlugin("pi")(off as never);
-        assert.ok(off.entryTypes.includes("acp-nudge"), "stays registered with the debug switch explicitly off");
         const other = makeStub();
         createBiliPlugin("omp")(other as never);
-        assert.ok(!other.entryTypes.includes("acp-nudge"), "pi lane only");
+        // The #3248 incremental-ack channel subscribes after_provider_response
+        // for BOTH lanes unconditionally, so assert the DIFFERENCE: the pi
+        // host carries exactly one extra subscription — the nudge notify hook
+        // (the debug switch gates the display, not the wiring).
+        const count = (s: { events: string[] }) => s.events.filter((e) => e === "after_provider_response").length;
+        assert.ok(count(on) >= 1, "pi host has the after_provider_response hook");
+        assert.equal(count(on), count(other) + 1, "pi lane only: exactly one extra after_provider_response subscription vs omp");
     } finally {
         if (savedEnv === undefined) delete process.env.ACP_DEBUG;
         else process.env.ACP_DEBUG = savedEnv;
