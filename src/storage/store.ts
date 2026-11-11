@@ -2377,9 +2377,10 @@ export class UnifiedStore {
     /** #3901/#3463: age-sweep GC. Sessions whose updated_at is older than
      *  the retention cutoff are archived (export + sweep); zero-ref content
      *  rows left by any path are collected. `vacuum: 'full'` additionally
-     *  rebuilds the database file (auto_vacuum=INCREMENTAL handles freed
-     *  pages incrementally; a one-time VACUUM reclaims the initial bloat of
-     *  databases created before that pragma). */
+     *  rebuilds the database file. `vacuum: 'incremental'` hands the
+     *  freelist back without the rewrite, but only on a file whose header
+     *  says auto_vacuum=INCREMENTAL (see storagePragmas); on a file created
+     *  with auto_vacuum=0 it is a no-op until one full VACUUM converts it. */
     gc(opts: { archiveAfterDays: number; archiveDir: string; now?: number; vacuum?: "full" | "incremental" }): { archived: number; contentRowsDeleted: number } {
         // #4612: full VACUUM is an O(db-size) atomic rewrite under the exclusive
         // write lock with no intermediate progress. Running it against a db that
