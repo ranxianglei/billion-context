@@ -263,12 +263,13 @@ test("checkpoint signal dedupe: same id+seq is not a new boundary, higher seq is
     assert.equal(parseCodexCheckpointSignal({ "x-bili-codex-checkpoint": "cp", "x-bili-codex-checkpoint-seq": "0", "x-bili-codex-checkpoint-state": "fresh" }), null);
 });
 
-test("a generation that cannot be persisted aborts the rebase and leaves live state intact", () => {
+test("a generation that cannot be persisted aborts the rebase, stays pending, and recovers on the next attempt", () => {
     const { session, blockId, messages } = sessionWithBlock();
     session.lastMessages = messages;
     const before = session.state.blocks.map((b) => b.blockId);
     const dir = mkdtempSync(join(tmpdir(), "bili-hg-fail-"));
     const store = new SessionStore({ dir, enabled: true, debounceMs: 0 });
+    const originalSave = store.saveHistoryGenerations.bind(store);
     (store as unknown as { saveHistoryGenerations: () => boolean }).saveHistoryGenerations = () => false;
     _setStoreForTest(store);
     try {
@@ -279,7 +280,14 @@ test("a generation that cannot be persisted aborts the rebase and leaves live st
         assert.ok(session.state.blocks.some((b) => b.blockId === blockId && b.active), "the folded block is still active");
         const boundary = session.metadata.nativeCompactionBoundary as { archiveFailedAt?: number; pendingRebase?: boolean };
         assert.ok(boundary.archiveFailedAt, "the failure is recorded on the boundary");
-        assert.equal(boundary.pendingRebase, false);
+        assert.equal(boundary.pendingRebase, true, "the boundary stays pending so the next request retries");
+
+        // Persistence recovers: the next request's retry closes the generation and completes the rebase.
+        store.saveHistoryGenerations = originalSave;
+        const retried = reconcileNativeCompactionBoundary(session, { messages, cause: "codex-cloud-compaction" });
+        assert.equal(retried, true, "recovery on the next attempt completes the rebase");
+        assert.equal(historyGenerationsOf(session).length, 1, "the recovered attempt archives exactly one generation");
+        assert.equal(session.state.blocks.length, 0, "live state resets only once the archive is durable");
     } finally {
         _setStoreForTest(new SessionStore({ dir: process.env.BILI_SESSIONS_DIR, enabled: true, debounceMs: 0 }));
         rmSync(dir, { recursive: true, force: true });

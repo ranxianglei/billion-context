@@ -1967,15 +1967,18 @@ export function reconcileNativeCompactionBoundary(session: Session, opts: Native
     });
     // Availability over destruction: if this session HAD history and it could
     // not be closed into a durable generation, leave the live state intact and
-    // let the next request retry. Resetting anyway would delete the only copy.
+    // KEEP THE BOUNDARY PENDING so the next request retries the close. Resetting
+    // anyway would delete the only copy; consuming the boundary instead would
+    // strand this checkpoint forever — the dedupe record never re-fires the same
+    // id/seq, so a cleared boundary can only re-enter through the weaker text
+    // heuristics this mechanism exists to replace.
     if (!generation && (session.state.blocks.length > 0 || messagesBefore.length > 0)) {
         session.metadata.nativeCompactionBoundary = {
             ...(boundary as Record<string, unknown>),
-            pendingRebase: false,
             archiveFailedAt: Date.now(),
         };
         markDirty(session);
-        loggerLog("warn", `[${session.id}] native compaction boundary NOT rebased: history generation could not be persisted`);
+        loggerLog("warn", `[${session.id}] native compaction boundary NOT rebased yet: history generation could not be persisted; retrying on the next request`);
         return false;
     }
     resetSessionCompression(session);
