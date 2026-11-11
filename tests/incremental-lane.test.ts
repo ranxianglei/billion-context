@@ -46,7 +46,7 @@ interface Harness {
     close: () => Promise<void>;
 }
 
-async function harness(storageMode: "full" | "legacy", opts: { upstreamDelayMs?: number; upstreamStatus?: number; logEnabled?: boolean; debounceMs?: number } = {}): Promise<Harness> {
+async function harness(storageMode: "full" | "legacy", opts: { upstreamDelayMs?: number; upstreamStatus?: number; debounceMs?: number; logEnabled?: boolean } = {}): Promise<Harness> {
     const dir = mkdtempSync(join(testRoot, "run-"));
     for (const key of ["XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME"]) process.env[key] = dir;
     process.env.BILI_STORAGE_UNIFIED = storageMode === "full" ? "full" : "legacy";

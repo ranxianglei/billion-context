@@ -87,13 +87,13 @@ test("dshTimeContextPath: clock readings get a path OUTSIDE durable/* — anchor
     // A real human request that merely QUOTES the phrase mid-sentence must stay
     // unclassified (prefix-anchored match) — otherwise Rule 3 would strand it.
     const quote = { id: "t4", role: "user", contentType: "text", text: "Why does the log say \"Time sampled while preparing turn 3\" even though I asked nothing yet?" } as never;
-    assert.equal(dshTimeContextPath(reading), "injected/time-context");
+    assert.equal(dshTimeContextPath(reading), "oneshot/time-context");
     assert.equal(dshTimeContextPath(echo), undefined, "assistant echo is never a carrier (#2766)");
     assert.equal(dshTimeContextPath(unrelated), undefined);
     assert.equal(dshTimeContextPath(quote), undefined, "a real request quoting the phrase mid-sentence stays unclassified");
     // The dsh lane classifier resolves it end-to-end...
     const cl = durableMessageToolPaths["dsh"]!;
-    assert.equal(cl(reading), "injected/time-context");
+    assert.equal(cl(reading), "oneshot/time-context");
     // ...and the default durable policy pins nothing in the injected/
     // namespace (stays foldable; the path exists for the Rule-3 anchor skip).
     const out = withDurableProtection(defaultConfig(200_000), cl);

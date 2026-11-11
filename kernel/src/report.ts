@@ -5,7 +5,11 @@ import { countMessageTokens } from "./tokenize.js";
 import { segmentGroups } from "./segment.js";
 import { isLiveCheckpointCarrier } from "./state.js";
 import { computeProtectedRefs } from "./recommend.js";
-import { collectCoverage, projectUnit } from "./unit-projection.js";
+import {
+  buildProjectionShared,
+  collectCoverage,
+  projectUnit,
+} from "./unit-projection.js";
 import type { UnitProjection } from "./unit-projection.js";
 import type {
   CompressionBlock,
@@ -103,7 +107,11 @@ function collectVisible(
   }
   let summaryTokens = 0;
   for (const block of state.blocks) {
-    if (block.active) summaryTokens += summaryTokensOf(block, countTokens);
+    // #5765: retired summaries are not resident in the view — counting them
+    // here would report context mass that is no longer on the wire. Coverage
+    // above intentionally still includes retired blocks (their messages stay
+    // folded away until acp_restore or decompress).
+    if (block.active && !block.retired) summaryTokens += summaryTokensOf(block, countTokens);
   }
   const visible: VisibleMessageInfo[] = [];
   // Tool RESULTS carry no toolName of their own — resolve them through
@@ -201,6 +209,13 @@ export function buildStatusReport(
   const activeBlocks = state.blocks
     .filter((b) => b.active)
     .sort((a, b) => numericPart(a.blockId) - numericPart(b.blockId));
+  // #5765: retire splits the active set — retired blocks keep their coverage
+  // and decompress entry but leave the resident view, so the overview shows
+  // them in their own section instead of the COMPRESSED BLOCKS list. The
+  // compressed drilldown still lists them (marked) so a specific block can be
+  // inspected either way.
+  const residentBlocks = activeBlocks.filter((b) => !b.retired);
+  const retiredBlocks = activeBlocks.filter((b) => b.retired);
 
   if (scope === "compressed") {
     return renderCompressedDrilldown(
@@ -237,7 +252,8 @@ export function buildStatusReport(
   return renderOverview(
     visible,
     summaryTokens,
-    activeBlocks,
+    residentBlocks,
+    retiredBlocks,
     state,
     countTokens,
     limit,
@@ -261,6 +277,7 @@ function renderOverview(
   visible: VisibleMessageInfo[],
   summaryTokens: number,
   blocks: CompressionBlock[],
+  retiredBlocks: CompressionBlock[],
   state: CompressionState,
   countTokens: (t: string) => number,
   limit: number,
@@ -343,9 +360,40 @@ function renderOverview(
     }
   }
 
+  // #5765 retire: retired blocks live in their own section — out of the
+  // resident view but still restorable and decompressible.
+  if (retiredBlocks.length > 0) {
+    const freed = retiredBlocks.reduce(
+      (s, b) => s + summaryTokensOf(b, countTokens),
+      0,
+    );
+    lines.push("");
+    lines.push(
+      `RETIRED BLOCKS — ${retiredBlocks.length} out of the resident view (${formatTokens(freed)} summary kept off the wire)`,
+    );
+    const sorted = [...retiredBlocks].sort(
+      (a, b) => numericPart(a.blockId) - numericPart(b.blockId),
+    );
+    for (const block of sorted.slice(0, limit)) {
+      const topic = block.topic ?? "(no topic)";
+      lines.push(
+        `  ${block.blockId} (${tierLabel(block)})  ${formatTokens(summaryTokensOf(block, countTokens))} summary  ${block.effectiveMessageIds.length} msgs  "${topic}"`,
+      );
+    }
+    if (retiredBlocks.length > limit) {
+      lines.push(`  ... and ${retiredBlocks.length - limit} more retired blocks not shown`);
+    }
+    lines.push(
+      `  acp_restore({ blockId }) puts a block back into the view; decompress/search_context work on retired blocks as usual.`,
+    );
+  }
+
   lines.push("");
+  // #5555 audit: was leaking an internal function name + option keys;
+  // scope/view/tool are declared params on every wire now, so this hint is
+  // honest advice in the public contract.
   lines.push(
-    `Tip: buildStatusReport({scope:"uncompressed", view:"messages", tool:"${topTool ?? "bash"}"}) for per-message listing`,
+    `Tip: call again with scope:"uncompressed", view:"messages"${topTool ? `, tool:"${topTool}"` : ""} for a per-message listing`,
   );
   return lines.join("\n");
 }
@@ -431,6 +479,11 @@ function renderUncompressedRanges(
       config,
       countTokens,
     );
+    // #5337 option A: every displayed row runs projectUnit against this same
+    // (original, state, config) triple — share the per-pass O(n) derivations
+    // instead of re-scanning the whole history per row (status refresh on a
+    // long session).
+    const shared = buildProjectionShared(original, state, config);
     const splitDescOf = (p: UnitProjection): string => {
       const parts: string[] = [];
       if (p.splitTurnCount > 0) parts.push(`${p.splitTurnCount} turn(s)`);
@@ -449,6 +502,7 @@ function renderUncompressedRanges(
           endRef: r.endRef,
           preExistingCoverage: coverage,
           protectedMessageIds: protectedRefs,
+          shared,
         });
       } catch {
         return "\u26a0 not foldable: refs unresolvable";
@@ -565,8 +619,11 @@ function renderCompressedDrilldown(
         : "";
     const topic = block.topic ?? "(no topic)";
     const eff = effectiveCompressedTokens(block, state, countTokens);
+    // #5765: retired blocks stay listed (inspectable) but marked — their
+    // summary is out of the resident view until acp_restore.
+    const retiredMark = block.retired ? ", retired" : "";
     lines.push(
-      `  ${block.blockId} (${tierLabel(block)})  ${formatTokens(eff)}→${formatTokens(summaryTokensOf(block, countTokens))}  ${block.effectiveMessageIds.length} msgs  age=${block.survivedCount} ${block.generation}${nested}`,
+      `  ${block.blockId} (${tierLabel(block)}${retiredMark})  ${formatTokens(eff)}→${formatTokens(summaryTokensOf(block, countTokens))}  ${block.effectiveMessageIds.length} msgs  age=${block.survivedCount} ${block.generation}${nested}`,
     );
     lines.push(`    "${topic}"`);
   }
