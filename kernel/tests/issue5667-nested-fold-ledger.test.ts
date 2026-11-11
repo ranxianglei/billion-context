@@ -4,6 +4,7 @@ import { createCore } from "../src/compress.js";
 import { createInitialState } from "../src/state.js";
 import { assignRefs } from "../src/refs.js";
 import { defaultCountTokens } from "../src/tokenize.js";
+import { syncBlocks } from "../src/sync.js";
 import { blocksSpannedByRange } from "../src/block-map.js";
 import {
   buildCompressibleRanges,
@@ -112,9 +113,54 @@ test("A: nested fold stamps consumed children with the consumer's id", () => {
 
 test("A: non-consumptive deactivation leaves supersedesBlockId unset", () => {
   const state = createInitialState();
-  const orphan = makeBlock({ blockId: "b1", active: false });
-  state.blocks = [orphan];
-  assert.equal(orphan.supersedesBlockId, undefined);
+  // Orphan GC: the block's messages are absent from the resent view.
+  const orphan = makeBlock({
+    blockId: "b-orphan",
+    effectiveMessageIds: ["ghost-1"],
+  });
+  // Host expand: the block is present but explicitly expanded by the host.
+  const expanded = makeBlock({
+    blockId: "b-expanded",
+    expanded: true,
+    effectiveMessageIds: ["live-1"],
+  });
+  // Reconcile re-mark of an already-recorded lineage edge: the consumer lists
+  // the child in directBlockIds, sync re-marks it inactive without restamping.
+  const parent = makeBlock({
+    blockId: "b-parent",
+    directBlockIds: ["b-child"],
+    effectiveMessageIds: ["live-2"],
+  });
+  const child = makeBlock({ blockId: "b-child" });
+  state.blocks = [orphan, expanded, parent, child];
+  const result = syncBlocks([msg("live-1", "a"), msg("live-2", "b")], state);
+  const gotOrphan = result.state.blocks.find((b) => b.blockId === "b-orphan")!;
+  const gotExpanded = result.state.blocks.find((b) => b.blockId === "b-expanded")!;
+  const gotParent = result.state.blocks.find((b) => b.blockId === "b-parent")!;
+  const gotChild = result.state.blocks.find((b) => b.blockId === "b-child")!;
+  assert.equal(gotOrphan.active, false, "orphan GC must deactivate");
+  assert.ok(
+    result.deactivated.includes("b-orphan"),
+    "orphan GC must record the deactivation",
+  );
+  assert.equal(gotExpanded.active, false, "host-expanded stays inactive");
+  assert.equal(gotParent.active, true, "present consumer stays active");
+  assert.equal(gotChild.active, false, "reconcile keeps consumed child inactive");
+  assert.equal(
+    gotOrphan.supersedesBlockId,
+    undefined,
+    "orphan-GC death stamps no lineage",
+  );
+  assert.equal(
+    gotExpanded.supersedesBlockId,
+    undefined,
+    "host-expand death stamps no lineage",
+  );
+  assert.equal(
+    gotChild.supersedesBlockId,
+    undefined,
+    "reconcile re-mark does not backfill lineage",
+  );
 });
 
 // ─── Defect B: display-only annotation for a range spanning a folded block ────
