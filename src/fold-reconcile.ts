@@ -2393,17 +2393,24 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
         }
         if (Object.keys(nextStreaks).length > 0) {
             session.metadata[METADATA_ABSENT_STREAKS] = nextStreaks;
-            // Same majority test as the z-accrual below (non-reasoning ids
-            // only — sanctioned reasoning drops never read as loss), applied
-            // WITHOUT the e/z gates: in doubt, protect.
+            // Doctrine-aligned protection (#5715): a block is safe to shrink
+            // only when its non-reasoning covered ids form a STRICT surviving
+            // majority — presence counted over hard ids alone, so sanctioned
+            // reasoning survivors cannot inflate the numerator (excluded from
+            // both sides, exactly like the terminal-verdict base above), while
+            // claims still count as evidence like the z-accrual's p+r. Exactly
+            // half present is NOT a clear majority (#5715 strict boundary):
+            // such a block belongs to the escalation machinery, and shrinking
+            // its denominator would turn the episode into a clean pass that
+            // resets foldDriftStreak/foldDriftEscalated. In doubt, protect.
             const protectedIds = new Set<string>();
             for (const block of session.state.blocks as BlockLike[]) {
                 const ids = (block.effectiveMessageIds ?? []).filter((id) => !isResponsesTurnSeparatorId(id));
                 if (ids.length === 0) continue;
-                let pr = 0;
-                for (const id of ids) if (byId.has(id) || plan.claims.has(id)) pr++;
                 const hard = ids.filter((id) => anchors[id]?.c !== "reasoning");
-                if (hard.length > 0 && 2 * pr < hard.length) {
+                let prHard = 0;
+                for (const id of hard) if (byId.has(id) || plan.claims.has(id)) prHard++;
+                if (hard.length > 0 && 2 * prHard <= hard.length) {
                     for (const id of ids) protectedIds.add(id);
                 }
             }
