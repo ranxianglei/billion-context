@@ -1777,7 +1777,7 @@ export class MysqlBackend implements StorageBackend {
         const refsRows = await q("SELECT ord, raw_id, ref, ref_num FROM refs WHERE session_id = ? ORDER BY ord");
         const deadRefs = await q("SELECT ord, ref, ref_num, recorded_at FROM dead_refs WHERE session_id = ? ORDER BY ord");
         const ccr = await q("SELECT ord, ccr_key, content_hash FROM ccr_entries WHERE session_id = ? ORDER BY ord");
-        const ext = await q("SELECT ext_key AS `key`, value_json FROM session_ext WHERE session_id = ?");
+        const ext = await q("SELECT ext_key AS `key`, value_json, updated_at FROM session_ext WHERE session_id = ?");
         const checkpoints = await q("SELECT cp_id, seq_at, block_set_hash, kind, created_at, pinned, label, state_hash FROM checkpoints WHERE session_id = ?");
         const wanted = new Set<string>();
         for (const m of messages) wanted.add(str(m.content_hash));
@@ -1929,7 +1929,7 @@ export class MysqlBackend implements StorageBackend {
                 await c.query(
                     "INSERT INTO session_ext (session_id, ext_key, value_json, updated_at) VALUES (?, ?, ?, ?) " +
                         "ON DUPLICATE KEY UPDATE value_json = VALUES(value_json), updated_at = VALUES(updated_at)",
-                    [sessionId, x.key, x.value_json, Date.now()],
+                    [sessionId, x.key, x.value_json, typeof x.updated_at === "number" && Number.isFinite(x.updated_at) ? x.updated_at : Date.now()],
                 );
             }
             for (const cp of dump.checkpoints) {

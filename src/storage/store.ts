@@ -2080,7 +2080,7 @@ export class UnifiedStore {
         const refsRows = (this.db.prepare("SELECT ord, raw_id, ref, ref_num FROM refs WHERE session_id = ? ORDER BY ord").all(sessionId) as Record<string, unknown>[]);
         const deadRefs = (this.db.prepare("SELECT ord, ref, ref_num, recorded_at FROM dead_refs WHERE session_id = ? ORDER BY ord").all(sessionId) as Record<string, unknown>[]);
         const ccr = (this.db.prepare("SELECT ord, ccr_key, content_hash FROM ccr_entries WHERE session_id = ? ORDER BY ord").all(sessionId) as Record<string, unknown>[]);
-        const ext = (this.db.prepare("SELECT key, value_json FROM session_ext WHERE session_id = ?").all(sessionId) as Record<string, unknown>[]);
+        const ext = (this.db.prepare("SELECT key, value_json, updated_at FROM session_ext WHERE session_id = ?").all(sessionId) as Record<string, unknown>[]);
         const checkpoints = (this.db.prepare("SELECT cp_id, seq_at, block_set_hash, kind, created_at, pinned, label, state_hash FROM checkpoints WHERE session_id = ?").all(sessionId) as Record<string, unknown>[]);
         // --- collect the distinct CAS bodies referenced by those rows ---
         const wanted = new Set<string>();
@@ -2215,8 +2215,10 @@ export class UnifiedStore {
             for (const d of dump.deadRefs) insDead.run(sessionId, d.ord, d.ref, d.ref_num, d.recorded_at);
             const insCcr = this.db.prepare("INSERT INTO ccr_entries (session_id, ord, ccr_key, content_hash) VALUES (?, ?, ?, ?)");
             for (const e of dump.ccrEntries) insCcr.run(sessionId, e.ord, e.ccr_key, e.content_hash);
-            const insExt = this.db.prepare("INSERT INTO session_ext (session_id, key, value_json) VALUES (?, ?, ?)");
-            for (const x of dump.sessionExt) insExt.run(sessionId, x.key, x.value_json);
+            const insExt = this.db.prepare("INSERT INTO session_ext (session_id, key, value_json, updated_at) VALUES (?, ?, ?, ?)");
+            for (const x of dump.sessionExt) {
+                insExt.run(sessionId, x.key, x.value_json, typeof x.updated_at === "number" && Number.isFinite(x.updated_at) ? x.updated_at : Date.now());
+            }
             const insCp = this.db.prepare("INSERT INTO checkpoints (cp_id, session_id, seq_at, block_set_hash, kind, created_at, pinned, label, state_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(cp_id) DO NOTHING");
             for (const cp of dump.checkpoints) insCp.run(cp.cp_id, sessionId, cp.seq_at, cp.block_set_hash, cp.kind, cp.created_at, cp.pinned, cp.label ?? null, cp.state_hash);
             this.db
