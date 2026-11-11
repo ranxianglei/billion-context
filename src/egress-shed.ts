@@ -280,11 +280,6 @@ export async function shedWireImages(
     let est = originalBytes;
     let archived = 0;
     let downscaled = 0;
-    // Rung B's downscale pass decodes + re-encodes through jimp, so it stays capped at
-    // MAX_SHED_IMAGES to bound per-request CPU. Rung A (archiving, below) is a cheap string
-    // swap and must walk EVERY occurrence — see #5745.
-    const work = occurrences.slice(0, MAX_SHED_IMAGES);
-
     // Rung A: archive oldest non-protected images to placeholder notes until under target.
     // Walks every occurrence (not just the first MAX_SHED_IMAGES): archiving is a string swap,
     // so the jimp CPU bound does not apply here — capping it left any session with more than
@@ -304,12 +299,12 @@ export async function shedWireImages(
     // Rung B: downscale whatever still rides the wire (protected tail included) through
     // the dim ladder; stop as soon as the estimate fits.
     if (est > targetBytes) {
+        // Only live occurrences consume the decode/re-encode budget; archived
+        // prefixes must not keep the surviving protected tail out of the pass.
+        const work = occurrences.filter((o) => !o.archived).slice(0, MAX_SHED_IMAGES);
         outer: for (const dim of DOWNSCALE_DIM_LADDER) {
             for (const o of work) {
                 if (est <= targetBytes) break;
-                // an archived occurrence's part was already replaced by the note — shrinking
-                // it would write into a detached object and double-count savings in est
-                if (o.archived) continue;
                 const dims = decodeImageDims(o.b64);
                 if (dims !== undefined && Math.max(dims.w, dims.h) <= dim) continue;
                 const smaller = await shedDownscaleImage(o.mediaType, o.b64, dim);
