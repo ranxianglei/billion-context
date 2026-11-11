@@ -16,6 +16,10 @@ import type {
 
 const PROXY_TOOL_SET = new Set([
     "compress", "decompress", "search_context", "acp_status",
+    // #5765: function-only tools added after the original four must be listed
+    // here or their chunks raw-replay to the client as "real" calls. acp_cache
+    // had the same gap before this change.
+    "acp_retire", "acp_restore", "acp_rewrite", "acp_cache",
     "bili_compress", "bili_decompress", "bili_search_context", "bili_status",
 ]);
 
