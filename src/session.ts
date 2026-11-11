@@ -1807,7 +1807,7 @@ export const PRESERVED_SESSION_FIELDS = [
     "lockChain",
 ] as const satisfies readonly (keyof Session)[];
 
-export type ResetSurfaceField =
+type ResetSurfaceField =
     | (typeof RESET_SESSION_FIELDS)[number]
     | (typeof INTENTIONAL_WRITE_SESSION_FIELDS)[number]
     | (typeof PRESERVED_SESSION_FIELDS)[number];
@@ -1818,10 +1818,10 @@ export type ResetSurfaceField =
  * being classified, it surfaces here and the gate below fails the build,
  * naming exactly what to add to RESET / INTENTIONAL_WRITE / PRESERVED.
  */
-export type UncoveredSessionFields = Exclude<keyof Session, ResetSurfaceField>;
+type UncoveredSessionFields = Exclude<keyof Session, ResetSurfaceField>;
 
 type _RequireCompleteResetCoverage<T extends never> = T;
-export type _resetCoverageGate = _RequireCompleteResetCoverage<UncoveredSessionFields>;
+type _resetCoverageGate = _RequireCompleteResetCoverage<UncoveredSessionFields>;
 
 export function resetSessionCompression(session: Session): void {
     session.state = createInitialState();
