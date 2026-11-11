@@ -1848,13 +1848,13 @@ export class MysqlBackend implements StorageBackend {
             rawLines = readFileSync(exportPath, "utf8").split("\n");
             for (let i = 0; i < rawLines.length; i++) {
                 if (!rawLines[i].trim()) continue;
-                let candidate: { sessionId?: string };
+                let candidate: unknown;
                 try {
-                    candidate = JSON.parse(rawLines[i]) as { sessionId?: string };
+                    candidate = JSON.parse(rawLines[i]) as unknown;
                 } catch {
                     continue;
                 }
-                if (candidate.sessionId === sessionId) {
+                if (candidate && typeof candidate === "object" && "sessionId" in candidate && candidate.sessionId === sessionId) {
                     lineNo = i;
                     break;
                 }

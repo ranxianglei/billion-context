@@ -2134,13 +2134,13 @@ export class UnifiedStore {
             rawLines = readFileSync(exportPath, "utf8").split("\n");
             for (let i = 0; i < rawLines.length; i++) {
                 if (!rawLines[i].trim()) continue;
-                let candidate: { sessionId?: string };
+                let candidate: unknown;
                 try {
-                    candidate = JSON.parse(rawLines[i]) as { sessionId?: string };
+                    candidate = JSON.parse(rawLines[i]) as unknown;
                 } catch {
                     continue;
                 }
-                if (candidate.sessionId === sessionId) { lineNo = i; break; }
+                if (candidate && typeof candidate === "object" && "sessionId" in candidate && candidate.sessionId === sessionId) { lineNo = i; break; }
             }
         } catch {
             return { ok: false, reason: "export-corrupt" };
@@ -2271,9 +2271,9 @@ export class UnifiedStore {
         let lineNo = -1;
         for (let i = 0; i < rawLines.length; i++) {
             if (!rawLines[i].trim()) continue;
-            let head: { sessionId?: string; blockId?: string };
-            try { head = JSON.parse(rawLines[i]) as typeof head; } catch { continue; }
-            if (head.sessionId === sessionId && head.blockId === blockId) { lineNo = i; break; }
+            let head: unknown;
+            try { head = JSON.parse(rawLines[i]) as unknown; } catch { continue; }
+            if (head && typeof head === "object" && "sessionId" in head && "blockId" in head && head.sessionId === sessionId && head.blockId === blockId) { lineNo = i; break; }
         }
         if (lineNo === -1) return { ok: false, reason: "not-found" };
         let dump: { block: Record<string, unknown>; content: Record<string, string> };
