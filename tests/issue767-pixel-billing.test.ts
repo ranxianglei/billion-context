@@ -65,6 +65,20 @@ function bmpB64(w: number, h: number): string {
     return b.toString("base64");
 }
 
+function bmpCoreB64(w: number, h: number): string {
+    const stride = Math.ceil(w * 3 / 4) * 4;
+    const b = Buffer.alloc(26 + stride * h);
+    b.write("BM", 0, "ascii");
+    b.writeUInt32LE(b.length, 2);
+    b.writeUInt32LE(26, 10);
+    b.writeUInt32LE(12, 14);
+    b.writeUInt16LE(w, 18);
+    b.writeUInt16LE(h, 20);
+    b.writeUInt16LE(1, 22);
+    b.writeUInt16LE(24, 24);
+    return b.toString("base64");
+}
+
 function webpVp8B64(w: number, h: number): string {
     const b = Buffer.alloc(32);
     b.write("RIFF", 0, "ascii");
@@ -177,6 +191,30 @@ test("#767 unit: pixelTileEstimate matches the OpenAI high-detail tile model", (
     assert.equal(pixelTileEstimate(2048, 2048), 2805, "max-size square = 16 tiles (the ceiling)");
     assert.equal(pixelTileEstimate(3584, 1024), 1445, "long side capped at 2048 → 4×2 tiles");
     assert.equal(pixelTileEstimate(1000, 200), 765, "double scale: up short side, then cap long side");
+});
+
+test("BMP core headers use 16-bit dimensions without reading plane/depth fields as height", () => {
+    assert.deepEqual(decodeImageDims(bmpCoreB64(64, 128)), { w: 64, h: 128 });
+    assert.deepEqual(decodeImageDims(bmpCoreB64(1, 1)), { w: 1, h: 1 });
+});
+
+test("BMP core pixel billing uses the actual aspect ratio", () => {
+    const b64 = bmpCoreB64(64, 128);
+    const body = { messages: [{ role: "user", content: [{ type: "image_url", image_url: { url: `data:image/bmp;base64,${b64}` } }] }] };
+    assert.equal(imageTokensInParsedBody("openai", body, "pixels"), pixelTileEstimate(64, 128));
+});
+
+test("BMP info headers reject negative width while preserving top-down height", () => {
+    assert.equal(decodeImageDims(bmpB64(-640, 480)), undefined);
+    assert.deepEqual(decodeImageDims(bmpB64(640, -480)), { w: 640, h: 480 });
+});
+
+test("BMP headers with an unsupported layout or zero dimensions use the fallback", () => {
+    const unsupported = Buffer.from(bmpB64(640, 480), "base64");
+    unsupported.writeUInt32LE(13, 14);
+    assert.equal(decodeImageDims(unsupported.toString("base64")), undefined);
+    assert.equal(decodeImageDims(bmpCoreB64(0, 128)), undefined);
+    assert.equal(decodeImageDims(bmpCoreB64(64, 0)), undefined);
 });
 
 test("#767 unit: resolveImageBilling — explicit bytes wins, everything else resolves to pixels (#1843)", () => {

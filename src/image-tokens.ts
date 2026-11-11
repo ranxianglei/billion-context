@@ -85,7 +85,15 @@ function gifDims(b: Buffer): Dims | undefined {
 
 function bmpDims(b: Buffer): Dims | undefined {
     if (b.length < 26 || b[0] !== 0x42 || b[1] !== 0x4d) return undefined; // "BM"
-    const w = b.readUInt32LE(18), h = Math.abs(b.readInt32LE(22));
+    const headerSize = b.readUInt32LE(14);
+    // BITMAPCOREHEADER stores two WORD dimensions; BITMAPINFOHEADER and
+    // its extensions store two LONGs at different offsets.
+    if (headerSize === 12) {
+        const w = b.readUInt16LE(18), h = b.readUInt16LE(20);
+        return w > 0 && h > 0 ? { w, h } : undefined;
+    }
+    if (headerSize < 40) return undefined;
+    const w = b.readInt32LE(18), h = Math.abs(b.readInt32LE(22));
     return w > 0 && h > 0 ? { w, h } : undefined;
 }
 
