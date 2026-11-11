@@ -70,11 +70,11 @@ function bmpCoreB64(w: number, h: number): string {
     b.write("BM", 0, "ascii");
     b.writeUInt32LE(b.length, 2);
     b.writeUInt32LE(26, 10);
-    b.writeUInt16LE(12, 14); // bfSize (WORD)=12 → CORE
-    b.writeUInt16LE(w, 16);  // bfWidth
-    b.writeUInt16LE(h, 18);  // bfHeight
-    b.writeUInt16LE(1, 20);  // planes
-    b.writeUInt16LE(24, 22); // bit count
+    b.writeUInt32LE(12, 14);
+    b.writeUInt16LE(w, 18);
+    b.writeUInt16LE(h, 20);
+    b.writeUInt16LE(1, 22);
+    b.writeUInt16LE(24, 24);
     return b.toString("base64");
 }
 
@@ -169,6 +169,14 @@ test("#767 unit: pixelTileEstimate matches the OpenAI high-detail tile model", (
 test("BMP core headers use 16-bit dimensions without reading plane/depth fields as height", () => {
     assert.deepEqual(decodeImageDims(bmpCoreB64(64, 128)), { w: 64, h: 128 });
     assert.deepEqual(decodeImageDims(bmpCoreB64(1, 1)), { w: 1, h: 1 });
+});
+
+test("BMP core dimensions and billing match an independently encoded image", () => {
+    // ImageMagick 7.1.1-43: magick -size 1x2 xc:black BMP2:core.bmp
+    const b64 = "Qk0iAAAAAAAAABoAAAAMAAAAAQACAAEAGAAAAAAAAAAAAA==";
+    assert.deepEqual(decodeImageDims(b64), { w: 1, h: 2 });
+    const body = { messages: [{ role: "user", content: [{ type: "image_url", image_url: { url: `data:image/bmp;base64,${b64}` } }] }] };
+    assert.equal(imageTokensInParsedBody("openai", body, "pixels"), pixelTileEstimate(1, 2));
 });
 
 test("BMP core pixel billing uses the actual aspect ratio", () => {

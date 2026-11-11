@@ -85,13 +85,9 @@ function gifDims(b: Buffer): Dims | undefined {
 
 function bmpDims(b: Buffer): Dims | undefined {
     if (b.length < 26 || b[0] !== 0x42 || b[1] !== 0x4d) return undefined; // "BM"
-    // bfSize is a WORD (2 bytes): BITMAPCOREHEADER==12, every INFO/V2–V5 variant
-    // is >=40. Reading it as a WORD keeps the size field from fusing with the
-    // bfWidth that immediately follows at offset 16.
-    const headerSize = b.readUInt16LE(14);
+    const headerSize = b.readUInt32LE(14);
     if (headerSize === 12) {
-        // CORE: bfWidth@16 / bfHeight@18 (WORD each), then planes@20, bitcount@22.
-        const w = b.readUInt16LE(16), h = b.readUInt16LE(18);
+        const w = b.readUInt16LE(18), h = b.readUInt16LE(20);
         return w > 0 && h > 0 ? { w, h } : undefined;
     }
     if (headerSize < 40) return undefined;
