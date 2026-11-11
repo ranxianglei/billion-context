@@ -12,7 +12,7 @@
  * tests/issue3654-health-probe-three-state.test.ts,不在此重钉。
  */
 
-import { test, before, after } from "node:test";
+import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
