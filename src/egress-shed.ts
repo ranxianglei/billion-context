@@ -168,8 +168,9 @@ function collectOccurrences(protocol: WireProtocol, body: Part): Occurrence[] {
                 if (!isObj(part)) return;
                 const inline = part.inlineData;
                 if (!isObj(inline) || typeof inline.data !== "string" || inline.data.length === 0) return;
+                if (typeof inline.mimeType !== "string" || !/^image\//i.test(inline.mimeType)) return;
                 if (matchesOriginalImageReceipt(inline.data, parts)) return;
-                const mediaType = typeof inline.mimeType === "string" ? inline.mimeType : "image/png";
+                const mediaType = inline.mimeType;
                 occ.push({
                     entryIndex,
                     b64: inline.data,
