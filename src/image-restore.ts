@@ -155,20 +155,13 @@ export function messageImageBytes(m: CoreMessage): RestorableImage[] {
             }
             const fr = part.functionResponse;
             if (isObj(fr) && Array.isArray(fr.parts)) {
-                // Review ⑤: mirror the strip side's Gemini-3 $ref guard (from the
-                // removed kernel strip-images.ts; kept for parity) — when
-                // `response` points at a part via
-                // {"$ref": displayName} the bytes are not inline,
-                // so there is nothing to restore: skip indexing (harmless waste,
-                // not corruption).
-                const refGuarded = JSON.stringify(fr.response ?? null).includes('"$ref"');
-                if (!refGuarded) {
-                    for (const np of fr.parts) {
-                        if (!isObj(np)) continue;
-                        const ni = np.inlineData;
-                        if (isObj(ni) && typeof ni.data === "string" && typeof ni.mimeType === "string" && ni.mimeType.startsWith("image/")) {
-                            out.push({ mediaType: ni.mimeType, b64: ni.data, bytes: b64Bytes(ni.data) });
-                        }
+                // Gemini's $ref names an inlineData part in this same response:
+                // https://ai.google.dev/api/generate-content#FunctionResponse
+                for (const np of fr.parts) {
+                    if (!isObj(np)) continue;
+                    const ni = np.inlineData;
+                    if (isObj(ni) && typeof ni.data === "string" && typeof ni.mimeType === "string" && ni.mimeType.startsWith("image/")) {
+                        out.push({ mediaType: ni.mimeType, b64: ni.data, bytes: b64Bytes(ni.data) });
                     }
                 }
             }

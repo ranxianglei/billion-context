@@ -14,6 +14,7 @@ import {
     type RestorableImage,
 } from "../src/image-restore.ts";
 import { resolveDecompress, type ProxyToolCtx } from "../src/decompress-shared.ts";
+import { imagePlaceholdersForSummary } from "../src/image-note.ts";
 import type { WireProtocol } from "../src/util.js";
 
 // Isolate stateDir() (hence restoreExportDir()) under a throwaway dir before any
@@ -299,4 +300,30 @@ test("buildIncomingImageIndex: end-to-end nested tool_result recovery (anthropic
     assert.match(ref, /^m\d+$/);
     assert.ok(existsSync(imgs[0].path), "nested image spilled at index time");
     assert.deepEqual(readFileSync(imgs[0].path), Buffer.from(PNG, "base64"), "nested pixels round-trip");
+});
+
+test("buildIncomingImageIndex: Gemini $ref image notes resolve to their inline pixels", () => {
+    const body = { contents: [{ role: "user", parts: [{ functionResponse: {
+        name: "screenshot", response: { image_ref: { $ref: "capture.png" } },
+        parts: [{ inlineData: { mimeType: "image/png", displayName: "capture.png", data: PNG } }],
+    } }] }] };
+    const original = JSON.stringify(body);
+    const message = googleToCore(body).msgs[0];
+    const index = buildIndex("google", body);
+    assert.equal(index.size, 1);
+    const [ref, images] = [...index.entries()][0];
+    assert.deepEqual(imagePlaceholdersForSummary(message, ref), [`[image: png 1x1 · ${ref}]`]);
+    assert.match(resolveDecompress({ imageRef: ref }, ctxWith(index)).text, /Restored 1 image\(s\)/);
+    assert.deepEqual(readFileSync(images[0].path), Buffer.from(PNG, "base64"));
+    assert.equal(JSON.stringify(body), original, "indexing preserves the complete wire response");
+});
+
+test("buildIncomingImageIndex: a Gemini $ref without inline bytes adds no image", () => {
+    const body = { contents: [{ role: "user", parts: [{ functionResponse: {
+        name: "screenshot", response: { image_ref: { $ref: "capture.png" } },
+    } }] }] };
+    const message = googleToCore(body).msgs[0];
+    assert.deepEqual(messageImageBytes(message), []);
+    assert.deepEqual(imagePlaceholdersForSummary(message, "m00001"), []);
+    assert.equal(buildIndex("google", body).size, 0);
 });
