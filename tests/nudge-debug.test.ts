@@ -1,10 +1,13 @@
-// Nudge debug surface (gated by the existing debug switch — ACP_DEBUG / config
-// debug): the prepare stage must mirror the EXACT nudge wire text it injects
-// into the in-process bus (src/nudge-debug.ts); the pi lane turns each event
-// into a transcript-only CustomEntry (src/agent/pi.ts — CustomEntry never
-// enters LLM context). Gold assertion: the bus event text is BYTE-IDENTICAL
-// to the trailing user message content the proxy actually sent upstream — the
-// human in pi sees exactly what the model read, and nothing more.
+// Nudge debug surface (billion-context-pi issue #326 parity): the prepare
+// stage must mirror the EXACT nudge wire text it injects into the in-process
+// bus (src/nudge-debug.ts); the pi lane turns each event into ONE compact
+// `[ACP nudge] …` CustomEntry record line per user turn (ALWAYS on —
+// CustomEntry never enters LLM context, pi-visible / model-invisible,
+// persistent in the session file) and, with the debug switch on
+// (ACP_DEBUG / config `debug`), a transient verbatim terminal notification.
+// Gold assertion: the bus event text is BYTE-IDENTICAL to the trailing user
+// message content the proxy actually sent upstream — the human in pi sees
+// exactly what the model read, and nothing more.
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import http from "node:http";
@@ -20,7 +23,7 @@ import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
-import { emitNudgeInjected, onNudgeInjected, _resetNudgeDebugForTest, type NudgeDebugEvent } from "../src/nudge-debug.ts";
+import { emitNudgeInjected, onNudgeInjected, _resetNudgeDebugForTest, formatNudgeRecord, nudgeDebugMeta, nudgeTurnKey, type NudgeDebugEvent } from "../src/nudge-debug.ts";
 import { debugEnabled } from "../src/knobs.ts";
 import { createBiliPlugin } from "../src/agent/pi.ts";
 
@@ -37,7 +40,7 @@ test("nudge-debug bus: emit reaches subscribers; unsubscribe works; a throwing l
     const later = onNudgeInjected(() => {
         afterThrow = true;
     });
-    const ev: NudgeDebugEvent = { sessionId: "s1", protocol: "anthropic", kind: "advisory", tier: null, reason: "r", text: "T", ts: 1 };
+    const ev: NudgeDebugEvent = { sessionId: "s1", protocol: "anthropic", kind: "advisory", tier: null, reason: "r", pct: 92, emergency: false, topRange: null, turnKey: "42:123456", text: "T", ts: 1 };
     emitNudgeInjected(ev);
     assert.deepEqual(seen, [ev]);
     assert.ok(afterThrow, "a throwing listener must not break later subscribers");
@@ -80,16 +83,47 @@ test("debugEnabled: ACP_DEBUG env wins; file `debug` tier; default off; only the
     }
 });
 
+// ---------- record line + turn key (billion-context-pi #326 parity) ----------
+
+test("formatNudgeRecord: matches the pi-lane one-liner format", () => {
+    const base = { tier: 2, pct: 92, emergency: false, topRange: { startRef: "m00010", endRef: "m00030" } };
+    assert.equal(formatNudgeRecord(base), "[ACP nudge] 92% · T2 · top range m00010–m00030");
+    assert.equal(formatNudgeRecord({ ...base, emergency: true }), "[ACP nudge] EMERGENCY 92% · T2 · top range m00010–m00030");
+    assert.equal(formatNudgeRecord({ ...base, tier: null, topRange: null }), "[ACP nudge] 92% · T1");
+});
+
+test("nudgeTurnKey: identity of the last TEXT user message; tool-only tails do not move it", () => {
+    const u = { role: "user", content: "please fix the ledger bug" };
+    const a = { role: "assistant", content: "on it" };
+    const t1 = nudgeTurnKey([u, a]);
+    // anthropic wire: tool results come back as role:"user" with tool_result
+    // blocks (no text) — they must NOT change the key, or the per-turn record
+    // dedup could not collapse a turn's re-injections.
+    const toolResult = { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "ok" }] };
+    assert.equal(nudgeTurnKey([u, a, toolResult]), t1, "tool_result tail keeps the key");
+    assert.notEqual(nudgeTurnKey([{ role: "user", content: "a different ask" }]), t1, "different user message → different key");
+    assert.equal(nudgeTurnKey([a]), "0:0", "no user message at all");
+});
+
+test("nudgeDebugMeta: pct rounds, emergency flags, top range by tokens", () => {
+    const meta = nudgeDebugMeta(
+        { tier: 2, reason: "over-limit", contextUsage: 0.924, breakdown: { emergencyOverride: 0 }, compressibleRanges: [{ startRef: "m1", endRef: "m2", tokens: 400 }, { startRef: "m3", endRef: "m4", tokens: 900 }] },
+        [{ role: "user", content: "go" }],
+    );
+    assert.equal(meta.pct, 92);
+    assert.equal(meta.emergency, false);
+    assert.deepEqual(meta.topRange, { startRef: "m3", endRef: "m4" }, "largest range by tokens");
+    assert.equal(typeof meta.turnKey, "string");
+    const emergency = nudgeDebugMeta({ tier: 1, reason: "x", contextUsage: 0.98, breakdown: { emergencyOverride: 1 }, compressibleRanges: [] }, [{ role: "user", content: "go" }]);
+    assert.equal(emergency.emergency, true);
+    assert.equal(emergency.topRange, null, "no ranges → null");
+});
+
 // ---------- pi wiring gate (both directions, #3617 discipline) ----------
 
-test("pi wiring: the bili-nudge entry renderer registers iff the debug switch is on", () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "bili-nudge-gate-"));
-    const cfg = path.join(root, "config.jsonc");
+test("pi wiring: the acp-nudge entry renderer registers on every pi host (record lines are always on)", () => {
     const savedEnv = process.env.ACP_DEBUG;
-    const savedCfg = process.env.BILI_CONFIG_FILE;
     try {
-        fs.writeFileSync(cfg, "{}");
-        process.env.BILI_CONFIG_FILE = cfg;
         if (savedEnv !== undefined) process.env.ACP_DEBUG = savedEnv;
         else delete process.env.ACP_DEBUG;
         const makeStub = () => {
@@ -108,23 +142,22 @@ test("pi wiring: the bili-nudge entry renderer registers iff the debug switch is
                 getSessionName: () => "test",
             };
         };
-        const off = makeStub();
-        createBiliPlugin("pi")(off as never);
-        assert.ok(!off.entryTypes.includes("bili-nudge"), "off by default");
-        process.env.ACP_DEBUG = "0";
-        const offExplicit = makeStub();
-        createBiliPlugin("pi")(offExplicit as never);
-        assert.ok(!offExplicit.entryTypes.includes("bili-nudge"), "env '0' keeps it off");
-        process.env.ACP_DEBUG = "1";
+        // Always on now — the compact record line no longer rides the debug
+        // switch (billion-context-pi #326: one line per turn, persistent);
+        // the switch gates only the transient full-text terminal notify.
         const on = makeStub();
         createBiliPlugin("pi")(on as never);
-        assert.ok(on.entryTypes.includes("bili-nudge"), "registers when ACP_DEBUG=1");
+        assert.ok(on.entryTypes.includes("acp-nudge"), "registers on the pi host without any debug config");
+        process.env.ACP_DEBUG = "0";
+        const off = makeStub();
+        createBiliPlugin("pi")(off as never);
+        assert.ok(off.entryTypes.includes("acp-nudge"), "stays registered with the debug switch explicitly off");
+        const other = makeStub();
+        createBiliPlugin("omp")(other as never);
+        assert.ok(!other.entryTypes.includes("acp-nudge"), "pi lane only");
     } finally {
         if (savedEnv === undefined) delete process.env.ACP_DEBUG;
         else process.env.ACP_DEBUG = savedEnv;
-        if (savedCfg === undefined) delete process.env.BILI_CONFIG_FILE;
-        else process.env.BILI_CONFIG_FILE = savedCfg;
-        fs.rmSync(root, { recursive: true, force: true });
     }
 });
 
@@ -260,6 +293,9 @@ test("nudge-debug e2e (anthropic wire): bus event text is byte-identical to the 
         assert.equal(ev.protocol, "anthropic");
         assert.equal(ev.kind, "advisory", "no decide config in this harness → legacy advisory arm");
         assert.equal(ev.text.length > 0, true, "event carries the verbatim wire text");
+        assert.ok(ev.pct >= 0 && ev.pct <= 100, "record metadata: usage percent");
+        assert.equal(ev.emergency, false, "the over-limit band here is not the emergency arm");
+        assert.ok(typeof ev.turnKey === "string" && ev.turnKey.length > 0, "record metadata: turn key");
 
         const body = JSON.parse(h.captured[1]!) as { messages: Array<{ role: string; content: string | Array<{ type?: string; text?: string }> }> };
         const sent = ANTHROPIC_MESSAGES().length;
