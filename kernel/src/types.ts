@@ -93,6 +93,21 @@ export interface CompressionBlock {
    *  is likewise restored — instead of rejecting it as "already compressed".
    *  Optional: old persisted states lack the field, which reads as false. */
   restoredInline?: boolean;
+  /** #5765 retire: the user marked this block retired — its summary is no
+   *  longer injected into the resident view (prune skips its anchor) while its
+   *  folded messages stay covered and decompress/search keep working. The
+   *  block remains `active` (its absence from the view is intentional, so
+   *  syncBlocks must not deactivate it and orphan GC must not reap it).
+   *  acp_restore clears the flag. Optional: old persisted states lack the
+   *  field, which reads as false (never retired). */
+  retired?: boolean;
+  /** #5765 rewrite: the summary text immediately before the last acp_rewrite,
+   *  kept one step deep so a rewrite is roll-backable without re-compressing.
+   *  A further rewrite overwrites this slot (only the immediate predecessor
+   *  is retained by design). */
+  previousSummary?: string;
+  /** #5765 rewrite: Date.now() of the last acp_rewrite on this block. */
+  rewrittenAt?: number;
   durationMs?: number;
   compressCallId?: string;
   startRef?: string;
@@ -210,6 +225,14 @@ export interface AbsorbConfig {
   excludeTools: string[];
   /** #3402: when true, only image-bearing tool results are candidates, and they bypass minToolTokens. */
   mediaOnly?: boolean;
+}
+
+/** #5765: opt-in switch for the block-lifecycle tools (acp_retire /
+ *  acp_restore / acp_rewrite). Absent/disabled = off: the tools are not
+ *  advertised, not injected, not in the prompt, and a stray call gets a
+ *  "not enabled" receipt (host-side). */
+export interface BlockOpsConfig {
+  enabled: boolean;
 }
 
 /** Emitted when the session's irreducible floor (system prompt + block
@@ -633,31 +656,13 @@ export interface Config {
   modelContextLimit: number;
   /** Instant tool-result absorption (see absorb.ts). Absent/disabled = feature off. */
   absorb?: AbsorbConfig;
+  /** #5765: block-lifecycle tools (acp_retire/acp_restore/acp_rewrite).
+   *  Absent/disabled = feature off (default). */
+  blockOps?: BlockOpsConfig;
   /** Persistent acp_rule reminders (see rules.ts). Absent/disabled = feature off. */
   rules?: RulesConfig;
   /** Deterministic tool-result compression, tier 1 of the absorb gate (see crush.ts). Requires absorb enabled. */
   crush?: CrushConfig;
-  /** EXPERIMENTAL (default off): relocate still-visible compress carrier pairs
-   *  from their original tail-adjacent position to their own fold point —
-   *  "[folded/summary region] – [compress pair] – [protected messages]".
-   *  View-only + deterministic (see relocate-compress.ts): nothing is persisted,
-   *  refs are untouched, so the layout recomputes identically every turn. OFF
-   *  = byte-identical to before (the node fast-paths to the same array ref).
-   *  The round-2 re-render and the S4 plugin render mirror this transform host-side
-   *  with the same pure function so all lanes agree. */
-  compressAtFoldPoint?: boolean;
-  /** Second opt-in riding on compressAtFoldPoint: drop the contiguous `reasoning`
-   *  core run immediately preceding a moved pair — ONLY cores accepted by
-   *  reasoningDroppable. Default off; both flags must be set to drop anything. */
-  compressAtFoldPointClearThinking?: boolean;
-  /** Host predicate for the above drop: signed-thinking blocks and strict-echo
-   *  sessions must answer false (wire signatures live host-side, #1658/#684
-   *  doctrine). UNSET ⇒ no reasoning core is ever dropped, even with
-   *  compressAtFoldPointClearThinking set (conservative default). Must be pure
-   *  and cheap: runs once per candidate per pass. NOTE: function fields are not
-   *  carried into session effectiveConfig stamps (#2584) — wire paths re-resolve
-   *  it per request; panel/tool reads see it absent by design. */
-  reasoningDroppable?: (msg: CoreMessage) => boolean;
   /** Lossless content-cached retrieval for oversized tool results (see ccr.ts). Absent/disabled = feature off. */
   ccr?: CcrConfig;
   messageFilters?: import("./filter/types.js").MessageFiltersConfig;
