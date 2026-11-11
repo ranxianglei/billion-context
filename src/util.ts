@@ -495,6 +495,10 @@ function parseOverflowCounts(text: string): { total?: number; messages?: number;
     // messages, 256000 in the completion)."
     let m = text.match(/requested\s+(\d[\d,]*)\s*tokens?\s*\(\s*(\d[\d,]*)\s*in the messages,\s*(\d[\d,]*)\s*in the completion\s*\)/i);
     if (m) return { total: toTokenNumber(m[1]), messages: toTokenNumber(m[2]), completion: toTokenNumber(m[3]) };
+    // SGLang/LiteLLM: "requested a total of N tokens: M tokens from the
+    // input messages and C tokens for the completion".
+    m = text.match(/requested\s+a\s+total\s+of\s+(\d[\d,]*)\s*tokens?\s*:\s*(\d[\d,]*)\s*tokens?\s+from the input messages\s+and\s+(\d[\d,]*)\s*tokens?\s+for the completion\b/i);
+    if (m) return { total: toTokenNumber(m[1]), messages: toTokenNumber(m[2]), completion: toTokenNumber(m[3]) };
     // Anthropic: "prompt is too long: 130000 tokens > 128000 maximum" — the
     // first number IS the prompt (messages) size; no completion split stated.
     m = text.match(/prompt is too long:\s*(\d[\d,]*)\s*tokens?\s*>/i);
@@ -655,6 +659,21 @@ export function systemToUser<T extends { role: string }>(messages: T[], should?:
     );
 }
 
+// #5432: index of the first entry of the trailing run of role:"system" entries
+// (== length when nothing trails). Shared by every host path that mutates an
+// ALREADY assembled anthropic body: the kernel heal keeps a client's legal
+// trailing system run verbatim at array end, so any post-assembly user insert
+// must land BEFORE it or the request 400s ("role 'system' must precede an
+// 'assistant' message or end the array").
+export function trailingSystemRunStart(messages: readonly unknown[]): number {
+    let i = messages.length;
+    while (i > 0) {
+        const m = messages[i - 1];
+        if (!m || typeof m !== "object" || Array.isArray(m) || (m as Record<string, unknown>).role !== "system") break;
+        i--;
+    }
+    return i;
+}
 
 /** #719: Some OpenAI-compatible backends (DeepSeek) reject assistant messages
  * whose `content` is null — they require a string content (possibly "") or

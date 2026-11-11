@@ -10,7 +10,9 @@
 两条通道，同一个插件(#941):
 
 - **启动器:** `bili dsh` 经 `--patch` overlay(`~/.dsh-bili/.bili-acp.patch.yml`)注入完整原生插件 —— 每个 profile 启动即注册 bili 工具，模型请求盖 `x-bili-plugin` + dsh 会话 id(plugin 模式)，`/acp` 会话绑定。同一份 patch 同时禁用 dsh 原生自动压缩(宿主平面 `compaction-basic` → `auto: false`,web profile 的 preset 实例由 #3354 加载期 overlay 关闭);非 web profile 下手动 `/compact` 仍可用。
-- **Profile 安装(免启动器)——统一泳道(#966):** `bili plugin install dsh` 对每个已存在的 profile 执行 `dsh plugin --profile <name> add billion-context` —— pnpm 把包装进各 profile 自己的 `node_modules`,dsh 自动挂载包内 patch 层(`dsh.bundle.patch.yml`)。装哪个源取决于 bili 自身的安装形态(#925):npm 安装传注册表名,checkout/dev 构建传绝对路径(`link:` 依赖,本地改动实时生效)。旧版受管块(`# bili begin` / `# bili end`,#966 之前的安装所写)在安装与卸载时都会被剥离 —— 用户条目与注释保留,清空的文件还原占位 `[]`。先在每个 profile 里跑过一次 dsh 让目录存在。插件加载时自拉起代理(已有健康实例则附看，不重复拉;父进程 pid 看门狗)，经全局 fetch 补丁把模型流量改写为 `<proxy>/bili/<上游URL>`，原样注册清单工具，并按工具就绪门控 plugin 模式头(第一轮走 wire 模式)。退出开关:`BILI_NATIVE_DSH=0`。卸载:`bili plugin remove dsh` 或 `dsh plugin --profile <name> remove billion-context` —— 两者走同一通道。经注册表安装要求 npm 上已发布含 `dsh.bundle.patch.yml` 的版本;请装 npm 形态 —— 直接填 GitHub 地址装到的是没有 `dist/` 的源码(入口悬空、dsh 静默跳过该 bundle;安装期守卫现在会响亮失败并给出正确装法,#2471)。若 add 后 dsh 启动即报 `billion-context/dsh` 的 `ERR_MODULE_NOT_FOUND`,说明 profile 从陈旧的包元数据缓存里解析到了不含 bundle 子路径导出的旧版本(#953)——固定版本重装:`dsh plugin --profile <name> add billion-context@latest`。
+- **Profile 安装(免启动器)——统一泳道(#966):** `bili plugin install dsh` 对每个已存在的 profile 执行 `dsh plugin --profile <name> add billion-context` —— pnpm 把包装进各 profile 自己的 `node_modules`,dsh 自动挂载包内 patch 层(`dsh.bundle.patch.yml`)。装哪个源取决于 bili 自身的安装形态(#925):npm 安装传注册表名,checkout/dev 构建传绝对路径(`link:` 依赖,本地改动实时生效)。旧版受管块(`# bili begin` / `# bili end`,#966 之前的安装所写)在安装与卸载时都会被剥离 —— 用户条目与注释保留,清空的文件还原占位 `[]`。先在每个 profile 里跑过一次 dsh 让目录存在。插件加载时自拉起代理(已有健康实例则附看，不重复拉;父进程 pid 看门狗)，经全局 fetch 与 Codex Responses WebSocket 补丁把模型流量改写为 `<proxy>/bili/<上游URL>`(#5838),原样注册清单工具，并按工具就绪门控 plugin 模式头。WS 握手等待工具注册并携带 DSH 会话/模型头；每个 `response.create` 都等待归属判定与 fork 准备。缓存连接遇到身份/模型、插件激活代次或代理地址变化时拒绝发送，须重连(或由 provider 回退 SSE)，其他 WebSocket 不变。退出开关:`BILI_NATIVE_DSH=0`。卸载:`bili plugin remove dsh` 或 `dsh plugin --profile <name> remove billion-context` —— 两者走同一通道。经注册表安装要求 npm 上已发布含 `dsh.bundle.patch.yml` 的版本;请装 npm 形态 —— 直接填 GitHub 地址装到的是没有 `dist/` 的源码(入口悬空、dsh 静默跳过该 bundle;安装期守卫现在会响亮失败并给出正确装法,#2471)。若 add 后 dsh 启动即报 `billion-context/dsh` 的 `ERR_MODULE_NOT_FOUND`,说明 profile 从陈旧的包元数据缓存里解析到了不含 bundle 子路径导出的旧版本(#953)——固定版本重装:`dsh plugin --profile <name> add billion-context@latest`。
+- **Codex WebSocket 腿(#5838):** 内嵌 pi-ai 的 `openai-codex` provider 默认 `transport: auto`,优先走直连 WebSocket——成功的 WS 交换从不调用 fetch。WS 车道修复之前的构建因此完全看不到这些模型请求:ACP 工具 404、上下文到顶前没有任何压缩。在这类构建上把 DSH 现有的 `providers.openai-codex.transport` 设为 `sse`(热设置,无需新增 bili 配置),让流量改走 fetch 腿;自携带该修复的版本起,WebSocket 腿会被自动拦截并盖章路由。
+- **边界——第三方 Codex 传输:** 自建 Codex WebSocket 客户端的插件会按构造绕开 bili 的拦截。2026-11-08 实机发现的例子:`dsh-codex-subscription` 在 `connectionMode: websocket` 下直接 import `ws` 包,并把 `globalThis.WebSocket` 换成按主机的 Proxy,模型帧根本不经过全局 fetch/WS 补丁——代理零可见、ACP 工具 404、native compaction 又被门禁关闭,压缩路径全无(#5838 的第二来源)。在插件改为「无 CONNECT 代理需求时透传环境里的 `globalThis.WebSocket`」之前,请用 `connectionMode: sse`(插件默认值);bili 无法拦截宿主自有 profile bundle 里模块作用域的 `ws` import。
 - **桌面应用(Electron 宿主):** 同一插件也运行在 deepseek-harness **desktop** 应用内(经其应用内插件管理器安装)。此时 bootstrap 在应用进程内拉起代理:该进程的 `process.execPath` 是 Electron 二进制而非 Node,GUI 的 PATH 又不含常规安装目录 —— `resolveNodeRuntime`(#819/#1429)先探测众所周知的安装位置(`/opt/homebrew/bin`、`/usr/local/bin`、Volta 等),再回退到以纯 Node 方式运行应用自身二进制(`ELECTRON_RUN_AS_NODE=1`,强制注入子进程 env),于是无需 PATH 里有独立 Node 也能零配置压缩;设 `BILLION_CONTEXT_NODE` 可强制指定某个 Node(优先于两者)。#1429 之前该路径在 spawn 前抛错,所有会话静默降级为直连(不压缩),只能从 bili.log 里发现。
 - **自动更新保持各 profile 同步:** 刷新有两个触发器 —— 全局自更新完成后,以及**profile 自己的代理**在周期检查里发现注册表有新版本时(全局 bili 从不运行也一样刷新,#1196 —— 插件市场安装的用户往往根本没有全局安装)。两种触发器都扫描 `~/.dsh/profiles/*/package.json`,把注册表钉住的 `billion-context` 依赖刷新到目标版本(全局触发器刷到新全局版本,自触发刷到注册表最新),统一经 dsh 自己的 `plugin add` 通道,绝不在位覆盖 —— 加载的插件与代理从此不再漂移(#953);钉在本地源的 profile 不动。刷新是尽力而为,失败下个周期重试,绝不会让代理或更新本身失败。
 - **已报告:Profile 安装下部分传输零代理流量(#1158,调查中):** dsh `llm-pi-ai` 层的部分传输服务会话**从未有任何模型请求到达代理**(日志无 `processTurn`,调用 bili 工具返回 404 "no model request has arrived"),而同宿主的其他 provider 正常。根因仍在用运行时证据定性 —— 候选:传输层 fetch 形态(SDK 注入 fetch / 非全局 dispatcher)或宿主侧归属缺口导致流量未被 takeover gate 认领。检测:此类情况会打一次性 `[plugin] NO MODEL REQUESTS seen for conversation …` 告警,dsh 插件还会把归属 gate 放行的每个端点各记一条日志(每进程一次)。期间可靠规避:改用 `bili dsh` 启动 —— 启动器的 settings overlay 会把那些 provider 的 `baseURL` 重写为 `/bili/` URL,无论传输层使用哪种 fetch、归属状态如何,流量都必然过代理。
@@ -158,7 +160,7 @@ Codex Desktop 的 Composer 预测功能有一道**客户端资格门槛**,在任
 
 ## Pi(pi.dev coding agent)
 
-Pi 有完整原生模式(`bili plugin install pi`,README 快速上手方案 1);这一节只讲一行表格装不下的内容——**原生拦截实际覆盖哪些模型传输**。pi 是唯一把 WebSocket 模型流量带进环路的宿主。
+Pi 有完整原生模式(`bili plugin install pi`,README 快速上手方案 1);这一节只讲一行表格装不下的内容——**原生拦截实际覆盖哪些模型传输**。DSH 也拦截 Codex Responses WebSocket(#5838),其宿主专属生命周期见上文。
 
 **子代理配置(#2230)。** 内置 `acp_delegate` 面(三个 delegate 工具、角色、fleet 检查器——由 `bili pi` 经内嵌扩展接线)配置在 bili 自己的配置文件:`~/.config/billion-context/billion-context.json` 的 `pi.subagents` 段(布尔简写 `"pi": {"subagents": false}` 可整体关闭)。`~/.pi/acp.json` 的四键(`delegate` / `delegatePrompt` / `displayUsage` / `debug`)是已废弃的回退源——仅当段缺失时读取,段存在后完全忽略。完整字段表与 `PI_ACP_DELEGATE_*` 环境变量见 configuration.zh-CN.md 的 [`pi`](configuration.zh-CN.md#pi) 段。
 
@@ -249,11 +251,13 @@ pi-subagents(pi.dev 上的包)为前台/后台子代理运行派生**子会话**
 | **Void** | 自定义 OpenAI 兼容端点设置 |
 | **Cursor**(单模型通道) | Settings → Models → OpenAI API key → **Override Base URL** |
 | **Warp** | 自定义模型 base URL 设置 |
+| **Command Code**(`cmd`,commandcode.ai) | `~/.commandcode/providers.json` —— 各 provider(及模型级)`baseURL`(密钥在 `auth.json`,不在这个文件) |
 
 注意:
 
 - **Crush** 已有启动器车道——直接用 `bili crush`(配置零改动,HTTPS 域自动 MITM)。
 - **Zed** 也已有启动器车道——直接用 `bili zed`(Linux;配置零改动,模型域自动 MITM,环回 provider 保持直连)。上面的 settings.json `api_url` 路径仍是跨平台替代。
+- **Command Code**:上表一行覆盖其 BYOK 模型(标准 wire,今天就能压缩)。其目录/网关套餐走自定义 wire(`POST /alpha/generate`),逐字节中继不压缩——见[下文](#未识别的端点直连什么都不压缩1290)「未识别的端点直连、什么都不压缩」一节;可声明 wire 的修复追踪在 #1295。
 - **账号登录**型客户端(OAuth/订阅)通常焊死端点——前缀技巧不适用,改看[下方 MITM 节](#客户端用-httpproxyconnect接入但从不压缩)。
 - 纯 **web 应用**(只在浏览器里的产品)本地没有流量可截。
 - VS Code 扩展的 baseURL 字段在明文设置里,密钥在系统钥匙串——这里只需要改 baseURL。
@@ -284,7 +288,7 @@ bili 只压缩路径匹配已知 wire 协议(`/chat/completions`、`/llm_raw_cha
 
 ## OpenCode
 
-同一个内置插件同时服务两代 OpenCode:agent 文件同时保留 V1 `server()` 与 V2 `setup()` 导出 —— ≥ 1.18.29 的 1.x 宿主加载 V1 形状,2.x 宿主加载 V2 `setup()`。独立扩展 [`opencode-acp`](https://github.com/ranxianglei/opencode-acp) 仅支持 V1,在 2.x 下**不加载** —— 对 OpenCode 2.x,**billion-context 是推荐的上下文管理方案**。以下均在 `@opencode/cli` 2.0.3 上端到端验证过(V1 泳道:1.14.46 与 1.18.31)。
+同一个内置插件同时服务两代 OpenCode:agent 文件同时保留 V1 `server()` 与 V2 `setup()` 导出 —— ≥ 1.18.29 的 1.x 宿主加载 V1 形状,2.x 宿主加载 V2 `setup()`。独立扩展 [`opencode-acp`](https://github.com/ranxianglei/opencode-acp) 仅支持 V1,在 2.x 下**不加载** —— 对 OpenCode 2.x,**billion-context 是推荐的上下文管理方案**。以下均在 `@opencode/cli` 2.1.0 上端到端验证过(V1 泳道:1.14.46 与 1.18.31)。
 
 | 路径 | 命令 | 适用 |
 |---|---|---|
@@ -304,7 +308,7 @@ HTTPS 走证书 MITM,HTTP 走临时 `opencode.json` 副本(`/bili/` 改写;JSONC
 
 ### 原生(免启动器)—— `bili plugin install opencode`
 
-在真实 opencode 配置里注册一个自拉起插件并设 `compaction.auto: false`,之后直接跑 `opencode` 即可。默认不加 MCP 面(原生插件已提供会话绑定的 bili 工具);需要就传 `--with-mcp` —— 该条目不带 origin 钉扎,能扛过插件临时端口的代理重启(#926)。条目形态取决于**本 bili 自身的安装来源**:**npm 安装**写裸包名(`"plugin": ["billion-context"]`)—— 包经 `exports["./server"]` → `dist/agent/opencode-native.js` 暴露插件入口,opencode 用自己的 Npm.add 机制加载、自行管理安装与升级;零绝对路径、可跨机。(这个裸包名条目也可以不经 bili 直接手写进配置 —— 见 README 快速上手 方式 1。)**git checkout / 开发构建**回退到本机 shim 目录(`<configDir>/plugins/billion-context/index.js` → 该 checkout 的 `dist/agent/opencode-native.js`)—— 按构造即机器本地;之后改用 npm 安装再跑一次 install 会把条目迁回裸包名。
+在真实 opencode 配置里注册一个自拉起插件并设 `compaction.auto: false`,之后直接跑 `opencode` 即可。默认不加 MCP 面(原生插件已提供会话绑定的 bili 工具);需要就传 `--with-mcp` —— 该条目不带 origin 钉扎,能扛过插件临时端口的代理重启(#926)。条目形态取决于**宿主代次**和**本 bili 自身的安装来源**。**OpenCode 1.x + npm 安装**写裸包名(`"plugin": ["billion-context"]`)—— 包经 `exports["./server"]` → `dist/agent/opencode-native.js` 暴露插件入口,opencode 用自己的 Npm.add 机制加载、自行管理安装与升级;零绝对路径、可跨机。(这个裸包名条目也可以不经 bili 直接手写进配置 —— 见 README 快速上手 方式 1。)在 **OpenCode 2.x 宿主**上 —— 以及任何 **git checkout / 开发构建** —— 改写本机 shim 目录(`<configDir>/plugins/billion-context/index.js` → 本次安装的 `dist/agent/opencode-native.js`):2.x 按包的 `main` 字段(`dist/index.js`,是 CLI、没有插件定义)解析裸包名,所以裸包名在那里永远加载不出来(#3976);重跑 install(或重装到新路径)会重新生成指向当前根的 shim,2.x 配置里遗留的裸包名条目也会被自动迁移为 shim。
 
 加载时插件自拉起自己的代理(健康的已有实例直接复用不重复起;父进程 pid 看门狗在 opencode 退出时收掉它),把模型流量路由到 `<proxy>/bili/<upstream-url>`,暴露与启动器模式相同的原生 bili 工具 —— 无固定端口、无环境变量、免启动器。退出:`BILI_NATIVE_OPENCODE=0`。若没有任何代理能拉到健康状态,请求直连(不压缩)并给一次性告警,之后自动恢复。在 `bili opencode` 启动下该条目整体跳过(代理归启动器管)。
 

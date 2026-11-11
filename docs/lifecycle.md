@@ -54,8 +54,6 @@
 | `BILI_OPENCODE_INLINE` | #3278 opencode 移植（#4687） | opencode inline 模式（需手动开启，默认保持旧行为 spawn，owner 决定不改默认）：与 pi 同构——不起 proxy 进程，模型 URL 被 V2 route/intercept 改写成伪 origin 后由进程内引擎接住（bun 宿主已验：引擎 boot/dispatch 全绿）；`=1/on/yes/TRUE` 或 file 家 `"opencode": {"inline": true}` 显式开启（显式开启压过 attach 目标）；`bili opencode-inline` 一键车道 | 同 pi inline 车道节奏 | opt-in（不设置时 attach/spawn 行为与旧版完全一致） |
 | `BILI_INLINE_DEBUG` | #4669 | 仅 inline 车道：引擎 stderr 日志腿默认静默（stderr 是 pi 的交互终端，日志会挤掉输入框；默认只写 bili.log），设 1 恢复 stderr 输出用于排查 | 随 inline 车道（#3278）走 | 排查逃生口 |
 | 测试钩子：`BILI_DSH_RECOVERY_INTERVAL_MS` / `BILI_DSH_RETRY_INTERVAL_MS` / `BILI_MODEL_INFO_RETRY_MS` | #2082 等 | 缩短测试/运维节奏（dsh-native.ts；NODE_TEST_CONTEXT 感知，避免生产误缩） | 永久测试设施，随宿主代码走 | 测试钩子 |
-| `BILI_COMPRESS_AT_FOLD_POINT` | #5470 | compress-at-fold-point 实验性 opt-in（**默认关**；2026-11-01 真实模型验证通过，owner 决定保持 opt-in）：把重放视图中可见的 compress 调用对挪到它自己的折叠点（布局 [已折叠区]–[调用对]–[保护消息]），弱注意力模型不再把历史尾部的工具交换误读成新命令；纯视图变换，关时布局字节级不变；文件键 `compress.compressAtFoldPoint`；含 env-only opt-in 可达性修复（默认短路保持不变） | 更多真实模型积累后转正为默认开（走评审），或按废弃流程删除 | opt-in（默认关） |
-| `BILI_COMPRESS_AT_FOLD_POINT_CLEAR_THINKING` | #5470 | 依附上一开关：挪位瞬间清紧邻的未签名思考段（默认 off，A 关时无效）；strict-echo(#684) 或存在签名思考块(#1658)时整个机制不出手 | 同上 | opt-in（默认 off） |
 | `BILI_PF_RENDER_WINDOW` / `BILI_PF_RENDER_AUDIT_EVERY` | #5664 v6 render-snapshot plane | 实验性渲染快照车道可调项（默认 OFF，嵌套于 watermarkV6MsgId cohort）：W = 稳态轮回放的冻结核数（默认 8）；N = 计划全量审计节奏（默认 8）；读点 src/server/fastpath-v6-render.ts:50-60 | render 平面转正（rollout 100% 且审计计数归稳）后移 §2 常设面，或随车道退役删除 | opt-in（默认 OFF；仅由显式 rollout 开启） |
 | `BILI_IDENTITY_HARVEST` | #5825 / PR #5842 | 身份信道采集 kill/scope 开关（src/identity-harvest.ts）：缺省=OFF（接线以惰性状态出厂）；`1`/`all`=全部已登记来源；逗号列表=按 roster 名圈定；须与 rollout `pluginLaneServerHistory` 及仅回环来源同时放行才生效 | harvest 车道（claude-code/codebuddy/mcode）站稳后按 #2028 模式退役 env（转 file 键）或移 §2 | opt-in（默认 off；rollout 0% 起灰度） |
 
@@ -136,6 +134,7 @@
 | `BILI_SESSION_WARM_MAX_BYTES` | warm 解码字节上限，64 MiB（#2803） |
 | `BILI_PERSIST` | `=0` 关闭持久化（ephemeral/test） |
 | `BILI_PERSIST_DEBOUNCE_MS` | persist.debounceMs，500 |
+| `BILI_PERSIST_MAX_DELAY_MS` | persist.maxDelayMs，5000——持续写入时待落盘写入的等待上限（#6058） |
 | `BILI_PERSIST_EPERM_ALERT_THRESHOLD` / `BILI_PERSIST_EPERM_ALERT_REPEAT_MS` | EPERM 告警阈值 5 / 重复间隔 0（不限次） |
 | `BILI_PERSIST_TAIL_TOKENS` | persist.tailTokens，16384（0 禁用消息持久化，#401） |
 | `BILI_PERSIST_ZSTD` | `=1/true` 启用 zstd 压缩持久化（owner 决定 #1080，默认 off） |
@@ -156,6 +155,8 @@
 | `BILI_FAKE_BUF_CAP` | fake-completion 缓冲上限，16 MiB |
 | `BILI_CONFLICT_SCAN` | thirdparty-scan 冲突扫描开关 |
 | `BILI_INVARIANT_JUDGE` | diagnostics.invariantJudge，默认 on——I1/I2 出站不变量法官（L1 顾问：violation 只 warn、流量永不拦；`=0` 解除武装，#3938 decision ②） |
+| `BILI_LOG_RETENTION_HOURS` | diagnostics.logRetentionHours，默认 48（下限 1h）——私有 `bili.log` 的目标覆盖窗口：活动文件 10 MiB 封存为不可变、名字唯一的一代；字节预算永远优先，报告的覆盖是**实测跨度**且 `continuity` 恒为 `unknown`（不宣称未中断）；非法值回落到默认而非文件层（env 一旦设置即拥有开关） |
+| `BILI_LOG_BUDGET_BYTES` | diagnostics.logBudgetBytes，默认 268435456（256 MiB，下限 1 MiB）——活动日志 + 全部封存分代的硬总字节预算，超限按封存时间戳**最旧优先**整代删除；活动文件永不删除（单文件超预算只报告、不截断）；与 `BILI_LOG_RETENTION_HOURS` 冲突时预算赢 |
 
 ### 2.6 安全 / 运维通道
 
@@ -235,6 +236,7 @@
 
 ## 5. 卫生记录
 
+- **2026-11-10 compress-at-fold-point 整功能移除（owner 指令，#6132）**：实验性开关 `BILI_COMPRESS_AT_FOLD_POINT` / `BILI_COMPRESS_AT_FOLD_POINT_CLEAR_THINKING`（§1 两行）及文件键 `compress.compressAtFoldPoint` / `compress.compressAtFoldPointClearThinking` 整体删除（v1 #5471 + 未发布的 v2 #5949）。移除原因：9 天内在其目标模型家族上出现两次不同的真实事故——2026-11-08 v1 引发的自发重复压缩循环（#5949 现场报告）与 2026-11-10 v0.1.213（v1 语义）生产会话中的作者误认（模型把自己最后一句话当成用户消息，详见 #6132）。旧配置中残留的键会被一次性 INERT 警告（warnInertRemovedCompressKeys）并忽略值；博客文章按 owner 指令直接删除。
 - **2026-11-08 文档集中化（owner 指令 2026-11-08）**：14 个根级设计/配置文档一次性迁入 `docs/`（CONFIGURATION→`docs/configuration`、CLIENTS→`docs/clients`、TECHNICAL-NOTES→`docs/technical-notes`、MESSAGE-IDENTITY→`docs/message-identity`、SESSION-IDENTITY→`docs/session-identity`、PLUGIN→`docs/plugin-protocol`、LIFECYCLE→`docs/lifecycle`、UNIFIED_LOOP_SPEC→`docs/unified-loop-spec`、AUTO-MERGE-GUARDRAILS→`docs/auto-merge-guardrails`，含 zh-CN 对）；新 `docs/index.md` / `docs/index.zh-CN.md` 为文档总目录。原路径留单行重定向占位，**解除条件：1–2 个版本后且无外部链接反馈时删除占位**（届时同步删根级 stub）。CI `docs-sync` diff 路径与 `scripts/{config-surface-guard,lifecycle-ledger-guard}.mjs` 运行时路径、`package.json` files 数组已随迁。
 - **2026-10-15 远端分支卫生（#3249 执行）**：删除 origin 已合并远端分支 **1394 条**（1386 条 = 已合并 PR 的同仓 head 分支 + 8 条 = 完全并入 master 但无对应 PR 记录：`2026-08-08_release-v0.1.14`、`2026-09-26_opencode-zen-mitm`、`2026-09-30_responses-side-compaction`、`2026-10-04_plugin-fork-context-provenance`、`2026-10-13_lastmessages-tabling`、`chore/pages-enablement`、`fix/codex-custom-tool-call-text-protocol`、`revert-3189-pages-enablement`）。删除前核对：与 open PR head 交集为空。删除后 origin 剩 361 个 head（其中 128 条为 open PR 分支、201 条 closed-unmerged 且未并入 master、30 条无 PR 未并入 = 废弃工作，均不动）。另执行一次 `git worktree prune` 清掉失效 worktree 登记。
 - **2026-10-20 台账补登（本 PR）**：#3249 落地本台账时 `src/` 实际读取数已比登记数多 22（#3955 mysql、guardrails、#3128 网络预算、#3400 图像缩放、#3619 错峰、#3733 dsh compaction、#3756 snapshot shadow 等），守卫上线即全线红（master run 均被后续 push 取消所以未暴露）。本次 22 条全部补登（3 条 §1 + 19 条 §2）。

@@ -1,6 +1,6 @@
 # Documentation Index
 
-> All system documentation lives under `docs/`. The repo root keeps only four entry files: `README.md`, `README.zh-CN.md`, `AGENTS.md`, `CHANGELOG.md`. Former root doc paths keep one-line redirect stubs (scheduled for removal after 1–2 releases; tracked in [lifecycle §5](lifecycle.md#5-卫生记录)).
+> All system documentation lives under `docs/`. The repo root keeps only four **core** entry files — `README.md`, `README.zh-CN.md`, `AGENTS.md`, `CHANGELOG.md` — and recognized community-maintained README translations (`README.<locale>.md`, e.g. `README.ja.md`, approved 2026-11-09, #6000). Former root doc paths keep one-line redirect stubs (scheduled for removal after 1–2 releases; tracked in [lifecycle §5](lifecycle.md#5-卫生记录)).
 > Lazy-load procedures (architecture / env-vars / testing / release / git-pr): [reference/](../reference/README.md).
 
 ## Start here
@@ -25,6 +25,7 @@
 | [msgid-infrastructure](msgid-infrastructure.md) / [中文](msgid-infrastructure.zh-CN.md) | Where sessionid+msgid is produced, validated (six copies), pinned, and consumed |
 | [opencode-responses-websocket](opencode-responses-websocket.md) / [中文](opencode-responses-websocket.zh-CN.md) | OpenCode V2 Responses-over-WebSocket integration (#1844) |
 | [plugin-protocol](plugin-protocol.md) | Cooperative plugin protocol v2 (experimental) |
+| [wire-contracts](wire-contracts.md) / [中文](wire-contracts.zh-CN.md) | WC ledger: permanent upstream wire constraints behind the declared custom-wire endpoints (#1295); entries are never deleted, only superseded |
 
 ## Engineering & operations
 
