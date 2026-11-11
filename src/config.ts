@@ -669,27 +669,6 @@ export type CompressSettings = {
      *  Real edits never match (normalized text differs) and honestly
      *  re-enter the wire unfolded, exactly as before. */
     reconcile?: "off" | "warn" | "repair";
-    /** EXPERIMENTAL view transform A (default OFF): move a still-visible
-     *  compress call/result pair from its original tail-adjacent position to
-     *  its own fold point, so resent history ends "[folded region] – [pair] –
-     *  [protected messages]" instead of a tool exchange at the very end (which
-     *  weak-attention models read as a fresh command). Purely view-side — refs
-     *  and state are untouched; identical layout is recomputed every turn.
-     *  Env BILI_COMPRESS_AT_FOLD_POINT wins over every level;
-     *  applyCompressSettings resolves it per request. Maps to kernel
-     *  Config.compressAtFoldPoint (acp-kernel >= 0.0.177; v2 semantics since
-     *  0.0.188 — summary text relocated to the fold point, pair kept in slot
-     *  with pointer args). */
-    compressAtFoldPoint?: boolean;
-    /** Second opt-in riding on compressAtFoldPoint (default OFF): also drop
-     *  the contiguous run of UNSIGNED reasoning cores immediately preceding a
-     *  relocated pair at the moment of repositioning (the turn's think about
-     *  the fold itself). Both switches must be set for anything to be dropped,
-     *  and the host additionally refuses any core carrying a wire signature or
-     *  running under strict reasoning-echo (#1658/#684 doctrine). Env
-     *  BILI_COMPRESS_AT_FOLD_POINT_CLEAR_THINKING wins over every level.
-     *  Maps to kernel Config.compressAtFoldPointClearThinking. */
-    compressAtFoldPointClearThinking?: boolean;
 };
 /** #5079: governs every prompt_cache_key BILI ITSELF writes to an egress body
  *  (chat-wire conversation-id stamping, Responses-wire identity injection).
@@ -2584,8 +2563,6 @@ const COMPRESS_SETTING_FIELDS = new Set([
     "reconcile", "streamSummary", "externalSummary",
     // #3635: summary-length caps — previously accepted nowhere, silently dropped.
     "maxSummaryLength", "minSummaryLength",
-    // Experimental fold-point carrier relocation switches (view-only).
-    "compressAtFoldPoint", "compressAtFoldPointClearThinking",
 ]);
 
 // Deduped per unique key set per process (same pattern as
@@ -2596,7 +2573,11 @@ const seenUnknownTopLevelKeySignatures = new Set<string>();
 export function warnUnknownTopLevelKeys(obj: Record<string, unknown>): void {
     // #3651: the removed top-level allowDshCompaction key gets its own deprecation
     // note (warnRemovedDshAllowKey) — exclude it here so it isn't named twice.
-    const unknown = Object.keys(obj).filter((key) => !KNOWN_TOP_LEVEL_KEYS.has(key) && key !== "allowDshCompaction");
+    // #6132: the experimental fold-point relocation keys were REMOVED entirely
+    // (v1 #5471 + unreleased v2 #5949) — they parse nowhere and are inert at
+    // every level. Named here (not in the generic unknown-key warning) with
+    // the removal reason, like allowDshCompaction (#3651).
+    const unknown = Object.keys(obj).filter((key) => !KNOWN_TOP_LEVEL_KEYS.has(key) && key !== "allowDshCompaction" && !(INERT_REMOVED_COMPRESS_KEYS as readonly string[]).includes(key));
     if (unknown.length === 0) return;
     const signature = [...unknown].sort().join("\u0000");
     if (seenUnknownTopLevelKeySignatures.has(signature)) return;
@@ -2824,7 +2805,15 @@ let seenInertStripImagesSignature = "";
 // EVERY compress level it can appear (global / provider / model). (`absorb` was
 // removed by #3293 but REVIVED by #3402/#3422 — it parses again and is NOT inert.)
 // Dedup by dead-key path signature (#1815 style): re-warn when the set changes.
-const INERT_REMOVED_COMPRESS_KEYS = ["imageCompression"] as const;
+// #6132 + #3266: removed `compress.*` keys that may still sit in old configs.
+// They parse nowhere and do nothing at any level — named once per distinct
+// shape (deduped like warnUnknownTopLevelKeys) with the removal reason.
+const INERT_REMOVED_COMPRESS_KEYS = ["imageCompression", "compressAtFoldPoint", "compressAtFoldPointClearThinking"] as const;
+const INERT_REMOVED_COMPRESS_KEY_REASON: Record<(typeof INERT_REMOVED_COMPRESS_KEYS)[number], string> = {
+    imageCompression: "compress.imageCompression was removed and no longer does anything at any level (image pre-compression + image_full restore channel, #3266); images pass through byte-identical",
+    compressAtFoldPoint: "compress.compressAtFoldPoint (the experimental fold-point relocation, #5470) was removed in #6132 — the resent layout is the long-standing baseline and the flag no longer changes anything",
+    compressAtFoldPointClearThinking: "compress.compressAtFoldPointClearThinking (the companion opt-in of the removed fold-point relocation) was removed in #6132",
+};
 let seenInertRemovedCompressKeysSignature = "";
 function warnInertRemovedCompressKeys(obj: Record<string, unknown>): void {
     const hits: string[] = [];
@@ -2834,6 +2823,9 @@ function warnInertRemovedCompressKeys(obj: Record<string, unknown>): void {
             if ((block as Record<string, unknown>)[key] !== undefined) hits.push(`${pathPrefix}.${key}`);
         }
     };
+    for (const key of INERT_REMOVED_COMPRESS_KEYS) {
+        if (obj[key] !== undefined) hits.push(`top-level ${key}`);
+    }
     scanBlock(obj.compress, "compress");
     const providers = obj.providers;
     if (providers && typeof providers === "object" && !Array.isArray(providers)) {
@@ -2854,7 +2846,11 @@ function warnInertRemovedCompressKeys(obj: Record<string, unknown>): void {
     const sig = hits.join(",");
     if (sig === "" || sig === seenInertRemovedCompressKeysSignature) return;
     seenInertRemovedCompressKeysSignature = sig;
-    loggerLog("warn", `[acp-config] ${hits.join(", ")} is INERT — compress.imageCompression was removed and no longer does anything at any level (image pre-compression + image_full restore channel, #3266). Remove it from the config; images pass through byte-identical.`);
+    const reasons = [...new Set(hits.map((h) => {
+        const key = h.split(".").pop();
+        return INERT_REMOVED_COMPRESS_KEY_REASON[key as keyof typeof INERT_REMOVED_COMPRESS_KEY_REASON] ?? `${h} was removed and is ignored`;
+    }))];
+    loggerLog("warn", `[acp-config] ${hits.join(", ")} is INERT — ${reasons.join("; ")}. Remove it from your config to silence this.`);
 }
 
 function warnInertResignPassthrough(obj: Record<string, unknown>): void {
@@ -3332,17 +3328,6 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
     if ("nudgeModelDecided" in obj) {
         if (typeof obj.nudgeModelDecided !== "boolean") ok = false;
         else out.nudgeModelDecided = obj.nudgeModelDecided;
-    }
-    // Experimental fold-point relocation pair (see CompressSettings docs): plain
-    // booleans; absent = off. Without this, file-tier/panel values are silently
-    // dropped by the parser while env resolution still honors them.
-    for (const key of ["compressAtFoldPoint", "compressAtFoldPointClearThinking"] as const) {
-        if (!(key in obj)) continue;
-        if (typeof obj[key] !== "boolean") {
-            ok = false;
-            continue;
-        }
-        out[key] = obj[key];
     }
     // #5683: unprompted/out-of-bounds compression policy gates — plain booleans,
     // off unless explicitly set (an explicit false at a deeper level disables).
