@@ -2201,7 +2201,8 @@ export class SessionStore {
             // ghosts have no rows; the tail re-based at seq 0) would let the
             // stamp evict the ghost bindings onto fresh numbers and re-target
             // saved citations at newer bodies. Incomplete → keep legacy refs
-            // (JSON-load parity); a later cold load retries once rows exist.
+            // (JSON-load parity); #5608-D: the next post-fold save boundary
+            // retries once rows exist (cold loads no longer attempt alignment).
             // Query failure fails safe to skip: never restamp on uncertain input.
             const mapped = Object.keys(state.messageRefs.byRaw).filter((id) => state.messageRefs.byRaw[id] !== "BLOCKED");
             const backed = this.unifiedBackedMsgIds(session.id, mapped);
