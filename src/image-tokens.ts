@@ -370,18 +370,19 @@ export function imageTokensInParsedBody(protocol: "anthropic" | "openai" | "resp
 }
 
 // Cheap gate: most bodies carry no images — skip the JSON parse entirely then.
-// prepared.body is bili's own compact JSON.stringify, but client raw buffers
-// may carry spaces, so probe both forms.
+// prepared.body is compact JSON.stringify; client buffers may use any JSON
+// whitespace or escape field names and discriminators with Unicode escapes.
 function bodyHasImagesProbe(protocol: "anthropic" | "openai" | "responses" | "google", s: string): boolean {
+    if (s.includes("\\u")) return true;
     // #3398: custom-shape media carries no recognizable literal — on the
     // wires where content arrays are the multi-part marker (openai/responses)
     // the array form itself is the gate; anthropic adds its two opaque block
     // types. Array-content bodies are the minority case on these wires, so the
     // extra parses stay rare (#2824's 170ms/32MiB worst case is unchanged).
     return protocol === "google" ? s.includes("inlineData") || s.includes("fileData")
-        : protocol === "responses" ? s.includes("input_image") || s.includes('"content":[') || s.includes('"content": [')
-        : protocol === "openai" ? s.includes("image_url") || s.includes('"type":"file"') || s.includes('"type": "file"') || s.includes('"content":[') || s.includes('"content": [')
-        : s.includes('"type":"image"') || s.includes('"type": "image"') || s.includes('"type":"redacted_thinking"') || s.includes('"type":"document"');
+        : protocol === "responses" ? s.includes("input_image") || /"content"[ \t\r\n]*:[ \t\r\n]*\[/.test(s)
+        : protocol === "openai" ? s.includes("image_url") || /"type"[ \t\r\n]*:[ \t\r\n]*"file"/.test(s) || /"content"[ \t\r\n]*:[ \t\r\n]*\[/.test(s)
+        : /"type"[ \t\r\n]*:[ \t\r\n]*"(?:image|redacted_thinking|document)"/.test(s);
 }
 
 export function imageTokensInRawBody(protocol: "anthropic" | "openai" | "responses" | "google", raw: string | Buffer, billing: ResolvedImageBilling = "bytes", configuredCap?: number): number {
