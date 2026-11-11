@@ -35,26 +35,38 @@ function mkSession(): Session {
 const NUDGE_ROUND = { pluginHeaderPresent: false, biliToolsDeclared: true, nudgeActive: true, biliToolUses: 0, degradeAvailable: true };
 const PLAIN_ROUND = { ...NUDGE_ROUND, nudgeActive: false };
 
+// The field symptom is the ARMING EVENT (the "nudge idle" warn line in the
+// #4578 log), not the end state: under the old gate the 5th injected round
+// armed AND the following evidence round lifted it inside the same cycle, so
+// end-state asserts alone pass under both old and new code.
+const NEVER_ARMED = "no false 'nudge idle' arming across five obeyed cycles";
+
 test("unit: #4578 a fold landing in a non-nudge round resets the idle streak — obeyed nudges never arm", () => {
     const s = mkSession();
+    const logs: string[] = [];
+    const log = (l: string, m: string) => logs.push(`${l}:${m}`);
     for (let i = 0; i < SELF_HEAL_WINDOW; i++) {
         // Injected nudge, then the model obeys and folds: the new block is
         // first seen by the very next ordinary round (nudgeActive=false).
-        evaluateSelfHealRound(s, NUDGE_ROUND, noop);
+        evaluateSelfHealRound(s, NUDGE_ROUND, log);
         s.state.nextBlockId += 1;
-        evaluateSelfHealRound(s, PLAIN_ROUND, noop);
+        evaluateSelfHealRound(s, PLAIN_ROUND, log);
         assert.equal(nudgeSuppressed(s), false, `cycle ${i + 1}: an intervening compression is not an ignored nudge`);
         assert.equal(pluginLaneDegraded(s), false, `cycle ${i + 1}: no degrade either`);
     }
+    assert.ok(!logs.some((x) => x.includes("nudge idle")), NEVER_ARMED);
 });
 
 test("unit: #4578 a visible bili tool use seen on a non-nudge round also resets the idle streak", () => {
     const s = mkSession();
+    const logs: string[] = [];
+    const log = (l: string, m: string) => logs.push(`${l}:${m}`);
     for (let i = 0; i < SELF_HEAL_WINDOW; i++) {
-        evaluateSelfHealRound(s, NUDGE_ROUND, noop);
-        evaluateSelfHealRound(s, { ...PLAIN_ROUND, biliToolUses: 1 }, noop);
+        evaluateSelfHealRound(s, NUDGE_ROUND, log);
+        evaluateSelfHealRound(s, { ...PLAIN_ROUND, biliToolUses: 1 }, log);
         assert.equal(nudgeSuppressed(s), false, `cycle ${i + 1}: tool use is engagement evidence wherever observed`);
     }
+    assert.ok(!logs.some((x) => x.includes("nudge idle")), NEVER_ARMED);
 });
 
 test("unit: #4578 non-nudge rounds without evidence are neutral — they neither reset nor earn credit", () => {
