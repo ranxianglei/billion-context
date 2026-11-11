@@ -7,7 +7,7 @@ import type { ProxyOptions } from "../config.js";
 import { effectivePromptCacheRouting } from "../config.js";
 import { currentCalibrationFactor, hardenOpenaiAssistantContent, systemToUser } from "../util.js";
 import { conversationHeaderSource, resolveRelayAffinityPck } from "../session-id.js";
-import { MSG_IDS_BODY_FIELD, applyMsgIdPin, validateMsgIds } from "../msgid-pin.js";
+import { MSG_IDS_BODY_FIELD, MSG_SEQS_BODY_FIELD, applyMsgIdPin, applyMsgSeqStamps, incomingSeqsOf, validateMsgIds, validateMsgSeqs } from "../msgid-pin.js";
 import { pluginAgentHeader } from "../plugin.js";
 import { applyReasoningDrop, diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, planReasoningDrop, reapOrphansLogged, resolveKnownOutputCeiling, runNudgeDecision, stripKernelSummaries, warnDroppedOpenaiParts, warnReasoningPairs, type Prepared } from "../server.js";
 import { recordNudgeObservation } from "../context-analysis.js";
@@ -41,7 +41,10 @@ import { isStrictReasoningEcho, modelIdOf, normalizeStrictEchoReasoning } from "
 import { reconcileSystemAnchor } from "../system-anchor.js";
 import { logRawStripCounts, markerArtifactCount, stripRawStage, type RawStripCounts } from "../marker/engine.js";
 import { imageRescaleMaxDim, renderNone as knobRenderNone } from "../knobs.js";
-import { SessionStore } from "../persist.js";
+import { SessionStore, getStore } from "../persist.js";
+import { FoundationRejectError, r3FaultTracker } from "../snapshot/plane.js";
+import { assembleKernelInput, shouldResync } from "../snapshot/assemble.js";
+import { ANCHOR_ID_PREFIX } from "../storage/snap.js";
 import { applyImageRescalePass } from "../image-rescale.js";
 import { clampOutgoingOutput, countSystemAndToolsTokens, dshLedgerFloorTokens, emergencyNudge, emergencyNudgeArmed } from "./budget.js";
 import { effectiveAbsorbBlock, effectiveBlockOpsEnabled } from "./prepare-responses.js";
@@ -78,6 +81,13 @@ export async function prepareOpenai(
     // host body stamps (pi incremental lane) or the #5825 handle-seam
     // re-stamp of stamped-header/harvested ids.
     const incomingMsgIds = (parsed as Record<string, unknown>)[MSG_IDS_BODY_FIELD];
+    // #5874 2×2: the seqs carrier (biliLedgerSeqs) — the M2 incremental
+    // join evidence. An optimization channel, not an identity channel:
+    // malformed/absent → the M2 fast path is disabled (the full-resend
+    // matchWorld path still works); it never 400s. (Stamped once msgs
+    // exists, below.)
+    const incomingSeqsRaw = incomingSeqsOf(parsed);
+    delete parsed[MSG_SEQS_BODY_FIELD];
     delete (parsed as Record<string, unknown>)[MSG_IDS_BODY_FIELD];
     // Real wire element count; a watermark hit overrides it with the measured
     // total T (see the #5403/#5418 block below).
@@ -172,6 +182,14 @@ export async function prepareOpenai(
         // otherwise the proxy would forward payloads without any system.
         const converted = wpHit !== undefined ? { msgs: wpHit.view, systemText: wpHit.systemText } : openaiToCore(parsed);
         let msgs = converted.msgs;
+        // #5874 2×2: stamp the M2 seqs carrier onto the converted array
+        // (parallel to messages; malformed/absent → null → M2 fast path
+        // disabled, the full-resend path still works).
+        const incomingSeqs: number[] | null =
+            incomingSeqsRaw !== undefined && incomingSeqsRaw.length === msgs.length && validateMsgSeqs(incomingSeqsRaw, msgs.length).ok
+                ? incomingSeqsRaw
+                : null;
+        if (incomingSeqs !== null) applyMsgSeqStamps(msgs, incomingSeqs);
         let systemText = converted.systemText;
         openaiSystemText = systemText;
         wpSeedSystemText = systemText;
@@ -193,12 +211,35 @@ export async function prepareOpenai(
         // materialized, and the decoded tail window is SHORTER than the
         // stamped list, so count-parity there would fail by design — pinning
         // only adds noise.
+        // #5874 2×2 stage 0: cohort (dual-channel DECLARED) plugin traffic
+        // assembles the kernel input from the snapshot plane (old cores —
+        // the kernel's own tagged output, invariant v) + the NEW spans
+        // (P5). Non-cohort traffic keeps the D-lane view below unchanged.
+        const twoX2Armed0 = wpHit === undefined && pluginMode && Array.isArray(incomingMsgIds) && incomingMsgIds.length > 0;
+        let twoX2Armed = twoX2Armed0 && !r3FaultTracker.isLatched(sessionId);
+        if (twoX2Armed0 && r3FaultTracker.isLatched(sessionId)) {
+            log("debug", `[${sessionId}] [2x2] sid is R3-latched — legacy path this turn`);
+        }
         if (wpHit === undefined && pluginMode && incomingMsgIds !== undefined) {
             if (featureEnabled("pluginLaneServerHistory")) {
                 const v = validateMsgIds(incomingMsgIds, msgs.length);
                 if (v.ok) {
                     msgs = applyMsgIdPin(msgs, v.ids);
                     originalMessages = msgs;
+                } else if (twoX2Armed) {
+                    // #5874 2×2 red gate R3: a cohort host that DECLARED the
+                    // dual-channel (per-element msgids) but did not collect
+                    // them all → hard 400 BEFORE any kernel side effect, and
+                    // the fault feeds the breaker (10-minute window, 3
+                    // strikes → the sid latches to the legacy path instead of
+                    // bricking the session on a misbehaving host).
+                    const { latched } = r3FaultTracker.recordFault(sessionId);
+                    if (latched) {
+                        twoX2Armed = false;
+                        log("error", `[${sessionId}] [2x2] R3 identity fault ×3 in window (${v.reason}) — sid latched to the legacy path`);
+                    } else {
+                        throw new FoundationRejectError(`inbound msgid envelope failed validation (${v.reason})`);
+                    }
                 } else {
                     log("warn", `[${sessionId}] [msgid] openai-wire pin rejected (${v.reason}) — falling back to content-derived ids (#4491/#5825)`);
                 }
@@ -206,12 +247,89 @@ export async function prepareOpenai(
                 log("info", `[${sessionId}] [msgid] openai-wire biliMsgIds present but pluginLaneServerHistory rollout is off for this install — field stripped, ids not pinned (#5825)`);
             }
         }
+        // #5874 2×2 stage 0 (brief 19544722): world match + kernel-input
+        // assembly for cohort traffic. Runs BEFORE processTurn, so a thrown
+        // FoundationRejectError (R3) carries zero kernel side effects. Every
+        // other fault → the legacy full path (degrade, never guess —
+        // one-round convergence).
+        let twoX2KernelInput: BiliMessage[] | undefined;
+        if (twoX2Armed) {
+            try {
+                const store = getStore();
+                const stage0 = store?.snapStage0(session.id, msgs.map((m) => m.id), { seqs: incomingSeqs });
+                const cores = stage0 ? (store?.snapStage0Cores(session.id) ?? null) : null;
+                if (stage0 && cores) {
+                    if (shouldResync(stage0.decision, cores.rows.length)) {
+                        // Structural disagreement (diverge) or an explicit
+                        // re-baseline: reset the plane; THIS turn runs the
+                        // legacy full path and re-seeds it through the
+                        // in-request flush — the NEXT turn re-issues the
+                        // envelope from the client's current array.
+                        store!.snapStage0Reset(session.id);
+                        log("warn", `[${sessionId}] [2x2] stage-0 ${stage0.decision.mode} — plane reset, this turn legacy (one-round convergence)`);
+                    } else {
+                        // newCores = the converted spans of the NEW ids, in
+                        // envelope order. The front stage already converted
+                        // the whole array (front-stage invariance), so the
+                        // new spans carry their full-parse bytes — T5 holds
+                        // by construction.
+                        const newIdSet = new Set(stage0.decision.newIdPos.map((n) => n.id));
+                        const newCores: BiliMessage[] = [];
+                        const taken = new Set<string>();
+                        for (const e of stage0.decision.envelope) {
+                            if (!newIdSet.has(e.id) || taken.has(e.id)) continue;
+                            taken.add(e.id);
+                            const m = msgs.find((x) => x.id === e.id);
+                            if (m === undefined) throw new Error(`new span ${e.id} absent from the converted array`);
+                            newCores.push(m);
+                        }
+                        // The plane's ANCHOR rows (active acp_summary_<blockId>)
+                        // ride the kernel input at their covered-run boundary
+                        // — the D-view placement parity. snapStage0Cores
+                        // returns both the rows and the coverMax map.
+                        const anchors = cores.rows
+                            .filter((r) => r.ids.some((id) => id.startsWith(ANCHOR_ID_PREFIX)))
+                            .map((r) => {
+                                const id = r.ids.find((x) => x.startsWith(ANCHOR_ID_PREFIX))!;
+                                return {
+                                    msg: JSON.parse(r.postJson) as BiliMessage,
+                                    blockId: id.slice(ANCHOR_ID_PREFIX.length),
+                                };
+                            });
+                        const asm = assembleKernelInput({
+                            decision: stage0.decision,
+                            rows: cores.rows
+                                .filter((r) => !r.ids.some((id) => id.startsWith(ANCHOR_ID_PREFIX)))
+                                .map((r) => ({ pos: r.pos, ids: r.ids, msg: JSON.parse(r.postJson) as BiliMessage })),
+                            newCores,
+                            skipIds: stage0.explainedGone,
+                            anchors,
+                            coverMax: cores.coverMax,
+                        });
+                        twoX2KernelInput = asm.kernelInput;
+                        log("info", `[${sessionId}] [2x2] stage-0 ${stage0.decision.mode} — kernel input from plane (old=${asm.oldCount}, new=${newCores.length}, anchors=${anchors.length})`);
+                    }
+                }
+            } catch (err) {
+                if (err instanceof FoundationRejectError) throw err; // R3 outranks the fallback
+                const why = err instanceof Error ? err.message : String(err);
+                if (why.startsWith("[snapshot 2×2]")) {
+                    // The assembly could not address the envelope against the
+                    // plane (table behind — R4-shaped): reset and take the
+                    // legacy path this turn (one-round convergence).
+                    try {
+                        getStore()?.snapStage0Reset(session.id);
+                    } catch { /* the reset is best-effort — the legacy path is the floor */ }
+                }
+                log("warn", `[${sessionId}] [2x2] stage-0 failed (${why}) — legacy full path`);
+            }
+        }
         // #3756 snapshot render: the outbound prefix renders from the unified
         // transcript (server-authoritative, fold-time ids — immune to identity
         // re-mints #3752); only the live tail keeps the client's bytes.
         // No-op returns `msgs` when the lane is inactive/degraded.
         // reconcileFoldCoverage below still observes the CLIENT view.
-        const renderMsgs = maybeSnapshotView(session, msgs, { sessionId, pluginMode, log });
+        const renderMsgs = twoX2KernelInput ?? maybeSnapshotView(session, msgs, { sessionId, pluginMode, log });
         // #4241: the render lane replaced the view (reference-inequality is the
         // discriminator — maybeSnapshotView returns the SAME array when idle),
         // so the judged baseline is the rendered transcript, not the inbound.
