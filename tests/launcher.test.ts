@@ -6884,6 +6884,83 @@ test("readGooseConfig: active_provider + custom_providers base_urls; GOOSE_PROVI
     }
 });
 
+// goose's shipped layout is `config.yaml` + `custom_providers/<id>.json` (its
+// loader filters `extension == "json"`, and config/declarative_providers.rs
+// writes `{id}.json`). The TOML-only reader discovered nothing for it, so the
+// launcher launched with no route for the custom provider (#1049 follow-up).
+test("readGooseConfig: config.yaml + custom_providers/*.json (goose's real layout), incl. model windows", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "bili-goose-json-"));
+    try {
+        const cfgDir = path.join(root, "config");
+        fs.mkdirSync(path.join(cfgDir, "custom_providers"), { recursive: true });
+        fs.writeFileSync(path.join(cfgDir, "config.yaml"), [
+            "# goose settings",
+            "GOOSE_MODEL: some-model",
+            "active_provider: mine   # trailing comment",
+            "extensions:",
+            "  active_provider: nested-not-a-setting",
+        ].join("\n"));
+        fs.writeFileSync(path.join(cfgDir, "custom_providers", "mine.json"), JSON.stringify({
+            name: "mine",
+            engine: "openai",
+            api_key_env: "MINE_KEY",
+            base_url: "http://192.168.1.178:8080",
+            models: [{ name: "qwen-local", context_limit: 131072 }, { name: "no-limit" }, "junk"],
+        }, null, 2) + "\n");
+        fs.writeFileSync(path.join(cfgDir, "custom_providers", "halfwritten.json"), '{ "base_url": "https://half.example/v1",');
+        const dirs = resolveGooseDirs({ GOOSE_PATH_ROOT: root });
+        const cfg = readGooseConfig(dirs, {});
+        assert.equal(cfg.activeProvider, "mine", "config.yaml is goose's settings file; an indented key of the same name is not");
+        assert.deepEqual(cfg.customProviders, { halfwritten: "https://half.example/v1", mine: "http://192.168.1.178:8080" });
+        assert.deepEqual(cfg.models, [{ id: "qwen-local", contextWindow: 131072 }], "context_limit feeds the launcher's window denominator; a model without one is skipped");
+        assert.equal(readGooseConfig(dirs, { GOOSE_PROVIDER: "override" }).activeProvider, "override", "GOOSE_PROVIDER env still wins");
+        const empty = readGooseConfig(resolveGooseDirs({ GOOSE_PATH_ROOT: "/nonexistent-bili-test" }), {});
+        assert.equal(empty.activeProvider, undefined);
+        assert.equal(empty.models, undefined, "no declared windows → no models key, so the proxy keeps its own resolution");
+    } finally {
+        rmrf(root);
+    }
+});
+
+test("prepareGooseHome/finalizeGooseHome: JSON provider overlay rewrite + config.yaml merge-back (goose's real layout)", () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-goose-json-home-"));
+    try {
+        const cfgDir = path.join(home, ".config", "goose");
+        fs.mkdirSync(path.join(cfgDir, "custom_providers"), { recursive: true });
+        const provider = (baseUrl: string): string => JSON.stringify({
+            name: "x",
+            engine: "openai",
+            api_key_env: "X_KEY",
+            base_url: baseUrl,
+            models: [{ name: "m", context_limit: 131072 }],
+        }, null, 2) + "\n";
+        fs.writeFileSync(path.join(cfgDir, "config.yaml"), "active_provider: mine\n");
+        fs.writeFileSync(path.join(cfgDir, "custom_providers", "mine.json"), provider("http://192.168.1.178:8080"));
+        fs.writeFileSync(path.join(cfgDir, "custom_providers", "other.json"), provider("https://keep.example/v1"));
+        fs.writeFileSync(path.join(cfgDir, "custom_providers", "tight.json"), '{"name":"x","engine":"openai","base_url":"https://tight.example/v1"}');
+        const origin = "http://127.0.0.1:9999";
+        const env: NodeJS.ProcessEnv = { XDG_CONFIG_HOME: path.join(home, ".config"), XDG_DATA_HOME: path.join(home, ".local", "share"), XDG_STATE_HOME: path.join(home, ".local", "state") };
+        const overlay = prepareGooseHome(env, origin, [{ key: "mine", realUpstream: "http://192.168.1.178:8080" }, { key: "tight", realUpstream: "https://tight.example/v1" }]);
+        assert.ok(overlay, "overlay prepared");
+        const patchedRaw = fs.readFileSync(path.join(overlay!.root, "config", "custom_providers", "mine.json"), "utf8");
+        const patched = JSON.parse(patchedRaw) as { base_url: string; engine: string; models: unknown[] };
+        assert.equal(patched.base_url, wrapUpstream(origin, "http://192.168.1.178:8080"), "base_url re-pointed at the proxy, stays valid JSON");
+        assert.equal(patched.engine, "openai");
+        assert.deepEqual(patched.models, [{ name: "m", context_limit: 131072 }], "everything else in the provider untouched");
+        assert.ok(fs.readFileSync(path.join(overlay!.root, "config", "custom_providers", "other.json"), "utf8").includes("https://keep.example/v1"), "provider outside the rewrite set untouched");
+        const tight = JSON.parse(fs.readFileSync(path.join(overlay!.root, "config", "custom_providers", "tight.json"), "utf8")) as { base_url: string };
+        assert.equal(tight.base_url, wrapUpstream(origin, "https://tight.example/v1"), "compact single-line provider rewritten in place, stays valid JSON");
+        const realBefore = fs.readFileSync(path.join(cfgDir, "custom_providers", "mine.json"), "utf8");
+        assert.ok(realBefore.includes("http://192.168.1.178:8080"), "real config untouched by prepare");
+        fs.writeFileSync(path.join(overlay!.root, "config", "config.yaml"), "active_provider: other\n");
+        finalizeGooseHome(overlay!);
+        assert.ok(fs.readFileSync(path.join(cfgDir, "config.yaml"), "utf8").includes("active_provider: other"), "yaml edit merged back");
+        assert.ok(realBefore === fs.readFileSync(path.join(cfgDir, "custom_providers", "mine.json"), "utf8"), "patched provider file did NOT leak into the real config");
+    } finally {
+        rmrf(home);
+    }
+});
+
 test("prepareGooseHome/finalizeGooseHome: overlay layout, patched urls, merge-back round-trip (#1049)", () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-goose-home-"));
     try {

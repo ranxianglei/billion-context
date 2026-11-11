@@ -263,3 +263,12 @@ test("anthropicBetaContextWindow: rejects malformed / non-context tokens", () =>
     assert.equal(anthropicBetaContextWindow({ "anthropic-beta": "context-1x-2025-08-07" }), undefined);
     assert.equal(anthropicBetaContextWindow({ "anthropic-beta": "my-context-1m-2025-08-07" }), undefined);
 });
+
+test("collectModelWindows: goose scope (custom_providers models[].context_limit)", () => {
+    const cfg: ClientConfig = {
+        goose: { customProviders: { mine: "http://192.168.1.178:8080" }, models: [{ id: "qwen-local", contextWindow: 131072 }] },
+    };
+    assert.deepEqual(collectModelWindows(cfg, "goose"), { "qwen-local": 131072 }, "goose declares its windows like every other scoped client");
+    assert.deepEqual(collectModelWindows(cfg), { "qwen-local": 131072 });
+    assert.deepEqual(collectModelWindows(cfg, "codex"), {}, "another client's scope must not pick up goose's windows (#436)");
+});

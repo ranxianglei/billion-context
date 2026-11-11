@@ -240,11 +240,20 @@ export interface AiderConfig {
  *  plain HTTP instead: built-in openai/anthropic via their `*_HOST` env
  *  overrides, custom declarative providers via a regenerated config overlay. */
 export interface GooseConfig {
-    /** `active_provider` from config.toml (legacy GOOSE_PROVIDER env wins). */
+    /** `active_provider` from goose's `config.yaml` (its `config.toml` spelling
+     *  and the legacy GOOSE_PROVIDER env are read as fallbacks). */
     activeProvider?: string;
-    /** Custom declarative providers: file name (without .toml) → raw
-     *  `base_url` from `<config_dir>/custom_providers/<name>.toml`. */
+    /** Custom declarative providers: file name (without extension) → raw
+     *  `base_url` from `<config_dir>/custom_providers/<name>.json` — goose
+     *  writes declarative providers as JSON (its `declarative.rs` loader
+     *  filters `extension == "json"`, and `config/declarative_providers.rs`
+     *  writes `{id}.json`). The `.toml` spelling is kept as a fallback for any
+     *  build that migrates formats. */
     customProviders: Record<string, string>;
+    /** Per-model context windows the declarative providers declare
+     *  (`models[].context_limit`) — the launcher's window denominator for
+     *  `bili goose`, same role as every other scoped client's model windows. */
+    models?: ModelWindow[];
 }
 
 /** crush.json discovery result — kept module-local: nobody imports the type
@@ -1358,32 +1367,85 @@ export function resolveGooseDirs(env: NodeJS.ProcessEnv = process.env): GooseDir
     return { configDir, dataDir, stateDir, agentsDir: path.join(dataDir, ".agents") };
 }
 
+/** goose's `config.yaml` top-level scalar (no YAML dependency — same targeted
+ *  discipline as parseMcodeYaml). Only unindented lines qualify: goose keeps its
+ *  settings flat, and an indented key of the same name belongs to some block. */
+function gooseYamlTopLevel(text: string, key: string): string | undefined {
+    for (const raw of text.split(/\r?\n/)) {
+        if (/^\s/.test(raw)) continue;
+        const line = yamlLineContent(raw);
+        if (!line) continue;
+        const m = new RegExp(`^${key}\\s*:\\s*(.+)$`).exec(line);
+        const value = m?.[1] ? unquoteYaml(m[1]) : undefined;
+        if (value) return value;
+    }
+    return undefined;
+}
+
+/** goose's declarative provider files carry `base_url` at the top level. Read
+ *  from the line rather than by JSON.parse, so a half-written file still yields
+ *  its url: the `^` branch matches goose's `to_string_pretty` spelling (the key
+ *  on its own line), the `[,{]` branch a hand-written compact one. launcher.ts
+ *  rewrites with this SAME pattern — what gets discovered here must always be
+ *  something the overlay can re-point, or the route would mislead. */
+export const GOOSE_JSON_BASE_URL_RE = /(^[\s]*|[,{][\s]*)"base_url"(\s*:\s*)("[^"]*")/;
+
+/** First `base_url` string in a goose provider JSON, line-scanned so the match
+ *  shape stays identical to the launcher's rewrite. */
+function gooseJsonBaseUrl(text: string): string | undefined {
+    for (const line of text.split(/\r?\n/)) {
+        const m = GOOSE_JSON_BASE_URL_RE.exec(line);
+        const url = m?.[3]?.slice(1, -1);
+        if (url) return url;
+    }
+    return undefined;
+}
+
 export function readGooseConfig(dirs: GooseDirs, env: NodeJS.ProcessEnv = process.env): GooseConfig {
     const result: GooseConfig = { customProviders: {} };
     if (nonEmpty(env.GOOSE_PROVIDER)) {
         result.activeProvider = env.GOOSE_PROVIDER!;
     } else {
         try {
-            const text = fs.readFileSync(path.join(dirs.configDir, "config.toml"), "utf8");
-            const m = /^active_provider\s*=\s*["']([^"']+)["']/m.exec(text);
-            if (m?.[1]) result.activeProvider = m[1];
+            const yaml = gooseYamlTopLevel(fs.readFileSync(path.join(dirs.configDir, "config.yaml"), "utf8"), "active_provider");
+            if (yaml) {
+                result.activeProvider = yaml;
+            }
         } catch {}
+        if (!result.activeProvider) {
+            try {
+                const text = fs.readFileSync(path.join(dirs.configDir, "config.toml"), "utf8");
+                const m = /^active_provider\s*=\s*["']([^"']+)["']/m.exec(text);
+                if (m?.[1]) result.activeProvider = m[1];
+            } catch {}
+        }
     }
     let entries: string[] = [];
     try {
         entries = fs.readdirSync(path.join(dirs.configDir, "custom_providers"));
     } catch {}
+    const windows: ModelWindow[] = [];
     for (const name of entries.sort()) {
-        if (!name.endsWith(".toml")) continue;
+        const json = name.endsWith(".json");
+        if (!json && !name.endsWith(".toml")) continue;
+        const file = path.join(dirs.configDir, "custom_providers", name);
         let txt: string;
         try {
-            txt = fs.readFileSync(path.join(dirs.configDir, "custom_providers", name), "utf8");
+            txt = fs.readFileSync(file, "utf8");
         } catch {
             continue;
         }
-        const m = /^\s*base_url\s*=\s*["']([^"']+)["']/m.exec(txt);
-        if (m?.[1]) result.customProviders[name.replace(/\.toml$/, "")] = m[1];
+        const url = json ? gooseJsonBaseUrl(txt) : /^\s*base_url\s*=\s*["']([^"']+)["']/m.exec(txt)?.[1];
+        if (url) result.customProviders[name.replace(/\.(json|toml)$/, "")] = url;
+        if (!json) continue;
+        const obj = readJsonObject(file);
+        for (const model of Array.isArray(obj?.models) ? obj!.models as unknown[] : []) {
+            const rec = model && typeof model === "object" && !Array.isArray(model) ? (model as Record<string, unknown>) : {};
+            const win = toModelWindow(rec.name, rec.context_limit);
+            if (win) windows.push(win);
+        }
     }
+    if (windows.length > 0) result.models = windows;
     return result;
 }
 
@@ -2143,7 +2205,8 @@ type ModelWindowScope = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes
 
 /** Collect per-model context windows from client configs the launcher can
  *  read (pi models.json, omp models.yml, opencode opencode.json, codex
- *  config.toml). With `scope`, ONLY that client's declarations are collected —
+ *  config.toml, goose custom_providers JSON). With `scope`, ONLY that client's
+ *  declarations are collected —
  *  the launched client's config is authoritative for its own proxy (#436:
  *  cross-client max-wins silently discarded the user's smaller configured
  *  window). Without `scope`, merges every client (legacy behavior). Same model
@@ -2164,6 +2227,7 @@ export function collectModelWindows(config: ClientConfig, scope?: ModelWindowSco
         else if (scope === "codebuddy") add(config.codebuddy?.models);
         else if (scope === "kimi") add(config.kimi?.models);
         else if (scope === "mcode") add(config.mcode?.models);
+        else if (scope === "goose") add(config.goose?.models);
         return out;
     }
     for (const p of Object.values(config.pi?.providers ?? {})) add(p.models);
@@ -2173,6 +2237,7 @@ export function collectModelWindows(config: ClientConfig, scope?: ModelWindowSco
     add(config.codebuddy?.models);
     add(config.kimi?.models);
     add(config.mcode?.models);
+    add(config.goose?.models);
     return out;
 }
 
@@ -2195,6 +2260,7 @@ export function collectModelMaxOutputs(config: ClientConfig, scope?: ModelWindow
         else if (scope === "codebuddy") add(config.codebuddy?.models);
         else if (scope === "kimi") add(config.kimi?.models);
         else if (scope === "mcode") add(config.mcode?.models);
+        else if (scope === "goose") add(config.goose?.models);
         return out;
     }
     for (const p of Object.values(config.pi?.providers ?? {})) add(p.models);
@@ -2204,5 +2270,6 @@ export function collectModelMaxOutputs(config: ClientConfig, scope?: ModelWindow
     add(config.codebuddy?.models);
     add(config.kimi?.models);
     add(config.mcode?.models);
+    add(config.goose?.models);
     return out;
 }

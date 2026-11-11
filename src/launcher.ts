@@ -77,7 +77,7 @@ import { winCmdUnsafeToken, winCmdRefusalError } from "./win-cmd.js";
 function selfDistFile(name: string): string {
     return path.join(selfPackageRoot(), "dist", name);
 }
-import { nonEmpty, resolvePiHome, resolveOmpHome, resolveDshHome, resolveCodexHome, resolveCodexEffectiveView, loadClientConfig, collectModelWindows, collectModelMaxOutputs, type ClientConfig, type CodexConfig, resolveOpencodeConfigFile, readOpencodeConfigRoot, opencodePluginBaseDir, type OpencodeConfig, type OpencodeProvider, type HermesConfig, type HermesProvider, qoderIsCnSite, QODER_DEFAULT_MODEL_HOSTS, resolveTraeHome, readTraeConfig, TRAE_DEFAULT_MODEL_HOSTS, JCODE_DEFAULT_MODEL_HOSTS, type TraeConfig, resolveKimiHome, readKimiConfig, parseKimiToml, KIMI_DEFAULT_MODEL_HOSTS, QWEN_DEFAULT_MODEL_HOSTS, type KimiConfig, type KimiProvider, readOpencodeProjectLayer, type OpencodeProjectLayer, readMcodeConfig, resolveMcodeInstallDir, MCODE_DEFAULT_MODEL_HOSTS, type McodeConfig, discoverAiderArgUrls, AIDER_DEFAULT_MODEL_HOSTS, COPILOT_DEFAULT_MODEL_HOSTS, AMP_DEFAULT_MODEL_HOSTS, CRUSH_DEFAULT_MODEL_HOSTS, ZED_DEFAULT_MODEL_HOSTS, readZedConfig, resolveGooseDirs, readGooseConfig, type GooseConfig, type GooseDirs } from "./client-config.js";
+import { nonEmpty, resolvePiHome, resolveOmpHome, resolveDshHome, resolveCodexHome, resolveCodexEffectiveView, loadClientConfig, collectModelWindows, collectModelMaxOutputs, type ClientConfig, type CodexConfig, resolveOpencodeConfigFile, readOpencodeConfigRoot, opencodePluginBaseDir, type OpencodeConfig, type OpencodeProvider, type HermesConfig, type HermesProvider, qoderIsCnSite, QODER_DEFAULT_MODEL_HOSTS, resolveTraeHome, readTraeConfig, TRAE_DEFAULT_MODEL_HOSTS, JCODE_DEFAULT_MODEL_HOSTS, type TraeConfig, resolveKimiHome, readKimiConfig, parseKimiToml, KIMI_DEFAULT_MODEL_HOSTS, QWEN_DEFAULT_MODEL_HOSTS, type KimiConfig, type KimiProvider, readOpencodeProjectLayer, type OpencodeProjectLayer, readMcodeConfig, resolveMcodeInstallDir, MCODE_DEFAULT_MODEL_HOSTS, type McodeConfig, discoverAiderArgUrls, AIDER_DEFAULT_MODEL_HOSTS, COPILOT_DEFAULT_MODEL_HOSTS, AMP_DEFAULT_MODEL_HOSTS, CRUSH_DEFAULT_MODEL_HOSTS, ZED_DEFAULT_MODEL_HOSTS, readZedConfig, resolveGooseDirs, readGooseConfig, GOOSE_JSON_BASE_URL_RE, type GooseConfig, type GooseDirs } from "./client-config.js";
 import { loadRoutes, resolveConfiguredContextLimit, lookupContextLimit, resolveNativeAttachExternal, resolveNativeAttachLanePriority, resolveNativeAttachPolicy, resolveNativeAttachUrl, resolveMitmDomains, resolveNonHttpProviders, resolveRecordedMitmDomains, resolveRecordedPassthrough, type ProviderRoutes } from "./config.js";
 import { discoverMitmDomains } from "./discover.js";
 import { contextFromRegistry } from "./registry.js";
@@ -2964,7 +2964,10 @@ export function prepareGooseHome(env: NodeJS.ProcessEnv, origin: string, rewrite
         cpEntries = fs.readdirSync(path.join(cfg, "custom_providers"));
     } catch {}
     for (const name of cpEntries) {
-        if (!name.endsWith(".toml")) continue;
+        // goose writes declarative providers as `<id>.json` (its loader filters
+        // `extension == "json"`); the `.toml` spelling is kept as a fallback.
+        const json = name.endsWith(".json");
+        if (!json && !name.endsWith(".toml")) continue;
         const file = path.join(cfg, "custom_providers", name);
         let txt: string;
         try {
@@ -2975,11 +2978,21 @@ export function prepareGooseHome(env: NodeJS.ProcessEnv, origin: string, rewrite
         const eol = txt.includes("\r\n") ? "\r\n" : "\n";
         let changed = false;
         const lines = txt.split(/\r?\n/).map((line) => {
+            if (json) {
+                const m = GOOSE_JSON_BASE_URL_RE.exec(line);
+                if (!m) return line;
+                const rawUrl = m[3].slice(1, -1);
+                if (!/^https?:\/\//i.test(rawUrl)) return line;
+                const real = unwrapUpstream(rawUrl);
+                if (!wrapSet.has(real)) return line;
+                changed = true;
+                const valueStart = m.index + m[0].length - m[3].length;
+                return line.slice(0, valueStart) + '"' + wrapUpstream(origin, real) + '"' + line.slice(m.index + m[0].length);
+            }
             const m = /^(\s*base_url\s*=\s*)(["'])([^"']+)\2(\s*(?:#.*)?)$/.exec(line);
             if (!m) return line;
-            const rawUrl = m[3];
-            if (!/^https?:\/\//i.test(rawUrl)) return line;
-            const real = unwrapUpstream(rawUrl);
+            if (!/^https?:\/\//i.test(m[3])) return line;
+            const real = unwrapUpstream(m[3]);
             if (!wrapSet.has(real)) return line;
             changed = true;
             return `${m[1]}${m[2]}${wrapUpstream(origin, real)}${m[2]}${m[4] ?? ""}`;
