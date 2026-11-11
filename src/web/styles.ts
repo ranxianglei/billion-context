@@ -530,7 +530,16 @@ pre.small-pre { max-height: 220px; overflow: auto; }
 .hdoc-title { font-weight: 700; font-size: 14.5px; margin-bottom: 6px; }
 .hdoc-meta-row { font-size: 12px; color: var(--text-muted); line-height: 1.7; word-break: break-word; }
 .hdoc-meta-k { color: var(--text-faint); margin-right: 6px; font-family: var(--mono); font-size: 11px; }
-.hdoc-sub { font-size: 12.5px; color: var(--text-muted); margin: 0 0 6px; }
+.hdoc-sub { font-size: 12.5px; font-weight: 600; color: var(--text-muted); margin: 14px 0 6px; }
+.handoff .hblock { background: var(--bg-elev); border: 1px solid var(--border-soft); border-radius: 8px; margin: 0 0 8px; overflow: hidden; }
+.handoff .hblock-head { display: flex; align-items: baseline; gap: 8px; padding: 6px 10px; background: var(--bg-muted); border-bottom: 1px solid var(--border-soft); }
+.handoff .hblock-id { font-family: var(--mono); font-size: 11px; font-weight: 600; color: var(--accent); white-space: nowrap; }
+.handoff .hblock-topic { font-size: 11.5px; color: var(--text-muted); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.handoff .hblock-tier { padding: 5px 12px 0; font-size: 10.5px; color: var(--text-faint); font-family: var(--mono); }
+.handoff .hblock-body { padding: 8px 12px 10px; font-size: 13px; }
+.handoff .hblock-body > :first-child { margin-top: 0; }
+.handoff .hblock-body > :last-child { margin-bottom: 0; }
+.handoff .hc-section-pro { margin: 0 0 8px; color: var(--text-muted); }
 .hcard { border: 1px solid var(--border-soft); border-left: 3px solid var(--accent); border-radius: 8px; background: var(--accent-soft); margin: 10px 0; overflow: hidden; }
 .hcard.hc-user { border-left-color: var(--hc-user); background: var(--hc-user-bg); }
 .hcard.hc-assistant { border-left-color: var(--hc-assistant); background: var(--hc-assistant-bg); }

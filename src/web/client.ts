@@ -2573,12 +2573,33 @@ function changelogCatOf(rawLine) {
         let start = 0;
         for (let i = 0; i < lines.length; i++) if (lines[i].indexOf("## ") === 0 && lines[i].indexOf("Conversation") > -1) { start = i + 1; break; }
         const blocks = [];
+        const sections = []; // post-Conversation ## sections (#845 appends "## Compressed block summaries")
         let cur = null;
+        let section = null;
+        let entry = null;
         // #2065: only known roles open a block — an in-body Markdown heading
         // ("### 7.1 …" inside a user's rules blob) is content, not a divider.
         const KNOWN_ROLE = { user: 1, assistant: 1, tool: 1 };
         for (let i = start; i < lines.length; i++) {
             const l = lines[i];
+            if (start > 0 && l.indexOf("## ") === 0) {
+                // A new ## section closes the role cards. Without this the whole
+                // "## Compressed block summaries" appendix (80+ block entries on
+                // long sessions) lands inside the last assistant card.
+                cur = null;
+                section = { title: l.slice(3).trim(), prologue: [], entries: [] };
+                sections.push(section);
+                entry = null;
+                continue;
+            }
+            if (section) {
+                if (l.indexOf("### Block ") === 0) {
+                    entry = { head: l.slice(10).trim(), lines: [] };
+                    section.entries.push(entry);
+                } else if (entry) entry.lines.push(l);
+                else section.prologue.push(l);
+                continue;
+            }
             let divider = null;
             if (l.indexOf("### ") === 0) { const r = l.slice(4).trim(); if (KNOWN_ROLE[r]) divider = r; }
             if (divider) { cur = { role: divider, lines: [] }; blocks.push(cur); continue; }
@@ -2619,6 +2640,28 @@ function changelogCatOf(rawLine) {
                 }
             }
             html.push('<div class="hcard hc-' + role + '"><div class="hc-head"><span class="hc-badge hc-badge-' + role + '">' + (HC_ROLE_ICON[role] || "") + " " + role.charAt(0).toUpperCase() + role.slice(1) + '</span></div><div class="hc-body">' + body.join("") + "</div></div>");
+        }
+        for (const sec of sections) {
+            html.push('<div class="hdoc-sub">' + escapeHtml(sec.title) + "</div>");
+            if (sec.prologue.some((x) => x.trim() !== "")) html.push('<div class="hc-section-pro">' + mdApi.render(sec.prologue.join("\\n")) + "</div>");
+            for (const e of sec.entries) {
+                const dash = e.head.indexOf(" \u2014 ");
+                const id = dash > -1 ? e.head.slice(0, dash) : e.head;
+                const topic = dash > -1 ? e.head.slice(dash + 3) : "";
+                let tier = "";
+                let tierAt = -1;
+                for (let k = 0; k < e.lines.length; k++) {
+                    const c = e.lines[k].trim();
+                    if (c === "") continue;
+                    if (c.indexOf("tier ") === 0 && c.indexOf(" tokens compressed") > -1) { tier = c; tierAt = k; }
+                    break;
+                }
+                const bodyLines = tierAt > -1 ? e.lines.slice(tierAt + 1) : e.lines;
+                const card = '<div class="hblock"><div class="hblock-head"><span class="hblock-id">' + escapeHtml(id) + "</span>" + (topic ? '<span class="hblock-topic">' + escapeHtml(topic) + "</span>" : "") + "</div>"
+                    + (tier ? '<div class="hblock-tier">' + escapeHtml(tier) + "</div>" : "")
+                    + '<div class="hblock-body">' + mdApi.render(bodyLines.join("\\n")) + "</div></div>";
+                html.push(card);
+            }
         }
         return html.join("");
     }

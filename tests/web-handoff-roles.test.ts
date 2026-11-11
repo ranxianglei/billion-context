@@ -382,3 +382,45 @@ test("#2065: a bare '### system' line is content here (parity with the server re
     assert.equal(assistantRoles(html), 1, "'### system' was not coerced to assistant");
     assert.ok(html.includes("this line looks like a role but is body text"));
 });
+
+test("the ## Compressed block summaries appendix renders as its own section, not inside the last role card", () => {
+    const render = loadRenderer();
+    // Shape produced by export.ts blockSummariesSection (#845) after the
+    // conversation: ## heading, then one ### Block entry per active block with
+    // a "tier N · ~X tokens compressed · date" meta line.
+    const md = [
+        "# billion-context session handoff",
+        "",
+        "## Conversation (persisted folded snapshot, 2 messages)",
+        "",
+        "### assistant",
+        "short tail answer",
+        "",
+        "## Compressed block summaries",
+        "",
+        "### Block b250 — [PR#54 合并 + 双机部署]",
+        "",
+        "tier 1 · ~20655 tokens compressed · 2026-11-10 05:56:36 UTC",
+        "",
+        "- 合并: **fcb7bec**",
+        "- 部署双机",
+        "",
+        "### Block b251 — [drain 排查]",
+        "",
+        "tier 1 · ~9365 tokens compressed · 2026-11-10 05:56:36 UTC",
+        "",
+        "- drain 未触发",
+    ].join("\n");
+    const html = render(md);
+    assert.equal(roleCount(html), 1, "exactly one role card — the appendix must not inflate it");
+    const cardEnd = html.indexOf("Compressed block summaries");
+    const card = html.slice(0, cardEnd);
+    assert.ok(!card.includes("b250"), "no block summary text inside the role card");
+    assert.ok(card.includes("short tail answer"), "role card keeps its own content");
+    assert.ok(html.includes(">Compressed block summaries<"), "section title rendered");
+    const m1 = html.match(/class="hblock-id">(b250)<\/span><span class="hblock-topic">(\[PR#54 合并 \+ 双机部署\])<\/span>/);
+    assert.ok(m1, "block entry head splits id/topic");
+    assert.ok(html.includes("fcb7bec"), "entry body content preserved");
+    assert.ok(html.includes("drain 未触发"), "second entry content preserved");
+    assert.ok((html.match(/class="hblock-tier"/g) || []).length === 2, "tier meta lines styled per entry");
+});
