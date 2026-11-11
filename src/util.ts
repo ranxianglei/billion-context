@@ -29,6 +29,19 @@ export const BILI_PASSTHROUGH_HEADER = "x-bili-passthrough";
 // 1M-token window could hold are stopped.
 export const MIN_ASSUMED_WINDOW_TOKENS = 1_000_000;
 
+// Session-ledger measurement (#5613): the wire bodies this host family sends
+// are billed upstream ~14% ABOVE the optimistic bytes/4 token FLOOR — the
+// floor is a strict lower bound, so a body that sits just under the window in
+// floor terms can already be OVER it in reality (the #5613 shape: a send that
+// passed every old "never false-refuse" check, then bricked the session
+// upstream). The over-window fuses therefore price media-excluded core text
+// at the CALIBRATED estimate (floor × this ratio) and only fail open when
+// even that fits; the bare floor remains the stronger "provably over" tier,
+// kept in the result shape for message wording. Owner-approved 2026-11-07:
+// large histories fail CLOSED locally instead of riding into a guaranteed
+// upstream 400.
+export const CALIBRATED_TEXT_TOKEN_RATIO = 1.14;
+
 /**
  * Cryptographic hash of a string, truncated to a 64-bit id (16 hex chars).
  *
@@ -482,6 +495,10 @@ function parseOverflowCounts(text: string): { total?: number; messages?: number;
     // messages, 256000 in the completion)."
     let m = text.match(/requested\s+(\d[\d,]*)\s*tokens?\s*\(\s*(\d[\d,]*)\s*in the messages,\s*(\d[\d,]*)\s*in the completion\s*\)/i);
     if (m) return { total: toTokenNumber(m[1]), messages: toTokenNumber(m[2]), completion: toTokenNumber(m[3]) };
+    // SGLang/LiteLLM: "requested a total of N tokens: M tokens from the
+    // input messages and C tokens for the completion".
+    m = text.match(/requested\s+a\s+total\s+of\s+(\d[\d,]*)\s*tokens?\s*:\s*(\d[\d,]*)\s*tokens?\s+from the input messages\s+and\s+(\d[\d,]*)\s*tokens?\s+for the completion\b/i);
+    if (m) return { total: toTokenNumber(m[1]), messages: toTokenNumber(m[2]), completion: toTokenNumber(m[3]) };
     // Anthropic: "prompt is too long: 130000 tokens > 128000 maximum" — the
     // first number IS the prompt (messages) size; no completion split stated.
     m = text.match(/prompt is too long:\s*(\d[\d,]*)\s*tokens?\s*>/i);
@@ -642,6 +659,21 @@ export function systemToUser<T extends { role: string }>(messages: T[], should?:
     );
 }
 
+// #5432: index of the first entry of the trailing run of role:"system" entries
+// (== length when nothing trails). Shared by every host path that mutates an
+// ALREADY assembled anthropic body: the kernel heal keeps a client's legal
+// trailing system run verbatim at array end, so any post-assembly user insert
+// must land BEFORE it or the request 400s ("role 'system' must precede an
+// 'assistant' message or end the array").
+export function trailingSystemRunStart(messages: readonly unknown[]): number {
+    let i = messages.length;
+    while (i > 0) {
+        const m = messages[i - 1];
+        if (!m || typeof m !== "object" || Array.isArray(m) || (m as Record<string, unknown>).role !== "system") break;
+        i--;
+    }
+    return i;
+}
 
 /** #719: Some OpenAI-compatible backends (DeepSeek) reject assistant messages
  * whose `content` is null — they require a string content (possibly "") or

@@ -14,6 +14,7 @@ import {
     createContentStore,
     createCore,
     defaultConfig,
+    syncBlocks,
     STORED_PLACEHOLDER_MARKER,
     type Config,
     type CoreMessage,
@@ -137,7 +138,7 @@ test("cloneStoreForRefs: ref-filtered independent clone", () => {
     assert.equal(cloneStoreForRefs(createContentStore(), []), null);
 });
 
-test("fork of armed parent resolves adopted covered refs via acp_retrieve (#1341)", async () => {
+for (const shortView of [false, true]) test(`fork of ${shortView ? "view-deactivated" : "armed"} parent retains compression and retrievable originals`, async () => {
     const body: Body = {
         model: "test-model",
         messages: [
@@ -151,6 +152,11 @@ test("fork of armed parent resolves adopted covered refs via acp_retrieve (#1341
     };
     const armed = armParent(body, { startId: "m00001", endId: "m00005" }, true);
     const { parent } = armed;
+    if (shortView) {
+        parent.state = syncBlocks([], parent.state).state;
+        assert.equal(parent.state.blocks.some(b => b.active), false);
+    }
+    const stateBefore = JSON.stringify(parent.state);
     const pstore = contentStoreOf(parent);
     // Arrival: m00003 (BIG_A), m00008 (BIG_B). Fold-time: m00001..m00005 minus
     // the already-stored m00003.
@@ -162,6 +168,7 @@ test("fork of armed parent resolves adopted covered refs via acp_retrieve (#1341
     forkBody.messages[7] = { role: "tool", tool_call_id: "call_b", content: `${BIG_B}\n(edited branch)` };
     const child = await forkChild(armed, forkBody);
 
+    assert.equal(JSON.stringify(parent.state), stateBefore, "fork recovery never mutates source state");
     assert.equal(child.state.blocks.length, 1);
     assert.ok(child.state.blocks[0].active);
     assert.equal(child.state.blocks[0].blockId, armed.blockId);
