@@ -327,7 +327,8 @@ billion-context/
 │       ├── changelog.ts          #   GitHub Releases feed for the panel changelog (#3719)
 │       ├── sessions-data.ts      #   Read-only session browsing (live pool + on-disk, #1420); tier tree + lazy block content (#3917)
 │       ├── logs-query.ts         #   GET /__bili/logs selection engine
-│       ├── markdown.ts           #   Escape-safe Markdown → HTML (#1420)
+│       ├── markdown.ts           #   Escape-safe Markdown → HTML (#1420) — thin wrapper over mdrender.ts
+│       ├── mdrender.ts           #   Shared escape-first Markdown + hand-rolled syntax-highlight core (server render + browser IIFE via .toString() inline, zero deps)
 │       ├── page.ts               #   Server-rendered HTML page shell (CA cert hint, i18n)
 │       ├── client.ts             #   Web UI client JS bundle
 │       ├── styles.ts             #   Web UI CSS
