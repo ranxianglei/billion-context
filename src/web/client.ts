@@ -419,17 +419,33 @@ export const WEB_CLIENT = `(function () {
         return html;
     }
     window.bili_hostPluginBanner = bili_hostPluginBanner;
-    // #5079: one-time-per-instance upgrade notice — prompt_cache_key
-    // self-stamping is off by default now. Server decides active (effective
-    // routing "disabled" && not dismissed); pure builder, same test-seam
-    // convention as the banners above.
-    function bili_pckNoticeBanner(s) {
+    // #5548: single renderer for every built-in notice — tone carries the
+    // color (banner ok|warn); adding a notice never adds a builder again.
+    // #5548 P2: local announcements ship their own localized copy on the wire
+    // ({"zh-CN": …, "en": …} or a plain string) — pick the UI locale with the
+    // same fallback chain t() uses.
+    function bili_pickLoc(v) {
+        if (typeof v === "string") return v;
+        if (v && typeof v === "object") {
+            if (v[locale] !== undefined && typeof v[locale] === "string") return v[locale];
+            if (v["zh-CN"] !== undefined && typeof v["zh-CN"] === "string") return v["zh-CN"];
+            if (v.en !== undefined && typeof v.en === "string") return v.en;
+            const vals = Object.values(v);
+            const first = vals.find((x) => typeof x === "string");
+            if (first !== undefined) return first;
+        }
+        return "";
+    }
+    function bili_noticeBanner(s) {
         let html = '<div class="banner-title">' + escapeHtml(s.on) + "</div>";
-        html += '<div class="alert-row"><span>' + escapeHtml(s.desc) + '</span><button class="btn sm pck-notice-dismiss">' + escapeHtml(s.dismiss) + "</button></div>";
+        let row = '<div class="alert-row"><span>' + escapeHtml(s.desc) + "</span>";
+        if (s.cta && s.cta.url) row += '<a class="btn sm notice-cta" href="' + escapeHtml(s.cta.url) + '" target="_blank" rel="noopener noreferrer">' + escapeHtml(s.cta.label) + "</a>";
+        if (!s.hideDismiss) row += '<button class="btn sm notice-dismiss">' + escapeHtml(s.dismiss) + "</button>";
+        html += row + "</div>";
         html += '<div class="dim small" style="margin-top:6px">' + escapeHtml(s.hint) + "</div>";
         return html;
     }
-    window.bili_pckNoticeBanner = bili_pckNoticeBanner;
+    window.bili_noticeBanner = bili_noticeBanner;
     function $(id) { return document.getElementById(id); }
     function toast(message, kind) {
         const host = $("toast-host");
@@ -527,6 +543,80 @@ export const WEB_CLIENT = `(function () {
         if (!p || p === "unknown") return '<span class="dim small">' + escapeHtml(t("protocol.unmarked")) + "</span>";
         return '<span class="badge proto">' + escapeHtml(p) + "</span>";
     }
+    function bindSessionColumns() {
+        document.querySelectorAll(".twide table.data").forEach((table) => {
+            const cols = Array.from(table.querySelectorAll("col"));
+            const headers = Array.from(table.querySelectorAll("thead th"));
+            headers.forEach((header, index) => {
+                if (index === headers.length - 1) return;
+                const label = () => t("ses.resize_column") + ": " + header.textContent;
+                const existing = header.querySelector(".col-resize");
+                if (existing) {
+                    existing.title = t("ses.resize_column");
+                    existing.setAttribute("aria-label", label());
+                    return;
+                }
+                const handle = document.createElement("button");
+                handle.type = "button";
+                handle.className = "col-resize";
+                handle.title = t("ses.resize_column");
+                handle.setAttribute("aria-label", label());
+                const start = () => {
+                    const widths = headers.map((cell) => cell.getBoundingClientRect().width);
+                    const total = table.getBoundingClientRect().width;
+                    table.style.width = total + "px";
+                    table.style.minWidth = "100%";
+                    widths.forEach((width, i) => { if (width > 0) cols[i].style.width = width + "px"; });
+                    table.classList.add("columns-resized");
+                    return widths;
+                };
+                const resize = (initial, delta) => {
+                    const widths = initial.slice();
+                    const direction = delta >= 0 ? 1 : -1;
+                    const receiver = direction > 0 ? index : initial.findIndex((width, i) => i > index && width > 0);
+                    if (receiver < 0 || initial[receiver] <= 0) return;
+                    let remaining = Math.abs(delta);
+                    let transferred = 0;
+                    for (let i = direction > 0 ? index + 1 : index; i >= 0 && i < widths.length; i += direction) {
+                        const available = Math.max(0, initial[i] - (i === 0 ? 120 : 48));
+                        const amount = Math.min(remaining, available);
+                        widths[i] -= amount;
+                        transferred += amount;
+                        remaining -= amount;
+                        if (remaining === 0) break;
+                    }
+                    widths[receiver] += transferred;
+                    widths.forEach((width, i) => { if (initial[i] > 0) cols[i].style.width = width + "px"; });
+                };
+                handle.addEventListener("pointerdown", (ev) => {
+                    if (ev.button !== 0) return;
+                    ev.preventDefault();
+                    try { handle.setPointerCapture(ev.pointerId); } catch (err) {}
+                    let initial = null;
+                    const move = (e) => {
+                        if (!initial) initial = start();
+                        resize(initial, e.clientX - ev.clientX);
+                    };
+                    const stop = () => {
+                        handle.removeEventListener("pointermove", move);
+                        handle.removeEventListener("pointerup", stop);
+                        handle.removeEventListener("pointercancel", stop);
+                        handle.removeEventListener("lostpointercapture", stop);
+                    };
+                    handle.addEventListener("pointermove", move);
+                    handle.addEventListener("pointerup", stop);
+                    handle.addEventListener("pointercancel", stop);
+                    handle.addEventListener("lostpointercapture", stop);
+                });
+                handle.addEventListener("keydown", (ev) => {
+                    if (ev.key !== "ArrowLeft" && ev.key !== "ArrowRight") return;
+                    ev.preventDefault();
+                    resize(start(), ev.key === "ArrowRight" ? 20 : -20);
+                });
+                header.appendChild(handle);
+            });
+        });
+    }
     function hydrate() {
         document.documentElement.lang = locale;
         document.querySelectorAll("[data-i18n]").forEach((el) => { el.textContent = t(el.getAttribute("data-i18n")); });
@@ -534,6 +624,7 @@ export const WEB_CLIENT = `(function () {
         document.querySelectorAll("[data-i18n-title]").forEach((el) => { el.setAttribute("title", t(el.getAttribute("data-i18n-title"))); });
         const tog = $("language-toggle");
         if (tog) tog.textContent = locale === "zh-CN" ? "English" : "中文";
+        bindSessionColumns();
     }
 
     const PAGES = ["overview", "sessions", "config", "updates", "connect", "logs", "blog"];
@@ -629,6 +720,8 @@ export const WEB_CLIENT = `(function () {
             + (s.selfHeal ? ' <span class="badge live" style="background:#8a6d3b" title="' + escapeHtml(t("det.self_heal_tip")) + '">' + t("det.self_heal_short") + "</span>" : "")
             + (s.autoModeForge ? ' <span class="badge live" style="background:#6d3b8a" title="' + escapeHtml(t("det.auto_mode_forge_tip")) + '">' + t("det.auto_mode_forge_short") + "</span>" : "")
 + (s.keepalive ? ' <span class="badge live" style="background:#3b6d8a" title="' + escapeHtml(t("det.keepalive_tip") + " · " + s.keepalive.tierLabel + " · " + (s.keepalive.cadenceMs >= 60_000 ? Math.round(s.keepalive.cadenceMs / 60_000) + "min" : Math.round(s.keepalive.cadenceMs / 1000) + "s") + (s.keepalive.lastHitAt ? " · " + t("det.keepalive_last_hit") + " " + timeAgo(new Date(s.keepalive.lastHitAt).toISOString()) : "")) + '">' + t("det.keepalive_short") + "×" + s.keepalive.pingCount + "</span>" : "")
+            // #5796: long-running session — host-side history only grows, per-step cost climbs; badge points at the actionable exit.
+            + (s.slowSession ? ' <span class="badge live" style="background:#8a3b3b" title="' + escapeHtml(t("ses.slow_tip", { n: fmtW(s.slowSession.requests) })) + '">' + t("ses.slow_short") + "</span>" : "")
             + '<span class="row-id">' + escapeHtml(s.id) + "</span></a>";
     }
     // SAVED column prefers ledger-derived net savings; pre-tagging sessions fall back
@@ -956,6 +1049,15 @@ function changelogCatOf(rawLine) {
             // keep the stale paint; the cache keeps its old timestamp, so the next visit retries
         }).then(function () { blogRefreshBusy = false; });
     }
+    // Per-post discussion thread: the thread number is data, not inference — it reaches
+    // the client as item.discussion once the server-side passthrough lands (separate PR,
+    // see PR body) and the pipeline records a number for the post. Exact direct link only;
+    // a post without a recorded number simply shows no button (no guessed search URL).
+    function blogDiscussionUrl(item) {
+        return (typeof item.discussion === "number" && item.discussion > 0)
+            ? "https://github.com/ranxianglei/billion-context/discussions/" + item.discussion
+            : null;
+    }
     async function loadBlog(sub) {
         const host = $("bl-list");
         if (!host) return;
@@ -985,7 +1087,13 @@ function changelogCatOf(rawLine) {
             const kindLabel = item.kind === "post" ? t("bl.kind_post") : t("bl.kind_article");
             const title = zhOn && item.titleZh ? item.titleZh : (item.title || "");
             const html = zhOn ? (item.htmlZh || item.html || "") : (item.html || "");
-            host.innerHTML = offlineNote + '<div class="card"><div class="card-b"><span class="mono bl-date">' + escapeHtml(item.date || "\u2014") + '</span><span class="badge">' + escapeHtml(kindLabel) + '</span><a href="#/blog" class="bl-back">' + escapeHtml(t("bl.back")) + "</a></div>"
+            const dUrl = blogDiscussionUrl(item);
+            const commentLink = dUrl ? '<a class="bl-back" href="' + dUrl + '" target="_blank" rel="noopener">' + escapeHtml(t("bl.comment")) + "</a>" : "";
+            // Per-article language pin: ?lang= outranks the saved UI language (#2321), so plain
+            // links double as an in-page EN|中文 toggle. Labels stay self-describing on purpose.
+            const subHref = "#/blog/" + encodeURIComponent(String(item.id));
+            const langToggle = '<a class="bl-back" href="?lang=en' + subHref + '">EN</a> <a class="bl-back" href="?lang=zh' + subHref + '">\u4e2d\u6587</a>';
+            host.innerHTML = offlineNote + '<div class="card"><div class="card-b"><span class="mono bl-date">' + escapeHtml(item.date || "\u2014") + '</span><span class="badge">' + escapeHtml(kindLabel) + '</span><a href="#/blog" class="bl-back">' + escapeHtml(t("bl.back")) + "</a> " + langToggle + " " + commentLink + "</div>"
                 + '<h3 class="bl-h">' + escapeHtml(title) + "</h3>"
                 + '<div class="card-b post-body">' + html + "</div></div>";
             return;
@@ -1053,8 +1161,13 @@ function changelogCatOf(rawLine) {
         try {
             const r = await json(API_ROOT + "/update/check", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
             if (r.already) showUpdateResult(t("up.already_in_flight"), true);
-            else if (r.ok) showUpdateResult(t("up.check_ok"), true);
-            else showUpdateResult(String(r.error || t("toast.failed", { msg: "check failed" })), false);
+            else if (!r.ok) showUpdateResult(String(r.error || t("toast.failed", { msg: "check failed" })), false);
+            else if (r.status === "update-available") showUpdateResult(t("up.check_available", { v: String(r.candidate || r.latest || "") }), true);
+            else if (r.status === "up-to-date") showUpdateResult(t("up.check_up_to_date"), true);
+            else if (r.status === "blocked-advisory") showUpdateResult(t("up.check_blocked", { v: String(r.latest || "") }), true);
+            else if (r.status === "deferred-advisory") showUpdateResult(t("up.check_deferred"), true);
+            else if (r.note) showUpdateResult(String(r.note), true);
+            else showUpdateResult(t("up.check_ok"), true);
         } catch (e) {
             showUpdateResult(e.message, false);
         } finally {
@@ -1557,34 +1670,44 @@ function changelogCatOf(rawLine) {
                 hb.innerHTML = "";
             }
         }
-        // #5079: prompt_cache_key default-off upgrade notice — dismissal is
+        // #5548: built-in notices — one region, one loop; per-notice activity
+        // is decided server-side (src/notices.ts registry), dismissal stays
         // server-side (POST /__bili/notices/dismiss) so one close silences
-        // every browser; the banner re-renders from the refetched overview.
-        const nb = $("pck-notice-banner");
-        if (nb) {
-            const pn = d.pckNotice && typeof d.pckNotice === "object" ? d.pckNotice : null;
-            if (pn && pn.active === true) {
-                nb.hidden = false;
-                nb.classList.add("show");
-                nb.innerHTML = bili_pckNoticeBanner({ on: t("pckoff.on"), desc: t("pckoff.desc"), hint: t("pckoff.hint"), dismiss: t("pckoff.dismiss_btn") });
-                for (const btn of Array.from(nb.querySelectorAll(".pck-notice-dismiss"))) {
-                    btn.addEventListener("click", async () => {
-                        busy(btn, true);
-                        try {
-                            await json(API_ROOT + "/notices/dismiss", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id: typeof pn.id === "string" ? pn.id : "" }) });
-                            toast(t("pckoff.dismissed"), "ok");
-                            await loadOverview(true);
-                        } catch (e) {
-                            toast(e.message, "err");
-                        } finally {
-                            busy(btn, false);
-                        }
-                    });
+        // every browser. Tone + i18n keys come from the payload.
+        const nr = $("notices-banner-region");
+        if (nr) {
+            const list = Array.isArray(d.notices) ? d.notices : [];
+            nr.innerHTML = "";
+            for (const n of list) {
+                if (!n || typeof n !== "object" || typeof n.id !== "string") continue;
+                const el = document.createElement("div");
+                el.className = "banner " + (n.tone === "ok" ? "ok" : n.tone === "warn" ? "warn" : "");
+                // .banner is display:none until .show — #5548's loop never added it,
+                // so every merged notice (builtin + file + feed) rendered invisibly.
+                el.classList.add("show");
+                el.dataset.id = n.id;
+                nr.appendChild(el);
+                if (n.source !== "builtin") {
+                    el.innerHTML = bili_noticeBanner({ on: bili_pickLoc(n.title), desc: bili_pickLoc(n.desc), hint: bili_pickLoc(n.hint), dismiss: t("notices.dismiss_btn"), cta: n.ctaUrl ? { label: n.ctaLabel ?? "", url: n.ctaUrl } : null, hideDismiss: !!n.suppressDismiss });
+                } else {
+                    const k = n.keys && typeof n.keys === "object" ? n.keys : {};
+                    el.innerHTML = bili_noticeBanner({ on: t(String(k.on)), desc: t(String(k.desc)), hint: t(String(k.hint)), dismiss: k.dismiss ? t(String(k.dismiss)) : t("notices.dismiss_btn"), cta: null, hideDismiss: false });
                 }
-            } else {
-                nb.hidden = true;
-                nb.classList.remove("show");
-                nb.innerHTML = "";
+            }
+            for (const btn of Array.from(nr.querySelectorAll(".notice-dismiss"))) {
+                btn.addEventListener("click", async () => {
+                    busy(btn, true);
+                    const holder = btn.closest(".banner");
+                    try {
+                        await json(API_ROOT + "/notices/dismiss", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id: holder ? holder.dataset.id : "" }) });
+                        toast(t("notices.dismissed"), "ok");
+                        await loadOverview(true);
+                    } catch (e) {
+                        toast(e.message, "err");
+                    } finally {
+                        busy(btn, false);
+                    }
+                });
             }
         }
         // #1682: global upstream-connection alert banner — visible on every view,
@@ -1603,6 +1726,7 @@ function changelogCatOf(rawLine) {
     function alertHint(kind) {
         switch (kind) {
             case "connect-timeout": return t("alert.hint.connect_timeout");
+            case "upstream-unreachable": return t("alert.hint.upstream_unreachable");
             case "connect-refused": return t("alert.hint.connect_refused");
             case "proxy-reset": return t("alert.hint.proxy_reset");
             case "upstream-reset": return t("alert.hint.upstream_reset");
@@ -2273,7 +2397,7 @@ function changelogCatOf(rawLine) {
         if (name === "bash" || name === "shell" || name === "run_command") return "t-shell";
         if (name === "read" || name === "write" || name === "edit" || name === "ls" || name === "glob" || name === "note") return "t-file";
         if (name === "grep" || name === "search_context" || name === "decompress" || name === "acp_retrieve") return "t-seek";
-        if (name === "compress" || name === "acp_status" || name === "acp_cache") return "t-fold";
+        if (name === "compress" || name === "acp_status" || name === "acp_cache" || name === "acp_retire" || name === "acp_restore" || name === "acp_rewrite") return "t-fold";
         return "";
     }
     function parseToolLine(line) {
@@ -3091,6 +3215,14 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         // #2904: no-ceiling output-budget pin — surface at the top of the detail
         // so GUI users see WHY long turns truncate (the /acp twin).
         if (d.outputBudgetDegraded) parts.push('<div class="banner warn show" style="margin-bottom:12px">' + escapeHtml(t("det.obudget_degraded", { model: d.outputBudgetDegraded.model, value: d.outputBudgetDegraded.value })) + "</div>");
+        if (d.contextAnalysis && d.contextAnalysis.text) {
+            // Context analysis: init size / nudge cadence / harvest acceptance /
+            // plain-language verdict — the question that used to take hours of
+            // manual log forensics (session-aedc188c investigation, 2026-11-08).
+            const ca = d.contextAnalysis;
+            const lines = ca.text.split("\\n").map((l) => "<div>" + escapeHtml(l) + "</div>");
+            parts.push('<div class="card" style="margin-top:16px"><div class="card-h"><span>' + t("det.context_analysis") + '</span><span class="hint">' + t("det.context_analysis_hint") + '</span></div><div class="card-b"><div class="mono small" style="line-height:1.8">' + lines.join("") + '</div></div></div>');
+        }
         if (Array.isArray(d.conflicts) && d.conflicts.length > 0) {
             // #2102: per-session evidence rows — the banner aggregates across sessions,
             // so this page is where its detail pointer lands.
@@ -3848,6 +3980,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         function compressOf(d) { return (d.compress && typeof d.compress === "object" && !Array.isArray(d.compress)) ? d.compress : null; }
         const NUDGE_DEFAULT = 50000, NUDGE_STEP = 5000, NUDGE_LOW = 20000, NUDGE_HIGH = 100000;
         const PRM_KERNEL_DEFAULT = 3;
+        const SUMFLOOR_DEFAULT = 50;
         const brokenNote = document.createElement("div");
         brokenNote.style.cssText = "min-height:16px;font-size:12px;color:#cf222e";
         box.appendChild(brokenNote);
@@ -3871,6 +4004,8 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             tsRow.inp.checked = cp ? cp.messageTimestamps !== false : true;
             const ab = (cp && cp.absorb && typeof cp.absorb === "object" && !Array.isArray(cp.absorb)) ? cp.absorb : null;
             abRow.inp.checked = ab ? ab.enabled === true : false;
+            rnRow.inp.checked = cp ? cp.requireNudge === true : false;
+            rrRow.inp.checked = cp ? cp.requireRecommendation === true : false;
             const pv = (cp && typeof cp.promptPack === "string") ? cp.promptPack : "default";
             while (packSel.options.length > 0) packSel.removeChild(packSel.lastChild);
             (packNames.length ? packNames : ["default", "lean"]).forEach((name) => {
@@ -3903,10 +4038,30 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             }
             pckSel.value = pcv;
             updatePckNote();
+            const wf = draft.rollout && typeof draft.rollout === "object" && !Array.isArray(draft.rollout) && draft.rollout.features && typeof draft.rollout.features === "object" && !Array.isArray(draft.rollout.features) ? draft.rollout.features.pluginFullResendWatermark : undefined;
+            let wmv = "default";
+            if (wf === true) wmv = "on"; else if (wf === false) wmv = "off";
+            while (wmSel.options.length > 0) wmSel.removeChild(wmSel.lastChild);
+            WM_VALUES.forEach((name) => {
+                const o = document.createElement("option");
+                o.value = name;
+                o.textContent = name;
+                wmSel.appendChild(o);
+            });
+            if (wf !== undefined && !WM_VALUES.includes(wmv)) {
+                const o = document.createElement("option");
+                o.value = String(wf);
+                o.textContent = String(wf) + " *";
+                wmSel.appendChild(o);
+                wmv = String(wf);
+            }
+            wmSel.value = wmv;
+            updateWmNote();
             nudge.value = String(cp && typeof cp.nudgeGrowthTokens === "number" ? cp.nudgeGrowthTokens : NUDGE_DEFAULT);
             updateNudgeNote();
             refreshTierInputs();
             prm.value = String(cp && typeof cp.preserveRecentMessages === "number" ? cp.preserveRecentMessages : PRM_KERNEL_DEFAULT);
+            sumfloor.value = String(cp && typeof cp.minSummaryLength === "number" ? cp.minSummaryLength : SUMFLOOR_DEFAULT);
             ptInp.value = (cp && Array.isArray(cp.protectedTools)) ? cp.protectedTools.join(", ") : "";
             const nv = (cp && Array.isArray(cp.neverPreserveRecentTools)) ? cp.neverPreserveRecentTools : null;
             neInp.value = nv ? nv.filter((x) => typeof x === "string").join(", ") : "";
@@ -4015,6 +4170,43 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         abHint.className = "dim small";
         abHint.textContent = t("cfg.q_absorb_hint");
         abRow.ctl.appendChild(abHint);
+        // #5683: unprompted/out-of-bounds compression gates (compress.* booleans).
+        const rnRow = row("quick-require-nudge", t("cfg.q_require_nudge"));
+        qCtrls.push(rnRow.inp);
+        rnRow.inp.addEventListener("change", () => commit((d) => {
+            if (rnRow.inp.checked) {
+                if (!compressOf(d)) d.compress = {};
+                d.compress.requireNudge = true;
+            } else {
+                const c = compressOf(d);
+                if (c) {
+                    delete c.requireNudge;
+                    if (Object.keys(c).length === 0) delete d.compress;
+                }
+            }
+        }));
+        const rnHint = document.createElement("span");
+        rnHint.className = "dim small";
+        rnHint.textContent = t("cfg.q_require_nudge_hint");
+        rnRow.ctl.appendChild(rnHint);
+        const rrRow = row("quick-require-rec", t("cfg.q_require_rec"));
+        qCtrls.push(rrRow.inp);
+        rrRow.inp.addEventListener("change", () => commit((d) => {
+            if (rrRow.inp.checked) {
+                if (!compressOf(d)) d.compress = {};
+                d.compress.requireRecommendation = true;
+            } else {
+                const c = compressOf(d);
+                if (c) {
+                    delete c.requireRecommendation;
+                    if (Object.keys(c).length === 0) delete d.compress;
+                }
+            }
+        }));
+        const rrHint = document.createElement("span");
+        rrHint.className = "dim small";
+        rrHint.textContent = t("cfg.q_require_rec_hint");
+        rrRow.ctl.appendChild(rrHint);
         const packSel = document.createElement("select");
         packSel.className = "field-input mono";
         qCtrls.push(packSel);
@@ -4447,6 +4639,41 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             if (PCK_VALUES.includes(pckSel.value)) pc.routing = pckSel.value; else delete pc.routing;
             if (Object.keys(pc).length === 0) delete d.promptCache; else d.promptCache = pc;
         }));
+        // #5403: watermark fastpath grey-rollout switch — maps 1:1 onto
+        // rollout.features.pluginFullResendWatermark (default follows the
+        // baked percent; on/off pin it per install). salt/base untouched.
+        const WM_VALUES = ["default", "on", "off"];
+        const wmSel = document.createElement("select");
+        wmSel.className = "field-input mono";
+        qCtrls.push(wmSel);
+        const ww = document.createElement("div");
+        ww.style.cssText = "display:flex;gap:12px;align-items:center;flex-wrap:wrap";
+        const wlab = document.createElement("label");
+        wlab.htmlFor = "quick-wm";
+        wlab.style.cssText = "flex:0 1 auto;max-width:520px";
+        wlab.textContent = t("cfg.q_wm");
+        wmSel.id = "quick-wm";
+        ww.appendChild(wlab);
+        ww.appendChild(wmSel);
+        box.appendChild(ww);
+        const wmNote = document.createElement("div");
+        wmNote.style.cssText = "margin:-6px 0 4px;font-size:12px;color:#57606a";
+        function updateWmNote() {
+            if (wmSel.value === "on") wmNote.textContent = t("cfg.q_wm_on_desc");
+            else if (wmSel.value === "off") wmNote.textContent = t("cfg.q_wm_off_desc");
+            else if (wmSel.value !== "default") wmNote.textContent = t("cfg.q_wm_custom");
+            else wmNote.textContent = t("cfg.q_wm_default_desc");
+        }
+        box.appendChild(wmNote);
+        wmSel.addEventListener("change", () => commit((d) => {
+            let roll = (d.rollout && typeof d.rollout === "object" && !Array.isArray(d.rollout)) ? d.rollout : {};
+            const feats = (roll.features && typeof roll.features === "object" && !Array.isArray(roll.features)) ? roll.features : {};
+            if (wmSel.value === "on") feats.pluginFullResendWatermark = true;
+            else if (wmSel.value === "off") feats.pluginFullResendWatermark = false;
+            else delete feats.pluginFullResendWatermark;
+            if (Object.keys(feats).length === 0) delete roll.features; else roll.features = feats;
+            if (Object.keys(roll).length === 0) delete d.rollout; else d.rollout = roll;
+        }));
         const nudge = document.createElement("input");
         nudge.type = "number";
         nudge.id = "quick-nudge";
@@ -4604,6 +4831,17 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             const v = parseInt(prm.value, 10);
             if (!isNaN(v) && v > 0 && v !== PRM_KERNEL_DEFAULT) d.compress.preserveRecentMessages = v;
             else { delete d.compress.preserveRecentMessages; prm.value = String(PRM_KERNEL_DEFAULT); }
+        }));
+        const sumfloor = textRow("quick-sumfloor", t("cfg.q_sumfloor"), t("cfg.q_sumfloor_ph"));
+        sumfloor.type = "number";
+        sumfloor.min = "0";
+        sumfloor.style.flex = "0 0 140px";
+        qCtrls.push(sumfloor);
+        sumfloor.addEventListener("change", () => commit((d) => {
+            if (!compressOf(d)) d.compress = {};
+            const v = parseInt(sumfloor.value, 10);
+            if (!isNaN(v) && v >= 0 && v !== SUMFLOOR_DEFAULT) d.compress.minSummaryLength = v;
+            else { delete d.compress.minSummaryLength; sumfloor.value = String(SUMFLOOR_DEFAULT); }
         }));
         const NEVER_DEFAULT = ["decompress", "search_context", "read", "bash"];
         const neInp = textRow("quick-never", t("cfg.q_never"), t("cfg.q_never_ph"));
@@ -4828,6 +5066,9 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             $("log-count").textContent = d.total > 0
                 ? t("logs.count", { n: (d.lines || []).length, total: d.total }) + ((typeof d.omitted === "number" && d.omitted > 0) ? t("logs.omitted", { o: d.omitted }) : "")
                 : "";
+            if (Array.isArray(d.unreadable) && d.unreadable.length > 0) {
+                $("log-count").textContent += " · " + t("logs.incomplete", { n: d.unreadable.length });
+            }
             const bodyEl = $("log-body");
             const rows = d.lines || [];
             if (!rows.length) {
@@ -4935,47 +5176,36 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         if (lsearch) lsearch.addEventListener("input", () => { clearTimeout(logTimer); logTimer = setTimeout(loadLogs, 400); });
         const llines = $("log-lines");
         if (llines) llines.addEventListener("change", loadLogs);
-        const ldl = $("log-dl");
-        if (ldl) ldl.addEventListener("click", async () => {
-            busy(ldl, true);
-            try {
-                const q = ($("log-search").value || "").trim();
-                const r = await fetch(API_ROOT + "/logs?raw=1&q=" + encodeURIComponent(q) + "&lines=2000" + logViewExtras());
-                const blob = await r.blob();
-                const a = document.createElement("a");
-                a.href = URL.createObjectURL(blob);
-                a.download = "billion-context-log.txt";
-                document.body.appendChild(a);
-                a.click();
-                a.remove();
-                setTimeout(() => URL.revokeObjectURL(a.href), 4000);
-            } catch (e) {
-                toast(t("toast.failed", { msg: e.message }), "err");
-            } finally {
-                busy(ldl, false);
-            }
-        });
-        const ldlAll = $("log-dl-all");
-        if (ldlAll) ldlAll.addEventListener("click", async () => {
-            busy(ldlAll, true);
-            try {
-                // Full unfiltered log (rotated .old + current) regardless of the
-                // search box — the honest "download everything" path.
-                const r = await fetch(API_ROOT + "/logs?raw=1&all=1");
-                const blob = await r.blob();
-                const a = document.createElement("a");
-                a.href = URL.createObjectURL(blob);
-                a.download = "billion-context-full-log.txt";
-                document.body.appendChild(a);
-                a.click();
-                a.remove();
-                setTimeout(() => URL.revokeObjectURL(a.href), 4000);
-            } catch (e) {
-                toast(t("toast.failed", { msg: e.message }), "err");
-            } finally {
-                busy(ldlAll, false);
-            }
-        });
+        for (const id of ["log-ctx", "log-win"]) {
+            const control = $(id);
+            if (control) control.addEventListener("change", loadLogs);
+        }
+        for (const [buttonId, all] of [["log-dl", false], ["log-dl-all", true]]) {
+            const button = $(buttonId);
+            if (button) button.addEventListener("click", async () => {
+                busy(button, true);
+                try {
+                    const q = ($("log-search").value || "").trim();
+                    const query = all ? "raw=1&all=1" : "raw=1&q=" + encodeURIComponent(q) + "&lines=2000" + logViewExtras();
+                    const response = await fetch(API_ROOT + "/logs?" + query);
+                    if (!response.ok) throw new Error("HTTP " + response.status);
+                    const unreadable = response.headers.get("x-bili-log-incomplete");
+                    if (unreadable) toast(t("logs.incomplete", { n: unreadable }), "err");
+                    const blob = await response.blob();
+                    const a = document.createElement("a");
+                    a.href = URL.createObjectURL(blob);
+                    a.download = all ? "billion-context-full-log.txt" : "billion-context-log.txt";
+                    document.body.appendChild(a);
+                    a.click();
+                    a.remove();
+                    setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+                } catch (e) {
+                    toast(t("toast.failed", { msg: e.message }), "err");
+                } finally {
+                    busy(button, false);
+                }
+            });
+        }
         const testBtn = $("test-upstream");
         if (testBtn) testBtn.addEventListener("click", async () => {
             busy(testBtn, true);

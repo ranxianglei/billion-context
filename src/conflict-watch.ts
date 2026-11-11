@@ -120,10 +120,10 @@ export function conflictClientOf(session: Session): string | undefined {
 
 /** #2219: where the full client×mechanism matrix lives — every hint surface
  *  points here instead of duplicating the matrix. */
-export const CONFLICT_DOCS_POINTER = 'CONFIGURATION.md → "Detecting other compression plugins (#1206)"';
+export const CONFLICT_DOCS_POINTER = 'docs/configuration.md → "Detecting other compression plugins (#1206)"';
 
 // #2219: one-line per-client remediation for the conflict surfaces. Each entry
-// mirrors its doc anchor (README opencode section / CONFIGURATION.md claude
+// mirrors its doc anchor (README opencode section / docs/configuration.md claude
 // auto-compact alignment + BILI_CODEX_COMPACT / pi·omp carriage evidence
 // #851/#1382); keep each entry ONE line — these render inline in acp_status
 // text, the web banner, and launcher stderr.

@@ -216,9 +216,9 @@ export function buildRescaleNote(opts: {
     origKb: number;
     ratio: number;
 }): string {
-    const head = `[bili] 本图已降采样:当前 ${opts.width}×${opts.height} / ${opts.kb}KB;原图 ${opts.origWidth}×${opts.origHeight} / ${opts.origKb}KB`;
+    const head = `[bili][resized] 本图已降采样/downsampled: now ${opts.width}×${opts.height} (${opts.kb}KB), original ${opts.origWidth}×${opts.origHeight} (${opts.origKb}KB)`;
     if (opts.ref !== undefined && opts.toolArmed) {
-        return `${head}(约 ${opts.ratio.toFixed(1)} 倍)。需要原分辨率细节(小字、颜色、对齐)时,调用 acp_read_original_image("${opts.ref}") 读取原图。原图较大,按需读取。`;
+        return `${head}. (≈${opts.ratio.toFixed(1)}×) Call acp_read_original_image("${opts.ref}") to read the original when full-resolution detail matters (small text, colors, alignment). 需要原分辨率细节时调用该工具读取原图,按需读取。`;
     }
     return `${head}。`;
 }
