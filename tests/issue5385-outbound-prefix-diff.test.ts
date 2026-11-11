@@ -88,3 +88,16 @@ test("same-length re-encoding with different bytes still breaks (content hash)",
     assert.equal(out[0].level, "info");
     assert.match(out[0].msg, /BREAK@1/);
 });
+
+test("history shrinkage reports the break boundary with an end sentinel", () => {
+    const out: Log[] = [];
+    const meta: Record<string, unknown> = {};
+    const log = makeLog(out);
+    observeOutboundPrefix("s6", [m0(), m1(), m2()], meta, log);
+    observeOutboundPrefix("s6", [m0(), m1()], meta, log);
+    assert.equal(out.length, 1);
+    assert.equal(out[0].level, "info");
+    assert.match(out[0].msg, /lcp=2\/2 \(prev 3\)/);
+    assert.match(out[0].msg, /BREAK@2/);
+    assert.match(out[0].msg, /<end>/, "the shorter list reads as <end> at the break boundary");
+});
