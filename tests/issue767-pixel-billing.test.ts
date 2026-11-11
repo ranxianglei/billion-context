@@ -64,6 +64,45 @@ function bmpB64(w: number, h: number): string {
     return b.toString("base64");
 }
 
+// #6179: BITMAPCOREHEADER variant — bfSize==12 marker at offset 14 with 16-bit
+// dims at offsets 16 (w) / 18 (h). Distinct from bmpB64 above (INFO, biSize==40).
+function bmpCoreB64(w: number, h: number): string {
+    const b = Buffer.alloc(26);
+    b.write("BM", 0, "ascii");
+    b.writeUInt32LE(26, 2);
+    b.writeUInt32LE(26, 10);
+    b.writeUInt16LE(12, 14); // bfSize = 12 → CORE layout
+    b.writeUInt16LE(w, 16);
+    b.writeUInt16LE(h, 18);
+    b.writeUInt16LE(1, 20);  // planes
+    b.writeUInt16LE(24, 22); // bit count
+    return b.toString("base64");
+}
+
+// #6179: an unsupported short DIB size (neither 12 nor >=40) must be rejected.
+function bmpShortDibB64(dibSize: number): string {
+    const b = Buffer.alloc(26);
+    b.write("BM", 0, "ascii");
+    b.writeUInt32LE(26, 2);
+    b.writeUInt32LE(26, 10);
+    b.writeUInt16LE(dibSize, 14);
+    b.writeUInt16LE(100, 16);
+    b.writeUInt16LE(100, 18);
+    return b.toString("base64");
+}
+
+// #6179: an INFO header with a negative width is invalid and must be rejected.
+function bmpNegWidthInfoB64(): string {
+    const b = Buffer.alloc(40);
+    b.write("BM", 0, "ascii");
+    b.writeUInt32LE(40, 2);
+    b.writeUInt32LE(40, 10);
+    b.writeUInt32LE(40, 14); // biSize = 40 → INFO layout
+    b.writeInt32LE(-1, 18);  // negative width
+    b.writeInt32LE(100, 22);
+    return b.toString("base64");
+}
+
 function webpVp8B64(w: number, h: number): string {
     const b = Buffer.alloc(32);
     b.write("RIFF", 0, "ascii");
@@ -143,6 +182,26 @@ test("#767 unit: decodeImageDims parses container headers without full decode", 
     assert.deepEqual(decodeImageDims(jpegB64(512, 384)), { w: 512, h: 384 }, "JPEG dims found behind APP0+EXIF padding");
     assert.equal(decodeImageDims("A".repeat(64)), undefined, "unparsable garbage falls back to flat cost");
     assert.equal(decodeImageDims(Buffer.from([0x89, 0x50, 0x4e, 0x47]).toString("base64")), undefined, "truncated header → fallback");
+});
+
+test("#6179 unit: BITMAPCOREHEADER reads 16-bit dims — no fused-width misparse", () => {
+    // A valid 64×128 CORE-header BMP used to parse as {w:65664,h:24}: the old reader
+    // always used the 32-bit INFO layout, fusing height+planes into width and reading
+    // the bit-count field as height → billed 765 tokens instead of the true 1105.
+    assert.deepEqual(decodeImageDims(bmpCoreB64(64, 128)), { w: 64, h: 128 }, "CORE 64×128 reads true dims");
+    assert.deepEqual(decodeImageDims(bmpCoreB64(32, 16)), { w: 32, h: 16 }, "CORE small image");
+    assert.deepEqual(decodeImageDims(bmpCoreB64(1000, 500)), { w: 1000, h: 500 }, "CORE large image");
+    // The INFO path is unchanged: bottom-up (bmpB64) and top-down magnitude preserved.
+    assert.deepEqual(decodeImageDims(bmpB64(640, 480)), { w: 640, h: 480 }, "INFO bottom-up unchanged");
+    assert.deepEqual(decodeImageDims(bmpB64(100, -50)), { w: 100, h: 50 }, "INFO top-down magnitude preserved");
+    // Reject invalid / unsupported layouts rather than guessing dimensions.
+    assert.equal(decodeImageDims(bmpNegWidthInfoB64()), undefined, "negative INFO width rejected");
+    assert.equal(decodeImageDims(bmpShortDibB64(8)), undefined, "unsupported short DIB (size 8) rejected");
+    assert.equal(decodeImageDims(bmpShortDibB64(11)), undefined, "unsupported short DIB (size 11) rejected");
+    // End-to-end: the 64×128 CORE BMP bills its TRUE dims through pixels mode,
+    // not the misparsed fused-width estimate.
+    const coreBody = { input: [{ type: "message", role: "user", content: [{ type: "input_image", image_url: `data:image/bmp;base64,${bmpCoreB64(64, 128)}` }] }] };
+    assert.equal(imageTokensInParsedBody("responses", coreBody, "pixels"), pixelTileEstimate(64, 128), "64×128 CORE bills its true tile cost");
 });
 
 test("#767 unit: pixelTileEstimate matches the OpenAI high-detail tile model", () => {

@@ -85,8 +85,24 @@ function gifDims(b: Buffer): Dims | undefined {
 
 function bmpDims(b: Buffer): Dims | undefined {
     if (b.length < 26 || b[0] !== 0x42 || b[1] !== 0x4d) return undefined; // "BM"
-    const w = b.readUInt32LE(18), h = Math.abs(b.readInt32LE(22));
-    return w > 0 && h > 0 ? { w, h } : undefined;
+    // The DIB header follows the 14-byte file header; its leading size field
+    // selects the dimension layout (#6179): BITMAPCOREHEADER (size==12) stores
+    // 16-bit dims at offsets 16 (width) / 18 (height), while BITMAPINFOHEADER
+    // and every V2–V5 extension (size>=40) store 32-bit signed dims at 18/22.
+    // Reading the low 16 bits discriminates both cleanly — all valid sizes carry
+    // zero high bits, so it is exact for the WORD-sized CORE field too.
+    const dibSize = b.readUInt16LE(14);
+    if (dibSize === 12) {
+        const w = b.readUInt16LE(16), h = b.readUInt16LE(18);
+        return w > 0 && h > 0 ? { w, h } : undefined;
+    }
+    if (dibSize >= 40) {
+        // Negative height encodes top-down scan order — take its magnitude. A
+        // negative width is invalid and rejected by the w > 0 gate below.
+        const w = b.readInt32LE(18), h = Math.abs(b.readInt32LE(22));
+        return w > 0 && h > 0 ? { w, h } : undefined;
+    }
+    return undefined; // unsupported short/unknown DIB layout
 }
 
 function webpDims(b: Buffer): Dims | undefined {
