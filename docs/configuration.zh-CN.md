@@ -310,6 +310,7 @@
 | `compress.injectNudge` | boolean | true | ACP_COMPRESS_NUDGE | 窗口填满过程中发送增长提醒（仅全局层级生效）。 |
 | `compress.reasoning` | { drop?, threshold? } | drop true · threshold 2048 | — | 丢弃超过 2048 字符的已结束轮次推理块（drop 默认 true）；严格推理上游需设 drop:false。 |
 | `compress.absorb` | object | opt-in (disabled) | — | 可选即时蒸馏：把工具结果蒸馏成短摘要，原文进内容库。默认仅图片类结果参与。 |
+| `compress.blockOps` | object | off | — | 可选的压缩块生命周期工具（acp_retire / acp_restore / acp_rewrite）；默认关闭，关闭时线上字节与 #5765 之前完全一致。 |
 | `compress.ccr` | object | enabled in proxy mode since v2 | — | 内容缓存与回取：大输出无损存到会话旁、替换为首段摘录+指针，模型用 acp_retrieve 取回原文；无上限、永不清除。 |
 | `compress.search` | object | off | — | search_context 的检索行为设置；当前含 planAware 重排。 |
 | `compress.search.planAware` | boolean | false | — | 开启后 search_context 候选按当前计划状态重排；关闭时结果逐字节不变。 |
@@ -325,6 +326,7 @@
 | `compress.absorb.excludeTools` | string[] | [] | — | 排除出吸收范围的工具名。 |
 | `compress.absorb.toolName` | string | "absorb" | — | absorb 工具的注册名。 |
 | `compress.absorb.mediaOnly` | boolean | true | — | 仅吸收携带媒体（图片）的工具结果；图片字节不计入文本 token，故豁免 minToolTokens 门槛。置 false 恢复对任意大结果的全文吸收（旧行为）。 |
+| `compress.blockOps.enabled` | boolean | false | — | 启用三个压缩块生命周期工具（注入 + prompt + manifest）。关闭 = 无工具、无 prompt 段、零每请求开销。 |
 | `compress.ccr.enabled` | boolean | true (proxy mode) | — | 启用内容缓存与回取块。 |
 | `compress.ccr.minToolTokens` | number | ≈4000 | — | 可进入 CCR 存储的工具结果的最小估算 token 大小。 |
 | `compress.ccr.excludeTools` | string[] | [] | — | 排除出 CCR 存储的工具名。 |
@@ -1618,6 +1620,17 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
   - `excludeTools: string[]` — 永不吸收的工具名模式。**已知限制：对工具*结果*目前无效，直到 [ranxianglei/acp-kernel#213](https://github.com/ranxianglei/acp-kernel/issues/213) 修复发布**（wire 投影不把 `toolName` 携带在结果上，内核名称守卫无法命中）。
   - `toolName: string` — 重命名注入工具（默认 `"absorb"`）；声明/注入的模式、系统提示段与按会话裁决在两条车道中都跟随该名称。**车道治理（#1359）：** 插件模式用**基础**配置治理整个 `absorb` 块，因此重命名后的工具既以该名声明、也以该名执行（二者永不背离）；provider/model 层的 `absorb.*` 覆盖**仅限代理车道**（代理注入并裁决合并后的名称）。加载时会输出一条警告，列出任何取值与基础值不同的 provider/model `absorb.*` 字段。
   注入跟随线上原生工具面：代理模式在 anthropic/openai/responses 原生工具线上注入工具（按每请求解析的名称）+ 系统提示段，插件模式在插件清单中广告它（MCP shell 自动拾取）。Responses **marker/文本协议**路由不支持（无原生工具面 — 强制的 absorb 指令不可满足），标题生成请求（`max_tokens ≤ 200`）跳过注入如压缩提示一样。吸收配对在重启后保持隐藏（在会话状态持久化）。
+
+#### `blockOps`
+
+- **类型：** `object`（`{ enabled? }`）
+- **默认：** *(关 — 只有 `enabled: true` 时才注入工具)*
+- **状态：** 已启用（issue #5765）
+- **说明：** 可选的**压缩块生命周期管理**。启用后，三个工具与 ACP 工具一并注入（代理通道）/ 上报（插件通道），各有独立 system-prompt 段；同时为每个会话存一份生效开关，保证插件工具 API 解析到与线上相同的值：
+  - `acp_retire` — 把 active 压缩块移出常驻视图（其摘要不再随每个请求发送；仍可按 id 用 `acp_restore` / `decompress` / `search_context` 取回）。
+  - `acp_restore` — 把已退场块放回常驻视图。
+  - `acp_rewrite` — 原地替换块摘要（保留一步回滚位 `previousSummary`；相同/空白摘要拒收）。
+  内核状态变更幂等、可批量（`blockId` 单块或 `ids` 数组）。**为何默认关：** 三个工具 schema 在启用期间是常驻面——每个会话每个请求约 +0.7k 估算 token——所以不显式开启时，线上表面（工具数组、prompt、manifest）与 #5765 之前逐字节一致。关闭时的误调会得到面向模型的「not enabled on this bili proxy (compress.blockOps.enabled is not true)」回执而非报错，且绝不改动状态。退场/改写状态跨重启持久化在会话状态中，导出台账（markdown handoff + JSONL）报告 `retired` 状态、消息 ref 区间与原文/摘要字符数。
 
 #### `ccr`
 
