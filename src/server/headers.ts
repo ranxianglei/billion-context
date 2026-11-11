@@ -9,7 +9,7 @@ export function safeSessionId(id: string | undefined): string {
  *  history are resolved by prefix affinity (#309); only degenerate probes
  *  (empty / system-only, or a fingerprint-sized history) fail explicitly. */
 export const NO_IDENTITY_MESSAGE =
-    "Missing stable conversation identity. Send one of the headers: x-session-id, x-session-affinity, x-acp-session, x-opencode-session-id, x-opencode-session, x-claude-code-session-id, session-id — or body session_id / prompt_cache_key (responses/openai/anthropic). Requests replaying a conversation history are matched by content prefix affinity (#309); this one carries no usable history signal.";
+    "Missing stable conversation identity. Send one of the headers: x-claude-code-session-id, x-grok-session-id/x-grok-conv-id, x-mavis-session-id, agent-session-id, x-opencode-session-id, x-session-affinity, x-acp-session, x-conversation-id, x-session-id, x-opencode-session, session-id/session_id — or body session_id / prompt_cache_key (responses/openai/anthropic). Requests replaying a conversation history are matched by content prefix affinity (#309); this one carries no usable history signal.";
 
 export const UPSTREAM_HOP_HEADERS = new Set([
     "host",
