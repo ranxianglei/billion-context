@@ -2208,8 +2208,8 @@ export class MysqlBackend implements StorageBackend {
         }
         if (keyPrefix !== undefined && keyPrefix !== "") {
             validateExtKey(keyPrefix, "key prefix");
-            where.push("kv_key LIKE CONCAT(?, '%')");
-            args.push(keyPrefix.replace(/[\\%_]/g, (ch) => "\\" + ch));
+            where.push("kv_key LIKE CONCAT(?, '%') AND LOCATE(CAST(? AS BINARY), CAST(kv_key AS BINARY)) = 1");
+            args.push(keyPrefix.replace(/[\\%_]/g, (ch) => "\\" + ch), keyPrefix);
         }
         const sql =
             "SELECT namespace, kv_key, value_json, updated_at FROM kv_store" +
