@@ -2794,7 +2794,7 @@ async function handleRequest(
                 const proofModel = (parsed as { model?: string }).model ?? "?";
                 if (!headroomFallbackLogged.has(`${proofModel}|proven-completion`)) {
                     headroomFallbackLogged.add(`${proofModel}|proven-completion`);
-                    log("info", `[headroom] model=${proofModel}: reserving the PROVEN completion share ${provenReserve} although protocol ${protocol ?? "unknown"} is exempt (#3450) — this origin+model billed completion inside the wall in an earlier rejection; judging input against ${nativeWindow} - ${provenReserve}`);
+                    log("info", `[headroom] model=${proofModel}: reserving the PROVEN completion share ${provenReserve} although ${skipForCodexWindow ? "the codex-aligned window already nets out codex's own output headroom" : `protocol ${protocol ?? "unknown"} is exempt`} (#3450) — this origin+model billed completion inside the wall in an earlier rejection; judging input against ${nativeWindow} - ${provenReserve}`);
                 }
             }
             // #2283 sub-defect 1: emit [window-change] when the per-session resolution
