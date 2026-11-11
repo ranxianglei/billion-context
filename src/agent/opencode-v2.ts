@@ -50,6 +50,7 @@
 
 import { randomUUID } from "node:crypto";
 import { ACP_TOOLS_OPENAI, ABSORB_TOOL_OPENAI } from "../compress-tool.js";
+import { stampedMsgIdsHeaderFromMessages } from "./opencode-v2-msgids.js";
 import { asciiHeaderValue, fetchManifest, fetchProxyVersion, fetchStatus, fitNoticeDescription, forwardTool, postIdentityRegister, proxyBaseFromEnv, proxyBaseFromUrl, reportCompactionBoundary, reportRuntimeInfoOnChange, V2_SYNTHETIC_TEXT } from "./shared.js";
 import { createForkAdopter } from "./fork-adopt.js";
 import { directExemptMatch, isModelApiUrl, routedBiliModelUrl } from "./native-intercept.js";
@@ -88,6 +89,9 @@ export interface V2HttpRequestEvent {
      *  x-bili-plugin-* header or lane-only body ever rides the direct send. The
      *  host spreads its own event fields and ignores this one. */
     biliDirect?: boolean;
+    /** http.response events only (@opencode/cli 2.2.x): the upstream reply,
+     *  paired with the request that was actually sent (e.request). */
+    response?: Response;
 }
 
 interface V2ToolEditor {
@@ -278,6 +282,12 @@ interface OpencodeV2SetupOptions {
      *  marker header. Absent in launcher mode. Must never throw — the hook
      *  itself wraps it, but adapters also guard internally. */
     incremental?: (e: V2HttpRequestEvent, state: V2State) => void | Promise<void>;
+    /** Native mode only: called from the http.response hook (@opencode/cli
+     *  2.2.x fires it per provider request with the SENT request and the
+     *  upstream response). This is the V2 ack seam for incremental turns —
+     *  V2 attach/spawn modes install no fetch intercept, so without it no
+     *  `x-bili-applied-seq` ack ever lands. Must never throw. */
+    onResponse?: (e: V2HttpRequestEvent, state: V2State) => void | Promise<void>;
     /** #1362: cooldown between failed derived-session register attempts (tests inject). */
     derivedRetryMs?: number;
 }
@@ -338,6 +348,13 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
             // instruction drift (AGENTS.md reconcile) must not fork the
             // compression session.
             headers.set("x-bili-plugin-instructions-mutable", "1");
+            // #5825: host msgIds on the V2 wire. Read from THIS event's
+            // structured message list (the very payload this turn sends —
+            // ids ride only when every one carries a usable host id, else no
+            // header); the server re-proves exact count parity vs the wire
+            // before trusting them, so drift degrades instead of misaligning.
+            const msgIdsHeader = stampedMsgIdsHeaderFromMessages(e.messages);
+            if (msgIdsHeader !== undefined) headers.set("x-bili-msg-ids", msgIdsHeader);
             // #1699: forward the host's per-request persona so the proxy can classify
             // side requests by intent — opencode v2 title-gen carries no max_tokens, so
             // the budget heuristic alone can never see it. Stamped for every non-empty
@@ -424,6 +441,28 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
 
         const hookReg = await ctx.session?.hook?.("http.request", httpRequestHook);
         if (hookReg) registrations.push(hookReg);
+
+        // #5825: the `http.request` payload itself carries the structured turn
+        // (event.messages with host ids) — extraction lives in stampHeaders
+        // above, same event, so there is deliberately NO separate `context`
+        // hook here (that seam fired pre-request in older builds and could
+        // race the wire; reading this event can't).
+
+        if (options.onResponse !== undefined) {
+            const onResponse = options.onResponse;
+            try {
+                const respReg = await ctx.session?.hook?.("http.response", async (e) => {
+                    try {
+                        await onResponse(e, state);
+                    } catch {
+                        // observability only — never break the host's response
+                    }
+                });
+                if (respReg) registrations.push(respReg);
+            } catch {
+                // hosts without an http.response seam keep the 30s pending TTL fallback
+            }
+        }
 
         try {
             const wsReg = await ctx.session?.hook?.("experimental.ws.handshake", async (e) => {

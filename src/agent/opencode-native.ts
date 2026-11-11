@@ -82,8 +82,9 @@ import { ACP_TOOLS_OPENAI } from "../compress-tool.js";
 import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST, unwrapUpstream, wrapUpstream } from "../launcher.js";
 import { createAcpCommandHooks, showAcpText } from "./opencode-acp-command.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, setNativeOriginWaiter, singleFlight } from "./native-bootstrap.js";
-import { createLiveOriginResolver, installNativeFetchIntercept, isModelApiUrl, noteRoutedOrigin, observeRoutedOrigin, readyOrigin, replaceRequestPayload, routedBiliModelUrl, type LiveOriginResolverDeps, type NativeInterceptState, type UnavailableReason } from "./native-intercept.js";
-import { clearIncrementalProbe, createPrepareDirectSend, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalAck, noteIncrementalRejection, planIncrementalTurn, probeIncrementalTurns, rememberOriginalBody, sweepStale, wireMessagesLookAnthropic, type IncrementalWireMessage } from "./incremental-client.js";
+import { createLiveOriginResolver, installNativeFetchIntercept, isModelApiUrl, noteRoutedOrigin, observeRoutedOrigin, readyOrigin, replaceRequestPayload, routedBiliModelUrl, setDeclaredModelEndpoints, type LiveOriginResolverDeps, type NativeInterceptState, type UnavailableReason } from "./native-intercept.js";
+import { loadDeclaredModelEndpoints } from "../model-endpoints.js";
+import { clearIncrementalProbe, createPrepareDirectSend, incrementalCacheRetouchEnabled, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalAck, noteIncrementalRejection, planIncrementalTurn, probeIncrementalTurns, rememberOriginalBody, sweepStale, wireMessagesLookAnthropic, type IncrementalWireMessage } from "./incremental-client.js";
 import * as pfChannel from "./pf-channel.js";
 import { createOpencodeV2Setup, type V2HttpRequestEvent, type V2PluginContext, type V2State } from "./opencode-v2.js";
 import { alignedMsgIdsForWire, harvestOpencodeMsgIds } from "./opencode-msgids.js";
@@ -274,6 +275,25 @@ export function createNativeRoute(state: NativeInterceptState, deps: OpencodeNat
     };
 }
 
+// #5032 (the #5025 family): the shared guard measures an oversized body against
+// a window it takes from the stamped header OR this reader. The V1 header stamp
+// below only runs once an origin is known (`if (base === undefined) return;`),
+// so on the direct fallback both sources used to be empty and a history that had
+// outgrown the window egressed uncompressed into a guaranteed upstream 400.
+// Record the SAME client-declared number before that early return; unknown model
+// or window records undefined, so the guard keeps failing open (never a guess).
+let opencodeDeclaredWindow: number | undefined;
+
+/** Recorded window for the direct-send guard (#5032); undefined ⇒ fail open. */
+export function opencodeDeclaredWindowForDirect(): number | undefined {
+    return opencodeDeclaredWindow;
+}
+
+/** Test hook: drop the recorded window so suites start from a clean slate. */
+export function _resetOpencodeDeclaredWindowForTest(): void {
+    opencodeDeclaredWindow = undefined;
+}
+
 const state: NativeInterceptState = { origin: undefined, ready: Promise.resolve(undefined) };
 // #3304: the opencode swap stamps the turn id atomically with the body, so the
 // strict shared guard applies — mutated + unrestorable ⇒ refuse locally.
@@ -281,6 +301,9 @@ state.prepareDirectSend = createPrepareDirectSend();
 // #4276: providers.<url>.direct client-side exemptions apply to BOTH fetch
 // chains sharing this state (V1 server() + V2 setup) and to the V2 hook.
 state.directPrefixes = zcodeDirectPrefixes(process.env);
+// #5032: arm the guard's second window source — the V1 header stamp never runs
+// on the no-proxy path, so without this arm the reader was always empty there.
+state.declaredWindowForDirect = opencodeDeclaredWindowForDirect;
 
 async function bootstrap(): Promise<string | undefined> {
     try {
@@ -386,6 +409,9 @@ const plan = planNativeOpencode(process.env, loadConfigFile().opencode?.inline);
 export function armNativeOpencode(p: typeof plan): void {
     if (p.mode === "off") return;
     markNativeHost(process.env, "opencode");
+    // #1295: declared custom-wire endpoints — same config source as the proxy;
+    // takes effect on the next host start (config is read once at arm time).
+    void loadDeclaredModelEndpoints().then(setDeclaredModelEndpoints);
     if (p.mode === "attach") {
         state.attach = true;
         const attachOrigin = p.attachOrigin;
@@ -472,6 +498,11 @@ export function _stateRespawnForTest(): (() => Promise<string | undefined>) | un
     return state.respawn;
 }
 
+/** Test hook (#5032): expose the armed direct-send window reader. */
+export function _declaredWindowHookForTest(): (() => number | undefined) | undefined {
+    return state.declaredWindowForDirect;
+}
+
 /** Test hook (#1365): record routed-channel evidence without the fetch patch. */
 export function _noteRoutedForTest(url: string): void {
     noteRoutedOrigin(state, url);
@@ -488,6 +519,7 @@ export function _resetNativeStateForTest(): void {
     state.onGiveUp = undefined;
     state.ready = Promise.resolve(undefined);
     _spawnForTest = undefined;
+    opencodeDeclaredWindow = undefined;
     delete process.env.BILLION_CONTEXT_PROXY;
 }
 
@@ -829,6 +861,16 @@ export function createV1ServerHooks(getOrigin: () => string | undefined, ctx: V1
                 output.headers["x-bili-plugin-bypass"] = "1";
                 return;
             }
+            // #5032: record the window BEFORE the no-origin return — the stamp
+            // below never runs on the direct fallback, which left the shared
+            // guard with nothing to measure an oversized history against.
+            const declaredModel = input.model;
+            if (declaredModel && typeof declaredModel.providerID === "string" && typeof declaredModel.id === "string") {
+                const declared = windows.get(`${declaredModel.providerID}/${declaredModel.id}`);
+                opencodeDeclaredWindow = typeof declared === "number" && Number.isFinite(declared) && declared > 0 ? Math.floor(declared) : undefined;
+            } else {
+                opencodeDeclaredWindow = undefined;
+            }
             const base = getOrigin();
             // No live proxy: traffic goes direct — stamping would leak the
             // conversation id to a raw upstream and mark plugin mode for a
@@ -900,7 +942,8 @@ export function createV1ServerHooks(getOrigin: () => string | undefined, ctx: V1
                     };
                 }
             } else {
-                console.error("[bili-opencode-native] v1: zod unavailable — plugin tools skipped; sessions run in proxy mode (wire-injected compress)");
+                // #5706: host-safe channel — raw console.* lands on the opencode TUI terminal.
+                logHostEvent("error", "[native-client]", "[bili-opencode-native] v1: zod unavailable — plugin tools skipped; sessions run in proxy mode (wire-injected compress)");
             }
             if (Object.keys(tools).length > 0) hooks.tool = tools;
         }
@@ -934,13 +977,13 @@ const server = async (ctx: V1PluginContext): Promise<V1Hooks> => {
     // observes network failures and drives state.respawn, so SDK-default
     // providers route again as soon as any proxy is alive.
     if (installNativeFetchIntercept(state)) {
-        console.log("[bili-opencode-native] v1: fetch patch installed (catches providers without an explicit baseURL)");
+        logHostEvent("info", "[native-client]", "[bili-opencode-native] v1: fetch patch installed (catches providers without an explicit baseURL)");
     }
     if (origin === undefined) {
-        console.error("[bili-opencode-native] v1: no live proxy at startup — traffic goes direct until runtime recovery lands one");
+        logHostEvent("error", "[native-client]", "[bili-opencode-native] v1: no live proxy at startup — traffic goes direct until runtime recovery lands one");
         return {};
     }
-    console.log(`[bili-opencode-native] v1 active (proxy ${origin})`);
+    logHostEvent("info", "[native-client]", `[bili-opencode-native] v1 active (proxy ${origin})`);
     let z: ZodLike | undefined;
     try {
         // Opaque specifier on purpose (#3511 P0 follow-up): zod is now bundled
@@ -962,14 +1005,14 @@ const server = async (ctx: V1PluginContext): Promise<V1Hooks> => {
         // Pass the host's full ctx object through: V1PluginContext types only
         // what bili uses (client/directory), but the runtime object may carry
         // extra host fields acp's hooks need at action time.
-        legacy = await loadLegacyAcp(ctx, (msg) => console.log(msg));
+        legacy = await loadLegacyAcp(ctx, (msg) => logHostEvent("info", "[native-client]", msg));
     } catch {
         legacy = undefined;
     }
     return createV1ServerHooks(() => state.origin, ctx, { z, legacy });
 };
 
-const v2Setup = createOpencodeV2Setup({ route: createNativeRoute(state), incremental: maybeIncrementalOpencode, directPrefixes: state.directPrefixes });
+const v2Setup = createOpencodeV2Setup({ route: createNativeRoute(state), incremental: maybeIncrementalOpencode, directPrefixes: state.directPrefixes, onResponse: opencodeIncrementalOnHttpResponse });
 
 // #4276: V2 processes install the shared fetch chain too — routing happens at
 // fetch time so every later hook (provider plugins included) sees the original
@@ -1042,7 +1085,7 @@ export async function maybeIncrementalOpencode(e: V2HttpRequestEvent, s: V2State
             if (pending.url === url && Date.now() - pending.at < INC_PENDING_TTL_MS) { inflight = true; break; }
         }
         if (inflight) return;
-        const plan = planIncrementalTurn({ conversationId: sid, path: "/v1/messages", messages: b.messages as IncrementalWireMessage[], system: b.system as unknown, request: b as { model?: unknown } & Record<string, unknown>, msgIds: alignedMsgIdsForWire(sid, b.messages) });
+        const plan = planIncrementalTurn({ cacheControlRetouch: incrementalCacheRetouchEnabled(base), conversationId: sid, path: "/v1/messages", messages: b.messages as IncrementalWireMessage[], system: b.system as unknown, request: b as { model?: unknown } & Record<string, unknown>, msgIds: alignedMsgIdsForWire(sid, b.messages) });
         if (plan.mode === "skip") return;
         const turnId = newIncrementalTurnId();
         // #3304: stash before the swap — the opencode replacement happens in
@@ -1132,3 +1175,17 @@ export function opencodeIncrementalOnResponse(_url: string, response: Response, 
 }
 
 state.onResponse = opencodeIncrementalOnResponse;
+
+/** V2 http.response adapter: forwards the SENT request's headers (the turn id
+ *  stamped by maybeIncrementalOpencode rides there) and the upstream response
+ *  to the same ack collector the fetch intercept feeds. Inline mode fires both
+ *  seams for one dispatch; the second call is a no-op because the first one
+ *  already consumed the pending entry. Exported for the native suites. */
+export function opencodeIncrementalOnHttpResponse(e: V2HttpRequestEvent): void {
+    const response = e.response;
+    const req = e.request as Request | undefined;
+    if (response === undefined || req === undefined || typeof req.headers?.get !== "function") return;
+    const turnId = req.headers.get(INCREMENTAL_TURN_ID_HEADER);
+    if (turnId === null) return;
+    opencodeIncrementalOnResponse(typeof req.url === "string" ? req.url : "", response, { [INCREMENTAL_TURN_ID_HEADER]: turnId });
+}

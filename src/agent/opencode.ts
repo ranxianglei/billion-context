@@ -20,7 +20,8 @@ import { zcodeDirectPrefixes } from "../config.js";
 import { LAUNCHER_DEFAULT_HOST, ensureProxyRunning } from "../launcher.js";
 import { createAcpCommandHooks } from "./opencode-acp-command.js";
 import { nativeProxyScriptPath, singleFlight } from "./native-bootstrap.js";
-import { createLiveOriginResolver, installNativeFetchIntercept, isModelApiUrl, routedBiliModelUrl, type NativeInterceptState } from "./native-intercept.js";
+import { createLiveOriginResolver, installNativeFetchIntercept, isModelApiUrl, routedBiliModelUrl, setDeclaredModelEndpoints, type NativeInterceptState } from "./native-intercept.js";
+import { loadDeclaredModelEndpoints } from "../model-endpoints.js";
 import { createOpencodeV2Setup, type V2HttpRequestEvent, type V2PluginContext, type V2State } from "./opencode-v2.js";
 import { fetchProxyVersion } from "./shared.js";
 import { logHostEvent } from "./host-log.js";
@@ -95,6 +96,10 @@ const intercept: NativeInterceptState | undefined = proxyBase === "" ? undefined
     directPrefixes: zcodeDirectPrefixes(process.env),
 };
 
+// #1295: declared custom-wire endpoints — same config source as the proxy;
+// takes effect on the next host start (config is read once at load time).
+if (intercept !== undefined) void loadDeclaredModelEndpoints().then(setDeclaredModelEndpoints);
+
 /** Re-probe the attached origin first: a transient blip must not migrate the
  *  session to a fresh proxy — restore the same origin when it is back. Only a
  *  truly dead origin falls through to spawning our own replacement. */
@@ -123,12 +128,13 @@ async function respawnOwnProxy(): Promise<string | undefined> {
 
 const server = async (ctx: OpencodePluginContext): Promise<OpencodeHooks> => {
     if (!proxyBase) return {};
-    console.log("[bili-opencode] plugin active (proxy " + proxyBase + ")");
+    // #5706: host-safe channel — raw console.* lands on the opencode TUI terminal.
+    logHostEvent("info", "[native-client]", "[bili-opencode] plugin active (proxy " + proxyBase + ")");
     // V1 host: same SDK-default-baseURL gap as the native entry — the
     // launcher's config-file rewrite only catches explicit baseURLs. Global
     // fetch patch catches the rest; runtime recovery rides the shared state.
     if (intercept !== undefined && installNativeFetchIntercept(intercept)) {
-        console.log("[bili-opencode] v1: fetch patch installed (catches providers without an explicit baseURL)");
+        logHostEvent("info", "[native-client]", "[bili-opencode] v1: fetch patch installed (catches providers without an explicit baseURL)");
     }
     return {
         ...createAcpCommandHooks(() => intercept?.origin ?? proxyBase, ctx),

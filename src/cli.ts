@@ -11,6 +11,8 @@
  *   bili start --config FILE      path to config file (default: XDG)
  *   bili start --passthrough      forward without compression
  *   bili pi/codex/claude/omp [args]   start a proxy + launch a client via cert-MITM
+ *   bili -i pi                     launch pi on the IN-PROCESS engine (≡ bili pi-inline)
+ *   bili -s pi                     force the proxy posture: spawn/attach, never inline
  *   bili export [id] [--full]     export a persisted session as a handoff doc
  *                                  (--jsonl: deterministic JSONL dump #2671)
  *   bili acp-cache diff <dir>     attribute cache breaks from ACP_DUMP_BODY dumps
@@ -39,6 +41,11 @@ import { startAdvisoryWatcher, getAdvisoryState, advisoryDeferring, advisoryBloc
 import { startReleaseNotesWatcher } from "./update-notes.js";
 import { startRemoteNoticesWatcher } from "./remote-notices.js";
 import { hydrateNoticeReceipts } from "./notice-store.js";
+import { hydrateHostPluginDismissals } from "./host-plugin-notice.js";
+import { hydrateResignPending } from "./apig-resign.js";
+import { hydrateRolloutIdentity } from "./rollout.js";
+import { hydrateOrderUnified } from "./order-persist.js";
+import { hydrateAffinityUnified } from "./affinity-persist.js";
 import { resolveProxy } from "./upstream-proxy.js";
 import { runMcpStdio } from "./mcp.js";
 import { PLUGIN_AGENTS, isPluginAgent, pluginInstall, pluginRemove, pluginStatusAll, pluginUpdate, renderPluginList, warnActivePluginSessions, type PluginAgent } from "./plugin-install.js";
@@ -179,6 +186,10 @@ Launcher (bili pi / bili codex / bili claude / bili omp / bili opencode / bili h
     bili -F http://127.0.0.1:7897 codex   # route bili's upstream through a proxy (gost-style -F)
 
 Options (override config file / env):
+  -i, --inline                     run the client's compression IN-PROCESS (pi/opencode;
+                                   same as "bili pi-inline"; must precede the client name)
+  -s, --server                     force the proxy posture — spawn/attach, never inline
+                                   (pi/opencode; overrides an inherited BILI_PI_INLINE=1)
   -F <url>                         upstream proxy to forward through (gost-style;
                                    http://host:port; must precede the client name)
   --port <N>                       listen port (start: 8787; launcher default: random free port)
@@ -239,6 +250,7 @@ export function parseArgs(argv: string[]): Parsed {
     const positional: string[] = [];
     let client: ClientName | undefined;
     let clientArgs: string[] = [];
+    let posture: "inline" | "server" | undefined;
     const mitmDomains: string[] = [];
     let exportSelector: string | undefined;
     let registerConversationId: string | undefined;
@@ -287,6 +299,22 @@ export function parseArgs(argv: string[]): Parsed {
             case "--version":
             case "-V":
                 command = "version";
+                break;
+            case "-i":
+            case "--inline":
+                if (posture === "server") {
+                    console.error("bili: -i/--inline and -s/--server are mutually exclusive — pick one");
+                    process.exit(2);
+                }
+                posture = "inline";
+                break;
+            case "-s":
+            case "--server":
+                if (posture === "inline") {
+                    console.error("bili: -i/--inline and -s/--server are mutually exclusive — pick one");
+                    process.exit(2);
+                }
+                posture = "server";
                 break;
             case "--debug":
                 overrides.ACP_DEBUG = "1";
@@ -551,6 +579,32 @@ export function parseArgs(argv: string[]): Parsed {
         }
     }
 
+    // -i/-s posture flags (#5428): translate onto the existing lanes so the
+    // launcher needs no new plumbing — `-i pi` IS `bili pi-inline` (env scrub
+    // + extension preflight + BILI_PI_INLINE=1, no proxy spawned), and
+    // `-s pi` pins BILI_PI_INLINE=0 on the child so an inherited/ambient
+    // inline env can't flip it while the launcher proxy runs.
+    if (posture !== undefined) {
+        if (!client) {
+            console.error(`bili: ${posture === "inline" ? "-i/--inline" : "-s/--server"} needs a client lane — e.g. \`bili -${posture === "inline" ? "i" : "s"} pi\``);
+            process.exit(2);
+        }
+        const inlineVariant = client === "pi" || client === "pi-inline" ? "pi-inline" : client === "opencode" || client === "opencode-inline" ? "opencode-inline" : undefined;
+        if (inlineVariant === undefined) {
+            console.error(`bili: -i/-s only apply to the pi and opencode lanes (got "${client}")`);
+            process.exit(2);
+        }
+        if (posture === "inline") {
+            client = inlineVariant;
+        } else if (client === inlineVariant) {
+            console.error(`bili: ${client} IS the inline lane — use \`bili -s ${inlineVariant === "pi-inline" ? "pi" : "opencode"}\``);
+            process.exit(2);
+        } else {
+            if (inlineVariant === "pi-inline") overrides.BILI_PI_INLINE = "0";
+            else overrides.BILI_OPENCODE_INLINE = "0";
+        }
+    }
+
     return { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, sessionsSub, sessionsTarget, sessionsNoVacuum, sessionsApply, sessionsRestoreTarget, storageDays, storageVacuum, storageDryRun, jsonOutput, doctorJson, doctorFix, packAction, packSpec, packProject, packForce };
 }
 
@@ -568,7 +622,7 @@ export async function main(): Promise<void> {
     }
     if (command === "acp-cache") {
         try {
-            const report = runDiff(acpCacheDir!, { logFile: acpCacheLog, noLog: acpCacheNoLog, session: acpCacheSession });
+            const report = await runDiff(acpCacheDir!, { logFile: acpCacheLog, noLog: acpCacheNoLog, session: acpCacheSession });
             process.stdout.write(jsonOutput ? renderJson(report) : renderText(report));
         } catch (error) {
             console.error(`bili acp-cache: ${error instanceof Error ? error.message : String(error)}`);
@@ -636,7 +690,7 @@ export async function main(): Promise<void> {
                     packageName: PACKAGE_NAME,
                     resolveProxy: updaterResolveProxy,
                     updateTag,
-                    globalCheck: () => checkForUpdate({ packageName: PACKAGE_NAME, currentVersion: VERSION, autoUpdate: true, resolveProxy: updaterResolveProxy, updateTag }, true),
+                    globalCheck: async () => { await checkForUpdate({ packageName: PACKAGE_NAME, currentVersion: VERSION, autoUpdate: true, resolveProxy: updaterResolveProxy, updateTag }, true); },
                     log: (_level, msg) => console.log(msg),
                 });
                 for (const line of lines) console.log(line);
@@ -914,4 +968,13 @@ export async function main(): Promise<void> {
     // #5548: notice dismissal receipts ride the unified storage — hydrate the
     // in-memory view once at boot (and migrate any legacy JSON file one time).
     void hydrateNoticeReceipts();
+    // #5753: the same carrier rules now cover host-plugin dismissals, the
+    // apig-resign pending queue, the rollout install id, and the session-order
+    // + prefix-affinity snapshots. All no-op on legacy-only instances and
+    // before anything created the storage singleton.
+    void hydrateHostPluginDismissals();
+    void hydrateResignPending();
+    void hydrateRolloutIdentity();
+    void hydrateOrderUnified();
+    void hydrateAffinityUnified();
 }
