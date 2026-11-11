@@ -484,11 +484,15 @@ test("storage unified FULL mode: read path serves from the index with organic im
         let expectedDigest = "";
         try {
             assert.ok(probe.getSessionRow(meta.id), "organic import did not populate index.db");
-            // #5609 CI red: the deferred-alignment high-water mark must ride
-            // kstate_json — dropping it diverged the second full-mode read
-            // from the legacy view on exactly this key.
+            // #5609 CI red: whatever value the served state carries for the
+            // deferred-alignment high-water mark must ride kstate_json
+            // unchanged — dropping it diverged the second full-mode read from
+            // the legacy view on exactly this key. This corpus is an imported
+            // collapsed ledger (#5599), so the re-stamp is skipped by design
+            // and the mark is absent on BOTH sides; the presence pin lives in
+            // S16's control half where the alignment does run.
             const rowKstate = JSON.parse(probe.getSessionRow(meta.id)!.kstateJson) as Record<string, unknown>;
-            assert.equal(typeof rowKstate.timestampsHighWaterRefSeq, "number", "timestampsHighWaterRefSeq must persist through kstate_json (#5608-C)");
+            assert.equal(rowKstate.timestampsHighWaterRefSeq, (session.state as { timestampsHighWaterRefSeq?: number }).timestampsHighWaterRefSeq, "timestampsHighWaterRefSeq must persist through kstate_json unchanged (#5608-C/#5599)");
             // #4316 PR3/3: expected = legacy view of the same files + the
             // deterministic alignment against these very rows.
             expectedDigest = alignedLegacyDigest(caseDir, meta, probe);
