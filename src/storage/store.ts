@@ -2079,7 +2079,15 @@ export class UnifiedStore {
         // One JSONL line per archived session: append-only (cheap, crash =
         // at worst one truncated line which the reader skips), restore
         // rewrites the file without the restored session's lines.
-        appendFileSync(exportPath, JSON.stringify({ version: 1, sessionId, archivedAt: Date.now(), session: row, content, messages, mediaMaps, blocks, refs: refsRows, deadRefs, ccrEntries: ccr, sessionExt: ext, checkpoints }) + "\n");
+        // Serialized here, appended as the LAST step inside the sweep
+        // transaction below: a sweep that cannot start or fails midway
+        // (write lock held by another process, constraint error) must not
+        // leave a line behind for a session that is still active — that
+        // stale line would shadow the next successful archive on restore,
+        // and every failed attempt would add another full copy. The line
+        // still reaches the log before COMMIT, so a committed sweep always
+        // has its export.
+        const archiveLine = JSON.stringify({ version: 1, sessionId, archivedAt: Date.now(), session: row, content, messages, mediaMaps, blocks, refs: refsRows, deadRefs, ccrEntries: ccr, sessionExt: ext, checkpoints }) + "\n";
         // --- sweep the row bodies (refcount discipline; pinned checkpoints survive) ---
         let contentRowsDeleted = 0;
         this.db.transaction(() => {
@@ -2101,6 +2109,7 @@ export class UnifiedStore {
             // #4796 follow-up: scoped collection (see collectZeroRefIn) —
             // the reported count is what THIS archive collected.
             contentRowsDeleted = this.collectZeroRefIn(rel);
+            appendFileSync(exportPath, archiveLine);
         });
         loggerLog("info", `[#3901] archived ${sessionId} → ${exportPath} (${contentRowsDeleted} content rows collected)`);
         return { ok: true, exportPath, contentRowsDeleted };
@@ -2127,12 +2136,15 @@ export class UnifiedStore {
         };
         // Scan the JSONL for the session's line (skip malformed/truncated
         // trailing lines — an archive append interrupted by a crash must not
-        // block restoring OTHER sessions).
+        // block restoring OTHER sessions). Newest first: when the log holds
+        // more than one line for this session (an archive whose sweep never
+        // committed, then a later successful one), the last line appended is
+        // the state the session was actually archived in.
         let lineNo = -1;
         let rawLines: string[] = [];
         try {
             rawLines = readFileSync(exportPath, "utf8").split("\n");
-            for (let i = 0; i < rawLines.length; i++) {
+            for (let i = rawLines.length - 1; i >= 0; i--) {
                 if (!rawLines[i].trim()) continue;
                 let candidate: { sessionId?: string };
                 try {
@@ -2195,11 +2207,15 @@ export class UnifiedStore {
         // archive can theoretically appear more than once across reinstalls;
         // rewrite removes them all). Other sessions' lines are untouched.
         const kept: string[] = [];
+        let ownLines = 0;
         for (const l of rawLines) {
             if (!l.trim()) continue;
             try {
                 const head = JSON.parse(l) as { sessionId?: string };
-                if (head.sessionId === sessionId) continue;
+                if (head.sessionId === sessionId) {
+                    if (++ownLines === 2) loggerLog("warn", `[storage] archive log holds more than one line for session ${sessionId}: the newest was restored, older ones are dropped`);
+                    continue;
+                }
             } catch { continue; }
             kept.push(l);
         }
