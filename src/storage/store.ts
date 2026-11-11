@@ -2312,7 +2312,6 @@ export class UnifiedStore {
         }
     }
 
-    /** A/B for tagged planes (#5874): the folded plane must AGREE WITH THE
     /** A/B for tagged planes (#5874): the plane must agree with the
      *  KERNEL VIEW, not with the legacy table. Invariant v makes the view
      *  (the kernel's tagged processTurn output) the egress source, so the
