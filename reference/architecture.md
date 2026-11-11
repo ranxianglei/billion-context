@@ -33,6 +33,7 @@ billion-context/
 │   │   ├── dsh-authored-compaction.ts #   Bili-authored dsh compaction: answers the summarize call locally (#3733)
 │   │   ├── fastpath.ts           #   Watermark fastpath: full-resend turns decode head + tail only (#5403)
 │   │   ├── fastpath-scan.ts      #   Zero-decode structural span scan of chat-completions bodies (#5403)
+│   │   ├── fold-summary-ccr.ts   #   Fold summaries out as CCR [acp-stored] placeholders, egress view only (POC, default-off, #6111)
 │   │   ├── lane-decisions.ts     #   Single resolver for per-lane gating decisions (#3417)
 │   │   ├── pi-subagent-channel.ts #   Channel fallback for pi-subagent children missing ACP tools (#2268)
 │   │   ├── snapshot-render.ts    #   Snapshot render: outbound prefix from server transcript (#3756)
