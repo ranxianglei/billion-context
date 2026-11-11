@@ -118,11 +118,11 @@ test("#252: post-compress re-request usage is netted by the compress credit", as
 
 test("#252: failed compress accrues no credit", async () => {
     const ctx = makeCompressibleCtx();
-    // Sub-viability range (kernel minCompressRange) → compress FAILS.
+    // Sub-viability range (kernel minCompressRange) → compress FAILS. Under #5220
+// such a round re-requests with a recovery receipt (round 2 below carries no
+// usage report) — and the point still stands: NO credit may be netted off the
+// turn's only real usage figure.
     const badArgs = JSON.stringify({ content: [{ startId: "m00007", endId: "m00007", summary: "s" }] });
-    // Usage rides the round-1 completion: the failed-only breaker (#156/#4186)
-    // ends the turn before any re-request, so this is the only usage report of
-    // the turn — it must still land raw (no credit netting).
     const round1 = [
         sse("response.created", { response: { id: "resp_1", status: "in_progress" } }),
         fcEvents(0, "call_c", "compress", badArgs),
@@ -138,7 +138,7 @@ test("#252: failed compress accrues no credit", async () => {
             { model: "gpt-4o", input: [], stream: true },
             { url: "http://mock", headers: {} },
         );
-        assert.equal(fetchCalls, 0, "failed-only round breaks before any re-request (#4186)");
+        assert.equal(fetchCalls, 1, "first-time failure re-requests once via recovery receipt (#5220)");
         assert.equal(ctx.session.stats.compressCreditTokens, 0, "no credit on failed compress");
         assert.equal(ctx.session.stats.lastInputTokens, 50000, "usage lands raw when nothing was compressed");
     } finally {

@@ -5,8 +5,8 @@ import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { handleAcpStatus } from "../src/acp-status.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
-import { setSqliteEnginesUnavailableForTests } from "../src/storage/driver.ts";
-import { _resetStorageRuntimeStatusForTest, recordEngineBootstrap } from "../src/storage/runtime-status.ts";
+
+import { _resetStorageRuntimeStatusForTest, recordEngineBootstrap, recordSidecarOpenFailure } from "../src/storage/runtime-status.ts";
 import { createCore, createInitialState, defaultConfig, type CompressionCore, type Config, type CoreMessage } from "acp-kernel";
 import type { Session } from "../src/session.ts";
 import { rmrf } from "./tmp-rm.ts";
@@ -60,11 +60,16 @@ test("#3385: acp_status STORAGE section surfaces the degrade reason so the model
     const snap = isolate(base);
     let store: SessionStore | null = null;
     try {
-        setSqliteEnginesUnavailableForTests(true);
         _resetStorageRuntimeStatusForTest();
         recordEngineBootstrap({ status: "failed", detail: "The operation was aborted due to timeout" });
+        // 2026-10-30: a no-engine OPEN refuses boot, so the acp_status surface
+        // can only see a failed open post-boot via the runtime breaker; this
+        // facet pins the SURFACE by driving the same recording seam shadow.ts
+        // calls before its rethrow. A real (healthy) store keeps
+        // ccrLoopConfig from rebuilding over the recorded state.
         store = new SessionStore({ dir: process.env.BILI_SESSIONS_DIR, enabled: true });
         _setStoreForTest(store);
+        recordSidecarOpenFailure("no SQLite engine available");
 
         const out = handleAcpStatus({}, makeCtx());
         const text = out.text ?? "";
@@ -81,7 +86,6 @@ test("#3385: acp_status STORAGE section surfaces the degrade reason so the model
     } finally {
         store?.closeQuietly();
         _setStoreForTest(null as unknown as SessionStore);
-        setSqliteEnginesUnavailableForTests(false);
         _resetStorageRuntimeStatusForTest();
         restore(snap);
         rmrf(base);
@@ -121,11 +125,11 @@ test("#3894: an unsupported Node surfaces the artifact-table reason, not generic
     const snap = isolate(base);
     let store: SessionStore | null = null;
     try {
-        setSqliteEnginesUnavailableForTests(true);
         _resetStorageRuntimeStatusForTest();
         recordEngineBootstrap({ status: "unsupported-node", detail: "no pinned SQLite engine runs on Node.js 21.7.3 (ABI 120)" });
         store = new SessionStore({ dir: process.env.BILI_SESSIONS_DIR, enabled: true });
         _setStoreForTest(store);
+        recordSidecarOpenFailure("no self-downloaded SQLite engine supports this Node.js 21.7.3 (ABI 120)");
 
         const out = handleAcpStatus({}, makeCtx());
         const text = out.text ?? "";
@@ -136,7 +140,6 @@ test("#3894: an unsupported Node surfaces the artifact-table reason, not generic
     } finally {
         store?.closeQuietly();
         _setStoreForTest(null as unknown as SessionStore);
-        setSqliteEnginesUnavailableForTests(false);
         _resetStorageRuntimeStatusForTest();
         restore(snap);
         rmrf(base);
@@ -156,11 +159,11 @@ test("#4444: an unsupported Node surfaces the Node.js upgrade lever on the degra
     const origNodeDesc = Object.getOwnPropertyDescriptor(process.versions, "node");
     let store: SessionStore | null = null;
     try {
-        setSqliteEnginesUnavailableForTests(true);
         _resetStorageRuntimeStatusForTest();
         recordEngineBootstrap({ status: "unsupported-node", detail: "no pinned SQLite engine runs on Node.js 21.6.1 (ABI 120)" });
         store = new SessionStore({ dir: process.env.BILI_SESSIONS_DIR, enabled: true });
         _setStoreForTest(store);
+        recordSidecarOpenFailure("no self-downloaded SQLite engine supports this Node.js 21.6.1 (ABI 120)");
 
         Object.defineProperty(process.versions, "node", { value: "21.6.1", configurable: true, writable: true });
         const text = handleAcpStatus({}, makeCtx()).text ?? "";
@@ -173,7 +176,6 @@ test("#4444: an unsupported Node surfaces the Node.js upgrade lever on the degra
         if (origNodeDesc) Object.defineProperty(process.versions, "node", origNodeDesc);
         store?.closeQuietly();
         _setStoreForTest(null as unknown as SessionStore);
-        setSqliteEnginesUnavailableForTests(false);
         _resetStorageRuntimeStatusForTest();
         restore(snap);
         rmrf(base);

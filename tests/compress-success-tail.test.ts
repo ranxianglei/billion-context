@@ -239,9 +239,16 @@ test("#1387: partial failure (some ranges rejected) keeps the old silent tail", 
         assert.ok(true, "atomic batch rejection (kernel-owned semantics)");
         return;
     }
+    // #4521: a valid range paired with an all-protected range is now partial
+    // SUCCESS, not failure — the protected range becomes a no-op warning on
+    // the receipt instead of a batch rejection. Since nothing failed and the
+    // recompute finds nothing else compressible, the stop signal correctly
+    // fires (this is the loop-terminator the failing session never got).
     assert.ok(out.startsWith("[Compressed"), `partial success expected, got: ${out.slice(0, 120)}`);
-    assert.ok(!out.includes(NO_RANGES_REMAIN_TEXT), "stop signal suppressed on partial failure:\n" + out);
-    assert.ok(!out.includes(RANGES_HEADER), "no ranges advertised on partial failure:\n" + out);
+    assert.match(out, /Range m00003\.\.m00007 folded nothing.*protected zone/s);
+    assert.match(out, /do not resend this range/);
+    assert.ok(out.includes(NO_RANGES_REMAIN_TEXT), "stop signal after a warning-only partial success:\n" + out);
+    assert.ok(!out.includes(RANGES_HEADER), "no ranges advertised when nothing compressible remains:\n" + out);
 });
 
 test("#1387: tail recompute respects the kernel's own eligibility (shouldInject=false leftovers are not advertised)", () => {
