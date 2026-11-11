@@ -1139,10 +1139,13 @@ export function apply(ctx: ClientContext): void {
         const header = rows.length === 1 ? t("upstreams_down_one") : t("upstreams_down_many").replace("{n}", String(rows.length));
         return createElement(
             "div",
-            { role: "status", style: { display: "flex", flexDirection: "column", gap: 4, maxWidth: 520, padding: "10px 14px", borderRadius: 10, border: "1px solid rgba(217,63,11,0.35)", background: "rgba(217,63,11,0.08)", boxShadow: "0 2px 8px rgba(0,0,0,0.15)" } },
+            // #5701: the overlay slot sits above host chrome; the banner body must stay
+            // click-through (pointerEvents none) or it blocks the controls underneath —
+            // only the ✕ button re-enables pointer events for itself.
+            { role: "status", style: { display: "flex", flexDirection: "column", gap: 4, maxWidth: 520, padding: "10px 14px", borderRadius: 10, border: "1px solid rgba(217,63,11,0.35)", background: "rgba(217,63,11,0.08)", boxShadow: "0 2px 8px rgba(0,0,0,0.15)", pointerEvents: "none" } },
             createElement("div", { style: { display: "flex", alignItems: "center", gap: 8 } },
                 createElement("div", { style: { flex: 1, fontSize: 13, fontWeight: 600 } }, header),
-                createElement("button", { type: "button", title: t("upstreams_dismiss"), "aria-label": t("upstreams_dismiss"), onClick: () => setDismissedSig(sig), style: { cursor: "pointer", border: "none", background: "transparent", color: "inherit", fontFamily: "inherit", fontSize: 14, lineHeight: 1, padding: 0, opacity: 0.6 } }, "✕"),
+                createElement("button", { type: "button", title: t("upstreams_dismiss"), "aria-label": t("upstreams_dismiss"), onClick: () => setDismissedSig(sig), style: { cursor: "pointer", border: "none", background: "transparent", color: "inherit", fontFamily: "inherit", fontSize: 14, lineHeight: 1, padding: 0, opacity: 0.6, pointerEvents: "auto" } }, "✕"),
             ),
             ...rows.map((r) => {
                 const code = r.code !== undefined ? ` ${r.code}` : "";

@@ -2233,10 +2233,15 @@ test("#5701: shell.overlay upstream pill — softened chrome; ✕ dismisses unti
     assert.ok(String(st.border).includes("rgba(217,63,11,0.35)"), "border saturation lowered from 0.5");
     assert.ok(String(st.background).includes("rgba(217,63,11,0.08)"), "background saturation lowered from 0.1");
     assert.ok(st.boxShadow !== undefined, "subtle shadow present");
+    // The overlay slot floats above host chrome: the banner body must stay
+    // click-through so it never blocks the controls underneath it.
+    assert.equal(st.pointerEvents, "none", "banner body is click-through (overlap report #5701)");
     // ✕ dismisses ...
     const btn = findButton(tree);
     assert.ok(btn !== undefined, "the dismiss control exists");
     assert.ok(btn.props !== null, "dismiss control carries props");
+    const bst = btn.props.style as Record<string, unknown>;
+    assert.equal(bst.pointerEvents, "auto", "the ✕ button re-enables its own pointer events");
     (btn.props.onClick as () => void)();
     assert.equal(m.component(), null, "...the identical failing set renders null");
     // ...and count/ETA churn of that same set never re-shows it.
