@@ -249,7 +249,7 @@ export type CompressSettings = {
      *  Accepts a ratio (0.7) or percent string ("70%"). Default: 0.7 (unchanged).
      *  Host-only — never passed to the kernel. If set >= `maxContextLimit` the
      *  kernel's own pressure branch fires first, so this line never arms. Deepest
-     *  level wins PER FIELD across global → provider → model (#5232). */
+     *  level wins PER FIELD across global → provider → model (#5230). */
     nudgeEscalationPct?: number | string;
     /** Context usage percentage that triggers emergency truncation of large
      *  tool outputs. Accepts a ratio (0.95) or percent string ("95%"). Must

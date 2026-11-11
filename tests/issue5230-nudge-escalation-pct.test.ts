@@ -7,7 +7,7 @@ import { defaultConfig, type NudgeDecision } from "acp-kernel";
 import { mergeCompress, applyCompressSettings, resolveRequestConfig } from "../src/compress-settings.ts";
 import { resolveNudgeEscalationPct, emergencyNudge } from "../src/server/budget.ts";
 
-// #5232: the host-side escalation-nudge line (EMERGENCY_NUDGE_ESCALATION_PCT,
+// #5230: the host-side escalation-nudge line (EMERGENCY_NUDGE_ESCALATION_PCT,
 // hardcoded at 0.7) had no config surface. compress.nudgeEscalationPct adds one:
 // deepest-wins across global/provider/model, rides the ResolvedKernelConfig rail
 // to the prepare call sites, and an absent/non-positive value keeps the 0.7
@@ -25,7 +25,7 @@ function mkNudge(contextUsage: number): NudgeDecision {
     };
 }
 
-test("#5232: resolveNudgeEscalationPct defaults to 0.7 when absent or invalid", () => {
+test("#5230: resolveNudgeEscalationPct defaults to 0.7 when absent or invalid", () => {
     assert.equal(resolveNudgeEscalationPct(undefined), 0.7);
     assert.equal(resolveNudgeEscalationPct(null), 0.7);
     assert.equal(resolveNudgeEscalationPct({}), 0.7);
@@ -36,25 +36,25 @@ test("#5232: resolveNudgeEscalationPct defaults to 0.7 when absent or invalid", 
     assert.equal(resolveNudgeEscalationPct({ nudgeEscalationPct: "0.85" }), 0.7, "non-number falls back (percent parsing happens upstream)");
 });
 
-test("#5232: resolveNudgeEscalationPct honors an explicit positive value", () => {
+test("#5230: resolveNudgeEscalationPct honors an explicit positive value", () => {
     assert.equal(resolveNudgeEscalationPct({ nudgeEscalationPct: 0.85 }), 0.85);
     assert.equal(resolveNudgeEscalationPct({ nudgeEscalationPct: 0.99 }), 0.99);
 });
 
-test("#5232: applyCompressSettings maps nudgeEscalationPct onto the resolved config", () => {
+test("#5230: applyCompressSettings maps nudgeEscalationPct onto the resolved config", () => {
     const base = defaultConfig(200_000);
     assert.equal(applyCompressSettings(base, 200_000, { nudgeEscalationPct: 0.85 }).nudgeEscalationPct, 0.85);
     assert.equal(applyCompressSettings(base, 200_000, { nudgeEscalationPct: "75%" }).nudgeEscalationPct, 0.75, "percent string parses");
     assert.equal(applyCompressSettings(base, 200_000, {}).nudgeEscalationPct, undefined, "unset leaves it absent -> budget default");
 });
 
-test("#5232: mergeCompress deepest-wins for nudgeEscalationPct", () => {
+test("#5230: mergeCompress deepest-wins for nudgeEscalationPct", () => {
     assert.equal(mergeCompress({ nudgeEscalationPct: 0.6 }, { nudgeEscalationPct: 0.7 }, { nudgeEscalationPct: 0.85 }).nudgeEscalationPct, 0.85);
     assert.equal(mergeCompress({ nudgeEscalationPct: 0.6 }, { nudgeEscalationPct: 0.7 }, {}).nudgeEscalationPct, 0.7);
     assert.equal(mergeCompress({ nudgeEscalationPct: 0.6 }, {}, {}).nudgeEscalationPct, 0.6);
 });
 
-test("#5232: resolveRequestConfig carries nudgeEscalationPct onto the resolved rail", () => {
+test("#5230: resolveRequestConfig carries nudgeEscalationPct onto the resolved rail", () => {
     const base = defaultConfig(200_000);
     const tuned = resolveRequestConfig(base, {}, undefined, "m", 200_000, { nudgeEscalationPct: 0.8 });
     assert.equal(tuned.nudgeEscalationPct, 0.8);
@@ -63,7 +63,7 @@ test("#5232: resolveRequestConfig carries nudgeEscalationPct onto the resolved r
     assert.equal(resolveNudgeEscalationPct(plain), 0.7, "unset everywhere -> base unchanged -> default 0.7");
 });
 
-test("#5232: the knob moves the fire line (user scenario: default 0.7 vs raised 0.85)", () => {
+test("#5230: the knob moves the fire line (user scenario: default 0.7 vs raised 0.85)", () => {
     const base = defaultConfig(200_000);
     const defaultLine = resolveNudgeEscalationPct(base);
     const raisedLine = resolveNudgeEscalationPct(applyCompressSettings(base, 200_000, { nudgeEscalationPct: 0.85 }));

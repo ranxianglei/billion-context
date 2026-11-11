@@ -400,7 +400,7 @@ export function applyCompressSettings(base: Config, limit: number, s: CompressSe
         // HERE, at resolve time — the executor still receives a fully
         // expanded ExternalSummarySettings and never sees references.
         externalSummary: s.externalSummary !== undefined ? expandExternalSummaryChainTolerant(s.externalSummary, recipes) : (base as ResolvedKernelConfig).externalSummary,
-        // Host-only escalation-nudge line (#5232): never passed to the kernel.
+        // Host-only escalation-nudge line (#5230): never passed to the kernel.
         // Deepest-wins via mergeCompress; unset inherits base unchanged so a
         // re-resolve without the field keeps its prior value; unset everywhere
         // leaves it absent → budget.ts falls back to the 0.7 default.

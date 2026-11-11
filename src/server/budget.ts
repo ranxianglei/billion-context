@@ -64,10 +64,10 @@ const OUTPUT_LEDGER_FLOOR_GIANT_REQUEST_PCT = 0.25;
 // host-side: renderNudgeText does not depend on shouldInject.
 const EMERGENCY_NUDGE_ESCALATION_PCT = 0.7;
 
-// #5232: resolve the host-side escalation line off a resolved kernel config.
+// #5230: resolve the host-side escalation line off a resolved kernel config.
 // The value rides the ResolvedKernelConfig rail (host-only, never sent to the
 // kernel); an absent or non-positive value keeps the 0.7 default, so behavior
-// is byte-identical to pre-#5232 unless a level sets compress.nudgeEscalationPct.
+// is byte-identical to pre-#5230 unless a level sets compress.nudgeEscalationPct.
 export function resolveNudgeEscalationPct(config: unknown): number {
     const v = (config as { nudgeEscalationPct?: unknown } | null | undefined)?.nudgeEscalationPct;
     return typeof v === "number" && Number.isFinite(v) && v > 0 ? v : EMERGENCY_NUDGE_ESCALATION_PCT;
