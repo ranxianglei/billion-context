@@ -298,7 +298,9 @@ test("S16: cold load keeps legacy refs when mapped ids own no rows (#5599 folded
         st.ingestSession(planIngest(legacy));
         st.close();
 
-        // Cold load from the index alone (fresh store over the same dir).
+        // Load from the index alone (fresh store over the same dir). #5608-D:
+        // the cold load itself never attempts alignment — below, one simulated
+        // fold-save drives the deferred re-stamp into the completeness guard.
         const store = new SessionStore({ enabled: true, dir, debounceMs: 0 });
         _setStoreForTest(store);
         const reloaded = store.loadSync("pr3-folded-tail");
@@ -306,7 +308,10 @@ test("S16: cold load keeps legacy refs when mapped ids own no rows (#5599 folded
         for (let i = 1; i <= 9; i++) {
             assert.equal(reloaded!.state.messageRefs.byRaw[idOf(i)], refOf(i), `${idOf(i)} keeps its legacy ref`);
         }
-        assert.notEqual((reloaded!.state as { refLedgerAligned?: boolean }).refLedgerAligned, true, "incomplete ledger: alignment skipped, retried on a later cold load");
+        assert.notEqual((reloaded!.state as { refLedgerAligned?: boolean }).refLedgerAligned, true, "#5608-D: cold load arms nothing");
+        reloaded!.pendingLedgerAlign = true;
+        assert.ok(store.flushSync(reloaded!), "post-fold save commits");
+        assert.notEqual((reloaded!.state as { refLedgerAligned?: boolean }).refLedgerAligned, true, "incomplete ledger: alignment skipped at the post-fold save boundary (#5599/#5608-D)");
         assert.equal(reloaded!.restampSuperseded, undefined);
         // The saved citation still resolves to the original body, not the tail.
         const ccr = reloaded!.contentStore as { byRef?: Record<string, { text?: string }> } | undefined;
@@ -328,11 +333,25 @@ test("S16: cold load keeps legacy refs when mapped ids own no rows (#5599 folded
             _setStoreForTest(store2);
             const aligned = store2.loadSync("pr3-complete");
             assert.ok(aligned, "complete-ledger session loads");
+            // #5608-D: alignment defers to the first post-fold save boundary.
+            aligned!.pendingLedgerAlign = true;
+            assert.ok(store2.flushSync(aligned!), "post-fold save commits");
             assert.equal((aligned!.state as { refLedgerAligned?: boolean }).refLedgerAligned, true, "complete ledger still aligns");
             for (let i = 1; i <= 9; i++) {
                 assert.equal(aligned!.state.messageRefs.byRaw[idOf(i)], refOf(i), `${idOf(i)} already at seq+1 — no-op alignment`);
             }
+            // #5608-C: the high-water mark raised by the re-stamp must ride
+            // kstate_json — the PRESENCE pin. The folded corpus in
+            // storage-unified.test.ts skips the re-stamp by design (#5599), so
+            // it pins fidelity instead.
             store2.closeQuietly();
+            const probe2 = UnifiedStore.open(join(dir2, "index.db"), undefined as never) as unknown as UnifiedStore;
+            try {
+                const rowKstate = JSON.parse(probe2.getSessionRow("pr3-complete")!.kstateJson) as Record<string, unknown>;
+                assert.equal(typeof rowKstate.timestampsHighWaterRefSeq, "number", "timestampsHighWaterRefSeq persists through kstate_json (#5608-C)");
+            } finally {
+                probe2.close();
+            }
         } finally {
             _setStoreForTest({} as never);
             rmSync(dir2, { recursive: true, force: true });
