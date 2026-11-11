@@ -23,6 +23,7 @@ billion-context/
 │   │   ├── headers.ts            #   Client-provided id sanitization for dump filenames (#286)
 │   │   ├── inject.ts             #   Per-wire tool-injection wrappers + FORCE_TEXT_PROTOCOL switch (#1440)
 │   │   ├── observability.ts      #   Body dumps (dumps/req-*.json, raw/*), unrecognized-path stats
+│   │   ├── outbound-prefix.ts    #   Outbound-prefix LCP triage line: per-message fingerprints vs previous turn localize prompt-cache breaks (#5385)
 │   │   ├── prepare-anthropic.ts  #   Anthropic request preparation (fold → rebuild → system/nudge injection) (#1440)
 │   │   ├── prepare-google.ts     #   Gemini request preparation incl. :countTokens twin (#1440)
 │   │   ├── prepare-openai.ts     #   OpenAI chat request preparation (#1440)
