@@ -147,7 +147,7 @@ entries:
     desc_en: "Route table: URL-prefix keys to per-provider entries (models, compress, compat, …). See the Providers section."
     desc_zh: "路由表：URL 前缀键到逐 provider 条目（models、compress、compat…）的映射。详见 Providers 章节。"
   - key: modelEndpointPatterns
-    type: "array of { match: string, wire: \"anthropic\" | \"openai\" | \"responses\" | \"google\" | \"commandcode\" }"
+    type: "array of { match: string, wire: \"anthropic\" | \"openai\" | \"responses\" | \"google\" | \"commandcode\" | \"trae\" }"
     default: "[]"
     group: upstream
     id: tt.modelendpoints
