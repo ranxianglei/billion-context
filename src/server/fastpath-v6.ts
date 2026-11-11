@@ -112,7 +112,7 @@ const PF_TAIL_WINDOW = 64;
 const SEEN_WORK_COPY_CAP = 2048;
 const MAX_ID_LEN = 512;
 const BAD_ID_CHARS = /[\s\p{C}]/u;
-const EMPTY_STRIP: RawStripCounts = { panels: 0, statusBodies: 0, statusBodyLines: 0, markerLines: 0, nudges: 0, carriers: 0 };
+const EMPTY_STRIP: RawStripCounts = { panels: 0, statusBodies: 0, statusBodyLines: 0, markerLines: 0, nudges: 0, carriers: 0, strippedMs: 0 };
 
 /** Terminal identity fault (§3.2): prepareOpenai lets it propagate,
  *  handle.ts maps it to a 400 JSON refusal. NO data-plane write ever
@@ -362,6 +362,8 @@ function addStripCounts(a: RawStripCounts, b: RawStripCounts): RawStripCounts {
         markerLines: a.markerLines + b.markerLines,
         nudges: a.nudges + b.nudges,
         carriers: a.carriers + b.carriers,
+        // both fragments were really walked — the sum is this request's strip wall time
+        strippedMs: Number((a.strippedMs + b.strippedMs).toFixed(1)),
     };
 }
 
