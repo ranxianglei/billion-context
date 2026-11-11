@@ -231,4 +231,26 @@ test("#5460 P1: legacy (pure-JSON) storage mode leaves ZERO telemetry footprint 
     }
 });
 
+test("#5460 P1: a malformed `extra` payload degrades telemetry, never throws into the caller", () => {
+    resetModule();
+    const dir = sandbox();
+    const warns: string[] = [];
+    try {
+        const rec: (level: "warn" | "error" | "info", msg: string) => void = (l, m) => warns.push(`${l}:${m}`);
+        assert.equal(perfTelemetryInit("sqlite", { dir, log: rec }), true);
+        // BigInt is not JSON-serializable: JSON.stringify throws. The record
+        // path must swallow it as a one-shot degrade, not propagate it into
+        // the caller (which is the request hot path via logRequestCost).
+        assert.doesNotThrow(() => {
+            perfRecordRequest({ sessionId: "s-bigint", extra: { bad: 10n } }, rec);
+        });
+        const degraded = warns.filter((w) => w.startsWith("warn:") && w.includes("telemetry degraded"));
+        assert.equal(degraded.length, 1, "exactly ONE degrade warn for a malformed payload");
+        assert.ok(degraded[0].includes("record failed"), "warn must name the record failure");
+        // Dead now: subsequent records are dropped silently (no throw, no row).
+        perfRecordRequest({ sessionId: "s-after" }, rec);
+        assert.equal(perfRecentRows().length, 0, "no rows may be recorded while dead");
+    } finally { perfStopAll(); }
+});
+
 after(() => { for (const d of SANDBOXES.splice(0)) rmSync(d, { recursive: true, force: true }); });

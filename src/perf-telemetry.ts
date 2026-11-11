@@ -169,34 +169,49 @@ export function perfRecordRequest(r: {
     extra?: Record<string, unknown>;
 }, w?: (level: "warn" | "error" | "info", msg: string) => void): void {
     if (state.mode === "off" || state.mode === "json") return;
-    const db = ensureDb();
-    if (!db) return;
-    const row: Record<string, unknown> = {
-        ts: Date.now(), kind: "req",
-        session_id: r.sessionId ?? null,
-        msgs: r.msgs ?? null,
-        inbound_bytes: r.inboundBytes ?? null,
-        outbound_bytes: r.outboundBytes ?? null,
-        total_ms: r.totalMs ?? null,
-        parse_ms: r.parseMs ?? null,
-        payload_json: r.extra ? JSON.stringify({ engine: state.mode, ...r.extra }) : JSON.stringify({ engine: state.mode }),
-    };
-    insertRow(db, row, w ?? loggerLog);
+    const logFn = w ?? loggerLog;
+    try {
+        const db = ensureDb();
+        if (!db) return;
+        const row: Record<string, unknown> = {
+            ts: Date.now(), kind: "req",
+            session_id: r.sessionId ?? null,
+            msgs: r.msgs ?? null,
+            inbound_bytes: r.inboundBytes ?? null,
+            outbound_bytes: r.outboundBytes ?? null,
+            total_ms: r.totalMs ?? null,
+            parse_ms: r.parseMs ?? null,
+            payload_json: r.extra ? JSON.stringify({ engine: state.mode, ...r.extra }) : JSON.stringify({ engine: state.mode }),
+        };
+        insertRow(db, row, logFn);
+    } catch (e) {
+        // Serving-immune contract (#5327/#5460): a malformed `extra` payload
+        // (BigInt / circular ref) makes JSON.stringify throw — degrade telemetry,
+        // never propagate into the request hot path that called us.
+        state.dead = true;
+        warnDegrade(logFn, `record failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
 }
 
 /** Memory watermark row — the OOM class (#5403 ×6) finally shows its ramp. */
 export function perfRecordMemSample(w?: (level: "warn" | "error" | "info", msg: string) => void): void {
     if (state.mode === "off" || state.mode === "json") return;
-    const db = ensureDb();
-    if (!db) return;
-    const m = process.memoryUsage();
-    const row: Record<string, unknown> = {
-        ts: Date.now(), kind: "mem",
-        session_id: null, msgs: null, inbound_bytes: null, outbound_bytes: null,
-        total_ms: null, parse_ms: null,
-        payload_json: JSON.stringify({ rss: m.rss, heapUsed: m.heapUsed, external: m.external, arrayBuffers: m.arrayBuffers }),
-    };
-    insertRow(db, row, w ?? loggerLog);
+    const logFn = w ?? loggerLog;
+    try {
+        const db = ensureDb();
+        if (!db) return;
+        const m = process.memoryUsage();
+        const row: Record<string, unknown> = {
+            ts: Date.now(), kind: "mem",
+            session_id: null, msgs: null, inbound_bytes: null, outbound_bytes: null,
+            total_ms: null, parse_ms: null,
+            payload_json: JSON.stringify({ rss: m.rss, heapUsed: m.heapUsed, external: m.external, arrayBuffers: m.arrayBuffers }),
+        };
+        insertRow(db, row, logFn);
+    } catch (e) {
+        state.dead = true;
+        warnDegrade(logFn, `mem-sample failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
 }
 
 /** Close everything (process shutdown / tests). Idempotent. */
