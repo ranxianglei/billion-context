@@ -20,8 +20,9 @@ import type { AddressInfo } from "node:net";
 process.env.NODE_TEST_CONTEXT = "1";
 
 const { ompIncrementalBeforeSend, ompIncrementalOnResponse, _setOmpOriginForTest, __resetOmpIncrementalForTests } = await import("../src/agent/omp-native.ts");
-const { __resetIncrementalClientForTests, noteHostMsgIdHint, noteIncrementalAck, planIncrementalTurn } = await import("../src/agent/incremental-client.ts");
+const { __resetIncrementalClientForTests, noteHostMsgIdHint, noteIncrementalAck, planIncrementalTurn, wireMessagesLookAnthropic } = await import("../src/agent/incremental-client.ts");
 const { ompBranchMsgIdEntries } = await import("../src/agent/pi.ts");
+const { pfLearnStamp, pfRequestHeaders } = await import("../src/agent/pf-channel.ts");
 
 const MODEL_URL = "https://api.openai-anthropic.example/v1/messages";
 
@@ -70,8 +71,7 @@ function stashHint(sid: string, branch: unknown[]): void {
 async function convert(sid: string, messages: unknown[]): Promise<{ body: Record<string, unknown>; ack: (appliedSeq: number) => void }> {
     const init = initOf({ model: "claude-test", max_tokens: 512, prompt_cache_key: sid, messages });
     await ompIncrementalBeforeSend(MODEL_URL, init);
-    const headers = init.headers as Headers;
-    const normalized = headersOf(headers);
+    const normalized = headersOf(new Headers(init.headers as Record<string, string> | Headers));
     return {
         body: JSON.parse(String(init.body)) as Record<string, unknown>,
         ack: (appliedSeq: number) => {
@@ -264,4 +264,112 @@ test("omp msgids: a re-planned delta never re-claims ids the lane may already ho
     // resync:true), so the same ids may ride a resync again.
     const resync = planIncrementalTurn({ conversationId: sid, messages: deltaMsgs, system: undefined, msgIds: ["c1", "c2", "c3"] }, true);
     assert.deepEqual(JSON.parse((resync as { body: string }).body).msgIds, ["c1", "c2", "c3"], "resync replaces the claim set wholesale");
+});
+
+// ── #5403/#5418: the same proven list feeds the SHARED watermark channel ──
+
+const PF_CONVO = "x-bili-plugin-conversation";
+
+test("omp watermark: an aligned branch feeds pf-channel for the chokepoint to stamp", async () => {
+    __resetIncrementalClientForTests();
+    __resetOmpIncrementalForTests();
+    const lane = await fakeLane();
+    lanes.push(lane);
+    _setOmpOriginForTest(lane.base);
+    const sid = "omp-pf-aligned";
+
+    stashHint(sid, [msgEntry("e1a2b3c4", "user", "hello"), msgEntry("e5f6a7b8", "assistant", "hi there")]);
+    const round = await convert(sid, [wire("user", "hello"), wire("assistant", "hi there")]);
+    assert.equal(round.body.resync, true, "the turn still converts normally");
+    // The watermark channel learned the list client-side; once a server stamp
+    // exists the single chokepoint emits count + tail-ids for this sid.
+    pfLearnStamp({ [PF_CONVO]: sid }, 200, new Headers({ "x-bili-pf-seq": "2" }));
+    const out = pfRequestHeaders({ [PF_CONVO]: sid });
+    assert.equal(out["x-bili-pf-count"], "2");
+    assert.equal(out["x-bili-pf-tail-ids"], "e5f6a7b8", "K=2 ⇒ anchor element 1 + new elements");
+    round.ack(2);
+});
+
+test("omp watermark: a misaligned branch CLEARS the channel list (count-only)", async () => {
+    __resetIncrementalClientForTests();
+    __resetOmpIncrementalForTests();
+    const lane = await fakeLane();
+    lanes.push(lane);
+    _setOmpOriginForTest(lane.base);
+    const sid = "omp-pf-misaligned";
+
+    // Two turns first: prove the list lands, then break alignment and expect
+    // the next request to wipe it rather than ride a stale one.
+    stashHint(sid, [msgEntry("e1a2b3c4", "user", "hello")]);
+    let round = await convert(sid, [wire("user", "hello")]);
+    pfLearnStamp({ [PF_CONVO]: sid }, 200, new Headers({ "x-bili-pf-seq": "1" }));
+    assert.equal(pfRequestHeaders({ [PF_CONVO]: sid })["x-bili-pf-tail-ids"], "e1a2b3c4", "first turn proves capture landed");
+    round.ack(1);
+
+    stashHint(sid, [msgEntry("e1a2b3c4", "user", "hello"), msgEntry("e9c0d1e2", "user", "WRONG role order")]);
+    round = await convert(sid, [wire("user", "hello"), wire("assistant", "edited reply")]);
+    const out = pfRequestHeaders({ [PF_CONVO]: sid });
+    assert.deepEqual(out, { "x-bili-pf-count": "1" }, "failed alignment clears the stored list — count-only, never a stale slice");
+    round.ack(2);
+});
+
+// ── #5403/#5418: capture is WIRE-SHAPES AGNOSTIC — omp egress picks its
+//   format per model (#2583), so an openai-wire session (tool_calls /
+//   role:"tool" ⇒ not anthropic-looking, divert stays off) still gets its id
+//   channel instead of staying count-only forever. ──
+
+const oaiEntry = (id: string, role: string) => ({ type: "message", id, message: { role, content: [{ type: "text", text: "x" }] }, timestamp: "2026-10-24T00:00:00.000Z" });
+const OAI_TOOL_TURN = [
+    { role: "user", content: "what time is it" },
+    { role: "assistant", content: "", tool_calls: [{ id: "call_1", type: "function", function: { name: "clock", arguments: "{}" } }] },
+    { role: "tool", tool_call_id: "call_1", content: "12:00" },
+];
+
+test("omp watermark: an OPENAI-shaped turn is NOT captured by the fetch layer (shared-hook authority)", async () => {
+    __resetIncrementalClientForTests();
+    __resetOmpIncrementalForTests();
+    const lane = await fakeLane();
+    lanes.push(lane);
+    _setOmpOriginForTest(lane.base);
+    const sid = "omp-pf-openai-wire";
+    assert.equal(wireMessagesLookAnthropic(OAI_TOOL_TURN), false, "fixture is genuinely non-anthropic");
+
+    // A perfectly-matching host-internal hint: even so, the fetch layer must
+    // not screen openai shapes. ompTurnMsgIds' count+role proof cannot bridge
+    // the config-assembled leading system run of real egress (guaranteed
+    // length mismatch), so any failure mode here ends in a clear — and this
+    // planner runs AFTER the shared before_provider_request capture for the
+    // same conversation id, erasing its position-aware list (#2583). Openai-
+    // wire turns are owned by that resolver alone.
+    stashHint(sid, [oaiEntry("a1b2c3d4", "user"), oaiEntry("b2c3d4e5", "assistant"), oaiEntry("c3d4e5f6", "tool")]);
+    const round = await convert(sid, structuredClone(OAI_TOOL_TURN));
+    assert.equal(round.body.resync, undefined, "openai shape is not converted — full-resend ride");
+    pfLearnStamp({ [PF_CONVO]: sid }, 200, new Headers({ "x-bili-pf-seq": "3" }));
+    assert.deepEqual(pfRequestHeaders({ [PF_CONVO]: sid }), { "x-bili-pf-count": "3" }, "no fetch-layer capture for this shape — count-only until the shared hook lands a list");
+});
+
+test("omp watermark: an openai-shaped turn neither lands nor clears (no fetch-layer clobber)", async () => {
+    __resetIncrementalClientForTests();
+    __resetOmpIncrementalForTests();
+    const lane = await fakeLane();
+    lanes.push(lane);
+    _setOmpOriginForTest(lane.base);
+    const sid = "omp-pf-openai-mismatch";
+
+    // Anthropic-aligned turn first so a list is on file…
+    stashHint(sid, [msgEntry("a1b2c3d4", "user", "hello")]);
+    const first = await convert(sid, [wire("user", "hello")]);
+    pfLearnStamp({ [PF_CONVO]: sid }, 200, new Headers({ "x-bili-pf-seq": "1" }));
+    assert.equal(pfRequestHeaders({ [PF_CONVO]: sid })["x-bili-pf-tail-ids"], "a1b2c3d4", "first turn proves capture landed");
+    first.ack(1);
+
+    // …then a genuinely-openai turn whose host-internal roles do not pair up:
+    // the fetch layer must leave the stored list UNTOUCHED — clearing here
+    // would erase the shared before_provider_request resolver's working list
+    // for the same conversation id (it runs first; this planner runs last).
+    stashHint(sid, [oaiEntry("a1b2c3d4", "user"), oaiEntry("b2c3d4e5", "assistant"), oaiEntry("c9d8e7f6", "WRONG ROLE")]);
+    const second = await convert(sid, structuredClone(OAI_TOOL_TURN));
+    assert.equal(second.body.resync, undefined, "the turn itself stays unconverted (divert off for this shape)");
+    const out = pfRequestHeaders({ [PF_CONVO]: sid });
+    assert.deepEqual(out, { "x-bili-pf-count": "1", "x-bili-pf-tail-ids": "a1b2c3d4" }, "the anthropic-landed list survives the openai turn intact — no fetch-layer clobber");
 });
