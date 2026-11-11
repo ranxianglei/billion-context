@@ -8,7 +8,7 @@ import { repairResponsesAssistantOrdering, reanchorSeparatorManifest, separatorM
 import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
-import { type CompressionCore, type Config, type CoreMessage, defaultCountTokens, defaultPrompts, relocateCompressCarriers, resolveOutputSteeringConfig } from "acp-kernel";
+import { type CompressionCore, type Config, type CoreMessage, buildBlockOpsSystemPrompt, defaultCountTokens, defaultPrompts, resolveOutputSteeringConfig } from "acp-kernel";
 import { type BiliMessage } from "acp-kernel/wire";
 import { absorbToolName, applyAbsorbView } from "../absorb.js";
 import { APIG_RESIGN_SCHEME, resignApig } from "../apig-resign.js";
@@ -73,10 +73,9 @@ import { applyOutputSteering, applyOutputSteeringJson } from "../output-steering
 import { estimateWireOverhead } from "./budget.js";
 import { buildForwardHeaders, connectionNamedHeaders, RESPONSE_ONLY_STRIP_HEADERS, safeSessionId, UPSTREAM_HOP_HEADERS } from "./headers.js";
 import { bodyDumpEnabled, logDumpFailure } from "./observability.js";
-import { effectiveAbsorbBlock } from "./prepare-responses.js";
+import { effectiveAbsorbBlock, effectiveBlockOpsEnabled } from "./prepare-responses.js";
 import { awaitDrain, bufferToStream, dumpStreamToFile, pipeThrough, readStreamToBuffer } from "./stream-io.js";
-import { buildForwardTarget, makeFoldPointReasoningDroppable, measuredBreakdownClause, measuredOutbound, outboundPayloadBreakdown, registerRequestAbort, beginStreamKeepalive, effectiveTokenCount, googlePathKind, imageBillingFor, imageTokenCapFor, inboundResignCredential, outboundContextEstimates, resolveUpstream, stripKernelSummaries, usageGradeInputBaseline, DOOMED_PROBE_ABSOLUTE_BYTES, DOOMED_PROBE_BYTES_PER_TOKEN, type Prepared } from "../server.js";
-import { isStrictReasoningEcho, modelIdOf } from "../strict-echo.js";
+import { buildForwardTarget, measuredBreakdownClause, measuredOutbound, outboundPayloadBreakdown, registerRequestAbort, beginStreamKeepalive, effectiveTokenCount, googlePathKind, imageBillingFor, imageTokenCapFor, inboundResignCredential, outboundContextEstimates, resolveUpstream, stripKernelSummaries, usageGradeInputBaseline, DOOMED_PROBE_ABSOLUTE_BYTES, DOOMED_PROBE_BYTES_PER_TOKEN, type Prepared } from "../server.js";
 
 /** Infer the wire protocol from the request path for compat-role rewrites on
  *  requests the pipeline did not prepare (passthrough). Mirrors the path
@@ -2613,13 +2612,11 @@ async function forwardCaptured(
             // the first request (prefix-cache anchor).
             const absorbBlock = effectiveAbsorbBlock(prepared.pluginMode === true, config, opts.compress.absorb);
             const absorbActive = absorbBlock?.enabled === true && opts.compress.injectTool && !textProtocol;
+            // #5765 cache-seam parity: the block-ops section rides the round-2
+            // rebuild exactly like the steady prepare* paths (hybrid lane on
+            // text protocol — it is a function tool there).
+            const blockOpsActive = effectiveBlockOpsEnabled(prepared.pluginMode === true, config, opts.compress.blockOps) && opts.compress.injectTool;
             const loopConfig = ccrLoopConfig(prepared.session, { ...config, absorb: absorbActive ? absorbBlock : undefined });
-            // Experimental fold-point "thinking clear" (default OFF): install the
-            // kernel drop predicate only when BOTH switches are set; strict-echo
-            // and signed-thinking views yield none at all (#684/#1658).
-            if (loopConfig.compressAtFoldPointClearThinking) {
-                loopConfig.reasoningDroppable = makeFoldPointReasoningDroppable(prepared.originalMessages as BiliMessage[], isStrictReasoningEcho(prepared.session, targetOrigin, modelIdOf({ model: prepared.model })));
-            }
             // Cache-seam: the compress<->absorb join must be byte-identical to
             // the steady prepare* paths. Every steady wire joins the absorb
             // section with a plain "\n\n" (sysParts.join / injectSystem parts
@@ -2629,6 +2626,9 @@ async function forwardCaptured(
             // the absorb boundary char).
             const absorbSection = absorbActive
                 ? `\n\n${buildAbsorbSystemPrompt(absorbToolName(loopConfig))}`
+                : "";
+            const blockOpsSection = blockOpsActive
+                ? `\n\n${buildBlockOpsSystemPrompt(textProtocol ? "hybrid" : "function")}`
                 : "";
             const visibilityMarkers = resolveCompress(opts.routes, route?.rewrittenUrl, (parsedReq as { model?: string }).model ?? prepared.model, opts.compress).visibilityMarkers ?? true;
             // #3298 cache-seam parity: every steady prepare* path appends the
@@ -2649,7 +2649,7 @@ async function forwardCaptured(
             // prepare* path — the round-2 rebuild must keep that exact order or
             // the system-element prefix forks at every fold of an affected session.
             const genBoundaryNote = detectGenerationBoundary(prepared.session, prepared.originalMessages, log) ? `\n\n${GENERATION_BOUNDARY_NOTE}` : "";
-            const systemPrompt = withProjectAttribution(withMcpDialectNote(withMarkerIntegrityNote(withSummaryBudgetNote(textProtocol ? buildCompressHybridSystemPrompt(prepared.prompts ?? defaultPrompts, messageTimestampSections(conversationPromptSections(prepared.surface?.promptSections, externalSummaryEnabled(config)), "hybrid")) : buildCompressSystemPrompt(prepared.prompts ?? defaultPrompts, messageTimestampSections(conversationPromptSections(prepared.surface?.promptSections, externalSummaryEnabled(config)))), externalSummaryEnabled(config)), visibilityMarkers), prepared.mcpDialectNote === true)) + genBoundaryNote + absorbSection;
+            const systemPrompt = withProjectAttribution(withMcpDialectNote(withMarkerIntegrityNote(withSummaryBudgetNote(textProtocol ? buildCompressHybridSystemPrompt(prepared.prompts ?? defaultPrompts, messageTimestampSections(conversationPromptSections(prepared.surface?.promptSections, externalSummaryEnabled(config)), "hybrid")) : buildCompressSystemPrompt(prepared.prompts ?? defaultPrompts, messageTimestampSections(conversationPromptSections(prepared.surface?.promptSections, externalSummaryEnabled(config)))), externalSummaryEnabled(config)), visibilityMarkers), prepared.mcpDialectNote === true, blockOpsActive)) + genBoundaryNote + absorbSection + blockOpsSection;
             // #1295: commandcode keeps the internal protocol "openai" (request
             // shape is openai-completions) but speaks bare JSONL on the wire.
             const adapter = prepared.commandcode
@@ -2700,20 +2700,7 @@ async function forwardCaptured(
                     // against them drops the only cross-turn summary carrier and breaks the byte-prefix
                     // at the fold anchor (post-fold cache floor reset to the stable head).
                     const outBase = [...stripKernelSummaries(viewed as BiliMessage[], turn.state), ...(records as BiliMessage[])] as BiliMessage[];
-                    // Fold-point summary relocation round-2 mirror (switch A): with
-                    // the switch on, each still-visible compress pair keeps its
-                    // chronological slot but its SUMMARY TEXT is re-emitted at its
-                    // fold point (call args become a pointer — v2 semantics).
-                    // Idempotent when processTurn's node already relocated them
-                    // (view-only + deterministic transform).
-                    const out = loopConfig.compressAtFoldPoint
-                        ? relocateCompressCarriers(outBase as unknown as CoreMessage[], turn.state, {
-                            isCompressTool: loopConfig.isCompressTool,
-                            ...(loopConfig.compressAtFoldPointClearThinking && loopConfig.reasoningDroppable
-                                ? { clearThinking: true, reasoningDroppable: loopConfig.reasoningDroppable }
-                                : {}),
-                        }) as BiliMessage[]
-                        : outBase;
+                    const out = outBase;
                     // [#1592] Mirror the steady path's per-wire post-processing EXACTLY:
                     // the reasoning drop each prepare* applied, and — only on the
                     // Responses wire — the run-ordering repair (#564). Applying the
