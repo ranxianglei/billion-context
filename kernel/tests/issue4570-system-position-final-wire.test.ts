@@ -108,7 +108,7 @@ test("#4570 shape: a note appended after a trailing system is healed on the fina
   assert.equal(sent.length, 6);
 });
 
-test("#4570 shape: a trailing tool-delta run before a note keeps the text and drops tool deltas", () => {
+test("#4570/#4818 shape: a trailing tool-delta run before a note is relocated after it, deltas intact", () => {
   const sent = healAnthropicSystemPositions([
     { role: "user", content: "q" },
     sys([{ type: "text", text: "tools updated" }, TOOL_ADDITION] as never),
@@ -116,8 +116,11 @@ test("#4570 shape: a trailing tool-delta run before a note keeps the text and dr
     { role: "user", content: "nudge" },
   ]);
   assert.deepEqual(violations(sent), []);
-  assert.deepEqual(texts(sent), ["q", "tools updated", "nudge"]);
-  assert.ok(!JSON.stringify(sent).includes("tool_addition"));
+  // #4818: tool-delta carriers are RELOCATED (not demoted+stripped) to the
+  // earliest forward legal slot — here the array end, after the appended note —
+  // keeping their deltas so paired add/remove chains are never orphaned.
+  assert.deepEqual(texts(sent), ["q", "nudge", "tools updated"]);
+  assert.ok(JSON.stringify(sent).includes("tool_addition"), "#4818: delta preserved on relocation");
 });
 
 // --- "must follow": a system right after an assistant -----------------------
@@ -134,7 +137,7 @@ test("must-follow shape: a sidecar system between two assistants is re-voiced", 
   assert.deepEqual(texts(wire), ["q1", "a1", "mid-session update", "a2", "q2"]);
 });
 
-test("must-follow shape: a system after an assistant is re-voiced in place", () => {
+test("must-follow/#4818 shape: a tool-delta system after an assistant is relocated past the tool result", () => {
   const sent = healAnthropicSystemPositions([
     { role: "user", content: "q1" },
     { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "bash", input: {} }] },
@@ -143,9 +146,13 @@ test("must-follow shape: a system after an assistant is re-voiced in place", () 
     { role: "assistant", content: [{ type: "text", text: "done" }] },
   ]);
   assert.deepEqual(violations(sent), []);
-  assert.equal(sent[2]!.role, "user", "demoted in place (#5438)");
+  // #4818: the tool-delta carrier is NOT demoted+stripped in place; it is
+  // relocated to the earliest forward legal slot — after the tool_result user
+  // turn, before the closing assistant — still a system, deltas intact.
+  assert.equal(sent[2]!.role, "user", "original tool_result user stays put");
+  assert.equal(sent[3]!.role, "system", "carrier relocated, still a system");
   assert.ok(JSON.stringify(sent).includes("tools updated"), "text kept");
-  assert.ok(!JSON.stringify(sent).includes("tool_addition"), "WC-022: delta stripped on demotion");
+  assert.ok(JSON.stringify(sent).includes("tool_addition"), "#4818: delta preserved on relocation");
 });
 
 test("must-follow shape: a run of systems after an assistant is demoted in order", () => {
