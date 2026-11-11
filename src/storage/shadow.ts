@@ -34,7 +34,7 @@ import { resolveBackendName, backendSelectionNotice, selectedBackendRaw, openBac
 import { canonicalDigest, canonicalize, sha256 } from "./canonical.ts";
 import { recordSidecarInstance, recordSidecarOpenFailure } from "./runtime-status.ts";
 import type { SqliteEngineName, SqliteEngineSource } from "./driver.ts";
-import type { MessageRow, BlockRow, SessionRow, RefRow, MessageRefContentRow } from "./store.js";
+import type { MessageRow, BlockRow, SessionRow, RefRow, MessageRefContentRow, MessageIdContentRow } from "./store.js";
 import type { CoreMessage, MessageContentStore } from "acp-kernel";
 
 // True once quick_check proved this process's index corrupt. such a boot is
@@ -63,6 +63,11 @@ interface ResidentFields {
  *  migration-parity property, not a per-commit one. The FIRST ingest of a
  *  session always verifies (cold-path full check), then every N-th. */
 export const VERIFY_EVERY_INGESTS = 20;
+
+/** #5744: wall-clock threshold for the slow-ingest warn (ms). The old
+ *  request-level warn keyed on message count, which cannot separate a fast
+ *  big session from a slow small one. */
+const SLOW_INGEST_WARN_MS = 500;
 
 /** #4323: consecutive sampled drifts required before escalating. A one-off
  *  drift is transient external churn (the watermark clear below heals it);
@@ -483,8 +488,29 @@ export class UnifiedShadow {
             // full path below; the delta itself re-verifies the boundary
             // inside the ingest transaction, so a racing writer degrades to
             // a full ingest, never a corrupt one.
+            // #5744: wall-clock guard on the ingest itself — message count is
+            // a bad proxy (one reporter session: 0.8s and 14.5s saves at the
+            // SAME ~3k msgs). Names the path so a spike is attributable
+            // (delta fast path vs full fallback) without a profiler.
+            const tIngestStart = performance.now();
+            let ingestPath = "delta";
             phase = "ingest-delta";
-            if (!this.ingestDelta(legacy, hasRawTail)) {
+            // #5677: while drift-latched the sampled digest has PROVEN the
+            // stored view diverges from the live one — vouching for a trusted
+            // prefix is exactly the trust that sample just voided. A host that
+            // re-writes history slots below the watermark on every save (the
+            // #4614 producer class) makes the delta path re-diverge within ≤
+            // VERIFY_EVERY_INGESTS saves of each heal, so the samples drift in
+            // a row, the streak escalates and the envelope freezes — the
+            // chronic ESCALATED→FROZEN loop reported in #5677. Forcing the
+            // exact full path for every latched save keeps both legs
+            // same-generation at sample time: the next sample passes, the
+            // latch releases, the delta resumes. Bounded cost (full ingest per
+            // save) paid only by sessions whose views are already proven
+            // divergent; healthy sessions never see it.
+            const deltaApplied = !this.driftedSessions.has(legacy.id) && this.ingestDelta(legacy, hasRawTail);
+            if (!deltaApplied) {
+                ingestPath = "full";
                 phase = "plan-ingest";
                 const plan = planIngest(legacy);
                 phase = "ingest-session";
@@ -502,6 +528,14 @@ export class UnifiedShadow {
                 this.sync.ingestSession(plan, undefined, { completeLog });
             }
             this.stats.ingests++;
+            const ingestMs = Math.round(performance.now() - tIngestStart);
+            if (ingestMs > SLOW_INGEST_WARN_MS) {
+                // #5744: attach WAL forensics so a stall spike can be attributed
+                // to a checkpoint burst (multi-second tick inside the window)
+                // instead of per-row statement cost — read-only, warn path only.
+                const walSuffix = this.sync.walDiagnosticsSuffix() ?? "";
+                loggerLog("warn", `[storage] slow-ingest: ${legacy.id} path=${ingestPath} took=${ingestMs}ms${walSuffix} — synchronous per-save storage work is starving the event loop (#5744); path=full means the delta fast path fell back (watermark missing/cleared or tail shape changed)`);
+            }
             // #3133 sampled verification: ingest integrity is already guarded
             // by the SQLite write path; the read-back digest is a migration
             // parity oracle, so it runs on the first ingest of a session and
@@ -987,6 +1021,13 @@ export class UnifiedShadow {
         return this.sync.messageContentByRefNums(sessionId, refNums);
     }
 
+    /** #6029: per-msg_id stored bodies — the restamp-proof twin of
+     *  messageContentByRefNums (sync store only, like its sibling). */
+    messageContentByMsgIds(sessionId: string, msgIds: readonly string[]): MessageIdContentRow[] {
+        if (this.sync === null || msgIds.length === 0) return [];
+        return this.sync.messageContentByMsgIds(sessionId, msgIds);
+    }
+
     sessionSummaries(): SessionSummaryRow[] {
         if (this.sync === null) return [];
         return this.sync.sessionSummaries();
@@ -1151,20 +1192,26 @@ export class UnifiedShadow {
                 // #3133 watermark delta.
                 phase = "ingest-delta";
                 let applied = false;
-                try {
-                    const mark = await backend.ingestWatermark(legacy.id);
-                    if (mark) {
-                        const boundary = await backend.probeIngestBoundary(legacy.id, mark.seq);
-                        if (boundary) {
-                            const plan = planIngestDelta(legacy, mark.seq, mark.tailSeqs, { msgId: boundary.msgId, contentHash: boundary.contentHash }, hasRawTail);
-                            if (plan) {
-                                applied = await backend.ingestSession(plan, { trustedSeq: mark.seq, boundaryMsgId: boundary.msgId, boundaryHash: boundary.contentHash, trustedTailSeqs: mark.tailSeqs });
-                                if (applied) this.stats.deltaIngests++;
+                // #5677: same latch gate as the sync path above — a drift-
+                // latched session's stored prefix is proven untrustworthy by
+                // definition; the exact full path keeps both legs same-
+                // generation so the next sample can re-admit and release it.
+                if (!this.driftedSessions.has(legacy.id)) {
+                    try {
+                        const mark = await backend.ingestWatermark(legacy.id);
+                        if (mark) {
+                            const boundary = await backend.probeIngestBoundary(legacy.id, mark.seq);
+                            if (boundary) {
+                                const plan = planIngestDelta(legacy, mark.seq, mark.tailSeqs, { msgId: boundary.msgId, contentHash: boundary.contentHash }, hasRawTail);
+                                if (plan) {
+                                    applied = await backend.ingestSession(plan, { trustedSeq: mark.seq, boundaryMsgId: boundary.msgId, boundaryHash: boundary.contentHash, trustedTailSeqs: mark.tailSeqs });
+                                    if (applied) this.stats.deltaIngests++;
+                                }
                             }
                         }
+                    } catch {
+                        applied = false;
                     }
-                } catch {
-                    applied = false;
                 }
                 // #5412: mirror the sync path's latched-sweep promotion (#5408
                 // B1 / #4323). While the sampler has latched this session as
@@ -1482,7 +1529,7 @@ interface DriftDiagnostics {
      *  converges the tables it owns; the sub-key names the actual residue. */
     stateKeys?: string[];
     /** First divergent lastMessages slot (or the length-mismatch index). */
-    tailSlot?: { index: number; expect: DriftSlotFingerprint; got: DriftSlotFingerprint };
+    tailSlot?: { index: number; expect: DriftSlotFingerprint; got: DriftSlotFingerprint; /** #5677: top-level field names whose values disagree (names only). */ fields?: string[] };
 }
 
 /** Compare the replay by component, retaining only message fingerprints across batches. */
@@ -1491,7 +1538,10 @@ class BatchedViewVerification {
     private readonly tail: { tailSeqs: number[] | null; pluginSnapshotSeqs: number[] | null };
     private readonly remainingContents: LegacySessionLike["blockContents"];
     private readonly orphans: LegacySessionLike["blockContents"];
-    private readonly messages = new Map<number, ReturnType<typeof messageSignature>>();
+    // #5677: the parsed row rides along with its signature so the FIRST
+    // divergent slot can be field-diffed without re-reading the store; the
+    // verifier is per-sample and short-lived, so the extra retention is bounded.
+    private readonly messages = new Map<number, { sig: ReturnType<typeof messageSignature>; raw: unknown }>();
     private readonly keys = new Set<string>();
     private headerDiag: DriftDiagnostics | null = null;
     private drift = false;
@@ -1542,7 +1592,10 @@ class BatchedViewVerification {
     }
 
     addMessages(rows: MessageRow[]): void {
-        for (const row of rows) this.messages.set(row.seq, messageSignature(JSON.parse(row.content)));
+        for (const row of rows) {
+            const raw = JSON.parse(row.content);
+            this.messages.set(row.seq, { sig: messageSignature(raw), raw });
+        }
     }
 
     private changed(key: string): void {
@@ -1559,16 +1612,19 @@ class BatchedViewVerification {
         const expected = this.legacy[key];
         let index = 0;
         for (const seq of seqs ?? []) {
-            const got = this.messages.get(seq);
-            if (!got) {
+            const rec = this.messages.get(seq);
+            if (!rec) {
                 this.tailGaps++;
                 continue;
             }
             const want = expected && index < expected.length ? messageSignature(expected[index]) : undefined;
-            if (!want || want.digest !== got.digest) {
+            if (!want || want.digest !== rec.sig.digest) {
                 this.changed(key);
                 if (key === "lastMessages" && expected && !this.tailSlot) {
-                    this.tailSlot = { index, expect: want?.slot ?? missingSlot(), got: got.slot };
+                    const fields = diffFieldNames(expected[index], rec.raw);
+                    this.tailSlot = fields === undefined
+                        ? { index, expect: want?.slot ?? missingSlot(), got: rec.sig.slot }
+                        : { index, expect: want?.slot ?? missingSlot(), got: rec.sig.slot, fields };
                 }
             }
             index++;
@@ -1609,6 +1665,23 @@ function messageSignature(value: unknown): { digest: string; slot: DriftSlotFing
             sha8: digest.slice(0, 8),
         },
     };
+}
+
+/** #5677: top-level field names whose canonicalized values disagree between
+ *  two slot copies. NAMES ONLY — values never leave this function (the log
+ *  line goes to disk and mirrors publicly). undefined when either side is not
+ *  a plain object; for two plain objects a digest mismatch always names ≥1
+ *  field, so an empty result is impossible there. */
+function diffFieldNames(a: unknown, b: unknown): string[] | undefined {
+    if (!a || typeof a !== "object" || Array.isArray(a) || !b || typeof b !== "object" || Array.isArray(b)) return undefined;
+    const ao = a as Record<string, unknown>;
+    const bo = b as Record<string, unknown>;
+    const ser = (v: unknown): string | null => (v === undefined ? null : JSON.stringify(canonicalize(v)));
+    const out: string[] = [];
+    for (const k of [...new Set([...Object.keys(ao), ...Object.keys(bo)])].sort()) {
+        if (ser(ao[k]) !== ser(bo[k])) out.push(k);
+    }
+    return out.length > 0 ? out : undefined;
 }
 
 // #3919: which dimensions disagree when the sampled verify detects drift —
@@ -1660,7 +1733,12 @@ export function describeViewDivergence(expectView: unknown, gotView: unknown): D
                 const s2 = ser(m) ?? "";
                 return { id: typeof s.id === "string" ? s.id : "-", role: typeof s.role === "string" ? s.role : "-", length: s2.length, sha8: sha256(s2).slice(0, 8) };
             };
-            diagnostics.tailSlot = { index, expect: fp(index < et.length ? et[index] : null), got: fp(index < gt.length ? gt[index] : null) };
+            const ea = index < et.length ? et[index] : null;
+            const ga = index < gt.length ? gt[index] : null;
+            const fields = diffFieldNames(ea, ga);
+            diagnostics.tailSlot = fields === undefined
+                ? { index, expect: fp(ea), got: fp(ga) }
+                : { index, expect: fp(ea), got: fp(ga), fields };
         }
     }
     return diagnostics;
@@ -1671,8 +1749,8 @@ export function formatDriftDiagnostics(d: DriftDiagnostics): string {
     const parts = [`diverged: ${d.keys.length > 0 ? d.keys.join(",") : "<unknown>"}`];
     if (d.stateKeys) parts.push(`state: ${d.stateKeys.join(",")}`);
     if (d.tailSlot) {
-        const { index, expect: ex, got: go } = d.tailSlot;
-        parts.push(`tail slot ${index}: expect ${ex.id}/${ex.role} len=${ex.length} sha=${ex.sha8}, got ${go.id}/${go.role} len=${go.length} sha=${go.sha8}`);
+        const { index, expect: ex, got: go, fields } = d.tailSlot;
+        parts.push(`tail slot ${index}: expect ${ex.id}/${ex.role} len=${ex.length} sha=${ex.sha8}, got ${go.id}/${go.role} len=${go.length} sha=${go.sha8}${fields ? `; fields: ${fields.join(",")}` : ""}`);
     }
     return " [" + parts.join("; ") + "]";
 }

@@ -69,15 +69,32 @@ test("cold load recovers the pre-fix orphan freeze before processing a request",
     assert.equal(recovered.stats.requests, 876);
     assert.equal(recovered.state.nextBlockId, 4);
     assert.deepEqual(recovered.state.blocks.map(b => b.blockId), ["b3"]);
-    // #4316 PR3/3: a full-mode cold load re-homes citation numbers once
-    // (ledger alignment) — pin the content-addressable round-trip, not the
-    // counter-era number, so the assertion holds under any numbering scheme.
-    const alignedRef = recovered.state.messageRefs.byRaw["raw-new"];
-    assert.ok(alignedRef, "raw-new must keep a citation number after recovery");
-    assert.equal(recovered.state.messageRefs.byRef[alignedRef], "raw-new");
+    // #5608-D: the one-time ledger alignment (formerly done on full-mode
+    // cold load, #4316 PR3/3) defers to the NEXT post-fold save — the
+    // restart itself must return the persisted counter numbers untouched so
+    // provider-cached rendered bytes survive. Pin both halves: cold load
+    // keeps m00003 with NO marker (nothing has folded since restart); the
+    // moment a fold commit arms the marker, the follow-up save settles the
+    // alignment exactly once (seq 0 + 1 -> m00001).
+    const coldRef = recovered.state.messageRefs.byRaw["raw-new"];
+    assert.ok(coldRef, "raw-new must keep a citation number after recovery");
+    assert.equal(coldRef, "m00003", "#5608-D: cold load keeps the persisted counter ref");
+    assert.equal(recovered.state.messageRefs.byRef[coldRef], "raw-new");
+    assert.notEqual((recovered.state as { refLedgerAligned?: boolean }).refLedgerAligned, true);
+    assert.equal((recovered as { pendingLedgerAlign?: boolean }).pendingLedgerAlign, undefined, "#5608-D: a bare cold load arms nothing (no fold has committed yet)");
+    // The fold-commit path (src/stream.ts) arms the marker after replacing
+    // session.state; simulate that commit + its follow-up save now:
+    // scheduleSave/flushSync consume the marker BEFORE serializing anything.
+    (recovered as { pendingLedgerAlign?: boolean }).pendingLedgerAlign = true;
+    assert.ok(store.flushSync(recovered));
+    const refs2 = recovered.state.messageRefs;
+    assert.equal(refs2.byRaw["raw-new"], "m00001", "the first stored message aligns to seq 0 + 1 on the deferred save");
+    assert.equal(refs2.byRef["m00001"], "raw-new");
+    assert.equal((recovered.state as { refLedgerAligned?: boolean }).refLedgerAligned, true);
     // The pre-alignment number is recorded as superseded, not silently dropped.
-    assert.equal(alignedRef, "m00001", "the first stored message aligns to seq 0 + 1");
+    // Map semantics are oldRef -> raw id (kernel contract), not oldRef -> newRef.
     assert.equal(recovered.restampSuperseded?.get("m00003"), "raw-new");
+    assert.equal((recovered as { pendingLedgerAlign?: boolean }).pendingLedgerAlign, undefined, "marker consumed");
     assert.equal(recovered.lastMessages?.at(-1)?.text, "new turn");
     assert.equal(recovered.metadata.recoveryMarker, "fresh");
     assert.equal(recovered.blockContents.get("b1")?.full.text, "retained original");

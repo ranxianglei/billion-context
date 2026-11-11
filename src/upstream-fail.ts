@@ -12,6 +12,16 @@
  *  neither imports the other just for this (they already form an import
  *  edge upstream-proxy → fetch-util; adding the reverse would be a cycle). */
 
+// #5807/#5917: the code fetchWithTimeout stamps on an error when its PHASE-1
+// (pre-first-byte) watchdog fires because the operator TIGHTENED the first-byte
+// budget below the idle budget. Carrying it as a string `code` (not a new
+// exception type) keeps the existing chainOf() walk working unchanged: the
+// classifier reads it off the error and returns "upstream-headers-timeout",
+// which isFailFastUpstreamKind() then replays. Unset knob ⇒ the marker is never
+// stamped ⇒ a first-byte timeout still classifies as "upstream-timeout" and
+// stays non-retried, byte-identical to the pre-#5807 default.
+export const UPSTREAM_FIRST_BYTE_TIMEOUT_CODE = "UPSTREAM_FIRST_BYTE_TIMEOUT";
+
 export type UpstreamFailureKind =
     /** Downstream client disconnected (external abort fired). Nothing bili
      *  did or can retry — the request is dead by definition. */
@@ -20,6 +30,14 @@ export type UpstreamFailureKind =
      *  OS/undici reported a headers/body timeout. NOT retried — the budget
      *  already waited and the request may have reached the upstream. */
     | "upstream-timeout"
+    /** Phase-1 FIRST-BYTE timeout: the operator tightened the first-byte budget
+     *  (network.upstreamFirstByteMs / BILI_UPSTREAM_FIRST_BYTE_MS below the idle
+     *  budget) and the upstream still sent NO response byte within it. Zero
+     *  bytes were received, so a replay cannot double-deliver anything and each
+     *  attempt costs at most the (explicitly tightened) first-byte budget — it
+     *  replays within the retry budget (#5807/#5831). Distinct from
+     *  upstream-timeout: a mid-stream (body) idle expiry stays non-retried. */
+    | "upstream-headers-timeout"
     /** Connect-phase timeout (undici UND_ERR_CONNECT_TIMEOUT): the TCP
      *  handshake never completed, so nothing reached the upstream and each
      *  attempt costs at most one connect timeout — replayed within the retry
@@ -78,6 +96,11 @@ export function classifyUpstreamFailure(error: unknown, ctx: UpstreamFailCtx = {
     for (const entry of chain) {
         const code = typeof entry.code === "string" ? entry.code : undefined;
         const name = typeof entry.name === "string" ? entry.name : undefined;
+        // #5807: a TIGHTENED first-byte watchdog stamps this code before
+        // aborting — nothing reached the wire (zero response bytes), so it is a
+        // distinct, replayable kind. Checked first: it is the only code whose
+        // meaning is defined by bili itself, not by the OS/undici.
+        if (code === UPSTREAM_FIRST_BYTE_TIMEOUT_CODE) return "upstream-headers-timeout";
         if (code === undefined) {
             if (name === "AbortError") return "upstream-timeout";
             continue;
@@ -231,10 +254,12 @@ export function buildProxyFailureResponse(msg: string, err: unknown): { status: 
  *  replay cannot double-deliver anything. Per-attempt cost stays bounded —
  *  milliseconds for resets/refusals/DNS/no-route rejections, at most one
  *  connect timeout for connect-timeout — so retrying never stacks the 12-min
- *  idle budget across attempts the way a headers/body timeout would
- *  (#1263, #1453, #2465/#5663). */
+ *  idle budget across attempts the way a headers/body timeout would; a
+ *  first-byte timeout is bounded by the explicitly-tightened first-byte budget
+ *  (strictly under the idle budget by construction), so it is fail-fast too
+ *  (#5807/#5831, #1263, #1453, #2465/#5663). */
 export function isFailFastUpstreamKind(kind: UpstreamFailureKind): boolean {
-    return kind === "proxy-reset" || kind === "upstream-reset" || kind === "connect-refused" || kind === "connect-timeout" || kind === "dns" || kind === "upstream-unreachable";
+    return kind === "proxy-reset" || kind === "upstream-reset" || kind === "connect-refused" || kind === "connect-timeout" || kind === "dns" || kind === "upstream-unreachable" || kind === "upstream-headers-timeout";
 }
 
 /** One-line remediation hint per kind — used by logs and the docs so the
@@ -242,6 +267,7 @@ export function isFailFastUpstreamKind(kind: UpstreamFailureKind): boolean {
 export const UPSTREAM_FAIL_HINTS: Record<UpstreamFailureKind, string> = {
     "client-abort": "downstream client disconnected — no bili-side action",
     "upstream-timeout": "idle budget expired (headers/body) — check upstream health; not retried by design",
+    "upstream-headers-timeout": "no first response byte within the explicitly-tightened first-byte budget (network.upstreamFirstByteMs / BILI_UPSTREAM_FIRST_BYTE_MS) — zero bytes were received, so a bounded transparent replay may be attempted (BILI_REPLAY_RETRY_MAX); the mid-stream (body) idle budget is unchanged",
     "connect-timeout": "TCP handshake never completed — upstream/proxy unreachable or blackholed; a bounded transparent replay may be attempted (BILI_REPLAY_RETRY_MAX)",
     "upstream-unreachable": "ICMP no-route rejection (EHOSTUNREACH/ENETUNREACH/EHOSTDOWN) — nothing reached the upstream; check routing/firewall/ACL (on macOS also the Local Network privacy grant for the app that owns the bili process, #5663); a bounded transparent replay may be attempted (BILI_REPLAY_RETRY_MAX)",
     "proxy-reset": "proxy dropped the connection before the response — check proxy idle-recycle/payload limits (BILI_PROXY_KEEPALIVE_MAX_MS can shorten our reuse window); a bounded transparent replay may be attempted (BILI_REPLAY_RETRY_MAX)",
