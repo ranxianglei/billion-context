@@ -5,9 +5,8 @@ import { coreToGoogle, googleToCore, normalizeGoogleUserPartOrder, type BiliMess
 import type { ProxyOptions } from "../config.js";
 import { pluginAgentHeader } from "../plugin.js";
 import { currentCalibrationFactor } from "../util.js";
-import { diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, makeFoldPointReasoningDroppable, reapOrphansLogged, resolveKnownOutputCeiling, runNudgeDecision, stripKernelSummaries, usageGradeInputBaseline, type Prepared } from "../server.js";
+import { diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, reapOrphansLogged, resolveKnownOutputCeiling, runNudgeDecision, stripKernelSummaries, usageGradeInputBaseline, type Prepared } from "../server.js";
 import { recordNudgeObservation } from "../context-analysis.js";
-import { isStrictReasoningEcho } from "../strict-echo.js";
 import { yieldToEventLoop } from "../yield-loop.js";
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, resolveDecisionRange, stripDecisionReasoningFields, type DecideConfig } from "../nudge-decide.js";
 import { excludeDeadRefRanges } from "../acp-status.js";
@@ -20,8 +19,10 @@ import { absorbAbortedTurnGrowth, applyCompactionArchive, coveredRealHistoryIds,
 import { recordConflict } from "../conflict-watch.js";
 import { carriesDshLocalCompactionSummary, DSH_LOCAL_COMPACTION_MIN_MISSING } from "./dsh-compaction-guard.js";
 import { carriesBiliSnapshotCheckpoint } from "./dsh-authored-compaction.js";
-import { ABSORB_TOOL_NAME, READ_ORIGINAL_IMAGE_TOOL_GOOGLE, RULE_TOOL_GOOGLE, absorbToolsFor, buildAbsorbSystemPrompt, buildAcpTagsOnlyPrompt, buildCompressSystemPrompt, retrieveToolsFor, withFirstSightDrain, withMarkerIntegrityNote, withMcpDialectNote, withSummaryBudgetNote, withProjectAttribution } from "../compress-tool.js";
+import { ABSORB_TOOL_NAME, READ_ORIGINAL_IMAGE_TOOL_GOOGLE, RULE_TOOL_GOOGLE, absorbToolsFor, blockOpsTools, buildAbsorbSystemPrompt, buildAcpTagsOnlyPrompt, buildCompressSystemPrompt, retrieveToolsFor, withFirstSightDrain, withMarkerIntegrityNote, withMcpDialectNote, withSummaryBudgetNote, withProjectAttribution } from "../compress-tool.js";
 import { absorbToolName, applyAbsorbView, storeEffectiveAbsorb } from "../absorb.js";
+import { storeEffectiveBlockOps } from "../acp-block-ops.js";
+import { buildBlockOpsSystemPrompt } from "acp-kernel";
 import { adoptContentStore, ccrEnabled, ccrLoopConfig, contentStoreOf, imageRescaleToolArmed, retrieveToolName } from "../store.js";
 import { rulesEnabled, storeEffectiveRules } from "../rules-feature.js";
 import { autoFoldEngaged, autoFoldFloor, conversationPromptSections, externalSummaryEnabled, growthFoldingArmed, messageTimestampSections } from "../external-summary-surface.js";
@@ -34,7 +35,7 @@ import { imageRescaleMaxDim, renderNone as knobRenderNone } from "../knobs.js";
 import { applyImageRescalePass } from "../image-rescale.js";
 import { clampOutgoingOutput, countSystemAndToolsTokens, dshLedgerFloorTokens, emergencyNudge, emergencyNudgeArmed } from "./budget.js";
 import { estimateCoreMessages } from "../preflight.js";
-import { effectiveAbsorbBlock } from "./prepare-responses.js";
+import { effectiveAbsorbBlock, effectiveBlockOpsEnabled } from "./prepare-responses.js";
 import { injectGoogleTool, injectTool } from "./inject.js";
 import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
 
@@ -152,15 +153,14 @@ export async function prepareGoogle(
         const absorbBlock = effectiveAbsorbBlock(pluginMode, config, opts.compress.absorb);
         const absorbTools = absorbToolsFor(absorbBlock?.toolName ?? ABSORB_TOOL_NAME);
         const absorbActive = absorbBlock?.enabled === true && shouldInject;
+        // #5765: block-lifecycle tools — one switch, off by default.
+        const blockOps = blockOpsTools();
+        const blockOpsActive = effectiveBlockOpsEnabled(pluginMode, config, opts.compress.blockOps) && shouldInject;
         // acp_rule has no processTurn side effect (no markers/instructions are
         // ever injected into messages), so unlike absorb it needs no loop-
         // config stripping — only tool availability matters.
         const rulesActive = rulesEnabled(config) && shouldInject;
         const loopConfig = ccrLoopConfig(session, { ...config, absorb: absorbActive ? absorbBlock : undefined });
-        // Experimental fold-point "thinking clear" (default OFF): install the kernel drop predicate only when BOTH switches are set; strict-echo (#684) and signed-thinking views yield none at all (#1658).
-        if (loopConfig.compressAtFoldPointClearThinking) {
-            loopConfig.reasoningDroppable = makeFoldPointReasoningDroppable(renderMsgs, isStrictReasoningEcho(session, upstreamOrigin, model));
-        }
         // #2432/#2658: same post-landing recovery as the openai/responses/
         // anthropic lanes — dsh desktop's native compaction can land without
         // transiting bili (direct-bypass / future gate mismatch); first notice =
@@ -218,6 +218,7 @@ export async function prepareGoogle(
             if (gap) log("warn", `[${sessionId}] [acp-drift] fold coverage mismatch: ${gap.matched}/${gap.expected} covered message id(s) present in resent history — ${gap.expected - gap.matched} covered id(s) missing from resent history — mutation (content edit invalidates content-hash refs, fold silently lost) or client-side deletion/truncation (benign, message no longer on the wire); observability complement to the #1328 overflow rescue (#1195)`);
         }
         storeEffectiveAbsorb(session, loopConfig);
+        storeEffectiveBlockOps(session, loopConfig);
         storeEffectiveRules(session, config);
         turn.messages = applyAbsorbView(turn.messages, session.state, loopConfig, tokenCount);
         turn.messages = attachSubagentSessions(turn.messages, session);
@@ -306,7 +307,7 @@ export async function prepareGoogle(
         // and round-2 re-requests — skipping them here would fork the prefix
         // at every fold and collapse the upstream cache hit.
         let acpStandingPushed = false;
-        if (laneDecisions.compressSurfaceOn) { sysParts.push(withProjectAttribution(withMcpDialectNote(withMarkerIntegrityNote(withSummaryBudgetNote(buildCompressSystemPrompt(prompts, messageTimestampSections(conversationPromptSections(surface?.promptSections, externalSummaryEnabled(config)))), externalSummaryEnabled(config)), visibilityMarkers), laneDecisions.mcpDialect))); acpStandingPushed = true; }
+        if (laneDecisions.compressSurfaceOn) { sysParts.push(withProjectAttribution(withMcpDialectNote(withMarkerIntegrityNote(withSummaryBudgetNote(buildCompressSystemPrompt(prompts, messageTimestampSections(conversationPromptSections(surface?.promptSections, externalSummaryEnabled(config)))), externalSummaryEnabled(config)), visibilityMarkers), laneDecisions.mcpDialect, blockOpsActive))); acpStandingPushed = true; }
         else if (!isTitleGen && renderStrategy !== "none") {
             // #1881: the NEVER-echo prohibition follows the rendered tags, not the tool switch.
             const tagsOnly = buildAcpTagsOnlyPrompt("function", prompts, messageTimestampSections(surface?.promptSections));
@@ -316,6 +317,7 @@ export async function prepareGoogle(
         // byte-stable once detected; never on a view that carries no ACP surface.
         if (acpStandingPushed && detectGenerationBoundary(session, processedMessages, log)) sysParts.push(GENERATION_BOUNDARY_NOTE);
         if (absorbActive) sysParts.push(buildAbsorbSystemPrompt(absorbToolName(loopConfig)));
+        if (blockOpsActive) sysParts.push(buildBlockOpsSystemPrompt("function"));
         googleOutboundSystem = sysParts.join("\n\n");
         // Untouched when nothing was added beyond the client's own text: the
         // original `systemInstruction` object then rides through byte-identical
@@ -323,7 +325,7 @@ export async function prepareGoogle(
         const extraSystemParts = sysParts.slice(googleClientSystem ? 1 : 0);
         systemInstruction = extraSystemParts.length > 0 ? { parts: sysParts.map((text) => ({ text })) } : parsed.systemInstruction;
         if (injectTools) {
-            toolsOut = injectGoogleTool(parsed.tools, [...(absorbActive ? [absorbTools.google] : []), ...(rulesActive ? [RULE_TOOL_GOOGLE] : []), ...(ccrEnabled(session) ? [retrieveToolsFor(retrieveToolName(session)).google] : []), ...(imageRescaleToolArmed(session) ? [READ_ORIGINAL_IMAGE_TOOL_GOOGLE] : [])], surface?.toolPrompts, ccrEnabled(session), externalSummaryEnabled(config));
+            toolsOut = injectGoogleTool(parsed.tools, [...(absorbActive ? [absorbTools.google] : []), ...(rulesActive ? [RULE_TOOL_GOOGLE] : []), ...(ccrEnabled(session) ? [retrieveToolsFor(retrieveToolName(session)).google] : []), ...(imageRescaleToolArmed(session) ? [READ_ORIGINAL_IMAGE_TOOL_GOOGLE] : []), ...(blockOpsActive ? blockOps.google : [])], surface?.toolPrompts, ccrEnabled(session), externalSummaryEnabled(config));
         }
         if (sysNotes.length > 0) {
             rebuiltContents = appendGoogleNudge(rebuiltContents, sysNotes.join("\n\n---\n\n"), model);

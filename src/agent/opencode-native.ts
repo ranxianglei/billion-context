@@ -76,7 +76,8 @@ import { ACP_TOOLS_OPENAI } from "../compress-tool.js";
 import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST, unwrapUpstream, wrapUpstream } from "../launcher.js";
 import { createAcpCommandHooks, showAcpText } from "./opencode-acp-command.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, setNativeOriginWaiter, singleFlight } from "./native-bootstrap.js";
-import { createLiveOriginResolver, installNativeFetchIntercept, isModelApiUrl, noteRoutedOrigin, observeRoutedOrigin, readyOrigin, replaceRequestPayload, replaceRequestTarget, routedBiliModelUrl, type LiveOriginResolverDeps, type NativeInterceptState, type UnavailableReason } from "./native-intercept.js";
+import { createLiveOriginResolver, installNativeFetchIntercept, isModelApiUrl, noteRoutedOrigin, observeRoutedOrigin, readyOrigin, replaceRequestPayload, replaceRequestTarget, routedBiliModelUrl, setDeclaredModelEndpoints, type LiveOriginResolverDeps, type NativeInterceptState, type UnavailableReason } from "./native-intercept.js";
+import { loadDeclaredModelEndpoints } from "../model-endpoints.js";
 import { clearIncrementalProbe, createPrepareDirectSend, incrementalCacheRetouchEnabled, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalAck, noteIncrementalRejection, planIncrementalTurn, probeIncrementalTurns, rememberOriginalBody, sweepStale, wireMessagesLookAnthropic, type IncrementalWireMessage } from "./incremental-client.js";
 import * as pfChannel from "./pf-channel.js";
 import { createOpencodeV2Setup, type V2HttpRequestEvent, type V2State } from "./opencode-v2.js";
@@ -396,6 +397,9 @@ const plan = planNativeOpencode(process.env, loadConfigFile().opencode?.inline);
 export function armNativeOpencode(p: typeof plan): void {
     if (p.mode === "off") return;
     markNativeHost(process.env, "opencode");
+    // #1295: declared custom-wire endpoints — same config source as the proxy;
+    // takes effect on the next host start (config is read once at arm time).
+    void loadDeclaredModelEndpoints().then(setDeclaredModelEndpoints);
     if (p.mode === "attach") {
         state.attach = true;
         const attachOrigin = p.attachOrigin;

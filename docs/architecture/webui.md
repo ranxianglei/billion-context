@@ -21,7 +21,7 @@ Everything a human sees about the proxy: the session browser, logs, config, upda
 
 **Data sources.** The live session pool plus storage rows (tier tree, #3917); `acp_status` ranges/nudge are recomputed LIVE per render, never cached stale (`acp-status.ts`); the cache ledger economics (`cache-ledger.ts`, #1536); billing at USD prices with the payback view (#4899); notice dismissal receipts in unified storage (kv_store namespace `notices`).
 
-**Render.** Server-rendered HTML shell (`page.ts`) + one JS bundle (`client.ts`) + styles; `i18n.ts` carries the zh-CN/en message tables (dead keys are test-guarded); `markdown.ts` is escape-safe; `report.ts` builds dependency-free MD+SVG session reports; `diagnostics.ts` produces the paste-ready blob for issue reports (#3040).
+**Render.** Server-rendered HTML shell (`page.ts`) + one JS bundle (`client.ts`) + styles; `i18n.ts` carries the zh-CN/en message tables (dead keys are test-guarded); `mdrender.ts` is the single escape-first Markdown + syntax-highlight core (hand-rolled lexers for json/diff/js/ts/py/sh, GitHub light+dark palettes, zero runtime deps — inlined into the browser IIFE via `.toString()` exactly like the JSONC helpers), and `markdown.ts` wraps it for the server side (blog articles + handoff fallback); `report.ts` builds dependency-free MD+SVG session reports; `diagnostics.ts` produces the paste-ready blob for issue reports (#3040).
 
 **Notices.** `mergedNotices()` (`src/announcements.ts`) merges the three sources; the remote feed is this repo's `announcements/remote.json`, polled on the ~3-minute watcher cadence, fail-open (fetch problems keep the last-known-good snapshot; model traffic is never affected); builtin notices are dead-key-guarded by `tests/notice-registry.test.ts`.
 
