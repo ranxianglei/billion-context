@@ -1,9 +1,10 @@
 import type { Config, PackSurface, Prompts, ToolPrompts } from "acp-kernel";
-import { applyAcpToolOverrides, defaultPrompts } from "acp-kernel";
+import { applyAcpToolOverrides, buildBlockOpsSystemPrompt, defaultPrompts } from "acp-kernel";
 import type { ProxyOptions } from "../config.js";
 import { type AnthropicRequestBody, type GoogleFunctionDeclaration, type GoogleTool, type OpenAITool } from "acp-kernel/wire";
 import { appendSystemText } from "../util.js";
 import { absorbEnabled, absorbToolName } from "../absorb.js";
+import { blockOpsEnabled } from "../acp-block-ops.js";
 import { BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, BILI_ACP_TOOLS_GOOGLE, BILI_ACP_TOOLS_GOOGLE_NO_RANGE, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_OPENAI_NO_RANGE, BILI_ACP_TOOLS_RESPONSES, buildAbsorbSystemPrompt, buildAcpTagsOnlyPrompt, buildCompressSystemPrompt, packOwnsDescription, ptcNoteMode, withAcpNotes, withAcpNotesOpenAI, withMarkerIntegrityNote, withMcpDialectNote, withSummaryBudgetNote, withProjectAttribution } from "../compress-tool.js";
 import { conversationPromptSections, externalSummaryEnabled, messageTimestampSections, withExternalSummaryTools } from "../external-summary-surface.js";
 import { forceTextProtocol as knobForceTextProtocol, renderNone as knobRenderNone } from "../knobs.js";
@@ -32,7 +33,7 @@ export function injectSystem(
     // the caller (prepareAnthropic), never merged into system.
     const parts: string[] = [];
     let acpStandingPushed = false;
-    if (opts.compress.injectTool && !suppressCompressPrompt) { parts.push(withProjectAttribution(withMcpDialectNote(withMarkerIntegrityNote(withSummaryBudgetNote(buildCompressSystemPrompt(prompts, messageTimestampSections(conversationPromptSections(surface?.promptSections, externalSummaryEnabled(config)))), externalSummaryEnabled(config)), visibilityMarkers), mcpDialectNote))); acpStandingPushed = true; }
+    if (opts.compress.injectTool && !suppressCompressPrompt) { parts.push(withProjectAttribution(withMcpDialectNote(withMarkerIntegrityNote(withSummaryBudgetNote(buildCompressSystemPrompt(prompts, messageTimestampSections(conversationPromptSections(surface?.promptSections, externalSummaryEnabled(config)))), externalSummaryEnabled(config)), visibilityMarkers), mcpDialectNote, blockOpsEnabled(config)))); acpStandingPushed = true; }
     else if (!knobRenderNone()) {
         // #1881: the NEVER-echo prohibition follows the rendered tags, not the tool switch.
         const tagsOnly = buildAcpTagsOnlyPrompt("function", prompts, messageTimestampSections(surface?.promptSections));
@@ -42,6 +43,9 @@ export function injectSystem(
     // byte-stable once detected; never on a view that carries no ACP surface.
     if (generationBoundaryActive && acpStandingPushed) parts.push(GENERATION_BOUNDARY_NOTE);
     if (opts.compress.injectTool && absorbEnabled(config)) parts.push(buildAbsorbSystemPrompt(absorbToolName(config)));
+    // #5765: block-lifecycle tools ride as a separate appended section only
+    // when enabled (default off) — byte-stable like the absorb section.
+    if (opts.compress.injectTool && blockOpsEnabled(config)) parts.push(buildBlockOpsSystemPrompt("function"));
     if (memoryToc !== undefined && memoryToc !== "") parts.push(memoryToc);
     if (parts.length === 0) return parsed.system;
     // #1876: APPEND the prompt as a trailing block (client blocks byte-exact)

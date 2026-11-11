@@ -297,8 +297,6 @@
 | `compress.maxSummaryLength` | number | kernel 20000 | — | 单条生成摘要的硬字符上限；超长的回复被整段拒绝（不截断、不重试）。外部摘要模型会被提前告知这个确切上限（#3635）。0 = 不限制。 |
 | `compress.minSummaryLength` | number | kernel 50 | — | 生成摘要的字符下限：单段压缩按自身判定；批量压缩按合计判定——一段偷懒不再拖垮整批（#5894）。0 = 禁用。外部摘要模型仍受逐段下限约束（#3635）。 |
 | `compress.reconcile` | "off" \| "warn" \| "repair" | "repair" | BILI_FOLD_RECONCILE | 客户端在轮次之间回退或改写历史时校准已折叠状态。 |
-| `compress.compressAtFoldPoint` | boolean | false | BILI_COMPRESS_AT_FOLD_POINT | 实验性，默认关闭：把仍可见的压缩调用/结果对从原位置（贴近尾部）移到它自己的折叠点，即 [已折叠区]–[调用对]–[保护消息]，避免弱注意力模型把历史末尾的工具交换当成新命令。纯视图变换：refs 与状态不变、每轮重算结果一致；关闭时布局字节级不变。 |
-| `compress.compressAtFoldPointClearThinking` | boolean | false | BILI_COMPRESS_AT_FOLD_POINT_CLEAR_THINKING | 依附于 compress.compressAtFoldPoint 的第二层开关：调用对被挪位的一瞬间，同时丢掉紧邻其前的未签名思考段（模型对本次折叠本身的思考），让挪位后的开头更干净。主开关关闭时无效；带签名的思考块与严格推理回显会话绝不受影响（#1658/#684）。 |
 | `compress.promptPack` | string (builtin: "default", "lean") | builtin "default" | — | 压缩提示词包，按 项目包 → 用户包 → 内置 解析；不受 acknowledgePromptsRisk 门控。 |
 | `compress.tiers` | boolean | true | — | T1→T3 分级蒸馏把折叠成本摊到多代。 |
 | `compress.protectedTools` | string[] | none | — | 全历史硬排除：列出工具的结果永不折叠。路径模式（skill/<name>）可按名指定 skill（#1947）。 |
@@ -314,6 +312,7 @@
 | `compress.injectNudge` | boolean | true | ACP_COMPRESS_NUDGE | 窗口填满过程中发送增长提醒（仅全局层级生效）。 |
 | `compress.reasoning` | { drop?, threshold? } | drop true · threshold 2048 | — | 丢弃超过 2048 字符的已结束轮次推理块（drop 默认 true）；严格推理上游需设 drop:false。 |
 | `compress.absorb` | object | opt-in (disabled) | — | 可选即时蒸馏：把工具结果蒸馏成短摘要，原文进内容库。默认仅图片类结果参与。 |
+| `compress.blockOps` | object | off | — | 可选的压缩块生命周期工具（acp_retire / acp_restore / acp_rewrite）；默认关闭，关闭时线上字节与 #5765 之前完全一致。 |
 | `compress.ccr` | object | enabled in proxy mode since v2 | — | 内容缓存与回取：大输出无损存到会话旁、替换为首段摘录+指针，模型用 acp_retrieve 取回原文；无上限、永不清除。 |
 | `compress.search` | object | off | — | search_context 的检索行为设置；当前含 planAware 重排。 |
 | `compress.search.planAware` | boolean | false | — | 开启后 search_context 候选按当前计划状态重排；关闭时结果逐字节不变。 |
@@ -329,6 +328,7 @@
 | `compress.absorb.excludeTools` | string[] | [] | — | 排除出吸收范围的工具名。 |
 | `compress.absorb.toolName` | string | "absorb" | — | absorb 工具的注册名。 |
 | `compress.absorb.mediaOnly` | boolean | true | — | 仅吸收携带媒体（图片）的工具结果；图片字节不计入文本 token，故豁免 minToolTokens 门槛。置 false 恢复对任意大结果的全文吸收（旧行为）。 |
+| `compress.blockOps.enabled` | boolean | false | — | 启用三个压缩块生命周期工具（注入 + prompt + manifest）。关闭 = 无工具、无 prompt 段、零每请求开销。 |
 | `compress.ccr.enabled` | boolean | true (proxy mode) | — | 启用内容缓存与回取块。 |
 | `compress.ccr.minToolTokens` | number | ≈4000 | — | 可进入 CCR 存储的工具结果的最小估算 token 大小。 |
 | `compress.ccr.excludeTools` | string[] | [] | — | 排除出 CCR 存储的工具名。 |
@@ -1623,6 +1623,17 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
   - `toolName: string` — 重命名注入工具（默认 `"absorb"`）；声明/注入的模式、系统提示段与按会话裁决在两条车道中都跟随该名称。**车道治理（#1359）：** 插件模式用**基础**配置治理整个 `absorb` 块，因此重命名后的工具既以该名声明、也以该名执行（二者永不背离）；provider/model 层的 `absorb.*` 覆盖**仅限代理车道**（代理注入并裁决合并后的名称）。加载时会输出一条警告，列出任何取值与基础值不同的 provider/model `absorb.*` 字段。
   注入跟随线上原生工具面：代理模式在 anthropic/openai/responses 原生工具线上注入工具（按每请求解析的名称）+ 系统提示段，插件模式在插件清单中广告它（MCP shell 自动拾取）。Responses **marker/文本协议**路由不支持（无原生工具面 — 强制的 absorb 指令不可满足），标题生成请求（`max_tokens ≤ 200`）跳过注入如压缩提示一样。吸收配对在重启后保持隐藏（在会话状态持久化）。
 
+#### `blockOps`
+
+- **类型：** `object`（`{ enabled? }`）
+- **默认：** *(关 — 只有 `enabled: true` 时才注入工具)*
+- **状态：** 已启用（issue #5765）
+- **说明：** 可选的**压缩块生命周期管理**。启用后，三个工具与 ACP 工具一并注入（代理通道）/ 上报（插件通道），各有独立 system-prompt 段；同时为每个会话存一份生效开关，保证插件工具 API 解析到与线上相同的值：
+  - `acp_retire` — 把 active 压缩块移出常驻视图（其摘要不再随每个请求发送；仍可按 id 用 `acp_restore` / `decompress` / `search_context` 取回）。
+  - `acp_restore` — 把已退场块放回常驻视图。
+  - `acp_rewrite` — 原地替换块摘要（保留一步回滚位 `previousSummary`；相同/空白摘要拒收）。
+  内核状态变更幂等、可批量（`blockId` 单块或 `ids` 数组）。**为何默认关：** 三个工具 schema 在启用期间是常驻面——每个会话每个请求约 +0.7k 估算 token——所以不显式开启时，线上表面（工具数组、prompt、manifest）与 #5765 之前逐字节一致。关闭时的误调会得到面向模型的「not enabled on this bili proxy (compress.blockOps.enabled is not true)」回执而非报错，且绝不改动状态。退场/改写状态跨重启持久化在会话状态中，导出台账（markdown handoff + JSONL）报告 `retired` 状态、消息 ref 区间与原文/摘要字符数。
+
 #### `ccr`
 
 - **类型：** `object`（`{ enabled?, minToolTokens?, excludeTools?, toolName?, maxHeadChars? }`）
@@ -1932,8 +1943,6 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_CLIENT_ERROR_BACKSTOP_MS` | `network.clientErrorBackstopMs` | 30000 |
 | `BILI_CODEARTS_REF` | `resign` | {} (armed; built-in scheme sdk-hmac-sha256) |
 | `BILI_CODEX_COMPACT` | `codexCompact` | "intercept" |
-| `BILI_COMPRESS_AT_FOLD_POINT` | `compress.compressAtFoldPoint` | false |
-| `BILI_COMPRESS_AT_FOLD_POINT_CLEAR_THINKING` | `compress.compressAtFoldPointClearThinking` | false |
 | `BILI_DECODED_BODY_BYTES` | `network.decodedBodyBytes` | 10737418240 |
 | `BILI_DECOMPRESS_TMP_CAP` | `decompressTmpCap` | 50 |
 | `BILI_DSH_AUTHORED_COMPACTION` | `dsh.authoredCompaction` | true (on, #3901 flip) |
@@ -2126,7 +2135,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_CHAIN_STAMP` | 设为 `1` 开启**模型可见**的 `<bili-chain …/>` 链完整性检查点载体的出站注入（#1683，默认关闭）：开启后，本实例实际处理的每个请求都携带一个带摘要的戳，使下游 bili 即使 `x-bili-hop` 头在传输中被剥离也能应用「首个处理器优先」（first-processor-wins）（#1421）。该载体落在终端模型同样会读取的位置（OpenAI/Responses 上是一条尾部 `user` 消息，Anthropic/Google 上是尾部文本 part），因此模型会把它当作幽灵用户输入并花 token 去评论它——这正是它默认关闭的原因。仅在多 bili 中继、且中间盒子剥掉 `x-bili-hop`、带摘要校验的 body-stamp 是防止双重处理的唯一手段这一狭窄场景下才启用。与 `BILI_CHAIN_CONTENT`（入站正文检测同样默认关闭）及 `x-bili-hop` 透传相互独立（后者无论如何都生效）。配置文件中设 `"chainEgressStamp": true` 效果相同；环境变量优先。 |
 | `BILI_CHAIN_MAX_FUTURE_SKEW_MS` | 校验链检查点 `issued-at` 时间戳时容忍的最大未来偏斜（毫秒）（#1395 step 2）：戳在比当前时间未来超过此值的检查点会被判为 `stale`（重放 / 时钟偏斜），即使其摘要校验通过。默认 `120000`（2 分钟）；非数字或非正值回退到默认值。Step 2 仅影子模式——这些旋钮只调判定日志，绝不影响转发。 |
 | `BILI_CHAIN_RECENT_WINDOW_MS` | 链检查点校验的近期窗口（毫秒）（#1395 step 2）：早于此窗口的检查点被判为 `stale`。默认 `600000`（10 分钟）；非数字或非正值回退到默认值。Step 2 仅影子模式——这些旋钮只调判定日志，绝不影响转发。 |
-| `BILI_CONFLICT_SCAN` | 设为 `0` 关闭第三方压缩插件检测（#1206）。默认开启：bili 会扫描客户端自身的插件/扩展注册表 —— opencode 全局 + 项目配置的 `plugin` 数组、pi 全局 + 项目 `.pi/settings.json` 的 `packages`、omp `config.yml` 的 `extensions`、claude 设置的 `enabledPlugins`/`plugins` 及其插件目录、kimi `plugins/installed.json`、hermes 插件目录、dsh profile 依赖 —— 查找与 bili 并存的另一个压缩器。两个层级：**已知冲突**（`opencode-acp`、遗留 `billion-context-pi`，确定性判定）和**关键词疑似**条目（名称匹配 compress / compact / acp / summar* / context*；bili 自身条目永远跳过，`context7` 这类非压缩工具不会误报）。发现结果出现在：客户端启动前的 launcher stderr、每个会话首个请求的一次性代理 warn 日志、以及会话冲突台账 —— `acp_status` 的 `COMPRESSION CONFLICTS` 段、`GET /__bili/stats` → `conflicts`、Web UI 横幅。横幅是拦截**失败**的告警（#3235）：只有存在已落地且未恢复的证据（已确认的第三方压缩器、推断出的客户端原生落点、或无法解释的历史改写信号）才弹出——已恢复（拦截+rebase）的落点与疑似/同族存量保持记录但静默；提供持久化「不再提示」（localStorage 水位线，任何更新的事件自动重新武装）与复制诊断/去 GitHub 报告按钮（复用通用 #3040 诊断设施）。运行时干扰证据（未宣告的历史改写 #1001、孤儿块废弃）记入同一台账。「扫描只读、尽力而为、5 分钟缓存，绝不阻塞或改动客户端配置。」 |
+| `BILI_CONFLICT_SCAN` | 设为 `0` 关闭第三方压缩插件检测（#1206）。默认开启：bili 会扫描客户端自身的插件/扩展注册表 —— opencode 全局 + 项目配置的 `plugin` 数组、pi 全局 + 项目 `.pi/settings.json` 的 `packages`、omp `config.yml` 的 `extensions`、claude 设置的 `enabledPlugins`/`plugins` 及其插件目录、kimi `plugins/installed.json`、hermes 插件目录、dsh profile 依赖 —— 查找与 bili 并存的另一个压缩器。两个层级：**已知冲突**（`opencode-acp`、遗留 `billion-context-pi`、dsh 的 `dsh-live-compact`（#5984），确定性判定）和**关键词疑似**条目（名称匹配 compress / compact / acp / summar* / context*；bili 自身条目永远跳过，`context7` 这类非压缩工具不会误报）。发现结果出现在：客户端启动前的 launcher stderr、每个会话首个请求的一次性代理 warn 日志、以及会话冲突台账 —— `acp_status` 的 `COMPRESSION CONFLICTS` 段、`GET /__bili/stats` → `conflicts`、Web UI 横幅。横幅是拦截**失败**的告警（#3235）：只有存在已落地且未恢复的证据（已确认的第三方压缩器、推断出的客户端原生落点、或无法解释的历史改写信号）才弹出——已恢复（拦截+rebase）的落点与疑似/同族存量保持记录但静默；提供持久化「不再提示」（localStorage 水位线，任何更新的事件自动重新武装）与复制诊断/去 GitHub 报告按钮（复用通用 #3040 诊断设施）。运行时干扰证据（未宣告的历史改写 #1001、孤儿块废弃）记入同一台账。「扫描只读、尽力而为、5 分钟缓存，绝不阻塞或改动客户端配置。」 |
 | `BILI_UPSTREAM_PROXY` | 代理自身出站连接的上游代理 —— 在*全局*来源中优先级最高（高于 Web UI 手动代理与配置文件 `proxy`）。per-URL 的 `providers.<url>.proxy` 对其匹配的 provider URL 仍然优先。完整解析顺序、防环规则与示例见 [服务端设置 → `proxy`](#服务端设置)。 |
 | `BILI_INHERITED_HTTP_PROXY` / `BILI_INHERITED_HTTPS_PROXY` / `BILI_INHERITED_ALL_PROXY` / `BILI_INHERITED_NO_PROXY` | 非用户直接使用 —— launcher 起代理子进程时自动设置（#1012）。launcher 会从客户端和代理子进程两侧剥掉 shell 的代理变量（客户端必须把流量发给 bili；代理的模型出网也不能被 shell 代理劫持），但会把用户剥离前的代理转发到这些变量里，让代理的**辅助出网**（MITM 盲隧道 —— 客户端侧的 MCP/web 流量）仍能走用户的 VPN。它们只作用于盲隧道的 fallback 层：显式路由 / 全局 `proxy` / `BILI_UPSTREAM_PROXY` / 显式 `"upstreamProxyMode": "direct"` 仍然优先，指向 bili 自身端口的值会被丢弃。模型出网不受影响（未显式配置则保持直连）。 |
 | `BILI_UPSTREAM_TIMEOUT_MS` | 上游请求的空闲预算（毫秒）：首字节时间（TTFB）与响应体块之间的间隔（默认 `720000` = 12 分钟）。持续产出数据块的健康流永远不会被中途切断；静默的流才会。同一个值同时驱动底层 HTTP 客户端的传输层超时，因此这一个旋钮即可端到端约束本地大模型的超长 prefill（#551）。 |
@@ -2490,7 +2499,7 @@ bili plugin remove pi       # 撤销（原文件一次性备份为 *.bili-bak）
 
 两个压缩器作用于同一会话会双压缩、破坏消息引用，所以 bili 会主动查找与自己并存的另一个压缩器：
 
-- **扫描**（只读、尽力而为、5 分钟缓存）：opencode 全局 + 项目配置的 `plugin` 数组；pi 全局 + 项目 `.pi/settings.json` 的 `packages`；omp `config.yml` 的 `extensions`；claude 设置的 `enabledPlugins`/`plugins` 键 + `~/.claude/plugins/` 目录；kimi `plugins/installed.json`；hermes `~/.hermes/plugins/` 目录；dsh profile 的 `package.json` 依赖。两个层级：**已知冲突**（`opencode-acp`、遗留 `billion-context-pi`，确定性判定）和**关键词疑似**条目（名称匹配 compress* / compact* / acp / summar*；裸 `context` 刻意不匹配——它指领域而非压缩动作本身，`context7`/`dsh-context` 这类只读工具不会误报）；已验证的只读/仅显示插件（如 `pi-compact-transcript`、`pi-context-inspector`）直接豁免。
+- **扫描**（只读、尽力而为、5 分钟缓存）：opencode 全局 + 项目配置的 `plugin` 数组；pi 全局 + 项目 `.pi/settings.json` 的 `packages`；omp `config.yml` 的 `extensions`；claude 设置的 `enabledPlugins`/`plugins` 键 + `~/.claude/plugins/` 目录；kimi `plugins/installed.json`；hermes `~/.hermes/plugins/` 目录；dsh profile 的 `package.json` 依赖。两个层级：**已知冲突**（`opencode-acp`、遗留 `billion-context-pi`、dsh 的 `dsh-live-compact`（#5984），确定性判定）和**关键词疑似**条目（名称匹配 compress* / compact* / acp / summar*；裸 `context` 刻意不匹配——它指领域而非压缩动作本身，`context7`/`dsh-context` 这类只读工具不会误报）；已验证的只读/仅显示插件（如 `pi-compact-transcript`、`pi-context-inspector`）直接豁免。dsh 的 `dsh-live-compact` 列为已知冲突而非关键词疑似：它是竞争压缩引擎——随包 `cordis.patch.yml` 禁用 stock `compaction-basic` 行、注册自己的引擎行（`compaction-spine`/`dsh-live-compact`）、preset 接管时把 preset 的压缩行改名成自己，而 bili 的加载期压缩禁用 overlay（#3354）只认 stock 行名，对它在结构上不可见，其压缩 checkpoint 会落在 bili 知识之外（#5984）。
 - **发现结果的出口**：客户端启动前的 launcher stderr；每个会话首个请求的一次性代理 warn 日志（client 由 `x-bili-plugin` 头或 wire 头识别）；会话冲突台账 —— `acp_status` 的 `COMPRESSION CONFLICTS` 段、`GET /__bili/stats` → `conflicts`、Web UI 横幅。
 - **运行时证据，按证据层级展示（#2545）**：未宣告的历史改写（#1001）与孤儿块废弃（被摘要的内容从客户端历史中被删掉）与「疑似并存」记入同一台账。严重程度表面按**证据层级**分级：**已确认** = 检测到的客户端原生压缩落点（bili 会 rebase 到其上，#2372/#2432）或非 suspected 的插件发现——只有它会触发「请只保留一个压缩器」的强制告警；**未确认信号** = 未宣告改写 + 孤儿块废弃——观测到变化但原因未确认（「历史发生了变化，原因未知」），绝不呈现为原生自动压缩或第二个压缩器；纯名称匹配的 [suspected] 停留在软性的「先核实」层级（#1736）。指向已验证只读插件的存量台账记录在显示期被中和，而不是持续作为告警残留；跨会话聚合的未确认信号计数永远不会升级成「同一会话双压缩」的结论。
 - **dsh 的 `auto: false` 只关闭自动触发**。profile bundle patch（`dsh.bundle.patch.yml`）写入的 `compaction-basic: { auto: false }` 跳过压力/溢出自压缩 —— 手动 `/compact`（以及空闲会话压缩）仍会触发。经 bili 路由的调用会被服务端闸门拒绝（#1729/#2360）；未经过 bili 直达上游的调用（桌面端插件接管门无法归因的路径）会落地，bili 在下次重放时检测出来（checkpoint 框架 + 折叠覆盖缺口），一个 turn 内重建自己的压缩状态，而不是让之后每次 compress 永久失败（#2432）。若目标是把 dsh 压缩**整个关掉**（含手动 `/compact`），delta 应写成同一行上的 `disabled: true`，而不是 `auto: false`（配方见下）。
