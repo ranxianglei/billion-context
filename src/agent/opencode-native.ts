@@ -1021,7 +1021,7 @@ const v2Setup = createOpencodeV2Setup({ route: createNativeRoute(state), increme
 // drive the chain explicitly through _resetForTest).
 async function setup(ctx: V2PluginContext): Promise<() => void> {
     if (plan.mode !== "off" && process.env.NODE_TEST_CONTEXT === undefined && installNativeFetchIntercept(state)) {
-        console.log("[bili-opencode-native] v2: fetch patch installed (routes model traffic at fetch time; provider plugins see original URLs)");
+        logHostEvent("info", "[native-client]", "[bili-opencode-native] v2: fetch patch installed (routes model traffic at fetch time; provider plugins see original URLs)");
     }
     return v2Setup(ctx);
 }
