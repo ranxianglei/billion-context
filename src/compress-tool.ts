@@ -379,9 +379,9 @@ export const MCP_DIALECT_NOTE = "On this host the context-management tools are e
 // #5765: the block-ops clause is appended only when blockOps is enabled —
 // the note must never name a tool the outbound tool table doesn't carry
 // (same invariant as the tool arrays themselves).
-export const MCP_DIALECT_NOTE_BLOCK_OPS = " The block-lifecycle tools are likewise prefixed: `mcp__bili__acp_retire`, `mcp__bili__acp_restore`, `mcp__bili__acp_rewrite`.";
+const MCP_DIALECT_NOTE_BLOCK_OPS = " The block-lifecycle tools are likewise prefixed: `mcp__bili__acp_retire`, `mcp__bili__acp_restore`, `mcp__bili__acp_rewrite`.";
 
-export function mcpDialectNoteText(blockOpsOn: boolean): string {
+function mcpDialectNoteText(blockOpsOn: boolean): string {
     return MCP_DIALECT_NOTE + (blockOpsOn ? MCP_DIALECT_NOTE_BLOCK_OPS : "");
 }
 
