@@ -3,6 +3,7 @@
 // own writeback is line-surgical per domain — our block survives login/logout/
 // catalog refresh as long as it uses its own provider name + model alias
 // (the refresh orchestrator preserves user-owned entries).
+import { nonNegativeTomlInteger } from "../toml-integer.js";
 
 export const KIMI_PROVIDER = "bili";
 export const KIMI_ALIAS = "bili-kimi";
@@ -48,14 +49,6 @@ function headerParts(line: string): string[] | undefined {
     const m = /^\[\[?(.+?)\]\]?\s*(?:#.*)?$/.exec(line.trim());
     if (!m) return undefined;
     return tomlPathParts(m[1]);
-}
-
-function nonNegativeTomlInteger(value: string): number | undefined {
-    // Model limits accept TOML integer spelling, not a numeric prefix of a
-    // float/date. Underscores may only separate digits of the selected base.
-    if (!/^(?:\+?(?:0|[1-9](?:_?[0-9])*)|0x[0-9A-Fa-f](?:_?[0-9A-Fa-f])*|0o[0-7](?:_?[0-7])*|0b[01](?:_?[01])*)$/.test(value)) return undefined;
-    const parsed = Number(value.replace(/_/g, ""));
-    return Number.isSafeInteger(parsed) ? parsed : undefined;
 }
 
 function keyValue(line: string): { key: string; strVal?: string; numVal?: number } | undefined {
