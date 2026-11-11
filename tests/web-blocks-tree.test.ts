@@ -169,6 +169,82 @@ test("#3917: a folded message the host pruned reports a miss instead of a guess"
     assert.deepEqual(await buildMessageContent("tree-pruned", "m00001"), { ok: false, reason: "unknown-message" });
 });
 
+test("frozen-snapshot hydration: a leaf block's pruned messages re-align by position", async () => {
+    const s = seedSession("tree-snap", [mkBlock("b1", 1, "s", ["rm1", "rm2", "rm3"], ["rm1", "rm2", "rm3"])]);
+    s.state.messageRefs = { byRaw: { rm1: "m00001", rm2: "m00002", rm3: "m00003" }, byRef: { m00001: "rm1", m00002: "rm2", m00003: "rm3" } };
+    s.lastMessages = [];
+    // collectBlockContent's full view: [role] (or [role • toolName]) header
+    // per message, pi-host user text opens with its ACP ref marker.
+    const full = [
+        "[user]",
+        '<acp tokens="2" type="text">m00001</acp>',
+        "hello world",
+        "",
+        "[assistant]",
+        "said hi",
+        "",
+        "[tool \u2022 read]",
+        "/path/x.ts:1-9",
+    ].join("\n");
+    s.blockContents.set("b1", { one: null, full: { text: full, count: 3 } });
+    _resetDiskCacheForTest();
+    const d = await buildSessionDetail("tree-snap");
+    assert.ok(d);
+    assert.deepEqual(d.blockDetails[0].directMessages, [
+        { ref: "m00001", role: "user", preview: "hello world" },
+        { ref: "m00002", role: "assistant", preview: "said hi" },
+        { ref: "m00003", role: "tool", toolName: "read", preview: "/path/x.ts:1-9" },
+    ], "window + store pruned — the frozen snapshot re-aligns by position");
+    const one = await buildMessageContent("tree-snap", "m00003");
+    assert.ok(one.ok);
+    assert.equal(one.role, "tool");
+    assert.equal(one.text, "/path/x.ts:1-9", "click-to-open serves the snapshot bytes");
+});
+
+test("frozen-snapshot hydration refuses a partial, shifted or non-leaf parse", async () => {
+    // Count mismatch: the snapshot captured only 2 of the block's 3 messages
+    // (host pruned the third before capture) — no half-alignment allowed.
+    const s = seedSession("tree-snap-short", [mkBlock("b1", 1, "s", ["rm1", "rm2", "rm3"], ["rm1", "rm2", "rm3"])]);
+    s.state.messageRefs = { byRaw: { rm1: "m00001", rm2: "m00002", rm3: "m00003" }, byRef: { m00001: "rm1", m00002: "rm2", m00003: "rm3" } };
+    s.lastMessages = [];
+    s.blockContents.set("b1", { one: null, full: { text: "[user]\\nfirst\\n\\n[assistant]\\nsecond", count: 2 } });
+    _resetDiskCacheForTest();
+    const d = await buildSessionDetail("tree-snap-short");
+    assert.ok(d);
+    assert.deepEqual(d.blockDetails[0].directMessages, [
+        { ref: "m00001", missing: true },
+        { ref: "m00002", missing: true },
+        { ref: "m00003", missing: true },
+    ], "a partial capture keeps every row an honest miss");
+    assert.deepEqual(await buildMessageContent("tree-snap-short", "m00002"), { ok: false, reason: "unknown-message" });
+
+    // Marker shift: three-way count matches, but the marker proves position 0
+    // is NOT the ledger's first ref — the whole block refuses to align.
+    const s2 = seedSession("tree-snap-shift", [mkBlock("b1", 1, "s", ["rm1", "rm2"], ["rm1", "rm2"])]);
+    s2.state.messageRefs = { byRaw: { rm1: "m00001", rm2: "m00002" }, byRef: { m00001: "rm1", m00002: "rm2" } };
+    s2.lastMessages = [];
+    s2.blockContents.set("b2", { one: null, full: { text: "unused", count: 0 } });
+    s2.blockContents.set("b1", { one: null, full: { text: '[user]\\n<acp tokens="1" type="text">m00002</acp>\\nwrong place\\n\\n[assistant]\\nsecond', count: 2 } });
+    _resetDiskCacheForTest();
+    const d2 = await buildSessionDetail("tree-snap-shift");
+    assert.ok(d2);
+    assert.deepEqual(d2.blockDetails[0].directMessages, [
+        { ref: "m00001", missing: true },
+        { ref: "m00002", missing: true },
+    ], "a marker contradicting the ledger aborts the whole block");
+
+    // Non-leaf span (direct \u2260 effective): children live inside the full
+    // text, so position means nothing — stays a miss even when counts look right.
+    const s3 = seedSession("tree-snap-nonleaf", [mkBlock("b1", 2, "s", ["rm1"], ["rm1", "rm2"])]);
+    s3.state.messageRefs = { byRaw: { rm1: "m00001", rm2: "m00002" }, byRef: { m00001: "rm1", m00002: "rm2" } };
+    s3.lastMessages = [];
+    s3.blockContents.set("b1", { one: null, full: { text: "[user]\\nonly direct\\n\\n[assistant]\\nchild message", count: 2 } });
+    _resetDiskCacheForTest();
+    const d3 = await buildSessionDetail("tree-snap-nonleaf");
+    assert.ok(d3);
+    assert.deepEqual(d3.blockDetails[0].directMessages, [{ ref: "m00001", missing: true }], "non-leaf spans never zip");
+});
+
 test("#4173: the live tree endpoint ships ids/tiers/edges/spans — no summaries", async () => {
     // #4173 review: nodes label their covered message span; non-monotonic
     // stored spans are canonicalized ascending before leaving the server.

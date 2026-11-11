@@ -2777,8 +2777,8 @@ function changelogCatOf(rawLine) {
             const maxCh = Math.floor((TREE_W - 52) / 7);
             if (topic.length > maxCh) topic = topic.slice(0, Math.max(1, maxCh - 1)) + "...";
             const rr = refRangeOf(b);
-            p.push('<g class="' + cls + '" data-bid="' + escapeHtml(b.blockId) + '" transform="translate(' + (n.x * colW + 12).toFixed(1) + "," + (n.y + 6).toFixed(1) + ')">');
-            p.push('<rect width="' + TREE_W + '" height="' + TREE_H + '" rx="9"><title>' + escapeHtml(b.blockId + " \u00b7 T" + tierNum + (rr ? " \u00b7 " + rr : "") + " \u00b7 " + blockTopic(b)) + "</title></rect>");
+            p.push('<g class="' + cls + '" data-bid="' + escapeHtml(b.blockId) + '" aria-label="' + escapeHtml(b.blockId + " \u00b7 T" + tierNum + (rr ? " \u00b7 " + rr : "") + " \u00b7 " + blockTopic(b)) + '" transform="translate(' + (n.x * colW + 12).toFixed(1) + "," + (n.y + 6).toFixed(1) + ')">');
+            p.push('<rect width="' + TREE_W + '" height="' + TREE_H + '" rx="9"></rect>');
             p.push('<text class="g-id" x="10" y="17">' + escapeHtml(b.blockId + " \u00b7 T" + tierNum + (rr ? " \u00b7 " + rr : "")) + "</text>");
             p.push('<text class="g-topic" x="10" y="34">' + escapeHtml(topic) + "</text>");
             if (hidden > 0)
@@ -3701,6 +3701,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
     // innerHTML under a pressed finger (same trick as the #4173 live map).
     let treeViewState = null;
     let treeViewRender = null;
+    let treeTipRedraw = null;
     function bindTreeModeActions() {
         const graphView = $("tree-graph");
         const listView = $("tree-list");
@@ -3715,10 +3716,69 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         let mode = "tree";
         try { mode = sessionStorage.getItem("bili-tree-mode") === "list" ? "list" : "tree"; } catch (e) {}
         const st = { mode: mode, selected: "", expanded: {} };
+        st.blocks = blocks;
         treeViewState = st;
+        // Stable hover card — the native SVG <title> tooltip dies the moment
+        // any repaint (expand/collapse, Esc, the #4173 live tick) swaps the
+        // drawing under a stationary cursor, so the tree keeps its own.
+        const tip = document.createElement("div");
+        tip.className = "g-tip";
+        tip.hidden = true;
+        graphView.appendChild(tip);
+        const tipState = { x: 0, y: 0 };
+        function blockAt(x, y) {
+            let el = null;
+            try { el = document.elementFromPoint(x, y); } catch (err) {}
+            if (!el || !el.closest) return null;
+            const n = el.closest("[data-bid]");
+            if (!n || !graphView.contains(n)) return null;
+            const bid = n.getAttribute("data-bid");
+            const srcB = st.blocks || [];
+            for (let i = 0; i < srcB.length; i++) if (srcB[i].blockId === bid) return srcB[i];
+            return null;
+        }
+        function showTipAt(x, y) {
+            if (st.mode !== "tree" || graphView.hidden) { tip.hidden = true; return; }
+            const b = blockAt(x, y);
+            if (!b) { tip.hidden = true; return; }
+            tipState.x = x; tipState.y = y;
+            const tierNum = Number(b.tier) || 1;
+            const rr = refRangeOf(b);
+            let html = '<div class="gt-id">' + escapeHtml(b.blockId + " \u00b7 T" + tierNum + (rr ? " \u00b7 " + rr : "")) + '</div>';
+            const topic = blockTopic(b);
+            if (topic) html += '<div class="gt-topic">' + escapeHtml(topic) + '</div>';
+            const bits = [];
+            if (b.compressedTokens) bits.push(fmtW(b.compressedTokens) + " \u2192 " + fmtW(b.summaryTokens));
+            if (b.effectiveMessageCount) bits.push(t("det.tree_msgs", { n: b.effectiveMessageCount }));
+            if (bits.length) html += '<div class="gt-meta">' + escapeHtml(bits.join(" \u00b7 ")) + '</div>';
+            tip.innerHTML = html;
+            tip.hidden = false;
+            const box = graphView.getBoundingClientRect();
+            let lx = x - box.left + 14;
+            let ly = y - box.top + 16;
+            const tw = tip.offsetWidth;
+            const th = tip.offsetHeight;
+            if (lx + tw > box.width - 4) lx = x - box.left - tw - 14;
+            if (ly + th > box.height - 4) ly = y - box.top - th - 16;
+            if (lx < 4) lx = 4;
+            if (ly < 4) ly = 4;
+            tip.style.left = lx + "px";
+            tip.style.top = ly + "px";
+        }
+        function hideTip() { tip.hidden = true; }
+        // After a repaint the node under a stationary pointer may have moved
+        // or been replaced — re-resolve it so the tip neither dangles over the
+        // wrong node nor vanishes while the cursor is still hovering.
+        treeTipRedraw = function () {
+            if (tip.hidden) return;
+            showTipAt(tipState.x, tipState.y);
+        };
+        graphView.addEventListener("pointermove", function (e) { showTipAt(e.clientX, e.clientY); });
+        graphView.addEventListener("pointerleave", hideTip);
         function renderTree() {
             const inner = graphView.querySelector(".tm-inner");
             if (inner) inner.innerHTML = renderCollapSvg(blocks, st.expanded, st.selected).html;
+            if (treeTipRedraw) treeTipRedraw();
         }
         treeViewRender = renderTree;
         function select(bid) {
@@ -5537,7 +5597,9 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
                     // selection survive the tick (the list is static DOM).
                     const inner = view.querySelector(".tm-inner");
                     const stv = treeViewState || { expanded: {}, selected: "" };
+                    if (stv) stv.blocks = r.blocks;
                     if (inner) inner.innerHTML = renderCollapSvg(r.blocks, stv.expanded, stv.selected).html;
+                    if (treeTipRedraw) treeTipRedraw();
                 }
             }
         } catch (e) {

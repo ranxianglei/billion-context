@@ -1,4 +1,4 @@
-import { defaultCountTokens, orderedRefPair } from "acp-kernel";
+import { defaultCountTokens, orderedRefPair, type CompressionBlock } from "acp-kernel";
 import { listSessions, displayContextBest, type ContextBest, type Session, type BlockContent } from "../session.js";
 import { conflictClientOf, conflictEventsOf } from "../conflict-watch.js";
 import { isDisplayOnlyConflictDetail, isSiblingConflictDetail } from "../thirdparty-scan.js";
@@ -1468,7 +1468,19 @@ function renderDetail(session: Session, live: boolean): WebSessionDetail {
     } catch {
         // sidecar unavailable/degraded: fall through to legacy missing leaves
     }
-    const messageLeaves = (rawIds: string[]): Array<{ ref: string; role?: string; toolName?: string; preview?: string; missing?: boolean }> => {
+    // Frozen-snapshot hydration for THIS detail build, memoized per block —
+    // a block's rows all come from one call, so at most one snapshot parse
+    // per block, and only when a row actually misses window + store.
+    const leafIndexMemo = new Map<string, Map<string, BlockSnapItem> | null>();
+    const leafRefIndex = (block: CompressionBlock): Map<string, BlockSnapItem> | null => {
+        let idx = leafIndexMemo.get(block.blockId);
+        if (idx === undefined) {
+            idx = leafRefIndexFor(session, block);
+            leafIndexMemo.set(block.blockId, idx);
+        }
+        return idx;
+    };
+    const messageLeaves = (rawIds: string[], block?: CompressionBlock): Array<{ ref: string; role?: string; toolName?: string; preview?: string; missing?: boolean }> => {
         const out: Array<{ ref: string; role?: string; toolName?: string; preview?: string; missing?: boolean }> = [];
         for (const raw of rawIds) {
             const ref = byRaw[raw];
@@ -1482,7 +1494,23 @@ function renderDetail(session: Session, live: boolean): WebSessionDetail {
             if (!msg) {
                 const num = /^m(\d+)$/.exec(ref);
                 const stored = num ? hydratedByMsgId.get(raw) : undefined;
-                out.push(stored ? { ref, role: stored.role, preview: messagePreview(stored.content) } : { ref, missing: true });
+                if (stored) {
+                    out.push({ ref, role: stored.role, preview: messagePreview(stored.content) });
+                    continue;
+                }
+                // Window and store are both empty, but the bytes may live on in
+                // the block's frozen content snapshot — leaf blocks re-align by
+                // position (marker-validated); every other case stays an
+                // honest miss.
+                const item = block ? (leafRefIndex(block)?.get(ref) ?? undefined) : undefined;
+                out.push(item
+                    ? {
+                          ref,
+                          role: item.role,
+                          ...(item.toolName !== undefined ? { toolName: item.toolName } : {}),
+                          preview: messagePreview(item.text),
+                      }
+                    : { ref, missing: true });
                 continue;
             }
             out.push({
@@ -1576,7 +1604,7 @@ function renderDetail(session: Session, live: boolean): WebSessionDetail {
                 effectiveMessageCount: (b.effectiveMessageIds || []).length,
                 directMessageCount: (b.directMessageIds || []).length,
                 directMessageRefs: refsOf(b.directMessageIds || []),
-                directMessages: messageLeaves(b.directMessageIds || []),
+                directMessages: messageLeaves(b.directMessageIds || [], b),
                 summaryTokens: defaultCountTokens(b.summary),
                 summaryBytes: utf8Bytes(b.summary),
             };
@@ -1607,6 +1635,82 @@ function messagePreview(text: string): string {
     const flat = text.replace(/\s+/g, " ").trim();
     const chars = Array.from(flat);
     return chars.length > MESSAGE_PREVIEW_CHARS ? chars.slice(0, MESSAGE_PREVIEW_CHARS).join("") + "…" : flat;
+}
+
+/** A frozen full-view snapshot (collectBlockContent) renders each original
+ *  message as a `[role]` (or `[role • toolName]`) header line followed by its
+ *  text; a pi-host user message additionally opens its body with an ACP ref
+ *  marker, which pins one exact ref→position alignment. */
+const BLOCK_ROLE_LINE_RE = /^\[([a-zA-Z]+)(?: • ([^\]]+))?\]$/;
+const ACP_REF_MARK_RE = /^<acp [^>]*>(m\d+)<\/acp>$/;
+
+type BlockSnapItem = { role: string; toolName?: string; text: string; ref?: string };
+
+/** Re-parse a frozen full-view snapshot into its ordered message fragments.
+ *  A body line that merely LOOKS like a role header splits the message — the
+ *  count/marker validation in leafRefIndexFor is what keeps a bad parse from
+ *  ever being served. */
+function parseBlockContentMessages(text: string): BlockSnapItem[] {
+    const items: BlockSnapItem[] = [];
+    let cur: BlockSnapItem | null = null;
+    for (const line of text.split("\n")) {
+        const roleM = BLOCK_ROLE_LINE_RE.exec(line);
+        if (roleM) {
+            if (cur) items.push(cur);
+            cur = {
+                role: roleM[1],
+                ...(roleM[2] !== undefined ? { toolName: roleM[2] } : {}),
+                text: "",
+            };
+            continue;
+        }
+        if (!cur) continue; // one-view summary preamble — never hydrated
+        const markM = ACP_REF_MARK_RE.exec(line);
+        if (markM && cur.ref === undefined && cur.text === "") {
+            cur.ref = markM[1];
+            continue;
+        }
+        cur.text = cur.text === "" ? line : cur.text + "\n" + line;
+    }
+    if (cur) items.push(cur);
+    return items;
+}
+
+/** ref → snapshot fragment for ONE leaf block, or null when the alignment
+ *  cannot be proven. Zip-eligible only when the frozen full view covers
+ *  exactly the block's own direct messages (leaf span) AND the parsed
+ *  fragment count equals the ref count — then position i IS ref i, and every
+ *  ACP marker cross-checks its own position. Any mismatch aborts the whole
+ *  block: the rows keep the honest "missing" marker instead of risking a
+ *  shifted alignment serving the wrong bytes under a ref. */
+function leafRefIndexFor(session: Session, block: CompressionBlock): Map<string, BlockSnapItem> | null {
+    const direct = block.directMessageIds || [];
+    const effective = block.effectiveMessageIds || [];
+    if (direct.length === 0 || direct.length !== effective.length) return null;
+    let content: BlockContent | undefined;
+    try {
+        content = session.blockContents.get(block.blockId);
+    } catch {
+        return null;
+    }
+    const full = content ? content.full : undefined;
+    if (!full) return null;
+    const byRaw = session.state.messageRefs.byRaw;
+    const refs: string[] = [];
+    for (const raw of direct) {
+        const r = byRaw[raw];
+        if (typeof r !== "string" || r.length === 0) return null; // unaligned ledger — abort
+        refs.push(r);
+    }
+    const items = parseBlockContentMessages(full.text);
+    if (items.length !== refs.length) return null;
+    const map = new Map<string, BlockSnapItem>();
+    for (let i = 0; i < items.length; i++) {
+        const item = items[i];
+        if (item.ref !== undefined && item.ref !== refs[i]) return null;
+        map.set(refs[i], item);
+    }
+    return map;
 }
 
 function utf8Bytes(s: string): number {
@@ -1764,6 +1868,30 @@ export async function buildMessageContent(id: string, ref: string): Promise<Mess
                 }
             } catch {
                 // sidecar degraded mid-request: report the miss, never 500
+            }
+        }
+        // Last resort: the bytes only survive in the frozen block-content
+        // snapshot (leaf zip). The ledger still owns identity — the ref we
+        // were asked for must be the one the block's alignment produced for
+        // this raw id; a shifted parse yields null, never wrong bytes.
+        if (typeof raw === "string") {
+            for (const b of session.state.blocks) {
+                const direct = b.directMessageIds || [];
+                if (direct.indexOf(raw) === -1) continue;
+                const item = leafRefIndexFor(session, b)?.get(ref);
+                if (!item) continue;
+                const totalBytes = utf8Bytes(item.text);
+                const truncated = totalBytes > BLOCK_CONTENT_MAX_BYTES;
+                return {
+                    ok: true,
+                    ref,
+                    role: item.role,
+                    ...(item.toolName !== undefined ? { toolName: item.toolName } : {}),
+                    bytes: truncated ? BLOCK_CONTENT_MAX_BYTES : totalBytes,
+                    totalBytes,
+                    truncated,
+                    text: truncated ? sliceUtf8(item.text, BLOCK_CONTENT_MAX_BYTES) : item.text,
+                };
             }
         }
         return { ok: false, reason: "unknown-message" };

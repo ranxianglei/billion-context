@@ -412,6 +412,15 @@ details.cl-item.cl-flash { outline: 2px solid var(--accent); outline-offset: -2p
 .tchip rect { fill: var(--bg-muted); stroke: var(--border-soft); }
 .tchip:hover rect { stroke: var(--accent); }
 .tchip text { font-size: 10px; font-weight: 700; fill: var(--text-muted); text-anchor: middle; }
+/* Stable hover card for the collapsible tree — the native SVG <title> tooltip
+   dies the instant any repaint (expand/collapse, Esc, the #4173 live tick)
+   swaps the drawing under a stationary cursor, so the tree draws its own
+   card (pointer-events: none so it never steals the pointer it tracks). */
+#tree-graph { position: relative; }
+.g-tip { position: absolute; z-index: 30; max-width: 340px; pointer-events: none; background: var(--bg-elev); border: 1px solid var(--border); border-radius: 8px; box-shadow: var(--shadow); padding: 7px 10px; line-height: 1.45; font-size: 11.5px; }
+.g-tip .gt-id { font-family: var(--mono); font-size: 11px; font-weight: 600; color: var(--accent); }
+.g-tip .gt-topic { color: var(--text); }
+.g-tip .gt-meta { color: var(--text-muted); font-size: 10.5px; margin-top: 3px; }
 .fd-side { min-width: 0; }
 .bd-card { border: 1px solid var(--border-soft); border-radius: 10px; position: sticky; top: 12px; max-height: calc(100vh - 240px); overflow-y: auto; }
 .bd-panel { padding-bottom: 14px; }
