@@ -6503,7 +6503,10 @@ async function abortLaunchOnBusyOverlay(handle: ProxyHandle, err: OverlayBusyErr
  *  because such tokens never reach this path anymore. */
 export function quoteWinToken(token: string): string {
     if (!/\s/.test(token) || token.includes('"')) return token;
-    return `"${token}"`;
+    // The receiving program reads 2n backslashes before a quote as n (MSVCRT /
+    // CommandLineToArgvW), so a trailing run is doubled or the closing quote halves it
+    // (an even run) or swallows itself (an odd one).
+    return `"${token.replace(/(\\+)$/, "$1$1")}"`;
 }
 
 /** #679: full command line for `comspec /d /s /c <line>` — tokens quoted as
