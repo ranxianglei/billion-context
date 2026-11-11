@@ -32,6 +32,18 @@ import {
     ACP_TOOLS_OPENAI,
     ACP_TOOLS_RESPONSES,
     ACP_READONLY_TOOLS_RESPONSES,
+    ACP_RETIRE_TOOL,
+    ACP_RESTORE_TOOL,
+    ACP_REWRITE_TOOL,
+    ACP_RETIRE_TOOL_OPENAI,
+    ACP_RESTORE_TOOL_OPENAI,
+    ACP_REWRITE_TOOL_OPENAI,
+    ACP_RETIRE_TOOL_RESPONSES,
+    ACP_RESTORE_TOOL_RESPONSES,
+    ACP_REWRITE_TOOL_RESPONSES,
+    ACP_RETIRE_TOOL_GOOGLE,
+    ACP_RESTORE_TOOL_GOOGLE,
+    ACP_REWRITE_TOOL_GOOGLE,
     ACP_TEXT_OPEN,
     ACP_TEXT_CLOSE,
     ACP_STATUS_OPEN,
@@ -362,10 +374,19 @@ export function mcpBiliToolName(name: string): string {
  *  cannot rewrite in plugin mode). Static string + per-session-stable tool
  *  table = cache-stable, the same premise the surface flag itself rides
  *  (#3403). */
-export const MCP_DIALECT_NOTE = "On this host the context-management tools are exposed under MCP-prefixed names: call `mcp__bili__compress` (not `compress`) — likewise `mcp__bili__decompress`, `mcp__bili__search_context`, `mcp__bili__acp_status`, `mcp__bili__acp_retire`, `mcp__bili__acp_restore`, `mcp__bili__acp_rewrite`.";
+export const MCP_DIALECT_NOTE = "On this host the context-management tools are exposed under MCP-prefixed names: call `mcp__bili__compress` (not `compress`) — likewise `mcp__bili__decompress`, `mcp__bili__search_context`, `mcp__bili__acp_status`.";
 
-export function withMcpDialectNote(prompt: string, on: boolean): string {
-    return on ? `${prompt}\n\n${MCP_DIALECT_NOTE}` : prompt;
+// #5765: the block-ops clause is appended only when blockOps is enabled —
+// the note must never name a tool the outbound tool table doesn't carry
+// (same invariant as the tool arrays themselves).
+export const MCP_DIALECT_NOTE_BLOCK_OPS = " The block-lifecycle tools are likewise prefixed: `mcp__bili__acp_retire`, `mcp__bili__acp_restore`, `mcp__bili__acp_rewrite`.";
+
+export function mcpDialectNoteText(blockOpsOn: boolean): string {
+    return MCP_DIALECT_NOTE + (blockOpsOn ? MCP_DIALECT_NOTE_BLOCK_OPS : "");
+}
+
+export function withMcpDialectNote(prompt: string, on: boolean, blockOpsOn = false): string {
+    return on ? `${prompt}\n\n${mcpDialectNoteText(blockOpsOn)}` : prompt;
 }
 
 /** Note mode for one request: the harness is code-mode-shaped when the
@@ -396,6 +417,19 @@ export function absorbToolsFor(name: string) {
         openai: { type: "function" as const, function: { name, description: ABSORB_TOOL_OPENAI.function.description, parameters: ABSORB_TOOL_OPENAI.function.parameters } },
         responses: { type: "function" as const, name, description: ABSORB_TOOL_OPENAI.function.description, parameters: ABSORB_TOOL_OPENAI.function.parameters },
         google: { name, description: ABSORB_TOOL_GOOGLE.description, parameters: ABSORB_TOOL_GOOGLE.parameters },
+    };
+}
+
+// #5765: the block-lifecycle tools' four wire shapes, fixed names (no
+// toolName rename — one switch, no identity surface). Served by every
+// injection point (wire extras, plugin manifest) only when
+// config.blockOps.enabled — absent from the default arrays, same as absorb.
+export function blockOpsTools() {
+    return {
+        anthropic: [ACP_RETIRE_TOOL, ACP_RESTORE_TOOL, ACP_REWRITE_TOOL],
+        openai: [ACP_RETIRE_TOOL_OPENAI, ACP_RESTORE_TOOL_OPENAI, ACP_REWRITE_TOOL_OPENAI],
+        responses: [ACP_RETIRE_TOOL_RESPONSES, ACP_RESTORE_TOOL_RESPONSES, ACP_REWRITE_TOOL_RESPONSES],
+        google: [ACP_RETIRE_TOOL_GOOGLE, ACP_RESTORE_TOOL_GOOGLE, ACP_REWRITE_TOOL_GOOGLE],
     };
 }
 

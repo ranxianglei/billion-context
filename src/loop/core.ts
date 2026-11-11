@@ -31,9 +31,9 @@ import { applyImageRescalePass, executeReadOriginalImage } from "../image-rescal
 import { recordThreadTail } from "../server/thread-tracking.js";
 import { applyRanges } from "../stream.js";
 import { applyConfiguredCompression } from "../external-summary-compress.js";
-import { executeAcpRetire, executeAcpRestore, executeAcpRewrite } from "../acp-block-ops.js";
+import { executeAcpRetire, executeAcpRestore, executeAcpRewrite, effectiveBlockOpsConfig } from "../acp-block-ops.js";
 import { executeSearchContextTarget, resolveDecompress } from "../decompress-shared.js";
-import { toolFail, type ProxyToolResult } from "../proxy-tool-result.js";
+import { toolFail, toolOk, type ProxyToolResult } from "../proxy-tool-result.js";
 import { fetchWithRetry, UpstreamHttpError } from "../fetch-util.js";
 import { noteUpstreamThrottle429, noteUpstreamThrottleResolved, throttle429ModelScope } from "../upstream-throttle.js";
 import { classifyUpstreamFailure, type SkippedProxyInfo, type UpstreamFailureKind } from "../upstream-fail.js";
@@ -467,13 +467,20 @@ export function executeProxyTool(
     if (toolName === "acp_cache") {
         return handleAcpCache(ctx.session, args);
     }
+    // #5765: block ops are opt-in (config.blockOps.enabled, default off) — a
+    // stray call (stale prompt / hallucinated tool) gets the model-facing
+    // "not enabled" receipt, never a silent state mutation.
+    const blockOpsOn = effectiveBlockOpsConfig(ctx.session, ctx.config)?.enabled === true;
     if (toolName === "acp_retire") {
+        if (!blockOpsOn) return toolOk("acp_retire is not enabled on this bili proxy (compress.blockOps.enabled is not true) — no blocks were retired.");
         return executeAcpRetire(args, ctx.session);
     }
     if (toolName === "acp_restore") {
+        if (!blockOpsOn) return toolOk("acp_restore is not enabled on this bili proxy (compress.blockOps.enabled is not true) — no blocks were restored.");
         return executeAcpRestore(args, ctx.session);
     }
     if (toolName === "acp_rewrite") {
+        if (!blockOpsOn) return toolOk("acp_rewrite is not enabled on this bili proxy (compress.blockOps.enabled is not true) — no summary was rewritten.");
         return executeAcpRewrite(args, ctx.session);
     }
     const absorb = effectiveAbsorbConfig(ctx.session, ctx.config);

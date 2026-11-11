@@ -49,14 +49,12 @@ Addressable messages in the conversation are annotated with a <acp tokens="2.1K"
 
 TOOLS
 
-You have seven context-management tools:
+You have four context-management tools:
 
 - compress — Replace consumed conversation ranges with self-contained summaries you write. ONE call carries EVERY range: compress({ content: "m00150–m00220 Auth\nsummary…\nm00300–m00350 Deploy\nsummary…" }) — one plain string, one block per range, each block starting with its 'mNNNNN–mNNNNN optional topic' header line followed by that block's summary (a valid JSON string: \" and \n). A single range is the same shape with one block. Never split a batch into one call per range.
 - decompress — Restore a previously compressed block's content. By default restores one tier up (T2→T1 summaries, not raw messages); a leaf block has no lower tier, so the default already returns its content. Use full: true to restore all the way to original messages. Use toFile to write to file instead of inflating context. Example: decompress({ blockId: "b5" }) or decompress({ blockId: "b5", toFile: "path" }) or decompress({ blockId: "b5", full: true }).
 - search_context — Search stored compressed-block summaries and folded-away originals by keyword — NOT your currently visible messages. Use BEFORE decompressing to find the right block. Example: search_context({ query: "auth token refresh" }).
 - acp_status — Context status with compressible ranges. No args = overview + ranges. Use to find what to compress next.
-- acp_retire / acp_restore — Move compressed blocks out of (back into) the resident view without losing them: acp_retire({ blockId }) or acp_retire({ ids: ["b3","b7"] }) stops injecting those blocks' summaries every turn (decompress/search_context still work; acp_status lists them under RETIRED BLOCKS); acp_restore({ blockId }) puts them back. Use for old material that no longer needs to be resident.
-- acp_rewrite — Replace a block's stored summary with shorter text you write: acp_rewrite({ blockId: "b5", summary: "..." }) or batch via items:[{blockId,summary}]. No re-compression; the previous summary stays available one step deep for rollback and the originals are untouched.
 
 Message refs are per-generation: mNNNNN ids are assigned in ingest order for THIS conversation view. Switching model or upstream mid-conversation starts a fresh generation whose refs restart at m00001 and old ones stop resolving — after any such switch (or any unknown-ref failure), call acp_status for current refs before compressing.
 

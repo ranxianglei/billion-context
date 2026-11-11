@@ -23,7 +23,9 @@ export const ACP_STATUS_TOOL_NAME = "acp_status";
 export const ACP_CACHE_TOOL_NAME = "acp_cache";
 /** #5765 block ops: retire/restore move a block's summary out of (back into)
  *  the resident view; rewrite replaces its stored summary with supplied text.
- *  Always-on like acp_cache (no config gate). */
+ *  OPT-IN (config.blockOps.enabled, default off): hosts advertise, inject and
+ *  prompt for these only when enabled — the tool definitions below stay exported
+ *  unconditionally (same pattern as the absorb tools). */
 export const ACP_RETIRE_TOOL_NAME = "acp_retire";
 export const ACP_RESTORE_TOOL_NAME = "acp_restore";
 export const ACP_REWRITE_TOOL_NAME = "acp_rewrite";
@@ -207,14 +209,12 @@ const FUNCTION_PROMPT_SECTIONS: ReadonlyArray<
     "tools",
     `TOOLS
 
-You have seven context-management tools:
+You have four context-management tools:
 
 - compress — Replace consumed conversation ranges with self-contained summaries you write. ONE call carries EVERY range: compress({ content: "m00150–m00220 Auth\\nsummary…\\nm00300–m00350 Deploy\\nsummary…" }) — one plain string, one block per range, each block starting with its 'mNNNNN–mNNNNN optional topic' header line followed by that block's summary (a valid JSON string: \\\" and \\n). A single range is the same shape with one block. Never split a batch into one call per range.
 - decompress — Restore a previously compressed block's content. By default restores one tier up (T2→T1 summaries, not raw messages); a leaf block has no lower tier, so the default already returns its content. Use full: true to restore all the way to original messages. Use toFile to write to file instead of inflating context. Example: decompress({ blockId: "b5" }) or decompress({ blockId: "b5", toFile: "path" }) or decompress({ blockId: "b5", full: true }).
 - search_context — Search stored compressed-block summaries and folded-away originals by keyword — NOT your currently visible messages. Use BEFORE decompressing to find the right block. Example: search_context({ query: "auth token refresh" }).
 - acp_status — Context status with compressible ranges. No args = overview + ranges. Use to find what to compress next.
-- acp_retire / acp_restore — Move compressed blocks out of (back into) the resident view without losing them: acp_retire({ blockId }) or acp_retire({ ids: ["b3","b7"] }) stops injecting those blocks' summaries every turn (decompress/search_context still work; acp_status lists them under RETIRED BLOCKS); acp_restore({ blockId }) puts them back. Use for old material that no longer needs to be resident.
-- acp_rewrite — Replace a block's stored summary with shorter text you write: acp_rewrite({ blockId: "b5", summary: "..." }) or batch via items:[{blockId,summary}]. No re-compression; the previous summary stays available one step deep for rollback and the originals are untouched.
 
 Message refs are per-generation: mNNNNN ids are assigned in ingest order for THIS conversation view. Switching model or upstream mid-conversation starts a fresh generation whose refs restart at m00001 and old ones stop resolving — after any such switch (or any unknown-ref failure), call acp_status for current refs before compressing.`,
   ],
@@ -351,8 +351,6 @@ The proxy also provides these as real function tools you can call directly (they
 - acp_status — view context usage, compression state, and compressible ranges. No arguments. Use this FIRST when unsure about context state.
 - search_context — search compressed block summaries by keyword. Arguments: {"query":"...","limit":5}.
 - decompress — restore compressed content for exact details. Arguments: {"blockId":"b5"} (optional "toFile":"/tmp/x.txt", "full":true).
-- acp_retire / acp_restore — move blocks out of (back into) the resident view without losing them. Arguments: {"blockId":"b5"} or {"ids":["b3","b7"]}.
-- acp_rewrite — replace a block's stored summary with shorter supplied text (no re-compression; originals untouched). Arguments: {"blockId":"b5","summary":"..."} or {"items":[{"blockId":"b5","summary":"..."}]}.
 
 Note: compress is ONLY available via the text marker above (it needs batch ranges + an immediate stop), NOT as a function tool.`,
   ],
@@ -372,6 +370,25 @@ export function buildCompressHybridSystemPrompt(
       sections,
     ),
   ].join("\n\n");
+}
+
+/** #5765: system-prompt section for the opt-in block-lifecycle tools
+ *  (acp_retire / acp_restore / acp_rewrite). Hosts append it ONLY when they
+ *  also inject the tools (config.blockOps.enabled), so the prompt never
+ *  advertises a tool the request's tools array lacks. "function" = the
+ *  function-tool lanes (anthropic/chat/google + responses function mode);
+ *  "hybrid" = the Responses text-protocol lane, where compress stays a text
+ *  marker and the block ops ride as real function tools. */
+export function buildBlockOpsSystemPrompt(lane: "function" | "hybrid"): string {
+  if (lane === "hybrid") {
+    return `You also have these block-management function tools:
+- acp_retire / acp_restore — move blocks out of (back into) the resident view without losing them. Arguments: {"blockId":"b5"} or {"ids":["b3","b7"]}.
+- acp_rewrite — replace a block's stored summary with shorter supplied text (no re-compression; originals untouched). Arguments: {"blockId":"b5","summary":"..."} or {"items":[{"blockId":"b5","summary":"..."}]}.`;
+  }
+  return `BLOCK-LIFECYCLE MANAGEMENT (acp_retire / acp_restore / acp_rewrite)
+
+- acp_retire / acp_restore — Move compressed blocks out of (back into) the resident view without losing them: acp_retire({ blockId }) or acp_retire({ ids: ["b3","b7"] }) stops injecting those blocks' summaries every turn (decompress/search_context still work; acp_status lists them under RETIRED BLOCKS); acp_restore({ blockId }) puts them back. Use for old material that no longer needs to be resident.
+- acp_rewrite — Replace a block's stored summary with shorter text you write: acp_rewrite({ blockId: "b5", summary: "..." }) or batch via items:[{blockId,summary}]. No re-compression; the previous summary stays available one step deep for rollback and the originals are untouched.`;
 }
 
 export const DECOMPRESS_TOOL_OPENAI = {
@@ -572,9 +589,6 @@ export const ACP_TOOLS_OPENAI = [
   SEARCH_CONTEXT_TOOL_OPENAI,
   ACP_STATUS_TOOL_OPENAI,
   ACP_CACHE_TOOL_OPENAI,
-  ACP_RETIRE_TOOL_OPENAI,
-  ACP_RESTORE_TOOL_OPENAI,
-  ACP_REWRITE_TOOL_OPENAI,
 ] as const;
 
 /** Anthropic-format tools (name + description + input_schema). The Anthropic
@@ -630,9 +644,6 @@ export const ACP_TOOLS_ANTHROPIC = [
   SEARCH_CONTEXT_TOOL,
   ACP_STATUS_TOOL,
   ACP_CACHE_TOOL,
-  ACP_RETIRE_TOOL,
-  ACP_RESTORE_TOOL,
-  ACP_REWRITE_TOOL,
 ] as const;
 
 // Responses API flat format (defined after the OpenAI chat constants).
@@ -699,9 +710,6 @@ export const ACP_TOOLS_RESPONSES = [
   SEARCH_CONTEXT_TOOL_RESPONSES,
   ACP_STATUS_TOOL_RESPONSES,
   ACP_CACHE_TOOL_RESPONSES,
-  ACP_RETIRE_TOOL_RESPONSES,
-  ACP_RESTORE_TOOL_RESPONSES,
-  ACP_REWRITE_TOOL_RESPONSES,
 ] as const;
 
 /** Read-only ACP tools (no compress) in Responses flat format. Used for the
@@ -715,22 +723,26 @@ export const ACP_READONLY_TOOLS_RESPONSES = [
   SEARCH_CONTEXT_TOOL_RESPONSES,
   ACP_STATUS_TOOL_RESPONSES,
   ACP_CACHE_TOOL_RESPONSES,
-  // #5765: block ops are not compress — they join the hybrid lane's function
-  // tools (compress stays a text marker there).
-  ACP_RETIRE_TOOL_RESPONSES,
-  ACP_RESTORE_TOOL_RESPONSES,
-  ACP_REWRITE_TOOL_RESPONSES,
 ] as const;
 
 /** All ACP tool names (dynamic membership — Set, not a static record). Does
- *  NOT include absorb or acp_retrieve: both are opt-in (config.absorb.enabled
- *  / config.ccr.enabled) and hosts only register/inject them when on. */
+ *  NOT include absorb, acp_retrieve or the #5765 block ops: all opt-in
+ *  (config.absorb.enabled / config.ccr.enabled / config.blockOps.enabled) and
+ *  hosts only register/inject them when on. */
 export const ACP_TOOL_NAMES: ReadonlySet<string> = new Set([
   COMPRESS_TOOL_NAME,
   DECOMPRESS_TOOL_NAME,
   SEARCH_CONTEXT_TOOL_NAME,
   ACP_STATUS_TOOL_NAME,
   ACP_CACHE_TOOL_NAME,
+]);
+
+/** #5765: the opt-in block-lifecycle tool names. Like absorb/acp_retrieve they
+ *  stay OUT of ACP_TOOL_NAMES (config.blockOps.enabled gates the surface), but
+ *  every "is this a bili-owned tool" check (absorb candidacy, ccr placeholder
+ *  skip, side-request demotion) must still recognize them — when enabled their
+ *  receipts behave like any other ACP tool receipt. */
+export const BLOCK_OP_TOOL_NAMES: ReadonlySet<string> = new Set([
   ACP_RETIRE_TOOL_NAME,
   ACP_RESTORE_TOOL_NAME,
   ACP_REWRITE_TOOL_NAME,
@@ -857,9 +869,6 @@ export const ACP_TOOLS_GOOGLE = [
   SEARCH_CONTEXT_TOOL_GOOGLE,
   ACP_STATUS_TOOL_GOOGLE,
   ACP_CACHE_TOOL_GOOGLE,
-  ACP_RETIRE_TOOL_GOOGLE,
-  ACP_RESTORE_TOOL_GOOGLE,
-  ACP_REWRITE_TOOL_GOOGLE,
 ] as const;
 
 /** Opt-in absorb tool in Gemini flat format (config.absorb.enabled). */

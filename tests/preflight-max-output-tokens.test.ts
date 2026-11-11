@@ -518,14 +518,10 @@ function longAnthropicMessages() {
     // growth of it (the project-attribution line) flipped the #330 soft-zone
     // relaxation, leaving a single anchor message in the forward that this mock
     // misclassifies as a summary call. repeat(235) restores ~700 est-tokens of
-    // margin so the guard pins behavior, not a knife-edge. #5765: the always-on
-    // retire/restore/rewrite tool schemas add ~0.7k est-tokens to every anthropic
-    // body — at repeat(235) the post-fold forward again degenerates to a single
-    // anchor message; repeat(220) restores a 4-message forward (margin: the mock
-    // only misclassifies exactly-1-message bodies).
+    // margin so the guard pins behavior, not a knife-edge.
     for (let i = 0; i < 12; i++) {
         const role = i % 2 === 0 ? "user" : "assistant";
-        msgs.push({ role, content: `Message ${i} of the long conversation. ` + `MARKER_${i}_content_`.repeat(220) });
+        msgs.push({ role, content: `Message ${i} of the long conversation. ` + `MARKER_${i}_content_`.repeat(235) });
     }
     return msgs;
 }

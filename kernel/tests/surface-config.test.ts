@@ -108,8 +108,7 @@ test("function builder honors section replace and remove", () => {
   assert.ok(
     !replaced.includes("NEVER echo, repeat, or reference these XML tags"),
   );
-  // #5765: tool count follows the live tool list (acp_retire/acp_restore/acp_rewrite added).
-  assert.ok(replaced.includes("You have seven context-management tools"));
+  assert.ok(replaced.includes("You have four context-management tools"));
 
   const removed = buildCompressSystemPrompt(undefined, {
     summariesInContext: null,

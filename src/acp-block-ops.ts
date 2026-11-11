@@ -2,9 +2,40 @@
 // external summary rewrite (acp_rewrite). The kernel owns the state mutation
 // (kernel/src/block-ops.ts); this module parses tool args, formats receipts,
 // and marks the session dirty so the change persists.
-import { retireBlocks, restoreBlocks, rewriteBlockSummary } from "acp-kernel";
+import { retireBlocks, restoreBlocks, rewriteBlockSummary, type Config } from "acp-kernel";
 import { markDirty, type Session } from "./session.js";
 import { toolFail, toolOk, type ProxyToolResult } from "./proxy-tool-result.js";
+
+// The kernel's ACP_TOOL_NAMES deliberately excludes the block ops (they are
+// opt-in, config.blockOps.enabled — same pattern as absorb), so surface and
+// dispatch adjudication must check the resolved config alongside the static
+// set. Two config sources exist: wire paths carry the per-request resolved
+// Config, while the plugin tool API resolves sessions without a request
+// context and falls back to the base kernel Config — prepare* therefore
+// stores the last resolved blockOps block per session for that path to read.
+const EFFECTIVE_BLOCK_OPS_KEY = "effectiveBlockOps";
+
+export function blockOpsEnabled(config: Config): boolean {
+    return config.blockOps?.enabled === true;
+}
+
+export function effectiveBlockOpsConfig(session: Session | undefined, fallback: Config): { enabled: boolean } | undefined {
+    const meta = session?.metadata[EFFECTIVE_BLOCK_OPS_KEY];
+    if (meta && typeof meta === "object" && typeof (meta as { enabled: boolean }).enabled === "boolean") {
+        return meta as { enabled: boolean };
+    }
+    return fallback.blockOps;
+}
+
+export function storeEffectiveBlockOps(session: Session, config: Config): void {
+    const value = config.blockOps ?? null;
+    // Default-off footprint stays zero: with no blockOps block configured and
+    // nothing stored yet, write nothing — the persisted session state (and its
+    // storage-render golden digest) is byte-identical to a pre-#5765 proxy.
+    if (value !== null || EFFECTIVE_BLOCK_OPS_KEY in session.metadata) {
+        session.metadata[EFFECTIVE_BLOCK_OPS_KEY] = value;
+    }
+}
 
 function collectBlockIds(args: Record<string, unknown>): string[] {
     const ids: string[] = [];

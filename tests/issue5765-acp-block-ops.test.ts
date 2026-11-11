@@ -64,7 +64,10 @@ function addBlock(s: Session, blockId: string, opts: { active?: boolean; retired
     s.blockContents.set(blockId, { one: null, full: { text: `original text of ${blockId}`, count: 1 } });
 }
 
-const ctxOf = (session: Session) => ({ session }) as unknown as Parameters<typeof executeProxyTool>[2];
+const ctxOf = (session: Session, blockOpsEnabled = true) => ({
+    session,
+    config: blockOpsEnabled ? { blockOps: { enabled: true } } : {},
+}) as unknown as Parameters<typeof executeProxyTool>[2];
 
 test("acp_retire dispatch: batch ids retire, receipt reports freed chars, state flags set", () => {
     const base = mkdtempSync(path.join(tmpdir(), "issue5765-"));
@@ -173,6 +176,29 @@ test("classification: all three are mutating proxy tools, never readonly", () =>
     for (const name of ["acp_retire", "acp_restore", "acp_rewrite"]) {
         assert.ok(MUTATING_PROXY_TOOLS.has(name), `${name} must be mutating`);
         assert.ok(!READONLY_PROXY_TOOLS.has(name), `${name} must not be readonly`);
+    }
+});
+
+test("opt-in gate: default-off calls get the model-facing not-enabled receipt, no state mutation", () => {
+    const base = mkdtempSync(path.join(tmpdir(), "issue5765-"));
+    const snap = isolate(base);
+    try {
+        const s = makeSession("t-gate");
+        addBlock(s, "b1", { summary: "alpha" });
+        let r = executeProxyTool("acp_retire", { blockId: "b1" }, ctxOf(s, false));
+        assert.equal(r.outcome, "success");
+        assert.match(r.text, /not enabled on this bili proxy \(compress\.blockOps\.enabled is not true\)/);
+        assert.match(r.text, /no blocks were retired/);
+        r = executeProxyTool("acp_restore", { blockId: "b1" }, ctxOf(s, false));
+        assert.equal(r.outcome, "success");
+        assert.match(r.text, /no blocks were restored/);
+        r = executeProxyTool("acp_rewrite", { blockId: "b1", summary: "x" }, ctxOf(s, false));
+        assert.equal(r.outcome, "success");
+        assert.match(r.text, /no summary was rewritten/);
+        assert.equal(s.state.blocks[0].retired, undefined, "disabled calls must not touch state");
+        assert.equal(s.state.blocks[0].summary, "alpha");
+    } finally {
+        restore(snap);
     }
 });
 

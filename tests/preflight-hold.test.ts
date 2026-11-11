@@ -50,15 +50,11 @@ function bigConversation(): Array<{ role: string; content: string }> {
     // #3298: repeat(250) sat ~16 est-tokens under the 10k window after the
     // preflight fold on old system-prompt sizes — any growth of the injected
     // prompt (e.g. the project-attribution line) flipped the #330 soft-zone
-    // relaxation gate and ate the protected tail. repeat(235) restored ~700
+    // relaxation gate and ate the protected tail. repeat(235) restores ~700
     // tokens of margin so the guard pins behavior, not a knife-edge.
-    // #5765: the always-on retire/restore/rewrite tool schemas add ~0.7k
-    // est-tokens to every anthropic body — at repeat(235) the post-fold payload
-    // again crossed the #330 soft-zone gate and the fold ate MARKER_11. repeat(220)
-    // restores the pre-#5765 geometry with margin (same retune as #663).
     for (let i = 0; i < 12; i++) {
         const role = i % 2 === 0 ? "user" : "assistant";
-        const filler = `MARKER_${i}_content_`.repeat(220);
+        const filler = `MARKER_${i}_content_`.repeat(235);
         msgs.push({ role, content: `Message ${i} of the long conversation. ${filler}` });
     }
     return msgs;

@@ -42,13 +42,10 @@ function fcEvents(callId: string, args: string): string {
 function longInput() {
     const input: { type: string; role: string; content: string }[] = [];
     for (let i = 0; i < 12; i++) {
-        // #5765: repeat(235) used to sit mid-window; the always-on tool schemas added ~0.7-1.5k
-        // est-tokens to every body, and the preflight fold (which runs to the compression target,
-        // with the #330 soft zone relaxed under overflow) then ate past MARKER_11. repeat(155) is
-        // the center of the measured pass window [100..215] at this surface — the payload still
-        // exceeds the 10k window (trigger fires) and the fold stops with the recent tail intact,
-        // with ~2.5k est-tokens of margin on both edges.
-        input.push({ type: "message", role: i % 2 === 0 ? "user" : "assistant", content: `Message ${i} of the long conversation. ` + `MARKER_${i}_content_`.repeat(155) });
+        // #3298: repeat(235) keeps ~700 est-tokens of margin under the 10k window
+        // after the preflight fold — repeat(250) was knife-edge against the
+        // injected system-prompt size and flipped the #330 soft-zone relaxation.
+        input.push({ type: "message", role: i % 2 === 0 ? "user" : "assistant", content: `Message ${i} of the long conversation. ` + `MARKER_${i}_content_`.repeat(235) });
     }
     return input;
 }

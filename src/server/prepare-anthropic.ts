@@ -19,8 +19,9 @@ import { compressBreakerArmed } from "../stream.js";
 import { absorbAbortedTurnGrowth, applyCompactionArchive, coveredRealHistoryIds, detectUnannouncedHistoryRewrite, foldCoverage, markCompactionBoundary, markDirty, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, REWRITE_MIN_INCOMING_TOTAL, snapshotMessages, type PendingRetrieval, type Session } from "../session.js";
 import { carriesDshLocalCompactionSummary, DSH_LOCAL_COMPACTION_MIN_MISSING } from "./dsh-compaction-guard.js";
 import { carriesBiliSnapshotCheckpoint } from "./dsh-authored-compaction.js";
-import { ABSORB_TOOL_NAME, READ_ORIGINAL_IMAGE_TOOL, RULE_TOOL, absorbToolsFor, retrieveToolsFor, withFirstSightDrain, withMarkerIntegrityNote, withSummaryBudgetNote } from "../compress-tool.js";
+import { ABSORB_TOOL_NAME, READ_ORIGINAL_IMAGE_TOOL, RULE_TOOL, absorbToolsFor, blockOpsTools, retrieveToolsFor, withFirstSightDrain, withMarkerIntegrityNote, withSummaryBudgetNote } from "../compress-tool.js";
 import { applyAbsorbView, storeEffectiveAbsorb } from "../absorb.js";
+import { storeEffectiveBlockOps } from "../acp-block-ops.js";
 import { adoptContentStore, ccrEnabled, ccrLoopConfig, contentStoreOf, dropRetrievals, imageRescaleToolArmed, pruneExpiredRetrievals, reconcileReloadedRetrievals, renderRetrievalNotes, retrieveToolName, snapshotPendingRetrievals, snapshotRetrievalNotes } from "../store.js";
 import { rulesEnabled, storeEffectiveRules } from "../rules-feature.js";
 import { autoFoldEngaged, autoFoldFloor, externalSummaryEnabled, growthFoldingArmed } from "../external-summary-surface.js";
@@ -38,6 +39,7 @@ import { applyImageRescalePass } from "../image-rescale.js";
 import { isAutoModeClassifier } from "../auto-mode-forge.js";
 import { countSystemAndToolsTokens, emergencyNudge, emergencyNudgeArmed, projectThinkingMass } from "./budget.js";
 import { effectiveAbsorbBlock } from "./prepare-responses.js";
+import { effectiveBlockOpsEnabled } from "./prepare-responses.js";
 import { injectSystem, injectTool } from "./inject.js";
 import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
 import { featureEnabled } from "../rollout.js";
@@ -296,6 +298,9 @@ export async function prepareAnthropic(
         const absorbBlock = effectiveAbsorbBlock(pluginMode, config, opts.compress.absorb);
         const absorbTools = absorbToolsFor(absorbBlock?.toolName ?? ABSORB_TOOL_NAME);
         const absorbActive = absorbBlock?.enabled === true && opts.compress.injectTool;
+        // #5765: block-lifecycle tools — one switch, off by default.
+        const blockOps = blockOpsTools();
+        const blockOpsActive = effectiveBlockOpsEnabled(pluginMode, config, opts.compress.blockOps) && opts.compress.injectTool;
         // acp_rule has no processTurn side effect (no markers/instructions are
         // ever injected into messages), so unlike absorb it needs no loop-
         // config stripping — only tool availability matters.
@@ -378,6 +383,7 @@ export async function prepareAnthropic(
             if (gap) log("warn", `[${sessionId}] [acp-drift] fold coverage mismatch: ${gap.matched}/${gap.expected} covered message id(s) present in resent history — ${gap.expected - gap.matched} covered id(s) missing from resent history — mutation (content edit invalidates content-hash refs, fold silently lost) or client-side deletion/truncation (benign, message no longer on the wire); observability complement to the #1328 overflow rescue (#1195)`);
         }
         storeEffectiveAbsorb(session, loopConfig);
+        storeEffectiveBlockOps(session, loopConfig);
         storeEffectiveRules(session, config);
         turn.messages = applyAbsorbView(turn.messages, session.state, loopConfig, tokenCount);
         turn.messages = attachSubagentSessions(turn.messages, session);
@@ -500,7 +506,7 @@ export async function prepareAnthropic(
         // the compress prompt on round-2, the exact F2 seam the matrix pins).
         systemOut = stampAnthropicSystemCacheControl(systemOut, anthropicCacheMarks !== undefined);
         if (injectTools) {
-            toolsOut = injectTool(parsed.tools, [...(absorbActive ? [absorbTools.anthropic] : []), ...(rulesActive ? [RULE_TOOL] : []), ...(ccrEnabled(session) ? [retrieveToolsFor(retrieveToolName(session)).anthropic] : []), ...(imageRescaleToolArmed(session) ? [READ_ORIGINAL_IMAGE_TOOL] : [])], surface?.toolPrompts, ccrEnabled(session), externalSummaryEnabled(config));
+            toolsOut = injectTool(parsed.tools, [...(absorbActive ? [absorbTools.anthropic] : []), ...(rulesActive ? [RULE_TOOL] : []), ...(ccrEnabled(session) ? [retrieveToolsFor(retrieveToolName(session)).anthropic] : []), ...(imageRescaleToolArmed(session) ? [READ_ORIGINAL_IMAGE_TOOL] : []), ...(blockOpsActive ? blockOps.anthropic : [])], surface?.toolPrompts, ccrEnabled(session), externalSummaryEnabled(config));
         }
         // Nudge as a separate trailing user message (cache-friendly): the
         // system block stays byte-stable so the prefix cache survives.

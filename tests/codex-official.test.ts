@@ -118,7 +118,7 @@ test("Codex official transport preserves OAuth headers, decodes bodies, and reba
         };
         assert.deepEqual(forwarded.input.map((item) => item.type), ["additional_tools", "message", "reasoning", "message"]);
         assert.match(String(forwarded.input[1].content), /Compression Philosophy/);
-        assert.match(String(forwarded.input[1].content), /seven context-management tools/);
+        assert.match(String(forwarded.input[1].content), /four context-management tools/);
         assert.match(String(forwarded.input[1].content), /keep native Codex instructions/);
         assert.equal(forwarded.input[2].encrypted_content, "ciphertext");
         assert.equal((forwarded.input[3].content as Array<Record<string, unknown>>)[1].type, "input_image");
@@ -130,7 +130,7 @@ test("Codex official transport preserves OAuth headers, decodes bodies, and reba
         // the injected tool set.
         assert.deepEqual(
             forwarded.tools.map((t: unknown) => (t as { name: string }).name),
-            ["shell", "compress", "decompress", "search_context", "acp_status", "acp_cache", "acp_retire", "acp_restore", "acp_rewrite", "acp_rule", "acp_retrieve", "acp_read_original_image"],
+            ["shell", "compress", "decompress", "search_context", "acp_status", "acp_cache", "acp_rule", "acp_retrieve", "acp_read_original_image"],
         );
 
         const session = listSessions().find((candidate) => candidate.meta.label === sessionId);

@@ -312,6 +312,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `compress.injectNudge` | boolean | true | ACP_COMPRESS_NUDGE | Send growth nudges as the window fills (global level only). |
 | `compress.reasoning` | { drop?, threshold? } | drop true · threshold 2048 | — | Drop finished-round reasoning runs longer than 2048 chars (drop: true by default); strict-reasoning upstreams need drop:false. |
 | `compress.absorb` | object | opt-in (disabled) | — | Opt-in instant distillation of tool results into short abstracts; originals go to the content store. By default only image-bearing results qualify. |
+| `compress.blockOps` | object | off | — | Opt-in block-lifecycle tools (acp_retire / acp_restore / acp_rewrite) for compressed-block management; default-off keeps the wire byte-identical to pre-#5765. |
 | `compress.ccr` | object | enabled in proxy mode since v2 | — | Content cache & retrieve: large outputs stored losslessly beside the session, replaced by head excerpt + pointer fetched back via acp_retrieve; no cap or eviction. |
 | `compress.search` | object | off | — | Search-behavior settings for search_context; currently holds planAware re-ranking. |
 | `compress.search.planAware` | boolean | false | — | When on, search_context candidates are re-ranked against current plan state; off keeps byte-identical lexical results. |
@@ -327,6 +328,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `compress.absorb.excludeTools` | string[] | [] | — | Tool names excluded from absorption. |
 | `compress.absorb.toolName` | string | "absorb" | — | Registered name of the absorb tool. |
 | `compress.absorb.mediaOnly` | boolean | true | — | Restrict absorption to tool results that carry media (images). Image bytes are exempt from minToolTokens since they are not counted in text. Set false to restore legacy full-text absorption of any large result. |
+| `compress.blockOps.enabled` | boolean | false | — | Enable the three block-lifecycle tools (injection + prompt + manifest). Off = no tools, no prompt section, zero per-request cost. |
 | `compress.ccr.enabled` | boolean | true (proxy mode) | — | Enable the content-cache-and-retrieve block. |
 | `compress.ccr.minToolTokens` | number | ≈4000 | — | Minimum estimated token size of a tool result eligible for CCR storage. |
 | `compress.ccr.excludeTools` | string[] | [] | — | Tool names excluded from CCR storage. |
@@ -1635,6 +1637,17 @@ Optional surface blocks: `prompts` (inline rule-text overrides), `nudgeSections`
   - `excludeTools: string[]` — tool-name patterns never absorbed. **Known limitation:** a no-op on tool *results* until [ranxianglei/acp-kernel#213](https://github.com/ranxianglei/acp-kernel/issues/213) ships (wire projections don't carry `toolName` on results, so the kernel's name guard can't fire).
   - `toolName: string` — rename the injected tool (default `"absorb"`); the advertised/injected schema, the system-prompt section and per-session adjudication all follow the name in both lanes. **Lane governance (#1359):** plugin mode governs the *entire* `absorb` block by the **base** config, so a renamed tool is advertised under that name and executed under it (they can never diverge); provider/model-level `absorb.*` overrides are **proxy-lane-only** (the proxy injects and adjudicates the merged name). A load-time warning lists any provider/model `absorb.*` field whose value diverges from base.
   Injection follows the wire's native-tool surface: proxy mode injects the tool (under the per-request resolved name) + a system-prompt section on the anthropic/openai/responses native-tools wires, plugin mode advertises it in the plugin manifest **only while enabled** (hosts register the manifest's tools verbatim — advertising a disabled tool breaks them, #1192; the MCP shell picks it up for free). Responses **marker/text-protocol** routes are not supported (no native tool surface — the REQUIRED absorb instruction would be unsatisfiable), and title-generation requests (`max_tokens ≤ 200`) skip injection like the compress prompt does. Absorbed pairs stay hidden across restarts (persisted in the session state).
+
+#### `blockOps`
+
+- **Type:** `object` (`{ enabled? }`)
+- **Default:** *(off — the tools are injected only while `enabled: true`)*
+- **Status:** ACTIVE (issue #5765)
+- **Description:** Opt-in **compressed-block lifecycle management**. When enabled, three tools are injected (proxy lanes) / advertised (plugin lane) alongside the ACP tools, each with its own system-prompt section, and a per-session enabled flag is stored so the plugin tool API resolves the same value the wire got:
+  - `acp_retire` — move active compressed blocks out of the resident view (their summaries no longer ride on every request; `acp_restore` / `decompress` / `search_context` still reach them by id).
+  - `acp_restore` — put retired blocks back into the resident view.
+  - `acp_rewrite` — replace a block's summary in place (one-step rollback slot `previousSummary` kept; identical/blank rewrites rejected).
+  The kernel state mutations are idempotent and batch-able (`blockId` single or `ids` array). **Why off by default:** the three tool schemas are always-on surface while enabled — roughly +0.7k estimated tokens per request on every session of the enabled proxy — so the surface (tool arrays, prompt, manifest) ships byte-identical to pre-#5765 unless you opt in. A stray call while disabled gets a model-facing "not enabled on this bili proxy (compress.blockOps.enabled is not true)" receipt instead of an error and never touches state. Retired/rewritten state persists across restarts in the session state, and the export ledger (markdown handoff + JSONL) reports `retired` status, message-ref spans and original/summary char counts.
 
 #### `ccr`
 
