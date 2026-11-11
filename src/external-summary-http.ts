@@ -46,7 +46,7 @@ function backoffDelayMs(attempt: number): number {
 }
 
 function retryAfterDelayMs(header: string | null, fallbackMs: number): number {
-    if (header !== null) {
+    if (header !== null && header.trim() !== "") {
         const seconds = Number(header);
         if (Number.isFinite(seconds) && seconds >= 0) return Math.min(Math.ceil(seconds * 1000), SUMMARY_RETRY_AFTER_CAP_MS);
         const dateMs = Date.parse(header);

@@ -196,6 +196,27 @@ test("external summary HTTP: a transient 429 with Retry-After recovers on the se
     assert.deepEqual(_summaryRetryDelaysForTest(), [7000]);
 });
 
+for (const [label, header, delays] of [
+    ["empty", "", [1000, 2000]],
+    ["whitespace-only", " \t ", [1000, 2000]],
+    ["explicit zero", "0", [0, 0]],
+] as const) {
+    test(`external summary HTTP: ${label} Retry-After preserves the intended retry delay`, async () => {
+        let hits = 0;
+        _setSummaryRetryDelayForTest(0);
+        await upstream((_req, res) => {
+            hits++;
+            if (hits < 3) { res.writeHead(429, { "retry-after": header }); res.end("rate limited"); return; }
+            res.end(JSON.stringify(completion("responses")));
+        }, async (url) => {
+            const result = await new ExternalSummaryExecutor(1).execute(work, [createSummaryHttpCandidate(target(url), 4096)], budget);
+            assert.equal(result.status, "success");
+        });
+        assert.equal(hits, 3);
+        assert.deepEqual(_summaryRetryDelaysForTest(), delays);
+    });
+}
+
 test("external summary HTTP: a hostile Retry-After is capped so it cannot eat the attempt budget", async () => {
     let hits = 0;
     _setSummaryRetryDelayForTest(0);
