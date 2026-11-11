@@ -260,7 +260,10 @@ export interface CheckpointRow {
      /** #3928: 'active' or 'archived' — archived rows are tombstones kept for
       *  restore (see archiveSession); the CLI surfaces both. */
      status: string;
- }
+  }
+
+/** Boot aliases need identity fields only, without web-list aggregates. */
+export type SessionAliasRow = Pick<SessionSummaryRow, "sessionId" | "label" | "protocol" | "origin" | "updatedAt">;
 
 /** #2960 R2.2: row backing the WEB session list in full mode. Carries the
  *  JSON columns the web summaryOf needs (stats/metadata) plus block
@@ -2930,6 +2933,21 @@ export class UnifiedStore {
      *  parse, no Session hydration. Parity contract with the legacy walk
      *  (export.ts listSessions): display title = host_title ?? title;
      *  display time = latest block created_at; blocks = ALL blocks count. */
+    sessionAliasRows(): SessionAliasRow[] {
+        // Keep the summary query's table-scan order: equal-time alias ties
+        // retain its last-row-wins behavior even with a covering index.
+        const rows = this.db.prepare(
+            "SELECT session_id AS sessionId, label, protocol, origin, updated_at AS updatedAt FROM sessions NOT INDEXED",
+        ).all() as { sessionId: string; label: string | null; protocol: string | null; origin: string | null; updatedAt: number }[];
+        return rows.map((row) => ({
+            sessionId: row.sessionId,
+            label: row.label ?? undefined,
+            protocol: row.protocol ?? undefined,
+            origin: row.origin ?? undefined,
+            updatedAt: row.updatedAt,
+        }));
+    }
+
     sessionSummaries(): SessionSummaryRow[] {
         const rows = this.db
             .prepare(
