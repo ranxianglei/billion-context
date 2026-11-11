@@ -46,6 +46,7 @@ billion-context/
 │   │   └── stream-io.ts          #   Small response-body reader for non-2xx inspection
 │   ├── knobs.ts                  # Single knob resolver: env > config file > default (#2030)
 │   ├── config.ts                 # Config file (billion-context.json) + providers table + loadOptions
+│   ├── model-endpoints.ts         # Declarable custom-wire model endpoints: pattern parse + longest-prefix match, one source feeds proxy classifier + client claim (#1295)
 │   ├── instance.ts               # Live-instance registry record in the proxy-origin file (#394/#403/#417)
 │   ├── port-owner.ts             # Post-bind port-ownership verification + pointer-clobber guard (#2941) + EADDRINUSE holder diagnostics (#4762)
 │   ├── event-loop-watchdog.ts    # Worker-thread event-loop wedge detector: self-exit after 5 min of continuous main-loop silence (#4762)
@@ -68,6 +69,7 @@ billion-context/
 │   ├── wire-body.ts              # Trailing-user-turn append on assembled wire bodies
 │   ├── egress-transforms.ts      # User-registerable egress request-body rewrite pipeline (#6003)
 │   ├── wire-drop-warn.ts         # Warn when a wire codec drops non-text parts (#1205)
+│   ├── commandcode-wire.ts       # commandcode CLI envelope codec: nested openai-completions request unwrap + bare JSONL response handling (#1295)
 │   ├── text-safe.ts              # Surrogate-safe string prefix helper
 │   ├── sse-util.ts               # SSE parsing / line-ending normalization
 │   ├── stream.ts                 # SSE stream utilities + tag patching
@@ -192,6 +194,7 @@ billion-context/
 │   │   ├── index.ts              #   Stream-failure presentation options (#1455)
 │   │   ├── core.ts               #   Protocol-neutral event model + tool adjudication
 │   │   ├── adapter-anthropic.ts  #   Anthropic wire adapter
+│   │   ├── adapter-commandcode.ts #   commandcode wire adapter: envelope unwrap/re-wrap over the OpenAI-family loop (#1295)
 │   │   ├── adapter-openai.ts     #   OpenAI chat adapter
 │   │   ├── adapter-responses.ts  #   Responses API adapter (+ over-long id healing)
 │   │   ├── adapter-google.ts     #   Google wire adapter

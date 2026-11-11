@@ -6,6 +6,7 @@ import { applyOrderSnapshot, orderSnapshot, type OrderSkeletonEntry } from "./se
 import { stateDir } from "./paths.js";
 import { log } from "./logger.js";
 import { openSnapshotJournal } from "./snapshot-journal.js";
+import { persistDebounceMs, persistMaxDelayMs } from "./knobs.js";
 import { kvStore } from "./persist.js";
 
 /**
@@ -26,10 +27,10 @@ import { kvStore } from "./persist.js";
  */
 
 // Same quiesce/max-delay discipline as #1834's affinity persistence: a busy
-// proxy must not starve the write indefinitely, and disk stays within ~500ms
-// of the last mutation (or 5s under sustained traffic).
-const PERSIST_DEBOUNCE_MS = 500;
-const PERSIST_MAX_DELAY_MS = 5_000;
+// proxy must not starve the write indefinitely. Both windows resolve through
+// the shared persist.* knobs (#6058 QLC field report: under sustained traffic
+// the 5s max-delay cap set the steady-state rewrite rate, so tuning only the
+// debounce window changed nothing); defaults keep the historical 500ms / 5s.
 const MAX_ORDER_ENTRIES = 1024;
 const MAX_SNAPSHOT_BYTES = 8 * 1024 * 1024;
 
@@ -306,7 +307,7 @@ export function scheduleOrderPersist(): void {
     const now = Date.now();
     if (pendingSince === null) pendingSince = now;
     if (timer) clearTimeout(timer);
-    const budget = PERSIST_MAX_DELAY_MS - (now - pendingSince);
+    const budget = persistMaxDelayMs() - (now - pendingSince);
     timer = setTimeout(
         () => {
             timer = null;
@@ -319,7 +320,7 @@ export function scheduleOrderPersist(): void {
                 writeSnapshotLegacy();
             }
         },
-        Math.max(0, Math.min(PERSIST_DEBOUNCE_MS, budget)),
+        Math.max(0, Math.min(persistDebounceMs(), budget)),
     );
     timer.unref?.();
 }

@@ -251,11 +251,13 @@ pi-subagents(pi.dev 上的包)为前台/后台子代理运行派生**子会话**
 | **Void** | 自定义 OpenAI 兼容端点设置 |
 | **Cursor**(单模型通道) | Settings → Models → OpenAI API key → **Override Base URL** |
 | **Warp** | 自定义模型 base URL 设置 |
+| **Command Code**(`cmd`,commandcode.ai) | `~/.commandcode/providers.json` —— 各 provider(及模型级)`baseURL`(密钥在 `auth.json`,不在这个文件) |
 
 注意:
 
 - **Crush** 已有启动器车道——直接用 `bili crush`(配置零改动,HTTPS 域自动 MITM)。
 - **Zed** 也已有启动器车道——直接用 `bili zed`(Linux;配置零改动,模型域自动 MITM,环回 provider 保持直连)。上面的 settings.json `api_url` 路径仍是跨平台替代。
+- **Command Code**:上表一行覆盖其 BYOK 模型(标准 wire,今天就能压缩)。其目录/网关套餐走自定义 wire(`POST /alpha/generate`),逐字节中继不压缩——见[下文](#未识别的端点直连什么都不压缩1290)「未识别的端点直连、什么都不压缩」一节;可声明 wire 的修复追踪在 #1295。
 - **账号登录**型客户端(OAuth/订阅)通常焊死端点——前缀技巧不适用,改看[下方 MITM 节](#客户端用-httpproxyconnect接入但从不压缩)。
 - 纯 **web 应用**(只在浏览器里的产品)本地没有流量可截。
 - VS Code 扩展的 baseURL 字段在明文设置里,密钥在系统钥匙串——这里只需要改 baseURL。
@@ -286,7 +288,7 @@ bili 只压缩路径匹配已知 wire 协议(`/chat/completions`、`/llm_raw_cha
 
 ## OpenCode
 
-同一个内置插件同时服务两代 OpenCode:agent 文件同时保留 V1 `server()` 与 V2 `setup()` 导出 —— ≥ 1.18.29 的 1.x 宿主加载 V1 形状,2.x 宿主加载 V2 `setup()`。独立扩展 [`opencode-acp`](https://github.com/ranxianglei/opencode-acp) 仅支持 V1,在 2.x 下**不加载** —— 对 OpenCode 2.x,**billion-context 是推荐的上下文管理方案**。以下均在 `@opencode/cli` 2.0.3 上端到端验证过(V1 泳道:1.14.46 与 1.18.31)。
+同一个内置插件同时服务两代 OpenCode:agent 文件同时保留 V1 `server()` 与 V2 `setup()` 导出 —— ≥ 1.18.29 的 1.x 宿主加载 V1 形状,2.x 宿主加载 V2 `setup()`。独立扩展 [`opencode-acp`](https://github.com/ranxianglei/opencode-acp) 仅支持 V1,在 2.x 下**不加载** —— 对 OpenCode 2.x,**billion-context 是推荐的上下文管理方案**。以下均在 `@opencode/cli` 2.1.0 上端到端验证过(V1 泳道:1.14.46 与 1.18.31)。
 
 | 路径 | 命令 | 适用 |
 |---|---|---|
@@ -306,7 +308,7 @@ HTTPS 走证书 MITM,HTTP 走临时 `opencode.json` 副本(`/bili/` 改写;JSONC
 
 ### 原生(免启动器)—— `bili plugin install opencode`
 
-在真实 opencode 配置里注册一个自拉起插件并设 `compaction.auto: false`,之后直接跑 `opencode` 即可。默认不加 MCP 面(原生插件已提供会话绑定的 bili 工具);需要就传 `--with-mcp` —— 该条目不带 origin 钉扎,能扛过插件临时端口的代理重启(#926)。条目形态取决于**本 bili 自身的安装来源**:**npm 安装**写裸包名(`"plugin": ["billion-context"]`)—— 包经 `exports["./server"]` → `dist/agent/opencode-native.js` 暴露插件入口,opencode 用自己的 Npm.add 机制加载、自行管理安装与升级;零绝对路径、可跨机。(这个裸包名条目也可以不经 bili 直接手写进配置 —— 见 README 快速上手 方式 1。)**git checkout / 开发构建**回退到本机 shim 目录(`<configDir>/plugins/billion-context/index.js` → 该 checkout 的 `dist/agent/opencode-native.js`)—— 按构造即机器本地;之后改用 npm 安装再跑一次 install 会把条目迁回裸包名。
+在真实 opencode 配置里注册一个自拉起插件并设 `compaction.auto: false`,之后直接跑 `opencode` 即可。默认不加 MCP 面(原生插件已提供会话绑定的 bili 工具);需要就传 `--with-mcp` —— 该条目不带 origin 钉扎,能扛过插件临时端口的代理重启(#926)。条目形态取决于**宿主代次**和**本 bili 自身的安装来源**。**OpenCode 1.x + npm 安装**写裸包名(`"plugin": ["billion-context"]`)—— 包经 `exports["./server"]` → `dist/agent/opencode-native.js` 暴露插件入口,opencode 用自己的 Npm.add 机制加载、自行管理安装与升级;零绝对路径、可跨机。(这个裸包名条目也可以不经 bili 直接手写进配置 —— 见 README 快速上手 方式 1。)在 **OpenCode 2.x 宿主**上 —— 以及任何 **git checkout / 开发构建** —— 改写本机 shim 目录(`<configDir>/plugins/billion-context/index.js` → 本次安装的 `dist/agent/opencode-native.js`):2.x 按包的 `main` 字段(`dist/index.js`,是 CLI、没有插件定义)解析裸包名,所以裸包名在那里永远加载不出来(#3976);重跑 install(或重装到新路径)会重新生成指向当前根的 shim,2.x 配置里遗留的裸包名条目也会被自动迁移为 shim。
 
 加载时插件自拉起自己的代理(健康的已有实例直接复用不重复起;父进程 pid 看门狗在 opencode 退出时收掉它),把模型流量路由到 `<proxy>/bili/<upstream-url>`,暴露与启动器模式相同的原生 bili 工具 —— 无固定端口、无环境变量、免启动器。退出:`BILI_NATIVE_OPENCODE=0`。若没有任何代理能拉到健康状态,请求直连(不压缩)并给一次性告警,之后自动恢复。在 `bili opencode` 启动下该条目整体跳过(代理归启动器管)。
 
