@@ -543,6 +543,80 @@ export const WEB_CLIENT = `(function () {
         if (!p || p === "unknown") return '<span class="dim small">' + escapeHtml(t("protocol.unmarked")) + "</span>";
         return '<span class="badge proto">' + escapeHtml(p) + "</span>";
     }
+    function bindSessionColumns() {
+        document.querySelectorAll(".twide table.data").forEach((table) => {
+            const cols = Array.from(table.querySelectorAll("col"));
+            const headers = Array.from(table.querySelectorAll("thead th"));
+            headers.forEach((header, index) => {
+                if (index === headers.length - 1) return;
+                const label = () => t("ses.resize_column") + ": " + header.textContent;
+                const existing = header.querySelector(".col-resize");
+                if (existing) {
+                    existing.title = t("ses.resize_column");
+                    existing.setAttribute("aria-label", label());
+                    return;
+                }
+                const handle = document.createElement("button");
+                handle.type = "button";
+                handle.className = "col-resize";
+                handle.title = t("ses.resize_column");
+                handle.setAttribute("aria-label", label());
+                const start = () => {
+                    const widths = headers.map((cell) => cell.getBoundingClientRect().width);
+                    const total = table.getBoundingClientRect().width;
+                    table.style.width = total + "px";
+                    table.style.minWidth = "100%";
+                    widths.forEach((width, i) => { if (width > 0) cols[i].style.width = width + "px"; });
+                    table.classList.add("columns-resized");
+                    return widths;
+                };
+                const resize = (initial, delta) => {
+                    const widths = initial.slice();
+                    const direction = delta >= 0 ? 1 : -1;
+                    const receiver = direction > 0 ? index : initial.findIndex((width, i) => i > index && width > 0);
+                    if (receiver < 0 || initial[receiver] <= 0) return;
+                    let remaining = Math.abs(delta);
+                    let transferred = 0;
+                    for (let i = direction > 0 ? index + 1 : index; i >= 0 && i < widths.length; i += direction) {
+                        const available = Math.max(0, initial[i] - (i === 0 ? 120 : 48));
+                        const amount = Math.min(remaining, available);
+                        widths[i] -= amount;
+                        transferred += amount;
+                        remaining -= amount;
+                        if (remaining === 0) break;
+                    }
+                    widths[receiver] += transferred;
+                    widths.forEach((width, i) => { if (initial[i] > 0) cols[i].style.width = width + "px"; });
+                };
+                handle.addEventListener("pointerdown", (ev) => {
+                    if (ev.button !== 0) return;
+                    ev.preventDefault();
+                    try { handle.setPointerCapture(ev.pointerId); } catch (err) {}
+                    let initial = null;
+                    const move = (e) => {
+                        if (!initial) initial = start();
+                        resize(initial, e.clientX - ev.clientX);
+                    };
+                    const stop = () => {
+                        handle.removeEventListener("pointermove", move);
+                        handle.removeEventListener("pointerup", stop);
+                        handle.removeEventListener("pointercancel", stop);
+                        handle.removeEventListener("lostpointercapture", stop);
+                    };
+                    handle.addEventListener("pointermove", move);
+                    handle.addEventListener("pointerup", stop);
+                    handle.addEventListener("pointercancel", stop);
+                    handle.addEventListener("lostpointercapture", stop);
+                });
+                handle.addEventListener("keydown", (ev) => {
+                    if (ev.key !== "ArrowLeft" && ev.key !== "ArrowRight") return;
+                    ev.preventDefault();
+                    resize(start(), ev.key === "ArrowRight" ? 20 : -20);
+                });
+                header.appendChild(handle);
+            });
+        });
+    }
     function hydrate() {
         document.documentElement.lang = locale;
         document.querySelectorAll("[data-i18n]").forEach((el) => { el.textContent = t(el.getAttribute("data-i18n")); });
@@ -550,6 +624,7 @@ export const WEB_CLIENT = `(function () {
         document.querySelectorAll("[data-i18n-title]").forEach((el) => { el.setAttribute("title", t(el.getAttribute("data-i18n-title"))); });
         const tog = $("language-toggle");
         if (tog) tog.textContent = locale === "zh-CN" ? "English" : "中文";
+        bindSessionColumns();
     }
 
     const PAGES = ["overview", "sessions", "config", "updates", "connect", "logs", "blog"];
@@ -1086,8 +1161,13 @@ function changelogCatOf(rawLine) {
         try {
             const r = await json(API_ROOT + "/update/check", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
             if (r.already) showUpdateResult(t("up.already_in_flight"), true);
-            else if (r.ok) showUpdateResult(t("up.check_ok"), true);
-            else showUpdateResult(String(r.error || t("toast.failed", { msg: "check failed" })), false);
+            else if (!r.ok) showUpdateResult(String(r.error || t("toast.failed", { msg: "check failed" })), false);
+            else if (r.status === "update-available") showUpdateResult(t("up.check_available", { v: String(r.candidate || r.latest || "") }), true);
+            else if (r.status === "up-to-date") showUpdateResult(t("up.check_up_to_date"), true);
+            else if (r.status === "blocked-advisory") showUpdateResult(t("up.check_blocked", { v: String(r.latest || "") }), true);
+            else if (r.status === "deferred-advisory") showUpdateResult(t("up.check_deferred"), true);
+            else if (r.note) showUpdateResult(String(r.note), true);
+            else showUpdateResult(t("up.check_ok"), true);
         } catch (e) {
             showUpdateResult(e.message, false);
         } finally {
@@ -1602,6 +1682,9 @@ function changelogCatOf(rawLine) {
                 if (!n || typeof n !== "object" || typeof n.id !== "string") continue;
                 const el = document.createElement("div");
                 el.className = "banner " + (n.tone === "ok" ? "ok" : n.tone === "warn" ? "warn" : "");
+                // .banner is display:none until .show — #5548's loop never added it,
+                // so every merged notice (builtin + file + feed) rendered invisibly.
+                el.classList.add("show");
                 el.dataset.id = n.id;
                 nr.appendChild(el);
                 if (n.source !== "builtin") {
@@ -2314,7 +2397,7 @@ function changelogCatOf(rawLine) {
         if (name === "bash" || name === "shell" || name === "run_command") return "t-shell";
         if (name === "read" || name === "write" || name === "edit" || name === "ls" || name === "glob" || name === "note") return "t-file";
         if (name === "grep" || name === "search_context" || name === "decompress" || name === "acp_retrieve") return "t-seek";
-        if (name === "compress" || name === "acp_status" || name === "acp_cache") return "t-fold";
+        if (name === "compress" || name === "acp_status" || name === "acp_cache" || name === "acp_retire" || name === "acp_restore" || name === "acp_rewrite") return "t-fold";
         return "";
     }
     function parseToolLine(line) {
@@ -3132,6 +3215,14 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         // #2904: no-ceiling output-budget pin — surface at the top of the detail
         // so GUI users see WHY long turns truncate (the /acp twin).
         if (d.outputBudgetDegraded) parts.push('<div class="banner warn show" style="margin-bottom:12px">' + escapeHtml(t("det.obudget_degraded", { model: d.outputBudgetDegraded.model, value: d.outputBudgetDegraded.value })) + "</div>");
+        if (d.contextAnalysis && d.contextAnalysis.text) {
+            // Context analysis: init size / nudge cadence / harvest acceptance /
+            // plain-language verdict — the question that used to take hours of
+            // manual log forensics (session-aedc188c investigation, 2026-11-08).
+            const ca = d.contextAnalysis;
+            const lines = ca.text.split("\\n").map((l) => "<div>" + escapeHtml(l) + "</div>");
+            parts.push('<div class="card" style="margin-top:16px"><div class="card-h"><span>' + t("det.context_analysis") + '</span><span class="hint">' + t("det.context_analysis_hint") + '</span></div><div class="card-b"><div class="mono small" style="line-height:1.8">' + lines.join("") + '</div></div></div>');
+        }
         if (Array.isArray(d.conflicts) && d.conflicts.length > 0) {
             // #2102: per-session evidence rows — the banner aggregates across sessions,
             // so this page is where its detail pointer lands.
@@ -3889,6 +3980,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         function compressOf(d) { return (d.compress && typeof d.compress === "object" && !Array.isArray(d.compress)) ? d.compress : null; }
         const NUDGE_DEFAULT = 50000, NUDGE_STEP = 5000, NUDGE_LOW = 20000, NUDGE_HIGH = 100000;
         const PRM_KERNEL_DEFAULT = 3;
+        const SUMFLOOR_DEFAULT = 50;
         const brokenNote = document.createElement("div");
         brokenNote.style.cssText = "min-height:16px;font-size:12px;color:#cf222e";
         box.appendChild(brokenNote);
@@ -3912,7 +4004,6 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             tsRow.inp.checked = cp ? cp.messageTimestamps !== false : true;
             const ab = (cp && cp.absorb && typeof cp.absorb === "object" && !Array.isArray(cp.absorb)) ? cp.absorb : null;
             abRow.inp.checked = ab ? ab.enabled === true : false;
-            cafRow.inp.checked = cp ? cp.compressAtFoldPoint === true : false;
             rnRow.inp.checked = cp ? cp.requireNudge === true : false;
             rrRow.inp.checked = cp ? cp.requireRecommendation === true : false;
             const pv = (cp && typeof cp.promptPack === "string") ? cp.promptPack : "default";
@@ -3970,6 +4061,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             updateNudgeNote();
             refreshTierInputs();
             prm.value = String(cp && typeof cp.preserveRecentMessages === "number" ? cp.preserveRecentMessages : PRM_KERNEL_DEFAULT);
+            sumfloor.value = String(cp && typeof cp.minSummaryLength === "number" ? cp.minSummaryLength : SUMFLOOR_DEFAULT);
             ptInp.value = (cp && Array.isArray(cp.protectedTools)) ? cp.protectedTools.join(", ") : "";
             const nv = (cp && Array.isArray(cp.neverPreserveRecentTools)) ? cp.neverPreserveRecentTools : null;
             neInp.value = nv ? nv.filter((x) => typeof x === "string").join(", ") : "";
@@ -4138,26 +4230,6 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             }
         }));
         void tsRow.ctl;
-        // #5470 fold-point carrier relocation — default OFF (opt-in); uncheck
-        // deletes the key so the file stays clean (mirrors the absorb row).
-        const cafRow = row("quick-compress-at-fold-point", t("cfg.q_cafp"));
-        qCtrls.push(cafRow.inp);
-        cafRow.inp.addEventListener("change", () => commit((d) => {
-            if (cafRow.inp.checked) {
-                if (!compressOf(d)) d.compress = {};
-                d.compress.compressAtFoldPoint = true;
-            } else {
-                const c = compressOf(d);
-                if (c) {
-                    delete c.compressAtFoldPoint;
-                    if (Object.keys(c).length === 0) delete d.compress;
-                }
-            }
-        }));
-        const cafHint = document.createElement("span");
-        cafHint.className = "dim small";
-        cafHint.textContent = t("cfg.q_cafp_hint");
-        cafRow.ctl.appendChild(cafHint);
         const pw = document.createElement("div");
         pw.style.cssText = "display:flex;gap:12px;align-items:center;flex-wrap:wrap";
         const plab = document.createElement("label");
@@ -4760,6 +4832,17 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             if (!isNaN(v) && v > 0 && v !== PRM_KERNEL_DEFAULT) d.compress.preserveRecentMessages = v;
             else { delete d.compress.preserveRecentMessages; prm.value = String(PRM_KERNEL_DEFAULT); }
         }));
+        const sumfloor = textRow("quick-sumfloor", t("cfg.q_sumfloor"), t("cfg.q_sumfloor_ph"));
+        sumfloor.type = "number";
+        sumfloor.min = "0";
+        sumfloor.style.flex = "0 0 140px";
+        qCtrls.push(sumfloor);
+        sumfloor.addEventListener("change", () => commit((d) => {
+            if (!compressOf(d)) d.compress = {};
+            const v = parseInt(sumfloor.value, 10);
+            if (!isNaN(v) && v >= 0 && v !== SUMFLOOR_DEFAULT) d.compress.minSummaryLength = v;
+            else { delete d.compress.minSummaryLength; sumfloor.value = String(SUMFLOOR_DEFAULT); }
+        }));
         const NEVER_DEFAULT = ["decompress", "search_context", "read", "bash"];
         const neInp = textRow("quick-never", t("cfg.q_never"), t("cfg.q_never_ph"));
         qCtrls.push(neInp);
@@ -4983,6 +5066,9 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             $("log-count").textContent = d.total > 0
                 ? t("logs.count", { n: (d.lines || []).length, total: d.total }) + ((typeof d.omitted === "number" && d.omitted > 0) ? t("logs.omitted", { o: d.omitted }) : "")
                 : "";
+            if (Array.isArray(d.unreadable) && d.unreadable.length > 0) {
+                $("log-count").textContent += " · " + t("logs.incomplete", { n: d.unreadable.length });
+            }
             const bodyEl = $("log-body");
             const rows = d.lines || [];
             if (!rows.length) {
@@ -5090,47 +5176,36 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         if (lsearch) lsearch.addEventListener("input", () => { clearTimeout(logTimer); logTimer = setTimeout(loadLogs, 400); });
         const llines = $("log-lines");
         if (llines) llines.addEventListener("change", loadLogs);
-        const ldl = $("log-dl");
-        if (ldl) ldl.addEventListener("click", async () => {
-            busy(ldl, true);
-            try {
-                const q = ($("log-search").value || "").trim();
-                const r = await fetch(API_ROOT + "/logs?raw=1&q=" + encodeURIComponent(q) + "&lines=2000" + logViewExtras());
-                const blob = await r.blob();
-                const a = document.createElement("a");
-                a.href = URL.createObjectURL(blob);
-                a.download = "billion-context-log.txt";
-                document.body.appendChild(a);
-                a.click();
-                a.remove();
-                setTimeout(() => URL.revokeObjectURL(a.href), 4000);
-            } catch (e) {
-                toast(t("toast.failed", { msg: e.message }), "err");
-            } finally {
-                busy(ldl, false);
-            }
-        });
-        const ldlAll = $("log-dl-all");
-        if (ldlAll) ldlAll.addEventListener("click", async () => {
-            busy(ldlAll, true);
-            try {
-                // Full unfiltered log (rotated .old + current) regardless of the
-                // search box — the honest "download everything" path.
-                const r = await fetch(API_ROOT + "/logs?raw=1&all=1");
-                const blob = await r.blob();
-                const a = document.createElement("a");
-                a.href = URL.createObjectURL(blob);
-                a.download = "billion-context-full-log.txt";
-                document.body.appendChild(a);
-                a.click();
-                a.remove();
-                setTimeout(() => URL.revokeObjectURL(a.href), 4000);
-            } catch (e) {
-                toast(t("toast.failed", { msg: e.message }), "err");
-            } finally {
-                busy(ldlAll, false);
-            }
-        });
+        for (const id of ["log-ctx", "log-win"]) {
+            const control = $(id);
+            if (control) control.addEventListener("change", loadLogs);
+        }
+        for (const [buttonId, all] of [["log-dl", false], ["log-dl-all", true]]) {
+            const button = $(buttonId);
+            if (button) button.addEventListener("click", async () => {
+                busy(button, true);
+                try {
+                    const q = ($("log-search").value || "").trim();
+                    const query = all ? "raw=1&all=1" : "raw=1&q=" + encodeURIComponent(q) + "&lines=2000" + logViewExtras();
+                    const response = await fetch(API_ROOT + "/logs?" + query);
+                    if (!response.ok) throw new Error("HTTP " + response.status);
+                    const unreadable = response.headers.get("x-bili-log-incomplete");
+                    if (unreadable) toast(t("logs.incomplete", { n: unreadable }), "err");
+                    const blob = await response.blob();
+                    const a = document.createElement("a");
+                    a.href = URL.createObjectURL(blob);
+                    a.download = all ? "billion-context-full-log.txt" : "billion-context-log.txt";
+                    document.body.appendChild(a);
+                    a.click();
+                    a.remove();
+                    setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+                } catch (e) {
+                    toast(t("toast.failed", { msg: e.message }), "err");
+                } finally {
+                    busy(button, false);
+                }
+            });
+        }
         const testBtn = $("test-upstream");
         if (testBtn) testBtn.addEventListener("click", async () => {
             busy(testBtn, true);
