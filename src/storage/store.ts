@@ -359,7 +359,7 @@ export interface IngestSessionInput {
 const EXT_KEY_MAX = 256;
 const EXT_VALUE_MAX_BYTES = 4 * 1024 * 1024;
 
-function validateExtKey(value: string, what: string): void {
+export function validateExtKey(value: string, what: string): void {
     if (typeof value !== "string" || value.length === 0 || value.length > EXT_KEY_MAX) {
         throw new Error(`[storage] extension ${what} must be a non-empty string of at most ${EXT_KEY_MAX} characters`);
     }
@@ -371,12 +371,12 @@ function validateExtKey(value: string, what: string): void {
     }
 }
 
-function serializeExtValue(value: unknown): string {
+export function serializeExtValue(value: unknown): string {
     const json = JSON.stringify(value);
     if (json === undefined) {
         throw new Error("[storage] extension values must be JSON-serializable (undefined/functions are not)");
     }
-    if (json.length > EXT_VALUE_MAX_BYTES) {
+    if (Buffer.byteLength(json, "utf8") > EXT_VALUE_MAX_BYTES) {
         throw new Error(`[storage] extension value exceeds ${EXT_VALUE_MAX_BYTES} bytes — store large payloads in the content CAS instead`);
     }
     return json;

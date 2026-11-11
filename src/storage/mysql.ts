@@ -39,7 +39,7 @@ import type { Pool, PoolConnection, PoolOptions } from "mysql2/promise";
 import { mkdirSync, appendFileSync, readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { log as loggerLog } from "../logger.js";
-import { sha256Hex, viewPointerSeqs, rewriteArchiveLog } from "./store.js";
+import { sha256Hex, viewPointerSeqs, rewriteArchiveLog, validateExtKey, serializeExtValue } from "./store.js";
 import { identityOfStoredContent } from "./identity.js";
 import type { MessageContentStore } from "acp-kernel";
 import type { StorageBackend, StorageReadView } from "./backend.js";
@@ -2137,7 +2137,9 @@ export class MysqlBackend implements StorageBackend {
     // --- session_ext / kv --------------------------------------------------
 
     async setSessionExt(sessionId: string, key: string, value: unknown): Promise<void> {
-        const valueJson = JSON.stringify(value);
+        validateExtKey(sessionId, "session id");
+        validateExtKey(key, "key");
+        const valueJson = serializeExtValue(value);
         await this.pool.query(
             "INSERT INTO session_ext (session_id, ext_key, value_json, updated_at) VALUES (?, ?, ?, ?) " +
                 "ON DUPLICATE KEY UPDATE value_json = VALUES(value_json), updated_at = VALUES(updated_at)",
@@ -2146,6 +2148,8 @@ export class MysqlBackend implements StorageBackend {
     }
 
     async getSessionExt(sessionId: string, key: string): Promise<unknown> {
+        validateExtKey(sessionId, "session id");
+        validateExtKey(key, "key");
         const [rows] = (await this.pool.query(
             "SELECT value_json FROM session_ext WHERE session_id = ? AND ext_key = ?",
             [sessionId, key],
@@ -2154,6 +2158,7 @@ export class MysqlBackend implements StorageBackend {
     }
 
     async listSessionExt(sessionId: string): Promise<{ key: string; value: unknown; updatedAt: number }[]> {
+        validateExtKey(sessionId, "session id");
         const [rows] = (await this.pool.query(
             "SELECT ext_key, value_json, updated_at FROM session_ext WHERE session_id = ? ORDER BY ext_key",
             [sessionId],
@@ -2162,6 +2167,8 @@ export class MysqlBackend implements StorageBackend {
     }
 
     async deleteSessionExt(sessionId: string, key?: string): Promise<number> {
+        validateExtKey(sessionId, "session id");
+        if (key !== undefined) validateExtKey(key, "key");
         if (key === undefined) {
             const [r] = (await this.pool.query("DELETE FROM session_ext WHERE session_id = ?", [sessionId])) as unknown as [{ affectedRows: number }, unknown];
             return r.affectedRows;
@@ -2171,7 +2178,9 @@ export class MysqlBackend implements StorageBackend {
     }
 
     async setKv(namespace: string, key: string, value: unknown): Promise<void> {
-        const valueJson = JSON.stringify(value);
+        validateExtKey(namespace, "namespace");
+        validateExtKey(key, "key");
+        const valueJson = serializeExtValue(value);
         await this.pool.query(
             "INSERT INTO kv_store (namespace, kv_key, value_json, updated_at) VALUES (?, ?, ?, ?) " +
                 "ON DUPLICATE KEY UPDATE value_json = VALUES(value_json), updated_at = VALUES(updated_at)",
@@ -2180,6 +2189,8 @@ export class MysqlBackend implements StorageBackend {
     }
 
     async getKv(namespace: string, key: string): Promise<unknown> {
+        validateExtKey(namespace, "namespace");
+        validateExtKey(key, "key");
         const [rows] = (await this.pool.query(
             "SELECT value_json FROM kv_store WHERE namespace = ? AND kv_key = ?",
             [namespace, key],
@@ -2191,10 +2202,12 @@ export class MysqlBackend implements StorageBackend {
         const where: string[] = [];
         const args: unknown[] = [];
         if (namespace !== undefined) {
+            validateExtKey(namespace, "namespace");
             where.push("namespace = ?");
             args.push(namespace);
         }
         if (keyPrefix !== undefined && keyPrefix !== "") {
+            validateExtKey(keyPrefix, "key prefix");
             where.push("kv_key LIKE CONCAT(?, '%')");
             args.push(keyPrefix.replace(/[\\%_]/g, (ch) => "\\" + ch));
         }
@@ -2207,6 +2220,8 @@ export class MysqlBackend implements StorageBackend {
     }
 
     async deleteKv(namespace: string, key?: string): Promise<number> {
+        validateExtKey(namespace, "namespace");
+        if (key !== undefined) validateExtKey(key, "key");
         if (key === undefined) {
             const [r] = (await this.pool.query("DELETE FROM kv_store WHERE namespace = ?", [namespace])) as unknown as [{ affectedRows: number }, unknown];
             return r.affectedRows;
