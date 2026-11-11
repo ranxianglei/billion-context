@@ -52,11 +52,12 @@ The unified-store `messages.msg_id` column is the ONLY id truth: ingestion pins 
 
 | Consumer | Location | Question answered | Id-usage boundary |
 |---|---|---|---|
-| ① storage-column identity | unified store `messages.msg_id` | join key for every settle/reconcile path | the single identity-space entry point; the other four's id evidence ultimately folds in here |
+| ① storage-column identity | unified store `messages.msg_id` | join key for every settle/reconcile path | the single identity-space entry point; the other five's id evidence ultimately folds in here |
 | ② session-resolve last-resort rung #5719 | tryMsgIdRescue (src/session-resolve.ts ~:324; fork-exit call sites ~:432/:481/:501) | after bytes/tag evidence was destroyed (compaction deleted cells, system rewrite deleted fragments), is this request the SAME session? | ANY id overlap under the same raw key ⇒ same session; NOTE: no LANE attribution (§7 boundary B) |
 | ③ settlement membership probe #4805 | probeRequestMembership (src/request-membership.ts; call sites src/server/prepare-openai.ts:597, prepare-anthropic.ts:640; consumed cache-ledger.ts:1866) | was this id admitted by this session's ledger? needle = latest admitted id | **pure evidence — never enters the identity space**, never re-keys/forks; worst case one unsettled cycle, self-heals |
 | ④ incremental-lane canonical rows #4491/#4834 | src/incremental-lane.ts (validateMsgIds :623, claim-reuse 400 :628, cache-control rekey :631-635; dsh-side burned-claim pre-screen ~:2584) | which canonical rows did this delta turn append? | claim semantics: re-sent claimed id = retry-storm signal, turn 400s |
 | ⑤ watermark tail continuity v2-v4 #5403/#5418 | PF_TAIL_IDS_HEADER (src/server/fastpath.ts:48) | does the client's delta window still originate where the server seed says? | under v4 width self-consistency (len=T−K+1, re-verified server-side) the count echo degrades to diagnostic-only; ids prove WINDOW ORIGIN ONLY, never prefix integrity (owner ruling 2026-11-02; §7.4 blind spot stands, §7 boundary A) |
+| ⑥ fork-adopt msgid track #6262 | tryForkAdoption(src/agent/fork-adopt.ts — client slot-matches collected host ids against the parent snapshot's rawIds) + handlePluginFork(src/plugin.ts — request.prefixMsgIds[k] === prefix[k].rawId over the child's resent prefix) | after a byte drift (host rewrite/re-render of an earlier message), is this prefix still the parent session's? | compared ONLY against rawId — never enters the identity space, never re-keys; ANY mismatch ⇒ silent fallback to the strict byte fork (fields ignored); malformed field shape ⇒ 400 INVALID_REQUEST; reuses identifier(), no new validation copy (§4) |
 
 ## 7. Trust boundaries (declared as part of the contract, not bugs)
 

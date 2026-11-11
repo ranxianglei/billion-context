@@ -1,7 +1,7 @@
 # 消息身份公用设施:sessionid+msgid 的生产与消费地图
 
 > 状态:#5826 release review(2026-11-07)owner 裁定落地的缺口修复配套文档。
-> 身份层级教义见根目录 message-identity.md 与会话侧 session-identity.md;本文只负责一件事——把 **sessionid+msgid 这套跨车道的公用设施**的生产端、传输形态、校验副本、持久化单一事实源、五个消费方、信任边界,一次说明白。改动任何一处之前先读这里。
+> 身份层级教义见根目录 message-identity.md 与会话侧 session-identity.md;本文只负责一件事——把 **sessionid+msgid 这套跨车道的公用设施**的生产端、传输形态、校验副本、持久化单一事实源、六个消费方、信任边界,一次说明白。改动任何一处之前先读这里。
 
 ## 1. 这是什么
 
@@ -49,15 +49,16 @@
 
 统一存储 `messages.msg_id` 列是唯一 id 事实源:ingest 时把校验过的 id 钉进行(T5 裁定:无双平行 ledger、skeleton 行不携 id)。账本主键 `(session_id, msg_id, content_hash)`;canonical 行按 **MSGID 而非内容 hash** 键控(#4491);fork 克隆保号(#4316 L3 PR3/3 `cloneSessionRows`)。
 
-## 6. 消费方(五个,id 各自回答什么问题)
+## 6. 消费方(六个,id 各自回答什么问题)
 
 | 消费方 | 位置 | 回答的问题 | id 使用边界 |
 |---|---|---|---|
-| ① 存储列身份 | unified store `messages.msg_id` | settle/reconcile 一切 join 的主键 | 唯一身份空间入口,其余四方的 id 证据最终都折到这里 |
+| ① 存储列身份 | unified store `messages.msg_id` | settle/reconcile 一切 join 的主键 | 唯一身份空间入口,其余五方的 id 证据最终都折到这里 |
 | ② session-resolve 最后一档 #5719 | tryMsgIdRescue(src/session-resolve.ts ~:324;fork-exit 调用点 ~:432/:481/:501) | 字节/标签证据被压缩或 system 重写摧毁后,这条请求还是不是既有会话? | 同一 raw key 下**任意 id 重叠 ⇒ 认定同会话**;注意它不做 lane 归属判定(§7 边界 B) |
 | ③ 结算 membership 探针 #4805 | probeRequestMembership(src/request-membership.ts;调用点 src/server/prepare-openai.ts:597、prepare-anthropic.ts:640;消费 cache-ledger.ts:1866) | 这个 id 是否已被本会话账本准入?needle = 最近准入 id | **纯证据,永不进身份空间**、永不 re-key/fork;误伤仅致一轮结算未决,自癒 |
 | ④ 增量车道 canonical 行 #4491/#4834 | src/incremental-lane.ts(validateMsgIds :623、认领复用 400 :628、cache-control rekey :631-635;dsh 侧 burned-claim 预筛 ~:2584) | 本轮增量追加了哪些正史行? | 认领语义:已认领 id 再上行=重试风暴信号,整回合 400 |
 | ⑤ 水位尾连续性 v2-v4 #5403/#5418 | PF_TAIL_IDS_HEADER(src/server/fastpath.ts:48) | 客户端 delta 窗口的起点还和服务端 seed 对齐吗? | v4 宽度自洽(len=T−K+1,服务端重验)时计数回声降为纯诊断;id 只证**窗口来源**,永不证前缀完整性(owner 裁定 2026-11-02;§7.4 盲点照旧,§7 边界 A) |
+| ⑥ fork 收养 msgid 轨 #6262 | tryForkAdoption(src/agent/fork-adopt.ts——客户端逐格比对采集到的宿主 id 与父快照 rawId)+ handlePluginFork(src/plugin.ts——request.prefixMsgIds[k] === prefix[k].rawId,对子会话重发前缀逐格验) | 字节漂移(宿主改写/重渲染了较早消息)之后,这段前缀还是不是父会话的? | 只与 rawId 比对——永不进身份空间、永不 re-key;任一失配 ⇒ 静默回退严格字节 fork(附加字段忽略);字段形状非法 ⇒ 400 INVALID_REQUEST;复用 identifier(),无新增校验副本(§4) |
 
 ## 7. 信任边界(声明为契约的一部分,不是 bug)
 
