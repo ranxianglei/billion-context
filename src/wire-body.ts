@@ -10,7 +10,7 @@ import { normalizeGoogleUserPartOrder, type GooglePart } from "acp-kernel/wire";
  *  MERGED into the last user turn when there is one and a fresh user turn is
  *  started only when there is not.
  *
- *  Returns null when the body is unparseable or carries no turn array — the
+ *  Returns null when the body is unparseable or carries no supported turn input — the
  *  caller skips the mutation rather than sending a body it has mangled. */
 export function appendTrailingUserText(protocol: WireProtocol, body: string | Buffer, text: string, model?: string): string | null {
     const raw = typeof body === "string" ? body : body.toString("utf8");
@@ -22,6 +22,10 @@ export function appendTrailingUserText(protocol: WireProtocol, body: string | Bu
     }
     if (protocol === "responses") {
         const input = obj.input;
+        if (typeof input === "string") {
+            obj.input = `${input}\n\n${text}`;
+            return JSON.stringify(obj);
+        }
         if (!Array.isArray(input)) return null;
         const arr = input as Record<string, unknown>[];
         const last = arr[arr.length - 1];
