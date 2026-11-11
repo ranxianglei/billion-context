@@ -1072,21 +1072,6 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
     }
     let { ranges, diagnostics } = parsed;
     if (ranges.length === 0) {
-        // compressAtFoldPoint v2 pointer echo (kind=already-folded-echo): the
-        // call's content was the relocation ack text of an earlier fold — the
-        // model copied the most recent compress call's rewritten args as its
-        // template (field report on #5949's v2: four identical
-        // content-not-array receipts in 25 minutes, each receipt feeding the
-        // next retry). Nothing is wrong with the format and nothing is
-        // foldable: ack a no-op instead of lecturing. NOT routed through
-        // recordCompressFailure (no repeat-guard counter for the model to
-        // misread as "the user asked N times"), but loop-tracked so a runaway
-        // echo burst still collapses to the #2146 short refusal.
-        if (diagnostics.kind === "already-folded-echo") {
-            const loopGuard = trackLoop ? noteCompressLoopFailure(ctx, "already-folded-echo") : "";
-            ctx.log("[acp-proxy: compress call echoed a fold-point relocation pointer (compressAtFoldPoint v2) — acked as no-op]");
-            return compressResult(`[bili: nothing was compressed — the text you sent is the relocation pointer of an earlier, already-completed fold (its summary lives at its fold point in the history). Do not re-send it. To fold NEW consumed ranges, issue one compress call whose content holds fresh 'mNNNNN–mNNNNN optional topic' header lines with their summaries.]${loopGuard}`, "refused", 0, "already-folded-echo");
-        }
         ctx.log("[acp-proxy: compress call had no valid ranges; nothing compressed.]");
         const rawReasons = diagnostics.invalidReasons ?? [];
         for (const reason of rawReasons) ctx.log(`[acp-proxy: rejected entry: ${reason}]`);
