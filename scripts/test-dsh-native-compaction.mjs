@@ -16,6 +16,7 @@ policy.configureNativeCompaction([{ model: 'gpt-*' }]);
 const ctx = new Context();
 const calls = [];
 let fail = false;
+let failAt = Infinity;
 await ctx.plugin(c => c.reflect.provide('llm', {
     imageRequestPricing: () => undefined,
     resolveModelInfo: async (_provider, model) => ({ context: { contextWindow: model === 'gpt-luna' ? 272000 : 18000 }, defaultMaxTokens: 100 }),
@@ -26,7 +27,7 @@ await ctx.plugin(c => c.reflect.provide('llm', {
         const window = options.model === 'gpt-luna' ? 272000 : 18000;
         assert.ok(cost + toolsTokens + options.maxTokens < window, `summary overflow: ${cost} + ${toolsTokens}`);
         calls.push(options);
-        if (fail) throw new Error('synthetic provider failure');
+        if (fail || calls.length === failAt) throw new Error('synthetic provider failure');
         yield { type: 'text-delta', index: 0, text: 'Facts retained: checkpoint integration verified.' };
         yield { type: 'finish', reason: 'stop' };
     }
@@ -99,5 +100,18 @@ try {
     await assert.rejects(engine.compactIfNeeded(broken, 'pressure'), /synthetic provider failure/);
     assert.deepEqual(broken.session.surface.nodes, nodes);
     assert.equal(broken.session.surface.replaceGeneration, 0);
+    fail = false;
+    const late = fixture('late-failed-test', 'gpt-5');
+    const lateNodes = [...late.session.surface.nodes];
+    const lateHistory = late.session.snapshotEvents();
+    failAt = calls.length + 2;
+    await assert.rejects(engine.compactIfNeeded(late, 'pressure'), /synthetic provider failure/);
+    assert.equal(calls.length, failAt, 'first batch completed before the second failed');
+    assert.deepEqual(late.session.surface.nodes, lateNodes, 'no partial checkpoint becomes visible');
+    assert.equal(late.session.surface.replaceGeneration, 0);
+    assert.deepEqual(late.session.snapshotEvents().slice(0, lateHistory.length), lateHistory);
+    failAt = Infinity;
+    assert.ok(await engine.compactIfNeeded(late, 'pressure'), 'the failed session remains retryable');
+    assert.equal(late.session.surface.replaceGeneration, 1);
     console.log(JSON.stringify({ result: 'passed', realDSH: '0.2.2-rc.1', summaryCalls: calls.length, originalSurfaceNodes: originalCount, finalSurfaceNodes: agent.session.surface.nodes.length, generation: agent.session.surface.replaceGeneration, largeCatalog: { tools: tools.length, summaryCalls: largeCalls.length, beforeTokens: largeBefore, afterTokens: ctx.tokenMeter.measure(large.session).totalTokens } }));
 } finally { await ctx.fiber.dispose(); }

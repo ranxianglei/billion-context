@@ -52,6 +52,12 @@ The caller must supply a detached runtime directory, not a running profile. No c
 
 Native requests fail closed when their preset has not attached the adapter. The stock minimal preset has no compaction backend: native rules preserve that behavior and do not add compression. Root-plane CLI compositions and unknown future DSH APIs require compatibility work before enabling rules there. This feature does not silently promise native compression on those profiles.
 
+## Extended live acceptance
+
+The deterministic tests also fail the second summary batch after the first succeeds, assert that no replacement or raw-history mutation is committed, and retry the same session. Unit coverage cancels a later reduction and overlaps native summarization with bili-owned work to check asynchronous ownership isolation.
+
+For live acceptance, use a separate DSH home, bili state and ports with real provider calls. Exercise compressed bili → native → bili twice, including raw history larger than the native model's window. Explicitly set DSH's summarization model when testing its smaller budget: selecting the main model alone can leave the previous model as the summarizer. Inject failure or hold the second summary request only after the first succeeds; check that no checkpoint is committed, then retry and recall planted facts without repeating their values. While a native summary is held, another bili session must finish under its own identity without the first session's facts. Finally restart the isolated host and proxy, verify the same conversation namespace and unchanged earlier event hashes, and recall the facts again. Require a new assistant answer in each turn; an older answer visible after a failed turn is not success. These checks demonstrate selected facts and lifecycle behavior, not lossless summarization.
+
 ## Carrying a patch across updates
 
 Keep the source commit/patch and tests in version control. Build candidates from the desired upstream release, apply the patch with `git apply --check`, then run typecheck, focused tests, build, and the real-DSH integration script before packaging. Use a profile-owned local `file:` package pin so the registry updater cannot overwrite the patch. Updates become an explicit rebuild-and-install workflow, not automatic registry replacement. Preserve the original package, profile manifest/lockfile and config for rollback. Never apply an old compiled `dist` over a newer upstream tree.

@@ -144,3 +144,67 @@ test("native summary budgets large multilingual tool catalogs in host tokens, pr
     await assert.rejects(engine.summarize({ messages: [message("fact")], tools: [{ description: "x".repeat(800000) }] }, agent), /insufficient input budget/);
     assert.equal(calls, previousCalls, "genuinely oversized schemas fail before egress");
 });
+
+test("multi-batch handoff discards partial reductions after a later failure or cancellation and can retry", async () => {
+    const input = { messages: Array.from({ length: 4 }, (_, i) => message(`fact-${i} `.repeat(8))) };
+    const before = structuredClone(input);
+    let failedCalls = 0;
+    await assert.rejects(boundedNativeSummary(input, 100, estimate, async () => {
+        if (++failedCalls === 2) throw new Error("second batch failed");
+        return { summary: [{ type: "text", text: "partial" }] };
+    }), /second batch failed/);
+    assert.equal(failedCalls, 2);
+    assert.deepEqual(input, before);
+
+    const controller = new AbortController();
+    let cancelledCalls = 0;
+    await assert.rejects(boundedNativeSummary(input, 100, estimate, async () => {
+        if (++cancelledCalls === 2) controller.abort(new Error("cancelled during reduction"));
+        return { summary: [{ type: "text", text: "partial" }] };
+    }, controller.signal), /cancelled during reduction/);
+    assert.equal(cancelledCalls, 2);
+    assert.deepEqual(input, before);
+
+    const seen = new Set<string>();
+    const recovered = await boundedNativeSummary(input, 100, estimate, async part => {
+        for (const m of part.messages) for (const b of m.content) for (const fact of b.text?.match(/fact-\d/g) ?? []) seen.add(fact);
+        return { summary: [{ type: "text", text: "recovered" }] };
+    });
+    assert.equal(seen.size, 4);
+    assert.equal(recovered.summary[0].text, "recovered");
+    assert.deepEqual(input, before);
+});
+
+test("overlapping native summary and bili work keep separate ownership across awaits and failure", async () => {
+    configureNativeCompaction([{ model: "gpt-*" }]);
+    const native = { model: { current: () => ({ provider: "test", model: "gpt-test" }) }, session: { id: "native-overlap", surface: { replaceGeneration: 0 } } };
+    const bili = { model: { current: () => ({ provider: "test", model: "glm" }) }, session: { id: "bili-overlap", surface: { replaceGeneration: 0 } } };
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    let entered!: () => void;
+    const ready = new Promise<void>(resolve => { entered = resolve; });
+    const engine: Parameters<typeof apply>[0]["compaction"] = {
+        config: { summarizationProvider: "", summarizationModel: "", maxTokens: 100 },
+        compactIfNeeded: async () => { throw new Error("bili must not call native backend"); },
+        compactPressure: async () => null, compactRegion: async () => null, compactNow: async () => null,
+        summarize: async () => {
+            assert.equal(nativeSummaryActive(), true);
+            entered();
+            await held;
+            assert.equal(nativeSummaryActive(), true);
+            throw new Error("held summary failed");
+        },
+    };
+    apply({ compaction: engine, tokenMeter: { estimateMessage: () => 10 }, llm: { resolveModelInfo: async () => ({ context: { contextWindow: 20000 } }) }, on: () => undefined });
+    const pending = engine.summarize({ messages: [message("fact")] }, native);
+    await ready;
+    assert.equal(nativeSummaryActive(), false);
+    assert.equal(await engine.compactIfNeeded(bili, "pressure"), null);
+    await Promise.resolve();
+    assert.equal(nativeSummaryActive(), false);
+    assert.equal(compactionConversationId(bili, "bili-overlap"), "bili-overlap");
+    const rejected = assert.rejects(pending, /held summary failed/);
+    release();
+    await rejected;
+    assert.equal(nativeSummaryActive(), false);
+});
