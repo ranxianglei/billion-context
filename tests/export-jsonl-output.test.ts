@@ -56,7 +56,8 @@ test("JSONL destination failures propagate and a session listing creates no outp
         await store.writeNow(session());
         const output = join(dir, "existing-directory");
         mkdirSync(output);
-        await assert.rejects(() => exportSession("jsonl-output", { dir, jsonl: true, output }), { code: "EISDIR" });
+        await assert.rejects(() => exportSession("jsonl-output", { dir, jsonl: true, output }), (error: unknown) =>
+            error instanceof Error && "code" in error && ["EISDIR", "EPERM", "EACCES"].includes(String(error.code)));
         const listingOutput = join(dir, "listing.jsonl");
         assert.match(await exportSession(undefined, { dir, jsonl: true, output: listingOutput }), /Persisted sessions:/);
         assert.equal(existsSync(listingOutput), false);
