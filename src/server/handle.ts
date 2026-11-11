@@ -14,7 +14,7 @@ import { resolveProxyDecision } from "../upstream-proxy.js";
 import { contextFromRegistry, peekRegistryContext, peekRegistryOutputLimit, peekRegistryPriceProfile } from "../registry.js";
 import { stampBillingPrice } from "../billing.js";
 import { recordClientUa } from "../client-ua-registry.js";
-import { codexAlignedWindow } from "../codex-models.js";
+import { codexAlignedWindow, codexWindowNetsOutputHeadroom } from "../codex-models.js";
 import { DecodedRequestAdmission, DecodedRequestBusyError } from "../request-body-budget.js";
 import { hostIdForLog, maskHeadersForLog, maskUrlForLog, maskUrlsInText } from "../log-mask.js";
 import { bodyMightCarryImages, buildIncomingImageIndex, pruneRetrieveImgExports, refreshIncomingImageIndex, type IndexedImage } from "../image-restore.js";
@@ -831,6 +831,10 @@ async function handleRequest(
     // operator that their own setting, not the upstream, is the wall they hit.
     let resolvedNativeWindow: number | undefined;
     let windowShrinkReason: "operator" | "codex" | undefined;
+    // The window was clamped to a codex live-table value that already reserves
+    // codex's own output headroom (effective_context_window_percent) — see
+    // codexWindowNetsOutputHeadroom. Gates the default output reservation below.
+    let codexWindowNetsOutput = false;
     // True when the resolved native window came from a low-confidence fallback
     // (built-in table / env default) instead of an authoritative source — such
     // windows get an effective-floor after output-headroom reservation (see
@@ -1006,6 +1010,7 @@ async function handleRequest(
                 reqConfig = { ...reqConfig, modelContextLimit: aligned.limit };
                 nativeFromFallback = false;
                 windowShrinkReason = "codex";
+                codexWindowNetsOutput = codexWindowNetsOutputHeadroom(aligned.source);
                 log("info", `[codex] effective window clamped ${before} → ${aligned.limit} (window source=${aligned.source} for model=${model}) upstream=${embeddedUrl ? hostIdForLog(embeddedUrl) : "none"} route=${routeLabel}`);
             } else if (operatorWindowTuned && native !== undefined && reqConfig.modelContextLimit < native) {
                 windowShrinkReason = "operator";
@@ -2692,7 +2697,21 @@ async function handleRequest(
             headroomOrigin,
             (parsed as { model?: string }).model,
         );
-        if (shouldReserveOutputHeadroom(protocol, headroomOrigin, requestModel) || provenReserve > 0) {
+        // A codex live-table window already nets out codex's own output
+        // headroom; reserving bili's default share on top double-counts it and
+        // walls the session below codex's own auto-compact point. An explicit
+        // operator outputHeadroomMaxPct and a proven completion share still apply.
+        const operatorHeadroomCap = resolveCompress(opts.routes, providerDestUrl, (parsed as { model?: string }).model, opts.compress).outputHeadroomMaxPct !== undefined;
+        const skipForCodexWindow = codexWindowNetsOutput && !operatorHeadroomCap;
+        const reserveByProtocol = shouldReserveOutputHeadroom(protocol, headroomOrigin, requestModel) && !skipForCodexWindow;
+        if (skipForCodexWindow && provenReserve === 0) {
+            const skipModel = String(requestModel ?? "?");
+            if (!headroomFallbackLogged.has(`${skipModel}|codex-netted`)) {
+                headroomFallbackLogged.add(`${skipModel}|codex-netted`);
+                log("info", `[headroom] model=${skipModel}: no output reservation — the codex-aligned window ${reqConfig.modelContextLimit} already nets out codex's own output headroom (effective_context_window_percent); set compress.outputHeadroomMaxPct to reserve anyway`);
+            }
+        }
+        if (reserveByProtocol || provenReserve > 0) {
             const p = parsed as Record<string, unknown>;
             const rawMax = p.max_tokens ?? p.max_completion_tokens ?? p.max_output_tokens;
             let maxOutput = typeof rawMax === "number" ? rawMax : 0;
@@ -2766,7 +2785,7 @@ async function handleRequest(
                     }
                 }
             }
-            if (provenReserve > 0 && !shouldReserveOutputHeadroom(protocol, headroomOrigin, requestModel)) {
+            if (provenReserve > 0 && !reserveByProtocol) {
                 // Proven share outranks the client-side fallbacks: it is what
                 // the upstream already counted into a rejection on this exact
                 // origin+model, so window − proven share is the input it accepts.
