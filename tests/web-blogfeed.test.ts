@@ -10,7 +10,7 @@
  */
 import { test, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import { mkdtempSync, rmSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ServerResponse } from "node:http";
@@ -92,6 +92,21 @@ test("rendering is escape-first: script tags survive only escaped; tables become
     const alpha = data.items.find((i) => i.id === "alpha")!;
     assert.ok(alpha.html.includes('<table class="data">'));
     assert.ok(alpha.html.includes("<td>two</td>"));
+});
+
+test("CRLF markdown preserves bilingual frontmatter and rendered content", () => {
+    const expected = getBlogFeed();
+    for (const relative of [
+        "website/blog/posts/2026-10-08_demo.md",
+        "website/blog/posts/2026-10-08_demo.zh.md",
+        "paper/a.md",
+        "paper/b.md",
+    ]) {
+        const file = join(pkgRoot, relative);
+        writeFileSync(file, readFileSync(file, "utf8").replace(/\n/g, "\r\n"));
+    }
+    _setBlogRootForTest(pkgRoot);
+    assert.deepEqual(getBlogFeed(), expected);
 });
 
 test("image refs: shipped files reroute to the panel asset prefix; traversal/unshipped refs drop silently", () => {
@@ -195,6 +210,23 @@ test("CRLF frontmatter (Windows autocrlf checkout) still yields title/excerpt/da
     assert.equal(crlf.title, "CRLF post");
     assert.equal(crlf.excerpt, "EN excerpt.");
     assert.equal(crlf.date, "2026-10-08");
+});
+
+test("manifest entry over a flat posts-dir file collapses to ONE row — manifest wins", () => {
+    // The shipped articles.json lists the very same files that live flat in
+    // website/blog/posts/ (that overlap is the normal state); without the id
+    // dedupe every such post would render twice in the list.
+    writeFileSync(join(pkgRoot, "website", "articles.json"), JSON.stringify({ articles: [
+        { file: "paper/a.md", zh_file: "paper/b.md", slug: "alpha" },
+        { file: "website/blog/posts/2026-10-09_new.md", slug: "new" },
+    ] }));
+    _setBlogRootForTest(pkgRoot);
+    const feed = getBlogFeed();
+    const rows = feed.items.filter((i) => i.id === "new");
+    assert.equal(rows.length, 1, "overlapping id renders exactly once");
+    assert.equal(rows[0].kind, "article", "the manifest entry wins the tie");
+    assert.equal(feed.items.filter((i) => i.id === "alpha").length, 1, "non-overlapping article unaffected");
+    assert.equal(feed.items.filter((i) => i.id === "demo").length, 1, "manifest-unlisted posts untouched");
 });
 
 test("default probing finds the repository tree from the TS source layout", () => {

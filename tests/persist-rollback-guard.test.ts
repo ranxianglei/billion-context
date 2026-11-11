@@ -36,7 +36,7 @@ function withTempStore(name: string, fn: (store: SessionStore, dir: string, warn
         try {
             await fn(store, dir, warnings);
         } finally {
-            store.cancelAll();
+            store.closeQuietly();
             rmrf(dir);
         }
     }) as unknown as Promise<void>;
