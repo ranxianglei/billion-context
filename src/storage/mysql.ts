@@ -2307,7 +2307,7 @@ export class MysqlBackend implements StorageBackend {
         // ckpt absorbs log payloads — the log's own MAX understates after a
         // fold; invariant ii is enforced against this value).
         const [rows] = (await this.pool.query(
-            "SELECT COALESCE(MAX(l.m), 0) AS m FROM (SELECT MAX(seq) AS m FROM snap_log WHERE sid = ?) l, " +
+            "SELECT COALESCE(GREATEST(COALESCE(l.m, 0), COALESCE(c.m, 0)), 0) AS m FROM (SELECT MAX(seq) AS m FROM snap_log WHERE sid = ?) l, " +
                 "(SELECT MAX(ckpt_seq) AS m FROM snap_ckpt WHERE sid = ?) c",
             [sessionId, sessionId],
         )) as unknown as Row[][];

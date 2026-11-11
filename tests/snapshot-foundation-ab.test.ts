@@ -49,6 +49,23 @@ process.env.BILI_STORAGE_UNIFIED = "full";
 const ENV_MASTER = "BILI_ROLLOUT_SNAPSHOT_FOUNDATION";
 const ENV_LANE = "BILI_ROLLOUT_SNAPSHOT_LANE";
 const ENV_WP = "BILI_ROLLOUT_PLUGIN_FULL_RESEND_WATERMARK";
+
+// Windows can still hold an ephemeral handle on index.db/-wal right after a
+// store closes (Defender scan, delayed close), so a bare rmSync throws EBUSY
+// and fails an otherwise green run. Retry, then give up quietly: the dir lives
+// under the OS temp root, which the after hook cannot hold hostage.
+function rmrf(p: string): void {
+    try {
+        rmSync(p, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    } catch {
+        /* Windows stray handle */
+    }
+}
+
+function closePhase(s: { store: { cancelAll(): void; closeQuietly(): void } }): void {
+    s.store.cancelAll();
+    s.store.closeQuietly();
+}
 const ENV_SR = "BILI_ROLLOUT_SNAPSHOT_RENDER";
 
 interface Capture { raw: string; headerKeys: string[] }
@@ -249,7 +266,7 @@ test("#5874 T4: foundation vs legacy A/B byte parity (hermetic dual-proxy + fold
             assert.equal(r.status, 200, `A turn 5: 200 (${r.text.slice(0, 300)})`);
             assert.equal(r.snap, null, "A turn 5: no foundation header");
         }
-        ha0.store.cancelAll();
+        closePhase(ha0);
         await closeServers([ha.proxy, ha0.upstream], "snapab phase-a");
 
         // ---------- PHASE B: foundation ON ----------
@@ -288,7 +305,7 @@ test("#5874 T4: foundation vs legacy A/B byte parity (hermetic dual-proxy + fold
             assert.equal(good.snap, "arm");
         }
         const status = (await (await fetch(`${hb.origin}/__bili/status`)).json()) as { snapshotFoundation?: Record<string, any> };
-        hb0.store.cancelAll();
+        closePhase(hb0);
         await closeServers([hb.proxy, hb0.upstream], "snapab phase-b");
 
         // ---------- invariants ----------
@@ -330,7 +347,7 @@ test("#5874 T4: foundation vs legacy A/B byte parity (hermetic dual-proxy + fold
             if (v === undefined) delete process.env[k];
             else process.env[k] = v;
         }
-        for (const root of roots) rmSync(root, { recursive: true, force: true });
+        for (const root of roots) rmrf(root);
     }
 });
 
@@ -372,7 +389,7 @@ test("#5874 T5: scattered NEW element (middle insertion) — outbound bytes stay
             assert.equal(r.status, 200, `A5 turn ${i}: 200 (${r.text.slice(0, 300)})`);
             assert.equal(r.snap, null, `A5 turn ${i}: legacy emits no x-bili-snapshot`);
         }
-        ha0.store.cancelAll();
+        closePhase(ha0);
         await closeServers([ha.proxy, ha0.upstream], "snapab phase-a5");
 
         // ---------- PHASE B: foundation ON ----------
@@ -389,7 +406,7 @@ test("#5874 T5: scattered NEW element (middle insertion) — outbound bytes stay
             assert.equal(r.status, 200, `B5 turn ${i}: 200 (${r.text.slice(0, 300)})`);
             bTokens.push(r.snap ?? "");
         }
-        hb0.store.cancelAll();
+        closePhase(hb0);
         await closeServers([hb.proxy, hb0.upstream], "snapab phase-b5");
 
         // ---------- invariants ----------
@@ -414,6 +431,6 @@ test("#5874 T5: scattered NEW element (middle insertion) — outbound bytes stay
             if (v === undefined) delete process.env[k];
             else process.env[k] = v;
         }
-        for (const root of roots) rmSync(root, { recursive: true, force: true });
+        for (const root of roots) rmrf(root);
     }
 });
