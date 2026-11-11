@@ -1,6 +1,6 @@
 # Message-ID lane infrastructure: the sessionid+msgid production/consumption map
 
-> Status: companion doc for the gap fix mandated by the #5826 release review (owner ruling 2026-11-07). Identity-ladder doctrine lives in message-identity.md (kernel) and session-identity.md (session side); this file does ONE job — explain where sessionid+msgid, the cross-lane public substrate, is produced, how it travels, who validates it (six copies), where it is pinned, its five consumers, and its declared trust boundaries. Read this before touching any of it.
+> Status: companion doc for the gap fix mandated by the #5826 release review (owner ruling 2026-11-07). Identity-ladder doctrine lives in message-identity.md (kernel) and session-identity.md (session side); this file does ONE job — explain where sessionid+msgid, the cross-lane public substrate, is produced, how it travels, who validates it (six copies), where it is pinned, its six consumers, and its declared trust boundaries. Read this before touching any of it.
 
 ## 1. What it is
 
@@ -48,7 +48,7 @@ One-off closure from the review: `parseTailIds` alone lacked the reserved-prefix
 
 The unified-store `messages.msg_id` column is the ONLY id truth: ingestion pins validated ids into rows (T5 ruling: no parallel ledger; skeleton rows carry no ids). Ledger primary key `(session_id, msg_id, content_hash)`; canonical rows key on **MSGID, not content hash** (#4491); fork clones preserve numbers (#4316 L3 PR3/3 `cloneSessionRows`).
 
-## 6. Consumers (five; what question each one asks of the ids)
+## 6. Consumers (six; what question each one asks of the ids)
 
 | Consumer | Location | Question answered | Id-usage boundary |
 |---|---|---|---|
