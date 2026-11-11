@@ -526,7 +526,7 @@ export async function prepareAnthropic(
         const egressMessages = await applyImageRescalePass(processedMessages as BiliMessage[], { session, sessionId, log, maxDim: imageRescaleMaxDim(), toolArmed: imageRescaleToolArmed(session) });
         rebuiltMessages = coreToAnthropic(egressMessages, anthropicCacheMarks ?? cacheControls);
         if (sysNotes.length > 0) {
-            rebuiltMessages = [...rebuiltMessages, ...sysNotes.map((text) => ({ role: "user" as const, content: text }))];
+            rebuiltMessages = insertBeforeTrailingSystemRun(rebuiltMessages, sysNotes.map((text) => ({ role: "user" as const, content: text })));
         }
 
         systemOut = injectSystem(parsed, opts, prompts, loopConfig, surface, visibilityMarkers, laneDecisions.compressSurfaceOff, laneDecisions.mcpDialect, detectGenerationBoundary(session, processedMessages, log));
@@ -560,7 +560,7 @@ export async function prepareAnthropic(
                     const rendered = renderNudgeText(turn.nudge, prompts, surface?.nudgeSections, "anthropic");
                     const renderedWithPayload = rendered.text;
                     if (rendered.text) {
-                        rebuiltMessages = [...rebuiltMessages, { role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withFirstSightDrain(renderedWithPayload, turn.nudge.reason, externalSummaryEnabled(config)), externalSummaryEnabled(config)), visibilityMarkers) }];
+                        rebuiltMessages = insertBeforeTrailingSystemRun(rebuiltMessages, [{ role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withFirstSightDrain(renderedWithPayload, turn.nudge.reason, externalSummaryEnabled(config)), externalSummaryEnabled(config)), visibilityMarkers) }]);
                         nudgeOutcome = "injected";
                     } else {
                         nudgeOutcome = "skipped";
@@ -573,15 +573,17 @@ export async function prepareAnthropic(
                 // [#5688] the side call shares the main request's upstream —
                 // un-deduped rebuiltMessages would 400 the decision too.
                 // [#4570] and the side array must obey the system-position rule
-                // on the array actually sent, which is exactly this one.
-                const sideBody: Record<string, unknown> = { ...parsed, messages: healAnthropicSystemPositions([...dedupeAdjacentOutputConfig(rebuiltMessages), { role: "user", content: buildDecisionPrompt(ranges) }]), system: systemOut, tools: toolsOut, stream: false, max_tokens: decide.maxTokens };
+                // on the array actually sent, which is exactly this one; #5432
+                // inserts the prompt BEFORE a trailing client system run so the
+                // backstop below stays a no-op for legal shapes.
+                const sideBody: Record<string, unknown> = { ...parsed, messages: healAnthropicSystemPositions(insertBeforeTrailingSystemRun(dedupeAdjacentOutputConfig(rebuiltMessages), [{ role: "user", content: buildDecisionPrompt(ranges) }])), system: systemOut, tools: toolsOut, stream: false, max_tokens: decide.maxTokens };
                 delete sideBody.prompt_cache_key;
                 stripDecisionReasoningFields("anthropic", sideBody);
                 const outcome = await runNudgeDecision({ req, opts, protocol: "anthropic", sideBody, session, log });
                 if (outcome.kind === "yes") {
                     const span = resolveDecisionRange(outcome, ranges);
                     if (span) {
-                        rebuiltMessages = [...rebuiltMessages, { role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withFirstSightDrain(buildDirectiveText(span.startRef, span.endRef, outcome.topic), turn.nudge.reason, externalSummaryEnabled(config)), externalSummaryEnabled(config)), visibilityMarkers) }];
+                        rebuiltMessages = insertBeforeTrailingSystemRun(rebuiltMessages, [{ role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withFirstSightDrain(buildDirectiveText(span.startRef, span.endRef, outcome.topic), turn.nudge.reason, externalSummaryEnabled(config)), externalSummaryEnabled(config)), visibilityMarkers) }]);
                         nudgeOutcome = "injected";
                     } else {
                         nudgeOutcome = "skipped";
@@ -597,7 +599,7 @@ export async function prepareAnthropic(
                     const rendered = renderNudgeText(turn.nudge, prompts, surface?.nudgeSections, "anthropic");
                     const renderedWithPayload = rendered.text;
                     if (rendered.text) {
-                        rebuiltMessages = [...rebuiltMessages, { role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withFirstSightDrain(renderedWithPayload, turn.nudge.reason, externalSummaryEnabled(config)), externalSummaryEnabled(config)), visibilityMarkers) }];
+                        rebuiltMessages = insertBeforeTrailingSystemRun(rebuiltMessages, [{ role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withFirstSightDrain(renderedWithPayload, turn.nudge.reason, externalSummaryEnabled(config)), externalSummaryEnabled(config)), visibilityMarkers) }]);
                         nudgeOutcome = "injected";
                     } else {
                         nudgeOutcome = "skipped";
@@ -617,16 +619,17 @@ export async function prepareAnthropic(
         // carrier as the nudge (never persisted, never in the client's
         // re-sent history, prefix-cache safe).
         if (turn.statusLine) {
-            rebuiltMessages = [...rebuiltMessages, { role: "user", content: turn.statusLine }];
+            rebuiltMessages = insertBeforeTrailingSystemRun(rebuiltMessages, [{ role: "user", content: turn.statusLine }]);
         }
         // [#1343/#1457] surface any earlier undelivered retrieve as an ephemeral
-        // trailing user note (kept last so it never reorders cached messages).
+        // trailing user note (after every stable message; only a client trailing
+        // system run may follow it — #5432).
         // Snapshot WITHOUT consuming: forward() commits the ids only once
         // upstream accepts this request; on failure they ride the next one.
         const retrNotes = snapshotRetrievalNotes(session);
         const retrNote = renderRetrievalNotes(retrNotes);
         if (retrNote) {
-            rebuiltMessages = [...rebuiltMessages, { role: "user", content: retrNote }];
+            rebuiltMessages = insertBeforeTrailingSystemRun(rebuiltMessages, [{ role: "user", content: retrNote }]);
             attachedRetrievalNoteIds = retrNotes.map((n) => n.id);
         }
     } catch (err) {

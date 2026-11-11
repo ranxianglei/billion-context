@@ -1,4 +1,4 @@
-import type { WireProtocol } from "./util.js";
+import { trailingSystemRunStart, type WireProtocol } from "./util.js";
 import { normalizeGoogleUserPartOrder, type GooglePart } from "acp-kernel/wire";
 
 /** Append `text` as a trailing user turn on the wire's own request body.
@@ -62,6 +62,13 @@ export function appendTrailingUserText(protocol: WireProtocol, body: string | Bu
         if (typeof c === "string") last.content = `${c}\n\n${text}`;
         else if (Array.isArray(c)) last.content = [...c, { type: "text", text }];
         else last.content = text;
+    } else if (protocol === "anthropic") {
+        // #5432: the assembled body can legally END in a client trailing system
+        // run (the kernel heal keeps it verbatim at array end); a plain push
+        // would put a user after it and 400. Insert before the run instead —
+        // identical to the push when no system trails. OpenAI has no such rule,
+        // so its bytes stay exactly as before.
+        arr.splice(trailingSystemRunStart(arr), 0, { role: "user", content: text });
     } else {
         arr.push({ role: "user", content: text });
     }
