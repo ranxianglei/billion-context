@@ -12,7 +12,7 @@
 //      full-resend request with the marker removed — behavior equals the
 //      pre-incremental world for that turn.
 //
-// Wire contract: see PLUGIN.md "Incremental turns". Messages are raw wire
+// Wire contract: see docs/plugin-protocol.md "Incremental turns". Messages are raw wire
 // messages ({role, content: string | blocks[]}) — the lane derives stable
 // content ids server-side, so hosts without their own message ids work.
 
@@ -250,6 +250,10 @@ function screenMsgIds(ids: unknown): ids is string[] {
     }
     return true;
 }
+
+/** Test-only accessor (#5826 review): pins tests/msgid-rule-parity.test.ts.
+ *  Production callers use screenMsgIds directly. */
+export const _screenMsgIdsForTest = screenMsgIds;
 
 /** Delta-turn claim gate: undefined when any candidate id was already sent
  *  on an earlier envelope of this conversation (the lane would 400 — see
