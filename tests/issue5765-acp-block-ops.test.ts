@@ -233,3 +233,69 @@ test("export JSONL: block records carry retired/rewrittenAt/originalChars/summar
     assert.equal(r2.retired, true);
     assert.equal(r2.rewrittenAt, undefined);
 });
+
+// acp_rewrite goes through the compress summary bounds of the resolved config
+// (compress.maxSummaryLength / minSummaryLength) and accepts the numeric
+// blockId spelling acp_retire already takes.
+const ctxWithLimits = (session: Session) => ({
+    session,
+    config: { blockOps: { enabled: true }, compress: { maxSummaryLength: 20000, minSummaryLength: 50 } },
+}) as unknown as Parameters<typeof executeProxyTool>[2];
+
+test("acp_rewrite: summaries compress would refuse are refused, with the limit in the receipt", () => {
+    const base = mkdtempSync(path.join(tmpdir(), "issue5765-"));
+    const snap = isolate(base);
+    try {
+        const s = makeSession("t-rewrite-limits");
+        const original = "a normal summary of the folded range that is comfortably longer than the configured floor";
+        addBlock(s, "b1", { summary: original });
+        s.state.blocks[0].compressedTokens = 1500; // a ~6000-char folded range
+
+        let r = executeProxyTool("acp_rewrite", { blockId: "b1", summary: "word ".repeat(5000) }, ctxWithLimits(s));
+        assert.equal(r.outcome, "failure", r.text.slice(0, 200));
+        assert.match(r.text, /b1: Summary too long \(24999 chars, max 20000\)/);
+        r = executeProxyTool("acp_rewrite", { blockId: "b1", summary: "word ".repeat(1800) }, ctxWithLimits(s));
+        assert.equal(r.outcome, "failure", r.text.slice(0, 200));
+        assert.match(r.text, /b1: no net shrink/);
+        r = executeProxyTool("acp_rewrite", { blockId: "b1", summary: "x" }, ctxWithLimits(s));
+        assert.equal(r.outcome, "failure", r.text.slice(0, 200));
+        assert.match(r.text, /b1: Summary too short \(1 chars, min 50\)/);
+        assert.equal(s.state.blocks[0].summary, original, "refused rewrites leave the stored summary alone");
+        assert.equal(s.state.blocks[0].previousSummary, undefined);
+
+        // Batch: the refused item is reported, the valid sibling still lands.
+        addBlock(s, "b2", { summary: "another summary of a folded range, also longer than the floor of fifty" });
+        const good = "rewritten: the b2 range is settled work, nothing in it is needed again later";
+        r = executeProxyTool("acp_rewrite", { items: [{ blockId: "b1", summary: "x" }, { blockId: "b2", summary: good }] }, ctxWithLimits(s));
+        assert.equal(r.outcome, "success", r.text);
+        assert.ok(r.text.includes("b1: Summary too short") && r.text.includes("b2 summary replaced"), r.text);
+        assert.equal(s.state.blocks[0].summary, original);
+        assert.equal(s.state.blocks[1].summary, good);
+    } finally {
+        restore(snap);
+    }
+});
+
+test("acp_rewrite: numeric blockId is accepted the way acp_retire accepts it (single and batch)", () => {
+    const base = mkdtempSync(path.join(tmpdir(), "issue5765-"));
+    const snap = isolate(base);
+    try {
+        const s = makeSession("t-rewrite-numeric");
+        addBlock(s, "b1", { summary: "a much longer original summary text" });
+        addBlock(s, "b2", { summary: "another long summary here" });
+        let r = executeProxyTool("acp_rewrite", { blockId: 1, summary: "short one" }, ctxOf(s));
+        assert.equal(r.outcome, "success", r.text);
+        assert.equal(s.state.blocks[0].summary, "short one");
+        r = executeProxyTool("acp_rewrite", { items: [{ blockId: 2, summary: "short two" }] }, ctxOf(s));
+        assert.equal(r.outcome, "success", r.text);
+        assert.equal(s.state.blocks[1].summary, "short two");
+        // Same bounds as the acp_retire id parser: non-integers and negatives are not ids.
+        r = executeProxyTool("acp_rewrite", { blockId: 1.5, summary: "nope" }, ctxOf(s));
+        assert.equal(r.outcome, "failure");
+        r = executeProxyTool("acp_rewrite", { items: [{ blockId: -1, summary: "nope" }] }, ctxOf(s));
+        assert.equal(r.outcome, "failure");
+        assert.equal(s.state.blocks[0].summary, "short one");
+    } finally {
+        restore(snap);
+    }
+});
