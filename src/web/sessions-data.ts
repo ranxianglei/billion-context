@@ -1471,12 +1471,12 @@ function renderDetail(session: Session, live: boolean): WebSessionDetail {
     // Frozen-snapshot hydration for THIS detail build, memoized per block —
     // a block's rows all come from one call, so at most one snapshot parse
     // per block, and only when a row actually misses window + store.
-    const leafIndexMemo = new Map<string, Map<string, BlockSnapItem> | null>();
-    const leafRefIndex = (block: CompressionBlock): Map<string, BlockSnapItem> | null => {
-        let idx = leafIndexMemo.get(block.blockId);
+    const snapIndexMemo = new Map<string, Map<string, BlockSnapItem> | null>();
+    const snapshotRefIndex = (block: CompressionBlock): Map<string, BlockSnapItem> | null => {
+        let idx = snapIndexMemo.get(block.blockId);
         if (idx === undefined) {
-            idx = leafRefIndexFor(session, block);
-            leafIndexMemo.set(block.blockId, idx);
+            idx = snapshotRefIndexFor(session, block);
+            snapIndexMemo.set(block.blockId, idx);
         }
         return idx;
     };
@@ -1502,7 +1502,7 @@ function renderDetail(session: Session, live: boolean): WebSessionDetail {
                 // the block's frozen content snapshot — leaf blocks re-align by
                 // position (marker-validated); every other case stays an
                 // honest miss.
-                const item = block ? (leafRefIndex(block)?.get(ref) ?? undefined) : undefined;
+                const item = block ? (snapshotRefIndex(block)?.get(ref) ?? undefined) : undefined;
                 out.push(item
                     ? {
                           ref,
@@ -1648,15 +1648,23 @@ type BlockSnapItem = { role: string; toolName?: string; text: string; ref?: stri
 
 /** Re-parse a frozen full-view snapshot into its ordered message fragments.
  *  A body line that merely LOOKS like a role header splits the message — the
- *  count/marker validation in leafRefIndexFor is what keeps a bad parse from
- *  ever being served. */
+ *  count/marker validation in snapshotRefIndexFor is what keeps a bad parse from
+ *  ever being served. The \n\n delimiter between messages leaves one empty
+ *  line at the tail of every body — stripped, since it is the separator, not
+ *  message text. */
 function parseBlockContentMessages(text: string): BlockSnapItem[] {
     const items: BlockSnapItem[] = [];
     let cur: BlockSnapItem | null = null;
+    const close = () => {
+        if (!cur) return;
+        cur.text = cur.text.replace(/\n+$/, "");
+        items.push(cur);
+        cur = null;
+    };
     for (const line of text.split("\n")) {
         const roleM = BLOCK_ROLE_LINE_RE.exec(line);
         if (roleM) {
-            if (cur) items.push(cur);
+            close();
             cur = {
                 role: roleM[1],
                 ...(roleM[2] !== undefined ? { toolName: roleM[2] } : {}),
@@ -1672,21 +1680,41 @@ function parseBlockContentMessages(text: string): BlockSnapItem[] {
         }
         cur.text = cur.text === "" ? line : cur.text + "\n" + line;
     }
-    if (cur) items.push(cur);
+    close();
     return items;
 }
 
-/** ref → snapshot fragment for ONE leaf block, or null when the alignment
- *  cannot be proven. Zip-eligible only when the frozen full view covers
- *  exactly the block's own direct messages (leaf span) AND the parsed
- *  fragment count equals the ref count — then position i IS ref i, and every
- *  ACP marker cross-checks its own position. Any mismatch aborts the whole
- *  block: the rows keep the honest "missing" marker instead of risking a
- *  shifted alignment serving the wrong bytes under a ref. */
-function leafRefIndexFor(session: Session, block: CompressionBlock): Map<string, BlockSnapItem> | null {
+/** ref → snapshot fragment for ONE block, or null when no alignment can be
+ *  proven. The frozen full view is an ordered subsequence of the block's
+ *  direct messages (host native compaction may have pruned some of them
+ *  before the snapshot was taken), so alignment is anchored on the ACP ref
+ *  markers the pi host stamps into user-message bodies. Each marker must be
+ *  anchored by at least one of two independent proofs — otherwise the whole
+ *  block is rejected:
+ *
+ *  · IDENTITY: the marker names the CURRENT ref sitting at the marker's own
+ *    snapshot position (marker number never restamped since creation);
+ *  · ARITHMETIC: the marker's FROZEN number falls inside the block's frozen
+ *    span and `frozenNumber − frozenSpanStart === snapshot position` (the
+ *    span and the markers were written together, so this is immune to the
+ *    cold-load ref RESTAMP — #5196 parked bands take fresh numbers, which
+ *    invalidates the identity proof for exactly the blocks that were
+ *    renumbered). A marker proving neither (foreign content, or a span that
+ *    does not start where the block's messages do) aborts the block.
+ *
+ *  With no markers at all the block degrades to the strict whole-block zip
+ *  (leaf span, exact counts), which is the only unanchored case that can be
+ *  proven; a pinless NON-leaf block can never be aligned (its frozen view
+ *  spans the effective messages, a superset of the direct list).
+ *
+ *  A marker proving neither anchor is rejected for the whole block; between
+ *  anchors, a segment zips positionally ONLY when its fragment count equals
+ *  its ref count — unbalanced segments stay missing. Never serve shifted
+ *  bytes under a ref. */
+function snapshotRefIndexFor(session: Session, block: CompressionBlock): Map<string, BlockSnapItem> | null {
     const direct = block.directMessageIds || [];
     const effective = block.effectiveMessageIds || [];
-    if (direct.length === 0 || direct.length !== effective.length) return null;
+    if (direct.length === 0) return null;
     let content: BlockContent | undefined;
     try {
         content = session.blockContents.get(block.blockId);
@@ -1694,7 +1722,7 @@ function leafRefIndexFor(session: Session, block: CompressionBlock): Map<string,
         return null;
     }
     const full = content ? content.full : undefined;
-    if (!full) return null;
+    if (!full || full.text.length === 0) return null;
     const byRaw = session.state.messageRefs.byRaw;
     const refs: string[] = [];
     for (const raw of direct) {
@@ -1702,15 +1730,63 @@ function leafRefIndexFor(session: Session, block: CompressionBlock): Map<string,
         if (typeof r !== "string" || r.length === 0) return null; // unaligned ledger — abort
         refs.push(r);
     }
+    const refPos = new Map<string, number>();
+    refs.forEach((r, i) => refPos.set(r, i));
     const items = parseBlockContentMessages(full.text);
-    if (items.length !== refs.length) return null;
-    const map = new Map<string, BlockSnapItem>();
+    if (items.length === 0) return null;
+    const startN = refNumber(block.startRef);
+    const endN = refNumber(block.endRef);
+    const pins: Array<[number, number]> = []; // [snapshot position, ledger position]
     for (let i = 0; i < items.length; i++) {
-        const item = items[i];
-        if (item.ref !== undefined && item.ref !== refs[i]) return null;
-        map.set(refs[i], item);
+        const mark = items[i].ref;
+        if (mark === undefined) continue;
+        if (refs[i] === mark) {
+            pins.push([i, i]); // identity — marker number never restamped
+            continue;
+        }
+        // arithmetic — frozen numbering vs the frozen span. Restamp-immune:
+        // the span and the markers were written together, so the offset still
+        // holds even after cold-load restamping renumbers the block's refs.
+        // Takes precedence over a coincidental current-ref match (a restamped
+        // number may equal some OTHER message's new ref).
+        const n = refNumber(mark);
+        if (n !== null && startN !== null && endN !== null && n >= startN && n <= endN && n - startN === i) {
+            pins.push([i, i]);
+            continue;
+        }
+        const p = refPos.get(mark);
+        if (p === undefined) return null; // foreign message in the frozen context — abort
+        pins.push([i, p]); // marker still names a current ref inside the block
     }
+    if (pins.length === 0 && direct.length !== effective.length) return null; // pinless non-leaf — unprovable
+    for (let k = 1; k < pins.length; k++) {
+        if (pins[k][0] <= pins[k - 1][0] || pins[k][1] <= pins[k - 1][1]) return null; // order disagreement — abort
+    }
+    const map = new Map<string, BlockSnapItem>();
+    const bounds: Array<[number, number]> = [[-1, -1], ...pins, [items.length, refs.length]];
+    for (let s = 0; s < bounds.length - 1; s++) {
+        const [i0, p0] = bounds[s];
+        const [i1, p1] = bounds[s + 1];
+        if (i1 - i0 !== p1 - p0) continue; // segment not balanced — unprovable, stays missing
+        for (let i = i0 + 1; i < i1; i++) {
+            const p = p0 + (i - i0);
+            if (p >= 0 && p < refs.length) map.set(refs[p], items[i]);
+        }
+    }
+    for (const [i, p] of pins) map.set(refs[p], items[i]);
     return map;
+}
+
+/** mNNNNN → N, or null when not a well-formed message ref. */
+function refNumber(ref: string | undefined): number | null {
+    if (typeof ref !== "string" || ref.length < 2 || ref[0] !== "m") return null;
+    let n = 0;
+    for (let i = 1; i < ref.length; i++) {
+        const c = ref.charCodeAt(i);
+        if (c < 48 || c > 57) return null;
+        n = n * 10 + (c - 48);
+    }
+    return n;
 }
 
 function utf8Bytes(s: string): number {
@@ -1871,14 +1947,15 @@ export async function buildMessageContent(id: string, ref: string): Promise<Mess
             }
         }
         // Last resort: the bytes only survive in the frozen block-content
-        // snapshot (leaf zip). The ledger still owns identity — the ref we
-        // were asked for must be the one the block's alignment produced for
-        // this raw id; a shifted parse yields null, never wrong bytes.
+        // snapshot (marker-anchored alignment). The ledger still owns
+        // identity — the ref we were asked for must be the one the block's
+        // alignment produced for this raw id; a shifted parse yields null,
+        // never wrong bytes.
         if (typeof raw === "string") {
             for (const b of session.state.blocks) {
                 const direct = b.directMessageIds || [];
                 if (direct.indexOf(raw) === -1) continue;
-                const item = leafRefIndexFor(session, b)?.get(ref);
+                const item = snapshotRefIndexFor(session, b)?.get(ref);
                 if (!item) continue;
                 const totalBytes = utf8Bytes(item.text);
                 const truncated = totalBytes > BLOCK_CONTENT_MAX_BYTES;

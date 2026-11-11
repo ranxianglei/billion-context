@@ -3734,12 +3734,35 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             if (!n || !graphView.contains(n)) return null;
             const bid = n.getAttribute("data-bid");
             const srcB = st.blocks || [];
-            for (let i = 0; i < srcB.length; i++) if (srcB[i].blockId === bid) return srcB[i];
+            for (let i = 0; i < srcB.length; i++) if (srcB[i].blockId === bid) return { b: srcB[i], g: n };
             return null;
         }
+        // The box only fits ~20 CJK chars at most, so the on-node label is
+        // truncated hard; hovering widens it in place (the float card beside
+        // the pointer still carries the full topic).
+        const TOPIC_LONG_CH = 20;
+        let tipNodeG = null;
+        let tipNodeB = null;
+        function setNodeTopic(g, b, long) {
+            if (!g || !b) return;
+            const t = g.querySelector("text.g-topic");
+            if (!t) return;
+            let topic = blockTopic(b);
+            const maxCh = long ? TOPIC_LONG_CH : Math.floor((TREE_W - 52) / 7);
+            if (topic.length > maxCh) topic = topic.slice(0, Math.max(1, maxCh - 1)) + "\u2026";
+            t.textContent = topic;
+        }
         function showTipAt(x, y) {
-            if (st.mode !== "tree" || graphView.hidden) { tip.hidden = true; return; }
-            const b = blockAt(x, y);
+            if (st.mode !== "tree" || graphView.hidden) { hideTip(); return; }
+            const hit = blockAt(x, y);
+            const b = hit ? hit.b : null;
+            const g = hit ? hit.g : null;
+            if (g !== tipNodeG) {
+                setNodeTopic(tipNodeG, tipNodeB, false);
+                tipNodeG = g;
+                tipNodeB = b;
+                if (tipNodeG) setNodeTopic(tipNodeG, tipNodeB, true);
+            }
             if (!b) { tip.hidden = true; return; }
             tipState.x = x; tipState.y = y;
             const tierNum = Number(b.tier) || 1;
@@ -3765,7 +3788,12 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             tip.style.left = lx + "px";
             tip.style.top = ly + "px";
         }
-        function hideTip() { tip.hidden = true; }
+        function hideTip() {
+            setNodeTopic(tipNodeG, tipNodeB, false);
+            tipNodeG = null;
+            tipNodeB = null;
+            tip.hidden = true;
+        }
         // After a repaint the node under a stationary pointer may have moved
         // or been replaced — re-resolve it so the tip neither dangles over the
         // wrong node nor vanishes while the cursor is still hovering.
@@ -3778,6 +3806,9 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         function renderTree() {
             const inner = graphView.querySelector(".tm-inner");
             if (inner) inner.innerHTML = renderCollapSvg(blocks, st.expanded, st.selected).html;
+            // the redraw replaced the drawing — the widened label died with it
+            tipNodeG = null;
+            tipNodeB = null;
             if (treeTipRedraw) treeTipRedraw();
         }
         treeViewRender = renderTree;
@@ -5597,8 +5628,29 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
                     // selection survive the tick (the list is static DOM).
                     const inner = view.querySelector(".tm-inner");
                     const stv = treeViewState || { expanded: {}, selected: "" };
-                    if (stv) stv.blocks = r.blocks;
-                    if (inner) inner.innerHTML = renderCollapSvg(r.blocks, stv.expanded, stv.selected).html;
+                    // The /tree tick ships lean nodes (no topic/summary/token
+                    // counts) — merge each over the rich detail block so the
+                    // 5s repaint keeps node titles, tip meta and counts.
+                    const rich = (stv && stv.blocks) || window.__biliDetailBlocks || [];
+                    const richById = {};
+                    for (let ri = 0; ri < rich.length; ri++) {
+                        const rb = rich[ri];
+                        if (rb && rb.blockId) richById[rb.blockId] = rb;
+                    }
+                    const merged = r.blocks.map(function (x) {
+                        const base = richById[x.blockId];
+                        if (!base) return x;
+                        const out = {};
+                        for (const k in base) out[k] = base[k]; // rich: topic/summary/tokens/counts
+                        out.blockId = x.blockId; out.tier = x.tier; out.active = x.active; // tick wins
+                        out.directBlockIds = (x.directBlockIds || []).slice();
+                        if (x.startRef !== undefined) out.startRef = x.startRef;
+                        if (x.endRef !== undefined) out.endRef = x.endRef;
+                        if (x.parentBlockId !== undefined) out.parentBlockId = x.parentBlockId;
+                        return out;
+                    });
+                    if (stv) stv.blocks = merged;
+                    if (inner) inner.innerHTML = renderCollapSvg(merged, stv.expanded, stv.selected).html;
                     if (treeTipRedraw) treeTipRedraw();
                 }
             }
