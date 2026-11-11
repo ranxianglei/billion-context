@@ -2,10 +2,12 @@
  * #5241 阶段 0 特征化打桩(不改产品代码):两把「一次性闩锁」的永久性
  * —— C3 契约(降级必须有告警、可恢复、有 TTL)改造前的现状基准。
  *
- *  - shadow.ts stats.disabled:3 次结构性 ingest 失败闩死统一 sidecar。
- *    issue5140 已钉「3 strike 才闩、闩后 warn 只一条」;这里补钉的是
- *    C3 关心的另一半事实:**进程内不存在任何恢复路径** —— 故障消失后
- *    record() 永久 no-op、读路径全部回退、fork 直接 throw,直到进程重启。
+ *  - shadow.ts ingest 失败**永不自我禁用**(owner policy 2026-10-30,
+ *    b9eb27a448 "never give up on index writes"):结构性失败每次 save 都重试、
+ *    warn 按消息去重(同一消息一条,#5140)、读保持 unified-first、fork 不
+ *    fail-close;stats.disabled 恒 false(面板兼容字段)。这里钉的正是旧
+ *    3-strike 闩锁被政策取代后的现状——含旧桩的反面事实:故障消失后
+ *    record() **能恢复**(不是永久 no-op)。
  *  - logger.ts stderrDead:stderr 写失败(同步抛或流 error 事件)把
  *    整个进程的日志降级为 file-only,一次性、幂等、同样无复位。
  *    markStderrDead 未导出且无 reset —— 进程内翻闩会污染同进程后续
@@ -23,7 +25,7 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { UnifiedShadow } from "../src/storage/shadow.ts";
-import { isStreamWriteError } from "../src/logger.ts";
+import { isStreamWriteError, setLogCapture } from "../src/logger.ts";
 import type { LegacySessionLike } from "../src/storage/ingest.ts";
 
 const HERMETIC = fs.mkdtempSync(path.join(os.tmpdir(), "bili-c2-latch-"));
@@ -40,7 +42,9 @@ after(() => {
 
 function mkShadow(): UnifiedShadow {
     const dir = fs.mkdtempSync(path.join(HERMETIC, "sh-"));
-    const shadow = UnifiedShadow.maybeOpen(dir, { BILI_STORAGE_UNIFIED: "shadow" }, (r) => r as LegacySessionLike);
+    // FULL mode on purpose: only there is readsUnified a live gate, so the
+    // stake can prove ingest health never flips full-mode reads legacy-only.
+    const shadow = UnifiedShadow.maybeOpen(dir, { BILI_STORAGE_UNIFIED: "full" }, (r) => r as LegacySessionLike);
     assert.ok(shadow !== null, "hermetic shadow must open (real sqlite engine present)");
     return shadow;
 }
@@ -71,32 +75,33 @@ function installFault(shadow: UnifiedShadow, message: string): () => void {
     return () => { sync.getBlocks = orig; };
 }
 
-test("shadow disable latch: once disabled, healthy records are permanent no-ops (no re-enable path exists)", () => {
+test("shadow ingest failures never self-disable: retry-forever with recovery is the landed contract (owner policy 2026-10-30)", async () => {
     const shadow = mkShadow();
+    const warns: string[] = [];
+    setLogCapture((level, msg) => { if (level === "warn") warns.push(msg); });
     try {
         const off = installFault(shadow, "file is not a database (stake: structural)");
         for (let i = 0; i < 3; i++) shadow.record(fix());
         off();
-        assert.equal(shadow.stats.disabled, true, "three structural strikes latch the sidecar");
-        const ingestsFrozen = shadow.stats.ingests;
-        const lastErr = String(shadow.stats.lastError);
-        assert.match(lastErr, /file is not a database/);
+        assert.equal(shadow.stats.disabled, false, "structural strikes never disable the sidecar (b9eb27a448: never give up on index writes)");
+        assert.match(String(shadow.stats.lastError), /file is not a database/, "lastError carries the latest failure detail");
+        assert.equal(warns.filter((w) => w.includes("file is not a database")).length, 1, "three strikes, ONE warn per distinct message (#5140 dedup)");
 
-        // The fault is GONE now. Today there is no recovery: every later
-        // record() early-returns at the disabled gate before it can succeed,
-        // so the streak can never reset and the latch can never clear.
+        // The inverse of the pre-policy stake: recovery IS possible. The fault
+        // is gone, so the next saves retry unconditionally and succeed again.
+        const ingestsBefore = shadow.stats.ingests;
         for (let i = 0; i < 5; i++) shadow.record(fix());
-        assert.equal(shadow.stats.disabled, true, "still disabled after healthy records — the latch never re-arms");
-        assert.equal(shadow.stats.ingests, ingestsFrozen, "disabled record() is a no-op: the ingest counter never moves again");
-        assert.equal(String(shadow.stats.lastError), lastErr, "lastError is frozen at the strike that latched");
+        assert.equal(shadow.stats.disabled, false, "healthy records find nothing to re-enable — no latch exists");
+        assert.ok(shadow.stats.ingests > ingestsBefore, "healthy records keep ingesting after the fault clears (retry-forever, not a permanent no-op)");
 
-        // Every read/degrade path funnels back to legacy:
-        assert.equal(shadow.readsUnified, false, "reads go legacy-only");
-        assert.equal(shadow.viewFor("anything"), null, "viewFor degrades to null (callers fall back to legacy)");
+        // Reads never flipped legacy-only during or after the failure streak:
+        assert.equal(shadow.readsUnified, true, "reads stay unified-first regardless of ingest health");
+        assert.ok(shadow.viewFor("latch-s1") !== null, "viewFor still serves the unified view after failed saves");
 
-        // And the strict fork publication path fails closed instead:
-        assert.throws(() => shadow.createForkAsync("parent", fix()), /fork storage unavailable/, "fork publication throws once disabled");
+        // Fork publication does not fail closed on a failing sidecar:
+        assert.equal(await shadow.createForkAsync("latch-s1", fix()), true, "fork publication runs normally despite the earlier failure streak");
     } finally {
+        setLogCapture(null);
         shadow.close();
     }
 });
