@@ -17,6 +17,11 @@ export const BILI_PLUGIN_BYPASS_HEADER = "x-bili-plugin-bypass";
 // mirroring what a direct send without the overlay would have been.
 export const BILI_PASSTHROUGH_HEADER = "x-bili-passthrough";
 
+// Internal request marker: OMP owns stream truncation recovery for its native
+// fetch calls; the proxy consumes this header and strips it before upstream egress.
+export const BILI_HOST_RECOVERY_OWNER_HEADER = "x-bili-host-recovery-owner";
+export const BILI_HOST_RECOVERY_OWNER_OMP = "omp";
+
 // #4079: the MINIMUM window both egress oversize guards size against. A
 // configured or declared window can be wrong SMALL — a stale
 // modelContextLimit, a registry miss, a model-catalog fallback (#3993:

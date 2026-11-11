@@ -6,10 +6,11 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
-import factory, { ompTrafficRidesBili, shouldBootstrapNativeOmp, planNativeOmp, armNativeOmp, _resetNativeStateForTest, _setSpawnForTest, _stateRespawnForTest, _noteRoutedForTest } from "../src/agent/omp-native.ts";
+import factory, { ompTrafficRidesBili, shouldBootstrapNativeOmp, planNativeOmp, armNativeOmp, _resetNativeStateForTest, _setSpawnForTest, _stateRespawnForTest, _noteRoutedForTest, _headersForTest } from "../src/agent/omp-native.ts";
 import { applyOmpFirstEventTimeout, applyOmpMessageThreadsOff, OMP_MESSAGE_THREADS_ENV, nativeProxyScriptPath, ompFirstEventTimeoutValue, OMP_FIRST_EVENT_TIMEOUT_DEFAULT_MS, OMP_FIRST_EVENT_TIMEOUT_ENV } from "../src/agent/native-bootstrap.ts";
 import { pluginInstall, pluginRemove, pluginStatusAll, selfPackageRoot, ompPluginLoadedFrom } from "../src/plugin-install.ts";
 import { rmrf } from "./tmp-rm.ts";
+import { BILI_HOST_RECOVERY_OWNER_HEADER, BILI_HOST_RECOVERY_OWNER_OMP } from "../src/util.ts";
 
 // #1135 wiring tests drive verifyAttachAndRecover against a dead target — cap
 // the routed-evidence grace so the probe fails fast instead of paying the 5s default.
@@ -92,6 +93,12 @@ test("nativeProxyScriptPath: dist/agent/omp-native.js resolves to the package bi
 
 test("default export is an ExtensionFactory (loaded by omp's extensions loader)", () => {
     assert.equal(typeof factory, "function");
+});
+
+test("native OMP host stamps the private recovery-owner marker", () => {
+    assert.deepEqual(_headersForTest("https://api.example.test/v1/chat/completions"), {
+        [BILI_HOST_RECOVERY_OWNER_HEADER]: BILI_HOST_RECOVERY_OWNER_OMP,
+    });
 });
 
 // — installer: `bili plugin install omp` targets the native entry (#957) ——

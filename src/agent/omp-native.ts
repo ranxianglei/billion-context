@@ -30,6 +30,7 @@ import { clearIncrementalProbe, createPrepareDirectSend, hostMsgIdHintFor, INCRE
 import * as pfChannel from "./pf-channel.js";
 import { fetchProxyVersion, waitForProxyVersion } from "./shared.js";
 import { logHostEvent } from "./host-log.js";
+import { BILI_HOST_RECOVERY_OWNER_HEADER, BILI_HOST_RECOVERY_OWNER_OMP } from "../util.js";
 
 /** Decides whether the native bootstrap should run in this process. */
 export function shouldBootstrapNativeOmp(env: NodeJS.ProcessEnv): boolean {
@@ -68,7 +69,11 @@ function errMessage(err: unknown): string {
     return err instanceof Error ? err.message : String(err);
 }
 
-const state: NativeInterceptState = { origin: undefined, ready: Promise.resolve(undefined) };
+const state: NativeInterceptState = {
+    origin: undefined,
+    ready: Promise.resolve(undefined),
+    headersFor: () => ({ [BILI_HOST_RECOVERY_OWNER_HEADER]: BILI_HOST_RECOVERY_OWNER_OMP }),
+};
 
 // #3248 phase 2: incremental-turn divert for omp. omp never emits header
 // events, so the ONLY identity signal at the fetch layer is the
@@ -452,6 +457,11 @@ export function _setOmpOriginForTest(origin: string | undefined): void {
 /** Test hook: expose the armed runtime-recovery seam (mirrors pi/opencode/dsh). */
 export function _stateRespawnForTest(): (() => Promise<string | undefined>) | undefined {
     return state.respawn;
+}
+
+/** Test hook: inspect the owner marker installed by the native OMP host. */
+export function _headersForTest(url: string): Record<string, string> | undefined {
+    return state.headersFor?.(url);
 }
 
 /** Test hook (#1365): record routed-channel evidence without the fetch patch. */

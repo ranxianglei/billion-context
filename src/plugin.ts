@@ -36,6 +36,9 @@ import { captureHandoffJson, HANDOFF_REPLY_MAX_BYTES } from "./server/handoff-re
 export interface UpstreamMeta {
     status?: number;
     contentType?: string;
+    requestId?: string;
+    opencodeLogId?: string;
+    cfRay?: string;
 }
 
 /** #2328 Q4: does the dangling partial event left at a cut carry the opening
@@ -2779,6 +2782,9 @@ export async function pipePluginChatWithStrip(
     // default); hosts that need the legacy completed-turn shape opt back in with
     // streamErrorShape:"completion".
     streamErrorShape?: "protocol" | "completion",
+    // #5951: the requesting host already classifies this cut and retries on its
+    // own budget — the proxy must not spend a second one.
+    hostOwnsTruncationRecovery = false,
 ): Promise<void> {
     let reader = stream.getReader();
     let decoder = new TextDecoder("utf-8");
@@ -3126,7 +3132,11 @@ export async function pipePluginChatWithStrip(
         // it too, so the two content-only counters are what separate an answer from
         // a thinking fragment.
         if (sawToolUse || blocksForwarded > 0 || visibleTextChars > 0 || releasedMarkupChars > 0 ||
-            sawStrippedEcho || answerProse.trim().length > 0 || streams.size > 0) return false;
+            sawStrippedEcho || answerProse.trim().length > 0) return false;
+        // OpenAI reasoning identity filters are not pending answer content.
+        for (const { field } of streams.values()) {
+            if (protocol !== "openai" || (field !== "reasoning_content" && field !== "reasoning")) return false;
+        }
         if (res.destroyed || res.writableEnded) return false;
         let next: ReadableStream<Uint8Array> | null = null;
         try {
@@ -3175,10 +3185,27 @@ export async function pipePluginChatWithStrip(
         // #5951: the read error itself, so a cut that was not replayed names its
         // cause instead of only its classification.
         ...(cause === "read-error" && readError !== undefined ? { readError: describeReadError(readError) } : {}),
+        ...(cause === "read-error" && readError !== undefined ? { readErrorCause: describeReadErrorCause(readError) } : {}),
         retryZeroByteCutSpent: truncationRetried,
         retryDegenerateSpent: degenerateRetried,
+        // #5951: the replay predicate's inputs, so a refused cut names the clause
+        // that refused it instead of only the read error.
+        replay: {
+            replayAvailable: refetch !== undefined,
+            sawThinking,
+            sawToolUse,
+            blocksForwarded,
+            openStreams: streams.size,
+            forwardedAny,
+            releasedMarkupChars,
+            proseChars: proseAcc.length,
+            answerProseChars: answerProse.trim().length,
+        },
         ...(upstreamMeta?.status !== undefined ? { upstreamStatus: upstreamMeta.status } : {}),
         ...(upstreamMeta?.contentType !== undefined ? { upstreamContentType: upstreamMeta.contentType } : {}),
+        ...(safeDiagnosticId(upstreamMeta?.requestId) ? { upstreamRequestId: safeDiagnosticId(upstreamMeta?.requestId) } : {}),
+        ...(safeDiagnosticId(upstreamMeta?.opencodeLogId) ? { upstreamLogId: safeDiagnosticId(upstreamMeta?.opencodeLogId) } : {}),
+        ...(safeDiagnosticId(upstreamMeta?.cfRay) ? { upstreamCfRay: safeDiagnosticId(upstreamMeta?.cfRay) } : {}),
     });
     /** While the retry stream feeds the client, the message the FIRST attempt
      *  opened is still open: nothing may re-open it. Returns true when the event
@@ -3818,14 +3845,14 @@ export async function pipePluginChatWithStrip(
             try {
                 step = await reader.read();
             } catch (e) {
-                if (await retryReasoningOnlyCut(e)) continue;
+                if (!hostOwnsTruncationRecovery && await retryReasoningOnlyCut(e)) continue;
                 throw e;
             }
             const { done, value } = step;
             if (done) {
                 // #2171: an EOF with nothing client-visible yet is safely
                 // re-issuable — try the one-shot retry before giving up.
-                if (!sawTerminal && !res.destroyed && !res.writableEnded && ((await retryZeroByteCut()) || (await retryReasoningOnlyCut()))) continue;
+                if (!hostOwnsTruncationRecovery && !sawTerminal && !res.destroyed && !res.writableEnded && ((await retryZeroByteCut()) || (await retryReasoningOnlyCut()))) continue;
                 // #2323: a CRLF/lone-CR whose final byte arrived last is held back
                 // by the streaming normalizer; resolve it and re-drive the completed
                 // event through the same path below before deciding truncation.
@@ -4182,6 +4209,25 @@ function describeReadError(error: unknown): string {
     return `${name}: ${error.message}`.replace(/[\r\n]+/g, " ").slice(0, 200);
 }
 
+/** Retain only bounded, structured cause identity; never serialize upstream text. */
+function describeReadErrorCause(error: unknown): Array<{ name: string; code?: string }> | undefined {
+    if (!(error instanceof Error)) return undefined;
+    const chain: Array<{ name: string; code?: string }> = [];
+    let cause: unknown = error.cause;
+    for (let depth = 0; depth < 3 && cause instanceof Error; depth++) {
+        const name = /^[A-Za-z][A-Za-z0-9_.-]{0,63}$/.test(cause.name) ? cause.name : "Error";
+        const codeValue = (cause as Error & { code?: unknown }).code;
+        const code = typeof codeValue === "string" && /^[A-Za-z0-9_]{1,64}$/.test(codeValue) ? codeValue : undefined;
+        chain.push({ name, ...(code ? { code } : {}) });
+        cause = cause.cause;
+    }
+    return chain.length > 0 ? chain : undefined;
+}
+
+function safeDiagnosticId(value: string | undefined): string | undefined {
+    return value !== undefined && value.length <= 128 && /^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(value) ? value : undefined;
+}
+
 function hadTextOtherThanTextFields(choices: unknown): boolean {
     if (!Array.isArray(choices)) return true;
     for (const c of choices) {
@@ -4303,6 +4349,7 @@ export async function pipePluginResponsesWithStrip(
     // #2328 Q2 — see pipePluginChatWithStrip.
     upstreamMeta?: UpstreamMeta,
     reply?: HandoffReply,
+    hostOwnsTruncationRecovery = false,
 ): Promise<void> {
     let reader = stream.getReader();
     let decoder = new TextDecoder("utf-8");
@@ -4610,11 +4657,27 @@ export async function pipePluginResponsesWithStrip(
         // #5951: the read error itself, so a cut that was not replayed names its
         // cause instead of only its classification.
         ...(cause === "read-error" && readError !== undefined ? { readError: describeReadError(readError) } : {}),
+        ...(cause === "read-error" && readError !== undefined ? { readErrorCause: describeReadErrorCause(readError) } : {}),
         retryZeroByteCutSpent: truncationRetried,
         retryDegenerateSpent: degenerateRetried,
+        // #5951: see the chat-pipe twin — the responses lane has no reasoning-only
+        // replay, so `replayAvailable` is the field that says so on a cut.
+        replay: {
+            replayAvailable: refetch !== undefined,
+            sawReasoning,
+            sawFunctionCall,
+            openStreams: argStreams.size,
+            forwardedAny,
+            proseChars: proseAcc.length,
+            fastPathChars,
+            heldVisibleChars,
+        },
         heldEvents: heldEvents.length,
         ...(upstreamMeta?.status !== undefined ? { upstreamStatus: upstreamMeta.status } : {}),
         ...(upstreamMeta?.contentType !== undefined ? { upstreamContentType: upstreamMeta.contentType } : {}),
+        ...(safeDiagnosticId(upstreamMeta?.requestId) ? { upstreamRequestId: safeDiagnosticId(upstreamMeta?.requestId) } : {}),
+        ...(safeDiagnosticId(upstreamMeta?.opencodeLogId) ? { upstreamLogId: safeDiagnosticId(upstreamMeta?.opencodeLogId) } : {}),
+        ...(safeDiagnosticId(upstreamMeta?.cfRay) ? { upstreamCfRay: safeDiagnosticId(upstreamMeta?.cfRay) } : {}),
     });
     /** Every id the retry carries is rewritten onto the first attempt's, so the
      *  client's assembled item stays the one it already holds. */
@@ -4756,7 +4819,7 @@ export async function pipePluginResponsesWithStrip(
             if (done) {
                 // #2171: an EOF with nothing client-visible yet is safely
                 // re-issuable — try the one-shot retry before giving up.
-                if (!sawTerminal && !res.destroyed && !res.writableEnded && (await retryZeroByteCut())) continue;
+                if (!hostOwnsTruncationRecovery && !sawTerminal && !res.destroyed && !res.writableEnded && (await retryZeroByteCut())) continue;
                 // #2323: a CRLF/lone-CR whose final byte arrived last is held back
                 // by the streaming normalizer; resolve it and re-drive the completed
                 // event through the same path below before deciding truncation.
