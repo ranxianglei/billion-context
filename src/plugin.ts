@@ -1195,6 +1195,15 @@ type ForkRequest = {
     branchPoint: { messageCount: number; orderHash: string };
     orderedMessages: ForkIdentity[];
     idempotencyKey: string;
+    // #6262 principle 1 (msgid identity track, discussion #6262): the child's
+    // host-stable ids for the claimed prefix. A host-pinned parent exposes the
+    // host ids AS its snapshot rawIds, so the gate in handlePluginFork is rawId
+    // equality — no new validation copy (identifier() below is the SAME check
+    // every rawId already passes).
+    prefixMsgIds?: string[];
+    // Where the byte-verified prefix stopped and the identity track extended it.
+    // Only rides WITH prefixMsgIds; >= messageCount normalizes to "no drift".
+    driftFrom?: number;
 };
 
 function stableJson(value: unknown): string {
@@ -1658,7 +1667,19 @@ function parseForkRequest(payload: string): ForkRequest {
         if (!identifier(item.rawId) || !(item.ref === null || (typeof item.ref === "string" && /^m\d{5,}$/.test(item.ref))) || !hash(item.identityHash)) throw new Error("invalid raw/ref identity");
         return { rawId: item.rawId, ref: item.ref, identityHash: item.identityHash };
     });
-    return { protocolVersion: b.protocolVersion, parentConversationId: b.parentConversationId, childConversationId: b.childConversationId, parentRevision: b.parentRevision, branchPoint: { messageCount: point.messageCount as number, orderHash: point.orderHash }, orderedMessages, idempotencyKey: b.idempotencyKey };
+    // #6262 principle 1: optional msgid track. identifier() is REUSED, not copied —
+    // the same shape check every claimed rawId already passes above.
+    let prefixMsgIds: string[] | undefined;
+    if (b.prefixMsgIds !== undefined) {
+        if (!Array.isArray(b.prefixMsgIds) || b.prefixMsgIds.length !== (point.messageCount as number) || b.prefixMsgIds.some((v: unknown) => !identifier(v))) throw new Error("invalid prefixMsgIds");
+        prefixMsgIds = b.prefixMsgIds as string[];
+    }
+    let driftFrom: number | undefined;
+    if (b.driftFrom !== undefined) {
+        if (prefixMsgIds === undefined || !Number.isSafeInteger(b.driftFrom) || (b.driftFrom as number) < 0 || (b.driftFrom as number) > (point.messageCount as number)) throw new Error("invalid driftFrom");
+        driftFrom = (b.driftFrom as number) < (point.messageCount as number) ? (b.driftFrom as number) : undefined;
+    }
+    return { protocolVersion: b.protocolVersion, parentConversationId: b.parentConversationId, childConversationId: b.childConversationId, parentRevision: b.parentRevision, branchPoint: { messageCount: point.messageCount as number, orderHash: point.orderHash }, orderedMessages, idempotencyKey: b.idempotencyKey, ...(prefixMsgIds !== undefined ? { prefixMsgIds } : {}), ...(driftFrom !== undefined ? { driftFrom } : {}) };
 }
 
 /** [#2399 stage 2] omp/pi identity-register their session ids at session_start
@@ -1718,6 +1739,23 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
             }
             const prefix = snapshot.orderedMessages.slice(0, request.branchPoint.messageCount);
             if (prefix.length !== request.branchPoint.messageCount || forkOrderHash(request.orderedMessages) !== request.branchPoint.orderHash || stableJson(prefix) !== stableJson(request.orderedMessages)) return forkReply(res, 409, { ok: false, code: "BRANCH_POINT_CONFLICT", error: "ordered prefix/hash does not match parent" });
+            // #6262 principle 1 (msgid identity track): the byte check above is
+            // final for the prefix AS CLAIMED (the client copies the parent's
+            // identities verbatim, including the drift region). When the client
+            // additionally claims host-stable ids for the prefix and every one
+            // equals the parent's rawId at its slot (host-pinned parents: the
+            // rawId IS the host id), the region [driftFrom, messageCount) is
+            // identity-stable byte drift — the host re-rendered those messages
+            // after the parent saw them but kept their ids. Blocks and refs are
+            // keyed by rawId, and the child's pinned ids match the parent's, so
+            // everything copied below stays valid in the child: accept and mark
+            // the receipt. Gate failure (parent not host-pinned — its rawIds are
+            // content digests, never host ids — or any id/length mismatch) → the
+            // byte-verified fork proceeds EXACTLY as before: strict, no 409.
+            let forkDriftFrom: number | undefined;
+            if (request.prefixMsgIds !== undefined && request.prefixMsgIds.length === prefix.length && request.prefixMsgIds.every((id, k) => id === prefix[k]!.rawId)) {
+                forkDriftFrom = request.driftFrom;
+            }
             const rawIds = new Set(prefix.map((m) => m.rawId));
             const child = createSession(request.childConversationId, { ...parent.meta, label: request.childConversationId });
             const crossing = parent.state.blocks.filter((b) => b.effectiveMessageIds.some((id) => rawIds.has(id)) && !b.effectiveMessageIds.every((id) => rawIds.has(id)));
@@ -1839,7 +1877,7 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
                 (child.transient ??= {}).latestKnownMsgId = parent.transient.latestKnownMsgId;
                 child.transient.needlePayloadUpper = parent.transient.needlePayloadUpper;
             }
-            const response = { ok: true, status: crossing.length > 0 ? "expanded" : "exact", protocolVersion: 2, parentConversationId: request.parentConversationId, childConversationId: request.childConversationId, sessionId: child.id, parentRevision: request.parentRevision, childRevision: forkSnapshot(child).parentRevision, branchPoint: request.branchPoint, expandedBlocks: crossing.map((b) => b.blockId), inheritedBlocks: child.state.blocks.map((b) => ({ id: b.blockId, tier: b.tier, active: b.active, expanded: b.expanded === true })), replayed: false };
+            const response = { ok: true, status: forkDriftFrom !== undefined ? (crossing.length > 0 ? "expanded+drifted" : "drifted") : crossing.length > 0 ? "expanded" : "exact", protocolVersion: 2, parentConversationId: request.parentConversationId, childConversationId: request.childConversationId, sessionId: child.id, parentRevision: request.parentRevision, childRevision: forkSnapshot(child).parentRevision, branchPoint: request.branchPoint, ...(forkDriftFrom !== undefined ? { driftFrom: forkDriftFrom } : {}), expandedBlocks: crossing.map((b) => b.blockId), inheritedBlocks: child.state.blocks.map((b) => ({ id: b.blockId, tier: b.tier, active: b.active, expanded: b.expanded === true })), replayed: false };
             child.metadata.publicForkReceipt = { requestHash, response };
             await publishForkSession(child, parent.id);
             recordPluginSession(request.childConversationId, child.id);

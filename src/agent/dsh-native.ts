@@ -1600,7 +1600,10 @@ async function maybeForkAdoptBeforeSend(ctx: PluginContext, init: RequestInit | 
             `bili-native-dsh: fork adoption for ${child.sid} skipped at the proxy-base gate — the proxy origin is not known yet, so the fork protocol cannot be reached (#4215)`);
         return;
     }
-    await dshForkAdopter.maybeAdopt({ base, parent: child.parent, child: child.sid, body });
+    // #6262 principle 1: host msgids for the msgid identity track — the SAME
+    // parity-pinned collector the incremental lane uses (hostMsgIdsOf); a
+    // mismatched count falls back to the byte track inside the adopter.
+    await dshForkAdopter.maybeAdopt({ base, parent: child.parent, child: child.sid, body, msgIds: hostMsgIdsOf((body as { messages?: unknown }).messages) });
 }
 
 // #1677: session id of the command's invoking agent (host-passed invocation); malformed

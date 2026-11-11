@@ -226,7 +226,7 @@ billion-context/
 │   │   ├── conversation-recall.ts #   Fallback identity when host attribution context is missing (#4082)
 │   │   ├── dsh-compaction-disable.ts #   Load-time overlay standing dsh basic compaction down (#3354)
 │   │   ├── dsh-compaction-gate.ts #   Always-on compaction gate entry, independent of bili-native (#3662)
-│   │   ├── fork-adopt.ts         #   Client half of fork adoption: prefix match + receipt (#2399)
+│   │   ├── fork-adopt.ts         #   Client half of fork adoption: prefix match + receipt (#2399, msgid track #6262)
 │   │   ├── host-log.ts           #   Host-safe log channel: durable record, zero terminal traffic (#2827)
 │   │   ├── incremental-client.ts #   Host-process incremental-turn client: diff, ack, resync (#3248)
 │   │   ├── opencode-msgids.ts    #   Opencode msgid harvest + wire alignment (#4491)
@@ -346,7 +346,7 @@ billion-context/
  │   ├── src/                      #   14 modules: delegate tool/lifecycle, fleet inspector/widget, config, events
  │   ├── tests/                    #   Component unit suite (`npm --prefix pi-subagents test`, runs on TS source)
  │   └── package.json              #   Own name/version (npm `billion-context-pi-subagents`), own build chain (tsup → dist + d.ts)
- ├── tests/                        # 614 test files (+ hermetic e2e lanes under tests/e2e/)
+ ├── tests/                        # 615 test files (+ hermetic e2e lanes under tests/e2e/)
  ├── tsup.config.ts                # Build config (inlines acp-kernel + billion-context-pi-subagents; zod external)
  └── package.json                  # npm manifest (consumes kernel via `"acp-kernel": "file:./kernel"`, pi-subagents via `"billion-context-pi-subagents": "file:./pi-subagents"`; version bumped ONLY on release branches)
 
