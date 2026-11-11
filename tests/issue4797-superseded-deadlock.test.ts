@@ -23,8 +23,10 @@ import { applyRanges, supersededRefRejection, type RewriteCtx } from "../src/str
 
 // Same drifted shape as kernel/tests/ref-restamp-collision.test.ts:
 // rows/seq a=0..f=5; old refs a=m1 b=m3 c=BLOCKED d=m4 e=m6 f=m7.
-// Post-restamp: b→m2, e→m5, f takes e's vacated m6. Superseded (post-prune):
-// {m3→b, m7→f} — m6 is live for f and MUST NOT sit in the map.
+// Post-restamp (#5196 slot-retirement): b→m2, e→m5; f's target m6 was retired
+// by e's move within the same pass, so f parks on a fresh number (m8, above
+// the pre-pass cursor) instead of re-occupying it. Superseded: {m3→b, m6→e,
+// m7→f} — no number is live for one message and an alias of another.
 function restampedSession(): { session: RewriteCtx["session"]; messages: CoreMessage[] } {
     const state: CompressionState = createInitialState();
     const map = emptyRefMap();
@@ -83,10 +85,12 @@ function spec(startRef: string, endRef: string): { ranges: { startRef: string; e
 
 test("T1: refs exactly as acp_status advertises them (live, inside the collision band) are accepted and fold — the #4797 deadlock is gone", () => {
     const { ctx, logs } = makeCtx();
-    // Post-restamp live numbering: d=m4, e=m5, f=m6 — m6 is ALSO e's old
-    // number (the collision band). The OLD guard span-scanned m4..m6, hit the
-    // superseded key m6 (old-kernel map), and refused — master-RED shape.
-    const res = applyRanges(spec("m00004", "m00006") as never, ctx);
+    // Post-restamp live numbering: d=m4, e=m5, f=m8 — the retired slots m6
+    // (e's old number) and m7 (f's) sit INSIDE the cited span. The OLD guard
+    // span-scanned the range, hit superseded keys, and refused — master-RED
+    // shape; now they translate onto their current owners and the fold lands.
+    assert.equal(ctx.session.state.messageRefs.byRef.m00008, "f", "#5196 parking: f holds the fresh number");
+    const res = applyRanges(spec("m00004", "m00008") as never, ctx);
     const text = typeof (res as { text?: string }).text === "string" ? (res as { text?: string }).text! : "";
     assert.ok(!text.includes("REFUSED"), `live advertised refs must not be refused; got: ${text.slice(0, 200)}`);
     // The fold actually happened and covered d, e, f.

@@ -215,14 +215,16 @@ test("#2317 e2e: a route-miss is loud in the log and a route-hit shows the match
         assert.ok(routeWarns[0].includes(`(model=${MODEL_B})`), routeWarns[0]);
         assert.ok(routeWarns[0].includes("known providers keys:"), routeWarns[0]);
         assert.match(routeWarns[0].match(/<host:[0-9a-f]{8}>/)![0], FP, "warn must fingerprint the upstream");
-        const winB = logs.filter((l) => l.includes(`[window] model=${MODEL_B}`));
+        // Match the info line by its source= field: #5490 added a sibling
+        // "[window] model=X resolved to NOTHING" warn sharing the bare prefix.
+        const winB = logs.filter((l) => l.includes(`[window] model=${MODEL_B} source=`));
         assert.equal(winB.length, 1, `one [window] line for the miss model, got: ${JSON.stringify(winB)}`);
         assert.ok(winB[0].includes("route=miss"), `[window] must label the miss, got: ${winB[0]}`);
 
         // Relay-A IS the configured key → route hit, no new warning, matched key shown.
         await drive(h.proxyPort, h.portA, MODEL_A, "s2317-a");
         assert.equal(logs.filter((l) => l.startsWith("[route] no provider route matched ")).length, 1, "a route-hit must not warn");
-        const winA = logs.filter((l) => l.includes(`[window] model=${MODEL_A}`));
+        const winA = logs.filter((l) => l.includes(`[window] model=${MODEL_A} source=`));
         assert.equal(winA.length, 1, `one [window] line for the hit model, got: ${JSON.stringify(winA)}`);
         assert.ok(!winA[0].includes("route=miss"), `[window] must not label a hit as a miss, got: ${winA[0]}`);
         assert.match(winA[0], /route=<host:[0-9a-f]{8}>/, `[window] must show the matched key fingerprint, got: ${winA[0]}`);

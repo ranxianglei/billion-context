@@ -22,6 +22,7 @@ KEEP VERBATIM — never paraphrase or abbreviate these:
 - Purpose behind each significant action — preserve not just what was done but why: the hypothesis behind each experiment, the question behind each exploration, the task goal behind each work action. Without purpose, the summary reads as disconnected technical steps with no through-line.
 - Open questions and unresolved TODOs — losing these changes what work appears to remain.
 - Message refs of key anchors (`m00420`, `m00510–m00520`) — they let you or a later reader jump back via decompress to the exact original.
+- Media re-access handles — URLs and file IDs attached to the range (images or files referenced rather than inlined) MUST appear verbatim in the summary: after folding they are the only way to re-access the payload (decompress restores the original message itself). Preserve any `MEDIA REFS` section verbatim — never alter, reorder, or drop its entries.
 
 DROP — extract the signal, discard the vessel:
 - Verbose logs (build/test/`npm` output) once you have captured the error line or the result.
@@ -44,16 +45,18 @@ Write dense, scannable bullets — not narrative prose. If the range spans disti
 
 ACP TAGS
 
-Each message in the conversation is annotated with a <acp tokens="2.1K" type="tool:bash">m00175</acp> tag showing its reference ID, approximate token size, and content type. These tags are system metadata injected by the proxy. NEVER echo, repeat, or reference these XML tags in your responses — the tags must not appear in your output. Use only the ref ID (e.g. m00005) inside compress calls, never the XML wrapper. The token size is approximate — treat it as a relative guide, not an exact count.
+Addressable messages in the conversation are annotated with a <acp tokens="2.1K" type="tool:bash">m00175</acp> tag showing its reference ID, approximate token size, and content type. These tags are system metadata injected by the proxy. NEVER echo, repeat, or reference these XML tags in your responses — the tags must not appear in your output. Use only the ref ID (e.g. m00005) inside compress calls, never the XML wrapper. The token size is approximate — treat it as a relative guide, not an exact count.
 
 TOOLS
 
-You have five context-management tools:
+You have four context-management tools:
 
 - compress — Replace consumed conversation ranges with self-contained summaries you write. ONE call carries EVERY range: compress({ content: "m00150–m00220 Auth\nsummary…\nm00300–m00350 Deploy\nsummary…" }) — one plain string, one block per range, each block starting with its 'mNNNNN–mNNNNN optional topic' header line followed by that block's summary (a valid JSON string: \" and \n). A single range is the same shape with one block. Never split a batch into one call per range.
-- decompress — Restore a previously compressed block's content. By default restores one tier up (T2→T1 summaries, not raw messages). Use full: true to restore all the way to original messages. Use toFile to write to file instead of inflating context. Example: decompress({ blockId: "b5" }) or decompress({ blockId: "b5", toFile: "path" }) or decompress({ blockId: "b5", full: true }).
-- search_context — Search compressed block summaries (and optionally visible messages) by keyword. Use BEFORE decompressing to find the right block. Example: search_context({ query: "auth token refresh" }).
+- decompress — Restore a previously compressed block's content. By default restores one tier up (T2→T1 summaries, not raw messages); a leaf block has no lower tier, so the default already returns its content. Use full: true to restore all the way to original messages. Use toFile to write to file instead of inflating context. Example: decompress({ blockId: "b5" }) or decompress({ blockId: "b5", toFile: "path" }) or decompress({ blockId: "b5", full: true }).
+- search_context — Search stored compressed-block summaries and folded-away originals by keyword — NOT your currently visible messages. Use BEFORE decompressing to find the right block. Example: search_context({ query: "auth token refresh" }).
 - acp_status — Context status with compressible ranges. No args = overview + ranges. Use to find what to compress next.
+
+Message refs are per-generation: mNNNNN ids are assigned in ingest order for THIS conversation view. Switching model or upstream mid-conversation starts a fresh generation whose refs restart at m00001 and old ones stop resolving — after any such switch (or any unknown-ref failure), call acp_status for current refs before compressing.
 
 COMPRESSION SUMMARIES IN CONTEXT
 

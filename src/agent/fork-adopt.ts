@@ -12,7 +12,7 @@ import { ACP_NAME_ALT } from "../loop/tag-echo-filter.js";
  * parentSession alone, opencode V2 derives it from session.created), and
  * before a fork child's first model request replays into the proxy, adopts
  * the parent conversation's compression state through the plugin fork
- * protocol (PLUGIN.md §8). This module is the client half: it projects the
+ * protocol (docs/plugin-protocol.md §8). This module is the client half: it projects the
  * outgoing body (openai/anthropic/responses dialects) the same way the
  * server's incomingCoreMessages does, matches the longest parent prefix by
  * identity hash, and posts the fork receipt. The google wire has no
@@ -74,16 +74,17 @@ function forkHash(value: unknown): string {
     return createHash("sha256").update(forkStableJson(value), "utf8").digest("hex");
 }
 
-// #5123: canonicalize the identity inputs so serialization/projection noise
-// cannot truncate fork prefix matching. Two relaxations vs the historical
-// tuple, both owner-approved after forensics showed every break on affected
-// sessions was noise, not content loss (97.6%~99.8% of rows align once these
-// two are applied): (1) contentType drops out — a reasoning cell and a text
-// cell with the same text ARE the same history cell (hosts re-project
-// reasoning↔text); (2) tool-call text is JSON-canonicalized — re-stringified
-// arguments differ only in whitespace. role/text/toolName/toolCallId/
-// thinkingTokens/summaryOfBlockId/toolIsError remain hard gates. Must stay
-// byte-identical to src/plugin.ts forkCanonicalText.
+// #5122/#5123: canonicalize the identity inputs so serialization/projection
+// noise cannot truncate fork prefix matching on either side of the wire. Two
+// relaxations vs the historical tuple, both owner-approved after forensics
+// showed every break on affected sessions was noise, not content loss (97.6%~
+// 99.8% of rows align once these two are applied): (1) contentType drops out
+// — a reasoning cell and a text cell with the same text ARE the same history
+// cell (hosts re-project reasoning↔text); signed-thinking cells stay
+// distinguished because their carrier rides thinkingSignature /
+// googleThoughtSignature below. (2) tool-call text is JSON-canonicalized —
+// re-stringified arguments differ only in whitespace. Must stay byte-identical
+// to src/plugin.ts forkCanonicalText + forkMessageIdentityHash.
 function forkCanonicalText(text: unknown, contentType: unknown): unknown {
     if (contentType === "tool-call" && typeof text === "string") {
         try { return JSON.stringify(JSON.parse(text)); } catch { return text; }
@@ -91,10 +92,22 @@ function forkCanonicalText(text: unknown, contentType: unknown): unknown {
     return text ?? null;
 }
 
-/** Byte-identical to src/plugin.ts forkMessageIdentityHash. */
+// Both-sides-only field set — byte-identical to what src/plugin.ts
+// forkMessageIdentityHash digests: thinkingTokens (host-projected metering
+// mass, never present in the client's bytes) is excluded; signed thinking
+// content rides thinkingSignature / googleThoughtSignature; the opaque
+// redacted_thinking payload digests itself (its projected text is a constant
+// label).
+function redactedPayloadDigest(message: CoreMessage): string | null {
+    const block = (message as CoreMessage & { rawAnthropicBlock?: { type?: unknown; data?: unknown } }).rawAnthropicBlock;
+    if (!block || block.type !== "redacted_thinking" || typeof block.data !== "string") return null;
+    return createHash("sha256").update(block.data, "utf8").digest("hex").slice(0, 16);
+}
+
 export function forkIdentityHashOf(message: CoreMessage): string {
-    const toolIsError = (message as CoreMessage & { toolIsError?: boolean }).toolIsError === true;
-    return forkHash([message.role, forkCanonicalText(message.text, message.contentType), message.toolName ?? null, message.toolCallId ?? null, message.thinkingTokens ?? null, message.summaryOfBlockId ?? null, toolIsError]);
+    const m = message as CoreMessage & { thinkingSignature?: string; googleThoughtSignature?: string; toolIsError?: boolean };
+    const toolIsError = m.toolIsError === true;
+    return forkHash([m.role, forkCanonicalText(m.text, m.contentType), m.toolName ?? null, m.toolCallId ?? null, m.thinkingSignature ?? null, m.googleThoughtSignature ?? null, m.summaryOfBlockId ?? null, toolIsError, redactedPayloadDigest(m)]);
 }
 
 /** Byte-identical to src/plugin.ts forkOrderHash (plain JSON.stringify over
