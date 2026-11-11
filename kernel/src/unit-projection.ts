@@ -228,7 +228,7 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
         input.excludeNestedBlockIds!.has(id),
       )
     : [];
-  const consumedBlockIds = resolved.nestedBlockIds.filter((id) => {
+  let consumedBlockIds = resolved.nestedBlockIds.filter((id) => {
     if (input.excludeNestedBlockIds?.has(id)) return false;
     const block = blockById(input.state, id);
     return block?.active && block.tier === targetTier;
@@ -540,6 +540,119 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
               `Inherited a pre-existing turn-integrity conflict this merge does not touch (${[...current].slice(0, 6).map((id) => input.state.messageRefs.byRaw[id] ?? id).join(", ")}): the partner(s) are already covered by other blocks or still visible. Left as-is — fold the visible partner(s) into coverage to clear it.`,
             );
           } else {
+            // #5919: classify the stranded set BEFORE the exclusion dance.
+            // A merge can only end one of two ways: by closing the turn
+            // (every partner of every folded reasoning/call gets coverage)
+            // or by keeping the poison block active AROUND a turn that is
+            // already closed outside the span. A stranded partner that can
+            // NEVER fold (BLOCKED / recent-zone / protected tool /
+            // unrecoverable media) makes both impossible — pre-#5919 that
+            // surfaced as a retryable "cannot satisfy turn integrity" fatal
+            // promising the partner(s) would "age into coverage", which never
+            // happens: every retry re-failed the same way and the advertised
+            // merge dead-ended (billion-context#5919, session-ad47cd30).
+            // Such a merge is now an idempotent no-op with exact guidance.
+            const refOf5919 = (id: string): string =>
+              input.state.messageRefs.byRaw[id] ?? id;
+            const isNeverFoldable5919 = (id: string): boolean => {
+              const ref = refOf5919(id);
+              const msg = msgById(id);
+              if (ref === "BLOCKED" || !msg) return true;
+              if (input.protectedMessageIds?.has(ref)) return true;
+              if (
+                filterProtectedToolMessages(
+                  [id],
+                  input.messages,
+                  input.config,
+                  shared,
+                ).length === 0
+              )
+                return true;
+              return hasUnrecoverableMediaPayload(msg);
+            };
+            const visibleStranded = [...current].filter(
+              (id) => !survivingCoverage.has(id) && !consumedCoverage.has(id),
+            );
+            const doomedStranded = visibleStranded.filter(isNeverFoldable5919);
+            if (doomedStranded.length > 0) {
+              const foldablePartners = visibleStranded.filter(
+                (id) => !isNeverFoldable5919(id),
+              );
+              warnings.push(
+                `Merge of ${consumedBlockIds.join(", ")} skipped — its turn cannot be closed now: ${doomedStranded.map(refOf5919).join(", ")} ${doomedStranded.length === 1 ? "is" : "are"} protected (never foldable) while the rest of their turn is covered by block(s). Do not retry this merge.${foldablePartners.length > 0 ? ` The foldable partner(s) ${foldablePartners.map(refOf5919).join(", ")} can only close their turn together with the protected member(s) — they stay visible until the protection lifts.` : ""}`,
+              );
+              // Consume nothing so the no-op below leaves every block active
+              // (coverage intact — the #4484 invariant).
+              consumedBlockIds = [];
+              filteredIds = [];
+              return finish({ fatal: null });
+            }
+            // #5919 rung 2 (fallback): rung 1 (the exclusion ladder) could
+            // not complete the merge — it re-failed, or it "succeeded" by
+            // folding nothing while the conflict stays live (the silent
+            // variant of the same deadlock). Before surfacing the fatal, try
+            // closing the turn by extending THIS fold to the stranded visible
+            // partner(s): the exact manual unblock the old error text
+            // instructed ("fold the stranded visible partner(s) first with a
+            // plain message-range compress"), done automatically so the
+            // advertised merge stops dead-ending (billion-context#5919).
+            let extended5919 = false;
+            const tryExtend5919 = (): boolean => {
+              if (
+                extended5919 ||
+                visibleStranded.length === 0 ||
+                visibleStranded.length > 16
+              )
+                return false;
+              // Every stranded member is foldable (the doomed check above
+              // already no-ops the protected/BLOCKED ones). Commit the
+              // extension only if a fixed-point re-judge shows NO fold-side
+              // withdrawal (the same judge the merge path below runs).
+              const extended = new Set(effectiveMessageIds);
+              for (const id of unfolded) extended.delete(id);
+              for (const id of visibleStranded) extended.add(id);
+              const checkBase = new Set(extended);
+              for (const id of survivingCoverage) checkBase.add(id);
+              let clean = false;
+              let check = new Set(checkBase);
+              for (let guard = 0; guard < 8; guard++) {
+                const w = computeIntegrityWithdrawals(
+                  input.messages,
+                  check,
+                  shared?.integrityPre,
+                ).withdrawn;
+                if (w.size === 0) {
+                  clean = true;
+                  break;
+                }
+                let touchesFold = false;
+                for (const id of w) {
+                  if (extended.has(id)) {
+                    touchesFold = true;
+                    break;
+                  }
+                }
+                if (touchesFold) break;
+                const next = new Set(check);
+                for (const id of w) next.delete(id);
+                if (next.size === check.size) break;
+                check = next;
+              }
+              if (!clean) return false;
+              for (const id of visibleStranded) {
+                if (skippedCarrierIds.includes(id)) continue;
+                effectiveMessageIds.add(id);
+                if (!directMessageIds.includes(id))
+                  directMessageIds.push(id);
+                if (!filteredIds.includes(id)) filteredIds.push(id);
+              }
+              warnings.push(
+                `Extended this merge to fold stranded partner(s) ${visibleStranded.map(refOf5919).join(", ")} so the turn closes (billion-context#5919) — the new block's coverage includes them.`,
+              );
+              extended5919 = true;
+              return true;
+            };
+            let retried: UnitProjection | null = null;
             if ((input.excludeNestedBlockIds?.size ?? 0) < 64) {
               const ownerByMessageId = new Map<string, string>();
               for (const bid of consumedBlockIds) {
@@ -557,29 +670,55 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
                 ),
               ].sort();
               if (offending.length > 0) {
-                const retried = projectUnit({
+                retried = projectUnit({
                   ...input,
                   excludeNestedBlockIds: new Set([
                     ...(input.excludeNestedBlockIds ?? []),
                     ...offending,
                   ]),
                 });
-                if (retried.fatal === null) {
+                const retriedFoldedNothing =
+                  retried.fatal === null &&
+                  retried.filteredIds.length === 0 &&
+                  retried.consumedBlockIds.length === 0;
+                if (retried.fatal === null && !retriedFoldedNothing) {
                   warnings.push(
-                    `Excluded ${offending.join(", ")} from this merge — their coverage cuts through a turn group whose partner(s) are still visible outside the span, and unfolding them would drop their only coverage. They stay ACTIVE (coverage intact) and can be distilled once the stranded partner(s) age into coverage; the merge proceeded around them.`,
+                    `Excluded ${offending.join(", ")} from this merge — their coverage cuts through a turn group whose partner(s) are still visible outside the span, and unfolding them would drop their only coverage. They stay ACTIVE (coverage intact); the merge proceeded around them.`,
                   );
                   return retried;
                 }
+                // Rung 1 could not complete the merge (re-failed, or folded
+                // nothing while the conflict stays live) — rung 2.
+                tryExtend5919();
+              } else {
+                // No consumed block owns the unresolved ids: nothing to
+                // exclude — rung 2 directly.
+                tryExtend5919();
               }
+            } else {
+              // Ladder exhausted (64 exclusions) — rung 2.
+              tryExtend5919();
             }
-            return finish({
-              fatal: {
-                kind: "split",
-                error: new Error(
-                  actionableSplitError(consumedBlockIds, current, input),
-                ),
-              },
-            });
+            if (!extended5919) {
+              if (retried !== null && retried.fatal === null) {
+                // Rung 1 "succeeded" by folding nothing and rung 2 had no
+                // foldable partner to extend to (the #5789 self-range no-op
+                // shape): keep the pinned idempotent no-op — a retry here
+                // must not arm the breaker.
+                return retried;
+              }
+              return finish({
+                fatal: {
+                  kind: "split",
+                  error: new Error(
+                    actionableSplitError(consumedBlockIds, current, input),
+                  ),
+                },
+              });
+            }
+            // #5919 rung 2 committed the extension: the fold now closes the
+            // turn, so fall through to the common withdrawal handling below
+            // (the same path merge-neutral inheritance takes).
           }
         }
         withdrawnIds = unfolded;
@@ -916,9 +1055,24 @@ function actionableSplitError(
         .filter((bid): bid is string => bid !== undefined),
     ),
   ];
+  const visibleRefs = [...unresolved]
+    .filter((id) => !consumedOwners.has(id) && !survivingOwners.has(id))
+    .map(refOf)
+    .sort((a, b) => refNum5919(a) - refNum5919(b) || a.localeCompare(b))
+    .slice(0, 6);
+  const unblockHint =
+    visibleRefs.length > 0
+      ? ` The exact unblock: one plain message-range compress over ${visibleRefs[0]}..${visibleRefs[visibleRefs.length - 1]!} (it may cover extra messages — that is fine), then retry this merge — the conflict clears once those partner(s) are covered.`
+      : ` The exact unblock: fold the stranded partner(s) listed above into coverage with a plain message-range compress, then retry this merge.`;
   const tail =
     survivingOffenders.length > 0
-      ? ` Block(s) ${survivingOffenders.join(", ")} survive this merge unchanged and keep the conflict alive — they can only distill once their partner(s) age into coverage.`
+      ? ` Block(s) ${survivingOffenders.join(", ")} stay active with their current coverage; this merge will not touch them.`
       : ` Merge a sub-span that stops before or resumes after the offending block instead.`;
-  return `Merging ${consumedBlockIds.join(", ")} cannot satisfy turn integrity without dropping existing coverage: folding would strand ${detail}. Do not retry the same span — fold the stranded visible partner(s) first with a plain message-range compress so the turn closes.${tail}`;
+  return `Merging ${consumedBlockIds.join(", ")} cannot satisfy turn integrity without dropping existing coverage: folding would strand ${detail}. Do not retry the same span — fold the stranded visible partner(s) first with a plain message-range compress so the turn closes.${unblockHint}${tail}`;
+
+/** #5919: numeric order for the unblock hint (BLOCKED sorts last). */
+function refNum5919(ref: string): number {
+  const m = /^m(\d+)$/.exec(ref);
+  return m ? Number(m[1]!) : Number.MAX_SAFE_INTEGER;
+}
 }

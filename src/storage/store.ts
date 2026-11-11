@@ -160,6 +160,12 @@ export interface MessageRow {
  *  hydration row, served when the resident window no longer carries the bytes. */
 export type MessageRefContentRow = { refNum: number; role: string; kind: string; content: string };
 
+/** #6029: one stored message addressed by its STABLE msg_id (the content-derived
+ *  identity). Unlike ref_num — frozen at index time — msg_id never moves under a
+ *  restampRefsToLedger renumbering, so it is the correct join key for the web
+ *  hydration lane once the live ref space has diverged from the stored numbers. */
+export type MessageIdContentRow = { msgId: string; role: string; kind: string; content: string };
+
 export interface BlockRow {
     blockId: string;
     ord: number;
@@ -1133,8 +1139,13 @@ export class UnifiedStore {
                 .all(s.sessionId) as StoredBlockRow[]) {
                 storedBlocks.set(row.block_id, row);
             }
+            // #5898 review (P3): rebuild the O(1) membership set the
+            // pre-#5744 code had — a per-stored-block Array.some over the
+            // incoming blocks is O(stored×incoming) string compares on the
+            // sync record() path that #5744 exists to make cheaper.
+            const incomingBlockIds = new Set(input.blocks.map((b) => b.blockId));
             for (const [blockId, stale] of storedBlocks) {
-                if (input.blocks.some((b) => b.blockId === blockId)) continue;
+                if (incomingBlockIds.has(blockId)) continue;
                 // referencing row first, then release (#4242 delete-on-zero)
                 this.db.prepare("DELETE FROM blocks WHERE session_id = ? AND block_id = ?").run(s.sessionId, blockId);
                 this.releaseContent(stale.summary_hash);
@@ -1766,6 +1777,31 @@ export class UnifiedStore {
             }
         }
         return out.sort((a, b) => a.refNum - b.refNum);
+    }
+
+    /** #6029: message bodies addressed by their STABLE msg_id — the restamp-proof
+     *  twin of messageContentByRefNums. restampRefsToLedger renumbers the LIVE
+     *  refs at cold load (the #5196 parked band lands on fresh high numbers), but
+     *  messages.ref_num is frozen at index time, so a ref-number join silently
+     *  misses every renumbered row. msg_id never moves under a restamp; unknown
+     *  ids come back absent and retired rows stay excluded, exactly like the
+     *  ref-number sibling. */
+    messageContentByMsgIds(sessionId: string, msgIds: readonly string[]): MessageIdContentRow[] {
+        if (msgIds.length === 0) return [];
+        const ids = [...new Set(msgIds)];
+        const CHUNK = 500;
+        const out: MessageIdContentRow[] = [];
+        for (let i = 0; i < ids.length; i += CHUNK) {
+            const chunk = ids.slice(i, i + CHUNK);
+            const ph = chunk.map(() => "?").join(",");
+            for (const r of this.db
+                .prepare(`SELECT msg_id, role, kind, content_hash FROM messages WHERE session_id = ? AND retired_at IS NULL AND msg_id IN (${ph})`)
+                .all(sessionId, ...chunk) as { msg_id: string; role: string; kind: string; content_hash: string }[]) {
+                const base = this.getContent(r.content_hash);
+                if (base !== null) out.push({ msgId: r.msg_id, role: r.role, kind: r.kind, content: this.hydrateMedia(base) });
+            }
+        }
+        return out;
     }
 
     /** #3841 reap journal: targeted update for the orphan shape (#2695 reap —

@@ -194,8 +194,11 @@ const MAX_CIRCUITS = 32;
 interface CircuitEntry {
     state: UpstreamCircuit;
     /** True while the single half-open probe is in flight — concurrent
-     *  requests fail fast instead of stacking parallel probes. */
+     *  requests fail fast instead of stacking parallel probes. The slot is a
+     *  lease that lapses one cooldown after probeAt: a claimant can be answered
+     *  locally (e.g. by the #4204 429 hold) and never settle it. */
     probeInFlight: boolean;
+    probeAt: number;
     /** #4254: timestamp of the last emitted per-request fail-fast [warn], used by
      *  noteCircuitFailFastLog to bound the OPEN-state log storm to one line/window. */
     lastFailFastLogAt: number;
@@ -223,8 +226,10 @@ export function upstreamCircuitBlockReason(url: string, now: number = Date.now()
     if (!entry || entry.state.openedAt === null) return undefined;
     const c = entry.state;
     if (now < (c.nextProbeAt ?? 0)) return blockReasonText(c, now);
-    if (entry.probeInFlight) return blockReasonText(c, now);
+    // Lease, not lock (see CircuitEntry.probeInFlight).
+    if (entry.probeInFlight && now - entry.probeAt < circuitProbeCooldownMs) return blockReasonText(c, now);
     entry.probeInFlight = true;
+    entry.probeAt = now;
     return undefined;
 }
 
@@ -307,7 +312,7 @@ export function recordUpstreamCircuitFailure(url: string, error: unknown, viaPro
             }
             if (oldestKey !== undefined) circuits.delete(oldestKey);
         }
-        entry = { state: { host, consecutiveFailures: 0, openedAt: null, nextProbeAt: null, lastFailure: null }, probeInFlight: false, lastFailFastLogAt: 0 };
+        entry = { state: { host, consecutiveFailures: 0, openedAt: null, nextProbeAt: null, lastFailure: null }, probeInFlight: false, probeAt: 0, lastFailFastLogAt: 0 };
         circuits.set(host, entry);
     }
     const c = entry.state;
@@ -341,11 +346,28 @@ export function recordUpstreamCircuitSuccess(url: string): void {
     circuits.delete(entry.state.host);
 }
 
+/** #6026: an OPEN circuit whose last scheduled probe lies more than
+ *  ALERT_STALE_MS in the past — with no newer failure since — is history, not
+ *  NOW, for REPORTING purposes only. Probes are request-driven (no background
+ *  timer), so once traffic to the host stops, nextProbeAt freezes and the entry
+ *  would otherwise pin every status surface forever — its only removal path is
+ *  a resolved response, which an on-demand local model may never send again.
+ *  The same window as the alert TTL so both tables age out together and the
+ *  banner source drains as one unit. Deliberately report-only: the entry stays
+ *  in the map and upstreamCircuitBlockReason keeps consulting it, so fail-fast
+ *  and the half-open probe slot behave exactly as before. */
+function isOpenCircuitStale(e: CircuitEntry, now: number): boolean {
+    const c = e.state;
+    if (c.openedAt === null) return false;
+    const anchor = c.nextProbeAt ?? c.lastFailure?.at ?? c.openedAt;
+    return now - anchor > ALERT_STALE_MS;
+}
+
 /** Open circuits for status surfaces (acp_status / web UI), newest first.
- *  Closed hosts keep no entry. Fresh copies. */
-export function getOpenUpstreamCircuits(): UpstreamCircuit[] {
+ *  Closed hosts keep no entry; stale idle circuits are excluded (#6026). */
+export function getOpenUpstreamCircuits(now: number = Date.now()): UpstreamCircuit[] {
     return [...circuits.values()]
-        .filter((e) => e.state.openedAt !== null)
+        .filter((e) => e.state.openedAt !== null && !isOpenCircuitStale(e, now))
         .map((e) => ({ ...e.state }))
         .sort((a, b) => (b.openedAt ?? 0) - (a.openedAt ?? 0));
 }
@@ -359,7 +381,9 @@ export function getOpenUpstreamCircuits(): UpstreamCircuit[] {
 // conversations point at. Merges the two existing tables into one stable
 // shape: the open circuit is the authoritative "currently down" signal
 // (fail-fast stops minting new alerts once open), while the alert rows carry
-// the actionable hint and cover the pre-circuit window.
+// the actionable hint and cover the pre-circuit window. An idle open circuit —
+// last scheduled probe more than ALERT_STALE_MS in the past with no newer
+// failure — is excluded from this projection like any stale alert row (#6026).
 
 export interface UpstreamHealthEntry {
     /** Host[:port] the failing traffic targeted — raw (endpoint is loopback-gated). */
@@ -401,7 +425,8 @@ export function getUpstreamHealthReport(now: number = Date.now()): UpstreamHealt
     };
     for (const a of alerts.values()) touch(a.host).alerts.push(a);
     for (const e of circuits.values()) {
-        if (e.state.openedAt !== null) touch(e.state.host).circuit = e.state;
+        // #6026: report-only staleness filter — see isOpenCircuitStale.
+        if (e.state.openedAt !== null && !isOpenCircuitStale(e, now)) touch(e.state.host).circuit = e.state;
     }
     const upstreams: UpstreamHealthEntry[] = [];
     for (const [host, { alerts: hostAlerts, circuit }] of byHost.entries()) {

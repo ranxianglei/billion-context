@@ -11,7 +11,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { HARVEST_TAIL_BYTES, findProjectJsonlFiles, headerFirst, harvestIdentity, readJsonlTail, registerIdentitySource, resetIdentityHarvestForTest, type IdentityHarvestCtx } from "../src/identity-harvest.js";
+import { alignTailIds, HARVEST_TAIL_BYTES, findProjectJsonlFiles, headerFirst, harvestIdentity, readJsonlTail, registerIdentitySource, resetIdentityHarvestForTest, type IdentityHarvestCtx } from "../src/identity-harvest.js";
 import { claudeVisibleRows, registerClaudeIdentitySource } from "../src/identity-claude.js";
 import { codebuddyVisibleRows, registerCodebuddyIdentitySource } from "../src/identity-codebuddy.js";
 import { registerGooseIdentitySource } from "../src/identity-goose.js";
@@ -347,4 +347,98 @@ test("session recognition: x-conversation-id sits below client-specific + affini
     // goose's client-specific header rides in the specific tier
     assert.equal(src({ "agent-session-id": "20261107_1", "session_id": "gen" })?.name, "agent-session-id");
     assert.equal(src({ "x-claude-code-session-id": "cc-1", "agent-session-id": "20261107_1" })?.name, "x-claude-code-session-id");
+});
+
+/* ---------------- alignTailIds: role-sequence + id-continuity (PR #5898 review) ---------------- */
+
+const acCtx = (sessionId: string, expectedLen: number, messageRoles?: string[]): IdentityHarvestCtx =>
+    ({ sessionId, expectedLen, messageRoles });
+
+const rows = (n: number, base = "r"): Array<{ id: string; role: string }> =>
+    Array.from({ length: n }, (_, i) => ({ id: `${base}${i + 1}`, role: i % 2 === 0 ? "user" : "assistant" }));
+
+test("alignTailIds: a store rewrite moving a pinned row into the overlap degrades the turn", () => {
+    resetIdentityHarvestForTest();
+    // turn 1: 4 rows, wire = last 2 ([r3 user, r4 assistant]) → pins land.
+    const first = alignTailIds(acCtx("s1", 2, ["user", "assistant"]), rows(4));
+    assert.deepEqual(first, ["r3", "r4"]);
+    // turn 2: the store was compacted/rewritten — same row COUNT and same role
+    // pattern at the tail, but the last two rows carry NEW ids (the old r3/r4
+    // were replaced). A pre-fix alignment would have stamped the wire's r3/r4
+    // content with the new rows' ids. Now the overlap disagrees → null.
+    const after = [...rows(2, "w"), { id: "r5x", role: "user" as const }, { id: "r6x", role: "assistant" as const }];
+    assert.equal(alignTailIds(acCtx("s1", 2, ["user", "assistant"]), after), null);
+});
+
+test("alignTailIds: healthy append-only progression passes, with and without overlap", () => {
+    resetIdentityHarvestForTest();
+    const first = alignTailIds(acCtx("s2", 3, ["assistant", "user", "assistant"]), rows(4));
+    assert.deepEqual(first, ["r2", "r3", "r4"]);
+    // +2 rows (the normal turn exchange): overlap of the tails is non-empty
+    // and consistent → no false degrade.
+    const grown = alignTailIds(acCtx("s2", 3, ["assistant", "user", "assistant"]), rows(6));
+    assert.deepEqual(grown, ["r4", "r5", "r6"]);
+    // a whole session's worth of new rows: the tails no longer overlap at all.
+    // Append-only ⇒ nothing moved ⇒ still fine.
+    const far = alignTailIds(acCtx("s2", 3, ["assistant", "user", "assistant"]), rows(40));
+    assert.deepEqual(far, ["r38", "r39", "r40"]);
+});
+
+test("alignTailIds: a role flip OUTSIDE the old 4-position spot-check window degrades", () => {
+    resetIdentityHarvestForTest();
+    // 10 rows, wire = all of them; the wire claims user at position 2 where the
+    // store says assistant. The old spot check only compared the last 4
+    // positions and passed this; the full-sequence check must not.
+    const r = rows(10);
+    const badRoles = ["user", "assistant", "user", "user", "assistant", "user", "assistant", "user", "assistant", "user"];
+    assert.equal(alignTailIds(acCtx("s3", 10, badRoles), r), null);
+    // and the matching sequence passes
+    const ok = alignTailIds(acCtx("s3b", 10, r.map((x) => x.role)), rows(10));
+    assert.deepEqual(ok, rows(10).map((x) => x.id));
+});
+
+test("alignTailIds: a pure even late append with no moved row still passes (bounded pin drift, not leakage)", () => {
+    resetIdentityHarvestForTest();
+    // turn 1 pins the last 2 of 4 rows.
+    assert.deepEqual(alignTailIds(acCtx("s4", 2, ["user", "assistant"]), rows(4)), ["r3", "r4"]);
+    // turn 2: a FULL extra turn (user+assistant) was persisted after the
+    // request was built. Roles match at every position (alternation) and no
+    // store row moved — undecidable from roles alone by design; the residual
+    // cost is pin drift for this turn, never a cross-session wrong identity.
+    const stale = alignTailIds(acCtx("s4", 2, ["user", "assistant"]), rows(6));
+    assert.deepEqual(stale, ["r5", "r6"]);
+});
+
+test("alignTailIds: state is per-session; cap eviction fails open for one turn", () => {
+    resetIdentityHarvestForTest();
+    // two sessions interleave without contaminating each other
+    assert.deepEqual(alignTailIds(acCtx("a", 2, ["user", "assistant"]), rows(4, "A")), ["A3", "A4"]);
+    assert.deepEqual(alignTailIds(acCtx("b", 2, ["user", "assistant"]), rows(4, "B")), ["B3", "B4"]);
+    // session "a" store rewritten → still degrades (its state survived "b")
+    assert.equal(
+        alignTailIds(acCtx("a", 2, ["user", "assistant"]), [
+            { id: "A1", role: "user" }, { id: "A2", role: "assistant" },
+            { id: "Ax", role: "user" }, { id: "Ay", role: "assistant" },
+        ]),
+        null,
+    );
+    // fill the 512-entry cap with other sessions → "a"'s state evicted; its
+    // next rewritten-store alignment fails OPEN (one turn of pin drift at
+    // worst), then re-arms.
+    for (let i = 0; i < 600; i++) alignTailIds(acCtx(`fill${i}`, 2, ["user", "assistant"]), rows(4, `F${i}`));
+    assert.deepEqual(
+        alignTailIds(acCtx("a", 2, ["user", "assistant"]), [
+            { id: "A1", role: "user" }, { id: "A2", role: "assistant" },
+            { id: "Ax", role: "user" }, { id: "Ay", role: "assistant" },
+        ]),
+        ["Ax", "Ay"],
+    );
+    // and re-armed: a further rewrite now degrades again
+    assert.equal(
+        alignTailIds(acCtx("a", 2, ["user", "assistant"]), [
+            { id: "A1", role: "user" }, { id: "A2", role: "assistant" },
+            { id: "Aw", role: "user" }, { id: "Av", role: "assistant" },
+        ]),
+        null,
+    );
 });

@@ -71,7 +71,7 @@ const MAX_IDS = 16_384;
  *  of src/server/fastpath-v6.ts PF_TAIL_WINDOW (server expects exactly
  *  min(N, T); the byte-budget derivation lives with that constant). */
 const PF_TAIL_WINDOW = 64;
-const MAX_TRACKED = 1024; // sid table cap (same hygiene as the old per-lane maps)
+const MAX_TRACKED = 1024; // sid table cap — at capacity exactly ONE oldest session is evicted (#6044)
 
 type Tracked = { t?: number; ids?: string[]; /** #5643: minted pf_sid echoed back by a v6-enabled server. */ v6?: string };
 
@@ -80,10 +80,15 @@ const tracked = new Map<string, Tracked>();
 function takeSlot(sid: string): Tracked {
     let slot = tracked.get(sid);
     if (slot === undefined) {
-        if (tracked.size >= MAX_TRACKED) tracked.clear();
+        if (tracked.size >= MAX_TRACKED) {
+            const oldest = tracked.keys().next().value;
+            if (oldest !== undefined) tracked.delete(oldest);
+        }
         slot = {};
-        tracked.set(sid, slot);
+    } else {
+        tracked.delete(sid);
     }
+    tracked.set(sid, slot);
     return slot;
 }
 
@@ -163,6 +168,8 @@ export function pfRequestHeaders(incoming: Record<string, string>): Record<strin
     if (sid === undefined || sid.length === 0) return {};
     const slot = tracked.get(sid);
     if (slot === undefined) return {};
+    tracked.delete(sid); // #6044 LRU touch — recency drives the one-oldest eviction above
+    tracked.set(sid, slot);
     const out: Record<string, string> = {};
     if (slot.t !== undefined && slot.t >= 1) out[COUNT_HEADER] = String(slot.t);
     const ids = slot.ids;
