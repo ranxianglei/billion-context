@@ -2154,7 +2154,27 @@ export class UnifiedStore {
         if (!dump.session || dump.session.sessionId !== sessionId) return { ok: false, reason: "export-mismatch" };
         const sess: NonNullable<typeof dump.session> = dump.session;
         this.db.transaction(() => {
-            for (const [hash, body] of Object.entries(dump.content)) this.putContent(Buffer.from(body, "utf8"), hash);
+            const references = new Map<string, number>();
+            const addRef = (hash: unknown): void => {
+                if (typeof hash === "string") references.set(hash, (references.get(hash) ?? 0) + 1);
+            };
+            for (const m of dump.messages) addRef(m.content_hash);
+            for (const mm of (dump as { mediaMaps?: Record<string, unknown>[] }).mediaMaps ?? []) addRef(mm.media_hash);
+            for (const b of dump.blocks) {
+                if (this.db.prepare("SELECT 1 FROM blocks WHERE session_id = ? AND block_id = ?").get(sessionId, b.block_id)) continue;
+                addRef(b.summary_hash);
+                addRef(b.one_hash);
+            }
+            for (const e of dump.ccrEntries) addRef(e.content_hash);
+            for (const cp of dump.checkpoints) {
+                if (!this.getCheckpoint(cp.cp_id as string)) addRef(cp.state_hash);
+            }
+            for (const [hash, count] of references) {
+                const body = dump.content[hash] ?? this.getContent(hash);
+                if (body === null || body === undefined) throw new Error(`archive content missing: ${hash}`);
+                this.putContent(body, hash);
+                if (count > 1) this.db.prepare("UPDATE content SET refcount = refcount + ? WHERE hash = ?").run(count - 1, hash);
+            }
             const insMsg = this.db.prepare("INSERT INTO messages (session_id, seq, msg_id, ref, ref_num, role, kind, content_hash, identity, retired_at, ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
             for (const m of dump.messages) {
                 // #4665: pre-fix dumps lack both fields — recompute identity
@@ -2287,7 +2307,12 @@ export class UnifiedStore {
                 "SELECT 1 AS one FROM blocks WHERE session_id = ? AND block_id = ?",
             ).get(sessionId, blockId);
             if (twin) return;
-            for (const [hash, body] of Object.entries(dump.content)) this.putContent(Buffer.from(body, "utf8"), hash);
+            for (const hash of [dump.block.summary_hash, dump.block.one_hash]) {
+                if (typeof hash !== "string") continue;
+                const body = dump.content[hash];
+                if (body === undefined) throw new Error(`archive content missing: ${hash}`);
+                this.putContent(body, hash);
+            }
             this.db.prepare(
                 `INSERT INTO blocks (block_id, session_id, ord, start_seq, end_seq, start_ref, end_ref, tier, summary_hash, one_hash, supersedes_block_id, active, created_at, covered_hash, payload_json)
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(session_id, block_id) DO NOTHING`,

@@ -1871,7 +1871,29 @@ export class MysqlBackend implements StorageBackend {
         if (!dump.session || dump.session.sessionId !== sessionId) return { ok: false, reason: "export-mismatch" };
         const sess = dump.session;
         await this.tx(async (c) => {
-            for (const [hash, body] of Object.entries(dump.content)) await this.putContent(c, body, hash);
+            const references = new Map<string, number>();
+            const addRef = (hash: unknown): void => {
+                if (typeof hash === "string") references.set(hash, (references.get(hash) ?? 0) + 1);
+            };
+            for (const m of dump.messages) addRef(m.content_hash);
+            for (const mm of (dump as { mediaMaps?: Record<string, unknown>[] }).mediaMaps ?? []) addRef(mm.media_hash);
+            for (const b of dump.blocks) {
+                const [twins] = await c.query("SELECT 1 FROM blocks WHERE session_id = ? AND block_id = ?", [sessionId, b.block_id]);
+                if ((twins as Row[]).length > 0) continue;
+                addRef(b.summary_hash);
+                addRef(b.one_hash);
+            }
+            for (const e of dump.ccrEntries) addRef(e.content_hash);
+            for (const cp of dump.checkpoints) {
+                const [twins] = await c.query("SELECT 1 FROM checkpoints WHERE cp_id = ?", [cp.cp_id]);
+                if ((twins as Row[]).length === 0) addRef(cp.state_hash);
+            }
+            for (const [hash, count] of references) {
+                const body = dump.content[hash] ?? await this.getContent(c, hash);
+                if (body === null || body === undefined) throw new Error(`archive content missing: ${hash}`);
+                await this.putContent(c, body, hash);
+                if (count > 1) await c.query("UPDATE content SET refcount = refcount + ? WHERE hash = ?", [count - 1, hash]);
+            }
             for (const m of dump.messages) {
                 // #4665: pre-fix dumps lack both fields — recompute identity
                 // from the CAS body (same formula as the v8 migration
