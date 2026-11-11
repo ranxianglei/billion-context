@@ -134,6 +134,8 @@ export const LIVE_FILES = [
     // child binds no port and does no network I/O, so no zone band is needed —
     // the entry is for the tripwire alone, like #3890/#5114
     "tests/integrity-worker-stderr.test.ts",
+    // Runs the Linux janitor shell against per-case local API fixtures; no ports or credentials.
+    "tests/ci-janitor-fork-heads.test.ts",
 ];
 
 /** Band width per live file: the zone ladder drifts +1 per EADDRINUSE retry;
