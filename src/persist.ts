@@ -40,7 +40,7 @@ import { orphanContents, resolveStorageMode, UnifiedShadow, hadIntegrityQuickChe
 import { noteColdLoad } from "./attach-heartbeat.js";
 import { resolveBackendName } from "./storage/backend.js";
 import { toLegacyLike, type LegacySessionLike } from "./storage/ingest.js";
-import { sha256Hex, type CheckpointRow, type MessageRefContentRow } from "./storage/store.js";
+import { sha256Hex, type CheckpointRow, type MessageRefContentRow, type MessageIdContentRow } from "./storage/store.js";
 import { contentStoreOf } from "./store.js";
 import type { WireProtocol } from "./util.js";
 import { currentContextObservation, canonicalJson, CALIBRATION_CLAMP_MAX, CALIBRATION_CLAMP_MIN, CALIBRATION_SAMPLE_MAX, CALIBRATION_SAMPLE_MIN, CALIBRATION_SAMPLE_WINDOW } from "./cache-ledger.js";
@@ -841,6 +841,23 @@ export class SessionStore {
         try {
             if (!session.contentStore || Object.keys(session.contentStore.byRef).length === 0) {
                 rmSync(abs, { force: true });
+                session.contentStoreDirty = false;
+                return true;
+            }
+            if (this.writerOffActive()) {
+                // #2960 Phase 3 extension: the off switch covers the CCR
+                // content-store sidecar as well — in effective-full mode
+                // the unified ccr mirror (ingested by this same save's
+                // builder, which runs right after this gate returns) is the
+                // durable copy, and contentStoreOf() reads it first, so the
+                // file is never consulted. contentStoreDirty is cleared for
+                // the same reason: this save drops the resident store right
+                // after the ingest (dropResidentContentStore), and a stale
+                // dirty=true with contentStore=null would make a later
+                // writer-resume save hit the emptied-store branch and
+                // DELETE the sidecar file while the table may be dead.
+                // Convergence after a writer-resume comes from the kernel
+                // re-adopting its in-memory store on the next turn.
                 session.contentStoreDirty = false;
                 return true;
             }
@@ -1943,20 +1960,32 @@ export class SessionStore {
             this.scheduleSave(session);
             this.log("info", `[persist] clamped negative token stats on reload for ${id} (#408)`);
         }
-        // #4316 layer 3 PR3/3: align the citation space with the unified
-        // ledger exactly once per state, at the ONLY safe moment — cold
-        // load. Mid-conversation alignment would shift refs the client has
-        // already seen (byte-stability contract, snapshot-render D-suite);
-        // a restart boundary has no in-flight compress call, so nothing can
-        // observe a half-renumbered map. Post-load arrivals keep minting
-        // counter refs (fresh numbers, no collision). Envelope-only loads
-        // (no rows) skip honestly.
-        this.maybeRestampToLedger(session);
+        // #4316 layer 3 PR3/3 + #5608-D (owner ruling 2026-11-06): the
+        // citation-space alignment NO LONGER runs here. Aligning at cold
+        // load renumbered every ref at every restart and made the FIRST
+        // post-restart round re-bill the whole cached prefix (the A-shape of
+        // #5608, e.g. "restamped=1156"). Alignment now DEFERS to the next
+        // successful fold of this session — its history rewrite already
+        // breaks the prefix once, so the renumbering rides that boundary
+        // free, and sessions that never fold pay nothing ever. The commit
+        // site (stream.ts fold path) sets session.pendingLedgerAlign;
+        // scheduleSave consumes it and calls maybeRestampToLedger BEFORE any
+        // build/write serializes state. Until then the outbound bytes stay
+        // byte-identical to what the provider already cached. Post-fold
+        // arrivals keep minting counter refs until alignment (fresh numbers,
+        // no collision), exactly like pre-alignment master. Envelope-only
+        // loads (no rows) skip honestly via the guard inside.
         this.logColdLoad(id, "unified store", session, record.savedAt);
         return session;
     }
 
-    /** #4316 PR3/3: one-time ref/ledger alignment at cold load. Guards:
+    /** #4316 PR3/3 (timing changed by #5608-D): one-time ref/ledger
+     *  alignment, now invoked NOT at cold load but from scheduleSave after
+     *  the session's next successful fold (session.pendingLedgerAlign
+     *  marker). The body is unchanged in intent: aligns refs onto store-row
+     *  seq+1 in one atomic pass, re-keys the CCR store and token snapshot in
+     *  the SAME pass (#4733/#4599), publishes the superseded map so stale
+     *  citations are refused rather than misattributed. Guards:
      *  state already aligned, no ref map, unified store unavailable, or no
      *  rows for this session → no-op. Multi-generation ids (edits) are
      *  excluded by seqByRaw itself — their legacy refs stay put. */
@@ -2024,6 +2053,18 @@ export class SessionStore {
             // load blocker — a failed stamp leaves the legacy refs intact.
             this.log("warn", `[persist] ref/ledger alignment skipped for ${session.id}: ${err instanceof Error ? err.message : String(err)}`);
         }
+    }
+
+    /** #5608-D: consume the deferred #4316 alignment exactly once at the
+     *  first SAVE boundary after a fold commit. Every write entry point
+     *  (scheduleSave / flushSync / writeNow) calls this BEFORE
+     *  saveContentStore / guardedBuild, so the aligned state and the
+     *  re-keyed CCR store land in the SAME serialized record (the invariant
+     *  #4733 exists for). No fold ⇒ marker never set ⇒ pure legacy no-op. */
+    private consumePendingLedgerAlign(session: Session): void {
+        if (!session.pendingLedgerAlign) return;
+        delete session.pendingLedgerAlign;
+        this.maybeRestampToLedger(session);
     }
 
     /** Unified-first view load (full mode). Null on miss. */
@@ -2425,6 +2466,21 @@ export class SessionStore {
         if (!this.shadow || this.shadow.stats.disabled) return null;
         try {
             return this.shadow.messageContentByRefNums(sessionId, refNums);
+        } catch {
+            return null; // sidecar degraded mid-call: treat as unavailable
+        }
+    }
+
+    /** #6029: per-msg_id message bodies from the unified store — the restamp-proof
+     *  web fallback. restampRefsToLedger renumbers the live refs at cold load, so
+     *  a ref-number join (unifiedMessageContentByRefs) misses every row whose live
+     *  ref drifted off its index-time number; msg_id is invariant across restamps.
+     *  Null when the unified store is unavailable — callers keep their legacy
+     *  "missing" posture and never guess. */
+    unifiedMessageContentByIds(sessionId: string, msgIds: readonly string[]): MessageIdContentRow[] | null {
+        if (!this.shadow || this.shadow.stats.disabled) return null;
+        try {
+            return this.shadow.messageContentByMsgIds(sessionId, msgIds);
         } catch {
             return null; // sidecar degraded mid-call: treat as unavailable
         }
@@ -3107,6 +3163,12 @@ export class SessionStore {
     }
 
     scheduleSave(session: Session): void {
+        // #5608-D: a committed fold IS the session's next legitimate
+        // cache-breaking boundary — run the deferred #4316 citation-space
+        // alignment HERE, before saveContentStore/guardedBuild serialize
+        // anything (the content-store re-key happens inside and must land in
+        // the same write). Cold-load alignment retired: see loadSync note.
+        this.consumePendingLedgerAlign(session);
         if (!this.saveContentStore(session)) return;
         if (this.writerOffActive() || this.envelopeFrozen(session.id)) {
             if (this.envelopeFrozen(session.id)) this.noteFrozenSkip(session.id, "scheduled");
@@ -3358,6 +3420,7 @@ export class SessionStore {
      *  check and the build), so concurrent callers there cannot interleave
      *  either. Do NOT regress this by eager-snapshotting the record here. */
     async writeNow(session: Session): Promise<void> {
+        this.consumePendingLedgerAlign(session); // #5608-D: before any serialization
         if (!this.saveContentStore(session)) throw new Error(`Originals were not saved for ${session.id}`);
         if (this.writerOffActive() || this.envelopeFrozen(session.id)) {
             if (this.envelopeFrozen(session.id)) this.noteFrozenSkip(session.id, "writeNow");
@@ -3661,6 +3724,7 @@ export class SessionStore {
      *  Returns true on success, false on failure (caller must NOT evict on
      *  failure for a never-persisted session or it is lost permanently). */
     flushSync(session: Session): boolean {
+        this.consumePendingLedgerAlign(session); // #5608-D: before any serialization
         if (!this.saveContentStore(session)) return false;
         this.tryRecoverSidecar(); // #5188: eviction-time flushes are also a recovery opportunity
         if (this.writerOffActive() || this.envelopeFrozen(session.id)) {
@@ -4380,5 +4444,26 @@ export function unifiedKvActive(): boolean {
         return _store.liveStorageStamp !== "legacy";
     } catch {
         return false;
+    }
+}
+
+/** #5753/#5757: same probe as unifiedKvActive(), but returns the store ONLY
+ *  when it actually exposes the KV methods the migration surfaces use.
+ *  Suites (and future adapters) may install a PARTIAL stub via
+ *  _setStoreForTest — e.g. snapshot-render-chain fakes only the unifiedTail*
+ *  view methods — and those must fall back to the legacy file paths silently
+ *  instead of crashing a hot path on a missing method. */
+export function kvStore(): SessionStore | null {
+    try {
+        const s = _store;
+        if (!s || s.liveStorageStamp === "legacy") return null;
+        if (
+            typeof s.getKvAsync !== "function"
+            || typeof s.setKvAsync !== "function"
+            || typeof s.listKvAsync !== "function"
+        ) return null;
+        return s;
+    } catch {
+        return null;
     }
 }

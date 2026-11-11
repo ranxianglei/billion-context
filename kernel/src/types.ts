@@ -357,6 +357,25 @@ export interface CompressionState {
      (ref = store row seq + 1) exactly once. Set by restampRefsToLedger;
      assignRefs' stamp path keeps new arrivals aligned from then on. */
   refLedgerAligned?: boolean;
+  /** #5608-C: high-water mark of ref index for time-attribute visibility.
+     Written exactly once by the first enabled stamp pass (= its PRE-PASS
+     highest ref index). A stored timestamp renders into a tag only when the
+     message's CURRENT ref index exceeds it — i.e. its ref was minted after
+     this session first ran with #4313 on; older refs keep their attribute-free
+     bytes until an edit/fold re-mints them (the number change already broke
+     those bytes, so the attribute costs zero extra). Restamp/ledger alignment
+     raises it as well (#5608-C), so alignment never re-grants attributes to
+     old refs mid-prefix. Optional: absent until the feature first runs. */
+  timestampsHighWaterRefSeq?: number;
+  /** #5608-B: one-shot honest-NULL arm for the stamp node. Set by the host
+     right before a FRESH-state child's first turn when that child inherited a
+     parent's history (resume adoption / fork clone): the stamp node must not
+     mint Date.now() for ids it did not actually watch arrive — unknown times
+     stay NULL instead of being fabricated as "today" (#5608-A display tier).
+     Consumed by the first enabled stamp pass whether or not anything was
+     stamped. Process-lifetime only — hydration never carries it across a
+     restart (dropping it is the safe default). */
+  suppressMintingOnce?: boolean;
   /** Ref-migration render deferral (#3939 ②/#3805): padded refs minted by the
    *  BLOCKED→numeric migration (assignRefs, #2607). The number exists (citable
    *  via decompress({ imageRef }) bookkeeping) but the carrier message keeps
@@ -516,7 +535,11 @@ export interface CompressValidationConfig {
   minCompressRange: number;
   /** Maximum summary length (chars). Summary exceeding this is rejected unless summaryMaxChars override is used. 0 = disabled. Default 20000. */
   maxSummaryLength: number;
-  /** Minimum summary length (chars). Summary shorter than this is rejected. 0 = disabled. Default 50. */
+  /** Minimum summary length (chars). A single folding range with a shorter
+   *  summary is rejected; a multi-range batch is judged on the COMBINED total
+   *  of its fold candidates' summaries (#5894) — one trivial span may earn a
+   *  short summary without killing the batch. Empty summaries are always
+   *  rejected per range. 0 = disabled. Default 50. */
   minSummaryLength: number;
 }
 
@@ -601,27 +624,6 @@ export interface Config {
   rules?: RulesConfig;
   /** Deterministic tool-result compression, tier 1 of the absorb gate (see crush.ts). Requires absorb enabled. */
   crush?: CrushConfig;
-  /** EXPERIMENTAL (default off): relocate still-visible compress carrier pairs
-   *  from their original tail-adjacent position to their own fold point —
-   *  "[folded/summary region] – [compress pair] – [protected messages]".
-   *  View-only + deterministic (see relocate-compress.ts): nothing is persisted,
-   *  refs are untouched, so the layout recomputes identically every turn. OFF
-   *  = byte-identical to before (the node fast-paths to the same array ref).
-   *  The round-2 re-render and the S4 plugin render mirror this transform host-side
-   *  with the same pure function so all lanes agree. */
-  compressAtFoldPoint?: boolean;
-  /** Second opt-in riding on compressAtFoldPoint: drop the contiguous `reasoning`
-   *  core run immediately preceding a moved pair — ONLY cores accepted by
-   *  reasoningDroppable. Default off; both flags must be set to drop anything. */
-  compressAtFoldPointClearThinking?: boolean;
-  /** Host predicate for the above drop: signed-thinking blocks and strict-echo
-   *  sessions must answer false (wire signatures live host-side, #1658/#684
-   *  doctrine). UNSET ⇒ no reasoning core is ever dropped, even with
-   *  compressAtFoldPointClearThinking set (conservative default). Must be pure
-   *  and cheap: runs once per candidate per pass. NOTE: function fields are not
-   *  carried into session effectiveConfig stamps (#2584) — wire paths re-resolve
-   *  it per request; panel/tool reads see it absent by design. */
-  reasoningDroppable?: (msg: CoreMessage) => boolean;
   /** Lossless content-cached retrieval for oversized tool results (see ccr.ts). Absent/disabled = feature off. */
   ccr?: CcrConfig;
   messageFilters?: import("./filter/types.js").MessageFiltersConfig;

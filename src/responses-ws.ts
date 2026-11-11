@@ -627,6 +627,16 @@ class ResponsesWsResponse extends http.ServerResponse {
         Object.defineProperty(this, "socket", { get: () => req.socket });
     }
 
+    // Socket-death semantics, as in InlineRes.destroy(): OutgoingMessage.destroy()
+    // emits 'close' only through its own socket slot (not the `socket` getter
+    // above), and the relay aborts the upstream only on 'close' while !writableEnded.
+    override destroy(error?: Error): this {
+        if (this.destroyed) return this;
+        super.destroy(error);
+        if (!this.ended) this.emit("close");
+        return this;
+    }
+
     override write(chunk: string | Uint8Array, callback?: (error?: Error | null) => void): boolean;
     override write(chunk: string | Uint8Array, encoding: BufferEncoding, callback?: (error?: Error | null) => void): boolean;
     override write(chunk: string | Uint8Array, encoding?: BufferEncoding | ((error?: Error | null) => void), callback?: (error?: Error | null) => void): boolean {
@@ -697,7 +707,7 @@ class ResponsesWsResponse extends http.ServerResponse {
         }
         this.ended = true;
         this.emit("finish");
-        this.emit("close");
+        if (!this.destroyed) this.emit("close");
         const cb = typeof chunk === "function" ? chunk : typeof encoding === "function" ? encoding : callback;
         if (typeof cb === "function") cb();
         return this;
