@@ -114,6 +114,7 @@ billion-context/
 │   ├── acp-status.ts             # acp_status payload (ranges/nudge recomputed live)
 │   ├── acp-panel.ts              # Cache report wrapper for transcript display
 │   ├── acp-cache-diff.ts         # Offline prefix-diff attribution over dumps (#1266)
+│   ├── acp-block-ops.ts          # Block retirement + external rewrite host executors (acp_retire/acp_restore/acp_rewrite): arg parse, receipts, dirty mark (#5765)
 │   ├── marker/                   # Inbound marker stripping: one spec table + engine, four wires (#2811)
 │   │   ├── anchors.ts            #   Shared marker anchors: integrity note, silence clause, echo match
 │   │   ├── engine.ts             #   Raw-stage inbound marker strip: one ordered pipeline (#2811)

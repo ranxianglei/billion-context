@@ -2397,7 +2397,7 @@ function changelogCatOf(rawLine) {
         if (name === "bash" || name === "shell" || name === "run_command") return "t-shell";
         if (name === "read" || name === "write" || name === "edit" || name === "ls" || name === "glob" || name === "note") return "t-file";
         if (name === "grep" || name === "search_context" || name === "decompress" || name === "acp_retrieve") return "t-seek";
-        if (name === "compress" || name === "acp_status" || name === "acp_cache") return "t-fold";
+        if (name === "compress" || name === "acp_status" || name === "acp_cache" || name === "acp_retire" || name === "acp_restore" || name === "acp_rewrite") return "t-fold";
         return "";
     }
     function parseToolLine(line) {
@@ -4004,7 +4004,6 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             tsRow.inp.checked = cp ? cp.messageTimestamps !== false : true;
             const ab = (cp && cp.absorb && typeof cp.absorb === "object" && !Array.isArray(cp.absorb)) ? cp.absorb : null;
             abRow.inp.checked = ab ? ab.enabled === true : false;
-            cafRow.inp.checked = cp ? cp.compressAtFoldPoint === true : false;
             rnRow.inp.checked = cp ? cp.requireNudge === true : false;
             rrRow.inp.checked = cp ? cp.requireRecommendation === true : false;
             const pv = (cp && typeof cp.promptPack === "string") ? cp.promptPack : "default";
@@ -4231,26 +4230,6 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             }
         }));
         void tsRow.ctl;
-        // #5470 fold-point carrier relocation — default OFF (opt-in); uncheck
-        // deletes the key so the file stays clean (mirrors the absorb row).
-        const cafRow = row("quick-compress-at-fold-point", t("cfg.q_cafp"));
-        qCtrls.push(cafRow.inp);
-        cafRow.inp.addEventListener("change", () => commit((d) => {
-            if (cafRow.inp.checked) {
-                if (!compressOf(d)) d.compress = {};
-                d.compress.compressAtFoldPoint = true;
-            } else {
-                const c = compressOf(d);
-                if (c) {
-                    delete c.compressAtFoldPoint;
-                    if (Object.keys(c).length === 0) delete d.compress;
-                }
-            }
-        }));
-        const cafHint = document.createElement("span");
-        cafHint.className = "dim small";
-        cafHint.textContent = t("cfg.q_cafp_hint");
-        cafRow.ctl.appendChild(cafHint);
         const pw = document.createElement("div");
         pw.style.cssText = "display:flex;gap:12px;align-items:center;flex-wrap:wrap";
         const plab = document.createElement("label");
