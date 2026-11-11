@@ -1538,6 +1538,13 @@ def _shutdown() -> None:
     refused by it; the join runs outside the lock, since the bootstrap needs it to observe the
     stop."""
     with _lifecycle_lock:
+        # apply_env routes host traffic by writing HTTPS_PROXY/SSL_CERT_FILE into the
+        # process-global os.environ, and the host does NOT dispose of that on unload — only of
+        # registrations. Leftover routing at a dead origin port breaks every LLM call in the
+        # process until a full restart (#5991), so restore what apply_env overwrote first.
+        # No-op when env was never applied; _unroute_env runs under this same lock.
+        if _state.get("env_applied"):
+            _unroute_env()
         stop = _state.get("stop_event")
         if stop is not None:
             stop.set()

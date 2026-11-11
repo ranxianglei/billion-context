@@ -1063,6 +1063,11 @@ test("e2e: oversized side request is blocked locally (413), never reaches the up
         const s = getSession(SESSION);
         assert.ok(s, "session row exists (created before the gate)");
         assert.equal(JSON.stringify(s.state), JSON.stringify(createInitialState()), "kernel state untouched by side requests (blocked or not)");
+        // Named poison-field pin (#5608-B fix for exactly this shape): a resume-miss
+        // under UNPROVEN identity (cross-lane boilerplate prefix match) must not arm
+        // honest-NULL on a side lane — a lane that never runs a kernel pass could
+        // never self-clear the flag, and it would ride into persisted state.
+        assert.equal(s.state.suppressMintingOnce, undefined, "unproven-identity miss must not arm honest-NULL on a side request (#554/#5608-B)");
         assert.equal(s.stats.requests, 0, "side requests do not count as main requests");
     } finally {
         await closeRig(rig);
@@ -1333,5 +1338,18 @@ test("e2e: google-lane dsh side request resolves verbatim — no kernel state, n
         upstream.close();
         upstream.closeIdleConnections?.();
         await once(upstream, "close");
+    }
+});
+
+// #5765: the bili-owned structural name set must cover the kernel-fixed ACP
+// names plus the (opt-in) block-lifecycle ops — kernel-fixed names can never
+// collide with a client tool, so they count toward the "entire declared
+// array is bili's set" signal regardless of the per-session switch. Renamed
+// config-gated tools (absorb/rule/retrieve custom names) stay out.
+test("#5765: BILI_TOOL_NAMES covers the kernel-fixed ACP names + block ops", async () => {
+    const { BILI_TOOL_NAMES } = await import("../src/server/side-request.ts");
+    const { ACP_TOOL_NAMES, BLOCK_OP_TOOL_NAMES, ABSORB_TOOL_NAME, RULE_TOOL_NAME, RETRIEVE_TOOL_NAME } = await import("acp-kernel");
+    for (const name of [...ACP_TOOL_NAMES, ...BLOCK_OP_TOOL_NAMES, ABSORB_TOOL_NAME, RULE_TOOL_NAME, RETRIEVE_TOOL_NAME]) {
+        assert.ok(BILI_TOOL_NAMES.has(name), `${name} must be bili-owned`);
     }
 });
