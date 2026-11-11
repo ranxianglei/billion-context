@@ -25,7 +25,6 @@
 // adapters decide where to emit them (log line, debug event, tool text).
 
 import { clampPrefix } from "./truncate.js";
-import { RELOCATED_POINTER_MARKER } from "./relocate-compress.js";
 import type { CompressRangeSpec } from "./types.js";
 
 export type CompressParseKind =
