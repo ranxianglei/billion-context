@@ -11,6 +11,11 @@ import { log as loggerLog } from "./logger.js";
 const ROOT_CERT_FILE = "root-ca.pem";
 const ROOT_KEY_FILE = "root-ca-key.pem";
 const COMBINED_CA_FILE = "combined-ca.pem";
+// #5802: format marker line at the top of the bundle. A FRESH file lacking it
+// predates the CA-only merge policy and gets rebuilt once after upgrade —
+// without it a pre-fix bundle (carrying keychain leaf certs) would survive
+// until its 24 h age expired and the fix would look inert for a day.
+const BUNDLE_MARKER = "# billion-context combined-ca (ca-only v1, #5802)";
 const ROOT_CN = "billion-context MITM Root CA";
 // #1807: the combined bundle merges the OS trust store, which costs a
 // PowerShell spawn on Windows — bound the rebuild to once per day per machine.
@@ -193,14 +198,62 @@ export function collectOsStorePems(platform: NodeJS.Platform = process.platform)
     }
 }
 
-/** Rebuild combined-ca.pem unless a fresh copy (< 24h) already carries the
- *  current MITM root CA — the OS-store merge makes each rebuild expensive on
- *  Windows, so steady-state startups reuse the existing file. */
+// #5802: RFC 5280 KeyUsage extension — OID 2.5.29.15. Per §4.1 the extension
+// body is [BOOLEAN critical] OCTET STRING wrapping a BIT STRING
+// (04 LL | 03 LL <unused-bits> <flags…>); the critical flag is OPTIONAL and
+// skipped when present (RFC-recommended for CA certs, so most real-world
+// anchors carry it). Logical bit 5 (keyCertSign) maps to mask 0x04 of the
+// FIRST flag octet under any valid unused-bits count, so the test is
+// independent of the encoder's padding choice. Scanned on the raw DER because
+// Node's X509Certificate.keyUsage getter is unusable in current runtimes
+// (returns undefined for every cert) and node-forge cannot parse non-RSA
+// subjects — both would misjudge ECDSA CAs.
+const KEY_USAGE_OID = Buffer.from([0x06, 0x03, 0x55, 0x1d, 0x0f]);
+const KEY_CERT_SIGN_BIT = 0x04;
+
+function hasKeyCertSign(raw: Buffer): boolean {
+    let i = raw.indexOf(KEY_USAGE_OID);
+    while (i >= 0) {
+        let b = i + KEY_USAGE_OID.length;
+        if (raw[b] === 0x01 && raw[b + 1] === 0x01) b += 3; // optional critical BOOLEAN
+        if (raw[b] === 0x04 && (raw[b + 1] === 0x04 || raw[b + 1] === 0x05)
+            && raw[b + 2] === 0x03 && (raw[b + 3] === 0x02 || raw[b + 3] === 0x03)) {
+            return (raw[b + 5] & KEY_CERT_SIGN_BIT) !== 0;
+        }
+        i = raw.indexOf(KEY_USAGE_OID, i + 1);
+    }
+    return false;
+}
+
+/** #5802: keep a combined-bundle entry only if it can act as a trust anchor —
+ *  basicConstraints CA:TRUE (X509Certificate.ca), or keyUsage Certificate
+ *  Sign for anchors predating the extension. security(1) find-certificate -a
+ *  exports EVERY keychain entry (Apple system identities, app/content-signing
+ *  and S-MIME leaves alike), not just anchors; replacement-semantics clients
+ *  (codex/rustls) parse every entry of SSL_CERT_FILE strictly, so one
+ *  RFC-violating leaf (com.apple.kerberos.kdc, duplicate EKU) aborts their
+ *  whole HTTP client. Unparseable entries anchor nothing and drop too. */
+export function isCaLike(pem: string): boolean {
+    try {
+        const x = new crypto.X509Certificate(pem);
+        return x.ca || hasKeyCertSign(x.raw);
+    } catch {
+        return false;
+    }
+}
+
+/** Rebuild combined-ca.pem unless a fresh copy (< 24h) already carries both
+ *  the current MITM root CA and the #5802 format marker — the OS-store merge
+ *  makes each rebuild expensive on Windows, so steady-state startups reuse
+ *  the existing file. */
 function writeCombinedBundle(): void {
     const file = path.join(caDir(), COMBINED_CA_FILE);
     try {
         const st = fs.statSync(file);
-        if (Date.now() - st.mtimeMs < COMBINED_MAX_AGE_MS && fs.readFileSync(file, "utf8").includes(rootCertPem!.trim())) return;
+        if (Date.now() - st.mtimeMs < COMBINED_MAX_AGE_MS) {
+            const existing = fs.readFileSync(file, "utf8");
+            if (existing.includes(rootCertPem!.trim()) && existing.includes(BUNDLE_MARKER)) return;
+        }
     } catch { }
     const byFingerprint = new Map<string, string>();
     const add = (pem: string): void => {
@@ -216,7 +269,18 @@ function writeCombinedBundle(): void {
     for (const pem of collectOsStorePems()) add(pem);
     for (const pem of tls.rootCertificates) add(pem);
     add(rootCertPem!);
-    const body = [...byFingerprint.values()].map((pem) => (pem.endsWith("\n") ? pem : pem + "\n")).join("");
+    // #5802: single choke point over ALL sources (keychain/PowerShell exports,
+    // filesystem bundle, Mozilla snapshot, user SSL_CERT_FILE) — the bundle
+    // must hold trust anchors only; see isCaLike.
+    let kept = [...byFingerprint.values()].filter(isCaLike);
+    if (kept.length === 0) {
+        // Availability floor: the MITM root always passes the filter, so an
+        // empty result means certificate parsing itself is broken — degrade
+        // to the pre-#5802 shape (loudly) instead of shipping an empty pool.
+        loggerLog("error", `[ca] CA-only filter dropped all ${byFingerprint.size} certificates including the MITM root — falling back to the unfiltered bundle; certificate parsing appears broken, report this`);
+        kept = [...byFingerprint.values()];
+    }
+    const body = BUNDLE_MARKER + "\n" + kept.map((pem) => (pem.endsWith("\n") ? pem : pem + "\n")).join("");
     try {
         fs.writeFileSync(file, body, { mode: 0o644 });
     } catch (err) {

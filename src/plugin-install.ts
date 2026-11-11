@@ -498,7 +498,7 @@ export function claudeAcpCacheCommandFile(env: NodeJS.ProcessEnv = process.env):
  *  `<protocol>/` segment covers the Vertex form (/bili/anthropic/<url>). */
 export function isBiliClaudeBaseUrl(value: unknown): boolean {
     if (typeof value !== "string") return false;
-    return /^http:\/\/127\.0\.0\.1:\d{1,5}\/bili\/(?:[a-z][a-z0-9-]*\/)?https?:\/\//.test(value);
+    return /^https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\]):\d{1,5}\/bili\/(?:[a-z][a-z0-9-]*\/)?https?:\/\//.test(value);
 }
 
 /** Disk evidence that the Claude Desktop app is installed — the host whose
@@ -587,8 +587,21 @@ export function claudeNativeBaseUrlForOrigin(origin: string, upstream: string | 
 /** The inverse of the wrap: strip a bili wrapper (any loopback port) from a
  *  base URL. Returns undefined for anything not written by us. */
 export function unwrapBiliBaseUrl(value: string): string | undefined {
-    const m = /^http:\/\/127\.0\.0\.1:\d{1,5}\/bili\/(https?:\/\/.+)$/.exec(value);
+    const m = /^https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\]):\d{1,5}\/bili\/(https?:\/\/.+)$/.exec(value);
     return m ? m[1] : undefined;
+}
+
+/** #5369: upstream to bake at INSTALL time. An explicit BILI_CLAUDE_UPSTREAM
+ *  override wins — return undefined so claudeNativeBaseUrlForOrigin's default
+ *  resolution picks the env relay up (documented override semantics). Without
+ *  the override, preserve what an earlier install or the user already pointed
+ *  at: the relay wrapped into the current value, or a plain http(s) relay. */
+export function claudeInstallUpstream(existingBaseUrl: unknown, env: NodeJS.ProcessEnv = process.env): string | undefined {
+    const relay = env.BILI_CLAUDE_UPSTREAM?.trim();
+    if (relay !== undefined && relay.length > 0) return undefined;
+    const raw = typeof existingBaseUrl === "string" ? existingBaseUrl.trim() : undefined;
+    if (!raw) return undefined;
+    return unwrapBiliBaseUrl(raw) ?? (raw.startsWith("http") ? raw : undefined);
 }
 
 /** #1660: SessionStart drift-repair — repin the managed block's
@@ -637,7 +650,10 @@ export function applyClaudeManagedBlock(settings: Record<string, unknown>, opts:
     const notes: string[] = [];
     const env = (data.env !== null && typeof data.env === "object" && !Array.isArray(data.env) ? data.env : {}) as Record<string, unknown>;
     const cur = env.ANTHROPIC_BASE_URL;
-    if (cur === undefined || cur === null || isBiliClaudeBaseUrl(cur)) {
+    const relay = process.env.BILI_CLAUDE_UPSTREAM?.trim();
+    const isRelayMatch = relay !== undefined && relay.length > 0 && typeof cur === "string" && cur.replace(/\/+$/, "") === relay.replace(/\/+$/, "");
+    const isWrappingCur = typeof cur === "string" && unwrapBiliBaseUrl(opts.baseUrl) === cur.replace(/\/+$/, "");
+    if (cur === undefined || cur === null || isBiliClaudeBaseUrl(cur) || isRelayMatch || isWrappingCur) {
         if (cur !== opts.baseUrl) {
             env.ANTHROPIC_BASE_URL = opts.baseUrl;
             notes.push("env.ANTHROPIC_BASE_URL pinned to the bili proxy");
@@ -659,13 +675,26 @@ export function applyClaudeManagedBlock(settings: Record<string, unknown>, opts:
         }
     }
     const dac = env.DISABLE_AUTO_COMPACT;
-    if (dac === undefined || dac === null || dac === "1") {
-        if (dac !== "1") {
-            env.DISABLE_AUTO_COMPACT = "1";
-            notes.push("env.DISABLE_AUTO_COMPACT=1 (bili owns compression; manual /compact survives)");
+    const isBiliManaged = isBiliClaudeBaseUrl(env.ANTHROPIC_BASE_URL) || (opts.vertexBaseUrl !== undefined && isBiliClaudeBaseUrl(env.ANTHROPIC_VERTEX_BASE_URL));
+    if (isBiliManaged) {
+        if (dac === undefined || dac === null || dac === "1") {
+            if (dac !== "1") {
+                env.DISABLE_AUTO_COMPACT = "1";
+                notes.push("env.DISABLE_AUTO_COMPACT=1 (bili owns compression; manual /compact survives)");
+            }
+        } else {
+            notes.push(`env.DISABLE_AUTO_COMPACT left untouched (foreign value ${JSON.stringify(dac)})`);
         }
+    } else if (dac === "1") {
+        // Pre-fix installs wrote DISABLE_AUTO_COMPACT=1 even when the URL stayed
+        // foreign, so an upgrade alone would keep native auto-compaction OFF while
+        // bili is bypassed — the original deadlock survives. The key is bili-owned
+        // (remove strips it), so drop only the harmful sticky value and say so;
+        // .bili-bak keeps it restorable.
+        delete env.DISABLE_AUTO_COMPACT;
+        notes.push(`env.DISABLE_AUTO_COMPACT removed (leftover "1" from a pre-fix install — bili bypasses this session, so native auto-compaction is restored; restore from .bili-bak if you set it yourself)`);
     } else {
-        notes.push(`env.DISABLE_AUTO_COMPACT left untouched (foreign value ${JSON.stringify(dac)})`);
+        notes.push(`env.DISABLE_AUTO_COMPACT left untouched (bili proxy bypassed — foreign ANTHROPIC_BASE_URL)`);
     }
     if (Object.keys(env).length > 0) data.env = env;
 
@@ -940,9 +969,10 @@ function claudeInstall(): string {
     // Both variables are baked for the SAME origin; the Vertex one only exists
     // when the lane is configured for Vertex (claudeNativeVertexBaseUrl).
     const managedOrigin = claudeNativeOrigin();
+    const existingBaseUrl = (settings.env as Record<string, unknown> | undefined)?.ANTHROPIC_BASE_URL;
     const vertexManagedBaseUrl = claudeNativeVertexBaseUrl(managedOrigin);
     const { data, notes } = applyClaudeManagedBlock(settings, {
-        baseUrl: claudeNativeBaseUrlForOrigin(managedOrigin, undefined),
+        baseUrl: claudeNativeBaseUrlForOrigin(managedOrigin, claudeInstallUpstream(existingBaseUrl)),
         hookCommand,
         subagentHookCommand,
         ...(vertexManagedBaseUrl !== undefined ? { vertexBaseUrl: vertexManagedBaseUrl } : {}),
@@ -997,7 +1027,7 @@ function claudeInstall(): string {
     } catch (err) {
         throw new Error(`claude: /acp-cache command write failed (${err instanceof Error ? err.message : String(err)}) — the managed settings block at ${file} and the MCP face were written; fix the permissions and rerun`);
     }
-    return `claude: managed block -> ${file} (${notes.join("; ")}); /acp-cache command -> ${cmdFile} (${cmdNote}); ${mcpNote} — restart claude to activate`;
+    return `claude: managed block -> ${file} (${notes.join("; ")}); /acp-cache command -> ${cmdFile} (${cmdNote}); ${mcpNote} — restart claude to activate. Note: routing claude through bili sets a custom ANTHROPIC_BASE_URL, which disables account-bound features (e.g. Remote Control /remote-control) while the proxy routes traffic — run plain claude without bili for sessions that need them (#4693)`;
 }
 
 function claudeRemove(): string {
@@ -1348,10 +1378,13 @@ function stripLegacyOpencodeAcp(data: Record<string, unknown>, notes: string[], 
 
 // #925: how THIS bili was installed decides which plugin entry install can
 // publish. An npm-form install (package root under node_modules — npm/pnpm/
-// yarn, both path-separator styles) ships its entry through package.json
-// exports["./server"], so opencode loads the bare package name via its own
-// Npm.add machinery (host-managed install + upgrade, portable config). Any
-// other form (git checkout / dev build) has no published entry — local shim dir.
+// yarn, both path-separator styles) CAN ship its entry through package.json
+// exports["./server"] as the bare package name (host-managed install +
+// upgrade, portable config) — but ONLY on OpenCode 1.x hosts. On 2.x hosts
+// the bare name resolves to the package MAIN field on some platforms
+// (Windows: dist/index.js — the CLI, no default export → LoadError, #3976),
+// so every 2.x install writes the local shim dir instead. Any non-npm form
+// (git checkout / dev build) has no published entry — local shim dir too.
 export function isNpmInstallForm(root: string): boolean {
     return /(^|[/\\])node_modules[/\\]/.test(root);
 }
@@ -1359,6 +1392,8 @@ export function isNpmInstallForm(root: string): boolean {
 export const OPENCODE_NPM_ENTRY = "billion-context";
 
 const DEV_FORM_NOTE = "dev form: machine-local shim, not portable across machines — an npm install writes the bare package name instead";
+
+const V2_NPM_SHIM_NOTE = "OpenCode 2.x host: machine-local shim dir instead of the bare package name — 2.x loads bare names via the package main field, which is not the plugin (#3976)";
 
 // #925: pick + apply the plugin entry for this install form. Replaces any
 // existing entry of either form (single owner), returns note(s). #927: the
@@ -1370,13 +1405,21 @@ const DEV_FORM_NOTE = "dev form: machine-local shim, not portable across machine
 // scalars) are preserved verbatim in form and position. A strings-only
 // projection must never be written back, and "plugin present" must mean
 // the key was left untouched (no rewrite of the surrounding file either).
+// #3976: the ENTRY FORM is decided by install form AND host major version —
+// the `plugins` key is written only for 2.x hosts (#927 pickPluginKey), so
+// key === "plugins" is the 2.x gate: every 2.x install (npm or dev form)
+// writes the shim dir, because a bare package name resolves to the package
+// main field (dist/index.js — the CLI, no default export) on 2.x hosts such
+// as Windows and loads no plugin at all. 1.x keeps the portable bare name
+// for npm-form installs; dev form always shims (no published entry).
 export function applyOpencodePluginEntry(args: { data: Record<string, unknown>; root: string; shimDir: string; agentJs: string; key?: "plugin" | "plugins"; touched?: Set<string> }): string[] {
     const { data, root, shimDir, agentJs } = args;
     const key = args.key ?? "plugin";
     const touched = args.touched ?? new Set<string>();
     const ours = [OPENCODE_NPM_ENTRY, shimDir];
     const npmForm = isNpmInstallForm(root);
-    const entry = npmForm ? OPENCODE_NPM_ENTRY : shimDir;
+    const useShim = !npmForm || key === "plugins";
+    const entry = useShim ? shimDir : OPENCODE_NPM_ENTRY;
     const isOurs = (x: unknown): boolean => typeof x === "string" && ours.includes(x);
     const raw = data[key];
     const oursIn = (): string[] => {
@@ -1385,10 +1428,15 @@ export function applyOpencodePluginEntry(args: { data: Record<string, unknown>; 
         return [];
     };
     const replaced = oursIn();
-    if (npmForm && replaced.includes(shimDir)) fs.rmSync(shimDir, { recursive: true, force: true });
-    if (!npmForm) {
+    if (!useShim && replaced.includes(shimDir)) fs.rmSync(shimDir, { recursive: true, force: true });
+    if (useShim) {
         fs.mkdirSync(shimDir, { recursive: true });
-        fs.writeFileSync(path.join(shimDir, "index.js"), `export { default } from ${JSON.stringify(agentJs)};\n`);
+        // Rewrite whenever the content drifts from THIS root (a reinstall to
+        // a new path must heal a stale shim even when the config entry is
+        // already present and left untouched below).
+        const idx = path.join(shimDir, "index.js");
+        const want = `export { default } from ${JSON.stringify(agentJs)};\n`;
+        if (!fs.existsSync(idx) || fs.readFileSync(idx, "utf8") !== want) fs.writeFileSync(idx, want);
     }
     // Exactly our one entry, already the right form — nothing to migrate:
     // leave the key (and the file) untouched.
@@ -1404,12 +1452,13 @@ export function applyOpencodePluginEntry(args: { data: Record<string, unknown>; 
         data[key] = [entry];
     }
     touched.add(key);
-    if (npmForm) {
-        if (replaced.length === 0) return [`plugin -> ${OPENCODE_NPM_ENTRY}`];
-        return [`plugin -> ${OPENCODE_NPM_ENTRY} (replaced ${replaced.join(", ")})`];
+    if (!useShim) {
+        if (replaced.length === 0) return [`${key} -> ${OPENCODE_NPM_ENTRY}`];
+        return [`${key} -> ${OPENCODE_NPM_ENTRY} (replaced ${replaced.join(", ")})`];
     }
-    if (replaced.length === 0) return [`plugin -> ${shimDir}`, DEV_FORM_NOTE];
-    return [`plugin -> ${shimDir} (replaced ${replaced.join(", ")})`, DEV_FORM_NOTE];
+    const note = npmForm ? V2_NPM_SHIM_NOTE : DEV_FORM_NOTE;
+    if (replaced.length === 0) return [`${key} -> ${shimDir}`, note];
+    return [`${key} -> ${shimDir} (replaced ${replaced.join(", ")})`, note];
 }
 
 function opencodeInstall(withMcp = false): string {
@@ -1471,9 +1520,10 @@ function opencodeInstall(withMcp = false): string {
         }
     }
 
-    // Native plugin (#820/#925): self-spawned proxy + http.request URL rewrite.
-    // Entry form depends on how THIS bili was installed — npm → bare package
-    // name (exports["./server"], host-managed), checkout/dev → local shim dir.
+    // Native plugin (#820/#925/#3976): self-spawned proxy + http.request URL
+    // rewrite. Entry form: OpenCode 1.x + npm install → bare package name
+    // (host-managed, portable); every 2.x install and any dev-form install →
+    // local shim dir (bare names do not load under 2.x hosts, #3976).
     const root = selfPackageRoot();
     const agentJs = path.join(root, "dist", "agent", "opencode-native.js");
     requireDistFile(agentJs);
@@ -2605,6 +2655,18 @@ async function updateLane(agent: PluginAgent, opts: PluginUpdateOpts, log: (leve
             return [`opencode: the cache copy is bili-owned and self-updates in place through its own proxy${where}${v} (#1234) — this command does NOT run opencode's upgrade; OpenCode v2 'plugin update' is an extra manual channel, and reload/restart OpenCode after a disk update to activate it`];
         }
         if (PLUGIN_KEYS.some((k) => pluginEntries(data, k).some((p) => p === dir))) {
+            // #3976: on 2.x hosts even npm installs use the shim — tell the
+            // user which root the shim re-exports before prescribing a fix.
+            let target: string | undefined;
+            try {
+                const m = /from\s+"([^"]+)"/.exec(fs.readFileSync(path.join(dir, "index.js"), "utf8"));
+                if (m) target = m[1];
+            } catch {}
+            if (target !== undefined && isNpmInstallForm(target)) {
+                const ver = pkgVersionAt(path.dirname(path.dirname(path.dirname(target))));
+                const v = ver !== undefined ? ` v${ver}` : "";
+                return [`opencode: the shim points at the npm install${v} (#3976) — it self-updates in place through its own proxy; reload/restart OpenCode after a disk update to activate it`];
+            }
             return ["opencode: plugin points at this checkout — rebuild the checkout (`npm run build`) to pick up changes"];
         }
         return ["opencode: not installed"];

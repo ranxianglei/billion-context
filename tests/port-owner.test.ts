@@ -270,6 +270,13 @@ test("holderHintFragment: serving vs wedged/dead wording, with and without a pid
     const serving = holderHintFragment(true, 4242);
     assert.match(serving, /answered \/__bili\/health \(pid 4242\)/);
     assert.match(serving, /spawner should attach to it/);
+    // #5907: the serving branch names the expected duplicate-instance outcome
+    // and cross-references a nearby [split-brain] notice so the EADDRINUSE +
+    // split-brain log pair reads as routine host-relaunch churn, not fatal.
+    assert.match(serving, /expected duplicate-instance outcome when a host relaunches/);
+    assert.match(serving, /no action is needed/);
+    assert.match(serving, /\[split-brain\] notice near these timestamps names this exiting pid/);
+    assert.match(serving, /not data corruption in progress/);
     const wedged = holderHintFragment(false, 4242);
     assert.match(wedged, /did NOT answer \/__bili\/health within 2s/);
     assert.match(wedged, /wedged or dead/);
