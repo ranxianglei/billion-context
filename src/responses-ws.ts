@@ -3,7 +3,7 @@ import type { ResponsesRequestBody } from "acp-kernel/wire";
 import { WebSocket as UpstreamWebSocket, type Dispatcher } from "undici";
 import WebSocket from "ws";
 import { fetchWithTimeout, type FetchOptions } from "./fetch-util.js";
-import { limitsReceiveBytes } from "./knobs.js";
+import { limitsReceiveBytes, wsIdleTimeoutMs } from "./knobs.js";
 import { featureEnabled } from "./rollout.js";
 import { getStore } from "./persist.js";
 import { responsesToCoreWithToolImages } from "./responses-tool-output.js";
@@ -20,6 +20,54 @@ type DiagnosticLog = (level: "debug" | "info" | "warn", message: string) => void
 
 function closeCode(event: Event): number | "none" {
     return "code" in event && typeof event.code === "number" ? event.code : "none";
+}
+
+const FAILURE_DETAIL_MAX_CHARS = 160;
+
+// #6171: failure-event text is untrusted upstream input — strip control chars,
+// collapse whitespace and cap the length before it touches the log. Frame bodies
+// never pass through this helper.
+function sanitizeDetail(value: unknown): string {
+    if (typeof value !== "string") return "none";
+    const cleaned = value.replace(/[\u0000-\u001f\u007f]/g, " ").replace(/\s+/g, " ").trim();
+    if (cleaned === "") return "none";
+    return cleaned.length <= FAILURE_DETAIL_MAX_CHARS ? cleaned : `${cleaned.slice(0, FAILURE_DETAIL_MAX_CHARS - 1)}…`;
+}
+
+// #6171: sanitized one-line description of a WebSocket failure event. The old log
+// line only carried event.type + close_code, so a raw-TCP drop (undici fires
+// error THEN a synchronous close(1006)) read as `event=error close_code=none` and
+// every failure looked identical. Only STRUCTURED facts land here: the close
+// REASON is arbitrary upstream-set text (untrusted content) and must never reach
+// the log — the leak guard in tests/responses-websocket.test.ts pins that; the
+// standard codes (1006/1009/1011/1013 …) already carry the intent.
+function describeFailureEvent(event: Event): string {
+    if (event.type === "close") {
+        const wasClean = "wasClean" in event && typeof event.wasClean === "boolean" ? event.wasClean : false;
+        return `close_code=${closeCode(event)} was_clean=${wasClean}`;
+    }
+    const cause = "error" in event ? event.error : undefined;
+    if (cause instanceof Error) return `error_class=${cause.name} error_message=${sanitizeDetail(cause.message)}`;
+    const message = "message" in event && typeof event.message === "string" ? sanitizeDetail(event.message) : "none";
+    return `error_class=unknown error_message=${message}`;
+}
+
+// #6171: inter-event idle watchdog for the WS leg. The HTTP lane gets this from
+// fetchWithTimeout; the upstream WebSocket owns its own socket and had no
+// server-side bound, so a stalled supplier (no events, no close) hung the
+// exchange until the client gave up. Re-armed on every liveness signal; unref'd
+// so it never holds the process open.
+function idleWatchdog(onFire: () => void, timeoutMs: number): { arm: () => void; disarm: () => void } {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const disarm = (): void => { if (timer !== undefined) { clearTimeout(timer); timer = undefined; } };
+    return {
+        arm: () => {
+            disarm();
+            timer = setTimeout(onFire, timeoutMs);
+            timer.unref();
+        },
+        disarm,
+    };
 }
 
 // #3342: the ONLY failure that may trigger the HTTP/SSE egress fallback is a
@@ -373,23 +421,49 @@ export class ResponsesWsUpstream {
         const socket = new UpstreamWebSocket(wsUrl, { headers, dispatcher: options.dispatcher as Dispatcher | undefined });
         this.socket = socket;
         this.key = key;
+        const startedAt = Date.now();
         await new Promise<void>((resolve, reject) => {
-            const clean = (): void => {
+            let failureEvents = 0;
+            let done = false;
+            // #6171: a wedged upgrade request (TCP up, no response) used to wait
+            // forever — the handshake now shares the exchange's idle budget. A
+            // timeout is NOT a refusal (#3342): it rejects with its own message so
+            // the HTTP/SSE fallback does not fire for a supplier that merely stalled.
+            const watchdog = idleWatchdog(() => {
+                if (done) return;
+                done = true;
+                clean();
+                this.log("warn", `upstream failed phase=handshake event=timeout reason=idle-timeout elapsed_ms=${Math.max(0, Date.now() - startedAt)}`);
+                reject(new Error("Responses WebSocket handshake timed out"));
+            }, wsIdleTimeoutMs());
+            const clean = (keepCloseListener = false): void => {
+                watchdog.disarm();
                 socket.removeEventListener("open", opened);
+                if (!keepCloseListener) socket.removeEventListener("close", failed);
                 socket.removeEventListener("error", failed);
-                socket.removeEventListener("close", failed);
                 options.signal?.removeEventListener("abort", aborted);
             };
-            const opened = (): void => { clean(); this.log("debug", "upstream connected phase=handshake"); resolve(); };
+            const opened = (): void => { done = true; clean(); this.log("debug", "upstream connected phase=handshake"); resolve(); };
             const failed = (event: Event): void => {
-                clean();
-                this.log("warn", `upstream failed phase=handshake event=${event.type} close_code=${closeCode(event)}`);
+                // #6171: undici fires 'error' and, on transport loss, a synchronous
+                // follow-up 'close'(1006). The first event decides the terminal state
+                // (and keeps the close listener alive to observe the follow-up); the
+                // second is logged informationally. Max two lines per handshake.
+                if (failureEvents >= 2) return;
+                const isFollowUp = failureEvents === 1;
+                if (!isFollowUp && done) return;
+                failureEvents++;
+                this.log("warn", `upstream failed phase=handshake event=${event.type} ${describeFailureEvent(event)} elapsed_ms=${Math.max(0, Date.now() - startedAt)}`);
+                if (isFollowUp) { clean(); return; }
+                done = true;
+                clean(event.type === "error");
                 reject(new Error("Responses WebSocket handshake failed"));
             };
-            const aborted = (): void => { clean(); this.log("debug", "upstream aborted phase=handshake"); this.close("handshake-abort"); reject(new DOMException("Aborted", "AbortError")); };
+            const aborted = (): void => { done = true; clean(); this.log("debug", "upstream aborted phase=handshake"); this.close("handshake-abort"); reject(new DOMException("Aborted", "AbortError")); };
             socket.addEventListener("open", opened, { once: true });
             socket.addEventListener("error", failed, { once: true });
             socket.addEventListener("close", failed, { once: true });
+            watchdog.arm();
             if (options.signal?.aborted) aborted();
             else options.signal?.addEventListener("abort", aborted, { once: true });
         });
@@ -465,6 +539,10 @@ export class ResponsesWsUpstream {
             let ended = false;
             let retryFull = request.previous_response_id !== undefined;
             let receivedEvents = 0;
+            // #6171: elapsed is measured from the LAST create frame, so a resend-full
+            // retry reports its own wait instead of the whole exchange's age.
+            let failureEvents = 0;
+            let startedAt = Date.now();
             const encoder = new TextEncoder();
             // #3701: log the EXACT outbound frame bytes — the upstream gateway judges by
             // bytes, not tokens, so this number is what the ws-byte-shed ladder targets.
@@ -472,6 +550,8 @@ export class ResponsesWsUpstream {
                 const frameText = JSON.stringify({ ...payload, ...egressTransportFields, type: "response.create" });
                 this.log("info", `upstream send mode=${payload.previous_response_id === undefined ? "full" : "delta"} bytes=${Buffer.byteLength(frameText)}`);
                 socket.send(frameText);
+                startedAt = Date.now();
+                watchdog.arm();
             };
             // Backpressure (#2076): the WS socket cannot be paused, so frames arriving
             // while the consumer lags wait in the stream's own queue — delivery is
@@ -479,30 +559,57 @@ export class ResponsesWsUpstream {
             // the queue is under the highWaterMark, conservative beyond) so the guard
             // below still bounds memory for a consumer that never catches up.
             let retained = 0;
-            const clean = (): void => {
+            // #6171: inter-event idle budget for the exchange — any upstream frame re-arms
+            // it, so steady streaming never trips it; only a full stall does. On fire the
+            // exchange gets its single terminal state and the connection drops so the next
+            // turn reconnects fresh. The HTTP lane's equivalent is fetchWithTimeout.
+            const watchdog = idleWatchdog(() => {
+                if (ended) return;
+                const phase = receivedEvents > 0 ? "stream" : "await-first-event";
+                this.log("warn", `upstream failed phase=${phase} event=timeout reason=idle-timeout elapsed_ms=${Math.max(0, Date.now() - startedAt)} received_events=${receivedEvents}`);
+                fail(new ResponsesWsUpstreamError(
+                    `Responses WebSocket upstream timed out before completion (idle_ms=${wsIdleTimeoutMs()}, received_events=${receivedEvents})`,
+                    "none",
+                    phase,
+                    receivedEvents,
+                ), "upstream-idle-timeout");
+                this.close("upstream-idle-timeout");
+            }, wsIdleTimeoutMs());
+            const clean = (keepCloseListener = false): void => {
                 ended = true;
+                watchdog.disarm();
                 socket.removeEventListener("message", message);
                 socket.removeEventListener("error", failed);
-                socket.removeEventListener("close", failed);
+                if (!keepCloseListener) socket.removeEventListener("close", failed);
                 options.signal?.removeEventListener("abort", aborted);
                 this.active = undefined;
             };
-            const fail = (error: Error, reason = "transport-close"): void => {
+            const fail = (error: Error, reason = "transport-close", opts?: { keepCloseListener?: boolean }): void => {
                 if (ended) return;
                 this.resetHistory(reason);
-                clean();
+                clean(opts?.keepCloseListener === true);
                 if (settled) controller?.error(error);
                 else reject(error);
             };
             const failed = (event: Event): void => {
+                // #6171: undici fires 'error' and, on transport loss, a synchronous
+                // follow-up 'close'(1006). The first event decides the terminal state
+                // (and keeps the close listener alive to observe the follow-up); the
+                // second is logged informationally so the close code/reason are never
+                // lost again. Max two lines per exchange.
+                if (failureEvents >= 2) return;
+                const isFollowUp = failureEvents === 1;
+                if (!isFollowUp && ended) return;
+                failureEvents++;
                 const phase = receivedEvents > 0 ? "stream" : "await-first-event";
-                this.log("warn", `upstream failed phase=${phase} event=${event.type} close_code=${closeCode(event)} received_events=${receivedEvents}`);
+                this.log("warn", `upstream failed phase=${phase} event=${event.type} ${describeFailureEvent(event)} elapsed_ms=${Math.max(0, Date.now() - startedAt)} received_events=${receivedEvents}`);
+                if (isFollowUp) { clean(); return; }
                 fail(new ResponsesWsUpstreamError(
-                    `Responses WebSocket upstream disconnected before completion (close_code=${closeCode(event)}, received_events=${receivedEvents})`,
+                    `Responses WebSocket upstream disconnected before completion (${describeFailureEvent(event)}, received_events=${receivedEvents})`,
                     closeCode(event),
                     phase,
                     receivedEvents,
-                ), "upstream-disconnect");
+                ), "upstream-disconnect", { keepCloseListener: event.type === "error" });
             };
             const aborted = (): void => {
                 this.log("debug", `upstream aborted phase=${receivedEvents > 0 ? "stream" : "await-first-event"}`);
@@ -511,6 +618,7 @@ export class ResponsesWsUpstream {
             };
             const message = (event: { data: unknown }): void => {
                 if (ended) return;
+                watchdog.arm(); // #6171: any upstream frame is a liveness signal
                 try {
                     if (typeof event.data !== "string" || Buffer.byteLength(event.data) > this.requestBytes) throw new Error("Invalid or oversized Responses WebSocket frame");
                     const frame: unknown = JSON.parse(event.data);
@@ -620,7 +728,7 @@ class ResponsesWsResponse extends http.ServerResponse {
     restoredOutputItems = 0;
     terminal = false;
 
-    constructor(req: http.IncomingMessage, private readonly peer: WebSocket) {
+    constructor(req: http.IncomingMessage, private readonly peer: WebSocket, private readonly log: DiagnosticLog = () => {}) {
         super(req);
         Object.defineProperty(this, "headersSent", { get: () => this.sent });
         Object.defineProperty(this, "writableEnded", { get: () => this.ended });
@@ -689,6 +797,7 @@ class ResponsesWsResponse extends http.ServerResponse {
             let details: unknown;
             try { details = JSON.parse(this.buffer); } catch { details = undefined; }
             const status = this.statusCode >= 400 ? this.statusCode : 502;
+            let code = "incomplete_response";
             if (!object(details)) {
                 this.peer.send(errorFrame("incomplete_response", "Responses exchange ended without a terminal event", status));
             } else {
@@ -702,8 +811,13 @@ class ResponsesWsResponse extends http.ServerResponse {
                     : typeof rawError === "string"
                         ? { code: "proxy_failure", message: detailText !== "" && detailText !== rawError ? `${rawError}: ${detailText}` : rawError }
                         : { code: "incomplete_response", message: "Responses exchange ended without a terminal event" };
+                if (typeof error.code === "string") code = error.code;
                 this.peer.send(JSON.stringify({ ...details, error, type: "error", status }));
             }
+            // #6171: the client-visible terminal state was synthesized by bili, not
+            // received from upstream — name it so the log line pairs with the
+            // upstream-side failure line under the same conn/session stamp.
+            this.log("warn", `client terminal=synthesized code=${code} status=${status}`);
         }
         this.ended = true;
         this.emit("finish");
@@ -727,6 +841,10 @@ export class ResponsesWsSession implements WsBridgeSession {
     private readonly budget = limitsReceiveBytes();
     private active?: ResponsesWsResponse;
     private busy = false;
+    // #6171: timestamp of a turn that ended without an upstream terminal event —
+    // the next successful turn logs how long the recovery took, pairing the
+    // failure line with its outcome under the same conn/session stamp.
+    private lastFailedExchangeAt?: number;
 
     constructor(private readonly context: WsBridgeContext) {
         this.transport = new ResponsesWsUpstream(context.log, undefined, context.instanceId, context.codec.allowStreamFlag === true);
@@ -897,7 +1015,7 @@ export class ResponsesWsSession implements WsBridgeSession {
         }
         req.push(Buffer.from(wire));
         req.push(null);
-        const res = new ResponsesWsResponse(req, peer);
+        const res = new ResponsesWsResponse(req, peer, this.context.log);
         res.on("error", () => {});
         this.active = res;
         // markWsLaneTransport (#3701 Finding 1): the egress-shed byte budget keys on
@@ -930,6 +1048,16 @@ export class ResponsesWsSession implements WsBridgeSession {
             } finally {
                 this.active = undefined;
                 this.busy = false;
+                // #6171: pair each failed exchange with its recovery outcome — the next
+                // terminal turn reports how long the client had to wait for a usable lane.
+                if (res.terminal) {
+                    if (this.lastFailedExchangeAt !== undefined) {
+                        this.context.log("info", `recovery=ok after_ms=${Math.max(0, Date.now() - this.lastFailedExchangeAt)}`);
+                        this.lastFailedExchangeAt = undefined;
+                    }
+                } else {
+                    this.lastFailedExchangeAt = Date.now();
+                }
             }
         });
     }
