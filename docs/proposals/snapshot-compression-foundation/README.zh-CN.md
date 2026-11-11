@@ -1,6 +1,6 @@
 # 提案：快照表式压缩底座（六段固定链，单一存储真源）
 
-> **状态：P0 + P1 + P2 已在 [#5901](https://github.com/ranxianglei/billion-context/pull/5901) 实现**（schema v12；影子写 soak；P2 = mapEgress 带 tripwire 保护的出站切换，soak 期间随 `ci:full` + 本地 gate 以 100% 运行，发版前与其他 soak 旗一样改回先关后发）。P2-final 按提案原序落地六段链：快照写入（事件→表）在**请求内**完成 —— 内核改写之后、出站改写之前，平面在响应发出前即可读，本轮自身重发的尾窗为空。
+> **状态：P0 + P1 + P2 已在 [#5901](https://github.com/ranxianglei/billion-context/pull/5901) 实现**（schema v12；影子写 soak；P2 = mapEgress 直接权威出站 —— 提案里的 tripwire（J 裁定）后被 owner 移除：平面存内核自己的打标输出，与旧出站逐字节一致是结构保证，逐轮比对只添复杂度）。P2-final 按提案原序落地六段链：快照写入（事件→表，cast/update/delete/compact 事件级增量）在**请求内**完成 —— 内核改写之后、出站改写之前，平面在响应发出前即可读，本轮自身重发的尾窗为空。
 > 2026-11-07 作为设计提案撰写；本文件是已落地实现的设计记录。
 > **基线：** origin/master（写于 2026-11-07；存储 schema v11，#5854 已把 v6 整线撤出 master）。
 > **来源讨论：** [#5643](https://github.com/ranxianglei/billion-context/issues/5643)（含定位纠正评论）。
@@ -159,7 +159,7 @@ upsert snap_rows（按证据寻址的行）
 
 ### 4.5 第 5 段：出站
 
-**tripwire 运行期形态**（J 裁定建议）：低比例抽样把出站字节与 legacy 全量路径产物逐字比对（除 time attr）。一致放行；不一致 ⇒ 该会话立即摘回 legacy + 告警。最终护栏防的是「漂移状态下供出陈旧前缀 = 缓存投毒」。
+**tripwire 运行期形态**（J 裁定建议，后被 owner 移除）：原案低比例抽样把出站字节与 legacy 全量路径产物逐字比对（除 time attr），不一致摘回 legacy + 告警。**终局形态改为直接权威**：平面存内核自己打标的 processTurn 输出（不变量 v：post_json 恒为改写后核心形态），平面行本身就是旧后处理的输入 ⇒ 与旧出站逐字节一致是结构保证，无需逐轮比对；防「漂移状态下供出陈旧前缀 = 缓存投毒」的终局护栏改为折叠时 A/B 身份裁判（视图对平面活动行的身份多重集），对不上即该会话平面永久锁死、legacy 继续兜底。
 
 **协议卫生**：pf-* / 信封类握手头是协议头不是 hop 头，转发上游前剥掉（UPSTREAM_HOP_HEADERS 白名单纪律）；本提案引入的任何新握手头同样进白名单管理。灰度期全程 A/B 字节钉在场。
 
@@ -310,10 +310,10 @@ CI：docker gate + 求解器无关；hermetic，端口 listen(0)（#360 纪律�
 |----|------|--------|------|
 | **P0** | DDL 四件套 + 提交原语 + 升级钉 + 回滚演练 + 事件事务单元测试 | **零行为变化**（纯铺底） | T1/T2/T6；写模型假设(H)与 key 命名(config-surface 章)在此期定稿——人审点① |
 | **P1** | 影子写：新表与旧路并行落数据，读侧完全不切 | 零行为面 | T3/T4(影子比对)/T7/T9 长跑曲线；体量模型过红线检查——人审点②（信任重建关键期） |
-| **P2** | 单车道 hydrate-egress 切源灰度（cohort 首个成员，建议 pi 或 dsh 之一） | 灰度会话读出站来自新表 | T5/T10/T11/T12 + A/B 钉常开 + tripwire 抽样在场；exit switch 一键回退 |
+| **P2** | 单车道 hydrate-egress 切源灰度（cohort 首个成员，建议 pi 或 dsh 之一） | 灰度会话读出站来自新表 | T5/T10/T11/T12 + A/B 身份裁判（折叠时）+ 直接权威出站；exit switch 一键回退 |
 | **P3** | decompress/export/UI/计费逐一切换；CCR/persona 处置；#3756 退役判断；cohort 名单扩员 | 消费方逐个切换 | T8 + 全矩阵复跑；每期独立 PR |
 
-**E 裁定的 P2 部分被 owner 推翻**：owner 要求单 PR 完成（#5901 现承载 P0+P1+P2）。P2 落地为 `mapEgress`（[src/server/snap-egress.ts](../../../src/server/snap-egress.ts)）：每个出站轮先拼平面视图（锚点 + 存活行 + 客户端尾窗，缝合与 #3756 同法），重放本车道后处理链，归一化完全一致才切出站字节（tripwire 逐轮全量比对 —— 比提案的抽样更严）；任何不一致保留旧字节，同会话累计 3 次不一致粘性排除。cohort = 协议车道（`storage.snapBase.egressCohorts`，默认四条全开），见[配置文档](../../configuration.zh-CN.md)。
+**E 裁定的 P2 部分被 owner 推翻**：owner 要求单 PR 完成（#5901 现承载 P0+P1+P2）。P2 落地为 `mapEgress`（[src/server/snap-egress.ts](../../../src/server/snap-egress.ts)）：快照平面就是**直接出站权威** —— 出站上下文直接从 S4 校验过的平面读，不做任何与旧字节的逐轮比对（tripwire 已被 owner 移除，理由同上：逐字节一致是结构保证）。写侧以事件级增量（cast/update/delete/compact，每次保存一个事务，与 legacy 提交同 tick）持久化内核看到的那份字节，压缩轮的新块同轮即可被平面读出；出站按 pos 顺序读平面行（存活活动行 + 每块存的锚点摘要，移到其覆盖区段的安全位置；被覆盖行靠平面自身 active 旗 / cover_ref 抑制，绝不靠 id 匹配），再跑本车道后处理链（absorb → attach → strip → drop）。降级回旧字节（一轮，下一轮重新决定）：旗关、cohort 不含、平面死/缺、任一行不可解析、拼装异常；不可寻址视图条目或折叠时 A/B 身份对不上 ⇒ 该会话平面永久锁死。cohort = 协议车道（`storage.snapBase.egressCohorts`，默认四条全开），见[配置文档](../../configuration.zh-CN.md)。
 
 ---
 
@@ -341,7 +341,7 @@ CI：docker gate + 求解器无关；hermetic，端口 listen(0)（#360 纪律�
 | **G** | L1 身份薄表 | 恢复 baseline §4.1.1 的 (sess_raw, ledger_id) 持久化（独立薄表 + 索引），复用 #5842 采集 | P0 DDL |
 | **H** | 写模型 | 单进程假设（WAL 串行化）or 多进程 + 内存视图失效协议，P0 二选一定稿 | P0 |
 | **I** | 硬门 vs 降级边界 | cohort 声称宿主故障拒绝 + 零副作用 + breaker；非 cohort 走顺序>hash 同表降级、会话粘滞、换模式=resync | P0/P2 路由 |
-| **J** | tripwire | 运行期低比例抽样 + 不匹配即摘回 legacy + 告警 | P2 |
+| **J** | tripwire | 运行期低比例抽样 + 不匹配即摘回 legacy + 告警 | P2（后被 owner 移除，改直接权威 + 折叠时 A/B 身份裁判，见 §4.5） |
 | **K** | 与 #3756 / v5 共存 | 新底座车道上 #3756 让位退役（旗互斥）；v5 继续服务非 cohort | P2/P3 |
 | **L** | 行内 token 计账列 | tokens_est 入表：判决面增长数据源 + 计费共用 | P0 DDL |
 | D3 | 故障响应形态 | HTTP 码 / 错误体 / 客户端重试约定（R3 硬拒绝的对端视角） | P2 |
@@ -355,7 +355,7 @@ CI：docker gate + 求解器无关；hermetic，端口 listen(0)（#360 纪律�
 - **「保元素数的前缀字节改写不可检测」**（继承 baseline 代价条款）：代价就是跳过逐条复核的信任模型变化——需人工评审把关，不得自动合并（KDD §7.4 同类门槛）。
 - **多模态尾部进入缓存后该段历史永久降级 legacy 全量轮**（继承 KDD#15 诚实边界②）：宁降级不偏离。
 - **marker-strip 计数随种子账本继承**，中部区从不重扫（同上③）。
-- 本提案所有「不变量」的最终裁判是运行期 tripwire + S4 抽验，不是纸面论证——所以 P1 影子期存在意义就是攒这份实证。
+- 本提案所有「不变量」的最终裁判是运行期折叠时 A/B 身份裁判 + S4 抽验（tripwire 已按 owner 裁定移除，见 §4.5），不是纸面论证——所以 P1 影子期存在意义就是攒这份实证。
 
 ---
 

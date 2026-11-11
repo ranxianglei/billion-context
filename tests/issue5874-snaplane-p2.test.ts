@@ -1,13 +1,37 @@
 /**
- * #5874 P2 — mapEgress: the outbound compressed context is served from the
- * verified snap plane (tripwire-guarded). Unit scope:
- *   T13  view assembly — anchor + surviving rows + client tail, D-lane seam
- *        walk parity (live tail / reply-lag gap / seam-too-short / rewind).
- *   T14  tripwire normalization — ids and stamps are metadata; payload
- *        (role/type/tool/text/image-hash) must match exactly.
- *   T15  anchor rendering parity with kernel renderSummary.
- *   T16  the gate: config off, cohort, plane miss, mismatch fallback and
- *        the sticky exclusion after EGRESS_EXCLUDE_AFTER verdicts.
+ * #5874 P2 — mapEgress: the snap plane is the DIRECT outbound egress
+ * authority (owner ruling 2026-11-11 — no per-round diff against the legacy
+ * view; the legacy bytes remain only the one-round crash-grade fallback).
+ *
+ * Model under test:
+ *   WRITE (incremental, event-level): the save carries the lane's tagged
+ *   processTurn output (planeMessages = the kernel's OWN tagged view). The
+ *   plane persists exactly those bytes (invariant v) — surviving rows keep
+ *   their tagged form, the pinned first user stays active, covered ranges
+ *   are flipped covered (rows retained for the pair-safe walk, materialized
+ *   from the legacy CAS only when the plane never recorded them), each
+ *   active block's rendered anchor is stored at a negative pos, and rows the
+ *   host no longer presents are deleted. No diff, no fuzzy matching: a view
+ *   entry is addressed to its ledger row by message id (steady state), with
+ *   a tag-stripped identity fallback for the rare kernel remint edge.
+ *   EGRESS (direct): the outbound view is assembled from the plane rows
+ *   alone — the non-anchor rows in pos order (covered ones included, for
+ *   pairing parity) walked with EXACT kernel prune/rebuild semantics
+ *   (earliest-covered anchor → pair-safe → pin clamp; alias-coverage /
+ *   stale-summary skips; pinned first user served),
+ *   each active block's stored anchor row re-inserted at its pair-safe
+ *   index — then run through the lane's transform (identical to what the
+ *   lane ran on the legacy view). Byte-identical to the legacy egress by
+ *   construction, because the plane rows ARE the transform input.
+ *
+ * Unit scope:
+ *   W*  write side — seed+fold, steady-state no-op, tail append, host
+ *        removal, unaddressable-entry death.
+ *   E*  egress assembly — kernel-view parity, no-fold passthrough,
+ *        no-plane / row-unparsable degrade, #4311 visible-compress-call
+ *        skip, remint coverage via row alias (core_ids), renderAnchor fallback.
+ *   G*  the gate — config off, cohort, plane miss, plane dead, and the
+ *        plane being served directly regardless of the legacy bytes.
  */
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -15,19 +39,17 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { defaultCountTokens, formatTagTime, renderVisibleRefs, SUMMARY_HEADER, summaryMessageId, type CompressionState } from "acp-kernel";
+import { SUMMARY_HEADER, type CompressionState } from "acp-kernel";
 import type { BiliMessage } from "acp-kernel/wire";
 import { planIngest, type LegacySessionLike } from "../src/storage/ingest.ts";
-import { _resetSnapPlaneDeadForTests, type SnapView } from "../src/storage/snap.ts";
+import { _resetSnapPlaneDeadForTests, isSnapPlaneDead, type SnapView } from "../src/storage/snap.ts";
 import { UnifiedStore } from "../src/storage/store.ts";
-import { SessionStore, _setStoreForTest, getStore } from "../src/persist.ts";
-import { createSession, markDirty, snapshotMessages } from "../src/session.ts";
+import { _setStoreForTest, SessionStore } from "../src/persist.ts";
+import type { UnifiedShadow } from "../src/storage/shadow.ts";
 import {
     applySnapEgress,
     buildSnapEgressView,
-    snapEgressFlags,
     snapEgressStatusWire,
-    tripwireCompare,
     _resetSnapEgressForTests,
     type SnapEgressProtocol,
 } from "../src/server/snap-egress.ts";
@@ -48,6 +70,32 @@ function tmpDir(prefix: string): string {
 
 function openPlane(p: string): UnifiedStore {
     return UnifiedStore.open(p, undefined, { snapBase: { enabled: true, shadowWrite: true } });
+}
+
+// ---------------------------------------------------------------------------
+// Fixtures
+// ---------------------------------------------------------------------------
+
+const refOf = (i: number): string => `m${String(i + 1).padStart(5, "0")}`;
+const tagOf = (i: number): string => `<acp tokens="4" type="text">${refOf(i)}</acp>\n`;
+const roleOf = (i: number): "user" | "assistant" => (i % 2 === 0 ? "user" : "assistant");
+
+/** Legacy (client-resent, untagged) core message i (1-based id). */
+function plainMsg(i: number): { id: string; role: "user" | "assistant"; contentType: "text"; text: string } {
+    return { id: `m${i}`, role: roleOf(i - 1), contentType: "text", text: `message ${i}` };
+}
+
+/** Tagged view entry for message i (what the kernel's processTurn output
+ *  carries — render-refs prepends the ref tag to the text). */
+function taggedMsg(i: number): BiliMessage {
+    const m = plainMsg(i);
+    return { ...m, text: tagOf(i - 1) + m.text } as BiliMessage;
+}
+
+const ANCHOR_ID = "acp_summary_blk-c1";
+const ANCHOR_TEXT = `${SUMMARY_HEADER} — fold topic\nfolded 1-8`;
+function anchorMsg(): BiliMessage {
+    return { id: ANCHOR_ID, role: "system", contentType: "text", text: ANCHOR_TEXT } as BiliMessage;
 }
 
 function session(id: string, msgs: Array<{ id: string; text: string; role?: "user" | "assistant" }>): LegacySessionLike {
@@ -72,15 +120,18 @@ function session(id: string, msgs: Array<{ id: string; text: string; role?: "use
     };
 }
 
-/** A folded session: 12 messages, block covers msgs[from..to) (T7 shape: 0..8). */
-function foldedSession(sid: string, from = 0, to = 8): { sess: LegacySessionLike; blk: Record<string, unknown>; msgs: Array<{ id: string; text: string }> } {
-    const msgs = Array.from({ length: 12 }, (_, i) => ({ id: `m${i + 1}`, text: `message ${i + 1}` }));
+/** A folded session: `count` messages, block covers msgs[from..to). */
+function foldedSession(
+    sid: string,
+    opts: { from?: number; to?: number; count?: number } = {},
+): { sess: LegacySessionLike; blk: Record<string, unknown>; msgs: Array<{ id: string; text: string }> } {
+    const { from = 0, to = 8, count = 12 } = opts;
+    const msgs = Array.from({ length: count }, (_, i) => ({ id: `m${i + 1}`, text: `message ${i + 1}` }));
     const byRaw: Record<string, string> = {};
     const byRef: Record<string, string> = {};
     msgs.forEach((m, i) => {
-        const ref = `m${String(i + 1).padStart(5, "0")}`;
-        byRaw[m.id] = ref;
-        byRef[ref] = m.id;
+        byRaw[m.id] = refOf(i);
+        byRef[refOf(i)] = m.id;
     });
     const blk = {
         blockId: "blk-c1",
@@ -89,6 +140,7 @@ function foldedSession(sid: string, from = 0, to = 8): { sess: LegacySessionLike
         tier: 1,
         active: true,
         summary: "folded 1-8",
+        topic: "fold topic",
         kind: "fold",
         reason: "test",
         effectiveMessageIds: msgs.slice(from, to).map((m) => m.id),
@@ -99,24 +151,36 @@ function foldedSession(sid: string, from = 0, to = 8): { sess: LegacySessionLike
     return { sess, blk, msgs };
 }
 
-function msg(id: string, text: string, role: "user" | "assistant" | "system" | "tool" = "user"): BiliMessage {
-    return { id, role, contentType: "text", text } as BiliMessage;
+/** The kernel's tagged processTurn output for the folded session: pinned
+ *  first user, the rendered anchor, then the surviving tail. */
+function foldedView(count = 12): BiliMessage[] {
+    return [taggedMsg(1), anchorMsg(), ...Array.from({ length: count - 8 }, (_, i) => taggedMsg(9 + i))];
 }
 
-/** Build the plane for the folded session and return its egress view. */
-function planeFor(sid: string, from = 0, to = 8): { store: UnifiedStore; view: SnapView; state: CompressionState; blk: Record<string, unknown> } {
-    const dir = tmpDir("bili-5874-p2-plane-");
-    const store = openPlane(path.join(dir, "index.db"));
-    const { sess, blk } = foldedSession(sid, from, to);
-    store.ingestSession(planIngest(sess));
+function stateFor(blk: Record<string, unknown>): CompressionState {
+    return { blocks: [blk as never], messageRefs: { byRaw: {}, byRef: {} } } as unknown as CompressionState;
+}
+
+const NO_COMPRESS = (name: string): boolean => name === "compress";
+
+function egressRows(store: UnifiedStore, sid: string): SnapView["rows"] {
     const view = store.snapEgressView(sid);
     assert.ok(view, "the plane must have rows after ingest");
-    // messageRefs present (empty) — the kernel renderer reads it unconditionally.
-    return { store, view, state: { blocks: [blk as never], messageRefs: { byRaw: {}, byRef: {} }, tsStamps: {} } as unknown as CompressionState, blk };
+    return view.rows;
 }
 
-const clientResend = (msgs: Array<{ id: string; text: string }>): BiliMessage[] =>
-    msgs.map((m, i) => msg(m.id, m.text, i % 2 === 0 ? "user" : "assistant"));
+/** G-tests: the egress reads the plane through getStore() (a SessionStore),
+ *  so register one whose sidecar wraps the store under test. SessionStore's
+ *  replicasAvailable() reads shadow.stats.disabled and the read path only
+ *  calls snapEgressView, so a minimal UnifiedShadow-shaped wrapper over the
+ *  raw UnifiedStore is sufficient (private ctor — no public seam exists). */
+function registerStore(store: UnifiedStore): void {
+    const shadow = {
+        stats: { disabled: false },
+        snapEgressView: (sid: string) => store.snapEgressView(sid),
+    } as unknown as UnifiedShadow;
+    _setStoreForTest(new SessionStore({ enabled: true, shadow, log: () => {} }));
+}
 
 test.beforeEach(() => {
     _resetSnapEgressForTests();
@@ -125,763 +189,383 @@ test.beforeEach(() => {
 });
 
 // ---------------------------------------------------------------------------
-// T13 — view assembly: anchors replace the covered region, surviving rows
-// ride the prefix in pos order, the client tail rides verbatim.
+// W* — write side: incremental event-level persistence of the tagged view
 // ---------------------------------------------------------------------------
 
-test("#5874 T13: folded session assembles anchor + surviving rows (steady-state seam)", () => {
-    const { view, state } = planeFor("sess-p2-a");
-    // The client re-sends the full post-fold history (m9..m12 plus the
-    // covered m1..m8 — ids still bind onto covered rows, D-lane parity).
-    const built = buildSnapEgressView(view, clientResend(Array.from({ length: 12 }, (_, i) => ({ id: `m${i + 1}`, text: `message ${i + 1}` }))), state);
-    assert.ok(built.ok, `view must assemble, got ${(built as { reason: string }).reason}`);
-    assert.equal(built.msgs.length, 5, "anchor + m9..m12");
-    const [anchor, ...rest] = built.msgs;
-    assert.equal(anchor.id, summaryMessageId("blk-c1"));
-    assert.equal(anchor.role, "system");
-    assert.equal(anchor.contentType, "text");
-    assert.equal(anchor.text, `${SUMMARY_HEADER}\nfolded 1-8`);
-    assert.deepEqual(rest.map((m) => m.text), ["message 9", "message 10", "message 11", "message 12"]);
-    assert.equal(built.tailCount, 0, "nothing above the join — empty tail");
+test("W1 seed+fold: surviving rows tagged, covered flipped, anchor at negative pos, A/B green", () => {
+    const store = openPlane(path.join(tmpDir("bili-5874-w1-"), "index.db"));
+    const sid = "w1";
+    const { sess, msgs } = foldedSession(sid);
+    sess.lastPlaneMessages = foldedView();
+    store.ingestSession(planIngest(sess));
+
+    // The fold is committed and the structural A/B check did NOT kill the
+    // plane (pin row stays active inside the covered interval).
+    assert.equal(isSnapPlaneDead(sid), false, "fold must pass the structural A/B check");
+
+    const rows = egressRows(store, sid);
+    const byPos = new Map(rows.map((r) => [r.pos, r]));
+    assert.equal(rows.length, 13, "12 ledger rows + 1 anchor row");
+    // Anchor row at the most-negative pos, active, kernel's own bytes.
+    assert.equal(byPos.get(-1)!.active, 1);
+    assert.equal(byPos.get(-1)!.postJson, JSON.stringify(anchorMsg()));
+    assert.ok(byPos.get(-1)!.coreIds.includes(ANCHOR_ID));
+    // Pinned first user: active, tagged bytes.
+    assert.equal(byPos.get(0)!.active, 1);
+    assert.equal(byPos.get(0)!.postJson, JSON.stringify(taggedMsg(1)));
+    // Covered rows: retained (pair-safe walk needs them), flipped covered,
+    // legacy bytes (they were never in the tagged view).
+    for (let i = 2; i <= 8; i++) {
+        const r = byPos.get(i - 1)!;
+        assert.equal(r.active, 0, `row ${i - 1} covered`);
+        assert.equal(r.coverRef, "blk-c1");
+        assert.equal(r.postJson, JSON.stringify(plainMsg(i)));
+    }
+    // Surviving tail: active, tagged bytes.
+    for (let i = 9; i <= 12; i++) {
+        const r = byPos.get(i - 1)!;
+        assert.equal(r.active, 1);
+        assert.equal(r.postJson, JSON.stringify(taggedMsg(i)));
+    }
 });
 
-test("#5874 T13b: this turn's fresh user message rides the tail", () => {
-    const { view, state } = planeFor("sess-p2-b");
-    const client = [...clientResend(Array.from({ length: 12 }, (_, i) => ({ id: `m${i + 1}`, text: `message ${i + 1}` }))), msg("m13", "继续")];
-    const built = buildSnapEgressView(view, client, state);
-    assert.ok(built.ok);
-    assert.equal(built.msgs.length, 6);
-    assert.equal(built.msgs.at(-1)?.text, "继续");
-    assert.equal(built.tailCount, 1);
+test("W2 steady state: an identical tagged save is a no-op (no rewrites, no new fold point)", () => {
+    const store = openPlane(path.join(tmpDir("bili-5874-w2-"), "index.db"));
+    const sid = "w2";
+    const { sess } = foldedSession(sid);
+    sess.lastPlaneMessages = foldedView();
+    store.ingestSession(planIngest(sess));
+    const snap1 = JSON.stringify(egressRows(store, sid));
+    const stats1 = store.sessionStorageStats(sid).rows;
+    assert.equal(stats1.snapRows, 13, "seed must materialize the plane");
+    assert.ok(stats1.snapCkpts >= 1, "the seed fold must checkpoint");
+
+    const sess2 = foldedSession(sid).sess;
+    sess2.lastPlaneMessages = foldedView();
+    store.ingestSession(planIngest(sess2));
+    const stats2 = store.sessionStorageStats(sid).rows;
+    assert.equal(JSON.stringify(egressRows(store, sid)), snap1, "steady-state save must not rewrite rows");
+    assert.equal(stats2.snapCkpts, stats1.snapCkpts, "a no-op round must not add a fold point");
 });
 
-test("#5874 T13c: the reply lag — an unobserved reply under the new user message stays in the tail", () => {
-    const { view, state } = planeFor("sess-p2-c");
-    // Client: resent history + the previous turn's reply (no row yet) + new user.
-    const client = [...clientResend(Array.from({ length: 12 }, (_, i) => ({ id: `m${i + 1}`, text: `message ${i + 1}` }))), msg("host-r1", "the reply"), msg("m13", "next question")];
-    const built = buildSnapEgressView(view, client, state);
-    assert.ok(built.ok);
-    assert.equal(built.tailCount, 2, "reply + question both live in the tail");
-    assert.deepEqual(built.msgs.slice(-2).map((m) => m.text), ["the reply", "next question"]);
+test("W3 tail append: new tail rows are cast tagged, nothing else changes", () => {
+    const store = openPlane(path.join(tmpDir("bili-5874-w3-"), "index.db"));
+    const sid = "w3";
+    const { sess } = foldedSession(sid);
+    sess.lastPlaneMessages = foldedView();
+    store.ingestSession(planIngest(sess));
+
+    // Next turn: two more messages, no new fold.
+    const { sess: sess2 } = foldedSession(sid, { count: 14 });
+    sess2.lastPlaneMessages = foldedView(14);
+    store.ingestSession(planIngest(sess2));
+
+    const rows = egressRows(store, sid);
+    const byPos = new Map(rows.map((r) => [r.pos, r]));
+    assert.equal(byPos.get(12)!.active, 1);
+    assert.equal(byPos.get(12)!.postJson, JSON.stringify(taggedMsg(13)));
+    assert.equal(byPos.get(13)!.active, 1);
+    assert.equal(byPos.get(13)!.postJson, JSON.stringify(taggedMsg(14)));
+    // The earlier rows are untouched.
+    assert.equal(byPos.get(0)!.postJson, JSON.stringify(taggedMsg(1)));
+    assert.equal(byPos.get(-1)!.postJson, JSON.stringify(anchorMsg()));
 });
 
-test("#5874 T13d: unobserved mid-history messages drop from the plane view — the tripwire catches that live", () => {
-    const { view, state } = planeFor("sess-p2-d");
-    const base = Array.from({ length: 12 }, (_, i) => ({ id: `m${i + 1}`, text: `message ${i + 1}` }));
-    // An unobserved message inside the resent region (not reply lag — that
-    // rides above): the walk tolerates ONE gap, the prefix renders from the
-    // plane rows, so the unknown content is absent from the plane view. In
-    // production the legacy view still carries it ⇒ tripwire mismatch ⇒
-    // legacy bytes kept. Unit-level: assert the drop + the catch.
-    const gapped = [...clientResend(base.slice(0, 9)), msg("host-x", "unknown"), ...clientResend(base.slice(10)), msg("m13", "next question")];
-    const built = buildSnapEgressView(view, gapped, state);
-    assert.ok(built.ok, "one gap is tolerated");
-    assert.deepEqual(built.msgs.map((m) => m.text), [`${SUMMARY_HEADER}\nfolded 1-8`, "message 9", "message 10", "message 11", "message 12", "next question"]);
-    assert.equal(built.tailCount, 1);
-    // Two consecutive unknowns: same join (the chain ends at the second
-    // miss; the seam m11+m12 still satisfies MIN_SEAM_RUN).
-    const broken = [...clientResend(base.slice(0, 9)), msg("host-x", "unknown"), msg("host-y", "unknown2"), ...clientResend(base.slice(10)), msg("m13", "next question")];
-    const built2 = buildSnapEgressView(view, broken, state);
-    assert.ok(built2.ok);
-    assert.deepEqual(built2.msgs.map((m) => m.text), built.msgs.map((m) => m.text));
-    // The tripwire catches the dropped content: a legacy view that still
-    // carries the unknown message must NOT match the plane view.
-    const legacyWithX = [msg("acp_summary_blk-c1", `${SUMMARY_HEADER}\nfolded 1-8`, "system"), msg("host-9", "message 9"), msg("host-x", "unknown"), msg("host-10", "message 10"), msg("host-11", "message 11"), msg("host-12", "message 12"), msg("host-13", "next question")];
-    const verdict = tripwireCompare(built.msgs, legacyWithX);
-    assert.ok(!verdict.ok, "a view missing the unknown message must fail the tripwire");
-    assert.equal(verdict.reason, "length(plane=6,legacy=7)");
+test("W4 host removal: an active row the view no longer presents is deleted", () => {
+    const store = openPlane(path.join(tmpDir("bili-5874-w4-"), "index.db"));
+    const sid = "w4";
+    const { sess } = foldedSession(sid);
+    sess.lastPlaneMessages = foldedView();
+    store.ingestSession(planIngest(sess));
+
+    // Host edit: m11 drops out of the transcript (and the tagged view).
+    const { sess: sess2 } = foldedSession(sid);
+    sess2.lastMessages = sess2.lastMessages!.filter((m) => m.id !== "m11");
+    sess2.lastPlaneMessages = foldedView().filter((m) => m.id !== "m11");
+    store.ingestSession(planIngest(sess2));
+
+    const byPos = new Map(egressRows(store, sid).map((r) => [r.pos, r]));
+    // Host-removed rows are physically GC'd (cover_ref='deleted' is the GC
+    // marker; only BLOCK-covered rows are retained for the pair-safe walk).
+    assert.equal(byPos.get(10), undefined, "m11 row GC'd");
+    // Everything else intact.
+    assert.equal(byPos.get(0)!.active, 1);
+    assert.equal(byPos.get(9)!.active, 1, "m10 still active");
+    assert.equal(byPos.get(11)!.active, 1, "m12 still active");
 });
 
-test("#5874 T13e: a lone match is never a seam (#3812) — degrade, do not guess", () => {
-    const { view, state } = planeFor("sess-p2-e");
-    const client = [msg("rand-1", "noise"), msg("rand-2", "noise"), ...clientResend([{ id: "m12", text: "message 12" }]), msg("m13", "next question")];
-    const built = buildSnapEgressView(view, client, state);
-    assert.ok(!built.ok);
-    assert.equal(built.reason, "seam-too-short");
-});
+test("W5 unaddressable view entry: the save latches the sid dead, legacy keeps the round", () => {
+    const store = openPlane(path.join(tmpDir("bili-5874-w5-"), "index.db"));
+    const sid = "w5";
+    const { sess } = foldedSession(sid);
+    // A view entry with no live ledger row: not by id, not by identity.
+    sess.lastPlaneMessages = [
+        ...foldedView(),
+        { id: "ghost-msg", role: "assistant", contentType: "text", text: "a content no legacy row carries" } as BiliMessage,
+    ];
+    store.ingestSession(planIngest(sess));
 
-test("#5874 T13f: rewind truncation — rows beyond the join never render", () => {
-    const { view, state } = planeFor("sess-p2-f");
-    // Client rewound to m1..m6 (+ new tail): join at m6; m7..m12 never render,
-    // m1..m6 are all covered → the anchor is the entire prefix.
-    const client = [...clientResend(Array.from({ length: 6 }, (_, i) => ({ id: `m${i + 1}`, text: `message ${i + 1}` }))), msg("m13", "after rewind")];
-    const built = buildSnapEgressView(view, client, state);
-    assert.ok(built.ok);
-    assert.deepEqual(built.msgs.map((m) => m.text), [`${SUMMARY_HEADER}\nfolded 1-8`, "after rewind"]);
-    assert.equal(built.tailCount, 1);
-});
-
-test("#5874 T13g: signature remint — client ids changed, content matches (#3812 sig path)", () => {
-    const { view, state } = planeFor("sess-p2-g");
-    const client = Array.from({ length: 12 }, (_, i) => msg(`fresh-${i + 1}`, `message ${i + 1}`, i % 2 === 0 ? "user" : "assistant"));
-    const built = buildSnapEgressView(view, client, state);
-    assert.ok(built.ok, "the sig path must chain when every id was reminted");
-    assert.equal(built.msgs.length, 5);
-    assert.deepEqual(built.msgs.slice(1).map((m) => m.text), ["message 9", "message 10", "message 11", "message 12"]);
-});
-
-test("#5874 T13h: a block anchoring zero rows degrades (coverage the plane cannot prove)", () => {
-    const { view } = planeFor("sess-p2-h");
-    const ghost = { blocks: [{ blockId: "blk-ghost", active: true, effectiveMessageIds: ["nope-1", "nope-2"], summary: "ghost" }] } as unknown as CompressionState;
-    const built = buildSnapEgressView(view, clientResend(Array.from({ length: 12 }, (_, i) => ({ id: `m${i + 1}`, text: `message ${i + 1}` }))), ghost);
-    assert.ok(!built.ok);
-    assert.equal(built.reason, "block-unanchored");
-});
-
-// ---------------------------------------------------------------------------
-// T14 — tripwire normalization.
-// ---------------------------------------------------------------------------
-
-test("#5874 T14: tripwire ignores ids/stamps, compares payload exactly", () => {
-    const a = [msg("plane-1", "hello"), msg("plane-2", "world", "assistant")];
-    const b = [msg("host-1", "hello"), msg("host-2", "world", "assistant")];
-    assert.deepEqual(tripwireCompare(a, b), { ok: true }, "same payload, different ids → match");
-    const c = [msg("host-1", "hello"), msg("host-2", "WORLD", "assistant")];
-    const cVerdict = tripwireCompare(a, c);
-    assert.equal(cVerdict.ok, false);
-    assert.equal(cVerdict.ok === false && cVerdict.reason, "shape@1:text");
-    assert.match(cVerdict.ok === false && cVerdict.firstDiff || "", /^text plane\(len=5\)="world" …seam@0: plane="world" legacy="WORLD" …tail="world"\|"WORLD"$/);
-    const d = [msg("host-1", "hello")];
-    assert.deepEqual(tripwireCompare(a, d), { ok: false, reason: "length(plane=2,legacy=1)", firstDiff: "+1×assistant/text" });
-    const imgA = { id: "i1", role: "user", contentType: "image", text: "", imagePart: true, imageBase64: "QUJD" } as unknown as BiliMessage;
-    const imgB = { id: "i2", role: "user", contentType: "image", text: "", imagePart: true, imageBase64: "QUJD" } as unknown as BiliMessage;
-    const imgC = { id: "i3", role: "user", contentType: "image", text: "", imagePart: true, imageBase64: "REVG" } as unknown as BiliMessage;
-    assert.deepEqual(tripwireCompare([imgA], [imgB]), { ok: true }, "image hashed, not id-compared");
-    const imgVerdict = tripwireCompare([imgA], [imgC]);
-    assert.equal(imgVerdict.ok, false);
-    assert.equal(imgVerdict.ok === false && imgVerdict.reason, "shape@0:image");
+    assert.equal(isSnapPlaneDead(sid), true, "unaddressable entry must latch the sid dead");
 });
 
 // ---------------------------------------------------------------------------
-// T15 — anchor rendering parity (kernel renderSummary).
+// E* — egress assembly: kernel prune/rebuild parity over the plane rows
 // ---------------------------------------------------------------------------
 
-test("#5874 T15: anchor text mirrors renderSummary (topic line + body; body-only fallback)", () => {
-    // Two rows so the seam run ≥ 2; the block covers m1 only.
-    const view: SnapView = {
-        sid: "x",
-        rows: [
-            { pos: 0, coreIds: ["m1"], preJson: null, postJson: JSON.stringify(msg("m1", "one")), tokensEst: 1, active: 1, coverRef: null, rowSum: "" },
-            { pos: 1, coreIds: ["m2"], preJson: null, postJson: JSON.stringify(msg("m2", "two")), tokensEst: 1, active: 1, coverRef: null, rowSum: "" },
-        ],
-        tailSeq: 2,
-        ckptSeq: 0,
+test("E1 folded plane: egress output is byte-identical to the kernel's tagged view", () => {
+    const store = openPlane(path.join(tmpDir("bili-5874-e1-"), "index.db"));
+    const sid = "e1";
+    const { sess, blk } = foldedSession(sid);
+    sess.lastPlaneMessages = foldedView();
+    store.ingestSession(planIngest(sess));
+
+    const out = buildSnapEgressView(store.snapEgressView(sid)!, stateFor(blk), NO_COMPRESS);
+    assert.equal(out.ok, true);
+    if (!out.ok) return;
+    assert.deepEqual(
+        out.msgs.map((m) => JSON.stringify(m)),
+        foldedView().map((m) => JSON.stringify(m)),
+        "the egress view must equal the kernel's tagged view, byte for byte",
+    );
+});
+
+test("E2 no fold: the plane rows are served verbatim in pos order", () => {
+    const store = openPlane(path.join(tmpDir("bili-5874-e2-"), "index.db"));
+    const sid = "e2";
+    const sess = session(sid, Array.from({ length: 12 }, (_, i) => ({ id: `m${i + 1}`, text: `message ${i + 1}`, role: roleOf(i) })));
+    const view = Array.from({ length: 12 }, (_, i) => taggedMsg(i + 1));
+    sess.lastPlaneMessages = view;
+    store.ingestSession(planIngest(sess));
+
+    const out = buildSnapEgressView(store.snapEgressView(sid)!, { blocks: [] } as unknown as CompressionState, NO_COMPRESS);
+    assert.equal(out.ok, true);
+    if (!out.ok) return;
+    assert.deepEqual(
+        out.msgs.map((m) => JSON.stringify(m)),
+        view.map((m) => JSON.stringify(m)),
+    );
+});
+
+test("E3 empty plane: no-plane degrade", () => {
+    const out = buildSnapEgressView({ rows: [] } as unknown as SnapView, { blocks: [] } as unknown as CompressionState, NO_COMPRESS);
+    assert.deepEqual(out, { ok: false, reason: "no-plane" });
+});
+
+test("E4 corrupt row: row-unparsable degrade", () => {
+    const view = {
+        rows: [{ pos: 0, coreIds: ["m1"], preJson: null, postJson: "{not-json", tokensEst: 1, active: 1, coverRef: null, rowSum: 1 }],
     } as unknown as SnapView;
-    const built = buildSnapEgressView(view, [msg("m1", "one"), msg("m2", "two")], {
-        blocks: [{ blockId: "blk-t", active: true, effectiveMessageIds: ["m1"], summary: "the body", topic: "setup" } as never],
-    } as unknown as CompressionState);
-    assert.ok(built);
-    assert.ok(built.ok, `expected ok, got ${JSON.stringify(built)}`);
-    assert.equal(built.msgs[0].text, `${SUMMARY_HEADER} — setup\nthe body`, "topic line + body");
-    assert.equal(built.msgs[0].id, "acp_summary_blk-t");
-    assert.equal(built.msgs.length, 2, "anchor + m2");
-    const built2 = buildSnapEgressView(view, [msg("m1", "one"), msg("m2", "two")], {
-        blocks: [{ blockId: "blk-t2", active: true, effectiveMessageIds: ["m1"], summary: "the body" } as never],
-    } as unknown as CompressionState);
-    assert.ok(built2.ok);
-    assert.equal(built2.msgs[0].text, `${SUMMARY_HEADER}\nthe body`, "no topic → header + body");
+    const out = buildSnapEgressView(view, { blocks: [] } as unknown as CompressionState, NO_COMPRESS);
+    assert.deepEqual(out, { ok: false, reason: "row-unparsable" });
+});
+
+test("E5 #4311: a visible compress tool-call suppresses its block's summary render", () => {
+    // The kernel's own tagged output for this fold: the block covers m1..m3,
+    // the first-user pin m1 survives, the visible compress call m4 (the wire
+    // evidence of the fold) and the live tail m5 remain — and #4311
+    // suppressed the separate summary render, so NO anchor entry. The plane
+    // persists exactly that (invariant v): m1/m4/m5 active, m2/m3 compacted.
+    const compressCall: BiliMessage = {
+        id: "m4",
+        role: "assistant",
+        contentType: "tool-call",
+        text: "",
+        toolCallId: "tc-1",
+        toolName: "compress",
+    } as BiliMessage;
+    const view = {
+        rows: [
+            { pos: 0, coreIds: ["m1"], preJson: null, postJson: JSON.stringify(taggedMsg(1)), tokensEst: 1, active: 1, coverRef: null, rowSum: 1 },
+            { pos: 1, coreIds: ["m2"], preJson: null, postJson: JSON.stringify(plainMsg(2)), tokensEst: 1, active: 0, coverRef: "blk-c1", rowSum: 1 },
+            { pos: 2, coreIds: ["m3"], preJson: null, postJson: JSON.stringify(plainMsg(3)), tokensEst: 1, active: 0, coverRef: "blk-c1", rowSum: 1 },
+            { pos: 3, coreIds: ["m4"], preJson: null, postJson: JSON.stringify(compressCall), tokensEst: 1, active: 1, coverRef: null, rowSum: 1 },
+            { pos: 4, coreIds: ["m5"], preJson: null, postJson: JSON.stringify(taggedMsg(5)), tokensEst: 1, active: 1, coverRef: null, rowSum: 1 },
+        ],
+    } as unknown as SnapView;
+    const blk = {
+        blockId: "blk-c1",
+        active: true,
+        summary: "folded",
+        effectiveMessageIds: ["m1", "m2", "m3"],
+        directMessageIds: [],
+        compressCallId: "tc-1",
+    };
+    const out = buildSnapEgressView(view, stateFor(blk), NO_COMPRESS);
+    assert.equal(out.ok, true);
+    if (!out.ok) return;
+    // The visible call suppresses the block's separate summary render —
+    // the plane serves pin + call + tail verbatim, no anchor.
+    assert.deepEqual(
+        out.msgs.map((m) => m.id),
+        ["m1", "m4", "m5"],
+    );
+});
+
+test("E6 remint: a reminted id is covered through its ALIAS (core_ids keeps the old id)", () => {
+    const m1 = { id: "m1", role: "user" as const, contentType: "text" as const, text: "message 1" };
+    // Post-remint plane: the block's effIds still carry the OLD ids (m2..m4
+    // — or the reconcile re-keyed them to the client's re-minted forms), but
+    // the covered run is read from the rows' OWN cover_ref, so no id
+    // resolution is involved. m2 was re-appended under its reminted id m2_k2
+    // (core_ids keeps the old alias); all three covered rows are inactive.
+    const m2k = { id: "m2_k2", role: "assistant" as const, contentType: "text" as const, text: "message 2" };
+    const m3 = { id: "m3", role: "assistant" as const, contentType: "text" as const, text: "message 3" };
+    const m4 = { id: "m4", role: "assistant" as const, contentType: "text" as const, text: "message 4" };
+    const view = {
+        rows: [
+            { pos: 0, coreIds: ["m1"], preJson: null, postJson: JSON.stringify(m1), tokensEst: 1, active: 1, coverRef: null, rowSum: 1 },
+            { pos: 1, coreIds: ["m2_k2", "m2"], preJson: null, postJson: JSON.stringify(m2k), tokensEst: 1, active: 0, coverRef: "blk-c1", rowSum: 1 },
+            { pos: 2, coreIds: ["m3"], preJson: null, postJson: JSON.stringify(m3), tokensEst: 1, active: 0, coverRef: "blk-c1", rowSum: 1 },
+            { pos: 3, coreIds: ["m4"], preJson: null, postJson: JSON.stringify(m4), tokensEst: 1, active: 0, coverRef: "blk-c1", rowSum: 1 },
+        ],
+    } as unknown as SnapView;
+    // The block's ids do NOT resolve against any active row — coverage must
+    // come from cover_ref alone, and the anchor takes the first row above
+    // the covered run (after the pinned first user).
+    const blk = {
+        blockId: "blk-c1",
+        active: true,
+        summary: "folded",
+        effectiveMessageIds: ["m2", "m3", "m4"],
+        directMessageIds: [],
+        startSeq: -1,
+        endSeq: -1,
+    };
+    const out = buildSnapEgressView(view, stateFor(blk), NO_COMPRESS);
+    assert.equal(out.ok, true);
+    if (!out.ok) return;
+    assert.deepEqual(
+        out.msgs.map((m) => m.id),
+        ["m1", ANCHOR_ID],
+        "pin first, anchor after the covered run, covered rows skipped",
+    );
+});
+
+test("E7 anchor row missing from the plane: renderAnchor fallback is byte-parity", () => {
+    const store = openPlane(path.join(tmpDir("bili-5874-e7-"), "index.db"));
+    const sid = "e7";
+    const { sess, blk } = foldedSession(sid);
+    sess.lastPlaneMessages = foldedView();
+    store.ingestSession(planIngest(sess));
+
+    // Drop the anchor row from the egress view (degenerate plane).
+    const full = store.snapEgressView(sid)!;
+    const degenerate = { ...full, rows: full.rows.filter((r) => r.pos >= 0) };
+    const out = buildSnapEgressView(degenerate, stateFor(blk), NO_COMPRESS);
+    assert.equal(out.ok, true);
+    if (!out.ok) return;
+    const expected = foldedView().map((m) => JSON.stringify(m));
+    assert.deepEqual(out.msgs.map((m) => JSON.stringify(m)), expected, "the fallback render must match the stored anchor bytes");
 });
 
 // ---------------------------------------------------------------------------
-// T16 — the gate: config, cohort, plane miss, mismatch fallback, sticky
-// exclusion — via the real applySnapEgress with a store stub.
+// G* — the gate: direct authority with the one-round crash-grade fallback
 // ---------------------------------------------------------------------------
 
-function withStore(view: SnapView | null): void {
-    _setStoreForTest({ snapEgressView: () => view } as unknown as SessionStore);
-    assert.ok(getStore(), "store stub installed");
-}
+test("G1 config off: the legacy bytes are served", () => {
+    const dir = tmpDir("bili-5874-g1-");
+    const store = openPlane(path.join(dir, "index.db"));
+    registerStore(store);
+    const sid = "g1";
+    const { sess, blk } = foldedSession(sid);
+    sess.lastPlaneMessages = foldedView();
+    store.ingestSession(planIngest(sess));
 
-const identity = (m: BiliMessage[]): BiliMessage[] => m;
-const deps = (protocol: SnapEgressProtocol = "openai") => ({
-    sessionId: "sess-gate",
-    protocol,
-    renderTags: "none" as const,
-    log: () => {},
-    transform: identity,
+    setConfig({ storage: { snapBase: { egress: false } } });
+    const legacy = [taggedMsg(99)];
+    const out = applySnapEgress(stateFor(blk), legacy, {
+        sessionId: sid,
+        protocol: "openai",
+        log: (_l: string, _m: string) => {},
+        transform: (m: BiliMessage[]) => m,
+    });
+    assert.equal(out, legacy, "gate off must return the legacy array verbatim");
+    assert.equal(snapEgressStatusWire().plane, 0);
 });
 
-test("#5874 T16a: config egress:false keeps legacy bytes", () => {
-    setConfig({ storage: { snapBase: { enabled: true, shadowWrite: true, egress: false } } });
-    assert.equal(snapEgressFlags().egress, false);
-    const legacy = [msg("l1", "legacy")];
-    const out = applySnapEgress([msg("m1", "one")], { blocks: [] } as unknown as CompressionState, legacy, deps());
-    assert.equal(out, legacy, "flag off → identity (same array reference)");
-});
+test("G2 cohort: a protocol outside egressCohorts serves the legacy bytes", () => {
+    const dir = tmpDir("bili-5874-g2-");
+    const store = openPlane(path.join(dir, "index.db"));
+    registerStore(store);
+    const sid = "g2";
+    const { sess, blk } = foldedSession(sid);
+    sess.lastPlaneMessages = foldedView();
+    store.ingestSession(planIngest(sess));
 
-test("#5874 T16b: cohort exclusion keeps legacy bytes", () => {
-    setConfig({ storage: { snapBase: { enabled: true, shadowWrite: true, egressCohorts: ["anthropic"] } } });
-    const legacy = [msg("l1", "legacy")];
-    const out = applySnapEgress([msg("m1", "one")], { blocks: [] } as unknown as CompressionState, legacy, deps("openai"));
+    setConfig({ storage: { snapBase: { egressCohorts: ["anthropic"] } } });
+    const legacy = [taggedMsg(99)];
+    const out = applySnapEgress(stateFor(blk), legacy, {
+        sessionId: sid,
+        protocol: "openai",
+        log: (_l: string, _m: string) => {},
+        transform: (m: BiliMessage[]) => m,
+    });
     assert.equal(out, legacy);
-    // and the named cohort passes the flag check (plane miss follows below).
-    setConfig({});
+    assert.equal(snapEgressStatusWire().plane, 0);
 });
 
-test("#5874 T16c: plane miss counts and keeps legacy", () => {
-    withStore(null);
-    const legacy = [msg("l1", "legacy")];
-    const out = applySnapEgress([msg("m1", "one")], { blocks: [] } as unknown as CompressionState, legacy, deps());
+test("G3 plane miss: an sid the plane never recorded serves the legacy bytes", () => {
+    const dir = tmpDir("bili-5874-g3-");
+    const store = openPlane(path.join(dir, "index.db"));
+    registerStore(store);
+    const legacy = [taggedMsg(99)];
+    const out = applySnapEgress({ blocks: [] } as unknown as CompressionState, legacy, {
+        sessionId: "never-ingested",
+        protocol: "openai",
+        log: (_l: string, _m: string) => {},
+        transform: (m: BiliMessage[]) => m,
+    });
     assert.equal(out, legacy);
     assert.equal(snapEgressStatusWire().planeMiss, 1);
 });
 
-test("#5874 T16d: exact tripwire match cuts over; mismatch falls back; 3 mismatches sticky-exclude", () => {
-    const { view, state } = planeFor("sess-gate");
-    withStore(view);
-    const resend = clientResend(Array.from({ length: 12 }, (_, i) => ({ id: `m${i + 1}`, text: `message ${i + 1}` })));
-    // Legacy view the kernel would emit for the same turn: anchor (reminted
-    // id is fine — payload compared) + m9..m12 with host-side ids.
-    const legacyOk: BiliMessage[] = [
-        { ...msg(summaryMessageId("blk-c1"), `${SUMMARY_HEADER}\nfolded 1-8`), role: "system" },
-        msg("host-9", "message 9", "user"),
-        msg("host-10", "message 10", "assistant"),
-        msg("host-11", "message 11", "user"),
-        msg("host-12", "message 12", "assistant"),
+test("G4 plane dead: a latched sid serves the legacy bytes", () => {
+    const dir = tmpDir("bili-5874-g4-");
+    const store = openPlane(path.join(dir, "index.db"));
+    registerStore(store);
+    const sid = "g4";
+    const { sess } = foldedSession(sid);
+    sess.lastPlaneMessages = [
+        ...foldedView(),
+        { id: "ghost-msg", role: "assistant", contentType: "text", text: "no legacy row" } as BiliMessage,
     ];
-    const out = applySnapEgress(resend, state, legacyOk, { ...deps(), sessionId: "sess-gate" });
-    assert.notEqual(out, legacyOk, "cutover returns the plane-sourced array");
-    assert.equal(snapEgressStatusWire().cutover, 1);
-    assert.equal(out.length, 5);
-    // Mismatching legacy (different text) → fallback, legacy kept, 3 strikes out.
-    const legacyBad = [msg("host-9", "DIFFERENT", "assistant")];
-    const sid = "sess-gate";
-    for (let i = 1; i <= 3; i++) {
-        const kept = applySnapEgress(resend, state, legacyBad, { ...deps(), sessionId: sid });
-        assert.equal(kept, legacyBad, `fallback ${i} keeps legacy`);
-    }
-    const st = snapEgressStatusWire();
-    assert.equal(st.fallback, 3);
-    assert.equal(st.excludedSids, 1, "sticky exclusion after the 3rd mismatch");
-    // 4th call short-circuits: even a perfect legacy view stays legacy now.
-    const kept = applySnapEgress(resend, state, legacyOk, { ...deps(), sessionId: sid });
-    assert.equal(kept, legacyOk);
-    assert.equal(snapEgressStatusWire().cutover, 1, "no further cutovers for the excluded sid");
-});
+    store.ingestSession(planIngest(sess)); // latches dead
 
-test("#5874 T16e: zero-plane session (no rows) degrades with no-plane", () => {
-    withStore({ sid: "empty", rows: [], tailSeq: 0, ckptSeq: 0 } as unknown as SnapView);
-    const legacy = [msg("l1", "legacy")];
-    const out = applySnapEgress([msg("m1", "one")], { blocks: [] } as unknown as CompressionState, legacy, deps());
+    const legacy = [taggedMsg(99)];
+    const out = applySnapEgress({ blocks: [] } as unknown as CompressionState, legacy, {
+        sessionId: sid,
+        protocol: "openai",
+        log: (_l: string, _m: string) => {},
+        transform: (m: BiliMessage[]) => m,
+    });
     assert.equal(out, legacy);
-    const st = snapEgressStatusWire();
-    assert.equal(st.degradeReasons["no-plane"], 1);
+    assert.equal(snapEgressStatusWire().plane, 0);
+    assert.equal(snapEgressStatusWire().planeMiss, 0, "dead is not a miss");
 });
 
-test("#5874 T16f: soak default — no config section means egress ON for all four cohorts", () => {
-    setConfig({});
-    const flags = snapEgressFlags();
-    assert.equal(flags.egress, true);
-    for (const p of ["openai", "anthropic", "google", "responses"] as SnapEgressProtocol[]) {
-        assert.ok(flags.cohorts.has(p), `${p} in default cohorts`);
-    }
-});
+test("G5 direct authority: the plane is served regardless of the legacy bytes", () => {
+    const dir = tmpDir("bili-5874-g5-");
+    const store = openPlane(path.join(dir, "index.db"));
+    registerStore(store);
+    const sid = "g5";
+    const { sess, blk } = foldedSession(sid);
+    sess.lastPlaneMessages = foldedView();
+    store.ingestSession(planIngest(sess));
 
-test("#5874 T18a: kernel render parity — plane rows re-stamped by the kernel renderer match the legacy render byte-for-byte", () => {
-    // CI's preload-test-env pins BILI_MESSAGE_TIMESTAMPS=0 suite-wide; this
-    // suite exercises the ON path, so pin it ON for the duration (env wins
-    // over the config file in resolveMessageTimestamps — setConfig can't).
-    const prevTs = process.env.BILI_MESSAGE_TIMESTAMPS;
-    process.env.BILI_MESSAGE_TIMESTAMPS = "1";
-    try {
-    _resetSnapEgressForTests();
-    setConfig({});
-    const { view, state } = planeFor("sess-p2-env-a");
-    withStore(view);
-    // A real post-fold state: refs minted for the anchor + surviving rows,
-    // immutable first-sight timestamps on tsStamps (kernel stamp-timestamps).
-    const TS = 1_234_567_890_123;
-    const ids = ["m9", "m10", "m11", "m12"];
-    const anchorId = summaryMessageId("blk-c1");
-    state.messageRefs = {
-        byRaw: Object.fromEntries([[anchorId, "m00005"], ...ids.map((id, i) => [id, `m0000${9 + i}`])]),
-        byRef: Object.fromEntries([["m00005", anchorId], ...ids.map((id, i) => [`m0000${9 + i}`, id])]),
-    };
-    state.tsStamps = Object.fromEntries([[anchorId, TS - 60_000], ...ids.map((id) => [id, TS])]);
-    // A real post-fold state carries the #5608-C visibility mark: a fresh
-    // session armed it to 0 on its first stamped pass, so every ref minted
-    // afterwards renders its time attribute (seq > hwm).
-    state.timestampsHighWaterRefSeq = 0;
-    // Plain untagged client resend (host transport never carries tags).
-    const resend = [
-        msg("m1", "message 1"),
-        msg("m2", "message 2"),
-        ...ids.map((id, i) => msg(id, `message ${9 + i}`, i % 2 === 0 ? "user" : "assistant")),
-    ];
-    // The legacy lane output for the same turn: the ideal view stamped by the
-    // kernel's own renderer (this is what turn.messages would have looked like).
-    const idealUntagged: BiliMessage[] = [
-        { ...msg(anchorId, `${SUMMARY_HEADER}\nfolded 1-8`, "system" as const), ts: TS - 60_000 },
-        ...ids.map((id, i) => ({ ...msg(id, `message ${9 + i}`, i % 2 === 0 ? "user" : "assistant"), ts: TS })),
-    ];
-    const legacy = renderVisibleRefs(idealUntagged, state, defaultCountTokens, "text-only", true) as BiliMessage[];
-    const out = applySnapEgress(resend, state, legacy, { ...deps(), renderTags: "text-only" as const });
-    assert.notEqual(out, legacy, "cutover returns the plane-sourced array");
-    assert.equal(snapEgressStatusWire().cutover, 1);
-    assert.deepEqual(tripwireCompare(out, legacy), { ok: true }, "plane render is payload-identical to the legacy render");
-    assert.deepEqual(out.map((m) => [m.id, m.role, m.text]), legacy.map((m) => [m.id, m.role, m.text]), "byte-identical texts (ledgerSeq stamps are plane metadata)");
-    assert.match(out[1].text ?? "", new RegExp(`^<acp tokens="[0-9]+" type="text" time="${formatTagTime(TS).replace(/[-: ]/g, "\\$&")}">m00009<`), "row tag comes from the kernel renderer (ref + first-sight time)");
-    } finally {
-        if (prevTs === undefined) delete process.env.BILI_MESSAGE_TIMESTAMPS;
-        else process.env.BILI_MESSAGE_TIMESTAMPS = prevTs;
-    }
-});
-
-test("#5874 T18b: immutable first-sight time — the plane render is stable across turns (no per-resend churn)", () => {
-    // Same ON-path pin as T18a (CI preload pins the env OFF suite-wide).
-    const prevTs = process.env.BILI_MESSAGE_TIMESTAMPS;
-    process.env.BILI_MESSAGE_TIMESTAMPS = "1";
-    try {
-    _resetSnapEgressForTests();
-    setConfig({});
-    const { view, state } = planeFor("sess-p2-env-b");
-    withStore(view);
-    const TS = 1_600_000_000_000;
-    const anchorId = summaryMessageId("blk-c1");
-    state.messageRefs = {
-        byRaw: Object.fromEntries([["m9", "m00009"], ["m10", "m00010"], ["m11", "m00011"], ["m12", "m00012"]]),
-        byRef: Object.fromEntries([["m00009", "m9"], ["m00010", "m10"], ["m00011", "m11"], ["m00012", "m12"]]),
-    };
-    state.tsStamps = Object.fromEntries([["m9", TS], ["m10", TS], ["m11", TS], ["m12", TS]]);
-    state.timestampsHighWaterRefSeq = 0; // #5608-C: fresh-session mark, all refs visible
-    const resend = [
-        msg("m1", "message 1"),
-        msg("m9", "message 9"),
-        msg("m10", "message 10", "assistant"),
-        msg("m11", "message 11"),
-        msg("m12", "message 12", "assistant"),
-    ];
-    const run = () => {
-        const unt: BiliMessage[] = [
-            { ...msg(anchorId, `${SUMMARY_HEADER}\nfolded 1-8`, "system" as const) },
-            msg("m9", "message 9"),
-            msg("m10", "message 10", "assistant"),
-            msg("m11", "message 11"),
-            msg("m12", "message 12", "assistant"),
-        ];
-        unt.slice(1).forEach((m, i) => ((m as { ts?: number }).ts = TS));
-        return renderVisibleRefs(unt, state, defaultCountTokens, "text-only", true) as BiliMessage[];
-    };
-    const out1 = applySnapEgress(resend, state, run(), { ...deps(), renderTags: "text-only" as const });
-    const out2 = applySnapEgress(resend, state, run(), { ...deps(), sessionId: "sess-p2-env-b2", renderTags: "text-only" as const });
-    assert.equal(snapEgressStatusWire().cutover, 2);
-    assert.equal(out1[1].text, out2[1].text, "same tsStamps → identical bytes across turns");
-    assert.ok((out1[1].text ?? "").includes(formatTagTime(TS)), "time is the immutable first-sight stamp, not the wall clock");
-    } finally {
-        if (prevTs === undefined) delete process.env.BILI_MESSAGE_TIMESTAMPS;
-        else process.env.BILI_MESSAGE_TIMESTAMPS = prevTs;
-    }
-});
-
-test("#5874 T18d: the #5608-C high-water mark gates the time attribute — plane and legacy both drop it for refs at/below the mark after a fold", () => {
-    const prevTs = process.env.BILI_MESSAGE_TIMESTAMPS;
-    process.env.BILI_MESSAGE_TIMESTAMPS = "1";
-    try {
-    _resetSnapEgressForTests();
-    setConfig({});
-    const { view, state } = planeFor("sess-p2-env-d");
-    withStore(view);
-    const TS = 1_600_000_000_000;
-    const anchorId = summaryMessageId("blk-c1");
-    state.messageRefs = {
-        byRaw: Object.fromEntries([[anchorId, "m00005"], ["m9", "m00009"], ["m10", "m00010"], ["m11", "m00011"], ["m12", "m00012"]]),
-        byRef: Object.fromEntries([["m00005", anchorId], ["m00009", "m9"], ["m00010", "m10"], ["m00011", "m11"], ["m00012", "m12"]]),
-    };
-    state.tsStamps = Object.fromEntries([[anchorId, TS - 60_000], ["m9", TS], ["m10", TS], ["m11", TS], ["m12", TS]]);
-    // The fold's ledger alignment raised the visibility mark to 11: m00005,
-    // m00009, m00010, m00011 sit at/below it and lose the attribute; only
-    // m00012 (minted after the mark) keeps it — in BOTH renders.
-    state.timestampsHighWaterRefSeq = 11;
-    const resend = [
-        msg("m1", "message 1"),
-        msg("m9", "message 9"),
-        msg("m10", "message 10", "assistant"),
-        msg("m11", "message 11"),
-        msg("m12", "message 12", "assistant"),
-    ];
-    const unt: BiliMessage[] = [
-        { ...msg(anchorId, `${SUMMARY_HEADER}\nfolded 1-8`, "system" as const) },
-        msg("m9", "message 9"),
-        msg("m10", "message 10", "assistant"),
-        msg("m11", "message 11"),
-        { ...msg("m12", "message 12", "assistant"), ts: TS },
-    ];
-    const legacy = renderVisibleRefs(unt, state, defaultCountTokens, "text-only", true) as BiliMessage[];
-    const out = applySnapEgress(resend, state, legacy, { ...deps(), renderTags: "text-only" as const });
-    assert.equal(snapEgressStatusWire().cutover, 1, "gated plane matches gated legacy — cutover, not red");
-    assert.deepEqual(out.map((m) => [m.id, m.role, m.text]), legacy.map((m) => [m.id, m.role, m.text]), "byte-identical after the mark change (ledgerSeq is plane metadata)");
-    assert.ok(!/(^|\s)time="/.test(out[1].text ?? ""), "m00009 (seq 9 <= 11) lost the attribute");
-    assert.ok(!/(^|\s)time="/.test(out[3].text ?? ""), "m00011 (seq 11 <= 11) lost the attribute");
-    assert.ok((out[4].text ?? "").includes(`time="${formatTagTime(TS)}"`), "m00012 (seq 12 > 11) keeps the attribute");
-    } finally {
-        if (prevTs === undefined) delete process.env.BILI_MESSAGE_TIMESTAMPS;
-        else process.env.BILI_MESSAGE_TIMESTAMPS = prevTs;
-    }
-});
-
-test("#5874 T18c: a client content edit diverges from the plane — tripwire red (byte-strict)", () => {
-    _resetSnapEgressForTests();
-    setConfig({});
-    const { view, state } = planeFor("sess-p2-env-c");
-    // The client rewrote m9's body (an edit): the seam walk pairs the row by
-    // id, but the plane renders its own stored text — the divergence lands
-    // exactly at that row and the tripwire keeps the legacy bytes.
-    const resend = [
-        msg("m1", "message 1"),
-        msg("m9", "message 9 EDITED"),
-        msg("m10", "message 10", "assistant"),
-        msg("m11", "message 11"),
-        msg("m12", "message 12", "assistant"),
-    ];
-    const built = buildSnapEgressView(view, resend, state);
-    assert.ok(built.ok);
-    assert.equal(built.msgs[1].text, "message 9", "the plane renders its stored text, never the edit");
-    const legacy = [
-        msg("acp_summary_blk-c1", `${SUMMARY_HEADER}\nfolded 1-8`, "system"),
-        msg("m9", "message 9 EDITED"),
-        msg("m10", "message 10", "assistant"),
-        msg("m11", "message 11"),
-        msg("m12", "message 12", "assistant"),
-    ];
-    const verdict = tripwireCompare(built.msgs, legacy);
-    assert.ok(!verdict.ok);
-    assert.equal(verdict.reason, "shape@1:text");
-});
-
-// T19a: mid-history block — the anchor takes the EARLIEST covered position
-// (prune pairing parity), not the end of the coverage run.
-test("T19a mid-history block anchors at the earliest covered row", () => {
-    const { view, state } = planeFor("t19a", 4, 8);
-    state.blocks = [state.blocks[0]] as never;
-    const resend = [
-        msg("m1", "message 1"),
-        msg("m2", "message 2", "assistant"),
-        msg("m3", "message 3"),
-        msg("m4", "message 4", "assistant"),
-        msg("m9", "message 9"),
-        msg("m10", "message 10", "assistant"),
-        msg("m11", "message 11"),
-        msg("m12", "message 12", "assistant"),
-    ];
-    const built = buildSnapEgressView(view, resend, state);
-    assert.ok(built.ok);
+    const legacy = [{ id: "sentinel", role: "user", contentType: "text", text: "not served" } as BiliMessage];
+    const out = applySnapEgress(stateFor(blk), legacy, {
+        sessionId: sid,
+        protocol: "openai",
+        log: (_l: string, _m: string) => {},
+        transform: (m: BiliMessage[]) => m.map((x) => ({ ...x, text: `X${x.text}` })),
+    });
+    const wire = snapEgressStatusWire();
+    assert.equal(wire.plane, 1);
+    assert.equal(wire.degrade, 0);
+    // The plane view, through the lane transform — never the legacy bytes.
     assert.deepEqual(
-        built.msgs.map((m) => m.id),
-        ["m1", "m2", "m3", "m4", "acp_summary_blk-c1", "m9", "m10", "m11", "m12"],
-        "anchor sits where the earliest covered message (m5) used to be",
+        out.map((m) => JSON.stringify(m)),
+        foldedView().map((m) => JSON.stringify({ ...m, text: `X${m.text}` })),
     );
-});
-
-// T19b: hosts trim bulky old tool results in resends; a resend text that is a
-// strict PREFIX of the stored plane text is adopted (kernel passes trimmed
-// text through, so legacy egress serves exactly these bytes).
-test("T19b client-trimmed prefix text is adopted on plane prefix rows", () => {
-    const { view, state } = planeFor("t19b");
-    const full = "message 9 ".repeat(40);
-    const trimmed = full.slice(0, 24);
-    const rows = view.rows.map((r) => ({ ...r, postJson: r.postJson?.replace('"message 9"', JSON.stringify(full)) }));
-    const viewFull = { ...view, rows: rows as SnapView["rows"] };
-    const resend = [
-        msg("m1", "message 1"),
-        msg("m9", trimmed),
-        msg("m10", "message 10", "assistant"),
-        msg("m11", "message 11"),
-        msg("m12", "message 12", "assistant"),
-    ];
-    const built = buildSnapEgressView(viewFull, resend, state);
-    assert.ok(built.ok);
-    const m9out = built.msgs.find((m) => m.id === "m9");
-    assert.equal(m9out?.text, trimmed, "trimmed resend text wins over the full stored text");
-    const verdict = tripwireCompare(
-        built.msgs,
-        [
-            msg("acp_summary_blk-c1", `${SUMMARY_HEADER}\nfolded 1-8`, "system"),
-            msg("m9", trimmed),
-            msg("m10", "message 10", "assistant"),
-            msg("m11", "message 11"),
-            msg("m12", "message 12", "assistant"),
-        ],
-    );
-    assert.ok(verdict.ok, `trimmed adoption must reach parity (got ${verdict.ok ? "" : verdict.reason})`);
-});
-
-// T19c: tool results have no host-echoed id on the wire and a trimmed body
-// fails the content signature — they pair by toolCallId, and a head-keep
-// trimmed resend (dsh's old-tool-result budget) is adopted byte-for-byte.
-test("T19c tool results pair by toolCallId; head-keep trim adopted", () => {
-    const { view, state } = planeFor("t19c");
-    const full = "corpus page text ".repeat(60);
-    const trimmed = full.slice(0, 120);
-    const rows = view.rows.map((r) => {
-        if (r.postJson?.includes('"message 9"')) {
-            const parsed = JSON.parse(r.postJson) as Record<string, unknown>;
-            parsed.contentType = "tool-result";
-            parsed.toolCallId = "call_abc";
-            parsed.text = full;
-            return { ...r, postJson: JSON.stringify(parsed) };
-        }
-        return r;
-    });
-    const viewFull = { ...view, rows: rows as SnapView["rows"] };
-    const resend = [
-        msg("m1", "message 1"),
-        { ...msg("m9", trimmed), contentType: "tool-result", toolCallId: "call_abc" } as unknown as BiliMessage,
-        msg("m10", "message 10", "assistant"),
-        msg("m11", "message 11"),
-        msg("m12", "message 12", "assistant"),
-    ];
-    const built = buildSnapEgressView(viewFull, resend, state);
-    assert.ok(built.ok, `view must assemble, got ${(built as { reason: string }).reason}`);
-    const m9out = built.msgs.find((m) => (m as { toolCallId?: string }).toolCallId === "call_abc");
-    assert.equal(m9out?.text, trimmed, "trimmed tool body adopted via toolCallId pairing");
-    assert.equal(m9out?.contentType, "tool-result");
-});
-
-// T19d: the dsh tool-result pruner keeps head+tail and replaces the middle
-// with a fixed marker; that shape is adopted byte-for-byte too.
-test("T19d middle-pruned tool result (dsh pruner shape) adopted", () => {
-    const { view, state } = planeFor("t19d");
-    const full = "X".repeat(3000) + "MIDDLE".repeat(500) + "Y".repeat(1000);
-    const MARKER = "\n\n[... tool result middle pruned ...]\n\n";
-    const pruned = "X".repeat(3000) + MARKER + "Y".repeat(1000);
-    const rows = view.rows.map((r) => {
-        if (r.postJson?.includes('"message 9"')) {
-            const parsed = JSON.parse(r.postJson) as Record<string, unknown>;
-            parsed.contentType = "tool-result";
-            parsed.toolCallId = "call_prune";
-            parsed.text = full;
-            return { ...r, postJson: JSON.stringify(parsed) };
-        }
-        return r;
-    });
-    const viewFull = { ...view, rows: rows as SnapView["rows"] };
-    const resend = [
-        msg("m1", "message 1"),
-        { ...msg("m9", pruned), contentType: "tool-result", toolCallId: "call_prune" } as unknown as BiliMessage,
-        msg("m10", "message 10", "assistant"),
-        msg("m11", "message 11"),
-        msg("m12", "message 12", "assistant"),
-    ];
-    const built = buildSnapEgressView(viewFull, resend, state);
-    assert.ok(built.ok, `view must assemble, got ${(built as { reason: string }).reason}`);
-    const m9out = built.msgs.find((m) => (m as { toolCallId?: string }).toolCallId === "call_prune");
-    assert.equal(m9out?.text, pruned, "head+marker+tail pruned body adopted");
-    // A body with the marker but a divergent head is NOT adopted.
-    const bad = "Z".repeat(3000) + MARKER + "Y".repeat(1000);
-    const badResend = [resend[0], { ...msg("m9", bad), contentType: "tool-result", toolCallId: "call_prune" } as unknown as BiliMessage, ...resend.slice(2)];
-    const built2 = buildSnapEgressView(viewFull, badResend, state);
-    assert.ok(built2.ok);
-    const m9bad = built2.msgs.find((m) => (m as { toolCallId?: string }).toolCallId === "call_prune");
-    assert.equal(m9bad?.text, full, "a marker-bearing edit with a divergent head stays plane-sourced");
-});
-
-// T20: the kernel's own emergency truncation (kernel/src/truncate-tools.ts)
-// clips oversized tool results inside processTurn — keepPrefix + marker +
-// keepSuffix — so the clipped bytes exist only in the legacy egress. A
-// verified marker shape is adopted byte-for-byte; a marker-bearing body whose
-// head/tail do not bound the plane text is still a red.
-test("T20 kernel emergency-truncation clips are adopted; divergent bounds stay red", () => {
-    const { view, state } = planeFor("t20");
-    const full = "P".repeat(2000) + "MIDDLE".repeat(300) + "S".repeat(2000);
-    const marker = `\n\n...[truncated for context space] — original ~${Math.ceil(full.length / 4)} tokens]...\n\n`;
-    const clipped = "P".repeat(2000) + marker + "S".repeat(2000);
-    const rows = view.rows.map((r) => {
-        if (r.postJson?.includes('"message 9"')) {
-            const parsed = JSON.parse(r.postJson) as Record<string, unknown>;
-            parsed.contentType = "tool-result";
-            parsed.toolCallId = "call_t20";
-            parsed.text = full;
-            return { ...r, postJson: JSON.stringify(parsed) };
-        }
-        return r;
-    });
-    const viewFull = { ...view, rows: rows as SnapView["rows"] };
-    withStore(viewFull);
-    const resend = [
-        msg("m1", "message 1"),
-        { ...msg("m9", full), contentType: "tool-result", toolCallId: "call_t20" } as unknown as BiliMessage,
-        msg("m10", "message 10", "assistant"),
-        msg("m11", "message 11"),
-        msg("m12", "message 12", "assistant"),
-    ];
-    const legacyClipped: BiliMessage[] = [
-        { ...msg(summaryMessageId("blk-c1"), `${SUMMARY_HEADER}\nfolded 1-8`), role: "system" },
-        { ...msg("host-9", clipped), contentType: "tool-result", toolCallId: "call_t20" } as unknown as BiliMessage,
-        msg("host-10", "message 10", "assistant"),
-        msg("host-11", "message 11"),
-        msg("host-12", "message 12", "assistant"),
-    ];
-    const out = applySnapEgress(resend, state, legacyClipped, { ...deps(), sessionId: "t20" });
-    assert.notEqual(out, legacyClipped, "verified kernel clip shape cuts over");
-    assert.equal(out[1]?.text, clipped, "adopted bytes are the kernel clip");
-    assert.equal(snapEgressStatusWire().cutover, 1);
-    // Same marker but a head the plane text does not start with → red, legacy kept.
-    const badClip = "Q".repeat(2000) + marker + "S".repeat(2000);
-    const legacyBad: BiliMessage[] = legacyClipped.map((m) =>
-        (m as { toolCallId?: string }).toolCallId === "call_t20" ? ({ ...msg("host-9", badClip), contentType: "tool-result", toolCallId: "call_t20" } as unknown as BiliMessage) : m);
-    const kept = applySnapEgress(resend, state, legacyBad, { ...deps(), sessionId: "t20" });
-    assert.equal(kept, legacyBad, "marker with divergent head stays legacy (red)");
-    assert.equal(snapEgressStatusWire().fallback, 1);
-});
-
-// T21 (review B1): the tripwire must see the model-visible sidecar fields the
-// codecs prefer over .text. Equal sidecars cut over; a divergent sidecar is a
-// red naming the offending key (remote-URL rotation, thinkingSignature,
-// toolIsError …), never a false green.
-test("T21 sidecar fields are tripwire-visible: equal cuts over, divergent goes red", () => {
-    const { view, state } = planeFor("t21");
-    const withSide = (extra: Record<string, unknown>) => ({
-        ...view,
-        rows: view.rows.map((r) => (r.postJson?.includes('"message 9"')
-            ? { ...r, postJson: JSON.stringify({ ...JSON.parse(r.postJson as string), ...extra }) }
-            : r)) as SnapView["rows"],
-    });
-    const base = { ...msg("m9", "message 9", "user"), contentType: "text" as const, toolCallId: undefined };
-    const resend = clientResend(Array.from({ length: 12 }, (_, i) => ({ id: `m${i + 1}`, text: `message ${i + 1}` })));
-    const legacyFor = (extra: Record<string, unknown> | undefined): BiliMessage[] => [
-        { ...msg(summaryMessageId("blk-c1"), `${SUMMARY_HEADER}\nfolded 1-8`), role: "system" },
-        extra === undefined ? msg("host-9", "message 9", "user") : ({ ...msg("host-9", "message 9", "user"), ...extra } as BiliMessage),
-        msg("host-10", "message 10", "assistant"),
-        msg("host-11", "message 11", "user"),
-        msg("host-12", "message 12", "assistant"),
-    ];
-    // Equal sidecars on both sides → cutover (the digest must not over-red).
-    withStore(withSide({ thinkingSignature: "sig-1" }));
-    const out = applySnapEgress(resend, state, legacyFor({ thinkingSignature: "sig-1" }), { ...deps(), sessionId: "t21" });
-    assert.notEqual(out, legacyFor({ thinkingSignature: "sig-1" }), "equal sidecars cut over");
-    assert.equal(snapEgressStatusWire().cutover, 1);
-    // Rotated remote URL (rawOpenaiContent) plane-old vs legacy-new → red.
-    withStore(withSide({ rawOpenaiContent: { type: "image_url", image_url: { url: "https://old.example/sig" } } }));
-    const legacyNew = legacyFor({ rawOpenaiContent: { type: "image_url", image_url: { url: "https://new.example/sig" } } });
-    const kept = applySnapEgress(resend, state, legacyNew, { ...deps(), sessionId: "t21" });
-    assert.equal(kept, legacyNew, "sidecar divergence keeps legacy");
-    const st = snapEgressStatusWire();
-    assert.equal(st.fallback, 1);
-    // toolIsError divergence is caught too.
-    withStore(withSide({ toolIsError: true }));
-    const legacyErr = legacyFor({ toolIsError: false });
-    const kept2 = applySnapEgress(resend, state, legacyErr, { ...deps(), sessionId: "t21" });
-    assert.equal(kept2, legacyErr);
-    assert.equal(snapEgressStatusWire().fallback, 2);
-});
-
-// T22 (review B3): two ADJACENT trimmed tool results (parallel calls) — the
-// seam walk pairs both by toolCallId, the chain holds, and both clips are
-// adopted: cutover, not a length-red sticky exclude.
-test("T22 adjacent double-trimmed tool results join by toolCallId and cut over", () => {
-    const { view, state } = planeFor("t22");
-    const fullA = "A".repeat(3000);
-    const fullB = "B".repeat(3000);
-    const trimA = "A".repeat(100);
-    const trimB = "B".repeat(100);
-    const rows = view.rows.map((r) => {
-        if (r.postJson?.includes('"message 9"')) {
-            const p = JSON.parse(r.postJson) as Record<string, unknown>;
-            p.contentType = "tool-result"; p.toolCallId = "call-a"; p.text = fullA;
-            return { ...r, postJson: JSON.stringify(p) };
-        }
-        if (r.postJson?.includes('"message 10"')) {
-            const p = JSON.parse(r.postJson) as Record<string, unknown>;
-            p.role = "tool"; p.contentType = "tool-result"; p.toolCallId = "call-b"; p.text = fullB;
-            return { ...r, postJson: JSON.stringify(p) };
-        }
-        return r;
-    });
-    withStore({ ...view, rows: rows as SnapView["rows"] });
-    const resend = [
-        msg("m1", "message 1"),
-        { ...msg("m9", trimA), contentType: "tool-result", toolCallId: "call-a" } as unknown as BiliMessage,
-        { ...msg("m10", trimB), contentType: "tool-result", toolCallId: "call-b" } as unknown as BiliMessage,
-        msg("m11", "message 11"),
-        msg("m12", "message 12", "assistant"),
-    ];
-    const legacy: BiliMessage[] = [
-        { ...msg(summaryMessageId("blk-c1"), `${SUMMARY_HEADER}\nfolded 1-8`), role: "system" },
-        { ...msg("host-9", trimA), contentType: "tool-result", toolCallId: "call-a" } as unknown as BiliMessage,
-        { ...msg("host-10", trimB, "tool"), contentType: "tool-result", toolCallId: "call-b" } as unknown as BiliMessage,
-        msg("host-11", "message 11"),
-        msg("host-12", "message 12", "assistant"),
-    ];
-    const out = applySnapEgress(resend, state, legacy, { ...deps(), sessionId: "t22" });
-    assert.notEqual(out, legacy, "adjacent trimmed pair cuts over (toolCallId seam arm)");
-    assert.equal(out[1]?.text, trimA);
-    assert.equal(out[2]?.text, trimB);
-    assert.equal(snapEgressStatusWire().cutover, 1);
-});
-
-// T23 (review G6): an emptied client body is NOT adopted as a trim.
-test("T23 empty client text is not adoption-eligible", () => {
-    const { view, state } = planeFor("t23");
-    const resend = [
-        msg("m1", "message 1"),
-        { ...msg("m9", ""), contentType: "tool-result", toolCallId: "call-a" } as unknown as BiliMessage,
-        msg("m10", "message 10", "assistant"),
-        msg("m11", "message 11"),
-        msg("m12", "message 12", "assistant"),
-    ];
-    const legacy: BiliMessage[] = [
-        { ...msg(summaryMessageId("blk-c1"), `${SUMMARY_HEADER}\nfolded 1-8`), role: "system" },
-        { ...msg("host-9", "message 9", "user"), contentType: "tool-result", toolCallId: "call-a" } as unknown as BiliMessage,
-        msg("host-10", "message 10", "assistant"),
-        msg("host-11", "message 11"),
-        msg("host-12", "message 12", "assistant"),
-    ];
-    withStore(view);
-    const kept = applySnapEgress(resend, state, legacy, { ...deps(), sessionId: "t23" });
-    assert.equal(kept, legacy, "empty body is not a trim — tripwire judges the divergence");
-});
-
-// T24 (P2-final): the in-request snapshot write — the lane flushes the store
-// BEFORE the egress stage, so the plane already holds THIS round's messages
-// and the seam walk for this round's own resend has an empty tail.
-test("T24 in-request flush: plane readable pre-egress, tail=0 for this round's resend", async () => {
-    const dir = tmpDir("bili-5874-p2-t24-");
-    // The suite-wide baseline preload pins BILI_STORAGE_UNIFIED=legacy for the
-    // legacy-corpus; this test asserts on the unified store's plane, so it
-    // pins its own mode (the preload's documented contract for mode-dependent
-    // suites) — unconditionally, because the baseline already set "legacy".
-    const prevMode = process.env.BILI_STORAGE_UNIFIED;
-    process.env.BILI_STORAGE_UNIFIED = "full";
-    const store = new SessionStore({ enabled: true, dir, debounceMs: 1000 });
-    _setStoreForTest(store);
-    try {
-        const session = createSession("t24-sid", { protocol: "openai" });
-        const resend = [
-            msg("u1", "first user message"),
-            msg("a1", "first reply", "assistant"),
-            msg("u2", "second user message"),
-        ];
-        // The lane's exact sequence: snapshotMessages → in-request flush.
-        snapshotMessages(session, resend);
-        const verdict = await SessionStore.flushOrSkip(session);
-        assert.equal(verdict.ok, true, "the in-request flush landed");
-        // The plane already holds the in-flight turn — pre-egress.
-        const view = store.snapEgressView("t24-sid");
-        assert.ok(view, "plane view present after the in-request flush");
-        const texts = view!.rows.map((r) => {
-            try { return (JSON.parse(r.postJson ?? "") as { text?: string }).text ?? null; } catch { return null; }
-        });
-        assert.deepEqual(texts, ["first user message", "first reply", "second user message"]);
-        // The seam walk for THIS round's resend sees a full prefix: no tail.
-        const state = session.state as CompressionState;
-        const built = buildSnapEgressView(view!, resend, state);
-        assert.ok(built.ok, built.ok ? "" : `view must assemble, got ${(built as { reason: string }).reason}`);
-        assert.equal(built.tailCount, 0, "this round's resend is fully on the plane — no tail");
-        assert.equal(built.msgs.length, 3, "the full transcript, no anchor (no folds yet)");
-        // Idempotent: re-flushing the same epoch persists nothing new.
-        const verdict2 = await SessionStore.flushOrSkip(session);
-        assert.equal(verdict2.ok, true);
-        assert.equal(store.snapEgressView("t24-sid")?.rows.length, 3);
-        // A mutation after the flush bumps the epoch — the lane's re-arm
-        // condition (!ok || epoch changed) is then true.
-        markDirty(session);
-        const verdict3 = await SessionStore.flushOrSkip(session);
-        assert.equal(verdict3.ok, true);
-        assert.notEqual(session.revisionEpoch, verdict.epoch, "epoch moved after the mutation");
-    } finally {
-        if (prevMode === undefined) delete process.env.BILI_STORAGE_UNIFIED;
-        else process.env.BILI_STORAGE_UNIFIED = prevMode;
-        _setStoreForTest(null as unknown as SessionStore);
-        await store.closeQuietly();
-    }
+    assert.ok(!out.some((m) => m.id === "sentinel"));
 });

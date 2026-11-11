@@ -454,11 +454,11 @@ export class UnifiedShadow {
      *  message log authoritatively, so the ingest uses the raw tail whenever
      *  available; both digest legs go through the same override, so parity
      *  accounting stays honest. */
-    record(record: unknown, rawTail?: { lastMessages: CoreMessage[]; lastMessagesFolded?: boolean }, liveCcr?: MessageContentStore): void {
+    record(record: unknown, rawTail?: { lastMessages: CoreMessage[]; lastMessagesFolded?: boolean }, liveCcr?: MessageContentStore, livePlane?: CoreMessage[]): void {
         // #3931 step 3: network backend — the ingest runs on the serial
         // queue (fire-and-forget; failures are logged once per distinct message — never disabled).
         if (this.sync === null) {
-            this.enqueueAsyncRecord(record, rawTail, liveCcr);
+            this.enqueueAsyncRecord(record, rawTail, liveCcr, livePlane);
             return;
         }
         // #5627: which stage is running — the failure forensics must name
@@ -488,6 +488,12 @@ export class UnifiedShadow {
             // stay empty for every plain compressed session. Both digest legs
             // flow through the same override.
             if (liveCcr) legacy = { ...legacy, contentStore: liveCcr };
+            // #5874 mapEgress: the live kernel turn view (tagged processTurn
+            // output) rides the save the same way — the envelope record never
+            // serializes it, so without this override the plane would never
+            // see the tagged forms and every save would fall back to the
+            // legacy CAS bytes.
+            if (livePlane && livePlane.length > 0) legacy = { ...legacy, lastPlaneMessages: livePlane };
             // #3133 watermark: pay the full O(log) ingest only when the
             // trusted-prefix probe cannot vouch for the stored prefix —
             // steady-state saves stringify+hash+INSERT just the NEW tail.
@@ -1192,7 +1198,7 @@ export class UnifiedShadow {
      *  above (orphan guard + #3841 reap journal, #3133 watermark delta,
      *  full ingest, #3133 sampled verify + drift latch). Serialized by the
      *  shadow queue; failures feed the same per-message warn — nothing disables (#2432-era breaker removed 2026-10-30). */
-    private enqueueAsyncRecord(record: unknown, rawTail?: { lastMessages: CoreMessage[]; lastMessagesFolded?: boolean }, liveCcr?: MessageContentStore): void {
+    private enqueueAsyncRecord(record: unknown, rawTail?: { lastMessages: CoreMessage[]; lastMessagesFolded?: boolean }, liveCcr?: MessageContentStore, livePlane?: CoreMessage[]): void {
         void this.enqueue(async () => {
             // #5627: same failing-stage forensics as the sync record() above.
             let phase = "legacy-load";
@@ -1209,7 +1215,7 @@ export class UnifiedShadow {
                     legacy = { ...legacy, lastMessages: rawTail.lastMessages, lastMessagesFolded: rawTail.lastMessagesFolded === true };
                 }
                 if (liveCcr) legacy = { ...legacy, contentStore: liveCcr };
-                // #3818/#3841: same orphan-guard + reap-journal semantics.
+                if (livePlane && livePlane.length > 0) legacy = { ...legacy, lastPlaneMessages: livePlane };
                 // #4216/#4242: orphan shape rides the plan journal — normal
                 // ingest (the async twin of the sync fix); no freeze.
                 // #3133 watermark delta.

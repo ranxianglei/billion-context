@@ -59,6 +59,13 @@ export interface LegacySessionLike {
     blockContents: Map<string, { one: BlockView | null; full: BlockView }>;
     lastMessages?: CoreMessage[];
     lastMessagesFolded?: boolean;
+    /** #5874 mapEgress direct authority: the RAW tagged processTurn output for
+     *  this turn (deep-copied by the lane before the in-request flush). The
+     *  snapshot plane persists THESE bytes (the kernel's own tagged output,
+     *  not the pre-rewrite transcript) so the egress stage reads the rows and
+     *  runs only the light transform. Carried into IngestSessionInput as
+     *  planeMessages. */
+    lastPlaneMessages?: CoreMessage[];
     pluginSnapshot?: CoreMessage[];
     /** #3301: external-converter import payload — original message
      *  decompositions interned BEFORE the snapshot/tail so their rows get the
@@ -125,6 +132,7 @@ export function toLegacyLike(s: {
     blockContents: LegacySessionLike["blockContents"];
     lastMessages?: LegacySessionLike["lastMessages"];
     lastMessagesFolded?: boolean;
+    lastPlaneMessages?: LegacySessionLike["lastPlaneMessages"];
     pluginSnapshot?: LegacySessionLike["pluginSnapshot"];
     decompositionLog?: LegacySessionLike["decompositionLog"];
     contentStore?: LegacySessionLike["contentStore"];
@@ -140,6 +148,7 @@ export function toLegacyLike(s: {
         blockContents: s.blockContents,
         lastMessages: s.lastMessages,
         lastMessagesFolded: s.lastMessagesFolded,
+        lastPlaneMessages: s.lastPlaneMessages,
         pluginSnapshot: s.pluginSnapshot,
         decompositionLog: s.decompositionLog,
         contentStore: s.contentStore,
@@ -505,7 +514,7 @@ function finishPlan(
         ccrJson: session.contentStore ? JSON.stringify(session.contentStore) : null,
     };
 
-    return { session: sessionRow, messages, blocks, deadRefs, refs, ccrEntries, pluginSnapshotSeqs, tailSeqs };
+    return { session: sessionRow, messages, blocks, deadRefs, refs, ccrEntries, pluginSnapshotSeqs, tailSeqs, planeMessages: session.lastPlaneMessages ?? null };
 }
 
 /** Rebuilds the legacy load view from unified rows alone. */

@@ -157,6 +157,21 @@ function snapAggregate(rows: {
     return sha256Hex(parts.join("\u0000"));
 }
 
+/** #5874 mapEgress anchor-row position domain: a PLANE pos is either a
+ *  ledger position (>= 0 — the messages-table seq space, the compact /
+ *  delete / coverage domain) or a negative ANCHOR position (the stored
+ *  render of an active block's summary). Anchor rows carry no ledger
+ *  position — the egress re-inserts each render at its pair-safe coverage
+ *  index — so they are parked in the negative space, which can never
+ *  collide with a ledger seq (seqs are >= 0) and never enters a compact
+ *  range (compacts stay >= 0). Bounds are generous (a session's block
+ *  count, not its message count, allocates anchor positions). */
+const ANCHOR_POS_MIN = -100000;
+
+function isAnchorPosDomain(pos: number, coreIds: string[] | undefined): boolean {
+    return pos >= ANCHOR_POS_MIN && pos < 0 && coreIds !== undefined && coreIds.some((id) => id.startsWith("acp_summary_"));
+}
+
 /** Validate event payloads (invariant v + addressing sanity). Throws on
  *  any violation — inside the commit transaction that rolls the whole
  *  commit back (T2: no half-state), and at the derivation hook where the
@@ -169,7 +184,7 @@ function validateEvents(sid: string, events: SnapEvent[]): void {
         switch (e.ev) {
             case "cast":
             case "append": {
-                if (!Number.isInteger(e.pos) || e.pos < 0) {
+                if (!Number.isInteger(e.pos) || (e.pos < 0 && !isAnchorPosDomain(e.pos, e.coreIds))) {
                     throw new Error(`[snaplane] sid=${sid} ${e.ev}: bad pos ${e.pos}`);
                 }
                 if (seen.has(e.pos)) throw new Error(`[snaplane] sid=${sid} ${e.ev}: duplicate pos ${e.pos}`);
@@ -185,7 +200,9 @@ function validateEvents(sid: string, events: SnapEvent[]): void {
                 break;
             }
             case "update": {
-                if (!Number.isInteger(e.pos) || e.pos < 0) {
+                // update carries no coreIds of its own when omitted — a
+                // negative pos here addresses the existing anchor row.
+                if (!Number.isInteger(e.pos) || (e.pos < 0 && !isAnchorPosDomain(e.pos, e.coreIds ?? []))) {
                     throw new Error(`[snaplane] sid=${sid} update: bad pos ${e.pos}`);
                 }
                 if (seen.has(e.pos)) throw new Error(`[snaplane] sid=${sid} update: duplicate pos ${e.pos}`);
@@ -194,7 +211,9 @@ function validateEvents(sid: string, events: SnapEvent[]): void {
                 break;
             }
             case "delete": {
-                if (!Number.isInteger(e.pos) || e.pos < 0) {
+                // delete is position-only (no coreIds): a negative pos may
+                // retire an anchor row (block consumed / render superseded).
+                if (!Number.isInteger(e.pos) || e.pos < ANCHOR_POS_MIN) {
                     throw new Error(`[snaplane] sid=${sid} delete: bad pos ${e.pos}`);
                 }
                 break;
