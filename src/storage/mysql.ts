@@ -36,10 +36,10 @@
  */
 
 import type { Pool, PoolConnection, PoolOptions } from "mysql2/promise";
-import { mkdirSync, writeFileSync, appendFileSync, readFileSync, existsSync } from "node:fs";
+import { mkdirSync, appendFileSync, readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { log as loggerLog } from "../logger.js";
-import { sha256Hex, viewPointerSeqs } from "./store.js";
+import { sha256Hex, viewPointerSeqs, rewriteArchiveLog } from "./store.js";
 import { identityOfStoredContent } from "./identity.js";
 import type { MessageContentStore } from "acp-kernel";
 import type { StorageBackend, StorageReadView } from "./backend.js";
@@ -1961,7 +1961,7 @@ export class MysqlBackend implements StorageBackend {
             }
             kept.push(l);
         }
-        writeFileSync(exportPath, kept.length > 0 ? kept.join("\n") + "\n" : "");
+        rewriteArchiveLog(exportPath, kept.length > 0 ? kept.join("\n") + "\n" : "");
         loggerLog("info", `[#3931] restored archived session ${sessionId} from ${exportPath} (line removed from the archive log)`);
         return { ok: true };
     }
