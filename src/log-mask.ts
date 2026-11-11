@@ -179,7 +179,10 @@ function publishHomeRoots(): string[] {
 
 export function maskPathsForPublish(text: string): string {
     if (!text) return text;
-    const roots = publishHomeRoots();
+    const roots = [...new Set(publishHomeRoots().flatMap((root) => [
+        root,
+        JSON.stringify(root).slice(1, -1),
+    ]))].sort((a, b) => b.length - a.length);
     if (roots.length === 0) return text;
     const re = new RegExp("(?<![/\\w.\\-])(" + roots.map(escapeRegExp).join("|") + ")(?=[/\\\\\"'\\s]|$)", "g");
     return text.replace(re, "~");
