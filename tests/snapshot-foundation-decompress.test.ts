@@ -28,6 +28,18 @@ const BLOCK_ID = "blk-t8";
 // mode. This one needs the unified sqlite substrate — the row ledger IS the fixture here.
 process.env.BILI_STORAGE_UNIFIED = "full";
 
+// Windows can still hold an ephemeral handle on index.db/-wal right after a
+// store closes (Defender scan, delayed close): retry the rm, then give up
+// quietly (the dir lives under the OS temp root).
+function rmrf(p: string): void {
+    try {
+        rmSync(p, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    } catch {
+        /* Windows stray handle */
+    }
+}
+
+
 const NO_LOG = (_msg: string): void => {};
 
 function makeSession(id: string): Session {
@@ -96,7 +108,7 @@ function ctxFor(session: Session): Parameters<typeof resolveDecompress>[1] {
 
 test("T8a: green lane — a block that left state is restored from the row ledger", async (t) => {
     const dir = mkdtempSync(join(tmpdir(), "t8a-"));
-    t.after(() => { _resetStoreForTest(); rmSync(dir, { recursive: true, force: true }); });
+    t.after(() => { _resetStoreForTest(); store.closeQuietly(); rmrf(dir); });
     const store = new SessionStore({ dir, enabled: true });
     _setStoreForTest(store);
     const session = makeSession("t8a");
@@ -112,7 +124,7 @@ test("T8a: green lane — a block that left state is restored from the row ledge
 
 test("T8b: lifecycle GC — the explicit audit exit, never a silent empty body", async (t) => {
     const dir = mkdtempSync(join(tmpdir(), "t8b-"));
-    t.after(() => { _resetStoreForTest(); rmSync(dir, { recursive: true, force: true }); });
+    t.after(() => { _resetStoreForTest(); store.closeQuietly(); rmrf(dir); });
     const store = new SessionStore({ dir, enabled: true });
     _setStoreForTest(store);
     const session = makeSession("t8b");
@@ -133,7 +145,7 @@ test("T8b: lifecycle GC — the explicit audit exit, never a silent empty body",
 
 test("T8c: no snapshot substrate — the legacy receipts apply unchanged", async (t) => {
     const dir = mkdtempSync(join(tmpdir(), "t8c-"));
-    t.after(() => { _resetStoreForTest(); rmSync(dir, { recursive: true, force: true }); });
+    t.after(() => { _resetStoreForTest(); store.closeQuietly(); rmrf(dir); });
     const store = new SessionStore({ dir, enabled: false }); // sidecar closed
     _setStoreForTest(store);
     const session = makeSession("t8c");

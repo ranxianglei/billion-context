@@ -371,7 +371,7 @@ test("#4666 mysql: v8 upgrade collapses duplicates, crash-safe stamp gate, retir
             // Fresh install lands at v11.
             be = await openBackend("mysql", H.dsn);
             await be.init?.();
-            assert.equal(await H.stamp(), "11", "fresh install stamped v11");
+            assert.equal(await H.stamp(), "12", "fresh install stamped v12 (snapshot foundation, #5874)");
 
             // Downgrade to the legacy v7 shape and plant the dirty fixture.
             await H.rewindToV7();
@@ -381,7 +381,7 @@ test("#4666 mysql: v8 upgrade collapses duplicates, crash-safe stamp gate, retir
             await be.close();
             be = await openBackend("mysql", H.dsn);
             await be.init?.();
-            assert.equal(await H.stamp(), "11", "upgrade stamped v11");
+            assert.equal(await H.stamp(), "12", "upgrade stamped v12");
 
             const survivors = await H.q("SELECT seq, msg_id, content_hash, identity FROM messages WHERE session_id = 's1' ORDER BY seq");
             assert.deepEqual(
@@ -430,7 +430,7 @@ test("#4666 mysql: v8 upgrade collapses duplicates, crash-safe stamp gate, retir
             await be.close();
             be = await openBackend("mysql", H.dsn);
             await be.init?.();
-            assert.equal(await H.stamp(), "11", "re-run completed and stamped v11");
+            assert.equal(await H.stamp(), "12", "re-run completed and stamped v12");
             const eRows = await H.q("SELECT seq, identity FROM messages WHERE session_id = 's2' ORDER BY seq");
             assert.deepEqual(eRows.map((r) => Number(r.seq)), [5, 13], "unbackfilled dup pair collapsed; the CAS-missing row survives (not a duplicate)");
             assert.notEqual(String(eRows[0].identity), "", "identity backfilled on the re-run");
@@ -537,7 +537,7 @@ test("#4666 mysql: concurrent boots serialize on the migration lock",
             assert.equal(Number(released[0].ok), 1, "lock released exactly once");
             locker.release();
             await migrating;
-            assert.equal(await H.stamp(), "11", "migration completed after the lock freed");
+            assert.equal(await H.stamp(), "12", "migration completed after the lock freed");
             const s1 = await H.q("SELECT seq FROM messages WHERE session_id = 's1' ORDER BY seq");
             assert.deepEqual(s1.map((r) => Number(r.seq)), [1, 2, 3, 5], "fixture collapsed exactly once — no double-delete");
             const sLock = await H.q("SELECT seq, identity FROM messages WHERE session_id = 's_lock' ORDER BY seq");
