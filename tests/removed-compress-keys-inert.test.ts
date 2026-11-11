@@ -32,7 +32,7 @@ function withConfigFile(body: string, fn: () => void): void {
 
 // Warnings for the removed-key family only (other INERT emitters exist too).
 const familyWarns = (captured: Captured[]) =>
-    captured.filter((e) => e.level === "warn" && e.msg.includes("is INERT") && /absorb|imageCompression/.test(e.msg));
+    captured.filter((e) => e.level === "warn" && e.msg.includes("is INERT") && /absorb|imageCompression|compressAtFoldPoint/.test(e.msg));
 
 // `absorb` was removed by #3293 but REVIVED by #3402/#3422 — it parses again
 // and is NOT inert; only imageCompression (#3266) stays in the removed family.
@@ -68,6 +68,31 @@ test("#3344: removed key at provider and model levels is named by full path; pro
             assert.equal(warns.length, 1, `expected exactly one family INERT warning, got: ${warns.map((w) => w.msg).join(" | ")}`);
             assert.doesNotMatch(warns[0]!.msg, /compress\.absorb/);
             assert.match(warns[0]!.msg, /providers\["https:\/\/u\.example"\]\.models\["gpt-x"\]\.compress\.imageCompression/);
+        },
+    );
+    stop();
+});
+
+test("#6132: removed fold-point keys warn INERT once at every level (top-level, root, provider, model) and are ignored", () => {
+    const { captured, stop } = captureLogs();
+    withConfigFile(
+        `{"compressAtFoldPoint":true,"compress":{"compressAtFoldPoint":true,"compressAtFoldPointClearThinking":true},"providers":{"https://u.example":{"compress":{"compressAtFoldPoint":true},"models":{"gpt-x":{"compress":{"compressAtFoldPointClearThinking":true}}}}}}`,
+        () => {
+            const cfg = loadConfigFile();
+            const cs = parseCompressSettings(cfg.compress ?? {});
+            assert.equal((cs as Record<string, unknown>).compressAtFoldPoint, undefined);
+            assert.equal((cs as Record<string, unknown>).compressAtFoldPointClearThinking, undefined);
+            const warns = familyWarns(captured);
+            assert.equal(warns.length, 1, `expected exactly one family INERT warning, got: ${warns.map((w) => w.msg).join(" | ")}`);
+            const msg = warns[0]!.msg;
+            assert.match(msg, /top-level compressAtFoldPoint/);
+            assert.match(msg, /compress\.compressAtFoldPoint/);
+            assert.match(msg, /compress\.compressAtFoldPointClearThinking/);
+            assert.match(msg, /providers\[\"https:\/\/u\.example\"\]\.models\[\"gpt-x\"\]\.compress\.compressAtFoldPointClearThinking/);
+            assert.match(msg, /#6132/);
+            // Second load of the SAME content: deduped (one notice per process).
+            loadConfigFile();
+            assert.equal(familyWarns(captured).length, 1);
         },
     );
     stop();
