@@ -28,6 +28,7 @@ import type { BiliMessage } from "acp-kernel/wire";
 import { loadConfigFile } from "../config.js";
 import { getStore } from "../persist.js";
 import { isSnapPlaneDead, type SnapView } from "../storage/snap.js";
+import { selectOutbound, isFullResend, type DeltaState, type DeltaSelection, type EgressElement } from "../snapshot/delta.js";
 
 export type SnapEgressProtocol = "openai" | "anthropic" | "google" | "responses";
 
@@ -44,6 +45,16 @@ interface SnapEgressDeps {
     /** #4311: which tool names are compress calls (kernel config
      *  isCompressTool). Gates the visible-compress-call anchor skip. */
     isCompressTool?: (name: string) => boolean;
+    /** 2×2 Part B (出站增量): the persisted delta state. Present only for
+     *  lanes whose target protocol has provider-side retention (Responses
+     *  chaining); undefined = snapshot outbound (send the whole active view,
+     *  the existing #5901 behavior). See src/snapshot/delta.ts. */
+    deltaState?: DeltaState | null;
+    /** Called once per successful plane egress with the selection outcome so
+     *  the lane can persist the new frontier (only after the outbound
+     *  succeeds — a failed round keeps the old state and re-sends the same
+     *  delta: at-least-once). */
+    onSelection?: (sel: DeltaSelection) => void;
 }
 
 // ---------------------------------------------------------------------------
@@ -186,6 +197,22 @@ interface AnchorSeed {
     insertAt: number;
     unresolved: boolean;
     msg: BiliMessage;
+    /** The stored anchor row's (negative) plane pos — 0 when synthesized.
+     *  Carried to the side channel so the incremental-outbound selector can
+     *  track which anchors were already sent. */
+    pos: number;
+}
+
+/** Per-element bookkeeping for the assembled egress view (parallel to
+ *  `msgs`). The snapshot outbound ignores it; the incremental outbound
+ *  (2×2 Part B, src/snapshot/delta.ts) uses it to pick the unsent suffix. */
+interface EgressElementSide {
+    /** The plane row pos (append-only). Anchors carry their negative pos. */
+    pos: number;
+    /** true for rendered summary anchors. */
+    isAnchor: boolean;
+    /** The anchor summary id (isAnchor only). */
+    anchorId?: string;
 }
 
 /** Assemble the outbound view from the S4-verified plane (kernel prune/
@@ -194,7 +221,7 @@ export function buildSnapEgressView(
     view: SnapView,
     state: CompressionState,
     isCompressTool: (name: string) => boolean,
-): { ok: true; msgs: BiliMessage[]; n: number } | { ok: false; reason: string } {
+): { ok: true; msgs: BiliMessage[]; n: number; side: EgressElementSide[] } | { ok: false; reason: string } {
     if (!view.rows.length) return { ok: false, reason: "no-plane" };
 
     // Parse EVERY row (active and covered): the covered rows stay in the walk
@@ -223,10 +250,10 @@ export function buildSnapEgressView(
     // whose core_ids carried a covered base id — the #4052 fresh-repeat
     // message vanished from egress while the kernel served it).
     const nonAnchor = rows.filter((r) => !r.isAnchor && r.active === 1);
-    const anchorMsgById = new Map<string, BiliMessage>();
+    const anchorMsgById = new Map<string, { msg: BiliMessage; pos: number }>();
     for (const r of rows) {
         if (!r.isAnchor) continue;
-        for (const id of r.ids) if (id.startsWith("acp_summary_")) anchorMsgById.set(id, r.msg);
+        for (const id of r.ids) if (id.startsWith("acp_summary_")) anchorMsgById.set(id, { msg: r.msg, pos: r.pos });
     }
 
     const n = nonAnchor.length;
@@ -237,7 +264,12 @@ export function buildSnapEgressView(
     const coveredIds = new Set<string>();
     for (const b of state.blocks) if (b.active) for (const id of b.effectiveMessageIds) coveredIds.add(id);
     if (coveredIds.size === 0) {
-        return { ok: true, msgs: nonAnchor.map((r) => r.msg), n };
+        return {
+            ok: true,
+            msgs: nonAnchor.map((r) => r.msg),
+            n,
+            side: nonAnchor.map((r) => ({ pos: r.pos, isAnchor: false })),
+        };
     }
     // #4311: a compress tool-call visible in the input suppresses its block's
     // separate summary render.
@@ -325,9 +357,11 @@ export function buildSnapEgressView(
         if (b.compressCallId !== undefined && visibleCompressCallIds.has(b.compressCallId)) continue;
         const sid = summaryMessageId(b.blockId);
         const existing = summaryIndexById.get(sid);
-        const msg = anchorMsgById.get(sid) ?? renderAnchor(b);
+        const stored = anchorMsgById.get(sid);
+        const msg = stored?.msg ?? renderAnchor(b);
+        const anchorPos = stored?.pos ?? 0;
         if (existing !== undefined) {
-            anchors.push({ insertAt: existing, unresolved: false, msg });
+            anchors.push({ insertAt: existing, unresolved: false, msg, pos: anchorPos });
             continue;
         }
         const anchorIds = b.directMessageIds && b.directMessageIds.length > 0 ? b.directMessageIds : b.effectiveMessageIds;
@@ -349,7 +383,7 @@ export function buildSnapEgressView(
             insertAt = earliest ?? fallbackIndex;
             unresolved = earliest === null;
         }
-        anchors.push({ insertAt, unresolved, msg });
+        anchors.push({ insertAt, unresolved, msg, pos: anchorPos });
     }
     // Pair-safe adjustment + pin/fallback clamp (kernel rebuildMessages
     // parity: non-head-anchors clamp past the pin when resolved, to the first
@@ -364,11 +398,20 @@ export function buildSnapEgressView(
     // The walk (kernel rebuildMessages parity): anchors at their index, the
     // pinned run verbatim, covered / positional / stale-summary skips.
     const merged: BiliMessage[] = [];
+    const side: EgressElementSide[] = [];
+    const pushAnchor = (a: AnchorSeed) => {
+        merged.push(a.msg);
+        side.push({ pos: a.pos, isAnchor: true, anchorId: a.msg.id });
+    };
+    const pushRow = (r: EgressRow) => {
+        merged.push(r.msg);
+        side.push({ pos: r.pos, isAnchor: false });
+    };
     let ai = 0;
     for (let i = 0; i < n; i++) {
-        while (ai < anchors.length && anchors[ai]!.insertAt === i) merged.push(anchors[ai++]!.msg);
+        while (ai < anchors.length && anchors[ai]!.insertAt === i) pushAnchor(anchors[ai++]!);
         if (i === firstUserIndex && firstUserIndex >= 0) {
-            for (let k = i; k < firstUserPinEnd && k < n; k++) merged.push(nonAnchor[k]!.msg);
+            for (let k = i; k < firstUserPinEnd && k < n; k++) pushRow(nonAnchor[k]!);
             i = firstUserPinEnd - 1;
             continue;
         }
@@ -377,10 +420,10 @@ export function buildSnapEgressView(
         // nonAnchor is the active set already — covered rows never reach
         // the walk (see the filter above).
         if (isRenderedSummaryMessage(m) && knownSummaryIds.has(m.id)) continue;
-        merged.push(m);
+        pushRow(r);
     }
-    while (ai < anchors.length) merged.push(anchors[ai++]!.msg);
-    return { ok: true, msgs: merged, n: merged.length };
+    while (ai < anchors.length) pushAnchor(anchors[ai++]!);
+    return { ok: true, msgs: merged, n: merged.length, side };
 }
 
 // Entry point — called by each protocol lane right after the lane computed
@@ -419,7 +462,25 @@ export function applySnapEgress(
             noteDegrade(built.reason);
             return legacyProcessed;
         }
-        const planeProcessed = deps.transform(built.msgs);
+        // 2×2 Part B: incremental outbound. Both modes read the SAME plane
+        // view — the difference is only how many elements go over the wire.
+        let outMsgs = built.msgs;
+        let selection: DeltaSelection | null = null;
+        if (deps.deltaState !== undefined) {
+            const elements: EgressElement[] = built.msgs.map((m, i) => ({
+                msg: m,
+                pos: built.side[i]!.pos,
+                isAnchor: built.side[i]!.isAnchor,
+                anchorId: built.side[i]!.anchorId,
+            }));
+            selection = selectOutbound(elements, deps.deltaState);
+            if (!selection.reseed && !isFullResend(selection, elements)) {
+                const keep = new Set(selection.delta.map((e) => e.msg));
+                outMsgs = built.msgs.filter((m) => keep.has(m));
+            }
+            deps.onSelection?.(selection);
+        }
+        const planeProcessed = deps.transform(outMsgs);
         // DIRECT AUTHORITY: the plane view is the outbound source. The legacy
         // bytes exist only as the crash-grade fallback above.
         egressStats.plane++;

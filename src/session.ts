@@ -694,6 +694,12 @@ export type Session = {
      *  only the light transform (absorb/attach/strip/drop) — no seam walk,
      *  no re-tagging, no id re-keying. Cleared per turn like lastMessages. */
     lastPlaneMessages?: CoreMessage[];
+    /** 2×2 Part B (出站增量, responses lane only): the incremental-outbound
+     *  frontier — the highest plane row pos + anchor summary ids the provider
+     *  already has via its retained chain. Persisted with the session; lost
+     *  state → next round reseeds (full send), one-round convergence. See
+     *  src/snapshot/delta.ts. */
+    responsesDelta?: { frontierPos: number; servedAnchors: string[] } | null;
     pluginSnapshot?: CoreMessage[];
     /** #3301: original message decompositions supplied by an external state
      *  converter (e.g. opencode-acp migration) at import time. Transient

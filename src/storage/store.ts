@@ -25,16 +25,19 @@ import { migrateSchema, storagePragmas, WAL_JOURNAL_SIZE_LIMIT } from "./schema.
 import { identityOfStoredContent, splitMediaContent } from "./identity.js";
 import {
     applySnapInTransaction,
+    clearSnapPlaneDead,
     isSnapPlaneDead,
     markSnapPlaneDead,
     readSnapView,
     snapGcCoveredRows,
     snapL1Record,
     snapplaneStatusWire,
+    snapRowsAll,
     SnapPlaneDeadError,
     type SnapEvent,
     type SnapView,
 } from "./snap.js";
+import { FoundationRejectError, stage0Decide, type Stage0Result } from "../snapshot/plane.js";
 import { recordIntegrityOutcome, recordSecondProcessOwner, recordBackupOutcome } from "./runtime-status.js";
 import { integrityModeFor, writeIntegrityCache, scheduleBackgroundIntegrityCheck, backgroundIntegrityInflightForTests, noteIntegrityCheckRun } from "./integrity-check.js";
 import { sqliteCorruptionDetail } from "./sqlite-errors.js";
@@ -2409,6 +2412,81 @@ export class UnifiedStore {
             }
             throw err;
         }
+    }
+
+    // #5874 2×2 stage 0 (brief 19544722): the element world match lives at the
+    // head of the chain, BEFORE protocol conversion. These accessors are the
+    // storage side of that stage — the pure decision (snapshot/plane.ts) and
+    // the kernel-input assembly (snapshot/assemble.ts) are lane-side.
+
+    private snapSessRawOf(sid: string): string {
+        // Raw host session id (P9: never truncated) → the l1_world key; the
+        // conversation binding when the host supplied one, the sid otherwise.
+        // (Same resolution as the save path below — stage 0 and the plane
+        // commit must address the SAME l1 row.)
+        return (
+            (this.db.prepare("SELECT conversation_id FROM conversations WHERE session_id = ?").get(sid) as { conversation_id: string } | undefined)
+                ?.conversation_id ?? sid
+        );
+    }
+
+    /** Stage 0 for one turn: ensure the l1 row exists (idempotent session-
+     *  level v1 record), run the element world match on the stored envelope,
+     *  and persist the new canon (every verdict except `diverge` — that one
+     *  has zero side effects by construction). A session-level identity
+     *  conflict ("red") throws — the lane maps it to the R3 hard 400 BEFORE
+     *  any kernel side effect.
+     */
+    snapStage0(sid: string, incoming: string[], opts?: { resync?: boolean, seqs?: number[] | null }): Stage0Result {
+        const sessRaw = this.snapSessRawOf(sid);
+        const now = Date.now();
+        const l1 = snapL1Record(this.db, sessRaw, sid, this.snapWitnessProbe(sid), now);
+        if (l1 === "red") {
+            // Session-level identity conflict (R3): the raw host id maps to a
+            // DIFFERENT ledger. Hard-reject BEFORE any kernel side effect —
+            // snapL1Record wrote nothing on this path.
+            throw new FoundationRejectError(`l1 ledger conflict: sess_raw=${sessRaw} maps to another ledger (R3)`);
+        }
+        return stage0Decide({ db: this.db, sessRaw, ledgerId: sid, incoming, seqs: opts?.seqs ?? null, resync: opts?.resync, now });
+    }
+
+    /** The plane's ACTIVE rows, pos-ordered — the "old cores from the table"
+     *  half of the kernel-input assembly. post_json is the tagged kernel
+     *  byte (invariant v) in its STORED (media-offloaded) form; the caller
+     *  hydrates before feeding the kernel. `coverMax` maps each active
+     *  block id to the HIGHEST row pos it covers (over the FULL row set —
+     *  the covered rows themselves) — the kernel-input anchor placement
+     *  input (an anchor renders before the first surviving element above
+     *  its covered run). */
+    snapStage0Cores(sid: string): { rows: { pos: number; ids: string[]; postJson: string }[]; coverMax: Record<string, number> } {
+        const all = snapRowsAll(this.db, sid);
+        const coverMax: Record<string, number> = {};
+        for (const r of all) {
+            if (r.coverRef !== null && r.pos > (coverMax[r.coverRef] ?? -1)) {
+                coverMax[r.coverRef] = r.pos;
+            }
+        }
+        const rows = all
+            .filter((r) => r.active === 1 && r.postJson !== null)
+            .map((r) => ({ pos: r.pos, ids: r.coreIds, postJson: this.hydrateMedia(r.postJson as string) }));
+        return { rows, coverMax };
+    }
+
+    /** The stage-0 resync (brief red gate R4 / the resync ruling): reset the
+     *  session's plane (rows + log + ckpt + the l1 element envelope + the
+     *  sticky R1 latch) in one txn. This turn then runs the legacy full path
+     *  and re-seeds the plane through the normal in-request flush; the NEXT
+     *  turn re-issues the envelope from the client's current array (one-round
+     *  convergence). */
+    snapStage0Reset(sid: string): void {
+        const sessRaw = this.snapSessRawOf(sid);
+        this.db.transaction(() => {
+            this.db.prepare("DELETE FROM snap_rows WHERE sid = ?").run(sid);
+            this.db.prepare("DELETE FROM snap_log WHERE sid = ?").run(sid);
+            this.db.prepare("DELETE FROM snap_ckpt WHERE sid = ?").run(sid);
+            this.db.prepare("UPDATE l1_world SET envelope_json = NULL, envelope_checksum = NULL WHERE sess_raw = ?").run(sessRaw);
+        });
+        clearSnapPlaneDead(sid);
     }
 
     /** #3250: cadence-tick WAL reclamation (see WAL_CHECKPOINT_EVERY_INGESTS).

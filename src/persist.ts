@@ -2442,6 +2442,31 @@ export class SessionStore {
         }
     }
 
+    // #5874 2×2 stage 0 (brief 19544722): errors PROPAGATE (the lane maps the
+    // R3 reject to a hard 400 and any other fault to the legacy full path) —
+    // the egress-view swallow above must not be copied here.
+
+    /** Stage 0 (element world match) for one turn. null when the unified
+     *  store is unavailable — the lane keeps the legacy path. */
+    snapStage0(sessionId: string, incoming: string[], opts?: { resync?: boolean, seqs?: number[] | null }): import("./snapshot/plane.js").Stage0Result | null {
+        if (!this.replicasAvailable()) return null;
+        return this.liveShadow().snapStage0(sessionId, incoming, opts);
+    }
+
+    /** The plane's ACTIVE cores, pos-ordered (the "old cores from the
+     *  table" half of the kernel-input assembly). */
+    snapStage0Cores(sessionId: string): { rows: { pos: number; ids: string[]; postJson: string }[]; coverMax: Record<string, number> } | null {
+        if (!this.replicasAvailable()) return null;
+        return this.liveShadow().snapStage0Cores(sessionId);
+    }
+
+    /** The stage-0 resync (R4 / table behind): reset the session plane so
+     *  the next turn re-issues from the client's current array. */
+    snapStage0Reset(sessionId: string): void {
+        if (!this.replicasAvailable()) return;
+        this.liveShadow().snapStage0Reset(sessionId);
+    }
+
     /** #3928: physical index.db shrink after deletions (`bili sessions rm`).
      *  Throws on failure — the deletion itself is already committed, callers
      *  report the shrink as partial. Throws in legacy-only lanes — check

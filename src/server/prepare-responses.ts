@@ -17,6 +17,7 @@ import { dropWhitespaceResponsesMessages, normalizeResponsesMessageItems, saniti
 import { METADATA_LAST_RESPONSES_MODE, noteCanonicalSystemFingerprint, reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "../fold-reconcile.js";
 import { buildAnchoredView, maybeSnapshotView, noteAnchoredRender, SnapshotAnchorFallbackError, wsAnchoredPayload } from "./snapshot-render.js";
 import { applySnapEgress } from "./snap-egress.js";
+import type { DeltaState } from "../snapshot/delta.js";
 import { storedMessagesFor, storedRowLookupFor } from "../fold-decomposition-lookup.js";
 import { nudgeSuppressed, pluginLaneDegraded } from "../session-self-heal.js";
 import { compressBreakerArmed } from "../stream.js";
@@ -112,6 +113,10 @@ export async function prepareResponses(
     let toolsOut = parsed.tools;
     let transformOk = false;
     let responsesDevContent: string | undefined;
+    // 2×2 Part B: true when this round's outbound is a PLANE DELTA (the
+    // provider's retained chain carries the rest) — gates the developer
+    // message re-injection and the previous_response_id strip below.
+    let deltaServed = false;
     let sysNotes: string[] = [];
     // #3713: billed tokens of the #1638-masked mid-history sys/dev items — they
     // ride the rebuilt input verbatim yet enter neither projection.msgs nor
@@ -447,15 +452,46 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         const ordered = repairResponsesAssistantOrdering(applyReasoningDrop(stripKernelSummaries(turn.messages, turn.state), reasoningPlan, log, sessionId), originalMessages);
         processedMessages = ordered.messages;
         separatorSlots = ordered.slots;
-        // #5874 P2 (mapEgress): tripwire-guarded plane egress — the lane's
-        // exact chain (strip → drop → repair) reapplied to the plane view.
+        // #5874 P2 (mapEgress) direct-authority plane egress. 2×2 Part B
+        // (出站增量): the Responses protocol is the only cohort with
+        // provider-side retention (previous_response_id chaining), so this is
+        // the only lane with an incremental outbound mode. Delta mode requires
+        // the client to chain (previous_response_id present) AND the owner to
+        // opt in via the EXISTING keepResponseId knob (PR config-surface
+        // section: no new field — the knob's documented "diagnostic only"
+        // status is what this upgrades to: keep + delta input).
+        // state===null = no persisted frontier (first round / resync / lost
+        // state) → reseed (full send, frontier reset).
+        const chains = knobKeepResponseId() && typeof parsed.previous_response_id === "string" && parsed.previous_response_id.length > 0;
+        const deltaState: DeltaState | null | undefined = chains ? (session.responsesDelta ?? null) : undefined;
+        let selectionFired = false;
+        // #5874 P2 (mapEgress): the plane view is the outbound source;
+        // the lane's exact chain (strip → drop → repair) is reapplied to it.
         processedMessages = applySnapEgress(turn.state, processedMessages, {
             sessionId,
             protocol: "responses",
             log,
             isCompressTool: loopConfig.isCompressTool,
             transform: (m) => repairResponsesAssistantOrdering(applyReasoningDrop(stripKernelSummaries(attachSubagentSessions(applyAbsorbView(m, session.state, loopConfig, tokenCount), session), turn.state), reasoningPlan, log, sessionId), originalMessages).messages,
+            ...(deltaState !== undefined ? {
+                deltaState,
+                onSelection: (sel) => {
+                    selectionFired = true;
+                    session.responsesDelta = sel.nextState;
+                    deltaServed = !sel.reseed && sel.delta.length > 0;
+                },
+            } : {}),
         });
+        if (deltaState !== undefined && !selectionFired) {
+            // Delta was requested but the plane degraded to legacy this round
+            // (the legacy bytes are the FULL replay and the id was stripped
+            // below) — the provider's chain no longer matches the stored
+            // frontier. Forget it: the next chained round re-seeds.
+            session.responsesDelta = null;
+        }
+        if (deltaServed) {
+            log("info", `[${sessionId}] [snaplane] outbound=delta frontier=${(session.responsesDelta as { frontierPos: number })?.frontierPos} — input carries only the unsent suffix; the retained chain carries the rest (re-injected developer message / forged summaries skipped to avoid duplicating what the provider keeps)`);
+        }
         // #3477: consume the announced native-compaction boundary (pi session_compact
         // → /__bili/plugin/compact → markCompactionBoundary) exactly once, after the
         // post-compaction history was processed: archives the deactivated blocks,
@@ -497,7 +533,9 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
             const devContent = devParts.join("\n\n---\n\n");
             responsesDevContent = devContent;
             if (forgedSummaries.length > 0) log("debug", `[${sessionId}] [inject] ${forgedSummaries.length} captured summary block(s) re-injected into developer message`);
-            rebuiltInput = injectResponsesDeveloperMessage(rebuiltInput, devContent, projection.headRole ?? "developer");
+            // 2×2 Part B: on a delta round the provider KEEPS the seed round's
+            // developer message — re-injecting would duplicate it.
+            if (!deltaServed) rebuiltInput = injectResponsesDeveloperMessage(rebuiltInput, devContent, projection.headRole ?? "developer");
             if (!knobNoInjectTool() && injectTools) {
                 // #1712: decompress's startId/endId execute only on CCR-armed
                 // sessions (#1179) — serve the no-range schema otherwise.
@@ -511,7 +549,7 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
             const devContent = [...projection.systemParts, ...forgedSummaries, ...(tagsOnlyPrompt !== "" ? [tagsOnlyPrompt] : []), ...(genBoundaryActive && !isCompactionTrigger ? [GENERATION_BOUNDARY_NOTE] : [])].join("\n\n---\n\n");
             responsesDevContent = devContent;
             if (forgedSummaries.length > 0) log("debug", `[${sessionId}] [inject] ${forgedSummaries.length} captured summary block(s) re-injected into developer message`);
-            rebuiltInput = injectResponsesDeveloperMessage(rebuiltInput, devContent, projection.headRole ?? "developer");
+            if (!deltaServed) rebuiltInput = injectResponsesDeveloperMessage(rebuiltInput, devContent, projection.headRole ?? "developer");
         }
         if (sysNotes.length > 0) {
             const inputItems: ResponseInputItem[] = typeof rebuiltInput === "string"
@@ -692,7 +730,10 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
     // #1954: stripping is only lossless when input already holds the full
     // conversation. Warn when we strip a non-empty id so a native-chaining
     // (delta) continuation that loses its history is visible, not silent 200s.
-    if (!knobKeepResponseId()) {
+    // 2×2 Part B: a plane DELTA round KEEPS the id (the input is the unsent
+    // suffix — chaining is the whole point); a reseed round STRIPS it (the
+    // full input would otherwise duplicate the retained chain).
+    if (!knobKeepResponseId() || !deltaServed) {
         const chainWarn = strippedResponseIdWarning(rebuilt.previous_response_id);
         if (chainWarn) log("warn", `[${sessionId}] ${chainWarn}`);
         delete rebuilt.previous_response_id;

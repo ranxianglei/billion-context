@@ -114,6 +114,12 @@ export function isSnapPlaneDead(sid: string): boolean {
 export function markSnapPlaneDead(sid: string): void {
     deadSids.add(sid);
 }
+/** 2×2 stage-0 resync: clear ONE sid's sticky dead latch (the plane is
+ *  being re-baselined from the client's current array — a stale R1 verdict
+ *  about the OLD rows must not shadow the new plane). */
+export function clearSnapPlaneDead(sid: string): void {
+    deadSids.delete(sid);
+}
 /** Test-only: clear sticky flags between hermetic fixtures. */
 export function _resetSnapPlaneDeadForTests(): void {
     deadSids.clear();
@@ -168,8 +174,13 @@ function snapAggregate(rows: {
  *  count, not its message count, allocates anchor positions). */
 const ANCHOR_POS_MIN = -100000;
 
+/** #5874 2×2: the stored anchor-row id prefix (acp_summary_<blockId>). The
+ *  write side, the D view and the 2×2 stage-0 assembly all key on it —
+ *  one constant, one source of truth. */
+export const ANCHOR_ID_PREFIX = "acp_summary_";
+
 function isAnchorPosDomain(pos: number, coreIds: string[] | undefined): boolean {
-    return pos >= ANCHOR_POS_MIN && pos < 0 && coreIds !== undefined && coreIds.some((id) => id.startsWith("acp_summary_"));
+    return pos >= ANCHOR_POS_MIN && pos < 0 && coreIds !== undefined && coreIds.some((id) => id.startsWith(ANCHOR_ID_PREFIX));
 }
 
 /** Validate event payloads (invariant v + addressing sanity). Throws on
@@ -245,7 +256,10 @@ function requireCoreShape(sid: string, ev: string, pos: number, json: string): v
     }
 }
 
-interface DbLike {
+/** The minimal db surface the plane functions need (exported so the stage-0
+ *  decision module (src/snapshot/plane.ts) can be type-coupled to it without
+ *  importing a driver). */
+export interface DbLike {
     exec(sql: string, ...params: unknown[]): unknown;
     prepare(sql: string): {
         run(...params: unknown[]): unknown;
@@ -675,6 +689,77 @@ export function snapGcCoveredRows(db: DbLike, sid: string): number {
         }
         return removed;
     });
+}
+
+// ---------------------------------------------------------------------------
+// 2×2 (proposal §4.0, brief 19544722) — the element-level WORLD ENVELOPE.
+//
+// The session-level v1 path above (snapL1Record/snapL1Lookup) stays the
+// identity ANCHOR (sess_raw → ledger_id + one-round arming). The 2×2 stage 0
+// adds, on the same row, the per-element msgid envelope: an ordered
+// [{id, pos}] canon binding every host msgid to its append-only ledger pos
+// (ruling G — the table is self-contained). The stage-0 decision function
+// (src/snapshot/identity.ts matchWorld) runs on this envelope; the plane rows
+// (snap_rows) keep the #5901 message-level model (pos = ledger seq).
+// ---------------------------------------------------------------------------
+
+interface L1Envelope {
+    /** The canon envelope JSON: an array of {id, pos} in host order.
+     *  Null when the session is still on the session-level v1 path (the
+     *  2×2 element world has not been issued for it yet). */
+    envelopeJson: string | null;
+    /** sha256 of the canonical envelope (fast mismatch before the walk). */
+    envelopeChecksum: string | null;
+}
+
+/** Read the element-level envelope for a raw session id (null when the l1
+ *  row is absent; envelopeJson null when present but not yet 2×2-issued). */
+export function snapL1EnvelopeRead(db: DbLike, sessRaw: string): L1Envelope | null {
+    const r = db
+        .prepare("SELECT envelope_json, envelope_checksum FROM l1_world WHERE sess_raw = ?")
+        .get(sessRaw) as { envelope_json: string | null; envelope_checksum: string | null } | undefined;
+    if (!r) return null;
+    return { envelopeJson: r.envelope_json, envelopeChecksum: r.envelope_checksum };
+}
+
+/** Persist the element-level envelope for a raw session id (UPDATE only —
+ *  the l1 row itself is created by snapL1Record; a missing row is a
+ *  programming error and is surfaced, not silently created). */
+export function snapL1EnvelopeUpsert(db: DbLike, sessRaw: string, envelopeJson: string, envelopeChecksum: string): void {
+    const res = db
+        .prepare("UPDATE l1_world SET envelope_json = ?, envelope_checksum = ? WHERE sess_raw = ?")
+        .run(envelopeJson, envelopeChecksum, sessRaw) as { changes: number };
+    if (res.changes === 0) throw new Error(`snapL1EnvelopeUpsert: no l1_world row for sess_raw ${sessRaw.slice(0, 12)}… (record it first)`);
+}
+
+// ---------------------------------------------------------------------------
+// 2×2 read side — the FULL row set (active AND inactive), for the stage-0
+// hydrate: S4 drift checks, explainedGone (fold-covered ids may legally
+// vanish from the head) and the coverage evidence all need the deactivated
+// rows, which snapRowsView/readSnapView filter out of the egress path.
+// ---------------------------------------------------------------------------
+
+interface SnapRowAll {
+    pos: number;
+    coreIds: string[];
+    postJson: string | null;
+    active: 0 | 1;
+    coverRef: string | null;
+}
+
+/** Every snap_rows entry for a sid, pos-ordered (active + inactive). Unlike
+ *  readSnapView this does NOT verify S4 and does NOT latch R1 — it is a raw
+ *  evidence read for the stage-0 decision; the verification path (readSnapView)
+ *  is unchanged and remains the only S4 authority. */
+export function snapRowsAll(db: DbLike, sid: string): SnapRowAll[] {
+    const rows = readRawRows(db, sid);
+    return rows.map((r) => ({
+        pos: r.pos,
+        coreIds: JSON.parse(r.core_ids) as string[],
+        postJson: r.post_json,
+        active: (r.active ? 1 : 0) as 0 | 1,
+        coverRef: r.cover_ref,
+    }));
 }
 
 // ---------------------------------------------------------------------------
