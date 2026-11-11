@@ -2388,7 +2388,8 @@ async function handleRequest(
         // three-level merge; default 0.25, aligned with billion-context-pi).
         // Resolved once here so the side-request guard below AND the main-path
         // reservation measure against the SAME capped window.
-        const headroomCap = resolveOutputHeadroomCap(resolveCompress(opts.routes, providerDestUrl, (parsed as { model?: string }).model, opts.compress).outputHeadroomMaxPct);
+        const resolvedHeadroomCompress = resolveCompress(opts.routes, providerDestUrl, (parsed as { model?: string }).model, opts.compress);
+        const headroomCap = resolveOutputHeadroomCap(resolvedHeadroomCompress.outputHeadroomMaxPct);
         // #1729: dsh native compaction guard — a compaction summarize call
         // (replayed prefix + COMPACTION_INSTRUCTION as the final user message)
         // is refused BEFORE any pipeline work: not forwarded, kernel state
@@ -2701,7 +2702,7 @@ async function handleRequest(
         // headroom; reserving bili's default share on top double-counts it and
         // walls the session below codex's own auto-compact point. An explicit
         // operator outputHeadroomMaxPct and a proven completion share still apply.
-        const operatorHeadroomCap = resolveCompress(opts.routes, providerDestUrl, (parsed as { model?: string }).model, opts.compress).outputHeadroomMaxPct !== undefined;
+        const operatorHeadroomCap = resolvedHeadroomCompress.outputHeadroomMaxPct !== undefined;
         const skipForCodexWindow = codexWindowNetsOutput && !operatorHeadroomCap;
         const reserveByProtocol = shouldReserveOutputHeadroom(protocol, headroomOrigin, requestModel) && !skipForCodexWindow;
         if (skipForCodexWindow && provenReserve === 0) {
