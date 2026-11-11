@@ -1,4 +1,5 @@
 import { MESSAGES } from "./i18n.js";
+import { makeMdRender } from "./mdrender.js";
 
 // #3572 (client half): the server accepts JSONC config files (comments +
 // trailing commas) since the parseBiliConfig fix, but the web editor still
@@ -141,6 +142,18 @@ export const WEB_CLIENT = `(function () {
     const parseConfigDraft = ${parseConfigDraft.toString()};
     const adminRelayActiveInDraft = ${adminRelayActiveInDraft.toString()};
     const blogCacheStale = ${blogCacheStale.toString()};
+    // Markdown + syntax-highlight core — the same single implementation the
+    // server uses (web/mdrender.ts), inlined like the JSONC helpers above.
+    // The factory is fully self-contained, so its (minified) source runs
+    // verbatim inside this IIFE.
+    // Dev/transpile note: tsx's esbuild keepNames pass rewrites every NESTED
+    // function inside the factory to call a __name(fn, "name") helper
+    // (name preservation), which only exists at module scope of the dev
+    // bundle. The production tsup/minify output never emits those calls, but
+    // tests run this template through tsx — this one-line shim keeps the
+    // dev-transpiled inlining runnable. It is a no-op in production.
+    var __name = function (fn) { return fn; };
+    const mdApi = (${makeMdRender.toString()})();
     const MESSAGES=${JSON.stringify(MESSAGES)};
     let locale = "zh-CN";
     try {
@@ -2418,12 +2431,16 @@ function changelogCatOf(rawLine) {
     // marker, so the handoff renderer would otherwise fold the answer that
     // follows into the collapsed thinking box. Mirrored in HANDOFF_THINK_END.
     const HANDOFF_THINK_END = "<!-- /reasoning -->";
-    function splitHandoffBody(bodyLines) {
+    function splitHandoffBody(bodyLines, role) {
         const segs = [];
         let thinkClosed = false;
+        // Tool-role blocks carry whole tool messages; multi-line payloads
+        // (results, multi-line call arguments) must stay attached to the tool
+        // segment so the card renders one highlighted input/output block.
+        const inToolBlock = role === "tool";
         for (let i = 0; i < bodyLines.length; i++) {
             const raw = bodyLines[i];
-            if (raw.trim() === "" && !(segs.length && segs[segs.length - 1].type === "out")) continue;
+            if (raw.trim() === "" && !(segs.length && (segs[segs.length - 1].type === "out" || (inToolBlock && segs[segs.length - 1].type === "tool")))) continue;
             const activeThink = segs[segs.length - 1];
             if (raw.trim() === HANDOFF_THINK_END && activeThink && activeThink.type === "think" && !thinkClosed) {
                 if (bodyLines[i + 1] === raw) { activeThink.lines.push(raw); i++; }
@@ -2440,7 +2457,7 @@ function changelogCatOf(rawLine) {
                 continue;
             }
             const last = segs[segs.length - 1];
-            if (last && (last.type === "out" || (last.type === "think" && !thinkClosed))) last.lines.push(raw);
+            if (last && (last.type === "out" || (inToolBlock && last.type === "tool") || (last.type === "think" && !thinkClosed))) last.lines.push(raw);
             else segs.push({ type: "out", lines: [raw] });
         }
         return segs;
@@ -2505,7 +2522,53 @@ function changelogCatOf(rawLine) {
         fP(); fL(); fQ(); fPr();
         return html.join("");
     }
+    // eWork-grade handoff rendering (2026-11-11): role cards instead of bare
+    // divider lines, Markdown bodies from the shared mdrender core, hand-
+    // highlighted code, and structured tool input/output with language
+    // detection and per-block copy. The old version escaped everything to
+    // plain text — raw backticks, no tables, no highlighting anywhere.
+    const handoffCopyBlobs = [];
+    const HC_ROLE_ICON = { user: "\ud83d\udc64", assistant: "\ud83e\udd16", tool: "\ud83d\udee0" };
+    function hcDetectLang(payload) {
+        const t2 = payload.trim();
+        if (!t2) return "text";
+        const first = t2.charAt(0);
+        const lastCh = t2.charAt(t2.length - 1);
+        if (first === "{" || first === "[") {
+            try { JSON.parse(t2); return "json"; } catch (e) { /* truncated / pretty-printed */ }
+            if (lastCh === "}" || lastCh === "]") return "json";
+        }
+        const ls = t2.split("\\n");
+        let nonempty = 0, mark = 0;
+        for (const l of ls) {
+            const c = l.trim();
+            if (!c) continue;
+            nonempty++;
+            if (c.charAt(0) === "+" || c.charAt(0) === "-" || c.charAt(0) === "@") mark++;
+        }
+        if (nonempty >= 3 && mark / nonempty > 0.5) return "diff";
+        return "text";
+    }
+    function renderHcTool(s) {
+        const payload = s.lines.join("\\n");
+        const lang = hcDetectLang(payload);
+        let shown = payload;
+        if (s.kind === "call" && lang === "json") { try { shown = JSON.stringify(JSON.parse(payload), null, 2); } catch (e) {} }
+        handoffCopyBlobs.push(payload);
+        const idx = handoffCopyBlobs.length - 1;
+        const isRes = s.kind === "res";
+        const open = payload.split("\\n").length <= 20;
+        return '<details class="hc-tool"' + (open ? " open" : "") + '><summary class="hc-tool-sum">'
+            + '<span class="tool-chip ' + toolChipCls(s.name) + '">' + escapeHtml(s.name) + "</span>"
+            + '<span class="tool-cid">' + escapeHtml(s.cid) + "</span>"
+            + (isRes ? '<span class="hc-res">\u2192</span>' : "")
+            + '</summary><div class="hc-tool-body">'
+            + '<div class="hc-io-head"><span class="hc-io-label">' + (isRes ? t("det.io_out") : t("det.io_in")) + (lang !== "text" ? " \u00b7 " + lang : "") + '</span><button type="button" class="hc-copy btn sm" data-hc="' + idx + '">' + t("common.copy") + "</button></div>"
+            + '<pre class="hc-io"><code' + (lang !== "text" ? ' class="hl"' : "") + ">" + mdApi.highlight(shown, lang) + "</code></pre>"
+            + "</div></details>";
+    }
     function renderHandoffMd(md) {
+        handoffCopyBlobs.length = 0; // re-render replaces every .hc-copy button — drop the previous session's payloads
         const lines = md.split("\\n");
         let start = 0;
         for (let i = 0; i < lines.length; i++) if (lines[i].indexOf("## ") === 0 && lines[i].indexOf("Conversation") > -1) { start = i + 1; break; }
@@ -2523,24 +2586,39 @@ function changelogCatOf(rawLine) {
         }
         const html = [];
         if (!blocks.length) return '<span class="dim small">' + escapeHtml(String(md).slice(0, 200)) + "</span>";
+        // Document meta (title, session id, token stats…) sits before the
+        // Conversation heading — the old client skipped it; render it as a
+        // compact key/value box so the handoff keeps its header context.
+        const meta = [];
+        for (let i = 0; i < start - 1; i++) {
+            const l = lines[i];
+            if (l.trim() === "") continue;
+            if (l.indexOf("# ") === 0) meta.push('<div class="hdoc-title">' + escapeHtml(l.slice(2).trim()) + "</div>");
+            else if (l.indexOf("- ") === 0) {
+                const item = l.slice(2);
+                const c = item.indexOf(": ");
+                if (c > -1) meta.push('<div class="hdoc-meta-row"><span class="hdoc-meta-k">' + escapeHtml(item.slice(0, c)) + '</span><span class="hdoc-meta-v">' + escapeHtml(item.slice(c + 2)) + "</span></div>");
+                else meta.push('<div class="hdoc-meta-row"><span class="hdoc-meta-v">' + escapeHtml(item) + "</span></div>");
+            } else meta.push('<div class="hdoc-meta-row"><span class="hdoc-meta-v">' + escapeHtml(l) + "</span></div>");
+        }
+        if (meta.length) html.push('<div class="hdoc-meta">' + meta.join("") + "</div>");
+        if (start > 0 && lines[start - 1] && lines[start - 1].indexOf("## ") === 0) html.push('<div class="hdoc-sub">' + escapeHtml(lines[start - 1].slice(3).trim()) + "</div>");
         for (const b of blocks) {
             const role = b.role === "user" || b.role === "assistant" || b.role === "tool" ? b.role : "assistant";
-            html.push('<h3 class="msg-role ' + role + '">' + role + "</h3>");
-            const segs = splitHandoffBody(b.lines);
-            if (!segs.length) { html.push('<div class="dim small">_(empty)_</div>'); continue; }
+            const segs = splitHandoffBody(b.lines, role);
+            const body = [];
+            if (!segs.length) body.push('<div class="dim small">_(empty)_</div>');
             for (const s of segs) {
                 if (s.type === "think") {
                     const n = s.lines.filter((x) => x.trim() !== "").length;
-                    html.push('<details class="msg-think"><summary>' + t("det.thinking") + " \u00b7 " + n + '</summary><div class="think-box">' + s.lines.map(escapeHtml).join("<br/>") + "</div></details>");
+                    body.push('<details class="hc-think"><summary>\ud83d\udcad ' + t("det.thinking") + " \u00b7 " + n + '</summary><div class="hc-think-body">' + mdApi.render(s.lines.join("\\n")) + "</div></details>");
                 } else if (s.type === "out") {
-                    html.push('<p class="msg-out">' + s.lines.map(escapeHtml).join("<br/>") + "</p>");
+                    body.push('<div class="hc-out">' + mdApi.render(s.lines.join("\\n")) + "</div>");
                 } else {
-                    const txt = s.lines.join("\\n");
-                    let shown = txt;
-                    if (s.kind === "call") { try { shown = JSON.stringify(JSON.parse(txt), null, 2); } catch (e) {} }
-                    html.push('<div class="' + (s.kind === "call" ? "msg-tool" : "msg-result") + '"><span class="tool-chip ' + toolChipCls(s.name) + '">' + escapeHtml(s.name) + '</span><span class="tool-cid">' + escapeHtml(s.cid) + "</span>" + (s.kind === "res" ? '<span class="dim"> \u2192 </span>' : "") + '<pre class="' + (s.kind === "call" ? "tool-args" : "tool-out") + '">' + escapeHtml(shown) + "</pre></div>");
+                    body.push(renderHcTool(s));
                 }
             }
+            html.push('<div class="hcard hc-' + role + '"><div class="hc-head"><span class="hc-badge hc-badge-' + role + '">' + (HC_ROLE_ICON[role] || "") + " " + role.charAt(0).toUpperCase() + role.slice(1) + '</span></div><div class="hc-body">' + body.join("") + "</div></div>");
         }
         return html.join("");
     }
@@ -3718,6 +3796,18 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         });
     }
     function bindHandoffActions(d) {
+        // Per-tool copy buttons (data-hc indexes handoffCopyBlobs, filled by
+        // renderHandoffMd at render time). Bound before the !handoffMd early
+        // return: the server-rendered fallback pane has no such buttons, so
+        // this is a harmless no-op there.
+        const hcPane = document.querySelector('#session-detail-view .det-pane[data-pane="handoff"]');
+        if (hcPane) hcPane.querySelectorAll(".hc-copy").forEach((btn) => {
+            btn.addEventListener("click", (ev) => {
+                ev.stopPropagation();
+                const i = Number(btn.getAttribute("data-hc") || 0);
+                copyText(handoffCopyBlobs[i] || "", btn);
+            });
+        });
         const copyBtn = $("handoff-copy-md");
         const dlBtn = $("handoff-dl");
         if (!d.handoffMd) {
