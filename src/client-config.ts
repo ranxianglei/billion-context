@@ -60,6 +60,11 @@ export interface CodexConfig {
     model?: string;
     /** Top-level `model_context_window` override (if set). */
     contextWindow?: number;
+    /** Top-level `model_catalog_json` — file holding codex's live model
+     *  table (the catalog install writes ONLY this; models_cache.json may be
+     *  absent). Absolute paths stay as-is, relative resolve against
+     *  $CODEX_HOME (#5243). */
+    modelCatalogJson?: string;
     /** Top-level `model_auto_compact_token_limit` override (if set). */
     autoCompactLimit?: number;
     /** Top-level `model_max_output_tokens` override (if set) (#971). */
@@ -723,6 +728,7 @@ export function parseCodexToml(text: string): CodexConfig {
                 if (key === "model_provider") result.modelProvider = val;
                 else if (key === "openai_base_url") result.openaiBaseUrl = val;
                 else if (key === "model") codexModel = val;
+                else if (key === "model_catalog_json") result.modelCatalogJson = val;
             } else if (curProvider && key === "base_url") {
                 result.providers[curProvider].baseUrl = val;
             }
@@ -813,6 +819,7 @@ export function parseCodexCliOverrides(args: readonly string[]): CodexConfig {
     let provider: string | undefined;
     let openaiBaseUrl: string | undefined;
     let contextWindow: number | undefined;
+    let modelCatalogJson: string | undefined;
     let autoCompactLimit: number | undefined;
     let maxOutput: number | undefined;
     const asNumber = (raw: string): number | undefined => {
@@ -829,6 +836,7 @@ export function parseCodexCliOverrides(args: readonly string[]): CodexConfig {
         else if (key === "model_provider") provider = val;
         else if (key === "openai_base_url") openaiBaseUrl = val;
         else if (key === "model_context_window") contextWindow = asNumber(val);
+        else if (key === "model_catalog_json") modelCatalogJson = val.length > 0 ? val : undefined;
         else if (key === "model_auto_compact_token_limit") autoCompactLimit = asNumber(val);
         else if (key === "model_max_output_tokens") maxOutput = asNumber(val);
         else {
@@ -857,6 +865,7 @@ export function parseCodexCliOverrides(args: readonly string[]): CodexConfig {
     if (provider !== undefined) out.modelProvider = provider;
     if (openaiBaseUrl !== undefined) out.openaiBaseUrl = openaiBaseUrl;
     if (contextWindow !== undefined) out.contextWindow = contextWindow;
+    if (modelCatalogJson !== undefined) out.modelCatalogJson = modelCatalogJson;
     if (autoCompactLimit !== undefined) out.autoCompactLimit = autoCompactLimit;
     if (maxOutput !== undefined) out.maxOutput = maxOutput;
     return out;
@@ -874,12 +883,14 @@ export function mergeCodexViews(base: CodexConfig, overlay: CodexConfig): CodexC
     }
     const model = overlay.model ?? base.model;
     const contextWindow = overlay.contextWindow ?? base.contextWindow;
+    const modelCatalogJson = overlay.modelCatalogJson ?? base.modelCatalogJson;
     const maxOutput = overlay.maxOutput ?? base.maxOutput;
     const out: CodexConfig = { providers };
     if (overlay.modelProvider !== undefined || base.modelProvider !== undefined) out.modelProvider = overlay.modelProvider ?? base.modelProvider;
     if (overlay.openaiBaseUrl !== undefined || base.openaiBaseUrl !== undefined) out.openaiBaseUrl = overlay.openaiBaseUrl ?? base.openaiBaseUrl;
     if (model !== undefined) out.model = model;
     if (contextWindow !== undefined) out.contextWindow = contextWindow;
+    if (modelCatalogJson !== undefined) out.modelCatalogJson = modelCatalogJson;
     if (overlay.autoCompactLimit !== undefined || base.autoCompactLimit !== undefined) out.autoCompactLimit = overlay.autoCompactLimit ?? base.autoCompactLimit;
     if (maxOutput !== undefined) out.maxOutput = maxOutput;
     const win = toModelWindow(model, contextWindow, maxOutput);
@@ -1548,10 +1559,12 @@ export function readOmpConfig(ompHome: string): OmpConfig {
 }
 
 /** Minimal line-based YAML reader for hermes config.yaml: collects provider
- *  entries from the v12 `providers:` dict (provider key -> `api:` url) and the
- *  legacy `custom_providers:` list (- name: ... / base_url: ...). Anything
- *  else in the file is ignored — only name -> endpoint URL pairs matter for
- *  launcher route discovery. */
+ *  entries from the v12 `providers:` dict (provider key -> `api:` url), the
+ *  legacy `custom_providers:` list (- name: ... / base_url: ...), and the stock
+ *  top-level `base_url`/`url`/`api` next to `provider:` (#6022 — the active
+ *  provider's endpoint when no providers entry covers it). Anything else in the
+ *  file is ignored — only name -> endpoint URL pairs matter for launcher route
+ *  discovery. */
 export function parseHermesYaml(text: string): HermesConfig {
     const result: HermesConfig = { providers: {} };
     const candidates = new Map<string, string>();
@@ -1561,6 +1574,22 @@ export function parseHermesYaml(text: string): HermesConfig {
     let entryIndent = -1;
     let current: string | null = null;
     let anonCount = 0;
+    // YAML scalars may be quoted; the launcher feeds endpoint values straight into
+    // new URL(), which rejects surrounding quotes (Invalid URL) and the entry
+    // would be silently skipped. Strip them where captured.
+    const unquote = (v: string): string => v.replace(/^["']|["']$/g, "");
+    // Top-level endpoint keys (#6022): first occurrence per key wins, resolved
+    // base_url > url > api like per-provider entries.
+    const topLevel: Partial<Record<"base_url" | "url" | "api", string>> = {};
+    let activeProvider = "";
+    const captureTopLevel = (line: string): void => {
+        if (!activeProvider) {
+            const pm = /^provider:\s*["']?([A-Za-z0-9_.-]+)/.exec(line);
+            if (pm) activeProvider = pm[1];
+        }
+        const um = /^(base_url|url|api):\s*(\S+)/.exec(line);
+        if (um && !(um[1] in topLevel)) topLevel[um[1] as "base_url" | "url" | "api"] = unquote(um[2]);
+    };
     for (const rawLine of text.split(/\r?\n/)) {
         const trimmed = rawLine.trim();
         if (!trimmed || trimmed.startsWith("#")) continue;
@@ -1576,9 +1605,12 @@ export function parseHermesYaml(text: string): HermesConfig {
                 sectionIndent = indent;
                 entryIndent = -1;
                 current = null;
+            } else if (indent === 0) {
+                captureTopLevel(trimmed);
             }
             continue;
         }
+
         if (indent <= sectionIndent) {
             // Left the section — re-evaluate this line for a new section start.
             mode = "none";
@@ -1591,6 +1623,8 @@ export function parseHermesYaml(text: string): HermesConfig {
             } else if (/^custom_providers:\s*(#.*)?$/.test(trimmed)) {
                 mode = "list";
                 sectionIndent = indent;
+            } else if (indent === 0) {
+                captureTopLevel(trimmed);
             }
             continue;
         }
@@ -1604,7 +1638,7 @@ export function parseHermesYaml(text: string): HermesConfig {
                 // hermes accepts base_url / url / api (priority order) — collect
                 // all and resolve after the scan.
                 const apiMatch = /^(base_url|url|api):\s*(\S+)/.exec(trimmed);
-                if (apiMatch) candidates.set(`${current}\u0000${apiMatch[1]}`, apiMatch[2]);
+                if (apiMatch) candidates.set(`${current}\u0000${apiMatch[1]}`, unquote(apiMatch[2]));
             }
         } else {
             // Legacy list: "- name: x" opens an entry; nested base_url/api/url lines.
@@ -1615,16 +1649,30 @@ export function parseHermesYaml(text: string): HermesConfig {
                 current = nameMatch ? nameMatch[1] : `custom-${++anonCount}`;
                 if (!result.providers[current]) result.providers[current] = {};
                 const inlineUrl = /^(?:base_url|api|url):\s*(\S+)/.exec(dashMatch[1]);
-                if (inlineUrl) result.providers[current].api = inlineUrl[1];
+                if (inlineUrl) result.providers[current].api = unquote(inlineUrl[1]);
             } else if (current) {
                 const urlMatch = /^(?:base_url|api|url):\s*(\S+)/.exec(trimmed);
-                if (urlMatch) result.providers[current].api = urlMatch[1];
+                if (urlMatch) result.providers[current].api = unquote(urlMatch[1]);
             }
         }
     }
     for (const name of Object.keys(result.providers)) {
         const pick = candidates.get(`${name}\u0000base_url`) ?? candidates.get(`${name}\u0000url`) ?? candidates.get(`${name}\u0000api`);
         if (pick !== undefined) result.providers[name].api = pick;
+    }
+    // Stock shape (#6022): a top-level base_url/url/api next to provider: is the
+    // active provider's endpoint when its own entry is absent. Both shapes may
+    // coexist in one file — keep both hosts routable rather than guessing which
+    // wins (a missing whitelist entry means blind-tunneled, uncompressed traffic).
+    const topLevelUrl = topLevel.base_url ?? topLevel.url ?? topLevel.api;
+    if (topLevelUrl !== undefined) {
+        const covered = Object.values(result.providers).some((p) => p.api === topLevelUrl);
+        if (!covered) {
+            const taken = new Set(Object.keys(result.providers));
+            let name = activeProvider && !taken.has(activeProvider) ? activeProvider : "top-level";
+            while (taken.has(name)) name += "-x";
+            result.providers[name] = { api: topLevelUrl };
+        }
     }
     return result;
 }
@@ -2091,7 +2139,7 @@ export function readAiderConfig(env: NodeJS.ProcessEnv = process.env, cwd: strin
  *  launched client's own declarations are authoritative (#436: launching
  *  `bili omp` with omp's models.yml declaring 131072 must not be overridden by
  *  another client's larger declaration for the same model id). */
-type ModelWindowScope = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh" | "codebuddy" | "qoder" | "trae" | "jcode" | "kimi" | "gemini" | "iflow" | "qwen" | "antigravity" | "mcode" | "aider" | "copilot" | "amp" | "goose" | "crush" | "zed";
+type ModelWindowScope = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh" | "codebuddy" | "qoder" | "trae" | "jcode" | "kimi" | "gemini" | "iflow" | "qwen" | "antigravity" | "mcode" | "aider" | "copilot" | "amp" | "goose" | "crush" | "zed" | "kiro";
 
 /** Collect per-model context windows from client configs the launcher can
  *  read (pi models.json, omp models.yml, opencode opencode.json, codex
