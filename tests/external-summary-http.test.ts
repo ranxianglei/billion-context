@@ -269,7 +269,12 @@ test("external summary HTTP: a stalled response is cancelled before the backup a
     }, async (url) => {
         const result = await new ExternalSummaryExecutor(1).execute(work, [createSummaryHttpCandidate(target(`${url}/primary`), 4096), createSummaryHttpCandidate(target(`${url}/backup`), 4096)], { ...budget, targetTimeoutMs: 150 });
         assert.equal(result.status, "success");
-        assert.deepEqual(result.attempts, [{ targetIndex: 0, outcome: "timeout" }, { targetIndex: 1, outcome: "success" }]);
+        if (result.status !== "success") throw new Error("unreachable");
+        assert.equal(result.attempts.length, 2);
+        assert.equal(result.attempts[0].outcome, "timeout");
+        // #4833: the stalled primary's timeout names its source and budget.
+        assert.match(result.attempts[0].detail ?? "", /^target-timeout 150ms \(elapsed \d+ms\)$/);
+        assert.equal(result.attempts[1].outcome, "success");
     });
     assert.deepEqual(paths, ["/primary", "/backup"]);
 });

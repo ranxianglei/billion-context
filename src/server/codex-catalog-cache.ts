@@ -90,6 +90,7 @@ export function createCodexCatalogFetch(
 ) {
     const memory = new Map<string, Entry>();
     const invalidated = new Set<string>();
+    const offSpec304Noted = new Set<string>();
     const clock = options.now ?? Date.now;
     const maxAge = options.maxAgeMs ?? 6 * 60 * 60 * 1000;
     const fresh = (entry: unknown): entry is Entry =>
@@ -213,6 +214,25 @@ export function createCodexCatalogFetch(
             if ([500, 502, 503, 504].includes(status)) return fresh(entry) ? cached(`temporary HTTP ${status}`, result) : result;
             if (status === 304) {
                 if (!entry) return result;
+                // A 304 only means "not modified" when THIS request was
+                // conditional — the wrapper itself never sends a validator,
+                // but the end client may have added if-none-match /
+                // if-modified-since and that negotiated 304 replays the
+                // cached 200 legitimately. An UNCONDITIONAL 304 is off-spec
+                // (some transparent middleboxes answer it anyway): treat it
+                // like any other unexpected status — drop the cache, pass
+                // the oddity through — instead of extending freshness on a
+                // phantom hit whose real headers we would also discard.
+                if (!headers.has("if-none-match") && !headers.has("if-modified-since")) {
+                    // A gateway looping on this off-spec answer would otherwise
+                    // stay invisible; one warn per credential makes it traceable.
+                    if (!offSpec304Noted.has(key)) {
+                        offSpec304Noted.add(key);
+                        log("warn", `[model-catalog] upstream answered 304 to an unconditional GET; dropping cached catalog and passing the response through; age=${Math.floor((clock() - entry.savedAt) / 1000)}s`);
+                    }
+                    await invalidate();
+                    return result;
+                }
                 await remember({ ...entry, savedAt: clock() });
                 discard(result);
                 return replay(entry, false);

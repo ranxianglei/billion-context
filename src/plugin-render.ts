@@ -84,6 +84,8 @@ export async function handlePluginRender(req: http.IncomingMessage, res: http.Se
         const m = parsed as BiliMessage & { ledgerSeq?: number };
         // store seqs are 0-based; ref display numbers are 1-based (#4346)
         m.ledgerSeq = row.seq + 1;
+        // #4313: hydrate the stored wall-clock stamp onto the message object.
+        if (typeof row.ts === "number") m.ts = row.ts;
         prefix.push(m);
         idToSeq.set(m.id, row.seq);
     }
@@ -106,11 +108,14 @@ export async function handlePluginRender(req: http.IncomingMessage, res: http.Se
         for (const s of blockSeqs) coveredSeqs.add(s);
         const maxCover = Math.max(...blockSeqs);
         const pos = viewRows.findIndex((r) => r.seq > maxCover);
-        if (pos === -1) continue; // the fold extends past the requested window
-        anchors.push({ pos, msg: { id: `acp_summary_${block.blockId}`, role: "system", contentType: "text", text: "" } as BiliMessage });
+        // #4732: pos === -1 means the fold reaches the END of the window — the
+        // covered rows are suppressed below, so the anchor MUST still land
+        // (at the tail) or the rendered prefix silently drops the whole fold
+        // with no summary in its place.
+        anchors.push({ pos: pos === -1 ? viewRows.length : pos, msg: { id: `acp_summary_${block.blockId}`, role: "system", contentType: "text", text: "" } as BiliMessage });
     }
     anchors.sort((a, b) => a.pos - b.pos);
-    const merged: BiliMessage[] = [];
+    let merged: BiliMessage[] = [];
     let ai = 0;
     for (let i = 0; i < viewRows.length; i++) {
         while (ai < anchors.length && anchors[ai].pos === i) {
@@ -118,6 +123,12 @@ export async function handlePluginRender(req: http.IncomingMessage, res: http.Se
             ai++;
         }
         if (!coveredSeqs.has(viewRows[i].seq)) merged.push(prefix[i]);
+    }
+    // #4732: tail anchors (fold covers the window's last rows) flush after
+    // the loop — they never satisfy anchors[ai].pos === i inside it.
+    while (ai < anchors.length) {
+        merged.push(anchors[ai].msg);
+        ai++;
     }
 
     const system = loadSystem(sessionId);
