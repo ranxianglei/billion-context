@@ -27,9 +27,9 @@ import {
     persistDismissedKey,
     unifiedReceiptsActive,
 } from "./notice-store.js";
-import { PCK_NOTICE_ID, WM_FASTPATH_INTRO_ID } from "./notice-store.js";
+import { IOT_INCOMPAT_NOTICE_ID, PCK_NOTICE_ID, WM_FASTPATH_INTRO_ID } from "./notice-store.js";
 
-export { PCK_NOTICE_ID, WM_FASTPATH_INTRO_ID };
+export { IOT_INCOMPAT_NOTICE_ID, PCK_NOTICE_ID, WM_FASTPATH_INTRO_ID };
 
 const DISMISS_FILE = "upgrade-notices.json";
 

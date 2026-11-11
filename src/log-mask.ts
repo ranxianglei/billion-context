@@ -354,7 +354,11 @@ export function redactSecretsInText(text: string): string {
     return text
         .replace(/\b(bearer|basic)\s+([A-Za-z0-9._~+\/=-]{8,})/gi, (_m, scheme: string, tok: string) => `${scheme} <masked ${tok.length} chars>`)
         .replace(/(?<![A-Za-z0-9])(?:sk|xai)-[A-Za-z0-9_-]{8,}/g, "<masked key>")
+        // Groq (gsk_…) and Hugging Face (hf_…) keys, both on PUBLIC_HOST_SUFFIXES.
+        .replace(/(?<![A-Za-z0-9])(?:gsk|hf)_[A-Za-z0-9]{20,}/g, "<masked key>")
         .replace(/(?<![A-Za-z0-9])AIza[A-Za-z0-9_-]{20,}/g, "<masked key>")
         .replace(/eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}/g, "<masked jwt>")
-        .replace(/(\b(?:api[_-]?key|access[_-]?token|auth(?:orization)?|secret|passwd|password|token)\b\s*[:=]\s*)(["']?)([A-Za-z0-9._~+\/=-]{8,})\2/gi, (_m, pre: string, q: string, val: string) => `${pre}${q}<masked ${val.length} chars>${q}`);
+        // The optional quote after the name covers JSON/dict keys ("api_key": "…"), the shape
+        // upstream error bodies and config dumps use; without it only key=value / key: value matched.
+        .replace(/(\b(?:api[_-]?key|access[_-]?token|auth(?:orization)?|secret|passwd|password|token)\b["']?\s*[:=]\s*)(["']?)([A-Za-z0-9._~+\/=-]{8,})\2/gi, (_m, pre: string, q: string, val: string) => `${pre}${q}<masked ${val.length} chars>${q}`);
 }
