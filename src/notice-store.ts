@@ -24,8 +24,13 @@ export const PCK_NOTICE_ID = "pck-default-off";
 // #5403 watermark fastpath experimental-grey intro (owner ruling 2026-11-02):
 // own id so dismissal stays independent of pck's.
 export const WM_FASTPATH_INTRO_ID = "wm-fastpath-intro";
+// Owner report 2026-11-09: dsh's iot-thinking plugin fires one extra
+// compress/rewrite request after every model reply, occupying the SAME
+// session's proxy lane serially — the step keeps waiting seconds to tens of
+// seconds after its first byte. Own id so its dismissal is independent.
+export const IOT_INCOMPAT_NOTICE_ID = "iot-incompat";
 
-const UPGRADE_NOTICE_IDS: ReadonlySet<string> = new Set([PCK_NOTICE_ID, WM_FASTPATH_INTRO_ID]);
+const UPGRADE_NOTICE_IDS: ReadonlySet<string> = new Set([PCK_NOTICE_ID, WM_FASTPATH_INTRO_ID, IOT_INCOMPAT_NOTICE_ID]);
 // #5548 P2: local announcements dismiss as `<id>@<content-hash16>` so edited
 // content re-nags exactly once; the hash shape is the only dynamic form the
 // store accepts (raw local ids never enter it — those use instance/always).

@@ -32,6 +32,39 @@ export function resolveAnnouncementsUrl(configured: string | undefined): string 
 }
 
 
+/** Stream-read `body` and UTF-8-decode it, rejecting once accumulated bytes
+ *  exceed `maxBytes` — so a feed whose Content-Length lies (or is absent/
+ *  chunked) can never be fully materialized in memory before the size bound
+ *  rejects it. Plain `res.text()` buffered the ENTIRE response first; the
+ *  feed URL is owner-overridable (firewall relays), so the bound had to live
+ *  on the read itself (release review #5826, 2026-11-06). */
+async function readCappedBody(body: Response["body"], maxBytes: number): Promise<string> {
+    if (body === null) return "";
+    const reader = body.getReader();
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    try {
+        for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (value !== undefined && value.byteLength > 0) {
+                total += value.byteLength;
+                if (total > maxBytes) {
+                    await reader.cancel().catch(() => {});
+                    throw new Error(`document exceeds ${maxBytes} bytes`);
+                }
+                chunks.push(value);
+            }
+        }
+    } finally {
+        reader.releaseLock();
+    }
+    const out = new Uint8Array(total);
+    let off = 0;
+    for (const c of chunks) { out.set(c, off); off += c.byteLength; }
+    return new TextDecoder("utf-8").decode(out);
+}
+
 /** Validate the wire document ({v:1, entries:[...]}). Bad individual entries
  *  are skipped (one typo must never blank the feed); a document that yields
  *  NOTHING from non-empty input is an error so callers keep the snapshot.
@@ -144,7 +177,10 @@ export async function runRemoteNoticesCheck(opts: RemoteNoticesOptions, force = 
             };
             const res = await fetch(url, init as RequestInit);
             if (!res.ok) throw new Error(`announcements source returned HTTP ${res.status}`);
-            text = await res.text();
+            // Bound the READ itself, not just the result: a multi-GB body from
+            // a hostile or misconfigured relay used to land fully in memory
+            // before MAX_REMOTE_BYTES below could reject it.
+            text = await readCappedBody(res.body, MAX_REMOTE_BYTES);
         } catch (e) {
             state.lastError = String(e);
             warnOnce(log, `fetch:${String(e)}`, `[notices] remote feed unreachable (${String(e)}) — serving last known-good copy`);

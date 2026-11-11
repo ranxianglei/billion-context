@@ -66,7 +66,7 @@ export function simhashHex(canonical: string): string {
         features.push(canonical);
     }
     const stride = Math.max(1, Math.ceil(features.length / MAX_FEATURES));
-    const v = new Int8Array(64);
+    const v = new Int16Array(64);
     for (let f = 0; f < features.length; f += stride) {
         const h1 = fnv1a32(features[f]!, 2166136261);
         const h2 = fnv1a32(features[f]!, 2166136261 ^ 0x9e3779b9);
