@@ -357,13 +357,25 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         const turn = core.processTurn({ messages: renderMsgs, state: session.state, config: loopConfig, tokenCount, tokenCountSource, renderTags, contentStore: contentStoreOf(session) });
         session.state = turn.state;
         adoptContentStore(session, turn.contentStore);
+        // #5874 mapEgress (owner ruling 2026-11-11): the plane persists the
+        // kernel's OWN tagged processTurn output (invariant v: post_json is
+        // the post-rewrite core form, never wire bytes). Deep-copy — the lane
+        // mutates turn.messages in place later (absorb view, subagent attach)
+        // and the egress transform re-applies exactly those passes, so the
+        // stored rows must stay the pre-mutation bytes. The anchor rows ride
+        // the copy too: they are processTurn output.
+        session.lastPlaneMessages = JSON.parse(JSON.stringify(turn.messages));
         // #5874 P2-final: snapshot application (in-request) — the canonical
         // transcript up to THIS user message plus the kernel's post-fold state
         // must be on the snapshot plane before the egress stage reads it
         // (chain: raw → wire→core → kernel rewrite → snapshot write → egress
         // rewrite → egress). snapshotMessages first: the persist build reads
-        // session.lastMessages. Never fatal — a failed flush leaves the round
-        // on the legacy egress path (the seam walk carries it).
+        // session.lastMessages — and it stays the RAW client resend (never
+        // the D-lane view: its synthetic acp_summary anchor is not a
+        // transcript message). The plane rows have a separate source:
+        // session.lastPlaneMessages above (the kernel's tagged output).
+        // Never fatal — a failed flush leaves the round on the legacy egress
+        // path.
         snapshotMessages(session, originalMessages);
         snapFlush = await SessionStore.flushOrSkip(session);
         // #4528: split the kernel pass from its post-processing scan passes so
@@ -437,11 +449,11 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         separatorSlots = ordered.slots;
         // #5874 P2 (mapEgress): tripwire-guarded plane egress — the lane's
         // exact chain (strip → drop → repair) reapplied to the plane view.
-        processedMessages = applySnapEgress(msgs, turn.state, processedMessages, {
+        processedMessages = applySnapEgress(turn.state, processedMessages, {
             sessionId,
-            renderTags,
             protocol: "responses",
             log,
+            isCompressTool: loopConfig.isCompressTool,
             transform: (m) => repairResponsesAssistantOrdering(applyReasoningDrop(stripKernelSummaries(attachSubagentSessions(applyAbsorbView(m, session.state, loopConfig, tokenCount), session), turn.state), reasoningPlan, log, sessionId), originalMessages).messages,
         });
         // #3477: consume the announced native-compaction boundary (pi session_compact

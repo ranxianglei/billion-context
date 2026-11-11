@@ -22,7 +22,7 @@ import { dirname, join } from "node:path";
 import { log as loggerLog } from "../logger.js";
 import { openSqliteDatabase, type SqliteDatabase, type SqliteEngineName, type SqliteEngineSource } from "./driver.js";
 import { migrateSchema, storagePragmas, WAL_JOURNAL_SIZE_LIMIT } from "./schema.js";
-import { identityOfStoredContent } from "./identity.js";
+import { identityOfStoredContent, splitMediaContent } from "./identity.js";
 import {
     applySnapInTransaction,
     isSnapPlaneDead,
@@ -39,7 +39,8 @@ import { recordIntegrityOutcome, recordSecondProcessOwner, recordBackupOutcome }
 import { integrityModeFor, writeIntegrityCache, scheduleBackgroundIntegrityCheck, backgroundIntegrityInflightForTests, noteIntegrityCheckRun } from "./integrity-check.js";
 import { sqliteCorruptionDetail } from "./sqlite-errors.js";
 import { listInstances, type RegistryEntry } from "../instance.js";
-import type { MessageContentStore } from "acp-kernel";
+import { baseIdOf } from "acp-kernel";
+import type { CoreMessage, MessageContentStore } from "acp-kernel";
 import type { BlockView } from "../session.js";
 
 /** #3250: run a PASSIVE wal_checkpoint every N successful ingests. The
@@ -343,6 +344,14 @@ export interface IngestSessionInput {
      *  absolute seqs before insert — see remapPlanSeqs. */
     pluginSnapshotSeqs?: number[] | null;
     tailSeqs?: number[] | null;
+    /** #5874 mapEgress direct authority: the lane's RAW tagged processTurn
+     *  output for this turn (deep-copied before the in-request flush). The
+     *  snapshot plane persists THESE bytes — the kernel's own tagged output,
+     *  not the legacy transcript (invariant v: post_json is the post-rewrite
+     *  core form). When present, snapShadowSync derives the plane events
+     *  from this view; null falls back to the defensive full-transcript diff
+     *  (saves that don't carry a turn view). */
+    planeMessages?: CoreMessage[] | null;
     /** Serialized orphan map (Record<blockId, {one, full}>) — blockContents
      *  entries whose block is absent from state.blocks (#4216/#4242: the reap
      *  shape is REPRESENTABLE; rides the same transaction so the session row,
@@ -385,6 +394,20 @@ function serializeExtValue(value: unknown): string {
 /** Escapes LIKE metacharacters for the ESCAPE '\\' clause used by listKv. */
 function likeEscape(prefix: string): string {
     return prefix.replace(/[\\%_]/g, (ch) => "\\" + ch);
+}
+
+/** #5874 A/B oracle: effectiveMessageIds from a blocks row's payload_json
+ *  (the verbatim CompressionBlock the ingest stored). '' on any parse
+ *  failure — a malformed payload just misses the base-set, it never kills
+ *  the oracle (the throw path latches dead like any A/B failure). */
+function effectiveIdsOfPayload(payload: string | null): string[] {
+    if (!payload) return [];
+    try {
+        const p = JSON.parse(payload) as { effectiveMessageIds?: unknown };
+        return Array.isArray(p.effectiveMessageIds) ? (p.effectiveMessageIds as string[]) : [];
+    } catch {
+        return [];
+    }
 }
 
 /**
@@ -1502,6 +1525,14 @@ export class UnifiedStore {
             (this.db.prepare("SELECT conversation_id FROM conversations WHERE session_id = ?").get(sid) as { conversation_id: string } | undefined)
                 ?.conversation_id ?? sid;
         const witness = this.snapWitnessProbe(sid);
+        // #5874 mapEgress: when the save carries the lane's tagged turn view
+        // (planeMessages), the plane is the DIRECT outbound authority — the
+        // events are derived from the view itself (kernel evidence
+        // addressing, no CAS I/O), never from the legacy diff (the legacy
+        // bytes are the pre-tag transcript and must not overwrite the
+        // plane's tagged forms).
+        const view = input.planeMessages;
+        const tagged = Array.isArray(view) && view.length > 0;
         try {
             const out = this.db.transaction(() => {
                 const l1 = snapL1Record(this.db, sessRaw, sid, witness, now);
@@ -1513,9 +1544,10 @@ export class UnifiedStore {
                 }
                 // Steady-state delta appends take the fast path (no full
                 // scan); everything else is a final-state diff (seed, edit,
-                // rewind, compaction, reap — the bounded passes).
-                const fast = delta ? this.snapFastAppendEvents(sid, input) : null;
-                const events = fast ?? this.snapDeriveEvents(sid);
+                // rewind, compaction, reap — the bounded passes). Tagged
+                // saves skip the fast path (the view is the source of truth).
+                const fast = !tagged && delta ? this.snapFastAppendEvents(sid, input) : null;
+                const events = tagged ? this.snapViewEvents(sid, view as CoreMessage[]) : (fast ?? this.snapDeriveEvents(sid));
                 const depth = this.snapLogDepth(sid);
                 const fold = events.some((e) => e.ev === "compact") || depth >= UnifiedStore.SNAP_FOLD_DEPTH;
                 const commit = applySnapInTransaction(this.db, sid, events, { fold, now });
@@ -1527,7 +1559,7 @@ export class UnifiedStore {
             // positions and forms. A mismatch kills the plane for this sid
             // (R2 as a red door on the read side); the save itself is done
             // and untouched.
-            if (out.commit.folded) this.snapAbCheck(sid);
+            if (out.commit.folded) this.snapAbCheck(sid, tagged ? (view as CoreMessage[]) : null);
             const kind =
                 out.nEvents === 0
                     ? "noop"
@@ -1679,6 +1711,471 @@ export class UnifiedStore {
         return events;
     }
 
+    // -----------------------------------------------------------------------
+    // #5874 mapEgress write side (direct authority): plane events from the
+    // lane's tagged processTurn output. The plane persists the kernel's OWN
+    // tagged bytes (invariant v), so the egress that reads them back is
+    // byte-identical to the legacy transform BY CONSTRUCTION — the legacy
+    // diff above stays for saves that carry no turn view (defensive
+    // fallback, and the lane-less seed path).
+    //
+    // Addressing (proposal §4.2 — kernel evidence only, no fuzzy matching):
+    // a view entry resolves to its ledger row by MESSAGE ID (steady state:
+    // the view id IS the client raw id — the kernel only remints a
+    // content-hash id on the rare "new byte-identical instance after a
+    // fold" edge, kernel instance-reid), with a position-independent
+    // IDENTITY fallback for that edge (stored bytes minus tags / id /
+    // wireIndex / ledgerSeq — the same identity the legacy intern computed
+    // from the RAW bytes, so the two forms agree). An entry that resolves
+    // to nothing throws (R2): the caller latches the plane dead for this
+    // sid and the legacy path carries the round.
+    //
+    // Event order: casts/updates in view order, deletes, compacts LAST (a
+    // compact flips whatever this batch just cast — a fold covers this
+    // turn's messages the moment it lands). The pinned opening wire message
+    // (#2733/#3642) is carved out of compact ranges: the kernel serves it
+    // even when covered, so its row stays active.
+    // -----------------------------------------------------------------------
+    /** Canonical stored bytes for a view entry: same serialize as the legacy
+     *  intern (#4390/#4313 — ts out of the payload) but over the TAGGED text
+     *  (the tag is part of the plane's post form; the egress serves it as-is).
+     *  Local copy of ingest.ts's serializeForStore (circular import). */
+    private planeSerializeForStore(m: CoreMessage): string {
+        if ("ts" in m) {
+            const copy: Record<string, unknown> = { ...m };
+            delete copy["ts"];
+            return JSON.stringify(copy);
+        }
+        return JSON.stringify(m);
+    }
+
+    /** Tag-stripped identity of a tagged view entry — the kernel prepends
+     *  `<acp …>mNNNNN</acp>\n` to the text, which is NOT part of the
+     *  message content identity (the legacy rows' identity column was
+     *  computed from the untagged transcript). Identity also strips
+     *  id/wireIndex/ledgerSeq, so a reminted id with identical content
+     *  still matches its ledger row. */
+    private planeViewIdentity(m: CoreMessage): string {
+        try {
+            const stored = splitMediaContent(this.planeSerializeForStore(m)).content;
+            const parsed = JSON.parse(stored) as { text?: unknown };
+            if (typeof parsed.text === "string") parsed.text = parsed.text.replace(/^<acp [^>\n]*>m\d+<\/acp>\n/, "");
+            return identityOfStoredContent(JSON.stringify(parsed));
+        } catch {
+            return ""; // unmatchable — the caller treats it as an id-path miss
+        }
+    }
+
+    private snapViewEvents(sid: string, view: CoreMessage[]): SnapEvent[] {
+        const live = this.db
+            .prepare(
+                "SELECT m.seq, m.msg_id, m.identity, m.content_hash, c.byte_len AS clen FROM messages m JOIN content c ON c.hash = m.content_hash WHERE m.session_id = ? AND m.retired_at IS NULL ORDER BY m.seq",
+            )
+            .all(sid) as { seq: number; msg_id: string; identity: string; content_hash: string; clen: number }[];
+        const plane = this.db
+            .prepare("SELECT pos, core_ids, post_json, active, cover_ref FROM snap_rows WHERE sid = ? ORDER BY pos")
+            .all(sid) as { pos: number; core_ids: string; post_json: string | null; active: number; cover_ref: string | null }[];
+        const blocks = this.db
+            .prepare("SELECT block_id, active, start_seq, end_seq, payload_json FROM blocks WHERE session_id = ? ORDER BY ord")
+            .all(sid) as { block_id: string; active: number; start_seq: number; end_seq: number; payload_json: string | null }[];
+        const blockIds = new Set(blocks.map((b) => b.block_id));
+        const activeBlocks = blocks.filter((b) => b.active === 1);
+        const parseIds = (json: string): string[] => {
+            try {
+                const a = JSON.parse(json);
+                return Array.isArray(a) ? (a as string[]) : [];
+            } catch {
+                return [];
+            }
+        };
+        const idsByPos = new Map<number, string[]>();
+        for (const r of plane) idsByPos.set(r.pos, parseIds(r.core_ids));
+        const planeByPos = new Map(plane.map((r) => [r.pos, r]));
+        let minAnchorPos = 0;
+        for (const r of plane) if (r.pos < minAnchorPos) minAnchorPos = r.pos;
+        // First unconsumed candidate wins: view order == transcript order ==
+        // live seq order (the kernel never reorders regular rows), so
+        // sequential consumption keeps reminted / duplicate-content entries
+        // mapped to the right instance.
+        const liveById = new Map<string, number[]>();
+        const liveByIdentity = new Map<string, number[]>();
+        live.forEach((r, i) => {
+            for (const map of [liveById, liveByIdentity] as const) {
+                const key = map === liveById ? r.msg_id : r.identity;
+                if (!key) continue; // pre-v8 rows carry no identity — id path only
+                const a = map.get(key);
+                if (a) a.push(i);
+                else map.set(key, [i]);
+            }
+        });
+        const consumed = new Array<boolean>(live.length).fill(false);
+        const pickUnconsumed = (list: number[] | undefined): number | undefined => (list ? (list.find((i) => !consumed[i]) ?? undefined) : undefined);
+        // Plane-first addressing (remint stability, #3752): the plane row is
+        // the STABLE address. A reminted client round re-mints only the
+        // LEGACY ids and re-appends the legacy table under new seqs (the old
+        // rows are sweep-retired) — the view still rides the plane's ids (the
+        // D lane builds the kernel input from the transcript rows), so the
+        // right mapping target is the EXISTING plane row (alias id, then
+        // tag-stripped identity), never the fresh legacy rows. Mapping onto
+        // the fresh rows re-casts the whole prefix at new seqs every upgrade
+        // and orphans the stable rows (host-removed + GC → pin lost).
+        const planeIdx = plane.map((r, i) => (r.pos >= 0 ? i : -1)).filter((i) => i >= 0);
+        const planeById = new Map<string, number[]>();
+        const planeByIdentity = new Map<string, number[]>();
+        const rowIdentity = new Map<number, string>(); // plane idx → tag-stripped identity
+        for (const i of planeIdx) {
+            const r = plane[i]!;
+            for (const id of idsByPos.get(r.pos) ?? []) {
+                const a = planeById.get(id);
+                if (a) a.push(i);
+                else planeById.set(id, [i]);
+            }
+            const pj = r.post_json;
+            if (typeof pj !== "string" || !pj) continue;
+            let id2 = "";
+            try {
+                const o = JSON.parse(pj) as { id?: unknown; role?: unknown; text?: unknown; wireIndex?: unknown; ledgerSeq?: unknown };
+                if (o && typeof o === "object" && typeof o.role === "string" && typeof o.id === "string") {
+                    const t = o.text;
+                    if (typeof t === "string") o.text = t.replace(/^<acp [^>\n]*>m\d+<\/acp>\n/, "");
+                    delete (o as Record<string, unknown>).ts;
+                    id2 = identityOfStoredContent(JSON.stringify(o));
+                }
+            } catch {
+                id2 = "";
+            }
+            if (!id2) continue;
+            rowIdentity.set(i, id2);
+            const a = planeByIdentity.get(id2);
+            if (a) a.push(i);
+            else planeByIdentity.set(id2, [i]);
+        }
+        const consumedPlane = new Array<boolean>(plane.length).fill(false);
+        const pickUnconsumedPlane = (list: number[] | undefined): number | undefined => (list ? (list.find((i) => !consumedPlane[i]) ?? undefined) : undefined);
+        const viewIdentity = (m: CoreMessage): string => this.planeViewIdentity(m);
+        const events: SnapEvent[] = [];
+        const mappedPos = new Set<number>(); // ledger pos claimed by a view entry this round
+        const materializedPos = new Set<number>(); // covered rows cast this batch (pre-compact) — the flip check must count them
+        const seqAt = new Array<number | undefined>(view.length).fill(undefined); // view idx → mapped ledger pos (undefined for anchor entries)
+        const anchorKept = new Set<string>(); // active block ids with a render in THIS view
+        // Pass 1: view entries → ledger rows (casts/updates) + anchor rows.
+        for (let vi = 0; vi < view.length; vi++) {
+            const m = view[vi]!;
+            const stored = splitMediaContent(this.planeSerializeForStore(m)).content;
+            const tokensEst = Math.ceil(Buffer.byteLength(stored, "utf8") / 4);
+            if (typeof m.id === "string" && m.id.startsWith("acp_summary_") && blockIds.has(m.id.slice("acp_summary_".length))) {
+                // A rendered summary whose block is KNOWN to the plane: the
+                // carrier is the ANCHOR row (negative pos — no ledger
+                // position; the egress re-inserts it at its pair-safe index),
+                // never the ledger row (a host-resent copy of it is a stale
+                // rendered-summary copy that the kernel DROPS, so pass 2
+                // retires it). Consumed blocks render no anchor in the view
+                // — their stale copies are retired by the generic pass-2
+                // rule (no mapping, not covered, not kept).
+                const bid = m.id.slice("acp_summary_".length);
+                if (!activeBlocks.some((b) => b.block_id === bid)) continue;
+                anchorKept.add(bid);
+                let anchorPos: number | null = null;
+                for (const r of plane) if (r.pos < 0 && idsByPos.get(r.pos)!.includes(m.id)) { anchorPos = r.pos; break; }
+                if (anchorPos === null) {
+                    const pos = minAnchorPos - 1; // newest anchor = most negative
+                    minAnchorPos = pos;
+                    events.push({ ev: "cast", pos, coreIds: [m.id], preJson: null, postJson: stored, tokensEst });
+                } else {
+                    const r = planeByPos.get(anchorPos)!;
+                    if (r.active === 0 || r.post_json !== stored) {
+                        events.push({ ev: "update", pos: anchorPos, postJson: stored, coreIds: [m.id], tokensEst });
+                    }
+                }
+                continue;
+            }
+            // Regular entry → PLANE row first (stable address), then a fresh
+            // legacy row for genuinely new content.
+            const vid = viewIdentity(m);
+            let pi = typeof m.id === "string" ? pickUnconsumedPlane(planeById.get(m.id)) : undefined;
+            if (pi === undefined) pi = pickUnconsumedPlane(planeByIdentity.get(vid));
+            if (pi !== undefined) {
+                consumedPlane[pi] = true;
+                const rp = plane[pi]!;
+                const pos = rp.pos;
+                mappedPos.add(pos);
+                seqAt[vi] = pos;
+                const ids = idsByPos.get(pos) ?? [];
+                const merged = typeof m.id === "string" ? [m.id, ...ids.filter((id) => id !== m.id)] : [...ids];
+                // Bridge the reminted legacy id (same content, fresh row):
+                // keep the alias chain whole so the egress's alias coverage
+                // and the next round's id addressing both resolve.
+                for (const li of liveByIdentity.get(vid) ?? []) {
+                    const l = live[li]!;
+                    if (!consumed[li] && !merged.includes(l.msg_id)) merged.push(l.msg_id);
+                    break;
+                }
+                if (rp.active === 0 || rp.post_json !== stored || rp.core_ids !== JSON.stringify(merged)) {
+                    events.push({ ev: "update", pos, postJson: stored, coreIds: merged, tokensEst });
+                }
+                continue;
+            }
+            // New content → fresh row from the legacy ledger: by id, then by
+            // tag-stripped identity (pre-v8 rows carry no identity — id only).
+            let li = pickUnconsumed(liveById.get(m.id));
+            if (li === undefined) li = pickUnconsumed(liveByIdentity.get(vid));
+            if (li === undefined) {
+                throw new Error(`[snaplane] sid=${sid} view[${vi}] id=${String(m.id).slice(0, 40)}: unaddressable — no plane row or live ledger row (R2)`);
+            }
+            consumed[li] = true;
+            const l = live[li]!;
+            mappedPos.add(l.seq);
+            seqAt[vi] = l.seq;
+            const coreIds = new Set<string>([m.id]);
+            if (l.msg_id !== m.id) coreIds.add(l.msg_id);
+            const p = planeByPos.get(l.seq);
+            if (!p) {
+                events.push({ ev: "cast", pos: l.seq, coreIds: [...coreIds], preJson: null, postJson: stored, tokensEst });
+                continue;
+            }
+            const merged = [...coreIds, ...idsByPos.get(l.seq)!.filter((id) => !coreIds.has(id))];
+            if (p.active === 0 || p.post_json !== stored || p.core_ids !== JSON.stringify(merged)) {
+                events.push({ ev: "update", pos: l.seq, postJson: stored, coreIds: merged, tokensEst });
+            }
+        }
+        // Id → pos (first occurrence in pos order) for coverage addressing:
+        // every alias in every plane row, then live rows without one.
+        const posById = new Map<string, number>();
+        for (const r of plane) for (const id of idsByPos.get(r.pos) ?? []) if (!posById.has(id)) posById.set(id, r.pos);
+        for (const l of live) if (!posById.has(l.msg_id)) posById.set(l.msg_id, l.seq);
+        // Covered PLANE pos (mirrors the kernel's coverage evidence): effIds
+        // → pos (aliases survive remint — the plane row keeps every id the
+        // content ever had) ∪ the block's durable table interval, TRANSLATED
+        // through the fold-time rows: the interval is LEGACY-seq space (fold
+        // time), and after a remint round the legacy table re-appends under
+        // new seqs while the plane keeps its own stable pos — so the raw
+        // interval must never be read as plane pos directly.
+        const coveredPos = new Set<number>();
+        const coveredLegacySeqs = new Set<number>(); // legacy-seq space — materialization
+        const blockEffIds = (b: { payload_json: string | null }): string[] => {
+            if (!b.payload_json) return [];
+            try {
+                const p = JSON.parse(b.payload_json) as { effectiveMessageIds?: unknown };
+                return Array.isArray(p.effectiveMessageIds) ? (p.effectiveMessageIds as string[]) : [];
+            } catch {
+                return [];
+            }
+        };
+        {
+            const intervalSeqs = new Set<number>();
+            for (const b of activeBlocks) if (b.start_seq >= 0 && b.end_seq >= b.start_seq) for (let s = b.start_seq; s <= b.end_seq; s++) intervalSeqs.add(s);
+            if (intervalSeqs.size > 0) {
+                // Fold-time rows — RETIRED ones included: the sweep retires the
+                // reminted originals but they stay queryable. One bounded
+                // query per interval.
+                for (const b of activeBlocks) {
+                    if (b.start_seq < 0 || b.end_seq < b.start_seq) continue;
+                    const rows = this.db
+                        .prepare("SELECT seq, msg_id FROM messages WHERE session_id = ? AND seq BETWEEN ? AND ?")
+                        .all(sid, b.start_seq, b.end_seq) as { seq: number; msg_id: string }[];
+                    for (const row of rows) {
+                        const p = posById.get(row.msg_id);
+                        if (p !== undefined && p >= 0) coveredPos.add(p);
+                    }
+                }
+                for (const s of intervalSeqs) coveredLegacySeqs.add(s);
+            }
+        }
+        for (const b of activeBlocks) {
+            for (const id of blockEffIds(b)) {
+                const p = posById.get(id);
+                if (p !== undefined && p >= 0) coveredPos.add(p);
+                for (const li of liveById.get(id) ?? []) coveredLegacySeqs.add(live[li]!.seq);
+            }
+        }
+        // Pass 2: deletions — an active row the view no longer presents and
+        // no block covers (host-side removal, or a stale rendered-summary
+        // copy). Covered rows stay: both forms retained (forensics + the
+        // egress's pair-safe walk needs the covered rows present).
+        for (const r of plane) {
+            if (r.active !== 1) continue;
+            if (r.pos < 0) {
+                const ids = idsByPos.get(r.pos) ?? [];
+                if (ids.some((id) => id.startsWith("acp_summary_")) && ids.every((id) => anchorKept.has(id.slice("acp_summary_".length)))) continue;
+            }
+            if (mappedPos.has(r.pos) || coveredPos.has(r.pos)) continue;
+            events.push({ ev: "delete", pos: r.pos });
+        }
+        // Pinned opening wire message span (#2733/#3642): the first role
+        // user row of the view, extended over its wireIndex core run — the
+        // kernel serves these even when covered, so their rows stay active
+        // (carved out of the compact ranges below).
+        const viewWireOf = (i: number): number | undefined => {
+            // #3642: wireIndex is a runtime core field (set by every codec,
+            // not declared on CoreMessage) — same local-cast pattern as
+            // kernel/src/prune.ts's wireIndexOf.
+            const w = (view[i] as { wireIndex?: number } | undefined)?.wireIndex;
+            return typeof w === "number" ? w : undefined;
+        };
+        const pinStart = view.findIndex((m) => m.role === "user");
+        let pinLo = -1;
+        let pinHi = -1;
+        if (pinStart >= 0) {
+            // The kernel's first-user pin is UNCONDITIONAL (DESIGN §8.1);
+            // the wireIndex only EXTENDS the run to the rest of the opening
+            // wire message's cores. A single-core pin (no wireIndex) still
+            // carves out its one row — compacting it would let snapGc
+            // delete the pin row when its covering block is later folded
+            // away, and the egress would then diverge from the kernel
+            // (which keeps serving the pin from the client's resend).
+            const w = viewWireOf(pinStart);
+            let hi = pinStart;
+            if (w !== undefined) {
+                while (hi + 1 < view.length && view[hi + 1]!.role === "user" && viewWireOf(hi + 1) === w) hi++;
+            }
+            const posA: number[] = [];
+            for (let i = pinStart; i <= hi; i++) {
+                const s = seqAt[i];
+                if (s !== undefined) posA.push(s);
+            }
+            if (posA.length) {
+                pinLo = Math.min(...posA);
+                pinHi = Math.max(...posA);
+            }
+        }
+        // (b) The TRANSCRIPT pin: the plane's first user row (stored bytes).
+        // In a D-on session the kernel's own pin (the view's first user) does
+        // NOT include it — the D lane drops covered rows before the kernel,
+        // so the transcript's first user is usually absent from the view —
+        // but the egress serves it anyway (pin-first doctrine: providers
+        // reject a conversation that starts without a user message), so its
+        // row must survive the compacts below.
+        let tPinLo = -1;
+        let tPinHi = -1;
+        {
+            const roleOf = (r: { post_json: string | null }): { role?: string; wireIndex?: number } | null => {
+                if (typeof r.post_json !== "string" || !r.post_json) return null;
+                try {
+                    const o = JSON.parse(r.post_json) as { role?: unknown; wireIndex?: unknown };
+                    return o && typeof o === "object" ? (o as { role?: string; wireIndex?: number }) : null;
+                } catch {
+                    return null;
+                }
+            };
+            let i0 = -1;
+            for (let i = 0; i < plane.length; i++) {
+                const r = plane[i]!;
+                if (r.pos < 0) continue;
+                if (roleOf(r)?.role === "user") { i0 = i; break; }
+            }
+            if (i0 >= 0) {
+                const w0 = roleOf(plane[i0]!)?.wireIndex;
+                let i1 = i0;
+                if (typeof w0 === "number") {
+                    while (i1 + 1 < plane.length && plane[i1 + 1]!.pos >= plane[i0]!.pos && roleOf(plane[i1 + 1]!)?.role === "user" && roleOf(plane[i1 + 1]!)?.wireIndex === w0) i1++;
+                }
+                const span: number[] = [];
+                for (let i = i0; i <= i1; i++) span.push(plane[i]!.pos);
+                tPinLo = Math.min(...span);
+                tPinHi = Math.max(...span);
+            }
+        }
+        // Materialize covered rows that the plane has never recorded
+        // (migration seed / first tagged save after a block already exists):
+        // the egress's pair-safe walk needs the covered rows PRESENT to place
+        // the anchor at the right position, so the block's covered range is
+        // recorded once (cast from the legacy CAS bytes — they are covered,
+        // never served, so their untagged form is fine), then flipped covered
+        // by the compact below. Bounded to the block's range, one-time per
+        // row. Steady-state folds already have the rows (cast while active),
+        // so this is a no-op there.
+        {
+            const liveBySeq = new Map(live.map((r) => [r.seq, r]));
+            const missing: { seq: number; msg_id: string; content_hash: string; clen: number }[] = [];
+            // Legacy-seq space: materialization is a migration-seed concern
+            // (the plane did not exist when the block was folded — no remint
+            // can have happened yet, so plane pos == legacy seq there). In
+            // steady state the covered rows were cast while active and are
+            // already in the plane, so this is a no-op.
+            for (const s of coveredLegacySeqs) {
+                const l = liveBySeq.get(s);
+                if (!l || planeByPos.has(s)) continue;
+                if (mappedPos.has(s)) continue;
+                let hasAlias = false;
+                for (const r of plane) {
+                    if ((idsByPos.get(r.pos) ?? []).includes(l.msg_id)) { hasAlias = true; break; }
+                }
+                if (hasAlias) continue; // the row exists under another pos
+                missing.push(l);
+            }
+            if (missing.length > 0) {
+                const content = this.snapContentByHash(missing.map((r) => r.content_hash));
+                for (const r of missing) {
+                    const body = content.get(r.content_hash);
+                    if (body === undefined) {
+                        throw new Error(`[snaplane] sid=${sid} pos=${r.seq}: content hash ${r.content_hash.slice(0, 12)}… missing from CAS (covered materialization)`);
+                    }
+                    events.push({ ev: "cast", pos: r.seq, coreIds: [r.msg_id], preJson: null, postJson: body, tokensEst: Math.ceil(r.clen / 4) });
+                    materializedPos.add(r.seq);
+                }
+            }
+        }
+        // Pass 3: compactions LAST (they flip whatever pass 1 just cast),
+        // with the protected spans carved out of the flip range: the view
+        // pin (a), the transcript pin (b), and every row the view mapped
+        // (mapped rows stay active — the egress serves them and the A/B
+        // expects them active; coverage suppression at egress is alias-based,
+        // so the flip only carries bookkeeping for rows the view dropped).
+        for (const b of activeBlocks) {
+            const effIds = blockEffIds(b);
+            const perPos: number[] = [];
+            for (const id of effIds) {
+                const p = posById.get(id);
+                if (p !== undefined && p >= 0) perPos.push(p);
+            }
+            // The table interval (legacy-seq space) translated to plane pos
+            // through the fold-time rows — same translation as coveredPos.
+            if (b.start_seq >= 0 && b.end_seq >= b.start_seq) {
+                const rows = this.db
+                    .prepare("SELECT msg_id FROM messages WHERE session_id = ? AND seq BETWEEN ? AND ?")
+                    .all(sid, b.start_seq, b.end_seq) as { msg_id: string }[];
+                for (const row of rows) {
+                    const p = posById.get(row.msg_id);
+                    if (p !== undefined && p >= 0) perPos.push(p);
+                }
+            }
+            if (perPos.length === 0) continue; // no coverage evidence resolvable to positions
+            const lo = Math.min(...perPos);
+            const hi = Math.max(...perPos);
+            // Protected points: both pin spans + every mapped row (a mapped
+            // row inside the min/max span but outside the actual coverage —
+            // a span gap — must not be flipped).
+            // Only MAPPED positions are protected. The pin spans are NOT:
+            // the kernel pins the first user only when that row is in the
+            // kernel's INPUT (rows-sourced views suppress covered rows, so a
+            // covered pin row never reaches the kernel and is absent from the
+            // output). A pin row in the kernel output is a MAPPED view row —
+            // already protected here; a covered pin row not in the output
+            // must compact like any other covered row. Keeping pin rows
+            // active made the plane carry rows the kernel never serves (out2
+            // pin divergence).
+            const prot = new Set<number>();
+            for (const p of mappedPos) prot.add(p);
+            const ranges: [number, number][] = [];
+            let cur = lo;
+            for (let p = lo; p <= hi; p++) {
+                if (prot.has(p)) {
+                    if (cur <= p - 1) ranges.push([cur, p - 1]);
+                    cur = p + 1;
+                }
+            }
+            if (cur <= hi) ranges.push([cur, hi]);
+            for (const [rl, rh] of ranges) {
+                let flip = false;
+                for (const r of plane) if (r.active === 1 && r.pos >= rl && r.pos <= rh) { flip = true; break; }
+                if (!flip) for (const p of mappedPos) if (p >= rl && p <= rh && !planeByPos.has(p)) { flip = true; break; }
+                if (!flip) for (const p of materializedPos) if (p >= rl && p <= rh) { flip = true; break; }
+                if (flip) events.push({ ev: "compact", blockId: b.block_id, posRange: [rl, rh] });
+            }
+        }
+        return events;
+    }
+
     /** Batch CAS read: hash → stored bytes (string). The plane stores the
      *  canonical core shape — exactly what the messages table stores. */
     private snapContentByHash(hashes: string[]): Map<string, string> {
@@ -1702,8 +2199,19 @@ export class UnifiedStore {
      *  plane (the block summary is their carrier) and are excluded here —
      *  they are accounted for in the ckpt coverage map (T7). Any mismatch ⇒
      *  the plane is dead for this sid (R2 as a red door on the read side).
-     *  Called only at fold time — amortized, off the per-save fast path. */
-    private snapAbCheck(sid: string): void {
+     *  Called only at fold time — amortized, off the per-save fast path.
+     *
+     *  #5874 tagged planes (view present): the post form is the TAGGED
+     *  bytes, so the byte A/B against the legacy CAS form cannot hold by
+     *  construction — the check becomes STRUCTURAL: active non-anchor plane
+     *  pos set == live pos − covered, and one active anchor row per active
+     *  block that rendered this turn (bytes equality is guaranteed by the
+     *  write side copying the view itself). */
+    private snapAbCheck(sid: string, view: CoreMessage[] | null): void {
+        if (view !== null) {
+            this.snapAbCheckTagged(sid, view);
+            return;
+        }
         try {
             const view = readSnapView(this.db, sid);
             const covers = this.db
@@ -1744,6 +2252,74 @@ export class UnifiedStore {
             loggerLog("warn", `[snaplane] sid=${sid} decision=red:R2 A/B check failed: ${String(err).slice(0, 200)}`);
         }
     }
+
+    /** A/B for tagged planes (#5874): the folded plane must AGREE WITH THE
+    /** A/B for tagged planes (#5874): the plane must agree with the
+     *  KERNEL VIEW, not with the legacy table. Invariant v makes the view
+     *  (the kernel's tagged processTurn output) the egress source, so the
+     *  correct oracle is "active non-anchor plane contents == the view's
+     *  regular entries' contents" (identity multisets, remint-proof —
+     *  id/wireIndex/ledgerSeq/tag are stripped from both sides). The
+     *  table-derived expectation was the wrong oracle: the table and the
+     *  view legitimately drift (reply-lag rows the client re-sent but the
+     *  rows-sourced D view gap-consumed; reminted re-appends), and a
+     *  red on that drift latched the plane dead, sending egress to legacy.
+     *  Runs fold-time only; a mismatch ⇒ plane dead for this sid (R2 as a
+     *  red door on the read side). */
+    private snapAbCheckTagged(sid: string, view: CoreMessage[]): void {
+        try {
+            const plane = this.db
+                .prepare("SELECT pos, core_ids, post_json, active FROM snap_rows WHERE sid = ? ORDER BY pos")
+                .all(sid) as { pos: number; core_ids: string; post_json: string | null; active: number }[];
+            const idsOf = (json: string): string[] => {
+                try {
+                    const a = JSON.parse(json);
+                    return Array.isArray(a) ? (a as string[]) : [];
+                } catch {
+                    return [];
+                }
+            };
+            const rowIdentity = (pj: string | null): string => {
+                if (typeof pj !== "string" || !pj) return "";
+                try {
+                    const o = JSON.parse(pj) as { id?: unknown; text?: unknown };
+                    if (!o || typeof o !== "object" || typeof o.id !== "string") return "";
+                    const t = o.text;
+                    if (typeof t === "string") o.text = t.replace(/^<acp [^>\n]*>m\d+<\/acp>\n/, "");
+                    return identityOfStoredContent(JSON.stringify(o));
+                } catch {
+                    return "";
+                }
+            };
+            const expected = new Map<string, number>();
+            const actual = new Map<string, number>();
+            const add = (mm: Map<string, number>, id: string) => {
+                if (id) mm.set(id, (mm.get(id) ?? 0) + 1);
+            };
+            for (const m of view) {
+                if (typeof m.id === "string" && m.id.startsWith("acp_summary_")) continue; // anchor — its own row
+                add(expected, this.planeViewIdentity(m));
+            }
+            for (const r of plane) {
+                if (r.active !== 1 || r.pos < 0) continue;
+                if (idsOf(r.core_ids).some((id) => id.startsWith("acp_summary_"))) continue;
+                add(actual, rowIdentity(r.post_json));
+            }
+            const eq = expected.size === actual.size && [...expected.entries()].every(([k, v]) => actual.get(k) === v);
+            if (!eq) {
+                markSnapPlaneDead(sid);
+                loggerLog(
+                    "warn",
+                    `[snaplane] sid=${sid} decision=red:R2 A/B(tagged) view-vs-plane identity multiset mismatch (view ${[...expected.values()].reduce((a, b) => a + b, 0)} rows vs plane active ${[...actual.values()].reduce((a, b) => a + b, 0)})`,
+                );
+            }
+        } catch (err) {
+            if (err instanceof Error && err.name === "SnapPlaneDeadError") return;
+            markSnapPlaneDead(sid);
+            loggerLog("warn", `[snaplane] sid=${sid} decision=red:R2 A/B(tagged) check failed: ${String(err).slice(0, 200)}`);
+        }
+    }
+
 
     /** #5874: the status payload for the /__bili/status wire (flag state +
      *  plane counters + dead latches). Wire-safe: no Buffer, no functions. */

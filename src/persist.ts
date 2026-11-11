@@ -3047,7 +3047,11 @@ export class SessionStore {
                 this.shadow?.record(payload !== undefined ? { ...record, decompositionLog: payload } : record,
                     tail && tail.length > 0
                         ? { lastMessages: tail, lastMessagesFolded: session.lastMessagesFolded }
-                        : undefined, session.contentStore ?? undefined);
+                        : undefined, session.contentStore ?? undefined,
+                    // #5874 mapEgress: the kernel's tagged turn view rides the
+                    // save live (the envelope record never serializes it) so
+                    // the snapshot plane persists the tagged forms.
+                    session.lastPlaneMessages);
                 this.noteOwnCommit(session.id, record);
                 return record;
             }

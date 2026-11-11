@@ -685,6 +685,15 @@ export type Session = {
      *  the state ranges). Cleared by snapshotMessages on the next live
      *  request — the client re-sends full raw history, restoring the invariant. */
     lastMessagesFolded?: boolean;
+    /** #5874 mapEgress direct authority: the RAW processTurn output for this
+     *  turn (the kernel's tagged, pre-absorbView/attach view — exactly the
+     *  bytes the egress stage re-derives no longer has to re-derive). Set as
+     *  a deep copy right after processTurn (before the in-request flush), so
+     *  the plane persists the kernel's OWN tagged output instead of the
+     *  pre-rewrite transcript. The egress then reads the plane rows and runs
+     *  only the light transform (absorb/attach/strip/drop) — no seam walk,
+     *  no re-tagging, no id re-keying. Cleared per turn like lastMessages. */
+    lastPlaneMessages?: CoreMessage[];
     pluginSnapshot?: CoreMessage[];
     /** #3301: original message decompositions supplied by an external state
      *  converter (e.g. opencode-acp migration) at import time. Transient
