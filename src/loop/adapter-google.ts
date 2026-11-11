@@ -692,8 +692,8 @@ export function createGoogleAdapter(
             }]);
         },
 
-        emitMarker(toolName, result) {
-            return buildChunk([{ text: buildVisibilityMarker(toolName, result) }]);
+        emitMarker(toolName, result, outcome) {
+            return buildChunk([{ text: buildVisibilityMarker(toolName, result, outcome) }]);
         },
 
         emitCompletion(opts?: EmitCompletionOpts) {

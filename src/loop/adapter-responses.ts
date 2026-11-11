@@ -770,11 +770,11 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
             return buf;
         },
 
-        emitMarker(toolName, result) {
+        emitMarker(toolName, result, outcome) {
             return buildMessageItemSequence(
                 proxyMessageItemId(outputIndex),
                 outputIndex++,
-                buildVisibilityMarker(toolName, result),
+                buildVisibilityMarker(toolName, result, outcome),
             );
         },
 

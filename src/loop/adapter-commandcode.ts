@@ -242,10 +242,10 @@ export function createCommandcodeAdapter(
             return lineBuf(JSON.stringify({ type: "tool-call", toolCallId: call.callId, toolName: call.name, input }));
         },
 
-        emitMarker(toolName, result) {
+        emitMarker(toolName, result, outcome) {
             // The base openai marker is SSE-framed; on this wire the marker
             // rides as prose inside a text-delta (WC-5).
-            return lineBuf(JSON.stringify({ type: "text-delta", text: buildVisibilityMarker(toolName, result) }));
+            return lineBuf(JSON.stringify({ type: "text-delta", text: buildVisibilityMarker(toolName, result, outcome) }));
         },
 
         emitCompletion(opts?: EmitCompletionOpts): Buffer {

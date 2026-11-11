@@ -33,7 +33,7 @@ import { applyRanges } from "../stream.js";
 import { applyConfiguredCompression } from "../external-summary-compress.js";
 import { executeAcpRetire, executeAcpRestore, executeAcpRewrite, effectiveBlockOpsConfig } from "../acp-block-ops.js";
 import { executeSearchContextTarget, resolveDecompress } from "../decompress-shared.js";
-import { toolFail, toolOk, type ProxyToolResult } from "../proxy-tool-result.js";
+import { toolFail, toolOk, type ProxyToolResult, type ToolOutcomeKind } from "../proxy-tool-result.js";
 import { fetchWithRetry, UpstreamHttpError } from "../fetch-util.js";
 import { noteUpstreamThrottle429, noteUpstreamThrottleResolved, throttle429ModelScope } from "../upstream-throttle.js";
 import { classifyUpstreamFailure, type SkippedProxyInfo, type UpstreamFailureKind } from "../upstream-fail.js";
@@ -77,22 +77,35 @@ export function failedCallSignature(name: string, argsJson: string): string {
     return `${name}:${norm}`;
 }
 
-export function buildVisibilityMarker(toolName: string, result: string): string {
+export function buildVisibilityMarker(toolName: string, result: string, outcome?: ToolOutcomeKind): string {
+    // #5389: the icon is judged from the executor's STRUCTURED outcome (#1875
+    // ProxyToolResult.outcome) — failure/refused → ❌, everything else
+    // (applied/partial/success) → the tool icon. Receipt text is never scanned:
+    // a SUCCESS receipt embeds model-authored content from line 2 on (the
+    // compress summary fingerprint excerpt, decompress's restored history,
+    // search evidence snippets, status-report block topics), where "FAILED"/
+    // "not found"/"is required" appear as ordinary words and used to flip the
+    // icon. Outcome also catches what text can't: keyword-less failure receipts
+    // (pre-fix acp_read_original_image) and the "[Compression REFUSED: …]"
+    // refusal whose wording contains no "FAILED". When outcome is absent (an
+    // executor that predates #1875 or forgets to set it), fall back to the FIRST
+    // non-empty line only — every failure receipt carries its keyword there
+    // ([Compression FAILED: …], [decompress FAILED: …], [Block bN not found],
+    // [search_context FAILED: query is required], [absorb FAILED: …]; acp_status
+    // has no in-text failure shape at all — handleAcpStatus returns only toolOk,
+    // exceptions surface as the single ❌-prefixed line). Scanning EVERY line
+    // misfired; scanning later lines than the first is what this fallback never
+    // does.
     const lines = result.split("\n").map((l) => l.trim()).filter((l) => l.length > 0);
-    // #5389: the first non-empty line is the authoritative status line for every
-    // proxy tool — every failure receipt carries its keyword THERE ([Compression
-    // FAILED: …], [decompress FAILED: …], [Block bN not found], [search_context
-    // FAILED: query is required], [absorb FAILED: …]; acp_status has no in-text
-    // failure shape at all — handleAcpStatus returns only toolOk, exceptions
-    // surface as the single ❌-prefixed line). Scanning EVERY line misread
-    // model-authored content embedded in SUCCESS receipts (the compress summary
-    // fingerprint excerpt, decompress's restored history, search evidence
-    // snippets, status-report block topics) as a failure whenever it merely
-    // mentioned a keyword.
-    const firstLine = lines[0] ?? "";
-    const failed = firstLine.includes("FAILED")
-        || firstLine.includes("not found")
-        || firstLine.includes("is required");
+    let failed: boolean;
+    if (outcome !== undefined) {
+        failed = outcome === "failure" || outcome === "refused";
+    } else {
+        const firstLine = lines[0] ?? "";
+        failed = firstLine.includes("FAILED")
+            || firstLine.includes("not found")
+            || firstLine.includes("is required");
+    }
     const icons: Record<string, string> = {
         compress: "📦",
         decompress: "📤",
@@ -422,7 +435,7 @@ export interface CompressLoopAdapter {
     emitText(delta: string): Buffer;
     emitReasoning?(delta: string): Buffer;
     emitToolCall(call: ToolCallEmit): Buffer;
-    emitMarker(toolName: string, result: string): Buffer;
+    emitMarker(toolName: string, result: string, outcome?: ToolOutcomeKind): Buffer;
     emitCompletion(opts?: EmitCompletionOpts): Buffer;
     emitError(message: string): Buffer;
     extractTextTriggers?(text: string): ExtractedTextTriggers;
@@ -1395,7 +1408,7 @@ export async function* runCompressLoop(
 
             let realCalls = 0;
             const realToolCalls: ToolCallEmit[] = [];
-            const proxyResults: { name: string; callId: string; result: string; arguments: string; wireArguments: string; signature?: string; image?: { base64: string; mediaType: string } }[] = [];
+            const proxyResults: { name: string; callId: string; result: string; outcome?: ToolOutcomeKind; arguments: string; wireArguments: string; signature?: string; image?: { base64: string; mediaType: string } }[] = [];
             // #5220: the marker lines ACTUALLY streamed to the client this round
             // (deduped, same order as the stream). On a failed-only round this IS
             // the recovery receipt the retry body must carry — reconstructing it
@@ -1426,15 +1439,15 @@ export async function* runCompressLoop(
                         parsedArgs = {};
                     }
                     const result = await withSessionLock(ctx.session, () => executeProxyToolAsync(call.name, parsedArgs, ctx, call.callId, rawArgs, signal));
-                    proxyResults.push({ name: call.name, callId: call.callId, result: result.text, arguments: call.arguments, wireArguments: rawArgs === undefined ? call.arguments : MALFORMED_PROXY_TOOL_ARGS_REPLAY, signature: call.signature, ...(result.image ? { image: result.image } : {}) });
+                    proxyResults.push({ name: call.name, callId: call.callId, result: result.text, ...(result.outcome !== undefined ? { outcome: result.outcome } : {}), arguments: call.arguments, wireArguments: rawArgs === undefined ? call.arguments : MALFORMED_PROXY_TOOL_ARGS_REPLAY, signature: call.signature, ...(result.image ? { image: result.image } : {}) });
                     if (ctx.visibilityMarkers !== false) {
                         const markerKey = `${call.name}\u0000${result.text}`;
                         if (seenMarkers.has(markerKey)) {
                             ctx.log(`[acp-loop] suppressed duplicate ${call.name} status marker (identical failure repeated this request)`);
                         } else {
                             seenMarkers.add(markerKey);
-                            yield adapter.emitMarker(call.name, result.text);
-                            streamedMarkers.push(buildVisibilityMarker(call.name, result.text));
+                            yield adapter.emitMarker(call.name, result.text, result.outcome);
+                            streamedMarkers.push(buildVisibilityMarker(call.name, result.text, result.outcome));
                         }
                     }
                 } else {
@@ -1591,7 +1604,7 @@ export async function* runCompressLoop(
                             id: `acp_loop_r${round}_marker_${pr.callId}`,
                             role: "system",
                             contentType: "text",
-                            text: buildVisibilityMarker(pr.name, pr.result),
+                            text: buildVisibilityMarker(pr.name, pr.result, pr.outcome),
                         });
                         // #2701: visibility markers are CLIENT-side noise; they
                         // are streamed to the client (emitMarker) and deliberately

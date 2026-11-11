@@ -825,8 +825,8 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
             return buildToolUseBlock(clientIndex++, call);
         },
 
-        emitMarker(toolName, result) {
-            return buildTextBlock(clientIndex++, buildVisibilityMarker(toolName, result));
+        emitMarker(toolName, result, outcome) {
+            return buildTextBlock(clientIndex++, buildVisibilityMarker(toolName, result, outcome));
         },
 
         emitCompletion(opts?: EmitCompletionOpts) {
