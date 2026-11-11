@@ -45,14 +45,14 @@ test("v8 identity migration can finish with a JSON-null content row", () => {
 
         const migrated = migrateSchema(db);
         assert.equal(migrated.from, 7);
-        assert.equal(migrated.to, 11);
+        assert.equal(migrated.to, 12);
         const row = db.prepare("SELECT identity, content_hash FROM messages WHERE session_id = ?").get("null-session") as { identity: string; content_hash: string };
         assert.equal(row.identity, hash);
         assert.equal(row.content_hash, hash);
         const content = db.prepare("SELECT bytes, refcount FROM content WHERE hash = ?").get(hash) as { bytes: Uint8Array; refcount: number };
         assert.equal(Buffer.from(content.bytes).toString(), raw);
         assert.equal(content.refcount, 1);
-        assert.equal(migrateSchema(db).from, 11);
+        assert.equal(migrateSchema(db).from, 12);
     } finally {
         db?.close();
         if (previousZstd === undefined) delete process.env.BILI_PERSIST_ZSTD;

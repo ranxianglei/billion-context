@@ -282,13 +282,13 @@ CREATE TABLE IF NOT EXISTS message_media (
 -- #5874 snapshot-table compression foundation (v12): the single storage
 -- truth for the coherent-host compression base (sqlite twin in
 -- src/storage/schema.ts). post_json ALWAYS holds the canonical-core form
--- (never wire bytes — invariant v); pre_json holds CAS digest references
--- (ruling A). Rows are never physically deleted while their covering
--- block lives (active=0 deactivation; physical cleanup with the covering
--- block — ruling B / #3752 red line). l1_world.envelope_json holds the
--- canonical host-msgid envelope as an ordered JSON array of {id, pos}
--- (append-only pos, never reused); l1_world.session_id is the reverse
--- pointer so deleteSession can cascade.
+-- (never wire bytes — invariant v), and pre_json holds CAS digest
+-- references (ruling A). Rows are never physically deleted while their
+-- covering block lives (active=0 deactivation, physical cleanup with the
+-- covering block — ruling B / #3752 red line). l1_world.envelope_json
+-- holds the canonical host-msgid envelope as an ordered JSON array of
+-- {id, pos} (append-only pos, never reused). l1_world.session_id is the
+-- reverse pointer so deleteSession can cascade.
 CREATE TABLE IF NOT EXISTS l1_world (
     sess_raw          VARCHAR(255) NOT NULL PRIMARY KEY,
     session_id        VARCHAR(255) NOT NULL,
