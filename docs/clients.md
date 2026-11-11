@@ -204,9 +204,10 @@ spawn mode (a loopback proxy target is never proxied, so the MITM envs are
 simply bypassed); already-routed `/bili/`-prefixed requests pass through
 untouched except for header stamping. Known limitation: manual
 `/compact` has no dsh-side event hook, so its boundary is left to the
-kernel's natural ingest diff (auto-compaction is now off everywhere — host
-plane via the bundle patch, web-profile presets via the #3354 load-time
-overlay; see the web-profile note above).
+kernel's natural ingest diff (auto-compaction is off everywhere while
+bili-native owns the lane — host plane via the bundle patch, web-profile
+presets via the #3354 load-time overlay; a disable restores stock since
+#5248; see the web-profile note above).
 
 **Host-side context meters diverge from the model's view by design (#2837):**
 in plugin mode the host's durable session log
