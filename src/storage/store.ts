@@ -1819,12 +1819,80 @@ export class UnifiedStore {
         // tag-stripped identity), never the fresh legacy rows. Mapping onto
         // the fresh rows re-casts the whole prefix at new seqs every upgrade
         // and orphans the stable rows (host-removed + GC → pin lost).
+        // Coverage evidence computed BEFORE the plane indexes: a fold stamps
+        // coverage in THIS save's pass 3, so at index-construction time the
+        // covered rows are still ACTIVE — the indexes must exclude them
+        // explicitly (an active-only filter alone cannot see the fold that
+        // happens a few lines later in the same save).
+        // Id → pos (first occurrence in pos order) for coverage addressing:
+        // every alias in every plane row, then live rows without one.
+        const posById = new Map<string, number>();
+        for (const r of plane) for (const id of idsByPos.get(r.pos) ?? []) if (!posById.has(id)) posById.set(id, r.pos);
+        for (const l of live) if (!posById.has(l.msg_id)) posById.set(l.msg_id, l.seq);
+        // Covered PLANE pos (mirrors the kernel's coverage evidence): effIds
+        // → pos (aliases survive remint — the plane row keeps every id the
+        // content ever had) ∪ the block's durable table interval, TRANSLATED
+        // through the fold-time rows: the interval is LEGACY-seq space (fold
+        // time), and after a remint round the legacy table re-appends under
+        // new seqs while the plane keeps its own stable pos — so the raw
+        // interval must never be read as plane pos directly.
+        const coveredPos = new Set<number>();
+        const coveredLegacySeqs = new Set<number>(); // legacy-seq space — materialization
+        const blockEffIds = (b: { payload_json: string | null }): string[] => {
+            if (!b.payload_json) return [];
+            try {
+                const p = JSON.parse(b.payload_json) as { effectiveMessageIds?: unknown };
+                return Array.isArray(p.effectiveMessageIds) ? (p.effectiveMessageIds as string[]) : [];
+            } catch {
+                return [];
+            }
+        };
+        {
+            const intervalSeqs = new Set<number>();
+            for (const b of activeBlocks) if (b.start_seq >= 0 && b.end_seq >= b.start_seq) for (let s = b.start_seq; s <= b.end_seq; s++) intervalSeqs.add(s);
+            if (intervalSeqs.size > 0) {
+                // Fold-time rows — RETIRED ones included: the sweep retires the
+                // reminted originals but they stay queryable. One bounded
+                // query per interval.
+                for (const b of activeBlocks) {
+                    if (b.start_seq < 0 || b.end_seq < b.start_seq) continue;
+                    const rows = this.db
+                        .prepare("SELECT seq, msg_id FROM messages WHERE session_id = ? AND seq BETWEEN ? AND ?")
+                        .all(sid, b.start_seq, b.end_seq) as { seq: number; msg_id: string }[];
+                    for (const row of rows) {
+                        const p = posById.get(row.msg_id);
+                        if (p !== undefined && p >= 0) coveredPos.add(p);
+                    }
+                }
+                for (const s of intervalSeqs) coveredLegacySeqs.add(s);
+            }
+        }
+        for (const b of activeBlocks) {
+            for (const id of blockEffIds(b)) {
+                const p = posById.get(id);
+                if (p !== undefined && p >= 0) coveredPos.add(p);
+                for (const li of liveById.get(id) ?? []) coveredLegacySeqs.add(live[li]!.seq);
+            }
+        }
+
         const planeIdx = plane.map((r, i) => (r.pos >= 0 ? i : -1)).filter((i) => i >= 0);
         const planeById = new Map<string, number[]>();
         const planeByIdentity = new Map<string, number[]>();
         const rowIdentity = new Map<number, string>(); // plane idx → tag-stripped identity
+        let maxUpdateViewIdx = -1;
+        const reentryCandidates: number[] = [];
         for (const i of planeIdx) {
             const r = plane[i]!;
+            // Same doctrine as the identity index below: the view never
+            // presents a covered row, so an id equal to a covered row's id is
+            // a REMINT collision (the kernel re-mints a fresh instance onto a
+            // folded row's id after the fold) — it must be cast as a fresh
+            // row at its own ledger seq, never update the covered row in
+            // place (that re-activates the folded slot and parks the new
+            // content at the original's position: the golden's repeated
+            // "running a check" row was re-homed onto pos 2 that way, and the
+            // egress served it as a stray mid-history message).
+            if (r.active !== 1 || coveredPos.has(r.pos)) continue;
             for (const id of idsByPos.get(r.pos) ?? []) {
                 const a = planeById.get(id);
                 if (a) a.push(i);
@@ -1846,6 +1914,18 @@ export class UnifiedStore {
             }
             if (!id2) continue;
             rowIdentity.set(i, id2);
+            // Identity is a WEAK address: it collides across duplicate content
+            // (e.g. a model that returns the identical reply N times — every
+            // instance shares one content-hash base, the kernel re-mints each
+            // with a _k suffix). The view NEVER presents a covered message
+            // (it is folded into its block's summary), so a covered row can
+            // only be an identity match for a NEW instance of that content —
+            // which must be cast as a fresh row, never update the covered one
+            // in place (that stole the covered row's pos and re-ordered the
+            // egress: the new reply parked at a folded row's ledger slot).
+            // Only ACTIVE rows are identity-match candidates; the remint case
+            // (identity-seed upgrade) re-mints live messages, which are active.
+            if (r.active !== 1 || coveredPos.has(r.pos)) continue;
             const a = planeByIdentity.get(id2);
             if (a) a.push(i);
             else planeByIdentity.set(id2, [i]);
@@ -1929,63 +2009,116 @@ export class UnifiedStore {
             const coreIds = new Set<string>([m.id]);
             if (l.msg_id !== m.id) coreIds.add(l.msg_id);
             const p = planeByPos.get(l.seq);
-            if (!p) {
-                events.push({ ev: "cast", pos: l.seq, coreIds: [...coreIds], preJson: null, postJson: stored, tokensEst });
-                continue;
-            }
-            const merged = [...coreIds, ...idsByPos.get(l.seq)!.filter((id) => !coreIds.has(id))];
-            if (p.active === 0 || p.post_json !== stored || p.core_ids !== JSON.stringify(merged)) {
-                events.push({ ev: "update", pos: l.seq, postJson: stored, coreIds: merged, tokensEst });
+            if (p) {
+                const merged = [...coreIds, ...idsByPos.get(l.seq)!.filter((id) => !coreIds.has(id))];
+                if (p.active === 0 || p.post_json !== stored || p.core_ids !== JSON.stringify(merged)) {
+                    events.push({ ev: "update", pos: l.seq, postJson: stored, coreIds: merged, tokensEst });
+                }
+                maxUpdateViewIdx = Math.max(maxUpdateViewIdx, vi);
+            } else {
+                // New content → fresh row from the legacy ledger. Normally a
+                // TAIL append (pos = fresh legacy seq). If the kernel instead
+                // placed it BEFORE existing content (mid-history re-entry —
+                // e.g. the user edited an old row after compression and the
+                // re-sent transcript carries the edit in mid position), the
+                // egress — which serves plane rows in pos order — would park
+                // it at the end and drift from the kernel's order (golden
+                // drift on every body after the edit). Re-home it in a
+                // post-pass below (mappedPos must be final first).
+                const castAt = { ev: "cast" as const, pos: l.seq, coreIds: [...coreIds], preJson: null, postJson: stored, tokensEst };
+                events.push(castAt);
+                maxUpdateViewIdx = Math.max(maxUpdateViewIdx, vi);
+                reentryCandidates.push(vi);
             }
         }
-        // Id → pos (first occurrence in pos order) for coverage addressing:
-        // every alias in every plane row, then live rows without one.
-        const posById = new Map<string, number>();
-        for (const r of plane) for (const id of idsByPos.get(r.pos) ?? []) if (!posById.has(id)) posById.set(id, r.pos);
-        for (const l of live) if (!posById.has(l.msg_id)) posById.set(l.msg_id, l.seq);
-        // Covered PLANE pos (mirrors the kernel's coverage evidence): effIds
-        // → pos (aliases survive remint — the plane row keeps every id the
-        // content ever had) ∪ the block's durable table interval, TRANSLATED
-        // through the fold-time rows: the interval is LEGACY-seq space (fold
-        // time), and after a remint round the legacy table re-appends under
-        // new seqs while the plane keeps its own stable pos — so the raw
-        // interval must never be read as plane pos directly.
-        const coveredPos = new Set<number>();
-        const coveredLegacySeqs = new Set<number>(); // legacy-seq space — materialization
-        const blockEffIds = (b: { payload_json: string | null }): string[] => {
-            if (!b.payload_json) return [];
-            try {
-                const p = JSON.parse(b.payload_json) as { effectiveMessageIds?: unknown };
-                return Array.isArray(p.effectiveMessageIds) ? (p.effectiveMessageIds as string[]) : [];
-            } catch {
-                return [];
+        // Post-pass: re-home mid-history re-entries (see above). The old row
+        // this entry replaced is the single non-anchor plane row strictly
+        // between the mapped neighbors that no view entry claims (covered or
+        // active — the edit case finds it covered). Cast there (the upsert
+        // re-activates it, clears cover_ref, keeps its ids as aliases) so the
+        // plane's pos order reproduces the kernel's output order exactly;
+        // mappedPos then protects the pos from pass 2's deletes and pass 3's
+        // compacts. If no such row exists, fall back to the first FREE slot
+        // between the neighbors (the old row was physically GC'd), else keep
+        // the fresh tail pos. A cast whose content identity matches a COVERED
+        // row is the duplicate-reply shape (#3812): a NEW instance of content
+        // a block folded — the kernel serves the fresh copy as the newest
+        // message, it must stay a tail cast, never occupy a folded row's
+        // slot. (Pass 1 runs before pass 2/3 — the pre-flush plane row is
+        // ground truth, the same invariant pass 3 uses.)
+        if (reentryCandidates.length > 0) {
+            // Identity of EVERY non-anchor plane row (active and covered).
+            // A cast entry whose identity is already on the plane matched an
+            // existing row — or is a new instance of folded content (the
+            // #3812 duplicate-reply shape, which may collide with an ACTIVE
+            // row too: the first instance is still live when the second
+            // arrives). Either way the entry belongs at the live tail — the
+            // kernel serves it there — and must never be re-homed into an
+            // old row's slot (that parks a duplicate at the original's
+            // position and serves the content twice).
+            const planeSigs = new Set<string>();
+            for (const i of planeIdx) {
+                const pr = plane[i]!;
+                if (pr.pos < 0) continue;
+                const rid = rowIdentity.get(i);
+                if (rid) planeSigs.add(rid);
             }
-        };
-        {
-            const intervalSeqs = new Set<number>();
-            for (const b of activeBlocks) if (b.start_seq >= 0 && b.end_seq >= b.start_seq) for (let s = b.start_seq; s <= b.end_seq; s++) intervalSeqs.add(s);
-            if (intervalSeqs.size > 0) {
-                // Fold-time rows — RETIRED ones included: the sweep retires the
-                // reminted originals but they stay queryable. One bounded
-                // query per interval.
-                for (const b of activeBlocks) {
-                    if (b.start_seq < 0 || b.end_seq < b.start_seq) continue;
-                    const rows = this.db
-                        .prepare("SELECT seq, msg_id FROM messages WHERE session_id = ? AND seq BETWEEN ? AND ?")
-                        .all(sid, b.start_seq, b.end_seq) as { seq: number; msg_id: string }[];
-                    for (const row of rows) {
-                        const p = posById.get(row.msg_id);
-                        if (p !== undefined && p >= 0) coveredPos.add(p);
+            for (const vi of reentryCandidates) {
+                const m = view[vi]!;
+                const vid = viewIdentity(m);
+                if (vid && planeSigs.has(vid)) continue; // duplicate-instance / stale-content shape
+                let prevVi = -1;
+                for (let k = vi - 1; k >= 0; k--) {
+                    if (seqAt[k] !== undefined) {
+                        prevVi = k;
+                        break;
                     }
                 }
-                for (const s of intervalSeqs) coveredLegacySeqs.add(s);
-            }
-        }
-        for (const b of activeBlocks) {
-            for (const id of blockEffIds(b)) {
-                const p = posById.get(id);
-                if (p !== undefined && p >= 0) coveredPos.add(p);
-                for (const li of liveById.get(id) ?? []) coveredLegacySeqs.add(live[li]!.seq);
+                if (prevVi < 0) continue; // no earlier mapped entry → true tail append
+                const lo = (seqAt[prevVi] ?? -1) + 1;
+                const laterPos: number[] = [];
+                for (let k = vi + 1; k < view.length; k++) {
+                    const s = seqAt[k];
+                    if (s !== undefined) laterPos.push(s);
+                }
+                const hi = laterPos.length ? Math.min(...laterPos) : Infinity;
+                // locate this entry's cast event: the cast whose coreIds lead
+                // with the view id (re-homed casts keep the new id first —
+                // old ids are appended, never prepended).
+                const castEv = events.find((e) => e.ev === "cast" && (e as { coreIds?: string[] }).coreIds?.[0] === (typeof m.id === "string" ? m.id : ""));
+                if (castEv === undefined || castEv.ev !== "cast") continue;
+                // Only an INVERSION is a re-entry: the fresh tail pos sorts
+                // after a row the view places LATER. A true tail append
+                // (no later-mapped row, or all later rows at higher pos)
+                // keeps its fresh pos untouched.
+                if (laterPos.length === 0 || Math.min(...laterPos) > castEv.pos) continue;
+                if (lo >= hi) continue;
+                // The REPLACED row is identified by its retired legacy row:
+                // the client's re-sent transcript still carries every
+                // unchanged (covered) row, so their legacy rows are alive;
+                // only the edited row's old content is absent from the
+                // re-send and was swept (retired). An unmapped plane row in
+                // the window whose legacy row is gone is the unique edit
+                // target. Unmapped rows with a LIVE legacy row are ordinary
+                // covered siblings — leave them alone.
+                const liveSeqs = new Set(live.map((r) => r.seq));
+                const candidates = plane.filter((pr) => pr.pos >= lo && pr.pos < hi && !mappedPos.has(pr.pos) && !liveSeqs.has(pr.pos));
+                let target: number | undefined;
+                if (candidates.length === 1) {
+                    target = candidates[0]!.pos;
+                    const oldIds = idsByPos.get(target) ?? [];
+                    castEv.coreIds = [castEv.coreIds[0]!, ...oldIds.filter((id) => !castEv.coreIds.includes(id))];
+                    mappedPos.add(target);
+                } else if (candidates.length === 0) {
+                    const taken = new Set<number>([...mappedPos, ...(events.filter((e) => e.ev === "cast").map((e) => e.pos)), ...plane.map((r) => r.pos), ...live.map((r) => r.seq)]);
+                    for (let p2 = lo; p2 < hi; p2++) {
+                        if (!taken.has(p2)) {
+                            target = p2;
+                            break;
+                        }
+                    }
+                }
+                if (target !== undefined) castEv.pos = target;
             }
         }
         // Pass 2: deletions — an active row the view no longer presents and
@@ -2000,80 +2133,6 @@ export class UnifiedStore {
             }
             if (mappedPos.has(r.pos) || coveredPos.has(r.pos)) continue;
             events.push({ ev: "delete", pos: r.pos });
-        }
-        // Pinned opening wire message span (#2733/#3642): the first role
-        // user row of the view, extended over its wireIndex core run — the
-        // kernel serves these even when covered, so their rows stay active
-        // (carved out of the compact ranges below).
-        const viewWireOf = (i: number): number | undefined => {
-            // #3642: wireIndex is a runtime core field (set by every codec,
-            // not declared on CoreMessage) — same local-cast pattern as
-            // kernel/src/prune.ts's wireIndexOf.
-            const w = (view[i] as { wireIndex?: number } | undefined)?.wireIndex;
-            return typeof w === "number" ? w : undefined;
-        };
-        const pinStart = view.findIndex((m) => m.role === "user");
-        let pinLo = -1;
-        let pinHi = -1;
-        if (pinStart >= 0) {
-            // The kernel's first-user pin is UNCONDITIONAL (DESIGN §8.1);
-            // the wireIndex only EXTENDS the run to the rest of the opening
-            // wire message's cores. A single-core pin (no wireIndex) still
-            // carves out its one row — compacting it would let snapGc
-            // delete the pin row when its covering block is later folded
-            // away, and the egress would then diverge from the kernel
-            // (which keeps serving the pin from the client's resend).
-            const w = viewWireOf(pinStart);
-            let hi = pinStart;
-            if (w !== undefined) {
-                while (hi + 1 < view.length && view[hi + 1]!.role === "user" && viewWireOf(hi + 1) === w) hi++;
-            }
-            const posA: number[] = [];
-            for (let i = pinStart; i <= hi; i++) {
-                const s = seqAt[i];
-                if (s !== undefined) posA.push(s);
-            }
-            if (posA.length) {
-                pinLo = Math.min(...posA);
-                pinHi = Math.max(...posA);
-            }
-        }
-        // (b) The TRANSCRIPT pin: the plane's first user row (stored bytes).
-        // In a D-on session the kernel's own pin (the view's first user) does
-        // NOT include it — the D lane drops covered rows before the kernel,
-        // so the transcript's first user is usually absent from the view —
-        // but the egress serves it anyway (pin-first doctrine: providers
-        // reject a conversation that starts without a user message), so its
-        // row must survive the compacts below.
-        let tPinLo = -1;
-        let tPinHi = -1;
-        {
-            const roleOf = (r: { post_json: string | null }): { role?: string; wireIndex?: number } | null => {
-                if (typeof r.post_json !== "string" || !r.post_json) return null;
-                try {
-                    const o = JSON.parse(r.post_json) as { role?: unknown; wireIndex?: unknown };
-                    return o && typeof o === "object" ? (o as { role?: string; wireIndex?: number }) : null;
-                } catch {
-                    return null;
-                }
-            };
-            let i0 = -1;
-            for (let i = 0; i < plane.length; i++) {
-                const r = plane[i]!;
-                if (r.pos < 0) continue;
-                if (roleOf(r)?.role === "user") { i0 = i; break; }
-            }
-            if (i0 >= 0) {
-                const w0 = roleOf(plane[i0]!)?.wireIndex;
-                let i1 = i0;
-                if (typeof w0 === "number") {
-                    while (i1 + 1 < plane.length && plane[i1 + 1]!.pos >= plane[i0]!.pos && roleOf(plane[i1 + 1]!)?.role === "user" && roleOf(plane[i1 + 1]!)?.wireIndex === w0) i1++;
-                }
-                const span: number[] = [];
-                for (let i = i0; i <= i1; i++) span.push(plane[i]!.pos);
-                tPinLo = Math.min(...span);
-                tPinHi = Math.max(...span);
-            }
         }
         // Materialize covered rows that the plane has never recorded
         // (migration seed / first tagged save after a block already exists):
