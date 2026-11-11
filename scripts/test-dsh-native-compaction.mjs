@@ -15,6 +15,7 @@ const policy = await import('../dist/agent/dsh-native-compaction.js');
 policy.configureNativeCompaction([{ model: 'gpt-*' }]);
 const ctx = new Context();
 const calls = [];
+let mergeCalls = 0;
 let fail = false;
 let failAt = Infinity;
 await ctx.plugin(c => c.reflect.provide('llm', {
@@ -22,6 +23,11 @@ await ctx.plugin(c => c.reflect.provide('llm', {
     resolveModelInfo: async (_provider, model) => ({ context: { contextWindow: model === 'gpt-luna' ? 272000 : 18000 }, defaultMaxTokens: 100 }),
     async *stream(options) {
         assert.equal(policy.nativeSummaryActive(), true);
+        if (options.messages.some(m => m.content?.some(b => b.text?.startsWith('Partial historical summary:')))) {
+            mergeCalls++;
+            assert.match(options.messages.at(-2).content[0].text, /Summary assembly instruction/);
+            assert.match(options.messages.at(-1).content[0].text, /You are now acting as a compaction engine/);
+        }
         const cost = options.messages.reduce((n, m) => n + ctx.tokenMeter.estimateMessage(m), 0);
         const toolsTokens = options.tools?.length ? Math.ceil(JSON.stringify(options.tools).length / 4) + 4 : 0;
         const window = options.model === 'gpt-luna' ? 272000 : 18000;
@@ -113,5 +119,6 @@ try {
     failAt = Infinity;
     assert.ok(await engine.compactIfNeeded(late, 'pressure'), 'the failed session remains retryable');
     assert.equal(late.session.surface.replaceGeneration, 1);
+    assert.ok(mergeCalls > 0, 'the real host receives scoped partial summaries and assembly instructions');
     console.log(JSON.stringify({ result: 'passed', realDSH: '0.2.2-rc.1', summaryCalls: calls.length, originalSurfaceNodes: originalCount, finalSurfaceNodes: agent.session.surface.nodes.length, generation: agent.session.surface.replaceGeneration, largeCatalog: { tools: tools.length, summaryCalls: largeCalls.length, beforeTokens: largeBefore, afterTokens: ctx.tokenMeter.measure(large.session).totalTokens } }));
 } finally { await ctx.fiber.dispose(); }

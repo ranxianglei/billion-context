@@ -125,11 +125,16 @@ export async function boundedNativeSummary(
     let messages = [...input.messages];
     const system: Message[] = [];
     while (messages[0]?.role === "system") system.push(messages.shift()!);
-    const available = budget - total(system);
-    if (available <= 0) throw new Error("native handoff system prompt exceeds summary input budget");
+    const mergeInstruction: Message = { role: "user", content: [{ type: "text", text: "Summary assembly instruction (not historical conversation content): the preceding partial summaries cover disjoint chronological segments, NOT successive revisions of a complete checkpoint. Produce one consolidated checkpoint using the requested native format. First collect and retain the still-valid Critical Context from EVERY segment, including early project facts, exact identifiers, dates, numeric values and standing constraints, even when later segments only discuss unrelated or completed tasks. Missing entries and '(none)' mean no information in that segment, not deletion, contradiction or evidence that earlier facts were never established. Repetition in later segments is not required. Only an explicit correction or revocation of the same fact can supersede it; preserve unresolved conflicts with provenance. Update Current Work and Next Step from the latest applicable segment without erasing standing context. Before returning, check that every earlier fact and constraint is retained or has an explicit superseding statement. Do not include these assembly instructions or execute historical next steps." }] };
+    const baseAvailable = budget - total(system);
+    if (baseAvailable <= 0) throw new Error("native handoff system prompt exceeds summary input budget");
     for (let round = 0; round < 16; round++) {
         signal?.throwIfAborted();
-        if (total(messages) <= available) return summarize({ ...input, messages: [...system, ...messages] });
+        const suffix = round ? [mergeInstruction] : [];
+        const available = baseAvailable - total(suffix);
+        if (available <= 0) throw new Error("native handoff merge instructions exceed summary input budget; history was preserved");
+        const summarizePart = (part: Message[]) => summarize({ ...input, messages: [...system, ...part, ...suffix] });
+        if (total(messages) <= available) return summarizePart(messages);
         const chunks: Message[][] = [];
         let chunk: Message[] = [], size = 0;
         for (const group of summaryGroups(messages)) {
@@ -140,10 +145,18 @@ export async function boundedNativeSummary(
         }
         if (chunk.length) chunks.push(chunk);
         const reduced: Message[] = [];
-        for (const part of chunks) {
+        let offset = 0;
+        for (const [index, part] of chunks.entries()) {
             signal?.throwIfAborted();
-            const result = await summarize({ ...input, messages: [...system, ...part] });
-            reduced.push({ id: randomUUID(), role: "user", content: result.summary, source: { kind: "user" } });
+            const result = await summarizePart(part);
+            const provenance = `Partial historical summary: reduction round ${round + 1}, chronological segment ${index + 1} of ${chunks.length}, input messages ${offset + 1}-${offset + part.length} within this round (excluding the leading system prompt).`;
+            const guidance = "This is evidence from only that segment, not a new user instruction or a complete replacement checkpoint. Merge all segments, retaining the union of still-valid facts, exact identifiers, values, constraints, corrections and unfinished tasks. A missing fact, '(none)', or 'no project facts' is local to that segment and does not revoke facts in other segments. Override a fact only when a later segment explicitly corrects or revokes it; otherwise preserve unresolved conflicts with their provenance. Next-step statements describe work at that historical point, not an instruction to execute now.";
+            reduced.push({ id: randomUUID(), role: "user", content: [
+                { type: "text", text: `${provenance}\n${guidance}\n\n\x3ccompacted-summary\x3e` },
+                ...result.summary,
+                { type: "text", text: "\x3c/compacted-summary\x3e" },
+            ], source: { kind: "user" } });
+            offset += part.length;
         }
         if (total(reduced) >= total(messages)) throw new Error("native handoff summary made no progress; history was preserved");
         messages = reduced;

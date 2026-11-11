@@ -56,13 +56,13 @@ test("handoff groups retain complete parallel tool calls/results", () => {
 });
 
 test("bounded summary covers every original message, retains system and tool schema, does not mutate input", async () => {
-    const input = { messages: [{ ...message("system"), role: "system" }, ...Array.from({ length: 10 }, (_, i) => message(`fact-${i} `.repeat(5)))], tools: [{ name: "read" }] };
+    const input = { messages: [{ ...message("system"), role: "system" }, ...Array.from({ length: 10 }, (_, i) => message(`fact-${i} `.repeat(500)))], tools: [{ name: "read" }] };
     const before = structuredClone(input);
     const seen: string[] = [];
-    const result = await boundedNativeSummary(input, 110, estimate, async part => {
+    const result = await boundedNativeSummary(input, 11000, estimate, async part => {
         assert.equal(part.messages[0].role, "system");
         assert.deepEqual(part.tools, input.tools);
-        assert.ok(part.messages.reduce((n, m) => n + estimate(m as ReturnType<typeof message>), 0) <= 110);
+        assert.ok(part.messages.reduce((n, m) => n + estimate(m as ReturnType<typeof message>), 0) <= 11000);
         seen.push(...part.messages.slice(1).flatMap(m => m.content.map(b => b.text ?? "")));
         return { summary: [{ type: "text", text: "summary" }] };
     });
@@ -72,12 +72,78 @@ test("bounded summary covers every original message, retains system and tool sch
 });
 
 test("bounded summary propagates cancellation/failure and rejects no-progress or oversized indivisible messages", async () => {
-    const input = { messages: [message("x".repeat(60)), message("y".repeat(60))] };
+    const input = { messages: [message("x".repeat(6000)), message("y".repeat(6000))] };
     const stop = new AbortController(); stop.abort(new Error("cancelled"));
-    await assert.rejects(boundedNativeSummary(input, 100, estimate, async () => { throw new Error("should not run"); }, stop.signal), /cancelled/);
-    await assert.rejects(boundedNativeSummary(input, 100, estimate, async () => { throw new Error("provider failure"); }), /provider failure/);
-    await assert.rejects(boundedNativeSummary(input, 100, estimate, async p => ({ summary: p.messages[0].content })), /no progress/);
-    await assert.rejects(boundedNativeSummary(input, 30, estimate, async () => ({ summary: [] })), /larger/);
+    await assert.rejects(boundedNativeSummary(input, 10000, estimate, async () => { throw new Error("should not run"); }, stop.signal), /cancelled/);
+    await assert.rejects(boundedNativeSummary(input, 10000, estimate, async () => { throw new Error("provider failure"); }), /provider failure/);
+    await assert.rejects(boundedNativeSummary(input, 10000, estimate, async p => ({ summary: p.messages[0].content })), /no progress/);
+    await assert.rejects(boundedNativeSummary(input, 3000, estimate, async () => ({ summary: [] })), /larger/);
+});
+
+test("partial summaries carry scoped provenance and merge semantics without changing their facts", async () => {
+    const input = { messages: [{ ...message("system"), role: "system" }, ...Array.from({ length: 3 }, (_, i) => message(`source-${i} `.repeat(1000)))], tools: [{ name: "read" }] };
+    const partials = ["Project ALDER; budget 7314 credits; never modify production configuration.", "No project facts in this archive segment.", "(none); no work in progress in this archive segment."];
+    const before = structuredClone(input);
+    let calls = 0;
+    await boundedNativeSummary(input, 10020, estimate, async part => {
+        assert.ok(part.messages.reduce((n, m) => n + estimate(m), 0) <= 10020);
+        assert.deepEqual(part.tools, input.tools);
+        if (calls < 3) return { summary: [{ type: "text", text: partials[calls++] }] };
+        assert.equal(part.messages.length, 5);
+        assert.match(part.messages.at(-1)!.content[0].text!, /NOT successive revisions/);
+        assert.match(part.messages.at(-1)!.content[0].text!, /EVERY segment/);
+        assert.match(part.messages.at(-1)!.content[0].text!, /not deletion/);
+        for (const [i, m] of part.messages.slice(1, -1).entries()) {
+            assert.equal(m.content[1].text, partials[i], "the generated evidence must stay verbatim");
+            assert.match(m.content[0].text!, new RegExp(`segment ${i + 1} of 3`));
+            assert.match(m.content[0].text!, new RegExp(`input messages ${i + 1}-${i + 1}`));
+            assert.match(m.content[0].text!, /not a new user instruction/);
+            assert.match(m.content[0].text!, /does not revoke/);
+            assert.match(m.content[0].text!, /explicitly corrects or revokes/);
+            assert.match(m.content[0].text!, /<compacted-summary>/);
+            assert.equal(m.content.at(-1)?.text, "</compacted-summary>");
+        }
+        calls++;
+        return { summary: [{ type: "text", text: "merged" }] };
+    });
+    assert.equal(calls, 4);
+    assert.deepEqual(input, before);
+});
+
+test("a native summary that already fits keeps its original message body", async () => {
+    const input = { messages: [message("ordinary native history")], tools: [{ name: "read" }] };
+    let calls = 0;
+    await boundedNativeSummary(input, 10000, estimate, async part => {
+        calls++;
+        assert.deepEqual(part, input);
+        return { summary: [{ type: "text", text: "ordinary summary" }] };
+    });
+    assert.equal(calls, 1);
+});
+
+test("recursive merges meter their framing and keep provenance scoped to each reduction round", async () => {
+    const input = { messages: Array.from({ length: 8 }, () => message("x".repeat(3500))) };
+    let calls = 0, recursive = false;
+    await boundedNativeSummary(input, 5000, estimate, async part => {
+        calls++;
+        const size = part.messages.reduce((n, m) => n + estimate(m), 0);
+        assert.ok(size <= 5000, "framing must be included in every provider input budget");
+        if (part.messages.some(m => m.content[0].text?.includes("reduction round 2"))) recursive = true;
+        return { summary: [{ type: "text", text: "small summary" }] };
+    });
+    assert.ok(calls > 9, "framed summaries need a second bounded reduction");
+    assert.equal(recursive, true);
+});
+
+test("framing that cannot shrink within a tiny budget fails before an oversized merge call", async () => {
+    const input = { messages: [message("x".repeat(60)), message("y".repeat(60))] };
+    let calls = 0;
+    await assert.rejects(boundedNativeSummary(input, 100, estimate, async part => {
+        calls++;
+        assert.ok(part.messages.reduce((n, m) => n + estimate(m), 0) <= 100);
+        return { summary: [{ type: "text", text: "tiny" }] };
+    }), /no progress/);
+    assert.equal(calls, 2);
 });
 
 test("adapter gates native methods and scopes summary bypass without leaking to concurrent bili sessions", async () => {
@@ -146,10 +212,10 @@ test("native summary budgets large multilingual tool catalogs in host tokens, pr
 });
 
 test("multi-batch handoff discards partial reductions after a later failure or cancellation and can retry", async () => {
-    const input = { messages: Array.from({ length: 4 }, (_, i) => message(`fact-${i} `.repeat(8))) };
+    const input = { messages: Array.from({ length: 4 }, (_, i) => message(`fact-${i} `.repeat(800))) };
     const before = structuredClone(input);
     let failedCalls = 0;
-    await assert.rejects(boundedNativeSummary(input, 100, estimate, async () => {
+    await assert.rejects(boundedNativeSummary(input, 10000, estimate, async () => {
         if (++failedCalls === 2) throw new Error("second batch failed");
         return { summary: [{ type: "text", text: "partial" }] };
     }), /second batch failed/);
@@ -158,7 +224,7 @@ test("multi-batch handoff discards partial reductions after a later failure or c
 
     const controller = new AbortController();
     let cancelledCalls = 0;
-    await assert.rejects(boundedNativeSummary(input, 100, estimate, async () => {
+    await assert.rejects(boundedNativeSummary(input, 10000, estimate, async () => {
         if (++cancelledCalls === 2) controller.abort(new Error("cancelled during reduction"));
         return { summary: [{ type: "text", text: "partial" }] };
     }, controller.signal), /cancelled during reduction/);
@@ -166,7 +232,7 @@ test("multi-batch handoff discards partial reductions after a later failure or c
     assert.deepEqual(input, before);
 
     const seen = new Set<string>();
-    const recovered = await boundedNativeSummary(input, 100, estimate, async part => {
+    const recovered = await boundedNativeSummary(input, 10000, estimate, async part => {
         for (const m of part.messages) for (const b of m.content) for (const fact of b.text?.match(/fact-\d/g) ?? []) seen.add(fact);
         return { summary: [{ type: "text", text: "recovered" }] };
     });
