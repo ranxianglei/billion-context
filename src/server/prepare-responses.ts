@@ -117,6 +117,10 @@ export async function prepareResponses(
     // provider's retained chain carries the rest) — gates the developer
     // message re-injection and the previous_response_id strip below.
     let deltaServed = false;
+    // 2×2 Part B: a persisted delta frontier existed BEFORE this round's
+    // outbound selection (the provider's retained context equals exactly the
+    // elements sent up to it) — see the strip site below for the contract.
+    let hadFrontier = false;
     let sysNotes: string[] = [];
     // #3713: billed tokens of the #1638-masked mid-history sys/dev items — they
     // ride the rebuilt input verbatim yet enter neither projection.msgs nor
@@ -464,6 +468,13 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         // state) → reseed (full send, frontier reset).
         const chains = knobKeepResponseId() && typeof parsed.previous_response_id === "string" && parsed.previous_response_id.length > 0;
         const deltaState: DeltaState | null | undefined = chains ? (session.responsesDelta ?? null) : undefined;
+        // True once THIS proxy has established a delta chain with the provider
+        // (a persisted frontier exists). Only then may a non-delta round strip
+        // the id: the provider's retained context equals exactly the elements
+        // up to the frontier, so a full replay would duplicate it. Before the
+        // first frontier the native #1954 KEEP=1 contract holds (id forwarded
+        // intact, whatever the outbound is).
+        hadFrontier = deltaState !== undefined && deltaState !== null;
         let selectionFired = false;
         // #5874 P2 (mapEgress): the plane view is the outbound source;
         // the lane's exact chain (strip → drop → repair) is reapplied to it.
@@ -475,18 +486,25 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
             transform: (m) => repairResponsesAssistantOrdering(applyReasoningDrop(stripKernelSummaries(attachSubagentSessions(applyAbsorbView(m, session.state, loopConfig, tokenCount), session), turn.state), reasoningPlan, log, sessionId), originalMessages).messages,
             ...(deltaState !== undefined ? {
                 deltaState,
-                onSelection: (sel) => {
+                onSelection: (sel, totalElements) => {
                     selectionFired = true;
                     session.responsesDelta = sel.nextState;
-                    deltaServed = !sel.reseed && sel.delta.length > 0;
+                    // deltaServed = a PARTIAL delta went out: new content only.
+                    // A reseed (state lost / first round) and a full-resend
+                    // (delta grew to the whole view — isFullResend) both send
+                    // the FULL view, which must read as "no delta" for the id
+                    // handling below.
+                    deltaServed = !sel.reseed && sel.delta.length > 0 && sel.delta.length < totalElements;
                 },
             } : {}),
         });
         if (deltaState !== undefined && !selectionFired) {
             // Delta was requested but the plane degraded to legacy this round
-            // (the legacy bytes are the FULL replay and the id was stripped
-            // below) — the provider's chain no longer matches the stored
-            // frontier. Forget it: the next chained round re-seeds.
+            // (the legacy bytes are the FULL replay). With an established
+            // frontier the id is stripped below and the provider's chain no
+            // longer matches the stored frontier → forget it: the next chained
+            // round re-seeds. Without one (native KEEP=1 client, plane never
+            // seeded) nothing to forget — the native contract stays intact.
             session.responsesDelta = null;
         }
         if (deltaServed) {
@@ -730,10 +748,15 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
     // #1954: stripping is only lossless when input already holds the full
     // conversation. Warn when we strip a non-empty id so a native-chaining
     // (delta) continuation that loses its history is visible, not silent 200s.
-    // 2×2 Part B: a plane DELTA round KEEPS the id (the input is the unsent
-    // suffix — chaining is the whole point); a reseed round STRIPS it (the
-    // full input would otherwise duplicate the retained chain).
-    if (!knobKeepResponseId() || !deltaServed) {
+    // 2×2 Part B: the id is governed by the delta chain this proxy established
+    // (hadFrontier). NO prior frontier → native #1954 semantics: KEEP=1
+    // forwards the id intact regardless of what the outbound is (seed / full
+    // view / legacy — the pinned contract). WITH a prior frontier the provider
+    // retains exactly the sent elements, so only a PARTIAL delta keeps the id;
+    // a reseed / full-resend / degraded-legacy round STRIPS it (the chain
+    // breaks, the client re-chains from this round's fresh response id and the
+    // frontier re-seeds — one-round convergence, acceptance #7).
+    if (!knobKeepResponseId() || (hadFrontier && !deltaServed)) {
         const chainWarn = strippedResponseIdWarning(rebuilt.previous_response_id);
         if (chainWarn) log("warn", `[${sessionId}] ${chainWarn}`);
         delete rebuilt.previous_response_id;
