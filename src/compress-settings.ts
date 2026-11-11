@@ -4,7 +4,6 @@ import { findRoute, resolveModelEntryOnRoute, type CompressSettings, type NamedP
 import { configDir } from "./paths.js";
 import { log as loggerLog } from "./logger.js";
 import { expandExternalSummaryChainTolerant, type ExternalSummarySettings } from "./external-summary-settings.js";
-import { resolveCompressAtFoldPoint, resolveCompressAtFoldPointClearThinking } from "./knobs.js";
 import { shippedPacksSource } from "./chat-pack.js";
 
 export type { CompressSettings } from "./config.js";
@@ -58,6 +57,7 @@ export function mergeCompress(
     // like `prompts`: a model-level minToolTokens must not discard a
     // provider-level excludeTools.
     const absorbLevels = [global?.absorb, provider?.absorb, model?.absorb].filter(Boolean) as NonNullable<CompressSettings["absorb"]>[];
+    const blockOpsLevels = [global?.blockOps, provider?.blockOps, model?.blockOps].filter(Boolean) as NonNullable<CompressSettings["blockOps"]>[];
     const ccrLevels = [global?.ccr, provider?.ccr, model?.ccr].filter(Boolean) as NonNullable<CompressSettings["ccr"]>[];
     const searchLevels = [global?.search, provider?.search, model?.search].filter(Boolean) as NonNullable<CompressSettings["search"]>[];
     const reasoningLevels = [global?.reasoning, provider?.reasoning, model?.reasoning].filter(Boolean) as NonNullable<CompressSettings["reasoning"]>[];
@@ -94,6 +94,7 @@ export function mergeCompress(
         prompts: promptLevels.length > 0 ? Object.assign({}, ...promptLevels) : undefined,
         acknowledgePromptsRisk: pick("acknowledgePromptsRisk"),
         absorb: absorbLevels.length > 0 ? Object.assign({}, ...absorbLevels) : undefined,
+        blockOps: blockOpsLevels.length > 0 ? Object.assign({}, ...blockOpsLevels) : undefined,
         ccr: ccrLevels.length > 0 ? Object.assign({}, ...ccrLevels) : undefined,
         search: searchLevels.length > 0 ? Object.assign({}, ...searchLevels) : undefined,
         rules: pick("rules"),
@@ -112,10 +113,6 @@ export function mergeCompress(
         outputSteering: outputSteeringLevels.length > 0 ? Object.assign({}, ...outputSteeringLevels) : undefined,
         priceProfile: priceProfileLevels.length > 0 ? Object.assign({}, ...priceProfileLevels) : undefined,
         reconcile: pick("reconcile"),
-        // Experimental fold-point carrier relocation (env-resolved later, in
-        // applyCompressSettings; here only the file tiers cascade).
-        compressAtFoldPoint: pick("compressAtFoldPoint"),
-        compressAtFoldPointClearThinking: pick("compressAtFoldPointClearThinking"),
         promptPack: pick("promptPack"),
         // Whole-chain replace (same semantics as `tiers`/`rules`): an
         // `externalSummary` object at a deeper level replaces the entire
@@ -281,6 +278,9 @@ export function hasCompressSettings(s: CompressSettings): boolean {
   *    kernel DEFAULT_ABSORB_CONFIG, so a partial user block still resolves
   *    fully). Absent `s.absorb` leaves `base.absorb` untouched — the feature
   *    stays off unless some level enables it.
+  *  - `blockOps` → `blockOps` (kernel BlockOpsConfig, acp-kernel >= 0.0.194;
+  *    one switch: enabled = the three block-lifecycle tools ride the surface).
+  *    Absent `s.blockOps` leaves `base.blockOps` untouched — off by default.
   *  - `rules` → `rules = { enabled }` (kernel RuleFeatureConfig; limits stay
   *    at kernel defaults). Absent `s.rules` leaves `base.rules` untouched.
   *  - `ccr` → `ccr` (kernel CcrConfig, acp-kernel >= 0.0.84; the kernel runs
@@ -400,14 +400,10 @@ export function applyCompressSettings(base: Config, limit: number, s: CompressSe
         // expanded ExternalSummarySettings and never sees references.
         externalSummary: s.externalSummary !== undefined ? expandExternalSummaryChainTolerant(s.externalSummary, recipes) : (base as ResolvedKernelConfig).externalSummary,
         ...(absorb !== undefined ? { absorb } : {}),
+        // #5765: one-switch opt-in — absent `s.blockOps` leaves base untouched
+        // (off); a present block normalizes enabled (absent/false = off).
+        ...(s.blockOps !== undefined ? { blockOps: { enabled: s.blockOps.enabled === true } } : {}),
         ...(ccr !== undefined ? { ccr } : {}),
-        // Fold-point carrier relocation pair: explicit pass-through so an unset
-        // flag never leaks a stale base value into the resolved config.
-        compressAtFoldPoint: resolveCompressAtFoldPoint(process.env, s.compressAtFoldPoint),
-        compressAtFoldPointClearThinking: resolveCompressAtFoldPointClearThinking(
-            process.env,
-            s.compressAtFoldPointClearThinking,
-        ),
         ...(s.rules !== undefined ? { rules: { enabled: s.rules === true } } : {}),
     };
     return resolved;
@@ -441,13 +437,6 @@ export function resolveRequestConfig(
 ): ResolvedKernelConfig {
     const compress = resolveCompress(routes, embeddedUrl, model, globalCompress);
     const limit = resolveContextLimitValue(compress.modelContextLimit, native ?? base.modelContextLimit);
-    // #5470 opt-in reachability: an env-only enablement of either fold-point
-    // switch is invisible to hasCompressSettings (env never joins the file
-    // cascade), so without these checks such a lane would hit the short-circuit
-    // below and the knob would silently die. Both-falsy keeps the original
-    // short-circuit byte-for-byte (zero behavior change when nothing is set).
-    const cafAt = resolveCompressAtFoldPoint(process.env, compress.compressAtFoldPoint);
-    const cafCt = resolveCompressAtFoldPointClearThinking(process.env, compress.compressAtFoldPointClearThinking);
-    if (!hasCompressSettings(compress) && limit === base.modelContextLimit && !cafAt && !cafCt) return base;
+    if (!hasCompressSettings(compress) && limit === base.modelContextLimit) return base;
     return applyCompressSettings(base, limit, compress, namedProviders ?? {});
 }
