@@ -1770,7 +1770,7 @@ export class UnifiedStore {
      *  ingestSession — re-establishing trust from this process's own view.
      *  Cost: one full ingest per saved session per boot. */
     resetAllIngestWatermarks(): void {
-        this.db.prepare("UPDATE sessions SET last_ingested_seq = NULL").run();
+        this.db.prepare("UPDATE sessions SET last_ingested_seq = NULL WHERE last_ingested_seq IS NOT NULL").run();
     }
 
     /** #3248 lane-ownership probe for the message sweep (#3285): every ext
