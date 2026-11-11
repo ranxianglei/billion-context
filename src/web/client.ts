@@ -419,17 +419,33 @@ export const WEB_CLIENT = `(function () {
         return html;
     }
     window.bili_hostPluginBanner = bili_hostPluginBanner;
-    // #5079: one-time-per-instance upgrade notice — prompt_cache_key
-    // self-stamping is off by default now. Server decides active (effective
-    // routing "disabled" && not dismissed); pure builder, same test-seam
-    // convention as the banners above.
-    function bili_pckNoticeBanner(s) {
+    // #5548: single renderer for every built-in notice — tone carries the
+    // color (banner ok|warn); adding a notice never adds a builder again.
+    // #5548 P2: local announcements ship their own localized copy on the wire
+    // ({"zh-CN": …, "en": …} or a plain string) — pick the UI locale with the
+    // same fallback chain t() uses.
+    function bili_pickLoc(v) {
+        if (typeof v === "string") return v;
+        if (v && typeof v === "object") {
+            if (v[locale] !== undefined && typeof v[locale] === "string") return v[locale];
+            if (v["zh-CN"] !== undefined && typeof v["zh-CN"] === "string") return v["zh-CN"];
+            if (v.en !== undefined && typeof v.en === "string") return v.en;
+            const vals = Object.values(v);
+            const first = vals.find((x) => typeof x === "string");
+            if (first !== undefined) return first;
+        }
+        return "";
+    }
+    function bili_noticeBanner(s) {
         let html = '<div class="banner-title">' + escapeHtml(s.on) + "</div>";
-        html += '<div class="alert-row"><span>' + escapeHtml(s.desc) + '</span><button class="btn sm pck-notice-dismiss">' + escapeHtml(s.dismiss) + "</button></div>";
+        let row = '<div class="alert-row"><span>' + escapeHtml(s.desc) + "</span>";
+        if (s.cta && s.cta.url) row += '<a class="btn sm notice-cta" href="' + escapeHtml(s.cta.url) + '" target="_blank" rel="noopener noreferrer">' + escapeHtml(s.cta.label) + "</a>";
+        if (!s.hideDismiss) row += '<button class="btn sm notice-dismiss">' + escapeHtml(s.dismiss) + "</button>";
+        html += row + "</div>";
         html += '<div class="dim small" style="margin-top:6px">' + escapeHtml(s.hint) + "</div>";
         return html;
     }
-    window.bili_pckNoticeBanner = bili_pckNoticeBanner;
+    window.bili_noticeBanner = bili_noticeBanner;
     function $(id) { return document.getElementById(id); }
     function toast(message, kind) {
         const host = $("toast-host");
@@ -527,6 +543,80 @@ export const WEB_CLIENT = `(function () {
         if (!p || p === "unknown") return '<span class="dim small">' + escapeHtml(t("protocol.unmarked")) + "</span>";
         return '<span class="badge proto">' + escapeHtml(p) + "</span>";
     }
+    function bindSessionColumns() {
+        document.querySelectorAll(".twide table.data").forEach((table) => {
+            const cols = Array.from(table.querySelectorAll("col"));
+            const headers = Array.from(table.querySelectorAll("thead th"));
+            headers.forEach((header, index) => {
+                if (index === headers.length - 1) return;
+                const label = () => t("ses.resize_column") + ": " + header.textContent;
+                const existing = header.querySelector(".col-resize");
+                if (existing) {
+                    existing.title = t("ses.resize_column");
+                    existing.setAttribute("aria-label", label());
+                    return;
+                }
+                const handle = document.createElement("button");
+                handle.type = "button";
+                handle.className = "col-resize";
+                handle.title = t("ses.resize_column");
+                handle.setAttribute("aria-label", label());
+                const start = () => {
+                    const widths = headers.map((cell) => cell.getBoundingClientRect().width);
+                    const total = table.getBoundingClientRect().width;
+                    table.style.width = total + "px";
+                    table.style.minWidth = "100%";
+                    widths.forEach((width, i) => { if (width > 0) cols[i].style.width = width + "px"; });
+                    table.classList.add("columns-resized");
+                    return widths;
+                };
+                const resize = (initial, delta) => {
+                    const widths = initial.slice();
+                    const direction = delta >= 0 ? 1 : -1;
+                    const receiver = direction > 0 ? index : initial.findIndex((width, i) => i > index && width > 0);
+                    if (receiver < 0 || initial[receiver] <= 0) return;
+                    let remaining = Math.abs(delta);
+                    let transferred = 0;
+                    for (let i = direction > 0 ? index + 1 : index; i >= 0 && i < widths.length; i += direction) {
+                        const available = Math.max(0, initial[i] - (i === 0 ? 120 : 48));
+                        const amount = Math.min(remaining, available);
+                        widths[i] -= amount;
+                        transferred += amount;
+                        remaining -= amount;
+                        if (remaining === 0) break;
+                    }
+                    widths[receiver] += transferred;
+                    widths.forEach((width, i) => { if (initial[i] > 0) cols[i].style.width = width + "px"; });
+                };
+                handle.addEventListener("pointerdown", (ev) => {
+                    if (ev.button !== 0) return;
+                    ev.preventDefault();
+                    try { handle.setPointerCapture(ev.pointerId); } catch (err) {}
+                    let initial = null;
+                    const move = (e) => {
+                        if (!initial) initial = start();
+                        resize(initial, e.clientX - ev.clientX);
+                    };
+                    const stop = () => {
+                        handle.removeEventListener("pointermove", move);
+                        handle.removeEventListener("pointerup", stop);
+                        handle.removeEventListener("pointercancel", stop);
+                        handle.removeEventListener("lostpointercapture", stop);
+                    };
+                    handle.addEventListener("pointermove", move);
+                    handle.addEventListener("pointerup", stop);
+                    handle.addEventListener("pointercancel", stop);
+                    handle.addEventListener("lostpointercapture", stop);
+                });
+                handle.addEventListener("keydown", (ev) => {
+                    if (ev.key !== "ArrowLeft" && ev.key !== "ArrowRight") return;
+                    ev.preventDefault();
+                    resize(start(), ev.key === "ArrowRight" ? 20 : -20);
+                });
+                header.appendChild(handle);
+            });
+        });
+    }
     function hydrate() {
         document.documentElement.lang = locale;
         document.querySelectorAll("[data-i18n]").forEach((el) => { el.textContent = t(el.getAttribute("data-i18n")); });
@@ -534,6 +624,7 @@ export const WEB_CLIENT = `(function () {
         document.querySelectorAll("[data-i18n-title]").forEach((el) => { el.setAttribute("title", t(el.getAttribute("data-i18n-title"))); });
         const tog = $("language-toggle");
         if (tog) tog.textContent = locale === "zh-CN" ? "English" : "中文";
+        bindSessionColumns();
     }
 
     const PAGES = ["overview", "sessions", "config", "updates", "connect", "logs", "blog"];
@@ -629,6 +720,8 @@ export const WEB_CLIENT = `(function () {
             + (s.selfHeal ? ' <span class="badge live" style="background:#8a6d3b" title="' + escapeHtml(t("det.self_heal_tip")) + '">' + t("det.self_heal_short") + "</span>" : "")
             + (s.autoModeForge ? ' <span class="badge live" style="background:#6d3b8a" title="' + escapeHtml(t("det.auto_mode_forge_tip")) + '">' + t("det.auto_mode_forge_short") + "</span>" : "")
 + (s.keepalive ? ' <span class="badge live" style="background:#3b6d8a" title="' + escapeHtml(t("det.keepalive_tip") + " · " + s.keepalive.tierLabel + " · " + (s.keepalive.cadenceMs >= 60_000 ? Math.round(s.keepalive.cadenceMs / 60_000) + "min" : Math.round(s.keepalive.cadenceMs / 1000) + "s") + (s.keepalive.lastHitAt ? " · " + t("det.keepalive_last_hit") + " " + timeAgo(new Date(s.keepalive.lastHitAt).toISOString()) : "")) + '">' + t("det.keepalive_short") + "×" + s.keepalive.pingCount + "</span>" : "")
+            // #5796: long-running session — host-side history only grows, per-step cost climbs; badge points at the actionable exit.
+            + (s.slowSession ? ' <span class="badge live" style="background:#8a3b3b" title="' + escapeHtml(t("ses.slow_tip", { n: fmtW(s.slowSession.requests) })) + '">' + t("ses.slow_short") + "</span>" : "")
             + '<span class="row-id">' + escapeHtml(s.id) + "</span></a>";
     }
     // SAVED column prefers ledger-derived net savings; pre-tagging sessions fall back
@@ -956,6 +1049,15 @@ function changelogCatOf(rawLine) {
             // keep the stale paint; the cache keeps its old timestamp, so the next visit retries
         }).then(function () { blogRefreshBusy = false; });
     }
+    // Per-post discussion thread: the thread number is data, not inference — it reaches
+    // the client as item.discussion once the server-side passthrough lands (separate PR,
+    // see PR body) and the pipeline records a number for the post. Exact direct link only;
+    // a post without a recorded number simply shows no button (no guessed search URL).
+    function blogDiscussionUrl(item) {
+        return (typeof item.discussion === "number" && item.discussion > 0)
+            ? "https://github.com/ranxianglei/billion-context/discussions/" + item.discussion
+            : null;
+    }
     async function loadBlog(sub) {
         const host = $("bl-list");
         if (!host) return;
@@ -985,7 +1087,13 @@ function changelogCatOf(rawLine) {
             const kindLabel = item.kind === "post" ? t("bl.kind_post") : t("bl.kind_article");
             const title = zhOn && item.titleZh ? item.titleZh : (item.title || "");
             const html = zhOn ? (item.htmlZh || item.html || "") : (item.html || "");
-            host.innerHTML = offlineNote + '<div class="card"><div class="card-b"><span class="mono bl-date">' + escapeHtml(item.date || "\u2014") + '</span><span class="badge">' + escapeHtml(kindLabel) + '</span><a href="#/blog" class="bl-back">' + escapeHtml(t("bl.back")) + "</a></div>"
+            const dUrl = blogDiscussionUrl(item);
+            const commentLink = dUrl ? '<a class="bl-back" href="' + dUrl + '" target="_blank" rel="noopener">' + escapeHtml(t("bl.comment")) + "</a>" : "";
+            // Per-article language pin: ?lang= outranks the saved UI language (#2321), so plain
+            // links double as an in-page EN|中文 toggle. Labels stay self-describing on purpose.
+            const subHref = "#/blog/" + encodeURIComponent(String(item.id));
+            const langToggle = '<a class="bl-back" href="?lang=en' + subHref + '">EN</a> <a class="bl-back" href="?lang=zh' + subHref + '">\u4e2d\u6587</a>';
+            host.innerHTML = offlineNote + '<div class="card"><div class="card-b"><span class="mono bl-date">' + escapeHtml(item.date || "\u2014") + '</span><span class="badge">' + escapeHtml(kindLabel) + '</span><a href="#/blog" class="bl-back">' + escapeHtml(t("bl.back")) + "</a> " + langToggle + " " + commentLink + "</div>"
                 + '<h3 class="bl-h">' + escapeHtml(title) + "</h3>"
                 + '<div class="card-b post-body">' + html + "</div></div>";
             return;
@@ -1053,8 +1161,13 @@ function changelogCatOf(rawLine) {
         try {
             const r = await json(API_ROOT + "/update/check", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
             if (r.already) showUpdateResult(t("up.already_in_flight"), true);
-            else if (r.ok) showUpdateResult(t("up.check_ok"), true);
-            else showUpdateResult(String(r.error || t("toast.failed", { msg: "check failed" })), false);
+            else if (!r.ok) showUpdateResult(String(r.error || t("toast.failed", { msg: "check failed" })), false);
+            else if (r.status === "update-available") showUpdateResult(t("up.check_available", { v: String(r.candidate || r.latest || "") }), true);
+            else if (r.status === "up-to-date") showUpdateResult(t("up.check_up_to_date"), true);
+            else if (r.status === "blocked-advisory") showUpdateResult(t("up.check_blocked", { v: String(r.latest || "") }), true);
+            else if (r.status === "deferred-advisory") showUpdateResult(t("up.check_deferred"), true);
+            else if (r.note) showUpdateResult(String(r.note), true);
+            else showUpdateResult(t("up.check_ok"), true);
         } catch (e) {
             showUpdateResult(e.message, false);
         } finally {
@@ -1557,34 +1670,44 @@ function changelogCatOf(rawLine) {
                 hb.innerHTML = "";
             }
         }
-        // #5079: prompt_cache_key default-off upgrade notice — dismissal is
+        // #5548: built-in notices — one region, one loop; per-notice activity
+        // is decided server-side (src/notices.ts registry), dismissal stays
         // server-side (POST /__bili/notices/dismiss) so one close silences
-        // every browser; the banner re-renders from the refetched overview.
-        const nb = $("pck-notice-banner");
-        if (nb) {
-            const pn = d.pckNotice && typeof d.pckNotice === "object" ? d.pckNotice : null;
-            if (pn && pn.active === true) {
-                nb.hidden = false;
-                nb.classList.add("show");
-                nb.innerHTML = bili_pckNoticeBanner({ on: t("pckoff.on"), desc: t("pckoff.desc"), hint: t("pckoff.hint"), dismiss: t("pckoff.dismiss_btn") });
-                for (const btn of Array.from(nb.querySelectorAll(".pck-notice-dismiss"))) {
-                    btn.addEventListener("click", async () => {
-                        busy(btn, true);
-                        try {
-                            await json(API_ROOT + "/notices/dismiss", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id: typeof pn.id === "string" ? pn.id : "" }) });
-                            toast(t("pckoff.dismissed"), "ok");
-                            await loadOverview(true);
-                        } catch (e) {
-                            toast(e.message, "err");
-                        } finally {
-                            busy(btn, false);
-                        }
-                    });
+        // every browser. Tone + i18n keys come from the payload.
+        const nr = $("notices-banner-region");
+        if (nr) {
+            const list = Array.isArray(d.notices) ? d.notices : [];
+            nr.innerHTML = "";
+            for (const n of list) {
+                if (!n || typeof n !== "object" || typeof n.id !== "string") continue;
+                const el = document.createElement("div");
+                el.className = "banner " + (n.tone === "ok" ? "ok" : n.tone === "warn" ? "warn" : "");
+                // .banner is display:none until .show — #5548's loop never added it,
+                // so every merged notice (builtin + file + feed) rendered invisibly.
+                el.classList.add("show");
+                el.dataset.id = n.id;
+                nr.appendChild(el);
+                if (n.source !== "builtin") {
+                    el.innerHTML = bili_noticeBanner({ on: bili_pickLoc(n.title), desc: bili_pickLoc(n.desc), hint: bili_pickLoc(n.hint), dismiss: t("notices.dismiss_btn"), cta: n.ctaUrl ? { label: n.ctaLabel ?? "", url: n.ctaUrl } : null, hideDismiss: !!n.suppressDismiss });
+                } else {
+                    const k = n.keys && typeof n.keys === "object" ? n.keys : {};
+                    el.innerHTML = bili_noticeBanner({ on: t(String(k.on)), desc: t(String(k.desc)), hint: t(String(k.hint)), dismiss: k.dismiss ? t(String(k.dismiss)) : t("notices.dismiss_btn"), cta: null, hideDismiss: false });
                 }
-            } else {
-                nb.hidden = true;
-                nb.classList.remove("show");
-                nb.innerHTML = "";
+            }
+            for (const btn of Array.from(nr.querySelectorAll(".notice-dismiss"))) {
+                btn.addEventListener("click", async () => {
+                    busy(btn, true);
+                    const holder = btn.closest(".banner");
+                    try {
+                        await json(API_ROOT + "/notices/dismiss", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id: holder ? holder.dataset.id : "" }) });
+                        toast(t("notices.dismissed"), "ok");
+                        await loadOverview(true);
+                    } catch (e) {
+                        toast(e.message, "err");
+                    } finally {
+                        busy(btn, false);
+                    }
+                });
             }
         }
         // #1682: global upstream-connection alert banner — visible on every view,
@@ -1603,6 +1726,7 @@ function changelogCatOf(rawLine) {
     function alertHint(kind) {
         switch (kind) {
             case "connect-timeout": return t("alert.hint.connect_timeout");
+            case "upstream-unreachable": return t("alert.hint.upstream_unreachable");
             case "connect-refused": return t("alert.hint.connect_refused");
             case "proxy-reset": return t("alert.hint.proxy_reset");
             case "upstream-reset": return t("alert.hint.upstream_reset");
@@ -2273,7 +2397,7 @@ function changelogCatOf(rawLine) {
         if (name === "bash" || name === "shell" || name === "run_command") return "t-shell";
         if (name === "read" || name === "write" || name === "edit" || name === "ls" || name === "glob" || name === "note") return "t-file";
         if (name === "grep" || name === "search_context" || name === "decompress" || name === "acp_retrieve") return "t-seek";
-        if (name === "compress" || name === "acp_status" || name === "acp_cache") return "t-fold";
+        if (name === "compress" || name === "acp_status" || name === "acp_cache" || name === "acp_retire" || name === "acp_restore" || name === "acp_rewrite") return "t-fold";
         return "";
     }
     function parseToolLine(line) {
@@ -3091,6 +3215,14 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         // #2904: no-ceiling output-budget pin — surface at the top of the detail
         // so GUI users see WHY long turns truncate (the /acp twin).
         if (d.outputBudgetDegraded) parts.push('<div class="banner warn show" style="margin-bottom:12px">' + escapeHtml(t("det.obudget_degraded", { model: d.outputBudgetDegraded.model, value: d.outputBudgetDegraded.value })) + "</div>");
+        if (d.contextAnalysis && d.contextAnalysis.text) {
+            // Context analysis: init size / nudge cadence / harvest acceptance /
+            // plain-language verdict — the question that used to take hours of
+            // manual log forensics (session-aedc188c investigation, 2026-11-08).
+            const ca = d.contextAnalysis;
+            const lines = ca.text.split("\\n").map((l) => "<div>" + escapeHtml(l) + "</div>");
+            parts.push('<div class="card" style="margin-top:16px"><div class="card-h"><span>' + t("det.context_analysis") + '</span><span class="hint">' + t("det.context_analysis_hint") + '</span></div><div class="card-b"><div class="mono small" style="line-height:1.8">' + lines.join("") + '</div></div></div>');
+        }
         if (Array.isArray(d.conflicts) && d.conflicts.length > 0) {
             // #2102: per-session evidence rows — the banner aggregates across sessions,
             // so this page is where its detail pointer lands.
@@ -3848,6 +3980,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         function compressOf(d) { return (d.compress && typeof d.compress === "object" && !Array.isArray(d.compress)) ? d.compress : null; }
         const NUDGE_DEFAULT = 50000, NUDGE_STEP = 5000, NUDGE_LOW = 20000, NUDGE_HIGH = 100000;
         const PRM_KERNEL_DEFAULT = 3;
+        const SUMFLOOR_DEFAULT = 50;
         const brokenNote = document.createElement("div");
         brokenNote.style.cssText = "min-height:16px;font-size:12px;color:#cf222e";
         box.appendChild(brokenNote);
@@ -3868,8 +4001,11 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             dbg.inp.checked = draft.debug === true;
             ptRow.inp.checked = draft.passthrough === true;
             imgRow.inp.checked = draft.imageRescale !== false;
+            tsRow.inp.checked = cp ? cp.messageTimestamps !== false : true;
             const ab = (cp && cp.absorb && typeof cp.absorb === "object" && !Array.isArray(cp.absorb)) ? cp.absorb : null;
             abRow.inp.checked = ab ? ab.enabled === true : false;
+            rnRow.inp.checked = cp ? cp.requireNudge === true : false;
+            rrRow.inp.checked = cp ? cp.requireRecommendation === true : false;
             const pv = (cp && typeof cp.promptPack === "string") ? cp.promptPack : "default";
             while (packSel.options.length > 0) packSel.removeChild(packSel.lastChild);
             (packNames.length ? packNames : ["default", "lean"]).forEach((name) => {
@@ -3902,10 +4038,30 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             }
             pckSel.value = pcv;
             updatePckNote();
+            const wf = draft.rollout && typeof draft.rollout === "object" && !Array.isArray(draft.rollout) && draft.rollout.features && typeof draft.rollout.features === "object" && !Array.isArray(draft.rollout.features) ? draft.rollout.features.pluginFullResendWatermark : undefined;
+            let wmv = "default";
+            if (wf === true) wmv = "on"; else if (wf === false) wmv = "off";
+            while (wmSel.options.length > 0) wmSel.removeChild(wmSel.lastChild);
+            WM_VALUES.forEach((name) => {
+                const o = document.createElement("option");
+                o.value = name;
+                o.textContent = name;
+                wmSel.appendChild(o);
+            });
+            if (wf !== undefined && !WM_VALUES.includes(wmv)) {
+                const o = document.createElement("option");
+                o.value = String(wf);
+                o.textContent = String(wf) + " *";
+                wmSel.appendChild(o);
+                wmv = String(wf);
+            }
+            wmSel.value = wmv;
+            updateWmNote();
             nudge.value = String(cp && typeof cp.nudgeGrowthTokens === "number" ? cp.nudgeGrowthTokens : NUDGE_DEFAULT);
             updateNudgeNote();
             refreshTierInputs();
             prm.value = String(cp && typeof cp.preserveRecentMessages === "number" ? cp.preserveRecentMessages : PRM_KERNEL_DEFAULT);
+            sumfloor.value = String(cp && typeof cp.minSummaryLength === "number" ? cp.minSummaryLength : SUMFLOOR_DEFAULT);
             ptInp.value = (cp && Array.isArray(cp.protectedTools)) ? cp.protectedTools.join(", ") : "";
             const nv = (cp && Array.isArray(cp.neverPreserveRecentTools)) ? cp.neverPreserveRecentTools : null;
             neInp.value = nv ? nv.filter((x) => typeof x === "string").join(", ") : "";
@@ -4014,9 +4170,66 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         abHint.className = "dim small";
         abHint.textContent = t("cfg.q_absorb_hint");
         abRow.ctl.appendChild(abHint);
+        // #5683: unprompted/out-of-bounds compression gates (compress.* booleans).
+        const rnRow = row("quick-require-nudge", t("cfg.q_require_nudge"));
+        qCtrls.push(rnRow.inp);
+        rnRow.inp.addEventListener("change", () => commit((d) => {
+            if (rnRow.inp.checked) {
+                if (!compressOf(d)) d.compress = {};
+                d.compress.requireNudge = true;
+            } else {
+                const c = compressOf(d);
+                if (c) {
+                    delete c.requireNudge;
+                    if (Object.keys(c).length === 0) delete d.compress;
+                }
+            }
+        }));
+        const rnHint = document.createElement("span");
+        rnHint.className = "dim small";
+        rnHint.textContent = t("cfg.q_require_nudge_hint");
+        rnRow.ctl.appendChild(rnHint);
+        const rrRow = row("quick-require-rec", t("cfg.q_require_rec"));
+        qCtrls.push(rrRow.inp);
+        rrRow.inp.addEventListener("change", () => commit((d) => {
+            if (rrRow.inp.checked) {
+                if (!compressOf(d)) d.compress = {};
+                d.compress.requireRecommendation = true;
+            } else {
+                const c = compressOf(d);
+                if (c) {
+                    delete c.requireRecommendation;
+                    if (Object.keys(c).length === 0) delete d.compress;
+                }
+            }
+        }));
+        const rrHint = document.createElement("span");
+        rrHint.className = "dim small";
+        rrHint.textContent = t("cfg.q_require_rec_hint");
+        rrRow.ctl.appendChild(rrHint);
         const packSel = document.createElement("select");
         packSel.className = "field-input mono";
         qCtrls.push(packSel);
+        // #4313 display gate — default ON since the leak-audit follow-up;
+        // unchecking writes an EXPLICIT false (deleting the key would
+        // silently resolve back to on). Sits ABOVE the prompt-pack row.
+        const tsRow = row("quick-message-ts", t("cfg.q_message_ts"));
+        qCtrls.push(tsRow.inp);
+        tsRow.inp.addEventListener("change", () => commit((d) => {
+            const c = compressOf(d);
+            if (tsRow.inp.checked) {
+                if (!c) return;
+                delete c.messageTimestamps;
+                // never leave a phantom empty container: an uncheck→recheck
+                // cycle must round-trip byte-identical to the saved config,
+                // or the dirty flag lints forever on a no-op
+                if (Object.keys(c).length === 0) delete d.compress;
+            } else {
+                if (typeof c !== "object" || c === null || Array.isArray(c)) d.compress = {};
+                d.compress.messageTimestamps = false;
+            }
+        }));
+        void tsRow.ctl;
         const pw = document.createElement("div");
         pw.style.cssText = "display:flex;gap:12px;align-items:center;flex-wrap:wrap";
         const plab = document.createElement("label");
@@ -4063,6 +4276,38 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         const peBox = document.createElement("div");
         peBox.hidden = true;
         peBox.style.cssText = "margin:4px 0";
+        // #5344: the editor is a three-tab panel (guided form / AI assist /
+        // raw JSON); the bare-JSON box below becomes the third tab.
+        // WEB_CLIENT embedding rules: no backtick literals; runtime \n
+        // escapes are written \\n in this source file.
+        const peTabs = document.createElement("div");
+        peTabs.style.cssText = "display:flex;gap:8px;margin-bottom:6px";
+        const PE_TAB_DEFS = [
+            { key: "form", label: t("cfg.q_pack_tab_form") },
+            { key: "ai", label: t("cfg.q_pack_tab_ai") },
+            { key: "json", label: t("cfg.q_pack_tab_json") },
+        ];
+        const peTabBtns = {};
+        for (const def of PE_TAB_DEFS) {
+            const btn = document.createElement("button");
+            btn.type = "button";
+            btn.className = "btn sm";
+            btn.textContent = def.label;
+            btn.style.borderBottom = "2px solid transparent";
+            (function (key) { btn.addEventListener("click", () => showPeTab(key)); })(def.key);
+            peTabBtns[def.key] = btn;
+            peTabs.appendChild(btn);
+        }
+        function showPeTab(key) {
+            for (const def of PE_TAB_DEFS) {
+                const btn = peTabBtns[def.key];
+                btn.style.fontWeight = def.key === key ? "700" : "400";
+                btn.style.borderBottom = def.key === key ? "2px solid #0969da" : "2px solid transparent";
+            }
+            peFormPane.hidden = key !== "form";
+            peAiPane.hidden = key !== "ai";
+            peJsonPane.hidden = key !== "json";
+        }
         const peTa = document.createElement("textarea");
         peTa.className = "editor mono codebox";
         peTa.spellcheck = false;
@@ -4077,8 +4322,202 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         peCancel.className = "btn sm";
         peCancel.textContent = t("cfg.q_pack_cancel");
         peBtns.append(peSave, peCancel);
-        peBox.append(peTa, peBtns);
+        // #5344 tab 1: guided form — start from a base text, tweak, save.
+        const peFormPane = document.createElement("div");
+        const peAiPane = document.createElement("div");
+        const peJsonPane = document.createElement("div");
+        peFormPane.hidden = false;
+        peAiPane.hidden = true;
+        peJsonPane.hidden = true;
+        peJsonPane.append(peTa, peBtns);
+        const baseRow = document.createElement("div");
+        baseRow.style.cssText = "display:flex;gap:8px;align-items:center;margin:2px 0 8px;flex-wrap:wrap";
+        const baseLab = document.createElement("label");
+        baseLab.htmlFor = "pack-base-sel";
+        baseLab.textContent = t("cfg.q_pack_base_label");
+        baseLab.style.cssText = "font-size:12px;color:#57606a";
+        const baseSel = document.createElement("select");
+        baseSel.id = "pack-base-sel";
+        baseSel.className = "field-input";
+        // #5345 follow-up: keep labels as literal t("…") calls — the #1024
+        // dead-key guard only counts string-literal arguments, so the old
+        // array + variable-lookup shape hid all four keys (CI red on master).
+        [["", t("cfg.q_pack_base_blank")], ["default", t("cfg.q_pack_base_default")], ["chat", t("cfg.q_pack_base_chat")], ["lean", t("cfg.q_pack_base_lean")]].forEach(([value, label]) => {
+            const opt = document.createElement("option");
+            opt.value = value;
+            opt.textContent = label;
+            baseSel.appendChild(opt);
+        });
+        const btnBaseLoad = document.createElement("button");
+        btnBaseLoad.type = "button";
+        btnBaseLoad.className = "btn sm";
+        btnBaseLoad.textContent = t("cfg.q_pack_base_load");
+        baseRow.append(baseLab, baseSel, btnBaseLoad);
+        const descWrap = document.createElement("div");
+        descWrap.style.cssText = "margin:8px 0";
+        const descLab = document.createElement("div");
+        descLab.textContent = t("cfg.q_pack_desc");
+        descLab.style.cssText = "font-size:13px;font-weight:600;margin-bottom:2px";
+        const descIn = document.createElement("input");
+        descIn.type = "text";
+        descIn.className = "field-input";
+        descIn.placeholder = t("cfg.q_pack_desc_ph");
+        descIn.style.cssText = "width:100%;box-sizing:border-box";
+        descWrap.append(descLab, descIn);
+        function packSectionField(label, helpText, rows) {
+            const wrap = document.createElement("div");
+            wrap.style.cssText = "margin:8px 0";
+            const lab = document.createElement("div");
+            lab.textContent = label;
+            lab.style.cssText = "font-size:13px;font-weight:600;margin-bottom:2px";
+            const help = document.createElement("div");
+            help.textContent = helpText;
+            help.style.cssText = "font-size:12px;color:#57606a;margin-bottom:4px";
+            const ta = document.createElement("textarea");
+            ta.className = "field-input mono";
+            ta.spellcheck = false;
+            ta.rows = rows;
+            ta.style.cssText = "width:100%;box-sizing:border-box";
+            wrap.append(lab, help, ta);
+            return { wrap, ta };
+        }
+        const phF = packSectionField(t("cfg.q_pack_phil"), t("cfg.q_pack_phil_help"), 5);
+        const hcF = packSectionField(t("cfg.q_pack_hc"), t("cfg.q_pack_hc_help"), 8);
+        const taPh = phF.ta;
+        const taHc = hcF.ta;
+        const formHint = document.createElement("div");
+        formHint.textContent = t("cfg.q_pack_form_hint");
+        formHint.style.cssText = "font-size:12px;color:#57606a;margin:8px 0";
+        const btnFormSave = document.createElement("button");
+        btnFormSave.type = "button";
+        btnFormSave.className = "btn sm";
+        btnFormSave.textContent = t("cfg.q_pack_form_save");
+        peFormPane.append(baseRow, descWrap, phF.wrap, hcF.wrap, formHint, btnFormSave);
+        // #5344 tab 2: AI assist — plain-language need -> self-contained
+        // prompt -> copy to any LLM -> paste its JSON back -> fills the form.
+        const aiNeedLab = document.createElement("div");
+        aiNeedLab.textContent = t("cfg.q_pack_ai_need");
+        aiNeedLab.style.cssText = "font-size:13px;font-weight:600;margin:2px 0";
+        const aiNeed = document.createElement("textarea");
+        aiNeed.className = "field-input";
+        aiNeed.rows = 3;
+        aiNeed.placeholder = t("cfg.q_pack_ai_need_ph");
+        aiNeed.style.cssText = "width:100%;box-sizing:border-box";
+        const aiBtnRow = document.createElement("div");
+        aiBtnRow.style.cssText = "display:flex;gap:8px;margin:6px 0";
+        const btnAiGen = document.createElement("button");
+        btnAiGen.type = "button";
+        btnAiGen.className = "btn sm";
+        btnAiGen.textContent = t("cfg.q_pack_ai_gen");
+        const btnAiCopy = document.createElement("button");
+        btnAiCopy.type = "button";
+        btnAiCopy.className = "btn sm";
+        btnAiCopy.textContent = t("cfg.q_pack_ai_copy");
+        aiBtnRow.append(btnAiGen, btnAiCopy);
+        const aiOut = document.createElement("textarea");
+        aiOut.className = "editor mono codebox";
+        aiOut.readOnly = true;
+        aiOut.rows = 8;
+        aiOut.spellcheck = false;
+        aiOut.style.cssText = "width:100%;box-sizing:border-box";
+        const aiHint = document.createElement("div");
+        aiHint.textContent = t("cfg.q_pack_ai_hint");
+        aiHint.style.cssText = "font-size:12px;color:#57606a;margin:8px 0 2px";
+        const aiIn = document.createElement("textarea");
+        aiIn.className = "editor mono codebox";
+        aiIn.rows = 8;
+        aiIn.spellcheck = false;
+        aiIn.placeholder = '{"promptSections": {"philosophy": "..."}}';
+        aiIn.style.cssText = "width:100%;box-sizing:border-box";
+        const btnAiApply = document.createElement("button");
+        btnAiApply.type = "button";
+        btnAiApply.className = "btn sm";
+        btnAiApply.textContent = t("cfg.q_pack_ai_apply");
+        const aiApplyRow = document.createElement("div");
+        aiApplyRow.style.cssText = "display:flex;gap:8px;margin-top:6px";
+        aiApplyRow.append(btnAiApply);
+        peAiPane.append(aiNeedLab, aiNeed, aiBtnRow, aiOut, aiHint, aiIn, aiApplyRow);
+        async function loadBaseText() {
+            const baseName = baseSel.value;
+            if (!baseName) { descIn.value = ""; taPh.value = ""; taHc.value = ""; return; }
+            try {
+                const r = await json(API_ROOT + "/packs/templates");
+                const pk = r && r.packs ? r.packs[baseName] : null;
+                if (!pk) { pmSet(t("cfg.q_pack_json_obj"), true); return; }
+                descIn.value = typeof pk.description === "string" ? pk.description : "";
+                taPh.value = typeof pk.philosophy === "string" ? pk.philosophy : "";
+                taHc.value = typeof pk.howToCompress === "string" ? pk.howToCompress : "";
+                pmSet("");
+            } catch (e) { pmSet(String(e), true); }
+        }
+        btnBaseLoad.addEventListener("click", () => loadBaseText());
+        // Shared pack-name normalizer (WEB_CLIENT rule: charCode, no regex
+        // with backslashes) for both save paths.
+        function packNameForSave() {
+            const rawName = (editingNew ? pmName.value.trim() : editingPack);
+            const first = rawName.charCodeAt(0);
+            return (first === 47 || first === 92 ? rawName.slice(1) : rawName).trim();
+        }
+        btnFormSave.addEventListener("click", async () => {
+            const name = packNameForSave();
+            if (!name || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name) || name.indexOf("..") !== -1) { pmSet(t("cfg.q_pack_bad_name"), true); return; }
+            const phil = taPh.value.trim();
+            const hc = taHc.value.trim();
+            if (!phil && !hc) { pmSet(t("cfg.q_pack_form_empty"), true); return; }
+            const obj = { promptSections: {} };
+            if (phil) obj.promptSections.philosophy = phil;
+            if (hc) obj.promptSections.howToCompress = hc;
+            const desc = descIn.value.trim();
+            if (desc) obj.description = desc;
+            try {
+                await json(API_ROOT + "/packs/user/" + encodeURIComponent(name), {
+                    method: "PUT",
+                    headers: { "content-type": "application/json" },
+                    body: JSON.stringify({ json: JSON.stringify(obj, null, 2) }),
+                });
+                pmSet(t("cfg.q_pack_saved", { name }));
+                peBox.hidden = true;
+                editingPack = "";
+                editingNew = false;
+                refreshPackInventory();
+                commit((d) => { if (!compressOf(d)) d.compress = {}; d.compress.promptPack = name; });
+            } catch (e) { pmSet(String(e), true); }
+        });
+        btnAiGen.addEventListener("click", () => {
+            const need = aiNeed.value.trim();
+            if (!need) { pmSet(t("cfg.q_pack_ai_need_empty"), true); return; }
+            aiOut.value = [t("cfg.q_pack_ai_p1", { need }), t("cfg.q_pack_ai_p2"), t("cfg.q_pack_ai_p3")].join("\\n\\n");
+            pmSet(t("cfg.q_pack_ai_gen_ok"));
+        });
+        btnAiCopy.addEventListener("click", async () => {
+            try { await navigator.clipboard.writeText(aiOut.value); pmSet(t("cfg.q_pack_ai_copied")); }
+            catch (e) { pmSet(String(e), true); }
+        });
+        btnAiApply.addEventListener("click", () => {
+            // Tolerate markdown fences around the model's reply (build the
+            // fence from charCodes — no backtick literals here).
+            const FENCE = String.fromCharCode(96) + String.fromCharCode(96) + String.fromCharCode(96);
+            let text = (aiIn.value || "").trim();
+            const lines = text.split("\\n");
+            if (lines.length > 0 && lines[0].trim().indexOf(FENCE) === 0) lines.shift();
+            if (lines.length > 0 && lines[lines.length - 1].trim() === FENCE) lines.pop();
+            text = lines.join("\\n").trim();
+            let obj = null;
+            try { obj = JSON.parse(text); } catch (e) { pmSet(t("cfg.q_pack_bad_json", { err: String(e) }), true); return; }
+            if (!obj || typeof obj !== "object" || Array.isArray(obj)) { pmSet(t("cfg.q_pack_json_obj"), true); return; }
+            const ps = (obj.promptSections && typeof obj.promptSections === "object") ? obj.promptSections : {};
+            descIn.value = typeof obj.description === "string" ? obj.description : "";
+            taPh.value = typeof ps.philosophy === "string" ? ps.philosophy : "";
+            taHc.value = typeof ps.howToCompress === "string" ? ps.howToCompress : "";
+            const extra = Object.keys(obj).filter((k) => k !== "name" && k !== "version" && k !== "description" && k !== "promptSections");
+            Object.keys(ps).forEach((k) => { if (k !== "philosophy" && k !== "howToCompress") extra.push("promptSections." + k); });
+            peTa.value = JSON.stringify(obj, null, 2);
+            showPeTab("form");
+            pmSet(extra.length ? t("cfg.q_pack_ai_extra", { names: extra.join(", ") }) : t("cfg.q_pack_ai_apply_ok"));
+        });
+        peBox.append(peTabs, peFormPane, peAiPane, peJsonPane);
         box.append(pmRow, peBox);
+        showPeTab("form");
         let editingPack = "";   // "" = closed; otherwise the name being edited
         let editingNew = false;
         function pmSet(text, isError) {
@@ -4093,8 +4532,16 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             editingNew = true;
             pmName.value = "";
             peTa.value = '{\\n  "promptSections": {\\n    "philosophy": ""\\n  }\\n}\\n';
+            baseSel.value = "";
+            descIn.value = "";
+            taPh.value = "";
+            taHc.value = "";
+            aiNeed.value = "";
+            aiOut.value = "";
+            aiIn.value = "";
             peBox.hidden = false;
             pmSet("");
+            showPeTab("form");
         });
         pmEdit.addEventListener("click", async () => {
             const name = packSel.value;
@@ -4107,11 +4554,18 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             try {
                 const r = await json(API_ROOT + "/packs/user/" + encodeURIComponent(name));
                 peTa.value = r && typeof r.json === "string" && r.json ? r.json : "{}\\n";
+                let loadedObj = null;
+                try { loadedObj = peTa.value ? JSON.parse(peTa.value) : null; } catch (e) { loadedObj = null; }
+                const loadedPs = (loadedObj && loadedObj.promptSections && typeof loadedObj.promptSections === "object") ? loadedObj.promptSections : {};
+                descIn.value = (loadedObj && typeof loadedObj.description === "string") ? loadedObj.description : "";
+                taPh.value = (typeof loadedPs.philosophy === "string") ? loadedPs.philosophy : "";
+                taHc.value = (typeof loadedPs.howToCompress === "string") ? loadedPs.howToCompress : "";
                 editingPack = name;
                 editingNew = false;
                 pmName.value = name;
                 peBox.hidden = false;
                 pmSet("");
+                showPeTab("form");
             } catch (e) { pmSet(String(e), true); }
         });
         pmDel.addEventListener("click", async () => {
@@ -4131,11 +4585,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             pmSet("");
         });
         peSave.addEventListener("click", async () => {
-            // No regex literals with backslashes here (WEB_CLIENT template):
-            // strip one leading path separator via charCode instead.
-            const rawName = (editingNew ? pmName.value.trim() : editingPack);
-            const first = rawName.charCodeAt(0);
-            const name = (first === 47 || first === 92 ? rawName.slice(1) : rawName).trim();
+            const name = packNameForSave();
             if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name) || name.includes("..")) { pmSet(t("cfg.q_pack_bad_name"), true); return; }
             let parsed;
             try { parsed = JSON.parse(peTa.value); } catch (e) { pmSet(t("cfg.q_pack_bad_json", { err: String(e) }), true); return; }
@@ -4188,6 +4638,41 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             const pc = (d.promptCache && typeof d.promptCache === "object" && !Array.isArray(d.promptCache)) ? d.promptCache : {};
             if (PCK_VALUES.includes(pckSel.value)) pc.routing = pckSel.value; else delete pc.routing;
             if (Object.keys(pc).length === 0) delete d.promptCache; else d.promptCache = pc;
+        }));
+        // #5403: watermark fastpath grey-rollout switch — maps 1:1 onto
+        // rollout.features.pluginFullResendWatermark (default follows the
+        // baked percent; on/off pin it per install). salt/base untouched.
+        const WM_VALUES = ["default", "on", "off"];
+        const wmSel = document.createElement("select");
+        wmSel.className = "field-input mono";
+        qCtrls.push(wmSel);
+        const ww = document.createElement("div");
+        ww.style.cssText = "display:flex;gap:12px;align-items:center;flex-wrap:wrap";
+        const wlab = document.createElement("label");
+        wlab.htmlFor = "quick-wm";
+        wlab.style.cssText = "flex:0 1 auto;max-width:520px";
+        wlab.textContent = t("cfg.q_wm");
+        wmSel.id = "quick-wm";
+        ww.appendChild(wlab);
+        ww.appendChild(wmSel);
+        box.appendChild(ww);
+        const wmNote = document.createElement("div");
+        wmNote.style.cssText = "margin:-6px 0 4px;font-size:12px;color:#57606a";
+        function updateWmNote() {
+            if (wmSel.value === "on") wmNote.textContent = t("cfg.q_wm_on_desc");
+            else if (wmSel.value === "off") wmNote.textContent = t("cfg.q_wm_off_desc");
+            else if (wmSel.value !== "default") wmNote.textContent = t("cfg.q_wm_custom");
+            else wmNote.textContent = t("cfg.q_wm_default_desc");
+        }
+        box.appendChild(wmNote);
+        wmSel.addEventListener("change", () => commit((d) => {
+            let roll = (d.rollout && typeof d.rollout === "object" && !Array.isArray(d.rollout)) ? d.rollout : {};
+            const feats = (roll.features && typeof roll.features === "object" && !Array.isArray(roll.features)) ? roll.features : {};
+            if (wmSel.value === "on") feats.pluginFullResendWatermark = true;
+            else if (wmSel.value === "off") feats.pluginFullResendWatermark = false;
+            else delete feats.pluginFullResendWatermark;
+            if (Object.keys(feats).length === 0) delete roll.features; else roll.features = feats;
+            if (Object.keys(roll).length === 0) delete d.rollout; else d.rollout = roll;
         }));
         const nudge = document.createElement("input");
         nudge.type = "number";
@@ -4346,6 +4831,17 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             const v = parseInt(prm.value, 10);
             if (!isNaN(v) && v > 0 && v !== PRM_KERNEL_DEFAULT) d.compress.preserveRecentMessages = v;
             else { delete d.compress.preserveRecentMessages; prm.value = String(PRM_KERNEL_DEFAULT); }
+        }));
+        const sumfloor = textRow("quick-sumfloor", t("cfg.q_sumfloor"), t("cfg.q_sumfloor_ph"));
+        sumfloor.type = "number";
+        sumfloor.min = "0";
+        sumfloor.style.flex = "0 0 140px";
+        qCtrls.push(sumfloor);
+        sumfloor.addEventListener("change", () => commit((d) => {
+            if (!compressOf(d)) d.compress = {};
+            const v = parseInt(sumfloor.value, 10);
+            if (!isNaN(v) && v >= 0 && v !== SUMFLOOR_DEFAULT) d.compress.minSummaryLength = v;
+            else { delete d.compress.minSummaryLength; sumfloor.value = String(SUMFLOOR_DEFAULT); }
         }));
         const NEVER_DEFAULT = ["decompress", "search_context", "read", "bash"];
         const neInp = textRow("quick-never", t("cfg.q_never"), t("cfg.q_never_ph"));
@@ -4570,6 +5066,9 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             $("log-count").textContent = d.total > 0
                 ? t("logs.count", { n: (d.lines || []).length, total: d.total }) + ((typeof d.omitted === "number" && d.omitted > 0) ? t("logs.omitted", { o: d.omitted }) : "")
                 : "";
+            if (Array.isArray(d.unreadable) && d.unreadable.length > 0) {
+                $("log-count").textContent += " · " + t("logs.incomplete", { n: d.unreadable.length });
+            }
             const bodyEl = $("log-body");
             const rows = d.lines || [];
             if (!rows.length) {
@@ -4677,47 +5176,36 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         if (lsearch) lsearch.addEventListener("input", () => { clearTimeout(logTimer); logTimer = setTimeout(loadLogs, 400); });
         const llines = $("log-lines");
         if (llines) llines.addEventListener("change", loadLogs);
-        const ldl = $("log-dl");
-        if (ldl) ldl.addEventListener("click", async () => {
-            busy(ldl, true);
-            try {
-                const q = ($("log-search").value || "").trim();
-                const r = await fetch(API_ROOT + "/logs?raw=1&q=" + encodeURIComponent(q) + "&lines=2000" + logViewExtras());
-                const blob = await r.blob();
-                const a = document.createElement("a");
-                a.href = URL.createObjectURL(blob);
-                a.download = "billion-context-log.txt";
-                document.body.appendChild(a);
-                a.click();
-                a.remove();
-                setTimeout(() => URL.revokeObjectURL(a.href), 4000);
-            } catch (e) {
-                toast(t("toast.failed", { msg: e.message }), "err");
-            } finally {
-                busy(ldl, false);
-            }
-        });
-        const ldlAll = $("log-dl-all");
-        if (ldlAll) ldlAll.addEventListener("click", async () => {
-            busy(ldlAll, true);
-            try {
-                // Full unfiltered log (rotated .old + current) regardless of the
-                // search box — the honest "download everything" path.
-                const r = await fetch(API_ROOT + "/logs?raw=1&all=1");
-                const blob = await r.blob();
-                const a = document.createElement("a");
-                a.href = URL.createObjectURL(blob);
-                a.download = "billion-context-full-log.txt";
-                document.body.appendChild(a);
-                a.click();
-                a.remove();
-                setTimeout(() => URL.revokeObjectURL(a.href), 4000);
-            } catch (e) {
-                toast(t("toast.failed", { msg: e.message }), "err");
-            } finally {
-                busy(ldlAll, false);
-            }
-        });
+        for (const id of ["log-ctx", "log-win"]) {
+            const control = $(id);
+            if (control) control.addEventListener("change", loadLogs);
+        }
+        for (const [buttonId, all] of [["log-dl", false], ["log-dl-all", true]]) {
+            const button = $(buttonId);
+            if (button) button.addEventListener("click", async () => {
+                busy(button, true);
+                try {
+                    const q = ($("log-search").value || "").trim();
+                    const query = all ? "raw=1&all=1" : "raw=1&q=" + encodeURIComponent(q) + "&lines=2000" + logViewExtras();
+                    const response = await fetch(API_ROOT + "/logs?" + query);
+                    if (!response.ok) throw new Error("HTTP " + response.status);
+                    const unreadable = response.headers.get("x-bili-log-incomplete");
+                    if (unreadable) toast(t("logs.incomplete", { n: unreadable }), "err");
+                    const blob = await response.blob();
+                    const a = document.createElement("a");
+                    a.href = URL.createObjectURL(blob);
+                    a.download = all ? "billion-context-full-log.txt" : "billion-context-log.txt";
+                    document.body.appendChild(a);
+                    a.click();
+                    a.remove();
+                    setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+                } catch (e) {
+                    toast(t("toast.failed", { msg: e.message }), "err");
+                } finally {
+                    busy(button, false);
+                }
+            });
+        }
         const testBtn = $("test-upstream");
         if (testBtn) testBtn.addEventListener("click", async () => {
             busy(testBtn, true);

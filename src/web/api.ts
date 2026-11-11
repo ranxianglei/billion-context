@@ -3,9 +3,11 @@ import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { configDir, configFile } from "../paths.js";
-import { isValidPackName, sanitizePackSurface, type PromptPackFile } from "acp-kernel";
+import { defaultPrompts, isValidPackName, sanitizePackSurface, type PromptPackFile } from "acp-kernel";
+import { resolveCompressSurfaceDetailed } from "../compress-settings.js";
 import {
     collectNamedProviders,
+    isUrlLikeKey,
     loadNamedProviders,
     parseBiliConfig,
     parseCacheKeepaliveSettings,
@@ -172,6 +174,31 @@ export async function handleUserPackDelete(res: ServerResponse, name: string): P
     res.end(JSON.stringify({ ok: true }));
 }
 
+// #5344: base texts for the guided pack editor (form tab). Mirrors the
+// tri-state resolution buildCompressSystemPrompt performs: absent key ->
+// kernel default text; null -> removed (empty); string -> verbatim.
+const PACK_TEMPLATE_NAMES = ["default", "chat", "lean"] as const;
+type PackTemplate = { description?: string; philosophy: string; howToCompress: string };
+
+function packTemplateFor(name: string): PackTemplate {
+    const resolution = resolveCompressSurfaceDetailed({ promptPack: name });
+    const sections = resolution.surface.promptSections ?? {};
+    const pick = (key: "philosophy" | "howToCompress"): string => {
+        const override = sections[key];
+        if (override === null) return "";
+        if (typeof override === "string") return override;
+        return key === "philosophy" ? defaultPrompts.compressPhilosophy : defaultPrompts.howToCompressRules;
+    };
+    return { philosophy: pick("philosophy"), howToCompress: pick("howToCompress") };
+}
+
+export async function handlePackTemplatesGet(res: ServerResponse): Promise<void> {
+    const packs: Record<string, PackTemplate> = {};
+    for (const name of PACK_TEMPLATE_NAMES) packs[name] = packTemplateFor(name);
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ packs }));
+}
+
 export async function handleConfigGet(res: ServerResponse): Promise<void> {
     const upstream = readUpstreamSettings();
     const config = readConfig();
@@ -295,8 +322,10 @@ export async function handleConfigPut(
                 if (!url || !route) return sendError(res, 400, `invalid provider entry: ${url || "(empty)"}`);
                 // Named entries may carry a dialing recipe (baseUrl/api/...) —
                 // validate its shape at save time too, so the chain
-                // references below can only fail on dangling names.
-                if (!/^https?:\/\//.test(url)) {
+                // references below can only fail on dangling names. Classify
+                // URL lanes via the runtime's isUrlLikeKey (incl. mitm://), not
+                // an https-only regex, or documented lanes mis-fail (#5620).
+                if (!isUrlLikeKey(url)) {
                     try { parseNamedProviderRecipe(value); } catch (error) {
                         return sendError(res, 400, `invalid recipe on named provider "${url}": ${String(error)}`);
                     }

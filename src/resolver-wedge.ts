@@ -25,12 +25,17 @@
  * Recovery is derived, not latched: any successful resolution clears that
  * host's streak; when fewer than two hosts remain wedged the alarm drops on
  * its own (status field back to null, web banner hides).
+ *
+ * Bound: tunnel destinations are user-supplied (/bili/<url>), so the tracker
+ * is FIFO-capped at MAX_TRACKED_HOSTS in first-seen order (activity-time
+ * ordering misbehaves when a record carries a backdated clock).
  */
 import { log as loggerLog } from "./logger.js";
 
 const WEDGE_MIN_HOSTS = 2;
 const WEDGE_SUSTAIN_MS = 5 * 60_000;
 const LOG_DEDUP_MS = 10 * 60_000;
+const MAX_TRACKED_HOSTS = 256;
 
 type ResolverWedgeWire = {
     tripped: true;
@@ -46,6 +51,12 @@ type HostRecord = { lastGoodAt: number | null; failSince: number | null };
 let hosts = new Map<string, HostRecord>();
 let nowFn: () => number = () => Date.now();
 let episodeLoggedAt = 0;
+
+function evictFirstSeen(): void {
+    if (hosts.size <= MAX_TRACKED_HOSTS) return;
+    const first = hosts.keys().next().value;
+    if (first !== undefined) hosts.delete(first);
+}
 
 function evalAndLog(now: number): ResolverWedgeWire | null {
     const wedged: Array<[string, number]> = [];
@@ -72,6 +83,7 @@ function evalAndLog(now: number): ResolverWedgeWire | null {
  *  false means every attempt THREW (ETIMEDOUT/EAI_AGAIN/…). IP literals and
  *  egress-proxied destinations never call this. */
 export function resolverWedgeRecord(host: string, resolvedOk: boolean, nowMs?: number): void {
+    evictFirstSeen();
     const key = host.toLowerCase();
     const rec = hosts.get(key) ?? { lastGoodAt: null, failSince: null };
     if (resolvedOk) {

@@ -8,6 +8,15 @@ permissions:
     contents: read
     pull-requests: write
 
+# 2026-10-31 queue-starvation incident: every master push also triggered this lane;
+# a busy day merged eight times and eight full artifact builds piled up behind the
+# pile. Only the newest master build can be valid (per-sha artifact + PR comment),
+# so cancel superseded ones like ci.yml does for push events. #3071 discipline:
+# cancel-in-progress never kills the LATEST run — the head's signal survives.
+concurrency:
+    group: ${{ github.workflow }}-${{ github.ref }}
+    cancel-in-progress: true
+
 jobs:
     build-artifact:
         runs-on: ubuntu-latest

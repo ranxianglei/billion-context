@@ -17,6 +17,7 @@ import type { ProxyOptions } from "../src/config.js";
 import { SessionStore, _setStoreForTest } from "../src/persist.js";
 import { _setForTest as setRegistryForTest } from "../src/registry.js";
 import { rmrf } from "./tmp-rm.js";
+import { CHAT_COMPRESS_PHILOSOPHY, CHAT_HOW_TO_COMPRESS } from "../src/chat-pack.js";
 
 async function waitReady(port: number): Promise<void> {
     for (let i = 0; i < 200; i++) {
@@ -112,6 +113,21 @@ test("#5328: user-dir pack management endpoints", async (t) => {
         const got = JSON.parse((await request("GET", port, "/__bili/packs/user/my-pack")).body) as { name: string; json: string };
         assert.equal(got.name, "my-pack");
         assert.equal(JSON.parse(got.json).promptSections.philosophy, "user philosophy");
+
+        // #5344: base texts for the guided editor — exactly the three
+        // resolvable shipped/builtin packs, tri-state resolved like
+        // buildCompressSystemPrompt (chat overrides both sections verbatim,
+        // default has none so the kernel default prose comes through).
+        const tplRes = await request("GET", port, "/__bili/packs/templates");
+        assert.equal(tplRes.status, 200, `templates ok (${tplRes.body})`);
+        const tpl = JSON.parse(tplRes.body) as { packs: Record<string, { philosophy: string; howToCompress: string }> };
+        assert.deepEqual(Object.keys(tpl.packs).sort(), ["chat", "default", "lean"]);
+        assert.ok(tpl.packs.default.philosophy.length > 100, "default philosophy falls back to kernel prose");
+        assert.ok(tpl.packs.default.howToCompress.length > 100, "default howToCompress falls back to kernel prose");
+        assert.equal(tpl.packs.chat.philosophy, CHAT_COMPRESS_PHILOSOPHY, "chat philosophy is the shipped text verbatim");
+        assert.equal(tpl.packs.chat.howToCompress, CHAT_HOW_TO_COMPRESS, "chat howToCompress is the shipped text verbatim");
+        assert.ok(tpl.packs.lean.howToCompress.length > 50, "lean provides its condensed rules");
+        assert.notEqual(tpl.packs.lean.howToCompress, tpl.packs.default.howToCompress, "lean howToCompress differs from default");
 
         // Invalid payloads are refused before touching disk.
         const badJson = await request("PUT", port, "/__bili/packs/user/bad-json", JSON.stringify({ json: "{nope" }));
