@@ -178,7 +178,7 @@ function parseFallbackProxy(proxy: string | undefined, biliPort?: number): Parse
 }
 
 type NoProxyOptions = {
-    /** Windows ProxyOverride grammar (#2502): mid-token `*` entries (Clash's default
+    /** Windows ProxyOverride grammar (#2502): `*` entries (Clash's default
      *  bypass list is `localhost;127.*;192.168.*;…;<local>`) glob-match the hostname —
      *  `.` stays literal, `*` matches any characters. NO_PROXY lists keep their
      *  conventional grammar where `*` only appears as a standalone item. */
@@ -214,7 +214,7 @@ export function matchesNoProxy(target: URL, noProxy: string | undefined, options
             }
         }
         if (tokenPort !== undefined && tokenPort !== port) continue;
-        if (options.windowsBypass && !token.startsWith("*") && token.includes("*") && wildcardHostMatch(host, token)) return true;
+        if (options.windowsBypass && token.includes("*") && wildcardHostMatch(host, token)) return true;
         const suffix = token.startsWith("*.") ? token.slice(1) : token.startsWith(".") ? token : undefined;
         if (suffix ? host.endsWith(suffix) || host === suffix.slice(1) : host === token) return true;
     }
