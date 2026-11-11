@@ -1725,6 +1725,104 @@ export function cacheBlockContent(session: Session, blockId: string, content: Bl
     session.blockContents.set(blockId, content);
 }
 
+// ---------------------------------------------------------------------------
+// resetSessionCompression completeness surface (#6181, item 3)
+//
+// resetSessionCompression clears per-turn compression state after a host-native
+// compaction rebase. It is a hand-enumerated field-by-field clear: every line
+// carries an issue comment, so adding a new state field to `Session` without
+// also touching reset silently leaks stale state across the ref-space reset
+// (the #5984 class). These three lists classify EVERY top-level `Session` field
+// into exactly one bucket so that omission becomes a BUILD error, not a runtime
+// surprise. They are the single source of truth for tests/issue6181-reset-
+// completeness.test.ts.
+//
+//   RESET              back to fresh/absent after reset (wholesale-replace,
+//                      clear-in-place, set-undefined, or consumed by the
+//                      markDirty->save boundary reset always invokes)
+//   INTENTIONAL_WRITE  deliberately written to a non-default value by reset's
+//                      control flow
+//   PRESERVED          deliberately left untouched (identity / persistence /
+//                      cumulative billing / recovery markers)
+//
+// Known boundary NOT covered here (documented, not fixed — see #6181 item 1 /
+// discussion #5874 proposal 6): `session.metadata` is a free-form
+// Record<string, unknown>, so keys written under ad-hoc names (e.g.
+// COMPRESS_LOOP_KEY = "compressFailStreak" at src/stream.ts:231) live outside
+// the typed surface and cannot be enumerated. Proposal 6's identity+snapshot
+// reconciliation is the structural replacement for this whole mechanism.
+// ---------------------------------------------------------------------------
+
+export const RESET_SESSION_FIELDS = [
+    // wholesale-replaced by createInitialState()
+    "state",
+    // replaced by undefined (rebuild from storage)
+    "contentStore",
+    // cleared in place (.clear())
+    "blockContents",
+    // cleared in place (.length = 0)
+    "pendingRetrievals",
+    // consumed by the markDirty->scheduleSave boundary reset always invokes
+    // (persist.ts consumePendingLedgerAlign, #5608-D): a deferred fold-alignment
+    // marker that must not survive the rebase. Not an explicit body line — it is
+    // cleared as a side effect of markDirty, which is why it lands here rather
+    // than beside the other explicit clears.
+    "pendingLedgerAlign",
+] as const satisfies readonly (keyof Session)[];
+
+export const INTENTIONAL_WRITE_SESSION_FIELDS = [
+    // set true so the store persists the cleared state
+    "contentStoreDirty",
+    // set false (a pending CCR reconcile is dropped across the rebase)
+    "ccrReconcilePending",
+    // bumped once via markDirty()
+    "revisionEpoch",
+] as const satisfies readonly (keyof Session)[];
+
+export const PRESERVED_SESSION_FIELDS = [
+    "transient",
+    "id",
+    "meta",
+    // cumulative billing counters survive the rebase; only per-turn estimate
+    // sub-fields inside stats are zeroed/deleted (pinned by the test)
+    "stats",
+    // free-form namespace; only named keys below are touched (see test pin)
+    "metadata",
+    "restampSuperseded",
+    "createdAt",
+    "lastSeen",
+    "lastMessages",
+    "lastMessagesFolded",
+    "pluginSnapshot",
+    "decompositionLog",
+    "pluginRevisionCache",
+    "retrieveCountsByRef",
+    "incomingImageIndex",
+    "lastImgPrune",
+    "inFlight",
+    "persisted",
+    "restored",
+    "coldLoadedAt",
+    "lastCompress",
+    "lockChain",
+] as const satisfies readonly (keyof Session)[];
+
+export type ResetSurfaceField =
+    | (typeof RESET_SESSION_FIELDS)[number]
+    | (typeof INTENTIONAL_WRITE_SESSION_FIELDS)[number]
+    | (typeof PRESERVED_SESSION_FIELDS)[number];
+
+/**
+ * Every `keyof Session` must appear in exactly one of the three lists above.
+ * This MUST stay `never`. When a new state field lands on `Session` without
+ * being classified, it surfaces here and the gate below fails the build,
+ * naming exactly what to add to RESET / INTENTIONAL_WRITE / PRESERVED.
+ */
+export type UncoveredSessionFields = Exclude<keyof Session, ResetSurfaceField>;
+
+type _RequireCompleteResetCoverage<T extends never> = T;
+export type _resetCoverageGate = _RequireCompleteResetCoverage<UncoveredSessionFields>;
+
 export function resetSessionCompression(session: Session): void {
     session.state = createInitialState();
     session.blockContents.clear();
