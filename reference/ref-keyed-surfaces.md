@@ -19,7 +19,7 @@
 |---|---|---|---|
 | `state.hiddenOrphanRefs` | refs | stale | hidden orphan pairs resurrect mid-history (#3769 regression class) |
 | `state.emergencyTruncateLatch[].ref`, `renderDeferredRefs`, `viewLatches`, `pendingOrphanSweepMinRef` | refs/number | stale | latch misses → replay divergence → prefix-cache churn (one-time rewrite) |
-| `messages.ref_num` (unified store rows) | ref number | **index-time, never rewritten** | web leaf hydration + export JSONL query NEW numbers against OLD rows → silent misses for the renumbered band (#4738 family) |
+| `messages.ref_num` (unified store rows) | ref number | **index-time, never rewritten** | consumers must NOT join LIVE refs to this column — a restamp moves live refs off their index-time numbers. Web leaf hydration now keys off the stable `msg_id` instead of the ref number (#6029, restamp-proof); export JSONL reads rows by `seq` order and reports the stored label verbatim (it never joins live refs), so neither path silently misses the renumbered band |
 
 ## Flag propagation contract (kernel)
 
