@@ -1,5 +1,5 @@
 import type { CoreMessage } from "acp-kernel";
-import { coreToAnthropic, healAnthropicSystemPositions, type AnthropicRequestBody } from "acp-kernel/wire";
+import { coreToAnthropic, healAnthropicSystemPositions, insertBeforeTrailingSystemRun, type AnthropicRequestBody } from "acp-kernel/wire";
 import { dedupeAdjacentOutputConfig } from "../dedupe-adjacent-output-config.js";
 import { appendSystemText, declaredInclusiveFromUsage } from "../util.js";
 import { stampAnthropicSystemCacheControl } from "./cache-control.js";
@@ -316,8 +316,10 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
             // injectSystem — both must emit byte-identical system (F2 seam).
             const system = originalSystem !== undefined ? appendSystemText(systemPrompt, originalSystem) : systemPrompt;
             const stamped = cacheMarks ? stampAnthropicSystemCacheControl(system) : system;
+            // #5432: notes go BEFORE a trailing client system run; the #4570
+            // backstop heals whatever still arrives illegal (fold orphans).
             const withNotes = notes && notes.length > 0
-                ? healAnthropicSystemPositions([...messages, ...notes.map((text) => ({ role: "user" as const, content: text }))])
+                ? healAnthropicSystemPositions(insertBeforeTrailingSystemRun(messages, notes.map((text) => ({ role: "user" as const, content: text }))))
                 : messages;
             return { ...body, system: stamped, messages: withNotes };
         },
