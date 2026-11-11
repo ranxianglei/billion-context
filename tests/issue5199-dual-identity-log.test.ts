@@ -3,7 +3,7 @@ import test from "node:test";
 
 process.env.NODE_ENV = "test";
 
-import { createCore, defaultConfig, createInitialState, restampRefsToLedger, emptyRefMap, type CoreMessage, type CompressionState } from "acp-kernel";
+import { createCore, defaultConfig, createInitialState, emptyRefMap, type CoreMessage, type CompressionState } from "acp-kernel";
 import { applyRanges, supersededRefRejection, type RewriteCtx } from "../src/stream.ts";
 
 // #5199: after a restart, the cold-load ledger restamp can hand a pre-restart
@@ -22,23 +22,33 @@ import { applyRanges, supersededRefRejection, type RewriteCtx } from "../src/str
 //  T4 translation path intact — a genuinely-vacated cite still translates
 //     onto the same message with no dual-identity entry.
 
-// Same drifted shape as tests/issue4797-superseded-deadlock.test.ts:
-// rows/seq a=0..f=5; old refs a=m1 b=m3 c=BLOCKED d=m4 e=m6 f=m7.
-// Post-restamp (master, no kernel liveness prune): b→m2, e→m5, f takes e's
-// vacated m6 → LIVE a=m1 b=m2 d=m4 e=m5 f=m6; superseded {m3→b, m6→e, m7→f}.
-// m6 is therefore dual-identity: live for f AND still e's recorded label.
+// Pre-#5196 restamped-session shape, built DIRECTLY rather than via
+// restampRefsToLedger: #5196 slot-retirement changed the kernel so a fresh
+// restamp no longer re-issues a vacated number (in this shape f would park on
+// m8 instead of taking e's vacated m6), so the restamp path can no longer
+// reproduce the fixture. Sessions restamped BEFORE #5196 still carry exactly
+// this persisted shape, which we build verbatim so the host-guard pin stays
+// independent of the kernel's current restamp algorithm:
+//   LIVE: a=m1 b=m2 d=m4 e=m5 f=m6 ; superseded {m3→b, m6→e, m7→f}.
+//   m6 is therefore dual-identity: live for f AND still e's recorded old label.
 function restampedSession(): { session: RewriteCtx["session"]; messages: CoreMessage[] } {
     const state: CompressionState = createInitialState();
     const map = emptyRefMap();
     map.byRaw.a = "m00001"; map.byRef.m00001 = "a";
-    map.byRaw.b = "m00003"; map.byRef.m00003 = "b";
+    map.byRaw.b = "m00002"; map.byRef.m00002 = "b";
     map.byRaw.c = "BLOCKED";
     map.byRaw.d = "m00004"; map.byRef.m00004 = "d";
-    map.byRaw.e = "m00006"; map.byRef.m00006 = "e";
-    map.byRaw.f = "m00007"; map.byRef.m00007 = "f";
+    map.byRaw.e = "m00005"; map.byRef.m00005 = "e";
+    map.byRaw.f = "m00006"; map.byRef.m00006 = "f";
     state.messageRefs = map;
-    const seq = new Map([["a", 0], ["b", 1], ["c", 2], ["d", 3], ["e", 4], ["f", 5]]);
-    const outcome = restampRefsToLedger(state, seq);
+    // The persisted superseded map such a legacy session carries: each vacated
+    // number mapped to its pre-restamp owner. m6→e is the dual-identity entry
+    // (m6 is live for f yet still recorded as e's old label).
+    const superseded = new Map([
+        ["m00003", "b"],
+        ["m00006", "e"],
+        ["m00007", "f"],
+    ]);
     const messages: CoreMessage[] = [
         { id: "a", role: "user", contentType: "text", text: "message a body " + "with enough substance to be worth folding someday. ".repeat(120) },
         { id: "b", role: "assistant", contentType: "text", text: "message b body " + "with enough substance to be worth folding someday. ".repeat(120) },
@@ -52,7 +62,7 @@ function restampedSession(): { session: RewriteCtx["session"]; messages: CoreMes
         stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, compressCreditTokens: 0, contextTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0 },
         metadata: {},
         state,
-        restampSuperseded: outcome.superseded,
+        restampSuperseded: superseded,
         createdAt: Date.now(),
         lastSeen: Date.now(),
         blockContents: new Map(),
