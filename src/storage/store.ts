@@ -2567,8 +2567,8 @@ export class UnifiedStore {
         }
         if (keyPrefix !== undefined && keyPrefix !== "") {
             validateExtKey(keyPrefix, "key prefix");
-            where.push("key LIKE ? ESCAPE '\\'");
-            args.push(likeEscape(keyPrefix) + "%");
+            where.push("key LIKE ? ESCAPE '\\' AND instr(key, ?) = 1");
+            args.push(likeEscape(keyPrefix) + "%", keyPrefix);
         }
         const sql =
             "SELECT namespace, key, value_json, updated_at FROM kv_store" +
