@@ -3103,9 +3103,10 @@ async function handleRequest(
                 if (!countTokens && !responsesCompact && protocol && prepared && bodyMayCarryImages) {
                     session.incomingImageIndex = refreshIncomingImageIndex(parsed, protocol, session.state, session.id, session.incomingImageIndex);
                 }
-                // #2155 self-heal round: one evaluation per request, on the
-                // nudge-carrying prepared result (bypass lanes have nudge
-                // undefined and the hook no-ops inside). Side requests
+                // #2155 self-heal round: one evaluation per request, whenever
+                // prepare produced a nudge decision — every main round (the
+                // kernel emits one whether it injects or not; #4578). Bypass
+                // lanes leave nudge undefined and skip it. Side requests
                 // (title-gen etc.) never carry a nudge, so they cannot burn
                 // zombie credit either. #3004: nudgeActive is the POST-GATE
                 // delivery fact (prepared.nudgeOutcome === "injected") — the

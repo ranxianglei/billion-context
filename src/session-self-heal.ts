@@ -195,8 +195,9 @@ type LogFn = (level: "info" | "warn", message: string) => void;
 
 /** Evaluate one prepared round. Pure w.r.t. inputs; mutates only the WeakMap
  * counters and (on transitions) session.metadata.selfHeal. Called once per
- * HTTP request after prepare (nudge-carrying rounds only — bypass lanes
- * never reach it). */
+ * HTTP request after prepare, on EVERY main round — the kernel emits a
+ * NudgeDecision whether it injects or not (#4578); bypass lanes leave nudge
+ * undefined and never reach it. */
 export function evaluateSelfHealRound(session: Session, inputs: SelfHealRoundInputs, log: LogFn): void {
     const st = counters.get(session) ?? { lastReductionKey: undefined, zombieStreak: 0, idleStreak: 0 };
     counters.set(session, st);
