@@ -317,6 +317,11 @@ export function buildSnapEgressView(
     const anchors: AnchorSeed[] = [];
     for (const b of state.blocks) {
         if (!b.active) continue;
+        // #5765 retire parity (kernel collectSummaryAnchors / D-lane render): a
+        // retired block stays active but its summary is intentionally NOT
+        // re-rendered — its covered rows stay covered (suppressed here by the
+        // active flag, exactly as the D-lane does).
+        if (b.retired === true) continue;
         if (b.compressCallId !== undefined && visibleCompressCallIds.has(b.compressCallId)) continue;
         const sid = summaryMessageId(b.blockId);
         const existing = summaryIndexById.get(sid);
