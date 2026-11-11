@@ -122,7 +122,10 @@ function completed(protocol: PreflightProtocol, events: unknown[], streaming: bo
             if (streaming ? item.type === "message_stop" && anthropicStopReason : anthropicStopReason) terminal = true;
         } else if (protocol === "openai") {
             const choice = Array.isArray(item.choices) ? record(item.choices[0]) : undefined;
-            if (record(choice?.message)?.tool_calls || record(choice?.delta)?.tool_calls) return false;
+            if ([record(choice?.message), record(choice?.delta)].some((payload) => {
+                const calls = payload?.tool_calls;
+                return Array.isArray(calls) ? calls.length > 0 : !!calls;
+            })) return false;
             if (choice?.finish_reason) {
                 if (choice.finish_reason !== "stop") return false;
                 terminal = true;
