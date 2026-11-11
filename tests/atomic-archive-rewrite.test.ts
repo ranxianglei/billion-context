@@ -53,8 +53,7 @@ test("a partial archive cleanup write cannot destroy other archived sessions", (
     }
 });
 
-test("successful cleanup preserves archive permissions under a restrictive umask", () => {
-    const previousUmask = process.umask(0o077);
+test("successful cleanup preserves records and POSIX archive permissions", () => {
     const dir = fs.mkdtempSync(join(tmpdir(), "atomic-archive-ok-"));
     const store = UnifiedStore.open(join(dir, "index.db"));
     try {
@@ -64,13 +63,18 @@ test("successful cleanup preserves archive permissions under a restrictive umask
             store.archiveSession(id, { archiveDir });
         }
         const file = join(archiveDir, UnifiedStore.ARCHIVE_LOG_NAME);
-        fs.chmodSync(file, 0o640);
-        assert.equal(store.restoreArchived("first", { archiveDir }).ok, true);
+        const posixPermissions = process.platform !== "win32";
+        if (posixPermissions) fs.chmodSync(file, 0o640);
+        const previousUmask = posixPermissions ? process.umask(0o077) : undefined;
+        try {
+            assert.equal(store.restoreArchived("first", { archiveDir }).ok, true);
+        } finally {
+            if (previousUmask !== undefined) process.umask(previousUmask);
+        }
         assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).sessionId, "second");
-        if (process.platform !== "win32") assert.equal(fs.statSync(file).mode & 0o777, 0o640);
+        if (posixPermissions) assert.equal(fs.statSync(file).mode & 0o777, 0o640);
         assert.deepEqual(fs.readdirSync(archiveDir), [UnifiedStore.ARCHIVE_LOG_NAME]);
     } finally {
-        process.umask(previousUmask);
         store.close();
         fs.rmSync(dir, { recursive: true, force: true });
     }
