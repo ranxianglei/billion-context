@@ -54,7 +54,7 @@ interface SnapEgressDeps {
      *  the lane can persist the new frontier (only after the outbound
      *  succeeds — a failed round keeps the old state and re-sends the same
      *  delta: at-least-once). */
-    onSelection?: (sel: DeltaSelection) => void;
+    onSelection?: (sel: DeltaSelection, totalElements: number) => void;
 }
 
 // ---------------------------------------------------------------------------
@@ -478,7 +478,7 @@ export function applySnapEgress(
                 const keep = new Set(selection.delta.map((e) => e.msg));
                 outMsgs = built.msgs.filter((m) => keep.has(m));
             }
-            deps.onSelection?.(selection);
+            deps.onSelection?.(selection, elements.length);
         }
         const planeProcessed = deps.transform(outMsgs);
         // DIRECT AUTHORITY: the plane view is the outbound source. The legacy
