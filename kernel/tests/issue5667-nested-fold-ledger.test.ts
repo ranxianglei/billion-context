@@ -11,7 +11,7 @@ import {
   mergeRangesToThreshold,
 } from "../src/recommend.js";
 import { formatRanges } from "../src/nudge-text.js";
-import { buildStatusReport } from "../src/report.js";
+import { buildStatusReport, projectionErrorDetail } from "../src/report.js";
 import type {
   CompressionBlock,
   Config,
@@ -274,4 +274,15 @@ test("C: an unresolvable endpoint surfaces the real reason, not a flat verdict",
   assert.match(out, /not foldable:/);
   assert.doesNotMatch(out, /refs unresolvable/);
   assert.match(out, /Invalid boundary ref/);
+});
+
+test("C: projectionErrorDetail falls back when the error carries no message", () => {
+  assert.equal(projectionErrorDetail(new Error("")), "no error detail");
+  assert.equal(projectionErrorDetail(new Error(" \t\n ")), "no error detail");
+  assert.equal(projectionErrorDetail("plain reason"), "plain reason");
+  assert.equal(
+    projectionErrorDetail(new Error("x".repeat(500))).length,
+    120,
+    "long details stay truncated",
+  );
 });

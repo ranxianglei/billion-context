@@ -191,6 +191,12 @@ export interface StatusReportOptions {
   originalMessages?: CoreMessage[];
 }
 
+export function projectionErrorDetail(err: unknown): string {
+  const raw = err instanceof Error ? err.message : String(err);
+  const detail = scrubLoneSurrogates(raw).trim();
+  return detail.slice(0, 120) || "no error detail";
+}
+
 export function buildStatusReport(
   state: CompressionState,
   messages: CoreMessage[],
@@ -465,8 +471,7 @@ function renderUncompressedRanges(
           shared,
         });
       } catch (err) {
-        const detail = err instanceof Error ? err.message : String(err);
-        return `\u26a0 not foldable: ${scrubLoneSurrogates(detail).slice(0, 120)}`;
+        return `\u26a0 not foldable: ${projectionErrorDetail(err)}`;
       }
       if (proj.fatal?.kind === "zone")
         return "\u26a0 not foldable: protected zone only";
