@@ -184,7 +184,7 @@ export interface MessageRow {
  *  content bytes and drops non-string-role rows, so this sentinel never reaches
  *  a model request — it exists so one bad row lands instead of latching the
  *  whole unified store off via the #4341 consecutive-failure amplifier. */
-export const UNSET_MESSAGE_ROLE = "unknown";
+const UNSET_MESSAGE_ROLE = "unknown";
 export function normalizeMessageRole(role: unknown): string {
     return typeof role === "string" ? role : UNSET_MESSAGE_ROLE;
 }
