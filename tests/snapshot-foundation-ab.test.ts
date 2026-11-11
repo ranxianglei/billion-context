@@ -40,6 +40,11 @@ import { SessionStore, _setStoreForTest, _resetStoreForTest } from "../src/persi
 import { _resetPluginStateForTest } from "../src/plugin.ts";
 import { _resetSessionsForTest } from "../src/session.ts";
 import { closeServers } from "./server-close-guard.ts";
+// The CI test baseline pins BILI_STORAGE_UNIFIED=legacy (tests/preload-storage-baseline.mjs,
+// #4011 lesson): a suite whose assertions depend on a specific storage mode MUST pin its own
+// mode. The unified sqlite sidecar is the substrate both phases run on.
+process.env.BILI_STORAGE_UNIFIED = "full";
+
 
 const ENV_MASTER = "BILI_ROLLOUT_SNAPSHOT_FOUNDATION";
 const ENV_LANE = "BILI_ROLLOUT_SNAPSHOT_LANE";

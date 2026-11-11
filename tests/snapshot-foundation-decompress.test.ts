@@ -23,6 +23,11 @@ import { resolveDecompress } from "../src/decompress-shared.ts";
 import type { ProxyToolResult } from "../src/proxy-tool-result.ts";
 
 const BLOCK_ID = "blk-t8";
+// The CI test baseline pins BILI_STORAGE_UNIFIED=legacy (tests/preload-storage-baseline.mjs,
+// #4011 lesson): a suite whose assertions depend on a specific storage mode MUST pin its own
+// mode. This one needs the unified sqlite substrate — the row ledger IS the fixture here.
+process.env.BILI_STORAGE_UNIFIED = "full";
+
 const NO_LOG = (_msg: string): void => {};
 
 function makeSession(id: string): Session {
