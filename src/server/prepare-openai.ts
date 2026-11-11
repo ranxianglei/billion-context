@@ -9,7 +9,7 @@ import { currentCalibrationFactor, hardenOpenaiAssistantContent, systemToUser } 
 import { conversationHeaderSource, resolveRelayAffinityPck } from "../session-id.js";
 import { MSG_IDS_BODY_FIELD, applyMsgIdPin, validateMsgIds } from "../msgid-pin.js";
 import { pluginAgentHeader } from "../plugin.js";
-import { applyReasoningDrop, diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, planReasoningDrop, makeFoldPointReasoningDroppable, reapOrphansLogged, resolveKnownOutputCeiling, runNudgeDecision, stripKernelSummaries, warnDroppedOpenaiParts, warnReasoningPairs, type Prepared } from "../server.js";
+import { applyReasoningDrop, diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, planReasoningDrop, reapOrphansLogged, resolveKnownOutputCeiling, runNudgeDecision, stripKernelSummaries, warnDroppedOpenaiParts, warnReasoningPairs, type Prepared } from "../server.js";
 import { recordNudgeObservation } from "../context-analysis.js";
 import { yieldToEventLoop } from "../yield-loop.js";
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, resolveDecisionRange, stripDecisionReasoningFields, type DecideConfig } from "../nudge-decide.js";
@@ -278,10 +278,6 @@ export async function prepareOpenai(
         const absorbActive = absorbBlock?.enabled === true && shouldInject;
         const rulesActive = rulesEnabled(config) && shouldInject;
         const loopConfig = ccrLoopConfig(session, { ...config, absorb: absorbActive ? absorbBlock : undefined });
-        // Experimental fold-point "thinking clear" (default OFF): install the kernel drop predicate only when BOTH switches are set; strict-echo (#684) and signed-thinking views yield none at all (#1658).
-        if (loopConfig.compressAtFoldPointClearThinking) {
-            loopConfig.reasoningDroppable = makeFoldPointReasoningDroppable(renderMsgs, isStrictReasoningEcho(session, upstreamOrigin, modelIdOf(parsed)));
-        }
         // #5664 render-snapshot lane — gate at station entry (cheap probes
         // only). Every red condition keeps the pre-#5664 path byte-for-byte;
         // a green verdict only swaps the processTurn slot below to a bounded
@@ -295,7 +291,8 @@ export async function prepareOpenai(
             const rcaps: RenderCaps = {
                 v: 1,
                 strategy: renderStrategy,
-                droppable: loopConfig.compressAtFoldPointClearThinking === true,
+                // #6132 removed fold-point clear-thinking — reasoning is never dropped at folds now
+                droppable: false,
                 multimodal: wpHit.seedMultimodal === true || wpHit.windowCores.some((m) => Array.isArray((m as { content?: unknown }).content)),
             };
             renderCapturedCaps = rcaps;
