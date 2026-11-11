@@ -53,7 +53,7 @@ interface SnapEgressDeps {
 
 const DEFAULT_COHORTS: ReadonlySet<SnapEgressProtocol> = new Set(["openai", "anthropic", "google", "responses"]);
 
-export function snapEgressFlags(): { egress: boolean; cohorts: ReadonlySet<SnapEgressProtocol> } {
+function snapEgressFlags(): { egress: boolean; cohorts: ReadonlySet<SnapEgressProtocol> } {
     const file = loadConfigFile();
     const v = file.storage?.snapBase;
     // SOAK (#5874): default ON at 100% for the soak + full-CI run.
