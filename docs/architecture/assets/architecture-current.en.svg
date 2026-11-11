@@ -1,0 +1,176 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1560" height="984" viewBox="0 0 1560 984">
+  <style>
+    text { font-family: sans-serif; }
+    .tt { font-size: 22px; font-weight: 700; fill: #0f172a; }
+    .sub { font-size: 13px; fill: #475569; }
+    .h  { font-size: 14px; font-weight: 700; fill: #0f172a; }
+    .b  { font-size: 12px; fill: #1e293b; }
+    .s  { font-size: 11px; fill: #475569; }
+    .chip { font-size: 11px; fill: #334155; }
+    .warn { font-size: 12px; fill: #7f1d1d; font-weight: 700; }
+    .warnb { font-size: 11px; fill: #991b1b; }
+    .num { font-size: 13px; font-weight: 700; fill: #b91c1c; }
+    .leg { font-size: 11px; fill: #334155; }
+  </style>
+  <defs>
+    <marker id="ar" markerWidth="10" markerHeight="8" refX="9" refY="3" orient="auto"><path d="M0,0 L9,3 L0,6 Z" fill="#334155"/></marker>
+    <marker id="arra" markerWidth="10" markerHeight="8" refX="9" refY="3" orient="auto"><path d="M0,0 L9,3 L0,6 Z" fill="#b91c1c"/></marker>
+  </defs>
+
+  <rect x="0" y="0" width="1560" height="984" fill="#ffffff"/>
+  <text x="30" y="42" class="tt">Current architecture · bili context-compression proxy (origin/master @ 2026-11-08, storage schema v11)</text>
+  <text x="30" y="68" class="sub">Four lanes each own their slice + kstate JSON as a parallel source of truth — the three structural pain points are boxed in red on the right (the #5854 v6 line was fully reverted out of master; evolution direction: #5643)</text>
+
+  <!-- legend -->
+  <g>
+    <rect x="620" y="84" width="14" height="14" rx="3" fill="#f3f4f6" stroke="#9ca3af"/>
+    <text x="640" y="95" class="leg">Host / existing pipeline</text>
+    <rect x="790" y="84" width="14" height="14" rx="3" fill="#dcfce7" stroke="#16a34a"/>
+    <text x="810" y="95" class="leg">Kernel (unchanged)</text>
+    <rect x="950" y="84" width="14" height="14" rx="3" fill="#e0e7ff" stroke="#4f46e5"/>
+    <text x="970" y="95" class="leg">Unified storage</text>
+    <rect x="1090" y="84" width="14" height="14" rx="3" fill="#fee2e2" stroke="#ef4444"/>
+    <text x="1110" y="95" class="leg">Structural pain point</text>
+    <rect x="1260" y="84" width="14" height="14" rx="3" fill="#fff" stroke="#334155" stroke-width="2"/>
+    <text x="1280" y="95" class="leg">Default main path</text>
+    <rect x="1390" y="84" width="14" height="14" rx="3" fill="#fff" stroke="#334155" stroke-dasharray="4 3"/>
+    <text x="1410" y="95" class="leg">Experimental rollout lane</text>
+  </g>
+
+  <!-- hosts -->
+  <rect x="30" y="112" width="230" height="238" rx="8" fill="#f3f4f6" stroke="#9ca3af"/>
+  <text x="145" y="138" class="h" text-anchor="middle">Host lanes (identity capture in place)</text>
+  <text x="48" y="166" class="b">dsh — shim / incremental envelope</text>
+  <text x="48" y="192" class="b">pi — entry-walker capture</text>
+  <text x="48" y="218" class="b">opencode — transform hooks</text>
+  <text x="48" y="244" class="b">codex — responses wire</text>
+  <text x="48" y="270" class="b">other hosts — bare proxy clients</text>
+  <text x="48" y="300" class="s">session id in the request headers;</text>
+  <text x="48" y="316" class="s">plugin lanes carry per-element host</text>
+  <text x="48" y="332" class="s">msgid in the envelope (#5842 in place)</text>
+
+  <!-- ingress -->
+  <rect x="330" y="148" width="250" height="72" rx="8" fill="#f3f4f6" stroke="#9ca3af"/>
+  <text x="455" y="176" class="h" text-anchor="middle">Ingress adapters prepare-*</text>
+  <text x="455" y="200" class="s" text-anchor="middle">anthropic | openai | responses | google</text>
+  <!-- branching -->
+  <rect x="330" y="272" width="250" height="62" rx="8" fill="#f3f4f6" stroke="#9ca3af"/>
+  <text x="455" y="298" class="h" text-anchor="middle">lane-decisions routing</text>
+  <text x="455" y="320" class="s" text-anchor="middle">request shape × sticky session binding</text>
+
+  <!-- lanes -->
+  <rect x="640" y="112" width="330" height="80" rx="8" fill="#eef2f7" stroke="#334155" stroke-width="2.5"/>
+  <text x="805" y="138" class="h" text-anchor="middle">legacy full-resend path (today's default)</text>
+  <text x="805" y="160" class="s" text-anchor="middle">JSON.parse of everything + full openaiToCore</text>
+  <text x="805" y="176" class="s" text-anchor="middle">lastMessages AST pinned in memory → #5403 OOM</text>
+
+  <rect x="640" y="214" width="330" height="64" rx="8" fill="#f8fafc" stroke="#64748b"/>
+  <text x="805" y="240" class="h" text-anchor="middle">incremental plugin-turn lane</text>
+  <text x="805" y="262" class="s" text-anchor="middle">anthropic wire divert · x-bili-plugin-turn rounds</text>
+
+  <rect x="640" y="300" width="330" height="64" rx="8" fill="#ffffff" stroke="#334155" stroke-dasharray="5 4"/>
+  <text x="805" y="326" class="h" text-anchor="middle">v5 watermark fastpath (5% rollout)</text>
+  <text x="805" y="348" class="s" text-anchor="middle">fastpath-scan structural scan · pf-seq stamp handshake</text>
+
+  <rect x="640" y="382" width="330" height="72" rx="8" fill="#ffffff" stroke="#334155" stroke-dasharray="5 4"/>
+  <text x="805" y="406" class="h" text-anchor="middle">D-lane snapshot render #3756 (≈0% rollout)</text>
+  <text x="805" y="428" class="s" text-anchor="middle">server-side canonical render of egress prefix</text>
+  <text x="805" y="444" class="s" text-anchor="middle">any failure ⇒ wholesale fallback to legacy</text>
+
+  <!-- kernel -->
+  <rect x="1030" y="128" width="250" height="264" rx="8" fill="#dcfce7" stroke="#16a34a" stroke-width="2"/>
+  <text x="1155" y="156" class="h" text-anchor="middle">acp-kernel compression engine</text>
+  <text x="1155" y="174" class="s" text-anchor="middle">(zero changes in the #5643 evolution)</text>
+  <text x="1048" y="202" class="b">fold judgment projectUnit</text>
+  <text x="1048" y="220" class="b">(shared projection)</text>
+  <text x="1048" y="246" class="b">summary generation + 4 prompts</text>
+  <text x="1048" y="272" class="b">nudge flat-50K fixed cadence</text>
+  <text x="1048" y="298" class="b">ref/msgid ledger (ids never reused)</text>
+  <text x="1048" y="324" class="b">CompressionState:</text>
+  <text x="1048" y="342" class="s">blocks / refs / deadRefs / ckpt</text>
+  <text x="1048" y="360" class="s">tokenSnapshot / nextBlockId …</text>
+  <text x="1048" y="382" class="s">who hydrates state — see below</text>
+
+  <!-- egress -->
+  <rect x="1330" y="128" width="200" height="230" rx="8" fill="#f3f4f6" stroke="#9ca3af"/>
+  <text x="1430" y="156" class="h" text-anchor="middle">Egress mapping coreTo*</text>
+  <text x="1348" y="186" class="b">four-wire re-serialization</text>
+  <text x="1348" y="214" class="s">carrier branch:</text>
+  <text x="1348" y="232" class="s">pluginMode: no tool+nudge</text>
+  <text x="1348" y="250" class="s">proxy: acp_summary revoiced</text>
+  <text x="1348" y="268" class="s">as a user message</text>
+  <text x="1348" y="296" class="s">pf-*/envelope headers stay</text>
+  <text x="1348" y="314" class="s">inside the proxy</text>
+  <rect x="1330" y="402" width="200" height="60" rx="8" fill="#f3f4f6" stroke="#9ca3af"/>
+  <text x="1430" y="426" class="h" text-anchor="middle">Model endpoint</text>
+  <text x="1430" y="444" class="s" text-anchor="middle">sglang / openai·responses</text>
+  <text x="1430" y="458" class="s" text-anchor="middle">anthropic / google</text>
+
+  <!-- storage band -->
+  <rect x="30" y="520" width="1300" height="240" rx="8" fill="#eef2ff" stroke="#4f46e5"/>
+  <text x="50" y="550" class="h">Unified SQLite · schema v11 (#5539 FK sub-index) — the row-level source of truth is only half there</text>
+  <!-- table chips row1 -->
+  <g>
+    <rect x="50" y="568" width="118" height="30" rx="5" fill="#e0e7ff" stroke="#6366f1"/><text x="109" y="588" class="chip" text-anchor="middle">sessions</text>
+    <rect x="178" y="568" width="118" height="30" rx="5" fill="#e0e7ff" stroke="#6366f1"/><text x="237" y="588" class="chip" text-anchor="middle">content</text>
+    <rect x="306" y="568" width="118" height="30" rx="5" fill="#e0e7ff" stroke="#6366f1"/><text x="365" y="588" class="chip" text-anchor="middle">messages</text>
+    <rect x="434" y="568" width="118" height="30" rx="5" fill="#e0e7ff" stroke="#6366f1"/><text x="493" y="588" class="chip" text-anchor="middle">blocks / dead_refs</text>
+    <rect x="562" y="568" width="118" height="30" rx="5" fill="#e0e7ff" stroke="#6366f1"/><text x="621" y="588" class="chip" text-anchor="middle">refs / checkpoints</text>
+    <rect x="690" y="568" width="118" height="30" rx="5" fill="#e0e7ff" stroke="#6366f1"/><text x="749" y="588" class="chip" text-anchor="middle">ccr_entries</text>
+    <rect x="818" y="568" width="118" height="30" rx="5" fill="#e0e7ff" stroke="#6366f1"/><text x="877" y="588" class="chip" text-anchor="middle">kv_store</text>
+    <rect x="946" y="568" width="150" height="30" rx="5" fill="#e0e7ff" stroke="#6366f1"/><text x="1021" y="588" class="chip" text-anchor="middle">message_media / ext</text>
+  </g>
+  <g>
+    <rect x="50" y="608" width="118" height="30" rx="5" fill="#e0e7ff" stroke="#6366f1"/><text x="109" y="628" class="chip" text-anchor="middle">conversations</text>
+    <rect x="178" y="608" width="118" height="30" rx="5" fill="#e0e7ff" stroke="#6366f1"/><text x="237" y="628" class="chip" text-anchor="middle">session_ext</text>
+    <rect x="306" y="608" width="240" height="30" rx="5" fill="#fee2e2" stroke="#ef4444"/><text x="426" y="628" class="warn" text-anchor="middle">kstate JSON (hydration field list)</text>
+  </g>
+  <text x="50" y="668" class="warnb">messages.msgId stores bili/kernel canonical ids — the host msgid has no landing spot; no table carries sess_raw.</text>
+  <text x="50" y="690" class="warnb">The surviving CompressionState fields are defined once by src/state-hydration.ts mergeState() and stored via kstate JSON through persist.ts.</text>
+  <text x="50" y="730" class="s">#5855 (v6 re-land · PF transaction skeleton) is open, awaiting human merge — the new four-table DDL must layer on top of it.</text>
+
+  <!-- red warning boxes right -->
+  <rect x="1150" y="520" width="380" height="70" rx="8" fill="#fee2e2" stroke="#ef4444"/>
+  <text x="1166" y="545" class="warn">⚠ Pain 1: state lives in three places</text>
+  <text x="1166" y="565" class="warnb">dual-write fork bricked the reverted line; #5403 OOM = full</text>
+  <text x="1166" y="581" class="warnb">lastMessages residency; restart reassembles via mergeState</text>
+  <rect x="1150" y="602" width="380" height="70" rx="8" fill="#fee2e2" stroke="#ef4444"/>
+  <text x="1166" y="627" class="warn">⚠ Pain 2: identity never lands on disk</text>
+  <text x="1166" y="647" class="warnb">host (sess_raw, msgid) pairs stripped at ingest — one-turn</text>
+  <text x="1166" y="663" class="warnb">envelope life only: cold-start re-probe + re-arm every turn</text>
+  <rect x="1150" y="684" width="380" height="76" rx="8" fill="#fee2e2" stroke="#ef4444"/>
+  <text x="1166" y="709" class="warn">⚠ Pain 3: fastpaths patch their own slices</text>
+  <text x="1166" y="729" class="warnb">v5 watermark / incremental / D-lane each own a slice; cache</text>
+  <text x="1166" y="745" class="warnb">stability = stacked patches; a slip = poisoning or rollback</text>
+
+  <!-- problem strip -->
+  <rect x="30" y="800" width="1500" height="100" rx="8" fill="#f8fafc" stroke="#cbd5e1"/>
+  <text x="50" y="830" class="h" fill="#b91c1c">Evolution target (#5643): raw bytes → protocol translation → rewrite (compression) → snapshot-table apply → egress mapping → egress — six-stage fixed chain, full every turn, one storage source of truth.</text>
+  <text x="50" y="858" class="b">Kernel (fold judgment / summaries / prompts / ref contract) untouched · hosts with session+msgid all take this path · no msgid degrades by order&gt;hash into the same tables.</text>
+  <text x="50" y="882" class="s">Mapping onto this diagram: ingress → four lanes (replaced by the chain's identity-ized stages 0–1) → kernel (stage 2, untouched) → egress (stages 4–5); the new stage 0 (L1 identity) and stage 3 (snapshot table) do not exist today.</text>
+
+  <!-- arrows -->
+  <g stroke="#334155" fill="none" stroke-width="1.6">
+    <path d="M260,200 H300 V184 H330" marker-end="url(#ar)"/>
+    <path d="M455,220 V272" marker-end="url(#ar)"/>
+    <path d="M580,303 H612"/>
+    <path d="M612,152 V418"/>
+    <path d="M612,152 H640" marker-end="url(#ar)"/>
+    <path d="M612,246 H640" marker-end="url(#ar)"/>
+    <path d="M612,332 H640" marker-end="url(#ar)"/>
+    <path d="M612,418 H640" marker-end="url(#ar)"/>
+    <path d="M970,152 H1002"/>
+    <path d="M970,246 H1002"/>
+    <path d="M970,332 H1002"/>
+    <path d="M970,418 H1002"/>
+    <path d="M1002,152 V418"/>
+    <path d="M1002,265 H1030" marker-end="url(#ar)"/>
+    <path d="M1280,243 H1330" marker-end="url(#ar)"/>
+    <path d="M1430,358 V402" marker-end="url(#ar)"/>
+  </g>
+  <!-- state dual-channel arrows to storage -->
+  <g stroke="#b91c1c" fill="none" stroke-width="1.4" stroke-dasharray="5 4">
+    <path d="M1155,392 V520" marker-end="url(#arra)"/>
+  </g>
+  <text x="1163" y="470" class="warnb">State read/write = kstate JSON + tables dual channel (the fork point)</text>
+</svg>
