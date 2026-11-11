@@ -22,6 +22,8 @@ billion-context/
 │   │   ├── handoff-response.ts   #   Retains parsed assistant output for handoff export without changing request snapshots
 │   │   ├── headers.ts            #   Client-provided id sanitization for dump filenames (#286)
 │   │   ├── inject.ts             #   Per-wire tool-injection wrappers + FORCE_TEXT_PROTOCOL switch (#1440)
+│   │   ├── native-identity-obs.ts       #   Native identity observation layer: live measurement of the #5571 collection table (default off) (#5571)
+│   │   ├── native-identity-profiles.ts #   Per-host native identity profiles feeding the observation layer (#5571)
 │   │   ├── observability.ts      #   Body dumps (dumps/req-*.json, raw/*), unrecognized-path stats
 │   │   ├── prepare-anthropic.ts  #   Anthropic request preparation (fold → rebuild → system/nudge injection) (#1440)
 │   │   ├── prepare-google.ts     #   Gemini request preparation incl. :countTokens twin (#1440)

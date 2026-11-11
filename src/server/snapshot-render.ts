@@ -97,7 +97,7 @@ export function identitySigForTest(m: BiliMessage): string {
 // per session at most (latch lives in session.metadata). Deliberately NOT
 // reused from buildView: this module is render authority (#3812/#4241) — the
 // probe must not couple doctrine-critical walk code to a diagnostics path.
-export interface TranscriptProbeResult {
+interface TranscriptProbeResult {
     readonly anchored: boolean;
     /** Human-readable reason when not anchored. */
     readonly reason?: string;
