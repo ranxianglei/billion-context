@@ -4153,6 +4153,72 @@ test("parseHermesYaml: v12 dict base_url/url forms + base_url wins over api", ()
     assert.equal(priority.providers.p?.api, "http://fresh:1/v1", "base_url beats api (hermes priority)");
 });
 
+test("parseHermesYaml: top-level base_url next to provider: is the stock config shape (#6022)", () => {
+    // Stock Hermes config: no providers map — provider + endpoint at the root.
+    const stock = parseHermesYaml([
+        "provider: nous",
+        "model: qwen3.8-27b",
+        'base_url: "https://inference-api.example.com/v1"',
+    ].join("\n"));
+    assert.equal(stock.providers.nous?.api, "https://inference-api.example.com/v1",
+        "top-level base_url attributes to the active provider");
+
+    // No provider name → synthetic entry; url/api key forms work too.
+    const unnamed = parseHermesYaml("url: https://u.example.com/v1\n");
+    assert.equal(unnamed.providers["top-level"]?.api, "https://u.example.com/v1");
+    const apiForm = parseHermesYaml("provider: p\napi: http://a:1/v1\n");
+    assert.equal(apiForm.providers.p?.api, "http://a:1/v1");
+
+    // Coexists with a providers map: keep BOTH hosts routable rather than
+    // guessing which shape wins (a missing whitelist entry = blind tunnel).
+    const mixed = parseHermesYaml([
+        "provider: alpha",
+        "providers:",
+        "  beta:",
+        "    base_url: https://beta.example.com/v1",
+        "base_url: https://alpha.example.com/v1",
+    ].join("\n"));
+    assert.equal(mixed.providers.beta?.api, "https://beta.example.com/v1");
+    assert.equal(mixed.providers.alpha?.api, "https://alpha.example.com/v1",
+        "active provider has no own entry → top-level URL lands under its name");
+
+    // Active provider DOES have an entry with a different URL: never overwrite.
+    const both = parseHermesYaml([
+        "provider: alpha",
+        "providers:",
+        "  alpha:",
+        "    base_url: https://map.example.com/v1",
+        "base_url: https://top.example.com/v1",
+    ].join("\n"));
+    assert.equal(both.providers.alpha?.api, "https://map.example.com/v1", "existing entry survives");
+    assert.equal(both.providers["top-level"]?.api, "https://top.example.com/v1");
+
+    // Same URL in both shapes → deduped to one entry.
+    const dup = parseHermesYaml([
+        "provider: alpha",
+        "providers:",
+        "  alpha:",
+        "    base_url: https://same.example.com/v1",
+        "base_url: https://same.example.com/v1",
+    ].join("\n"));
+    assert.deepEqual(Object.keys(dup.providers).sort(), ["alpha"]);
+});
+
+test("parseHermesYaml: quoted endpoint values survive (new URL() rejects quotes)", () => {
+    const q = parseHermesYaml([
+        "providers:",
+        "  bili:",
+        '    base_url: "http://127.0.0.1:8199/v1"',
+        "custom_providers:",
+        "  - name: sg",
+        "    url: 'http://s:1/v1'",
+        '  - api: "http://inline:1/v1"',
+    ].join("\n"));
+    assert.equal(q.providers.bili?.api, "http://127.0.0.1:8199/v1", "dict nested, double-quoted");
+    assert.equal(q.providers.sg?.api, "http://s:1/v1", "list nested, single-quoted");
+    assert.equal(q.providers["custom-1"]?.api, "http://inline:1/v1", "list inline, double-quoted");
+});
+
 test("readHermesConfig + resolveHermesHome", () => {
     assert.equal(resolveHermesHome({ HERMES_HOME: "/tmp/hh" }), "/tmp/hh");
     assert.ok(resolveHermesHome({}).endsWith(path.join(".hermes")));

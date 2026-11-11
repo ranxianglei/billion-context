@@ -62,6 +62,24 @@ export function incomingMsgIdsOf(body: unknown): string[] | undefined {
     return raw as string[];
 }
 
+// #5825 stamped-header channel: hosts that cannot rewrite the body they send
+// (opencode V2 — ids live on the structured event, not in the wire JSON) ride
+// them comma-joined on `x-bili-msg-ids`. Parsed into the SAME light contract
+// as incomingMsgIdsOf so downstream consumers see one shape; full strictness
+// stays at pin time (validateMsgIds). Absent / oversized / malformed →
+// undefined → exactly the pre-channel path.
+const STAMPED_HEADER_MAX_TOTAL_BYTES = 64 * 1024; // host-side budget is 16KiB; parse headroom above it
+const STAMPED_HEADER_MAX_IDS = 4096;
+
+export function incomingMsgIdsHeader(headerValue: string | string[] | undefined): string[] | undefined {
+    const raw = Array.isArray(headerValue) ? headerValue[0] : headerValue;
+    if (typeof raw !== "string" || raw.length === 0) return undefined;
+    if (raw.length > STAMPED_HEADER_MAX_TOTAL_BYTES) return undefined;
+    const list = raw.split(",").filter((s) => s.length > 0);
+    if (list.length === 0 || list.length > STAMPED_HEADER_MAX_IDS) return undefined;
+    return incomingMsgIdsOf({ [MSG_IDS_BODY_FIELD]: list });
+}
+
 type SeqValidation = { ok: true; seqs: number[] } | { ok: false; reason: string };
 
 /** Strict validation for the seq stamp array: 1-based positive integers,
