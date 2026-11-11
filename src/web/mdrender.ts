@@ -14,7 +14,7 @@
  * browser IIFE — keep it that way (nested helpers may call each other,
  * but nothing may reach out to this module's scope).
  */
-export interface MdRenderApi {
+interface MdRenderApi {
     escape(s: string): string;
     /** Block-level render: headings, paragraphs (<br/>-joined), fenced code
      *  (highlighted when a known language is tagged), lists, blockquotes,
