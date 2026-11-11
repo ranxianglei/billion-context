@@ -71,11 +71,11 @@ function bmpCoreB64(w: number, h: number): string {
     b.write("BM", 0, "ascii");
     b.writeUInt32LE(b.length, 2);
     b.writeUInt32LE(26, 10);
-    b.writeUInt32LE(12, 14);
-    b.writeUInt16LE(w, 18);
-    b.writeUInt16LE(h, 20);
-    b.writeUInt16LE(1, 22);
-    b.writeUInt16LE(24, 24);
+    b.writeUInt16LE(12, 14); // bfSize (WORD)=12 → CORE
+    b.writeUInt16LE(w, 16);  // bfWidth
+    b.writeUInt16LE(h, 18);  // bfHeight
+    b.writeUInt16LE(1, 20);  // planes
+    b.writeUInt16LE(24, 22); // bit count
     return b.toString("base64");
 }
 
