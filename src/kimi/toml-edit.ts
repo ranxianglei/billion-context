@@ -50,13 +50,24 @@ function headerParts(line: string): string[] | undefined {
     return tomlPathParts(m[1]);
 }
 
+function nonNegativeTomlInteger(value: string): number | undefined {
+    // Model limits accept TOML integer spelling, not a numeric prefix of a
+    // float/date. Underscores may only separate digits of the selected base.
+    if (!/^(?:\+?(?:0|[1-9](?:_?[0-9])*)|0x[0-9A-Fa-f](?:_?[0-9A-Fa-f])*|0o[0-7](?:_?[0-7])*|0b[01](?:_?[01])*)$/.test(value)) return undefined;
+    const parsed = Number(value.replace(/_/g, ""));
+    return Number.isSafeInteger(parsed) ? parsed : undefined;
+}
+
 function keyValue(line: string): { key: string; strVal?: string; numVal?: number } | undefined {
     const l = line.trim();
     if (!l || l.startsWith("#") || l.startsWith("[")) return undefined;
     const strMatch = /^([A-Za-z0-9_.-]+)\s*=\s*(?:"([^"]*)"|'([^']*)')/.exec(l);
     if (strMatch) return { key: strMatch[1], strVal: strMatch[2] !== undefined ? strMatch[2] : strMatch[3] };
-    const numMatch = /^([A-Za-z0-9_.-]+)\s*=\s*([0-9]+)\b/.exec(l);
-    if (numMatch) return { key: numMatch[1], numVal: Number(numMatch[2]) };
+    const numMatch = /^([A-Za-z0-9_.-]+)\s*=\s*([^\s#]+)\s*(?:#.*)?$/.exec(l);
+    if (numMatch) {
+        const numVal = nonNegativeTomlInteger(numMatch[2]);
+        if (numVal !== undefined) return { key: numMatch[1], numVal };
+    }
     // Inline tables / arrays ({ x-bili-plugin = "kimi" }, ["a"]) have no scalar
     // value — key-only, so callers can still locate/replace the line.
     const tblMatch = /^([A-Za-z0-9_.-]+)\s*=\s*[{[]/.exec(l);
