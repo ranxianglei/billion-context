@@ -31,10 +31,8 @@
 export const RESPONSES_INSTRUCTIONS_CHAR_LIMIT = 1_048_576;
 
 /** Result of the instructions size check. */
-export interface InstructionsOverflow {
-    /** The actual character length of body.instructions. */
+interface InstructionsOverflow {
     length: number;
-    /** The limit that was exceeded. */
     limit: number;
 }
 

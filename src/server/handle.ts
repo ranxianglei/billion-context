@@ -64,7 +64,7 @@ import { checkTunnelDestination, tunnelAllowlistFromEnv } from "../tunnel-guard.
 import { resolveCompatDropFields } from "../compat-drop.js";
 import { unwrapCommandcodeBody, type CommandcodeEnvelopeMeta } from "../commandcode-wire.js";
 import { DecompressedTooLargeError, decodeRequestBody, IngestBodyTooLargeError } from "../content-encoding.js";
-import { checkInstructionsOverflow, dedupInstructionsKeepLatest, RESPONSES_INSTRUCTIONS_CHAR_LIMIT } from "../instructions-guard.js";
+import { checkInstructionsOverflow, dedupInstructionsKeepLatest } from "../instructions-guard.js";
 import { matchModelEndpoint } from "../model-endpoints.js";
 import { autoModeForgeEnabled, dshAuthoredCompactionEnabled, imageRescaleEnabled, limitsDecodedBytes as knobLimitsDecodedBytes, limitsIngestBytes as knobLimitsIngestBytes, noInjectTool as knobNoInjectTool, rawDumpDir as knobRawDumpDir } from "../knobs.js";
 import { buildForgeResponse, classifierForgeVariant, estimateCjkTokens, isAutoModeClassifier, requestText, summarizeAction } from "../auto-mode-forge.js";

@@ -16,7 +16,7 @@ import * as pfChannel from "./pf-channel.js";
 import { probeLiveness, type LivenessVerdict } from "../liveness.js";
 import { BILI_PASSTHROUGH_HEADER, CALIBRATED_TEXT_TOKEN_RATIO, MIN_ASSUMED_WINDOW_TOKENS } from "../util.js";
 import { DSH_COMPACTION_MARKER_SNIFF, isDshCompactionCall } from "../server/dsh-compaction-guard.js";
-import { checkInstructionsOverflow, RESPONSES_INSTRUCTIONS_CHAR_LIMIT } from "../instructions-guard.js";
+import { checkInstructionsOverflow } from "../instructions-guard.js";
 import { APIG_RESIGN_HEADER, APIG_RESIGN_CREDENTIAL_HEADER, APIG_RESIGN_SCHEME, clearSignedRefusal, encodeApigCredential, inboundSignedScheme, recordSignedRefusal, resignEnabled, resignPassthroughEnabled, signedRefusal } from "../apig-resign.js";
 
 /** #2924: takeover-gate verdict. `true` claims the request; `false` keeps the
