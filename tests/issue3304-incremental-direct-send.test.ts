@@ -9,6 +9,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { installNativeFetchIntercept, withRestoredBody, _resetForTest, type NativeInterceptState } from "../src/agent/native-intercept.ts";
 import { createPrepareDirectSend, incrementalEnvelopeConversationId, INCREMENTAL_TURN_ID_HEADER, rememberOriginalBody, originalBodyForTurn, __resetIncrementalClientForTests } from "../src/agent/incremental-client.ts";
+import { _resetArmedLaneForTest } from "../src/agent/native-attach.ts";
 
 const ORIGINAL_BODY = JSON.stringify({ model: "claude-test", max_tokens: 1024, messages: [{ role: "user", content: "hello" }] });
 const DELTA_BODY = JSON.stringify({ conversationId: "conv-1", sinceSeq: 3, path: "/v1/messages", request: { model: "claude-test" }, messages: [{ role: "assistant", content: "hi" }] });
@@ -383,6 +384,12 @@ import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 
 const { maybeIncrementalOpencode } = await import("../src/agent/opencode-native.ts");
+// #3304 deliberately drives TWO lanes in one test process (cross-lane
+// matrix). The one-lane-per-process guard (#5241 phase 1) encodes the
+// PRODUCTION contract — each lane rides its own host process — so a test
+// that consciously co-loads lanes resets the guard between them instead of
+// spawning per-lane subprocesses like the phase-0 stakes do.
+_resetArmedLaneForTest();
 const { ompIncrementalBeforeSend, _setOmpOriginForTest, __resetOmpIncrementalForTests } = await import("../src/agent/omp-native.ts");
 
 function fakeLane(enabled: boolean): Promise<{ base: string; close: () => Promise<void> }> {
