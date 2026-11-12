@@ -183,6 +183,7 @@ const WORKER_CODE = [
     "let parentDeadStreak = 0;",
     "let parentTripped = false;",
     "let watcherCount = 0;",
+    "let lastOwnerProbeErr = \"\";",
     "let timer = null;",
     "let emitStderr = false;",
     "",
@@ -198,8 +199,12 @@ const WORKER_CODE = [
     "",
     // kill-0 liveness probe, #3890 discipline: EPERM means the pid EXISTS but
     // belongs to someone else — alive. Only ESRCH (and friends) mean gone.
+    // lastOwnerProbeErr keeps the errno of the latest probe for the FATAL line:
+    // on Windows every non-ACCESS_DENIED OpenProcess failure collapses to
+    // ESRCH, so the code is the only clue left to attribute false-dead
+    // episodes (#3890 field instrumentation, mirrored from the in-loop reaper).
     "function ownerAlive() {",
-    "  try { process.kill(parentPid, 0); return true; } catch (e) { return e !== null && e.code === \"EPERM\"; }",
+    "  try { process.kill(parentPid, 0); lastOwnerProbeErr = \"\"; return true; } catch (e) { lastOwnerProbeErr = e != null && e.code ? e.code : String(e); return e !== null && e.code === \"EPERM\"; }",
     "}",
     "",
     "function line(level, msg) {",
@@ -227,7 +232,7 @@ const WORKER_CODE = [
     "    if (ownerAlive()) { parentDeadStreak = 0; } else { parentDeadStreak++; }",
     "    if (parentDeadStreak >= parentConfirmTicks && gap >= softWarnMs && watcherCount <= 0) {",
     "      parentTripped = true;",
-    "      line(\"error\", \"[event-loop-watchdog] FATAL: owner pid \" + parentPid + \" gone (kill-0 x\" + parentConfirmTicks + \" off-loop) with loop silent for \" + fmt(gap) + \" and no other watchers — exiting so the spawner can respawn onto the freed port (#5449)\");",
+    "      line(\"error\", \"[event-loop-watchdog] FATAL: owner pid \" + parentPid + \" gone (kill-0 x\" + parentConfirmTicks + \" off-loop, last probe code=\" + (lastOwnerProbeErr || \"?\") + \") with loop silent for \" + fmt(gap) + \" and no other watchers — exiting so the spawner can respawn onto the freed port (#5449)\");",
     "      try { parentPort.postMessage({ type: \"trip\", gapMs: gap, reason: \"parent-gone\" }); } catch (e) {}",
     "      if (fatalMode === \"exit\") process.exit(1);",
     "    }",
