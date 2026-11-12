@@ -549,8 +549,12 @@ export async function fetchWithRetry(
             continue;
         }
         if (result.response.ok) return result;
-        const errText = await result.response.text().catch(() => "upstream error");
-        result.clearTimer();
+        let errText: string;
+        try {
+            errText = await result.response.text();
+        } finally {
+            result.clearTimer();
+        }
         const lastAttempt = attempt >= maxAttempts;
         if (!lastAttempt && isTransientUpstreamError(result.response.status, errText)) {
             const delayMs = replayBackoffMs(attempt);

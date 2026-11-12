@@ -54,6 +54,11 @@ test("e2e #321 PR-C: rebase only on completed; trigger request forwarded clean",
                     res.end(JSON.stringify({ error: { message: "compact failed" } }));
                     return;
                 }
+                if (mode?.startsWith("status-")) {
+                    res.writeHead(200, { "content-type": "application/json" });
+                    res.end(JSON.stringify({ status: mode.slice(7), error: null, output: [] }));
+                    return;
+                }
                 if (mode === "empty") {
                     res.writeHead(200, { "content-type": "application/json" });
                     res.end();
@@ -198,6 +203,17 @@ test("e2e #321 PR-C: rebase only on completed; trigger request forwarded clean",
         assert.equal(r5.status, 200);
         await r5.text();
         assert.equal(pendingRebase("term-empty"), undefined, "empty body must not schedule a rebase");
+
+        for (const status of ["failed", "incomplete", "cancelled", "queued", "in_progress"]) {
+            const label = `term-json-${status}`;
+            const response = await postResponses(`/responses/compact?mode=status-${status}`, { model: "gpt-resp", session_id: label });
+            assert.equal(response.status, 200);
+            await response.text();
+            assert.equal(pendingRebase(label), undefined, `${status} JSON output must not schedule a rebase`);
+        }
+        const completed = await postResponses("/responses/compact?mode=status-completed", { model: "gpt-resp", session_id: "term-null-error" });
+        await completed.text();
+        assert.equal(pendingRebase("term-null-error"), true, "a null error must not suppress completed compaction");
 
         // 6. Endpoint form, JSON with output → rebase (the #249 happy path).
         const r6 = await postResponses("/responses/compact", { model: "gpt-resp", session_id: "term-jsonok" });
