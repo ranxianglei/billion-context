@@ -38,6 +38,16 @@ test("unwrap: text parts become strings, envelope keys drop into meta", () => {
     assert.equal((out.meta.envelope as Record<string, unknown>).mode_type, 1);
 });
 
+test("unwrap: multiple text parts collapse to a newline-joined string", () => {
+    const out = unwrapTraeBody(body({
+        messages: [{ role: "user", content: [{ type: "text", text: "A" }, { type: "text", text: "B" }] }],
+    }));
+    assert.ok(out);
+    // A real newline, not a literal backslash-n: the commandcode sibling
+    // (commandcode-wire.ts) collapses parts the same way.
+    assert.deepEqual(out.body.messages, [{ role: "user", content: "A\nB" }]);
+});
+
 test("unwrap: function_call reduces to function and tool results flatten", () => {
     const out = unwrapTraeBody(body({
         messages: [

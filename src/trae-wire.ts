@@ -49,7 +49,7 @@ function partsToContent(content: unknown): string | Array<Record<string, unknown
         }
         return undefined;
     }
-    if (allText) return parts.map((p) => String(p.text)).join("\\n");
+    if (allText) return parts.map((p) => String(p.text)).join("\n");
     return parts;
 }
 
