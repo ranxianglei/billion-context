@@ -8,8 +8,8 @@
 | Doc | What it is |
 |---|---|
 | [README](../README.md) / [中文](../README.zh-CN.md) / [日本語](../README.ja.md) | Project entry: what it is, quickstart, architecture overview |
-| [architecture](architecture.md) / [中文](architecture.zh-CN.md) | **System architecture hub** (LIVE doc, owner ruling 2026-11-08): overall diagram + per-module pages, each with its own diagram — see `docs/architecture/` |
-| [configuration](configuration.md) / [中文](configuration.zh-CN.md) | Full configuration reference (generated from `website/config-reference/*.yaml` by `tools/gen-config-docs.mjs`; hand-written sections are drift-guarded) |
+| [architecture](architecture.md) / [中文](architecture.zh-CN.md) / [日本語](architecture.ja.md) | **System architecture hub** (LIVE doc, owner ruling 2026-11-08): overall diagram + per-module pages, each with its own diagram — see `docs/architecture/` |
+| [configuration](configuration.md) / [中文](configuration.zh-CN.md) / [日本語](configuration.ja.md) | Full configuration reference (generated from `website/config-reference/*.yaml` by `tools/gen-config-docs.mjs`; hand-written sections are drift-guarded) |
 | [clients](clients.md) / [中文](clients.zh-CN.md) / [日本語](clients.ja.md) | Per-client integration deep dives: how each mode (launcher / `/bili/` / native plugin) wires traffic in |
 | [how-it-works](how-it-works.en.svg) / [中文](how-it-works.zh-CN.svg) | One diagram: request flow + the injected context tools |
 | [README](README.md) / [中文](README.zh-CN.md) / [日本語](README.ja.md) | Directory landing page: section map + the rules that keep this directory live |
@@ -31,7 +31,7 @@
 
 | Doc | What it is |
 |---|---|
-| [technical-notes](technical-notes.md) / [中文](technical-notes.zh-CN.md) | Large compendium of mechanism deep-dives (wire behavior, compression modes, fastpaths) |
+| [technical-notes](technical-notes.md) / [中文](technical-notes.zh-CN.md) / [日本語](technical-notes.ja.md) | Large compendium of mechanism deep-dives (wire behavior, compression modes, fastpaths) |
 | [lifecycle](lifecycle.md) | Transition-switch ledger / retirement inventory / hygiene record (CI-enforced `BILI_*` coverage) |
 | [auto-merge-guardrails](auto-merge-guardrails.md) | Evidence appendix behind §7 of `AGENTS.md` (AI auto-dev review history) |
 | [unified-loop-spec](unified-loop-spec.md) | Historical design: unified compress-loop spec (implemented; code is the source of truth) |
