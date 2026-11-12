@@ -3180,8 +3180,20 @@ export class SessionStore {
             const record = this.buildRecordForSave(session, stamp);
             const disk = this.staleDiskPayload(record);
             if (disk !== null) {
-                // #2401: disk is strictly newer — converge + ingest the disk view
-                // (same as the debounced path, minus the envelope rewrite).
+                // #2401/#405: disk is strictly newer — converge + ingest the disk view
+                // (same as the debounced path, minus the envelope rewrite). Log the same
+                // "rejected stale snapshot" line (throttled identically) so the
+                // multi-instance guard stays observable when this durability pass
+                // converges before the debounced save gets to it.
+                const now = Date.now();
+                const last = this.staleWarnAt.get(record.id) ?? 0;
+                if (now - last >= STALE_WARN_THROTTLE_MS) {
+                    this.staleWarnAt.set(record.id, now);
+                    this.log(
+                        "warn",
+                        `[persist] rejected stale snapshot for session ${record.id} (durability-before-render): in-memory copy is older than the on-disk one (another bili instance holds newer state) — keeping disk state and converging in-memory state to it, so subsequent requests serve the fuller fold coverage instead of the stale view (#405/#2401)`,
+                    );
+                }
                 this.convergeToDisk(session, disk);
                 this.shadow.record(disk);
                 this.noteOwnCommit(session.id, disk);
