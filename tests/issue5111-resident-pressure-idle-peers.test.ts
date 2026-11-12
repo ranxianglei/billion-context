@@ -9,6 +9,16 @@
 // exit advice (closing others cannot help). The gate itself stays pinned in
 // tests/issue3126-no-visible-context.test.ts; the fresh-peer direction stays
 // pinned in tests/issue3918-resident-eviction-refusal.test.ts.
+//
+// The "exact reason code" test below asserts the receipt names the persisted-view
+// fallback failure as (no-persisted-rows) — that code only exists when the unified
+// sidecar is OPEN (a closed sidecar yields unified-store-off instead). The ambient
+// storage mode is environment-dependent: a developer's config may set storage.unified,
+// but CI's hermetic preload (tests/preload-test-env.mjs) points XDG_CONFIG_HOME at a
+// fresh temp dir with none, so the sidecar is closed there and the receipt reads
+// (unified-store-off) — the #5118 CI red. Pin the sidecar open to keep the receipt
+// deterministic (same ambient-env note as tests/issue4241-judge-render-baseline.test.ts).
+process.env.BILI_STORAGE_UNIFIED = "shadow";
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { mkdtempSync, rmSync } from "node:fs";
