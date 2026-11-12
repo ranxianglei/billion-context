@@ -174,6 +174,64 @@ export function isDshAutoReviewRequest(protocol: string | null, parsed: unknown)
     return users === 1 && userHasContent;
 }
 
+// #5656/#5584: dsh's per-feature sidecar pins above (title #2503, auto-review
+// #4438) are whack-a-mole — every NEW one-shot sidecar dsh ships around the
+// main conversation (prompt-enhance in #5656: "请重写以下提示词…" rewrites the
+// user's input before sending) arrives under the SAME conversation id, with
+// its OWN system prompt, no tools, one user blob — and misses every pinned
+// prefix. If it fires before the first main turn it CLAIMS the raw-key anchor
+// (first-seen-instructions semantics), exiling the real conversation onto
+// `<id>|sub:<fp>` for the session lifetime: the host-stamped management calls
+// (compress / acp_status) resolve the bare id, see the 1-message ghost, never
+// match a ref, trip the circuit breaker — compression is permanently dead and
+// the context grows unbounded (the session-drift explosion family; 11 of 13
+// sessions on the reporter's machine, feeding #5671's terminal 7.3×-window
+// deaths). This is the STRUCTURAL close: the two things a one-shot sidecar can
+// never fake, per #546 ("a non-empty tools array marks an agent MAIN turn") and
+// #4438's replay veto — NO action surface (tools absent/empty; dsh's own
+// request builder emits no tools key only when the resolved tool set is
+// empty, agent-loop buildRequest) and a single-shot body (exactly ONE
+// non-system message with content, no assistant/tool turn anywhere). System
+// text is deliberately NOT pinned: the next sidecar must not reopen the hole.
+// A non-empty system carrier is REQUIRED so the kernel's empty-instructions
+// path (aux calls riding the main session through the full pipeline, pinned in
+// tests/dsh-persona-fingerprint.test.ts phase 6) keeps its contract.
+// Residual, accepted: a tool-less MAIN turn 1 matches the single-shot shape and
+// rides the verbatim side lane for that one turn (tiny — nothing to compress);
+// turn 2+ replays history and rejoins the full pipeline. The caller must gate
+// on the dsh lane (evidence-per-client discipline, cf. isDshTitleRequest).
+export function isDshSingleShotSidecar(protocol: string | null, parsed: unknown): boolean {
+    if (protocol === null || !parsed || typeof parsed !== "object") return false;
+    const p = parsed as Record<string, unknown>;
+    // Same no-tools veto as isSideRequest/isDshTitleRequest/isDshAutoReviewRequest.
+    if (Array.isArray(p.tools) && p.tools.length > 0) return false;
+    // A sidecar carries its own persona; an empty system is the kernel's
+    // empty-instructions path, not this gate's business.
+    if (!systemCarrierTexts(p).some((t) => t.trim().length > 0)) return false;
+    const entries = protocol === "responses" ? p.input : protocol === "google" ? p.contents : p.messages;
+    if (!Array.isArray(entries)) return false;
+    let users = 0;
+    let userHasContent = false;
+    for (const entry of entries) {
+        if (entry === null || typeof entry !== "object") continue;
+        const rec = entry as Record<string, unknown>;
+        const role = rec.role;
+        if (role === "system" || role === "developer") continue;
+        // Responses-side typed items that are not plain messages (reasoning,
+        // function_call, …) can only appear in a real model round-trip.
+        if (role !== "user") return false;
+        if (rec.type !== undefined && rec.type !== "message") return false;
+        users += 1;
+        const c = rec.content ?? rec.parts;
+        if (typeof c === "string") {
+            if (c.length > 0) userHasContent = true;
+        } else if (Array.isArray(c) && c.length > 0) {
+            userHasContent = true;
+        }
+    }
+    return users === 1 && userHasContent;
+}
+
 // #5135: Claude Code's session-title sidecar (terminal CLI, proxy mode — no
 // x-bili-plugin stamp). It fires at session start UNDER THE SAME
 // x-claude-code-session-id as the first main turn, ~1ms ahead of it. Field

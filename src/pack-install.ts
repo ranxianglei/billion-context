@@ -145,7 +145,7 @@ export function installPackFromNpm(spec: string, options: PackInstallOptions = {
 
         const entryPath = path.join(installed.dir, PACK_ENTRY_FILE);
         if (!existsSync(entryPath)) {
-            throw new Error(`${trimmed} is not a billion-context pack: it has no \`${PACK_ENTRY_FILE}\` in the package root (that file holds the pack JSON — see CONFIGURATION.md “Pack file format”)`);
+            throw new Error(`${trimmed} is not a billion-context pack: it has no \`${PACK_ENTRY_FILE}\` in the package root (that file holds the pack JSON — see docs/configuration.md “Pack file format”)`);
         }
         let parsed: unknown;
         try { parsed = JSON.parse(readFileSync(entryPath, "utf8")); }
