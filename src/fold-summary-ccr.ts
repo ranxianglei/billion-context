@@ -40,6 +40,72 @@ const SYNTHETIC_SUMMARY_REF_BASE = 5_000_000;
 const SYNTHETIC_SUMMARY_REF_SPAN = 4_999_999; // [5_000_000, 9_999_998] ⊂ valid mNNNNN
 const SUMMARY_PLACEHOLDER_KIND = "compressed history";
 
+// Bounded-head default for the fold-summary placeholder. The tool-result CCR
+// default is 96 chars, but a fold summary is the ONLY inline trace of a whole
+// folded span — 96 chars is a header fragment with near-zero topical signal
+// (measured on real folds). A larger bounded head gives prose folds (which have
+// no literals for the inverted index to catch) a real topical hint. Still
+// bounded: it is a hint, not the full prose (that stays one acp_retrieve away).
+const FOLD_SUMMARY_DEFAULT_HEAD_CHARS = 256;
+
+// Inverted-index cap: guards a pathological never-ending session from growing
+// the persisted anchor map without bound. Anchors are cheap (a few dozen per
+// summary); 16K is far beyond any realistic session and evicts nothing below it.
+const FOLD_INDEX_MAX_ANCHORS = 16384;
+
+/** Distinctive literal anchors in a fold summary — the "grep-able" tokens a
+ *  weak model would query to localize the block. Backtick-quoted (code, config
+ *  keys, values), CJK 「」-quoted (semantic keys), file paths (>=2 segments),
+ *  hex tokens (hashes/ids), and #issue refs. Lowercased, deduped, trivially
+ *  short (<3 chars) dropped. Deterministic — the same prose yields the same
+ *  anchors, so the index is byte-stable across turns. */
+export function extractFoldAnchors(text: string): string[] {
+    const out = new Set<string>();
+    const add = (raw: string | undefined): void => {
+        if (!raw) return;
+        const norm = raw.trim().toLowerCase();
+        if (norm.length >= 3) out.add(norm);
+    };
+    let m: RegExpExecArray | null;
+    const bt = /`([^`\n]+)`/g;
+    while ((m = bt.exec(text))) add(m[1]);
+    const cq = /「([^」\n]+)」/g;
+    while ((m = cq.exec(text))) add(m[1]);
+    const pp = /[\w.-]+(?:\/[\w.-]+){1,}/g;
+    while ((m = pp.exec(text))) add(m[0]);
+    const hx = /\b[0-9a-fA-F]{6,}\b/g;
+    while ((m = hx.exec(text))) add(m[0]);
+    const ir = /#[0-9]{2,}/g;
+    while ((m = ir.exec(text))) add(m[0]);
+    return [...out];
+}
+
+/** Persisted fold-summary inverted index: anchor (lowercased) → the synthetic
+ *  refs of the fold summaries containing it. A plain object (not a Map) so it
+ *  round-trips through session.metadata JSON unchanged. Absent == empty. */
+export type FoldSummaryIndex = Record<string, string[]>;
+
+export function readFoldSummaryIndex(session: Session): FoldSummaryIndex {
+    const v = session.metadata.foldSummaryIndex;
+    return v && typeof v === "object" && !Array.isArray(v) ? (v as FoldSummaryIndex) : {};
+}
+
+/** Merge freshly-extracted anchors (anchor → refs) into the session's persisted
+ *  index. Idempotent (a ref already listed for an anchor is not re-added) and
+ *  bounded (stops adding once the anchor count hits the cap). */
+function mergeFoldIndex(session: Session, indexOut: Map<string, Set<string>>): void {
+    if (indexOut.size === 0) return;
+    const existing = readFoldSummaryIndex(session);
+    let anchorCount = Object.keys(existing).length;
+    for (const [anchor, refs] of indexOut) {
+        if (anchorCount >= FOLD_INDEX_MAX_ANCHORS) break;
+        const arr = existing[anchor] ?? (existing[anchor] = []);
+        for (const r of refs) if (!arr.includes(r)) arr.push(r);
+        anchorCount++;
+    }
+    session.metadata.foldSummaryIndex = existing;
+}
+
 /** FNV-1a 32-bit over UTF-16 code units — pure arithmetic, platform-stable. */
 function fnv1a(str: string): number {
     let h = 0x811c9dc5;
@@ -79,6 +145,7 @@ export function foldSummariesToCcr(
     storeIn: MessageContentStore,
     retrieveName: string,
     maxHeadChars: number,
+    indexOut?: Map<string, Set<string>>,
 ): FoldSummaryCcrOutcome {
     let store = storeIn;
     let replaced = 0;
@@ -88,6 +155,13 @@ export function foldSummariesToCcr(
         if (text.length === 0) return m;
         const blockId = m.id.slice(SUMMARY_ID_PREFIX.length);
         const ref = syntheticSummaryRef(blockId);
+        if (indexOut) {
+            for (const anchor of extractFoldAnchors(text)) {
+                let s = indexOut.get(anchor);
+                if (!s) { s = new Set(); indexOut.set(anchor, s); }
+                s.add(ref);
+            }
+        }
         const existing = hasStoredRef(store, ref) ? store.byRef[ref] : undefined;
         if (existing) {
             replaced++;
@@ -122,9 +196,11 @@ export function applyFoldSummaryCcr(
     if (!featureEnabled("foldSummaryCcrPlaceholder") || !ccrEnabled(session)) {
         return { messages, applied: false };
     }
-    const folded = foldSummariesToCcr(messages, contentStoreOf(session), retrieveToolName(session), effectiveCcr(session)?.maxHeadChars ?? 96);
+    const indexOut = new Map<string, Set<string>>();
+    const folded = foldSummariesToCcr(messages, contentStoreOf(session), retrieveToolName(session), effectiveCcr(session)?.maxHeadChars ?? FOLD_SUMMARY_DEFAULT_HEAD_CHARS, indexOut);
     if (folded.replaced > 0) {
         adoptContentStore(session, folded.store);
+        mergeFoldIndex(session, indexOut);
         return { messages: folded.messages, applied: true };
     }
     return { messages, applied: false };

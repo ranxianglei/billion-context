@@ -1,9 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createContentStore, parseStoredPlaceholder, refToIndex, retrieveByRef, RETRIEVE_TOOL_NAME, type CoreMessage } from "acp-kernel";
-import { applyFoldSummaryCcr, foldSummariesToCcr, syntheticSummaryRef } from "../src/fold-summary-ccr.js";
+import { applyFoldSummaryCcr, extractFoldAnchors, foldSummariesToCcr, readFoldSummaryIndex, syntheticSummaryRef } from "../src/fold-summary-ccr.js";
 import { getSession } from "../src/session.js";
-import { contentStoreOf, storeEffectiveCcr } from "../src/store.js";
+import { contentStoreOf, executeRetrieve, storeEffectiveCcr } from "../src/store.js";
 
 // #6111 POC (from #6025): proxy-mode fold summaries rendered as CCR placeholders
 // on the outbound view. The transform lives in src/fold-summary-ccr.ts; these
@@ -146,5 +146,141 @@ test("gate: feature ON + ccr ON → summary becomes a retrievable placeholder", 
         const res = retrieveByRef(contentStoreOf(session), syntheticSummaryRef("g-on"));
         assert.equal(res.ok, true, "stored ref must be retrievable from the session store");
         assert.equal(res.text, prose, "retrieved bytes equal the original prose");
+    });
+});
+
+// --- #6111 POC hybrid: bounded head + inverted index (keyword localization) ---
+
+test("extractFoldAnchors pulls the grep-able literals, lowercases, dedupes, drops short", () => {
+    const prose = "Edited src/server/prepare-openai.ts and kernel/src/ccr.ts; build hash f089220f67ee " +
+        "resolved issue #6111. Config key `k84bd` set to `f089220f67ee`. 事项「灰度窗口说明 #1-1」 noted. " +
+        "The word and the token ab (too short) are dropped.";
+    const anchors = extractFoldAnchors(prose);
+    // backtick-quoted
+    assert.ok(anchors.includes("k84bd"), "backtick key");
+    assert.ok(anchors.includes("f089220f67ee"), "backtick value (also hex)");
+    // 「」-quoted (CJK)
+    assert.ok(anchors.includes("灰度窗口说明 #1-1"), "CJK-quoted key");
+    // file paths (>=2 segments)
+    assert.ok(anchors.includes("src/server/prepare-openai.ts"), "path 1");
+    assert.ok(anchors.includes("kernel/src/ccr.ts"), "path 2");
+    // hex-6+
+    assert.ok(anchors.includes("f089220f67ee"), "hex token");
+    // #issue refs
+    assert.ok(anchors.includes("#6111"), "issue ref");
+    // lowercased
+    assert.ok(!anchors.some((a) => a !== a.toLowerCase()), "all anchors lowercased");
+    // deduped (f089220f67ee appears twice in prose)
+    assert.equal(anchors.filter((a) => a === "f089220f67ee").length, 1, "deduped");
+    // short dropped
+    assert.ok(!anchors.includes("ab"), "sub-3-char dropped");
+    // deterministic
+    assert.deepEqual(extractFoldAnchors(prose), anchors, "same prose → same anchors");
+});
+
+test("bounded head: fold-summary placeholder head uses the 256-char default (not the 96 tool-result default)", () => {
+    const session = getSession(`t-fsc-head-${Math.random().toString(36).slice(2)}`);
+    storeEffectiveCcr(session, { enabled: true, toolName: RETRIEVE_TOOL_NAME, minToolTokens: 50 });
+    // A prose summary with no literals (the head is its only topical signal).
+    // Long enough that 96 chars is a fragment but 256 chars carries the topic.
+    const prose = "[Compressed conversation section]\n" +
+        "The user was debugging a flaky integration test in the storage layer. " +
+        "Root cause traced to a connection pool exhaustion under load; the fix " +
+        "bounded the pool and added a retry with backoff. Verified across three " +
+        "consecutive runs on both the sqlite and mysql backends before closing.";
+    const summary = summaryMsg("head-1", prose);
+    withGateEnv("1", () => {
+        const out = applyFoldSummaryCcr([summary], session);
+        assert.equal(out.applied, true);
+        const parsed = parseStoredPlaceholder(out.messages[0]!.text!);
+        assert.ok(parsed, "placeholder must parse");
+        // The head (the backtick-quoted group, parsed as `title`) is the first
+        // 256 chars (bounded), NOT 96 — so it extends well past the 96-char
+        // mark and carries real topical signal.
+        assert.ok(parsed!.title, "placeholder must carry a head (backtick group)");
+        assert.ok(parsed!.title!.length > 96, `head must exceed the 96 tool-result default (got ${parsed!.title!.length})`);
+        // normalizeHead caps at maxHeadChars and appends an ellipsis on truncation,
+        // so the bound is maxHeadChars + a small margin.
+        assert.ok(parsed!.title!.length <= 260, `head must stay bounded near 256 (got ${parsed!.title!.length})`);
+    });
+});
+
+test("index: applyFoldSummaryCcr populates session.metadata.foldSummaryIndex (anchor → synthetic ref)", () => {
+    const session = getSession(`t-fsc-idx-${Math.random().toString(36).slice(2)}`);
+    storeEffectiveCcr(session, { enabled: true, toolName: RETRIEVE_TOOL_NAME, minToolTokens: 50 });
+    const prose = "[Compressed conversation section]\nEdited src/server/prepare-openai.ts; hash f089220f67ee; key `k84bd`.";
+    const summary = summaryMsg("idx-1", prose);
+    withGateEnv("1", () => {
+        const out = applyFoldSummaryCcr([summary], session);
+        assert.equal(out.applied, true);
+        const idx = readFoldSummaryIndex(session);
+        const ref = syntheticSummaryRef("idx-1");
+        assert.ok(idx["k84bd"]?.includes(ref), "backtick anchor maps to the synthetic ref");
+        assert.ok(idx["f089220f67ee"]?.includes(ref), "hex anchor maps to the synthetic ref");
+        assert.ok(idx["src/server/prepare-openai.ts"]?.includes(ref), "path anchor maps to the synthetic ref");
+    });
+});
+
+test("index: idempotent across turns (re-applying the same summary does not duplicate refs)", () => {
+    const session = getSession(`t-fsc-idx-idem-${Math.random().toString(36).slice(2)}`);
+    storeEffectiveCcr(session, { enabled: true, toolName: RETRIEVE_TOOL_NAME, minToolTokens: 50 });
+    const prose = "[Compressed conversation section]\nKey `k84bd` and hash f089220f67ee discussed.";
+    const summary = summaryMsg("idx-2", prose);
+    withGateEnv("1", () => {
+        applyFoldSummaryCcr([summary], session);
+        applyFoldSummaryCcr([summaryMsg("idx-2", prose)], session); // next turn, same summary
+        const idx = readFoldSummaryIndex(session);
+        assert.equal(idx["k84bd"]!.length, 1, "ref listed once despite two passes");
+    });
+});
+
+test("keyword search: executeRetrieve with a non-ref arg returns the matching fold block ref", () => {
+    const session = getSession(`t-fsc-kw-${Math.random().toString(36).slice(2)}`);
+    storeEffectiveCcr(session, { enabled: true, toolName: RETRIEVE_TOOL_NAME, minToolTokens: 50 });
+    const prose = "[Compressed conversation section]\nKey `k84bd` and hash f089220f67ee discussed at length.";
+    withGateEnv("1", () => {
+        applyFoldSummaryCcr([summaryMsg("kw-1", prose)], session);
+        const ref = syntheticSummaryRef("kw-1");
+        const res = executeRetrieve({ ref: "k84bd" }, session);
+        assert.equal(res.outcome, "success", `keyword search must succeed:\n${res.text}`);
+        assert.ok(res.text!.includes(ref), `result must name the matching ref:\n${res.text}`);
+        assert.ok(res.text!.includes("k84bd"), "result echoes the keyword");
+    });
+});
+
+test("keyword search: miss returns an honest not-found (no index entry for the keyword)", () => {
+    const session = getSession(`t-fsc-kw-miss-${Math.random().toString(36).slice(2)}`);
+    storeEffectiveCcr(session, { enabled: true, toolName: RETRIEVE_TOOL_NAME, minToolTokens: 50 });
+    const prose = "[Compressed conversation section]\nKey `k84bd` discussed.";
+    withGateEnv("1", () => {
+        applyFoldSummaryCcr([summaryMsg("kw-miss", prose)], session);
+        const res = executeRetrieve({ ref: "zzz-not-an-anchor-xyz" }, session);
+        assert.equal(res.outcome, "failure", "a keyword with no index entry must fail");
+        assert.match(res.text!, /no compressed-history block contains/);
+    });
+});
+
+test("keyword search: feature OFF → a non-ref arg is a plain miss (no index consulted)", () => {
+    const session = getSession(`t-fsc-kw-off-${Math.random().toString(36).slice(2)}`);
+    storeEffectiveCcr(session, { enabled: true, toolName: RETRIEVE_TOOL_NAME, minToolTokens: 50 });
+    // Pre-seed an index entry so we can prove the OFF path ignores it.
+    session.metadata.foldSummaryIndex = { k84bd: [syntheticSummaryRef("kw-off")] };
+    withGateEnv("0", () => {
+        const res = executeRetrieve({ ref: "k84bd" }, session);
+        assert.equal(res.outcome, "failure", "feature off → keyword search must not run");
+        assert.match(res.text!, /no fold-block index is active/);
+    });
+});
+
+test("keyword search: a valid mNNNNN ref still resolves by ref (no regression to the exact-ref path)", () => {
+    const session = getSession(`t-fsc-kw-ref-${Math.random().toString(36).slice(2)}`);
+    storeEffectiveCcr(session, { enabled: true, toolName: RETRIEVE_TOOL_NAME, minToolTokens: 50 });
+    const prose = "[Compressed conversation section]\nKey `k84bd` discussed.";
+    withGateEnv("1", () => {
+        applyFoldSummaryCcr([summaryMsg("kw-ref", prose)], session);
+        const ref = syntheticSummaryRef("kw-ref");
+        const res = executeRetrieve({ ref }, session);
+        assert.equal(res.outcome, "success", `exact-ref retrieve must still work:\n${res.text}`);
+        assert.ok(res.text!.includes(prose), `exact-ref retrieve must carry the full prose verbatim:\n${res.text}`);
     });
 });
