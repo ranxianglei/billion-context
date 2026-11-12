@@ -679,6 +679,16 @@ export type UpstreamProxyMode = "auto" | "manual" | "direct";
  *  strands the session in the preflight fail-fast loop while a too-large
  *  one self-heals on the first upstream overflow (#852). */
 const CONTEXT_LIMIT_TABLE: Array<{ match: RegExp; limit: number }> = [
+    // #6433: the 5.x-generation Claude line (and Opus 4.6+) serves 1M NATIVELY —
+    // no context-Nm beta header or [Nm] suffix required. The #1321 tier-gate
+    // assumed every claude-* id was 200K-standard (1M beta-gated), which held
+    // for the 4.x line but is stale for these: capping them back to 200K fires
+    // a spurious preflight + deep fold + cold cache on a request that already
+    // fit (reporter field evidence: claude-fable-5-2 forwarded 282K cleanly).
+    // Listed BEFORE the generic claude- row so both the fallback lookup and the
+    // tier-gate standard resolve to 1M (the cap becomes a no-op). Genuinely
+    // beta-gated ids (Sonnet 4.x, Opus ≤4.5, Haiku) fall through to the 200K row.
+    { match: /^claude-(opus-4-[6-9]|opus-5|sonnet-5|fable-|mythos-)/i, limit: 1_000_000 },
     { match: /^claude-/i, limit: 200_000 },
     { match: /^gpt-5/i, limit: 400_000 },
     { match: /^gpt-4\.1/i, limit: 1_000_000 },
