@@ -182,6 +182,7 @@
 | `BILI_ALLOW_PRIVATE_HTTP_PROVIDERS` | 私有 http provider 放行（CGNAT 100.64/10 恒拒） |
 | `BILI_MITM` | MITM 功能总开关（env > 文件 mitm.enabled > 默认开；`=0` 整体关闭；与内部通道 `BILI_MITM_HOSTS`/`BILI_MITM_DOMAINS` 不同） |
 | `BILI_CLAUDE_UPSTREAM` | direct-URL 模式下绕过预置 relay 的上游 URL（OAuth 订阅流量需 MITM 模式） |
+| `BILI_PLUGIN_BYPASS` | x-bili-plugin-bypass 透传判定的运维覆盖（#6220，env-only）：三态 unset/auto=现状（入站头逐请求决定，legacy opencode-acp 会话透传）/ `1`·`on`·`true`=强制透传（所有请求原样转发，不进管线、不绑会话）/ `0`·`off`·`false`=永不透传（忽略入站头）；逐请求读取无需重启（src/server/handle.ts 单点判定） |
 
 ### 2.7 更新器 / 公告
 
